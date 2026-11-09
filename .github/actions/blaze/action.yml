@@ -1,6 +1,6 @@
 # blaze to build and test blaze with (AGENTS.md rule blaze-builds-blaze): the release
 # .github/blaze-version names, installed by site/install.sh into ~/.cargo/bin with the Rust it builds
-# with (its own toolchain, ~/.blaze/toolchains, docs/self-contained.md: no rustup), and an empty
+# with (its own toolchain, ~/.blaze/toolchains, docs/v2/plan.md: no rustup), and an empty
 # store at BLAZE_CACHE. With `llvm: true`, also the LLVM blaze pins
 # (crates/hir-ty-codegen/llvm.json), fetched by its sha256 and named by LLVM_SYS_231_PREFIX, for
 # a build of blaze, which links it (blaze-engine's default `native`). No Nix: the C compiler and linker are the runner's own (gcc and

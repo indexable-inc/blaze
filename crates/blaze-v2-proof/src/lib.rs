@@ -1,4 +1,4 @@
-//! The invalidation oracle on the query database's own record (docs/v2/plan/lanes/proof.md).
+//! The invalidation oracle on the query database's own record (docs/v2/plan.md).
 //!
 //! `harness/v2/oracle.py` checks from outside that an incremental build equals a build from
 //! scratch of the same sources: the programs, the tests, the bytes, the codegen inputs. This
@@ -10,7 +10,7 @@
 //!   differs is [`Stale`]; the culprits are a result kept though what it read changed
 //!   ([`Stale::Unverified`], verification missed it) and a result that read the same as the
 //!   build from scratch and still came out otherwise ([`Stale::UnrecordedRead`]: it read
-//!   something it has no edge for, a fact missing from docs/v2/plan/lanes/items.md section 6.2's table).
+//!   something it has no edge for, a fact missing from docs/v2/plan/design/item-hash.md section 6.2's table).
 //!   Under-invalidation is a failure.
 //! - [`over`]: an incremental build's reruns against the build before it. A rerun that read
 //!   what it read before and came out as before is work for nothing; it is measured and
@@ -18,7 +18,7 @@
 //! - [`apart`]: where two maps differ, for the codegen inputs (each `InstanceKey` with its
 //!   `CodeHash`), the kernel's entries (each instance with the key its entry is kept under) and
 //!   the output files.
-//! - [`kernel`]: the kernel's entries as rows of a [`Trace`] (blaze-kernel, docs/v2/plan/lanes/kernel.md):
+//! - [`kernel`]: the kernel's entries as rows of a [`Trace`] (blaze-kernel, docs/v2/plan/design/kernel.md):
 //!   an entry is a result keyed by its step and identity, its value's hash its fingerprint, the
 //!   reads it recorded its edges; so [`under`] names the stale entry and the read it missed as
 //!   it names a query.

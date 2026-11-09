@@ -1,4 +1,4 @@
-//! A field order plan's file (docs/v2/plan/lanes/codegen/field-order.md): each ADT's hot
+//! A field order plan's file (docs/v2/plan/design/field-order.md): each ADT's hot
 //! fields as `hir_ty::layout::field_order::heat` ranked them, the ADT named by its item key so
 //! the plan one profile gives is read by every build of the tree. Text, sorted by key:
 //!

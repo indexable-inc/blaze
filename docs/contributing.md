@@ -64,7 +64,7 @@ The crates to know first:
     vendor/source.rev         the commit of the old development branch this tree last took from
 
 Every crate of v2, what it is for and which lane owns it:
-[v2/plan/reference/crates.md](v2/plan/reference/crates.md).
+[v2/plan/reference/crates.md](v2/plan.md).
 
 `crates/hir-ty-codegen` is the code generator, a crate of its own over `hir-ty`'s MIR: what
 it uses of `hir-ty` is public there. Its root is `mod.rs`, the file it was compiled from when
@@ -347,7 +347,7 @@ built by the stage-0 blaze `.github/blaze-version` names, through
 `.github/scripts/build_release.py` (one JSON input, `{"target": ..., "out": ...}`). The release
 workflow and install.yaml run that script; blaze builds blaze, never cargo or rustc. `dist`'s
 `lto = "thin"` and `codegen-units = 1` are what blaze's release codegen does anyway (one LLVM unit
-per function with ThinLTO's summaries and imports across the program, [v2-codegen.md](v2-codegen.md)).
+per function with ThinLTO's summaries and imports across the program, [v2-codegen.md](v2/plan/design/codegen.md)).
 [reports/RELEASE-BUILD.md](reports/RELEASE-BUILD.md) has the numbers of the older cargo build.
 
 PGO is off: releases build with `"pgo": "off"`. The `pgo` workflow trains profiles with

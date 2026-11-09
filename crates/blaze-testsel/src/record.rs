@@ -1,5 +1,5 @@
 //! What a test process executed: one byte per jump-table slot of its binary, set on the
-//! slot's first call (docs/v2/plan/lanes/fastcompile/select.md, "The record").
+//! slot's first call (docs/v2/plan/design/compile-time.md, "The record").
 //!
 //! The fork server maps a region of [`HEADER`] plus `slots` bytes shared (`MAP_SHARED`)
 //! before it forks a test's child, with [`header`] written at its start. The child's runtime

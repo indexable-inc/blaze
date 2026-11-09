@@ -1240,7 +1240,7 @@ in `docs/v2/requests/db-expand.md`, "## speed-hir: four edits", item 3.
 ## frontend-tree-move-def-lower: hand over body lowering's syntax side (2026-10-29)
 
 From `frontend-tree-move-def-lower` (frontend.md item 16; notes
-`docs/v2/plan/lanes/frontend/tree-move-def-lower.md`, report
+`docs/v2/plan/design/frontend.md`, report
 `/tmp/blaze-lanes/v2-frontend-tree-move-def-lower.md`). You hold hir-def's `expr_store*` now.
 frontend-tree moves body and signature lowering from syntax handles onto borrowed views
 (`syntax::view`): every `ast::X` parameter becomes `ast::X<'t>` by value, `AstPtr::new(&x)`

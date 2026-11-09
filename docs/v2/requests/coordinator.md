@@ -14,7 +14,7 @@ date: 2026-10-30
     `needless_pass_by_value`, `large_types_passed_by_value`, `box_collection`, `vec_box`,
     `rc_buffer`, `large_enum_variant`.
 - Where: root `Cargo.toml`.
-- Why: `docs/v2/plan/goals/principles.md`, "Allocation, `dyn` and clones are controlled
+- Why: `docs/v2/plan.md`, "Allocation, `dyn` and clones are controlled
   mechanically".
 
 > applied by requests: `blaze-alloc-count = { path = \"crates/blaze-alloc-count\" }` in `[workspace.dependencies]` (new to the lock), and the twelve lints `\"deny\"` in `[workspace.lints.clippy]` under their own heading citing principles.md; `rc_buffer` moved there from the warn list.
@@ -47,7 +47,7 @@ date: 2026-10-30
 ## speed-hir-store-stmts: statements become columns, `Statement` a view (hir-ide)
 
 From speed-hir-store-stmts (child of speed-hir-store), 2026-10-29. `crates/hir-ide/` is the
-coordinator's (`docs/v2/plan/reference/crates.md`) and `crates/hir/` still builds on it, so it
+coordinator's (`docs/v2/plan.md`) and `crates/hir/` still builds on it, so it
 must compile against this change. `hir-def` stores a block's statements as rows of two columns
 (5 bytes a statement, a `let`'s ids in `extra`), where it was a 32-byte enum in a flat array.
 
@@ -116,13 +116,13 @@ Status: open
 ## dedup: one `stdx::edit_distance` (rustc's edit distance and `find_best_match_for_name`, cargo's `closest`)
 
 From `dedup-scan` (lane dedup; report `/tmp/blaze-lanes/v2-dedup-scan.md`, notes
-`docs/v2/plan/lanes/dedup/scan.md`). Six copies of rustc's restricted Damerau-Levenshtein
+`docs/v2/plan/design/data.md`). Six copies of rustc's restricted Damerau-Levenshtein
 distance exist: `crates/blaze-manifest/src/edit_distance.rs`, `crates/blaze-resolve/src/edit_distance.rs`
 (cargo's: the same algorithm on lowercased strings), `crates/blaze-diagnostics/src/lints/edit_distance.rs`,
 `crates/blaze-diagnostics/src/lower/unresolved_field.rs` 474-617, `crates/hir-expand/src/builtin/fn_macro.rs`
 1400-1448 and `crates/hir-ty-matchck/src/distance.rs`, plus three copies of `find_best_match_for_name`.
 Diagnostics must suggest what rustc suggests, so one implementation of rustc's rules, in `stdx`
-(the dedup table in `docs/v2/plan/lanes/dedup.md`: "edit distance and other small text helpers").
+(the dedup table in `docs/v2/plan/design/data.md`: "edit distance and other small text helpers").
 The callers' edits are in `docs/v2/requests/diagnostics.md`, `docs/v2/requests/db.md` (hir-expand),
 `docs/v2/requests/db-matchck.md` (hir-ty-matchck), each under `## dedup: stdx::edit_distance`; the cargo
 crates' edits are below (they are the coordinator's too).
@@ -706,7 +706,7 @@ Status: open
   (`rg 'thread::Pool|stdx::thread' crates` finds only `Builder`, `ThreadIntent`, `JoinHandle`
   in `ide-db` and `vfs-notify`). The plane's pool, `blaze_graph::pool::Pool` (work stealing,
   topology-aware, LIFO slot), is blaze's one thread pool; a second is a copy
-  (docs/v2/plan/lanes/dedup.md, "Thread pools").
+  (docs/v2/plan/design/data.md, "Thread pools").
 - Check: `rg -n 'stdx::thread::Pool|thread::\{[^}]*Pool' crates` stays empty.
 
 Status: open
@@ -912,7 +912,7 @@ equal text, so blaze-fmt's `Symbol(&'static str)` keeps its type, its text equal
 ## dedup: `blaze-lints` uses `blaze-diagnostics`' diagnostic model, `Level`, `CommandLine` and emitter (from dedup-scan-diag)
 
 From `dedup-scan-diag` (report `/tmp/blaze-lanes/v2-dedup-scan-diag.md`, notes
-`docs/v2/plan/lanes/dedup/scan-diag.md`). The files are `lints-driver`'s (lane `lints`), which is
+`docs/v2/plan/design/data.md`). The files are `lints-driver`'s (lane `lints`), which is
 rewriting `diag.rs`, `level.rs`, `check.rs` and `serve.rs` now: apply this with or after that
 rewrite, keeping its rules where its code has moved. Land it after `docs/v2/requests/diagnostics.md`
 `## dedup: one diagnostic model, `Level` and emitter, shared with `blaze-lints`` parts 1 and 2
@@ -1233,7 +1233,7 @@ fn written_at(level: Level) -> model::Level {
   same lines, `check.rs` 911-942 against `cx.rs` 297-327) and `fn derive_paths` (`cx`'s gives the
   same paths and ranges); `lints/empty_enums.rs`'s `crate::check::item_range` becomes
   `blaze_diagnostics::cx::item_range`. If the rewrite moves `item_range` onto `syntax::view`
-  nodes (`docs/v2/plan/lanes/lints/cx.md`), that one is of another tree and stays, under its
+  nodes (`docs/lints.md`), that one is of another tree and stays, under its
   own name (`view_item_range`), and only the `SyntaxNode` ones go.
 
 > forwarded to lints (holds `crates/blaze-lints/`) (from requests, pass 16; told by tmux).
@@ -1348,7 +1348,7 @@ has a macro expansion, and on what they have the two emitters write the same byt
 > forwarded to lints (holds `crates/blaze-lints/`) (from requests, pass 16; told by tmux).
 > applied by lints, 2026-10-29 (see Status under part 8).
 
-### 8. `docs/v2/plan/lanes/lints/cx.md`
+### 8. `docs/lints.md`
 
 Each `-> &mut Diagnostic` becomes `-> &mut Diag`, and "`Diagnostic`, `MultiSpan`, `Span`,
 `Applicability` and their builders" becomes "`Diag` (`blaze_diagnostics::model`'s, re-exported
@@ -2773,7 +2773,7 @@ copies" item 1, and this file's "the v1 cargo crates call blaze-units' copies" i
 ## dedup: `stdx::lend` for the two `relocating` scopes; `needless_borrow::unambiguous` onto syntax's precedence (from dedup-sim-rest, 2026-10-29)
 
 From `dedup-sim-rest` (lane dedup; report `/tmp/blaze-lanes/v2-dedup-sim-rest.md`, notes
-`docs/v2/plan/lanes/dedup/sim-rest.md`). `stdx` and `blaze-lints` are the coordinator's.
+`docs/v2/plan/design/data.md`). `stdx` and `blaze-lints` are the coordinator's.
 
 ### 1. `stdx::lend`, and hir-def's `relocating` onto it
 
@@ -2917,7 +2917,7 @@ What:
    will within this lane's step 3):
    `blaze-lint-defs = { path = "crates/blaze-lint-defs", version = "0.0.0" }` and
    `hir-lint-levels = { path = "crates/hir-lint-levels", version = "0.0.0" }`.
-3. **`docs/v2/plan/reference/crates.md`**, the "Paths each lane owns" row for diagnostics:
+3. **`docs/v2/plan.md`**, the "Paths each lane owns" row for diagnostics:
    `crates/blaze-diagnostics/` (new), `crates/blaze-lint-defs/` (new),
    `crates/hir-lint-levels/` (new), `crates/ide-diagnostics/`.
 4. Forwarding of the dependency lines that aren't diagnostics': base-db's
@@ -2970,7 +2970,7 @@ Status: open
 ## diagnostics (2026-10-30 00:45): `crates/ide-diagnostics` is deleted; what still names it
 
 Lane diagnostics deleted `crates/ide-diagnostics/` (95 files, 28k lines). It had been replaced by
-`crates/blaze-diagnostics`, as `docs/v2/plan/reference/crates.md` says. The root `Cargo.toml`
+`crates/blaze-diagnostics`, as `docs/v2/plan.md` says. The root `Cargo.toml`
 line was already gone (codegen-rq-engine.md "## 2."). No `Cargo.toml` and no `.rs` outside it
 used it. These coordinator-owned files still name it, and should change in the same landing:
 
@@ -2991,7 +2991,7 @@ used it. These coordinator-owned files still name it, and should change in the s
 8. `crates/hir-ty/src/solver_errors.rs` line 1 (db-ty's): the module doc says it converts errors "`hir` can pass to `ide-diagnostics`"; it should say `blaze-diagnostics`. (Added by diagnostics window 82.)
 
 Left alone, as records: `CHANGELOG.md`, `harness/BREAKERS.md`, `docs/upstream/**`,
-`docs/research/**`, `docs/architecture-split.md`, `docs/roadmap.md`, and
+`docs/research/**`, `docs/architecture-split.md`, `docs/v2/plan.md`, and
 `harness/smoke/ce_toml/manifest.toml`, a snapshot of an old root manifest that the smoke test
 parses.
 

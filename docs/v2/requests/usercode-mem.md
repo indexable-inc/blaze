@@ -6,7 +6,7 @@ date: 2026-10-29
 # Requests from usercode-mem
 
 usercode-mem applied requests 2-5 of `docs/v2/requests/mem-codegen.md` and brought its files to the
-allocation, `dyn` and clone bar (docs/v2/plan/goals/principles.md). Requests 1-3 below are the
+allocation, `dyn` and clone bar (docs/v2/plan.md). Requests 1-3 below are the
 other implementations of the new `trace::Inputs` (mem-codegen request 4f), which still use the
 old trait and so don't build against it. Request 4 is a caller that cloned a type that no
 longer derives `Clone`. Requests 5 and 6 explain why two types still derive it.

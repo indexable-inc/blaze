@@ -8,7 +8,7 @@ date: 2026-10-29
 Child of `mem-db-def`. Slice: `crates/hir-def/` less format's files (`expr_store*`, `hir*`,
 `item_tree*`) and the siblings' (`nameres*`, `item_scope.rs`, `resolver.rs`, `per_ns.rs`,
 `visibility.rs`, `find_path.rs`, `dyn_map.rs`). Notes and speed of light:
-`docs/v2/plan/lanes/mem/db-def-items.md`. Report: `/tmp/blaze-lanes/v2-mem-db-def-items.md`.
+`docs/v2/plan/design/memory.md`. Report: `/tmp/blaze-lanes/v2-mem-db-def-items.md`.
 
 Owner of every file here: lane db's `db-expand-next2`. Live speed agents naming these files, to
 apply or forward: `speed-hir-sol-defs` (attrs, signatures, lang_item, upvars, src, deps,

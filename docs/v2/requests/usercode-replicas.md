@@ -8,7 +8,7 @@ date: 2026-10-29
 ## usercode-replicas 1: cargo: accept `K` connections per binary on its test socket (`crates/blaze-cargo/src/serve/unit/test.rs`)
 
 From `usercode-replicas` (child of `usercode`), 2026-10-29, for `usercode-fast-tests` 7. Bound
-and arithmetic: `docs/v2/plan/lanes/usercode/speed-of-light.md`, "Tests", "Replicas of a fork
+and arithmetic: `docs/v2/plan.md`, "Tests", "Replicas of a fork
 server".
 
 What the queue now does (`crates/blaze-usercode/src/test/queue.rs`): for binary `b` it emits one

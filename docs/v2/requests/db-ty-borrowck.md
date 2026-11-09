@@ -145,7 +145,7 @@ Why: the coordinator's state-of-the-art rule asks every lane to name the fastest
 technique for its part in its lane notes.
 
 > forwarded to db: `docs/v2/plan/lanes/db/` is lane db's notes folder.
-> applied by db: `docs/v2/plan/lanes/db/borrowck.md`, linked from `query-database.md`.
+> applied by db: `docs/v2/plan.md`, linked from `query-database.md`.
 
 ## dedup: `relation.rs`'s counting sorts onto `blaze_ids::radix::Csr`
 

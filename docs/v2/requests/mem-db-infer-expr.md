@@ -5,7 +5,7 @@ date: 2026-10-29
 ---
 # mem-db-infer-expr: requests
 
-Part of `mem-db-infer` (`docs/v2/plan/lanes/mem/db-infer.md`, rules R1 to R8). Files, all in
+Part of `mem-db-infer` (`docs/v2/plan/design/memory.md`, rules R1 to R8). Files, all in
 `crates/hir-ty/src/infer/`: `expr.rs`, `pat.rs`, `coerce.rs`, `callee.rs`, `cast.rs`, `op.rs`,
 `place_op.rs`. Their owner is lane db (none done), so every change below is a request; apply
 them together with `mem-db-infer-ctx`'s (`infer.rs`, `infer/autoderef.rs`), which these program
@@ -13,7 +13,7 @@ against. Lines are as of 2026-10-29 20:50 (UTC-7); other agents are editing thes
 entry quotes its "before" code to find it by. The `db` parameters (`&'db Db` now, `&dyn
 HirDatabase` before) are left exactly as they are wherever they appear.
 
-Notes and the speed-of-light bound: `docs/v2/plan/lanes/mem/db-infer-expr.md` (and "Speed" at the
+Notes and the speed-of-light bound: `docs/v2/plan/design/memory.md` (and "Speed" at the
 end of this file).
 
 ## What these files allocate, in short

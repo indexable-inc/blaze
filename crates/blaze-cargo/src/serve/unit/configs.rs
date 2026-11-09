@@ -1,6 +1,6 @@
 //! blaze: the lints over every configuration of a package that `blaze check` linted
 //! (`blaze::dead`, `blaze::test_only`, `blaze::cfg_only`; [`blaze_diagnostics::reach`],
-//! docs/v2/plan/multiconfig-check.md), given once every unit of the job ends.
+//! docs/v2/plan/design/multiconfig-check.md), given once every unit of the job ends.
 //!
 //! A configuration is one linted unit: the lib, the lib checked as a test, each bin, test,
 //! bench and example, as this job built them (the host and the features asked for; more

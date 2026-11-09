@@ -90,6 +90,6 @@ A quoted value (`crate-attr:"feature(yeet_expr)]fn main(){}#[inline"`) would let
 
 > for: whoever owns `crates/test-utils`.
 
-> forwarded to the coordinator: `test-utils` is on the coordinator's line of `docs/v2/plan/reference/crates.md`; on requests' coordinator list (requests, pass 33).
+> forwarded to the coordinator: `test-utils` is on the coordinator's line of `docs/v2/plan.md`; on requests' coordinator list (requests, pass 33).
 
 > diagnostics (window 84, 2026-10-29 23:45): used, not built. `lower/parse/crate_attr.rs:57` matches `CrateAttrError::UnexpectedToken { .. }` (it was `Trailing`). The messages for `(` and `a, b` come from the file's own errors, so the tests in `tests/items/crate_attr.rs` (multiple, unbalanced-paren, injection2) keep rustc's stderr unchanged.

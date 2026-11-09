@@ -6,7 +6,7 @@ date: 2026-10-29
 # Requests of mem-db-infer-lower
 
 Part `lower` of mem-db-infer (`docs/v2/requests/mem-db-infer.md`, design and rules R1 to R8 in
-`docs/v2/plan/lanes/mem/db-infer.md`, notes in `docs/v2/plan/lanes/mem/db-infer-lower.md`).
+`docs/v2/plan/design/memory.md`, notes in `docs/v2/plan/design/memory.md`).
 Files of `crates/hir-ty/src/`: `lower.rs`, `lower/{batch,diagnostics,path,persist}.rs`,
 `generics.rs`, `utils.rs`, `variance.rs`, `variance/unused.rs`, `dyn_compatibility.rs`,
 `builtin_derive.rs`, `effects.rs`. All are lane db's (db-ty-lower and its siblings), none is done,

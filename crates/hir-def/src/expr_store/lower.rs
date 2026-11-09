@@ -4336,7 +4336,7 @@ impl<'db> ExprCollector<'db> {
             });
         }
         // blaze: `5u3` under `#![blaze::arbitrary_ints]`; every other crate reads the suffix
-        // as rustc does (docs/v2/plan/lanes/frontend/arbitrary-ints.md).
+        // as rustc does (docs/v2/plan/design/arbitrary-ints.md).
         if self.def_map.arbitrary_ints()
             && let ast::LiteralKind::IntNumber(int) = kind
             && let Some(suffix) = int.suffix()

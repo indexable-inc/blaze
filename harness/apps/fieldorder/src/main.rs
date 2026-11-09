@@ -1,4 +1,4 @@
-//! Field order (docs/v2/plan/lanes/codegen/field-order.md): a table of rows visited at random,
+//! Field order (docs/v2/plan/design/field-order.md): a table of rows visited at random,
 //! the loop reading two fields of each, `key` (declared first) and `weight` (declared last), and
 //! never the payload between them.
 //!

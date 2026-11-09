@@ -2275,7 +2275,7 @@ fn a_switching_job_takes_its_query_marks_and_stacks_with_it() {
     assert!(!crate::inside_a_query());
 }
 
-/// Model tests of the database's own lock-free state (docs/v2/plan/lanes/safety/model.md): the
+/// Model tests of the database's own lock-free state (docs/v2/plan/design/model-checker.md): the
 /// collection generation with each memo's `born`, and the thread-local that marks a query
 /// running.
 #[cfg(blaze_check)]

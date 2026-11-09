@@ -1,4 +1,4 @@
-//! blaze v2's store (docs/v2/plan/lanes/store.md). Replaces `blaze-store`.
+//! blaze v2's store (docs/v2/plan/design/store.md). Replaces `blaze-store`.
 //!
 //! - A value is kept under a [`Key`]: the BLAKE3 hash of exactly what it was made from (the
 //!   source, cfg, features, target, toolchain, the layout facts read, the schema and code of
@@ -23,10 +23,10 @@
 //!   segment of its own; the store copies the segments into its packs at a commit and points
 //!   each key at its pack with one swap.
 //!
-//! The layout on disk and why it survives a crash at any point: docs/v2-store.md.
+//! The layout on disk and why it survives a crash at any point: docs/v2/plan/design/store.md.
 //!
 //! Its in-memory tables and segments sit on `blaze_mem` regions tagged `Tag::Store`
-//! (docs/v2/plan/lanes/mem/backend-cas.md): a lookup that hits and a warm put allocate nothing.
+//! (docs/v2/plan/design/memory.md): a lookup that hits and a warm put allocate nothing.
 
 #![feature(allocator_api)]
 

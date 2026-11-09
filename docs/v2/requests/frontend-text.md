@@ -126,7 +126,7 @@ every item of a file on every edit of that file. Today it does
 
 `subtree_without` makes the outline in one pass over the elements outside `elided`, and copies
 only the text outside it. The work is linear in the outline, not in the item. By the
-speed-of-light figures in `docs/v2/plan/lanes/db/speed-of-light.md` (section
+speed-of-light figures in `docs/v2/plan.md` (section
 "hir-def signatures"), this is the largest part of the per-edit cost of signature syntax: about
 1.5 µs per 20-method impl, and the whole lowered body of every fn whose body was lowered.
 

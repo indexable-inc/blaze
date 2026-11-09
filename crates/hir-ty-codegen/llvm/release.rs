@@ -1,4 +1,4 @@
-//! LLVM for a release build of blaze v2 (docs/v2-codegen.md, "Release"): each function is
+//! LLVM for a release build of blaze v2 (docs/v2/plan/design/codegen.md, "Release"): each function is
 //! lowered and simplified by ThinLTO's pre-link pipeline once ([`prelink`]), which gives what
 //! its summary says of it ([`Facts`]) and its export; then compiled from that module with the
 //! exports it imports linked in and what the whole program says of it and its callees

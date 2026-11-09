@@ -1,4 +1,4 @@
-//! What the linker's core and an object format's writer share (docs/v2/plan/lanes/link/notes.md).
+//! What the linker's core and an object format's writer share (docs/v2/plan.md).
 //!
 //! The core is the same for every format: it interns symbols, places pieces in regions of
 //! one address space, makes the jump table, the GOT and the PLT, and applies every

@@ -1,4 +1,4 @@
-//! The index table (docs/v2-store.md, "On disk"): an open-addressed table on keys, mapped and
+//! The index table (docs/v2/plan/design/store.md, "On disk"): an open-addressed table on keys, mapped and
 //! read in place. A slot's number is the record's place in the store's flag columns, so it is
 //! part of what `get` and `iter` give.
 //!

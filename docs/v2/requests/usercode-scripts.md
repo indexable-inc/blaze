@@ -72,7 +72,7 @@ date: 2026-10-29
 - Where: `crates/blaze-engine/src/as_rustc.rs` and the daemon's socket in
   `crates/blaze-cargo/src/cargo/daemon.rs`. Coordinator's paths.
 - Why: the probe scripts are the largest group of scripts that can't be elided, and the
-  docs/v2/plan/goals/principles.md rule (everything is ours, for the best performance possible).
+  docs/v2/plan.md rule (everything is ours, for the best performance possible).
 
 > forwarded to codegen: `crates/blaze-engine/src/as_rustc.rs`.
 > forwarded to cargo: the daemon's socket in `crates/blaze-cargo/src/cargo/daemon.rs`.

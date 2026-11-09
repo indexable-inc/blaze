@@ -84,14 +84,14 @@ date: 2026-10-29
 
 > forwarded to core: `crates/blaze-core/src/fs.rs` is lane core's.
 
-## 4. docs/v2/plan/lanes/core.md's Windows section: how a process's end is heard
+## 4. docs/v2/plan.md's Windows section: how a process's end is heard
 
 - What: where it says the process's end is the job's `JOB_OBJECT_MSG_EXIT_PROCESS`, say
   instead: "a thread-pool wait on the process (`RegisterWaitForSingleObject`) posts its end to
   the port; the job's messages, which Windows does not promise to deliver, only say that the job
   went past its memory, and the driver then kills it". Also: "a memory-limited job's peak is at
   most its limit: Windows refuses any commit past it".
-- Where: `docs/v2/plan/lanes/core.md` and `~/restart-2026-10-28/briefs/v2/core-windows.md` (if
+- Where: `docs/v2/plan.md` and `~/restart-2026-10-28/briefs/v2/core-windows.md` (if
   that brief is kept as the record).
 - Why: the job's completion-port messages are documented as not guaranteed. A lost
   `EXIT_PROCESS` would leave a spawn in flight forever, while a wait on the process handle
@@ -105,6 +105,6 @@ same change); 2 (the file script runs on `Iocp` in `tests.rs`; the process scrip
 `iocp.rs` covers Windows processes); 3 (`fs.rs` on Windows re-exports `iocp::files`'s
 `write_atomically`, `rename`, `clone`, `set_mode` and `map`, so `Threads` and `Iocp` share one
 implementation; `files_end_as_on_threads` no longer special-cases the clone); 4 asked of the
-coordinator (core's request 7) and in docs/v2/plan/lanes/core/plane.md.
+coordinator (core's request 7) and in docs/v2/plan.md.
 
-> forwarded to coordinator: a lane's plan (`docs/v2/plan/lanes/core.md`) changes by request to the coordinator, not among the paths `requests` applies.
+> forwarded to coordinator: a lane's plan (`docs/v2/plan.md`) changes by request to the coordinator, not among the paths `requests` applies.

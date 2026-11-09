@@ -480,7 +480,7 @@ through `with_source_map` (`crates/hir-def/src/signatures.rs`, lane db). Asked:
 - Consumers that read maps on the build's path: `hir-ty-mir/src/mir/lower.rs:4471`,
   `mir/location.rs:45,71,342`, `mir/type_name.rs:914`, `mir/eval.rs:670`, `const_check.rs:100`
   (lane codegen). These turn HIR ids into positions for `Location`, panics and debug info; per
-  `docs/v2/plan/lanes/items.md` 6.1 positions are side-table references resolved at link time,
+  `docs/v2/plan/design/item-hash.md` 6.1 positions are side-table references resolved at link time,
   so MIR keeps the `ExprId`/`PatId` and the position is looked up from the map only when debug
   info, a panic location or a diagnostic is emitted. frontend sends that part to codegen.
 Why: a dependency's bodies (most of what a build lowers) never emit a diagnostic, so building
@@ -664,7 +664,7 @@ again and an old value exists. The comparison is then about 2 memcmp passes over
 about 0.1 cycles a byte against about 1.3 for one-chunk BLAKE3, and nothing is computed when the
 value is new. Being exact, it also can't collide and reuse a stale signature. Nothing calls
 `subtree_hash` from `signatures.rs`. The arithmetic is in
-`docs/v2/plan/lanes/db/speed-of-light.md`, section "hir-def signatures".
+`docs/v2/plan.md`, section "hir-def signatures".
 
 > forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).
 > mem-format-fwd: overtaken by `SignatureSyntax`/`FileOutline` comparing the tree by content (`FlatTree: PartialEq`); `signatures.rs` has no `tree_hash`. `body::subtree_hash` is now `tree.subtree_hash(at)` (`expr_store/body.rs` ~L491). Nothing to apply.
@@ -813,7 +813,7 @@ Status: done by speed-hir-defs-sigs. The section's "Now" bullet and summary row 
 lands.
 
 > forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).
-> mem-format-fwd: information, nothing to apply (a doc gap in `docs/v2/plan/lanes/db/speed-of-light.md`, closed by speed-hir-defs-sigs as the status line says).
+> mem-format-fwd: information, nothing to apply (a doc gap in `docs/v2/plan.md`, closed by speed-hir-defs-sigs as the status line says).
 
 ## speed-hir-sol-defs: for speed-hir-store (store bits upvars needs)
 
@@ -835,5 +835,5 @@ Costs are in `db/speed-of-light.md`, section "hir-def: attributes, interned locs
 > existing `expr_kind` column, no new stored bit) in `docs/v2/requests/mem-format.md`, "## speed-hir",
 > with the `upvars.rs` caller in `docs/v2/requests/db-expand.md`, "## speed-hir: four edits", item 3.
 > The second (a path's resolved local kept at lowering, rustc's `Res::Local`) changes lowering
-> and the store's encoding; it is listed as open in `docs/v2/plan/lanes/db/speed-hir.md`.
-> mem-format-fwd: the first bit is in, better than asked: `ExpressionStore::kinds_present()` is a `u64` with a bit per `ExprKind`, made once in `finish` and on decode, and `has_closures()` is one bit test (`expr_store.rs`). The `upvars.rs` caller is db's ("four edits" item 3). The second bit (rustc's `Res::Local` kept at lowering) is not applied. It is not a written change: lowering has no scopes today (`ExprScopes` is built from the finished store), so keeping it means resolving locals during lowering under macro hygiene, exactly as rustc does, plus a new persisted column. That needs its own design and differential tests, so it stays open in `docs/v2/plan/lanes/db/speed-hir.md`.
+> and the store's encoding; it is listed as open in `docs/v2/plan/design/frontend.md`.
+> mem-format-fwd: the first bit is in, better than asked: `ExpressionStore::kinds_present()` is a `u64` with a bit per `ExprKind`, made once in `finish` and on decode, and `has_closures()` is one bit test (`expr_store.rs`). The `upvars.rs` caller is db's ("four edits" item 3). The second bit (rustc's `Res::Local` kept at lowering) is not applied. It is not a written change: lowering has no scopes today (`ExprScopes` is built from the finished store), so keeping it means resolving locals during lowering under macro hygiene, exactly as rustc does, plus a new persisted column. That needs its own design and differential tests, so it stays open in `docs/v2/plan/design/frontend.md`.

@@ -1,4 +1,4 @@
-//! The VM as CI (docs/v2/plan/lanes/ci.md section 10).
+//! The VM as CI (docs/v2/plan.md section 10).
 //!
 //! A GitHub webhook ([`Event`]) opens a view of the pushed commit on the running daemon and
 //! sends it agent-API requests ([`blaze_api::Request`]): no runner, no cache transfer, no

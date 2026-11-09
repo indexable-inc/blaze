@@ -36,7 +36,7 @@ pub(crate) const ENABLE_WEBTRANSPORT: u64 = 0x2b60_3742;
 pub(crate) const WEBTRANSPORT_MAX_SESSIONS: u64 = 0xc671_706a;
 
 /// What a blaze endpoint advertises, in this order: what wtransport 0.7.2 sent, which Chrome's
-/// draft-02 and draft-07 clients take (docs/v2/plan/observe/http3-sans-io.md, section 4).
+/// draft-02 and draft-07 clients take (docs/v2/plan/design/http3-sans-io.md, section 4).
 pub(crate) const OURS: [(u64, u64); 6] = [
     (QPACK_MAX_TABLE_CAPACITY, 0),
     (QPACK_BLOCKED_STREAMS, 0),

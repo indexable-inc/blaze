@@ -28,7 +28,7 @@ What, in `crates/span/`:
 Why: `hir-def`'s `item_tree/items.rs` (the item tree kept beside salsa, frontend.md item 14)
 reads every top-level item's ast ids and anchors again on every edit, one hash probe and one
 binary search an item: about 13 µs of a keystroke's 18 µs for a 500-item file
-(`docs/v2/plan/lanes/frontend/speed-of-light.md`, frontend-deps-reparse item 4). With the two
+(`docs/v2/plan/design/frontend.md`, frontend-deps-reparse item 4). With the two
 arrays as slices, the slot keeps the last ones and compares the unchanged prefix's with one
 `memcmp` and the suffix's moved by the edit's length, about 0.3 µs, so an item wholly in an
 unchanged run needs no per-item read. Both are read-only views of what the maps hold; nothing
@@ -60,7 +60,7 @@ Status: open
 ## frontend-tree: hir-def item_tree/lower.rs: onto views (1)
 
 From `frontend-tree-move-def-items` (frontend.md item 16; notes
-`docs/v2/plan/lanes/frontend/tree-move-def-items.md`). The item tree's lowering walks borrowed
+`docs/v2/plan/design/frontend.md`). The item tree's lowering walks borrowed
 `Copy` views (`use syntax::view as ast;`) instead of counted handles: views by value, no clone,
 kind tags as `tag::X` (`use syntax::ast as tag;`). Keeps dedyn-def's shape (one attribute body
 for every node kind, thin `impl HasAttrs` shells), with the concrete `ast::AnyHasAttrs<'t>` in

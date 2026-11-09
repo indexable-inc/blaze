@@ -15,7 +15,7 @@
 //!
 //! Safe code only: reading mapped, untrusted bytes in place stays behind the check-then-view
 //! rule of docs/v2/plan/design/unsafe.md, and this never makes a view the checks don't cover.
-//! docs/v2/plan/lanes/dedup/cursor.md gives the bound.
+//! docs/v2/plan/design/data.md gives the bound.
 
 #![forbid(unsafe_code)]
 

@@ -6,7 +6,7 @@ date: 2026-10-29
 # Requests of db-ty-sol-lower
 
 Speed-of-light changes in files other agents are editing. The arithmetic is in
-`docs/v2/plan/lanes/db/speed-of-light-lower.md`. Each one keeps every answer the same: it only
+`docs/v2/plan.md`. Each one keeps every answer the same: it only
 moves a buffer from the heap to the stack or reuses a value already computed.
 
 ## 1. db-ty-d-lower: `crates/hir-ty/src/lower.rs`, four allocations per signature query

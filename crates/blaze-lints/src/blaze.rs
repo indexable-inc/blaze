@@ -1,6 +1,6 @@
 //! blaze's own lints, `blaze::`: what costs in hot code, the rules `tools/v2/hot_lint.py`
 //! checks by pattern, from types and resolutions instead
-//! ([docs/v2/plan/lanes/lints/blaze.md](../../../docs/v2/plan/lanes/lints/blaze.md)).
+//! ([docs/lints.md](../../../docs/lints.md)).
 //!
 //! The walk calls [`check_node`] on every node. A path type is checked where it is written
 //! (`default_hasher`'s type form); the calls of a body are checked once, from its root, over the
@@ -128,7 +128,7 @@ use crate::{check::Cx, diag::Applicability};
 
 macro_rules! docs {
     () => {
-        "https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan/lanes/lints/blaze.md"
+        "https://github.com/indexable-inc/blaze/blob/main/docs/lints.md"
     };
 }
 
@@ -141,7 +141,7 @@ macro_rules! general_docs {
 
 macro_rules! parallel_docs {
     () => {
-        "https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan/lanes/lints/parallel.md"
+        "https://github.com/indexable-inc/blaze/blob/main/docs/lints.md"
     };
 }
 
@@ -684,7 +684,7 @@ impl Lint {
             Lint::LenientDeserialize => concat!(docs!(), "#lenient_deserialize"),
             Lint::LockHeldAcrossSlow => concat!(docs!(), "#lock_held_across_slow"),
             Lint::FiberBoundary => {
-                "https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan/lanes/may-suspend/fiber-boundary.md"
+                "https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan.md"
             }
         }
     }

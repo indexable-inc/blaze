@@ -7,7 +7,7 @@ date: 2026-10-29
 ## mem-backend-cas: `Cargo.lock` for blaze-cas's new dependencies
 
 From `mem-backend-cas` (report `/tmp/blaze-lanes/v2-mem-backend-cas.md`, design
-`docs/v2/plan/lanes/mem/backend-cas.md`). `crates/blaze-cas/Cargo.toml` now depends on
+`docs/v2/plan/design/memory.md`). `crates/blaze-cas/Cargo.toml` now depends on
 `blaze-mem` and, for tests, `blaze-alloc-count`; both are workspace dependencies already. The
 lane may not run cargo, so `Cargo.lock` is not updated: its `blaze-cas` entry already lacks
 `blaze-reclaim`, `lz4_flex`, `rustc-hash` and `zstd`, so whoever next regenerates the lock file
@@ -612,7 +612,7 @@ undo it.
 
 blaze-cas's hand-written byte cursors move onto the one checked cursor,
 `blaze_format::cursor::{Reader, Put}` (crates/blaze-format/src/cursor.rs; API table and error
-mapping in docs/v2/plan/lanes/dedup/cursor.md). blaze-cas already depends on blaze-format, so
+mapping in docs/v2/plan/design/data.md). blaze-cas already depends on blaze-format, so
 no `Cargo.toml` change. No byte on the wire or on disk changes, so `FORMAT` and `VERSION`
 stay. Each read is one length compare and one load, and the error is built out of line, so the
 inlined read holds no `format!`. The old `Reader::take(len, what)` formatted its message in the
@@ -814,7 +814,7 @@ same.)
 They stay: `u32_at`, `u64_at`, `id_at` and `RecordHeader::{encode, decode}`,
 `pack_header`/`check_pack_header`, `decode_chunks` (`chunks_exact` over 40-byte refs) and
 `index.rs`'s rows. They are fixed-layout records and tables read at their offsets after one
-length check (docs/v2/plan/lanes/dedup/cursor.md, "What stays"), not cursors.
+length check (docs/v2/plan/design/data.md, "What stays"), not cursors.
 
 > applied by requests-cas: `disk.rs` as written. Import added (`blaze_format::cursor::{Put as _, Reader}`; it shadows nothing, since disk.rs doesn't import `crate::Reader`). `encode_chunk` and `Head::encode` are on `Put`. `Head::decode`'s four lists read through `Reader::starting_at(body, HEAD_FIXED)?`, with `?` going through `From<cursor::Error> for String`. `PACK_REF`, `DICTIONARY_REF`, `EXTERNAL_REF`, `UNIT_REF` and `id_at` are still used (capacity, the `want` check, `RecordHeader::decode`, `decode_chunks`, `index.rs`), so nothing is left unused. No byte of the head changes.
 

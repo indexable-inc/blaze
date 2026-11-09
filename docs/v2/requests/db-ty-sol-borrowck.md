@@ -6,7 +6,7 @@ date: 2026-10-29
 # Requests from db-ty-sol-borrowck
 
 All in `crates/hir-ty-borrowck/src/`, for db-ty-d-borrowck, who is editing these files now.
-Why: [speed-of-light-borrowck.md](../plan/lanes/db/speed-of-light-borrowck.md).
+Why: [speed-of-light-borrowck.md](../plan.md).
 
 ## 1. `check.rs`: the new `Loans` signatures (needed to build)
 

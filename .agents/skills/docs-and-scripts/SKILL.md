@@ -12,7 +12,7 @@ description: "Conventions for blaze's documents, scripts and agent-facing interf
 No MCP. Agent-facing interfaces are a Unix socket or HTTP with one versioned schema in deterministic
 CBOR; the CLI is a client of the same API.
 
-See [docs/roadmap.md#8-the-agent-api](../../../docs/roadmap.md#8-the-agent-api).
+See [docs/v2/plan.md](../../../docs/v2/plan.md).
 
 ## docs-say-what-they-are (rule 41)
 

@@ -53,7 +53,7 @@ the region walk's stacks on the stack); the manifest lint passes.
 > forwarded to db: `crates/hir/` and `crates/hir-ty-wfcheck/Cargo.toml` are lane db's (`smallvec` is a workspace dependency already).
 > checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir-ty-wfcheck/Cargo.toml:21` (`smallvec`); `Send + Sync` of `AnyDiagnostic` is held by the compiler: `crates/hir/src/check/bodies.rs:178` shares `OnceLock<Vec<AnyDiagnostic>>` slots with `Db::run_all`'s `F: Sync` task (`base-db/src/db.rs:313`).
 
-## 5. Lane db: name the techniques in `docs/v2/plan/lanes/db/query-database.md`
+## 5. Lane db: name the techniques in `docs/v2/plan.md`
 
 The notes are lane db's file; a paragraph for its front-end section:
 

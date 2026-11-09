@@ -1,4 +1,4 @@
-//! The plane's slots (docs/v2/plan/lanes/mem/core/plane.md): against the free lists they
+//! The plane's slots (docs/v2/plan/design/memory.md): against the free lists they
 //! replaced over seeds, a stale task handle refused, and a warm request allocating nothing but
 //! its one payload.
 

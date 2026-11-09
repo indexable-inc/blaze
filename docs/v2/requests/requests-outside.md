@@ -6,7 +6,7 @@ date: 2026-10-29
 # Requests of requests-outside (child of `requests`): usercode.md section 11
 
 What blaze-vfs now gives (`crates/blaze-vfs/src/outside.rs`, notes in
-`docs/v2/plan/lanes/vfs/outside.md`), re-exported from the crate root:
+`docs/v2/plan/design/vfs.md`), re-exported from the crate root:
 
 - `blaze_vfs::generation() -> u64`: one acquire load.
 - `blaze_vfs::unchanged_since(path: &Path, generation: u64) -> bool`: no lock, no allocation;
@@ -35,7 +35,7 @@ What:
   answer under that generation with `blaze_vfs::cover(path)` (a `Cover<'static>`, 16 bytes,
   `Copy`; `None` means no directory above it is wanted, so don't vouch). A check through a
   `Cover` is three loads with no hashing and no ancestor walk
-  (docs/v2/plan/lanes/vfs/speed-of-light-outside.md section 1); `unchanged_since(path, g)` by
+  (docs/v2/plan/design/vfs.md section 1); `unchanged_since(path, g)` by
   path hashes the path and is for cold callers only. Call `want` before `cover` on a miss, so
   the cover is the directory just wanted, or the one above it.
 - Record an answer as one the table may vouch for only when `path` is canonical (no symlink in

@@ -252,7 +252,7 @@ which includes every integer and float literal (through the per-expression `is_n
 That is rustc's behavior, so the rounds can't be skipped. But most of them find nothing new:
 about 35K of the 42K cycles a typical body spends on obligations goes to rounds over stalled
 obligations that nothing has unblocked. Arithmetic in
-`docs/v2/plan/lanes/db/speed-of-light-infer.md` (obligations and rounds).
+`docs/v2/plan.md` (obligations and rounds).
 
 1. **Return at once from an empty round** (`fulfill.rs`; needs part a from
    db-ty-port-infer-next2, told by tmux):

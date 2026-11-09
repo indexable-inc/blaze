@@ -326,7 +326,7 @@ jobs:
   # keep warm for it. Each package's default targets: blaze's check of test targets fails for
   # now ("can't find crate for `test`"), so tests are counted once it passes. No baseline is
   # made yet, as blaze cannot yet finish this check of its own workspace, so the job fails until
-  # a run does and makes them (docs/v2/plan/lanes/lints.md#baselines).
+  # a run does and makes them (docs/lints.md).
   lint-baselines:
     name: lint baselines
     needs: changes

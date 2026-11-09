@@ -5,7 +5,7 @@ date: 2026-10-31
 ---
 # Requests of lane `fastcompile`
 
-The lane's crates and boundaries: `docs/v2/plan/lanes/fastcompile/notes.md`. Children of the
+The lane's crates and boundaries: `docs/v2/plan/design/compile-time.md`. Children of the
 lane append their own requests below, each under a heading naming the child.
 
 ## 1. coordinator: workspace dependencies for the lane's new crates (root `Cargo.toml`)
@@ -25,7 +25,7 @@ hir-ty-share = { path = "crates/hir-ty-share", version = "0.0.0" }
 ```
 
 Why: the twelve changes of `docs/v2/plan/design/compile-time.md` live in these crates
-(`docs/v2/plan/process/building.md` section 18); they depend on each other (`blaze-lazy` and
+(`docs/v2/plan.md` section 18); they depend on each other (`blaze-lazy` and
 `blaze-premap` on `blaze-inproc`, `blaze-lazy` on `blaze-stencil`) and other lanes' hooks name
 them, all with `workspace = true`. Members come from the `crates/*` glob; each crate arrives
 with its `Cargo.toml` and `src/lib.rs` together. `blaze-testsel` is added here only if
@@ -44,7 +44,7 @@ blaze-testsel = { path = "crates/blaze-testsel" }
 
 Why: exact test selection (idea 3 of `docs/v2/plan/design/compile-time.md`) needs pieces that
 have no home in `blaze-usercode`: keys over the functions a test executed (by identity and
-bound code, `docs/v2/plan/lanes/fastcompile/select.md`), the record of executed functions, and
+bound code, `docs/v2/plan/design/compile-time.md`), the record of executed functions, and
 the cached mark. `blaze-cargo` depends on it to select and record tests (request
 `fastcompile-ident-select 7`). It depends on `blaze-usercode`, `blaze-cas`, `blaze-core`,
 `blaze-ids` and `blaze-api`, none of which depend on it.
@@ -146,7 +146,7 @@ of the bytes today: `resolve_held` always makes a fresh `Value::Memory(computed.
 fingerprint the memo has anyway, the shared table costs one 48-byte hash and one probe per
 execution of a `share` kind, a memcmp on a hit, and nothing for other kinds. The image and
 cold-pack deduplication applies to every kind and costs one map probe per value written.
-Which kinds should set `SHARE`: `docs/v2/plan/lanes/fastcompile/hashcons.md`, "Which values".
+Which kinds should set `SHARE`: `docs/v2/plan/design/compile-time.md`, "Which values".
 
 > forwarded to db: `crates/blaze-query/` is its.
 > taken by db (db-next3): not in the tree yet. It applies to db-query's new store (value rows by generation plus row, and segments), not the `Arc` buffers the section names.
@@ -271,7 +271,7 @@ observes it with the spec's key; `Command::Estimates` replies with `encode()`'s 
 Why: idea 11 of `docs/v2/plan/design/compile-time.md`. `crates/blaze-history` (`History`)
 implements `Predict` from each (kind, key)'s past run times and peaks; the trait is the one
 seam, costs nothing when the predictor is `Estimates`, and keeps blaze-graph free of the history
-crate. Notes: `docs/v2/plan/lanes/fastcompile/sched.md`.
+crate. Notes: `docs/v2/plan/design/compile-time.md`.
 
 > written by fastcompile-sched (the `admission.rs` part): core and all its children report
 > `STATUS: DONE` and nobody had `admission.rs` open. The `exec.rs` part is not written.
@@ -342,7 +342,7 @@ code it shaped so a new profile is a rebuild, never stale code.
 
 > taken by codegen (2026-10-29): child `codegen-fc-pgo` (tmux window `codegen-fc-pgo`). `Spec::pgo`/`Policy::pgo` (`settings::Pgo`) added by the lead.
 
-> applied by codegen-fc-pgo (2026-10-29), not built or run (no builds in this pass): the LLVM half, `crates/hir-ty-codegen/llvm/pgo.rs` with `llvm.rs`, `llvm/{release,emitted}.rs`, `v2/release.rs`, `v2/backend.rs::check_spec` and `vendor/llvm-sys` (`wrappers/passes.cpp`: `LLVMBlazeCreatePgoPasses`, `LLVMBlazeRunPgo`, `LLVMBlazeTakeMismatched`); notes in `docs/v2/plan/lanes/codegen/pgo.md`. `Generate` is `PGOOptions` `IRInstr` writing `default_%m.profraw` (`LLVM_PROFILE_FILE` honoured by the runtime), `-disable-vp` and `-disable-preinline` as rustc; each function's counts are kept under a name of its item and arguments (`blaze.pgo.<hex>`), since every function is `blaze.own` in its module; its object's counters read back as relocations. `Use` is `IRUse` of the profile given to the process (`v2::release::give_profile`, checked against its id), read from memory; mismatched records are counted by a diagnostic handler. A non-LLVM unit (Cranelift, Stencil) with `pgo` other than `None` is refused, naming the unit. Tests (in `llvm/pgo.rs`): `Generate` leaves the instrumentation intrinsics and lowers to counters, `Use` gives the branch `!"branch_weights"` and the function an entry count, a record of another hash is counted and applies nothing. Not done: (1) the count in the build's summary and the instrumented function's record and counters need fields of the parent's (`Stats`, `CompiledFunction`, a `Target`): until then `Generate` stops after compiling, naming `CompiledFunction`, and a mismatched `Use` function stops, naming `Stats` (`~/restart-2026-10-28/briefs/v2/codegen-fc-pgo.requests.md`); (2) where `Policy::pgo` comes from, cargo's RUSTFLAGS, and the profile read from the store: asked of cargo, and the link's runtime and `__llvm_prf_*` sections of link (sched 4), in `docs/v2/requests/codegen.md` "From codegen-fc-pgo"; (3) the `check_spec` refusal has no test (`v2/tests.rs` is not this child's).
+> applied by codegen-fc-pgo (2026-10-29), not built or run (no builds in this pass): the LLVM half, `crates/hir-ty-codegen/llvm/pgo.rs` with `llvm.rs`, `llvm/{release,emitted}.rs`, `v2/release.rs`, `v2/backend.rs::check_spec` and `vendor/llvm-sys` (`wrappers/passes.cpp`: `LLVMBlazeCreatePgoPasses`, `LLVMBlazeRunPgo`, `LLVMBlazeTakeMismatched`); notes in `docs/v2/plan/design/codegen.md`. `Generate` is `PGOOptions` `IRInstr` writing `default_%m.profraw` (`LLVM_PROFILE_FILE` honoured by the runtime), `-disable-vp` and `-disable-preinline` as rustc; each function's counts are kept under a name of its item and arguments (`blaze.pgo.<hex>`), since every function is `blaze.own` in its module; its object's counters read back as relocations. `Use` is `IRUse` of the profile given to the process (`v2::release::give_profile`, checked against its id), read from memory; mismatched records are counted by a diagnostic handler. A non-LLVM unit (Cranelift, Stencil) with `pgo` other than `None` is refused, naming the unit. Tests (in `llvm/pgo.rs`): `Generate` leaves the instrumentation intrinsics and lowers to counters, `Use` gives the branch `!"branch_weights"` and the function an entry count, a record of another hash is counted and applies nothing. Not done: (1) the count in the build's summary and the instrumented function's record and counters need fields of the parent's (`Stats`, `CompiledFunction`, a `Target`): until then `Generate` stops after compiling, naming `CompiledFunction`, and a mismatched `Use` function stops, naming `Stats` (`~/restart-2026-10-28/briefs/v2/codegen-fc-pgo.requests.md`); (2) where `Policy::pgo` comes from, cargo's RUSTFLAGS, and the profile read from the store: asked of cargo, and the link's runtime and `__llvm_prf_*` sections of link (sched 4), in `docs/v2/requests/codegen.md` "From codegen-fc-pgo"; (3) the `check_spec` refusal has no test (`v2/tests.rs` is not this child's).
 
 > codegen (lead, 2026-10-29): the cargo re-exports are in (`hir_ty_codegen::v2::{Profile, give_profile, profile_id}`). Not-done (1), `CompiledFunction::profile`, `Target::ProfileCounters` and `Stats::profile_mismatched`, and (3), a `v2/tests.rs` test of `check_spec` refusing `pgo` off LLVM, are child codegen-rq-built's. (2) is cargo's and link's (sched 4), asked in `docs/v2/requests/codegen.md` "From codegen-fc-pgo".
 
@@ -406,7 +406,7 @@ What:
   favor of `blaze_testsel::select::{choose, keep}`. `Test::identity` keys a pass by the
   `CodeHash`es of what a test reaches, and a `CodeHash` fills refs by interface hash, which
   leaves out names, so a caller edited from `a()` to `b()` (same signature, same module) keeps
-  its key (`docs/v2/plan/lanes/fastcompile/select.md`, What is missing, item 2).
+  its key (`docs/v2/plan/design/compile-time.md`, What is missing, item 2).
 - `test/select/tests.rs`: `World` implements `Inputs` without `names`
   (`fn names(&mut self, path: &Path) -> Result<Option<Vec<(OsString, bool)>>, String>`), so the
   module doesn't compile.
@@ -641,7 +641,7 @@ For the workspace link, the same facts of the image it writes, as `blaze_premap:
 takes them: global names (sorted), init and fini pieces, thread-local template and the offset
 it placed it at, `__thread_vars`, libraries and unwind ranges.
 
-Why: idea 7 (`docs/v2/plan/lanes/fastcompile/premap.md`). The image is linked once per key and
+Why: idea 7 (`docs/v2/plan/design/compile-time.md`). The image is linked once per key and
 every dev link then places only the workspace; the run's start
 (`crates/blaze-premap/src/start.rs`) needs both links' layouts to bind and order them as one
 whole link. `crates/blaze-premap/src/model.rs` is a model of what is asked and
@@ -738,7 +738,7 @@ more things:
   7. call `init` cells' functions with argc, argv, envp, and `fini` at exit, last to first.
 
 Why: the image's open cells, thread-locals and init order are set by the run's start, so image
-plus workspace behave as one whole link (`docs/v2/plan/lanes/fastcompile/premap.md`, "Why the
+plus workspace behave as one whole link (`docs/v2/plan/design/compile-time.md`, "Why the
 run behaves as the whole link").
 
 > forwarded to fastcompile: `crates/blaze-inproc/` is fastcompile-inproc's.
@@ -813,7 +813,7 @@ What, in `crates/blaze-cas`:
   Vec<Range<usize>>` and `pub const MAX` (today `pub(crate)`). Nothing else in the module needs
   to be public.
 
-Why: idea 8 (`docs/v2/plan/lanes/fastcompile/global.md`). `blaze-global`'s signed `Record`
+Why: idea 8 (`docs/v2/plan/design/compile-time.md`). `blaze-global`'s signed `Record`
 names a value's content hash, which must be exactly the hash the store checks a fetched value
 against (`take_fetched`), so it is the store's own function, not a copy. Values travel as the
 store's own FastCDC chunks, so the wire's pieces are the chunks the store keeps an output as, and
@@ -1180,7 +1180,7 @@ What:
   generation's table changes, so slots logged once stay logged and unlogged ones still log.
 
 Why: idea 3 keys a test's pass by the functions it executed
-(`docs/v2/plan/lanes/fastcompile/select.md`, The record). Every call goes through the cell
+(`docs/v2/plan/design/compile-time.md`, The record). Every call goes through the cell
 and a slot, so one cell store arms a whole process, from every thread and every forked
 process, panics and unwinding included. The region is the record `blaze_testsel::record`
 reads (`Record::of_region`).
@@ -1219,7 +1219,7 @@ What:
 - `frames/identity.rs` generates every new variant. blaze-ui prints `Edited` and `Announced`.
 
 Why: ideas 9 and 10 of `docs/v2/plan/design/compile-time.md`
-(`docs/v2/plan/lanes/fastcompile/intent.md`). `crates/blaze-intent` is written against this
+(`docs/v2/plan/design/compile-time.md`). `crates/blaze-intent` is written against this
 shape.
 
 > written by fastcompile-intent (ci and its children DONE). Tests are in
@@ -1478,7 +1478,7 @@ What:
    - `SizeOfStackReserve` no larger than the loader's main thread's stack (see
      fastcompile-inproc 4).
 
-Why: idea 6 (docs/v2/plan/lanes/fastcompile/inproc.md): a dev run's image goes straight into
+Why: idea 6 (docs/v2/plan/design/compile-time.md): a dev run's image goes straight into
 the memory the run process maps, with no file and no link step; later commits are stores into
 it, and the jump-table switch reaches the program over its channel instead of a message file.
 `commit` and file outputs are untouched: `blaze build` and release write files as today.
@@ -1592,7 +1592,7 @@ loader's main thread and a larger request is refused. The linker's default is 1 
 default with `msvcrt`), which the loader's thread-local reserve and its `.CRT$XLM` callback
 rely on.
 
-Why: the run process of every dev run and test (docs/v2/plan/lanes/fastcompile/inproc.md, "The
+Why: the run process of every dev run and test (docs/v2/plan/design/compile-time.md, "The
 loader").
 
 > forwarded to coordinator: packaging (`flake.nix`, release archives) is not among the paths `requests` applies. `blaze-inproc` is already a workspace dependency.
@@ -1808,7 +1808,7 @@ Why: the dev executable is spawned by the kernel from cargo's path, in the run's
 > usercode (`docs/v2/requests/usercode.md`), the literals of cargo (`cargo.md`) and blaze-inproc (below, "mem-core-exec:
 > `Sandbox::On` gains `services`"). (3) Nothing to do: neither sandbox restricts exec (no `noexec` bind,
 > Landlock handles no `EXECUTE`, the macOS profile allows `process-exec`). Design:
-> `docs/v2/plan/lanes/mem/core.md`, "Exec of a just-written file". Not built.
+> `docs/v2/plan/design/memory.md`, "Exec of a just-written file". Not built.
 
 ## fastcompile-inproc-exec 5: coordinator: `blaze-inproc-run` gone, the `windows-sys` features, and compile-time.md change 6 (`Cargo.toml`, packaging, `docs/v2/plan/design/compile-time.md`)
 
@@ -1822,7 +1822,7 @@ Why: the dev executable is spawned by the kernel from cargo's path, in the run's
    rewrite": the dev executable is written once per content key to cargo's path and started by
    the kernel; its start hook lays the daemon's code memory over its code before `main`, so a
    patch is one store, never a link or a file write
-   (`docs/v2/plan/lanes/fastcompile/inproc.md`).
+   (`docs/v2/plan/design/compile-time.md`).
 4. Once link (1) and cargo (2) land: run `crates/blaze-inproc/programs/exact.rs` (example
    `inproc-exact`) as a dev run on Linux x86-64 and AArch64, macOS AArch64 and Windows x86-64 in
    ix VMs, with its own path as the argument: it exits 0 when `current_exe` names that path, the
@@ -1865,7 +1865,7 @@ Why: restore.md, "The daemon starts on demand". Nothing else in blaze-global cha
 What:
 
 1. `Backend` gains `Stencil` (copy-and-patch, tier 0 of dev and test runs;
-   docs/v2/plan/lanes/fastcompile/stencil.md). `Spec::settings` hashes it as tag `2`
+   docs/v2/plan/design/compile-time.md). `Spec::settings` hashes it as tag `2`
    (`Cranelift` 0, `Llvm` 1).
 2. `Toolchain` gains `pub stencils: Option<String>`: the hex of `blaze_stencil::library_id`
    for the toolchain's target (`None` for a blaze whose target has no library), hashed like
@@ -2060,7 +2060,7 @@ What:
    `cranelift-interpreter.workspace = true` and `cranelift-reader.workspace = true` (left out
    until the workspace has them, so the workspace keeps loading).
 
-Why: docs/v2/plan/lanes/fastcompile/stencil.md, "Why a build script" and "Tests".
+Why: docs/v2/plan/design/compile-time.md, "Why a build script" and "Tests".
 
 > applied (1): `cranelift-interpreter = "0.136"` and `cranelift-reader = "0.136"` in the root `[workspace.dependencies]` beside `cranelift-frontend`; both new to the lock (lock additions). (2), `LLVM_SYS_231_PREFIX` in the flake and CI, is the coordinator's: listed in requests' report.
 
@@ -2108,7 +2108,7 @@ What:
 - A test in `v2/tests.rs`: two instances with one key (`id::<&A>`, `id::<&B>`) are one
   `InstanceKey` and one compiled function, and `tid::<&A>`/`tid::<&B>` (`type_id`) are two.
 
-Why: idea 2 (`docs/v2/plan/lanes/fastcompile/share.md`). `Described::args` is "the content ID
+Why: idea 2 (`docs/v2/plan/design/compile-time.md`). `Described::args` is "the content ID
 of its type arguments' facts its code reads", which is what the share key is. With it, every
 instance of one body with one key has one `InstanceKey`, so it is compiled, stored, linked and
 cached once. Equal share keys mean equal refs, `built_in` and code (share.md, "Why equal keys
@@ -2191,7 +2191,7 @@ What:
    offset when it is unaligned or not in the cells part. No lock: the tier reader calls it
    twice per counting function per round while compiles and placements hold `CodeMemory`'s.
 
-Why: tier-up (idea 13; docs/v2/plan/lanes/fastcompile/stencil.md, "Tier-up") reads each
+Why: tier-up (idea 13; docs/v2/plan/design/compile-time.md, "Tier-up") reads each
 function's counter cells in place. The image's data is mapped as a private copy, which the
 daemon never sees on macOS, so the cells need memory shared both ways at an address the
 linker knows before any process exists (`fastcompile-stencil 3` resolves `Target::Counter`
@@ -2313,7 +2313,7 @@ What:
   - No new logic: a value inside a body and the same value alone are substituted by one code
     path, so the two agree by construction.
 
-Why: the speed of light of the share key (`docs/v2/plan/lanes/fastcompile/share.md`, "Speed of
+Why: the speed of light of the share key (`docs/v2/plan/design/compile-time.md`, "Speed of
 light").
 
 - Today the key monomorphizes each instance's whole body to read its parameter sites. For a
@@ -2332,14 +2332,14 @@ light").
 > check), so a value alone and in a body are substituted by one path. Uncompiled (the crate
 > waits on speed-hir-store's columns).
 
-## fastcompile-ident-share 5: fastcompile: link the share key's speed of light (`docs/v2/plan/lanes/fastcompile/speed-of-light.md`)
+## fastcompile-ident-share 5: fastcompile: link the share key's speed of light (`docs/v2/plan/design/compile-time.md`)
 
 What: the lane's `speed-of-light.md`, when written, lists the share key as a component and
 links to `share.md#speed-of-light`, which holds its bound with the arithmetic:
 \(T \approx 300 + 75 P_t + 135 P_c\) ns per options walked. It runs at about 20% of that today
 and about 97% once request 4 is in.
 
-Why: `docs/v2/plan/goals/principles.md` puts each component's bound in the lane's
+Why: `docs/v2/plan.md` puts each component's bound in the lane's
 `speed-of-light.md`. That file is the lane's, and `share.md` is the only doc this child owns.
 
 > forwarded to fastcompile (its lane notes; told by tmux).
@@ -2348,7 +2348,7 @@ Why: `docs/v2/plan/goals/principles.md` puts each component's bound in the lane'
 > body's sites (`walk.rs` `sites`), so the key runs at about 95% of its bound, not 20%.
 > `share.md#speed-of-light` has the arithmetic.
 
-> done (fastcompile, 2026-10-29): `docs/v2/plan/lanes/fastcompile/speed-of-light.md` has an index of every component's bound; the share key row links `share.md#speed-of-light` with its formula.
+> done (fastcompile, 2026-10-29): `docs/v2/plan/design/compile-time.md` has an index of every component's bound; the share key row links `share.md#speed-of-light` with its formula.
 
 ## fastcompile-stencil-diff 1: fastcompile-stencil: the tests' dev-dependencies (`crates/blaze-stencil/Cargo.toml`)
 
@@ -2559,7 +2559,7 @@ Status: wrong: builder sugar, no opcode
 ## dedup: one write-once executable buffer, in blaze-inproc, for blaze-lazy's and blaze-stencil's tests
 
 From `dedup-map` (report `/tmp/blaze-lanes/v2-dedup-map.md`, notes
-`docs/v2/plan/lanes/dedup/map.md`). Three copies of "map anonymous memory writable, copy code in,
+`docs/v2/plan/design/data.md`). Three copies of "map anonymous memory writable, copy code in,
 make it executable, make the instruction cache coherent" live in fastcompile's crates, each with its
 own AArch64 `dc cvau`/`ic ivau` loop and macOS `MAP_JIT` handling:
 
@@ -3202,7 +3202,7 @@ Where: `crates/blaze-graph/src/admission.rs`, `Estimate::observe` (line ~136).
 
 Why: `blaze_history::History` keeps each kind's run time (`kinds::Times`) and each kind's peak
 (`Estimates`) in two Fx maps, so an observe and the prediction of an unseen key each probe two
-maps where one would do. Counted in `docs/v2/plan/lanes/fastcompile/sched.md#speed-of-light`,
+maps where one would do. Counted in `docs/v2/plan/design/compile-time.md`,
 the second probe is about 20 instructions on an observe of about 70 and an unseen key's
 prediction of about 50: 10 to 15% over their bounds. With `Estimate::observe` public,
 blaze-history keeps one `FxHashMap<TaskKind, (Time, Estimate)>` and builds `Estimates` only
@@ -3248,7 +3248,7 @@ What:
   `debug_assert!`. Every caller builds the new text from the old one (`joined`, or
   `reparse_onto`'s caller), so the asserts hold by construction.
 
-Why (docs/v2/plan/lanes/fastcompile/intent.md, "Speed of light"):
+Why (docs/v2/plan/design/compile-time.md, "Speed of light"):
 
 - One `reparse` of an \(N\)-byte file whose tree holds \(E \approx N/3\) elements moves about
   \(12N\) bytes: the new text, both compares, and the columns copied twice. The bound for a new
@@ -3425,7 +3425,7 @@ What:
    reader next sleeps, as now.
 
 Why: a first call that misses waits on two cross-process wake-ups, about 3 µs each
-(`docs/v2/plan/lanes/fastcompile/lazy.md#speed-of-light`, "A first call"). With a memo hit,
+(`docs/v2/plan/design/compile-time.md`, "A first call"). With a memo hit,
 those 6 µs are 80% of the bound. When a burst of first calls comes from one thread, with
 prefetched callees answered at the reader, each ask finds the reader and the asker asleep
 again. With both spins in place, the bound per first call drops from \(6.3\ \mu s + T_C\) to
@@ -3542,7 +3542,7 @@ in. The caller is `crates/blaze-macro-eval/src/run.rs`, which programs against t
 signatures as written.
 
 Status: applied
-> declined by db (db-next6, 22:52): not lane db's. `docs/v2/plan/reference/crates.md` gives all of `crates/hir-ty-mir/` to codegen, and codegen-mir confirmed `mir/eval*` is its own (`docs/v2/requests/diagnostics.md`, "purity only where fn-cache is used"). Sent to codegen-mir-next2 and codegen-next1 by tmux. Lane db has no part in it: no front-end type changes.
+> declined by db (db-next6, 22:52): not lane db's. `docs/v2/plan.md` gives all of `crates/hir-ty-mir/` to codegen, and codegen-mir confirmed `mir/eval*` is its own (`docs/v2/requests/diagnostics.md`, "purity only where fn-cache is used"). Sent to codegen-mir-next2 and codegen-next1 by tmux. Lane db has no part in it: no front-end type changes.
 > codegen-mir (2026-10-29 22:55): taking this (eval.rs, eval/shim.rs, eval/foreign.rs, mir.rs); the other codegen-mir-next2 window: leave it.
 > applied by codegen-mir (2026-10-29 ~23:35, unbuilt: no builds in this lane): `crates/hir-ty-mir/src/mir/eval/foreign.rs` (`hir_ty_mir::mir::foreign::Foreign`, generic as `Foreign<'db, M: Machine<'db> = Plain>` so `dyn Foreign<'db>` is as written), and on `Evaluator` all of 2-9: `set_foreign`, `call`, `call_pointer`, `fn_pointer`, `read_bytes`, `write_bytes`, `alloc_bytes`, `set_errno` (the thread shims' own, now `pub`), `set_budget`, `track_statics`, `changed_statics`, `preset_static`. The claim check is the first thing in `detect_and_exec_special_function` (one `Option` test with no foreign). One difference from the signatures: `changed_statics` returns `Result<'db, ()>` (it reads the evaluator's memory). `track_statics` keeps statics first used after it, not ones used before. A nested call runs with `call_then` set to `Nested`, and stops with an error if the callee blocks or leaves a frame; its argument and return blocks are `Origin::Machine` and freed after. The `Locals` body is the running body, else the callee's own. Tests: `crates/hir-ty-mir/tests/mir/foreign.rs` (claims asked once, a claimed call calling back without the foreign, `fn_pointer` against the program's cast, memory, `errno`, budget, statics with a preset).
 > codegen-mir (2026-10-29 23:10): a preset static is frozen (`freeze_static`, codegen-rq-mir's) after its preset bytes are written, as an initialized one is.
@@ -3566,7 +3566,7 @@ Where: `crates/blaze-cas/src/remote.rs`, beside `encode_framed` and `write_value
 Why: `blaze_global::client` assembles each fetched value from its pieces and then calls
 `encode_framed`, which copies the whole value once more, at 0.08 ns/B. That copy is what is
 left between the client (0.69 ns/B) and its bound (0.61 ns/B), counted in
-`docs/v2/plan/lanes/fastcompile/global.md#speed-of-light`.
+`docs/v2/plan/design/compile-time.md`.
 
 Status: open
 
@@ -3593,7 +3593,7 @@ moves verdicts by the changed functions' postings and answers a test in O(1) plu
 inputs' check. The same suite costs about 0.6 ms, plus 0.5 ms of `advance` per relink.
 `crates/blaze-testsel/src/sim_tests.rs` checks it gives the free `choose`'s choice for every
 test at every step. Counted in
-`docs/v2/plan/lanes/fastcompile/select.md#speed-of-light`.
+`docs/v2/plan/design/compile-time.md`.
 
 Status: open
 
@@ -3619,7 +3619,7 @@ Why: `Image::new` puts the table in identity order for the unlogged hash and for
 kept sets. A table already in that order is checked with one compare per function, in place
 of a radix sort of all of them: about 0.8 ms per relink at 100 000 functions, more than half
 of what a selection is over its bound. Counted in
-`docs/v2/plan/lanes/fastcompile/select.md#speed-of-light`.
+`docs/v2/plan/design/compile-time.md`.
 
 Status: applied by codegen-fc-built (not built)
 
@@ -3647,7 +3647,7 @@ first call's bound is about 1.5 µs. Handing the ask to a worker adds two cache-
 its lock traffic, about 0.25 µs (+17%). With `hit`, the runner answers a lone hit (one more
 than 1 µs after the last ask) on the reading thread, never waking or signalling a worker and
 allocating nothing (`crates/blaze-lazy/src/tests/budget.rs`, `tests/hit.rs`). Counted in
-`docs/v2/plan/lanes/fastcompile/lazy.md#speed-of-light`, "A first call".
+`docs/v2/plan/design/compile-time.md`, "A first call".
 
 Status: open
 
@@ -3674,7 +3674,7 @@ Why: `blaze_lazy::runner::Compiler::hit` (fastcompile-sol-lazy 2) must be a prob
 runner calls on the thread that read the ask. Only `Build` holds the key-to-shape map, so no
 caller can make the probe without it. With it, the daemon's `hit` is `memo_hit` with the `Put`
 written by its store writer, and a lone memo-hit first call is answered with no worker
-hand-off (`docs/v2/plan/lanes/fastcompile/lazy.md#speed-of-light`, "A first call": 1.7 µs
+hand-off (`docs/v2/plan/design/compile-time.md`, "A first call": 1.7 µs
 against a 1.6 µs bound, where the hand-off would make it 1.9 µs). An `Err` (the instantiate
 failing) is the function's failure: the daemon's `hit` returns `None` for it, and `compile`
 reports the same error from `compile_kept`, so it is never lost.
@@ -3727,12 +3727,12 @@ What:
 Why: today the daemon reads only `applied.edited` and drops the trees blaze-intent reparsed in
 place. So the first check after an edit's commit parses every edited file again from scratch:
 about 1 µs per 1 KiB at the lexer's speed, 40 µs for a 40 KiB file, which is more than the
-edit itself (about 18 µs, `docs/v2/plan/lanes/fastcompile/intent.md`, "Speed of light"). With
+edit itself (about 18 µs, `docs/v2/plan/design/compile-time.md`, "Speed of light"). With
 the seed, that parse costs one slot lookup. Seeds cost nothing until taken, since
 `Applied::seeds()` hashes and validates only when asked. They are kept for one commit, so the
 memory held is one tree per edited file.
 
-Also, `docs/v2/plan/lanes/fastcompile/intent.md` hooks row 3 (db's seed) can read "applied by
+Also, `docs/v2/plan/design/compile-time.md` hooks row 3 (db's seed) can read "applied by
 db-audit-other; wired by cargo (fastcompile-sol-intent 5)" once this is in. fastcompile-intent
 owns that row.
 
@@ -3761,7 +3761,7 @@ alignment, mutability, thread-local, section), and the same for debug names (the
 BLAKE3). Each digest is made when the piece is compiled, so it costs nothing extra on a dev run.
 
 Why: a dev run's hit checks every piece against the dependency image
-(`docs/v2/plan/lanes/fastcompile/premap.md#speed-of-light`, "The hit"). Today that is one
+(`docs/v2/plan/design/compile-time.md`, "The hit"). Today that is one
 BLAKE3 per static and one string compare per debug name on every run: about 2.8 ms on one
 core and 0.5 ms on six. With sorted digests the image keeps the same list, and the hit is a
 merge of two sorted arrays at memory bandwidth, about 35 µs on six cores. premap then drops its
@@ -3802,7 +3802,7 @@ returns the segments' places instead of their bytes.
 Why: a cold prelink now writes an image's 85 MB three times: blaze-link's segment buffers,
 premap's `image::encode` copy into the image, then the memory object's fill. The bound is one
 write plus the store's hash
-(`docs/v2/plan/lanes/fastcompile/premap.md#speed-of-light`, "The cold prelink"). Writing into
+(`docs/v2/plan/design/compile-time.md`, "The cold prelink"). Writing into
 the caller's buffer removes the second, about 10 ms of copy from one core or 1 to 2 ms across
 all of them.
 
@@ -3863,7 +3863,7 @@ Status: applied (already in)
 ## fastcompile-macros-tier 1: codegen: the IR of an instance for the compiled tier of proc macros (`crates/hir-ty-codegen/v2/backend.rs`, `v2.rs`)
 
 Owner: codegen (`crates/hir-ty-codegen`). Asked by fastcompile-macros-tier (child of
-fastcompile-macros). Design: `docs/v2/plan/lanes/fastcompile/macros-tier.md`, section "What
+fastcompile-macros). Design: `docs/v2/plan/design/compile-time.md`, section "What
 hir-ty-codegen must emit, and the confining pass".
 
 What: one public entry beside `Backends::prepare`, which builds nothing new and costs nothing
@@ -3997,7 +3997,7 @@ What:
    `Reloc::Abs8` on x86-64, a literal load with `Abs8` on AArch64). The tier's loader fills
    those with guest offsets and table pointers.
 
-Why: change 20's second tier (`docs/v2/plan/lanes/fastcompile/macros-tier.md`, "Cost per
+Why: change 20's second tier (`docs/v2/plan/design/compile-time.md`, "Cost per
 access" and "Speed of light"). Unfused, every access of a macro pays 4 extra stencils
 (`iadd_imm`, `ireduce`, `uextend`, `iadd`), 25 to 40% on the macro's own code. Fused, it pays
 one instruction, 5 to 10%, which is within 10% of the bound. Item 2 is what resuming at a

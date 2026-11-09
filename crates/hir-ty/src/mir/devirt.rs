@@ -3,7 +3,7 @@
 //! that list is all there can be. The code generator learns it from the walk of everything a
 //! final binary reaches and gives it here ([`give`]); `hir-ty-mir`'s `Devirtualize` pass reads
 //! it by its content ID, which is in the [`super::MirOptions`] of the body
-//! (docs/v2/plan/lanes/codegen/devirt.md).
+//! (docs/v2/plan/design/devirt.md).
 //!
 //! The facts are keyed as the code generator keys a vtable: the principal trait reference with
 //! every free region erased, bound regions anonymized and projections normalized

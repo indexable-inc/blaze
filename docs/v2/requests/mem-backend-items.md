@@ -6,7 +6,7 @@ date: 2026-10-29
 ## mem-backend-items: `Cargo.lock` for blaze-items's new dependencies
 
 From `mem-backend-items` (report `/tmp/blaze-lanes/v2-mem-backend-items.md`, design
-`docs/v2/plan/lanes/mem/backend-items.md`). `crates/blaze-items/Cargo.toml` now depends on
+`docs/v2/plan/design/memory.md`). `crates/blaze-items/Cargo.toml` now depends on
 `blaze-mem` and, for tests, `blaze-alloc-count`; both are workspace dependencies already. The
 lane may not run cargo, so `Cargo.lock` is not updated; its `blaze-items` entry already lacks most
 of the crate's dependencies (it lists `blaze-format`, `blaze-ids`, `blaze-query`, `serde`), so the

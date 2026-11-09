@@ -11,7 +11,7 @@ date: 2026-10-30
   (already in `Cargo.lock` through rayon, so the lock does not change).
 - Where: root `Cargo.toml`; used by `crates/blaze-graph/Cargo.toml` (`crossbeam-deque.workspace
   = true`).
-- Why: the worker pool (docs/v2/plan/lanes/core.md section 4) steals work between threads; each worker's
+- Why: the worker pool (docs/v2/plan.md section 4) steals work between threads; each worker's
   deque is crossbeam's Chase-Lev deque, so the hot path takes no lock.
 
 ---
@@ -45,7 +45,7 @@ Applied by the coordinator, 16:46.
   `blaze_graph::exec::Scheduler` as `Task`s with their `TaskKind`, the plane's budget from
   `blaze_graph::arena::machine_budget`.
 - Where: the crate holding the daemon's `main` (cargo or ci), `crates/blaze-cargo/src/memory.rs`.
-- Why: memory admission (docs/v2/plan/lanes/core.md section 4) learns each kind's peak from what the
+- Why: memory admission (docs/v2/plan.md section 4) learns each kind's peak from what the
   counting allocator measures per task and holds the daemon's own arenas against the budget;
   without the allocator every measured peak is 0 and admission admits everything.
 
@@ -166,7 +166,7 @@ check on a warm build.
 ## From speed-link-edge-remote: two socket effects for the remote tier (2026-10-29)
 
 For `crates/blaze-cas/src/remote.rs` (the laptop/VM read-through tier). The before and after
-numbers are in `docs/v2/plan/lanes/store/speed-link-edge-remote.md`, and the rest of that work
+numbers are in `docs/v2/plan/design/store.md`, and the rest of that work
 is in `docs/v2/requests/concurrency.md`. These are the two copies left there that only
 `blaze-core`'s effect API can remove.
 
@@ -213,13 +213,13 @@ K2. **`Effect::RecvInto { conn: Conn, buffer: Vec<u8>, most: usize, tag: Tag }`,
 
 > applied: `windows-sys` 0.61.2 with those features was in the root `[workspace.dependencies]`; lane core is DONE, so `crates/blaze-core/Cargo.toml` now has `[target.'cfg(windows)'.dependencies]` `windows-sys.workspace = true`.
 
-## 7. docs/v2/plan/lanes/core.md "Windows": how a process's end is heard
+## 7. docs/v2/plan.md "Windows": how a process's end is heard
 
 - What: say "a thread-pool wait on the process (`RegisterWaitForSingleObject`) posts its end to
   the port; the job's messages, which Windows does not promise to deliver, only say the job went
   past its memory" and "a memory-limited job's peak is at most its limit: Windows refuses any
   commit past it", in place of the job's `EXIT_PROCESS` message.
-- Where: `docs/v2/plan/lanes/core.md` (coordinator's).
+- Where: `docs/v2/plan.md` (coordinator's).
 - Why: a lost `EXIT_PROCESS` would leave a spawn in flight forever; the wait always fires.
 
 > forwarded to coordinator: `docs/v2/` is the coordinator's, not among the paths `requests` applies.
@@ -236,7 +236,7 @@ K2. **`Effect::RecvInto { conn: Conn, buffer: Vec<u8>, most: usize, tag: Tag }`,
 
 > answered by lane cargo (cargo-inbox): done: `rg "std::process::Command" crates/blaze-cargo/src/serve*` finds none; every process the daemon starts goes through its driver.
 
-## From speed-runtime: `docs/v2/plan/lanes/core/plane.md`, "Memory admission" (2026-10-29)
+## From speed-runtime: `docs/v2/plan.md`, "Memory admission" (2026-10-29)
 
 - What: replace "`arena::Counting` is the daemon's global allocator (per-thread counts, sharded
   totals, no lock)" with "`arena::Counting` is the daemon's global allocator, over the allocator
@@ -244,8 +244,8 @@ K2. **`Effect::RecvInto { conn: Conn, buffer: Vec<u8>, most: usize, tag: Tag }`,
   exit: no lock and no atomic per allocation; `held()` is one load, within 256 KiB per other
   thread)". In "What others wire", the daemon line can say `Counting<Jemalloc>` (or mimalloc)
   rather than `Counting<System>`.
-- Where: `docs/v2/plan/lanes/core/plane.md` (core's).
-- Why: `crates/blaze-graph/src/arena.rs` changed so (see `docs/v2/plan/lanes/core/speed-runtime.md`),
+- Where: `docs/v2/plan.md` (core's).
+- Why: `crates/blaze-graph/src/arena.rs` changed so (see `docs/v2/plan.md`),
   and the doc is `current`-kept by core.
 
 > forwarded to coordinator: lane core is DONE and its doc falls back to the coordinator's `docs/v2/`, not among the paths `requests` applies.
@@ -271,18 +271,18 @@ step.
    take `Result<(), Error>` and `for output in said.drain(..) { self.output(output) }`, then put
    the buffer back; the same for `Msg::Cancel` with `cancel_into`. Why: the scheduler's owner
    thread steps the plane once per task; this takes its one remaining allocation per step.
-3. **`docs/v2/plan/lanes/core/plane.md` (core), "The plane".** What: add a item 7: "**Layout.**
+3. **`docs/v2/plan.md` (core), "The plane".** What: add a item 7: "**Layout.**
    Nodes and tasks are `u32` slots into hot rows (64 bytes a node, 32 a task) and colder columns,
    reused through free lists; a request's deps are one edge array (a node's deps a range of it,
    its dependents a list threaded through it); task members a list through the node rows; ready
    sets 4-ary heaps whose nodes know their place; keys index the flight table by their own first
    eight bytes. In steady state a task costs the plane no allocation; `Plane::step_into` appends
    to the caller's buffer." Why: the doc is `current`-kept by core and now says nothing of how
-   the plane holds its state (see `docs/v2/plan/lanes/core/speed-runtime-plane.md`).
+   the plane holds its state (see `docs/v2/plan.md`).
 
 > applied: lane core is DONE. 1: `crates/blaze-graph/src/machine.rs` `Machine` keeps `said: Vec<PlaneOutput>` and `step` drains `Plane::step_into` into it, mapped as before. > forwarded to speed: 2 (`exec.rs`) is speed-runtime-pool's, told by the requester.
 > Status (2): done by speed (2026-10-30; speed-runtime-pool and core-pool are DONE, so `exec.rs` was free). `Owner` keeps `said: Vec<PlaneOutput>`; `step` and `Msg::Cancel` take it out with `mem::take`, call `step_into`/`cancel_into`, and `outputs(request, Result<(), Error>, said)` drains it into `output` and puts it back (the larger buffer is kept when a step started from an output, such as a failed run, left its own). `Open`'s `release` passes the same buffer, so `Vec::new()` per open is gone too. Not compiled (common.md).
-> forwarded to coordinator: 3, `docs/v2/plan/lanes/core/plane.md`, falls to the coordinator's `docs/v2/` with core DONE.
+> forwarded to coordinator: 3, `docs/v2/plan.md`, falls to the coordinator's `docs/v2/` with core DONE.
 
 ## From speed-runtime-vfs: one effect to look at many paths, and the kind of a change (2026-10-29)
 
@@ -308,7 +308,7 @@ The watcher moves to both once they exist; until then it stays correct with Stat
 ## From speed-link-edge-wire: a sent buffer handed back (2026-10-29)
 
 For `crates/blaze-api/src/server.rs`, the daemon's API listener. The numbers are in
-`docs/v2/plan/lanes/ci/speed-link-edge-wire.md`.
+`docs/v2/plan.md`.
 
 K3. **`Done::Sent` carrying the `Vec<u8>` that `Effect::Send` took, emptied (length 0, capacity
     kept): `Done::Sent(Vec<u8>)`, or a new `Done::SentBack(Vec<u8>)` beside it.**

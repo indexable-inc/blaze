@@ -7,7 +7,7 @@ date: 2026-10-29
 
 ## From concurrency: lock audit (2026-10-29)
 
-For the coordinator, whose paths these are (docs/v2/plan/reference/crates.md, the list after
+For the coordinator, whose paths these are (docs/v2/plan.md, the list after
 "Paths each lane owns"). This is a read-only audit of `blaze-registry`, `blaze-source`,
 `blaze-resolve`, `blaze-wasm`, `blaze-cache`, `blaze-doc`, `blaze-lints`, `blaze-fmt`,
 `hir-ide` and `ide-db` against docs/v2/plan/design/concurrency.md.
@@ -81,7 +81,7 @@ Off the hot path, so nothing to change (hits read, one line per group):
 
 > forwarded to coordinator: findings 1-7 are in `blaze-source`, `blaze-resolve`, `blaze-cache`, `blaze-doc` and `blaze-fmt`, coordinator paths not among those `requests` applies (1-4 go to lane cargo if cargo 1 and 5 give it those crates). Nothing to change in `hir-ide` or `ide-db`: the audit finds only off-path locks there.
 
-> answered by lane cargo (cargo-inbox): declined for lane cargo: findings 1-7 are in `blaze-source`, `blaze-resolve`, `blaze-cache`, `blaze-doc` and `blaze-fmt`, and lane cargo owns `crates/blaze-cargo/` and `crates/load-cargo/` only (docs/v2/plan/reference/crates.md). They stay with the coordinator, as forwarded; nothing in lane cargo's paths takes these locks.
+> answered by lane cargo (cargo-inbox): declined for lane cargo: findings 1-7 are in `blaze-source`, `blaze-resolve`, `blaze-cache`, `blaze-doc` and `blaze-fmt`, and lane cargo owns `crates/blaze-cargo/` and `crates/load-cargo/` only (docs/v2/plan.md). They stay with the coordinator, as forwarded; nothing in lane cargo's paths takes these locks.
 
 > applied by lane cargo (cargo-next1, after request 1 gave lane cargo blaze-source and
 > blaze-resolve): findings 1-4. `InternedString`, `SourceId` and `PackageId` intern into a

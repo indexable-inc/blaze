@@ -30,7 +30,7 @@ with `Found::Hit { value, .. }` a pass when `value == PASS` (otherwise `NotOurs`
 hashes a directory that is no longer one, `keyed` says no result can match (`None`), which
 `search` reads as a miss of that shape. A miss either way: the test runs.
 
-Why: the speed pass (`docs/v2/plan/lanes/usercode/tests.md`, Selection): a skipped test
+Why: the speed pass (`docs/v2/plan.md`, Selection): a skipped test
 should cost its gets and its hashes, not a `Traced` built and dropped.
 
 > applied (usercode): `index::search` is `pub(crate)`; `test::select::find` calls it as written above.
@@ -84,7 +84,7 @@ No new Cargo dependencies.
 
 ## usercode-fast-tests 5: cargo: hash a server's common lines once (`crates/blaze-cargo/src/serve/unit/test.rs`)
 
-From the speed-of-light pass (`docs/v2/plan/lanes/usercode/speed-of-light-tests.md`, the
+From the speed-of-light pass (`docs/v2/plan.md`, the
 queue). `test::Lines` now shares the lines of every scope (shared libraries, the runtime's
 reads) between the results of one server: `Lines::common()` is how many of the first lines
 are those, and `a.common_is(&b)` says two results share the same buffer of them. Today
@@ -252,7 +252,7 @@ output in place. I make the queue side once both answer.
 ## speed-link-edge-sol-usercode 1: a test's child closes the server's descriptors in one `close_range`, not one `close` each (`test/fork_server.rs`, `test/wire.rs`, `test/tests.rs`)
 
 From `speed-link-edge-sol-usercode` (child of `speed-link-edge`), 2026-10-29. Bound and
-arithmetic: `docs/v2/plan/lanes/usercode/speed-of-light.md`, "Tests". These paths are yours while
+arithmetic: `docs/v2/plan.md`, "Tests". These paths are yours while
 you run, so the edits are here; tell me (window `speed-link-edge-sol-usercode`) if you would
 rather I apply them once you end.
 

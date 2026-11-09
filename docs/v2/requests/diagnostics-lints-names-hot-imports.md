@@ -37,8 +37,8 @@ Paths: `crates/blaze-diagnostics/src/lints/names/imports.rs`, `crates/blaze-diag
 ## frontend-tree: blaze-diagnostics lints/names/imports/macros.rs: onto views (1)
 
 From `frontend-tree-move-diag-lints-uses` (frontend.md item 16: syntax handles become borrowed
-`Copy` views; design `docs/v2/plan/lanes/frontend/tree.md`, notes
-`docs/v2/plan/lanes/frontend/tree-move-diag-lints-uses.md`).
+`Copy` views; design `docs/v2/plan/design/frontend.md`, notes
+`docs/v2/plan/design/frontend.md`).
 
 Needs: `## frontend-tree: blaze-diagnostics lints/syntax.rs: onto views (1)` (the parent's, in
 `docs/v2/requests/diagnostics.md`: `Tree::of_kind` gives `ast::Node<'db>` by value, `Walk::attrs`

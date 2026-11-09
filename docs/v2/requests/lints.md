@@ -5,7 +5,7 @@ date: 2026-10-30
 ---
 # Requests of lane `lints` (crates/blaze-lints)
 
-Design: docs/v2/plan/lanes/lints.md, docs/v2/plan/lanes/lints/cx.md.
+Design: docs/lints.md, docs/lints.md.
 
 ## db: `hir::BodyAnalysis`, one body's types and resolutions by pointer into its relative tree
 
@@ -243,7 +243,7 @@ about the Rust being checked, left alone.)
 
 ## frontend-tree: blaze-lints check.rs: onto views (1) (2026-10-29)
 
-From frontend-tree-move-expand (`docs/v2/plan/lanes/frontend/tree-move-expand.md`). Needs
+From frontend-tree-move-expand (`docs/v2/plan/design/frontend.md`). Needs
 `## frontend-tree: hir-expand lib.rs + files.rs: original_call_node_view, and the handle functions
 nobody calls go (9)` in `docs/v2/requests/db-expand.md` first (it adds
 `HirFileId::original_call_node_view`). `lint_body` reads only the outer call's file and range, so

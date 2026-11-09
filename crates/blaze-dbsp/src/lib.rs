@@ -1,5 +1,5 @@
 //! blaze v2's delta engine (docs/v2/plan/design/dbsp.md §3, notes in
-//! docs/v2/plan/lanes/dbsp/engine.md): the generic pieces the write-side maintainers of name
+//! docs/v2/plan/design/dbsp.md): the generic pieces the write-side maintainers of name
 //! resolution, impl tables and trait candidate sets are made of.
 //!
 //! - [`ZSet`]: a multiset with integer weights, DBSP's unit of change.

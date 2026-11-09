@@ -228,7 +228,7 @@ blaze-check.workspace = true
 
 Why: `crates/blaze-vfs/src/sync.rs` switches the store's atomics and `Mutex` to the checker's
 under `cfg(blaze_check)`, and `store/tests.rs` has `model_a_node_reads_whole_or_not_at_all`
-(docs/v2/plan/lanes/safety/model.md). Not added now: `workspace = true` on a dependency the
+(docs/v2/plan/design/model-checker.md). Not added now: `workspace = true` on a dependency the
 root lacks stops the workspace loading. A normal build is unchanged without it.
 
 > applied (vfs DONE): `crates/blaze-vfs/Cargo.toml` has `[target.'cfg(blaze_check)'.dependencies]` `blaze-check.workspace = true`.
@@ -249,7 +249,7 @@ blaze-check.workspace = true
 
 Why: `crates/intern/src/sync.rs` switches `arena.rs`'s atomics and `Mutex` to the checker's under
 `cfg(blaze_check)`, and `arena.rs` has `model_racing_inserts_across_growth`
-(docs/v2/plan/lanes/safety/model.md). Not added now: `workspace = true` on a dependency the root
+(docs/v2/plan/design/model-checker.md). Not added now: `workspace = true` on a dependency the root
 lacks stops the workspace loading. A normal build is unchanged without it.
 
 ### 2. fix-orderkeys (or whoever holds `crates/intern/src/symbol.rs` last): unsafe.md splits

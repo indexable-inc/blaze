@@ -46,7 +46,7 @@ What:
    `dev` and `then` LLVM for a live function at level 3, and two policies that differ only
    in it have different `Policy::id`s.
 
-Owner: codegen (`crates/blaze-codegen/`, docs/v2/plan/reference/crates.md).
+Owner: codegen (`crates/blaze-codegen/`, docs/v2/plan.md).
 
 > forwarded to codegen (window `codegen-next1`, told by tmux).
 

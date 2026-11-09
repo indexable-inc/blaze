@@ -5,7 +5,7 @@ date: 2026-10-30
 ---
 # Requests of lane cargo
 
-Lane cargo's design is `docs/v2/plan/lanes/cargo/notes.md`. Its children (cargo-load, cargo-std,
+Lane cargo's design is `docs/v2/plan.md`. Its children (cargo-load, cargo-std,
 cargo-daemon, cargo-cli) append below, each request saying which child it comes from.
 
 ## 1. Ownership: blaze-manifest, blaze-metadata, blaze-resolve, blaze-registry, blaze-source to lane cargo
@@ -13,12 +13,12 @@ cargo-daemon, cargo-cli) append below, each request saying which child it comes 
 APPLIED by the coordinator 2026-10-29 21:08 (crates.md). Use a closed set for `Files`, not
 `&dyn Files`: an enum `{ Disk, View(..) }` or a generic `F: Files` (lane dedyn).
 
-What: in `docs/v2/plan/reference/crates.md`, add `crates/blaze-manifest/`, `crates/blaze-metadata/`,
+What: in `docs/v2/plan.md`, add `crates/blaze-manifest/`, `crates/blaze-metadata/`,
 `crates/blaze-resolve/`, `crates/blaze-registry/` and `crates/blaze-source/` to lane cargo's
 paths, and take `blaze-tree` and `blaze-units` out of the "Every other path" paragraph (the table
 already gives them to cargo; the paragraph says they are the coordinator's).
 
-Why: `docs/v2/plan/process/building.md` section 18 gives cargo "everything cargo-shaped that no lane had", and the workspace
+Why: `docs/v2/plan.md` section 18 gives cargo "everything cargo-shaped that no lane had", and the workspace
 load as queries over a view can't be written without changing these crates. Today they read the
 machine's disk directly: `blaze_manifest::manifest::read_manifest` (`std::fs::read`), target
 autodiscovery (`targets.rs`: `exists`, `is_file`, `read_dir`), workspace member globs
@@ -48,11 +48,11 @@ pub struct Disk;
 with `Context::with_files(config, files: Rc<dyn Files>)` and glob expansion done over `list`
 (cargo's `glob` semantics kept). blaze-metadata's registry reads take the same `Files`; fetching
 moves to the daemon (effects), which mounts each fetched package as a VFS root
-(`docs/v2/plan/lanes/cargo/notes.md`, "Sources"). No behavior changes for a `Disk` context, which every
+(`docs/v2/plan.md`, "Sources"). No behavior changes for a `Disk` context, which every
 v1 caller keeps; `harness/resolve.py` still holds them to cargo. Lane cargo writes all of it once
 granted; until then its child cargo-load writes everything else.
 
-> forwarded to coordinator: the grant changes `docs/v2/plan/reference/crates.md` and five crates that are the coordinator's, neither among the paths `requests` applies; building.md section 18 ("everything cargo-shaped that no lane had") supports it.
+> forwarded to coordinator: the grant changes `docs/v2/plan.md` and five crates that are the coordinator's, neither among the paths `requests` applies; building.md section 18 ("everything cargo-shaped that no lane had") supports it.
 
 ## 2. `crates/blaze-query/src/lib.rs`: a kind range for cargo, and reads of an immutable root
 
@@ -77,7 +77,7 @@ Why: a build reads files of more than the view: every registry and git dependenc
 and the standard library's are content-addressed roots of their own, mounted where cargo would
 have them (`$CARGO_HOME/registry/src/...`, the sysroot's `library/`). Keyed by the root's
 content ID, their results are shared by every view and project that uses the same version: the
-shared base layer (docs/v2/plan/lanes/ci.md). Reading them through `Cx::file` would need every view to
+shared base layer (docs/v2/plan.md). Reading them through `Cx::file` would need every view to
 contain every dependency's files. `Tree::file(root, path)` already reads any root; this only
 exposes it to a query, with an edge, so `Why` can still name the file.
 
@@ -100,7 +100,7 @@ exposes it to a query, with an edge, so `Why` can still name the file.
 ## 3. `crates/blaze-api/src/lib.rs`: what cargo's command line and cargo's output need (schema 5)
 
 Why: the CLI (`blaze build|run|test|check`, `cargo blaze`) is a client of the agent API with
-cargo's flags, output and exit codes unchanged (`docs/v2/plan/process/building.md` section 18). `Targets` holds six of
+cargo's flags, output and exit codes unchanged (`docs/v2/plan.md` section 18). `Targets` holds six of
 cargo's flags; a build also depends on target selection, `--workspace`, `--exclude`,
 `--config`, `-Z`, `--manifest-path`, `--locked`/`--offline`/`--frozen`, the environment cargo
 and build scripts read (`RUSTFLAGS`, `CARGO_*`, `PATH` for a script's `cc`), and config files
@@ -607,7 +607,7 @@ pub struct Artifact {
 ```
 
 **Why:** the CLI runs `run`'s program and `test`'s executables itself, on the terminal
-(docs/v2/plan/lanes/cargo/notes.md section 7), and reads no manifest, so what cargo knows of
+(docs/v2/plan.md section 7), and reads no manifest, so what cargo knows of
 how to run each (its runner, its variables, whether it has libtest's harness) has to come
 with the artifact; v1's client had it from v1's daemon (`Program::env`). `UnitOf::test`: cargo's
 per-unit summary lines name a test unit differently, and `UnitTarget` cannot tell a lib's
@@ -1012,7 +1012,7 @@ critical path). `serve/plane.rs:494` matches `PlaneOutput::Run { id, pool, near 
 `..`, so it stops compiling once the field lands. Match `Run { id, pool, near, critical }` and,
 where the task goes to the pool, submit it with `Pool::submit_critical` when `critical`
 (as `blaze_graph::exec` does), so a critical task runs on a fast group (P cores on Apple).
-Why: docs/v2/plan/design/hardware.md, threads row: the critical path on the fast cores.
+Why: docs/v2/plan/design/data.md, threads row: the critical path on the fast cores.
 
 > forwarded to cargo: `crates/blaze-cargo/src/serve/plane.rs` is lane cargo's.
 
@@ -1038,7 +1038,7 @@ one `self.write(&self.out)`. `tick` uses `tick_into` into the same `out`.
 Why: a cold build sends thousands of records, and a 64 KiB read holds hundreds. Each now
 costs a region redraw and an `eprint!`; batched, a read is one draw and one write.
 
-Lane speed-link-edge-ci-ui's notes: docs/v2/plan/lanes/ci/speed-link-edge-ci-ui.md.
+Lane speed-link-edge-ci-ui's notes: docs/v2/plan.md.
 
 **From cargo-daemon-units, speed (to lanes codegen, link, store/concurrency, core):**
 - link: `blaze_link::target::locate(&Output, &[NativeLib], &[PathBuf]) -> Result<Vec<Located { path:
@@ -1493,7 +1493,7 @@ For **cargo-std** (`stdlib/`):
 
 > for lane cargo: forward the third to core.
 
-- For `docs/v2/plan/lanes/cargo/notes.md` section 4 (the lane's file), the load's state of the art,
+- For `docs/v2/plan.md` section 4 (the lane's file), the load's state of the art,
   to put in as the lane sees fit:
   - **What it measures against.** The load is incremental as rust-analyzer's salsa project
     loading and Buck2's DICE are: every file read is an edge, and every query cuts off early on
@@ -1583,7 +1583,7 @@ a large workspace (#1450's 238 s) is that many sequential reads. cargo-load's re
 
 What: `crates/load-cargo/src/v2/db.rs:15-35` gives each worker a cloned `Db` handle
 (`Lowered::snapshot`), and a write cancels readers by unwinding (`salsa::Cancelled` ->
-`Failed::Again`). The decided design (`docs/v2/plan/process/decisions.md`: the database is
+`Failed::Again`). The decided design (`docs/v2/plan.md`: the database is
 `Sync` and shared by reference; no per-thread handles) needs every worker to read `&Db`. Asked,
 once db answers item 2 of "frontend: what frontend.md items 7-12 still need" in
 `docs/v2/requests/db.md`: drop `Snapshot`/`snapshot` and the `Clone` impl, pass `&Db` to the tasks,
@@ -1813,7 +1813,7 @@ is now `Option<Unix>`, and `Config` lost `Clone`), `units` (the launchd plist an
 `installed`, `place_here`, `here`), `Client::until_hung_up`, and `Status.pid` with
 `session::Daemon.pid` (`SCHEMA` 10). blaze-core's side (`Address::Inherited { fd, at }`) is
 asked of frontend-journal in `docs/v2/requests/frontend-journal.md`. Notes:
-`docs/v2/plan/lanes/frontend/activate.md`. Each edit below is complete once both land.
+`docs/v2/plan/design/restore.md`. Each edit below is complete once both land.
 
 > forwarded to cargo (told by tmux): `crates/blaze-cargo/` is its.
 
@@ -2338,7 +2338,7 @@ Status: open
 
 ## 21. From lane cargo (to the coordinator, 2026-10-29 19:30): request 1 is what the lane's "Done when" waits on
 
-`docs/v2/plan/lanes/cargo.md`'s "Done when" has the workspace load as queries and a report
+`docs/v2/plan.md`'s "Done when" has the workspace load as queries and a report
 saying `STATUS: DONE`. The load is written and cannot be finished until request 1 (and its
 addenda 5, 14 and 19) is granted: `crates/blaze-units/src/load/` and `crates/blaze-tree/src/query.rs`
 call `blaze_manifest::files::Files`, `Config::load_with`, `Context::with_files`,
@@ -2351,7 +2351,7 @@ Also done in lane cargo's own paths after the plan's reorganization: the git fet
 lock and writes nothing in the user's `$CARGO_HOME` (`serve/fetch/git.rs`, decisions.md "no build
 lock"); child cargo-sync makes `load-cargo` and `serve/` share the front end's database by
 reference (decisions.md, `docs/v2/requests/db-salsa.md`'s load-cargo and blaze-cargo items); child
-cargo-sol writes `docs/v2/plan/lanes/cargo/speed-of-light.md`.
+cargo-sol writes `docs/v2/plan.md`.
 
 > forwarded to the coordinator: granting the five cargo crates is its decision, not requests' (listed in requests' report).
 
@@ -2555,7 +2555,7 @@ handed the job's writer as the front end's last use and measures under `Arc::get
 
 ## cargo-sol: speed-of-light gaps outside cargo-sol's paths (from cargo-sol, 2026-10-29)
 
-The bounds and the arithmetic are in `docs/v2/plan/lanes/cargo/speed-of-light.md`. A warm
+The bounds and the arithmetic are in `docs/v2/plan.md`. A warm
 no-op is bound at about 0.6 ms and costs roughly 20 to 40 ms as written. Each item below is
 over 10% of the 5 ms target on its own. Nothing compiled.
 
@@ -2600,7 +2600,7 @@ over 10% of the 5 ms target on its own. Nothing compiled.
 
 `load-cargo`'s v2 now uses `base_db::Db` (`pub use base_db::Db`), and its own `src/v2/db.rs`
 (`impl SourceDatabase`, `hir::impl_hir_database!`) is deleted. `v2::build_db` makes the
-database as docs/v2/plan/lanes/frontend/db.md says whoever makes a `Db` does:
+database as docs/v2/plan/design/frontend.md says whoever makes a `Db` does:
 `hir_ty_mir::provide()`, then `Db::new()`, `ProcMacros::init_default`,
 `set_expand_proc_attr_macros(true)`. `serve/` passes `&Db` where it bound
 `&dyn HirDatabase`.
@@ -2623,7 +2623,7 @@ database as docs/v2/plan/lanes/frontend/db.md says whoever makes a `Db` does:
 ## frontend-db: `build_db` installs nothing (answer to cargo-sync's note 2; 2026-10-29)
 
 The design changed under `build_db` (`crates/load-cargo/src/v2.rs:173-181`): the MIR providers
-register at link time (`docs/v2/plan/lanes/frontend/db.md`, "Providers"), so there is no
+register at link time (`docs/v2/plan/design/frontend.md`, "Providers"), so there is no
 `hir_ty_mir::provide()`. hir-def's `set_expand_proc_attr_macros` is being deleted too
 (`docs/v2/requests/db.md`, "frontend-db: the concrete database", 4): rustc always expands attribute
 macros, and every v2 database set it to `true`.
@@ -2916,7 +2916,7 @@ Status: open
 > simulation on its disk's inode (a `Stat` or `List` there now reports the inode's mtime). A warm
 > set allocates nothing (`a_warm_times_set_allocates_nothing` in `src/tests.rs` and
 > `kqueue.rs`). No `match` outside blaze-core changes: every one there ends in a wildcard. How
-> the daemon uses it: the next section. Design: `docs/v2/plan/lanes/mem/core.md`, "File times".
+> the daemon uses it: the next section. Design: `docs/v2/plan/design/memory.md`, "File times".
 
 ## dedup: blaze-cargo's build-script SHA-256 onto blaze-sha256
 
@@ -3772,7 +3772,7 @@ being shown late.
 
 Four hand-written byte cursors in blaze-cargo move onto the one checked cursor,
 `blaze_format::cursor::{Reader, Put}` (crates/blaze-format/src/cursor.rs; API table in
-docs/v2/plan/lanes/dedup/cursor.md). Every read is one bounds check and one load; a failed read
+docs/v2/plan/design/data.md). Every read is one bounds check and one load; a failed read
 leaves the reader where it was. The formats' bytes don't change, so nothing kept in a store is
 invalidated. Each caller keeps its `Option` with `.ok()?`.
 
@@ -4239,13 +4239,13 @@ Nothing in blaze-units stays generic: it has one implementation.
      an `Arc` per directory listing and a `Vec` from `tree.list`, and a new `ViewState`'s results
      table grows as it fills. Read the listing borrowed, and size the table from the previous
      view's count.
-3. To cargo-sol, `docs/v2/plan/lanes/cargo/speed-of-light.md` (not mine):
+3. To cargo-sol, `docs/v2/plan.md` (not mine):
    - In "The standard library's graph", the extra decode and encode of `StdUnits` is closed:
      its value is `Foreign`'s bytes passed on.
    - In "The workspace load", a memo hit no longer allocates: every load query's
      `input` hashes its key through `key_id`'s per-thread buffer, with zero-budget tests for a
      file query hit, a `Plan` hit and a `StdUnits` hit.
-4. Request 1 is not granted: `docs/v2/plan/reference/crates.md`'s cargo row has no blaze-manifest,
+4. Request 1 is not granted: `docs/v2/plan.md`'s cargo row has no blaze-manifest,
    so I made no `Files` change and the "`Files` is never `dyn`" request's blaze-units part waits
    on it. The manifest's three parses and the resolve reruns in speed-of-light wait on it too.
 
@@ -4336,7 +4336,7 @@ Status: open
 
 ## frontend-tree: `without_tests` reads the tree through views (2026-10-29)
 
-frontend.md item 16 (notes `docs/v2/plan/lanes/frontend/tree.md`): the `SyntaxNode`/`ast`
+frontend.md item 16 (notes `docs/v2/plan/design/frontend.md`): the `SyntaxNode`/`ast`
 handles are being deleted; this is blaze-cargo's only caller. Same items, same ranges, same
 tokens, so the same hash; no handle made, no refcount per node, and the attribute's text is a
 borrowed slice instead of a `String` per attribute.
@@ -4604,7 +4604,7 @@ dependency image, keyed by the image's filed key, the unit's lint flags, `keep_d
 the borrowck mode and the check's producer. Builds on `## frontend-deps: serve dependency
 images from the store` and its amendment above (the adapter, `deps::serve`, `deps::store`),
 and on `Stored::filed` (asked of frontend-deps in `docs/v2/requests/frontend-deps.md`). Notes:
-`docs/v2/plan/lanes/frontend/fast-bodies-cache.md`. Asked, in `crates/blaze-cargo/src/serve/`:
+`docs/v2/plan/design/frontend.md`. Asked, in `crates/blaze-cargo/src/serve/`:
 
 1. **Serve**, on the writer right after `hir_def::deps::serve` (same adapter, same
    `ReadThrough` once it is there), for every unit whose crate has an image:
@@ -4724,7 +4724,7 @@ Status: open
    rustc's built-in target specs: compiled-in table, a lookup). Its Resolve row should add "index
    lines parsed lazily per matching version, as cargo's index cache".
 
-> applied (1, requests, pass 25): nothing to add to the root `Cargo.toml`. Of the two, the table built ahead of time is the long-term one: it is rustc's (target specs compiled in, a lookup, no parse), and a lazy `RawValue` per target still parses JSON in every process. It needs no build script either: `harness/answers.py --write` can write the columns as a Rust file beside `rustc.json` (cargo-units' side, with the coordinator's `harness/answers.py`; on the coordinator list). serde_json's `raw_value` is not added. 2 and 3 are lane cargo's docs (`speed-of-light.md`, `docs/v2/plan/lanes/cargo/notes.md`): forwarded to cargo (told by tmux).
+> applied (1, requests, pass 25): nothing to add to the root `Cargo.toml`. Of the two, the table built ahead of time is the long-term one: it is rustc's (target specs compiled in, a lookup, no parse), and a lazy `RawValue` per target still parses JSON in every process. It needs no build script either: `harness/answers.py --write` can write the columns as a Rust file beside `rustc.json` (cargo-units' side, with the coordinator's `harness/answers.py`; on the coordinator list). serde_json's `raw_value` is not added. 2 and 3 are lane cargo's docs (`speed-of-light.md`, `docs/v2/plan.md`): forwarded to cargo (told by tmux).
 
 > cargo (2026-10-29 22:10): 2 and 3 done, each checked against the tree first.
 > - speed-of-light.md:
@@ -4743,7 +4743,7 @@ Status: open
 ## frontend-fast-const-deps: keep dependencies' constant values in the store (2026-10-29)
 
 `hir_ty::consteval::deps` (frontend-fast-const-deps's; notes
-`docs/v2/plan/lanes/frontend/fast-const-deps.md`) serves a dependency's `const` item with no
+`docs/v2/plan/design/frontend.md`) serves a dependency's `const` item with no
 generic arguments from the store, by content, before its body is read, and records the values
 evaluated on a miss for the driver to write. It needs the driver at two points, next to the
 dependency check cache (`blaze_diagnostics::cache::{serve, store}`), wherever the driver calls
@@ -4810,7 +4810,7 @@ Status: open
 
 ## frontend-fast-bodies-tasks: a unit's check runs beside its codegen, reached bodies first (2026-10-29)
 
-From `frontend-fast-bodies-tasks` (notes `docs/v2/plan/lanes/frontend/fast-bodies-tasks.md`).
+From `frontend-fast-bodies-tasks` (notes `docs/v2/plan/design/frontend.md`).
 Today `make()` checks the whole crate, then starts codegen. With this, the check (one plane task
 per body, `hir::check::bodies::Plan`) runs as a job of the pool while codegen runs on the
 unit's thread; codegen's walk tells the plan the bodies it reaches, which are checked first;
@@ -5374,7 +5374,7 @@ Changes to my request above:
 
 ## From cargo-units-tree: `blaze tree`'s docs and one blaze-resolve accessor (2026-10-29)
 
-1. **`docs/v2/plan/lanes/cargo/speed-of-light.md`, section "`blaze tree` (`blaze-tree`)"**: its
+1. **`docs/v2/plan.md`, section "`blaze tree` (`blaze-tree`)"**: its
    "As written" bullet is no longer true. Replace it with:
    > - As written: packages interned once to a dense `Pkg(u32)` in `PackageId` order; nodes a
    >   `u32`-indexed column of 24-byte `Node`s (const-asserted); edges collected flat as 12-byte
@@ -5390,7 +5390,7 @@ Changes to my request above:
    >   `the_graph_and_walk_allocate_a_fixed_number_of_buffers`); a repeat is a memo hit with
    >   zero allocations. The one remaining per-node allocation is blaze-resolve's
    >   `ResolvedFeatures::activated_features`, which returns a new `Vec` (item 3).
-2. **`docs/v2/plan/lanes/cargo/notes.md` section 8**: add a row
+2. **`docs/v2/plan.md` section 8**: add a row
    `| cargo tree (`blaze-tree`) | cargo's `ops/tree`, CSR graph traversal (GAP, Ligra) | CSR edges per kind built by counting sort, bitset visited and on-stack sets, specs matched once into bitsets over packages, one output buffer; the printed text is the query's value, so a repeat is a memo hit |`.
 3. **blaze-resolve (whoever owns `crates/blaze-resolve/src/resolver/features.rs`)**: add
    `ResolvedFeatures::activated_features_iter(&self, pkg_id, features_for) -> impl Iterator<Item = InternedString> + '_`
@@ -5415,7 +5415,7 @@ Status: open
 ## frontend-fast-trait-store: install the goal store and flush it beside `deps::store` (to cargo-daemon; 2026-10-29)
 
 From frontend-fast-trait-store, child of frontend-fast-trait (notes
-`docs/v2/plan/lanes/frontend/fast-trait-store.md` section 3; code
+`docs/v2/plan/design/frontend.md` section 3; code
 `crates/hir-ty/src/next_solver/goal_store.rs`). The persistent goal cache keeps global trait
 goals' answers in the store by content, so a build of an unchanged workspace does not solve
 them again. It uses the same adapter as `hir_def::deps::serve` (`DepImages`, frontend-deps'
@@ -6113,7 +6113,7 @@ example).
 ## dedup: one `block_on`, blaze-resolve's; one `SourceId` (from dedup-sim-rest, 2026-10-29)
 
 From `dedup-sim-rest` (lane dedup; report `/tmp/blaze-lanes/v2-dedup-sim-rest.md`, notes
-`docs/v2/plan/lanes/dedup/sim-rest.md`).
+`docs/v2/plan/design/data.md`).
 
 ### 1. `block_on`: `blaze_resolve::block_on`
 
@@ -6137,7 +6137,7 @@ and stays.
 
 ### 2. One `SourceId`: blaze-manifest's goes onto blaze-source's (after request 1)
 
-dedup-scan-cargo's notes (`docs/v2/plan/lanes/dedup/scan-cargo.md`, last line) leave this for
+dedup-scan-cargo's notes (`docs/v2/plan/design/data.md`, last line) leave this for
 after this file's request 1 (the grant of the five cargo crates). It is the copy behind the
 similar-code report's `fmt` pair (`blaze-manifest/src/source.rs:96` and
 `blaze-source/src/source_id.rs:712`). What is there today:

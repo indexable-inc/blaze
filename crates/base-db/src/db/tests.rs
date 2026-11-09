@@ -135,7 +135,7 @@ fn line_column_is_rustcs_from_zero() {
 }
 
 /// A memo hit of a query over `&Db` is static calls and loads: no call through a vtable or a
-/// function pointer, so the hit inlines into its caller (docs/v2/plan/lanes/frontend/db.md,
+/// function pointer, so the hit inlines into its caller (docs/v2/plan/design/frontend.md,
 /// "Proof"). The miss paths the engine keeps out of line (`fetch_cold`) are
 /// direct calls from the hit's code, so any indirect call or jump in it is the hit's own.
 ///

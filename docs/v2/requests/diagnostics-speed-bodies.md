@@ -7,7 +7,7 @@ date: 2026-10-29
 
 From `diagnostics-speed-bodies`, the speed pass over `crates/blaze-diagnostics/src/lints/bodies/`
 (report `/tmp/blaze-lanes/v2-diagnostics-speed-bodies.md`), 2026-10-29. Each one removes a cost named
-in the "Bodies" section of `docs/v2/plan/lanes/diagnostics/speed-of-light.md`.
+in the "Bodies" section of `docs/v2/plan.md`.
 
 ## 1. hir-def: expose which expression kinds a store has
 

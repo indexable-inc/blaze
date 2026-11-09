@@ -58,7 +58,7 @@
         # build scripts over the shell's value (Cargo.toml's [workspace.metadata.blaze.native.llvm]);
         # the shell's serves a stage 0 older than that table, and tools other than blaze.
         llvmEnv = { LLVM_SYS_231_PREFIX = "${llvm}"; };
-        # The Z3 blaze_verify's solver runs (crates/hir-ty-verus, docs/v2/plan/lanes/verus.md):
+        # The Z3 blaze_verify's solver runs (crates/hir-ty-verus, docs/v2/plan/design/verus.md):
         # 4.16.0, the release Verus pins (vendor/verus/SOURCE.md), from Z3's own release
         # archives by their unpacked hash. BLAZE_Z3 names it; blaze looks for no other.
         z3 =

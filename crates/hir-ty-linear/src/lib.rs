@@ -16,7 +16,7 @@
 //! parameter marked `#[blaze::linear]` (Swift's `~Copyable`, the `?Drop` of Rust's must-move
 //! discussions): every function a body names, with the type arguments it names it with, is
 //! checked here ([`generic`]). The design, the prior art and what is not checked yet are in
-//! docs/v2/plan/lanes/linear.md.
+//! docs/v2/plan/design/linear.md.
 //!
 //! [`check_body`] is called by the borrow check for each body it checks
 //! (`hir_ty_borrowck::check_owner`), so its errors refuse the body's code as a borrow check

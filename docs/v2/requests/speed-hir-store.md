@@ -31,7 +31,7 @@ With that, speed-hir-store adds `Owner::Image(Arc<that type>)` to `Col`, a safe
 (relocated into a `Vec`) keeps `decode()`.
 
 Why: principles.md, "zero-copy reads of mapped bytes". Speed of light:
-`docs/v2/plan/lanes/format/speed-of-light.md`, "Encoding and decoding a store".
+`docs/v2/plan/design/data.md`, "Encoding and decoding a store".
 
 > forwarded to frontend-deps-sigs-next1 (told by tmux): it names the crate image's owning type.
 
@@ -84,7 +84,7 @@ one to sum, one to place" stays true. Why: one counting sort in the tree.
 From `speed-hir-sol-items`. `item_tree/persist.rs` reads and writes its tables through your
 `Read`/`Words`. The item tree's decode budget test (`docs/v2/requests/frontend-deps.md`,
 "speed-hir-sol-items" D: one allocation per non-empty column) holds only with 1 and 2 below.
-The arithmetic is in `docs/v2/plan/lanes/format/speed-of-light.md`, "The item tree",
+The arithmetic is in `docs/v2/plan/design/data.md`, "The item tree",
 "Encoding and decoding".
 
 1. `Read::seq` collects at the exact length. `(0..len).map(|_| T::get(self)).collect()` into

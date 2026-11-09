@@ -1,5 +1,5 @@
 //! The daemon's tasks as the explorer's `tasks` and `task_edges` tables
-//! (docs/v2/plan/observe/explore-generic.md, "The core tables"; explore-core.md).
+//! (docs/v2/plan/design/explore-generic.md, "The core tables"; explore-core.md).
 //!
 //! The plane's loop owns the plane and the explorer's sessions never touch it: what the loop's
 //! live models already read (each [`Record`] of the plane's records, through the one conversion

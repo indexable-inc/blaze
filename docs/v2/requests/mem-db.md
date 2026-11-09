@@ -6,7 +6,7 @@ date: 2026-10-30
 # Requests of mem-db (the query database and the front end onto blaze-mem)
 
 The contract every change below and in mem-db's children's files programs against is in
-`docs/v2/plan/lanes/mem/db.md` ("The contract"). The children's files:
+`docs/v2/plan/design/memory.md` ("The contract"). The children's files:
 `docs/v2/requests/mem-db-salsa.md` (vendor/salsa), `docs/v2/requests/mem-db-infer.md` (hir-ty but its
 solver), `docs/v2/requests/mem-db-solver.md` (hir-ty's `next_solver/`, rustc_type_ir,
 rustc_next_trait_solver), `docs/v2/requests/mem-db-def.md` (base-db, hir-expand, hir, hir-def),

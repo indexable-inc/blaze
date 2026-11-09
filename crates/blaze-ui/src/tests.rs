@@ -464,7 +464,7 @@ fn the_region_is_a_tree_of_the_crates_under_way() {
     );
 }
 
-/// The driver's nodes that are no crate's (docs/driver.md) are lines of their own, moved by
+/// The driver's nodes that are no crate's (docs/v2/plan.md) are lines of their own, moved by
 /// their [`Event::Moved`]s: a build script compiling waits for nothing, its run for it.
 #[test]
 fn a_build_script_is_a_node_of_its_own() {

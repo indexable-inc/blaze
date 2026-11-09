@@ -6,7 +6,7 @@ date: 2026-10-29
 # frontend-tree-move-hir: requests made
 
 Requests this lane wrote in other lanes' files, and the twins it calls that other children
-declared. Notes: `docs/v2/plan/lanes/frontend/tree-move-hir.md`.
+declared. Notes: `docs/v2/plan/design/frontend.md`.
 
 ## In `docs/v2/requests/db.md`
 

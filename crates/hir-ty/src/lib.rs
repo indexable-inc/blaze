@@ -157,7 +157,7 @@ pub mod closure_analysis {
     };
 }
 
-/// A map of a query run's temporaries, in its frame (docs/v2/plan/lanes/mem/db-infer.md, R3).
+/// A map of a query run's temporaries, in its frame (docs/v2/plan/design/memory.md, R3).
 pub type FrameMap<'f, K, V> = hashbrown::HashMap<K, V, FixedState, &'f Frame>;
 /// A set of a query run's temporaries, in its frame.
 pub type FrameSet<'f, T> = hashbrown::HashSet<T, FixedState, &'f Frame>;

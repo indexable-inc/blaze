@@ -7,7 +7,7 @@ date: 2026-10-29
 
 ## frontend-bodies: R3, `in_crate_trait_value_items` visible to `infer/` (2026-10-29)
 
-From `frontend-fast-bodies` (notes: `docs/v2/plan/lanes/frontend/fast-bodies.md`, section 1).
+From `frontend-fast-bodies` (notes: `docs/v2/plan/design/frontend.md`, section 1).
 
 Why: `infer/sized_bound.rs` `probe_all_traits` walks every module scope of every crate for the
 traits with a value item of one name (rustc's `ProbeScope::AllTraits`). That set is exactly

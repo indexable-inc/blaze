@@ -29,7 +29,7 @@ date: 2026-10-29
 
 ## frontend-tree: blaze-diagnostics lints/names/dead/level.rs: onto views (1)
 
-From `frontend-tree-move-diag-lints-names` (frontend.md item 16, `docs/v2/plan/lanes/frontend/tree-move-diag-lints-names.md`).
+From `frontend-tree-move-diag-lints-names` (frontend.md item 16, `docs/v2/plan/design/frontend.md`).
 The level of `dead_code` at a node, walked up over views: no handle, count or clone per ancestor.
 
 Needs first: `Cx::vsema` (`hir::view::Semantics<'db>`, with `lint_attrs(FileId, Crate,
@@ -1943,7 +1943,7 @@ Hunk 4:
 ## frontend-tree: blaze-diagnostics lints/names/items/walk.rs: onto views (1)
 
 From `frontend-tree-move-diag-lints-items` (frontend.md item 16, design
-`docs/v2/plan/lanes/frontend/tree-move-diag-lints-items.md`). The item walk holds views of the
+`docs/v2/plan/design/frontend.md`). The item walk holds views of the
 database's trees (`'db`, the `Cx<'_, 'db>` borrow) instead of counted handles: nothing is cloned
 to keep a node, and every `// clone: a rowan cursor's refcount` goes with the clone it excused.
 Rewritten 2026-10-29 22:00 against the walk with one column of own nodes (hot-items-b's request,
@@ -5654,7 +5654,7 @@ Status: open
 
 ## frontend-tree: blaze-diagnostics lints/names/items/externs.rs: onto views (1)
 
-From `frontend-tree-move-diag-lints-items` (`docs/v2/plan/lanes/frontend/tree-move-diag-lints-items.md`).
+From `frontend-tree-move-diag-lints-items` (`docs/v2/plan/design/frontend.md`).
 Lands with the `walk.rs` and `items.rs` headings above (`Item<'db>`, `Container<'db>`, `def_span` of a
 view) and the `c_void.rs` heading (it calls `abi_of` with a view). Needs `Cx::vsema` and
 `cx::item_range_view` (`## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` in
@@ -6227,7 +6227,7 @@ Status: open
 
 ## frontend-tree: blaze-diagnostics lints/names/items/lifetime_syntax.rs: onto views (1)
 
-From `frontend-tree-move-diag-lints-items` (`docs/v2/plan/lanes/frontend/tree-move-diag-lints-items.md`).
+From `frontend-tree-move-diag-lints-items` (`docs/v2/plan/design/frontend.md`).
 Lands with the `walk.rs` and `items.rs` headings above (`Item<'db>`, `item_id` of `'db`). Needs
 `Cx::vsema` (`## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` in `docs/v2/requests/diagnostics.md`,
 frontend-tree-move-diag-lower) and `hir::view::Semantics::resolve_path(ast::Path<'db>)`
@@ -6611,7 +6611,7 @@ Status: open
 
 ## frontend-tree: blaze-diagnostics lints/names/items/lifetimes.rs: onto views (1)
 
-From `frontend-tree-move-diag-lints-items` (`docs/v2/plan/lanes/frontend/tree-move-diag-lints-items.md`).
+From `frontend-tree-move-diag-lints-items` (`docs/v2/plan/design/frontend.md`).
 Lands with the `walk.rs` and `items.rs` headings above (`Item<'db>`, `Item::nodes()` of views,
 `item_id` of `'db`). Needs `Cx::vsema` (`## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` in
 `docs/v2/requests/diagnostics.md`, frontend-tree-move-diag-lower) and

@@ -7,7 +7,7 @@ date: 2026-10-29
 
 ## 1. `crates/blaze-format/src/tiers.rs`: use `blaze_ids::radix::sort` (for lane format)
 
-Why: `docs/v2/plan/goals/principles.md` ("Sorting and ordering") wants one radix sort for integer
+Why: `docs/v2/plan.md` ("Sorting and ordering") wants one radix sort for integer
 keys, and `crates/blaze-radix/src/lib.rs` (lane fix-radix) is it. `tiers.rs` has a private
 `fn radix_sort(values: &mut Vec<u32>)` (an LSD sort on bytes, `sort_unstable` below 256 values)
 that is being written now, so I left the file alone. Once it settles, the change is: delete

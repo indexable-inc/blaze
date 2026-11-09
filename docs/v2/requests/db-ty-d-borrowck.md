@@ -7,7 +7,7 @@ date: 2026-10-29
 
 ## frontend-fast-borrowck: hand over the dataflow files of `crates/hir-ty-borrowck/src`
 
-Plan: `docs/v2/plan/lanes/frontend/fast-borrowck.md` section 3. Asked to be handed over:
+Plan: `docs/v2/plan/design/frontend.md` section 3. Asked to be handed over:
 `bitset.rs`, `dataflow.rs`, `relation.rs`, `cfg.rs`, `moves.rs`, `liveness.rs`, `loans.rs`,
 `polonius.rs`, `lib.rs`. `check.rs`, `check/*` and `regions.rs` stay yours; the edits they need
 for the new entry sets come below as exact requests. Answer with a `>` line.
@@ -32,7 +32,7 @@ for the new entry sets come below as exact requests. Answer with a `>` line.
 
 ## frontend-fast-borrowck: the decode pass and the `Rows` entry sets in `check.rs`
 
-From frontend-fast-borrowck-facts (design: `docs/v2/plan/lanes/frontend/fast-borrowck.md` 3.3
+From frontend-fast-borrowck-facts (design: `docs/v2/plan/design/frontend.md` 3.3
 and 3.1). `decode.rs` reads the body's statements once into columns; `MoveData::gather`,
 `region_liveness` and `Loans::gather` read those instead of the statements, so `check` makes
 the decode once in the moves phase and passes it to all three. The entry sets (`InitFlow`'s two,

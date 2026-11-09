@@ -117,7 +117,7 @@ let Flags { mode, .. } = f;             // patterns and `..` update work as for 
   that integer's, so `transmute` to and from it works; bits above the fields are zero in a
   literal and kept by a field write.
 - A field's width comes from its type: `bool` is 1, an integer its width (`u8` is 8; with
-  [integers of any width](v2/plan/lanes/frontend/arbitrary-ints.md), `level: u3` is 3), a fieldless enum the bits
+  [integers of any width](v2/plan/design/arbitrary-ints.md), `level: u3` is 3), a fieldless enum the bits
   that hold its discriminants (`⌈log2 n⌉` for `0..n`, signed when one is negative, its repr's
   width when it has an integer `#[repr]`), a nested `#[blaze::bits]` struct its fields' total.
   `usize`, `isize`, any other type, a generic struct, a `#[repr]` on the struct, a field type
@@ -136,7 +136,7 @@ let Flags { mode, .. } = f;             // patterns and `..` update work as for 
 Not yet: `from_bits`/`into_bits` methods (use `transmute`); a bits struct as a const generic
 argument (refused, naming the type); a tuple bits struct's constructor used as a function value
 in compiled code (refused, naming the struct: call it in a closure); debug info shows the
-backing integer, not the fields. Plan: [v2/plan/lanes/frontend/bits.md](v2/plan/lanes/frontend/bits.md).
+backing integer, not the fields. Plan: [v2/plan/lanes/frontend/bits.md](v2/plan/design/bits.md).
 
 ## Integers of any width
 
@@ -230,7 +230,7 @@ Not yet: `From<bool>`, `Sum`, `Product`, `FromStr`, `Step` (a `for` loop over a 
 `unchecked_*` and the `*_signed`/`*_unsigned` methods; `NonZero<u3>`; atomics; `#[repr(u3)]`
 on an enum. Each is an error naming the type.
 
-Plan: [v2/plan/lanes/frontend/arbitrary-ints.md](v2/plan/lanes/frontend/arbitrary-ints.md).
+Plan: [v2/plan/lanes/frontend/arbitrary-ints.md](v2/plan/design/arbitrary-ints.md).
 
 blaze checks const bodies against rustc's `check_consts` rules (#914, #1440,
 `crates/hir-ty-mir/src/mir/const_check.rs`): E0015 for a non-const call, a call of a `fn`

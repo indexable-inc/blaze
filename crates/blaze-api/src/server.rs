@@ -1,4 +1,4 @@
-//! The daemon's listener (docs/v2/plan/lanes/ci.md; #277), a sans-IO state machine over [`blaze_core`]'s
+//! The daemon's listener (docs/v2/plan.md; #277), a sans-IO state machine over [`blaze_core`]'s
 //! sockets: it listens, cuts requests from what peers send, hands the session what
 //! [`Arrived`], and sends each [`Reply`] where it goes.
 //!

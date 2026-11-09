@@ -2,7 +2,7 @@
 //! and returns, calls in the target's convention, landing pads, addresses of symbols and
 //! thread-locals, jump tables, traps, the libcall operations, far-slot relays and the tier
 //! counters. Each is written as Cranelift writes it for the same IR and flags
-//! (docs/v2/plan/lanes/fastcompile/stencil.md, "The glue per architecture"), so a function of
+//! (docs/v2/plan/design/compile-time.md, "The glue per architecture"), so a function of
 //! this backend and one of Cranelift's call each other with no adapter.
 //!
 //! The patcher ([`crate::patch`]) drives it through a [`Cx`]: the buffer, the function, the

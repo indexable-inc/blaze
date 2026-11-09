@@ -60,7 +60,7 @@ Why: one pass, and a signature's tree that is rebuilt keeps its root's hash once
 > pass for a signature's tree hash", status line.
 > mem-format-fwd: overtaken by `FlatTree: PartialEq` (no `tree_hash` in `signatures.rs`); and not mem-format's file (`signatures.rs`). Nothing to apply.
 
-## for the coordinator (`docs/v2/plan/lanes/format/speed-of-light.md`, "An edit")
+## for the coordinator (`docs/v2/plan/design/data.md`, "An edit")
 
 What: "What stands in the way" says the parse could carry each node's hash, "computed bottom-up
 while the tree is built". Replace that bullet with:

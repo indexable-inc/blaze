@@ -8,11 +8,11 @@ date: 2026-10-29
 
 - What: root `Cargo.toml` `[workspace.dependencies]`: add `blaze-radix = { path = "crates/blaze-radix" }`
   (next to `blaze-ids`). The member is already covered by `crates/*`.
-- What: `docs/v2/plan/reference/crates.md`: list `crates/blaze-radix` (owner `fix-radix`): the one
+- What: `docs/v2/plan.md`: list `crates/blaze-radix` (owner `fix-radix`): the one
   stable LSD radix sort, a leaf crate with no dependencies.
 - Why: `blaze-core` uses the radix sort, `blaze-check` (the model checker) depends on `blaze-core`,
   and `blaze-ids` takes `blaze-check` under `cfg(blaze_check)`: with the sort in `blaze-ids` that is
-  a cycle (asked by safety-model-format; docs/v2/plan/lanes/safety/model.md keeps `blaze-core` below
+  a cycle (asked by safety-model-format; docs/v2/plan/design/model-checker.md keeps `blaze-core` below
   crates with model tests). `blaze-ids` now re-exports it (`pub use blaze_radix as radix;`), so every
   `blaze_ids::radix::...` call site is unchanged; `blaze-core` and `blaze-graph` use `blaze-radix`
   directly and no longer depend on `blaze-ids`.

@@ -21,7 +21,7 @@ files: 0 findings.
 ## docs/README.md is stale
 
 `python3 tools/docs.py check` says `docs/README.md is stale`. That covers this lane's new
-`docs/v2/plan/lanes/mem/core/linux.md`, among others. Fix: `python3 tools/docs.py write` when the
+`docs/v2/plan/design/memory.md`, among others. Fix: `python3 tools/docs.py write` when the
 lanes' docs land.
 
 > forwarded to the coordinator (`python3 tools/docs.py write` once the lanes' docs land), on the requests report's list (requests, pass 19).

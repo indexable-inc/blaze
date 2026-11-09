@@ -70,7 +70,7 @@ date: 2026-10-29
 ## 5. docs/README.md: index the new plan doc (required)
 
 - What: run `python3 tools/docs.py write` so the index lists
-  `docs/v2/plan/lanes/usercode/scripts.md` and `docs/v2/plan/lanes/usercode/speed-of-light.md`.
+  `docs/v2/plan.md` and `docs/v2/plan.md`.
 - Where: `docs/README.md` (generated).
 - Why: the docs are new, and `tools/docs.py check` fails on a stale index. (`speed-of-light.md`
   is lane usercode's, with a section per component; this lane wrote the first, for
@@ -87,7 +87,7 @@ date: 2026-10-29
   whoever makes it), `crates/blaze-cargo/src/cargo/compile_time.rs` (`self.inherited`).
 - Why: `env` now checks whether the inherited environment is sorted (one pass) and only
   sorts its indices when it is not: about 3,600 cycles a unit saved, a quarter of `env`'s
-  bound (`docs/v2/plan/lanes/usercode/speed-of-light.md`, "The environment"). The result is
+  bound (`docs/v2/plan.md`, "The environment"). The result is
   the same either way.
 
 > forwarded to usercode and cargo (told by tmux).

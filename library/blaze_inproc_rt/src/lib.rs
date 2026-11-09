@@ -1,5 +1,5 @@
 //! blaze's dev runtime: the run process's side of a dev run on the daemon's code memory
-//! (docs/v2/plan/lanes/fastcompile/inproc.md), and what both sides share.
+//! (docs/v2/plan/design/compile-time.md), and what both sides share.
 //!
 //! - [`runtime`]: the start hook, `blaze_inproc_start`, which the link puts first among a dev
 //!   executable's initializers. Before `main` it attaches the process to the daemon and lays the

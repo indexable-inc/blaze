@@ -15,7 +15,7 @@ This describes blaze v1. Its store (`crates/blaze-store`) and remote (blaze-carg
 `remote.rs`) were deleted on 2026-10-30, with the `blaze-engine cache` commands, `BLAZE_CACHE`
 and every `BLAZE_REMOTE*` variable. v2 keeps one store per daemon in `$BLAZE_HOME/v2/store`
 (`crates/blaze-cas`), and its remote is the read-through tier `blaze_cas::remote`: see
-[v2/plan/lanes/store.md](v2/plan/lanes/store.md). The reports behind this file are
+[v2/plan/lanes/store.md](v2/plan/design/store.md). The reports behind this file are
 [reports/DISKCACHE.md](reports/DISKCACHE.md) and [reports/REMOTE.md](reports/REMOTE.md).
 
 ## What is stored and under what key

@@ -1,5 +1,5 @@
 //! Dev runs and tests that patch running code with one store (docs/v2/plan/design/compile-time.md
-//! change 6, docs/v2/plan/lanes/fastcompile/inproc.md).
+//! change 6, docs/v2/plan/design/compile-time.md).
 //!
 //! A [`CodeMemory`] is one OS memory object (Linux `memfd_create`, macOS a Mach memory entry,
 //! Windows a pagefile-backed section) mapped writable in the daemon and executable in every
@@ -79,7 +79,7 @@
 // The run process's side and what both sides share (the channel's frames, the handshake, the
 // image's headers, the asks, the fence's words, the platform) are `blaze-inproc-rt`, whose source
 // is library/blaze_inproc_rt: the dev runtime blaze links into every dev executable whose
-// dependencies don't link it themselves (docs/v2/plan/lanes/fastcompile/inproc.md, "The
+// dependencies don't link it themselves (docs/v2/plan/design/compile-time.md, "The
 // runtime"). This crate is the daemon's side built on it, and names its modules as its own.
 #[cfg(test)]
 pub(crate) use blaze_inproc_rt::bind;

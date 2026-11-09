@@ -8,7 +8,7 @@ date: 2026-10-21
 2026-10-21. What was fetched is in [docs/upstream/glancer/](../upstream/glancer/SOURCE.md). Each
 claim is marked **read** (in a source we read, or measured), **reported** (someone says so and we
 did not check) or **unverified** (our inference). The plan this feeds is
-[docs/glancer.md](../glancer.md).
+[docs/v2/plan.md](../v2/plan.md).
 
 ## What Rust Glancer is
 

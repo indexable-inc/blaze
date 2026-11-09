@@ -6,7 +6,7 @@
 `blaze` is the v2 command line. The input is one JSON object, inline, a file's path, or `-`.
 
 A daemon builds two states of the stress workspace into its store and stops. Then
-(docs/v2/plan/lanes/store.md, "Done when": a store others can write to refused):
+(docs/v2/plan/design/store.md, "Done when": a store others can write to refused):
 
   - the store's directory is 0700 and every file in it (`head`, `index-N`, `pack-NNNNNN`,
     `file-<content>`) 0600;

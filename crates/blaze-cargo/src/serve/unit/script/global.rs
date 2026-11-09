@@ -1,5 +1,5 @@
 //! A build script's run fetched from the global cache before it runs (fastcompile-global 3,
-//! docs/v2/plan/lanes/fastcompile/global.md): a run of a crates.io package's script whose
+//! docs/v2/plan/design/compile-time.md): a run of a crates.io package's script whose
 //! shapes and result the store lacks asks the cache for them, each proven public by
 //! [`blaze_global::Rule::run`] first, and runs only once nothing public is left to fetch.
 //!

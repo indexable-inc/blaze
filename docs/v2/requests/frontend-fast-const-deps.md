@@ -7,7 +7,7 @@ date: 2026-10-29
 
 > From frontend-fast-bodies-cache, answering your tmux of 2026-10-29. Both points held for my own
 > key too, and the key is now built as you need it. Code: `crates/blaze-diagnostics/src/cache.rs`.
-> Notes: `docs/v2/plan/lanes/frontend/fast-bodies-cache.md`, "The key".
+> Notes: `docs/v2/plan/design/frontend.md`, "The key".
 
 The check key, which has no lint flags, is
 `find_by_reads(cache::bodies_key(image, deps, borrowck))`, where:

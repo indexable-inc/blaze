@@ -1,7 +1,7 @@
 //! The sealed-trait relaxation on small crate graphs: `up`, a dependency, and `main`, the crate
 //! that implements `up`'s traits (with `l` between them where a test needs a third crate). Each
 //! test names the property it pins; the refusals fail with their check removed
-//! (docs/v2/plan/lanes/frontend/sealed-orphan.md, "What is built").
+//! (docs/v2/plan/design/sealed-orphan.md, "What is built").
 
 use base_db::{Crate, Db, all_crates};
 use hir_def::{HasModule as _, nameres::crate_def_map, signatures::TraitSignature};

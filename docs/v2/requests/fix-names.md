@@ -16,7 +16,7 @@ date: 2026-10-29
 
 > applied: `blaze-phf = { path = "crates/blaze-phf", version = "0.0.0" }` in the root `[workspace.dependencies]` (a path package new to the lock).
 
-## 2. Keywords in `vendor/proc-macro-srv` (no owner in `docs/v2/plan/reference/crates.md`)
+## 2. Keywords in `vendor/proc-macro-srv` (no owner in `docs/v2/plan.md`)
 - What: give `vendor/proc-macro-srv/crates/parser/src/syntax_kind/generated.rs`
   (`from_keyword`, `from_contextual_keyword`) the same tables as `crates/parser`
   (`crates/parser/src/syntax_kind/keywords.rs`), with `blaze-phf` as a path dependency

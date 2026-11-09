@@ -7,7 +7,7 @@ date: 2026-10-29
 
 ## frontend-tree: declare the view modules
 
-frontend.md item 16 (notes: `docs/v2/plan/lanes/frontend/tree.md`). frontend-tree writes the new
+frontend.md item 16 (notes: `docs/v2/plan/design/frontend.md`). frontend-tree writes the new
 files `crates/syntax-tree/src/view.rs`, `crates/syntax/src/view.rs`, `crates/syntax/src/view/**`
 and `crates/syntax/tests/view.rs`; they need three lines in files you own.
 
@@ -59,7 +59,7 @@ Status: open
 
 Why: item 4 (docs/v2/plan/design/frontend.md) is to have no conversion left. The parser will
 read `parser::Tokens<'t>`, a borrowed slice of its words, so that it parses a token tree's
-words where they lie (design: docs/v2/plan/lanes/frontend/tokens.md, "Item 4"). `Parser`
+words where they lie (design: docs/v2/plan/design/frontend.md, "Item 4"). `Parser`
 calls your `outline::lazy_block_len(self.inp, self.pos)`, so its argument has to be able to be a
 `Tokens`.
 
@@ -183,7 +183,7 @@ Justify, a comment on the line above each:
   `// alloc: why a crate is refused, once per refused crate`
 
 Why: the coordinator's rule ("Allocation, `dyn` and clones are controlled mechanically"). The read
-path's speed of light is in `docs/v2/plan/lanes/db/speed-of-light.md`, "hir-def: attributes,
+path's speed of light is in `docs/v2/plan.md`, "hir-def: attributes,
 interned locs, lang items (speed-hir-sol-defs)".
 
 Status: open
@@ -194,7 +194,7 @@ Status: open
 
 From `speed-hir-sol-items` (child of `speed-hir`). These are your files (`item_tree.rs`,
 `item_tree/`), so here are exact edits, grouped by what they do. The arithmetic is in
-`docs/v2/plan/lanes/format/speed-of-light.md`, "The item tree: `hir-def` `item_tree*`
+`docs/v2/plan/design/data.md`, "The item tree: `hir-def` `item_tree*`
 (speed-hir-sol-items)".
 
 hot_lint (`tools/v2/hot_lint.py`, whole workspace, 20:10) finds nothing in `item_tree*`: every
@@ -898,7 +898,7 @@ Status: open
 > body keystroke on a 500-item file (13 µs of it ids and anchors), against 29 µs plus a
 > backdating compare for `lower_whole`. The span slices requested in
 > `docs/v2/requests/frontend-deps-items.md` take it to about 3 µs. Written up in
-> `docs/v2/plan/lanes/frontend/speed-of-light.md` (frontend-deps-reparse items 4 to 6, the
+> `docs/v2/plan/design/frontend.md` (frontend-deps-reparse items 4 to 6, the
 > keystroke) and `reparse.md`.
 > frontend-deps-items (2026-10-29 22:05): the span slices are in. `items.rs` compares the ast
 > id entries and anchors in bulk, so only touched items read the maps. Item 4 is about 6 µs;
@@ -906,7 +906,7 @@ Status: open
 
 ### speed-hir-sol-defs: `serve`'s read path is serial and copies each part (design)
 
-Counted in `docs/v2/plan/lanes/db/speed-of-light.md`, section "hir-def: attributes, interned
+Counted in `docs/v2/plan.md`, section "hir-def: attributes, interned
 locs, lang items (speed-hir-sol-defs)". For 300 crates and an assumed 50 MB of images, it is
 ≈ 12 ms today against ≈ 0.6 ms at the bound.
 - `serve` calls `images.get` one crate at a time, so the store's read and BLAKE3 check of
@@ -981,7 +981,7 @@ visibility.rs, signatures.rs twice).
 ## frontend-fast-bodies-cache: `Stored` gives each written crate's filed key (2026-10-29)
 
 A dependency's check outcome (`blaze_diagnostics::cache`, notes
-`docs/v2/plan/lanes/frontend/fast-bodies-cache.md`, "The key") is filed under the key its image
+`docs/v2/plan/design/frontend.md`, "The key") is filed under the key its image
 is filed under (`Image::key`: the crate key and, with reads, their values), plus the lint flags,
 `keep_duplicates` and the borrowck mode. For a served crate that key is
 `DepImages::try_get(db)?.images(db).get(&krate).map(Image::key)` (all `pub` already, nothing
@@ -1043,7 +1043,7 @@ In `crates/hir-def/src/deps/serve.rs`:
 
 ## frontend-fast-const-deps: an item's key for a constant, public (2026-10-29)
 
-`hir_ty::consteval::deps` (notes `docs/v2/plan/lanes/frontend/fast-const-deps.md`, "The key")
+`hir_ty::consteval::deps` (notes `docs/v2/plan/design/frontend.md`, "The key")
 keeps a dependency's evaluated `const` items in the store under a hash of the crate's
 check-result key, the item's stable key and its schema. The item's stable key is
 `signatures::key::of(db, Item::Const(id))`, which is `pub(super)` in a private module. Asked:

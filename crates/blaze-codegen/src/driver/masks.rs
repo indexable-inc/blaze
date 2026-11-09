@@ -1,5 +1,5 @@
 //! The forms of the masked IR every build of a daemon folds (#1292,
-//! docs/v2/plan/lanes/fastcompile/hashcons.md), hash-consed: a form seen by an earlier build
+//! docs/v2/plan/design/compile-time.md), hash-consed: a form seen by an earlier build
 //! is not hashed again. A function's masked IR itself is made from its IR in each build that
 //! folds it: no key known before preparing holds every input of its data objects' content.
 

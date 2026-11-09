@@ -5,7 +5,7 @@ date: 2026-10-29
 ---
 # mem-db-infer-ctx: requests
 
-Part of `mem-db-infer` (`docs/v2/plan/lanes/mem/db-infer.md`, rules R1 to R8). Files, all in
+Part of `mem-db-infer` (`docs/v2/plan/design/memory.md`, rules R1 to R8). Files, all in
 `crates/hir-ty/src/`: `infer.rs`, `infer/{unify,columns,persist,fallback,diagnostics,ambiguity,
 at_error,mutability,opaques,path,autoderef}.rs`. Their owner is lane db (none done), so every
 change below is a request. Lines are as of 2026-10-29 21:30 (UTC-7); `infer.rs` moved by 16 lines
@@ -1511,7 +1511,7 @@ After, the fields that change (the others as they are):
 #[derive(Debug)]
 pub(crate) struct InferenceContext<'db, 'f> {
     // .. `db` to `features` unchanged ..
-    /// The run's frame (docs/v2/plan/lanes/mem/db-infer.md, R1): `result`'s tables and every
+    /// The run's frame (docs/v2/plan/design/memory.md, R1): `result`'s tables and every
     /// temporary below live in it until the result is frozen.
     pub(crate) frame: &'f Frame,
     /// The traits in scope, disregarding block modules. This is used for caching purposes.
@@ -1964,9 +1964,9 @@ reused `Rc` set's was, which already varied with what the previous block held; o
 an ambiguity's candidate sources depends on it.) Its caller, `method_resolution.rs:194`
 `with_method_resolution`, is entry M1.
 
-> superseded, applied otherwise by db-mem-infer-a-ctx (21:45): frontend-fast-method's `TraitsInScope` (`method_resolution/scope_sets.rs`, docs/v2/plan/lanes/frontend/fast-method.md section 7) replaces the body's set: `with_method_resolution` passes `TraitsInScope::of_resolver(self.db, &self.resolver)` (written by frontend-fast-method), so `infer.rs`'s `traits_in_scope`, `block_traits` and `get_traits_in_scope` are deleted (A4 and A5's lines for them with it, and `Cell`'s import). `sized_bound.rs`' all-traits probe moves to `TraitsInScope::Set(TraitSet::new(..))` (handed to db-mem-infer-a-small).
+> superseded, applied otherwise by db-mem-infer-a-ctx (21:45): frontend-fast-method's `TraitsInScope` (`method_resolution/scope_sets.rs`, docs/v2/plan/design/frontend.md section 7) replaces the body's set: `with_method_resolution` passes `TraitsInScope::of_resolver(self.db, &self.resolver)` (written by frontend-fast-method), so `infer.rs`'s `traits_in_scope`, `block_traits` and `get_traits_in_scope` are deleted (A4 and A5's lines for them with it, and `Cell`'s import). `sized_bound.rs`' all-traits probe moves to `TraitsInScope::Set(TraitSet::new(..))` (handed to db-mem-infer-a-small).
 
-> superseded, applied otherwise by db-mem-infer-a-ctx (21:45): frontend-fast-method's `TraitsInScope` (`method_resolution/scope_sets.rs`, docs/v2/plan/lanes/frontend/fast-method.md section 7) replaces the body's set: `with_method_resolution` passes `TraitsInScope::of_resolver(self.db, &self.resolver)` (written by frontend-fast-method), so `infer.rs`'s `traits_in_scope`, `block_traits` and `get_traits_in_scope` are deleted (A4 and A5's lines for them with it, and `Cell`'s import). `sized_bound.rs`' all-traits probe moves to `TraitsInScope::Set(TraitSet::new(..))` (handed to db-mem-infer-a-small).
+> superseded, applied otherwise by db-mem-infer-a-ctx (21:45): frontend-fast-method's `TraitsInScope` (`method_resolution/scope_sets.rs`, docs/v2/plan/design/frontend.md section 7) replaces the body's set: `with_method_resolution` passes `TraitsInScope::of_resolver(self.db, &self.resolver)` (written by frontend-fast-method), so `infer.rs`'s `traits_in_scope`, `block_traits` and `get_traits_in_scope` are deleted (A4 and A5's lines for them with it, and `Cell`'s import). `sized_bound.rs`' all-traits probe moves to `TraitsInScope::Set(TraitSet::new(..))` (handed to db-mem-infer-a-small).
 
 ### A11. The two context helpers of mem-db-infer-expr's X1 and X4
 

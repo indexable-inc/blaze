@@ -243,7 +243,7 @@ Fn =
  SpecClause*
  (body:BlockExpr | ';')
 
-// blaze_verify (docs/v2/plan/lanes/verus.md): a function's `requires`, `recommends`, `ensures`
+// blaze_verify (docs/v2/plan/design/verus.md): a function's `requires`, `recommends`, `ensures`
 // and `decreases`, in that order, and a loop's `invariant`, `ensures` and `decreases`.
 SpecClause =
   ('requires' | 'recommends' | 'ensures' | 'decreases' | 'invariant')

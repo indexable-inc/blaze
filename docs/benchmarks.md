@@ -18,7 +18,7 @@ Every number on this page is blaze v1's: each table names the commit it measured
 profile, `llvm` the release profile on both sides), but has not run against v2 yet
 ([harness.md](harness.md#timing)). Where this page says what the daemon does (hands an edit to
 cargo, builds cold with cargo, leaves crates to rustc), it says what v1 did; v2 never hands a
-build to cargo or rustc. v2's targets are in [v2/plan/goals/targets.md](v2/plan/goals/targets.md),
+build to cargo or rustc. v2's targets are in [v2/plan/goals/targets.md](v2/plan/objectives.md),
 and `harness/v2/budgets.py` is what measures them.
 
 - [How fast an edit builds](#how-fast-an-edit-builds)

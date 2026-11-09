@@ -8,7 +8,7 @@ date: 2026-10-30
 ## dedup: one type identity for the code generator and the share key
 
 From `dedup-scan-ident` (lane `dedup`), 2026-10-29. Notes:
-`docs/v2/plan/lanes/dedup/scan-ident.md`. The paired request to lane `codegen` is
+`docs/v2/plan/design/data.md`. The paired request to lane `codegen` is
 `docs/v2/requests/codegen.md`, `## dedup: one type identity (hashes.rs onto hir-ty-share)`. Apply
 this one first: codegen's edit calls what this one makes public.
 

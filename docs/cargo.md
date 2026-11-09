@@ -12,7 +12,7 @@ blaze had another name and another command before 2026-10-28; [rename.md](rename
 This file describes blaze v2, checked against its code on 2026-10-30: the program `blaze`
 (`crates/blaze-engine/src/program.rs`), in front of the client (`crates/blaze-cargo/src/cli.rs`
 and `cli/`) of the daemon `blaze serve` (`crates/blaze-cargo/src/serve/`), on the crates of
-[v2/plan/reference/crates.md](v2/plan/reference/crates.md). v1's code was deleted that day;
+[v2/plan/reference/crates.md](v2/plan.md). v1's code was deleted that day;
 where v1 had a setting or command v2 lacks, the section says so. v2's design is
 [v2/plan.md](v2/plan.md).
 
@@ -209,7 +209,7 @@ blaze never runs rustc, and a build has one path ([no-rustc.md](no-rustc.md)). T
 reads the command line as cargo does, into cargo's unit graph (`crates/blaze-units`: the
 packages, features, profiles, targets and build-script runs cargo would have), and builds
 each unit itself: every crate is compiled by blaze over blaze's standard library, a
-function at a time ([v2/plan/design/model.md](v2/plan/design/model.md)), and each program is
+function at a time ([v2/plan/design/model.md](v2/plan.md)), and each program is
 linked by blaze's linker (`crates/blaze-link`) where cargo puts it in the build directory
 (`debug/<name>`, `release/<name>`, `examples/` for an example). No `cargo build` runs. A function the
 program can reach that blaze cannot compile fails its unit, naming the function and why;
@@ -362,7 +362,7 @@ A `blaze.lock` that would pin nothing is not written. Unknown keys and other for
 errors naming the file. Why a second file and not `Cargo.lock`'s `[metadata]`: that table is a
 flat map of strings cargo copies through `cargo update` untouched, so a pin there would go stale
 without a word, and anything blaze adds to `Cargo.lock` stops it being what cargo writes. One
-file holds every pin that is not a crate (docs/v2/plan/lock-policy.md).
+file holds every pin that is not a crate (docs/v2/plan/design/lock-policy.md).
 
 ### Link arguments
 
@@ -560,7 +560,7 @@ network rule; a sandbox inside the sandbox fails with `EPERM`.
 What it cost v1, measured with `harness/sandboxbench.py` on 2026-10-26 (one sandbox per
 executable, v1's way, against a sandbox per test). v2's fork server is a third way, one sandbox
 per binary and a fork per test, not measured here; its costs are in
-[v2/plan/lanes/usercode/tests.md](v2/plan/lanes/usercode/tests.md):
+[v2/plan/lanes/usercode/tests.md](v2/plan.md):
 
 | | Linux x86-64 (dev host, 16 cores) | macOS (M5 Max, 8 at a time, loaded) |
 |---|---|---|
@@ -750,7 +750,7 @@ hint and the record is what counts. What is kept is its exit, what it printed an
 in `OUT_DIR`, which a reused run writes back as it was. A run that failed is not kept, and
 runs again on the next build, as cargo reruns it. A run outside the sandbox
 (`unsandboxed-build-scripts`, `BLAZE_SANDBOX=off`) is never kept. The design is
-[v2/plan/lanes/usercode/scripts.md](v2/plan/lanes/usercode/scripts.md).
+[v2/plan/lanes/usercode/scripts.md](v2/plan.md).
 
 A build script's sandbox costs one launch (8 ms on Linux, 38 ms on macOS, measured on
 2026-10-26), which is lost in a cold build's noise.
@@ -834,7 +834,7 @@ the run's key (`blaze_usercode::script::Place::pinned`), so another archive is a
 
 Every build runs its proc macros as `wasm32-wasip1` modules under Wasmtime, in the daemon's own
 process (`crates/blaze-macro-eval/src/wasm.rs`, `blaze_macro_eval::load_wasm`;
-[v2/plan/lanes/usercode/macros.md](v2/plan/lanes/usercode/macros.md)). blaze builds each
+[v2/plan/lanes/usercode/macros.md](v2/plan/design/proc-macros.md)). blaze builds each
 proc-macro crate, and every crate it depends on, for `wasm32-wasip1` with its own front end and
 code generator, against the real std and `library/proc_macro` (`UnitPlan::macro_wasm`,
 `crates/blaze-units/src/load.rs`): nothing rustc compiles is loaded and no process is started.
@@ -944,7 +944,7 @@ run them instead and send each result, which the client prints in libtest's form
   `executable`, `outcome`, `millis`, `outside`, `output`, and `cached` (null for a test that
   ran; else the kept run's `basis`, `executed` or `reached`, its `why`, `millis` and
   `outcome`), as `crates/blaze-cargo/src/cli/json.rs` (`test_result`) writes it. The design is
-  [v2/plan/lanes/usercode/tests.md](v2/plan/lanes/usercode/tests.md) and
+  [v2/plan/lanes/usercode/tests.md](v2/plan.md) and
   [v2/plan/design/compile-time.md](v2/plan/design/compile-time.md), idea 3.
 - `--ub` runs the tests picked (every one, or with `--reached` those it would run) in blaze's
   MIR evaluator under the checker of undefined behavior (`crates/hir-ty-ub`), compiling
@@ -986,7 +986,7 @@ program is a libtest runner that runs each under rustdoc's name and judges it as
 does. The examples are built side by side, an edit of one example rebuilds and relinks that
 one alone, and a `test_harness` example is built as a test under its own libtest harness, as
 rustdoc's `--test` builds it. A unit blaze can't build fails alone: unless
-`--fail-fast`, every other unit's tests still run, and the end names the doc tests it held back. The design and what is left are in [v2/plan/doctests.md](v2/plan/doctests.md).
+`--fail-fast`, every other unit's tests still run, and the end names the doc tests it held back. The design and what is left are in [v2/plan/doctests.md](v2/plan/design/doctests.md).
 
 ## The daemon
 
@@ -1119,7 +1119,7 @@ The directory holds what has to be a real path: build scripts' `OUT_DIR`s, the e
 that are run (programs, tests, build scripts) and the `doc` pages a user opens. What is
 addressed by content lives in the store. An output of 16 KiB or more (a library, an executable,
 a test) is placed in the directory as a clone of the store's read-only copy of its bytes
-([v2-store.md](v2-store.md#chunks-and-placing)), so a second checkout of the same project adds
+([v2-store.md](v2/plan/design/store.md)), so a second checkout of the same project adds
 only the blocks its own outputs differ in; a volume that cannot clone (or a build directory on
 another volume than the store) fails the build, naming both volumes, and nothing is copied
 instead. Each build reports the bytes it placed by clone, wrote and copied in its `blaze-work`
@@ -1176,7 +1176,7 @@ and `blaze cache gc --dry-run` shows each volume's free space, its levels and wh
 
 The store is always on: one per daemon, in `$BLAZE_HOME/v2/store`, the user's alone (the
 daemon refuses one another user owns or others may write to;
-[v2/plan/lanes/store.md](v2/plan/lanes/store.md)).
+[v2/plan/lanes/store.md](v2/plan/design/store.md)).
 
 ## Pinning a release of blaze
 
@@ -1461,7 +1461,7 @@ configuration it checked (the lib, the lib as a test, each bin, test, bench and 
 own check leaves out), `blaze::test_only` when only the tests do (`--fix` adds `#[cfg(test)]`)
 and `blaze::cfg_only` when only some features or platforms do (with the narrowest exact
 `#[cfg]`). The group `blaze::reach` sets all three; they warn by default. None is given when a
-unit failed. See [the plan](v2/plan/multiconfig-check.md).
+unit failed. See [the plan](v2/plan/design/multiconfig-check.md).
 
 `--baselines DIR` holds the run's `clippy::` and `blaze::` findings, counted by lint and crate
 (the package of the unit that gave each; a finding a crate's lib and its lib test both give
@@ -1490,7 +1490,7 @@ needs that target's C compiler and LLVM for the build scripts, so it is not the 
 Tests are not counted yet: blaze's check of a test target fails for now ("can't find crate for
 `test`"), and once it passes the scope grows to every target and the baselines are made again.
 None is made yet: blaze cannot yet finish this check of its own workspace (see
-[the lints plan](v2/plan/lanes/lints.md#baselines)), so `lint-baselines` fails until a run does
+[the lints plan](lints.md)), so `lint-baselines` fails until a run does
 and the first baselines are made with `--new-baseline`.
 
 A record of v1 (as of 2026-10-27). v1's `blaze clippy` linted with

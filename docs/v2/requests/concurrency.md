@@ -9,7 +9,7 @@ date: 2026-10-29
 
 Paths: `crates/blaze-cas/src/remote.rs`, and `Store::take_fetched`/`put` in
 `crates/blaze-cas/src/lib.rs`. Before and after numbers:
-`docs/v2/plan/lanes/store/speed-link-edge-remote.md`. Nothing outside `blaze-cas` calls
+`docs/v2/plan/design/store.md`. Nothing outside `blaze-cas` calls
 `blaze_cas::remote` yet, so the signature changes below break no caller. C1 is a memory bound,
 so do it even if you skip the rest.
 
@@ -274,14 +274,14 @@ answers are refused as malformed (an error, never a wrong value).
 > forwarded to fastcompile: `crates/blaze-global/` is fastcompile-global's.
 > applied (fastcompile-global): both answers in `client.rs` (`fetched`, the missing and the kept value) are `Answer::encode_framed()`. A refused value stays `Done::Failed`.
 
-### R4. store (or the coordinator): `docs/v2-store.md`
+### R4. store (or the coordinator): `docs/v2/plan/design/store.md`
 
 It still describes `put` appending to memory under one writer, `Append`, and flags indexed by
 row with a delta entry of 48 bytes. Describe instead: `Reader` and `Writer`, per-worker
 segments, spots retargeted to packs after mapping, `WriteAt` pack writes, and point at
-`docs/v2/plan/lanes/concurrency/store.md`.
+`docs/v2/plan/design/concurrency.md`.
 
-> forwarded to coordinator: `docs/v2-store.md` is not in any lane's paths in crates.md, so it falls to the coordinator.
+> forwarded to coordinator: `docs/v2/plan/design/store.md` is not in any lane's paths in crates.md, so it falls to the coordinator.
 
 ## From safety-fuzz-cas (2026-10-29)
 
@@ -433,7 +433,7 @@ blaze-check.workspace = true
 
 ```rust
 //! The atomics and thread-local this crate's slots and epoch use: `std`'s, or under
-//! `cfg(blaze_check)` the model checker's (docs/v2/plan/lanes/safety/model.md "The switch").
+//! `cfg(blaze_check)` the model checker's (docs/v2/plan/design/model-checker.md "The switch").
 
 #[cfg(not(blaze_check))]
 pub(crate) use std::{sync::atomic, thread_local};
@@ -486,7 +486,7 @@ mod tests;
 **`src/model.rs`** (new):
 
 ```rust
-//! Model tests (docs/v2/plan/lanes/safety/model.md) of the slots, `enter`/`Guard`, `Grace` and
+//! Model tests (docs/v2/plan/design/model-checker.md) of the slots, `enter`/`Guard`, `Grace` and
 //! `Limbo`, from 2 or 3 threads under every interleaving to the preemption bound and every
 //! value C11 lets a load read. A retired value holds a tracked cell its readers read and its
 //! drop writes, so a free not ordered after a read is a data race the checker reports. What
@@ -682,7 +682,7 @@ blaze-check.workspace = true
 
 ```rust
 //! The synchronization types this crate's tables, segments and flags use: `std`'s, or under
-//! `cfg(blaze_check)` the model checker's (docs/v2/plan/lanes/safety/model.md "The switch"),
+//! `cfg(blaze_check)` the model checker's (docs/v2/plan/design/model-checker.md "The switch"),
 //! and [`track`], a segment chunk's raw bytes as a model sees them.
 
 #[cfg(not(blaze_check))]
@@ -858,7 +858,7 @@ The chunk's tracking: four calls into `crate::sync::track` (blaze-check's
 **`src/model.rs`** (new):
 
 ```rust
-//! Model tests (docs/v2/plan/lanes/safety/model.md) of the store's lock-free structures: a
+//! Model tests (docs/v2/plan/design/model-checker.md) of the store's lock-free structures: a
 //! table's slots and levels, the flag bits of a table and of an index, and a segment chunk's
 //! published bytes, each from 2 or 3 threads under every interleaving to the preemption bound
 //! and every value C11 lets a load read, against a sequential model. A table value holds a

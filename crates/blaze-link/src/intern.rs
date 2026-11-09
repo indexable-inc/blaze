@@ -1,5 +1,5 @@
 //! The symbol table's storage on reserved regions (docs/v2/plan/design/memory.md, "tables,
-//! interners and columns"; docs/v2/plan/lanes/mem/backend-link.md).
+//! interners and columns"; docs/v2/plan/design/memory.md).
 //!
 //! Each of the 64 shards of [`crate::symbols::Symbols`]' three tables (symbol keys, names, ids) keeps its
 //! entries in [`RegionVec`]s tagged [`Tag::Link`] and finds them through an [`Index`]: an

@@ -499,7 +499,7 @@ class Engine(ABC):
     @abstractmethod
     def codegen_inputs(self, ws: Path, env: dict[str, str]) -> dict[str, str]:
         """The input of every function's code generation in the last build of `ws`, by the
-        instance's content key: what the oracle compares bit for bit (docs/v2/plan/lanes/proof.md)."""
+        instance's content key: what the oracle compares bit for bit (docs/v2/plan.md)."""
 
     @abstractmethod
     def critical_path_s(self, ws: Path, env: dict[str, str]) -> float:

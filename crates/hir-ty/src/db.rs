@@ -39,7 +39,7 @@ use crate::{
 };
 
 /// What hir-ty's inference, lowering, method resolution, layout, const eval and trait
-/// solving allocate (docs/v2/plan/lanes/mem/db.md, contract 3).
+/// solving allocate (docs/v2/plan/design/memory.md, contract 3).
 pub(crate) const INFER_TAG: blaze_mem::Tag = blaze_mem::Tag::Infer;
 /// What hir-ty's MIR queries allocate.
 pub(crate) const MIR_TAG: blaze_mem::Tag = blaze_mem::Tag::Mir;

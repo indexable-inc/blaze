@@ -1,7 +1,7 @@
 //! [`instance_identity`]: compile identity, what one instance's generated code depends on,
 //! by one walk of its generic body in two passes. Two instances of one body with one
 //! identity compile to one body: this is what the code generator's ICF folds by
-//! (`docs/v2/plan/lanes/codegen/icf.md`), and what replaces an instance's arguments in its
+//! (`docs/v2/plan/design/icf.md`), and what replaces an instance's arguments in its
 //! instance key.
 //!
 //! - [`sites`], once per generic body and options, walks the body and lists, in walk order,

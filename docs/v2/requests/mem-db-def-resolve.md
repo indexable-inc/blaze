@@ -7,7 +7,7 @@ date: 2026-10-30
 
 Slice: `crates/hir-def/src/` `nameres/path_resolution.rs`, `item_scope.rs`, `resolver.rs`,
 `per_ns.rs`, `visibility.rs`, `find_path.rs`, `dyn_map.rs`. Notes:
-`docs/v2/plan/lanes/mem/db-def-resolve.md`. Parent: mem-db-def (`docs/v2/requests/mem-db-def.md`, whose
+`docs/v2/plan/design/memory.md`. Parent: mem-db-def (`docs/v2/requests/mem-db-def.md`, whose
 H1 to H3 these need: the `blaze-mem`/`hashbrown` deps, `#![feature(allocator_api)]`, and
 `#[cfg(test)] #[global_allocator] static ALLOC: blaze_alloc_count::Counting` in `lib.rs`).
 
@@ -2034,7 +2034,7 @@ The callers (`resolver.rs`, `collector.rs`, `facts/unit.rs`, `path_resolution.rs
   while building and after.
 - **Building state in the frame, settled once.** Nothing read mid-collection reaches the
   global heap. The memo's tables are each made once at their length, which is the memo contract
-  (`docs/v2/plan/lanes/mem/db.md`, point 3). Frame growth is in place in reserved memory, so it
+  (`docs/v2/plan/design/memory.md`, point 3). Frame growth is in place in reserved memory, so it
   makes no global allocation (blaze-mem `frame.rs`).
 - **Nothing escapes the frame.** `settle` copies every list out, the `ModuleScope` and
   `Modules` take owned values, and `frame::task` resets the frame after the query returns. A
@@ -2042,7 +2042,7 @@ The callers (`resolver.rs`, `collector.rs`, `facts/unit.rs`, `path_resolution.rs
 
 ### R10.6 The ruling's names, and the exact types (2026-10-29, after mem-db-def's ruling)
 
-mem-db-def's ruling (`docs/v2/plan/lanes/mem/db-def.md`, "Ruling: the scopes a collection
+mem-db-def's ruling (`docs/v2/plan/design/memory.md`, "Ruling: the scopes a collection
 builds live in its frame") takes the full fix: the building map in the frame, not a
 reservation. Its tmux text names the parameter `A: Allocator + Copy = Global` on `ItemScope`,
 `ModuleData`, `ModulesMap` and `DefMap`, with the `ThinVec`s becoming `Vec<T, A>`. The ruling's

@@ -53,7 +53,7 @@ call's destination, say so and I'll call `self.machine.typed` there (needs a `Ty
 
 > safety-check: the call path doesn't run `typed` on a call's destination today: only
 > `Assign` (`typed_assign`) and the callee's arguments (`FnEntry`) do. The lane notes' table
-> (`docs/v2/plan/lanes/safety/notes.md`, "Retags without Retag statements") says a call's
+> (`docs/v2/plan/design/unsafe.md`, "Retags without Retag statements") says a call's
 > return value into its destination is a typed copy with `RetagMode::Default`. Wanted:
 > - One `typed` call on the destination, at the destination's type with `Default`, once the
 >   call has written it. Make it at the point every call's destination is complete

@@ -101,7 +101,7 @@ pub(crate) fn units(
         Ok(it) => it,
         Err(error) => return Ok(fail(error)),
     };
-    // blaze's `contract-checks` (docs/v2/plan/lanes/contracts.md, part 1), which cargo's
+    // blaze's `contract-checks` (docs/v2/plan/design/contracts.md, part 1), which cargo's
     // profile tables do not carry. A foreign load builds another build's dependencies with
     // the profile it asks for, whose root default stands.
     if spec.foreign.is_none() {
@@ -962,7 +962,7 @@ fn std_key(
     // (`CompileMode::is_rustc_test`: a test, or a check of one, `check --tests` and the
     // `--all-targets` of `check --fix`, whose crate's root has the harness and its `extern crate
     // test` appended all the same), or a library's doctests, whose runner is a libtest harness
-    // blaze writes (docs/v2/plan/doctests.md).
+    // blaze writes (docs/v2/plan/design/doctests.md).
     let harnessed = !for_macros
         && graph.units.iter().any(|unit| {
             let rustc_test =

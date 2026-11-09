@@ -1,5 +1,5 @@
 """clone_out.py: a second checkout of a project costs only its own bytes
-(docs/v2/plan/lanes/clone-out.md).
+(docs/v2/plan/design/clone-out.md).
 
     uv run --frozen python harness/v2/clone_out.py '{"engine": {"kind": "v2", "blaze": "<blaze>"}, "out": "/tmp/clone-out.json"}'
     uv run --frozen python harness/v2/clone_out.py '{"engine": {...}, "out": "...", "work": "/mnt/btrfs/clone-out"}'

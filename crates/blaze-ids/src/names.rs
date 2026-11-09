@@ -1,4 +1,4 @@
-//! Sorting by name for determinism (docs/v2/plan/goals/principles.md, "Sorting and ordering"):
+//! Sorting by name for determinism (docs/v2/plan.md, "Sorting and ordering"):
 //! a radix sort of each name's [`order_key`], then the bytes only within a run of one key.
 //!
 //! Names that are interned symbols carry their order key already (`intern::Symbol::cmp_order`);

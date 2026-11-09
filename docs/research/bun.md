@@ -193,7 +193,7 @@ EPYC 9R45) unless said otherwise.
   0.64 s against cargo's 14.7 s (was 19.8 s), spliced; a body 0.44 s, a signature 0.57 s, a
   widely used function 0.41 s, a generic function 0.44 s, nothing changed 18 ms; cold to
   ready 73.0 s against cargo's 73.0 s. The daemon's memory is in
-  [docs/glancer.md](../glancer.md).
+  [docs/v2/plan.md](../v2/plan.md).
 - **macOS arm64** (Apple M5 Max, 18 cores, by hand): the whole-program build failed to link
   for two reasons, both fixed. `runbench.py` built blaze's whole program with `-C
   link-dead-code`, which takes `-dead_strip` off the link, so the one object had to resolve
@@ -215,7 +215,7 @@ EPYC 9R45) unless said otherwise.
   81.4 s against cargo's 83.3 s (was 291 s). The signature's median hides its first sample,
   574 s: the daemon gave its own base up at the memory bound of a 128 GiB machine, so that edit
   could not patch rustc's executable and linked bun in full, twice
-  ([docs/glancer.md](../glancer.md), bun). The dev loop's `Bun.Transpiler` run takes 1.33 s,
+  ([docs/v2/plan.md](../v2/plan.md), bun). The dev loop's `Bun.Transpiler` run takes 1.33 s,
   against 0.85 s for cargo's debug build and 0.11 s for its release build.
 
 The reduced nightly fixtures in `harness/bun-repros` keep these two refusals measurable without

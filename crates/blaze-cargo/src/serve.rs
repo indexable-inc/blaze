@@ -1,4 +1,4 @@
-//! `blaze serve` (docs/v2/plan/lanes/cargo/notes.md section 6): v2's daemon. One loop over the
+//! `blaze serve` (docs/v2/plan.md section 6): v2's daemon. One loop over the
 //! platform's driver holds the API server, the session, the VFS, the database, the store and
 //! the plane, and builds what the CLI and agents ask through them.
 //!

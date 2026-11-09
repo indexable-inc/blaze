@@ -1,5 +1,5 @@
 //! A build as it runs now: the one model of it that its client's live view, `blaze status`
-//! and the explorer's daemon source read (docs/v2/plan/observe/build-view.md). [`Now`] is the
+//! and the explorer's daemon source read (docs/v2/plan/design/build-view.md). [`Now`] is the
 //! wire type, said to a build's client about twice a second; [`Fold`] is the sans-IO core
 //! that builds it from tasks and their moves ([`TaskRecord`]s through [`Fold::take`], [`State`]s
 //! through [`Fold::moved`]), the clock it is handed ([`Fold::advance_clock`]) and what one look

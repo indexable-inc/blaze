@@ -1,5 +1,5 @@
 //! Exact test selection (docs/v2/plan/design/compile-time.md, idea 3;
-//! docs/v2/plan/lanes/fastcompile/select.md): a test runs again only when a function it
+//! docs/v2/plan/design/compile-time.md): a test runs again only when a function it
 //! executed is not as it was, or something it read is not; every other test reports its last
 //! pass, marked cached, with how long that run took and what it was selected by.
 //!

@@ -2,7 +2,7 @@
 //!
 //! A value is written once into a chunk of its shard's arena and never moves or is freed: the
 //! stores are statics, so a pointer to a value is good for the life of the process. Memory is
-//! bounded by the database rebuilding what it keeps (docs/v2/plan/lanes/db.md), not by counting references.
+//! bounded by the database rebuilding what it keeps (docs/v2/plan.md), not by counting references.
 //!
 //! The hash is the caller's, and it must be one the values' authors can't steer: a store's
 //! probes are linear, so values that share a hash (or only a home group) cost each insert a walk
@@ -10,7 +10,7 @@
 //! random ([`crate::table`]).
 //!
 //! A shard's table maps a hash to the values with it, SwissTable-style ([`crate::swiss`],
-//! docs/v2/plan/design/hardware.md, "interner and memo lookups"): slots in groups of seven, each group one cache line holding a
+//! docs/v2/plan/design/data.md, "interner and memo lookups"): slots in groups of seven, each group one cache line holding a
 //! control word of tag bytes and the seven value pointers, so a lookup reads one line of the
 //! table and then the value. Finding a value takes no lock and writes nothing; interning one
 //! takes its shard's [`InsertLock`] only to look again and insert. A table grows by copying into
@@ -23,7 +23,7 @@
 //! write never dirties a line a reader loads.
 //!
 //! Chunks grow to 2 MiB, claimed from [`crate::space`]'s region, which is backed by huge pages
-//! where the kernel offers them (docs/v2/plan/design/hardware.md, "memory").
+//! where the kernel offers them (docs/v2/plan/design/data.md, "memory").
 //!
 //! Cost: a value takes one 8-byte pointer and one tag byte in its group's line (9.1 bytes a
 //! slot) and an 8-byte hash in a column only growth reads, at a load of a quarter to a half: 34

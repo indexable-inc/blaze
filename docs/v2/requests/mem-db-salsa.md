@@ -116,9 +116,9 @@ proptest differential against the old copies.
 
 # From mem-db-salsa (to lane db, owner of `vendor/salsa*`; window `db-next2`)
 
-salsa onto `crates/blaze-mem` (mem-db's contract, `docs/v2/plan/lanes/mem/db.md`). Notes and the
-inventory behind each change: `docs/v2/plan/lanes/mem/db-salsa.md`. Speed-salsa's audit
-(`docs/v2/plan/lanes/db/speed-salsa.md`, and S1 to S5 in `docs/v2/requests/db-salsa.md`) is applied
+salsa onto `crates/blaze-mem` (mem-db's contract, `docs/v2/plan/design/memory.md`). Notes and the
+inventory behind each change: `docs/v2/plan/design/memory.md`. Speed-salsa's audit
+(`docs/v2/plan.md`, and S1 to S5 in `docs/v2/requests/db-salsa.md`) is applied
 and not refiled here: the lock-free hits (S1, S2), the shard count (S3), the repeated-read skip
 (S4) and the edge array, node table, 24-byte header and claim-free verify (S5). These changes
 are what is left. M1 to M4 are part 1, M5 and M6 part 2, M7 part 3, M8 the tests. They are
@@ -277,7 +277,7 @@ inner `#[salsa::tracked(..)]` (`tracked_impl.rs:100` to `135`), so methods get i
                 )?
 ```
 
-Which tag each front-end query takes is contract item 3 (`docs/v2/plan/lanes/mem/db.md`); the
+Which tag each front-end query takes is contract item 3 (`docs/v2/plan/design/memory.md`); the
 front-end lanes add `mem_tag = ..` to their tracked attributes (mem-db-def, mem-db-infer,
 mem-db-solver, mem-db-checks file those).
 

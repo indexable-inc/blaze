@@ -1,4 +1,4 @@
-//! What inference allocates (docs/v2/plan/lanes/mem/db-infer.md, "Budget tests"): nothing on a
+//! What inference allocates (docs/v2/plan/design/memory.md, "Budget tests"): nothing on a
 //! re-check of bodies whose inputs did not change, its owned result alone on a run whose
 //! dependencies are all memoized, and frame memory linear in the body.
 

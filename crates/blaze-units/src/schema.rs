@@ -153,7 +153,7 @@ pub struct Profile {
     pub panic: String,
     pub strip: Strip,
     /// blaze: whether the unit checks its native contract clauses at run time (the profile's
-    /// `contract-checks`; docs/v2/plan/lanes/contracts.md, part 1). cargo prints no such key; a
+    /// `contract-checks`; docs/v2/plan/design/contracts.md, part 1). cargo prints no such key; a
     /// graph that lacks it (cargo's own) has it off.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub contract_checks: bool,

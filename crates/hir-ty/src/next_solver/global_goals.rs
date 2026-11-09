@@ -1,5 +1,5 @@
 //! Root goals answered before the solver canonicalizes them
-//! (docs/v2/plan/lanes/frontend/fast-trait.md).
+//! (docs/v2/plan/design/frontend.md).
 //!
 //! A root goal whose predicate and param env, resolved through the unification table, hold no
 //! inference variable, placeholder, local region, error or escaping bound variable, asked in a

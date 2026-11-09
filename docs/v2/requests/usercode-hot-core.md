@@ -5,7 +5,7 @@ date: 2026-10-29
 ---
 # Requests from usercode-hot-core
 
-The clone bar (docs/v2/plan/goals/principles.md, "By construction"): big types in hot crates
+The clone bar (docs/v2/plan.md, "By construction"): big types in hot crates
 don't derive `Clone`. Two of mine still do, because a caller outside my paths needs it (1 and 2); 3 is a caller to
 update for a type made private.
 

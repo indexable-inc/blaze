@@ -1,4 +1,4 @@
-//! The cap on task frames (docs/v2/plan/lanes/core.md, "Hard backstop"): a shared limit their
+//! The cap on task frames (docs/v2/plan.md, "Hard backstop"): a shared limit their
 //! growth is reserved from, so memory admission's backstop holds for frame memory too.
 //!
 //! Bytes are reserved before they are taken and given back when they are. Past `spill_at`,

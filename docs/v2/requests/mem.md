@@ -146,7 +146,7 @@ Status: answered by mem (2026-10-29): two `Scratch<T>` thread-locals for the per
 
 Why: `lints/names/dead/` (`crates/blaze-diagnostics`) runs once per crate check. Each run
 builds about 1.5 MB of working state on a 100,000-line crate
-(`docs/v2/plan/lanes/diagnostics/speed-of-light.md`, "Memory"):
+(`docs/v2/plan.md`, "Memory"):
 
 - the numbering's columns, its `FxHashMap<Id, u32>` and its CSR;
 - four bitsets, the level and attribute `Cell` columns, and the level memo maps;
@@ -281,7 +281,7 @@ dedup-mem added `crates/blaze-mem/src/align.rs` (+ `src/align/tests.rs`) and the
 6. `crates/blaze-mem/src/lib.rs`: add `align` to the crate doc, e.g. after the table:
    `//! Rounding to power-of-two alignments is [`align`]'s, one copy for the whole tree.`
 
-Why: one implementation per primitive (docs/v2/plan/lanes/dedup.md, "align_up and friends":
+Why: one implementation per primitive (docs/v2/plan/design/data.md, "align_up and friends":
 `blaze-mem`); `os::round_up` is the same function as `align::checked_align_up`.
 
 Status: done by mem (2026-10-29): 1 to 5 applied as written (`proptest` was already in the
@@ -372,7 +372,7 @@ Status: closed by mem (2026-10-29): information only, and every child of lane me
   `crates/blaze-cas/src/tests.rs:562` `disk::aligned(RECORD_HEADER + stored)` becomes
   `(RECORD_HEADER + stored).next_multiple_of(disk::ALIGN)`.
 
-Why: docs/v2/plan/lanes/dedup.md: where std's `next_multiple_of` serves, the helper goes.
+Why: docs/v2/plan/design/data.md: where std's `next_multiple_of` serves, the helper goes.
 
 Status: done by mem-backend-cas (2026-10-29): applied as written; `lib.rs` lines are now 1257, 1848, 2380.
 

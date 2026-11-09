@@ -78,7 +78,7 @@ To keep an input a fuzz run found, copy it from `fuzz/out/<target>/` into the ta
   new child after each failing try, cutting chunks of halving size and then zeroing bytes while
   the failure stays the same.
 - **Speed**: the bounds and the arithmetic are in
-  `docs/v2/plan/lanes/safety/speed-of-light.md` ("The fuzzer"). The engine's work per run is
+  `docs/v2/plan/design/unsafe.md` ("The fuzzer"). The engine's work per run is
   two reads of the counters a cache line at a time, one before it (zeroing the lines that hold
   a count) and one after (the features);
   the drain and the run are `__sanitizer_*` functions, which SanitizerCoverage leaves

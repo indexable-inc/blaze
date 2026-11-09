@@ -1,4 +1,4 @@
-//! The negative-fact indexes (docs/v2/plan/lanes/items.md section 6.2): the impls of a trait by
+//! The negative-fact indexes (docs/v2/plan/design/item-hash.md section 6.2): the impls of a trait by
 //! simplified self type, and what a name is in a scope, each answering its question both ways
 //! ("no impl", "nothing by that name" are answers too).
 //!

@@ -1,4 +1,4 @@
-//! blaze's sans-IO core (docs/v2/plan/lanes/core.md section 3, docs/v2/plan/lanes/core/plane.md).
+//! blaze's sans-IO core (docs/v2/plan.md section 3, docs/v2/plan.md).
 //!
 //! A state machine of blaze's (the build's plane, a journal, the store's index) does no IO,
 //! reads no clock and starts no thread. It asks for IO by pushing [`Effect`]s, each with a
@@ -705,7 +705,7 @@ pub enum Sandbox {
 }
 
 /// What a sandboxed process read, recorded by its sandbox: its result is keyed by exactly
-/// these (docs/v2/plan/lanes/usercode.md section 6.5), so the paths are as the process named them.
+/// these (docs/v2/plan.md section 6.5), so the paths are as the process named them.
 #[derive(Clone, Default, PartialEq, Eq, Debug)] // clone: kept with a run's record (blaze-usercode, blaze-testsel, blaze-api), once per run
 pub struct Traced {
     /// Each file it opened to read, and the BLAKE3 hash of its bytes then; `None` for a file
@@ -1069,7 +1069,7 @@ pub fn native(root: &std::path::Path, threads: usize) -> std::io::Result<Native>
 mod tests;
 
 /// Counts each test thread's allocations, for the allocation-budget tests
-/// (docs/v2/plan/goals/principles.md).
+/// (docs/v2/plan.md).
 #[cfg(test)]
 #[global_allocator]
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;

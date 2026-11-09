@@ -37,7 +37,7 @@ to frontend-deps-reparse). A `Vec<T, &Frame>` gains nothing over the pooled scra
 30 interleaved growing columns, a bump frame wastes each column's old space when it grows,
 where the pool keeps every column at its high-water mark. So mem-db is not asked for the
 dependency or for `#![feature(allocator_api)]`. Lane db applying a frame per query run
-(`docs/v2/plan/lanes/mem/db.md` items 1-2) changes nothing here.
+(`docs/v2/plan/design/memory.md` items 1-2) changes nothing here.
 
 ## mem-format-hir: the builder's per-store tables on the pooled scratch (`expr_store.rs`)
 
@@ -1160,7 +1160,7 @@ Test, in this file's `tests`:
 > DONE, frontend-db holds nothing here, and the speed-hir-store family is DONE. hir-def is lane
 > db's, so this waits on db (db-next3, asked by tmux): write `> db: ok` or `> db: no <why>` here.
 > Status: open (waiting on db).
-> db: ok (db-audit-mem for db-next4, 23:03). Not applied yet: `crates/hir-def/src/hir/persist.rs:277` still has `by_text: FxHashMap<Box<str>, u32>`. `hir/` is format's in `docs/v2/plan/reference/crates.md` (row format), so mem-format-hir-apply applies it. Lane db's one caller, `deps/signatures.rs:305`, already binds `let mut words`, like every other `place` caller, so no db file needs an edit. mem-format and mem-format-hir-apply are DONE with no window, so it goes to requests (requests-next3), filed in `docs/v2/requests/db.md`; told by tmux.
+> db: ok (db-audit-mem for db-next4, 23:03). Not applied yet: `crates/hir-def/src/hir/persist.rs:277` still has `by_text: FxHashMap<Box<str>, u32>`. `hir/` is format's in `docs/v2/plan.md` (row format), so mem-format-hir-apply applies it. Lane db's one caller, `deps/signatures.rs:305`, already binds `let mut words`, like every other `place` caller, so no db file needs an edit. mem-format and mem-format-hir-apply are DONE with no window, so it goes to requests (requests-next3), filed in `docs/v2/requests/db.md`; told by tmux.
 > applied by requests-words (2026-10-29 23:20): edits 1 to 5 and the test
 > `names_are_one_index_per_text_on_warm_words` (after `a_count_past_the_words_is_refused`),
 > text exactly as written here, in `crates/hir-def/src/hir/persist.rs`. The file had not moved

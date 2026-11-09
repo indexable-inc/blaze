@@ -34,7 +34,7 @@ pub fn lend<T: Default + 'static, R>(
 
 // `f` may wait and resume on another thread: each access to the slot is its own call, never
 // inlined into `lend`, whose inlined access could reuse the first thread's slot address
-// (docs/v2/plan/lanes/may-suspend.md).
+// (docs/v2/plan/design/may-suspend.md).
 
 #[inline(never)]
 fn lend_to<T: 'static>(slot: &'static LocalKey<RefCell<Option<T>>>, value: T) {

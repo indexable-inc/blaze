@@ -1,5 +1,5 @@
 //! blaze's own copy of the Rust release it builds with, for a machine with no rustup or whose
-//! rustup does not have that release (docs/self-contained.md, "blaze's own toolchain"). It is
+//! rustup does not have that release (docs/v2/plan.md, "blaze's own toolchain"). It is
 //! the release's `rustc`, `cargo` and `rust-std` as the Rust project publishes them (the source
 //! of the standard library is blaze's own, `library.rs`), each checked against the sha256 `pins.txt` has for it (`harness/toolchain_pins.py` writes
 //! that from the release's manifest), and laid out in `~/.blaze/toolchains/<release>-<host>`

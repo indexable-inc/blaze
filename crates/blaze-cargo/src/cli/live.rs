@@ -5,7 +5,7 @@
 //! [`TestView`] (`apply` is the update, fed [`Event`]s with the time injected; `render` is the
 //! view, into a ratatui buffer; `take_above` and `summary` are the effects, lines to print
 //! above the live region), drawn under the board's sections
-//! (docs/v2/plan/observe/build-view.md, "The renderer"). This file is only the runtime around
+//! (docs/v2/plan/design/build-view.md, "The renderer"). This file is only the runtime around
 //! them, threads that do the IO and nothing else:
 //!
 //! - the caller's thread talks to the daemon and turns each response into a message for the

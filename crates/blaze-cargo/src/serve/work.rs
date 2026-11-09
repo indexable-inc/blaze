@@ -1,4 +1,4 @@
-//! What a job of the daemon asks of the build (docs/v2/plan/lanes/cargo/notes.md section 6): the steps
+//! What a job of the daemon asks of the build (docs/v2/plan.md section 6): the steps
 //! between a plan and its outputs, behind traits so the loop runs the same in the daemon
 //! ([`crate::serve::unit::Real`]) and in the simulation ([`crate::serve::tests`]). The loop is
 //! generic over its [`Steps`], whose associated types are the front end's: `blaze serve` is
@@ -23,7 +23,7 @@
 //! # Who reads the front end, and where the stop is
 //!
 //! A job's front end is one value owned by the loop: its database is shared by reference and
-//! never cloned (docs/v2/plan/process/decisions.md). The tasks that read it are those of a
+//! never cloned (docs/v2/plan.md). The tasks that read it are those of a
 //! batch added with `reads` ([`crate::serve::plane::Plane::add`]): every compile, the
 //! `--ub` selection and evaluations, a reach (of both its views) and the codegen inputs. Each
 //! is posted with a [`Steps::Reader`], a shared reference it holds for its run and drops as it ends,
@@ -422,7 +422,7 @@ pub enum Full {
     Output(OutputFields),
     /// The output keeps no room ([`blaze_link::Output::incremental`] is off): every link of it is whole.
     NotIncremental,
-    /// The profile its code is laid out by changed (docs/v2/plan/lanes/layout/layout.md): an
+    /// The profile its code is laid out by changed (docs/v2/plan/design/code-layout.md): an
     /// image keeps its first link's order, so it is laid out again.
     Layout,
 }

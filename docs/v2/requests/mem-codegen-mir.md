@@ -11,7 +11,7 @@ path-type change). From `mem-codegen-mir`, child of `mem-codegen` in lane `mem`.
 crate was edited; this file is the whole change.
 
 Line numbers are of the tree on 2026-10-29 (`blaze-v2`); each change also quotes the code it
-replaces, so it can be found after other edits. Rules it follows: `docs/v2/plan/lanes/mem/db.md`
+replaces, so it can be found after other edits. Rules it follows: `docs/v2/plan/design/memory.md`
 (one frame per query run, owned memoized results built once at exact size, temporaries in the
 frame, scratch for per-call buffers, a budget test per change) and lane mem's ruling in
 `docs/v2/requests/mem.md` (memoized results stay on the global allocator).

@@ -1,4 +1,4 @@
-//! A build's inputs, kept so the build replays as a test (docs/driver.md, "The step
+//! A build's inputs, kept so the build replays as a test (docs/v2/plan.md, "The step
 //! function"). A trace is lines of JSON: the machine's [`Config`], then each [`Input`] it took,
 //! in order. Replayed on a new machine, a trace gives the outputs the build gave, since the
 //! machine reads nothing but its inputs.

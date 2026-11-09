@@ -1,4 +1,4 @@
-//! One view's files as the front end's inputs (docs/v2/plan/lanes/vfs.md section 2): a view is a root of
+//! One view's files as the front end's inputs (docs/v2/plan/design/vfs.md section 2): a view is a root of
 //! blaze-vfs, a map of every file to its content ID, and setting one writes only the inputs
 //! whose content changed, so the query engine sees no change where there is none.
 //!

@@ -1,4 +1,4 @@
-//! The plane (docs/v2/plan/lanes/core/plane.md) as the daemon's loop steps it: every job's
+//! The plane (docs/v2/plan.md) as the daemon's loop steps it: every job's
 //! tasks are nodes of one [`blaze_graph::Plane`], with single flight, fair share, critical path
 //! and memory admission. The loop owns the plane and steps it with the driver's clock, so a run
 //! under the simulation driver is a function of its seed.
@@ -691,7 +691,7 @@ pub struct Plane<W: Work, P: Predict> {
     folds: Folds,
 }
 
-/// Each plane request's live model (`blaze_protocol::now`, docs/v2/plan/observe/build-view.md):
+/// Each plane request's live model (`blaze_protocol::now`, docs/v2/plan/design/build-view.md):
 /// a [`Fold`] made as the request opens ([`Plane::open`]), fed every record the plane says of
 /// it ([`PlaneOutput::Said`]), looked at once a second while its job runs
 /// (`super::job::doing`) and dropped as its job ends ([`Plane::forget`]). The same records,

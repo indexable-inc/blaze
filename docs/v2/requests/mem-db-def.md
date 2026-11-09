@@ -8,8 +8,8 @@ date: 2026-10-30
 `mem-db-def` (child of `mem-db`, lane `mem`) moves `crates/base-db/`, `crates/hir-expand/`,
 `crates/hir/` and `crates/hir-def/` (but format's files) onto `crates/blaze-mem`. Every path is
 lane db's (children not DONE), so each change is written here for its owner to apply. The
-contract it programs against is "The contract" in `docs/v2/plan/lanes/mem/db.md`; the plan and
-the speed-of-light bounds are `docs/v2/plan/lanes/mem/db-def.md`.
+contract it programs against is "The contract" in `docs/v2/plan/design/memory.md`; the plan and
+the speed-of-light bounds are `docs/v2/plan/design/memory.md`.
 
 This file holds the shared harness (H1 to H3, for all four crates) and base-db (B1 to B8). The
 other parts are in the children's files, each written against H1 to H3:
@@ -744,7 +744,7 @@ Callers pass their tag (each a one-word edit before the count):
 - `crates/hir/src/check.rs:117` (`check_modules`): `Tag::Infer`, a check being the body checks
   hir-ty runs (owner `db-next2`).
 - `crates/ide-db/src/symbol_index.rs:247`, `:255` (library and crate symbols): `Tag::Query`
-  (owner per `docs/v2/plan/reference/crates.md`, lane db).
+  (owner per `docs/v2/plan.md`, lane db).
 - `crates/base-db/src/db/tests.rs:44`, `:53`: `db.run_all(Tag::Query, ..)`.
 
 Each caller imports `blaze_mem::Tag` (H1 gives the dependency; ide-db's manifest needs
@@ -1103,7 +1103,7 @@ the same heading. The RNG is `blaze_ids::rng::SplitMix64` (`crates/blaze-ids/src
 ## dedup: byte cursor onto blaze_format::cursor
 
 From `dedup-cursor-front` (report `/tmp/blaze-lanes/v2-dedup-cursor-front.md`; the cursor is
-`crates/blaze-format/src/cursor.rs`, API in `docs/v2/plan/lanes/dedup/cursor.md`). `hir-def`
+`crates/blaze-format/src/cursor.rs`, API in `docs/v2/plan/design/data.md`). `hir-def`
 already depends on `blaze-format`; no `Cargo.toml` change. This replaces the `Dec::u32` bullet of
 the LEB128 request just above (that one reads `self.bytes`/`self.at`, which go away here); the
 `Enc::u32` there and here write the same bytes, apply either.

@@ -30,7 +30,7 @@ jobs:
     name: ${{ matrix.target }}
     # Hosted runners, Linux too, for the glibc a release asks for: the oldest hosted Ubuntu, not ix's
     # 24.04 (docs/harness.md "ix runners"). TODO(sysroot): ix once blaze links against an older
-    # glibc sysroot (docs/v2/plan/toolchain-c.md); it has no --sysroot today.
+    # glibc sysroot (docs/v2/plan/design/toolchain-c.md); it has no --sysroot today.
     runs-on: ${{ matrix.os }}
     timeout-minutes: 340
     strategy:

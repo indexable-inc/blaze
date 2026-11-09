@@ -93,7 +93,7 @@ expressions inference resolved to `ValueNs::StaticId`, with
 already (`infer/path.rs`).
 Why: `hir-ty-unsafeck`'s `check_static` re-resolves every path that is not a variant, an
 associated item or a function, through the resolver: every use of a local. With the bitset, it
-is one bit test (`docs/v2/plan/lanes/db/speed-of-light-unsafeck.md`, "The gap").
+is one bit test (`docs/v2/plan.md`, "The gap").
 
 > forwarded to db (window `db-next2`, told by tmux).
 > db-ty-next3 (2026-10-29 ~22:20): **not needed in hir-ty.** Inference already records what
@@ -105,7 +105,7 @@ is one bit test (`docs/v2/plan/lanes/db/speed-of-light-unsafeck.md`, "The gap").
 > in place of the resolver, its scope guard and the hygiene lookup (and the `resolver` field
 > if nothing else reads it). A path inference could not resolve records nothing, so nothing is
 > reported for it, as rustc reports no unsafety for an unresolved path.
-> applied by db-audit-dbsub (2026-10-29 22:33): as db-ty-next3 wrote, in `crates/hir-ty-unsafeck/src/lib.rs` `check_static`: `self.infer.value_resolution(current.into())` in place of the resolver walk; the `resolver` field and the `HasResolver`/`ResolveValueResult`/`Resolver` imports go. `docs/v2/plan/lanes/db/speed-of-light-unsafeck.md` "The gap" becomes "Static paths". Not built.
+> applied by db-audit-dbsub (2026-10-29 22:33): as db-ty-next3 wrote, in `crates/hir-ty-unsafeck/src/lib.rs` `check_static`: `self.infer.value_resolution(current.into())` in place of the resolver walk; the `resolver` field and the `HasResolver`/`ResolveValueResult`/`Resolver` imports go. `docs/v2/plan.md` "The gap" becomes "Static paths". Not built.
 
 ## 6. Tools: `tools/v2/hot_lint.py` cannot read its `crates` field
 

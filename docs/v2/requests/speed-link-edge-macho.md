@@ -30,6 +30,6 @@ per section or per symbol of their own. Two remain, both in `macho.rs` (yours) o
    Status: forwarded to lead `link` as `docs/v2/requests/link.md` item 11 (a `model.rs` change).
 
 Neither blocks anything; both are what the notes
-`docs/v2/plan/lanes/link/speed-link-edge-macho-input.md` list as left.
+`docs/v2/plan.md` list as left.
 
 > forwarded to link: `crates/blaze-link/` is lane link's (speed-link-edge-macho is DONE).

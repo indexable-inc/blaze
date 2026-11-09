@@ -190,15 +190,15 @@ false`. The test at 86 sets `outside: false, executable: 0`. Why: two new `TestR
 
 > forwarded to fastcompile (window `fastcompile`); told by tmux (requests, pass 30).
 
-## 5. To the coordinator (`docs/v2/plan/reference/crates.md`)
+## 5. To the coordinator (`docs/v2/plan.md`)
 
 Line 49, `blaze-api`'s row: `SCHEMA` (5) becomes `SCHEMA` (14). After `Span`, add
 `Applicability`, and after `Artifact`, `ArtifactKind`. Name `TargetKind`, `CrateType` and
 `ResponseRef` (`borrowed`: responses read in place) with the rest. Why: the row states the
-schema, and this change made 14. `docs/v2/plan/lanes/ci/notes.md:13` still says `SCHEMA` 5. It is
+schema, and this change made 14. `docs/v2/plan.md:13` still says `SCHEMA` 5. It is
 ci's (DONE), so it's yours or requests' to date.
 
-> applied in part (requests, pass 30): `docs/v2/plan/lanes/ci/notes.md:13` now says `SCHEMA` 5 when written and 14 since this change. The `crates.md` blaze-api row is the coordinator's, on requests' coordinator list.
+> applied in part (requests, pass 30): `docs/v2/plan.md:13` now says `SCHEMA` 5 when written and 14 since this change. The `crates.md` blaze-api row is the coordinator's, on requests' coordinator list.
 
 ## 6. To lane cargo: `Worked::served` and the `blaze-served` line (cargo.md "frontend-fast-bodies-cache: the `blaze-served` line"; requests, pass 30)
 

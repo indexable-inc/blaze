@@ -84,7 +84,7 @@ rather than minting its own, and `blaze_api::build::Opened` drops its second fie
 fills `base_db::ViewFile` for the front end reads a source file with `Vfs::follow`, not
 `Vfs::read`: a symlink's own bytes are its target's path.
 
-Why: the vfs arena is the one every crate uses (`docs/v2/plan/reference/crates.md`). rustc opens a
+Why: the vfs arena is the one every crate uses (`docs/v2/plan.md`). rustc opens a
 symlinked `.rs` file as its target, so the front end must see the target's text
 (superset-of-rust).
 
@@ -169,7 +169,7 @@ every `Reader` are dropped). The contract is in `Vfs::reclaim`'s doc.
 ## From speed-runtime-vfs: the node store, reclamation and the watcher's reads (2026-10-29)
 
 speed-runtime-vfs rebuilt `crates/blaze-vfs` for speed while this lane was done (notes:
-`docs/v2/plan/lanes/vfs/speed-runtime.md`). The hashes, the journal's bytes and the public
+`docs/v2/plan/design/vfs.md`). The hashes, the journal's bytes and the public
 `Vfs` API are unchanged; what changed for this lane:
 
 - **One store, no publish.** The tree and every `Reader` share one `store::Table` (append-only
@@ -199,7 +199,7 @@ speed-runtime-vfs rebuilt `crates/blaze-vfs` for speed while this lane was done 
   `a`'s group and a delete of `a` with a write under it could lose the write. It now sorts by
   component (test `a_directory_deleted_and_written_under_again_keeps_its_dotted_sibling`).
 
-The exact edits for `docs/v2-vfs.md` (this lane's), so it stays true:
+The exact edits for `docs/v2/plan/design/vfs.md` (this lane's), so it stays true:
 
 1. Replace the bullet list under "**Readers on other threads**" (from "- The nodes are in an
    append-only open-addressed table" through "- A node an open view, head or `keep` reaches
@@ -229,11 +229,11 @@ The exact edits for `docs/v2-vfs.md` (this lane's), so it stays true:
    read." with "Every path in it is stat-ed and read at once (one round trip); the read
    counts only if the stat says a file."
 
-**Applied by vfs (2026-10-29, 18:08):** the three `docs/v2-vfs.md` edits, word for word.
+**Applied by vfs (2026-10-29, 18:08):** the three `docs/v2/plan/design/vfs.md` edits, word for word.
 Items 8 and 9 and the lock-audit note above are marked to match. I checked the claims against
 the tree (`store.rs`, `Pinned`, `blaze_reclaim`, no `Publisher`), but didn't build or run.
 
-> forwarded to coordinator: lane vfs is DONE and `docs/v2-vfs.md` is not in `crates.md`'s lane paths, so it is the coordinator's; the three edits are exact. Item 9's withdrawal is noted.
+> forwarded to coordinator: lane vfs is DONE and `docs/v2/plan/design/vfs.md` is not in `crates.md`'s lane paths, so it is the coordinator's; the three edits are exact. Item 9's withdrawal is noted.
 
 
 ## From speed-link-edge-wire: `Op`'s and `Change`'s fields in their keys' order (2026-10-29)

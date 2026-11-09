@@ -6,7 +6,7 @@
 //! type of the crate. Such a blanket impl stands for one impl per impl of the sealed trait,
 //! `impl Display for Local`, each of which the orphan rules allow in the crate, so the
 //! relaxation adds no impl that plain Rust could not have written (Jules Bertholet's proposal
-//! on IRLO, sealed as scottmcm suggested; docs/v2/plan/lanes/frontend/sealed-orphan.md has the
+//! on IRLO, sealed as scottmcm suggested; docs/v2/plan/design/sealed-orphan.md has the
 //! design, the hazards and the soundness argument). hir-ty makes the parameter local in its orphan check (`sealed_local_bound`) and
 //! answers a sealed trait as having no downstream implementor in coherence (`rustc_type_ir`
 //! patch `0013-sealed-traits`); this crate refuses what would break that argument:

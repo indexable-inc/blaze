@@ -10,7 +10,7 @@ date: 2026-10-29
 `LitKind` to and from its number 0 to 10 is written out in `crates/tt/src/storage.rs`
 (`Node::literal` 144-156 and `Node::lit_kind` 166-178), in `hir-def`'s `nameres/frozen.rs`
 (960-972 and 2289-2301, requested of db) and in both proc-macro wires (which move onto tt's
-column bytes in your request to usercode). Design: `docs/v2/plan/lanes/dedup/macros.md`.
+column bytes in your request to usercode). Design: `docs/v2/plan/design/data.md`.
 
 1. In `crates/tt/src/lib.rs`, after `pub enum LitKind`:
 

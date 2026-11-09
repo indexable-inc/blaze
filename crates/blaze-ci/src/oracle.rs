@@ -1,4 +1,4 @@
-//! The production oracle's sample (docs/v2/plan/lanes/ci.md section 10): one shared memo table means one
+//! The production oracle's sample (docs/v2/plan.md section 10): one shared memo table means one
 //! wrong result is wrong everywhere, so a sample of views is also built again from nothing
 //! ([`blaze_api::Request::Verify`]) and compared. Which views is a hash of the commit, so every
 //! run of the service (and a standby restored from a snapshot) samples the same ones.

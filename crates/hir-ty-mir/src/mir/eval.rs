@@ -1922,7 +1922,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
 
     /// The typed copy an `Assign` of `r` to `place` (at `addr`) is: the machine checks the
     /// value at the place's type and retags what it holds, by the mode of the notes' table
-    /// (`docs/v2/plan/lanes/safety/notes.md`, "Retags without Retag statements").
+    /// (`docs/v2/plan/design/unsafe.md`, "Retags without Retag statements").
     fn typed_assign(
         &self,
         place: &StoredPlace,

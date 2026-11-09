@@ -5,7 +5,7 @@ date: 2026-10-30
 ---
 # Requests of lane safety
 
-Lane safety's design is `docs/v2/plan/lanes/safety/notes.md`; its plan is
+Lane safety's design is `docs/v2/plan/design/unsafe.md`; its plan is
 `docs/v2/plan/design/unsafe.md`. Its children (safety-mem, safety-tb, safety-race,
 safety-check, safety-fuzz, safety-model, safety-audit) append below, each under
 `## From safety-<child>`.
@@ -45,7 +45,7 @@ blaze-native-proc-macro) and `vendor/*` are not bound by the lints.
 > applied: `hir-ty-ub = { path = "crates/hir-ty-ub", version = "0.0.0" }` in the root `[workspace.dependencies]` (its own dependencies are all workspace ones). `members` gains `"fuzz"` when `fuzz/` exists: a member path that doesn't exist stops the workspace from loading.
 > applied: `members = ["crates/*", "fuzz"]` now that `fuzz/` has its `Cargo.toml` and `src/lib.rs`.
 
-## 3. Coordinator: `docs/v2/plan/reference/crates.md`
+## 3. Coordinator: `docs/v2/plan.md`
 
 Add lane `safety` to "Paths each lane owns": `crates/hir-ty-ub/`, `fuzz/`,
 `crates/blaze-check/` (safety-model's M1 below replaces the first plan of
@@ -82,7 +82,7 @@ still refused (CFI, KCFI, dataflow, if codegen doesn't do them) stays, with that
 
 - safety-check C1 (dependencies) and C2 (`Ub::Value` wording, `Ub::ThreadsLeft`): applied in
   `crates/hir-ty-ub/Cargo.toml` and `src/ub.rs`.
-- safety-model M1 (`crates/blaze-check/`): agreed; `docs/v2/plan/lanes/safety/notes.md` says so.
+- safety-model M1 (`crates/blaze-check/`): agreed; `docs/v2/plan/design/unsafe.md` says so.
 
 > applied: noted; each is in its lane's file, with its outcome there.
 
@@ -260,7 +260,7 @@ test binary's global allocator. Wanted in `crates/hir-ty-ub/Cargo.toml`, under
 `blaze-alloc-count = { path = "crates/blaze-alloc-count" }`. No crate depends on it yet.
 
 The tests' database is now `TestDB { db: Db }`, made from `Db::for_tests()`
-(docs/v2/plan/lanes/frontend/db.md, "Test databases"). The tests no longer use `hir-ide`,
+(docs/v2/plan/design/frontend.md, "Test databases"). The tests no longer use `hir-ide`,
 `salsa` or `test-utils`, so those three dev-dependencies can go. `test-fixture` stays.
 
 > applied by safety (parent), 2026-10-29: the root entry was already in; `crates/hir-ty-ub/Cargo.toml`
@@ -315,7 +315,7 @@ displayed as `"Undefined Behavior: {it}"`, and `From<check::OffsetFromError> for
   `blaze-graph` dependency is then a cycle, which cargo refuses even under a `cfg` (resolution is
   platform-independent). A leaf crate every one of `blaze-ids`, `intern`, `blaze-query`,
   `blaze-cas`, `blaze-graph`, `blaze-reclaim` can depend on has neither the cycle nor a second
-  copy of any type. Design: `docs/v2/plan/lanes/safety/model.md`.
+  copy of any type. Design: `docs/v2/plan/design/model-checker.md`.
 - Its dependencies: `blaze-core` (the simulation driver's `sim::Rng`, so a model's seed is a
   `Sim`'s), `libc` on Unix (stacks), `windows-sys` on Windows (fibers; feature
   `Win32_System_Threading`, already in the workspace list). Constraint to keep: `blaze-core` never
@@ -324,7 +324,7 @@ displayed as `"Undefined Behavior: {it}"`, and `From<check::OffsetFromError> for
   1. `[workspace.dependencies]`: `blaze-check = { path = "crates/blaze-check" }` beside the
      other v2 crates (`crates/*` already makes it a member).
   2. `[workspace.lints.rust]` `unexpected_cfgs` `check-cfg`: add `'cfg(blaze_check)'`.
-  3. `docs/v2/plan/reference/crates.md`: a row for `blaze-check` (safety-model) and the
+  3. `docs/v2/plan.md`: a row for `blaze-check` (safety-model) and the
      safety paths line gains `crates/blaze-check/`.
 - `Cargo.lock`: a new package `blaze-check` with `blaze-core`, `libc`, `windows-sys`; no new
   package from crates.io.
@@ -659,7 +659,7 @@ that has run its time budget in CI with no finding. `.github/` is the coordinato
 > forwarded to coordinator: `.github/` is its.
 
 **F1 amended (safety-fuzz, 2026-10-29, speed of light,
-`docs/v2/plan/lanes/safety/speed-of-light.md` "The fuzzer"):**
+`docs/v2/plan/design/unsafe.md` "The fuzzer"):**
 - Step 1 once, not per entry: one job runs `blaze build --release -p blaze-fuzzer` (every
   `[[bin]]`; their crates are shared, so 52 per-entry builds would redo the same graph 52 times)
   and uploads `target/release/<target>` for each; the matrix entries download theirs.

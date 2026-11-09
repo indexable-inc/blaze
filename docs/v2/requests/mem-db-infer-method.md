@@ -5,12 +5,12 @@ date: 2026-10-29
 ---
 # mem-db-infer-method: requests
 
-Part of `mem-db-infer` (`docs/v2/plan/lanes/mem/db-infer.md`, rules R1 to R8). Files, all in
+Part of `mem-db-infer` (`docs/v2/plan/design/memory.md`, rules R1 to R8). Files, all in
 `crates/hir-ty/src/`: `method_resolution.rs`, `method_resolution/probe.rs`,
 `method_resolution/confirm.rs`, `method_resolution/frozen.rs`, `autoderef.rs`, `traits.rs`,
 `specialization.rs`, `opaques.rs`, `drop.rs`, `inhabitedness.rs`, `representability.rs`.
 
-Owners (`docs/v2/plan/reference/crates.md`): every file is lane db's; `method_resolution.rs`,
+Owners (`docs/v2/plan.md`): every file is lane db's; `method_resolution.rs`,
 `method_resolution/`, `traits.rs`, `specialization.rs`, `opaques.rs` and `drop.rs` are lane
 items' as well. Neither is done, so every change below is a request; each entry names its owners.
 Lines are as of 2026-10-29 (UTC-7); other agents edit these files, so each entry quotes the
@@ -20,7 +20,7 @@ where either changed a quoted line, apply the entry to the line as it is now and
 change. No entry adds a `dyn` or a `SyntaxNode` use. `db` parameters (`&Db`, `&'db Db`) are left exactly as they are; the
 code holds unchanged if they go back to `&dyn HirDatabase`.
 
-Notes and the speed-of-light bound: `docs/v2/plan/lanes/mem/db-infer-method.md` (and "Speed" at
+Notes and the speed-of-light bound: `docs/v2/plan/design/memory.md` (and "Speed" at
 the end of this file).
 
 ## What these files allocate, in short
@@ -97,7 +97,7 @@ the paths below change to `crate::FrameMap`/`crate::FrameSet` and nothing else.
 ```rust
 use blaze_mem::Frame;
 
-/// A map of temporaries in a run's frame (rule R3 of `docs/v2/plan/lanes/mem/db-infer.md`).
+/// A map of temporaries in a run's frame (rule R3 of `docs/v2/plan/design/memory.md`).
 pub(crate) type FrameMap<'f, K, V> = hashbrown::HashMap<K, V, FxBuildHasher, &'f Frame>;
 /// A set of temporaries in a run's frame.
 pub(crate) type FrameSet<'f, T> = hashbrown::HashSet<T, FxBuildHasher, &'f Frame>;
@@ -364,7 +364,7 @@ then unused: the import becomes `use smallvec::SmallVec;`.
 
 > forwarded to db (from requests, pass 17; told by tmux).
 
-> superseded by frontend-fast-method: `probe_op` borrows the steps in place from the steps cache (`pick_cache::with_steps`) or from one `method_autoderef_steps` call, and `Mode::Path`'s one step is inline in the `SmallVec`; there is no copy of the steps to move into the frame. Notes: docs/v2/plan/lanes/frontend/fast-method.md, section 3.3.
+> superseded by frontend-fast-method: `probe_op` borrows the steps in place from the steps cache (`pick_cache::with_steps`) or from one `method_autoderef_steps` call, and `Mode::Path`'s one step is inline in the `SmallVec`; there is no copy of the steps to move into the frame. Notes: docs/v2/plan/design/frontend.md, section 3.3.
 
 ### P4. `ProbeForNameChoice` and `TraitValueItems` carry the frame (probe.rs:632-646, 282-300; method_resolution.rs:593-624, lane db + items)
 

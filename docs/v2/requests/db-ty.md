@@ -63,7 +63,7 @@ Why: `InferenceResult::for_body`/`for_anon_const` are now free tracked fns `infe
 ## 5. Link (live patch)
 
 Before committing a speculative patch, run `hir_ty_borrowck::Pending::finish(db)` as a plane
-task beside the patch, sharing the database by reference (docs/v2/plan/process/decisions.md: no per-thread
+task beside the patch, sharing the database by reference (docs/v2/plan.md: no per-thread
 handles), and roll the patch back on `Err(Refused)`; the
 `Refused` names the body and the errors to report.
 
@@ -108,7 +108,7 @@ What: compute a memo's value fingerprint (`Fingerprint::of_value`) when the valu
 the old value is still there.
 Where: `vendor/salsa/src/function/` (memo store, eviction, backdate), not yet wired to
 `fingerprint.rs`'s probe.
-Why: under "everything is ours, for the best performance" (docs/v2/plan/goals/principles.md), hashing
+Why: under "everything is ours, for the best performance" (docs/v2/plan.md), hashing
 every `InferenceResult` and `MirBody` as it is stored walks the whole value with SipHash on every
 body's first computation, the hot path of a cold build, to serve only the values later evicted.
 Hashing at eviction costs one walk per evicted value, and only for values that are evicted. The
@@ -135,21 +135,21 @@ optimized MIR), so it does not compile until these 11 have it. Their outputs alr
 ## 10. Coordinator: MIR's layout belongs to codegen
 
 What: move `crates/hir-ty/src/mir.rs` and `crates/hir-ty/src/mir/` (the MIR types) from db to
-codegen in `docs/v2/plan/reference/crates.md`.
+codegen in `docs/v2/plan.md`.
 Why: `docs/v2/plan/design/data.md` gives MIR's columnar layout (locals as columns, blocks as ranges,
 statements as tag and data, places as base plus CSR projections) to codegen, which builds and
 reads every `MirBody` in `crates/hir-ty-mir`. The types sit in hir-ty only because borrowck and
 const eval read them; whoever changes the layout changes all their constructors. Until it moves,
 db-ty does not change MIR's layout.
 
-> forwarded to coordinator: an ownership change in `docs/v2/plan/reference/crates.md`, not among the paths `requests` applies.
+> forwarded to coordinator: an ownership change in `docs/v2/plan.md`, not among the paths `requests` applies.
 
 ## 11. Lane db (parent): `vendor/rustc_type_ir` and `vendor/rustc_next_trait_solver` for db-ty's children
 
 What: let `db-ty-types` change `vendor/rustc_type_ir` and `db-ty-solver` change
 `vendor/rustc_next_trait_solver`, or apply their requests (`docs/v2/requests/db-ty-types.md`,
 `docs/v2/requests/db-ty-solver.md`).
-Why: "types and the trait solver are u32-indexed tables" (`docs/v2/plan/lanes/db.md`, Done when) is half in
+Why: "types and the trait solver are u32-indexed tables" (`docs/v2/plan.md`, Done when) is half in
 those crates: the `Interner` trait's associated types and the search graph's `GlobalCache`.
 
 > forwarded to db: both vendor crates are lane db's own; db-ty is its child.
@@ -267,7 +267,7 @@ What: a variant `MachineStop` of `MirEvalError` (no fields; `Debug`, `Hash`, `Pa
 others, and its arm in the `Debug` impl and in every exhaustive `match` over the enum in your
 paths), with the doc "the evaluator's `Machine` (a checker of undefined behavior, `hir-ty-ub`)
 stopped the run; what it found the machine holds".
-Why: `hir-ty-mir`'s evaluator becomes generic over a `Machine` (docs/v2/plan/lanes/safety/notes.md;
+Why: `hir-ty-mir`'s evaluator becomes generic over a `Machine` (docs/v2/plan/design/unsafe.md;
 requested of codegen-mir in `docs/v2/requests/codegen.md` "From safety" S1, since the evaluator is in
 `crates/hir-ty-mir/src/mir/eval.rs`, not in `hir-ty`). A hook that finds undefined behavior
 returns `Stop`, which the evaluator turns into this, inside its `InFunction` stack; the checker
@@ -379,7 +379,7 @@ from the range kept for speed-types-probe's children; `0x2458`..`0x245f` stay un
   so every disabled `#[instrument]` span still costs a callsite check (about 1 to 2 ns) in
   release. Adding `release_max_level_info` (or `_off`) to the workspace `tracing` features makes
   them free in release builds. I removed the per-node spans from `infer/relate/` either way; see
-  `docs/v2/plan/lanes/db/speed-of-light-infer-relate.md`.
+  `docs/v2/plan.md`.
 - `crates/hir-ty/Cargo.toml`: add `blaze-alloc-count.workspace = true` under
   `[dev-dependencies]` (needs the workspace entry in `docs/v2/requests/coordinator.md`). The
   allocation-budget tests in `next_solver/infer/relate/generalize.rs` use it.
@@ -1603,7 +1603,7 @@ Differential cases from rustc's `tests/ui/unsized-locals/` (each one E0277 in it
 
 ## frontend-fast-trait: hook the global-goal and shape tables into the solver
 
-From frontend-fast-trait (notes: `docs/v2/plan/lanes/frontend/fast-trait.md`). The new code is
+From frontend-fast-trait (notes: `docs/v2/plan/design/frontend.md`). The new code is
 in my files `crates/hir-ty/src/next_solver/global_goals.rs` and `global_goals/{table,shape,tests}.rs`;
 `goal_store.rs` is my child frontend-fast-trait-store's. Seven small edits in your files wire
 them in. Nothing else of yours changes behavior: with the edits, a root goal that is global
@@ -1783,7 +1783,7 @@ Answer with `>` lines here; when applied I check the tree and run `hot_lint` on 
 ## frontend-fast-trait-store: a definition hook in `persist`'s codec, an interner's crate, and `pub mod goal_store` (2026-10-29)
 
 From frontend-fast-trait-store, child of frontend-fast-trait (notes
-`docs/v2/plan/lanes/frontend/fast-trait-store.md` section 3; code
+`docs/v2/plan/design/frontend.md` section 3; code
 `crates/hir-ty/src/next_solver/goal_store.rs` and `goal_store/`). The persistent goal cache
 writes a goal in `persist`'s codec through its own `Sink`, with every definition as its item
 key (lane items' `def_key`) where `persist` writes a salsa ID, so a goal has the same words in
@@ -2645,7 +2645,7 @@ list.
 
 ## frontend-fast-trait: the shape table charges search-graph depth as rustc does (2026-10-29)
 
-From frontend-fast-trait, asked by frontend-fast (notes: `docs/v2/plan/lanes/frontend/fast-trait.md`,
+From frontend-fast-trait, asked by frontend-fast (notes: `docs/v2/plan/design/frontend.md`,
 section 2, "Depth"). The shape table proves auto-trait goals, plus `Copy`/`Clone` through one impl,
 that rustc proves through the search graph. Today it answers them in `add_goal` without
 charging depth. A goal nested within 24 levels of the recursion limit then holds in blaze,

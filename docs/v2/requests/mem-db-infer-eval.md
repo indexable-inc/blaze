@@ -5,7 +5,7 @@ date: 2026-10-29
 ---
 # mem-db-infer-eval: requests
 
-Part of `mem-db-infer` (`docs/v2/plan/lanes/mem/db-infer.md`, rules R1 to R8). Files, all in
+Part of `mem-db-infer` (`docs/v2/plan/design/memory.md`, rules R1 to R8). Files, all in
 `crates/hir-ty/src/`: `layout.rs`, `layout/adt.rs`, `layout/target.rs`, `consteval.rs`, `mir.rs`,
 `mir/held.rs`, `mir/target.rs`, `intrinsic.rs`, `target_feature.rs`, `target_feature/tests.rs`,
 `lang_items.rs`, `primitive.rs`, `solver_errors.rs`, `evict.rs`. Their owner is lane db (`layout.rs`

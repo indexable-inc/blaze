@@ -29,7 +29,7 @@ date: 2026-10-29
 
 > applied: by db (`pub use blaze_graph::Cancelled;` in `crates/blaze-query/src/lib.rs`).
 
-## 3. docs/v2/plan/lanes/core/plane.md "The executor" (core)
+## 3. docs/v2/plan.md "The executor" (core)
 
 - What: say what the executor now is: groups are the CPUs of a level 3 cache or, where the
   machine says so (a cluster of more than one core), a cluster, the smaller winning; on macOS a
@@ -39,10 +39,10 @@ date: 2026-10-29
   cycle) and `exec::Scheduler` as the owner thread. `drive` runs a build's work and IO nodes on
   two pools lent to it alone and kept for the next build of their size, so a build starts no
   threads.
-- Where: `docs/v2/plan/lanes/core/plane.md` (core's path).
+- Where: `docs/v2/plan.md` (core's path).
 - Why: docs-say-what-they-are; the section was written before the pool.
 
-> applied: by core (`docs/v2/plan/lanes/core/plane.md`, "The executor").
+> applied: by core (`docs/v2/plan.md`, "The executor").
 
 ## 4. pool.rs's part of core-hardware.md (speed-runtime-pool, while it rewrites pool.rs)
 

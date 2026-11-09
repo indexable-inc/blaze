@@ -1092,7 +1092,7 @@ fn plans_for_a_target() {
 fn refusals() {
     let mut unit = unit("app", &["lib"], &["lib"], "app", None, Mode::Doc, &[], &[]);
     assert!(hash::CompileMode::of(&unit).unwrap_err().what.contains("rustdoc"));
-    // A library's doctests are planned: blaze builds them itself (docs/v2/plan/doctests.md).
+    // A library's doctests are planned: blaze builds them itself (docs/v2/plan/design/doctests.md).
     let doctest = Unit { mode: Mode::Doctest, ..unit.clone() };
     assert_eq!(hash::CompileMode::of(&doctest).unwrap(), hash::CompileMode::Doctest);
     unit.profile.trim_paths = Some(serde_json::json!("all"));

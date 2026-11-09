@@ -7,7 +7,7 @@ date: 2026-10-29
 
 ## frontend-bodies: fast.md 5, every body is checked; reachability orders, never skips (2026-10-29)
 
-From `frontend-fast-bodies` (notes: `docs/v2/plan/lanes/frontend/fast-bodies.md`, section 2).
+From `frontend-fast-bodies` (notes: `docs/v2/plan/design/frontend.md`, section 2).
 
 Why: rustc rejects a crate with a type or borrow error in a function nothing calls (`fn
 unused() { let x: u8 = "a"; }` is E0308 under `cargo build`). Checking only reached bodies
@@ -16,7 +16,7 @@ decide the order: reached bodies first, as they feed codegen, and the unit's out
 every body. The cases under `harness/v2/frontend/cases/bodies/` (`unreached_*.rs`, each
 `//@ expect: reject E0xxx`) hold it.
 
-`docs/v2/plan/lanes/frontend/fast.md`, section 5, before:
+`docs/v2/plan/design/frontend.md`, section 5, before:
 
 ```markdown
 - **Lower bound.** A build checks only the bodies reachable from what it builds (compile-time.md
@@ -72,7 +72,7 @@ read from a dependency image: a case is one unit, so no case takes this path, an
    closures, async fns, `const` items, statics, trait impls, a body using `OUT_DIR`, and the edges
    that hand over (a block-local item, a body frozen refuses).
 
-Notes: `docs/v2/plan/lanes/frontend/fast-bodies-cache.md`.
+Notes: `docs/v2/plan/design/frontend.md`.
 
 Status: open
 
@@ -81,7 +81,7 @@ Status: open
 > (a) the file goes in `auxiliary/` beside the case, as compiletest has it, so `discover` does not take it for a case. A dependency may name its own with `//@ aux-crate:`, take `//@ edition:` (else 2015) and be `#![crate_type = "proc-macro"]`.
 > (b) blaze gets the dependency as a crates.io package vendored in a `directory` source (`vendor/` with `.cargo-checksum.json`, and `.cargo/config.toml` replacing crates.io), not as a path package. `load-cargo`'s `is_path` makes any path package `CrateOrigin::Local`, which `deps::eligible` refuses. Its package is `u<i>_<j>_<dep>`, and `[lib] name` keeps rustc's crate name. Spans and panics in a dependency compare as `<dep NAME>` on both sides; its other files compare by their path under `auxiliary/`.
 > (c) the second build's served/refused signal is a JSON line, not `-v` text (nothing prints one today). The exact shape is requested in `docs/v2/requests/frontend-fast-diff.md`, from frontend-fast-bodies-cache, who wires `cache::serve`, and lane ci (`blaze-ui/src/api.rs`). Until it is printed, every bodies-cache case is an error ("printed no `blaze-served` line"), never a pass. A case's `//@ refused: dep` marks an expected hand-over: one part of that dependency must be `refused`.
-> Item 3 (the cases) is frontend-fast-bodies-cache's, as the request says. Notes: `docs/v2/plan/lanes/frontend/fast-diff.md`, "Cases with a dependency, and cases built twice".
+> Item 3 (the cases) is frontend-fast-bodies-cache's, as the request says. Notes: `docs/v2/plan/design/frontend.md`, "Cases with a dependency, and cases built twice".
 
 ## frontend-deps: read a crate's image through `deps::image_of` (to frontend-fast-bodies-cache, `crates/blaze-diagnostics/src/cache.rs`, 2026-10-29)
 

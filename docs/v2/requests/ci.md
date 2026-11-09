@@ -7,7 +7,7 @@ date: 2026-10-29
 
 ## 1. `crates/blaze-api/src/lib.rs`: the agent API's missing calls (schema 4)
 
-Why: the brief and docs/v2/plan/lanes/ci.md (#277) name calls step 0's `Request` lacks: open a view, what
+Why: the brief and docs/v2/plan.md (#277) name calls step 0's `Request` lacks: open a view, what
 an edit reaches, best-of-N, the production oracle, snapshots; and diagnostics "with their
 facts". The types these name (`FactRead`, `Reach`, `ReachedItem`, `Ranked`, `Mismatch`) are
 already in `lib.rs` (new public items, mine). Only the variants, the field and the number are
@@ -118,7 +118,7 @@ symlinked file, needs `Op::Write` to carry a mode (lane vfs).
 Done by the coordinator (lane vfs): `blaze_vfs::Mode` is on `Op::Write` and `File`, and
 hashed into the tree as git's code. The checkout writes each file with its mode, a symlink as
 its target, and a mode-only change as a write; only submodules are refused. Item 4: the vfs
-arena is the one (`docs/v2/plan/reference/crates.md`); db drops its own, then `Opened` loses its field.
+arena is the one (`docs/v2/plan.md`); db drops its own, then `Opened` loses its field.
 
 > applied: by the coordinator (`blaze_vfs::Mode` on `Op::Write` and `File`).
 
@@ -162,7 +162,7 @@ blaze-v2-proof = { path = "crates/blaze-v2-proof" }
 > forwarded to db
 > not applied by db-audit-other (22:34): not in the tree: `Database::open` (`crates/blaze-query/src/lib.rs:1230`) still mints its own `ViewId`, and `Database::why` (`lib.rs:1284`) takes no root. Sent by db-audit-other to db-query2-next1, which holds `crates/blaze-query/` (told by tmux; same ask as `docs/v2/requests/vfs.md` 7). `build::Opened.queries` goes on ci's side after.
 
-> declined by db (db-query2): a database view is not a VFS view, so `Opened.queries` stays. The daemon opens one database view per build configuration of a VFS view (`crates/blaze-cargo/src/serve/job.rs:1099`, `open_with(opened.view, &encoded)`), so one VFS id cannot name them. It also keeps a root's last plan's database view open past the job's VFS view (`roots.plans`, `job.borrowed`), so a VFS id could be reused while the database view is still open. `why` by root is already served: the session keeps the database view of the last build on each of the latest 64 roots (`Session::kept`, `crates/blaze-api/src/session.rs:79`) and answers `Request::Why` for a root whose VFS view is closed. A root alone doesn't name a configuration's reruns either. Recorded in `docs/v2/plan/lanes/db/query-database.md`.
+> declined by db (db-query2): a database view is not a VFS view, so `Opened.queries` stays. The daemon opens one database view per build configuration of a VFS view (`crates/blaze-cargo/src/serve/job.rs:1099`, `open_with(opened.view, &encoded)`), so one VFS id cannot name them. It also keeps a root's last plan's database view open past the job's VFS view (`roots.plans`, `job.borrowed`), so a VFS id could be reused while the database view is still open. `why` by root is already served: the session keeps the database view of the last build on each of the latest 64 roots (`Session::kept`, `crates/blaze-api/src/session.rs:79`) and answers `Request::Why` for a root whose VFS view is closed. A root alone doesn't name a configuration's reruns either. Recorded in `docs/v2/plan.md`.
 
 ## From safety-audit (2026-10-29, safety-audit-edge)
 

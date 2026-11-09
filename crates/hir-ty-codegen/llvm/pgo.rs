@@ -1,5 +1,5 @@
 //! Profile-guided optimization in the LLVM back end: rustc's `-Cprofile-generate` and
-//! `-Cprofile-use` (fastcompile-sched 3; `docs/v2/plan/lanes/codegen/pgo.md`).
+//! `-Cprofile-use` (fastcompile-sched 3; `docs/v2/plan/design/codegen.md`).
 //!
 //! A function is compiled alone in a module, where it is [`OWN`]. For the pre-link pipeline,
 //! which is where LLVM instruments a function or reads its profile, it is given its [`name`]

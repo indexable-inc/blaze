@@ -18,7 +18,7 @@ date: 2026-10-29
 
 > applied: by ci (`NodeState::Cancelled` in `crates/blaze-protocol/src/events.rs`, drawn as a skip by `blaze-ui`, decoded by `blaze-web`).
 
-## 2. docs/v2/plan/lanes/core/plane.md (core's) says the old fair-share and starvation rules
+## 2. docs/v2/plan.md (core's) says the old fair-share and starvation rules
 
 - What: in "The plane", rule 3: the next thread goes to the request that started the fewest
   tasks of the pool for its weight (stride scheduling; a request that had no ready work comes
@@ -26,11 +26,11 @@ date: 2026-10-29
   passed over `starve_after` times holds back every task with memory of every pool and request
   (tasks with no memory still start) until it starts. Add: a task not started is ready in the
   request of each of its nodes, at that node's priority; `Plane::cancel`.
-- Where: `docs/v2/plan/lanes/core/plane.md`.
+- Where: `docs/v2/plan.md`.
 - Why: the plane's module doc says this now; the old rule (running tasks over weight) gave a
   pool of one thread to the first request opened forever.
 
-> applied: by core (`docs/v2/plan/lanes/core/plane.md`, rules 3, 5 and 6).
+> applied: by core (`docs/v2/plan.md`, rules 3, 5 and 6).
 
 ## 3. The plane keeps no memo: pass it the database's (core, core-pool)
 
@@ -50,7 +50,7 @@ date: 2026-10-29
     before it posts `Done`, or a node of its key that becomes ready in between runs again.
 - Where: `crates/blaze-graph/src/{lib.rs,build.rs}` (core), `exec.rs` (core-pool),
   `blaze-query` for the impl of `Memo` over the db's results by input hash.
-- Why: docs/v2/plan/lanes/core.md, "One memo, the database's": two memos of one result can disagree, and
+- Why: docs/v2/plan.md, "One memo, the database's": two memos of one result can disagree, and
   the plane's grew without bound in a long-lived daemon.
 
 > applied: core's and core-pool's parts by core (`lib.rs` re-exports `Memo` and `RequestStats`; `build.rs` and `exec.rs` use `Plane::with_memo`).

@@ -1,7 +1,7 @@
 //! What the daemon and its clients say to each other, and how: frames of a four-byte
 //! big-endian length and then one CBOR item in RFC 8949 section 4.2.1's core deterministic
 //! encoding ([`cbor`]). One value has one encoding, so a recorded session can be hashed,
-//! replayed into a renderer and compared byte for byte with another (docs/roadmap.md, "The
+//! replayed into a renderer and compared byte for byte with another (docs/v2/plan.md, "The
 //! agent API").
 //!
 //! The item of a frame is a [`Message`]: the [`SCHEMA`] it is written in, the id of the

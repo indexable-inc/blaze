@@ -21,7 +21,7 @@ zerocopy = { version = "0.8.63", default-features = false, features = ["derive"]
 Why: `tt::TopSubtree::write_wire` and `read_wire` (the proc-macro wire, frontend.md item 4) copy
 the tree's columns. `tt` is `#![forbid(unsafe_code)]`, so a column can't be viewed as bytes
 today, and each is written and read as rows of words: about 1 cycle a leaf against a memory
-copy's 0.5 (docs/v2/plan/lanes/frontend/speed-of-light.md, section 4). With `Node`,
+copy's 0.5 (docs/v2/plan/design/frontend.md, section 4). With `Node`,
 `PackedSpan` and `WideSpan` as `#[repr(C)]` `IntoBytes + FromBytes` (no padding: two or three
 `u32`s each), each column is one `extend_from_slice` on write, and one copy before its checks
 on read, on little-endian targets. On a big-endian target the row path stays, and it writes the
@@ -129,7 +129,7 @@ Status: open
 
 ## frontend-db: the concrete `Db` in the coordinator's paths (frontend.md item 15; 2026-10-29)
 
-From `frontend-db` (notes `docs/v2/plan/lanes/frontend/db.md`). `base_db::Db` is written
+From `frontend-db` (notes `docs/v2/plan/design/frontend.md`). `base_db::Db` is written
 (`crates/base-db/src/db.rs`), and db hooks it in (`docs/v2/requests/db.md`, "frontend-db: the
 concrete database"). Broadcast once db's section 3 lands: new front-end code takes `&Db`
 (`base_db::Db`), never `&dyn HirDatabase` or `&dyn SourceDatabase`.
@@ -166,7 +166,7 @@ concrete database"). Broadcast once db's section 3 lands: new front-end code tak
    - `Cargo.toml`: `inventory.workspace = true`.
    - Run the tool on hir-ide (61 sites, 6 left, each printed).
 4. **Docs**: `docs/v2/plan/design/frontend.md` item 15 can point at
-   `docs/v2/plan/lanes/frontend/db.md` for the design.
+   `docs/v2/plan/design/frontend.md` for the design.
 
 Status: open
 
@@ -267,7 +267,7 @@ Status: open
 ## frontend-tree: cfg `src/cfg_expr.rs`, `src/tests.rs`: delete `CfgExpr::parse_from_ast` (1) (2026-10-29)
 
 From frontend-tree-move-tools (frontend.md item 16, notes
-`docs/v2/plan/lanes/frontend/tree-move-tools.md`). `parse_from_view` is its view twin, already
+`docs/v2/plan/design/frontend.md`). `parse_from_view` is its view twin, already
 in the crate and compared with it on every cfg test (`cfgs` in `src/tests.rs`). Apply only after
 every caller has moved to `parse_from_view`.
 

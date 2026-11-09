@@ -8,7 +8,7 @@ date: 2026-10-29
 ## speed-hir-sol-basedb: hot_lint and budgets
 
 From `speed-hir-sol-basedb` (report `/tmp/blaze-lanes/v2-speed-hir-sol-basedb.md`; bounds and
-arithmetic in `docs/v2/plan/lanes/db/speed-of-light.md`, "base-db: inputs and views"). Written
+arithmetic in `docs/v2/plan.md`, "base-db: inputs and views"). Written
 against the tree at 10-29 20:40, after your `&Db` rewrite of these files. Every block is an exact
 old → new replacement; old text is unique in its file unless a block says "every". Blocks 1–6
 change code; block 7 is justify comments only; block 8 declares the new budget tests in
@@ -678,7 +678,7 @@ without it `budget_tests.rs` is not compiled.
 ## dedup: byte cursor onto blaze_format::cursor
 
 From `dedup-cursor-front` (report `/tmp/blaze-lanes/v2-dedup-cursor-front.md`; the cursor is
-`crates/blaze-format/src/cursor.rs`, API in `docs/v2/plan/lanes/dedup/cursor.md`). Two copies of
+`crates/blaze-format/src/cursor.rs`, API in `docs/v2/plan/design/data.md`). Two copies of
 `Put::put_bytes_u64` (a `u64` length, then the bytes) in base-db's hash inputs. Same bytes
 written, so every content ID stays what it is.
 

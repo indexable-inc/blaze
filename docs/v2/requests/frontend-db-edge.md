@@ -10,7 +10,7 @@ What: in `crates/ide-db/src/lib.rs`, replace `pub struct RootDatabase` (L82) and
 `pub type RootDatabase = base_db::Db;`. Its inherent helpers (`included_files`, `included_by`,
 `included_sources`, `sources_included_by`, `with_files` and the rest) move into a
 `pub trait RootDatabaseExt` implemented for `Db`, so call sites stay, as the test databases'
-helpers did (`docs/v2/plan/lanes/frontend/db.md`, "Test databases"). Its fields (`storage`,
+helpers did (`docs/v2/plan/design/frontend.md`, "Test databases"). Its fields (`storage`,
 `files`, `crates_map`, `nonce`, `pool`) are `Db`'s already.
 
 Why: `HirDatabase` is sealed to its one impl for `Db`, so `RootDatabase` can no longer be one.

@@ -7,8 +7,8 @@ date: 2026-10-30
 
 For lane `db` (owner of `crates/hir-ty-borrowck/` and `crates/hir-ty-wfcheck/`) and, while it
 works in borrowck, `db-ty-d-borrowck`. Design and the speed-of-light bound:
-`docs/v2/plan/lanes/mem/db-checks.md`. Contract programmed against:
-`docs/v2/plan/lanes/mem/db.md` ("The contract"). `blaze_mem::frame::current` is mem-db's request 1
+`docs/v2/plan/design/memory.md`. Contract programmed against:
+`docs/v2/plan/design/memory.md` ("The contract"). `blaze_mem::frame::current` is mem-db's request 1
 of lane mem, `pub fn current<R>(f: impl FnOnce(&Frame) -> R) -> R`.
 
 Line numbers are of the tree as of 2026-10-29 20:00. Every change keeps what the code computes,
@@ -745,7 +745,7 @@ oracle, not the code under test.
 > replaces the `BitMatrix` result, `Edge` replaces the edge callback); `forward(frame, cfg,
 > &Effects, start, boundary: &[u64], edge: FnMut(from, to) -> Edge) -> Rows<'f>`,
 > `backward(frame, cfg, &Effects, edge) -> Rows<'f>`. All of it allocates from the frame. See
-> `docs/v2/plan/lanes/frontend/fast-borrowck.md` 3.1-3.2.
+> `docs/v2/plan/design/frontend.md` 3.1-3.2.
 
 ### B2.4 `crates/hir-ty-borrowck/src/cfg.rs`
 

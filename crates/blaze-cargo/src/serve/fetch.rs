@@ -1,5 +1,5 @@
 //! The sources a build's load asks for ([`Fetch`]), fetched and checked as cargo fetches them
-//! (docs/v2/plan/lanes/cargo/notes.md section 3): a `.crate` got through blaze-fetch with its
+//! (docs/v2/plan.md section 3): a `.crate` got through blaze-fetch with its
 //! lock file's sha256 as the pin (from the store when it has it, else downloaded, checked and
 //! kept there) and unpacked in memory with cargo's checks of its paths, a sparse index's file
 //! as served, a git tree at exactly its locked commit. Called on an IO thread of the plane ([`super::work::Steps::fetch`]).

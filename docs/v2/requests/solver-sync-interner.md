@@ -17,7 +17,7 @@ nightly-2026-10-27's `rustc_type_ir`).
   `Region::get_name_or_anon` names an unnamed region). `next_solver/interner.rs` implements it as
   `const SYM_ANON: Self = Symbol(sym::anon);`, which needs `intern::sym::anon` as a `const`;
   the `@PLAIN` list gives exactly that. Its test `the_keyword_symbols_are_rustcs` checks the
-  text is `"anon"`. Owner: format (`docs/v2/plan/reference/crates.md`).
+  text is `"anon"`. Owner: format (`docs/v2/plan.md`).
 
 > forwarded to format: `crates/intern/` is its.
 

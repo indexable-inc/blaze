@@ -3,13 +3,13 @@ status: record
 summary: The v2 lanes' requests filed under `mem-db-def-collect` (what one lane asked of the code another owns), each with its answer.
 date: 2026-10-30
 ---
-<!-- From mem-db-def-collect (child of mem-db-def). Notes: docs/v2/plan/lanes/mem/db-def-collect.md.
+<!-- From mem-db-def-collect (child of mem-db-def). Notes: docs/v2/plan/design/memory.md.
      Report: /tmp/blaze-lanes/v2-mem-db-def-collect.md. Line numbers are as read on 2026-10-29;
      the files move under other lanes, so the function named with each line is what to match. -->
 
 # mem-db-def-collect: def-map collection on the query frame
 
-Contract: `docs/v2/plan/lanes/mem/db.md` (points 1 to 7). Every collecting query opens its own
+Contract: `docs/v2/plan/design/memory.md` (points 1 to 7). Every collecting query opens its own
 task frame (`blaze_mem::frame::task(Tag::Nameres, |frame| ..)` around its body; salsa's
 `execute` opens none), threads `&'f Frame` into its collector, and keeps every per-run temporary
 there. What it
@@ -729,7 +729,7 @@ batch runs on the calling thread (`TestDB`'s `RUN_ORDER`), so per-thread counts 
 collection.
 
 ```rust
-//! Allocation budgets of def-map collection (docs/v2/plan/lanes/mem/db.md, point 7): a
+//! Allocation budgets of def-map collection (docs/v2/plan/design/memory.md, point 7): a
 //! re-collection that changes nothing allocates nothing, and a miss allocates what its owned
 //! result holds and no more.
 
@@ -969,7 +969,7 @@ C2 to C4, and nothing in them points into a frame.
 > and frozen encoding 11 are all unbuilt. A1-A5, A8, B1 and B4, which Part H supersedes, are left
 > as they are until then.
 
-mem-db-def's ruling (`docs/v2/plan/lanes/mem/db-def.md`, "Ruling: the scopes a collection builds
+mem-db-def's ruling (`docs/v2/plan/design/memory.md`, "Ruling: the scopes a collection builds
 live in its frame") puts the def map being collected in the collector's frame. mem-db-def-resolve
 wrote the types and readers as **R10** of `docs/v2/requests/mem-db-def-resolve.md`, and mem-db-def
 accepted R10's shape over its ruling's `ItemScope<A>`/`DefMap<A>` names (21:17).
@@ -1766,7 +1766,7 @@ signature edit. The edit (a function's visibility) keeps every salsa identity: t
 (`ModuleIdLt` by parent and name, `FunctionLoc` and the rest by container and `AstId`, the macro
 call by its `AstId`) are found, not made, and the `ModuleScope`s and the `Modules` reuse their
 slots. A first-ever run differs only by salsa interning those ids: the growth of the interned
-hash tables, which M5 of `docs/v2/plan/lanes/mem/db-salsa.md` keeps on the global allocator. That
+hash tables, which M5 of `docs/v2/plan/design/memory.md` keeps on the global allocator. That
 cost is salsa's, depends on how full each shard's table already is, and is not a property of
 collection. T5 covers the first-ever run.
 

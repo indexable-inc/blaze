@@ -9,11 +9,11 @@
 //!   runs the key and holds it until the other waits for it, so every key is a claim, a wait and
 //!   a wake in the scheduler, and the pairs share nothing: what a scheduler's lock costs pairs
 //!   that never wait on each other (one lock for the process before each pool held a scheduler
-//!   of its own, docs/v2/plan/lanes/sched.md). [`PAIR_OPS`] keys a thread; even counts only.
+//!   of its own, docs/v2/plan/design/fibers.md). [`PAIR_OPS`] keys a thread; even counts only.
 //!
 //! A key nobody else asks for is two claims of its shard, one to add the run and one to remove
 //! it. One thread is the uncontended cost a lock-free table must not lose
-//! (docs/v2/plan/lanes/concurrency/flights.md).
+//! (docs/v2/plan/design/concurrency.md).
 //!
 //! Run: `blaze bench -p blaze-graph --bench flights`. Each number is the best of `ROUNDS`: the
 //! nanoseconds a thread takes per operation, and millions of operations a second over all.

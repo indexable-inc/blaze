@@ -6,7 +6,7 @@ date: 2026-10-29
 # Requests from `lints-parallel` (`blaze::parallelizable`, `blaze::serial_dependence`)
 
 All via lane `lints` unless said. The lints are in `crates/blaze-lints/src/blaze/parallel*`;
-notes in `docs/v2/plan/lanes/lints/parallel.md`.
+notes in `docs/lints.md`.
 
 ## 1. lints: review the wiring in `crates/blaze-lints/src/blaze.rs`
 
@@ -14,7 +14,7 @@ notes in `docs/v2/plan/lanes/lints/parallel.md`.
   - `Lint::Parallelizable`, `Lint::SerialDependence` at the end of `Lint` and `Lint::ALL`
     (bits 52 and 53; `lints/mod.rs`'s assert that they fit an `On` holds);
   - their names (`parallelizable`, `serial_dependence`), help lines and docs urls (a
-    `parallel_docs!()` beside `docs!()`, into `docs/v2/plan/lanes/lints/parallel.md`);
+    `parallel_docs!()` beside `docs!()`, into `docs/lints.md`);
   - `mod parallel;` and `parallel::check(cx);` first in `check_body`.
   `HOT` is unchanged: the two are in no group, as `docs/v2/requests/lints.md`'s registration says.
 - Where: `crates/blaze-lints/src/blaze.rs`.

@@ -1,5 +1,5 @@
 //! The synchronization types of [`crate::Sharded`] and the domain keys: std's, or the model
-//! checker's in a model build (docs/v2/plan/lanes/safety/model.md, "The switch"). Outside one the
+//! checker's in a model build (docs/v2/plan/design/model-checker.md, "The switch"). Outside one the
 //! lock is `blaze_core::lock`'s named lock.
 
 #[cfg(not(blaze_check))]

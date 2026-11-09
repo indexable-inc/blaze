@@ -411,7 +411,7 @@ impl Drop for Maintaining {
 
 // Each access to `MAINTAINING` is a call of its own, never inlined: a maintainer run that waits
 // between two may resume on another thread, and an inlined access may reuse the address of the
-// first thread's slot (docs/v2/plan/lanes/may-suspend.md).
+// first thread's slot (docs/v2/plan/design/may-suspend.md).
 
 #[inline(never)]
 fn replace_maintaining(krate: Option<Crate>) -> Option<Crate> {

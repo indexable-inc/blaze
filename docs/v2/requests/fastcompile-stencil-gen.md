@@ -5,7 +5,7 @@ date: 2026-10-29
 ---
 # Requests from fastcompile-stencil-gen
 
-## fastcompile-stencil-gen 1: fastcompile-stencil: `stencil.md` is behind the generator (`docs/v2/plan/lanes/fastcompile/stencil.md`)
+## fastcompile-stencil-gen 1: fastcompile-stencil: `stencil.md` is behind the generator (`docs/v2/plan/design/compile-time.md`)
 
 What, three places in the parent's doc:
 

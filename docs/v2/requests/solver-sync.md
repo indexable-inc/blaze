@@ -100,7 +100,7 @@ solver-sync then moves `Column` onto it, in its own file.
 
 Why: the speed-of-light bar. It takes an intern hit from about 41 to 33 cycles and a handle
 read from about 15 cycles to the bound of about 6 (with the change in section 2 of
-`docs/v2/plan/lanes/solver-sync/speed-of-light.md`).
+`docs/v2/plan.md`).
 
 > forwarded to db and mem (from requests, pass 16; told by tmux).
 

@@ -373,7 +373,7 @@ pub enum ExpressionStoreDiagnostics {
         form: ComptimeForm,
     },
     /// A specification clause (`requires`, `ensures`, `invariant`, ..) or a named return type
-    /// (docs/v2/plan/lanes/verus.md) lowering refuses, for `why`: the clause is not lowered.
+    /// (docs/v2/plan/design/verus.md) lowering refuses, for `why`: the clause is not lowered.
     VerifyRefused {
         node: InFile<SyntaxNodePtr>,
         why: VerifyRefusal,
@@ -410,7 +410,7 @@ impl VerifyRefusal {
     }
 }
 
-/// blaze_verify: which clauses a clause group holds (docs/v2/plan/lanes/verus.md). A group is
+/// blaze_verify: which clauses a clause group holds (docs/v2/plan/design/verus.md). A group is
 /// one expression statement lowering puts at the head of the block it is about: a function's
 /// body for `Requires`, `Recommends`, `Ensures` and `Decreases`, a loop's body for the others.
 /// Its expression is a tuple of the clause's expressions, or, for an `Ensures` of a function
@@ -2006,7 +2006,7 @@ impl ExpressionStore {
 
     /// blaze_verify: the clause `group` is, when it is one: an expression statement that
     /// [`lower`](crate::expr_store::lower) made of a function's or a loop's clauses
-    /// (docs/v2/plan/lanes/verus.md). The program erases it: MIR lowering skips it.
+    /// (docs/v2/plan/design/verus.md). The program erases it: MIR lowering skips it.
     pub fn spec_clause(&self, group: ExprId) -> Option<SpecClauseKind> {
         let clauses = &self.expr_only.as_deref()?.spec_clauses;
         let at = clauses.binary_search_by_key(&group, |&(it, _)| it).ok()?;

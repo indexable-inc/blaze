@@ -1,6 +1,6 @@
 //! The explorer's daemon side: the daemon as a source of ix-prof's explorer
 //! (`ix_prof::explore`, the HTTP/3 WebTransport server https://ix.dev/explore connects to on
-//! 127.0.0.1; docs/v2/plan/observe/explore-generic.md). `blaze explore` starts it in the
+//! 127.0.0.1; docs/v2/plan/design/explore-generic.md). `blaze explore` starts it in the
 //! daemon. This crate is the `blaze` layer alone: the transport, the certificate, the link, the
 //! token, `hello` and the live stream's framing are ix-prof's.
 //!

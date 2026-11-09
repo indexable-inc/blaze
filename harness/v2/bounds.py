@@ -1,10 +1,9 @@
-"""bounds.py: the speed-of-light bounds every lane writes (docs/v2/plan/goals/principles.md, "Within
-10% of the theoretical maximum"), read as budgets: at most the bound × 1.1, or for a rate at least
-the bound / 1.1. `budgets.py` measures them as its budget `bounds`.
+"""bounds.py: the speed-of-light bounds (docs/v2/plan.md, "Within 10% of the bound"), read as
+budgets: at most the bound × 1.1, or for a rate at least the bound / 1.1. `budgets.py` measures
+them as its budget `bounds`.
 
-Each lane's `docs/v2/plan/lanes/<lane>/speed-of-light.md` says, per component, its bound with the
-arithmetic and what `proof` should measure. A bound a program can measure is also written there,
-beside that arithmetic, as a fenced block with the info string `bound` holding one JSON object:
+`docs/v2/plan/bounds.md` is the one home of every bound: per component, the arithmetic in a
+sentence and a fenced block with the info string `bound` holding one JSON object:
 
     ```bound
     {"name": "link: ripgrep's full link", "bound": 9.0, "unit": "ms",
@@ -41,9 +40,9 @@ sys.path[:0] = [str(HERE), str(HERE.parent)]
 from typed_input import fail, parse
 
 SCRIPT = "bounds.py"
-# docs/v2/plan/goals/principles.md: a component more than 10% off its bound is a bug.
+# docs/v2/plan.md: a component more than 10% off its bound is a bug.
 SLACK = 1.1
-DOCS = "docs/v2/plan/lanes/*/speed-of-light.md"
+DOCS = "docs/v2/plan/bounds.md"
 BLOCK = re.compile(r"^```bound[ \t]*\n(.*?)^```[ \t]*$", re.M | re.S)
 
 
@@ -134,9 +133,9 @@ def selftest() -> None:
         '{"name": "a: hash", "bound": 6.0, "unit": "GB/s", "program": "h", "rate": true}\n'
         "```\n"
     )
-    found = blocks(doc, "lanes/a/speed-of-light.md")
+    found = blocks(doc, "bounds.md")
     expect([f.bound.name for f in found] == ["a: link", "a: hash"], f"two bound blocks, not {found}")
-    expect(found[0].where == "lanes/a/speed-of-light.md:5", f"where the first is: {found[0].where}")
+    expect(found[0].where == "bounds.md:5", f"where the first is: {found[0].where}")
     expect(found[0].bound.args == ("x",) and found[1].bound.args == (), "the arguments")
     expect(abs(found[0].budget - 22.0) < 1e-9 and abs(found[1].budget - 6.0 / 1.1) < 1e-9,
            f"budgets: {[f.budget for f in found]}")

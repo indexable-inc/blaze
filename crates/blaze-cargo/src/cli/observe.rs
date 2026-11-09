@@ -1,5 +1,5 @@
 //! blaze's looks at itself (docs/profiling.md): `blaze explore`, the explorer's link to the
-//! daemon (docs/v2/plan/lanes/observe/explore.md); `blaze debug profile`, `blaze debug live`
+//! daemon (docs/v2/plan/design/explore.md); `blaze debug profile`, `blaze debug live`
 //! and `blaze debug sql`, the daemon's flight recorder and its profile history; `blaze
 //! explain`, a rule's long text, the last build's failure of a package with all it blocks, or a
 //! named view of that history; and `blaze why`, what the last build computed again and why.

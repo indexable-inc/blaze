@@ -109,7 +109,7 @@ tree struct, accessors, `$Lens`, `$Sinks`, `build`/`try_build`, `Default`, `Part
 `assemble`). Every `unsafe` block is one operation with its `// SAFETY:`.
 
 ```rust
-//! A tree's columns in one allocation (docs/v2/plan/lanes/mem/format.md, "tree items"): a
+//! A tree's columns in one allocation (docs/v2/plan/design/memory.md, "tree items"): a
 //! header of where each column ends, then the columns, each at its type's alignment. A tree is
 //! one pointer, making one is one allocation (none for a tree with no values), and offsets,
 //! never pointers, place the columns, so the same layout can later be a verified view of mapped

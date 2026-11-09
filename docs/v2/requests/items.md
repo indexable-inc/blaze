@@ -116,7 +116,7 @@ instance and holds no name itself. What codegen must do:
   on its code hash: `const C: &str = f::<A>()` keeps its code hash when `A` is renamed while
   its bytes change.
 
-Why: otherwise a rename keeps a stale `type_name` string or `TypeId` (docs/v2/plan/lanes/items.md 6.1:
+Why: otherwise a rename keeps a stale `type_name` string or `TypeId` (docs/v2/plan/design/item-hash.md 6.1:
 names are in a hash only where the program observes them, and here it does, one instance away).
 
 > forwarded to codegen
@@ -140,7 +140,7 @@ What, both bit-identical to today's output on every path:
 3. The root `Cargo.toml`: `blake3` with the `neon` feature (store's request 5), so aarch64
    (Graviton, Apple) gets NEON.
 
-Why: docs/v2/plan/design/hardware.md, "BLAKE3 of sources, items and blobs ... one batched
+Why: docs/v2/plan/design/data.md, "BLAKE3 of sources, items and blobs ... one batched
 call per many small inputs, not one call each".
 
 > forwarded to format: items 1 and 2 are `crates/blaze-ids` (format's).
@@ -373,7 +373,7 @@ What: add `mod coherence;` to `crates/blaze-items/src/tests/mod.rs` (after `mod 
 file `crates/blaze-items/src/tests/coherence.rs` with exactly the contents below.
 
 Why: speed-types-probe-coherence changed `crates/hir-ty/src/{specialization,traits,opaques,drop}.rs`
-(notes: `docs/v2/plan/lanes/items/speed-types-probe-coherence.md`). hir-ty has no test
+(notes: `docs/v2/plan/design/item-hash.md`). hir-ty has no test
 database, and blaze-items' `TestDB` is where these files' fixture tests already live
 (`narrow.rs`). Each test checks the answers the code gave before the change on a fixture
 (blanket, inherent and specializing impls, impls in two crates, aliases with and without
@@ -384,7 +384,7 @@ database, and blaze-items' `TestDB` is where these files' fixture tests already 
 ```rust
 //! Coherence, specialization, opaque types and `Freeze` over fixtures: each answers as it
 //! did before speed-types-probe-coherence's pass
-//! (docs/v2/plan/lanes/items/speed-types-probe-coherence.md), and skips what it now skips.
+//! (docs/v2/plan/design/item-hash.md), and skips what it now skips.
 
 use base_db::{Crate, all_crates};
 use hir_def::{
@@ -2156,7 +2156,7 @@ Same order, so no CodeHash changes. `tests/form.rs`'s copy stays: it is the refe
 ## frontend-fast-trait-store: implement `GoalFacts`, and the facts the solver's reads need (2026-10-29)
 
 From frontend-fast-trait-store, child of frontend-fast-trait (notes
-`docs/v2/plan/lanes/frontend/fast-trait-store.md` section 3; code
+`docs/v2/plan/design/frontend.md` section 3; code
 `crates/hir-ty/src/next_solver/goal_store.rs`). The persistent goal cache keeps a global trait
 goal's answer in the store under its stable form (definitions by your item keys) with the facts
 its evaluation read. hir-ty cannot name `blaze_items`, so it defines the interface,

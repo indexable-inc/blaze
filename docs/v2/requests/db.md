@@ -38,7 +38,7 @@ shares them (not `&mut Vfs`) can answer both. Wire it in `Database::new(Config {
 
 - Make the daemon's database with `Database::new(Config { tree, dir, tags })` (or, at start,
   `Database::from_image_with(config, mapping)` of `<dir>/image`; on `DbError::Image` start from
-  `Database::new` and rebuild from the store's results, as `docs/v2/plan/lanes/format.md` says).
+  `Database::new` and rebuild from the store's results, as `docs/v2/plan/design/data.md` says).
 - Hand it every completion whose tag it `owns`, through `Database::complete`.
 - After a cold build: `write_image`, then, once `complete` has mapped it, `settle(&mut effects)`
   swaps to the mapped image and drops the cold arenas (#1299). `reclaim` frees retired buffers
@@ -55,7 +55,7 @@ Routed or applied by the coordinator, 16:54.
 
 ## 4. Status of request 1 (db, 17:40)
 
-`crates/blaze-query/` is lane db's crate (`docs/v2/plan/reference/crates.md`), so db applied
+`crates/blaze-query/` is lane db's crate (`docs/v2/plan.md`), so db applied
 request 1 itself: `Query::Key: Clone + Send + Sync + Serialize + DeserializeOwned + 'static`. No
 crate outside blaze-query implements `Query` yet; `blaze-units`' planned queries (`Plan` with key
 `()`, `StdUnits` with `StdKey`) must derive serde on their keys.
@@ -91,7 +91,7 @@ for a query cycle. Salsa can't depend on blaze-graph, so the daemon hands it the
 
 ## 7. Docs (coordinator)
 
-`docs/v2/plan/lanes/db.md` moved to `docs/v2/plan/lanes/db/query-database.md` (lane notes go in the lane's
+`docs/v2/plan.md` moved to `docs/v2/plan.md` (lane notes go in the lane's
 folder); the one link to it (`crates/blaze-query/src/lib.rs`) is updated. Index it wherever
 `python3 tools/docs.py check` wants lane notes listed.
 
@@ -430,7 +430,7 @@ stays. What changes, so it lines up when the front end moves onto `blaze-query`:
   range or a box of cold data (cycle state, tracked struct IDs, accumulated values, fingerprints).
 - Deep verification runs without a claim while it only reads; only a memo that must run claims.
 
-Design and the mapping onto `MemoData`/`Edge`: `docs/v2/plan/lanes/db/speed-salsa.md`, "S5".
+Design and the mapping onto `MemoData`/`Edge`: `docs/v2/plan.md`, "S5".
 
 > applied: noted; it asks for no change (no public API moves).
 
@@ -1286,7 +1286,7 @@ What:
   `hir-ty-matchck = { path = "crates/hir-ty-matchck", version = "0.0.0" }` and
   `hir-ty-unsafeck = { path = "crates/hir-ty-unsafeck", version = "0.0.0" }`. Both are members
   already through `crates/*`.
-- In `docs/v2/plan/reference/crates.md`, add both crates to lane db's paths (line 71), and to
+- In `docs/v2/plan.md`, add both crates to lane db's paths (line 71), and to
   the table at line 111 beside `hir-ty-borrowck`.
 
 Why: this answers the diagnostics request "diagnostics-lints-mir-unsafe", whose note says "the
@@ -1373,7 +1373,7 @@ again.
 From `safety-model-db` (child of `safety-model`, lane safety; report
 `/tmp/blaze-lanes/v2-safety-model-db.md`). For `db-query`, who owns `crates/blaze-query/` and is
 still at work, so none of this is written in the crate. Design:
-`docs/v2/plan/lanes/safety/model.md` ("The switch", "Model tests"). It is written against
+`docs/v2/plan/design/model-checker.md` ("The switch", "Model tests"). It is written against
 `table.rs` and `lib.rs` as of 2026-10-29 20:xx (`Map<V>`, `Column<T>`, `ValueCell`,
 `Database::generation` and `born`, `INSIDE`). `db-query`'s plan (`Map<V, X>`, `Rows<T>`,
 `segment.rs`, `memo.rs`) replaces some of these. Apply what still names real code; for a
@@ -1455,7 +1455,7 @@ below check each of these.
 ```rust
 //! The synchronization types the tables and the database use: `std`'s, or under
 //! `--cfg blaze_check` the model checker's, which have `std`'s API
-//! (docs/v2/plan/lanes/safety/model.md "The switch"). A normal build sees `std`'s alone.
+//! (docs/v2/plan/design/model-checker.md "The switch"). A normal build sees `std`'s alone.
 
 #[cfg(not(blaze_check))]
 #[allow(clippy::disallowed_types)]
@@ -1631,7 +1631,7 @@ get_or_insert_keeps_the_first_value`, `#[test] fn an_update_sees_the_entry_it_re
 Append at the end of the file:
 
 ```rust
-/// Model tests (docs/v2/plan/lanes/safety/model.md): each structure from two or three threads
+/// Model tests (docs/v2/plan/design/model-checker.md): each structure from two or three threads
 /// under every interleaving and every value its loads may read. What a lock, a
 /// read-modify-write or a join orders is checked against a sequential model; what a lone
 /// acquire load sees is asserted directly, since it may be older than a store that came
@@ -2147,7 +2147,7 @@ mod model {
 Append at the end of the file:
 
 ```rust
-/// Model tests of the database's own lock-free state (docs/v2/plan/lanes/safety/model.md): the
+/// Model tests of the database's own lock-free state (docs/v2/plan/design/model-checker.md): the
 /// collection generation and the thread-local that marks a query running.
 #[cfg(blaze_check)]
 mod model {
@@ -3211,8 +3211,8 @@ Status: open
 ## frontend-nameres-core: crate_local_def_map and block_def_map on the per-module resolver
 
 From `frontend-nameres-core` (report `/tmp/blaze-lanes/v2-frontend-nameres-core.md`, notes
-`docs/v2/plan/lanes/frontend/nameres-core.md`). Puts the def maps on `nameres/facts/` (the
-per-module, per-SCC resolver of `docs/v2/plan/lanes/frontend/nameres.md`) and takes the old
+`docs/v2/plan/design/frontend.md`). Puts the def maps on `nameres/facts/` (the
+per-module, per-SCC resolver of `docs/v2/plan/design/frontend.md`) and takes the old
 `collector` fixpoint off the build's path (test-only, for the differential tests). Every edit
 below is needed together; `facts/` is written against them.
 
@@ -3574,7 +3574,7 @@ Status: open
 
 ## frontend-tree: views of a file's tree, borrowed from the database (2026-10-29)
 
-frontend.md item 16 (notes: `docs/v2/plan/lanes/frontend/tree.md`) moves the build path from the
+frontend.md item 16 (notes: `docs/v2/plan/design/frontend.md`) moves the build path from the
 counted handles (`SyntaxNode`, `ast::*`) to borrowed `Copy` views (`syntax::view`). The parse a
 query keeps is returned by reference (`EditionedFileId::parse`, `parse_macro_expansion` are
 `returns(ref)`), so a view of it lives as long as the `&'db Db`: no handle, no
@@ -3654,7 +3654,7 @@ Status: open
 ## frontend-db: the concrete database, `base_db::Db` (frontend.md item 15; 2026-10-29)
 
 From `frontend-db` (report `/tmp/blaze-lanes/v2-frontend-db.md`, notes
-`docs/v2/plan/lanes/frontend/db.md`, which say why: rustc's `TyCtxt` on salsa, with
+`docs/v2/plan/design/frontend.md`, which say why: rustc's `TyCtxt` on salsa, with
 `&'db Db` as `TyCtxt<'tcx>`). The type is written: `crates/base-db/src/db.rs` and its tests
 `crates/base-db/src/db/tests.rs` (new files, frontend-db's). What follows hooks it in and moves
 db's crates onto it. `tools/v2/concrete_db.py` does the mechanical part of 4 and 6 (dry run over
@@ -3980,7 +3980,7 @@ Status: open
 `crates/hir-def/src/nameres/frozen.rs` writes and reads `LitKind`'s number 0 to 10 with its own
 two `match`es, equal to `crates/tt/src/storage.rs`'s. `tt::LitKind::code` and `from_code` are
 requested of frontend-tokens (`docs/v2/requests/frontend-tokens.md`, same heading). Apply this after
-they land. Design: `docs/v2/plan/lanes/dedup/macros.md`.
+they land. Design: `docs/v2/plan/design/data.md`.
 
 1. The writer (around line 958, in the `Leaf::Literal` arm): replace
    `let (kind, hashes) = match kind { LitKind::Byte => (0, 0), ... LitKind::Err(()) => (10, 0), };`
@@ -7671,7 +7671,7 @@ call these two methods and are complete once they exist.
    ```
    (`use crate::Cancelled;` if not in scope.) Cost on a memo hit: one `Relaxed` load from
    `Runtime`, which the hit reads anyway for `current_revision`, and a never-taken branch:
-   about 0.3 ns against the hit's 6-8 ns (`docs/v2/plan/lanes/frontend/db.md`, speed of light).
+   about 0.3 ns against the hit's 6-8 ns (`docs/v2/plan/design/frontend.md`, speed of light).
 4. `vendor/salsa/src/database.rs`, after `trigger_cancellation`:
    ```rust
        /// Has every query running on this database, on any thread and inside cycles too, unwind
@@ -7910,7 +7910,7 @@ Lines 1609, 1646 and 1747 (`// dyn: see `KeySource::Typed``) stay.
 
 ## frontend-bodies: R1, a def map's records leave the `DefMap` value (2026-10-29)
 
-From `frontend-fast-bodies` (notes: `docs/v2/plan/lanes/frontend/fast-bodies.md`, section 1).
+From `frontend-fast-bodies` (notes: `docs/v2/plan/design/frontend.md`, section 1).
 Cc `frontend-nameres` and `frontend-deps` (they touched `facts/` and `frozen.rs`).
 
 Why: every resolver and every `DbInterner::new_with` reads the crate's whole `DefMap` (one
@@ -8334,7 +8334,7 @@ store (`blaze_cas::Reader::pinned`, a mapping), so the owner is
 
 Why: principles.md's zero-copy reads of mapped bytes. A served dependency's signature stores
 are read where the store maps them; a copy is about 11% over decode's bound
-(`docs/v2/plan/lanes/format/speed-of-light.md`, "Encoding and decoding a store").
+(`docs/v2/plan/design/data.md`, "Encoding and decoding a store").
 
 Status: open
 
@@ -8510,7 +8510,7 @@ keeping only calls on `hir` types.
 module `crates/hir-ty/src/consteval/hir_eval.rs` (frontend-fast-const's, written) evaluates a
 constant of the closed shape (literals, paths to free `const` items, integer/`bool` unary and
 binary operators with rustc's checks, integer casts, `size_of`/`align_of`, blocks with no
-statements; definition and proof in `docs/v2/plan/lanes/frontend/fast-const.md` section 3) over
+statements; definition and proof in `docs/v2/plan/design/frontend.md` section 3) over
 its HIR, giving the same allocation or the same `ConstEvalError` as the MIR evaluator, and sends
 every other constant to `hir_eval::by_mir`, which is the MIR code these queries have now, moved
 verbatim. Why: a literal constant goes from 3 queries, 20+ allocations and 5-20 us to one
@@ -8647,7 +8647,7 @@ Status: open
 > tests' `check_module(&db, it, false, None)` become `&every_body`.
 
 From `frontend-fast-bodies-tasks` (child of `frontend-fast-bodies`; notes:
-`docs/v2/plan/lanes/frontend/fast-bodies-tasks.md`). New files, mine:
+`docs/v2/plan/design/frontend.md`). New files, mine:
 `crates/hir/src/check/bodies.rs` (the plan, its queue, the tasks, assembly) and
 `crates/hir/src/check/bodies/tests.rs`. These edits hook them in.
 
@@ -8680,7 +8680,7 @@ is byte-identical to `check_module` of each module whole. A build posts reached 
 //!
 //! The technique to match is rustc's parallel front end, `par_hir_body_owners` on rayon's work
 //! stealing: one body per task. A task costs about 200 ns to schedule against a body's 11 µs or
-//! more (docs/v2/plan/lanes/frontend/fast-bodies-tasks.md), a slot is written once (no lock),
+//! more (docs/v2/plan/design/frontend.md), a slot is written once (no lock),
 //! and unlike rustc's the diagnostics come out in one order whatever the threads.
 
 pub mod bodies;
@@ -8913,7 +8913,7 @@ Status: open
 module `crates/hir-ty/src/consteval/hir_eval.rs` (frontend-fast-const's, written) evaluates a
 constant of the closed shape (literals, paths to free `const` items, integer/`bool` unary and
 binary operators with rustc's checks, integer casts, `size_of`/`align_of`, blocks with no
-statements; definition and proof in `docs/v2/plan/lanes/frontend/fast-const.md` section 3) over
+statements; definition and proof in `docs/v2/plan/design/frontend.md` section 3) over
 its HIR, giving the same allocation or the same `ConstEvalError` as the MIR evaluator, and sends
 every other constant to `hir_eval::by_mir`, which is the MIR code these queries have now, moved
 verbatim. Why: a literal constant goes from 3 queries, 20+ allocations and 5-20 us to one
@@ -9044,7 +9044,7 @@ lane items' files:
 - `method_resolution.rs:174`: expr X1's caller, `self.write_expr_adj(receiver, &result.adjustments);`.
 - `method_resolution.rs`: ctx M1 (`TraitsInScope`) is superseded by frontend-fast-method's
   `TraitsInScope` (interned ids), and method P3 for method calls (steps cached in a table,
-  borrowed), per `docs/v2/plan/lanes/frontend/fast-method.md` section 7. frontend-fast-method holds
+  borrowed), per `docs/v2/plan/design/frontend.md` section 7. frontend-fast-method holds
   `method_resolution.rs` and `probe.rs` now; P1, P2, P4, P5 apply on top once it says it is out.
 - `traits.rs:405` `where_predicate_must_hold`: T1 above, unchanged (task, frame to
   `TyLoweringContext::new`, frame `Vec` of clauses).
@@ -9065,7 +9065,7 @@ lane items' files:
 evaluation queries go through `consteval::hir_eval::value`" above; the old text below is
 `const_eval_query`'s body as that section leaves it. The new module
 `crates/hir-ty/src/consteval/deps.rs` (frontend-fast-const-deps's, written; notes
-`docs/v2/plan/lanes/frontend/fast-const-deps.md`) serves a dependency's `const` item from the
+`docs/v2/plan/design/frontend.md`) serves a dependency's `const` item from the
 store by its content key, before its body is parsed, inferred or lowered, and records evaluated
 values for the driver to write. It is `pub` because the driver calls
 `hir_ty::consteval::deps::{set, drain}` and hir-ide's tests use them; `cached`/`record` stay
@@ -9107,7 +9107,7 @@ Status: open
 ## frontend-fast-infer: the touched log of union-find writes (2026-10-29)
 
 db-ty's `next_solver/infer/` (db-ty-next2 answered in `docs/v2/requests/db-ty-next2.md`: db-ty's, no
-one editing). Notes: `docs/v2/plan/lanes/frontend/fast-infer.md` section 2. The new module
+one editing). Notes: `docs/v2/plan/design/frontend.md` section 2. The new module
 `crates/hir-ty/src/next_solver/infer/touched.rs` (written, with `touched/tests.rs`) logs each row
 `UnionFind::set` writes, so `fulfill/watch.rs` wakes only the obligations stalled on a written
 variable. Apply with the next two sections; nothing uses the log until they land.
@@ -9435,7 +9435,7 @@ Status: open
 ## frontend-fast-infer: coercion by head dispatch in `infer/coerce.rs` (2026-10-29)
 
 mem-db-infer's and mem-db-infer-expr's file (both DONE); lane db's `hir-ty`. Notes:
-`docs/v2/plan/lanes/frontend/fast-infer.md` section 1, with the proof of each case. The new
+`docs/v2/plan/design/frontend.md` section 1, with the proof of each case. The new
 module `crates/hir-ty/src/infer/coerce/fast.rs` (written, with `fast/tests.rs`: the
 differential test against the old order and the allocation budgets) holds the dispatch: rustc's
 unsizing rejections before any snapshot, unsizing skipped where no `CoerceUnsized` candidate
@@ -9723,7 +9723,7 @@ Status: open
 ## frontend-tree: hir `src/semantics.rs`: `SemanticsScope::speculative_resolve_mod_path` (1) (2026-10-29)
 
 From frontend-tree-move-tools (frontend.md item 16, notes
-`docs/v2/plan/lanes/frontend/tree-move-tools.md`). blaze-lints' `Cx::resolve_name` resolves a
+`docs/v2/plan/design/frontend.md`). blaze-lints' `Cx::resolve_name` resolves a
 name a format string captures as a one-segment path in an item's scope. It made a handle path
 with `ast::make::path_from_text(name)` for `speculative_resolve`; on views there is no path node
 to give, so it builds the `ModPath` (`one_segment_path` in `crates/blaze-lints/src/check.rs`,
@@ -9777,7 +9777,7 @@ Status: open
 > (dedyn's enum) onto `view::Node<'a>`, along with its test.
 
 From `frontend-tree-move-def` (frontend.md item 16, notes
-`docs/v2/plan/lanes/frontend/tree-move-def.md`), for lane db (`crates/hir-def/src/expr_store/` is
+`docs/v2/plan/design/frontend.md`), for lane db (`crates/hir-def/src/expr_store/` is
 format's; format is DONE and no live child holds this file). The source map's node-to-id lookups
 get view twins taking the view by value: `node_expr_view`, `node_macro_file_view`,
 `node_pat_view`, `node_type_view`, `node_label_view`, `macro_expansion_expr_view`,
@@ -10008,7 +10008,7 @@ scratch back. The hir part is lane db's, applied once this lands.
 ## frontend-tree: base-db reparse.rs + tests.rs: onto views (1)
 
 From frontend-tree-move-expand (child of frontend-tree; notes
-`docs/v2/plan/lanes/frontend/tree-move-expand.md`). base-db has no public API that takes or
+`docs/v2/plan/design/frontend.md`). base-db has no public API that takes or
 returns a handle: `EditionedFileId::parse` returns the `Parse`, a kind tag that already gives
 views (`root()`, `view()`). These are its last syntax-handle reads. Each reads the same tree
 and makes the same check.
@@ -10095,7 +10095,7 @@ Why: a view node's text is one slice of the source, so the check makes no `Strin
 ## frontend-tree: hir semantics.rs, source_analyzer.rs, lib.rs: onto views (1) (2026-10-29)
 
 From frontend-tree-move-hir (frontend.md item 16, notes
-`docs/v2/plan/lanes/frontend/tree-move-hir.md`). Declares the new view modules, all new files
+`docs/v2/plan/design/frontend.md`). Declares the new view modules, all new files
 of mine (`crates/hir/src/semantics/view.rs`, `semantics/view/{has_source,source_to_def,analyze,tests}.rs`,
 `crates/hir/src/source_analyzer/view.rs`), and re-exports them where `blaze-diagnostics`,
 `blaze-engine`, `blaze-lints` and the tools already name them (`hir::view::Semantics`,
@@ -10178,7 +10178,7 @@ Status: open
 
 ## frontend-tree: hir-ty effects.rs, hir-ty-borrowck names.rs, check/tests.rs: onto views (3) (2026-10-29)
 
-From frontend-tree-move-hir (notes `docs/v2/plan/lanes/frontend/tree-move-hir.md`, "hir-ty and
+From frontend-tree-move-hir (notes `docs/v2/plan/design/frontend.md`, "hir-ty and
 the checkers"). The last handle syntax in hir-ty and the four checkers: each reads one node
 under its file's root and needs no handle. `HirFileId::root` and `AstPtr::to_view` /
 `syntax::view::to_node` are in the tree. wfcheck, matchck and unsafeck have none.
@@ -10294,7 +10294,7 @@ of a dependency crate as its `InferenceRecord` plus its borrowck verdict, every 
 index into a per-body table (`check_cache::relocating`) and read back in another database. The
 codecs below go through `crate::check_cache::{id_bits, id_of}`: outside a scope these are exactly
 today's `as_bits` / `from_bits`, so no record outside the cache changes by a byte (test
-`outside_a_scope_a_record_is_todays_bytes`). Notes: `docs/v2/plan/lanes/frontend/fast-bodies-cache-bodies.md`.
+`outside_a_scope_a_record_is_todays_bytes`). Notes: `docs/v2/plan/design/frontend.md`.
 
 ### 1. `crates/hir-ty/src/lib.rs`: the module
 
@@ -12465,7 +12465,7 @@ Status: open.
 ## dedup: hir-ty's `relocating` onto `stdx::lend`; the two `tail`s onto `layout::struct_tail_erasing_lifetimes`; one `MacroDefKind::macro_kind`; the const evaluator's widths (from dedup-sim-rest, 2026-10-29)
 
 From `dedup-sim-rest` (lane dedup; report `/tmp/blaze-lanes/v2-dedup-sim-rest.md`, notes
-`docs/v2/plan/lanes/dedup/sim-rest.md`). Four copies in db's paths of code another place owns.
+`docs/v2/plan/design/data.md`). Four copies in db's paths of code another place owns.
 
 ### 1. `crates/hir-ty/src/check_cache/ids.rs` `relocating`: `stdx::lend`
 

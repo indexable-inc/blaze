@@ -1,5 +1,5 @@
 //! A crate's `DefMap` and `LocalDefMap`, and its lang items, written as bytes and read back
-//! into a running database (frozen dependency artifacts, blaze's `docs/glancer.md`, item 1).
+//! into a running database (frozen dependency artifacts, blaze's `docs/v2/plan.md`, item 1).
 //! [`Enc`] and [`Dec`] write and read other values that name items, as `hir_ty` does impls.
 //!
 //! The bytes name nothing by a query database id: a file is the crate it belongs to and its path from

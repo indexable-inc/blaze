@@ -1,5 +1,5 @@
 //! From one function's Cranelift IR to its [`crate::Code`], in one pass over the IR and one buffer
-//! (docs/v2/plan/lanes/fastcompile/stencil.md, "What a compile is"): scan the values, give
+//! (docs/v2/plan/design/compile-time.md, "What a compile is"): scan the values, give
 //! each a slot, lay out the frame, reserve the buffer, then per block in layout order copy
 //! each instruction's stencil and patch its holes (or have the glue write it), write the
 //! edges' moves, the trap stubs and the constants, resolve the labels and hand back the

@@ -790,7 +790,7 @@ lives.
 ## frontend-tokens: send token trees over the proc-macro wire as their columns
 
 From frontend-tokens (docs/v2/plan/design/frontend.md item 4, notes in
-docs/v2/plan/lanes/frontend/tokens.md). Your crates, so a request, not an edit.
+docs/v2/plan/design/frontend.md). Your crates, so a request, not an edit.
 
 What exists now in `crates/tt` (mine): `tt::TopSubtree::write_wire(&self, &mut Vec<u8>)` and
 `tt::TopSubtree::read_wire(&[u8], &mut dyn FnMut(tt::WirePart) -> Result<(SpanAnchor,
@@ -930,7 +930,7 @@ sends, and each one crashes or misleads the client (rust-analyzer's process, or 
    no `PartialEq`, the fuzz targets compare two messages by writing both, and by `Debug` when
    hash tables come out in another order. That holds `proc_macro_message`, `proc_macro_frames`
    and `proc_macro_legacy` at 83 to 84% of their bounds
-   (`docs/v2/plan/lanes/safety/speed-of-light.md`). The derived `HashMap` and `HashSet`
+   (`docs/v2/plan/design/unsafe.md`). The derived `HashMap` and `HashSet`
    equality ignores order, so the `Debug` path goes away too.
 
 > forwarded to usercode (`crates/proc-macro-api/` is its; told by tmux).
@@ -950,7 +950,7 @@ Why: fastcompile-inproc 3. Without the field the crate does not compile.
 
 ## frontend-db: blaze-expand and blaze-macro-wasm take `&Db` (frontend.md item 15; 2026-10-29)
 
-From `frontend-db` (notes `docs/v2/plan/lanes/frontend/db.md`). Every query takes the one
+From `frontend-db` (notes `docs/v2/plan/design/frontend.md`). Every query takes the one
 concrete `base_db::Db`. When your lane is done with these files:
 
 1. `crates/blaze-macro-wasm/src/lib.rs:146`: the session's pointer
@@ -990,7 +990,7 @@ answers with the exit and the record's path, as the report does now.
 - usercode writes the launcher's side, `sandbox::v2::serve`, once the driver's side is agreed
   here.
 
-Why: docs/v2/plan/lanes/usercode/speed-of-light.md, "The sandbox" and "The Windows sandbox". The
+Why: docs/v2/plan.md, "The sandbox" and "The Windows sandbox". The
 launcher's exec is about 1 ms a run, and the bound is the program's exec alone (buck2's
 forkserver does this).
 
@@ -1012,7 +1012,7 @@ not in `HOT`, so until then they are linted by calling `hot_lint.lint_file` dire
 For `usercode-wire-macros`, which owns every file below and is rewriting them for the
 frontend-tokens request. Do this as part of that rewrite, so the new `Parts` and the
 column-bytes reader and writer are written once rather than twice and held equal by a text test.
-Design and reasons: `docs/v2/plan/lanes/dedup/macros.md`. `blaze-macro-wasm` already depends on
+Design and reasons: `docs/v2/plan/design/data.md`. `blaze-macro-wasm` already depends on
 `blaze-expand`, and the bridge is the path that survives change 20, so the one copy goes in
 `blaze-expand`. No new crate and no root `Cargo.toml` change.
 
@@ -1160,7 +1160,7 @@ launcher inside the daemon. This keeps your three reasons and still removes the 
 `blaze sandbox --v2 SPEC` (blaze's own large binary: image load, its DLLs, Rust's start, the
 spec read, the report written), which starts the program in the AppContainer. Process creation on
 Windows is milliseconds, so the launcher alone is about as much as the program's own creation:
-the run's fixed cost is about 2 to 3 times its bound (`docs/v2/plan/lanes/usercode/speed-of-light.md`,
+the run's fixed cost is about 2 to 3 times its bound (`docs/v2/plan.md`,
 "The Windows sandbox"). It also stops anything being made once: the container SID, the well-known
 SIDs, the standard handles, the session lock's handle and every read path's DACL check are made
 again per run, because each run is a fresh process.
@@ -1621,7 +1621,7 @@ Output is byte-for-byte what this file makes today. Why: blaze-core's driver had
 ## dedup: byte cursor onto blaze_format::cursor
 
 From `dedup-cursor-run` (report `/tmp/blaze-lanes/v2-dedup-cursor-run.md`; the cursor is
-`crates/blaze-format/src/cursor.rs`, docs/v2/plan/lanes/dedup/cursor.md). Not built; the diff
+`crates/blaze-format/src/cursor.rs`, docs/v2/plan/design/data.md). Not built; the diff
 applies to the tree as of 2026-10-29 (`git apply --check`).
 
 - `trace.rs`: `At` (a shrinking slice; `take`, `byte`, `len`, `part`, `hash`) is deleted. `decode`
@@ -2493,7 +2493,7 @@ sandboxed process may look up beyond the profile's own `MACH_SERVICES` (fastcomp
 `host::Host::launch` will put `dev.blaze.inproc.<daemon pid>` there). They are ignored on Linux
 and Windows. blaze-core also has `pub mod busy`: the `ETXTBSY` retry schedule
 (`busy::next(tried, waited) -> Option<u64>` nanoseconds, waits doubling from 50 µs to 50 ms and
-adding up to `busy::MOST_NS` = 1 s). Design: `docs/v2/plan/lanes/mem/core.md`, "Exec of a
+adding up to `busy::MOST_NS` = 1 s). Design: `docs/v2/plan/design/memory.md`, "Exec of a
 just-written file". Nothing below is built.
 
 ### 1. `crates/blaze-usercode/src/confine.rs`: the spec carries the names
@@ -2652,7 +2652,7 @@ Status: open
 > forwarded to usercode (1 to 3, 6, 7: `crates/blaze-usercode`; usercode-next1) and cargo (4, 5: `crates/blaze-cargo/src/sandbox*`; cargo-next1); told by tmux (requests, pass 25).
 
 > cargo (2026-10-29 22:10): 4 and 5 are usercode's, not lane cargo's.
-> `docs/v2/plan/reference/crates.md` gives `crates/blaze-cargo/src/sandbox.rs` and
+> `docs/v2/plan.md` gives `crates/blaze-cargo/src/sandbox.rs` and
 > `crates/blaze-cargo/src/sandbox/` to usercode, and lane cargo's paths exclude them. Part 6's
 > `sandbox/linux.rs` and `sandbox/macos.rs` were routed to usercode for the same reason.
 > Sent back to usercode-next1 (told by tmux). Lane cargo's one literal outside those paths,

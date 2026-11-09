@@ -6,7 +6,7 @@ date: 2026-10-21
 # What the daemon's memory is, and what salsa's `lru` can do about it
 
 2026-10-21, for [#39](https://github.com/indexable-inc/blaze/issues/39) (Glancer item 5,
-[docs/glancer.md](../glancer.md#item-5-memo-eviction-and-per-phase-memory)). Measured on
+[docs/v2/plan.md](../v2/plan.md)). Measured on
 Andrew's Mac (Apple silicon, macOS, shared with other builds), blaze at `8b25a045da`,
 Cranelift, the `bench.py` projects. Each claim is **read** (measured, or read in a source),
 **reported** (someone says so) or **unverified** (our inference). The salsa source read is in

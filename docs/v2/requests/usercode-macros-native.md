@@ -7,7 +7,7 @@ date: 2026-10-29
 
 Native expanders for serde_derive, thiserror-impl 1 and 2 and tokio-macros (#1297), in
 `crates/blaze-expand/src/native/` (child of `usercode-macros`). Design:
-`docs/v2/plan/lanes/usercode/macros-native.md`. Written, not built. The code reads the vendored
+`docs/v2/plan.md`. Written, not built. The code reads the vendored
 copies below with `include_bytes!`, so it does not compile until request 1 is applied.
 
 > **Superseded, 2026-10-29.** Change 20 of `docs/v2/plan/design/compile-time.md` replaces
@@ -222,7 +222,7 @@ contexts, so it could not be exact. The reasoning is in the notes.
 
 What: take what is useful of `crates/blaze-expand/src/native/` for change 20's proc-macro
 bridge. The list, with what each piece gives, is the section "For fastcompile: the proc-macro
-bridge" of `docs/v2/plan/lanes/usercode/macros-native.md`. In short:
+bridge" of `docs/v2/plan.md`. In short:
 - the bridge's whole surface as one 20-function `Host` trait (`proc_macro/lib.rs`, the wasm
   guest's `proc_macro` with its imports routed to a thread-local host);
 - `host.rs`, which answers those 20 exactly as the wasm host does, span numbering included;

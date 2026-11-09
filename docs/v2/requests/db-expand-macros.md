@@ -20,7 +20,7 @@ lines in `crates/hir-expand` (465 before `frontend-db-def` moved the crate to `&
 ("speed-hir-sol-expand: hot_lint skips files of `#[cfg(test)] mod x;`"). Nothing to do for those
 here. The other 152 are below: 6 real fixes (blocks 1 to 6) and justify-comments for the rest.
 
-The speed-of-light notes these come from: `docs/v2/plan/lanes/db/speed-of-light.md`, section
+The speed-of-light notes these come from: `docs/v2/plan.md`, section
 "hir-expand: macro expansion (speed-hir-sol-expand)".
 
 > forwarded to db (db-expand-macros-next1, which holds these paths) (from requests, pass 16; told by tmux).

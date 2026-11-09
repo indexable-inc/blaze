@@ -5,7 +5,7 @@ date: 2026-10-29
 ---
 # mem-db-infer-closure: requests
 
-Part of `mem-db-infer` (`docs/v2/plan/lanes/mem/db-infer.md`, rules R1 to R8). Files, all in
+Part of `mem-db-infer` (`docs/v2/plan/design/memory.md`, rules R1 to R8). Files, all in
 `crates/hir-ty/src/infer/`: `closure.rs`, `closure/analysis.rs`,
 `closure/analysis/expr_use_visitor.rs`. Their owner is lane db, so every change below is a
 request; apply them together with `mem-db-infer-ctx`'s (`infer.rs`, `infer/persist.rs`), which
@@ -13,7 +13,7 @@ these program against and which X1 to X4 below ask for. Lines are as of 2026-10-
 are editing these files (`infer.rs` moved by about 50 lines while this was written), so each entry
 quotes its "before" code to find it by. The `db` parameters are left exactly as they are.
 
-Notes and the speed-of-light bound: `docs/v2/plan/lanes/mem/db-infer-closure.md` (and "Speed" at
+Notes and the speed-of-light bound: `docs/v2/plan/design/memory.md` (and "Speed" at
 the end of this file).
 
 ## The answer in short

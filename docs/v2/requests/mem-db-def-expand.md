@@ -5,8 +5,8 @@ date: 2026-10-29
 ---
 # Requests of `mem-db-def-expand` (child of `mem-db-def`, lane `mem`)
 
-`crates/hir-expand/` onto `crates/blaze-mem`, against mem-db's contract (`docs/v2/plan/lanes/mem/db.md`,
-"The contract"). Notes and the speed-of-light bound: `docs/v2/plan/lanes/mem/db-def-expand.md`.
+`crates/hir-expand/` onto `crates/blaze-mem`, against mem-db's contract (`docs/v2/plan/design/memory.md`,
+"The contract"). Notes and the speed-of-light bound: `docs/v2/plan/design/memory.md`.
 
 Owners:
 - **E1 to E14, T1, T2**: `crates/hir-expand/` belongs to `db-expand-macros` (window

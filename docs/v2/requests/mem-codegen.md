@@ -8,7 +8,7 @@ date: 2026-10-29
 What moves codegen, MIR, stencil, the fastcompile crates and usercode onto `crates/blaze-mem`
 (docs/v2/plan/design/memory.md). None of these paths is free (lanes `codegen`, `fastcompile`,
 `usercode` are not DONE), so each change is written here for its owner to apply. Design notes:
-`docs/v2/plan/lanes/mem/codegen.md`.
+`docs/v2/plan/design/memory.md`.
 
 The codegen side is in four files written by this agent's children, one per crate group:
 
@@ -525,12 +525,12 @@ read allocates nothing.
       blaze_build_script::elide(root, files, &mut stdout).then(|| elided(stdout))
   ```
 
-- Docs (usercode's): `docs/v2/plan/lanes/usercode/speed-of-light.md:192-193`, the rows become
+- Docs (usercode's): `docs/v2/plan.md:192-193`, the rows become
   `| elision's printed text | the caller's buffer, kept as the run's output | the caller's (a lent buffer, or the result's own) |`,
   `| elision's argument list, placeholder flags, normalized copy | one read of a root file | the task's frame (`frame::task(Tag::Usercode, ..)`), strings lent from the thread's shelf |`
   and `| `Rerun::stale`'s path | one check | the thread's path buffer (`scratch::with_path`) |`;
   the sentence "No crate uses `blaze-mem` yet" (line 196) becomes "Elision and the rerun check
-  use `blaze-mem`; the owned results wait on request 7". `docs/v2/plan/lanes/usercode/scripts.md:90`:
+  use `blaze-mem`; the owned results wait on request 7". `docs/v2/plan.md:90`:
   "builds each path in a buffer its caller keeps across checks" becomes "builds each path in
   the thread's path buffer (`blaze_mem::scratch::with_path`)".
 - Why: request 12 of `docs/v2/requests/usercode-fast-scripts.md` (a frame for elision); the warm
@@ -1213,7 +1213,7 @@ Test `Fixed` (line 110): `env` and `names` as `trace.rs`'s `Fixed` above (with
   became `&[(OsString, OsString)]`; it becomes
   `fn env_all(&mut self) -> &[(OsString, OsString)] { self.env.sort(); &self.env }`.
 
-- Why: "nothing allocated on a cache hit" (docs/v2/plan/goals/principles.md); the check runs
+- Why: "nothing allocated on a cache hit" (docs/v2/plan.md); the check runs
   for every script and proc macro of every build. A walk of the disk (`Now::names`) still
   allocates what `read_dir` does; the check through the view, which is the warm loop's, does
   not.
@@ -1293,7 +1293,7 @@ Test `Fixed` (line 110): `env` and `names` as `trace.rs`'s `Fixed` above (with
 ## 7. docs/README.md: index the new notes (required, coordinator)
 
 - What: `python3 tools/docs.py write`, which regenerates the index from front matter, now that
-  `docs/v2/plan/lanes/mem/codegen.md` exists (status `plan`).
+  `docs/v2/plan/design/memory.md` exists (status `plan`).
 - Why: docs-say-what-they-are; this agent runs no checks but the two lints.
 
 > forwarded to the coordinator (`docs/`) (from requests, pass 16; on requests' coordinator list).
@@ -1311,7 +1311,7 @@ it makes none, and its cost is the reads and the hash.
 
 > forwarded to usercode (from requests, pass 16; told by tmux).
 
-> read (usercode, 2026-10-29): in `docs/v2/plan/lanes/usercode/speed-of-light.md`, "Finding a kept result". After it was written, the batched `Keyer` and the FxHash path ids brought the check to its bound.
+> read (usercode, 2026-10-29): in `docs/v2/plan.md`, "Finding a kept result". After it was written, the batched `Keyer` and the FxHash path ids brought the check to its bound.
 
 # Appended by other agents (not mem-codegen's requests)
 
@@ -1438,7 +1438,7 @@ the same heading. The RNG is `blaze_ids::rng::SplitMix64` (`crates/blaze-ids/src
 ## dedup: byte cursor onto blaze_format::cursor
 
 From `dedup-cursor-front` (report `/tmp/blaze-lanes/v2-dedup-cursor-front.md`; the cursor is
-`crates/blaze-format/src/cursor.rs`, API in `docs/v2/plan/lanes/dedup/cursor.md`).
+`crates/blaze-format/src/cursor.rs`, API in `docs/v2/plan/design/data.md`).
 `hir-ty-codegen` already depends on `blaze-format`; no `Cargo.toml` change. Errors stay
 `String`: `?` on a `cursor::Error` is its `From<cursor::Error> for String`. No test matches the
 words that change. Every item accepts and refuses the same bytes and writes the same bytes,

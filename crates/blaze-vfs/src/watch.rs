@@ -1,6 +1,6 @@
 //! The disk as one input: a [`Watcher`] follows a directory through the system's journal of
 //! changes ([`Effect::Journal`]) and turns what changed into transactions on one head, by the
-//! disk (docs/v2/plan/design/restore.md, docs/v2/plan/lanes/frontend/journal.md).
+//! disk (docs/v2/plan/design/restore.md, docs/v2/plan/design/restore.md).
 //!
 //! - **Start**: the journal is asked for what changed since the cursor the head's [`Disk`] saved
 //!   (FSEvents' event ID, NTFS's USN). With no cursor (a first start, or Linux, whose journal

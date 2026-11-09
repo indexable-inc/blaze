@@ -36,7 +36,7 @@ All to `lints-driver` (via lane `lints`) unless said.
   `node == cx.root()`, `cx.in_file()` and `cx.analysis()` is `Some`: once per body. cx.md
   still names `blaze::check_body(cx)` / `blaze::check_items(cx)`; the brief and the code use
   this one entry, so cx.md's line should say `blaze::check_node(cx, node)`.
-- Where: `check.rs` (the walk), `docs/v2/plan/lanes/lints/cx.md` (one line).
+- Where: `check.rs` (the walk), `docs/lints.md` (one line).
 - Why: one entry point, as clippy's lints have.
 
 > forwarded to lints (from requests, pass 17; told by tmux).
@@ -61,7 +61,7 @@ All to `lints-driver` (via lane `lints`) unless said.
 
 - What: `cx.blaze(lint, at, span, message)` adds the level note but not a
   "for further information" help: blaze's lints add theirs (`Lint::docs_url()`, a link into
-  `docs/v2/plan/lanes/lints/blaze.md`) after their own help, as clippy's order is.
+  `docs/lints.md`) after their own help, as clippy's order is.
 - Where: `check.rs` (`Cx::blaze`).
 - Why: otherwise every finding has two such lines.
 

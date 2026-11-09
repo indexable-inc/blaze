@@ -3,14 +3,14 @@ status: record
 summary: The v2 lanes' requests filed under `mem-db-def-hir` (what one lane asked of the code another owns), each with its answer.
 date: 2026-10-29
 ---
-<!-- From mem-db-def-hir (child of mem-db-def). Notes: docs/v2/plan/lanes/mem/db-def-hir.md.
+<!-- From mem-db-def-hir (child of mem-db-def). Notes: docs/v2/plan/design/memory.md.
      Report: /tmp/blaze-lanes/v2-mem-db-def-hir.md. Line numbers are as read on 2026-10-29;
      the files move under other lanes, so the function named with each line is what to match. -->
 
 # mem-db-def-hir: `crates/hir` off the general allocator on its hit paths
 
 Holder of every path below: **db-next2** (`crates/hir/`). Parts R10 and R11 also ask things of
-other owners, named there. Contract: `docs/v2/plan/lanes/mem/db.md`, points 1 to 7.
+other owners, named there. Contract: `docs/v2/plan/design/memory.md`, points 1 to 7.
 Manifests, `#![feature(allocator_api)]` and the counting allocator in `src/lib.rs` are
 mem-db-def's H1 to H3 (`docs/v2/requests/mem-db-def.md`); they are not refiled here.
 
@@ -1785,7 +1785,7 @@ hir-def's `search_runs`, which is mem-db-def-items' I6.2 budget.)
 > handed to db-audit-mem (22:38): `path_at` (`expr_store/path.rs:1304`) and `search_dependencies_each` (`import_map.rs:681`) are in, and db-audit-mem is applying R10 part 2 and R10b in `source_analyzer.rs`, hir `lib.rs`, `scratch.rs` and `tests/budget.rs`. db-mem-def is in none of them.
 > applied by db-audit-mem (22:42): as written, `search_dependencies_each` being in (crates/hir-def/src/import_map.rs:681): crates/hir/src/scratch.rs gains the `Importables` shelf, `IMPORTABLES_SEEN` with `take_`/`give_importables_seen` (through an `ImportablesSeen` alias) and `LentCopied`; crates/hir/src/lib.rs `query_external_importables` fills them in search order; `a_warm_completion_search_allocates_nothing` in crates/hir/src/tests/budget.rs. db-mem-def's `// alloc:` lines in scratch.rs kept.
 
-## R11. Callers outside `crates/hir/` (owners from `docs/v2/plan/reference/crates.md`)
+## R11. Callers outside `crates/hir/` (owners from `docs/v2/plan.md`)
 
 - **ide-db** (coordinator; `crates/ide-db/` until it is removed at integration):
   `symbol_index.rs:374`, `:403`, `:422` make the collector inside `module_symbols`,

@@ -2,7 +2,7 @@
 //! build of the image, kept for the run, compiling each function against the front end as it
 //! stands when the function is first called.
 //!
-//! There is one database and no fork of it (docs/v2/plan/lanes/frontend/db.md), and a run that
+//! There is one database and no fork of it (docs/v2/plan/design/frontend.md), and a run that
 //! held a reader for its life would hold off every edit while the program runs. So a compile
 //! takes a reader for itself alone ([`Source::reader`]) and lets it go once the function is
 //! compiled, before it is placed. A write meanwhile stops the reader, and the compile starts

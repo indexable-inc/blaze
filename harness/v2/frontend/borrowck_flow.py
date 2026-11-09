@@ -1,5 +1,5 @@
 """borrowck_flow.py: `BLAZE_BORROWCK=polonius-flow` accepts more than the default checker and
-never less, on rustc's polonius UI tests (docs/v2/plan/lanes/borrowck-cursor.md).
+never less, on rustc's polonius UI tests (docs/v2/plan/design/borrowck-cursor.md).
 
     uv run --frozen python harness/v2/frontend/borrowck_flow.py '{"engine": {"kind": "v2", "blaze": "target/release/blaze"}, "out": "/tmp/borrowck-flow.json"}'
     uv run --frozen python harness/v2/frontend/borrowck_flow.py selftest

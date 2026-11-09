@@ -15,7 +15,7 @@ Then `lints::syntax::attrs::lints` reads `cx.owners()` instead of calling `owner
 
 Why: `owners` (every attribute owner of the crate, with its attributes) is built twice per
 check, once by `checks::check` and once by the attribute lints. That is about 0.6 ms of the
-reference crate, paid twice (docs/v2/plan/lanes/diagnostics/speed-of-light.md, "The checks
+reference crate, paid twice (docs/v2/plan.md, "The checks
 hir does not make").
 
 > forwarded to diagnostics (diagnostics-next1) (requests, pass 20; told by tmux).

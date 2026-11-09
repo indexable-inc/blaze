@@ -42,7 +42,7 @@ whose tests read `env!("BLAZE_PROC_MACRO_LIBRARY_PROC_MACRO_TEST_IMPL")`
 tests don't compile under `blaze test -p proc-macro-srv`; `blaze check --workspace` (lib
 targets) is unaffected. Change 20 (macros on blaze's own compiler) would make the server and
 these tests obsolete, but it hasn't landed and the warm server is what runs native macros
-today (`docs/v2/plan/lanes/usercode/macros.md`).
+today (`docs/v2/plan/design/proc-macros.md`).
 
 `given_by_cargo` (`crates/blaze-cargo/src/cargo/directives.rs`) refuses a build script setting
 `BLAZE_PROC_MACRO_LIBRARY_*` (selfbuild-env).

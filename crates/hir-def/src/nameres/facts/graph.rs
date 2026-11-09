@@ -2,7 +2,7 @@
 //!
 //! [`partition`] over-approximates, for every import and `pub(in path)` path of each module, the
 //! modules whose scope resolving it can read (every case is listed in
-//! `docs/v2/plan/lanes/frontend/nameres-graph.md`), then splits the round's modules into the
+//! `docs/v2/plan/design/frontend.md`), then splits the round's modules into the
 //! components of that graph with Pearce's iterative algorithm. Components come in reverse
 //! topological order: a component reads only itself and components before it.
 //!

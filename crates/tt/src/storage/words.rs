@@ -1,6 +1,6 @@
 //! The parser's words of a tree's tokens, made once and kept in the tree, so that parsing the
 //! tree or any view of it reads them where they are and converts nothing
-//! (docs/v2/plan/lanes/frontend/tokens.md, "Item 4").
+//! (docs/v2/plan/design/frontend.md, "Item 4").
 //!
 //! `tt` does not know what a word means: whoever makes them (`syntax_bridge`) does, from the
 //! tokens [`Tree::for_each_slotted_token`] gives. The tree only keeps them and finds a

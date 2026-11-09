@@ -18,7 +18,7 @@ date: 2026-10-29
 - Where: root `Cargo.toml`. `crates/blaze-cas/Cargo.toml` already says `zstd.workspace = true`
   and `lz4_flex.workspace = true`.
 - Why:
-  - `zdict_builder`: cold values (debug info, build-script runs) are zstd with a dictionary per kind (docs/v2/plan/lanes/store.md), and this feature trains the dictionaries.
+  - `zdict_builder`: cold values (debug info, build-script runs) are zstd with a dictionary per kind (docs/v2/plan/design/store.md), and this feature trains the dictionaries.
   - `zstdmt`: long cold values use long-distance matching on a fixed 4 workers (plan/hardware.md). Without it zstd refuses `NbWorkers`, which makes the store stop.
   - LZ4: chunks of hot outputs, where decompression speed matters.
 
@@ -32,8 +32,8 @@ date: 2026-10-29
   commands, which are the coordinator's until integration.
 - Where: the paths above; their users in `crates/blaze-cargo/` (`BLAZE_REMOTE*`, `cache
   push|pull|stats|gc|verify`) and `crates/blaze-engine` (`blaze_store::*`, `BLAZE_SOURCES`).
-- Why: docs/v2/plan/reference/crates.md ("`blaze-store` replaced by `blaze-cas`, deleted at integration");
-  docs/v2/plan/lanes/store.md: the remote is only a read-through tier for machines outside the pool,
+- Why: docs/v2/plan.md ("`blaze-store` replaced by `blaze-cas`, deleted at integration");
+  docs/v2/plan/design/store.md: the remote is only a read-through tier for machines outside the pool,
   never the VM's, superseding the per-job remote naming (#1481). The v2 tier is
   `blaze_cas::remote::{Client, Server, Answer}`: the VM daemon runs a `Server` on a Unix
   socket (or a loopback port forwarded over SSH); a laptop's daemon holds a `Client` and calls

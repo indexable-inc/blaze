@@ -3,7 +3,7 @@
 //! by their sha256 and kept in blaze's store) and unpacked where cargo unpacks them, `[source]` replacement,
 //! vendored directories and git checkouts, so that the paths a build sees (`file!()`, panics,
 //! `CARGO_MANIFEST_DIR`) are cargo's and cargo and blaze share `$CARGO_HOME`. What is ported
-//! from where is said at the top of each module; the plan is `docs/self-contained.md`.
+//! from where is said at the top of each module; the plan is `docs/v2/plan.md`.
 
 #![feature(allocator_api)]
 

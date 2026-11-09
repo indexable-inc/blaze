@@ -59,7 +59,7 @@ date: 2026-10-29
 
 ## 4. solver-sync (`interner.rs`): compute the shared cache's key once per interner
 
-- Why: the speed-of-light bar (`docs/v2/plan/lanes/db/speed-of-light-solver-cache.md`).
+- Why: the speed-of-light bar (`docs/v2/plan.md`).
   `tls_cache::shared` is at 22% of its bound, about 45 cycles against 10. Each lookup makes
   a dyn `nonce_and_revision` call and FxHashes the scope again, and the interner could hold
   both.
@@ -82,7 +82,7 @@ date: 2026-10-29
 
 > forwarded to solver-sync (told by tmux).
 
-## 5. lane db: `docs/v2/plan/lanes/db/trait-solver.md` describes the old cache
+## 5. lane db: `docs/v2/plan.md` describes the old cache
 
 - Its "Costs" section says "one uncontended lock on the slot's own 128-byte-aligned lines"
   and "one virtual call for the database state". The per-query cache is now lock-free with no
@@ -117,7 +117,7 @@ date: 2026-10-29
 ## 8. mem: a pool the reclaimer returns to, and a limbo that doesn't allocate
 
 - For `crates/hir-ty/src/next_solver/interner/tls_cache.rs` (design in
-  `docs/v2/plan/lanes/db/speed-of-light-solver-cache.md`, "Memory"). The solver cache's
+  `docs/v2/plan.md`, "Memory"). The solver cache's
   generations, about 2.5 KB each, are made and retired across workers. Readers hold them under
   `blaze_reclaim` guards, so one may be reused only after its grace.
 - Asked:

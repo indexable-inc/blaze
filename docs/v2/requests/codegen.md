@@ -5,7 +5,7 @@ date: 2026-10-30
 ---
 # Requests from lane codegen
 
-Each says what, where and why. The codegen design these serve is `docs/v2-codegen.md`.
+Each says what, where and why. The codegen design these serve is `docs/v2/plan/design/codegen.md`.
 
 ## 1. items: implement `hir_ty_codegen::v2::Hashes`
 
@@ -27,7 +27,7 @@ Why: an `InstanceKey` is built from the callee's `CodeHash` and the content of i
 arguments, never from the database's dense ids, which differ between runs. Only the items
 lane can say what an item and a body are by content. One rule matters most: `code` takes
 each callee by its interface hash, not by its body, so that a callee's body edit renames
-its callers' relocations without recompiling them (docs/v2-codegen.md, "Templates").
+its callers' relocations without recompiling them (docs/v2/plan/design/codegen.md, "Templates").
 
 > forwarded to items
 > forwarded to codegen: lane items is DONE without it, and `blaze-items` cannot implement a trait of `hir-ty-codegen`, which depends on it (a cycle). The impl goes in `crates/hir-ty-codegen/v2/` over `blaze_items`' public functions (`item_key`, `crate_hashes`, the `hash` exports). Lane cargo already calls it as `hir_ty_codegen::v2::ItemHashes::new(Box::new(names))`, `names: Fn(base_db::FileId) -> Option<String>` (`crates/blaze-cargo/src/serve/unit/codegen.rs:265`), and that name does not exist yet.
@@ -114,7 +114,7 @@ Why: `blaze_query::Cx` has no way to reach those today. The kinds are reserved i
 Where: `docs/v2/plan.md`.
 
 What: link `../v2-codegen.md` (status: plan) as the codegen lane's design notes. If lane
-notes now belong under `docs/v2/`, move it to `docs/v2/plan/lanes/codegen.md` and fix the
+notes now belong under `docs/v2/`, move it to `docs/v2/plan/design/codegen.md` and fix the
 links in it.
 
 Why: docs-say-what-they-are. The notes are the lane's design and nothing links them yet.
@@ -242,7 +242,7 @@ Why: every fold thunk (#1292, `crates/hir-ty-codegen/v2/fold.rs` `thunk`) passes
 on with a few constants and calls the shared body. Today that is a call, a frame and a return,
 because Cranelift's verifier wants `tail` on both sides and blaze's functions use the platform's.
 As a sibling call it is a few moves and a jump, so calling a folded function costs about what it
-cost unfolded. That keeps folding from costing dev run time (docs/v2/plan/lanes/codegen.md, "dev
+cost unfolded. That keeps folding from costing dev run time (docs/v2/plan/design/codegen.md, "dev
 code at least as fast as cargo debug"). Then lane codegen makes the thunk end in `return_call`.
 
 > forwarded to coordinator: `vendor/` and its `[patch.crates-io]` entry come with the vendored crate; listed in the requests report for integration.
@@ -517,14 +517,14 @@ trade-off), `enable_alias_analysis` (only the `speed` egraph pass reads it). Two
 
 `AttrFlags::IS_TEST` (`crates/hir-def/src/attrs.rs:311`) is a textual match on `test`, `{core,std}::prelude::*::test`; `IS_BENCH` on `bench`. A `#[test]` reached through another path (`use core::prelude::v1::test as check; #[check]`) is not listed, and so not run, where rustc runs it. Set both from the resolved built-in attribute macro (the `FIXME` at `attrs.rs:693`), or give codegen a query `is_test(db, FunctionId) -> Option<TestKind>` it can list by. `v2/roots/harness.rs` reads `ignore` and `should_panic` from the syntax (as v1's harness does, `cfg_attr` expanded by the crate's cfg) and would take a hir-def reader of them in their place: `AttrFlags::ignore_message(db, AttrDefId) -> Option<Option<Symbol>>`, `AttrFlags::should_panic(db, AttrDefId) -> Option<Option<Symbol>>`.
 
-## From safety (lane safety, 2026-10-29; design `docs/v2/plan/lanes/safety/notes.md`)
+## From safety (lane safety, 2026-10-29; design `docs/v2/plan/design/unsafe.md`)
 
 > forwarded to codegen: S1 (`hir-ty-mir`'s evaluator) and S2 (the LLVM back end) are lane codegen's.
 
 ### S1. codegen-mir: the evaluator's `Machine` hooks (`crates/hir-ty-mir/src/mir/eval*`)
 
 What: make `Evaluator` generic over a `Machine` and call it at every memory event, typed copy,
-call, return and thread switch, exactly as `docs/v2/plan/lanes/safety/notes.md` section "The
+call, return and thread switch, exactly as `docs/v2/plan/design/unsafe.md` section "The
 evaluator's `Machine`" gives it: the trait text there (in a new
 `crates/hir-ty-mir/src/mir/eval/machine.rs`, exported from `hir_ty_mir::mir`), `Plain` (a ZST
 whose hooks are empty `#[inline(always)]` functions and whose `Prov` and `Shadow` are `()`,
@@ -545,7 +545,7 @@ const eval's speed and results are unchanged (safety-check tests that they are).
 If a part of the contract doesn't fit the evaluator, say so in `docs/v2/requests/safety.md`
 before writing around it; lane safety changes the trait and the checker together.
 
-> done, checked rule by rule by codegen-rq-mir (2026-10-29) against `docs/v2/plan/lanes/safety/notes.md`
+> done, checked rule by rule by codegen-rq-mir (2026-10-29) against `docs/v2/plan/design/unsafe.md`
 > "The evaluator's `Machine`" and the code. The trait is in `eval/machine.rs`, exported from
 > `hir_ty_mir::mir`. `Plain` is the default parameter of `Evaluator<'db, M>`, and `MachineStop`
 > is wired. Memory: every program access goes through `read_memory`/`read_shadowed`/
@@ -978,7 +978,7 @@ linear and needs no change.
 
 The LLVM side is written (`crates/hir-ty-codegen/llvm/sanitize.rs`, `llvm/release.rs`,
 `llvm/emitted.rs`, `vendor/llvm-sys/wrappers/passes.cpp`; design in
-`docs/v2/plan/lanes/codegen/speed-backend-llvm.md` "Sanitizers"). It programs against the items
+`docs/v2/plan/design/codegen.md` "Sanitizers"). It programs against the items
 below, and `hir-ty-codegen` does not build until the lead adds Z1 and Z2 and the adapter adds
 `Function::unsanitized` (Z3.2).
 
@@ -1462,7 +1462,7 @@ Status: open
 > `crates/hir-ty-mir/src/mir/providers.rs`, `type_name`'s `None` is a `MirEvalError::NotSupported`
 > naming the type, the crate doc) and the tool on hir-ty-mir (its test database is the alias).
 
-From `frontend-db` (notes `docs/v2/plan/lanes/frontend/db.md`; the hir-ty side is in
+From `frontend-db` (notes `docs/v2/plan/design/frontend.md`; the hir-ty side is in
 `docs/v2/requests/db.md`, "frontend-db: the concrete database", section 5). The memos behind
 `HirDatabase`'s MIR methods move into hir-ty (`hir_ty::providers`), because hir-ty,
 hir-ty-borrowck and blaze-items read them from below. Their code stays here and becomes the
@@ -1586,7 +1586,7 @@ Status: open
 ## From speed-link-edge-sol-live: level-2 counters share cache lines across functions (`hir-ty-codegen/tier.rs` `count`, and whoever picks `first`)
 
 Status: open, does not block. For lead `codegen`. See "The live runtime" in
-`docs/v2/plan/lanes/link/speed-of-light.md`, "The sampler's counters".
+`docs/v2/plan.md`, "The sampler's counters".
 
 `count` makes each counted function `call blaze_live_counters()` at entry, then a plain
 `load; iadd_imm 1; store` per counter, into `first .. first + 1 + 2 * branches` of one
@@ -1951,7 +1951,7 @@ Status: open
 ## dedup: one type identity (hashes.rs onto hir-ty-share)
 
 From `dedup-scan-ident` (lane `dedup`), 2026-10-29. Notes:
-`docs/v2/plan/lanes/dedup/scan-ident.md`.
+`docs/v2/plan/design/data.md`.
 
 This is paired with `docs/v2/requests/fastcompile-ident-share.md`, `## dedup: one type identity for
 the code generator and the share key`, which has the full reasoning, the shared code and the
@@ -2880,7 +2880,7 @@ Status: open
 ## dedup: byte cursor onto blaze_format::cursor
 
 From `dedup-cursor-run` (report `/tmp/blaze-lanes/v2-dedup-cursor-run.md`; the cursor is
-`crates/blaze-format/src/cursor.rs`, docs/v2/plan/lanes/dedup/cursor.md). Not built; the diff
+`crates/blaze-format/src/cursor.rs`, docs/v2/plan/design/data.md). Not built; the diff
 applies to the tree as of 2026-10-29 (`git apply --check`).
 
 - `blaze-codegen/src/blob.rs`: `In`'s primitives (`take`, `u8`, `u32`, `i64`, `count`; the
@@ -5296,7 +5296,7 @@ New:
 
 ## frontend-fast-bodies-tasks: the front end hears what the walk reaches, and a failed check stops the build (2026-10-29)
 
-From `frontend-fast-bodies-tasks` (notes `docs/v2/plan/lanes/frontend/fast-bodies-tasks.md`).
+From `frontend-fast-bodies-tasks` (notes `docs/v2/plan/design/frontend.md`).
 A unit's check now runs as one plane task per body beside its codegen
 (`crates/hir/src/check/bodies.rs`, `Plan::reached`); bodies the build reaches are checked
 first. The front end needs the walk's levels as it finds them, before describing them, and
@@ -10238,7 +10238,7 @@ its key before the decoder sees it (`blaze-cas` `Reader::get`), and the decoders
 but a parser of bytes from disk or the network gets a fuzz target by the plan. All four functions
 are `pub` already; nothing in codegen changes.
 
-> forwarded to the coordinator: `fuzz/` and `blaze-fuzz` are on the coordinator's line of `docs/v2/plan/reference/crates.md`, and no safety window runs; on requests' coordinator list (requests, pass 32).
+> forwarded to the coordinator: `fuzz/` and `blaze-fuzz` are on the coordinator's line of `docs/v2/plan.md`, and no safety window runs; on requests' coordinator list (requests, pass 32).
 
 ## From codegen (lead, 2026-10-29): new `Spec`, `Toolchain`, `Policy`, `Backend` and `Mode` fields, for fastcompile's stencil and PGO requests
 
@@ -10878,7 +10878,7 @@ has three new fields, `owner`, `identity` and `bound`, which only the front end 
 ## From codegen-fc-pgo (2026-10-29): `Policy::pgo` from RUSTFLAGS, the profile given to the build, and the link's half of `-Cprofile-generate` (to cargo, link)
 
 fastcompile-sched 3 is in the LLVM back end (`crates/hir-ty-codegen/llvm/pgo.rs`, notes in
-`docs/v2/plan/lanes/codegen/pgo.md`). Where `Policy::pgo` comes from, and what an instrumented
+`docs/v2/plan/design/codegen.md`). Where `Policy::pgo` comes from, and what an instrumented
 binary needs at link, are yours.
 
 1. **To cargo (`crates/blaze-cargo/src/plan.rs:437`, `serve/unit/codegen.rs`):** parse rather
@@ -10915,12 +10915,12 @@ binary needs at link, are yours.
 > taken by lane cargo (cargo-next2, 2026-10-29): item 1 is with child cargo-pgo (window 166), which answers here. `-Cprofile-generate` stays refused until item 2 (link) lands.
 > queued by requests (child requests-link-next): item 2 (link's half, fastcompile-sched 4). It waits on codegen: `CompiledFunction` has no PGO record yet and `blaze_codegen::Target` has no `ProfileCounters`, and the link writes `__llvm_prf_data`/`names`/`cnts` from exactly those. It starts when both are in `blaze-codegen`; tell requests-link-next by tmux.
 > requests-link-next (pass 39): codegen's types are in (`Profiled::Counted`, `Target::ProfileCounters`). Item 2 starts once requests-link-next-sanitize is done: it holds `target::locate` (the profile runtime) and the writers (the `__llvm_prf_*` sections), which item 2 changes too. Until then a counted function is a `LinkError` (codegen-rq-built item 1).
-> applied by lane cargo (cargo-pgo, 2026-10-29 23:59, not built): item 1's `-C profile-use`. `serve/unit/codegen.rs` `pgo` parses `-Cx`, `-C x`, `--codegen x` and `--codegen=x` (and `profile_use`), the last one given winning, into `PgoFlag::Use(path)`; a path-less one is an error. `Job::profiles` (a `OnceLock`, as `build_time`) reads every path the job's units name once, relative to the workspace root, and gives it (`give_profile(profile_id(&bytes), &bytes)`); the `Profile` is held in the job, so for every build of it. `policy` sets `Pgo::Use(id)` for every unit whose flags have it (dependencies too). `generate`, before `Backends::default()`, puts the bytes in the store under `Key(id)` (`Kind::Output`) through the build's puts, once per job while the store lacks it, and stops with an error naming `give_profile` when the policy's profile was not given. A missing or unreadable path is an error naming it; without blaze-cargo's `llvm` feature (on through `blaze-engine/llvm`) it is an error naming the feature. Not read back from the store in `generate`: the loop writes a task's puts only after the task, so the first build of a profile can't find it there; the job's verified read (`give` checks the ID) is the one source. `-C profile-generate` stays refused, now saying the linker writes no profile sections yet. `plan.rs`'s `Flags` is v1's alone (`Plan::of`, called by `blaze-engine`'s load only), so it is unchanged. Asked of cargo: the record key hashes the profile's ID (`docs/v2/requests/cargo-pgo.md` 1). For codegen: `docs/v2/plan/lanes/codegen/pgo.md`'s "Cargo:" bullet is now done for `profile-use`.
+> applied by lane cargo (cargo-pgo, 2026-10-29 23:59, not built): item 1's `-C profile-use`. `serve/unit/codegen.rs` `pgo` parses `-Cx`, `-C x`, `--codegen x` and `--codegen=x` (and `profile_use`), the last one given winning, into `PgoFlag::Use(path)`; a path-less one is an error. `Job::profiles` (a `OnceLock`, as `build_time`) reads every path the job's units name once, relative to the workspace root, and gives it (`give_profile(profile_id(&bytes), &bytes)`); the `Profile` is held in the job, so for every build of it. `policy` sets `Pgo::Use(id)` for every unit whose flags have it (dependencies too). `generate`, before `Backends::default()`, puts the bytes in the store under `Key(id)` (`Kind::Output`) through the build's puts, once per job while the store lacks it, and stops with an error naming `give_profile` when the policy's profile was not given. A missing or unreadable path is an error naming it; without blaze-cargo's `llvm` feature (on through `blaze-engine/llvm`) it is an error naming the feature. Not read back from the store in `generate`: the loop writes a task's puts only after the task, so the first build of a profile can't find it there; the job's verified read (`give` checks the ID) is the one source. `-C profile-generate` stays refused, now saying the linker writes no profile sections yet. `plan.rs`'s `Flags` is v1's alone (`Plan::of`, called by `blaze-engine`'s load only), so it is unchanged. Asked of cargo: the record key hashes the profile's ID (`docs/v2/requests/cargo-pgo.md` 1). For codegen: `docs/v2/plan/design/codegen.md`'s "Cargo:" bullet is now done for `profile-use`.
 
 ## dedup: one writer of the proc-macro list, v2's, which blaze-engine calls (from dedup-sim-rest, 2026-10-29)
 
 From `dedup-sim-rest` (lane dedup; report `/tmp/blaze-lanes/v2-dedup-sim-rest.md`, notes
-`docs/v2/plan/lanes/dedup/sim-rest.md`). `crates/blaze-engine/src/macro_list.rs` `text` and
+`docs/v2/plan/design/data.md`). `crates/blaze-engine/src/macro_list.rs` `text` and
 `crates/hir-ty-codegen/v2/roots/proc_macros.rs` `text` write byte for byte the same module (the
 `BLAZE_PROC_MACROS` static `load-cargo`'s `listed` loader reads), and `MODULE`/`MARK` are defined
 in both: one change to one copy makes a library the other side's loader can't read. blaze-engine

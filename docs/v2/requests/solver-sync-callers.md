@@ -24,7 +24,7 @@ hir-ty-ub, hir-ty-wfcheck and macros. It also finds stdx, but only in a doc comm
 no change. blaze-fmt uses neither crate, so it needs no change. blaze-wasm only has
 `ra-ap-rustc_type_ir_macros` entries in its own `Cargo.lock`, which is the coordinator's.
 
-**Owners** come from `docs/v2/plan/reference/crates.md`:
+**Owners** come from `docs/v2/plan.md`:
 
 - `db`: hir-ty (except items' files), hir, hir-ty-borrowck and hir-ty-wfcheck.
 - `items`: blaze-items, plus these files in hir-ty/src: method_resolution, traits, specialization,

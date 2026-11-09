@@ -29,7 +29,7 @@ date: 2026-10-29
   none of them. `lint_with`: `inefficient_to_string` says nothing unless the crate keeps to a
   Rust before 1.82 (`msrv`), which only a `Conf` sets; `more_clone_tests.rs` asks it with
   `Conf { msrv: Some(Version(1, 81, 0)), ..Conf::default() }`.
-- `Cx` used, all as `docs/v2/plan/lanes/lints/cx.md` has them: `on`, `db`, `conf`, `krate`,
+- `Cx` used, all as `docs/lints.md` has them: `on`, `db`, `conf`, `krate`,
   `root`, `range`, `snippet`, `source_of`, `span`, `is_written` (through `utils::method_call`),
   `expansion`, `std_macro`, `ty`, `adjusted_ty`, `adjustments`, `method`, `path`, `local`,
   `famous`, `lang_trait`, `std_def`, `std_trait`, `assoc_ty`, `lint`. No addition.

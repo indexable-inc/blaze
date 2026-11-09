@@ -17,7 +17,7 @@ format-hir) append below with their name.
    `ast::SourceFile::parse_shared(text, edition)`; `parse_errors` of a dependency file uses
    `Parse::errors_with_bodies()` only when the build checks that crate (`blaze check` checks
    workspace crates fully; a dependency's body that is never reached is never parsed: see the
-   report's note on syntax errors in unreached bodies). Why: #1294, docs/v2/plan/lanes/format.md
+   report's note on syntax errors in unreached bodies). Why: #1294, docs/v2/plan/design/data.md
    "Issues this lane takes in": dependency bodies are parsed only when reached. The parse
    query needs to know the file's crate; if it can't, a second query `parse_outline` beside
    `parse`, chosen by the caller that knows the crate, works as well.
@@ -34,7 +34,7 @@ format-hir) append below with their name.
    make it `std::sync::Arc<str>` instead of `triomphe::Arc<str>`, so `parse_shared` /
    `parse_outline` keep the file's own text in the tree instead of a copy (syntax-tree's
    `FlatTree::source` is a `std::sync::Arc<str>`; it can't take triomphe's without a copy).
-   Why: docs/v2/plan/lanes/format.md "Syntax": text read from the source, not copied.
+   Why: docs/v2/plan/design/data.md "Syntax": text read from the source, not copied.
 
 > forwarded to db: `FileText::text` (`crates/base-db/src/lib.rs:709`) still returns triomphe's `Arc<str>`.
 > applied by db-expand: `FileText::text` is `std::sync::Arc<str>` (field, getter and the three
@@ -56,7 +56,7 @@ format-hir) append below with their name.
    parse of the same file is at hand and the VFS gives the edit (`blaze_vfs::Change`), make
    the new parse with `Parse::reparse(delete, insert, edition)` rather than parsing the whole
    file. It gives the same tree as a full parse (format-parse's tests check it). Why:
-   docs/v2/plan/lanes/format.md "an edit reparses the changed item".
+   docs/v2/plan/design/data.md "an edit reparses the changed item".
 
 > forwarded to db
 > applied by db-expand: db's D8 (`crates/base-db/src/reparse.rs`). `Files::set_text` finds the edit once, as the common prefix and suffix of the two texts (32 bytes a compare, with a scalar reference the tests hold it to), and keeps it on `FileText` (an unhashed field) with the "before" text's vfs content id. `EditionedFileId::parse` makes the new parse with `Parse::reparse_onto` from the before text's parse, which a per-text slot holds weakly (`OnceLock`s, no lock, nothing allocated on a hit). Otherwise it parses the whole text. Debug builds check each reparse against a whole parse. Tests: `a_parse_after_random_edits_is_the_whole_parse` (random edits of real files, full and outline), `a_reparse_is_made_from_the_last_text_that_was_parsed`, `a_cache_hit_of_parse_allocates_nothing`, `the_simd_prefix_and_suffix_equal_their_scalar_reference`, `the_edit_between_two_texts_makes_one_the_other`. This needs `Parse::reparse_onto` and `WeakParse` in `crates/syntax`: requested of format in `docs/v2/requests/db-expand.md`, "db-expand-inputs2: `Parse::reparse_onto` and `WeakParse`". `SourceFile::parse_file` and `parsing::kept` are then unused.
@@ -73,7 +73,7 @@ format-hir) append below with their name.
    `blake3 = { version = "=1.8.7", default-features = false, features = ["std", "neon"] }`
    in place of `"1.8"`. Why: `ContentId::of_many` (`crates/blaze-ids/src/many.rs`) drives
    `blake3::platform::Platform::hash_many`, which blake3 marks unstable, to hash many short
-   inputs a SIMD lane each (docs/v2/plan/lanes/format/speed-ids-format.md). A test holds it to
+   inputs a SIMD lane each (docs/v2/plan/design/data.md). A test holds it to
    `blake3::Hasher` at every length, so a bump is a deliberate change that runs that test,
    not a lockfile refresh.
 7. **Warm words are `u32` now** — `crates/blaze-cas/src/tests.rs:1000`, `OneColumn::hot_from_warm`
@@ -81,10 +81,10 @@ format-hir) append below with their name.
    `warm[WARM_HEAD..].chunks_exact(4).map(|it| u32::from_le_bytes(it.try_into().unwrap()))`,
    in place of `chunks_exact(8)` and `u64::from_le_bytes`. `tiers::Packed::words` is a
    `Vec<u32>` in SIMD-BP128 layout. The writer at :992 already writes them as 4 bytes each.
-   Why: the warm tier's speed pass (docs/v2/plan/lanes/format/speed-ids-format.md); until this
+   Why: the warm tier's speed pass (docs/v2/plan/design/data.md); until this
    changes, blaze-cas's tests don't compile.
 
-**Speed pass (2026-10-29), changes others see** (docs/v2/plan/lanes/format/speed-ids-format.md):
+**Speed pass (2026-10-29), changes others see** (docs/v2/plan/design/data.md):
 - `blaze-format`: `Record` has `const PLAIN: bool` (default `false`). `record!` sets it when
   every field is plain, and a plain record is checked by bounds alone. A hand-written
   `unsafe impl Record` may set it only if every bit pattern of its size is a valid value.
@@ -179,8 +179,8 @@ format-hir) append below with their name.
 
 ## format-span-intern
 
-`crates/intern/` is now sharded and append-only (docs/v2/plan/lanes/format.md section 5, "IDs, two kinds";
-docs/v2/plan/lanes/db.md: memory is bounded by the db's reachability GC rebuilding arenas, not by
+`crates/intern/` is now sharded and append-only (docs/v2/plan/design/data.md section 5, "IDs, two kinds";
+docs/v2/plan.md: memory is bounded by the db's reachability GC rebuilding arenas, not by
 refcounts). `Interned`, `InternedRef`, `InternedSlice`, `InternedSliceRef` and `Symbol` are
 `Copy` pointers with no reference count; nothing is ever freed. So the GC (`intern::GarbageCollector`,
 `GcInternedVisit`, `GcInternedSliceVisit`), `InternedRef::decrement_refcount`,
@@ -302,7 +302,7 @@ are still accepted and mean the same as without `gc;` (`hir-ty/src/next_solver/*
    ```
    Why: `hir/persist.rs`, `item_tree/persist.rs` and `expr_store/persist.rs` implement
    `blaze_format::Persist` for `ItemTree`, `ExpressionStore`, `Body` and their source maps
-   (docs/v2/plan/lanes/format.md section 5). Both crates are already workspace dependencies
+   (docs/v2/plan/design/data.md section 5). Both crates are already workspace dependencies
    (`Cargo.toml`: `blaze-format = { path = "crates/blaze-format" }`, `blaze-ids = ...`).
    hir-def doesn't build without it.
 
@@ -454,7 +454,7 @@ Lookups in both interners take no lock, which is right. The findings are on the 
    then) and derive `SHARD_BITS` from that. With more shards each table is smaller, which also
    shortens the copy done under the lock.
    Status: done by speed-span (`crates/intern/src/arena.rs`: shards from the core count, the
-   lock a named `InsertLock`; docs/v2/plan/lanes/format/speed-span.md).
+   lock a named `InsertLock`; docs/v2/plan/design/data.md).
 2. **`crates/blaze-ids/src/lib.rs:210` (`SHARDS = 64`) and `:224` (`Shard.lock: Mutex<u32>`).**
    It has the same fixed count. On top of that, `Interner::intern` runs the caller's `value()` with
    the shard locked (:340): that's computing under a shard lock, where the rule is "held only to
@@ -602,7 +602,7 @@ Status: done by format (lead), in `crates/blaze-ids/src/lib.rs`:
 ## speed-syntax (speed pass of `crates/parser`, `crates/syntax`)
 
 From `speed-syntax`, for format-tree (`crates/syntax-tree/` is live as format-edit). Notes:
-`docs/v2/plan/lanes/format/speed-syntax.md`.
+`docs/v2/plan/design/data.md`.
 
 Already wired in `crates/syntax` (format-parse is done, its files are speed-syntax's now):
 format-tree's request 2 (`expand_lazy` returns its parser errors; `Parse::errors_of` reads
@@ -757,7 +757,7 @@ is upheld (format-hir told).
 ## speed-span-tt: an in-order token walk of a flat tree (`crates/syntax-tree/src/flat.rs`)
 
 From `speed-span-tt`, for format-tree (live as format-edit). Notes:
-`docs/v2/plan/lanes/format/speed-span-tt.md`.
+`docs/v2/plan/design/data.md`.
 
 `syntax_node_to_token_tree` on a flat node, through syntax-bridge's `FlatTokens`, reads every
 token of a macro input in order through `FlatTree::range(at)`. `range` computes `offset(at)` from
@@ -1263,7 +1263,7 @@ numbered from the node. An incremental reparse keeps the hashes of the subtrees 
 Why: `hir-def` `expr_store/body.rs` `tree_hash` runs for every body of a file on each edit of the
 file and hashes each anchor (an `impl` or module) whole, so an edit costs O(file size) of hashing,
 about 70 µs for a 400 KB file with one BLAKE3 pass. With the hash carried by the parse, an edit
-costs the reparse plus the edited body (`docs/v2/plan/lanes/format/speed-of-light.md`, "An edit").
+costs the reparse plus the edited body (`docs/v2/plan/design/data.md`, "An edit").
 `signatures.rs` hashes each item's tree the same way.
 
 > taken by requests (format and speed-syntax are DONE): child `requests-subtree-hash`; the outcome follows.
@@ -1380,7 +1380,7 @@ a justification on the line or the one above (`// alloc: an error.`):
 ## frontend-deps-reparse: `FlatTree::replace_subtree` by copying, not repacking (speed of light; 2026-10-29)
 
 From frontend-deps-reparse, for whoever holds `crates/syntax-tree/src/flat.rs` (requests-subtree-hash
-is editing it now, so I did not). Notes: `docs/v2/plan/lanes/frontend/speed-of-light.md`, section
+is editing it now, so I did not). Notes: `docs/v2/plan/design/frontend.md`, section
 frontend-deps-reparse.
 
 Every reparse of an edit (`syntax::Parse::reparse_to`, `incremental_reparse_onto`) ends in
@@ -1456,7 +1456,7 @@ does not read: list[str]". The field is declared `list[str]`, but `typed_input` 
 
 ## format-grammar: the parser's speed of light (`crates/parser/src/parser.rs`, `input.rs`; to the lead)
 
-What, from "The grammar: tokens to events" in `docs/v2/plan/lanes/format/speed-of-light.md`:
+What, from "The grammar: tokens to events" in `docs/v2/plan/design/data.md`:
 1. Move `Parser`'s step counter out of `nth` (a `Cell` load, compare, branch and store on
    every kind test, and the store keeps the compiler from reusing a loaded kind) into the
    places a stuck loop must pass: `start`, `error`, `err_recover`, a failed `expect`. Add a fuzz
@@ -1481,7 +1481,7 @@ grammar's structure (speed-syntax's postorder rewrite).
    them.
 
 > taken by requests (format is DONE): child `requests-parser`; the outcome follows.
-> applied by requests (child requests-parser): items 1-3. (1) The step counter is a plain u32 in Parser, checked in start, error (every failed expect and every err_recover path go through it), and the EOF branches of bump_any/bump_remap. Same PARSER_STEP_LIMIT and message, not in nth. Termination is a property test, not a fuzz target, because fuzz/Cargo.toml was being edited by another lane and blaze-fuzz has its own global allocator: tests.rs termination::every_entry_point_finishes_on_every_input runs every Top/Prefix entry point, outlines and Reparser::top_level_item over 2000 changed token sequences, with a deadline. (2) Input and frontend-tokens new parser::Tokens end in Tokens::PAD = 4 EOF words, and len() leaves them out. kind, contextual_kind and is_joint are a slice load, and kind is transmuted with no SyntaxKind::from assert; Tokens::new checks the pad and every kind field. No change in grammar/. (3) Marker is a u32 and a bool with its own Drop, same message, and drop_bomb is gone from Cargo.toml. Tests are beside the code (input.rs, parser.rs). Arithmetic is in docs/v2/plan/lanes/format/speed-of-light.md: about 2.5x the bound, from about 5x. Items 4 and 5 were not in this brief. Nothing built.
+> applied by requests (child requests-parser): items 1-3. (1) The step counter is a plain u32 in Parser, checked in start, error (every failed expect and every err_recover path go through it), and the EOF branches of bump_any/bump_remap. Same PARSER_STEP_LIMIT and message, not in nth. Termination is a property test, not a fuzz target, because fuzz/Cargo.toml was being edited by another lane and blaze-fuzz has its own global allocator: tests.rs termination::every_entry_point_finishes_on_every_input runs every Top/Prefix entry point, outlines and Reparser::top_level_item over 2000 changed token sequences, with a deadline. (2) Input and frontend-tokens new parser::Tokens end in Tokens::PAD = 4 EOF words, and len() leaves them out. kind, contextual_kind and is_joint are a slice load, and kind is transmuted with no SyntaxKind::from assert; Tokens::new checks the pad and every kind field. No change in grammar/. (3) Marker is a u32 and a bool with its own Drop, same message, and drop_bomb is gone from Cargo.toml. Tests are beside the code (input.rs, parser.rs). Arithmetic is in docs/v2/plan/design/data.md: about 2.5x the bound, from about 5x. Items 4 and 5 were not in this brief. Nothing built.
 > forwarded to frontend-tokens (items 4 and 5): `crates/parser/` is held by frontend-tokens, still running (design item 4), and item 4 also changes `tests/top_entries.rs`' budget. Items 1-3 were applied above. Told by tmux.
 > items 4 and 5 done by frontend-tokens: (4) events are sized at 3.25 a token (requests-parser's `lend_events`), and with the output words on a shelf too the budget in `src/tests/top_entries.rs` is 0 for a second parse, not 5; (5) `Parser::errors`, `event::process` and `Output`'s error table are `Cow<'static, str>`, `error` takes `Into<Cow<'static, str>>`, and `err_and_bump`, `err_recover`, `error_block`, `error_let_stmt` take `&'static str` (every caller passes a literal), so a fixed message allocates nothing. Nothing built.
 

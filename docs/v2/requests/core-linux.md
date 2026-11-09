@@ -52,18 +52,18 @@ date: 2026-10-29
 > CLONE_PIDFD)`, the cgroup joined in the child, and `Started.pidfd` is what `uring.rs` takes
 > now. `cgroup.rs` needs no `dir_fd` for it.
 
-## 4. docs/v2/plan/lanes/core/plane.md's watch row: what makes fanotify refuse
+## 4. docs/v2/plan.md's watch row: what makes fanotify refuse
 
 - What: after "fanotify, inotify where fanotify needs a privilege the process lacks", add: "A
   file system that gives no file handles (fanotify reports changes by them) is an error naming
   it, not a quiet switch to inotify."
-- Where: `docs/v2/plan/lanes/core/plane.md`, the IO core table.
+- Where: `docs/v2/plan.md`, the IO core table.
 - Why: that is what `crate::watch::Tree::new` does (no-fallback): only `EPERM` (no
   `CAP_SYS_ADMIN` or `CAP_DAC_READ_SEARCH`) means inotify. A daemon running as root on a file
   system without handles (an overlayfs before 6.6, some FUSE or 9p mounts) will fail its
   watches with that error, which whoever runs the VMs should know.
 
-> applied: by core (`docs/v2/plan/lanes/core/plane.md`, the watch row).
+> applied: by core (`docs/v2/plan.md`, the watch row).
 
 ## 5. `process.rs`: remove `pidfd`, which nothing uses now
 
@@ -90,7 +90,7 @@ date: 2026-10-29
 
 ---
 Applied by core: 1 (`a_sandbox_is_made_by_the_confine_or_refused` runs on `Uring` and `Kqueue`
-too; the shared scripts already did), 2 (`Threads::local_addr`), 3 (in docs/v2/plan/lanes/core/plane.md).
+too; the shared scripts already did), 2 (`Threads::local_addr`), 3 (in docs/v2/plan.md).
 
 > forwarded to concurrency: the pack writer is in `crates/blaze-cas`, lane concurrency's now (store is DONE); `fs::write_at` already gives macOS the same rule (`F_NOCACHE`, core-macos 4).
 

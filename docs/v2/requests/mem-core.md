@@ -7,7 +7,7 @@ date: 2026-10-29
 
 mem-core (lane mem's child: blaze-core's I/O, timers and watches and blaze-graph's plane onto
 blaze-mem, memory admission on blaze-mem's counters, the counters on the agent API). Notes:
-`docs/v2/plan/lanes/mem/core.md`. Each item names the file, the exact change, and why.
+`docs/v2/plan/design/memory.md`. Each item names the file, the exact change, and why.
 
 ## C1 (blaze-cargo `serve/daemon.rs`, lane cargo): the session's memory counters
 
@@ -698,7 +698,7 @@ The `Confine` sites (`threads.rs`, `process.rs`, `kqueue.rs`, `uring.rs`, `iocp.
 `crates/blaze-graph/src/admission.rs`'s `Estimates::decode` has a hand-written cursor (a `take`
 closure over `at`, then `u32_at`/`u64_at` over each 40-byte chunk), and `Estimates::encode` its
 writer. They move onto the one checked cursor, `blaze_format::cursor::{Reader, Put}`
-(crates/blaze-format/src/cursor.rs; docs/v2/plan/lanes/dedup/cursor.md). blaze-graph already
+(crates/blaze-format/src/cursor.rs; docs/v2/plan/design/data.md). blaze-graph already
 depends on blaze-format, so no `Cargo.toml` change. The bytes are the same, so
 `history::SCHEMA` stays. The test at admission.rs:626 (`Short { at: 8 }` for the first 12
 bytes) holds: `cursor::Error::at` is where the failed `u64` starts. Same move as

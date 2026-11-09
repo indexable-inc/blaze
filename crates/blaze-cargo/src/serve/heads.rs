@@ -1,4 +1,4 @@
-//! The CLI's checkouts as heads (docs/v2/plan/lanes/cargo/notes.md section 6): a request that names
+//! The CLI's checkouts as heads (docs/v2/plan.md section 6): a request that names
 //! `ViewRef::Head(<absolute path>)` builds the checkout as saved.
 //!
 //! - The first request on a checkout imports it: a [`Watcher`] of its directory scans it into

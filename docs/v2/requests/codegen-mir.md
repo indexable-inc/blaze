@@ -207,7 +207,7 @@ calls them as rustc's codegen does.
 
 ## 12. hir-ty `src/infer.rs` (db-ty): value resolutions and adjustments as columns
 
-For MIR building's speed of light (`docs/v2/plan/lanes/codegen/speed-of-light.md`, section 3).
+For MIR building's speed of light (`docs/v2/plan/design/codegen.md`, section 3).
 Lowering resolves every path expression a second time through the resolver
 (`update_to_inner_scope` + `resolve_path_in_value_ns_fully`, 200 to 500 cycles each), though
 inference already resolved it, and finds each expression's adjustments by a hash probe

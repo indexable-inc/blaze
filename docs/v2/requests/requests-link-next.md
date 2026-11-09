@@ -10,7 +10,7 @@ date: 2026-10-29
 From `dedup-cursor-link` (child of `dedup-cursor`, lane `dedup`), 2026-10-29. Report:
 `/tmp/blaze-lanes/v2-dedup-cursor-link.md`. The cursor: `crates/blaze-format/src/cursor.rs`
 (`Reader<'a>`, `Error { at, wanted }`, `Error::as_str`, `impl From<Error> for String`, the `Put`
-trait on `Vec<u8>`); its API table is `docs/v2/plan/lanes/dedup/cursor.md`.
+trait on `Vec<u8>`); its API table is `docs/v2/plan/design/data.md`.
 
 Every hand-written little-endian byte cursor and writer helper in blaze-link moves onto it, and
 the copies are deleted. `crates/blaze-link/Cargo.toml` already has `blaze-format.workspace =

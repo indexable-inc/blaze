@@ -7,7 +7,7 @@ date: 2026-10-29
 
 ## frontend-tree: blaze-diagnostics lints/bodies/unstable_names.rs: onto views (1)
 
-From `frontend-tree-move-diag-lints` (notes `docs/v2/plan/lanes/frontend/tree-move-diag-lints.md`).
+From `frontend-tree-move-diag-lints` (notes `docs/v2/plan/design/frontend.md`).
 `method_name` reads the call through a view: no handle, no clone. Needs `Cx::syntax_view`
 (in `cx.rs` already). Independent of every other heading.
 

@@ -187,7 +187,7 @@ None needed in blaze-doc, blaze-lints or ide-diagnostics: they name the type onl
 
 ## From requests-vfs (2026-10-29): `SCHEMA` 13 in the ci lane's speed-of-light note, and `hot_lint.py`'s `crates` input
 
-1. `docs/v2/plan/lanes/ci/speed-of-light.md` ("What stands in the way", ~L220): the item
+1. `docs/v2/plan.md` ("What stands in the way", ~L220): the item
    "**`Op::Write` and `Op::Edit`'s bytes as byte strings**: `docs/v2/requests/vfs.md`, to land inside
    `SCHEMA` 11." is no longer true. They are byte strings now (`crates/blaze-vfs/src/lib.rs`),
    and as `SCHEMA` was already 12 (`Request::Memory`), the change is `SCHEMA` 13
@@ -208,7 +208,7 @@ None needed in blaze-doc, blaze-lints or ide-diagnostics: they name the type onl
 `crates/blaze-live/` (the reason is under it): blaze-live links into user programs that build
 outside this workspace, and blaze-mem is `publish = false`, path-only in the root, and nightly-only.
 
-1. `docs/v2/plan/lanes/mem/backend-live.md`, the table row for "`blaze-live` `Log` (ten columns
+1. `docs/v2/plan/design/memory.md`, the table row for "`blaze-live` `Log` (ten columns
    per generation) and `Lasting` ranges" (~L23), says "`RegionVec`s, `Tag::Link` ...
    (requested)". Make it "`Vec`s, kept: refused, blaze-live takes no dependency (see the request)".
    Lane mem is the doc's owner; it is DONE, so the doc is the coordinator's.
@@ -247,13 +247,13 @@ From `requests-fuzz-pm`, which applied `docs/v2/requests/usercode-wire.md` secti
    do, and every `msg.write(out)` caller keeps compiling through autoref. Why: with a write that
    consumes, `proc_macro_message` must write a read message twice and compare frames (15n per
    input byte) instead of writing once and comparing with `==` (12.5n, its bound in
-   `docs/v2/plan/lanes/safety/speed-of-light.md`): 83%, more than 10% off.
+   `docs/v2/plan/design/unsafe.md`): 83%, more than 10% off.
 3. **A comment** (usercode, `legacy_protocol/msg/flat.rs` L1082): `proc_macro_flat_tree` picks
    the version as `4 + byte % 5` now that 8 is a version; the test helper's `4 + byte % 4` reads
    every corpus file the same (their version bytes are 0 and 3), but its doc comment should
    say "the corpus's version bytes, 0 and 3, pick 4 and 7".
 4. **The safety speed note** (coordinator, safety DONE:
-   `docs/v2/plan/lanes/safety/speed-of-light.md` L150-191 and L235). With `PartialEq`:
+   `docs/v2/plan/design/unsafe.md` L150-191 and L235). With `PartialEq`:
    `proc_macro_frames` compares messages with `==` (its 9n of writes go), and its pieces read
    goes through `warm::LinkReader` over a link that gives the cut's pieces, one `Vec` a piece
    (what `Link::recv` returns), so a cut's overhead is about a small allocation a piece more;
@@ -261,7 +261,7 @@ From `requests-fuzz-pm`, which applied `docs/v2/requests/usercode-wire.md` secti
    (about 46n, its bound); `proc_macro_message` has no `canonical` and stays at 15n until item
    2. The "known bug, waiting on usercode" line becomes item 2.
 
-> forwarded to usercode (usercode-wire-next1, which holds `crates/proc-macro-api/`) for items 1 to 3; item 4 (`docs/v2/plan/lanes/safety/speed-of-light.md`) is the coordinator's, on the requests report's list (requests, pass 18; told by tmux).
+> forwarded to usercode (usercode-wire-next1, which holds `crates/proc-macro-api/`) for items 1 to 3; item 4 (`docs/v2/plan/design/unsafe.md`) is the coordinator's, on the requests report's list (requests, pass 18; told by tmux).
 
 > applied (usercode-wire): items 1-3. (1) In `crates/proc-macro-api/src/wire.rs`, these are now public: `Sent` (fields still private, plus `impl Default`), `Sent::new`, `Sent::span`, `Sent::of_table`, `Sent::has` (added so the target can check that every span of an accepted tree has an anchor and a context `sent` holds), and `read_tree(bytes, &Sent, scratch)`. `Sent::part` and `sub_response` stay crate-private. (2) `Message::write(&self, out)` in the trait and its three impls (legacy `Request` and `Response`, `BidirectionalMessage`), which encode `self` by reference. Every `.write(..)` call keeps compiling through autoref. (3) The doc comment of the test helper `resolved` in `flat.rs` now says the target picks `4 + byte % 5`, and that the helper's `4 + byte % 4` reads the corpus's version bytes, 0 and 3, the same, as 4 and 7. Not built or run.
 
@@ -277,7 +277,7 @@ use none), so its `Cargo.toml` line is gone (`docs/v2/requests/link.md`, "dedup:
 2. Root `Cargo.toml` `[workspace.dependencies]`: delete `bumpalo` once 1 is in (no other member's
    manifest names it), and the lock entry with it. Owner: coordinator.
 
-Why: one arena (docs/v2/plan/lanes/dedup.md: arenas are `blaze-mem`'s).
+Why: one arena (docs/v2/plan/design/data.md: arenas are `blaze-mem`'s).
 
 > forwarded to codegen (codegen-next1) for item 1 (`crates/hir-ty-codegen/Cargo.toml`); item 2, the root `bumpalo` line, requests deletes once item 1 is in and `rg '^bumpalo' --glob Cargo.toml crates` finds nothing (requests, pass 18; told by tmux).
 
@@ -338,7 +338,7 @@ byte string" item 1 is applied in `crates/blaze-ids/src/wire.rs`: both serialize
 reader takes only a byte string of exactly 32 (16) bytes; JSON is unchanged (serde_json writes
 bytes as the same array of numbers, and the reader still takes it). Every serde encoding that
 holds one changes bytes. Item 2, the ones that are persisted, hashed or versioned, each to bump
-in the same change (owners from `docs/v2/plan/reference/crates.md`):
+in the same change (owners from `docs/v2/plan.md`):
 
 1. **blaze-api `SCHEMA`** (`crates/blaze-api/src/lib.rs:56`, owner ci): every `Envelope` body
    holds them (`Commit.base`, `View.root`, `Artifact.content`, `QueryKey`, `Edge.saw`,

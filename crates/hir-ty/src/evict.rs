@@ -4,7 +4,7 @@
 //! edges without the value, so a dependent of an unchanged body stays valid, and a read of it
 //! computes it again and backdates by fingerprint, so a later edit cuts off early as if the value
 //! had been kept (`evict_values` and `evict_values_of`, which every `lru` query has;
-//! docs/v2/plan/lanes/db/query-unify.md, "LRU and eviction").
+//! docs/v2/plan.md, "LRU and eviction").
 //!
 //! A closure's captures and signature are its body's inference result, dropped with it. Enum
 //! discriminants are not dropped: an `i128` is smaller than the fingerprint kept in its place.

@@ -14,7 +14,7 @@ date: 2026-10-29
 - Why: every query run calls `blaze_query::write_value`, which does `Writer::new`, a fresh
   4 KiB `Vec` for each run. blaze-query then copies the bytes once into its thread's value
   segment. With a reusable buffer, a run allocates nothing for its value once the buffer has
-  grown (docs/v2/plan/goals/principles.md, "preallocate and reuse buffers"). Miss path only;
+  grown (docs/v2/plan.md, "preallocate and reuse buffers"). Miss path only;
   hits already allocate nothing. Once it exists, blaze-query keeps one buffer per thread in its
   thread-local run stacks (`lib.rs`, `Stacks`).
 
@@ -25,10 +25,10 @@ date: 2026-10-29
 `Query::fingerprint(value)` is now `Query::fingerprint(value, bytes)`, with `bytes` the value as
 written, and its default hashes those bytes instead of writing the value a second time. No
 crate in the tree overrides it (`rg 'fn fingerprint' crates` finds no `impl Query` that does),
-so no caller changes. If `docs/v2/plan/reference/crates.md` ever lists the trait's methods, it
+so no caller changes. If `docs/v2/plan.md` ever lists the trait's methods, it
 should show the new signature.
 
-> applied: nothing to change; `docs/v2/plan/reference/crates.md` lists no `Query` methods.
+> applied: nothing to change; `docs/v2/plan.md` lists no `Query` methods.
 
 ## 3. Root `Cargo.toml`: `blaze-mem` as a workspace dependency (owner of the root manifest)
 
@@ -38,7 +38,7 @@ should show the new signature.
   row through a dependent load of its chunk's base. Over `blaze_mem::Region` (reserved once,
   committed as it grows, never moved) a row's address is base + index × size, which takes two
   dependent L1 loads off every warm hit: from ≈ 1.6× to ≈ 1.2× the hot hit's bound
-  (`docs/v2/plan/lanes/db/speed-of-light.md`, "blaze-query", "Warm hit"). Once it exists,
+  (`docs/v2/plan.md`, "blaze-query", "Warm hit"). Once it exists,
   blaze-query adds `blaze-mem.workspace = true` and moves `Rows` onto regions tagged
   `Tag::Query`.
 
@@ -51,7 +51,7 @@ should show the new signature.
   a task (the daemon calling `Database::collect`).
 - Why: `collect`'s marking is one thread walking every reachable memo, about 1.1 s at
   nushell's scale against 6 ms on all cores
-  (`docs/v2/plan/lanes/db/speed-of-light.md`, "blaze-query", "Collection"). The marks are
+  (`docs/v2/plan.md`, "blaze-query", "Collection"). The marks are
   already a bitset by memo ID, so parallel marking is a `fetch_or` on the shared words, with
   the roots split across jobs. The database must not start threads of its own, so it needs the
   plane's.

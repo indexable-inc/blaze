@@ -6,7 +6,7 @@ date: 2026-10-29
 # Requests of mem-db-infer
 
 hir-ty (all but `src/next_solver/`) onto `crates/blaze-mem`. Design and the rules every change
-follows (R1 to R8): `docs/v2/plan/lanes/mem/db-infer.md`. The paths belong to lane db (db-ty and
+follows (R1 to R8): `docs/v2/plan/design/memory.md`. The paths belong to lane db (db-ty and
 its children; frontend-db's children change `db` parameters) and, for `method_resolution.rs`,
 `method_resolution/`, `traits.rs`, `specialization.rs`, `opaques.rs`, `layout.rs`, `layout/`,
 `drop.rs`, lane items; none is done, so these are requests. The file-by-file changes are in the
@@ -71,7 +71,7 @@ After:
 ```
 
 `Vec<T, &Frame>`, `Box<T, &Frame>` and hashbrown's `A` need it (contract 2 of
-`docs/v2/plan/lanes/mem/db.md`); blaze builds with its pinned nightly.
+`docs/v2/plan/design/memory.md`); blaze builds with its pinned nightly.
 
 After the module list (after `pub mod traits;`, line 47):
 
@@ -104,7 +104,7 @@ After the `use` block (after line 41, `};` closing `use crate::{..}`):
 
 ```rust
 /// What hir-ty's inference, lowering, method resolution, layout, const eval and trait
-/// solving allocate (docs/v2/plan/lanes/mem/db.md, contract 3).
+/// solving allocate (docs/v2/plan/design/memory.md, contract 3).
 pub(crate) const INFER_TAG: blaze_mem::Tag = blaze_mem::Tag::Infer;
 /// What hir-ty's MIR queries allocate.
 pub(crate) const MIR_TAG: blaze_mem::Tag = blaze_mem::Tag::Mir;
@@ -148,7 +148,7 @@ each owned heap block of the result is one allocation of its clone, interned typ
 reference counts); the frame's peak to linear in the body's size.
 
 ```rust
-//! What inference allocates (docs/v2/plan/lanes/mem/db-infer.md, "Budget tests"): nothing on a
+//! What inference allocates (docs/v2/plan/design/memory.md, "Budget tests"): nothing on a
 //! re-check of bodies whose inputs did not change, its owned result alone on a run whose
 //! dependencies are all memoized, and frame memory linear in the body.
 
@@ -341,7 +341,7 @@ once, in `lib.rs`, after the `use` block:
 use blaze_mem::Frame;
 use rustc_hash::FxBuildHasher;
 
-/// A map of a query run's temporaries, in its frame (docs/v2/plan/lanes/mem/db-infer.md, R3).
+/// A map of a query run's temporaries, in its frame (docs/v2/plan/design/memory.md, R3).
 pub(crate) type FrameMap<'f, K, V> = hashbrown::HashMap<K, V, FxBuildHasher, &'f Frame>;
 /// A set of a query run's temporaries, in its frame.
 pub(crate) type FrameSet<'f, T> = hashbrown::HashSet<T, FxBuildHasher, &'f Frame>;
@@ -546,7 +546,7 @@ memoized result:
 ## dedup: byte cursor onto blaze_format::cursor
 
 From `dedup-cursor-front` (report `/tmp/blaze-lanes/v2-dedup-cursor-front.md`; the cursor is
-`crates/blaze-format/src/cursor.rs`, API in `docs/v2/plan/lanes/dedup/cursor.md`). `hir-ty`
+`crates/blaze-format/src/cursor.rs`, API in `docs/v2/plan/design/data.md`). `hir-ty`
 already depends on `blaze-format`; no `Cargo.toml` change.
 
 `crates/hir-ty/src/method_resolution/frozen.rs`:

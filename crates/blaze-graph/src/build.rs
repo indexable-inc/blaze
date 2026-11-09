@@ -1,4 +1,4 @@
-//! A build as the plane's nodes (docs/driver.md steps 4 to 7, docs/v2/plan/lanes/core/plane.md "What moves onto
+//! A build as the plane's nodes (docs/v2/plan.md steps 4 to 7, docs/v2/plan.md "What moves onto
 //! it"): the workspace load, codegen and its store writes, links and test runs, each a node of
 //! one request with the kind, pool and waits the step gives it.
 //!

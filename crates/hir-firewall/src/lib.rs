@@ -1,4 +1,4 @@
-//! A body edit touches only its own function (docs/v2/plan/lanes/firewall/notes.md): edits
+//! A body edit touches only its own function (docs/v2/plan/design/item-hash.md): edits
 //! one function body of a crate at a time and checks that the queries executed again are
 //! that function's, its file's and the exceptions Rust's semantics need, and that the code
 //! compiled again is that function's.

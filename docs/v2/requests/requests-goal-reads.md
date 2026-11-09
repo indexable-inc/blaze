@@ -90,7 +90,7 @@ impls), and with `self_ty: None` the blanket impls alone (`for_self_ty()` empty)
 arguments), `TraitImpls::for_block` (a whole block's table) and
 `TraitImpls::blanket_in_crate_and_deps` (two arguments). None of these reads names one trait and
 one self type that a fact could stand for, so the persistent goal cache keeps every goal that
-selects among impls out of the store (docs/v2/plan/lanes/frontend/fast-trait-store.md 3.4, row 1).
+selects among impls out of the store (docs/v2/plan/design/frontend.md 3.4, row 1).
 A read of `relevant_impls` decodes to `(crate, trait, self type)`, and blaze-items'
 `fact_of_read` maps it to `Fact::Implements { trait_, self_ty }`; with no self type, it maps to
 `Implements` for the self type that only blanket impls unify with. The answers stay the same: the

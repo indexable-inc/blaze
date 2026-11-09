@@ -1907,7 +1907,7 @@ fn coroutine_layout_line<'db>(db: &'db Db, ty: Ty<'db>, layout: &Layout) -> Opti
 
 /// Whether `func` runs only when something has gone wrong, so its code goes after every other
 /// function and a block calling it after the rest of its function
-/// (docs/v2/plan/lanes/layout/layout.md): it is `#[cold]` (`handle_alloc_error`,
+/// (docs/v2/plan/design/code-layout.md): it is `#[cold]` (`handle_alloc_error`,
 /// `unwrap_failed`, core's panics), the panic machinery by its lang items (the
 /// `#[panic_handler]`, `begin_panic`, the personality routine unwinding runs), or
 /// `#[track_caller]` and never returns (a panic helper of a crate's own). A profile that saw it

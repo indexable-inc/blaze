@@ -27,7 +27,7 @@ a proptest against the build scripts' copy). Its workspace dependency line is re
 # mem-backend-link: blaze-link's tables and stage scratch onto blaze-mem
 
 From `mem-backend-link` (report `/tmp/blaze-lanes/v2-mem-backend-link.md`, design
-`docs/v2/plan/lanes/mem/backend-link.md`). Every file below is held by an agent that is not DONE
+`docs/v2/plan/design/memory.md`). Every file below is held by an agent that is not DONE
 (`requests-link-fuzz-core-model` for `symbols.rs`, `state.rs`, `native.rs`, `cow.rs`;
 `requests-link-fuzz-core-stage` for `lib.rs`, `stage.rs`, `place.rs`, `write.rs`, `file.rs`,
 `live.rs`), so each change is written here exactly; I apply any the holder leaves once it is
@@ -394,7 +394,7 @@ the symbol tables alone. Packing several vectors into one reservation does not h
 partly committed vector is still its own mapping). What does: blaze raises `vm.max_map_count`
 at install (current Fedora and Arch ship 1 048 576), and the daemon reads it at start and stops
 naming it when it is below what its image budget needs (no-fallback). Recorded in
-`docs/v2/plan/lanes/mem/backend-link.md`.
+`docs/v2/plan/design/memory.md`.
 
 > forwarded to mem (`crates/blaze-mem`, lane mem; told by tmux).
 

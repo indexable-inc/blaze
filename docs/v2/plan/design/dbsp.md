@@ -5,13 +5,12 @@ date: 2026-10-30
 ---
 # dbsp: resolution, impls and trait candidates maintained by deltas
 
-Lane dbsp (Andrew approved, 2026-10-30). Notes: `docs/v2/plan/lanes/dbsp/` (speed of light,
-children's notes). Report: `/tmp/blaze-lanes/v2-dbsp.md`.
+Andrew approved, 2026-10-30.
 
 ## 1. Why
 
 Name resolution is already per module (`crates/hir-def/src/nameres/facts/`,
-[lanes/frontend/nameres.md](../lanes/frontend/nameres.md)). Each module's round-0 collection is
+[lanes/frontend/nameres.md](frontend.md)). Each module's round-0 collection is
 a query, imports resolve per SCC, and each name is a backdating memo. It is still pull-based,
 so every edit pays crate-wide terms even when one fact changed:
 
@@ -372,7 +371,7 @@ merges two builds. Maintained form, as maintainer `300` in `blaze-items`:
 
 ## 10. Cost and speed of light
 
-The arithmetic is in [../lanes/dbsp/speed-of-light.md](../lanes/dbsp/speed-of-light.md).
+The arithmetic is in [../lanes/dbsp/speed-of-light.md](dbsp.md).
 In short, per edit:
 - the edited module's log is diffed: `O(ops of m)` hash compares at about 2 ns each;
 - the delta's facts are applied: `O(1)` per op, plus `O(readers)` per changed binding;
@@ -391,7 +390,7 @@ woken, modules rebuilt, slices set, and that a 1000-module crate gives the same 
 
 ## 11. Coordination
 
-- **frontend-fast** (listed Datalog name resolution, [fast.md](../lanes/frontend/fast.md) §1):
+- **frontend-fast** (listed Datalog name resolution, [fast.md](frontend.md) §1):
   this design is that item's maintained form. fast.md §1 points here.
 - **item-hash** (window `item-hash`): consumes `ImplSetHash` (§7) and `CandidateSlice::hash`
   (§8) as the global-table inputs of a coherence or trait key. The identity of an impl inside

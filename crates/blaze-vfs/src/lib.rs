@@ -1,4 +1,4 @@
-//! blaze v2's files (docs/v2/plan/lanes/vfs.md section 2, docs/v2/plan/lanes/core.md section 3): a persistent, content-addressed Merkle
+//! blaze v2's files (docs/v2/plan/design/vfs.md section 2, docs/v2/plan.md section 3): a persistent, content-addressed Merkle
 //! tree, ported from blaze-next's `blaze-vfs` (`git show origin/blaze-next:crates/blaze-vfs`).
 //!
 //! - A file's [`ContentId`] is the hash of its bytes (domain [`FILE_DOMAIN`]); a directory's
@@ -574,7 +574,7 @@ pub struct Recovered {
 }
 
 /// Counts each test thread's allocations, for the allocation-budget tests
-/// (docs/v2/plan/goals/principles.md).
+/// (docs/v2/plan.md).
 #[cfg(test)]
 #[global_allocator]
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;

@@ -1,5 +1,5 @@
 //! `#[blaze::noalloc]` and `#[blaze::nonblocking]` over the stand-in toolchain
-//! (docs/v2/plan/lanes/effects.md).
+//! (docs/v2/plan/design/effects.md).
 
 use super::{
     fixture::{crate_named, db_with},

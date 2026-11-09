@@ -92,7 +92,7 @@ and to `Target`:
 ```
 
 What the linker does with each relocation kind, so codegen emits the right one, is in
-`docs/v2/plan/lanes/link/notes.md` ("Relocations codegen emits").
+`docs/v2/plan.md` ("Relocations codegen emits").
 
 > applied: by codegen (`docs/v2/requests/codegen.md` section 2: `unwind`, `lines`, `Line`, `Unwind`, `Static` with `data`, `Init`, `Target::Weak` in `crates/blaze-codegen/src/lib.rs`).
 
@@ -263,7 +263,7 @@ the slots whose target or neighbour changed instead of re-encoding every opcode.
 ## 7. From speed-link-edge-elf: what the ELF writer's speed needs from the core
 
 Status: open. For lead `link` (window `link-next1`). Notes:
-`docs/v2/plan/lanes/link/speed-link-edge-elf.md`.
+`docs/v2/plan.md`.
 
 1. **Request 5 above, for ELF too.** The ELF side, once `Data::Input` and `Name` exist:
    `elf/read.rs` `section()` gives `Data::Input(sh_offset..sh_offset + sh_size)` for every
@@ -353,7 +353,7 @@ slot (`Target::Function(old)`). For an edit, pass the old key in `removed`, the 
 `added`, and `(old, new)` in `Change::slots`; for a tier-up, codegen's `TieredUp::replaced`
 pairs. Without it the edit links (the new function gets a slot of its own) but callers keep
 calling the old code, or the link fails naming a caller of the removed function. See
-`docs/v2/plan/lanes/link/notes.md`, "The jump table".
+`docs/v2/plan.md`, "The jump table".
 
 > forwarded to codegen: whoever builds the `Change` from codegen's output is codegen's live path. > forwarded to coordinator: the integration side, listed in the requests report.
 
@@ -376,7 +376,7 @@ calling the old code, or the link fails naming a caller of the removed function.
 
 Status: open. For lead `link` (`crates/blaze-link/src/live.rs`, `commit.rs`, `table.rs`). The
 `blaze-live` side is in place, and the bytes on the wire are unchanged. See
-`docs/v2/plan/lanes/link/speed-link-edge-live.md`.
+`docs/v2/plan.md`.
 
 1. `live.rs` `message()`: each piece is copied (`self.new.bytes(piece).to_vec()`) into an owned
    `Patch`. `blaze_live::patch::PatchRef<'a>` has the same fields, borrowing: `code` and `data`
@@ -657,7 +657,7 @@ numbers in "MAY BE UNSOUND (n)" below refer to this list:
 
 `speed-link-edge-live` says `slots/` now follows `docs/v2/plan/design/unsafe.md`: the message is read,
 not mapped, and every block has one op and a SAFETY comment (details in
-`docs/v2/plan/lanes/link/speed-link-edge-live.md`, section "Unsafe"). A rescan agrees: in `slots/`,
+`docs/v2/plan.md`, section "Unsafe"). A rescan agrees: in `slots/`,
 the three lints leave only `slots/unix.rs:74`, where the comment's placement is worth a check (two
 lines above the block). The scan's other `slots/` hits are its false positives on `extern` blocks.
 The `slots/` soundness findings still stand on the current code:
@@ -700,7 +700,7 @@ Status: open. Items a and b block jump-table patches after a rollback, and ELF p
 frames from the second one on; items c and d don't block. For lead `link` (`blaze-link` place
 and live writer, `blaze-splice`, `blaze-engine`'s counter code). Applied in `crates/blaze-live`
 by speed-link-edge-live, unbuilt (this lane may not build); details in
-`docs/v2/plan/lanes/link/speed-link-edge-live.md`, section "Safety audit".
+`docs/v2/plan.md`, section "Safety audit".
 
 What was applied for "## From safety-audit" / blaze-live:
 - Every comment and split the audit proposed, in `lib.rs`, `linux.rs`, `macos.rs`, `windows.rs`,
@@ -1188,7 +1188,7 @@ piece is `SHF_LINK_ORDER` to the function's section (`!associated`); on Mach-O t
 COMDAT. Keep the counters and the PC table in the same order, one entry each per kept block:
 `fuzz/src/raw.rs` (`Coverage::new`) refuses a module whose counts differ.
 
-Why: the fuzz engine reads every counter twice per run (`docs/v2/plan/lanes/safety/speed-of-light.md`,
+Why: the fuzz engine reads every counter twice per run (`docs/v2/plan/design/unsafe.md`,
 "The fuzzer": the bound is `2N/64` cycles for N counters). A counter of a function that was
 dropped can never count, but if it stays in the section it is still scanned on every run. For a
 target linking std, salsa and hir-def, most of the instrumented functions are dead in the binary.
@@ -1239,7 +1239,7 @@ the same either way.
 
 For whoever holds the core now (`requests-link-fuzz-core-model-next1`: `model.rs`, `native.rs`,
 `state.rs`; `requests-link-fuzz-core-stage`: `file.rs`, `stage.rs`, `write.rs`). The bounds and
-arithmetic are in `docs/v2/plan/lanes/link/speed-of-light.md`, "ELF writer and readers" and
+arithmetic are in `docs/v2/plan.md`, "ELF writer and readers" and
 "Mach-O writer and readers". Each item is independent. None changes a byte of any output.
 
 1. **Diff a writer's part by block, as synthetic regions are** (`file.rs` `Stage::dirty`). Today
@@ -1355,7 +1355,7 @@ moves the crate onto blaze-mem and can apply these with its own changes.
    (it is listed there and used nowhere in that crate's sources), and the root's `bumpalo`
    (coordinator).
 
-Why: one implementation per primitive (docs/v2/plan/lanes/dedup.md: `align_up` and friends,
+Why: one implementation per primitive (docs/v2/plan/design/data.md: `align_up` and friends,
 arenas: `blaze-mem`). The test that held `reloc::align_up` now lives in
 `crates/blaze-mem/src/align/tests.rs` (the copy kept there as the reference).
 
@@ -1367,7 +1367,7 @@ Status: open
 ## 19. From speed-link-edge-sol-live: a patch writes no read-only page of the image (`place.rs`, `live.rs`)
 
 Status: open, does not block. For lead `link`. See "The live runtime" in
-`docs/v2/plan/lanes/link/speed-of-light.md`.
+`docs/v2/plan.md`.
 
 What a patch writes on Linux, by class: `Class::Patch` goes through the runtime's RW alias of
 the patch code region (0 system calls, 0 TLB shootdowns), `PatchData`, `Data` and `Table` are in

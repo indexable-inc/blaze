@@ -22,7 +22,7 @@ Where: `crates/ide-db/src/lib.rs` (`impl SourceDatabase for RootDatabase`, coord
 `impl SourceDatabase for` that lands before integration (`rg 'impl.*SourceDatabase for' crates`).
 `hir-def`'s `TestDB` already has it.
 
-Why: the def-map collector expands each round's macros in parallel (docs/v2/plan/lanes/db.md, "Parallel
+Why: the def-map collector expands each round's macros in parallel (docs/v2/plan.md, "Parallel
 macro expansion"); each worker thread reads through its own fork.
 
 > applied: superseded by the `run_all` section below; `fork` is gone from `crates/ide-db/src/lib.rs` and `crates/hir-ide/src/test_db.rs`.
@@ -157,7 +157,7 @@ Also: a crate's content ID names its root file by path, so `CrateGraphBuilder::s
 `FileSet`) and stop with a panic naming the file otherwise. Every caller found sets the roots
 first (`FileChange::apply`, load-cargo, test-fixture, blaze-wasm, the doctest crates).
 
-Why: docs/v2/plan.md section 2 and docs/v2/plan/reference/crates.md "IDs": results keyed by input hashes,
+Why: docs/v2/plan.md section 2 and docs/v2/plan.md "IDs": results keyed by input hashes,
 never by revision, so views with equal inputs share them; a setter that changes a value without
 its ID would let a stale result be reused.
 
@@ -194,7 +194,7 @@ address that can be reused. db-expand's sites and what each still lacks:
 
 Why: without them these four queries don't compile under db-salsa's macros; with them an evicted
 parse or expansion that recomputes to the same value is backdated, so its readers don't rerun
-(docs/v2/plan/lanes/db.md, "The LRU caps go away as a correctness problem").
+(docs/v2/plan.md, "The LRU caps go away as a correctness problem").
 
 > forwarded to format: `impl<T> Hash for syntax::Parse<T>` (`crates/syntax/src/lib.rs`) and `Hash` on `mbe::ValueResult` (`crates/mbe/src/lib.rs:341`); neither is there yet.
 
@@ -239,7 +239,7 @@ Where, and what each does:
   hir-def's `TestDB` (`RunOrder` in `test_db.rs`) also runs a batch reversed or strided, so
   `nameres/tests/batch_order.rs` can check that no def map depends on the order.
 
-Why: docs/v2/plan/lanes/db.md, "One database, shared by every thread", and its Done when item
+Why: docs/v2/plan.md, "One database, shared by every thread", and its Done when item
 "no salsa per-thread handles; expansion rounds are plane tasks". This replaces the `fork`
 section above.
 
@@ -428,7 +428,7 @@ macro` reachability", part (2). Part (1) (`global_asm!`) waits on format's item-
 ## frontend-tokens: stop deriving `Clone` on what holds a `DeclarativeMacro` or a `tt::TopSubtree`
 
 Why: the new bar says big types in hot crates must not derive `Clone`
-(docs/v2/plan/goals/principles.md). `mbe::DeclarativeMacro` (its rules, matchers and templates)
+(docs/v2/plan.md). `mbe::DeclarativeMacro` (its rules, matchers and templates)
 and `tt::TopSubtree` (four columns) derive it only because hir-expand needs it to compile:
 
 - `hir-expand/src/declarative.rs:24`: `DeclarativeMacroExpander` derives `Clone`, and so needs
@@ -509,7 +509,7 @@ crates; doing it first would break hir-expand's build.
 
 ## frontend-deps-reparse: `Attr::input` shared, `Option<Arc<AttrInput>>` (speed of light; 2026-10-29)
 
-From frontend-deps-reparse (notes: `docs/v2/plan/lanes/frontend/speed-of-light.md`).
+From frontend-deps-reparse (notes: `docs/v2/plan/design/frontend.md`).
 
 A source file's item tree is now assembled from its items' trees on every edit
 (`hir_def::item_tree::items::assemble`), which clones every attribute of the file. An `Attr`'s
@@ -742,7 +742,7 @@ directly.
 
 ## frontend-tokens: token trees carry the parser's words (item 4)
 
-Why: item 4, design in docs/v2/plan/lanes/frontend/tokens.md, "Item 4". A token tree will keep
+Why: item 4, design in docs/v2/plan/design/frontend.md, "Item 4". A token tree will keep
 the parser's word for each token, so that no expansion or fragment is converted to parser input.
 Three call sites in hir-expand change when the matching tt, syntax-bridge and mbe parts land.
 I will add the new entries next to the old ones first, so nothing breaks before then:
@@ -1130,7 +1130,7 @@ shows only `dyn SourceDatabase` lines until frontend-db-def's rewrite lands, the
 
 ### 12. Attributes are read off the live parse, so every body edit re-runs them (design)
 
-Counted in `docs/v2/plan/lanes/db/speed-of-light.md`, section "hir-def: attributes, interned
+Counted in `docs/v2/plan.md`, section "hir-def: attributes, interned
 locs, lang items (speed-hir-sol-defs)".
 - What happens: `attrs_source` reads the item through `loc.source(db)`, which reads `parse` and
   `ast_id_map`, and both change on every edit of the file. The signature queries read
@@ -1167,7 +1167,7 @@ Status: open
 
 From `speed-hir-sol-nameres` (round 2 of `speed-hir`; report
 `/tmp/blaze-lanes/v2-speed-hir-sol-nameres.md`). The bounds behind the two design edits (1, 2)
-are in `docs/v2/plan/lanes/db/speed-of-light.md`, "hir-def: name resolution
+are in `docs/v2/plan.md`, "hir-def: name resolution
 (speed-hir-sol-nameres)". Files: db-expand-names' (`nameres.rs`, `nameres/` but `facts/`,
 `item_scope.rs`, `resolver.rs`) and db-expand's (`find_path.rs`, `import_map.rs`, `lib.rs`).
 `nameres/facts/` is in `docs/v2/requests/frontend-nameres.md` under the same heading. Line numbers are
@@ -2712,7 +2712,7 @@ untracked reader of it now, so the executed-query lists name the new query.
 ## frontend-tree: hir-expand files.rs: onto views (1)
 
 From frontend-tree-move-expand (child of frontend-tree, frontend.md item 16). These are the view
-twins of `files.rs`' handle APIs, declared in `docs/v2/plan/lanes/frontend/tree-move-expand.md`.
+twins of `files.rs`' handle APIs, declared in `docs/v2/plan/design/frontend.md`.
 The frontend-tree-move children of hir-def, hir, hir-ty-mir, blaze-diagnostics and blaze-engine
 program against them. Every hunk adds code; nothing existing changes meaning. It needs nothing
 first: `HirFileId::root` and `AstId::to_view` are already in, and request 2's
@@ -3193,7 +3193,7 @@ Why: this is the twin of `original_ast_node_rooted` (`hir/src/semantics.rs`).
 
 ## frontend-tree: hir-def resolver.rs: onto views (1)
 
-From frontend-tree-move-def-sigs (notes `docs/v2/plan/lanes/frontend/tree-move-def-sigs.md`). Owner
+From frontend-tree-move-def-sigs (notes `docs/v2/plan/design/frontend.md`). Owner
 of the file now: db-expand-names-next2.
 
 needs: `## frontend-tree: hir-def src.rs: onto views (1)` (frontend-tree-move-def, `HasSource::source_view`);
@@ -3333,13 +3333,13 @@ needs: `## frontend-tree: hir-def src.rs: onto views (1)` (frontend-tree-move-de
 
    Why: the name read off the view (`Name::text` is the same `&str`), with no cursor.
 
-> applied by db-expand (db-expand-items, 2026-10-29 21:40): both edits, as written. `diagnostic_item/tests.rs` uses no handle now. It calls `source_view`, which doesn't exist yet: the heading it needs, `## frontend-tree: hir-def src.rs: onto views (1)`, is not filed in any `docs/v2/requests/` file (`docs/v2/plan/lanes/frontend/tree-move-def.md` says it will be, here, for db-expand-items). Until that lands, this test file doesn't build. I apply the `src.rs` heading when it is filed.
+> applied by db-expand (db-expand-items, 2026-10-29 21:40): both edits, as written. `diagnostic_item/tests.rs` uses no handle now. It calls `source_view`, which doesn't exist yet: the heading it needs, `## frontend-tree: hir-def src.rs: onto views (1)`, is not filed in any `docs/v2/requests/` file (`docs/v2/plan/design/frontend.md` says it will be, here, for db-expand-items). Until that lands, this test file doesn't build. I apply the `src.rs` heading when it is filed.
 > db-expand-items, 21:45: the `src.rs` heading is filed and applied now, so `source_view` exists.
 
 ## frontend-tree: hir-expand lib.rs: onto views (2)
 
 From frontend-tree-move-expand. These are the view twins of `lib.rs`' handle APIs
-(`docs/v2/plan/lanes/frontend/tree-move-expand.md`), plus `ExpansionInfo`'s views. It needs
+(`docs/v2/plan/design/frontend.md`), plus `ExpansionInfo`'s views. It needs
 request 3 (`AttrId::find_attr_range_view`, `attrs.rs`) and request 1 (`to_in_file_view`). Land
 1, 2 and 3 together.
 
@@ -3785,7 +3785,7 @@ Err(other), })`) stays as it is and now ends `of_parent_kind`.
 
 ## frontend-tree: hir-def visibility.rs: onto views (4)
 
-From frontend-tree-move-def-sigs (notes `docs/v2/plan/lanes/frontend/tree-move-def-sigs.md`).
+From frontend-tree-move-def-sigs (notes `docs/v2/plan/design/frontend.md`).
 Owner of the file now: db-expand-paths. Adds the edge twin `visibility_from_ast_view` (callers in
 `hir`, `blaze-items`, `hir-ty-codegen` move to it under their own headings); the handle version
 stays, written over the twin, until its last caller moves.
@@ -4010,7 +4010,7 @@ needs: `## frontend-tree: hir-def src.rs: onto views (1)` (frontend-tree-move-de
 ## frontend-tree: hir-def nameres.rs: onto views (1)
 
 From frontend-tree-move-def-nameres (child of frontend-tree-move-def, frontend.md item 16; notes
-`docs/v2/plan/lanes/frontend/tree-move-def-nameres.md`). Owner of the files: db-expand-names-next2.
+`docs/v2/plan/design/frontend.md`). Owner of the files: db-expand-names-next2.
 The view twins of a module's source, which `hir` re-exports (`frontend-tree-move-hir`) and this
 crate's tests use. Every hunk adds code; the handle versions stay until their callers outside
 hir-def move. Needs nothing first (`AstId::to_view` and `Parse::view` are in the tree).
@@ -4473,7 +4473,7 @@ paragraph above.
 ## frontend-tree: hir-expand attrs.rs + cfg_process.rs: onto views (3)
 
 From frontend-tree-move-expand. These are the view twins of `attrs.rs`' handle APIs
-(`docs/v2/plan/lanes/frontend/tree-move-expand.md`). It needs nothing first; requests 1 and 2
+(`docs/v2/plan/design/frontend.md`). It needs nothing first; requests 1 and 2
 use it. `expand_view_cfg_attr` becomes public as `expand_cfg_attr_view` (the convention's
 name), and its one caller in `cfg_process.rs` follows.
 
@@ -5374,7 +5374,7 @@ file) and `## frontend-tree: hir-def expr_store/source_map.rs: onto views (1)` (
 ## frontend-tree: hir-def src.rs: onto views (1)
 
 From `frontend-tree-move-def` (frontend.md item 16, notes
-`docs/v2/plan/lanes/frontend/tree-move-def.md`), for `db-expand-items`. The view twins
+`docs/v2/plan/design/frontend.md`), for `db-expand-items`. The view twins
 `HasSource::source_view`, `HasChildSourceView::child_source_view`, `use_tree_to_view` and
 `use_trees_view` are added, and the handle versions of `use_tree_to_ast` and the `UseId`/`VariantId`
 `child_source` become wrappers over them. Their callees move onto views, so the handle walks
@@ -5828,7 +5828,7 @@ From `frontend-tree-move-def`, for `db-expand-items`. Adds the edge twin
 needs: `## frontend-tree: hir-def src.rs: onto views (1)` (above, `HasSource::source_view`);
 frontend-tree-move-expand's `## frontend-tree: hir-expand eager.rs: onto views (5)`
 (`expand_eager_macro_input_view(db, krate, macro_call: view::MacroCall<'_>, ast_id, ..)`, declared
-in `docs/v2/plan/lanes/frontend/tree-move-expand.md`).
+in `docs/v2/plan/design/frontend.md`).
 
 ### Hunk 1
 
@@ -5923,14 +5923,14 @@ New:
 
 Why: the eager call's input read through a view, no handle made.
 
-> applied by db-expand (db-expand-items, 2026-10-29 21:45): hunks 1 to 3 as written (`file_id_and_params_of_view` beside `file_id_and_params_of`, `macro_call_as_call_id` on `expand_eager_macro_input_view(.., ast_id.to_view(db), ..)`). hot_lint is clean. Not in the code yet: `hir_expand::eager::expand_eager_macro_input_view`. It is only declared in `docs/v2/plan/lanes/frontend/tree-move-expand.md`, and no `## frontend-tree: hir-expand eager.rs: onto views` heading is filed in `docs/v2/requests/`. Until it lands, `lib.rs` doesn't build.
+> applied by db-expand (db-expand-items, 2026-10-29 21:45): hunks 1 to 3 as written (`file_id_and_params_of_view` beside `file_id_and_params_of`, `macro_call_as_call_id` on `expand_eager_macro_input_view(.., ast_id.to_view(db), ..)`). hot_lint is clean. Not in the code yet: `hir_expand::eager::expand_eager_macro_input_view`. It is only declared in `docs/v2/plan/design/frontend.md`, and no `## frontend-tree: hir-expand eager.rs: onto views` heading is filed in `docs/v2/requests/`. Until it lands, `lib.rs` doesn't build.
 
 > forwarded to db-expand (db-expand-paths, which holds it; db-expand-next2 told too) (requests, pass 25).
 
 ## frontend-tree: hir-expand name.rs + mod_path.rs: onto views (4)
 
 From frontend-tree-move-expand. These are the view twins of name and path lowering from `ast`
-(`docs/v2/plan/lanes/frontend/tree-move-expand.md`). It needs nothing first and only adds code.
+(`docs/v2/plan/design/frontend.md`). It needs nothing first and only adds code.
 Callers: `hir-def` (`item_tree/lower.rs`, `expr_store/lower*.rs`, `attrs.rs`), `hir`,
 `blaze-diagnostics`.
 
@@ -6429,7 +6429,7 @@ needs: `## frontend-tree: hir-def src.rs: onto views (1)` (this file, frontend-t
 
 ## frontend-tree: hir-def signatures.rs: onto views (27)
 
-From frontend-tree-move-def-sigs (notes `docs/v2/plan/lanes/frontend/tree-move-def-sigs.md`, "In
+From frontend-tree-move-def-sigs (notes `docs/v2/plan/design/frontend.md`, "In
 place"). Owner of the file now: db-expand-sigs. Every function here is called only inside hir-def,
 so each changes in place: views by value, `use syntax::view as ast;`. `SignatureSyntax` and
 `FileOutline` keep their trees as `Arc<FlatTree>` and nodes as `SyntaxNodePtr`, so no memo
@@ -7890,7 +7890,7 @@ onto views (2)` (frontend-tree-move-expand, `MacroCallId::call_node_view`, `Macr
 
 ## frontend-tree: hir-def attrs.rs: onto views (1)
 
-From `frontend-tree-move-def-attrs` (notes `docs/v2/plan/lanes/frontend/tree-move-def-attrs.md`).
+From `frontend-tree-move-def-attrs` (notes `docs/v2/plan/design/frontend.md`).
 Why: frontend.md item 16; attributes are read for every item, so the walk borrows views of the
 database's trees, reads `&'db str` text and interns only what it keeps. `cfg_attr` goes through
 hir-expand's view expansion; the three `CfgExpr::parse_from_ast` calls become `parse_from_view`.
@@ -9394,7 +9394,7 @@ needs: `## frontend-tree: hir-expand lib.rs: onto views (2)` (frontend-tree-move
 ## frontend-tree: hir-expand eager.rs: onto views (5)
 
 From frontend-tree-move-expand. This adds `expand_eager_macro_input_view`, the view twin of
-`expand_eager_macro_input` (`docs/v2/plan/lanes/frontend/tree-move-expand.md`), with its
+`expand_eager_macro_input` (`docs/v2/plan/design/frontend.md`), with its
 recursion on views. Additive: the handle version stays until `hir-def/src/lib.rs`'s one caller
 moves, then a deletion request removes it. It needs request 2 (`ExpandTo::of_call_site_view`)
 and request 4 (`ModPath::from_src_view`).
@@ -9909,7 +9909,7 @@ Status: open (db-expand-attrs, told db-expand-sigs by tmux)
 
 ## frontend-tree: hir-def signatures.rs: outline_item/outline_root onto views (2)
 
-From frontend-tree-move-def-sigs (notes `docs/v2/plan/lanes/frontend/tree-move-def-sigs.md`),
+From frontend-tree-move-def-sigs (notes `docs/v2/plan/design/frontend.md`),
 for frontend-tree-move-def-attrs' `## frontend-tree: hir-def attrs.rs: onto views (1)`, which
 calls these two. Owner of the file now: db-expand-sigs. Both are called only from `attrs.rs`, so
 they change in place to the forms attrs asked for, borrowing the `file_outline` memo's tree: no
@@ -10022,7 +10022,7 @@ frontend-tree-move-def-nameres, are in `facts/`. Items 1-8 are applied in my fil
 
 ## frontend-tree: hir-def attrs/docs.rs: onto views (2)
 
-From `frontend-tree-move-def-attrs` (notes `docs/v2/plan/lanes/frontend/tree-move-def-attrs.md`).
+From `frontend-tree-move-def-attrs` (notes `docs/v2/plan/design/frontend.md`).
 Why: frontend.md item 16; docs are read through the attribute walk, so they borrow views of the
 database's trees too. The text is built exactly as before: doc comment text and unescaped
 `#[doc = ".."]` values are lent `&'t str`/`Cow<'t, str>` pushed into the worker's buffer, and the
@@ -10422,7 +10422,7 @@ same type). The `a_block_may_start_with_inner_docs` test reads text only.
 
 ## frontend-tree: hir-def attrs/stability.rs: onto views (3)
 
-From `frontend-tree-move-def-attrs` (notes `docs/v2/plan/lanes/frontend/tree-move-def-attrs.md`).
+From `frontend-tree-move-def-attrs` (notes `docs/v2/plan/design/frontend.md`).
 Why: frontend.md item 16; stability reads attributes through the same walk as attrs.rs, so it
 borrows views too: the list items hold `Copy` tokens and string views (the clones of cursors
 go), key text is lent `&'t str`, and a value is interned once, as before. The block owner is
@@ -10832,7 +10832,7 @@ and `field.value.syntax().text_range()`.
 ## frontend-tree: hir-expand lib.rs, declarative.rs, span_map.rs, fn_macro.rs, attrs.rs, budget_tests.rs: bodies onto views (6)
 
 From frontend-tree-move-expand. This moves hir-expand's own build-path bodies off handles
-(`docs/v2/plan/lanes/frontend/tree-move-expand.md`, "Bodies moved"). Each reads the same nodes
+(`docs/v2/plan/design/frontend.md`, "Bodies moved"). Each reads the same nodes
 of the same trees and gives the same result. A handle conversion of a flat node
 (`syntax_node_to_token_tree`) already runs the `FlatConverter` that `call_input` runs. With the
 last of its callers gone, `HirFileId::parse_with_map` goes. It needs requests 1, 2 and 3, and
@@ -11583,7 +11583,7 @@ own item keeps.
 
 ## frontend-tree: hir-def attrs/tests.rs: onto views (4)
 
-From `frontend-tree-move-def-attrs` (notes `docs/v2/plan/lanes/frontend/tree-move-def-attrs.md`).
+From `frontend-tree-move-def-attrs` (notes `docs/v2/plan/design/frontend.md`).
 Why: frontend.md item 16; the attribute readers take views (headings (1)-(3)), so their tests
 feed them views. The differential tests that compare the word index with the string match it
 replaced keep their reference side on handles and feed the new side the view of the same parse
@@ -12188,7 +12188,7 @@ handles. Every other test reads views or ids.
 From `frontend-tree-move-diag-lints` (for `blaze-diagnostics`' `Walk::attrs`, which callers
 iterate; told `frontend-tree-move-expand`). Needs `## frontend-tree: hir-expand attrs.rs +
 cfg_process.rs: onto views (3)` first (it names `expand_cfg_attr_view`); additive, nothing else
-changes. Notes: `docs/v2/plan/lanes/frontend/tree-move-diag-lints.md`.
+changes. Notes: `docs/v2/plan/design/frontend.md`.
 
 File `crates/hir-expand/src/attrs.rs`.
 
@@ -12306,7 +12306,7 @@ in one place: the same steps as `expand_cfg_attr_view` with the cfg in hand.
 ## frontend-tree: hir-def src.rs: use_tree_sources_view, the UseId child source as views (2)
 
 From `frontend-tree-move-diag-lints-uses` (frontend.md item 16, notes
-`docs/v2/plan/lanes/frontend/tree-move-diag-lints-uses.md`), for whoever holds `src.rs`
+`docs/v2/plan/design/frontend.md`), for whoever holds `src.rs`
 (`db-expand-items`). `blaze-diagnostics` `lints/names/imports/used.rs` keys each use tree's binding
 by `ImportId { use_, idx: Idx<ast::UseTree> }`. `use_trees_view` gives `Idx<view::UseTree>` indices,
 and blaze-diagnostics has no `la_arena` dependency to turn them back, so it needs the `UseId`
@@ -12388,7 +12388,7 @@ Status: applied
 
 ## frontend-tree: hir-expand lib.rs + files.rs: original_call_node_view, and the handle functions nobody calls go (9)
 
-From frontend-tree-move-expand (`docs/v2/plan/lanes/frontend/tree-move-expand.md`, "Deleted"). Needs
+From frontend-tree-move-expand (`docs/v2/plan/design/frontend.md`, "Deleted"). Needs
 `## frontend-tree: hir-expand lib.rs: onto views (2)` (in: `MacroCallLoc::to_node_view`) and nothing else.
 9.1 adds the twin of `HirFileId::original_call_node`; 9.2-9.7 delete four handle functions with no
 caller left in any crate. `view_tests.rs` (mine) no longer names any of them.
@@ -12613,7 +12613,7 @@ Status: open (db-expand-attrs; told codegen-api-link by tmux).
 ## frontend-tree: hir-expand builtin/derive_macro.rs: onto views (10)
 
 From frontend-tree-move-expand-derive (window `frontend-tree-move-expand-derive`; notes
-`docs/v2/plan/lanes/frontend/tree-move-expand-derive.md`). The built-in derives read their own
+`docs/v2/plan/design/frontend.md`). The built-in derives read their own
 item (the parse of the derive's token tree) in place, through views. `CoercePointee` writes its
 impls as tokens, with no `SyntaxEditor`, no `make`, no green rewrite and no reparse. Every
 expansion is the same tree, with the same spans and errors. The one exception is in the notes: a
@@ -15194,7 +15194,7 @@ Status: open.
 ## frontend-tree: hir-expand builtin/derive_macro.rs: onto views (11)
 
 From frontend-tree-move-expand-derive (window `frontend-tree-move-expand-derive-next1`; notes
-`docs/v2/plan/lanes/frontend/tree-move-expand-derive.md`). Half of (10), which is withdrawn (the
+`docs/v2/plan/design/frontend.md`). Half of (10), which is withdrawn (the
 split `## db-expand-views: (10) split so the view move changes no output` asked for, option 2).
 The other half is (12), below.
 

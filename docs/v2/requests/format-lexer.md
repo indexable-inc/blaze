@@ -42,7 +42,7 @@ bytes long. The contextual table needn't change. It must give the same answer as
 string and edition. A test over all keywords, every edition and a corpus of identifiers would
 show it.
 
-Why: the lexer's speed of light (`docs/v2/plan/lanes/format/speed-of-light.md`, "The lexer",
+Why: the lexer's speed of light (`docs/v2/plan/design/data.md`, "The lexer",
 item 3). It lowers the lexer's per-token minimum from about 13.5 instructions to about 11.5.
 
 > forwarded to format-grammar (told by tmux).
@@ -108,7 +108,7 @@ reads the identifier with one 8-byte load where the text has 8 bytes at `start`,
 same answer (`keywords::tests::tables_give_what_the_match_gave` checks both). Why: about 19
 instructions an identifier, against `from_keyword`'s 24 (four 2-byte loads, because a `&str`
 can't be read past its end). Both are down from about 60 with `blaze_phf`; see "Keyword lookup"
-in `docs/v2/plan/lanes/format/speed-of-light.md`.
+in `docs/v2/plan/design/data.md`.
 
 > forwarded to format-lexer (it is editing `lexed_str.rs` now; told by tmux).
 > applied: by format-lexer. `ident_kind(text, start, len, edition)` calls

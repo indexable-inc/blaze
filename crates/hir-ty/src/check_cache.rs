@@ -1,5 +1,5 @@
 //! A dependency's bodies, checked once for everyone
-//! (docs/v2/plan/lanes/frontend/fast-bodies-cache-bodies.md): for each body of a dependency
+//! (docs/v2/plan/design/frontend.md): for each body of a dependency
 //! crate, what codegen reads of its check, its inference result and whether its borrow check
 //! passed, kept in the store beside frontend-deps' image as one part per crate ([`encode`]) and
 //! given to another process's database ([`set_served`]). `infer_body_query` returns a served

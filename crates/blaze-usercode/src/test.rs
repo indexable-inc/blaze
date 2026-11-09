@@ -1,4 +1,4 @@
-//! Tests (docs/v2/plan/lanes/usercode.md section 6.5; #1443, #227, #1330): run only the tests an edit
+//! Tests (docs/v2/plan.md section 6.5; #1443, #227, #1330): run only the tests an edit
 //! reached, each in a process of its own forked from its binary, on one queue over all cores.
 //!
 //! - [`select`]: whether a test runs. Each test's reached functions are recorded by code hash
@@ -20,7 +20,7 @@
 //! (`blaze_testsel::select::{choose, keep}`), [`select::select`], [`select::record`] and
 //! [`select::Test::identity`] retire.
 //!
-//! The costs and the fastest known way of each part: docs/v2/plan/lanes/usercode/tests.md.
+//! The costs and the fastest known way of each part: docs/v2/plan.md.
 
 pub mod queue;
 pub mod select;

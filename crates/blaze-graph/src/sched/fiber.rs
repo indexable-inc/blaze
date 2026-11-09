@@ -1,4 +1,4 @@
-//! The fibers driver of the scheduler (docs/v2/plan/lanes/sched.md, phase 2): one worker thread per
+//! The fibers driver of the scheduler (docs/v2/plan/design/fibers.md, phase 2): one worker thread per
 //! core of the shape, each running jobs on stackful fibers ([`super::stack`]). A job that waits switches
 //! back to its worker, which tells the scheduler and runs whatever it decides next; the waiting job
 //! holds no thread, and resumes, on whichever core the scheduler says, when what it waits for is
@@ -165,7 +165,7 @@ pub(super) fn next_fiber() -> u32 {
 // in its job's slot), never while it runs. Its stack then holds the driver's frames (an
 // `Arc<Shared>`, the `Yielder` and `Cx`, which only the fiber itself touches, and a payload
 // `J: Send`) and the job's frames below a wait, which phase 2's audit
-// (docs/v2/plan/lanes/sched.md) holds to `Send`: no thread-local borrow, lock guard or `Rc`
+// (docs/v2/plan/design/fibers.md) holds to `Send`: no thread-local borrow, lock guard or `Rc`
 // across a wait; `NoWait` guards are checked at every switch (`Cx::switch`).
 unsafe impl<J: Send> Send for Fiber<J> {}
 

@@ -5,7 +5,7 @@ date: 2026-10-30
 ---
 # Requests from lane usercode-macros
 
-Proc-macro expansions as traced runs of user code (docs/v2/plan/lanes/usercode.md, #1297,
+Proc-macro expansions as traced runs of user code (docs/v2/plan.md, #1297,
 #805). The code in `crates/blaze-expand/`, `crates/blaze-macro-wasm/`, `crates/proc-macro-api/`
 and `crates/proc-macro-srv/` is written against exactly the items below. None of it has been
 built: the lane may not build.
@@ -103,7 +103,7 @@ crates or add `native-proc-macro2`, `native-serde-derive`, `native-thiserror-imp
 
 ## 5a. fastcompile: take the proc-macro bridge
 
-What blaze has of the bridge, for change 20, is in docs/v2/plan/lanes/usercode/macros.md,
+What blaze has of the bridge, for change 20, is in docs/v2/plan/design/proc-macros.md,
 "For fastcompile: the proc-macro bridge": blaze's own `proc_macro`, the shims it calls, span
 numbering, the wire format and lexer, questions as keyed inputs, keys, stateful macros, and the
 `difference` comparison. Take `crates/blaze-expand/src/native/` (the bridge) into your crate
@@ -113,7 +113,7 @@ when you want it, by telling me (or the usercode lane) and I'll drop it from bla
 
 ## 6. Speed: what the expansion path still waits on outside my paths
 
-Under "everything is ours, for the best performance possible" (docs/v2/plan/goals/principles.md).
+Under "everything is ours, for the best performance possible" (docs/v2/plan.md).
 The target is an expansion found in the store, which is cheaper than rustc's in-process bridge
 run of the same macro. That cost is one BLAKE3 of the call, one lookup, a stat of each traced
 file, and a decode of the expansion in place.

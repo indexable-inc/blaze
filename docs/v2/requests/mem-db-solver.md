@@ -5,10 +5,10 @@ date: 2026-10-29
 ---
 # Requests of mem-db-solver
 
-mem-db-solver's part of mem-db's contract (`docs/v2/plan/lanes/mem/db.md`, `docs/v2/requests/mem-db.md`):
+mem-db-solver's part of mem-db's contract (`docs/v2/plan/design/memory.md`, `docs/v2/requests/mem-db.md`):
 `crates/hir-ty/src/next_solver/` (except `interner/tls_cache.rs`, mem-db's), `vendor/rustc_type_ir/`
 and `vendor/rustc_next_trait_solver/`. Notes, the design argument and the speed-of-light bound:
-`docs/v2/plan/lanes/mem/db-solver.md`. Every path here belongs to lane db and its children
+`docs/v2/plan/design/memory.md`. Every path here belongs to lane db and its children
 (solver-sync and its children, db-ty-port-solver), none of them DONE as a lane, so every change is
 a request: who, file and line, the code before and after, why, and the allocation-budget test.
 
@@ -711,7 +711,7 @@ under rustc_next_trait_solver's test module, against `SolverScratch` alone:
 
 ```rust
 //! What the solver's inference contexts and search graphs allocate, kept per worker between
-//! them (docs/v2/plan/lanes/mem/db-solver.md): each is emptied, its capacity kept, when its
+//! them (docs/v2/plan/design/memory.md): each is emptied, its capacity kept, when its
 //! context ends, and the next one built on the worker takes it, so a warm worker builds
 //! contexts without allocating.
 

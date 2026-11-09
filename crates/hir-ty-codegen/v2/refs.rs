@@ -1,4 +1,4 @@
-//! The references of an instance's code, from a walk of its MIR (docs/v2/plan/lanes/codegen.md):
+//! The references of an instance's code, from a walk of its MIR (docs/v2/plan/design/codegen.md):
 //! what [`blaze_codegen::backend::Described::refs`] lists before the instance is compiled, and
 //! all that the IR of any unit of it may ask for by place ([`places::Placer::listed`]).
 //!

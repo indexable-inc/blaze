@@ -3045,7 +3045,7 @@ binding (`ValueNs`). Ideally it is a dense column rather than a hash map. Why: r
 bodies over the store (`lints/names/dead/mark/body.rs`) and reads every other resolution from
 inference. Value paths it must still resolve itself: `update_to_inner_scope` and
 `resolve_path_in_value_ns_fully` for each path, about 13 ms of its 20 ms on a 100,000-line
-crate (`docs/v2/plan/lanes/diagnostics/speed-of-light.md`). Inference already resolves each
+crate (`docs/v2/plan.md`). Inference already resolves each
 of these paths to type it, so recording the result costs one store per path. Any other pass
 that maps a body path back to a definition would read the same column. `Walk::resolve`
 already tries what inference recorded first, so with this column the dead-code side gains one
@@ -3106,7 +3106,7 @@ Status: open
 
 ## frontend-db: blaze-diagnostics takes `&Db` (frontend.md item 15; 2026-10-29)
 
-From `frontend-db` (notes `docs/v2/plan/lanes/frontend/db.md`). Every query takes the one
+From `frontend-db` (notes `docs/v2/plan/design/frontend.md`). Every query takes the one
 concrete `base_db::Db`, so a memo hit is a static call. When your lane is done (or now, if
 nothing else of yours is open in these files), run:
 
@@ -3382,7 +3382,7 @@ Status: applied by speed-hir (2026-10-29, for diagnostics); hir-expand's side is
 ## dedup: one diagnostic model, `Level` and emitter, shared with `blaze-lints` (from dedup-scan-diag)
 
 From `dedup-scan-diag` (report `/tmp/blaze-lanes/v2-dedup-scan-diag.md`, notes
-`docs/v2/plan/lanes/dedup/scan-diag.md`). `blaze-lints` had copies of `model.rs` (`Span`,
+`docs/v2/plan/design/data.md`). `blaze-lints` had copies of `model.rs` (`Span`,
 `Expansion`, `MacroKind`, `MultiSpan`, `SpanLabel`, `Sublevel`, `Child`, `Applicability`,
 `SuggestionStyle`, `Suggestion`, a `Diagnostic` builder), `emit.rs` (the text and JSON emitter),
 `lints::registry::Level` and `lints::CommandLine::parse`. `blaze-diagnostics`' are the better
@@ -4392,7 +4392,7 @@ Why: `lints/names/{imports,stability,items}` and `dead` each call `Semantics::re
 ancestors, a `SourceAnalyzer` for the body, a source-map lookup and a resolver for the scope,
 about 3,000 cycles. Over a 100,000-line crate's 180,000 body paths that is about 150 ms per
 pass, several passes over the same paths, where reading a recorded table is about 0.5 ms
-(docs/v2/plan/lanes/diagnostics/speed-of-light.md, "Names"). It is rustc's design: each path
+(docs/v2/plan.md, "Names"). It is rustc's design: each path
 in HIR carries its `Res` and `TypeckResults` holds the rest. Together with imports' request 1
 (`used_imports`), it takes the names passes to their bound.
 
@@ -4468,7 +4468,7 @@ heading of its own.)
 
 ## frontend-tree: blaze-diagnostics lints/bodies.rs: onto views (3)
 
-From `frontend-tree-move-diag-lints-bodies` (frontend.md item 16, `docs/v2/plan/lanes/frontend/tree-move-diag-lints-bodies.md`).
+From `frontend-tree-move-diag-lints-bodies` (frontend.md item 16, `docs/v2/plan/design/frontend.md`).
 Needs: `Cx::syntax_view` (frontend-tree-move-diag-lower's `cx.rs` heading). The `InFile<SyntaxNodePtr>` ids stay.
 
 1. `crates/blaze-diagnostics/src/lints/bodies.rs`, the import. Why: the two reads below are views.
@@ -4779,7 +4779,7 @@ becomes
 
 ## frontend-tree: blaze-diagnostics lints/syntax/early/validation/pretty.rs: onto views (1)
 
-From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/lanes/frontend/tree.md`).
+From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/design/frontend.md`).
 rustc's pretty printer of a `where` predicate, on `syntax::view` (`use syntax::view as ast;`):
 every node is a `Copy` view taken by value, every word written is `&'t str` lent by the tree
 into the one output buffer, and `ident(text, edition) -> String` (a `String` per identifier)
@@ -5946,7 +5946,7 @@ use syntax::view::{self as ast, AstNode as _};
 ## frontend-tree: blaze-diagnostics cx.rs: the item walk on views (1)
 
 From `frontend-tree-move-diag-lints-items` (frontend.md item 16,
-`docs/v2/plan/lanes/frontend/tree-move-diag-lints-items.md`). The item walk (`lints/names/items/walk.rs`)
+`docs/v2/plan/design/frontend.md`). The item walk (`lints/names/items/walk.rs`)
 holds views borrowed for `'db`.
 
 Needs: `## frontend-tree: blaze-diagnostics cx.rs: onto views (1)` (frontend-tree-move-diag-lower:
@@ -6134,7 +6134,7 @@ The rest of the file keeps its text: `&lit.kind` matches give `&ast::IntNumber<'
 
 ## frontend-fast-bodies-tasks: `check_planned`, a crate's check over a plan the build tells what it reaches (2026-10-29)
 
-From `frontend-fast-bodies-tasks` (notes `docs/v2/plan/lanes/frontend/fast-bodies-tasks.md`).
+From `frontend-fast-bodies-tasks` (notes `docs/v2/plan/design/frontend.md`).
 A build checks its unit beside its codegen: blaze-cargo makes a
 `hir::check::bodies::Plan` of the unit's crate, hands it to codegen's walk (which tells it the
 bodies it reaches, `Plan::reached`), and has the check run its bodies through that plan. The
@@ -6285,7 +6285,7 @@ pub use check::{Options, check_crate, check_planned};
 >   `lints/names/items/runtime_symbols.rs` (`transitive_deps(db).iter().copied()`).
 
 From frontend-tree-move-diag-lower (frontend.md item 16; notes
-`docs/v2/plan/lanes/frontend/tree-move-diag-lower.md`). Adds `Cx`'s view API beside the handle
+`docs/v2/plan/design/frontend.md`). Adds `Cx`'s view API beside the handle
 one, which `lints/` still calls until frontend-tree-move-diag-lints' headings land; a later
 heading deletes the handle versions. Needs first: `hir::view::Semantics` (frontend-tree-move-hir,
 `docs/v2/requests/db.md`), `MacroCallLoc::to_node_view` (frontend-tree-move-expand, in the tree),
@@ -6807,7 +6807,7 @@ Then `lower/const_impure.rs` drops its own `uses_cache`, and the cost in any oth
 
 ## frontend-tree: blaze-diagnostics lints/syntax/early.rs: onto views (1)
 
-From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/lanes/frontend/tree.md`).
+From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/design/frontend.md`).
 The early pass's loop hands each node of a `Tree<'db>` to the parts by value (a 24-byte `Copy` view), and `Expansions` keys trees by the call's `InFile<SyntaxNodePtr>` (an id), made from the call's view (`view::ptr`, arithmetic) instead of a handle (`MacroCallLoc::to_node_view` for `to_node`). `Expansions<'w>` becomes `Expansions<'w, 'db>` (it holds `&'w Tree<'db>`); `of_call` takes the call's view by value. `lints` takes `cx: &Cx<'_, 'db>, walk: &Walk<'db>` (its caller passes `cx.walk()`, of the same `'db`), so the lexer's gallery can borrow an expansion's text. New budget test `the_walk_allocates_nothing_per_node`: on a crate with nothing to lint, what the pass allocates less what `unused_labels` does (hir-def's `every_body` list, which grows with the crate and is not this pass's walk) is the same for 4 and 400 functions.
 
 Lands with: the parent's `## frontend-tree: blaze-diagnostics lints/syntax.rs: onto views (1)`
@@ -6964,7 +6964,7 @@ Why: onto views: nodes by value, the call's pointer from its view; the walk's al
 
 ## frontend-tree: blaze-diagnostics lints/syntax/early/validation.rs: onto views (1)
 
-From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/lanes/frontend/tree.md`).
+From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/design/frontend.md`).
 AST validation's lints on views: each node of the walk by value, casts without `clone()`, `cx::item_range_view` for `item_range`, `pretty::where_predicate` given the predicate by value, and the `patterns_in_fns_without_body` suggestion written with `pretty::push_ident` into its one `String` (the one `pretty::ident` made). Same lints, spans and order.
 
 Lands with: the parent's `## frontend-tree: blaze-diagnostics lints/syntax.rs: onto views (1)`
@@ -7414,7 +7414,7 @@ Why: onto views: a `Copy` view by value for each `&SyntaxNode`/`&ast::X`, no `cl
 
 ## frontend-tree: blaze-diagnostics lints/syntax/early/validation/parser.rs: onto views (1)
 
-From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/lanes/frontend/tree.md`).
+From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/design/frontend.md`).
 The parser's buffered lints (`varargs_without_pattern`, `break_with_label_and_loop`) on views: the node by value, the `BREAK_EXPR` cast without `clone()`, the crate root's pointer from `Tree::root` by value.
 
 Lands with: the parent's `## frontend-tree: blaze-diagnostics lints/syntax.rs: onto views (1)`
@@ -7635,7 +7635,7 @@ becomes
 
 ## frontend-tree: blaze-diagnostics lints/syntax.rs: onto views (1)
 
-From `frontend-tree-move-diag-lints` (notes `docs/v2/plan/lanes/frontend/tree-move-diag-lints.md`).
+From `frontend-tree-move-diag-lints` (notes `docs/v2/plan/design/frontend.md`).
 The early pass's `Walk`/`Tree` become views: one preorder walk over the database's trees, each
 node a 24-byte `Copy` view (no handle, no count, no clone), the columns sized once from the flat
 tree so the walk never grows them; budget and differential tests added.
@@ -9327,7 +9327,7 @@ views (1)` (the parent's `Walk`/`Tree` on views), and the heading of every other
 `Module::declaration_source_view` (frontend-tree-move-hir), `hir_expand::attrs::
 expand_cfg_attr_with_doc_comments_view` (frontend-tree-move-expand). Callers outside these
 paths (`checks/`, frontend-tree-move-diag-lower) are told the new types; `Attr::path()` stays
-for `checks/attrs/accept.rs`. Signatures: `docs/v2/plan/lanes/frontend/tree-move-diag-lints-attrs.md`.
+for `checks/attrs/accept.rs`. Signatures: `docs/v2/plan/design/frontend.md`.
 
 File `crates/blaze-diagnostics/src/lints/syntax/attrs.rs`.
 
@@ -10030,7 +10030,7 @@ Why (9 to 13): view nodes by value; the macro call is read as a view of its file
 
 ## frontend-tree: blaze-diagnostics lints/syntax/early/builtin.rs: onto views (1)
 
-From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/lanes/frontend/tree.md`).
+From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/design/frontend.md`).
 The builtin early lints (`while_true`, `unsafe_code`, `special_module_name`, `anonymous_parameters`, `ellipsis_inclusive_range_patterns`, `double_negations`, `ambiguous_negative_literals`, `redundant_semicolons`) on views: nodes and typed views by value, casts without `clone()`, `cx::item_range_view`, `global_asm!`'s call from `MacroCallLoc::to_node_view`. `allow_internal_unsafe` reads `Walk::attrs` (the walk's `cfg_attr` iterator, the same metas in the same order with the walk's `cfg`) with `find_map` instead of calling `expand_cfg_attr` itself, and `special_module_name` compares `simple_name()`'s lent `&str`. `crate_items` hands each crate-root item to a closure instead of gathering them into a `Vec` (the same items in the same order; nothing allocated that grows with the crate). The `...` suggestion formats the end pattern's `&str` instead of first making a `String` of it. `Builtin<'a, 'w>` becomes `Builtin<'a, 'w, 'db>` (it holds `&'a Expansions<'w, 'db>`).
 
 Lands with: the parent's `## frontend-tree: blaze-diagnostics lints/syntax.rs: onto views (1)`
@@ -10718,7 +10718,7 @@ Why: onto views: nodes and views by value, no clones, the crate's items visited 
 
 ## frontend-tree: blaze-diagnostics lints/syntax/early/labels.rs: onto views (1)
 
-From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/lanes/frontend/tree.md`).
+From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/design/frontend.md`).
 `unused_labels` and label shadowing on views: the label's node from `Cx::syntax_view`, the climb through expansions to each call by `MacroCallLoc::to_node_view` (every view borrows the database, so the climb crosses trees without a handle), the rib checks (`label_over`, `barrier`, `macro_definitions`) on views by value. Same labels, same order.
 
 Lands with: the parent's `## frontend-tree: blaze-diagnostics lints/syntax.rs: onto views (1)`
@@ -11124,7 +11124,7 @@ becomes
 
 1. What: `crates/blaze-diagnostics/src/emit/reference.rs` is now `emit/reference_tests.rs`
    (`#[cfg(test)] mod reference_tests;` in `emit.rs`); nothing else changed. Where:
-   `docs/v2/plan/lanes/dedup/scan-diag.md:82` names `emit/reference.rs`, and
+   `docs/v2/plan/design/data.md:82` names `emit/reference.rs`, and
    `docs/v2/requests/coordinator.md:1341` names `blaze_diagnostics::emit::reference`. Why: the module
    is test-only, declared `#[cfg(test)]` in its parent, which `tools/v2/hot_lint.py` cannot see
    (it skips `*tests.rs` files and `#[cfg(test)]` blocks within a file); the `*tests.rs` name is
@@ -11138,8 +11138,8 @@ becomes
    symbol), so it allocates on a check that writes nothing; ordering by `(file, lo, hi)` needs
    no `Span`. `Span.file` as a shared or interned name is a model and serde change, not made.
 
-> applied by dedup (2026-10-29 23:20): 1, `docs/v2/plan/lanes/dedup/scan-diag.md` names `emit/reference_tests.rs`.
-> forwarded (requests, pass 25): 1's path in `docs/v2/plan/lanes/dedup/scan-diag.md` to dedup (its notes; window `dedup`, told by tmux); 2 to the coordinator (`tools/`, on requests' coordinator list); 3 to diagnostics (`lexer.rs`; diagnostics-next2, told by tmux).
+> applied by dedup (2026-10-29 23:20): 1, `docs/v2/plan/design/data.md` names `emit/reference_tests.rs`.
+> forwarded (requests, pass 25): 1's path in `docs/v2/plan/design/data.md` to dedup (its notes; window `dedup`, told by tmux); 2 to the coordinator (`tools/`, on requests' coordinator list); 3 to diagnostics (`lexer.rs`; diagnostics-next2, told by tmux).
 > diagnostics (window 67): 3 accepted, given to the child `diagnostics-hot3` (build the `Span`
 > only for a written diagnostic; `model::Span` unchanged).
 > applied by diagnostics-hot3 (2026-10-29): 3. `Gallery::add_proc_macro_idents` orders by `cx.place(range)`, a new `Cx::place` (`cx.rs`) giving the `(FileId, TextRange)` `Cx::span` would, case for case, with no file name copied and no expansion built; its call-site case uses a new `Cx::call_of(call, named)`, which `Cx::expansion_of` now also goes through, so both agree on when a call has a call site and where. The `Span` is still built only by `Place::span` when `idents.rs` writes a diagnostic. One difference: the file is indexed by its `FileId` directly rather than through `Cx::file_of`'s name map (which could merge two files of one name).
@@ -11401,7 +11401,7 @@ becomes
 
 ## frontend-tree: blaze-diagnostics lints/syntax/early/lexer.rs: onto views (1)
 
-From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/lanes/frontend/tree.md`).
+From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/design/frontend.md`).
 The lexer's pass on views: the crate root's pointer from `Tree::root` by value; whether a proc macro's expansion is ASCII is `str::is_ascii` of the root's lent text (one SIMD scan, no chunk walk); a proc macro's identifier goes into the symbol gallery borrowing the expansion's text (`&'db str`, which the database keeps) unless NFC changes it, where the handle version copied every one into a `String`, and is looked up once (`entry`) instead of `contains_key` then `insert`. Same gallery, same order, same lints.
 
 Lands with: the parent's `## frontend-tree: blaze-diagnostics lints/syntax.rs: onto views (1)`
@@ -11545,7 +11545,7 @@ Why: onto views: text is the tree's `&'db str`, no `String` per symbol, one hash
 
 ## frontend-tree: blaze-diagnostics lints/syntax/early/lexer/keywords.rs: onto views (1)
 
-From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/lanes/frontend/tree.md`).
+From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/design/frontend.md`).
 `keyword_idents_2018`/`keyword_idents_2024` on views: one `preorder_with_tokens` of the file's view, tokens and nodes by value, the meta's path and expression as views without `clone()`. Same identifiers, same order.
 
 Lands with: the parent's `## frontend-tree: blaze-diagnostics lints/syntax.rs: onto views (1)`
@@ -12923,7 +12923,7 @@ lists, an empty item and a trailing comma) and that the per-attribute reads allo
 > clones, and tell them by tmux when it is in.
 
 From `frontend-tree-move-diag-lints-delims` (frontend.md item 16; design
-`docs/v2/plan/lanes/frontend/tree-move-diag-lints-delims.md`). `unused_parens`, `unused_braces`
+`docs/v2/plan/design/frontend.md`). `unused_parens`, `unused_braces`
 and `unused_import_braces` read views (`use syntax::view as ast;`, `Copy`, by value) instead of
 counted handles: no `SyntaxNode`, no `.clone()` of a node, no handle `cx.sema`. Macro
 expansions come from the view `Semantics` (`cx.vsema.expand_macro_call`), which handed out
@@ -16636,7 +16636,7 @@ Moved to `Phase::Lower`: `await_outside_of_async.rs` and the `#[coroutine]` erro
 
 ## frontend-tree: blaze-diagnostics lints/syntax/early/macros.rs: onto views (1)
 
-From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/lanes/frontend/tree.md`).
+From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/design/frontend.md`).
 Every node and view by value; `trailing_semicolon`, `incomplete_include`, `duplicate_attribute` and `enclosing` read views (`MacroCallLoc::to_node_view`, `AstId::to_view`, `vsema.parse`, `find_attr_range_view`, `walk.attrs`); `lints` ties the walk's `'db` to `cx`'s for `asm`.
 
 Lands with: the parent's `## frontend-tree: blaze-diagnostics lints/syntax.rs: onto views (1)`
@@ -16974,7 +16974,7 @@ Why: onto views: nodes by value, view lookups in place of handle ones
 
 ## frontend-tree: blaze-diagnostics lints/syntax/early/macros/asm.rs: onto views (1)
 
-From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/lanes/frontend/tree.md`).
+From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/design/frontend.md`).
 `Args::of`, `asm_lints`, `string_of`, `lint_node_of`, `has_lint_id` and `is_expr` take views by value; the first `ASM_EXPR` is found by `tree.of_kind`; macro calls in the template are expanded by `cx.vsema`.
 
 Lands with: the parent's `## frontend-tree: blaze-diagnostics lints/syntax.rs: onto views (1)`
@@ -17285,7 +17285,7 @@ Why: onto views: views by value, `up` walked without a Vec
 
 ## frontend-tree: blaze-diagnostics lints/syntax/early/macros/matchers.rs: onto views (1)
 
-From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/lanes/frontend/tree.md`).
+From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/design/frontend.md`).
 `definition` takes the node by value and casts it without a clone; `Tokens::of` takes the `ast::Macro` view by value.
 
 Lands with: the parent's `## frontend-tree: blaze-diagnostics lints/syntax.rs: onto views (1)`
@@ -17447,7 +17447,7 @@ Why: onto views: nodes by value, `Tokens<'_>`
 
 ## frontend-tree: blaze-diagnostics lints/syntax/early/macros/matchers/tokens.rs: onto views (1)
 
-From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/lanes/frontend/tree.md`).
+From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/design/frontend.md`).
 `Tokens::of` and `group` read the view; the tokens' text is lent, not copied.
 
 Lands with: the parent's `## frontend-tree: blaze-diagnostics lints/syntax.rs: onto views (1)`
@@ -17768,7 +17768,7 @@ Why: onto views: lent text, views by value
 
 ## frontend-tree: blaze-diagnostics lints/syntax/early/macros/matchers/quoted.rs: onto views (1)
 
-From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/lanes/frontend/tree.md`).
+From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/design/frontend.md`).
 `Tokens<'_>` (the tokens now borrow the definition's text); the tests read the definition from `parse.root()`.
 
 Lands with: the parent's `## frontend-tree: blaze-diagnostics lints/syntax.rs: onto views (1)`
@@ -18037,7 +18037,7 @@ Why: `Tokens<'_>`; tests on views
 
 ## frontend-tree: blaze-diagnostics lints/syntax/early/macros/matchers/check.rs: onto views (1)
 
-From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/lanes/frontend/tree.md`).
+From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/design/frontend.md`).
 `Tokens<'_>` (the tokens now borrow the definition's text); the tests read the definition from `parse.root()`.
 
 Lands with: the parent's `## frontend-tree: blaze-diagnostics lints/syntax.rs: onto views (1)`
@@ -18123,7 +18123,7 @@ Why: `Tokens<'_>`; tests on views
 
 ## frontend-tree: blaze-diagnostics lints/syntax/early/macros/matchers/follow.rs: onto views (1)
 
-From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/lanes/frontend/tree.md`).
+From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/design/frontend.md`).
 `Tokens<'_>` (the tokens now borrow the definition's text); the tests read the definition from `parse.root()`.
 
 Lands with: the parent's `## frontend-tree: blaze-diagnostics lints/syntax.rs: onto views (1)`
@@ -18215,7 +18215,7 @@ Why: `Tokens<'_>`; tests on views
 
 ## frontend-tree: blaze-diagnostics lints/syntax/early/macros/matchers/expr_2024.rs: onto views (1)
 
-From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/lanes/frontend/tree.md`).
+From `frontend-tree-move-diag-lints-early` (frontend.md item 16, `docs/v2/plan/design/frontend.md`).
 `Tokens<'_>` (the tokens now borrow the definition's text); the tests read the definition from `parse.root()`.
 
 Lands with: the parent's `## frontend-tree: blaze-diagnostics lints/syntax.rs: onto views (1)`
@@ -20330,7 +20330,7 @@ Why (12, 13): the view by value.
 > (now the view `ast::String<'db>`). `break_outside_of_loop::ancestors` stays on handles for
 > the `lints/` callers until they move.
 
-From `frontend-tree-move-diag-lower` (notes `docs/v2/plan/lanes/frontend/tree-move-diag-lower.md`).
+From `frontend-tree-move-diag-lower` (notes `docs/v2/plan/design/frontend.md`).
 The eight files land together: they share `break_outside_of_loop`'s `up` and `edges`, and
 `unreachable_label` calls `undeclared_label::resolve`, which now takes `InFile<ast::Node<'db>>`
 by value and the name as `&str`.
@@ -21781,7 +21781,7 @@ patterns and the method-on-trait-object errors) give the same output; no new beh
 ## frontend-tree: blaze-diagnostics lints/syntax/check_cfg.rs, check_cfg/unexpected.rs: onto views (1)
 
 From `frontend-tree-move-diag-lints-attrs` (notes
-`docs/v2/plan/lanes/frontend/tree-move-diag-lints-attrs.md`). `unexpected_cfgs` reads every
+`docs/v2/plan/design/frontend.md`). `unexpected_cfgs` reads every
 `#[cfg]`, `#[cfg_attr]`, `cfg!` and `cfg_select!` of the crate through the flat tree's `Copy`
 views: no node or token handle, no clone, `CfgExpr::parse_from_view` where it used
 `parse_from_ast`, one token buffer per `cfg_select!` where it made two, a macro's path sliced
@@ -22540,7 +22540,7 @@ a `return` from the closure. Same names, kinds and `k`, so the same marks. Owner
 ## dedup: the stability lint reads hir-def's stability, not its own parse (from dedup-sim-diag, 2026-10-29)
 
 From `dedup-sim-diag` (lane dedup; report `/tmp/blaze-lanes/v2-dedup-sim-diag.md`, notes
-`docs/v2/plan/lanes/dedup/sim-diag.md`). `lints/names/stability/attr.rs` parses
+`docs/v2/plan/design/data.md`). `lints/names/stability/attr.rs` parses
 `#[deprecated]`, `#[stable]` and `#[unstable]` a second time and `lookup.rs` walks rustc's
 inheritance a second time; both are `hir_def::attrs::stability`'s (`deprecation_entry`,
 `stability`, per definition, salsa-kept, parsed only when `AttrFlags` say so), which `hir`
@@ -24612,7 +24612,7 @@ From `diagnostics-infer2-methods`, which applied items 8, 7 and 3 of `docs/v2/re
 ## dedup: diagnostics reads hir-def's expression and pattern tags, rustc_ast_ir's widths, hir-def's version parse and syntax's precedence (from dedup-sim-rest, 2026-10-29)
 
 From `dedup-sim-rest` (lane dedup; report `/tmp/blaze-lanes/v2-dedup-sim-rest.md`, notes
-`docs/v2/plan/lanes/dedup/sim-rest.md`). Four copies of things another crate owns. Nothing
+`docs/v2/plan/design/data.md`). Four copies of things another crate owns. Nothing
 here changes what a lint reports, except where noted in item 4.
 
 ### 1. `lints/bodies.rs`: `ExprTag`/`PatTag` are hir-def's `ExprKind`/`PatKind`

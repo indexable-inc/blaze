@@ -1,5 +1,5 @@
 //! Scheduling from history (docs/v2/plan/design/compile-time.md change 11,
-//! docs/v2/plan/lanes/fastcompile/sched.md): what each task took and held, by its kind and
+//! docs/v2/plan/design/compile-time.md): what each task took and held, by its kind and
 //! its key, predicts what the next task of that kind and key will, for the plane's critical
 //! path (a node's cost, in nanoseconds of run time) and its memory admission (a node's peak).
 //!

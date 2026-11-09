@@ -1,4 +1,4 @@
-//! Dependencies' constants by content (docs/v2/plan/lanes/frontend/fast-const-deps.md): a
+//! Dependencies' constants by content (docs/v2/plan/design/frontend.md): a
 //! dependency's `const` item with no generic arguments, once evaluated, is kept in the driver's
 //! store under its crate's check-result key and its stable item key ([`key`]), as bytes with no
 //! database id ([`codec`]). [`cached`] gives `const_eval_query` the kept value before it reads

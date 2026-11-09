@@ -49,7 +49,7 @@ such an error still builds.
   The rules have a fixed budget (`flow::BUDGET` steps). A body that hits it keeps `polonius`'s
   errors, and each error carries a note saying the budget ran out. The second check is a
   `borrowck.flow` span named for the function. The design and its proof are in
-  [the lane plan](v2/plan/lanes/borrowck-cursor.md).
+  [the lane plan](v2/plan/design/borrowck-cursor.md).
 - `nll`: stable rustc's checker. The only difference from `polonius` is when a loan goes out
   of scope.
 - `off`.

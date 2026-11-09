@@ -11,7 +11,7 @@ date: 2026-10-30
 - Where: `Cargo.lock` (coordinator's).
 - Why: `crates/blaze-core/Cargo.toml` now has
   `[target.'cfg(blaze_check)'.dependencies] blaze-check.workspace = true`, the switch
-  docs/v2/plan/lanes/safety/model.md asks of a crate with lock-free code (`src/sync.rs`,
+  docs/v2/plan/design/model-checker.md asks of a crate with lock-free code (`src/sync.rs`,
   `src/handoff.rs`'s model tests). A lock entry lists target-specific dependencies too. No cycle:
   `blaze-check` depends on no workspace crate, and `blaze-mem`, which blaze-core already uses,
   has the same line. `blaze-check` is already in the root `[workspace.dependencies]` and
@@ -22,7 +22,7 @@ date: 2026-10-30
 ## 2. Docs index
 
 - What: `python3 tools/docs.py write` (or the line by hand) so `docs/README.md` lists
-  `docs/v2/plan/lanes/core/speed-unsafe-back-core.md` (new, `status: plan`).
+  `docs/v2/plan.md` (new, `status: plan`).
 - Where: `docs/README.md` (generated; not mine).
 - Why: `tools/docs.py check` holds the index to the tree.
 

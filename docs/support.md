@@ -9,7 +9,7 @@ This is what blaze v1 supported, as of its integration into v2 on 2026-10-30. Mu
 describes v1's machinery: rustc's copy of a refused function, handing a build to cargo, the
 splice, tiers and live edits through `blaze-live`, rustc linking with blaze's objects. v2 builds
 with no rustc and no cargo, and none of these cells has been measured for it; what v2 must reach
-is [v2/plan/goals/targets.md](v2/plan/goals/targets.md).
+is [v2/plan/goals/targets.md](v2/plan/objectives.md).
 
 Every cell here points at a report or a harness run. The harnesses that compared blaze with
 rustc or cargo (the corpus, the breakers, the build-model cases, the fuzzer's differential

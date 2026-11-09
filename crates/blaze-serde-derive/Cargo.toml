@@ -15,7 +15,7 @@ proc-macro = true
 doctest = false
 
 # No dependencies, on purpose: the derive is one small crate to compile and to interpret
-# (docs/v2/plan/lanes/usercode/macros.md). Its tests are blaze-serde's, which re-exports it.
+# (docs/v2/plan/design/proc-macros.md). Its tests are blaze-serde's, which re-exports it.
 
 [lints]
 workspace = true

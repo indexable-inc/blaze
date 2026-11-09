@@ -1,5 +1,5 @@
 //! The live view of a build (`blaze build`, `check` and `test`), drawn from one [`Now`]
-//! (docs/v2/plan/observe/build-view.md, "The renderer"). A sans-IO state machine: a [`Board`]
+//! (docs/v2/plan/design/build-view.md, "The renderer"). A sans-IO state machine: a [`Board`]
 //! is fed the build's model as it comes ([`Board::take`]) and the keys pressed ([`Board::key`]),
 //! and draws it into a ratatui [`Buffer`] ([`Board::render`]) in one of two [`Form`]s, or, off a
 //! terminal, as one line of text when one is due ([`Board::line`]). It owns no terminal, thread

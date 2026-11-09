@@ -125,7 +125,7 @@ MODULE_IMPLS = 0x220c, "module_impls";
 `pub mod kinds;` in `facts.rs`, and in core's db hook (the `mod facts` line of
 `crates/hir-def/src/nameres.rs`) also `pub use self::facts::kinds;`, so it is
 `hir_def::nameres::kinds`. A query core drops keeps its number unused; one it adds takes the next.
-When hir-def's queries run on blaze-query (lane db, docs/v2/plan/lanes/db.md: "hir-def,
+When hir-def's queries run on blaze-query (lane db, docs/v2/plan.md: "hir-def,
 hir-expand and hir-ty run on it") they are keyed with these kinds, and `blaze trace` then holds
 them. Until then the cases count the blaze-items facts and report the resolver's kinds as
 unmeasured (`Finding::Unrecorded`), never as passing. Open.
@@ -362,7 +362,7 @@ Why: one counting sort in the tree; the shared one places without zeroing first.
 
 From `speed-hir-sol-nameres` (round 2 of `speed-hir`; report
 `/tmp/blaze-lanes/v2-speed-hir-sol-nameres.md`). The bounds are in
-`docs/v2/plan/lanes/db/speed-of-light.md`, "hir-def: name resolution (speed-hir-sol-nameres)".
+`docs/v2/plan.md`, "hir-def: name resolution (speed-hir-sol-nameres)".
 The edits to db-expand-names' files (`nameres.rs`, `path_resolution.rs`, `frozen.rs`,
 `resolver.rs` and the rest) are in `docs/v2/requests/db-expand.md` under the same heading. Two of them
 touch what you asked for in `db.md`:

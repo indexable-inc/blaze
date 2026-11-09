@@ -115,7 +115,7 @@ Where: `crates/hir-ty/src/db.rs`, `evict.rs`.
 Why: db-ty-shared.md rule 4, values in the format.
 
 > forwarded to db: between lane db's children.
-> checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir-ty/src/check_cache/part.rs:427`: the stored form is `InferenceRecord`, read with `to_result` and a failed read an error (`map_err(format_error)`), never a recomputation. `evict.rs`'s `drop_inference` drops the in-memory value only (salsa recomputes and backdates by fingerprint, the design of `docs/v2/plan/lanes/db.md` section 7), so nothing there needs the record.
+> checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir-ty/src/check_cache/part.rs:427`: the stored form is `InferenceRecord`, read with `to_result` and a failed read an error (`map_err(format_error)`), never a recomputation. `evict.rs`'s `drop_inference` drops the in-memory value only (salsa recomputes and backdates by fingerprint, the design of `docs/v2/plan.md` section 7), so nothing there needs the record.
 
 ## 6. Notes (no change asked)
 

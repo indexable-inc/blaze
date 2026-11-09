@@ -16,8 +16,8 @@ date: 2026-10-29
   `{"reason": "blaze-work", "reran": N, "green": N, "compiled": N, "found": N, "link":
   "patched"|"placed", "critical_path_us": N}`.
 - Where: `crates/blaze-api/src/lib.rs` (ci), the plane's request accounting (core), the CLI.
-- Why: docs/v2/plan/goals/targets.md's budgets ("a format or comment edit compiles nothing", "a signature edit
-  compiles its callers") and docs/v2/plan/lanes/proof.md's "over-invalidation is measured and budgeted"
+- Why: docs/v2/plan/objectives.md's budgets ("a format or comment edit compiles nothing", "a signature edit
+  compiles its callers") and docs/v2/plan.md's "over-invalidation is measured and budgeted"
   need the count per request. `harness/v2/engine.py`'s `V2.mark`/`work_since` and
   `critical_path_s` raise `engine.Missing` until this exists, which fails every v2 run of
   oracle.py and budgets.py naming it.
@@ -41,7 +41,7 @@ date: 2026-10-29
   view's last build compiled or found, with the hash its code was generated from. CLI: `blaze
   codegen-inputs --format=json` printing `{"<instance key hex>": "<code hash hex>", ...}`.
 - Where: `crates/blaze-api` (ci), answered by the codegen queries (codegen).
-- Why: docs/v2/plan/lanes/proof.md: "the incremental result must equal a from-scratch build, bit for bit
+- Why: docs/v2/plan.md: "the incremental result must equal a from-scratch build, bit for bit
   for the codegen inputs". `V2.codegen_inputs` raises `engine.Missing` until then.
 
 > applied: the API by ci (`Request::CodegenInputs`, `Response::CodegenInputs`).
@@ -60,7 +60,7 @@ date: 2026-10-29
   which the `blaze-v2-proof` binary compares.
 - Where: `crates/blaze-api` (ci), from `blaze_query::Database::memo` (db).
 - Why: the oracle names the query that went stale and the read it missed (a fact missing from
-  docs/v2/plan/lanes/items.md section 6.2), not only the wrong program. `V2.trace` raises
+  docs/v2/plan/design/item-hash.md section 6.2), not only the wrong program. `V2.trace` raises
   `engine.Missing` until then.
 
 > applied: by ci (`Request::Trace`, `Response::Trace(Vec<Traced>)`; `blaze_ui::api::trace_cbor` writes `blaze_v2_proof::Trace`).
@@ -94,8 +94,8 @@ date: 2026-10-29
 - What: a row for `harness/v2/proof.py` (one entry, one report: oracle, corpus, rejections,
   determinism, tight memory, budgets) and one per script, each run as `uv run --frozen python
   harness/v2/<script>.py '<json>'` with `"engine": {"kind": "v1"|"v2", "blaze": PATH}`;
-  `docs/v2/plan/lanes/proof.md` can link it.
-- Where: `docs/harness.md`, `docs/v2/plan/lanes/proof.md` (coordinator).
+  `docs/v2/plan.md` can link it.
+- Where: `docs/harness.md`, `docs/v2/plan.md` (coordinator).
 - Why: docs-say-what-they-are; the harnesses are otherwise undocumented.
 
 > applied: by the coordinator (`docs/harness.md` has the `harness/v2/` section).
@@ -213,7 +213,7 @@ stream its 1.3 GB. As columns it is nine items and a length check, read in place
 splits the joins across cores. Callers keep compiling: `blaze-ui`'s `trace_cbor` still writes
 `cbor::to_vec(&trace.finish())` and its test reads it back with `cbor::from_slice`, and
 `tests.rs`'s round trip still holds. The serial `under` and `over` stay as the reference
-`join`'s tests compare against. Numbers: `docs/v2/plan/lanes/proof/speed-of-light.md`, "The
+`join`'s tests compare against. Numbers: `docs/v2/plan/bounds.md`, "The
 oracle and the harness".
 
 > applied by requests (proof DONE): `pub mod join;` after `columns`, `pub mod wire;` after `nameres`; `Trace` derives `Clone, PartialEq, Eq, Debug, Default` only (`wire.rs` 214/244 implement serde); the two module-doc lines after `[`columns`]`. `serde` import kept for `Bits` and the rest.

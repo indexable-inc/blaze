@@ -1,5 +1,5 @@
 """reachable.py: dependencies built reachable-only against built whole, program for program
-(docs/v2/plan/lanes/cold-v2/notes.md). A crate of the standard library, or of a package cargo caps
+(docs/v2/plan/design/compile-time.md). A crate of the standard library, or of a package cargo caps
 the lints of (registry, git), runs no check and compiles no roots of its own as a library unit:
 the programs' codegen walks compile what they reach of it (`reached_only` in
 crates/blaze-cargo/src/serve/unit/compile.rs). `BLAZE_DEPS=full` in a job's environment builds

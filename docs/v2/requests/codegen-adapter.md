@@ -73,7 +73,7 @@ Each says what, where and why.
 > (`Kind::Allocator(v2::allocator::Forward)`, `HirFrontend::allocator_shim`). 9 confirmed: blaze-link
 > applies `PcRel32` as `S + A - P` on every format (`reloc.rs` `of_kind` maps it to
 > `X86Branch32` whatever the format; `apply` writes `pc(sa)`), so Cranelift's `-4` is right on
-> Mach-O. 10 said: `docs/v2-codegen.md` states wasm32 is not yet a v2 target and `check_spec`
+> Mach-O. 10 said: `docs/v2/plan/design/codegen.md` states wasm32 is not yet a v2 target and `check_spec`
 > refuses it with an error. 11 done (side table version 2 has `side::Scopes`). 12 done:
 > `Prepare::masked(&self, unit, prepared, refs: &Refs)` (`backend.rs`).
 
@@ -518,8 +518,8 @@ closure there is unchanged.
    or index them by slot.
 4. Done: `Homes::sees` as a salsa query (`home.rs` `sees`, see above).
 
-Notes: `docs/v2/plan/lanes/codegen/adapter.md` names the benchmarks. The header of `release.rs` cites `docs/v2-codegen.md`, now
-`docs/v2/plan/lanes/codegen.md`.
+Notes: `docs/v2/plan/design/codegen.md` names the benchmarks. The header of `release.rs` cites `docs/v2/plan/design/codegen.md`, now
+`docs/v2/plan/design/codegen.md`.
 
 > forwarded to codegen: its lane decides which child owns these.
 

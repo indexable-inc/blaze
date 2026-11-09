@@ -1,4 +1,4 @@
-//! The daemon's [`Builder`] (docs/v2/plan/lanes/cargo/notes.md section 6): each job of the
+//! The daemon's [`Builder`] (docs/v2/plan.md section 6): each job of the
 //! session as tasks of the plane, from its view to what it reports.
 //!
 //! A job that builds goes through, for each view it reads (two for a reach, else one):

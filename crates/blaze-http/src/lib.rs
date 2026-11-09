@@ -55,7 +55,7 @@
 //!
 //! The core has no recorder: the waits a driver does (a connect, a receive, the asker's wait
 //! for its next event) open no span yet. When `blaze-trace` lands
-//! (docs/v2/plan/observe/no-tracing.md), the driver opens one per wait, named by the
+//! (docs/v2/plan/design/no-tracing.md), the driver opens one per wait, named by the
 //! connection's origin and the request (every-wait-says-what).
 //!
 //! # What the core reads that is not its input

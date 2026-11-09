@@ -422,7 +422,7 @@ Why: the speed-of-light bar. io_uring always punts `STATX` to io-wq, and each re
 (name copy, queue, wake) runs serially on the one submission thread: 30–60 ms for 100k names
 whatever the cores, 5–80× the bound of N·t/C (6 ms on 8 cores, 0.8 ms on 64). `uring.rs` now
 sweeps on a per-core pool of `statx` calls relative to each directory; the arithmetic is in
-`docs/v2/plan/lanes/frontend/journal/linux.md`, "Speed of light". `docs/v2/plan/design/` is
+`docs/v2/plan/design/restore.md`, "Speed of light". `docs/v2/plan/design/` is
 outside the lane, so for whoever holds it:
 
 - File: `docs/v2/plan/design/restore.md`
@@ -448,7 +448,7 @@ Answer with `>` lines below.
 
 `crates/blaze-vfs/src/text.rs`'s test `reading_text_allocates_nothing` holds `text_of`,
 `Reader::text` and `Vfs::text` to zero allocations with `blaze_alloc_count::assert_at_most`
-(the coordinator's allocation-budget rule, docs/v2/plan/goals/principles.md). It needs, once
+(the coordinator's allocation-budget rule, docs/v2/plan.md). It needs, once
 for the crate:
 
 - `crates/blaze-vfs/Cargo.toml`: a `[dev-dependencies]` section (there is none) with
@@ -579,7 +579,7 @@ not compile until both hunks land.**
 - File: `crates/blaze-core/src/lib.rs`, at the end:
   ```rust
   /// Counts each test thread's allocations, for the allocation-budget tests
-  /// (docs/v2/plan/goals/principles.md).
+  /// (docs/v2/plan.md).
   #[cfg(test)]
   #[global_allocator]
   static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
@@ -650,7 +650,7 @@ whole". The tree opens in place from the daemon's image: `store.rs` (a mapped ba
 `tree.rs`/`reader.rs`/`rebase.rs` (reads give `Result<_, Corrupt>`), `journal.rs` (a base
 record naming the image, then only the tail), and the new `image.rs` with `image/tests.rs`.
 They are all written. They compile only with the edits below, which are in your paths. Notes:
-`docs/v2/plan/lanes/frontend/journal/tree.md`.
+`docs/v2/plan/design/restore.md`.
 
 > applied (see 1-3; 4 forwarded).
 

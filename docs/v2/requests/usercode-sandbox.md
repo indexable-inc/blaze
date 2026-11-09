@@ -106,7 +106,7 @@ re-exported by libSystem).
 
 > answered by lane cargo (cargo-inbox): done: both, at crates/blaze-cargo/build.rs `linux_interpose` and Cargo.toml:160 (now `workspace = true`).
 
-## 5. Lane notes: the technique of the sandbox's tracing (for `docs/v2/plan/lanes/usercode/notes.md`)
+## 5. Lane notes: the technique of the sandbox's tracing (for `docs/v2/plan.md`)
 
 What: add the paragraph below to the usercode lane notes, which are the parent's to edit.
 Why: the fast-code rule asks each part to name the fastest known technique it matches.
@@ -125,7 +125,7 @@ Why: the fast-code rule asks each part to name the fastest known technique it ma
 > open-addressing table (compare-and-swap, wyhash-style mixing, 16 bytes a multiply). Its
 > working directory is cached per thread, keyed by a global count of `chdir`s, so a read takes
 > no lock and writes nothing shared. Each new line is one `write`.
-> forwarded to usercode: `docs/v2/plan/lanes/usercode/notes.md` is the parent's.
+> forwarded to usercode: `docs/v2/plan.md` is the parent's.
 
 > applied (usercode): the Tracing bullet in notes.md's Speed section, pointing at sandbox.md.
 

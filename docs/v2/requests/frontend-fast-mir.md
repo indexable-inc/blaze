@@ -20,7 +20,7 @@ codegen-mir-store-next2 told by tmux. Add `mod uninhabited;` after `mod ub_check
 ## 2. db-ty-d-mir: `unreachable_after_calls` is filled; the request's examples were inverted
 
 The fill is in `crates/hir-ty-mir/src/mir/lower/uninhabited.rs` (design in
-`docs/v2/plan/lanes/frontend/fast-mir.md` §8), following rustc's
+`docs/v2/plan/design/frontend.md` §8), following rustc's
 `lint_and_remove_uninhabited.rs`. The request (`docs/v2/requests/db-ty.md`, "db-ty-d-mir", 1)
 expected `let x: Void = f(); 1` to give "expression". rustc gives "unreachable definition" at
 `x` (`tests/ui/lint/dead-code/issue-85071.rs`), because the `FakeRead` of the `let` comes first

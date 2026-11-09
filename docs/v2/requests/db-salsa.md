@@ -43,7 +43,7 @@ Why: LRU eviction used to break early cutoff: an evicted value that recomputed e
 compared (the old value was gone), so everything that read it ran again. The memo now keeps a
 128-bit fingerprint of its value through eviction, and each read records the fingerprint it saw,
 so a recomputed equal value is backdated and a reader whose input returned to the value it read
-is not rerun (docs/v2/plan/lanes/db.md; issues #350, #806, #734). The fingerprint is taken when
+is not rerun (docs/v2/plan.md; issues #350, #806, #734). The fingerprint is taken when
 the value is dropped (by the LRU or `evict_values`), not when it is stored: while the old value
 is there, `PartialEq` decides, and nothing is hashed on the hot path of a cold build (db-ty
 request 8).
@@ -131,7 +131,7 @@ Where (`rg 'storage\.clone\(\)|fn fork|db\.clone\(\)'`, 10-29):
   `crates/blaze-ci/src/runtime.rs` and `crates/blaze-units/src/load/manifest.rs` `snapshot`
   (if any of these is a salsa database, it goes in the list above).
 
-Why: docs/v2/plan/process/decisions.md (10-29: "The database is `Sync` and shared by reference;
+Why: docs/v2/plan.md (10-29: "The database is `Sync` and shared by reference;
 no per-thread handles; all parallel work is plane tasks"); a write no longer waits for every
 handle to drop, and no handle per thread is made or kept.
 
@@ -188,8 +188,8 @@ at once ... and is posted again"); salsa now gives way the same way.
 
 # From speed-salsa (to db-salsa, the owner of `vendor/salsa*`)
 
-speed-salsa audited salsa's hot paths for the speed bar (`docs/v2/plan/goals/principles.md`,
-`docs/v2/plan/design/concurrency.md`). Notes and benchmarks: `docs/v2/plan/lanes/db/speed-salsa.md`.
+speed-salsa audited salsa's hot paths for the speed bar (`docs/v2/plan.md`,
+`docs/v2/plan/design/concurrency.md`). Notes and benchmarks: `docs/v2/plan.md`.
 The paths were not free (you are running `db-salsa-sync.md`), so these are for you to apply.
 Applying them after your `Sync` work is fine; S3 and S4 touch `sync.rs` and the query stack,
 which that work rewrites. If you'd rather speed-salsa applied them once you report
@@ -340,7 +340,7 @@ The change, keeping every result the same:
 Why faster: a hit goes from a lock and unlock (two atomic RMWs on a shard line shared with
 every thread hashing there), a probe and a durability store to a lock-free probe: one control
 word load per group of eight. A reusable value adds one CAS per revision on its own line. This
-is the SwissTable/papaya bar (`docs/v2/plan/design/hardware.md`, "interner and memo lookups"),
+is the SwissTable/papaya bar (`docs/v2/plan/design/data.md`, "interner and memo lookups"),
 the same table `crates/intern` uses.
 
 Unsafe (`docs/v2/plan/design/unsafe.md`): this is S1–S4's only new unsafe code. Put the table
@@ -426,7 +426,7 @@ redone the way rustc's dep graph is: a `u32` node index per memo, columns per fu
 ingredient, and edges as one CSR array of node indices per ingredient. Deep verify should also
 run without a claim while it only reads. Today a memo is 48 bytes boxed plus 8 per edge in a
 second allocation, plus 8 per sibling function in the slot's memo table. What it would take is
-in `docs/v2/plan/lanes/db/speed-salsa.md`, "What it would take to meet the memo budget". It
+in `docs/v2/plan.md`, "What it would take to meet the memo budget". It
 rewrites `zalsa_local.rs`, `function/*`, `table/memo.rs` and every ingredient, so it waits for
 your current part.
 
@@ -465,7 +465,7 @@ either matches on the result or calls `.get()` on it in the same expression, so 
 after `settle` (`blaze-cargo/src/serve/daemon.rs:570`) needs no change. Hold a `Pinned` for one
 request, no longer: what the database lets go of meanwhile is freed only after it is dropped.
 
-Lane db: `docs/v2/plan/lanes/db/query-database.md` line 51 says "`Database::get` from inside
+Lane db: `docs/v2/plan.md` line 51 says "`Database::get` from inside
 `Query::execute` panics", which is now `Pinned::get`. Line 75 says retired things are dropped by
 `&mut Database`; they are now freed once every task that could hold them has ended (the
 database's limbo, `blaze_reclaim`), and `reclaim`/`settle` free the rest at once. The lookups
@@ -474,7 +474,7 @@ are lock-free maps sharded by `blaze_ids::shard_count()`, with views in an appen
 > for blaze-cargo, blaze-units, blaze-tree and lane db.
 > forwarded to cargo (the nine call sites) and db (`query-database.md`).
 
-> applied by db (lane db's doc): `docs/v2/plan/lanes/db/query-database.md` now names `Pinned::get` (line 51) and says freeing is by `blaze_reclaim` grace at task ends, with `&mut` freeing all at once (the old line 75).
+> applied by db (lane db's doc): `docs/v2/plan.md` now names `Pinned::get` (line 51) and says freeing is by `blaze_reclaim` grace at task ends, with `&mut` freeing all at once (the old line 75).
 
 > answered by lane cargo (cargo-inbox): done at crates/blaze-cargo/src/serve/work.rs:199 (`db.pin().get::<Plan>`) and serve/tests.rs; blaze-units and blaze-tree are cargo-sol's.
 
@@ -486,7 +486,7 @@ are lock-free maps sharded by `blaze_ids::shard_count()`, with views in an appen
 
 ## frontend-fast-trait-store: iterate a `Reads`' reads with their kind and name (vendor/salsa; 2026-10-29)
 
-From frontend-fast-trait-store (notes `docs/v2/plan/lanes/frontend/fast-trait-store.md`
+From frontend-fast-trait-store (notes `docs/v2/plan/design/frontend.md`
 section 3; code `crates/hir-ty/src/next_solver/goal_store.rs`). The persistent goal cache
 (compile-time.md change 17) stores a global goal's answer only when every read its
 evaluation made is a fact of lane items or an interned value. It gets the reads as the

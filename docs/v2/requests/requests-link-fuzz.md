@@ -54,7 +54,7 @@ its `sdk_libsystem` helper makes 5 findings.
 
 For the holders of `macho.rs` (`requests-link-fuzz`) and `macho/{sign,linkedit}.rs`
 (`requests-link-fuzz-macho-input-next1`). I make each edit myself once every holder is DONE;
-until then they are here, exact. Bounds and arithmetic: `docs/v2/plan/lanes/link/speed-of-light.md`,
+until then they are here, exact. Bounds and arithmetic: `docs/v2/plan.md`,
 "Mach-O writer and readers". None changes an output byte except A2, which is opt-in by
 deployment target.
 
@@ -205,7 +205,7 @@ order. The bound is about 0.06 ms for 200,000 functions.
 > (with `entry`, `frame` and `rewalk`), and both `elf/dynamic.rs` and `macho/unwind.rs` `fdes`
 > call it. The `__unwind_info` merge and its regular pages are parallel; compressed pages stay
 > serial (O(native entries)). See "`__unwind_info` assembly" in
-> `docs/v2/plan/lanes/link/speed-of-light.md`.
+> `docs/v2/plan.md`.
 
 ## dedup: `macho/dylib.rs` LEB128 and RNG onto `blaze_format::leb` and `blaze_ids::rng`
 

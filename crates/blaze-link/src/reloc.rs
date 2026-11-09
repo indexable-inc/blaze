@@ -1,4 +1,4 @@
-//! Writing a relocation's value into code and data (docs/v2/plan/lanes/link/notes.md, "Relocations").
+//! Writing a relocation's value into code and data (docs/v2/plan.md, "Relocations").
 //!
 //! Every [`Apply`] but [`Apply::Native`] is computed and written here, for x86-64 and
 //! AArch64; a value that does not fit its field is an error naming the field, never a

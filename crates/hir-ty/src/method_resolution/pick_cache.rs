@@ -1,4 +1,4 @@
-//! The pick cache and the autoderef steps cache (notes: docs/v2/plan/lanes/frontend/fast-method.md).
+//! The pick cache and the autoderef steps cache (notes: docs/v2/plan/design/frontend.md).
 //!
 //! A probe's answer is a function of the inputs [`PickKey`] names, its reads aside. For a
 //! receiver with no inference variables those are known before the probe, so the answer is

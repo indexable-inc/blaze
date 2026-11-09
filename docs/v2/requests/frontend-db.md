@@ -26,7 +26,7 @@ Status: done
 > one in the front end once db.md's migration is done) then gets a static call that inlines, and
 > the generic costs one instance per database type. There is one database type (and `dyn` for any
 > caller left on it), so code size is unchanged, unlike making the whole front end generic
-> (`docs/v2/plan/lanes/frontend/db.md`, "The options weighed"). Moving the interned struct into
+> (`docs/v2/plan/design/frontend.md`, "The options weighed"). Moving the interned struct into
 > base-db would tie `span`'s users to base-db for no gain. `concrete_db.py` doesn't touch span.
 
 ## frontend-deps-reparse: the item tree's `db` lines, for the hir-def migration

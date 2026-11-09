@@ -8,7 +8,7 @@
 //! actually true.
 
 #![feature(allocator_api, allocator_ext, register_tool)]
-// `#[blaze::noalloc]` (docs/v2/plan/lanes/effects.md); inert under rustc.
+// `#[blaze::noalloc]` (docs/v2/plan/design/effects.md); inert under rustc.
 #![register_tool(blaze)]
 #![deny(unsafe_code)]
 
