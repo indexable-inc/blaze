@@ -1,8 +1,18 @@
 //! Files (docs/v2/plan/design/std.md, "Capabilities"): [`Fs`] gives directories, a
 //! [`Dir<P>`] gives files beneath it by relative [`Path`] only, a [`File<P>`] gives positional
 //! reads and writes and its sync. `P` is [`ReadOnly`] or [`ReadWrite`]; the methods that change
-//! anything are gated by `P: CanWrite`, and narrowing ([`Dir::subdir`], [`Dir::read_only`],
-//! [`File::read_only`]) never widens.
+//! anything are on `Dir<ReadWrite>` and `File<ReadWrite>` only, and narrowing
+//! ([`Dir::subdir`], [`Dir::read_only`], [`File::read_only`]) never widens.
+//!
+//! **Finishing.** A `File<ReadWrite>` is linear: it holds a [`ReadWrite`], which is
+//! `#[blaze::linear]`, so leaving one is a compile error and it ends with [`File::close`],
+//! which syncs it and returns the sync's error. A write is not durable until a sync, and a
+//! file dropped unsynced loses its writes to a crash silently: closing makes that choice
+//! visible. A panic that unwinds past one closes nothing and syncs nothing: there is no handle
+//! to close (effects name files), so its abandonment path is its writes left unsynced, as a
+//! crash would find them. A `File<ReadOnly>` and a [`Dir`] of either rights are not linear:
+//! dropping one loses nothing. The positional ops in flight, [`File::read_into`] and
+//! [`File::write_from`], are [`Pending`] values.
 //!
 //! Each is a name under the driver's root and an `Io`: blaze-core's effects name files, not
 //! handles. So a read-only narrowing is the type's alone, not the OS's, and an open is beneath
@@ -22,6 +32,7 @@ use crate::{
     io::Io,
     mem::Bytes,
     path::Path,
+    pending::{self, Pending},
 };
 
 mod sealed {
@@ -35,19 +46,17 @@ pub trait Rights: sealed::Sealed {
     const WRITE: bool;
 }
 
-/// May read.
-pub trait CanRead: Rights {}
-
-/// May change.
-pub trait CanWrite: CanRead {}
-
 /// Reads only.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ReadOnly;
 
-/// Reads and changes.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct ReadWrite;
+/// Reads and changes. Linear (`#[blaze::linear]`), so a `File<ReadWrite>`, which holds one, is
+/// finished with [`File::close`] (see the module's doc): neither `Copy` nor `Clone`, and made
+/// only here. A `Dir<ReadWrite>` names it only in a `PhantomData`, which holds no value, so a
+/// directory stays an ordinary value.
+#[blaze::linear]
+#[derive(PartialEq, Eq, Debug)]
+pub struct ReadWrite(());
 
 impl Rights for ReadOnly {
     const WRITE: bool = false;
@@ -55,9 +64,6 @@ impl Rights for ReadOnly {
 impl Rights for ReadWrite {
     const WRITE: bool = true;
 }
-impl CanRead for ReadOnly {}
-impl CanRead for ReadWrite {}
-impl CanWrite for ReadWrite {}
 
 /// What a file or directory is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -81,6 +87,7 @@ pub enum FsOp {
     Replace,
     Remove,
     Rename,
+    Close,
 }
 
 impl FsOp {
@@ -98,6 +105,7 @@ impl FsOp {
             FsOp::Replace => "replace",
             FsOp::Remove => "remove",
             FsOp::Rename => "rename",
+            FsOp::Close => "close",
         }
     }
 }
@@ -181,6 +189,16 @@ fn call(
     io.call(cx, effect).map_err(|stopped| FsError::new(op, path, FsKind::Stopped(stopped)))
 }
 
+/// `name` synced: everything written to it before is durable once this returns.
+fn sync(io: &Io, cx: &Cx, op: FsOp, name: &FileName) -> Result<(), FsError> {
+    // clone: the effect's name, a refcount.
+    let file = name.clone();
+    match call(io, cx, op, name, |tag| Effect::Sync { file, tag })? {
+        Done::Synced => Ok(()),
+        done => Err(unexpected(op, name, done)),
+    }
+}
+
 /// What is at `name`, or `None`.
 fn stat(io: &Io, cx: &Cx, op: FsOp, name: &FileName) -> Result<Option<Meta>, FsError> {
     // clone: the effect's name, a refcount.
@@ -216,27 +234,27 @@ impl Fs {
 }
 
 /// A directory: the files beneath it, by relative path only.
-pub struct Dir<P: Rights> {
+pub struct Dir<#[blaze::linear] P: Rights> {
     io: Io,
     base: FileName,
     rights: PhantomData<P>,
 }
 
-impl<P: Rights> Clone for Dir<P> {
+impl<#[blaze::linear] P: Rights> Clone for Dir<P> {
     fn clone(&self) -> Dir<P> {
         // clone: authority held, copied: a refcount each.
         Dir { io: self.io.clone(), base: self.base.clone(), rights: PhantomData }
     }
 }
 
-impl<P: Rights> fmt::Debug for Dir<P> {
+impl<#[blaze::linear] P: Rights> fmt::Debug for Dir<P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let rights = if P::WRITE { "ReadWrite" } else { "ReadOnly" };
         write!(f, "Dir<{rights}>({})", self.base)
     }
 }
 
-impl<P: Rights> Dir<P> {
+impl<#[blaze::linear] P: Rights> Dir<P> {
     /// Where it is, under the driver's root.
     pub fn name(&self) -> &FileName {
         &self.base
@@ -287,41 +305,60 @@ impl<P: Rights> Dir<P> {
         stat(&self.io, cx, FsOp::Stat, &self.beneath(path))
     }
 
-    /// The file at `path`, with this directory's rights. A missing one is
+    /// That a file, not a directory, is at `name`, for an open. A missing one is
     /// [`FsKind::NotFound`]: an open never makes a file.
-    pub fn open(&self, cx: &Cx, path: &Path) -> Result<File<P>, FsError> {
-        let name = self.beneath(path);
-        self.open_name(cx, name)
-    }
-
-    fn open_name(&self, cx: &Cx, name: FileName) -> Result<File<P>, FsError> {
-        match stat(&self.io, cx, FsOp::Open, &name)? {
-            Some(Meta { dir: false, .. }) => Ok(File { io: self.io.clone(), name, rights: PhantomData }),
-            Some(Meta { dir: true, .. }) => Err(FsError::new(FsOp::Open, &name, FsKind::IsADirectory)),
+    fn found(&self, cx: &Cx, name: &FileName) -> Result<(), FsError> {
+        match stat(&self.io, cx, FsOp::Open, name)? {
+            Some(Meta { dir: false, .. }) => Ok(()),
+            Some(Meta { dir: true, .. }) => Err(FsError::new(FsOp::Open, name, FsKind::IsADirectory)),
             None => {
                 if self.io.plant() == Plant::OpenCreates {
                     // clone: the planted bug's effect's name, a refcount.
                     let file = name.clone();
                     // alloc: none, an empty file.
-                    call(&self.io, cx, FsOp::Open, &name, |tag| Effect::Write { file, bytes: Vec::new(), tag })?;
+                    call(&self.io, cx, FsOp::Open, name, |tag| Effect::Write { file, bytes: Vec::new(), tag })?;
                 }
-                Err(FsError::new(FsOp::Open, &name, FsKind::NotFound))
+                Err(FsError::new(FsOp::Open, name, FsKind::NotFound))
             }
         }
     }
 
+    /// The file at `path`, read only, whatever this directory's rights. A missing one is
+    /// [`FsKind::NotFound`]: an open never makes a file.
+    pub fn open_read(&self, cx: &Cx, path: &Path) -> Result<File<ReadOnly>, FsError> {
+        let name = self.beneath(path);
+        self.found(cx, &name)?;
+        Ok(File { io: self.io.clone(), name, rights: ReadOnly })
+    }
+
     /// The whole file at `path` added to `into`; how many bytes it added.
     pub fn read_all(&self, cx: &Cx, path: &Path, into: &mut Bytes<'_>) -> Result<usize, FsError> {
-        self.open(cx, path)?.read_all(cx, into)
+        self.open_read(cx, path)?.read_all(cx, into)
     }
 }
 
-impl<P: CanWrite> Dir<P> {
-    /// The file at `path` made empty, replacing what was there, and its directories made.
-    pub fn create(&self, cx: &Cx, path: &Path) -> Result<File<P>, FsError> {
+impl Dir<ReadOnly> {
+    /// The file at `path`, read only. A missing one is [`FsKind::NotFound`].
+    pub fn open(&self, cx: &Cx, path: &Path) -> Result<File<ReadOnly>, FsError> {
+        self.open_read(cx, path)
+    }
+}
+
+impl Dir<ReadWrite> {
+    /// The file at `path`, read and write: closed with [`File::close`]. A missing one is
+    /// [`FsKind::NotFound`]: an open never makes a file.
+    pub fn open(&self, cx: &Cx, path: &Path) -> Result<File<ReadWrite>, FsError> {
+        let name = self.beneath(path);
+        self.found(cx, &name)?;
+        Ok(File { io: self.io.clone(), name, rights: ReadWrite(()) })
+    }
+
+    /// The file at `path` made empty, replacing what was there, and its directories made:
+    /// closed with [`File::close`].
+    pub fn create(&self, cx: &Cx, path: &Path) -> Result<File<ReadWrite>, FsError> {
         let name = self.beneath(path);
         replace(&self.io, cx, FsOp::Create, &name, &[])?;
-        Ok(File { io: self.io.clone(), name, rights: PhantomData })
+        Ok(File { io: self.io.clone(), name, rights: ReadWrite(()) })
     }
 
     /// The file at `path` made to hold `bytes`, durably and all at once: a reader or a crash
@@ -365,28 +402,30 @@ fn replace(io: &Io, cx: &Cx, op: FsOp, name: &FileName, bytes: &[u8]) -> Result<
     }
 }
 
-/// A file beneath a directory.
-pub struct File<P: Rights> {
+/// A file beneath a directory. A `File<ReadWrite>` is linear, finished with [`File::close`];
+/// a `File<ReadOnly>` is not (see the module's doc).
+pub struct File<#[blaze::linear] P: Rights> {
     io: Io,
     name: FileName,
-    rights: PhantomData<P>,
+    /// The rights themselves, not a `PhantomData`: a [`ReadWrite`] held makes the file linear.
+    rights: P,
 }
 
-impl<P: Rights> Clone for File<P> {
-    fn clone(&self) -> File<P> {
+impl Clone for File<ReadOnly> {
+    fn clone(&self) -> File<ReadOnly> {
         // clone: authority held, copied: a refcount each.
-        File { io: self.io.clone(), name: self.name.clone(), rights: PhantomData }
+        File { io: self.io.clone(), name: self.name.clone(), rights: ReadOnly }
     }
 }
 
-impl<P: Rights> fmt::Debug for File<P> {
+impl<#[blaze::linear] P: Rights> fmt::Debug for File<P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let rights = if P::WRITE { "ReadWrite" } else { "ReadOnly" };
         write!(f, "File<{rights}>({})", self.name)
     }
 }
 
-impl<P: Rights> File<P> {
+impl<#[blaze::linear] P: Rights> File<P> {
     pub fn name(&self) -> &FileName {
         &self.name
     }
@@ -394,7 +433,7 @@ impl<P: Rights> File<P> {
     /// The same file, read only.
     pub fn read_only(&self) -> File<ReadOnly> {
         // clone: authority held, narrowed: a refcount each.
-        File { io: self.io.clone(), name: self.name.clone(), rights: PhantomData }
+        File { io: self.io.clone(), name: self.name.clone(), rights: ReadOnly }
     }
 
     /// Its length now.
@@ -405,12 +444,44 @@ impl<P: Rights> File<P> {
         }
     }
 
-    /// Up to `len` bytes at `at` added to `into`, fewer at the end of the file; how many.
-    pub fn read_at(&self, cx: &Cx, at: u64, len: usize, into: &mut Bytes<'_>) -> Result<usize, FsError> {
+    /// A read of up to `into.len()` bytes at `at` into `into`, in flight: its outcome, once
+    /// waited for, is how many bytes it read, fewer at the end of the file.
+    pub fn read_into<'buf>(&'buf self, into: &'buf mut [u8], at: u64) -> Pending<'buf, Result<usize, FsError>> {
         // clone: the effect's name, a refcount.
         let file = self.name.clone();
-        let done = call(&self.io, cx, FsOp::Read, &self.name, |tag| Effect::Read { file, at, len, tag })?;
-        self.took(done, into)
+        let len = into.len();
+        let name = &self.name;
+        let effect = |tag| Effect::Read { file, at, len, tag };
+        pending::start(&self.io, "bstd::fs read_into", into, effect, move |into: &mut [u8], done| {
+            match done {
+                Ok(Done::Read(bytes)) if bytes.len() <= into.len() => {
+                    into[..bytes.len()].copy_from_slice(&bytes);
+                    Ok(bytes.len())
+                }
+                Ok(done) => Err(unexpected(FsOp::Read, name, done)),
+                Err(stopped) => Err(FsError::new(FsOp::Read, name, FsKind::Stopped(stopped))),
+            }
+        })
+    }
+
+    /// Up to `len` bytes at `at` added to `into`, fewer at the end of the file; how many. Its
+    /// [`File::read_into`], waited for.
+    pub fn read_at(&self, cx: &Cx, at: u64, len: usize, into: &mut Bytes<'_>) -> Result<usize, FsError> {
+        let stopped = |stopped| FsError::new(FsOp::Read, &self.name, FsKind::Stopped(stopped));
+        cx.stopped_by(self.io.now()).map_err(stopped)?;
+        let start = into.len();
+        let slot = into.grow_zeroed(len).map_err(stopped)?;
+        let read = self.read_into(slot, at).wait(cx);
+        match read {
+            Ok(read) => {
+                into.truncate(start + read);
+                Ok(read)
+            }
+            Err(error) => {
+                into.truncate(start);
+                Err(error)
+            }
+        }
     }
 
     /// The whole file added to `into`; how many bytes.
@@ -418,11 +489,6 @@ impl<P: Rights> File<P> {
         // clone: the effect's name, a refcount.
         let file = self.name.clone();
         let done = call(&self.io, cx, FsOp::Read, &self.name, |tag| Effect::ReadAll { file, tag })?;
-        self.took(done, into)
-    }
-
-    /// A read's bytes, moved into the caller's allocator.
-    fn took(&self, done: Done, into: &mut Bytes<'_>) -> Result<usize, FsError> {
         match done {
             Done::Read(bytes) => {
                 into.try_extend(&bytes)
@@ -434,7 +500,7 @@ impl<P: Rights> File<P> {
     }
 }
 
-impl<P: CanWrite> File<P> {
+impl File<ReadWrite> {
     /// `bytes` added at the end; durable once a later [`File::sync`] has returned.
     pub fn append(&self, cx: &Cx, bytes: &[u8]) -> Result<(), FsError> {
         // clone: the effect's name, a refcount.
@@ -447,17 +513,31 @@ impl<P: CanWrite> File<P> {
         }
     }
 
-    /// `bytes` written at `at`, past the end making it longer; durable once a later sync has
-    /// returned.
-    pub fn write_at(&self, cx: &Cx, at: u64, bytes: &[u8]) -> Result<(), FsError> {
+    /// A write of `from` at `at`, past the end making it longer, in flight; durable once a
+    /// later sync has returned. The bytes are copied as it starts (see [`crate::pending`]),
+    /// and stay lent until it ends.
+    pub fn write_from<'buf>(&'buf self, from: &'buf [u8], at: u64) -> Pending<'buf, Result<(), FsError>> {
         // clone: the effect's name, a refcount.
         let file = self.name.clone();
         // alloc: the effect's bytes, which blaze-core's `Effect` owns.
-        let bytes = bytes.to_vec();
-        match call(&self.io, cx, FsOp::WriteAt, &self.name, |tag| Effect::WriteAt { file, at, bytes, tag })? {
-            Done::Written => Ok(()),
-            done => Err(unexpected(FsOp::WriteAt, &self.name, done)),
-        }
+        let bytes = from.to_vec();
+        let name = &self.name;
+        let effect = |tag| Effect::WriteAt { file, at, bytes, tag };
+        pending::start(&self.io, "bstd::fs write_from", &mut [], effect, move |_: &mut [u8], done| {
+            match done {
+                Ok(Done::Written) => Ok(()),
+                Ok(done) => Err(unexpected(FsOp::WriteAt, name, done)),
+                Err(stopped) => Err(FsError::new(FsOp::WriteAt, name, FsKind::Stopped(stopped))),
+            }
+        })
+    }
+
+    /// `bytes` written at `at`, past the end making it longer; durable once a later sync has
+    /// returned. Its [`File::write_from`], waited for.
+    pub fn write_at(&self, cx: &Cx, at: u64, bytes: &[u8]) -> Result<(), FsError> {
+        cx.stopped_by(self.io.now())
+            .map_err(|stopped| FsError::new(FsOp::WriteAt, &self.name, FsKind::Stopped(stopped)))?;
+        self.write_from(bytes, at).wait(cx)
     }
 
     /// The file cut or grown to `len`; durable once a later sync has returned.
@@ -475,16 +555,23 @@ impl<P: CanWrite> File<P> {
         if self.io.plant() == Plant::SyncSkipped {
             return Ok(());
         }
-        // clone: the effect's name, a refcount.
-        let file = self.name.clone();
-        match call(&self.io, cx, FsOp::Sync, &self.name, |tag| Effect::Sync { file, tag })? {
-            Done::Synced => Ok(()),
-            done => Err(unexpected(FsOp::Sync, &self.name, done)),
-        }
+        sync(&self.io, cx, FsOp::Sync, &self.name)
     }
 
     /// The file made to hold `bytes`, durably and all at once.
     pub fn replace(&self, cx: &Cx, bytes: &[u8]) -> Result<(), FsError> {
         replace(&self.io, cx, FsOp::Replace, &self.name, bytes)
+    }
+
+    /// The file finished: synced, so everything written to it is durable, or the sync's
+    /// error, op [`FsOp::Close`]. The one way a `File<ReadWrite>` ends.
+    #[blaze::consumes]
+    pub fn close(self, cx: &Cx) -> Result<(), FsError> {
+        let File { io, name, rights } = self;
+        crate::consume(rights);
+        if io.plant() == Plant::CloseSkipsSync {
+            return Ok(());
+        }
+        sync(&io, cx, FsOp::Close, &name)
     }
 }

@@ -268,3 +268,130 @@ fn an_async_body_holding_a_linear_value_is_an_error() {
     assert!(found.iter().all(|(message, _)| message.contains("`async` body")), "{found:#?}");
     assert!(found.iter().any(|(message, at)| message.contains("`t`") && at == "t"), "{found:#?}");
 }
+
+/// bstd's linear types (crates/blaze-std), mirrored: this harness builds crates over minicore
+/// and cannot reach blaze-std, so each is its shape and its finishing call, nothing more.
+const BSTD: &str = "
+struct Cx;
+
+#[blaze::linear]
+struct Scope<'p> { cx: &'p Cx }
+
+#[blaze::linear]
+struct Task<'s> { outcome: u32, scope: &'s () }
+
+impl Cx {
+    fn scope(&self) -> Scope<'_> { Scope { cx: self } }
+}
+
+impl<'p> Scope<'p> {
+    fn spawn(&self, task: impl FnOnce(&Cx) -> u32) -> Task<'_> {
+        Task { outcome: task(self.cx), scope: &() }
+    }
+    #[blaze::consumes]
+    fn join(self, _cx: &Cx) -> Result<(), u32> { Ok(()) }
+}
+
+impl Task<'_> {
+    #[blaze::consumes]
+    fn join(self, _cx: &Cx) -> Result<u32, u32> { Ok(self.outcome) }
+}
+
+#[blaze::linear]
+struct Pending<'buf> { into: &'buf mut [u8; 4] }
+
+impl Pending<'_> {
+    #[blaze::consumes]
+    fn wait(self, _cx: &Cx) -> usize { 4 }
+    #[blaze::consumes]
+    fn cancel(self, _cx: &Cx) -> usize { 0 }
+}
+
+fn read_into(into: &mut [u8; 4]) -> Pending<'_> { Pending { into } }
+
+struct ReadOnly;
+
+#[blaze::linear]
+struct ReadWrite(());
+
+struct File<#[blaze::linear] P> { name: u32, rights: P }
+
+#[blaze::consumes]
+fn consume<#[blaze::linear] T>(_: T) {}
+
+impl File<ReadWrite> {
+    fn close(self, _cx: &Cx) -> Result<(), u32> {
+        let File { name: _, rights } = self;
+        consume(rights);
+        Ok(())
+    }
+}
+
+fn open_rw() -> File<ReadWrite> { File { name: 0, rights: ReadWrite(()) } }
+fn open_ro() -> File<ReadOnly> { File { name: 0, rights: ReadOnly } }
+";
+
+#[test]
+fn bstd_a_scope_left_unjoined_is_an_error() {
+    let found = check(&format!("{BSTD}\nfn f(cx: &Cx) {{\n    let scope = cx.scope();\n}}\n"));
+    expect(&found, &[(&["`scope`", "Scope", "at the end of its scope"], "}")]);
+}
+
+#[test]
+fn bstd_a_task_left_unjoined_is_an_error() {
+    let found = check(&format!(
+        "{BSTD}\nfn f(cx: &Cx) {{\n    let scope = cx.scope();\n    let task = scope.spawn(|_| 1);\n    let _ = scope.join(cx);\n}}\n"
+    ));
+    expect(&found, &[(&["`task`", "Task", "at the end of its scope"], "}")]);
+}
+
+#[test]
+fn bstd_a_pending_left_unfinished_is_an_error() {
+    let found = check(&format!(
+        "{BSTD}\nfn f(buf: &mut [u8; 4]) {{\n    let pending = read_into(buf);\n}}\n"
+    ));
+    expect(&found, &[(&["`pending`", "Pending", "at the end of its scope"], "}")]);
+}
+
+#[test]
+fn bstd_a_writable_file_left_unclosed_is_an_error() {
+    let found = check(&format!("{BSTD}\nfn f() {{\n    let file = open_rw();\n}}\n"));
+    // The file is linear by its `rights` field: the error names the file or that field.
+    assert!(!found.is_empty(), "no error");
+    assert!(
+        found.iter().all(|(message, at)| message.contains("file") && message.contains("ReadWrite") && at == "}"),
+        "{found:#?}"
+    );
+}
+
+#[test]
+fn bstd_a_question_mark_while_a_scope_is_live_is_an_error() {
+    let found = check(&format!(
+        "{BSTD}\nfn f(cx: &Cx, r: Result<u32, ()>) -> Result<u32, ()> {{\n    let scope = cx.scope();\n    let v = r?;\n    let _ = scope.join(cx);\n    Ok(v)\n}}\n"
+    ));
+    expect(&found, &[(&["`scope`", "`?` returns early"], "r?")]);
+}
+
+#[test]
+fn bstd_finished_values_and_a_read_only_file_get_no_error() {
+    let found = check(&format!(
+        "{BSTD}
+fn f(cx: &Cx, buf: &mut [u8; 4]) -> Result<u32, u32> {{
+    let scope = cx.scope();
+    let task = scope.spawn(|_| 1);
+    let got = task.join(cx);
+    let _waited = read_into(buf).wait(cx);
+    let _cancelled = read_into(buf).cancel(cx);
+    let file = open_rw();
+    let closed = file.close(cx);
+    let _read_only = open_ro();
+    let joined = scope.join(cx);
+    match (got, closed, joined) {{
+        (Ok(v), Ok(()), Ok(())) => Ok(v),
+        _ => Err(0),
+    }}
+}}
+"
+    ));
+    expect(&found, &[]);
+}

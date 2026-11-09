@@ -52,7 +52,7 @@ fn plan(d: &mut impl Draw) -> Plan {
 
 fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
     let io = world(plan.seed, plant);
-    let clock = io.clock();
+    let clock = io.need_clock().map_err(|e| format!("harness: {e}"))?;
     let mut made: Vec<Cx> = vec![root(&io)];
     for (at, &(make, from)) in plan.makes.iter().enumerate() {
         let parent = &made[from as usize];

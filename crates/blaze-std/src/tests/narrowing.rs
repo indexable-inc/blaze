@@ -43,7 +43,7 @@ fn plan(d: &mut impl Draw) -> Plan {
 fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
     let io = world(plan.seed, plant);
     let cx = root(&io);
-    let top = io.fs().open_dir(&cx, &path("top")).map_err(|e| format!("harness: {e}"))?;
+    let top = io.need_fs().map_err(|e| format!("harness: {e}"))?.open_dir(&cx, &path("top")).map_err(|e| format!("harness: {e}"))?;
     top.write(&cx, &path("secret"), b"parent's").map_err(|e| format!("harness: {e}"))?;
     let sub = top.subdir(&path("sub"));
     // Where `sub` is: the oracle's yardstick, whatever the narrowing says.
@@ -67,10 +67,17 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
                 Call::ReadAll => read_only.read_all(&cx, &name, &mut into).map(|_| ()),
             };
         } else {
+            // A writable file is linear: each opened is closed, which syncs it beneath `sub`.
             let _ = match call {
                 Call::Write => sub.write(&cx, &name, b"call"),
-                Call::Create => sub.create(&cx, &name).map(|_| ()),
-                Call::Open => sub.open(&cx, &name).map(|_| ()),
+                Call::Create => match sub.create(&cx, &name) {
+                    Ok(file) => file.close(&cx),
+                    Err(error) => Err(error),
+                },
+                Call::Open => match sub.open(&cx, &name) {
+                    Ok(file) => file.close(&cx),
+                    Err(error) => Err(error),
+                },
                 Call::Stat => sub.stat(&cx, &name).map(|_| ()),
                 Call::ReadAll => sub.read_all(&cx, &name, &mut into).map(|_| ()),
             };

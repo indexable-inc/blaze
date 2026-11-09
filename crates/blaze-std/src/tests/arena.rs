@@ -26,7 +26,7 @@ fn plan(d: &mut impl Draw) -> Plan {
 
 fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
     let io = world(plan.seed, plant);
-    let arena = io.mem().arena("test arena", plan.limit).map_err(|e| format!("harness: {e}"))?;
+    let arena = io.need_mem().map_err(|e| format!("harness: {e}"))?.arena("test arena", plan.limit).map_err(|e| format!("harness: {e}"))?;
     let mut bytes = arena.bytes();
     let mut model: Vec<u8> = Vec::new();
     for (at, &len) in plan.appends.iter().enumerate() {

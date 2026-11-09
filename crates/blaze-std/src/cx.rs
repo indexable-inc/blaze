@@ -14,7 +14,9 @@
 //!   and every context made from it are gone.
 //! - The one wait ([`Cx::wait`]): every call in bstd that waits (IO, sleeps) waits through it,
 //!   until the deadline, ending ready or in [`Stopped::Deadline`] or [`Stopped::Cancelled`].
-//! - Tasks: [`Cx::scope`] runs a scope of tasks ([`crate::task`]); there is no `io.tasks()`.
+//! - Tasks: [`Cx::scope`] makes a scope of tasks, a linear [`Scope`] value joined with
+//!   [`Scope::join`] ([`crate::task`]); [`Cx::scope_with`] runs a closure as one. There is no
+//!   `io.tasks()`.
 
 use std::sync::{
     Arc,
@@ -144,11 +146,28 @@ impl Cx {
         self.plant
     }
 
-    /// Runs `body` as a scope of tasks inside this one: each task it spawns has ended when
-    /// this returns, and the first that failed, if any, is the result (docs/v2/plan/design/
-    /// std.md, "Tasks and waiting").
-    pub fn scope<'p, R>(&'p self, body: impl FnOnce(&mut Scope<'p>) -> R) -> Result<R, TaskError> {
-        crate::task::run(self.scoped(), body)
+    /// The world it came from.
+    pub(crate) fn io(&self) -> &Io {
+        &self.world
+    }
+
+    /// A scope of tasks inside this one: spawn its tasks with [`Scope::spawn`], then
+    /// [`Scope::join`] it, which returns once each has ended, with the first that failed. A
+    /// task may borrow from the frame that holds the scope. The scope is linear: leaving it
+    /// unjoined is a compile error (docs/v2/plan/design/std.md, "Tasks and waiting").
+    pub fn scope(&self) -> Scope<'_> {
+        Scope::new(self.scoped())
+    }
+
+    /// `body` run with a scope of tasks inside this one, which is then joined: its result,
+    /// or the first of its tasks that failed. The convenience over [`Cx::scope`].
+    pub fn scope_with<'p, R>(&'p self, body: impl FnOnce(&Scope<'p>) -> R) -> Result<R, TaskError> {
+        let scope = self.scope();
+        let made = body(&scope);
+        match scope.join(self) {
+            Ok(()) => Ok(made),
+            Err(failed) => Err(failed),
+        }
     }
 
     /// The one wait: the next completion of `tag` from `io`, until this context's deadline.
@@ -156,6 +175,9 @@ impl Cx {
     /// [`Stopped::Deadline`] once the deadline passes on the driver's clock, or
     /// [`Stopped::Stalled`] if the driver keeps answering early (rule bounded-progress). A
     /// stopped wait gives up a one-shot tag ([`Ends::Once`]); a stream's stays its owner's.
+    /// A one-shot wait stopped by cancellation first waits, heeding no cancellation and until
+    /// the deadline, for its effect to end ([`Io::settle`]): nothing it does lands after the
+    /// task has seen `Cancelled`.
     ///
     /// In S1's `Inline` layout it polls the driver on the calling thread ([`Io::poll`]); a
     /// fiber layout parks the task here instead.
@@ -180,7 +202,12 @@ impl Cx {
             };
             if let Some(stopped) = stopped {
                 if ends == Ends::Once {
-                    io.forget(tag, Ends::Once);
+                    let settles = matches!(stopped, Stopped::Cancelled { .. }) && self.plant != Plant::CancelSkipsWait;
+                    match settles {
+                        // Ended or given up: either way its tag is no longer waited on.
+                        true => _ = io.settle(tag, deadline, self.span),
+                        false => io.forget(tag, Ends::Once),
+                    }
                 }
                 return Err(stopped);
             }

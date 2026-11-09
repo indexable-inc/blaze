@@ -19,6 +19,15 @@
 //! - [`cell`]: one token reads and writes every cell of its kind, behind one lock across
 //!   threads too.
 //! - [`names`]: the compile-time checks of `path!`, `var!` and `host!` are the run-time ones.
+//! - [`scopes`]: when a scope joins, its tasks have all ended, and each join gives its own
+//!   outcome.
+//! - [`inflight`]: a `Pending` op waited for or cancelled never lands after it returned.
+//! - [`missing`]: a withheld capability is `None` at the root and its `need_` names it.
+//! - [`close`]: closing a writable file syncs it, or returns the sync's failure.
+//!
+//! The compile-time half, that dropping a `Scope`, `Task`, `Pending` or `File<ReadWrite>`
+//! unfinished is an error, is in crates/hir-ty-linear's fixtures (`bstd_*`): that harness
+//! builds small crates over minicore and cannot reach this one, so they mirror its types.
 //!
 //! Replay: a failure prints its plan, the simulation's seed in it; a control prints the seed of
 //! the plan that caught its plant.
@@ -26,13 +35,17 @@
 mod arena;
 mod cancel;
 mod cell;
+mod close;
 mod contexts;
 mod crash;
 mod deadlines;
 mod env;
+mod inflight;
+mod missing;
 mod names;
 mod narrowing;
 mod paths;
+mod scopes;
 mod world;
 
 use std::{fmt, time::Duration};

@@ -16,6 +16,14 @@
 //! wait that already stopped is dropped as it arrives. In the simulation a poll that brings
 //! nothing before the deadline means nothing will complete by then, so the virtual clock is
 //! moved to the deadline, as a real wait would sleep to it.
+//!
+//! **What the host offers** ([`Offers`]) is a table fixed when the `Io` is made
+//! (docs/v2/plan/design/std.md, "When a capability is missing"): every root accessor
+//! ([`Io::fs`], [`Io::net`], ...) is an `Option`, `None` for a capability the host withholds,
+//! and each has a `need_` form ([`Io::need_fs`], ...) for the common case where `main` requires
+//! it, whose [`Missing`] names it. A native `Io` offers what its target can
+//! ([`crate::host::OFFERS`]); [`Io::sim`] offers everything, and [`Io::sim_with`] lets a test
+//! withhold some.
 
 use std::{fmt, sync::Arc, time::Duration};
 
@@ -45,6 +53,11 @@ use crate::{
 /// The most polls in a row that bring nothing while the deadline has not passed: a driver
 /// whose poll returns early this often does not keep its deadline (rule bounded-progress).
 pub(crate) const POLL_FUEL: u32 = 1 << 16;
+
+/// How long an abandoned value waits, on the driver's clock, for what it had in flight to end
+/// (a [`crate::pending::Pending`]'s op, a [`crate::task::Scope`]'s tasks) when a panic drops it:
+/// its abandonment path's bound (rule bounded-progress).
+pub const ABANDON_WAIT: Duration = Duration::from_secs(1);
 
 /// What the simulation's generator of [`Io::rng`] starts from, besides the seed: so it draws
 /// other numbers than the simulation's own scheduler.
@@ -100,6 +113,14 @@ impl Backend {
         }
     }
 
+    fn in_flight(&self) -> usize {
+        match self {
+            #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
+            Backend::Native(driver) => driver.in_flight(),
+            Backend::Sim(sim) => sim.in_flight(),
+        }
+    }
+
     fn sim(&mut self) -> Option<&mut Sim> {
         match self {
             #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
@@ -150,7 +171,62 @@ pub struct Io {
     world: Arc<Lock<World>>,
     env: Arc<[(String, String)]>,
     args: Arc<[String]>,
+    offers: Offers,
 }
+
+/// Which capabilities a host offers: a table fixed when the [`Io`] is made, never discovered
+/// by an op failing halfway through (docs/v2/plan/design/std.md, "When a capability is
+/// missing"). One flag a root accessor of [`Io`].
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Offers {
+    pub fs: bool,
+    pub net: bool,
+    pub env: bool,
+    pub args: bool,
+    pub clock: bool,
+    pub rng: bool,
+    pub mem: bool,
+    pub host: bool,
+}
+
+impl Offers {
+    /// Every capability.
+    pub const ALL: Offers =
+        Offers { fs: true, net: true, env: true, args: true, clock: true, rng: true, mem: true, host: true };
+
+    /// None: a host that hands its program nothing but its context.
+    pub const NONE: Offers = Offers {
+        fs: false,
+        net: false,
+        env: false,
+        args: false,
+        clock: false,
+        rng: false,
+        mem: false,
+        host: false,
+    };
+}
+
+/// A capability `main` requires and the host does not offer ([`Offers`]): the error of each
+/// `need_` accessor of [`Io`], naming it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Missing {
+    /// The capability, as its accessor is named: `fs`, `net`, `env`, ...
+    pub capability: &'static str,
+}
+
+impl fmt::Display for Missing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let capability = self.capability;
+        write!(
+            f,
+            "bstd::Io: the host does not offer `{capability}` (io.{capability}() is None): this \
+             program needs it, so it stops here rather than run without it"
+        )
+    }
+}
+
+impl std::error::Error for Missing {}
 
 /// A simulated world: the seed every choice of it comes from, how unkind it is, its
 /// environment variables, its command line and its host.
@@ -161,14 +237,24 @@ pub struct SimWorld {
     pub env: Vec<(String, String)>,
     pub args: Vec<String>,
     pub host: HostFacts,
+    /// What its program is offered: [`Offers::ALL`] unless a test withholds some.
+    pub offers: Offers,
 }
 
 impl SimWorld {
     /// The world of [`Io::sim`]: no faults beyond latency, no environment, no arguments, the
-    /// simulated host.
+    /// simulated host, every capability offered.
     pub fn new(seed: u64) -> SimWorld {
-        // alloc: none, an empty environment and command line.
-        SimWorld { seed, faults: Faults::default(), env: Vec::new(), args: Vec::new(), host: HostFacts::simulated() }
+        SimWorld {
+            seed,
+            faults: Faults::default(),
+            // alloc: none, an empty environment.
+            env: Vec::new(),
+            // alloc: none, an empty command line.
+            args: Vec::new(),
+            host: HostFacts::simulated(),
+            offers: Offers::ALL,
+        }
     }
 }
 
@@ -193,6 +279,7 @@ struct Start {
     env: Vec<(String, String)>,
     args: Vec<String>,
     host: HostFacts,
+    offers: Offers,
     plant: Plant,
 }
 
@@ -218,6 +305,13 @@ impl Io {
         Io::simulated(SimWorld::new(seed))
     }
 
+    /// [`Io::sim`] offering only what `offers` says: a test of a host that withholds some.
+    pub fn sim_with(seed: u64, offers: Offers) -> Io {
+        let mut world = SimWorld::new(seed);
+        world.offers = offers;
+        Io::simulated(world)
+    }
+
     pub fn simulated(world: SimWorld) -> Io {
         Io::planted(world, Plant::None)
     }
@@ -231,6 +325,7 @@ impl Io {
             env: world.env,
             args: world.args,
             host: world.host,
+            offers: world.offers,
             plant,
         })
     }
@@ -254,12 +349,13 @@ impl Io {
             env: world.env,
             args: world.args,
             host: HostFacts { pid: std::process::id(), cores, name: world.host_name },
+            offers: crate::host::OFFERS,
             plant: Plant::None,
         }))
     }
 
     fn over(start: Start) -> Io {
-        let Start { driver, seed, env, args, host, plant } = start;
+        let Start { driver, seed, env, args, host, offers, plant } = start;
         let world = World {
             driver,
             next: 0,
@@ -287,6 +383,7 @@ impl Io {
             env: env.into(),
             // alloc: once per world, its command line.
             args: args.into(),
+            offers,
         }
     }
 
@@ -298,38 +395,89 @@ impl Io {
         Ok(Cx::root(Deadline::after(self.now(), budget), frame, self.clone()))
     }
 
-    pub fn fs(&self) -> Fs {
-        Fs::new(self.clone())
+    /// What the host offers: fixed when this `Io` was made.
+    pub fn offers(&self) -> Offers {
+        self.offers
     }
 
-    pub fn clock(&self) -> Clock {
-        Clock::new(self.clone())
+    /// Whether the host offers the capability `of` picks from the table.
+    fn offered(&self, of: fn(&Offers) -> bool) -> bool {
+        of(&self.offers) || self.plant() == Plant::OffersIgnored
     }
 
-    /// A generator of its own, forked from the world's: seeded in the simulation.
-    pub fn rng(&self) -> Rng {
-        Rng::new(self.world.lock().rng.next_u64())
+    /// The file tree, if the host offers one.
+    pub fn fs(&self) -> Option<Fs> {
+        self.offered(|it| it.fs).then(|| Fs::new(self.clone()))
     }
 
-    /// Every variable of the world's environment; narrow it with [`Env::only`].
-    pub fn env(&self) -> Env {
-        Env::new(Arc::clone(&self.env), self.plant())
+    /// The file tree, which `main` requires: [`Missing`] names it when the host has none.
+    pub fn need_fs(&self) -> Result<Fs, Missing> {
+        self.fs().ok_or(Missing { capability: "fs" })
     }
 
-    pub fn args(&self) -> Args {
-        Args::new(Arc::clone(&self.args))
+    /// The driver's clock, if the host offers one.
+    pub fn clock(&self) -> Option<Clock> {
+        self.offered(|it| it.clock).then(|| Clock::new(self.clone()))
     }
 
-    pub fn host(&self) -> Host {
-        Host::new(self.clone())
+    pub fn need_clock(&self) -> Result<Clock, Missing> {
+        self.clock().ok_or(Missing { capability: "clock" })
     }
 
-    pub fn mem(&self) -> Mem {
-        Mem::new(self.clone())
+    /// A generator of its own, forked from the world's: seeded in the simulation. `None` when
+    /// the host offers no randomness.
+    pub fn rng(&self) -> Option<Rng> {
+        self.offered(|it| it.rng).then(|| Rng::new(self.world.lock().rng.next_u64()))
     }
 
-    pub fn net(&self) -> Net {
-        Net::new(self.clone())
+    pub fn need_rng(&self) -> Result<Rng, Missing> {
+        self.rng().ok_or(Missing { capability: "rng" })
+    }
+
+    /// Every variable of the world's environment, if the host offers it; narrow it with
+    /// [`Env::only`].
+    pub fn env(&self) -> Option<Env> {
+        self.offered(|it| it.env).then(|| Env::new(Arc::clone(&self.env), self.plant()))
+    }
+
+    pub fn need_env(&self) -> Result<Env, Missing> {
+        self.env().ok_or(Missing { capability: "env" })
+    }
+
+    /// The command line, if the host hands one over.
+    pub fn args(&self) -> Option<Args> {
+        self.offered(|it| it.args).then(|| Args::new(Arc::clone(&self.args)))
+    }
+
+    pub fn need_args(&self) -> Result<Args, Missing> {
+        self.args().ok_or(Missing { capability: "args" })
+    }
+
+    /// The host's facts and its exit, if it offers them.
+    pub fn host(&self) -> Option<Host> {
+        self.offered(|it| it.host).then(|| Host::new(self.clone()))
+    }
+
+    pub fn need_host(&self) -> Result<Host, Missing> {
+        self.host().ok_or(Missing { capability: "host" })
+    }
+
+    /// Named arenas against the memory budget, if the host offers them.
+    pub fn mem(&self) -> Option<Mem> {
+        self.offered(|it| it.mem).then(|| Mem::new(self.clone()))
+    }
+
+    pub fn need_mem(&self) -> Result<Mem, Missing> {
+        self.mem().ok_or(Missing { capability: "mem" })
+    }
+
+    /// Sockets, if the host offers them (a wasm worker does not).
+    pub fn net(&self) -> Option<Net> {
+        self.offered(|it| it.net).then(|| Net::new(self.clone()))
+    }
+
+    pub fn need_net(&self) -> Result<Net, Missing> {
+        self.net().ok_or(Missing { capability: "net" })
     }
 
     /// `f` on the simulation, for a test to change the world (advance the clock, fail syncs,
@@ -437,6 +585,41 @@ impl Io {
         tag
     }
 
+    /// How many effects the driver holds that have not completed: a test's view of whether
+    /// anything a wait gave back is still in flight.
+    pub(crate) fn in_flight(&self) -> usize {
+        self.world.lock().driver.in_flight()
+    }
+
+    /// The next completion of the one-shot `tag`, waited for until `until` heeding no
+    /// cancellation: the wait of a cancel and of an abandonment, which must see their op end
+    /// so that nothing it does lands after they return. Past `until`, or after [`POLL_FUEL`]
+    /// polls in a row that bring nothing, the op is given up ([`Io::forget`]) and the stop
+    /// says why (rule bounded-progress).
+    pub(crate) fn settle(&self, tag: Tag, until: Deadline, span: &'static str) -> Result<Done, Stopped> {
+        let mut idle = 0;
+        loop {
+            if let Some(done) = self.take(tag) {
+                return Ok(done);
+            }
+            let stopped = if until.passed(self.now()) {
+                Some(Stopped::Deadline { span, at: until.get() })
+            } else if idle == POLL_FUEL {
+                Some(Stopped::Stalled { span, polls: idle })
+            } else {
+                None
+            };
+            if let Some(stopped) = stopped {
+                self.forget(tag, Ends::Once);
+                return Err(stopped);
+            }
+            match self.poll(until) {
+                0 => idle += 1,
+                _ => idle = 0,
+            }
+        }
+    }
+
     /// The tag's waiter is gone: its completions are dropped as they arrive.
     pub(crate) fn forget(&self, tag: Tag, ends: Ends) {
         self.world.lock().abandoned.push((tag, ends));
@@ -489,6 +672,7 @@ fn touch(touched: &mut Vec<(FileName, bool)>, effect: &Effect) {
     match effect {
         Effect::ReadAll { file, .. }
         | Effect::Read { file, .. }
+        | Effect::ReadInto { file, .. }
         | Effect::ReadLink { file, .. }
         | Effect::Stat { file, .. }
         | Effect::Lstat { file, .. }

@@ -85,6 +85,8 @@ What is about building Rust (the cargo graph, the store, codegen) stays out.
 | `quic` | QUIC as a sans-IO core: datagrams and time in, datagrams and stream events out; the driver is a `Net` datagram socket and the `Clock` | `blaze-http`'s QUIC core ([http3-sans-io](http3-sans-io.md)) |
 | `http` | sans-IO HTTP/1.1 over a `Conn`, and HTTP/3 and WebTransport over `quic` | `blaze-http` |
 | `trace` | spans and events through `Cx` | `blaze-trace` (no-tracing) |
+| `gpu` | the device behind the `Gpu` capability: buffers, launches, render targets | new, with [gpu](../../../future/gpu/plan.md) |
+| `video`, `image` | codecs as sans-IO cores; image decode and encode as functions | `harness-video`'s encoder, moved; `png` |
 | `test` | the simulation, property tests, the model checker for lock-free code, allocation counting | `blaze_core::sim`, hegel, `blaze-check`, `blaze-alloc-count` |
 | `io`, `fs`, `net`, ... | the capabilities of the sections below | new, on `blaze-core` |
 
@@ -232,6 +234,7 @@ not ambient and is never fetched from a thread-local; `main` receives the root o
 | `Sandboxes` | `io.sandboxes()` | a smaller budget | `OsSandbox`, `Vm`, `WasmSandbox`, and the `Runner` each makes (below) |
 | `Out` | `io.out()` | | standard input, output and error |
 | `Mem` | `io.mem()` | | named arenas and caches against the memory budget |
+| `Gpu` | `io.gpu()` | `only(kernels)`, a memory budget | a device: buffers, kernel launches, offscreen render targets (below) |
 
 Rules that hold for all of them:
 
@@ -334,8 +337,8 @@ function. ([may-suspend](may-suspend.md) is the analysis underneath.)
 - **Spawn is eager, and cancellation is a value.** A cancelled task learns it only as
   `Stopped::Cancelled` from its next wait. Nothing is cancelled by being dropped, and user code
   never holds a task that has not started or is half run.
-- **`Drop` may wait.** A value holds the capability it was made with, so closing a file or
-  flushing a connection on drop goes through the same wait.
+- **Finishing is explicit.** What must be closed, flushed or joined is a linear value with a
+  call that takes `cx` ("Values that must be finished"); `Drop` waits only on the panic path.
 - **A panic fails its task** with a typed error to its scope (rule `panics-fail-one-job`).
 - **A program runs only in a sandbox** (below). There is no bare `spawn`.
 - **Code that uses `async` still builds** as the pinned nightly builds it. The bridge is one
@@ -388,6 +391,90 @@ Deterministic simulation tests of the scheduler, scopes and cancellation with an
 planted bug; a differential test that runs the same programs under `Fibers` and `Frames` and
 compares outputs and the order of cancellations, drops and panics; and a UI test for each error
 above.
+
+## Values that must be finished
+
+bstd is written with linear types ([linear](linear.md)): a `#[blaze::linear]` value cannot be
+dropped or forgotten, only handed to a function that takes it by value. Rust's std cannot use
+them (its generics would have to change), and much of its shape is a workaround for that. bstd
+does not need the workarounds.
+
+- **A scope is a value, not a closure.** `let s = cx.scope(); s.spawn(..); s.join(cx)?;`. Rust
+  needs the closure form because a guard can be leaked, and a leaked guard would let a task
+  outlive what it borrowed. A linear `Scope` cannot be leaked, so the code is straight-line and
+  an early return has to go through `join`. The same holds for a GPU launch scope. The closure
+  forms remain as conveniences.
+- **An operation in flight borrows its buffer.** With completion-based IO the kernel writes into
+  a buffer after the call returns, so today's libraries make every read take an owned buffer,
+  since a forgotten future would free memory the kernel still writes. A linear
+  `Pending<'buf>` cannot be forgotten: it must be `wait`ed or `cancel`led (which also waits), so
+  `file.read_into(cx, &mut buf)` on a borrowed buffer is sound and zero-copy.
+- **Closing is a call that can fail and can wait**: `file.close(cx)?`, `conn.finish(cx)?`,
+  `vm.stop(cx)?`. A handle with unsynced writes, a connection with unsent data, a sandbox and a
+  transaction are linear, so their last error cannot be lost in a destructor and nothing has to
+  wait inside `Drop`.
+- **A task's result must be taken**: `Task<T>` is linear and `join` returns its outcome, so a
+  failure cannot be ignored by dropping the handle.
+- **On a panic** the value's abandonment path runs instead (roll back, cancel and wait, close
+  without syncing), as [linear](linear.md) says; that is the one place a destructor of these types
+  runs.
+- **bstd's containers say whether they admit linear elements.** `Vec`, `Option`, `Result` and
+  the maps do (and are then linear themselves); `Shared` and `LocalShared` do not, since a cycle
+  would leak one; there is no `forget`.
+
+## Eval: who decides how a pure function is computed
+
+A call to a pure function equals its value, so *how* the value is obtained is free to choose:
+run it, look it up, fetch it from another machine, record where it came from. bstd makes that
+choice a value the program passes, like every other.
+
+```rust
+#[blaze::memo]                      // a pure function chosen as a point the evaluator sees
+fn layout(ty: &Type, target: &Target) -> Layout { .. }
+
+fn size_of(eval: &Eval, s: &Struct, target: &Target) -> u64 {
+    s.fields.iter().map(|f| eval.call(layout, (&f.ty, target)).size).sum()
+}
+
+fn main(cx: &Cx, io: Io) -> Result<(), Error> {
+    let eval = Eval::memo(&io.need_mem()?);            // or direct(), stored(..), handler(..)
+    compile(cx, &eval, &krate)
+}
+```
+
+`Eval` is an ordinary parameter, passed down like `cx`. Calling `layout(..)` directly still
+works and simply runs it.
+
+- **A memo point is a pure function marked `#[blaze::memo]`.** `eval.call(f, args)` hands the
+  evaluator the point's code identity, the arguments, and a way to
+  compute. Purity is what makes this sound: the arguments are everything the result depends on.
+  Only marked functions pay for it; an ordinary pure call is an ordinary call.
+- **The key is derived, not written**: the function's code identity plus its arguments, by
+  reflection ([reflect](reflect.md), items 1 and 5). A changed body is a different key.
+- **`Eval` is one type with providers**, as `Http` is:
+
+  | provider | does |
+  |---|---|
+  | `Eval::direct()` | calls the body; with this one the marks compile to plain calls |
+  | `Eval::memo(mem)` | remembers results in a cache of the memory budget |
+  | `Eval::stored(mem, store)` | the above, kept in the store and the remote cache: the engine blaze builds with ([kernel](kernel.md)) |
+  | `Eval::handler(h)` | yours |
+
+- **A handler sees every point and can wrap another evaluator**, so behaviours stack: record
+  provenance over a stored evaluator, count and time over a direct one, send some points to
+  another machine. `h.run(point, args, next)` returns the value; what it does around `next` is
+  its business, and because the functions are pure it cannot change any answer, only where it
+  comes from.
+- **Provenance is what an evaluator already knows.** While a point runs, the points it calls are
+  its inputs, so the evaluator holds the whole graph of what was computed from what. `blaze why`
+  is that graph for the compiler; a program gets the same for its own values by choosing an
+  evaluator that keeps it.
+- A library that marks points takes `&Eval` where it calls them; a caller with no opinion passes
+  `Eval::direct()`.
+
+This is the third place bstd lets a program supply its own machinery, after the host behind `Io`
+(the boundary) and a capability's provider (`Http::handler`). None of them is a compiler plug-in:
+each is a value passed down, which is why they compose and why a test can swap any of them.
 
 ## Sandboxes: the one way to run a program
 
@@ -445,6 +532,70 @@ fn compile(cx: &Cx, run: &Runner) -> Result<(), Error> {
 This is one design for what blaze has three of today (the build-script sandbox, the proc-macro
 host, `ix` VMs for lanes), and the shape of wasm-host's sandbox ops (a spec, a handle, `exec`,
 events) with capabilities as the spec.
+
+## Gpu, video and images
+
+**`Gpu` is a capability.** A program can use a graphics device only if it was handed one, like a
+socket. It is the `Device` of the GPU plan ([gpu](../../../future/gpu/plan.md)) moved under `Io`:
+
+- `io.gpu()` is `None` on a host with no device; `Gpu::cpu()` is always available and runs the
+  same kernels as host code, which is what tests and the simulation use.
+- **Running Rust on it is the GPU plan's job, not bstd's**: a `#[gpu::kernel]` function in the
+  same crate is compiled by blaze for Metal, Vulkan, CUDA and the CPU, and
+  `gpu.scope(cx, |s| s.launch(&kernel, grid, args))` is type-checked against its signature. bstd
+  supplies what that plan called the runtime crate: the device, `Buffer<T>` made in an allocator
+  the caller hands over and counted against the memory budget, the launch that goes through the
+  one wait (so it has a deadline, and host buffers stay borrowed until the device finishes), and
+  offscreen render targets.
+- Narrowing: `gpu.only(&[kernels])`, and a smaller memory budget.
+- The providers are Metal, Vulkan, CUDA and the CPU, one `Gpu` type, chosen as any provider is.
+
+**Getting data to the device, and unified memory.** A kernel's arguments are `Buffer<T>`s, never
+plain slices, so a copy is never hidden. What a buffer costs depends on the machine, and the same
+code is right on both kinds:
+
+| | unified memory (Apple silicon, integrated GPUs) | separate memory (a discrete card) |
+|---|---|---|
+| `Vec::new_in(gpu.alloc())`, `gpu.buffer(n)` | page-aligned memory both processors address | pinned host memory, with device memory behind it |
+| the host writes it (`buf.host_mut()`) | writes the bytes the device will read | writes host memory and marks the range dirty |
+| `launch` | no copy | uploads the dirty ranges first |
+| the host reads a result (`buf.host(cx)`) | ready at once, no copy | a wait: downloads what the device changed |
+| a file read into it | disk to device-visible pages, no copy | then an upload |
+
+- **Allocate where the data will be used.** Because every collection takes its allocator, data
+  built in `gpu.alloc()` is a device buffer from its first byte. That is the whole optimization
+  on unified memory: nothing is ever copied in either direction.
+- **The borrow checker carries the rule that makes it safe on both.** A launch borrows its inputs
+  shared and its outputs uniquely until the device finishes (the scope), so the host cannot read
+  a buffer the device is writing. On unified memory that prevents a race; on separate memory it
+  is the same rule, and it is why the dirty ranges are always known.
+- **Reading back is a wait** (`host(cx)`), so it has a deadline everywhere and costs nothing where
+  nothing needs copying.
+- **`Buffer<T, DeviceOnly>` has no host view at all**, for intermediates between kernels. On a
+  discrete card it never crosses the bus; on unified memory the driver may keep it private.
+- **Which kind a device is**: a constant where the target decides it (Metal on Apple silicon, so
+  the dirty tracking compiles out), otherwise `gpu.memory()` at run time for a program that wants
+  to pick a strategy, such as keeping data on the device across many launches.
+- `gpu.upload(cx, &slice)` is the explicit copy from ordinary memory, for data that already
+  exists somewhere else.
+
+**A codec is a sans-IO core.** `bstd::video::Encoder` takes frames and returns packets;
+`Decoder` the reverse; a `Muxer` takes packets and returns the bytes of a container. None of
+them takes a capability or reads a clock: frame times are data. Where the work is done is a
+provider:
+
+| provider | made from | |
+|---|---|---|
+| the platform's hardware encoder (VideoToolbox; VA-API and NVENC later) | a `Gpu` | fast, HDR; what the agent app's video tool uses today |
+| a software encoder | nothing | anywhere, including the simulation |
+
+Writing a file is the caller's: packets go to a `File` it holds. So rendering a video is
+`Gpu` renders a frame into a buffer, `Encoder` turns frames into packets, `Muxer` into bytes,
+`File` takes the bytes, and each step can be tested without the others.
+
+**Images are functions.** `bstd::image::{decode, encode}` take bytes and an allocator and return
+pixels, or the reverse, with a size limit on decode since input is untrusted. PNG first; no
+capability, no IO.
 
 ## Shared mutation
 
@@ -570,6 +721,33 @@ uses the `try_` forms (`try_push`, `try_reserve`), which return the error.
 Until S4, `alloc`'s global allocator still exists underneath; the `ambient` check treats a use of
 it in a capabilities crate as an effect (`global_alloc`), which replaces the `// alloc:` comment.
 
+### The page pool: one home for bytes that come from outside
+
+The store's buffer pool (`docs/v2/plan/design/store-pool.md`) is not a store feature. It is how bstd
+holds any bytes that came from a file, a socket or a device, and it moves into `bstd::mem::pool`
+with the store as its first user. There is no `mmap` in bstd.
+
+- **One reserved range, pages loaded by explicit reads** on the driver, in parallel, with a
+  state word per page. A miss is an op with a deadline, never a page fault that stalls a worker.
+- **`file.pin(cx, range)` gives `Pinned`**, which derefs to `&[u8]`: the bytes of the file in
+  place, held for as long as the pin lives. This is what `mmap` was used for, with the pool
+  choosing what stays in memory and blaze choosing what to prefetch.
+- **Records are read in place from pinned pages** (`bstd::record`: bytes in memory are the bytes
+  on disk), so loading a result decodes nothing and copies nothing.
+- **Receives land in pool pages.** The buffers a driver lends with an event (the boundary's
+  "events lend their bytes") are pool pages, so network data, file data and what the program
+  keeps of them are one kind of memory with one owner and one count.
+- **On unified memory a pool page can be a GPU buffer** (page-aligned, shared), so disk to pool to
+  device is no copy at all.
+- **It is the `Cache` of `Mem`.** Pool pages are the cheapest thing to drop (one read brings them
+  back), so the one evictor takes them first, and the pool grows only into room the budget has.
+- **The pool's logic is a sans-IO core**: its inputs are requests and completions, its outputs
+  are reads, advice to the OS and wake-ups. The simulation runs it with failed reads, short
+  reads and crashes like everything else.
+
+`Mem` itself is a capability whose system calls (reserve, commit, give back) are ops on the
+boundary, so a simulated `Io` can refuse memory, count it and fail it at a chosen point.
+
 Strings are UTF-8; a path is bytes on Unix and WTF-8 on Windows behind one `Path`.
 
 ## The checks
@@ -602,6 +780,8 @@ Interface first, bottom last, so nothing waits on the runtime and every step lan
 | S1b | `bstd::{sync, cell}`: the table of "Shared mutation", token cells, `Freeze` as a bound, typed names (`HostPort`, `VarName`) in place of strings, and bans on the removed names | misuse tests: two live `get_mut` on one token do not compile; a static that is not `Freeze` is refused |
 | S1c | Tracing on bstd: the span in `Cx` and the scheduler's own events first; then the compile-time site table and the ring; then reflection encoders and redaction; disabled-site patching and keep-or-drop last | the emit budget holds; the ring's simulation test and the round trip pass |
 | S1d | The facade: bstd re-exports the crates of "What is in it", the interner and helper crates are merged, and the piece crates' names are banned outside bstd | `blaze check` with the bans on; no blaze crate outside bstd names a piece crate |
+| S1e | `bstd::image` (PNG), `bstd::video` (the encoder core, the muxer, the VideoToolbox provider moved out of `harness-video`, which then uses bstd's), and `Gpu` as a capability with the CPU provider and offscreen targets | a round trip of an image; a clip encoded from fixed frames is byte-identical twice; `harness-video` builds on it |
+| S1f | The page pool moves from `blaze-cas` to `bstd::mem::pool`; `file.pin`, pooled receive buffers, records read in place; no `mmap` anywhere in bstd | the pool's simulation test still passes from its new home; the store builds on it |
 | S3b | The `Frames` layout: the calling convention, the slab, unwinding, and the profiler and backtraces walking the frame chain | the differential test against `Fibers` passes |
 | S4 | The bottom: `bstd::sys` and `bstd::rt`, `blaze-core`'s drivers move in as `bstd::driver`, and bstd is `#![no_std]` | no blaze crate links Rust's `std`; C1 still passes |
 | S5 | The edition: `edition = "blaze-2026.11"` makes `std` name bstd, `fn main(io: Io)` is the entry, and the OS sandbox of a program is derived from what `main` hands out | a program of the edition that never opens the network cannot, checked by the sandbox |

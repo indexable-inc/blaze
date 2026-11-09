@@ -32,7 +32,7 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
     // Every one but UNSET is set.
     world.env = VARS[..4].iter().map(|name| ((*name).to_owned(), format!("{name} value"))).collect();
     let io = Io::planted(world, plant);
-    let mut env = io.env();
+    let mut env = io.need_env().map_err(|e| format!("harness: {e}"))?;
     let names: Vec<VarName> = VARS.iter().map(|raw| VarName::new(raw).expect("a test's variable name")).collect();
     let mut allowed: u64 = (1 << VARS.len()) - 1;
     for (at, &mask) in plan.chain.iter().enumerate() {

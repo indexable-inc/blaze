@@ -59,6 +59,21 @@ impl<'a> Bytes<'a> {
             .map_err(|_| Stopped::OutOfMemory { arena: self.arena, asked: more })
     }
 
+    /// `more` zero bytes added at the end, lent back to be filled (by a
+    /// [`crate::pending::Pending`] read), or [`Stopped::OutOfMemory`] with the bytes as they
+    /// were.
+    pub fn grow_zeroed(&mut self, more: usize) -> Result<&mut [u8], Stopped> {
+        self.try_reserve(more)?;
+        let at = self.bytes.len();
+        self.bytes.resize(at + more, 0);
+        Ok(&mut self.bytes[at..])
+    }
+
+    /// Only the first `len` bytes kept; nothing changes if it holds no more.
+    pub fn truncate(&mut self, len: usize) {
+        self.bytes.truncate(len);
+    }
+
     pub fn as_slice(&self) -> &[u8] {
         &self.bytes
     }
@@ -111,6 +126,8 @@ impl Mem {
 }
 
 /// Memory for a result that outlives its task: named, with a limit, freed when dropped.
+/// Not linear: dropping it frees its memory and there is nothing else to finish, so leaving
+/// one is not a mistake the checker should refuse.
 pub struct Arena {
     name: &'static str,
     limit: usize,
