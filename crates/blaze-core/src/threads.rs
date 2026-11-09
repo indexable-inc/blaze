@@ -442,7 +442,22 @@ pub struct Threads {
     conns: Slab<Connection>,
     /// The file locks of [`Effect::Lock`], each taken as it is asked for.
     locks: crate::locks::Locks,
+    /// The datagrams, the standard streams, the clock and randomness ([`crate::host`]).
+    #[cfg(unix)]
+    host: crate::host::Host,
     in_flight: usize,
+}
+
+/// Where the host's effects are told: the driver's mailbox.
+#[cfg(unix)]
+struct HostSink(Arc<Shared>);
+
+#[cfg(unix)]
+impl crate::host::Sink for HostSink {
+    fn tell(&self, completion: Completion) {
+        // A closed mailbox is a driver dropped: nobody asks any more.
+        _ = self.0.done.push(Told::Done(completion));
+    }
 }
 
 impl Threads {
@@ -483,6 +498,9 @@ impl Threads {
             // alloc: none, an empty list.
             Vec::new()
         };
+        // clone: a count of the state the host's threads tell through; alloc: once per driver.
+        #[cfg(unix)]
+        let host = crate::host::Host::new(Arc::new(HostSink(Arc::clone(&shared))));
         Threads {
             start: Instant::now(),
             shared,
@@ -504,6 +522,8 @@ impl Threads {
             confine: None,
             spawn_dirs,
             locks: crate::locks::Locks::new(),
+            #[cfg(unix)]
+            host,
             #[cfg(unix)]
             spawns: Tagged::new(RESERVE),
             #[cfg(unix)]
@@ -1087,6 +1107,14 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
             fs::remove(path)?;
             Ok(Done::Removed)
         }),
+        // `mkdir`: its parent must be there, and nothing at its name.
+        Effect::MakeDir { dir, .. } => at(root, &dir, |path| std::fs::create_dir(path))
+            .map(|()| Done::MadeDir)
+            .map_err(|error| named(&dir, &error)),
+        // `rmdir`: of an empty directory alone, never what is under it or a link to one.
+        Effect::RemoveDir { dir, .. } => at(root, &dir, |path| std::fs::remove_dir(path))
+            .map(|()| Done::RemovedDir)
+            .map_err(|error| named(&dir, &error)),
         Effect::Map { file, .. } => Ok(Done::Mapped(at(root, &file, |path| fs::map(path))?)),
         Effect::Lock { .. } | Effect::Unlock { .. } => {
             unreachable!("file locks are kept by the driver, which takes each as it is asked for")
@@ -1104,8 +1132,19 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
         | Effect::Recv { .. }
         | Effect::Send { .. }
         | Effect::Hangup { .. }
-        | Effect::Pressure { .. } => {
-            unreachable!("timers, watches, processes and sockets are kept by the driver")
+        | Effect::Pressure { .. }
+        | Effect::Bind { .. }
+        | Effect::SendTo { .. }
+        | Effect::RecvFrom { .. }
+        | Effect::Unbind { .. }
+        | Effect::ReadStdin { .. }
+        | Effect::WriteOut { .. }
+        | Effect::Now { .. }
+        | Effect::Random { .. } => {
+            unreachable!(
+                "timers, watches, processes, sockets, the standard streams, the clock and \
+                 randomness are kept by the driver"
+            )
         }
     }
 }
@@ -1953,6 +1992,25 @@ impl Driver for Threads {
                         None => Done::Failed(IoError(format!("no connection {conn:?}"))),
                     };
                     self.tell(tag, done);
+                }
+                #[cfg(unix)]
+                effect if crate::host::Host::takes(&effect) => {
+                    self.in_flight += 1;
+                    self.host.submit(effect);
+                }
+                #[cfg(not(unix))]
+                Effect::Now { tag } => self.tell(tag, crate::host::wall()),
+                #[cfg(not(unix))]
+                Effect::Random { len, tag } => self.tell(tag, crate::host::random(len)),
+                #[cfg(not(unix))]
+                effect @ (Effect::Bind { .. }
+                | Effect::SendTo { .. }
+                | Effect::RecvFrom { .. }
+                | Effect::Unbind { .. }
+                | Effect::ReadStdin { .. }
+                | Effect::WriteOut { .. }) => {
+                    let tag = effect.tag();
+                    self.tell(tag, crate::host::refused(effect));
                 }
                 #[cfg(not(unix))]
                 Effect::Kill { .. } => {}

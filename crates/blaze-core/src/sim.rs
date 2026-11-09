@@ -35,6 +35,10 @@
 //! holder runs its section through [`Sim::critical_section`], or [`Sim::hold_for`] when other
 //! actors step while it holds, and once in a while it stalls on the virtual clock).
 //!
+//! UDP sockets, the standard streams, the wall clock, random bytes and directories made empty
+//! are the host's (`sim/host.rs`): datagrams lost, doubled and reordered at [`Sim::datagrams`]'
+//! rates, the input the test's ([`Sim::stdin`]) and the output kept for it ([`Sim::output`]).
+//!
 //! What is in flight sits where a real driver keeps it (docs/v2/plan/design/memory.md,
 //! "Generational handles"): effects in a [`Wheel`], spawns, watches and listens in [`Tagged`]
 //! slabs named by the asker's tag, and the ends of connections in a [`Slab`] whose handle bits
@@ -46,6 +50,7 @@
 //! on some seeds: a watch that is ending is still told some of the changes made meanwhile, as a
 //! system that queued them before it saw the unwatch.
 
+mod host;
 mod journal;
 #[cfg(test)]
 mod pages;
@@ -56,7 +61,7 @@ use blaze_hash::HashMap;
 use blaze_mem::{Slab, Tag as MemTag};
 use std::alloc::Global;
 
-pub use self::journal::Journal;
+pub use self::{host::Datagrams, journal::Journal};
 use crate::{
     Access, Address, Cache, Command, Completion, Conn, Done, Driver, Effect, Exit, FileName,
     IoError, LockMode, Meta, RECV_MOST, Span, Tag, spans,
@@ -400,6 +405,8 @@ pub struct Sim {
     /// A critical section stalls once in `.0` (never 0), for a drawn time up to `.1`
     /// ([`Sim::stall_holders`]).
     stall_holders: Option<(u32, Duration)>,
+    /// UDP sockets, the standard streams, the wall clock and directories made (`sim/host.rs`).
+    host: host::Host,
 }
 
 /// A delay drawn up to the simulation's latency.
@@ -482,6 +489,7 @@ impl Sim {
             // alloc: none until memory pressure is watched.
             pressures: Vec::new(),
             stall_holders: None,
+            host: host::Host::new(seed),
         }
     }
 
@@ -612,6 +620,7 @@ impl Sim {
         self.listens.clear();
         self.ends.clear();
         self.receiving.clear();
+        self.host_crash();
         // By name, so the seed's numbers go to the same files whatever the table's order.
         // alloc: a crash, not an op.
         let mut files: Vec<(&FileName, &mut SimFile)> = self.files.iter_mut().collect();
@@ -972,6 +981,20 @@ impl Sim {
             let modified_ns = self.disk.mtime(file).unwrap_or(0);
             // clone: a name of the listing.
             listed.push((file.clone(), Meta { len: sim.len(), dir: false, modified_ns }));
+        }
+        // A directory made is listed as a file's directories are, with those it is under.
+        for made in self.made_under(dir) {
+            for (at, _) in made.as_str()[start..].match_indices('/') {
+                let inner = FileName::new(&made.as_str()[..start + at]).expect("a part of a name");
+                let modified_ns = self.disk.mtime(&inner).unwrap_or(0);
+                listed.push((inner, Meta { len: 0, dir: true, modified_ns }));
+            }
+            let modified_ns = self.disk.mtime(made).unwrap_or(0);
+            // clone: a name of the listing.
+            listed.push((made.clone(), Meta { len: 0, dir: true, modified_ns }));
+        }
+        if listed.is_empty() && self.was_made(dir) {
+            return Done::Listed(listed);
         }
         if listed.is_empty() {
             // alloc: an error's message.
@@ -1602,9 +1625,7 @@ impl Sim {
                 let modified_ns = self.disk.mtime(&file).unwrap_or(0);
                 match self.files.get(&file) {
                     Some(it) => Some(Meta { len: it.len(), dir: false, modified_ns }),
-                    None if self.files.keys().any(|it| it != &file && it.is_under(&file)) => {
-                        Some(Meta { len: 0, dir: true, modified_ns })
-                    }
+                    None if self.is_dir(&file) => Some(Meta { len: 0, dir: true, modified_ns }),
                     None => None,
                 }
             }),
@@ -1626,6 +1647,7 @@ impl Sim {
                 // alloc: an error's message.
                 None => Done::Failed(IoError(format!("{dir}: no such directory"))),
             },
+            Effect::Remove { file, .. } if self.was_made(&file) => self.remove_made(&file),
             Effect::Remove { file, .. } => {
                 if self.files.remove(&file).is_some() {
                     self.unlink_locks(&file);
@@ -1634,6 +1656,8 @@ impl Sim {
                 Done::Removed
             }
             Effect::Lock { file, mode, tag } => self.lock(&file, mode, tag),
+            Effect::MakeDir { dir, .. } => self.make_dir(dir),
+            Effect::RemoveDir { dir, .. } => self.remove_dir(&dir),
             Effect::Timer { .. } => Done::Fired,
             Effect::Map { file, .. } => {
                 // alloc: the mapping, which the completion carries.
@@ -1656,8 +1680,19 @@ impl Sim {
             | Effect::Send { .. }
             | Effect::Hangup { .. }
             | Effect::Pressure { .. }
-            | Effect::Unlock { .. } => {
-                unreachable!("watches, kills, sockets and unlocks are not pending effects")
+            | Effect::Unlock { .. }
+            | Effect::Bind { .. }
+            | Effect::SendTo { .. }
+            | Effect::RecvFrom { .. }
+            | Effect::Unbind { .. }
+            | Effect::ReadStdin { .. }
+            | Effect::WriteOut { .. }
+            | Effect::Now { .. }
+            | Effect::Random { .. } => {
+                unreachable!(
+                    "watches, kills, sockets, unlocks and the host's effects are not pending \
+                     effects"
+                )
             }
         };
         Completion { tag, done }
@@ -1983,6 +2018,17 @@ impl Driver for Sim {
                     self.tell(tag, done, Of::Op);
                     continue;
                 }
+                effect @ (Effect::Bind { .. }
+                | Effect::SendTo { .. }
+                | Effect::RecvFrom { .. }
+                | Effect::Unbind { .. }
+                | Effect::ReadStdin { .. }
+                | Effect::WriteOut { .. }
+                | Effect::Now { .. }
+                | Effect::Random { .. }) => {
+                    self.hosted(effect);
+                    continue;
+                }
                 Effect::Spawn { ref command, tag } => match self.run(command) {
                     Ok(ran) => {
                         let after = ran.takes.saturating_add(self.delay());
@@ -2074,7 +2120,12 @@ impl Driver for Sim {
     /// With nothing in flight that will complete, it returns at once.
     fn poll(&mut self, out: &mut Vec<Completion>, until: Deadline) -> usize {
         let first = self.pending.next_deadline().map(Duration::from_nanos);
-        let Some(first) = first.into_iter().chain(self.told.iter().map(|it| it.at)).min() else {
+        let Some(first) = first
+            .into_iter()
+            .chain(self.first_landing())
+            .chain(self.told.iter().map(|it| it.at))
+            .min()
+        else {
             return 0;
         };
         if first > self.now {
@@ -2108,6 +2159,8 @@ impl Driver for Sim {
             out.push(completion);
         }
         self.ready = ready;
+        // Datagrams due by now arrive, and the receives waiting for them are told.
+        self.land();
         // What watches were told, in the order they were told: a watch's end comes last.
         let mut told = mem::take(&mut self.told);
         let mut later = mem::take(&mut self.later);
@@ -2139,6 +2192,7 @@ impl Driver for Sim {
             + self.listens.len()
             + self.receiving.len()
             + self.pressures.len()
+            + self.host_in_flight()
             + ending.count()
     }
 

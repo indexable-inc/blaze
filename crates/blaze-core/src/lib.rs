@@ -29,10 +29,11 @@
 // `#![blaze::sans_io]` marks a sans-IO core for `blaze::sans_io_core`; inert under rustc.
 #![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
-// The seed's target (docs/future/bootstrap.md): WASI's positional reads and writes
-// (`std::os::wasi::fs::FileExt`) and its random source (`std::random`), for temporary names
-// where there is no process id.
-#![cfg_attr(target_os = "wasi", feature(wasi_ext, random))]
+// The system's random source (`std::random`): [`Effect::Random`] on every target, and on the
+// seed's target (docs/future/bootstrap.md) temporary names where there is no process id.
+#![feature(random)]
+// The seed's: WASI's positional reads and writes (`std::os::wasi::fs::FileExt`).
+#![cfg_attr(target_os = "wasi", feature(wasi_ext))]
 
 pub mod busy;
 #[cfg(target_os = "linux")]
@@ -55,6 +56,7 @@ pub mod fs;
 #[allow(unsafe_code, reason = "the FSEvents driver: CoreFoundation, FSEvents and dispatch calls")]
 mod fsevents;
 mod handoff;
+mod host;
 #[cfg(windows)]
 #[allow(unsafe_code, reason = "the IOCP driver: Win32 calls and the OVERLAPPEDs the kernel writes")]
 pub mod iocp;
@@ -615,6 +617,114 @@ pub enum Effect {
     Pressure {
         tag: Tag,
     },
+    /// A UDP socket bound at `at` (port 0: one the system picks). Completes with
+    /// [`Done::Bound`] of the socket and the address it is bound at; an address another socket
+    /// has fails, naming it.
+    Bind {
+        at: std::net::SocketAddr,
+        tag: Tag,
+    },
+    /// `bytes` sent from `sock` to `to` as one datagram. Completes with [`Done::Sent`] of
+    /// `bytes` cleared, its capacity kept, once the system took it: not once it arrived, as a
+    /// datagram may be lost, duplicated or reordered on its way. More than [`DATAGRAM_MOST`]
+    /// bytes, a socket not bound, or a send the system refuses completes with [`Done::Broken`]
+    /// of `bytes` cleared, naming the socket's address and `to`.
+    SendTo {
+        sock: Dgram,
+        to: std::net::SocketAddr,
+        bytes: Vec<u8>,
+        tag: Tag,
+    },
+    /// The next datagram `sock` receives, and who sent it: completes with
+    /// [`Done::Datagram`], its bytes in `into` (cleared first, its capacity kept, grown once to
+    /// [`DATAGRAM_MOST`]), so an asker that hands each datagram's buffer to its next receive
+    /// allocates nothing once it has grown. Waits for as long as nothing comes; an
+    /// [`Effect::Unbind`] of the socket with it in flight ends it with [`Done::Broken`] of
+    /// `into` as given, naming the socket, as does a receive the system fails.
+    RecvFrom {
+        sock: Dgram,
+        into: Vec<u8>,
+        tag: Tag,
+    },
+    /// `sock` closed: completes with [`Done::Unbound`], and each receive in flight on it ends
+    /// as [`Effect::RecvFrom`] says. A socket not bound fails, naming it.
+    Unbind {
+        sock: Dgram,
+        tag: Tag,
+    },
+    /// What the process's standard input holds next, at most `most` bytes and at most
+    /// [`RECV_MOST`], appended to `into` after what it holds, as [`Effect::Recv`] appends:
+    /// completes with [`Done::Read`] of `into`, nothing appended once the input has ended, or
+    /// with [`Done::Broken`] of it as given. Reads are answered in the order asked. Waits for as
+    /// long as nothing comes.
+    ReadStdin {
+        most: usize,
+        into: Vec<u8>,
+        tag: Tag,
+    },
+    /// All of `bytes` written to the process's standard output or error, after every write
+    /// asked of the same stream before: completes with [`Done::Sent`] of `bytes` cleared, its
+    /// capacity kept, or with [`Done::Broken`] of it cleared, naming the stream. Written around
+    /// std's buffer of the stream, so what `print!` holds unflushed may land after.
+    WriteOut {
+        stream: Stream,
+        bytes: Vec<u8>,
+        tag: Tag,
+    },
+    /// The wall clock: completes with [`Done::Wall`] of the time since the Unix epoch. A
+    /// simulation's is virtual: its seed's start plus its clock.
+    Now {
+        tag: Tag,
+    },
+    /// `len` random bytes from the system's secure source (the simulation's: its seeded
+    /// numbers): completes with [`Done::Random`]. More than [`RANDOM_MOST`] fails, naming
+    /// both.
+    Random {
+        len: usize,
+        tag: Tag,
+    },
+    /// `dir` made, empty: completes with [`Done::MadeDir`]. Its parent must be there (the
+    /// root always is); a `dir` that is there already, as a file or a directory, fails, naming
+    /// it.
+    MakeDir {
+        dir: FileName,
+        tag: Tag,
+    },
+    /// The empty directory `dir` removed: completes with [`Done::RemovedDir`]. A `dir` that is
+    /// not there, is no directory or is not empty fails, naming it: nothing under it is
+    /// removed.
+    RemoveDir {
+        dir: FileName,
+        tag: Tag,
+    },
+}
+
+/// The most bytes one datagram of [`Effect::SendTo`] carries: UDP's most over IPv4 (65,535
+/// less its 8-byte header and IPv4's 20-byte one), which a receive's buffer is grown to.
+pub const DATAGRAM_MOST: usize = 65_507;
+
+/// The most bytes one [`Effect::Random`] draws.
+pub const RANDOM_MOST: usize = 1 << 16;
+
+/// A UDP socket an [`Effect::Bind`] bound, named by the driver: never named again once
+/// unbound.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct Dgram(pub u64);
+
+/// Which of the process's standard streams an [`Effect::WriteOut`] writes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Stream {
+    Stdout,
+    Stderr,
+}
+
+impl fmt::Display for Stream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Stream::Stdout => "the standard output",
+            Stream::Stderr => "the standard error",
+        })
+    }
 }
 
 /// The PSI trigger an [`Effect::Pressure`] arms on Linux: some task stalled on memory for 300
@@ -666,7 +776,17 @@ impl Effect {
             | Effect::Recv { tag, .. }
             | Effect::Send { tag, .. }
             | Effect::Hangup { tag, .. }
-            | Effect::Pressure { tag } => *tag,
+            | Effect::Pressure { tag }
+            | Effect::Bind { tag, .. }
+            | Effect::SendTo { tag, .. }
+            | Effect::RecvFrom { tag, .. }
+            | Effect::Unbind { tag, .. }
+            | Effect::ReadStdin { tag, .. }
+            | Effect::WriteOut { tag, .. }
+            | Effect::Now { tag }
+            | Effect::Random { tag, .. }
+            | Effect::MakeDir { tag, .. }
+            | Effect::RemoveDir { tag, .. } => *tag,
         }
     }
 }
@@ -987,6 +1107,25 @@ pub enum Done {
         buffer: Vec<u8>,
         error: IoError,
     },
+    /// Of an [`Effect::Bind`]: the socket, and the address it is bound at (the port the system
+    /// picked, where it was asked for port 0).
+    Bound {
+        sock: Dgram,
+        local: std::net::SocketAddr,
+    },
+    /// Of an [`Effect::RecvFrom`]: who sent the datagram, and its bytes in the receive's buffer.
+    Datagram {
+        from: std::net::SocketAddr,
+        bytes: Vec<u8>,
+    },
+    /// Of an [`Effect::Unbind`].
+    Unbound,
+    /// Of an [`Effect::Now`]: the time since the Unix epoch.
+    Wall(Duration),
+    /// Of an [`Effect::Random`]: its bytes.
+    Random(Vec<u8>),
+    MadeDir,
+    RemovedDir,
     /// It did not happen. For an append, none of its bytes are durable unless a later sync
     /// says so; for a sync, nothing appended since the last successful one is known durable;
     /// for a write, the file is as it was.

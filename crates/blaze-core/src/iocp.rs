@@ -918,8 +918,31 @@ impl Iocp {
             | Effect::Private { .. }
             | Effect::Map { .. }
             | Effect::Stamp { .. }
-            | Effect::Entries { .. }) => {
+            | Effect::Entries { .. }
+            | Effect::MakeDir { .. }
+            | Effect::RemoveDir { .. }) => {
                 self.to_threads(Work::File(effect));
+                Ok(())
+            }
+            Effect::Now { tag } => {
+                self.ready.push(Completion { tag, done: crate::host::wall() });
+                Ok(())
+            }
+            Effect::Random { len, tag } => {
+                self.ready.push(Completion { tag, done: crate::host::random(len) });
+                Ok(())
+            }
+            // Not yet: a datagram socket or a standard stream waited on here needs its overlapped
+            // form (`WSARecvFrom`, an overlapped console or pipe read) on the port. Until then each
+            // ends at once, naming why ([`crate::host::refused`]).
+            effect @ (Effect::Bind { .. }
+            | Effect::SendTo { .. }
+            | Effect::RecvFrom { .. }
+            | Effect::Unbind { .. }
+            | Effect::ReadStdin { .. }
+            | Effect::WriteOut { .. }) => {
+                let tag = effect.tag();
+                self.ready.push(Completion { tag, done: crate::host::refused(effect) });
                 Ok(())
             }
             Effect::Timer { after, tag } => {

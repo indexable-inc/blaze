@@ -159,6 +159,21 @@ impl Notify {
     }
 }
 
+/// Where the host's effects ([`crate::host`]) are told: a channel of their own, and a wake.
+struct HostSink {
+    done: Sender<Completion>,
+    notify: Arc<Notify>,
+}
+
+impl crate::host::Sink for HostSink {
+    fn tell(&self, completion: Completion) {
+        // A driver dropped takes nothing.
+        if self.done.send(completion).is_ok() {
+            self.notify.wake();
+        }
+    }
+}
+
 /// Where a watch tells what it hears: the watches' channel, and a wake.
 struct Watched(Arc<Notify>);
 
@@ -297,6 +312,10 @@ pub struct Kqueue {
     notify: Arc<Notify>,
     files: Receiver<Completion>,
     watched: Receiver<Completion>,
+    /// What the host told ([`HostSink`]).
+    hosted: Receiver<Completion>,
+    /// The datagrams, the standard streams, the clock and randomness ([`crate::host`]).
+    host: crate::host::Host,
     work: Option<Sender<Effect>>,
     /// File effects asked for beyond the [`FILES`] at the threads, in the order asked.
     backlog: VecDeque<Effect>,
@@ -375,6 +394,12 @@ impl Kqueue {
             0,
             TRIGGER,
         )?;
+        // alloc: setup, once per driver: the host's channel, which grows with what it tells
+        // between two polls.
+        let (host_done, hosted) = crossbeam_channel::unbounded();
+        // clone: setup, a count of the kqueue for the host's wakes.
+        let sink = HostSink { done: host_done, notify: Arc::clone(&notify) };
+        let host = crate::host::Host::new(Arc::new(sink)); // alloc: setup, once per driver.
         let workers = (0..threads.max(1))
             .map(|n| {
                 // clone: setup, one count of each per worker thread.
@@ -396,6 +421,8 @@ impl Kqueue {
             notify,
             files,
             watched,
+            hosted,
+            host,
             work: Some(work),
             backlog: VecDeque::with_capacity(FILES), // alloc: setup, once per driver.
             at_threads: 0,
@@ -496,6 +523,8 @@ impl Kqueue {
             | Effect::Lstat { .. }
             | Effect::List { .. }
             | Effect::Remove { .. }
+            | Effect::MakeDir { .. }
+            | Effect::RemoveDir { .. }
             | Effect::Stamp { .. }
             | Effect::Entries { .. }
             | Effect::Map { .. }) => {
@@ -573,6 +602,18 @@ impl Kqueue {
                     NOTE_MEMORYSTATUS_PRESSURE_WARN | NOTE_MEMORYSTATUS_PRESSURE_CRITICAL,
                 );
                 self.pressure = Some((tag, id));
+                Ok(())
+            }
+            // Told through the host's channel.
+            effect @ (Effect::Bind { .. }
+            | Effect::SendTo { .. }
+            | Effect::RecvFrom { .. }
+            | Effect::Unbind { .. }
+            | Effect::ReadStdin { .. }
+            | Effect::WriteOut { .. }
+            | Effect::Now { .. }
+            | Effect::Random { .. }) => {
+                self.host.submit(effect);
                 Ok(())
             }
             Effect::Kill { .. } | Effect::Unwatch { .. } | Effect::Unlisten { .. } => {
@@ -1219,6 +1260,9 @@ impl Kqueue {
             self.to_threads(effect);
         }
         while let Ok(completion) = self.watched.try_recv() {
+            out.push(completion);
+        }
+        while let Ok(completion) = self.hosted.try_recv() {
             out.push(completion);
         }
     }
