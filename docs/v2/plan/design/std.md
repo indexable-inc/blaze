@@ -422,6 +422,53 @@ does not need the workarounds.
   the maps do (and are then linear themselves); `Shared` and `LocalShared` do not, since a cycle
   would leak one; there is no `forget`.
 
+## Eval: who decides how a pure function is computed
+
+A call to a pure function equals its value, so *how* the value is obtained is free to choose:
+run it, look it up, fetch it from another machine, record where it came from. bstd makes that
+choice a value the program passes, like every other.
+
+```rust
+#[blaze::memo]                      // a pure function chosen as a point the evaluator sees
+fn layout(ty: &Type, target: &Target) -> Layout { .. }
+
+fn main(cx: &Cx, io: Io) {
+    let eval = Eval::stored(&io.mem(), &store);        // or Eval::direct(), Eval::handler(my)
+    with eval { compile(cx, &krate) }                  // every memo point below goes through it
+}
+```
+
+- **A memo point is a pure function marked `#[blaze::memo]`.** A call to it becomes
+  `eval.run(point, &args, || body)`: the point's code identity, the arguments, and a way to
+  compute. Purity is what makes this sound: the arguments are everything the result depends on.
+  Only marked functions pay for it; an ordinary pure call is an ordinary call.
+- **The key is derived, not written**: the function's code identity plus its arguments, by
+  reflection ([reflect](reflect.md), items 1 and 5). A changed body is a different key.
+- **`Eval` is one type with providers**, as `Http` is:
+
+  | provider | does |
+  |---|---|
+  | `Eval::direct()` | calls the body; with this one the marks compile to plain calls |
+  | `Eval::memo(mem)` | remembers results in a cache of the memory budget |
+  | `Eval::stored(mem, store)` | the above, kept in the store and the remote cache: the engine blaze builds with ([kernel](kernel.md)) |
+  | `Eval::handler(h)` | yours |
+
+- **A handler sees every point and can wrap another evaluator**, so behaviours stack: record
+  provenance over a stored evaluator, count and time over a direct one, send some points to
+  another machine. `h.run(point, args, next)` returns the value; what it does around `next` is
+  its business, and because the functions are pure it cannot change any answer, only where it
+  comes from.
+- **Provenance is what an evaluator already knows.** While a point runs, the points it calls are
+  its inputs, so the evaluator holds the whole graph of what was computed from what. `blaze why`
+  is that graph for the compiler; a program gets the same for its own values by choosing an
+  evaluator that keeps it.
+- With no `Eval` in scope the default is direct, so a library can mark points without making its
+  users choose anything.
+
+This is the third place bstd lets a program supply its own machinery, after the host behind `Io`
+(the boundary) and a capability's provider (`Http::handler`). None of them is a compiler plug-in:
+each is a value passed down, which is why they compose and why a test can swap any of them.
+
 ## Sandboxes: the one way to run a program
 
 There is no "start a process" call. A program runs in a sandbox, and a sandbox is a value with a
