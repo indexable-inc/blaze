@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: LIR, blaze's own low-level IR, replaces Cranelift IR as the one input of code generation (Andrew's decisions, 2026-11-09) - its level (after layout, ABI and drop elaboration, before instruction selection), columnar encoding, types and operations, how it carries Rust's facts (rustc's set: noalias, nonnull, alignment, ranges, provenance, atomic orderings, volatile; no TBAA) as promises a consumer may drop and meanings it must keep, intrinsics and SIMD, unwinding, debug info, inline asm, references by place, its key and its blaze-format record; its consumers (stencils keyed on LIR ops, LLVM lowered from LIR directly, blaze's wasm emitter; Cranelift left only inside Wasmtime); LLVM's own allocations routed through blaze's allocator with a context per compile and charged to the unit's task; const eval staying on MIR; why a new IR and not lowered MIR, against codegen_ssa, CLIF, LLVM IR, GIMPLE/RTL, Zig's AIR, Go's SSA and MLIR; the migration straight to LIR with no bridge (lanes written in parallel, one switch gated on blaze building blaze and the real projects passing, then the deletions); ranked risks.
+summary: LIR, blaze's own low-level IR, replaces Cranelift IR as the one input of code generation (Andrew's decisions, 2026-11-09) - its level (after layout, ABI and drop elaboration, before instruction selection), columnar encoding, types and operations, how it carries Rust's facts (rustc's set: noalias, nonnull, alignment, ranges, provenance, atomic orderings, volatile; no TBAA) as promises a consumer may drop and meanings it must keep, intrinsics and SIMD, unwinding, debug info, inline asm, references by place, its key and its blaze-format record; its consumers (stencils keyed on LIR ops, LLVM lowered from LIR directly, blaze's wasm emitter; Cranelift left only inside Wasmtime); LLVM's own allocations routed through blaze's allocator with a context per compile and charged to the unit's task; const eval staying on MIR; why a new IR and not lowered MIR, against codegen_ssa, CLIF, LLVM IR, GIMPLE/RTL, Zig's AIR, Go's SSA and MLIR; the migration straight to LIR with no bridge (lanes written in parallel, one switch gated on blaze building blaze and the real projects passing, then the deletions); ranked risks; the decisions that settled its open questions (no TBAA, no stored LIR, no extra facts and no folding until after the switch).
 date: 2026-11-09
 ---
 # LIR: blaze's low-level IR
@@ -154,13 +154,20 @@ same columns in its record when it is kept ([below](#keys-shape-and-the-record))
 | `extra` | `[u32]` | operand lists, wide immediates, block targets with their arguments |
 | `attrs` | `u32`, cold | 0, or a row of the memory-attribute table (`MemAttrs`) for a load, store, atomic or call |
 | `locs` | `u32`, cold | the source location: an index into the function's span table, 0 for none |
-| `blocks` | `(first, len)` + `params` (CSR) + a kind byte | normal, cold, `cleanup`, `catch`, `terminate` |
+| `block_starts` | `u32` | per block, in layout order, its first instruction |
+| `block_kinds` | `u8` | normal, cold, `cleanup`, `catch`, `terminate` |
 
-- **Values** are numbered in layout order: each block's parameters, then each instruction's
-  results. So two builds of one function number it the same, and its bytes are canonical with
-  no renumbering pass.
+- **A value is the index of the instruction that makes it.** A block's parameters are its
+  leading `param` instructions, so values are numbered in layout order (each block's
+  parameters, then each instruction's result), the type of any value is `tys[v]`, and two
+  builds of one function are the same bytes with no renumbering pass.
 - **Results.** An instruction has at most one result. A call returning several values, and an
-  overflow op (`uadd.overflow`), yield a tuple that `project k` instructions read.
+  overflow op (`uadd_overflow`), yield a compound that `project k` instructions read.
+- **The tables** beside the instructions are columns too, in CSR: signatures with their
+  parameters and parameter facts, memory attributes, ranges, references, the function's data
+  and its relocations, intrinsics, slots, `asm` blocks, spans, variables, scopes and inlined
+  bodies. The list of columns is one macro (`columns!`, blaze-lir `func.rs`) that `Func`,
+  its borrowed `View` and the record are all made from, so they cannot drift.
 - **Size budget**, held by `const` asserts as data.md asks: 8 bytes hot per instruction, plus its
   `extra`. CLIF's `InstructionData` alone is 16 bytes, before the DFG's lists.
 
@@ -204,10 +211,12 @@ an integer" set is replaced by pointer operations, and the operations CLIF lacks
 - **Vectors:** `splat`, `extract`, `insert`, `shuffle` (a mask in `extra`), `swizzle`, `reduce.*`,
   `bitmask`, `select` by lanes, `widen` and `narrow`, `load`/`store` with a mask, `gather`,
   `scatter`, and every integer and float op lane by lane.
-- **Control:** `jump`, `br` (with branch weights in `extra`), `switch` (MIR's `SwitchInt`; LLVM's
-  `switch`, a stencil jump table), `return`, `unreachable`, `trap` (with a code), `call`,
-  `call_indirect`, `tail_call` (`become`, [tail-calls.md](../lanes/codegen/tail-calls.md)),
-  `resume`.
+- **Control:** `jump`, `br` (with `likely`/`unlikely` as `expect_true`/`expect_false` hint
+  flags, as rustc gives LLVM), `switch` (MIR's `SwitchInt`; LLVM's `switch`, a stencil jump
+  table), `return`, `unreachable`, `trap` (with a code), `call`, `call_indirect`, `invoke` and
+  `invoke_indirect` (a call with an unwind edge, which ends its block), `tail_call` and
+  `tail_call_indirect` (`become`, [tail-calls.md](../lanes/codegen/tail-calls.md)), `asm_br`
+  (an `asm!` with `label` operands), `resume`.
 - **Facts as instructions:** `assume` (`core::intrinsics::assume`, `assert_unchecked`); `freeze`
   (where the builder needs a value LLVM may not treat as poison).
 - **Target and machine:** `target_intrinsic` (an `llvm.*` name from `core::arch`, by index into the
@@ -216,7 +225,8 @@ an integer" set is replaced by pointer operations, and the operations CLIF lacks
   `get_return_address` are now).
 
 A per-op table (`Op::info`) gives arity, results, the flags each op may carry and which operands
-take immediates. `lir::verify` checks every function against it, along with dominance and the
+take immediates. The crate has 146 operations; the table's code is part of the record's schema,
+so a change to any operation's operands is a new schema. `lir::verify` checks every function against it, along with dominance and the
 block-argument types: in debug builds always, in release builds behind a check mode.
 
 ### Semantics: defined by default, facts are opt-in UB
@@ -293,7 +303,7 @@ is a function of the builder named after the rustc function it ports.
 u32`, and rustc emits no `!tbaa`. The type information LLVM gets is what the table gives:
 alignment, dereferenceability, ranges, and `noalias` from references. A stronger alias model
 (scopes for bodies blaze's MIR inliner builds in, as LLVM's inliner makes them from `noalias`
-parameters) is a later, opt-in addition, measured and argued by itself (open question 2).
+parameters) comes after the switch, each fact its own measured change (Andrew, 2026-11-09).
 
 ### Memory, pointers and provenance
 
@@ -362,8 +372,10 @@ by test ([below](#stencils)), and `float_pair.rs` is deleted: a pair of floats i
 
 ### Unwinding
 
-- **Calls that can unwind:** `call` and `call_indirect` carry an optional unwind edge to a block
-  of kind `cleanup`. Its one parameter is the exception.
+- **Calls that can unwind:** `invoke` and `invoke_indirect`, a call with an unwind edge to a
+  block of kind `cleanup`, whose one parameter is the exception. An invoke ends its block; its
+  result is a value of the block it returns to, whose one predecessor it is. A `call` cannot
+  unwind.
 - **`catch_unwind`:** the `try` intrinsic has a `catch` edge.
 - **`UnwindAction::Terminate`:** a `terminate` edge, a cleanup that calls `panic_cannot_unwind`.
 - **`UnwindResume`:** `resume`.
@@ -465,30 +477,22 @@ The builder is handed a `LirSpec` and cannot read a field its key lacks (rule
   (`Template`, `blob.rs` `BZT7`), unchanged.
 
 **The record.** A kept LIR is one `blaze_format` buffer, the columns above as `Slice`s of one
-`record!` root, as `hir-ty/src/mir/persist.rs`'s `MirRoot` keeps a MIR body:
+`record!` root (`blaze_lir::persist::LirRoot`), as `hir-ty/src/mir/persist.rs`'s `MirRoot` keeps
+a MIR body: the function's `Head` (its signature row, attributes and pointer width), then one
+`Slice` per column, generated from the same `columns!` list as `Func` and `View`.
 
-```rust
-blaze_format::record! {
-    struct LirRoot: 1 {
-        sig: Rel<SigRec>,
-        ops: Slice<u8>, flags: Slice<u8>, tys: Slice<u16>, data: Slice<u32>, extra: Slice<u32>,
-        blocks: Slice<BlockRec>, params: Slice<u32>,
-        attrs: Slice<MemAttrsRec>, ranges: Slice<RangeRec>,
-        refs: Slice<RefRec>, data_blobs: Slice<Rel<DataRec>>, intrinsics: Slice<u32>,
-        slots: Slice<SlotRec>, asm: Slice<Rel<AsmRec>>, text: Slice<u8>,
-        locs: Slice<u32>, spans: Slice<SpanRef>, variables: Slice<VarRec>, scopes: Slice<ScopeRec>,
-    }
-}
-```
-
-The schema hash covers every field, so a LIR of another encoding reads as a schema mismatch,
-never as another function. `lir::persist::read` checks every tag, length and index as it maps
-the buffer, as `mir::persist::read` does. The record is the in-memory form: a consumer reads a
-kept LIR in place, with no decoding into another structure. It is stored as
+The schema hash covers every field, every table row's layout, `blaze_lir::VERSION` and the
+operation table's code, so a LIR of another encoding reads as a schema mismatch, never as
+another function. `lir::persist::read` checks the buffer as blaze-format does, then every tag,
+length and index of the columns (`verify::structure`), so a reader may index the `View` it gets
+without checking. The record is the in-memory form: a consumer reads a kept LIR in place, with
+no decoding into another structure. When LIR is kept (after the switch, below) it is stored as
 `blaze_cas::Kind::Lir` (a new kind), in the warm and cold tiers of [data.md](data.md) (columns
 compress well: `ops` and `tys` are low-entropy).
 
-**When a LIR is kept.** A LIR is kept only where another build reads it:
+**When a LIR is kept.** Never at the switch (Andrew, 2026-11-09): no build stores LIR, and the
+record exists for the round-trip tests and `blaze explain`. After the switch, measured by
+itself, a LIR may be kept where another build reads it:
 
 - every function of a release unit, so ThinLTO-style imports (`blaze_codegen::imports`,
   `v2/release.rs` `summarize`/`emit`) can read a callee's LIR from the store instead of the
@@ -496,13 +500,13 @@ compress well: `ops` and `tys` are low-entropy).
 - every function of a run that tiers up, so the daemon compiles a hot function, and the callees
   it builds in, at LLVM from their LIR.
 
-A dev build that only makes stencil code keeps none: its template is what is reused. Turning
-this on is measured after the switch (open question 3).
+A dev build that only makes stencil code keeps none: its template is what is reused.
 
 **Round trips** (rule `persisted-state-round-trips`):
 
 - `read(write(f)) == f` byte for byte, by a Hegel property over generated LIR.
-- A LIR read from the store compiles to the same bytes as a fresh build, in each consumer.
+- Once LIR is kept: a LIR read from the store compiles to the same bytes as a fresh build, in
+  each consumer.
 - `lir::print` and `lir::parse` round-trip the text form, which replaces the .clif corpora
   of the tests and is what `blaze explain` prints for a function.
 
@@ -513,8 +517,10 @@ so every consumer sees one LIR:
 
 - `promote`: today's `promote.rs`, slots written and read whole become values.
 - `copies`: today's `copies.rs`, small `memcpy`/`memcmp` as loads and stores.
-- `fold`: today's `v2/fold.rs` `masked_ir`/`merge`. Masking a function is zeroing its
-  immediates' `data` words, a column operation.
+- `fold`, after the switch (Andrew, 2026-11-09): today's `v2/fold.rs` `masked_ir`/`merge` on
+  LIR, its own measured change, which also decides whether it runs for every backend and not
+  only wasm32. Masking a function is zeroing its immediates' `data` words, a column operation.
+  Until it lands, a LIR build folds no functions, wasm32's included.
 
 Consumer-side, after the shape, a deterministic function of the LIR, the consumer's `Accepts`
 set and its library id:
@@ -794,7 +800,7 @@ would be a second copy of the IR builder") and removes the IR that forced the wo
 
 | crate | what | depends on |
 |---|---|---|
-| `crates/blaze-lir` (new, `#![blaze::sans_io]`) | `Func`, `Ty`, `Op`, `Op::info`, `Builder` (full and requests-only sinks), `verify`, `print`/`parse`, `persist` (records), `pass/`, `legalize` | blaze-format, blaze-mem, blaze-ids |
+| `crates/blaze-lir` (new, `#![blaze::sans_io]`) | `Func`, `Ty`, `Op`, `Op::info`, `Builder` (full and requests-only sinks, in the caller's allocator), `verify`, `print`/`parse`, `persist` (records); later `pass/` and `legalize` | blaze-format, blaze-hash, blaze-ids |
 | `crates/hir-ty-codegen` | the new builder in `lir.rs` and `lir/` (MIR to LIR), beside the old one in mod.rs until the switch; the v2 adapter; the unwind and debug-info writers | blaze-lir, hir-ty, ... |
 | `crates/blaze-stencil` | the patcher and glue over LIR | blaze-lir; blaze-llvm at build time |
 | `crates/blaze-llvm` (new) | LIR to LLVM IR, release, PGO, sanitizers, reports | blaze-lir, inkwell, llvm-sys |
@@ -803,7 +809,7 @@ would be a second copy of the IR builder") and removes the IR that forced the wo
 
 `blaze_codegen::backend::Prepare` keeps its methods. `prepare` returns the LIR's shape and a
 `Prepared` that is one struct holding the LIR, since all backends read one LIR:
-`v2::Prepared::{Cranelift, Llvm, Stencil}` collapses. `masked` and `merge` work on LIR.
+`v2::Prepared::{Cranelift, Llvm, Stencil}` collapses. `masked` and `merge` work on LIR once `fold` lands after the switch.
 
 ## The way there
 
@@ -851,7 +857,7 @@ each owns its crate or directory, and none changes the old path.
 | `lir-llvm` | `crates/blaze-llvm`: LIR to LLVM IR; `release.rs`, `pgo.rs`, `sanitize.rs`, `report.rs` and `emitted.rs` moved in and reading LIR | per-fact tests that LLVM is given each fact; a planted-bug test per fact (the fact stated where it is false, such as `noalias` on a `&Cell` argument) that a program's own test catches (rule `test-the-cause`) | `lir-ir` |
 | `lir-stencil` | blaze-stencil on LIR: scan, select, slots, glue, `Shape` over `lir::Op`; the generator through `blaze-llvm`'s per-op lowering, making a second library beside the CLIF one until the switch; target-intrinsic stencils | the library checks, per-op results against the Rust operation, the ABI cross-calls with LLVM code on each OS | `lir-ir`, `lir-llvm`'s op lowering |
 | `lir-wasm` | `crates/blaze-lir-wasm`: `wasm::lower` and `wasm/v128.rs` on LIR, `Backend::Wasm` | the wasm emitter's own tests, moved | `lir-ir` |
-| `lir-adapter` | the v2 adapter on LIR: `LirSpec`/`EmitSpec`, `LirKey` with `built_in`, the shape from the record's bytes, `Prepared` as one struct, the walk through the requests-only sink, `promote`/`copies`/`fold`/`frame` and `legalize` on LIR, `Toolchain::codegen` | keys: `harness/keys.py`'s single-input changes miss, `v2/edits/identity.rs`'s edit fuzzer holds; determinism (two builds byte-equal) | `lir-ir`; joins the others |
+| `lir-adapter` | the v2 adapter on LIR: `LirSpec`/`EmitSpec`, `LirKey` with `built_in`, the shape from the record's bytes, `Prepared` as one struct, the walk through the requests-only sink, `promote`/`copies`/`frame` and `legalize` on LIR, `Toolchain::codegen` | keys: `harness/keys.py`'s single-input changes miss, `v2/edits/identity.rs`'s edit fuzzer holds; determinism (two builds byte-equal) | `lir-ir`; joins the others |
 
 ### The switch
 
@@ -889,8 +895,9 @@ with its replacement (rule `one-concept-one-home`):
   `cranelift-reader` leave every one but Wasmtime's. A test holds that no blaze crate's
   dependency closure has `cranelift-codegen` but through `wasmtime`.
 
-**After the switch**, measured, each by itself: keeping LIR in the store for release imports and
-tier-up (`blaze_cas::Kind::Lir`), and facts beyond rustc's set (open questions 2 and 3).
+**After the switch**, measured, each by itself (Andrew, 2026-11-09): keeping LIR in the store
+for release imports and tier-up (`blaze_cas::Kind::Lir`), facts beyond rustc's set, and
+folding near-equal functions on LIR.
 
 **The rule and doc changes with the switch.**
 
@@ -903,7 +910,7 @@ tier-up (`blaze_cas::Kind::Lir`), and facts beyond rustc's set (open questions 2
 - plan.rs's comment that Cranelift optimizes wasm32 code (`opt_level=speed`) is corrected:
   `speed` never reached wasm32's emitter.
 
-## Risks and open questions, ranked
+## Risks, ranked
 
 1. **A fact that is false is a silent miscompile.** A `noalias`, `range`, `inbounds` or `nsw`
    claimed where Rust does not guarantee it changes a correct program's behaviour only under
@@ -944,23 +951,19 @@ tier-up (`blaze_cas::Kind::Lir`), and facts beyond rustc's set (open questions 2
    *Settled by:* `harness/unwinds.py` and `harness/unwindsplice.py` on a Windows ix VM, mixing
    stencil and LLVM frames in one unwind.
 
-Open questions for Andrew:
+Settled by Andrew (2026-11-09), once open questions:
 
-1. **TBAA.** Rust has no type-based aliasing and rustc emits no `!tbaa`. This design gives LLVM
-   rustc's facts (alignment, dereferenceable, ranges, `noalias` from references) and no TBAA.
-   Is that the "type information for alias analysis" meant?
-2. **Facts beyond rustc's set**, such as alias scopes for bodies blaze's MIR inliner builds in,
-   or ranges on loads rustc leaves plain. The proposal is rustc's set at the switch, and each
-   extra fact after it as its own measured change. Or should blaze claim more from the start?
-3. **Keep every LIR, or only what another build reads** (release units, tier-up), or none until
-   measured? The proposal is none at the switch, then release units and tier-up once measured.
-4. **Fold for every backend.** On LIR, folding near-equal functions (`v2/fold.rs`) no longer
-   depends on the backend. Today it runs only for wasm32, an artifact of where the CLIF path
-   could do it ("Folds are Cranelift's", plan.rs). Should it run for stencils and LLVM too?
+1. **TBAA: none.** Rust has no type-based aliasing and rustc emits no `!tbaa`; LLVM gets
+   rustc's facts (alignment, dereferenceable, ranges, `noalias` from references) and no more.
+2. **Facts beyond rustc's set** (alias scopes for bodies blaze's MIR inliner builds in, ranges on
+   loads rustc leaves plain) come after the switch, each its own measured change.
+3. **No LIR is kept at the switch.** Keeping it for release units and tier-up comes after, once
+   measured.
+4. **Folding** near-equal functions on LIR comes after the switch, with whether it runs for
+   every backend.
 
-The memory-and-data skill and `docs/memory-footprint.md` that the brief names are not in the
-tree on this date. The record and encoding rules above are [data.md](data.md)'s,
-[memory.md](memory.md)'s and blaze-format's (`record!`, "the bytes in memory are the bytes on
+The record and encoding rules above are [data.md](data.md)'s, [memory.md](memory.md)'s, the
+memory-and-data skill's and blaze-format's (`record!`, "the bytes in memory are the bytes on
 disk").
 
 ## Related
