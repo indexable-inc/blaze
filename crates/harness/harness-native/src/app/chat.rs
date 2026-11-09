@@ -1667,6 +1667,13 @@ impl App {
                 // Grown past its most, it scrolls on its FieldScroll (step_chat_inputs), the caret kept in view.
             }
         }
+        // The night sky, while nothing was sent in it yet.
+        if let Some(sky) = pv.part("sky") {
+            let on = harness_native_ui_text_api::Starfield { on: !t.items.iter().any(|i| matches!(i, Item::User { .. })) };
+            if sky.entity().try_cloned::<&harness_native_ui_text_api::Starfield>() != Some(on) {
+                sky.set(on);
+            }
+        }
         // Its status bar is the sidebar's (hn.SideChat): the chat in front fills it.
         if let Some(bar) = (self.focused_pane() == Some(pv.id())).then(|| View::of(w.entity_from_id(self.ids.side_chat))) {
             let o = w.entity_from_id(e);

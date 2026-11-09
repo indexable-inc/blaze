@@ -25,6 +25,7 @@ pub mod pack;
 pub mod paint;
 pub mod photo;
 pub mod select;
+pub mod sky;
 pub mod slug;
 pub mod text;
 pub mod vector;

@@ -241,6 +241,7 @@ hn {
   // his Kip from hn.KipEmpty), over a quiet note naming the key that starts one.
   prefab EmptyPane : hn.Pane {
     Flex: {axis: Column, gap: 10, align: Center, justify: Center, wrap: false}
+    sky : ui.Sky { Starfield: {on: true} }
     kip : ui.Node {
       Hoverable
     }
