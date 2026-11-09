@@ -425,7 +425,8 @@ hn {
 
   // A picture attached to the message being written: its thumbnail (sized by fill_attach to chat_attach_h tall at its
   // aspect), rounded, with a remove button over its top trailing corner on a raised plate so it reads over any picture.
-  // The remove button shows only while the pointer is on the picture (HoverGroup on it, HoverShow on the button).
+  // The remove button shows only while the pointer is on the picture (HoverGroup on it, HoverShow on the button and its
+  // glyph).
   prefab ChatAttach : ui.ZStack {
     HoverGroup
     Cursor: {shape: Arrow}
@@ -448,6 +449,7 @@ hn {
         Size: {w: {kind: Fixed, value: $chat_attach_remove, min: 0, max: 0}, h: {kind: Fixed, value: $chat_attach_remove, min: 0, max: 0}}
         Tooltip: {text: "Remove picture"}
         icon : ui.Symbol {
+          HoverShow: {row: 0, keep: false, away: false}
           Size: {w: {kind: Fixed, value: $chat_attach_icon, min: 0, max: 0}, h: {kind: Fixed, value: $chat_attach_icon, min: 0, max: 0}}
         }
       }
@@ -533,7 +535,8 @@ hn {
   prefab ChatActivityPopHead : ui.Lead, Strong {
     TextStyle: {size: $size_peek_body, line: $line_peek_title, role: 0, bold: 1}
   }
-  prefab ChatActivityPopMeta : ui.Lead, Muted {
+  prefab ChatActivityPopMeta : ui.Words, Muted {
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     TextStyle: {size: $size_peek_meta, line: $line_peek_meta, role: 0, bold: 0}
   }
   prefab ChatActivityPopText : ui.Words, Ink {
@@ -585,14 +588,15 @@ hn {
     }
   }
 
-  // A finished turn's steps button, before the person's bubble while the pointer is on its row (HoverShow): a list
-  // glyph; a press shows the turn's steps under it, or folds them again (its Action and Tooltip, from the host).
+  // A finished turn's steps button, before the person's bubble while the pointer is on its row (HoverShow on it and on
+  // its glyph: a node's hover fade is its own, not its subtree's): a list glyph; a press shows the turn's steps under it, or folds them again (its Action and Tooltip, from the host).
   prefab ChatTurnSteps : ui.IconButton {
     HoverShow: {row: 0, keep: false, away: false}
     AlignSelf: {align: Center}
     Size: {w: {kind: Fixed, value: $chat_turn_steps, min: 0, max: 0}, h: {kind: Fixed, value: $chat_turn_steps, min: 0, max: 0}}
     Padding: {l: 0, r: 0, t: 0, b: 0}
     icon : ui.Symbol {
+      HoverShow: {row: 0, keep: false, away: false}
       Icon: {glyph: ""}
       Size: {w: {kind: Fixed, value: $chat_turn_steps_icon, min: 0, max: 0}, h: {kind: Fixed, value: $chat_turn_steps_icon, min: 0, max: 0}}
     }

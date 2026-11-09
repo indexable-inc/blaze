@@ -1348,8 +1348,14 @@ impl App {
                 if let Some((m, e)) = &st.started {
                     chats.entry(sid).or_default().start_on(m.as_deref(), e.as_deref());
                 }
-                drop(chats);
-                self.link.attach(sid, 80, 24, true);
+                // A shot's recorded chat stands in for the daemon's stream.
+                match self.shot_feed.get(&sid) {
+                    Some(bytes) => chats.entry(sid).or_default().feed(bytes),
+                    None => {
+                        drop(chats);
+                        self.link.attach(sid, 80, 24, true);
+                    }
+                }
             }
         }
         // Drawn in the window's appearance on the theme's ground (`tone_ground`, not the terminal's): a chat is a page, so it
@@ -1362,6 +1368,7 @@ impl App {
                 v.entity().set(scheme);
             }
         }
+        self.watch_chats();
         let chats = self.chats.borrow();
         let empty = Transcript::default();
         let t = chats.get(&sid).unwrap_or(&empty);
@@ -1598,6 +1605,7 @@ impl App {
         }
         let turn_from = t.turn_ts.unwrap_or(u64::MAX);
         let chats = self.chats.borrow();
+        let mut watch: Vec<u64> = Vec::new(); // alloc: a few sub-agents, a frame
         o.each_child(|c| {
             let id = *c.id();
             let status = self.status_of(id);
@@ -1632,12 +1640,19 @@ impl App {
             };
             let ran = start.map(|s| end.unwrap_or(now).saturating_sub(s));
             let took = if state == "running" { ran.map(ran_for).unwrap_or_default() } else { String::new() };
-            let sub = c.try_cloned::<&model::Object>().and_then(|ob| chats.get(&ob.id));
+            let sid = c.try_cloned::<&model::Object>().map(|ob| ob.id);
+            if let Some(sid) = sid.filter(|_| c.has(model::ChatMode::id())) {
+                watch.push(sid);
+            }
+            let sub = sid.and_then(|sid| chats.get(&sid));
             let listed = c.try_cloned::<&model::AgentModel>().unwrap_or_default();
             let pop = agent_pop(&name(), state, sub, listed.s.as_str(), listed.effort.as_str(), ran);
             chips.push(Chip { key: format!("s{id}"), state, words: name(), took, action: format!("select:{id}"), pop });
         });
         drop(chats);
+        for sid in watch {
+            self.watch_chat(sid);
+        }
         if chips.len() > ACTIVITY_MAX {
             let more = chips.len() - (ACTIVITY_MAX - 1);
             let rest: Vec<String> = chips[ACTIVITY_MAX - 1..].iter().map(|c| c.words.clone()).collect();
@@ -1672,6 +1687,31 @@ impl App {
         });
         if let Some(pop) = foot.part("activity_pop") {
             fill_activity_pop(pop, strip, &chips);
+        }
+    }
+
+    /// Attach chat `sid`'s events once, for a look only (its transcript then fills as a shown chat's does): a sub-agent
+    /// whose chip shows over its parent's composer. A shot's recorded chat is fed instead.
+    /// Asked while the transcripts are borrowed (the pane's fill), so it waits for the next fill ([`App::watch_chats`]).
+    fn watch_chat(&self, sid: u64) {
+        let mut w = self.watched.borrow_mut();
+        if !w.0.contains(&sid) {
+            w.0.insert(sid);
+            w.1.push(sid);
+        }
+    }
+
+    /// Attach the chats [`App::watch_chat`] asked for, before a pane's fill borrows the transcripts.
+    fn watch_chats(&self) {
+        let due = std::mem::take(&mut self.watched.borrow_mut().1);
+        for sid in due {
+            if self.link.attached(sid) || self.chats.borrow().contains_key(&sid) {
+                continue;
+            }
+            match self.shot_feed.get(&sid) {
+                Some(bytes) => self.chats.borrow_mut().entry(sid).or_default().feed(bytes),
+                None => self.link.attach(sid, 80, 24, true),
+            }
         }
     }
 
@@ -2918,7 +2958,7 @@ fn clip_lines(s: &str, lines: usize, chars: usize) -> String {
 
 /// A step's words as a chip says them: a command by what it runs (`blaze check`), anything else by its own words while
 /// it runs (`Reading chat.rs`), without the ellipsis (its time follows).
-fn step_words(e: &model::chat::Effect) -> String {
+pub(super) fn step_words(e: &model::chat::Effect) -> String {
     let cmd = super::short_cmd(&e.target);
     if e.kind == "exec" && !cmd.is_empty() {
         return cmd;
@@ -3012,6 +3052,8 @@ fn turn_steps(t: &Transcript, since: usize) -> Vec<PopLine> {
 /// it said (a few lines).
 fn agent_pop(name: &str, state: &str, t: Option<&Transcript>, model: &str, effort: &str, ran: Option<u64>) -> Vec<PopLine> {
     let model = t.map(|t| t.model.as_str()).filter(|m| !m.is_empty()).unwrap_or(model);
+    // Its name as the agent lists it ("Opus 5.5"), when it did.
+    let model = t.and_then(|t| t.models.iter().find(|c| c.is(model))).map_or(model, |c| if c.name.is_empty() { model } else { c.name.as_str() });
     let effort = t.map(|t| t.effort.as_str()).filter(|e| !e.is_empty()).unwrap_or(effort);
     let ran = ran.map(ran_for).unwrap_or_default();
     let how = match state {
