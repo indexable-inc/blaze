@@ -2213,8 +2213,10 @@ impl App {
         self.poke();
     }
 
+    /// Command-[ / Command-]: the previous or next row the sidebar shows ([`model::rows`]); it stops at the ends, never wrapping round. Rows folded
+    /// away (under a collapsed node, or a run that has finished and left) are not stepped to, as they cannot be seen.
     fn step_object(&mut self, by: i64) {
-        let objs = self.objects();
+        let objs: Vec<u64> = model::rows(self.world.world_ref()).into_iter().map(|r| r.e).collect();
         if objs.is_empty() {
             return;
         }
@@ -2224,7 +2226,11 @@ impl App {
             .selected()
             .and_then(|s| objs.iter().position(|&e| e == s))
             .map_or(if by > 0 { -1 } else { n }, |i| i as i64);
-        self.select(Some(objs[(at + by).rem_euclid(n) as usize]));
+        // Stops at the first and last rows rather than wrapping round.
+        let to = (at + by).clamp(0, n - 1);
+        if to != at {
+            self.select(Some(objs[to as usize]));
+        }
     }
 
     /// Command-= / Command-- / Command-0: the UI's scale steps (layout, drawing and input all in view points, window
