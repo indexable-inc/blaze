@@ -119,6 +119,9 @@ Footprint is the one number admission, the front end's release and the ceiling r
 
 ### 4. Outputs as records in the store's buffer pool
 
+Design: [v2/plan/design/store-pool.md](v2/plan/design/store-pool.md).
+
+
 - `Persist` from one generic impl over `for const` (`#[blaze::reflect]`, `for<F: Field<T>> F::Type:
   Flat`), replacing the hand-written impls (about 20,000 lines in ten `persist.rs` files).
 - The store's hot tier as a vmcache-style buffer pool: one reserved address range with a fixed slot per
