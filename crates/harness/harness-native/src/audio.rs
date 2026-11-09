@@ -158,14 +158,17 @@ extern "C" fn fill(_user: *mut c_void, queue: *mut c_void, buffer: *mut QueueBuf
         (b as *mut QueueBuffer, std::slice::from_raw_parts_mut(b.data.cast::<[f32; 2]>(), FRAMES))
     };
     out.fill([0.0; 2]);
-    if let Some(m) = MIXER.get() {
+    // The lock is let go before any call into the queue: the queue's calls can wait on this callback.
+    let rest = MIXER.get().is_some_and(|m| {
         let mut m = m.lock().unwrap_or_else(PoisonError::into_inner);
         m.render(out);
-        if m.idle > REST * u64::from(SR) && !m.paused {
-            m.paused = true;
-            // SAFETY: the queue this callback was called for.
-            unsafe { AudioQueuePause(queue) };
-        }
+        let rest = m.idle > REST * u64::from(SR) && !m.paused;
+        m.paused |= rest;
+        rest
+    });
+    if rest {
+        // SAFETY: the queue this callback was called for.
+        unsafe { AudioQueuePause(queue) };
     }
     // SAFETY: the buffer is this queue's, filled above.
     unsafe {
@@ -244,12 +247,19 @@ pub fn start(level: f32, music: bool, cues: Vec<Cue>, themes: Vec<Tune>) -> Resu
 /// The mixer, with its queue running again if it had paused.
 fn with_mixer(f: impl FnOnce(&mut Mixer)) {
     let Some(m) = MIXER.get() else { return };
-    let mut m = m.lock().unwrap_or_else(PoisonError::into_inner);
-    f(&mut m);
     let queue = QUEUE.load(Ordering::Acquire);
-    if m.paused && !queue.is_null() && (!m.playing.is_empty() || m.music.is_some()) {
-        m.paused = false;
-        m.idle = 0;
+    let wake = {
+        let mut m = m.lock().unwrap_or_else(PoisonError::into_inner);
+        f(&mut m);
+        let wake = m.paused && !queue.is_null() && (!m.playing.is_empty() || m.music.is_some());
+        if wake {
+            m.paused = false;
+            m.idle = 0;
+        }
+        wake
+    };
+    // Started with the lock let go: AudioQueueStart can call the callback, which takes it.
+    if wake {
         // SAFETY: the queue start made, never disposed.
         unsafe { AudioQueueStart(queue, std::ptr::null()) };
     }
@@ -337,5 +347,31 @@ mod tests {
             m.render(&mut out);
         }
         assert!(m.playing.is_empty() && m.idle > u64::from(SR), "rung out and idle");
+    }
+}
+
+#[cfg(test)]
+mod live {
+    use super::*;
+    use harness_native_blaze::sound::Voice;
+    /// By hand (`--ignored`): opens the real output and plays one cue.
+    #[test]
+    #[ignore]
+    fn plays_out_loud() {
+        let n = |at: f32, hz: f32| Note { voice: Voice::Mallet, at, dur: 1.0, freq: hz, amp: 0.05, pan: 0.0, sweep: 0.0 };
+        start(0.5, true, vec![Cue("done".into(), 0.4, vec![n(0.0, 440.0), n(0.15, 554.37), n(0.3, 659.25)])], Vec::new()).unwrap();
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if LIB.get().unwrap().lock().unwrap().cues.contains_key("done") { break; }
+        }
+        cue("done");
+        let m = MIXER.get().unwrap();
+        {
+            let g = m.lock().unwrap();
+            println!("after cue: playing {} paused {}", g.playing.len(), g.paused);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2500));
+        let g = m.lock().unwrap();
+        println!("later: clock {} playing {} paused {}", g.clock, g.playing.len(), g.paused);
     }
 }
