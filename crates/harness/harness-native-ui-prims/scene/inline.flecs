@@ -31,10 +31,10 @@ rest {
 meta {
   Fill: $tone_ink_muted
 }
-// The chip under the pointer (a brighter plate, its label underlined) and held down (brighter still); the pointer is
-// the pointing hand over any chip that opens.
+// The chip under the pointer (a wash of the strong ink, its label underlined) and held down (brighter still); the
+// pointer is the pointing hand over any chip that opens. Washes, not the list's selection: a chip is not selected.
 hover {
-  Fill: $tone_selection_focus
+  Fill: $tone_wash
 }
 pressed {
   Fill: $tone_press
