@@ -30,7 +30,7 @@ How blaze is now. Kept true: CI checks their links, paths and settings against t
 
 Designs not (fully) built, newest first.
 
-- [v2/plan/objectives.md](v2/plan/objectives.md) (2026-11-09): The ledger. Every objective of the plan, the check that decides it and where it stands; work is picked from here and nowhere else.
+- [v2/plan/objectives.md](v2/plan/objectives.md) (2026-11-09): The ledger. Every objective of the plan, the check that decides it and where it stands; generated from objectives.json by harness/v2/ledger.py.
 - [v2/plan/design/tasks.md](v2/plan/design/tasks.md) (2026-11-09): Tasks in the agent app. Every agent belongs to a task, the sidebar lists tasks with their agents under them, and a task says what it waits on, what it costs and how it ended.
 - [v2/plan/bounds.md](v2/plan/bounds.md) (2026-11-09): Every speed-of-light bound blaze is held to, one machine-read block each; harness/v2/bounds.py reads this file and budgets.py measures it.
 - [v2/plan.md](v2/plan.md) (2026-11-09): The plan for blaze, whole, on one page. The goal, the rules, the one design every part shares, the targets, and how the work is run; the ledger of objectives is plan/objectives.md.
