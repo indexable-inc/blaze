@@ -165,7 +165,7 @@ pub const fn share(tag: Tag) -> u64 {
     match tag {
         Tag::Infer | Tag::Codegen | Tag::Link | Tag::Frames => 32,
         Tag::Mir | Tag::Query => 24,
-        Tag::Nameres | Tag::Intern | Tag::Diagnostics | Tag::Solver => 16,
+        Tag::Nameres | Tag::Intern | Tag::Diagnostics | Tag::Solver | Tag::Pool => 16,
         Tag::Parse | Tag::Expand | Tag::Store | Tag::Vfs | Tag::Chunks | Tag::Fuzz => 8,
         Tag::Usercode | Tag::Other => 4,
         Tag::Plane | Tag::Io | Tag::Api | Tag::Profile => 2,
