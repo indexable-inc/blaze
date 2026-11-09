@@ -8,7 +8,6 @@ use hir_expand::fixture;
 use super::{check_fail, check_number, check_str, eval_goal};
 use crate::{
     consteval::ConstEvalError,
-    db::HirDatabase,
     display::DisplayTarget,
     mir::{AddressRead, ComptimeError, ComptimeErrorKind, Dispatch, MirEvalError},
     mir_pretty::comptime_error_text,
@@ -227,7 +226,8 @@ fn format_fixture(goal_ty: &str, goal: &str) -> String {
     )
 }
 
-const PAUSE: &str = "{ let args = [Arg { value: SYM, fmt: display }, Arg { value: SYM, fmt: display }]; \
+const PAUSE: &str = "{ \
+     let args = [Arg { value: SYM, fmt: display }, Arg { value: SYM, fmt: display }]; \
      format([\".globl \", \"\\n\", \":\\npause\\nret\\n\"], args).leak() }";
 
 /// The target of the design: `const PAUSE: &str = const static { format!(..).leak() }`. Non-const
@@ -244,7 +244,8 @@ fn a_const_static_block_formats_and_leaks() {
 #[test]
 fn without_static_the_leaked_buffer_is_refused() {
     check_fail(&format_fixture("&str", PAUSE), |e| {
-        matches!(e, ConstEvalError::MirEvalError(MirEvalError::HeapInValue { of_const_allocate: false }))
+        let heap = MirEvalError::HeapInValue { of_const_allocate: false };
+        matches!(&e, ConstEvalError::MirEvalError(it) if *it == heap)
     });
 }
 
@@ -259,7 +260,8 @@ fn a_const_static_block_may_not_own_its_heap() {
         while let ConstEvalError::MirEvalError(MirEvalError::ConstEvalError(_, inner)) = e {
             e = &**inner;
         }
-        matches!(e, ConstEvalError::MirEvalError(MirEvalError::HeapInValue { of_const_allocate: false }))
+        let heap = MirEvalError::HeapInValue { of_const_allocate: false };
+        matches!(e, ConstEvalError::MirEvalError(it) if *it == heap)
     });
 }
 
