@@ -221,7 +221,7 @@ const SYM: &str = "spin";
 
 fn format_fixture(goal_ty: &str, goal: &str) -> String {
     format!(
-        "//- minicore: sized, coerce_unsized, dispatch_from_dyn, fn, transmute\n\
+        "//- minicore: sized, coerce_unsized, dispatch_from_dyn, fn, transmute, index, slice\n\
          #![feature(blaze_comptime)]\n{FORMAT}\nconst GOAL: {goal_ty} = {goal};\n"
     )
 }
@@ -275,8 +275,8 @@ extern "C" {
     fn write(fd: i32, buf: *const u8, count: usize) -> usize;
 }
 const GOAL: usize = const static {
-    let text = [b'.'];
-    unsafe { write(1, &text[0], 1) }
+    let text = b'.';
+    unsafe { write(1, &text, 1) }
 };
 "#;
     check_refused(fixture, |db, refused, text| {
@@ -296,7 +296,7 @@ extern "C" {
 }
 const GOAL: usize = const static {
     let text = [b'a', b'b', 0];
-    unsafe { strlen(&text[0]) }
+    unsafe { strlen(&text as *const [u8; 3] as *const u8) }
 };
 "#,
         2,
