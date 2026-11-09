@@ -120,7 +120,12 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         // The edition's lints name a construct the edition removes, not a cost on a line.
         | Lint::LossyAs
         | Lint::GlobalState
-        | Lint::AsyncFn => None,
+        | Lint::AsyncFn
+        // Kept with `#[expect(..)]` on the function: a mark is the item's choice, not a line's.
+        | Lint::UnmarkedPure
+        | Lint::UnmarkedNopanic
+        | Lint::UnmarkedNoalloc
+        | Lint::UnmarkedNonblocking => None,
     }
 }
 

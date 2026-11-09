@@ -1084,6 +1084,14 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::async_fn", Allow, "detects an `async fn`, `async` block or `async` closure, which the blaze edition removes: a wait parks the fiber and the may-suspend effect is inferred")
         .externally_loaded(),
+    l("blaze::unmarked_pure", Allow, "detects a function the effects walk proves pure that lacks `#[blaze::pure]`, which callers and the cache could rely on")
+        .externally_loaded(),
+    l("blaze::unmarked_nopanic", Allow, "detects a function the effects walk proves cannot panic that lacks `#[blaze::nopanic]`, which callers could rely on")
+        .externally_loaded(),
+    l("blaze::unmarked_noalloc", Allow, "detects a function the effects walk proves never calls the global allocator that lacks `#[blaze::noalloc]`, which callers could rely on")
+        .externally_loaded(),
+    l("blaze::unmarked_nonblocking", Allow, "detects a function the effects walk proves never blocks the thread that lacks `#[blaze::nonblocking]`, which callers could rely on")
+        .externally_loaded(),
     // Emitted by the release build, which reads it from the code LLVM made, never by `blaze check`.
     l("blaze::vecreport", Allow, "reports a bounds check, overflow check or panic path the optimizer kept inside a loop, and a loop it left unvectorized with its reason, read from the optimized code; only hot loops when the build has a profile"),
 ];

@@ -19,10 +19,12 @@ the release build reports, only by its flags). `checkfree`,
 `nopanic`, `noalloc` and `nonblocking` are in `blaze::general` but `deny` by default, and fire
 only on functions marked with their attribute (`#[blaze::checkfree]`, `#[blaze::nopanic]`, ...).
 
-The group `blaze::edition` (`async_fn`, `global_state`, `lossy_as`) flags what the blaze
-edition removes (docs/v2/plan/design/edition.md); it is allowed unless a workspace or crate
-turns it on to get ready for the edition (`edition = "warn"` in `[workspace.metadata.blaze.lints]`,
-or `#![warn(blaze::edition)]`). None of its lints has a fix.
+The group `blaze::edition` (`async_fn`, `global_state`, `lossy_as`, `unmarked_pure`,
+`unmarked_nopanic`, `unmarked_noalloc`, `unmarked_nonblocking`) flags what the blaze edition
+removes and what it writes at a crate's border (docs/v2/plan/design/edition.md); it is allowed
+unless a workspace or crate turns it on to get ready for the edition (`edition = "warn"` in
+`[workspace.metadata.blaze.lints]`, or `#![warn(blaze::edition)]`). Only the four `unmarked_*`
+lints have a fix.
 
 Several lints come from ideas of the Goose language (no global heap, data stacks, bump
 growth, inline nested data, narrow relative links, variable-size enums, in-place construction
@@ -69,6 +71,7 @@ The lints with a threshold read it from `clippy.toml` (or `.clippy.toml`), as cl
 | `bounded-heap-field-string-bytes` | `bounded_heap_field` | 16 (bytes) |
 | `bounded-heap-field-vec-len` | `bounded_heap_field` | 8 (elements) |
 | `large-box-threshold` | `box_large_new` | 4096 (bytes) |
+| `unmarked-effects-private` | `unmarked_pure`, `unmarked_nopanic`, `unmarked_noalloc`, `unmarked_nonblocking` | `false` (a flag; `true` also finds functions with no visibility written) |
 
 ```toml
 # clippy.toml
@@ -1215,6 +1218,58 @@ and make the calls on the wrapper. A `BufWriter` writes what is left when droppe
 
 **Allowing it.** `#[expect(blaze::unbuffered_io, reason = "..")]`, where each call must reach
 the system on its own (a log that must survive a crash).
+
+## `unmarked_pure`, `unmarked_nopanic`, `unmarked_noalloc`, `unmarked_nonblocking`
+
+In `blaze::edition`, allowed by default. Each can be turned on alone.
+
+**What it catches.** A function, method or associated function with a body that the effects
+walk proves pure, nopanic, noalloc or nonblocking and that lacks `#[blaze::pure]`,
+`#[blaze::nopanic]`, `#[blaze::noalloc]` or `#[blaze::nonblocking]`. The proof is the answer
+the attribute's own lint (`pure`, `nopanic`, `noalloc`, `nonblocking`) computes for a marked
+function, so the attribute is suggested only where it then passes: nothing is trusted but what
+that check trusts, and where the walk can't decide (a body that does not lower, a call it can't
+resolve) nothing is found. By default only a function at the crate's border is found: one with
+a visibility written (`pub`, `pub(crate)`, `pub(in ..)`), or a method of a trait, or of an impl
+of one, whose trait has one. `unmarked-effects-private = true` in `clippy.toml` finds every
+function.
+
+One finding per lint that is on and proved, each at the function's name with its own fix, so a
+level set on the function (`#[expect(blaze::unmarked_noalloc, reason = "..")]`, `#[allow(..)]`)
+works per lint, and `--fix` writes only the attributes of the lints left on there.
+
+- A generic function is proved as a marked one is checked: in its own where-clauses, with what
+  only an instance decides (a type parameter's method, its drop) left to each instance.
+- `unmarked_nopanic` finds only in a crate checked with overflow checks (a dev profile, or
+  `overflow-checks = true`), where a proof covers the checks release drops, so the mark holds
+  in dev and in release. Checked without them it finds nothing.
+- No attribute implies another: each refuses a kind of effect the others allow.
+- In a crate with `#![blaze::capabilities]` the global heap is out of reach, so
+  `unmarked_noalloc` finds only a function whose signature could allocate: a parameter (`self`
+  included, behind references too) that is or holds a type implementing
+  `core::alloc::Allocator`, a type with an allocator parameter (`Vec<T, A>`), or bstd's `Cx`.
+  A signature with none already says noalloc.
+- A method of an impl is found whether or not its trait is marked: the check reads the
+  function's own attribute first. A method covered by its trait's attribute is not found.
+
+**Why it matters.** The blaze edition infers effects inside a crate and writes them at its
+border. A mark the code already earns lets callers rely on it (a `pure` caller needs no
+`trusted`, the kernel caches a pure step), and from then on its lint refuses a change that
+breaks it, naming the call chain.
+
+**How to fix it.** `blaze check --fix` writes each attribute on its own line at the item's
+indentation, keeping the function's effect attributes in the order pure, nopanic, noalloc,
+nonblocking and moving none it has: before the first one written that comes later in that
+order, else after the last one written, else directly above the signature, under the doc
+comments and the other attributes. Attributes that land at one place are written one per pass
+of `--fix`, so a function gaining all four takes its four passes.
+
+**Not found.** A function already marked in any form (the bare word, `trusted = ".."`, a
+malformed attribute, or the attribute on its trait); a trait method with no body; a test, a
+bench, the crate's `main` and test code; a function a macro wrote.
+
+**Allowing it.** `#[expect(blaze::unmarked_pure, reason = "..")]` (or the lint the finding
+names) on the function, where the effect is an accident of today's body and not a promise.
 
 ## `unwind_across_ffi`
 

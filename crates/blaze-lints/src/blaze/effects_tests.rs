@@ -7,9 +7,9 @@
 
 use crate::tests::lint;
 
-const MINICORE: &str = "//- minicore: sized, copy, clone, drop, option, result, fn, panic, index, slice, builtin_impls, allocator_api\n";
+pub(super) const MINICORE: &str = "//- minicore: sized, copy, clone, drop, option, result, fn, panic, index, slice, builtin_impls, allocator_api\n";
 
-const TOOLCHAIN: &str = r#"
+pub(super) const TOOLCHAIN: &str = r#"
 //- /alloc.rs crate:alloc
 pub mod alloc {
     unsafe extern "Rust" {
@@ -44,6 +44,9 @@ pub mod vec {
                 Ok(ptr) => Vec { ptr: ptr as *mut T, len: 0, alloc },
                 Err(_) => loop {},
             }
+        }
+        pub fn len(&self) -> usize {
+            self.len
         }
     }
 }
