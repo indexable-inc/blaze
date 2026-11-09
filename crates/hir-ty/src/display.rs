@@ -2588,6 +2588,10 @@ impl<'db> HirDisplayWithExpressionStore<'db> for TypeRefId {
                 write!(f, " is ")?;
                 pat.hir_fmt(f, owner, store)?;
             }
+            TypeRef::Union(members) => {
+                let members = members.iter().map(ExpressionStoreAdapter::wrap(owner, store));
+                f.write_joined(members, " | ")?;
+            }
             TypeRef::UnsafeBinder { lifetimes, ty } => {
                 let lifetimes = store.names(lifetimes);
                 if lifetimes.is_empty() {

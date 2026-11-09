@@ -78,7 +78,8 @@ pub use hir_def::{
 pub use hir_expand::BuiltinChild;
 pub use hir_ty::solver_errors::{TypeAnnotationNeeded, UnreportedSolverError};
 pub use hir_ty::{
-    AssocTypeFailure, CycleQuery, GenericArgsProhibitedReason, IncorrectGenericsLenKind,
+    AssocTypeFailure, CycleQuery, ERROR_UNION_MAX_MEMBERS, ErrorUnionRefusal,
+    GenericArgsProhibitedReason, IncorrectGenericsLenKind,
     MissingLifetimeKind, PatternTypeUnsupported, ReturnKind, StructPathDef, StructPathFound,
     const_param_ty::ConstParamTyReason,
     consteval::CreateConstError,
@@ -190,6 +191,7 @@ diagnostics![AnyDiagnostic<'db> ->
     MissingSelfDefaultParams,
     ObjectWithoutTrait,
     PatternTypeNotLowered,
+    ErrorUnionRefused,
     QueryCycle,
     InactiveCode,
     IncoherentImpl,
@@ -1683,6 +1685,14 @@ impl QueryCycle {
 pub struct PatternTypeNotLowered {
     pub ty: InFile<AstPtr<ast::Type>>,
     pub reason: PatternTypeUnsupported,
+}
+
+/// An error union (`A | B`, `#![blaze::error_unions]`) refused for `reason`, at `ty`: the
+/// member refused, or the whole union.
+#[derive(Debug)]
+pub struct ErrorUnionRefused {
+    pub ty: InFile<AstPtr<ast::Type>>,
+    pub reason: ErrorUnionRefusal,
 }
 
 #[derive(Debug)]
@@ -5467,6 +5477,11 @@ impl<'db> AnyDiagnostic<'db> {
                 }
                 .into()
             }
+            TyLoweringDiagnostic::ErrorUnionRefused { source, reason } => ErrorUnionRefused {
+                ty: Self::type_syntax(*source, source_map)?,
+                reason: *reason,
+            }
+            .into(),
             TyLoweringDiagnostic::QueryCycle { def, query } => {
                 QueryCycle::new(db, *def, *query).into()
             }

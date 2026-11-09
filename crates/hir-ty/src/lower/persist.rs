@@ -35,7 +35,7 @@ use crate::{
             SideTable,
         },
         diagnostics::{
-            AssocTypeFailure, AssocTypeQself, CycleQuery, ElidedLifetimeSite,
+            AssocTypeFailure, AssocTypeQself, CycleQuery, ElidedLifetimeSite, ErrorUnionRefusal,
             GenericArgsProhibitedReason, IncorrectGenericsLenKind, MissingLifetimeKind,
             PathGenericsSource, PathLoweringDiagnostic, PatternTypeUnsupported,
         },
@@ -914,6 +914,18 @@ pub(crate) fn put_diagnostic(w: &mut Vec<u32>, diagnostic: &TyLoweringDiagnostic
                 PatternTypeUnsupported::Pattern => 0,
             });
         }
+        TyLoweringDiagnostic::ErrorUnionRefused { source, reason } => {
+            w.push(41);
+            put_local(w, *source);
+            w.push(match reason {
+                ErrorUnionRefusal::NotEnabled => 0,
+                ErrorUnionRefusal::NoLangItem => 1,
+                ErrorUnionRefusal::TypeParam => 2,
+                ErrorUnionRefusal::NotNamed => 3,
+                ErrorUnionRefusal::Ambiguous => 4,
+                ErrorUnionRefusal::TooMany => 5,
+            });
+        }
         TyLoweringDiagnostic::QueryCycle { def, query } => {
             w.push(10);
             put_generic_def(w, *def);
@@ -1233,6 +1245,18 @@ impl Words<'_> {
                     _ => return Err(self.invalid("a pattern type not lowered for no reason")),
                 },
             },
+            41 => TyLoweringDiagnostic::ErrorUnionRefused {
+                source: self.local()?,
+                reason: match self.u32()? {
+                    0 => ErrorUnionRefusal::NotEnabled,
+                    1 => ErrorUnionRefusal::NoLangItem,
+                    2 => ErrorUnionRefusal::TypeParam,
+                    3 => ErrorUnionRefusal::NotNamed,
+                    4 => ErrorUnionRefusal::Ambiguous,
+                    5 => ErrorUnionRefusal::TooMany,
+                    _ => return Err(self.invalid("an error union refused for no reason")),
+                },
+            },
             10 => TyLoweringDiagnostic::QueryCycle {
                 def: self.generic_def()?,
                 query: match self.u32()? {
@@ -1496,6 +1520,11 @@ mod tests {
                 source,
                 reason: PatternTypeUnsupported::Pattern,
             },
+            TyLoweringDiagnostic::ErrorUnionRefused {
+                source,
+                reason: ErrorUnionRefusal::NotEnabled,
+            },
+            TyLoweringDiagnostic::ErrorUnionRefused { source, reason: ErrorUnionRefusal::TooMany },
             TyLoweringDiagnostic::QueryCycle { def, query: CycleQuery::Predicates },
             TyLoweringDiagnostic::QueryCycle { def: trait_def, query: CycleQuery::SuperClauses },
             TyLoweringDiagnostic::QueryCycle { def: trait_def, query: CycleQuery::ImpliedClauses },

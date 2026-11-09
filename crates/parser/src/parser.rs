@@ -44,6 +44,11 @@ pub(crate) struct Parser<'t> {
     outline: bool,
     /// Which tokens are a `{` some `}` closes ([`Parser::curly_closes`]), made when first asked.
     closed_curlies: Option<Vec<bool>>,
+    /// Whether a type here may be an error union `A | B` (`#![blaze::error_unions]`): the
+    /// input's extension, off while a type is read where Rust lets a `|` follow one (a
+    /// closure's parameters, after `as`) and inside one union's members
+    /// ([`Parser::with_unions`]).
+    unions: bool,
 }
 
 const PARSER_STEP_LIMIT: usize = if cfg!(debug_assertions) { 150_000 } else { 15_000_000 };
@@ -59,7 +64,22 @@ impl<'t> Parser<'t> {
             steps: 0,
             outline: false,
             closed_curlies: None,
+            unions: inp.extensions().error_unions(),
         }
+    }
+
+    /// Whether a type parsed here may be an error union `A | B`.
+    pub(crate) fn unions(&self) -> bool {
+        self.unions
+    }
+
+    /// Runs `parse` with error unions allowed (`true`, inside a delimiter: only when the
+    /// input's extensions have them) or not (`false`), then puts back what was allowed before.
+    pub(crate) fn with_unions(&mut self, allowed: bool, parse: impl FnOnce(&mut Parser<'t>)) {
+        let allowed = allowed && self.inp.extensions().error_unions();
+        let before = std::mem::replace(&mut self.unions, allowed);
+        parse(self);
+        self.unions = before;
     }
 
     pub(super) fn new_outline(inp: impl Into<Tokens<'t>>) -> Parser<'t> {

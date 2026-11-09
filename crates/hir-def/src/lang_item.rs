@@ -541,6 +541,9 @@ language_item_table! { LangItems =>
     PointeeTrait,            sym::pointee_trait,       TraitId;
     Metadata,                sym::metadata_type,       TypeAliasId;
     DynMetadata,             sym::dyn_metadata,        StructId;
+    /// The type of blaze's error unions `A | B` (`#![blaze::error_unions]`): core's
+    /// `error_union::ErrorUnion<(A, B)>`, which hir-ty lowers a union to.
+    ErrorUnion,              sym::error_union,         StructId;
 
     Freeze,                  sym::freeze,              TraitId;
 

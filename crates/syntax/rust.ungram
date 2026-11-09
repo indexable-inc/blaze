@@ -699,6 +699,7 @@ Type =
 | RefType
 | SliceType
 | TupleType
+| UnionType
 | UnsafeBinderType
 
 ParenType =
@@ -743,6 +744,10 @@ UnsafeBinderType =
 
 PatternType =
   'builtin' '#' 'pattern_type' '(' Type 'is' Pat ')'
+
+// `A | B | C`, blaze's error unions (`#![blaze::error_unions]`).
+UnionType =
+  types:(Type ('|' Type)+)
 
 ImplTraitType =
   'impl' TypeBoundList

@@ -30,6 +30,12 @@ rust-src https://static.rust-lang.org/dist/2026-10-27/rust-src-nightly.tar.xz a9
 #   `IntTryFrom<S>`, which only blaze's trait solver answers and nothing can implement. Every
 #   impl's self type or argument must be such an integer, so no other type gains an impl
 #   (docs/v2/plan/design/arbitrary-ints.md).
+# - core/src/error_union.rs (new) with its `pub mod error_union;` in core/src/lib.rs: the type
+#   of blaze's error unions `A | B` (`#![blaze::error_unions]`), `ErrorUnion<M>` over a tuple
+#   of members (`#[lang = "error_union"]`, which hir-ty lowers a union to), the trait `Members`
+#   and the enums `Of2`..`Of12` that hold one member's value, and `Debug`, `Display` and `Error`
+#   by delegation to the member held. Unstable under `blaze_error_unions`; nothing else in
+#   library/ refers to it.
 # - core/src/blaze.rs (new) with its `pub mod blaze;` in core/src/lib.rs: blaze's own attribute
 #   macros, `contract_test` (`#[rustc_builtin_macro]`, expanded by blaze's `hir-expand`), which
 #   the attribute path `blaze::contract_test` names in every crate. Unstable under

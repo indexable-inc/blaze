@@ -39,6 +39,7 @@
 //!     env: option
 //!     eq: sized, unary_ops, builtin_impls
 //!     error: fmt
+//!     error_union: error
 //!     float_consts: unary_ops, builtin_impls
 //!     fmt: option, result, transmute, coerce_unsized, copy, clone, derive
 //!     fn: sized, tuple
@@ -2824,6 +2825,59 @@ pub mod error {
     }
 }
 // endregion:error
+
+// region:error_union
+pub mod error_union {
+    use crate::{error::Error, fmt};
+
+    pub trait Members {
+        type Repr;
+    }
+
+    #[lang = "error_union"]
+    pub struct ErrorUnion<M: Members>(pub M::Repr);
+
+    pub enum Of2<T0, T1> {
+        M0(T0),
+        M1(T1),
+    }
+    pub enum Of3<T0, T1, T2> {
+        M0(T0),
+        M1(T1),
+        M2(T2),
+    }
+    impl<T0, T1> Members for (T0, T1) {
+        type Repr = Of2<T0, T1>;
+    }
+    impl<T0, T1, T2> Members for (T0, T1, T2) {
+        type Repr = Of3<T0, T1, T2>;
+    }
+    impl<T0: fmt::Display, T1: fmt::Display> fmt::Display for ErrorUnion<(T0, T1)> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match &self.0 {
+                Of2::M0(it) => fmt::Display::fmt(it, f),
+                Of2::M1(it) => fmt::Display::fmt(it, f),
+            }
+        }
+    }
+    impl<T0: fmt::Debug, T1: fmt::Debug> fmt::Debug for ErrorUnion<(T0, T1)> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match &self.0 {
+                Of2::M0(it) => fmt::Debug::fmt(it, f),
+                Of2::M1(it) => fmt::Debug::fmt(it, f),
+            }
+        }
+    }
+    impl<T0: Error, T1: Error> Error for ErrorUnion<(T0, T1)> {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            match &self.0 {
+                Of2::M0(it) => it.source(),
+                Of2::M1(it) => it.source(),
+            }
+        }
+    }
+}
+// endregion:error_union
 
 // region:float_consts
 impl f32 {

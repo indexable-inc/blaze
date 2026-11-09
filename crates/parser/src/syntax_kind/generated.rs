@@ -355,6 +355,9 @@ pub enum SyntaxKind {
     RECOMMENDS_KW,
     REQUIRES_KW,
     SPEC_CLAUSE,
+    // blaze's error unions (`#![blaze::error_unions]`, docs/v2/plan/design/edition.md), after
+    // the others too.
+    UNION_TYPE,
     #[doc(hidden)]
     __LAST,
 }
@@ -474,6 +477,7 @@ impl SyntaxKind {
             | UNSAFE_BINDER_CAST_EXPR
             | UNSAFE_BINDER_TYPE
             | SPEC_CLAUSE
+            | UNION_TYPE
             | OR_PAT
             | PARAM
             | PARAM_LIST

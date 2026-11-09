@@ -11,6 +11,7 @@ mod const_bounds;
 mod const_param_ty;
 mod consteval_inference;
 mod elided_lifetime_args;
+mod error_unions;
 mod fn_cache;
 mod fn_item_predicates;
 mod impl_header_elided_lifetimes;

@@ -7,6 +7,7 @@
 //! This usually involves resolving names, collecting generic arguments etc.
 pub(crate) mod batch;
 pub(crate) mod diagnostics;
+mod error_union;
 pub(crate) mod path;
 pub mod persist;
 
@@ -1260,6 +1261,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                 self.lifetime_elision = old_lifetime_elision;
                 Ty::new_unsafe_binder(interner, Binder::bind_with_vars(inner, bound_vars))
             }
+            TypeRef::Union(members) => self.lower_error_union(type_ref_id, members),
             TypeRef::Error => self.types.types.error,
         };
         (ty, res)

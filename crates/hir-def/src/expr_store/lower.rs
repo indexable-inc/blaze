@@ -1283,6 +1283,17 @@ impl<'db> ExprCollector<'db> {
                 let ty = self.lower_type_ref_opt(inner.ty(), impl_trait_lower_fn);
                 self.alloc_type_ref(TypeRef::UnsafeBinder { lifetimes, ty }, ptr)
             }
+            ast::Type::UnionType(inner) => {
+                let mark = self.store.list_mark();
+                for member in inner.types() {
+                    let ty = self.lower_type_ref(member, impl_trait_lower_fn);
+                    self.store.push_list_type(ty);
+                }
+                let id = self.with_lists(mark, |this, lists| {
+                    this.store.alloc_type_ref(TypeRef::Union(lists.types_since(mark)))
+                });
+                self.map_type_ref(id, ptr, false)
+            }
             ast::Type::MacroType(mt) => match mt.macro_call() {
                 Some(mcall) => {
                     let macro_ptr = AstPtr::<tag::MacroCall>::of(mcall);

@@ -309,6 +309,14 @@ impl Printer<'_> {
                 }
             }
             ast::Type::MacroType(it) => self.source(it.syntax()),
+            ast::Type::UnionType(it) => {
+                for (at, member) in it.types().enumerate() {
+                    if at > 0 {
+                        self.word(" | ");
+                    }
+                    self.opt_ty(Some(member));
+                }
+            }
             ast::Type::UnsafeBinderType(it) => {
                 self.word("unsafe");
                 if let Some(list) = it.generic_param_list() {

@@ -33,7 +33,7 @@ pub use crate::{
     content::{CFG_OPTIONS_DOMAIN, InputId, cfg_options_content},
     crate_attrs::{
         CRATE_ATTR_FILE_NAME, CrateAttrError, applied_crate_attr_files, crate_attr_error,
-        crate_attr_files, crate_attr_owner,
+        crate_attr_files, crate_attr_owner, crate_extensions,
     },
     db::{Db, Reader, RunOrder, Shared, executions, set_run_order},
     editioned_file_id::EditionedFileId,
