@@ -140,17 +140,19 @@ fn tone_of(w: &PlanWindow) -> &'static str {
 
 /// The plan meter in `slot` (the status bar's `plan`) for `windows` (none: no meter, no room), as agent kind `agent`'s
 /// maker counts them, at unix second `now`: the shown window's bar filling in its tone over a track of `ink` faintly,
-/// its words in its tone, the tooltip saying every window.
-pub(in crate::app) fn fill_plan(slot: View<'_>, windows: &[PlanWindow], agent: &str, ink: Fill, now: u64) {
+/// its words in its tone (`worded`; else the bar alone, the words leading its tooltip), the tooltip saying every window.
+pub(in crate::app) fn fill_plan(slot: View<'_>, windows: &[PlanWindow], agent: &str, ink: Fill, now: u64, worded: bool) {
     let w = slot.entity().world();
     view::for_each_of(slot, shown(windows).map(|s| ("plan", "hn.ChatPlan", s)), |v, s, _| {
         let tone = fill_of(w, tone_of(s));
         let text = tip(windows, agent, now, Clock::local);
+        let text = if worded { text } else { format!("{}\n{text}", words(s)) };
         if v.entity().try_cloned::<&Tooltip>().is_none_or(|t| t.text.as_str() != text) {
             v.set(Tooltip { text: text.as_str().into() });
         }
         if let Some(p) = v.part("words") {
-            p.text(&words(s));
+            // Where room is short (the sidebar's foot) the bar alone shows; its words lead the tooltip.
+            p.text(&if worded { words(s) } else { String::new() });
             set_fill(p, tone);
         }
         let Some(track) = v.part("track") else { return };

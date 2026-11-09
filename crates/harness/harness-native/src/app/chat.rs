@@ -1332,11 +1332,6 @@ fn composer(pv: View<'_>) -> Option<View<'_>> {
     pv.part("foot")?.part("card")
 }
 
-/// Chat pane `pv`'s status bar under its composer (hn.ChatPane's foot.status: model and effort, context, plan).
-fn status_bar(pv: View<'_>) -> Option<View<'_>> {
-    pv.part("foot")?.part("status")
-}
-
 /// Chat pane `pv`'s composer's words' area (its ui.field.GrowingTextArea).
 fn composer_area(pv: View<'_>) -> Option<View<'_>> {
     composer(pv)?.part("entry")?.part("area")
@@ -1384,7 +1379,7 @@ impl App {
     }
 
     /// The focused pane, its chat session's object and session id, when it shows one.
-    fn focused_chat(&self) -> Option<(u64, u64, u64)> {
+    pub(in crate::app) fn focused_chat(&self) -> Option<(u64, u64, u64)> {
         let p = self.focused_pane()?;
         let o = model::shows(self.world.world_ref(), p)?;
         if model::pane_kind(o) != model::PaneKind::Chat {
@@ -1664,7 +1659,8 @@ impl App {
                 // Grown past its most, it scrolls on its FieldScroll (step_chat_inputs), the caret kept in view.
             }
         }
-        if let Some(bar) = status_bar(pv) {
+        // Its status bar is the sidebar's (hn.SideChat): the chat in front fills it.
+        if let Some(bar) = (self.focused_pane() == Some(pv.id())).then(|| View::of(w.entity_from_id(self.ids.side_chat))) {
             let o = w.entity_from_id(e);
             // The model and the effort it runs with, as den's picker (chat/pick.rs `Label`), the daemon's listing its last
             // say.
