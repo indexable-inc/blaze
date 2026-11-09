@@ -381,6 +381,9 @@ struct DefMapCrateData {
     /// blaze: `#![blaze::arbitrary_ints]`, under which `u1`..`u128` and `i1`..`i128` are
     /// primitive integer types (docs/v2/plan/design/arbitrary-ints.md).
     arbitrary_ints: bool,
+    /// blaze: `#![blaze::handles]`, under which a move of a `Share` value that is used again
+    /// later is a copy (docs/v2/plan/design/edition.md, change 1; `hir_ty_mir::mir::handles`).
+    handles: bool,
 
     edition: Edition,
     recursion_limit: Option<u32>,
@@ -400,6 +403,7 @@ impl DefMapCrateData {
             no_std: false,
             proc_macro: false,
             arbitrary_ints: false,
+            handles: false,
             edition,
             recursion_limit: None,
         }
@@ -417,6 +421,7 @@ impl DefMapCrateData {
             no_std: _,
             proc_macro: _,
             arbitrary_ints: _,
+            handles: _,
             edition: _,
             recursion_limit: _,
         } = self;
@@ -1167,6 +1172,13 @@ impl DefMap {
     #[inline]
     pub fn arbitrary_ints(&self) -> bool {
         self.data.arbitrary_ints
+    }
+
+    /// Whether the crate says `#![blaze::handles]`, so that a move of a handle (a `Share`
+    /// value) that is used again on some later path is a copy (`hir_ty_mir::mir::handles`).
+    #[inline]
+    pub fn handles(&self) -> bool {
+        self.data.handles
     }
 
     /// The integer of an arbitrary width `name` names in this crate, as the builtin scope's

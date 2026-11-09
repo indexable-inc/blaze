@@ -727,6 +727,7 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                 (Some(Word::blaze), Some(Word::nopanic)) => AttrFlags::NOPANIC,
                 (Some(Word::blaze), Some(Word::noalloc)) => AttrFlags::NOALLOC,
                 (Some(Word::blaze), Some(Word::nonblocking)) => AttrFlags::NONBLOCKING,
+                (Some(Word::blaze), Some(Word::norefcount)) => AttrFlags::NOREFCOUNT,
                 (Some(Word::blaze), Some(Word::linear)) => AttrFlags::LINEAR,
                 (Some(Word::blaze), Some(Word::consumes)) => AttrFlags::CONSUMES,
                 (Some(Word::blaze), Some(Word::reflect)) => AttrFlags::BLAZE_REFLECT,
@@ -935,6 +936,7 @@ name_set! {
     non_exhaustive,
     nonblocking,
     nopanic,
+    norefcount,
     optimize,
     panic_handler,
     path,
@@ -1201,6 +1203,12 @@ bitflags::bitflags! {
         /// `unsafe` and `global_alloc`, docs/v2/plan/design/std.md). It changes diagnostics,
         /// never code: no codegen key reads it.
         const CAPABILITIES = 1 << 101;
+        /// `#[blaze::norefcount]`, a word, on a function or method: a blaze extension (inert
+        /// under rustc with `#![register_tool(blaze)]`). Under `#![blaze::handles]`, each copy
+        /// of a handle the body would otherwise make where it moves one is an error naming the
+        /// line and the handle (`hir_ty_mir::mir::handles::norefcount_errors`, reported with
+        /// the borrow check's). It changes diagnostics, never code.
+        const NOREFCOUNT = 1 << 125;
         /// `#[blaze::linear]`, a word: a blaze extension (inert under rustc with
         /// `#![register_tool(blaze)]`), read by `hir-ty-linear`
         /// (docs/v2/plan/design/linear.md). On a struct or enum: a value of it may not be

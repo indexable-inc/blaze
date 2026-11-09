@@ -137,6 +137,11 @@ impl DefMap {
                         // `#![blaze::arbitrary_ints]`, from `DefMap::arbitrary_ints`
                         // (docs/v2/plan/design/arbitrary-ints.md).
                         | "arbitrary_ints"
+                        // `#![blaze::handles]`, from `DefMap::handles`, and the effect
+                        // `#[blaze::norefcount]`, from `AttrFlags::NOREFCOUNT`
+                        // (docs/v2/plan/design/edition.md, change 1).
+                        | "handles"
+                        | "norefcount"
                         // `#[blaze::reflect]`, from `AttrFlags::BLAZE_REFLECT`
                         // (`hir_ty_comptime::struct_domain`, docs/v2/plan/design/comptime.md).
                         | "reflect"

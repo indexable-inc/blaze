@@ -378,6 +378,7 @@ fn old_match_attr_flags(
                         "consumes" => attr_flags.insert(AttrFlags::CONSUMES),
                         "reflect" => attr_flags.insert(AttrFlags::BLAZE_REFLECT),
                         "sealed" => attr_flags.insert(AttrFlags::BLAZE_SEALED),
+                        "norefcount" => attr_flags.insert(AttrFlags::NOREFCOUNT),
                         _ => {}
                     },
                     _ => {}

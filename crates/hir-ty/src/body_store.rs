@@ -75,6 +75,18 @@ fn passed_schema(checker: &'static str) -> SchemaHash {
     schema_of(&[Part::Str("blaze v2 item store borrow check passed 1"), Part::Str(checker)])
 }
 
+/// `schema` for an answer about a body of `def`'s crate, with the crate attributes that change
+/// what the body's MIR is: `#![blaze::handles]` makes a move of a handle that is used again a
+/// copy (`hir_ty_mir::mir::handles`), so the built MIR and the borrow check's verdict differ.
+/// A crate without it keeps `schema` itself, so its keys are what they were.
+fn with_crate_attrs(db: &Db, def: DefWithBodyId, schema: SchemaHash) -> SchemaHash {
+    use hir_def::HasModule;
+    match hir_def::nameres::crate_def_map(db, def.krate(db)).handles() {
+        true => schema_of(&[Part::Schema(schema), Part::Str("blaze::handles")]),
+        false => schema,
+    }
+}
+
 /// What a step's name is in an error.
 fn what(step: Step) -> &'static str {
     match step {
@@ -560,7 +572,8 @@ fn lookup_passed_in(
     checker: &'static str,
     check: impl FnOnce() -> bool,
 ) -> bool {
-    let found = lookup(db, def, Step::Borrowck, passed_schema(checker), |_, bytes| {
+    let schema = with_crate_attrs(db, def, passed_schema(checker));
+    let found = lookup(db, def, Step::Borrowck, schema, |_, bytes| {
         match bytes.is_empty() {
             true => Ok(()),
             // alloc: the reason a record does not read
@@ -592,7 +605,8 @@ pub fn offer_passed(
     if INSTALLED.load(Ordering::Relaxed) == 0 {
         return;
     }
-    offer(db, def, Step::Borrowck, passed_schema(checker), reads, |_, _| Ok(()));
+    let schema = with_crate_attrs(db, def, passed_schema(checker));
+    offer(db, def, Step::Borrowck, schema, reads, |_, _| Ok(()));
 }
 
 /// Gives `db` an item store: `images`, the driver's store (the local store, or the local store

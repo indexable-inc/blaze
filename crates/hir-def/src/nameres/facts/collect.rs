@@ -151,6 +151,15 @@ pub(crate) fn crate_data(db: &Db, krate: Crate) -> Arc<DefMapCrateData> {
             crate_data.arbitrary_ints = true;
             continue;
         }
+        // `#![blaze::handles]`: a handle that would be moved and is used again is copied
+        // (`DefMap::handles`, docs/v2/plan/design/edition.md, change 1).
+        if let [tool, name] = attr.path.segments()
+            && tool.symbol().as_str() == "blaze"
+            && name.symbol().as_str() == "handles"
+        {
+            crate_data.handles = true;
+            continue;
+        }
         let Some(attr_name) = attr.path.as_ident() else { continue };
 
         match () {

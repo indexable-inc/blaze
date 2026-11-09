@@ -521,6 +521,10 @@ language_item_table! { LangItems =>
     UseCloned,               sym::use_cloned,          TraitId;
     Clone,                   sym::clone,               TraitId;
     TrivialClone,            sym::trivial_clone,       TraitId;
+    /// Nightly's `core::clone::Share`: a type whose clone is another reference to the same
+    /// thing. Under `#![blaze::handles]` a value of one that would be moved and is used again
+    /// is copied (`hir_ty_mir::mir::handles`).
+    Handle,                  sym::blaze_handle,        TraitId;
     TryAsDyn,                sym::try_as_dyn,          TraitId;
     /// The arbitrary-width integers `u1`..`u128`, `i1`..`i128` other than the standard ones
     /// (`#[blaze::arbitrary_ints]`): a marker the solver answers, never implemented by an impl.
