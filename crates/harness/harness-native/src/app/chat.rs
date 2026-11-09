@@ -980,8 +980,12 @@ fn rows_nested(t: &Transcript, shows: Shows<'_>) -> (Vec<(String, Row)>, HashSet
         {
             *steps = Some((key.clone(), open));
         }
-        if live || open {
-            out.push((key.clone(), Row::Steps(steps::turn_line(&key, &calls, t, ended.flatten(), live, open))));
+        // Opened, the line heads the steps under it. While the turn runs (and it is not opened) its line comes last,
+        // under the newest words, where the next thing will appear: the item marks where the work is.
+        let line = (live || open).then(|| (key.clone(), Row::Steps(steps::turn_line(&key, &calls, t, ended.flatten(), live, open))));
+        let last = live && !open;
+        if !last {
+            out.extend(line.clone());
         }
         // A turn whose steps are one run: the turn's line already is that run's (the same marks), so the run shows
         // opened under it with no line of its own, never two identical lines one inside the other.
@@ -994,6 +998,9 @@ fn rows_nested(t: &Transcript, shows: Shows<'_>) -> (Vec<(String, Row)>, HashSet
                     nested.extend(out[from..].iter().map(|(k, _)| k.clone()));
                 }
             }
+        }
+        if last {
+            out.extend(line);
         }
     }
     (out, nested)
