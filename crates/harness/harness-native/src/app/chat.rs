@@ -4,7 +4,7 @@
 //! headings, list items, quotes and code blocks, thinking and tool calls folded to a line, a turn's foot) in a
 //! `ui.LazyList`, so only the rows in view are entities. It scrolls on AppKit's physics and sticks to the bottom while
 //! the agent writes unless the person scrolled up. The input is a `ui.TextArea` edited here (`Draft`, keys in
-//! scene/20-keys.flecs ctx.Chat): Return sends, Shift+Return breaks the line, Escape interrupts. A draft that starts with a
+//! scene/20-keys.flecs ctx.Chat): Return sends, Shift+Return breaks the line, Escape or Cmd+. interrupts. A draft that starts with a
 //! space is an aside: the composer takes the aside's tint, and Return asks it of a fork of the conversation instead
 //! (`Link::chat_aside`), its answer in a card over the composer ([`Aside`]) that Escape or its button closes; the
 //! conversation never has it.
@@ -850,8 +850,8 @@ fn item_rows(t: &Transcript, n: usize, shows: Shows<'_>, out: &mut Vec<(String, 
 }
 
 /// The transcript as rows ([`Grouped`]), and the keys of the rows nested under a run. A turn (the person's message to
-/// its turn's end) that did anything on the way shows as the message, one line for all of it ([`steps::turn_line`]),
-/// and its last answer: what the agent said last is the answer, what came before (its narration, its calls, its
+/// its turn's end) that did anything on the way shows as the message and its last answer, its one line for all of it
+/// ([`steps::turn_line`]) folded away behind the message's hover-only steps button once the turn is done: what the agent said last is the answer, what came before (its narration, its calls, its
 /// reasoning) is how it got there, and opens under the line when the person presses it. While the turn runs, its line
 /// says what it is doing and its newest words show as they come. Everything shows, as runs, when the person keeps
 /// every step (native.json `chat_steps: "all"`, [`Shows::all`]).
@@ -2072,6 +2072,18 @@ impl App {
         self.poke();
     }
 
+    /// A finished turn's steps button (`{sid}:{turn key}`): show its steps under its message, or fold them again. It names
+    /// its chat, so it works in a pane that does not have the keyboard.
+    pub(super) fn chat_turn_toggle(&mut self, rest: &str) {
+        let Some((sid, key)) = rest.split_once(':').and_then(|(s, k)| Some((s.parse::<u64>().ok()?, k))) else { return };
+        let mut states = self.chat.borrow_mut();
+        let st = states.entry(sid).or_default();
+        let open = is_open(&st.fold, key);
+        st.fold.insert(key.to_owned(), !open);
+        drop(states);
+        self.poke();
+    }
+
     fn any_chat_with(&self, block: &str) -> Option<(u64, u64, u64)> {
         // A card's code (`block#code`) and a value (`block#v…`) belong to their call's block.
         let block = block.split('#').next().unwrap_or(block);
@@ -3153,7 +3165,7 @@ fn fill_row(row: View<'_>, r: &Row, ctx: &RowCtx<'_>, measure: &mut Measure<'_>)
             // A finished turn's steps button: shows the steps folded away under the message, or folds them again.
             if let Some(slot) = row.part("steps") {
                 view::for_each_of(slot, steps.as_ref().map(|s| ("b", "hn.ChatTurnSteps", s)), |b, (key, open), _| {
-                    b.action(&format!("chat:open:{key}"));
+                    b.action(&format!("chat:turn:{}:{key}", ctx.sid));
                     tooltip(b, if *open { "Hide steps" } else { "Show steps" });
                 });
             }
@@ -3580,8 +3592,8 @@ mod tests {
         let cut = HashMap::new();
         let shown = super::rows(&t, Shows { fold: &code, cut: &cut, all: true });
         assert!(matches!(&shown[3].1, Row::Code { lang, .. } if lang == "ts"), "{:?}", shown.iter().map(|(_, r)| r.prefab()).collect::<Vec<_>>());
-        // By default a finished turn is its message, one line for how it got there (naming what failed), the view a cell
-        // drew, and its answer; the line opens to the steps, nested under it.
+        // By default a finished turn is its message (its steps button standing for how it got there), the view a cell drew,
+        // and its answer; opened, its line (naming what failed) shows, and the steps nested under it.
         let fold = HashMap::new();
         let (turned, nested) = rows_nested(&t, Shows { fold: &fold, cut: &cut, all: false });
         let kinds: Vec<&str> = turned.iter().map(|(_, r)| r.prefab()).collect();

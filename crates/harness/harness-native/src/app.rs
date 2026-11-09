@@ -2070,6 +2070,8 @@ impl App {
                 self.request_older();
             } else if let Some(b) = a.strip_prefix("chat:open:") {
                 self.chat_toggle(b);
+            } else if let Some(rest) = a.strip_prefix("chat:turn:") {
+                self.chat_turn_toggle(rest);
             } else if let Some(rest) = a.strip_prefix("row:") {
                 // An item of a sidebar row's menu (row_menu.rs).
                 self.row_menu_action(rest);

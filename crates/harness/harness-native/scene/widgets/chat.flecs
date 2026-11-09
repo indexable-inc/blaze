@@ -349,7 +349,8 @@ hn {
     steps : ui.Row {
       Flex: {axis: Row, gap: 0, align: Center, justify: End, wrap: false}
       Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-      Padding: {l: 0, r: $chat_turn_steps_gap, t: 0, b: 0}
+      // Centred on the bubble's first line.
+      Padding: {l: 0, r: $chat_turn_steps_gap, t: $chat_bubble_pad_y + $line_chat_bubble / 2 - $chat_turn_steps / 2, b: 0}
     }
     bubble : ui.Bubble {
       Fill: $tone_raised
