@@ -367,6 +367,12 @@ impl Crate {
         self.id.data(db).edition
     }
 
+    /// The syntax gates the crate turns on (`#![blaze::uniq]`): its files parse and print
+    /// under them ([`base_db::Crate::syntax_gates`]).
+    pub fn syntax_gates(self, db: &Db) -> span::SyntaxGates {
+        self.id.syntax_gates(db)
+    }
+
     pub fn version(self, db: &Db) -> Option<String> {
         // clone: editor edge, an owned string for display
         self.id.extra_data(db).version.clone()

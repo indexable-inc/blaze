@@ -62,7 +62,9 @@ pub fn write(parse: &Parse<SourceFile>, out: &mut Vec<u8>) -> Range<usize> {
     head[0] = MAGIC;
     head[1] = offset(out, start);
     head[2] = TREE_VERSION;
-    head[3] = parse.outline.map_or(0, |edition| edition as u32 + 1);
+    // The syntax gates above the edition: a gated parse never reads back as an ungated one.
+    head[3] = parse.outline.map_or(0, |edition| edition as u32 + 1)
+        | u32::from(parse.gates.bits()) << 8;
     head[4] = to_u32(errors.len());
     head[8] = to_u32(tree.start - start);
     head[9] = to_u32(tree.len());
@@ -75,7 +77,8 @@ pub fn write(parse: &Parse<SourceFile>, out: &mut Vec<u8>) -> Range<usize> {
 /// The parse of `text` in `edition` (an outline when `outline`) stored at byte `at` of `bytes`
 /// by [`write`], its tree read in place from `bytes`. An error says what about the bytes is
 /// not that parse: another parser's tree ([`TREE_VERSION`]), another edition's or kind of
-/// parse, or a tree of another text's length.
+/// parse, one made under syntax gates (`#![blaze::uniq]`, which no stored parse is read
+/// under), or a tree of another text's length.
 pub fn read(
     bytes: &Bytes,
     at: usize,
@@ -95,7 +98,7 @@ pub fn read(
         return Err(wrong("a tree of another parser version"));
     }
     if head[3] != if outline { edition as u32 + 1 } else { 0 } {
-        return Err(wrong("a tree of another edition or kind of parse"));
+        return Err(wrong("a tree of another edition, syntax gates or kind of parse"));
     }
     let len = head[1] as usize;
     if at.checked_add(len).is_none_or(|end| end > bytes.len()) {

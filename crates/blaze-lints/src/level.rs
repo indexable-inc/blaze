@@ -79,6 +79,9 @@ pub(crate) const BLAZE_PEDANTIC_PERF: On = blaze_kind(blaze::Kind::PedanticPerf)
 /// `async_fn`) and what it writes at a crate's border (`unmarked_pure`, `unmarked_nopanic`,
 /// `unmarked_noalloc`, `unmarked_nonblocking`), allowed until a workspace or crate turns it on
 /// to get ready for the edition (docs/v2/plan/design/edition.md).
+/// The group `blaze::edition`: what the blaze edition removes or respells (`lossy_as`,
+/// `global_state`, `async_fn`, `mut_ref`), allowed until a workspace or crate turns it on to
+/// get ready for the edition (docs/v2/plan/design/edition.md).
 pub(crate) const BLAZE_EDITION: On = blaze_kind(blaze::Kind::Edition);
 
 /// The lints `deny` by default ([`blaze::DENY_BY_DEFAULT`]), as a [`Target::Blaze`] has them.

@@ -1,6 +1,6 @@
 //! See [`Input`].
 
-use edition::Edition;
+use edition::{Edition, SyntaxGates};
 
 use crate::SyntaxKind;
 
@@ -178,7 +178,12 @@ impl Input {
     /// The input as the parser reads it, fragment starts included.
     #[inline]
     pub fn tokens(&self) -> Tokens<'_> {
-        Tokens { words: &self.words, fragments: true, first_fragment: true }
+        Tokens {
+            words: &self.words,
+            fragments: true,
+            first_fragment: true,
+            gates: SyntaxGates::NONE,
+        }
     }
     #[inline]
     pub(crate) fn kind(&self, idx: usize) -> SyntaxKind {
@@ -212,12 +217,16 @@ impl Input {
 /// end (the parser's reach) are a plain load with no `EOF` branch; past that they panic. Both
 /// kind fields of every word are a `SyntaxKind`, so a kind is read with no range check.
 /// `is_fragment_start` reads `false` past the end at any index, and `edition` panics there.
+///
+/// `gates` are the crate's syntax gates the parse is made under ([`Tokens::with_gates`]): none
+/// unless the caller names them, so every parse that does not is rustc's grammar.
 #[derive(Clone, Copy, Debug)]
 pub struct Tokens<'t> {
     words: &'t [u32],
     fragments: bool,
     /// Whether a fragment start on token 0 counts ([`Tokens::without_first_fragment`]).
     first_fragment: bool,
+    gates: SyntaxGates,
 }
 
 impl<'t> Tokens<'t> {
@@ -240,7 +249,20 @@ impl<'t> Tokens<'t> {
             words.iter().fold(true, |valid, &word| valid & has_valid_kinds(word)),
             "a parser word holds a kind that is no SyntaxKind"
         );
-        Tokens { words, fragments, first_fragment: true }
+        Tokens { words, fragments, first_fragment: true, gates: SyntaxGates::NONE }
+    }
+
+    /// The same tokens, parsed under `gates`: a file of a crate that turned them on
+    /// (`#![blaze::uniq]`). A parse's tree depends on them, so its key must hold them.
+    #[inline]
+    pub fn with_gates(self, gates: SyntaxGates) -> Tokens<'t> {
+        Tokens { gates, ..self }
+    }
+
+    /// The syntax gates the parse is made under.
+    #[inline]
+    pub(crate) fn gates(self) -> SyntaxGates {
+        self.gates
     }
 
     /// The same tokens, with a fragment start on token 0 not counted: a token tree's view that

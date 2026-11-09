@@ -962,6 +962,7 @@ mod tests {
                 && edition.intersects(blaze::Lint::UnmarkedNopanic.bit())
                 && edition.intersects(blaze::Lint::UnmarkedNoalloc.bit())
                 && edition.intersects(blaze::Lint::UnmarkedNonblocking.bit())
+                && edition.intersects(blaze::Lint::MutRef.bit())
                 && !edition.intersects(blaze::Lint::HashTwice.bit())
         );
         assert!(

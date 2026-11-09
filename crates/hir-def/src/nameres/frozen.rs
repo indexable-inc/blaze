@@ -860,7 +860,9 @@ impl Enc<'_> {
 
     pub(crate) fn file(&mut self, file: base_db::EditionedFileId) -> R {
         let (file_id, edition) = file.unpack(self.db);
-        self.edition(edition);
+        // The crate's syntax gates in the edition byte's high nibble: the file id is another
+        // one under them (`span::EditionedFileId::gates`), so the image keeps them.
+        self.u8(edition as u8 | file.gates(self.db).bits() << 4);
         if self.fingerprinting {
             let (owner, path) = self.file_name(file_id)?;
             self.u32(owner);
@@ -2490,10 +2492,16 @@ impl Dec<'_> {
     }
 
     pub(crate) fn file(&mut self) -> R<base_db::EditionedFileId> {
-        let edition = self.edition()?;
+        let byte = self.u8()?;
+        // alloc: error path
+        let edition = Edition::iter().find(|e| *e as u8 == byte & 0xF);
+        let edition = edition.ok_or_else(|| format!("a file's edition {}", byte & 0xF))?;
+        let gates = span::SyntaxGates::from_bits(byte >> 4)
+            // alloc: error path
+            .ok_or_else(|| format!("a file's syntax gates {:#x}", byte >> 4))?;
         let index = self.len()?;
         let file = *self.files.get(index).ok_or("a file not in the header")?;
-        Ok(base_db::EditionedFileId::new(self.db, file, edition))
+        Ok(base_db::EditionedFileId::new_gated(self.db, file, edition, gates))
     }
 
     pub(crate) fn hir_file(&mut self) -> R<HirFileId> {

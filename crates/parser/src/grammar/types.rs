@@ -217,7 +217,10 @@ fn ref_type(p: &mut Parser<'_>) {
     if p.at(LIFETIME_IDENT) {
         lifetime(p);
     }
-    p.eat(T![mut]);
+    if !p.eat(T![mut]) && uniq::at_type(p) {
+        // `&uniq T`, `&'a uniq T` (`#![blaze::uniq]`): the `mut` of `&mut T`, spelled `uniq`.
+        p.bump_remap(T![mut]);
+    }
     type_no_bounds(p);
     m.complete(p, REF_TYPE);
 }

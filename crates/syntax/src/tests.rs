@@ -10,6 +10,8 @@ use parser::Edition;
 use stdx::format_to_acc;
 use test_utils::{bench, bench_fixture, project_root};
 
+mod uniq;
+
 use crate::{AstNode, SourceFile, SyntaxError, Text, TextRange, TextSize, ast, fuzz};
 
 #[test]
