@@ -171,7 +171,7 @@ impl Memo {
 
     /// Keeps `template` under `key`, a store key (a folded body's, a thunk's, a release
     /// compile's), and gives what is kept. A template already kept under `key` that is equal
-    /// is given back; one that differs is refused, both given back (rule 18: the key misses
+    /// is given back; one that differs is refused, both given back (rule 21: the key misses
     /// an input), and never instantiated for the unit that compiled `template`.
     pub fn put_keyed(&self, key: Key, template: Template) -> Result<&Template, Refused<'_>> {
         match self.insert(key.0, template) {

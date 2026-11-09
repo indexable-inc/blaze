@@ -345,7 +345,7 @@ pub(crate) fn served_lang_items(db: &Db, krate: Crate) -> Option<Option<Box<Lang
 /// implied write), so this is a bug in the key or in that withdrawal. Nothing is resolved in
 /// its place. It unwinds out of the query that asked, with this as its payload, as
 /// [`super::Unmaintained`] does, and the driver that catches it fails that one job with it as
-/// the error (rule 17).
+/// the error (rule 20).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unreadable {
     pub krate: Crate,

@@ -265,7 +265,7 @@ pub fn name_rows(namer: RowNamer) {
 /// Everything `db`'s storage logged since the last take, each node named with `db` attached
 /// (a memo by its key as its type shows it, a field by its row's [`name_rows`] name, else by
 /// ID) and sorted by memo, view, reason and read, so the same runs give the same rows in the
-/// same order whatever threads ran them (rule 24). Called by the database's holder outside any
+/// same order whatever threads ran them (rule 25). Called by the database's holder outside any
 /// query (the daemon, as a build ends), so a key's `Debug` may read the database.
 pub fn take_log_in<D: super::Database>(db: &D) -> Taken {
     let storage = db.storage();

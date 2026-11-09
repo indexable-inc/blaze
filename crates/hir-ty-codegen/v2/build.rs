@@ -3,7 +3,7 @@
 //!
 //! The IR builder is handed the unit's [`Build`] as an argument (`backend::built`'s `build`,
 //! `Recorder::new`'s `unit`), never through the thread: a compile waits in queries, and a fiber
-//! resumes on any thread, or interleaves with another compile on its own (rule 24). Every body
+//! resumes on any thread, or interleaves with another compile on its own (rule 27). Every body
 //! it reads is the MIR query's under the options [`Build::options`] derives, which are that
 //! query's key, so a body built under one unit's settings is never served for another's (rule
 //! 18). With `Some`, the compiling crate's `-C debug-assertions` (what `ub_checks()` folds to)
@@ -115,7 +115,7 @@ impl Build {
     /// keeps no alignment or null check in a member built with them. Never the home's
     /// (`hir_ty_mir::mir::home`), a choice of sharing that no store key names: the key (`code`,
     /// `args`, the unit's settings) covers `written`, whether the instance is compiled per user
-    /// and this unit's setting, so one key is one body (rule 18). What
+    /// and this unit's setting, so one key is one body (rule 21). What
     /// `ub_checks()` itself is, the compiling unit's in the library's crates, is
     /// `ub_checks_in`'s, at code generation.
     ///

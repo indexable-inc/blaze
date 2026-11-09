@@ -140,7 +140,7 @@ pub(crate) trait Graph<'g> {
     fn name(&self, node: &Self::Node) -> Result<ContentId, Self::Error>;
     /// `error`, of a node `node` reaches: with `node` first on its path.
     fn through(&self, node: &Self::Node, error: Self::Error) -> Self::Error;
-    /// Past `fuel` nodes of one component, at `node` (rule 15).
+    /// Past `fuel` nodes of one component, at `node` (rule 18).
     fn exhausted(&self, node: &Self::Node, fuel: usize) -> Self::Error;
 }
 

@@ -31,7 +31,7 @@ use crate::next_solver::{
 use hir_ty::db::HirDatabase as _;
 
 /// How many loops one body may expand, the copies of inner loops counted: the bound of the
-/// expansion (rule 15). A body past it is refused, naming it.
+/// expansion (rule 18). A body past it is refused, naming it.
 const EXPANSION_FUEL: usize = 1 << 16;
 
 /// The fold that puts `member` in place of the binder `binder`, and nothing else.

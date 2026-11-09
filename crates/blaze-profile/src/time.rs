@@ -594,7 +594,7 @@ impl fmt::Display for TimeError {
                     f,
                     ". Each was a daemon that numbered a build {build} in this history (a blaze before 2026-11-03 named a \
                      timer's flush of a build that never ended 0, so the next daemon took its number again); a build's number \
-                     is its identity (rule 18), so this one is refused rather than read as one build of all their workers"
+                     is its identity (rule 21), so this one is refused rather than read as one build of all their workers"
                 )
             }
             TimeError::TooManySpans { build, spans, read, floor_ns, budget } => write!(

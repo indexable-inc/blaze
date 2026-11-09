@@ -6,7 +6,7 @@
 //! What the program makes is the code generator's walk of every instance a final binary
 //! reaches ([`hir_ty::mir::devirt::World`]), named by the body's [`MirOptions::world`]. Each
 //! call the pass looks at pushes the digest of the facts it read to
-//! `body.inlined.devirtualized`, which keys the body's code (rule 18): a body keyed by what it
+//! `body.inlined.devirtualized`, which keys the body's code (rule 21): a body keyed by what it
 //! read is built again when those facts change, and only then.
 //!
 //! Why the rewrite is the same program:
@@ -233,7 +233,7 @@ fn erased<'db>(interner: DbInterner<'db>, ty: Ty<'db>) -> Ty<'db> {
 
 /// What the body's crate found of one target of the object, in the object's order: beside
 /// the object's facts, what a site's plan depends on. Which impls a crate sees follows from its
-/// dependencies, which its code hash leaves out, so a site's digest holds these (rule 18).
+/// dependencies, which its code hash leaves out, so a site's digest holds these (rule 21).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 enum Found {

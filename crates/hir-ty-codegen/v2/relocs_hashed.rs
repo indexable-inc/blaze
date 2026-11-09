@@ -1,5 +1,5 @@
 //! Every vtable and function the relocation of a constant's or static's value emits is among
-//! what code identity hashes of that value (rule 18). Each block of the identity port so far
+//! what code identity hashes of that value (rule 21). Each block of the identity port so far
 //! was one shape of this bug: `relocate` emitted a vtable or a function for the value that the
 //! identity walk ([`hir_ty_identity::hashed::value_edges`]) did not reach, so an edit to its
 //! code kept a stale cached result. This checks the whole class over a corpus instead of one
@@ -1060,7 +1060,7 @@ enum Pending {
     Static(hir_def::StaticId, String),
 }
 
-/// The most functions and statics one value's emitted code may reach (rule 15).
+/// The most functions and statics one value's emitted code may reach (rule 18).
 const REACHED: usize = 4000;
 
 impl<'a> Emitted<'a> {
@@ -1397,7 +1397,7 @@ fn first_difference(a: &str, b: &str) -> String {
 /// `rv6`, and the codegen relocation tests' fixtures) and every edit of its case's source (the
 /// pointee, the impl or type behind a vtable, a slice tail's length, a function a pointer runs,
 /// an item first that moves the rest, an unrelated function), the item's code id changes if and
-/// only if what the build emits for its value and everything that reaches does (rule 18 and
+/// only if what the build emits for its value and everything that reaches does (rule 21 and
 /// its converse: no input missed, nothing hashed the build doesn't emit). Each side refusing is
 /// listed. No value the code generator builds is refused by identity (a refused value would
 /// get no code id, and its caller none). Where the code generator refuses a word of a corpus

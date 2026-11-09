@@ -337,7 +337,7 @@ fn claimed<B: Prepare>(
                     unit.item,
                     // alloc: an error
                     format!(
-                        "`{}` ({at:?}) given up: asked for {asks} times, each time another build of the memo compiled it and let it go unlanded (rule 15)",
+                        "`{}` ({at:?}) given up: asked for {asks} times, each time another build of the memo compiled it and let it go unlanded (rule 18)",
                         node.described.name
                     ),
                 ));

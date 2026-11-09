@@ -155,7 +155,7 @@ pub enum RunError<E> {
     },
     /// What its sandbox traced it reading disagrees with what a check of it reads
     /// ([`crate::script::keyed`]): kept, its result would be under a key no check makes again
-    /// (rule 18), so nothing is kept.
+    /// (rule 21), so nothing is kept.
     Traced {
         key: RunKey,
         error: blaze_build_script::Error,
@@ -196,7 +196,7 @@ impl<E: fmt::Debug> fmt::Display for RunError<E> {
                 "the run of {} given {} gave other than the result kept under the same key {stored:?} for \
                  the same inputs ({what}): it read what its key misses (randomness, the clock, an \
                  input not traced), or it is not a function of its inputs, or blaze's lookup and keep \
-                 make different keys for one run, so it ran when its result was kept (rule 18, a bug \
+                 make different keys for one run, so it ran when its result was kept (rule 21, a bug \
                  in blaze); the kept result stays",
                 key.code, key.given
             ),
@@ -484,7 +484,7 @@ impl Run {
         let kept = verify::keep(store, &roots, &key, marked, stored.encode(), ported_differs)
             .map_err(|it| match it.error {
                 // The store keeps another value under this run's key and trace: said by what
-                // differs, both values named, never by the two hashes alone (rule 16).
+                // differs, both values named, never by the two hashes alone (rule 19).
                 KeepError::Mismatch(mismatch) => {
                     let what = rerun_differs(store, &mismatch, &stored).unwrap_or_else(|why| {
                         // alloc: error path

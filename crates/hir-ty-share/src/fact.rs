@@ -174,7 +174,7 @@ impl<'db> Cx<'db> {
 
     /// The fact of `ty`: one query per (type, environment), so a hit is one lookup. A field's
     /// fact is a query inside its ADT's or tuple's, so a miss nests one query per level of
-    /// `ty`, as deep as the program built it: each level runs with stack to spare (rule 17).
+    /// `ty`, as deep as the program built it: each level runs with stack to spare (rule 20).
     pub fn fact(&self, ty: Ty<'db>) -> Result<ContentId, Unshared> {
         stdx::ensure_sufficient_stack(|| {
             let ty = self.deeply_normalize(ty)?;

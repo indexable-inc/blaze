@@ -647,7 +647,7 @@ fn found_kept(store: &blaze_cas::Store, home: &str, map: &RootMap) -> Option<Vec
 /// keeps it against its roots and a copy; a second that runs it and gets the same, its
 /// output ported, verifies it, and every other checkout is given it from then on. All of it
 /// is the store's: the store flushed, dropped and opened again (a daemon restarted) says at
-/// each step what the one that never stopped said (rule 23).
+/// each step what the one that never stopped said (rule 26).
 #[test]
 fn another_checkout_verifies_a_run_before_it_is_given_it() {
     let mut sim = blaze_core::sim::Sim::new(11, blaze_core::sim::Faults::default());

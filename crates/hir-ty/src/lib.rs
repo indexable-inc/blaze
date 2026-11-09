@@ -225,7 +225,7 @@ impl ComplexMemoryMap<'_> {
     /// relocates). Left out, for the caller to hash by identity, are what names a type or an
     /// item by the database's ids: the table of functions and vtables, the types of the
     /// `TypeId`s and which static each range of memory is. The one place that says which fields
-    /// are content, so a field added is hashed by every identity that reads the map (rule 18).
+    /// are content, so a field added is hashed by every identity that reads the map (rule 21).
     /// Every number is written by `write_usize`, each column after its length, so a hasher
     /// that writes integers at a fixed width (`blaze_hash::Blake3Hasher`) gets the same bytes
     /// on every target.

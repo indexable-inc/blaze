@@ -593,7 +593,7 @@ mod tests {
     }
 
     /// Every summary decodes from its bytes to itself, and encodes to the same bytes each time
-    /// and again from what was decoded (rule 25).
+    /// and again from what was decoded (rule 26).
     #[test]
     fn a_summary_round_trips_through_its_store_bytes() {
         let mut each_hint = Vec::new();

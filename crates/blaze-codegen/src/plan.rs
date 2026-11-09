@@ -5,7 +5,7 @@
 //!   (`"*"` for every package that is not a workspace member) and `build-override` for what
 //!   build scripts and proc macros run, picks the backend (docs/cargo.md, "Backends"): 0 and
 //!   1 copy-and-patch stencils, 2, `s` and `z` LLVM at `-O2`, 3 LLVM at `-O3` (#635: tests
-//!   are built at the profile's level). Native code is never Cranelift's (AGENTS.md rule 8),
+//!   are built at the profile's level). Native code is never Cranelift's (AGENTS.md rule 10),
 //!   and a target with no stencil library stops at 0 and 1 with an error naming it. wasm32's
 //!   one producer is the lowering of Cranelift's IR at every level; Cranelift optimizes
 //!   (`opt_level=speed`) all but a workspace member's code there, which no edit reaches and
@@ -295,7 +295,7 @@ impl std::fmt::Display for PlanError {
                 f,
                 "{origin:?} is compiled at opt-level {level:?}, whose native code starts as \
                  copy-and-patch stencils, and {target} has no stencil library: native code is \
-                 never Cranelift's (AGENTS.md rule 8)"
+                 never Cranelift's (AGENTS.md rule 10)"
             ),
             PlanError::StencilsNeedBaseline { origin, level, target, cpu, off } => write!(
                 f,
@@ -376,7 +376,7 @@ impl Policy {
         // wasm32 has one code producer, the lowering of the IR to wasm (`hir-ty-codegen`'s
         // `wasm::lower`, which `check_built` holds every wasm32 unit to): the level picks
         // no other, as LLVM writes no wasm32 for blaze (its pinned build has no WebAssembly
-        // target). Native code is stencils or LLVM's, never Cranelift's (AGENTS.md rule 8).
+        // target). Native code is stencils or LLVM's, never Cranelift's (AGENTS.md rule 10).
         let backend = match native {
             false => Backend::Cranelift { speed: !member },
             true => level.backend(llvm).ok_or(PlanError::NoLlvm { origin: *origin, level })?,
@@ -549,7 +549,7 @@ mod tests {
         assert!(!dependency.patchable);
     }
 
-    /// AGENTS.md rule 8: native code is stencils or LLVM's at every level, origin and mode,
+    /// AGENTS.md rule 10: native code is stencils or LLVM's at every level, origin and mode,
     /// the first tier of a live build's included.
     #[test]
     fn native_code_is_never_cranelifts() {

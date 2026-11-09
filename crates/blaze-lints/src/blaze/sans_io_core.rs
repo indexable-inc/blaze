@@ -1,5 +1,5 @@
 //! `sans_io_core`: a function of a sans-IO core that reaches an ambient effect through some
-//! call chain (AGENTS.md rule 12, sans-io-cores: a core is a synchronous state machine that
+//! call chain (AGENTS.md rule 14, sans-io-cores: a core is a synchronous state machine that
 //! reads time only from an injected clock, owns no socket, file, thread, timer or sleep, and
 //! hands back decisions and deadlines).
 //!
@@ -41,7 +41,7 @@ use super::{
 use crate::check::Cx;
 
 /// The most steps a finding's chain names: past it the chain ends in `…` (the walk itself is
-/// bounded by its memo; this bounds only the naming, rule 15).
+/// bounded by its memo; this bounds only the naming, rule 18).
 const LONGEST_CHAIN: usize = 24;
 
 /// The rule every message ends with.
@@ -252,7 +252,7 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
             steps = walked.steps,
             core = module_path(db, core),
         );
-        let note = "AGENTS.md rule 12 (sans-io-cores): a core owns no socket, file, thread, timer or sleep; \
+        let note = "AGENTS.md rule 14 (sans-io-cores): a core owns no socket, file, thread, timer or sleep; \
                     a driver does the IO and hands the core what it read";
         facts::push(&mut found, Lint::SansIoCore, range, message, Some(note.to_owned())); // alloc: a finding's note
     }

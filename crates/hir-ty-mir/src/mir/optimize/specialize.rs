@@ -33,7 +33,7 @@
 //! - What the copy knows decides at least one branch, and the work it removes is at least
 //!   [`MIN_SAVES`]: [`SWITCH_COST`] per branch decided and one per statement and terminator of
 //!   the blocks it no longer reaches, each [`LOOP_WEIGHT`] times where the block is on a cycle.
-//! - Budgets (rule 15), each from one function alone, so that no decision depends on another
+//! - Budgets (rule 18), each from one function alone, so that no decision depends on another
 //!   function or on the order bodies are optimized in: a function has at most [`MAX_COPIES`]
 //!   copies whatever its callers pass, as the classes its own comparisons give the parameters
 //!   it specializes on bound them; a callee is at most [`MAX_CALLEE_SIZE`]; one body calls at

@@ -37,7 +37,7 @@ use crate::check::Cx;
 const LINT: Lint = Lint::SyscallInLoop;
 
 /// The most steps followed from a call to the stat or open it reaches, to name that (the walk
-/// itself is bounded by its memo; this bounds only the naming, rule 15).
+/// itself is bounded by its memo; this bounds only the naming, rule 18).
 const LONGEST_CHAIN: usize = 24;
 
 /// The crates whose file system work is batched, besides those denying `blaze::hot`.

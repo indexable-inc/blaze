@@ -14,7 +14,7 @@ use crate::{Unshared, fact::Cx, identity};
 /// `Load<<MappedLookup<T, L, {closure}> as LookupContinuation>::Buf>`.
 ///
 /// Normalizing and spelling recurse once per level of `ty`, which a callee's argument makes as
-/// deep as the program built it, so it runs with stack to spare (rule 17).
+/// deep as the program built it, so it runs with stack to spare (rule 20).
 pub fn key<'db>(cx: &Cx<'db>, ty: Ty<'db>) -> Result<ContentId, Unshared> {
     stdx::ensure_sufficient_stack(|| {
         let ty = cx.normalize(ty);
