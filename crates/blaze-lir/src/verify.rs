@@ -393,8 +393,9 @@ fn structure_tables(view: &View<'_>) -> Result {
                     text_before = true;
                 }
                 AsmPieceRec::OPERAND => {
-                    if piece.a >= rec.operands_len || char::from_u32(piece.b).is_none() {
-                        return Err(row("asms", r, "a template operand past its operands or a modifier that is no character"));
+                    let modifier = char::from_u32(piece.b).filter(|it| piece.b == 0 || it.is_ascii_alphanumeric());
+                    if piece.a >= rec.operands_len || modifier.is_none() {
+                        return Err(row("asms", r, "a template operand past its operands or a modifier that is not a letter or digit"));
                     }
                     text_before = false;
                 }
@@ -583,8 +584,6 @@ struct Cfg {
     /// Per block, its immediate dominator; [`NONE`] for an unreachable block, itself for the
     /// entry.
     idom: Vec<u32>,
-    /// Per block, its place in reverse postorder.
-    order: Vec<u32>,
     /// Per block, how many edges lead to it.
     preds: Vec<u32>,
 }
@@ -659,7 +658,7 @@ impl Cfg {
                 break;
             }
         }
-        Cfg { idom, order, preds }
+        Cfg { idom, preds }
     }
 
     fn reachable(&self, b: u32) -> bool {
@@ -745,6 +744,10 @@ fn semantics(view: &View<'_>) -> Result {
             }
             let kind = view.block_kind(edge.to);
             let params = view.params(edge.to);
+            if edge.to.0 == 0 {
+                bad = Some("an edge to the entry block, which has no predecessors");
+                return;
+            }
             bad = match edge.kind {
                 EdgeKind::Plain(args) => {
                     if kind.is_landing() {
