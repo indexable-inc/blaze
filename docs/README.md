@@ -32,6 +32,7 @@ Designs not (fully) built, newest first.
 
 - [v2/plan/objectives.md](v2/plan/objectives.md) (2026-11-09): The ledger. Every objective of the plan, the check that decides it and where it stands; generated from objectives.json by harness/v2/ledger.py.
 - [v2/plan/design/tasks.md](v2/plan/design/tasks.md) (2026-11-09): Tasks in the agent app. Every agent belongs to a task, the sidebar lists tasks with their agents under them, and a task says what it waits on, what it costs and how it ended.
+- [v2/plan/design/std.md](v2/plan/design/std.md) (2026-11-09): blaze's own standard library, written from scratch on core and alloc. No ambient authority (main receives an Io and every function touches only what it is handed), sans-IO underneath (one Io over io_uring, kqueue, IOCP and the simulation), and every blaze crate moves onto it.
 - [v2/plan/bounds.md](v2/plan/bounds.md) (2026-11-09): Every speed-of-light bound blaze is held to, one machine-read block each; harness/v2/bounds.py reads this file and budgets.py measures it.
 - [v2/plan.md](v2/plan.md) (2026-11-09): The plan for blaze, whole, on one page. The goal, the rules, the one design every part shares, the targets, and how the work is run; the ledger of objectives is plan/objectives.md.
 - [v2/plan/design/named-locks.md](v2/plan/design/named-locks.md) (2026-11-05): Every lock in blaze is a named blaze_core::lock::{Lock, ReadLock, Signal} that records who waited, behind whom and for how long, on the slow path only; raw std and parking_lot locks are banned; the profile ranks locks by wait time (`lock_waits`, `blaze debug locks`) and the gate fails a build where one lock eats a share of worker time.
@@ -85,7 +86,6 @@ Designs not (fully) built, newest first.
 - [future/gpu/raytracing.md](future/gpu/raytracing.md) (2026-11-02): Ray tracing in blaze GPU kernels, built on inline ray query, typed pipeline payloads and acceleration structures that carry lifetimes.
 - [future/gpu/plan.md](future/gpu/plan.md) (2026-11-02): Rust kernels in the same crate as the host code, compiled by blaze for Metal, Vulkan, CUDA and the CPU, launched through one typed API.
 - [future/gpu/README.md](future/gpu/README.md) (2026-11-02): Index of the plans for compiling Rust kernels to GPUs with blaze.
-- [future/capabilities.md](future/capabilities.md) (2026-11-02): A blaze edition where std has no ambient authority, main receives an Io capability, code is safe Rust by default, and a function's signature is the complete list of what it can touch.
 - [future/bootstrap.md](future/bootstrap.md) (2026-11-02): Bootstrap blaze from a wasm seed (blaze's own source plus blaze compiled to core WebAssembly), so blaze is built only by its seed and by blaze, never rustc or cargo, and its source may use blaze-only Rust.
 - [future/autodiff.md](future/autodiff.md) (2026-11-02): Differentiation in blaze on CPU and GPU, from automatic differentiation on MIR, to symbolic derivatives of pure functions, to e-graph simplification shared by both.
 - [v2/plan/design/store.md](v2/plan/design/store.md) (2026-11-01): blaze v2: the store.

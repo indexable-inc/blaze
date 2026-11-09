@@ -13,7 +13,7 @@ remembered. How rows are picked, worked and landed is
 `harness/v2/ledger.py`. A check in *italics* is not written yet, and writing it is the first
 part of the work. `?` is not measured; "last known" is a lead, not a status.
 
-57 objectives: 0 met, 0 open, 0 blocked, 57 not measured.
+62 objectives: 0 met, 0 open, 0 blocked, 62 not measured.
 
 ## Targets
 
@@ -87,6 +87,11 @@ The parts of [the design](../plan.md#the-design) no check has shown yet.
 | D29 | Every lock-free structure has a model-checker test; every durable path a simulation test with a planted bug | *write: a lint that lists atomics and renames with no such test* |  | ? |
 | D30 | Each extension is checked on one shared MIR walk and used in blaze's own crates | *write: per extension: its tests named, and its attribute found in crates/* |  | ? |
 | D31 | One install command gives a working blaze on Linux, macOS and Windows | *write: an install test per platform in the train* |  | ? |
+| S1 | bstd exists: Io, the capability types, scoped tasks with deadlines and typed errors, on blaze-core's drivers and simulation | *write: crates/blaze-std's simulation tests in `blaze test`, with one planted bug per invariant* |  | ? |
+| S2 | A crate with `#![blaze::capabilities]` that reaches ambient IO or untrusted unsafe is refused, naming the call path | *write: a test crate per effect that must be refused; `blaze explain trusted` on blaze* |  | ? |
+| S3 | Every crate in crates/ is on bstd with `#![blaze::capabilities]` | *write: a count of crates without the attribute, which must be zero* |  | ? |
+| S4 | bstd is `#![no_std]` with its own sys and runtime; no blaze crate links Rust's std | *write: a link-time check that no blaze binary holds a std symbol* |  | ? |
+| S5 | The blaze edition: `std` names bstd, `fn main(io: Io)` is the entry, and a program's OS sandbox is what main hands out | *write: a program of the edition that never takes Net and cannot open a socket* |  | ? |
 
 ## The agent app
 

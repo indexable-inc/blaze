@@ -194,6 +194,16 @@ and the lints [vecreport](plan/design/vecreport.md) and
 [borrow-workarounds](plan/design/lint-borrow-workarounds.md). Further out: [future/](../future/).
 blaze's own crates use each extension as soon as it exists.
 
+### 13. Its own standard library
+
+`bstd` is blaze's standard library, written from scratch on `core` and `alloc`: no ambient
+authority (`main` receives an `Io`, and a function touches only what it is handed), sans-IO
+underneath (one `Io` over io_uring, kqueue, IOCP and the simulation of section 6), and the one
+lock, map, clock, wait and error shape the rules already name. A program on it is a deterministic
+simulation test for free, and its signatures are its permissions. Every blaze crate moves onto
+it; later it is the `std` of the blaze edition, where the sandbox of section 8 is derived from
+what `main` hands out. Spec: [std](plan/design/std.md).
+
 ## How the work is run
 
 The old way (70 agent windows, lanes that owned paths, request files between them, nothing
