@@ -495,7 +495,7 @@ impl<'a> Values<'a> {
         Value(self.0[at])
     }
 
-    pub fn iter(&self) -> impl ExactSizeIterator<Item = Value> + 'a {
+    pub fn iter(self) -> impl ExactSizeIterator<Item = Value> + 'a {
         self.0.iter().map(|&it| Value(it))
     }
 }
