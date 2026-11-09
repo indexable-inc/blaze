@@ -1056,10 +1056,28 @@ impl App {
                     ]
                     .concat(),
                 );
-                // Its kind's mark before its title, in ink only, and the row's one sign of work: the strong ink while its
-                // agent works, the faint ink at rest or ended. Nothing moves.
+                // Before its title, how it stands, not what made it (its kind ends its tooltip): an agent at work is a
+                // filled dot in the strong ink, one up and waiting for the person a hollow ring in the faint ink, one
+                // that ended nothing (its title is already muted). The glyphs are the chat's own statuses
+                // (scene/widgets/chat_status.flecs `running`, `waiting`), still here. A shell keeps its terminal
+                // glyph, since it opens a terminal and not a chat, in the same two inks.
                 if let Some(i) = row.part("kind_icon") {
-                    crate::look::kind_mark(w, i.entity(), model::kind_name(o));
+                    let kind = model::kind_name(o);
+                    if matches!(kind, "claude" | "codex" | "cursor") {
+                        let state = match (busy, status) {
+                            (true, _) => Some("running"),
+                            (false, "running") => Some("waiting"),
+                            _ => None,
+                        };
+                        let glyph = state.map(|s| {
+                            view::prefab(w, &format!("hn.chat_status.{s}"))
+                                .and_then(|p| p.try_cloned::<&harness_native_ui_text_api::Icon>())
+                                .unwrap_or_else(|| panic!("the scene's hn.chat_status.{s} has no Icon (scene/widgets/chat_status.flecs)"))
+                        });
+                        crate::look::show_glyph(i.entity(), glyph.as_ref().map_or("", |g| g.glyph.as_str()));
+                    } else {
+                        crate::look::kind_mark(w, i.entity(), kind);
+                    }
                     let f = tone(w, if busy { "ink_strong" } else { "ink_faint" });
                     if i.entity().try_cloned::<&Fill>() != Some(f) {
                         i.entity().set(f);
@@ -2417,7 +2435,8 @@ fn done_mark(status: &str, code: Option<i32>, depth: usize) -> &'static str {
 }
 
 /// What a working agent is doing now, from its transcript's last item: the words its tooltip leads with, and the
-/// detail its row trails (the command, the file, the pattern, the page).
+/// detail its row trails (the command, the file, the pattern, the page): only what names a thing. A state alone
+/// (thinking, writing) trails nothing, since the row's dot already says it is at work.
 struct Doing {
     what: &'static str,
     detail: String,
@@ -2445,13 +2464,13 @@ fn doing_of(t: &model::chat::Transcript) -> Option<Doing> {
     // A message still queued is not what it is on.
     let last = (0..t.items.len()).rev().find(|&k| !t.is_queued(k)).map(|k| &t.items[k])?;
     Some(match last {
-        Item::Thinking { done: false, .. } => Doing { what: "Thinking", detail: "thinking".to_owned() },
+        Item::Thinking { done: false, .. } => Doing { what: "Thinking", detail: String::new() },
         // A harness REPL cell: what its running step does ("blaze check", "Reading chat.rs"), never the tool's name.
         Item::Tool { block, result: None, .. } if t.details.contains_key(block) => {
             match t.details[block].effects.iter().rev().find(|e| e.status == "running") {
                 Some(e) if e.kind == "exec" => Doing { what: "Running a command", detail: chat::step_words(e) },
                 Some(e) => Doing { what: "Working", detail: chat::step_words(e) },
-                None => Doing { what: "Running code", detail: "running code".to_owned() },
+                None => Doing { what: "Running code", detail: String::new() },
             }
         }
         Item::Tool { name, input, result: None, .. } => {
@@ -2474,8 +2493,8 @@ fn doing_of(t: &model::chat::Transcript) -> Option<Doing> {
                 Doing { what: "Using a tool", detail: name.rsplit("__").next().unwrap_or(name).to_owned() }
             }
         }
-        Item::Text { done: false, .. } => Doing { what: "Writing", detail: "writing".to_owned() },
-        _ => Doing { what: "Thinking", detail: "thinking".to_owned() },
+        Item::Text { done: false, .. } => Doing { what: "Writing", detail: String::new() },
+        _ => Doing { what: "Thinking", detail: String::new() },
     })
 }
 
