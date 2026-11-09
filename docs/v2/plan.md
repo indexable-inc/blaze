@@ -199,7 +199,9 @@ blaze's own crates use each extension as soon as it exists.
 `bstd` is blaze's standard library, written from scratch on `core` and `alloc`: no ambient
 authority (`main` receives an `Io`, and a function touches only what it is handed), sans-IO
 underneath (one `Io` over io_uring, kqueue, IOCP and the simulation of section 6), and the one
-lock, map, clock, wait and error shape the rules already name. A program on it is a deterministic
+lock, map, clock, wait and error shape the rules already name. Context and memory are explicit
+too: each task has a `Cx` (deadline, cancellation, span, frame allocator) passed as a parameter,
+and there is no global heap, so running out of memory fails one task and never the process. A program on it is a deterministic
 simulation test for free, and its signatures are its permissions. Every blaze crate moves onto
 it; later it is the `std` of the blaze edition, where the sandbox of section 8 is derived from
 what `main` hands out. Spec: [std](plan/design/std.md).

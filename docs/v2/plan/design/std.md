@@ -17,23 +17,31 @@ not use Rust's `std`. Three properties define it:
    signature is the complete list of what it can do.
 2. **Sans-IO.** Every operation is an effect handed to one driver. The same `Io` runs on
    io_uring, kqueue, IOCP and the deterministic simulation, and code above it cannot tell which.
-3. **One of each.** One lock, one map, one channel, one clock, one wait, one error shape: the
+3. **Explicit context and memory.** Every task has a `Cx` that says how long it may run, whether
+   it was cancelled, what span it is and where its scratch memory comes from. Nothing allocates
+   from a hidden global heap: memory comes from an allocator the code was handed.
+4. **One of each.** One lock, one map, one channel, one clock, one wait, one error shape: the
    ones blaze's rules already name.
 
 Every blaze crate moves onto it, and later it is the `std` of the blaze edition. Nothing here is
 built except the driver layer it starts from (`crates/blaze-core`).
 
 ```rust
-fn main(io: Io) -> Result<(), Error> {
-    let data: Dir<ReadWrite> = io.fs().open_dir("data")?;
+fn main(cx: &Cx, io: Io) -> Result<(), Error> {
+    let data: Dir<ReadWrite> = io.fs().open_dir(cx, "data")?;
     let cfg: Dir<ReadOnly> = data.read_only();               // narrow
     let key = StripeKey::from_env(&io.env().only(&["STRIPE_KEY"]))?;
     let api = io.net().connect_only("api.stripe.com:443");   // one host
-    charge(&key, &api, &cfg)
+    let cx = cx.until(io.clock().after(Duration::from_secs(5)));   // a deadline only shrinks
+    charge(&cx, &key, &api, &cfg)
 }
 
-// charge cannot open files outside cfg, write, read other variables or dial other hosts.
-fn charge(key: &StripeKey, api: &Net, cfg: &Dir<ReadOnly>) -> Result<(), Error> { .. }
+// charge cannot open files outside cfg, write, read other variables, dial other hosts,
+// run past its deadline, or allocate anywhere but its task's memory.
+fn charge(cx: &Cx, key: &StripeKey, api: &Net, cfg: &Dir<ReadOnly>) -> Result<(), Error> {
+    let mut body = Vec::new_in(cx.frame());                  // freed when the task ends
+    ..
+}
 ```
 
 ## Layers
@@ -71,6 +79,23 @@ and no second copy of each API.
 A sans-IO core takes no `Io` at all. It takes bytes and returns bytes and effects, as rule
 `sans-io-cores` already asks; with capabilities that is a fact of its signature, not a lint.
 
+## Cx: the task's context
+
+A capability says what code may touch. `Cx` says on whose behalf it runs. Every task has one, and
+every call that can wait or allocate scratch takes `cx: &Cx` as its first parameter. It holds:
+
+- **the deadline**, an instant on the task's `Clock`. `cx.until(deadline)` makes a child context
+  whose deadline is the earlier of the two: like a capability, it only narrows.
+- **cancellation.** A scope that fails or is dropped cancels its tasks; a wait under a cancelled
+  `Cx` ends with `Stopped::Cancelled`. `cx.check()?` is the one line a long computation calls.
+- **the span.** The task's name and its place in the trace. `cx.span("what")` opens a child, so
+  every wait is named by construction (rule `every-wait-says-what`).
+- **the frame.** `cx.frame()` is the task's bump allocator, freed whole when the task ends.
+
+A sans-IO core takes no `Cx` and no `Io`: it cannot wait, so it needs neither. A function that
+takes `&Cx` and no capability can wait and allocate scratch but cannot touch the world. `Cx` is
+not ambient and is never fetched from a thread-local; `main` receives the root one.
+
 ## Capabilities
 
 | type | made from | narrowing | gives |
@@ -99,22 +124,20 @@ Rules that hold for all of them:
   signature would stop being the whole truth. The `ambient` check refuses it.
 - **Clone is allowed.** Copying authority you hold adds none.
 
-Ambient on purpose: allocation, panics, and the span stream (logs and traces go to the recorder,
-not through a parameter). A logger threaded through every function would be worked around with a
-global, which is worse than an honest exception.
+Ambient on purpose, and nothing else: panics, and emitting to the span stream (`Cx` says which
+span, the recorder is global). Allocation is not ambient (below).
 
 **Secrets.** `#[derive(bstd::Secret)]` gives a type no `Debug`, `Display` or `Clone`, zeroes it on
 drop, and hands its bytes only to functions of its own module.
 
 ## Time, waiting and tasks
 
-- **Every wait has a deadline.** A task runs in a scope with a `Deadline` on its `Clock`; every
-  blocking call ends in a typed outcome that includes `Stopped::Deadline` and
-  `Stopped::Cancelled`. There is no call that can wait for ever (rules `bounded-progress`,
-  `deadline-waits`).
-- **Concurrency is structured.** `tasks.scope(|s| s.spawn("name", ..))`: a task cannot outlive
-  its scope, a scope ends when its tasks have, an error or a deadline cancels the siblings. There
-  is no detached thread. Every task has a name, which is its span (rule `every-wait-says-what`).
+- **Every wait has a deadline.** Every blocking call takes the task's `Cx` and ends in a typed
+  outcome that includes `Stopped::Deadline` and `Stopped::Cancelled`. There is no call that can
+  wait for ever (rules `bounded-progress`, `deadline-waits`).
+- **Concurrency is structured.** `tasks.scope(cx, |s| s.spawn("name", |cx| ..))`: each task gets
+  its own `Cx` (its name, its frame, the scope's deadline), cannot outlive its scope, and an
+  error or a deadline cancels its siblings. There is no detached thread.
 - **A panic fails its task** with a typed error to the scope (rule `panics-fail-one-job`).
 - **A child process is handed capabilities.** `process.spawn(program, dirs, env)` gives the child
   exactly those; the driver's sandbox enforces it. This is the sandbox blaze already builds for
@@ -126,11 +149,32 @@ One error type per area (`FsError`, `NetError`, ...), each naming the operation,
 path, the host) and the kind. No catch-all `io::Error`, no error without its subject (rule
 `errors-name-the-thing`).
 
-## Memory and data
+## Memory is explicit
 
-Collections take their allocator (`Vec::new_in(frame)`); bstd gives the allocators by lifetime
-(frame, task, image) of [memory](memory.md). A global-heap allocation still needs its `// alloc:`
-line. Strings are UTF-8; a path is bytes on Unix and WTF-8 on Windows behind one `Path`.
+There is no global heap in bstd. Every collection is made in an allocator its code was handed
+(`Vec::new_in(a)`, `Map::new_in(a)`, `String::new_in(a)`); `Vec::new()` does not exist. This is
+Zig's rule, and it buys what the plan needs: every byte belongs to a task or a named cache
+(section 6), `noalloc` is visible in a signature, and tests can count and fail allocations.
+
+| allocator | from | lives |
+|---|---|---|
+| `Frame` | `cx.frame()` | until the task ends; a bump pointer, freed whole |
+| `Arena` | `mem.arena("name", limit)` | until dropped; for a result that outlives its task |
+| `Cache` | `mem.cache("name", limit)` | until evicted; the one evictor may take entries back |
+
+`Mem` is a capability from `io.mem()`: it hands out named arenas and caches against the process's
+one memory budget ([memory](memory.md), [memory-budget](../../../memory-budget.md)). Every arena has
+a name and a limit, so "what holds the memory" always has an answer.
+
+**Running out is an outcome, not a crash.** An allocation over its limit or the budget fails the
+task with `Stopped::OutOfMemory { arena, asked }` through the same path as a panic (rule
+`panics-fail-one-job`); the process and the other tasks go on. Code that wants to handle it itself
+uses the `try_` forms (`try_push`, `try_reserve`), which return the error.
+
+Until S4, `alloc`'s global allocator still exists underneath; the `ambient` check treats a use of
+it in a capabilities crate as an effect (`global_alloc`), which replaces the `// alloc:` comment.
+
+Strings are UTF-8; a path is bytes on Unix and WTF-8 on Windows behind one `Path`.
 
 ## The checks
 
@@ -140,6 +184,7 @@ nonblocking; [effects](effects.md)):
 - **`ambient`**: reaches a system call, or Rust `std`'s file, environment, network, clock, random,
   process or thread API, outside the trusted list.
 - **`unsafe`**: reaches an `unsafe` block outside the trusted list.
+- **`global_alloc`**: allocates from the global heap instead of a handed allocator.
 
 The trusted list is in the workspace manifest (`[blaze.trusted]`, each entry with an owner and a
 reason); `bstd` is on it. `blaze explain trusted <binary>` prints what a binary rests on, and
@@ -153,7 +198,7 @@ Interface first, bottom last, so nothing waits on the runtime and every step lan
 
 | step | what | done when |
 |---|---|---|
-| S1 | The crate `crates/blaze-std` (`bstd`): `Io`, every capability above, the scopes and deadlines, the errors, over `blaze-core`'s drivers and its simulation | its simulation tests pass; one planted bug per invariant is caught |
+| S1 | The crate `crates/blaze-std` (`bstd`): `Cx`, `Io`, every capability above, the allocators, the scopes and deadlines, the errors, over `blaze-core`'s drivers and its simulation | its simulation tests pass; one planted bug per invariant is caught |
 | S2 | The `ambient` and `unsafe` effects, `#![blaze::capabilities]`, `blaze explain trusted` | a crate with the attribute that calls `std::fs` is refused, naming the call path |
 | S3 | blaze's crates move, leaves first: a sans-IO core takes nothing, a driver takes the piece it needs, `blaze`'s `main` takes `Io`. Each move is a `.clippy.toml` ban and `blaze check --fix` (rule `fix-through-blaze-lints`) | every crate in `crates/` has `#![blaze::capabilities]` |
 | S4 | The bottom: `bstd::sys` and `bstd::rt`, `blaze-core`'s drivers move in as `bstd::driver`, and bstd is `#![no_std]` | no blaze crate links Rust's `std`; C1 still passes |
@@ -175,6 +220,10 @@ with its path, or put on the trusted list with a reason.
 - **`Io` is a concrete value**, as Zig's `std.Io` is passed explicitly, without Zig's vtable in
   every signature and without a generic.
 - **Fibers, not `async`.** One API, no colour.
+- **Context is a parameter**, as Go's `context` and Zig's allocator are, never a thread-local: a
+  thread-local context is ambient authority over time and memory.
+- **No global heap.** Out of memory fails a task, never the process.
+- **`fn main(cx: &Cx, io: Io)`.**
 - **Structured tasks with deadlines**, as Trio's scopes.
 - **Standard error is not a capability; standard output is.**
 - **No revocation** until something needs it.
