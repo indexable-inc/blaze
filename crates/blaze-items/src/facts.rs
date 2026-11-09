@@ -1,4 +1,4 @@
-//! What each [`Fact`] stands for (docs/v2/plan/lanes/items.md section 6.2): [`value`] computes
+//! What each [`Fact`] stands for (docs/v2/plan/design/item-hash.md section 6.2): [`value`] computes
 //! it from the current database, and a query that read the fact is reused while its
 //! [`fingerprint`] stays the same. A fact names its subject by key; a key that names nothing now
 //! gives the value "absent", never an error, so a deleted item is a changed fact like any other.

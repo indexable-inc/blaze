@@ -19,8 +19,8 @@
 //! arguments, `describe_enclosure`), and `compiler/rustc_hir_typeck/src/fn_ctxt/adjust_fulfillment_errors.rs`
 //! (`blame_specific_arg_if_possible`) (MIT or Apache-2.0).
 //!
-//! What the front end does not give yet (requested in `docs/v2/requests/diagnostics.md` and
-//! `docs/v2/requests/diagnostics-infer2-solver.md`): the span of a derive's impl, and whether a span
+//! What the front end does not give yet (requested in `fed1eb428d:docs/v2/requests/diagnostics.md` and
+//! `fed1eb428d:docs/v2/requests/diagnostics-infer2-solver.md`): the span of a derive's impl, and whether a span
 //! is of a format string's desugaring.
 //!
 //! Cost: nothing until the solver reports the error. Then O(the call's arguments, the

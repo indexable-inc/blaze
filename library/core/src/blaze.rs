@@ -17,7 +17,7 @@
 /// returned. A failure names the function and the clause and prints the shrunk case as a plain
 /// `#[test]` to paste and keep. The test calls the `hegel` crate (`hegeltest`), which the crate
 /// names as a dev-dependency. `#[blaze::contract_test(skip)]` keeps the function and adds nothing
-/// (docs/v2/plan/lanes/contracts.md, part 2).
+/// (docs/v2/plan/design/contracts.md, part 2).
 #[unstable(feature = "blaze_verify", issue = "none")]
 #[rustc_builtin_macro]
 pub macro contract_test($item:item) {

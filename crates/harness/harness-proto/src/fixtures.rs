@@ -2,7 +2,7 @@
 //! value as JSON (`fixtures/<name>.json`). This crate's test checks its encoder writes exactly the checked-in bytes;
 //! `mcp/src/wire.test.ts` checks the kernel decodes each `.cbor` to its `.json` and encodes that back to the same bytes.
 //! `HARNESS_PROTO_BLESS=1 cargo test -p harness-proto` rewrites them after a deliberate schema change.
-use crate::event::{Body, ContextCall, ContextPart, ContextUse, Detail, Effect, Event, Kind, ModelChoice};
+use crate::event::{Body, ContextCall, ContextPart, ContextUse, Detail, Effect, Event, Kind, ModelChoice, PlanWindow};
 use crate::msg::{Down, Reply, Request, RunReq, SessionInfo, Up};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -64,6 +64,7 @@ pub fn all() -> Vec<(&'static str, Vec<u8>, Value)> {
         one("up-detach", &Up::Detach),
         one("up-rename", &Up::Req(Request::Rename { id: 7, title: "tidy the build".into() })),
         one("up-set-model", &Up::Req(Request::SetModel { id: 7, model: Some("haiku".into()), effort: Some("xhigh".into()) })),
+        one("up-aside", &Up::Req(Request::Aside { id: 7, text: "what does flecs#2389 say?".into() })),
         one("down-hello", &Down::Hello { schema: crate::SCHEMA, pid: 4242 }),
         one(
             "down-sessions",
@@ -85,6 +86,7 @@ pub fn all() -> Vec<(&'static str, Vec<u8>, Value)> {
         ),
         one("down-attached", &Down::Reply(Reply::Attached { info })),
         one("down-ok", &Down::Reply(Reply::Ok)),
+        one("down-aside", &Down::Reply(Reply::Aside { text: "A token named like its entity **does not resolve**.".into() })),
         one("down-record", &Down::Reply(Reply::Record(json!({"id": "r12", "exit_code": 0, "signal": null})))),
         one("down-error", &Down::Error { error: "no session 99".into() }),
         one("down-changed", &Down::Changed { generation: 70_000 }),
@@ -113,6 +115,18 @@ pub fn all() -> Vec<(&'static str, Vec<u8>, Value)> {
             },
         ),
         one("event-choice", &Event { ts: 2, body: Body::Choice { model: None, effort: Some("xhigh".into()) } }),
+        one(
+            "event-plan",
+            &Event {
+                ts: 5,
+                body: Body::Plan {
+                    windows: vec![
+                        PlanWindow { name: "5h".into(), used: 0.08, resets_at: Some(1_794_253_800), warn: false, limited: false },
+                        PlanWindow { name: "week".into(), used: 0.79, resets_at: Some(1_794_470_400), warn: true, limited: false },
+                    ],
+                },
+            },
+        ),
         one("event-context", &Event { ts: 3, body: Body::Context(ContextUse { used: 46_200, window: 200_000, ..ContextUse::default() }) }),
         one(
             "event-context-parts",

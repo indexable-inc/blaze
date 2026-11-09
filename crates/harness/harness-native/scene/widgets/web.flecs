@@ -45,14 +45,17 @@ hn {
     icon : ui.Symbol {}
   }
 
-  // The pane: its toolbar (back, forward, reload, the address, extensions, close) under the title-bar strip, the loading
-  // hairline, then the page filling the rest. `menu` holds the extensions menu while it is open, floating under its
-  // button.
+  // The pane: the page filling it, top to bottom (under the title-bar strip too: the strip on the right holds no
+  // controls, so nothing of the pane is dead room). Its toolbar (back, forward, reload, the address, extensions, close)
+  // takes no room until it is wanted (src/app/browser.rs: while the address is edited, cmd+L, or the extensions menu is
+  // open), so a link opened here reads as the page alone. The loading hairline lies over the page's top edge, taking no
+  // room either. `menu` holds the extensions menu while it is open, floating under its button. The pane's width is
+  // WebState's, dragged at its left edge between web_pane_min and web_pane_max (hn.Theme.web_drag).
   prefab WebPane : ui.Column {
     Size: {w: {kind: Fixed, value: $web_pane_w, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
     Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
-    SafeAreaPadding: {l: false, r: false, t: true, b: false}
     bar : ui.Row {
+      Clip
       Flex: {axis: Row, gap: 2, align: Center, justify: Start, wrap: false}
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $web_toolbar_h, min: 0, max: 0}}
       Padding: {l: 8, r: 8, t: 0, b: 0}
@@ -63,13 +66,14 @@ hn {
       ext : hn.WebButton { Action: {name: "web:extensions"}; Tooltip: {text: "Extensions"} }
       close : hn.WebButton { Action: {name: "web:close"}; Tooltip: {text: "Close"} }
     }
-    load : ui.Node {
-      Fill: $tone_accent
-      Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $gen_browser_load, min: 0, max: 0}}
-    }
     page : ui.Browser {
       Shape: {radius: 0, n: 4, border: 0, feather: 0}
       pic { Shape: {radius: 0, n: 4, border: 0, feather: 0} }
+      load : ui.Node {
+        AlignSelf: {align: Start}
+        Fill: $tone_accent
+        Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $gen_browser_load, min: 0, max: 0}}
+      }
     }
     menu : ui.Node {}
   }

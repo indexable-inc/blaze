@@ -320,6 +320,59 @@ mod unix {
         checked(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_NOCACHE, 1) }).map(drop)
     }
 
+    /// `f` run with the calling thread's disk IO at idle priority, which is put back after: a
+    /// read of [`crate::Priority::Idle`]. Linux: `ioprio_set` of the thread to
+    /// `IOPRIO_CLASS_IDLE` (`who` 0 is the calling thread).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn idle_io<R>(f: impl FnOnce() -> io::Result<R>) -> io::Result<R> {
+        const IOPRIO_WHO_PROCESS: libc::c_long = 1;
+        const IOPRIO_CLASS_IDLE: libc::c_long = 3;
+        const IOPRIO_CLASS_SHIFT: libc::c_long = 13;
+        // SAFETY: no pointers; asks the calling thread's IO priority.
+        let was = unsafe { libc::syscall(libc::SYS_ioprio_get, IOPRIO_WHO_PROCESS, 0) };
+        if was < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let idle = IOPRIO_CLASS_IDLE << IOPRIO_CLASS_SHIFT;
+        // SAFETY: no pointers; sets the calling thread's IO priority.
+        if unsafe { libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0, idle) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let result = f();
+        // SAFETY: as above, back to what it was.
+        unsafe { libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0, was) };
+        result
+    }
+
+    /// `f` run with the calling thread's disk IO throttled, its policy put back after: a read of
+    /// [`crate::Priority::Idle`]. macOS: `setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD,
+    /// IOPOL_THROTTLE)` (`<sys/resource.h>`, public), what the store's prefetch threads read with.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn idle_io<R>(f: impl FnOnce() -> io::Result<R>) -> io::Result<R> {
+        const IOPOL_TYPE_DISK: libc::c_int = 0;
+        const IOPOL_SCOPE_THREAD: libc::c_int = 1;
+        const IOPOL_THROTTLE: libc::c_int = 3;
+        unsafe extern "C" {
+            fn getiopolicy_np(iotype: libc::c_int, scope: libc::c_int) -> libc::c_int;
+            fn setiopolicy_np(
+                iotype: libc::c_int,
+                scope: libc::c_int,
+                policy: libc::c_int,
+            ) -> libc::c_int;
+        }
+        // SAFETY: no pointers; asks the calling thread's disk policy.
+        let was = unsafe { getiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD) };
+        if was < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: no pointers; sets the calling thread's disk policy.
+        checked(unsafe { setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, IOPOL_THROTTLE) })?;
+        let result = f();
+        // SAFETY: as above, back to what it was.
+        unsafe { setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, was) };
+        result
+    }
+
     /// A new eventfd, count 0, close-on-exec and nonblocking.
     #[cfg(target_os = "linux")]
     pub(crate) fn eventfd() -> io::Result<OwnedFd> {

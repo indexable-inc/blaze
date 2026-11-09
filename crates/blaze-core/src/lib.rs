@@ -1,4 +1,4 @@
-//! blaze's sans-IO core (docs/v2/plan/lanes/core.md section 3, docs/v2/plan/lanes/core/plane.md).
+//! blaze's sans-IO core (docs/v2/plan.md section 3, docs/v2/plan.md).
 //!
 //! A state machine of blaze's (the build's plane, a journal, the store's index) does no IO,
 //! reads no clock and starts no thread. It asks for IO by pushing [`Effect`]s, each with a
@@ -83,6 +83,11 @@ mod raw;
 pub mod reaped;
 pub mod signal;
 pub mod sim;
+#[allow(
+    unsafe_code,
+    reason = "registered memory the drivers read into and write from by address, behind safe accessors"
+)]
+pub mod spans;
 mod sync;
 mod tags;
 pub mod threads;
@@ -101,6 +106,7 @@ use std::{fmt, time::Duration};
 pub use crate::journal::{
     Cursor, Journaled, Lost, Names, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, Stamp,
 };
+pub use crate::spans::{DIRECT_ALIGN, Memory, Registered, Span, SpanRegion, Spans};
 pub use crate::tags::Tags;
 
 /// Makes the sandbox of a process: given to a driver by whoever owns the platform's sandbox
@@ -262,6 +268,12 @@ pub const SEAL_THROUGH_A_LINK: &str = "is a symbolic link: a seal is never set t
 /// file: a FIFO, a socket, a device or a directory.
 pub const SEAL_OF_NO_FILE: &str = "is no regular file: only a regular file is sealed";
 
+/// What a failed [`Effect::ReadInto`] or [`Effect::WriteFrom`] says when the driver itself failed
+/// with it in flight (io_uring's ring): the kernel may still write or read its span, which its
+/// asker must never use again (the store's pool keeps that page from every later load).
+pub const ABANDONED_SPAN: &str =
+    "the span is abandoned to the kernel, which may still read or write it: never use it again";
+
 /// The most bytes one [`Effect::Recv`] appends, whatever its `most`: a receive reserves its
 /// room before the bytes come, so an asker of a long frame grows its buffer by this much a
 /// receive, not by the frame's length at once.
@@ -281,6 +293,41 @@ pub enum Effect {
         file: FileName,
         at: u64,
         len: usize,
+        tag: Tag,
+    },
+    /// `into.len` bytes at `at` of `file` read into the registered span `into`
+    /// ([`Spans::register`]), with no copy and nothing allocated: the store's pool loading its
+    /// pages (docs/v2/plan/design/store-pool.md). Completes with [`Done::ReadInto`] of how many
+    /// were read, fewer than the span only at the end of the file. The span's bytes past them hold
+    /// anything: a read around the page cache writes whole blocks, and the simulation scribbles
+    /// them; an asker that keeps the span zeroes what it needs zeroed. A `file` that is not there
+    /// fails, naming it. So does a span whose region is
+    /// not registered or that runs past its region's end, and, with [`Cache::Bypassed`], an
+    /// offset, address or length that is not a whole number of [`DIRECT_ALIGN`].
+    ///
+    /// The asker's contract: while it is in flight, nothing reads, writes or gives back the
+    /// span's bytes; once it fails, they hold anything (a part may have been read), and where
+    /// its failure says [`ABANDONED_SPAN`] they are never to be used again.
+    ReadInto {
+        file: FileName,
+        at: u64,
+        into: Span,
+        cache: Cache,
+        priority: Priority,
+        tag: Tag,
+    },
+    /// The registered span `from` written at `at` of `file`, which exists, past its end making
+    /// it longer; durable once a later [`Effect::Sync`] of the file completes. Completes with
+    /// [`Done::Written`]. What [`Effect::ReadInto`] refuses of a span, this refuses too.
+    ///
+    /// The asker's contract: while it is in flight, nothing writes or gives back the span's
+    /// bytes, which the system may read at any time until it completes. One that fails, or is in
+    /// flight at a crash, may have written any of its blocks.
+    WriteFrom {
+        file: FileName,
+        at: u64,
+        from: Span,
+        cache: Cache,
         tag: Tag,
     },
     /// The target of the symbolic link `file`, never followed: completes with [`Done::Read`]
@@ -582,6 +629,8 @@ impl Effect {
         match self {
             Effect::ReadAll { tag, .. }
             | Effect::Read { tag, .. }
+            | Effect::ReadInto { tag, .. }
+            | Effect::WriteFrom { tag, .. }
             | Effect::ReadLink { tag, .. }
             | Effect::Append { tag, .. }
             | Effect::Sync { tag, .. }
@@ -620,6 +669,31 @@ impl Effect {
             | Effect::Pressure { tag } => *tag,
         }
     }
+}
+
+/// Whether an [`Effect::ReadInto`] or [`Effect::WriteFrom`] goes through the system's page cache.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Cache {
+    /// Through it, as every other effect's bytes go.
+    Kept,
+    /// Around it: `O_DIRECT` on Linux, `F_NOCACHE` on macOS, `FILE_FLAG_NO_BUFFERING` on
+    /// Windows. For bytes the asker keeps in memory of its own (the store's pool), which the
+    /// system then holds no second copy of, and on Linux does not charge to the daemon's cgroup a
+    /// second time. The offset, the span's address and its length are each a whole number of
+    /// [`DIRECT_ALIGN`], on every driver; a file system that cannot bypass its cache fails the
+    /// effect, naming the file. Nothing goes through the cache instead.
+    Bypassed,
+}
+
+/// How soon an [`Effect::ReadInto`] is wanted, against other reads of the disk.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Priority {
+    /// A task waits for it.
+    Demand,
+    /// Nobody waits for it yet (a prefetch): read when the disk is otherwise idle. Linux's
+    /// `IOPRIO_CLASS_IDLE` (honoured under `mq-deadline` and BFQ), macOS's `IOPOL_THROTTLE` on
+    /// the thread that reads it. Windows has no per-read class: there it fails, naming why.
+    Idle,
 }
 
 /// How [`Effect::Lock`] takes a file's lock.
@@ -705,7 +779,7 @@ pub enum Sandbox {
 }
 
 /// What a sandboxed process read, recorded by its sandbox: its result is keyed by exactly
-/// these (docs/v2/plan/lanes/usercode.md section 6.5), so the paths are as the process named them.
+/// these (docs/v2/plan.md section 6.5), so the paths are as the process named them.
 #[derive(Clone, Default, PartialEq, Eq, Debug)] // clone: kept with a run's record (blaze-usercode, blaze-testsel, blaze-api), once per run
 pub struct Traced {
     /// Each file it opened to read, and the BLAKE3 hash of its bytes then; `None` for a file
@@ -843,6 +917,10 @@ pub enum Done {
     /// Of an [`Effect::ReadAll`] or [`Effect::Read`], the bytes read; of an [`Effect::Recv`],
     /// its buffer with the bytes received appended.
     Read(Vec<u8>),
+    /// Of an [`Effect::ReadInto`]: how many bytes of its span were read, from its first.
+    ReadInto {
+        len: u32,
+    },
     Appended,
     Synced,
     Truncated,
@@ -1069,7 +1147,7 @@ pub fn native(root: &std::path::Path, threads: usize) -> std::io::Result<Native>
 mod tests;
 
 /// Counts each test thread's allocations, for the allocation-budget tests
-/// (docs/v2/plan/goals/principles.md).
+/// (docs/v2/plan.md).
 #[cfg(test)]
 #[global_allocator]
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;

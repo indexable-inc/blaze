@@ -6,7 +6,12 @@
 //! one [`GhItem`] a ref, and keeps answers for [`TTL`] seconds of an injected clock. The driver ([`status`]) runs `gh`
 //! with a bounded wait ([`run_bounded`]). Nothing is guessed: a ref the answer does not cover comes back with an error
 //! naming `owner/name#n`, its state unset.
-use harness_proto::peek::{BODY_MAX, GhCi, GhItem, GhKind, GhRef, GhState, REFS_MAX};
+//!
+//! While a pull request's card shows and its checks are not all done, the app asks after them one by one
+//! (`github_checks`: [`checks_query`], [`parse_checks`], kept [`CHECKS_TTL`] seconds by [`checks`]): each check run's or
+//! commit status's state, start and end, page, and a running job's step in progress, read from the check run's own steps
+//! in the same query, so a card costs one `gh` run however many jobs run.
+use harness_proto::peek::{BODY_MAX, CHECKS_MAX, GhCheck, GhCheckState, GhChecks, GhCi, GhItem, GhKind, GhRef, GhState, REFS_MAX, STEPS_MAX};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -254,6 +259,151 @@ fn fetch(refs: &[GhRef]) -> Vec<GhItem> {
     }
 }
 
+/// How long a pull request's checks one by one are kept (seconds): long enough that the cards of several windows share
+/// one ask, short enough that a step in progress is the one running now.
+pub const CHECKS_TTL: f64 = 10.0;
+
+/// The GraphQL document asking after pull request `r`'s head commit's checks one by one (at most [`CHECKS_MAX`], each
+/// job's steps to find the one in progress), or why it cannot be asked.
+pub fn checks_query(r: &GhRef) -> Result<String, String> {
+    if r.kind != GhKind::Pr {
+        return Err(format!("{}#{}: an issue has no checks", r.repo, r.n));
+    }
+    let Some((o, n)) = owner_name(&r.repo) else { return Err(format!("{}#{}: not a GitHub repository (owner/name)", r.repo, r.n)) };
+    Ok(format!(
+        "query {{ repository(owner: \"{o}\", name: \"{n}\") {{ pullRequest(number: {}) {{ commits(last: 1) {{ nodes {{ commit {{ \
+         statusCheckRollup {{ contexts(first: {CHECKS_MAX}) {{ totalCount nodes {{ __typename \
+         ... on CheckRun {{ name status conclusion startedAt completedAt detailsUrl \
+         checkSuite {{ workflowRun {{ workflow {{ name }} }} }} steps(first: {STEPS_MAX}) {{ nodes {{ name status }} }} }} \
+         ... on StatusContext {{ context state targetUrl createdAt }} }} }} }} }} }} }} }} }} }}\n",
+        r.n
+    ))
+}
+
+/// Pull request `r`'s checks from `answer`, GitHub's reply to [`checks_query`]'s document, in GitHub's order; a commit
+/// with no checks has none, and a reply without the pull request is its error, naming it.
+#[must_use]
+pub fn parse_checks(r: &GhRef, answer: &Value) -> GhChecks {
+    let pr = &answer["data"]["repository"]["pullRequest"];
+    if !pr.is_object() {
+        let said = answer["errors"][0]["message"].as_str().unwrap_or("GitHub's answer has no such pull request");
+        return GhChecks::failed(r, format!("{}#{}: {said}", r.repo, r.n));
+    }
+    let contexts = &pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"];
+    let s = |n: &Value, k: &str| n[k].as_str().unwrap_or_default().to_owned();
+    let checks: Vec<GhCheck> = contexts["nodes"]
+        .as_array()
+        .map(|a| a.iter().take(CHECKS_MAX))
+        .into_iter()
+        .flatten()
+        .filter_map(|n| match n["__typename"].as_str()? {
+            "CheckRun" => {
+                let state = match (n["status"].as_str()?, n["conclusion"].as_str()) {
+                    ("COMPLETED", Some("SUCCESS")) => GhCheckState::Passed,
+                    ("COMPLETED", Some("NEUTRAL" | "SKIPPED" | "STALE")) => GhCheckState::Skipped,
+                    ("COMPLETED", _) => GhCheckState::Failed,
+                    ("IN_PROGRESS", _) => GhCheckState::Running,
+                    _ => GhCheckState::Queued,
+                };
+                let step = (state == GhCheckState::Running)
+                    .then(|| n["steps"]["nodes"].as_array()?.iter().find(|st| st["status"].as_str() == Some("IN_PROGRESS")).map(|st| s(st, "name")))
+                    .flatten()
+                    .unwrap_or_default();
+                Some(GhCheck {
+                    name: s(n, "name"),
+                    state,
+                    workflow: s(&n["checkSuite"]["workflowRun"]["workflow"], "name"),
+                    step,
+                    started: unix(n["startedAt"].as_str().unwrap_or_default()),
+                    completed: unix(n["completedAt"].as_str().unwrap_or_default()),
+                    url: s(n, "detailsUrl"),
+                })
+            }
+            "StatusContext" => {
+                let state = match n["state"].as_str()? {
+                    "SUCCESS" => GhCheckState::Passed,
+                    "FAILURE" | "ERROR" => GhCheckState::Failed,
+                    "PENDING" => GhCheckState::Running,
+                    _ => GhCheckState::Queued,
+                };
+                Some(GhCheck {
+                    name: s(n, "context"),
+                    state,
+                    workflow: String::new(),
+                    step: String::new(),
+                    started: unix(n["createdAt"].as_str().unwrap_or_default()),
+                    completed: 0,
+                    url: s(n, "targetUrl"),
+                })
+            }
+            _ => None,
+        })
+        .collect();
+    let total = contexts["totalCount"].as_u64().unwrap_or(0).max(checks.len() as u64);
+    GhChecks { checks, total, ..GhChecks::of(r) }
+}
+
+/// An RFC 3339 time in UTC as GitHub gives it (`2026-11-07T00:15:34Z`) as Unix seconds; 0 for anything else.
+#[must_use]
+pub fn unix(s: &str) -> i64 {
+    let b = s.as_bytes();
+    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' || !s.ends_with('Z') {
+        return 0;
+    }
+    let num = |r: std::ops::Range<usize>| s.get(r).and_then(|t| t.parse::<i64>().ok());
+    let (Some(y), Some(m), Some(d), Some(hh), Some(mm), Some(ss)) = (num(0..4), num(5..7), num(8..10), num(11..13), num(14..16), num(17..19)) else {
+        return 0;
+    };
+    // Days from 1970-01-01 to y-m-d in the proleptic Gregorian calendar (Howard Hinnant's days_from_civil).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    days * 86_400 + hh * 3600 + mm * 60 + ss
+}
+
+static CHECKS: Mutex<BTreeMap<GhRef, (f64, GhChecks)>> = Mutex::new(BTreeMap::new());
+
+/// Pull request `r`'s checks one by one: kept for [`CHECKS_TTL`] seconds, else from one `gh api graphql` run; a failure
+/// is the answer's error, naming the pull request and why.
+pub fn checks(r: &GhRef) -> GhChecks {
+    let t = now();
+    if let Some((at, c)) = CHECKS.lock().get(r)
+        && t - at < CHECKS_TTL
+    {
+        return c.clone();
+    }
+    let got = fetch_checks(r);
+    let mut kept = CHECKS.lock();
+    kept.retain(|_, (at, _)| t - *at < CHECKS_TTL);
+    kept.insert(r.clone(), (t, got.clone()));
+    got
+}
+
+fn fetch_checks(r: &GhRef) -> GhChecks {
+    let doc = match checks_query(r) {
+        Ok(d) => d,
+        Err(why) => return GhChecks::failed(r, why),
+    };
+    let mut cmd = Command::new("gh");
+    cmd.args(["api", "graphql", "--input", "-"]);
+    let run = match run_bounded(cmd, json!({ "query": doc }).to_string().as_bytes(), GH_WAIT, "gh api graphql") {
+        Ok(run) => run,
+        Err(e) => return GhChecks::failed(r, format!("{}#{}: {e}", r.repo, r.n)),
+    };
+    match serde_json::from_slice::<Value>(&run.stdout) {
+        Ok(v) if v.get("data").is_some() || v.get("errors").is_some() => parse_checks(r, &v),
+        _ => {
+            let err = String::from_utf8_lossy(&run.stderr);
+            let line = err.lines().find(|l| !l.trim().is_empty()).unwrap_or("no output");
+            let code = run.code.map_or("signal".to_owned(), |c| c.to_string());
+            GhChecks::failed(r, format!("{}#{}: gh api graphql failed (exit {code}): {line}", r.repo, r.n))
+        }
+    }
+}
+
 /// What a bounded run printed and how it ended.
 pub struct Ran {
     pub stdout: Vec<u8>,
@@ -365,6 +515,54 @@ mod tests {
         let refused = json!({"errors": [{"path": ["fragment Is"], "message": "Fragment Is was defined, but not used"}]});
         let r = parse(&refs[..1], &aliases[..1], &[], &refused);
         assert_eq!(r[0].error, "o/a#1: Fragment Is was defined, but not used");
+    }
+
+    /// Each check run and status as a check (GitHub's shape, from a real answer), a running job's step the one in
+    /// progress; a pull request the answer lacks is its error, by name; an issue or a bad repository is never asked.
+    #[test]
+    fn checks_one_by_one() {
+        let r = pr("indexable-inc/blaze", 1872);
+        let doc = checks_query(&r).expect("a pull request");
+        assert!(doc.contains("repository(owner: \"indexable-inc\", name: \"blaze\") { pullRequest(number: 1872)"));
+        assert!(doc.contains(&format!("contexts(first: {CHECKS_MAX})")) && doc.contains(&format!("steps(first: {STEPS_MAX})")));
+        assert!(checks_query(&GhRef { kind: GhKind::Issue, repo: "o/a".into(), n: 1 }).is_err());
+        assert!(checks_query(&pr("x\"){evil}", 2)).is_err());
+        let answer = json!({"data": {"repository": {"pullRequest": {"commits": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {
+            "totalCount": 60,
+            "nodes": [
+                {"__typename": "CheckRun", "name": "Analyze (rust)", "status": "IN_PROGRESS", "conclusion": null,
+                 "startedAt": "2026-11-07T00:15:34Z", "completedAt": null,
+                 "detailsUrl": "https://github.com/o/a/actions/runs/1/job/2", "checkSuite": {"workflowRun": {"workflow": {"name": "CodeQL"}}},
+                 "steps": {"nodes": [{"name": "Set up job", "status": "COMPLETED"}, {"name": "Perform CodeQL Analysis", "status": "IN_PROGRESS"}]}},
+                {"__typename": "CheckRun", "name": "tango", "status": "QUEUED", "conclusion": null, "startedAt": "2026-11-07T00:15:34Z",
+                 "completedAt": null, "detailsUrl": "u", "checkSuite": {"workflowRun": null}, "steps": {"nodes": []}},
+                {"__typename": "CheckRun", "name": "lint", "status": "COMPLETED", "conclusion": "CANCELLED", "startedAt": null,
+                 "completedAt": null, "detailsUrl": "", "checkSuite": null, "steps": {"nodes": []}},
+                {"__typename": "CheckRun", "name": "CodeQL", "status": "COMPLETED", "conclusion": "NEUTRAL", "startedAt": null,
+                 "completedAt": null, "detailsUrl": "", "checkSuite": null, "steps": {"nodes": []}},
+                {"__typename": "StatusContext", "context": "ci/ext", "state": "PENDING", "targetUrl": "t", "createdAt": "1970-01-01T00:01:00Z"}
+            ]}}}}]}}}}});
+        let c = parse_checks(&r, &answer);
+        assert_eq!((c.total, c.checks.len(), c.error.as_str()), (60, 5, ""));
+        let run = &c.checks[0];
+        assert_eq!((run.state, run.step.as_str(), run.workflow.as_str()), (GhCheckState::Running, "Perform CodeQL Analysis", "CodeQL"));
+        assert_eq!((run.started, run.completed), (1_794_010_534, 0));
+        let states: Vec<GhCheckState> = c.checks.iter().map(|c| c.state).collect();
+        assert_eq!(states, [GhCheckState::Running, GhCheckState::Queued, GhCheckState::Failed, GhCheckState::Skipped, GhCheckState::Running]);
+        assert_eq!((c.checks[1].step.as_str(), c.checks[4].name.as_str(), c.checks[4].started), ("", "ci/ext", 60));
+        assert!(c.unfinished());
+        let gone = parse_checks(&r, &json!({"data": {"repository": {"pullRequest": null}}, "errors": [{"message": "Could not resolve"}]}));
+        assert_eq!(gone.error, "indexable-inc/blaze#1872: Could not resolve");
+    }
+
+    /// GitHub's times as Unix seconds; anything else is 0.
+    #[test]
+    fn times_are_unix_seconds() {
+        assert_eq!(unix("1970-01-01T00:00:00Z"), 0);
+        assert_eq!(unix("2000-03-01T00:00:00Z"), 951_868_800);
+        assert_eq!(unix("2026-11-07T00:15:34Z"), 1_794_010_534);
+        assert_eq!(unix(""), 0);
+        assert_eq!(unix("2026-11-07 00:15:34"), 0);
     }
 
     /// Kept for TTL seconds of the injected clock, a failure for TTL_FAILED.

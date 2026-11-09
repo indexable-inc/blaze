@@ -10,7 +10,7 @@
 //! Recency is the row's own stamp (the view it was last verified in), so nothing is counted on
 //! a hit or a verify and no view walks what it holds: a pass reads the values once, which a
 //! pass's eighth of the budget pays for. Recompute cost does not weigh in: the self-build's
-//! values all fit under the budget (docs/v2/plan/lanes/db/query-unify.md, "LRU and eviction").
+//! values all fit under the budget (docs/v2/plan.md, "LRU and eviction").
 //!
 //! Eviction only costs time: an evicted value runs again when asked for, its stamp and hash
 //! kept, so no policy here can change an answer.

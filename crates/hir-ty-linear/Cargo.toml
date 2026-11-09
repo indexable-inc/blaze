@@ -2,7 +2,7 @@
 name = "hir-ty-linear"
 version = "0.0.0"
 repository.workspace = true
-description = "`#[blaze::linear]`: a value of a marked type is never dropped implicitly; every path consumes it (docs/v2/plan/lanes/linear.md)."
+description = "`#[blaze::linear]`: a value of a marked type is never dropped implicitly; every path consumes it (docs/v2/plan/design/linear.md)."
 publish = false
 
 authors.workspace = true

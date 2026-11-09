@@ -1,4 +1,4 @@
-//! blaze v2's IDs (docs/v2/plan/lanes/format.md section 5, "IDs, two kinds").
+//! blaze v2's IDs (docs/v2/plan/design/data.md section 5, "IDs, two kinds").
 //!
 //! - A [`ContentId`] is the BLAKE3 hash of what a thing is, under a domain that names the
 //!   kind of thing and its schema. It is the identity used in every hash, key and output.
@@ -7,7 +7,7 @@
 //!   output. It may be kept in the daemon's image, which is one run's state.
 //! - An [`Interner`] holds one arena and maps each way between the two; [`Sharded`] is the
 //!   one blaze uses.
-//! - A [`Fingerprint`] is the 128 bits of a result kept for early cutoff (docs/v2/plan/lanes/items.md
+//! - A [`Fingerprint`] is the 128 bits of a result kept for early cutoff (docs/v2/plan/design/item-hash.md
 //!   section 6.2).
 
 #![feature(allocator_api, allocator_ext, portable_simd, register_tool)]

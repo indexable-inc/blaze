@@ -1,4 +1,4 @@
-//! The workspace load and the unit graph as queries of blaze's database (docs/v2/plan/lanes/cargo/notes.md;
+//! The workspace load and the unit graph as queries of blaze's database (docs/v2/plan.md;
 //! #1450's 238 s load): pure functions of a view's `Cargo.toml`s, lock file and config, and of
 //! the sources mounted beside it, so nothing is loaded again on start (the daemon's image has
 //! it) and an edit reruns only what read what changed.
@@ -286,7 +286,7 @@ pub fn env_var<'e>(env: &'e [(String, String)], name: &str) -> Option<&'e str> {
 /// unset) and what read it, noted at the read ([`EnvReads::var`]). It is what the kept thing
 /// is keyed by in the environment: a request whose other variables differ (a shell's `SHLVL`,
 /// `OLDPWD` or `TERM_SESSION_ID`, systemd's `INVOCATION_ID`) reuses it, and one in which a
-/// variable it read moved does not (rule 18 both ways). Sorted by name, each once.
+/// variable it read moved does not (rule 21 both ways). Sorted by name, each once.
 #[derive(Clone, PartialEq, Eq, Default)]
 pub struct EnvReads {
     read: Vec<(String, Option<String>, &'static str)>,
@@ -308,7 +308,7 @@ impl EnvReads {
             Ok(at) => Err(format!(
                 // alloc: an error, once
                 "`{name}` is read by {by} with another value than {} read it with, into one kept front end: \
-                 its key holds the first read alone (rule 18)",
+                 its key holds the first read alone (rule 21)",
                 self.read[at].2
             )),
             Err(at) => {
@@ -523,7 +523,7 @@ impl Units {
     /// for) is of, as cargo's `is_primary_package` has it. Its crates see
     /// `CARGO_PRIMARY_PACKAGE=1`. It is of the request alone, never in a plan: a record is
     /// keyed by it only through a crate that read it, so `--workspace` then `-p one` reuses
-    /// every unit `one` depends on (rule 18).
+    /// every unit `one` depends on (rule 21).
     pub fn is_primary(&self, unit: usize) -> bool {
         let pkg = &self.graph.units[unit].pkg_id;
         self.primary_package(pkg)

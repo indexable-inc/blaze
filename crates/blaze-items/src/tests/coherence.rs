@@ -1,6 +1,6 @@
 //! Coherence, specialization, opaque types and `Freeze` over fixtures: each answers as it
 //! did before speed-types-probe-coherence's pass
-//! (docs/v2/plan/lanes/items/speed-types-probe-coherence.md), and skips what it now skips.
+//! (docs/v2/plan/design/item-hash.md), and skips what it now skips.
 
 use base_db::{Crate, all_crates};
 use hir_def::{

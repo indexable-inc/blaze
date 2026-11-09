@@ -1,5 +1,5 @@
 //! The sanitizers of rustc's `-Zsanitizer` (address, thread, memory) and SanitizerCoverage on
-//! the release path (`docs/v2/requests/codegen.md` S2, `safety.md` F2).
+//! the release path (`fed1eb428d:docs/v2/requests/codegen.md` S2, `safety.md` F2).
 //!
 //! [`mark`] gives the function the attributes rustc gives it (`sanitize_attrs`), at lowering,
 //! so every pipeline after sees them as rustc's do: what LLVM builds in is only what has the
@@ -7,7 +7,7 @@
 //! as rustc's single module does at the end of its pipeline: what is instrumented is the code
 //! that is written. [`super::emitted::read_covered`] reads back what SanitizerCoverage made
 //! of it; the runtimes, the arrays of every function together and their initialization are
-//! the link's (`docs/v2/requests/link.md`).
+//! the link's (`fed1eb428d:docs/v2/requests/link.md`).
 
 #![forbid(unsafe_code)]
 

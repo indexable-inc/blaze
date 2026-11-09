@@ -143,7 +143,7 @@ pub(crate) fn crate_data(db: &Db, krate: Crate) -> Arc<DefMapCrateData> {
     // Process other crate-level attributes.
     for attr in &*attrs {
         // `#![blaze::arbitrary_ints]`: `u3` and `i24` name integers in this crate
-        // (`DefMap::arbitrary_ints`, docs/v2/plan/lanes/frontend/arbitrary-ints.md).
+        // (`DefMap::arbitrary_ints`, docs/v2/plan/design/arbitrary-ints.md).
         if let [tool, name] = attr.path.segments()
             && tool.symbol().as_str() == "blaze"
             && name.symbol().as_str() == "arbitrary_ints"

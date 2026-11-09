@@ -7,7 +7,7 @@ description: "Building native UI as Flecs (the harness app in crates/harness/): 
 
 General Flecs rules, traits and script syntax are in the `flecs` skill; this one is how the harness app builds UI
 with them. Paths below are relative to `crates/harness/`. The app is copied from den's native stack: flecs v4.2.0
-(the indexable-inc/flecs fork, branch `indexable/v4.2`, pinned by rev in `vendor/hyperion-flecs-c/Cargo.toml`; blaze's
+(the indexable-inc/flecs fork, branch `indexable/v4.2`, pinned by rev in `crates/harness/vendor/hyperion-flecs-c/Cargo.toml`; blaze's
 `vendor/flecs-c` pins the same rev, and CI's `.github/scripts/flecs_pin.py` fails when they differ), Metal through the
 indexable-inc/slang fork (`harness-native/build.rs`), den's text shaper plus Slug outlines, libghostty-vt for terminal
 state (`harness-vt`).
@@ -56,7 +56,8 @@ springs, drawing (shared with harness-video in `harness-native-render`: Metal, t
 | Scrolling | `ui.Scroll` (clips, shifts by `ScrollState`) carries `ui.Scroller`, macOS's overlay scroller: knob and track parts (`ScrollerPart`) layout places from `ScrollExtent`, motion fades and widens (`ScrollerState`), input drags and pages (`ScrollerGrip`); tokens `scroller_*`, `NoScroller` turns it off, `ScrollFed` lets a host feed the extent (the terminal), `scroll_quietly` moves without showing it. A host running its own physics (the tree's, harness-native-scroll-physics, in `harness-native/src/app/sidebar.rs`; a chat's) adopts a `ScrollState` the scroller wrote |
 | Motion | `MatchedGeometry {id}` (selection pill), `Transition: {kind: Opacity/Slide/Scale/Move}`, `Animate`, `HoverAmt`/`HoverLift` springs; spring params are tokens |
 | Pose / timeline | `Pose: {dx, dy, shrink, fade, cut}` (0 at rest; draw folds it into the subtree, layout ignores it); a `Cue` child animates any member by path over the clock (`harness-native-ui-timeline`, used by `harness-video`) |
-| Text motion, code colour | `GlyphsIn: {at, per, dur, by, ease}` (glyph-by-glyph arrival), `Caret: {at, until, blink, ink}`, `Highlight: {file}` (tree-sitter, inks from `code_ink.<capture>` tokens). Words always break at the width their box has this frame, so they re-wrap live through a fold (only broken again over glyphs shaped once); the glyphs a new break moves slide along their line or fade into the next on `ui.spring.reflow` (`harness-native-render/src/reflow.rs`). Never lay words out at a rest width: `LaysAtRest` is for a terminal's grid only |
+| Text motion, code colour | `GlyphsIn: {at, per, dur, by, ease}` (glyph-by-glyph arrival), `Caret: {at, until, blink, ink}`, `Sheen: {period, rest, band, strength, still, ease, bands, phase, scatter, dark, light}` (a band of light sweeping through the words, the sign of work: `ui.Shimmer`, a working row's title; strength 0 is off and free), `Highlight: {file}` (tree-sitter, inks from `code_ink.<capture>` tokens). Words always break at the width their box has this frame, so they re-wrap live through a fold, instantly (only broken again over glyphs shaped once, `Layout::wrap`). Never lay words out at a rest width: `LaysAtRest` is for a terminal's grid only |
+| A running step's block | `ui.Block` + `PixelBlock: {face, turn}`: a pixel-art block (a game's item icon) whose face names what a step does (`exec`, `read`, `edit`, `net`, `think`, ...; drawn in harness-native-render block.rs, no file); set another face and it turns a quarter to it. The one coloured, moving thing in the app (a running step's line) |
 | Pixel art | `Picture: {handle}` + `Pixelated`, `Frames: {count, fps}` for a sheet; `BlazeMark: {start, exit}` for the live fire wordmark (`harness-native-blaze`). Drawn as one texture, texels fetched not filtered: never a panel per cell (those seam when scaled) |
 | Clip | `Clip` (the sidebar fold lays out at full width and clips; never relayout at in-between widths) |
 
@@ -72,8 +73,15 @@ New UI need not covered here: add a primitive (component + prim prefab + a galle
 
 ## Flecs 4.2 traps (the vendored version)
 
+- A script has at most 64 reactive inputs: every distinct `$prop` and `$token` it reads and every `entity[Component]`
+  read count, and past 64 the whole scene refuses to load (the app exits at launch). Keep fixed looks out of templates:
+  a token-heavy value (an icon's size and padding) goes in a prefab in a prefab-only file (tree.flecs,
+  parts.flecs) that the template's part inherits (`kind_icon : hn.tree.Kind {}`) or reads once
+  (`Fill: hn.Kind.shell[Fill]`); what only Rust knows (a kind's mark) Rust sets. Two changes that each fit can
+  together pass 64 on main: `scenes_load` is the check, run it on the merged tree.
+
 - The 4.2 changes (explicit deferral, `Copy`, Parent storage) are in the `flecs` skill. Here: mutate from systems
-  through the stage (`vendor/hyperion-ecs/src/system.rs`: `Iter::world` and the stage accessor) or collect, then write;
+  through the stage (`crates/harness/vendor/hyperion-ecs/src/system.rs`: `Iter::world` and the stage accessor) or collect, then write;
   never rely on implicit `defer_begin`.
 - Script prefab/template children default to Parent storage in 4.2. The shutdown abort it caused
   (flecs_non_fragmenting_childof_move) is fixed in the fork (upstream flecs#2384), but the views still find children
@@ -125,8 +133,9 @@ template hn.ObjRow {
 
 ## Tokens, theme and look
 
-- One theme: every colour is a role at the top of 00-tokens.flecs (`tone_<role>`, the blaze site's palette, dark and
-  light): grounds `ground`, `sidebar`, `card`, `raised` (menus, popovers), `well` (fields, code), `term_ground`; lines
+- One theme: every colour is a role at the top of 00-tokens.flecs (`tone_<role>`; dark is near-black with a cool
+  undertone and one blue for links and focus rings, light the blaze site's paper): grounds `ground`, `sidebar`, `card`, `raised`
+  (what floats, solid), `well` (fields, code), `term_ground`; lines
   `line`, `line_strong`; inks `ink_strong`, `ink`, `ink_muted`, `ink_faint`; washes `hover`, `wash`, `selection`,
   `selection_focus`, `press`, `scrim`; `accent`, `accent_wash`, `on_accent`, `link`, `code_ink`; states `success`,
   `warning`, `error` and their `_wash`. Below them sit the palettes (kinds, brand marks, file types, chart series,
@@ -139,9 +148,38 @@ template hn.ObjRow {
   `tone`) and panics on a missing one.
 - The sidebar is the main card's own ground with one `line` hairline (hn.Seam) between them: no lighter slab, no
   shadow. Only the terminal follows the user's Ghostty theme: its palette, cursor, font, padding and `term_ground` (a
-  terminal pane's ground, src/app/ghostty.rs); the app's chrome stays the theme's.
-- Taste: native macOS, minimal. One font family for UI (Inter) at macOS sizes, hierarchy by weight/size/tone,
-  no noise on rows, meta on hover, highlights hug their target, motion on springs, never a step.
+  terminal pane's ground, src/app/ghostty.rs); the app's chrome, and code in a chat (`code_ink.*`, JetBrains' Islands
+  Dark editor scheme), stay the theme's.
+- Taste: dark, sleek and quiet, a cockpit at night, native macOS underneath. Concretely:
+  - **Near-black, few steps.** Grounds a step or two apart on a cool near-black; hairlines barely over the ground; no
+    grey slabs. Colour only where it means something (a state, the one accent, a series), never per kind for fun.
+  - **Ink only.** Four inks on one ground. A kind's mark, a brand's mark, a slider, a highlight and a selection are ink
+    or a step of grey, never a hue. The accent is for a link and a focus ring; red is for a real failure (an exit by
+    SIGINT or SIGTERM is "stopped", not a failure).
+  - **Plates only where something floats or is typed into.** One hairline, no shadow, no glass, corners of 8. A menu
+    is ui.MenuPlate's solid plate in a window of its own.
+  - **Type is the hierarchy.** One UI family (Inter) at macOS sizes; weight, size and ink tone separate levels before
+    any box or rule does. Rows carry no noise: what matters now trails a row (what an agent is doing, the command or
+    file), when is a tooltip, never a timestamp column.
+  - **No sparkles.** Every glyph is monochrome and minimal, one weight (the codicons' line): never a sparkle, star
+    burst, gradient or any other decorative "AI" mark, for an agent, a model, a suggestion or anything else. An agent is
+    `cod-person` (`look::kind_icon`) or, on a chip, its state (`hn.chat_status`); a brand's own vector mark
+    (`hn.Kind.<kind>`) is the only exception.
+  - **Live work says what and how long.** Anything running shows its live step in words (the step, never the tool:
+    "blaze check · 6 min", not "ts") and its elapsed time, ticking, with the one breathing glyph (the only motion left), so a long wait never
+    looks hung; a card under the pointer says the rest (chat.rs `fill_chat_activity`).
+  - **State by ink, not marks.** A working row's mark is in the strong ink and its step trails it in words; at rest
+    the mark is faint; ended, the title is muted; failure is the error ink. No badges, no sheen, no dots.
+  - **Show what changed, not what was looked at.** Summaries name their targets ("Edited chat.rs, ran cargo test");
+    reads and listings are said only when nothing else happened.
+  - **Lists are live.** A tree shows what is running or just finished; what is done leaves on its own for the Archive.
+  - **Chrome only when asked.** A pane shows its content; its toolbar comes when it is used (the browser pane's
+    address on cmd+L), a detail view when its summary is pressed (the context donut opening to its parts).
+  - **Nothing moves on its own and nothing eases.** A hover, a menu's highlight, a menu, a popover and a sheet are
+    there at once and gone at once (no `Transition`, no hover spring), so two states never show together. Ask before
+    adding any motion. What still moves follows the hand or the content: a scroll, a fold, text streaming in.
+  - **Nothing written while you were away animates.** Text arriving in a pane you are watching streams in; switching
+    to it shows what came meanwhile at rest.
 
 ## Keybindings are data
 

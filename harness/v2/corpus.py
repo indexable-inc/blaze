@@ -1,5 +1,5 @@
 """corpus.py: real crates built, run and tested by blaze, each judged by its own verdicts: the
-build succeeds, its programs run and exit 0, and its own tests pass (docs/v2/plan/lanes/proof.md).
+build succeeds, its programs run and exit 0, and its own tests pass (docs/v2/plan.md).
 
     uv run --frozen python harness/v2/corpus.py '{"engine": {"kind": "v1", "blaze": "target/release/blaze"}, "out": "/tmp/corpus.json"}'
     uv run --frozen python harness/v2/corpus.py '{"engine": {...}, "out": "...", "projects": ["crates.io"], "crates": ["itoa"]}'

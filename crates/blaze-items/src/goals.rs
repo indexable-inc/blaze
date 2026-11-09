@@ -1,5 +1,5 @@
 //! Lane items' part of the persistent goal cache (`hir_ty::next_solver::goal_store`, notes in
-//! docs/v2/plan/lanes/frontend/fast-trait-store.md section 3): item keys for a goal's
+//! docs/v2/plan/design/frontend.md section 3): item keys for a goal's
 //! definitions, its crate's key, and the facts its reads stand for.
 //!
 //! A read stands for a fact when its query is keyed by one item and what the query returns for

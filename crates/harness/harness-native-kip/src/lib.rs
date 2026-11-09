@@ -1,6 +1,6 @@
 //! den's mascot, Kip, ported whole from den-native's src/mascot (github.com/andrewgazelka/den, 008da141): a small voxel
 //! creature that keeps the person company (an empty chat, perched on the composer while an agent works, a `<Kip>` a cell
-//! drew) and shows what the agent is doing. den's docs/research/mascot.md has the why of every choice here. Nothing here
+//! drew) and shows what the agent is doing. den's fed1eb428d:docs/research/mascot.md has the why of every choice here. Nothing here
 //! touches a GPU or a clock: the host steps a [`Mascot`] by the frame's time and hands harness-native-render a [`MascotQuad`].
 //!
 //! - [`model`]: den's `.voxels` text format and its mesh (faces with per-corner ambient occlusion).

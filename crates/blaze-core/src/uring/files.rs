@@ -76,6 +76,9 @@ const STATX_META: u32 = 0x0001 | 0x0002 | 0x0040 | 0x0200;
 const STATX_MTIME: u32 = 0x0040;
 /// How a kept file is opened: for reading and appending.
 const KEEP: i32 = libc::O_RDWR | libc::O_APPEND;
+/// How a kept file for reads into and writes from memory is opened: for reading and writing at
+/// offsets, never made (its asker makes it first).
+const POSITIONAL_KEEP: i32 = libc::O_RDWR;
 /// How a directory is opened to be synced.
 const DIR: i32 = libc::O_RDONLY | libc::O_DIRECTORY;
 
@@ -547,6 +550,13 @@ impl Uring {
         if make {
             hot.flags |= MAKE;
         }
+        let kept = self.kept.get(file).expect("a file just kept");
+        if kept.positional {
+            hot.flags |= ops::POSITIONAL;
+        }
+        if kept.direct {
+            hot.flags |= DIRECT;
+        }
         let push = |path: &Path, names: &mut RegionVec<u8>, at: &mut [u32; 5]| {
             at[0] = push_c(names, path.as_os_str().as_bytes())?;
             Ok(())
@@ -575,7 +585,10 @@ impl Uring {
     /// ([`Uring::wake`]).
     pub(super) fn prepared(&mut self, id: Id) -> bool {
         let hot = *self.ops.get(id).expect("a request in flight");
-        if !matches!(hot.kind, Kind::Read | Kind::Append | Kind::Sync) {
+        if !matches!(
+            hot.kind,
+            Kind::Read | Kind::Append | Kind::Sync | Kind::ReadInto | Kind::WriteFrom
+        ) {
             return true;
         }
         let kept = self.kept.get(Handle::from_bits(hot.of)).expect("held by its request");
@@ -653,7 +666,7 @@ impl Uring {
     /// Every kept file no request uses let go, and every other unnamed so it goes once its
     /// last request ends: their slots emptied through the ring.
     fn evict(&mut self) {
-        for (_, file) in self.names.drain() {
+        for (_, file) in self.names.drain().chain(self.positional.drain()) {
             let kept = self.kept.get_mut(file).expect("named files are kept");
             kept.named = false;
             if kept.users == 0 {
@@ -830,7 +843,11 @@ impl Uring {
                 1
             }
             (Kind::Open, _) => {
-                let flags = KEEP | if hot.flags & MAKE != 0 { libc::O_CREAT } else { 0 };
+                let flags = match (hot.flags & ops::POSITIONAL != 0, hot.flags & DIRECT != 0) {
+                    (true, true) => POSITIONAL_KEEP | libc::O_DIRECT,
+                    (true, false) => POSITIONAL_KEEP,
+                    (false, _) => KEEP | if hot.flags & MAKE != 0 { libc::O_CREAT } else { 0 },
+                };
                 sqes[0] = open(name(0), flags, 0o644, NO_SLOT, 0, ud(0));
                 1
             }
@@ -1132,6 +1149,7 @@ impl Uring {
     fn unkept(&mut self, file: Handle<Kept>, res: i32, why: &str) {
         self.wake(file, Some((res, why)), false);
         self.names.retain(|_, it| *it != file);
+        self.positional.retain(|_, it| *it != file);
         if let Some(kept) = self.kept.get_mut(file) {
             kept.named = false;
         }

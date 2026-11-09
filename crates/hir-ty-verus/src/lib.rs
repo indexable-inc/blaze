@@ -1,5 +1,5 @@
 //! Formal verification of `#![feature(blaze_verify)]`'s native specification clauses
-//! (docs/v2/plan/lanes/verus.md).
+//! (docs/v2/plan/design/verus.md).
 //!
 //! A function's clauses (`requires`, `ensures`, loop `invariant` and `decreases`) are written in
 //! Verus's syntax as blaze grammar, and hir-def lowers each clause to a ghost group at the head
@@ -204,7 +204,7 @@ pub struct Unknown {
 }
 
 /// A construct this slice of the lowering does not take yet, by name and place. The plan
-/// (docs/v2/plan/lanes/verus.md, "Ported, left, and the order") lists what comes next.
+/// (docs/v2/plan/design/verus.md, "Ported, left, and the order") lists what comes next.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Unsupported {
     /// The function, `crate::path::name`.
@@ -301,7 +301,7 @@ pub fn verify_function(db: &Db, func: FunctionId, config: &Config) -> Verdict {
 }
 
 /// Whether `clause` of `func<args>` is proved, and the key of that proof: the interface lane
-/// contracts reads (docs/v2/plan/lanes/contracts.md, part 4). Only [`Outcome::Proved`] answers
+/// contracts reads (docs/v2/plan/design/contracts.md, part 4). Only [`Outcome::Proved`] answers
 /// `Some`; `Unknown` is never a proof.
 ///
 /// This slice proves non-generic functions with Z3 from `BLAZE_Z3` and [`DEFAULT_RLIMIT`].

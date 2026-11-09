@@ -1866,6 +1866,15 @@ impl<'db> ExprCollector<'db> {
                         })
                     })
                 }
+                // `const static { .. }` (`#![feature(blaze_comptime)]`): an inline const like
+                // `const { .. }`, whose syntax says it is evaluated with no const checking
+                // (`hir_ty::effects::const_block_is_comptime`).
+                Some(ast::BlockModifier::Const(_))
+                    if e.is_comptime()
+                        && !self.comptime_enabled(syntax_ptr.into(), ComptimeForm::Block) =>
+                {
+                    self.alloc_expr(Expr::Missing, syntax_ptr)
+                }
                 Some(ast::BlockModifier::Const(_)) => {
                     self.with_label_rib(RibKind::Constant, |this| {
                         this.with_awaitable_block(Awaitable::No("constant block"), |this| {
@@ -4336,7 +4345,7 @@ impl<'db> ExprCollector<'db> {
             });
         }
         // blaze: `5u3` under `#![blaze::arbitrary_ints]`; every other crate reads the suffix
-        // as rustc does (docs/v2/plan/lanes/frontend/arbitrary-ints.md).
+        // as rustc does (docs/v2/plan/design/arbitrary-ints.md).
         if self.def_map.arbitrary_ints()
             && let ast::LiteralKind::IntNumber(int) = kind
             && let Some(suffix) = int.suffix()

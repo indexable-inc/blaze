@@ -5,9 +5,9 @@ date: 2026-10-29
 ---
 # The fastest compile times
 
-[model.md](model.md) and the lanes make every step incremental. These changes go further: they
+[model.md](../../plan.md) and the lanes make every step incremental. These changes go further: they
 remove steps entirely, or make the ones left an order of magnitude cheaper. Lane `fastcompile`
-builds them ([building.md](../process/building.md) section 18), asking the owning lanes for
+builds them ([building.md](../../plan.md) section 18), asking the owning lanes for
 hooks.
 
 ## Compile less
@@ -51,7 +51,7 @@ hooks.
    writable in the daemon and executable in the process, so a patch is a store with no
    `mprotect`, no link and no file write. Fences make the change safe for running threads: the
    old function stays valid until no thread is in it (plane task boundaries,
-   [concurrency.md](concurrency.md)). See [lanes/fastcompile/inproc.md](../lanes/fastcompile/inproc.md).
+   [concurrency.md](concurrency.md)). See [lanes/fastcompile/inproc.md](compile-time.md).
 7. **Dependencies as one premapped image.** Everything below the workspace members is
    prelinked once into one shared image, keyed by the dependency graph's hash and mapped by
    every dev run, so a dev link covers only the workspace's own code.

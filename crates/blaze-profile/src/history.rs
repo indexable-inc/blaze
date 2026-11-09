@@ -373,6 +373,8 @@ pub struct Flushed {
     pub counters: usize,
     pub builds: usize,
     pub samples: usize,
+    /// Heap samples ([`crate::heap`]): `alloc_samples` rows.
+    pub alloc_samples: usize,
     pub switches: usize,
     pub events: usize,
     /// Rows of `event_fields`: the fields of the events written.
@@ -604,7 +606,7 @@ fn dictionary(column: &Column) -> bool {
 }
 
 /// How each table's files are written: zstd at level 1 (fast enough to keep up with the
-/// recorder: see docs/v2/plan/lanes/observe/history.md), Parquet 2 pages (delta-encoded
+/// recorder: see docs/v2/plan/design/profile-history.md), Parquet 2 pages (delta-encoded
 /// integers), DuckDB-sized row groups, page statistics for pruning by time and build.
 fn properties(table: &Table) -> WriterProperties {
     let mut it = WriterProperties::builder()
@@ -797,6 +799,9 @@ pub struct History {
     sampler: &'static sampler::Ring,
     sampled: u64,
     samples: Vec<Sample>,
+    /// The heap samples read so far ([`crate::heap::since`]), and a flush's new ones.
+    heap_sampled: u64,
+    heap_samples: Vec<crate::heap::HeapSample>,
     /// The code images the samples' addresses are in that this history wrote rows of.
     images: symbols::ImagesWritten,
     /// [`identity::binary`], once a history: every build of this process ran it.
@@ -934,6 +939,9 @@ impl History {
             sampled: 0,
             // alloc: once a history
             samples: Vec::new(),
+            heap_sampled: 0,
+            // alloc: once a history
+            heap_samples: Vec::new(),
             images: symbols::ImagesWritten::new(),
             blaze,
             unidentified: None,
@@ -1405,10 +1413,16 @@ impl History {
         self.samples.clear();
         let samples_skipped = self.sampler.since(&mut self.sampled, &mut self.samples);
         let samples = [self.samples_batch().map_err(arrow_error(&schema::SAMPLES))?];
+        self.heap_samples.clear();
+        let heap_skipped = crate::heap::since(&mut self.heap_sampled, &mut self.heap_samples);
+        let alloc_samples =
+            [self.alloc_samples_batch().map_err(arrow_error(&schema::ALLOC_SAMPLES))?];
         // The images the samples' and this process's panics' addresses are in, and each
         // recovered crash's executable, of its own process.
         let seen_ns = clock::mono_ns();
         let stacks = self.samples.iter().map(|it| &it.pcs[..usize::from(it.depth)]);
+        let stacks =
+            stacks.chain(self.heap_samples.iter().map(|it| &it.pcs[..usize::from(it.depth)]));
         let stacks = stacks.chain(self.raised.iter().map(panics::Raised::pcs));
         let mut images = vec![
             self.images
@@ -1444,6 +1458,7 @@ impl History {
             counters: rows(&counters),
             builds: rows(&builds),
             samples: rows(&samples),
+            alloc_samples: rows(&alloc_samples),
             switches: rows(&switches),
             events: rows(&events),
             event_fields: rows(&event_fields),
@@ -1462,7 +1477,7 @@ impl History {
             processes: rows(&processes),
             test_runs: rows(&test_runs),
             client,
-            skipped: self.read.skipped + samples_skipped + panics_skipped,
+            skipped: self.read.skipped + samples_skipped + heap_skipped + panics_skipped,
             build: 0,
             files: 0,
             bytes: 0,
@@ -1473,11 +1488,12 @@ impl History {
         let build = named;
         flushed.build = build;
         self.core.files_mut().named(build);
-        let tables: [(&'static Table, &[RecordBatch]); 20] = [
+        let tables: [(&'static Table, &[RecordBatch]); 21] = [
             (&schema::SPANS, &spans),
             (&schema::COUNTERS, &counters),
             (&schema::BUILDS, &builds),
             (&schema::SAMPLES, &samples),
+            (&schema::ALLOC_SAMPLES, &alloc_samples),
             (&schema::SWITCHES, &switches),
             (&schema::EVENTS, &events),
             (&schema::ERRORS, &errors),
@@ -1698,6 +1714,22 @@ impl History {
         let frames =
             symbols::frames(self.samples.iter().map(|it| &it.pcs[..usize::from(it.depth)]));
         batches::samples(&self.samples, &frames, (Instant::now(), clock::mono_ns()), self.process)
+    }
+
+    /// The `alloc_samples` rows of the heap samples this flush read ([`crate::heap`]), named
+    /// as [`History::samples_batch`] names the CPU samples'.
+    fn alloc_samples_batch(&self) -> Result<RecordBatch, ArrowError> {
+        if self.heap_samples.is_empty() {
+            return Ok(RecordBatch::new_empty(batches::schema_of(&schema::ALLOC_SAMPLES)));
+        }
+        let frames =
+            symbols::frames(self.heap_samples.iter().map(|it| &it.pcs[..usize::from(it.depth)]));
+        batches::alloc_samples(
+            &self.heap_samples,
+            &frames,
+            (Instant::now(), clock::mono_ns()),
+            self.process,
+        )
     }
 }
 
@@ -2870,7 +2902,7 @@ mod tests {
         );
     }
 
-    /// The flush's cost a span, in release: what docs/v2/plan/lanes/observe/history.md bounds.
+    /// The flush's cost a span, in release: what docs/v2/plan/design/profile-history.md bounds.
     #[test]
     #[ignore = "a measurement: blaze test -p blaze-profile --release -- --ignored --nocapture what_a_flush_costs"]
     fn what_a_flush_costs() {

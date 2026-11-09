@@ -471,8 +471,14 @@ impl Kqueue {
 
     fn begin(&mut self, effect: Effect) -> io::Result<()> {
         match effect {
+            // A read into memory of the asker's, or a write from it, is a `pread` or `pwrite` on
+            // a file thread (`threads::run`), `F_NOCACHE` where it bypasses the cache and at
+            // `IOPOL_THROTTLE` where it is idle; the store's pool gives its driver threads
+            // enough to keep a drive's queue deep (docs/v2/plan/design/store-pool.md).
             effect @ (Effect::ReadAll { .. }
             | Effect::Read { .. }
+            | Effect::ReadInto { .. }
+            | Effect::WriteFrom { .. }
             | Effect::ReadLink { .. }
             | Effect::Append { .. }
             | Effect::Sync { .. }

@@ -27,7 +27,8 @@ pub struct MarkdownText {
 /// One inline component of inline markdown (`<Path loc="...">blaze</Path>`, harness-native-ui-inline's grammar): an entity
 /// of the `ui.inline` module per name (`ui.inline.Path`), drawn as a chip of its `glyph` and its label. `target` names the
 /// prop that says where a press goes (`loc`, `href`; empty: the chip opens nothing) and `line` the prop with a line in it
-/// (empty: none); with `file_icon` the icon is the target's file kind's (harness-native-ui-inline's files.rs), not `glyph`.
+/// (empty: none); with `file_icon` the icon is the drawing of the target's file kind (harness-native-ui-inline's
+/// files.rs, in the drawing's own colours), not `glyph`.
 /// The glyph lives here, not in an `Icon`, because inside `ui.inline` the name `Icon` resolves to the `ui.Icon` prefab.
 ///
 /// The rest are formats over the tag's props (`{n}` is its `n`; harness-native-ui-inline's `format`), each unused when
@@ -39,7 +40,9 @@ pub struct MarkdownText {
 /// (a link to a pull request is its `PR` chip), and one that stays a link shows its host after its words.
 ///
 /// A component with live state has a child per state it can be in (`ui.inline.PR.merged`), each with its own `InlineRef`
-/// (only its `glyph`) and `Fill` (the icon's ink), and an `unknown` child for while nothing is known.
+/// (its `glyph`, or `file_icon`) and `Fill` (the glyph's ink), and an `unknown` child for while nothing is known. On a
+/// file component's state, `folder` says the host found the target a folder (`ui.inline.Path.folder`), so its icon is a
+/// folder's (by the folder's name: `.github` has its own) whatever its name says.
 #[derive(Component, Clone, Debug, Default, PartialEq)]
 pub struct InlineRef {
     pub target: ScriptString,
@@ -52,6 +55,10 @@ pub struct InlineRef {
     pub feed: ScriptString,
     pub mark: bool,
     pub url: ScriptString,
+    pub folder: bool,
+    /// Not a chip but the words themselves, cited (`ui.inline.Cite`): no icon, set in the face of the words around them,
+    /// a dotted underline under them at rest and a solid one under the pointer.
+    pub plain: bool,
 }
 
 /// What the host knows of the thing a live inline component names (a pull request), on an entity of its own the host's
@@ -152,6 +159,15 @@ pub struct Mark {
     pub name: ScriptString,
 }
 
+/// The drawing of a `ui.Art`, by name among the host's multi-colour vector drawings (harness-native-render's drawing.rs:
+/// the file icons, `rust`, `folder`, ..., which harness-native-ui-inline's files.rs names for each file kind), drawn in
+/// its own colours (its dark variant in a dark appearance), fitted and centred in its box, crisp at every zoom. Its node's
+/// `Fill` is not read.
+#[derive(Component, Clone, Debug, Default, PartialEq)]
+pub struct Drawing {
+    pub name: ScriptString,
+}
+
 /// A picture of an `Image`, by handle in the host's media cache.
 #[derive(Component, Clone, Debug, Default, PartialEq)]
 pub struct Picture {
@@ -178,6 +194,16 @@ pub struct Pixelated;
 pub struct Frames {
     pub count: u32,
     pub fps: f32,
+}
+
+/// A small pixel-art item, a game's dropped item, that floats and does what it stands for, named by `face` (what a
+/// step does: `exec` a terminal with a blinking cursor, `read` a book turning a page, `net` the world turning, `think` a
+/// crystal, ...; harness-native-render block.rs draws each, none is a file). When `face` changes the old item sinks away
+/// and the new one rises in over `turn` seconds (0: at once). A picture without a file, its texels on whole device pixels, centred in the node's box.
+#[derive(Component, Clone, Debug, Default, PartialEq)]
+pub struct PixelBlock {
+    pub face: ScriptString,
+    pub turn: f32,
 }
 
 /// blaze's wordmark set on fire (harness-native-blaze), drawn as pixel art over the node's width: its letters start
@@ -339,11 +365,13 @@ hyperion_api_layouts::api_layouts! {
     "OneLine" => alias OneLine,
     "Icon" => alias Icon,
     "Mark" => alias Mark,
+    "Drawing" => alias Drawing,
     "Picture" => alias Picture,
     "Surface" => alias Surface,
     "Pixelated" => alias Pixelated,
     "Frames" => alias Frames,
     "BlazeMark" => alias BlazeMark,
+    "PixelBlock" => alias PixelBlock,
     "Kip" => alias Kip,
     "KipStand" => alias KipStand,
     "Caret" => alias Caret,
@@ -371,11 +399,13 @@ pub fn register(world: &World) {
     world.component::<OneLine>().writable();
     world.component::<Icon>().writable();
     world.component::<Mark>().writable();
+    world.component::<Drawing>().writable();
     world.component::<Picture>().writable();
     world.component::<Surface>().writable();
     world.component::<Pixelated>().writable();
     world.component::<Frames>().writable();
     world.component::<BlazeMark>().writable();
+    world.component::<PixelBlock>().writable();
     world.component::<Kip>().writable();
     world.component::<KipStand>().writable();
     world.component::<Caret>().writable();

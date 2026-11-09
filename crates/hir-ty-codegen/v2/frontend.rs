@@ -495,13 +495,13 @@ impl<'db> HirFrontend<'db> {
         let walking = super::devirt::walking(db, self.devirt.world(), instance, inlined, || owner)
             .map_err(fail)?;
         let built_in_code = built_in_code(db, hashes, &instance.0).map_err(fail)?;
-        // A body built against the program's dyn facts is keyed by those it read (rule 18). A
+        // A body built against the program's dyn facts is keyed by those it read (rule 21). A
         // copy of it built into a caller is built against none: `built_in_code`.
         let read = refs::read(db, instance, walking).map_err(fail)?;
         let told =
             self.units_as(db, instance, &origin, |it| (&it.tells, it.tells_any)).map_err(fail)?;
         // What its compiled function reads of names beside its code (the files its `file!()`
-        // names, its told locals' types) is in every key of it (rule 20), its link code's as
+        // names, its told locals' types) is in every key of it (rule 21), its link code's as
         // its template code's: read once, folded into both ([`with_names`]).
         let body = kind_body(&instance.0);
         let names = body.map(|body| hashes.names_read(db, body, told)).transpose().map_err(fail)?;
@@ -540,7 +540,7 @@ impl<'db> HirFrontend<'db> {
         let identity = identity(db, &instance.0, item, plain);
         let bound = bound(db, &instance.0, code, plain);
         let cold = cold_of(db, &instance.0);
-        // Always the origin's profile, which keys it (rule 18). Pinning the setting of one
+        // Always the origin's profile, which keys it (rule 21). Pinning the setting of one
         // whose MIR keeps no check would let requesters that differ only in overflow checks
         // share its key while its callees that take their caller's setting differ between them
         // (`<u8 as Add>::add` under `impl Add<&u8> for u8`); for one compiled in its own crate
@@ -585,14 +585,14 @@ impl<'db> HirFrontend<'db> {
     /// (`side::Variable::ty`), and it is the instance's own (`&UnsafeCell<usize>` or
     /// `&UnsafeCell<Align8<*mut ()>>` for one body of one compile identity), so two instances
     /// sharing one key would give the store two shapes under it, or one instance the other's
-    /// debug info (rule 18). Without told locals the instances stay one.
+    /// debug info (rule 21). Without told locals the instances stay one.
     ///
     /// A compile identity names each callee by its own identity, never by which instance it
     /// is, so callees of equal identities that are one instance in one instance of the generic
     /// and two in another (`size_of::<S>` and `size_of::<D>` in `needs_realloc::<S, D>` for
     /// `S == D` and for two types of one layout) leave it equal, while the reference list,
     /// which holds each instance once, and so the code, which names a reference by its place,
-    /// differ: `placement` is that one difference (rule 18).
+    /// differ: `placement` is that one difference (rule 21).
     fn generic_args(
         &self,
         db: &Db,
@@ -1040,7 +1040,7 @@ impl HirInstance {
     /// `body`'s ([`code_of`]: `body` itself, a closure or coroutine written in it, the start
     /// of a `main` that is it, a shim adapting it), or its type arguments name a closure or
     /// coroutine written in it (`block_on::<its future>`, its drop glue). No other instance's
-    /// key reads a body (docs/v2/plan/lanes/firewall/notes.md).
+    /// key reads a body (docs/v2/plan/design/item-hash.md).
     pub fn of_body(&self, db: &Db, body: DefWithBodyId) -> bool {
         let instance = match &self.0 {
             Kind::Code(instance, _) => instance,

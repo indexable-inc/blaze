@@ -258,7 +258,7 @@ the level from `set_interpreter_mir_opt_level`.
   The drops drop the value as before; the frees go. Zero-sized boxes and `vec!`s stay. Library
   units and std's own bodies never get it, nor do bodies built into another. A body that
   keeps a move (`Inlined::moved_to_frame`) is one LLVM never imports. What it relies on and leaves out:
-  `docs/v2/plan/lanes/heap-to-stack.md`.
+  `docs/v2/plan/design/heap-to-stack.md`.
 - blaze's own, at levels 1 and 2, after `HeapToStack` and before `LowerSliceLenCalls`:
   `BoxInPlace` (`optimize/box_in_place.rs`), which rustc has none of. `Box::new(value)` of a
   value of at least 4 KiB (`BOX_IN_PLACE_MIN`) with nothing to drop, built by an assignment
@@ -281,7 +281,7 @@ the level from `set_interpreter_mir_opt_level`.
   `#[rustc_no_mir_inline]`, `#[rustc_inherit_overflow_checks]`, with inline assembly, or named
   by a symbol gets one; `#[inline(never)]` callees do. The
   code generator's half, which calls the copies, has not landed: until it does, every listed
-  call still calls the callee. The plan: docs/v2/plan/lanes/codegen/constspec.md.
+  call still calls the callee. The plan: docs/v2/plan/design/constspec.md.
 - Storage markers are kept at every level: the code generator gives its backend lifetimes, and
   rustc runs `RemoveStorageMarkers` only where it gives none.
 - Not ported: `passes_not_ported(level)` lists them. At level 1 `ForceInline`, `RemoveZsts`

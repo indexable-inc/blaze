@@ -193,8 +193,8 @@ pub(crate) fn cfg(
     }
     // blaze's own atom, after the target's cfgs and rustc's flags, so `--print cfg` and build
     // scripts' `CARGO_CFG_*` never see it: MIR building reads it to check native contract
-    // clauses (docs/v2/plan/lanes/contracts.md, part 1). The crate's cfg is an input of every
-    // body lowering, so each key over a body covers it (rule 18).
+    // clauses (docs/v2/plan/design/contracts.md, part 1). The crate's cfg is an input of every
+    // body lowering, so each key over a body covers it (rule 21).
     if profile.contract_checks {
         options.insert_atom(Symbol::intern(cfg::CONTRACT_CHECKS));
     }

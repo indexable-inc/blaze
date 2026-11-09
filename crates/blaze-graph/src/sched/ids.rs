@@ -1,4 +1,4 @@
-//! The process's job, counter, member and scheduler ids (docs/v2/plan/lanes/sched.md): one
+//! The process's job, counter, member and scheduler ids (docs/v2/plan/design/fibers.md): one
 //! space for every [`super::Scheduler`] of the process, so two schedulers that join
 //! ([`super::Scheduler::join`]) never hold two jobs, counters or members of one id, and a job's
 //! or counter's scheduler is found from its id with no lock.

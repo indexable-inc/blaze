@@ -1,6 +1,6 @@
 //! One fixture crate of many bodies in many files, one body edited at a time: the time to
 //! ask for the whole crate again after an edit, against its bound
-//! (docs/v2/plan/lanes/firewall/speed-of-light.md). An edit's pass can do no less than a pass
+//! (docs/v2/plan/design/item-hash.md). An edit's pass can do no less than a pass
 //! that changed nothing (every memo validated) plus executing the edited body's queries,
 //! which cost a cold pass's share per body; an edit is that twice, once for the undo.
 

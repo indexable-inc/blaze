@@ -1,5 +1,5 @@
 //! Where the lines of a text are (docs/v2/plan/design/frontend.md item 6,
-//! docs/v2/plan/lanes/frontend/text.md): built only when something asks for a line or a
+//! docs/v2/plan/design/restore.md): built only when something asks for a line or a
 //! column (a diagnostic, `line!`/`column!`, a caller location, debug info), never on load.
 //!
 //! [`LineIndex`] is a bitmap of the text's `\n` bytes (`simd`, 64 bytes per word with the

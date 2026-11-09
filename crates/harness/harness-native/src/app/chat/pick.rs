@@ -1,6 +1,7 @@
-//! Den's model and effort picker in a chat's composer bar (scene/widgets/chat.flecs `hn.ChatPick`), and its context meter.
+//! Den's model and effort picker in a chat's status bar under its composer (scene/widgets/chat.flecs `hn.ChatPick`,
+//! in hn.ChatPane's `foot.status`), its context meter, and its plan meter (plan.rs).
 //!
-//! The bar's leading edge shows one quiet control, the model's name, its effort as a level meter (a bar per effort the
+//! The status bar's leading edge shows one quiet control, the model's name, its effort as a level meter (a bar per effort the
 //! model takes, those up to the effort lit) and a small chevron, on a wash under the pointer, its words and lit bars
 //! easing toward the ink. Its tooltip says the model and effort and how to change them; never while its menu is open.
 //!
@@ -30,7 +31,8 @@
 //!
 //! At the bar's trailing edge, the context meter: a small ring filling as the conversation fills its model's window
 //! (den's: muted, the warning tone from [`WARN`], the failed tone from [`FULL`]); under the pointer, its popover
-//! (context.rs) says how full, with the percentage, and with what.
+//! (context.rs) says how full, with the percentage, and with what. After it, how much of the person's plan is used
+//! (plan.rs), once any agent of the chat's kind has said.
 use super::*;
 use harness_native_ui_look_api::Stroke;
 use harness_native_ui_text_api::Vector;
@@ -45,7 +47,7 @@ use std::collections::BTreeMap;
 const WARN: f64 = 0.8;
 const FULL: f64 = 0.95;
 /// The track under the ring: the ink at this alpha (den's).
-const TRACK_ALPHA: f32 = 0.18;
+pub(super) const TRACK_ALPHA: f32 = 0.18;
 
 /// Which of the picker's menus is open: the models, the efforts, or both.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -192,17 +194,17 @@ fn mix(a: Rgba, b: Rgba, k: f32) -> Rgba {
 }
 
 /// The Fill of scene prefab `path` (`hn.ChatControlInk.rest`); the scene always has it.
-fn fill_of(w: WorldRef<'_>, path: &str) -> Fill {
+pub(super) fn fill_of(w: WorldRef<'_>, path: &str) -> Fill {
     view::prefab(w, path).and_then(|p| p.try_cloned::<&Fill>()).unwrap_or_else(|| panic!("scene/widgets/chat.flecs has no Fill on {path}"))
 }
 
-fn set_fill(v: View<'_>, f: Fill) {
+pub(super) fn set_fill(v: View<'_>, f: Fill) {
     if v.entity().try_cloned::<&Fill>() != Some(f) {
         v.set(f);
     }
 }
 
-/// The composer bar's quiet controls' inks (hn.ChatControlInk): at rest, under the pointer, and a level's unlit bars.
+/// The status bar's quiet controls' inks (hn.ChatControlInk): at rest, under the pointer, and a level's unlit bars.
 pub(super) struct ControlInk {
     pub rest: Fill,
     pub hot: Fill,
@@ -288,12 +290,13 @@ fn efforts_of(t: &Transcript, kind: &str, kept: &BTreeMap<String, Vec<ModelChoic
 }
 
 impl App {
-    /// The composer bar's picker and meter for chat `sid` (transcript `t`, an agent of kind `kind`, `listed` the daemon's
-    /// `(model, effort)` for it, `ended` when no agent runs it), and its menu while `open`.
+    /// The status bar's picker, context meter and plan meter for chat `sid` (`bar`: hn.ChatPane's foot.status; transcript
+    /// `t`, an agent of kind `kind`, `listed` the daemon's `(model, effort)` for it, `ended` when no agent runs it), and
+    /// its menu while `open`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn fill_chat_pick(
         &self, bar: View<'_>, sid: u64, t: &Transcript, kind: &str, open: Option<Pick>, nav: &mut PickNav, eff: &mut EffortState,
-        listed: (&str, &str), ended: bool,
+        listed: (&str, &str), ended: bool, ctx_open: bool,
     ) {
         let w = self.world.world_ref();
         let kept = self.link.agent_models();
@@ -324,15 +327,31 @@ impl App {
         view::for_each_of(pick, shown, |v, (), _| {
             control(v, &format!("chat:pick:{sid}:all"), &words, &tip, level, &ink, word.as_deref());
         });
-        view::for_each_of(meter_slot, context.map(|_| ("context", "hn.ChatContext", ())), |v, (), _| {
-            if let Some(c) = context {
-                meter(v, (c.used, c.window), ink.hot);
+        // One ring: how full the context is, breathing while the agent works (the composer's one sign of work: Return sends,
+        // Escape stops). Before the first turn says how full, a working agent's ring is an empty track.
+        let working = t.busy && !ended;
+        let shown = (context.is_some() || working).then_some(("context", "hn.ChatContext", ()));
+        view::for_each_of(meter_slot, shown, |v, (), _| {
+            meter(v, context.map_or((0, 1), |c| (c.used, c.window)), ink.hot);
+            breathe(v, working);
+            // A press opens the popover to the whole account (context.rs), another closes it.
+            let action = Action { name: format!("chat:ctx:{sid}").as_str().into() };
+            if v.entity().try_cloned::<&Action>() != Some(action.clone()) {
+                v.entity().set(action);
             }
         });
+        let agent = if t.agent.is_empty() { kind } else { t.agent.as_str() };
         // Under the pointer, the meter's popover (context.rs), anchored to the ring; never over the open menu.
         if let Some(pop) = bar.part("pop") {
-            let agent = if t.agent.is_empty() { kind } else { t.agent.as_str() };
-            super::context::fill_context_pop(pop, meter_slot.part("context"), context, agent, open.is_some());
+            super::context::fill_context_pop(
+                pop,
+                meter_slot.part("context"),
+                context,
+                agent,
+                open.is_some(),
+                ctx_open,
+                (self.pointer.x, self.pointer.y),
+            );
         }
         // Open, the menu floats above the control, its leading edge on the control's.
         let trigger = open.and_then(|_| pick.part("model"));
@@ -381,6 +400,20 @@ impl App {
         if let (Ok(sid), Some(page)) = (sid.parse(), Pick::parse(page)) {
             self.chat_pick_toggle(sid, page);
         }
+    }
+
+    /// A press on the models' "older" row (`chat:older:<sid>:<kind>`): that kind's older models shown, the menu kept open
+    /// and the highlight on the first of them.
+    pub(in crate::app) fn chat_pick_older(&mut self, rest: &str) {
+        let Some((sid, kind)) = rest.split_once(':') else { return };
+        let Ok(sid) = sid.parse::<u64>() else { return };
+        let mut states = self.chat.borrow_mut();
+        let Some(st) = states.get_mut(&sid).filter(|st| st.pick.is_some()) else { return };
+        if !st.pick_nav.older.iter().any(|k| k == kind) {
+            st.pick_nav.older.push(kind.to_owned());
+        }
+        drop(states);
+        self.poke();
     }
 
     /// A pick from the menu (`chat:set:<sid>:model:<id>` or `...:effort:<level>`): sent to the daemon, the menu closed.
@@ -495,7 +528,7 @@ impl App {
         let w = self.world.world_ref();
         let menus = [view::prefab(w, "ui.Menu"), view::prefab(w, "ui.SearchMenu"), view::prefab(w, "hn.ChatPickMenu")];
         let ours = |n: EntityView<'_>| {
-            n.try_cloned::<&Action>().is_some_and(|a| ["chat:pick:", "chat:set:", "chat:spawn:"].iter().any(|p| a.name.as_str().starts_with(p)))
+            n.try_cloned::<&Action>().is_some_and(|a| ["chat:pick:", "chat:set:", "chat:spawn:", "chat:older:"].iter().any(|p| a.name.as_str().starts_with(p)))
                 || menus.iter().flatten().any(|m| n.owns((flecs::IsA::ID, *m.id())))
         };
         let hovered = w.entity_named(APP).target(Hovered::id(), 0);
@@ -663,7 +696,10 @@ impl App {
                 if model::pane_kind(o) != model::PaneKind::Chat {
                     return None;
                 }
-                let control = super::composer(View::of(w.entity_from_id(p)))?.part("bar")?.part("pick")?.part("model")?;
+                if self.focused_pane() != Some(p) {
+                    return None;
+                }
+                let control = View::of(w.entity_from_id(self.ids.side_chat)).part("pick")?.part("model")?;
                 over(control.entity()).then(|| self.session_of(*o.id())).flatten()
             })
         })
@@ -723,6 +759,7 @@ impl App {
                 match pick.as_deref() {
                     Some(a) if a.starts_with("chat:set:") => self.chat_pick_set(&a["chat:set:".len()..]),
                     Some(a) if a.starts_with("chat:spawn:") => self.chat_pick_spawn(&a["chat:spawn:".len()..]),
+                    Some(a) if a.starts_with("chat:older:") => self.chat_pick_older(&a["chat:older:".len()..]),
                     _ => {
                         self.chat_pick_close();
                     }
@@ -801,6 +838,23 @@ fn effort_meter(m: View<'_>, level: Option<(usize, usize)>, lit: Fill, off: Fill
 
 /// The context meter for `(used, window)` tokens: the ring's arc in its tone, the track in `ink` faintly. The number is
 /// the popover's (context.rs).
+/// The context ring's parts breathe while the agent works (down to chat_working_breath), and rest at full ink when it
+/// does not (a breath of low 1 dims nothing).
+fn breathe(v: View<'_>, working: bool) {
+    let w = v.entity().world();
+    let low = if working { crate::look::width(w, "chat_working_breath_at") } else { 1.0 };
+    let Some(ring) = v.part("ring") else { return };
+    for part in ["track", "arc"] {
+        let Some(p) = ring.part(part) else { continue };
+        let e = p.entity();
+        match e.try_cloned::<&crate::look::Breath>() {
+            Some(b) if (b.low - low).abs() < 1e-3 => {}
+            Some(b) => _ = e.set(crate::look::Breath { low, ..b }),
+            None => _ = e.set(crate::look::Breath { spring: Spring::at(1.0), up: false, low }),
+        }
+    }
+}
+
 fn meter(v: View<'_>, (used, window): (u64, u64), ink: Fill) {
     let w = v.entity().world();
     let f = used as f64 / window as f64;
@@ -837,6 +891,10 @@ pub struct PickNav {
     error: Option<String>,
     slider: Option<u64>,
     efforts: Vec<String>,
+    /// The agent kinds whose older models are shown (their "older" row pressed), until the menu closes.
+    older: Vec<String>,
+    /// The highlight has been put on the model the chat runs, once per opening (so keys start from it).
+    seeded: bool,
 }
 
 /// A model in the picker's menu: its name, its version (`meta`), the line about it (`detail`), whether the chat runs it,
@@ -883,6 +941,54 @@ fn split_about(name: &str, about: &str) -> (String, String) {
     (meta.to_owned(), rest.trim().to_owned())
 }
 
+/// A model's row in the menu: its name, its version quiet after it, and the line about it. Claude lists a short name
+/// ("Opus") with its version at the head of its line ("Opus 5.5 · Best for everyday, complex tasks"); Codex lists one
+/// id-like name ("GPT-6.1-Sol"), read here as its family ("Sol") and version ("6.1"): no maker's prefix (the section's
+/// head and mark say whose it is) and no dashes. A line that only says the name again ("GPT-6.1 Terra Codex model.")
+/// is dropped.
+fn row_words(m: &ModelChoice) -> (String, String, String) {
+    let name = if m.name.is_empty() { m.id.as_str() } else { m.name.as_str() };
+    if m.about.contains(" · ") {
+        let (meta, about) = split_about(name, &m.about);
+        return (name.to_owned(), meta, about);
+    }
+    let (family, version) = family_version(name);
+    let about = m.about.trim();
+    let restates = about.to_ascii_lowercase().starts_with(&name.to_ascii_lowercase());
+    (family, version, if restates { String::new() } else { about.to_owned() })
+}
+
+/// An id-like model name read as its family and version: "GPT-6.1-Sol" and "GPT-6.1 Terra" are ("Sol", "6.1") and
+/// ("Terra", "6.1"), "gpt-5.6" is ("GPT", "5.6"), "o4-mini" is ("o4 Mini", ""). The maker's prefix goes, a word with no
+/// digit in it is capitalised, the first all-digit word is the version.
+fn family_version(name: &str) -> (String, String) {
+    let mut maker: Option<&str> = None;
+    let mut version = String::new();
+    let mut words: Vec<String> = Vec::new(); // alloc: a few words of one model's name, while the menu is open
+    for (i, t) in name.split(['-', ' ', '_']).filter(|t| !t.is_empty()).enumerate() {
+        match t.to_ascii_lowercase().as_str() {
+            "gpt" if i == 0 => maker = Some("GPT"),
+            "claude" if i == 0 => maker = Some("Claude"),
+            _ if version.is_empty() && t.starts_with(|c: char| c.is_ascii_digit()) && t.chars().all(|c| c.is_ascii_digit() || c == '.') => {
+                t.clone_into(&mut version);
+            }
+            _ if t.chars().any(|c| c.is_ascii_digit()) => words.push(t.to_owned()),
+            _ => {
+                let mut c = t.chars();
+                words.push(c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default());
+            }
+        }
+    }
+    let family = if words.is_empty() { maker.unwrap_or(name).to_owned() } else { words.join(" ") };
+    (family, version)
+}
+
+/// Version `a` is newer than `b` ("6.1" after "6", "6" after "5.6"); an empty one is never newer.
+fn newer(a: &str, b: &str) -> bool {
+    let parts = |v: &str| v.split('.').map(|p| p.parse::<u32>().unwrap_or(0)).collect::<Vec<_>>();
+    !a.is_empty() && parts(a) > parts(b)
+}
+
 /// The menu's models (hn.ChatPickModels `list`): every kind's under its head led by its maker's mark, the chat's own
 /// first, filtered by what is typed; what cannot be chosen says why instead. The highlight goes where the pointer (on
 /// `hovered`) or the keys put it (`nav`); the line about the highlighted model (else the chat's own) shows under them.
@@ -903,10 +1009,21 @@ fn model_rows(w: WorldRef<'_>, list: View<'_>, c: &MenuCtx<'_>, hovered: Option<
             continue;
         }
         let own = kind == c.kind;
-        rows.extend(models.iter().map(|m| {
-            let label = if m.name.is_empty() { m.id.clone() } else { m.name.clone() };
-            let (meta, about) = split_about(&label, &m.about);
-            let on = own && c.cur.is_some_and(|x| x.id == m.id);
+        let words: Vec<(String, String, String)> = models.iter().map(row_words).collect(); // alloc: a row's words per model
+        // A model with a newer version of its family in the list is older: folded behind one quiet row until that row is
+        // pressed (or anything is typed: search finds every model), unless the chat runs it.
+        let searching = !nav.search.query.trim().is_empty();
+        let older = |i: usize| words.iter().any(|(f, v, _)| *f == words[i].0 && newer(v, &words[i].1));
+        let runs = |m: &ModelChoice| own && c.cur.is_some_and(|x| x.id == m.id);
+        let fold = !searching && !nav.older.iter().any(|k| k == kind);
+        let folded: Vec<bool> = (0..models.len()).map(|i| fold && older(i) && !runs(&models[i])).collect(); // alloc: per model
+        let hidden = folded.iter().filter(|f| **f).count();
+        // The newest first, then (opened) the older ones, each kept in the order the agent lists them.
+        let order: Vec<usize> = (0..models.len()).filter(|&i| !older(i) || runs(&models[i])).chain((0..models.len()).filter(|&i| older(i) && !runs(&models[i]))).collect(); // alloc: per model
+        let shown: Vec<(&ModelChoice, &(String, String, String))> = order.iter().filter(|&&i| !folded[i]).map(|&i| (&models[i], &words[i])).collect(); // alloc: per model
+        rows.extend(shown.into_iter().map(|(m, (label, meta, about))| {
+            let (label, meta, about) = (label.clone(), meta.clone(), about.clone());
+            let on = runs(m);
             let detail = if own { about } else { format!("Starts a new {title} chat. {about}").trim_end().to_owned() };
             if on {
                 own_detail.clone_from(&detail);
@@ -926,6 +1043,18 @@ fn model_rows(w: WorldRef<'_>, list: View<'_>, c: &MenuCtx<'_>, hovered: Option<
                 },
             }
         }));
+        if hidden > 0 {
+            rows.push(Entry::Item {
+                text: String::new(),
+                data: Choice {
+                    label: format!("{hidden} older"),
+                    meta: String::new(),
+                    detail: "Earlier versions of these models.".to_owned(),
+                    on: false,
+                    action: format!("chat:older:{}:{kind}", c.sid),
+                },
+            });
+        }
     }
     let rows = search::filter(&nav.search.query, rows);
     // An error leads (cmd+N's remembered model no longer offered), until something is typed.
@@ -933,11 +1062,25 @@ fn model_rows(w: WorldRef<'_>, list: View<'_>, c: &MenuCtx<'_>, hovered: Option<
         Some(e) => std::iter::once(Entry::Note(e.clone())).chain(rows).collect(),
         None => rows,
     };
+    // The highlight and the pointer's row are kept by what they pick, not by index: the rows are rebuilt as things are
+    // typed, an error clears or the list arrives, and an index would land on another model beside the running one's tick.
+    let at = |i: Option<usize>, picks: &[Option<String>]| i.and_then(|i| picks.get(i).cloned().flatten());
+    let (was_hot, was_pointer) = (at(nav.search.nav.hot, &nav.picks), at(nav.search.nav.pointer_at(), &nav.picks));
     nav.picks.clear();
     nav.picks.extend(rows.iter().map(|r| match r {
         Entry::Item { data, .. } => Some(data.action.clone()),
         _ => None,
     }));
+    let find = |a: Option<String>| a.and_then(|a| nav.picks.iter().position(|p| p.as_ref() == Some(&a)));
+    let (hot, pointer) = (find(was_hot), find(was_pointer));
+    nav.search.nav.retarget(hot, pointer);
+    // Opened with nothing typed: the highlight starts on the model the chat runs (one row lit, the one ticked).
+    if !nav.seeded && !rows.is_empty() {
+        nav.seeded = true;
+        if nav.search.query.is_empty() && nav.search.nav.hot.is_none() {
+            nav.search.nav.retarget(rows.iter().position(|r| matches!(r, Entry::Item { data: Choice { on: true, .. }, .. })), None);
+        }
+    }
     let picks = &nav.picks;
     nav.search.first(picks.len(), |i| picks[i].is_some());
     search::show(list, &nav.search.query, "Search models");
@@ -956,6 +1099,8 @@ fn model_rows(w: WorldRef<'_>, list: View<'_>, c: &MenuCtx<'_>, hovered: Option<
             Entry::Head(_) => "ui.MenuHead",
             Entry::Sep => "ui.MenuSep",
             Entry::Item { data: Choice { on: true, .. }, .. } => "ui.MenuItemOn",
+            // The fold's row ("4 older"): more of the list, not a model.
+            Entry::Item { data, .. } if data.action.starts_with("chat:older:") => "ui.MenuItemQuiet",
             Entry::Item { .. } => "ui.MenuItem",
             Entry::Note(_) => "ui.MenuNote",
         };
@@ -963,6 +1108,7 @@ fn model_rows(w: WorldRef<'_>, list: View<'_>, c: &MenuCtx<'_>, hovered: Option<
     });
     view::for_each_of(items, keyed, |v, (i, r), _| match r {
         Entry::Head(s) => {
+            harness_native_ui_view::menu::light(v.entity(), false);
             if let Some(l) = v.part("label") {
                 l.text(s);
             }
@@ -971,6 +1117,7 @@ fn model_rows(w: WorldRef<'_>, list: View<'_>, c: &MenuCtx<'_>, hovered: Option<
             }
         }
         Entry::Note(s) => {
+            harness_native_ui_view::menu::light(v.entity(), false);
             if let Some(l) = v.part("label") {
                 l.text(s);
             }
@@ -985,7 +1132,7 @@ fn model_rows(w: WorldRef<'_>, list: View<'_>, c: &MenuCtx<'_>, hovered: Option<
                 m.text(&c.meta);
             }
         }
-        Entry::Sep => {}
+        Entry::Sep => harness_native_ui_view::menu::light(v.entity(), false),
     });
     // The line about the highlighted model, else the chat's own, whole under the list.
     let detail = match hot.and_then(|i| rows.get(i)) {
@@ -1048,6 +1195,23 @@ mod tests {
         assert_eq!(s("Opus", "Best for everyday tasks"), (String::new(), "Best for everyday tasks".into()));
         assert_eq!(s("gpt-6.1", "A frontier agentic coding model for long work \u{b7} reasoning"), (String::new(), "A frontier agentic coding model for long work \u{b7} reasoning".into()));
         assert_eq!(s("Sonnet", "Sonnet \u{b7} Fast"), (String::new(), "Fast".into()));
+    }
+
+    /// Codex's id-like names read as a family and a quiet version, no maker's prefix and no dashes; Claude's keep their
+    /// name, the version from the head of their line; a line that only restates the name is dropped. Older versions of a
+    /// family are told by their version.
+    #[test]
+    fn model_rows_read_as_a_family_and_a_version() {
+        assert_eq!(family_version("GPT-6.1-Sol"), ("Sol".into(), "6.1".into()));
+        assert_eq!(family_version("GPT-6.1 Terra"), ("Terra".into(), "6.1".into()));
+        assert_eq!(family_version("GPT-6-Astra"), ("Astra".into(), "6".into()));
+        assert_eq!(family_version("gpt-5.6"), ("GPT".into(), "5.6".into()));
+        assert_eq!(family_version("o4-mini"), ("o4 Mini".into(), String::new()));
+        let m = |name: &str, about: &str| ModelChoice { id: name.to_ascii_lowercase(), name: name.into(), about: about.into(), ..ModelChoice::default() };
+        assert_eq!(row_words(&m("GPT-6.1 Terra", "GPT-6.1 Terra Codex model.")), ("Terra".into(), "6.1".into(), String::new()));
+        assert_eq!(row_words(&m("GPT-6-Luna", "Fast and affordable model for easier tasks.")), ("Luna".into(), "6".into(), "Fast and affordable model for easier tasks.".into()));
+        assert_eq!(row_words(&m("Opus", "Opus 5.5 · Best for everyday, complex tasks")), ("Opus".into(), "5.5".into(), "Best for everyday, complex tasks".into()));
+        assert!(newer("6.1", "6") && newer("6", "5.6") && !newer("5.6", "6") && !newer("", "6") && !newer("6", "6"));
     }
 
     use harness_proto::event::{Body, Event};

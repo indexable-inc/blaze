@@ -1,12 +1,12 @@
 //! `Devirtualize`, blaze's own (rustc has none): a call through a `dyn` whose object type the
 //! whole program makes vtables of for one to four concrete types, and no others can exist,
 //! becomes a direct call of each type's method, behind a compare of the object's vtable
-//! pointer where there are several (docs/v2/plan/lanes/codegen/devirt.md).
+//! pointer where there are several (docs/v2/plan/design/devirt.md).
 //!
 //! What the program makes is the code generator's walk of every instance a final binary
 //! reaches ([`hir_ty::mir::devirt::World`]), named by the body's [`MirOptions::world`]. Each
 //! call the pass looks at pushes the digest of the facts it read to
-//! `body.inlined.devirtualized`, which keys the body's code (rule 18): a body keyed by what it
+//! `body.inlined.devirtualized`, which keys the body's code (rule 21): a body keyed by what it
 //! read is built again when those facts change, and only then.
 //!
 //! Why the rewrite is the same program:
@@ -233,7 +233,7 @@ fn erased<'db>(interner: DbInterner<'db>, ty: Ty<'db>) -> Ty<'db> {
 
 /// What the body's crate found of one target of the object, in the object's order: beside
 /// the object's facts, what a site's plan depends on. Which impls a crate sees follows from its
-/// dependencies, which its code hash leaves out, so a site's digest holds these (rule 18).
+/// dependencies, which its code hash leaves out, so a site's digest holds these (rule 21).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 enum Found {
@@ -377,7 +377,7 @@ fn plan<'db>(
             )),
             // A compare of each, and the `dyn` call past them: a vtable is one object per
             // content in a staged image, but not in a lazy run, nor where two origins'
-            // settings key one method twice (docs/v2/plan/lanes/codegen/devirt.md, "Vtable
+            // settings key one method twice (docs/v2/plan/design/devirt.md, "Vtable
             // identity"). Past the compares is where an object with another copy of a listed
             // type's vtable goes, and one of a type the body can't name the method of.
             (seen, _) => Plan::Rewrite { guarded: tys(&seen), last: None, outcome: "compared" },

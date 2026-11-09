@@ -28,7 +28,7 @@
 //! it lends the kernel, and what only its submission and end read; its handle is the
 //! `user_data` of its completions. The machinery that asks the kernel and steps completions is
 //! in [`flight`]. A large send on a TCP connection goes from the asker's pages
-//! (`IORING_OP_SEND_ZC`). docs/v2/plan/lanes/core/speed-uring.md has the costs per request and
+//! (`IORING_OP_SEND_ZC`). docs/v2/plan.md has the costs per request and
 //! how they compare with other runtimes.
 //!
 //! Why unsafe: the rings are memory shared with the kernel (`mmap` of the ring's file), read and
@@ -185,7 +185,7 @@ const AT_STATX_DONT_SYNC: i32 = 0x4000;
 /// Names a stamper claims at once: enough to make the claim's atomic add and the reopen of a
 /// chunk's first directory a percent or two of them (64 `statx`es are ~30 µs), few enough that
 /// the cores' last chunks end within ~30 µs of each other, under 5% of 100 000 names' sweep on
-/// 64 cores (docs/v2/plan/lanes/frontend/journal/linux.md, "Speed of light").
+/// 64 cores (docs/v2/plan/design/restore.md, "Speed of light").
 const STAMP_CHUNK: usize = 64;
 
 /// Requests the ring holds at once, enough to keep an NVMe queue full; more wait in the
@@ -1299,6 +1299,11 @@ struct Kept {
     open: bool,
     /// A request waiting for it makes it if missing.
     make: bool,
+    /// Opened for reads into and writes from memory at offsets, not for appending: under its
+    /// name in [`Uring::positional`] while `named`.
+    positional: bool,
+    /// A positional file opened `O_DIRECT`, around the page cache.
+    direct: bool,
 }
 
 /// The bits of a `user_data` that are its link.
@@ -1537,7 +1542,7 @@ impl Job {
 /// Threads, one per core, that stamp [`Effect::Stamp`]'s names with `statx` calls of their own.
 /// The ring would prepare each `IORING_OP_STATX` on its one submission thread and run it on a
 /// worker after, two handoffs per name that take longer than the `statx` itself
-/// (docs/v2/plan/lanes/frontend/journal/linux.md, "Speed of light"). A job reaches stamper 0,
+/// (docs/v2/plan/design/restore.md, "Speed of light"). A job reaches stamper 0,
 /// and stamper `i` hands it on to `2i + 1` and `2i + 2` before it starts, as far as the job has
 /// chunks for: every core is at work after log2 of them wake-ups, none from the ring's thread
 /// but the first. [`Effect::Entries`]' listings go to one stamper each, in turn, where a thread
@@ -1748,6 +1753,9 @@ pub struct Uring {
     /// Each file opened, for reading and appending, and the name each is kept under.
     kept: Slab<Kept>,
     names: HashMap<FileName, Handle<Kept>, Global>,
+    /// Each file opened for reads into and writes from memory ([`Effect::ReadInto`],
+    /// [`Effect::WriteFrom`]), by its name: the store's pool's packs, opened once and kept.
+    positional: HashMap<FileName, Handle<Kept>, Global>,
     /// Every request in flight or waiting, by the handle its `user_data` carries ([`data`]).
     /// Not freed while the kernel may still read or write what a request holds (see `Drop`).
     ops: ManuallyDrop<ops::Ops>,
@@ -1836,6 +1844,7 @@ impl Uring {
             lent: ops::Lent::new(DIRECT_BUFFERS),
             kept: slab(KEPT)?,
             names: HashMap::new_in(Global),
+            positional: HashMap::new_in(Global),
             ops: ManuallyDrop::new(ops::Ops::new(PENDING).map_err(io::Error::other)?),
             paths: ManuallyDrop::new(ops::Paths::new().map_err(io::Error::other)?),
             // alloc: setup, once per driver: room for as many as the ring holds.
@@ -1898,6 +1907,7 @@ impl Uring {
     /// Forgets the descriptor kept for `name`: the name now is another file.
     fn forget(&mut self, name: &FileName) {
         forget(&mut self.names, &mut self.kept, name);
+        forget(&mut self.positional, &mut self.kept, name);
     }
 
     /// The file kept under `name`, its open through the ring started where none is; `make`
@@ -1912,7 +1922,15 @@ impl Uring {
         }
         let fixed = Fixed::unopened(&self.table);
         // Held by its open until it ends.
-        let file = self.kept.insert(Kept { fixed, users: 1, named: true, open: false, make });
+        let file = self.kept.insert(Kept {
+            fixed,
+            users: 1,
+            named: true,
+            open: false,
+            make,
+            positional: false,
+            direct: false,
+        });
         // clone: the name once per file opened, as the key it is kept under.
         self.names.insert(name.clone(), file);
         if let Err(error) = self.open(file, name, make) {
@@ -1921,6 +1939,78 @@ impl Uring {
             return Err(error);
         }
         Ok(file)
+    }
+
+    /// The file kept under `name` for reads into and writes from memory at offsets, around the
+    /// page cache where `direct`; its open through the ring started where none is, or where the
+    /// one kept goes through the cache the other way (that one is let go once its requests end).
+    /// Never made: a missing file fails every request waiting for it, naming it.
+    fn positional_file(&mut self, name: &FileName, direct: bool) -> io::Result<Handle<Kept>> {
+        if let Some(&file) = self.positional.get(name) {
+            if self.kept.get(file).is_some_and(|it| it.direct == direct) {
+                return Ok(file);
+            }
+            forget(&mut self.positional, &mut self.kept, name);
+        }
+        let fixed = Fixed::unopened(&self.table);
+        // Held by its open until it ends.
+        let file = self.kept.insert(Kept {
+            fixed,
+            users: 1,
+            named: true,
+            open: false,
+            make: false,
+            positional: true,
+            direct,
+        });
+        // clone: the name once per file opened, as the key it is kept under.
+        self.positional.insert(name.clone(), file);
+        if let Err(error) = self.open(file, name, false) {
+            self.positional.remove(name);
+            self.kept.remove(file);
+            return Err(error);
+        }
+        Ok(file)
+    }
+
+    /// Starts [`Effect::ReadInto`] (`kind` [`Kind::ReadInto`]) or [`Effect::WriteFrom`] `tag`
+    /// of `span` at `at` of `name`, on its kept positional file: the kernel reads into or
+    /// writes from the span's address, with no copy and no buffer of the driver's. Refused before
+    /// anything is asked where the span is not one of a registered region's, or, around the page
+    /// cache, is not whole blocks.
+    #[allow(clippy::too_many_arguments, reason = "an effect's fields, taken apart once")]
+    fn on_memory(
+        &mut self,
+        tag: Tag,
+        kind: Kind,
+        name: &FileName,
+        at: u64,
+        span: &crate::Span,
+        cache: crate::Cache,
+        idle: bool,
+    ) -> io::Result<()> {
+        let what = match kind {
+            Kind::ReadInto => "a read into memory of",
+            _ => "a write from memory to",
+        };
+        let span = crate::spans::resolve(span, name, at, cache, what)
+            // alloc: an error path.
+            .map_err(|why| io::Error::other(why.0))?;
+        let direct = cache == crate::Cache::Bypassed;
+        let file = self.positional_file(name, direct)?;
+        let file = self.hold(file);
+        let mut hot = Hot::new(tag, kind, file.to_bits());
+        if direct {
+            hot.flags |= ops::DIRECT;
+        }
+        if idle {
+            hot.flags |= ops::IDLE;
+        }
+        let addr = span.addr();
+        let len = u32::try_from(span.len()).expect("a span's length is a u32");
+        let cold = Cold { at, names: [addr as u32, (addr >> 32) as u32, len, 0, 0], ..Cold::EMPTY };
+        self.start(hot, ops::NO_BYTES, cold);
+        Ok(())
     }
 
     /// A kept file's sync, done: [`Done::Synced`], unless the file kept under its name has no
@@ -2434,6 +2524,14 @@ impl Driver for Uring {
                     }),
                     false => self.load(tag, &file, at, Some(len)).map(|()| None),
                 },
+                Effect::ReadInto { file, at, into, cache, priority, .. } => {
+                    let idle = priority == crate::Priority::Idle;
+                    self.on_memory(tag, Kind::ReadInto, &file, at, &into, cache, idle)
+                        .map(|()| None)
+                }
+                Effect::WriteFrom { file, at, from, cache, .. } => self
+                    .on_memory(tag, Kind::WriteFrom, &file, at, &from, cache, false)
+                    .map(|()| None),
                 // An empty one too, so it answers once the file it makes is there.
                 Effect::Append { file, bytes, .. } => self.file(&file, true).map(|file| {
                     let file = self.hold(file);
@@ -3708,7 +3806,7 @@ mod tests {
     }
 
     /// docs/v2/plan/design/restore.md's budget, a warm sweep of 100 000 tracked names in 50 ms,
-    /// and the speed of light (docs/v2/plan/lanes/frontend/journal/linux.md): the kernel's own
+    /// and the speed of light (docs/v2/plan/design/restore.md): the kernel's own
     /// work for every name, measured as one thread's plain `statx` calls of them, over the
     /// cores. The sweep comes within 10% of it; the reference sweep's time is printed beside.
     #[test]
@@ -3982,7 +4080,7 @@ mod tests {
     /// The rounds before this one open what is kept and grow what is reused.
     const WARM: u64 = 3;
 
-    /// docs/v2/plan/lanes/mem/core/linux.md's budget: a warm sync, stat and read of a file kept
+    /// docs/v2/plan/design/memory.md's budget: a warm sync, stat and read of a file kept
     /// open allocate the read's bytes and nothing else.
     #[test]
     fn a_warm_cycle_allocates_the_read_alone() {

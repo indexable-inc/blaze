@@ -4,7 +4,7 @@
 //! of cargo's `resolve_ws_with_opts` made by blaze-resolve, guided by the lock file. Either
 //! the whole workspace's graph, as `cargo metadata` prints it, or that of one build
 //! ([`Build`]), whose features are a build's: unified over the members it selects, or over
-//! every member with `resolver.feature-unification = "workspace"` (docs/self-contained.md,
+//! every member with `resolver.feature-unification = "workspace"` (docs/v2/plan.md,
 //! "Resolution and fetching").
 //!
 //! A registry package the lock file does not pin is chosen from the registry's index, as

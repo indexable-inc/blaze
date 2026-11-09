@@ -90,6 +90,8 @@ hn {
   // numbers at the end, nulls dim; a foot says how many rows.
   prefab GenTable : hn.ChatGrid {
     Padding: {l: 0, r: 0, t: 0, b: 0}
+    // No guide: a drawn table is not nested under a step's line (ChatGrid's hairline showed as a tick under its card).
+    guide { line { Fill: $tone_clear } }
   }
 
   // A short word on a chip, in a tone. Its ground is opaque and edged, so it reads over any picture as on the page.
@@ -421,23 +423,26 @@ hn {
   }
 
   // A segmented control: its options side by side on one quiet plate, the selected one raised on its own plate in the
-  // strong ink, the rest muted.
+  // strong ink, the rest muted. Options that do not fit on one row wrap onto more (each at its own width, the plate as
+  // tall as its rows), and an option wider than the whole row wraps its own words: an option is never cut.
   prefab GenChoice : ui.Row {
     Fill: $tone_card
     Shape: {radius: 7, n: 4, border: 0, feather: 0}
-    Flex: {axis: Row, gap: 2, align: Center, justify: Start, wrap: false}
-    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $gen_control_h, min: 0, max: 0}}
+    Flex: {axis: Row, gap: 2, align: Center, justify: Start, wrap: true}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: $gen_control_h, max: 0}}
     Padding: {l: 2, r: 2, t: 2, b: 2}
   }
+  // One option: its words (wrapping when it is given less than their width) centred on a plate one control tall inside
+  // the plate's padding, taller only when its words take more lines.
   prefab GenChoiceItem : ui.Row {
     Fill: $tone_clear
     Shape: {radius: 5, n: 4, border: 0, feather: 0}
     HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0, radius: -1}
     Cursor: {shape: Arrow}
     Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
-    Size: {w: {kind: Fit, value: 0, min: 40, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
-    Padding: {l: 11, r: 11, t: 0, b: 0}
-    label : ui.Line {
+    Size: {w: {kind: Fit, value: 0, min: 40, max: 0}, h: {kind: Fit, value: 0, min: $gen_control_h - 4, max: 0}}
+    Padding: {l: 11, r: 11, t: 4, b: 4}
+    label : ui.Words {
       Fill: $tone_ink_muted
       TextStyle: {size: $size_gen_control, line: 16, role: 0, bold: 0, weight: 500}
     }
@@ -447,7 +452,7 @@ hn {
     Edge: {dark: $tone_clear.dark, light: $tone_line.light}
     Shape: {radius: 5, n: 4, border: 0.5, feather: 0}
     Lift: {blur: 2, alpha: 0.14, dy: 0.5}
-    label : ui.Line { Fill: $tone_ink }
+    label : ui.Words { Fill: $tone_ink }
   }
 
   // A labelled control (a slider, a field, a number, a select) is a column of its parts, made by genui/control.rs in
@@ -672,15 +677,17 @@ hn {
     GridColumns: {min: 120, max: 0}
     Flex: {axis: Column, gap: 12, align: Stretch, justify: Start, wrap: false}
   }
-  // Children on top of one another, centred, the box as big as the largest; a GenLayer over them adds no size: laid on
-  // the stack's frame (out of the flow), its children at its anchor moved by x and y (genui/layout.rs sets its alignment
-  // and padding), above the rest by its z.
+  // Children on top of one another, centred, the box as big as the largest of them, GenLayers included (SwiftUI's ZStack:
+  // its frame is the union of its children's), later ones and a higher z above.
   prefab GenStack : ui.ZStack {
     Flex: {axis: Z, gap: 0, align: Center, justify: Center, wrap: false}
     Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
   }
+  // A Stack's child that is its content's size and is stretched over the stack's whole frame, so its children are
+  // proposed the stack's width and sit at its anchor moved by x and y (genui/layout.rs sets its alignment and padding;
+  // x and y add no size), above its siblings by its z.
   prefab GenLayer : ui.Column {
-    Overlay
+    AlignSelf: {align: Stretch}
     Flex: {axis: Column, gap: 0, align: Start, justify: Start, wrap: false}
   }
   // Children left to right, wrapping, `gap` apart.
@@ -1049,32 +1056,11 @@ hn {
     Size: {w: {kind: Percent, value: 0.6, min: 0, max: 0}, h: {kind: Fixed, value: $gen_bone_h, min: 0, max: 0}}
   }
 
-  // A file kind's icon (in the kind's colour, hn.GenFileKind) or a symbol (in the ink), $gen_icon square.
+  // A file kind's icon (its drawing in its own colours: the host swaps the glyph for a Drawing) or a symbol (in the ink),
+  // $gen_icon square.
   prefab GenIcon : ui.Symbol {
     Fill: $tone_ink
     Size: {w: {kind: Fixed, value: $gen_icon, min: 0, max: 0}, h: {kind: Fixed, value: $gen_icon, min: 0, max: 0}}
-  }
-  prefab GenFileKind {
-    rust { Fill: $tone_file_rust }
-    typescript { Fill: $tone_file_typescript }
-    tsx { Fill: $tone_file_tsx }
-    javascript { Fill: $tone_file_javascript }
-    json { Fill: $tone_file_json }
-    toml { Fill: $tone_file_toml }
-    yaml { Fill: $tone_file_yaml }
-    markdown { Fill: $tone_file_markdown }
-    nix { Fill: $tone_file_nix }
-    shell { Fill: $tone_file_shell }
-    python { Fill: $tone_file_python }
-    go { Fill: $tone_file_go }
-    html { Fill: $tone_file_html }
-    css { Fill: $tone_file_css }
-    image { Fill: $tone_file_image }
-    lock { Fill: $tone_file_lock }
-    git { Fill: $tone_file_git }
-    folder { Fill: $tone_file_folder }
-    folder_open { Fill: $tone_file_folder }
-    text { Fill: $tone_file_text }
   }
   // A photo: its box (the width and height said, or the photo's own shape up to its own width and the column's), the
   // picture in it (`pic`: contained in its own shape, or covering the box).
@@ -1254,8 +1240,7 @@ hn {
     Flex: {axis: Row, gap: 6, align: Center, justify: Start, wrap: false}
     Size: {w: {kind: Fit, value: 0, min: 0, max: $gen_field_w}, h: {kind: Fixed, value: $gen_file_h, min: 0, max: 0}}
     Padding: {l: 7, r: 8, t: 0, b: 0}
-    icon : ui.Symbol {
-      Fill: $tone_file_text
+    icon : ui.Art {
       Size: {w: {kind: Fixed, value: 14, min: 0, max: 0}, h: {kind: Fixed, value: 14, min: 0, max: 0}}
     }
     name : ui.Lead {
@@ -1292,7 +1277,7 @@ hn {
   // ---- New elements (lane E): File, CellRef, ColorPicker and DropZone (src/app/chat/genui/{files,cellref,color,
   // dropzone}.rs), after den's 30-genui.flecs and 33-genui-prims.flecs. ----
 
-  // A File: one row of a listing (den's GenFile). Its kind's icon in the kind's colour (hn.GenFileKind), its name, then
+  // A File: one row of a listing (den's GenFile). Its kind's icon (IntelliJ's, in its own colours: ui.Art), its name, then
   // its size and when it changed, quiet, in tabular figures. A trailing / on its name makes it a folder. With an onClick
   // it is hn.GenFileOn: it shows the hover, and a press sends its value, else its name.
   prefab GenFile : ui.Row {
@@ -1300,8 +1285,7 @@ hn {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $gen_file_row_h, min: 0, max: 0}}
     Padding: {l: $gen_file_pad, r: $gen_file_pad, t: 0, b: 0}
     Shape: {radius: $gen_file_radius, n: 4, border: 0, feather: 0}
-    icon : ui.Symbol {
-      Fill: $tone_file_text
+    icon : ui.Art {
       Size: {w: {kind: Fixed, value: $gen_file_icon, min: 0, max: 0}, h: {kind: Fixed, value: $gen_file_icon, min: 0, max: 0}}
     }
     name : ui.Lead {

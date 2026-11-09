@@ -1,4 +1,4 @@
-//! The scheduler as a state machine that does no IO (docs/v2/plan/lanes/sched.md): it reads no
+//! The scheduler as a state machine that does no IO (docs/v2/plan/design/fibers.md): it reads no
 //! clock, starts no thread and never sleeps. A driver tells it what happened ([`Sched::spawn`],
 //! [`Sched::suspended`], [`Sched::done`], [`Sched::key_done`], [`Sched::yielded`],
 //! [`Sched::core_idle`], [`Sched::advance_clock`]) and does what it decides
@@ -283,7 +283,7 @@ pub enum StopReason {
 }
 
 /// A parked job of a pool that stops can never wake: its wait ends with this, for the job to
-/// fail with it, naming its wait, rather than the pool's drop waiting on it forever (rule 15).
+/// fail with it, naming its wait, rather than the pool's drop waiting on it forever (rule 18).
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: an error, off every hot path
 pub struct Stopped {
     pub job: JobId,
@@ -351,7 +351,7 @@ impl fmt::Display for Stalled {
 
 /// Every job of the wait graph that waits now and what on, stuck or not ([`waits_now`]): what a
 /// report of a build that stopped names, since a parked job's spans are on no thread while it
-/// waits (rule 13).
+/// waits (rule 15).
 #[derive(Clone, PartialEq, Eq, Debug, Default)] // clone: a report, off every hot path
 pub struct Waits(pub Vec<(JobId, StallWait)>);
 

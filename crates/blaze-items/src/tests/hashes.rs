@@ -1051,7 +1051,7 @@ fn a_leak_changes_the_interface_hash_and_keeps_the_signature_hash() {
     }
 }
 
-/// E4 of docs/v2/plan/lanes/firewall/notes.md: a constant without generics is its value, so an
+/// E4 of docs/v2/plan/design/item-hash.md: a constant without generics is its value, so an
 /// edit of the `const fn` it calls that keeps the value reaches none of its users.
 #[test]
 fn a_constant_is_its_value() {
@@ -1154,7 +1154,7 @@ fn mir_that_fails_to_lower_is_named_in_the_error() {
 }
 
 /// MIR that fails to lower in a closure written in a body is named by where the closure is
-/// written, then why it failed (rule 16): the item's hash covers the closure's code, so the
+/// written, then why it failed (rule 19): the item's hash covers the closure's code, so the
 /// item is what has no hash, but the error says which body of it.
 #[test]
 fn mir_that_fails_to_lower_in_a_closure_names_the_closure_and_its_place() {
@@ -1355,7 +1355,7 @@ pub fn run() -> u32 { by_dyn(&F) + walk(&F).unwrap_or(0) }",
     }
 }
 
-/// Rule 18: the trait's declaration holds no impl's hidden type, so each impl's comes from
+/// Rule 21: the trait's declaration holds no impl's hidden type, so each impl's comes from
 /// that impl's method. Changing what one impl's method returns behind its `impl Trait`
 /// changes that method's interface, keeps the trait method's and the other impl's, and two
 /// impls with different hidden types never hash alike.
@@ -1406,7 +1406,7 @@ pub fn run(x: &[u32]) -> Option<u32> {{ walk(&F(x)) }}"
     assert_eq!(of(&db, "run").code, run.code);
 }
 
-/// Rule 16: the site an error type is at is named by what holds the error, never a parameter
+/// Rule 19: the site an error type is at is named by what holds the error, never a parameter
 /// whose only error is the region of an elided lifetime (every elided lifetime of a signature
 /// is an error region, and is hashed).
 #[test]

@@ -1,4 +1,4 @@
-//! Pure build scripts (docs/v2/plan/lanes/pure-scripts/design.md): a script `hir_ty_pure`
+//! Pure build scripts (docs/v2/plan.md): a script `hir_ty_pure`
 //! proves pure from its MIR is looked up under its pure key ([`blaze_usercode::pure`]) as its
 //! compile begins, on the worker that has the front end. When every run of it hits, it is
 //! neither built nor run: each run's value is the kept one, its `OUT_DIR` written back. When a
@@ -139,7 +139,7 @@ pub(crate) fn built_nothing(job: &Job, unit: usize) -> bool {
 }
 
 /// The most instances a build script's purity proof may walk before it stops with an error
-/// naming the script: the bound on the walk (rule 15). A step is a body instance the walk
+/// naming the script: the bound on the walk (rule 18). A step is a body instance the walk
 /// reaches, each once ([`hir_ty_pure::ScriptProof::steps`]), whatever the daemon had cached
 /// and whichever task ran what, so a script is proved or refused alike on a cold, warm or busy
 /// daemon. How many a proof took is the `steps` of its `build script proof` span: the margin
@@ -149,7 +149,7 @@ const PROOF_STEPS: u64 = 1 << 20;
 
 /// The most rows of the front end a purity proof may bring up to date (each run or verified,
 /// each time it is reached): a bound on the query engine under the proof, not on the script,
-/// so an engine that would not end the proof stops with an error that says so (rule 15).
+/// so an engine that would not end the proof stops with an error that says so (rule 18).
 /// Unlike [`PROOF_STEPS`] it counts what was not cached, so it sits far above any proof's
 /// real work: a verify checks each row of a cycle once (`blaze_query`'s pending rows), and a
 /// cold proof of cranelift-codegen's build script brought fewer than 2^25 up to date.
@@ -197,7 +197,7 @@ fn work_out(
             Err(out) => {
                 let what = format!(
                     "did not end: the query engine under it {out}, past the {ENGINE_FUEL} rows a proof may bring up to \
-                     date (rule 15). The walk itself is bounded by the instances it reaches, so this is the engine \
+                     date (rule 18). The walk itself is bounded by the instances it reaches, so this is the engine \
                      not ending, a blaze bug, not the script"
                 ); // alloc: an error, once
                 return Err(proof_error(job, compile, &what));
@@ -242,7 +242,7 @@ fn work_out(
 fn refused(job: &Job, compile: usize, how: &str) -> ApiError {
     // alloc: an error, once
     let what = format!(
-        "walks more than the {PROOF_STEPS} instances a proof's walk may reach (rule 15): {how}"
+        "walks more than the {PROOF_STEPS} instances a proof's walk may reach (rule 18): {how}"
     );
     proof_error(job, compile, &what)
 }

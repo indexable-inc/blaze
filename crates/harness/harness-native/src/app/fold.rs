@@ -1,13 +1,15 @@
-//! Folding the sidebar's tree: a folded node (every node starts so) shows only its running children and the selected
-//! one, so a run that finishes folds away on its own; each row's disclosure chevron (left of its icon, Finder's) expands
-//! it to all of them or folds it back, as does a double click on a session's row, Left and Right while the tree has the
-//! keyboard, and Option on any of them for every sibling at once. Rows come and go on one spring each (`RowFold`, the
+//! Folding the sidebar's tree: every node starts folded and shows none of its children but the selected one, so a
+//! sub-agent or a shell starting under a chat never opens it (its row counts what runs under it instead: `under`); an
+//! open node, one the person opened, shows its live children (running, with something running under them, just
+//! finished, or selected: the model's `rows`), so a run that finishes folds away on its own. Each row's disclosure chevron (left of its title, Finder's) folds
+//! it or opens it again, as do a double click on a session's row, Left and Right while the tree has the keyboard, and
+//! Option on any of them for every sibling at once. Rows come and go on one spring each (`RowFold`, the
 //! `tree_fold` tune of the sidebar's one spring family): a row that comes grows in from no height, pushing the rows under
 //! it down, and its words fade in and settle into place once there is room for them; one that goes lets its words go
 //! first and then closes. Its selection pill is not part of that: it is the tree's one matched pill, which holds where it
 //! was while the row opens (the row is `Settling`) and then slides to it at its full height, so it never squeezes under
-//! the row's words. Under Reduce Motion rows come and go at once. What is expanded is kept in native.json (`folds`, by
-//! stable key: `false` for expanded, as it was saved before).
+//! the row's words. Under Reduce Motion rows come and go at once. What is open is kept in native.json (`folds`, by
+//! stable key: `true` folded, `false` open; a node with no entry is folded).
 use std::collections::{HashMap, HashSet};
 
 use super::*;
@@ -72,9 +74,13 @@ fn shape(row: EntityView<'_>, f: RowFold, look: FoldIn) {
     }
     let a = content_share(x, look.lead);
     let pose = Pose { dx: 0.0, dy: -look.rise * (1.0 - a), shrink: 0.0, fade: 1.0 - a, cut: 0.0 };
+    // Its selection pill (its Background) shows only once the row has opened: filling a row still growing in, it would
+    // be a sliver under the words.
+    let hidden = Pose { fade: if settling { 1.0 } else { 0.0 }, ..Pose::default() };
     for part in harness_native_ui_node_api::children(row) {
-        if !part.has(Background::id()) && part.try_cloned::<&Pose>() != Some(pose) {
-            part.set(pose);
+        let want = if part.has(Background::id()) { hidden } else { pose };
+        if part.try_cloned::<&Pose>() != Some(want) {
+            part.set(want);
         }
     }
 }
@@ -229,7 +235,7 @@ impl App {
             if let Some(folded) =
                 fold_key(e).and_then(|k| saved.get(&k)).and_then(serde_json::Value::as_bool)
             {
-                model::set_expanded(w, id, !folded);
+                model::set_folded(w, id, folded);
             }
         }
     }
@@ -238,7 +244,7 @@ impl App {
     pub(super) fn toggle_fold_of(&mut self, e: u64, all: bool) {
         let w = self.world.world_ref();
         let o = w.entity_from_id(e);
-        let fold = o.has(model::Expanded::id());
+        let fold = !model::folded(o);
         let mut targets = vec![e];
         if all && let Some(p) = o.parent() {
             p.each_child(|c| {
@@ -251,7 +257,7 @@ impl App {
             crate::prefs::get("folds").and_then(|v| v.as_object().cloned()).unwrap_or_default();
         for t in targets {
             let c = w.entity_from_id(t);
-            model::set_expanded(w, t, !fold);
+            model::set_folded(w, t, fold);
             if let Some(k) = fold_key(c) {
                 saved.insert(k, serde_json::Value::Bool(fold));
             }
@@ -260,35 +266,32 @@ impl App {
         self.poke();
     }
 
-    /// Left in the tree (scene/20-keys.flecs, ctx.Tree): fold the selected row back to its running children, or go to its
-    /// parent when it is folded or has no rows under it (Finder's, Xcode's); with `all`, its siblings fold too.
+    /// Left in the tree (scene/20-keys.flecs, ctx.Tree): fold the selected row, or go to its parent when it is folded or
+    /// has no rows under it (Finder's, Xcode's); with `all`, its siblings fold too.
     pub(super) fn tree_fold(&mut self, all: bool) {
         let w = self.world.world_ref();
         let Some(s) = self.selected().map(|s| w.entity_from_id(s)) else { return };
-        if has_kids(s) && s.has(model::Expanded::id()) {
+        if has_kids(s) && !model::folded(s) {
             self.toggle_fold_of(*s.id(), all);
         } else if let Some(p) = s.parent().filter(|p| p.target(model::Kind::id(), 0).is_some()) {
             self.select(Some(*p.id()));
         }
     }
 
-    /// Right in the tree: expand the selected row to all its children.
+    /// Right in the tree: open the selected row again (its live children show).
     pub(super) fn tree_unfold(&mut self, all: bool) {
         let w = self.world.world_ref();
         let Some(s) = self.selected().map(|s| w.entity_from_id(s)) else { return };
-        if has_kids(s) && !s.has(model::Expanded::id()) {
+        if has_kids(s) && model::folded(s) {
             self.toggle_fold_of(*s.id(), all);
         }
     }
 }
 
-/// Whether `e` has rows under it in the tree (objects, not archived): what a disclosure folds.
+/// Whether `e` has live rows under it in the tree (the model's `has_live_kids`): what its chevron folds, so a row whose
+/// children have all finished shows none.
 pub fn has_kids(e: EntityView<'_>) -> bool {
-    let mut any = false;
-    e.each_child(|c| {
-        any |= c.target(model::Kind::id(), 0).is_some() && !c.has(model::Archived::id())
-    });
-    any
+    model::has_live_kids(e.world(), *e.id())
 }
 
 /// The key an object's fold is kept by across launches: its daemon session (`s14`) or its run (`r12`).
@@ -307,17 +310,14 @@ mod tests {
     use super::*;
     use harness_native_api::Clock;
     use harness_native_ui_layout_api::{Align, Flex, FlexAxis, Justify, Viewport};
-    use harness_native_ui_motion_api::{Drawn, Matched};
     use harness_native_ui_node_api::Laid;
     use harness_native_ui_view::View;
 
-    /// The selection pill is never drawn shorter than the words of the row it is on, and at rest it holds them: through
-    /// a Cmd-N (a new session's row folding in from no height, selected at once) and an Up from it to a shorter run's
-    /// row. While the new row opens its pill holds where it was (the row is `Settling`), then slides in at the row's full
-    /// height; a slide between rows of two heights takes the new row's height at once and only its position springs.
+    /// The selection pill is never seen shorter than the words of the row it is on, and it is where the selection is at
+    /// once: through a Cmd-N (a new session's row folding in from no height, selected at once) its pill stays hidden until
+    /// the row has opened, then holds the row's words; an Up to a shorter run's row puts it there in the same frame.
     /// Headless: the scene's hn.Selection, layout, motion and this fold's own step and animate, frame by frame. It failed
-    /// when the pill chased the frame of a row still growing in (its height springing toward a sliver under the words)
-    /// and when its height sprang between rows.
+    /// when the pill showed on a row still growing in (a sliver under the words).
     #[test]
     fn the_pill_never_squeezes_under_its_row_words() {
         let world = super::super::scene_world().unwrap_or_else(|e| panic!("{e}"));
@@ -345,27 +345,22 @@ mod tests {
         };
         let laid = |v: View<'_>| v.entity().try_cloned::<&Laid>().expect("laid out");
         let words = |r: View<'_>| laid(r.part("name").expect("the row's words"));
-        fn plate(r: View<'_>) -> View<'_> {
-            r.part("pill").and_then(|p| p.part("plate")).expect("the row's pill")
+        fn pill(r: View<'_>) -> View<'_> {
+            r.part("pill").expect("the row's pill")
         }
-        let drawn = |r: View<'_>| plate(r).entity().try_cloned::<&Drawn>().expect("the pill is drawn");
-        let sliding = || {
-            w.try_lookup("ui_matched::hn_selection").and_then(|h| h.try_cloned::<&Matched>()).is_some_and(|m| m.moving)
-        };
-        // One frame as App::frame runs it (the fold, then layout and motion), then the pill against the selected row's
-        // words: never shorter, and holding them once it rests on a row that is not still opening. Whether anything
-        // still moves.
+        let plate = |r: View<'_>| laid(pill(r).part("plate").expect("the pill's plate"));
+        let seen = |r: View<'_>| pill(r).entity().try_cloned::<&Pose>().is_none_or(|p| p.fade < 1.0);
+        // One frame as App::frame runs it (the fold, then layout and motion); a pill that shows holds its row's words.
+        // Whether anything still moves.
         let frame = |sel: View<'_>| {
             let (_, folding) = step(tree.entity(), dt);
             world.get::<&mut Clock>(|c| c.time += dt);
             world.progress_time(dt);
-            let (d, t) = (drawn(sel), words(sel));
-            assert!(d.h >= t.h, "the pill ({} tall) is shorter than its row's words ({})", d.h, t.h);
-            let opening = sel.entity().has(Settling::id());
-            if !sliding() && !opening {
-                assert!(d.y <= t.y && d.y + d.h >= t.y + t.h, "the pill at rest {d:?} does not hold its row's words {t:?}");
+            let (d, t) = (plate(sel), words(sel));
+            if seen(sel) {
+                assert!(d.y <= t.y && d.y + d.h >= t.y + t.h, "the pill {d:?} shows without holding its row's words {t:?}");
             }
-            folding || sliding() || opening
+            folding
         };
         let session = row("o1", 30.0, 16.0);
         let run = row("o2", 24.0, 15.0);
@@ -381,28 +376,18 @@ mod tests {
         fold.entering.insert("o3".to_owned());
         fold.animate(tree.entity(), crate::look::fold_in(w));
         assert!(new.entity().has(RowFold::id()) && new.entity().has(Settling::id()), "the new row folds in");
+        assert!(!seen(new), "the pill is hidden while its row opens");
         let mut frames = 0;
         while frame(new) {
             frames += 1;
             assert!(frames < 240, "Cmd-N never settles");
         }
-        let (d, t) = (drawn(new), words(new));
-        assert!(d.y <= t.y && d.y + d.h >= t.y + t.h, "the pill did not land on the new row: {d:?} {t:?}");
-        // Up: to the run's row above it, shorter: its height at once, its position on the spring.
+        assert!(seen(new), "the pill shows once the row has opened");
+        // Up: to the run's row above it, shorter: the pill is there in the same frame.
         new.part("pill").expect("o3's pill").entity().destruct();
         select(run);
-        let mut frames = 0;
-        loop {
-            let going = frame(run);
-            if frames > 0 {
-                assert_eq!(drawn(run).h, laid(plate(run)).h, "frame {frames}: the pill's height sprang between rows");
-            }
-            if !going {
-                break;
-            }
-            frames += 1;
-            assert!(frames < 240, "the move never settles");
-        }
-        assert!(frames > 2, "the move slid ({frames} frames)");
+        frame(run);
+        let (d, t) = (plate(run), words(run));
+        assert!(seen(run) && d.y <= t.y && d.y + d.h >= t.y + t.h, "the pill is not on the run's row at once: {d:?} {t:?}");
     }
 }

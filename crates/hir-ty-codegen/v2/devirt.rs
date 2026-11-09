@@ -1,5 +1,5 @@
 //! The whole program's trait objects, for `hir-ty-mir`'s `Devirtualize`
-//! (docs/v2/plan/lanes/codegen/devirt.md). Each walked body lists what it does with trait
+//! (docs/v2/plan/design/devirt.md). Each walked body lists what it does with trait
 //! objects ([`Facts`], found by [`super::refs`] beside its references); once the walk of a
 //! final binary has reached everything, [`State::closed`] makes the program's [`World`] of
 //! them, and the walk runs again (`blaze_codegen::driver`) with the bodies that call through a
@@ -189,7 +189,7 @@ fn sites(db: &Db, body: &MirBody<'_>) -> bool {
 
 /// `code`, the code hash of an instance's body, with the facts its body read of the world
 /// (`MirBody::inlined.devirtualized`, as [`refs::read`] lists them): the key of what was
-/// built against them (rule 18). A body that read none keeps its code.
+/// built against them (rule 21). A body that read none keeps its code.
 pub(crate) fn code(code: blaze_items::CodeHash, read: &[[u8; 32]]) -> blaze_items::CodeHash {
     if read.is_empty() {
         return code;

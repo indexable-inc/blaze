@@ -244,17 +244,22 @@ float4 panel_shade(PanelV v, ConstantBuffer<Frame> frame, PanelInst p)
     }
     if (p.fx.w > 4.5 && p.fx.w < 5.5)
     {
-        // Copy light (den's selection flash, harness-native-render select.rs): a soft band of the fill across the row, its
-        // centre going left to right as fx2.z goes 0 to 1; the row's corners as the selection's (fx2.w mask).
+        // A copy's light over one row of the selection (harness-native-render select.rs `Pulse`): a soft band of the fill
+        // whose middle crosses the point (lens.x, lens.y) and leans back lens.w points for every point down, lens.z points
+        // either side of it before it is gone (smoothstep; 0: the whole row, Reduce Motion's glow). It is given in view
+        // points, so the pieces on every row are one band across the shape. fx2.z is how much of it adds to what is under
+        // rather than lying over it: premultiplied, an alpha of 0 adds (light on a dark page), its own alpha lays it over (a
+        // tint on a light one). Clipped to the row's corners as the selection's (fx2.w mask).
         uint lmask = (uint)p.fx2.w;
         uint lquad = (v.local.x > 0.0 ? 1u : 0u) + (v.local.y > 0.0 ? 2u : 0u);
         uint lbit = lquad == 0u ? 1u : (lquad == 1u ? 2u : (lquad == 2u ? 8u : 4u));
         float ld = sd_squircle(v.local, half_size, (lmask & lbit) != 0u ? 0.0 : p.shape.x, p.shape.y);
-        float band = max(12.0, p.rect.z * 0.26);
-        float centre = -band + (p.rect.z + 2.0 * band) * p.fx2.z;
-        float lit = saturate(1.0 - abs(v.local.x + half_size.x - centre) / band);
+        float2 pt = p.rect.xy + half_size + v.local;
+        float lit = 1.0;
+        if (p.lens.z > 0.0)
+            lit = 1.0 - smoothstep(0.0, 1.0, abs(pt.x - (p.lens.x - p.lens.w * (pt.y - p.lens.y))) / p.lens.z);
         float a = fill.a * saturate(0.5 - ld / aa) * lit * opacity;
-        return float4(fill.rgb * a, a);
+        return float4(fill.rgb * a, a * (1.0 - saturate(p.fx2.z)));
     }
     if (p.fx.w > 3.5)
     {

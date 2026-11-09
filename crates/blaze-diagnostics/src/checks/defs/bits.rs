@@ -1,4 +1,4 @@
-//! `#[blaze::bits]`, blaze's own (docs/v2/plan/lanes/frontend/bits.md), not rustc's: a struct whose fields
+//! `#[blaze::bits]`, blaze's own (docs/v2/plan/design/bits.md), not rustc's: a struct whose fields
 //! are refused a bit width or don't fit its backing integer, and the attribute on an enum or a
 //! union, which have no bit-packed form. Each error names the struct, and the field and its type
 //! where there is one; the layout says why (`hir_ty::layout::BitsError`).

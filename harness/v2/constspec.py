@@ -1,5 +1,5 @@
 """constspec.py: the benchmark of `hir-ty-mir`'s `Specialize`, which calls a copy of a callee
-compiled knowing a constant argument it branches on (docs/v2/plan/lanes/codegen/constspec.md).
+compiled knowing a constant argument it branches on (docs/v2/plan/design/constspec.md).
 The program `constspec/modes.rs` runs mode-switched hot loops; two blazes build it, the one
 without the pass (`before`) and the one with it (`after`), and their programs are timed.
 
@@ -14,7 +14,7 @@ The input is one JSON object (inline, a file's path, or `-` for stdin):
     duckdb         the DuckDB `blaze debug sql` runs (`nix build --print-out-paths .#duckdb`/bin/duckdb)
     out            the path the result JSON is written to (report.py)
     before_tree    what each blaze was built from, kept in the result as given: the exact tree
-    after_tree     (rule 19), as a content digest of its sources; the binaries' hashes are added
+    after_tree     (rule 22), as a content digest of its sources; the binaries' hashes are added
     rounds         rounds of each hot loop in a timed run (20000: 82M elements a loop)
     runs           timed runs of each program, the two alternating (15)
     work           the directory everything is built in; empty: a new one under /tmp

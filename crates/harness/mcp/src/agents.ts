@@ -42,9 +42,11 @@ export const agents = {
   },
 
   /** Start an agent as a child of this one (it shows up under us in the harness UI). */
-  async spawn(opts: { kind?: Kind; prompt?: string; args?: string[]; cwd?: string; cols?: number; rows?: number } = {}): Promise<number> {
-    const { kind = "claude", prompt, args = [], cwd = process.cwd(), cols = 140, rows = 45 } = opts;
-    const r = await req<{ id: string }>({ op: "spawn_object", kind, prompt, args, cwd, cols, rows, parent: selfId() });
+  async spawn(opts: { kind?: Kind; name: string; model: string; effort?: string; prompt?: string; args?: string[]; cwd?: string; cols?: number; rows?: number }): Promise<number> {
+    const { kind = "claude", name, model, effort, prompt, args = [], cwd = process.cwd(), cols = 140, rows = 45 } = opts;
+    const missing = [!name && "name", (kind !== "shell" && !model) && "model"].filter(Boolean);
+    if (missing.length) throw new Error(`agents.spawn needs an explicit ${missing.join(", ")}: agents.spawn({ kind, name, model, effort, prompt })`);
+    const r = await req<{ id: string }>({ op: "spawn_object", kind, name, model, effort: effort ?? null, prompt, args, cwd, cols, rows, parent: selfId() });
     return Number(r.id.slice(1));
   },
 

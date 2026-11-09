@@ -1,5 +1,5 @@
 //! What a function's optimized code still does in its loops, by statement: the report lint
-//! `blaze::vecreport` prints (docs/v2/plan/lanes/codegen/vecreport.md). LLVM's units built
+//! `blaze::vecreport` prints (docs/v2/plan/design/vecreport.md). LLVM's units built
 //! with [`blaze_codegen::settings::Spec::report`] have one; it is read from the code LLVM is
 //! about to write ([`crate::llvm::report`]), never guessed from MIR.
 //!

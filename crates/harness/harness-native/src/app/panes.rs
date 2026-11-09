@@ -535,6 +535,7 @@ impl App {
             marked: marked.as_deref(),
             select: &select,
             select_ink: select.colour(self.term_ground_dark()),
+            ground_dark: self.term_ground_dark(),
             flash: te.try_cloned::<&CopyFlash>(),
         };
         let paint_ = self.paint.get_mut();
@@ -700,6 +701,10 @@ impl App {
             self.side_drag_move();
             return;
         }
+        if self.web_dragging() {
+            self.web_drag_move();
+            return;
+        }
         // Over a live browser page, or holding a press on one: the page's (app/browser.rs).
         if self.browser_pointer_move(m) {
             self.poke();
@@ -748,9 +753,23 @@ impl App {
             self.side_drag_start();
             return;
         }
+        // On the browser pane's left edge: drag it wider or narrower (app/browser/drag.rs).
+        if b == Button::Left && self.on_web_edge() {
+            self.web_drag_start();
+            return;
+        }
+        // A right press or a control-click on a sidebar row opens its menu at the pointer, the selection left where it is;
+        // a press off an open one closes it and goes no further (row_menu.rs).
+        if self.row_menu_down(x, y, b, m) {
+            return;
+        }
         if b == Button::Left {
             self.pointer.down = true;
             self.pointer.went_down = true;
+        }
+        // A press on the open row menu is its items' (the UI layer's press), not a pane's or a terminal's under it.
+        if self.on_row_menu() {
+            return;
         }
         // A press off the row whose name is being renamed saves the rename (chat/rename.rs), and does what it does.
         self.rename_press();
@@ -804,6 +823,10 @@ impl App {
         self.mods = m;
         if self.drag.active() {
             self.side_drag_end();
+            return;
+        }
+        if self.web_dragging() {
+            self.web_drag_end();
             return;
         }
         if b == Button::Left {
@@ -1002,6 +1025,10 @@ impl App {
     /// send up the responder chain), else typing for whatever has the keyboard.
     pub fn key(&mut self, k: &term::KeyIn<'_>) -> super::Outcome {
         self.poke_why("key");
+        // An open row menu has the keys while it is open, as NSMenu has (row_menu.rs).
+        if self.row_menu_key(k) {
+            return super::Outcome::None;
+        }
         // An element of a cell's UI that has the keys hears them first (genui/common.rs).
         if self.genui_common_key(k) {
             return super::Outcome::None;
@@ -1071,6 +1098,10 @@ impl App {
 
     /// Text an input method, the emoji picker or dictation committed: sent as typed to the focused terminal.
     pub fn commit_text(&mut self, text: &str) {
+        // Typing while a row menu is open goes nowhere, as under an open NSMenu.
+        if self.row_menu_open() {
+            return;
+        }
         if self.palette.is_none() && self.browser_commit(text) {
             return;
         }
@@ -1164,9 +1195,8 @@ impl App {
         let t = self.focused_term()?;
         let sel = self.get::<TermSelection>(t).get()?;
         let text = self.with_parser(t, |p| term::selection_text(p, sel.ordered())).filter(|s| !s.is_empty())?;
-        let w = self.world.world_ref();
-        let look = harness_native_render::select::Look::of(w).copy;
-        self.put(t, CopyFlash::kicked(look.secs, look.rise));
+        let pulse = harness_native_render::select::Look::of(self.world.world_ref()).kick();
+        self.put(t, pulse);
         self.poke();
         Some(text)
     }
@@ -1181,9 +1211,33 @@ impl App {
         self.chat_cut()
     }
 
-    /// Files pasted (a Finder copy: their paths): into a terminal as words its shell reads back as those paths (quoted
-    /// where they need it), anywhere else as the paths, a space apart.
+    /// Pictures pasted (Command-V of a screenshot, a browser's Copy Image, several copied at once), as PNG bytes: each
+    /// saved under `$HARNESS_HOME/pastes`, then all attached to the focused chat's message, else their paths pasted
+    /// ([`Self::paste_paths`]).
+    pub fn paste_pictures(&mut self, pngs: &[Vec<u8>]) {
+        let dir = crate::link::home().join("pastes");
+        let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+        let mut paths = Vec::new(); // alloc: a paste's few pictures
+        for (i, png) in pngs.iter().enumerate() {
+            let path = dir.join(format!("{ms}-{i}.png"));
+            if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, png)) {
+                eprintln!("harness-native: paste: saving the picture to {}: {e}", path.display());
+                continue;
+            }
+            paths.push(path.to_string_lossy().into_owned());
+        }
+        if !paths.is_empty() && !self.chat_attach(&paths) {
+            self.paste_paths(&paths);
+        }
+    }
+
+    /// Files pasted (a Finder copy: their paths): pictures into a chat's message ([`Self::chat_attach`]); else into a
+    /// terminal as words its shell reads back as those paths (quoted where they need it), anywhere else as the paths, a
+    /// space apart.
     pub fn paste_paths(&mut self, paths: &[String]) {
+        if self.chat_attach(paths) {
+            return;
+        }
         let terminal = self.palette.is_none() && !self.archive_focused() && !self.chat_focused() && !self.renaming();
         let words: Vec<String> = paths.iter().map(|p| if terminal { term::shell_quote(p) } else { p.clone() }).collect();
         self.paste(&words.join(" "));

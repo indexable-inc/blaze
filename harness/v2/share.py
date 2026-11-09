@@ -1,6 +1,6 @@
 """share.py: the programs of `crates/hir-ty-share/programs/` built by blaze, each program's
 stdout held to the `<name>.stdout` beside it
-(`fastcompile-ident-share 2` in docs/v2/requests/fastcompile.md; docs/v2/plan/lanes/fastcompile/share.md).
+(`fastcompile-ident-share 2` in fed1eb428d:docs/v2/requests/fastcompile.md; docs/v2/plan/design/compile-time.md).
 
     uv run --frozen python harness/v2/share.py '{"engine": {"kind": "v2", "blaze": "target/release/blaze"}, "out": "/tmp/share.json"}'
     uv run --frozen python harness/v2/share.py '{"engine": {...}, "out": "...", "programs": ["type_id", "statics"]}'

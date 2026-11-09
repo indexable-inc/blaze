@@ -3071,7 +3071,7 @@ impl From<BuilderError> for Unhandled {
 }
 
 /// The weights of a branch with one cold side (Cranelift's `Layout::is_cold`: a cleanup, a panic or
-/// the `Err` arm of `?`, docs/v2/plan/lanes/layout/layout.md), as `llvm.expect` gives an
+/// the `Err` arm of `?`, docs/v2/plan/design/code-layout.md), as `llvm.expect` gives an
 /// unlikely edge (its `UnlikelyBranchWeight` of 1 against `LikelyBranchWeight`'s 2000), so
 /// LLVM moves the cold side out of the hot path; none when neither side or both are cold.
 fn unlikely([then, otherwise]: [bool; 2]) -> Option<[u64; 2]> {

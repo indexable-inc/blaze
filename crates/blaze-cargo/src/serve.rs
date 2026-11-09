@@ -1,4 +1,4 @@
-//! `blaze serve` (docs/v2/plan/lanes/cargo/notes.md section 6): v2's daemon. One loop over the
+//! `blaze serve` (docs/v2/plan.md section 6): v2's daemon. One loop over the
 //! platform's driver holds the API server, the session, the VFS, the database, the store and
 //! the plane, and builds what the CLI and agents ask through them.
 //!
@@ -16,6 +16,7 @@
 //!   its CPUs, and answers `blaze explore`, `blaze debug live` and a reader's ask to flush the
 //!   history (`blaze_api::Request::Flush`) itself ([`observe`]).
 
+mod breakdown;
 pub mod ceiling;
 mod daemon;
 mod fetch;
@@ -1115,7 +1116,7 @@ pub(crate) fn engine(
     // Keyed by what makes std's records and outputs ([`RecordMakers`]), never the executable's
     // bytes: the shared store holds std units' records and outputs alone, and each std key's
     // outputs are files at fixed paths under it, so two blazes share it only when every byte
-    // either writes there is made by the same code from the same inputs (AGENTS.md rule 22).
+    // either writes there is made by the same code from the same inputs (AGENTS.md rule 25).
     let makers = record_makers().map_err(|why| anyhow::anyhow!(why))?;
     let std = machine()?.join("std").join(format!("{:x}", makers.id()));
     std::fs::create_dir_all(&std).with_context(|| {
@@ -1199,6 +1200,12 @@ pub(crate) fn engine(
     };
     // A sampler that can't be made is no other path: every dump and history says it is off.
     if let Err(why) = blaze_profile::sampler::start(blaze_profile::sampler::HZ) {
+        tracing::warn!("{why}");
+        eprintln!("blaze serve: {why}");
+    }
+    // The heap's: one allocation in every 4 MiB a thread allocates, with its stack, as
+    // `alloc_samples` rows (docs/memory-footprint.md, step 1). Said, as the CPU sampler is.
+    if let Err(why) = blaze_profile::heap::start() {
         tracing::warn!("{why}");
         eprintln!("blaze serve: {why}");
     }

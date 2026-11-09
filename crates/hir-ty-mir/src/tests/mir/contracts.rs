@@ -1,4 +1,4 @@
-//! blaze_verify's native contracts checked at run time (docs/v2/plan/lanes/contracts.md,
+//! blaze_verify's native contracts checked at run time (docs/v2/plan/design/contracts.md,
 //! part 1): what the crate cfg atom `blaze::contract_checks` changes in MIR, and what it
 //! leaves alone.
 

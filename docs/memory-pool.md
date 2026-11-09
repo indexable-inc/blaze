@@ -104,6 +104,10 @@ never the machine.
 
 ### 7. What the kernel does for it (Linux 7.2, macOS)
 
+For the store's hot tier, [v2/plan/design/store-pool.md](v2/plan/design/store-pool.md#giving-pages-back-and-the-tlb)
+supersedes the droppable arenas and `memory.reclaim` below: pinned zero-copy reads cannot let the
+kernel drop a page, so the pool's own evictor gives its pages back.
+
 blaze's Linux floor is 7.2, the ix VM kernel (docs/kernel.md). The pool uses the kernel
 features below directly, with no probe and no path for an older kernel:
 

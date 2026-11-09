@@ -1,4 +1,4 @@
-//! The effects of the one walk (docs/v2/plan/lanes/pure-fns.md, "Effects"): every kind of thing
+//! The effects of the one walk (docs/v2/plan/design/pure-fns.md, "Effects"): every kind of thing
 //! an instance may do ([`Rule`]), as the bitset ([`EffectSet`]) each instance's summary carries
 //! with a witness per kind; the attribute effects that refuse some kinds ([`EffectDef`]:
 //! `#[blaze::pure]` here, `nopanic`, `noalloc` and `nonblocking` beside it); and the toolchain's
@@ -675,7 +675,7 @@ pub(crate) const MODELS: &[Modeled] = &[
         ADDRESS,
         "splits a slice where its address is aligned",
     )),
-    // The effects lane's rows: what blocks (docs/v2/plan/lanes/effects.md).
+    // The effects lane's rows: what blocks (docs/v2/plan/design/effects.md).
     block_row("std::thread::sleep_ms", Site::Fn(&["thread", "sleep_ms"]), SLEEPS, "sleeps"),
     block_row("std::thread::sleep_until", Site::Fn(&["thread", "sleep_until"]), SLEEPS, "sleeps"),
     block_row(

@@ -8,7 +8,7 @@
 //! collisions of it cost a few thousand tries each. SipHash is a keyed PRF: without the key a
 //! hash says nothing about another's, and a key drawn at random ([`SipKey::random`]) is never
 //! shown. Where a table is persisted its key must be a pure function of its content (AGENTS.md
-//! rule 22): derive it from the values with BLAKE3, so the keys can't be picked before the key
+//! rule 25): derive it from the values with BLAKE3, so the keys can't be picked before the key
 //! is known.
 //!
 //! The algorithm is fixed here, never std's (whose `DefaultHasher` may change), so a key and

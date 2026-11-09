@@ -1,4 +1,4 @@
-//! The crate an instance is worked out in: its home. One rule for every reader (rule 26): the
+//! The crate an instance is worked out in: its home. One rule for every reader (rule 30): the
 //! code generator compiles an instance there, build-script purity walks it and takes its
 //! identity there. Where the instance is asked for by a function of some crate, what it does
 //! depends only on what its own name names, the function it instantiates and the types it is
@@ -43,7 +43,7 @@
 //!   impl that matches a goal of `H`'s walk (the orphan rule, below), so it can't matter, and a
 //!   script with a dependency of its own (specializing or not) still shares with `std`.
 //!
-//! Then what `I` does worked out in `H` equals what it does worked out in `S` (rule 18):
+//! Then what `I` does worked out in `H` equals what it does worked out in `S` (rule 21):
 //!
 //! - What the walk of `I` asks the solver names only crates among `H`'s dependencies: `I`'s
 //!   own, what the bodies of those crates name, and what the impls found in them name, by
@@ -142,7 +142,7 @@ pub fn home(db: &Db, asker: Crate, code: Option<Crate>, args: GenericArgs<'_>) -
     // The crates the arguments name, each type walked once: a type reached by many paths (a
     // deep nest of generics, a closure's upvars) is walked once per path without the set,
     // exponentially many times, which held a helix build for 25 s on one thread
-    // (docs/research/warm-start.md).
+    // (fed1eb428d:docs/research/warm-start.md).
     let crates = frame::task(Tag::Mir, |frame| {
         let mut named =
             Named { db, crates: SmallVec::new(), seen: HashSet::new_in(frame), open: false };
@@ -178,7 +178,7 @@ pub fn unloaded_crate(db: &Db, krate: Crate, ty: Ty<'_>) -> Option<Crate> {
 }
 
 /// Whether an instance with `args` is generic: an argument is not a lifetime. The one
-/// definition every reader uses (rule 26): one that is not, a function, closure or coroutine,
+/// definition every reader uses (rule 30): one that is not, a function, closure or coroutine,
 /// is compiled once, in its own crate ([`own_crate`]); a generic one per instantiation.
 pub fn is_generic(args: GenericArgs<'_>) -> bool {
     args.iter().any(|arg| arg.region().is_none())
@@ -193,7 +193,7 @@ pub fn own_crate(code: Option<Crate>, args: GenericArgs<'_>) -> Option<Crate> {
 
 /// Whether rustc compiles the instance `body<args>` into each crate that uses it, rather than
 /// linking every user to one copy compiled in its own crate: the one rule of which crate's
-/// code-generation settings an instance takes (rule 26): the code generator compiles it for
+/// code-generation settings an instance takes (rule 30): the code generator compiles it for
 /// the crate that asks for it exactly when this holds (`HirFrontend::compiled_for`), under that
 /// crate's overflow checks (`overflow`'s module doc). Its MIR is
 /// still worked out in its own crate ([`own_crate`], [`env_of`]); only how that MIR becomes

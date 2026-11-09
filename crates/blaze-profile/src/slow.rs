@@ -10,7 +10,7 @@
 //! misses, the query engine's counts, the memory counters). [`load`] is the driver that reads
 //! them through DuckDB; [`text`] renders a report for a person, and the report is
 //! `serde::Serialize` for an agent (`blaze slow --json`). The output depends on nothing but the
-//! rows: every map is sorted before it is read out (rule 22).
+//! rows: every map is sorted before it is read out (rule 25).
 //!
 //! What it borrows (/tmp/blaze-lanes/v2-slowreport.md):
 //! - EngFlow's bazel_invocation_analyzer: independent suggestion providers over one profile, each
@@ -61,7 +61,7 @@ pub struct BuildFacts {
     pub workspace: Option<String>,
     pub command: Option<String>,
     pub outcome: Option<String>,
-    /// The digest of the tree it built, and the BLAKE3 of the blaze that built it (rule 19).
+    /// The digest of the tree it built, and the BLAKE3 of the blaze that built it (rule 22).
     pub tree: Option<String>,
     pub blaze: Option<String>,
     pub hits: Option<u64>,
@@ -483,7 +483,7 @@ pub enum BlindKind {
     Unrecorded,
     /// Workers running a job inside no span.
     Uncovered,
-    /// Waits that say nothing of what they wait for (rule 13).
+    /// Waits that say nothing of what they wait for (rule 15).
     UnnamedWait,
     /// Waits that name what they wait for but never who runs it.
     OwnerlessWait,
@@ -1051,7 +1051,7 @@ impl<'a> Ctx<'a> {
                     title: format!("waits on `{name}` say nothing of what they wait for: {} of wall, {} parked in all", s(wall), s(class.ns)),
                     subject: name,
                     evidence,
-                    fix: "open a `wait` span naming the awaited key, lock, channel or child, and its owner (rule 13); or, when the recorder lost spans, find what held its open slots".to_owned(),
+                    fix: "open a `wait` span naming the awaited key, lock, channel or child, and its owner (rule 15); or, when the recorder lost spans, find what held its open slots".to_owned(),
                 });
                 continue;
             }

@@ -101,7 +101,7 @@ pub(crate) fn units(
         Ok(it) => it,
         Err(error) => return Ok(fail(error)),
     };
-    // blaze's `contract-checks` (docs/v2/plan/lanes/contracts.md, part 1), which cargo's
+    // blaze's `contract-checks` (docs/v2/plan/design/contracts.md, part 1), which cargo's
     // profile tables do not carry. A foreign load builds another build's dependencies with
     // the profile it asks for, whose root default stands.
     if spec.foreign.is_none() {
@@ -989,7 +989,7 @@ fn std_key(
     // (`CompileMode::is_rustc_test`: a test, or a check of one, `check --tests` and the
     // `--all-targets` of `check --fix`, whose crate's root has the harness and its `extern crate
     // test` appended all the same), or a library's doctests, whose runner is a libtest harness
-    // blaze writes (docs/v2/plan/doctests.md).
+    // blaze writes (docs/v2/plan/design/doctests.md).
     let harnessed = !for_macros
         && graph.units.iter().any(|unit| {
             let rustc_test =
@@ -1033,7 +1033,7 @@ fn std_key(
         // neither `std` nor `panic_unwind` (`core`, `alloc`) is built with the profile's
         // `panic`, as cargo builds it: no crate of it defines `rust_eh_personality`, which a
         // `core` built to unwind names from its landing pads (#1611 round 3, L9). The key names
-        // it, so a std built to abort is never another's (rule 18).
+        // it, so a std built to abort is never another's (rule 21).
         panic: if for_macros || target_aborts(triple)? {
             "abort".to_owned()
         } else if !crates.iter().any(|it| it == "std" || it == "panic_unwind") {
@@ -1064,7 +1064,7 @@ fn std_key(
 
 /// Refuses std's `roots` for `built_for` when one of them runs elsewhere than `key`, of ID
 /// `id`, says: a key that missed where std's code runs would give the target a std compiled
-/// for this machine's CPU, or the host one for the baseline (rule 18).
+/// for this machine's CPU, or the host one for the baseline (rule 21).
 fn runs_as_keyed(
     graph: &schema::UnitGraph,
     roots: &[(String, usize)],

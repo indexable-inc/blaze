@@ -866,7 +866,7 @@ impl Rule {
 /// Whether a value fetched from the global cache may be kept (the `admit` of `blaze_cas::Store::fetch`):
 /// never one verified across checkouts (`blaze_usercode::index::verified_value`). The record
 /// that retracts it would be in the store of the machine that found it differs alone, so this
-/// machine would be given it after it was retracted (rule 18). Checked on the bytes as they
+/// machine would be given it after it was retracted (rule 21). Checked on the bytes as they
 /// come, before the store keeps them; a value this machine verified is never fetched (the
 /// store has it), so never refused here.
 /// Every kind is checked: a run's value is a [`Kind::Run`], and no other value starts as one

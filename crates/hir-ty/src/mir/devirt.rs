@@ -3,7 +3,7 @@
 //! that list is all there can be. The code generator learns it from the walk of everything a
 //! final binary reaches and gives it here ([`give`]); `hir-ty-mir`'s `Devirtualize` pass reads
 //! it by its content ID, which is in the [`super::MirOptions`] of the body
-//! (docs/v2/plan/lanes/codegen/devirt.md).
+//! (docs/v2/plan/design/devirt.md).
 //!
 //! The facts are keyed as the code generator keys a vtable: the principal trait reference with
 //! every free region erased, bound regions anonymized and projections normalized
@@ -79,7 +79,7 @@ pub struct Object {
     /// the list is closed.
     pub open: Option<Box<str>>,
     /// The content of the facts above ([`object_digest`]): what a body that read them is keyed
-    /// by (rule 18).
+    /// by (rule 21).
     pub digest: ContentId,
 }
 
@@ -123,7 +123,7 @@ pub fn object_digest(
 
 /// The digest of a site that read `object`'s facts and found its targets as `found` says,
 /// one byte a target in the object's order (`hir-ty-mir`'s `Found`): what the body's crate
-/// sees of each target's impl, which a body's code hash does not cover (rule 18).
+/// sees of each target's impl, which a body's code hash does not cover (rule 21).
 pub fn site_digest(object: &ContentId, found: &[u8]) -> ContentId {
     let mut hasher = Hasher::new(SITE_DOMAIN);
     hasher.id(object).part(found);
@@ -189,7 +189,7 @@ impl Held {
 /// content, while a world holds them as one database's interned rows (its keys' traits, its
 /// targets' types): a world of the same ID whose rows differ (a second database that interned
 /// the same program otherwise) is refused, naming the program and the first object that
-/// differs, never handed the other's rows (rule 18).
+/// differs, never handed the other's rows (rule 21).
 pub fn give(world: World) -> Result<Held, String> {
     let held = {
         let mut given = GIVEN.lock();

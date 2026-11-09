@@ -1,5 +1,5 @@
 //! A token tree as its columns' bytes, the wire format the client is to read a proc-macro
-//! server's (user code, in its sandbox) answers in (docs/v2/requests/usercode.md,
+//! server's (user code, in its sandbox) answers in (fed1eb428d:docs/v2/requests/usercode.md,
 //! "frontend-tokens"): `tt::TopSubtree::read_wire` (`crates/tt/src/storage/wire.rs`), with a
 //! part callback that refuses what this side can't have sent.
 //!

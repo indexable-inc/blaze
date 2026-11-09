@@ -1,5 +1,5 @@
 //! The jobs of a pool that keeps its own queues ([`crate::pool`]) on fibers, and the waits of
-//! threads that run no fiber (docs/v2/plan/lanes/sched.md, phase 2 step 3).
+//! threads that run no fiber (docs/v2/plan/design/fibers.md, phase 2 step 3).
 //!
 //! A pool's worker runs each job on a fiber of its own recycled set ([`Host`]). A job that never
 //! claims a key or waits never touches the scheduler. At its first claim or wait it joins the
@@ -74,7 +74,7 @@ struct Fiber(Stackful<In, Out>, u32);
 // worker's set, or parked in a record), never while it runs. Its stack then holds this module's
 // frames (the `Yielder` and `HostCx`, touched only by the fiber itself, and a `Job: Send`) and the
 // job's frames below a wait, which hold nothing that must not cross threads (the may-suspend
-// check, docs/v2/plan/lanes/may-suspend.md; `NoWait` guards at every wait).
+// check, docs/v2/plan/design/may-suspend.md; `NoWait` guards at every wait).
 unsafe impl Send for Fiber {}
 
 /// A parked job of a pool: its fiber and the thread-locals it carries, behind a pool job header
@@ -134,7 +134,7 @@ pub(crate) enum Turn {
 /// each job it ran and wherever a worker with a thread would park. So a target without threads
 /// runs the same loop, queues, fibers and waits as every other; only who runs the loop differs.
 ///
-/// Rule 24 holds by construction: a driven worker and every job it runs are on the one thread
+/// Rule 27 holds by construction: a driven worker and every job it runs are on the one thread
 /// that drives it, which is the thread that made the pool ([`crate::pool::Pool::driven`]). Once
 /// the seed has threads (`blaze_seed.thread_spawn`, plan.md "Next: a multi-threaded seed"), its
 /// pools start a thread per worker as on native, and a thread's thread-locals are its own: a
@@ -310,7 +310,7 @@ pub(crate) fn waits_of(sched: &Scheduler, member: u32) -> super::Waits {
 
 /// The job this thread runs in the wait graph, if it joined it, and its scheduler: its fiber's
 /// job, or the thread's own as a client. Never joins it: a thread that never claimed or waited
-/// holds nothing a wait could lead to. Not inlined: it reads thread-locals (rule 24).
+/// holds nothing a wait could lead to. Not inlined: it reads thread-locals (rule 27).
 #[inline(never)]
 #[allow(unsafe_code)]
 pub(crate) fn job_in_graph() -> Option<(JobId, Scheduler)> {
@@ -371,7 +371,7 @@ pub fn stall_while_quiet() -> Option<super::Waits> {
 }
 
 /// Every job that waits in the graph now and what on, stuck or not, in every scheduler: what a
-/// report of a build that stopped names, as a parked job's spans are on no thread (rule 13).
+/// report of a build that stopped names, as a parked job's spans are on no thread (rule 15).
 pub fn waits_now() -> super::Waits {
     let mut waits = Vec::new(); // alloc: a report, off every hot path
     for root in roots() {
@@ -478,7 +478,7 @@ pub(crate) fn swap_core(core: u32) -> u32 {
 /// ([`super::fiber::spawner`]): its lifetime starts here, not at the claim or wait that joins
 /// it to the graph later, if ever. Nothing on a thread that is no pool worker's fiber, or for a
 /// job already in the graph. Not inlined: it reads `HERE`, and a job's code it were inlined
-/// into could keep that thread-local's address across a wait (rule 24).
+/// into could keep that thread-local's address across a wait (rule 27).
 #[inline(never)]
 pub(crate) fn job_begins(given: Given) {
     if observing() && HERE.get().is_some_and(|here| here.job == UNREGISTERED) {
@@ -1016,7 +1016,7 @@ pub(crate) fn gave_way_on(asked: Key, named: Box<str>, flight: Key, cycle: &Cycl
 
 /// A loop caught this thread's job's give-way to run its item again later, and goes on to
 /// another item: that give-way is taken back from its streak ([`super::GaveWay::set_aside`]).
-/// Not inlined: the thread-local is read anew at each call (rule 24).
+/// Not inlined: the thread-local is read anew at each call (rule 27).
 #[inline(never)]
 pub(crate) fn set_give_way_aside() {
     // Only a give-way this job's record counted since its last ask: a give-way that made no
@@ -1071,7 +1071,7 @@ thread_local! {
 }
 
 /// Sets [`RETRY`], saying what it was. Not inlined: read anew at each call, never kept across a
-/// wait that may resume the job on another thread (rule 24).
+/// wait that may resume the job on another thread (rule 27).
 #[inline(never)]
 fn set_retry(to: bool) -> bool {
     RETRY.with(|it| it.replace(to))
@@ -1126,15 +1126,34 @@ static EVENTS: crate::sync::atomic::AtomicU64 = crate::sync::atomic::AtomicU64::
 impl Event {
     #[expect(clippy::new_without_default, reason = "each one claims a key in the graph")]
     pub fn new() -> Event {
+        let key = Event::fresh_key();
+        let sched = Scheduler::new(1);
+        assert!(sched.lock().claim(key, None), "event key {key:?} is new");
+        Event { key, sched }
+    }
+
+    /// A key no event has had.
+    fn fresh_key() -> Key {
         let mut key = [0u8; 32];
         key[..8].copy_from_slice(
             &EVENTS.fetch_add(1, crate::sync::atomic::Ordering::Relaxed).to_le_bytes(),
         );
         key[8..].copy_from_slice(b"an event, of sched::host");
-        let key = Key(key);
-        let sched = Scheduler::new(1);
-        assert!(sched.lock().claim(key, None), "event key {key:?} is new");
-        Event { key, sched }
+        Key(key)
+    }
+
+    /// Fires it, ending every wait on it as [`Event::fire`] does, and arms it again under a
+    /// fresh key in the scheduler it has: a waiter taken from [`Event::waiter`] before waits for
+    /// this fire, one taken after for the next. One event made per slot of a table of loads (the
+    /// store's pool's, docs/v2/plan/design/store-pool.md), each load's waiters on that load
+    /// alone, claims no scheduler per load.
+    pub fn rearm(&mut self) {
+        let next = Event::fresh_key();
+        let mut g = self.sched.lock();
+        g.world.key_done(self.key);
+        dispatch(&mut g, None);
+        assert!(g.claim(next, None), "event key {next:?} is new");
+        self.key = next;
     }
 
     pub fn waiter(&self) -> EventWait {
@@ -1222,7 +1241,7 @@ thread_local! {
 
 /// [`SCOPE`]'s one reader and writer. Not inlined: a job opens a scope, waits on it and closes
 /// it, maybe on another thread, so the thread-local's address is looked up anew at each call,
-/// never kept by an inlined caller across a wait (rule 24).
+/// never kept by an inlined caller across a wait (rule 27).
 #[inline(never)]
 fn with_scope<R>(f: impl FnOnce(&Cell<u32>) -> R) -> R {
     SCOPE.with(f)

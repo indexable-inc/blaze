@@ -18,7 +18,7 @@ pub use cfg_expr::{CfgAtom, CfgExpr};
 pub use dnf::DnfExpr;
 
 /// blaze: the crate cfg atom of a profile whose `contract-checks` is on (dev and test by
-/// default; docs/v2/plan/lanes/contracts.md, part 1). blaze-lower adds it after the target's
+/// default; docs/v2/plan/design/contracts.md, part 1). blaze-lower adds it after the target's
 /// cfgs, so `--print cfg` and build scripts never see it, and no source can test it: a cfg
 /// predicate's name is one identifier, never a path. Its one meaning is that MIR building
 /// checks the crate's native `requires`/`ensures` clauses at run time. It is not nightly's

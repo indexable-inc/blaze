@@ -7,7 +7,7 @@ summary: How to build, test and change blaze: AI use, where new code goes, rules
 ## AI use
 
 This code was written largely with AI assistance under human direction. The same is true
-of the harnesses, the reports under `docs/reports/` and these documents. The reports are
+of the harnesses, the reports under `fed1eb428d:docs/reports/` and these documents. The reports are
 written in the first person by the session that did the work; "I ran" in a report means
 that session ran it.
 
@@ -34,7 +34,7 @@ one level down:
                               remote-cache/ (the cache gateway Worker), typed-input/ (the Python
                               workspace's shared helper), v2/ (the lanes' scripts and queue)
     docs/                     these documents; docs/future/ the plans for work not started,
-                              docs/reports/ working reports, docs/v2/ the v2 plan and the lanes'
+                              fed1eb428d:docs/reports/ working reports, docs/v2/ the v2 plan and the lanes'
                               requests
     demo/                     small projects the harnesses build, and the live-reload demo
     fuzz/                     the fuzz targets and their corpora (docs/fuzzing.md)
@@ -63,13 +63,10 @@ The crates to know first:
     crates/rustc_abi/         rustc's layout crate at the pinned nightly's commit
     vendor/source.rev         the commit of the old development branch this tree last took from
 
-Every crate of v2, what it is for and which lane owns it:
-[v2/plan/reference/crates.md](v2/plan/reference/crates.md).
-
 `crates/hir-ty-codegen` is the code generator, a crate of its own over `hir-ty`'s MIR: what
 it uses of `hir-ty` is public there. Its root is `mod.rs`, the file it was compiled from when
 it was a module of `hir-ty`. The front end's crates depend on none of blaze's machinery
-(the code generator, the store, the daemon; [architecture-split.md](architecture-split.md)).
+(the code generator, the store, the daemon).
 
 ## rust-analyzer
 
@@ -105,7 +102,7 @@ crates.io's `ra-ap-rustc_abi`, the same way. The fork repositories
 
 New code that is the language's semantics goes in the front end's crates: building MIR and
 the passes over it, borrow checking, const evaluation, layout, and the hashes that say what a
-function's code is made from, as salsa queries. These are what rustc keeps in `rustc_middle`,
+function's code is made from, as queries on blaze's own engine (`blaze_query::db`, derived from salsa). These are what rustc keeps in `rustc_middle`,
 `rustc_mir_transform` and `rustc_borrowck`; rust-analyzer could take them, and a query lives
 with the database it reads. Where rust-analyzer's MIR differs from rustc's, the fix goes in
 the fork's lowering or in a pass of its runtime MIR queries, and the code generator relies on
@@ -251,7 +248,7 @@ files are, what they hold, the DuckDB queries that answer each question and the 
   and the machine, so the entry can be replaced and not just appended to.
 
 When you report what you did, separate what you ran from what you inferred. The reports
-under `docs/reports/` do this and it is the reason they can be used.
+under `fed1eb428d:docs/reports/` do this and it is the reason they can be used.
 
 ### Tests
 
@@ -280,9 +277,12 @@ regenerates the index.
 Several lanes, people or agents, change blaze at once. A lane shares `git`'s metadata and
 main with all the others, so:
 
-- **Builds, tests, benchmarks and experiments run in the lane's ix VM**, never on the Mac and
-  never on an AWS dev host or any other AWS machine. The Mac edits, reads and runs `git`; a
-  build, a harness, a unit test or a benchmark goes to the VM.
+- **Work comes from the ledger.** A lane is one task: an objective of
+  [v2/plan/objectives.md](v2/plan/objectives.md), done when its check passes. How a session
+  picks, briefs, integrates and lands is [the plan's loop](v2/plan.md#how-the-work-is-run).
+- **Builds, tests, benchmarks and experiments run on the Mac or in the lane's ix VM**, never
+  on an AWS dev host or any other AWS machine. Anything large (a cold build, a harness, a
+  benchmark) goes to the VM: blaze's daemons have run the Mac out of memory.
   - Make it: `ix new --name <lane> --no-shell`. The default image is NixOS with `nix`, `git`
     and `gh`; `nix develop -c ...` in the checkout brings up `harness/toolchain`'s nightly
     (about 30 s the first time). `--cpus` (2 to 128, the default is the architecture's cap) and
@@ -297,8 +297,7 @@ main with all the others, so:
     host CPU class (`--cpu epyc-5`, `xeon-6` or `graviton-5`) with `--memory-commit`, and build
     nothing else there.
   - Remove it: `ix rm <lane>` when the lane is done.
-  - Where an ix VM can't do something, stop and say what is missing; never take it to a dev
-    host or the Mac instead.
+  - Where neither can do something, stop and say what is missing; never take it to AWS.
 - **One worktree per lane, named for it** (`blaze-<lane>-<date>`). Its build directory is its
   own without a `CARGO_TARGET_DIR`: blaze builds each workspace root into a directory of its
   own under blaze's root, never in the checkout ([cargo.md](cargo.md#where-a-build-writes)).
@@ -347,8 +346,8 @@ built by the stage-0 blaze `.github/blaze-version` names, through
 `.github/scripts/build_release.py` (one JSON input, `{"target": ..., "out": ...}`). The release
 workflow and install.yaml run that script; blaze builds blaze, never cargo or rustc. `dist`'s
 `lto = "thin"` and `codegen-units = 1` are what blaze's release codegen does anyway (one LLVM unit
-per function with ThinLTO's summaries and imports across the program, [v2-codegen.md](v2-codegen.md)).
-[reports/RELEASE-BUILD.md](reports/RELEASE-BUILD.md) has the numbers of the older cargo build.
+per function with ThinLTO's summaries and imports across the program, [v2-codegen.md](v2/plan/design/codegen.md)).
+reports/RELEASE-BUILD.md has the numbers of the older cargo build.
 
 PGO is off: releases build with `"pgo": "off"`. The `pgo` workflow trains profiles with
 `tools/pgo/pgo.py`, which builds blaze instrumented with the stage-0 blaze, and `"pgo": "pinned"`
@@ -427,7 +426,7 @@ the library hashes to the id in its header, and that this id is the pinned one:
 
   The libraries themselves are committed in `crates/blaze-stencil/prebuilt/` (about 570 KB
   each), and the build also stops when what it made differs from them. If nothing the
-  generator reads changed, the output isn't deterministic, which is a bug (rule 22).
+  generator reads changed, the output isn't deterministic, which is a bug (rule 25).
 - The seed profile (`blaze-engine --no-default-features --features seed`) has no LLVM. It
   includes the committed libraries in `crates/blaze-stencil/prebuilt/`; no variable points
   elsewhere. A library whose bytes aren't the pinned ones is refused, and the error names the

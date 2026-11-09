@@ -1,4 +1,4 @@
-//! The parallel, in-place linker (docs/v2/plan/lanes/link/notes.md; #275, #232, #1496).
+//! The parallel, in-place linker (docs/v2/plan.md; #275, #232, #1496).
 //!
 //! An [`Image`] is an executable or shared library kept linked. A [`Change`] says which
 //! functions, statics, names and native inputs came or went; [`Image::stage`] places the new
@@ -117,7 +117,7 @@ pub struct Change<'a> {
     /// The span side tables the positions are filled from, by anchor ([`SpanTable::encode`]).
     pub spans: Vec<(ContentId, &'a [u8])>,
     /// A profile of the program, mapped onto its functions: a full link packs the functions
-    /// it saw run together in call order ([`Heat`], docs/v2/plan/lanes/layout/layout.md).
+    /// it saw run together in call order ([`Heat`], docs/v2/plan/design/code-layout.md).
     pub heat: Option<&'a Heat>,
     /// The functions codegen inferred cold (`#[cold]`, the panic machinery, a diverging
     /// `#[track_caller]` function): a full link puts those the heat does not name after
@@ -932,7 +932,7 @@ impl Image {
 
     /// Each Rust function's code, by address: its instance key, its address as the file
     /// places it (a profiler's address with the load slide taken off) and its size. The
-    /// address map a profile of this image is read through (docs/v2/plan/lanes/layout/layout.md).
+    /// address map a profile of this image is read through (docs/v2/plan/design/code-layout.md).
     pub fn functions(&self) -> Vec<(InstanceKey, u64, u64)> {
         // alloc: once per link that keeps an address map, which the caller writes out
         let mut out: Vec<(InstanceKey, u64, u64)> = self

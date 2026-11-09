@@ -1,5 +1,5 @@
 //! A file's bytes as text, read in place (docs/v2/plan/design/frontend.md item 6,
-//! docs/v2/plan/lanes/frontend/text.md): a [`Text`] is the file's [`Bytes`](crate::Bytes)
+//! docs/v2/plan/design/restore.md): a [`Text`] is the file's [`Bytes`](crate::Bytes)
 //! (the tree's own allocation, or a range of the mapped image), checked to be UTF-8 once and
 //! lent as `&str`, never copied. Holding it keeps the bytes alive as holding the bytes does.
 //! `Text`, `Bytes` and the check are `blaze-bytes`'s, below the parse tree, so the tree's

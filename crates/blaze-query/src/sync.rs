@@ -1,6 +1,6 @@
 //! The synchronization types the tables, the store and the database use: `std`'s atomics and
 //! `blaze_core::lock`'s named lock, or under `--cfg blaze_check` the model checker's, behind the
-//! same API (docs/v2/plan/lanes/safety/model.md "The switch"). A normal build sees no checker.
+//! same API (docs/v2/plan/design/model-checker.md "The switch"). A normal build sees no checker.
 //!
 //! Also the tracked-bytes hooks: what the segments copy in, what readers read of it and what
 //! a sweep frees. Under the model checker these are `blaze_check::cell`'s, so a read that the

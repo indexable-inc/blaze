@@ -1,4 +1,4 @@
-//! Global interning in sharded, append-only arenas (docs/v2/plan/lanes/format.md section 5, "IDs, two
+//! Global interning in sharded, append-only arenas (docs/v2/plan/design/data.md section 5, "IDs, two
 //! kinds"): an interned value is stored once, never moves and is never freed while the process
 //! runs. An [`Interned`]'s handle is a `Copy` pointer compared by address. A [`Symbol`]'s and a
 //! [`Mapped`] value's is a `u32` ID that means the same in every process restoring one image

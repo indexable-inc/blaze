@@ -7,7 +7,7 @@
 //! `compiler/rustc_middle/src/ty/error.rs` and the type mismatch label of
 //! `compiler/rustc_trait_selection/src/error_reporting/infer/mod.rs` (MIT or Apache-2.0).
 //!
-//! The printer is `hir_ty_print`'s, the one of every spelling (rule 26), spelled for a
+//! The printer is `hir_ty_print`'s, the one of every spelling (rule 30), spelled for a
 //! diagnostic: the check is its [`DiagnosticHost`](hir_ty_print::DiagnosticHost) (`host`),
 //! and the per-crate tables of `paths` are built once and read without locks.
 

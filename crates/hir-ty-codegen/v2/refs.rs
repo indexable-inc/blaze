@@ -1,4 +1,4 @@
-//! The references of an instance's code, from a walk of its MIR (docs/v2/plan/lanes/codegen.md):
+//! The references of an instance's code, from a walk of its MIR (docs/v2/plan/design/codegen.md):
 //! what [`blaze_codegen::backend::Described::refs`] lists before the instance is compiled, and
 //! all that the IR of any unit of it may ask for by place ([`places::Placer::listed`]).
 //!
@@ -165,7 +165,7 @@ pub(crate) fn built_in<'db>(
 /// place where `S` is `D`), and the IR names a reference by its place. Two instances whose
 /// compile identities are equal call callees of equal identities, which may be one instance in
 /// one of them and two in the other: their code differs only here, so a generic shared under
-/// its compile identity is keyed by this too ([`super::frontend`]'s `generic_args`, rule 18).
+/// its compile identity is keyed by this too ([`super::frontend`]'s `generic_args`, rule 21).
 /// The default for an instance that names nothing.
 pub(crate) fn placement(
     db: &Db,

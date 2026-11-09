@@ -934,8 +934,27 @@ pub fn building(build: u32) -> Building {
     Building(BUILD.with(|it| it.replace(build)))
 }
 
+/// While the result lives, the counters this thread plots ([`plot`], [`plot_named`]) are of
+/// build `build` (0: none), and nothing else of the thread is: for a thread that samples
+/// process-wide counters (the daemon's loop) while a build is under way, so its rows carry that
+/// build's `build_id` and a build's counters are found by it, not by the daemon's pid. Unlike
+/// [`building`] it does not make the thread's job the build's.
+#[must_use]
+pub fn counting_for(build: u32) -> Building {
+    Building(BUILD.with(|it| it.replace(build)))
+}
+
 /// See [`building`]: gives back the build the thread was working for before.
 pub struct Building(u32);
+
+/// What the calling thread works for now: its build (0: none) and its innermost span (0:
+/// none). For a sample taken on the thread from inside the allocator (`crate::heap`): it
+/// claims no ring and allocates nothing, and on a thread being torn down says none.
+pub(crate) fn here_now() -> (u32, u64) {
+    let build = BUILD.try_with(Cell::get).unwrap_or(0);
+    let span = MINE.try_with(Cell::get).ok().flatten().map_or(0, Ring::innermost);
+    (build, span)
+}
 
 impl Drop for Building {
     fn drop(&mut self) {

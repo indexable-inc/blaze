@@ -235,7 +235,7 @@ impl TopSubtree {
     /// `bytes` start at a 4-byte boundary, as a heap buffer or a tree after another one does.
     /// A header past `limits` is refused (its counts before any column is read, its length
     /// once the nodes are), and no symbol is interned unless the whole tree is accepted. `part`
-    /// runs in the middle of the read and must not wait (rule 24): it is a lookup.
+    /// runs in the middle of the read and must not wait (rule 27): it is a lookup.
     pub fn read_wire(
         bytes: &[u8],
         limits: WireLimits,
@@ -414,7 +414,7 @@ thread_local! {
 /// back to [`KEEP`] items when a read grew it past them, so bytes refused after filling it (a
 /// part repeated millions of times, nesting millions deep) leave no memory held on the worker.
 /// The buffer is moved out and back in by two calls that each find the thread's slot afresh,
-/// so `f` may resume on another thread without writing this one's (rule 24).
+/// so `f` may resume on another thread without writing this one's (rule 27).
 fn with_kept<T: 'static, R>(
     key: &'static LocalKey<Cell<Stack<T>>>,
     f: impl FnOnce(&mut Vec<T>) -> R,

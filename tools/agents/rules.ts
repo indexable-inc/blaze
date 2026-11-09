@@ -16,8 +16,9 @@
 // on every pull request.
 //
 // A rule's identity is its `id` (kebab case, never reused); its number is only its position in the
-// printed list and moves when a rule is inserted (`.clippy.toml` cites rules by number: keep the
-// order, append new rules).
+// printed list and moves when a rule is inserted. Code comments, error texts, `.clippy.toml` and
+// Cargo.toml cite rules by that number (`AGENTS.md rule 21`): never reorder, append new rules, and
+// when a citation's number is wrong, fix the citation (`rg 'AGENTS.md rules? [0-9]'`), not the order.
 
 /** The skills the rules are grouped into, by the task an agent loads them for. */
 const skills = {
@@ -29,17 +30,17 @@ const skills = {
 	"compiler-correctness": {
 		title: "Compiler correctness",
 		description:
-			"What blaze must compile and how: never rustc, every program the pinned nightly builds behaves the same (except rustc soundness holes), usefulness over parity with rustc and cargo, semantics in the front end's query crates (blaze-query, derived from salsa), keys that cover every input, deterministic output, proc macros on wasm and Cranelift's place, sandboxed build scripts and proc macros. Load before changing the front end, codegen, the linker, caching or store keys, diagnostics, proc-macro or build-script execution, or the sandbox.",
+			"What blaze must compile and how: never rustc, every program the pinned nightly builds behaves the same (except rustc soundness holes), usefulness over parity with rustc and cargo, semantics in the front end's query crates (blaze-query, derived from salsa), keys that cover every input, deterministic output, proc macros on wasm and Cranelift's place, sandboxed build scripts and proc macros. A cache of a function's results keyed by code identity, and what the store holds, are the `memory-and-data` skill. Load before changing the front end, codegen, the linker, caching or store keys, diagnostics, proc-macro or build-script execution, or the sandbox.",
 	},
 	"runtime-code": {
 		title: "Writing blaze's runtime code",
 		description:
-			"How code inside blaze is written: no fallbacks, allocation by lifetime, the one standard data structure per need (locks, maps, queues, channels, waits), sans-IO cores, named and bounded waits, errors that name the thing, panics that fail one job, nothing thread-bound across a fiber wait. Load before writing or reviewing Rust in blaze's crates, especially the scheduler, daemon, query engine, store or anything concurrent.",
+			"How code inside blaze is written: no fallbacks, the one standard data structure per need (locks, maps, queues, channels, waits), sans-IO cores, named and bounded waits, errors that name the thing, panics that fail one job, nothing thread-bound across a fiber wait. Allocation by lifetime and what is persisted are the `memory-and-data` skill. Load before writing or reviewing Rust in blaze's crates, especially the scheduler, daemon, query engine, store or anything concurrent.",
 	},
 	"perf-and-tracing": {
 		title: "Performance and tracing",
 		description:
-			"How a slow thing is found and fixed: a span names every stretch of worker time, `self_cpu_ns` is filled, the profile parquet answers which item took the time, and a speed PR quotes before and after from the spans. Load before investigating anything slow, adding tracing, or making a speed claim.",
+			"How a slow thing is found and fixed: a span names every stretch of worker time, `self_cpu_ns` is filled, the profile parquet answers which item took the time, and a speed PR quotes before and after from the spans. Querying the profile to find out why a build did what it did is the `debugging` skill. Load before investigating anything slow, adding tracing, or making a speed claim.",
 	},
 	"changing-code": {
 		title: "Changing code across blaze",
@@ -54,7 +55,7 @@ const skills = {
 	testing: {
 		title: "Testing blaze",
 		description:
-			"How blaze tests its own code, the one home for it: few tests, each for hard-to-verify logic behind a stable interface; property tests with Hegel (vendor/hegeltest, imported as `hegel`); deterministic simulation tests (DST) on blaze-core's seeded `sim::Sim` (virtual clock, shuffled completions, failure injection, crashes that tear unsynced writes), moving to Hegel's own `hegel::sim`; an invariant oracle with planted-bug controls and seed replay; sans-IO cores as the precondition; round-trip tests for persisted state; testing a causal claim by removing the cause. Proof for concurrent, durable, crash-recovering, billing and data-deletion code is a DST, never a code review. Load before writing or changing a test, before changing anything concurrent, persisted, crash-recovering, billing or data-deleting (the store, the daemon image, the profile history, a lock-free structure, a ring), and before claiming such code is correct.",
+			"How blaze tests its own code, the one home for it: few tests, each for hard-to-verify logic behind a stable interface; property tests with Hegel (vendor/hegeltest, imported as `hegel`); deterministic simulation tests (DST) on blaze-core's seeded `sim::Sim` (virtual clock, shuffled completions, failure injection, crashes that tear unsynced writes), moving to Hegel's own `hegel::sim`; an invariant oracle with planted-bug controls and seed replay; sans-IO cores as the precondition; round-trip tests for persisted state; testing a causal claim by removing the cause. What a persisted type is and where memory lives are the `memory-and-data` skill. Proof for concurrent, durable, crash-recovering, billing and data-deletion code is a DST, never a code review. Load before writing or changing a test, before changing anything concurrent, persisted, crash-recovering, billing or data-deleting (the store, the daemon image, the profile history, a lock-free structure, a ring), and before claiming such code is correct.",
 	},
 	"docs-and-scripts": {
 		title: "Docs, scripts and agent interfaces",
@@ -64,7 +65,12 @@ const skills = {
 	debugging: {
 		title: "Debugging blaze from its profile",
 		description:
-			"How to find out why a blaze build did what it did from its profile parquet. Covers where the files are, the tables (spans, query_counts, provenance, key_parts, misses, task spans), how to run DuckDB (`blaze debug sql`, `blaze explain`, `BLAZE_DUCKDB`), and ready queries for top time by span, what reran and why, diffing two runs' keys, memory by task, admission waits and a cycle that won't settle. Also the method: reproduce, capture, query, claim a cause, remove it and watch the effect go. Load before debugging a slow, rerunning, memory-hungry or non-converging build, before writing a query over the profile, and before making a claim about why a build did something.",
+			"How to find out why a blaze build did what it did from its profile parquet. Covers where the files are, the tables (spans, query_counts, provenance, key_parts, misses, task spans), how to run DuckDB (`blaze debug sql`, `blaze explain`, `BLAZE_DUCKDB`), and ready queries for top time by span, what reran and why, diffing two runs' keys, memory by task, admission waits and a cycle that won't settle. Also the method: reproduce, capture, query, claim a cause, remove it and watch the effect go. Adding spans and making a speed claim are `perf-and-tracing`; how memory is meant to be held is `memory-and-data`. Load before debugging a slow, rerunning, memory-hungry or non-converging build, before writing a query over the profile, and before making a claim about why a build did something.",
+	},
+	"memory-and-data": {
+		title: "Memory and durable data",
+		description:
+			"How blaze holds memory and keeps what it computes: an owner per lifetime (a task's frame, reset per item in a long task; the store for what outlives it), footprint as the one measure, outputs as blaze-format records written once and read in place through the store's own buffer pool (vmcache-style: reserved address range, explicit io_uring/kqueue reads, MADV_DONTNEED/MADV_FREE_REUSABLE eviction, no mmap), persistence from one generic impl over `for const`, and caches keyed by code identity. Load before allocating in a task, adding a query result or anything persisted, touching blaze-mem, blaze-format, the store, admission, the allocator or the memory ceiling, or caching a function's results. Finding where a build's memory went is the `debugging` skill.",
 	},
 } as const satisfies Record<string, { title: string; description: string }>;
 
@@ -165,13 +171,13 @@ export const rules = [
 		id: "proc-macros-on-wasm",
 		skill: "compiler-correctness",
 		line: "Proc macros compile to `wasm32-wasip1` with blaze's own front end and run in Wasmtime; Cranelift never generates native code.",
-		info: "A proc macro runs as a WebAssembly module: blaze compiles the macro crate to `wasm32-wasip1` with its own front end and code generator (never rustc), and Wasmtime runs it in process, Cranelift as its compiler, behind the `proc_macro` bridge, whose shims are its only imports. Cranelift's code generator runs only there, inside Wasmtime for wasm. Native code (every target blaze builds for, debug or release) is never generated by Cranelift: it is copy-and-patch stencils or LLVM, a function with no stencil is a typed error naming it, and there is no Cranelift tier between them. Cranelift's IR types (`cranelift_codegen::ir`) may stay as the stencils' input until blaze has its own IR. The MIR evaluator stays for const eval and as the reference a macro's wasm output is tested against; nothing hand-rolls a wasm-style sandbox (`blaze-macro-eval`'s `tier.rs` is replaced by this).",
+		info: "A proc macro runs as a WebAssembly module: blaze compiles the macro crate to `wasm32-wasip1` with its own front end and code generator (never rustc), and Wasmtime runs it in process, Cranelift as its compiler, behind the `proc_macro` bridge, whose shims are its only imports. Cranelift's code generator runs only there, inside Wasmtime for wasm. Native code (every target blaze builds for, debug or release) is never generated by Cranelift: it is copy-and-patch stencils or LLVM, a function with no stencil is a typed error naming it, and there is no Cranelift tier between them. Target and today: the build plan (`crates/blaze-codegen/src/plan.rs`) already picks only stencils or LLVM for native code and Cranelift only for wasm32; `hir-ty-codegen`'s own backend choice (`backend.rs`, `BLAZE_BACKEND`) still defaults to Cranelift for native code, a leftover to remove, never to extend. Cranelift's IR types (`cranelift_codegen::ir`) may stay as the stencils' input until blaze has its own IR. The MIR evaluator stays for const eval and as the reference a macro's wasm output is tested against; nothing hand-rolls a wasm-style sandbox (`blaze-macro-eval`'s `tier.rs` is replaced by this).",
 		reason: "Andrew, 2026-11-01: \"modify cranelift ONLY for wasm stuff for native code dont use it ... properly use cranelift for proc macros\". On 2026-10-30 the wasm host was deleted for one engine on blaze's own compiler, but the compiled tier that was to make it fast stayed off, so every derive ran interpreted: two samples of build 53 showed the busy threads in the MIR evaluator while about 56 waited, on about 2 of 18 cores. `tier.rs` rebuilt by hand what a wasm runtime does (a 4 GiB region, guard pages, a shadow stack).",
-		link: "docs/v2/plan/lanes/usercode/macros.md",
+		link: "docs/v2/plan/design/proc-macros.md",
 	},
 	{
 		id: "bump-allocate",
-		skill: "runtime-code",
+		skill: "memory-and-data",
 		line: "Allocate by lifetime (`Vec::new_in(frame)`); a global-heap allocation needs `// alloc: <why>` on its line.",
 		info: "Allocate by lifetime, never from the global heap by default: a collection that lives within one task (a query run, a codegen unit, a maintainer pass) names its allocator, `Vec::new_in(frame)` / `Box::new_in(.., frame)` from `blaze_mem::frame::current`, and longer lifetimes use the request, revision or image allocator. A global allocation (`Vec::new`, `vec![]`, `collect` into a heap `Vec`, `Box::new`, `to_owned`) needs `// alloc: <why>` on its line. `blaze::implicit_allocator` enforces this, warning everywhere and denied wherever `blaze::hot` is, with `blaze::hot_alloc` for what a call reaches.",
 		reason: "\"Allocate like a highly optimized game\" (Andrew, 2026-10-29, decisions.md). Andrew, 2026-10-31, on a fan-out that collected results into a heap Vec it did not need: heavily bump allocate, always give the Vec its allocator, and lint it.",
@@ -181,14 +187,14 @@ export const rules = [
 		id: "standard-structures",
 		skill: "runtime-code",
 		line: "One standard structure per need (named `blaze_core::lock` locks, papaya and blaze_hash maps, crossbeam queues and channels, atomics).",
-		info: "One choice per need, never a hand-rolled or std stand-in: a lock is `blaze_core::lock::{Lock, ReadLock}` (with `Signal` for a driver thread's condition), named where it is made (`Lock::new(\"store.packs\", v)`), held only for a field update and never across a query call, IO or a global allocation (`blaze::lock_held_across_slow`); raw `std::sync` and `parking_lot` locks are banned in `.clippy.toml` outside `crates/blaze-core/src/lock.rs`, and a contended wait records who waited behind whom into the profile's `lock_waits` (`blaze debug locks` ranks them and says what to use instead: arc-swap or RCU for reads, papaya for a map, an atomic for an integer, a channel for a queue, an owner for one holder); a shared map is `papaya::HashMap`; a single-owner map or set is `blaze_hash::{HashMap<K, V, A>, HashSet<K, A>}` (foldhash with a fixed seed, its allocator named: a frame's for a task, `Global` with a reason otherwise), with `blaze_hash::KeyHasher` for keys that are already content hashes and `blaze_hash::Blake3Hasher` for persisted content IDs; results of parallel items come back from `blaze_graph::par` in order, never pushed into a `Mutex<Vec>`; a queue is `crossbeam::queue::{SegQueue, ArrayQueue}`; a channel is `crossbeam-channel`; a counter or flag is an atomic. How a thread or fiber waits is `deadline-waits`. `BTreeMap` only where iteration order is part of the output.",
+		info: "One choice per need, never a hand-rolled or std stand-in: a lock is `blaze_core::lock::{Lock, ReadLock}` (with `Signal` for a driver thread's condition), named where it is made (`Lock::new(\"store.packs\", v)`), held only for a field update and never across a query call, IO or a global allocation (`blaze::lock_held_across_slow`); raw `std::sync` and `parking_lot` locks are banned in `.clippy.toml` outside `crates/blaze-core/src/lock.rs`, and a contended wait records who waited behind whom into the profile's `lock_waits` (`blaze debug locks` ranks them and says what to use instead: arc-swap or RCU for reads, papaya for a map, an atomic for an integer, a channel for a queue, an owner for one holder); a shared map is `papaya::HashMap`; a single-owner map or set is `blaze_hash::{HashMap<K, V, A>, HashSet<K, A>}` (foldhash with a fixed seed, its allocator named as `bump-allocate` says: a frame's for a task, `Global` with a reason otherwise), with `blaze_hash::KeyHasher` for keys that are already content hashes and `blaze_hash::Blake3Hasher` for persisted content IDs; results of parallel items come back from `blaze_graph::par` in order, never pushed into a `Mutex<Vec>`; a queue is `crossbeam::queue::{SegQueue, ArrayQueue}`; a channel is `crossbeam-channel`; a counter or flag is an atomic. How a thread or fiber waits is `deadline-waits`. `BTreeMap` only where iteration order is part of the output.",
 		reason: "Andrew, 2026-11-01: \"use the best data structure in general\", \"use proper hasher too\", parking_lot with std's Mutex denied. On macOS std's Mutex parks in the kernel with no spin; FxHash clusters on integer and pointer keys; a startup stall on 2026-11-01 was workers spinning with nothing recording why. 2026-11-05: one hot lock (`blaze_profile::flight::intern`) stalled 60+ threads and the turn loop, and none of 840 lock sites said it was contended; every lock is now named and records its waits (docs/v2/plan/design/named-locks.md).",
 	},
 	{
 		id: "fix-through-blaze-lints",
 		skill: "changing-code",
 		line: "Move a type, path, API or idiom across the code with a `.clippy.toml` ban and `blaze check --fix` (or `blaze check --replace A=B`), by name resolution, never by text.",
-		info: "A change that moves a type, path, API or idiom across the code is a ban with a `replacement` in `.clippy.toml` (mirrored in the hot crates' `clippy.toml`), which blaze-lints' `disallowed_types`/`disallowed_methods`/`disallowed_macros` enforce with a MachineApplicable fix, or a `blaze::` lint where the rule needs types or MIR; either is applied with `blaze check --fix`, and its count lives in `crates/blaze-lints/baselines/`, which may only shrink; a one-off move of a path is `blaze check --replace A=B`. Both find code by name resolution (imports, renames, globs, re-exports, macro output), never by text, and leave it compiling and lint-clean, so the rule keeps holding after the port. `sed`, `rg` replace and syntax-only rewriters (astlog) are for syntax-only shapes, scoped and checked by a build afterward.",
+		info: "A change that moves a type, path, API or idiom across the code is a ban with a `replacement` in `.clippy.toml` (mirrored in the hot crates' `clippy.toml`), which blaze-lints' `disallowed_types`/`disallowed_methods`/`disallowed_macros` enforce with a MachineApplicable fix, or a `blaze::` lint where the rule needs types or MIR; either is applied with `blaze check --fix`, and its count lives in `crates/blaze-lints/baselines/`, which may only shrink (no baseline file exists yet, because blaze cannot yet finish its own check of the workspace: `blaze check --baselines DIR --new-baseline LINT` starts one, and the merge gate's `lint-baselines` job, docs/cargo.md#lints, holds them once they exist); a one-off move of a path is `blaze check --replace A=B`. Both find code by name resolution (imports, renames, globs, re-exports, macro output), never by text, and leave it compiling and lint-clean, so the rule keeps holding after the port. `sed`, `rg` replace and syntax-only rewriters (astlog) are for syntax-only shapes, scoped and checked by a build afterward.",
 		reason: "Andrew, 2026-11-01: \"make our own version of clippy that is incremental and has suggestions for replace\" and \"recommend doing find replace with blaze lints\". A text or tree-sitter rewrite of `std::sync::Mutex` misses `use std::sync::{Arc, Mutex}`, renames and globs, and can hit an unrelated `Mutex`; blaze-lints already runs per body as front-end queries.",
 	},
 	{
@@ -279,7 +285,7 @@ export const rules = [
 		id: "persisted-state-round-trips",
 		skill: "testing",
 		line: "Anything persisted has a restore test equal byte for byte to a fresh build; a restore never silently starts empty.",
-		info: "Anything blaze persists (the daemon image, the store, the plane's history) has a test that restores it and checks the result equals a fresh build byte for byte, and a budget for restart to first answer. A restore that silently starts empty is a failure the daemon reports, naming why. A format that is written while blaze runs and read after a crash also gets a DST (`dst-not-review`) that crashes it at every point and checks the restore.",
+		info: "Anything blaze persists (the daemon image, the store, the plane's history; what a persisted value is, is `outputs-are-records`) has a test that restores it and checks the result equals a fresh build byte for byte, and a budget for restart to first answer. A restore that silently starts empty is a failure the daemon reports, naming why. A format that is written while blaze runs and read after a crash also gets a DST (`dst-not-review`) that crashes it at every point and checks the restore.",
 		reason: "2026-11-01: the self-build home held a 1.8 GB image while the daemon log said \"the database starts empty: there is no daemon image\", and nothing measured whether a restart used it.",
 	},
 	{
@@ -295,7 +301,7 @@ export const rules = [
 		line: "Pick the best long-term design, not the least work, and spend the effort proving it right.",
 		info: "Pick the best long-term design, not the least work: own the layer or port rustc's rule properly, and spend the effort on proving it right: real crates' own test suites passing under blaze, Hegel property tests and deterministic simulation of blaze's own invariants (`testing` skill), and fuzzing of parsers of hostile bytes.",
 		reason: "Agents write most of blaze, so the amount of code a design takes is not what limits it; what stays expensive is proving it right. Andrew, 2026-10-30, deleting the harnesses that compared blaze with rustc or cargo: \"we use other ppl['s] test[s] [of] the other crates ... it over-constrains us\".",
-		link: "docs/contributing.md#rules-for-code",
+		link: "docs/contributing.md#what-a-change-needs",
 	},
 	{
 		id: "spec-then-build",
@@ -303,7 +309,7 @@ export const rules = [
 		line: "A change that needs a design gets a spec first, then the same lane builds it right away; a spec is never the deliverable.",
 		info: "Before a change that spans crates, adds a concept, or changes a persisted format, a protocol or a hot path, write a short spec as a `plan` doc under `docs/` (what, why, the chosen design and the losing alternative in a line, the cost budget, the migration, how it is proven: for concurrent, durable, billing or data-deleting code, the DST and the invariant its oracle checks). Have a fresh reviewer check it against the code when it is large. Then start building it in the same lane, in the same session, without waiting to be asked: fan out the code, build, land. The spec ships in the same pull request as the first code that implements it, and is marked `current` (or rewritten to describe what was built) once the work lands. A spec with no code behind it is unfinished work, not a result; a lane that cannot build what it specified says what blocks it and who it handed the work to.",
 		reason: "Andrew, 2026-11-04: \"by default write a spec but also do it right away (don't just write and not do)\". A plan written and left alone goes stale while the code moves, and the work it describes never happens.",
-		link: "docs/contributing.md#rules-for-code",
+		link: "docs/contributing.md#documents",
 	},
 	{
 		id: "one-concept-one-home",
@@ -323,7 +329,7 @@ export const rules = [
 		id: "library-over-language",
 		skill: "compiler-correctness",
 		line: "Build a feature as a library on the language that exists; when no library can express it, add the smallest general primitive, never an ad hoc language feature.",
-		info: "Before adding an attribute, intrinsic or special case to the compiler, write the feature as library code on what the language already has: traits, generics, const eval, compile-time reflection (`core::mem::type_info`), allocators, effects and the purity proof. When it cannot be written that way, the language is missing a primitive: add the smallest general one that makes the library possible (nightly's API where one exists, otherwise an opt-in blaze extension), and keep the set of primitives small. The compiler proves and exposes facts (purity, code identity, layout, reflection); policy (caching, storage, hash formats, how code is executed) lives in libraries anyone can read or replace. Example: `Canonical` is library code over `type_info`, and `#[blaze::cache]` lowers to a call on a library `Executor`; the compiler generates neither the hashing nor the caching.",
+		info: "Before adding an attribute, intrinsic or special case to the compiler, write the feature as library code on what the language already has: traits, generics, const eval, compile-time reflection (`core::mem::type_info`), allocators, effects and the purity proof. When it cannot be written that way, the language is missing a primitive: add the smallest general one that makes the library possible (nightly's API where one exists, otherwise an opt-in blaze extension), and keep the set of primitives small. The compiler proves and exposes facts (purity, code identity, layout, reflection); policy (caching, storage, hash formats, how code is executed) lives in libraries anyone can read or replace. Example, a design and not yet code (docs/v2/plan/design/comptime.md; the first `blaze-cache` crates were deleted on 2026-10-30, docs/fn-cache.md): a `Canonical` trait is library code over `type_info`, and `#[blaze::cache]` lowers to a call on a library `Executor`; the compiler generates neither the hashing nor the caching.",
 		reason: "Andrew, 2026-11-03, designing `#[blaze::pinned]`: \"you don't need to add ad hoc language features when you can just do things with [the] existing language, and if you can't you probably do not have a powerful enough language and you need to improve the primitives\".",
 		link: "docs/contributing.md#where-new-code-goes",
 	},
@@ -333,7 +339,7 @@ export const rules = [
 		line: "No MCP: agent interfaces are a Unix socket or HTTP with one versioned schema in deterministic CBOR.",
 		info: "No MCP. Agent-facing interfaces are a Unix socket or HTTP with one versioned schema in deterministic CBOR; the CLI is a client of the same API.",
 		reason: "MCP is cringe and outdated.",
-		link: "docs/roadmap.md#8-the-agent-api",
+		link: "docs/v2/plan.md#9-one-interface",
 	},
 	{
 		id: "work-in-ix-vms",
@@ -410,7 +416,7 @@ export const rules = [
 		id: "deadline-waits",
 		skill: "runtime-code",
 		line: "Every blocking kernel wait goes through blaze-core's one deadline wait (`blaze_core::wait`); nothing signals pool threads; a fiber parks on the scheduler, never in the kernel.",
-		info: "A thread blocks in the kernel only through `blaze_core::wait`, which takes an absolute `Deadline` on the injected clock (a driver's `now()`), recomputes the time left from that clock before every system call, treats an interrupted (EINTR) or spurious return as a retry, and ends in a typed outcome (`Waited::Ready` or `Waited::Deadline`), with fuel for a clock that does not move. `Driver::poll` takes that `Deadline`, never a relative timeout, so no layer restarts one. The kernel's waits (`poll`, `ppoll`, `select`, `epoll_wait`, `kevent`, `nanosleep`, `usleep`, `sleep`, `GetQueuedCompletionStatusEx`, ...) are banned in `.clippy.toml` outside `crates/blaze-core/src/wait*`, each with its `blaze_core::wait` replacement; io_uring waits pass a signal mask that blocks every asynchronous signal but the stop signals. Only IO driver threads and the pool's idle park block in the kernel: a fiber that waits, with a deadline or without, parks on the scheduler (a key, a counter, a job, a timer on the driver's wheel), never a `Condvar`, a channel receive, `thread::sleep` or a raw `spin_loop`; elsewhere a spin is the one bounded spin-then-park helper. Nothing sends a signal to a pool or driver thread: the sampler reads the kernel's samples (Linux `perf_event_open`) or stops the thread (macOS `thread_suspend`, Windows `SuspendThread`). The DST in `crates/blaze-core/src/wait/tests.rs` interrupts every wait and checks that it ends by its deadline, with a planted relative-timeout retry it must catch.",
+		info: "A thread blocks in the kernel only through `blaze_core::wait`, which takes an absolute `Deadline` on the injected clock (a driver's `now()`), recomputes the time left from that clock before every system call, treats an interrupted (EINTR) or spurious return as a retry, and ends in a typed outcome (`Waited::Ready` or `Waited::Deadline`), with fuel for a clock that does not move. `Driver::poll` takes that `Deadline`, never a relative timeout, so no layer restarts one. The kernel's waits (`poll`, `ppoll`, `select`, `epoll_wait`, `kevent`, `nanosleep`, `usleep`, `sleep`, `GetQueuedCompletionStatusEx`, ...) are banned in `.clippy.toml` outside `crates/blaze-core/src/wait*`, each with its `blaze_core::wait` replacement; io_uring waits pass a signal mask that blocks every asynchronous signal but the stop signals. Only IO driver threads and the pool's idle park block in the kernel: a fiber that waits, with a deadline or without, parks on the scheduler (a key, a counter, a job, a timer on the driver's wheel), never a `Condvar`, a channel receive, `thread::sleep` or a raw `spin_loop`; elsewhere a spin is the one bounded spin-then-park helper. Nothing sends a signal to a pool or driver thread: the sampler reads the kernel's samples (Linux `perf_event_open`) or stops the thread (macOS `thread_suspend`; Windows `SuspendThread` is the target, there is no Windows sampler yet). The DST in `crates/blaze-core/src/wait/tests.rs` interrupts every wait and checks that it ends by its deadline, with a planted relative-timeout retry it must catch.",
 		reason: "2026-11-05: `blaze serve` 0.20261105.0 hung before it listened on Linux. The profile's sampler sent SIGRTMIN+6 to every thread about every 20 ms, every `io_uring_enter` returned EINTR, and `Ring::enter` entered again with the same relative 50 ms timeout, so the wait never ended and the client said only that the daemon did not listen after 60 s (#1748 fixed that one call). Andrew asked for the class gone: deadlines, not timeouts; one wait; no signals at blaze's own threads.",
 		link: "docs/v2/plan/design/deadline-waits.md",
 	},
@@ -421,6 +427,70 @@ export const rules = [
 		info: "On macOS, use any private or undocumented interface (Mach calls, libsystem and libdispatch internals, `__ulock_wait2`, `kevent_qos`/`kevent_id` workloops, `sandbox_init_with_parameters`, kperf, `thread_selfcounts`, `proc_info`, ...) where it is more efficient or more capable than the public one, and the public one where it is the better (`os_sync_wait_on_address_with_deadline`'s absolute deadline over `__ulock_wait2`'s relative one). Each use carries a comment naming the symbol and why it wins, and a test that resolves the symbol at run time and fails naming it if it is gone, so an OS update that removes it fails loudly in CI. There is no public-API fallback (`no-fallback`): a missing symbol is an error naming it. Which are in use and which are next is in docs/v2/plan/design/deadline-waits.md.",
 		reason: "Andrew, 2026-11-04, with the deadline-waits lane: blaze is a developer tool shipped with each release, not an App Store app, so Apple's private interfaces are fair game when they are better; a symbol that disappears is caught by its test, not by a user.",
 		link: "docs/v2/plan/design/deadline-waits.md#macos-private-apis-rule-macos-private-apis",
+	},
+	{
+		id: "ledger-decides",
+		skill: "build-and-test",
+		line: "Work is picked from the objectives ledger (`docs/v2/plan/objectives.md`) and is done when its row's check passes on a named commit; never from a status someone remembered.",
+		info: "The ledger is `docs/v2/plan/objectives.json`, one row per objective: the outcome, the check that decides it as a command, its paths, its status (`docs/v2/plan/objectives.md` is its generated table). `harness/v2/ledger.py` picks work that does not collide (`pick`), runs a row's check and writes its status with the commit (`run`), and regenerates the table (`write`); never type a status by hand, except `blocked` with why. Before starting a row, run its check on main. A row with no check gets one written first, as part of the work. Done means the check passes on a named commit and has joined the gate or the release train, so it cannot regress silently. A row that fails twice records what blocks it and stops.",
+		reason: "Andrew, 2026-11-09: \"come up with some orchestration pattern that we can use to get every objective of v2 done\". The 415 lane notes it replaced each said `STATUS: DONE` for code nobody had run.",
+		link: "docs/v2/plan.md#how-the-work-is-run",
+	},
+	{
+		id: "every-agent-has-a-task",
+		skill: "build-and-test",
+		line: "Every agent is started on one task (an objective id or a named piece of one) that says its outcome and its check; people follow tasks, not agents.",
+		info: "Start an agent only with a task: an objective's id from the ledger, or a named piece of one, with its outcome and its check in one line each, the paths it may touch and what done prints. A sub-agent takes its parent's task unless given its own. The agent app's sidebar lists tasks with their agents under them, so name the task for a person reading that list: what is being done, not who does it.",
+		reason: "Andrew, 2026-11-09: \"all agents should be assigned to a task and task visible in the sidebar instead of agents so humans can get better view\".",
+		link: "docs/v2/plan/design/tasks.md",
+	},
+	{
+		id: "agents-are-a-cost",
+		skill: "build-and-test",
+		line: "Use the fewest agents that do the work: a worker only for a piece that is independent and large enough to pay for its context; four is a lot.",
+		info: "An agent costs its whole context, and its report loses detail both ways. The coordinator does small pieces, reads and deletions itself. Start a worker only for a piece that is independent of the others and large enough to pay for its brief; four workers at once is a lot. Never start a fleet to read or summarise.",
+		reason: "Andrew, 2026-11-09, on sixteen agents started to summarise docs: \"why do you have so many\", \"we have limited amount\".",
+		link: "docs/v2/plan.md#how-the-work-is-run",
+	},
+	{
+		id: "docs-stay-small",
+		skill: "docs-and-scripts",
+		line: "Keep docs few and short: the plan, the ledger, the bounds and one spec per unbuilt design; no lane notes, pass reports or indexes; delete a doc when it stops being true or needed.",
+		info: "The plan is one page (`docs/v2/plan.md`), with the ledger, the bounds and one spec per design that is not yet built. Write no lane notes, pass reports, status files or indexes of indexes: what was done is the commit and the pull request. A design that changes edits its spec in place; a spec whose design is built is deleted or becomes a current doc. Delete a doc that is no longer true or needed in the same change; git keeps it.",
+		reason: "Andrew, 2026-11-09: \"we want simple docs, way simpler\", \"delete old documentation too\". 856 docs became about 110.",
+		link: "docs/v2/plan.md#how-the-work-is-run",
+	},
+	{
+		id: "one-memory-measure",
+		skill: "memory-and-data",
+		line: "Footprint, the number the kernel enforces, is the one memory measure: admission, the front end's release and the ceiling all decide on it.",
+		info: "The footprint (macOS `phys_footprint`, Linux's cgroup charge) is the one measure of blaze's memory, because it is the number the kernel enforces. Admission, the front end's release and the daemon's ceiling all read it, and nothing decides on resident or live bytes alone. Live bytes per tag say who holds memory; the gap between footprint and live is memory freed but kept (by an allocator, or purged in a way the kernel still counts) and is a bug to find an owner for, never a number to tune a threshold around.",
+		reason: "Build 54 (2026-11-08, the stage5 self-build on the Mac): the footprint reached 75.7 GiB against a 47 GiB limit while live memory was 29 GiB and the sum of running tasks' peaks never passed 22.4 GiB. The release fired on resident memory (56 GiB) while the kernel counted 75.7. docs/memory-footprint.md.",
+		link: "docs/memory-footprint.md",
+	},
+	{
+		id: "outputs-are-records",
+		skill: "memory-and-data",
+		line: "What outlives its task (a query result, a compiled function, object code) is a blaze-format record written once into the store and read in place through the store's buffer pool; never a heap tree kept until something serializes it, and never an mmap of a store file for the hot tier.",
+		info: "A value that outlives the task that made it (a query result, a compiled function, a unit's object code) is a blaze-format record: no pointer, position-independent, written once and read in place through its `Persist::Ref`. Where the store takes it, the task appends it to the store's pack with explicit I/O (io_uring on Linux, kqueue and the read threads on macOS, through blaze-core), and readers reach it through the store's buffer pool: one reserved address range with a fixed slot per page, a page loaded by an explicit read the task yields on (never a page fault that blocks the worker), and evicted by blaze's one evictor with `MADV_DONTNEED` (Linux) or `MADV_FREE_REUSABLE` (macOS), never plain `MADV_FREE`, which the kernel still counts. Records are immutable, so no page is ever dirty and eviction writes nothing. The hot tier never mmaps a store file: a fault there blocks a worker thread, eviction and write-back are the kernel's, and a failed read is a SIGBUS. A new persisted type gets `Persist` from the one generic impl over `for const` (`#[blaze::reflect]` on the struct, `for<F: Field<T>> F::Type: Flat`) once that lands, never a new hand-written impl; until then a hand-written one names the generic impl's issue. Its round-trip test is the `testing` skill's.",
+		reason: "Query storage only grew, from 3 to 15 GiB over build 54, and was the largest part of the live heap. 2026-11-09 (Andrew): \"could we create our own version of kinda of swap? where task output goes to some mmap'd file\" and \"could u laso output directly into the mmap friendly vrsion no intermediate\"; then \"is there ab etter way than mmap so we can control writing to file etc more and make our own thing and io uring and MADV_FREE\" chose the vmcache-style pool (Leis et al. 2023; \"Are You Sure You Want to Use MMAP in Your DBMS?\", CIDR 2022). The hand-written impls this replaces were about 20,000 lines in ten persist.rs files that day.",
+		link: "crates/blaze-format/src/lib.rs",
+	},
+	{
+		id: "cache-by-code-id",
+		skill: "memory-and-data",
+		line: "A cache of a function's results is keyed by the function's code identity (`fn_info(&f).code_id`) and its arguments; nothing invalidates entries by hand.",
+		info: "A cache of what a function returns is keyed by that function's behaviour identity, `fn_info(&f).code_id` (a Merkle hash of its code and everything it reaches; const eval does not answer `fn_info` yet, docs/const.md, so today the same identity is `hir_ty_identity::code_id`, which `crates/hir-ty-codegen/fncache.rs` hands to `#[blaze::cache]`), together with its arguments, so an edit to the function or anything it calls makes new keys and old entries are never read again; garbage collection drops them later. Nothing invalidates entries by hand, compares timestamps or keeps a dependency list beside the key. A function the identity walk cannot follow (a `dyn` it cannot see through, a body that does not lower) is an error naming it, never a cache keyed on less.",
+		reason: "2026-11-09 (Andrew): \"how would u write functions nad then invalidate the thingin cache that have those funcions and depndent if the impl chages\". The design is docs/v2/plan/design/comptime.md, Function reflection; #[blaze::cache] (docs/fn-cache.md) was the same idea as a macro.",
+		link: "docs/v2/plan/design/comptime.md",
+	},
+	{
+		id: "invariants-are-stated",
+		skill: "testing",
+		line: "State what code promises once (a contract, a reference model, `/// The invariant:` or `/// The refinement:` on its test) and raise its level of evidence as needed: tested, simulated, model-checked, proved in Lean; `harness/v2/invariants.py` lists them and the gate holds each to its control.",
+		info: "What code must always do is written once, in blaze, and every check reads the same text. A contract (`requires`, `ensures`) says what one call does. A reference model is a small, pure, sequential implementation of what a component means, an ordinary type in the crate under `/// The reference model:`. `/// The invariant:` goes on the test whose oracle checks an invariant, and `/// The refinement:` on the test that runs an implementation against its model (or another implementation) and compares. Each needs a control in the same file, a test named `the_oracle_catches_<the planted bug>`. The statement then climbs a ladder without being rewritten: tested (a property test), simulated (the deterministic simulation with faults and crashes), model-checked (every interleaving to a bound), proved (Lean, from the same contract and model; say it as `/// The invariant (proved: <proof file>):`). Durable, concurrent and crash-recovering code is at least simulated; prove the sans-IO cores and what must never be wrong; a disagreement between two levels is a bug in one of them. `harness/v2/invariants.py` collects every statement with its level into `docs/v2/plan/invariants.md` (`write`) and fails the gate (`check`) when one has no control, names a missing proof, or the list is stale. Before changing or regenerating code, read the invariants its crate states: they are what the new code is judged against.",
+		reason: "Andrew, 2026-11-09, on a day when agents wrote about 25,000 lines: \"anyone building with agents and accumulating piles of generated code [should] start making semantics, invariants, and refinement properties first-class artifacts\"; \"try to have this as first class\"; and that tests, the simulation and the Lean verifier should be tied together rather than three separate things.",
+		link: "docs/v2/plan.md#11-proof-by-check-not-by-review",
 	},
 ] as const satisfies readonly Rule[];
 

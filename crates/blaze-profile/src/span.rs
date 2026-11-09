@@ -953,6 +953,10 @@ span_kinds! {
             "the times a daemon `task` was passed over for memory before it started: another task started while its granted bytes did not fit (0: memory never held it back); null for any other span";
         Node = "node" (U64): u64,
             "the plane node a daemon `task` ran as, as the build's records number it; null for any other span";
+        HeapAllocated = "heap_allocated_bytes" (U64): u64,
+            "the bytes a daemon `task`'s work allocated from the global heap in all, never netted against its frees, its fan-out's included (`blaze_graph::arena::Spent`): far past `peak_bytes`, the task churns the heap; null for a task that gave way or panicked, and any other span";
+        HeapFreed = "heap_freed_bytes" (U64): u64,
+            "the bytes a daemon `task`'s work freed to the global heap in all, whoever allocated them (a memo it replaced counts); null as `heap_allocated_bytes` is";
     }
     kinds {
         /// A unit's names phase: its crate's names resolved, or its record replayed.
@@ -999,9 +1003,10 @@ span_kinds! {
         /// task kind and subsystem (`unit bodies (infer)`), `node` the plane node it ran as,
         /// `granted` the memory the plane granted it (its predicted peak) and `passed` the
         /// times it was passed over for memory before it started; as it ends, `peak` the most
-        /// it held. The unit phase and query spans of its work are under it.
+        /// it held, and `heap_allocated` and `heap_freed` what it allocated and freed of the
+        /// global heap in all. The unit phase and query spans of its work are under it.
         Task = "task" { kind: Name => Function, node: u64 => Node, granted: u64 => GrantedBytes, passed: u64 => Passed }
-            => TaskEnded { peak: Option<u64> => PeakBytes }
+            => TaskEnded { peak: Option<u64> => PeakBytes, heap_allocated: Option<u64> => HeapAllocated, heap_freed: Option<u64> => HeapFreed }
         /// A daemon plane task's wait for admission (`blaze_cargo::serve::plane`): from the
         /// step its node became ready to the step it started, `kind` its task kind as its
         /// `task` span names it and `node` its plane node. No thread waits in it (the plane

@@ -1,6 +1,6 @@
 //! The edit fuzzer: an incremental build after any sequence of edits gives what a clean build
 //! of the edited source does (docs/v2/plan/design/verify.md), judged by the invalidation oracle
-//! (`blaze-v2-proof`, docs/v2/plan/lanes/proof.md).
+//! (`blaze-v2-proof`, docs/v2/plan.md).
 //!
 //! A small real crate (a struct, consts, an `#[inline]` callee, a pair of `cfg`-chosen
 //! functions, a generic, a static, and a boxed struct whose `Drop` comes and goes, boxed by a
@@ -95,7 +95,7 @@ enum Edit {
     Reformat(u8),
     /// `impl Drop` for the boxed struct `B` added or removed: the drop of `boxed`'s box runs
     /// the program's code or none, and with `heap_to_stack` its box stays on the heap or moves
-    /// to the stack (rule 18: `boxed`'s key covers the impl).
+    /// to the stack (rule 21: `boxed`'s key covers the impl).
     ToggleDrop,
 }
 
@@ -432,7 +432,7 @@ fn verdict(
     for stale in under(inc_trace, cl_trace, &[]) {
         out.push(match stale {
             Stale::UnrecordedRead { query, .. } => format!(
-                "{} holds other bytes than a clean build makes under the same key, and records no read: its identity misses an input its bytes depend on (rule 18)",
+                "{} holds other bytes than a clean build makes under the same key, and records no read: its identity misses an input its bytes depend on (rule 21)",
                 entry(&query)
             ),
             Stale::Unverified { query, read, saw, now } => format!(

@@ -23,7 +23,7 @@
 //! a retry's wait for its run really ends: that run ended, which is progress, and the job's
 //! record goes. At [`GIVE_WAYS_WITHOUT_PROGRESS`] the ask fails with
 //! [`NoProgress`], naming the key's query and both jobs: a caller that asks again while it holds
-//! what the other waits for can never end, and the bug is where it loops (rule 15).
+//! what the other waits for can never end, and the bug is where it loops (rule 18).
 //!
 //! A loop that catches an item's give-way to run that item again later ([`crate::par`]'s, the
 //! test database's) goes on to its next item, not the same ask: it says so
@@ -34,7 +34,7 @@
 //! end. Only that give-way is taken back: a retry loop around such a loop still counts the
 //! rerun's give-way that reaches it, once a pass, and meets the bound.
 //!
-//! [`GaveWay`] is the decision, a state machine with no IO (rule 12). The world keeps each job's
+//! [`GaveWay`] is the decision, a state machine with no IO (rule 14). The world keeps each job's
 //! by its id, dropped as the job ends; the driver (`sched::host`) waits.
 
 use std::fmt;
@@ -115,7 +115,7 @@ impl GaveWay {
         })
     }
 
-    /// What the job's wait for the run to end waits for, as its span says (rule 13).
+    /// What the job's wait for the run to end waits for, as its span says (rule 15).
     pub(crate) fn name_wait(&self, out: &mut String) {
         use fmt::Write as _;
         // Writing to a `String` does not fail.

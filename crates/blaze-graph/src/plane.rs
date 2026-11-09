@@ -1,9 +1,9 @@
-//! The plane (docs/v2/plan/lanes/core/plane.md, "The plane"): one scheduler for every request a daemon has under
+//! The plane (docs/v2/plan.md, "The plane"): one scheduler for every request a daemon has under
 //! way, as a state machine that does no IO.
 //!
 //! A request (a build, a test run, an edit) is opened with a weight, adds nodes, and is closed;
 //! it finishes once each of its nodes is settled. A node may have a [`Key`], the hash of
-//! everything its value depends on. The plane keeps no results (docs/v2/plan/lanes/core.md, "One memo, the
+//! everything its value depends on. The plane keeps no results (docs/v2/plan.md, "One memo, the
 //! database's"): before it runs a node with a key it asks the [`Memo`], and a key the database
 //! has settles the node at once, running nothing. A node whose key another node is running or
 //! about to run joins it (**single flight**): one task runs, and every node of it settles when
@@ -108,7 +108,7 @@ impl Key {
     }
 }
 
-/// What the query database has of a key: the one memo of results (docs/v2/plan/lanes/core.md, "One memo,
+/// What the query database has of a key: the one memo of results (docs/v2/plan.md, "One memo,
 /// the database's"). `Some` settles a node of the key at once, running nothing: `Built` as
 /// cached on this machine, `Cached` as it says, `Failed` as failed. A task's work puts its
 /// value in the database before its [`PlaneInput::Done`], so a node of its key that becomes
@@ -2592,7 +2592,7 @@ impl<M: Memo> Plane<M> {
     /// blaze's own refused behind a prediction of 15.78 GB with 31 GB held and none of it
     /// granted) would fail a unit that waiting could never help, since nothing granted is left
     /// to end and give memory back; what the process holds besides is the driver's to let go
-    /// ([`Plane::short`]), and a prediction is a guess, not a measure (rule 15: the wait ends,
+    /// ([`Plane::short`]), and a prediction is a guess, not a measure (rule 18: the wait ends,
     /// in a start).
     ///
     /// "The budget" here is [`Plane::budget_now`]: with the machine's ledger, a task within the

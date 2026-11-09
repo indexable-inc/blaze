@@ -1,0 +1,20 @@
+{
+  "ev": "plan",
+  "ts": 5,
+  "windows": [
+    {
+      "limited": false,
+      "name": "5h",
+      "resets_at": 1794253800,
+      "used": 0.08,
+      "warn": false
+    },
+    {
+      "limited": false,
+      "name": "week",
+      "resets_at": 1794470400,
+      "used": 0.79,
+      "warn": true
+    }
+  ]
+}

@@ -9,7 +9,7 @@ many cases run at once (3; each runs two daemons at a time). The JSON is inline,
 or `-` for stdin. Python 3.13, from the workspace at the repository's root.
 
 v2's store keys every value by its schema, the code that made it and every input it was made
-from (#1439, docs/v2-store.md "Keys"): a key that misses an input is a bug, and this is that
+from (#1439, docs/v2/plan/design/store.md "Keys"): a key that misses an input is a bug, and this is that
 bug's acceptance test (#1336, #1291). Each case changes one thing a function's code depends on
 without the function's own text changing: a callee's body, an inline helper folded into a
 caller and into a constant's array length, a public return type with a caller in another

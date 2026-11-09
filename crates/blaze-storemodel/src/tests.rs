@@ -114,7 +114,7 @@ fn a_restore_never_silently_starts_empty() {
 }
 
 /// Finding: a store whose head is gone opens empty and ready, though its packs hold durable
-/// values, and its next commit writes over them. See docs/v2/plan/lanes/storemodel.md.
+/// values, and its next commit writes over them. See docs/v2/plan/design/storemodel.md.
 #[test]
 #[ignore = "finding 1 of the storemodel lane: a lost head opens an empty store and says nothing"]
 fn a_store_whose_head_is_lost_says_so() {
@@ -294,7 +294,7 @@ fn a_restore_on_a_posix_file_system_opens() {
     ));
 }
 
-/// The model's own check (rule 20): a build that answers before its store is durable is
+/// The model's own check (rule 23): a build that answers before its store is durable is
 /// caught, at the crash that loses it, with a schedule that says so.
 #[test]
 fn the_model_catches_an_answer_given_before_its_store_is_durable() {

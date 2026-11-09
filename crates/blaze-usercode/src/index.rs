@@ -1,4 +1,4 @@
-//! Finding a run's result in the store (docs/v2/plan/lanes/usercode/notes.md, "Keys").
+//! Finding a run's result in the store (docs/v2/plan.md, "Keys").
 //!
 //! A result is kept under [`RunKey::traced`]: the run's code, what it was given, and every
 //! input it read with its value then. To find one for a run about to happen, the store keeps
@@ -228,7 +228,7 @@ pub fn split_verified(bytes: &[u8]) -> Option<(Key, &[u8])> {
 /// every run (one shape), and portable keys add one for the marks and one for each set of
 /// roots a value was verified against ([`crate::roots::verify`]), at most 2^6. A chain longer
 /// than this is a run whose paths change every run, or a store's bytes gone wrong: a typed
-/// error naming the run, never an open walk (rule 15).
+/// error naming the run, never an open walk (rule 18).
 pub const MOST_SHAPES: u32 = 4096;
 
 /// The run key [`values`] hashes under: no library and no call, which the image of the
@@ -539,7 +539,7 @@ pub enum KeepError {
         why: String,
     },
     /// The run's chain has [`MOST_SHAPES`] shapes, none this result's: its shape is not
-    /// kept (the result is, under its key), and the walk stops there (rule 15).
+    /// kept (the result is, under its key), and the walk stops there (rule 18).
     TooManyShapes {
         run: RunKey,
     },

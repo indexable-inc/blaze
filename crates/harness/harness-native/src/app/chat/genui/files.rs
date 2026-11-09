@@ -1,5 +1,5 @@
-//! A File: one row of a listing (den's genui.rs File slot and 30-genui.flecs GenFile). Its kind's glyph in the kind's
-//! colour (media.rs's file kinds: the `kind` prop, else guessed from the name; a trailing `/` is a folder), its name, then
+//! A File: one row of a listing (den's genui.rs File slot and 30-genui.flecs GenFile). Its kind's drawing in its own
+//! colours (media.rs's file kinds: the `kind` prop, else guessed from the name; a trailing `/` is a folder), its name, then
 //! its size (Finder's 1000-based units) and when it changed, quiet. With an onClick a press sends its `value`, else its
 //! name. A File given a `path` is the FileRef chip: the kernel sends it as type FileRef, so it never reaches here.
 use super::*;
@@ -7,15 +7,13 @@ use control::{arm, handler, send};
 
 /// Draw File `node` on `v` (an `hn.GenFile`, or `hn.GenFileOn` when it has an onClick).
 pub(super) fn element(v: View<'_>, node: &Value, b: &Budget<'_, '_>) {
-    let world = v.entity().world();
     let name = words(node, "name");
     let kind = match prop(node, "kind").as_str() {
         Some(k) => media::kind_named(k).unwrap_or("text"),
         None => media::kind_of(&name),
     };
     if let Some(i) = v.part("icon") {
-        i.icon(&media::kind_glyph(kind).to_string());
-        media::filled(i, media::fill_of(world, &format!("hn.GenFileKind.{kind}")));
+        i.drawing(media::files::drawing(kind));
     }
     if let Some(n) = v.part("name") {
         n.text(name.trim_end_matches('/'));

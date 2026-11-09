@@ -11,8 +11,23 @@ the table, a diagram that steps through what happened (like ix.dev's learn pages
 animated diagram, one clear action). Keep each view to one idea; ask with `ask(...)` when the person's choice
 decides what you do next.
 
+A report is progressive: the verdict on one line, each part (what changed, risks, what to verify) in a
+`Disclosure` under it, closed:
+
+```svelte
+<Column>
+  <Text tone="strong">Fable 5.2 is in the picker; malloc routing is committed, not yet built.</Text>
+  <Accordion>
+    <Disclosure title="What changed"><Text>...</Text></Disclosure>
+    <Disclosure title="Risks"><Text tone="warning">...</Text></Disclosure>
+    <Disclosure title="What to verify"><Text>...</Text></Disclosure>
+  </Accordion>
+</Column>
+```
+
 Content: Column, Row, Text (tone: ink muted strong error accent success warning), Markdown, Code, Table (rows of
-records; query, onselect), Badge, Stat (label, value, note), Card (title), Divider and Spacer.
+records; query, onselect; a cell that is an inline reference, `from: '<Path loc="/abs/file.md" line={12}>rule 48</Path>'`,
+draws as its chip: give a row its source that way), Badge, Stat (label, value, note), Card (title), Divider and Spacer.
 
 Charts: <Chart kind="bar|stacked|line|area|scatter|pie|donut" data={[...]} or series={[{name, data}]} labels={[...]}
 unit height /> (pie and donut take data as [{label, value}]); never draw a chart by hand.

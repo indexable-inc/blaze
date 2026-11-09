@@ -1,4 +1,4 @@
-//! The simulation's disk as a journal of changes sees it (docs/v2/plan/lanes/frontend/journal.md):
+//! The simulation's disk as a journal of changes sees it (docs/v2/plan/design/restore.md):
 //! each file and directory has an inode and change times that move as a real file system's
 //! do, and a journal of every change survives [`super::Sim::crash`], as FSEvents' store and
 //! NTFS's USN journal survive a reboot. [`Journal`] says which system it plays; the test

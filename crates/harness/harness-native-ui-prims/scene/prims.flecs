@@ -88,6 +88,14 @@ ui {
     Size: {w: {kind: Fixed, value: 16, min: 0, max: 0}, h: {kind: Fixed, value: 16, min: 0, max: 0}}
   }
 
+  // A multi-colour vector drawing by name, in its own colours (`Drawing: {name: "rust"}`: a file kind's icon, IntelliJ's,
+  // harness-native-render drawing.rs; the dark appearance takes its `_dark` variant), 16 points, square in its box, crisp
+  // at every zoom. A file's icon is harness-native-ui-inline files.rs's drawing for its kind, never a name picked here.
+  prefab Art : ui.Node {
+    Drawing: {name: ""}
+    Size: {w: {kind: Fixed, value: 16, min: 0, max: 0}, h: {kind: Fixed, value: 16, min: 0, max: 0}}
+  }
+
   // A picture from the media cache, square until an instance sets another Aspect or a Size.
   prefab Image : ui.Node {
     Picture: {handle: ""}
@@ -485,14 +493,14 @@ ui {
     Padding: {l: $menu_pad, r: $menu_pad, t: $menu_pad, b: $menu_pad}
   }
   // In a window of its own (`Windowed`), as NSMenu is: past the main window's edge when it must be, kept on the screen,
-  // the system's shadow under it (its Lift is the in-window look, for a MenuPlate drawn in place).
+  // the system's shadow under it (its Lift is the in-window look, for a MenuPlate drawn in place). The plate is
+  // MenuPlate's: solid, one hairline. It is there at once and gone at once: no Transition, so an old menu never
+  // stands beside the one that replaced it.
   prefab Menu : ui.MenuPlate {
     Placed
     Windowed
     Layer: {level: Overlay}
     Side: {edge: Top, dx: 0, dy: $menu_gap}
-    Transition: {kind: Grow, from: Bottom, scale: $menu_in_scale, fade: true}
-    Motion: {omega: $menu_omega, zeta: $menu_zeta}
   }
   // An item: the check gutter (`mark`, clear unless ui.MenuItemOn), the `label` and its `meta` just after it, then trailing muted words pushed to
   // the end (`about`, a line about it that truncates first; `keys`, its shortcut). Its highlight is a pill fading in on
@@ -551,6 +559,14 @@ ui {
   prefab MenuItemOn : ui.MenuItem {
     mark : ui.Check { Fill: $tone_ink_strong }
   }
+  // An item that is not a choice but more of the list (a fold's "4 older"): its label quiet, at the meta's size, in
+  // line with the labels over it.
+  prefab MenuItemQuiet : ui.MenuItem {
+    label {
+      Fill: $tone_ink_muted
+      TextStyle: {size: $size_menu_meta, line: $line_menu, role: 0, bold: 0}
+    }
+  }
   // A section's head: small, muted, in line with the items' labels.
   prefab MenuHead : ui.Row {
     Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
@@ -597,21 +613,46 @@ ui {
 @tree ChildOf
 ui {
   // The selection's one look (harness-native-render select.rs): every surface that selects text draws its plate from
-  // here, and a Cmd+C pulses it with CopyLook (den's FlashLook: a 300 ms timeline, not a spring).
+  // here, and a Cmd+C pulses it with CopyLook (den's FlashLook grow and a light that sweeps it: a timeline, not a spring).
   prefab selection {
     Fill: $tone_text_selection
     Shape: {radius: $plate_selection_radius, n: $plate_selection_n, border: 0, feather: 0}
-    CopyLook: {secs: $copy_secs, rise: $copy_rise, grow: $copy_grow, light: $copy_light, stagger: $copy_stagger, row_in: $copy_row_in}
+    CopyLook: {
+      secs: $copy_secs, rise: $copy_rise, grow: $copy_grow,
+      sweep: $copy_sweep, band: $copy_band, tilt: $copy_tilt, ink: $copy_ink,
+      dark: $tone_copy_sheen.dark, light: $tone_copy_sheen.light, add_dark: $copy_add_dark, add_light: $copy_add_light
+    }
   }
   // The text caret's one look (harness-native-render caret.rs, harness.slang's caret): every field, text area and the
   // chat's composer draws its caret from here, den's: a rounded bar that sweeps when it jumps and blinks in the shader.
   prefab caret {
     CaretLook: {w: $caret_w, h: $caret_h, radius: $caret_radius, glide: $caret_glide, hold: $caret_hold, blink: $caret_blink, fade: $caret_fade}
   }
+  // A small pixel-art item, a game's dropped item (PixelBlock, harness-native-render block.rs): its face names what it
+  // is and does (`exec` a terminal, `read` a book, `net` the world turning, `think` a crystal, ...); it floats and moves
+  // while shown; set another face and the old item sinks as the new one rises in over block_turn seconds. block_size across, its texels on whole device pixels.
+  prefab Block : ui.Node {
+    PixelBlock: {face: "cell", turn: $block_turn}
+    Size: {w: {kind: Fixed, value: $block_size, min: 0, max: 0}, h: {kind: Fixed, value: $block_size, min: 0, max: 0}}
+  }
+  // Words with light running through them, the sign that something is at work (a working row's title): a Sheen
+  // (harness-native-ui-look-api; drawn by harness-native-render paint.rs, glyph by glyph) sweeps a soft band left to right
+  // through the letters, lifting them toward tone_sheen, and rests between passes; under Reduce Motion they sit steadily a
+  // little brighter instead. Its defaults are the slow drift of sheen_think_*; a place that means another rhythm sets its
+  // own Sheen (scene/widgets/rows.flecs: one per activity). A Sheen of strength 0 lights nothing and costs nothing, the
+  // way a template turns one off. Only words in view with a moving sheen keep frames coming, at the calm rate.
+  prefab Shimmer : ui.Line {
+    Sheen: {period: $sheen_think_period, rest: $sheen_think_rest, band: $sheen_think_band, strength: $sheen_think_strength, still: $sheen_still, ease: $sheen_think_ease, bands: 1, phase: 0, scatter: true, dark: $tone_sheen.dark, light: $tone_sheen.light}
+  }
   // Struck-through words' one look (harness-native-render paint.rs, inline markdown's ~~struck~~): a hairline through
   // the glyphs about the middle of their x-height, in the text's own ink at reduced alpha.
   prefab strike {
     StrikeLook: {w: $strike_w, rise: $strike_rise_em, alpha: $strike_alpha}
+  }
+  // LaTeX math's one look (harness-native-render math.rs and paint.rs, inline markdown's $…$ and a chat's displayed
+  // formula): its size against its words', the room kept clear above and below it in its line, and its strokes' width.
+  prefab formula {
+    MathLook: {inline_scale: $math_inline_scale, display_scale: $math_display_scale, inline_pad: $math_inline_pad, display_pad: $math_display_pad, stroke: $math_stroke_em}
   }
   spring {
     // The springs the generic motion falls back on when a node has no Motion of its own.
@@ -626,10 +667,6 @@ ui {
     }
     prefab pose {
       Motion: {omega: $spring_pose_omega, zeta: $spring_pose_zeta}
-    }
-    // Words re-wrapping live (harness-native-render reflow.rs): the glyphs a new line break moves glide on it.
-    prefab reflow {
-      Motion: {omega: $spring_reflow_omega, zeta: $spring_reflow_zeta}
     }
     // The overlay scroller's: showing, fading away, widening near its edge, and a page on its track.
     prefab scroller_show {

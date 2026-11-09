@@ -1,5 +1,5 @@
 """cases.py: the front end's cases, each built by blaze and held to what its header says
-(docs/v2/plan/lanes/frontend/fast-diff.md; section 9 of docs/v2/plan/lanes/frontend/fast.md).
+(docs/v2/plan/design/frontend.md; section 9 of docs/v2/plan/design/frontend.md).
 
     uv run --frozen python harness/v2/frontend/cases.py '{"engine": {"kind": "v2", "blaze": "target/release/blaze"}, "out": "/tmp/cases.json"}'
     uv run --frozen python harness/v2/frontend/cases.py '{"engine": {...}, "out": "...", "areas": ["nameres"], "filter": "e0425"}'

@@ -1,7 +1,8 @@
 //! A turn's steps (scene/widgets/steps.flecs): outputs, minimal. Every call starts folded, and nothing opens unless the
-//! person presses it. A run of calls, or a lone cell, is one quiet line ([`Line`], `hn.StepLine`): its kind's icon, what
-//! it did in plain words taken from each step's own outcome (harness-chat's `group::told`: "Searched once, couldn't fetch
-//! 1 page"), a small mark when something failed (its plain sentence on hover), how long it took on hover. Opened, each
+//! person presses it. A run of calls, or a lone cell, is one quiet line ([`Line`], `hn.StepLine`) of marks, not words: a
+//! glyph a kind of step and how many (a terminal and 2, a globe and 2), a small mark when something failed (its plain
+//! sentence on hover). What it did in plain words (harness-chat's `group::told`: "Searched once, couldn't fetch 1
+//! page") and how long it took are its tooltip. Opened, each
 //! step shows its meaningful output only, one prefab per kind of output ([`Out`], `hn.Step*`): search results as titled
 //! links, a fetched page as its host, a file as its chip, a command's output, a failure as one sentence, any other value
 //! as one line of it that opens to its table. Never bookkeeping: no task ids, statuses, timestamps, empty logs or code.
@@ -21,8 +22,13 @@ const PREVIEW_CHARS: usize = 160;
 pub(super) struct Line {
     /// What a press toggles (a run's `run:` key, a cell's block).
     pub key: String,
-    /// Its icon's kind (`hn.StepKind.<kind>`).
-    pub kind: &'static str,
+    /// What it did as marks, not words: each kind of step (`hn.StepKind.<kind>`) and how many, in the order they first
+    /// happened ([`tally`]).
+    pub tally: Vec<(&'static str, usize)>,
+    /// While it runs, the kind of step it is on now (`think` between steps): the face its block shows (`ui.Block`),
+    /// turning as the step changes, in place of the marks. None once it is done.
+    pub live: Option<&'static str>,
+    /// The same in words ("Ran cargo test, fetched 2 pages"): its tooltip, and what a copy takes.
     pub words: String,
     /// Its failures, a plain sentence a line (the mark's tooltip); empty when nothing failed.
     pub why: String,
@@ -33,7 +39,11 @@ pub(super) struct Line {
 
 impl Line {
     pub(super) fn prefab(&self) -> &'static str {
-        if self.why.is_empty() { "hn.StepLine" } else { "hn.StepLineFailed" }
+        match (self.live.is_some(), self.why.is_empty()) {
+            (true, _) => "hn.StepLineLive",
+            (false, true) => "hn.StepLine",
+            (false, false) => "hn.StepLineFailed",
+        }
     }
 }
 
@@ -133,10 +143,28 @@ fn kind_of(a: Act) -> &'static str {
     }
 }
 
-/// The kind a set of calls shows: the first thing they did that was not waiting.
-fn lead_kind<'c>(calls: impl IntoIterator<Item = &'c group::Call>) -> &'static str {
+/// What a set of calls did, as a line's marks: each kind of step and how many, in the order they first happened.
+/// Waiting counts only when nothing else happened; calls that did nothing are one `cell`.
+fn tally<'c>(calls: impl IntoIterator<Item = &'c group::Call>) -> Vec<(&'static str, usize)> {
     let acts: Vec<Act> = calls.into_iter().flat_map(|c| c.acts.iter().chain(&c.fails).copied()).collect();
-    acts.iter().copied().find(|a| *a != Act::Wait).or(acts.first().copied()).map_or("cell", kind_of)
+    let only_waits = acts.iter().all(|a| *a == Act::Wait);
+    let mut out: Vec<(&'static str, usize)> = Vec::new(); // alloc: a few kinds a line
+    for kind in acts.iter().filter(|a| only_waits || **a != Act::Wait).map(|a| kind_of(*a)) {
+        match out.iter_mut().find(|(k, _)| *k == kind) {
+            Some((_, n)) => *n += 1,
+            None => out.push((kind, 1)),
+        }
+    }
+    if out.is_empty() {
+        out.push(("cell", 1));
+    }
+    out
+}
+
+/// The kind of step `calls` are on now: the newest step of the newest call still running; `think` when none runs (the
+/// agent is between steps).
+fn now_kind<'c>(calls: impl DoubleEndedIterator<Item = &'c group::Call>) -> &'static str {
+    calls.rev().find(|c| c.running).and_then(|c| c.acts.last().copied()).map_or("think", kind_of)
 }
 
 /// "Took 1.2s", or nothing while it runs or when it was not timed.
@@ -149,14 +177,38 @@ fn doing(d: &Detail) -> Option<String> {
     if d.status != "running" {
         return None;
     }
-    Some(d.effects.iter().rev().find(|e| e.status == "running").map_or_else(|| "Running\u{2026}".to_owned(), |e| format!("{}\u{2026}", e.doing)))
+    Some(d.effects.iter().rev().find(|e| e.status == "running").map_or_else(|| "Running code\u{2026}".to_owned(), |e| format!("{}\u{2026}", e.doing)))
+}
+
+/// A turn's one line, all its steps folded under it (only its last answer shows beside it): what one of its `calls` is
+/// doing now while it runs (`live`), else what they did, named ("Edited chat.rs, ran cargo test"), failures marked;
+/// how long the turn took (`ms`) its tooltip.
+pub(super) fn turn_line(key: &str, calls: &[group::Call], t: &Transcript, ms: Option<u64>, live: bool, open: bool) -> Line {
+    let now = if live { calls.iter().rev().filter(|c| c.running).find_map(|c| t.details.get(&c.block).and_then(doing)) } else { None };
+    let names: Vec<(Act, String)> = calls.iter().flat_map(|c| c.names.iter().cloned()).collect();
+    let did = group::told_named(calls.iter().flat_map(|c| c.acts.iter().copied()), &names, calls.iter().flat_map(|c| c.fails.iter().copied()));
+    let words = match now {
+        Some(n) => n,
+        None if live && did.is_empty() => "Working\u{2026}".to_owned(),
+        None if live => format!("{did}\u{2026}"),
+        None if did.is_empty() => "Thought it through".to_owned(),
+        None => did,
+    };
+    let mut why: Vec<String> = Vec::new();
+    for w in calls.iter().flat_map(|c| &c.why) {
+        if !why.contains(w) {
+            why.push(w.clone());
+        }
+    }
+    let tip = ms.map(|ms| format!("Worked {}", secs(ms))).unwrap_or_default();
+    Line { key: key.to_owned(), tally: tally(calls), live: live.then(|| now_kind(calls.iter())), words, why: why.join("\n"), tip, open }
 }
 
 /// A lone cell's line: what it is doing now, else what it did ([`group::Call::summary`]).
 pub(super) fn call_line(key: &str, c: &group::Call, d: &Detail, open: bool) -> Line {
     let words = doing(d).unwrap_or_else(|| c.summary());
     let tip = if d.status == "running" { String::new() } else { took(d.ms) };
-    Line { key: key.to_owned(), kind: lead_kind([c]), words, why: c.why.join("\n"), tip, open }
+    Line { key: key.to_owned(), tally: tally([c]), live: c.running.then(|| now_kind([c].into_iter())), words, why: c.why.join("\n"), tip, open }
 }
 
 /// A run's line: what its running call is doing now, else what its calls did ([`group::Run::summary`]), how long they
@@ -167,12 +219,12 @@ pub(super) fn run_line(key: &str, run: &group::Run, t: &Transcript, open: bool) 
     let words = now.unwrap_or_else(|| run.summary());
     let ms: Vec<u64> = details().filter_map(|d| d.ms).collect();
     let tip = if run.running() || ms.is_empty() { String::new() } else { took(Some(ms.iter().sum())) };
-    Line { key: key.to_owned(), kind: lead_kind(run.calls.iter().map(|(_, c)| c)), words, why: run.why().join("\n"), tip, open }
+    Line { key: key.to_owned(), tally: tally(run.calls.iter().map(|(_, c)| c)), live: run.running().then(|| now_kind(run.calls.iter().map(|(_, c)| c))), words, why: run.why().join("\n"), tip, open }
 }
 
 /// What a failed step could not do, from its words while it ran ("Searching Google for x" → "Couldn't search Google
 /// for x"); its done words when its verb is not one the kernel says.
-fn tried(doing: &str, done: &str) -> String {
+pub(super) fn tried(doing: &str, done: &str) -> String {
     const VERBS: [(&str, &str); 30] = [
         ("Searching", "search"),
         ("Fetching", "fetch"),
@@ -385,6 +437,16 @@ fn results(v: &Value) -> Vec<(String, Vec<view::table::Result>, usize)> {
     groups
 }
 
+/// A step's kind, as `hn.StepKind` names its glyph (the composer's activity cards list steps by it too).
+pub(super) fn effect_kind(e: &model::chat::Effect) -> &'static str {
+    kind_of(Act::of_effect(&e.kind))
+}
+
+/// The glyph `hn.StepKind.<kind>` draws.
+pub(super) fn kind_glyph(world: WorldRef<'_>, kind: &str) -> String {
+    glyph(world, kind)
+}
+
 /// The glyph `hn.StepKind.<kind>` draws.
 fn glyph(world: WorldRef<'_>, kind: &str) -> String {
     view::prefab(world, &format!("hn.StepKind.{kind}"))
@@ -415,9 +477,33 @@ fn chevron(v: View<'_>, open: bool) {
 pub(super) fn fill_line(row: View<'_>, l: &Line) {
     let Some(h) = row.part("head") else { return };
     h.action(&format!("chat:open:{}", l.key));
-    look(h, l.kind, &l.words);
+    // Marks, not words: a glyph a kind of step, its count after it when there was more than one. The words are the
+    // tooltip (with how long it took).
+    // While it runs: its block, showing the step it is on (it turns as the step changes), and no marks yet.
+    if let (Some(b), Some(kind)) = (h.part("block"), l.live) {
+        let e = b.entity();
+        let mut block = e.try_cloned::<&harness_native_ui_text_api::PixelBlock>().unwrap_or_default();
+        if block.face.as_str() != kind {
+            block.face = kind.into();
+            e.set(block);
+        }
+        // The step it is on, to the ear (src/audio.rs: a new one plays its cue).
+        crate::audio::step(kind);
+    }
+    let tally: &[(&'static str, usize)] = if l.live.is_some() { &[] } else { &l.tally };
+    if let Some(items) = h.part("items") {
+        let world = h.entity().world();
+        view::for_each(items, "hn.StepTally", tally.iter().map(|&(kind, n)| (kind, (kind, n))), |v, (kind, n), _| {
+            if let Some(i) = v.part("icon") {
+                i.icon(&glyph(world, kind));
+            }
+            if let Some(c) = v.part("n") {
+                c.text(&if n > 1 { n.to_string() } else { String::new() });
+            }
+        });
+    }
     chevron(h, l.open);
-    tooltip(h, &l.tip);
+    tooltip(h, &[l.words.as_str(), l.tip.as_str()].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<_>>().join(" \u{b7} "));
     if let Some(m) = h.part("mark") {
         tooltip(m, &l.why);
     }
@@ -425,7 +511,6 @@ pub(super) fn fill_line(row: View<'_>, l: &Line) {
 
 /// Fill one output row.
 pub(super) fn fill(row: View<'_>, o: &Out) {
-    let world = row.entity().world();
     match o {
         Out::Head { kind, words, why, tip } => {
             if let Some(l) = row.part("line") {
@@ -458,10 +543,8 @@ pub(super) fn fill(row: View<'_>, o: &Out) {
                 look(l, kind, verb);
                 tooltip(l, tip);
                 if let Some(c) = l.part("chip") {
-                    let (g, fill) = genui::file_icon(world, path);
                     if let Some(i) = c.part("icon") {
-                        i.icon(&g);
-                        genui::filled(i, fill);
+                        i.drawing(genui::file_icon(path));
                     }
                     if let Some(n) = c.part("name") {
                         n.text(path.trim_end_matches('/').rsplit('/').next().unwrap_or(path));

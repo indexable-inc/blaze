@@ -61,7 +61,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::TraitImplMissingAssocItems) -> Vec
             diag.span_label(label_at, format!("`{}` from trait", name.as_str()));
         }
         // An item whose signature hir cannot give as rustc writes it gets no suggestion
-        // (docs/v2/requests/diagnostics.md, `diagnostics-items-impls`).
+        // (fed1eb428d:docs/v2/requests/diagnostics.md, `diagnostics-items-impls`).
         if let Some(snippet) = signature(cx, &at, *item) {
             // alloc: the error's text, for an error hir found
             let code = format!("{padding}{snippet}\n{padding}");

@@ -345,9 +345,11 @@ pub struct Paint<'a> {
     pub time: f32,
     /// An input method's uncommitted text, drawn underlined at the cursor.
     pub marked: Option<&'a str>,
-    /// The selection's look (the app's one, harness-native-render select.rs), its colour on this ground, and a copy's pulse.
+    /// The selection's look (the app's one, harness-native-render select.rs), its colour on this ground, whether that
+    /// ground is dark (a copy's light adds to a dark one), and a copy's pulse.
     pub select: &'a harness_native_render::select::Look,
     pub select_ink: Rgba,
+    pub ground_dark: bool,
     pub flash: Option<harness_native_ui_motion_api::CopyFlash>,
 }
 
@@ -659,8 +661,9 @@ pub fn draw(
         }
     }
     // The selection: one joined plate over the grounds and under the text, each row from its first selected cell to its
-    // last (a row it runs through whole, the grid's width), pulsing after a copy (its glyphs growing with it, below).
-    let mut grow = None;
+    // last (a row it runs through whole, the grid's width), pulsing after a copy (its glyphs growing with it and catching
+    // its light, below).
+    let mut pulse = harness_native_render::select::Pulse::default();
     if let Some(sel) = p.sel {
         let ((r0, c0), (r1, c1)) = sel.ordered();
         let cols = snap.rows.first().map_or(0, Vec::len) as i32;
@@ -676,8 +679,8 @@ pub fn draw(
                 (b > a).then(|| harness_native_render::select::Plate::of(pt(ox + a * cw), pt(y), pt((b - a) * cw), pt(ch)))
             })
             .collect();
-        grow = harness_native_render::select::Grow::of(&plates, p.select, p.flash);
-        harness_native_render::select::emit(d, &plates, p.select, p.select_ink, p.flash, 1.0, sc);
+        pulse = harness_native_render::select::Pulse::of(&plates, p.select, p.flash, p.ground_dark);
+        harness_native_render::select::emit(d, &plates, p.select, p.select_ink, &pulse, 1.0, sc);
     }
     if let (Some(m), Some((r, a, b))) = (marked, marked_span) {
         // Marked text inline at the cursor on the ground colour, underlined, with a bar caret after it.
@@ -830,13 +833,17 @@ pub fn draw(
             }
         }
     }
-    // Under a copy's pulse, the glyphs whose cell (the one under their middle) is selected grow with the plate.
-    if let Some(g) = grow {
+    // Under a copy's pulse, the glyphs whose cell (the one under their middle) is selected grow with the plate and catch
+    // its light.
+    if pulse.live() {
         let cell = |v: f32, o: i32, step: i32| ((v * sc - o as f32) / step as f32).floor();
         for gi in &mut d.glyphs[first_glyph..] {
             let (col, row) = (cell(gi.rect[0] + gi.rect[2] * 0.5, ox, cw), cell(gi.rect[1] + gi.rect[3] * 0.5, oy, ch));
             if row >= 0.0 && col >= 0.0 && selected(row as u16, col as u16) {
-                gi.rect = g.rect(gi.rect);
+                if let Some(g) = pulse.grow {
+                    gi.rect = g.rect(gi.rect);
+                }
+                pulse.light_glyph(gi);
             }
         }
     }

@@ -15,7 +15,7 @@
 //! becomes an indirect call in the body.
 //!
 //! What a bucket is, a masked IR without its constants' values ([`Form`]), is hash-consed
-//! (docs/v2/plan/lanes/fastcompile/hashcons.md): its content ID is computed once, when it is
+//! (docs/v2/plan/design/compile-time.md): its content ID is computed once, when it is
 //! interned, and [`groups`] compares those IDs without hashing any IR.
 
 #![forbid(unsafe_code)]
@@ -154,7 +154,7 @@ impl Group {
     /// is its masked IR and parameters ([`Group::shape`]), its settings, which constants it
     /// takes, and its first member's code ([`Group::first`]), which it is emitted as: two
     /// groups alike but for their first member are two bodies of other line rows and debug
-    /// info, and one key for both is two values under it (rule 18).
+    /// info, and one key for both is two values under it (rule 21).
     pub fn key(&self) -> InstanceKey {
         let mut hasher = Hasher::new(FOLDED_DOMAIN);
         hasher.id(&self.shape).id(&self.settings.0);
@@ -542,7 +542,7 @@ pub fn groups(
     }
     // One sort makes every bucket a run, its members in key order. Stable, so of candidates
     // given twice under one key in one bucket, the first given stays; they must be kept
-    // under one stored key too, or which stays would pick the group's key (rule 18).
+    // under one stored key too, or which stays would pick the group's key (rule 21).
     // alloc: one exact-size column per build
     let mut order: Vec<u32> = (0..all.len() as u32).collect();
     order.sort_by(|&a, &b| {

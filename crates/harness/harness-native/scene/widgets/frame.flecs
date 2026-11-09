@@ -75,6 +75,42 @@ hn {
     Padding: {l: $side_inset, r: 0, t: 0, b: 0}
   }
 
+  // The sidebar's last row: the Archive button, the focused chat's status bar (hn.SideChat) and, at the end, how much of
+  // the account's plan is used (`plan`: hn.ChatPlan, src/app/chat/plan.rs; src/app.rs sync_side_status).
+  prefab SideStatus : ui.Row {
+    Flex: {axis: Row, gap: $tree_gap, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+  // The focused chat's status bar (src/app/chat.rs and chat/pick.rs keep each slot, each only while it has something to
+  // say; empty with no chat in front): its model and effort (hn.ChatPick, its menu hanging from it), then at the end its
+  // context ring (hn.ChatContext), breathing while its agent works. Here, out of the way, not under the composer.
+  prefab SideChat : ui.Row {
+    Cursor: {shape: Arrow}
+    Flex: {axis: Row, gap: $chat_bar_gap, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    pick : ui.Row {
+      Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $chat_bar_h, min: 0, max: 0}}
+    }
+    spacer : ui.Spacer {}
+    meter : ui.Row {
+      Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    }
+    // The picker's menu while it is open: out of the row's flow, its plate placed above the control.
+    menu : ui.Node {
+      Overlay
+    }
+    // The context meter's popover while the pointer is on the ring or on it (src/app/chat/context.rs).
+    pop : ui.Node {
+      Overlay
+    }
+  }
+  prefab SidePlan : ui.Row {
+    Flex: {axis: Row, gap: 0, align: Center, justify: End, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+
   // Over the Archive row: why the link is refused (src/link.rs `Refused`: a daemon that never answered the hello, or
   // speaks another schema), naming its pid and socket and `harness stop`. No room and no words while it is not
   // (src/app.rs sync_view sets its height and text).
@@ -86,21 +122,48 @@ hn {
   }
 
   // The selected tree row's pill: a Background under the row (src/app.rs), its plate inset `pill_inset` from the row's
-  // frame on every side so it hugs the row's content with air between neighbours, and matched by id: the tree's one
-  // highlight, whichever row holds it, its position springing (the tree's spring family) from where it was drawn to the
-  // new row while its size is always the new row's, so it is never shorter than the words it sits under. A row still
-  // folding in is Settling: its pill holds where it was until the row has opened, then slides in. The row picks the plate's Fill (tone_selection, or tone_selection_focus while the tree has the keyboard).
+  // frame on every side so it hugs the row's content with air between neighbours. It is where the selection is at once:
+  // no slide between rows (Finder's and Xcode's lists; a list clicked through all day reads a glide as lag). The row
+  // picks the plate's Fill (tone_selection, or tone_selection_focus while the tree has the keyboard).
   prefab Selection : ui.Row {
     Background
     Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}
     Padding: {l: $pill_inset, r: $pill_inset, t: $pill_inset, b: $pill_inset}
     plate : ui.Node {
-      MatchedGeometry: {id: "hn.selection", jump: $pill_jump_rows}
       Fill: $tone_selection
       Shape: {radius: $radius_row, n: 4, border: 0, feather: 0}
-      Motion: {omega: $pill_omega, zeta: $pill_zeta}
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
     }
+  }
+
+  // The ring round a tree row while its menu is open (src/app/row_menu.rs), Finder's: a Background on the selection pill's
+  // frame, its plate clear inside a hairline, drawn over the pill (Z) when the row is selected too. The row sets the
+  // hairline's ink (rows.flecs `menu`: tone_accent while its menu is open, clear else), so the part is always there and
+  // nothing is made or removed as menus open and close.
+  prefab RowMenuMark : ui.Row {
+    Background
+    Z: {z: 1}
+    Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Padding: {l: $pill_inset, r: $pill_inset, t: $pill_inset, b: $pill_inset}
+    plate : ui.Node {
+      Fill: $tone_clear
+      Edge: {dark: $tone_clear.dark, light: $tone_clear.light}
+      Shape: {radius: $radius_row, n: 4, border: 1, feather: 0}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+    }
+  }
+
+  // Where a sidebar row's menu opens (src/app/row_menu.rs): a node of the window's out of its flow (Placed: layout keeps
+  // the Laid the host gives it, the point the right press was), drawing nothing; the menu hangs from it while open.
+  prefab RowMenuAt : ui.Node {
+    Placed
+    Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 0, min: 0, max: 0}}
+  }
+
+  // A sidebar row's menu (src/app/row_menu.rs): ui.Menu's plate with its corner on the point (hn.RowMenuAt), there at once,
+  // down from it (up when there is no room below, slid in from the screen's edge), its rows ui.MenuItem and ui.MenuSep.
+  prefab RowMenu : ui.Menu {
+    Side: {edge: Bottom, dx: 0, dy: 0}
   }
 
   // The main card: an opaque plate in the theme's ground from the window's top edge to its right and bottom edges (the

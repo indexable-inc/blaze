@@ -1,0 +1,30 @@
+File icons harness-native draws for files and folders (src/drawing.rs reads each SVG into filled and stroked layers in
+their own colours; harness-native-ui-inline's files.rs says which file kind is drawn with which).
+
+The SVG file icons in this folder are from IntelliJ IDEA Community's New UI icon set:
+https://github.com/JetBrains/intellij-community at 6df68efff3363b03362d0c406a591d4429c6669c,
+platform/icons/src/expui/fileTypes, platform/icons/src/expui/nodes and platform/icons/src/language.
+
+Copyright (C) 2000-2024 JetBrains s.r.o. and contributors.
+Licensed under the Apache License, Version 2.0: https://www.apache.org/licenses/LICENSE-2.0
+
+This software includes code from IntelliJ IDEA
+Copyright (C) JetBrains s.r.o.
+https://www.jetbrains.com/idea/
+
+The files are unchanged; `<name>_dark.svg` is the dark-appearance variant of `<name>.svg` (gitignore.svg has none and
+is drawn in both). They came by way of den (github.com/andrewgazelka/den, crates/den-native/icons/jetbrains), and the
+rest straight from the commit above, fetched 2026-11-06:
+  expui/fileTypes: archive, binaryData, c, config, cpp, csv, docker, editorConfig, font, graphql, h, java, sql,
+                   swiftLang, terraform, xml
+  expui/nodes:     folderGithub
+  language:        kotlin, ruby
+
+The exceptions, which are not IntelliJ's files:
+- folderOpen.svg and folderOpen_dark.svg are den's (the set has no open folder), drawn from folder.svg and
+  folder_dark.svg on the same grid with the same stroke and colours; Apache 2.0, as folder.svg.
+- lockFile.svg and lockFile_dark.svg are harness's: text.svg with its lower lines cut short under the lock badge of
+  expui/nodes/locked.svg (the set has no lock file), same grid and colours; Apache 2.0, as both.
+- nix.svg and nix_dark.svg are harness's: the NixOS snowflake from Simple Icons (simple-icons 16.36.0,
+  https://cdn.jsdelivr.net/npm/simple-icons@16.36.0/icons/nixos.svg, CC0 1.0), inset on its grid to the ink of the
+  icons beside it, in NixOS's blues (the set has no Nix icon).

@@ -1,6 +1,6 @@
 //! The building blocks of compile identity (`hir-ty-identity`'s `instance_identity`, which
 //! decides which generic instances compile to one body: idea 2 of
-//! `docs/v2/plan/design/compile-time.md`, `docs/v2/plan/lanes/fastcompile/share.md`), and the
+//! `docs/v2/plan/design/compile-time.md`, `docs/v2/plan/design/compile-time.md`), and the
 //! code generator's spelling of types and bodies by content:
 //!
 //! - `fact`: what code that moves, copies, projects or passes a value of a type reads (its
@@ -49,7 +49,7 @@ pub enum Unshared {
     /// A shim the code generator builds without MIR: kept per instance.
     Shim(&'static str),
     /// An intrinsic that is not in [`intrinsics`]' table: its name, the body that calls it, and
-    /// how the instance reached that body (rule 16). Each body is named as an error names one
+    /// how the instance reached that body (rule 19). Each body is named as an error names one
     /// (`` `path` ``, "a closure in `path`"). [`Through`] is decided where the error is made and
     /// as it passes up a call, from the subjects themselves, never by comparing names (two
     /// bodies can have one path: methods of `impl Foo<u8>` and `impl Foo<u16>`), so a caller

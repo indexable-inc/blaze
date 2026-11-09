@@ -1,7 +1,7 @@
 //! What the always-on flight recorder, `blaze_profile::flight`, costs a span: an info span of the
 //! target `blaze` opened, entered, left and closed on one thread, with the thread's CPU counted
 //! (`flight::count_cpu`, as every blaze process does) and no `BLAZE_PROFILE`
-//! (docs/v2/plan/lanes/observe/speed-of-light.md):
+//! (docs/v2/plan.md):
 //!
 //! - `record/root`: a span under no other, so its close may end a CPU stretch
 //!   (`time::cpu::ROOT_AGE`): one CPU read in about every 20 µs of such spans;

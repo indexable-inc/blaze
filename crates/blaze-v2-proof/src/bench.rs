@@ -1,5 +1,5 @@
 //! `blaze-v2-proof '{"bench": "first-difference"}'` and `'{"bench": "join"}'`: the reference
-//! workloads of the proof lane's speed of light (docs/v2/plan/lanes/proof/speed-of-light.md, "The
+//! workloads of the proof lane's speed of light (docs/v2/plan/bounds.md, "The
 //! oracle and the harness"), each made in memory, run once and timed, printed as `{"value": MS}`
 //! for `harness/v2/bounds.py`. Only the work the bound counts is timed, not making the inputs.
 

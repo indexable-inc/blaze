@@ -2,7 +2,7 @@
 //! nothing of: each module a set of rustc's checks, computed from `hir`'s public queries,
 //! each `pub(crate) fn check(cx) -> Vec<Found>` in the order rustc gives them within its pass.
 //! A check that needs inference or trait solving is not made here: it is the front end's, and
-//! asked of it (`docs/v2/requests/diagnostics.md`).
+//! asked of it (`fed1eb428d:docs/v2/requests/diagnostics.md`).
 
 mod ast_validation;
 mod attrs;

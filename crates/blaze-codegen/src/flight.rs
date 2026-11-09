@@ -3,7 +3,7 @@
 //! while that compile is under way goes on with its other functions and then waits for that one
 //! function; one that asks after takes the shape the memo keeps its template under, and prepares
 //! nothing. Two proc macros of a job that both reach `syn`'s parser compile it once
-//! (docs/v2/plan/lanes/compile-time-sched/notes.md).
+//! (docs/v2/plan/design/compile-time.md).
 //!
 //! A function's compile is a run of the scheduler's ([`pump::Flights`]) under its flight key,
 //! from the moment a build asks for it until it lands ([`Flights::ask`]): one function, never a
@@ -15,7 +15,7 @@
 //!
 //! What a build does with each of its functions (ask, wait, take a landing, ask again, or give
 //! up after [`ASKS`]) is decided by [`Plan`], a state machine that reads no table and waits for
-//! nothing (rule 12): the driver does the asking and waiting and tells it what each found.
+//! nothing (rule 14): the driver does the asking and waiting and tells it what each found.
 //!
 //! A wait parks its job on the run's flight in the scheduler: its thread runs other work
 //! meanwhile, the scheduler sees who waits for whom (a wait that would close a cycle gives way),
@@ -229,7 +229,7 @@ impl Drop for Running<'_> {
 /// How often a build asks for one function before it gives up on it: each ask after the first
 /// follows a run of another build's that ended unlanded, which its waiter saw. Far more than the
 /// builds of a job, so only a livelock reaches it, and it ends in an error naming the function
-/// rather than an open loop (rule 15).
+/// rather than an open loop (rule 18).
 pub const ASKS: u32 = 256;
 
 /// What an ask of an item found ([`Plan::asked`]).
@@ -266,10 +266,10 @@ enum Step {
 
 /// What one build does with each of its items (functions, summaries, groups) of the memo's
 /// flights, as decisions: a synchronous state machine that reads no table, compiles nothing and
-/// waits for nothing (rule 12). The driver asks and waits, and tells it what each found
+/// waits for nothing (rule 14). The driver asks and waits, and tells it what each found
 /// ([`Plan::asked`], [`Plan::waited`]); it hands back what to do next
 /// ([`Plan::take_decisions`]). Every item ends run here, taken from another build's landing, or
-/// given up after [`ASKS`] asks, so a build's flights end (rule 15).
+/// given up after [`ASKS`] asks, so a build's flights end (rule 18).
 pub struct Plan {
     /// Of each item: where it is, and how often it was asked for.
     steps: Vec<(Step, u32)>,

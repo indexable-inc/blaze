@@ -1152,7 +1152,7 @@ bitflags::bitflags! {
         const MUST_NOT_SUSPEND = 1 << 91;
         /// `#![blaze::sans_io]`, a word, inner, on a module or a crate root: a blaze extension
         /// (inert under rustc with `#![register_tool(blaze)]`), read by blaze-lints'
-        /// `blaze::sans_io_core` (the module is a sans-IO core, AGENTS.md rule 12).
+        /// `blaze::sans_io_core` (the module is a sans-IO core, AGENTS.md rule 14).
         const SANS_IO = 1 << 92;
         /// `#[blaze::checkfree]`, a word, on a function: a blaze extension (inert under rustc
         /// with `#![register_tool(blaze)]`), read by blaze-lints' `blaze::checkfree` and the
@@ -1194,7 +1194,7 @@ bitflags::bitflags! {
         const BLAZE_SEALED = 1 << 100;
         /// `#[blaze::linear]`, a word: a blaze extension (inert under rustc with
         /// `#![register_tool(blaze)]`), read by `hir-ty-linear`
-        /// (docs/v2/plan/lanes/linear.md). On a struct or enum: a value of it may not be
+        /// (docs/v2/plan/design/linear.md). On a struct or enum: a value of it may not be
         /// dropped implicitly, it must be consumed. On a type parameter, a trait (its `Self`) or
         /// a trait's associated type: it may be a linear type, and generic code treats it as
         /// one. It changes diagnostics, never code: no codegen key reads it.
@@ -1212,7 +1212,7 @@ bitflags::bitflags! {
         /// `#![blaze::specialization]`, a word, inner, on a crate root: a blaze extension
         /// (refused under rustc, whose feature gate refuses the `default fn` it allows), sound
         /// specialization: `default fn` and impls that specialize, each impl checked as always
-        /// applicable (docs/v2/plan/lanes/frontend/specialization.md). Read by
+        /// applicable (docs/v2/plan/design/specialization.md). Read by
         /// `hir_ty::specialization_mode`.
         const BLAZE_SPECIALIZATION = 1 << 122;
         /// `#[blaze::specialization_trait]`, a word, on a trait: a blaze extension (inert under
@@ -1676,7 +1676,7 @@ fn link_symbol(tt: ast::TokenTree<'_>, key: &str) -> Option<Symbol> {
 }
 
 /// What `#[blaze::pure]` on an item says: a blaze extension (inert under rustc with
-/// `#![register_tool(blaze)]`), read by `hir-ty-pure` (docs/v2/plan/lanes/pure-fns.md).
+/// `#![register_tool(blaze)]`), read by `hir-ty-pure` (docs/v2/plan/design/pure-fns.md).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum PureAttr {
     /// `#[blaze::pure]`: the function, and everything it can call, is checked. On a trait:
@@ -1714,7 +1714,7 @@ fn pure_args(tt: ast::TokenTree<'_>) -> PureAttr {
     }
 }
 
-/// Which of the effect attributes `hir-ty-effects` checks (docs/v2/plan/lanes/effects.md): the
+/// Which of the effect attributes `hir-ty-effects` checks (docs/v2/plan/design/effects.md): the
 /// word after `blaze::`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]

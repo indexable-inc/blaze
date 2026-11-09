@@ -49,6 +49,8 @@ pub fn run(path: &str) -> Result<(), String> {
     if let Some(h) = std::env::var("HARNESS_NATIVE_SHOT_HEADROOM").ok().and_then(|s| s.trim().parse::<f32>().ok()) {
         app.headroom = harness_native_render::hdr::Headroom { current: h, potential: h, reference: 0.0 };
     }
+    // HARNESS_NATIVE_SHOT_WORKING: every session row and every run row shows at work, with nothing really at work.
+    app.shot_working = std::env::var_os("HARNESS_NATIVE_SHOT_WORKING").is_some();
     if std::env::var("HARNESS_NATIVE_SIDEBAR").as_deref() == Ok("0") {
         app.fold_sidebar_now();
     }
@@ -60,6 +62,15 @@ pub fn run(path: &str) -> Result<(), String> {
         if q != "1" {
             app.palette_query(&q);
         }
+    }
+    // HARNESS_NATIVE_SHOT_OPEN `<url>|<path>`: opened as a press on a link to it would (the browser pane on the right).
+    if let Ok(t) = std::env::var("HARNESS_NATIVE_SHOT_OPEN") {
+        app.open_target(&t, false);
+    }
+    // HARNESS_NATIVE_SHOT_FIXTURE <json>: a recorded world (the daemon's list and runs, chats' events) instead of the
+    // daemon's (App::shot_fixture); run with a private HARNESS_HOME and no daemon.
+    if let Ok(f) = std::env::var("HARNESS_NATIVE_SHOT_FIXTURE") {
+        app.shot_fixture(&f)?;
     }
     // A session id, a run (`r12`) or one of its stages (`r12.0`).
     if let Ok(s) = std::env::var("HARNESS_NATIVE_SHOT_SELECT") {
@@ -77,6 +88,11 @@ pub fn run(path: &str) -> Result<(), String> {
                 app.shot_chat_pick(sid, &page);
             }
         }
+    }
+    // HARNESS_NATIVE_SHOT_PLAN `5h=0.08,week=0.79` (a `!` after a share: refused): every chat's status bar shows that plan
+    // as if its agent had reported it (src/app/chat/plan.rs), so a shot shows the plan meter before any agent has.
+    if let Ok(spec) = std::env::var("HARNESS_NATIVE_SHOT_PLAN") {
+        app.set_shot_plan(&spec)?;
     }
     // HARNESS_NATIVE_SHOT_CHROME `strip,title_x`: a title-bar strip as the window would report it (points), so the title
     // bar and its subtitle show; HARNESS_NATIVE_SHOT_UNFOCUSED: drawn as a window that is not key (the title dimmed).
@@ -124,6 +140,12 @@ pub fn run(path: &str) -> Result<(), String> {
         .filter(|v| v.len() == 3)
         .collect();
     let mut hovered: Option<(f32, f32)> = None;
+    // HARNESS_NATIVE_SHOT_ROW_MENU `x,y,t[,ctrl]`: a right press on the sidebar row at (x, y) (window points) at t seconds
+    // (with a fourth value of 1, a control-click instead), handed on as the window hands one: that row's menu opens at the
+    // point (src/app/row_menu.rs), and what it offers is logged. HARNESS_NATIVE_SHOT_KEY `none+down,t` then moves its
+    // highlight, `none+return,t` runs it, `none+escape,t` closes it.
+    let mut row_menu =
+        std::env::var("HARNESS_NATIVE_SHOT_ROW_MENU").ok().map(|s| nums(&s)).filter(|v| v.len() == 3 || v.len() == 4);
     // HARNESS_NATIVE_SHOT_KEY `k,t`: Command-k at t seconds, into this offscreen app only (`w,2.4`: archive the selected
     // object, which kills its session). With a `+`, the keys as a binding names them: `cmd+shift+t,1.5`, `none+down,2`
     // (`none+` a key with no modifiers: a tree arrow, the palette's Return), dispatched as the window would.
@@ -233,6 +255,17 @@ pub fn run(path: &str) -> Result<(), String> {
         if let Some((text, _)) = typed.take_if(|k| t >= k.1) {
             app.commit_text(&text);
         }
+        if let Some(v) = row_menu.take_if(|v| t >= v[2]) {
+            let (b, m) = if v.get(3).is_some_and(|c| *c != 0.0) {
+                (left, crate::app::KeyMods { ctrl: true, ..none })
+            } else {
+                (crate::term::Button::Right, none)
+            };
+            app.pointer_move(v[0], v[1], m);
+            app.pointer_down(v[0], v[1], b, 1, m);
+            app.pointer_up(v[0], v[1], b, m);
+            eprintln!("harness-native: shot row menu at {},{}: {}", v[0], v[1], app.row_menu_line());
+        }
         while keys.first().is_some_and(|k| t >= k.1) {
             let (k, _) = keys.remove(0);
             press(&mut app, &k);
@@ -299,6 +332,8 @@ pub fn run(path: &str) -> Result<(), String> {
     let px = renderer.read(&tex);
     write_png(path, &app, &px, (w * backing) as u32, (h * backing) as u32)?;
     eprintln!("harness-native: wrote {path}");
+    // As the window does when the app quits: the chats' drafts are kept for the next launch.
+    app.flush_drafts();
     if let Ok(pfm) = std::env::var("HARNESS_NATIVE_SHOT_PFM") {
         write_pfm(&pfm, &renderer.read_float(&tex), (w * backing) as usize, (h * backing) as usize)?;
     }
@@ -420,14 +455,19 @@ fn press(app: &mut App, spec: &str) {
     };
     eprintln!("harness-native: shot key {spec}: {out:?}");
     // A selector goes up the responder chain to the view (src/window.rs): this app plays the view's part, with
-    // HARNESS_NATIVE_SHOT_CLIP as the pasteboard (`\n` in it a newline); what a copy or cut would put on it is logged.
+    // HARNESS_NATIVE_SHOT_CLIP as the pasteboard (`\n` in it a newline), or HARNESS_NATIVE_SHOT_CLIP_PICTURE (a PNG file)
+    // as a picture on it; what a copy or cut would put on it is logged.
     if let crate::app::Outcome::Selector(sel) = out {
         let clip = std::env::var("HARNESS_NATIVE_SHOT_CLIP").unwrap_or_default().replace("\\n", "\n");
         let took = match sel.as_str() {
             "copy:" => app.copy(),
             "cut:" => app.cut(),
             "paste:" => {
-                app.paste(&clip);
+                match std::env::var("HARNESS_NATIVE_SHOT_CLIP_PICTURE").map(std::fs::read) {
+                    Ok(Ok(png)) => app.paste_pictures(&[png]),
+                    Ok(Err(e)) => eprintln!("harness-native: shot paste: HARNESS_NATIVE_SHOT_CLIP_PICTURE: {e}"),
+                    Err(_) => app.paste(&clip),
+                }
                 None
             }
             _ => None,

@@ -29,7 +29,7 @@ thread_local! {
 
 // Each access to `ON`, `READER` or `READS` is in a function of its own, never inlined: a run
 // that waits between two may resume on another thread, and an inlined access may reuse the
-// address of the first thread's slot (docs/v2/plan/lanes/may-suspend.md).
+// address of the first thread's slot (docs/v2/plan/design/may-suspend.md).
 
 /// The name a glob of an enum, or a path through it to a variant (`use E::V`), is noted reading
 /// in the enum's module, `(module, Some(it))`: no binding has it, so a glob of the module

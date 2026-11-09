@@ -13,7 +13,7 @@ use harness_native_model::{LinkState, Mailbox, Msg};
 use harness_proto::frame::{self, T_CBOR, T_DATA, T_EVENT};
 use harness_proto::event::ModelChoice;
 use harness_proto::msg::{Down, Reply, Request, RunReq, Up};
-use harness_proto::peek::{GhItem, GhRef, PageMeta, REFS_MAX};
+use harness_proto::peek::{GhChecks, GhItem, GhRef, PageMeta, REFS_MAX};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
@@ -155,7 +155,13 @@ fn open(first: &Up) -> std::io::Result<UnixStream> {
 /// One request on a fresh connection: its reply, or the daemon's refusal (the inner error, naming why). The outer error
 /// is the socket's (no daemon, a closed connection).
 pub fn request(r: Request) -> std::io::Result<Result<Reply, String>> {
+    request_within(r, REPLY_WAIT)
+}
+
+/// [`request`], its answer waited for up to `wait` (a request the daemon may take minutes over, an aside's).
+fn request_within(r: Request, wait: Duration) -> std::io::Result<Result<Reply, String>> {
     let mut s = open(&Up::Req(r))?;
+    s.set_read_timeout(Some(wait))?;
     match recv(&mut s)? {
         Down::Reply(reply) => Ok(Ok(reply)),
         Down::Error { error } => Ok(Err(error)),
@@ -342,13 +348,16 @@ pub struct Link {
     peeks: Arc<Mutex<Peeks>>,
 }
 
-/// The daemon's answers about chips' targets: a pull request's or issue's state by ref, a page's card by URL, what is
-/// being asked now (asked once at a time), and a revision that moves with each answer.
+/// The daemon's answers about chips' targets: a pull request's or issue's state by ref, a shown pull request's checks one
+/// by one, a page's card by URL, what is being asked now (asked once at a time), and a revision that moves with each
+/// answer.
 #[derive(Default)]
 pub struct Peeks {
     pub gh: BTreeMap<GhRef, GhItem>,
+    pub checks: BTreeMap<GhRef, GhChecks>,
     pub pages: BTreeMap<String, PageMeta>,
     pub asking_gh: std::collections::BTreeSet<GhRef>,
+    pub asking_checks: std::collections::BTreeSet<GhRef>,
     pub asking_pages: std::collections::BTreeSet<String>,
     pub rev: u64,
 }
@@ -361,6 +370,11 @@ struct UiEvent {
 }
 
 impl Link {
+    /// Where this link posts what the daemon says (a shot posts a recorded world there: App::shot_fixture).
+    pub fn mailbox(&self) -> Mailbox {
+        self.tx.clone()
+    }
+
     pub fn start(tx: Mailbox, wake: Wake) -> Self {
         let (poke, poked) = std::sync::mpsc::channel::<()>();
         let link = Self {
@@ -494,6 +508,11 @@ impl Link {
         link
     }
 
+    /// What wakes the main thread: for work the app runs on a thread of its own (chat/mention.rs's index).
+    pub fn waker(&self) -> Wake {
+        self.wake.clone()
+    }
+
     /// The last `list` round trip to the daemon, milliseconds (None before the first answer).
     pub fn rtt_ms(&self) -> Option<f32> {
         let us = self.rtt_us.load(Ordering::Relaxed);
@@ -623,16 +642,43 @@ impl Link {
         }
     }
 
-    /// A message from the person into chat session `id` (the daemon writes it to the agent as a user turn).
-    pub fn chat_send(&self, id: u64, text: &str) {
+    /// A message from the person into chat session `id`, with the pictures at `images` (the daemon writes it to the agent
+    /// as a user turn).
+    pub fn chat_send(&self, id: u64, text: &str, images: Vec<String>) {
         let (text, poke) = (text.to_owned(), self.poke.clone());
         std::thread::spawn(move || {
-            match request(Request::Send { id, text, raw: false, submit: None }) {
+            match request(Request::Send { id, text, raw: false, submit: None, images }) {
                 Ok(Err(e)) => eprintln!("harness-native: send {id}: {e}"),
                 Ok(Ok(_)) => {}
                 Err(e) => eprintln!("harness-native: send {id}: {e}"),
             }
             let _ = poke.send(());
+        });
+    }
+
+    /// An aside to chat session `id` (`Request::Aside`): `text` asked of a fork of its conversation as one turn, the fork
+    /// then discarded, so the conversation never has it. `then` gets the fork's answer (markdown), or why there is none
+    /// (the daemon's refusal, naming the chat, or the socket's error), on the asking thread; the main thread is woken
+    /// after. The reply is waited for the daemon's own bound on the fork ([`harness_proto::msg::ASIDE_SECS`]) and a
+    /// little more, never past it.
+    pub fn chat_aside(&self, id: u64, text: &str, then: impl FnOnce(Result<String, String>) + Send + 'static) {
+        let (text, wake) = (text.to_owned(), self.wake.clone());
+        std::thread::spawn(move || {
+            let wait = Duration::from_secs(harness_proto::msg::ASIDE_SECS) + REPLY_WAIT;
+            let answer = match request_within(Request::Aside { id, text }, wait) {
+                Ok(Ok(Reply::Aside { text })) => Ok(text),
+                Ok(Ok(r)) => Err(format!("the daemon answered the aside to chat s{id} with {r:?}")),
+                Ok(Err(e)) => Err(e),
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                    Err(format!("the daemon did not answer the aside to chat s{id} within {}s", wait.as_secs()))
+                }
+                Err(e) => Err(format!("asking chat s{id} aside: {e}")),
+            };
+            if let Err(e) = &answer {
+                eprintln!("harness-native: aside {id}: {e}");
+            }
+            then(answer);
+            wake();
         });
     }
 
@@ -704,6 +750,33 @@ impl Link {
                 drop(p);
                 wake();
             }
+        });
+    }
+
+    /// Ask the daemon after pull request `pr`'s checks one by one (`github_checks`) unless they are being asked now. The
+    /// answer lands in [`Peeks::checks`]; a failed request as checks whose error names the pull request and why.
+    pub fn checks(&self, pr: GhRef) {
+        if !self.peeks().asking_checks.insert(pr.clone()) {
+            return;
+        }
+        let (peeks, wake) = (self.peeks.clone(), self.wake.clone());
+        std::thread::spawn(move || {
+            let failed = |why: String| GhChecks::failed(&pr, format!("{}#{}: {why}", pr.repo, pr.n));
+            let checks = match request(Request::GithubChecks { pr: pr.clone() }) {
+                Ok(Ok(Reply::GithubChecks { checks })) => checks,
+                Ok(Ok(r)) => failed(format!("the daemon answered github_checks with {r:?}")),
+                Ok(Err(e)) => failed(e),
+                Err(e) => failed(format!("no daemon: {e}")),
+            };
+            if !checks.error.is_empty() {
+                eprintln!("harness-native: github: {}", checks.error);
+            }
+            let mut p = peeks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            p.asking_checks.remove(&pr);
+            p.checks.insert(pr, checks);
+            p.rev += 1;
+            drop(p);
+            wake();
         });
     }
 

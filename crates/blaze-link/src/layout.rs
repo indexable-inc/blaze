@@ -1,5 +1,5 @@
 //! Profile-guided function order: hot functions packed together in call order, cold ones
-//! last (docs/v2/plan/lanes/layout/layout.md).
+//! last (docs/v2/plan/design/code-layout.md).
 //!
 //! A full link sorts each code class's functions in three tiers, by the middle word of their
 //! sort key ([`crate::place`]):

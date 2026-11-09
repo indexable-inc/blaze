@@ -1,4 +1,4 @@
-//! `#[blaze::pure]` over the stand-in toolchain (docs/v2/plan/lanes/pure-fns.md): a refusal names
+//! `#[blaze::pure]` over the stand-in toolchain (docs/v2/plan/design/pure-fns.md): a refusal names
 //! the chain of calls to what is not pure, allocation and a trusted function's work are
 //! allowed, and a trusted foreign function is reported with its reason.
 
@@ -90,7 +90,7 @@ pub fn compute(x: u32) -> u32 {
     for (name, want) in names.iter().zip(["compute", "middle", "helper", "deeper"]) {
         assert!(name.ends_with(want), "step `{name}` should be `{want}`: {}", refusal.said());
     }
-    // Named by its whole path (AGENTS.md rule 16), not its bare name.
+    // Named by its whole path (AGENTS.md rule 19), not its bare name.
     assert!(
         refusal.what.contains("calls `std::env::var`"),
         "the last step calls `std::env::var`: {}",

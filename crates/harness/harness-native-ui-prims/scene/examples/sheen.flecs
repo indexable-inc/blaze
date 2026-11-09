@@ -1,0 +1,15 @@
+// ui.Shimmer and Sheen: words with a band of light sweeping through them (tokens sheen_think_* in 00-tokens.flecs). The
+// last line's Sheen has strength 0: words at rest, drawn in their own ink. The app itself uses none: nothing in it moves
+// on its own; the primitive is harness-video's.
+
+@tree ChildOf
+ex {
+  prefab SheenDemo : ex.Card {
+    label : ui.Label { Text: {s: "SHEEN, A BAND OF LIGHT THROUGH WORDS"} }
+    think : ui.Shimmer { Text: {s: "Thinking through the tree's fold"} }
+    rest : ui.Shimmer {
+      Text: {s: "At rest, its own ink"}
+      Sheen: {period: 0, rest: 0, band: 0, strength: 0, still: 0, ease: 0, bands: 1, phase: 0, scatter: false, dark: $tone_sheen.dark, light: $tone_sheen.light}
+    }
+  }
+}

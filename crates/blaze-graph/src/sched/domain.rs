@@ -1,4 +1,4 @@
-//! A scheduler as a value (docs/v2/plan/lanes/sched.md): each pool, fiber driver, client thread
+//! A scheduler as a value (docs/v2/plan/design/fibers.md): each pool, fiber driver, client thread
 //! and [`super::Event`] holds a [`Scheduler`], a wait graph and its members' wakers behind a lock
 //! of its own, so pools whose jobs never meet never share a lock.
 //!

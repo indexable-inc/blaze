@@ -1,5 +1,5 @@
 //! `default_hasher` (was `std_hashmap`): a hash collection whose hasher nobody chose, or chose
-//! to seed at random (AGENTS.md rules 10 and 22: the hasher is an explicit choice, and output
+//! to seed at random (AGENTS.md rules 12 and 25: the hasher is an explicit choice, and output
 //! never depends on a per-process seed).
 //!
 //! A collection's hasher is the type parameter of its ADT that has a default implementing

@@ -4,7 +4,7 @@
 //! outlines (Slug), selection plates and the bundled Berkeley Mono cut. Code is set in an installed monospace font.
 //!
 //! den's own typesetter shapes and breaks (text/shaper.rs: HarfRust, ICU4X and unicode-bidi,
-//! docs/research/text-shaping.md), on macOS and Linux alike. Choosing fonts and the font a character falls back to, font
+//! fed1eb428d:docs/research/text-shaping.md), on macOS and Linux alike. Choosing fonts and the font a character falls back to, font
 //! metrics, advances and rasterising are the platform's ([`font::FontSource`]: CoreText on macOS, fontdb, skrifa and
 //! tiny-skia on Linux).
 //!
@@ -13,6 +13,7 @@
 //! ([`Layout::wrap`]): the typesetter still picks each break, and a line is cut from its paragraph's glyphs wherever the
 //! typesetter has shown it sets the line exactly so (docs/text-layout.md).
 use crate::atlas::Packer;
+use crate::math::{Katex, PathSeg};
 use font::{Font, FontSource};
 use shaper::{SetLine, Typesetter};
 use std::cell::{Cell, OnceCell, RefCell};
@@ -708,6 +709,8 @@ pub struct Fonts {
     shaper: shaper::Fonts,
     /// The terminal's families from the user's Ghostty config.
     term_families: TermFamilies,
+    /// The bundled KaTeX fonts a formula has asked for, each loaded once at one point to the em ([`Fonts::math_font`]).
+    math: HashMap<Katex, Option<FontId>>,
 }
 
 impl Default for Fonts {
@@ -737,6 +740,7 @@ impl Fonts {
             look,
             shaper: shaper::Fonts::default(),
             term_families: TermFamilies::default(),
+            math: HashMap::new(),
         }
     }
 
@@ -761,6 +765,24 @@ impl Fonts {
 
     fn font(&self, id: FontId) -> Option<&Font> {
         self.by_id.get(&id)
+    }
+
+    /// The id of the bundled KaTeX font `font`, loaded on first use at one point to the em (so a glyph of it at any size
+    /// is its atlas scale); none if it has no file (the fallbacks RaTeX names) or the file does not load.
+    pub fn math_font(&mut self, font: Katex) -> Option<FontId> {
+        if let Some(id) = self.math.get(&font) {
+            return *id;
+        }
+        let id = crate::math::font_file(font).and_then(|bytes| Font::from_data(bytes, 1.0)).map(|f| self.register(&f));
+        self.math.insert(font, id);
+        id
+    }
+
+    /// The glyph a character is in a font (as [`Fonts::math_font`] gave it), if the font has one.
+    #[must_use]
+    pub fn math_glyph(&self, font: FontId, ch: char) -> Option<u16> {
+        let g = self.by_id.get(&font)?.glyph(ch);
+        (g != 0).then_some(g)
     }
 
     /// How wide `ch` is at `size` points in `face` (the text font, bold or not, when there is none), before any tracking
@@ -1979,7 +2001,7 @@ fn make_line(
 }
 
 #[cfg(test)]
-mod reflow_tests {
+mod wrap_tests {
     use super::*;
 
     /// A line as the eye and the caret see it: its units, box, width and every glyph's face, id, unit and place, to the bit.
@@ -1989,32 +2011,79 @@ mod reflow_tests {
         (l.start, l.end, boxed, l.hard_break, glyphs)
     }
 
+    /// Prose as a transcript holds it: runs of words, a bold run, a long unbreakable token, curly quotes, a hard line end
+    /// and a blank line.
+    const PROSE: &str = "Live re-wrap keeps every word where the typesetter puts it, whatever width came before: \
+                         blaze builds blaze, and the harness's transcript follows its column as the sidebar folds.\n\
+                         A second paragraph, with a long-unbroken-identifier_like_this_one and \u{201c}quotes\u{201d}, \
+                         then a line that ends hard.\n\nAfter a blank line, the last words.";
+    const BOLD: [Run; 1] = [Run { start: 5, end: 12, face: Face::Bold }];
+    const STYLE: Style = Style { size: 14.0, bold: false, line: 20.0 };
+
+    /// The widths a sidebar's spring passes through a fold, narrowing and then widening.
+    fn fold_widths() -> impl Iterator<Item = f32> {
+        let narrowing = (0..60).map(|k| 640.0 - 7.25 * k as f32);
+        let widening = (0..60).map(|k| 212.5 + 7.25 * k as f32);
+        narrowing.chain(widening)
+    }
+
     /// A transcript's prose re-wrapping live through a fold, shaped once: broken again at every width a sidebar's spring
     /// passes, narrowing and then widening, each break-only layout ([`Layout::wrap`], reusing the lines, cuts and seams the
     /// widths before it left) is the layout the typesetter sets from nothing at that width ([`Layout::typeset`]), line for
     /// line and glyph for glyph.
     #[test]
     fn breaking_again_at_a_width_is_a_full_layout_at_that_width() {
-        let text = "Live re-wrap keeps every word where the typesetter puts it, whatever width came before: \
-                    blaze builds blaze, and the harness's transcript follows its column as the sidebar folds.\n\
-                    A second paragraph, with a long-unbroken-identifier_like_this_one and \u{201c}quotes\u{201d}, \
-                    then a line that ends hard.\n\nAfter a blank line, the last words.";
-        let len = text.encode_utf16().count();
-        let bold = [Run { start: 5, end: 12, face: Face::Bold }];
-        let style = Style { size: 14.0, bold: false, line: 20.0 };
+        let len = PROSE.encode_utf16().count();
         let mut fonts = Fonts::default();
-        let shaped = Rc::new(Shaped::new(&mut fonts, text, &bold, &[], &[], style, 0.0));
-        let narrowing = (0..60).map(|k| 640.0 - 7.25 * k as f32);
-        let widening = (0..60).map(|k| 212.5 + 7.25 * k as f32);
-        for w in narrowing.chain(widening) {
+        let shaped = Rc::new(Shaped::new(&mut fonts, PROSE, &BOLD, &[], &[], STYLE, 0.0));
+        for w in fold_widths() {
             let again = Layout::wrap(&mut fonts, &shaped, w);
-            let full = Layout::typeset(&mut fonts, text, &bold, &[], &[], style, 0.0, w);
+            let full = Layout::typeset(&mut fonts, PROSE, &BOLD, &[], &[], STYLE, 0.0, w);
             assert_eq!(again.lines.len(), full.lines.len(), "at {w} points: {} lines broken again, {} set", again.lines.len(), full.lines.len());
             for (k, (a, b)) in again.lines.iter().zip(&full.lines).enumerate() {
                 assert_eq!(seen(a), seen(b), "at {w} points, line {k} differs");
             }
             assert_eq!(again.lines.last().map(|l| l.end), Some(len), "at {w} points the lines do not cover the text");
         }
+    }
+
+    /// What one frame of a fold costs a transcript of `HARNESS_BENCH_WRAP` messages (den's `bench_resize`): each width
+    /// broken again over text shaped once ([`Layout::wrap`]) against typeset from nothing ([`Layout::typeset`]), printed;
+    /// it asserts nothing and is skipped unless the variable is set (run it with `--nocapture` to see the numbers).
+    #[test]
+    fn fold_frame_cost() {
+        let Some(n) = std::env::var("HARNESS_BENCH_WRAP").ok().and_then(|v| v.parse::<usize>().ok()) else { return };
+        let mut fonts = Fonts::default();
+        let widths: Vec<f32> = fold_widths().collect();
+        let per_width = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1e3 / widths.len() as f64;
+        let t = std::time::Instant::now();
+        let shaped: Vec<Rc<Shaped>> =
+            (0..n).map(|_| Rc::new(Shaped::new(&mut fonts, PROSE, &BOLD, &[], &[], STYLE, 0.0))).collect();
+        let shape = t.elapsed().as_secs_f64() * 1e3;
+        let t = std::time::Instant::now();
+        for &w in &widths {
+            for sh in &shaped {
+                std::hint::black_box(Layout::wrap(&mut fonts, sh, w));
+            }
+        }
+        let first = per_width(t);
+        let t = std::time::Instant::now();
+        for &w in &widths {
+            for sh in &shaped {
+                std::hint::black_box(Layout::wrap(&mut fonts, sh, w));
+            }
+        }
+        let again = per_width(t);
+        let t = std::time::Instant::now();
+        for &w in &widths {
+            for _ in 0..n {
+                std::hint::black_box(Layout::typeset(&mut fonts, PROSE, &BOLD, &[], &[], STYLE, 0.0, w));
+            }
+        }
+        let typeset = per_width(t);
+        eprintln!("{n} messages, {} widths: shape once {shape:.2} ms", widths.len());
+        eprintln!("wrap, first fold (learning cuts): {first:.3} ms per frame; every fold after: {again:.3} ms per frame");
+        eprintln!("typeset afresh: {typeset:.3} ms per frame ({:.1}x the wrap)", typeset / again.max(1e-9));
     }
 }
 
@@ -2135,6 +2204,36 @@ impl GlyphCache {
         e
     }
 
+    /// The atlas entry for a formula's outline (a radical, a tall bracket, a stretchy arrow: `segs`, in ems from the
+    /// outline's origin, y down) at `scale` pixels to the em and subpixel step `sub` across, filled or stroked `stroke` ems
+    /// wide; `key` names the shape (math.rs `Item::Path`). The entry's `left` and `top` place it from the origin like a
+    /// glyph's. Rasterised on first use, like [`GlyphCache::get`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn outline(
+        &mut self,
+        key: u64,
+        segs: &[PathSeg],
+        fill: bool,
+        stroke: f32,
+        scale: f32,
+        sub: u32,
+        upload: &mut dyn FnMut(u32, u32, u32, u32, &[u8]),
+    ) -> Option<AtlasGlyph> {
+        // Outlines live beside glyphs under a key no glyph has: glyph u16::MAX and bit 29 of the step (a plain glyph's step
+        // is below SUBPX, a placed glyph's has bit 31 set), the shape, its stroke and whether it is filled all in it.
+        let id = (key ^ u64::from(stroke.to_bits()) << 32 ^ 0x7a3d_51c9, u16::MAX, scale.to_bits(), sub | 0x2000_0000 | u32::from(fill) << 28);
+        if let Some(e) = self.map.get(&id) {
+            self.hits += 1;
+            return *e;
+        }
+        self.misses += 1;
+        let e = self.place(font::raster_outline(segs, fill, stroke, scale, f64::from(sub) / f64::from(SUBPX)), upload);
+        if e.is_some() || !self.full {
+            self.map.insert(id, e);
+        }
+        e
+    }
+
     /// The atlas entry for a coverage mask drawn elsewhere (an icon), `w` by `h` pixels under `key`; uploaded on first
     /// use as white, so it tints like a plain glyph.
     pub fn mask(
@@ -2221,5 +2320,27 @@ impl GlyphCache {
         };
         upload(x, y, b.w, b.h, &b.rgba);
         Some(AtlasGlyph { x, y, w: b.w, h: b.h, left: b.left, top: b.top, colour: b.colour })
+    }
+}
+
+#[cfg(test)]
+mod math_tests {
+    use super::*;
+
+    /// A bundled KaTeX font loads once and has its letters (and not what it lacks); an outline rasterises into the atlas
+    /// solid inside, standing on its origin, and is remembered.
+    #[test]
+    fn a_math_font_loads_and_an_outline_rasterises_with_coverage() {
+        let mut f = Fonts::default();
+        let id = f.math_font(Katex::MainRegular).expect("the bundled font loads");
+        assert!(f.math_glyph(id, 'x').is_some() && f.math_glyph(id, '\u{4e2d}').is_none(), "it has x and has no Han");
+        assert_eq!(f.math_font(Katex::MainRegular), Some(id), "loaded once");
+        let mut cache = GlyphCache::new(256);
+        let square = [PathSeg::Move([0.0, -1.0]), PathSeg::Line([1.0, -1.0]), PathSeg::Line([1.0, 0.0]), PathSeg::Line([0.0, 0.0]), PathSeg::Close];
+        let mut got = (0, 0, 0u8);
+        let e = cache.outline(7, &square, true, 0.0, 10.0, 0, &mut |_, _, w, h, b| got = (w, h, b.iter().copied().max().unwrap_or(0))).unwrap();
+        assert!(e.w >= 10 && e.h >= 10 && e.top >= 10, "a ten-pixel square standing on its origin: {e:?}");
+        assert_eq!(got.2, 255, "solid inside");
+        assert!(cache.outline(7, &square, true, 0.0, 10.0, 0, &mut |_, _, _, _, _| panic!("remembered")).is_some());
     }
 }

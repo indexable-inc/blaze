@@ -227,6 +227,24 @@ fn arm_kip_nap(secs: f64) {
     });
 }
 
+/// The app went idle with a finished row lingering in the tree: wake in `secs`, when its linger is out and it folds
+/// away, unless a frame was drawn meanwhile (that frame armed the next wake itself, if one is still due).
+fn arm_linger(secs: f64) {
+    let at = FRAMES_DRAWN.load(Ordering::SeqCst);
+    let Ok(when) = dispatch2::DispatchTime::try_from(std::time::Duration::from_secs_f64(secs.clamp(0.02, 60.0))) else {
+        return;
+    };
+    let _ = DispatchQueue::main().after(when, move || {
+        if FRAMES_DRAWN.load(Ordering::SeqCst) != at {
+            return;
+        }
+        with(|st| {
+            st.app.linger_woke();
+            st.link.setPaused(false);
+        });
+    });
+}
+
 /// The headroom of the screen `view`'s window is on (SDR when it is on none). Public NSScreen API: CoreDisplay's private
 /// `CoreDisplay_Display_Get{Current,Potential,Reference}Headroom` were measured to return the same numbers (macOS 27,
 /// built-in XDR: 1.0, 16.0, 0.0), so they would add nothing (rule macos-private-apis).
@@ -584,8 +602,9 @@ define_class!(
             wake();
         }
 
-        /// Files on the pasteboard (a Finder copy, which carries their names as a string too) paste as their paths, else
-        /// its string pastes.
+        /// Files on the pasteboard (a Finder copy, which carries their names as a string too) paste as their paths (a
+        /// chat attaches the pictures among them), else its string pastes, else its picture (a screenshot, a browser's
+        /// Copy Image) is saved and attached to a chat's message, or its path pasted elsewhere.
         #[unsafe(method(paste:))]
         fn paste(&self, _sender: Option<&AnyObject>) {
             let pb = NSPasteboard::generalPasteboard();
@@ -595,37 +614,15 @@ define_class!(
                 let text = pb.stringForType(unsafe { NSPasteboardTypeString }).map(|s| s.to_string());
                 if let Some(text) = text {
                     with(|st| st.app.paste(&text));
+                } else {
+                    let pngs = pasteboard_pngs(&pb);
+                    if !pngs.is_empty() {
+                        with(|st| st.app.paste_pictures(&pngs));
+                    }
                 }
             } else {
                 with(|st| st.app.paste_paths(&paths));
             }
-            wake();
-        }
-
-        /// A right click (or control-click) on a tree row: what can be done to its object.
-        #[unsafe(method_id(menuForEvent:))]
-        fn menu_for_event(&self, event: &NSEvent) -> Option<Retained<NSMenu>> {
-            self.context_menu(event)
-        }
-
-        #[unsafe(method(ctxKill:))]
-        fn ctx_kill(&self, sender: &NSMenuItem) {
-            let e = sender.tag() as u64;
-            with(|st| st.app.kill_object(e));
-            wake();
-        }
-
-        #[unsafe(method(ctxPin:))]
-        fn ctx_pin(&self, sender: &NSMenuItem) {
-            let e = sender.tag() as u64;
-            with(|st| st.app.toggle_pin(e));
-            wake();
-        }
-
-        #[unsafe(method(ctxUnarchive:))]
-        fn ctx_unarchive(&self, sender: &NSMenuItem) {
-            let e = sender.tag() as u64;
-            with(|st| st.app.unarchive(e));
             wake();
         }
 
@@ -889,35 +886,6 @@ impl HarnessView {
         wake();
     }
 
-    fn context_menu(&self, event: &NSEvent) -> Option<Retained<NSMenu>> {
-        let p = self.local(event);
-        let (x, y) = (p.x as f32, p.y as f32);
-        let mtm = self.mtm();
-        let menu = NSMenu::new(mtm);
-        menu.setAutoenablesItems(false);
-        let add = |title: &str, action: objc2::runtime::Sel, tag: u64| {
-            let it = item(mtm, title, action, "");
-            // SAFETY: the view outlives the menu it pops up; the item only holds it weakly.
-            unsafe { it.setTarget(Some(self)) };
-            it.setTag(tag as isize);
-            menu.addItem(&it);
-        };
-        let e = with(|st| st.app.object_at(x, y)).flatten()?;
-        let (archived, pinned, object) =
-            with(|st| (st.app.is_archived(e), st.app.is_pinned(e), st.app.is_object(e)))
-                .unwrap_or_default();
-        if !object {
-            return None;
-        }
-        if archived {
-            add("Unarchive", sel!(ctxUnarchive:), e);
-        } else {
-            add(if pinned { "Don't Keep in Tree" } else { "Keep in Tree" }, sel!(ctxPin:), e);
-            add("Kill", sel!(ctxKill:), e);
-        }
-        Some(menu)
-    }
-
     /// Tell the app where the title bar is (Ghostty's layout: the traffic lights centred in a strip as tall as AppKit's
     /// title bar, the title past them on the same line), re-centring the lights when AppKit has put them elsewhere.
     fn sync_chrome(&self) {
@@ -1060,6 +1028,11 @@ impl HarnessView {
                     if let Some(secs) = st.app.kip_nap() {
                         arm_kip_nap(secs);
                     }
+                    if let Some(secs) = st.app.linger_due() {
+                        arm_linger(secs);
+                    }
+                    // A pause in typing: the chats' drafts are kept for the next launch.
+                    st.app.flush_drafts();
                     if st.app.headroom.potential > 1.0 {
                         arm_headroom_watch();
                     }
@@ -1426,6 +1399,10 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
     let mut app = App::new(wake_from_any_thread())?;
     app.set_gpu_clock(renderer.gpu_clock());
     app.set_media(renderer.media());
+    // The app's sound (src/audio.rs): the window's only. A scene or a device that refuses it leaves the app silent.
+    if let Err(e) = app.start_sound() {
+        eprintln!("harness-native: sound: {e}");
+    }
     if std::env::var("HARNESS_NATIVE_SIDEBAR").as_deref() == Ok("0") {
         app.fold_sidebar_now();
     }
@@ -1603,6 +1580,8 @@ define_class!(
 
         #[unsafe(method(applicationWillTerminate:))]
         fn will_terminate(&self, _note: &NSNotification) {
+            // What was typed since the last pause is kept too.
+            with(|st| st.app.flush_drafts());
             single::release();
         }
 
@@ -1705,6 +1684,30 @@ fn pasteboard_put(text: &str) {
     pb.clearContents();
     // SAFETY: NSPasteboardTypeString is a valid static pasteboard type.
     pb.setString_forType(&NSString::from_str(text), unsafe { NSPasteboardTypeString });
+}
+
+/// The pictures on pasteboard `pb` as PNG bytes, one for each item that holds one (a copy of several pictures is
+/// several items): its PNG as it is, else its TIFF (a screenshot's, Safari's Copy Image) converted. Empty when none holds
+/// a picture (or only TIFFs AppKit cannot read).
+fn pasteboard_pngs(pb: &NSPasteboard) -> Vec<Vec<u8>> {
+    let Some(items) = pb.pasteboardItems() else { return Vec::new() };
+    let mut out = Vec::new(); // alloc: a paste's few pictures
+    for item in &items {
+        // SAFETY: NSPasteboardTypePNG is a valid static pasteboard type.
+        if let Some(d) = item.dataForType(unsafe { objc2_app_kit::NSPasteboardTypePNG }) {
+            out.push(d.to_vec());
+            continue;
+        }
+        // SAFETY: NSPasteboardTypeTIFF is a valid static pasteboard type.
+        let Some(tiff) = item.dataForType(unsafe { objc2_app_kit::NSPasteboardTypeTIFF }) else { continue };
+        let Some(rep) = objc2_app_kit::NSBitmapImageRep::imageRepWithData(&tiff) else { continue };
+        // SAFETY: an empty properties dictionary has the type the method takes.
+        let png = unsafe { rep.representationUsingType_properties(objc2_app_kit::NSBitmapImageFileType::PNG, &objc2_foundation::NSDictionary::new()) };
+        if let Some(png) = png {
+            out.push(png.to_vec());
+        }
+    }
+    out
 }
 
 /// The paths of the files on pasteboard `pb` (each item's file URL; Finder's are file reference URLs, resolved to paths).

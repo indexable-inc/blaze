@@ -268,6 +268,137 @@ WHERE build_id = $build AND name = 'task'
 GROUP BY function
 ORDER BY peak_mib DESC NULLS LAST, task
 
+-- name: memory_timeline
+-- says: a build's memory minute by minute from its first counter (`blaze explain memory`): the footprint (all the OS counts against the daemon), the global heap's live blocks, what blaze-mem's tags hold, what the allocators keep freed (`allocator kept bytes`, or the footprint less the live heap and blaze-mem's resident pages where no such row is), and the most tasks running, in GiB; each column its minute's most. Counters of a blaze before they carried a build are taken by the build's window
+WITH c AS (
+    SELECT t_ns, name, value FROM counters
+    WHERE build_id = $build
+        OR (build_id IS NULL
+            AND NOT EXISTS (SELECT 1 FROM counters WHERE build_id = $build)
+            AND t_ns BETWEEN (SELECT started_ns FROM builds WHERE build_id = $build)
+                AND (SELECT started_ns + coalesce(dur_ns, 0) FROM builds WHERE build_id = $build))
+),
+measured AS (SELECT t_ns, value AS kept FROM c WHERE name = 'allocator kept bytes'),
+derived AS (
+    SELECT r.t_ns, f.value - h.value - r.value AS kept
+    FROM (SELECT t_ns, value FROM c WHERE name = 'blaze-mem resident bytes') r
+    ASOF JOIN (SELECT t_ns, value FROM c WHERE name = 'heap live bytes') h ON r.t_ns >= h.t_ns
+    ASOF JOIN (SELECT t_ns, value FROM c WHERE name = 'footprint bytes') f ON r.t_ns >= f.t_ns
+),
+kept AS (
+    SELECT * FROM measured
+    UNION ALL
+    SELECT * FROM derived WHERE NOT EXISTS (SELECT 1 FROM measured)
+),
+points AS (
+    SELECT t_ns, name, value FROM c
+    WHERE name IN ('footprint bytes', 'heap live bytes', 'live bytes', 'pool running')
+    UNION ALL
+    SELECT t_ns, 'kept', kept FROM kept
+)
+SELECT
+    floor((t_ns - (SELECT min(t_ns) FROM c)) / 60e9)::BIGINT AS minute,
+    round(max(value) FILTER (WHERE name = 'footprint bytes') / 1073741824, 2) AS footprint_gib,
+    round(max(value) FILTER (WHERE name = 'heap live bytes') / 1073741824, 2) AS heap_live_gib,
+    round(max(value) FILTER (WHERE name = 'live bytes') / 1073741824, 2) AS blaze_mem_gib,
+    round(max(value) FILTER (WHERE name = 'kept') / 1073741824, 2) AS kept_gib,
+    CAST(max(value) FILTER (WHERE name = 'pool running') AS BIGINT) AS tasks_running
+FROM points
+GROUP BY minute
+ORDER BY minute
+
+-- name: memory_peak_tasks
+-- says: a build's daemon tasks that held the most at once (`task` spans, `blaze explain memory`), largest first: the task kind, its crate and unit (the task span's, else the unit phase span under it), the most it held, its grant, what it allocated and freed of the global heap in all and how many times its peak that churn is, and how long it ran
+WITH tasks AS (
+    SELECT * FROM spans WHERE build_id = $build AND name = 'task' AND peak_bytes IS NOT NULL
+),
+phases AS (
+    SELECT process, parent, any_value("crate") AS krate, any_value(unit) AS unit
+    FROM spans
+    WHERE build_id = $build
+        AND name IN ('unit names', 'unit bodies', 'unit codegen', 'unit link', 'unit store')
+    GROUP BY process, parent
+)
+SELECT
+    t.function AS task,
+    coalesce(t."crate", p.krate) AS "crate",
+    coalesce(t.unit, p.unit) AS unit,
+    round(t.peak_bytes / 1073741824, 2) AS peak_gib,
+    round(t.granted_bytes / 1073741824, 2) AS granted_gib,
+    round(t.heap_allocated_bytes / 1073741824, 2) AS heap_allocated_gib,
+    round(t.heap_freed_bytes / 1073741824, 2) AS heap_freed_gib,
+    round(t.heap_allocated_bytes / nullif(t.peak_bytes, 0), 1) AS churn_x_peak,
+    round(t.dur_ns / 1e9, 1) AS s
+FROM tasks t
+LEFT JOIN phases p ON p.process = t.process AND p.parent = t.span_id
+ORDER BY t.peak_bytes DESC, task
+LIMIT $limit
+
+-- name: memory_at_peak
+-- says: a build's memory by area at the instant its footprint peaked (`blaze explain memory`), most first: each tag's blaze-mem bytes and global-heap bytes then, and what it allocated and freed of the global heap from the build's first counter to the peak; then the process's own areas (the footprint, the live heap and what its allocator committed, what the allocators keep, blaze-mem's resident pages, free chunks and kept values' classes), in GiB
+WITH c AS (
+    SELECT t_ns, name, value FROM counters
+    WHERE build_id = $build
+        OR (build_id IS NULL
+            AND NOT EXISTS (SELECT 1 FROM counters WHERE build_id = $build)
+            AND t_ns BETWEEN (SELECT started_ns FROM builds WHERE build_id = $build)
+                AND (SELECT started_ns + coalesce(dur_ns, 0) FROM builds WHERE build_id = $build))
+),
+peak AS (
+    SELECT t_ns FROM c WHERE name = 'footprint bytes' ORDER BY value DESC, t_ns LIMIT 1
+),
+then_ AS (
+    SELECT name, arg_max(value, t_ns) AS value FROM c
+    WHERE t_ns <= (SELECT t_ns FROM peak)
+    GROUP BY name
+),
+first_ AS (SELECT name, arg_min(value, t_ns) AS value FROM c GROUP BY name),
+tags AS (
+    SELECT
+        split_part(then_.name, ': ', 2) AS area,
+        max(then_.value) FILTER (WHERE then_.name LIKE 'tag live bytes: %') AS mem,
+        max(then_.value) FILTER (WHERE then_.name LIKE 'tag heap bytes: %') AS heap,
+        max(then_.value - first_.value) FILTER (WHERE then_.name LIKE 'tag heap allocated bytes: %') AS allocated,
+        max(then_.value - first_.value) FILTER (WHERE then_.name LIKE 'tag heap freed bytes: %') AS freed
+    FROM then_ JOIN first_ USING (name)
+    WHERE then_.name LIKE 'tag %: %'
+    GROUP BY area
+),
+process AS (
+    SELECT name AS area, value AS mem FROM then_
+    WHERE name IN ('footprint bytes', 'heap live bytes', 'heap committed bytes', 'allocator kept bytes',
+        'blaze-mem resident bytes', 'chunks warm bytes', 'chunks cold bytes', 'blocks live bytes',
+        'blocks warm bytes', 'blocks cold bytes')
+)
+SELECT
+    area,
+    'tag' AS kind,
+    round((coalesce(mem, 0) + coalesce(heap, 0)) / 1073741824, 2) AS held_gib,
+    round(mem / 1073741824, 2) AS blaze_mem_gib,
+    round(heap / 1073741824, 2) AS heap_gib,
+    round(allocated / 1073741824, 2) AS heap_allocated_gib,
+    round(freed / 1073741824, 2) AS heap_freed_gib
+FROM tags
+UNION ALL
+SELECT replace(area, ' bytes', ''), 'process', round(mem / 1073741824, 2), NULL, NULL, NULL, NULL
+FROM process
+ORDER BY kind DESC, held_gib DESC NULLS LAST, area
+
+-- name: memory_sites
+-- says: what churns a build's global heap, by call site (`alloc_samples`, `blaze explain memory`): each site's bytes allocated (its samples' weights summed, within a sample's), its share of the build's, the tags of the tasks that allocated there, its samples and their mean block size, most first
+WITH s AS (SELECT * FROM alloc_samples WHERE build_id = $build)
+SELECT
+    coalesce(site, '(in the allocator)') AS site,
+    round(sum(bytes) / 1073741824, 2) AS allocated_gib,
+    round(100.0 * sum(bytes) / (SELECT sum(bytes) FROM s), 1) AS pct,
+    string_agg(DISTINCT coalesce(tag, 'outside'), ', ' ORDER BY coalesce(tag, 'outside')) AS tags,
+    count(*) AS samples,
+    CAST(avg(block_bytes) AS BIGINT) AS mean_block_bytes
+FROM s
+GROUP BY site
+ORDER BY allocated_gib DESC, site
+LIMIT $limit
+
 -- name: admission_waits
 -- says: what a build's daemon tasks waited for before they started (`admission` spans, from ready to start): per task kind and what held it back (memory, a work or io thread, nothing), how many, their whole and longest wait, and the times memory passed them over; a null waited_for never started
 SELECT

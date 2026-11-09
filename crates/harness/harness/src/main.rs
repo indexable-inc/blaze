@@ -13,6 +13,7 @@ mod paths;
 mod profiles;
 mod queries;
 mod runs;
+mod instructions;
 mod skills;
 mod ui_feed;
 
@@ -87,7 +88,7 @@ async fn main() -> Result<()> {
         }
         Some("send") => {
             let id: u64 = arg(1).parse()?;
-            client::Ctl::connect().await?.req(Request::Send { id, text: args[2..].join(" "), raw: false, submit: None }).await?;
+            client::Ctl::connect().await?.req(Request::Send { id, text: args[2..].join(" "), raw: false, submit: None, images: Vec::new() }).await?;
             Ok(())
         }
         Some("set-model") => {

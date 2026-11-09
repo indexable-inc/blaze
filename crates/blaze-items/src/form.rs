@@ -910,7 +910,7 @@ impl<'db> Cx<'db> {
     }
 
     /// Where the signature of `id` holds an error type, and what can have left it there: for
-    /// the error a build stops with at [`Missed::ErrorType`] (rule 16), never hashed. It names
+    /// the error a build stops with at [`Missed::ErrorType`] (rule 19), never hashed. It names
     /// the first field of an ADT, or the parameter or return type of a function, whose type
     /// has an error, and each proc macro the item's crate loads, directly or through a crate
     /// it sees, that has no expanders yet or failed: such a macro expands to nothing, so a
@@ -1235,7 +1235,7 @@ impl<'db> Cx<'db> {
         }
         let key = FormTy::new(self.db, ty.store());
         // A type's form asks for its parts' forms, one query inside another per level of the
-        // type, as deep as the program nests it (rule 17).
+        // type, as deep as the program nests it (rule 20).
         let code = stdx::ensure_sufficient_stack(|| {
             if self.leak_free { signature_ty_form(self.db, key) } else { ty_form(self.db, key) }
         });
@@ -1519,7 +1519,7 @@ impl<'db> Cx<'db> {
         self.attrs(f, it.into());
         // A constant's value is what its users see: it is in their code. One without generics
         // that evaluates is its value, so an edit of a `const fn` it calls that keeps the value
-        // reaches no user (E4 in docs/v2/plan/lanes/firewall/notes.md); else its body, from
+        // reaches no user (E4 in docs/v2/plan/design/item-hash.md); else its body, from
         // which each use evaluates it.
         if data.has_body() && self.leak_free {
             f.u8(LEAK);

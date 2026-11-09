@@ -14,10 +14,25 @@
 //! `models` event), `set_model` (answered with the model it resolved to), and `apply_flag_settings` with `effortLevel`
 //! (answered with success even for a level it ignores, so it is followed by `get_settings` and the effort its effective
 //! settings read is what the `session` event says, an `error` when it is not the one asked for).
+//!
+//! Around each call to the model Claude says how much of the person's plan is used: a `rate_limit_event` whose
+//! `rate_limit_info` carries `unifiedWindows` (`five_hour`, `seven_day`, ...: each a `utilization` 0 to 1, `resetsAt` in
+//! unix seconds, a `status` of `allowed`, `allowed_warning` or `rejected`, and a `surpassedThreshold` once warned),
+//! read as the `plan` event.
 use super::context;
-use harness_proto::event::{Body, ContextCall, ContextUse, Kind, ModelChoice};
+use harness_proto::event::{Body, ContextCall, ContextUse, Kind, ModelChoice, PlanWindow};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+
+/// The content block that gives Claude the picture at `path`: its bytes, base64, under the media type its header names.
+/// A picture that cannot be read by now (the daemon checked it as the message came) is a text block saying so, naming it.
+fn image_block(path: &str) -> Value {
+    use base64::Engine as _;
+    match std::fs::read(path).map_err(|e| e.to_string()).and_then(|b| super::picture_type(&b).map(|t| (t, b)).ok_or_else(|| "not a PNG, JPEG, GIF or WebP picture".to_owned())) {
+        Ok((media, bytes)) => json!({"type": "image", "source": {"type": "base64", "media_type": media, "data": base64::engine::general_purpose::STANDARD.encode(bytes)}}),
+        Err(e) => json!({"type": "text", "text": format!("[the picture at {path} could not be sent: {e}]")}),
+    }
+}
 
 /// What `claude` needs, before the profile's flags, to speak stream-json on stdin and stdout.
 pub const ARGS: &[&str] =
@@ -337,8 +352,27 @@ fn models(a: &Value) -> Vec<ModelChoice> {
         .filter(|m| !m.id.is_empty())
         .collect();
     let aliased = |m: &ModelChoice| m.id == "default" && all.iter().any(|o| o.id != "default" && !m.model.is_empty() && o.model == m.model);
-    all.iter().filter(|m| !aliased(m)).cloned().collect()
+    let mut kept: Vec<ModelChoice> = all.iter().filter(|m| !aliased(m)).cloned().collect();
+    for &(model, name, about) in OFFERED {
+        if !kept.iter().any(|m| m.model == model || m.id == model) {
+            kept.push(ModelChoice {
+                id: model.to_owned(),
+                model: model.to_owned(),
+                name: name.to_owned(),
+                about: about.to_owned(),
+                efforts: ["low", "medium", "high", "xhigh", "max"].map(str::to_owned).to_vec(),
+                effort: None,
+            });
+        }
+    }
+    kept
 }
+
+/// Models the picker and `spawn` offer for claude whether or not this Claude Code lists them yet (model id, name, line):
+/// a model released after the installed Claude Code, which `set_model` and `--model` take by its full id all the same.
+/// Once Claude Code lists one itself, its own entry is the one kept; drop it from here then.
+const OFFERED: &[(&str, &str, &str)] =
+    &[("claude-fable-5-2", "Fable 5.2", "The most capable; the default")];
 
 /// The context window a turn's `result` says its model has (den-claude's reading): `modelUsage[model].contextWindow`,
 /// else the widest window it names; 0 when it names none. What the turn filled is its last main-loop assistant message's
@@ -349,6 +383,62 @@ fn window(v: &Value, model: &str) -> u64 {
         .as_u64()
         .or_else(|| usage.as_object().into_iter().flat_map(|o| o.values()).filter_map(|m| m["contextWindow"].as_u64()).max())
         .unwrap_or(0)
+}
+
+/// A `rate_limit_event`'s `rate_limit_info` as the `plan` event: a window each of its `unifiedWindows`, shortest first
+/// (with none, the one window it is about, `rateLimitType` with its own `utilization`). A window warns once its status
+/// is `allowed_warning` or it is past its `surpassedThreshold` (else [`PlanWindow::WARN`]), and is limited once
+/// `rejected` or used up. None when it names no window with a utilization (an `allowed` line before any use).
+fn plan(info: &Value) -> Option<Body> {
+    let window = |key: &str, w: &Value| {
+        let used = w["utilization"].as_f64()?;
+        let status = w["status"].as_str().unwrap_or("");
+        let threshold = w["surpassedThreshold"].as_f64().unwrap_or(PlanWindow::WARN);
+        Some(PlanWindow {
+            name: window_name(key),
+            used,
+            resets_at: w["resetsAt"].as_u64(),
+            warn: status == "allowed_warning" || used >= threshold,
+            limited: status == "rejected" || used >= 1.0,
+        })
+    };
+    let mut keyed: Vec<(&str, PlanWindow)> =
+        info["unifiedWindows"].as_object().into_iter().flatten().filter_map(|(k, w)| Some((k.as_str(), window(k.as_str(), w)?))).collect();
+    if keyed.is_empty()
+        && let Some(k) = info["rateLimitType"].as_str()
+    {
+        keyed.extend(window(k, info).map(|w| (k, w)));
+    }
+    keyed.sort_by_key(|&(k, _)| (window_rank(k), k));
+    let windows: Vec<PlanWindow> = keyed.into_iter().map(|(_, w)| w).collect();
+    (!windows.is_empty()).then_some(Body::Plan { windows })
+}
+
+/// Where Claude's window `key` sorts among a plan's: the five-hour one, then the weekly ones, then any other.
+fn window_rank(key: &str) -> u8 {
+    match key {
+        "five_hour" => 0,
+        "seven_day" => 1,
+        k if k.starts_with("seven_day") => 2,
+        _ => 3,
+    }
+}
+
+/// Claude's window `key` as the status bar names it: `five_hour` is `5h`, `seven_day` `week`, a model's weekly
+/// window (`seven_day_opus`) `Opus week`, any other its key in words.
+fn window_name(key: &str) -> String {
+    match key {
+        "five_hour" => "5h".to_owned(),
+        "seven_day" => "week".to_owned(),
+        k => match k.strip_prefix("seven_day_") {
+            Some(m) => {
+                let mut c = m.chars();
+                let model: String = c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default();
+                format!("{} week", model.replace('_', " "))
+            }
+            None => k.replace('_', " "),
+        },
+    }
 }
 
 /// The tool's name as a person reads it: the harness REPL's MCP name is just `ts`.
@@ -390,6 +480,7 @@ impl super::Adapter for Claude {
             "assistant" => self.assistant(&v),
             "user" => self.from_user(&v),
             "result" => self.result(&v),
+            "rate_limit_event" => plan(&v["rate_limit_info"]).into_iter().collect(),
             _ => vec![],
         }
     }
@@ -402,8 +493,13 @@ impl super::Adapter for Claude {
         std::mem::take(&mut self.out)
     }
 
-    fn user(&mut self, text: &str) -> Vec<String> {
-        vec![json!({"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": text}]}}).to_string()]
+    fn user(&mut self, text: &str, images: &[String]) -> Vec<String> {
+        // Each picture before the words, as Claude Code's own paste puts them: an image block of its bytes.
+        let mut content: Vec<Value> = images.iter().map(|p| image_block(p)).collect();
+        if !text.is_empty() || content.is_empty() {
+            content.push(json!({"type": "text", "text": text}));
+        }
+        vec![json!({"type": "user", "message": {"role": "user", "content": content}}).to_string()]
     }
 
     fn interrupt(&mut self) -> Vec<String> {
@@ -423,5 +519,63 @@ impl super::Adapter for Claude {
             lines.push(self.ask(json!({"subtype": "apply_flag_settings", "settings": {"effortLevel": e}}), Asked::Effort(e.to_owned())));
         }
         Ok(lines)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chat::Adapter;
+
+    /// Claude's `rate_limit_event` lines (as a real session wrote them) are `plan` events: both windows, five-hour first,
+    /// the weekly one warned past its threshold; a line that names no window's use is none; a rejected window is limited.
+    #[test]
+    fn rate_limit_events_are_the_plan() {
+        let warned = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1794470400,"rateLimitType":"seven_day","utilization":0.78,"overageStatus":"rejected","overageDisabledReason":"org_level_disabled","isUsingOverage":false,"surpassedThreshold":0.75,"unifiedWindows":{"seven_day":{"utilization":0.78,"resetsAt":1794470400,"status":"allowed_warning","surpassedThreshold":0.75},"five_hour":{"utilization":0.05,"resetsAt":1794253800,"status":"allowed"}},"overageEnabled":false},"uuid":"2b7f270b-d730-4f58-9f26-5aa2a2df9756","session_id":"f088ac1a-54ed-4adf-bd6d-ca98cd560259"}"#;
+        let out = Claude::default().events(warned);
+        assert_eq!(
+            out,
+            vec![Body::Plan {
+                windows: vec![
+                    PlanWindow { name: "5h".into(), used: 0.05, resets_at: Some(1_794_253_800), warn: false, limited: false },
+                    PlanWindow { name: "week".into(), used: 0.78, resets_at: Some(1_794_470_400), warn: true, limited: false },
+                ],
+            }]
+        );
+        // An `allowed` line: no top-level utilization, its windows' own (an integer 0 among them).
+        let allowed = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1793884800,"rateLimitType":"five_hour","overageStatus":"rejected","overageDisabledReason":"org_level_disabled","isUsingOverage":false,"unifiedWindows":{"five_hour":{"utilization":0.01,"resetsAt":1793884800,"status":"allowed"},"seven_day":{"utilization":0,"resetsAt":1794470400,"status":"allowed"}}},"uuid":"fc0a6cc1-c225-4c68-935e-0271756090f5","session_id":"fe41695e-d6e4-4b78-ab47-6e966dfd33f6"}"#;
+        let Body::Plan { windows } = &Claude::default().events(allowed)[0] else { panic!("not a plan event") };
+        assert_eq!(windows.iter().map(|w| (w.name.as_str(), w.used, w.warn)).collect::<Vec<_>>(), [("5h", 0.01, false), ("week", 0.0, false)]);
+        // Without windows, the one it is about; with no use named, nothing.
+        let one = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1794253800,"rateLimitType":"five_hour","utilization":1.0}}"#;
+        let Body::Plan { windows } = &Claude::default().events(one)[0] else { panic!("not a plan event") };
+        assert_eq!((windows.len(), windows[0].name.as_str(), windows[0].limited, windows[0].warn), (1, "5h", true, true));
+        assert!(Claude::default().events(r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}"#).is_empty());
+        assert_eq!(window_name("seven_day_opus"), "Opus week");
+    }
+
+    /// A message with a picture is one user line whose content is the picture's bytes as an image block, then the words.
+    #[test]
+    fn a_picture_rides_as_an_image_block() {
+        let dir = std::env::temp_dir().join(format!("harness-claude-image-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("shot.png");
+        let bytes = b"\x89PNG\r\n\x1a\nrest of the picture";
+        std::fs::write(&png, bytes).unwrap();
+        let path = png.to_string_lossy().into_owned();
+        let lines = Claude::default().user("what is this?", std::slice::from_ref(&path));
+        let v: Value = serde_json::from_str(&lines[0]).unwrap();
+        let content = &v["message"]["content"];
+        assert_eq!(content[0]["type"], "image");
+        assert_eq!(content[0]["source"]["media_type"], "image/png");
+        use base64::Engine as _;
+        assert_eq!(content[0]["source"]["data"], base64::engine::general_purpose::STANDARD.encode(bytes));
+        assert_eq!(content[1], json!({"type": "text", "text": "what is this?"}));
+        // A picture gone by the time it is sent says so, naming it, rather than vanishing from the message.
+        std::fs::remove_file(&png).unwrap();
+        let gone: Value = serde_json::from_str(&Claude::default().user("", std::slice::from_ref(&path))[0]).unwrap();
+        assert!(gone["message"]["content"][0]["text"].as_str().unwrap().contains(&path));
+        assert_eq!(gone["message"]["content"].as_array().unwrap().len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

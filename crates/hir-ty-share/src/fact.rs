@@ -5,7 +5,7 @@
 //! - An integer or a float is whether it is signed, unsigned or a float, and its layout:
 //!   `u64` and `usize` have one fact on a 64-bit target, `u32` and `i32` do not (the layout's
 //!   scalar has its signedness). `bool`, `char`, `str` and `!` are their identity.
-//! - An ADT is its **shape** (`docs/v2/plan/lanes/polymorph.md`): whether it is a struct, an
+//! - An ADT is its **shape** (`docs/v2/plan/design/polymorph.md`): whether it is a struct, an
 //!   enum or a union, its `repr` (flags, integer, `align`, `packed`, scalable; not the field
 //!   shuffle seed, whose effect is in the layout's offsets), its layout, its number of variants,
 //!   each variant's discriminant and number of fields, and its fields' facts, with the
@@ -174,7 +174,7 @@ impl<'db> Cx<'db> {
 
     /// The fact of `ty`: one query per (type, environment), so a hit is one lookup. A field's
     /// fact is a query inside its ADT's or tuple's, so a miss nests one query per level of
-    /// `ty`, as deep as the program built it: each level runs with stack to spare (rule 17).
+    /// `ty`, as deep as the program built it: each level runs with stack to spare (rule 20).
     pub fn fact(&self, ty: Ty<'db>) -> Result<ContentId, Unshared> {
         stdx::ensure_sufficient_stack(|| {
             let ty = self.deeply_normalize(ty)?;

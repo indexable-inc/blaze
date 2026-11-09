@@ -1,6 +1,7 @@
 // The chat pane (src/app/chat.rs): a chat session's transcript over its agent's structured events, drawn as a chat, not
 // a terminal. The transcript is a ui.LazyList (only the rows in view exist, each as tall as its words); at the foot the
-// composer, one card: a ui.field.GrowingTextArea over a bar of controls (model and effort, context, send or stop).
+// composer, one card holding only what composes (a ui.field.GrowingTextArea and the pictures pasted into it), and under it
+// the chat's status bar (model and effort, context, how much of the plan is used).
 
 @tree ChildOf
 hn {
@@ -33,55 +34,59 @@ hn {
       Flex: {axis: Column, gap: 0, align: Center, justify: Start, wrap: false}
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
       Padding: {l: $chat_pad, r: $chat_pad, t: $chat_foot_pad_t, b: $chat_foot_pad_b}
-      // The composer: one card, the words over a bar of controls, as wide as the transcript's column. A press anywhere
-      // on it that no control takes gives the words the keys.
+      // What is running for this chat, over the composer while anything is (src/app/chat.rs fill_chat_activity): its
+      // turn's step, its commands, its sub-agents at work, the messages waiting for it; empty, it takes no room.
+      activity : ui.Row {
+        Flex: {axis: Row, gap: $chat_activity_gap, align: Center, justify: Start, wrap: true}
+        Size: {w: {kind: Grow, value: 1, min: 0, max: $chat_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      }
+      // The hover card of the activity chip under the pointer (hn.ChatActivityPop): out of the flow, over the chip.
+      activity_pop : ui.Node {
+        Overlay
+      }
+      // An aside's answer over the composer while it shows (hn.ChatAside, src/app/chat.rs fill_chat_aside); empty, it
+      // takes no room.
+      aside : ui.Column {
+        Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+        Size: {w: {kind: Grow, value: 1, min: 0, max: $chat_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      }
+      // The person's messages sent while the turn runs that the agent has not taken yet (hn.ChatQueued, src/app/chat.rs
+      // fill_chat_queued), right over the composer: they join the transcript as the agent takes them. Empty, no room.
+      queued : ui.Column {
+        Flex: {axis: Column, gap: $chat_queued_gap, align: Stretch, justify: Start, wrap: false}
+        Size: {w: {kind: Grow, value: 1, min: 0, max: $chat_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      }
+      // The composer: one card holding the words, as wide as the transcript's column. A press anywhere on it that no
+      // control takes gives the words the keys. While its draft starts with a space (an aside) it takes the aside's tint
+      // (src/app/chat.rs sets its Fill and Edge from hn.Theme.aside and aside_line).
       card : ui.Column {
         Fill: $tone_card
         Edge: {dark: $tone_line.dark, light: $tone_line.light}
         Shape: {radius: $chat_composer_radius, n: 4, border: 1, feather: 0}
-        Lift: {blur: $chat_composer_lift_blur, alpha: $chat_composer_lift_alpha, dy: $chat_composer_lift_dy}
         Cursor: {shape: Text}
         Pressable
         Action: {name: "chat:focus"}
         Flex: {axis: Column, gap: $chat_composer_gap, align: Stretch, justify: Start, wrap: false}
         Size: {w: {kind: Grow, value: 1, min: 0, max: $chat_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-        Padding: {l: $chat_composer_pad, r: $chat_composer_pad, t: $chat_composer_pad_t, b: $chat_composer_pad}
-        entry : ui.Row {
-          Flex: {axis: Row, gap: 0, align: Start, justify: Start, wrap: false}
+        Padding: {l: $chat_composer_pad, r: $chat_composer_pad, t: $chat_composer_pad_t, b: $chat_composer_pad_b}
+        // The `@` mention menu while the draft ends in an `@` word (src/app/chat/mention.rs): out of the flow, its plate
+        // placed above the card.
+        mention : ui.Node {
+          Overlay
+        }
+        // The words, under the pictures pasted into the message (hn.ChatAttach each, src/app/chat.rs fill_pictures): each
+        // thumbnail brings the space under it, so with none the strip takes no room and the card's spacing is as it was.
+        entry : ui.Column {
+          Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
           Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
           Padding: {l: $chat_composer_text_inset, r: $chat_composer_text_inset, t: 0, b: 0}
+          attach : ui.Row {
+            Flex: {axis: Row, gap: $chat_attach_gap, align: Start, justify: Start, wrap: true}
+            Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+          }
           // Grows with its words to most of the pane, then scrolls (src/app/chat.rs steps its FieldScroll).
           area : ui.field.GrowingTextArea {
             GrowLimit: {share: $textarea_grow_share, keep: $chat_input_keep}
-          }
-        }
-        // The controls (src/app/chat.rs and chat/pick.rs keep each slot, each only while it has something to say): the
-        // model and effort (hn.ChatPick) at the leading edge; the context meter (hn.ChatContext) and, while the agent works, its
-        // breathing ring (hn.ChatWorking) at the trailing one. No buttons: Return sends, Escape stops.
-        bar : ui.Row {
-          Cursor: {shape: Arrow}
-          Flex: {axis: Row, gap: $chat_bar_gap, align: Center, justify: Start, wrap: false}
-          Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $chat_bar_h, min: 0, max: 0}}
-          pick : ui.Row {
-            Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
-            Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-          }
-          spacer : ui.Spacer {}
-          meter : ui.Row {
-            Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
-            Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-          }
-          act : ui.Row {
-            Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
-            Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-          }
-          // The picker's menu while it is open: out of the row's flow, its plate placed above the control.
-          menu : ui.Node {
-            Overlay
-          }
-          // The context meter's popover while the pointer is on the ring or on it (src/app/chat/context.rs).
-          pop : ui.Node {
-            Overlay
           }
         }
       }
@@ -104,7 +109,7 @@ hn {
     Shape: {radius: $chat_effort_bar_radius, n: 4, border: 0, feather: 0}
     Size: {w: {kind: Fixed, value: $chat_effort_bar_w, min: 0, max: 0}, h: {kind: Fixed, value: $chat_effort_h, min: $chat_effort_h * $chat_effort_floor, max: 0}}
   }
-  // Den's model and effort picker, in the composer's bar (src/app/chat/pick.rs): one quiet control, the model's name, its
+  // Den's model and effort picker, in the chat's status bar (src/app/chat/pick.rs): one quiet control, the model's name, its
   // effort as a level meter (hn.ChatEffort) and a small chevron, muted, on a soft wash under the pointer, its words and
   // lit bars easing to the ink (pick.rs mixes hn.ChatControlInk's by the hover spring). The effort's name is the
   // control's tooltip and the menu's; an effort its model does not list (so no level to light) shows as words after the
@@ -165,6 +170,62 @@ hn {
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     }
   }
+  // The `@` mention menu (chat/mention.rs): ui.Menu's plate above the composer's card, chat_mention_w wide, its rows
+  // under `items` (hn.ChatMentionItem, or a ui.MenuNote saying why there are none). Instant: no grow or fade in or out,
+  // and it follows what is typed without a spring (ui.Menu less its Transition and Motion).
+  // The list (`list.items`) at the leading side, the highlighted place's preview (`preview`) past a hairline.
+  prefab ChatMention : ui.MenuPlate {
+    Placed
+    Windowed
+    Layer: {level: Overlay}
+    Side: {edge: Top, dx: 0, dy: $menu_gap}
+    Flex: {axis: Row, gap: $menu_pad, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    list : ui.Column {
+      Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Fixed, value: $chat_mention_w, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      items : ui.Column {
+        Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+        Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      }
+    }
+    seam : hn.Seam {}
+    preview : ui.Column {
+      Clip
+      Flex: {axis: Column, gap: $inline_peek_gap, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Fixed, value: $chat_mention_preview_w, min: 0, max: 0}, h: {kind: Fixed, value: $chat_mention_preview_h, min: 0, max: 0}}
+      Padding: {l: $chat_mention_preview_pad, r: $chat_mention_preview_pad, t: $chat_mention_preview_pad, b: $chat_mention_preview_pad}
+    }
+  }
+  // The preview's path, quiet, one line (cut in its middle).
+  prefab ChatMentionHead : ui.LineMiddle, Muted {
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    TextStyle: {size: $size_peek_meta, line: $line_peek_meta, role: 0, bold: 0}
+  }
+  // A file's first lines in the code face, coloured by its language (chat/mention.rs sets Highlight), never wrapped: the box cuts them.
+  prefab ChatMentionCode : ui.Words {
+    Fill: $tone_ink
+    FixedSize: {h: true, v: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    TextStyle: {size: $size_code, line: $line_chat_code, role: 9, bold: 0}
+  }
+  // A picture, drawn whole at the size chat/mention.rs fits it to, a little rounded.
+  prefab ChatMentionImage : ui.Node {
+    Picture: {handle: ""}
+    Clip
+    Shape: {radius: $inline_peek_radius, n: 4, border: 0, feather: 0}
+  }
+  // A place: its kind's icon (files.rs's drawing) before its name, its folder quiet at the end (`about`, cut first).
+  prefab ChatMentionItem : ui.MenuItem {
+    lead {
+      icon : ui.Art {
+        Size: {w: {kind: Fixed, value: $chat_mention_icon, min: 0, max: 0}, h: {kind: Fixed, value: $chat_mention_icon, min: 0, max: 0}}
+      }
+      after : ui.Node {
+        Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+      }
+    }
+  }
   // The models, searchable (search_menu.flecs's filter over `items`): each agent kind's under its head led by its maker's
   // mark (ui.MenuHeadMarked), a row each with its name and its version quiet after it (ui.MenuItem's `meta`), the one
   // the chat runs ticked; where nothing can be chosen a ui.MenuNote says why. Under them, the line about the row the
@@ -178,9 +239,12 @@ hn {
       Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     }
+    // Always chat_pick_detail_h tall (two lines of it), whatever the line says or whether there is one: the menu keeps
+    // its height as the highlight moves, so nothing in it jumps.
     detail : ui.Column {
+      Clip
       Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
-      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_detail_h, min: 0, max: 0}}
     }
   }
   prefab ChatPickDetail : ui.Row {
@@ -204,10 +268,12 @@ hn {
   }
 
   // The context meter (den's): a small ring filling as the conversation fills its model's window, in a square that takes
-  // the pointer; muted, then hn.ChatContextTone's warn from 80% and full from 95% (pick.rs). Under the pointer,
-  // hn.ChatContextPop (widgets/context.flecs) says how full (the percentage at its head) and with what.
+  // the pointer; muted, then hn.ChatContextTone's warn from 80% (the strong ink: brighter, not a colour) and full from 95% (the
+  // error ink, the one colour) (pick.rs). Under the pointer,
+  // hn.ChatContextPop (widgets/context.flecs) shows how full as a donut of its parts; a press opens it to every part.
   prefab ChatContext : ui.Row {
     Hoverable
+    Pressable
     Cursor: {shape: Arrow}
     Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
     Size: {w: {kind: Fixed, value: $chat_bar_h, min: 0, max: 0}, h: {kind: Fixed, value: $chat_bar_h, min: 0, max: 0}}
@@ -229,8 +295,37 @@ hn {
   }
   prefab ChatContextTone {
     ok { Fill: $tone_ink_muted }
-    warn { Fill: $tone_warning }
+    warn { Fill: $tone_ink_strong }
     full { Fill: $tone_error }
+  }
+
+  // How much of the person's plan is used (src/app/chat/plan.rs), after the context meter in the status bar: the window
+  // nearest its limit as a small bar filling (`track.fill`, the track the ink faintly, as the ring's) and quiet words
+  // ("79% of week"); muted, then hn.ChatContextTone's warn once the agent warns of it and full once it refuses for it.
+  // Its tooltip says every window, how much of each is used and when each resets, and that the plan is the account's,
+  // not this chat's.
+  prefab ChatPlan : ui.Row {
+    Hoverable
+    Cursor: {shape: Arrow}
+    Tooltip: {text: ""}
+    Flex: {axis: Row, gap: $chat_plan_gap, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $chat_bar_h, min: 0, max: 0}}
+    Padding: {l: $chat_plan_lead, r: $chat_plan_trail, t: 0, b: 0}
+    track : ui.Row {
+      Fill: $tone_ink_faint
+      Shape: {radius: $chat_plan_meter_radius, n: 4, border: 0, feather: 0}
+      Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Fixed, value: $chat_plan_meter_w, min: 0, max: 0}, h: {kind: Fixed, value: $chat_plan_meter_h, min: 0, max: 0}}
+      fill : ui.Node {
+        Fill: $tone_ink_muted
+        Shape: {radius: $chat_plan_meter_radius, n: 4, border: 0, feather: 0}
+        Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $chat_plan_meter_h, min: 0, max: 0}}
+      }
+    }
+    words : ui.Line {
+      Fill: $tone_ink_muted
+      TextStyle: {size: $size_chrome, line: $line_chrome, role: 0, bold: 0}
+    }
   }
 
   // While the agent works, a ring at the bar's trailing edge breathing gently in the bar's muted ink (src/app/chat.rs
@@ -252,10 +347,19 @@ hn {
 
   // What the person sent: their words in a bubble at the trailing edge, as wide as they are up to $chat_bubble_max_w,
   // wrapping past it (and past the row's room in a narrow pane).
+  // A finished turn folds its steps away: under the pointer, a quiet button before the bubble shows them (or hides them
+  // again; hn.ChatTurnSteps in `steps`, src/app/chat.rs fill_row), so the steps are a press away, never in the way.
   prefab ChatUser : ui.Row {
+    HoverGroup
     Flex: {axis: Row, gap: 0, align: Start, justify: End, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     Padding: {l: $chat_bubble_lead, r: 0, t: $chat_gap_turn - $chat_block_half, b: $chat_gap_reply - $chat_block_half}
+    steps : ui.Row {
+      Flex: {axis: Row, gap: 0, align: Center, justify: End, wrap: false}
+      Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      // Centred on the bubble's first line.
+      Padding: {l: 0, r: $chat_turn_steps_gap, t: $chat_bubble_pad_y + $line_chat_bubble / 2 - $chat_turn_steps / 2, b: 0}
+    }
     bubble : ui.Bubble {
       Fill: $tone_raised
       Padding: {l: $chat_bubble_pad_x, r: $chat_bubble_pad_x, t: $chat_bubble_pad_y, b: $chat_bubble_pad_y}
@@ -266,6 +370,259 @@ hn {
         Fill: $tone_ink
         TextStyle: {size: $size_chat, line: $line_chat_bubble, role: 0, bold: 0}
       }
+    }
+  }
+
+  // An aside's answer (src/app/chat.rs fill_chat_aside): a question asked of a fork of the conversation (Return on a
+  // draft that starts with a space), never part of it. A card over the composer in the aside's tint (tone_aside, the
+  // composer's own while a draft is one), chat_aside_gap above it: its head the quiet word "Aside", the working ring
+  // (hn.ChatAsideWorking, in `head.act`) while it asks and a close button (Escape closes it too); its body the answer's words
+  // as the transcript draws them (hn.ChatProse and its kin), or the question in a quiet note while it asks, or the
+  // error naming what failed (hn.ChatError). Gone once closed; a new aside takes its place.
+  prefab ChatAside : ui.Column {
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 0, r: 0, t: 0, b: $chat_aside_gap}
+    plate : ui.Column {
+      Fill: $tone_aside
+      Edge: {dark: $tone_aside_line.dark, light: $tone_aside_line.light}
+      Shape: {radius: $chat_aside_radius, n: 4, border: 1, feather: 0}
+      Cursor: {shape: Arrow}
+      Flex: {axis: Column, gap: $chat_aside_head_gap, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      Padding: {l: $chat_aside_pad_x, r: $chat_aside_pad_x, t: $chat_aside_pad_t, b: $chat_aside_pad_b}
+      head : ui.Row {
+        Flex: {axis: Row, gap: $chat_bar_gap, align: Center, justify: Start, wrap: false}
+        Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $chat_bar_h, min: 0, max: 0}}
+        label : ui.Line {
+          Text: {s: "Aside"}
+          Fill: $tone_ink_muted
+          TextStyle: {size: $size_chrome, line: $line_chrome, role: 0, bold: 0}
+        }
+        act : ui.Row {
+          Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+          Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+        }
+        spacer : ui.Spacer {}
+        close : ui.IconButton {
+          Action: {name: ""}
+          Tooltip: {text: "Close  esc"}
+          AlignSelf: {align: Center}
+          Size: {w: {kind: Fixed, value: $chat_aside_close, min: 0, max: 0}, h: {kind: Fixed, value: $chat_aside_close, min: 0, max: 0}}
+          icon : ui.Symbol {
+            Size: {w: {kind: Fixed, value: $chat_aside_icon, min: 0, max: 0}, h: {kind: Fixed, value: $chat_aside_icon, min: 0, max: 0}}
+          }
+        }
+      }
+      body : ui.Column {
+        Cursor: {shape: Text}
+        Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+        Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      }
+    }
+  }
+
+  // An aside's working ring (in its head while it is asked): the composer's, saying what Escape does here.
+  prefab ChatAsideWorking : hn.ChatWorking {
+    Tooltip: {text: "Asking aside  esc to close"}
+  }
+
+  // The words of a message sent with pictures, under them: no turn's gap over it (the pictures took it).
+  prefab ChatUserUnder : hn.ChatUser {
+    Padding: {l: $chat_bubble_lead, r: 0, t: 0, b: $chat_gap_reply - $chat_block_half}
+  }
+
+  // A picture attached to the message being written: its thumbnail (sized by fill_attach to chat_attach_h tall at its
+  // aspect), rounded, with a remove button over its top trailing corner on a raised plate so it reads over any picture.
+  // The remove button shows only while the pointer is on the picture (HoverGroup on it, HoverShow on the button and its
+  // glyph).
+  prefab ChatAttach : ui.ZStack {
+    HoverGroup
+    Cursor: {shape: Arrow}
+    Flex: {axis: Z, gap: 0, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 0, r: 0, t: 0, b: $chat_attach_below}
+    pic : ui.Node {
+      Picture: {handle: ""}
+      Clip
+      Shape: {radius: $chat_attach_radius, n: 4, border: 0, feather: 0}
+    }
+    corner : ui.Row {
+      Flex: {axis: Row, gap: 0, align: Start, justify: End, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+      Padding: {l: 0, r: $chat_attach_inset, t: $chat_attach_inset, b: 0}
+      remove : ui.IconButton {
+        HoverShow: {row: 0, keep: false, away: false}
+        Fill: $tone_raised
+        Shape: {radius: $chat_attach_remove / 2, n: 2, border: 0, feather: 0}
+        Size: {w: {kind: Fixed, value: $chat_attach_remove, min: 0, max: 0}, h: {kind: Fixed, value: $chat_attach_remove, min: 0, max: 0}}
+        Tooltip: {text: "Remove picture"}
+        icon : ui.Symbol {
+          HoverShow: {row: 0, keep: false, away: false}
+          Size: {w: {kind: Fixed, value: $chat_attach_icon, min: 0, max: 0}, h: {kind: Fixed, value: $chat_attach_icon, min: 0, max: 0}}
+        }
+      }
+    }
+  }
+  // A sent message's pictures, over its bubble at the trailing edge (Row::Pictures): the same thumbnails, larger, with
+  // no remove button.
+  prefab ChatSentPictures : ui.Row {
+    Flex: {axis: Row, gap: $chat_attach_gap, align: Start, justify: End, wrap: true}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: $chat_bubble_lead, r: 0, t: $chat_gap_turn - $chat_block_half, b: $chat_attach_gap}
+  }
+  prefab ChatSentPicturesLast : hn.ChatSentPictures {
+    Padding: {l: $chat_bubble_lead, r: 0, t: $chat_gap_turn - $chat_block_half, b: $chat_gap_reply - $chat_block_half}
+  }
+  prefab ChatSentPicture : ui.Node {
+    Picture: {handle: ""}
+    Clip
+    Shape: {radius: $chat_attach_radius, n: 4, border: 0, feather: 0}
+  }
+
+  // A pull request or issue said on its own in the agent's words: the component's block form, its card in the flow of
+  // the words (src/app/chat.rs Row::RefCard). The same lines as its hover card (chat/peek.rs fill_card: where it is,
+  // its title, its state and checks, who and how much, its description's start) on a solid card, chat_ref_w wide at
+  // most; in the flow, so solid: glass is only for what floats.
+  prefab ChatRefCard : ui.Row {
+    Flex: {axis: Row, gap: 0, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 0, r: 0, t: $chat_block_half, b: $chat_block_half}
+    card : ui.Column {
+      Fill: $tone_card
+      Edge: {dark: $tone_line.dark, light: $tone_line.light}
+      Shape: {radius: $inline_peek_radius, n: 4, border: 1, feather: 0}
+      Flex: {axis: Column, gap: $inline_peek_gap, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: $chat_ref_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      Padding: {l: $inline_peek_pad, r: $inline_peek_pad, t: $inline_peek_pad, b: $inline_peek_pad}
+    }
+  }
+
+  // One thing running for the chat, over its composer (src/app/chat.rs fill_chat_activity): a glyph and a few words in
+  // the chrome's size and the muted ink, on a quiet plate that brightens under the pointer; a command or a sub-agent
+  // selects it in the sidebar on a press (its Action), the turn's step and the queue only say. The strip's space under
+  // it (chat_activity_below) is set only while it holds items, so an empty strip takes none.
+  // Its glyph says how the thing stands (the host copies a hn.chat_status entry onto `icon`: running breathes, waiting
+  // is a hollow ring, done a check, failed a cross in the error ink); its words say what it is doing and, while it runs,
+  // for how long ("blaze check · 6 min"), ticking. Under the pointer its card (hn.ChatActivityPop) says more.
+  prefab ChatActivityItem : ui.Row {
+    Hoverable
+    Pressable
+    Cursor: {shape: Arrow}
+    Fill: $tone_clear
+    HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0, radius: -1}
+    Shape: {radius: $chat_activity_radius, n: 4, border: 0, feather: 0}
+    Flex: {axis: Row, gap: $chat_activity_icon_gap, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: $chat_activity_max_w}, h: {kind: Fixed, value: $chat_activity_h, min: 0, max: 0}}
+    Padding: {l: $chat_activity_pad, r: $chat_activity_pad, t: 0, b: 0}
+    icon : ui.Symbol {
+      Fill: $tone_ink_muted
+      Size: {w: {kind: Fixed, value: $chat_activity_icon, min: 0, max: 0}, h: {kind: Fixed, value: $chat_activity_icon, min: 0, max: 0}}
+    }
+    words : ui.Lead {
+      Fill: $tone_ink_muted
+      TextStyle: {size: $size_chrome, line: $line_chrome, role: 0, bold: 0}
+    }
+    // How long it has run, after its words, never cut (the words cut first).
+    took : ui.Line {
+      Fill: $tone_ink_faint
+      FixedSize: {h: true, v: false}
+      TextStyle: {size: $size_chrome, line: $line_chrome, role: 0, bold: 0}
+    }
+  }
+
+  // An activity chip's hover card (src/app/chat.rs fill_activity_pop): a ui.Menu (glass, its own window) over the chip,
+  // a column of lines the host keeps by key: the head (what it is), a meta line (model and effort, how long), then what
+  // it is doing or said last (a few lines), or the steps the turn's cells took so far, one a line.
+  prefab ChatActivityPop : ui.Menu {
+    Side: {edge: Top, dx: 0, dy: $menu_gap}
+    Flex: {axis: Column, gap: $chat_activity_pop_gap, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Fixed, value: $chat_activity_pop_w, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: $chat_activity_pop_pad, r: $chat_activity_pop_pad, t: $chat_activity_pop_pad, b: $chat_activity_pop_pad}
+  }
+  prefab ChatActivityPopHead : ui.Lead, Strong {
+    TextStyle: {size: $size_peek_body, line: $line_peek_title, role: 0, bold: 1}
+  }
+  prefab ChatActivityPopMeta : ui.Words, Muted {
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    TextStyle: {size: $size_peek_meta, line: $line_peek_meta, role: 0, bold: 0}
+  }
+  prefab ChatActivityPopText : ui.Words, Ink {
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    TextStyle: {size: $size_peek_body, line: $line_peek_meta, role: 0, bold: 0}
+  }
+  // A block of what it said last: the transcript's inline markdown (hn.ChatProse's MarkdownText: strong words, code,
+  // a path's or a pull request's chip), at the card's size.
+  prefab ChatActivityPopSaid : ui.Words, Ink {
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    MarkdownText: {chip_dark: $tone_wash.dark, chip_light: $tone_wash.light,
+      link_dark: $tone_link.dark, link_light: $tone_link.light,
+      code_dark: $tone_code_ink.dark, code_light: $tone_code_ink.light,
+      strong_dark: $tone_ink_strong.dark, strong_light: $tone_ink_strong.light, chip_radius: $chat_code_radius}
+    TextStyle: {size: $size_peek_body, line: $line_peek_meta, role: 0, bold: 0}
+  }
+  // One step a cell took, one line: its kind's glyph (hn.StepKind), its verb in the UI's words ("Ran", "Read"), then
+  // what it was done to in the code face, a notch smaller and muted (a command, a path: src/app/chat.rs StepWords),
+  // which gives up its room first: a path cut in its middle so its file shows, a command at its end.
+  prefab ChatActivityPopStep : ui.Row {
+    Flex: {axis: Row, gap: $chat_activity_icon_gap, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    icon : ui.Symbol {
+      Fill: $tone_ink_muted
+      Size: {w: {kind: Fixed, value: $chat_activity_icon, min: 0, max: 0}, h: {kind: Fixed, value: $chat_activity_icon, min: 0, max: 0}}
+    }
+    words : ui.Line, Ink {
+      LayoutPriority: {value: 1}
+      TextStyle: {size: $size_peek_body, line: $line_peek_meta, role: 0, bold: 0}
+    }
+    what : ui.Lead, Muted {
+      TextStyle: {size: $size_code, line: $line_peek_meta, role: 9, bold: 0}
+    }
+  }
+
+  // A message sent while the turn runs, waiting for the agent to take it: the person's bubble at the trailing edge, its
+  // ground faded (chat_queued_fade) and its words muted, "Queued" and a clock before it, so it reads as not yet sent on.
+  prefab ChatQueued : ui.Row {
+    Flex: {axis: Row, gap: $chat_activity_icon_gap, align: Center, justify: End, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: $chat_bubble_lead, r: 0, t: 0, b: 0}
+    Cursor: {shape: Arrow}
+    Tooltip: {text: "Queued: the agent takes it at its next step"}
+    icon : ui.Symbol {
+      Icon: {glyph: ""}
+      Fill: $tone_ink_faint
+      Size: {w: {kind: Fixed, value: $chat_activity_icon, min: 0, max: 0}, h: {kind: Fixed, value: $chat_activity_icon, min: 0, max: 0}}
+    }
+    label : ui.Line {
+      Text: {s: "Queued"}
+      Fill: $tone_ink_faint
+      FixedSize: {h: true, v: false}
+      TextStyle: {size: $size_chrome, line: $line_chrome, role: 0, bold: 0}
+    }
+    bubble : ui.Bubble {
+      Fill: $tone_raised
+      Pose: {dx: 0, dy: 0, shrink: 0, fade: $chat_queued_fade, cut: 0}
+      Padding: {l: $chat_bubble_pad_x, r: $chat_bubble_pad_x, t: $chat_bubble_pad_y, b: $chat_bubble_pad_y}
+      Shape: {radius: $chat_bubble_radius, n: 4, border: 0, feather: 0}
+      Size: {w: {kind: Fit, value: 0, min: 0, max: $chat_bubble_max_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      text : ui.Words {
+        Fill: $tone_ink
+        TextStyle: {size: $size_chat, line: $line_chat_bubble, role: 0, bold: 0}
+      }
+    }
+  }
+
+  // A finished turn's steps button, before the person's bubble while the pointer is on its row (HoverShow on it and on
+  // its glyph: a node's hover fade is its own, not its subtree's): a list glyph; a press shows the turn's steps under it, or folds them again (its Action and Tooltip, from the host).
+  prefab ChatTurnSteps : ui.IconButton {
+    HoverShow: {row: 0, keep: false, away: false}
+    AlignSelf: {align: Center}
+    Size: {w: {kind: Fixed, value: $chat_turn_steps, min: 0, max: 0}, h: {kind: Fixed, value: $chat_turn_steps, min: 0, max: 0}}
+    Padding: {l: 0, r: 0, t: 0, b: 0}
+    icon : ui.Symbol {
+      HoverShow: {row: 0, keep: false, away: false}
+      Icon: {glyph: ""}
+      Size: {w: {kind: Fixed, value: $chat_turn_steps_icon, min: 0, max: 0}, h: {kind: Fixed, value: $chat_turn_steps_icon, min: 0, max: 0}}
     }
   }
 
@@ -363,6 +720,23 @@ hn {
       MarkdownText: {chip_dark: $tone_wash.dark, chip_light: $tone_wash.light,
         link_dark: $tone_link.dark, link_light: $tone_link.light,
         code_dark: $tone_code_ink.dark, code_light: $tone_code_ink.light, chip_radius: $chat_code_radius}
+      TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
+    }
+  }
+
+  // A displayed formula ($$…$$ or \[…\] on lines of their own, a ```math fence): its words are the formula alone
+  // (src/app/chat.rs sets them as $$…$$, inline markdown typesets it in display style), hugging it, centred in the column.
+  prefab ChatMath : ui.Row {
+    Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 0, r: 0, t: $chat_block_half, b: $chat_block_half}
+    text : ui.Words {
+      Fill: $tone_ink
+      Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      MarkdownText: {chip_dark: $tone_wash.dark, chip_light: $tone_wash.light,
+        link_dark: $tone_link.dark, link_light: $tone_link.light,
+        code_dark: $tone_code_ink.dark, code_light: $tone_code_ink.light,
+        strong_dark: $tone_ink_strong.dark, strong_light: $tone_ink_strong.light, chip_radius: $chat_code_radius}
       TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
     }
   }

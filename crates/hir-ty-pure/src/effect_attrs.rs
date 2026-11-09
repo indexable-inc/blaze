@@ -1,5 +1,5 @@
 //! `#[blaze::nopanic]`, `#[blaze::noalloc]` and `#[blaze::nonblocking]`
-//! (docs/v2/plan/lanes/effects.md): their [`EffectDef`]s, and the rules and tables the walk
+//! (docs/v2/plan/design/effects.md): their [`EffectDef`]s, and the rules and tables the walk
 //! ([`crate::walk`]) asks for the kinds of a site: an `Assert` ([`assert_rule`]), a method of an
 //! allocator ([`allocator_rule`]), a foreign function ([`foreign_kinds`]), inline assembly
 //! ([`asm_kinds`]), an intrinsic ([`intrinsic_kinds`]) and a function of a library outside the
@@ -11,7 +11,7 @@
 //! instance's arguments substituted and references taken off, is alloc's `Global` or std's
 //! `System`, the global heap ([`Rule::Alloc`]); every method of a `GlobalAlloc` impl is
 //! [`Rule::Alloc`]. So `Vec::new_in(frame).push(x)` reaches `<&Frame as Allocator>::allocate`,
-//! `AllocIn`, which `noalloc` allows (AGENTS.md rule 9's proof), and `Vec::new().push(x)` reaches
+//! `AllocIn`, which `noalloc` allows (AGENTS.md rule 11's proof), and `Vec::new().push(x)` reaches
 //! `<Global as Allocator>::allocate`, `Alloc`, which it refuses. By type, never by data flow; the
 //! allocator's own body is not walked.
 

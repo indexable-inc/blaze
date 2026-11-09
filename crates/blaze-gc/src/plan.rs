@@ -1,4 +1,4 @@
-//! The collector's core (AGENTS.md rule 12): a synchronous state machine. It reads time only from
+//! The collector's core (AGENTS.md rule 14): a synchronous state machine. It reads time only from
 //! [`Collector::advance_clock`], does no IO, and hands back [`Decision`]s
 //! ([`Collector::take_decisions`]) and when it next wants the clock ([`Collector::next_deadline`]).
 //!
@@ -10,7 +10,7 @@
 //! ask for) and by a deadline on the injected clock, and ends in an [`Outcome`]: done, or stopped
 //! naming the phase, why, and how far it got.
 //!
-//! Every list it hands out is sorted by construction (rule 22): the same inventory, roots and
+//! Every list it hands out is sorted by construction (rule 25): the same inventory, roots and
 //! clock give the same decisions, byte for byte.
 //!
 //! Runs are paced ([`crate::pace`]): each is a slice, whose steps, bytes and scan width scale
@@ -112,7 +112,7 @@ impl Clock {
 /// `wall_ns` held within [`CLOCK_SLACK_NS`] of `anchor`'s wall time plus what the boot clock
 /// (`boot_ns`) says passed since it, and how far ahead of that it was or behind it. Behind is
 /// bounded too: a clock set back would otherwise hold every deadline back by as much
-/// (AGENTS.md rule 15). A clock set back is never re-anchored to: the collector would wait out
+/// (AGENTS.md rule 18). A clock set back is never re-anchored to: the collector would wait out
 /// the step with a run under way.
 fn bounded((wall, at): (u64, u64), wall_ns: u64, boot_ns: u64) -> (u64, u64, u64) {
     let expected = wall.saturating_add(boot_ns.saturating_sub(at));

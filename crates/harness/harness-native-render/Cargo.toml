@@ -33,7 +33,6 @@ harness-native-ui-look-api = { path = "../harness-native-ui-look-api" }
 harness-native-ui-text-api = { path = "../harness-native-ui-text-api" }
 harness-native-ui-inline = { path = "../harness-native-ui-inline" }
 harness-native-ui-motion-api = { path = "../harness-native-ui-motion-api" }
-harness-native-ui-spring-api = { path = "../harness-native-ui-spring-api" }
 harness-native-ui-draw-api = { path = "../harness-native-ui-draw-api" }
 harness-native-ui-draw = { path = "../harness-native-ui-draw" }
 bytemuck = { version = "1", features = ["derive"] }
@@ -45,6 +44,13 @@ read-fonts = "=0.45.0"
 icu_segmenter = "=2.3.0"
 icu_properties = "=2.3.0"
 unicode-bidi = "=0.3.18"
+# LaTeX math (math.rs): RaTeX, a pure-Rust port of KaTeX's parser and layout, gives a display list of positioned
+# glyphs, rules and outlines that the painter draws itself. Pinned exactly: it is 0.x and its layout moves between patch releases.
+# Only the four crates the typesetter's API is in are named; their own (ratex-lexer and a few small ones) come with them.
+ratex-types = "=0.1.14"
+ratex-font = "=0.1.14"
+ratex-parser = "=0.1.14"
+ratex-layout = "=0.1.14"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

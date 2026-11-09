@@ -1,6 +1,6 @@
 ---
 name: testing
-description: "How blaze tests its own code, the one home for it: few tests, each for hard-to-verify logic behind a stable interface; property tests with Hegel (vendor/hegeltest, imported as `hegel`); deterministic simulation tests (DST) on blaze-core's seeded `sim::Sim` (virtual clock, shuffled completions, failure injection, crashes that tear unsynced writes), moving to Hegel's own `hegel::sim`; an invariant oracle with planted-bug controls and seed replay; sans-IO cores as the precondition; round-trip tests for persisted state; testing a causal claim by removing the cause. Proof for concurrent, durable, crash-recovering, billing and data-deletion code is a DST, never a code review. Load before writing or changing a test, before changing anything concurrent, persisted, crash-recovering, billing or data-deleting (the store, the daemon image, the profile history, a lock-free structure, a ring), and before claiming such code is correct."
+description: "How blaze tests its own code, the one home for it: few tests, each for hard-to-verify logic behind a stable interface; property tests with Hegel (vendor/hegeltest, imported as `hegel`); deterministic simulation tests (DST) on blaze-core's seeded `sim::Sim` (virtual clock, shuffled completions, failure injection, crashes that tear unsynced writes), moving to Hegel's own `hegel::sim`; an invariant oracle with planted-bug controls and seed replay; sans-IO cores as the precondition; round-trip tests for persisted state; testing a causal claim by removing the cause. What a persisted type is and where memory lives are the `memory-and-data` skill. Proof for concurrent, durable, crash-recovering, billing and data-deletion code is a DST, never a code review. Load before writing or changing a test, before changing anything concurrent, persisted, crash-recovering, billing or data-deleting (the store, the daemon image, the profile history, a lock-free structure, a ring), and before claiming such code is correct."
 ---
 
 # Testing blaze
@@ -15,11 +15,11 @@ hold. Pin a load-bearing one with a test named for the property.
 
 ## persisted-state-round-trips (rule 26)
 
-Anything blaze persists (the daemon image, the store, the plane's history) has a test that restores
-it and checks the result equals a fresh build byte for byte, and a budget for restart to first
-answer. A restore that silently starts empty is a failure the daemon reports, naming why. A format
-that is written while blaze runs and read after a crash also gets a DST (`dst-not-review`) that
-crashes it at every point and checks the restore.
+Anything blaze persists (the daemon image, the store, the plane's history; what a persisted value
+is, is `outputs-are-records`) has a test that restores it and checks the result equals a fresh build
+byte for byte, and a budget for restart to first answer. A restore that silently starts empty is a
+failure the daemon reports, naming why. A format that is written while blaze runs and read after a
+crash also gets a DST (`dst-not-review`) that crashes it at every point and checks the restore.
 
 ## dst-not-review (rule 43)
 
@@ -33,6 +33,26 @@ controls the oracle must catch and a failing seed that replays. A code review is
 such code is right: it finds candidates, and each one it finds becomes a case the DST must catch
 before the fix lands. A change to such code without a DST that covers it is unfinished, whoever
 reviewed it.
+
+## invariants-are-stated (rule 53)
+
+What code must always do is written once, in blaze, and every check reads the same text. A contract
+(`requires`, `ensures`) says what one call does. A reference model is a small, pure, sequential
+implementation of what a component means, an ordinary type in the crate under `/// The reference
+model:`. `/// The invariant:` goes on the test whose oracle checks an invariant, and `/// The
+refinement:` on the test that runs an implementation against its model (or another implementation)
+and compares. Each needs a control in the same file, a test named `the_oracle_catches_<the planted
+bug>`. The statement then climbs a ladder without being rewritten: tested (a property test),
+simulated (the deterministic simulation with faults and crashes), model-checked (every interleaving
+to a bound), proved (Lean, from the same contract and model; say it as `/// The invariant (proved:
+<proof file>):`). Durable, concurrent and crash-recovering code is at least simulated; prove the
+sans-IO cores and what must never be wrong; a disagreement between two levels is a bug in one of
+them. `harness/v2/invariants.py` collects every statement with its level into
+`docs/v2/plan/invariants.md` (`write`) and fails the gate (`check`) when one has no control, names a
+missing proof, or the list is stale. Before changing or regenerating code, read the invariants its
+crate states: they are what the new code is judged against.
+
+See [docs/v2/plan.md#11-proof-by-check-not-by-review](../../../docs/v2/plan.md#11-proof-by-check-not-by-review).
 
 <!-- End of the generated rules. Hand-written notes follow. -->
 
@@ -106,6 +126,15 @@ smallest run that still fails, and replays it exactly.
   lock of a file; a crash lets every lock go, another process's too.
 - `program` for spawned processes (a memory limit kills, as a cgroup does), `dial`/`peer_*` for a
   peer outside the simulation.
+- Reads into and writes from memory the asker owns (`Effect::ReadInto`, `Effect::WriteFrom`),
+  carried out against the registered memory itself (`blaze_core::Memory` for a test's own): a
+  read scribbles its span with `sim::SCRIBBLE` at submit and fills it at completion, so a
+  reader of a span in flight sees the scribble; a write takes its bytes from memory at
+  completion, so memory changed in flight is what lands; a failed write, and one in flight at a
+  crash, lands any of its 512-byte sectors, and a crash tears unsynced writes from memory by
+  sector. Targeted: `hold_reads`/`release_reads`, `fail_reads`, `short_reads`, and `rot` (a
+  block changed on disk under what was synced). `crates/blaze-core/src/sim/pages.rs` is the
+  worked example: a pool-shaped page store, its oracle, five planted bugs and seed replay.
 
 Examples: `crates/blaze-cas/src/tests/model_check.rs` (Hegel draws the store's operation
 sequence and the `Sim` seed, checks it against a `BTreeMap`) and the crash tests in

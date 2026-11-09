@@ -1,4 +1,4 @@
-//! The kernel: blaze v2's compute steps from MIR down (docs/v2/plan/lanes/kernel.md).
+//! The kernel: blaze v2's compute steps from MIR down (docs/v2/plan/design/kernel.md).
 //!
 //! A step is a registered, pure function of its input ([`Step`], [`Compute`]). It sees the
 //! world only through [`Reads`], which records each read it makes: its name (a [`Read`], a kind
@@ -19,9 +19,9 @@
 //!   in a bounded chain of slots under its identity ([`MOST_SHAPES`]). Lookup hashes each
 //!   shape's reads now and probes the entry those hashes name.
 //! - **Refusals, not overwrites.** Two values under one identity and set of reads is a
-//!   [`KernelError::Conflict`] (rule 18). A run whose read failed, or which saw two hashes for
+//!   [`KernelError::Conflict`] (rule 21). A run whose read failed, or which saw two hashes for
 //!   one read, keeps nothing.
-//! - **Deterministic** (rule 22): an entry keeps its reads sorted by kind and key, each once.
+//! - **Deterministic** (rule 25): an entry keeps its reads sorted by kind and key, each once.
 //! - **Checked** (lane verify, `blaze_store_check`): a hit that `BLAZE_VERIFY_STORE` samples is
 //!   computed again with fresh reads, and it must make the same reads and the same bytes.
 
@@ -52,7 +52,7 @@ pub use crate::why::{Miss, Missed, Part};
 
 /// The most shapes one identity's chain holds. A step whose reads differ by shape more often
 /// than this reads too much of what varies, so its keys should be split. Reaching the bound is
-/// [`KernelError::TooManyShapes`], never an endless walk (rule 15).
+/// [`KernelError::TooManyShapes`], never an endless walk (rule 18).
 pub const MOST_SHAPES: u32 = 1024;
 
 /// Every step's number, in one table so that no two crates take the same one (registration
@@ -305,7 +305,7 @@ pub enum KernelError {
     World { of: Of, read: String, why: String },
     /// One read gave two hashes in one run: the world changed under the step, so nothing was kept.
     Unsteady { of: Of, read: String, first: Seen, then: Seen },
-    /// The store has other bytes for this identity and set of reads (rule 18). Either the
+    /// The store has other bytes for this identity and set of reads (rule 21). Either the
     /// identity misses an input the value depends on, or the step is not deterministic.
     Conflict { of: Of, key: Key, reads: Vec<String>, kept: ContentId, given: ContentId },
     /// The identity's chain of shapes is full ([`MOST_SHAPES`]).

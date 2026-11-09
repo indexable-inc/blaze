@@ -362,7 +362,7 @@ impl<'a, 'f, 'db> Inliner<'a, 'f, 'db> {
         let written_checked = overflow::body_written_checked(db, generic);
         let index = self.list(body, site.callee, site.args, written_checked);
         // What the callee's body read of the program's dyn facts is read by its copy here, so
-        // it keys the caller's code (rule 18) whatever options the callee is optimized with.
+        // it keys the caller's code (rule 21) whatever options the callee is optimized with.
         // A copy's options read none (`MirOptions::built_in`), so this adds nothing today.
         for &digest in &callee.inlined.devirtualized {
             body.inlined.read_devirt(digest);

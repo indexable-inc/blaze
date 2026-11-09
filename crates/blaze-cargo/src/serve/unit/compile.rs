@@ -313,7 +313,7 @@ fn with_record_inputs<T>(
     // The lints name their profile by its path too; its bytes are the input.
     let lint_profile = lint_profile(job, unit)?.map(|it| it.profile.id);
     // The profiles the images it links are laid out by: their heat is the input
-    // (docs/v2/plan/lanes/layout/layout.md).
+    // (docs/v2/plan/design/code-layout.md).
     let links =
         matches!(codegen::makes(u), Ok(Makes::Executable | Makes::Shared { proc_macro: false }));
     let layout = match links && !checks_only(job.input.goal, u) {
@@ -356,7 +356,7 @@ const FILED_BEYOND: &str =
 /// compares it with its last miss by ([`blaze_kernel::Miss::subject`]).
 pub(super) fn unit_subject(job: &Job, u: &Unit) -> Result<ContentId, String> {
     // The workspace's root too: one `BLAZE_HOME`'s ledger holds every workspace's units, and a
-    // registry crate's package id is the same in each (rule 18).
+    // registry crate's package id is the same in each (rule 21).
     let workspace = &job.input.config.invocation.root;
     let named = (
         workspace,
@@ -677,7 +677,7 @@ pub(crate) const DEPS: &str = "BLAZE_DEPS";
 pub(crate) const REACHED_ONLY: &str = "only what the build's programs reach of it is type-checked and compiled (`BLAZE_DEPS=full` checks it whole)";
 
 /// Whether only what the build's programs reach of `unit`'s crate is type-checked and compiled
-/// (docs/v2/plan/lanes/cold-v2/notes.md): a crate of the standard library, or of a package
+/// (docs/v2/plan/design/compile-time.md): a crate of the standard library, or of a package
 /// cargo caps the lints of (a registry or git dependency), unless the job's [`DEPS`] is `full`.
 /// Such a library runs no check and compiles no roots of its own: a program's walk, from roots
 /// as complete as rustc's collector's, compiles what it reaches of it and type-checks those
@@ -719,7 +719,7 @@ pub(crate) fn reached_only(job: &Job, unit: &Unit) -> Result<bool, ApiError> {
 /// And the `#[blaze::sealed]` checks, when a crate of its graph seals a trait
 /// (`hir_ty::sealed_in_graph`): sealing is the sealing crate's opt-in and binds every crate
 /// that can name the trait, a registry crate rustc accepted included, and a registry crate that
-/// seals is checked by nothing else (docs/v2/plan/lanes/frontend/sealed-orphan.md). Nothing is
+/// seals is checked by nothing else (docs/v2/plan/design/sealed-orphan.md). Nothing is
 /// type-checked; only what the build's programs reach is. std is checked like every other
 /// crate.
 pub(crate) fn reached_only_diags(
@@ -2216,7 +2216,7 @@ fn gpu_msl(job: &Job, unit: usize, ok: bool, module: Module<'_>) -> Result<Optio
 /// the macro crate, never run another way. A proc macro built for the host (a plan with
 /// `Spec::macro_wasm` off, which no build makes) is refused naming it: blaze's MIR evaluator
 /// is const eval's and the reference the wasm host is tested against, never a build's macro
-/// host (AGENTS.md rule 8).
+/// host (AGENTS.md rule 10).
 ///
 /// Asked again each time the unit compiles or its record is reused, as the front end it reads
 /// may have changed.

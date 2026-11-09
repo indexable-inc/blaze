@@ -1,4 +1,4 @@
-//! std at the walk's edge (docs/v2/plan/lanes/pure-scripts/design.md, section 5): the functions
+//! std at the walk's edge (docs/v2/plan.md, section 5): the functions
 //! of the toolchain's crates where the walk stops ([`Leaf`], with what each does) and those whose
 //! bodies it walks but whose values the path analysis follows ([`Transfer`]).
 //!

@@ -620,19 +620,35 @@ pub const INPUTS: Table = Table {
     ],
 };
 
-/// One allocation in about every 512 KiB, with its stack.
+/// One allocation from the global heap in every 4 MiB a thread allocates, with its stack
+/// (`crate::heap`): what churns the heap, by call site.
 pub const ALLOC_SAMPLES: Table = Table {
     name: "alloc_samples",
-    doc: "one row a sampled allocation: about one every 512 KiB allocated, on each thread",
+    doc: "one row a sampled allocation from the daemon's global heap: one every 4 MiB a thread allocates (`blaze_graph::arena::SAMPLE_EVERY`), the one that crossed it",
     columns: &[
         BUILD_ID,
         PROCESS,
         THREAD,
         col("t_ns", Type::I64, "when"),
-        col("bytes", Type::U64, "the bytes the sample stands for (the sampling interval)"),
+        col(
+            "bytes",
+            Type::U64,
+            "the bytes of allocation the sample stands for: the sampling interval, or as many of it as a larger block crossed; summed by `site`, the bytes allocated there, within a sample's",
+        ),
         col("stack", Type::Stack, "the call stack, outermost first"),
         opt("span_id", Type::U64, "the innermost span its thread was inside"),
         STACK_PCS,
+        opt(
+            "tag",
+            Type::Dict,
+            "the blaze-mem tag of the task that made the block (`query`, `mir`, `codegen`, ...); null for one made outside any task",
+        ),
+        col("block_bytes", Type::U64, "the sampled block's own bytes"),
+        opt(
+            "site",
+            Type::Utf8,
+            "the call site: the innermost frame of `stack` outside the allocator and the collections that call it (`alloc::`, `core::`, `std::`, `hashbrown::`, ...); null when every frame is theirs",
+        ),
     ],
 };
 
@@ -1083,7 +1099,7 @@ pub const CORE_BUSY: Table = Table {
 };
 
 /// One row a profiled run of a program blaze built: one or more repetitions of it, recorded by
-/// `blaze perf record` (docs/v2/plan/lanes/perf-history.md). Its files are
+/// `blaze perf record` (docs/v2/plan/design/perf-history.md). Its files are
 /// `perf-<run>.perf_runs.parquet`, which the history's cap leaves alone.
 pub const PERF_RUNS: Table = Table {
     name: "perf_runs",

@@ -1,7 +1,7 @@
 //! E0320 "overflow while adding drop-check rules for `{ty}`", noting "overflowed on
 //! `{overflow_ty}`", at the local whose drop check went past the crate's recursion limit. Both
 //! types are abbreviated as rustc's `short_string` abbreviates them. The message also names the
-//! body and the limit, which rustc's leaves out (rule 16), and a help to raise the limit, as
+//! body and the limit, which rustc's leaves out (rule 19), and a help to raise the limit, as
 //! E0055's.
 //!
 //! Follows rustc's `compiler/rustc_trait_selection/src/traits/query/dropck_outlives.rs`

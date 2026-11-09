@@ -9,6 +9,22 @@
 use super::*;
 use crate::pane::Back;
 use std::collections::HashSet;
+use harness_native_scroll_physics::{Engine, Input, Mutation, Phase, Vec2};
+
+/// The Archive list's scroll: its engine (AppKit's physics, as the tree's) and the origin it last showed.
+pub struct ListScroll {
+    engine: Engine,
+    clock: std::time::Instant,
+    y: f32,
+    /// Bumped for each origin set from outside the engine: the engine takes it as a command.
+    rev: usize,
+}
+
+impl Default for ListScroll {
+    fn default() -> Self {
+        Self { engine: Engine::new(sidebar::config(0.0, 0.0, 0.0, 0.0, 0, 0.5), Mutation::None), clock: std::time::Instant::now(), y: 0.0, rev: 0 }
+    }
+}
 
 /// The Archive's note when its filter matches nothing (Kip puzzles over it).
 const NOTHING_MATCHES: &str = "Nothing matches";
@@ -556,23 +572,58 @@ impl App {
         }
     }
 
-    /// A scroll over the Archive's list: it moves the list (clamped to its rows). Whether it was over it.
-    pub(super) fn archive_wheel(&mut self, dy: f32, precise: bool) -> bool {
+    /// A scroll over the Archive's list: its physics take it (AppKit's, as the tree's: the fingers' drag, the momentum
+    /// after, the rubber band at either end). Whether it was over it.
+    pub(super) fn archive_wheel(&mut self, ev: &sidebar::Wheel, z: f32) -> bool {
         let Some(l) = self.archive_list() else { return false };
-        let le = self.world.entity_from_id(l);
-        let Some(r) = le.try_cloned::<&Laid>() else { return false };
+        let Some(r) = self.world.entity_from_id(l).try_cloned::<&Laid>() else { return false };
         let (x, y) = (self.pointer.x, self.pointer.y);
         if !(x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h) {
             return false;
         }
-        // How far its content reaches, as layout measured it (the lazy column stands for all its rows, made or not).
-        let content = le.try_cloned::<&harness_native_ui_layout_api::ScrollExtent>().map_or(r.h, |x| x.h);
-        let max = (content - r.h).max(0.0);
-        let by = if precise { dy } else { dy * 28.0 };
-        let now = le.try_cloned::<&ScrollStateOf>().map_or(0.0, |s| s.y);
-        self.archive_scroll_to((now - by).clamp(0.0, max));
+        let t = self.arch_scroll.clock.elapsed().as_secs_f64();
+        let k = if ev.precise { 1.0 / z } else { 1.0 };
+        self.arch_scroll.engine.wheel(
+            Input {
+                delta: Vec2::new(f64::from(ev.dx * k), f64::from(ev.dy * k)),
+                precise: ev.precise,
+                direct: Phase::from_ns(ev.phase),
+                momentum: Phase::from_ns(ev.momentum),
+                timestamp: t,
+            },
+            t,
+        );
         self.poke();
         true
+    }
+
+    /// Step the Archive list's scroll one frame: measure it from the last layout, advance the physics and show its
+    /// origin. An origin something else set (a key that keeps the selection in view, a search that starts over, a drag on
+    /// the overlay scroller) is the origin from then.
+    pub(super) fn step_archive_scroll(&mut self) {
+        let Some(l) = self.archive_list() else { return };
+        let le = self.world.entity_from_id(l);
+        let Some(r) = le.try_cloned::<&Laid>().filter(|r| r.h > 0.0) else { return };
+        let content = le.try_cloned::<&harness_native_ui_layout_api::ScrollExtent>().map_or(r.h, |x| x.h);
+        let max = (content - r.h).max(0.0);
+        let shown = le.try_cloned::<&ScrollStateOf>().map_or(0.0, |s| s.y);
+        if (shown - self.arch_scroll.y).abs() > 0.01 {
+            self.arch_scroll.y = shown;
+            self.arch_scroll.rev += 1;
+        } else if self.arch_scroll.y > max && !self.arch_scroll.engine.needs_frame() {
+            // The list got shorter under the origin: back inside it.
+            self.arch_scroll.y = max;
+            self.arch_scroll.rev += 1;
+        }
+        let t = self.arch_scroll.clock.elapsed().as_secs_f64();
+        self.arch_scroll.engine.configure(sidebar::config(r.w, r.h, content, self.arch_scroll.y, self.arch_scroll.rev, 1.0 / f64::from(self.grid.scale.max(0.5))));
+        self.arch_scroll.engine.advance(t);
+        let y = self.arch_scroll.engine.report().y as f32;
+        self.arch_scroll.y = y;
+        self.archive_scroll_to(y);
+        if self.arch_scroll.engine.needs_frame() {
+            self.poke();
+        }
     }
 
     /// Whether the focused pane shows the Archive (typing goes to its search).

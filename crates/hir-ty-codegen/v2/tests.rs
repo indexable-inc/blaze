@@ -412,7 +412,7 @@ fn panics_on_overflow(frontend: &HirFrontend, instance: &HirInstance, checked: b
 /// (`rustc_codegen_ssa` `codegen_assert_terminator`). So a crate built with overflow checks
 /// whose generic `sum::<u8>` adds `255 + 1` through std's `impl Add for u8` panics, and built
 /// without it wraps: the impl is compiled under its user's setting, and the two compiles are
-/// two keys (rule 18). The `#[inline(never)]` body is compiled once, in std, built without
+/// two keys (rule 21). The `#[inline(never)]` body is compiled once, in std, built without
 /// overflow checks, so it wraps whoever calls it, as under rustc.
 #[test]
 fn an_inline_body_that_inherits_overflow_checks_takes_its_users_setting() {
@@ -558,7 +558,7 @@ pub fn roots() {
 }
 "#;
 
-/// The property polymorphization rests on (docs/v2/plan/lanes/polymorph.md): instances whose
+/// The property polymorphization rests on (docs/v2/plan/design/polymorph.md): instances whose
 /// keys are equal compile to one shape, at every debuginfo level. Values of two types of one
 /// shape (`A` and `B`, `E1` and `E3`, `F` and `G`) are one instance of `id`, `swap` and `wrap`
 /// where no local is told to a debugger; a `u64`, a `transparent` wrapper and a float are not
@@ -652,7 +652,7 @@ fn equal_share_keys_compile_to_one_shape() {
     }
 }
 
-/// Rule 18 for debug info: a local a debugger is told of carries its own instance's type into
+/// Rule 21 for debug info: a local a debugger is told of carries its own instance's type into
 /// the shape and the side table (`side::Variable::ty`), so where the unit tells them
 /// (`DebugInfo::Limited` and `Full`) `id::<A>` and `id::<B>`, one compile identity, have two
 /// keys; where none is told they stay one key and one shape. Each is prepared at its unit's
@@ -699,7 +699,7 @@ fn a_key_covers_the_types_of_the_locals_a_debugger_is_told() {
     }
 }
 
-/// Rule 18 across specs: one instance compiled under two specs that differ only in debug info
+/// Rule 21 across specs: one instance compiled under two specs that differ only in debug info
 /// gets either equal keys and equal shapes, or two keys. Which locals the shape tells of is
 /// decided at the spec it is prepared at, and the key's settings hold that spec's debug info,
 /// so a unit at another level than its origin's first spec can't share a key with a shape of
@@ -1219,7 +1219,7 @@ pub fn holds(x: u32) -> u32 {
 /// One function built under two units' settings in one database gives two IRs, and neither
 /// build reuses the other's: the settings are an argument of the compile and the key of every
 /// body it reads (`MirStage::compiled`'s options), never state on the thread, which a fiber
-/// that waits in a query leaves behind (rule 24) and a memo would not cover (rule 18).
+/// that waits in a query leaves behind (rule 27) and a memo would not cover (rule 21).
 /// Unwinding, the call has a landing pad that drops the held value; aborting, none. Built
 /// unwinding, then aborting, then unwinding again, each is its own settings' IR, and the
 /// compile directly under `instance_code` agrees with `built`.
@@ -2581,7 +2581,7 @@ pub fn roots(x: u32) {
     });
 }
 
-/// Rule 18 for which callees are one instance: `one::<A>` and `one::<B>` have one compile
+/// Rule 21 for which callees are one instance: `one::<A>` and `one::<B>` have one compile
 /// identity, so `two::<A, B>` and `two::<A, A>` do too, and one shared identity in their
 /// arguments' place (asserted first, so the keys differ only by their placement). But the first
 /// calls two instances and the second one: two places against one, and other code, so they are
@@ -3724,7 +3724,7 @@ pub fn roots() -> u32 {
 /// specializing impl is seen: `k` is no home of it asked from `main`
 /// (`hir_ty_mir::mir::home::stands_for`), so its call of `go` on `DType` is `dep`'s. Compiled
 /// in `k`, the one crate it names, it would call `t`'s default and return 1 where rustc's
-/// returns 2 (rule 18: the home is in the instance's key, and `k` misses an input `main`'s
+/// returns 2 (rule 21: the home is in the instance's key, and `k` misses an input `main`'s
 /// answer reads).
 #[test]
 fn an_instance_is_not_compiled_in_a_crate_that_misses_a_specializing_impl_its_asker_sees() {
@@ -3805,7 +3805,7 @@ pub fn roots(x: u32) -> u32 {{ dep::generic::<u8>(x) }}
 }
 
 /// What the MIR inliner put in the body of a callee a caller builds in is the caller's code,
-/// so the caller's template key holds it (rule 18): two `leaf`s are two keys. The key holds
+/// so the caller's template key holds it (rule 21): two `leaf`s are two keys. The key holds
 /// the code of what the caller's walk lists as built in and, as the driver closes it, what
 /// each of those lists as walked for its own units; `dep`'s units inline nothing, so only the
 /// caller's walk can name `leaf`. Without it both programs' `generic::<u8>` had one key, the
@@ -4104,7 +4104,7 @@ pub fn g<T: core::fmt::Debug>(t: &T) -> &dyn core::fmt::Debug {{ t }}
     )
 }
 
-/// sb-testkey's soundness argument for generic bodies (rule 20): an item's bound hash takes
+/// sb-testkey's soundness argument for generic bodies (rule 23): an item's bound hash takes
 /// the impls of an object's trait only from the crates its own crate loads, so `lib::g`'s
 /// says nothing of `main`'s `impl Debug for D`. What covers it is the instance: the vtable
 /// `g::<D>` makes is among its refs (its slots through `callee`), which `exec::bound` binds by

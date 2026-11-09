@@ -71,7 +71,7 @@ impl Resolved {
 /// in `clippy.toml`, so the lint knows its paths, and an entry configured for one wins.
 const WALL_CLOCK: [&str; 3] =
     ["std::time::Instant::now", "std::time::SystemTime::now", "std::time::Instant::elapsed"];
-const WALL_CLOCK_REASON: &str = "a core reads time from its injected clock, `advance_clock(now)` (AGENTS.md rule 11); drivers read the wall clock";
+const WALL_CLOCK_REASON: &str = "a core reads time from its injected clock, `advance_clock(now)` (AGENTS.md rule 14); drivers read the wall clock";
 
 /// The `disallowed-*` entries of `key`'s configuration, resolved as `krate` names their paths:
 /// once per crate and configuration.

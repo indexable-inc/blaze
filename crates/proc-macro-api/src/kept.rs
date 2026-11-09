@@ -1,4 +1,4 @@
-//! Proc-macro expansions kept in the store (docs/v2/plan/lanes/usercode.md), so that no
+//! Proc-macro expansions kept in the store (docs/v2/plan.md), so that no
 //! macro is expanded twice for the same inputs, on this machine or, through the store's
 //! remote, another.
 //!
@@ -16,7 +16,7 @@
 //!
 //! The key, what the expansion read and its shape are written against the calling crate's
 //! roots ([`roots`]: its package, `CARGO_MANIFEST_DIR`, and its `OUT_DIR`), so the same call of
-//! the same macro on the same crate in another checkout is found (docs/v2/plan/lanes/store.md,
+//! the same macro on the same crate in another checkout is found (docs/v2/plan/design/store.md,
 //! "Portable keys"). Every expansion is kept against where those roots are, and is given to
 //! another checkout only once a second one expanded it the same (`blaze_usercode::roots::verify`);
 //! one whose output, read variables or given strings still hold a root once ported ([`left`],
@@ -126,7 +126,7 @@ pub struct Keeping {
 }
 
 /// What a warm front end is kept by, besides its units and config: whether a value verified
-/// across checkouts that it may have been given has been retracted since (rule 18). Such a
+/// across checkouts that it may have been given has been retracted since (rule 21). Such a
 /// value is a tracked expansion and, through `hir_def::deps`, a crate's image; neither is asked
 /// again while its database is kept, so a record put later would not reach it. The store of
 /// expansions has one writer, its daemon (`blaze-cargo`'s `daemon.rs` opens it once), so every

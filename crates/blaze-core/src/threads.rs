@@ -992,6 +992,30 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
             bytes.truncate(read);
             Ok(Done::Read(bytes))
         }
+        Effect::ReadInto { file, at: from, into, cache, priority, .. } => {
+            let span = crate::spans::resolve(&into, &file, from, cache, "a read into memory of")
+                // alloc: an error path.
+                .map_err(|why| io::Error::other(why.0))?;
+            let read = at(root, &file, |path| {
+                let opened = fs::open_positional(path, false, cache)?;
+                at_priority(priority, || {
+                    span.with_mut(|bytes| fs::read_into(&opened, bytes, from, cache))
+                })
+            })
+            .map_err(|error| named(&file, &error))?;
+            Ok(Done::ReadInto { len: u32::try_from(read).expect("at most a span's u32 length") })
+        }
+        Effect::WriteFrom { file, at: offset, from, cache, .. } => {
+            let span = crate::spans::resolve(&from, &file, offset, cache, "a write from memory to")
+                // alloc: an error path.
+                .map_err(|why| io::Error::other(why.0))?;
+            at(root, &file, |path| {
+                let opened = fs::open_positional(path, true, cache)?;
+                span.with(|bytes| fs::write_from(&opened, bytes, offset))
+            })
+            .map_err(|error| named(&file, &error))?;
+            Ok(Done::Written)
+        }
         Effect::Append { file, bytes, .. } => at(root, &file, |path| {
             let open = || OpenOptions::new().create(true).append(true).open(path);
             fs::making_parent(path, open)?.write_all(&bytes)?;
@@ -1083,6 +1107,32 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
         | Effect::Pressure { .. } => {
             unreachable!("timers, watches, processes and sockets are kept by the driver")
         }
+    }
+}
+
+/// `error` of `file`, saying which.
+fn named(file: &crate::FileName, error: &io::Error) -> io::Error {
+    // alloc: an error path.
+    io::Error::new(error.kind(), format!("{file}: {error}"))
+}
+
+/// `f`, a read of [`crate::Priority`] `priority`, on this thread: at idle priority where asked.
+fn at_priority<R>(
+    priority: crate::Priority,
+    f: impl FnOnce() -> io::Result<R>,
+) -> io::Result<R> {
+    match priority {
+        crate::Priority::Demand => f(),
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        crate::Priority::Idle => crate::raw::idle_io(f),
+        // alloc: an error path.
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        crate::Priority::Idle => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "a read at idle priority: this system has no IO class per read (Linux's \
+             IOPRIO_CLASS_IDLE and macOS's IOPOL_THROTTLE are blaze's); it is not read at \
+             normal priority instead",
+        )),
     }
 }
 

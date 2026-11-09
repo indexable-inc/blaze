@@ -28,7 +28,7 @@ use super::{Answer, Kind, OpError, session};
 pub const ALIGN: usize = 8;
 
 /// The zstd level of the IPC buffers: the fastest, since the bytes cross loopback, not a
-/// network (docs/v2/plan/lanes/observe/explore.md, "Speed of light").
+/// network (docs/v2/plan/design/explore.md, "Speed of light").
 pub const ZSTD_LEVEL: i32 = 1;
 
 /// Appends the head of an answer to `out`: the header's length and its JSON, padded so that

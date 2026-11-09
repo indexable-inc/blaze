@@ -1,6 +1,6 @@
-//! The optimizer's use of proved contracts (docs/v2/plan/lanes/contracts.md, part 3): a fact a
+//! The optimizer's use of proved contracts (docs/v2/plan/design/contracts.md, part 3): a fact a
 //! native `ensures` states is used only once a proof stands behind it, and each use is a
-//! [`Fact`] the caller's code identity covers (rule 18).
+//! [`Fact`] the caller's code identity covers (rule 21).
 //!
 //! What it uses today, and nothing else ([`use_proved_contracts`]): where a body does
 //! `r = f(..)`, `f` a direct call of a non-generic function whose `ensures` lane verus proves
@@ -114,7 +114,7 @@ impl fmt::Display for Use {
 }
 
 /// One use of a proved contract: the code the optimizer made depends on it, so the caller's
-/// code identity covers it (rule 18). A change to the callee's clause, its body (through the
+/// code identity covers it (rule 21). A change to the callee's clause, its body (through the
 /// proof's key), whether it has a `requires` or whether its crate checks contracts changes the
 /// fact, and with it every caller that used it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

@@ -10,17 +10,38 @@ hn {
     Padding: {l: $chat_ctx_pad, r: $chat_ctx_pad, t: $chat_ctx_pad, b: $chat_ctx_pad}
   }
 
-  // The window as a track; its segments (hn.ChatContextSeg, kept by the host) laid end to end from the leading edge.
-  prefab ChatContextBar : ui.Column {
-    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+  // The window as a donut: the whole window an empty ring (tone_line), each part a slice of it in its ink
+  // (hn.ChatContextSlice, kept by the host in `slices`, clockwise from the top), how full it is in its middle (or the
+  // part under the pointer).
+  prefab ChatContextPie : ui.Row {
+    Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     Padding: {l: 0, r: 0, t: $chat_ctx_bar_pad, b: $chat_ctx_bar_pad}
-    track : ui.Row {
-      Fill: $tone_line
-      Shape: {radius: $chat_ctx_bar_r, n: 4, border: 0, feather: 0}
-      Clip
-      Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}
-      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $chat_ctx_bar_h, min: 0, max: 0}}
+    chart : ui.ZStack {
+      Flex: {axis: Z, gap: 0, align: Center, justify: Center, wrap: false}
+      Size: {w: {kind: Fixed, value: $chat_ctx_pie, min: 0, max: 0}, h: {kind: Fixed, value: $chat_ctx_pie, min: 0, max: 0}}
+      track : ui.Node {
+        Overlay
+        Fill: $tone_line
+        Vector: {d: "M50 2 A48 48 0 1 1 50 98 A48 48 0 1 1 50 2 Z M50 16 A34 34 0 1 0 50 84 A34 34 0 1 0 50 16 Z", view_x: 0, view_y: 0, view_w: 100, view_h: 100, stroke_w: 0}
+      }
+      slices : ui.ZStack {
+        Overlay
+        Flex: {axis: Z, gap: 0, align: Start, justify: Start, wrap: false}
+      }
+      // In its middle: how full (`pct`, large) and of what (`label`: "used", or the part under the pointer).
+      mid : ui.Column {
+        Flex: {axis: Column, gap: 0, align: Center, justify: Center, wrap: false}
+        Size: {w: {kind: Fixed, value: $chat_ctx_pie * 0.62, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+        pct : ui.Line, Strong {
+          Text: {s: ""}
+          TextStyle: {size: $size_ctx_pct, line: $line_ctx_pct, role: 0, bold: 1}
+        }
+        label : ui.LineMiddle, Muted {
+          Text: {s: ""}
+          TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+        }
+      }
     }
   }
 }

@@ -50,7 +50,7 @@ pub enum Event {
     Said { level: Level, text: String } keys [text, level],
     /// The build is done.
     Finished { ok: bool, summary: Summary } keys [ok, summary],
-    /// A node of the build's graph (docs/driver.md), said once, before it first moves: what it
+    /// A node of the build's graph (docs/v2/plan.md), said once, before it first moves: what it
     /// is and the nodes it waits for.
     Node { id: u32, kind: NodeKind, name: String, deps: Vec<u32> } keys [id, deps, kind, name],
     /// Nodes of the graph said together, each as its [`Event::Node`] would say it, before any
@@ -378,7 +378,7 @@ pub enum How {
     Stored,
 }
 
-/// What a node of the build's graph does (docs/driver.md, "The graph").
+/// What a node of the build's graph does (docs/v2/plan.md, "The graph").
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NodeKind {
     /// Reading the manifests and the lock file.

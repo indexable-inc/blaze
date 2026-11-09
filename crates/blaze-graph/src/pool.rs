@@ -1,4 +1,4 @@
-//! The threads the plane's tasks run on (docs/v2/plan/lanes/core.md section 4, docs/v2/plan/lanes/core/plane.md "The
+//! The threads the plane's tasks run on (docs/v2/plan.md section 4, docs/v2/plan.md "The
 //! executor"): one worker per CPU of a [`Topology`], stealing work nearest first.
 //!
 //! Each worker has a deque of its own (crossbeam's Chase-Lev deque, as Rayon's) and a LIFO
@@ -43,7 +43,7 @@
 //! a time until its wait ends; where a worker of its own thread would park, a driven one gives
 //! its turn back, and its thread looks at the clock's next due wait, then for a stall.
 //!
-//! A job allocates nothing once its thread is warm (docs/v2/plan/lanes/mem/core/plane.md). Its
+//! A job allocates nothing once its thread is warm (docs/v2/plan/design/memory.md). Its
 //! closure goes in a cell of 128, 512 or 2048 bytes from one of three process-wide
 //! [`blaze_mem::Pool`]s, through a cache of the thread that submits it, and its cell goes back
 //! to the cache of the thread that runs it before the closure runs. A closure no cell holds is
@@ -220,17 +220,17 @@ thread_local! {
 /// function, so a caller inlined into a job's code that waits between two submits (checkpoint
 /// 36's `blaze_codegen::driver::Build::walk`, two `par::map`s in a loop) borrowed the cache of
 /// the thread it ran on before the wait, racing that thread's own jobs on a `RefCell` that is
-/// not `Sync`: "RefCell already borrowed" at every job of the victim thread (rule 24).
+/// not `Sync`: "RefCell already borrowed" at every job of the victim thread (rule 27).
 #[inline(never)]
 fn with_caches<R>(f: impl FnOnce(&mut Caches) -> R) -> Option<R> {
     CACHES
         .try_with(|caches| {
             let mut caches = caches
                 .try_borrow_mut()
-                .expect("this thread's job-cell caches, borrowed twice: a thread-local's address kept across a fiber switch (rule 24)");
+                .expect("this thread's job-cell caches, borrowed twice: a thread-local's address kept across a fiber switch (rule 27)");
             let caches = caches.get_or_insert_with(Caches::new);
             #[cfg(all(test, not(blaze_check)))]
-            assert_eq!(caches.owner, this_thread(), "a job used another thread's job-cell caches: a thread-local's address kept across a wait (rule 24)");
+            assert_eq!(caches.owner, this_thread(), "a job used another thread's job-cell caches: a thread-local's address kept across a wait (rule 27)");
             f(caches)
         })
         .ok()
@@ -317,7 +317,7 @@ fn give_back(cell: Room) {
 
 /// How the pool's own work before a job's closure went (giving back its cell, beginning its
 /// span): `Err` with what that panicked with, which the job reports as its failure rather than
-/// run. A job is never dropped unrun for it, so whoever waits on the job hears of it (rule 17).
+/// run. A job is never dropped unrun for it, so whoever waits on the job hears of it (rule 20).
 // dyn: a panic's payload, as `catch_unwind` gives it
 pub(crate) type Started = Result<(), Box<dyn Any + Send>>;
 
@@ -818,7 +818,7 @@ thread_local! {
 }
 
 /// The worker this thread is, or null. Not inlined, as [`with_caches`] is not: a job that reads
-/// it, waits and reads it again must find the worker it resumed on (rule 24).
+/// it, waits and reads it again must find the worker it resumed on (rule 27).
 #[inline(never)]
 fn local() -> *const Local {
     LOCAL.get()
@@ -1405,7 +1405,7 @@ fn ambient(with: &mut dyn FnMut(&dyn radix::Workers)) -> bool {
 
 impl Pool {
     /// Stops the pool: its workers run every job given it and every parked one once woken,
-    /// then end, and are joined. Bounded (rule 15), as its drop is with [`STOP_BOUND`]:
+    /// then end, and are joined. Bounded (rule 18), as its drop is with [`STOP_BOUND`]:
     ///
     /// - a parked job whose waits lead to the calling thread, which holds what it claimed until
     ///   this returns (a key its panic left held), can never wake: it wakes at once, to fail with
@@ -1543,7 +1543,7 @@ pub(crate) enum StopStep {
     GiveUp { waited_ns: u64 },
 }
 
-/// The bound of a pool's stop (rule 15), a sans-IO core (rule 12): told the time on the
+/// The bound of a pool's stop (rule 18), a sans-IO core (rule 14): told the time on the
 /// injected clock and whether the pool moved since it was last told, it says what the stop does
 /// next. The bound runs from the pool's last progress.
 #[cfg(not(blaze_check))]
@@ -2054,7 +2054,7 @@ impl Local {
             assert_eq!(
                 thread.id(),
                 this_thread(),
-                "a job gave a job to another worker's own slot and deque: a thread-local's address kept across a wait (rule 24)"
+                "a job gave a job to another worker's own slot and deque: a thread-local's address kept across a wait (rule 27)"
             );
         }
         if let Some(old) = NonNull::new(slot.next.swap(job.0.as_ptr(), Ordering::AcqRel)) {
@@ -3988,6 +3988,37 @@ mod tests {
             move |it| _ = tx.send(it.unwrap()),
         );
         assert_eq!(rx.recv_timeout(LONG).unwrap(), "after the fire");
+    }
+
+    /// An event rearmed ends the waits on it before, as a fire does, and is armed again: a
+    /// waiter taken after waits for the next fire, a job on a worker parked meanwhile, and its
+    /// last fire (the drop) ends that wait too.
+    #[test]
+    fn a_rearmed_event_ends_the_waits_before_and_holds_the_ones_after() {
+        use crate::sched::{Event, EventWait};
+        let pool = Pool::new(&Topology::flat(1), false).unwrap();
+        let mut event = Event::new();
+        let first: EventWait = event.waiter();
+        event.rearm();
+        first.wait().unwrap();
+        let second: EventWait = event.waiter();
+        assert_ne!(first, second, "a rearmed event waits under a new key");
+        let (tx, rx) = unbounded::<&'static str>();
+        pool.submit(
+            None,
+            move || {
+                second.wait().unwrap();
+                "the second waiter"
+            },
+            move |it| _ = tx.send(it.unwrap()),
+        );
+        until("the second waiter to park", || pool.shared.parked.load(Ordering::SeqCst) == 1);
+        assert!(rx.try_recv().is_err(), "the second waiter waits for the next fire");
+        event.rearm();
+        assert_eq!(rx.recv_timeout(LONG).unwrap(), "the second waiter");
+        let third = event.waiter();
+        std::thread::spawn(move || event.fire()).join().unwrap();
+        third.wait().unwrap();
     }
 
     /// On a pool of one worker, a job waits on the pool's clock and holds no thread: it parks,

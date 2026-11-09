@@ -6,7 +6,7 @@
 //! objects, the sanitizer runtimes in blaze's toolchain, the libraries the crates ask for (`-l`,
 //! `#[link]`), the libraries the C toolchain's driver adds, then its end objects.
 //!
-//! blaze never links with `cc` (docs/linker.md, "The C toolchain stays a source of files, not
+//! blaze never links with `cc` (docs/v2/plan.md, "The C toolchain stays a source of files, not
 //! a linker"): the platform's C toolchain is asked where its files are, never to compile or
 //! link.
 //!

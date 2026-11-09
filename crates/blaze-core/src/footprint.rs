@@ -1,4 +1,4 @@
-//! The memory backstop of a spawned process on macOS (docs/v2/plan/lanes/core.md section 4, "Hard
+//! The memory backstop of a spawned process on macOS (docs/v2/plan.md section 4, "Hard
 //! backstop"): one thread for every watched process that reads its physical footprint, the
 //! number Activity Monitor and the kernel's memory pressure go by, and kills it once it passes
 //! the limit. No resource limit is set: macOS refuses RLIMIT_AS and RLIMIT_DATA below the

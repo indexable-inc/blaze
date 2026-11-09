@@ -1,5 +1,5 @@
 //! A build script's run fetched from the global cache before it runs (fastcompile-global 3,
-//! docs/v2/plan/lanes/fastcompile/global.md): a run of a crates.io package's script whose
+//! docs/v2/plan/design/compile-time.md): a run of a crates.io package's script whose
 //! shapes and result the store lacks asks the cache for them, each proven public by
 //! [`blaze_global::Rule::run`] first, and runs only once nothing public is left to fetch.
 //!
@@ -96,7 +96,7 @@ impl Fetch {
             return Err(format!("the global cache's answer for {:x} is not in yet", key.0));
         }
         let read = |key: &Key| get(key).map_err(|corrupt| format!("the store: {corrupt}"));
-        // Bounded as the store's own walk is (`index::search_in`, rule 15), and ending as it
+        // Bounded as the store's own walk is (`index::search_in`, rule 18), and ending as it
         // does: a full chain of `MOST_SHAPES` is a miss, and one that goes on past it is an
         // error naming the run, never walked on.
         for n in 0..index::MOST_SHAPES {

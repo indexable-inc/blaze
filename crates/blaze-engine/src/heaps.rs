@@ -29,12 +29,13 @@ use std::{
     },
 };
 
-use blaze_graph::arena::Holders;
+use blaze_graph::arena::{Holders, Malloc};
 use blaze_mem::Tag;
 use libmimalloc_sys::{
     mi_collect, mi_free, mi_heap_delete, mi_heap_malloc_aligned, mi_heap_new,
-    mi_heap_realloc_aligned, mi_heap_t, mi_heap_zalloc_aligned, mi_malloc, mi_malloc_aligned,
-    mi_process_info, mi_realloc_aligned, mi_theap_t, mi_zalloc, mi_zalloc_aligned,
+    mi_heap_realloc_aligned, mi_heap_t, mi_heap_zalloc_aligned, mi_is_in_heap_region, mi_malloc,
+    mi_malloc_aligned, mi_process_info, mi_realloc_aligned, mi_theap_t, mi_usable_size, mi_zalloc,
+    mi_zalloc_aligned,
 };
 
 unsafe extern "C" {
@@ -208,7 +209,7 @@ fn theap_for(tag: Tag, slot: &Cell<*mut mi_theap_t>) -> *mut mi_theap_t {
 
 /// Allocates `size` bytes aligned to `align` in `tag`'s heap from this thread's theap of it.
 /// Not inlined, as blaze-graph's `with_local` is not: a job may wait on one thread and resume
-/// on another, so each allocation reads the thread-local afresh (rule 24).
+/// on another, so each allocation reads the thread-local afresh (rule 27).
 #[inline(never)]
 fn alloc_in(tag: Tag, size: usize, align: usize, zeroed: bool) -> *mut u8 {
     settle();
@@ -459,6 +460,47 @@ impl Holders for Heaps {
                     mi_heap_realloc_aligned(heap, ptr.cast(), new_size, layout.align()).cast()
                 }
                 None => mi_realloc_aligned(ptr.cast(), new_size, layout.align()).cast(),
+            }
+        }
+    }
+}
+
+// What C's `malloc` family needs past the layout-carrying calls (`crate::malloc`): mimalloc
+// finds a block's page, and with it its size and heap, from the address alone.
+impl Malloc for Heaps {
+    /// Whether mimalloc's page map has a page for `ptr` (`mi_is_in_heap_region`, mimalloc's
+    /// checked read of it, which any address may be given; [`heap_of`] may only read a live
+    /// block's): the macOS zone's `size`, which libmalloc asks of every block any zone frees.
+    #[inline]
+    fn owns(&self, ptr: *const u8) -> bool {
+        // SAFETY: reads the page map, checking each level; any address.
+        unsafe { mi_is_in_heap_region(ptr.cast()) }
+    }
+
+    #[inline]
+    unsafe fn usable(&self, ptr: *mut u8) -> usize {
+        // SAFETY: the caller says `ptr` is a live block of mimalloc's.
+        unsafe { mi_usable_size(ptr.cast()) }
+    }
+
+    #[inline]
+    unsafe fn free(&self, ptr: *mut u8) {
+        // SAFETY: the caller says `ptr` is a live block of mimalloc's; `mi_free` frees a block
+        // of any heap from any thread.
+        unsafe { mi_free(ptr.cast()) }
+    }
+
+    #[inline]
+    unsafe fn realloc_in(&self, into: Option<Tag>, ptr: *mut u8, new_size: usize) -> *mut u8 {
+        // SAFETY: the caller upholds `realloc`'s contract; at a word's alignment mimalloc's
+        // `_aligned` reallocs are its plain ones, as `realloc_for`'s are.
+        unsafe {
+            match into {
+                Some(tag) => {
+                    let Some(heap) = heap(tag) else { return no_heap() };
+                    mi_heap_realloc_aligned(heap, ptr.cast(), new_size, WORD).cast()
+                }
+                None => mi_realloc_aligned(ptr.cast(), new_size, WORD).cast(),
             }
         }
     }

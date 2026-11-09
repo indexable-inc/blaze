@@ -15,19 +15,43 @@ hn {
   struct Row(obj: u64, name: string, selected: bool, depth: i32, kids: bool, open: bool)
 
 
-  // A tree row's disclosure, Xcode's source list: a layer over the whole row (out of its flow) whose first slot is the
-  // row's chevron gutter, `disclose_w` wide at the row's indent, so the icon column never moves whether or not the row
-  // has rows under it, and a child's chevron sits under its parent's icon. With rows under the row it is a thin chevron
-  // (a vector mark, hn's own: icons/chevron.svg) in the faint ink, always shown so the tree reads as one, turned a
-  // quarter on the `turn` spring as it opens; its hit target is the whole gutter. Else an empty slot and no hit target
-  // (the row takes the press). Its click is script (flecs.script.input): `hn.act` hands the host the toggle, with Option
-  // for every sibling.
+  // A tree row's gutter, Xcode's source list and IntelliJ's tree: a layer over the whole row (out of its flow). First the
+  // indent guides, one slot `indent_step` wide per ancestor level, each a hairline (tone_guide) down its middle, so they
+  // run under each ancestor's chevron and join from row to row into one line per level (rows are packed); up to
+  // tree_guides levels, a slot past the row's depth taking no room. Then the row's own chevron slot, `tree_gutter` wide, so the title
+  // column never moves whether or not the row has rows under it. With rows under the row it is a thin chevron (a vector
+  // mark, hn's own: icons/chevron.svg) pointing at the title, in the muted ink, always shown so the tree reads as one,
+  // turned a quarter to point down on the `turn` spring as it opens; its hit target is the whole slot. Else the slot
+  // holds the row's `mark` while a finished row lingers ("fail": a cross in tone_error; "": nothing, a row that
+  // ended well fading instead) and no hit target (the row takes the press). Its click is script (flecs.script.input):
+  // `hn.act` hands the host the toggle, with Option for every sibling.
   @tree ChildOf
   template Hang : Row {
+    prop mark: string = ""
     (IsA, ui.Row)
     Overlay
-    Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
-    Padding: {l: indent($depth, $tree_pad, $indent_step), r: 0, t: 0, b: 0}
+    Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Padding: {l: $tree_pad, r: 0, t: 0, b: 0}
+    // One slot a level, written once: a slot past the row's depth takes no room and draws nothing (a re-run sets
+    // components, it never removes them: so both arms set the Size and the Fill).
+    for i in 0..$tree_guides {
+      "g{i}" : ui.Row {
+        Flex: {axis: Row, gap: 0, align: Stretch, justify: Center, wrap: false}
+        if $depth > i {
+          Size: {w: {kind: Fixed, value: $indent_step, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+        } else {
+          Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+        }
+        line : ui.Node {
+          Size: {w: {kind: Fixed, value: $tree_guide_w, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+          if $depth > i {
+            Fill: $tone_guide
+          } else {
+            Fill: $tone_clear
+          }
+        }
+      }
+    }
     disclose : ui.Row {
       Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
       Size: {w: {kind: Fixed, value: $tree_gutter, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
@@ -38,14 +62,30 @@ hn {
         Focusable
       }
       icon : ui.Icon {
-        Size: {w: {kind: Fixed, value: $tree_chevron, min: 0, max: 0}, h: {kind: Fixed, value: $tree_chevron, min: 0, max: 0}}
+        if $kids {
+          Size: {w: {kind: Fixed, value: $tree_chevron, min: 0, max: 0}, h: {kind: Fixed, value: $tree_chevron, min: 0, max: 0}}
+        } else {
+          Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 0, min: 0, max: 0}}
+        }
         Mark: {name: "chevron"}
         Disclose: {open: $open}
         // Clear with nothing under the row (a re-run sets components, it never removes them: so both arms set the Fill).
         if $kids {
-          Fill: $tone_ink_faint
+          Fill: $tone_ink_muted
         } else {
           Fill: $tone_clear
+        }
+      }
+      // The mark of a childless row that failed (its glyph, ink and size set in every arm).
+      done : ui.Symbol {
+        if $kids == false && $mark == "fail" {
+          Icon: {glyph: ""}
+          Fill: $tone_error
+          Size: {w: {kind: Fixed, value: $tree_mark, min: 0, max: 0}, h: {kind: Fixed, value: $tree_mark, min: 0, max: 0}}
+        } else {
+          Icon: {glyph: ""}
+          Fill: $tone_clear
+          Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 0, min: 0, max: 0}}
         }
       }
       async {

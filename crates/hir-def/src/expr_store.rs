@@ -365,15 +365,15 @@ pub enum ExpressionStoreDiagnostics {
     IntLiteralTooLarge {
         node: InFile<AstPtr<ast::Literal>>,
     },
-    /// `for const`, `x.[f]` or a bounded type parameter of a where predicate's `for<..>` binder
-    /// in a crate without `#![feature(blaze_comptime)]`: an expression lowers to `Missing`, a
-    /// binder parameter is not recorded.
+    /// `for const`, `x.[f]`, `const static { .. }` or a bounded type parameter of a where
+    /// predicate's `for<..>` binder in a crate without `#![feature(blaze_comptime)]`: an
+    /// expression lowers to `Missing`, a binder parameter is not recorded.
     ComptimeWithoutFeature {
         node: InFile<SyntaxNodePtr>,
         form: ComptimeForm,
     },
     /// A specification clause (`requires`, `ensures`, `invariant`, ..) or a named return type
-    /// (docs/v2/plan/lanes/verus.md) lowering refuses, for `why`: the clause is not lowered.
+    /// (docs/v2/plan/design/verus.md) lowering refuses, for `why`: the clause is not lowered.
     VerifyRefused {
         node: InFile<SyntaxNodePtr>,
         why: VerifyRefusal,
@@ -410,7 +410,7 @@ impl VerifyRefusal {
     }
 }
 
-/// blaze_verify: which clauses a clause group holds (docs/v2/plan/lanes/verus.md). A group is
+/// blaze_verify: which clauses a clause group holds (docs/v2/plan/design/verus.md). A group is
 /// one expression statement lowering puts at the head of the block it is about: a function's
 /// body for `Requires`, `Recommends`, `Ensures` and `Decreases`, a loop's body for the others.
 /// Its expression is a tuple of the clause's expressions, or, for an `Ensures` of a function
@@ -466,6 +466,8 @@ pub enum ComptimeForm {
     ReflectedField,
     /// `for<F: Bound> ..` in a where predicate.
     BinderBound,
+    /// `const static { .. }`, a `const` block evaluated with no const checking.
+    Block,
 }
 
 impl ComptimeForm {
@@ -475,6 +477,18 @@ impl ComptimeForm {
             ComptimeForm::ForConst => "`for const`",
             ComptimeForm::ReflectedField => "a reflected field access `base.[field]`",
             ComptimeForm::BinderBound => "a bounded type parameter in a `for<..>` binder",
+            ComptimeForm::Block => "a `const static { .. }` block",
+        }
+    }
+
+    /// Which part of the extension the form is, for a message: its reflection, or its
+    /// evaluation of any code at compile time.
+    pub fn part(self) -> &'static str {
+        match self {
+            ComptimeForm::ForConst | ComptimeForm::ReflectedField | ComptimeForm::BinderBound => {
+                "compile-time reflection"
+            }
+            ComptimeForm::Block => "compile-time evaluation",
         }
     }
 }
@@ -2006,7 +2020,7 @@ impl ExpressionStore {
 
     /// blaze_verify: the clause `group` is, when it is one: an expression statement that
     /// [`lower`](crate::expr_store::lower) made of a function's or a loop's clauses
-    /// (docs/v2/plan/lanes/verus.md). The program erases it: MIR lowering skips it.
+    /// (docs/v2/plan/design/verus.md). The program erases it: MIR lowering skips it.
     pub fn spec_clause(&self, group: ExprId) -> Option<SpecClauseKind> {
         let clauses = &self.expr_only.as_deref()?.spec_clauses;
         let at = clauses.binary_search_by_key(&group, |&(it, _)| it).ok()?;

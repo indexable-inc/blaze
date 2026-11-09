@@ -1,5 +1,5 @@
 //! A crate's `DefMap` and `LocalDefMap`, and its lang items, written as bytes and read back
-//! into a running database (frozen dependency artifacts, blaze's `docs/glancer.md`, item 1).
+//! into a running database (frozen dependency artifacts, blaze's `docs/v2/plan.md`, item 1).
 //! [`Enc`] and [`Dec`] write and read other values that name items, as `hir_ty` does impls.
 //!
 //! The bytes name nothing by a query database id: a file is the crate it belongs to and its path from
@@ -345,7 +345,7 @@ pub(crate) fn served_lang_items(db: &Db, krate: Crate) -> Option<Option<Box<Lang
 /// implied write), so this is a bug in the key or in that withdrawal. Nothing is resolved in
 /// its place. It unwinds out of the query that asked, with this as its payload, as
 /// [`super::Unmaintained`] does, and the driver that catches it fails that one job with it as
-/// the error (rule 17).
+/// the error (rule 20).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unreadable {
     pub krate: Crate,

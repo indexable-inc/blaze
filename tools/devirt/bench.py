@@ -1,4 +1,4 @@
-"""Devirtualization's benchmark (docs/v2/plan/lanes/codegen/devirt.md): the dyn-heavy loop of
+"""Devirtualization's benchmark (docs/v2/plan/design/devirt.md): the dyn-heavy loop of
 `tools/devirt/dyn_loop` built `--release` by a blaze of the tree before devirtualization and by a
 blaze of this change, each binary timed on the same iterations.
 

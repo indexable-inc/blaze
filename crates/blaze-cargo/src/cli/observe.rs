@@ -1,5 +1,5 @@
 //! blaze's looks at itself (docs/profiling.md): `blaze explore`, the explorer's link to the
-//! daemon (docs/v2/plan/lanes/observe/explore.md); `blaze debug profile`, `blaze debug live`
+//! daemon (docs/v2/plan/design/explore.md); `blaze debug profile`, `blaze debug live`
 //! and `blaze debug sql`, the daemon's flight recorder and its profile history; `blaze
 //! explain`, a rule's long text, the last build's failure of a package with all it blocks, or a
 //! named view of that history; and `blaze why`, what the last build computed again and why.
@@ -41,7 +41,16 @@ const DEBUG_USAGE: &str = "blaze debug profile [--seconds N] | blaze debug live 
                            | blaze debug gate [--build N] [--history DIR] [--json] [--summary FILE] \
                            | blaze debug locks [--build N] [--top N] [--json]";
 const EXPLAIN_USAGE: &str =
-    "blaze explain RULE | PACKAGE [--json] | VIEW [NAME=VALUE ...] [--json]";
+    "blaze explain RULE | PACKAGE [--json] | memory [BUILD] [limit=N] [--json] | VIEW [NAME=VALUE ...] [--json]";
+const MEMORY_USAGE: &str = "blaze explain memory [BUILD] [limit=N] [--json]";
+
+/// The parts of `blaze explain memory`, each a view of `sql/examples.sql`, with its heading.
+const MEMORY_PARTS: [(&str, &str, &str); 4] = [
+    ("timeline", "memory_timeline", "the memory, minute by minute"),
+    ("peak_tasks", "memory_peak_tasks", "the tasks that held the most at once"),
+    ("at_peak", "memory_at_peak", "the memory by area at the footprint's peak"),
+    ("sites", "memory_sites", "what churns the global heap, by call site"),
+];
 const WHY_USAGE: &str = "blaze why [ITEM] [--all] [--json]";
 const SLOW_USAGE: &str = "blaze slow [--build N] [--top N] [--json]";
 
@@ -616,6 +625,9 @@ fn explained(words: Vec<OsString>) -> Result<(), Refusal> {
         blaze_report::rules::explain_into(&mut text, rule);
         return stdout(&text);
     }
+    if name == "memory" {
+        return memory(words);
+    }
     if !views::VIEWS.iter().any(|it| it.name == name)
         && let Some(report) = failure_of(&name)?
     {
@@ -636,6 +648,64 @@ fn explained(words: Vec<OsString>) -> Result<(), Refusal> {
     }
     let sql = views::render(view, &args).map_err(|error| error.to_string())?;
     print(&run(&sql)?, shape)
+}
+
+/// `blaze explain memory [BUILD] [limit=N] [--json]`: who owned a build's memory, from its
+/// profile alone (docs/memory-footprint.md, step 1): the timeline per minute (footprint, live
+/// heap, blaze-mem, kept), the tasks with the largest peaks with their crate and unit, the
+/// breakdown by tag at the footprint's peak, and the call sites that allocated the most. Each
+/// part is a view of its own (`memory_timeline`, `memory_peak_tasks`, `memory_at_peak`,
+/// `memory_sites`); the build is the last one unless named. With `--json`, a line a row, each
+/// with its `part`.
+fn memory(words: impl Iterator<Item = String>) -> Result<(), Refusal> {
+    let (mut build, mut limit, mut json) = (None, None, false);
+    for word in words {
+        match (word.as_str(), word.split_once('=')) {
+            ("--json", _) => json = true,
+            (_, Some(("build", value))) | (value, None) if build.is_none() => {
+                let it = value.parse::<u64>().map_err(|_| {
+                    Refusal::Usage(format!("{MEMORY_USAGE}: the build is a number, not `{value}`"))
+                })?;
+                build = Some(it);
+            }
+            (_, Some(("limit", value))) if limit.is_none() => {
+                let it = value.parse::<u64>().map_err(|_| {
+                    Refusal::Usage(format!("{MEMORY_USAGE}: the limit is a number, not `{value}`"))
+                })?;
+                limit = Some(it);
+            }
+            _ => return Err(Refusal::Usage(format!("{MEMORY_USAGE}, not `{word}`"))),
+        }
+    }
+    let mut out = String::new();
+    for (part, name, heading) in MEMORY_PARTS {
+        let view = views::find(name).map_err(|error| error.to_string())?;
+        let mut args = Map::new();
+        if let Some(build) = build {
+            args.insert("build".to_owned(), Value::from(build));
+        }
+        if let Some(limit) = limit
+            && view.args.iter().any(|it| it.name == "limit")
+        {
+            args.insert("limit".to_owned(), Value::from(limit));
+        }
+        let sql = views::render(view, &args).map_err(|error| error.to_string())?;
+        let batches = run(&sql)?;
+        if json {
+            let rows = self::json(&batches)?;
+            for line in rows.lines() {
+                // Each row an object: its part first, then its columns.
+                let columns = line.strip_prefix('{').unwrap_or(line);
+                let sep = if columns.starts_with('}') { "" } else { "," };
+                _ = writeln!(out, "{{\"part\":\"{part}\"{sep}{columns}");
+            }
+        } else {
+            _ = writeln!(out, "{heading} ({name}):");
+            out.push_str(&table(&batches)?);
+            out.push('\n');
+        }
+    }
+    stdout(&out)
 }
 
 /// The file the CLI keeps the last build's failures in, for `blaze explain PACKAGE`: a JSON

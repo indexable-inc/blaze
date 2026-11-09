@@ -1,6 +1,6 @@
 // Inline components: the vocabulary of chips an agent writes in its words, `<Path loc="/Volumes/Projects/blaze">blaze</Path>`
 // (harness-native-ui-inline is the tag grammar; this module is what each name means). One entity per name: its icon
-// (`glyph`, or the file kind of where it points with `file_icon`), the prop that says where a press opens (`target`) and
+// (`glyph`, or the drawing of the file kind of where it points with `file_icon`), the prop that says where a press opens (`target`) and
 // the one with a line in it (`line`). A chip is the label in the UI face, medium, after its icon, on `rest`'s plate (clear)
 // at rest and `hover`'s under the pointer. A new component is an entity here; nothing in Rust
 // lists them. Depends on the primitives (prims.flecs: MarkdownText's chips) and the tokens.
@@ -31,10 +31,10 @@ rest {
 meta {
   Fill: $tone_ink_muted
 }
-// The chip under the pointer (a brighter plate, its label underlined) and held down (brighter still); the pointer is
-// the pointing hand over any chip that opens.
+// The chip under the pointer (a wash of the strong ink, its label underlined) and held down (brighter still); the
+// pointer is the pointing hand over any chip that opens. Washes, not the list's selection: a chip is not selected.
 hover {
-  Fill: $tone_selection_focus
+  Fill: $tone_wash
 }
 pressed {
   Fill: $tone_press
@@ -67,13 +67,28 @@ marks {
   }
 }
 
-// A file or a folder: its kind's icon; a press opens it (at `line`), an Option-press shows it in the Finder.
+// A file or a folder: its kind's icon (IntelliJ's, in its own colours: harness-native-ui-inline files.rs); a press opens
+// it (at `line`), an Option-press shows it in the Finder. Whether it is a folder the host finds out once a chat shows it
+// (the `fs` feed, src/app/chat/peek.rs), so /Volumes/Projects/blaze is a folder's icon though its name has no slash; a
+// place that is not there keeps its name's icon and says so as its tooltip.
 Path {
-  InlineRef: {target: "loc", line: "line", file_icon: true}
+  InlineRef: {target: "loc", line: "line", file_icon: true, key: "path:\{loc}", feed: "fs"}
+  folder { InlineRef: {file_icon: true, folder: true} }
+  file { InlineRef: {file_icon: true} }
+  unknown { InlineRef: {file_icon: true} }
+}
+// A cited phrase, `<Cite loc="/abs/AGENTS.md" line={96}>four at once is a lot</Cite>`: the words themselves, in the face
+// of the words around them, with a dotted underline; under the pointer the underline is solid and the card shows the
+// file from that line (the part cited, not the whole file); a press opens it there. Not a chip: no icon, no plate.
+Cite {
+  InlineRef: {target: "loc", line: "line", file_icon: false, plain: true}
 }
 // A cell's FileRef, by the same name and props as in a ts cell's UI.
 FileRef {
-  InlineRef: {target: "path", line: "line", file_icon: true}
+  InlineRef: {target: "path", line: "line", file_icon: true, key: "path:\{path}", feed: "fs"}
+  folder { InlineRef: {file_icon: true, folder: true} }
+  file { InlineRef: {file_icon: true} }
+  unknown { InlineRef: {file_icon: true} }
 }
 // A symbol in code (a type, a function): a press opens the file it is in, at its line.
 Symbol {

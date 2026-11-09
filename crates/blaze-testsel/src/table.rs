@@ -1,4 +1,4 @@
-//! A test binary's functions as selection sees them (docs/v2/plan/lanes/fastcompile/select.md,
+//! A test binary's functions as selection sees them (docs/v2/plan/design/compile-time.md,
 //! "Keys"), made from what codegen says of the binary.
 //!
 //! Each function is a [`Version`]: its identity ([`FnId`], the same across edits of its body)

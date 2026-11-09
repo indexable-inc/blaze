@@ -22,7 +22,10 @@
 //! has it the keys go there (`AppUp::Key` with the Mac key code and the characters) after the bindings in ctx.Browser
 //! (cmd+L, cmd+[, cmd+], cmd+R: scene/20-keys.flecs), and the input method's work goes through the window's
 //! NSTextInputClient path as `AppUp::Ime` (setMarkedText: Set, insertText: Commit, unmarkText: Finish). A card's press
-//! opens its view in the pane.
+//! opens its view in the pane; a `web:open:<url>` action (a check's row on a pull request's hover card), an `open:` web
+//! link and a chat's link or chip (a pull request, an issue, a page) open that page in the pane as a view of its own
+//! ([`App::open_target`]), and so does a file a chat or a cell names, as a `file://` page; Option-pressed, either opens
+//! outside (the system's browser, the file's own app).
 use super::*;
 use harness_mach::iosurface::Surface as IoSurface;
 use harness_mach::{Msg, RecvPort, SendRight, Source};
@@ -38,8 +41,24 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
-/// The pane's state, on `hn.web` (scene/widgets/web.flecs): the view it shows (0 none yet), whether it is open, its width
-/// in points (0: hn.WebPane's).
+mod drag;
+mod fileview;
+
+/// The `file://` URL of absolute path `path`: each byte outside the unreserved set and `/` percent-encoded.
+fn file_url(path: &str) -> String {
+    let mut out = String::from("file://");
+    for b in path.bytes() {
+        if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// The pane's state, on `hn.web` (scene/widgets/web.flecs): the view it shows (0 none yet), whether it is open (asked
+/// for: it shows only once it has a page, [`App::web_shown`]), its width in points as last dragged (0: hn.WebPane's).
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct WebState {
     pub view: u64,
@@ -144,6 +163,10 @@ pub(super) struct Browser {
     ext_req: Option<u64>,
     extensions: Option<Vec<Extension>>,
     popup: Option<u64>,
+    /// A page to open in the pane as a view of its own once the link is up (a check's log from a chat card, `web:open:`).
+    go: Option<String>,
+    /// The pane's left edge while it is dragged (drag.rs).
+    drag: Option<drag::Grab>,
 }
 
 impl Browser {
@@ -181,6 +204,8 @@ impl Browser {
             ext_req: None,
             extensions: None,
             popup: None,
+            go: None,
+            drag: None,
         }
     }
 
@@ -386,11 +411,72 @@ impl App {
             self.set_web(s);
             self.web_focus_page();
         } else {
-            self.set_web(s);
-            self.web_blur();
-            self.browser.menu = false;
-            self.browser.url = None;
+            self.web_shut(s);
         }
+    }
+
+    /// Shut the pane at `s` (its `open` cleared): the keyboard, the address and the extensions menu leave with it.
+    fn web_shut(&mut self, s: WebState) {
+        self.set_web(WebState { open: false, ..s });
+        self.web_blur();
+        self.browser.menu = false;
+        self.browser.url = None;
+    }
+
+    /// Whether the pane shows: open, with its page's picture in (or a reason the harness browser gave for there being
+    /// none: a refused link or open, a view it closed or whose frames it could not take). It never stands open on nothing:
+    /// asked for before the page is made and has drawn, it opens on the page's first frame.
+    pub(super) fn web_shown(&self) -> bool {
+        let s = self.web();
+        let b = &self.browser;
+        if !s.open {
+            return false;
+        }
+        if matches!(b.conn, Conn::Failed(_)) || b.note.is_some() {
+            return true;
+        }
+        s.view != 0
+            && !b.closed.contains_key(&s.view)
+            && (b.errors.contains_key(&s.view) || b.media.as_ref().is_some_and(|m| m.borrow().browser_showing(s.view)))
+    }
+
+    /// Open `url` in the pane, as a view of its own (the pane shows it once the host made it; what the pane showed stays
+    /// a view): the pane opens, the link is asked for if it is not up, and the next frame sends the open.
+    fn web_open(&mut self, url: &str) {
+        self.browser.note = None;
+        if matches!(self.browser.conn, Conn::Failed(_)) {
+            self.browser.conn = Conn::Idle;
+        }
+        self.browser.go = Some(url.to_owned());
+        let s = self.web();
+        self.set_web(WebState { open: true, ..s });
+        self.web_focus_page();
+    }
+
+    /// Open what a press on a link names (an `open:` action, a chat's link or inline component: `<url>`, `<path>` or
+    /// `<line>:<path>`) in the pane on the right, as a view of its own: a web page, or a file or folder as a `file://`
+    /// page (a text file as fileview.rs's page of it: markdown rendered, its line marked). With Option held (`alt`) it opens outside instead, as crate::open says: a page in the system's browser, a
+    /// file in the app its kind opens in, at its line.
+    pub(crate) fn open_target(&mut self, target: &str, alt: bool) {
+        if alt {
+            return crate::open::open(target, false);
+        }
+        let (line, path) = match target.split_once(':') {
+            Some((n, rest)) if rest.starts_with('/') && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => (n.parse::<u32>().ok(), rest),
+            _ => (None, target),
+        };
+        if target.starts_with("https://") || target.starts_with("http://") || target.starts_with("file://") {
+            self.web_open(target);
+        } else if path.starts_with('/') {
+            // A text file as a page of its own (fileview.rs): markdown rendered, the line it was opened at marked. Anything
+            // else (a folder, a picture, a page) as the file itself.
+            let shown = fileview::page(path, line);
+            self.web_open(&file_url(shown.as_deref().and_then(|p| p.to_str()).unwrap_or(path)));
+        } else {
+            eprintln!("harness-native: open {target:?}: not a web link or an absolute path");
+            return;
+        }
+        self.poke();
     }
 
     /// Open the pane on `view`, its page focused.
@@ -483,6 +569,11 @@ impl App {
             self.web_show(v);
             return;
         }
+        if let Some(url) = a.strip_prefix("open:") {
+            self.web_open(url);
+            self.poke();
+            return;
+        }
         if let Some(id) = a.strip_prefix("ext:") {
             let view = self.web().view;
             let req = self.browser.req();
@@ -554,16 +645,23 @@ impl App {
         if let Some(p) = self.web_page() {
             set_if(self.world.entity_from_id(p), BrowserView { view: s.view, src: "".into() });
         }
-        // A refused open stays refused (its plate says why) until the pane is opened again.
+        // A page asked for (`web:open:`) opens as a view of its own, the pane's once it is made; an open pane with no view
+        // gets a blank one. A refused open stays refused (its plate says why) until the pane is opened again.
         if s.open
-            && s.view == 0
             && self.browser.live()
             && self.browser.note.is_none()
             && !self.browser.opening.values().any(|o| matches!(o, Opening::Pane))
         {
-            let req = self.browser.req();
-            self.browser.opening.insert(req, Opening::Pane);
-            self.browser.up(&AppUp::Open { req, url: BLANK.into() });
+            let url = match self.browser.go.take() {
+                Some(url) => Some(url),
+                None if s.view == 0 => Some(BLANK.to_owned()),
+                None => None,
+            };
+            if let Some(url) = url {
+                let req = self.browser.req();
+                self.browser.opening.insert(req, Opening::Pane);
+                self.browser.up(&AppUp::Open { req, url });
+            }
         }
         for (e, bv) in nodes {
             self.browser_node(e, &bv);
@@ -676,6 +774,15 @@ impl App {
                 if let Some(m) = media {
                     m.borrow_mut().browser_forget(view);
                 }
+                // The pane never stands empty: it moves to the newest page left, or shuts when none is.
+                let s = self.web();
+                if s.view == view {
+                    let next = self.browser.views.keys().copied().filter(|v| !self.browser.closed.contains_key(v)).max();
+                    match next {
+                        Some(next) => self.set_web(WebState { view: next, ..s }),
+                        None => self.web_shut(WebState { view: 0, ..s }),
+                    }
+                }
             }
             AppDown::Extensions { req, extensions } => {
                 if b.ext_req == Some(req) {
@@ -694,17 +801,16 @@ impl App {
         }
     }
 
-    /// Spring the pane's clip toward its width (open) or 0 (shut), on the sidebar's spring; the pane keeps its full width.
+    /// Spring the pane's clip toward its width (shown) or 0 (shut, or first opened with no page yet), on the sidebar's
+    /// spring; the pane keeps its full width.
     fn browser_fold(&mut self, dt: f32) {
-        let s = self.web();
         let mut moved = false;
+        let full = self.web_width();
+        // Out already and still open: it stays out while a page opened in it loads (the new view has no frame yet, so
+        // `web_shown` is false for a moment), never folding away and coming out again.
+        let stays = self.web().open && self.browser.x.x > 0.0;
+        let target = f32::from(u8::from(self.web_shown() || stays));
         let w = self.world.world_ref();
-        let full = if s.width > 0.0 {
-            s.width
-        } else {
-            view::prefab(w, "hn.WebPane").and_then(|p| p.try_cloned::<&Size>()).map_or(0.0, |z| z.w.value)
-        };
-        let target = f32::from(u8::from(s.open));
         if !self.browser.x.settled(target) {
             let tune = crate::look::tune(w, "sidebar");
             if !settle(&mut self.browser.x, target, tune, dt) {
@@ -741,7 +847,8 @@ impl App {
             if let Some(why) = b.note.as_ref().filter(|_| src.is_empty()) {
                 return format!("The harness browser refused: {why}");
             }
-            return if src.is_empty() { "No page".into() } else { format!("Opening {}", short(src)) };
+            // The pane has no page only while it folds away (it shuts when its last page goes): no words over it.
+            return if src.is_empty() { String::new() } else { format!("Opening {}", short(src)) };
         };
         if let Some(why) = b.closed.get(&view) {
             return format!("The harness browser closed this page: {why}");
@@ -822,6 +929,18 @@ impl App {
         let s = self.web();
         let info = self.browser.views.get(&s.view).cloned();
         if let Some(bar) = pane.part("bar") {
+            // The toolbar is out of the way: the page fills the pane, and the bar (back, forward, reload, the address)
+            // comes only while the address is edited (cmd+L) or the extensions menu is open.
+            let want = if self.browser.url.is_some() || self.browser.menu {
+                view::prefab(self.world.world_ref(), "hn.WebPane").and_then(|p| View::of(p).part("bar")).and_then(|b| b.entity().try_cloned::<&Size>())
+            } else {
+                bar.entity().try_cloned::<&Size>().map(|s| Size { h: Sizing::fixed(0.0), ..s })
+            };
+            if let Some(want) = want
+                && bar.entity().try_cloned::<&Size>() != Some(want)
+            {
+                bar.set(want);
+            }
             for (part, glyph) in
                 [("back", BACK_ICON), ("forward", FORWARD_ICON), ("reload", RELOAD_ICON), ("ext", EXT_ICON), ("close", CLOSE_ICON)]
             {
@@ -837,7 +956,7 @@ impl App {
                 t.text(&shown);
             }
         }
-        if let Some(l) = pane.part("load") {
+        if let Some(l) = pane.part("page").and_then(|p| p.part("load")) {
             hairline(l.entity(), info.as_ref().is_some_and(|i| i.loading));
         }
         let Some(holder) = pane.part("menu") else { return };

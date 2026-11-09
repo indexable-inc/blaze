@@ -1,7 +1,7 @@
 //! [`instance_identity`]: compile identity, what one instance's generated code depends on,
 //! by one walk of its generic body in two passes. Two instances of one body with one
 //! identity compile to one body: this is what the code generator's ICF folds by
-//! (`docs/v2/plan/lanes/codegen/icf.md`), and what replaces an instance's arguments in its
+//! (`docs/v2/plan/design/icf.md`), and what replaces an instance's arguments in its
 //! instance key.
 //!
 //! - [`sites`], once per generic body and options, walks the body and lists, in walk order,
@@ -303,7 +303,7 @@ thread_local! {
 /// instance asked from outside (a root of the code generator's) can be past it; and the depth a
 /// chain of asks starts from bounds how many steps down it can take.
 /// It reads only the instance's own key, so the answer is the same whichever root asks first
-/// (rules 18 and 22). It is no limit on what builds: rustc's recursion limit, which counts how
+/// (rules 21 and 25). It is no limit on what builds: rustc's recursion limit, which counts how
 /// often one body repeats along the collector's path of instances (`check_recursion_limit`), is
 /// the build's walk's (`blaze_codegen`'s `driver/recursion.rs`). A type written
 /// this deep by hand, with no recursion, builds: it is only compiled for its arguments.
@@ -1221,7 +1221,7 @@ impl<'a, 'db> Walk<'a, 'db> {
     /// projection's value passes only where it equals one of the instance's arguments, kept in
     /// order, and two arguments that differ only in their lifetimes are one.
     ///
-    /// That bounds every chain of asks by its keys alone (rules 15 and 18). Along a chain the
+    /// That bounds every chain of asks by its keys alone (rules 18 and 21). Along a chain the
     /// depth never rises, so it falls at most [`SHARED_DEPTH`] times. Between two falls each ask
     /// is a sub-list, so the number of arguments never rises; while it holds too, the arguments
     /// are equal, so each ask is of another body with the same arguments, and a body that comes
@@ -1497,7 +1497,7 @@ impl<'a, 'db> Walk<'a, 'db> {
         // for their lifetimes (`'static` or a reordering of the caller's early-bound lifetimes,
         // or of `&u8` type arguments that differ only in region) are one key, so they are one
         // `CALLEE_SELF`, one ask and one `Instance`, and a chain of asks is bounded by its keys
-        // up to regions as [`Self::asks`] says (review 6, C1; rules 15 and 18). Compile identity
+        // up to regions as [`Self::asks`] says (review 6, C1; rules 18 and 21). Compile identity
         // reads no region, so this only merges keys.
         let args = erased(self.cx.interner, args);
         let mut h = Hasher::new(CALLEE_DOMAIN);
@@ -1546,7 +1546,7 @@ impl<'a, 'db> Walk<'a, 'db> {
             Err(why) if why.is_per_instance() => {
                 h.update(&[tag::CALLEE_ARGS]).id(&identity::args(db, args)?)
             }
-            // Rule 16: the caller's error names the callee it went through, not only the body
+            // Rule 19: the caller's error names the callee it went through, not only the body
             // that calls the intrinsic. The callee calls it itself only where the body is the
             // callee's own; one in a closure of the callee, or further on, is reached.
             Err(Unshared::UnknownIntrinsic { name, body: at, through }) => {
@@ -1577,7 +1577,7 @@ impl<'a, 'db> Walk<'a, 'db> {
             Class::Layout => {
                 let db = self.db();
                 let mut h = Hasher::new(CALLEE_DOMAIN);
-                // By name, never by index: the index shifts when an intrinsic is added (rule 18).
+                // By name, never by index: the index shifts when an intrinsic is added (rule 21).
                 h.update(&[tag::CALLEE_INTRINSIC]).part(intrinsic.symbol().as_str().as_bytes());
                 h.id(&self.args_facts(args.iter())?);
                 // An intrinsic the code generator does not make inline calls its fallback body.

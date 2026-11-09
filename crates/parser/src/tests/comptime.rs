@@ -1,5 +1,5 @@
 //! blaze's `#![feature(blaze_comptime)]` syntax (`docs/v2/plan/design/comptime.md`): `for const`,
-//! `x.[f]` and bounded `for<F: ..>` binders in where clauses. The parser takes them in every
+//! `x.[f]`, bounded `for<F: ..>` binders in where clauses and `const static { .. }` blocks. The parser takes them in every
 //! crate; hir-def lowering refuses them without the feature.
 
 use super::{has_run, parse_lines};
@@ -103,4 +103,39 @@ fn code_without_the_extension_parses_as_before() {
     assert!(!errors.is_empty(), "a `.` with nothing after it is still an error");
     let (_, errors) = parse_lines("fn f() { for const in x {} }", Edition::CURRENT);
     assert!(!errors.is_empty(), "`for const` still needs a pattern");
+}
+
+#[test]
+fn const_static_is_a_block_expr_with_a_const_and_a_static_token() {
+    let comptime = clean("fn f() { let x = const static { g() }; const static { h(); } }");
+    let plain = clean("fn f() { let x = const { g() }; const { h(); } }");
+    let run = ["BLOCK_EXPR", "CONST_KW \"const\"", "WHITESPACE \" \"", "STATIC_KW \"static\""];
+    assert!(has_run(&comptime, &run), "{comptime:#?}");
+    // In statement position too: a block, no item.
+    assert_eq!(comptime.iter().filter(|it| *it == "BLOCK_EXPR").count(), 3, "{comptime:#?}");
+    assert!(!comptime.iter().any(|it| it == "CONST" || it == "STATIC"), "{comptime:#?}");
+    // Apart from `static` and its space, the same tree as the plain `const` blocks'.
+    let stripped: Vec<_> = comptime
+        .iter()
+        .enumerate()
+        .filter(|(i, it)| {
+            *it != "STATIC_KW \"static\""
+                && !(*it == "WHITESPACE \" \""
+                    && comptime.get(i + 1).is_some_and(|n| n == "STATIC_KW \"static\""))
+        })
+        .map(|(_, it)| it.clone())
+        .collect();
+    assert_eq!(stripped, plain);
+}
+
+/// `const static` before a closure's `|`, and `const` and `static` items, parse as before.
+#[test]
+fn const_static_without_a_brace_is_as_before() {
+    let tree =
+        clean("const X: u8 = 1; static Y: u8 = 2; fn f() { const Z: u8 = 3; let c = const static || 1; }");
+    assert!(tree.iter().any(|it| it == "CONST"), "{tree:#?}");
+    assert!(tree.iter().any(|it| it == "STATIC"), "{tree:#?}");
+    assert!(tree.iter().any(|it| it == "CLOSURE_EXPR"), "{tree:#?}");
+    let blocks = tree.iter().filter(|it| *it == "BLOCK_EXPR").count();
+    assert_eq!(blocks, 1, "the function's body, no `const static` block: {tree:#?}");
 }

@@ -600,7 +600,7 @@ impl Storage {
             return;
         }
         // Named, so a build's time moving edges is its own, never its writer's self time
-        // (rule 14).
+        // (rule 16).
         let _settle =
             tracing::info_span!(target: "blaze", "edge settle", view = self.view, live, dead)
                 .entered();
@@ -787,7 +787,7 @@ impl Storage {
     #[cold]
     fn pass(&mut self, tag: Tag, budget: u64) -> usize {
         // Named, so a build's time in passes is the pass's, never its writer's self time
-        // (rule 14): each input write opens a view, and any view may pass.
+        // (rule 16): each input write opens a view, and any view may pass.
         let span = tracing::info_span!(
             target: "blaze",
             "lru pass",

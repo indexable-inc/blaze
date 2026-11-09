@@ -2486,7 +2486,7 @@ pub(crate) struct InferenceContext<'db, 'f> {
     pub(crate) table: unify::InferenceTable<'db>,
     pub(crate) lang_items: &'db LangItems,
     pub(crate) features: &'db UnstableFeatures,
-    /// The run's frame (docs/v2/plan/lanes/mem/db-infer.md, R1): `result`'s tables and every
+    /// The run's frame (docs/v2/plan/design/memory.md, R1): `result`'s tables and every
     /// temporary below live in it until the result is frozen.
     pub(crate) frame: &'f Frame,
     pub(crate) result: InferenceTables<'db, 'f>,

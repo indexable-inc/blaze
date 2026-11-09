@@ -1,4 +1,4 @@
-//! Where a task's memory is measured (docs/v2/plan/lanes/core.md section 4, "Memory-budget
+//! Where a task's memory is measured (docs/v2/plan.md section 4, "Memory-budget
 //! admission").
 //!
 //! [`Counting`] is the daemon's global allocator: it counts the bytes the process holds
@@ -14,13 +14,22 @@
 //! in its frames ([`blaze_mem::frame::task`]) is [`blaze_mem::frame::measure`]'s, and the
 //! frames' cap is [`blaze_mem::frame::Cap`]. [`machine_budget`] is the memory the plane may
 //! grant: the machine's limit, less what others use in blaze's own cgroup and a margin.
+//!
+//! Besides what is held, it counts the churn: the bytes allocated and freed in all, never
+//! netted, per account ([`Spent`]) and per tag (`blaze_mem::tag::heap_churned`), and every
+//! [`SAMPLE_EVERY`] bytes a thread allocates it hands one allocation to the heap sampler
+//! ([`sample_heap_with`]: the profiler walks its stack), so what churns the global heap has an
+//! answer by task, by tag and by call site (docs/memory-footprint.md, step 1).
 
 use std::{
     cell::Cell,
     fmt, io,
     num::NonZeroUsize,
     path::Path,
-    sync::atomic::{AtomicI64, AtomicPtr, AtomicU32, AtomicUsize, Ordering},
+    sync::{
+        OnceLock,
+        atomic::{AtomicI64, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    },
 };
 
 use blaze_mem::Tag;
@@ -28,7 +37,7 @@ use crossbeam_queue::SegQueue;
 
 use crate::Budget;
 
-pub use global::Holders;
+pub use global::{Holders, Malloc};
 
 /// How far a thread's count may move before it is added to [`HELD`] (Linux's
 /// `percpu_counter`): an allocation then costs a few thread-local adds and no atomic, and
@@ -53,6 +62,10 @@ struct Local {
     /// What this thread allocated less what it freed for `account` since it last charged it:
     /// charged at [`ACCOUNT_BATCH`], and whenever the thread's account changes.
     charged: Cell<i64>,
+    /// What this thread allocated, and what it freed, for `account` since it last charged it,
+    /// each in all (never netted): charged with `charged`.
+    charged_allocated: Cell<u64>,
+    charged_freed: Cell<u64>,
     /// What `net` moved since it was last added to [`HELD`].
     unflushed: Cell<i64>,
     /// How far `unflushed` may go before it is added: 0 until the flush at the thread's exit is
@@ -63,6 +76,15 @@ struct Local {
     /// (`blaze_mem::tag::heap_moved`), by [`slot`]: each tag's, then what was allocated outside
     /// any task. Folded at `batch` each, as `unflushed` is.
     holders: [Cell<i64>; HOLDERS],
+    /// What this thread allocated, and freed, of each holder's blocks since it last folded them
+    /// into its tag line (`blaze_mem::tag::heap_churned`), by [`slot`]: each folded at
+    /// [`CHURN_BATCH`].
+    churn_allocated: [Cell<u64>; HOLDERS],
+    churn_freed: [Cell<u64>; HOLDERS],
+    /// The bytes this thread allocates before its next heap sample ([`SAMPLE_EVERY`]).
+    sample_left: Cell<i64>,
+    /// The heap sampler runs on this thread now: what it allocates is not sampled again.
+    sampling: Cell<bool>,
     #[cfg(test)]
     flushed: Cell<i64>,
 }
@@ -89,10 +111,16 @@ thread_local! {
             net: Cell::new(0),
             account: Cell::new(0),
             charged: Cell::new(0),
+            charged_allocated: Cell::new(0),
+            charged_freed: Cell::new(0),
             unflushed: Cell::new(0),
             batch: Cell::new(0),
             armed: Cell::new(false),
             holders: [const { Cell::new(0) }; HOLDERS],
+            churn_allocated: [const { Cell::new(0) }; HOLDERS],
+            churn_freed: [const { Cell::new(0) }; HOLDERS],
+            sample_left: Cell::new(SAMPLE_EVERY),
+            sampling: Cell::new(false),
             #[cfg(test)]
             flushed: Cell::new(0),
         }
@@ -103,7 +131,7 @@ thread_local! {
 /// [`LOCAL`]'s reader, but for [`count`]'s own. Not inlined: the allocator counts through it from a job's code,
 /// which may wait and resume on another thread, and an inlined read would let the job keep
 /// the first thread's `Local` across the wait and count into it from the second, a data race
-/// on its cells (rule 24, as pool.rs's caches were in checkpoint 36). One direct call per
+/// on its cells (rule 27, as pool.rs's caches were in checkpoint 36). One direct call per
 /// allocation.
 #[inline(never)]
 fn with_local<R>(f: impl FnOnce(&Local) -> R) -> R {
@@ -122,6 +150,12 @@ impl Drop for Exit {
 /// once: what the thread's other destructors free still counts. What it added.
 fn exit_flush(local: &Local) -> i64 {
     local.batch.set(0);
+    fold_all(local)
+}
+
+/// Adds what the thread's count moved since it last did to [`HELD`] and each holder's to its
+/// tag line. What it added to [`HELD`].
+fn fold_all(local: &Local) -> i64 {
     let left = local.unflushed.replace(0);
     add(local, left);
     for (at, moved) in local.holders.iter().enumerate() {
@@ -130,7 +164,46 @@ fn exit_flush(local: &Local) -> i64 {
             blaze_mem::tag::heap_moved(holder_of(at), moved);
         }
     }
+    for (at, (allocated, freed)) in
+        local.churn_allocated.iter().zip(&local.churn_freed).enumerate()
+    {
+        let (allocated, freed) = (allocated.replace(0), freed.replace(0));
+        if (allocated, freed) != (0, 0) {
+            blaze_mem::tag::heap_churned(holder_of(at), allocated, freed);
+        }
+    }
     left
+}
+
+/// Folds what this thread's count moved since it last did into [`held`] and the tags' lines
+/// (`blaze_mem::tag::Counters::heap`), which otherwise take it once it moves [`BATCH`]: a
+/// reading after it is exact for what this thread allocated and freed, within [`BATCH`] for
+/// each other thread. Allocates nothing.
+pub fn fold_here() {
+    with_local(|local| {
+        fold_all(local);
+    });
+}
+
+/// [`count`] for a thread whose thread-locals are not there to count into
+/// ([`Locals::Gone`]): straight to [`HELD`] and the holder's tag line, two atomic adds, and
+/// to no account (the task that ran on the thread is over, or none began). Touches no
+/// thread-local.
+fn count_shared(holder: Option<Tag>, delta: i64) {
+    HELD.0.fetch_add(delta, Ordering::Relaxed);
+    blaze_mem::tag::heap_moved(holder, delta);
+}
+
+/// Where a block C allocated or freed is counted ([`Counting::c_malloc`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Locals {
+    /// In the thread's counts and its job's account, as a block of Rust's is.
+    Live,
+    /// Straight to the process's totals ([`count_shared`]), touching no thread-local: on
+    /// macOS, dyld makes a thread's thread-locals with `malloc` the first time the thread
+    /// touches one, and frees them with `free` as the thread ends, so a `malloc` or `free`
+    /// there that counted through them would make them again, through itself.
+    Gone,
 }
 
 #[cfg_attr(not(test), allow(unused_variables))]
@@ -140,9 +213,10 @@ fn add(local: &Local, bytes: i64) {
     local.flushed.set(local.flushed.get().wrapping_add(bytes));
 }
 
-/// Per allocation: one thread-local block, four adds and three well-predicted branches; the
-/// atomic adds are in [`flush`], [`fold`] and [`charge`], once per [`BATCH`] (or
-/// [`ACCOUNT_BATCH`]) bytes of drift. `holder` is the tag whose task allocated the bytes
+/// Per allocation: one thread-local block, seven adds and five well-predicted branches; the
+/// atomic adds are in [`flush`], [`fold`], [`churn`] and [`charge`], once per [`BATCH`] (or
+/// [`ACCOUNT_BATCH`], [`CHURN_BATCH`]) bytes, and the heap sample in [`sample`], once per
+/// [`SAMPLE_EVERY`] bytes allocated. `holder` is the tag whose task allocated the bytes
 /// ([`Holders`]).
 ///
 /// [`LOCAL`]'s other reader, not inlined for the same reason as [`with_local`], and reading it
@@ -155,6 +229,10 @@ fn count(holder: Option<Tag>, delta: i64) {
         local.net.set(local.net.get().wrapping_add(delta));
         let account = local.account.get();
         if account != 0 {
+            match delta >= 0 {
+                true => local.charged_allocated.set(local.charged_allocated.get() + delta as u64),
+                false => local.charged_freed.set(local.charged_freed.get() + delta.unsigned_abs()),
+            }
             let charged = local.charged.get().wrapping_add(delta);
             if charged.unsigned_abs() < ACCOUNT_BATCH.unsigned_abs() {
                 local.charged.set(charged);
@@ -162,8 +240,26 @@ fn count(holder: Option<Tag>, delta: i64) {
                 charge(local, account, charged);
             }
         }
+        let at = slot(holder);
+        let (churned, gross) = match delta >= 0 {
+            true => (&local.churn_allocated[at], delta as u64),
+            false => (&local.churn_freed[at], delta.unsigned_abs()),
+        };
+        let churn_now = churned.get() + gross;
+        churned.set(churn_now);
+        if churn_now >= CHURN_BATCH {
+            churn(local, at);
+        }
+        if delta > 0 {
+            let left = local.sample_left.get() - delta;
+            if left > 0 {
+                local.sample_left.set(left);
+            } else {
+                sample(local, holder, delta as u64, left);
+            }
+        }
         let batch = local.batch.get().unsigned_abs();
-        let moved = &local.holders[slot(holder)];
+        let moved = &local.holders[at];
         let held = moved.get().wrapping_add(delta);
         if held.unsigned_abs() < batch {
             moved.set(held);
@@ -177,6 +273,63 @@ fn count(holder: Option<Tag>, delta: i64) {
             flush(local, unflushed);
         }
     });
+}
+
+/// Folds what this thread allocated and freed of the holder at `at` into its tag line.
+#[cold]
+#[inline(never)]
+fn churn(local: &Local, at: usize) {
+    let allocated = local.churn_allocated[at].replace(0);
+    let freed = local.churn_freed[at].replace(0);
+    blaze_mem::tag::heap_churned(holder_of(at), allocated, freed);
+}
+
+/// How many bytes a thread allocates between two heap samples: each sample stands for this
+/// many (a block past it, for as many times it as it spans), so the bytes allocated at a call
+/// site are its samples' weights summed, within a sample's. 4 MiB: a build that churns a GiB a
+/// second takes 256 samples a second, a walk of about 100 system calls each
+/// (`blaze_profile::heap`), and the profile's ring holds half a minute of them.
+pub const SAMPLE_EVERY: i64 = 4 << 20;
+
+/// One allocation the heap sampler is handed ([`sample_heap_with`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeapSampled {
+    /// The tag of the task that made it; `None` outside any task, or where the allocator keeps
+    /// no tags.
+    pub holder: Option<Tag>,
+    /// Its bytes.
+    pub bytes: u64,
+    /// The bytes allocated on its thread this sample stands for: [`SAMPLE_EVERY`] times the
+    /// samples it is (more than one for a block past it).
+    pub weight: u64,
+}
+
+/// The heap sampler, set once ([`sample_heap_with`]).
+static HEAP_SAMPLER: OnceLock<fn(HeapSampled)> = OnceLock::new();
+
+/// Every [`SAMPLE_EVERY`] bytes a thread allocates through [`Counting`], `sampler` is handed
+/// the allocation that crossed it, on the allocating thread, inside the allocator: it must not
+/// lock, and what it allocates is neither sampled nor sent back to it (the profiler walks the
+/// thread's frame pointers into a ring of its own, `blaze_profile::heap`). The first call wins.
+pub fn sample_heap_with(sampler: fn(HeapSampled)) {
+    _ = HEAP_SAMPLER.set(sampler);
+}
+
+/// A thread's allocation of `bytes` took its count `left` to or past 0: the next sample is
+/// due in [`SAMPLE_EVERY`] past it, and this allocation is the sample, standing for as many
+/// strides as it crossed.
+#[cold]
+#[inline(never)]
+fn sample(local: &Local, holder: Option<Tag>, bytes: u64, left: i64) {
+    // `left` is above -(isize::MAX), so this is at least 1 and fits.
+    let strides = left.unsigned_abs() / SAMPLE_EVERY as u64 + 1;
+    local.sample_left.set(left + (strides * SAMPLE_EVERY as u64) as i64);
+    let Some(sampler) = HEAP_SAMPLER.get() else { return };
+    if local.sampling.replace(true) {
+        return;
+    }
+    sampler(HeapSampled { holder, bytes, weight: strides * SAMPLE_EVERY as u64 });
+    local.sampling.set(false);
 }
 
 /// Folds what `holder`'s count on this thread moved into its tag line.
@@ -228,7 +381,7 @@ mod global {
 
     use blaze_mem::Tag;
 
-    use super::{Counting, count, signed};
+    use super::{Counting, Locals, count, count_shared, signed};
 
     /// What [`Counting`] asks of the allocator under it to name the holder of a block: the
     /// blaze-mem tag whose task allocated it, kept apart so that a free, on any thread, finds
@@ -268,6 +421,39 @@ mod global {
             layout: Layout,
             new_size: usize,
         ) -> *mut u8;
+    }
+
+    /// What [`Counting`] asks of the allocator under it to serve C's `malloc`, `free` and
+    /// `realloc` (blaze-engine's `malloc.rs`), which name no layout: a block's owner and size
+    /// from its address alone. Every block C allocates through it is counted at its usable size,
+    /// as it is made and again as it is freed, so the two cancel whatever size was asked.
+    pub trait Malloc: Holders {
+        /// Whether `ptr` is in a block of this allocator's. Any address may be asked, one of
+        /// another allocator's too. Allocates nothing.
+        fn owns(&self, ptr: *const u8) -> bool;
+
+        /// The bytes `ptr`'s block holds: what C may use of it, and what it is counted at.
+        ///
+        /// # Safety
+        ///
+        /// `ptr` is a live block of this allocator.
+        unsafe fn usable(&self, ptr: *mut u8) -> usize;
+
+        /// Frees `ptr`, whatever layout it was made with.
+        ///
+        /// # Safety
+        ///
+        /// `ptr` is a live block of this allocator, not used after.
+        unsafe fn free(&self, ptr: *mut u8);
+
+        /// C's `realloc` of `ptr` to `new_size` bytes, at `malloc`'s alignment, putting the
+        /// block among `into`'s blocks when it moves, as [`Holders::realloc_for`] does.
+        ///
+        /// # Safety
+        ///
+        /// `ptr` is a live block of this allocator; once this returns non-null, `ptr` is
+        /// not used again.
+        unsafe fn realloc_in(&self, into: Option<Tag>, ptr: *mut u8, new_size: usize) -> *mut u8;
     }
 
     /// std's allocator keeps no blocks apart: its bytes are counted, not named.
@@ -386,12 +572,110 @@ mod global {
             new
         }
     }
+
+    /// C's allocator, over `A`: the entry points blaze's `malloc`, `free` and `realloc` (and
+    /// on macOS its malloc zone) call, so a block C or C++ allocates (LLVM, through its C API
+    /// and its `operator new`) is made for the running task's tag and counted as Rust's are.
+    /// A block is counted at its usable size ([`Malloc::usable`]).
+    impl<A: Malloc> Counting<A> {
+        /// `malloc` (`zeroed`: `calloc`), and with `align` past a word `posix_memalign`,
+        /// `aligned_alloc` and the rest: a block of at least `size` bytes, in the running
+        /// task's tag, counted in this thread's counts ([`Locals::Live`]). Null where the
+        /// allocator has none, or `size` and `align` make no layout.
+        ///
+        /// # Safety
+        ///
+        /// `align` is a power of two; the thread's thread-locals are there to count into.
+        pub unsafe fn c_malloc(&self, size: usize, align: usize, zeroed: bool) -> *mut u8 {
+            // `malloc(0)` is a block of its own, as mimalloc makes it; a layout of 0 bytes is
+            // outside `GlobalAlloc`'s contract.
+            let Ok(layout) = Layout::from_size_align(size.max(1), align) else {
+                return std::ptr::null_mut();
+            };
+            let holder = Self::running();
+            // SAFETY: a valid layout of a nonzero size.
+            let ptr = unsafe {
+                match (holder, zeroed) {
+                    (Some(tag), _) => self.0.alloc_for(tag, layout, zeroed),
+                    (None, true) => self.0.alloc_zeroed(layout),
+                    (None, false) => self.0.alloc(layout),
+                }
+            };
+            if !ptr.is_null() {
+                // SAFETY: the live block just made.
+                count(holder, signed(unsafe { self.0.usable(ptr) }));
+            }
+            ptr
+        }
+
+        /// `free` of `ptr`, a live block of `A` (`usable`: its size, where the caller has it
+        /// from `A` already), taken off the tag whose heap holds it, wherever it was made.
+        ///
+        /// # Safety
+        ///
+        /// `ptr` is a live block of `A`, not used after; `usable`, if given, is
+        /// [`Malloc::usable`] of it.
+        pub unsafe fn c_free(&self, ptr: *mut u8, usable: Option<usize>, locals: Locals) {
+            // SAFETY: the caller says `ptr` is a live block of `A`.
+            let (holder, bytes) = unsafe {
+                (self.holder(ptr), usable.unwrap_or_else(|| self.0.usable(ptr)))
+            };
+            // SAFETY: as above, freed once.
+            unsafe { self.0.free(ptr) };
+            tally(locals, holder, -signed(bytes));
+        }
+
+        /// `realloc` of `ptr`, a live block of `A`, to `new_size` bytes: one that moves goes
+        /// to the running task's tag ([`Locals::Live`]; the untagged blocks where the thread's
+        /// thread-locals are gone, which name no task), as Rust's do. Null, `ptr` untouched,
+        /// where the allocator has no room.
+        ///
+        /// # Safety
+        ///
+        /// `ptr` is a live block of `A`, not used again once this returns non-null.
+        pub unsafe fn c_realloc(&self, ptr: *mut u8, new_size: usize, locals: Locals) -> *mut u8 {
+            // SAFETY: the caller says `ptr` is a live block of `A`.
+            let (was, old) = unsafe { (self.holder(ptr), self.0.usable(ptr)) };
+            let into = match locals {
+                Locals::Live => Self::running(),
+                Locals::Gone => None,
+            };
+            // SAFETY: as above; `realloc(p, 0)` keeps a block, as `malloc(0)` makes one.
+            let new = unsafe { self.0.realloc_in(into, ptr, new_size.max(1)) };
+            if !new.is_null() {
+                // SAFETY: `new` is the live block the realloc gave.
+                let (now, bytes) = unsafe { (self.holder(new), self.0.usable(new)) };
+                match now == was {
+                    true => tally(locals, was, signed(bytes) - signed(old)),
+                    false => {
+                        tally(locals, was, -signed(old));
+                        tally(locals, now, signed(bytes));
+                    }
+                }
+            }
+            new
+        }
+    }
+
+    /// Counts `delta` bytes of `holder`'s where `locals` says.
+    #[inline(always)]
+    fn tally(locals: Locals, holder: Option<Tag>, delta: i64) {
+        match locals {
+            Locals::Live => count(holder, delta),
+            Locals::Gone => count_shared(holder, delta),
+        }
+    }
 }
 
 /// How far a thread's bytes for its account may move before they are charged to it: the
 /// account's peak is exact to this much per thread charging it, and an allocation in an
 /// account costs a thread-local add and no atomic but once per this many bytes.
 const ACCOUNT_BATCH: i64 = 64 << 10;
+
+/// How many bytes a thread allocates, or frees, of one holder's blocks before it adds them to
+/// that tag's churn (`blaze_mem::tag::heap_churned`): a tag's churn is within this per thread
+/// of what was allocated and freed.
+const CHURN_BATCH: u64 = 1 << 20;
 
 /// The slots of the first segment of [`SEGMENTS`]; segment `k` holds `FIRST_SLOTS << k`.
 const FIRST_SLOTS: usize = 256;
@@ -422,13 +706,18 @@ struct Slot {
     net: AtomicI64,
     /// The most `net` was.
     peak: AtomicI64,
+    /// What its work allocated, and what it freed, in all, never netted: its churn.
+    allocated: AtomicU64,
+    freed: AtomicU64,
 }
 
 /// Every account's slot, in segments that double, each made the first time an index in it is
 /// opened and never freed: a slot's address is fixed for the process's life, so the allocator's
 /// charges reach it with an acquire load and no lock. A segment is taken from the system
-/// allocator, zeroed (a zeroed [`Slot`] is a free one), outside [`Counting`]: making one charges
-/// no account and never reenters a charge.
+/// allocator, zeroed (a zeroed [`Slot`] is a free one), outside [`Counting`]'s Rust entry points:
+/// making one charges no account ([`uncharged`]) and never reenters a charge. In the daemon the
+/// system allocator is blaze's C allocator (blaze-engine's `malloc.rs`, [`Counting::c_malloc`]),
+/// so its bytes are in [`held`] and the heap's tag lines like any C block's.
 static SEGMENTS: [AtomicPtr<Slot>; SEGMENT_COUNT] =
     [const { AtomicPtr::new(std::ptr::null_mut()) }; SEGMENT_COUNT];
 
@@ -532,17 +821,47 @@ impl Account {
     }
 }
 
-/// Charges `moved` bytes to `account` and to every account it was opened inside, raising each
+/// What a thread's work moved for an account since it last charged it: the net bytes, and the
+/// bytes allocated and freed in all.
+#[derive(Clone, Copy)]
+struct Moved {
+    net: i64,
+    allocated: u64,
+    freed: u64,
+}
+
+impl Moved {
+    /// What `local` moved for its account since it last charged it, taken off it.
+    fn take(local: &Local) -> Moved {
+        Moved {
+            net: local.charged.replace(0),
+            allocated: local.charged_allocated.replace(0),
+            freed: local.charged_freed.replace(0),
+        }
+    }
+
+    fn is_empty(self) -> bool {
+        (self.net, self.allocated, self.freed) == (0, 0, 0)
+    }
+}
+
+/// Charges `moved` to `account` and to every account it was opened inside, raising each
 /// one's peak. Atomics only: it runs inside the allocator, and as a job parks. An account that
 /// closed (its slot's generation moved on) is charged nothing, and neither is any above it.
 /// Bounded by the account's depth: each parent is one shallower, so the walk ends there.
-fn charge_to(account: Account, moved: i64) {
+fn charge_to(account: Account, moved: Moved) {
     let Some(mut slot) = account.slot() else { return };
     let depth = slot.depth.load(Ordering::Relaxed);
     for _ in 0..=depth {
-        let net = slot.net.fetch_add(moved, Ordering::Relaxed).wrapping_add(moved);
-        if moved > 0 {
+        let net = slot.net.fetch_add(moved.net, Ordering::Relaxed).wrapping_add(moved.net);
+        if moved.net > 0 {
             slot.peak.fetch_max(net, Ordering::Relaxed);
+        }
+        if moved.allocated != 0 {
+            slot.allocated.fetch_add(moved.allocated, Ordering::Relaxed);
+        }
+        if moved.freed != 0 {
+            slot.freed.fetch_add(moved.freed, Ordering::Relaxed);
         }
         let Some(parent) = Account(slot.parent.load(Ordering::Relaxed)).slot() else { return };
         slot = parent;
@@ -552,9 +871,9 @@ fn charge_to(account: Account, moved: i64) {
 /// [`count`]'s charge, once a thread's bytes for its account moved [`ACCOUNT_BATCH`].
 #[cold]
 #[inline(never)]
-fn charge(local: &Local, account: usize, moved: i64) {
-    local.charged.set(0);
-    charge_to(Account(account), moved);
+fn charge(local: &Local, account: usize, net: i64) {
+    local.charged.set(net);
+    charge_to(Account(account), Moved::take(local));
 }
 
 /// Charges what this thread moved for its account since it last charged it, then makes
@@ -562,9 +881,9 @@ fn charge(local: &Local, account: usize, moved: i64) {
 #[inline(never)]
 fn switch(account: Account) -> Account {
     with_local(|local| {
-        let moved = local.charged.replace(0);
+        let moved = Moved::take(local);
         let was = Account(local.account.replace(account.0));
-        if moved != 0 {
+        if !moved.is_empty() {
             charge_to(was, moved);
         }
         was
@@ -596,6 +915,8 @@ fn open(parent: Account) -> Account {
     });
     slot.net.store(0, Ordering::Relaxed);
     slot.peak.store(0, Ordering::Relaxed);
+    slot.allocated.store(0, Ordering::Relaxed);
+    slot.freed.store(0, Ordering::Relaxed);
     slot.depth.store(depth, Ordering::Relaxed);
     slot.parent.store(parent.0, Ordering::Relaxed);
     // The slot is this open's alone (popped or new): even to odd, published with its fields.
@@ -603,19 +924,34 @@ fn open(parent: Account) -> Account {
     Account::of(index, held)
 }
 
-/// Closes `account`, freeing its slot: its peak, what its work held at most.
-fn close(account: Account) -> u64 {
-    let (Some(slot), Some(index)) = (account.slot(), account.index()) else { return 0 };
-    let peak = slot.peak.load(Ordering::Relaxed);
+/// Closes `account`, freeing its slot.
+fn close(account: Account) {
+    let (Some(slot), Some(index)) = (account.slot(), account.index()) else { return };
     slot.generation.fetch_add(1, Ordering::Release);
     // alloc: a free slot's place in the queue, a block per 31 frees (crossbeam), reused
     uncharged(|| FREE_SLOTS.push(index));
-    u64::try_from(peak).unwrap_or(0)
 }
 
-/// What `account`'s work held at most so far, as charged.
-fn peak_of(account: Account) -> u64 {
-    account.slot().map_or(0, |slot| u64::try_from(slot.peak.load(Ordering::Relaxed)).unwrap_or(0))
+/// What `account`'s work spent so far, as charged: the most it held, and what it allocated and
+/// freed in all.
+fn spent_of(account: Account) -> Spent {
+    account.slot().map_or(Spent::default(), |slot| Spent {
+        peak: u64::try_from(slot.peak.load(Ordering::Relaxed)).unwrap_or(0),
+        allocated: slot.allocated.load(Ordering::Relaxed),
+        freed: slot.freed.load(Ordering::Relaxed),
+    })
+}
+
+/// What a task's work spent of the global heap through [`Counting`] ([`measured`]): the most
+/// it held at once, and its churn, what it allocated and what it freed in all, on its own job
+/// and every job of its pool scopes. A task whose `allocated` is far past its `peak` churns
+/// the heap: it frees and allocates again what it could have kept in its frame, and the pages
+/// that churn leaves are what the allocator keeps (docs/memory-footprint.md, cause 2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Spent {
+    pub peak: u64,
+    pub allocated: u64,
+    pub freed: u64,
 }
 
 /// Runs `f` in a new account, inside the job's account if it has one, and says the most bytes
@@ -630,6 +966,13 @@ fn peak_of(account: Account) -> u64 {
 /// is the most above where it began, never below 0. A byte its work allocated and left behind
 /// (a memo it made) is held at its end, and counts toward its peak.
 pub fn account<R>(f: impl FnOnce() -> R) -> (R, u64) {
+    let (out, spent) = measured(f);
+    (out, spent.peak)
+}
+
+/// [`account`], saying all its work spent ([`Spent`]): its peak, and what it allocated and
+/// freed in all.
+pub fn measured<R>(f: impl FnOnce() -> R) -> (R, Spent) {
     struct Open {
         account: Account,
         outer: Account,
@@ -649,9 +992,9 @@ pub fn account<R>(f: impl FnOnce() -> R) -> (R, u64) {
     // What this thread moved for it, charged before its peak is read; every job of its scopes
     // charged its own as it ended (`charged_to`).
     switch(account);
-    let peak = peak_of(account);
+    let spent = spent_of(account);
     drop(open);
-    (result, peak)
+    (result, spent)
 }
 
 /// The account the job on this thread charges: what a pool scope's job is charged to
@@ -1396,6 +1739,22 @@ mod tests {
     }
 
     const MB: usize = 1 << 20;
+
+    /// An account's churn is every byte its work allocated and freed, never netted: a task
+    /// that frees and allocates again churns far past its peak (docs/memory-footprint.md,
+    /// cause 2), and its peak alone would not say so.
+    #[test]
+    fn an_accounts_churn_is_what_its_work_allocated_and_freed_in_all() {
+        let ((), spent) = measured(|| {
+            for _ in 0..8 {
+                drop(std::hint::black_box(vec![1u8; MB]));
+            }
+        });
+        assert!(spent.allocated >= 8 * MB as u64, "{spent:?}");
+        assert!(spent.freed >= 8 * MB as u64, "{spent:?}");
+        assert!(spent.peak < 2 * MB as u64, "one block at a time: {spent:?}");
+        assert!(spent.allocated < 9 * MB as u64, "nothing else: {spent:?}");
+    }
 
     #[test]
     fn an_account_says_what_its_work_held_at_most() {

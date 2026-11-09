@@ -1,4 +1,4 @@
-//! A dev executable on the daemon's code memory (docs/v2/plan/lanes/fastcompile/inproc.md):
+//! A dev executable on the daemon's code memory (docs/v2/plan/design/compile-time.md):
 //! linked with the start hook's reservations ([`dev_run`]), committed into a
 //! [`CodeMemory`] instead of a file, written to cargo's path once per content key by
 //! [`Program::command`], and overlaid by the memory before `main`. Each patch is

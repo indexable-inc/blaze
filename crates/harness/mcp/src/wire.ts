@@ -58,6 +58,8 @@ export type Request =
   | { op: "set_model"; id: number; model?: string | null; effort?: string | null }
   /** Name a session (its `label`); an empty title takes the name away. */
   | { op: "rename"; id: number; title: string }
+  /** Ask chat `id` aside: `text` as one turn on a discarded fork of its conversation, which never has it. */
+  | { op: "aside"; id: number; text: string }
   | { op: "screen" | "kill" | "forget"; id: number }
   | { op: "resize"; id: number; cols: number; rows: number }
   | ({ op: "repl_task" } & Record<string, unknown>)
@@ -98,6 +100,8 @@ export type Reply =
   | { reply: "attached"; info: SessionInfo }
   /** `browser`: the harness browser host's pid, its socket for the kernel (cdp.ts) and the Mach service the app looks up. */
   | { reply: "browser"; pid: number; sock: string; service: string }
+  /** `aside`: the fork's answer, its last words (markdown). */
+  | { reply: "aside"; text: string }
   | ({ reply: "record" } & Record<string, unknown>);
 
 /** The daemon's message. */
@@ -128,12 +132,15 @@ export type ModelChoice = { id: string; model: string; name: string; about: stri
 export type ContextCall = { input: number; cache_read: number; cache_write: number; output: number; thinking?: number };
 /** One part of what the context holds; `of` names the part it splits, `estimate` how harness estimated it ("": the agent's count). */
 export type ContextPart = { id: string; name: string; tokens: number; of: string; estimate: string };
+/** One window of the person's plan (a plan event): `used` is 0 to 1, `resets_at` unix seconds. */
+export type PlanWindow = { name: string; used: number; resets_at?: number; warn: boolean; limited: boolean };
 /** What happened. */
 export type Body =
   | { ev: "session"; agent: string; model: string; session_id?: string; effort?: string }
   | { ev: "models"; models: ModelChoice[] }
   | { ev: "choice"; model?: string; effort?: string }
   | { ev: "context"; used: number; window: number; last?: ContextCall; parts?: ContextPart[] }
+  | { ev: "plan"; windows: PlanWindow[] }
   | { ev: "user"; text: string }
   | { ev: "busy"; busy: boolean }
   | { ev: "block_start"; block: string; kind: Kind }
@@ -151,7 +158,7 @@ export type Body =
 export type Event = { ts: number } & Body;
 
 // A field's type as serde reads it: required (no default), defaulted when missing, or optional (missing or null is none).
-type F = "s" | "b" | "u" | "f" | "k" | "v" | "effects" | "models" | "parts" | "call";
+type F = "s" | "b" | "u" | "f" | "k" | "v" | "effects" | "models" | "parts" | "windows" | "call";
 type Spec = Record<string, [F, "req" | "def" | "opt"]>;
 const DETAIL: Spec = {
   block: ["s", "req"], cell: ["s", "req"], status: ["s", "req"], ms: ["u", "opt"], code: ["s", "def"], effects: ["effects", "def"],
@@ -166,6 +173,7 @@ const BODIES: Record<Body["ev"], Spec> = {
   models: { models: ["models", "req"] },
   choice: { model: ["s", "opt"], effort: ["s", "opt"] },
   context: { used: ["u", "req"], window: ["u", "req"], last: ["call", "opt"], parts: ["parts", "opt"] },
+  plan: { windows: ["windows", "req"] },
   user: { text: ["s", "req"] },
   busy: { busy: ["b", "req"] },
   block_start: { block: ["s", "req"], kind: ["k", "req"] },
@@ -185,10 +193,11 @@ const MODEL: Spec = {
 };
 const CALL: Spec = { input: ["u", "req"], cache_read: ["u", "req"], cache_write: ["u", "req"], output: ["u", "req"], thinking: ["u", "opt"] };
 const PART: Spec = { id: ["s", "req"], name: ["s", "req"], tokens: ["u", "req"], of: ["s", "def"], estimate: ["s", "def"] };
+const WINDOW: Spec = { name: ["s", "req"], used: ["f", "req"], resets_at: ["u", "opt"], warn: ["b", "def"], limited: ["b", "def"] };
 // The lists of maps, each read by its spec.
-const LISTS: Partial<Record<F, Spec>> = { effects: EFFECT, models: MODEL, parts: PART };
+const LISTS: Partial<Record<F, Spec>> = { effects: EFFECT, models: MODEL, parts: PART, windows: WINDOW };
 const EMPTY: Record<F, () => unknown> = {
-  s: () => "", b: () => false, u: () => 0, f: () => 0, k: () => "text", v: () => null, effects: () => [], models: () => [], parts: () => [],
+  s: () => "", b: () => false, u: () => 0, f: () => 0, k: () => "text", v: () => null, effects: () => [], models: () => [], parts: () => [], windows: () => [],
   call: () => null,
 };
 
@@ -213,7 +222,7 @@ function fields(m: Record<string, unknown>, spec: Spec, what: string): Record<st
       : f === "call" ? isMap(x)
       : LISTS[f] ? Array.isArray(x)
       : true;
-    if (!ok) throw new Error(`${what}: \`${k}\` is not ${{ s: "a string", b: "a bool", u: "a u64", f: "a number", k: "text or thinking", v: "", effects: "a list", models: "a list", parts: "a list", call: "a map" }[f]}`);
+    if (!ok) throw new Error(`${what}: \`${k}\` is not ${{ s: "a string", b: "a bool", u: "a u64", f: "a number", k: "text or thinking", v: "", effects: "a list", models: "a list", parts: "a list", windows: "a list", call: "a map" }[f]}`);
     const list = LISTS[f];
     out[k] = list ? (x as unknown[]).map((e, i) => {
       if (!isMap(e)) throw new Error(`${what}: ${k}[${i}] is not a map`);

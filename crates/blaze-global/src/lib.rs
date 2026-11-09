@@ -1,5 +1,5 @@
 //! The global cache (docs/v2/plan/design/compile-time.md, idea 8;
-//! docs/v2/plan/lanes/fastcompile/global.md): what depends only on public inputs is computed
+//! docs/v2/plan/design/compile-time.md): what depends only on public inputs is computed
 //! once, by blaze's builders, and fetched by every machine instead of built.
 //!
 //! - **What is public** ([`public`]): a store [`Key`] is a hash, so whether its inputs are

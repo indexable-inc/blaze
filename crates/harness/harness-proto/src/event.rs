@@ -53,8 +53,17 @@ pub enum Body {
     },
     /// How much of the model's context window the conversation fills, after a turn.
     Context(ContextUse),
-    /// The person's message (written by the daemon as it sends it).
-    User { text: String },
+    /// How much of the person's plan with the agent's maker is used, as the agent last said (claude's
+    /// `rate_limit_event`, codex's `account/rateLimits/updated`): each of the plan's windows (the five-hour one, the
+    /// weekly one). The account's, not the chat's: every chat of the agent's kind shares it.
+    Plan { windows: Vec<PlanWindow> },
+    /// The person's message (written by the daemon as it sends it): its words and the pictures sent with it (absolute
+    /// paths of PNG or JPEG files, a pasted picture's as the app saved it).
+    User {
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<String>,
+    },
     /// A turn started (true) or ended (false).
     Busy { busy: bool },
     /// A block began streaming (partial).
@@ -151,6 +160,31 @@ impl ContextPart {
     pub const O200K: &str = "o200k_base";
     /// [`ContextPart::estimate`] for a part that is the agent's exact total less the others.
     pub const REST: &str = "rest";
+}
+
+/// One window of the person's plan ([`Body::Plan`]): a span of time whose use the maker caps, how much of it is used,
+/// when it starts again, and whether the agent warned of it or refused for it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct PlanWindow {
+    /// Its short name as the status bar says it: `5h`, `week`, `Opus week`, `day`.
+    pub name: String,
+    /// The share of it used, 0 to 1.
+    pub used: f64,
+    /// When it resets (unix seconds), when the agent says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<u64>,
+    /// The agent says it is past its warning threshold (claude's `allowed_warning`, or [`PlanWindow::WARN`] of it used).
+    #[serde(default)]
+    pub warn: bool,
+    /// The agent refuses for it: the window is used up (claude's `rejected`, or all of it used).
+    #[serde(default)]
+    pub limited: bool,
+}
+
+impl PlanWindow {
+    /// The share of a window from which it warns when the agent names no threshold of its own (claude's usual
+    /// `surpassedThreshold`; codex names none).
+    pub const WARN: f64 = 0.75;
 }
 
 /// One model an agent offers ([`Body::Models`]).
@@ -279,7 +313,7 @@ impl Event {
                 window: v["window"].as_u64().unwrap_or(0),
                 ..ContextUse::default()
             }),
-            "user" => Body::User { text: s("text") },
+            "user" => Body::User { text: s("text"), images: Vec::new() },
             "busy" => Body::Busy { busy: v["busy"].as_bool().unwrap_or(false) },
             "block_start" => Body::BlockStart { block: block(), kind: kind() },
             "delta" => Body::Delta { block: block(), text: s("text") },
@@ -370,6 +404,7 @@ impl Body {
             Self::Models { .. } => "models",
             Self::Choice { .. } => "choice",
             Self::Context(_) => "context",
+            Self::Plan { .. } => "plan",
             Self::User { .. } => "user",
             Self::Busy { .. } => "busy",
             Self::BlockStart { .. } => "block_start",

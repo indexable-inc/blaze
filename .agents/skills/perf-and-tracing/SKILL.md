@@ -1,6 +1,6 @@
 ---
 name: perf-and-tracing
-description: "How a slow thing is found and fixed: a span names every stretch of worker time, `self_cpu_ns` is filled, the profile parquet answers which item took the time, and a speed PR quotes before and after from the spans. Load before investigating anything slow, adding tracing, or making a speed claim."
+description: "How a slow thing is found and fixed: a span names every stretch of worker time, `self_cpu_ns` is filled, the profile parquet answers which item took the time, and a speed PR quotes before and after from the spans. Querying the profile to find out why a build did what it did is the `debugging` skill. Load before investigating anything slow, adding tracing, or making a speed claim."
 ---
 
 # Performance and tracing

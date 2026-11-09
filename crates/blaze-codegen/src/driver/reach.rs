@@ -141,7 +141,7 @@ impl Reach {
     }
 
     /// The graph for a link's code map (blaze-profile's `perf::map`,
-    /// docs/v2/plan/lanes/perf-history.md): the functions in key order (node `i`; the statics
+    /// docs/v2/plan/design/perf-history.md): the functions in key order (node `i`; the statics
     /// follow them), per node where its edges start (one more than there are nodes), the
     /// edges, and per node its marks (a function's code hash and arguments, a static's value
     /// and instance).

@@ -1,4 +1,4 @@
-//! The daemon's real build ([`Real`], the [`Steps`] of `blaze serve`; docs/v2/plan/lanes/cargo/notes.md
+//! The daemon's real build ([`Real`], the [`Steps`] of `blaze serve`; docs/v2/plan.md
 //! section 6): a job's units lowered into the front end, each checked, compiled and linked
 //! by blaze's own code generator and linker, its build scripts, tests and program run as the
 //! driver's sandboxed spawns.
@@ -126,7 +126,7 @@ pub(crate) struct Shared {
     /// (fastcompile-sol-select 1): each test run takes its suites' and gives them back.
     pub(crate) selectors: test::image::Selectors,
     /// The dev executables in the daemon's code memory, by path, which a `run` starts from
-    /// and each link patches (docs/v2/plan/lanes/fastcompile/inproc.md).
+    /// and each link patches (docs/v2/plan/design/compile-time.md).
     pub(crate) dev_runs: run::inproc::DevRuns,
 }
 
@@ -307,7 +307,7 @@ impl Steps for Real {
                     flushed = it.flushed.take();
                 }
                 // Whether a record retracting a value verified across checkouts was published since
-                // the kept front end was lowered (rule 18): its database's tracked expansions and
+                // the kept front end was lowered (rule 21): its database's tracked expansions and
                 // served images would keep such a value, so it is not lowered into, and the build
                 // lowers afresh, where `deps::serve` works every verified image's reads out again
                 // and an expansion is looked up again. Read before this job expands anything, so a
@@ -468,7 +468,7 @@ fn unkept(
     {
         // alloc: a reason, once per front end let go
         return Some((
-            format!("{moved} (rule 18: a front end is keyed by the variables it read)"),
+            format!("{moved} (rule 21: a front end is keyed by the variables it read)"),
             Some(moved),
         ));
     }
@@ -477,7 +477,7 @@ fn unkept(
         return Some((
             format!(
                 "a record retracting a value verified across checkouts was published since it was lowered \
-                 (retractions epoch {} then, {retractions} now; rule 18)",
+                 (retractions epoch {} then, {retractions} now; rule 21)",
                 kept.retractions
             ),
             None,
@@ -982,7 +982,7 @@ impl Writer<Real> for UnitWriter {
         // kept front end as in a fresh one: a run applied again with other cfgs, env or
         // `OUT_DIR` files, or a macro built into other code, moved the keys of the crates it
         // reaches, and a crate read from an image under its old key would resolve as it did
-        // before (rule 18). A serve that fails or panics has left the front end partly served,
+        // before (rule 21). A serve that fails or panics has left the front end partly served,
         // which no unit's write owns: it is the writer's own error, and ends the job with or
         // without keep-going, naming the units it served; no unit is built over it.
         if let Some(&first) = written.first() {
@@ -1115,7 +1115,7 @@ impl UnitWriter {
 
 /// A front end's database as the loop holds it ([`UnitWriter`], [`KeptLowered`]). The last
 /// drop of one drops a whole query storage, which may panic (a table it can't walk), and a
-/// panic on the loop would end every request the daemon serves (rule 15). Its drop runs inside
+/// panic on the loop would end every request the daemon serves (rule 18). Its drop runs inside
 /// a catch: a panic there is said in the daemon's log, naming what was let go, and where a job
 /// can still fail with it, [`Held::let_go`] gives it to that job.
 pub(crate) struct Held<T> {
@@ -1610,7 +1610,7 @@ pub(crate) fn cost_key(unit: &Unit, phase: Option<Phase>) -> blaze_graph::Key {
     blaze_graph::Key(hasher.finish().0)
 }
 
-/// The most directory entries [`source_bytes`] reads for one unit (rule 15): a unit rooted
+/// The most directory entries [`source_bytes`] reads for one unit (rule 18): a unit rooted
 /// in a directory of more (a package root holding a vendored tree) is sized by what it read.
 const SOURCE_ENTRIES: usize = 50_000;
 

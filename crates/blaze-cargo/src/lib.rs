@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 pub mod answers;
 pub mod as_rustc;
 /// blaze v2's CLI: a client of the agent API with cargo's flags, output and exit codes
-/// (docs/v2/plan/lanes/cargo/notes.md section 7).
+/// (docs/v2/plan.md section 7).
 pub mod cli;
 pub mod content;
 pub mod directives;
@@ -27,7 +27,7 @@ pub mod release;
 #[allow(unsafe_code, reason = "the sandbox's own system calls")]
 pub mod sandbox;
 /// blaze v2's daemon: the plane, the agent API's server and session, the VFS, the database and
-/// the store in one loop (docs/v2/plan/lanes/cargo/notes.md section 6).
+/// the store in one loop (docs/v2/plan.md section 6).
 #[allow(unsafe_code, reason = "the daemon's own signal and process calls")]
 pub mod serve;
 /// The daemon's sockets: not in the seed, which runs no daemon (without the `native` feature).

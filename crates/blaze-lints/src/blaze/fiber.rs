@@ -1,5 +1,5 @@
 //! `fiber_boundary`: a path written outside `blaze_graph::sched` that names the scheduler's
-//! fibers ([docs/v2/plan/lanes/may-suspend/fiber-boundary.md](../../../../docs/v2/plan/lanes/may-suspend/fiber-boundary.md)).
+//! fibers ([docs/v2/plan.md](../../../../docs/v2/plan.md)).
 //!
 //! A written path (one whose parent is not a path, in a `use` tree, a type, an expression or a
 //! pattern) is a finding when it or one of its qualifiers resolves to the module

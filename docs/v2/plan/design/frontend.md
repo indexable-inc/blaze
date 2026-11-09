@@ -14,7 +14,7 @@ sense for the IDE and costs blaze, followed by what v2 does instead.
    fixpoint over every module, so adding a `use` or an item in one file reruns resolution for
    the crate and invalidates everything that read it. v2 resolves per module, with facts:
    - each import and glob records the names it read and the names it found missing (negative
-     facts, [items.md](../lanes/items.md));
+     facts, [items.md](item-hash.md));
    - an edit reruns only the modules whose facts changed, and the fixpoint reruns only over
      the strongly connected set of glob imports the change touches.
 2. **Trait impls are collected per crate.** `TraitImpls::for_crate` is one value, so adding
@@ -56,7 +56,7 @@ sense for the IDE and costs blaze, followed by what v2 does instead.
     live views).
 12. **Early cutoff breaks under memory caps.** The LRU caps evict values, and salsa can only
     backdate by comparing values. v2 puts fingerprints on edges, so an evicted value still cuts
-    off ([db.md](../lanes/db.md)).
+    off ([db.md](../../plan.md)).
 13. **Workspace loading shells out.** `cargo metadata` and `rustc --print` run as processes on
     every load. v2 loads the workspace as queries over its own view of the manifests and lock
     files (lane cargo).

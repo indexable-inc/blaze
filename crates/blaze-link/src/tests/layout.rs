@@ -1,4 +1,4 @@
-//! Profile-guided function order through a full ELF link (docs/v2/plan/lanes/layout/layout.md):
+//! Profile-guided function order through a full ELF link (docs/v2/plan/design/code-layout.md):
 //! a profile's hot functions first in call order and the cold ones last, the same bytes
 //! whatever order the profile and cold set came in, and an incremental link moving no
 //! function for a profile.

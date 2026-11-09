@@ -1,4 +1,4 @@
-//! The plane's tests (docs/v2/plan/lanes/core/plane.md): what each rule does alone, the plane as the machine
+//! The plane's tests (docs/v2/plan.md): what each rule does alone, the plane as the machine
 //! with one request, and random requests under a seeded generator, checked after every step
 //! and step by step against [`reference`], the plane as it was before its state moved to
 //! columns.

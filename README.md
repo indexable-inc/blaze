@@ -109,7 +109,7 @@ All the details: [what works and what doesn't yet](docs/usage.md#what-works-and-
 - [Benchmarks](docs/benchmarks.md): every number, how it's measured, and on what machines
 - [How it works](docs/v2/plan.md): the plan of blaze v2, and a map of its crates
 - [Cargo compatibility](docs/cargo.md): every command, flag and setting
-- [CI runner](docs/ci-runner.md) and [roadmap](docs/roadmap.md): where blaze is going
+- [CI runner](docs/v2/plan.md) and [roadmap](docs/v2/plan.md): where blaze is going
 - [Contributing](docs/contributing.md)
 
 ## Demo: a Game of Life you can edit

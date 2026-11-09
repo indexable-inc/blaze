@@ -2,10 +2,12 @@
 //! app (and other features) share, so a write reads the file, changes one key and writes it back whole (through a
 //! temporary file and a rename, so a reader never sees half of it).
 //!
-//! Keys: `selected` (the session the main pane showed last), `sidebar_width`, `closed` (objects cmd+W'd, by key: `s14`,
+//! Keys: `selected` (the session the main pane showed last), `sidebar_width`, `web_width` (the browser pane's, as last
+//! dragged), `closed` (objects cmd+W'd, by key: `s14`,
 //! `r12`; the older `archived` and `trashed` session ids are read once in its place), `pinned` (objects kept in the
 //! tree), `new_kind` (the kind last started from the File > New… picker, highlighted when it opens next) and `chat_kind`
-//! (the agent kind a chat was last started with, what cmd+N starts).
+//! (the agent kind a chat was last started with, what cmd+N starts), and `drafts` (each chat's unsent words and pasted
+//! pictures by session, `{"s14": {"text", "images"}}`, src/app/chat.rs).
 use serde_json::{Map, Value};
 use std::path::PathBuf;
 

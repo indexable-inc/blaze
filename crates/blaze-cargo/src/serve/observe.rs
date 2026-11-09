@@ -1,5 +1,5 @@
 //! What the daemon says of itself beside its builds (docs/profiling.md;
-//! docs/v2/plan/lanes/observe/explore.md, "Where it runs").
+//! docs/v2/plan/design/explore.md, "Where it runs").
 //!
 //! - [`Profiling`]: the profile history, which the thread `blaze-history` keeps off the loop
 //!   ([`keep_history`]), and the DuckDB `nix run .#duckdb` pins ([`duckdb`]). `blaze serve`
@@ -160,7 +160,7 @@ pub struct Profiling {
 
 /// How long a `blaze why` waits for the builds that ended before it was asked to be explained,
 /// on the loop's clock, before it fails naming the build and what the history's thread is
-/// doing (rule 15).
+/// doing (rule 18).
 pub const WHY_WAIT: Duration = Duration::from_secs(30);
 
 /// What the history's thread is doing, as the loop reads it: a step in the top byte and the
@@ -291,7 +291,7 @@ enum ToHistory {
 }
 
 /// How long a reader's flush ([`blaze_api::Request::Flush`]) may take, on the loop's clock,
-/// before it fails naming what the history's thread is doing (rule 15). A flush is about
+/// before it fails naming what the history's thread is doing (rule 18). A flush is about
 /// 10-100 ms; a build's end flush, which merges, a few seconds.
 pub const FLUSH_WAIT: Duration = Duration::from_secs(30);
 
@@ -716,7 +716,7 @@ fn keep(
                     rebuilt,
                 };
                 // Sent before the record is durable: an answer may name a build whose record a
-                // crash then loses (docs/v2/plan/lanes/why.md, "Answered before durable").
+                // crash then loses (docs/v2/plan/design/why.md, "Answered before durable").
                 _ = told.send(Told::Explained { answer, dropped: why.dropped() });
                 doing.set(Step::Appending, build);
                 if let Err(error) = why.write(build, &record) {

@@ -1,4 +1,4 @@
-//! Interned values persist by content (docs/v2/plan/lanes/format.md section 5): an
+//! Interned values persist by content (docs/v2/plan/design/data.md section 5): an
 //! [`Interned`] is written as its value's bytes, and bytes read back are made into a value and
 //! interned again, never trusted to name an index or an address of another run.
 //!

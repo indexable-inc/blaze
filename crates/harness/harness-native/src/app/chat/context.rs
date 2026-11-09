@@ -1,8 +1,10 @@
 //! The context meter's popover (scene/widgets/context.flecs `hn.ChatContext*`). While the pointer is on the meter
-//! (pick.rs) or on the popover itself, and the picker's menu is closed, a plate over the meter says what the chat's last
-//! `context` event (harness-proto `ContextUse`) holds: a head with the total, the window as a bar of the parts, a row a
-//! part (its splits under it) and a foot with the last call's cache split and whose numbers these are. Each line is a
-//! template instance whose props this sets; the look is all scene data.
+//! (pick.rs) or on the popover itself, and the picker's menu is closed, a plate over the meter shows what the chat's last
+//! `context` event (harness-proto `ContextUse`) holds at a glance: a head with the total and the window as a donut of
+//! its parts; the pointer on a slice names that part in the donut's middle, the others dimmed. A press on the meter
+//! opens it (`open`, until another press or Escape) to the whole account: a row a part (its splits under it) and a foot
+//! with the last call's cache split and whose numbers these are. Each line is a template instance whose props this sets;
+//! the look is all scene data.
 use super::pick::tokens;
 use super::*;
 use harness_proto::event::{ContextCall, ContextPart, ContextUse};
@@ -14,9 +16,12 @@ const INKS: [&str; 8] = ["s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8"];
 /// hn.ChatContextInk's slot for a [`ContextPart::REST`] part.
 const REST_INK: &str = "rest";
 
-/// The popover in `pop` (the composer bar's overlay slot for it) over `meter` (its hn.ChatContext ring), for context `c` as an
-/// agent of kind `agent` reported it; none while `hidden` (the picker's menu is open) or while the pointer is elsewhere.
-pub(super) fn fill_context_pop(pop: View<'_>, meter: Option<View<'_>>, c: Option<&ContextUse>, agent: &str, hidden: bool) {
+/// The popover in `pop` (the status bar's overlay slot for it) over `meter` (its hn.ChatContext ring), for context `c` as an
+/// agent of kind `agent` reported it; none while `hidden` (the picker's menu is open) or while the pointer is elsewhere,
+/// unless it was pressed `open`. `pointer`: where the pointer is (view points), for the slice under it.
+pub(super) fn fill_context_pop(
+    pop: View<'_>, meter: Option<View<'_>>, c: Option<&ContextUse>, agent: &str, hidden: bool, open: bool, pointer: (f32, f32),
+) {
     let w = pop.entity().world();
     let on = |m: View<'_>| {
         let (m, p) = (m.id(), pop.id());
@@ -26,13 +31,13 @@ pub(super) fn fill_context_pop(pop: View<'_>, meter: Option<View<'_>>, c: Option
             || pop.part("plate").is_some_and(|plate| view::bridged(w.entity_from_id(m), plate.entity()))
     };
     let shown = match (meter, c) {
-        (Some(m), Some(c)) if !hidden && on(m) => Some((m, c)),
+        (Some(m), Some(c)) if !hidden && (open || on(m)) => Some((m, c)),
         _ => None,
     };
     view::for_each_of(pop, shown.map(|_| ("plate", "hn.ChatContextPop", ())), |_, (), _| {});
     if let (Some(plate), Some((meter, c))) = (pop.part("plate"), shown) {
         plate.anchored(meter.id());
-        lines(plate, c, agent);
+        lines(plate, c, agent, open, pointer);
     }
 }
 
@@ -44,8 +49,8 @@ enum Line<'c> {
     Foot,
 }
 
-/// The plate's lines for `c`.
-fn lines(plate: View<'_>, c: &ContextUse, agent: &str) {
+/// The plate's lines for `c`: the head and the donut, and opened (`open`) a row a part and the foot.
+fn lines(plate: View<'_>, c: &ContextUse, agent: &str, open: bool, pointer: (f32, f32)) {
     let mut slot = 0;
     let inked = c.parts.iter().map(|p| {
         let ink = if !p.of.is_empty() {
@@ -59,19 +64,38 @@ fn lines(plate: View<'_>, c: &ContextUse, agent: &str) {
         (p, ink)
     });
     // alloc: a dozen parts' keys, while the popover is up
-    let parts: Vec<(String, &str, Line<'_>)> = inked.map(|(p, ink)| (format!("p.{}", p.id), "hn.ChatContextRow", Line::Part(p, ink))).collect();
-    let rows = [("head".to_owned(), "hn.ChatContextHead", Line::Head), ("bar".to_owned(), "hn.ChatContextBar", Line::Bar)] // alloc: two keys
+    let parts: Vec<(String, &str, Line<'_>)> =
+        if open { inked.map(|(p, ink)| (format!("p.{}", p.id), "hn.ChatContextRow", Line::Part(p, ink))).collect() } else { Vec::new() };
+    let foot = open.then(|| ("foot".to_owned(), "hn.ChatContextFoot", Line::Foot)); // alloc: one key
+    let rows = [("head".to_owned(), "hn.ChatContextHead", Line::Head), ("pie".to_owned(), "hn.ChatContextPie", Line::Bar)] // alloc: two keys
         .into_iter()
         .chain(parts)
-        .chain([("foot".to_owned(), "hn.ChatContextFoot", Line::Foot)]); // alloc: one key
+        .chain(foot);
     view::for_each_of(plate, rows, |v, line, _| match line {
         Line::Head => {
             let (used, window, pct) = (tokens(c.used), tokens(c.window), share(c.used, c.window));
             v.props("hn.ChatContextHead", &[("used", Prop::Str(&used)), ("window", Prop::Str(&window)), ("pct", Prop::Str(&pct))]);
         }
         Line::Bar => {
-            if let Some(track) = v.part("track") {
-                segments(track, c);
+            if let Some(chart) = v.part("chart") {
+                let slices = slices_of(c);
+                let under = under_pointer(chart, &slices, pointer);
+                // In its middle: how full the window is, or the part under the pointer and its share.
+                let (big, small) = match under.and_then(|i| slices.get(i)) {
+                    Some(s) => (share(s.part.tokens, c.window), s.part.name.clone()),
+                    None => (share(c.used, c.window), "used".to_owned()),
+                };
+                if let Some(mid) = chart.part("mid") {
+                    if let Some(p) = mid.part("pct") {
+                        p.text(&big);
+                    }
+                    if let Some(l) = mid.part("label") {
+                        l.text(&small);
+                    }
+                }
+                if let Some(s) = chart.part("slices") {
+                    pie(s, &slices, under);
+                }
             }
         }
         Line::Part(p, ink) => {
@@ -97,25 +121,80 @@ fn lines(plate: View<'_>, c: &ContextUse, agent: &str) {
     });
 }
 
-/// The bar's segments on `track`: one for each part of the whole that holds tokens, its share of the window, in its
-/// row's ink. Laid end to end they never pass the track's end (claude's own counts can sum a little past its total).
-fn segments(track: View<'_>, c: &ContextUse) {
+/// One slice of the donut: its part, its ink slot, and where it runs (shares of a turn, clockwise from the top).
+struct Slice<'c> {
+    part: &'c ContextPart,
+    ink: &'static str,
+    from: f64,
+    to: f64,
+}
+
+/// The donut's slices for `c`: one for each part of the whole that holds tokens, its share of the window after the ones
+/// before it, in its row's ink. They never pass the ring's end (claude's own counts can sum a little past its total).
+fn slices_of(c: &ContextUse) -> Vec<Slice<'_>> {
     let mut slot = 0;
-    let mut left = 1.0_f64;
-    let segs = c.parts.iter().filter(|p| p.of.is_empty()).filter_map(|p| {
+    let mut at = 0.0_f64;
+    let mut out = Vec::new(); // alloc: a dozen slices, while the popover is up
+    for p in c.parts.iter().filter(|p| p.of.is_empty()) {
         let ink = if p.estimate == ContextPart::REST {
             REST_INK
         } else {
             slot += 1;
             INKS[(slot - 1) % INKS.len()]
         };
-        let f = (p.tokens as f64 / c.window as f64).min(left);
-        left -= f;
-        (p.tokens > 0).then(|| (format!("seg.{}", p.id), "hn.ChatContextSeg", (f, ink))) // alloc: a key a part
+        let f = (p.tokens as f64 / c.window as f64).min(1.0 - at);
+        if p.tokens > 0 && f > 0.0 {
+            out.push(Slice { part: p, ink, from: at, to: at + f });
+        }
+        at += f.max(0.0);
+    }
+    out
+}
+
+/// Which of `slices` the pointer is on in `chart` (the donut's square, its ring between 34 and 48 of 50 out from the
+/// middle, as [`ring_path`] draws it): by its distance from the middle and its angle clockwise from the top.
+fn under_pointer(chart: View<'_>, slices: &[Slice<'_>], (x, y): (f32, f32)) -> Option<usize> {
+    let l = chart.entity().try_cloned::<&Laid>()?;
+    let (cx, cy, half) = (l.x + l.w / 2.0, l.y + l.h / 2.0, l.w.min(l.h) / 2.0);
+    let (dx, dy) = (f64::from(x - cx), f64::from(y - cy));
+    let r = dx.hypot(dy) / f64::from(half.max(1.0)) * 50.0;
+    if !(30.0..=50.0).contains(&r) {
+        return None;
+    }
+    let turn = dx.atan2(-dy).rem_euclid(std::f64::consts::TAU) / std::f64::consts::TAU;
+    slices.iter().position(|s| (s.from..s.to).contains(&turn))
+}
+
+/// The donut's slices in `slices`, each giving up a hair at its end so neighbours read apart; with one under the pointer
+/// (`under`), the others dimmed.
+fn pie(slices: View<'_>, all: &[Slice<'_>], under: Option<usize>) {
+    let parts = all.iter().enumerate().map(|(i, s)| {
+        let d = ring_path(s.from, s.to - (s.to - s.from).min(SLICE_GAP) * 0.5);
+        (format!("slice.{}", s.part.id), "hn.ChatContextSlice", (d, s.ink, under.is_some_and(|u| u != i))) // alloc: a key a part
     });
-    view::for_each_of(track, segs, |v, (f, ink), _| {
-        v.props("hn.ChatContextSeg", &[("share", Prop::Float(f)), ("ink", Prop::Str(ink))]);
+    view::for_each_of(slices, parts, |v, (d, ink, dim), _| {
+        v.props("hn.ChatContextSlice", &[("d", Prop::Str(&d)), ("ink", Prop::Str(ink)), ("dim", Prop::Bool(dim))]);
     });
+}
+
+/// The share of the ring each slice gives up at its end, so neighbours read apart.
+const SLICE_GAP: f64 = 0.006;
+
+/// A ring segment from `a` to `b` (shares of a turn, clockwise from the top) in a 100-point square: outside radius 48,
+/// inside 34, as hn.ChatContextPie's track. A whole turn is drawn as two halves (one arc cannot close on itself).
+fn ring_path(a: f64, b: f64) -> String {
+    const R: f64 = 48.0;
+    const IN: f64 = 34.0;
+    if b - a >= 0.9999 {
+        return format!("{} {}", ring_path(0.0, 0.5), ring_path(0.5, 1.0));
+    }
+    let p = |t: f64, r: f64| {
+        let th = t * std::f64::consts::TAU;
+        (50.0 + r * th.sin(), 50.0 - r * th.cos())
+    };
+    let large = u8::from(b - a > 0.5);
+    let ((x0, y0), (x1, y1), (x2, y2), (x3, y3)) = (p(a, R), p(b, R), p(b, IN), p(a, IN));
+    format!("M{x0:.2} {y0:.2} A{R} {R} 0 {large} 1 {x1:.2} {y1:.2} L{x2:.2} {y2:.2} A{IN} {IN} 0 {large} 0 {x3:.2} {y3:.2} Z")
 }
 
 /// `n` as a share of `of`: `12%`, `<1%` for a part that holds less than half a percent.

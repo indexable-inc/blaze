@@ -78,7 +78,7 @@ To keep an input a fuzz run found, copy it from `fuzz/out/<target>/` into the ta
   new child after each failing try, cutting chunks of halving size and then zeroing bytes while
   the failure stays the same.
 - **Speed**: the bounds and the arithmetic are in
-  `docs/v2/plan/lanes/safety/speed-of-light.md` ("The fuzzer"). The engine's work per run is
+  `docs/v2/plan/design/unsafe.md` ("The fuzzer"). The engine's work per run is
   two reads of the counters a cache line at a time, one before it (zeroing the lines that hold
   a count) and one after (the features);
   the drain and the run are `__sanitizer_*` functions, which SanitizerCoverage leaves
@@ -126,4 +126,4 @@ Each target's file (`targets/<target>.rs`) begins with the invariants it checks.
 | `intern_table` | an interner table's section, `Table::restore` and its `validate` (`intern::fuzz::restore`, into a fresh table of a small text shape), in an image whose CRCs are good | never panics; bounded; refused as `Invalid` at a byte of the section or `Corrupt` by a column's place; restored IDs ascend below the end, every compiled-in one there, every value UTF-8, `find` never another value's ID; written again it restores to the same IDs, bytes and end, `find` the first ID holding each value, and writes the same bytes |
 
 Several seed corpora hold inputs that show a bug their owner has not fixed yet (each listed in
-the owner's `docs/v2/requests/<owner>.md`); those targets' `#[test]`s fail until it is fixed.
+the owner's `fed1eb428d:docs/v2/requests/<owner>.md`); those targets' `#[test]`s fail until it is fixed.

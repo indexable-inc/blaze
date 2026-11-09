@@ -31,7 +31,9 @@ use crate::{
     next_solver::{DbInterner, TyKind, infer::DbInternerInferExt},
 };
 
-pub use self::errors::{ConstEvalErrorPretty, MirEvalErrorPretty, MirLowerErrorPretty};
+pub use self::errors::{
+    ConstEvalErrorPretty, MirEvalErrorPretty, MirLowerErrorPretty, comptime_error_text,
+};
 
 macro_rules! w {
     ($dst:expr, $($arg:tt)*) => {

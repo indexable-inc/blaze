@@ -109,7 +109,7 @@ pub struct Described<I, S> {
     /// Whether it runs only when something has gone wrong, so a full link places it after
     /// every other function ([`Built::cold`](crate::driver::Built::cold)): `#[cold]`, the
     /// panic machinery, a diverging `#[track_caller]` function, a closure of one of those.
-    /// A profile that saw it run wins (docs/v2/plan/lanes/layout/layout.md).
+    /// A profile that saw it run wins (docs/v2/plan/design/code-layout.md).
     pub cold: bool,
 }
 
@@ -136,7 +136,7 @@ pub struct DescribedStatic<I, S> {
     /// references of which kind: its alignment, how it is initialized and its data, its
     /// relocations by place (each one's offset, addend and the place it resolves), and
     /// what its externs are imported as. A value that leaves one out lets two statics of other
-    /// bytes share one key (rule 18).
+    /// bytes share one key (rule 21).
     pub value: ContentId,
     /// `static mut`, or a type with interior mutability.
     pub mutable: bool,
@@ -293,7 +293,7 @@ impl Shape {
     /// ([`crate::template::own_place`]), else itself. The IR takes that place like any other,
     /// but its template holds a [`crate::template::Ref::Own`] there, so a function that calls
     /// itself and one with the same IR that calls another instance at that place compile to two
-    /// templates: one memo entry would give one of them the other's call (rule 20).
+    /// templates: one memo entry would give one of them the other's call (rule 21).
     pub fn own_place(self, at: Option<u32>) -> Shape {
         let Some(at) = at else { return self };
         let mut hasher = blaze_ids::Hasher::new(OWN_PLACE_SHAPE_DOMAIN);

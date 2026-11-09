@@ -57,7 +57,7 @@ impl Held {
 /// (`rerun-if-env-changed`, `rerun-if-changed`) is an input too. No build script of the closure
 /// works out an identity (only the program's does, a leaf past every closure), so none may read
 /// or watch the lock. Anything else would be an input missing from every key the identity is in
-/// (AGENTS.md rule 18), and is named in [`Held::missing`].
+/// (AGENTS.md rule 21), and is named in [`Held::missing`].
 pub fn hold(
     workspace: &Workspace,
     worked: &Worked,

@@ -1,6 +1,6 @@
 //! `blaze build|run|test|check|bench|doc` and `cargo blaze <the same>`, `blaze stop`, `blaze
 //! status`: a client of the agent API with cargo's flags, output and exit codes
-//! (docs/v2/plan/lanes/cargo/notes.md section 7). It reads no manifest and commits nothing (the
+//! (docs/v2/plan.md section 7). It reads no manifest and commits nothing (the
 //! daemon's watcher has the edits): it finds the checkout, sends one request with the whole
 //! command line, prints the responses as cargo prints its build, and runs what `run` and `test`
 //! run itself, on the terminal.

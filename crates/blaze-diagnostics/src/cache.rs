@@ -1,4 +1,4 @@
-//! A dependency's check computed once for everyone (docs/v2/plan/lanes/frontend/fast-bodies-cache.md;
+//! A dependency's check computed once for everyone (docs/v2/plan/design/frontend.md;
 //! compile-time.md idea 8): what [`crate::check_crate`] gives for a crate read from a dependency
 //! image ([`hir_def::deps`]), and per body what codegen reads of the check
 //! ([`hir_ty::check_cache`]), kept in the image's store and read back by every later build, on
@@ -667,7 +667,7 @@ type Fetched = Result<Option<(ContentId, ImageBuf, Option<ImageBuf>)>, String>;
 /// looked up again; one under other keys is, and loses what it had when nothing is found. A
 /// crate asked that is read from no image now (its key moved and the image went with it), or
 /// one of whose dependencies has no check key now, loses what it had too, so nothing served
-/// under an image a crate is no longer read from stays (rule 18). The
+/// under an image a crate is no longer read from stays (rule 21). The
 /// bodies of every crate of `served` are given to the database
 /// ([`hir_ty::check_cache::set_served`]) when they changed; the check keys and outcomes are kept
 /// in `served`, for [`read`] and [`store`].

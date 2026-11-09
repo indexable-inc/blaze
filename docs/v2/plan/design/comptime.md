@@ -1,7 +1,7 @@
 ---
 status: plan
-summary: Compile-time reflection in blaze. Phase 1 completes nightly `core::mem::type_info` in blaze's const evaluator; phase 2 is the opt-in `blaze_comptime` extension (`for const f in fields_of::<T>()`, `self.[f]`, `for<F: Field<T>>` bounds, `fn_info`); phase 3 builds types from const code (`type_of!`).
-date: 2026-11-02
+summary: Compile-time reflection in blaze. Phase 1 completes nightly `core::mem::type_info` in blaze's const evaluator; phase 2 is the opt-in `blaze_comptime` extension (`for const f in fields_of::<T>()`, `self.[f]`, `for<F: Field<T>>` bounds, `fn_info`), and 2b adds `dyn` and fn-pointer calls in const checked at evaluation and `const static { .. }` blocks that run any code at compile time; phase 3 builds types from const code (`type_of!`).
+date: 2026-11-09
 ---
 # Compile-time reflection (`comptime`)
 
@@ -30,6 +30,9 @@ Three phases, each usable on its own:
 
    Function reflection sits beside it: `fn_info(&f)` gives const facts about a function,
    including its `code_id`.
+   Phase 2b, under the same feature: `dyn` and function-pointer calls in const, checked when
+   they are evaluated, and `const static { .. }` blocks, which run any code that can run at
+   compile time (`format!(..).leak()` as a `&'static str`).
 3. **Types built by const code** (`type_of!`). Design only; see the last section.
 
 Rules this follows: superset-of-rust (phase 2 is opt-in and changes nothing for a crate that
@@ -465,6 +468,149 @@ Interfaces are this document's; each lane builds and lands on its own.
    reduced fixture core: field names, indices and values, no `fmt`) and the `if const` one are
    written, not yet run.
 6. **fn_info**: after lane identity lands.
+
+## Phase 2b: evaluation in place of const checking
+
+Two more pieces of `#![feature(blaze_comptime)]` (2026-11-09), for const code the nightly's
+const checker refuses although the evaluator can run it: calls through `dyn` and function
+pointers in a const context, checked when they are evaluated; and `const static { .. }` blocks,
+in which nothing is const-checked and everything that can happen at compile time runs:
+
+```rust
+#![feature(blaze_comptime)]
+const SYM: &str = "spin";
+const PAUSE: &str = const static { format!(".globl {SYM}\n{SYM}:\npause\nret\n").leak() };
+```
+
+### `dyn` and fn-pointer calls in const
+
+Without the feature, as rustc: the const checker (`hir-ty-mir/src/mir/const_check/calls.rs`,
+rustc's `check_consts`) refuses a call through a function pointer (`FnCallIndirect`) and a
+method call on `dyn Trait` of a trait that is not const (`NonConstFn`); `effects::non_const_calls`
+refuses the same. With it, in a crate that has it, neither is a static error: the call is
+checked where its target is known, when it is evaluated.
+
+- **Which calls.** A `TerminatorKind::Call` whose callee is a function pointer, and a call the
+  evaluator makes through a vtable: `Fn::call`, `FnMut::call_mut` or `FnOnce::call_once` whose
+  `Self`, behind references, is `dyn Trait`, or another trait's method whose `Self` is a `dyn`
+  type with the trait among its principal's supertraits (`is_dyn_method`). A method of an impl
+  written for a `dyn` type, or for a reference to one, is a direct call the evaluator does not
+  check, so it stays a static error. `effects::defers_dispatch_check` (the crate has the feature) and
+  `effects::is_dyn_dispatch` are the one rule both checkers read.
+- **The target.** The evaluator already runs these calls: a function pointer's bytes are a
+  `VTableMap` id of the `FnDef` or closure it was made from, a vtable's id names the concrete
+  type, and the method is called with `Self` that type. Before the call, it asks
+  `effects::const_call_error(db, env, Const, callee, args)` of the target, the rule the static
+  checker applies to a direct call: a `const fn` whose `[const]` bounds hold const, or a method
+  of a `const trait` whose `Self: [const] Trait` holds (a `const impl`; a default method
+  only through one). A closure is const when it is written `const ||`.
+- **The error.** Otherwise `MirEvalError::Comptime(ComptimeError { kind: NonConstTarget { .. },
+  at })`, naming the function that would run (a trait method resolved to its impl's), how it
+  was reached (a function pointer, or the vtable of the `dyn` type), whether its `[const]`
+  bounds were what failed, and the call site; the frames it propagates through
+  (`MirEvalError::InFunction`) are the call chain.
+- **When the check runs.** In an evaluation at compile time (a constant, a static, an anonymous
+  constant), outside a `const static` block, at a call in a body that is a const context
+  (`effects::body_constness`, or an anonymous constant) of a crate with the feature
+  (`effects::dispatch_checked_at_eval`). That is exactly the set of calls the static check
+  let through: a body of a crate without the feature never reaches one (refused statically),
+  and a body that is no const context only runs at compile time inside a `const static` block.
+  So std's bodies, which never have the feature, keep the evaluator's behavior, and the
+  evaluator's own uses of function pointers (`fmt::rt::Argument` in a panic message) are not
+  checked.
+
+Why at evaluation, not a `dyn const Trait` type: rustc's `dyn [const] Trait` is not settled at
+the pinned nightly and needs a vtable's constness in the type system. Checking the target
+needs nothing of the type system, accepts every program whose evaluation reaches only const
+code, is what rustc's own const eval does to a call it reaches ("calling non-const function"),
+and names the concrete function, which a type error could not. A type-level guarantee for
+generic code can come later on top.
+
+### `const static { .. }` blocks
+
+- **Syntax.** `const static { stmts }`, an expression. Not `comptime { .. }`: `comptime { x }`
+  is valid Rust today (a struct literal of a type named `comptime`; `if comptime { .. }` with a
+  `bool` of that name), so taking it would change programs that do not opt in, against the
+  rule of this document's syntax that none of its forms parse as Rust. `const static {` is a
+  syntax error under rustc (`const static` starts only a closure, `const static || ..`), adds
+  no keyword and no `SyntaxKind` (whose numbers are persisted in source maps), and reads as
+  `const { .. }` evaluated statically, as D's `static if` and C++'s `static_assert` use the
+  word. The parser takes it in every crate as a `BLOCK_EXPR` with a `const` and a `static`
+  token (`BlockExpr::is_comptime`); hir-def lowering refuses it without the feature
+  (`ComptimeForm::Block`, the `ComptimeWithoutFeature` error) and with it lowers it as an
+  inline const, `Expr::Const`: the same type checking, the same generic handling (evaluated per
+  instance), no new `Expr` and no change to the store's format. Whether an `Expr::Const` is one
+  is read from its syntax (`effects::const_block_is_comptime`, as `closure_is_const` reads a
+  closure's `const`), after the crate's feature, so a crate without it pays one feature lookup.
+  The formatter refuses it, as the other forms, rather than print a plain `const { }`.
+- **Its own evaluation.** A `const static` block is always a constant of its own
+  (`AnonConstId`, `inline_const_at`), also in a constant's or static's value, where `const { }`
+  is lowered in place; and an evaluation that meets it evaluates it as an anonymous constant
+  (`anon_const_eval`), not in its own run as it runs a `const { }`. So comptime is a property of
+  one evaluation (`Evaluator::comptime`, from its owner), never of a frame, and nothing it
+  allows leaks into the code around it.
+- **No const checking.** `anon_const_check` reports nothing of such a block, and the dispatch
+  check above is off in it: any function may be called (non-const functions, `dyn`, function
+  pointers, std's `fmt` machinery, `String` and `Vec`).
+- **What is refused**, each a `ComptimeError` naming the call or the site:
+  - `Foreign { func }`: a call of an `extern "C"` function other than the memory ones the
+    evaluator answers purely (`memcmp`, `memcpy`, `memmove`, `memset`, `strlen`): I/O
+    (`write`, `open`), time (`clock_gettime`), randomness (`getrandom`, `CCRandomGenerateBytes`,
+    so `HashMap::new()`'s `RandomState`), threads (`pthread_create`), the environment (`getenv`)
+    and system calls. LLVM intrinsics and the allocator's shims are not foreign calls.
+  - `PointerAddress { how }`: a pointer's address read as an integer, by an `as` cast
+    (`PointerExposeAddress`, `expose_provenance`) or a `transmute` of a value with a pointer in it
+    to a type with none (`ptr.addr()`). The evaluator's addresses are its own; one in the
+    constant would differ from the program's and between builds.
+  - Nondeterminism needs no rule of its own: the evaluator's only sources of it (a clock, a
+    random state, scheduling) are reached through foreign calls, which are refused.
+- **The heap.** What the program's allocator (`__rust_alloc`: `Global`, `Box`, `Vec`, `String`)
+  allocates in the block is the block's const heap. At the end, a heap block the value reaches
+  through a shared reference to `Freeze` data (or through a raw pointer in such a block) is
+  made global: copied into the constant and immutable, as `const_make_global` makes a
+  `const_allocate` block. So `format!(..).leak()` as a `&'static str` works. A block the value
+  owns (a `Box`, `Vec` or `String` by value, one behind `&mut` or behind an `UnsafeCell`) is
+  `HeapInValue`, as today: each use of the constant would copy its owner, and a drop would free
+  the constant's memory. Heap the value does not reach is dropped, as in any constant.
+
+### Without the feature
+
+A crate without `#![feature(blaze_comptime)]`: `const_check` and `non_const_calls` report what
+they did (both refusals above); `const static { .. }` is the lowering error naming the feature;
+the evaluator never checks a dispatch target in its bodies and never evaluates in comptime
+mode; MIR, store keys and output are unchanged. Keys: a `const static` block's value depends
+on its code and the values it reads, as any constant's (keys-cover-every-input); every input
+from outside the program (files, the environment, the clock) is refused, not read.
+
+Cost: one cached feature lookup per inline const of a constant's body at MIR lowering and per
+`anon_const_check`, the syntax read only in a crate with the feature; on a function-pointer or
+`dyn` call at compile time, the feature lookup and, in a crate with it, one `const_call_error`.
+
+### Tests
+
+`crates/hir-ty-mir/src/tests/consteval/comptime.rs` (evaluation) and
+`crates/hir-ty-mir/tests/mir/const_check.rs` (the static check):
+
+- a `dyn` call of a `const impl` method in a `const fn` evaluates; one of a plain impl is the
+  `NonConstTarget` error naming the impl's method and the `dyn` type;
+- a function-pointer call of a `const fn` evaluates; of a plain `fn`, the error naming it;
+- in a `const static` block, a `format!`-shaped run (a growing `String` over `__rust_alloc`,
+  `dyn Write`, function-pointer formatters, non-const functions) ending in `leak()` gives the
+  text as a `&'static str`; keeping the `String` itself is `HeapInValue`;
+- a `const static` block calling `write` is `Foreign` naming `write`; one casting a pointer to
+  `usize` is `PointerAddress`;
+- without the feature: both static errors as before, the evaluator runs the same calls as
+  before, and `const static { }` is the lowering error.
+
+### Known gaps
+
+- A pointer's bytes read as an integer through memory (`*(p as *const *const u8 as *const
+  usize)`) are not caught: the provenance machine knows the bytes hold a pointer, but a load does
+  not say which type it reads them as. rustc refuses it.
+- A `dyn` call reached through a generic impl of std (`<Box<dyn Fn()> as Fn>::call`) is still
+  refused statically, as std's impl is not const; through the evaluator it would be checked.
+- `const_eval_select` takes its const arm in every evaluation, so a `const static` block runs
+  std's const-eval paths where std has them (`align_offset` gives `usize::MAX`).
 
 ## Phase 3: types from const code (`type_of!`), design only
 

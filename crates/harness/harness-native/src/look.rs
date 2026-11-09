@@ -1,7 +1,7 @@
 //! harness-native's look: the small moving parts of the sidebar on den's spring system, and the per-kind icons and tones.
 //!
 //! Every value (colours, sizes, spring tunes) is in the scene (scene/00-tokens.flecs, scene/10-harness.flecs); this file
-//! reads prefabs by name and keeps only runtime state: a breath (a working row's title, a chat status), a part shown
+//! reads prefabs by name and keeps only runtime state: a breath (a chat status, a running check's mark), a part shown
 //! while its row is hovered (or only while it is not), a disclosure chevron's turn.
 use harness_native_api::spring::{Spring, Tune};
 use harness_native_api::{APP, Fold, HoverAmt, moving, settle};
@@ -14,7 +14,7 @@ use harness_native_ui_text_api::{Icon, Mark};
 use harness_native_ui_timeline_api::GlyphsArrive;
 use harness_native_ui_view as view;
 
-/// A breath, what is at work (a working session's title, a chat's thinking icon): a spring chasing 0 and 1 in turn (`up`
+/// A breath, what is at work (a chat's thinking icon, a running check's mark; a working row's title has a Sheen instead): a spring chasing 0 and 1 in turn (`up`
 /// its current target), the node's opacity going between full and `low` with it. Each user says how far it dims.
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Breath {
@@ -42,13 +42,19 @@ pub struct Sweep {
 
 /// A part shown only while row `row` is hovered (its opacity the row's hover spring), or with `away` only while it is not
 /// (what a hover-only part takes the place of), or always when `keep`. Row 0: the part's nearest ancestor with a row's
-/// hover look (what a scene template writes: it cannot name its instance's id).
+/// hover look or a [`HoverGroup`] (what a scene template writes: it cannot name its instance's id).
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct HoverShow {
     pub row: u64,
     pub keep: bool,
     pub away: bool,
 }
+
+/// What a [`HoverShow`] part of row 0 counts as its row besides a node with a hover look: a group with no wash of its own
+/// (a pasted picture, whose remove button shows only while the pointer is on it; a sent message's row, its steps button).
+/// Its host gives it a `HoverAmt`, which the Hover system steps.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct HoverGroup;
 
 /// A disclosure chevron: whether what it discloses is open. Its turn (0 closed, 1 open: a quarter turn) is the `Fold`
 /// spring on the same entity.
@@ -75,6 +81,16 @@ pub struct SideDrag {
     pub keep: f32,
 }
 
+/// Dragging the browser pane's left edge (src/app/web_drag.rs), all points: its width's range, how near the edge a press
+/// grabs it (`grab`), and the least the main card keeps beside it (`keep`, which lowers `max` in a narrow window).
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct PaneDrag {
+    pub min: f32,
+    pub max: f32,
+    pub grab: f32,
+    pub keep: f32,
+}
+
 /// How the chat's effort moves under a sideways swipe (`hn.Theme.chat_pick`, src/app/chat/pick.rs): the fingers' travel
 /// a stop takes (`step`, points), how long after the last step the effort is sent (`commit`, seconds), and how long the
 /// control keeps saying it in words once it stops moving (`word`, seconds).
@@ -83,6 +99,18 @@ pub struct PickFeel {
     pub step: f32,
     pub commit: f32,
     pub word: f32,
+}
+
+/// The chat's `@` mention preview (`hn.Theme.chat_mention`, src/app/chat/mention.rs): the `cols` characters a file's line
+/// is read to, the height of a line of code (`line`) and of a folder's entry (`entry`), and the `image_w` by `image_h`
+/// box (points) under the path: a picture is drawn whole in it, and as many lines or entries are read as fit it.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct MentionLook {
+    pub cols: u32,
+    pub line: f32,
+    pub entry: f32,
+    pub image_w: f32,
+    pub image_h: f32,
 }
 
 /// How a sidebar row's content comes in as the row folds in (and goes as it folds away), on the row's one fold spring
@@ -102,12 +130,15 @@ pub struct PressAmt {
 
 pub fn register(world: &World) {
     world.component::<SideDrag>().writable();
+    world.component::<PaneDrag>().writable();
     world.component::<PickFeel>().writable();
+    world.component::<MentionLook>().writable();
     world.component::<FoldIn>().writable();
     world.component::<PressAmt>();
     // The row templates (scene/widgets/rows.flecs) set these.
     world.component::<Breath>().writable();
     world.component::<HoverShow>().writable();
+    world.component::<HoverGroup>();
     world.component::<Disclose>().writable();
     world.component::<ShowAfter>().writable();
     world.component::<Sweep>().writable();
@@ -158,9 +189,19 @@ pub fn side_drag(w: WorldRef<'_>) -> SideDrag {
     role(w, "side_drag").try_cloned::<&SideDrag>().unwrap_or_else(|| panic!("hn.Theme.side_drag has no SideDrag"))
 }
 
+/// The browser pane drag's numbers (`hn.Theme.web_drag`).
+pub fn web_drag(w: WorldRef<'_>) -> PaneDrag {
+    role(w, "web_drag").try_cloned::<&PaneDrag>().unwrap_or_else(|| panic!("hn.Theme.web_drag has no PaneDrag"))
+}
+
 /// The chat effort's swipe and commit timings (`hn.Theme.chat_pick`).
 pub fn pick_feel(w: WorldRef<'_>) -> PickFeel {
     role(w, "chat_pick").try_cloned::<&PickFeel>().unwrap_or_else(|| panic!("hn.Theme.chat_pick has no PickFeel"))
+}
+
+/// The `@` mention preview's look (`hn.Theme.chat_mention`).
+pub fn mention_look(w: WorldRef<'_>) -> MentionLook {
+    role(w, "chat_mention").try_cloned::<&MentionLook>().unwrap_or_else(|| panic!("hn.Theme.chat_mention has no MentionLook"))
 }
 
 /// How a sidebar row's content folds in and away (`hn.Theme.tree_fold`).
@@ -262,7 +303,7 @@ pub fn alpha(w: WorldRef<'_>, e: EntityView<'_>) -> f32 {
         let amt = if h.row == 0 {
             std::iter::successors(e.parent(), |n| n.parent())
                 .take(4)
-                .find(|n| n.has(HoverLook::id()))
+                .find(|n| n.has(HoverLook::id()) || n.has(HoverGroup::id()))
                 .and_then(|n| n.try_cloned::<&HoverAmt>())
         } else {
             w.entity_from_id(h.row).try_cloned::<&HoverAmt>()
@@ -297,7 +338,7 @@ pub fn disclose(part: EntityView<'_>, open: bool) {
     }
 }
 
-/// Whether anything breathes (the window then keeps drawing, at a calm rate). A breath of `low` 1 dims nothing (a row
+/// Whether anything breathes (the window then keeps drawing, at a calm rate). A breath of `low` 1 dims nothing (a
 /// template's breath at rest: a re-run cannot remove it), so it does not count.
 pub fn breathing(w: WorldRef<'_>) -> bool {
     let mut any = false;
@@ -308,7 +349,7 @@ pub fn breathing(w: WorldRef<'_>) -> bool {
 /// A kind's icon: an SF Symbols–like codicon of the bundled Symbols Nerd Font.
 pub fn kind_icon(kind: &str) -> &'static str {
     match kind {
-        "claude" => "\u{EC10}",  // cod-sparkle
+        "claude" => "\u{EA67}",  // cod-person: an agent, one weight (no "AI" sparkle)
         "codex" => "\u{EC81}",   // cod-openai
         "cursor" => "\u{F01BF}", // md-cursor_default_outline
         "shell" => "\u{EA85}",   // cod-terminal

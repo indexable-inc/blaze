@@ -8,4 +8,4 @@ They are licensed under the SIL Open Font License, Version 1.1. The full license
 LICENSE.txt in this directory.
 
 den-native sets its text in an installed Inter when the machine has one, and in these otherwise
-(text.rs `bundled`), so the brand face (docs/research/ra-mir-brand.md) is there on any machine.
+(text.rs `bundled`), so the brand face (fed1eb428d:docs/research/ra-mir-brand.md) is there on any machine.

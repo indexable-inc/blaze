@@ -15,6 +15,7 @@
 //! | `models` | `models` (`id`, `model`, `name`, `about`, `efforts`, `effort`) | the models the agent offers, from its own list, as it starts |
 //! | `choice` | `model`, `effort` | the person switched the model and/or effort for the turns from here on (`set_model`); a resume starts with the latest |
 //! | `context` | `used`, `window`, `last` (`input`, `cache_read`, `cache_write`, `output`, `thinking`), `parts` (`id`, `name`, `tokens`, `of`, `estimate`) | tokens of the model's context window the conversation fills, after a turn; the last call's exact split and what the context holds part by part, each the agent's count or harness's named estimate ([`context`]) |
+//! | `plan` | `windows` (`name`, `used`, `resets_at`, `warn`, `limited`) | how much of the person's plan with the agent's maker is used, a window each (`5h`, `week`): the share used (0 to 1), when it resets (unix seconds), whether the agent warns of it or refuses for it; the account's, not the chat's (claude's `rate_limit_event`, codex's `account/rateLimits/updated`) |
 //! | `user` | `text` | the user's message (written by the daemon as it sends it) |
 //! | `busy` | `busy` | a turn started (true) or ended (false) |
 //! | `block_start` | `block`, `kind` (`text` \| `thinking`) | a block began streaming *(partial)* |
@@ -86,6 +87,7 @@
 //!
 //! A log from before harness schema 1 (NDJSON) is converted once, at daemon start before it listens ([`migrate_logs`],
 //! harness-proto's `migrate`), and marked in the index (`meta.chat_log`); [`Chat::open`] refuses one it finds unconverted.
+pub mod aside;
 pub mod claude;
 pub mod codex;
 pub mod context;
@@ -124,8 +126,9 @@ pub trait Adapter: Send {
     fn replies(&mut self) -> Vec<String> {
         Vec::new()
     }
-    /// The lines that send the user's `text` (none while the adapter holds it until the agent can take it).
-    fn user(&mut self, text: &str) -> Vec<String>;
+    /// The lines that send the user's `text` and the pictures at `images` (absolute paths of PNG or JPEG files) with it
+    /// (none while the adapter holds it until the agent can take it).
+    fn user(&mut self, text: &str, images: &[String]) -> Vec<String>;
     /// The lines that stop the turn in flight (none when there is nothing to stop yet).
     fn interrupt(&mut self) -> Vec<String>;
     /// The lines that switch the model (a [`harness_proto::event::ModelChoice::id`]) and/or the effort for the turns from
@@ -138,6 +141,40 @@ pub trait Adapter: Send {
     }
 }
 
+/// The media type of a picture an agent takes, from its first bytes: PNG, JPEG, GIF or WebP (None for anything else).
+#[must_use]
+pub fn picture_type(head: &[u8]) -> Option<&'static str> {
+    if head.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if head.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if head.starts_with(b"GIF87a") || head.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if head.len() >= 12 && &head[..4] == b"RIFF" && &head[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// Check that each of `images` is a picture an agent takes (an absolute path to a PNG, JPEG, GIF or WebP file), so a
+/// message with one that is not is refused before it is recorded. The error names the path and what is wrong with it.
+pub fn check_pictures(images: &[String]) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use std::io::Read;
+    for p in images {
+        if !p.starts_with('/') {
+            anyhow::bail!("picture {p:?} is not an absolute path");
+        }
+        let mut head = [0u8; 12];
+        let n = std::fs::File::open(p).and_then(|mut f| f.read(&mut head)).with_context(|| format!("reading picture {p}"))?;
+        if picture_type(&head[..n]).is_none() {
+            anyhow::bail!("{p} is not a PNG, JPEG, GIF or WebP picture");
+        }
+    }
+    Ok(())
+}
+
 /// The adapter of a chat whose agent is not running (restored from its log, before a resume): it reads and writes
 /// nothing.
 pub struct NoAdapter;
@@ -146,7 +183,7 @@ impl Adapter for NoAdapter {
     fn events(&mut self, _: &str) -> Vec<Body> {
         Vec::new()
     }
-    fn user(&mut self, _: &str) -> Vec<String> {
+    fn user(&mut self, _: &str, _: &[String]) -> Vec<String> {
         Vec::new()
     }
     fn interrupt(&mut self) -> Vec<String> {
@@ -164,7 +201,7 @@ pub fn backfill_titles() {
         let Ok(bytes) = std::fs::read(crate::db::object_dir(&oid).join("chat")) else { continue };
         let Ok(l) = log::read(&bytes) else { continue };
         let first = l.records.iter().find_map(|r| match &r.event {
-            Ok(Event { body: Body::User { text }, .. }) => Some(harness_chat::title_of(text)),
+            Ok(Event { body: Body::User { text, .. }, .. }) => Some(harness_chat::title_of(text)),
             _ => None,
         });
         if let Some(t) = first.filter(|t| !t.is_empty()) {
@@ -418,6 +455,14 @@ impl Chat {
         Ok(lines)
     }
 
+    /// Whether the agent ever said or did anything in this conversation (words, a thought, a call). False for a chat
+    /// no turn of which reached its agent: Claude writes a conversation only once a turn runs, so there is none to
+    /// resume and a relaunch starts it instead.
+    pub fn agent_spoke(&self) -> bool {
+        use harness_chat::Item;
+        self.store.lock().transcript.items.iter().any(|i| matches!(i, Item::Text { .. } | Item::Thinking { .. } | Item::Tool { .. }))
+    }
+
     /// The agent's own id for this conversation (what resumes it), when its log said one.
     pub fn session_id(&self) -> Option<String> {
         Some(self.store.lock().transcript.session_id.clone()).filter(|s| !s.is_empty())
@@ -455,11 +500,12 @@ impl Chat {
         (flipped, replies)
     }
 
-    /// The lines that send `text` to the agent, after recording its `user` event (and the turn starting).
-    pub fn user_lines(&self, text: &str, tx: &broadcast::Sender<Ev>) -> Vec<String> {
-        self.record(Body::User { text: text.to_owned() }, tx);
+    /// The lines that send `text` and the pictures at `images` to the agent, after recording its `user` event (and the turn
+    /// starting).
+    pub fn user_lines(&self, text: &str, images: &[String], tx: &broadcast::Sender<Ev>) -> Vec<String> {
+        self.record(Body::User { text: text.to_owned(), images: images.to_vec() }, tx);
         self.record(Body::Busy { busy: true }, tx);
-        self.store.lock().adapter.user(text)
+        self.store.lock().adapter.user(text, images)
     }
 
     /// The lines that stop the turn in flight.
@@ -530,12 +576,15 @@ pub fn tool_detail(block: &str, task: &serde_json::Value) -> Body {
 #[must_use]
 pub fn text_of(ev: &Event) -> String {
     match &ev.body {
-        Body::User { text } => {
+        Body::User { text, images } => {
             let mut out = String::from("\n");
             for l in text.lines() {
                 out.push_str("> ");
                 out.push_str(l);
                 out.push('\n');
+            }
+            for p in images {
+                out.push_str(&format!("> ![image]({p})\n"));
             }
             out + "\n"
         }
@@ -588,7 +637,7 @@ mod tests {
         fn events(&mut self, _: &str) -> Vec<Body> {
             Vec::new()
         }
-        fn user(&mut self, _: &str) -> Vec<String> {
+        fn user(&mut self, _: &str, _: &[String]) -> Vec<String> {
             Vec::new()
         }
         fn interrupt(&mut self) -> Vec<String> {

@@ -1,4 +1,4 @@
-//! blaze v2's data format (docs/v2/plan/lanes/format.md section 5): **the bytes in memory are the bytes on
+//! blaze v2's data format (docs/v2/plan/design/data.md section 5): **the bytes in memory are the bytes on
 //! disk**.
 //!
 //! A long-lived structure (a query's result, a pack of the store, the daemon's image) is a
@@ -905,7 +905,7 @@ impl fmt::Debug for Aligned {
     }
 }
 
-/// A span in a span side table (docs/v2/plan/lanes/format.md section 5, "Spans"): the anchor is the
+/// A span in a span side table (docs/v2/plan/design/data.md section 5, "Spans"): the anchor is the
 /// content ID of the item the span is relative to, `index` its place in that item's table.
 /// Never hashed into code: a formatting edit changes the table, not the code that names it.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]

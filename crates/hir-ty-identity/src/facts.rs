@@ -47,7 +47,7 @@ use smallvec::SmallVec;
 use std::{alloc::Global, borrow::Cow};
 
 /// The most types one body's facts may hold: past it the walk stops with an error naming the
-/// body, never runs on (rule 15).
+/// body, never runs on (rule 18).
 const TYPES: u32 = 1 << 20;
 
 /// What the queries of one environment share.
@@ -576,7 +576,7 @@ impl<'a, 'db> Facts<'a, 'db> {
             }
             Call::Intrinsic(intrinsic) => {
                 // By name: its index is its rank among the toolchain's names and shifts when one
-                // is added, so a stored hash would come to name another intrinsic (rule 18).
+                // is added, so a stored hash would come to name another intrinsic (rule 21).
                 self.h.update(&[32]).part(intrinsic.symbol().as_str().as_bytes());
                 self.args(args);
                 // The code generator writes an intrinsic's code in place, from its types.
@@ -764,7 +764,7 @@ pub(crate) fn evaluate<'db>(cx: &Cx<'db>, konst: Const<'db>) -> Result<Allocatio
     .map_err(|error| format!("the constant `{konst:?}` does not evaluate: {error:?}")) // alloc: error path
 }
 
-/// What holds a value [`Facts::allocation`] reads, for its refusals to name (rule 16).
+/// What holds a value [`Facts::allocation`] reads, for its refusals to name (rule 19).
 #[derive(Clone, Copy)]
 pub(crate) enum Holder<'db> {
     /// A named constant, by its use.
@@ -835,7 +835,7 @@ fn held_ids(value: &AllocationData<'_>, map: &ComplexMemoryMap<'_>, word: usize)
 }
 
 /// The most places [`VtableWalk`] looks at in one value: past it the walk stops with an error,
-/// never runs on (rule 15).
+/// never runs on (rule 18).
 const PLACES: u32 = 1 << 22;
 
 /// Where the bytes a walk goes through were in const eval, and whether a type says what they
@@ -1010,7 +1010,7 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
     }
 
     /// The value of `ty` at `offset` in `bytes`. One level per level of the value, as deep as
-    /// the program built it (rule 17).
+    /// the program built it (rule 20).
     fn walk(&mut self, bytes: &[u8], at: At, offset: usize, ty: Ty<'db>) -> Result<(), String> {
         stdx::ensure_sufficient_stack(|| self.walk_level(bytes, at, offset, ty))
     }
@@ -1690,7 +1690,7 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
 
     /// What a value of `ty` at `base` in `bytes` says of the byte at `pos`, as the code
     /// generator's `relocate` walks it: one level per level of the type, as deep as the program
-    /// built it (rule 17).
+    /// built it (rule 20).
     fn leaf(
         &mut self,
         bytes: &[u8],

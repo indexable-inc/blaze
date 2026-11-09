@@ -2,8 +2,21 @@ module hn.tree
 
 // The sidebar tree's parts (scene/widgets/rows.flecs builds its rows of them), Notion's sidebar: a title and a few muted
 // words trailing it, nothing else. Type and ink from the tokens (00-tokens.flecs: size_row, weight_tree, tone_row_*);
-// each row sets only what its state changes (its ink, its weight, its breath). Prefabs only, leaves only (no children),
+// each row sets only what its state changes (its ink, its weight). Prefabs only, leaves only (no children),
 // so an instance in a template is the part itself.
+
+// A row's kind at a glance, before its title: tree_kind across, tree_kind_gap after (the host sets an agent's mark or a
+// shell's glyph on it, src/app.rs sync_view).
+prefab Kind : ui.Symbol {
+  Size: {w: {kind: Fixed, value: $tree_kind, min: 0, max: 0}, h: {kind: Fixed, value: $tree_kind, min: 0, max: 0}}
+  Padding: {l: 0, r: $tree_kind_gap, t: 0, b: 0}
+}
+
+// A command's: the terminal glyph, faint (cod-terminal).
+prefab CmdKind : Kind {
+  Icon: {glyph: ""}
+  Fill: $tone_ink_faint
+}
 
 // A session's title: 13, a touch over regular, one line that gives way first (ui.Lead) when the row runs out of room.
 // Renamed in place (cmd+R, src/app/chat/rename.rs), the host sets its TextEdit's caret and selection; at rest nothing.
@@ -21,9 +34,11 @@ prefab Cmd : ui.Lead {
 }
 
 // The words trailing a row (how long ago, how long it took, how it went wrong; the shortcut on hover): 11 in the faint
-// row ink, never giving way to the title.
+// row ink, at most tree_trail_max wide (cut with an ellipsis past it), so a long step never takes the title's room.
 prefab Trail : ui.Line {
   Fill: $tone_ink_faint
   LayoutPriority: {value: 1}
+  Size: {w: {kind: Fit, value: 0, min: 0, max: $tree_trail_max}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  Truncate: {mode: Tail}
   TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
 }

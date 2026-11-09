@@ -15,6 +15,8 @@ mod as_rustc;
 mod heaps;
 #[cfg(feature = "native")]
 mod huge;
+#[cfg(feature = "native")]
+pub mod malloc;
 mod pin;
 mod program;
 mod update;
@@ -26,7 +28,8 @@ pub use program::main;
 /// bulk of a build comes from `blaze-mem`, which gives its pages back itself) wants the fastest
 /// small-object allocator, mimalloc, with a heap per blaze-mem tag (`heaps.rs`). Counted, so
 /// that the plane's `arena::account` and admission's `arena::held` see its bytes, and each
-/// tag's share of them (`blaze_mem::tag::Counters::heap`) is named in the memory line.
+/// tag's share of them (`blaze_mem::tag::Counters::heap`) is named in the memory line. C's and
+/// C++'s allocations (LLVM's) come through the same counts (`malloc.rs`).
 #[cfg(all(not(test), feature = "native"))]
 #[global_allocator]
 static ALLOC: blaze_graph::arena::Counting<heaps::Heaps> =

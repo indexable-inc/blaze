@@ -16,6 +16,17 @@
 //! lock follows its file as a rename moves it; a file removed or replaced takes its locks with
 //! it, so a lock of the name made again is another's. A crash lets every lock go.
 //!
+//! Reads into memory of the asker's ([`Effect::ReadInto`]) and writes from it
+//! ([`Effect::WriteFrom`]) are carried out against the registered memory itself
+//! ([`crate::spans`]), as a kernel's are: a read scribbles its span with [`SCRIBBLE`] as it is
+//! submitted and fills it as it completes, so an asker that reads a span in flight sees the
+//! scribble; a write takes its bytes from memory as it completes, so memory changed while it was
+//! in flight is what lands. A failed write, and one in flight at a crash, lands any of its
+//! [`SECTOR`]s, and a crash tears a write from memory that was not synced the same way: each
+//! sector kept or not, as a drive writes a request's blocks in any order. [`Sim::hold_reads`],
+//! [`Sim::fail_reads`], [`Sim::short_reads`] and [`Sim::rot`] aim faults at the reads of the
+//! store's pool.
+//!
 //! Targeted faults, each until a crash: [`Sim::fail_syncs`] (a disk gone bad),
 //! [`Sim::hold_syncs`] (a disk that stopped answering), [`Sim::slow_writes`],
 //! [`Sim::hold_lists`] and [`Sim::fail_lists`], [`Sim::hold_sends`], [`Sim::fill`] (a disk
@@ -36,6 +47,8 @@
 //! system that queued them before it saw the unwatch.
 
 mod journal;
+#[cfg(test)]
+mod pages;
 
 use std::{cell::Cell, mem, path::PathBuf, time::Duration};
 
@@ -45,8 +58,8 @@ use std::alloc::Global;
 
 pub use self::journal::Journal;
 use crate::{
-    Access, Address, Command, Completion, Conn, Done, Driver, Effect, Exit, FileName, IoError,
-    LockMode, Meta, RECV_MOST, Tag,
+    Access, Address, Cache, Command, Completion, Conn, Done, Driver, Effect, Exit, FileName,
+    IoError, LockMode, Meta, RECV_MOST, Span, Tag, spans,
     threads::tagged::{Id, Tagged},
     wait::{self, Clock, Deadline, Once},
     wheel::{self, Wheel},
@@ -76,6 +89,15 @@ const RESERVE: usize = 256;
 /// A change made under a watch that is ending is still told once in this many, as a system
 /// that queued it before it saw the unwatch: when it is due after the end, it is stale.
 const RACE_ONE_IN: u64 = 3;
+
+/// What a read into memory writes over its span as it is submitted: the bytes an asker sees
+/// that reads a span while the read is in flight (the kernel may be writing it), and what a
+/// failed read leaves.
+pub const SCRIBBLE: u8 = 0x5A;
+
+/// What a write from memory lands, or is torn, in: a drive's sector, each written whole or
+/// not at all, in any order, when the power goes or the write fails.
+pub const SECTOR: usize = 512;
 
 type EndId = blaze_mem::Handle<End>;
 
@@ -174,7 +196,7 @@ impl SimFile {
     fn len(&self) -> u64 {
         self.ops.iter().fold(self.durable.len() as u64, |len, op| match op {
             Op::Append(more) => len + more.len() as u64,
-            Op::At(at, more) => len.max(at + more.len() as u64),
+            Op::At(at, more) | Op::Sectors(at, more) => len.max(at + more.len() as u64),
             Op::Cut(to) => *to,
         })
     }
@@ -193,6 +215,8 @@ impl SimFile {
 enum Op {
     Append(Vec<u8>),
     At(u64, Vec<u8>),
+    /// A write from memory ([`Effect::WriteFrom`]): as [`Op::At`], torn by [`SECTOR`]s.
+    Sectors(u64, Vec<u8>),
     Cut(u64),
 }
 
@@ -200,7 +224,7 @@ impl Op {
     fn apply(&self, bytes: &mut Vec<u8>) {
         match self {
             Op::Append(more) => bytes.extend_from_slice(more),
-            Op::At(at, more) => {
+            Op::At(at, more) | Op::Sectors(at, more) => {
                 let at = *at as usize;
                 if bytes.len() < at + more.len() {
                     bytes.resize(at + more.len(), 0);
@@ -211,17 +235,32 @@ impl Op {
         }
     }
 
-    /// The change cut short, as a power cut leaves a write it was in the middle of.
-    fn torn(&self, rng: &mut Rng) -> Option<Op> {
+    /// The change cut short, as a power cut leaves a write it was in the middle of: a prefix
+    /// of an append or a write at an offset, any of a write from memory's sectors.
+    fn torn(&self, rng: &mut Rng) -> Vec<Op> {
         // alloc: a crash, not an op: the part of the change that landed.
         let part =
             |more: &[u8], rng: &mut Rng| more[..rng.below(more.len() as u64) as usize].to_vec();
         match self {
-            Op::Append(more) => Some(Op::Append(part(more, rng))),
-            Op::At(at, more) => Some(Op::At(*at, part(more, rng))),
-            Op::Cut(_) => None,
+            Op::Append(more) => vec![Op::Append(part(more, rng))],
+            Op::At(at, more) => vec![Op::At(*at, part(more, rng))],
+            Op::Sectors(at, more) => some_sectors(*at, more, rng),
+            Op::Cut(_) => Vec::new(),
         }
     }
+}
+
+/// Any of the [`SECTOR`]s of `bytes` at `at`, each kept or not, as writes at their offsets: what
+/// a write from memory leaves that failed or was cut by a crash. One kept past the file's end
+/// leaves zeros before it, as a hole reads.
+fn some_sectors(at: u64, bytes: &[u8], rng: &mut Rng) -> Vec<Op> {
+    bytes
+        .chunks(SECTOR)
+        .enumerate()
+        .filter(|_| rng.one_in(2))
+        // alloc: a failure or a crash, not an op: the sectors that landed.
+        .map(|(n, it)| Op::At(at + (n * SECTOR) as u64, it.to_vec()))
+        .collect()
 }
 
 #[derive(Debug)]
@@ -321,6 +360,16 @@ pub struct Sim {
     held_sends: Vec<(Conn, Tag, Vec<u8>)>,
     /// Syncs of files under this directory fail ([`Sim::fail_syncs`]): a disk that went bad.
     fail_syncs: Option<FileName>,
+    /// Reads into memory of files under this directory are taken and not done until
+    /// [`Sim::release_reads`] ([`Sim::hold_reads`]).
+    hold_reads: Option<FileName>,
+    /// The reads it holds, their spans scribbled.
+    held_reads: Vec<Effect>,
+    /// Reads into memory of files under this directory fail once in `.1` ([`Sim::fail_reads`]).
+    fail_reads: Option<(FileName, u32)>,
+    /// Reads into memory of files under this directory end short once in `.1`
+    /// ([`Sim::short_reads`]).
+    short_reads: Option<(FileName, u32)>,
     /// Lists of this directory wait until [`Sim::release_lists`] ([`Sim::hold_lists`]).
     hold_lists: Option<FileName>,
     /// The lists it holds, each listed as the directory is when released.
@@ -414,6 +463,11 @@ impl Sim {
             // alloc: none until a send is held.
             held_sends: Vec::new(),
             fail_syncs: None,
+            hold_reads: None,
+            // alloc: none until a read is held.
+            held_reads: Vec::new(),
+            fail_reads: None,
+            short_reads: None,
             hold_lists: None,
             held_lists: Vec::new(), // alloc: empty, allocates nothing
             fail_lists: None,
@@ -514,15 +568,30 @@ impl Sim {
 
     /// The machine loses power: every effect in flight is gone without a completion, every
     /// watch, process, listen and connection with it, and each file keeps what was synced plus
-    /// a random prefix of the changes after (appends, writes at an offset, truncations), the
-    /// last of which may be torn. A whole-file write or rename that completed is kept whole;
-    /// one in flight is not there.
+    /// a random prefix of the changes after (appends, writes at an offset, writes from memory,
+    /// truncations), the last of which may be torn: an append or a write at an offset to a
+    /// prefix, a write from memory to any of its [`SECTOR`]s. A write from memory in flight
+    /// may have landed any of its sectors first. A whole-file write or rename that completed is
+    /// kept whole; one in flight is not there.
     ///
     /// Every lock goes with the processes that held them, another process's too
     /// ([`Sim::hold_lock`]), and a disk filled up ([`Sim::fill`]) has room again.
     pub fn crash(&mut self) {
-        self.pending.drain(|_, _| {});
+        // A write from memory in flight may have landed any of its sectors, unsynced: the cut
+        // below keeps or tears them as it does every change since the last sync.
+        // alloc: a crash, not an op.
+        let mut flying = Vec::new();
+        self.pending.drain(|_, pending| flying.push(pending.effect));
+        for effect in flying {
+            if let Effect::WriteFrom { file, at, from, cache, .. } = effect {
+                self.land_some(&file, at, &from, cache);
+            }
+        }
         self.held.clear();
+        self.held_reads.clear();
+        self.hold_reads = None;
+        self.fail_reads = None;
+        self.short_reads = None;
         self.held_sends.clear();
         self.hold_syncs = None;
         self.fail_syncs = None;
@@ -549,10 +618,10 @@ impl Sim {
         files.sort_unstable_by(|a, b| a.0.cmp(b.0));
         for (_, file) in files {
             let kept = self.rng.below(file.ops.len() as u64 + 1) as usize;
-            let torn = file.ops.get(kept).and_then(|op| op.torn(&mut self.rng));
+            let torn = file.ops.get(kept).map(|op| op.torn(&mut self.rng)).unwrap_or_default();
             file.sync(kept);
-            if let Some(torn) = torn {
-                torn.apply(&mut file.durable);
+            for op in torn {
+                op.apply(&mut file.durable);
             }
             file.ops.clear();
         }
@@ -618,6 +687,52 @@ impl Sim {
     /// was. For a test of a store or a journal on a full disk.
     pub fn fill(&mut self, dir: FileName, room: u64) {
         self.room = Some((dir, room));
+    }
+
+    /// From now on, a read into memory ([`Effect::ReadInto`]) of a file under `dir` is taken,
+    /// its span scribbled, and not done until [`Sim::release_reads`] or a crash: a load the
+    /// test keeps in flight while other actors step (a pool's page `Loading` while a reader and
+    /// the evictor look at it). As held syncs are, a held read is not counted in flight.
+    pub fn hold_reads(&mut self, dir: FileName) {
+        self.hold_reads = Some(dir);
+    }
+
+    /// The reads held so far ([`Sim::hold_reads`]).
+    pub fn reads_held(&self) -> usize {
+        self.held_reads.len()
+    }
+
+    /// Lets the reads held so far go, each done `after` from now against the file as it is
+    /// then, and holds no more.
+    pub fn release_reads(&mut self, after: Duration) {
+        self.hold_reads = None;
+        for effect in mem::take(&mut self.held_reads) {
+            self.pend(after, effect, 0);
+        }
+    }
+
+    /// From now on, once in `one_in` (at least 1), a read into memory of a file under `dir`
+    /// fails with EIO, its span left scribbled, until a crash: a drive that cannot read a
+    /// block. For a test that a failed load is an error for its reader and leaves nothing kept.
+    pub fn fail_reads(&mut self, dir: FileName, one_in: u32) {
+        self.fail_reads = Some((dir, one_in.max(1)));
+    }
+
+    /// From now on, once in `one_in` (at least 1), a read into memory of a file under `dir`
+    /// ends short of what the file holds, a drawn part of it read and the rest of its span left
+    /// scribbled, until a crash: a file cut by something other than blaze, as its reader sees
+    /// it. For a test that a short read inside what was committed is refused as corrupt.
+    pub fn short_reads(&mut self, dir: FileName, one_in: u32) {
+        self.short_reads = Some((dir, one_in.max(1)));
+    }
+
+    /// `bytes` at `at` of `file` changed on the disk, durably and silently, by nothing the
+    /// simulation runs: a block that rotted, or a file another program wrote. No watch hears of
+    /// it, and what was not synced stays on top of it. A file not there is left so.
+    pub fn rot(&mut self, file: &FileName, at: u64, bytes: &[u8]) {
+        if let Some(sim) = self.files.get_mut(file) {
+            Op::At(at, bytes.to_vec()).apply(&mut sim.durable); // alloc: the world changed by the test, not an op.
+        }
     }
 
     /// Another process holds `file`'s lock in `mode`, until [`Sim::release_lock`] or a crash:
@@ -1113,6 +1228,9 @@ impl Sim {
             Effect::WriteAt { file, bytes, .. } if self.files.contains_key(file) => {
                 (file, bytes.len() as u64)
             }
+            Effect::WriteFrom { file, from, .. } if self.files.contains_key(file) => {
+                (file, u64::from(from.len))
+            }
             _ => return Ok(effect),
         };
         if !file.is_under(dir) {
@@ -1140,10 +1258,101 @@ impl Sim {
                 sim.ops.push(Op::At(at, bytes));
                 self.changed(&file);
             }
+            // The sectors that fit, as a drive out of room takes the first of a request's.
+            Effect::WriteFrom { file, at, from, cache, .. } if fits >= SECTOR => {
+                if let Ok(mut bytes) = Sim::bytes_of(&from, &file, at, cache) {
+                    bytes.truncate(fits / SECTOR * SECTOR);
+                    let sim = self.files.get_mut(&file).expect("looked up above");
+                    sim.ops.push(Op::Sectors(at, bytes));
+                    self.changed(&file);
+                }
+            }
             // A whole-file write leaves the file as it was.
             _ => {}
         }
         Err(full)
+    }
+
+    /// `span` of the read or write `what` of `file` at `at` reached, or why not.
+    fn resolve(
+        span: &Span,
+        file: &FileName,
+        at: u64,
+        cache: Cache,
+        what: &str,
+    ) -> Result<spans::Resolved, IoError> {
+        spans::resolve(span, file, at, cache, what)
+    }
+
+    /// The span of a read into memory just submitted written over with [`SCRIBBLE`]: what the
+    /// asker would see of it while the kernel writes there.
+    fn scribble(effect: &Effect) {
+        if let Effect::ReadInto { file, at, into, cache, .. } = effect
+            && let Ok(span) = Sim::resolve(into, file, *at, *cache, "a read into memory of")
+        {
+            span.with_mut(|bytes| bytes.fill(SCRIBBLE));
+        }
+    }
+
+    /// Whether `file` is under the directory of a fault drawn once in its count.
+    fn drawn(rng: &mut Rng, fault: &Option<(FileName, u32)>, file: &FileName) -> bool {
+        fault.as_ref().is_some_and(|(dir, one_in)| {
+            file.is_under(dir) && rng.below(u64::from(*one_in)) == 0
+        })
+    }
+
+    /// [`Effect::ReadInto`] of `into` from `at` of `file`, done now against the file as it is.
+    fn read_into(&mut self, file: &FileName, at: u64, into: &Span, cache: Cache) -> Done {
+        let span = match Sim::resolve(into, file, at, cache, "a read into memory of") {
+            Ok(span) => span,
+            Err(why) => return Done::Failed(why),
+        };
+        let followed = match self.followed(file) {
+            Ok(followed) => followed,
+            Err(why) => return Done::Failed(why),
+        };
+        let file = followed.as_ref().unwrap_or(file);
+        if !self.files.contains_key(file) {
+            // alloc: an error's message.
+            return Done::Failed(IoError(format!("{file}: No such file or directory (os error 2)")));
+        }
+        if Sim::drawn(&mut self.rng, &self.fail_reads, file) {
+            // alloc: an error's message.
+            return Done::Failed(IoError(format!("{file}: Input/output error (os error 5)")));
+        }
+        let bytes = match self.read(file, at, span.len()) {
+            Ok(bytes) => bytes,
+            Err(why) => return Done::Failed(why),
+        };
+        let mut len = bytes.len();
+        if len > 0 && Sim::drawn(&mut self.rng, &self.short_reads, file) {
+            len = self.rng.below(len as u64) as usize;
+        }
+        span.with_mut(|into| into[..len].copy_from_slice(&bytes[..len]));
+        Done::ReadInto { len: len as u32 }
+    }
+
+    /// The bytes of `from` as they are now, for a write from memory to `file` at `at`.
+    fn bytes_of(from: &Span, file: &FileName, at: u64, cache: Cache) -> Result<Vec<u8>, IoError> {
+        let span = Sim::resolve(from, file, at, cache, "a write from memory to")?;
+        // alloc: the write's bytes, taken from memory as the kernel would as it writes them.
+        Ok(span.with(<[u8]>::to_vec))
+    }
+
+    /// Any of the sectors of a write from memory landed on `file`, unsynced: what one that
+    /// failed, or was in flight at a crash, leaves.
+    fn land_some(&mut self, file: &FileName, at: u64, from: &Span, cache: Cache) {
+        let Ok(bytes) = Sim::bytes_of(from, file, at, cache) else { return };
+        if !self.files.contains_key(file) {
+            return;
+        }
+        let landed = some_sectors(at, &bytes, &mut self.rng);
+        if landed.is_empty() {
+            return;
+        }
+        let sim = self.files.get_mut(file).expect("looked up above");
+        sim.ops.extend(landed);
+        self.changed(file);
     }
 
     fn fail(&mut self, tag: Tag) -> Completion {
@@ -1259,6 +1468,8 @@ impl Sim {
                 if torn > 0 {
                     self.changed(&file);
                 }
+            } else if let Effect::WriteFrom { file, at, from, cache, .. } = effect {
+                self.land_some(&file, at, &from, cache);
             }
             return self.fail(tag);
         }
@@ -1274,6 +1485,21 @@ impl Sim {
                 self.read(&file, at, len).map_or_else(Done::Failed, Done::Read)
             }
             Effect::ReadLink { file, .. } => self.read_link(&file),
+            Effect::ReadInto { file, at, into, cache, .. } => self.read_into(&file, at, &into, cache),
+            Effect::WriteFrom { file, at, from, cache, .. } => {
+                match Sim::bytes_of(&from, &file, at, cache) {
+                    Err(why) => Done::Failed(why),
+                    Ok(bytes) => match self.files.get_mut(&file) {
+                        Some(sim) => {
+                            sim.ops.push(Op::Sectors(at, bytes));
+                            self.changed(&file);
+                            Done::Written
+                        }
+                        // alloc: an error's message.
+                        None => Done::Failed(IoError(format!("{file}: no such file"))),
+                    },
+                }
+            }
             Effect::Append { file, bytes, .. } => {
                 file_mut(&mut self.files, &file).ops.push(Op::Append(bytes));
                 self.changed(&file);
@@ -1778,12 +2004,21 @@ impl Driver for Sim {
                 },
                 _ => {}
             }
+            // The kernel may write a read's span from now until it completes.
+            Sim::scribble(&effect);
+            if let (Effect::ReadInto { file, .. }, Some(dir)) = (&effect, &self.hold_reads)
+                && file.is_under(dir)
+            {
+                self.held_reads.push(effect);
+                continue;
+            }
             let delay = match (&effect, &self.slow) {
                 (Effect::Timer { after, .. }, _) => *after,
                 (
                     Effect::Sync { file, .. }
                     | Effect::Write { file, .. }
                     | Effect::WriteAt { file, .. }
+                    | Effect::WriteFrom { file, .. }
                     | Effect::Truncate { file, .. },
                     Some((dir, by)),
                 ) if file.is_under(dir) => *by,
@@ -1857,9 +2092,9 @@ impl Driver for Sim {
             if !self.recording.is_empty() {
                 let file = match &pending.effect {
                     Effect::Sync { file, .. } => Some((file, true)),
-                    Effect::Write { file, .. } | Effect::WriteAt { file, .. } => {
-                        Some((file, false))
-                    }
+                    Effect::Write { file, .. }
+                    | Effect::WriteAt { file, .. }
+                    | Effect::WriteFrom { file, .. } => Some((file, false)),
                     _ => None,
                 };
                 if let Some((file, sync)) = file
@@ -2854,5 +3089,133 @@ mod tests {
         sim.crash();
         assert_eq!(ran(&mut sim, vec![write(b"new", 5)])[&Tag(5)], Done::Written);
         assert_eq!(sim.contents(&head), b"new");
+    }
+
+    /// Memory of the simulation's tests, registered for reads into and writes from it.
+    #[allow(unsafe_code, reason = "test memory: under `Sim`, which touches it only inside poll and crash")]
+    fn memory(len: usize) -> crate::Memory {
+        // SAFETY: `Memory::new`'s contract holds under `Sim` on the test's one thread.
+        unsafe { crate::Memory::new("the simulation's tests", len) }.expect("a free region")
+    }
+
+    fn read_into(file: &FileName, at: u64, into: crate::Span, tag: u64) -> Effect {
+        Effect::ReadInto {
+            file: file.clone(),
+            at,
+            into,
+            cache: Cache::Kept,
+            priority: crate::Priority::Demand,
+            tag: Tag(tag),
+        }
+    }
+
+    fn write_from(file: &FileName, at: u64, from: crate::Span, tag: u64) -> Effect {
+        Effect::WriteFrom { file: file.clone(), at, from, cache: Cache::Kept, tag: Tag(tag) }
+    }
+
+    /// A read into memory scribbles its span as it is submitted, so an asker that looks at it
+    /// in flight sees the scribble, and fills it as it completes; a write from memory takes the
+    /// bytes memory holds as it completes, not as it was asked.
+    #[test]
+    fn memory_is_the_kernel_s_while_an_effect_on_it_is_in_flight() {
+        let mut sim = Sim::new(3, Faults::default());
+        let mut memory = memory(4096);
+        let file = name("pool/pack-1");
+        sim.change(&file, b"0123456789");
+        sim.submit(&mut vec![read_into(&file, 2, memory.span(0, 4), 1)]);
+        let mut held = [0; 4];
+        memory.read(0, &mut held);
+        assert_eq!(held, [SCRIBBLE; 4]);
+        let mut out = Vec::new();
+        while out.is_empty() {
+            sim.poll(&mut out, Deadline::NEVER);
+        }
+        assert_eq!(out[0].done, Done::ReadInto { len: 4 });
+        memory.read(0, &mut held);
+        assert_eq!(&held, b"2345");
+        memory.write(100, b"asked");
+        sim.submit(&mut vec![write_from(&file, 0, memory.span(100, 5), 2)]);
+        memory.write(100, b"later");
+        out.clear();
+        while out.is_empty() {
+            sim.poll(&mut out, Deadline::NEVER);
+        }
+        assert_eq!(out[0].done, Done::Written);
+        assert_eq!(sim.contents(&file), b"later56789");
+    }
+
+    /// A crash keeps each sector of a write from memory that was not synced whole or not at
+    /// all, never a part of one, on every seed; across seeds it keeps none, all, and some.
+    #[test]
+    fn a_crash_tears_a_write_from_memory_by_sectors() {
+        let file = name("pool/pack-1");
+        let (mut none, mut all, mut some) = (false, false, false);
+        for seed in 0..200 {
+            let mut sim = Sim::new(seed, Faults::default());
+            let mut memory = memory(4096);
+            memory.fill(0, 4096, b'x');
+            sim.change(&file, &[0; 4096]);
+            let mut effects = vec![write_from(&file, 0, memory.span(0, 4096), 1)];
+            // On odd seeds the write is still in flight at the crash.
+            match seed % 2 {
+                0 => run_until_idle(&mut sim, &mut effects, |_, _| {}).expect("the effects end"),
+                _ => sim.submit(&mut effects),
+            }
+            sim.crash();
+            let after = sim.contents(&file);
+            assert_eq!(after.len(), 4096, "seed {seed}");
+            let kept: Vec<bool> = after
+                .chunks(SECTOR)
+                .map(|it| match it {
+                    it if it.iter().all(|&b| b == b'x') => true,
+                    it if it.iter().all(|&b| b == 0) => false,
+                    it => panic!("seed {seed}: a torn sector {it:?}"),
+                })
+                .collect();
+            none |= kept.iter().all(|it| !it);
+            all |= kept.iter().all(|it| *it);
+            some |= kept.iter().any(|it| *it) && !kept.iter().all(|it| *it);
+        }
+        assert!(none && all && some, "none {none}, all {all}, some {some}");
+    }
+
+    /// Held reads wait, scribbled, until released; failed and short reads say so; rot changes
+    /// the disk under what was synced, and a read sees it.
+    #[test]
+    fn reads_into_memory_are_held_failed_cut_short_and_see_rot() {
+        let file = name("pool/pack-1");
+        let mut sim = Sim::new(9, Faults::default());
+        let mut memory = memory(4096);
+        sim.change(&file, b"abcdefgh");
+        sim.hold_reads(name("pool"));
+        sim.submit(&mut vec![read_into(&file, 0, memory.span(0, 8), 1)]);
+        let mut out = Vec::new();
+        sim.advance(Duration::from_secs(1));
+        sim.poll(&mut out, Deadline::PASSED);
+        assert!(out.is_empty() && sim.reads_held() == 1);
+        sim.rot(&file, 2, b"XY");
+        sim.release_reads(Duration::ZERO);
+        while out.is_empty() {
+            sim.poll(&mut out, Deadline::NEVER);
+        }
+        assert_eq!(out[0].done, Done::ReadInto { len: 8 });
+        let mut held = [0; 8];
+        memory.read(0, &mut held);
+        assert_eq!(&held, b"abXYefgh");
+        sim.fail_reads(name("pool"), 1);
+        let mut failed = None;
+        run_until_idle(&mut sim, &mut vec![read_into(&file, 0, memory.span(0, 8), 2)], |it, _| {
+            failed = Some(it.done)
+        })
+        .expect("the effects end");
+        assert!(matches!(failed, Some(Done::Failed(_))), "{failed:?}");
+        sim.crash();
+        sim.short_reads(name("pool"), 1);
+        let mut cut = None;
+        run_until_idle(&mut sim, &mut vec![read_into(&file, 0, memory.span(0, 8), 3)], |it, _| {
+            cut = Some(it.done)
+        })
+        .expect("the effects end");
+        assert!(matches!(cut, Some(Done::ReadInto { len }) if len < 8), "{cut:?}");
     }
 }

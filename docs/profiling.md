@@ -164,8 +164,10 @@ column.
 | granted_bytes | u64? | the memory the plane granted a daemon `task` as it started, its predicted peak (`blaze_graph::admission`): against `peak_bytes`, how far off the forecast was |
 | passed | u64? | the times a daemon `task` was passed over for memory before it started (another started while its grant did not fit); 0 when memory never held it back |
 | node | u64? | the plane node a daemon `task` ran as |
+| heap_allocated_bytes | u64? | the bytes a daemon `task`'s work allocated from the global heap in all, never netted against its frees, its fan-out's included (`blaze_graph::arena::Spent`): far past `peak_bytes`, the task churns the heap; null for a task that gave way or panicked |
+| heap_freed_bytes | u64? | the bytes a daemon `task`'s work freed to the global heap in all, whoever allocated them; null as `heap_allocated_bytes` is |
 
-The columns from `awaits` on are typed: only a span kind fills them, never an ad hoc span's fields. A span kind is a struct declared once in the registry `span_kinds!` at the end of `crates/blaze-profile/src/span.rs`: `unit names`, `unit bodies`, `unit codegen`, `unit link` and `unit store` (`krate`, `unit`), `macro expand` (`path`, `krate`, and as it ends `steps`, `peak_bytes`, `outcome`), `wait` (`awaits`, `function`, `owner`, `on`), `hold` (`what`, `holder`), `job` (`kind`, `job`, `creator`), `worker` (`doing` in `function`: a pool worker's `search`, `idle` or `switch` between jobs), `macro module` (`module` in `function`, and as it ends `module_from`, `code_bytes`) `build script proof` (`krate`, `unit`, and as it ends `steps`), `admission` (a plane task's wait from ready to start: `kind` in `function`, `node`, and as it ends `waited_for` in `awaits` (memory, a work or io thread, nothing), `passed`, `granted`; detached, on no thread's stack, as no thread waits in it; `blaze explain admission_waits`) and `task` (a daemon plane task run on a thread, `crates/blaze-cargo/src/serve/plane.rs`: `kind` in `function` as `unit bodies (infer)`, `node`, `granted`, `passed`, and as it ends `peak` in `peak_bytes`; `blaze explain task_memory` and `admission_waits` read it). Each field names its column by type, so a site that leaves out a field, gives one of the wrong type, or names a column that does not exist does not compile, and a typed column no kind writes fails the build. The kind writes its fields straight into its open span's slot, with no field visitor. `span::read` reads a ring's row back as its kind and `span::read_batch` a `spans` batch; every kind has a view of its rows with its fields as columns, `span_<name>` with spaces as underscores (`span_macro_expand`, whose `path` is `function`). An ad hoc `tracing::info_span!(target: "blaze", ..)` fills `crate`, `function` and `unit` from fields of those names (`krate`, `subject` and `cgu` too); its other fields are kept nowhere.
+The columns from `awaits` on are typed: only a span kind fills them, never an ad hoc span's fields. A span kind is a struct declared once in the registry `span_kinds!` at the end of `crates/blaze-profile/src/span.rs`: `unit names`, `unit bodies`, `unit codegen`, `unit link` and `unit store` (`krate`, `unit`), `macro expand` (`path`, `krate`, and as it ends `steps`, `peak_bytes`, `outcome`), `wait` (`awaits`, `function`, `owner`, `on`), `hold` (`what`, `holder`), `job` (`kind`, `job`, `creator`), `worker` (`doing` in `function`: a pool worker's `search`, `idle` or `switch` between jobs), `macro module` (`module` in `function`, and as it ends `module_from`, `code_bytes`) `build script proof` (`krate`, `unit`, and as it ends `steps`), `admission` (a plane task's wait from ready to start: `kind` in `function`, `node`, and as it ends `waited_for` in `awaits` (memory, a work or io thread, nothing), `passed`, `granted`; detached, on no thread's stack, as no thread waits in it; `blaze explain admission_waits`) and `task` (a daemon plane task run on a thread, `crates/blaze-cargo/src/serve/plane.rs`: `kind` in `function` as `unit bodies (infer)`, `node`, `granted`, `passed`, and as it ends `peak` in `peak_bytes`, `heap_allocated` in `heap_allocated_bytes` and `heap_freed` in `heap_freed_bytes`; `blaze explain task_memory`, `admission_waits` and `memory` read it). Each field names its column by type, so a site that leaves out a field, gives one of the wrong type, or names a column that does not exist does not compile, and a typed column no kind writes fails the build. The kind writes its fields straight into its open span's slot, with no field visitor. `span::read` reads a ring's row back as its kind and `span::read_batch` a `spans` batch; every kind has a view of its rows with its fields as columns, `span_<name>` with spaces as underscores (`span_macro_expand`, whose `path` is `function`). An ad hoc `tracing::info_span!(target: "blaze", ..)` fills `crate`, `function` and `unit` from fields of those names (`krate`, `subject` and `cgu` too); its other fields are kept nowhere.
 
 A `macro expand` span is one run of a proc macro: `function` is the macro's path (`serde_derive::Serialize`), `crate` the crate the call is in. A unit's phase spans (`unit names`, `unit bodies`, `unit codegen`, `unit link`, `unit store`) carry the unit in `unit` as `serde v1.0.219 (build script)`; their `crate` is the target's name, `build-script-build` for every build script. A `scope` wait names the span its caller opened the scope in: `scope 13 of unit codegen serde v1.0.219 (build script)`.
 
@@ -296,7 +298,7 @@ there a repeated name is not a repeated key.
 | since | u64? | the last build that computed it (however that build ended), which it is compared with |
 
 `blaze why` reads the same rows from the daemon (`Request::Rebuilt`). How each cause is worked
-out is in docs/v2/plan/lanes/why.md.
+out is in docs/v2/plan/design/why.md.
 
 The fiber driver notes the four `fiber stack` counters when a job ends, as one row in the
 recorder (`blaze_profile::fiber_stack`):
@@ -524,20 +526,29 @@ key_part_diff before=N after=M`). A key with no parts has one row with a null `p
 | detail | utf8? | what changed about it |
 | seen_by | dict | watcher, rescan or request |
 
-### `alloc_samples`: about one allocation every 512 KiB allocated, on each thread
+### `alloc_samples`: one global-heap allocation in every 4 MiB a thread allocates
+
+The daemon's heap sampler (`crates/blaze-profile/src/heap.rs`, started by `blaze serve`): every
+`blaze_graph::arena::SAMPLE_EVERY` (4 MiB) bytes a thread allocates through the counting
+allocator, the allocation that crosses it is sampled, its frame pointers walked inside the
+allocator into a fixed ring of atomics (no lock, no allocation) and named at the flush, as the
+CPU samples are. Summed by `site`, the samples' `bytes` are what was allocated there, within a
+sample's: what churns the global heap, by function (`blaze explain memory`). A sample written
+over before a flush read it is counted in the flush's skipped rows.
 
 | column | type | |
 |---|---|---|
-| build_id | u64? | the build, or null |
+| build_id | u64? | the build its thread worked for, or null |
 | process | u32 | the process id |
 | thread | u32 | the thread |
 | t_ns | i64 | when |
-| bytes | u64 | the bytes the sample stands for (the sampling interval) |
+| bytes | u64 | the bytes of allocation the sample stands for: the interval, or as many of it as a larger block crossed |
 | stack | stack | the call stack, outermost first |
 | span_id | u64? | the innermost span its thread was inside |
 | stack_pcs | pcs? | as in `samples` |
-
-No writer fills `alloc_samples` yet; its `stack_pcs` is there for the one that will.
+| tag | dict? | the blaze-mem tag of the task that made the block; null outside any task |
+| block_bytes | u64 | the sampled block's own bytes |
+| site | utf8? | the innermost frame of `stack` outside the allocator and the collections that call it (`alloc::`, `core::`, `std::`, `hashbrown::`, ...) |
 
 ### `heap_by_owner`: the live heap at the end of a build, by what holds it
 
@@ -816,7 +827,7 @@ The daemon gives both to `History::linked` and `History::crate_graph` (`crates/b
 
 `blaze perf record` writes both, one pair of files a run (`perf-<run>.<table>.parquet`, which the
 history's cap never deletes), and `blaze perf diff` compares two runs function by function, joined by
-`identity`, with a noise bound and a cause class: docs/v2/plan/lanes/perf-history.md.
+`identity`, with a noise bound and a cause class: docs/v2/plan/design/perf-history.md.
 
 ### `open`: the spans live threads are inside
 
@@ -1185,7 +1196,7 @@ What the profile could not see is listed after the findings, as blind spots, nev
   build (`builds.daemon_user_ns` and `daemon_system_ns`, from getrusage), which the gate checks
   the spans' total against (`cpu_matches_process`); a build row from before those columns says
   it has none;
-- waits with no wait span (rule 13), classed by their kind alone (`key wait with no wait span`)
+- waits with no wait span (rule 15), classed by their kind alone (`key wait with no wait span`)
   and sized by the wall they cover, with the recorder's `profile spans lost` over the build
   beside them; and named waits that never name an owner. A class's evidence says its waits'
   parked time summed over the jobs waiting, which is not workers' time;

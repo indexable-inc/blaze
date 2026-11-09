@@ -1,4 +1,4 @@
-//! Every file the load reads, through the database (docs/v2/plan/lanes/cargo/notes.md section 2).
+//! Every file the load reads, through the database (docs/v2/plan.md section 2).
 //!
 //! - A path, absolute as cargo names it, is read through its longest [`Mount`]: the view's
 //!   files (`Cx::file`) or another root's (`Cx::file_at`). [`LoadFile`] and [`LoadDir`] are one

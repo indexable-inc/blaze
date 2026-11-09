@@ -280,7 +280,7 @@ fn an_assemblers_lines_are_read_from_its_error() {
 
 /// A blaze with no assembler (neither LLVM nor rsasm) assembles no `global_asm!`: it says so,
 /// naming the block, and never hands the text to the machine's C compiler
-/// (docs/v2/plan/toolchain-c.md, slice 1).
+/// (docs/v2/plan/design/toolchain-c.md, slice 1).
 #[test]
 #[cfg(not(any(feature = "llvm", feature = "rsasm")))]
 fn without_llvm_a_global_asm_is_an_error_not_the_machines_compiler() {

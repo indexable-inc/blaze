@@ -1,5 +1,5 @@
 //! `blaze why`: what the last build computed again instead of reusing, and why
-//! (docs/v2/plan/lanes/why.md). A sans-IO core (rule 12): [`Ledger`] takes the misses a
+//! (docs/v2/plan/design/why.md). A sans-IO core (rule 14): [`Ledger`] takes the misses a
 //! build gave back with what it built (`Ended::misses`, its own and no other build's), names
 //! each one's cause against what it holds of the subject's last compute, and hands back the
 //! answer, the history's rows and the record to append to its file; [`Answers`] keeps each
@@ -11,7 +11,7 @@
 //!   telling apart instances side by side (one function built for a test and for a program,
 //!   one crate built in two workspaces). Its name is for a person only. Two different misses of
 //!   one step under one subject in one build are refused ([`RebuildCause::Twice`]) and
-//!   compared with nothing (rule 18).
+//!   compared with nothing (rule 21).
 //! - **A miss with parts** (a key made of named parts: a dev template's toolchain, code,
 //!   settings and callees) is told apart against the parts the subject had when last computed,
 //!   by any build, one that failed or was stopped too (a keep-going build that failed still
@@ -110,7 +110,7 @@ struct Record {
 }
 
 /// What `blaze why`'s answers are told apart against: each subject's last compute, by step and
-/// subject. A `BTreeMap`, as the file is written in its order (rule 22).
+/// subject. A `BTreeMap`, as the file is written in its order (rule 25).
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Ledger {
     items: BTreeMap<(String, ContentId), Last>,
@@ -541,7 +541,7 @@ impl Answers {
             blaze_hash::HashSet::default();
         seen.insert(item);
         // Each item enters the chain once and each lookup is a binary search, so the walk is
-        // bounded by the answer's length (rule 15).
+        // bounded by the answer's length (rule 18).
         let mut at = 0;
         while at < chain.len() && chain.len() <= answer.rebuilt.len() {
             // alloc: once a request, the names a reason gives
@@ -584,7 +584,7 @@ pub fn magic() -> [u8; 32] {
 /// The version of the file's records: a hash of the encoding of a record with every field
 /// set, and of [`NAMING`]. A field added, removed, renamed or of another type, or parts and
 /// subjects made another way, changes it, so a file written by a blaze whose records differ is
-/// another version, moved aside rather than misread (rule 23).
+/// another version, moved aside rather than misread (rule 26).
 pub fn version() -> ContentId {
     let id = ContentId([7; 32]);
     let part =
@@ -919,7 +919,7 @@ mod tests {
         assert_eq!((restored.fault, restored.records), (None, 3));
         assert_eq!(restored.ledger.items, ledger.items);
         assert_eq!(Ledger::restore(&restored.ledger.file()).ledger.items, ledger.items);
-        // Written whole and read back, byte for byte (rule 23).
+        // Written whole and read back, byte for byte (rule 26).
         let whole = restored.ledger.file();
         assert_eq!(Ledger::restore(&whole).ledger.file(), whole);
         let torn = Ledger::restore(&file[..file.len() - 1]);

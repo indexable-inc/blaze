@@ -27,7 +27,7 @@ ctx {
   // The new-object picker (File > New…) while it is open.
   Picker {}
   Archive {}
-  // A chat pane has the keyboard: keys edit its input (macOS text editing), Return sends, Escape interrupts.
+  // A chat pane has the keyboard: keys edit its input (macOS text editing), Return sends, Escape or Cmd+. interrupts.
   Chat {}
   // A harness browser view has the keyboard (the pane, or a card clicked into: BrowserFocus, src/app/browser.rs): keys
   // no binding here takes go to the page.
@@ -150,6 +150,8 @@ act {
   ChatNewline : act.Edit { EditOp: {op: "newline"} }
   // Command-Return: sends the chat's message, and submits a cell's TextArea (where Return breaks the line).
   ChatSubmit : act.Edit { EditOp: {op: "submit"} }
+  // Tab: takes the `@` mention menu's highlighted place (chat/mention.rs); with no menu open, types a tab.
+  ChatComplete : act.Edit { EditOp: {op: "complete"} }
   ChatInterrupt : act.Edit { EditOp: {op: "interrupt"} }
   // The model and effort picker under the composer (src/app/chat/pick.rs): open its models, step its effort.
   ChatPickModel : act.Edit { EditOp: {op: "pick_model"} }
@@ -270,6 +272,13 @@ key {
   tree_down { Keybind: {key: "down"}
     (Does, act.TreeDown)
     (When, ctx.Tree) }
+  // Control-P and Control-N as up and down (emacs's, as in every macOS list); never in a terminal, whose shell has them.
+  tree_ctrl_p { Keybind: {key: "p", ctrl: 1}
+    (Does, act.TreeUp)
+    (When, ctx.Tree) }
+  tree_ctrl_n { Keybind: {key: "n", ctrl: 1}
+    (Does, act.TreeDown)
+    (When, ctx.Tree) }
   tree_fold { Keybind: {key: "left"}
     (Does, act.TreeFold)
     (When, ctx.Tree) }
@@ -298,6 +307,13 @@ key {
   palette_down { Keybind: {key: "down"}
     (Does, act.PaletteDown)
     (When, ctx.Palette) }
+  // Control-P and Control-N as up and down (emacs's, as in every macOS list); never in a terminal, whose shell has them.
+  palette_ctrl_p { Keybind: {key: "p", ctrl: 1}
+    (Does, act.PaletteUp)
+    (When, ctx.Palette) }
+  palette_ctrl_n { Keybind: {key: "n", ctrl: 1}
+    (Does, act.PaletteDown)
+    (When, ctx.Palette) }
   palette_return { Keybind: {key: "return"}
     (Does, act.PaletteRun)
     (When, ctx.Palette) }
@@ -317,6 +333,13 @@ key {
     (Does, act.PaletteUp)
     (When, ctx.Picker) }
   picker_down { Keybind: {key: "down"}
+    (Does, act.PaletteDown)
+    (When, ctx.Picker) }
+  // Control-P and Control-N as up and down (emacs's, as in every macOS list); never in a terminal, whose shell has them.
+  picker_ctrl_p { Keybind: {key: "p", ctrl: 1}
+    (Does, act.PaletteUp)
+    (When, ctx.Picker) }
+  picker_ctrl_n { Keybind: {key: "n", ctrl: 1}
     (Does, act.PaletteDown)
     (When, ctx.Picker) }
   picker_tab { Keybind: {key: "tab"}
@@ -397,16 +420,21 @@ key {
   chat_send { Keybind: {key: "return"}; (Does, act.ChatSend); (When, ctx.Chat) }
   chat_send_enter { Keybind: {key: "enter"}; (Does, act.ChatSend); (When, ctx.Chat) }
   chat_newline { Keybind: {key: "return", shift: 1}; (Does, act.ChatNewline); (When, ctx.Chat) }
+  chat_complete { Keybind: {key: "tab"}; (Does, act.ChatComplete); (When, ctx.Chat) }
   chat_submit { Keybind: {key: "return", cmd: 1}; (Does, act.ChatSubmit); (When, ctx.Chat) }
   chat_pick_model { Keybind: {key: "/", cmd: 1}; (Does, act.ChatPickModel); (When, ctx.Chat) }
   chat_effort_next { Keybind: {key: "/", cmd: 1, shift: 1}; (Does, act.ChatEffortNext); (When, ctx.Chat) }
   chat_newline_opt { Keybind: {key: "return", opt: 1}; (Does, act.ChatNewline); (When, ctx.Chat) }
   chat_interrupt { Keybind: {key: "escape"}; (Does, act.ChatInterrupt); (When, ctx.Chat) }
   chat_interrupt_ctrl { Keybind: {key: "c", ctrl: 1}; (Does, act.ChatInterrupt); (When, ctx.Chat) }
+  // Cmd+. stops the turn too (macOS's cancel); the composer's hint names Escape and this one while a turn runs.
+  chat_interrupt_cmd { Keybind: {key: ".", cmd: 1}; (Does, act.ChatInterrupt); (When, ctx.Chat) }
   chat_left { Keybind: {key: "left"}; (Does, act.ChatLeft); (When, ctx.Chat) }
   chat_right { Keybind: {key: "right"}; (Does, act.ChatRight); (When, ctx.Chat) }
   chat_up { Keybind: {key: "up"}; (Does, act.ChatUp); (When, ctx.Chat) }
   chat_down { Keybind: {key: "down"}; (Does, act.ChatDown); (When, ctx.Chat) }
+  chat_ctrl_p { Keybind: {key: "p", ctrl: 1}; (Does, act.ChatUp); (When, ctx.Chat) }
+  chat_ctrl_n { Keybind: {key: "n", ctrl: 1}; (Does, act.ChatDown); (When, ctx.Chat) }
   chat_word_left { Keybind: {key: "left", opt: 1}; (Does, act.ChatWordLeft); (When, ctx.Chat) }
   chat_word_right { Keybind: {key: "right", opt: 1}; (Does, act.ChatWordRight); (When, ctx.Chat) }
   chat_line_start { Keybind: {key: "left", cmd: 1}; (Does, act.ChatLineStart); (When, ctx.Chat) }

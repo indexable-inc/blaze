@@ -9,7 +9,7 @@
 //! `hir::Function::impl_signature_mismatch`).
 //!
 //! What needs the front end's trait solving or region resolution and is not given yet is asked
-//! of it (`docs/v2/requests/diagnostics.md`, `diagnostics-items-impls`): parameters of other kinds at
+//! of it (`fed1eb428d:docs/v2/requests/diagnostics.md`, `diagnostics-items-impls`): parameters of other kinds at
 //! the same places (E0053 of `compare_generic_param_kinds`), argument-position `impl Trait`
 //! against a named parameter (E0643), and lifetime parameters early bound in one and late bound
 //! in the other (E0195). Where the trait is another

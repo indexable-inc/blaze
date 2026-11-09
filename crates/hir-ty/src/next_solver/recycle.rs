@@ -1,5 +1,5 @@
 //! What the solver's inference contexts, fulfillment contexts and search graphs allocate, kept
-//! per worker between them (docs/v2/plan/lanes/mem/db-solver.md): each is emptied, its capacity
+//! per worker between them (docs/v2/plan/design/memory.md): each is emptied, its capacity
 //! kept, when its context ends, and the next one built on the worker takes it, so a warm worker
 //! builds contexts without allocating. Obligation lists are kept the same way between their
 //! registering and the next list a coercion makes.

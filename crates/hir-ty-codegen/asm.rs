@@ -1586,7 +1586,7 @@ fn keyed(domain: &str, triple: &str, text: &str) -> ([u8; 32], u64) {
 }
 
 /// The object file of `text` for `triple`, assembled in this process by the assembler blaze was
-/// built with, and by nothing else (docs/v2/plan/toolchain-c.md, slice 1): blaze's pinned LLVM's
+/// built with, and by nothing else (docs/v2/plan/design/toolchain-c.md, slice 1): blaze's pinned LLVM's
 /// own, or in a blaze built without LLVM, rsasm (`--features rsasm`, the seed's: [`rsasm`]).
 /// No C compiler, clang or `as` of the machine's assembles a block, as what they make depends on
 /// whichever one is installed, which no key names. A blaze built with neither assembles nothing

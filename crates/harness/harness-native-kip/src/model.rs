@@ -18,7 +18,7 @@
 //! box its cells inclusive. x is right, y up, z toward the viewer. `//` starts a comment.
 //!
 //! The mesh is every face of a cell that has no neighbour in its own part, with each corner's ambient occlusion from the
-//! three cells in front of it (Lysenko's voxel AO, docs/research/mascot.md): two triangles per face, split along the
+//! three cells in front of it (Lysenko's voxel AO, fed1eb428d:docs/research/mascot.md): two triangles per face, split along the
 //! brighter diagonal so the shade stays in the corners. Faces are not merged (greedy meshing would merge faces whose
 //! corners shade differently, and a character is a couple of thousand triangles anyway).
 use bytemuck::{Pod, Zeroable};

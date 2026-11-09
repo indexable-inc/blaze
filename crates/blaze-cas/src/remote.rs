@@ -1,4 +1,4 @@
-//! The remote tier (docs/v2/plan/lanes/store.md, "Remote"): a machine outside the pool (a laptop)
+//! The remote tier (docs/v2/plan/design/store.md, "Remote"): a machine outside the pool (a laptop)
 //! reads values from the store of a project's VM daemon, read-through. It is never on the VM's
 //! hot path. [`Server`] runs in the VM's daemon and answers from its [`Store`]; [`Client`] runs
 //! on the laptop as the store's [`Remote`]. Both are sans-IO: they push [`Effect`]s and take

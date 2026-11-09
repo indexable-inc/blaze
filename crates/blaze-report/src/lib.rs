@@ -1,4 +1,4 @@
-//! Everything blaze says, as data (docs/v2/plan/structured-output.md): a [`Report`] is one
+//! Everything blaze says, as data (docs/v2/plan/design/structured-output.md): a [`Report`] is one
 //! thing blaze tells a person or an agent (an error, a warning, a note), with no text made
 //! ahead of time. Its parts are typed ([`Span`]: a package, a path, a hash, a piece of code),
 //! so one renderer ([`render`]) decides how each looks on this terminal, in a CI log or a pipe,
@@ -130,7 +130,7 @@ impl Report {
 
     /// An error that is words only: the headline `what` as it is (lines and all), `at` as
     /// plain words. For a caller not yet ported to a structured report; each such call is
-    /// counted in docs/v2/plan/structured-output.md's inventory.
+    /// counted in docs/v2/plan/design/structured-output.md's inventory.
     pub fn text(what: impl Into<String>, at: Option<String>) -> Report {
         let mut report = Report::error(Text::plain(what));
         report.at = at.map(Text::plain);

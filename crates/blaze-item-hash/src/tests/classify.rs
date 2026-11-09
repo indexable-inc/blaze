@@ -1,5 +1,5 @@
 //! What each read of a body's steps stands for (docs/v2/plan/design/item-hash.md section 9,
-//! docs/v2/plan/lanes/item-hash/reads.md): each fact changes across a pair of programs where
+//! docs/v2/plan/design/item-hash.md): each fact changes across a pair of programs where
 //! what it stands for changed and stays where it did not; every read the steps make over
 //! fixtures with method calls, operators, closures, `async`, `?`, `for`, patterns, consts and
 //! generics is covered, a fact, or in the refusal list below with why; and classifying a read

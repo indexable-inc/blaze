@@ -42,5 +42,8 @@ swiftui_gallery : ui.Column {
     search_menu : ex.SearchMenuDemo {}
     level : ex.LevelDemo {}
     browser : ex.BrowserDemo {}
+    art : ex.ArtDemo {}
+    sheen : ex.SheenDemo {}
+    block : ex.BlockDemo {}
   }
 }

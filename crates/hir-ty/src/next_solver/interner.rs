@@ -2217,7 +2217,7 @@ impl<'db> Interner for DbInterner<'db> {
                 // This causes a compiler error if any new integer kinds are added. blaze: an
                 // integer variable never becomes an arbitrary width (`#![blaze::arbitrary_ints]`)
                 // through an impl, only by unifying with one, so their impls are not listed
-                // here (docs/v2/plan/lanes/frontend/arbitrary-ints.md).
+                // here (docs/v2/plan/design/arbitrary-ints.md).
                 let (I8 | I16 | I32 | I64 | I128 | Isize | IntTy::Bits(_)): IntTy;
                 let (U8 | U16 | U32 | U64 | U128 | Usize | UintTy::Bits(_)): UintTy;
                 let possible_integers = [
@@ -3267,12 +3267,12 @@ mod attached_db {
     /// Text a user reads (a diagnostic, an error) is rendered with the database in hand
     /// (`HirDisplay`, or inside `blaze_query::db::attach` where the text is made), never through
     /// a `Debug` that reads the task's: a query's text must not depend on which thread ran it
-    /// (rule 17, rule 22). Every query's run has its database attached, so this reads none only
+    /// (rule 20, rule 25). Every query's run has its database attached, so this reads none only
     /// outside one, where a driver formats a value it holds: a bug at the caller.
     ///
     /// In a debug build (every test) that panics naming `what`, so the test that formats
     /// detached fails at the place. Otherwise it never panics, since formatting must not
-    /// (rule 17), and a panic here would end a daemon's driver outside any job: it writes a
+    /// (rule 20), and a panic here would end a daemon's driver outside any job: it writes a
     /// marker naming `what` as a blaze bug and reports the bug (`stdx::assert::reported`),
     /// which the daemon says in `blaze status` and the profile, and which fails a test
     /// process at its exit. So does a debug build inside a panic's message or a drop while
@@ -4117,7 +4117,7 @@ pub(crate) mod table {
     /// read `keyed` before the switch walks `fixed` and finds every row interned before it; one
     /// it misses is a hint only, settled under a shard's lock ([`Index::lock`]), where `keyed` is
     /// read again. Rows are numbered by the table's counter, never by where they land, so which
-    /// hash an index uses changes no output (AGENTS.md rule 22).
+    /// hash an index uses changes no output (AGENTS.md rule 25).
     #[repr(C)]
     struct Index {
         /// Whether values are placed in `secret` by SipHash under `key` rather than in `fixed` by

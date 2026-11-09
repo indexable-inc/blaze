@@ -1,5 +1,5 @@
 """oracle.py: the invalidation oracle. After every edit, the incremental result must equal a
-build from scratch of the same sources (docs/v2/plan/lanes/proof.md).
+build from scratch of the same sources (docs/v2/plan.md).
 
     uv run --frozen python harness/v2/oracle.py run '{"engine": {"kind": "v1", "blaze": "target/release/blaze"}}'
     uv run --frozen python harness/v2/oracle.py run '{"engine": {...}, "rounds": 2, "steps": 30, "kinds": ["closure"]}'
@@ -7,7 +7,7 @@ build from scratch of the same sources (docs/v2/plan/lanes/proof.md).
     uv run --frozen python harness/v2/oracle.py selftest
 
 The workspace is fixture.py's: three crates whose source is a vector of slots, one for each
-kind of edit of docs/v2/plan/lanes/items.md section 6 (bodies, signatures, impls added and removed,
+kind of edit of docs/v2/plan/design/item-hash.md section 6 (bodies, signatures, impls added and removed,
 renames, moves, formatting, comments, cfgs and features, closure captures, a file `include_str!` reads deleted,
 whitespace in literals, names `type_name` and `module_path!` read, positions `line!` and
 `#[track_caller]` read, the environment of a build). A sequence starts from a state and edits
@@ -31,7 +31,7 @@ Apart from that:
 - `refuses/...` fails where a state fixture.py marks as one the compiler must refuse
   (`fixture.rejects`: a deleted `include_str!` file, a non-`Send` type sent) was built: both
   builds have to refuse it;
-- `over/...` fails where an edit docs/v2/plan/goals/targets.md says compiles nothing (`fixture.Slot.budget_zero`:
+- `over/...` fails where an edit docs/v2/plan/objectives.md says compiles nothing (`fixture.Slot.budget_zero`:
   formatting, comments, a rename or move nothing reads, PATH) compiled something. What every
   other kind of edit compiled is measured and summed by kind in the result (`work_by_kind`).
 
@@ -620,7 +620,7 @@ def record(out: report.Report, ran: Ran, gaps: dict[str, tuple[report.Verdict, s
             by_kind.setdefault(step.kind, []).append(step.compiled)
             if step.budget_zero and step.compiled > 0:
                 out.add(f"over/{step.name}", "fail",
-                        f"{step.edit}: docs/v2/plan/goals/targets.md says this compiles nothing; it compiled {step.compiled} functions",
+                        f"{step.edit}: docs/v2/plan/objectives.md says this compiles nothing; it compiled {step.compiled} functions",
                         kind=step.kind, compiled=step.compiled, budget=0)
     for verdict, why in ran.gaps:
         gaps.setdefault(why.split(":")[0], (verdict, why))

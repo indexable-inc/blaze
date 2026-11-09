@@ -15,6 +15,9 @@ pub enum MemError {
     Exhausted { tag: Tag, reserved: usize, wanted: usize },
     /// A size or count that overflows the address space or a `u32` index.
     TooLarge { tag: Tag, what: &'static str, wanted: usize },
+    /// The system cannot give a sparse region's pages back ([`crate::Region::evict`]): its
+    /// kernel lacks the call, or the call did not drop them.
+    Evict { tag: Tag, os: io::Error },
 }
 
 impl MemError {
@@ -23,7 +26,8 @@ impl MemError {
             MemError::Reserve { tag, .. }
             | MemError::Commit { tag, .. }
             | MemError::Exhausted { tag, .. }
-            | MemError::TooLarge { tag, .. } => tag,
+            | MemError::TooLarge { tag, .. }
+            | MemError::Evict { tag, .. } => tag,
         }
     }
 }
@@ -45,6 +49,11 @@ impl fmt::Display for MemError {
             MemError::TooLarge { tag, what, wanted } => {
                 write!(f, "{tag}: {what} of {wanted} is too large")
             }
+            MemError::Evict { tag, os } => write!(
+                f,
+                "{tag}: this system cannot give the pages of a sparse region back, so none it \
+                 loads would ever leave memory: {os}"
+            ),
         }
     }
 }
@@ -53,7 +62,9 @@ impl std::error::Error for MemError {
     // dyn: std's `Error::source`, on an error path.
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            MemError::Reserve { os, .. } | MemError::Commit { os, .. } => Some(os),
+            MemError::Reserve { os, .. }
+            | MemError::Commit { os, .. }
+            | MemError::Evict { os, .. } => Some(os),
             MemError::Exhausted { .. } | MemError::TooLarge { .. } => None,
         }
     }

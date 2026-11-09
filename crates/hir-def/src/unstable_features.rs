@@ -104,6 +104,6 @@ define_unstable_features! {
     forced_keywords,
     // blaze's compile-time reflection (`docs/v2/plan/design/comptime.md`).
     blaze_comptime,
-    // blaze's native verification clauses (`docs/v2/plan/lanes/verus.md`).
+    // blaze's native verification clauses (`docs/v2/plan/design/verus.md`).
     blaze_verify,
 }

@@ -113,7 +113,36 @@ impl Act {
     }
 }
 
-/// Acts counted by kind in the order each kind first came: `(act, n)`.
+impl Act {
+    /// Where it comes in a run's words, what matters first: what changed (edits, writes, deletes), then what ran
+    /// (builds, commands, sessions, queries), then what was looked at; waiting last.
+    fn rank(self) -> u8 {
+        match self {
+            Act::Edit => 0,
+            Act::Write => 1,
+            Act::Delete => 2,
+            Act::Build => 3,
+            Act::Shell => 4,
+            Act::Spawn => 5,
+            Act::Query => 6,
+            Act::Fetch => 7,
+            Act::Search => 8,
+            Act::Cell => 9,
+            Act::Other => 10,
+            Act::Read => 11,
+            Act::List => 12,
+            Act::Skill => 13,
+            Act::Wait => 14,
+        }
+    }
+
+    /// Only looking (a file read, a folder listed, a skill loaded, a wait): not worth saying beside anything else.
+    fn looks(self) -> bool {
+        matches!(self, Act::Read | Act::List | Act::Skill | Act::Wait)
+    }
+}
+
+/// Acts counted by kind, what matters first ([`Act::rank`]): `(act, n)`.
 fn counted(acts: impl IntoIterator<Item = Act>) -> Vec<(Act, usize)> {
     let mut counts: Vec<(Act, usize)> = Vec::new();
     for a in acts {
@@ -122,6 +151,7 @@ fn counted(acts: impl IntoIterator<Item = Act>) -> Vec<(Act, usize)> {
             None => counts.push((a, 1)),
         }
     }
+    counts.sort_by_key(|(a, _)| a.rank());
     counts
 }
 
@@ -130,21 +160,62 @@ fn capitalised(s: &str) -> String {
     c.next().map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())
 }
 
-/// Acts in words, counted by kind in the order each kind first came, capitalised: "Read 3 files, searched 2 times".
+/// One kind of act in words, by name where every one of them has one: "edited chat.rs and tokens.flecs", "ran cargo
+/// test", past three "edited a.rs, b.rs and 4 more files"; else counted, "edited 2 files".
+fn named_words(act: Act, n: usize, names: &[(Act, String)]) -> String {
+    let mut mine: Vec<&str> = Vec::new();
+    for (a, name) in names {
+        if *a == act && !mine.contains(&name.as_str()) {
+            mine.push(name);
+        }
+    }
+    let (past, _, one, many) = act.parts();
+    let named = mine.len().min(n);
+    if named == 0 || (named < n && named < NAMED) {
+        return act.words(n);
+    }
+    let shown = &mine[..named.min(NAMED)];
+    let rest = n - shown.len();
+    let list = match (shown, rest) {
+        ([a], 0) => (*a).to_owned(),
+        (_, 0) => format!("{} and {}", shown[..shown.len() - 1].join(", "), shown[shown.len() - 1]),
+        _ => format!("{} and {rest} more {}", shown.join(", "), if rest == 1 { one } else { many }),
+    };
+    format!("{past} {list}")
+}
+
+/// The most names one kind of act says before counting the rest.
+const NAMED: usize = 3;
+
+/// Acts in words, counted by kind, what matters first, capitalised: "Edited 2 files, ran 1 build".
 #[must_use]
 pub fn summary(acts: impl IntoIterator<Item = Act>) -> String {
     told(acts, [])
 }
 
-/// What went well and what failed, in words: the acts that went well counted by kind, then those that failed ("Searched
-/// once, couldn't fetch 1 page"), capitalised. Waiting for a cell is left out when anything else was done.
+/// What went well and what failed, in words: the acts that went well counted by kind, what changed first, then those
+/// that failed ("Edited 2 files, couldn't run 1 build"), capitalised. Looking (reads, listings, skills, waits) is said
+/// only when nothing that went well did more than look: the person cares what changed, not what was read on the way.
 #[must_use]
 pub fn told(ok: impl IntoIterator<Item = Act>, failed: impl IntoIterator<Item = Act>) -> String {
+    told_named(ok, &[], failed)
+}
+
+/// [`told`], each kind that went well said by what it was done to where its names are known ([`named_words`]):
+/// "Edited chat.rs and tokens.flecs, ran cargo test".
+#[must_use]
+pub fn told_named(ok: impl IntoIterator<Item = Act>, names: &[(Act, String)], failed: impl IntoIterator<Item = Act>) -> String {
     let (ok, failed) = (counted(ok), counted(failed));
+    let did = ok.iter().any(|(a, _)| !a.looks());
     let busy = ok.iter().chain(&failed).any(|(a, _)| *a != Act::Wait);
-    let keep = |(a, _): &&(Act, usize)| !busy || *a != Act::Wait;
-    let words: Vec<String> =
-        ok.iter().filter(keep).map(|(a, n)| a.words(*n)).chain(failed.iter().filter(keep).map(|(a, n)| a.failed_words(*n))).collect();
+    let keep_ok = |(a, _): &&(Act, usize)| if did { !a.looks() } else { !busy || *a != Act::Wait };
+    let keep_failed = |(a, _): &&(Act, usize)| !busy || *a != Act::Wait;
+    let words: Vec<String> = ok
+        .iter()
+        .filter(keep_ok)
+        .map(|(a, n)| named_words(*a, *n, names))
+        .chain(failed.iter().filter(keep_failed).map(|(a, n)| a.failed_words(*n)))
+        .collect();
     capitalised(&words.join(", "))
 }
 
@@ -175,6 +246,9 @@ pub struct Call {
     pub acts: Vec<Act>,
     /// What it could not do: one act per step that failed (a cell that threw with no step of its own: one Cell).
     pub fails: Vec<Act>,
+    /// What each act that went well was done to, where it names one ([`name_of`]: a file, a command, a host), in order:
+    /// what a run's words say instead of a bare count.
+    pub names: Vec<(Act, String)>,
     /// Each failure in one plain sentence ([`plain`]), in order.
     pub why: Vec<String>,
     /// It failed: an error result, a cell that threw, a step that failed (a command's non-zero exit).
@@ -196,7 +270,7 @@ impl Call {
     /// What it did, in words ([`told`]).
     #[must_use]
     pub fn summary(&self) -> String {
-        told(self.acts.iter().copied(), self.fails.iter().copied())
+        told_named(self.acts.iter().copied(), &self.names, self.fails.iter().copied())
     }
 }
 
@@ -215,7 +289,7 @@ fn draws(ui: &Value) -> bool {
 pub fn call(t: &Transcript, i: usize) -> Option<Call> {
     let Item::Tool { block, name, input, result, done, .. } = t.items.get(i)? else { return None };
     let detail: Option<&Detail> = t.details.get(block);
-    let (mut acts, mut fails, mut why) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut acts, mut fails, mut why, mut names) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     match detail {
         Some(d) => {
             for e in &d.effects {
@@ -225,6 +299,7 @@ pub fn call(t: &Transcript, i: usize) -> Option<Call> {
                     why.push(plain(&e.detail));
                 } else {
                     acts.push(a);
+                    names.extend(name_of(a, &e.target).map(|n| (a, n)));
                 }
             }
             if d.status == "error" {
@@ -249,7 +324,10 @@ pub fn call(t: &Transcript, i: usize) -> Option<Call> {
                     fails.extend(std::iter::repeat_n(a, n));
                     why.push(plain(&r.text));
                 }
-                _ => acts.extend(std::iter::repeat_n(a, n)),
+                _ => {
+                    acts.extend(std::iter::repeat_n(a, n));
+                    names.extend(tool_targets(name, input).into_iter().filter_map(|t| name_of(a, &t)).map(|n| (a, n)));
+                }
             }
         }
     }
@@ -259,7 +337,53 @@ pub fn call(t: &Transcript, i: usize) -> Option<Call> {
         Some(d) => d.status == "running",
         None => result.is_none() && (!done || t.busy),
     };
-    Some(Call { block: block.clone(), acts, fails, why, failed, running, draws: detail.is_some_and(|d| draws(&d.ui)) })
+    Some(Call { block: block.clone(), acts, fails, names, why, failed, running, draws: detail.is_some_and(|d| draws(&d.ui)) })
+}
+
+/// What a plain tool call (Claude Code's, Codex's) was done to, from its input: a file's path, a patch's paths, a
+/// command, a page, a sub-agent's description.
+fn tool_targets(name: &str, input: &Value) -> Vec<String> {
+    let s = |k: &str| input[k].as_str().map(str::to_owned);
+    if name == "apply_patch" {
+        return input["paths"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
+    }
+    ["file_path", "notebook_path", "path", "command", "cmd", "url", "description"].iter().find_map(|k| s(k)).into_iter().collect()
+}
+
+/// The name a run's words give what `act` was done to (`target`: a path, a command, a URL): a file by its name, a
+/// command by its first words, a page by its host, a session by what it was asked; None for what has no useful name
+/// (a search, a wait, a cell).
+fn name_of(act: Act, target: &str) -> Option<String> {
+    let t = target.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let cut = |s: &str, n: usize| match s.char_indices().nth(n) {
+        Some((i, _)) => format!("{}\u{2026}", &s[..i]),
+        None => s.to_owned(),
+    };
+    match act {
+        Act::Read | Act::Edit | Act::Write | Act::Delete | Act::List => {
+            Some(t.trim_end_matches('/').rsplit('/').next().unwrap_or(t).to_owned()).filter(|n| !n.is_empty())
+        }
+        Act::Shell | Act::Build => {
+            // Past `cd <dir> &&` and leading VAR=value: the program and its first words.
+            let mut rest = t;
+            while let Some(after) = rest.strip_prefix("cd ") {
+                match after.find("&&") {
+                    Some(i) => rest = after[i + 2..].trim_start(),
+                    None => break,
+                }
+            }
+            let words: Vec<&str> = rest
+                .split_whitespace()
+                .skip_while(|w| w.split_once('=').is_some_and(|(k, _)| !k.is_empty() && k.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())))
+                .take(3)
+                .map(|w| if w.starts_with('/') { w.rsplit('/').next().unwrap_or(w) } else { w })
+                .collect();
+            (!words.is_empty()).then(|| cut(&words.join(" "), 32))
+        }
+        Act::Fetch => t.split("://").nth(1).and_then(|r| r.split('/').next()).map(str::to_owned),
+        Act::Spawn => Some(cut(t, 32)),
+        _ => None,
+    }
 }
 
 /// Calls in a row, with what came between them that is not the agent's words (its reasoning, a text block not yet
@@ -283,7 +407,8 @@ impl Run {
     /// after, as what could not be done ([`told`]).
     #[must_use]
     pub fn summary(&self) -> String {
-        told(self.calls.iter().flat_map(|(_, c)| c.acts.iter().copied()), self.calls.iter().flat_map(|(_, c)| c.fails.iter().copied()))
+        let names: Vec<(Act, String)> = self.calls.iter().flat_map(|(_, c)| c.names.iter().cloned()).collect();
+        told_named(self.calls.iter().flat_map(|(_, c)| c.acts.iter().copied()), &names, self.calls.iter().flat_map(|(_, c)| c.fails.iter().copied()))
     }
 
     /// How many of its calls failed.
@@ -423,12 +548,12 @@ mod tests {
         let g = Grouped::of(&t);
         let rs = runs(&g);
         assert_eq!(rs.len(), 2);
-        assert_eq!(rs[0].summary(), "Read 2 files, couldn't run 1 shell command");
+        assert_eq!(rs[0].summary(), "Read x and y, couldn't run 1 shell command", "what it was done to, by name");
         assert_eq!(rs[0].why(), ["boom"]);
         assert_eq!(rs[0].items, [1, 2, 3, 4], "the reasoning between its calls is inside it");
         assert_eq!(rs[0].failed(), 1);
         assert_eq!(rs[0].key(), "run:a");
-        assert_eq!(rs[1].summary(), "Edited 2 files, ran 1 shell command");
+        assert_eq!(rs[1].summary(), "Edited a and b, ran ls");
         // The lone Grep between two prose blocks is an item of its own.
         assert!(g.pieces.contains(&Piece::Item(6)));
     }
@@ -468,15 +593,21 @@ mod tests {
         assert_eq!(rs[0].summary(), "Ran 2 shell commands, couldn't run 1 shell command");
         assert_eq!(rs[0].why(), ["Exited with code 1"]);
         assert!(g.pieces.contains(&Piece::Item(3)), "the view stands alone");
-        assert_eq!(rs[1].summary(), "Ran 1 cell, searched once, couldn't fetch 1 page");
+        assert_eq!(rs[1].summary(), "Searched once, ran 1 cell, couldn't fetch 1 page");
         assert_eq!(rs[1].why(), ["No browser is connected"]);
         assert_eq!(told([Act::Wait], []), "Waited for 1 cell");
     }
 
-    /// The REPL's typed calls count as what they did: reads, searches, listings and builds, never shell commands.
+    /// The REPL's typed calls count as what they did: reads, searches, listings and builds, never shell commands; what
+    /// ran leads, and the looking on the way is left unsaid beside it.
     #[test]
     fn typed_calls_sum_up_in_words() {
         let kinds = ["skill", "read", "read", "search", "read", "list", "search", "build"];
-        assert_eq!(summary(kinds.map(Act::of_effect)), "Read 1 skill, read 3 files, searched 2 times, listed 1 folder, ran 1 build");
+        assert_eq!(summary(kinds.map(Act::of_effect)), "Ran 1 build, searched 2 times");
+        let looked = ["read", "list", "read", "skill"];
+        assert_eq!(summary(looked.map(Act::of_effect)), "Read 2 files, listed 1 folder, read 1 skill", "only looking is said when it is all");
+        let edits: Vec<(Act, String)> = ["a.rs", "b.rs", "c.rs", "d.rs", "e.rs"].map(|n| (Act::Edit, n.to_owned())).into();
+        assert_eq!(named_words(Act::Edit, 5, &edits), "edited a.rs, b.rs, c.rs and 2 more files", "past three, the rest counted");
+        assert_eq!(named_words(Act::Shell, 1, &[(Act::Shell, "cargo test".into())]), "ran cargo test");
     }
 }
