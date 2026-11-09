@@ -20,12 +20,12 @@ fn comptime_of<'a, 'db>(mut error: &'a ConstEvalError<'db>) -> Option<&'a Compti
         let ConstEvalError::MirEvalError(mut inner) = error else { return None };
         loop {
             match inner {
-                MirEvalError::InFunction(it, _) => inner = it,
+                MirEvalError::InFunction(it, _) => inner = &**it,
                 MirEvalError::ConstEvalError(_, it) => {
-                    error = it;
+                    error = &**it;
                     break;
                 }
-                MirEvalError::Comptime(it) => return Some(it),
+                MirEvalError::Comptime(it) => return Some(&**it),
                 _ => return None,
             }
         }
