@@ -33,7 +33,7 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 10. **proc-macros-on-wasm**: Proc macros compile to `wasm32-wasip1` with blaze's own front end and run
     in Wasmtime; Cranelift never generates native code. Skill: `compiler-correctness`.
 11. **bump-allocate**: Allocate by lifetime (`Vec::new_in(frame)`); a global-heap allocation needs `//
-    alloc: <why>` on its line. Skill: `runtime-code`.
+    alloc: <why>` on its line. Skill: `memory-and-data`.
 12. **standard-structures**: One standard structure per need (named `blaze_core::lock` locks, papaya and
     blaze_hash maps, crossbeam queues and channels, atomics). Skill: `runtime-code`.
 13. **fix-through-blaze-lints**: Move a type, path, API or idiom across the code with a `.clippy.toml`
@@ -110,6 +110,14 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 45. **macos-private-apis**: On macOS use a private or undocumented API (Mach, ulock, workloops, kperf,
     sandbox, ...) where it is more efficient or more capable than the public one; comment which and
     why, and test that its symbol exists. Skill: `runtime-code`.
+46. **one-memory-measure**: Footprint, the number the kernel enforces, is the one memory measure:
+    admission, the front end's release and the ceiling all decide on it. Skill: `memory-and-data`.
+47. **outputs-are-records**: What outlives its task (a query result, a compiled function, object code)
+    is a blaze-format record written once, into the store where it can be, and read in place; never
+    a heap tree kept until something serializes it. Skill: `memory-and-data`.
+48. **cache-by-code-id**: A cache of a function's results is keyed by the function's code identity
+    (`fn_info(&f).code_id`) and its arguments; nothing invalidates entries by hand. Skill:
+    `memory-and-data`.
 
 ## Code Review Rules
 

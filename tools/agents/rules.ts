@@ -66,6 +66,11 @@ const skills = {
 		description:
 			"How to find out why a blaze build did what it did from its profile parquet. Covers where the files are, the tables (spans, query_counts, provenance, key_parts, misses, task spans), how to run DuckDB (`blaze debug sql`, `blaze explain`, `BLAZE_DUCKDB`), and ready queries for top time by span, what reran and why, diffing two runs' keys, memory by task, admission waits and a cycle that won't settle. Also the method: reproduce, capture, query, claim a cause, remove it and watch the effect go. Load before debugging a slow, rerunning, memory-hungry or non-converging build, before writing a query over the profile, and before making a claim about why a build did something.",
 	},
+	"memory-and-data": {
+		title: "Memory and durable data",
+		description:
+			"How blaze holds memory and keeps what it computes: an owner per lifetime (a task's frame, a heap of its own for a big task, the store for what outlives it), footprint as the one measure, outputs as blaze-format records written once and read in place from mapped files, persistence from one generic impl over `for const`, and caches keyed by code identity. Load before allocating in a task, adding a query result or anything persisted, touching blaze-mem, blaze-format, the store, admission, the allocator or the memory ceiling, caching a function's results, or explaining where a build's memory went.",
+	},
 } as const satisfies Record<string, { title: string; description: string }>;
 
 type SkillId = keyof typeof skills;
@@ -171,7 +176,7 @@ export const rules = [
 	},
 	{
 		id: "bump-allocate",
-		skill: "runtime-code",
+		skill: "memory-and-data",
 		line: "Allocate by lifetime (`Vec::new_in(frame)`); a global-heap allocation needs `// alloc: <why>` on its line.",
 		info: "Allocate by lifetime, never from the global heap by default: a collection that lives within one task (a query run, a codegen unit, a maintainer pass) names its allocator, `Vec::new_in(frame)` / `Box::new_in(.., frame)` from `blaze_mem::frame::current`, and longer lifetimes use the request, revision or image allocator. A global allocation (`Vec::new`, `vec![]`, `collect` into a heap `Vec`, `Box::new`, `to_owned`) needs `// alloc: <why>` on its line. `blaze::implicit_allocator` enforces this, warning everywhere and denied wherever `blaze::hot` is, with `blaze::hot_alloc` for what a call reaches.",
 		reason: "\"Allocate like a highly optimized game\" (Andrew, 2026-10-29, decisions.md). Andrew, 2026-10-31, on a fan-out that collected results into a heap Vec it did not need: heavily bump allocate, always give the Vec its allocator, and lint it.",
@@ -421,6 +426,30 @@ export const rules = [
 		info: "On macOS, use any private or undocumented interface (Mach calls, libsystem and libdispatch internals, `__ulock_wait2`, `kevent_qos`/`kevent_id` workloops, `sandbox_init_with_parameters`, kperf, `thread_selfcounts`, `proc_info`, ...) where it is more efficient or more capable than the public one, and the public one where it is the better (`os_sync_wait_on_address_with_deadline`'s absolute deadline over `__ulock_wait2`'s relative one). Each use carries a comment naming the symbol and why it wins, and a test that resolves the symbol at run time and fails naming it if it is gone, so an OS update that removes it fails loudly in CI. There is no public-API fallback (`no-fallback`): a missing symbol is an error naming it. Which are in use and which are next is in docs/v2/plan/design/deadline-waits.md.",
 		reason: "Andrew, 2026-11-04, with the deadline-waits lane: blaze is a developer tool shipped with each release, not an App Store app, so Apple's private interfaces are fair game when they are better; a symbol that disappears is caught by its test, not by a user.",
 		link: "docs/v2/plan/design/deadline-waits.md#macos-private-apis-rule-macos-private-apis",
+	},
+	{
+		id: "one-memory-measure",
+		skill: "memory-and-data",
+		line: "Footprint, the number the kernel enforces, is the one memory measure: admission, the front end's release and the ceiling all decide on it.",
+		info: "The footprint (macOS `phys_footprint`, Linux's cgroup charge) is the one measure of blaze's memory, because it is the number the kernel enforces. Admission, the front end's release and the daemon's ceiling all read it, and nothing decides on resident or live bytes alone. Live bytes per tag say who holds memory; the gap between footprint and live is memory freed but kept (by an allocator, or purged in a way the kernel still counts) and is a bug to find an owner for, never a number to tune a threshold around.",
+		reason: "Build 54 (2026-11-08, the stage5 self-build on the Mac): the footprint reached 75.7 GiB against a 47 GiB limit while live memory was 29 GiB and the sum of running tasks' peaks never passed 22.4 GiB. The release fired on resident memory (56 GiB) while the kernel counted 75.7. docs/memory-footprint.md.",
+		link: "docs/memory-footprint.md",
+	},
+	{
+		id: "outputs-are-records",
+		skill: "memory-and-data",
+		line: "What outlives its task (a query result, a compiled function, object code) is a blaze-format record written once, into the store where it can be, and read in place; never a heap tree kept until something serializes it.",
+		info: "A value that outlives the task that made it (a query result, a compiled function, a unit's object code) is a blaze-format record: no pointer, position-independent, written once and read in place through its `Persist::Ref`. Where the store takes it, the task writes it straight into the store's mapped file, so its pages are file pages the kernel can drop and read back, not heap. A new persisted type gets `Persist` from the one generic impl over `for const` (`#[blaze::reflect]` on the struct, `for<F: Field<T>> F::Type: Flat`) once that lands, never a new hand-written impl; until then a hand-written one names the generic impl's issue. Its round-trip test is the `testing` skill's.",
+		reason: "Query storage only grew, from 3 to 15 GiB over build 54, and was the largest part of the live heap. 2026-11-09 (Andrew): \"could we create our own version of kinda of swap? where task output goes to some mmap'd file\" and \"could u laso output directly into the mmap friendly vrsion no intermediate\". The hand-written impls this replaces were about 20,000 lines in ten persist.rs files that day.",
+		link: "crates/blaze-format/src/lib.rs",
+	},
+	{
+		id: "cache-by-code-id",
+		skill: "memory-and-data",
+		line: "A cache of a function's results is keyed by the function's code identity (`fn_info(&f).code_id`) and its arguments; nothing invalidates entries by hand.",
+		info: "A cache of what a function returns is keyed by that function's behaviour identity, `fn_info(&f).code_id` (a Merkle hash of its code and everything it reaches), together with its arguments, so an edit to the function or anything it calls makes new keys and old entries are never read again; garbage collection drops them later. Nothing invalidates entries by hand, compares timestamps or keeps a dependency list beside the key. A function the identity walk cannot follow (a `dyn` it cannot see through, a body that does not lower) is an error naming it, never a cache keyed on less.",
+		reason: "2026-11-09 (Andrew): \"how would u write functions nad then invalidate the thingin cache that have those funcions and depndent if the impl chages\". The design is docs/v2/plan/design/comptime.md, Function reflection; #[blaze::cache] (docs/fn-cache.md) was the same idea as a macro.",
+		link: "docs/v2/plan/design/comptime.md",
 	},
 ] as const satisfies readonly Rule[];
 

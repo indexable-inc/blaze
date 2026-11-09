@@ -15,18 +15,6 @@ older cached result, a default guessed for a missing value). A fallback that onl
 still a fallback. A change that touches an existing fallback turns it into an error, and a bench or
 test that hits one fails instead of timing the slow path.
 
-## bump-allocate (rule 11)
-
-Allocate by lifetime, never from the global heap by default: a collection that lives within one task
-(a query run, a codegen unit, a maintainer pass) names its allocator, `Vec::new_in(frame)` /
-`Box::new_in(.., frame)` from `blaze_mem::frame::current`, and longer lifetimes use the request,
-revision or image allocator. A global allocation (`Vec::new`, `vec![]`, `collect` into a heap `Vec`,
-`Box::new`, `to_owned`) needs `// alloc: <why>` on its line. `blaze::implicit_allocator` enforces
-this, warning everywhere and denied wherever `blaze::hot` is, with `blaze::hot_alloc` for what a
-call reaches.
-
-See [docs/v2/plan/design/memory.md](../../../docs/v2/plan/design/memory.md).
-
 ## standard-structures (rule 12)
 
 One choice per need, never a hand-rolled or std stand-in: a lock is `blaze_core::lock::{Lock,
