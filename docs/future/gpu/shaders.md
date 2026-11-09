@@ -200,9 +200,12 @@ The rest of the lowering, MIR to naga:
   naga struct with the layout `core::mem` gives it; a uniform's layout is checked against the
   target's rules (Metal's `float3` is 16 bytes, which is why every field in the harness shaders is
   a `Vec4`) and a mismatch is an error naming the field.
-- Every function reachable from an entry becomes a naga function; generic functions are
-  monomorphized first, as for any target. blaze's inliner runs first, so small helpers like
-  `m_srgb_to_linear` don't survive as calls unless they are big.
+- Every call reachable from an entry is inlined into it (phase 2's decision; see "Phase 2 as
+  built"): each callee's monomorphized MIR, chosen by the code generator's own dispatch, is a
+  fresh frame of one flat graph. A panic at any depth is then one branch to the end of the
+  invocation, a reference never crosses a naga call, and resources stay globals. Recursion is
+  refused. Whether big helpers should become naga functions again is a size question for later,
+  with a span on the MSL size first.
 - The entry point: its `EntryDesc` says what each argument is. Built-ins become naga
   `Binding::BuiltIn`, varyings fields `Binding::Location` with their interpolation, resources global
   variables with `ResourceBinding { group: 0, binding: i }`, and the MSL writer's per-entry binding
@@ -248,6 +251,75 @@ device-only build of a shader crate**, the way proc macros are built for wasm.
   the compile first).
 - A build script never runs blaze or a shader compiler for this: build scripts run sandboxed, and
   a compiler inside one is a second build graph blaze can't see or key.
+
+## Phase 2 as built
+
+What `crates/blaze-shader` does now, and the choices it made where the plan above was open.
+
+- **Pipeline.** `device::device_msl(db, krate)` reads `GPU_ENTRIES` by const evaluation
+  (`entries.rs`), lowers each entry into one naga module (`lower.rs`), validates the module with
+  `ValidationFlags::all()`, and writes MSL 2.4 with naga's writer. Every refusal in every entry
+  comes back at once, each naming the entry, the function, the construct and the rule
+  (`refuse.rs`).
+- **One home for each decision** (`mirrors-derive-or-check`):
+  - bodies come from `dispatch::body_of`;
+  - callees come from `dispatch::call`, the code generator's dispatch;
+  - layouts come from `layout_of_ty`: a struct's members sit at the front end's offsets, an array
+    has its stride, and a uniform's size and a storage stride are checked against the descriptor;
+  - enum discriminants come from `const_eval_discriminant`, and constant bytes are decoded with
+    `detect_variant_from_bytes`;
+  - which functions panic comes from `hir_ty_pure::models`;
+  - slots come from the `EntryDesc`s, and the storage sizes buffer from `gpu::sizes_slot`.
+
+  The intrinsics table (`intrinsics.rs`) is the one place that lowers anything by name: the gpu
+  crate's vectors, textures and device functions; core's intrinsics; and std's libm calls
+  (`atan2f` and kin), so std's own `f32` bodies are still what is lowered.
+- **Runtime MIR, not codegen's optimized MIR.** The lowering reads the same monomorphized bodies
+  the code generator starts from. naga and Metal optimize after.
+- **References are places, not values.** A reference or raw pointer local is bound once, as the
+  graph is built, to a symbolic place: a local, a resource or a place of no size, plus field steps
+  and index steps (an index is snapshotted where the reference is taken). Pointer casts that keep
+  the pointee keep the place, and `&[T; N]` to `&[T]` records `N`. A reference that names
+  different places on different paths is refused.
+- **Panics.**
+  - Blocks from which every path ends in a panic, `unreachable` or an abort are pruned, and edges
+    into them, like a failed `assert`, go to the end of the invocation.
+  - A fragment is discarded; a vertex returns zeroed varyings at clip position (2, 2, 2, 1).
+  - `ub_checks()` is false, and the branch it guards is pruned before the graph is walked, so
+    core's precondition checks (`const_eval_select`, pointer arithmetic) are never lowered.
+- **Enums** (needed by `for` loops, through `Option`) lower as values: a naga struct holding the
+  discriminant then every variant's fields, a layout of the device's own. A uniform or storage
+  type holding an enum is refused, since the host would write other bytes.
+- **The device target.**
+  - The device build is a target of its own, `naga-unknown-unknown`: `target_arch = "naga"`,
+    32-bit `usize`, little endian, `panic = "abort"`, data layout `e-m:e-p:32:32-i64:64-n32-S128`.
+  - The toolchain's core and std are built for it like wasm32-unknown-unknown's (std's
+    unsupported platform layer), so a shader can call std's `f32` methods.
+  - A triple, not only a build kind, because core's MIR depends on pointer width and endianness,
+    and those are target properties. A shader crate may `cfg(target_arch = "naga")`, which it
+    should rarely need.
+- **The output.** The dependent crate gets `BLAZE_GPU_MSL_<CRATE>`: the crate's name upper-cased
+  with `-` as `_`, holding the path of the crate's one MSL source. Its key is the crate's code, the
+  device target, naga's pinned version and the writer's options (`keys-cover-every-input`).
+- **The Metal step.**
+  - No build step runs `xcrun`, and nothing leaves the sandbox. The host compiles the MSL at
+    start with `newLibraryWithSource:options:error:` and `MTLMathMode::Fast`.
+  - A `.metallib` step, if a span on the start-up compile ever asks for one, runs only in the
+    daemon, outside the sandbox, as an explicit opt-in step. It is keyed by the MSL's bytes, the
+    output of `xcrun metal --version` and the flags, and stops with an error when Xcode's Metal
+    toolchain is missing.
+- **Left for phase 3.**
+  - The build-kind wiring: the `naga-unknown-unknown` target spec, `artifact = "gpu"`, and the env
+    var.
+  - The mascot switch in harness-native-render's build.rs, which waits on that wiring. No Slang
+    fallback.
+  - An end-to-end test on the real gpu crate and harness.rs. The fixture tests use a mirror of the
+    gpu crate on minicore.
+  - Uniformity diagnostics on the Rust source.
+  - Vector fast paths, so `gpu::vec` operators lower as one naga vector op rather than per
+    component. They are correct through their Rust bodies now.
+  - Derived-impl methods (`Callee::Derived`, e.g. a derived `PartialEq` call), slices of a local
+    array passed through `Index`, `dyn`, closures.
 
 ## Migration and verification
 
@@ -313,9 +385,8 @@ One shader at a time, each on its own switch, with no fallback between them:
   one with an error; if that ever fires on real code, node splitting is the fix.
 - naga's version is a key input of every device artifact. Pin it in the workspace and bump it
   deliberately, like the toolchain.
-- Does blaze's device build need its own target triple (`gpu-naga-unknown`?), or is the device a
-  property of the build kind with no `cfg(target_*)` visible to the crate? A triple lets a shader
-  crate `cfg` on it, which shaders should rarely need.
+- ~~Does blaze's device build need its own target triple?~~ Decided in phase 2: yes,
+  `naga-unknown-unknown` (see "Phase 2 as built").
 
 ## Prior art
 
