@@ -56,9 +56,50 @@ Each layer uses only the ones below it.
 | 1 | `bstd::sys` | raw system calls per target, the only home of `unsafe`; Linux by syscall number with no libc, macOS through libSystem, Windows through ntdll and kernel32 |
 | 0 | `core`, `alloc` | the language's own libraries, unchanged |
 
-Beside them, with no IO: `bstd::{lock, map, chan, mem, hash, text, path, time}`, which are the one
-standard structure per need (named locks, blaze_hash maps, the queues and channels of rule
-`standard-structures`, allocators by lifetime, BLAKE3, UTF-8 text, relative paths, durations).
+## What is in it
+
+bstd is batteries included, and most of the batteries exist. It is a **facade**: the pieces stay
+separate crates (they build in parallel, and a build script can take one alone), bstd re-exports
+them under one tree of names, and code outside bstd imports `bstd::..` only (a lint bans the
+piece crates' own names, so there is one name per thing).
+
+Something belongs in bstd when most programs need it, or a rule names it as the one structure for
+a need, and it can obey bstd's rules (no ambient authority, explicit memory, no global state).
+What is about building Rust (the cargo graph, the store, codegen) stays out.
+
+| module | what | from |
+|---|---|---|
+| `mem` | allocators by lifetime: frames, arenas, pools, caches | `blaze-mem` |
+| `bytes`, `text` | held bytes and UTF-8 text, lent and never copied | `blaze-bytes` |
+| `map`, `set`, `hash` | the one hash map and set (fixed seed), the identity hasher | `blaze-hash` |
+| `id` | content ids (BLAKE3), dense `u32` indices, and the one interner | `blaze-ids`, `intern`, `blaze-hashcons` merged |
+| `sync`, `cell` | named locks, `Shared`, `Atomic`, token cells, the bounded spin, reclamation at task ends | `blaze_core::lock`, `blaze-spin`, `blaze-reclaim` |
+| `chan` | the one queue and the one channel | the crossbeam types rule `standard-structures` names |
+| `sort`, `phf` | the stable radix sort; perfect hashes of fixed name sets | `blaze-radix`, `blaze-phf` |
+| `digest` | BLAKE3 and SHA-256 | `blaze-ids`' `b3`, `blaze-sha256` |
+| `rng` | the seeded generator behind the `Rng` capability | `blaze-rng` |
+| `path`, `time` | relative paths; durations and instants | `paths` (replaced), new |
+| `data` | serialization by compile-time reflection (below) | new, replacing `blaze-serde` in blaze's crates |
+| `record` | zero-copy records: bytes in memory are the bytes on disk | `blaze-format` |
+| `report` | the `Report`: what a program says to a person or an agent, as data | `blaze-report` |
+| `http` | the sans-IO HTTP client and server cores over a `Conn` | `blaze-http` |
+| `trace` | spans and events through `Cx` | `blaze-trace` (no-tracing) |
+| `test` | the simulation, property tests, the model checker for lock-free code, allocation counting | `blaze_core::sim`, hegel, `blaze-check`, `blaze-alloc-count` |
+| `io`, `fs`, `net`, ... | the capabilities of the sections below | new, on `blaze-core` |
+
+`stdx` (leftover helpers) is dissolved into the modules above or deleted. Each merge follows rule
+`one-concept-one-home`: one type per concept, and the removed name banned.
+
+### `bstd::data`: serialization by reflection
+
+`Encode` and `Decode` are implemented for a type from its fields ([comptime](comptime.md)), in
+ordinary typed code: no derive macro, no generated tokens, errors on real lines, and nothing to
+compile to wasm and sandbox. A type opts in by naming a policy for its fields, not by deriving.
+The formats are bstd's: deterministic CBOR (the agent API's), JSON, and `record` for zero-copy.
+Decoding takes an allocator, as everything does, and a size limit, since input is untrusted.
+The same field walk gives tracing its encoders and `Secret` its redaction. `blaze-serde` remains
+for crates from crates.io that speak serde; blaze's own crates move to `data` once reflection
+lands.
 
 The runtime (`bstd::rt`) is what `std` hides: the entry that builds the `Io` and calls
 `main(io)`, the panic handler and unwinding (on `library/unwind`), the allocator, thread-local
@@ -396,6 +437,7 @@ Interface first, bottom last, so nothing waits on the runtime and every step lan
 | S3 | blaze's crates move, leaves first: a sans-IO core takes nothing, a driver takes the piece it needs, `blaze`'s `main` takes `Io`. Each move is a `.clippy.toml` ban and `blaze check --fix` (rule `fix-through-blaze-lints`) | every crate in `crates/` has `#![blaze::capabilities]` |
 | S1b | `bstd::{sync, cell}`: the table of "Shared mutation", token cells, `Freeze` as a bound, typed names (`HostPort`, `VarName`) in place of strings, and bans on the removed names | misuse tests: two live `get_mut` on one token do not compile; a static that is not `Freeze` is refused |
 | S1c | Tracing on bstd: the span in `Cx` and the scheduler's own events first; then the compile-time site table and the ring; then reflection encoders and redaction; disabled-site patching and keep-or-drop last | the emit budget holds; the ring's simulation test and the round trip pass |
+| S1d | The facade: bstd re-exports the crates of "What is in it", the interner and helper crates are merged, and the piece crates' names are banned outside bstd | `blaze check` with the bans on; no blaze crate outside bstd names a piece crate |
 | S3b | The `Frames` layout: the calling convention, the slab, unwinding, and the profiler and backtraces walking the frame chain | the differential test against `Fibers` passes |
 | S4 | The bottom: `bstd::sys` and `bstd::rt`, `blaze-core`'s drivers move in as `bstd::driver`, and bstd is `#![no_std]` | no blaze crate links Rust's `std`; C1 still passes |
 | S5 | The edition: `edition = "blaze-2026.11"` makes `std` name bstd, `fn main(io: Io)` is the entry, and the OS sandbox of a program is derived from what `main` hands out | a program of the edition that never opens the network cannot, checked by the sandbox |
