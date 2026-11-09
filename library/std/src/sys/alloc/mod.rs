@@ -24,6 +24,8 @@ const MIN_ALIGN: usize = if cfg!(any(
     target_arch = "powerpc64",
     target_arch = "sparc",
     target_arch = "wasm32",
+    // blaze: the GPU device target (naga-unknown-unknown), 32-bit.
+    target_arch = "naga",
     target_arch = "hexagon",
     target_arch = "riscv32",
     target_arch = "xtensa",
@@ -99,6 +101,11 @@ cfg_select! {
     target_family = "wasm" => {
         mod wasm;
         use wasm as imp;
+    }
+    // blaze: the GPU device target (naga-unknown-unknown) has no heap.
+    target_arch = "naga" => {
+        mod naga;
+        use naga as imp;
     }
     target_os = "xous" => {
         mod xous;

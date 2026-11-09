@@ -200,6 +200,12 @@ pub(super) fn run_env(it: RunEnv<'_>, config_env: &[(String, String)]) -> Vec<(S
         env.set("CARGO_CFG_DEBUG_ASSERTIONS", "");
     }
     env.set("CARGO_ENCODED_RUSTFLAGS", it.rustflags.join("\x1f"));
+    // blaze's own targets that rustc's bootstrap would call synthetic (`naga-unknown-unknown`):
+    // std's script then leaves std stable to name, as bootstrap's run of it does. A triple blaze
+    // has no data of was refused when its cfgs (`cfg_lines`) were made, before this.
+    if matches!(platform::is_synthetic(it.target), Ok(true)) {
+        env.set("RUSTC_BOOTSTRAP_SYNTHETIC_TARGET", "1");
+    }
     // Removed after `[env]` is applied: blaze has no rustc wrapper.
     let removed = ["RUSTFLAGS", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER"];
     let config_env: Vec<(String, String)> =

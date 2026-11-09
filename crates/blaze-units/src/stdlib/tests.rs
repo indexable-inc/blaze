@@ -357,6 +357,35 @@ fn a_targets_facts_and_file_names() {
     assert!(target::triples().any(|it| it == "aarch64-unknown-linux-gnu"));
 }
 
+/// blaze's GPU device target (docs/future/gpu/shaders.md, "Phase 2 as built"): `target_arch =
+/// "naga"`, 32-bit `usize`, little endian, `panic = "abort"`, no family and `target_os =
+/// "unknown"` (std's unsupported platform layer), std built for it, nothing linked, and its
+/// scripts run as bootstrap runs a synthetic target's.
+#[test]
+fn the_device_target_is_blazes_own() {
+    let triple = "naga-unknown-unknown";
+    let cfgs = target_cfg(triple, &CfgArgs::default()).unwrap();
+    for cfg in [
+        "target_arch=\"naga\"",
+        "target_pointer_width=\"32\"",
+        "target_endian=\"little\"",
+        "target_os=\"unknown\"",
+        "panic=\"abort\"",
+    ] {
+        assert!(cfgs.iter().any(|it| it == cfg), "{triple} has no {cfg}: {cfgs:?}");
+    }
+    assert!(!cfgs.iter().any(|it| it.starts_with("target_family")), "{cfgs:?}");
+    assert!(!cfgs.iter().any(|it| it == "unix" || it == "windows"), "{cfgs:?}");
+    let facts = target_facts(triple).unwrap();
+    assert_eq!((facts.panic.as_str(), facts.has_std), ("abort", true));
+    assert_eq!(data_layout(triple).unwrap(), "e-m:e-p:32:32-i64:64-n32-S128");
+    assert_eq!(file_name(triple, "lib", "gpu").unwrap().as_deref(), Some("libgpu.rlib"));
+    assert_eq!(file_name(triple, "bin", "a").unwrap(), None);
+    assert!(target::is_synthetic(triple).unwrap());
+    assert!(!target::is_synthetic("wasm32-unknown-unknown").unwrap());
+    assert!(!has_dev_runtime(triple));
+}
+
 /// `rustc +nightly --print target-spec-json -Z unstable-options --target <triple>`'s
 /// `data-layout` of the pinned nightly (1.101.0-nightly 16d1ffac1), for each tier-1 target.
 #[test]

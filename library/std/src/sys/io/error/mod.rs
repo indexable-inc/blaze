@@ -31,7 +31,8 @@ cfg_select! {
         mod xous;
         pub use xous::*;
     }
-    any(target_os = "vexos", target_family = "wasm", target_os = "zkvm", target_os = "trusty") => {
+    // blaze: `target_arch = "naga"`, the GPU device target (naga-unknown-unknown).
+    any(target_os = "vexos", target_family = "wasm", target_os = "zkvm", target_os = "trusty", target_arch = "naga") => {
         mod generic;
         pub use generic::*;
     }
