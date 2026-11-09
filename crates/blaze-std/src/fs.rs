@@ -22,13 +22,14 @@
 //! `openat2` with `RESOLVE_BENEATH` and its equals). A directory is there once a file under it
 //! is (blaze-core has no effect that makes an empty one).
 
-use std::{fmt, marker::PhantomData};
+use std::{fmt, marker::PhantomData, sync::Arc};
 
 use blaze_core::{Done, Effect, FileName};
 use blaze_mem::Frame;
 
 use crate::{
     Plant, Stopped,
+    budget::{Budget, Over},
     cx::Cx,
     io::Io,
     mem::Bytes,
@@ -123,6 +124,8 @@ pub enum FsKind {
     NotADirectory,
     /// The wait stopped first.
     Stopped(Stopped),
+    /// The directory it came from has a quota ([`Dir::quota`]) with no room for it.
+    OverQuota(Over),
     /// The driver failed it, saying this.
     Driver(String),
     /// The driver answered with a completion of another kind: a driver's bug.
@@ -145,6 +148,7 @@ impl fmt::Display for FsError {
             FsKind::IsADirectory => write!(f, "bstd::fs {op} of {path}: is a directory"),
             FsKind::NotADirectory => write!(f, "bstd::fs {op} of {path}: is a file, not a directory"),
             FsKind::Stopped(stopped) => write!(f, "bstd::fs {op} of {path}: {stopped}"),
+            FsKind::OverQuota(over) => write!(f, "bstd::fs {op} of {path}: its directory's quota: {over}"),
             FsKind::Driver(said) => write!(f, "bstd::fs {op} of {path}: {said}"),
             FsKind::Answered(done) => {
                 write!(f, "bstd::fs {op} of {path}: the driver answered {done} (a driver's bug)")
@@ -212,6 +216,29 @@ fn stat(io: &Io, cx: &Cx, op: FsOp, name: &FileName) -> Result<Option<Meta>, FsE
     }
 }
 
+/// `write`, which hands `bytes` bytes to the driver for `name`, run within `quota` if there
+/// is one: the bytes are taken from it first, and with no room for them nothing is written
+/// ([`FsKind::OverQuota`]). A write that then fails keeps what it took: some of its bytes may
+/// be on the disk. Under [`Plant::BudgetCheckedAfter`] the quota is looked at once the bytes
+/// are written: the planted bug of the budget tests.
+fn within(
+    io: &Io,
+    quota: Option<&Budget>,
+    op: FsOp,
+    name: &FileName,
+    bytes: u64,
+    write: impl FnOnce() -> Result<(), FsError>,
+) -> Result<(), FsError> {
+    let Some(quota) = quota else { return write() };
+    let over = |over| FsError::new(op, name, FsKind::OverQuota(over));
+    if io.plant() == Plant::BudgetCheckedAfter {
+        write()?;
+        return quota.take(bytes).map_err(over);
+    }
+    quota.take(bytes).map_err(over)?;
+    write()
+}
+
 /// The driver's whole file tree, from [`Io::fs`].
 #[derive(Clone)]
 pub struct Fs {
@@ -231,7 +258,7 @@ impl Fs {
                 Err(FsError::new(FsOp::OpenDir, path.name(), FsKind::NotADirectory))
             }
             // clone: the directory's name, a refcount.
-            Some(_) | None => Ok(Dir { io: self.io.clone(), base: path.name().clone(), rights: PhantomData }),
+            Some(_) | None => Ok(Dir { io: self.io.clone(), base: path.name().clone(), quota: None, rights: PhantomData }),
         }
     }
 }
@@ -240,13 +267,15 @@ impl Fs {
 pub struct Dir<#[blaze::linear] P: Rights> {
     io: Io,
     base: FileName,
+    /// The bytes that may still be written through it, if it has a quota ([`Dir::quota`]).
+    quota: Option<Arc<Budget>>,
     rights: PhantomData<P>,
 }
 
 impl<#[blaze::linear] P: Rights> Clone for Dir<P> {
     fn clone(&self) -> Dir<P> {
         // clone: authority held, copied: a refcount each.
-        Dir { io: self.io.clone(), base: self.base.clone(), rights: PhantomData }
+        Dir { io: self.io.clone(), base: self.base.clone(), quota: self.quota.clone(), rights: PhantomData }
     }
 }
 
@@ -261,7 +290,32 @@ impl Dir<ReadWrite> {
     /// The directory named `base` under the driver's root, read and write: for a capability
     /// that holds a directory's name as authority ([`crate::user::User::home`]).
     pub(crate) fn at(io: &Io, base: FileName) -> Dir<ReadWrite> {
-        Dir { io: io.clone(), base, rights: PhantomData }
+        Dir { io: io.clone(), base, quota: None, rights: PhantomData }
+    }
+
+    /// The same directory with a quota: at most `bytes` bytes are written through the `Dir`
+    /// this returns, through its subdirectories and through the files opened from them,
+    /// counted by bstd. A write with no room left ends in [`FsKind::OverQuota`], and nothing
+    /// of it is written. A quota set on a directory that has one is inside it: both count,
+    /// so it never raises what is left (docs/v2/plan/design/std.md, "Budgets ride the same
+    /// way").
+    ///
+    /// What it counts is bytes handed to the driver: an append's, a positional write's, a
+    /// whole-file write's, and the length a [`File::set_len`] names. A replace or a remove
+    /// gives nothing back, since effects name files and bstd would have to stat before every
+    /// change to know what it freed; and a positional write past a file's end is counted as
+    /// its bytes, not the hole before them. So the files written through it by appends and
+    /// whole-file writes never hold more than the quota; bytes held on the disk are the
+    /// driver's to bound, with an effect blaze-core does not have yet.
+    pub fn quota(&self, bytes: u64) -> Dir<ReadWrite> {
+        // clone: authority held, narrowed: a refcount each, the budget this one is inside too.
+        let quota = Some(Budget::new(bytes, self.quota.clone()));
+        Dir { io: self.io.clone(), base: self.base.clone(), quota, rights: PhantomData }
+    }
+
+    /// The bytes that may still be written through it; `None` with no quota.
+    pub fn quota_left(&self) -> Option<u64> {
+        self.quota.as_deref().map(Budget::left)
     }
 }
 
@@ -278,13 +332,14 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
             Plant::SubdirKeepsParent => self.base.clone(),
             _ => self.beneath(path),
         };
-        Dir { io: self.io.clone(), base, rights: PhantomData }
+        // clone: the quota shared, a refcount.
+        Dir { io: self.io.clone(), base, quota: self.quota.clone(), rights: PhantomData }
     }
 
     /// The same directory, read only.
     pub fn read_only(&self) -> Dir<ReadOnly> {
         // clone: authority held, narrowed: a refcount each.
-        Dir { io: self.io.clone(), base: self.base.clone(), rights: PhantomData }
+        Dir { io: self.io.clone(), base: self.base.clone(), quota: self.quota.clone(), rights: PhantomData }
     }
 
     /// The world it is in: for a capability made from a directory ([`crate::local::Local`]).
@@ -384,7 +439,7 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
     pub fn open_read(&self, cx: &Cx, path: &Path) -> Result<File<ReadOnly>, FsError> {
         let name = self.beneath(path);
         self.found(cx, &name)?;
-        Ok(File { io: self.io.clone(), name, rights: ReadOnly })
+        Ok(File { io: self.io.clone(), name, quota: None, rights: ReadOnly })
     }
 
     /// The whole file at `path` added to `into`; how many bytes it added.
@@ -406,7 +461,8 @@ impl Dir<ReadWrite> {
     pub fn open(&self, cx: &Cx, path: &Path) -> Result<File<ReadWrite>, FsError> {
         let name = self.beneath(path);
         self.found(cx, &name)?;
-        Ok(File { io: self.io.clone(), name, rights: ReadWrite(()) })
+        // clone: the quota shared, a refcount.
+        Ok(File { io: self.io.clone(), name, quota: self.quota.clone(), rights: ReadWrite(()) })
     }
 
     /// The file at `path` made empty, replacing what was there, and its directories made:
@@ -414,13 +470,17 @@ impl Dir<ReadWrite> {
     pub fn create(&self, cx: &Cx, path: &Path) -> Result<File<ReadWrite>, FsError> {
         let name = self.beneath(path);
         replace(&self.io, cx, FsOp::Create, &name, &[])?;
-        Ok(File { io: self.io.clone(), name, rights: ReadWrite(()) })
+        // clone: the quota shared, a refcount.
+        Ok(File { io: self.io.clone(), name, quota: self.quota.clone(), rights: ReadWrite(()) })
     }
 
     /// The file at `path` made to hold `bytes`, durably and all at once: a reader or a crash
     /// sees the old contents or the new, never a part.
     pub fn write(&self, cx: &Cx, path: &Path, bytes: &[u8]) -> Result<(), FsError> {
-        replace(&self.io, cx, FsOp::Replace, &self.beneath(path), bytes)
+        let name = self.beneath(path);
+        within(&self.io, self.quota.as_deref(), FsOp::Replace, &name, bytes.len() as u64, || {
+            replace(&self.io, cx, FsOp::Replace, &name, bytes)
+        })
     }
 
     /// The planted bug of [`Plant::KvPutUnsynced`], for [`crate::kv::Kv::put`] alone: the file
@@ -428,15 +488,17 @@ impl Dir<ReadWrite> {
     /// of them where [`Dir::write`] keeps the old contents or the new.
     pub(crate) fn write_unsynced(&self, cx: &Cx, path: &Path, bytes: &[u8]) -> Result<(), FsError> {
         let name = self.beneath(path);
-        replace(&self.io, cx, FsOp::Replace, &name, &[])?;
-        // clone: the effect's name, a refcount.
-        let file = name.clone();
-        // alloc: the effect's bytes, which blaze-core's `Effect` owns.
-        let bytes = bytes.to_vec();
-        match call(&self.io, cx, FsOp::Append, &name, |tag| Effect::Append { file, bytes, tag })? {
-            Done::Appended => Ok(()),
-            done => Err(unexpected(FsOp::Append, &name, done)),
-        }
+        within(&self.io, self.quota.as_deref(), FsOp::Replace, &name, bytes.len() as u64, || {
+            replace(&self.io, cx, FsOp::Replace, &name, &[])?;
+            // clone: the effect's name, a refcount.
+            let file = name.clone();
+            // alloc: the effect's bytes, which blaze-core's `Effect` owns.
+            let bytes = bytes.to_vec();
+            match call(&self.io, cx, FsOp::Append, &name, |tag| Effect::Append { file, bytes, tag })? {
+                Done::Appended => Ok(()),
+                done => Err(unexpected(FsOp::Append, &name, done)),
+            }
+        })
     }
 
     /// The file at `path` gone; gone already is done.
@@ -479,6 +541,9 @@ fn replace(io: &Io, cx: &Cx, op: FsOp, name: &FileName, bytes: &[u8]) -> Result<
 pub struct File<#[blaze::linear] P: Rights> {
     io: Io,
     name: FileName,
+    /// The quota of the directory it was opened from, which its writes count against; none
+    /// on a read-only file, which writes nothing.
+    quota: Option<Arc<Budget>>,
     /// The rights themselves, not a `PhantomData`: a [`ReadWrite`] held makes the file linear.
     rights: P,
 }
@@ -486,7 +551,7 @@ pub struct File<#[blaze::linear] P: Rights> {
 impl Clone for File<ReadOnly> {
     fn clone(&self) -> File<ReadOnly> {
         // clone: authority held, copied: a refcount each.
-        File { io: self.io.clone(), name: self.name.clone(), rights: ReadOnly }
+        File { io: self.io.clone(), name: self.name.clone(), quota: None, rights: ReadOnly }
     }
 }
 
@@ -505,7 +570,7 @@ impl<#[blaze::linear] P: Rights> File<P> {
     /// The same file, read only.
     pub fn read_only(&self) -> File<ReadOnly> {
         // clone: authority held, narrowed: a refcount each.
-        File { io: self.io.clone(), name: self.name.clone(), rights: ReadOnly }
+        File { io: self.io.clone(), name: self.name.clone(), quota: None, rights: ReadOnly }
     }
 
     /// Its length now.
@@ -575,29 +640,46 @@ impl<#[blaze::linear] P: Rights> File<P> {
 impl File<ReadWrite> {
     /// `bytes` added at the end; durable once a later [`File::sync`] has returned.
     pub fn append(&self, cx: &Cx, bytes: &[u8]) -> Result<(), FsError> {
-        // clone: the effect's name, a refcount.
-        let file = self.name.clone();
-        // alloc: the effect's bytes, which blaze-core's `Effect` owns.
-        let bytes = bytes.to_vec();
-        match call(&self.io, cx, FsOp::Append, &self.name, |tag| Effect::Append { file, bytes, tag })? {
-            Done::Appended => Ok(()),
-            done => Err(unexpected(FsOp::Append, &self.name, done)),
-        }
+        within(&self.io, self.quota.as_deref(), FsOp::Append, &self.name, bytes.len() as u64, || {
+            // clone: the effect's name, a refcount.
+            let file = self.name.clone();
+            // alloc: the effect's bytes, which blaze-core's `Effect` owns.
+            let bytes = bytes.to_vec();
+            match call(&self.io, cx, FsOp::Append, &self.name, |tag| Effect::Append { file, bytes, tag })? {
+                Done::Appended => Ok(()),
+                done => Err(unexpected(FsOp::Append, &self.name, done)),
+            }
+        })
     }
 
     /// A write of `from` at `at`, past the end making it longer, in flight; durable once a
     /// later sync has returned. The bytes are copied as it starts (see [`crate::pending`]),
     /// and stay lent until it ends.
     pub fn write_from<'buf>(&'buf self, from: &'buf [u8], at: u64) -> Pending<'buf, Result<(), FsError>> {
+        let name = &self.name;
+        let asked = from.len() as u64;
+        let over = move |over| FsError::new(FsOp::WriteAt, name, FsKind::OverQuota(over));
+        // The planted bug of the budget tests: the quota is looked at once the bytes are written.
+        let after = self.io.plant() == Plant::BudgetCheckedAfter;
+        let quota = self.quota.as_deref();
+        let short = match quota {
+            Some(quota) if !after => quota.take(asked).err(),
+            _ => None,
+        };
+        if let Some(short) = short {
+            return pending::refused(&self.io, "bstd::fs write_from", Err(over(short)));
+        }
         // clone: the effect's name, a refcount.
         let file = self.name.clone();
         // alloc: the effect's bytes, which blaze-core's `Effect` owns.
         let bytes = from.to_vec();
-        let name = &self.name;
         let effect = |tag| Effect::WriteAt { file, at, bytes, tag };
         pending::start(&self.io, "bstd::fs write_from", &mut [], effect, move |_: &mut [u8], done| {
             match done {
-                Ok(Done::Written) => Ok(()),
+                Ok(Done::Written) => match quota {
+                    Some(quota) if after => quota.take(asked).map_err(over),
+                    _ => Ok(()),
+                },
                 Ok(done) => Err(unexpected(FsOp::WriteAt, name, done)),
                 Err(stopped) => Err(FsError::new(FsOp::WriteAt, name, FsKind::Stopped(stopped))),
             }
@@ -614,12 +696,14 @@ impl File<ReadWrite> {
 
     /// The file cut or grown to `len`; durable once a later sync has returned.
     pub fn set_len(&self, cx: &Cx, len: u64) -> Result<(), FsError> {
-        // clone: the effect's name, a refcount.
-        let file = self.name.clone();
-        match call(&self.io, cx, FsOp::SetLen, &self.name, |tag| Effect::Truncate { file, len, tag })? {
-            Done::Truncated => Ok(()),
-            done => Err(unexpected(FsOp::SetLen, &self.name, done)),
-        }
+        within(&self.io, self.quota.as_deref(), FsOp::SetLen, &self.name, len, || {
+            // clone: the effect's name, a refcount.
+            let file = self.name.clone();
+            match call(&self.io, cx, FsOp::SetLen, &self.name, |tag| Effect::Truncate { file, len, tag })? {
+                Done::Truncated => Ok(()),
+                done => Err(unexpected(FsOp::SetLen, &self.name, done)),
+            }
+        })
     }
 
     /// Everything written to the file before this was called is durable once it returns.
@@ -632,14 +716,16 @@ impl File<ReadWrite> {
 
     /// The file made to hold `bytes`, durably and all at once.
     pub fn replace(&self, cx: &Cx, bytes: &[u8]) -> Result<(), FsError> {
-        replace(&self.io, cx, FsOp::Replace, &self.name, bytes)
+        within(&self.io, self.quota.as_deref(), FsOp::Replace, &self.name, bytes.len() as u64, || {
+            replace(&self.io, cx, FsOp::Replace, &self.name, bytes)
+        })
     }
 
     /// The file finished: synced, so everything written to it is durable, or the sync's
     /// error, op [`FsOp::Close`]. The one way a `File<ReadWrite>` ends.
     #[blaze::consumes]
     pub fn close(self, cx: &Cx) -> Result<(), FsError> {
-        let File { io, name, rights } = self;
+        let File { io, name, quota: _, rights } = self;
         crate::consume(rights);
         if io.plant() == Plant::CloseSkipsSync {
             return Ok(());

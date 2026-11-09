@@ -37,6 +37,8 @@
 //!   gives a [`resolver::Resolver`] and [`requests::Http`] ([`requests::Http::over`]), a
 //!   [`fs::Dir`] gives [`kv::Kv`], [`blobs::Blobs`] and [`local::Local`]. Each of those has a
 //!   real provider. [`streams::Streams`] has a handler and the simulation only.
+//! - Budgets ride the same way ([`budget`]): [`net::Net::limit`] is a byte limit and
+//!   [`fs::Dir::quota`] a quota, each counted by bstd and ending in a typed outcome.
 //! - How a pure function's value is got is a value too: [`eval::Eval`] runs a memo point
 //!   (`#[blaze::memo]`), remembers it or hands it to a handler ([`eval`]).
 //!
@@ -96,6 +98,8 @@ pub mod audio;
 pub mod automation;
 /// An object store beneath a directory: `Blobs`, bytes under the BLAKE3 of what they are.
 pub mod blobs;
+/// Budgets: the byte limit of a `Net` and the quota of a `Dir`, and the `Over` each ends in.
+pub mod budget;
 #[expect(
     unsafe_code,
     reason = "a token cell's two views of its value and its `Sync`, each with its SAFETY"
@@ -384,6 +388,9 @@ pub(crate) enum Plant {
     LocalDropsChunk,
     /// `Http::only` hands back the capability it was given.
     HttpOnlyIgnored,
+    /// A `Net`'s byte limit and a `Dir`'s quota are looked at after the bytes are sent or
+    /// written, not before.
+    BudgetCheckedAfter,
     /// A tuple's key leaves its last element out: two calls that differ only there share one.
     KeyIgnoresLast,
     /// `Eval::memo` never drops a generation: its entries pass its limit.
