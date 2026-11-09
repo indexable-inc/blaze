@@ -8,7 +8,14 @@
 //! (`<Path loc="...">blaze</Path>`, harness-native-ui-inline's grammar) become their label after a hole the painter draws
 //! the component's icon in, on a chip; so does a markdown link or a bare address that is
 //! one (`[the fix](https://github.com/o/r/pull/7)` is that pull request's chip, harness-native-ui-inline's `from_url`).
+//! LaTeX math (`$…$`, `\(…\)`, and `$$…$$`, `\[…\]` in display style) is typeset (math.rs) and leaves a hole as wide and
+//! tall as the formula, which the painter draws it in; one that does not typeset is its source as written, as inline code.
 //! Ranges are UTF-16 units of the plain text, as layouts count.
+use std::sync::Arc;
+
+use harness_native_ui_look_api::MathLook;
+
+use crate::math::Typeset;
 use crate::text::{Face, Hole, Run};
 
 /// Inline markdown set: the words shown, the faces over them, the code spans (each drawn on a chip), the links (their
@@ -23,6 +30,36 @@ pub struct Inline {
     pub strike: Vec<(usize, usize)>,
     /// The inline components: each one's range (its icon's hole first, then its label) and its tag.
     pub tags: Vec<InlineTag>,
+    /// The formulas, in order: each stands in one hole ([`crate::text::HOLE`]) the painter draws it in.
+    pub math: Vec<InlineMath>,
+}
+
+/// A formula in the words: the hole it stands in (one unit at `at`), what was written (delimiters and all: what copying it
+/// whole gives), whether it is in display style (`$$…$$`, `\[…\]`) and how it typeset.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InlineMath {
+    pub at: usize,
+    pub source: String,
+    pub display: bool,
+    pub set: Arc<Typeset>,
+}
+
+impl InlineMath {
+    /// Points to the formula's em for words set at `size`: the look's scale for inline or displayed math times their size.
+    #[must_use]
+    pub fn em(&self, size: f32, look: &MathLook) -> f32 {
+        size * if self.display { look.display_scale } else { look.inline_scale }
+    }
+
+    /// The room it takes in its line for words set at `size`: as wide as it is, as far above and below the baseline as it
+    /// reaches, with the look's pad clear of the line's edges.
+    #[must_use]
+    pub fn hole(&self, size: f32, look: &MathLook) -> Hole {
+        let em = self.em(size, look);
+        let s = &self.set;
+        let pad = if self.display { look.display_pad } else { look.inline_pad };
+        Hole { start: self.at, end: self.at + 1, width: s.width * em, ascent: s.height * em, descent: s.depth * em, pad }
+    }
 }
 
 /// One inline component in the words: `start` is its icon's hole (one unit, [`crate::text::HOLE`]), its label runs to
@@ -82,15 +119,117 @@ fn emit_tag(out: &mut Inline, at: &mut usize, tag: harness_native_ui_inline::Tag
 }
 
 impl Inline {
-    /// The holes the components' icons stand in, for words set at `size`: [`REF_ICON_EM`] wide, as tall as the words; and
-    /// after a label with a mark, [`MARK_EM`] wide.
+    /// The holes in the words, in order, for words set at `size`: the components' icons [`REF_ICON_EM`] wide, as tall as
+    /// the words, and after a label with a mark, [`MARK_EM`] wide; each formula as wide and tall as `look` sets it
+    /// ([`InlineMath::hole`]).
     #[must_use]
-    pub fn holes(&self, size: f32) -> Vec<Hole> {
+    pub fn holes(&self, size: f32, look: &MathLook) -> Vec<Hole> {
         let hole = |at: usize, em: f32| Hole { start: at, end: at + 1, width: size * em, ascent: 0.0, descent: 0.0, pad: 0.0 };
-        self.tags
+        let mut out: Vec<Hole> = self
+            .tags
             .iter()
             .flat_map(|t| std::iter::once(hole(t.start, REF_ICON_EM)).chain(t.mark().map(|m| hole(m, MARK_EM))))
-            .collect()
+            .chain(self.math.iter().map(|f| f.hole(size, look)))
+            .collect();
+        out.sort_by_key(|h| h.start);
+        out
+    }
+}
+
+/// The longest a formula may be written, in bytes: a delimiter that is never closed does not swallow the message.
+const MATH_MAX: usize = 4000;
+
+/// A formula found at `chars[i]`: its LaTeX's range (between the delimiters), where it ends (past its closer) and whether it
+/// is displayed. `$…$` and `\(…\)` are inline, `$$…$$` and `\[…\]` displayed; a backslash before a `$` is no delimiter (an
+/// escape: a dollar). A formula has something in it, and stops short of a blank line, of the next code span and of
+/// [`MATH_MAX`] bytes, so a delimiter never closed does not swallow the words.
+fn math_at(chars: &[char], i: usize) -> Option<(std::ops::Range<usize>, usize, bool)> {
+    let (open, close, display) = match (chars[i], chars.get(i + 1)) {
+        ('\\', Some('(')) => (2, close_of(chars, i + 2, &['\\', ')']), false),
+        ('\\', Some('[')) => (2, close_of(chars, i + 2, &['\\', ']']), true),
+        ('$', Some('$')) => (2, close_of(chars, i + 2, &['$', '$']), true),
+        ('$', _) => (1, dollar_close(chars, i), false),
+        _ => return None,
+    };
+    let c = close?;
+    let tex = i + open..c;
+    (!chars[tex.clone()].iter().all(|c| c.is_whitespace())).then_some((tex, c + open, display))
+}
+
+/// Whether the newline at `chars[j]` starts a blank line (the end of a paragraph).
+fn blank_after(chars: &[char], j: usize) -> bool {
+    chars[j + 1..].iter().find(|&&c| c != ' ' && c != '\t') == Some(&'\n')
+}
+
+/// Where `close` is from `from`, unless a blank line, a code span or the cap comes first. A backslash takes the character
+/// after it with it, so `\$` and `\\` are no delimiters (a `close` that begins with a backslash is looked for first).
+fn close_of(chars: &[char], from: usize, close: &[char]) -> Option<usize> {
+    let (mut j, mut bytes) = (from, 0usize);
+    while j < chars.len() && bytes <= MATH_MAX {
+        if chars[j..].starts_with(close) {
+            return Some(j);
+        }
+        match chars[j] {
+            '\\' => {
+                bytes += 1;
+                j += 1;
+            }
+            '\n' if blank_after(chars, j) => return None,
+            '`' if code_span(chars, j).is_some() => return None,
+            _ => {}
+        }
+        bytes += chars.get(j).map_or(0, |c| c.len_utf8());
+        j += 1;
+    }
+    None
+}
+
+/// The `$` that closes the inline math `chars[i]` opens (`$x$`), if it is math: the opener has no space after it, and the
+/// closer none before it and no digit after it, so "costs $5 and $10" is a price list. Another `$` that cannot close it
+/// ends the attempt (and is looked at as an opener itself: "$5 or $x$" is the formula `x`).
+fn dollar_close(chars: &[char], i: usize) -> Option<usize> {
+    let next = *chars.get(i + 1)?;
+    if next.is_whitespace() || next == '$' {
+        return None;
+    }
+    let (mut j, mut bytes) = (i + 1, 0usize);
+    while j < chars.len() && bytes <= MATH_MAX {
+        match chars[j] {
+            '\\' => {
+                bytes += 1;
+                j += 1;
+            }
+            '\n' if blank_after(chars, j) => return None,
+            '`' if code_span(chars, j).is_some() => return None,
+            '$' => return (!chars[j - 1].is_whitespace() && !chars.get(j + 1).is_some_and(char::is_ascii_digit)).then_some(j),
+            _ => {}
+        }
+        bytes += chars.get(j).map_or(0, |c| c.len_utf8());
+        j += 1;
+    }
+    None
+}
+
+/// The formula `chars[i..next]` (its LaTeX `tex`) set into `out` at `at`: a hole it is drawn in when it typesets, else
+/// its source as written, as inline code.
+fn emit_math(out: &mut Inline, at: &mut usize, chars: &[char], i: usize, tex: std::ops::Range<usize>, next: usize, display: bool) {
+    let source: String = chars[i..next].iter().collect();
+    let latex: String = chars[tex].iter().collect();
+    let start = *at;
+    match crate::math::typeset(&latex, display) {
+        Ok(set) => {
+            out.text.push(crate::text::HOLE);
+            *at += crate::text::HOLE.len_utf16();
+            out.math.push(InlineMath { at: start, source, display, set });
+        }
+        Err(_) => {
+            for ch in source.chars() {
+                out.text.push(ch);
+                *at += ch.len_utf16();
+            }
+            out.runs.push(Run { start, end: *at, face: Face::InlineCode });
+            out.code.push((start, *at));
+        }
     }
 }
 
@@ -144,6 +283,19 @@ pub fn inline(src: &str) -> Inline {
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
+        // A formula, before an escape takes its `\(` for a bracket or emphasis its `_` and `*`.
+        if let Some((tex, next, display)) = math_at(&chars, i) {
+            emit_math(&mut out, &mut at, &chars, i, tex, next, display);
+            i = next;
+            continue;
+        }
+        // A `$$` that opens no formula is two dollars, neither of them an opener.
+        if c == '$' && chars.get(i + 1) == Some(&'$') {
+            push(&mut out, &mut at, '$');
+            push(&mut out, &mut at, '$');
+            i += 2;
+            continue;
+        }
         match c {
             '\\' if chars.get(i + 1).is_some_and(|n| n.is_ascii_punctuation()) => {
                 push(&mut out, &mut at, chars[i + 1]);
@@ -283,6 +435,9 @@ pub fn inline(src: &str) -> Inline {
                     for (a, b) in inner.strike {
                         out.strike.push((a + base, b + base));
                     }
+                    for f in inner.math {
+                        out.math.push(InlineMath { at: f.at + base, ..f });
+                    }
                     out.links.push((base, at, chars[url].iter().collect()));
                     i = next;
                 }
@@ -404,9 +559,12 @@ fn has_closer(chars: &[char], from: usize, c: char, want: usize) -> bool {
     false
 }
 
-/// Where a construct [`inline`] reads whole ends, when one starts at `i`: an escape, a code span (or an unclosed run of
+/// Where a construct [`inline`] reads whole ends, when one starts at `i`: a formula, an escape, a code span (or an unclosed run of
 /// ticks, which stays ticks), a link, an inline component, an autolink or a bare address.
 fn atom(chars: &[char], i: usize) -> Option<usize> {
+    if let Some((_, next, _)) = math_at(chars, i) {
+        return Some(next);
+    }
     match chars[i] {
         '\\' => chars.get(i + 1).is_some_and(|n| n.is_ascii_punctuation()).then_some(i + 2),
         '`' => Some(code_span(chars, i).map_or(i + run(chars, i, '`'), |(_, next)| next)),
@@ -657,6 +815,72 @@ pub fn table(lines: &[&str]) -> Option<(Table, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each formula's source as written and whether it is displayed.
+    fn maths(m: &Inline) -> Vec<(&str, bool)> {
+        m.math.iter().map(|f| (f.source.as_str(), f.display)).collect()
+    }
+
+    /// A formula leaves one hole where it stands, whichever delimiters it has; what markdown would take for emphasis or
+    /// an escape stays in it; what is in code is no math.
+    #[test]
+    fn math_leaves_a_hole_whichever_delimiters_it_has() {
+        let m = inline("The root is $x^2$.");
+        assert_eq!((m.text.as_str(), maths(&m)), ("The root is \u{a0}.", vec![("$x^2$", false)]));
+        assert_eq!(m.math[0].at, 12);
+        assert_eq!(maths(&inline("so \\(a+b\\) ok")), [("\\(a+b\\)", false)]);
+        assert_eq!(maths(&inline("so $$\\frac{a}{b}$$ and \\[x\\]")), [("$$\\frac{a}{b}$$", true), ("\\[x\\]", true)]);
+        let m = inline("$a_1*b_2$ and **bold**");
+        assert_eq!(maths(&m), [("$a_1*b_2$", false)]);
+        assert_eq!(m.runs.iter().map(|r| (&m.text[r.start..r.end], r.face)).collect::<Vec<_>>(), [("bold", Face::Bold)], "no emphasis was made of it");
+        let m = inline("`$x$` then");
+        assert!(m.math.is_empty() && m.text == "$x$ then", "{m:?}");
+        // Across a soft break, inside a link's words.
+        assert_eq!(maths(&inline("a $x +\ny$ b")), [("$x +\ny$", false)]);
+        let m = inline("[see $x$](https://x.dev)");
+        assert_eq!((maths(&m), m.math[0].at), (vec![("$x$", false)], 4));
+    }
+
+    /// Prices are not math: an opening `$` has no space after it, a closing one no space before it and no digit after it,
+    /// and a backslash escapes either.
+    #[test]
+    fn currency_is_not_math() {
+        for text in ["It costs $5 and $10 today.", "From $5 to $10.", "$ 5 and 6 $", "a $x$5 b", "It was \\$5 and \\$6", "just a $ sign", "$$ never closed", "\\( never closed"] {
+            assert!(inline(text).math.is_empty(), "{text:?} is not math: {:?}", inline(text).math);
+        }
+        assert_eq!(inline("It was \\$5 and \\$6").text, "It was $5 and $6", "an escaped dollar is a dollar");
+        assert_eq!(maths(&inline("costs $5 and $10, so $x+1$ more")), [("$x+1$", false)], "a price before real math does not swallow it");
+        assert_eq!(maths(&inline("$5 or $x$")), [("$x$", false)]);
+        let long = format!("${}$", "x".repeat(MATH_MAX + 1));
+        assert!(inline(&long).math.is_empty(), "past the cap it is words");
+    }
+
+    /// Math that does not typeset is its source as written, as inline code, and no formula.
+    #[test]
+    fn math_that_does_not_typeset_is_its_source_as_inline_code() {
+        let m = inline("see $\\frac{1}{$ ok");
+        assert!(m.math.is_empty());
+        assert_eq!(m.text, "see $\\frac{1}{$ ok");
+        assert_eq!(m.code, [(4, 15)]);
+    }
+
+    /// A formula's hole is as wide and tall as the look sets it: its ems times the words' size and the look's scale, a
+    /// displayed one at the display scale; the holes come in order with the components'.
+    #[test]
+    fn a_formulas_hole_is_its_typeset_size() {
+        let look = MathLook { inline_scale: 1.1, display_scale: 1.25, inline_pad: 2.0, display_pad: 10.0, stroke: 0.0375 };
+        let m = inline("a $x^2$ b $$\\sum_i i$$");
+        let holes = m.holes(14.0, &look);
+        assert_eq!(holes.len(), 2);
+        for (h, f) in holes.iter().zip(&m.math) {
+            let em = 14.0 * if f.display { 1.25 } else { 1.1 };
+            assert_eq!((h.start, h.end), (f.at, f.at + 1));
+            assert!(h.width > 0.0 && (h.width - f.set.width * em).abs() < 1e-4, "{h:?} for {f:?}");
+            assert!((h.ascent - f.set.height * em).abs() < 1e-4 && (h.descent - f.set.depth * em).abs() < 1e-4);
+            assert_eq!(h.pad, if f.display { 10.0 } else { 2.0 });
+        }
+        assert!(holes[1].ascent + holes[1].descent > holes[0].ascent + holes[0].descent, "the displayed sum stands taller");
+    }
 
     #[test]
     fn links_are_ranged() {

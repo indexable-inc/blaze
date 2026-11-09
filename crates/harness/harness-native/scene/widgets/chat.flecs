@@ -588,6 +588,23 @@ hn {
     }
   }
 
+  // A displayed formula ($$…$$ or \[…\] on lines of their own, a ```math fence): its words are the formula alone
+  // (src/app/chat.rs sets them as $$…$$, inline markdown typesets it in display style), hugging it, centred in the column.
+  prefab ChatMath : ui.Row {
+    Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 0, r: 0, t: $chat_block_half, b: $chat_block_half}
+    text : ui.Words {
+      Fill: $tone_ink
+      Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      MarkdownText: {chip_dark: $tone_wash.dark, chip_light: $tone_wash.light,
+        link_dark: $tone_link.dark, link_light: $tone_link.light,
+        code_dark: $tone_code_ink.dark, code_light: $tone_code_ink.light,
+        strong_dark: $tone_ink_strong.dark, strong_light: $tone_ink_strong.light, chip_radius: $chat_code_radius}
+      TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
+    }
+  }
+
   // A fenced code block on a card, in the code face (coloured by its language when blaze has its grammar).
   prefab ChatCode : ui.Column {
     Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
