@@ -484,6 +484,14 @@ export const rules = [
 		reason: "2026-11-09 (Andrew): \"how would u write functions nad then invalidate the thingin cache that have those funcions and depndent if the impl chages\". The design is docs/v2/plan/design/comptime.md, Function reflection; #[blaze::cache] (docs/fn-cache.md) was the same idea as a macro.",
 		link: "docs/v2/plan/design/comptime.md",
 	},
+	{
+		id: "invariants-are-stated",
+		skill: "testing",
+		line: "State an invariant once, as `/// The invariant: ...` on the test whose oracle checks it, with a planted-bug control beside it; `harness/v2/invariants.py` lists them all and the gate holds each to its control.",
+		info: "What code must always do is written once, in the code: a doc comment opening `/// The invariant:` on the test whose oracle checks it, `/// The refinement:` on a test that runs an implementation against its model (or against another implementation) and compares, and `/// The reference model:` on the simple executable model itself. An invariant or a refinement needs a control in the same file, a test named `the_oracle_catches_<the planted bug>`. `harness/v2/invariants.py` collects every statement into `docs/v2/plan/invariants.md` (`write`) and fails the gate (`check`) when one has no control, a control has no statement, or the list is stale, so adding, rewording or dropping a guarantee is a visible line in the pull request. Before changing or regenerating code, read the invariants its crate states; they are what the new code is judged against.",
+		reason: "Andrew, 2026-11-09, on a day when agents wrote about 25,000 lines: \"anyone building with agents and accumulating piles of generated code [should] start making semantics, invariants, and refinement properties first-class artifacts\"; \"try to have this as first class\". The invariants existed only as test bodies and prose.",
+		link: "docs/v2/plan.md#11-proof-by-check-not-by-review",
+	},
 ] as const satisfies readonly Rule[];
 
 /**

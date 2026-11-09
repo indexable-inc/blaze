@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: The blaze edition. Rust with nine opt-in changes (handles that copy themselves, error unions, view types, records, contexts, effects at the border, values that must be used up, contracts and pattern types, compile-time reflection), what it removes, the lints that get a crate ready for it, and the order it is built in.
+summary: The blaze edition. Rust with ten opt-in changes (handles that copy themselves, error unions, view types, records, contexts, effects at the border, values that must be used up, contracts and pattern types, compile-time reflection, `&uniq`), what it removes, the lints that get a crate ready for it, and the order it is built in.
 date: 2026-11-09
 ---
 # The blaze edition
@@ -27,7 +27,7 @@ Three tests decide what goes in:
    functions and written on every `pub` one.
 3. **Each addition deletes something**: a pattern, a crate or a tool people use today.
 
-## The nine changes
+## The ten changes
 
 Each is its own feature attribute first (`#![blaze::handles]`, ...), usable in any crate, and the
 edition turns them all on. The spec column is where the design lives; this page does not repeat
@@ -39,11 +39,12 @@ it.
 | 2 | **Error unions.** `A \| B` in type position is an anonymous enum, order-free; `?` widens a smaller set into a larger one; `match` on it is exhaustive. | error enums, `From` impls, `anyhow`, `thiserror` | here | medium |
 | 3 | **View types.** `fn old_keys(&self.{lru})` says which fields a method borrows. | structs split to please the borrow checker | here | medium |
 | 4 | **Records and named arguments.** `{ a: T, b: U }` is a type, equal to any record with the same fields; fields may have defaults. | builders, options structs, one-off structs | here | medium |
-| 5 | **Contexts.** `fn f() with fs: &Fs, cx: &Cx` is a parameter passed by name from the caller's scope. With [bstd](std.md), a function with no `with fs` cannot reach the disk. | ambient files, clock, network, allocator; threading `cx` by hand | [std](std.md) | large |
+| 5 | **Capabilities as parameters.** With [bstd](std.md), a function touches only what it is handed, so one with no `Fs` or `Dir` parameter cannot reach the disk. (A `with` clause to pass them by name is deferred.) | ambient files, clock, network, allocator | [std](std.md) | large |
 | 6 | **Effects at the border.** pure, nopanic, noalloc, nonblocking, ambient, unsafe and may-suspend are inferred inside a crate and written on `pub` functions; a function that takes a closure does what the closure does. | `async`/`await`, and the async, const and `try_` twins of every API | [effects](effects.md), [pure-fns](pure-fns.md), [may-suspend](may-suspend.md) | medium |
 | 7 | **Values that must be used up.** A `#[blaze::linear]` value cannot be dropped; every path hands it to a function that takes it by value. | forgotten commits, drop bombs | [linear](linear.md) | medium |
-| 8 | **Contracts and pattern types.** `requires` and `ensures` on a function; `usize is 1..` puts a range in the type. | preconditions in doc comments, restated checks | [contracts](contracts.md) | small |
+| 8 | **Contracts and pattern types.** `requires` and `ensures` on a function; `usize is 1..` puts a range in the type, and `Conn is Conn::Open { .. }` a variant. | preconditions in doc comments, restated checks, `unreachable!()` after a match already made | [contracts](contracts.md), here | medium |
 | 9 | **Compile-time reflection.** `for const f in fields_of::<T>()` in ordinary typed code. | most derive proc macros | [comptime](comptime.md) | large |
+| 10 | **`&uniq T`.** The unique reference is spelled for what it guarantees. `&mut T` means the same and is the old spelling. | the belief that `&` means immutable and `&mut` means mutable | here | small |
 
 ### Rules for the four that have no spec yet
 
@@ -67,7 +68,16 @@ it.
   same set is the same type in every crate.
 - `Err(e: io::Error) =>` matches by member. `?` converts when the source set is a subset of the
   target's; otherwise the error names the member that is missing.
-- A union implements a trait when every member does (`Error`, `Debug`, `Display`).
+- **Unions are not only for errors.** `type AnySpec = OsSpec | VmSpec | WasmSpec;` is the closed
+  family "one of these", with no wrapper enum to declare and no `From` impls to keep in step.
+- **A union implements a trait when every member does, by delegation**: calling a method calls
+  the held member's. An associated type of the union is the union of the members' (`Spec::Sandbox`
+  of `AnySpec` is `OsSandbox | Vm | WasmSandbox`), so one call maps a family onto another. A
+  trait whose methods take a second `Self` by value or reference (`PartialEq`, `Add`) is not
+  delegated, since the two values might hold different members; `Debug`, `Display`, `Error`,
+  `Clone` and `Hash` are.
+- **One arm can handle every member**: `match x { each v => f(v) }` checks `f(v)` once per
+  member type and is the delegation rule written by hand, for when no trait fits.
 
 **3. View types.**
 - `&self.{a, b}` and `&mut self.{a}` borrow only those fields; two calls whose views are disjoint
@@ -86,11 +96,44 @@ it.
 - Layout is the fields sorted by name then laid out as `repr(Rust)`, so equal records are one
   type everywhere.
 
-**5. Contexts**, beyond [std](std.md): a `with` clause is sugar for parameters matched by name
-and type in the caller's scope, so bstd's API is written with plain parameters today and reads
-the same under the edition. `with x = expr { .. }` binds for a block. A function pointer, a
-closure type and a `dyn` method carry their contexts in their type. `main` is
-`fn main() with cx: &Cx, io: Io`.
+**5. Contexts are deferred.** Capabilities, `Cx`, allocators and evaluators are plain parameters
+([std](std.md)); that is the design, and what a function takes is read off its parameter list. A
+`with` clause (a parameter passed by name from the caller's scope, so the functions in between
+need not list it) would only save typing in the middle of a call chain. It is not built, and it
+is reconsidered only if threading turns out to be the main complaint once blaze's own crates are
+on bstd. `main` is `fn main(cx: &Cx, io: Io)`.
+
+**10. `&uniq`.**
+- `&uniq T`, `&uniq self`, `&uniq expr` and `ref uniq` in patterns are exactly `&mut T`,
+  `&mut self`, `&mut expr` and `ref mut`: the same type, so code in the two spellings mixes
+  freely, across crates too. `uniq` is a keyword only in those positions.
+- What `&` and `&uniq` promise is aliasing: shared, or unique. Whether the target can change
+  follows from that (unique: yes; shared: only through a cell or a lock), which is why
+  `&Atomic<u32>` can be written to and the old names mislead.
+- `let mut x` stays: it says the binding may be reassigned or borrowed uniquely, which is a
+  different thing. `*mut T` and `*const T` stay.
+- Diagnostics and docs say "shared" and "unique" in every crate; under the gate they print
+  `&uniq`.
+
+**8. Pattern types cover enum variants.** (The rest of change 8 is in [contracts](contracts.md).)
+- `T is PAT` is `T` restricted to the values that match `PAT`. A range is one case
+  (`usize is 1..`); a variant is another: `Provider is Provider::Host(_)`,
+  `Option<T> is Some(_)`, `Conn is Conn::Open { .. } | Conn::Draining { .. }`. There is no
+  separate "variant type" feature.
+- **Same bytes.** A narrowed value has the enum's layout, so `T is PAT` to `T`, and
+  `&(T is PAT)` to `&T`, are free and implicit. The other direction needs proof.
+- **A constructor has the enum's type** (`Some(x)` is an `Option`), as today. Narrowing happens
+  in two places only: where the type is written, and where control flow proves it. In a `match`
+  arm or after `if let`/`let else`, the scrutinee, when it is a local that is not reassigned, has
+  the type narrowed to that arm's pattern, and can be passed to a function that asks for it.
+- **A `match` on a narrowed type needs only its variants**, and a field of the variant can be
+  read directly (`conn.socket` on a `Conn is Conn::Open { .. }`): no `unreachable!()`, no second
+  match.
+- **A unique reference cannot change the variant.** Through `&uniq (T is PAT)` the fields may be
+  written, but the whole value may not be assigned or swapped, since that could store a value
+  outside `PAT`.
+- With error unions: handling one member in a `match` leaves the rest narrowed
+  (`E is not io::Error` is written as the union of the remaining members).
 
 ## What the edition removes
 
@@ -102,8 +145,9 @@ Each is a hard error in the edition and a lint (below) in any crate before it.
 | `async` and `await` | fibers and the inferred may-suspend effect |
 | the ambient file, clock, network, environment, process and thread APIs | capabilities of [bstd](std.md) |
 | the global allocator | an allocator the code was handed |
-| `static mut` | an atomic, a named lock, or a context |
+| global mutable state: `static mut`, a `static` with interior mutability, thread-locals | a value someone owns and passes, or a context |
 | `unsafe` outside the trusted list | safe code, or a reviewed entry in the list |
+| the spelling `&mut` | `&uniq` |
 | derive proc macros that reflection covers | `fields_of` and friends; proc macros stay for foreign syntax |
 
 Not touched: ownership and borrowing, traits and coherence, monomorphization, enums and `match`,
@@ -119,14 +163,15 @@ is an error. Where a mechanical fix exists, `blaze check --fix` applies it.
 | lint | flags | fix |
 |---|---|---|
 | `blaze::lossy_as` | an `as` cast that can lose value or sign, or goes between pointer and integer | `T::from(x)` when lossless; else suggests `try_from` or the named method |
-| `blaze::static_mut` | any `static mut` | none: says which of atomic, lock or context fits the uses |
+| `blaze::global_state` | a `static mut`, a `static` whose type has interior mutability (an atomic, a lock, a cell), a `thread_local!` | none: says where the state is used, so its owner can be chosen |
 | `blaze::async_fn` | `async fn`, `async` blocks, `.await` | none until fibers are the runtime of the crate |
 | `blaze::ambient` | reaching ambient IO (the effect of [std](std.md)) | none: names the capability to take |
 | `blaze::global_alloc` | allocating from the global heap | `new_in(..)` when an allocator is in scope |
 | `blaze::untrusted_unsafe` | `unsafe` outside the trusted list | none |
+| `blaze::mut_ref` | `&mut` and `ref mut` where `&uniq` is available | rewrites to `&uniq` and `ref uniq` |
 | `blaze::handle_clone` | `.clone()` on a `Handle` (once change 1 exists) | removes it |
 | `blaze::error_wrapper` | an error enum that is only `From` variants (once change 2 exists) | rewrites to a union |
-| `blaze::undeclared_effects` | a `pub` function without its effects written (once change 6 infers them) | writes the inferred ones |
+| `blaze::unmarked_pure`, `unmarked_nopanic`, `unmarked_noalloc`, `unmarked_nonblocking` | a function the effects walk proves has that property and that lacks its attribute; `pub` functions by default, every function with `unmarked-effects-private = true` | adds the attribute; never one the check would then refuse |
 | `blaze::derivable_by_reflection` | a derive that reflection covers (once change 9 exists) | none at first |
 
 The first three need nothing new and are built first. `lossy_as` is one lint with one message in
@@ -138,12 +183,14 @@ Payoff per unit of compiler work, and what leans on what.
 
 | step | what | needs |
 |---|---|---|
-| E1 | The lint group with `lossy_as`, `static_mut`, `async_fn`; turned on in blaze's own crates one at a time | nothing |
+| E1 | The lint group with `lossy_as`, `global_state`, `async_fn`; turned on in blaze's own crates one at a time | nothing |
 | E2 | Handles (change 1) and `handle_clone` | nothing |
 | E3 | Error unions (change 2) and `error_wrapper` | nothing |
 | E4 | View types (change 3) | nothing |
 | E5 | Records and named arguments (change 4) | nothing |
-| E6 | Contexts (change 5): the `with` clause over bstd's parameters | S1, S2 of [std](std.md) |
+| E5b | `&uniq` (change 10) and `mut_ref` with its fix; blaze's own crates rewritten by the fix | nothing |
+| E5c | Pattern types over enum variants, with narrowing in `match` and `if let` (change 8) | nothing |
+| E6 | Capabilities as parameters (change 5): blaze's crates on bstd; the `with` clause deferred | S1 to S3 of [std](std.md) |
 | E7 | Effects inferred and declared at the border; closures pass their effects through; `async` removed for crates on fibers (change 6) | E6 |
 | E8 | Linear values, contracts and pattern types, reflection (changes 7 to 9), each finishing its own spec | their specs |
 | E9 | `edition = "blaze-2026.11"`: everything above on, everything removed an error, `blaze fix --edition` | E1 to E8, S5 |
@@ -165,5 +212,5 @@ With live patching for redefinition, the tool and the code base are one language
   attribute.
 - **Unions hold concrete types only** until a sound rule for parameters exists.
 - **Handles need no mark at the use**; the off switch is an effect.
-- **`with` is sugar over parameters**, so no library is written twice.
+- **Capabilities are plain parameters.** `with` is deferred.
 - **The syntax is otherwise Rust's.**
