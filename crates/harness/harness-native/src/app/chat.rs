@@ -32,6 +32,7 @@ mod genui;
 mod mention;
 mod peek;
 mod pick;
+mod plan;
 mod rename;
 mod steps;
 
@@ -1308,9 +1309,14 @@ fn keep_in_view(from: f32, at: f32, view: f32, len: f32) -> f32 {
     to.clamp(0.0, (len - view).max(0.0))
 }
 
-/// Chat pane `pv`'s composer card (scene/widgets/chat.flecs hn.ChatPane's foot.card: the words over the bar).
+/// Chat pane `pv`'s composer card (scene/widgets/chat.flecs hn.ChatPane's foot.card: the words and their pictures).
 fn composer(pv: View<'_>) -> Option<View<'_>> {
     pv.part("foot")?.part("card")
+}
+
+/// Chat pane `pv`'s status bar under its composer (hn.ChatPane's foot.status: model and effort, context, plan).
+fn status_bar(pv: View<'_>) -> Option<View<'_>> {
+    pv.part("foot")?.part("status")
 }
 
 /// Chat pane `pv`'s composer's words' area (its ui.field.GrowingTextArea).
@@ -1630,7 +1636,7 @@ impl App {
                 // Grown past its most, it scrolls on its FieldScroll (step_chat_inputs), the caret kept in view.
             }
         }
-        if let Some(bar) = composer(pv).and_then(|c| c.part("bar")) {
+        if let Some(bar) = status_bar(pv) {
             let o = w.entity_from_id(e);
             // The model and the effort it runs with, as den's picker (chat/pick.rs `Label`), the daemon's listing its last
             // say.
@@ -2619,9 +2625,8 @@ impl App {
         let w = self.world.world_ref();
         let pv = View::of(w.entity_from_id(p));
         let over = |v: Option<View<'_>>| v.and_then(|v| v.entity().try_cloned::<&Laid>()).is_some_and(|l| l.contains(x, y));
-        // On the composer's card but off its bar of controls is on the words (its insets too).
-        let card = composer(pv);
-        let in_input = over(card) && !over(card.and_then(|c| c.part("bar")));
+        // On the composer's card is on the words (its insets too): the controls are the status bar's, under it.
+        let in_input = over(composer(pv));
         let in_list = over(pv.part("list"));
         // A press on a cell's control is the control's (genui/control.rs): it starts no selection in the transcript.
         let on_control = w.entity_named(APP).target(Hovered::id(), 0).is_some_and(|h| {

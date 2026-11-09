@@ -15,6 +15,7 @@
 //! | `models` | `models` (`id`, `model`, `name`, `about`, `efforts`, `effort`) | the models the agent offers, from its own list, as it starts |
 //! | `choice` | `model`, `effort` | the person switched the model and/or effort for the turns from here on (`set_model`); a resume starts with the latest |
 //! | `context` | `used`, `window`, `last` (`input`, `cache_read`, `cache_write`, `output`, `thinking`), `parts` (`id`, `name`, `tokens`, `of`, `estimate`) | tokens of the model's context window the conversation fills, after a turn; the last call's exact split and what the context holds part by part, each the agent's count or harness's named estimate ([`context`]) |
+//! | `plan` | `windows` (`name`, `used`, `resets_at`, `warn`, `limited`) | how much of the person's plan with the agent's maker is used, a window each (`5h`, `week`): the share used (0 to 1), when it resets (unix seconds), whether the agent warns of it or refuses for it; the account's, not the chat's (claude's `rate_limit_event`, codex's `account/rateLimits/updated`) |
 //! | `user` | `text` | the user's message (written by the daemon as it sends it) |
 //! | `busy` | `busy` | a turn started (true) or ended (false) |
 //! | `block_start` | `block`, `kind` (`text` \| `thinking`) | a block began streaming *(partial)* |
