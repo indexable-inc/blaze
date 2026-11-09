@@ -42,6 +42,7 @@ use std::rc::Rc;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 mod drag;
+mod fileview;
 
 /// The `file://` URL of absolute path `path`: each byte outside the unreserved set and `/` percent-encoded.
 fn file_url(path: &str) -> String {
@@ -454,20 +455,23 @@ impl App {
 
     /// Open what a press on a link names (an `open:` action, a chat's link or inline component: `<url>`, `<path>` or
     /// `<line>:<path>`) in the pane on the right, as a view of its own: a web page, or a file or folder as a `file://`
-    /// page. With Option held (`alt`) it opens outside instead, as crate::open says: a page in the system's browser, a
+    /// page (a text file as fileview.rs's page of it: markdown rendered, its line marked). With Option held (`alt`) it opens outside instead, as crate::open says: a page in the system's browser, a
     /// file in the app its kind opens in, at its line.
     pub(crate) fn open_target(&mut self, target: &str, alt: bool) {
         if alt {
             return crate::open::open(target, false);
         }
-        let path = match target.split_once(':') {
-            Some((n, rest)) if rest.starts_with('/') && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => rest,
-            _ => target,
+        let (line, path) = match target.split_once(':') {
+            Some((n, rest)) if rest.starts_with('/') && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => (n.parse::<u32>().ok(), rest),
+            _ => (None, target),
         };
         if target.starts_with("https://") || target.starts_with("http://") || target.starts_with("file://") {
             self.web_open(target);
         } else if path.starts_with('/') {
-            self.web_open(&file_url(path));
+            // A text file as a page of its own (fileview.rs): markdown rendered, the line it was opened at marked. Anything
+            // else (a folder, a picture, a page) as the file itself.
+            let shown = fileview::page(path, line);
+            self.web_open(&file_url(shown.as_deref().and_then(|p| p.to_str()).unwrap_or(path)));
         } else {
             eprintln!("harness-native: open {target:?}: not a web link or an absolute path");
             return;
