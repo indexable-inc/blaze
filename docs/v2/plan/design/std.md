@@ -667,6 +667,33 @@ uses the `try_` forms (`try_push`, `try_reserve`), which return the error.
 Until S4, `alloc`'s global allocator still exists underneath; the `ambient` check treats a use of
 it in a capabilities crate as an effect (`global_alloc`), which replaces the `// alloc:` comment.
 
+### The page pool: one home for bytes that come from outside
+
+The store's buffer pool (`docs/v2/plan/design/store-pool.md`) is not a store feature. It is how bstd
+holds any bytes that came from a file, a socket or a device, and it moves into `bstd::mem::pool`
+with the store as its first user. There is no `mmap` in bstd.
+
+- **One reserved range, pages loaded by explicit reads** on the driver, in parallel, with a
+  state word per page. A miss is an op with a deadline, never a page fault that stalls a worker.
+- **`file.pin(cx, range)` gives `Pinned`**, which derefs to `&[u8]`: the bytes of the file in
+  place, held for as long as the pin lives. This is what `mmap` was used for, with the pool
+  choosing what stays in memory and blaze choosing what to prefetch.
+- **Records are read in place from pinned pages** (`bstd::record`: bytes in memory are the bytes
+  on disk), so loading a result decodes nothing and copies nothing.
+- **Receives land in pool pages.** The buffers a driver lends with an event (the boundary's
+  "events lend their bytes") are pool pages, so network data, file data and what the program
+  keeps of them are one kind of memory with one owner and one count.
+- **On unified memory a pool page can be a GPU buffer** (page-aligned, shared), so disk to pool to
+  device is no copy at all.
+- **It is the `Cache` of `Mem`.** Pool pages are the cheapest thing to drop (one read brings them
+  back), so the one evictor takes them first, and the pool grows only into room the budget has.
+- **The pool's logic is a sans-IO core**: its inputs are requests and completions, its outputs
+  are reads, advice to the OS and wake-ups. The simulation runs it with failed reads, short
+  reads and crashes like everything else.
+
+`Mem` itself is a capability whose system calls (reserve, commit, give back) are ops on the
+boundary, so a simulated `Io` can refuse memory, count it and fail it at a chosen point.
+
 Strings are UTF-8; a path is bytes on Unix and WTF-8 on Windows behind one `Path`.
 
 ## The checks
@@ -700,6 +727,7 @@ Interface first, bottom last, so nothing waits on the runtime and every step lan
 | S1c | Tracing on bstd: the span in `Cx` and the scheduler's own events first; then the compile-time site table and the ring; then reflection encoders and redaction; disabled-site patching and keep-or-drop last | the emit budget holds; the ring's simulation test and the round trip pass |
 | S1d | The facade: bstd re-exports the crates of "What is in it", the interner and helper crates are merged, and the piece crates' names are banned outside bstd | `blaze check` with the bans on; no blaze crate outside bstd names a piece crate |
 | S1e | `bstd::image` (PNG), `bstd::video` (the encoder core, the muxer, the VideoToolbox provider moved out of `harness-video`, which then uses bstd's), and `Gpu` as a capability with the CPU provider and offscreen targets | a round trip of an image; a clip encoded from fixed frames is byte-identical twice; `harness-video` builds on it |
+| S1f | The page pool moves from `blaze-cas` to `bstd::mem::pool`; `file.pin`, pooled receive buffers, records read in place; no `mmap` anywhere in bstd | the pool's simulation test still passes from its new home; the store builds on it |
 | S3b | The `Frames` layout: the calling convention, the slab, unwinding, and the profiler and backtraces walking the frame chain | the differential test against `Fibers` passes |
 | S4 | The bottom: `bstd::sys` and `bstd::rt`, `blaze-core`'s drivers move in as `bstd::driver`, and bstd is `#![no_std]` | no blaze crate links Rust's `std`; C1 still passes |
 | S5 | The edition: `edition = "blaze-2026.11"` makes `std` name bstd, `fn main(io: Io)` is the entry, and the OS sandbox of a program is derived from what `main` hands out | a program of the edition that never opens the network cannot, checked by the sandbox |
