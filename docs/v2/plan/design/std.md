@@ -142,6 +142,28 @@ Rules that hold for all of them:
 
 The one thing left ambient is a panic, which is the language's, and it fails its task.
 
+### What replaces a thread-local
+
+A thread-local is the wrong tool on fibers anyway: a task can resume on another thread after any
+wait (rule `no-wait-across-thread-locals`). Each thing people use one for has an owner here:
+
+| used for | instead |
+|---|---|
+| the "current" something (span, deadline, database, runtime) | `Cx`, or a `with` context |
+| scratch buffers reused across calls | `cx.frame()` |
+| state that belongs to one task | a local the task owns, passed down |
+| per-thread caches and counters that avoid contention (allocator caches, statistics, shards of an interner) | `PerWorker<T>` |
+
+`PerWorker<T>` is an ordinary value: one cache-line-padded slot per scheduler worker, made with
+`PerWorker::new_in(mem, ..)` and owned and passed like anything else. `slots.with(cx, |slot| ..)`
+gives `&mut T` for the worker the task is on. The closure gets no `Cx`, so it cannot wait, so the
+task cannot move to another worker while it holds the slot (the `nonblocking` check enforces it).
+`slots.iter()` reads every slot, for summing counters. This is the per-CPU variable of a kernel
+and the shard of a shared-nothing runtime, without a global.
+
+The runtime keeps one real thread-local, the pointer to the current worker, inside `bstd::rt`
+(trusted); nothing else may.
+
 **Secrets.** `#[derive(bstd::Secret)]` gives a type no `Debug`, `Display` or `Clone`, zeroes it on
 drop, and hands its bytes only to functions of its own module.
 
