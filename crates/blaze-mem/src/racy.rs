@@ -119,3 +119,35 @@ pub unsafe fn zero(to: *mut u8, len: usize) {
         at += 1;
     }
 }
+
+#[cfg(all(test, not(blaze_check)))]
+mod tests {
+    use hegel::{TestCase, generators as gs};
+
+    use super::*;
+
+    /// Bytes written with [`copy_in`] at any offset and length come back whole through
+    /// [`copy_out`], the head, words and tail each where the address puts them, and nothing
+    /// outside the range moves; [`zero`] clears exactly its range.
+    #[hegel::test]
+    fn copies_round_trip_at_any_alignment(tc: TestCase) {
+        let offset = tc.draw(gs::integers::<usize>().max_value(15));
+        let bytes: Vec<u8> = tc.draw(gs::vecs(gs::integers::<u8>()).max_size(80));
+        let mut buffer = [0xEEu8; 112];
+        let at = buffer.as_mut_ptr().wrapping_add(offset);
+        // SAFETY: `[at, at + bytes.len())` is inside `buffer` (16 + 80 <= 112), which only this
+        // test reaches, through `at` alone until the copies end.
+        unsafe { copy_in(at, &bytes) };
+        let mut out = vec![0u8; bytes.len()]; // alloc: a test's copy
+        // SAFETY: as above.
+        unsafe { copy_out(at, &mut out) };
+        assert_eq!(out, bytes);
+        let end = offset + bytes.len();
+        assert!(buffer[..offset].iter().chain(&buffer[end..]).all(|&it| it == 0xEE), "outside moved");
+        let at = buffer.as_mut_ptr().wrapping_add(offset);
+        // SAFETY: as above.
+        unsafe { zero(at, bytes.len()) };
+        assert!(buffer[offset..end].iter().all(|&it| it == 0), "zeroed");
+        assert!(buffer[..offset].iter().chain(&buffer[end..]).all(|&it| it == 0xEE), "outside moved");
+    }
+}

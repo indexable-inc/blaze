@@ -1195,9 +1195,12 @@ const EVICT_NEEDS: &str = "blaze needs Linux 6.13 for any advice to its own proc
 const EVICT_CALL: &str = "madvise(MADV_FREE_REUSABLE)";
 #[cfg(windows)]
 const EVICT_CALL: &str = "VirtualFree(MEM_DECOMMIT)";
-#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+#[cfg(all(
+    any(unix, target_arch = "wasm64"),
+    not(any(target_os = "linux", target_os = "macos"))
+))]
 const EVICT_CALL: &str = "giving pages back";
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(any(unix, windows, target_arch = "wasm64"), not(target_os = "linux")))]
 const EVICT_NEEDS: &str = "the store's pool cannot give its pages back on this system";
 
 /// The kernel's name and release, for an error: `uname`'s `sysname` and `release`.
@@ -1218,7 +1221,7 @@ fn system_release() -> std::string::String {
     format!("{} {}", text(&name.sysname), text(&name.release)) // alloc: as above
 }
 
-#[cfg(not(unix))]
+#[cfg(any(windows, all(not(unix), target_arch = "wasm64")))]
 #[cold]
 fn system_release() -> std::string::String {
     std::env::consts::OS.to_owned() // alloc: an error's text, once

@@ -739,3 +739,6 @@ impl std::fmt::Debug for Region {
             .finish()
     }
 }
+
+#[cfg(all(test, not(blaze_check)))]
+mod tests;
