@@ -272,9 +272,12 @@ hn {
       Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     }
+    // Always chat_pick_detail_h tall (two lines of it), whatever the line says or whether there is one: the menu keeps
+    // its height as the highlight moves, so nothing in it jumps.
     detail : ui.Column {
+      Clip
       Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
-      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_detail_h, min: 0, max: 0}}
     }
   }
   prefab ChatPickDetail : ui.Row {

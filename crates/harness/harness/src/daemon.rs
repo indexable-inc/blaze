@@ -792,6 +792,20 @@ struct Relaunch {
 /// `--fork-session --no-session-persistence` (a new conversation from the old one's history, never written: an aside);
 /// Codex's choice and thread ride on its adapter (chat/codex.rs `resume`, `fork`, `with_choice`).
 ///
+/// The flags that pick Claude's conversation `session` on a relaunch. One the agent spoke in is on disk: `--resume`, and
+/// for an aside (`fork`) a copy never written. One no turn ever reached (a new chat left empty, then lost with its
+/// daemon) was never written, and `--resume` of it fails with "No conversation found with session ID": it starts under
+/// the same id instead, and an aside of it starts from nothing, unwritten.
+fn claude_conversation(session: &str, spoke: bool, fork: bool) -> Vec<String> {
+    let flags: &[&str] = match (spoke, fork) {
+        (true, false) => &["--resume", session],
+        (true, true) => &["--resume", session, "--fork-session", "--no-session-persistence"],
+        (false, false) => &["--session-id", session],
+        (false, true) => &["--no-session-persistence"],
+    };
+    flags.iter().map(|f| (*f).to_owned()).collect()
+}
+
 /// # Errors
 /// Not a chat; its log never named the agent's id for the conversation; a kind with no chat adapter; the launch's.
 fn relaunch(s: &Session, fork: bool) -> Result<Relaunch> {
@@ -826,10 +840,7 @@ fn relaunch(s: &Session, fork: bool) -> Result<Relaunch> {
     }
     match s.kind.as_str() {
         "claude" => {
-            args.extend(["--resume".to_owned(), session.clone()]);
-            if fork {
-                args.extend(["--fork-session".to_owned(), "--no-session-persistence".to_owned()]);
-            }
+            args.extend(claude_conversation(&session, c.agent_spoke(), fork));
             if let Some(m) = &chosen.0 {
                 args.extend(["--model".to_owned(), m.clone()]);
             }
@@ -1359,6 +1370,16 @@ fn uuid_v4() -> String {
 mod tests {
     use super::*;
     use crate::client::{recv, send};
+
+    /// A Claude chat no turn ever reached has no conversation on disk, so its relaunch starts it under its id; `--resume`
+    /// of it is what failed with "No conversation found with session ID". One the agent spoke in resumes.
+    #[test]
+    fn a_chat_never_spoken_in_starts_instead_of_resuming() {
+        assert_eq!(claude_conversation("id", false, false), ["--session-id", "id"]);
+        assert_eq!(claude_conversation("id", true, false), ["--resume", "id"]);
+        assert_eq!(claude_conversation("id", true, true), ["--resume", "id", "--fork-session", "--no-session-persistence"]);
+        assert_eq!(claude_conversation("id", false, true), ["--no-session-persistence"]);
+    }
 
     /// Set: the next request panics while holding the sessions lock.
     pub(super) static PANIC_NEXT: AtomicBool = AtomicBool::new(false);

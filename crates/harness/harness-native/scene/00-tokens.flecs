@@ -679,7 +679,8 @@ export const chat_effort_gap = 1.5
 export const chat_effort_bar_radius = 1
 export const chat_effort_floor = 0.3
 // The picker's menu (hn.ChatPickMenu): chat_pick_menu_w wide whatever it holds, so a model's line about it wraps under
-// the list (chat_pick_detail_*: size, line, insets) instead of being cut; the effort's slider chat_pick_level_t under
+// the list (chat_pick_detail_*: size, line, insets; always chat_pick_detail_h tall, two lines, so the menu never
+// changes height as the highlight moves) instead of being cut; the effort's slider chat_pick_level_t under
 // the hairline and chat_pick_level_b over the plate's foot. A sideways two-finger swipe over the control (or the
 // slider) steps the effort a stop each chat_pick_swipe_step points the fingers travel (detents: momentum never steps
 // it), a pulse on the trackpad at each; the effort is sent chat_pick_commit_secs after the last step (one switch for a
@@ -701,6 +702,7 @@ export const size_chat_pick_detail = 11.5
 export const line_chat_pick_detail = 15
 export const chat_pick_detail_t = 3
 export const chat_pick_detail_b = 4
+export const chat_pick_detail_h = $chat_pick_detail_t + 2 * $line_chat_pick_detail + $chat_pick_detail_b
 export const chat_pick_level_t = 2
 export const chat_pick_level_b = 4
 export const chat_pick_swipe_step = 22
