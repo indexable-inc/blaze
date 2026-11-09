@@ -1002,7 +1002,7 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
                     span.with_mut(|bytes| fs::read_into(&opened, bytes, from, cache))
                 })
             })
-            .map_err(|error| named(&file, error))?;
+            .map_err(|error| named(&file, &error))?;
             Ok(Done::ReadInto { len: u32::try_from(read).expect("at most a span's u32 length") })
         }
         Effect::WriteFrom { file, at: offset, from, cache, .. } => {
@@ -1013,7 +1013,7 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
                 let opened = fs::open_positional(path, true, cache)?;
                 span.with(|bytes| fs::write_from(&opened, bytes, offset))
             })
-            .map_err(|error| named(&file, error))?;
+            .map_err(|error| named(&file, &error))?;
             Ok(Done::Written)
         }
         Effect::Append { file, bytes, .. } => at(root, &file, |path| {
@@ -1111,7 +1111,7 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
 }
 
 /// `error` of `file`, saying which.
-fn named(file: &crate::FileName, error: io::Error) -> io::Error {
+fn named(file: &crate::FileName, error: &io::Error) -> io::Error {
     // alloc: an error path.
     io::Error::new(error.kind(), format!("{file}: {error}"))
 }
