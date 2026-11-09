@@ -1214,8 +1214,8 @@ fn system_release() -> std::string::String {
         return "a kernel uname does not name".to_owned(); // alloc: an error's text, once
     }
     let text = |field: &[libc::c_char]| {
-        let bytes: Vec<u8> = // alloc: an error's text, once
-            field.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
+        let bytes = field.iter().take_while(|&&c| c != 0).map(|&c| c as u8);
+        let bytes: Vec<u8> = bytes.collect(); // alloc: an error's text, once
         std::string::String::from_utf8_lossy(&bytes).into_owned()
     };
     format!("{} {}", text(&name.sysname), text(&name.release)) // alloc: as above
