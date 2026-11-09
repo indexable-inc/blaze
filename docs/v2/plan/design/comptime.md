@@ -499,7 +499,7 @@ checked where its target is known, when it is evaluated.
   type, and the method is called with `Self` that type. Before the call, it asks
   `effects::const_call_error(db, env, Const, callee, args)` of the target, the rule the static
   checker applies to a direct call: a `const fn` whose `[const]` bounds hold const, or a method
-  of a `const trait` whose `Self: [const] Trait` holds (an `impl const`; a default method
+  of a `const trait` whose `Self: [const] Trait` holds (a `const impl`; a default method
   only through one). A closure is const when it is written `const ||`.
 - **The error.** Otherwise `MirEvalError::Comptime(ComptimeError { kind: NonConstTarget { .. },
   at })`, naming the function that would run (a trait method resolved to its impl's), how it
@@ -588,7 +588,7 @@ Cost: one cached feature lookup per inline const of a constant's body at MIR low
 `crates/hir-ty-mir/src/tests/consteval/comptime.rs` (evaluation) and
 `crates/hir-ty-mir/tests/mir/const_check.rs` (the static check):
 
-- a `dyn` call of an `impl const` method in a `const fn` evaluates; one of a plain impl is the
+- a `dyn` call of a `const impl` method in a `const fn` evaluates; one of a plain impl is the
   `NonConstTarget` error naming the impl's method and the `dyn` type;
 - a function-pointer call of a `const fn` evaluates; of a plain `fn`, the error naming it;
 - in a `const static` block, a `format!`-shaped run (a growing `String` over `__rust_alloc`,

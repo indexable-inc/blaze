@@ -331,7 +331,7 @@ pub fn comptime_error_text(
                         });
                     let why = match bounds {
                         true => "a const function whose `[const]` bounds do not hold const here",
-                        false => "which is not a `const fn` nor a method of an `impl const`",
+                        false => "which is not a `const fn` nor a method of a `const impl`",
                     };
                     // alloc: the text of a diagnostic, made when it is reported
                     (format!("`{name}`"), why)

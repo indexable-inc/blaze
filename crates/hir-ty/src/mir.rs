@@ -2752,7 +2752,7 @@ pub struct ComptimeError<'db> {
 pub enum ComptimeErrorKind<'db> {
     /// A call in a const context through `through` reached `callee` (with `args`; a trait's
     /// method named by the impl's that runs), which is not const: not a `const fn`, not a
-    /// method of an `impl const`, not a `const` closure. `bounds`: it is const, but its
+    /// method of a `const impl`, not a `const` closure. `bounds`: it is const, but its
     /// `[const]` bounds do not hold const for these arguments.
     NonConstTarget {
         callee: Either<FunctionId, InternedClosureId<'db>>,

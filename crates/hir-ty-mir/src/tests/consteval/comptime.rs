@@ -76,7 +76,7 @@ pub trait Plain {
     fn get(&self) -> u8;
 }
 pub struct Seven;
-impl const Get for Seven {
+const impl Get for Seven {
     fn get(&self) -> u8 { 7 }
 }
 pub struct Eight;
@@ -104,7 +104,7 @@ fn dispatch(feature: bool, goal: &str) -> String {
     )
 }
 
-/// A `dyn` call of a method of an `impl const` evaluates in a `const fn`; one of a plain impl
+/// A `dyn` call of a method of a `const impl` evaluates in a `const fn`; one of a plain impl
 /// is refused when it is reached, naming the impl's method and the vtable it came through.
 #[test]
 fn a_dyn_call_in_const_is_checked_when_evaluated() {
