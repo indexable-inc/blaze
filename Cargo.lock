@@ -1804,6 +1804,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-std"
+version = "0.0.0"
+dependencies = [
+ "blaze-alloc-count",
+ "blaze-bytes",
+ "blaze-check",
+ "blaze-core",
+ "blaze-format",
+ "blaze-hash",
+ "blaze-http",
+ "blaze-ids",
+ "blaze-mem",
+ "blaze-phf",
+ "blaze-radix",
+ "blaze-reclaim",
+ "blaze-report",
+ "blaze-rng",
+ "blaze-sha256",
+ "blaze-spin",
+ "hegeltest",
+]
+
+[[package]]
 name = "blaze-stencil"
 version = "0.0.0"
 dependencies = [

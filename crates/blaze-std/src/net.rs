@@ -1,0 +1,573 @@
+//! Connections (docs/v2/plan/design/std.md, `Net`): connects and listens on blaze-core's
+//! sockets, narrowed by [`Net::connect_only`] and [`Net::listen_only`], which never widen.
+//!
+//! Addresses are socket addresses and Unix sockets beneath the driver's root. A peer named by
+//! its host is a [`HostPort`], checked as it is made, never a string; blaze-core has no effect
+//! for name lookup yet, so a [`Net`] cannot connect to one by name until it has.
+//!
+//! There is no UDP socket ([`Net`]'s `Datagrams`) yet: blaze-core's `Effect` has no datagram
+//! effects (a bind of a UDP socket, a send to an address, a receive with its sender).
+
+use std::{fmt, net::SocketAddr, sync::Arc};
+
+use blaze_core::{Address, Done, Effect, Tag};
+
+use crate::{
+    Stopped,
+    cx::Cx,
+    io::{Ends, Io},
+    mem::Bytes,
+    path::Path,
+};
+
+/// Where to connect or listen.
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: a refcount or a copy
+pub enum Addr {
+    Tcp(SocketAddr),
+    /// A Unix socket beneath the driver's root.
+    Unix(Path),
+}
+
+impl Addr {
+    fn address(&self) -> Address {
+        match self {
+            Addr::Tcp(at) => Address::Tcp(*at),
+            // clone: the socket's name, a refcount.
+            Addr::Unix(path) => Address::Unix(path.name().clone()),
+        }
+    }
+}
+
+impl fmt::Display for Addr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Addr::Tcp(at) => write!(f, "tcp:{at}"),
+            Addr::Unix(path) => write!(f, "unix:{path}"),
+        }
+    }
+}
+
+/// The most bytes in a host name (RFC 1035 section 2.3.4, without the root's dot).
+pub const HOST_MOST: usize = 253;
+
+/// A host and a port: a DNS name (labels of letters, digits and `-`, each 1 to 63 bytes and
+/// neither starting nor ending in `-`), an IPv4 address, or an IPv6 address in brackets; then
+/// a port from 1. Made by [`HostPort::new`], [`HostPort::parse`] or, for a literal,
+/// [`crate::host!`] as the crate compiles.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)] // clone: a refcount and a copy
+pub struct HostPort {
+    host: Arc<str>,
+    port: u16,
+}
+
+/// What [`HostPort::new`] or [`HostPort::parse`] refused.
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: an error
+pub struct HostPortError {
+    /// What was given: `host:port`, or the host and port joined so.
+    pub given: String,
+    pub why: HostPortWhy,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HostPortWhy {
+    EmptyHost,
+    /// More than [`HOST_MOST`] bytes.
+    HostTooLong,
+    /// A label is empty, longer than 63 bytes, or starts or ends with `-`.
+    BadLabel,
+    /// A byte that is in no host name or address.
+    BadByte,
+    /// A `[` with no `]`, or an IPv6 address with a byte other than hex digits, `:` and `.`.
+    BadBrackets,
+    /// No `:port` after the host.
+    NoPort,
+    /// The port is not a number from 1 to 65535.
+    BadPort,
+}
+
+impl HostPortWhy {
+    const fn says(self) -> &'static str {
+        match self {
+            HostPortWhy::EmptyHost => "has no host",
+            HostPortWhy::HostTooLong => "has a host longer than 253 bytes",
+            HostPortWhy::BadLabel => {
+                "has a label that is empty, longer than 63 bytes, or starts or ends with `-`"
+            }
+            HostPortWhy::BadByte => {
+                "has a byte that is no letter, digit, `-` or `.` in its host name"
+            }
+            HostPortWhy::BadBrackets => {
+                "has an IPv6 address that is not hex digits, `:` and `.` inside `[` and `]`"
+            }
+            HostPortWhy::NoPort => "has no `:port` after its host",
+            HostPortWhy::BadPort => "has a port that is not a number from 1 to 65535",
+        }
+    }
+}
+
+impl fmt::Display for HostPortError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "host and port {:?} {}", self.given, self.why.says())
+    }
+}
+
+impl std::error::Error for HostPortError {}
+
+/// Why `host` is no host, if it is not: a DNS name, an IPv4 address (which is one by these
+/// rules too), or an IPv6 address in brackets. A `const fn`, shared by run time and
+/// [`crate::host!`].
+pub const fn refused_host(host: &str) -> Option<HostPortWhy> {
+    let bytes = host.as_bytes();
+    if bytes.is_empty() {
+        return Some(HostPortWhy::EmptyHost);
+    }
+    if bytes.len() > HOST_MOST {
+        return Some(HostPortWhy::HostTooLong);
+    }
+    if bytes[0] == b'[' {
+        if bytes.len() < 3 || bytes[bytes.len() - 1] != b']' {
+            return Some(HostPortWhy::BadBrackets);
+        }
+        let mut at = 1;
+        while at < bytes.len() - 1 {
+            let byte = bytes[at];
+            if !(byte.is_ascii_hexdigit() || byte == b':' || byte == b'.') {
+                return Some(HostPortWhy::BadBrackets);
+            }
+            at += 1;
+        }
+        return None;
+    }
+    // Each `.`-separated label, from `start` to the dot (or the end) at `at`.
+    let (mut start, mut at) = (0, 0);
+    while at <= bytes.len() {
+        if at == bytes.len() || bytes[at] == b'.' {
+            let len = at - start;
+            if len == 0 || len > 63 || bytes[start] == b'-' || bytes[at - 1] == b'-' {
+                return Some(HostPortWhy::BadLabel);
+            }
+            start = at + 1;
+        } else if !(bytes[at].is_ascii_alphanumeric() || bytes[at] == b'-') {
+            return Some(HostPortWhy::BadByte);
+        }
+        at += 1;
+    }
+    None
+}
+
+/// Where `raw` (`host:port`) splits: the index of the `:` before the port, or why there is
+/// none. The port is after the last `:`, so `[::1]:443` splits after its `]`.
+const fn split(raw: &str) -> Result<usize, HostPortWhy> {
+    let bytes = raw.as_bytes();
+    let mut at = bytes.len();
+    while at > 0 {
+        at -= 1;
+        match bytes[at] {
+            b':' => {
+                // A `:` inside brackets is the address's, not the port's.
+                if bytes[0] == b'[' && (at == 0 || bytes[at - 1] != b']') {
+                    return Err(HostPortWhy::NoPort);
+                }
+                return Ok(at);
+            }
+            b']' => return Err(HostPortWhy::NoPort),
+            _ => {}
+        }
+    }
+    Err(HostPortWhy::NoPort)
+}
+
+/// The port `digits` spell, from 1 to 65535.
+const fn port_of(digits: &[u8]) -> Result<u16, HostPortWhy> {
+    if digits.is_empty() || digits.len() > 5 {
+        return Err(HostPortWhy::BadPort);
+    }
+    let (mut port, mut at) = (0u32, 0);
+    while at < digits.len() {
+        if !digits[at].is_ascii_digit() {
+            return Err(HostPortWhy::BadPort);
+        }
+        port = port * 10 + (digits[at] - b'0') as u32;
+        at += 1;
+    }
+    if port == 0 || port > u16::MAX as u32 {
+        return Err(HostPortWhy::BadPort);
+    }
+    Ok(port as u16)
+}
+
+/// Why `raw` (`host:port`) is none, if it is not: [`HostPort::parse`]'s rule, as a `const fn`.
+pub const fn refused(raw: &str) -> Option<HostPortWhy> {
+    let colon = match split(raw) {
+        Ok(colon) => colon,
+        Err(why) => return Some(why),
+    };
+    let (host, port) = raw.as_bytes().split_at(colon);
+    let host = match std::str::from_utf8(host) {
+        Ok(host) => host,
+        Err(_) => return Some(HostPortWhy::BadByte),
+    };
+    if let Some(why) = refused_host(host) {
+        return Some(why);
+    }
+    let (_, digits) = port.split_at(1);
+    match port_of(digits) {
+        Ok(_) => None,
+        Err(why) => Some(why),
+    }
+}
+
+/// [`refused`], as a compile-time panic: what [`crate::host!`] evaluates in a `const`.
+pub const fn check_literal(raw: &str) {
+    if let Some(why) = refused(raw) {
+        panic!("{}", why.says());
+    }
+}
+
+impl HostPort {
+    /// `host` and `port`, checked.
+    pub fn new(host: &str, port: u16) -> Result<HostPort, HostPortError> {
+        let why = match refused_host(host) {
+            Some(why) => Some(why),
+            None if port == 0 => Some(HostPortWhy::BadPort),
+            None => None,
+        };
+        if let Some(why) = why {
+            // alloc: an error's message.
+            return Err(HostPortError { given: format!("{host}:{port}"), why });
+        }
+        // alloc: once per name, its host.
+        Ok(HostPort { host: Arc::from(host), port })
+    }
+
+    /// `host:port`, checked: `api.stripe.com:443`, `127.0.0.1:8080`, `[::1]:443`.
+    pub fn parse(raw: &str) -> Result<HostPort, HostPortError> {
+        // alloc: an error's message.
+        let refuse = |why| HostPortError { given: raw.to_owned(), why };
+        if let Some(why) = refused(raw) {
+            return Err(refuse(why));
+        }
+        let colon = split(raw).map_err(refuse)?;
+        let port = port_of(&raw.as_bytes()[colon + 1..]).map_err(refuse)?;
+        // alloc: once per name, its host.
+        Ok(HostPort { host: Arc::from(&raw[..colon]), port })
+    }
+
+    /// The host, an IPv6 address with its brackets.
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// The socket address it names when its host is an IP address; `None` for a DNS name,
+    /// which needs a lookup.
+    pub fn socket_addr(&self) -> Option<SocketAddr> {
+        let host = self.host();
+        let host = host.strip_prefix('[').and_then(|it| it.strip_suffix(']')).unwrap_or(host);
+        let ip: std::net::IpAddr = host.parse().ok()?;
+        Some(SocketAddr::new(ip, self.port))
+    }
+}
+
+impl fmt::Display for HostPort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.host, self.port)
+    }
+}
+
+impl fmt::Debug for HostPort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "HostPort({}:{})", self.host, self.port)
+    }
+}
+
+impl TryFrom<&str> for HostPort {
+    type Error = HostPortError;
+
+    fn try_from(raw: &str) -> Result<HostPort, HostPortError> {
+        HostPort::parse(raw)
+    }
+}
+
+/// A [`HostPort`] from a string literal, checked as the crate compiles:
+/// `host!("api.stripe.com:443")`. A bad literal (`host!("a..b:443")`) is a compile error
+/// saying why.
+#[macro_export]
+macro_rules! host {
+    ($raw:literal) => {{
+        const _: () = $crate::net::check_literal($raw);
+        $crate::net::HostPort::parse($raw).expect("a host! literal was checked as the crate compiled")
+    }};
+}
+
+/// Which addresses a [`Net`] may reach one way.
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: a refcount or a copy
+enum Allowed {
+    Any,
+    Only(Addr),
+    Nothing,
+}
+
+impl Allowed {
+    /// Only `at`, of what this allows: never more.
+    fn narrowed(&self, at: &Addr) -> Allowed {
+        match self {
+            Allowed::Any => Allowed::Only(at.clone()),
+            Allowed::Only(only) if only == at => Allowed::Only(at.clone()),
+            Allowed::Only(_) | Allowed::Nothing => Allowed::Nothing,
+        }
+    }
+
+    fn allows(&self, at: &Addr) -> bool {
+        match self {
+            Allowed::Any => true,
+            Allowed::Only(only) => only == at,
+            Allowed::Nothing => false,
+        }
+    }
+}
+
+/// What a network call was.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NetOp {
+    Connect,
+    Listen,
+    Accept,
+    Send,
+    Recv,
+    Close,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: an error
+pub enum NetKind {
+    /// The capability does not reach the address (rule: narrowing never widens).
+    NotAllowed,
+    Stopped(Stopped),
+    /// The driver failed it, saying this.
+    Driver(String),
+    /// The driver answered with a completion of another kind: a driver's bug.
+    Answered(String),
+}
+
+/// A network call that failed: the call, the address and how.
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: an error
+pub struct NetError {
+    pub op: NetOp,
+    pub addr: Addr,
+    pub kind: NetKind,
+}
+
+impl fmt::Display for NetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (op, addr) = (self.op, &self.addr);
+        match &self.kind {
+            NetKind::NotAllowed => {
+                write!(f, "bstd::net {op:?} to {addr}: this Net does not reach it (it was narrowed)")
+            }
+            NetKind::Stopped(stopped) => write!(f, "bstd::net {op:?} to {addr}: {stopped}"),
+            NetKind::Driver(said) => write!(f, "bstd::net {op:?} to {addr}: {said}"),
+            NetKind::Answered(done) => {
+                write!(f, "bstd::net {op:?} to {addr}: the driver answered {done} (a driver's bug)")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NetError {}
+
+fn error(op: NetOp, addr: &Addr, kind: NetKind) -> NetError {
+    // clone: an error's address.
+    NetError { op, addr: addr.clone(), kind }
+}
+
+fn unexpected(op: NetOp, addr: &Addr, done: Done) -> NetError {
+    let kind = match done {
+        Done::Failed(failed) => NetKind::Driver(failed.0),
+        Done::Broken { error: broken, .. } => NetKind::Driver(broken.0),
+        // alloc: an error's message.
+        done => NetKind::Answered(format!("{done:?}")),
+    };
+    error(op, addr, kind)
+}
+
+/// The network, from [`Io::net`].
+#[derive(Clone)]
+pub struct Net {
+    io: Io,
+    connect: Allowed,
+    listen: Allowed,
+}
+
+impl Net {
+    pub(crate) fn new(io: Io) -> Net {
+        Net { io, connect: Allowed::Any, listen: Allowed::Any }
+    }
+
+    /// Connects only to `at`, of what this connects to, and listens nowhere.
+    pub fn connect_only(&self, at: &Addr) -> Net {
+        Net { io: self.io.clone(), connect: self.connect.narrowed(at), listen: Allowed::Nothing }
+    }
+
+    /// Listens only on `at`, of what this listens on, and connects nowhere.
+    pub fn listen_only(&self, at: &Addr) -> Net {
+        Net { io: self.io.clone(), connect: Allowed::Nothing, listen: self.listen.narrowed(at) }
+    }
+
+    pub fn connect(&self, cx: &Cx, at: &Addr) -> Result<Conn, NetError> {
+        if !self.connect.allows(at) {
+            return Err(error(NetOp::Connect, at, NetKind::NotAllowed));
+        }
+        let address = at.address();
+        let done = self
+            .io
+            .call(cx, |tag| Effect::Connect { at: address, tag })
+            .map_err(|stopped| error(NetOp::Connect, at, NetKind::Stopped(stopped)))?;
+        match done {
+            // clone: the connection's peer, for its errors.
+            Done::Connected { conn } => Ok(Conn { io: self.io.clone(), conn, peer: at.clone(), open: true }),
+            done => Err(unexpected(NetOp::Connect, at, done)),
+        }
+    }
+
+    /// Listens on `at`: each connection made to it is [`Listener::accept`]ed.
+    pub fn listen(&self, cx: &Cx, at: &Addr) -> Result<Listener, NetError> {
+        if !self.listen.allows(at) {
+            return Err(error(NetOp::Listen, at, NetKind::NotAllowed));
+        }
+        cx.check().map_err(|stopped| error(NetOp::Listen, at, NetKind::Stopped(stopped)))?;
+        let address = at.address();
+        let tag = self.io.submit(|tag| Effect::Listen { at: address, tag });
+        // clone: the listener's address, for its errors.
+        Ok(Listener { io: self.io.clone(), tag, at: at.clone(), open: true })
+    }
+}
+
+/// A listen in flight: dropping it ends it.
+pub struct Listener {
+    io: Io,
+    tag: Tag,
+    at: Addr,
+    open: bool,
+}
+
+impl Listener {
+    /// The next connection made to it.
+    pub fn accept(&mut self, cx: &Cx) -> Result<Conn, NetError> {
+        let done = cx
+            .wait(&self.io, self.tag, Ends::Stream)
+            .map_err(|stopped| error(NetOp::Accept, &self.at, NetKind::Stopped(stopped)))?;
+        match done {
+            // clone: the connection's address, for its errors.
+            Done::Accepted { conn } => Ok(Conn { io: self.io.clone(), conn, peer: self.at.clone(), open: true }),
+            done => {
+                // A failed listen has ended: nothing more comes of its tag.
+                self.open = false;
+                Err(unexpected(NetOp::Accept, &self.at, done))
+            }
+        }
+    }
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        if self.open {
+            let tag = self.tag;
+            self.io.forget(tag, Ends::Stream);
+            let _ = self.io.submit(|_| Effect::Unlisten { tag });
+        }
+    }
+}
+
+/// A connection.
+pub struct Conn {
+    io: Io,
+    conn: blaze_core::Conn,
+    peer: Addr,
+    open: bool,
+}
+
+impl Conn {
+    pub fn peer(&self) -> &Addr {
+        &self.peer
+    }
+
+    /// All of `bytes` sent.
+    pub fn send(&self, cx: &Cx, bytes: &[u8]) -> Result<(), NetError> {
+        let conn = self.conn;
+        // alloc: the effect's bytes, which blaze-core's `Effect` owns.
+        let bytes = bytes.to_vec();
+        let done = self
+            .io
+            .call(cx, |tag| Effect::Send { conn, bytes, tag })
+            .map_err(|stopped| error(NetOp::Send, &self.peer, NetKind::Stopped(stopped)))?;
+        match done {
+            Done::Sent(_) => Ok(()),
+            done => Err(unexpected(NetOp::Send, &self.peer, done)),
+        }
+    }
+
+    /// The bytes the peer sent since the last receive, at most `most`, added to `into`; how
+    /// many, 0 once the peer has hung up.
+    pub fn recv(&self, cx: &Cx, most: usize, into: &mut Bytes<'_>) -> Result<usize, NetError> {
+        let conn = self.conn;
+        // alloc: the effect's buffer, which blaze-core's `Effect` owns.
+        let buffer = Vec::new();
+        let done = self
+            .io
+            .call(cx, |tag| Effect::Recv { conn, most, into: buffer, tag })
+            .map_err(|stopped| error(NetOp::Recv, &self.peer, NetKind::Stopped(stopped)))?;
+        match done {
+            Done::Read(bytes) => {
+                into.try_extend(&bytes)
+                    .map_err(|stopped| error(NetOp::Recv, &self.peer, NetKind::Stopped(stopped)))?;
+                Ok(bytes.len())
+            }
+            done => Err(unexpected(NetOp::Recv, &self.peer, done)),
+        }
+    }
+
+    /// The connection closed: the peer's receives get nothing more.
+    pub fn close(mut self, cx: &Cx) -> Result<(), NetError> {
+        self.open = false;
+        let conn = self.conn;
+        let done = self
+            .io
+            .call(cx, |tag| Effect::Hangup { conn, tag })
+            .map_err(|stopped| error(NetOp::Close, &self.peer, NetKind::Stopped(stopped)))?;
+        match done {
+            Done::HungUp => Ok(()),
+            done => Err(unexpected(NetOp::Close, &self.peer, done)),
+        }
+    }
+}
+
+impl Drop for Conn {
+    fn drop(&mut self) {
+        if self.open {
+            let conn = self.conn;
+            let tag = self.io.submit(|tag| Effect::Hangup { conn, tag });
+            self.io.forget(tag, Ends::Once);
+        }
+    }
+}
+
+impl fmt::Debug for Conn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Conn({:?} to {})", self.conn, self.peer)
+    }
+}
+
+impl fmt::Debug for Listener {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Listener({})", self.at)
+    }
+}
+
+impl fmt::Debug for Net {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Net(connect {:?}, listen {:?})", self.connect, self.listen)
+    }
+}
