@@ -76,6 +76,8 @@ pub struct Effect {
     pub target: String,
     /// `running`, `ok` or `error`.
     pub status: String,
+    /// When it started (ms since the epoch), when the kernel said.
+    pub started_ms: Option<u64>,
     pub ms: Option<u64>,
     pub detail: String,
     pub value: Arc<Value>,
@@ -97,6 +99,7 @@ impl Detail {
                     done: e.done.clone(),
                     target: e.target.clone(),
                     status: e.status.clone(),
+                    started_ms: e.started_ms,
                     ms: e.ms,
                     detail: e.detail.clone(),
                     value: Arc::new(e.value.clone()),
@@ -116,6 +119,10 @@ pub struct Transcript {
     pub items: Vec<Item>,
     /// A turn is in flight.
     pub busy: bool,
+    /// When the turn in flight began, and when its newest item (a block, a call, a message) began (ms since the epoch,
+    /// the events' own stamps): how long it and its current step have run. None outside a turn.
+    pub turn_since: Option<u64>,
+    pub step_since: Option<u64>,
     pub agent: String,
     pub model: String,
     /// The reasoning effort it runs with; empty when its `session` event did not say.
@@ -237,6 +244,14 @@ impl Transcript {
     /// One event.
     pub fn apply(&mut self, e: &Event) {
         self.rev = self.rev.wrapping_add(1);
+        let had = self.items.len();
+        self.apply_body(e);
+        if self.items.len() != had {
+            self.step_since = Some(e.ts);
+        }
+    }
+
+    fn apply_body(&mut self, e: &Event) {
         match &e.body {
             Body::Session { agent, model, session_id, effort } => {
                 self.agent.clone_from(agent);
@@ -266,7 +281,14 @@ impl Transcript {
                 }
                 self.push("", Item::User { text: text.clone(), images: images.clone() });
             }
-            Body::Busy { busy } => self.busy = *busy,
+            Body::Busy { busy } => {
+                if *busy && !self.busy {
+                    self.turn_since = Some(e.ts);
+                } else if !*busy {
+                    (self.turn_since, self.step_since) = (None, None);
+                }
+                self.busy = *busy;
+            }
             Body::BlockStart { block, kind } => {
                 let item = match kind {
                     Kind::Thinking => Item::Thinking { block: block.clone(), text: String::new(), done: false },
