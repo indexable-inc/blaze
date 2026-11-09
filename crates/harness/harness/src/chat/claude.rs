@@ -19,6 +19,16 @@ use harness_proto::event::{Body, ContextCall, ContextUse, Kind, ModelChoice};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
+/// The content block that gives Claude the picture at `path`: its bytes, base64, under the media type its header names.
+/// A picture that cannot be read by now (the daemon checked it as the message came) is a text block saying so, naming it.
+fn image_block(path: &str) -> Value {
+    use base64::Engine as _;
+    match std::fs::read(path).map_err(|e| e.to_string()).and_then(|b| super::picture_type(&b).map(|t| (t, b)).ok_or_else(|| "not a PNG, JPEG, GIF or WebP picture".to_owned())) {
+        Ok((media, bytes)) => json!({"type": "image", "source": {"type": "base64", "media_type": media, "data": base64::engine::general_purpose::STANDARD.encode(bytes)}}),
+        Err(e) => json!({"type": "text", "text": format!("[the picture at {path} could not be sent: {e}]")}),
+    }
+}
+
 /// What `claude` needs, before the profile's flags, to speak stream-json on stdin and stdout.
 pub const ARGS: &[&str] =
     &["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages"];
@@ -402,8 +412,13 @@ impl super::Adapter for Claude {
         std::mem::take(&mut self.out)
     }
 
-    fn user(&mut self, text: &str) -> Vec<String> {
-        vec![json!({"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": text}]}}).to_string()]
+    fn user(&mut self, text: &str, images: &[String]) -> Vec<String> {
+        // Each picture before the words, as Claude Code's own paste puts them: an image block of its bytes.
+        let mut content: Vec<Value> = images.iter().map(|p| image_block(p)).collect();
+        if !text.is_empty() || content.is_empty() {
+            content.push(json!({"type": "text", "text": text}));
+        }
+        vec![json!({"type": "user", "message": {"role": "user", "content": content}}).to_string()]
     }
 
     fn interrupt(&mut self) -> Vec<String> {
@@ -423,5 +438,36 @@ impl super::Adapter for Claude {
             lines.push(self.ask(json!({"subtype": "apply_flag_settings", "settings": {"effortLevel": e}}), Asked::Effort(e.to_owned())));
         }
         Ok(lines)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chat::Adapter;
+
+    /// A message with a picture is one user line whose content is the picture's bytes as an image block, then the words.
+    #[test]
+    fn a_picture_rides_as_an_image_block() {
+        let dir = std::env::temp_dir().join(format!("harness-claude-image-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("shot.png");
+        let bytes = b"\x89PNG\r\n\x1a\nrest of the picture";
+        std::fs::write(&png, bytes).unwrap();
+        let path = png.to_string_lossy().into_owned();
+        let lines = Claude::default().user("what is this?", std::slice::from_ref(&path));
+        let v: Value = serde_json::from_str(&lines[0]).unwrap();
+        let content = &v["message"]["content"];
+        assert_eq!(content[0]["type"], "image");
+        assert_eq!(content[0]["source"]["media_type"], "image/png");
+        use base64::Engine as _;
+        assert_eq!(content[0]["source"]["data"], base64::engine::general_purpose::STANDARD.encode(bytes));
+        assert_eq!(content[1], json!({"type": "text", "text": "what is this?"}));
+        // A picture gone by the time it is sent says so, naming it, rather than vanishing from the message.
+        std::fs::remove_file(&png).unwrap();
+        let gone: Value = serde_json::from_str(&Claude::default().user("", std::slice::from_ref(&path))[0]).unwrap();
+        assert!(gone["message"]["content"][0]["text"].as_str().unwrap().contains(&path));
+        assert_eq!(gone["message"]["content"].as_array().unwrap().len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

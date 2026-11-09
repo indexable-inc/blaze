@@ -1970,6 +1970,8 @@ impl App {
                 self.chat_pick_spawn(rest);
             } else if let Some(rest) = a.strip_prefix("chat:mention:") {
                 self.chat_mention_action(rest);
+            } else if let Some(rest) = a.strip_prefix("chat:unattach:") {
+                self.chat_unattach(rest);
             } else if let Some(rest) = a.strip_prefix("chat:row:") {
                 self.chat_row_toggle(rest);
             } else if let Some(ev) = a.strip_prefix("ui:") {

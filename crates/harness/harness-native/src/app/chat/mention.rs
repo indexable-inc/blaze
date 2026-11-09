@@ -285,7 +285,7 @@ enum Preview {
 }
 
 /// The pixel size of the PNG or JPEG at `path` from its header, without decoding it (None for any other file).
-fn image_size(path: &str) -> Option<(u32, u32)> {
+pub(super) fn image_size(path: &str) -> Option<(u32, u32)> {
     use std::io::Read;
     let lower = path.to_lowercase();
     let png = lower.ends_with(".png");

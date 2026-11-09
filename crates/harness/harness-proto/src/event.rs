@@ -53,8 +53,13 @@ pub enum Body {
     },
     /// How much of the model's context window the conversation fills, after a turn.
     Context(ContextUse),
-    /// The person's message (written by the daemon as it sends it).
-    User { text: String },
+    /// The person's message (written by the daemon as it sends it): its words and the pictures sent with it (absolute
+    /// paths of PNG or JPEG files, a pasted picture's as the app saved it).
+    User {
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<String>,
+    },
     /// A turn started (true) or ended (false).
     Busy { busy: bool },
     /// A block began streaming (partial).
@@ -279,7 +284,7 @@ impl Event {
                 window: v["window"].as_u64().unwrap_or(0),
                 ..ContextUse::default()
             }),
-            "user" => Body::User { text: s("text") },
+            "user" => Body::User { text: s("text"), images: Vec::new() },
             "busy" => Body::Busy { busy: v["busy"].as_bool().unwrap_or(false) },
             "block_start" => Body::BlockStart { block: block(), kind: kind() },
             "delta" => Body::Delta { block: block(), text: s("text") },

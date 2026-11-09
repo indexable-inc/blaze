@@ -27,6 +27,15 @@ use harness_proto::event::{Body, ContextCall, ContextUse, Kind, ModelChoice};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 
+/// A message's `turn/start` input: each picture as a `localImage` (Codex reads the file), then the words.
+fn input_items(text: &str, images: &[String]) -> Value {
+    let mut items: Vec<Value> = images.iter().map(|p| json!({"type": "localImage", "path": p})).collect();
+    if !text.is_empty() || items.is_empty() {
+        items.push(json!({"type": "text", "text": text, "text_elements": []}));
+    }
+    Value::Array(items)
+}
+
 /// Notifications this client never reads, asked off at initialize so the raw record stays small.
 const OPT_OUT: &[&str] = &[
     "turn/moderationMetadata",
@@ -78,7 +87,7 @@ pub struct Codex {
     turn: Option<String>,
     /// An interrupt asked for before the turn started.
     interrupt_pending: bool,
-    queue: VecDeque<String>,
+    queue: VecDeque<(String, Vec<String>)>,
     out: Vec<String>,
     open: HashMap<String, Open>,
     seq: u64,
@@ -162,13 +171,13 @@ impl Codex {
         json!({"id": id, "method": method, "params": params}).to_string()
     }
 
-    fn turn_start(&mut self, text: &str) -> String {
+    fn turn_start(&mut self, text: &str, images: &[String]) -> String {
         self.in_turn = true;
         self.turn = None;
         let thread = self.thread.clone().unwrap_or_default();
         let mut params = json!({
             "threadId": thread,
-            "input": [{"type": "text", "text": text, "text_elements": []}],
+            "input": input_items(text, images),
             "summary": "auto",
         });
         if let Some(m) = &self.model {
@@ -183,8 +192,8 @@ impl Codex {
     /// Start the next waiting message's turn, when the thread can take one.
     fn pump(&mut self) {
         if self.thread.is_some() && !self.in_turn {
-            if let Some(text) = self.queue.pop_front() {
-                let line = self.turn_start(&text);
+            if let Some((text, images)) = self.queue.pop_front() {
+                let line = self.turn_start(&text, &images);
                 self.out.push(line);
             }
         }
@@ -655,13 +664,13 @@ impl super::Adapter for Codex {
         std::mem::take(&mut self.out)
     }
 
-    fn user(&mut self, text: &str) -> Vec<String> {
+    fn user(&mut self, text: &str, images: &[String]) -> Vec<String> {
         if self.dead {
             // The thread never started, so nothing would answer (the error said why); the turn ends when Codex exits.
             return Vec::new();
         }
         self.ledger.user(text);
-        self.queue.push_back(text.to_owned());
+        self.queue.push_back((text.to_owned(), images.to_vec()));
         self.pump();
         std::mem::take(&mut self.out)
     }

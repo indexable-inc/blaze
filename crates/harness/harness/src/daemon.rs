@@ -222,11 +222,13 @@ impl Session {
         }
     }
 
-    /// A chat session's message: its user lines to the agent (Err: not a chat session).
-    pub fn chat_send(&self, text: &str) -> Result<()> {
+    /// A chat session's message, its words and the pictures at `images`: its user lines to the agent (Err: not a chat
+    /// session, or one of `images` is not a picture an agent takes).
+    pub fn chat_send(&self, text: &str, images: &[String]) -> Result<()> {
         let c = self.chat.as_ref().ok_or_else(|| anyhow!("session {} is not a chat session", self.id))?;
+        chat::check_pictures(images).with_context(|| format!("sending to chat s{}", self.id))?;
         let untitled = c.title().is_empty();
-        let lines = c.user_lines(text, &self.tx);
+        let lines = c.user_lines(text, images, &self.tx);
         if untitled && !c.title().is_empty() {
             // The index keeps the title, so `list` names a past chat without reading its log.
             db::set_meta(&format!("s{}", self.id), "title", &json!(c.title()));
@@ -508,7 +510,7 @@ impl Daemon {
         self.start_agent(&session, &launch, adapter, env)?;
         changed();
         if let Some(p) = prompt.filter(|p| !p.trim().is_empty()) {
-            session.chat_send(p)?;
+            session.chat_send(p, &[])?;
         }
         eprintln!("spawned chat session {id}: {kind} (parent {parent:?})");
         Ok(id)
@@ -599,7 +601,7 @@ impl Daemon {
     }
 
     /// A message to chat `s`: sent to its agent, which is resumed first when it is not running.
-    fn chat_send(self: &Arc<Self>, s: &Arc<Session>, text: &str) -> Result<()> {
+    fn chat_send(self: &Arc<Self>, s: &Arc<Session>, text: &str, images: &[String]) -> Result<()> {
         {
             let _one = s.resuming.lock();
             if s.ended.lock().is_some() {
@@ -612,7 +614,7 @@ impl Daemon {
                 }
             }
         }
-        s.chat_send(text)
+        s.chat_send(text, images)
     }
 
     /// Start chat `s`'s agent again on its log, continuing its conversation by the agent's own id for it (from the log):
@@ -755,12 +757,15 @@ impl Daemon {
                 let id = self.spawn_full(&kind, &args, parent, cwd, prompt.as_deref(), name, &BTreeMap::new(), cols.unwrap_or(120), rows.unwrap_or(40), choice)?;
                 Reply::Spawned { id }
             }
-            Req::Send { id, text, raw, submit } => {
+            Req::Send { id, text, raw, submit, images } => {
                 let s = self.get(id)?;
+                if !images.is_empty() && (raw || s.chat.is_none()) {
+                    anyhow::bail!("session {id} takes no pictures: only a chat message carries them");
+                }
                 if raw {
                     s.write(text.as_bytes())?;
                 } else if s.chat.is_some() {
-                    self.chat_send(&s, &text)?;
+                    self.chat_send(&s, &text, &images)?;
                 } else {
                     crate::inject::send(&s, &text, submit.unwrap_or(true))?;
                 }
