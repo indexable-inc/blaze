@@ -272,6 +272,13 @@ key {
   tree_down { Keybind: {key: "down"}
     (Does, act.TreeDown)
     (When, ctx.Tree) }
+  // Control-P and Control-N as up and down (emacs's, as in every macOS list); never in a terminal, whose shell has them.
+  tree_ctrl_p { Keybind: {key: "p", ctrl: 1}
+    (Does, act.TreeUp)
+    (When, ctx.Tree) }
+  tree_ctrl_n { Keybind: {key: "n", ctrl: 1}
+    (Does, act.TreeDown)
+    (When, ctx.Tree) }
   tree_fold { Keybind: {key: "left"}
     (Does, act.TreeFold)
     (When, ctx.Tree) }
@@ -300,6 +307,13 @@ key {
   palette_down { Keybind: {key: "down"}
     (Does, act.PaletteDown)
     (When, ctx.Palette) }
+  // Control-P and Control-N as up and down (emacs's, as in every macOS list); never in a terminal, whose shell has them.
+  palette_ctrl_p { Keybind: {key: "p", ctrl: 1}
+    (Does, act.PaletteUp)
+    (When, ctx.Palette) }
+  palette_ctrl_n { Keybind: {key: "n", ctrl: 1}
+    (Does, act.PaletteDown)
+    (When, ctx.Palette) }
   palette_return { Keybind: {key: "return"}
     (Does, act.PaletteRun)
     (When, ctx.Palette) }
@@ -319,6 +333,13 @@ key {
     (Does, act.PaletteUp)
     (When, ctx.Picker) }
   picker_down { Keybind: {key: "down"}
+    (Does, act.PaletteDown)
+    (When, ctx.Picker) }
+  // Control-P and Control-N as up and down (emacs's, as in every macOS list); never in a terminal, whose shell has them.
+  picker_ctrl_p { Keybind: {key: "p", ctrl: 1}
+    (Does, act.PaletteUp)
+    (When, ctx.Picker) }
+  picker_ctrl_n { Keybind: {key: "n", ctrl: 1}
     (Does, act.PaletteDown)
     (When, ctx.Picker) }
   picker_tab { Keybind: {key: "tab"}
@@ -410,6 +431,8 @@ key {
   chat_right { Keybind: {key: "right"}; (Does, act.ChatRight); (When, ctx.Chat) }
   chat_up { Keybind: {key: "up"}; (Does, act.ChatUp); (When, ctx.Chat) }
   chat_down { Keybind: {key: "down"}; (Does, act.ChatDown); (When, ctx.Chat) }
+  chat_ctrl_p { Keybind: {key: "p", ctrl: 1}; (Does, act.ChatUp); (When, ctx.Chat) }
+  chat_ctrl_n { Keybind: {key: "n", ctrl: 1}; (Does, act.ChatDown); (When, ctx.Chat) }
   chat_word_left { Keybind: {key: "left", opt: 1}; (Does, act.ChatWordLeft); (When, ctx.Chat) }
   chat_word_right { Keybind: {key: "right", opt: 1}; (Does, act.ChatWordRight); (When, ctx.Chat) }
   chat_line_start { Keybind: {key: "left", cmd: 1}; (Does, act.ChatLineStart); (When, ctx.Chat) }
