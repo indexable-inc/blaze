@@ -857,6 +857,8 @@ pub struct PickNav {
     error: Option<String>,
     slider: Option<u64>,
     efforts: Vec<String>,
+    /// The highlight has been put on the model the chat runs, once per opening (so keys start from it).
+    seeded: bool,
 }
 
 /// A model in the picker's menu: its name, its version (`meta`), the line about it (`detail`), whether the chat runs it,
@@ -953,11 +955,25 @@ fn model_rows(w: WorldRef<'_>, list: View<'_>, c: &MenuCtx<'_>, hovered: Option<
         Some(e) => std::iter::once(Entry::Note(e.clone())).chain(rows).collect(),
         None => rows,
     };
+    // The highlight and the pointer's row are kept by what they pick, not by index: the rows are rebuilt as things are
+    // typed, an error clears or the list arrives, and an index would land on another model beside the running one's tick.
+    let at = |i: Option<usize>, picks: &[Option<String>]| i.and_then(|i| picks.get(i).cloned().flatten());
+    let (was_hot, was_pointer) = (at(nav.search.nav.hot, &nav.picks), at(nav.search.nav.pointer_at(), &nav.picks));
     nav.picks.clear();
     nav.picks.extend(rows.iter().map(|r| match r {
         Entry::Item { data, .. } => Some(data.action.clone()),
         _ => None,
     }));
+    let find = |a: Option<String>| a.and_then(|a| nav.picks.iter().position(|p| p.as_ref() == Some(&a)));
+    let (hot, pointer) = (find(was_hot), find(was_pointer));
+    nav.search.nav.retarget(hot, pointer);
+    // Opened with nothing typed: the highlight starts on the model the chat runs (one row lit, the one ticked).
+    if !nav.seeded && !rows.is_empty() {
+        nav.seeded = true;
+        if nav.search.query.is_empty() && nav.search.nav.hot.is_none() {
+            nav.search.nav.retarget(rows.iter().position(|r| matches!(r, Entry::Item { data: Choice { on: true, .. }, .. })), None);
+        }
+    }
     let picks = &nav.picks;
     nav.search.first(picks.len(), |i| picks[i].is_some());
     search::show(list, &nav.search.query, "Search models");
@@ -983,6 +999,7 @@ fn model_rows(w: WorldRef<'_>, list: View<'_>, c: &MenuCtx<'_>, hovered: Option<
     });
     view::for_each_of(items, keyed, |v, (i, r), _| match r {
         Entry::Head(s) => {
+            harness_native_ui_view::menu::light(v.entity(), false);
             if let Some(l) = v.part("label") {
                 l.text(s);
             }
@@ -991,6 +1008,7 @@ fn model_rows(w: WorldRef<'_>, list: View<'_>, c: &MenuCtx<'_>, hovered: Option<
             }
         }
         Entry::Note(s) => {
+            harness_native_ui_view::menu::light(v.entity(), false);
             if let Some(l) = v.part("label") {
                 l.text(s);
             }
@@ -1005,7 +1023,7 @@ fn model_rows(w: WorldRef<'_>, list: View<'_>, c: &MenuCtx<'_>, hovered: Option<
                 m.text(&c.meta);
             }
         }
-        Entry::Sep => {}
+        Entry::Sep => harness_native_ui_view::menu::light(v.entity(), false),
     });
     // The line about the highlighted model, else the chat's own, whole under the list.
     let detail = match hot.and_then(|i| rows.get(i)) {
