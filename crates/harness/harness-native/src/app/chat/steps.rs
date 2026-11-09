@@ -149,7 +149,7 @@ fn doing(d: &Detail) -> Option<String> {
     if d.status != "running" {
         return None;
     }
-    Some(d.effects.iter().rev().find(|e| e.status == "running").map_or_else(|| "Running\u{2026}".to_owned(), |e| format!("{}\u{2026}", e.doing)))
+    Some(d.effects.iter().rev().find(|e| e.status == "running").map_or_else(|| "Running code\u{2026}".to_owned(), |e| format!("{}\u{2026}", e.doing)))
 }
 
 /// A turn's one line, all its steps folded under it (only its last answer shows beside it): what one of its `calls` is
@@ -407,6 +407,16 @@ fn results(v: &Value) -> Vec<(String, Vec<view::table::Result>, usize)> {
         last.2 += total.saturating_sub(rows.len());
     }
     groups
+}
+
+/// A step's kind, as `hn.StepKind` names its glyph (the composer's activity cards list steps by it too).
+pub(super) fn effect_kind(e: &model::chat::Effect) -> &'static str {
+    kind_of(Act::of_effect(&e.kind))
+}
+
+/// The glyph `hn.StepKind.<kind>` draws.
+pub(super) fn kind_glyph(world: WorldRef<'_>, kind: &str) -> String {
+    glyph(world, kind)
 }
 
 /// The glyph `hn.StepKind.<kind>` draws.

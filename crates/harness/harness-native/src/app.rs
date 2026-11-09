@@ -2426,7 +2426,7 @@ fn doing_of(t: &model::chat::Transcript) -> Option<Doing> {
                 let host = url.split("://").nth(1).and_then(|r| r.split('/').next()).map_or_else(|| s("query"), str::to_owned);
                 Doing { glyph: "\u{EB01}", what: "On the web", detail: host }
             } else if n.contains("task") || n.contains("agent") {
-                Doing { glyph: "\u{EC10}", what: "Running a sub-agent", detail: s("description") }
+                Doing { glyph: "\u{EA67}", what: "Running a sub-agent", detail: s("description") }
             } else {
                 Doing { glyph: "\u{EB6D}", what: "Using a tool", detail: name.rsplit("__").next().unwrap_or(name).to_owned() }
             }

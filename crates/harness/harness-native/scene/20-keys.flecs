@@ -27,7 +27,7 @@ ctx {
   // The new-object picker (File > New…) while it is open.
   Picker {}
   Archive {}
-  // A chat pane has the keyboard: keys edit its input (macOS text editing), Return sends, Escape interrupts.
+  // A chat pane has the keyboard: keys edit its input (macOS text editing), Return sends, Escape or Cmd+. interrupts.
   Chat {}
   // A harness browser view has the keyboard (the pane, or a card clicked into: BrowserFocus, src/app/browser.rs): keys
   // no binding here takes go to the page.
@@ -427,6 +427,8 @@ key {
   chat_newline_opt { Keybind: {key: "return", opt: 1}; (Does, act.ChatNewline); (When, ctx.Chat) }
   chat_interrupt { Keybind: {key: "escape"}; (Does, act.ChatInterrupt); (When, ctx.Chat) }
   chat_interrupt_ctrl { Keybind: {key: "c", ctrl: 1}; (Does, act.ChatInterrupt); (When, ctx.Chat) }
+  // Cmd+. stops the turn too (macOS's cancel); the composer's hint names Escape and this one while a turn runs.
+  chat_interrupt_cmd { Keybind: {key: ".", cmd: 1}; (Does, act.ChatInterrupt); (When, ctx.Chat) }
   chat_left { Keybind: {key: "left"}; (Does, act.ChatLeft); (When, ctx.Chat) }
   chat_right { Keybind: {key: "right"}; (Does, act.ChatRight); (When, ctx.Chat) }
   chat_up { Keybind: {key: "up"}; (Does, act.ChatUp); (When, ctx.Chat) }

@@ -42,13 +42,19 @@ pub struct Sweep {
 
 /// A part shown only while row `row` is hovered (its opacity the row's hover spring), or with `away` only while it is not
 /// (what a hover-only part takes the place of), or always when `keep`. Row 0: the part's nearest ancestor with a row's
-/// hover look (what a scene template writes: it cannot name its instance's id).
+/// hover look or a [`HoverGroup`] (what a scene template writes: it cannot name its instance's id).
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct HoverShow {
     pub row: u64,
     pub keep: bool,
     pub away: bool,
 }
+
+/// What a [`HoverShow`] part of row 0 counts as its row besides a node with a hover look: a group with no wash of its own
+/// (a pasted picture, whose remove button shows only while the pointer is on it; a sent message's row, its steps button).
+/// Its host gives it a `HoverAmt`, which the Hover system steps.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct HoverGroup;
 
 /// A disclosure chevron: whether what it discloses is open. Its turn (0 closed, 1 open: a quarter turn) is the `Fold`
 /// spring on the same entity.
@@ -121,6 +127,7 @@ pub fn register(world: &World) {
     // The row templates (scene/widgets/rows.flecs) set these.
     world.component::<Breath>().writable();
     world.component::<HoverShow>().writable();
+    world.component::<HoverGroup>();
     world.component::<Disclose>().writable();
     world.component::<ShowAfter>().writable();
     world.component::<Sweep>().writable();
@@ -280,7 +287,7 @@ pub fn alpha(w: WorldRef<'_>, e: EntityView<'_>) -> f32 {
         let amt = if h.row == 0 {
             std::iter::successors(e.parent(), |n| n.parent())
                 .take(4)
-                .find(|n| n.has(HoverLook::id()))
+                .find(|n| n.has(HoverLook::id()) || n.has(HoverGroup::id()))
                 .and_then(|n| n.try_cloned::<&HoverAmt>())
         } else {
             w.entity_from_id(h.row).try_cloned::<&HoverAmt>()
@@ -326,7 +333,7 @@ pub fn breathing(w: WorldRef<'_>) -> bool {
 /// A kind's icon: an SF Symbols–like codicon of the bundled Symbols Nerd Font.
 pub fn kind_icon(kind: &str) -> &'static str {
     match kind {
-        "claude" => "\u{EC10}",  // cod-sparkle
+        "claude" => "\u{EA67}",  // cod-person: an agent, one weight (no "AI" sparkle)
         "codex" => "\u{EC81}",   // cod-openai
         "cursor" => "\u{F01BF}", // md-cursor_default_outline
         "shell" => "\u{EA85}",   // cod-terminal
