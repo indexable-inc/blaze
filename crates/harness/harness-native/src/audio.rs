@@ -239,6 +239,8 @@ pub fn start(level: f32, music: bool, cues: Vec<Cue>, themes: Vec<Tune>) -> Resu
                     l.themes.insert(name, Arc::new(Music { every, notes })); // alloc: the library, kept for the process
                 }
             }
+            // Everything is rendered: one bell says the sound is ready.
+            cue("ready");
         })
         .map_err(|e| format!("the sound thread: {e}"))?;
     Ok(())

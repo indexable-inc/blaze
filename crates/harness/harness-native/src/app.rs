@@ -1734,59 +1734,12 @@ impl App {
     /// # Errors
     /// The scene's sound is malformed (named), or the system refused the output.
     pub fn start_sound(&self) -> Result<(), String> {
-        use harness_native_blaze::sound::{Note, Voice as V};
-        use harness_native_ui_timeline_api::{Gain, Lasts, Onset, Pan, Pitch, Sound, Voice};
         let on = |k: &str| crate::prefs::get(k).and_then(|v| v.as_bool()).unwrap_or(true);
         if !on("sound") {
             return Ok(());
         }
-        let w = self.world.world_ref();
-        let at = |path: &str| w.try_lookup(path).ok_or_else(|| format!("the scene has no {path} (scene/widgets/sound.flecs)"));
-        let voice = |v: Voice| match v {
-            Voice::Bell => V::Bell,
-            Voice::Mallet => V::Mallet,
-            Voice::Bass => V::Bass,
-            Voice::Click => V::Click,
-            Voice::Thud => V::Thud,
-            Voice::Whoosh => V::Whoosh,
-            Voice::Fire => V::Fire,
-        };
-        let gain = |e: EntityView<'_>| e.try_cloned::<&Gain>().map_or(0.0, |g| g.amp);
-        let lasts = |e: EntityView<'_>| e.try_cloned::<&Lasts>().map_or(0.0, |l| l.dur);
-        let key = at("hn::sound::key")?.try_cloned::<&Pitch>().map(|p| p.hz).filter(|hz| *hz > 0.0).ok_or("hn.sound.key has no Pitch")?;
-        let mut cues = Vec::new(); // alloc: the scene's sounds, read once
-        at("hn::sound::cue")?.each_child(|c| {
-            let mut notes = Vec::new();
-            c.each_child(|n| {
-                if let (Some(s), Some(o)) = (n.try_cloned::<&Sound>(), n.try_cloned::<&Onset>()) {
-                    let Pan { pos, sweep } = n.try_cloned::<&Pan>().unwrap_or_default();
-                    let freq = n.try_cloned::<&Pitch>().map_or(0.0, |p| p.hz);
-                    notes.push(Note { voice: voice(s.voice), at: o.at.max(0.0), dur: lasts(n), freq, amp: gain(n), pan: pos.clamp(-1.0, 1.0), sweep });
-                }
-            });
-            notes.sort_by(|a, b| a.at.total_cmp(&b.at));
-            cues.push(crate::audio::Cue(c.name(), gain(c), notes));
-        });
-        let mut themes = Vec::new(); // alloc: the scene's themes, read once
-        let mut bad = None;
-        at("hn::sound::theme")?.each_child(|t| {
-            let (Some(th), Some(s)) = (t.try_cloned::<&crate::audio::Theme>(), t.try_cloned::<&Sound>()) else { return };
-            let degrees: Result<Vec<f32>, _> = th.degrees.as_str().split_whitespace().map(str::parse::<f32>).collect();
-            match degrees {
-                Ok(mut d) if !d.is_empty() && th.every > 0.0 => {
-                    d.sort_by(f32::total_cmp);
-                    let notes = d.iter().map(|semi| Note { voice: voice(s.voice), at: 0.0, dur: lasts(t), freq: key * 2f32.powf(semi / 12.0), amp: 0.05, pan: 0.0, sweep: 0.0 }).collect();
-                    themes.push(crate::audio::Tune(t.name(), th.every, gain(t), notes));
-                }
-                _ => bad = Some(format!("{}: Theme needs every > 0 and degrees as numbers in words (\"0 7 12\"), not {:?}", t.path(), th.degrees.as_str())),
-            }
-        });
-        if let Some(e) = bad {
-            return Err(e);
-        }
-        cues.sort_by(|a, b| a.0.cmp(&b.0));
-        themes.sort_by(|a, b| a.0.cmp(&b.0));
-        crate::audio::start(gain(at("hn::sound")?), on("music"), cues, themes)
+        let (level, cues, themes) = scene_sound(self.world.world_ref())?;
+        crate::audio::start(level, on("music"), cues, themes)
     }
 
     /// The agent kind cmd+N starts a chat of: the one last used (here, else native.json `chat_kind`), else the picker's
@@ -2733,6 +2686,61 @@ fn set_if(v: View<'_>, fill: Fill) {
     }
 }
 
+/// The scene's sound (`hn.sound`, scene/widgets/sound.flecs): its master level, its cues and its themes.
+///
+/// # Errors
+/// A part of it is missing or malformed, named.
+fn scene_sound(w: WorldRef<'_>) -> Result<(f32, Vec<crate::audio::Cue>, Vec<crate::audio::Tune>), String> {
+    use harness_native_blaze::sound::{Note, Voice as V};
+    use harness_native_ui_timeline_api::{Gain, Lasts, Onset, Pan, Pitch, Sound, Voice};
+    let at = |path: &str| w.try_lookup(path).ok_or_else(|| format!("the scene has no {path} (scene/widgets/sound.flecs)"));
+    let voice = |v: Voice| match v {
+        Voice::Bell => V::Bell,
+        Voice::Mallet => V::Mallet,
+        Voice::Bass => V::Bass,
+        Voice::Click => V::Click,
+        Voice::Thud => V::Thud,
+        Voice::Whoosh => V::Whoosh,
+        Voice::Fire => V::Fire,
+    };
+    let gain = |e: EntityView<'_>| e.try_cloned::<&Gain>().map_or(0.0, |g| g.amp);
+    let lasts = |e: EntityView<'_>| e.try_cloned::<&Lasts>().map_or(0.0, |l| l.dur);
+    let key = at("hn::sound::key")?.try_cloned::<&Pitch>().map(|p| p.hz).filter(|hz| *hz > 0.0).ok_or("hn.sound.key has no Pitch")?;
+    let mut cues = Vec::new(); // alloc: the scene's sounds, read once
+    at("hn::sound::cue")?.each_child(|c| {
+        let mut notes = Vec::new();
+        c.each_child(|n| {
+            if let (Some(s), Some(o)) = (n.try_cloned::<&Sound>(), n.try_cloned::<&Onset>()) {
+                let Pan { pos, sweep } = n.try_cloned::<&Pan>().unwrap_or_default();
+                let freq = n.try_cloned::<&Pitch>().map_or(0.0, |p| p.hz);
+                notes.push(Note { voice: voice(s.voice), at: o.at.max(0.0), dur: lasts(n), freq, amp: gain(n), pan: pos.clamp(-1.0, 1.0), sweep });
+            }
+        });
+        notes.sort_by(|a, b| a.at.total_cmp(&b.at));
+        cues.push(crate::audio::Cue(c.name(), gain(c), notes));
+    });
+    let mut themes = Vec::new(); // alloc: the scene's themes, read once
+    let mut bad = None;
+    at("hn::sound::theme")?.each_child(|t| {
+        let (Some(th), Some(s)) = (t.try_cloned::<&crate::audio::Theme>(), t.try_cloned::<&Sound>()) else { return };
+        let degrees: Result<Vec<f32>, _> = th.degrees.as_str().split_whitespace().map(str::parse::<f32>).collect();
+        match degrees {
+            Ok(mut d) if !d.is_empty() && th.every > 0.0 => {
+                d.sort_by(f32::total_cmp);
+                let notes = d.iter().map(|semi| Note { voice: voice(s.voice), at: 0.0, dur: lasts(t), freq: key * 2f32.powf(semi / 12.0), amp: 0.05, pan: 0.0, sweep: 0.0 }).collect();
+                themes.push(crate::audio::Tune(t.name(), th.every, gain(t), notes));
+            }
+            _ => bad = Some(format!("{}: Theme needs every > 0 and degrees as numbers in words (\"0 7 12\"), not {:?}", t.path(), th.degrees.as_str())),
+        }
+    });
+    if let Some(e) = bad {
+        return Err(e);
+    }
+    cues.sort_by(|a, b| a.0.cmp(&b.0));
+    themes.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok((gain(at("hn::sound")?), cues, themes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2850,6 +2858,19 @@ mod tests {
         frame(z);
         frame(z);
         assert!((drawn(pill).y - laid(rows[2]).y).abs() > 1.0, "a selection still slides");
+    }
+
+    /// The scene's sound reads whole: every step item has a cue and a theme, each with notes, and `ready` and `done` ring.
+    #[test]
+    fn the_scenes_sound_reads() {
+        let world = scene_world().unwrap_or_else(|e| panic!("{e}"));
+        let (level, cues, themes) = scene_sound(world.world_ref()).unwrap_or_else(|e| panic!("{e}"));
+        assert!(level > 0.0);
+        for item in ["exec", "read", "edit", "search", "net", "build", "spawn", "wait", "sql", "think"] {
+            assert!(cues.iter().any(|c| c.0 == item && c.1 > 0.0 && !c.2.is_empty()), "no cue for {item}");
+            assert!(themes.iter().any(|t| t.0 == item && t.1 > 0.0 && t.2 > 0.0 && t.3.len() >= 2), "no theme for {item}");
+        }
+        assert!(["ready", "done"].iter().all(|n| cues.iter().any(|c| c.0 == *n && !c.2.is_empty())));
     }
 
     /// Every scene script loads, headless (no window, Metal or daemon): the tokens, the primitives, the harness scene and
