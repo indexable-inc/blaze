@@ -108,10 +108,11 @@ pub fn const_block_is_comptime(db: &Db, owner: ExpressionStoreOwnerId, expr: Exp
     matches!(syntax.peel_parens(), ast::Expr::BlockExpr(block) if block.is_comptime())
 }
 
-/// Whether `konst` is a `const static { .. }` block ([`const_block_is_comptime`]).
+/// Whether `konst` is a `const static { .. }` block ([`const_block_is_comptime`]): an inline
+/// const of a body, or the whole of an array length or const argument written as one.
 pub fn anon_const_is_comptime(db: &Db, konst: AnonConstId<'_>) -> bool {
     let loc = konst.loc(db);
-    konst.is_inline_const(db) && const_block_is_comptime(db, loc.owner, loc.expr)
+    const_block_is_comptime(db, loc.owner, loc.expr)
 }
 
 /// Whether a call in a const context of `krate` through a function pointer or a `dyn` method
