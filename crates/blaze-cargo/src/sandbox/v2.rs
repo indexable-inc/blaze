@@ -30,7 +30,7 @@
 //! environment, as it would with no sandbox, and the visible names ([`VISIBLE`]): running it is
 //! no read by this process. The child's interposer lends itself the rest when its executable
 //! proves std alone walks its environment (the linker's export `__blaze_std_says_walks`, link's
-//! part of `docs/v2/requests/usercode.md` item 6); a child without it (a C compiler, a shell,
+//! part of `fed1eb428d:docs/v2/requests/usercode.md` item 6); a child without it (a C compiler, a shell,
 //! which imports its environment through `main`'s `envp`) notes `E\t<scope>\t* <why>` as it
 //! loads. A child the interposer can't load in (a static program, one macOS protects) is the
 //! record's `X` line, as before: the run is not whole and is keyed as cargo keys it.

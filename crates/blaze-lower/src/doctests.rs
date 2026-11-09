@@ -1,4 +1,4 @@
-//! A library's doctests in the front end (docs/v2/plan/doctests.md): each example's program,
+//! A library's doctests in the front end (docs/v2/plan/design/doctests.md): each example's program,
 //! and the runner that runs them, is a crate of its own, made from the library's `Doctest`
 //! unit by [`Lowered::doctests`] on the loop's writer. An example's crate is what rustdoc
 //! compiles it as: a binary named `rust_out`, of its own edition, with the library's

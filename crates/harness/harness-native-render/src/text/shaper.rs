@@ -2,7 +2,7 @@
 //! shaping, `trak`), ICU4X (line and grapheme breaks, scripts, emoji presentation) and unicode-bidi (UAX #9). What it
 //! asks of the platform is [`FontSource`] (text/font.rs; CoreText on macOS, fontdb and skrifa on Linux): a font's data,
 //! at the variation the system sets it at (its optical size the point size unless something else is asked for), each
-//! glyph's advance, and the font a character a font lacks falls back to (docs/research/text-shaping.md).
+//! glyph's advance, and the font a character a font lacks falls back to (fed1eb428d:docs/research/text-shaping.md).
 //!
 //! A text is shaped whole to measure where its lines break, and each line is shaped again on its own.
 use super::font::{Font as SystemFont, FontSource};

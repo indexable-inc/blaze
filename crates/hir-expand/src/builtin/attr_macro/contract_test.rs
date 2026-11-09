@@ -1,5 +1,5 @@
 //! `#[blaze::contract_test]`, the builtin attribute `core::blaze::contract_test`
-//! (docs/v2/plan/lanes/contracts.md, part 2): a property test of a function's native contract
+//! (docs/v2/plan/design/contracts.md, part 2): a property test of a function's native contract
 //! clauses (`requires`, `ensures`, `#![feature(blaze_verify)]`), generated next to it.
 //!
 //! The function stays as written, and an ordinary test follows it:

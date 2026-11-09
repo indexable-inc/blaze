@@ -41,7 +41,7 @@ serde_json.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
 
 # One fixture crate of many bodies, one body edited at a time: the time to check the crate
-# again against the bound (docs/v2/plan/lanes/firewall/speed-of-light.md); prints a verdict.
+# again against the bound (docs/v2/plan/design/item-hash.md); prints a verdict.
 [[bench]]
 name = "edit"
 harness = false

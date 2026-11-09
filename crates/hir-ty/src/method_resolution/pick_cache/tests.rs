@@ -1,4 +1,4 @@
-//! The pick cache against the probe it stands for (notes: docs/v2/plan/lanes/frontend/fast-method.md,
+//! The pick cache against the probe it stands for (notes: docs/v2/plan/design/frontend.md,
 //! section 5): every hit, in generated bodies and in the method resolution fixtures, is probed
 //! again without the cache and must give the same pick; a hit allocates nothing; the table keeps
 //! one value per key and state under contention; and the scope buckets equal the assembly they

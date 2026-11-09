@@ -1083,7 +1083,7 @@ pub const CORE_BUSY: Table = Table {
 };
 
 /// One row a profiled run of a program blaze built: one or more repetitions of it, recorded by
-/// `blaze perf record` (docs/v2/plan/lanes/perf-history.md). Its files are
+/// `blaze perf record` (docs/v2/plan/design/perf-history.md). Its files are
 /// `perf-<run>.perf_runs.parquet`, which the history's cap leaves alone.
 pub const PERF_RUNS: Table = Table {
     name: "perf_runs",

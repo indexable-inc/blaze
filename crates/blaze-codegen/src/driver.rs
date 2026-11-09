@@ -1,4 +1,4 @@
-//! A build's codegen, one function instance at a time (docs/v2-codegen.md).
+//! A build's codegen, one function instance at a time (docs/v2/plan/design/codegen.md).
 //!
 //! 1. **Walk**: from the roots, the front end describes each instance and what it refers to,
 //!    a level at a time on all cores; the policy gives each its settings and so its key.
@@ -233,7 +233,7 @@ pub struct Built {
     /// Every instance the walk reached by key, with what it is across edits of its body and
     /// its settings, told apart from instances side by side ([`subject`]), and each folded group's body with one made of
     /// its members' identities: what a profile of an earlier build names it by
-    /// (docs/v2/plan/lanes/layout/layout.md).
+    /// (docs/v2/plan/design/code-layout.md).
     pub identities: Vec<(InstanceKey, ContentId)>,
     /// The instances the front end inferred cold ([`Described::cold`]), by key: a full link
     /// puts them after every other function.

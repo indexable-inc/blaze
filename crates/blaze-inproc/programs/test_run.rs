@@ -1,4 +1,4 @@
-//! A test binary that checks blaze ran it on its code memory (docs/v2/plan/lanes/fastcompile/inproc.md):
+//! A test binary that checks blaze ran it on its code memory (docs/v2/plan/design/compile-time.md):
 //! `blaze test -p blaze-inproc` links it as a dev executable (blaze-cargo's
 //! `inproc::runs_in_process`: it links the dev runtime, here this crate's dependency
 //! `blaze-inproc-rt`, and not the `host` feature), and its harness's fork server and every test process it forks start from the file

@@ -1,4 +1,4 @@
-//! How HIR values are written into a [`blaze_format`] buffer (docs/v2/plan/lanes/format.md section 5),
+//! How HIR values are written into a [`blaze_format`] buffer (docs/v2/plan/design/data.md section 5),
 //! for the results the database keeps on disk once they are cold: item trees, expression
 //! stores, bodies and their source maps.
 //!
@@ -250,7 +250,7 @@ fn carry_scopes() {
 
 // Each access to `RELOCATION` or `ANONYMOUS` is a call of its own, never inlined: a job that
 // waits between two may resume on another thread, and an inlined access may reuse the address
-// of the first thread's slot (docs/v2/plan/lanes/may-suspend.md).
+// of the first thread's slot (docs/v2/plan/design/may-suspend.md).
 
 /// The index of an id written in a [`relocating`] scope, `None` outside one.
 #[inline(never)]

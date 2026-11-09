@@ -3963,7 +3963,7 @@
   },
   "blaze-check@0.0.0": {
    "authors": "blaze contributors",
-   "description": "blaze's model checker for lock-free code: std's atomics, locks and threads as coroutines on one OS thread, explored under every interleaving to a preemption bound (loom's bounded DPOR) and every value a load may read under C11 (docs/v2/plan/lanes/safety/model.md)",
+   "description": "blaze's model checker for lock-free code: std's atomics, locks and threads as coroutines on one OS thread, explored under every interleaving to a preemption bound (loom's bounded DPOR) and every value a load may read under C11 (docs/v2/plan/design/model-checker.md)",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
    "license_file": "",
@@ -4014,7 +4014,7 @@
   },
   "blaze-graph@0.0.0": {
    "authors": "blaze contributors",
-   "description": "blaze's build driver as a graph that does no IO: a state machine of nodes, and the executor that does what it asks (docs/driver.md)",
+   "description": "blaze's build driver as a graph that does no IO: a state machine of nodes, and the executor that does what it asks (docs/v2/plan.md)",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
    "license_file": "",

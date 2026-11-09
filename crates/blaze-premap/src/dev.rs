@@ -4,7 +4,7 @@
 //! [`Job`] makes an image (from the store when it is there, else by the prelink) for
 //! [`Images::finish`].
 //!
-//! The daemon's dev run (`docs/v2/requests/fastcompile.md`, fastcompile-premap 5):
+//! The daemon's dev run (`fed1eb428d:docs/v2/requests/fastcompile.md`, fastcompile-premap 5):
 //!
 //! 1. [`plan`]. On [`Plan::Make`], run the job now (the graph has no image yet), finish it,
 //!    plan again; on [`Plan::Wait`], wait for the build making it.

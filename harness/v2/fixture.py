@@ -4,7 +4,7 @@ The workspace has three crates: `oracle_base` (a library with a build script, a 
 `include_str!`, features and cfgs), `oracle_mid` (a library over it) and `oracle_app` (a
 program over both, with integration tests). Its source is a pure function of a `State`: for
 each `Slot`, the index of one of its variants. A slot is one thing an edit of section 6 of
-docs/v2/plan/lanes/items.md changes (a body, a signature, an impl, a name, where an item lives, a file's
+docs/v2/plan/design/item-hash.md changes (a body, a signature, an impl, a name, where an item lives, a file's
 formatting or comments, a cfg, a feature, a closure's captures, a file `include_str!` reads, the
 whitespace in a literal, an environment variable), and every variant of every slot builds
 beside every variant of every other, so any state is a program: an edit is one slot moved to
@@ -20,7 +20,7 @@ layout (field order under a derive, `repr`, a private field's type), names a pro
 a panic's location), cfgs and features, a build script's environment and `option_env!`. Its
 tests pass or fail by the state, so a stale test result shows too.
 
-`budget_zero` marks the slots whose edits docs/v2/plan/goals/targets.md says compile nothing (formatting, comments,
+`budget_zero` marks the slots whose edits docs/v2/plan/objectives.md says compile nothing (formatting, comments,
 a rename or a move no program reads, the `PATH` a build is run with, #805).
 """
 
@@ -885,7 +885,7 @@ def by_label(slot: str, label: str) -> int:
 
 
 # Sequences the oracle always runs, each from the default state, each step `(slot, variant)`:
-# the reproductions of the issues docs/v2/plan/lanes/proof.md gives the oracle, and one of each kind
+# the reproductions of the issues docs/v2/plan.md gives the oracle, and one of each kind
 # of name and position a program can read.
 REGRESSIONS: dict[str, tuple[tuple[str, str], ...]] = {
     # #906: back and forth, so that the store has both versions, then the other capture.

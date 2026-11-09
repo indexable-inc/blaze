@@ -1,7 +1,7 @@
 //! The front end's query attributes over `blaze_query::db`: `#[tracked]` on free functions, on
 //! the functions of a tracked `impl` and on structs, `#[input]`, `#[interned]`,
 //! `#[derive(Supertype)]` and `#[derive(Value)]`. Generated code names `::blaze_query::db::plumbing` and the public
-//! `::blaze_query::db` items only, as docs/v2/plan/lanes/db/query-unify.md ("The contract")
+//! `::blaze_query::db` items only, as docs/v2/plan.md ("The contract")
 //! fixes them. Every option the front end doesn't use is refused with an error naming it.
 
 #![forbid(unsafe_code)]

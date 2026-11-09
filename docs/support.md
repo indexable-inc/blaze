@@ -9,14 +9,14 @@ This is what blaze v1 supported, as of its integration into v2 on 2026-10-30. Mu
 describes v1's machinery: rustc's copy of a refused function, handing a build to cargo, the
 splice, tiers and live edits through `blaze-live`, rustc linking with blaze's objects. v2 builds
 with no rustc and no cargo, and none of these cells has been measured for it; what v2 must reach
-is [v2/plan/goals/targets.md](v2/plan/goals/targets.md).
+is [v2/plan/goals/targets.md](v2/plan/objectives.md).
 
 Every cell here points at a report or a harness run. The harnesses that compared blaze with
 rustc or cargo (the corpus, the breakers, the build-model cases, the fuzzer's differential
 runs) were deleted on 2026-10-30 ([harness.md](harness.md)); the cells they measured keep the
 figures of their last run, and the bar from here on is real crates' own tests. "CI" is GitHub Actions run
 39057174862 on commit 888e87df74, the last run recorded in the reports that covered all
-four native platforms under both backends ([reports/PLAT-ABI2.md](reports/PLAT-ABI2.md)).
+four native platforms under both backends (reports/PLAT-ABI2.md).
 "Local" is a run of the gate on Linux x86-64 at f191c6e42a, the commit these docs were
 written against, under both backends (see [results.md](results.md)). [platforms.md](platforms.md) describes each port. "Unverified" means
 nobody recorded running it; it does not mean it is known to fail.
@@ -88,7 +88,7 @@ another blaze ([toolchain.md](toolchain.md)).
    `-no_fixup_chains`, so a deployment target of 12 or later splices as 11.0 does
    (`headerpad.py` builds for 14.0); an executable linked with chained fixups by a line of
    one's own is declined and linked in full.
-6. [reports/DEBUGINFO.md](reports/DEBUGINFO.md) for x86-64 and PLAT-ABI2 for native
+6. reports/DEBUGINFO.md for x86-64 and PLAT-ABI2 for native
    AArch64: `debuginfo.py` passes under both backends. See "Debug info" below for what that
    covers.
 7. On Windows blaze writes CodeView procedures and line tables, checked by `debuginfo.py`
@@ -97,21 +97,21 @@ another blaze ([toolchain.md](toolchain.md)).
    not checked here.
 8. `harness/blaze_cli.py`, Cranelift only: seven real projects with no difference from
    cargo, 66 of 66 flag steps, 11 of 11 lifecycle checks
-   ([reports/CARGO.md](reports/CARGO.md)). Not in CI. Run by hand for these docs on a new
+   (reports/CARGO.md). Not in CI. Run by hand for these docs on a new
    project and on ripgrep 15.1.0.
 9. `blaze` links ELF, Mach-O and COFF executables (`unsupported_target` in
    `cargo/cli.rs`). On Windows x86-64 MSVC it links with `rust-lld` and was run by hand on a
    toy crate and `demo/life` ([platforms.md](platforms.md#windows-x86-64-msvc)). On macOS
-   arm64 it was run by hand on bun 1.4.3's dev loop ([research/bun.md](research/bun.md)).
+   arm64 it was run by hand on bun 1.4.3's dev loop (research/bun.md).
    Nobody recorded running it on Linux AArch64.
 10. CI: `storekills.py`, `storecorrupts.py` and `storeshared.py` on all four platforms.
     `storefull.py` on Linux only. The earlier
-    [reports/DISKCACHE.md](reports/DISKCACHE.md) says "Linux x86-64 only"; PLAT-ABI2 is
+    reports/DISKCACHE.md says "Linux x86-64 only"; PLAT-ABI2 is
     later and is what this row follows.
-11. v1's remote (S3, a directory or the gateway; [reports/REMOTE.md](reports/REMOTE.md)) was
+11. v1's remote (S3, a directory or the gateway; reports/REMOTE.md) was
     deleted on 2026-10-30 with its harness. v2's remote is a read-through tier of the store
     (`blaze_cas::remote`), tested in blaze-cas but not yet wired into the daemon.
-12. [reports/FUZZ.md](reports/FUZZ.md), the differential fuzzer's runs, Linux x86-64 only. The
+12. reports/FUZZ.md, the differential fuzzer's runs, Linux x86-64 only. The
     fuzzers left (`fuzz/edits.py`, `fuzz/store.py`) hold a warm daemon and store to blaze's own
     cold build; their smoke runs are in that CI job.
 
@@ -138,7 +138,7 @@ By default each crate's MIR gets the passes rustc runs at that crate's level, th
 ported: level 1 (a debug build's) at `-Copt-level=0`, level 2 above it and for the library's
 crates, whose MIR rustc ships optimized. `BLAZE_MIR_OPT` overrides the level for every crate:
 0 runs none, 1 a debug build's passes, 2 those above `-Copt-level=0`
-([mir-passes.md](mir-passes.md#optimizations), [research/mir-gap.md](research/mir-gap.md)).
+([mir-passes.md](mir-passes.md#optimizations), research/mir-gap.md).
 Coroutine bodies are never optimized.
 
 | | 0 | 1 | 2 |
@@ -190,7 +190,7 @@ What is missing:
 blaze compiles what rust-analyzer can lower to MIR and what the code generator has an
 explicit lowering for. The rest is refused per function, with a reason, and rustc's copy of
 that function is used. Measured on rustc's own tests
-([reports/RUSTCSUITES.md](reports/RUSTCSUITES.md), Linux x86-64): of the `tests/ui`
+(reports/RUSTCSUITES.md, Linux x86-64): of the `tests/ui`
 run-pass tests that can run on stable, blaze compiled 5558 of 5615 functions and refused
 57; in the standard library's test suites it refused 11 of 2846.
 
@@ -267,7 +267,7 @@ The daemon itself, driven by the harness, follows most of cargo's build model. A
 small project per feature, compared against cargo under both backends, measured it until it
 was deleted on 2026-10-30. Its last recorded result is 208 of 208 on Linux x86-64 and 204 of 204 on
 native AArch64, where four rows that need an x86-64 host are not run (CI on `51339e5`).
-[reports/BUILDMODEL.md](reports/BUILDMODEL.md) has the table at 97 cases per backend, of
+reports/BUILDMODEL.md has the table at 97 cases per backend, of
 which 92 were supported and 5 refused.
 
 `blaze` is narrower. Its column was recorded while it still handed builds to cargo. Since

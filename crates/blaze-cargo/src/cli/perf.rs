@@ -1,5 +1,5 @@
 //! `blaze perf`: the performance history of the programs blaze builds
-//! (docs/v2/plan/lanes/perf-history.md).
+//! (docs/v2/plan/design/perf-history.md).
 //!
 //! - `blaze perf record [--target-dir DIR] [--workspace DIR] FILE.ixprof...`: the repetitions
 //!   of one run, read through the code maps the links kept in `<target-dir>/perf`, as one row

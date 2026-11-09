@@ -1,4 +1,4 @@
-//! The explorer core a producer serves (docs/v2/plan/observe/explore-core.md, decision 3): the
+//! The explorer core a producer serves (docs/v2/plan/design/explore-core.md, decision 3): the
 //! page's state and views compiled to `wasm32-unknown-unknown`, served by the program whose feed
 //! it folds, so the page always runs the core that program was released with. `hello` names it
 //! (`core: {abi, sha256, bytes}`) and the `core` op answers its bytes; the page fetches it once

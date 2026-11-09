@@ -6,7 +6,7 @@ date: 2026-10-22
 # Flat syntax trees for files nobody edits
 
 2026-10-22, for [#42](https://github.com/indexable-inc/blaze/issues/42) (Glancer item 4,
-[glancer.md](glancer.md#item-4-a-flat-syntax-tree-for-files-nobody-edits)). Measured on an
+[glancer.md](v2/plan.md)). Measured on an
 ephemeral AWS host (64 vCPU, Linux, release builds with mimalloc; `heap-profile` builds with
 jemalloc for the heap profiles), blaze at `c43c6443bd` (main) and the `flat-syntax` branch,
 and for steps (b) and (c) main at `74fb27b7ed` (step (a) merged) and the `flat-cursor` branch on it,

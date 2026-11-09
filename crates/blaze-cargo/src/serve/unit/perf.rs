@@ -1,4 +1,4 @@
-//! The code map of each link while `<target-dir>/perf` exists (docs/v2/plan/lanes/perf-history.md,
+//! The code map of each link while `<target-dir>/perf` exists (docs/v2/plan/design/perf-history.md,
 //! "The code map"): what each address of the image is, by path and by code identity, and what
 //! it refers to, so `blaze perf record` names a run's functions across builds and
 //! `blaze perf diff` tells a function whose code changed from one whose callee did.

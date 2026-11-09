@@ -179,7 +179,7 @@ pub(crate) trait Memory {
 /// The most rows the log and [`Lasting`] hold: their columns reserve address space for these
 /// when the switch is made and commit it as they fill, so no patch moves a row or calls the
 /// allocator, and a patch past one is refused naming the column. The arithmetic, and the
-/// address space it takes, are in docs/v2/plan/lanes/link/speed-of-light.md ("The live
+/// address space it takes, are in docs/v2/plan.md ("The live
 /// runtime").
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Limits {

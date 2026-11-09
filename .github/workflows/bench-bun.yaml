@@ -2,7 +2,7 @@
 # platform's dedicated benchmark machine, nightly: the edits of harness/bench.py, stored as
 # docs/benchmarks/bun-<platform>.json (`benchreport.py --name bun`) and shown as a project like the others
 # in the tables and charts of docs/benchmarks.md, which benchreport.py writes again from every stored result
-# (docs/research/bun.md says what it is). The platforms and their runners are bench-readme's
+# (fed1eb428d:docs/research/bun.md says what it is). The platforms and their runners are bench-readme's
 # (harness/benchplatforms.py, BENCH_RUNNERS); one whose runner is not registered is skipped and
 # keeps its last numbers. Too slow for every push: bun's own build of its C and C++ (once per
 # revision, kept in BENCH_HOME), cargo's cold build and blaze's whole-program LLVM build each

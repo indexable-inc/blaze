@@ -108,7 +108,7 @@ macOS was not measured.
   address range at startup (64 GB, which is free on 64-bit) and commits pages as it grows
   (`mmap` with `PROT_NONE`, then `mprotect`; `VirtualAlloc` with `MEM_RESERVE` then
   `MEM_COMMIT`). Growing never moves data, so addresses and `u32` offsets stay stable, and
-  there is no realloc-and-copy. Huge pages back the hot regions ([hardware.md](hardware.md)).
+  there is no realloc-and-copy. Huge pages back the hot regions ([hardware.md](data.md)).
 - **Generational handles.** Objects that are freed and reused (tasks, I/O operations, watch
   slots, live-patch sites) are referred to by `(index: u32, generation: u32)`. A stale handle
   is detected, not dereferenced.
@@ -126,7 +126,7 @@ macOS was not measured.
 
 - **Every allocator is tagged with its subsystem** (parse, nameres, infer, MIR, codegen, link,
   store, VFS, usercode). It reports live bytes, high-water mark and allocation rate.
-- **Each subsystem has a budget.** Memory admission ([core.md](../lanes/core.md)) reads these
+- **Each subsystem has a budget.** Memory admission ([core.md](../../plan.md)) reads these
   counters. A subsystem over budget is throttled before the machine is, so the daemon never
   OOMs.
 - The agent API exposes the counters, so a regression shows up as a number, not a mystery.

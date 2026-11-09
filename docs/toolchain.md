@@ -49,7 +49,7 @@ the standard library is part of a compiler.
   this one copy (`BLAZE_HOME` moves a daemon's settings and state, not the toolchain), found
   with nothing run (`crates/blaze-cargo/src/toolchain.rs`, `found`). rustup's directory is never
   read, not even when it has the same nightly: a toolchain found by its directory's name is
-  trusted by name, whatever was installed there ([v2/plan/toolchain-c.md](v2/plan/toolchain-c.md),
+  trusted by name, whatever was installed there ([v2/plan/toolchain-c.md](v2/plan/design/toolchain-c.md),
   which also plans the end of this download). The installer downloads it by running
   `blaze toolchain`, and every build checks it is there first (`toolchain::ensure`, which
   fetches it with `toolchain::own::fetch` when it is not).
@@ -94,7 +94,7 @@ what assembles `asm!`, `naked_asm!` and `global_asm!` in process, never the mach
 `rsasm`, which blaze-engine's `seed` turns on; `vendor/rsasm/SOURCE.md`). What else
 blaze still takes from the machine's C toolchain (the C driver the linker asks for crt files,
 the macOS SDK, MSVC's libraries, build scripts' `CC`) and the plan to replace it with one C
-toolchain built from this LLVM: [v2/plan/toolchain-c.md](v2/plan/toolchain-c.md).
+toolchain built from this LLVM: [v2/plan/toolchain-c.md](v2/plan/design/toolchain-c.md).
 
 ## The daily bump
 

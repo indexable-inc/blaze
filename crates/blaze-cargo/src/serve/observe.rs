@@ -1,5 +1,5 @@
 //! What the daemon says of itself beside its builds (docs/profiling.md;
-//! docs/v2/plan/lanes/observe/explore.md, "Where it runs").
+//! docs/v2/plan/design/explore.md, "Where it runs").
 //!
 //! - [`Profiling`]: the profile history, which the thread `blaze-history` keeps off the loop
 //!   ([`keep_history`]), and the DuckDB `nix run .#duckdb` pins ([`duckdb`]). `blaze serve`
@@ -716,7 +716,7 @@ fn keep(
                     rebuilt,
                 };
                 // Sent before the record is durable: an answer may name a build whose record a
-                // crash then loses (docs/v2/plan/lanes/why.md, "Answered before durable").
+                // crash then loses (docs/v2/plan/design/why.md, "Answered before durable").
                 _ = told.send(Told::Explained { answer, dropped: why.dropped() });
                 doing.set(Step::Appending, build);
                 if let Err(error) = why.write(build, &record) {

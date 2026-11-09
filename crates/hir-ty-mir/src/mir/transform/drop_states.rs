@@ -4,7 +4,7 @@
 //! glue, read at each `Drop` and `DropAndReplace` of the body as lowering built it.
 //!
 //! `hir-ty-linear` asks it for the locals that hold a `#[blaze::linear]` value
-//! (docs/v2/plan/lanes/linear.md). It reads the body and changes nothing: drop elaboration
+//! (docs/v2/plan/design/linear.md). It reads the body and changes nothing: drop elaboration
 //! runs its own analysis, rooted as before, so no body's code depends on it.
 
 use blaze_mem::{Tag, frame};

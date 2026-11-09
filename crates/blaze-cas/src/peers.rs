@@ -1,5 +1,5 @@
 //! A store several daemons on one machine write at once: one build's std, kept once for every
-//! BLAZE_HOME on the machine (docs/v2-store.md, "A shared store").
+//! BLAZE_HOME on the machine (docs/v2/plan/design/store.md, "A shared store").
 //!
 //! Each daemon writes a store of its own in the shared directory, `w-<writer>`, exactly as any
 //! store is written: one writer a directory, its commits and its crash safety as they are, so

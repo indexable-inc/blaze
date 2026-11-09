@@ -1,4 +1,4 @@
-//! What a task is expected to hold, for the plane's memory admission (docs/v2/plan/lanes/core.md section 4).
+//! What a task is expected to hold, for the plane's memory admission (docs/v2/plan.md section 4).
 //!
 //! Every task runs in a bump arena of its own, so what it held at most is measured, not
 //! guessed. [`Estimates`] keeps, for each kind of task (a query kind), what tasks of it held,
@@ -114,7 +114,7 @@ pub const fn name_of(kind: TaskKind) -> Option<&'static str> {
 /// Query kinds go by `blaze_query::kinds`' ranges (inputs, facts `0x1000`, the front end
 /// `0x2000`, codegen and link `0x4000`, user code `0x5000`, the units' loads `0x6000`), the
 /// front end's and the back end's ranges split by subsystem as written here and in
-/// docs/v2/plan/lanes/mem/core.md ("Kinds and tags"); the daemon's own by [`kinds`]. A kind
+/// docs/v2/plan/design/memory.md ("Kinds and tags"); the daemon's own by [`kinds`]. A kind
 /// none of them names is [`Tag::Other`]'s.
 pub const fn tag_of(kind: TaskKind) -> Tag {
     match kind {

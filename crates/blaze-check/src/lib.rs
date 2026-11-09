@@ -1,4 +1,4 @@
-//! blaze's model checker for lock-free code (docs/v2/plan/lanes/safety/model.md).
+//! blaze's model checker for lock-free code (docs/v2/plan/design/model-checker.md).
 //!
 //! [`model`] runs a closure under every interleaving of the threads it spawns, to a preemption
 //! bound (loom's bounded DPOR), and under every value each atomic load may read under C11. Its

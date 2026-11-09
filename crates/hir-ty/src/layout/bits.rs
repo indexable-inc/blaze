@@ -1,4 +1,4 @@
-//! `#[blaze::bits]`: bit-packed structs, a blaze extension (docs/v2/plan/lanes/frontend/bits.md).
+//! `#[blaze::bits]`: bit-packed structs, a blaze extension (docs/v2/plan/design/bits.md).
 //!
 //! A bits struct's fields sit at bit offsets of one backing integer, the first at bit 0, in
 //! declaration order, each as wide as its type says ([`bit_width_of`]). The struct is laid out

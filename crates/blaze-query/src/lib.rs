@@ -2,7 +2,7 @@
 // `#![blaze::sans_io]` marks a sans-IO core for `blaze::sans_io_core`; inert under rustc.
 #![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
-//! blaze v2's query database (docs/v2/plan/lanes/db.md section 7, docs/v2/plan/lanes/items.md
+//! blaze v2's query database (docs/v2/plan.md section 7, docs/v2/plan/design/item-hash.md
 //! section 6.2).
 //!
 //! - A query is asked of a [`QueryKey`]: its kind and the content ID of its arguments. Results
@@ -13,7 +13,7 @@
 //!   the fingerprint it had then. A rerun that produces the same fingerprint stops there
 //!   (early cutoff); fingerprints outlive evicted values, so eviction never breaks cutoff.
 //!   No result is reused unless every edge's fingerprint is equal (#350).
-//! - A **fact** is the narrowest thing a query read (docs/v2/plan/lanes/items.md section 6.2's table): a
+//! - A **fact** is the narrowest thing a query read (docs/v2/plan/design/item-hash.md section 6.2's table): a
 //!   query of its own whose value is small and whose fingerprint is the hash it stands for (an
 //!   interface hash, a layout hash, "N in S resolves to X"). The kinds of fact are
 //!   `blaze-items`'s.
@@ -21,7 +21,7 @@
 //!   configuration. Everything else is a function of content.
 //! - [`Why`] answers, for a query that ran, the chain of edges back to the input that changed.
 //!
-//! How it works (docs/v2/plan/lanes/db/query-database.md):
+//! How it works (docs/v2/plan.md):
 //!
 //! - A key keeps every memo made of it, each with its edges in the order they were read
 //!   (constructive traces). In a view, a memo is the key's result when each of its edges, in
@@ -354,7 +354,7 @@ pub trait Query: 'static {
     /// Equal values of this kind are kept once, whichever view or key made them: a memo of an
     /// equal value (its schema and fingerprint, then its bytes) names the one value row. Two
     /// values of one fingerprint whose bytes differ panic, naming the query. For kinds whose
-    /// values often repeat across keys (docs/v2/plan/lanes/fastcompile/hashcons.md, "Which
+    /// values often repeat across keys (docs/v2/plan/design/compile-time.md, "Which
     /// values"); a kind that leaves it costs nothing.
     const SHARE: bool = false;
     /// Kept as bytes (deterministic CBOR) beside the key's memos and in the image, so a

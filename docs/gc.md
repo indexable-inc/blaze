@@ -12,7 +12,7 @@ crates/blaze-cargo, never the executable's bytes), shared by every daemon of the
 (`<machine>/std/<makers>`). The collector, `crates/blaze-gc`, removes what is no
 longer used of the first and the last, so a machine that builds many checkouts does not fill its
 disk. The daemon's state (its store, image and journal) is never listed, so never a candidate;
-eviction inside a store is not done yet ([v2-store.md](v2-store.md#not-done-here)).
+eviction inside a store is not done yet ([v2-store.md](v2/plan/design/store.md)).
 
 It is automatic: nobody needs `blaze clean` or `blaze cache gc` to keep a disk from filling.
 The daemon measures each area's volume and collects more, and sooner, the closer free space

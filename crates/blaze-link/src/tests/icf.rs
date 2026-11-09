@@ -1,4 +1,4 @@
-//! Identical code folding through a full ELF link (docs/v2/plan/lanes/codegen/icf.md): codegen's
+//! Identical code folding through a full ELF link (docs/v2/plan/design/icf.md): codegen's
 //! dedupe hands the linker one copy of equal code and renames every relocation to it, the
 //! static that points at both instances included, so both pointers are one address; a function
 //! whose address is significant keeps its own copy; the image is the same bytes whatever

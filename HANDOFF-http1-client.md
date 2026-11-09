@@ -1,4 +1,4 @@
-# Handoff: lane T1 `http1-client` (docs/v2/plan/observe/no-tracing.md, 6.1)
+# Handoff: lane T1 `http1-client` (docs/v2/plan/design/no-tracing.md, 6.1)
 
 Code only: nothing was built, checked or tested (no blaze, cargo or VM ran). Cargo.lock is
 untouched; the changes it should get are listed below. This second pass replaces the first
@@ -129,7 +129,7 @@ driver contract":
   `net = ["dep:blaze-http", "dep:tokio"]`. The dev-dep tokio is unchanged.
 - `crates/blaze-registry/src/http/client.rs`: rewritten onto blaze-http (433 lines, was 752).
 - `crates/blaze-registry/src/http.rs`: module doc only.
-- `docs/v2/plan/observe/no-tracing.md`: section 6.1, the section 6 table row, and the T1 lane
+- `docs/v2/plan/design/no-tracing.md`: section 6.1, the section 6 table row, and the T1 lane
   row now describe this design.
 - `HANDOFF-http1-client.md`: this file.
 

@@ -1,6 +1,6 @@
 //! The database's part of the daemon image (docs/v2/plan/design/restore.md): five sections of
 //! `blaze-image`'s file, read where they are mapped, so a start is an mmap that pages in only
-//! what it touches (docs/v2/plan/lanes/db.md section 7).
+//! what it touches (docs/v2/plan.md section 7).
 //!
 //! Each section is the database's alone, with a schema of its own; little-endian:
 //!

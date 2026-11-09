@@ -16,7 +16,7 @@ given is the one that last changed the report, marked "report at". Commits are o
 development branch (`blaze-collate` and the branches merged into it), not of the published
 tree; `vendor/source.rev` says which development commit a published tree was made from.
 
-Reports are named by file. Those under [reports/](reports/) are published with this
+Reports are named by file. Those under reports/ are published with this
 tree. BREAKERS.md and the other `harness/*.md` files are in `harness/`. WINDOWS.md,
 MACOS.md, MACOS-ABI2.md, AARCH64.md and BLAZE.md are earlier reports that
 [platforms.md](platforms.md) and these documents replace; they are on the development

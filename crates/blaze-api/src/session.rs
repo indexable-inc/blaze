@@ -1,4 +1,4 @@
-//! What each request does (docs/v2/plan/lanes/ci.md, #277): a state machine over the VFS, the database and
+//! What each request does (docs/v2/plan.md, #277): a state machine over the VFS, the database and
 //! the [`Builder`], with no IO, clock or threads.
 //!
 //! Every request ends with exactly one [`Response::Done`], after a [`Response::Error`] naming

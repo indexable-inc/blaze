@@ -1,4 +1,4 @@
-//! The agent API (docs/v2/plan/lanes/ci.md, docs/v2/plan.md section 1; #277; rule no-mcp): the daemon's
+//! The agent API (docs/v2/plan.md, docs/v2/plan.md section 1; #277; rule no-mcp): the daemon's
 //! only interface.
 //!
 //! Every message is a [`Envelope`] of [`SCHEMA`], encoded in RFC 8949's core deterministic
@@ -79,7 +79,7 @@ use serde::{Deserialize, Serialize};
 /// [`Request::Launch`] and [`Response::Launched`]. 29: [`Response::Stopping`]. 30:
 /// [`UnitOf::doctest`]. 31: [`Response::Unchecked`]. 32: [`LinkHow::Unchanged`]. 33:
 /// [`Status::bugs`]. 34: [`Request::FetchUrl`] and [`Response::Stored`]. 35:
-/// [`Status::settings`]. 36: an [`ApiError`] is its [`Report`] (docs/v2/plan/structured-output.md),
+/// [`Status::settings`]. 36: an [`ApiError`] is its [`Report`] (docs/v2/plan/design/structured-output.md),
 /// [`Response::Report`], and [`Behind::id`]. 37: [`RebuildCause::Unfinished`]. 38:
 /// [`Request::Flush`] and [`Response::Flushed`] in place of `Request::Sql` (`blaze debug sql
 /// --live`) and `Response::Queried`: a reader of the profile history asks the daemon to flush,
@@ -428,7 +428,7 @@ pub enum Request {
     },
     /// `blaze run` of a built program, before it execs it as process `pid`: what that process
     /// needs to run on the daemon's code memory when `program` (the path the build linked it
-    /// at) is a dev executable the daemon holds (docs/v2/plan/lanes/fastcompile/inproc.md).
+    /// at) is a dev executable the daemon holds (docs/v2/plan/design/compile-time.md).
     /// Answered with [`Response::Launched`] by the daemon's loop, which holds the programs.
     Launch {
         pid: u32,
@@ -1722,7 +1722,7 @@ pub struct TagMemory {
     pub high_water: u64,
 }
 
-/// What failed, and where: a [`Report`] (docs/v2/plan/structured-output.md), which is all
+/// What failed, and where: a [`Report`] (docs/v2/plan/design/structured-output.md), which is all
 /// the wire carries. `what` and `at` are its words, flat ([`Report::flat`]), for a caller that
 /// puts an error into a sentence of its own; they are made from the report and never change
 /// it, so an error is changed through its report ([`ApiError::and`], [`ApiError::from`]).
@@ -1736,7 +1736,7 @@ pub struct ApiError {
 
 impl ApiError {
     /// An error that is words only ([`Report::text`]): a caller not yet given a report of its
-    /// own. docs/v2/plan/structured-output.md counts these down.
+    /// own. docs/v2/plan/design/structured-output.md counts these down.
     pub fn new(what: impl Into<String>, at: Option<String>) -> ApiError {
         ApiError::from(Report::text(what, at))
     }

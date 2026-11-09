@@ -10,7 +10,7 @@ hegeltest = { path = "../../../../../vendor/hegeltest", default-features = false
 
 # Part 1's contract checks abort on a broken clause inside the callee (`panic_nounwind`), which
 # Hegel can't catch or shrink: the generated tests need them off until part 3's unchecked entry
-# (docs/v2/plan/lanes/contracts.md, part 2).
+# (docs/v2/plan/design/contracts.md, part 2).
 [profile.test]
 contract-checks = false
 

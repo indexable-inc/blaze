@@ -459,7 +459,7 @@ mod tests {
 
     /// What the always-on recorder costs: an info span of the target `blaze` opened, entered,
     /// left and closed, and a plot. The cost of a build is these times the spans and plots it
-    /// records (docs/v2/plan/lanes/observe/speed-of-light.md).
+    /// records (docs/v2/plan.md).
     #[test]
     #[ignore = "a measurement, not a check: run it in release with --ignored --nocapture"]
     fn what_a_span_and_a_plot_cost() {

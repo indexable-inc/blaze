@@ -1,4 +1,4 @@
-//! A dependency's check computed once for everyone (docs/v2/plan/lanes/frontend/fast-bodies-cache.md;
+//! A dependency's check computed once for everyone (docs/v2/plan/design/frontend.md;
 //! compile-time.md idea 8): what [`crate::check_crate`] gives for a crate read from a dependency
 //! image ([`hir_def::deps`]), and per body what codegen reads of the check
 //! ([`hir_ty::check_cache`]), kept in the image's store and read back by every later build, on

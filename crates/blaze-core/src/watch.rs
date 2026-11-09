@@ -1,4 +1,4 @@
-//! Watching a tree on Linux (docs/v2/plan/lanes/core/plane.md's table): with fanotify, one mark of the whole
+//! Watching a tree on Linux (docs/v2/plan.md's table): with fanotify, one mark of the whole
 //! file system, where the process has the privileges it needs, and with inotify where it does
 //! not (a watch on each directory under the watched one, added as directories appear). Either
 //! way the events are read off one descriptor, which the threads driver reads on a thread of

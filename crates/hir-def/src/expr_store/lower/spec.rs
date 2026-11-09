@@ -1,4 +1,4 @@
-//! Lowering of blaze_verify's native specification clauses (docs/v2/plan/lanes/verus.md):
+//! Lowering of blaze_verify's native specification clauses (docs/v2/plan/design/verus.md):
 //! `requires`, `recommends`, `ensures` and `decreases` on a function, `invariant`, `ensures` and
 //! `decreases` on a `loop` or `while`, and a named return type `-> (r: T)`.
 //!

@@ -1,4 +1,4 @@
-//! The negative-fact indexes (docs/v2/plan/lanes/items.md section 6.2): the impls of a trait by
+//! The negative-fact indexes (docs/v2/plan/design/item-hash.md section 6.2): the impls of a trait by
 //! simplified self type, and what a name is in a scope, each answering its question both ways
 //! ("no impl", "nothing by that name" are answers too).
 //!
@@ -890,7 +890,7 @@ impl ScopeNames {
                 let items = run(starts);
                 // clone: a range, two indexes.
                 let keys = keys[items.clone()].iter().copied();
-                // alloc: `ScopeEntry` owns its items; see docs/v2/requests/mem-backend-items.md.
+                // alloc: `ScopeEntry` owns its items; see fed1eb428d:docs/v2/requests/mem-backend-items.md.
                 ScopeEntry::Assoc(keys.zip(visibilities[items].iter().copied()).collect())
             }
         }

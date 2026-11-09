@@ -1519,7 +1519,7 @@ impl<'db> Cx<'db> {
         self.attrs(f, it.into());
         // A constant's value is what its users see: it is in their code. One without generics
         // that evaluates is its value, so an edit of a `const fn` it calls that keeps the value
-        // reaches no user (E4 in docs/v2/plan/lanes/firewall/notes.md); else its body, from
+        // reaches no user (E4 in docs/v2/plan/design/item-hash.md); else its body, from
         // which each use evaluates it.
         if data.has_body() && self.leak_free {
             f.u8(LEAK);

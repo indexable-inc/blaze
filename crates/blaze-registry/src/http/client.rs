@@ -7,7 +7,7 @@
 //! the client, naming it.
 //!
 //! The name is the first client's, kept so that no caller changes; nothing under it is hyper
-//! any more (no hyper, hyper-util, hyper-rustls or tokio-rustls: docs/v2/plan/observe/no-tracing.md,
+//! any more (no hyper, hyper-util, hyper-rustls or tokio-rustls: docs/v2/plan/design/no-tracing.md,
 //! 6.1).
 
 use std::{io::Read as _, sync::Arc, time::Duration};

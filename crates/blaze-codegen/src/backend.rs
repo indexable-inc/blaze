@@ -109,7 +109,7 @@ pub struct Described<I, S> {
     /// Whether it runs only when something has gone wrong, so a full link places it after
     /// every other function ([`Built::cold`](crate::driver::Built::cold)): `#[cold]`, the
     /// panic machinery, a diverging `#[track_caller]` function, a closure of one of those.
-    /// A profile that saw it run wins (docs/v2/plan/lanes/layout/layout.md).
+    /// A profile that saw it run wins (docs/v2/plan/design/code-layout.md).
     pub cold: bool,
 }
 

@@ -1,5 +1,5 @@
 //! The synchronization types of the store's lock-free code: std's, or the model checker's in a
-//! model build (docs/v2/plan/lanes/safety/model.md), where nothing else changes. Outside one the
+//! model build (docs/v2/plan/design/model-checker.md), where nothing else changes. Outside one the
 //! lock is blaze's named one (`blaze_core::lock::Lock`); in one, [`Lock`] is the model's mutex
 //! with the same constructor, the name dropped.
 

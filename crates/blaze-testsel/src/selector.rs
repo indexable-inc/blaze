@@ -1,5 +1,5 @@
 //! Choosing for every test of a suite after each edit in time proportional to what the edit
-//! changed (docs/v2/plan/lanes/fastcompile/select.md, "Speed of light").
+//! changed (docs/v2/plan/design/compile-time.md, "Speed of light").
 //!
 //! [`choose`](crate::select::choose) decides one test from the store alone: it finds the end
 //! of the test's history, reads its entries and, for each, the set it was kept under, and

@@ -209,7 +209,7 @@ pub(super) fn lint_literal(
 }
 
 /// blaze: a literal out of the range of an integer of `#![blaze::arbitrary_ints]`
-/// (docs/v2/plan/lanes/frontend/arbitrary-ints.md), `ty` with the range `min..=max`, of
+/// (docs/v2/plan/design/arbitrary-ints.md), `ty` with the range `min..=max`, of
 /// magnitude `value` and negated when `negation` is the `-`'s span. Such a type is new, so no
 /// program's meaning rests on its literal wrapping: unlike `overflowing_literals` of a
 /// standard type it is a hard error at every lint level, naming the literal as written, the

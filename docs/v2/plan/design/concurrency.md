@@ -41,14 +41,14 @@ the work around it. Each rule says what is shared and who writes it.
   waits for every worker to pass a task boundary (quiescent-state reclamation), which costs
   readers nothing.
 - **Allocation is per task.** A task allocates from its own bump arena, freed when it ends, on
-  the worker's NUMA node in huge pages ([hardware.md](hardware.md)). A hit allocates nothing.
+  the worker's NUMA node in huge pages ([hardware.md](data.md)). A hit allocates nothing.
 - **No false sharing.** Per-worker state is padded to 128 bytes, the size of the pair of lines
   arm64 and x86 prefetch together.
 
 ## Waiting
 
 - **No thread waits on another's work.** Single flight parks the waiting *task* in the plane,
-  and the worker runs something else ([core.md](../lanes/core.md)).
+  and the worker runs something else ([core.md](../../plan.md)).
 - **No guard lives across a query call.** A lock held while calling into the database can
   deadlock or invert priorities. `clippy.toml`'s `disallowed-types` bans `std::sync::Mutex` and
   `RwLock` in `blaze-query`, `blaze-cas`, `blaze-ids`, `intern` and `blaze-graph`. Where a lock

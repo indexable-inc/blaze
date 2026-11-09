@@ -12,8 +12,8 @@ session, so generic kernels, shared structs and the borrow checker work across t
 Nothing here is built yet. The front matter uses the fields `tools/docs.py` checks, so this file
 can move under `docs/v2/plan/` unchanged once it's adopted.
 
-The 10-29 decision "no GPU" in [decisions.md](../../v2/plan/process/decisions.md) and
-[hardware.md](../../v2/plan/design/hardware.md) covers blaze's own work. That work is
+The 10-29 decision "no GPU" in [decisions.md](../../v2/plan.md) and
+[hardware.md](../../v2/plan/design/data.md) covers blaze's own work. That work is
 pointer-chasing and branchy, the build machines have no GPU, and the parts that would map to one
 (hashing, compression) already run near memory bandwidth on SIMD. This plan is about a target for
 the programs blaze builds, so it doesn't reopen that decision.

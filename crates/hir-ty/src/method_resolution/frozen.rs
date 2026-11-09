@@ -1,5 +1,5 @@
 //! The impls of a crate written as bytes and read back instead of found (frozen dependency
-//! artifacts, blaze's `docs/glancer.md`, item 1), with `hir_def`'s frozen encoding.
+//! artifacts, blaze's `docs/v2/plan.md`, item 1), with `hir_def`'s frozen encoding.
 //!
 //! The bytes are two parts, each read on its own: the crate's [`TraitImpls`] and its
 //! [`InherentImpls`]. As with a frozen `DefMap`, what is read must equal what finding the impls

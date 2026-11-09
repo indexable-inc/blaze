@@ -1,5 +1,5 @@
 //! blaze's own Miri: a checker of undefined behavior over `hir-ty-mir`'s MIR evaluator, for
-//! `blaze test --ub` (docs/v2/plan/design/unsafe.md, docs/v2/plan/lanes/safety/notes.md).
+//! `blaze test --ub` (docs/v2/plan/design/unsafe.md, docs/v2/plan/design/unsafe.md).
 //!
 //! The evaluator runs the program and calls [`check::Checker`] through its `Machine` trait at
 //! every allocation, access, typed copy, call, return and thread switch. The checker holds what

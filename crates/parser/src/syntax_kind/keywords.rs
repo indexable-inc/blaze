@@ -112,7 +112,7 @@ const CONTEXTUAL: &[(&str, SyntaxKind, Option<Edition>)] = &[
     ("unwrap_binder", UNWRAP_BINDER_KW, None),
     ("wrap_binder", WRAP_BINDER_KW, None),
     ("yeet", YEET_KW, None),
-    // blaze_verify's specification clauses (docs/v2/plan/lanes/verus.md).
+    // blaze_verify's specification clauses (docs/v2/plan/design/verus.md).
     ("decreases", DECREASES_KW, None),
     ("ensures", ENSURES_KW, None),
     ("invariant", INVARIANT_KW, None),

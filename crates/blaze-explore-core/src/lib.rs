@@ -3,7 +3,7 @@
 #![register_tool(blaze)]
 // Only `abi` reads linear memory the page wrote; everything else is safe code.
 #![deny(unsafe_code)]
-//! The explorer's core (docs/v2/plan/observe/explore-core.md): bytes from the daemon in, view
+//! The explorer's core (docs/v2/plan/design/explore-core.md): bytes from the daemon in, view
 //! models out, the clock handed in. The page (indexable-inc/ix, packages/web) loads it compiled
 //! to `wasm32-unknown-unknown` and keeps only the shell; the host runs the same code in its
 //! tests.

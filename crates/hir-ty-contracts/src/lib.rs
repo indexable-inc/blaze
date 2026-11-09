@@ -1,4 +1,4 @@
-//! The optimizer's use of proved contracts (docs/v2/plan/lanes/contracts.md, part 3): a fact a
+//! The optimizer's use of proved contracts (docs/v2/plan/design/contracts.md, part 3): a fact a
 //! native `ensures` states is used only once a proof stands behind it, and each use is a
 //! [`Fact`] the caller's code identity covers (rule 18).
 //!

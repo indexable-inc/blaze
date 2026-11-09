@@ -6,7 +6,7 @@
 //! there (`arm64e` for `arm64`, `x86_64h` for `x86_64`), since an `arm64` process loads the
 //! system's `arm64e` libraries (the SDK's `libSystem.B.tbd` lists no `arm64-macos` itself).
 //!
-//! The YAML is lexed over the bytes (docs/v2/plan/lanes/link/speed-link-edge-macho-dylib.md):
+//! The YAML is lexed over the bytes (docs/v2/plan.md):
 //! one pass per line finds comments, quotes and flow brackets eight bytes a step (SWAR), and
 //! one reads values onto a flat tape of 12-byte [`Node`]s whose scalars are spans of the
 //! text, copied only when unescaped or wrapped across lines. A list is decoded only when its
@@ -92,7 +92,7 @@ const PARALLEL: usize = 64 << 10;
 
 /// Every document on one tape, each with its [`Doc`], and the targets they list.
 ///
-/// In `parallel` (A6 of `docs/v2/requests/requests-link-fuzz.md`), each document is parsed onto a
+/// In `parallel` (A6 of `fed1eb428d:docs/v2/requests/requests-link-fuzz.md`), each document is parsed onto a
 /// tape of its own on a worker (libSystem's 40-odd documents on as many cores), then the tapes
 /// are joined in document order, each node's subtree end and scratch offset and each doc's
 /// and target's nodes moved by where its tape lands. The tape, docs, targets and first error

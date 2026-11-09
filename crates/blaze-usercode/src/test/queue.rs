@@ -2076,7 +2076,7 @@ impl Queue {
 /// for `C` cores, a fork of `F` nanoseconds (the server's own measure) and a median test of
 /// `T`, at least one and at most the cores and the tests. A replica starts a test per fork,
 /// and a core takes about `F + T` per test, so `C` cores need `C × F / (F + T)` forks going
-/// at once (docs/v2/plan/lanes/usercode/speed-of-light.md, "Tests"). A fork that costs
+/// at once (docs/v2/plan.md, "Tests"). A fork that costs
 /// nothing needs one.
 fn replicas(cores: usize, fork: u64, median: u64, tests: usize) -> u32 {
     let cores = cores.max(1) as u128;

@@ -1,4 +1,4 @@
-//! `#[blaze::bits]` structs lowered to their backing integers (docs/v2/plan/lanes/frontend/bits.md).
+//! `#[blaze::bits]` structs lowered to their backing integers (docs/v2/plan/design/bits.md).
 //!
 //! Until this pass a field of a bits struct is a place like any other: borrow checking sees
 //! its reads, writes and moves as it sees any field's, and refuses a reference to it. This

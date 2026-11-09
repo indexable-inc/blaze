@@ -157,7 +157,7 @@ jobs:
     name: build
     runs-on: ${{ inputs.platform == 'linux-arm64' && fromJSON('["ix", "arm64", "ix-cpu-64", "blaze-build"]') || inputs.os }}
     # A store blaze's release has not compiled into builds for about 97 minutes on Linux
-    # x86-64 (docs/unit-keys.md), and longer on macOS's 7 GB runner.
+    # x86-64 (docs/v2/plan/design/store.md), and longer on macOS's 7 GB runner.
     timeout-minutes: ${{ startsWith(inputs.os, 'macos') && 240 || 150 }}
     # The remote's write token and signing key, for main's push alone.
     environment: ${{ github.ref == 'refs/heads/main' && inputs.tier == 'warm' && !startsWith(inputs.os, 'windows') && 'cache-writer' || '' }}

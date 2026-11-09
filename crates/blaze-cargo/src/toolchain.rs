@@ -10,7 +10,7 @@
 //! [`own::fetch`] downloads, each file checked against its sha256 in `pins.txt`. rustup's
 //! directory is never read, not even as a copy of the same files: a toolchain found by its
 //! directory's name is trusted by name, and its bytes are whatever was installed there
-//! (docs/v2/plan/toolchain-c.md, slice 2). The source of the standard library is not the
+//! (docs/v2/plan/design/toolchain-c.md, slice 2). The source of the standard library is not the
 //! release's: it is blaze's own `library/` ([`library`]).
 
 pub mod library;

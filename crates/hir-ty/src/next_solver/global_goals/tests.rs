@@ -1,5 +1,5 @@
 //! The global-goal table and the shape table against a locked map and the plain solver
-//! (docs/v2/plan/lanes/frontend/fast-trait.md, "Tests").
+//! (docs/v2/plan/design/frontend.md, "Tests").
 
 use std::{
     collections::{BTreeMap, HashMap},

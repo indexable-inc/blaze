@@ -77,7 +77,7 @@ IR types (`cranelift_codegen::ir`) may stay as the stencils' input until blaze h
 MIR evaluator stays for const eval and as the reference a macro's wasm output is tested against;
 nothing hand-rolls a wasm-style sandbox (`blaze-macro-eval`'s `tier.rs` is replaced by this).
 
-See [docs/v2/plan/lanes/usercode/macros.md](../../../docs/v2/plan/lanes/usercode/macros.md).
+See [docs/v2/plan/design/proc-macros.md](../../../docs/v2/plan/design/proc-macros.md).
 
 ## keys-cover-every-input (rule 21)
 

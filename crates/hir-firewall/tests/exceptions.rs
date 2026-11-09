@@ -1,5 +1,5 @@
 //! The harness over fixtures: an edit of each body reaches only it, in each case of
-//! docs/v2/plan/lanes/firewall/notes.md section 2 that a body edit can be; and an edit that
+//! docs/v2/plan/design/item-hash.md section 2 that a body edit can be; and an edit that
 //! changes what another item reads of a body is found.
 
 use std::{collections::HashMap, sync::Arc};

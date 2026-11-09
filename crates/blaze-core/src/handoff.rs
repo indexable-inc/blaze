@@ -1,5 +1,5 @@
 //! The two lock-free protocols the drivers run between their threads, kept apart from the
-//! drivers so each is model-checked (docs/v2/plan/lanes/safety/model.md) on every platform, not
+//! drivers so each is model-checked (docs/v2/plan/design/model-checker.md) on every platform, not
 //! only where its driver runs: [`Claims`], the chunks of one job claimed by many threads and
 //! completed by the last (the io_uring driver's stamp sweeps), and [`Wake`], one wake-up of a
 //! driver for any number of hand-backs since it last drained them (the IOCP and kqueue drivers'

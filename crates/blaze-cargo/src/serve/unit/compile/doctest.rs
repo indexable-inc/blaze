@@ -1,4 +1,4 @@
-//! A library's `Doctest` unit (docs/v2/plan/doctests.md): every example of its documentation
+//! A library's `Doctest` unit (docs/v2/plan/design/doctests.md): every example of its documentation
 //! is a crate and a program of its own, built and run as its own process, and the unit's
 //! program is the runner, a libtest harness with one test per example. blaze never runs
 //! rustdoc and never merges examples.

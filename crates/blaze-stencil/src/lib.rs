@@ -1,5 +1,5 @@
 //! Copy-and-patch codegen for dev runs (docs/v2/plan/design/compile-time.md, change 4; the
-//! design is docs/v2/plan/lanes/fastcompile/stencil.md).
+//! design is docs/v2/plan/design/compile-time.md).
 //!
 //! When blaze is built, LLVM compiles one *stencil* per Cranelift IR operation, operand shape
 //! and type ([`shape`]): a few instructions in continuation-passing style, each ending in a

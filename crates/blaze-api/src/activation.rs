@@ -1,5 +1,5 @@
 //! Socket activation (docs/v2/plan/design/restore.md, "The daemon starts on demand";
-//! docs/v2/plan/lanes/frontend/activate.md): the service manager listens on the daemon's
+//! docs/v2/plan/design/restore.md): the service manager listens on the daemon's
 //! socket, starts `blaze serve --activated` at the first connection and passes it the
 //! listening socket.
 //!

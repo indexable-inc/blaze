@@ -30,7 +30,7 @@ HOSTS = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "aarch64-unknown-li
 # rustup's `minimal` profile without rust-docs, and wasm32-wasip1's standard library for the C
 # runtime (wasi-libc, `lib/rustlib/wasm32-wasip1/lib/self-contained`) that blaze's linker links
 # every proc macro's module with (blaze-link `target.rs`, `wasi`): blaze's own copy is the only
-# one it reads, never rustup's (docs/v2/plan/toolchain-c.md, slice 2). `None` is the host. The
+# one it reads, never rustup's (docs/v2/plan/design/toolchain-c.md, slice 2). `None` is the host. The
 # standard library's source is not downloaded: it is blaze's own library/ (docs/toolchain.md).
 COMPONENTS = [("rustc", None), ("cargo", None), ("rust-std", None), ("rust-std", "wasm32-wasip1")]
 

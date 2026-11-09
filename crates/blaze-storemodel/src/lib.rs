@@ -1,4 +1,4 @@
-//! A model checker of blaze's store and kernel protocol (docs/v2/plan/lanes/storemodel.md).
+//! A model checker of blaze's store and kernel protocol (docs/v2/plan/design/storemodel.md).
 //!
 //! It drives the real state machines, `blaze_cas::Store` with its `Writer`s and `Reader`s and
 //! `blaze_kernel::Kernel`, through every schedule of a few actors (two writers on one key or one

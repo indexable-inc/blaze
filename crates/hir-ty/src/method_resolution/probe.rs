@@ -1438,7 +1438,7 @@ impl<'a, 'db, Choice: ProbeChoice<'db>> ProbeContext<'a, 'db, Choice> {
     /// those of its bounds, so `x.wrapping_add(y)` and `u3::MAX` need no import. The solver's
     /// builtin holds the trait of every such type, so the reference is the concrete
     /// `self_ty: ArbitraryInt`, and the item resolves to the trait's default
-    /// (docs/v2/plan/lanes/frontend/arbitrary-ints.md). A crate graph whose core has no
+    /// (docs/v2/plan/design/arbitrary-ints.md). A crate graph whose core has no
     /// `ArbitraryInt` has no such items.
     #[instrument(level = "debug", skip(self))]
     fn assemble_inherent_candidates_of_arbitrary_int(&mut self, self_ty: Ty<'db>) {

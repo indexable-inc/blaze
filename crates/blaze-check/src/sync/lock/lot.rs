@@ -1,5 +1,5 @@
 //! `parking_lot::{Mutex, RwLock, Condvar}`'s API over the model's locks, for a crate whose
-//! `sync` switch is `parking_lot` outside a model (docs/v2/plan/lanes/safety/model.md, "The
+//! `sync` switch is `parking_lot` outside a model (docs/v2/plan/design/model-checker.md, "The
 //! switch"). A lock is taken as `parking_lot` takes it, with no poisoning (`std`'s lock under the
 //! model's is taken as it is when a holder panicked), and a condition variable waits on the guard
 //! in place. The model sees the same operations as through `std`'s API in [`super`].

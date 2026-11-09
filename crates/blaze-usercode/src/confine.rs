@@ -304,7 +304,7 @@ impl Confine for Launcher {
     }
 
     /// `blaze sandbox --v2-serve` on Windows, where a run's second process creation is the
-    /// largest cost it has (docs/v2/plan/lanes/usercode/speed-of-light.md, "The Windows
+    /// largest cost it has (docs/v2/plan.md, "The Windows
     /// sandbox"). Linux and macOS have no warm launcher: their driver starts `--v2` a run.
     fn warm(&self) -> Option<Confined> {
         if !cfg!(windows) {

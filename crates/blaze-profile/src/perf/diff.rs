@@ -1,4 +1,4 @@
-//! Two runs compared function by function (docs/v2/plan/lanes/perf-history.md): joined by
+//! Two runs compared function by function (docs/v2/plan/design/perf-history.md): joined by
 //! identity, each change with its noise bound and its cause class, sorted by construction.
 //!
 //! The bound: per side, the variance of a function's samples across the side's repetitions,

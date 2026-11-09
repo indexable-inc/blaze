@@ -1,4 +1,4 @@
-"""Profile-guided code layout's benchmark (docs/v2/plan/lanes/layout/layout.md): one tree of
+"""Profile-guided code layout's benchmark (docs/v2/plan/design/code-layout.md): one tree of
 blaze built three ways, each binary timed on one fixed workload.
 
   uv run --frozen python tools/layout/bench.py tools/layout/bench.json

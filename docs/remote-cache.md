@@ -32,14 +32,14 @@ and for the Worker once blaze builds wasm. Written against blaze main `e4bbb88` 
 `blaze-next` `5c5299f` ([#283](https://github.com/indexable-inc/blaze/pull/283)). Each claim is
 marked **read** (in a source we read, or measured by us), **reported** (a document or someone
 says so, not checked again here) or **unverified** (our inference or an estimate). "Slice R2"
-below is [ci-runner.md](ci-runner.md)'s second slice; "R2" alone is Cloudflare's object store.
+below is [ci-runner.md](v2/plan.md)'s second slice; "R2" alone is Cloudflare's object store.
 
 Andrew wants CI and local testing to be "uber fast", and wants other people to benefit from the
 cache. [AGENTS.md](../AGENTS.md) makes blaze's own store "the one cache", locally and in the
 shared remote CI fills, and rules out sccache. This file is the design of that shared remote:
 how CI on main fills it, how CI on every branch and any user reads it, and how nobody else can
 put code in it. It builds on [cache.md](cache.md) (the store and today's remote), on
-[ci-runner.md](ci-runner.md) (test results keyed by content) and on [cargo.md](cargo.md) (the
+[ci-runner.md](v2/plan.md) (test results keyed by content) and on [cargo.md](cargo.md) (the
 sandbox and `BLAZE_TESTS=affected`).
 
 ## Short version
@@ -120,7 +120,7 @@ Goals:
 Non-goals:
 
 - Remote execution. A function compiles in milliseconds and a test runs in a sandbox locally in
-  about 8 ms (**read**, [ci-runner.md](ci-runner.md#protocol-why-none-on-the-hot-path)); there is
+  about 8 ms (**read**, [ci-runner.md](v2/plan.md)); there is
   nothing to execute remotely. REAPI stays an edge adapter
   ([#226](https://github.com/indexable-inc/blaze/issues/226)).
 - Writes to the shared tier from anyone but CI on main: no pull request, no fork, no user.
@@ -158,7 +158,7 @@ identity and an empty cache.
 
 | System | What it does | What we take, or not |
 |---|---|---|
-| Bazel REAPI ([remote_execution.proto](https://github.com/bazelbuild/remote-apis/blob/main/build/bazel/remote/execution/v2/remote_execution.proto)) | CAS of `Digest{hash, size}` plus an ActionCache from action digest to result. AC entries carry no signature; trust is the server's access control. Recently `GetChunkMapping`/`SpliceBlob` with FastCDC 2020 (avg 512 KiB recommended) | The CAS/AC split. Not its unsigned AC (our gateway is not trusted for integrity, so the index must carry its own proof), and not its per-entry unary lookups: 165,752 functions would be 165,752 calls (**read**, [ci-runner.md](ci-runner.md)) |
+| Bazel REAPI ([remote_execution.proto](https://github.com/bazelbuild/remote-apis/blob/main/build/bazel/remote/execution/v2/remote_execution.proto)) | CAS of `Digest{hash, size}` plus an ActionCache from action digest to result. AC entries carry no signature; trust is the server's access control. Recently `GetChunkMapping`/`SpliceBlob` with FastCDC 2020 (avg 512 KiB recommended) | The CAS/AC split. Not its unsigned AC (our gateway is not trusted for integrity, so the index must carry its own proof), and not its per-entry unary lookups: 165,752 functions would be 165,752 calls (**read**, [ci-runner.md](v2/plan.md)) |
 | [Attic](https://github.com/zhaofengli/attic) | Nix cache on S3: FastCDC 16/64/256 KiB for NARs of 64 KiB and up, zstd, narinfo signed by the server, GC by retention then orphans | Same chunk sizes as a start; the index expiring before the blobs it names. Not server-side signing: our gateway checks signatures but holds no signing key, so a compromised gateway cannot forge an entry |
 | casync / [desync](https://github.com/folbricht/desync) | Chunk stores `<4 hex>/<id>.cacnk`, chunks 16:64:256 KB, zstd, SHA-512/256 or SHA-256, index files listing chunks | A chunk list per large file; over S3, HTTP and OCI alike |
 | Nix binary cache ([narinfo](https://nix.dev/manual/nix/2.35/protocols/binary-cache/narinfo.html)) | Ed25519 over a fingerprint, `trusted-public-keys = name:key`, keys named `cache.example.org-1` and incremented to revoke; rotation signs with both keys ([nix#12976](https://github.com/NixOS/nix/pull/12976)) | Named, numbered keys and an overlap when rotating |
@@ -227,7 +227,7 @@ linked into one program. So the version is checked, not trusted.
 - **Dependency units.** `SHA-256(UNIT, toolchain, target, package id, version, the
   Cargo.lock checksum or git commit, features, profile settings, the unit keys of its
   dependencies)`. The output is a unit record: each file's path, mode, size and chunk list.
-- **Test passes.** As [ci-runner.md](ci-runner.md#what-a-test-result-is-keyed-by) says, in two
+- **Test passes.** As [ci-runner.md](v2/plan.md) says, in two
   steps, because what a test read is only known after it ran. The entry key is
   `SHA-256(TESTS, identity, target, reach hash, attributes, fixed environment, the content of each
   CARGO_BIN_EXE_* it runs)`. Its value is a list of pass records, each holding the paths the
@@ -235,7 +235,7 @@ linked into one program. So the version is checked, not trusted.
   checks those paths on its own machine; when all match, the test is skipped as passed. Only
   passes are kept: a failure is never a reason to skip.
 - **Flakes.** Two verdicts under one key are nondeterminism by construction
-  ([ci-runner.md](ci-runner.md#nondeterminism-and-flakes)). CI on main writes a `flake` entry under
+  ([ci-runner.md](v2/plan.md)). CI on main writes a `flake` entry under
   the same key when a rerun disagrees, so every client knows the test is main's bug and not the
   pull request's. The seed is a hash of the key, so a rerun sees the same randomness.
 - **Proc-macro expansions and build-script runs**, as cache.md keys them, under `EXPAND` and
@@ -614,7 +614,7 @@ file node's hash is its CAS name, and a root shipped to another machine is fetch
 already holds) and directories as SHA-256 over a domain prefix (`"blaze vfs directory v1\0"`) and
 the same entry encoding (a new journal magic). The cost measured so far is a tie on one thread:
 BLAKE3 1.9 to 2.1 GiB/s (2.0 to 2.3 GB/s) on one M5 Max core in the roadmap (**read**,
-`docs/roadmap.md` on `blaze-next`), SHA-256 2.22 GB/s with SHA-NI on dev-aws-14 and 2.38 GB/s with
+`docs/v2/plan.md` on `blaze-next`), SHA-256 2.22 GB/s with SHA-NI on dev-aws-14 and 2.38 GB/s with
 the ARMv8 extensions on an M2 Max (table below). What BLAKE3 gives that SHA-256 does not is its tree
 mode: one large file hashed on many threads, and a range verified alone (Bao). The CAS needs
 neither: no blob is larger than 256 KiB once [Large files](#large-files) has cut it, and each is
@@ -648,7 +648,7 @@ ARMv8 extensions at run time (**reported**,
   So the level is a setting measured in slice 6: high for incremental pushes, lower for a cold
   fill that a background job compresses again later. The blob names do not change.
 - **Dictionaries for small blobs.** A function record is about 400 bytes on average (nushell:
-  165,752 functions in 64 MB after zstd, **read**, [ci-runner.md](ci-runner.md)), too small for
+  165,752 functions in 64 MB after zstd, **read**, [ci-runner.md](v2/plan.md)), too small for
   zstd to find much in on its own. CI trains a dictionary (`zstd::dict::from_samples`, 112 KiB)
   per (codegen version, target, blob kind) from a sample of main's blobs, and compresses each
   small blob with it.
@@ -794,7 +794,7 @@ entry off.
    decompressed frame by frame as it streams, each blob hashed against its name, and written
    into the local store.
 6. **Meanwhile** rust-analyzer loads the workspace (52 s cold for nushell, **read**,
-   [ci-runner.md](ci-runner.md)). Store lookups during the load and the first build
+   [ci-runner.md](v2/plan.md)). Store lookups during the load and the first build
    find what has arrived; a key whose blob is still in flight waits on that part rather than
    compiling it (the store's existing hook, `fetch_missing_with`, used by `BLAZE_REMOTE_LAZY`
    today).
@@ -825,7 +825,7 @@ aggregate, is what slice 1 measures first. The table assumes they do.
 | blaze's workspace, whole, level 3 | 300 MB | 7.5 s | 1.3 s |
 | the same at a higher level, 20% smaller | 240 MB | 6.0 s | 1.1 s |
 | a branch that touched one crate: what main's head lacks | 10 to 30 MB | 0.3 to 0.8 s | 0.05 to 0.15 s plus a round trip |
-| nushell's function store ([ci-runner.md](ci-runner.md)) | 64 MB | 1.6 s | 0.3 s |
+| nushell's function store ([ci-runner.md](v2/plan.md)) | 64 MB | 1.6 s | 0.3 s |
 
 All **unverified** arithmetic on the figures above. The CPU on the client: 300 MB compressed is
 about 1.5 GB of blobs, which hash in about 0.7 core-seconds and decompress in about 1 to 1.5
@@ -835,7 +835,7 @@ segments, a few hundred milliseconds.
 
 After this the fetch is not the long pole. helix's warm start spent 129 to 131 s of thread time
 turning store records back into the daemon's values
-([research/warm-start.md](research/warm-start.md), **read**); that cost is the store's, and #216 is
+(research/warm-start.md, **read**); that cost is the store's, and #216 is
 its fix.
 
 ### HTTP versions
@@ -1156,7 +1156,7 @@ Ranked by what each gives. Each slice lands on its own and is measured.
    measures dedup across consecutive main commits.
 6. **Compression.** The upload level and the dictionaries, measured against level 3 in 128 KB
    blocks, on blaze's workspace and nushell.
-7. **Test passes.** Slice R2 of [ci-runner.md](ci-runner.md) writes its records into this index;
+7. **Test passes.** Slice R2 of [ci-runner.md](v2/plan.md) writes its records into this index;
    flake entries; `BLAZE_TESTS=affected` reads them, so a branch skips what main passed.
 8. **Drivers.** The socket effects on `Uring`, and HTTP/3 over `quiche`, each kept only if it
    measures faster where it is meant to.

@@ -69,7 +69,7 @@ replaces the stored value and never falls back. It only fails the unit.
 
 When the kernel stores entries as `identity -> { output, reads, code }`, its lookup calls
 `blaze_store_check::check` on each hit, passing the entry's recorded reads ([the
-kernel](../lanes/kernel.md#checks-lane-verify): `Kernel::get` does, and its recompute must make
+kernel](kernel.md#checks-lane-verify): `Kernel::get` does, and its recompute must make
 the entry's reads as well as its bytes). A mismatch then names
 the narrow reads (the layout of `Foo`, a const's value) that should have changed the identity
 and did not, which is the missing input a key must cover (rule 18).

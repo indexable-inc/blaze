@@ -1,6 +1,6 @@
 //! A file's parse as stored bytes read in place: base-db keeps the parses of library files in
 //! the daemon's image and maps them back at a restart instead of lexing and parsing the files
-//! again (docs/v2/plan/lanes/tree-store/design.md).
+//! again (docs/v2/plan/design/store.md).
 //!
 //! A parse's record, little-endian, from a multiple of 8, every offset from its start: a head
 //! of [`HEAD`] `u32`s (magic, the record's length, [`TREE_VERSION`], the outline's edition

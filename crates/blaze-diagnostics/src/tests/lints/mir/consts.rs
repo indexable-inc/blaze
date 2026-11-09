@@ -362,7 +362,7 @@ For more information about this error, try `rustc --explain E0658`.
 }
 
 #[test]
-#[ignore = "needs the desugaring's type printed as rustc's diagnostics print it (`std::ops::Range<i32>`; the checker's message spells it with `type_name`, `core::ops::range::Range<i32>`: docs/v2/requests/codegen-rq-mir-constcheck.md R2's printer, R8) and std's `Range`, which minicore's stands in for"]
+#[ignore = "needs the desugaring's type printed as rustc's diagnostics print it (`std::ops::Range<i32>`; the checker's message spells it with `type_name`, `core::ops::range::Range<i32>`: fed1eb428d:docs/v2/requests/codegen-rq-mir-constcheck.md R2's printer, R8) and std's `Range`, which minicore's stands in for"]
 fn a_for_loop_in_a_constant() {
     // tests/ui/consts/const-for-feature-gate.rs
     let source = r#"// gate-test-const_for
@@ -400,7 +400,7 @@ For more information about this error, try `rustc --explain E0015`.
 }
 
 #[test]
-#[ignore = "needs rustc's `def_path_str` of an item nested in a function's body (`copy::copy`; the checker writes `copy`: docs/v2/requests/codegen-rq-mir-constcheck.md R8)"]
+#[ignore = "needs rustc's `def_path_str` of an item nested in a function's body (`copy::copy`; the checker writes `copy`: fed1eb428d:docs/v2/requests/codegen-rq-mir-constcheck.md R8)"]
 fn unstable_intrinsics_in_a_const_fn_exposed_to_stable() {
     // tests/ui/consts/const-unstable-intrinsic.rs, with its auxiliary/unstable_intrinsic.rs
     let source = r#"//! Ensure that unstable intrinsics can actually not be called,

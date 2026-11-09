@@ -1,6 +1,6 @@
 //! The disk as one input: a [`Watcher`] follows a directory through the system's journal of
 //! changes ([`Effect::Journal`]) and turns what changed into transactions on one head, by the
-//! disk (docs/v2/plan/design/restore.md, docs/v2/plan/lanes/frontend/journal.md).
+//! disk (docs/v2/plan/design/restore.md, docs/v2/plan/design/restore.md).
 //!
 //! - **Start**: the journal is asked for what changed since the cursor the head's [`Disk`] saved
 //!   (FSEvents' event ID, NTFS's USN). With no cursor (a first start, or Linux, whose journal
@@ -27,7 +27,7 @@
 //!   path whose head changed after the report (by anyone but this watcher) is not taken and is
 //!   named ([`Watched::Conflict`]). A file whose bytes are those the head has already makes no op.
 //! - Modes: a file the head has keeps its mode, a new one is [`Mode::Regular`] (the stamp's
-//!   mode bits are saved for when the driver reports modes, docs/v2/requests/vfs.md item 6).
+//!   mode bits are saved for when the driver reports modes, fed1eb428d:docs/v2/requests/vfs.md item 6).
 //! - **Names are numbers inside**: each name is interned once ([`Paths`]) as it comes in, and
 //!   slots, looks in flight, the commit's lists and what its commits left are [`PathId`]s. Text
 //!   is made only where a name leaves: an effect's [`FileName`], an [`Op`]'s path, a

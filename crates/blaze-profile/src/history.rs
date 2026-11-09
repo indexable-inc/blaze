@@ -604,7 +604,7 @@ fn dictionary(column: &Column) -> bool {
 }
 
 /// How each table's files are written: zstd at level 1 (fast enough to keep up with the
-/// recorder: see docs/v2/plan/lanes/observe/history.md), Parquet 2 pages (delta-encoded
+/// recorder: see docs/v2/plan/design/profile-history.md), Parquet 2 pages (delta-encoded
 /// integers), DuckDB-sized row groups, page statistics for pruning by time and build.
 fn properties(table: &Table) -> WriterProperties {
     let mut it = WriterProperties::builder()
@@ -2870,7 +2870,7 @@ mod tests {
         );
     }
 
-    /// The flush's cost a span, in release: what docs/v2/plan/lanes/observe/history.md bounds.
+    /// The flush's cost a span, in release: what docs/v2/plan/design/profile-history.md bounds.
     #[test]
     #[ignore = "a measurement: blaze test -p blaze-profile --release -- --ignored --nocapture what_a_flush_costs"]
     fn what_a_flush_costs() {

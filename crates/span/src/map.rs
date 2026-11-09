@@ -839,7 +839,7 @@ impl RealSpanMap {
     }
 
     /// `ranges`, of this map's text at or after where anchor `ast_id` begins, as the side table
-    /// of the anchor's spans (docs/v2/plan/lanes/format.md section 5, "Spans"), each relative to where the
+    /// of the anchor's spans (docs/v2/plan/design/data.md section 5, "Spans"), each relative to where the
     /// anchor begins. `anchor` is the content id of the anchor's item, which names the table;
     /// the span of the `i`th range is the table's `i`th, `SpanRef { anchor, index: i }`.
     ///

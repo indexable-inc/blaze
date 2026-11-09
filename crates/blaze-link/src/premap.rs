@@ -1,4 +1,4 @@
-//! Dependency images (`docs/v2/requests/fastcompile.md`, fastcompile-premap 1 and 2): a run maps a
+//! Dependency images (`fed1eb428d:docs/v2/requests/fastcompile.md`, fastcompile-premap 1 and 2): a run maps a
 //! prelinked image of the workspace's dependencies at a fixed address and links the
 //! workspace's own code beside it, so the two behave as one whole link.
 //!

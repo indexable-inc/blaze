@@ -1,4 +1,4 @@
-//! The scheduler as a state machine that does no IO (docs/v2/plan/lanes/sched.md): it reads no
+//! The scheduler as a state machine that does no IO (docs/v2/plan/design/fibers.md): it reads no
 //! clock, starts no thread and never sleeps. A driver tells it what happened ([`Sched::spawn`],
 //! [`Sched::suspended`], [`Sched::done`], [`Sched::key_done`], [`Sched::yielded`],
 //! [`Sched::core_idle`], [`Sched::advance_clock`]) and does what it decides

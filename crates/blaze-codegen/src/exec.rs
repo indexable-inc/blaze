@@ -1,5 +1,5 @@
 //! A test binary's execution table (fastcompile-ident-select 5,
-//! docs/v2/plan/lanes/fastcompile/select.md, "Keys"): every function of the binary as test
+//! docs/v2/plan/design/compile-time.md, "Keys"): every function of the binary as test
 //! selection keys it, the function of each jump-table slot, the code the binary runs that is
 //! in no table, and the functions each test reaches. `blaze_testsel::Image::new` takes its
 //! first three as they are, and each test's reached set by position.

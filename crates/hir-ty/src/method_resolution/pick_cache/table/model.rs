@@ -1,4 +1,4 @@
-//! Model tests (docs/v2/plan/lanes/safety/model.md) of the table from two threads under every
+//! Model tests (docs/v2/plan/design/model-checker.md) of the table from two threads under every
 //! interleaving to the preemption bound and every value C11 lets a load read. A value holds a
 //! tracked cell its readers read and its drop writes, so an entry freed before a reader that
 //! loaded it is done is a data race the checker reports. Two slots, so every key shares one

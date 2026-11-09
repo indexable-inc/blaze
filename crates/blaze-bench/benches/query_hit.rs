@@ -1,6 +1,6 @@
 //! The front end's query database, `blaze_query::db`, on its hot paths (`db/*`;
-//! docs/v2/plan/lanes/db/query-unify.md, "How it is measured"). The numbers, and those of the
-//! fork it replaced on the same shapes, are in docs/v2/plan/lanes/db/speed-of-light.md:
+//! docs/v2/plan.md, "How it is measured"). The numbers, and those of the
+//! fork it replaced on the same shapes, are in docs/v2/plan.md:
 //!
 //! - `hit/*`: a warm hit of a function of one interned ID returning `u64`, over [`KEYS`] keys,
 //!   in order and scattered, one hit an iteration;

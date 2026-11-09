@@ -2,7 +2,7 @@
 //! other width that is not 8, 16, 32, 64 or 128 bits.
 //!
 //! A `uN` is held in its storage integer zero-extended from N bits and an `iN` sign-extended
-//! (docs/v2/plan/lanes/frontend/arbitrary-ints.md). Every operation here reads its operands in
+//! (docs/v2/plan/design/arbitrary-ints.md). Every operation here reads its operands in
 //! that form as `i128` (no arbitrary width is over 127 bits, so every value fits), computes,
 //! and writes the result back in that form. The standard widths never come here, so their
 //! evaluation is unchanged. Codegen (`hir-ty-codegen`) computes the same results and panics

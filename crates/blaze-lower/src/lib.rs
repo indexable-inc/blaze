@@ -1,4 +1,4 @@
-//! A build's units lowered into the front end (docs/v2/plan/lanes/cargo/notes.md sections 2
+//! A build's units lowered into the front end (docs/v2/plan.md sections 2
 //! and 6): base-db's crate graph, source roots and files, from `blaze_units::query::Units` and
 //! the files of the view and the sources mounted beside it, read through the tree and never
 //! from the disk.
@@ -23,7 +23,7 @@
 //! - **What a running proc macro asks** of the database (a span's text, file, line or parent)
 //!   is answered by [`answer`], whichever runtime runs it.
 //!
-//! The database is shared by reference, never cloned (docs/v2/plan/process/decisions.md): a
+//! The database is shared by reference, never cloned (docs/v2/plan.md): a
 //! task reads it through [`Lowered::db`] while it holds a shared reference to the
 //! [`Lowered`], and a write takes `&mut Lowered`, which no reader can hold at the same time.
 

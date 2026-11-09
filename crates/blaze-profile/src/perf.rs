@@ -1,4 +1,4 @@
-//! Performance history of the programs blaze builds (docs/v2/plan/lanes/perf-history.md): each
+//! Performance history of the programs blaze builds (docs/v2/plan/design/perf-history.md): each
 //! profiled run is one row set in the history, its functions named by path and by code
 //! identity, so `blaze perf diff` lines up two builds' functions, bounds the noise, and says
 //! why each changed.

@@ -1,4 +1,4 @@
-//! The kernel: blaze v2's compute steps from MIR down (docs/v2/plan/lanes/kernel.md).
+//! The kernel: blaze v2's compute steps from MIR down (docs/v2/plan/design/kernel.md).
 //!
 //! A step is a registered, pure function of its input ([`Step`], [`Compute`]). It sees the
 //! world only through [`Reads`], which records each read it makes: its name (a [`Read`], a kind

@@ -1,5 +1,5 @@
 //! The jobs of a pool that keeps its own queues ([`crate::pool`]) on fibers, and the waits of
-//! threads that run no fiber (docs/v2/plan/lanes/sched.md, phase 2 step 3).
+//! threads that run no fiber (docs/v2/plan/design/fibers.md, phase 2 step 3).
 //!
 //! A pool's worker runs each job on a fiber of its own recycled set ([`Host`]). A job that never
 //! claims a key or waits never touches the scheduler. At its first claim or wait it joins the
@@ -74,7 +74,7 @@ struct Fiber(Stackful<In, Out>, u32);
 // worker's set, or parked in a record), never while it runs. Its stack then holds this module's
 // frames (the `Yielder` and `HostCx`, touched only by the fiber itself, and a `Job: Send`) and the
 // job's frames below a wait, which hold nothing that must not cross threads (the may-suspend
-// check, docs/v2/plan/lanes/may-suspend.md; `NoWait` guards at every wait).
+// check, docs/v2/plan/design/may-suspend.md; `NoWait` guards at every wait).
 unsafe impl Send for Fiber {}
 
 /// A parked job of a pool: its fiber and the thread-locals it carries, behind a pool job header

@@ -48,7 +48,7 @@ exclude = [
     "vendor/libzstd-rs-sys",
     # Patched below; its own tests and benches need dev-dependencies blaze has no use for.
     "vendor/corosensei",
-    # Patched below, without `tracing` (docs/v2/plan/observe/no-tracing.md, 6.2); each is its own
+    # Patched below, without `tracing` (docs/v2/plan/design/no-tracing.md, 6.2); each is its own
     # workspace for its tests, whose dev-dependencies stay out of blaze's lock (vendor/*/PATCHES.md).
     "vendor/quinn-proto",
     "vendor/ra-ap-rustc_pattern_analysis",
@@ -74,7 +74,7 @@ internal = "warn"
 # `blaze::hot` stays with the crates that deny it (`#![deny(blaze::hot)]`); its members turned
 # on everywhere are named below (`hot_alloc`, `default_hasher`, `cold_error`).
 hot = "allow"
-# The parallel lints are read in their own lane (docs/v2/plan/lanes/lints/parallel.md).
+# The parallel lints are read in their own lane (docs/lints.md).
 parallelizable = "allow"
 serial_dependence = "allow"
 hot_alloc = "warn"
@@ -98,7 +98,7 @@ hash_order_output = "warn"
 fixed_key_lookup = "warn"
 # Code written by agents: a new field or a new answer forces a decision at every site. A struct
 # literal of the workspace writes every field (no `..base`), and a parameter that chooses is an
-# enum named for the choice, not a `bool` (docs/v2/plan/lanes/lints/blaze.md).
+# enum named for the choice, not a `bool` (docs/lints.md).
 struct_update = "warn"
 bool_param = "warn"
 # A `#![blaze::sans_io]` core that reaches the wall clock or IO (AGENTS.md rule 12), and a
@@ -240,7 +240,7 @@ inherits = "release"
 debug = 2
 
 # The binaries a release ships, built with PGO by .github/scripts/build_release.py
-# (docs/reports/RELEASE-BUILD.md). Thin LTO takes 4-5% off an edit's work in the daemon but
+# (fed1eb428d:docs/reports/RELEASE-BUILD.md). Thin LTO takes 4-5% off an edit's work in the daemon but
 # makes a rebuild of blaze after a one-line change 2.5 times longer, so `release`, which the
 # harnesses and CI build after every change, goes without.
 [profile.dist]
@@ -278,9 +278,9 @@ rsasm = { path = "vendor/rsasm" }
 # (#1659); removed when stage 0 is a release built after 8498b0dfc1 (vendor/corosensei/SOURCE.md).
 corosensei = { path = "vendor/corosensei" }
 # Upstream with every `tracing` site deleted, as patch series tools/vendor/sync.py replays on each
-# bump (docs/v2/plan/observe/no-tracing.md, 6.2; vendor/<crate>/PATCHES.md). quinn, quinn-udp and
+# bump (docs/v2/plan/design/no-tracing.md, 6.2; vendor/<crate>/PATCHES.md). quinn, quinn-udp and
 # wtransport are out of the graph: blaze-http's h3 core drives quinn-proto itself
-# (docs/v2/plan/observe/http3-sans-io.md).
+# (docs/v2/plan/design/http3-sans-io.md).
 quinn-proto = { path = "vendor/quinn-proto" }
 ra-ap-rustc_pattern_analysis = { path = "vendor/ra-ap-rustc_pattern_analysis" }
 
@@ -339,7 +339,7 @@ blaze-report = { path = "crates/blaze-report" }
 blaze-serde = { path = "crates/blaze-serde" }
 blaze-serde-derive = { path = "crates/blaze-serde-derive" }
 blaze-ui = { path = "crates/blaze-ui" }
-# v2 (docs/v2/plan/reference/crates.md)
+# v2 (docs/v2/plan.md)
 blaze-alloc-count = { path = "crates/blaze-alloc-count" }
 blaze-bytes = { path = "crates/blaze-bytes" }
 blaze-api = { path = "crates/blaze-api" }
@@ -367,7 +367,7 @@ blaze-item-hash = { path = "crates/blaze-item-hash" }
 blaze-link = { path = "crates/blaze-link", default-features = false }
 blaze-store-check = { path = "crates/blaze-store-check" }
 blaze-phf = { path = "crates/blaze-phf", version = "0.0.0" }
-# fastcompile (docs/v2/plan/lanes/fastcompile/notes.md)
+# fastcompile (docs/v2/plan/design/compile-time.md)
 blaze-global = { path = "crates/blaze-global", default-features = false }
 blaze-hashcons = { path = "crates/blaze-hashcons" }
 blaze-history = { path = "crates/blaze-history" }
@@ -436,7 +436,7 @@ bitflags = "2.13.2"
 # wasm32, the seed's; it does nothing on any other target.
 blake3 = { version = "1.8", default-features = false, features = ["std", "neon", "wasm32_simd"] }
 # BLAKE3-Servil (johnservil/BLAKE3 `servil`, 0.8.0 on official 1.8.7): `blaze_ids::b3`'s
-# backend on x86-64 Linux and AArch64 Linux and macOS (docs/v2/plan/process/decisions.md).
+# backend on x86-64 Linux and AArch64 Linux and macOS (docs/v2/plan.md).
 # Its kernels are chosen at run time; `std` alone, and its pool's threads start only in
 # `initialize_multithreaded`, which blaze never calls.
 blake3-servil = { path = "vendor/blake3-servil", default-features = false, features = ["std"] }
@@ -457,7 +457,7 @@ cranelift-reader = "=0.137.1"
 wasmtime = { version = "=50.0.1", default-features = false, features = ["cranelift", "runtime", "std"] }
 # `vendor/llvm-sys` by the patch above.
 llvm-sys = "231"
-# The stackful fibers blaze-graph's scheduler parks a waiting job on (docs/v2/plan/lanes/sched.md, Phase 2).
+# The stackful fibers blaze-graph's scheduler parks a waiting job on (docs/v2/plan/design/fibers.md, Phase 2).
 corosensei = "0.3.4"
 crossbeam-channel = "0.5.17"
 crossbeam-deque = "0.8.8"
@@ -516,7 +516,7 @@ semver = "1.0.28"
 serde = { version = "1.0.229" }
 serde_derive = { version = "1.0.229" }
 serde_json = "1.0.154"
-# blaze-ci's webhook payload decode, validating at SIMD speed (docs/v2/plan/lanes/ci.md).
+# blaze-ci's webhook payload decode, validating at SIMD speed (docs/v2/plan.md).
 sonic-rs = { version = "0.5", default-features = false }
 rustc-literal-escaper = "0.0.8"
 smallvec = { version = "1.16.4", features = [
@@ -714,7 +714,7 @@ type_complexity = "allow"
 wrong_self_convention = "allow"
 
 ## deny: allocation, dyn and clones are controlled mechanically
-## (docs/v2/plan/goals/principles.md)
+## (docs/v2/plan.md)
 redundant_clone = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
 clone_on_ref_ptr = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
 implicit_clone = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings

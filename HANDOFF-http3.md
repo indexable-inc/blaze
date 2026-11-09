@@ -1,4 +1,4 @@
-# Handoff: HTTP/3 and WebTransport, sans-IO (docs/v2/plan/observe/http3-sans-io.md)
+# Handoff: HTTP/3 and WebTransport, sans-IO (docs/v2/plan/design/http3-sans-io.md)
 
 Branch `nt-http3-webtransport`, worktree `/Volumes/Projects/blaze-wt-nt-http3`. Nothing here has
 been built, checked or run: the lane's brief forbade every build, test, cargo, rustc, blaze and VM.
@@ -6,7 +6,7 @@ The first `blaze check -p blaze-http -p blaze-explore` is the first compile.
 
 ## Design
 
-- **Spec**: docs/v2/plan/observe/http3-sans-io.md (`plan`, 2026-11-04). It covers what blaze uses
+- **Spec**: docs/v2/plan/design/http3-sans-io.md (`plan`, 2026-11-04). It covers what blaze uses
   QUIC for, the contracts, what the browser requires, the designs that lost, cost, migration and
   proof.
 - **QUIC core**: quinn-proto, vendored without tracing (vendor/quinn-proto). It stays as it is.
@@ -79,7 +79,7 @@ New:
   verifier.
 - `crates/blaze-http/src/h3/tokio_driver.rs`.
 - `crates/blaze-http/src/h3/tests.rs`.
-- `docs/v2/plan/observe/http3-sans-io.md`.
+- `docs/v2/plan/design/http3-sans-io.md`.
 
 Changed:
 - `Cargo.toml`:
@@ -99,7 +99,7 @@ Changed:
 - `crates/blaze-cargo/src/serve/observe.rs` and `crates/blaze-cargo/Cargo.toml`: comments only.
 - `tools/vendor/sync.py`: `Crate` is `quinn-proto | ra-ap-rustc_pattern_analysis`; docstring
   example updated.
-- `docs/v2/plan/lanes/observe/explore.md` and `docs/v2/plan/observe/no-tracing.md`: the rows and
+- `docs/v2/plan/design/explore.md` and `docs/v2/plan/design/no-tracing.md`: the rows and
   notes that named wtransport or quinn.
 
 Deleted:
