@@ -1,6 +1,6 @@
 [package]
 name = "harness-native-shaders"
-description = "The harness renderer's shaders in Rust (docs/future/gpu/shaders.md): shaders/harness.slang and shaders/mascot.slang ported function for function, its types shared with the host, its binding table generated from the signatures"
+description = "The harness renderer's shaders in Rust (docs/future/gpu/shaders.md): shaders/harness.slang and what was shaders/mascot.slang ported function for function, its types shared with the host, its binding table generated from the signatures"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"

@@ -1,4 +1,5 @@
-//! shaders/mascot.slang in Rust, function for function.
+//! What was harness-native-render's shaders/mascot.slang (deleted when Kip's pass switched to this; the switch's parent
+//! commit has it), in Rust, function for function.
 //!
 //! Kip, den's mascot (harness-native-kip): a voxel character drawn off screen into a picture of its
 //! own device pixels (4x MSAA, with depth), then set into the frame as a premultiplied quad over a

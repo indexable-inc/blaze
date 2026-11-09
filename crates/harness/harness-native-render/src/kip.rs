@@ -1,6 +1,13 @@
 //! Kip's Metal pass (copied from den-native's src/mascot/gpu.rs): each Kip's picture rendered off screen at its own
 //! device pixels (4x MSAA with depth, both memoryless on Apple GPUs, resolved into a half-float texture), then set into
-//! the frame by a composite quad over its contact shadow (shaders/mascot.slang). harness-native-kip says what to draw.
+//! the frame by a composite quad over its contact shadow. harness-native-kip says what to draw.
+//!
+//! The shaders are harness-native-shaders' `mascot` module, Rust compiled by blaze (docs/future/gpu/shaders.md): blaze's
+//! device build of that crate (`artifact = "gpu"` in Cargo.toml) writes its MSL and names the file in
+//! `BLAZE_GPU_MSL_HARNESS_NATIVE_SHADERS`; Metal compiles it here at start-up with fast math, as `xcrun metal
+//! -ffast-math` compiled the Slang. Every slot is the one the entry's Rust signature generated (`mascot::<entry>::<param>`),
+//! the same constants the device build bound the MSL by, so the two can't number a parameter differently. A build without
+//! blaze's device build has no such variable and fails to compile here, naming it: there is no Slang to fall back to.
 //!
 //! A picture renders again only when its uniforms change (its pose, its look, its size), so a still Kip costs one quad a
 //! frame and nothing when nothing else draws. The renders go in a command buffer of their own on the frame's queue,
@@ -9,8 +16,8 @@ use crate::gpu::PIXEL_FORMAT;
 use crate::pack::Frame;
 use harness_native_kip::MascotQuad;
 use harness_native_kip::model::Vertex;
+use harness_native_shaders::mascot::{self as shaders, mascot_fs, mascot_quad_fs, mascot_quad_vs, mascot_vs};
 use bytemuck::{Pod, Zeroable};
-use dispatch2::DispatchData;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
@@ -18,11 +25,12 @@ use objc2_metal::*;
 use std::collections::HashMap;
 use std::ptr::NonNull;
 
-mod bindings {
-    include!(concat!(env!("OUT_DIR"), "/mascot_bindings.rs"));
-}
-
-static METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mascot.metallib"));
+/// The MSL of harness-native-shaders' entries, as blaze's device build wrote it.
+static MSL: &str = include_str!(env!(
+    "BLAZE_GPU_MSL_HARNESS_NATIVE_SHADERS",
+    "harness-native-render takes Kip's shaders from blaze's device build of harness-native-shaders (`artifact = \"gpu\"`), \
+     which names its MSL in BLAZE_GPU_MSL_HARNESS_NATIVE_SHADERS: build the harness with blaze (docs/future/gpu/shaders.md)"
+));
 
 /// Samples a pixel of the picture takes.
 const SAMPLES: usize = 4;
@@ -34,7 +42,7 @@ type Tex = Retained<ProtocolObject<dyn MTLTexture>>;
 type Buf = Retained<ProtocolObject<dyn MTLBuffer>>;
 type Pso = Retained<ProtocolObject<dyn MTLRenderPipelineState>>;
 
-/// `MascotQuad` in shaders/mascot.slang.
+/// harness-native-shaders' `mascot::MascotQuad`, byte for byte.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 struct QuadParams {
@@ -42,6 +50,9 @@ struct QuadParams {
     shape: [f32; 4],
     color: [f32; 4],
 }
+
+const _: () = assert!(size_of::<QuadParams>() == size_of::<shaders::MascotQuad>());
+const _: () = assert!(size_of::<Vertex>() == size_of::<shaders::MascotVertex>());
 
 struct Picture {
     tex: Tex,
@@ -65,10 +76,6 @@ pub struct Mascots {
     serial: u64,
 }
 
-fn slot(entry: &str, param: &str) -> usize {
-    bindings::BINDINGS.iter().find(|b| b.0 == entry && b.1 == param).unwrap_or_else(|| panic!("no binding {entry}.{param}")).3 as usize
-}
-
 fn bytes<T: Pod>(v: &T) -> (NonNull<std::ffi::c_void>, usize) {
     let b = bytemuck::bytes_of(v);
     (NonNull::new(b.as_ptr().cast_mut().cast()).expect("live bytes"), b.len())
@@ -76,13 +83,19 @@ fn bytes<T: Pod>(v: &T) -> (NonNull<std::ffi::c_void>, usize) {
 
 impl Mascots {
     pub fn new(dev: &Dev) -> Self {
-        let data = DispatchData::from_bytes(METALLIB);
-        let lib = dev.newLibraryWithData_error(&data).expect("mascot metallib");
-        let f = |n: &str| lib.newFunctionWithName(&NSString::from_str(n)).unwrap_or_else(|| panic!("shader entry {n} missing from mascot.metallib"));
+        let opts = MTLCompileOptions::new();
+        // The flags build.rs gave the Slang's MSL (`xcrun metal -std=metal3.1 -ffast-math`), so the two differ only by
+        // their source; blaze-shader writes MSL 2.4 (its `MSL_VERSION`), which 3.1 compiles.
+        opts.setMathMode(MTLMathMode::Fast);
+        opts.setLanguageVersion(MTLLanguageVersion::Version3_1);
+        let lib = dev
+            .newLibraryWithSource_options_error(&NSString::from_str(MSL), Some(&opts))
+            .unwrap_or_else(|e| panic!("Metal refused harness-native-shaders' MSL (BLAZE_GPU_MSL_HARNESS_NATIVE_SHADERS): {e}"));
+        let f = |n: &str| lib.newFunctionWithName(&NSString::from_str(n)).unwrap_or_else(|| panic!("shader entry {n} missing from harness-native-shaders' MSL"));
 
         let desc = MTLRenderPipelineDescriptor::new();
-        desc.setVertexFunction(Some(&f("mascot_vs")));
-        desc.setFragmentFunction(Some(&f("mascot_fs")));
+        desc.setVertexFunction(Some(&f(mascot_vs::ENTRY.name)));
+        desc.setFragmentFunction(Some(&f(mascot_fs::ENTRY.name)));
         desc.setRasterSampleCount(SAMPLES);
         desc.setDepthAttachmentPixelFormat(MTLPixelFormat::Depth32Float);
         // SAFETY: attachment 0 always exists.
@@ -90,8 +103,8 @@ impl Mascots {
         let mesh = dev.newRenderPipelineStateWithDescriptor_error(&desc).unwrap_or_else(|e| panic!("pipeline mascot_vs/mascot_fs: {e}"));
 
         let desc = MTLRenderPipelineDescriptor::new();
-        desc.setVertexFunction(Some(&f("mascot_quad_vs")));
-        desc.setFragmentFunction(Some(&f("mascot_quad_fs")));
+        desc.setVertexFunction(Some(&f(mascot_quad_vs::ENTRY.name)));
+        desc.setFragmentFunction(Some(&f(mascot_quad_fs::ENTRY.name)));
         // SAFETY: attachment 0 always exists.
         let att = unsafe { desc.colorAttachments().objectAtIndexedSubscript(0) };
         att.setPixelFormat(PIXEL_FORMAT);
@@ -188,11 +201,18 @@ impl Mascots {
             enc.setRenderPipelineState(&self.mesh);
             enc.setDepthStencilState(Some(&self.depth));
             let (ptr, len) = bytes(&q.uniforms);
+            // The storage buffers' sizes in bytes, one `u32` each in parameter order (`gpu::EntryDesc::sizes`): `verts`'s
+            // length on the device is its size over its stride, and its bounds check reads it.
+            let sizes = [u32::try_from(count * size_of::<Vertex>()).expect("Kip's mesh is under 4 GiB, as a `u32` size names")];
+            let (sizes_ptr, sizes_len) = bytes(&sizes);
             // SAFETY: live bytes (under 4 KB), copied by setBytes; the mesh buffer is live and holds `count` vertices.
             unsafe {
-                enc.setVertexBytes_length_atIndex(ptr, len, slot("mascot_vs", "mf"));
-                enc.setFragmentBytes_length_atIndex(ptr, len, slot("mascot_fs", "mf"));
-                enc.setVertexBuffer_offset_atIndex(Some(&verts), 0, slot("mascot_vs", "verts"));
+                enc.setVertexBytes_length_atIndex(ptr, len, mascot_vs::mf.index());
+                enc.setFragmentBytes_length_atIndex(ptr, len, mascot_fs::mf.index());
+                enc.setVertexBuffer_offset_atIndex(Some(&verts), 0, mascot_vs::verts.index());
+                if let Some(at) = mascot_vs::ENTRY.sizes {
+                    enc.setVertexBytes_length_atIndex(sizes_ptr, sizes_len, at.index());
+                }
                 enc.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, count);
             }
             enc.endEncoding();
@@ -214,8 +234,8 @@ impl Mascots {
                 let (ptr, len) = bytes(frame);
                 // SAFETY: live bytes, copied by setBytes; a live sampler at a slot the shader declares.
                 unsafe {
-                    enc.setVertexBytes_length_atIndex(ptr, len, slot("mascot_quad_vs", "frame"));
-                    enc.setFragmentSamplerState_atIndex(Some(&self.sampler), slot("mascot_quad_fs", "smp"));
+                    enc.setVertexBytes_length_atIndex(ptr, len, mascot_quad_vs::frame.index());
+                    enc.setFragmentSamplerState_atIndex(Some(&self.sampler), mascot_quad_fs::smp.index());
                 }
                 bound = true;
             }
@@ -225,9 +245,9 @@ impl Mascots {
                 let (ptr, len) = bytes(&params);
                 // SAFETY: live bytes, copied by setBytes; a live texture at a slot the shader declares; one quad.
                 unsafe {
-                    enc.setVertexBytes_length_atIndex(ptr, len, slot("mascot_quad_vs", "quad"));
-                    enc.setFragmentBytes_length_atIndex(ptr, len, slot("mascot_quad_fs", "quad"));
-                    enc.setFragmentTexture_atIndex(Some(&p.tex), slot("mascot_quad_fs", "src"));
+                    enc.setVertexBytes_length_atIndex(ptr, len, mascot_quad_vs::quad.index());
+                    enc.setFragmentBytes_length_atIndex(ptr, len, mascot_quad_fs::quad.index());
+                    enc.setFragmentTexture_atIndex(Some(&p.tex), mascot_quad_fs::src.index());
                     enc.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::TriangleStrip, 0, 4);
                 }
             }
