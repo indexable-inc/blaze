@@ -1,14 +1,10 @@
-//! The lints of `blaze::edition` (`lossy_as`, `global_state`, `async_fn`): what each finds and
-//! leaves alone, and that the group is off until turned on, over an `std` of their own: a
-//! `thread_local!` that declares one `const` key per item and calls itself for the rest, as
-//! std's does, and an atomic holding an `UnsafeCell`. Then the four `unmarked_*` lints, over
-//! the effects tests' toolchain (an `Allocator`, a `Vec` that allocates through one, a
-//! `Mutex::lock`, `env::var` and `SystemTime::now` at the paths the models name): what each
-//! finds, what it leaves, and where each fix writes its attribute.
 //! The lints of `blaze::edition` (`lossy_as`, `global_state`, `async_fn`, `mut_ref`): what each
 //! finds and leaves alone, `mut_ref`'s fix, and that the group is off until turned on, over an
 //! `std` of their own: a `thread_local!` that declares one `const` key per item and calls itself
-//! for the rest, as std's does, and an atomic holding an `UnsafeCell`.
+//! for the rest, as std's does, and an atomic holding an `UnsafeCell`. Then the four
+//! `unmarked_*` lints, over the effects tests' toolchain (an `Allocator`, a `Vec` that
+//! allocates through one, a `Mutex::lock`, `env::var` and `SystemTime::now` at the paths the
+//! models name): what each finds, what it leaves, and where each fix writes its attribute.
 
 use std::path::PathBuf;
 
@@ -740,6 +736,10 @@ pub fn mix(a: u32, b: u32) -> u32 {
     for word in ["pure", "noalloc", "nonblocking"] {
         assert!(on.contains(&format!("`fn mix` is proved {word} ")), "{word}:\n{on}");
     }
+}
+
+// mut_ref
+
 /// `mut_ref`'s crate: each unique reference spelled with `mut` (receivers with and without a
 /// lifetime, types, borrows, one whose operand starts with `<`, a `ref mut` binding), beside
 /// what it leaves alone (a `&uniq` already, `let mut`, a `mut` binding, `*mut`, `&raw mut`,

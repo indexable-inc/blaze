@@ -496,7 +496,7 @@ where
         if def.def_id() != AdtId::StructId(union) || a == b {
             return None;
         }
-        if !base_db::crate_extensions(self.db(), interner.krate()?).error_unions() {
+        if !interner.krate()?.extensions(self.db()).error_unions() {
             return None;
         }
         let widened = self.commit_if_ok(|this| {

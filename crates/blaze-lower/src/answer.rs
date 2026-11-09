@@ -196,7 +196,7 @@ fn anchor(
     if !Raw::is_valid_raw(raw_file) {
         // alloc: the message of a question refused.
         return Err(format!(
-            "file_id {raw_file:#x} names an edition past {} or syntax gates there are not",
+            "file_id {raw_file:#x} names an edition past {} or syntax extensions there are not",
             span::Edition::LATEST
         ));
     }

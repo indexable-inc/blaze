@@ -51,8 +51,8 @@ mod fixed_key_lookup;
 mod fmt_allocates;
 mod front_vec_ops;
 mod frozen_collection;
-mod global_state;
 mod general_facts;
+mod global_state;
 mod goose_fields;
 mod goose_locals;
 #[cfg(test)]
@@ -489,14 +489,14 @@ impl Lint {
             Lint::DeepDropAtExit | Lint::PodSerializedByField | Lint::Packable | Lint::SoaCandidate => {
                 Kind::PedanticPerf
             }
-            // What the blaze edition removes; right for any crate getting ready for it.
-            Lint::LossyAs | Lint::GlobalState | Lint::AsyncFn => Kind::Edition,
+            // What the blaze edition removes or respells; right for any crate getting ready
+            // for it.
+            Lint::LossyAs | Lint::GlobalState | Lint::AsyncFn | Lint::MutRef => Kind::Edition,
             // What the blaze edition writes at a crate's border: an effect the code already has.
             Lint::UnmarkedPure
             | Lint::UnmarkedNopanic
             | Lint::UnmarkedNoalloc
             | Lint::UnmarkedNonblocking => Kind::Edition,
-            Lint::LossyAs | Lint::GlobalState | Lint::AsyncFn | Lint::MutRef => Kind::Edition,
             // `blaze::hot` and its comments (`// clone:`, `// alloc:`, `// dyn:`).
             Lint::HotClone
             | Lint::HotAlloc
@@ -1019,6 +1019,7 @@ impl Lint {
             }
             Lint::UnmarkedNonblocking => {
                 "write `#[blaze::nonblocking]` above the function (`blaze check --fix` does); or say why it stays unmarked with `#[expect(blaze::unmarked_nonblocking, reason = \"..\")]`"
+            }
             Lint::MutRef => {
                 "spell the unique reference `&uniq` (`ref uniq` in a pattern), as `blaze check --fix` does; or say why with `#[expect(blaze::mut_ref, reason = \"..\")]`"
             }

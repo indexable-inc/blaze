@@ -1196,6 +1196,8 @@ impl DefMap {
     #[inline]
     pub fn views(&self) -> bool {
         self.data.views
+    }
+
     /// Whether the crate says `#![blaze::pattern_types]`, so that `T is PAT` is a type and its
     /// pattern may name variants of an enum (`Conn is Conn::Open { .. }`), and a match, `if let`
     /// or `let else` narrows a plain local to the variants its pattern admits.

@@ -10,11 +10,6 @@
 //!   while it holds both texts.
 //!
 //! `parse` reparses the kept parse when the slot is of the edit's "before" text and of the same
-//! edition and kind (full or outline), else it parses the whole text. A reparse is the parse a
-//! whole parse makes (`syntax::Parse::reparse_onto`; debug builds check each one against a whole
-//! parse), so what `parse` returns is a function of the text and edition alone and the slot
-//! only changes how long it takes. The edition stands for the edition and the crate's syntax
-//! gates (`#![blaze::uniq]`) here: a parse is kept, found and made again under both.
 //! edition, syntax extensions and kind (full or outline), else it parses the whole text. A
 //! reparse is the parse a whole parse makes (`syntax::Parse::reparse_onto`; debug builds check
 //! each one against a whole parse), so what `parse` returns is a function of the text, edition
@@ -31,8 +26,6 @@ use std::{
 };
 
 use blaze_ids::ContentId;
-use span::{Edition, SyntaxGates};
-use syntax::{Parse, SourceFile, Text, TextRange, TextSize, WeakParse};
 use span::Edition;
 use syntax::{Extensions, Parse, SourceFile, Text, TextRange, TextSize, WeakParse};
 
@@ -60,7 +53,6 @@ struct Slot {
 
 struct Kept {
     edition: Edition,
-    gates: SyntaxGates,
     extensions: Extensions,
     outline: bool,
     parse: WeakParse<SourceFile>,
@@ -121,10 +113,6 @@ impl Reparse {
         self.from.as_ref().map(|(_, edit)| *edit)
     }
 
-    /// The parse of `text` (this one's text) in `edition` and under the crate's syntax
-    /// `gates`, an outline when `outline`, made from the kept parse when there is one, else
-    /// read from `stored` when it has the text's ([`Trees`], which holds ungated parses only);
-    /// kept for the next text. A stored parse that is not the text's is an error.
     /// The parse of `text` (this one's text) in `edition` and under `extensions`, an outline
     /// when `outline`, made from the kept parse when there is one, else read from `stored` when
     /// it has the text's ([`Trees`], which keeps parses under no extensions only); kept for the
@@ -133,18 +121,14 @@ impl Reparse {
         &self,
         text: &Text,
         edition: Edition,
-        gates: SyntaxGates,
         extensions: Extensions,
         outline: bool,
         stored: Option<&Trees>,
     ) -> Result<Parse<SourceFile>, TreeError> {
         debug_assert!(text.ptr_eq(&self.slot.text), "a reparse of another text");
-        if let Some(own) = self.own(edition, gates, outline) {
         if let Some(own) = self.own(edition, extensions, outline) {
             return Ok(own);
         }
-        let stored = stored.filter(|_| gates == SyntaxGates::NONE);
-        let parse = match self.previous(edition, gates, outline) {
         let stored = stored.filter(|_| extensions.is_none());
         let parse = match self.previous(edition, extensions, outline) {
             Some((previous, delete)) => {
@@ -157,19 +141,17 @@ impl Reparse {
                 }
                 parse
             }
-            // clone: a refcount, as above.
             None => match stored {
                 Some(stored) => match stored.map(self.slot.id, text, edition, outline)? {
                     Some(parse) => parse,
                     // clone: a refcount, as above.
-                    None => whole(text.clone(), edition, gates, outline),
                     None => whole(text.clone(), edition, extensions, outline),
                 },
-                None => whole(text.clone(), edition, gates, outline), // clone: a refcount, as above.
+                // clone: a refcount, as above.
                 None => whole(text.clone(), edition, extensions, outline),
             },
         };
-        self.keep(&parse, edition, gates, outline);
+        self.keep(&parse, edition, extensions, outline);
         Ok(parse)
     }
 
@@ -183,14 +165,14 @@ impl Reparse {
         self.slot.id
     }
 
-    /// The live outlines of this text made under no syntax gates, by edition: what the image
-    /// stores of a library file (its key holds no gates, so a gated one is never stored).
+    /// The live outlines of this text made under no syntax extensions, by edition: what the
+    /// image stores of a library file (its key holds no extensions, so one made under an
+    /// extension is never stored).
     pub(crate) fn kept_outlines(&self) -> impl Iterator<Item = (Edition, Parse<SourceFile>)> + '_ {
         self.slot
             .kept
             .iter()
             .filter_map(OnceLock::get)
-            .filter(|kept| kept.outline && kept.gates == SyntaxGates::NONE)
             .filter(|kept| kept.outline && kept.extensions.is_none())
             .filter_map(|kept| Some((kept.edition, kept.parse.upgrade()?)))
     }
@@ -199,28 +181,25 @@ impl Reparse {
     /// reparsed in place, `blaze_intent::Seed`), as the text's parse: [`Reparse::parse`] returns
     /// it while it lives. It is kept weakly, as the parses `parse` makes are, so the caller holds
     /// it until the file is parsed. `false`, and nothing kept, when its text is not this one,
-    /// it was made under other syntax gates than `gates`, or the slot has a live parse of the
-    /// edition already.
+    /// it was made under other syntax extensions than `extensions`, or the slot has a live
+    /// parse of the edition and extensions already.
     pub(crate) fn seed(
         &self,
         text: &Text,
         edition: Edition,
-        gates: SyntaxGates,
+        extensions: Extensions,
         parse: &Parse<SourceFile>,
     ) -> bool {
         debug_assert!(text.ptr_eq(&self.slot.text), "a seed of another text");
-        if parse.root().text() != text.as_str() || parse.gates() != gates {
+        if parse.root().text() != text.as_str() || parse.extensions() != extensions {
             return false;
         }
         if cfg!(debug_assertions) {
             assert_whole(parse, text, edition, false);
         }
-        self.keep(parse, edition, gates, false)
+        self.keep(parse, edition, extensions, false)
     }
 
-    /// A live parse of this text in `edition`, under `gates` and of the kind: a seed, or one
-    /// `parse` made that something still holds.
-    fn own(&self, edition: Edition, gates: SyntaxGates, outline: bool) -> Option<Parse<SourceFile>> {
     /// A live parse of this text in `edition`, under `extensions` and of the kind: a seed, or
     /// one `parse` made that something still holds.
     fn own(
@@ -233,17 +212,10 @@ impl Reparse {
             .kept
             .iter()
             .filter_map(OnceLock::get)
-            .filter(|kept| kept.is(edition, gates, outline))
             .filter(|kept| kept.is(edition, extensions, outline))
             .find_map(|kept| kept.parse.upgrade())
     }
 
-    /// The kept parse of the edit's "before" text in `edition`, under `gates` and of the kind,
-    /// and the range of that text the edit replaces.
-    fn previous(
-        &self,
-        edition: Edition,
-        gates: SyntaxGates,
     /// The kept parse of the edit's "before" text in `edition`, under `extensions` and of the
     /// kind, and the range of that text the edit replaces.
     fn previous(
@@ -266,28 +238,22 @@ impl Reparse {
             .iter()
             .rev()
             .filter_map(OnceLock::get)
-            .filter(|kept| kept.is(edition, gates, outline))
             .filter(|kept| kept.is(edition, extensions, outline))
             .find_map(|kept| kept.parse.upgrade())?;
         Some((parse, edit.delete))
     }
 
-    /// Keeps `parse` in this text's slot, unless a live one of its edition, gates and kind is
+    /// Keeps `parse` in this text's slot, unless a live one of its edition, extensions and kind is
     /// kept: whether it kept this one.
     fn keep(
         &self,
         parse: &Parse<SourceFile>,
         edition: Edition,
-        gates: SyntaxGates,
+        extensions: Extensions,
         outline: bool,
     ) -> bool {
-    /// Keeps `parse` in this text's slot, unless a live one of its edition, extensions and kind
-    /// is kept: whether it kept this one.
-    fn keep(&self, parse: &Parse<SourceFile>, edition: Edition, outline: bool) -> bool {
-        let extensions = parse.extensions();
         for kept in &self.slot.kept {
             match kept.get() {
-                Some(it) if it.is(edition, gates, outline) => {
                 Some(it) if it.is(edition, extensions, outline) => {
                     if it.parse.upgrade().is_some() {
                         return false;
@@ -295,7 +261,6 @@ impl Reparse {
                 }
                 Some(_) => {}
                 None => {
-                    let made = Kept { edition, gates, outline, parse: parse.downgrade() };
                     let made = Kept { edition, extensions, outline, parse: parse.downgrade() };
                     if kept.set(made).is_ok() {
                         return true;
@@ -326,16 +291,6 @@ thread_local! {
     pub(crate) static WHOLE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-impl Kept {
-    fn is(&self, edition: Edition, gates: SyntaxGates, outline: bool) -> bool {
-        self.edition == edition && self.gates == gates && self.outline == outline
-    }
-}
-
-pub(crate) fn whole(
-    text: Text,
-    edition: Edition,
-    gates: SyntaxGates,
 pub(crate) fn whole(
     text: Text,
     edition: Edition,
@@ -345,20 +300,15 @@ pub(crate) fn whole(
     #[cfg(test)]
     WHOLE.with(|it| it.set(it.get() + 1));
     match outline {
-        true => SourceFile::parse_outline_gated(text, edition, gates),
-        false => SourceFile::parse_gated(text, edition, gates),
         true => SourceFile::parse_outline_with(text, edition, extensions),
         false => SourceFile::parse_shared_with(text, edition, extensions),
     }
 }
 
-/// Panics unless `made` is the parse a whole parse of `text` makes, under the syntax gates
-/// `made` was made under: the same tree and errors.
 /// Panics unless `made` is the parse a whole parse of `text` makes (under `made`'s
 /// extensions): the same tree and errors.
 pub(crate) fn assert_whole(made: &Parse<SourceFile>, text: &Text, edition: Edition, outline: bool) {
     // clone: the check of debug builds and tests, not of a release parse.
-    let whole = whole(text.clone(), edition, made.gates(), outline);
     let whole = whole(text.clone(), edition, made.extensions(), outline);
     assert!(
         made.root().file() == whole.root().file(),

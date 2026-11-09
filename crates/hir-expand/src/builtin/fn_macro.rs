@@ -1171,8 +1171,8 @@ fn relative_file(
     if res == call_site && !allow_recursion {
         Err(ExpandError::other(err_span, format!("recursive inclusion of `{path_str}`"))) // alloc: an error's message, on the error path
     } else {
-        let (edition, gates) = (lookup.krate.data(db).edition, lookup.krate.syntax_gates(db));
-        Ok(EditionedFileId::new_gated(db, res, edition, gates))
+        let (edition, extensions) = (lookup.krate.data(db).edition, lookup.krate.extensions(db));
+        Ok(EditionedFileId::new_with_extensions(db, res, edition, extensions))
     }
 }
 

@@ -367,10 +367,10 @@ impl Crate {
         self.id.data(db).edition
     }
 
-    /// The syntax gates the crate turns on (`#![blaze::uniq]`): its files parse and print
-    /// under them ([`base_db::Crate::syntax_gates`]).
-    pub fn syntax_gates(self, db: &Db) -> span::SyntaxGates {
-        self.id.syntax_gates(db)
+    /// The syntax extensions the crate turns on (`#![blaze::uniq]`): its files parse and print
+    /// under them ([`base_db::Crate::extensions`]).
+    pub fn extensions(self, db: &Db) -> span::Extensions {
+        self.id.extensions(db)
     }
 
     pub fn version(self, db: &Db) -> Option<String> {

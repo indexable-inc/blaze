@@ -128,8 +128,9 @@ fn own_code(db: &Db, krate: Crate) -> ContentId {
         };
         let code = match path.ends_with(".rs") {
             true => {
-                let gates = krate.syntax_gates(db);
-                code_text(db, EditionedFileId::new_gated(db, file, data.edition, gates))
+                let extensions = krate.extensions(db);
+                let file = EditionedFileId::new_with_extensions(db, file, data.edition, extensions);
+                code_text(db, file)
             }
             false => None,
         };

@@ -1035,8 +1035,8 @@ impl Persist for InferenceRecord {
         // 25: `comptime_loops`, after the named pattern types in the side table words.
         // 26: `SolverDiagnosticKind::ReflectedMemberUnmet` (solver kind 9).
         // 27: `InferenceDiagnostic::PrivateField::at`, an `offset_of!` field's position.
-        // 28: `InferenceDiagnostic::WholeValueWriteThroughRefinement` (tag 90).
-        // 28: `Adjust::ErrorUnion` (adjust code 16).
+        // 28: `InferenceDiagnostic::WholeValueWriteThroughRefinement` (tag 90) and
+        //     `Adjust::ErrorUnion` (adjust code 16).
         Part::U64(28),
         Part::Schema(<InferRoot as Record>::SCHEMA),
     ]);

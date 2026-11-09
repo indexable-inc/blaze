@@ -11,6 +11,7 @@ mod content;
 pub mod crate_attrs;
 mod db;
 mod editioned_file_id;
+mod extensions;
 mod file_set;
 mod files;
 mod input;
@@ -19,7 +20,6 @@ mod named;
 mod reparse;
 mod settings;
 mod source_path;
-mod syntax_gates;
 mod table;
 pub mod target;
 #[cfg(test)]
@@ -34,7 +34,7 @@ pub use crate::{
     content::{CFG_OPTIONS_DOMAIN, InputId, cfg_options_content},
     crate_attrs::{
         CRATE_ATTR_FILE_NAME, CrateAttrError, applied_crate_attr_files, crate_attr_error,
-        crate_attr_files, crate_attr_owner, crate_extensions,
+        crate_attr_files, crate_attr_owner,
     },
     db::{Db, Reader, RunOrder, Shared, executions, set_run_order},
     editioned_file_id::EditionedFileId,

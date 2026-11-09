@@ -1091,6 +1091,7 @@ pub(super) const BLAZE: &[Lint] = &[
     l("blaze::unmarked_noalloc", Allow, "detects a function the effects walk proves never calls the global allocator that lacks `#[blaze::noalloc]`, which callers could rely on")
         .externally_loaded(),
     l("blaze::unmarked_nonblocking", Allow, "detects a function the effects walk proves never blocks the thread that lacks `#[blaze::nonblocking]`, which callers could rely on")
+        .externally_loaded(),
     l("blaze::mut_ref", Allow, "detects a unique reference spelled `&mut` or `ref mut` in a crate that says `#![blaze::uniq]`, which spells it `&uniq` and `ref uniq`")
         .externally_loaded(),
     // Emitted by the release build, which reads it from the code LLVM made, never by `blaze check`.

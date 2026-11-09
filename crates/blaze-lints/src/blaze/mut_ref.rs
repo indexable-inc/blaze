@@ -54,7 +54,7 @@ struct Found<'t> {
 /// `node`, when it is a reference type, a borrow, a receiver or a `ref` binding spelled with
 /// `mut`, in a crate that says `#![blaze::uniq]`.
 pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
-    if !cx.on_blaze(LINT) || !cx.in_file() || !cx.krate().syntax_gates(cx.db()).uniq() {
+    if !cx.on_blaze(LINT) || !cx.in_file() || !cx.krate().extensions(cx.db()).uniq() {
         return;
     }
     let Some(found) = found(node) else { return };

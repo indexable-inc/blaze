@@ -208,7 +208,6 @@ impl<T> Parse<T> {
             tree: self.tree.take(),
             errors: self.errors.take(),
             outline: self.outline,
-            gates: self.gates,
             extensions: self.extensions,
             _ty: PhantomData,
         }
@@ -225,7 +224,6 @@ impl Parse<Untyped> {
             tree: self.tree.take(),
             errors: self.errors.take(),
             outline: self.outline,
-            gates: self.gates,
             extensions: self.extensions,
             _ty: PhantomData,
         })

@@ -146,13 +146,13 @@ impl DefMap {
                         // (`hir_ty_borrowck::views`, docs/v2/plan/design/edition.md).
                         | "views"
                         // `#![blaze::uniq]`, read off the root's tokens before any parse
-                        // (`base_db::Crate::syntax_gates`, docs/v2/plan/design/edition.md).
+                        // (`base_db::Crate::extensions`, docs/v2/plan/design/edition.md).
                         | "uniq"
                         // `#![blaze::pattern_types]`, from `DefMap::pattern_types`
                         // (docs/v2/plan/design/edition.md, section 8).
                         | "pattern_types"
-                        // `#![blaze::error_unions]`, read off the crate root's tokens by
-                        // `base_db::crate_extensions` (the parser's `A | B` types).
+                        // `#![blaze::error_unions]`, read off the root's tokens the same way
+                        // (`base_db::Crate::extensions`: the parser's `A | B` types).
                         | "error_unions"
                         // `#[blaze::reflect]`, from `AttrFlags::BLAZE_REFLECT`
                         // (`hir_ty_comptime::struct_domain`, docs/v2/plan/design/comptime.md).

@@ -123,13 +123,22 @@ fn a_member_that_is_not_a_known_named_type_is_refused_naming_why() {
     });
 }
 
-/// `other` shares `main`'s source root, so its file parses with the union; hir-ty refuses it,
-/// as the crate lacks the attribute.
+/// `other` lacks the attribute, so its file parses as Rust's though it shares `main`'s source
+/// root (a file is read under its own crate's extensions): its `A | B` is the syntax error it
+/// is in Rust, and no union of it reaches hir-ty. `main`'s file, read under `main`'s, has none.
 #[test]
-fn a_crate_without_the_attribute_is_refused() {
-    fields("other", |_, _, diagnostics| {
-        assert_eq!(refusals(diagnostics), [ErrorUnionRefusal::NotEnabled], "{diagnostics:?}");
-    });
+fn a_crate_without_the_attribute_parses_no_union() {
+    let db = fixture::db(FIXTURE).into_db();
+    blaze_query::db::attach(&db, || {
+        let (main, other) = (crate_named(&db, "main"), crate_named(&db, "other"));
+        assert!(main.extensions(&db).error_unions());
+        assert!(other.extensions(&db).is_none());
+        let (main, other) = (main.root_file_id(&db), other.root_file_id(&db));
+        assert!(main.extensions(&db).error_unions() && other.extensions(&db).is_none());
+        let errors = main.parse(&db).errors();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(!other.parse(&db).errors().is_empty(), "`A | B` is no type in `other`");
+    })
 }
 
 /// Bodies that widen into unions, in a crate with the attribute (`main`), and one without it

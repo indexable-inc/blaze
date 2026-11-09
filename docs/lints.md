@@ -19,16 +19,12 @@ the release build reports, only by its flags). `checkfree`,
 `nopanic`, `noalloc` and `nonblocking` are in `blaze::general` but `deny` by default, and fire
 only on functions marked with their attribute (`#[blaze::checkfree]`, `#[blaze::nopanic]`, ...).
 
-The group `blaze::edition` (`async_fn`, `global_state`, `lossy_as`, `unmarked_pure`,
-`unmarked_nopanic`, `unmarked_noalloc`, `unmarked_nonblocking`) flags what the blaze edition
-removes and what it writes at a crate's border (docs/v2/plan/design/edition.md); it is allowed
-unless a workspace or crate turns it on to get ready for the edition (`edition = "warn"` in
-`[workspace.metadata.blaze.lints]`, or `#![warn(blaze::edition)]`). Only the four `unmarked_*`
-lints have a fix.
-The group `blaze::edition` (`async_fn`, `global_state`, `lossy_as`, `mut_ref`) flags what the
-blaze edition removes or respells (docs/v2/plan/design/edition.md); it is allowed unless a
-workspace or crate turns it on to get ready for the edition (`edition = "warn"` in
-`[workspace.metadata.blaze.lints]`, or `#![warn(blaze::edition)]`). Only `mut_ref` has a fix.
+The group `blaze::edition` (`async_fn`, `global_state`, `lossy_as`, `mut_ref`,
+`unmarked_pure`, `unmarked_nopanic`, `unmarked_noalloc`, `unmarked_nonblocking`) flags what the
+blaze edition removes or respells and what it writes at a crate's border
+(docs/v2/plan/design/edition.md); it is allowed unless a workspace or crate turns it on to get
+ready for the edition (`edition = "warn"` in `[workspace.metadata.blaze.lints]`, or
+`#![warn(blaze::edition)]`). Only `mut_ref` and the four `unmarked_*` lints have a fix.
 
 Several lints come from ideas of the Goose language (no global heap, data stacks, bump
 growth, inline nested data, narrow relative links, variable-size enums, in-place construction

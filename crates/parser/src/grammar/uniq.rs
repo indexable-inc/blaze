@@ -1,6 +1,6 @@
 //! `&uniq` and `ref uniq` (`#![blaze::uniq]`, docs/v2/plan/design/edition.md, change 10).
 //!
-//! In a crate that says `#![blaze::uniq]` ([`crate::SyntaxGates::UNIQ`]), `uniq` is a keyword
+//! In a crate that says `#![blaze::uniq]` ([`crate::Extensions::UNIQ`]), `uniq` is a keyword
 //! in exactly four places and an identifier everywhere else; in every other crate it is always
 //! an identifier and the grammar is rustc's, token for token. Where it is the keyword it goes in
 //! the tree as a `mut` token whose text is `uniq` (`Parser::bump_remap`), so the tree has the

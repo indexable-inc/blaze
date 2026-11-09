@@ -5,7 +5,7 @@
 
 use parser::Edition;
 
-use crate::{Parse, SourceFile, SyntaxGates, SyntaxKind};
+use crate::{Extensions, Parse, SourceFile, SyntaxKind};
 
 /// One unique reference in each position: a field's and a parameter's type, with and without
 /// a lifetime and nested, a receiver with and without a lifetime, a borrow of a place, of an
@@ -46,11 +46,11 @@ fn names(uniq: u32, p: &uniq, q: &uniq<u8>, r: &uniq::X, s: &uniq!()) {
 "#;
 
 fn gated(text: &str) -> Parse<SourceFile> {
-    SourceFile::parse_gated(text, Edition::CURRENT, SyntaxGates::UNIQ)
+    SourceFile::parse_shared_with(text, Edition::CURRENT, Extensions::UNIQ)
 }
 
 fn ungated(text: &str) -> Parse<SourceFile> {
-    SourceFile::parse_gated(text, Edition::CURRENT, SyntaxGates::NONE)
+    SourceFile::parse_shared_with(text, Edition::CURRENT, Extensions::NONE)
 }
 
 /// The kind of every node and token of the parse, in order: its shape, without the text.
@@ -72,7 +72,7 @@ fn spelled_uniq(parse: &Parse<SourceFile>) -> usize {
 fn every_position_parses_as_its_mut_spelling() {
     let uniq = gated(POSITIONS);
     assert!(uniq.errors().is_empty(), "{}", uniq.debug_dump());
-    assert_eq!(uniq.gates(), SyntaxGates::UNIQ);
+    assert_eq!(uniq.extensions(), Extensions::UNIQ);
     assert_eq!(spelled_uniq(&uniq), POSITIONS.matches("uniq").count(), "{}", uniq.debug_dump());
     let spelled_mut = POSITIONS.replace("uniq", "mut");
     for mut_ in [ungated(&spelled_mut), gated(&spelled_mut)] {
@@ -132,8 +132,8 @@ fn without_the_gate_uniq_is_a_syntax_error_as_before() {
 /// reparse of a gated parse stays gated.
 #[test]
 fn outlines_and_reparses_keep_the_gate() {
-    let outline = SourceFile::parse_outline_gated(POSITIONS, Edition::CURRENT, SyntaxGates::UNIQ);
-    assert_eq!(outline.gates(), SyntaxGates::UNIQ);
+    let outline = SourceFile::parse_outline_with(POSITIONS, Edition::CURRENT, Extensions::UNIQ);
+    assert_eq!(outline.extensions(), Extensions::UNIQ);
     assert!(outline.errors_with_bodies().is_empty(), "{}", outline.debug_dump());
     assert_eq!(kinds(&outline), kinds(&gated(POSITIONS)));
     assert_eq!(spelled_uniq(&outline), POSITIONS.matches("uniq").count());
@@ -141,7 +141,7 @@ fn outlines_and_reparses_keep_the_gate() {
     let before = "fn f(r: &uniq u32) { let _ = &uniq x; }\n";
     let after = "fn f(r: &uniq u32) { let _ = &uniq y; }\n";
     let reparsed = gated(before).reparse_to(after, Edition::CURRENT);
-    assert_eq!(reparsed.gates(), SyntaxGates::UNIQ);
+    assert_eq!(reparsed.extensions(), Extensions::UNIQ);
     assert!(reparsed.errors().is_empty(), "{}", reparsed.debug_dump());
     assert_eq!(kinds(&reparsed), kinds(&gated(after)));
     assert_eq!(spelled_uniq(&reparsed), 2);

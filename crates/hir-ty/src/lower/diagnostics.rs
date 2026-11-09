@@ -96,8 +96,9 @@ pub enum TyLoweringDiagnostic {
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
 pub enum ErrorUnionRefusal {
     /// The crate does not say `#![blaze::error_unions]` plainly among the inner attributes that
-    /// open its root (under `cfg_attr` it is not read): its file is parsed with the syntax only
-    /// because another crate of its source root says it.
+    /// open its root (under `cfg_attr` it is not read). Its own files parse no union
+    /// (`base_db::Crate::extensions`), so this is a union that reached it some other way, and
+    /// is refused rather than lowered.
     NotEnabled,
     /// `core` declares no `#[lang = "error_union"]` type to lower the union to.
     NoLangItem,

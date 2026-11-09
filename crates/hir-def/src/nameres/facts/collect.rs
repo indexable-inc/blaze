@@ -167,6 +167,8 @@ pub(crate) fn crate_data(db: &Db, krate: Crate) -> Arc<DefMapCrateData> {
             && name.symbol().as_str() == "views"
         {
             crate_data.views = true;
+            continue;
+        }
         // `#![blaze::pattern_types]`: `T is PAT` types and variant refinements in this crate
         // (`DefMap::pattern_types`, docs/v2/plan/design/edition.md, section 8).
         if let [tool, name] = attr.path.segments()

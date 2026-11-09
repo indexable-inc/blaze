@@ -47,7 +47,7 @@ impl<'db> TyLoweringContext<'db, '_> {
             this.push_diagnostic(TyLoweringDiagnostic::ErrorUnionRefused { source, reason });
             error
         };
-        if !base_db::crate_extensions(self.db, self.resolver.krate()).error_unions() {
+        if !self.resolver.krate().extensions(self.db).error_unions() {
             return refuse(self, source, ErrorUnionRefusal::NotEnabled);
         }
         let Some(lang) = self.lang_items.ErrorUnion else {

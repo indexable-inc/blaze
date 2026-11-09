@@ -83,6 +83,8 @@ impl<'t> Parser<'t> {
     /// Whether a bare `T is PAT` is a type here (`#![blaze::pattern_types]`).
     pub(crate) fn bare_pattern_types(&self) -> bool {
         self.bare_pattern_types
+    }
+
     /// Whether a type parsed here may be an error union `A | B`.
     pub(crate) fn unions(&self) -> bool {
         self.unions
@@ -464,9 +466,9 @@ impl<'t> Parser<'t> {
     }
 
     /// Whether the parse is of a crate that says `#![blaze::uniq]`
-    /// ([`crate::SyntaxGates::uniq`]): only then does `grammar/uniq.rs` take `uniq` as a keyword.
+    /// ([`crate::Extensions::uniq`]): only then does `grammar/uniq.rs` take `uniq` as a keyword.
     pub(crate) fn uniq_gate(&self) -> bool {
-        self.inp.gates().uniq()
+        self.inp.extensions().uniq()
     }
 }
 
