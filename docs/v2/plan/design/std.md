@@ -184,6 +184,17 @@ directories; a test gives a fake.
 
   `Http::best(&io)` is that match, for the common case.
 
+- **Both arms give the same type.** `Http` is one struct whose provider is a field, so the match
+  type-checks, and code below it is compiled once.
+- **What the target can never offer is settled at compile time.** A target's possible
+  capabilities are a constant (`bstd::host::OFFERS`). A provider the target cannot have is not a
+  variant of the field at all, and `io.net()` on a target with no sockets is a constant `None`,
+  so the match above folds to one arm and the call to one direct call: no dispatch is paid for a
+  choice the build already made. A capability `main` requires that the target cannot offer is a
+  compile error, not a failure at start.
+- **What is left for run time** is only what truly varies there: a parent that granted a child
+  less than its target allows, and a handler passed in a test.
+
 ## Cx: the task's context
 
 A capability says what code may touch. `Cx` says on whose behalf it runs. Every task has one, and
