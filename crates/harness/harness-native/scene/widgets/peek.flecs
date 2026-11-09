@@ -156,8 +156,10 @@ hn {
       TextStyle: {size: $size_peek_meta, line: $line_peek_meta, role: 10, bold: 0}
     }
   }
-  // A failed one: the cross, in the failing checks' ink (oct-x).
+  // A failed one: the cross and its name in the failing checks' ink (oct-x), its name a step heavier: what failed is
+  // what the card is for.
   prefab PeekCheckFailed : hn.PeekCheck {
+    name : ui.Line { Fill: $tone_gh_ci_failure; TextStyle: {size: $size_peek_meta, line: $line_peek_meta, role: 0, bold: 0, weight: 560} }
     mark : ui.Symbol { Icon: {glyph: ""}; Fill: $tone_gh_ci_failure }
   }
   // A running one: the running dot, breathing while it shows, in the pending checks' ink (cod-circle_small_filled).

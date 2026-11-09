@@ -435,7 +435,11 @@ impl App {
             };
             self.ask_checks(st, &r, item.as_ref(), checks.as_ref());
             // The checks' list opens while the pointer is on the state line or the list (one hit target, PeekState).
-            let open = block || card.part("state").is_some_and(|s| under_pointer(w, s));
+            // Listed at once on a card in the transcript, or whenever anything failed (what failed is the news); else
+            // while the pointer is on the state line.
+            let failed = item.as_ref().is_some_and(|it| it.ci == Some(GhCi::Failure))
+                || checks.as_ref().is_some_and(|c| c.checks.iter().any(|k| k.state == GhCheckState::Failed));
+            let open = block || failed || card.part("state").is_some_and(|s| under_pointer(w, s));
             let at = Checks { known: checks.as_ref(), open, now: unix_now(), expand: block };
             gh_lines(w, tag, &r, item.as_ref(), &at, dark, &mut lines);
         } else {
