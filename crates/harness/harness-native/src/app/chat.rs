@@ -2198,8 +2198,8 @@ impl App {
     }
 
     /// Open what transcript place `s` of session `sid` is on: an inline component (`<Path loc="...">`, through the scene's
-    /// `ui.inline`, relative paths from the session's directory) or a markdown link, in the app its kind opens in; an
-    /// Option-press shows a file in the Finder. A component that cannot open says why in the log, naming it.
+    /// `ui.inline`, relative paths from the session's directory) or a markdown link, in the browser pane on the right; an
+    /// Option-press opens it outside ([`App::open_target`]). A component that cannot open says why in the log, naming it.
     fn chat_open_at(&mut self, sid: u64, s: Spot) {
         let rows = self.chat_rows(sid);
         let Some((_, src, true)) = rows.get(s.row).and_then(|(_, r)| texts(r).into_iter().nth(s.part)) else { return };
@@ -2225,7 +2225,7 @@ impl App {
         } else {
             return;
         };
-        crate::open::open(&target, self.press.1.alt);
+        self.open_target(&target, self.press.1.alt);
     }
 
     /// Session `sid`'s transcript as rows.

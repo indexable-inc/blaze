@@ -55,6 +55,10 @@ pub fn run(path: &str) -> Result<(), String> {
             app.palette_query(&q);
         }
     }
+    // HARNESS_NATIVE_SHOT_OPEN `<url>|<path>`: opened as a press on a link to it would (the browser pane on the right).
+    if let Ok(t) = std::env::var("HARNESS_NATIVE_SHOT_OPEN") {
+        app.open_target(&t, false);
+    }
     // A session id, a run (`r12`) or one of its stages (`r12.0`).
     if let Ok(s) = std::env::var("HARNESS_NATIVE_SHOT_SELECT") {
         if s == "archive" {
