@@ -167,7 +167,7 @@ pub(super) fn opt_item(
     }
 
     // modifiers
-    if p.at(T![const]) && p.nth(1) != T!['{'] {
+    if p.at(T![const]) && p.nth(1) != T!['{'] && !at_comptime_block(p) {
         p.eat(T![const]);
         has_mods = true;
     }
@@ -268,7 +268,7 @@ pub(super) fn opt_item(
         // pub unsafe mod n;
         T![mod] if is_unsafe_mod => mod_item(p, m),
 
-        T![const] if p.nth(1) != T!['{'] => consts::konst(p, m),
+        T![const] if p.nth(1) != T!['{'] && !at_comptime_block(p) => consts::konst(p, m),
         T![static] if matches!(p.nth(1), IDENT | T![_] | T![mut]) => consts::static_(p, m),
 
         T![trait] => traits::trait_(p, m),
@@ -297,6 +297,12 @@ pub(super) fn opt_item(
         _ => return Err(m),
     }
     Ok(())
+}
+
+/// Whether `p` is at `const static {`, blaze's `const static { .. }` block
+/// (`#![feature(blaze_comptime)]`): an expression, never an item's `const`.
+fn at_comptime_block(p: &Parser<'_>) -> bool {
+    p.at(T![const]) && p.nth(1) == T![static] && p.nth(2) == T!['{']
 }
 
 fn opt_item_without_modifiers(p: &mut Parser<'_>, m: Marker) -> Result<(), Marker> {

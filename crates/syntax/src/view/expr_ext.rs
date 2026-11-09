@@ -338,6 +338,18 @@ pub enum BlockModifier<'t> {
 }
 
 impl<'t> ast::BlockExpr<'t> {
+    /// The `static` of a `const static { .. }` block (blaze's `#![feature(blaze_comptime)]`).
+    pub fn static_token(self) -> Option<Token<'t>> {
+        support::token(self.syntax, T![static])
+    }
+
+    /// Whether the block is `const static { .. }` (blaze's `#![feature(blaze_comptime)]`,
+    /// docs/v2/plan/design/comptime.md): a `const` block evaluated with no const checking. Its
+    /// [`Self::modifier`] is `Const`, as it is a `const { .. }` block to everything else.
+    pub fn is_comptime(self) -> bool {
+        self.const_token().is_some() && self.static_token().is_some()
+    }
+
     pub fn modifier(self) -> Option<BlockModifier<'t>> {
         self.gen_token()
             .map(|v| {
