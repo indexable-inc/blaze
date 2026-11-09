@@ -285,6 +285,55 @@ they mean.
   `path` to be combined with an `Fs` later. A name joined to authority far from where it was
   checked is where confused-deputy bugs come from.
 
+## Tracing
+
+The recorder is the one [no-tracing](no-tracing.md) specifies (`blaze-trace`: per-thread rings,
+fixed-layout rows, fields as words, no formatting on the hot path) feeding the profile history
+([profiling](../../../profiling.md), [ix-prof-format](../../../ix-prof-format.md)). bstd does not
+add a second one. It changes where the span lives, what is recorded without being asked, and how
+a site is described. Where this section and no-tracing differ, this section is the newer.
+
+- **The span is in `Cx`.** `let cx = cx.span(FETCH, &url);` returns a child `Cx`; the span ends
+  when it drops; everything called with it is inside. A spawned task's `cx` comes from its scope,
+  so the trace tree is the task tree and nothing needs attaching by hand. This replaces the
+  thread-local enter stack: a task can change threads at any wait, and nothing here is global.
+  The ring is the current worker's, reached through `Cx`.
+- **The runtime records by itself**, with no instrumentation in user code:
+  - per task, time split three ways: running, parked (on what, from the one wait), and ready but
+    not running (queue delay);
+  - wake edges, which task woke which. A lock is built on the wait and records its holder, so a
+    slow wait reads "lock L, held by task N in span S";
+  - the task's logical stack for the sampler: the slab's frame chain under `Frames`, the fiber's
+    stack under `Fibers`.
+- **A site is described at compile time.** blaze is the compiler and the linker, so each span and
+  event site gets its id and a static schema (name, field names and types, file and line) in a
+  table beside the binary. Nothing about a site is formatted, hashed or registered at run time.
+  (no-tracing rejected link-time ids because a distributed slice was the only way; it is not.)
+- **An event is fixed bytes**: site id, timestamp, task id, span id, raw field bytes, copied into
+  the worker's ring. No formatting, allocation, lock, system call or write to another thread's
+  memory. A drainer moves full chunks out; decoding happens offline against the schema table,
+  straight into the history's typed columns.
+- **Field encoders come from reflection** ([comptime](comptime.md)), not a macro and not `Debug`.
+  A field whose type has no encoder is an error at the site, naming the type; there is no
+  format-as-text path.
+- **Secrets cannot be recorded.** A `Secret` field of a struct encodes as nothing; recording one
+  directly is a compile error naming the field.
+- **Time comes from the injected clock**: the CPU's counter read directly in production, virtual
+  time under `Io::sim(seed)`. A seeded run gives a byte-identical trace, so a trace can be a
+  test's oracle.
+- **The tracer never blocks a worker.** A full ring drops and counts, per worker, and the count
+  is recorded.
+- **Keep or drop at the end.** A task's detailed events are buffered and kept only when the task
+  was slow or failed; its cheap summary is always kept.
+- **A disabled site**: patched out by the live-patch engine so it costs nothing, or one branch on
+  a per-site flag. Chosen by measurement, and the number is written here.
+
+Checked: the emit path is `nopanic`, `noalloc` and `nonblocking`, enforced, so tracing stays on
+in release. Proved: a bound for the emit path in [bounds.md](../bounds.md) (a counter read and a
+few stores into a hot buffer) with a budget on ns and bytes per event and zero allocations; a
+simulation test of ring and drainer whose oracle is "every event is delivered once, in order per
+worker, or counted as dropped", with a planted bug; and an encode-decode round trip.
+
 ## Errors
 
 One error type per area (`FsError`, `NetError`, ...), each naming the operation, the thing (the
@@ -346,6 +395,7 @@ Interface first, bottom last, so nothing waits on the runtime and every step lan
 | S2 | The `ambient` and `unsafe` effects, `#![blaze::capabilities]`, `blaze explain trusted` | a crate with the attribute that calls `std::fs` is refused, naming the call path |
 | S3 | blaze's crates move, leaves first: a sans-IO core takes nothing, a driver takes the piece it needs, `blaze`'s `main` takes `Io`. Each move is a `.clippy.toml` ban and `blaze check --fix` (rule `fix-through-blaze-lints`) | every crate in `crates/` has `#![blaze::capabilities]` |
 | S1b | `bstd::{sync, cell}`: the table of "Shared mutation", token cells, `Freeze` as a bound, typed names (`HostPort`, `VarName`) in place of strings, and bans on the removed names | misuse tests: two live `get_mut` on one token do not compile; a static that is not `Freeze` is refused |
+| S1c | Tracing on bstd: the span in `Cx` and the scheduler's own events first; then the compile-time site table and the ring; then reflection encoders and redaction; disabled-site patching and keep-or-drop last | the emit budget holds; the ring's simulation test and the round trip pass |
 | S3b | The `Frames` layout: the calling convention, the slab, unwinding, and the profiler and backtraces walking the frame chain | the differential test against `Fibers` passes |
 | S4 | The bottom: `bstd::sys` and `bstd::rt`, `blaze-core`'s drivers move in as `bstd::driver`, and bstd is `#![no_std]` | no blaze crate links Rust's `std`; C1 still passes |
 | S5 | The edition: `edition = "blaze-2026.11"` makes `std` name bstd, `fn main(io: Io)` is the entry, and the OS sandbox of a program is derived from what `main` hands out | a program of the edition that never opens the network cannot, checked by the sandbox |
