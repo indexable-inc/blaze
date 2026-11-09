@@ -113,6 +113,16 @@ pub(super) fn atom_expr(
         T![break] => break_expr(p, r),
 
         LIFETIME_IDENT if la == T![:] => labeled_expr(p)?,
+        // `const static { .. }` (blaze's `#![feature(blaze_comptime)]`): a `const` block whose
+        // body is evaluated with no const checking. No Rust program has it: rustc takes
+        // `const static` only before a closure's `|`.
+        T![const] if la == T![static] && p.nth(2) == T!['{'] => {
+            let m = p.start();
+            p.bump(T![const]);
+            p.bump(T![static]);
+            stmt_list(p);
+            m.complete(p, BLOCK_EXPR)
+        }
         // test effect_blocks
         // fn f() { unsafe { } }
         // fn f() { const { } }

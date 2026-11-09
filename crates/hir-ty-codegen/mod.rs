@@ -2068,6 +2068,28 @@ fn refused_const_eval(
                 // alloc: the error's message
                 return Some(CodegenError::Refused(format!("the value of {what}: {e:?}")));
             }
+            // `#![feature(blaze_comptime)]`'s refusals: a call through a function pointer or
+            // vtable that reached a function that is not const, or what a `const static` block
+            // cannot do at compile time; named, with where it was.
+            MirEvalError::Comptime(error) => {
+                let at = error
+                    .at
+                    .and_then(|(owner, span)| fncache::location(db, owner, span))
+                    // alloc: the error's message
+                    .map(|it| format!(" at {it}"))
+                    .unwrap_or_default();
+                let text = match error.at {
+                    Some((owner, _)) => {
+                        let krate = owner.module(db).krate(db);
+                        let target = hir_ty::display::DisplayTarget::from_crate(db, krate);
+                        hir_ty_mir::mir_pretty::comptime_error_text(db, error, target)
+                    }
+                    // alloc: the error's message
+                    None => format!("{error:?}"),
+                };
+                // alloc: the error's message
+                return Some(CodegenError::Refused(format!("const eval of {what}{at}: {text}")));
+            }
             MirEvalError::MirLowerError(func, error) => {
                 // alloc: the error's message
                 let name = hir_ty_print::rustc_function_name(db, *func, &[])
