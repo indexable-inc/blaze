@@ -58,6 +58,7 @@ macro_rules! per_tag {
             concat!($prefix, "profile"),
             concat!($prefix, "other"),
             concat!($prefix, "solver"),
+            concat!($prefix, "pool"),
         ]
     };
 }
