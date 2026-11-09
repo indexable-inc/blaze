@@ -82,7 +82,7 @@ thread_local! {
 /// again ([`crate::par`]). The count moves with its job when the job switches threads.
 ///
 /// Not inlined: the thread-local's address is looked up anew at each call, never kept across
-/// a wait that may resume the job on another thread (rule 24).
+/// a wait that may resume the job on another thread (rule 27).
 #[inline(never)]
 pub fn gave_way() -> u64 {
     GAVE_WAYS.with(Cell::get)
@@ -372,7 +372,7 @@ impl<V: Clone + Send + Sync + 'static> Drop for Ending<'_, V> {
 }
 
 /// Why [`Flights::hold`] holds nothing; the key is the caller's to name, which it knows by what
-/// it holds (rule 16).
+/// it holds (rule 19).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NotHeld {
     /// Another task runs the key now.

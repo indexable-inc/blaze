@@ -1,5 +1,5 @@
 //! The decisions of one fetch, as a synchronous state machine on an injected clock (AGENTS.md
-//! rule 12): whether to ask again after a failure and when, when to give up, and whether what
+//! rule 14): whether to ask again after a failure and when, when to give up, and whether what
 //! came is what was pinned. It owns no socket, file, thread or timer; the driver
 //! ([`crate::fetcher`]) does the IO, tells it the time ([`Attempts::advance_clock`]) and what
 //! happened ([`Attempts::failed`]), and does what it decides ([`Attempts::next_decision`],

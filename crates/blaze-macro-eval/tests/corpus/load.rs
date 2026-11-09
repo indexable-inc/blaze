@@ -8,7 +8,7 @@
 //! The plan is every build's: its proc macros, and what they depend on, are built for
 //! `wasm32-wasip1` to run as modules, so each macro crate here is the one its module is built
 //! from, with wasm32's cfg, and the evaluator runs that crate. The tests compare engines on one
-//! input (rule 8: the evaluator is the modules' reference), so what a host cfg would change in a
+//! input (rule 10: the evaluator is the modules' reference), so what a host cfg would change in a
 //! macro is not theirs to see. Its build scripts' runs are those that build left for the
 //! macros' kind (`wasm32-wasip1+macros`).
 

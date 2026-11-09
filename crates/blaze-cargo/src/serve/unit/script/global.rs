@@ -96,7 +96,7 @@ impl Fetch {
             return Err(format!("the global cache's answer for {:x} is not in yet", key.0));
         }
         let read = |key: &Key| get(key).map_err(|corrupt| format!("the store: {corrupt}"));
-        // Bounded as the store's own walk is (`index::search_in`, rule 15), and ending as it
+        // Bounded as the store's own walk is (`index::search_in`, rule 18), and ending as it
         // does: a full chain of `MOST_SHAPES` is a miss, and one that goes on past it is an
         // error naming the run, never walked on.
         for n in 0..index::MOST_SHAPES {

@@ -90,7 +90,7 @@ pub fn compute(x: u32) -> u32 {
     for (name, want) in names.iter().zip(["compute", "middle", "helper", "deeper"]) {
         assert!(name.ends_with(want), "step `{name}` should be `{want}`: {}", refusal.said());
     }
-    // Named by its whole path (AGENTS.md rule 16), not its bare name.
+    // Named by its whole path (AGENTS.md rule 19), not its bare name.
     assert!(
         refusal.what.contains("calls `std::env::var`"),
         "the last step calls `std::env::var`: {}",

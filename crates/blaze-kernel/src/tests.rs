@@ -282,7 +282,7 @@ impl Put for Memory {
 }
 
 /// What the kernel keeps comes back from the store on disk after the process that kept it is
-/// gone, read in place, equal byte for byte to a fresh run (rule 23). A store that opens empty
+/// gone, read in place, equal byte for byte to a fresh run (rule 26). A store that opens empty
 /// fails here.
 #[test]
 fn a_kept_entry_comes_back_after_a_restart() {

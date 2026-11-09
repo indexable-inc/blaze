@@ -1933,7 +1933,7 @@ fn filled_id(function: &blaze_codegen::CompiledFunction) -> ContentId {
 /// the whole function as filled, and a caller whose fill changed is in both lists: blaze-link
 /// removes its old piece, which still refers to the callee the change removes, and adds the
 /// new one (blaze-link's `Stage::apply` removes first). A function put again as it was is in
-/// neither. Two fills of one key in one build are refused (rule 18), naming the function by
+/// neither. Two fills of one key in one build are refused (rule 21), naming the function by
 /// its entry in `debug_names` ([`Built::debug_names`]).
 pub(crate) fn function_rows(
     old: &[FunctionRow],
@@ -2402,7 +2402,7 @@ pub(crate) fn edited_slots(
     now.sort_unstable();
     now.dedup();
     // Two functions one across edits: which of them an earlier key's slot runs is not
-    // decidable (rule 18), never a guess.
+    // decidable (rule 21), never a guess.
     if let Some(pair) = now.windows(2).find(|it| it[0].0 == it[1].0) {
         let name = |key: InstanceKey| {
             debug_names.iter().find(|it| it.0 == key).map_or("(no debug name)", |it| it.1.as_str())

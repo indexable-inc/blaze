@@ -9,7 +9,7 @@
 //! The loop hands each request to a thread of its own, which may wait on the network for
 //! minutes, and sends the answers it gets back each turn ([`FetchUrls::take_answers`]); the
 //! loop turns at least every 50ms, so an answer waits no longer than that. A panic in a fetch
-//! fails that request alone, answered with an error naming it (AGENTS.md rule 17). Two
+//! fails that request alone, answered with an error naming it (AGENTS.md rule 20). Two
 //! requests of the same digest download once (blaze-fetch's single-flight).
 
 use std::{

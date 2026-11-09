@@ -2410,7 +2410,7 @@ impl<S: Steps> Job<S> {
             _ => Vec::new(),
         };
         // Sorted, so what `blaze why` keeps of the build is not down to the order its units
-        // and runs ended in (rule 22).
+        // and runs ended in (rule 25).
         let mut misses = std::mem::take(&mut self.misses);
         misses.sort_unstable();
         misses.dedup();
@@ -4529,7 +4529,7 @@ impl<S: Steps> Jobs<S> {
         let mut next = first.0;
         // Each unit's source bytes, what its phases' memory is predicted from
         // (`Plane::push_sized`): a stat of each `.rs` file under its modules' directories,
-        // once a directory a build, named so its time is its own (rule 14).
+        // once a directory a build, named so its time is its own (rule 16).
         let sizing = tracing::info_span!(target: "blaze", "unit source sizes", units = built);
         let mut seen = HashMap::new_in(Global); // alloc: once per build, a directory an entry
         for offset in 0..built {
@@ -6129,7 +6129,7 @@ impl<S: Steps> Jobs<S> {
             // What its kept front end left for the store ([`Job::stored`]) and the retractions it
             // put ([`Job::durable`]) are durable first; the store was flushed as they were put.
             // A store that broke never makes them durable, nor does one that stopped committing:
-            // the job fails naming why and which, rather than wait with no end (rule 15).
+            // the job fails naming why and which, rather than wait with no end (rule 18).
             // Wait for everything (the store model's `Wait::Everything`): a value a job read is
             // handed back with no ticket, so it may be another job's put that is not durable
             // yet, and answering on it before a crash loses it gives what a restart can't. Once,

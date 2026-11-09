@@ -12,7 +12,7 @@
 //! - one that read what the build from scratch read, with the same hashes, and holds other
 //!   bytes is [`crate::Stale::UnrecordedRead`]: its step read something [`blaze_kernel::Reads`]
 //!   did not record, or, for an entry with no reads (one kept by its whole identity, as codegen's
-//!   dev templates are), its identity misses an input its bytes depend on (rule 18);
+//!   dev templates are), its identity misses an input its bytes depend on (rule 21);
 //! - one the build from scratch made under a key the incremental build never reached is
 //!   [`crate::Stale::Absent`]: the incremental build keyed it otherwise, so its identity depends
 //!   on the build's history.

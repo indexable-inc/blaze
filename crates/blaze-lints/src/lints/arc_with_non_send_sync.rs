@@ -1,6 +1,6 @@
 //! `arc_with_non_send_sync`: `Arc::new(value)` of a value that is not both `Send` and `Sync`:
 //! the `Arc` can't cross a thread, so its atomic count buys nothing an `Rc` doesn't. AGENTS.md
-//! rule 9: one choice per need.
+//! rule 12: one choice per need.
 //!
 //! Follows clippy's `clippy_lints/src/arc_with_non_send_sync.rs` (MIT or Apache-2.0), read from
 //! indexable-inc's fork at c2308e38 (nightly-2026-05-27), the nearest checkout to the pinned

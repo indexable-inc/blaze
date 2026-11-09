@@ -103,7 +103,7 @@ thread_local! {
 /// [`LOCAL`]'s reader, but for [`count`]'s own. Not inlined: the allocator counts through it from a job's code,
 /// which may wait and resume on another thread, and an inlined read would let the job keep
 /// the first thread's `Local` across the wait and count into it from the second, a data race
-/// on its cells (rule 24, as pool.rs's caches were in checkpoint 36). One direct call per
+/// on its cells (rule 27, as pool.rs's caches were in checkpoint 36). One direct call per
 /// allocation.
 #[inline(never)]
 fn with_local<R>(f: impl FnOnce(&Local) -> R) -> R {

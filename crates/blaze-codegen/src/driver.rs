@@ -360,7 +360,7 @@ pub const PLACED_DOMAIN: &str = "blaze v2 placed 2";
 /// references, and two bodies of one key can have other places (a fact of the arguments the
 /// key leaves out adds a call), so how many there are and what each is are keyed; which callee
 /// or symbol is at a place is not, as a template takes any, but for the function itself, which
-/// its template holds as its own and never as a place (rule 20).
+/// its template holds as its own and never as a place (rule 21).
 pub fn placed(stored: InstanceKey, refs: &[Target], own: Option<u32>) -> InstanceKey {
     let mut hasher = Hasher::new(PLACED_DOMAIN);
     hasher.id(&stored.0).update(&(refs.len() as u64).to_le_bytes());
@@ -438,7 +438,7 @@ pub const IMPORTED_DOMAIN: &str = "blaze v2 release imported bodies 2";
 /// [`Imports::imported`] names imports by the walk's key, which in a live build's tier-up is
 /// the first tier's, not the settings the export is built at; and an edit of a body an import
 /// builds in changes no import's key. Either way [`Imports::blob_key`] alone would give the
-/// importer code made with another export (rule 18). All three lists' lengths are hashed:
+/// importer code made with another export (rule 21). All three lists' lengths are hashed:
 /// the rule that proves a function public refuses lists that are not one per import.
 pub fn with_imported(
     laid: InstanceKey,
@@ -528,7 +528,7 @@ impl<I, S> FnNode<I, S> {
     /// one stored key in the two forms. A landing hands its template to every build that flew
     /// the key, which keeps it under its own template key: a relative build given an absolute
     /// template would keep another function's positions under a key with no name or place in
-    /// it (rule 18), as [`Shape::relative`] keeps the two forms apart in the memo.
+    /// it (rule 21), as [`Shape::relative`] keeps the two forms apart in the memo.
     fn flight(&self) -> InstanceKey {
         let stored = self.stored();
         if self.described.anchors.is_none() {
@@ -861,7 +861,7 @@ fn prepare_node<B: Prepare>(
 }
 
 /// `why`, the refusal of the function called `name`, with its message naming it where it does
-/// not already (rule 16): a backend's error knows the unit's keys, not the function's path, so
+/// not already (rule 19): a backend's error knows the unit's keys, not the function's path, so
 /// "LLVM has no code for it: opcode `swizzle`" alone says nothing of which function.
 fn naming(why: CodegenError, name: &str) -> CodegenError {
     if why.what.contains(name) {
@@ -899,7 +899,7 @@ fn symbols_defined_twice<B: Prepare>(
             *item,
         ))
     });
-    // By symbol, then definer's name: the message lists them in order of name (rule 22).
+    // By symbol, then definer's name: the message lists them in order of name (rule 25).
     // alloc: per build, its symbols, a few hundred
     let mut named: Vec<(&str, &str, InstanceKey, ItemKey)> = functions.chain(statics).collect();
     named.sort_unstable();
@@ -1019,7 +1019,7 @@ enum Read<T> {
 
 /// Who put a value: the unit whose code it is and what of the walk it is (`of`), for the
 /// refusal of another put of other bytes under its key. Ordered, so a build's puts are sorted
-/// by key and then putter, whatever order they were pushed in (rule 22).
+/// by key and then putter, whatever order they were pushed in (rule 25).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 struct By {
     unit: InstanceKey,
@@ -1199,7 +1199,7 @@ impl Out {
     /// folded body's, a thunk's, a release compile's), and put: what is kept, to instantiate.
     /// When the memo already keeps another template under `key`, compiled earlier, neither is
     /// instantiated: both are put, so [`Out::finish`] refuses the build naming both and their
-    /// content IDs (rule 18). Two templates of equal bytes are one.
+    /// content IDs (rule 21). Two templates of equal bytes are one.
     fn keyed<'m>(
         &mut self,
         memo: &'m Memo,
@@ -1373,12 +1373,12 @@ impl Out {
 
     /// What the build collected, sorted and each once. Two puts under one key are one when
     /// their kind and bytes are equal; of another kind or other bytes, the build is refused
-    /// as the store would refuse the second ([`blaze_cas::Mismatch`], rule 18), with an error
+    /// as the store would refuse the second ([`blaze_cas::Mismatch`], rule 21), with an error
     /// naming both putters (`name_of` gives what of the walk is called), the key, both kinds
     /// and both content IDs.
     fn finish<'n>(mut self, name_of: impl Fn(Of) -> Option<&'n str>) -> Finished {
         // By key, then putter, kind and bytes: which of one key's puts comes first is the
-        // same whatever order the build pushed them in (rule 22).
+        // same whatever order the build pushed them in (rule 25).
         self.puts.sort_unstable_by(|a, b| {
             (a.1.key, a.0, a.1.kind)
                 .cmp(&(b.1.key, b.0, b.1.kind))
@@ -1486,7 +1486,7 @@ fn put_twice<'n>(
     let refusal = if kept == given { String::new() } else { format!(" {mismatch:?}") };
     // alloc: an error
     let what = format!(
-        "this build is refused, and neither value is put: {} and {} put two values under one store key {key:?}, a {kept_kind:?} value of content {kept:?} and a {given_kind:?} value of content {given:?}, so the key misses an input of its value (rule 18: {why}{refusal}){differ}",
+        "this build is refused, and neither value is put: {} and {} put two values under one store key {key:?}, a {kept_kind:?} value of content {kept:?} and a {given_kind:?} value of content {given:?}, so the key misses an input of its value (rule 21: {why}{refusal}){differ}",
         who(first),
         who(then),
     );
@@ -1871,7 +1871,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                     // whole: its code is the key's either way, and the image's copy refers
                     // to what that describer's references are, never the workspace's.
                     // Two describes under one key that disagree on what the code is mean the
-                    // key misses an input (rule 18): refused, never one kept silently.
+                    // key misses an input (rule 21): refused, never one kept silently.
                     blaze_hash::hash_map::Entry::Occupied(mut it) => {
                         let (kept, new) = (&it.get().described, &node.described);
                         if kept.code != new.code
@@ -2228,7 +2228,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                             of,
                             // alloc: an error
                             format!(
-                                "`{called}` ({key:?}) given up: asked for {asks} times, each time another build of the memo compiled it and let it go unlanded (rule 15)"
+                                "`{called}` ({key:?}) given up: asked for {asks} times, each time another build of the memo compiled it and let it go unlanded (rule 18)"
                             ),
                         ));
                     }
@@ -2854,7 +2854,7 @@ impl<'a, B: Prepare> Build<'a, B> {
     /// Function `key`, whose template another build compiled into the memo under `shape`,
     /// made with this build's places: neither prepared nor compiled here. Where this build
     /// prepared it already (a fold candidate), its own shape must be the one landed: two
-    /// shapes under one stored key are refused (rule 18), naming both.
+    /// shapes under one stored key are refused (rule 21), naming both.
     fn landed(
         &self,
         nodes: &Sorted<InstanceKey, Node<B>>,
@@ -2873,7 +2873,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                     node.unit.item,
                     // alloc: an error
                     format!(
-                        "the function `{name}` is refused: this build prepared it as shape {own:?}, and another build of the memo landed shape {shape:?} under the same flight key {stored:?}, so the key misses an input of its IR (rule 18)"
+                        "the function `{name}` is refused: this build prepared it as shape {own:?}, and another build of the memo landed shape {shape:?} under the same flight key {stored:?}, so the key misses an input of its IR (rule 21)"
                     ),
                 ));
                 return;
@@ -3419,7 +3419,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                             job.unit.item,
                             // alloc: an error
                             format!(
-                                "the function `{}` is refused: its summary and another build's are not one under the same flight key {flight:?}, so the key misses an input of its summary (rule 18)",
+                                "the function `{}` is refused: its summary and another build's are not one under the same flight key {flight:?}, so the key misses an input of its summary (rule 21)",
                                 job.node.described.name
                             ),
                         ));

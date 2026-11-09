@@ -1,6 +1,6 @@
 //! `map_err_ignore`: `result.map_err(|_| ..)`, which throws the original error away, so the new
 //! one can't say what failed: the silent fallback AGENTS.md rule 3 bans, and an error that names
-//! nothing (rule 14).
+//! nothing (rule 19).
 //!
 //! Follows clippy's `clippy_lints/src/methods/map_err_ignore.rs` (MIT or Apache-2.0), read from
 //! indexable-inc's fork at c2308e38 (nightly-2026-05-27), the nearest checkout to the pinned

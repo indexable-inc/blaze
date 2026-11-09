@@ -194,7 +194,7 @@ impl std::error::Error for Cancelled {}
 /// Why [`with_fuel`]'s work stopped: it brought `steps` rows up to date that were not already,
 /// and was bringing `query`'s row of `key` up to date `depth` frames deep when none was left.
 /// `value` is that key as its type shows it ([`function::Function::write_key`], read while the
-/// database was attached), so the error names the item and not only its number (rule 16).
+/// database was attached), so the error names the item and not only its number (rule 19).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct OutOfFuel {
     pub steps: u64,
@@ -218,7 +218,7 @@ impl std::error::Error for OutOfFuel {}
 
 /// Runs `f`, which may bring at most `steps` rows that are not up to date in this view up to
 /// date (a row run or verified, each time it is reached), on this task: what bounds a walk
-/// whose verification would otherwise not end in a useful time (rule 15). Out of fuel, the
+/// whose verification would otherwise not end in a useful time (rule 18). Out of fuel, the
 /// row being reached unwinds, as a panic in it does (its row and the cycle it is in are left
 /// empty, and a later call runs them again), and `f` gives way with [`OutOfFuel`]. Ended, it
 /// gives what `f` gave and the steps it spent, what a caller records to know its margin.
@@ -260,7 +260,7 @@ impl fmt::Display for OutOfSteps {
 impl std::error::Error for OutOfSteps {}
 
 /// Runs `f`, a walk that may take at most `steps` distinct steps on this task, each a key it
-/// gives [`step`]: what bounds a walk by a measure of the walk itself (rule 15), where
+/// gives [`step`]: what bounds a walk by a measure of the walk itself (rule 18), where
 /// [`with_fuel`] bounds the engine's work under it. A step is taken once however often it is
 /// given, whether the rows it stands for were run, verified or already up to date, so a walk
 /// that gives a step for each thing it reaches takes the same steps on a cold database, a warm
@@ -315,7 +315,7 @@ fn out_of_steps(steps: u64, key: u128, at: impl FnOnce() -> String) -> ! {
 /// Unwinds the task out of fuel ([`with_fuel`]), at `F`'s row of `key`, which it names as
 /// [`function::Function::write_key`] shows it with `db` attached. The bound is set aside while
 /// the key is written, so a `Debug` that reads a row is not charged and can't run out again
-/// here, and a panic in it leaves the key named by its number (rule 17).
+/// here, and a panic in it leaves the key named by its number (rule 20).
 #[cold]
 #[inline(never)]
 pub(crate) fn out_of_fuel<F: function::Function>(
@@ -354,14 +354,14 @@ pub enum Over {
     Rounds,
 }
 
-/// Why a query unwound instead of growing its task's query stack without end (rule 15): it
+/// Why a query unwound instead of growing its task's query stack without end (rule 18): it
 /// held `held` of what [`Over`] names, past the `bound` it may hold. `query` and `key` name it,
 /// with `value` the key as its type shows it (read while the database was attached). It is
 /// the `depth`-th of the `frames` queries running or verifying on its task's stack (outermost
 /// 1), and `most` is what it held most often, most first, with how many times (each read's
 /// query or input field and key, counted over its last [`Runaway::WINDOW`] entries): the loop's
 /// body. The query and every query under it on the task's stack fail, their rows left empty to
-/// run again, as a panic in them would (rule 17), and a host reports this text
+/// run again, as a panic in them would (rule 20), and a host reports this text
 /// ([`unwind_text`]).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Runaway {
@@ -390,18 +390,18 @@ impl fmt::Display for Runaway {
             Over::Reads => write!(
                 f,
                 "`{query}` of {value} ({key:?}) held {held} reads in one run, past the {bound} a \
-                 run may hold on its query stack (rule 15): it keeps reading"
+                 run may hold on its query stack (rule 18): it keeps reading"
             )?,
             Over::Pending => write!(
                 f,
                 "the verify of `{query}` of {value} ({key:?}) held {held} rows proved on its \
                  assumption pending, past its bound of {bound} (the storage's rows and a margin, \
-                 rule 15): rows proved again and again while it is open"
+                 rule 18): rows proved again and again while it is open"
             )?,
             Over::Rounds => write!(
                 f,
                 "`{query}` of {value} ({key:?}) went round its refresh {held} times without coming \
-                 up to date, past the bound of {bound} (rule 15)"
+                 up to date, past the bound of {bound} (rule 18)"
             )?,
         }
         write!(f, "; it is query {depth} of the {frames} on its task's query stack")?;

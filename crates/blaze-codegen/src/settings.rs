@@ -28,7 +28,7 @@ impl DebugInfo {
     /// Whether a function built at this level tells a debugger of its named locals, each with
     /// its type. The one predicate both the code generator (which builds the told variables
     /// into the shape and side table) and the front end (which keys a generic by its exact
-    /// arguments when they are told) read, so the key and the shape can't disagree (rule 18).
+    /// arguments when they are told) read, so the key and the shape can't disagree (rule 21).
     pub fn tells_locals(self) -> bool {
         match self {
             DebugInfo::None | DebugInfo::LineTablesOnly => false,

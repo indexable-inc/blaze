@@ -1,5 +1,5 @@
 //! `mutex_atomic` and `mutex_integer`: a `Mutex` around one `bool`, integer or `*mut T`, where
-//! an atomic does the same without a lock. AGENTS.md rule 9: a counter or flag is an atomic.
+//! an atomic does the same without a lock. AGENTS.md rule 12: a counter or flag is an atomic.
 //!
 //! Follows clippy's `clippy_lints/src/mutex_atomic.rs` (MIT or Apache-2.0), read from
 //! indexable-inc's fork at c2308e38 (nightly-2026-05-27), the nearest checkout to the pinned

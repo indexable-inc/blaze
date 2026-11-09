@@ -6,7 +6,7 @@
 //! strings must be equal; a difference is a [`Mismatch`] naming the function, the identity
 //! it is stored under, the reads its entry recorded and the first byte where they differ.
 //! Which hits are sampled is a pure function of the setting's seed and the hit's identity, so
-//! one tree and one setting check the same entries every run (rule 22).
+//! one tree and one setting check the same entries every run (rule 25).
 //!
 //! The kernel implements [`Recompute`] for its compute steps and calls [`check`] on each hit;
 //! a caller that recomputes in batches (blaze-codegen's driver) samples with

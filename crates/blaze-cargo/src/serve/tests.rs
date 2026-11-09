@@ -2986,7 +2986,7 @@ fn outcome(
     (got.last().cloned(), app, kept)
 }
 
-/// Rule 23, at every point: two checkouts build at once, so one's answer may rest on what the
+/// Rule 26, at every point: two checkouts build at once, so one's answer may rest on what the
 /// other put and has not made durable (a value read from the store carries no ticket); the
 /// daemon crashes after turn `k`, for every `k` up to both answering. After each crash, every
 /// checkout whose `Done` the client saw still has all it left in the store (durable before it
@@ -4288,7 +4288,7 @@ fn status_says_the_daemons_pid() {
     assert_eq!(pid, Some(std::process::id()), "{got:#?}");
 }
 
-/// The loop's time between its turns is a `wait` span naming what ends it (rule 13). Before
+/// The loop's time between its turns is a `wait` span naming what ends it (rule 15). Before
 /// 2026-11-03 it was in no span, and 108.9 s of a self-build check's critical path read as
 /// unrecorded on the daemon's thread.
 #[test]

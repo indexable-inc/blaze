@@ -294,7 +294,7 @@ fn a_restore_on_a_posix_file_system_opens() {
     ));
 }
 
-/// The model's own check (rule 20): a build that answers before its store is durable is
+/// The model's own check (rule 23): a build that answers before its store is durable is
 /// caught, at the crash that loses it, with a schedule that says so.
 #[test]
 fn the_model_catches_an_answer_given_before_its_store_is_durable() {

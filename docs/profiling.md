@@ -1185,7 +1185,7 @@ What the profile could not see is listed after the findings, as blind spots, nev
   build (`builds.daemon_user_ns` and `daemon_system_ns`, from getrusage), which the gate checks
   the spans' total against (`cpu_matches_process`); a build row from before those columns says
   it has none;
-- waits with no wait span (rule 13), classed by their kind alone (`key wait with no wait span`)
+- waits with no wait span (rule 15), classed by their kind alone (`key wait with no wait span`)
   and sized by the wall they cover, with the recorder's `profile spans lost` over the build
   beside them; and named waits that never name an owner. A class's evidence says its waits'
   parked time summed over the jobs waiting, which is not workers' time;

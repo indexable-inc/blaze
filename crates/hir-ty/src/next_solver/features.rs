@@ -32,7 +32,7 @@ impl<'db> Features<'db> {
     /// lowest crate that sees what the query solves in place of the crate that asked
     /// (`hir_ty_mir::mir::home::stands_for`, which code generation and build-script purity
     /// both key by); a feature the solver starts reading is added
-    /// here, or such a key misses it (rule 18).
+    /// here, or such a key misses it (rule 21).
     pub fn solve_alike(db: &Db, a: Crate, b: Crate) -> bool {
         if a == b {
             return true;

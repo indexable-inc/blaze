@@ -219,7 +219,7 @@ mod tests {
     /// the shape of the function built in it next (`v2/shape.rs`): nothing of the function
     /// compiled in it before is left, not even what no instruction names and the IR's text
     /// leaves out. Cranelift's `DataFlowGraph::clear` kept the exception tables, so a function
-    /// got another shape by what its thread compiled before (rule 18).
+    /// got another shape by what its thread compiled before (rule 21).
     #[test]
     fn a_kept_context_hashes_as_a_new_one() {
         struct Bytes(Vec<u8>); // alloc: a test's

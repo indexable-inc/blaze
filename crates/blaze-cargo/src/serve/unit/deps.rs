@@ -11,7 +11,7 @@
 //!   served at the same points as one freshly lowered: its [`Session`] keeps the key each crate
 //!   was last served or resolved under, and a serve asks the store again only of a crate whose
 //!   key moved, so a run applied again with other output (a variable only a build script
-//!   reads, such as `CC`, changed) takes a served crate's stale image away (rule 18).
+//!   reads, such as `CC`, changed) takes a served crate's stale image away (rule 21).
 //! - Its images are written once the head's next build lowers into the front end kept
 //!   ([`store`]): every unit of the build it was kept from has compiled, so what each crate
 //!   resolves to is memoized already.
@@ -186,7 +186,7 @@ pub(crate) fn images(
         lowered.serve_deps(&moved, build, &*session.images, mode).map_err(super::lower_error)?;
     debug_assert!(session.images.take_puts().is_empty(), "serving puts nothing");
     // The walk is noted only once `keyed` holds its keys: a serve that failed above leaves no
-    // record that a later serve at this view could skip on with the old keys (rule 18).
+    // record that a later serve at this view could skip on with the old keys (rule 21).
     session.keyed.extend(keys.iter().map(|(&krate, &key)| (krate, key)));
     session.walked.note(at, build, crates.iter().chain(keys.keys()));
     // Written: what was walked stands again only once [`serve`] is done and stamps its view.
@@ -267,7 +267,7 @@ impl Walked {
     /// That each crate walked keys at `db`'s present view by `build` as `keyed` holds it: what
     /// [`stamp`] rests on, that a serve's writes are no input of a key. A write that becomes
     /// one (a file set, a crate's env, a source root) would make every later skip serve stale
-    /// images, so it fails here, naming the crate (rule 18).
+    /// images, so it fails here, naming the crate (rule 21).
     #[cfg(debug_assertions)]
     fn assert_stands(&self, db: &Db, build: ContentId, keyed: &HashMap<Crate, ContentId, Global>) {
         let mut crates: Vec<Crate> = self.crates.iter().copied().collect(); // alloc: debug assertions only, once per serve that served
@@ -282,7 +282,7 @@ impl Walked {
         assert!(
             moved.is_empty(),
             "a dependency serve wrote an input of a crate's image key, so the walk it stamps would \
-             skip on stale keys (rule 18): (crate, key walked, key now) {moved:?}"
+             skip on stale keys (rule 21): (crate, key walked, key now) {moved:?}"
         );
     }
 

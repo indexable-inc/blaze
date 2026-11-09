@@ -26,7 +26,7 @@
 //!   maintainer's state from one pass to the next, and only for the keys of the last pass
 //!   ([`Costs::keep_only`]). The driver measures; the plan reads no clock.
 //!
-//! Every node that begins ends once; [`Plan::outcome`] says which did not (rule 15).
+//! Every node that begins ends once; [`Plan::outcome`] says which did not (rule 18).
 
 use std::{alloc::Global, fmt};
 
@@ -65,7 +65,7 @@ pub enum PlanError {
 }
 
 impl PlanError {
-    /// The node it is about, for the maintainer to name (rule 16).
+    /// The node it is about, for the maintainer to name (rule 19).
     pub fn node(&self) -> u32 {
         match *self {
             PlanError::Cycle { node }
