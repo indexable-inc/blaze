@@ -10,6 +10,9 @@
 //! them free and fires each one's event, `drive`); the tag of each read names the slot and the
 //! read, so a completion finds its load with no table.
 //!
+//! A read's blocks are all checked: every page with a block that fails is `Corrupt`, not only the
+//! first such page of the read.
+//!
 //! Each page's transition is the word's: `Loading -> Loaded` with the asker's pin in the same
 //! store, `Loading -> Evicting -> Unloaded` for a failed or short read (its pages given back
 //! first), `Loading -> Evicting -> Corrupt` for a block that failed its check, `Loading ->
@@ -570,11 +573,22 @@ impl Loads {
                 // What lies past the committed bytes reads as zeros, whatever the read or an
                 // earlier tenant of the pages left there.
                 pool.zero(part.first * PAGE + part.want, part.pages * PAGE - part.want);
-                let bad = check(pool, file, part);
+                // Every block is checked, not only up to the first that fails: one read covers
+                // up to `PAGES_PER_READ` pages, and each page with a bad block is `Corrupt`. The
+                // load's failure names the first.
                 let flight = &mut self.table[slot];
-                if let Some((block, page)) = bad.filter(|_| !pool.planted(Plant::NoCheck)) {
-                    flight.ends[(page - load.first) as usize] = PageEnd::Bad;
-                    flight.failure.get_or_insert(LoadFailure::Block { file: file.name.clone(), block, page }); // clone: a count of the name
+                if !pool.planted(Plant::NoCheck) {
+                    for (block, page) in check(pool, file, part) {
+                        flight.ends[(page - load.first) as usize] = PageEnd::Bad;
+                        if flight.failure.is_none() {
+                            flight.failure = Some(LoadFailure::Block { file: file.name.clone(), block, page }); // clone: a count of the name
+                        }
+                        if pool.planted(Plant::FirstBadBlock) {
+                            // Only the first bad block's page is refused: a later page of the
+                            // same read is published with its rotted block.
+                            break;
+                        }
+                    }
                 }
                 (PageEnd::Good, None)
             }
@@ -666,14 +680,16 @@ impl Loads {
     }
 }
 
-/// The first block of `part` that fails its check, and its page.
+/// Every block of `part` that fails its check, with its page, in the file's order. All of them:
+/// a read covers several pages, and a caller that stopped at the first would publish a later
+/// page with a bad block unrefused (planted bug 10, [`Plant::FirstBadBlock`]).
 #[expect(
     blaze::sans_io_core,
     reason = "the CRC-32C is a pure function of the bytes; the syscall is std's one-time CPU feature detection (sysctl on macOS), read once and cached, never IO the core decides on"
 )]
-fn check<G: Give>(pool: &Pool<G>, file: &File, part: Part) -> Option<(u64, u64)> {
+fn check<'a, G: Give>(pool: &'a Pool<G>, file: &'a File, part: Part) -> impl Iterator<Item = (u64, u64)> + 'a {
     let blocks = part.want.div_ceil(BLOCK);
-    (0..blocks).find_map(|b| {
+    (0..blocks).filter_map(move |b| {
         let len = BLOCK.min(part.want - b * BLOCK);
         let at = part.first * PAGE + b * BLOCK;
         // SAFETY: the part's pages are `Loading` in this load, whose read into them completed:

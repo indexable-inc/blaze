@@ -40,6 +40,8 @@
 //!    with no pin, and none is made the process's while it already is.
 //! 3. After any crash and reopen, every record reads back its bytes, or is refused for a block
 //!    that rotted: every record of a committed append among them, and none of one that was not.
+//!    And once every record was read back after the last reopen, no page that holds a rotted
+//!    block is `Loaded`: each was read from the disk since, so its check refused it.
 //! 4. The pages the process holds (what `Tag::Pool` counts) are exactly the pages `Loading`,
 //!    `Loaded`, `Evicting` or `Abandoned`; the pins in the words are exactly the guards' alive.
 //! 5. Every load ends, and every reading ends, within a bound of polls.
@@ -48,7 +50,7 @@
 //!    prefetched page is counted once as loaded and once as hit, late or wasted, or is still
 //!    marked: `loaded = hit + late + wasted + marked`.
 //!
-//! Planted bugs 1 to 6, 8 and 9 ([`Plant`]), each a safeguard of the pool's removed, must each be caught on
+//! Planted bugs 1 to 6, 8, 9 and 10 ([`Plant`]), each a safeguard of the pool's removed, must each be caught on
 //! one of [`CONTROL_SEEDS`] seeded plans. Replay: a failure names its plan and the simulator's
 //! seed in it; a control names a seed of [`plan_of`] for [`REPLAY`].
 
@@ -1157,6 +1159,26 @@ impl World {
         }
         Ok(())
     }
+
+    /// The oracle's third rule for the pages themselves, after the last reopen's read back:
+    /// every page was loaded from the disk since the crash (nothing appends after it), so none
+    /// that holds a rotted block is `Loaded`, whether or not a record lies over the rot.
+    fn rot_refused(&self) -> Result<(), Broke> {
+        for file in &self.files {
+            for &block in &file.rotted {
+                let page = file.window.first_page() + block * BLOCK / PAGE;
+                let word = self.pool.word_now(page);
+                if word.state() == State::Loaded {
+                    return Err(Broke::Oracle(format!(
+                        "page {page} of the pool is {word:?} after a reopen, and block {block} of {}, which it \
+                         holds, rotted on disk: its load did not refuse it",
+                        file.name
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// `plan` run with `plant` planted, the oracle at every act, then everything let end and read
@@ -1173,7 +1195,8 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), Broke> {
     world.crash(plan)?;
     world.check()?;
     world.drain(plan)?;
-    world.read_back(plan)
+    world.read_back(plan)?;
+    world.rot_refused()
 }
 
 // --- The tests -------------------------------------------------------------------------------
@@ -1245,6 +1268,36 @@ fn the_oracle_catches_a_commit_that_does_not_pin_its_file_s_last_page() {
 #[test]
 fn the_oracle_catches_a_prefetch_issued_while_a_demand_load_is_in_flight() {
     control(Plant::PrefetchFirst);
+}
+
+#[test]
+fn the_oracle_catches_block_checks_that_stop_at_the_first_bad_block() {
+    control(Plant::FirstBadBlock);
+}
+
+/// Two blocks rotted in two pages that one read loads, by hand (the plan the property test
+/// found, at its smallest): record 0 covers both pages, so its load reads them in one read, and
+/// both pages must be refused. A check that stops at the first bad block publishes the second
+/// page, and record 2, which lies in it over the rot, is handed back with the rotted bytes.
+#[test]
+fn a_read_with_two_rotted_pages_refuses_both() {
+    let spec = Spec { sizes: vec![110_004, 4096, 4096], fill: 0, rank: Rank::Plain };
+    let plan = Plan { rot: true, files: vec![spec.clone()], spares: vec![spec], ..quiet_plan() };
+    let mut world = World::new(&plan, Plant::None).unwrap_or_else(|broke| panic!("{broke}"));
+    let blocks = world.files[0].bytes.len() as u64 / BLOCK;
+    assert_eq!(blocks, 29, "the file is two pages, its last block in the second");
+    let (at, len) = world.files[0].records[2];
+    assert!(at <= 28 * BLOCK + 7 && 28 * BLOCK + 16 <= at + len, "record 2 lies over the last block's rot");
+    world.rot(0, 0);
+    world.rot(0, 28);
+    world.read_back(&plan).unwrap_or_else(|broke| panic!("{broke}"));
+    let first = world.files[0].window.first_page();
+    for page in [first, first + 1] {
+        let word = world.pool.word_now(page);
+        assert_eq!(word.state(), State::Corrupt, "page {page}, which holds a rotted block: {word:?}");
+    }
+    world.rot_refused().unwrap_or_else(|broke| panic!("{broke}"));
+    world.check().unwrap_or_else(|broke| panic!("{broke}"));
 }
 
 /// A view's trace by hand, with no faults: a miss is recorded and kept; after a restart its

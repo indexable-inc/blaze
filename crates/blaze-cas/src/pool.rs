@@ -35,7 +35,7 @@
 //!
 //! Proof: `pool/tests.rs`, a deterministic simulation test of the real word, reading, loads
 //! core, sweep, append and prefetch under `blaze_core::sim::Sim`, with planted bugs 1 to 6, 8
-//! and 9 of the design's section 7 ([`Plant`]).
+//! and 9 of the design's section 7 and a tenth of this module's ([`Plant`]).
 
 use std::{
     cell::Cell,
@@ -262,7 +262,7 @@ impl fmt::Debug for Word {
 // --- Planted bugs ------------------------------------------------------------------------------
 
 /// A safeguard of the pool's removed, for the DST's controls (the design's section 7, bugs 1 to
-/// 6, 8 and 9): each is caught by the oracle within its case budget, or the oracle is too weak. Only a
+/// 6, 8 and 9, and a tenth found by the DST itself): each is caught by the oracle within its case budget, or the oracle is too weak. Only a
 /// test's pool plants one ([`Pool::planted`] is `false` in every build of blaze).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Plant {
@@ -286,6 +286,9 @@ pub(crate) enum Plant {
     UnpinnedTail,
     /// 9: a prefetch read is issued while a demand load is in flight.
     PrefetchFirst,
+    /// 10 (not in the design's list): a load's block checks stop at the first block that fails,
+    /// so a later page of the same read with a rotted block is published and served.
+    FirstBadBlock,
 }
 
 // --- Counting prefetched pages -------------------------------------------------------------------
