@@ -37,9 +37,10 @@ hn {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $tree_row_h, min: 0, max: 0}}
     Padding: {l: indent($depth, $tree_pad, $indent_step) + $tree_gutter, r: $tree_pad_r, t: 0, b: 0}
     hang { hn.Hang: {obj: $obj, depth: $depth, kids: $kids, open: $open, mark: $mark} }
-    // What it is at a glance: an agent's mark or a shell's terminal glyph, in ink only, tree_kind across before its
-    // title (src/app.rs sync_view sets it with look::kind_mark, outside the template's reactive inputs): the strong ink
-    // while it works, the faint ink else.
+    // How it stands at a glance, tree_kind across before its title (src/app.rs sync_view sets it, outside the
+    // template's reactive inputs): an agent at work a filled dot in the strong ink, one waiting for the person a hollow
+    // ring in the faint ink, one that ended nothing; a shell its terminal glyph in the same inks. Which agent it is ends
+    // the row's tooltip, never its mark.
     kind_icon : hn.tree.Kind {}
     name : hn.tree.Head {
       Text: {s: $name}

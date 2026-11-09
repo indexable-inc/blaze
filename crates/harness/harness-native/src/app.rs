@@ -1056,10 +1056,28 @@ impl App {
                     ]
                     .concat(),
                 );
-                // Its kind's mark before its title, in ink only, and the row's one sign of work: the strong ink while its
-                // agent works, the faint ink at rest or ended. Nothing moves.
+                // Before its title, how it stands, not what made it (its kind ends its tooltip): an agent at work is a
+                // filled dot in the strong ink, one up and waiting for the person a hollow ring in the faint ink, one
+                // that ended nothing (its title is already muted). The glyphs are the chat's own statuses
+                // (scene/widgets/chat_status.flecs `running`, `waiting`), still here. A shell keeps its terminal
+                // glyph, since it opens a terminal and not a chat, in the same two inks.
                 if let Some(i) = row.part("kind_icon") {
-                    crate::look::kind_mark(w, i.entity(), model::kind_name(o));
+                    let kind = model::kind_name(o);
+                    if matches!(kind, "claude" | "codex" | "cursor") {
+                        let state = match (busy, status) {
+                            (true, _) => Some("running"),
+                            (false, "running") => Some("waiting"),
+                            _ => None,
+                        };
+                        let glyph = state.map(|s| {
+                            view::prefab(w, &format!("hn.chat_status.{s}"))
+                                .and_then(|p| p.try_cloned::<&harness_native_ui_text_api::Icon>())
+                                .unwrap_or_else(|| panic!("the scene's hn.chat_status.{s} has no Icon (scene/widgets/chat_status.flecs)"))
+                        });
+                        crate::look::show_glyph(i.entity(), glyph.as_ref().map_or("", |g| g.glyph.as_str()));
+                    } else {
+                        crate::look::kind_mark(w, i.entity(), kind);
+                    }
                     let f = tone(w, if busy { "ink_strong" } else { "ink_faint" });
                     if i.entity().try_cloned::<&Fill>() != Some(f) {
                         i.entity().set(f);
