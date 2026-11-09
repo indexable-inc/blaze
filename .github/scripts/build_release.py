@@ -15,7 +15,7 @@ host's: every release target builds on a machine of its own kind, nothing is cro
 
 `dist` is `release` with `lto = "thin"` and `codegen-units = 1`. blaze's release codegen is one
 LLVM unit per function with ThinLTO's summaries and imports across the whole program
-(docs/v2-codegen.md, "Release"), so what thin LTO and one unit per crate ask of rustc, inlining
+(docs/v2/plan/design/codegen.md, "Release"), so what thin LTO and one unit per crate ask of rustc, inlining
 across functions and crates, is what blaze's release build always does; both settings are
 in the units' keys.
 

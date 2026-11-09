@@ -1,5 +1,5 @@
 //! What a restart needs to know which files changed while blaze was down
-//! (docs/v2/plan/design/restore.md, docs/v2/plan/lanes/frontend/journal.md): a [`Cursor`] into
+//! (docs/v2/plan/design/restore.md, docs/v2/plan/design/restore.md): a [`Cursor`] into
 //! the system's journal of changes (FSEvents' event IDs, NTFS's USN journal), the
 //! [`Journaled`] batches an [`crate::Effect::Journal`] completes with, and the [`Stamp`]s of a
 //! sweep ([`crate::Effect::Stamp`]) that compares what a file is now with what it was.

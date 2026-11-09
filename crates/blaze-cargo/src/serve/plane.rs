@@ -1,4 +1,4 @@
-//! The plane (docs/v2/plan/lanes/core/plane.md) as the daemon's loop steps it: every job's
+//! The plane (docs/v2/plan.md) as the daemon's loop steps it: every job's
 //! tasks are nodes of one [`blaze_graph::Plane`], with single flight, fair share, critical path
 //! and memory admission. The loop owns the plane and steps it with the driver's clock, so a run
 //! under the simulation driver is a function of its seed.
@@ -317,14 +317,18 @@ fn run_measured<W: Work>(
     }
     .open();
     let start = Instant::now();
-    let (result, peak) = admission::run_as(kind, || {
+    let (result, spent) = admission::run_as(kind, || {
         let _job = InJob::enter();
         catch_unwind(AssertUnwindSafe(|| work.run(arg, readers)))
     });
     let ran_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let ended = matches!(result, Ok(Some(_)));
     span.ended(blaze_profile::span::TaskEnded {
-        peak: matches!(result, Ok(Some(_))).then_some(peak),
+        peak: ended.then_some(spent.peak),
+        heap_allocated: ended.then_some(spent.heap.allocated),
+        heap_freed: ended.then_some(spent.heap.freed),
     });
+    let peak = spent.peak;
     match result {
         Ok(None) => (None, peak, ran_ns, Vec::new()),
         Ok(Some(did)) => (Some(Ended::Did(did)), peak, ran_ns, proc_macro_api::kept::take_puts()),
@@ -691,7 +695,7 @@ pub struct Plane<W: Work, P: Predict> {
     folds: Folds,
 }
 
-/// Each plane request's live model (`blaze_protocol::now`, docs/v2/plan/observe/build-view.md):
+/// Each plane request's live model (`blaze_protocol::now`, docs/v2/plan/design/build-view.md):
 /// a [`Fold`] made as the request opens ([`Plane::open`]), fed every record the plane says of
 /// it ([`PlaneOutput::Said`]), looked at once a second while its job runs
 /// (`super::job::doing`) and dropped as its job ends ([`Plane::forget`]). The same records,

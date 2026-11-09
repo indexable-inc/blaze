@@ -39,7 +39,7 @@
 //! `blaze check --fix` applies the fix and checks the crate again (`fix.rs`'s settling), undoing
 //! it if it adds an error.
 //!
-//! Not yet found (docs/v2/plan/lanes/lints/borrow-workarounds.md): a `clone()` or `to_owned()`
+//! Not yet found (docs/v2/plan/design/lint-borrow-workarounds.md): a `clone()` or `to_owned()`
 //! made only to end a borrow, an index loop or `unsafe { &mut *ptr }` standing in for a cursor
 //! (rust-lang/rust#57165, #63908, #108704, which the alpha still rejects), `mem::take` and put
 //! back, and a call of the crate's own function twice (it may have effects).

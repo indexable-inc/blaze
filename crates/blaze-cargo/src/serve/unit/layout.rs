@@ -1,4 +1,4 @@
-//! Profile-guided code layout's inputs (docs/v2/plan/lanes/layout/layout.md): the address map
+//! Profile-guided code layout's inputs (docs/v2/plan/design/code-layout.md): the address map
 //! of each image blaze links, and the ix-prof profiles of runs of those images, read back as
 //! each image's [`Weights`] by function identity, and each link's [`Heat`] by instance key.
 //!

@@ -75,6 +75,37 @@ the checkout, so it needs no `CARGO_TARGET_DIR`; never `git stash`.
 
 When a lane is done, delete its build directory (`blaze clean`), worktree, ix VM and merged branch.
 
+## ledger-decides (rule 46)
+
+The ledger is `docs/v2/plan/objectives.json`, one row per objective: the outcome, the check that
+decides it as a command, its paths, its status (`docs/v2/plan/objectives.md` is its generated
+table). `harness/v2/ledger.py` picks work that does not collide (`pick`), runs a row's check and
+writes its status with the commit (`run`), and regenerates the table (`write`); never type a status
+by hand, except `blocked` with why. Before starting a row, run its check on main. A row with no
+check gets one written first, as part of the work. Done means the check passes on a named commit and
+has joined the gate or the release train, so it cannot regress silently. A row that fails twice
+records what blocks it and stops.
+
+See [docs/v2/plan.md#how-the-work-is-run](../../../docs/v2/plan.md#how-the-work-is-run).
+
+## every-agent-has-a-task (rule 47)
+
+Start an agent only with a task: an objective's id from the ledger, or a named piece of one, with
+its outcome and its check in one line each, the paths it may touch and what done prints. A sub-agent
+takes its parent's task unless given its own. The agent app's sidebar lists tasks with their agents
+under them, so name the task for a person reading that list: what is being done, not who does it.
+
+See [docs/v2/plan/design/tasks.md](../../../docs/v2/plan/design/tasks.md).
+
+## agents-are-a-cost (rule 48)
+
+An agent costs its whole context, and its report loses detail both ways. The coordinator does small
+pieces, reads and deletions itself. Start a worker only for a piece that is independent of the
+others and large enough to pay for its brief; four workers at once is a lot. Never start a fleet to
+read or summarise.
+
+See [docs/v2/plan.md#how-the-work-is-run](../../../docs/v2/plan.md#how-the-work-is-run).
+
 <!-- End of the generated rules. Hand-written notes follow. -->
 
 ## How a lane runs

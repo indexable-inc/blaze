@@ -239,7 +239,7 @@ pub(crate) fn filenames(_unit: &Unit, plan: &UnitPlan) -> Vec<String> {
 /// where it is run from, so its `current_exe()` is there); none for a build script.
 pub(crate) fn executable(unit: &Unit, plan: &UnitPlan) -> Option<String> {
     let runs = match unit.mode {
-        // A doctest unit's program is its runner (docs/v2/plan/doctests.md).
+        // A doctest unit's program is its runner (docs/v2/plan/design/doctests.md).
         Mode::Test | Mode::Doctest => true,
         Mode::Build => {
             let kinds = &unit.target.kind;

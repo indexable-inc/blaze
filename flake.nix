@@ -58,7 +58,7 @@
         # build scripts over the shell's value (Cargo.toml's [workspace.metadata.blaze.native.llvm]);
         # the shell's serves a stage 0 older than that table, and tools other than blaze.
         llvmEnv = { LLVM_SYS_231_PREFIX = "${llvm}"; };
-        # The Z3 blaze_verify's solver runs (crates/hir-ty-verus, docs/v2/plan/lanes/verus.md):
+        # The Z3 blaze_verify's solver runs (crates/hir-ty-verus, docs/v2/plan/design/verus.md):
         # 4.16.0, the release Verus pins (vendor/verus/SOURCE.md), from Z3's own release
         # archives by their unpacked hash. BLAZE_Z3 names it; blaze looks for no other.
         z3 =
@@ -345,7 +345,7 @@
         devShells.bench = pkgs.mkShell bench;
         # Python-only work needs neither LLVM nor a Rust toolchain.
         devShells.scripts = pkgs.mkShell scripts;
-        # What harness/bench.py measures bun in (bunprep.py, docs/research/bun.md):
+        # What harness/bench.py measures bun in (bunprep.py, fed1eb428d:docs/research/bun.md):
         # bun's own pinned nightly in place of blaze's, for the cargo side (blaze ignores the pin
         # and compiles its own library/), with rust-src, which bun's own build of its Rust
         # (`-Zbuild-std`, run by bunprep.py's plan step) reads std from, and

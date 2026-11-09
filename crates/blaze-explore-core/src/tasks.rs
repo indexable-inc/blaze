@@ -1,4 +1,4 @@
-//! The live tasks (tables `tasks` and `task_edges`, docs/v2/plan/observe/explore-generic.md),
+//! The live tasks (tables `tasks` and `task_edges`, docs/v2/plan/design/explore-generic.md),
 //! folded through the one model of a program as it runs, `blaze_protocol::now::Fold`
 //! (explore-core.md decision 4): the same core `blaze status` and a build's client fold the
 //! plane with, so the page's Running now and the terminal's say the same thing.

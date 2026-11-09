@@ -17,8 +17,8 @@ use hir_ty::{
     InferBodyId,
     db::HirDatabase,
     effects::{
-        body_constness, const_call_error, const_param_env, fn_is_const, impl_is_const,
-        trait_is_const,
+        body_constness, const_call_error, const_param_env, defers_dispatch_check, fn_is_const,
+        impl_is_const, is_dyn_dispatch, trait_is_const,
     },
     intrinsic::Intrinsic,
     next_solver::{GenericArgs, Ty, TyKind, default_types},
@@ -59,9 +59,14 @@ impl<'db> Checker<'_, 'db> {
         span: MirSpan,
     ) {
         let MirSpan::ExprId(expr) = span else { return };
+        // blaze: with `#![feature(blaze_comptime)]` a call through a function pointer or a
+        // `dyn` method is checked when it is evaluated, where its target is known
+        // (docs/v2/plan/design/comptime.md, "Phase 2b"); rustc refuses both here.
+        let (db, krate) = (self.db, self.krate);
+        let deferred = move || defers_dispatch_check(db, krate);
         let (callee, fn_args) = match operand_ty(self.body, func) {
             Some(TyKind::FnPtr(..)) => {
-                if matches!(self.store.expr(expr), Expr::Call { .. }) {
+                if matches!(self.store.expr(expr), Expr::Call { .. }) && !deferred() {
                     self.check_op(ConstCheckKind::FnPointerCall, Status::Forbidden, span);
                 }
                 return;
@@ -72,8 +77,10 @@ impl<'db> Checker<'_, 'db> {
             },
             _ => return,
         };
+        if is_dyn_dispatch(db, krate, callee, fn_args) && deferred() {
+            return;
+        }
         let Some(source) = self.source(expr, callee) else { return };
-        let db = self.db;
 
         if let ItemContainerId::TraitId(trait_) = callee.lookup(db).container {
             self.check_trait_call(trait_, callee, fn_args, destination, source, span);

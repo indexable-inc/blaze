@@ -147,7 +147,7 @@ pub enum DocCommentDesugarMode {
 }
 
 /// A macro's input, or any node's tokens as a token tree, from a view of the node
-/// (`syntax::view`, docs/v2/plan/lanes/frontend/tree.md): one pass over the flat tree's tokens
+/// (`syntax::view`, docs/v2/plan/design/frontend.md): one pass over the flat tree's tokens
 /// in the node's range, through the parts of the lazy nodes in it (an attribute macro's `fn`
 /// whose body an outline left unparsed), with each span from `map`, the file's side table, read
 /// in order. No syntax handle is made and nothing is counted.

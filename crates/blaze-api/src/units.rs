@@ -1,5 +1,5 @@
 //! The units that socket-activate the daemon ([`crate::activation`];
-//! docs/v2/plan/lanes/frontend/activate.md), made from one [`Unit`]: a launchd agent on
+//! docs/v2/plan/design/restore.md), made from one [`Unit`]: a launchd agent on
 //! macOS, a systemd user socket and service on Linux. The manager listens on the socket the
 //! CLI connects to and starts `blaze serve --activated` at the first connection; nothing waits
 //! for a start step.

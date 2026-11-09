@@ -1,5 +1,5 @@
 //! Whose each instance and static is for a dependency image (fastcompile-premap 3,
-//! docs/v2/plan/lanes/fastcompile/premap.md): a dependency's code goes in the image linked
+//! docs/v2/plan/design/compile-time.md): a dependency's code goes in the image linked
 //! once per set of dependencies, the workspace's in the link of every edit.
 //!
 //! The front end decides every owner, by one rule, where it sees the crates and the type

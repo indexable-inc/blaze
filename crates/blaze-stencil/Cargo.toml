@@ -24,7 +24,7 @@ cranelift-codegen.workspace = true
 smallvec.workspace = true
 
 [build-dependencies]
-# The stencils are made by LLVM when blaze is built (docs/v2/plan/lanes/fastcompile/stencil.md,
+# The stencils are made by LLVM when blaze is built (docs/v2/plan/design/compile-time.md,
 # "Why a build script"): the generator in `gen/` drives it through its C API.
 llvm-sys = { workspace = true, optional = true }
 object = { workspace = true, optional = true }

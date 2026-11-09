@@ -1,4 +1,4 @@
-//! Pure build scripts (docs/v2/plan/lanes/pure-scripts/design.md): a script whose MIR proves it
+//! Pure build scripts (docs/v2/plan.md): a script whose MIR proves it
 //! only reads the variables cargo gives it and its package's files, writes its `OUT_DIR` and
 //! prints (`hir_ty_pure`) is kept a second time, under a key that needs no compile: its
 //! instance graph's identity, the variables its code can read and the package files its first

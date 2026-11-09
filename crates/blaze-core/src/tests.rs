@@ -158,6 +158,181 @@ fn the_native_driver_runs_the_shared_script_as_threads_does() {
     assert_eq!(script(&mut crate::native(&root, 2).unwrap()), threads);
 }
 
+/// What a pack of the store's pool holds in the script below: three whole blocks, then a tail
+/// past the last whole one.
+fn pack_bytes() -> Vec<u8> {
+    let block = crate::DIRECT_ALIGN as usize;
+    let mut bytes = Vec::new();
+    for fill in [b'a', b'b', b'c'] {
+        bytes.extend(std::iter::repeat_n(fill, block));
+    }
+    bytes.extend(std::iter::repeat_n(b'd', 100));
+    bytes
+}
+
+/// Memory for the script below, 8 blocks, registered for reads into and writes from it.
+#[allow(unsafe_code, reason = "test memory: the script reads it only between effects, once each completed")]
+fn script_memory() -> crate::Memory {
+    // SAFETY: `memory_script` reads and writes the memory only while no effect on it is in
+    // flight: each step runs to its completion before the next.
+    unsafe { crate::Memory::new("the drivers' memory script", 8 * crate::DIRECT_ALIGN as usize) }
+        .expect("a free region")
+}
+
+/// Reads into memory of the asker's and writes from it, each step run to its end before the
+/// next, what each ended with and what the memory and the file held then: a read of whole
+/// blocks, one cut at the file's end, one at an odd offset, a write from memory into the middle
+/// and one past the end, and the refusals every driver makes alike (a missing file, a span past
+/// its region, a misaligned read around the cache). What a read leaves of its span past what it
+/// read, or of all of it where it failed, is anything (the simulation scribbles it, a read
+/// around the cache writes whole blocks), so the script zeroes it, as the store's pool does.
+fn memory_script(driver: &mut impl Driver) -> Vec<String> {
+    use crate::{Cache, Priority};
+    let block = crate::DIRECT_ALIGN;
+    let mut memory = script_memory();
+    let pack = name("pool/pack-1");
+    let missing = name("pool/missing");
+    let read = |file: &FileName, at, into, cache| Effect::ReadInto {
+        file: file.clone(),
+        at,
+        into,
+        cache,
+        priority: Priority::Demand,
+        tag: Tag(1),
+    };
+    let write = |file: &FileName, at, from| Effect::WriteFrom {
+        file: file.clone(),
+        at,
+        from,
+        cache: Cache::Kept,
+        tag: Tag(2),
+    };
+    let steps = [
+        Effect::Write { file: pack.clone(), bytes: pack_bytes(), tag: Tag(0) },
+        read(&pack, 0, memory.span(0, 2 * block as u32), Cache::Kept),
+        read(&pack, 2 * block, memory.span(2 * block, 2 * block as u32), Cache::Kept),
+        read(&pack, 1, memory.span(5 * block + 3, 10), Cache::Kept),
+        // Memory written with `w` first, below.
+        write(&pack, block, memory.span(4 * block, block as u32)),
+        Effect::Sync { file: pack.clone(), tag: Tag(3) },
+        write(&pack, pack_bytes().len() as u64, memory.span(4 * block, 100)),
+        Effect::ReadAll { file: pack.clone(), tag: Tag(4) },
+        read(&missing, 0, memory.span(0, 16), Cache::Kept),
+        write(&missing, 0, memory.span(0, 16)),
+        read(&pack, 0, memory.span(8 * block - 10, 100), Cache::Kept),
+        read(&pack, 1, memory.span(0, block as u32), Cache::Bypassed),
+        read(&pack, 0, memory.span(1, block as u32), Cache::Bypassed),
+    ];
+    let mut seen = Vec::new();
+    for (n, effect) in steps.into_iter().enumerate() {
+        if n == 4 {
+            memory.write(4 * block as usize, &vec![b'w'; block as usize]);
+        }
+        let into = match &effect {
+            Effect::ReadInto { into, .. } => Some(*into),
+            _ => None,
+        };
+        let mut ended = None;
+        run_until_idle(driver, &mut vec![effect], |done, _| ended = Some(done.done))
+            .expect("the effects end");
+        let ended = ended.expect("the step ended");
+        if let Some(into) = into {
+            let read = match ended {
+                Done::ReadInto { len } => u64::from(len),
+                _ => 0,
+            };
+            let left = (u64::from(into.len) - read) as usize;
+            if (into.end() as usize) <= memory.len() {
+                memory.fill((into.offset + read) as usize, left, 0);
+            }
+        }
+        let shown = match ended {
+            Done::Failed(why) if why.0.contains("DIRECT_ALIGN") => "refused: alignment".into(),
+            Done::Failed(why) if why.0.contains("past the region's end") => {
+                "refused: past the region".into()
+            }
+            Done::Failed(_) => "failed".to_owned(),
+            Done::Read(bytes) => format!("read {:?}", digest(&bytes)),
+            other => format!("{other:?}"),
+        };
+        let mut held = vec![0; memory.len()];
+        memory.read(0, &mut held);
+        seen.push(format!("{shown}; memory {:?}", digest(&held)));
+    }
+    seen
+}
+
+/// A short stand-in for bytes, so a mismatch is readable: their length and a hash.
+fn digest(bytes: &[u8]) -> (usize, u32) {
+    (bytes.len(), blaze_ids::crc32c::crc32c(bytes))
+}
+
+/// A read into memory and a write from it end the same on every driver, the simulation's
+/// scribble included: each read here completes before its span is looked at.
+#[test]
+fn every_driver_reads_into_and_writes_from_memory_the_same() {
+    let simulated = memory_script(&mut Sim::new(5, Faults::default()));
+    let threads = memory_script(&mut Threads::new(&dir("memory-threads"), 2));
+    assert_eq!(simulated, threads);
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    {
+        let native = memory_script(&mut crate::native(&dir("memory-native"), 2).unwrap());
+        assert_eq!(simulated, native);
+    }
+    // The read cut at the end of the file says how far it read.
+    let tail = format!("{:?}", Done::ReadInto { len: crate::DIRECT_ALIGN as u32 + 100 });
+    assert!(simulated[2].starts_with(&tail), "{simulated:?}");
+    assert!(simulated[8].starts_with("failed") && simulated[9].starts_with("failed"));
+    assert!(simulated[10].starts_with("refused: past the region"), "{simulated:?}");
+    assert!(simulated[11].starts_with("refused: alignment"), "{simulated:?}");
+    assert!(simulated[12].starts_with("refused: alignment"), "{simulated:?}");
+}
+
+/// Around the page cache, an aligned read into memory reads what the file holds, and one cut
+/// at the file's end stops there, on the driver the build path makes. Where the file system
+/// cannot bypass its cache (tmpfs before Linux 6.6), the read fails naming the file instead,
+/// and nothing reads through the cache in its place.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[test]
+fn a_read_around_the_page_cache_reads_the_file() {
+    use crate::{Cache, Priority};
+    let block = crate::DIRECT_ALIGN;
+    let mut driver = crate::native(&dir("memory-bypassed"), 2).unwrap();
+    let mut memory = script_memory();
+    memory.fill(0, memory.len(), 0xEE);
+    let pack = name("pool/pack-2");
+    run_until_idle(
+        &mut driver,
+        &mut vec![Effect::Write { file: pack.clone(), bytes: pack_bytes(), tag: Tag(0) }],
+        |_, _| {},
+    )
+    .expect("the effects end");
+    let mut ended = None;
+    let mut effects = vec![Effect::ReadInto {
+        file: pack.clone(),
+        at: 0,
+        into: memory.span(0, 4 * block as u32),
+        cache: Cache::Bypassed,
+        priority: Priority::Demand,
+        tag: Tag(1),
+    }];
+    run_until_idle(&mut driver, &mut effects, |done, _| ended = Some(done.done))
+        .expect("the effects end");
+    match ended.expect("the read ended") {
+        Done::ReadInto { len } => {
+            // Three whole blocks, and the tail of 100 bytes, which ends short of a block.
+            assert_eq!(u64::from(len), 3 * block + 100);
+            let mut held = vec![0; len as usize];
+            memory.read(0, &mut held);
+            assert_eq!(held, pack_bytes());
+        }
+        Done::Failed(why) => {
+            assert!(cfg!(target_os = "linux") && why.0.contains("pool/pack-2"), "{why}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
 /// Each step's end, one at a time: two exclusive locks of one file (the second contends, as
 /// another holder's does), the first let go of, the second asked again.
 fn locks(driver: &mut impl Driver) -> Vec<Done> {

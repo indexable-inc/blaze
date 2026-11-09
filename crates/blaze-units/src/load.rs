@@ -1,4 +1,4 @@
-//! The workspace load as queries of blaze's database (docs/v2/plan/lanes/cargo/notes.md): the
+//! The workspace load as queries of blaze's database (docs/v2/plan.md): the
 //! view's invocation ([`invocation`]), every file through the mounts ([`files`]), the config
 //! chain ([`config`]), each manifest and the workspace ([`manifest`]), the resolve
 //! ([`resolve`], packages located by [`source`]), the units ([`units`]) and their plans

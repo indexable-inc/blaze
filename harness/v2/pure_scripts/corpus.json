@@ -1,5 +1,5 @@
 {
- "about": "Build scripts for harness/v2/pure_scripts.py (docs/v2/plan/lanes/pure-scripts/measure.md): 100 of the most downloaded crates.io packages with a build script, each pinned, each built as its own workspace from its .crate with default features. `expect` is pure, or why not: cc (spawns the C compiler), rustc (reads RUSTC and runs it, autocfg and version_check too), pkg-config, env (a variable that is not cargo's, or one named at run time), listing, process (another program), thread, random (std's RandomState), other. Read at the pinned version in the crates.io source on 2026-10-30 (`seen: registry`) unless `seen` says memory.",
+ "about": "Build scripts for harness/v2/pure_scripts.py (docs/v2/plan.md): 100 of the most downloaded crates.io packages with a build script, each pinned, each built as its own workspace from its .crate with default features. `expect` is pure, or why not: cc (spawns the C compiler), rustc (reads RUSTC and runs it, autocfg and version_check too), pkg-config, env (a variable that is not cargo's, or one named at run time), listing, process (another program), thread, random (std's RandomState), other. Read at the pinned version in the crates.io source on 2026-10-30 (`seen: registry`) unless `seen` says memory.",
  "crates": [
   {
    "name": "libc",

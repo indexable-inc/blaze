@@ -1,4 +1,4 @@
-//! The memory backstop of a spawned process on Linux (docs/v2/plan/lanes/core.md section 4, "Hard
+//! The memory backstop of a spawned process on Linux (docs/v2/plan.md section 4, "Hard
 //! backstop"): a cgroup v2 of its own, with `memory.max` at its limit and no swap, which the
 //! child joins before its program runs, so the kernel holds it (and whatever it starts) to the
 //! limit whatever admission estimated.

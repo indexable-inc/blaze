@@ -1,4 +1,4 @@
-//! Library files' parses kept across a daemon restart (docs/v2/plan/lanes/tree-store/design.md):
+//! Library files' parses kept across a daemon restart (docs/v2/plan/design/store.md):
 //! the trees of every library file's outline, with the bodies parsed so far, stored in a
 //! section of the daemon's image by the text's content ID, its edition and the parse's kind,
 //! and read back in place: on restart a dependency file's parse is a lookup and a few checks,

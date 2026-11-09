@@ -1,4 +1,4 @@
-//! Why a lookup missed (lane why-miss, docs/v2/plan/lanes/why.md). Nothing here runs on a
+//! Why a lookup missed (lane why-miss, docs/v2/plan/design/why.md). Nothing here runs on a
 //! hit's path, and nothing here writes: a reason is worked out only once a lookup has found
 //! nothing and someone wants to know why, and what it needs from before is handed in.
 //!

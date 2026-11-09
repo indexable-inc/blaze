@@ -1,4 +1,4 @@
-"""budgets.py: the performance budgets of docs/v2/plan/goals/targets.md, and docs/v2/plan/lanes/proof.md's release
+"""budgets.py: the performance budgets of docs/v2/plan/objectives.md, and docs/v2/plan.md's release
 code speed against rustc's, each an outcome with the number measured, the budget, today's figure from the
 table, and pass or fail.
 
@@ -85,8 +85,8 @@ their pinned revisions, except blaze, which is the files of this checkout as the
                    relocation 16
     cache-misses   nushell: the machine's cache misses over the build of bench's `body` edit
                    (`perf stat -a`, Linux); docs/v2/plan/design/data.md asks for it and sets no budget
-    bounds         every lane's speed-of-light bounds (bounds.py: the `bound` blocks of each
-                   docs/v2/plan/lanes/<lane>/speed-of-light.md), each program beside `blaze` run
+    bounds         every speed-of-light bound (bounds.py: the `bound` blocks of
+                   docs/v2/plan/bounds.md), each program beside `blaze` run
                    until settled: at most the bound x 1.1 (at least the bound / 1.1 for a rate);
                    unmeasured on v1, which has none of v2's components
 
@@ -246,7 +246,7 @@ ROWS = (
     Row("dev-speed", "dev-speed", "ripgrep", "dev-build code speed (ripgrep): blaze's dev program against cargo's debug "
         "build", 1.0, True, "x cargo's time", "ripgrep's dev build runs 5.8x slower than cargo's debug build (#1404)"),
     Row("release-speed", "release-speed", "ripgrep", "release code speed (ripgrep): `blaze build --release` against "
-        "`cargo build --release`", 1.0, True, "x cargo's time", "no figure in docs/v2/plan/goals/targets.md"),
+        "`cargo build --release`", 1.0, True, "x cargo's time", "no figure in docs/v2/plan/objectives.md"),
     Row("big-crate", "big-crate", "ruff", "body edit of a big top crate (ruff)", 50, True, "ms",
         "ruff 75 s, ty 147 s; cargo 7 s; Astral's fork 0.3 s (#1450)"),
     Row("cold-busy", "cold-blaze", "blaze", "cold build of blaze: the share of the machine's cores busy", 0.8, False,

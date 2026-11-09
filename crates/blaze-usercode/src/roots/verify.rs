@@ -1,4 +1,4 @@
-//! Verified before shared (docs/v2/plan/lanes/store.md, "Portable keys"): a run's value is
+//! Verified before shared (docs/v2/plan/design/store.md, "Portable keys"): a run's value is
 //! never given to another checkout on the word of the checkout that ran it. Each value is kept
 //! three ways in the store's key space, all through [`index::keep`], so all of it is the
 //! store's and is restored with it:

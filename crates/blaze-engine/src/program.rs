@@ -15,6 +15,13 @@ use crate::{as_rustc, pin, update, versions};
 
 /// The program `blaze`, whose `src/main.rs` and `src/bin/blaze.rs` are only this.
 pub fn main() -> ExitCode {
+    // C's and C++'s allocations (LLVM's) are blaze's allocator's, counted to the running task's
+    // tag as Rust's are (`malloc.rs`); a process where they are not stops here, saying why.
+    #[cfg(feature = "native")]
+    if let Err(why) = crate::malloc::check() {
+        eprintln!("error: {why}");
+        return ExitCode::FAILURE;
+    }
     // A bug blaze reports and goes on past (`stdx::assert::reported`) is said by the daemon in
     // `blaze status` and the profile; it doesn't change how this process exits, as it does a
     // test's.
@@ -99,7 +106,7 @@ pub fn main() -> ExitCode {
             // `IX_PROF=<dir>`: this process (the client, or the daemon it starts) is sampled
             // until it ends and its profile written to `<dir>`; with `<dir>` a target
             // directory's `layout`, the next build of blaze there lays its code out by it
-            // (docs/v2/plan/lanes/layout/layout.md). Unset, nothing runs.
+            // (docs/v2/plan/design/code-layout.md). Unset, nothing runs.
             let _profiled = match ix_prof::start_from_env() {
                 Ok(guard) => guard,
                 Err(error) => return failed(&error.to_string()),

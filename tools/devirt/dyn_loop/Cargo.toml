@@ -1,4 +1,4 @@
-# The dyn-heavy loop `tools/devirt/bench.py` times (docs/v2/plan/lanes/codegen/devirt.md): a
+# The dyn-heavy loop `tools/devirt/bench.py` times (docs/v2/plan/design/devirt.md): a
 # workspace of its own, so the blaze workspace above never takes it for a member.
 [package]
 name = "dyn-loop"

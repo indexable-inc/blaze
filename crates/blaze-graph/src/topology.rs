@@ -1,4 +1,4 @@
-//! Which CPUs share what (docs/v2/plan/lanes/core.md section 4, docs/v2/plan/lanes/core/plane.md "The executor"), for the
+//! Which CPUs share what (docs/v2/plan.md section 4, docs/v2/plan.md "The executor"), for the
 //! worker pool's groups and the order its workers steal in.
 //!
 //! A **group** is the CPUs that share a last-level cache (an EPYC's CCD: the level 3 cache's

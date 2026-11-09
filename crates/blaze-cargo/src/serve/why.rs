@@ -1,5 +1,5 @@
 //! `blaze why`: what the last build computed again instead of reusing, and why
-//! (docs/v2/plan/lanes/why.md). A sans-IO core (rule 14): [`Ledger`] takes the misses a
+//! (docs/v2/plan/design/why.md). A sans-IO core (rule 14): [`Ledger`] takes the misses a
 //! build gave back with what it built (`Ended::misses`, its own and no other build's), names
 //! each one's cause against what it holds of the subject's last compute, and hands back the
 //! answer, the history's rows and the record to append to its file; [`Answers`] keeps each

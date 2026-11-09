@@ -1,4 +1,4 @@
-//! The threads the plane's tasks run on (docs/v2/plan/lanes/core.md section 4, docs/v2/plan/lanes/core/plane.md "The
+//! The threads the plane's tasks run on (docs/v2/plan.md section 4, docs/v2/plan.md "The
 //! executor"): one worker per CPU of a [`Topology`], stealing work nearest first.
 //!
 //! Each worker has a deque of its own (crossbeam's Chase-Lev deque, as Rayon's) and a LIFO
@@ -43,7 +43,7 @@
 //! a time until its wait ends; where a worker of its own thread would park, a driven one gives
 //! its turn back, and its thread looks at the clock's next due wait, then for a stall.
 //!
-//! A job allocates nothing once its thread is warm (docs/v2/plan/lanes/mem/core/plane.md). Its
+//! A job allocates nothing once its thread is warm (docs/v2/plan/design/memory.md). Its
 //! closure goes in a cell of 128, 512 or 2048 bytes from one of three process-wide
 //! [`blaze_mem::Pool`]s, through a cache of the thread that submits it, and its cell goes back
 //! to the cache of the thread that runs it before the closure runs. A closure no cell holds is
@@ -3988,6 +3988,37 @@ mod tests {
             move |it| _ = tx.send(it.unwrap()),
         );
         assert_eq!(rx.recv_timeout(LONG).unwrap(), "after the fire");
+    }
+
+    /// An event rearmed ends the waits on it before, as a fire does, and is armed again: a
+    /// waiter taken after waits for the next fire, a job on a worker parked meanwhile, and its
+    /// last fire (the drop) ends that wait too.
+    #[test]
+    fn a_rearmed_event_ends_the_waits_before_and_holds_the_ones_after() {
+        use crate::sched::{Event, EventWait};
+        let pool = Pool::new(&Topology::flat(1), false).unwrap();
+        let mut event = Event::new();
+        let first: EventWait = event.waiter();
+        event.rearm();
+        first.wait().unwrap();
+        let second: EventWait = event.waiter();
+        assert_ne!(first, second, "a rearmed event waits under a new key");
+        let (tx, rx) = unbounded::<&'static str>();
+        pool.submit(
+            None,
+            move || {
+                second.wait().unwrap();
+                "the second waiter"
+            },
+            move |it| _ = tx.send(it.unwrap()),
+        );
+        until("the second waiter to park", || pool.shared.parked.load(Ordering::SeqCst) == 1);
+        assert!(rx.try_recv().is_err(), "the second waiter waits for the next fire");
+        event.rearm();
+        assert_eq!(rx.recv_timeout(LONG).unwrap(), "the second waiter");
+        let third = event.waiter();
+        std::thread::spawn(move || event.fire()).join().unwrap();
+        third.wait().unwrap();
     }
 
     /// On a pool of one worker, a job waits on the pool's clock and holds no thread: it parks,

@@ -1,4 +1,4 @@
-//! Integers of any width (`#![blaze::arbitrary_ints]`, docs/v2/plan/lanes/frontend/arbitrary-ints.md):
+//! Integers of any width (`#![blaze::arbitrary_ints]`, docs/v2/plan/design/arbitrary-ints.md):
 //! `u1`..`u127` and `i1`..`i127` but the standard widths, each held in the standard integer
 //! of its storage (`u3` in a `u8`, `i24` in an `i32`, `u65` in a `u128`), zero-extended from
 //! its width when unsigned and sign-extended when signed.

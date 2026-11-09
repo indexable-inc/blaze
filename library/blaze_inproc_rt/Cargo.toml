@@ -2,7 +2,7 @@
 name = "blaze_inproc_rt"
 version = "0.0.0"
 license = "MIT OR Apache-2.0"
-description = "blaze's dev runtime: the run process's side of a dev run on the daemon's code memory, linked into every dev executable (docs/v2/plan/lanes/fastcompile/inproc.md, \"The runtime\")"
+description = "blaze's dev runtime: the run process's side of a dev run on the daemon's code memory, linked into every dev executable (docs/v2/plan/design/compile-time.md, \"The runtime\")"
 edition = "2024"
 
 # One source, two builds: this manifest is the standard library's (blaze attaches the crate as

@@ -1,6 +1,6 @@
 //! hir's `VerifyRefused`: a `blaze_verify` specification clause (`requires`, `ensures`,
 //! `invariant`, ..) or named return type `-> (r: T)` that body lowering refused
-//! (docs/v2/plan/lanes/verus.md), named by the function it is on and the clause's keyword.
+//! (docs/v2/plan/design/verus.md), named by the function it is on and the clause's keyword.
 
 use hir::InFile;
 use syntax::view::{self as ast, AstNode as _};

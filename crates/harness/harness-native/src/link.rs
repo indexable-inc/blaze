@@ -370,6 +370,11 @@ struct UiEvent {
 }
 
 impl Link {
+    /// Where this link posts what the daemon says (a shot posts a recorded world there: App::shot_fixture).
+    pub fn mailbox(&self) -> Mailbox {
+        self.tx.clone()
+    }
+
     pub fn start(tx: Mailbox, wake: Wake) -> Self {
         let (poke, poked) = std::sync::mpsc::channel::<()>();
         let link = Self {

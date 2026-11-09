@@ -1,4 +1,4 @@
-//! The VM snapshots itself (docs/v2/plan/lanes/ci.md section 10, "no single point of failure"): after a
+//! The VM snapshots itself (docs/v2/plan.md section 10, "no single point of failure"): after a
 //! green run of the default branch or a release, once the newest snapshot is older than
 //! [`SnapshotConfig::every_secs`], the daemon makes its state durable
 //! ([`blaze_api::Request::Snapshot`]) and the configured command snapshots the VM. Beyond

@@ -1010,7 +1010,7 @@ fn scalar_unit(dl: &TargetDataLayout, value: Primitive) -> Scalar {
 /// `#![blaze::arbitrary_ints]` is its storage integer (`u3` is a `u8`, `i24` an `i32`) holding
 /// the value zero- or sign-extended, so its valid range is the width's values and the high
 /// bits it never sets are a niche, as `bool`'s are: `Option<u7>` is one byte
-/// (docs/v2/plan/lanes/frontend/arbitrary-ints.md).
+/// (docs/v2/plan/design/arbitrary-ints.md).
 pub(crate) fn int_scalar(
     dl: &TargetDataLayout,
     storage: Integer,

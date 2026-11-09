@@ -1,5 +1,5 @@
 //! The code map of one link: what each address of an image is, by code identity, so a profile
-//! of a run of that build names its functions across builds (docs/v2/plan/lanes/perf-history.md,
+//! of a run of that build names its functions across builds (docs/v2/plan/design/perf-history.md,
 //! "The code map").
 //!
 //! A link writes one while `<target-dir>/perf` exists, as `maps/<image>-<hash>/<build id>`.

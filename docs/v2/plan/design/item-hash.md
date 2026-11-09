@@ -6,7 +6,7 @@ date: 2026-10-30
 # Item identities: a front-end result is a lookup by hash
 
 Lane item-hash, approved by Andrew. Builds on lane items' hashes
-([lanes/items.md](../lanes/items.md), [lanes/items/notes.md](../lanes/items/notes.md)), the
+([lanes/items.md](item-hash.md), [lanes/items/notes.md](item-hash.md)), the
 persistent goal cache (`hir_ty::next_solver::goal_store`), the dependency bodies part
 (`hir_ty::check_cache`) and the HIR codec (`hir_def::hir::persist`). Works with lanes firewall
 (which body reads are allowed across items), dbsp (incremental impl and name tables), graph and
@@ -189,7 +189,7 @@ lang items) by key and **signature hash** (`blaze_items::signature_hash`, `Signa
 interface hash's form with a fixed marker in place of each leak, each ref by its signature
 hash. What a body then reads of a leak goes into its trace as a fact. The cases, each with
 rustc's rule; lane firewall lists the same set as the only allowed cross-body reads
-(`docs/v2/plan/lanes/firewall/notes.md`):
+(`docs/v2/plan/design/item-hash.md`):
 
 | leak | rustc's rule | in the signature hash | how a read enters |
 |---|---|---|---|
@@ -313,7 +313,7 @@ body when the two results differ: the differential mode the harness runs.
 
 ## 10. Speed of light
 
-In `docs/v2/plan/lanes/item-hash/speed-of-light.md`. Summary: the identity hashes a body's
+In `docs/v2/plan/design/item-hash.md`. Summary: the identity hashes a body's
 portable bytes (BLAKE3 at ~4-8 GB/s with SIMD, a 2 KB body in ~0.5 µs) and k ≈ 10-50 entries and
 names (each a memoized lookup, ~20 ns); a hit is two store reads from mapped memory (~1 µs each,
 page cache) plus the decode, against an inference of 50-500 µs: a 50-200x saving per body.

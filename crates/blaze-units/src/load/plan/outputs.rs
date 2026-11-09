@@ -240,7 +240,7 @@ pub(super) fn rustc_outputs(
         }
         // cargo writes nothing for a library's doctests (rustdoc builds each example in a
         // directory it deletes); blaze plans the unit's program where a test's goes, and each
-        // example is a program of its own beside it (docs/v2/plan/doctests.md).
+        // example is a program of its own beside it (docs/v2/plan/design/doctests.md).
         CompileMode::Test | CompileMode::Doctest => {
             match file_types(&CrateType::Bin, Flavor::Normal, triple)? {
                 Some(it) => (it, Vec::new()),

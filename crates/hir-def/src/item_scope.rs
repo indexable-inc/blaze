@@ -2946,7 +2946,7 @@ mod tests {
         }
     }
 
-    /// The sizes the notes give (`docs/v2/plan/lanes/db/speed-hir-nameres-scope.md`), with
+    /// The sizes the notes give (`docs/v2/plan/design/frontend.md`), with
     /// ids of 4 bytes (`blaze_query::db::Id`).
     #[test]
     fn sizes() {

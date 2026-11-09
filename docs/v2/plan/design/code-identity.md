@@ -250,6 +250,6 @@ The verify lane's Hegel edit fuzzer
 - `docs/v2/plan/design/caching.md`: what stored code is keyed by.
 - `docs/v2/plan/design/comptime.md`: `fn_info(f).code_id`, the one user-facing door.
 - `docs/v2/plan/design/verify.md`: the edit fuzzer.
-- `docs/v2/plan/lanes/kernel.md`: the kernel's step identity.
-- `docs/v2/plan/lanes/polymorph.md`: the share key and shapes.
-- `docs/v2/plan/lanes/pure-scripts/design.md`: pure scripts and trusted doors.
+- `docs/v2/plan/design/kernel.md`: the kernel's step identity.
+- `docs/v2/plan/design/polymorph.md`: the share key and shapes.
+- `docs/v2/plan.md`: pure scripts and trusted doors.

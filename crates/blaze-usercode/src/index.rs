@@ -1,4 +1,4 @@
-//! Finding a run's result in the store (docs/v2/plan/lanes/usercode/notes.md, "Keys").
+//! Finding a run's result in the store (docs/v2/plan.md, "Keys").
 //!
 //! A result is kept under [`RunKey::traced`]: the run's code, what it was given, and every
 //! input it read with its value then. To find one for a run about to happen, the store keeps

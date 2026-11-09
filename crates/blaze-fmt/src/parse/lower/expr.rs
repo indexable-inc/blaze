@@ -101,6 +101,13 @@ impl Lower<'_> {
                 ast::ExprKind::Await(self.opt_expr(a.expr(), span), kw_span)
             }
             ra::Expr::BecomeExpr(b) => ast::ExprKind::Become(self.opt_expr(b.expr(), span)),
+            // Not formatted as the plain `const { .. }` it would lose its `static` to.
+            ra::Expr::BlockExpr(b) if b.is_comptime() => {
+                return self.comptime_unsupported(
+                    span,
+                    "a `const static { .. }` block (`#![feature(blaze_comptime)]`)",
+                );
+            }
             ra::Expr::BlockExpr(b) => return self.block_expr(b, attrs),
             ra::Expr::BreakExpr(b) => {
                 let label = b.lifetime().map(|lt| ast::Label {

@@ -1,4 +1,4 @@
-//! Model tests (docs/v2/plan/lanes/safety/model.md) of the store's lock-free structures: a
+//! Model tests (docs/v2/plan/design/model-checker.md) of the store's lock-free structures: a
 //! table's slots and levels, the flag bits of a table and of an index, and a segment chunk's
 //! published bytes, each from 2 or 3 threads under every interleaving to the preemption bound
 //! and every value C11 lets a load read, against a sequential model. A table value holds a

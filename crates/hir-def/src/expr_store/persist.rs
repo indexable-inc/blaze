@@ -1,5 +1,5 @@
 //! [`ExpressionStore`], [`Body`] and their source maps as [`blaze_format`] buffers
-//! (docs/v2/plan/lanes/format.md section 5), in the encoding of [`crate::hir::persist`].
+//! (docs/v2/plan/design/data.md section 5), in the encoding of [`crate::hir::persist`].
 //!
 //! A store's expressions, patterns and statements are written as the columns they are in memory
 //! ([`HirColumns`]): the kind bytes, the data words, `extra` and the list arrays copied as they
@@ -1947,6 +1947,7 @@ unit_codes! {
         0 => ComptimeForm::ForConst,
         1 => ComptimeForm::ReflectedField,
         2 => ComptimeForm::BinderBound,
+        3 => ComptimeForm::Block,
     }
     VerifyRefusal {
         0 => VerifyRefusal::WithoutFeature,

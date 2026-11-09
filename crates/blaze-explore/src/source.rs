@@ -90,7 +90,7 @@ impl Source for Daemon {
     /// The daemon, whose builds the generic views read through `spans` and `sql`, and which
     /// alone has the `blaze` extension (builds, SQL, views, the build world): a page that reads
     /// `source` shows the extension's views only when it is listed
-    /// (docs/v2/plan/lanes/observe/explore.md, "One explorer, many sources").
+    /// (docs/v2/plan/design/explore.md, "One explorer, many sources").
     fn hello(&self) -> Hello {
         Hello {
             // alloc: once a session

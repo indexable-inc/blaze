@@ -23,7 +23,7 @@ the environment every build of it needs: bun's pinned toolchain, the code bun's 
 What bun's build needs is on PATH: what docs/project/contributing.mdx lists (LLVM 23, cmake,
 ninja, go, a bun to run its scripts), as `nix develop .#bench-bun` has it, whose only Rust is
 bun's pinned nightly. With rustup, that nightly is installed when it is missing.
-docs/research/bun.md says what was measured with it.
+fed1eb428d:docs/research/bun.md says what was measured with it.
 """
 import hashlib, os, re, shlex, shutil, subprocess, sys, tarfile, urllib.request
 

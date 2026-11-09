@@ -17,7 +17,6 @@ hn {
   // The plate: under the chip (above it when there is no room below), inline_peek_w wide, a column of lines.
   prefab ChatPeek : ui.Menu {
     Side: {edge: Bottom, dx: 0, dy: $menu_gap}
-    Transition: {kind: Grow, from: Top, scale: $menu_in_scale, fade: true}
     Flex: {axis: Column, gap: $inline_peek_gap, align: Stretch, justify: Start, wrap: false}
     Size: {w: {kind: Fixed, value: $inline_peek_w, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     Padding: {l: $inline_peek_pad, r: $inline_peek_pad, t: $inline_peek_pad, b: $inline_peek_pad}
@@ -208,10 +207,19 @@ hn {
     TextStyle: {size: $size_peek_body, line: $line_peek_body, role: 0, bold: 0}
   }
 
-  // A file's first lines, in the code face.
-  prefab PeekCode : ui.Words, Ink {
+  // A file's lines from the place named, in the code face and coloured by its language (src/app/chat/peek.rs sets
+  // `text`'s Highlight), as the transcript's code and the mention preview (chat.flecs ChatMentionCode) draw it: each
+  // line whole, never wrapped (a wrapped line starts at the left edge and reads as dedented), cut by this box's edge.
+  prefab PeekCode : ui.Column {
+    Clip
+    Flex: {axis: Column, gap: 0, align: Start, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-    TextStyle: {size: $size_peek_meta, line: $line_peek_meta, role: 9, bold: 0}
+    text : ui.Words {
+      Fill: $tone_ink
+      FixedSize: {h: true, v: false}
+      Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      TextStyle: {size: $size_peek_meta, line: $line_peek_meta, role: 9, bold: 0}
+    }
   }
 
   // A page's og:image (the daemon saves it as a file), cut to the plate's width and inline_peek_image_h, rounded; only on

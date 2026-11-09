@@ -1,4 +1,4 @@
-//! The standard library as one more crate graph (docs/v2/plan/lanes/cargo/notes.md section 5,
+//! The standard library as one more crate graph (docs/v2/plan.md section 5,
 //! #86): `library/` (rust-lang/rust at `library/UPSTREAM`'s commit) is a root of its own in the
 //! VFS, mounted at `/rustc/<commit>/library` as rustc's own paths into it are named, and loaded
 //! by the same queries as a user's workspace ([`crate::load::Foreign`]), asked as cargo's
@@ -95,7 +95,7 @@ pub fn default_crates(triple: &str) -> Result<Vec<String>, String> {
 /// blaze's dev runtime, a crate of the standard library's workspace (library/blaze_inproc_rt):
 /// the run process's side of a dev run on the daemon's code memory, whose start hook
 /// (`blaze_inproc_start`) the link puts first among a dev executable's initializers
-/// (docs/v2/plan/lanes/fastcompile/inproc.md, "The runtime"). The load asks it of the standard
+/// (docs/v2/plan/design/compile-time.md, "The runtime"). The load asks it of the standard
 /// library of a build whose dev executables run on this machine's code memory and gives it to
 /// each of them as it gives std ([`crate::load`]'s `attach_std`), so every dev binary and test
 /// has its hook whatever it depends on. Its package name is its `--extern` name.

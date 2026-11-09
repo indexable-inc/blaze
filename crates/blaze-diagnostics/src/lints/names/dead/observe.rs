@@ -1,6 +1,6 @@
 //! blaze: what one configuration of a package (one unit's crate: its lib, a test of it, a bin,
 //! under one set of features and one platform) says of its definitions, for the lints over
-//! every configuration at once (`crate::reach`, docs/v2/plan/multiconfig-check.md): each
+//! every configuration at once (`crate::reach`, docs/v2/plan/design/multiconfig-check.md): each
 //! definition with where it is, whether this configuration uses it (rustc's liveness, the same
 //! pass `dead_code` runs), whether `dead_code` would report it here, and at what levels; what
 //! the code this configuration does not use names (so a `#[cfg]` fix can be shown sound); and

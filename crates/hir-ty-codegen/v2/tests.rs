@@ -558,7 +558,7 @@ pub fn roots() {
 }
 "#;
 
-/// The property polymorphization rests on (docs/v2/plan/lanes/polymorph.md): instances whose
+/// The property polymorphization rests on (docs/v2/plan/design/polymorph.md): instances whose
 /// keys are equal compile to one shape, at every debuginfo level. Values of two types of one
 /// shape (`A` and `B`, `E1` and `E3`, `F` and `G`) are one instance of `id`, `swap` and `wrap`
 /// where no local is told to a debugger; a `u64`, a `transparent` wrapper and a float are not

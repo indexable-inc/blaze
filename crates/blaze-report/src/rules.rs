@@ -18,7 +18,7 @@ pub const RULES: &[Rule] = &[
         text: "A build script that prints `cargo::error=MESSAGE` (or `cargo:error=`) fails the build of its \
                package, as cargo fails it, even when it exits 0. blaze shows each message it logged; a script \
                that also prints `cargo:blaze-report=` lines says its failure as a report of its own, with the \
-               facts and fixes it knows (docs/v2/plan/structured-output.md, \"Build scripts\").\n\n\
+               facts and fixes it knows (docs/v2/plan/design/structured-output.md, \"Build scripts\").\n\n\
                Everything that depends on the package is held back: `blaze explain <package>` lists it.",
     },
     Rule {

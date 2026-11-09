@@ -9,11 +9,11 @@ This is the long-term plan for proofs in blaze. blaze translates its own MIR to 
 Lean program logic proves the specs. Other docs own the parts this one builds on, and it links
 to them rather than repeating them:
 
-- **The spec form and the first prover**: lane verus ([verus.md](../lanes/verus.md)). It owns
+- **The spec form and the first prover**: lane verus ([verus.md](verus.md)). It owns
   the native clause grammar (`requires`, `ensures`, `invariant`, `spec fn`, `ghost`/`tracked`),
   `VerifyRefused`, the interface `proved(..) -> Option<ProofKey>`, and `blaze check --verify`.
-- **Checked, generated, used contracts**: [contracts.md](../lanes/contracts.md).
-- **Purity and effects**: [pure-fns.md](../lanes/pure-fns.md) and [effects.md](../lanes/effects.md).
+- **Checked, generated, used contracts**: [contracts.md](contracts.md).
+- **Purity and effects**: [pure-fns.md](pure-fns.md) and [effects.md](effects.md).
 - **How unsafe code is checked today**: [unsafe.md](unsafe.md), with the shared-memory rules in
   [concurrency.md](concurrency.md).
 - **Testing, including DST**: the
@@ -170,7 +170,7 @@ contracts part 3.
 
 `blaze check --verify` (lane verus's decision: one command for checks) runs every changed
 obligation. It reports each obligation as one record, rendered for a terminal and given to
-agents as data over the agent API ([roadmap §8](../../../roadmap.md#8-the-agent-api)):
+agents as data over the agent API ([roadmap §8](../../plan.md)):
 
 ```text
 { item, clause, prover: lean|verus, key,

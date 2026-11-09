@@ -1,6 +1,6 @@
 //! The oracle's cases for lane dbsp's maintained name resolution and impl tables
 //! (docs/v2/plan/design/dbsp.md section 12, "a reader sees only its slice"; notes in
-//! docs/v2/plan/lanes/dbsp/proof.md). Each [`Case`] is one kind of edit of
+//! docs/v2/plan/design/dbsp.md). Each [`Case`] is one kind of edit of
 //! `harness/v2/dbsp/edits.py` and says what the build after it may rerun. [`check`] holds two
 //! traces to it, the build before the edit and the incremental build after it, given what the
 //! edit [`Touched`]: how many traits' impl sets, and how many (trait, self type) buckets, it

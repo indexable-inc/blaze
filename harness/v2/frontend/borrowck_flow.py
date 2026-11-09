@@ -1,5 +1,5 @@
 """borrowck_flow.py: `BLAZE_BORROWCK=polonius-flow` accepts more than the default checker and
-never less, on rustc's polonius UI tests (docs/v2/plan/lanes/borrowck-cursor.md).
+never less, on rustc's polonius UI tests (docs/v2/plan/design/borrowck-cursor.md).
 
     uv run --frozen python harness/v2/frontend/borrowck_flow.py '{"engine": {"kind": "v2", "blaze": "target/release/blaze"}, "out": "/tmp/borrowck-flow.json"}'
     uv run --frozen python harness/v2/frontend/borrowck_flow.py selftest
@@ -52,7 +52,7 @@ SUITE = ROOT / "docs" / "upstream" / "borrowck" / "rust-lang-rust" / "tests-ui"
 TABLE_NAME = "ui-polonius-revisions-table.md"
 AREA = "borrowck"
 MODES = ("polonius", "polonius-flow")
-# docs/research/borrowck.md section 2.5: rejected by the alpha, accepted by legacy Polonius.
+# fed1eb428d:docs/research/borrowck.md section 2.5: rejected by the alpha, accepted by legacy Polonius.
 TARGETS = frozenset({
     "tests/ui/nll/polonius/iterating-updating-cursor-issue-57165.rs",
     "tests/ui/nll/polonius/iterating-updating-cursor-issue-63908.rs",

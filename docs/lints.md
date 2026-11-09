@@ -189,7 +189,7 @@ again, undoing the fix if it adds an error.
 
 **Not found.** A `clone()` made to end a borrow, an index loop or raw pointer standing in for a
 cursor, `mem::take` and put back, and the crate's own function called twice (it may have
-effects): see [the plan](v2/plan/lanes/lints/borrow-workarounds.md). Concurrent maps (papaya,
+effects): see [the plan](v2/plan/design/lint-borrow-workarounds.md). Concurrent maps (papaya,
 dashmap), whose `get` hands back a guard; an `if` in a closure; code a macro wrote.
 
 **Allowing it.** `#[expect(blaze::borrow_workaround, reason = "..")]` on the function.
@@ -693,7 +693,7 @@ Each also refuses what it can't see: a call through a `dyn` or a function pointe
 follow, and (`noalloc`, `nonblocking`) a foreign function or `asm!` it knows nothing of. The
 finding says the shortest call chain to what does it, each step with its file and line. They
 are `deny` by default: the function asked for it. The tables and rules are in
-[v2/plan/lanes/effects.md](v2/plan/lanes/effects.md).
+[v2/plan/lanes/effects.md](v2/plan/design/effects.md).
 
 **Why it matters.** The promise holds for everything the function reaches, in every crate, and
 keeps holding as the code changes: a pool thread's pick never waits, a hot loop never touches
@@ -720,7 +720,7 @@ state with interior mutability behind a shared reference (`&AtomicU64`, `&Mutex<
 another thread can change during the call. Allocation, panics, atomics and cells on memory the
 function owns are allowed. The finding says the shortest call chain to what does it, each step
 with its file and line. It is `deny` by default: the function asked for it. What counts and why
-is in [v2/plan/lanes/pure-fns.md](v2/plan/lanes/pure-fns.md).
+is in [v2/plan/lanes/pure-fns.md](v2/plan/design/pure-fns.md).
 
 **Why it matters.** A pure function's result can be kept and reused by its arguments (the
 compute kernel's memoized steps), and two calls with the same arguments can be merged; that is

@@ -923,6 +923,6 @@ define_symbols! {
     blaze_field_index, blaze_field_attrs, blaze_variant_index, blaze_variant_discriminant,
     blaze_fn_info,
     // `#[blaze::contract_test]`, the builtin attribute `core::blaze::contract_test`
-    // (docs/v2/plan/lanes/contracts.md, part 2).
+    // (docs/v2/plan/design/contracts.md, part 2).
     contract_test,
 }

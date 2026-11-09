@@ -1,5 +1,5 @@
-//! `nopanic`, `noalloc`, `nonblocking` and `pure` (lane pure's, docs/v2/plan/lanes/pure-fns.md) (`deny` by default; each fires only where the code
-//! asks for it, docs/v2/plan/lanes/effects.md): a function marked `#[blaze::nopanic]`,
+//! `nopanic`, `noalloc`, `nonblocking` and `pure` (lane pure's, docs/v2/plan/design/pure-fns.md) (`deny` by default; each fires only where the code
+//! asks for it, docs/v2/plan/design/effects.md): a function marked `#[blaze::nopanic]`,
 //! `#[blaze::noalloc]` or `#[blaze::nonblocking]` (or a method of an impl of, or a default
 //! method of, a trait so marked) that may, through any call, panic, call the global allocator or
 //! block the thread. Each refusal is one finding at the function, saying the shortest call chain

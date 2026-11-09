@@ -1,4 +1,4 @@
-//! An [`ItemTree`] in a [`blaze_format`] buffer (docs/v2/plan/lanes/format.md section 5): its
+//! An [`ItemTree`] in a [`blaze_format`] buffer (docs/v2/plan/design/data.md section 5): its
 //! columns as they are in memory (docs/v2/plan/design/data.md), and its tables (names, paths,
 //! visibilities, attributes, `cfg`s) in the words of [`crate::hir::persist`].
 //!

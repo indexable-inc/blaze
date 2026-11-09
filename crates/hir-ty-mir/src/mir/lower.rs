@@ -338,7 +338,7 @@ struct MirLowerCtx<'a, 'f, 'db> {
     /// Whether a call of an uninhabited type other than `!` was lowered.
     uninhabited_call: bool,
     /// Set by `lower_root` for a function body whose clauses are checked at run time
-    /// (`cfg::CONTRACT_CHECKS`, docs/v2/plan/lanes/contracts.md part 1); `None` everywhere
+    /// (`cfg::CONTRACT_CHECKS`, docs/v2/plan/design/contracts.md part 1); `None` everywhere
     /// else, which lowers as before.
     contracts: Option<contract::Contracts>,
     /// Set only while `unreachable_after_calls`'s probe lowers the body again
@@ -4020,8 +4020,8 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                     }
                 }
                 // blaze_verify's clause groups are ghost: erased, never run
-                // (docs/v2/plan/lanes/verus.md), but for a `requires` checked at run time
-                // (`contract-checks`, docs/v2/plan/lanes/contracts.md part 1).
+                // (docs/v2/plan/design/verus.md), but for a `requires` checked at run time
+                // (`contract-checks`, docs/v2/plan/design/contracts.md part 1).
                 hir_def::hir::Statement::Expr { expr, has_semi: _ }
                     if let Some(kind) = self.store.spec_clause(expr) =>
                 {
@@ -4866,16 +4866,24 @@ fn cast_kind<'db>(db: &'db Db, source_ty: Ty<'db>, target_ty: Ty<'db>) -> Result
 }
 
 /// The constant a `const { .. }` block `expr` of `owner` is lowered to, a body of its own; `None`
-/// where it is lowered in place, as an inline const of a constant's or static's value is.
+/// where it is lowered in place, as an inline const of a constant's or static's value is. A
+/// `const static { .. }` block (`#![feature(blaze_comptime)]`) is a constant of its own in every
+/// body: it is evaluated by an evaluation of its own, in comptime mode, never in place.
 pub fn inline_const_at<'db>(
     db: &'db Db,
     owner: InferBodyId<'db>,
     infer: &InferenceResult<'db>,
     expr: ExprId,
 ) -> Option<AnonConstId<'db>> {
-    let InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(_)) = owner else {
+    // The block's own constant lowers the block in place.
+    if matches!(owner, InferBodyId::AnonConstId(it) if it.loc(db).expr == expr) {
         return None;
-    };
+    }
+    if !matches!(owner, InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(_)))
+        && !hir_ty::effects::const_block_is_comptime(db, owner.expression_store_owner(db), expr)
+    {
+        return None;
+    }
     let ty = infer.expr_ty(expr);
     if ty.references_non_lt_error() || ty.has_infer() {
         return None;

@@ -1,4 +1,4 @@
-//! Field order by heat (docs/v2/plan/lanes/codegen/field-order.md): the fields of a
+//! Field order by heat (docs/v2/plan/design/field-order.md): the fields of a
 //! `repr(Rust)` struct or enum variant that a profile shows hot code touching laid out first,
 //! so they share the type's first cache line.
 //!

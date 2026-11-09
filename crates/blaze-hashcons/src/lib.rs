@@ -1,5 +1,5 @@
 //! blaze v2's hash-consing of query values (docs/v2/plan/design/compile-time.md, change 5;
-//! docs/v2/plan/lanes/fastcompile/hashcons.md).
+//! docs/v2/plan/design/compile-time.md).
 //!
 //! - Equal values are stored once: a [`HashCons`] of `T` hands out one [`Interned`] handle (and
 //!   one dense [`Idx`]) per distinct value, so comparing two values is comparing two pointers.

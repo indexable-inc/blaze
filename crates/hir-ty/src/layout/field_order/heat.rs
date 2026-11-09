@@ -1,4 +1,4 @@
-//! Field heat (docs/v2/plan/lanes/codegen/field-order.md): how much the code a profile shows
+//! Field heat (docs/v2/plan/design/field-order.md): how much the code a profile shows
 //! running reads and writes each field of each struct and enum variant, from the bodies' built
 //! MIR, so [`Heat::ranked`] can name each type's hot fields for a [`FieldOrderPlan`].
 //!

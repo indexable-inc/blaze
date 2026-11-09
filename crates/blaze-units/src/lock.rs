@@ -1,4 +1,4 @@
-//! The lock policy (docs/v2/plan/lock-policy.md, docs/cargo.md "Lock files"): whether a build may
+//! The lock policy (docs/v2/plan/design/lock-policy.md, docs/cargo.md "Lock files"): whether a build may
 //! change its lock files, what it says when it does, and `blaze.lock`, which pins what blaze
 //! builds a workspace with besides the crates `Cargo.lock` pins.
 //!

@@ -31,7 +31,7 @@
 //! - blaze: [`Frame::Quit`] (kind 131): the server exits once every test it runs has ended
 //!   and been answered. A server whose socket ends kills what it runs and exits.
 //!
-//! What a test executed (docs/v2/plan/lanes/fastcompile/select.md, "The record"): a server
+//! What a test executed (docs/v2/plan/design/compile-time.md, "The record"): a server
 //! built with jump-table slots maps, before each fork, a region of [`HEADER`] plus a byte per
 //! slot, shared with the child, starting with [`header`]. The child's runtime arms it
 //! (`__blaze_exec_arm`), then each slot's first call sets its byte; once the child has ended

@@ -1,7 +1,7 @@
 """Moves a vendored third-party crate to a crates.io version: `vendor/<crate>` becomes that
 version's published `.crate`, checked against the crates.io index (and `Cargo.lock`, when the lock
 has it), with blaze's patch series (`vendor/<crate>/PATCHES.md`) replayed on top
-(docs/v2/plan/observe/no-tracing.md, section 6.2). Run it on every bump of the crate, and with
+(docs/v2/plan/design/no-tracing.md, section 6.2). Run it on every bump of the crate, and with
 the current version to re-check that the tree is upstream plus the series.
 
     uv run --frozen tools/vendor/sync.py '{"crate": "quinn-proto", "version": "0.11.19"}'

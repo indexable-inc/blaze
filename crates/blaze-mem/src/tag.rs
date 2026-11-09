@@ -21,6 +21,11 @@
 //! taken off the tag that made the block, on whatever thread and in whatever task it happens;
 //! what is allocated outside any task is [`Snapshot::heap_outside`]. It folds its counts in
 //! per thread ([`heap_moved`]), as the other counters are.
+//!
+//! And each tag counts its global-heap churn ([`Counters::heap_allocated`],
+//! [`Counters::heap_freed`]): the bytes of its blocks allocated and freed in all, never netted
+//! ([`heap_churned`]). Churn far past what a tag holds is scratch that belongs on a frame: the
+//! pages it leaves behind are what the allocator keeps.
 
 use std::{cell::Cell, fmt, sync::OnceLock};
 
@@ -69,10 +74,14 @@ pub enum Tag {
     /// The trait solver's caches of solved goals: hir-ty's `tls_cache` tables and the blocks of
     /// each `GlobalCache` (rustc_type_ir).
     Solver,
+    /// The store's buffer pool (docs/v2/plan/design/store-pool.md): its pages loaded or being
+    /// loaded, counted as each run is made the process's ([`crate::Region::reuse`]) and given
+    /// back ([`crate::Region::evict`]). [`Tag::Store`] keeps the store's tables and segments.
+    Pool,
 }
 
 impl Tag {
-    pub const COUNT: usize = 22;
+    pub const COUNT: usize = 23;
 
     pub const ALL: [Tag; Tag::COUNT] = [
         Tag::Parse,
@@ -97,6 +106,7 @@ impl Tag {
         Tag::Profile,
         Tag::Other,
         Tag::Solver,
+        Tag::Pool,
     ];
 
     pub const fn index(self) -> usize {
@@ -127,6 +137,7 @@ impl Tag {
             Tag::Profile => "profile",
             Tag::Other => "other",
             Tag::Solver => "solver",
+            Tag::Pool => "pool",
         }
     }
 
@@ -170,6 +181,9 @@ struct Line {
     /// freed on one thread may be folded in before another thread folds in its allocation.
     heap: AtomicI64,
     heap_high_water: AtomicU64,
+    /// Its blocks' bytes allocated, and freed, in the global heap in all ([`heap_churned`]).
+    heap_allocated: AtomicU64,
+    heap_freed: AtomicU64,
 }
 
 impl Line {
@@ -187,6 +201,8 @@ impl Line {
             regions: AtomicU64::new(0),
             heap: AtomicI64::new(0),
             heap_high_water: AtomicU64::new(0),
+            heap_allocated: AtomicU64::new(0),
+            heap_freed: AtomicU64::new(0),
         }
     }
 }
@@ -216,9 +232,16 @@ static BASE_PAGES: Committed = Committed { now: AtomicU64::new(0), high_water: A
 struct Outside {
     now: AtomicI64,
     high_water: AtomicU64,
+    allocated: AtomicU64,
+    freed: AtomicU64,
 }
 
-static HEAP_OUTSIDE: Outside = Outside { now: AtomicI64::new(0), high_water: AtomicU64::new(0) };
+static HEAP_OUTSIDE: Outside = Outside {
+    now: AtomicI64::new(0),
+    high_water: AtomicU64::new(0),
+    allocated: AtomicU64::new(0),
+    freed: AtomicU64::new(0),
+};
 
 /// Whether the global allocator keeps blocks by tag ([`heap_by_tag`]): set once, by the
 /// allocator, when it first does.
@@ -318,6 +341,26 @@ pub fn heap_moved(holder: Option<Tag>, bytes: i64) {
     let held = now.fetch_add(bytes, Ordering::Relaxed).wrapping_add(bytes);
     if bytes > 0 {
         raise(high_water, u64::try_from(held).unwrap_or(0));
+    }
+}
+
+/// `holder`'s blocks (`None`: made outside any task) had `allocated` bytes allocated and
+/// `freed` bytes freed in the global heap, in all: what a thread of the global allocator
+/// gathered and folds in. Takes no lock and allocates nothing, as an allocator's callee must.
+#[inline]
+pub fn heap_churned(holder: Option<Tag>, allocated: u64, freed: u64) {
+    let (into, out) = match holder {
+        Some(tag) => {
+            let line = line(tag);
+            (&line.heap_allocated, &line.heap_freed)
+        }
+        None => (&HEAP_OUTSIDE.allocated, &HEAP_OUTSIDE.freed),
+    };
+    if allocated != 0 {
+        into.fetch_add(allocated, Ordering::Relaxed);
+    }
+    if freed != 0 {
+        out.fetch_add(freed, Ordering::Relaxed);
     }
 }
 
@@ -605,6 +648,11 @@ pub struct Counters {
     /// allocator does not keep blocks by tag ([`Snapshot::heap_by_tag`]).
     pub heap: u64,
     pub heap_high_water: u64,
+    /// Its blocks' bytes allocated, and freed, in the global heap in all, never netted
+    /// ([`heap_churned`]): each within a megabyte per thread of what was. 0 where the global
+    /// allocator does not keep blocks by tag.
+    pub heap_allocated: u64,
+    pub heap_freed: u64,
 }
 
 /// Every tag's counters, read with relaxed loads: each number is exact, the set is not one
@@ -627,6 +675,10 @@ pub struct Snapshot {
     /// What the global heap holds of blocks allocated outside any task, or of every block
     /// where the global allocator does not keep them by tag.
     pub heap_outside: u64,
+    /// What the global heap allocated, and freed, of blocks made outside any task (of every
+    /// block where it keeps none by tag), in all ([`heap_churned`]).
+    pub heap_outside_allocated: u64,
+    pub heap_outside_freed: u64,
     /// Whether the global allocator keeps blocks by tag, so each tag's [`Counters::heap`] is
     /// what it holds ([`heap_by_tag`]).
     pub heap_by_tag: bool,
@@ -708,6 +760,8 @@ pub fn snapshot() -> Snapshot {
             regions: line.regions.load(Ordering::Relaxed),
             heap: held(&line.heap),
             heap_high_water: line.heap_high_water.load(Ordering::Relaxed),
+            heap_allocated: line.heap_allocated.load(Ordering::Relaxed),
+            heap_freed: line.heap_freed.load(Ordering::Relaxed),
         };
     }
     Snapshot {
@@ -720,6 +774,8 @@ pub fn snapshot() -> Snapshot {
         base_pages_high_water: BASE_PAGES.high_water.load(Ordering::Relaxed),
         thp: crate::huge::thp(),
         heap_outside: held(&HEAP_OUTSIDE.now),
+        heap_outside_allocated: HEAP_OUTSIDE.allocated.load(Ordering::Relaxed),
+        heap_outside_freed: HEAP_OUTSIDE.freed.load(Ordering::Relaxed),
         heap_by_tag: HEAP_BY_TAG.load(Ordering::Relaxed),
         purged: crate::chunks::cached().cold,
         heap_committed: HEAP_COMMITTED.get().map(|committed| committed()),
@@ -782,6 +838,8 @@ mod footprint_tests {
             base_pages_high_water: 0,
             thp: Default::default(),
             heap_outside: 0,
+            heap_outside_allocated: 0,
+            heap_outside_freed: 0,
             heap_by_tag: true,
             purged,
             heap_committed,

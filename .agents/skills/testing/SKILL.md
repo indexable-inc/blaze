@@ -106,6 +106,15 @@ smallest run that still fails, and replays it exactly.
   lock of a file; a crash lets every lock go, another process's too.
 - `program` for spawned processes (a memory limit kills, as a cgroup does), `dial`/`peer_*` for a
   peer outside the simulation.
+- Reads into and writes from memory the asker owns (`Effect::ReadInto`, `Effect::WriteFrom`),
+  carried out against the registered memory itself (`blaze_core::Memory` for a test's own): a
+  read scribbles its span with `sim::SCRIBBLE` at submit and fills it at completion, so a
+  reader of a span in flight sees the scribble; a write takes its bytes from memory at
+  completion, so memory changed in flight is what lands; a failed write, and one in flight at a
+  crash, lands any of its 512-byte sectors, and a crash tears unsynced writes from memory by
+  sector. Targeted: `hold_reads`/`release_reads`, `fail_reads`, `short_reads`, and `rot` (a
+  block changed on disk under what was synced). `crates/blaze-core/src/sim/pages.rs` is the
+  worked example: a pool-shaped page store, its oracle, five planted bugs and seed replay.
 
 Examples: `crates/blaze-cas/src/tests/model_check.rs` (Hegel draws the store's operation
 sequence and the `Sim` seed, checks it against a `BTreeMap`) and the crash tests in

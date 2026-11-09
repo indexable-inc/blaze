@@ -1,4 +1,4 @@
-"""proof.py: everything that proves blaze v2 (docs/v2/plan/lanes/proof.md), run as one, into one report.
+"""proof.py: everything that proves blaze v2 (docs/v2/plan.md), run as one, into one report.
 
     uv run --frozen python harness/v2/proof.py '{"engine": {"kind": "v1", "blaze": "target/release/blaze"}, "out": "/tmp/proof"}'
     uv run --frozen python harness/v2/proof.py '{"engine": {...}, "out": "/tmp/proof",
@@ -15,7 +15,7 @@ The checks, each a script of this directory run with the same `engine` (v1 now, 
     determinism   determinism.py: two builds on different core counts, byte for byte the same
     tightmemory   tightmemory.py: a build under a tight memory budget finishes, never OOMs
     macroeval     macroeval_corpus.py: blaze-macro-eval's corpus of proc macros
-    budgets       budgets.py: the targets of docs/v2/plan/goals/targets.md
+    budgets       budgets.py: the targets of docs/v2/plan/objectives.md
 
 Each writes its result (report.py's shape) to `OUT/<check>.json` and what it printed to
 `OUT/<check>.log`; this writes `OUT/report.json` (one outcome per check, the verdict of the
@@ -149,7 +149,7 @@ def markdown(spec: engine.EngineSpec, rows: list[tuple[Check, report.Verdict, st
     lines += [f"| {check.name} | {verdict} | {cell(detail.splitlines()[0])} |" for check, verdict, detail, _ in rows]
     budgets = next((result for check, _, _, result in rows if check.name == "budgets" and result), None)
     if budgets is not None:
-        lines += ["", "## Budgets (docs/v2/plan/goals/targets.md)", "", "| budget | verdict | numbers | detail |",
+        lines += ["", "## Budgets (docs/v2/plan/objectives.md)", "", "| budget | verdict | numbers | detail |",
                   "|---|---|---|---|"]
         for o in budgets["outcomes"]:
             numbers = "  ".join(f"{k}={v}" for k, v in o["numbers"].items() if v is not None)

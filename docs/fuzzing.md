@@ -9,7 +9,7 @@ and edits of them, and hold what blaze builds warm to what blaze builds of the s
 nothing. None of them compares with rustc or cargo: the differential fuzzer that built each
 program with cargo too (`fuzz/fuzz.py`) was deleted on 2026-10-30 with the other comparisons
 ([harness.md](harness.md)). Its account, with every finding, is in
-[reports/FUZZ.md](reports/FUZZ.md), a record.
+reports/FUZZ.md, a record.
 
 ## Running them
 
@@ -74,7 +74,7 @@ again.
 ## What they have found
 
 The differential fuzzer found twenty-one problems in whole builds before it was deleted, most
-of them miscompiles of drop order; [reports/FUZZ.md](reports/FUZZ.md) lists them and
+of them miscompiles of drop order; reports/FUZZ.md lists them and
 [results.md](results.md) tabulates the runs. Generated edits against v1's running daemon found
 four more problems in the incremental path, all fixed, and a fifth that is open: after some
 edits a panic inside `core` names the file by its `/rustc/<commit>/library/...` path instead of

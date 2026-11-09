@@ -1,4 +1,4 @@
-//! The build's graph as a state machine (docs/driver.md, "The step function").
+//! The build's graph as a state machine (docs/v2/plan.md, "The step function").
 //!
 //! [`Machine::step`] takes an [`Input`]: nodes added, no more to be added, or what came of a
 //! node it asked to run. It gives back [`Output`]s: the nodes to run now, the records of
@@ -9,7 +9,7 @@
 //! end of the build runs first, so what the build waits for longest is never behind what it
 //! does not wait for; ties go to the node added first.
 //!
-//! A machine is the [`Plane`] with one request (docs/v2/plan/lanes/core/plane.md): one scheduler, whose
+//! A machine is the [`Plane`] with one request (docs/v2/plan.md): one scheduler, whose
 //! one-build case this is, so a build script graph and a daemon's many requests are scheduled by
 //! the same rules.
 

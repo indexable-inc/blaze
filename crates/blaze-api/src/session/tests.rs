@@ -657,6 +657,8 @@ fn counters() -> Snapshot {
             regions: 0,
             heap: 0,
             heap_high_water: 0,
+            heap_allocated: 0,
+            heap_freed: 0,
         };
     }
     tags[Tag::Infer.index()].budget = 4096;
@@ -671,6 +673,8 @@ fn counters() -> Snapshot {
         base_pages_high_water: 0,
         thp: blaze_mem::huge::Thp::Unset,
         heap_outside: 0,
+        heap_outside_allocated: 0,
+        heap_outside_freed: 0,
         heap_by_tag: false,
         purged: 0,
         heap_committed: None,

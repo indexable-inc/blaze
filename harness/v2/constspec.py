@@ -1,5 +1,5 @@
 """constspec.py: the benchmark of `hir-ty-mir`'s `Specialize`, which calls a copy of a callee
-compiled knowing a constant argument it branches on (docs/v2/plan/lanes/codegen/constspec.md).
+compiled knowing a constant argument it branches on (docs/v2/plan/design/constspec.md).
 The program `constspec/modes.rs` runs mode-switched hot loops; two blazes build it, the one
 without the pass (`before`) and the one with it (`after`), and their programs are timed.
 

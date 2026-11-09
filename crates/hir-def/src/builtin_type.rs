@@ -20,7 +20,7 @@ pub enum BuiltinInt {
     I64,
     I128,
     /// blaze: `i1`..`i127` but for the standard widths, named only in a crate with
-    /// `#![blaze::arbitrary_ints]` (docs/v2/plan/lanes/frontend/arbitrary-ints.md).
+    /// `#![blaze::arbitrary_ints]` (docs/v2/plan/design/arbitrary-ints.md).
     Bits(IntWidth),
 }
 

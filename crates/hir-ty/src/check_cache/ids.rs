@@ -239,7 +239,7 @@ pub(crate) fn outside<T>(f: impl FnOnce() -> T) -> T {
 
 // Each access to `TABLE` is a call of its own, never inlined: a job that waits between two may
 // resume on another thread, and an inlined access may reuse the address of the first thread's
-// slot (docs/v2/plan/lanes/may-suspend.md).
+// slot (docs/v2/plan/design/may-suspend.md).
 
 #[inline(never)]
 fn replace_table(table: Option<Table>) -> Option<Table> {

@@ -561,7 +561,7 @@ fn context(buf: &mut [u8], w: usize, h: usize, px: usize) -> Option<CFRetained<C
     CGContext::set_should_antialias(Some(&ctx), true);
     CGContext::set_allows_antialiasing(Some(&ctx), true);
     // No font smoothing: it thickens every stem (0.15 px a side at 16 px to the em), and den's text is a browser's
-    // with `-webkit-font-smoothing: antialiased`, as the brand site sets it (docs/research/colour-pipeline.md).
+    // with `-webkit-font-smoothing: antialiased`, as the brand site sets it (fed1eb428d:docs/research/colour-pipeline.md).
     CGContext::set_allows_font_smoothing(Some(&ctx), false);
     CGContext::set_should_smooth_fonts(Some(&ctx), false);
     Some(ctx)

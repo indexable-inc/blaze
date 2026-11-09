@@ -48,7 +48,7 @@ without `--prof` is byte-for-byte what it is today and behaves as under rustc
   below 1% (the measurement and its tree go in docs/profiling.md); until then they are on
   under `--prof` only.
 - Line info: both backends write DWARF 4 line tables per function
-  (`crates/hir-ty-codegen/debuginfo.rs`, docs/reports/DEBUGINFO.md; stencils record
+  (`crates/hir-ty-codegen/debuginfo.rs`, fed1eb428d:docs/reports/DEBUGINFO.md; stencils record
   `(offset, srcloc)` → `LineRow`). `--prof` forces at least `debug = "line-tables-only"`, so
   `blaze pprof list` has lines. The symbolizer (implemented, `ix_prof::symbols`) reads the
   executable's symbol table and DWARF (`addr2line` over `gimli`), inline chains included.

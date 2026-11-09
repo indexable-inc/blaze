@@ -1,5 +1,5 @@
 //! The load's first query, the only one that reads the view's configuration
-//! (docs/v2/plan/lanes/cargo/notes.md section 1): the cargo command line parsed as cargo parses
+//! (docs/v2/plan.md section 1): the cargo command line parsed as cargo parses
 //! it, and of the environment only the variables cargo reads by name, so a change to any other
 //! variable reruns this query alone.
 

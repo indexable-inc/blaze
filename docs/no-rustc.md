@@ -191,7 +191,7 @@ handed to cargo ([cargo.md](cargo.md#every-subcommand)).
 ## Self-contained: no rustup, no cargo
 
 The same goal seen from the machine blaze is installed on
-([self-contained.md](self-contained.md), [#298](https://github.com/indexable-inc/blaze/issues/298)):
+([self-contained.md](v2/plan.md), [#298](https://github.com/indexable-inc/blaze/issues/298)):
 installing is one `curl`, with no rustup, no toolchain pin and no cargo, and blaze resolves a
 project exactly as cargo does. Until K, J and M land, blaze keeps a toolchain of its own,
 private to it: the pinned nightly's `rustc`, `cargo` and `rust-std` (the host's and
@@ -315,7 +315,7 @@ there is the user's command):
 
 bun was not counted. Its workspace builds only after bun's own configure step has generated
 code and built its C and C++ (`harness/bunprep.py` under `nix develop .#bench-bun`), which the
-host did not have. What is known from [research/bun.md](research/bun.md) and the issues: bun
+host did not have. What is known from research/bun.md and the issues: bun
 needs `BLAZE_OTHER_TOOLCHAIN=1` for its pinned nightly; the whole-program report left 1,645
 functions to rustc, 907 of them reaching `type_info` and 304 `adt_const_params` (#34, #35); a
 signature edit goes to cargo because `posix_signal_handler` is left to rustc and writes a
@@ -578,7 +578,7 @@ without LLVM (CI's builds have it); the other places (cross targets other than t
 for which there is no `cc`) need clang as they did. An assembler in process for a build without
 LLVM is still to write.
 
-2026-11-02 (the `owntc` lane, [v2/plan/toolchain-c.md](v2/plan/toolchain-c.md), slice 1): the C
+2026-11-02 (the `owntc` lane, [v2/plan/toolchain-c.md](v2/plan/design/toolchain-c.md), slice 1): the C
 compiler is gone too. Every block is assembled by the pinned LLVM's MC assembler in process and by
 nothing else; a blaze built without LLVM, and a set `BLAZE_ASSEMBLER`, are errors that say so,
 never a run of the machine's clang or `cc`, whose output no key named.
@@ -993,7 +993,7 @@ Where J is now (2026-10-30): the server path below (J1, J2, the workspace's own 
 deleted. Every proc macro runs in process on blaze's evaluator (`crates/blaze-macro-eval`,
 [compile-time.md](v2/plan/design/compile-time.md) change 20), which speaks the pinned
 `library/proc_macro` bridge itself; a macro it cannot run stops the build with an error naming
-the macro and its crate ([v2/plan/lanes/dedup.md](v2/plan/lanes/dedup.md), "Proc macros: one
+the macro and its crate ([v2/plan/lanes/dedup.md](v2/plan/design/data.md), "Proc macros: one
 engine"). What follows is the record of the server path.
 
 The plan (the `no-rustc-l3` lane, 2026-10-23). What stands in the way, read in the vendored
@@ -1179,7 +1179,7 @@ Where J stands (2026-10-24):
   client half of `crates/proc-macro-api`, `crates/blaze-macro-wasm` and `crates/blaze-wasi`, and
   `build_release.py --server`. blaze-macro-eval is the one engine.
 
-J, K and M are planned together in [self-contained.md](self-contained.md#j-k-and-m), since
+J, K and M are planned together in [self-contained.md](v2/plan.md), since
 what they remove is most of the toolchain blaze still keeps: rustc and the sysroot's rlibs (116
 of its 132 MB on Linux x86-64) go only once all three are in.
 
@@ -1193,7 +1193,7 @@ build`, no rustc base. See [the cold start](#the-cold-start-without-rustc).
   putting it where cargo does; no `cargo build` runs, and a function the program can reach that
   blaze cannot compile fails the build with which and why ([cargo.md](cargo.md#what-a-build-does)).
   `harness/coldbuild.py` holds a fixture's programs, an example and a build script's output equal
-  to cargo's. Measured on the bench projects ([self-contained.md](self-contained.md)): ripgrep,
+  to cargo's. Measured on the bench projects ([self-contained.md](v2/plan.md)): ripgrep,
   fd, hyperfine, just, bat and nushell build whole and run as cargo's builds; axum and biome missed
   a build script's variable, until the loads read the graph of the build with blaze's own
   resolution ([resolve.md](resolve.md), 2026-10-25): axum then builds, and biome reaches 9
@@ -1470,7 +1470,7 @@ of its crate, `core`'s for most of the unit's 2,000; that is now once a crate, a
 unit, whose refusals nobody reads.
 
 With frozen dependency artifacts (#40, 2026-10-23, same host and pinning; each crate's
-`DefMap`, impls and lang items read from the store instead of resolved, [glancer.md](glancer.md),
+`DefMap`, impls and lang items read from the store instead of resolved, [glancer.md](v2/plan.md),
 item 1):
 
 | Build | Wall time |

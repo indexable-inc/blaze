@@ -1,4 +1,4 @@
-//! The goal store against a store in memory (docs/v2/plan/lanes/frontend/fast-trait-store.md,
+//! The goal store against a store in memory (docs/v2/plan/design/frontend.md,
 //! "Tests"): a goal's stable form decodes back to the goal, its records read back as written,
 //! an answer is found while its facts hold and refused when one or the solver changed, a goal
 //! with a read that is no fact is never stored, and a lookup with no store allocates nothing.

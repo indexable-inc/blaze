@@ -1,4 +1,4 @@
-//! blaze_verify's native specification syntax (docs/v2/plan/lanes/verus.md): Verus's clauses
+//! blaze_verify's native specification syntax (docs/v2/plan/design/verus.md): Verus's clauses
 //! as blaze grammar, with no `verus! { }` around them.
 //!
 //! Ported from verus-analyzer's `crates/parser/src/grammar/verus.rs`

@@ -379,7 +379,7 @@ struct DefMapCrateData {
     /// A crate of procedural macros, which gives other crates its macros and nothing else.
     proc_macro: bool,
     /// blaze: `#![blaze::arbitrary_ints]`, under which `u1`..`u128` and `i1`..`i128` are
-    /// primitive integer types (docs/v2/plan/lanes/frontend/arbitrary-ints.md).
+    /// primitive integer types (docs/v2/plan/design/arbitrary-ints.md).
     arbitrary_ints: bool,
 
     edition: Edition,

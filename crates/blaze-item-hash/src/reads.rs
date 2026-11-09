@@ -1,7 +1,7 @@
 //! What each read a body's step makes stands for (docs/v2/plan/design/item-hash.md section 6):
 //! covered by the body's identity, one fact, or refused. A step with a refused read is not
 //! stored. The audit behind each rule, and the reads refused on purpose, are in
-//! docs/v2/plan/lanes/item-hash/reads.md.
+//! docs/v2/plan/design/item-hash.md.
 //!
 //! A read is found by its ingredient's debug name in [`RULES`], sorted, by binary search, then
 //! told apart from a same-named ingredient by the file its ingredient was declared in: a field

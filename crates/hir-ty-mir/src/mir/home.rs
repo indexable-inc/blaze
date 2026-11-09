@@ -142,7 +142,7 @@ pub fn home(db: &Db, asker: Crate, code: Option<Crate>, args: GenericArgs<'_>) -
     // The crates the arguments name, each type walked once: a type reached by many paths (a
     // deep nest of generics, a closure's upvars) is walked once per path without the set,
     // exponentially many times, which held a helix build for 25 s on one thread
-    // (docs/research/warm-start.md).
+    // (fed1eb428d:docs/research/warm-start.md).
     let crates = frame::task(Tag::Mir, |frame| {
         let mut named =
             Named { db, crates: SmallVec::new(), seen: HashSet::new_in(frame), open: false };

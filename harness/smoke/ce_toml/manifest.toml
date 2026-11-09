@@ -51,7 +51,7 @@ inherits = "release"
 debug = 2
 
 # The binaries a release ships, built with PGO by .github/scripts/build_release.py
-# (docs/reports/RELEASE-BUILD.md). Thin LTO takes 4-5% off an edit's work in the daemon but
+# (fed1eb428d:docs/reports/RELEASE-BUILD.md). Thin LTO takes 4-5% off an edit's work in the daemon but
 # makes a rebuild of blaze after a one-line change 2.5 times longer, so `release`, which the
 # harnesses and CI build after every change, goes without.
 [profile.dist]

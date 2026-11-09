@@ -2,7 +2,7 @@
 //! calls of builtin macros made by hand. Each answer, element by element, is held to the stored
 //! one in `view_tests/` (they were held to the handle functions' until those were deleted with
 //! the IDE); and the allocation budgets of the walks
-//! (docs/v2/plan/lanes/frontend/tree-move-expand.md).
+//! (docs/v2/plan/design/frontend.md).
 
 use std::{fmt::Write as _, ops::ControlFlow};
 

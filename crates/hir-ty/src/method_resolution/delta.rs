@@ -1,5 +1,5 @@
 //! Impl tables and trait candidate sets maintained on the write side (design
-//! `docs/v2/plan/design/dbsp.md` §7, §8; notes `docs/v2/plan/lanes/dbsp/impls.md`).
+//! `docs/v2/plan/design/dbsp.md` §7, §8; notes `docs/v2/plan/design/dbsp.md`).
 //!
 //! After name resolution's maintainer (order `100`) has published a write's scopes, this one
 //! (`200`) reads its delta ([`NameresWrite`]): impls and derives added or removed, traits declared

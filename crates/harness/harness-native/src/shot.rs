@@ -43,19 +43,8 @@ pub fn run(path: &str) -> Result<(), String> {
     if let Some(h) = std::env::var("HARNESS_NATIVE_SHOT_HEADROOM").ok().and_then(|s| s.trim().parse::<f32>().ok()) {
         app.headroom = harness_native_render::hdr::Headroom { current: h, potential: h, reference: 0.0 };
     }
-    // HARNESS_NATIVE_SHOT_WORKING `think,run,edit,read,agent` (any of them, in any order; `all` for those five): every
-    // session row shows at work, its title's sheen at those paces in turn down the tree, and every run row at a command's,
-    // so a shot catches a sweep with nothing really at work. With HARNESS_NATIVE_SHOT_SEQ the frames show it moving.
-    if let Ok(v) = std::env::var("HARNESS_NATIVE_SHOT_WORKING") {
-        const PACES: [&str; 5] = ["think", "run", "edit", "read", "agent"];
-        app.shot_working = if v.trim() == "all" {
-            PACES.to_vec()
-        } else {
-            v.split(',')
-                .map(|p| PACES.into_iter().find(|k| *k == p.trim()).ok_or_else(|| format!("HARNESS_NATIVE_SHOT_WORKING={v}: {p:?} is not one of {PACES:?} or all")))
-                .collect::<Result<_, _>>()?
-        };
-    }
+    // HARNESS_NATIVE_SHOT_WORKING: every session row and every run row shows at work, with nothing really at work.
+    app.shot_working = std::env::var_os("HARNESS_NATIVE_SHOT_WORKING").is_some();
     if std::env::var("HARNESS_NATIVE_SIDEBAR").as_deref() == Ok("0") {
         app.fold_sidebar_now();
     }
@@ -71,6 +60,11 @@ pub fn run(path: &str) -> Result<(), String> {
     // HARNESS_NATIVE_SHOT_OPEN `<url>|<path>`: opened as a press on a link to it would (the browser pane on the right).
     if let Ok(t) = std::env::var("HARNESS_NATIVE_SHOT_OPEN") {
         app.open_target(&t, false);
+    }
+    // HARNESS_NATIVE_SHOT_FIXTURE <json>: a recorded world (the daemon's list and runs, chats' events) instead of the
+    // daemon's (App::shot_fixture); run with a private HARNESS_HOME and no daemon.
+    if let Ok(f) = std::env::var("HARNESS_NATIVE_SHOT_FIXTURE") {
+        app.shot_fixture(&f)?;
     }
     // A session id, a run (`r12`) or one of its stages (`r12.0`).
     if let Ok(s) = std::env::var("HARNESS_NATIVE_SHOT_SELECT") {

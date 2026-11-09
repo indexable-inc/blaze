@@ -1051,7 +1051,7 @@ fn a_leak_changes_the_interface_hash_and_keeps_the_signature_hash() {
     }
 }
 
-/// E4 of docs/v2/plan/lanes/firewall/notes.md: a constant without generics is its value, so an
+/// E4 of docs/v2/plan/design/item-hash.md: a constant without generics is its value, so an
 /// edit of the `const fn` it calls that keeps the value reaches none of its users.
 #[test]
 fn a_constant_is_its_value() {

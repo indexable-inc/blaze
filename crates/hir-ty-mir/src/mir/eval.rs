@@ -63,7 +63,10 @@ use super::{
     Operand, OperandKind, PlaceElem, PlaceTy, ProjectionElem, Rvalue, Statement, StatementKind,
     StoredPlace, Terminator, TerminatorKind, UnOp, return_slot,
 };
-use super::{Budget, IsSigned, MirEvalError, VTableMap, pad16};
+use super::{
+    AddressRead, Budget, ComptimeError, ComptimeErrorKind, Dispatch, IsSigned, MirEvalError,
+    VTableMap, pad16,
+};
 
 pub mod foreign;
 mod hooks;
@@ -106,6 +109,16 @@ macro_rules! from_bytes {
     };
 }
 use from_bytes;
+
+/// A refusal of blaze's `#![feature(blaze_comptime)]` (docs/v2/plan/design/comptime.md, "Phase
+/// 2b"), at `at` when known; one met in an rvalue gets its statement's.
+fn comptime_error<'db>(
+    kind: ComptimeErrorKind<'db>,
+    at: Option<(InferBodyId<'db>, MirSpan)>,
+) -> MirEvalError<'db> {
+    // alloc: error path
+    MirEvalError::Comptime(Box::new(ComptimeError { kind, at }))
+}
 
 pub(super) mod macro_call;
 
@@ -447,6 +460,12 @@ pub struct Evaluator<'db, M: Machine<'db> = Plain> {
     /// Evaluating at compile time (the body of a constant or static, or a const macro) rather
     /// than running a function: no extern static has a value then.
     compile_time: bool,
+    /// Evaluating a `const static { .. }` block (`#![feature(blaze_comptime)]`,
+    /// docs/v2/plan/design/comptime.md, "Phase 2b"): any function may run, and what cannot
+    /// happen at compile time is refused as it is reached (a foreign call, a pointer's address
+    /// read as an integer); the value may keep the heap it reaches through shared references.
+    /// A property of the whole evaluation: such a block is always a constant of its own.
+    comptime: bool,
     /// Heap memory standing in for the extern statics named at compile time, as start and
     /// size: their address is known, their value is not.
     extern_statics: Vec<(usize, usize, StaticId)>,
@@ -1013,6 +1032,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             compile_time: !matches!(
                 owner,
                 InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(_))
+            ),
+            comptime: matches!(
+                owner,
+                InferBodyId::AnonConstId(konst) if hir_ty::effects::anon_const_is_comptime(db, konst)
             ),
             extern_statics: Vec::new(), // alloc: empty, allocates nothing; one per evaluation
             in_static: matches!(owner, InferBodyId::DefWithBodyId(DefWithBodyId::StaticId(_))),
@@ -1905,7 +1928,15 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         match &statement.kind {
             StatementKind::Assign(l, r) => {
                 let addr = self.place_addr(l, locals)?;
-                let result = self.eval_rvalue(r, locals)?;
+                let result = match self.eval_rvalue(r, locals) {
+                    Ok(it) => it,
+                    // A refusal of `#![feature(blaze_comptime)]` in an rvalue is at its statement.
+                    Err(MirEvalError::Comptime(mut error)) if error.at.is_none() => {
+                        error.at = Some((locals.body.owner, statement.span));
+                        return Err(MirEvalError::Comptime(error));
+                    }
+                    Err(error) => return Err(error),
+                };
                 self.copy_from_interval_or_owned(addr, result)?;
                 if M::CHECKS {
                     self.typed_assign(l, addr, r, locals)?;
@@ -1922,7 +1953,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
 
     /// The typed copy an `Assign` of `r` to `place` (at `addr`) is: the machine checks the
     /// value at the place's type and retags what it holds, by the mode of the notes' table
-    /// (`docs/v2/plan/lanes/safety/notes.md`, "Retags without Retag statements").
+    /// (`docs/v2/plan/design/unsafe.md`, "Retags without Retag statements").
     fn typed_assign(
         &self,
         place: &StoredPlace,
@@ -2745,6 +2776,17 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         "destination of int to int cast",
                     )?;
                     let (bytes, shadow) = self.read_shadowed(value.addr, value.size)?;
+                    // A `const static { .. }` block may not read an address: the evaluator's are
+                    // not the program's. An integer cast to a pointer and back has none.
+                    if self.comptime
+                        && *kind == CastKind::PointerExposeAddress
+                        && (!M::CHECKS || shadow.prov_at(0, value.size).is_some())
+                    {
+                        return Err(comptime_error(
+                            ComptimeErrorKind::PointerAddress { how: AddressRead::Cast },
+                            None,
+                        ));
+                    }
                     if M::CHECKS {
                         self.machine.require_init(&shadow, 0..value.size)?;
                         if *kind == CastKind::PointerExposeAddress {
@@ -3741,7 +3783,11 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         (allocation, const_id.into())
                     }
                     AliasConstKind::Anon { def_id: AnonConstIdWrapper(konst) } => {
-                        if konst.is_inline_const(self.db) {
+                        // A `const static { .. }` block is evaluated by an evaluation of its own,
+                        // in comptime mode, as any anonymous constant: never in this one.
+                        if konst.is_inline_const(self.db)
+                            && !hir_ty::effects::anon_const_is_comptime(self.db, konst)
+                        {
                             return self.inline_const_in_heap(konst, subst, locals);
                         }
                         let allocation = self
@@ -4755,11 +4801,20 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     /// would free at run time, or `const_allocate` memory not made global. rustc refuses the
     /// latter alike ("encountered `const_allocate` pointer in final value that was not made
     /// global"), and has no `Box` or `Vec` that allocates in a constant.
-    fn may_be_in_value(&self, addr: usize) -> Result<'db, ()> {
+    ///
+    /// `shared`: the value reaches `addr` only as immutable, unowned memory, through a shared
+    /// reference to `Freeze` data or a raw pointer in such memory. In a `const static { .. }`
+    /// block (`#![feature(blaze_comptime)]`) the program's allocations so reached are made
+    /// global, as `const_make_global` makes a `const_allocate` block: nothing frees or writes
+    /// them (`format!(..).leak()` as a `&'static str`). One the value owns is still refused.
+    fn may_be_in_value(&self, addr: usize, shared: bool) -> Result<'db, ()> {
         let Heap(offset) = Address::from_usize(addr, self.cached_ptr_size).at() else {
             return Ok(());
         };
         match self.heap_block_at(offset) {
+            Some((_, HeapBlock { origin: Origin::Allocator, .. })) if self.comptime && shared => {
+                Ok(())
+            }
             Some((_, HeapBlock { origin: Origin::Allocator, .. })) => {
                 Err(MirEvalError::HeapInValue { of_const_allocate: false })
             }
@@ -4869,6 +4924,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         ty: Ty<'db>,
         locals: &Locals<'db>,
     ) -> Result<'db, ComplexMemoryMap<'db>> {
+        /// `shared`: the memory `bytes` are in is immutable and unowned, reached through a shared
+        /// reference to `Freeze` data ([`Evaluator::may_be_in_value`]); never so at the top.
         fn rec<'db, M: Machine<'db>>(
             this: &Evaluator<'db, M>,
             bytes: &[u8],
@@ -4876,10 +4933,21 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             locals: &Locals<'db>,
             mm: &mut ComplexMemoryMap<'db>,
             stack_depth_limit: usize,
+            shared: bool,
         ) -> Result<'db, ()> {
             if stack_depth_limit.checked_sub(1).is_none() {
                 return Err(MirEvalError::StackOverflow);
             }
+            // Whether what a pointer of `ty` points to is so: through `&T` of a `Freeze` `T`,
+            // or through a raw pointer in memory that is. Asked only in a `const static` block,
+            // the one evaluation whose value may keep the program's allocations.
+            let pointee_shared = match ty.kind() {
+                TyKind::Ref(_, pointee, Mutability::Not) => {
+                    this.comptime && is_freeze(&this.infcx, pointee, this.param_env.param_env)
+                }
+                TyKind::Ref(..) => false,
+                _ => shared,
+            };
             if let TyKind::RawPtr(..) | TyKind::Ref(..) = ty.kind()
                 && let Some(addr) = bytes.get(..this.ptr_size())
             {
@@ -4895,7 +4963,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     }
                     return Ok(());
                 }
-                this.may_be_in_value(addr)?;
+                this.may_be_in_value(addr, pointee_shared)?;
             }
             match ty.kind() {
                 // Nothing to find in these, and a large array of them is slow to walk.
@@ -4914,11 +4982,13 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         .lang_items()
                         .TypeId
                         .is_some_and(|it| adt.def_id() == AdtId::StructId(it)) => {}
-                TyKind::Pat(base, _) => rec(this, bytes, base, locals, mm, stack_depth_limit - 1)?,
+                TyKind::Pat(base, _) => {
+                    rec(this, bytes, base, locals, mm, stack_depth_limit - 1, shared)?
+                }
                 TyKind::RawPtr(..) => {
                     let Some(addr) = bytes.get(..this.ptr_size()) else { return Ok(()) };
                     let addr = from_bytes!(usize, this.cached_ptr_size, addr);
-                    behind_raw(this, addr, mm, stack_depth_limit - 1)?;
+                    behind_raw(this, addr, mm, stack_depth_limit - 1, pointee_shared)?;
                 }
                 TyKind::Ref(_, t, _) => {
                     // A field's pointee can be an alias (`&'static <T as Tr>::Obj`), whose size
@@ -4935,7 +5005,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                             let bytes = this.read_memory(addr, size)?;
                             mm.memory.insert(addr_usize, bytes);
                             this.note_align(mm, addr_usize);
-                            rec(this, bytes, t, locals, mm, stack_depth_limit - 1)?;
+                            let depth = stack_depth_limit - 1;
+                            rec(this, bytes, t, locals, mm, depth, pointee_shared)?;
                         }
                         None => {
                             let mut check_inner = None;
@@ -4968,7 +5039,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                                         for i in 0..count {
                                             let at = offset + i * size;
                                             let Some(bytes) = b.get(at..at + size) else { break };
-                                            rec(this, bytes, part, locals, mm, depth)?;
+                                            let shared = pointee_shared;
+                                            rec(this, bytes, part, locals, mm, depth, shared)?;
                                         }
                                     }
                                 }
@@ -5014,6 +5086,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                                         locals,
                                         mm,
                                         stack_depth_limit - 1,
+                                        pointee_shared,
                                     )?;
                                 }
                             }
@@ -5038,6 +5111,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                             locals,
                             mm,
                             stack_depth_limit - 1,
+                            shared,
                         )?;
                     }
                 }
@@ -5053,6 +5127,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                             locals,
                             mm,
                             stack_depth_limit - 1,
+                            shared,
                         )?;
                     }
                 }
@@ -5080,6 +5155,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                                 locals,
                                 mm,
                                 stack_depth_limit - 1,
+                                shared,
                             )?;
                         }
                     }
@@ -5109,6 +5185,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                                     locals,
                                     mm,
                                     stack_depth_limit - 1,
+                                    shared,
                                 )?;
                             }
                         }
@@ -5121,7 +5198,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                             let pointer =
                                 Ty::new_imm_ptr(this.interner(), Ty::new_unit(this.interner()));
                             for word in bytes.chunks_exact(this.ptr_size()) {
-                                rec(this, word, pointer, locals, mm, stack_depth_limit - 1)?;
+                                let depth = stack_depth_limit - 1;
+                                rec(this, word, pointer, locals, mm, depth, shared)?;
                             }
                         }
                     }
@@ -5137,7 +5215,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         // alloc: error path
                         .map_err(|_| MirEvalError::NotSupported("couldn't normalize".to_owned()))?;
 
-                    rec(this, bytes, ty, locals, mm, stack_depth_limit - 1)?;
+                    rec(this, bytes, ty, locals, mm, stack_depth_limit - 1, shared)?;
                 }
                 // A closure's captures, as a struct's fields.
                 TyKind::Closure(_, args) => {
@@ -5153,6 +5231,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                             locals,
                             mm,
                             stack_depth_limit - 1,
+                            shared,
                         )?;
                     }
                 }
@@ -5169,6 +5248,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             addr: usize,
             mm: &mut ComplexMemoryMap<'db>,
             stack_depth_limit: usize,
+            shared: bool,
         ) -> Result<'db, ()> {
             if stack_depth_limit.checked_sub(1).is_none() {
                 return Err(MirEvalError::StackOverflow);
@@ -5183,7 +5263,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 }
                 return Ok(());
             }
-            this.may_be_in_value(addr)?;
+            this.may_be_in_value(addr, shared)?;
             // A pointer one past an allocation's end is to that allocation: the heap leaves a
             // gap after each block, so it is never also the start of the next.
             let allocation = this.allocation_at(addr).or_else(|| {
@@ -5206,13 +5286,13 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             for word in memory.chunks_exact(this.ptr_size()) {
                 let inner = from_bytes!(usize, this.cached_ptr_size, word);
                 if inner != 0 {
-                    behind_raw(this, inner, mm, stack_depth_limit - 1)?;
+                    behind_raw(this, inner, mm, stack_depth_limit - 1, shared)?;
                 }
             }
             Ok(())
         }
         let mut mm = ComplexMemoryMap::default();
-        rec(self, bytes, ty, locals, &mut mm, self.stack_depth_limit - 1)?;
+        rec(self, bytes, ty, locals, &mut mm, self.stack_depth_limit - 1, false)?;
         Ok(mm)
     }
 
@@ -5581,6 +5661,102 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         Ok(())
     }
 
+    /// Whether a call through a function pointer or a vtable in `locals`' body has its target
+    /// checked for constness (`#![feature(blaze_comptime)]`, docs/v2/plan/design/comptime.md,
+    /// "Phase 2b"): at compile time, outside a `const static` block, in a const context of a
+    /// crate with the feature, where the static check let the call through.
+    fn checks_dispatch(&self, locals: &Locals<'db>) -> bool {
+        self.compile_time
+            && !self.comptime
+            && hir_ty::effects::dispatch_checked_at_eval(self.db, locals.body.owner)
+    }
+
+    /// Refuses the call `through` a function pointer or vtable of `target` (a function item, a
+    /// closure, or a type whose `Fn*` impl of `fn_trait`'s method, with its arguments, runs)
+    /// when [`Self::checks_dispatch`] and the target is not const.
+    fn check_dispatched(
+        &self,
+        target: Ty<'db>,
+        fn_trait: Option<(FunctionId, GenericArgs<'db>)>,
+        through: Dispatch,
+        locals: &Locals<'db>,
+        span: MirSpan,
+    ) -> Result<'db, ()> {
+        if !self.checks_dispatch(locals) {
+            return Ok(());
+        }
+        match target.kind() {
+            TyKind::FnDef(def, args) => match def.0 {
+                CallableDefId::FunctionId(func) => {
+                    self.check_const_target(func, args.skip_binder(), through, locals, span)
+                }
+                // A constructor is const.
+                CallableDefId::StructId(_) | CallableDefId::EnumVariantId(_) => Ok(()),
+            },
+            TyKind::Closure(closure, args) => {
+                if hir_ty::effects::closure_is_const(self.db, closure.0) {
+                    return Ok(());
+                }
+                let kind = ComptimeErrorKind::NonConstTarget {
+                    callee: Either::Right(closure.0),
+                    args: args.store(),
+                    through,
+                    bounds: false,
+                };
+                Err(comptime_error(kind, Some((locals.body.owner, span))))
+            }
+            // A function pointer behind `dyn Fn*` is checked where it is called.
+            TyKind::FnPtr(..) => Ok(()),
+            // A type with an `Fn*` impl of its own: that impl's method runs.
+            _ => match fn_trait {
+                Some((func, args)) => {
+                    let args = GenericArgs::new_from_iter(
+                        iter::once(target.into()).chain(args.iter().skip(1)),
+                    );
+                    self.check_const_target(func, args, through, locals, span)
+                }
+                None => Ok(()),
+            },
+        }
+    }
+
+    /// Refuses the call of `func` with `args` reached `through` a function pointer or vtable
+    /// unless it is const: `effects::const_call_error`, the rule the static check applies to a
+    /// direct call. The error names the function that would run (a trait's method by its
+    /// impl's).
+    fn check_const_target(
+        &self,
+        func: FunctionId,
+        args: GenericArgs<'db>,
+        through: Dispatch,
+        locals: &Locals<'db>,
+        span: MirSpan,
+    ) -> Result<'db, ()> {
+        let constness = rustc_type_ir::BoundConstness::Const;
+        let Some(error) =
+            hir_ty::effects::const_call_error(self.db, self.param_env, constness, func, args)
+        else {
+            return Ok(());
+        };
+        let env = ParamEnvAndCrate { param_env: self.param_env.param_env, krate: self.crate_id };
+        let (callee, args) = match self.db.lookup_impl_method(env, func, args) {
+            (Either::Left(impl_func), impl_args) => (impl_func, impl_args),
+            (Either::Right(_), _) => (func, args),
+        };
+        // The function that runs is const, and its `[const]` bounds are what fails; not a
+        // trait's method whose impl is not const.
+        let bounds = matches!(error, hir_ty::effects::NonConst::Unsatisfied(..))
+            && !matches!(callee.lookup(self.db).container, ItemContainerId::TraitId(_))
+            && hir_ty::effects::fn_is_const(self.db, callee);
+        let kind = ComptimeErrorKind::NonConstTarget {
+            callee: Either::Left(callee),
+            args: args.store(),
+            through,
+            bounds,
+        };
+        Err(comptime_error(kind, Some((locals.body.owner, span))))
+    }
+
     fn exec_fn_pointer(
         &mut self,
         bytes: Interval,
@@ -5592,6 +5768,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     ) -> Result<'db, Option<StackFrame<'db>>> {
         let id = from_bytes!(usize, self.cached_ptr_size, bytes.get(self)?);
         let next_ty = self.vtable_map.ty(id)?;
+        self.check_dispatched(next_ty, None, Dispatch::FnPointer, locals, span)?;
         use rustc_type_ir::TyKind;
         match next_ty.kind() {
             TyKind::FnDef(def, generic_args) => self.exec_fn_def(
@@ -5913,6 +6090,11 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         .enumerate()
                         .map(|(i, it)| if i == self_ty_idx { ty.into() } else { it }),
                 );
+                if self.checks_dispatch(locals) {
+                    let dyn_ty = generic_args.as_slice()[self_ty_idx].expect_ty().store();
+                    let through = Dispatch::Vtable { dyn_ty };
+                    self.check_const_target(def, generics_for_target, through, locals, span)?;
+                }
                 self.exec_fn_with_args(
                     def,
                     &args_for_target,
@@ -5978,6 +6160,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             .ok_or_else(|| MirEvalError::InternalError("fn trait with no arg".into()))?;
         let mut func_ty = func.ty;
         let mut func_data = func.interval;
+        // The `dyn Fn*` the callee was reached through, if it was.
+        let mut through_dyn = None;
         while let TyKind::Ref(_, z, _) = func_ty.kind() {
             func_ty = z;
             if matches!(func_ty.kind(), TyKind::Dynamic(..)) {
@@ -5987,6 +6171,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     &func_data.get(self)?[self.ptr_size()..self.ptr_size() * 2]
                 );
                 func_data = func_data.slice(0..self.ptr_size());
+                through_dyn = Some(func_ty);
                 func_ty = self.vtable_map.ty(id)?;
             }
             let size = self.size_of_sized(func_ty, locals, "self type of fn trait")?;
@@ -5994,6 +6179,11 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 addr: Address::from_bytes(func_data.get(self)?, self.cached_ptr_size)?,
                 size,
             };
+        }
+        if let Some(dyn_ty) = through_dyn {
+            let through = Dispatch::Vtable { dyn_ty: dyn_ty.store() };
+            let fn_trait = Some((def, generic_args));
+            self.check_dispatched(func_ty, fn_trait, through, locals, span)?;
         }
         match func_ty.kind() {
             TyKind::FnDef(def, subst) => self.exec_fn_def(

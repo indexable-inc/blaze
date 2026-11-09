@@ -1,7 +1,7 @@
 //! HTTP/3 and WebTransport, sans-IO: [`Endpoint`], a synchronous state machine over
 //! quinn-proto's QUIC core, and drivers that own the UDP socket and the timers (`tokio_driver`
 //! today; io_uring later, with no change here). The design is
-//! docs/v2/plan/observe/http3-sans-io.md.
+//! docs/v2/plan/design/http3-sans-io.md.
 //!
 //! # The core
 //!
@@ -40,7 +40,7 @@
 //!    whose peer sends no SETTINGS fails at [`SETTINGS_WAIT`], so no wait is open.
 //!
 //! The waits a driver does open no span yet: blaze-trace is not in the graph
-//! (docs/v2/plan/observe/no-tracing.md). When it lands, the driver opens one per wait, named
+//! (docs/v2/plan/design/no-tracing.md). When it lands, the driver opens one per wait, named
 //! by the peer and the session or stream (every-wait-says-what).
 //!
 //! # What the core reads that is not its input

@@ -1,6 +1,7 @@
 //! hir's `ComptimeUnsupported`: `#![feature(blaze_comptime)]` syntax (`for const`, `x.[f]`, a
-//! bounded `for<F: ..>` binder; `docs/v2/plan/design/comptime.md`), either in a crate without
-//! the feature, or with it where blaze's type checker does not check the form yet. blaze's own
+//! bounded `for<F: ..>` binder, `const static { .. }`; `docs/v2/plan/design/comptime.md`),
+//! either in a crate without the feature, or with it where blaze's type checker does not check
+//! the form yet. blaze's own
 //! extension, so no rustc text to follow.
 
 use crate::{
@@ -11,12 +12,10 @@ use crate::{
 };
 
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::ComptimeUnsupported) -> Vec<Found> {
-    let form = d.form.syntax();
+    let (form, part) = (d.form.syntax(), d.form.part());
     // alloc: the message, for an error hir found
     let message = match d.feature_enabled {
-        false => format!(
-            "{form} is blaze's compile-time reflection, which needs `#![feature(blaze_comptime)]`"
-        ),
+        false => format!("{form} is blaze's {part}, which needs `#![feature(blaze_comptime)]`"),
         true => format!(
             "{form} (`#![feature(blaze_comptime)]`) is not yet supported by blaze's type checker"
         ),

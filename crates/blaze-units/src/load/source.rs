@@ -1,5 +1,5 @@
 //! Where cargo has each package the resolve pins, and the registries' indexes the resolve reads
-//! (docs/v2/plan/lanes/cargo/notes.md section 3): every file read through the view's mounts,
+//! (docs/v2/plan.md section 3): every file read through the view's mounts,
 //! never the disk or the network. What is not mounted yet is a [`Fetch`] the daemon makes and
 //! mounts where cargo keeps it; offline, it is cargo's error.
 //!

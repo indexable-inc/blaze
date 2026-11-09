@@ -132,7 +132,7 @@ it ends with the peak they measured.
 ### 3. Caches with a bound
 
 salsa's `lru` only evicts when a revision begins, and cannot be put on `infer` or the MIR
-queries, which have cycle handling ([research/daemon-memory.md](research/daemon-memory.md)).
+queries, which have cycle handling (research/daemon-memory.md).
 So a build holds every memo it computed until it ends. Under pressure:
 
 - Machine code and objects already written to the store are dropped from the worker and read

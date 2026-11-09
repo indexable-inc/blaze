@@ -1,4 +1,4 @@
-//! The daemon's real build ([`Real`], the [`Steps`] of `blaze serve`; docs/v2/plan/lanes/cargo/notes.md
+//! The daemon's real build ([`Real`], the [`Steps`] of `blaze serve`; docs/v2/plan.md
 //! section 6): a job's units lowered into the front end, each checked, compiled and linked
 //! by blaze's own code generator and linker, its build scripts, tests and program run as the
 //! driver's sandboxed spawns.
@@ -126,7 +126,7 @@ pub(crate) struct Shared {
     /// (fastcompile-sol-select 1): each test run takes its suites' and gives them back.
     pub(crate) selectors: test::image::Selectors,
     /// The dev executables in the daemon's code memory, by path, which a `run` starts from
-    /// and each link patches (docs/v2/plan/lanes/fastcompile/inproc.md).
+    /// and each link patches (docs/v2/plan/design/compile-time.md).
     pub(crate) dev_runs: run::inproc::DevRuns,
 }
 

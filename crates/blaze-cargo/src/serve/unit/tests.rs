@@ -1452,7 +1452,7 @@ fn a_units_phase_spans_name_its_package_version_and_target() {
 
 /// A library's doctests are named as cargo names the unit, and each example's program and
 /// the verdicts are kept beside the runner, in its `.doctests` directory only
-/// (docs/v2/plan/doctests.md).
+/// (docs/v2/plan/design/doctests.md).
 #[test]
 fn doctests_are_named_and_kept_beside_their_runner() {
     let lib = target("blaze_api", "lib", "src/lib.rs");

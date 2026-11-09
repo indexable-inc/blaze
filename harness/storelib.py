@@ -5,7 +5,7 @@ What storekills.py, storecorrupts.py, storefull.py, storeguards.py, storetracked
 fuzz/store.py share. A daemon keeps what outlives it in `<home>/v2` and its store in
 `<home>/v2/store` (crates/blaze-cargo/src/serve.rs, `state`; the daemon's `Store::open` in
 serve/daemon.rs), so the same store is the same home and a build from nothing is a build in an
-empty one. The store's files (crates/blaze-cas/src/disk.rs, docs/v2-store.md "On disk"):
+empty one. The store's files (crates/blaze-cas/src/disk.rs, docs/v2/plan/design/store.md "On disk"):
 `head`, `index-0` and `index-1`, `pack-NNNNNN`, `file-<content>`, and while a whole file is
 written, its temporary `.<name>.<pid>-<n>.tmp` beside it (crates/blaze-core/src/fs.rs).
 

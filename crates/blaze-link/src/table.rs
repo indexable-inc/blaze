@@ -1,4 +1,4 @@
-//! The jump table: the patch table of #275 (docs/v2/plan/lanes/link/notes.md, "The jump table").
+//! The jump table: the patch table of #275 (docs/v2/plan.md, "The jump table").
 //!
 //! A call to a function through its slot goes to the slot's stub, which loads the table
 //! cell (`Class::Table`'s first word: the address of the current table), then the slot's

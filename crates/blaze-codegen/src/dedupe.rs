@@ -1,4 +1,4 @@
-//! Code dedupe (docs/v2/plan/lanes/items.md section 6.4, docs/v2/plan/lanes/codegen/icf.md):
+//! Code dedupe (docs/v2/plan/design/item-hash.md section 6.4, docs/v2/plan/design/icf.md):
 //! functions of a build that run the same instructions against the same addresses are one
 //! function.
 //!

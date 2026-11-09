@@ -90,7 +90,7 @@ PROJECTS = ["ripgrep", "fd", "bat", "hyperfine", "just", "axum", "nushell", "hel
 APART = {
     "bun": "It is the Rust port of [bun](https://github.com/oven-sh/bun), 1.25M lines of Rust in 103 crates on a nightly "
            "beside a JavaScript engine's C and C++, built with frame pointers as bun's own build is "
-           "(`-C force-frame-pointers=yes`; [what it took](docs/research/bun.md)). Its test suites are not measured yet.",
+           "(`-C force-frame-pointers=yes`; [what it took](fed1eb428d:docs/research/bun.md)). Its test suites are not measured yet.",
 }
 EDITS = {
     "body": "Edit a function",

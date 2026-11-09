@@ -114,7 +114,7 @@ made from; its IDE source map is that one moved to where the item is. The places
 debuggers report (`hir-ty-codegen/places.rs`) are found the same way, as a row and column in
 the item, and where the item begins is added when an object is stitched. An edit inside one
 function of a 500-function file lowers, infers and compiles that function and lowers no
-other: [reports/INCREMENTAL.md](reports/INCREMENTAL.md).
+other: reports/INCREMENTAL.md.
 
 ## From MIR to code
 
@@ -402,4 +402,4 @@ targets. It is not written for Windows, and has not been checked on macOS. See
 
 `crates/blaze-wasm` is an experiment that builds the compiler itself for wasm and runs it in
 a web page. It is excluded from the workspace and is not part of the daemon. See
-[reports/WASM.md](reports/WASM.md).
+reports/WASM.md.

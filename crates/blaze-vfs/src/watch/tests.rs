@@ -1,5 +1,5 @@
 //! The watcher under the simulation, as each system's journal behaves across a restart
-//! (docs/v2/plan/lanes/frontend/journal.md): what changed while blaze was down is found from
+//! (docs/v2/plan/design/restore.md): what changed while blaze was down is found from
 //! the saved cursor and column, a lost journal is named and looked at again only where it was,
 //! and no file whose stamp did not move, nor one that only moved, is read.
 

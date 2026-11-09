@@ -59,7 +59,7 @@ pub enum SpecializationMode {
     Rustc,
     /// `#![blaze::specialization]`: blaze's sound subset, rustc's always-applicable rule with
     /// no unsafe marker and `default fn` the only specializable item
-    /// (docs/v2/plan/lanes/frontend/specialization.md). It wins over either feature.
+    /// (docs/v2/plan/design/specialization.md). It wins over either feature.
     Blaze,
 }
 

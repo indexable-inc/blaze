@@ -297,7 +297,7 @@ const PREDEFINED_INHERITS: [(&str, &str); 4] =
     [("debug", "dev"), ("bench", "release"), ("test", "dev"), ("doc", "dev")];
 
 /// blaze: each `[profile.<name>]`'s `contract-checks` in a root manifest
-/// (docs/v2/plan/lanes/contracts.md, part 1). cargo's `TomlProfile` has no such key (real cargo
+/// (docs/v2/plan/design/contracts.md, part 1). cargo's `TomlProfile` has no such key (real cargo
 /// warns of an unused manifest key and builds), so it is read from the manifest's TOML itself.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ContractChecks {

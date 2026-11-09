@@ -1,4 +1,4 @@
-//! The standby (docs/v2/plan/lanes/ci.md section 10, "a standby resumes from the newest snapshot"): on
+//! The standby (docs/v2/plan.md section 10, "a standby resumes from the newest snapshot"): on
 //! another machine, `blaze-ci standby` asks the primary's daemon for its status
 //! ([`blaze_api::Request::Status`] over HTTP) every [`StandbyConfig::every_secs`]. After
 //! [`StandbyConfig::misses`] failures in a row it finds the newest snapshot (`latest`),

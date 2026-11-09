@@ -1,5 +1,5 @@
 //! What each release compile is given, decided from the summaries of the whole build before
-//! any compile runs (docs/v2-codegen.md, "Release"; #899, #176).
+//! any compile runs (docs/v2/plan/design/codegen.md, "Release"; #899, #176).
 //!
 //! [`decide`] is a function of the summaries alone, in key order, so a warm build gives every
 //! function the [`Imports`] a cold one did without building any IR, and two builds of one

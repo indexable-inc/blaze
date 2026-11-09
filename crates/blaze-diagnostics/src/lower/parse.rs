@@ -12,7 +12,7 @@
 //!
 //! What blaze's parser reports is less than rustc's parser knows (the tokens it expected, where
 //! it recovers): what it reports in a form rustc has is written as rustc writes it, the rest in
-//! the parser's own words, always an error (`docs/v2/requests/diagnostics.md`).
+//! the parser's own words, always an error (`fed1eb428d:docs/v2/requests/diagnostics.md`).
 
 use blaze_hash::HashSet;
 use blaze_ids::radix;

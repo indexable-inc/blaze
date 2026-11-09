@@ -1,5 +1,5 @@
 //! Allocation budgets of what every query reads first and of setting a view
-//! (docs/v2/plan/lanes/db/speed-of-light.md, "base-db: inputs and views"): a read allocates
+//! (docs/v2/plan.md, "base-db: inputs and views"): a read allocates
 //! nothing, a view's unchanged file allocates nothing, and a changed file costs a constant.
 
 use crate::{AbsPathBuf, FileId, FileSet, FileSetConfig, VfsPath};

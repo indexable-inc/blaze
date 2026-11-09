@@ -1,4 +1,4 @@
-//! `#[blaze::pure]` over the stand-in toolchain (docs/v2/plan/lanes/pure-fns.md): a refusal names
+//! `#[blaze::pure]` over the stand-in toolchain (docs/v2/plan/design/pure-fns.md): a refusal names
 //! the chain of calls to what is not pure, allocation and a trusted function's work are
 //! allowed, and a trusted foreign function is reported with its reason.
 

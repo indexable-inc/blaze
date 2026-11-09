@@ -1,5 +1,5 @@
 //! The synchronization types this crate's tables, segments and flags use: `std`'s, or under
-//! `cfg(blaze_check)` the model checker's (docs/v2/plan/lanes/safety/model.md "The switch"),
+//! `cfg(blaze_check)` the model checker's (docs/v2/plan/design/model-checker.md "The switch"),
 //! and [`track`], a segment chunk's raw bytes as a model sees them.
 
 #[cfg(not(blaze_check))]

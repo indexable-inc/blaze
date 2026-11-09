@@ -14,7 +14,7 @@
 //!
 //! The technique to match is rustc's parallel front end, `par_hir_body_owners` on rayon's work
 //! stealing: one body per task. A task costs about 200 ns to schedule against a body's 11 µs or
-//! more (docs/v2/plan/lanes/frontend/fast-bodies-tasks.md), a slot is written once (no lock),
+//! more (docs/v2/plan/design/frontend.md), a slot is written once (no lock),
 //! and unlike rustc's the diagnostics come out in one order whatever the threads.
 
 pub mod bodies;
@@ -82,7 +82,7 @@ pub struct SealedCheck<'db> {
 /// `blaze-cargo`'s `reached_only`) whose graph has a sealed trait in it
 /// ([`hir_ty::sealed_in_graph`]). Sealing is the sealing crate's opt-in, and binds every crate
 /// that can name its trait, a registry crate rustc accepted included
-/// (docs/v2/plan/lanes/frontend/sealed-orphan.md). Empty, with one flag read, for a crate with
+/// (docs/v2/plan/design/sealed-orphan.md). Empty, with one flag read, for a crate with
 /// no sealed trait in its graph.
 pub fn check_sealed(db: &Db, krate: Crate) -> SealedCheck<'_> {
     // alloc: the results; empty, so no allocation, unless the graph has a sealed trait

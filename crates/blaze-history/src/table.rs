@@ -1,4 +1,4 @@
-//! The keys' records (docs/v2/plan/lanes/fastcompile/sched.md, "The table"): what each task
+//! The keys' records (docs/v2/plan/design/compile-time.md, "The table"): what each task
 //! key's last runs took and held, in a table of fixed size that one writer changes and any
 //! thread reads with no lock and no write to shared memory.
 //!

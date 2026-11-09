@@ -1,4 +1,4 @@
-//! The store's bytes on disk (docs/v2-store.md, "On disk"): packs of records, the index table and
+//! The store's bytes on disk (docs/v2/plan/design/store.md, "On disk"): packs of records, the index table and
 //! the head. Every number is little-endian, every record 16-byte aligned, so a pack is read in
 //! place wherever it is mapped.
 

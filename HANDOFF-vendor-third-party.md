@@ -1,4 +1,4 @@
-# Handoff: lane T2 `vendor-third-party` (docs/v2/plan/observe/no-tracing.md, 6.2)
+# Handoff: lane T2 `vendor-third-party` (docs/v2/plan/design/no-tracing.md, 6.2)
 
 Branch `nt-vendor-third-party`. I wrote code only: no build, check, test, cargo, rustc, blaze or
 VM. I did run `tools/vendor/sync.py`, which is plain Python. It fetched the four crates, checked
@@ -47,7 +47,7 @@ script with an error that names them.
   - `[patch.'crates-io']` gets `quinn`, `quinn-proto`, `wtransport` and
     `ra-ap-rustc_pattern_analysis = { path = "vendor/<crate>" }`.
 - `pyproject.toml`: `tools/vendor` is added to ruff's and pyright's `include`.
-- `docs/v2/plan/observe/no-tracing.md`: the spec, already staged in the worktree, committed with
+- `docs/v2/plan/design/no-tracing.md`: the spec, already staged in the worktree, committed with
   this lane.
 
 ## What `0001-no-tracing` deletes

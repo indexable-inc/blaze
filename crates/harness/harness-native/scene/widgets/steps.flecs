@@ -82,19 +82,54 @@ hn {
     PressLook: {dark: $tone_press.dark, light: $tone_press.light}
   }
 
-  // A run's or a cell's one line ("Searched 3 times, fetched 4 pages"), folded until pressed. Failed: the same words (they
-  // say what could not be done) and a small mark.
+  // One kind of step on a line: its glyph, faint, and how many after it (nothing for one).
+  prefab StepTally : ui.Row {
+    Flex: {axis: Row, gap: $chat_tally_gap, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    icon : ui.Symbol {
+      Fill: $tone_ink_faint
+      Size: {w: {kind: Fixed, value: $chat_line_icon, min: 0, max: 0}, h: {kind: Fixed, value: $chat_line_icon, min: 0, max: 0}}
+    }
+    n : ui.Line {
+      Fill: $tone_ink_faint
+      FixedSize: {h: true, v: false}
+      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+    }
+  }
+
+  // A line's marks (`items`: a hn.StepTally a kind of step, kept by the host), pressable as hn.StepPress is: a soft wash
+  // hugging them under the pointer.
+  prefab StepSum : ui.Row {
+    Pressable
+    Action: {name: ""}
+    Cursor: {shape: Arrow}
+    Fill: $tone_clear
+    Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+    HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_press.dark, light: $tone_press.light}
+    Flex: {axis: Row, gap: $chat_line_word_gap, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $chat_tool_h, min: 0, max: 0}}
+    AlignSelf: {align: Start}
+    Padding: {l: $chat_line_pad, r: $chat_line_pad, t: 0, b: 0}
+    items : ui.Row {
+      Flex: {axis: Row, gap: $chat_tally_between, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    }
+  }
+
+  // A run's or a cell's one line, folded until pressed: marks, not words (a glyph a kind of step and how many; what it
+  // did in words is its tooltip). Failed: the same and a small mark.
   prefab StepLine : ui.Column {
     Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     Padding: {l: 0, r: 0, t: 1, b: 1}
     guide : hn.ChatGuideOff {}
-    head : hn.StepPress {
+    head : hn.StepSum {
       chevron : hn.StepChevron {}
     }
   }
   prefab StepLineFailed : hn.StepLine {
-    head : hn.StepPress {
+    head : hn.StepSum {
       mark : hn.StepMark {}
       chevron : hn.StepChevron {}
     }

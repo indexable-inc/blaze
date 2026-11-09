@@ -149,7 +149,7 @@ pub fn planned(artifact: &Artifact, program_args: &[OsString], cwd: &Path) -> Re
 }
 
 /// `exec` made to start `artifact`'s program on the daemon's code memory, where the daemon
-/// holds it as a dev executable (docs/v2/plan/lanes/fastcompile/inproc.md): the daemon writes
+/// holds it as a dev executable (docs/v2/plan/design/compile-time.md): the daemon writes
 /// the executable from the memory when it is not that file, and gives the start hook's
 /// variable, which waits for this process, the one that becomes the program ([`exec`]). Any
 /// other program runs its file, as does one under a runner, which takes the file.
@@ -196,7 +196,7 @@ fn launched(executable: &str) -> Result<Option<Vec<(String, String)>>, String> {
 /// spawns it, and the daemon's launch waits for the one process that becomes the program. So
 /// the child is this command, which launches the program as itself ([`launch`]) and becomes it
 /// ([`exec`]): a dev test binary runs on the daemon's code memory, never from its file
-/// (docs/v2/plan/lanes/no-fallback/link/cargo-units.md), as `blaze run`'s program does.
+/// (docs/v2/plan.md), as `blaze run`'s program does.
 pub const TRAMPOLINE: &str = "__launch";
 
 /// `exec` made to start through [`TRAMPOLINE`]: this blaze, which asks the daemon to launch

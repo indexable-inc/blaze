@@ -549,7 +549,7 @@ impl Guard {
         let name = profile_name(&program, std::process::id(), &session.id);
         let path = dir.join(&name);
         // Whole or not at all: a reader of the directory (a build laying code out by it,
-        // docs/v2/plan/lanes/layout/layout.md) never sees a profile half written. The part
+        // docs/v2/plan/design/code-layout.md) never sees a profile half written. The part
         // file is made new, so two writers never share one.
         private_dir(&dir)
             .and_then(|d| d.write_whole(&name, &format!("{name}.part"), &bytes))

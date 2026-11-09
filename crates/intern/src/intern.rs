@@ -8,7 +8,7 @@
 //! [`InternedRef::change_lifetime`] move between the two freely.
 //!
 //! Interned values are never freed: memory is bounded by the database's reachability GC
-//! rebuilding what it keeps (docs/v2/plan/lanes/db.md).
+//! rebuilding what it keeps (docs/v2/plan.md).
 //!
 //! Safe code: the typed store and the handle's pointer are [`crate::typed`]'s.
 

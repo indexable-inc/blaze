@@ -14,7 +14,7 @@
 //!   reads (a shell's `OLDPWD` or `SHLVL`) is in no key. A script that walks its environment
 //!   (`env::vars`, a `Command` that passes it on to a program) is lent all of it then, and
 //!   read all of it.
-//! - **Portable** (docs/v2/plan/lanes/store.md, "Portable keys"): every path and value in
+//! - **Portable** (docs/v2/plan/design/store.md, "Portable keys"): every path and value in
 //!   the key and in what is traced is written against the run's roots ([`crate::roots`]): its
 //!   package, its `OUT_DIR`, the target directory, the workspace, blaze's tools and launcher
 //!   ([`Place::roots`]), so the same script of the same package in another checkout is found

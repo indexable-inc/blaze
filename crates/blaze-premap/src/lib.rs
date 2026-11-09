@@ -15,7 +15,7 @@
 //! - [`cache`], [`store`], [`dev`]: one image per key on the machine, made again only when
 //!   the key changes, kept in the store.
 //!
-//! Design and the case for each behavior: `docs/v2/plan/lanes/fastcompile/premap.md`.
+//! Design and the case for each behavior: `docs/v2/plan/design/compile-time.md`.
 
 #![forbid(unsafe_code)]
 #![feature(allocator_api, allocator_ext)]

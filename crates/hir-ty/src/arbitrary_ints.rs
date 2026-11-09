@@ -1,5 +1,5 @@
 //! blaze: which impls a goal may use, for the impls core writes once over the markers of
-//! `#![blaze::arbitrary_ints]` (docs/v2/plan/lanes/frontend/arbitrary-ints.md).
+//! `#![blaze::arbitrary_ints]` (docs/v2/plan/design/arbitrary-ints.md).
 //!
 //! `impl<T: ArbitraryInt> Add for T`, `impl<T: ArbitraryInt> Add<T> for &T` and
 //! `impl<S, D: IntFrom<S>> From<S> for D` are blanket impls (or impls of a reference) to the

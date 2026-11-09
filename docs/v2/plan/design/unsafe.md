@@ -5,7 +5,7 @@ date: 2026-10-29
 ---
 # Unsafe: where it pays, and proved
 
-v2 is as fast as Rust allows ([principles.md](../goals/principles.md)). Sometimes that takes
+v2 is as fast as Rust allows ([principles.md](../../plan.md)). Sometimes that takes
 `unsafe`: mapped pages read in place, lock-free tables, arenas, io_uring buffers, SIMD,
 the linker writing an image in place. Everywhere else the code is safe Rust. Unsafe code has to
 be proved, not just reviewed.

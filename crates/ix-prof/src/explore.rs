@@ -1,6 +1,6 @@
 //! The explorer's serving side (feature `explore`): the HTTP/3 WebTransport server on 127.0.0.1
 //! that https://ix.dev/explore connects to, for any program that has a [`Source`]
-//! (docs/v2/plan/observe/explore-generic.md). The blaze daemon is one source (crate
+//! (docs/v2/plan/design/explore-generic.md). The blaze daemon is one source (crate
 //! blaze-explore); this module knows nothing of builds.
 //!
 //! - [`link`]: the token, the origins accepted and the link the user opens, which carries the

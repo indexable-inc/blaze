@@ -114,7 +114,7 @@ fn a_restore_never_silently_starts_empty() {
 }
 
 /// Finding: a store whose head is gone opens empty and ready, though its packs hold durable
-/// values, and its next commit writes over them. See docs/v2/plan/lanes/storemodel.md.
+/// values, and its next commit writes over them. See docs/v2/plan/design/storemodel.md.
 #[test]
 #[ignore = "finding 1 of the storemodel lane: a lost head opens an empty store and says nothing"]
 fn a_store_whose_head_is_lost_says_so() {

@@ -1,6 +1,6 @@
 //! blaze: the integers of any width of `#![blaze::arbitrary_ints]` (`u1`..`u127` and
 //! `i1`..`i127` but the standard widths), their traits and their inherent items
-//! (docs/v2/plan/lanes/frontend/arbitrary-ints.md).
+//! (docs/v2/plan/design/arbitrary-ints.md).
 //!
 //! Every trait impl here is written once, as a blanket impl over [`ArbitraryInt`], a marker the
 //! trait solver answers from the type alone: it holds of every integer of an arbitrary width and

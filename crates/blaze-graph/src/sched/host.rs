@@ -1,5 +1,5 @@
 //! The jobs of a pool that keeps its own queues ([`crate::pool`]) on fibers, and the waits of
-//! threads that run no fiber (docs/v2/plan/lanes/sched.md, phase 2 step 3).
+//! threads that run no fiber (docs/v2/plan/design/fibers.md, phase 2 step 3).
 //!
 //! A pool's worker runs each job on a fiber of its own recycled set ([`Host`]). A job that never
 //! claims a key or waits never touches the scheduler. At its first claim or wait it joins the
@@ -74,7 +74,7 @@ struct Fiber(Stackful<In, Out>, u32);
 // worker's set, or parked in a record), never while it runs. Its stack then holds this module's
 // frames (the `Yielder` and `HostCx`, touched only by the fiber itself, and a `Job: Send`) and the
 // job's frames below a wait, which hold nothing that must not cross threads (the may-suspend
-// check, docs/v2/plan/lanes/may-suspend.md; `NoWait` guards at every wait).
+// check, docs/v2/plan/design/may-suspend.md; `NoWait` guards at every wait).
 unsafe impl Send for Fiber {}
 
 /// A parked job of a pool: its fiber and the thread-locals it carries, behind a pool job header
@@ -1126,15 +1126,34 @@ static EVENTS: crate::sync::atomic::AtomicU64 = crate::sync::atomic::AtomicU64::
 impl Event {
     #[expect(clippy::new_without_default, reason = "each one claims a key in the graph")]
     pub fn new() -> Event {
+        let key = Event::fresh_key();
+        let sched = Scheduler::new(1);
+        assert!(sched.lock().claim(key, None), "event key {key:?} is new");
+        Event { key, sched }
+    }
+
+    /// A key no event has had.
+    fn fresh_key() -> Key {
         let mut key = [0u8; 32];
         key[..8].copy_from_slice(
             &EVENTS.fetch_add(1, crate::sync::atomic::Ordering::Relaxed).to_le_bytes(),
         );
         key[8..].copy_from_slice(b"an event, of sched::host");
-        let key = Key(key);
-        let sched = Scheduler::new(1);
-        assert!(sched.lock().claim(key, None), "event key {key:?} is new");
-        Event { key, sched }
+        Key(key)
+    }
+
+    /// Fires it, ending every wait on it as [`Event::fire`] does, and arms it again under a
+    /// fresh key in the scheduler it has: a waiter taken from [`Event::waiter`] before waits for
+    /// this fire, one taken after for the next. One event made per slot of a table of loads (the
+    /// store's pool's, docs/v2/plan/design/store-pool.md), each load's waiters on that load
+    /// alone, claims no scheduler per load.
+    pub fn rearm(&mut self) {
+        let next = Event::fresh_key();
+        let mut g = self.sched.lock();
+        g.world.key_done(self.key);
+        dispatch(&mut g, None);
+        assert!(g.claim(next, None), "event key {next:?} is new");
+        self.key = next;
     }
 
     pub fn waiter(&self) -> EventWait {

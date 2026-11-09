@@ -4,7 +4,9 @@
 //! nightly, `16d1ffac1`).
 //!
 //! It reports only what rustc reports, never more: a program rustc accepts in const is
-//! accepted here. As rustc, it looks at the blocks control reaches when nothing unwinds (rustc
+//! accepted here. In a crate with blaze's `#![feature(blaze_comptime)]` it reports less: a call
+//! through a function pointer or a `dyn` method, which the evaluator checks
+//! (`hir_ty::effects::defers_dispatch_check`), and nothing of a `const static { .. }` block. As rustc, it looks at the blocks control reaches when nothing unwinds (rustc
 //! checks after `SimplifyCfg::Initial` and skips cleanup blocks), and of the calls at those the
 //! source writes or an operator, a deref or a desugaring makes ([`calls`]). A body with a call
 //! typeck refuses (a `[const]` bound of the callee that does not hold) is not checked further:
@@ -390,6 +392,11 @@ pub fn const_check<'db>(db: &'db Db, def: DefWithBodyId) -> ConstCheck {
 /// the body it is written in is.
 #[blaze_query::tracked(returns(ref))]
 pub fn anon_const_check<'db>(db: &'db Db, konst: AnonConstId<'db>) -> ConstCheck {
+    // blaze: a `const static { .. }` block (`#![feature(blaze_comptime)]`) is evaluated with no
+    // const checking; the evaluator refuses what cannot run at compile time.
+    if hir_ty::effects::anon_const_is_comptime(db, konst) {
+        return ConstCheck::default();
+    }
     check(db, InferBodyId::AnonConstId(konst), ConstContext::Const)
 }
 

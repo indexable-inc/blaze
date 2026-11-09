@@ -3,7 +3,7 @@
 //! The type is declared here, in the lowest front-end crate, so that each crate above can name
 //! it: `hir-expand`, `hir-def`, `hir-ty` and the rest declare their queries as tracked
 //! functions over `&Db`, and a call to one is a static call whose memo hit inlines into the
-//! caller (docs/v2/plan/lanes/frontend/db.md). Each ingredient is a `static` of the crate that
+//! caller (docs/v2/plan/design/frontend.md). Each ingredient is a `static` of the crate that
 //! declares it, which the storage numbers when it is first used, so this crate names none of
 //! them. A query whose code lives
 //! above the crate that declares it is declared where its key and value types are, and its
@@ -543,7 +543,7 @@ impl Db {
     ///
     /// A build's database runs them as plane tasks on the one worker pool, each reading this
     /// database by reference, and the calling thread pump-waits for them
-    /// (docs/v2/plan/lanes/db.md, "One database, shared by every thread"): no handle per
+    /// (docs/v2/plan.md, "One database, shared by every thread"): no handle per
     /// thread, no thread of its own. A test database runs them here, in [`RunOrder`].
     ///
     /// Each task runs in a frame of its own, tagged `tag` (the caller's subsystem): its body

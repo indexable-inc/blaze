@@ -343,6 +343,73 @@ pub(crate) fn samples(
     RecordBatch::try_new(schema, columns)
 }
 
+/// The `alloc_samples` rows of `samples` (the heap sampler's, [`crate::heap`]), each frame
+/// named by `frames` ([`crate::symbols::frames`]) and each row's call site the innermost frame
+/// outside the allocator ([`crate::heap::site_of`]), all from `process`. `at` is one reading
+/// of both clocks, as for [`samples`].
+pub(crate) fn alloc_samples(
+    samples: &[crate::heap::HeapSample],
+    frames: &HashMap<u64, Vec<String>, Global>,
+    at: (Instant, i64),
+    process: Process<'_>,
+) -> Result<RecordBatch, ArrowError> {
+    let rows = samples.len();
+    let schema = schema_of(&schema::ALLOC_SAMPLES);
+    let list_field = |name: &str| {
+        let at = schema::ALLOC_SAMPLES
+            .column(name)
+            .unwrap_or_else(|| unreachable!("alloc_samples has {name}"));
+        let DataType::List(item) = schema.field(at).data_type() else {
+            unreachable!("{name} is a list (arrow.rs)")
+        };
+        // clone: an `Arc` of the schema's field, once a batch
+        item.clone()
+    };
+    let mut stacks = ListBuilder::new(StringDictionaryBuilder::<UInt32Type>::new())
+        .with_field(list_field("stack"));
+    let mut pcs = ListBuilder::new(UInt64Builder::new()).with_field(list_field("stack_pcs"));
+    for sample in samples {
+        let stack = &sample.pcs[..usize::from(sample.depth)];
+        // Outermost first; the sampler keeps the innermost first.
+        for (i, pc) in stack.iter().enumerate().rev() {
+            let named = frames.get(&crate::symbols::lookup(i, *pc)).map_or(&[][..], Vec::as_slice);
+            for name in named {
+                stacks.values().append_value(name);
+            }
+            if named.is_empty() {
+                stacks.values().append_value("?");
+            }
+            pcs.values().append_value(*pc);
+        }
+        stacks.append(true);
+        pcs.append(true);
+    }
+    let t_ns = |it: &crate::heap::HeapSample| {
+        at.1 - at.0.saturating_duration_since(it.at).as_nanos() as i64
+    };
+    let tags: DictionaryArray<UInt32Type> =
+        samples.iter().map(|it| it.tag.map(blaze_mem::Tag::name)).collect();
+    // alloc: a batch's list of columns, once a read
+    let columns: Vec<ArrayRef> = vec![
+        column(UInt64Array::from_iter(samples.iter().map(|it| build_id(it.build)))),
+        column(UInt32Array::from_value(process.pid, rows)),
+        column(UInt32Array::from_iter_values(samples.iter().map(|it| it.tid as u32))),
+        column(Int64Array::from_iter_values(samples.iter().map(t_ns))),
+        column(UInt64Array::from_iter_values(samples.iter().map(|it| it.weight))),
+        column(stacks.finish()),
+        column(UInt64Array::from_iter(samples.iter().map(|it| (it.span != 0).then_some(it.span)))),
+        column(pcs.finish()),
+        column(tags),
+        column(UInt64Array::from_iter_values(samples.iter().map(|it| it.bytes))),
+        column(StringArray::from_iter(
+            samples
+                .iter()
+                .map(|it| crate::heap::site_of(&it.pcs[..usize::from(it.depth)], frames)),
+        )),
+    ];
+    RecordBatch::try_new(schema, columns)
+}
+
 /// A code image a flush's `stack_pcs` addresses are in ([`crate::symbols::ImagesWritten`]), or
 /// a recovered crash's ([`crate::crash::Crash::image`]).
 #[derive(Debug)]

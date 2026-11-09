@@ -1,4 +1,4 @@
-//! Named roots (docs/v2/plan/lanes/store.md, "Portable keys"): what makes a run's key, its
+//! Named roots (docs/v2/plan/design/store.md, "Portable keys"): what makes a run's key, its
 //! shapes and its kept value independent of where a checkout, its target directory or blaze's
 //! tools are on disk, so two checkouts, or two repos with one dependency, find each other's
 //! build-script runs and proc-macro expansions.
