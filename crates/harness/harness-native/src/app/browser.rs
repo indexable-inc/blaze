@@ -801,12 +801,15 @@ impl App {
         }
     }
 
-    /// Spring the pane's clip toward its width (shown) or 0 (shut, or open with no page yet), on the sidebar's spring; the
-    /// pane keeps its full width.
+    /// Spring the pane's clip toward its width (shown) or 0 (shut, or first opened with no page yet), on the sidebar's
+    /// spring; the pane keeps its full width.
     fn browser_fold(&mut self, dt: f32) {
         let mut moved = false;
         let full = self.web_width();
-        let target = f32::from(u8::from(self.web_shown()));
+        // Out already and still open: it stays out while a page opened in it loads (the new view has no frame yet, so
+        // `web_shown` is false for a moment), never folding away and coming out again.
+        let stays = self.web().open && self.browser.x.x > 0.0;
+        let target = f32::from(u8::from(self.web_shown() || stays));
         let w = self.world.world_ref();
         if !self.browser.x.settled(target) {
             let tune = crate::look::tune(w, "sidebar");

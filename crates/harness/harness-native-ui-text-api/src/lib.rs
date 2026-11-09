@@ -196,10 +196,10 @@ pub struct Frames {
     pub fps: f32,
 }
 
-/// A small block of pixel art, a game's item icon: its front face a material with an emblem, named by `face` (what a
-/// step does: `exec`, `read`, `edit`, `net`, `think`, ...; harness-native-render block.rs draws each, none is a file).
-/// When `face` changes the block turns a quarter about its upright axis to the new one over `turn` seconds (0: at once);
-/// at rest it is still. A picture without a file, its texels on whole device pixels, centred in the node's box.
+/// A small pixel-art item, a game's dropped item, that floats and does what it stands for, named by `face` (what a
+/// step does: `exec` a terminal with a blinking cursor, `read` a book turning a page, `net` the world turning, `think` a
+/// crystal, ...; harness-native-render block.rs draws each, none is a file). When `face` changes the old item sinks away
+/// and the new one rises in over `turn` seconds (0: at once). A picture without a file, its texels on whole device pixels, centred in the node's box.
 #[derive(Component, Clone, Debug, Default, PartialEq)]
 pub struct PixelBlock {
     pub face: ScriptString,

@@ -63,10 +63,11 @@ pub struct Painter {
     sheets: HashMap<String, Rc<Sheet>>,
     /// Each `BlazeMark` node's fire, by entity and appearance: its automaton runs on from frame to frame.
     marks: HashMap<(u64, bool), harness_native_blaze::mark::Blaze>,
-    /// Each `PixelBlock` node's turn (block.rs).
+    /// Each `PixelBlock` node's item (block.rs).
     blocks: crate::block::Blocks,
-    /// A block painted in the last frame is still turning ([`Painter::end_frame`]): the host draws another.
-    pub turning: bool,
+    /// A block was painted in the last frame ([`Painter::end_frame`]): its item moves, so the host keeps drawing, at
+    /// its calm rate (pixel art at a few steps a second).
+    pub blocks_live: bool,
     /// Each `Kip` node's mascot, stepped while it is painted (kips.rs).
     kips: crate::kips::Kips,
     /// What the Kips painted in the last frame want next ([`Painter::end_frame`]).
@@ -313,7 +314,7 @@ impl Painter {
             sheets: HashMap::new(),
             marks: HashMap::new(),
             blocks: crate::block::Blocks::default(),
-            turning: false,
+            blocks_live: false,
             kips: crate::kips::Kips::default(),
             kip_wake: crate::kips::Wake::None,
             paths: HashMap::new(),
@@ -512,7 +513,7 @@ impl Painter {
     /// After a frame: an overflowed atlas is emptied (true: draw again, its glyphs are gone) and a big layout cache dropped.
     pub fn end_frame(&mut self) -> bool {
         self.kip_wake = self.kips.end_frame();
-        self.turning = self.blocks.end_frame();
+        self.blocks_live = self.blocks.end_frame();
         self.arriving = self.arrivals.end_frame();
         self.gliding = self.carets.end_frame();
         self.shimmering = std::mem::take(&mut self.sheening);
