@@ -4565,6 +4565,9 @@ pub(crate) fn param_env_from_clauses<'db>(
 ) -> ParamEnv<'db> {
     let clauses = rustc_type_ir::elaborate::elaborate(interner, clauses);
     let clauses = Clauses::new_from_iter(clauses);
+    // A parameter `F: Field<C>` is a member of `C`: the field binders over `C` hold of it
+    // (`#![feature(blaze_comptime)]`; the clauses as they are without a field binder).
+    let clauses = crate::comptime::with_member_bounds(interner, clauses);
     if !clauses.has_aliases() {
         return ParamEnv { clauses };
     }
