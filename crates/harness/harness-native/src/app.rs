@@ -897,8 +897,8 @@ impl App {
             let code = o.try_cloned::<&model::ExitCode>().map(|c| c.code).filter(|&c| c != 0);
             let failed = status == "killed" || code.is_some();
             let selected = sel == Some(e);
-            // A sub-agent up but idle sleeps: its title muted like what ended, a pause mark in its gutter, and it sorts
-            // after the ones at work (the model's rows).
+            // A sub-agent up but idle sleeps: its title faded like what ended (no mark: only finishing earns one), and it
+            // sorts after the ones at work (the model's rows).
             let sleeps = me.run_of(e).is_none() && depth > 0 && status == "running" && !o.has(model::Busy::id());
             let look = if selected {
                 "on"
@@ -966,9 +966,7 @@ impl App {
                     ("running", _) => (doing.as_ref().map_or(folder, |d| d.detail.clone()), format!("Started {when} ago")),
                     _ => (folder, format!("Ended {when} ago")),
                 };
-                // A sub-agent up but idle sleeps: its title muted, a pause mark in its gutter (and it sorts after the
-                // ones at work, the model's rows).
-                let mark = if sleeps { "sleep" } else { done_mark(status, code, depth) };
+                let mark = done_mark(status, code, depth);
                 // Its name being renamed (chat/rename.rs): the field's words in its place, still (no breath) and alone
                 // on the row (no trailing words or shortcut).
                 let edit = me.rename_shown(e);
