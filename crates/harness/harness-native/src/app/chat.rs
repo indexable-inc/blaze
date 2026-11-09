@@ -32,7 +32,7 @@ mod genui;
 mod mention;
 mod peek;
 mod pick;
-mod plan;
+pub(super) mod plan;
 mod rename;
 mod steps;
 

@@ -1,5 +1,5 @@
-//! How much of the person's plan is used, in a chat's status bar after the context meter (scene/widgets/chat.flecs
-//! `hn.ChatPlan`): the plan's window nearest its limit ([`shown`]) as a small bar filling and quiet words ("79% of
+//! How much of the person's plan is used, at the sidebar's foot (scene/widgets/frame.flecs `hn.SideStatus`; the meter is
+//! scene/widgets/chat.flecs `hn.ChatPlan`): the plan's window nearest its limit ([`shown`]) as a small bar filling and quiet words ("79% of
 //! week", [`words`]); muted, the warning tone once the agent warns of it, the failed tone once it refuses for it (the
 //! context meter's tones, hn.ChatContextTone). Its tooltip ([`tip`]) says every window, how much of each is used and when
 //! each resets in plain words, and that the plan is the account's, not this chat's.
@@ -141,7 +141,7 @@ fn tone_of(w: &PlanWindow) -> &'static str {
 /// The plan meter in `slot` (the status bar's `plan`) for `windows` (none: no meter, no room), as agent kind `agent`'s
 /// maker counts them, at unix second `now`: the shown window's bar filling in its tone over a track of `ink` faintly,
 /// its words in its tone, the tooltip saying every window.
-pub(super) fn fill_plan(slot: View<'_>, windows: &[PlanWindow], agent: &str, ink: Fill, now: u64) {
+pub(in crate::app) fn fill_plan(slot: View<'_>, windows: &[PlanWindow], agent: &str, ink: Fill, now: u64) {
     let w = slot.entity().world();
     view::for_each_of(slot, shown(windows).map(|s| ("plan", "hn.ChatPlan", s)), |v, s, _| {
         let tone = fill_of(w, tone_of(s));
@@ -171,7 +171,7 @@ pub(super) fn fill_plan(slot: View<'_>, windows: &[PlanWindow], agent: &str, ink
 impl App {
     /// The plan as the latest any chat of agent kind `kind` was told (it is the account's, not one chat's): its windows,
     /// none before any said. An offscreen shot's stand-in ([`App::set_shot_plan`]) wins.
-    pub(super) fn chat_plan(&self, kind: &str) -> Vec<PlanWindow> {
+    pub(in crate::app) fn chat_plan(&self, kind: &str) -> Vec<PlanWindow> {
         if !self.shot_plan.is_empty() {
             return self.shot_plan.clone();
         }

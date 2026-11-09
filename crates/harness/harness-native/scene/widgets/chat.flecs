@@ -110,10 +110,6 @@ hn {
           Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
           Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
         }
-        plan : ui.Row {
-          Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
-          Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-        }
         // The picker's menu while it is open: out of the row's flow, its plate placed above the control.
         menu : ui.Node {
           Overlay
