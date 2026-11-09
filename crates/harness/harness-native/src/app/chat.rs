@@ -292,6 +292,8 @@ pub struct ChatState {
     mention: mention::Mention,
     /// The pictures pasted into the message being written (absolute paths of PNG or JPEG files), sent with it.
     images: Vec<String>,
+    /// The context popover pressed open to the whole account (chat/context.rs), until another press or Escape.
+    ctx_open: bool,
     /// The draft as native.json keeps it (`drafts`): read once, when the pane first shows it, and what was last written
     /// there (its words and pictures), so [`App::flush_drafts`] writes only what changed.
     draft_read: bool,
@@ -428,6 +430,7 @@ impl Default for ChatState {
             peek: peek::Peek::default(),
             mention: mention::Mention::default(),
             images: Vec::new(),
+            ctx_open: false,
             draft_read: false,
             draft_saved: (String::new(), Vec::new()),
             sizes: HashMap::new(),
@@ -1442,7 +1445,7 @@ impl App {
             // say.
             let listed = o.try_cloned::<&model::AgentModel>().unwrap_or_default();
             let listed = (listed.s.as_str(), listed.effort.as_str());
-            self.fill_chat_pick(bar, sid, t, model::kind_name(o), st.pick, &mut st.pick_nav, &mut st.effort, listed, ended);
+            self.fill_chat_pick(bar, sid, t, model::kind_name(o), st.pick, &mut st.pick_nav, &mut st.effort, listed, ended, st.ctx_open);
         }
     }
 
@@ -1889,7 +1892,7 @@ impl App {
         }
         // Escape closes the picker's menu, what a cell floats over the transcript (a popover, a menu, a dialog), and an
         // aside's card, before it interrupts.
-        if op == "interrupt" && (self.chat_pick_close() || self.genui_escape() || self.chat_aside_close()) {
+        if op == "interrupt" && (self.chat_pick_close() || self.genui_escape() || self.chat_aside_close() || self.chat_ctx_close()) {
             return;
         }
         let Some((_, _, sid)) = self.focused_chat() else { return };
@@ -1984,6 +1987,28 @@ impl App {
         drop(states);
         self.poke();
         true
+    }
+
+    /// A press on the context meter (`chat:ctx:<sid>`): its popover opens to the whole account, or closes again.
+    pub(in crate::app) fn chat_ctx_toggle(&mut self, rest: &str) {
+        let Ok(sid) = rest.parse::<u64>() else {
+            eprintln!("harness-native: chat:ctx:{rest} names no session");
+            return;
+        };
+        if let Some(st) = self.chat.borrow_mut().get_mut(&sid) {
+            st.ctx_open = !st.ctx_open;
+        }
+        self.poke();
+    }
+
+    /// Escape: the focused chat's opened context popover closes. Whether one was open.
+    fn chat_ctx_close(&mut self) -> bool {
+        let Some((_, _, sid)) = self.focused_chat() else { return false };
+        let closed = self.chat.borrow_mut().get_mut(&sid).is_some_and(|st| std::mem::take(&mut st.ctx_open));
+        if closed {
+            self.poke();
+        }
+        closed
     }
 
     /// A pasted picture's remove button (`chat:unattach:<sid>:<i>`): picture `i` out of chat `sid`'s message.

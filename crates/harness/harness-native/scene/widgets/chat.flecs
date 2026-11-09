@@ -275,9 +275,10 @@ hn {
 
   // The context meter (den's): a small ring filling as the conversation fills its model's window, in a square that takes
   // the pointer; muted, then hn.ChatContextTone's warn from 80% and full from 95% (pick.rs). Under the pointer,
-  // hn.ChatContextPop (widgets/context.flecs) says how full (the percentage at its head) and with what.
+  // hn.ChatContextPop (widgets/context.flecs) shows how full as a donut of its parts; a press opens it to every part.
   prefab ChatContext : ui.Row {
     Hoverable
+    Pressable
     Cursor: {shape: Arrow}
     Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
     Size: {w: {kind: Fixed, value: $chat_bar_h, min: 0, max: 0}, h: {kind: Fixed, value: $chat_bar_h, min: 0, max: 0}}
