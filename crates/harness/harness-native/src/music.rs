@@ -196,26 +196,117 @@ impl Room {
     }
 }
 
-/// Rain, for when nothing else plays (and, quieter, under the music): noise with its lows and its highest highs taken
-/// out, drifting a little in level as rain does, and a drop now and then, each a short high ping somewhere across.
-pub struct Rain {
-    rng: u64,
-    fast: [f32; 2],
-    slow: [f32; 2],
-    level: f32,
-    want: f32,
-    t: u64,
-    /// Drops sounding: each its pitch, where it is, and its samples so far.
-    drops: [(f32, f32, u32); 4],
+/// One place the rain falls, heard from where the listener sits (the scene's `hn.sound.ambient.*`): where it is, and
+/// what the rain sounds like on it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RainSource {
+    /// Degrees round from straight ahead (positive: to the right; 180: behind), degrees up from the ears' level
+    /// (90: overhead), and how far, in metres.
+    pub azimuth: f32,
+    pub elevation: f32,
+    pub distance: f32,
+    pub gain: f32,
+    /// The steady wash of rain on it: its level, between `low` and `high` Hz.
+    pub hiss: f32,
+    /// Single drops: how many a second, each ringing at a pitch between `low` and `high`, dying at `ring` (1/s: a
+    /// dull roof high, glass higher, water low), its pitch bending by `bend` of itself as it rings (a drip into water
+    /// rises).
+    pub rate: f32,
+    pub low: f32,
+    pub high: f32,
+    pub ring: f32,
+    pub bend: f32,
 }
 
-impl Default for Rain {
-    fn default() -> Self {
-        Self { rng: 0x9e37_79b9_7f4a_7c15, fast: [0.0; 2], slow: [0.0; 2], level: 0.0, want: 0.0, t: 0, drops: [(0.0, 0.0, u32::MAX); 4] }
+/// The longest an ear waits for a sound the other heard first, in samples (about 0.7 ms: a head's width).
+const HEAD: usize = 34;
+
+/// A source as it plays: its drops, its wash's filters, and the last samples it made, for the later ear.
+struct Falling {
+    at: RainSource,
+    fast: f32,
+    slow: f32,
+    /// Drops sounding: each its pitch and its samples so far.
+    drops: [(f32, u32); 6],
+    line: [f32; 64],
+    head: usize,
+    /// Each ear: how many samples late it hears the source, how loud, and how much of its highs the head keeps.
+    ears: [(usize, f32, f32); 2],
+    shade: [f32; 2],
+    /// How much goes to the room: more the farther it is.
+    room: f32,
+}
+
+impl Falling {
+    fn new(at: RainSource) -> Self {
+        let (az, el) = (at.azimuth.to_radians(), at.elevation.to_radians());
+        // How far to the right it is, -1 to 1: nothing overhead, all of it at the side.
+        let side = az.sin() * el.cos();
+        let behind = (az.cos() * el.cos()).min(0.0).abs();
+        let near = 1.0 / at.distance.max(0.5);
+        let ear = |right: bool| {
+            let toward = if right { side } else { -side };
+            // The far ear hears it later, quieter, and duller (the head's shadow); from behind both are a little duller.
+            let late = if toward < 0.0 { (-toward * HEAD as f32) as usize } else { 0 };
+            let level = near * (0.62 + 0.38 * toward);
+            let open = (0.85 - 0.6 * (-toward).max(0.0) - 0.25 * behind - 0.03 * at.distance).clamp(0.08, 1.0);
+            (late, level, open)
+        };
+        Self { at, fast: 0.0, slow: 0.0, drops: [(0.0, u32::MAX); 6], line: [0.0; 64], head: 0, ears: [ear(false), ear(true)], shade: [0.0; 2], room: (0.08 * at.distance).min(0.6) }
+    }
+
+    /// Its next sample in each ear, and what it sends to the room.
+    fn next(&mut self, noise: f32, chance: f32, pick: f32) -> ([f32; 2], f32) {
+        let a = self.at;
+        let pole = |hz: f32| 1.0 - (-TAU * hz / SR).exp();
+        self.fast += (noise - self.fast) * pole(a.high.max(a.low + 1.0));
+        self.slow += (noise - self.slow) * pole(a.low.max(20.0));
+        let mut s = a.hiss * (self.fast - self.slow);
+        if chance < a.rate / SR
+            && let Some(free) = self.drops.iter().position(|d| d.1 == u32::MAX)
+        {
+            self.drops[free] = (a.low + (a.high - a.low) * pick, 0);
+        }
+        for d in &mut self.drops {
+            if d.1 == u32::MAX {
+                continue;
+            }
+            let t = d.1 as f32 / SR;
+            let dies = (-t * a.ring).exp();
+            s += 0.5 * dies * (TAU * d.0 * (1.0 + a.bend * (1.0 - dies)) * t).sin();
+            d.1 = if dies < 0.002 { u32::MAX } else { d.1 + 1 };
+        }
+        let s = s * a.gain;
+        self.head = (self.head + 1) % self.line.len();
+        self.line[self.head] = s;
+        let mut out = [0.0; 2];
+        for (side, o) in out.iter_mut().enumerate() {
+            let (late, level, open) = self.ears[side];
+            let heard = self.line[(self.head + self.line.len() - late) % self.line.len()];
+            self.shade[side] += (heard - self.shade[side]) * open;
+            *o = self.shade[side] * level;
+        }
+        (out, s * self.room)
     }
 }
 
+/// Rain in a room, for when nothing else plays (and, far quieter, under the music): each place it falls a source of
+/// its own ([`RainSource`]), placed round the listener by ear (the later, quieter, duller far ear: on headphones it
+/// comes from there), the farther ones more in the room.
+pub struct Rain {
+    rng: u64,
+    sources: Vec<Falling>,
+    room: Room,
+    level: f32,
+    want: f32,
+}
+
 impl Rain {
+    #[must_use]
+    pub fn new(sources: &[RainSource]) -> Self {
+        Self { rng: 0x9e37_79b9_7f4a_7c15, sources: sources.iter().map(|s| Falling::new(*s)).collect(), room: Room::new(), level: 0.0, want: 0.0 }
+    }
+
     /// Rain at `level` from here on (it comes and goes over a few seconds).
     pub fn set(&mut self, level: f32) {
         self.want = level;
@@ -223,7 +314,7 @@ impl Rain {
 
     #[must_use]
     pub fn playing(&self) -> bool {
-        self.want > 0.0 || self.level > 0.0005
+        !self.sources.is_empty() && (self.want > 0.0 || self.level > 0.0005)
     }
 
     fn rand(&mut self) -> f32 {
@@ -240,31 +331,17 @@ impl Rain {
         }
         for frame in out {
             self.level += (self.want - self.level) * 0.000_02;
-            self.t += 1;
-            let gust = 1.0 + 0.18 * (self.t as f32 / SR * TAU * 0.07).sin() + 0.08 * (self.t as f32 / SR * TAU * 0.31).sin();
-            // About six drops a second.
-            if self.rand() < 6.0 / SR
-                && let Some(free) = self.drops.iter().position(|d| d.2 == u32::MAX)
-            {
-                self.drops[free] = (1400.0 + 2600.0 * self.rand(), self.rand() * 2.0 - 1.0, 0);
+            let (mut ears, mut send) = ([0.0f32; 2], 0.0f32);
+            for k in 0..self.sources.len() {
+                let (noise, chance, pick) = (self.rand() * 2.0 - 1.0, self.rand(), self.rand());
+                let (e, r) = self.sources[k].next(noise, chance, pick);
+                ears[0] += e[0];
+                ears[1] += e[1];
+                send += r;
             }
-            let mut drop = [0.0f32; 2];
-            for d in &mut self.drops {
-                if d.2 == u32::MAX {
-                    continue;
-                }
-                let t = d.2 as f32 / SR;
-                let s = 0.22 * (-t * 70.0).exp() * (TAU * d.0 * (1.0 + 0.4 * (-t * 90.0).exp()) * t).sin();
-                drop[0] += s * (0.5 - 0.45 * d.1);
-                drop[1] += s * (0.5 + 0.45 * d.1);
-                d.2 = if t > 0.09 { u32::MAX } else { d.2 + 1 };
-            }
-            for (side, o) in frame.iter_mut().enumerate() {
-                let n = self.rand() * 2.0 - 1.0;
-                self.fast[side] += (n - self.fast[side]) * 0.45;
-                self.slow[side] += (n - self.slow[side]) * 0.04;
-                *o += self.level * (gust * 0.55 * (self.fast[side] - self.slow[side]) + drop[side]);
-            }
+            let wet = self.room.next(send);
+            frame[0] += self.level * (ears[0] + wet[0]);
+            frame[1] += self.level * (ears[1] + wet[1]);
         }
     }
 }
@@ -549,21 +626,30 @@ mod tests {
         assert!(peak == 0.0, "at rest it still sounds: {peak}");
     }
 
-    /// Rain comes in, stays under its level, and goes.
+    /// Rain comes in, stays under its level, and goes; a source at the left is louder and earlier in the left ear, one
+    /// overhead the same in both.
     #[test]
-    fn rain_comes_and_goes() {
-        let mut r = Rain::default();
+    fn rain_falls_where_it_is_placed() {
+        let on = |azimuth: f32, elevation: f32| RainSource { azimuth, elevation, distance: 1.5, gain: 1.0, hiss: 0.5, rate: 20.0, low: 800.0, high: 3000.0, ring: 60.0, bend: 0.0 };
+        let ears = |src: RainSource| {
+            let mut r = Rain::new(&[src]);
+            r.set(0.1);
+            let mut out = vec![[0.0f32; 2]; (8.0 * SR) as usize];
+            r.render(&mut out);
+            let tail = &out[out.len() - 2 * SR as usize..];
+            let rms = |side: usize| (tail.iter().map(|f| f[side] * f[side]).sum::<f32>() / tail.len() as f32).sqrt();
+            (rms(0), rms(1), tail.iter().flatten().fold(0.0f32, |p, x| p.max(x.abs())))
+        };
+        let (l, r, peak) = ears(on(-80.0, 0.0));
+        assert!(l > r * 1.4 && r > 0.0005 && peak < 0.3, "at the left: {l} against {r}, peak {peak}");
+        let (l, r, _) = ears(on(0.0, 90.0));
+        assert!((l / r - 1.0).abs() < 0.15, "overhead: {l} against {r}");
+        let mut r = Rain::new(&[on(0.0, 0.0)]);
         assert!(!r.playing());
         r.set(0.1);
-        let mut out = vec![[0.0f32; 2]; (6.0 * SR) as usize];
-        r.render(&mut out);
-        let tail = &out[out.len() - SR as usize..];
-        let rms = (tail.iter().flatten().map(|x| x * x).sum::<f32>() / (tail.len() * 2) as f32).sqrt();
-        let peak = tail.iter().flatten().fold(0.0f32, |p, x| p.max(x.abs()));
-        assert!(rms > 0.002 && peak < 0.2, "rms {rms}, peak {peak}");
+        r.render(&mut vec![[0.0f32; 2]; SR as usize]);
         r.set(0.0);
-        let mut out = vec![[0.0f32; 2]; (20.0 * SR) as usize];
-        r.render(&mut out);
+        r.render(&mut vec![[0.0f32; 2]; (20.0 * SR) as usize]);
         assert!(!r.playing());
     }
 }
