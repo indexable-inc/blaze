@@ -828,42 +828,76 @@ fn item_rows(t: &Transcript, n: usize, shows: Shows<'_>, out: &mut Vec<(String, 
     }
 }
 
-/// The transcript as rows ([`Grouped`]: runs of calls under one line), and the keys of the rows nested under a run.
-/// A run is its one line ([`steps::run_line`]) and nothing else until the person opens it; opened, each cell's outputs
-/// ([`steps::outs`], set in by their own prefabs) and each agent tool call and reasoning between them as its own folded
-/// line, nested. A text block shows as far as its cut says ([`Shows`]).
+/// The transcript as rows ([`Grouped`]), and the keys of the rows nested under a run. A turn (the person's message to
+/// its turn's end) that did anything on the way shows as the message, one line for all of it ([`steps::turn_line`]),
+/// and its last answer: what the agent said last is the answer, what came before (its narration, its calls, its
+/// reasoning) is how it got there, and opens under the line when the person presses it. While the turn runs, its line
+/// says what it is doing and its newest words show as they come. Everything shows, as runs, when the person keeps
+/// every step (native.json `chat_steps: "all"`, [`Shows::all`]).
 fn rows_nested(t: &Transcript, shows: Shows<'_>) -> (Vec<(String, Row)>, HashSet<String>) {
     let fold = shows.fold;
     let g = Grouped::of(t);
     let mut out = Vec::new();
     let mut nested = HashSet::new();
-    for piece in &g.pieces {
-        match piece {
-            Piece::Item(n) => item_rows(t, *n, shows, &mut out),
-            Piece::Run(run) => {
-                let key = run.key();
-                let open = fold.get(&key).copied().unwrap_or(false);
-                out.push((key.clone(), Row::Steps(steps::run_line(&key, run, t, open))));
-                if !open {
-                    continue;
-                }
-                for &n in &run.items {
-                    let from = out.len();
-                    let cell = match &t.items[n] {
-                        Item::Tool { block, .. } => t.details.get(block).map(|d| (block, d)),
-                        _ => None,
-                    };
-                    match cell {
-                        Some((block, d)) => {
-                            let mut part = Vec::new();
-                            steps::outs(block, d, fold, &mut part);
-                            out.extend(part.into_iter().enumerate().map(|(k, r)| (format!("i{n}.{k}"), r)));
-                        }
-                        None => {
-                            item_rows(t, n, shows, &mut out);
-                            nested.extend(out[from..].iter().map(|(k, _)| k.clone()));
-                        }
-                    }
+    let is_user = |p: &Piece| matches!(p, Piece::Item(n) if matches!(t.items[*n], Item::User { .. }));
+    let starts: Vec<usize> = g.pieces.iter().enumerate().filter(|(_, p)| is_user(p)).map(|(i, _)| i).collect();
+    // Before the first message (a log's own start), then each message's turn.
+    let mut bounds = vec![0];
+    bounds.extend(starts.iter().copied().filter(|&s| s > 0));
+    bounds.push(g.pieces.len());
+    bounds.dedup();
+    for w in bounds.windows(2) {
+        let turn = &g.pieces[w[0]..w[1]];
+        let Some((Piece::Item(u), rest)) = turn.split_first().filter(|(p, _)| is_user(p)) else {
+            for piece in turn {
+                piece_rows(t, piece, shows, &mut out, &mut nested);
+            }
+            continue;
+        };
+        let item = |p: &Piece| match p {
+            Piece::Item(n) => Some(*n),
+            Piece::Run(_) => None,
+        };
+        let ended = rest.iter().filter_map(item).find_map(|n| match &t.items[n] {
+            Item::TurnEnd { duration_ms, .. } => Some(*duration_ms),
+            _ => None,
+        });
+        // Its answer: the last words it said; what always shows beside it: a view a cell drew (the view is the message),
+        // a failure, a note.
+        let answer = rest.iter().filter_map(item).filter(|&n| matches!(t.items[n], Item::Text { .. })).last();
+        let draws = |n: usize| match &t.items[n] {
+            Item::Tool { block, .. } => t.details.get(block).is_some_and(|d| !empty_value(&d.ui)),
+            _ => false,
+        };
+        let shown = |n: usize| {
+            Some(n) == answer || draws(n) || matches!(t.items[n], Item::Error { .. } | Item::Note { .. } | Item::TurnEnd { .. })
+        };
+        let folds = rest.iter().any(|p| item(p).is_none_or(|n| !shown(n)));
+        item_rows(t, *u, shows, &mut out);
+        if shows.all || !folds {
+            for piece in rest {
+                piece_rows(t, piece, shows, &mut out, &mut nested);
+            }
+            continue;
+        }
+        let key = format!("turn:{u}");
+        let open = fold.get(&key).copied().unwrap_or(false);
+        let calls: Vec<group::Call> = rest
+            .iter()
+            .flat_map(|p| match p {
+                Piece::Item(n) => vec![*n],
+                Piece::Run(r) => r.items.clone(),
+            })
+            .filter_map(|n| group::call(t, n))
+            .collect();
+        let live = ended.is_none() && t.busy;
+        out.push((key.clone(), Row::Steps(steps::turn_line(&key, &calls, t, ended.flatten(), live, open))));
+        for piece in rest {
+            if open || item(piece).is_some_and(shown) {
+                let from = out.len();
+                piece_rows(t, piece, shows, &mut out, &mut nested);
+                if open && item(piece).is_none_or(|n| !shown(n)) {
+                    nested.extend(out[from..].iter().map(|(k, _)| k.clone()));
                 }
             }
         }
@@ -871,23 +905,67 @@ fn rows_nested(t: &Transcript, shows: Shows<'_>) -> (Vec<(String, Row)>, HashSet
     (out, nested)
 }
 
+/// One piece's rows: an item's, or a run as its one line ([`steps::run_line`]) and nothing else until the person opens
+/// it; opened, each cell's outputs ([`steps::outs`], set in by their own prefabs) and each agent tool call and reasoning
+/// between them as its own folded line, nested. A text block shows as far as its cut says ([`Shows`]).
+fn piece_rows(t: &Transcript, piece: &Piece, shows: Shows<'_>, out: &mut Vec<(String, Row)>, nested: &mut HashSet<String>) {
+    let fold = shows.fold;
+    match piece {
+        Piece::Item(n) => item_rows(t, *n, shows, out),
+        Piece::Run(run) => {
+            let key = run.key();
+            let open = fold.get(&key).copied().unwrap_or(false);
+            out.push((key.clone(), Row::Steps(steps::run_line(&key, run, t, open))));
+            if !open {
+                return;
+            }
+            for &n in &run.items {
+                let from = out.len();
+                let cell = match &t.items[n] {
+                    Item::Tool { block, .. } => t.details.get(block).map(|d| (block, d)),
+                    _ => None,
+                };
+                match cell {
+                    Some((block, d)) => {
+                        let mut part = Vec::new();
+                        steps::outs(block, d, fold, &mut part);
+                        out.extend(part.into_iter().enumerate().map(|(k, r)| (format!("i{n}.{k}"), r)));
+                    }
+                    None => {
+                        item_rows(t, n, shows, out);
+                        nested.extend(out[from..].iter().map(|(k, _)| k.clone()));
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The transcript as rows.
 fn rows(t: &Transcript, shows: Shows<'_>) -> Vec<(String, Row)> {
     rows_nested(t, shows).0
 }
 
-/// What decides how the transcript shows besides itself: the folds the person set, and how far each text block still
-/// streaming shows (byte offset, by block; a block not in it shows whole).
+/// What decides how the transcript shows besides itself: the folds the person set, how far each text block still
+/// streaming shows (byte offset, by block; a block not in it shows whole), and whether every step shows (`all`:
+/// native.json `chat_steps: "all"`) rather than each turn folded to its answer.
 #[derive(Clone, Copy)]
 struct Shows<'a> {
     fold: &'a HashMap<String, bool>,
     cut: &'a HashMap<String, usize>,
+    all: bool,
 }
 
 impl<'a> Shows<'a> {
     fn of(st: &'a ChatState) -> Self {
-        Self { fold: &st.fold, cut: &st.cut }
+        Self { fold: &st.fold, cut: &st.cut, all: all_steps() }
     }
+}
+
+/// Whether the person keeps every step of a turn in view (native.json `chat_steps: "all"`), read once per launch.
+fn all_steps() -> bool {
+    static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ALL.get_or_init(|| crate::prefs::get("chat_steps").and_then(|v| v.as_str().map(|s| s == "all")).unwrap_or(false))
 }
 
 /// How much of a text block still streaming in can show without what shows changing as more comes (byte offset): up to
@@ -3001,7 +3079,7 @@ mod tests {
             t.apply(&harness_proto::event::Event::from_json(l).unwrap());
         }
         let (fold, cut) = (HashMap::new(), HashMap::new());
-        let (rows, nested) = rows_nested(&t, Shows { fold: &fold, cut: &cut });
+        let (rows, nested) = rows_nested(&t, Shows { fold: &fold, cut: &cut, all: true });
         let kinds: Vec<(&str, &str)> = rows.iter().map(|(k, r)| (k.as_str(), r.prefab())).collect();
         assert_eq!(kinds[1].1, "hn.StepLineFailed", "{kinds:?}");
         assert!(matches!(&rows[1].1, Row::Steps(l) if !l.open && !l.why.is_empty() && l.words.contains("couldn't")), "{kinds:?}");
@@ -3011,15 +3089,29 @@ mod tests {
         assert_eq!(rows.len(), 4, "user, run, view, prose: {kinds:?}");
         // Opened, its cells' outputs show; the table only as its folded preview.
         let key = rows[1].0.clone();
-        let opened = super::rows(&t, Shows { fold: &HashMap::from([(key, true)]), cut: &cut });
+        let opened = super::rows(&t, Shows { fold: &HashMap::from([(key, true)]), cut: &cut, all: true });
         let shown: Vec<&str> = opened.iter().map(|(_, r)| r.prefab()).collect();
         assert!(opened.iter().any(|(_, r)| matches!(r, Row::Out(steps::Out::Value { open: false, .. }))), "{shown:?}");
         assert!(!opened.iter().any(|(_, r)| matches!(r, Row::Grid { .. })), "{shown:?}");
         // The view's code button shows the cell's code under the view.
         let code = HashMap::from([(code_key("d"), true)]);
         let cut = HashMap::new();
-        let shown = super::rows(&t, Shows { fold: &code, cut: &cut });
+        let shown = super::rows(&t, Shows { fold: &code, cut: &cut, all: true });
         assert!(matches!(&shown[3].1, Row::Code { lang, .. } if lang == "ts"), "{:?}", shown.iter().map(|(_, r)| r.prefab()).collect::<Vec<_>>());
+        // By default a finished turn is its message, one line for how it got there (naming what failed), the view a cell
+        // drew, and its answer; the line opens to the steps, nested under it.
+        let fold = HashMap::new();
+        let (turned, nested) = rows_nested(&t, Shows { fold: &fold, cut: &cut, all: false });
+        let kinds: Vec<&str> = turned.iter().map(|(_, r)| r.prefab()).collect();
+        assert_eq!(turned.len(), 4, "message, turn line, view, answer: {kinds:?}");
+        assert!(matches!(&turned[1].1, Row::Steps(l) if l.key == "turn:0" && !l.open && l.words.contains("couldn't")), "{kinds:?}");
+        assert!(matches!(&turned[2].1, Row::Ui { block, .. } if block == "d"), "{kinds:?}");
+        assert!(matches!(&turned[3].1, Row::Prose(s) if s == "Done."), "{kinds:?}");
+        assert!(nested.is_empty());
+        let open = HashMap::from([("turn:0".to_owned(), true)]);
+        let (all, nested) = rows_nested(&t, Shows { fold: &open, cut: &cut, all: false });
+        assert!(all.iter().any(|(k, r)| matches!(r, Row::Steps(_)) && k.starts_with("run:") && nested.contains(k)), "opened, its run shows nested");
+        assert_eq!(all.last().map(|(_, r)| r.prefab()), Some("hn.ChatProse"), "the answer stays last");
     }
 
     #[test]
