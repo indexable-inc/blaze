@@ -399,9 +399,10 @@ fn rung(item: &str, agents: usize) -> usize {
 }
 
 /// Each frame: how many agents are at work, whether the chat in front is one of them, and whether it is night. While
-/// any works the music plays in the mood that fits ([`rung`]); when the chat in front stops, `done` rings; with none at
+/// any works the music plays in the mood that fits ([`rung`]); when the chat in front stops, `done` rings (`fail` when it ended
+/// on an error); with none at
 /// work the band goes back to its `rest` mood.
-pub fn scene(agents: usize, front: bool, night: bool) {
+pub fn scene(agents: usize, front: bool, failed: bool, night: bool) {
     if MIXER.get().is_none() {
         return;
     }
@@ -413,7 +414,7 @@ pub fn scene(agents: usize, front: bool, night: bool) {
     }
     drop(now);
     if was && !front {
-        cue("done");
+        cue(if failed { "fail" } else { "done" });
     }
     let mood = (agents > 0).then(|| MOODS.get().and_then(|m| m.get(LADDER[rung(&item, agents)]))).flatten();
     with_mixer(|m| {
@@ -457,7 +458,7 @@ mod live {
         std::thread::sleep(std::time::Duration::from_millis(1500));
         cue("done");
         for _ in 0..80 {
-            scene(1, true, false);
+            scene(1, true, false, false);
             step("edit");
             std::thread::sleep(std::time::Duration::from_millis(100));
         }

@@ -1626,7 +1626,7 @@ impl App {
         if let Some(area) = composer_area(pv) {
             let (shown, [caret, anchor, lo, hi]) = st.draft.shown();
             if let Some(h) = area.part("hint_at").and_then(|a| a.part("hint")) {
-                // Its agent's name ("Message Codex" in a Codex session), and that a message resumes an ended one; an
+                // Nothing while it is empty (how to stop a running turn, while one runs); an
                 // aside's, while it asks nothing past its space, that it stays out of the conversation.
                 let agent = match model::kind_name(w.entity_from_id(e)) {
                     "codex" => "Codex",
@@ -1638,9 +1638,10 @@ impl App {
                 let hint = match (shown.is_empty(), ended) {
                     _ if aside && shown.trim().is_empty() => format!("Ask {agent} aside: the answer stays out of the conversation"),
                     (false, _) => String::new(),
-                    (true, false) if t.busy && !stop.is_empty() => format!("Message {agent} (queued) \u{b7} {stop} to stop"),
-                    (true, false) => format!("Message {agent}"),
-                    (true, true) => format!("Message {agent} to resume"),
+                    // An empty field says nothing: a field under a chat needs no label. Only what is not obvious shows:
+                    // how to stop a running turn.
+                    (true, false) if t.busy && !stop.is_empty() => format!("{stop} to stop"),
+                    (true, _) => String::new(),
                 };
                 h.text(&hint);
             }
@@ -2209,6 +2210,7 @@ impl App {
                 return;
             }
             let text = std::mem::take(&mut d.text).trim_end().to_owned();
+            crate::audio::cue("send");
             (d.caret, d.anchor, d.marked) = (0, 0, None);
             st.stick = true;
             (text, std::mem::take(&mut st.images))
