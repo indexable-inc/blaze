@@ -4866,16 +4866,20 @@ fn cast_kind<'db>(db: &'db Db, source_ty: Ty<'db>, target_ty: Ty<'db>) -> Result
 }
 
 /// The constant a `const { .. }` block `expr` of `owner` is lowered to, a body of its own; `None`
-/// where it is lowered in place, as an inline const of a constant's or static's value is.
+/// where it is lowered in place, as an inline const of a constant's or static's value is. A
+/// `const static { .. }` block (`#![feature(blaze_comptime)]`) is a constant of its own in every
+/// body: it is evaluated by an evaluation of its own, in comptime mode, never in place.
 pub fn inline_const_at<'db>(
     db: &'db Db,
     owner: InferBodyId<'db>,
     infer: &InferenceResult<'db>,
     expr: ExprId,
 ) -> Option<AnonConstId<'db>> {
-    let InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(_)) = owner else {
+    if !matches!(owner, InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(_)))
+        && !hir_ty::effects::const_block_is_comptime(db, owner.expression_store_owner(db), expr)
+    {
         return None;
-    };
+    }
     let ty = infer.expr_ty(expr);
     if ty.references_non_lt_error() || ty.has_infer() {
         return None;
