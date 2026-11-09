@@ -139,6 +139,11 @@ pub struct Transcript {
     /// How much of the model's context window the conversation fills, as the agent last said (its `context` event: the
     /// tokens, the window (0: unknown), the last call's split and the parts); None before it said.
     pub context: Option<ev::ContextUse>,
+    /// How much of the person's plan is used, window by window, as the agent last said in this chat (its latest `plan`
+    /// event), and when it said it (the event's stamp, ms since the epoch): the account's, so the app shows the latest of
+    /// any chat of the same agent kind. Empty before it said.
+    pub plan: Vec<ev::PlanWindow>,
+    pub plan_at: u64,
     /// What the conversation has cost so far (the sum of its turns' `cost_usd`); None while no turn said.
     pub cost_usd: Option<f64>,
     /// The first user message's first line, cut to [`TITLE_CHARS`].
@@ -157,8 +162,8 @@ pub struct Transcript {
 /// are bookkeeping, not state.
 impl PartialEq for Transcript {
     fn eq(&self, o: &Self) -> bool {
-        (&self.models, &self.chosen_model, &self.chosen_effort, &self.context, self.cost_usd)
-            == (&o.models, &o.chosen_model, &o.chosen_effort, &o.context, o.cost_usd)
+        (&self.models, &self.chosen_model, &self.chosen_effort, &self.context, &self.plan, self.plan_at, self.cost_usd)
+            == (&o.models, &o.chosen_model, &o.chosen_effort, &o.context, &o.plan, o.plan_at, o.cost_usd)
             && (&self.items, self.busy, &self.agent, &self.model, &self.effort, &self.session_id, &self.title, &self.details, &self.at)
                 == (&o.items, o.busy, &o.agent, &o.model, &o.effort, &o.session_id, &o.title, &o.details, &o.at)
     }
@@ -275,6 +280,10 @@ impl Transcript {
                 }
             }
             Body::Context(c) => self.context = Some(c.clone()),
+            Body::Plan { windows } => {
+                self.plan.clone_from(windows);
+                self.plan_at = e.ts;
+            }
             Body::User { text, images } => {
                 if self.title.is_empty() {
                     self.title = title_of(text);

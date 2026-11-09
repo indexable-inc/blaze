@@ -21,11 +21,15 @@
 //! with in `thread/settings/updated`, read as a `session` event; it sends none for a turn's own `model` and `effort`, so
 //! a `turn/start` it accepts with them is that turn's `session` event.
 //!
+//! How much of the person's plan is used comes as `account/rateLimits/updated` (v2 `AccountRateLimitsUpdatedNotification`:
+//! `rateLimits`, a `RateLimitSnapshot` whose `primary` and `secondary` are each a `RateLimitWindow` of `usedPercent` 0 to
+//! 100, `windowDurationMins` and `resetsAt` in unix seconds, or null), read as the `plan` event.
+//!
 //! Codex asks the client too (server requests, each answered at once so a turn never hangs): approvals are approved
 //! (the profile already runs with approval policy never and no sandbox, the TUI's yolo), questions for the user get no
 //! answers, MCP elicitations are declined, and everything else is refused with a JSON-RPC error naming the method.
 use super::context;
-use harness_proto::event::{Body, ContextCall, ContextUse, Kind, ModelChoice};
+use harness_proto::event::{Body, ContextCall, ContextUse, Kind, ModelChoice, PlanWindow};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -41,7 +45,6 @@ fn input_items(text: &str, images: &[String]) -> Value {
 /// Notifications this client never reads, asked off at initialize so the raw record stays small.
 const OPT_OUT: &[&str] = &[
     "turn/moderationMetadata",
-    "account/rateLimits/updated",
     "account/updated",
     "thread/readState/changed",
     "thread/status/changed",
@@ -557,6 +560,7 @@ impl Codex {
                 self.runs = (t["model"].as_str().unwrap_or("").to_owned(), t["effort"].as_str().filter(|e| !e.is_empty()).map(str::to_owned));
                 vec![Body::Session { agent: "codex".to_owned(), model: self.runs.0.clone(), session_id: None, effort: self.runs.1.clone() }]
             }
+            "account/rateLimits/updated" => plan(p.get("rateLimits").unwrap_or(p)).into_iter().collect(),
             "model/rerouted" => {
                 let s = |k: &str| p[k].as_str().unwrap_or("?").to_owned();
                 vec![Body::Note { text: format!("Model rerouted from {} to {}", s("fromModel"), s("toModel")) }]
@@ -588,6 +592,40 @@ impl Codex {
             None if declined => vec![Body::Note { text: format!("Declined codex's {method} request") }],
             None => vec![],
         }
+    }
+}
+
+/// A `RateLimitSnapshot` as the `plan` event: its `primary` and `secondary` windows that say how much is used, the
+/// shorter first. Read defensively: the v2 camelCase names, else the snake_case of codex's core protocol
+/// (`used_percent`, `window_minutes`, `resets_at`); unknown fields are ignored and a missing one leaves its part out.
+/// Codex names no warning threshold, so a window warns from [`PlanWindow::WARN`] of it used, and is limited used up.
+/// None when neither window says how much is used.
+fn plan(s: &Value) -> Option<Body> {
+    let field = |w: &Value, names: &[&str]| names.iter().find_map(|n| w.get(*n).filter(|v| !v.is_null()).cloned());
+    let mut windows: Vec<(Option<u64>, PlanWindow)> = ["primary", "secondary"]
+        .iter()
+        .filter_map(|k| {
+            let w = &s[*k];
+            let used = field(w, &["usedPercent", "used_percent"])?.as_f64()? / 100.0;
+            let mins = field(w, &["windowDurationMins", "windowMinutes", "window_minutes"]).and_then(|v| v.as_u64());
+            let resets_at = field(w, &["resetsAt", "resets_at"]).and_then(|v| v.as_u64());
+            let name = mins.map_or_else(|| (*k).to_owned(), span_name);
+            Some((mins, PlanWindow { name, used, resets_at, warn: used >= PlanWindow::WARN, limited: used >= 1.0 }))
+        })
+        .collect();
+    windows.sort_by_key(|(mins, _)| mins.unwrap_or(u64::MAX));
+    let windows: Vec<PlanWindow> = windows.into_iter().map(|(_, w)| w).collect();
+    (!windows.is_empty()).then_some(Body::Plan { windows })
+}
+
+/// A window of `mins` minutes as the status bar names it: `5h`, `day`, `week`, else in days, hours or minutes.
+fn span_name(mins: u64) -> String {
+    match mins {
+        10_080 => "week".to_owned(),
+        1_440 => "day".to_owned(),
+        m if m % 1_440 == 0 => format!("{}d", m / 1_440),
+        m if m % 60 == 0 => format!("{}h", m / 60),
+        m => format!("{m}m"),
     }
 }
 
@@ -717,5 +755,37 @@ impl super::Adapter for Codex {
                 Vec::new()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chat::Adapter;
+
+    /// `account/rateLimits/updated` (asked for: not opted out) is the `plan` event: the five-hour window then the weekly
+    /// one, `usedPercent` as a share, the weekly one warned past [`PlanWindow::WARN`]; the core protocol's snake_case and
+    /// a window with nothing used read too, and a snapshot that says no use is none.
+    #[test]
+    fn rate_limits_are_the_plan() {
+        assert!(!OPT_OUT.contains(&"account/rateLimits/updated"));
+        let line = r#"{"method":"account/rateLimits/updated","params":{"rateLimits":{"limitId":"codex","limitName":null,"primary":{"usedPercent":42,"windowDurationMins":300,"resetsAt":1794253800},"secondary":{"usedPercent":81.5,"windowDurationMins":10080,"resetsAt":1794470400},"credits":{"hasCredits":false,"unlimited":false,"balance":null},"planType":"plus","someFutureField":1}}}"#;
+        assert_eq!(
+            Codex::new("/tmp").events(line),
+            vec![Body::Plan {
+                windows: vec![
+                    PlanWindow { name: "5h".into(), used: 0.42, resets_at: Some(1_794_253_800), warn: false, limited: false },
+                    PlanWindow { name: "week".into(), used: 0.815, resets_at: Some(1_794_470_400), warn: true, limited: false },
+                ],
+            }]
+        );
+        let snake = r#"{"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"used_percent":100.0,"window_minutes":1440,"resets_at":null},"secondary":null}}}"#;
+        assert_eq!(
+            Codex::new("/tmp").events(snake),
+            vec![Body::Plan { windows: vec![PlanWindow { name: "day".into(), used: 1.0, resets_at: None, warn: true, limited: true }] }]
+        );
+        let none = r#"{"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":null,"secondary":null,"planType":"free"}}}"#;
+        assert!(Codex::new("/tmp").events(none).is_empty());
+        assert_eq!((span_name(300), span_name(10_080), span_name(4_320), span_name(90)), ("5h".into(), "week".into(), "3d".into(), "90m".into()));
     }
 }

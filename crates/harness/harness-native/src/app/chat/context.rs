@@ -16,7 +16,7 @@ const INKS: [&str; 8] = ["s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8"];
 /// hn.ChatContextInk's slot for a [`ContextPart::REST`] part.
 const REST_INK: &str = "rest";
 
-/// The popover in `pop` (the composer bar's overlay slot for it) over `meter` (its hn.ChatContext ring), for context `c` as an
+/// The popover in `pop` (the status bar's overlay slot for it) over `meter` (its hn.ChatContext ring), for context `c` as an
 /// agent of kind `agent` reported it; none while `hidden` (the picker's menu is open) or while the pointer is elsewhere,
 /// unless it was pressed `open`. `pointer`: where the pointer is (view points), for the slice under it.
 pub(super) fn fill_context_pop(

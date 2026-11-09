@@ -282,6 +282,9 @@ pub struct App {
     /// An offscreen shot's `HARNESS_NATIVE_SHOT_WORKING` (src/shot.rs): every session row shows at work, at these paces in
     /// turn, and every run row too; empty, rows show what is really at work.
     pub shot_working: Vec<&'static str>,
+    /// An offscreen shot's `HARNESS_NATIVE_SHOT_PLAN` (src/shot.rs, chat/plan.rs): every chat's status bar shows this plan;
+    /// empty, each shows what its agent kind last reported.
+    pub shot_plan: Vec<harness_proto::event::PlanWindow>,
     pub focused: bool,
     pub title: String,
     /// The title-bar strip the window reports, and the (strip, zoom) last written into the view.
@@ -580,6 +583,7 @@ impl App {
             pruned: false,
             persist: true,
             shot_working: Vec::new(), // alloc: empty but in a shot
+            shot_plan: Vec::new(), // alloc: empty but in a shot
             focused: true,
             title: "harness".into(),
             chrome: Chrome::default(),
@@ -2777,7 +2781,7 @@ mod tests {
             "hn.StepKind.build", "hn.StepKind.net", "hn.StepKind.sql", "hn.StepKind.spawn", "hn.StepKind.wait", "hn.StepKind.cell", "hn.StepKind.tool", "ex.TableDemo",
             "hn.chat_status.thinking", "hn.chat_status.thought", "hn.ChatPick", "hn.ChatControlInk.rest", "hn.ChatControlInk.hot",
             "hn.ChatControlInk.off", "hn.ChatEffort", "hn.ChatEffortBar", "ui.caret",
-            "hn.ChatContext", "hn.ChatWorking", "hn.ChatAside", "hn.ChatAsideWorking", "hn.ChatNote", "hn.ChatError",
+            "hn.ChatContext", "hn.ChatPlan", "hn.ChatWorking", "hn.ChatAside", "hn.ChatAsideWorking", "hn.ChatNote", "hn.ChatError",
             "hn.ChatItem", "hn.ChatItemNumber", "hn.ChatItemTask",
             "hn.ChatPeek", "hn.ChatPeekAnchor", "hn.PeekSite", "hn.PeekSiteGlyph", "hn.PeekTitle", "hn.PeekState", "hn.PeekMeta", "hn.PeekBody", "hn.PeekCode",
             "hn.PeekImage", "hn.PeekPage", "hn.PeekCheckFailed", "hn.PeekCheckRunning", "hn.PeekCheckQueued", "hn.PeekChecksFolded",
