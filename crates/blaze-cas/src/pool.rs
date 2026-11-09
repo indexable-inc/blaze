@@ -25,9 +25,12 @@
 //! through [`Give`], a type parameter: [`Kernel`] in a build, the DST's poisoning stand-in in
 //! its test. So the cores reach no system call of their own (rule `sans-io-cores`).
 //!
+//! A commit writes through the pool too ([`append`]): its new bytes go into their file's window,
+//! are written from there, and are the file's loaded pages once the commit is durable.
+//!
 //! Proof: `pool/tests.rs`, a deterministic simulation test of the real word, reading, loads
-//! core and sweep under `blaze_core::sim::Sim`, with planted bugs 1 to 6 of the design's section 7
-//! ([`Plant`]).
+//! core, sweep and append under `blaze_core::sim::Sim`, with planted bugs 1 to 6 and 8 of the
+//! design's section 7 ([`Plant`]).
 
 use std::{
     cell::Cell,
@@ -42,12 +45,14 @@ use blaze_core::{Registered, Span, Spans};
 use blaze_ids::ContentId;
 use blaze_mem::{MemError, Region};
 
+pub(crate) mod append;
 pub(crate) mod drive;
 pub(crate) mod evict;
 pub(crate) mod loads;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use append::Append;
 pub(crate) use loads::{Ended, Load, LoadFailure, Loads, Opened};
 
 /// A page of the pool: 64 KiB, 16 base pages on Linux, 4 on macOS arm64, the image's default
@@ -245,7 +250,7 @@ impl fmt::Debug for Word {
 // --- Planted bugs ------------------------------------------------------------------------------
 
 /// A safeguard of the pool's removed, for the DST's controls (the design's section 7, bugs 1 to
-/// 6): each is caught by the oracle within its case budget, or the oracle is too weak. Only a
+/// 6 and 8): each is caught by the oracle within its case budget, or the oracle is too weak. Only a
 /// test's pool plants one ([`Pool::planted`] is `false` in every build of blaze).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Plant {
@@ -264,6 +269,9 @@ pub(crate) enum Plant {
     NoCheck,
     /// 6: a failed read leaves its pages `Loaded`.
     FailedLoadKept,
+    /// 8: a commit writes into its file's last committed page without pinning it, so the sweep
+    /// gives the page back in the middle of the write.
+    UnpinnedTail,
 }
 
 // --- Giving pages to and taking them from the kernel -------------------------------------------
@@ -312,6 +320,9 @@ pub(crate) struct Pool<G: Give> {
     /// Pages of the reservation, each with a word.
     total: u64,
     give: G,
+    /// Give-backs the kernel refused outside the sweep's batches (an append given up): memory
+    /// kept, counted.
+    refused: AtomicU64,
     #[cfg(test)]
     plant: Plant,
 }
@@ -340,7 +351,7 @@ impl<G: Give> Pool<G> {
             .map_err(|full| PoolError::Reserve { what: "a registration", windows, why: full.to_string() })?;
         #[cfg(test)]
         let plant = Plant::None;
-        Ok(Pool { spans, pages, words, total, give, #[cfg(test)] plant })
+        Ok(Pool { spans, pages, words, total, give, refused: AtomicU64::new(0), #[cfg(test)] plant })
     }
 
     /// A test's pool with `plant` planted.
@@ -398,6 +409,20 @@ impl<G: Give> Pool<G> {
     /// The span of `len` bytes from `page`'s first, for a read into it.
     pub(crate) fn span(&self, page: u64, len: u32) -> Span {
         self.spans.span(page * PAGE, len)
+    }
+
+    /// The span of `len` bytes from the pool's byte `at`, for a write from it.
+    pub(crate) fn span_at(&self, at: u64, len: u32) -> Span {
+        self.spans.span(at, len)
+    }
+
+    /// Give-backs the kernel refused outside the sweep's batches, so far.
+    pub(crate) fn refused(&self) -> u64 {
+        self.refused.load(Ordering::Relaxed)
+    }
+
+    fn count_refused(&self) {
+        self.refused.fetch_add(1, Ordering::Relaxed);
     }
 
     /// The address of the pool's byte `at`.
@@ -473,6 +498,55 @@ impl<G: Give> Pool<G> {
         let word = self.word_now(page);
         assert_eq!(word.state(), State::Loading, "page {page} of the store's pool given up unclaimed: {word:?}");
         self.word(page).store(Word::unloaded(word.version()).0, Ordering::Release);
+    }
+
+    /// `page`, which no file commits yet, taken for a commit's append ([`Append`]): made the
+    /// process's and moved `Unloaded -> Loaded` with the commit's pin, its second-chance bit set.
+    /// Its bytes are anything until the commit writes them; no reader can ask for it and the
+    /// sweep does not visit it until its file commits it ([`Windows::grow`]).
+    ///
+    /// # Errors
+    ///
+    /// [`PoolError::NotFresh`] when the page is not `Unloaded` (nothing changed), and
+    /// [`PoolError::Reuse`] when the kernel refused it.
+    pub(crate) fn fresh(&self, page: u64) -> Result<(), PoolError> {
+        let seen = self.word_now(page);
+        if seen.state() != State::Unloaded {
+            return Err(PoolError::NotFresh { page, word: seen });
+        }
+        self.reuse_run(Run { first: page, pages: 1 }).map_err(|err| PoolError::Reuse {
+            page,
+            pages: 1,
+            // alloc: an error path
+            why: err.to_string(),
+        })?;
+        let next = Word::loaded(seen.version(), 1, Referenced::Set);
+        // Nothing else moves the word of a page no file commits: the swap only says so.
+        self.word(page)
+            .compare_exchange(seen.0, next.0, Ordering::AcqRel, Ordering::Acquire)
+            .map(drop)
+            .map_err(|now| PoolError::NotFresh { page, word: Word(now) })
+    }
+
+    /// `bytes` written at the pool's byte `at` with relaxed atomic stores: a commit's bytes,
+    /// into pages it pins.
+    ///
+    /// # Safety
+    ///
+    /// Every page the bytes touch is pinned by the caller, and no file commits any byte of
+    /// them: no reader holds a reference to them, and no load reads into them.
+    #[allow(unsafe_code, reason = "atomic stores into the pool's pages")]
+    pub(crate) unsafe fn copy_in(&self, at: u64, bytes: &[u8]) {
+        assert!(
+            at + bytes.len() as u64 <= self.total * PAGE,
+            "writing bytes {at}..{} of a store pool of {} pages",
+            at + bytes.len() as u64,
+            self.total
+        );
+        // SAFETY: inside the reservation (asserted), mapped readable and writable; by the
+        // caller's contract nothing holds a plain reference to the bytes, and an optimistic copy
+        // of the same pages' committed bytes is of other bytes, and atomic.
+        unsafe { blaze_mem::racy::copy_in(self.addr(at), bytes) }
     }
 
     /// The pages of `run` made the process's before a load writes them.
@@ -816,6 +890,24 @@ impl Windows {
         self.ids.insert(id, first);
         self.open_pages += window.pages();
         Ok(window)
+    }
+
+    /// `id`'s committed bytes grown to `len` by a commit ([`Append::commit`]), inside its
+    /// windows: its new pages are the sweep's to visit and a reader's to ask for from now on. Its
+    /// window as it is now.
+    pub(crate) fn grow(&mut self, id: FileId, len: u64) -> Window {
+        let first = *self.ids.get(&id).unwrap_or_else(|| panic!("{id:?} grown in the store's pool, where it is not open"));
+        let window = self.by_first.get_mut(&first).expect("an open file has its window");
+        assert!(
+            window.len <= len && len <= u64::from(window.count) * WINDOW,
+            "{id:?}, which commits {} bytes in {} windows, grown to {len}",
+            window.len,
+            window.count
+        );
+        let before = window.pages();
+        window.len = len;
+        self.open_pages += window.pages() - before;
+        *window
     }
 
     /// Whether the sweep passes over `id`'s last page.
@@ -1302,6 +1394,8 @@ pub(crate) enum PoolError {
     Corrupt { page: u64 },
     /// `page` was abandoned to the kernel by a failed driver and is never used again.
     Abandoned { page: u64 },
+    /// `page`, past what its file commits, is not `Unloaded` as a commit's append takes it.
+    NotFresh { page: u64, word: Word },
     /// `page` was evicted and loaded again under one reading more times than any build does.
     Starved { page: u64, waits: u32 },
     /// Every load slot stayed taken through every wait for one.
@@ -1341,6 +1435,13 @@ impl fmt::Display for PoolError {
                     f,
                     "the store's pool page at {at} of window {window} was abandoned to the kernel by a failed read ({})",
                     blaze_core::ABANDONED_SPAN
+                )
+            }
+            PoolError::NotFresh { page, word } => {
+                let (window, at) = page_of(*page);
+                write!(
+                    f,
+                    "a commit could not take the store's pool page at {at} of window {window} to append to its                      file: no file commits it, and it is {word:?}"
                 )
             }
             PoolError::Starved { page, waits } => {

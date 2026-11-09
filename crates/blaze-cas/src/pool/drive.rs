@@ -54,7 +54,7 @@ use blaze_spin::SpinWait;
 use crossbeam_queue::{ArrayQueue, SegQueue};
 
 use super::{
-    Ended, Give, Load, LoadFailure, Loads, Opened, Pins, Pool, PoolError, ReadStep, Reading, State,
+    Ended, Give, Load, LoadFailure, Loads, Opened, Pins, Pool, PoolError, ReadStep, Reading, State, Window,
     loads::LOADS,
 };
 
@@ -74,6 +74,7 @@ struct Slot {
 /// A change to the files the core reads.
 enum FileAsk {
     Open(Opened),
+    Grow(Window, Vec<u32>),
     Close(u32),
 }
 
@@ -166,6 +167,14 @@ impl<G: Give + Send + Sync + 'static> Loader<G> {
     /// it, so the core takes it first.
     pub(crate) fn open(&self, opened: Opened) {
         self.shared.files.push(FileAsk::Open(opened));
+        self.wake();
+    }
+
+    /// The file at `window.first` committed more ([`super::Append::commit`]), `checks` those of its
+    /// new blocks: asked before the commit publishes the new length to readers, so the core
+    /// takes it before any load past the old one.
+    pub(crate) fn grow(&self, window: Window, checks: Vec<u32>) {
+        self.shared.files.push(FileAsk::Grow(window, checks));
         self.wake();
     }
 
@@ -339,6 +348,7 @@ fn take_files<G: Give>(shared: &Shared<G>, loads: &mut Loads) {
     while let Some(ask) = shared.files.pop() {
         match ask {
             FileAsk::Open(opened) => loads.open(opened),
+            FileAsk::Grow(window, checks) => loads.grow(window, checks),
             FileAsk::Close(first) => loads.close(first),
         }
     }

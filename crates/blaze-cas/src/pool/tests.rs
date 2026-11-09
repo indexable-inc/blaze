@@ -17,6 +17,12 @@
 //!   waits for `hegel::sim`'s scheduled atomics);
 //! - faults, as a swarm: failed reads, short reads, held reads, any effect failed once in a
 //!   while, and a block of a file changed on disk (rot);
+//! - the commit: an append to a file, as the store's commit makes one. It pins the file's last
+//!   committed page (a pinned read, loading it if it was evicted), writes its new records into
+//!   the file's window, writes them from there (`WriteFrom`), syncs, and only then makes them the
+//!   file's ([`Append`]). The test's files stand in for the head: an append is committed, in the
+//!   model and in the pool, as its sync completes. One that fails, or is in flight at a crash, is
+//!   not;
 //! - file retirements (its windows freed and taken by a new file), crashes and reopens.
 //!
 //! The test's [`Poison`] stands in for the kernel: what it is given back it poisons with `0xDB`
@@ -30,14 +36,14 @@
 //! 2. No page is given back while it is pinned or `Loading`: every page given back is `Evicting`
 //!    with no pin, and none is made the process's while it already is.
 //! 3. After any crash and reopen, every record reads back its bytes, or is refused for a block
-//!    that rotted.
+//!    that rotted: every record of a committed append among them, and none of one that was not.
 //! 4. The pages the process holds (what `Tag::Pool` counts) are exactly the pages `Loading`,
 //!    `Loaded`, `Evicting` or `Abandoned`; the pins in the words are exactly the guards' alive.
 //! 5. Every load ends, and every reading ends, within a bound of polls.
 //!
 //! (Section 7's sixth, the prefetch budget, is lane 6's.)
 //!
-//! Planted bugs 1 to 6 ([`Plant`]), each a safeguard of the pool's removed, must each be caught on
+//! Planted bugs 1 to 6 and 8 ([`Plant`]), each a safeguard of the pool's removed, must each be caught on
 //! one of [`CONTROL_SEEDS`] seeded plans. Replay: a failure names its plan and the simulator's
 //! seed in it; a control names a seed of [`plan_of`] for [`REPLAY`].
 
@@ -50,7 +56,7 @@ use std::{
 };
 
 use blaze_core::{
-    Cache, Completion, Driver, Effect, FileName,
+    Cache, Completion, Done, Driver, Effect, FileName, Tag,
     sim::{Faults, Rng, SCRIBBLE, Sim},
     wait::Deadline,
 };
@@ -58,8 +64,8 @@ use blaze_mem::MemError;
 use hegel::{TestCase, generators as gs};
 
 use super::{
-    BLOCK, Ended, FileId, Give, Kernel, LoadFailure, Loads, Opened, Optimistic, PAGE, PinSet, Pins, Plant,
-    Pool, PoolError, Rank, ReadStep, Reading, Seen, State, Window, Windows, checks_of,
+    Append, BLOCK, Ended, FileId, Give, Kernel, LoadFailure, Loads, Opened, Optimistic, PAGE, PinSet, Pins,
+    Plant, Pool, PoolError, Rank, ReadStep, Reading, Seen, State, WINDOW, Window, Windows, checks_of,
     drive::Loader,
     evict::{Sweep, Visit},
 };
@@ -68,6 +74,11 @@ use super::{
 /// makes after its retirements.
 const WINDOWS: u32 = 64;
 const READERS: usize = 3;
+/// The commit's place among the actors, after the readers.
+const COMMITTER: usize = READERS;
+/// The tags of the commit's writes, from this one, and of its sync: none a load's.
+const WRITE_TAG: u64 = 1000;
+const SYNC_TAG: u64 = 999;
 /// Load slots the test hands its readers: few, so a reader meets a full table.
 const SLOTS: u16 = 3;
 /// What a page given back holds: the design's stand-in for the kernel's zeros or anything.
@@ -90,6 +101,7 @@ const CONTROL_SEEDS: u64 = 1024;
 const REPLAY: (u64, Plant) = (0, Plant::None);
 
 const _: () = assert!(CONTENT < SCRIBBLE && CONTENT < POISON && CONTENT < ROT);
+const _: () = assert!(WRITE_TAG < TAGS && SYNC_TAG < WRITE_TAG);
 
 type Handle = Rc<Pool<Poison>>;
 
@@ -182,6 +194,8 @@ enum Act {
     ReleaseReads,
     /// A file retired, and a new one made (taking its windows, maybe).
     Retire { file: u8 },
+    /// The commit's next step: an append to a file begun, or the one under way stepped.
+    Append { file: u8 },
     Crash,
 }
 
@@ -257,7 +271,7 @@ fn plan(d: &mut impl Draw) -> Plan {
     for _ in 0..n {
         let reader = d.int(0, READERS as u64 - 1) as u8;
         let (file, rec) = (d.int(0, 2) as u8, d.int(0, 2) as u8);
-        acts.push(match d.int(0, 23) {
+        acts.push(match d.int(0, 25) {
             0..=3 => Act::Read { reader, file, rec, set: false },
             4 | 5 => Act::Read { reader, file, rec, set: true },
             6 | 7 => Act::Optimistic { reader, file, rec },
@@ -273,6 +287,7 @@ fn plan(d: &mut impl Draw) -> Plan {
             21 if hold_reads => Act::ReleaseReads,
             21 => Act::Step { us: 0 },
             22 => Act::Retire { file },
+            23 | 24 => Act::Append { file },
             _ => Act::Crash,
         });
     }
@@ -331,6 +346,8 @@ struct File {
 enum Keep {
     Hold,
     Set,
+    /// The commit's pin of a file's last committed page, for its append.
+    Tail,
 }
 
 enum Actor {
@@ -341,6 +358,20 @@ enum Actor {
     Begun { file: usize, rec: usize, at: u64, len: usize, seen: Seen },
     /// One that copied its bytes, to look again.
     Copied { file: usize, rec: usize, seen: Seen, copy: Vec<u8> },
+    /// The commit's append: its records' bytes in the file's window, their writes asked, then
+    /// their sync.
+    Appending {
+        file: usize,
+        append: Append<Poison, Handle>,
+        bytes: Vec<u8>,
+        /// The new records' places in the file.
+        records: Vec<(u64, u64)>,
+        checks: Vec<u32>,
+        /// Writes not yet answered.
+        writes: u32,
+        failed: bool,
+        syncing: bool,
+    },
 }
 
 impl Actor {
@@ -350,7 +381,8 @@ impl Actor {
             Actor::Reading { file, .. }
             | Actor::Holding { file, .. }
             | Actor::Begun { file, .. }
-            | Actor::Copied { file, .. } => Some(*file),
+            | Actor::Copied { file, .. }
+            | Actor::Appending { file, .. } => Some(*file),
         }
     }
 }
@@ -414,7 +446,7 @@ impl World {
         let pool = fresh(plant)?;
         let mut world = World {
             sim: Sim::new(plan.seed, faults),
-            actors: (0..READERS).map(|_| Actor::Idle).collect(),
+            actors: (0..=READERS).map(|_| Actor::Idle).collect(),
             set: PinSet::new(Rc::clone(&pool)),
             set_held: Vec::new(),
             pool,
@@ -525,6 +557,7 @@ impl World {
             | PoolError::Give { .. }
             | PoolError::Reuse { .. }
             | PoolError::Abandoned { .. }
+            | PoolError::NotFresh { .. }
             | PoolError::Starved { .. }
             | PoolError::LoadsFull { .. } => false,
         };
@@ -551,6 +584,7 @@ impl World {
                     guards += u64::from(pins.run().pages);
                     self.same(*file, *rec, pins.bytes(), "a pinned read held")?;
                 }
+                Actor::Appending { append, .. } => guards += append.pinned(),
                 Actor::Idle | Actor::Begun { .. } | Actor::Copied { .. } => {}
             }
         }
@@ -603,8 +637,11 @@ impl World {
                 ReadStep::Pinned(pins) => {
                     self.slot_back(&mut reading);
                     drop(reading);
-                    self.same(file, rec, pins.bytes(), "a pinned read")?;
+                    if keep != Keep::Tail {
+                        self.same(file, rec, pins.bytes(), "a pinned read")?;
+                    }
                     match keep {
+                        Keep::Tail => self.begin_append(plan, file, Some(pins))?,
                         Keep::Hold => Actor::Holding { file, rec, pins },
                         Keep::Set => match self.set.keep(pins) {
                             Ok(bytes) => {
@@ -651,7 +688,7 @@ impl World {
                 }
                 Actor::Idle
             }
-            held @ (Actor::Idle | Actor::Holding { .. }) => held,
+            held @ (Actor::Idle | Actor::Holding { .. } | Actor::Appending { .. }) => held,
         };
         self.actors[i] = next;
         self.sim.submit(&mut self.effects);
@@ -678,12 +715,14 @@ impl World {
     fn step(&mut self, us: u64) -> Result<(), Broke> {
         self.sim.advance(Duration::from_micros(us));
         self.sim.poll(&mut self.out, Deadline::PASSED);
-        for completion in self.out.drain(..) {
-            if !self.loads.owns(completion.tag) {
-                return Err(Broke::Harness(format!("a completion no load asked for: {completion:?}")));
+        let mut out = std::mem::take(&mut self.out);
+        for completion in out.drain(..) {
+            match self.loads.owns(completion.tag) {
+                true => self.loads.complete(&self.pool, completion, &mut self.ended),
+                false => self.written(completion)?,
             }
-            self.loads.complete(&self.pool, completion, &mut self.ended);
         }
+        self.out = out;
         self.deliver()?;
         self.sim.submit(&mut self.effects);
         Ok(())
@@ -711,6 +750,89 @@ impl World {
         if let Ok(seen) = self.pool.begin(at, len) {
             self.actors[i] = Actor::Begun { file, rec, at, len, seen };
         }
+        Ok(())
+    }
+
+    /// The commit's next step: an append to a drawn file begun (its last committed page pinned
+    /// first, when its committed bytes end inside one), or the one under way stepped.
+    fn append(&mut self, plan: &Plan, file: u8) -> Result<(), Broke> {
+        if matches!(self.actors[COMMITTER], Actor::Idle) {
+            let (file, _) = self.pick(file, 0);
+            let window = self.files[file].window;
+            self.actors[COMMITTER] = match Append::<Poison, Handle>::tail_of(&window) {
+                Some((at, len)) => Actor::Reading { file, rec: 0, keep: Keep::Tail, reading: Reading::new(at, len) },
+                None => self.begin_append(plan, file, None)?,
+            };
+        }
+        self.advance(plan, COMMITTER)
+    }
+
+    /// The commit's append to `file` begun, `tail` its pin of the file's last committed page: a
+    /// spare's records written into the file's window after what is committed, and their writes
+    /// asked. No append when the file's windows have no room for them (the store would begin
+    /// another pack).
+    fn begin_append(&mut self, plan: &Plan, file: usize, tail: Option<Pins<Poison, Handle>>) -> Result<Actor, Broke> {
+        let spec = &plan.spares[self.spares % plan.spares.len()];
+        self.spares += 1;
+        let (bytes, records) = file_bytes(spec);
+        let ours = &self.files[file];
+        let window = ours.window;
+        if window.len + bytes.len() as u64 > u64::from(window.count) * WINDOW {
+            return Ok(Actor::Idle);
+        }
+        let mut append = Append::begin(Rc::clone(&self.pool), window, tail);
+        append.put(&bytes).map_err(|err| Broke::Harness(err.to_string()))?;
+        let checks = append.checks();
+        let parts = append.parts();
+        for (n, &(at, from)) in parts.iter().enumerate() {
+            self.effects.push(Effect::WriteFrom {
+                file: ours.name.clone(),
+                at,
+                from,
+                cache: Cache::Bypassed,
+                tag: Tag(WRITE_TAG + n as u64),
+            });
+        }
+        let records = records.into_iter().map(|(at, len)| (window.len + at, len)).collect();
+        Ok(Actor::Appending { file, append, bytes, records, checks, writes: parts.len() as u32, failed: false, syncing: false })
+    }
+
+    /// A completion of the commit's: a write of its append, or its sync. Once every write has
+    /// completed, the sync is asked; once the sync has, the append is the file's, in the pool
+    /// and in the model (the head's flip). A write or a sync that failed gives the append up:
+    /// nothing of it was committed.
+    fn written(&mut self, completion: Completion) -> Result<(), Broke> {
+        let actor = std::mem::replace(&mut self.actors[COMMITTER], Actor::Idle);
+        let Actor::Appending { file, append, bytes, records, checks, mut writes, mut failed, syncing } = actor else {
+            return Err(Broke::Harness(format!("a completion neither a load nor the commit asked for: {completion:?}")));
+        };
+        let good = !matches!(completion.done, Done::Failed(_));
+        let next = match (syncing, good) {
+            (true, true) => {
+                let window = append.commit(&mut self.windows);
+                self.loads.grow(window, checks);
+                let ours = &mut self.files[file];
+                ours.window = window;
+                ours.bytes.extend_from_slice(&bytes);
+                ours.records.extend(records);
+                Actor::Idle
+            }
+            // Dropped, its fresh pages given back.
+            (true, false) => Actor::Idle,
+            (false, _) => {
+                writes -= 1;
+                failed |= !good;
+                match (writes, failed) {
+                    (0, true) => Actor::Idle,
+                    (0, false) => {
+                        self.effects.push(Effect::Sync { file: self.files[file].name.clone(), tag: Tag(SYNC_TAG) });
+                        Actor::Appending { file, append, bytes, records, checks, writes, failed, syncing: true }
+                    }
+                    _ => Actor::Appending { file, append, bytes, records, checks, writes, failed, syncing },
+                }
+            }
+        };
+        self.actors[COMMITTER] = next;
         Ok(())
     }
 
@@ -815,6 +937,7 @@ impl World {
                 Ok(())
             }
             Act::Retire { file } => self.retire(plan, file),
+            Act::Append { file } => self.append(plan, file),
             Act::Crash => self.crash(plan),
         }
     }
@@ -823,14 +946,16 @@ impl World {
     /// fifth rule).
     fn drain(&mut self, plan: &Plan) -> Result<(), Broke> {
         for _ in 0..DRAIN {
-            let busy = self.actors.iter().any(|it| matches!(it, Actor::Reading { .. } | Actor::Begun { .. } | Actor::Copied { .. }));
+            let busy = self.actors.iter().any(|it| {
+                matches!(it, Actor::Reading { .. } | Actor::Begun { .. } | Actor::Copied { .. } | Actor::Appending { .. })
+            });
             if !busy && self.loads.in_flight() == 0 && self.sweep.batch().is_empty() {
                 return Ok(());
             }
             self.sim.release_reads(Duration::ZERO);
             self.sweep.give(&self.pool).map_err(Broke::Harness)?;
             self.step(100)?;
-            for i in 0..READERS {
+            for i in 0..self.actors.len() {
                 self.advance(plan, i)?;
             }
             self.check()?;
@@ -972,6 +1097,49 @@ fn the_oracle_catches_a_load_with_no_block_checks() {
 #[test]
 fn the_oracle_catches_a_failed_load_kept() {
     control(Plant::FailedLoadKept);
+}
+
+#[test]
+fn the_oracle_catches_a_commit_that_does_not_pin_its_file_s_last_page() {
+    control(Plant::UnpinnedTail);
+}
+
+/// An append with no faults, by hand: its records are not the file's until its sync completes,
+/// then read back from the page the commit wrote with no read of the disk, and again from the
+/// disk after the page is given back.
+#[test]
+fn an_append_is_the_file_s_once_its_sync_completes_and_reads_back() {
+    let plan = quiet_plan();
+    let mut world = World::new(&plan, Plant::None).unwrap_or_else(|broke| panic!("{broke}"));
+    let before = world.files[0].records.len();
+    world.append(&plan, 0).unwrap_or_else(|broke| panic!("{broke}"));
+    for _ in 0..DRAIN {
+        if matches!(world.actors[COMMITTER], Actor::Idle) {
+            break;
+        }
+        assert_eq!(world.files[0].records.len(), before, "an append is not the file's before its sync");
+        world.step(100).unwrap_or_else(|broke| panic!("{broke}"));
+        world.advance(&plan, COMMITTER).unwrap_or_else(|broke| panic!("{broke}"));
+        world.check().unwrap_or_else(|broke| panic!("{broke}"));
+    }
+    assert_eq!(world.files[0].records.len(), before + 1, "the append was committed");
+    assert_eq!(world.files[0].window.len, world.files[0].bytes.len() as u64);
+    // The new record, pinned with no load: its page is the one the commit wrote.
+    let page = world.files[0].window.first_page();
+    let (at, len) = world.place(0, before);
+    let mut reading = Reading::new(at, len);
+    match reading.step(&world.pool) {
+        ReadStep::Pinned(pins) => {
+            world.same(0, before, pins.bytes(), "a read of an appended record").unwrap_or_else(|broke| panic!("{broke}"));
+        }
+        _ => panic!("the appended record's page is not loaded as its commit ends"),
+    }
+    drop(reading);
+    // Given back, and read again from the disk, block checks and all.
+    let swept = world.sweep.evict(&world.pool, &world.windows, u64::MAX);
+    assert_eq!(swept.refused, None);
+    assert_eq!(world.pool.word_now(page).state(), State::Unloaded, "{swept:?}");
+    world.read_back(&plan).unwrap_or_else(|broke| panic!("{broke}"));
 }
 
 /// One seeded plan, [`REPLAY`]'s: set it to a seed a failure names to run that case alone.

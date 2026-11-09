@@ -218,6 +218,36 @@ impl Loads {
         self.files.insert(window.first, File { window, name, checks });
     }
 
+    /// The file at `window.first` committed more: `window` as it is now ([`super::Append::commit`]),
+    /// and the checks of its new blocks ([`super::Append::checks`]). Told before a reader can
+    /// learn the new length, so a load of a new page finds its checks.
+    ///
+    /// A load in flight is not disturbed: what a read of a page must read changes only for the
+    /// page the committed bytes ended in, which the commit pinned, so no load of it is in flight.
+    pub(crate) fn grow(&mut self, window: Window, checks: Vec<u32>) {
+        let file = self
+            .files
+            .get_mut(&window.first)
+            .unwrap_or_else(|| panic!("{:?} grown in the store pool's loads, which were not told of it", window.id));
+        assert!(
+            file.window.id == window.id && file.window.len <= window.len,
+            "{} of {} bytes grown to {:?} of {} bytes",
+            file.name,
+            file.window.len,
+            window.id,
+            window.len
+        );
+        file.checks.extend(checks);
+        assert_eq!(
+            file.checks.len() as u64,
+            window.len.div_ceil(BLOCK),
+            "{} grown to {} bytes with the wrong number of checks",
+            file.name,
+            window.len
+        );
+        file.window = window;
+    }
+
     /// The file at window `first` read no more: retired.
     pub(crate) fn close(&mut self, first: u32) {
         self.files.remove(&first);
@@ -431,7 +461,7 @@ fn check<G: Give>(pool: &Pool<G>, file: &File, part: Part) -> Option<(u64, u64)>
 /// `pages` (ascending, each `Evicting`) given back to the kernel, then each moved to the word
 /// `then` makes of its version: `false` when the kernel kept some. Those stay resident and are
 /// moved all the same: that costs memory, not correctness (their next load writes them whole).
-fn give_back<G: Give>(pool: &Pool<G>, pages: &[u64], then: impl Fn(u64) -> fn(u64) -> Word) -> bool {
+pub(super) fn give_back<G: Give>(pool: &Pool<G>, pages: &[u64], then: impl Fn(u64) -> fn(u64) -> Word) -> bool {
     if pages.is_empty() {
         return true;
     }
