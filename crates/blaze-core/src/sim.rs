@@ -47,6 +47,8 @@
 //! system that queued them before it saw the unwatch.
 
 mod journal;
+#[cfg(test)]
+mod pages;
 
 use std::{cell::Cell, mem, path::PathBuf, time::Duration};
 
