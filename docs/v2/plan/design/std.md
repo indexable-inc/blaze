@@ -104,12 +104,15 @@ not ambient and is never fetched from a thread-local; `main` receives the root o
 | `Dir<P>` | `Fs`, a `Dir` | `subdir`, `read_only` | files beneath it, by relative path only |
 | `File<P>` | `Dir` | `read_only` | positional reads and writes, sync, mapping |
 | `Net` | `io.net()` | `connect_only(host)`, `listen_only(addr)` | `Conn`, `Listener`, name lookup |
-| `Env` | `io.env()` | `only(names)` | variables; `Args` beside it |
+| `Env` | `io.env()` | `only(names)` | environment variables |
+| `Args` | `io.args()` | | the command line |
+| `Host` | `io.host()` | | the process id, core count, host name, signals, and exiting with a status |
 | `Clock` | `io.clock()` | | `Instant`, wall time, `Deadline` |
 | `Rng` | `io.rng()` | `fork()` | random bytes; seeded in the simulation |
 | `Tasks` | `io.tasks()` | | scopes of named tasks |
 | `Process` | `io.process()` | `only(programs)` | child processes |
-| `Out` | `io.out()` | | standard output and input |
+| `Out` | `io.out()` | | standard input, output and error |
+| `Mem` | `io.mem()` | | named arenas and caches against the memory budget |
 
 Rules that hold for all of them:
 
@@ -124,8 +127,20 @@ Rules that hold for all of them:
   signature would stop being the whole truth. The `ambient` check refuses it.
 - **Clone is allowed.** Copying authority you hold adds none.
 
-Ambient on purpose, and nothing else: panics, and emitting to the span stream (`Cx` says which
-span, the recorder is global). Allocation is not ambient (below).
+**Nothing is global.** Everything a program can reach outside its own values comes down from
+`main`'s `Io` and `Cx`:
+
+- There is no `std::env::var`, no arguments function, no current directory, no process-wide
+  clock, random source, exit, signal handler or standard stream: each is a capability above.
+- **No global mutable state.** A `static` may hold only immutable data. A `static` with interior
+  mutability (an atomic, a lock, a cell), a `static mut` and a thread-local are refused in a
+  capabilities crate (the effect `global_state`): state shared across calls is a value someone
+  owns and passes, or a context.
+- **Spans and events go through `Cx`** (`cx.span(..)`, `cx.event(..)`); the recorder is reached
+  from the root `Cx`, not from a global.
+- Allocation is not ambient (below).
+
+The one thing left ambient is a panic, which is the language's, and it fails its task.
 
 **Secrets.** `#[derive(bstd::Secret)]` gives a type no `Debug`, `Display` or `Clone`, zeroes it on
 drop, and hands its bytes only to functions of its own module.
@@ -185,6 +200,8 @@ nonblocking; [effects](effects.md)):
   process or thread API, outside the trusted list.
 - **`unsafe`**: reaches an `unsafe` block outside the trusted list.
 - **`global_alloc`**: allocates from the global heap instead of a handed allocator.
+- **`global_state`**: reads or writes a `static` with interior mutability, a `static mut` or a
+  thread-local.
 
 The trusted list is in the workspace manifest (`[blaze.trusted]`, each entry with an owner and a
 reason); `bstd` is on it. `blaze explain trusted <binary>` prints what a binary rests on, and
