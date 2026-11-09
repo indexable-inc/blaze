@@ -17,3 +17,5 @@ pub mod lower;
 pub mod refuse;
 pub mod structure;
 
+#[cfg(test)]
+mod tests;
