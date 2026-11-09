@@ -23,7 +23,7 @@ hn {
   // mark, hn's own: icons/chevron.svg) pointing at the title, in the muted ink, always shown so the tree reads as one,
   // turned a quarter to point down on the `turn` spring as it opens; its hit target is the whole slot. Else the slot
   // holds the row's done `mark` while a finished row lingers ("ok": a check in tone_success, "fail": a cross in
-  // tone_error, "sleep": a pause in the faint ink for a sub-agent up but idle, "": nothing) and no hit target (the row takes the press). Its click is script (flecs.script.input):
+  // tone_error, "": nothing) and no hit target (the row takes the press). Its click is script (flecs.script.input):
   // `hn.act` hands the host the toggle, with Option for every sibling.
   @tree ChildOf
   template Hang : Row {
@@ -164,15 +164,9 @@ hn {
             Fill: $tone_error
             Size: {w: {kind: Fixed, value: $tree_mark, min: 0, max: 0}, h: {kind: Fixed, value: $tree_mark, min: 0, max: 0}}
           } else {
-            if $kids == false && $mark == "sleep" {
-              Icon: {glyph: ""}
-              Fill: $tone_ink_faint
-              Size: {w: {kind: Fixed, value: $tree_mark, min: 0, max: 0}, h: {kind: Fixed, value: $tree_mark, min: 0, max: 0}}
-            } else {
-              Icon: {glyph: ""}
-              Fill: $tone_clear
-              Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 0, min: 0, max: 0}}
-            }
+            Icon: {glyph: ""}
+            Fill: $tone_clear
+            Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 0, min: 0, max: 0}}
           }
         }
       }
