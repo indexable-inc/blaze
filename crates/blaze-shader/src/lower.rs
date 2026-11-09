@@ -29,7 +29,7 @@ use std::alloc::Global;
 
 use base_db::Db;
 use blaze_hash::HashMap;
-use hir_def::{AdtId, CallableDefId, EnumId, EnumVariantId, FunctionId, VariantId};
+use hir_def::{AdtId, CallableDefId, EnumId, EnumVariantId, FunctionId, StaticId, VariantId};
 use hir_ty::{
     MemoryMap, ParamEnvAndCrate, PointerCast,
     db::HirDatabase as _,
@@ -57,7 +57,7 @@ use naga::{
 };
 use rustc_abi::{Endian, FieldsShape};
 use rustc_type_ir::{
-    FloatTy,
+    FloatTy, IntTy,
     inherent::{AdtDef as _, GenericArgs as _, IntoKind as _, SliceLike as _},
 };
 
@@ -178,6 +178,9 @@ struct Frame<'db> {
     succ: Vec<Vec<m::BasicBlockId>>,
     /// The locals that hold `ub_checks()`'s value and are assigned nowhere else: false.
     known_false: Vec<m::LocalId>,
+    /// The front end's discriminant temporaries ([`discriminant_temps`]): `i128` in the MIR,
+    /// the device's `i32` tag here.
+    discriminants: Vec<m::LocalId>,
     /// What each block's call runs, decided once.
     calls: HashMap<m::BasicBlockId, Target<'db>, Global>,
     nodes: HashMap<m::BasicBlockId, u32, Global>,
@@ -439,6 +442,12 @@ impl<'db> Device<'db> {
                 .const_eval_discriminant(variant)
                 // alloc: an error
                 .map_err(|e| (format!("the discriminant of a variant of `{ty}`, which did not evaluate ({e:?})", ty = self.shown(ty)), why::ENUMS))?;
+            // The tag is an `i32`, and so is every discriminant read on the device
+            // (`EntryCx::local_ty`): a wider one would be cut.
+            if i32::try_from(discr).is_err() {
+                // alloc: an error
+                return Err((format!("the enum `{ty}`, whose discriminant {discr} does not fit the device's 32-bit tag", ty = self.shown(ty)), why::ENUMS));
+            }
             let mut map = Vec::new(); // alloc: a variant's members
             let fields: Vec<Ty<'db>> = self
                 .db
@@ -779,6 +788,7 @@ impl<'d, 'db> EntryCx<'d, 'db> {
             doomed: Vec::new(),
             succ: Vec::new(),
             known_false: Vec::new(),
+            discriminants: discriminant_temps(body),
             calls: HashMap::default(), // alloc: a frame's calls
             nodes: HashMap::default(), // alloc: a frame's nodes
             caller,
@@ -978,7 +988,7 @@ impl<'d, 'db> EntryCx<'d, 'db> {
             m::Rvalue::Ref(_, of) => self.sym_of(frame, of, Some((block, si)))?,
             m::Rvalue::Use(op) => match &op.kind {
                 m::OperandKind::Copy(of) | m::OperandKind::Move(of) => self.sym_of_ref_value(frame, of)?,
-                _ => return Err(("a reference constant".to_owned(), why::POINTERS)), // alloc: an error
+                _ => return Err(self.reference_constant(op, "a reference constant")),
             },
             m::Rvalue::CopyForDeref(of) => self.sym_of_ref_value(frame, of)?,
             m::Rvalue::Cast(kind, op, to) => self.cast_sym(frame, kind, op, self.dev.normalize(to.as_ref()))?,
@@ -1036,10 +1046,18 @@ impl<'d, 'db> EntryCx<'d, 'db> {
     }
 
     fn local_ty(&self, frame: usize, local: m::LocalId) -> Ty<'db> {
+        if self.frames[frame].discriminants.contains(&local) {
+            // It only ever holds a discriminant, which is the device's `i32` tag: every enum
+            // lowered has discriminants that fit it (`lower_enum`), and any other type's is 0.
+            return Ty::new_int(self.dev.interner, IntTy::I32);
+        }
         self.dev.normalize(self.frames[frame].body.locals[local].ty.as_ref())
     }
 
     fn place_ty(&self, frame: usize, place: &m::StoredPlace) -> Ty<'db> {
+        if place.projection.as_slice().is_empty() {
+            return self.local_ty(frame, place.local);
+        }
         let ty = place.as_ref().ty(self.frames[frame].body, &self.dev.infcx, self.dev.env.param_env).ty;
         self.dev.normalize(ty)
     }
@@ -1261,7 +1279,7 @@ impl<'d, 'db> EntryCx<'d, 'db> {
             }
             let sym = match &arg.kind {
                 m::OperandKind::Copy(of) | m::OperandKind::Move(of) => self.sym_of_ref_value(caller, of)?,
-                _ => return Err(("a reference constant passed to a call".to_owned(), why::POINTERS)), // alloc: an error
+                _ => return Err(self.reference_constant(arg, "a reference constant passed to a call")),
             };
             self.bind(callee, *param, sym)?;
         }
@@ -1912,6 +1930,9 @@ impl<'d, 'db> EntryCx<'d, 'db> {
                 if op.fn_def().is_some() {
                     return Ok(None);
                 }
+                if self.static_of(op).is_some() {
+                    return Err(self.reference_constant(op, "a constant that points into a static"));
+                }
                 let allocation = allocation.as_ref();
                 if !matches!(allocation.memory_map, MemoryMap::Empty) && !allocation.memory_map.value_pointers().is_empty() {
                     return Err((format!("a constant of `{}` that holds references", self.dev.shown(allocation.ty)), why::POINTERS)); // alloc: an error
@@ -1921,7 +1942,48 @@ impl<'d, 'db> EntryCx<'d, 'db> {
                     None => Ok(None),
                 }
             }
-            m::OperandKind::Static(_) => Err(("a read of a static".to_owned(), why::STATICS)), // alloc: an error
+            m::OperandKind::Static(_) => Err(self.reference_constant(op, "a read of a static")),
+        }
+    }
+
+    /// The static a reference constant points into: a static's address (`OperandKind::Static`),
+    /// or a constant reference whose address the evaluation gave to a static's memory.
+    fn static_of(&self, op: &m::Operand) -> Option<StaticId> {
+        match &op.kind {
+            m::OperandKind::Static(id) => Some(*id),
+            m::OperandKind::Allocation { allocation } => {
+                let allocation = allocation.as_ref();
+                if !self.is_ref(allocation.ty) {
+                    return None;
+                }
+                let dl = self.dev.db.target_data_layout(self.dev.env.krate).ok()?;
+                let word = allocation.memory.get(..dl.pointer_size().bytes_usize())?;
+                let mut bytes = [0u8; 8];
+                match dl.endian {
+                    Endian::Little => bytes[..word.len()].copy_from_slice(word),
+                    Endian::Big => {
+                        for (i, b) in word.iter().rev().enumerate() {
+                            bytes[i] = *b;
+                        }
+                    }
+                }
+                let addr = usize::try_from(u64::from_le_bytes(bytes)).ok()?;
+                allocation.memory_map.static_at(addr).map(|(id, _)| id)
+            }
+            m::OperandKind::Copy(_) | m::OperandKind::Move(_) | m::OperandKind::Constant { .. } => None,
+        }
+    }
+
+    /// The refusal of a reference that is a constant: one into a static is a read of that
+    /// static, refused under the statics rule and named by its path; any other is `what`,
+    /// under the references rule.
+    fn reference_constant(&self, op: &m::Operand, what: &str) -> Refused {
+        match self.static_of(op) {
+            Some(statik) => {
+                let path = blaze_items::key::path(self.dev.db, blaze_items::ItemId::Static(statik));
+                (format!("a read of the static `{path}`"), why::STATICS) // alloc: an error
+            }
+            None => (what.to_owned(), why::POINTERS), // alloc: an error
         }
     }
 
@@ -2591,6 +2653,28 @@ fn false_target(targets: &m::SwitchTargets) -> m::BasicBlockId {
 
 /// How many times `local` is written: by an assignment to it or into it, or as a call's
 /// destination.
+/// The locals the front end reads a discriminant into to switch on it (`discr_temp_place` in
+/// hir-ty-mir's lowering): typed `i128` whatever the enum, and assigned only by
+/// `Rvalue::Discriminant`. Nothing else is written to them, so the device holds each as its
+/// `i32` tag, losing nothing; a local that is also written another way keeps its type.
+fn discriminant_temps(body: &m::MirBody<'_>) -> Vec<m::LocalId> {
+    let mut found: Vec<(m::LocalId, usize)> = Vec::new(); // alloc: a frame's discriminant temporaries
+    for (_, block) in body.basic_blocks.iter() {
+        for statement in block.statements.iter() {
+            if let m::StatementKind::Assign(place, m::Rvalue::Discriminant(_)) = &statement.kind
+                && place.projection.as_slice().is_empty()
+                && matches!(body.locals[place.local].ty.as_ref().kind(), TyKind::Int(IntTy::I128))
+            {
+                match found.iter_mut().find(|(local, _)| *local == place.local) {
+                    Some((_, n)) => *n += 1,
+                    None => found.push((place.local, 1)),
+                }
+            }
+        }
+    }
+    found.into_iter().filter(|&(local, n)| assignments(body, local) == n).map(|(local, _)| local).collect()
+}
+
 fn assignments(body: &m::MirBody<'_>, local: m::LocalId) -> usize {
     let mut count = 0;
     for (_, block) in body.basic_blocks.iter() {
