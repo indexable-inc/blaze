@@ -1,0 +1,26 @@
+[package]
+name = "blaze-std"
+description = "bstd, blaze's own capability-based standard library (docs/v2/plan/design/std.md): one Io over blaze-core's drivers and its simulation, capabilities made only from it or by narrowing, a task context (Cx) with a deadline, cancellation, a span and a frame, and memory from named allocators"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+name = "bstd"
+doctest = false
+
+[dependencies]
+blaze-core.workspace = true
+blaze-mem.workspace = true
+blaze-rng.workspace = true
+
+[dev-dependencies]
+hegeltest.workspace = true
+
+[lints]
+workspace = true
