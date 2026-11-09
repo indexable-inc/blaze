@@ -2314,6 +2314,7 @@ impl Sink {
                     ComptimeForm::ForConst => 0,
                     ComptimeForm::ReflectedField => 1,
                     ComptimeForm::BinderBound => 2,
+                    ComptimeForm::Block => 3,
                 };
                 self.words.extend([80, local(*expr), form]);
             }
@@ -3380,6 +3381,7 @@ impl Source<'_> {
                     0 => ComptimeForm::ForConst,
                     1 => ComptimeForm::ReflectedField,
                     2 => ComptimeForm::BinderBound,
+                    3 => ComptimeForm::Block,
                     _ => return Err(self.invalid("a comptime form of no kind")),
                 },
             },

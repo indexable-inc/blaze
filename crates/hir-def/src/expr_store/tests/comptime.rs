@@ -1,6 +1,6 @@
 //! `#![feature(blaze_comptime)]` lowering (`docs/v2/plan/design/comptime.md`): `for const` to
 //! `Expr::ComptimeFor`, `x.[f]` to `Expr::ReflectedField`, a bounded `for<F: ..>` binder to the
-//! generics' binder parameters; and without the feature, each one the `ComptimeWithoutFeature`
+//! generics' binder parameters, `const static { .. }` to an inline const; and without the feature, each one the `ComptimeWithoutFeature`
 //! error and nothing else.
 
 use hir_expand::fixture;
@@ -109,6 +109,29 @@ fn a_reflected_field_lowers_to_a_reflected_field() {
             .exprs()
             .any(|(_, it)| matches!(it, Expr::ReflectedField { .. } | Expr::Index { .. }))
     );
+}
+
+/// `const static { .. }` is an inline const (`Expr::Const`) of the block, as `const { .. }` is:
+/// what it is is read off its syntax later. Without the feature it is `Missing`, with the error.
+#[test]
+fn const_static_lowers_to_an_inline_const() {
+    let text = "fn f() -> u8 { let x = const static { 1 }; x }";
+    let (forms, db, def) = lower_body(text, true);
+    assert_eq!(forms, []);
+    let store = Body::of(&db, def);
+    let inner = store
+        .exprs()
+        .find_map(|(_, it)| match it {
+            Expr::Const(inner) => Some(inner),
+            _ => None,
+        })
+        .expect("an `Expr::Const`");
+    assert!(matches!(store.expr(inner), Expr::Block { .. }), "the inline const's block");
+
+    let (forms, db, def) = lower_body(text, false);
+    assert_eq!(forms, [ComptimeForm::Block]);
+    let store = Body::of(&db, def);
+    assert!(!store.exprs().any(|(_, it)| matches!(it, Expr::Const(_))));
 }
 
 #[test]
