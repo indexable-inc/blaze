@@ -107,3 +107,67 @@ pub fn sign(x: f32) -> f32 {
 pub fn asuint(x: f32) -> u32 {
     x.to_bits()
 }
+
+/// `x` as an IEEE half, in the low 16 bits (Slang's `f32tof16`): rounded to the nearest half, ties
+/// to even, as Metal converts; past the largest half it is infinity, and a NaN stays a NaN. The
+/// device lowers it to `as_type<uint>(half2(x, 0))`.
+#[inline(never)]
+pub fn f32tof16(x: f32) -> u32 {
+    let bits = x.to_bits();
+    let sign = (bits >> 16) & 0x8000;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let man = bits & 0x7f_ffff;
+    if exp == 0xff {
+        // Infinity, or a NaN kept quiet and non-zero.
+        return sign | 0x7c00 | if man != 0 { 0x200 | (man >> 13) } else { 0 };
+    }
+    // The exponent rebiased from 127 to 15.
+    let e = exp - 127 + 15;
+    if e >= 0x1f {
+        return sign | 0x7c00;
+    }
+    if e <= 0 {
+        // A subnormal half, or zero: the mantissa with its implicit bit, shifted into place.
+        if e < -10 {
+            return sign;
+        }
+        let m = man | 0x80_0000;
+        let shift = (14 - e) as u32;
+        let half = m >> shift;
+        let rest = m & ((1 << shift) - 1);
+        let mid = 1 << (shift - 1);
+        let up = rest > mid || (rest == mid && half & 1 == 1);
+        return sign | (half + up as u32);
+    }
+    let half = ((e as u32) << 10) | (man >> 13);
+    let rest = man & 0x1fff;
+    // A carry out of the mantissa steps the exponent, and out of the largest half, to infinity.
+    let up = rest > 0x1000 || (rest == 0x1000 && half & 1 == 1);
+    sign | (half + up as u32)
+}
+
+/// The IEEE half in the low 16 bits of `x`, as an `f32` (Slang's `f16tof32`); exact, since every
+/// half is an `f32`. The bits above 16 are ignored. The device lowers it to
+/// `float2(as_type<half2>(x)).x`.
+#[inline(never)]
+pub fn f16tof32(x: u32) -> f32 {
+    let sign = (x & 0x8000) << 16;
+    let exp = (x >> 10) & 0x1f;
+    let man = x & 0x3ff;
+    let bits = match exp {
+        0 if man == 0 => sign,
+        0 => {
+            // A subnormal: normalized into an f32's range.
+            let mut e = 127 - 15 + 1;
+            let mut m = man;
+            while m & 0x400 == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            sign | ((e as u32) << 23) | ((m & 0x3ff) << 13)
+        }
+        0x1f => sign | 0x7f80_0000 | (man << 13),
+        _ => sign | ((exp + 127 - 15) << 23) | (man << 13),
+    };
+    f32::from_bits(bits)
+}

@@ -195,3 +195,146 @@ fn integer_vectors_convert_and_clamp() {
     assert_eq!(vec2(1.0, 2.0).extend(3.0).extend(4.0), vec4(1.0, 2.0, 3.0, 4.0));
     assert_eq!(size_of::<IVec4>(), 16);
 }
+
+#[repr(C)]
+#[derive(Copy, Clone, crate::Pod)]
+struct Lamp {
+    o: Vec4,
+    light: Vec4,
+}
+
+/// A kernel in light.slang's shape: a uniform, the TLAS, read-only storage, and storage it writes.
+#[crate::kernel(threads = (8, 8))]
+fn light_cs(t: Thread, view: &Globals, scene: &Tlas, lamps: &[Lamp], cells: &[UVec2], acc: &RawOut<UVec2>) {
+    let _ = (t, view, scene, lamps, cells, acc);
+}
+
+#[crate::kernel(threads = 64)]
+fn flat_cs(t: Thread, out: &RawOut<u32>) {
+    let _ = (t, out);
+}
+
+/// A kernel's buffers, the TLAS among them, take buffer slots in parameter order (wgpu's Metal
+/// backend counts an acceleration structure with the buffers); its Thread takes none; and its
+/// RawOut counts as storage, so the sizes buffer follows the last buffer.
+#[test]
+fn a_kernels_buffers_and_tlas_count_together() {
+    let slot = |table, index| Slot { table, index };
+    assert_eq!(light_cs::t, slot(Table::None, 0));
+    assert_eq!(light_cs::view, slot(Table::Buffer, 0));
+    assert_eq!(light_cs::scene, slot(Table::Buffer, 1));
+    assert_eq!(light_cs::lamps, slot(Table::Buffer, 2));
+    assert_eq!(light_cs::cells, slot(Table::Buffer, 3));
+    assert_eq!(light_cs::acc, slot(Table::Buffer, 4));
+    assert_eq!(light_cs::ENTRY.sizes, Some(slot(Table::Buffer, 5)));
+    // A RawOut alone is storage too.
+    assert_eq!(flat_cs::out, slot(Table::Buffer, 0));
+    assert_eq!(flat_cs::ENTRY.sizes, Some(slot(Table::Buffer, 1)));
+}
+
+/// `threads` is the workgroup's size, an axis left out 1; a kernel returns nothing.
+#[test]
+fn a_kernel_is_compute_with_its_threads() {
+    assert_eq!(light_cs::ENTRY.stage, Stage::Compute { x: 8, y: 8, z: 1 });
+    assert_eq!(light_cs::ENTRY.threads(), Some([8, 8, 1]));
+    assert_eq!(flat_cs::ENTRY.threads(), Some([64, 1, 1]));
+    assert_eq!(quad_fs::ENTRY.threads(), None);
+    assert_eq!(light_cs::ENTRY.out, Out::Nothing);
+    let kinds: Vec<Kind> = light_cs::ENTRY.params.iter().map(|p| p.kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            Kind::Thread,
+            Kind::Uniform { size: 32 },
+            Kind::Tlas,
+            Kind::Storage { stride: 32 },
+            Kind::Storage { stride: 8 },
+            Kind::RawOut { stride: 8 },
+        ]
+    );
+}
+
+/// What `check` refuses, each next to the same shape it accepts; the macros evaluate it in a
+/// const, so each of these is a compile error with this message.
+#[test]
+fn check_refuses_what_a_stage_may_not_take() {
+    use crate::{EntryDesc, ParamDesc, check, layout};
+    fn refusal(e: EntryDesc) -> Option<String> {
+        std::panic::catch_unwind(|| check(&e)).err().map(|p| {
+            p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_default()
+        })
+    }
+    static ONE: [ParamDesc; 1] = layout(["t"], [Kind::Thread]);
+    static RAW: [ParamDesc; 1] = layout(["out"], [Kind::RawOut { stride: 4 }]);
+    static VID: [ParamDesc; 1] = layout(["vid"], [Kind::VertexIndex]);
+    let kernel = |x, y, z, params: &'static [ParamDesc], out| EntryDesc {
+        name: "k",
+        stage: Stage::Compute { x, y, z },
+        params,
+        out,
+        sizes: None,
+    };
+    let fragment = |params: &'static [ParamDesc]| EntryDesc { name: "f", stage: Stage::Fragment, params, out: Out::Color, sizes: None };
+    // Positive controls.
+    assert_eq!(refusal(kernel(32, 32, 1, &ONE, Out::Nothing)), None);
+    assert_eq!(refusal(kernel(1, 1, 1, &RAW, Out::Nothing)), None);
+    // Workgroup bounds.
+    assert!(refusal(kernel(32, 33, 1, &ONE, Out::Nothing)).unwrap().contains("at most 1024 threads"));
+    assert!(refusal(kernel(8, 0, 1, &ONE, Out::Nothing)).unwrap().contains("at least one thread"));
+    // What a kernel returns and takes.
+    assert!(refusal(kernel(8, 8, 1, &ONE, Out::Color)).unwrap().contains("a kernel returns nothing"));
+    assert!(refusal(kernel(8, 8, 1, &VID, Out::Nothing)).unwrap().contains("its identity is a Thread"));
+    // What only a kernel takes.
+    assert!(refusal(fragment(&ONE)).unwrap().contains("only a kernel"));
+    assert!(refusal(fragment(&RAW)).unwrap().contains("only a kernel"));
+    assert_eq!(refusal(fragment(&[])), None);
+    let vertex_nothing = EntryDesc { name: "v", stage: Stage::Vertex, params: &[], out: Out::Nothing, sizes: None };
+    assert!(refusal(vertex_nothing).unwrap().contains("a vertex stage returns"));
+}
+
+/// Every half but the NaNs goes to an `f32` and back to itself, and the ones on either side of
+/// it in the `f32`s round as Metal does: to the nearest, ties to even.
+#[test]
+fn halves_round_trip_and_round_to_even() {
+    for h in 0u32..=0xffff {
+        let nan = (h >> 10) & 0x1f == 0x1f && h & 0x3ff != 0;
+        let x = f16tof32(h);
+        if nan {
+            assert!(x.is_nan() && f32tof16(x) & 0x7c00 == 0x7c00 && f32tof16(x) & 0x3ff != 0, "{h:#06x}");
+        } else {
+            assert_eq!(f32tof16(x), h, "{h:#06x} through {x}");
+        }
+    }
+    let one_ulp = 2f32.powi(-10);
+    assert_eq!(f32tof16(1.0), 0x3c00);
+    assert_eq!(f32tof16(1.0 + one_ulp / 2.0), 0x3c00, "a tie to the even 1.0");
+    assert_eq!(f32tof16(1.0 + 1.5 * one_ulp), 0x3c02, "a tie to the even 1 + 2 ulp");
+    assert_eq!(f32tof16(65504.0), 0x7bff);
+    assert_eq!(f32tof16(65519.0), 0x7bff);
+    assert_eq!(f32tof16(65520.0), 0x7c00, "a tie past the largest half is infinity");
+    assert_eq!(f32tof16(2f32.powi(-24)), 0x0001);
+    assert_eq!(f32tof16(2f32.powi(-25)), 0x0000, "a tie to the even 0");
+    assert_eq!(f32tof16(1.5 * 2f32.powi(-25)), 0x0001);
+    assert_eq!(f32tof16(-0.0), 0x8000);
+    assert_eq!(f32tof16(f32::INFINITY), 0x7c00);
+    assert_eq!(f16tof32(0x1_3c00), 1.0, "the bits above 16 are ignored");
+}
+
+/// Any `f32` in a half's range comes back within half a half's ulp of itself.
+#[hegel::test]
+fn f32tof16_is_the_nearest_half(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    let x = tc.draw(gs::floats::<f32>().min_value(-65504.0).max_value(65504.0).allow_nan(false));
+    let back = f16tof32(f32tof16(x));
+    // The gap between halves at x: 2^(e - 10) for a normal, 2^-24 for a subnormal.
+    let e = x.abs().log2().floor().max(-14.0);
+    let ulp = 2f32.powf(e - 10.0);
+    assert!((back - x).abs() <= ulp / 2.0, "{x} came back as {back} (ulp {ulp})");
+}
+
+/// A Thread gives back the ids the kernel ABI made it with.
+#[test]
+fn a_kernel_thread_reads_its_ids() {
+    let t = Thread::new_for_tests(uvec3(3, 4, 0), uvec3(3, 4, 0), uvec3(0, 0, 0));
+    assert_eq!((t.global().xy(), t.local(), t.group()), (uvec2(3, 4), uvec3(3, 4, 0), uvec3(0, 0, 0)));
+}

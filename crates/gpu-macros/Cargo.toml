@@ -1,6 +1,6 @@
 [package]
 name = "gpu-macros"
-description = "#[gpu::vertex], #[gpu::fragment], #[derive(gpu::Varyings)] and #[derive(gpu::Pod)]: an entry point's binding table and a type's interface, written from its Rust signature (docs/future/gpu/shaders.md)"
+description = "#[gpu::vertex], #[gpu::fragment], #[gpu::kernel], #[derive(gpu::Varyings)] and #[derive(gpu::Pod)]: an entry point's binding table and a type's interface, written from its Rust signature (docs/future/gpu/shaders.md)"
 version = "0.0.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"

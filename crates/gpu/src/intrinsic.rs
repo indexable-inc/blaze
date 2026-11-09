@@ -11,35 +11,35 @@ use crate::vec::{IVec2, Vec2, Vec4};
 #[cold]
 #[inline(never)]
 #[track_caller]
-fn device_only(what: &str) -> ! {
-    panic!("gpu::intrinsic::{what} runs only on a GPU: the host has no fragment quad or texture to give it")
+pub(crate) fn device_only(what: &str) -> ! {
+    panic!("gpu::{what} runs only on a GPU: the host has no fragment quad, texture, device buffer or acceleration structure to give it")
 }
 
 /// How fast `v` changes across the quad, in x: Slang's `ddx`.
 #[inline(never)]
 pub fn dpdx<T: Copy>(v: T) -> T {
     let _ = v;
-    device_only("dpdx")
+    device_only("intrinsic::dpdx")
 }
 
 /// How fast `v` changes across the quad, in y: Slang's `ddy`.
 #[inline(never)]
 pub fn dpdy<T: Copy>(v: T) -> T {
     let _ = v;
-    device_only("dpdy")
+    device_only("intrinsic::dpdy")
 }
 
 /// `abs(dpdx(v)) + abs(dpdy(v))`: Slang's `fwidth`.
 #[inline(never)]
 pub fn fwidth<T: Copy>(v: T) -> T {
     let _ = v;
-    device_only("fwidth")
+    device_only("intrinsic::fwidth")
 }
 
 /// Drop this fragment: Slang's `discard`.
 #[inline(never)]
 pub fn discard() -> ! {
-    device_only("discard")
+    device_only("intrinsic::discard")
 }
 
 impl Texture2d {

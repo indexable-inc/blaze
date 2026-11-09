@@ -3,8 +3,9 @@
 //! built-in, a flat varying) is its trait constant in `gpu`, and the rules (slots, locations, what a
 //! stage may take) are `const fn`s there. So nothing here reads a name or the spelling of a type.
 //!
-//! - `#[gpu::vertex]`, `#[gpu::fragment]`: the function unchanged, and beside it a module of its
-//!   name holding `ENTRY: gpu::EntryDesc`, `PARAMS`, and one `gpu::Slot` per parameter, named like it.
+//! - `#[gpu::vertex]`, `#[gpu::fragment]`, `#[gpu::kernel(threads = ...)]`: the function
+//!   unchanged, and beside it a module of its name holding `ENTRY: gpu::EntryDesc`, `PARAMS`, and
+//!   one `gpu::Slot` per parameter, named like it.
 //! - `#[derive(gpu::Varyings)]`: `gpu::Varyings` (the fields and their locations), and `gpu::Param`
 //!   and `gpu::Output`, so the struct is what a vertex stage returns and a fragment stage takes.
 //! - `#[derive(gpu::Pod)]`: `gpu::Pod` for a `#[repr(C)]` struct whose fields are all `Pod` and
@@ -12,7 +13,10 @@
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as T2;
 use quote::{format_ident, quote};
-use syn::{Data, DeriveInput, Fields, FnArg, ItemFn, Pat, ReturnType, Type, parse_macro_input};
+use syn::{
+    Data, DeriveInput, Expr, Fields, FnArg, ItemFn, Lit, Pat, ReturnType, Token, Type, parse::Parser as _,
+    parse_macro_input, punctuated::Punctuated,
+};
 
 #[proc_macro_attribute]
 pub fn vertex(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -24,20 +28,77 @@ pub fn fragment(attr: TokenStream, item: TokenStream) -> TokenStream {
     entry(attr, item, "Fragment")
 }
 
-fn entry(attr: TokenStream, item: TokenStream, stage: &str) -> TokenStream {
-    let attr = T2::from(attr);
-    if !attr.is_empty() {
-        return syn::Error::new_spanned(attr, format!("#[gpu::{}] takes no arguments", stage.to_lowercase()))
-            .into_compile_error()
-            .into();
-    }
+/// A compute kernel: `#[gpu::kernel(threads = 64)]`, `(8, 8)` or `(4, 4, 4)`, the workgroup's
+/// size on each axis (Slang's `numthreads`); an axis left out is 1.
+#[proc_macro_attribute]
+pub fn kernel(attr: TokenStream, item: TokenStream) -> TokenStream {
     let f = parse_macro_input!(item as ItemFn);
-    described(&f, stage).unwrap_or_else(syn::Error::into_compile_error).into()
+    let what = format!("#[gpu::kernel] fn {}", f.sig.ident);
+    let stage = match threads(T2::from(attr), &what) {
+        Ok([x, y, z]) => quote! { ::gpu::Stage::Compute { x: #x, y: #y, z: #z } },
+        Err(e) => return e.into_compile_error().into(),
+    };
+    described(&f, stage, "kernel").unwrap_or_else(syn::Error::into_compile_error).into()
 }
 
-fn described(f: &ItemFn, stage: &str) -> syn::Result<T2> {
+/// The workgroup size of `threads = N | (x, y) | (x, y, z)`. Its bounds (at least one thread on an
+/// axis, at most `gpu::MAX_THREADS` in all) are `gpu::check`'s, not here.
+fn threads(attr: T2, what: &str) -> syn::Result<[u32; 3]> {
+    let usage = || format!("{what}: write `#[gpu::kernel(threads = 64)]`, `(8, 8)` or `(4, 4, 4)`");
+    let span = attr.clone(); // clone: the tokens, for an error's span
+    let args = Punctuated::<syn::MetaNameValue, Token![,]>::parse_terminated
+        .parse2(attr)
+        .map_err(|e| syn::Error::new(e.span(), usage()))?;
+    let mut found = None;
+    for arg in &args {
+        if !arg.path.is_ident("threads") {
+            return Err(syn::Error::new_spanned(&arg.path, format!("{what}: the only argument is `threads`")));
+        }
+        if found.is_some() {
+            return Err(syn::Error::new_spanned(arg, format!("{what}: `threads` is given once")));
+        }
+        found = Some(&arg.value);
+    }
+    let Some(value) = found else { return Err(syn::Error::new_spanned(span, usage())) };
+    let axis = |e: &Expr| -> syn::Result<u32> {
+        match e {
+            Expr::Lit(l) => match &l.lit {
+                Lit::Int(i) => i.base10_parse::<u32>(),
+                _ => Err(syn::Error::new_spanned(e, usage())),
+            },
+            _ => Err(syn::Error::new_spanned(e, usage())),
+        }
+    };
+    let mut size = [1u32; 3];
+    match value {
+        Expr::Tuple(t) if (1..=3).contains(&t.elems.len()) => {
+            for (i, e) in t.elems.iter().enumerate() {
+                size[i] = axis(e)?;
+            }
+        }
+        Expr::Paren(p) => size[0] = axis(&p.expr)?,
+        e @ Expr::Lit(_) => size[0] = axis(e)?,
+        e => return Err(syn::Error::new_spanned(e, usage())),
+    }
+    Ok(size)
+}
+
+fn entry(attr: TokenStream, item: TokenStream, stage: &str) -> TokenStream {
+    let attr = T2::from(attr);
+    let lower = stage.to_lowercase();
+    if !attr.is_empty() {
+        return syn::Error::new_spanned(attr, format!("#[gpu::{lower}] takes no arguments")).into_compile_error().into();
+    }
+    let f = parse_macro_input!(item as ItemFn);
+    let stage = format_ident!("{stage}");
+    described(&f, quote! { ::gpu::Stage::#stage }, &lower).unwrap_or_else(syn::Error::into_compile_error).into()
+}
+
+/// `f` and its module of descriptors, for the stage `stage` (a `gpu::Stage` expression) that
+/// `#[gpu::{attr}]` names.
+fn described(f: &ItemFn, stage: T2, attr: &str) -> syn::Result<T2> {
     let sig = &f.sig;
-    let what = format!("#[gpu::{}] fn {}", stage.to_lowercase(), sig.ident);
+    let what = format!("#[gpu::{attr}] fn {}", sig.ident);
     if !sig.generics.params.is_empty() || sig.generics.where_clause.is_some() {
         return Err(syn::Error::new_spanned(&sig.generics, format!("{what}: an entry point is not generic")));
     }
@@ -67,17 +128,22 @@ fn described(f: &ItemFn, stage: &str) -> syn::Result<T2> {
         idents.push(pi.ident.clone());
         tys.push(&pt.ty);
     }
-    let ReturnType::Type(_, ret) = &sig.output else {
-        return Err(syn::Error::new_spanned(
-            &sig.ident,
-            format!("{what}: an entry point returns its varyings (vertex) or its colour (fragment)"),
-        ));
+    let unit: Type = syn::parse_quote!(());
+    let ret: &Type = match &sig.output {
+        ReturnType::Type(_, ret) => ret,
+        // A kernel returns nothing; `gpu::check` refuses a kernel that returns something.
+        ReturnType::Default if attr == "kernel" => &unit,
+        ReturnType::Default => {
+            return Err(syn::Error::new_spanned(
+                &sig.ident,
+                format!("{what}: an entry point returns its varyings (vertex) or its colour (fragment)"),
+            ));
+        }
     };
     let n = names.len();
     let name = &sig.ident;
     let name_s = name.to_string();
     let vis = &f.vis;
-    let stage = format_ident!("{stage}");
     let slots = idents.iter().enumerate().map(|(i, id)| {
         let doc = format!("Where `{name_s}`'s parameter `{id}` is bound.");
         quote! {
@@ -100,7 +166,7 @@ fn described(f: &ItemFn, stage: &str) -> syn::Result<T2> {
             /// The entry point as its signature describes it.
             pub const ENTRY: ::gpu::EntryDesc = ::gpu::EntryDesc {
                 name: #name_s,
-                stage: ::gpu::Stage::#stage,
+                stage: #stage,
                 params: &PARAMS,
                 out: <#ret as ::gpu::Output>::OUT,
                 sizes: ::gpu::sizes_slot(&PARAMS),

@@ -172,6 +172,14 @@ vector!(
     Vec4, vec4, f32, x, y, z, w
 );
 vector!(
+    /// Slang's `uint2`.
+    UVec2, uvec2, u32, x, y
+);
+vector!(
+    /// Slang's `uint3`. 12 bytes, so never a field of a uniform, like `Vec3`.
+    UVec3, uvec3, u32, x, y, z
+);
+vector!(
     /// Slang's `uint4`.
     UVec4, uvec4, u32, x, y, z, w
 );
@@ -213,6 +221,33 @@ impl IVec2 {
     #[inline]
     pub const fn yx(self) -> IVec2 {
         ivec2(self.y, self.x)
+    }
+}
+
+impl UVec2 {
+    /// Each component converted to `f32` (Slang's `float2(v)`).
+    #[inline]
+    pub fn as_vec2(self) -> Vec2 {
+        vec2(self.x as f32, self.y as f32)
+    }
+}
+
+impl UVec3 {
+    #[inline]
+    pub const fn xy(self) -> UVec2 {
+        uvec2(self.x, self.y)
+    }
+}
+
+impl UVec4 {
+    #[inline]
+    pub const fn xy(self) -> UVec2 {
+        uvec2(self.x, self.y)
+    }
+
+    #[inline]
+    pub const fn zw(self) -> UVec2 {
+        uvec2(self.z, self.w)
     }
 }
 
