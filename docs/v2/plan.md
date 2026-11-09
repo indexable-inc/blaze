@@ -204,6 +204,15 @@ simulation test for free, and its signatures are its permissions. Every blaze cr
 it; later it is the `std` of the blaze edition, where the sandbox of section 8 is derived from
 what `main` hands out. Spec: [std](plan/design/std.md).
 
+### 14. Its own edition
+
+`edition = "blaze-2026.11"` is Rust with nine opt-in changes: handles that copy themselves, error
+unions, view types, records and named arguments, contexts (`with`), effects declared at the
+border, values that must be used up, contracts with pattern types, and compile-time reflection.
+It removes lossy `as`, `async`, ambient IO, the global allocator and `static mut`. The lint group
+`blaze::edition` gets a crate ready before the edition exists. Sections 12 and 13 are its parts.
+Spec: [edition](plan/design/edition.md).
+
 ## How the work is run
 
 The old way (70 agent windows, lanes that owned paths, request files between them, nothing
