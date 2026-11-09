@@ -25,6 +25,7 @@
 use std::{fmt, marker::PhantomData};
 
 use blaze_core::{Done, Effect, FileName};
+use blaze_mem::Frame;
 
 use crate::{
     Plant, Stopped,
@@ -88,6 +89,7 @@ pub enum FsOp {
     Remove,
     Rename,
     Close,
+    List,
 }
 
 impl FsOp {
@@ -106,6 +108,7 @@ impl FsOp {
             FsOp::Remove => "remove",
             FsOp::Rename => "rename",
             FsOp::Close => "close",
+            FsOp::List => "list",
         }
     }
 }
@@ -284,6 +287,51 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
         Dir { io: self.io.clone(), base: self.base.clone(), rights: PhantomData }
     }
 
+    /// The world it is in: for a capability made from a directory ([`crate::local::Local`]).
+    pub(crate) fn io(&self) -> &Io {
+        &self.io
+    }
+
+    /// `path` beneath this directory, as a path under the driver's root: for a capability
+    /// that names a socket beneath a directory ([`crate::local::Local`]).
+    pub(crate) fn path_beneath(&self, path: &Path) -> Path {
+        Path::of(self.beneath(path))
+    }
+
+    /// Every file beneath this directory, at any depth, sorted by name, in `frame`: each one's
+    /// path relative to this directory, and what it is. A directory that is not there yet (no
+    /// file was made under it) has none.
+    pub fn list<'a>(&self, cx: &Cx, frame: &'a Frame) -> Result<Vec<(Path, Meta), &'a Frame>, FsError> {
+        let mut found = Vec::new_in(frame);
+        match stat(&self.io, cx, FsOp::List, &self.base)? {
+            None => return Ok(found),
+            Some(Meta { dir: false, .. }) => return Err(FsError::new(FsOp::List, &self.base, FsKind::NotADirectory)),
+            Some(_) => {}
+        }
+        // clone: the effect's name, a refcount.
+        let dir = self.base.clone();
+        let listed = match call(&self.io, cx, FsOp::List, &self.base, |tag| Effect::List { dir, tag })? {
+            Done::Listed(listed) => listed,
+            done => return Err(unexpected(FsOp::List, &self.base, done)),
+        };
+        let start = self.base.as_str().len() + 1;
+        for (name, meta) in listed.iter().filter(|(_, meta)| !meta.dir) {
+            let rest = name.is_under(&self.base).then(|| name.as_str().get(start..)).flatten();
+            let beneath = rest.and_then(|rest| Path::new(rest).ok());
+            let Some(path) = beneath else {
+                // alloc: an error's message.
+                let said = format!("a listing with {name}, which is no path beneath it");
+                return Err(FsError::new(FsOp::List, &self.base, FsKind::Answered(said)));
+            };
+            found.try_reserve(1).map_err(|_| {
+                let stopped = Stopped::OutOfMemory { arena: "bstd::fs list", asked: size_of::<(Path, Meta)>() };
+                FsError::new(FsOp::List, &self.base, FsKind::Stopped(stopped))
+            })?;
+            found.push((path, Meta { len: meta.len, dir: false }));
+        }
+        Ok(found)
+    }
+
     /// The name of `path` beneath this directory.
     fn beneath(&self, path: &Path) -> FileName {
         // alloc: once per name joined.
@@ -373,6 +421,22 @@ impl Dir<ReadWrite> {
     /// sees the old contents or the new, never a part.
     pub fn write(&self, cx: &Cx, path: &Path, bytes: &[u8]) -> Result<(), FsError> {
         replace(&self.io, cx, FsOp::Replace, &self.beneath(path), bytes)
+    }
+
+    /// The planted bug of [`Plant::KvPutUnsynced`], for [`crate::kv::Kv::put`] alone: the file
+    /// at `path` emptied, then `bytes` appended and never synced, so a crash keeps any prefix
+    /// of them where [`Dir::write`] keeps the old contents or the new.
+    pub(crate) fn write_unsynced(&self, cx: &Cx, path: &Path, bytes: &[u8]) -> Result<(), FsError> {
+        let name = self.beneath(path);
+        replace(&self.io, cx, FsOp::Replace, &name, &[])?;
+        // clone: the effect's name, a refcount.
+        let file = name.clone();
+        // alloc: the effect's bytes, which blaze-core's `Effect` owns.
+        let bytes = bytes.to_vec();
+        match call(&self.io, cx, FsOp::Append, &name, |tag| Effect::Append { file, bytes, tag })? {
+            Done::Appended => Ok(()),
+            done => Err(unexpected(FsOp::Append, &name, done)),
+        }
     }
 
     /// The file at `path` gone; gone already is done.

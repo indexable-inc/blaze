@@ -26,6 +26,8 @@ blaze-format.workspace = true
 blaze-hash.workspace = true
 # The sans-IO cores only: its `tokio` feature (the drivers) stays off.
 blaze-http.workspace = true
+# A request's method, as blaze-http's h1 request writer takes it (`requests::Http::over`).
+http.workspace = true
 blaze-ids.workspace = true
 blaze-phf.workspace = true
 blaze-radix.workspace = true

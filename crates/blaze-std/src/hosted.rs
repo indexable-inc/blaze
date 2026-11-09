@@ -21,7 +21,9 @@ use crate::{
     name::{AppName, DeviceName, ModuleName, ServiceName},
     power::Battery,
     procs::{ProcId, Signal, SimProc},
+    requests::SimHttp,
     roots::Anchor,
+    streams::SimStreams,
     term::{KeyEvent, SimTerm},
     url::Url,
     user::UserFacts,
@@ -109,6 +111,10 @@ pub struct SimHost {
     pub position: Position,
     /// What a name resolves to: the simulation's name service ([`crate::resolver`]).
     pub names: Vec<(String, IpAddr)>,
+    /// The requests the host makes for the program ([`Io::http`]).
+    pub http: SimHttp,
+    /// The streams the host carries for the program ([`Io::streams`]).
+    pub streams: SimStreams,
 }
 
 impl SimHost {
@@ -141,6 +147,8 @@ impl SimHost {
             notices: Vec::new(),
             position: Position { lat_e7: 0, lon_e7: 0 },
             names: Vec::new(),
+            http: SimHttp::default(),
+            streams: SimStreams::default(),
         }
     }
 }

@@ -33,6 +33,10 @@
 //!   [`audio::AudioOut`] and [`audio::AudioIn`], and the devices of [`device`]. blaze-core has
 //!   no effect for any of them yet, so only the simulation provides them
 //!   ([`hosted::SimHost`]) and a native `Io` withholds them.
+//! - A lower capability makes the higher one (std.md, "Capabilities are layered"): a `Net`
+//!   gives a [`resolver::Resolver`] and [`requests::Http`] ([`requests::Http::over`]), a
+//!   [`fs::Dir`] gives [`kv::Kv`], [`blobs::Blobs`] and [`local::Local`]. Each of those has a
+//!   real provider. [`streams::Streams`] has a handler and the simulation only.
 //! - How a pure function's value is got is a value too: [`eval::Eval`] runs a memo point
 //!   (`#[blaze::memo]`), remembers it or hands it to a handler ([`eval`]).
 //!
@@ -90,6 +94,8 @@ pub mod args;
 pub mod audio;
 /// Driving other applications: `Automation`, narrowed to one.
 pub mod automation;
+/// An object store beneath a directory: `Blobs`, bytes under the BLAKE3 of what they are.
+pub mod blobs;
 #[expect(
     unsafe_code,
     reason = "a token cell's two views of its value and its `Sync`, each with its SAFETY"
@@ -113,6 +119,11 @@ pub mod hosted;
 pub mod io;
 /// The keychain: `Keys`, by named key, and the `Secret` a fetch gives.
 pub mod keys;
+/// A key-value store beneath a directory: `Kv`, by typed `Key`.
+pub mod kv;
+/// Local connections: an in-memory `Pair` of linear `End`s, and `Local`, the named sockets
+/// beneath a directory.
+pub mod local;
 /// The locale: time zone, language and formats, as plain data.
 pub mod locale;
 pub mod mem;
@@ -129,9 +140,15 @@ pub mod power;
 /// Other processes: `Procs`, from `Host`, narrowed to one.
 pub mod procs;
 pub mod quic;
+/// Making requests: `Http`, one type over a `Net`, the host or a handler.
+pub mod requests;
+/// Name lookup alone: `Resolver`, from a `Net`, with no connect.
+pub mod resolver;
 pub mod rng;
 /// Whom TLS trusts: `Roots`, a set of trust anchors.
 pub mod roots;
+/// Streams to an origin: `Streams`, from the host or a handler.
+pub mod streams;
 pub mod sync;
 pub mod task;
 /// The terminal as a device: `Term`, its size, raw mode, styled text and keys.
@@ -277,7 +294,9 @@ pub use crate::{
     net::HostPort,
     path::Path,
     pending::Pending,
+    requests::Http,
     task::{Scope, Task},
+    url::{Origin, Url},
 };
 pub use blaze_core::wait::Deadline;
 
@@ -358,6 +377,13 @@ pub(crate) enum Plant {
     /// A narrowing of the capabilities on `narrow::Allowed` (`Keys::only`, `Opener::only`, ...)
     /// and of `Location` and `Clipboard` gives what was asked for, reached before or not.
     OnlyWidens,
+    /// `Kv::put` empties the key's file and appends the value without a sync, where it should
+    /// replace it durably and all at once.
+    KvPutUnsynced,
+    /// A write to a local pair behind bytes not yet read says it wrote its chunk and drops it.
+    LocalDropsChunk,
+    /// `Http::only` hands back the capability it was given.
+    HttpOnlyIgnored,
     /// A tuple's key leaves its last element out: two calls that differ only there share one.
     KeyIgnoresLast,
     /// `Eval::memo` never drops a generation: its entries pass its limit.

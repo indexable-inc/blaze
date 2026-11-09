@@ -79,6 +79,8 @@ fn asked(io: &Io, name: &str) -> Option<(bool, Result<(), Missing>)> {
         "serial" => (io.serial().is_some(), need(io.need_serial())),
         "clipboard" => (io.clipboard().is_some(), need(io.need_clipboard())),
         "notify" => (io.notify().is_some(), need(io.need_notify())),
+        "http" => (io.http().is_some(), need(io.need_http())),
+        "streams" => (io.streams().is_some(), need(io.need_streams())),
         _ => return None,
     })
 }

@@ -28,6 +28,7 @@ use crate::{
     mem::Bytes,
     path::Path,
     pending::{self, Pending},
+    resolver::Resolver,
 };
 
 /// Where to connect or listen.
@@ -322,7 +323,7 @@ macro_rules! host {
 
 /// Which addresses a [`Net`] may reach one way.
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: a refcount or a copy
-enum Allowed {
+pub(crate) enum Allowed {
     Any,
     Only(Addr),
     Nothing,
@@ -338,7 +339,7 @@ impl Allowed {
         }
     }
 
-    fn allows(&self, at: &Addr) -> bool {
+    pub(crate) fn allows(&self, at: &Addr) -> bool {
         match self {
             Allowed::Any => true,
             Allowed::Only(only) => only == at,
@@ -359,6 +360,8 @@ pub enum NetOp {
     Close,
     /// [`Conn::finish`].
     Finish,
+    /// [`crate::resolver::Resolver::lookup`].
+    Lookup,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: an error
@@ -367,6 +370,8 @@ pub enum NetKind {
     NotAllowed,
     /// The host is a DNS name, and blaze-core has no effect that looks one up yet.
     NoLookup,
+    /// The name service has no such name.
+    NoSuchName,
     /// [`Listener::close`] took more than [`CLOSE_MOST`] connections made while it closed,
     /// and stopped waiting for the listen's end.
     Unending { accepted: usize },
@@ -397,6 +402,7 @@ impl fmt::Display for NetError {
                 "bstd::net {op:?} to {addr}: its host is a name, and blaze-core has no effect that \
                  looks a name up yet: give its IP address"
             ),
+            NetKind::NoSuchName => write!(f, "bstd::net {op:?} of {addr}: the name service has no such name"),
             NetKind::Unending { accepted } => write!(
                 f,
                 "bstd::net {op:?} to {addr}: {accepted} connections were made while it closed, more \
@@ -413,7 +419,7 @@ impl fmt::Display for NetError {
 
 impl std::error::Error for NetError {}
 
-fn error(op: NetOp, addr: &Addr, kind: NetKind) -> NetError {
+pub(crate) fn error(op: NetOp, addr: &Addr, kind: NetKind) -> NetError {
     // clone: an error's address.
     NetError { op, addr: addr.clone(), kind }
 }
@@ -439,6 +445,18 @@ pub struct Net {
 impl Net {
     pub(crate) fn new(io: Io) -> Net {
         Net { io, connect: Allowed::Any, listen: Allowed::Any }
+    }
+
+    /// The world it is in.
+    pub(crate) fn io(&self) -> &Io {
+        &self.io
+    }
+
+    /// Name lookup alone, for the hosts this may connect to: for code that should resolve and
+    /// not connect (docs/v2/plan/design/std.md, "The rest of the set", `Resolver`).
+    pub fn resolver(&self) -> Resolver {
+        // clone: authority held, narrowed: a refcount or a copy.
+        Resolver::new(self.io.clone(), self.connect.clone())
     }
 
     /// Connects only to `at`, of what this connects to, and listens nowhere.

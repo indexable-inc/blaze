@@ -28,7 +28,8 @@
 //! **Capabilities with no effect yet.** A capability is a type whenever it is authority; its
 //! real provider exists only where a blaze-core effect supports it. The terminal, the
 //! keychain, trust anchors, the locale, the user, other processes, executable memory, windows,
-//! automation, the opener, power, sound and the devices have none, so a native `Io` withholds
+//! automation, the opener, power, sound, the devices, and requests and streams made by the
+//! host have none, so a native `Io` withholds
 //! them ([`Offers::NATIVE`]) and a simulated one answers them from its
 //! [`SimHost`] ([`Io::script`]). Nothing stands in for a missing provider.
 
@@ -62,8 +63,10 @@ use crate::{
     net::Net,
     opener::Opener,
     power::Power,
+    requests::Http,
     rng::Rng,
     roots::Roots,
+    streams::Streams,
     term::Term,
     trace::{Record, RecordKind, Trace},
     user::User,
@@ -282,6 +285,10 @@ offers! {
     serial,
     clipboard,
     notify,
+    /// Requests the host makes for the program ([`Io::http`]).
+    http,
+    /// Streams the host carries for the program ([`Io::streams`]).
+    streams,
 }
 
 impl Offers {
@@ -762,6 +769,27 @@ impl Io {
 
     pub fn need_notify(&self) -> Result<Notify, Missing> {
         self.notify().ok_or(Missing { capability: "notify" })
+    }
+
+    /// Requests the host makes for the program, if it offers that (a wasm worker's `fetch`;
+    /// today the simulation's routes alone). A program that has a `Net` makes its own with
+    /// [`Http::over`].
+    pub fn http(&self) -> Option<Http> {
+        self.offered(|it| it.http).then(|| Http::host(self.clone()))
+    }
+
+    pub fn need_http(&self) -> Result<Http, Missing> {
+        self.http().ok_or(Missing { capability: "http" })
+    }
+
+    /// Streams the host carries for the program, if it offers that (a browser's WebTransport;
+    /// today the simulation's alone).
+    pub fn streams(&self) -> Option<Streams> {
+        self.offered(|it| it.streams).then(|| Streams::host(self.clone()))
+    }
+
+    pub fn need_streams(&self) -> Result<Streams, Missing> {
+        self.streams().ok_or(Missing { capability: "streams" })
     }
 
     /// `f` on the simulated host, for a test to script what its devices will say and read
