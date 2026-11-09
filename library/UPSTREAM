@@ -63,3 +63,15 @@ rust-src https://static.rust-lang.org/dist/2026-10-27/rust-src-nightly.tar.xz a9
 #   `#![blaze::handles]` finds the handles it copies where a crate would move one that it uses
 #   again (docs/v2/plan/design/edition.md, change 1). A lang item changes nothing a crate
 #   without the attribute builds.
+# - core/src/option.rs and core/src/result.rs: `#[blaze::linear]` on the type parameters of
+#   the impls of `Option` and `Result` that admit a linear payload (blaze's linear types,
+#   docs/v2/plan/design/linear.md, rule 4). The inherent `impl<T> Option<T>` and
+#   `impl<T, E> Result<T, E>` are each written as several impls, no method moved or changed,
+#   so that the methods that hand the payload on or panic sit in marked ones (each under a
+#   `// blaze:` line): `Option`'s `is_some`, `is_none`, `as_ref`, `as_mut`, `expect`, `unwrap`,
+#   `map`, `ok_or`, `ok_or_else`, `and_then` (`T`); `Result`'s `is_ok`, `is_err`, `as_ref`,
+#   `as_mut`, `map`, `map_err`, `and_then`, `or_else`, `unwrap_or_else` (`T` and `E`) and `ok`,
+#   `expect`, `unwrap` (`T`). The impls of `Try` and `FromResidual` for both mark `T`, which
+#   is what `?` goes through. Every other method stays in an impl with no mark, and a method
+#   moves into a marked one only if its body, checked with the parameter linear, drops no
+#   value of it. The attribute is inert: nothing that names no linear type changes.

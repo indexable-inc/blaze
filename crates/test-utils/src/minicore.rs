@@ -1166,7 +1166,9 @@ pub mod ops {
             type TryType = ControlFlow<B, C>;
         }
         // region:option
-        impl<T> Try for Option<T> {
+        // `#[blaze::linear] T` here and below: as library/core marks the impls of `Option`
+        // and `Result` that admit a linear payload (docs/v2/plan/design/linear.md, rule 4).
+        impl<#[blaze::linear] T> Try for Option<T> {
             type Output = T;
             type Residual = Option<Infallible>;
             fn from_output(output: Self::Output) -> Self {
@@ -1180,7 +1182,7 @@ pub mod ops {
             }
         }
 
-        impl<T> FromResidual for Option<T> {
+        impl<#[blaze::linear] T> FromResidual for Option<T> {
             fn from_residual(x: Option<Infallible>) -> Self {
                 match x {
                     None => None,
@@ -1197,7 +1199,7 @@ pub mod ops {
         // region:from
         use crate::convert::From;
 
-        impl<T, E> Try for Result<T, E> {
+        impl<#[blaze::linear] T, E> Try for Result<T, E> {
             type Output = T;
             type Residual = Result<Infallible, E>;
 
@@ -1213,7 +1215,9 @@ pub mod ops {
             }
         }
 
-        impl<T, E, F: From<E>> FromResidual<Result<Infallible, E>> for Result<T, F> {
+        impl<#[blaze::linear] T, E, F: From<E>> FromResidual<Result<Infallible, E>>
+            for Result<T, F>
+        {
             fn from_residual(residual: Result<Infallible, E>) -> Self {
                 match residual {
                     Err(e) => Err(F::from(e)),
@@ -1754,7 +1758,8 @@ pub mod option {
     impl<T: Copy> Copy for Option<T> {}
     // endregion:copy
 
-    impl<T> Option<T> {
+    // The methods that hand a payload on or panic, which admit a linear one.
+    impl<#[blaze::linear] T> Option<T> {
         pub const fn is_some(&self) -> bool {
             match self {
                 Some(_) => true,
@@ -1779,7 +1784,17 @@ pub mod option {
                 None => None,
             }
         }
+        // region:result
+        pub const fn ok_or<E>(self, err: E) -> Result<T, E> {
+            match self {
+                Some(v) => Ok(v),
+                None => Err(err),
+            }
+        }
+        // endregion:result
+    }
 
+    impl<T> Option<T> {
         pub fn and<U>(self, _optb: Option<U>) -> Option<U> {
             loop {}
         }
@@ -1789,14 +1804,6 @@ pub mod option {
                 None => default,
             }
         }
-        // region:result
-        pub const fn ok_or<E>(self, err: E) -> Result<T, E> {
-            match self {
-                Some(v) => Ok(v),
-                None => Err(err),
-            }
-        }
-        // endregion:result
         // region:fn
         pub fn and_then<U, F>(self, _f: F) -> Option<U>
         where
@@ -1851,19 +1858,21 @@ pub mod result {
             }
         }
 
-        // region:fmt
-        #[track_caller]
-        pub fn unwrap(self) -> T
+        // region:default
+        pub fn unwrap_or_default(self) -> T
         where
-            E: crate::fmt::Debug,
+            T: crate::default::Default,
         {
             match self {
                 Ok(t) => t,
-                Err(_) => panic!("called `Result::unwrap()` on an `Err` value"),
+                Err(_) => T::default(),
             }
         }
-        // endregion:fmt
+        // endregion:default
+    }
 
+    // The methods that hand both payloads on, which admit a linear one of either.
+    impl<#[blaze::linear] T, #[blaze::linear] E> Result<T, E> {
         // region:fn
         pub const fn or_else<F, O>(self, op: O) -> Result<T, F>
         where
@@ -1892,6 +1901,23 @@ pub mod result {
             }
         }
         // endregion:fn
+    }
+
+    // The methods that hand the `Ok` payload on and drop or print the `Err` one, which admit a
+    // linear `Ok` payload only.
+    impl<#[blaze::linear] T, E> Result<T, E> {
+        // region:fmt
+        #[track_caller]
+        pub fn unwrap(self) -> T
+        where
+            E: crate::fmt::Debug,
+        {
+            match self {
+                Ok(t) => t,
+                Err(_) => panic!("called `Result::unwrap()` on an `Err` value"),
+            }
+        }
+        // endregion:fmt
 
         // region:option
         pub fn ok(self) -> crate::option::Option<T> {
@@ -1901,18 +1927,6 @@ pub mod result {
             }
         }
         // endregion:option
-
-        // region:default
-        pub fn unwrap_or_default(self) -> T
-        where
-            T: crate::default::Default,
-        {
-            match self {
-                Ok(t) => t,
-                Err(_) => T::default(),
-            }
-        }
-        // endregion:default
     }
 }
 // endregion:result
