@@ -64,6 +64,7 @@ pub fn all() -> Vec<(&'static str, Vec<u8>, Value)> {
         one("up-detach", &Up::Detach),
         one("up-rename", &Up::Req(Request::Rename { id: 7, title: "tidy the build".into() })),
         one("up-set-model", &Up::Req(Request::SetModel { id: 7, model: Some("haiku".into()), effort: Some("xhigh".into()) })),
+        one("up-aside", &Up::Req(Request::Aside { id: 7, text: "what does flecs#2389 say?".into() })),
         one("down-hello", &Down::Hello { schema: crate::SCHEMA, pid: 4242 }),
         one(
             "down-sessions",
@@ -85,6 +86,7 @@ pub fn all() -> Vec<(&'static str, Vec<u8>, Value)> {
         ),
         one("down-attached", &Down::Reply(Reply::Attached { info })),
         one("down-ok", &Down::Reply(Reply::Ok)),
+        one("down-aside", &Down::Reply(Reply::Aside { text: "A token named like its entity **does not resolve**.".into() })),
         one("down-record", &Down::Reply(Reply::Record(json!({"id": "r12", "exit_code": 0, "signal": null})))),
         one("down-error", &Down::Error { error: "no session 99".into() }),
         one("down-changed", &Down::Changed { generation: 70_000 }),

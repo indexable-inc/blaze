@@ -45,14 +45,16 @@ hn {
     icon : ui.Symbol {}
   }
 
-  // The pane: its toolbar (back, forward, reload, the address, extensions, close) under the title-bar strip, the loading
-  // hairline, then the page filling the rest. `menu` holds the extensions menu while it is open, floating under its
+  // The pane: the page filling it under the title-bar strip and the loading hairline. Its toolbar (back, forward, reload,
+  // the address, extensions, close) takes no room until it is wanted (src/app/browser.rs: while the address is edited,
+  // cmd+L, or the extensions menu is open), so a link opened here reads as the page alone. `menu` holds the extensions menu while it is open, floating under its
   // button.
   prefab WebPane : ui.Column {
     Size: {w: {kind: Fixed, value: $web_pane_w, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
     Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
     SafeAreaPadding: {l: false, r: false, t: true, b: false}
     bar : ui.Row {
+      Clip
       Flex: {axis: Row, gap: 2, align: Center, justify: Start, wrap: false}
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $web_toolbar_h, min: 0, max: 0}}
       Padding: {l: 8, r: 8, t: 0, b: 0}

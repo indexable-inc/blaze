@@ -58,6 +58,8 @@ export type Request =
   | { op: "set_model"; id: number; model?: string | null; effort?: string | null }
   /** Name a session (its `label`); an empty title takes the name away. */
   | { op: "rename"; id: number; title: string }
+  /** Ask chat `id` aside: `text` as one turn on a discarded fork of its conversation, which never has it. */
+  | { op: "aside"; id: number; text: string }
   | { op: "screen" | "kill" | "forget"; id: number }
   | { op: "resize"; id: number; cols: number; rows: number }
   | ({ op: "repl_task" } & Record<string, unknown>)
@@ -98,6 +100,8 @@ export type Reply =
   | { reply: "attached"; info: SessionInfo }
   /** `browser`: the harness browser host's pid, its socket for the kernel (cdp.ts) and the Mach service the app looks up. */
   | { reply: "browser"; pid: number; sock: string; service: string }
+  /** `aside`: the fork's answer, its last words (markdown). */
+  | { reply: "aside"; text: string }
   | ({ reply: "record" } & Record<string, unknown>);
 
 /** The daemon's message. */

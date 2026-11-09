@@ -743,6 +743,61 @@ impl Painter {
                         }
                     }
                 }
+                // Plates under words set from markdown, drawn before the words so the words lie on them (a plate drawn after
+                // would hide its words, as soon as its fill is opaque): code spans on their chip, a plate per line they
+                // cover; inline components on `ui.inline.rest`'s plate (clear), the one the pointer is over (InlineHot) on
+                // the hover or pressed plate with its label underlined. Their icons and marks are drawn over, below.
+                if let Some(m) = md {
+                    let size = set_of(&style).size;
+                    let inset = size * crate::markdown::CHIP_INSET_EM;
+                    let units: Vec<u16> = shown_md.as_ref().map_or_else(Vec::new, |m| m.text.encode_utf16().collect());
+                    let chip = rgba(if dark { m.chip_dark } else { m.chip_light });
+                    let radius = if m.chip_radius > 0.0 { m.chip_radius } else { crate::markdown::CHIP_RADIUS };
+                    let code_shape = Shape { radius, n: 4.0, border: 0.0, feather: 0.0 };
+                    // A stretch's plate, a rect per line it covers: its carets are half the room the typesetter left
+                    // (chip_room) outside its glyphs, and the plate reaches `inset` past the glyphs either side, into that
+                    // room.
+                    let mut plate = |d: &mut Draw, lo: usize, hi: usize, fill: [f32; 4], shape: Shape| {
+                        let (before, after) = crate::markdown::chip_room(&units, lo, hi, size);
+                        let rects = spans_of(&lay, lo, hi);
+                        let last = rects.len().saturating_sub(1);
+                        for (k, r) in rects.into_iter().enumerate() {
+                            let x0 = r[0] + if k == 0 { before * 0.5 } else { 0.0 } - inset;
+                            let x1 = r[0] + r[2] - if k == last { after * 0.5 } else { 0.0 } + inset;
+                            let rect = [laid.x + x0, laid.y + r[1] + 1.0, x1 - x0, r[3] - 2.0];
+                            d.panel(panel_from(fill, [0.0; 4], shape, rect, p.alpha));
+                        }
+                    };
+                    for &(lo, hi) in shown_md.as_ref().map_or(&[][..], |m| m.code.as_slice()) {
+                        plate(d, lo, hi, chip, code_shape);
+                    }
+                    let tags = shown_md.as_ref().map_or(&[][..], |m| m.tags.as_slice());
+                    if !tags.is_empty() {
+                        let w = e.world();
+                        let (_, ref_shape) = crate::inline::look(w, dark);
+                        let hot = e.try_cloned::<&harness_native_ui_text_api::InlineHot>();
+                        let rest = crate::inline::rest(w, dark);
+                        for (n, t) in tags.iter().enumerate() {
+                            let here = hot.filter(|h| h.tag as usize == n);
+                            let fill = here.map_or(rest, |h| crate::inline::hot(w, h.pressed, dark));
+                            if fill[3] > 0.0 {
+                                plate(d, t.start, t.end, fill, ref_shape);
+                            }
+                            if here.is_some() {
+                                // The label's underline: a hairline under its words, past the icon's hole, before its host
+                                // and its mark.
+                                let (label_lo, label_hi) = t.label();
+                                let under = crate::inline::underline(w, dark);
+                                for r in spans_of(&lay, label_lo, label_hi) {
+                                    let y = laid.y + r[1] + r[3] - 3.0;
+                                    let rect = [laid.x + r[0], (y * sc).round() / sc, r[2], 1.0 / sc.max(1.0)];
+                                    let flat = Shape { radius: 0.0, n: 4.0, border: 0.0, feather: 0.0 };
+                                    d.panel(panel_from(under, [0.0; 4], flat, rect, p.alpha));
+                                }
+                            }
+                        }
+                    }
+                }
                 let pen = emit_glyphs(
                     d,
                     &self.fonts,
@@ -765,29 +820,9 @@ impl Painter {
                         pulse.light_glyph(g);
                     }
                 }
-                if let Some(m) = md {
-                    // Code spans on a chip, a plate per line they cover.
-                    let chip = rgba(if dark { m.chip_dark } else { m.chip_light });
-                    let radius = if m.chip_radius > 0.0 { m.chip_radius } else { crate::markdown::CHIP_RADIUS };
-                    let shape = Shape { radius, n: 4.0, border: 0.0, feather: 0.0 };
+                if md.is_some() {
                     let size = set_of(&style).size;
-                    let inset = size * crate::markdown::CHIP_INSET_EM;
-                    let (units, code): (Vec<u16>, &[(usize, usize)]) = shown_md
-                        .as_ref()
-                        .map_or((Vec::new(), &[][..]), |m| (m.text.encode_utf16().collect(), m.code.as_slice()));
-                    for &(lo, hi) in code {
-                        // The span's carets are half the room the typesetter left (chip_room) outside its glyphs; the
-                        // plate reaches `inset` past the glyphs either side, into that room.
-                        let (before, after) = crate::markdown::chip_room(&units, lo, hi, size);
-                        let rects = spans_of(&lay, lo, hi);
-                        let last = rects.len().saturating_sub(1);
-                        for (k, r) in rects.into_iter().enumerate() {
-                            let x0 = r[0] + if k == 0 { before * 0.5 } else { 0.0 } - inset;
-                            let x1 = r[0] + r[2] - if k == last { after * 0.5 } else { 0.0 } + inset;
-                            let rect = [laid.x + x0, laid.y + r[1] + 1.0, x1 - x0, r[3] - 2.0];
-                            d.panel(panel_from(chip, [0.0; 4], shape, rect, p.alpha));
-                        }
-                    }
+                    let units: Vec<u16> = shown_md.as_ref().map_or_else(Vec::new, |m| m.text.encode_utf16().collect());
                     // Struck-through words: a hairline over the glyphs of each line they cover, `ui.strike`'s look.
                     let struck = shown_md.as_ref().map_or(&[][..], |m| m.strike.as_slice());
                     if !struck.is_empty() {
@@ -808,47 +843,20 @@ impl Painter {
                             }
                         }
                     }
-                    // Inline components: at rest on `ui.inline.rest`'s plate (clear: the icon says what it is, as GitHub's
-                    // and Linear's references read), from the icon's hole to the end of the label (its host, its mark);
-                    // the icon drawn in the hole in its ink (the look's, quiet, or its live state's: a merged pull
-                    // request's purple), or its live picture there (a link's favicon); the mark in its own ink. The one
-                    // the pointer is over (InlineHot) on the hover or pressed plate, its label underlined.
+                    // Inline components, over their plates (drawn under the words, above): the icon drawn in its hole in its
+                    // ink (the look's, quiet, or its live state's: a merged pull request's purple), or its live picture
+                    // there (a link's favicon); the mark in its own ink.
                     let tags = shown_md.as_ref().map_or(&[][..], |m| m.tags.as_slice());
                     if !tags.is_empty() {
                         let w = e.world();
-                        let (_, ref_shape) = crate::inline::look(w, dark);
-                        let hot = e.try_cloned::<&harness_native_ui_text_api::InlineHot>();
                         let icon_style = TextStyle {
                             size: size * crate::markdown::REF_ICON_SIZE_EM,
                             line: set_of(&style).line,
                             ..TextStyle::default()
                         };
                         let mark_style = TextStyle { size: size * crate::markdown::MARK_SIZE_EM, ..icon_style };
-                        let rest = crate::inline::rest(w, dark);
-                        for (n, t) in tags.iter().enumerate() {
-                            let here = hot.filter(|h| h.tag as usize == n);
-                            let plate = here.map_or(rest, |h| crate::inline::hot(w, h.pressed, dark));
-                            let (before, after) = crate::markdown::chip_room(&units, t.start, t.end, size);
-                            let rects = spans_of(&lay, t.start, t.end);
-                            let last = rects.len().saturating_sub(1);
-                            for (k, r) in rects.iter().enumerate().filter(|_| plate[3] > 0.0) {
-                                let x0 = r[0] + if k == 0 { before * 0.5 } else { 0.0 } - inset;
-                                let x1 = r[0] + r[2] - if k == last { after * 0.5 } else { 0.0 } + inset;
-                                let rect = [laid.x + x0, laid.y + r[1] + 1.0, x1 - x0, r[3] - 2.0];
-                                d.panel(panel_from(plate, [0.0; 4], ref_shape, rect, p.alpha));
-                            }
-                            if here.is_some() {
-                                // The label's underline: a hairline under its words, past the icon's hole, before its host
-                                // and its mark.
-                                let (label_lo, label_hi) = t.label();
-                                let under = crate::inline::underline(w, dark);
-                                for r in spans_of(&lay, label_lo, label_hi) {
-                                    let y = laid.y + r[1] + r[3] - 3.0;
-                                    let rect = [laid.x + r[0], (y * sc).round() / sc, r[2], 1.0 / sc.max(1.0)];
-                                    let flat = Shape { radius: 0.0, n: 4.0, border: 0.0, feather: 0.0 };
-                                    d.panel(panel_from(under, [0.0; 4], flat, rect, p.alpha));
-                                }
-                            }
+                        for t in tags {
+                            let (before, _) = crate::markdown::chip_room(&units, t.start, t.end, size);
                             // The hole is REF_ICON_EM wide: the icon at its start, the rest the gap before the label.
                             let Some(hole) = spans_of(&lay, t.start, t.start + 1).into_iter().next() else { continue };
                             if let Some(pic) = crate::inline::picture(w, &t.tag) {

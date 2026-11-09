@@ -1181,9 +1181,33 @@ impl App {
         self.chat_cut()
     }
 
-    /// Files pasted (a Finder copy: their paths): into a terminal as words its shell reads back as those paths (quoted
-    /// where they need it), anywhere else as the paths, a space apart.
+    /// Pictures pasted (Command-V of a screenshot, a browser's Copy Image, several copied at once), as PNG bytes: each
+    /// saved under `$HARNESS_HOME/pastes`, then all attached to the focused chat's message, else their paths pasted
+    /// ([`Self::paste_paths`]).
+    pub fn paste_pictures(&mut self, pngs: &[Vec<u8>]) {
+        let dir = crate::link::home().join("pastes");
+        let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+        let mut paths = Vec::new(); // alloc: a paste's few pictures
+        for (i, png) in pngs.iter().enumerate() {
+            let path = dir.join(format!("{ms}-{i}.png"));
+            if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, png)) {
+                eprintln!("harness-native: paste: saving the picture to {}: {e}", path.display());
+                continue;
+            }
+            paths.push(path.to_string_lossy().into_owned());
+        }
+        if !paths.is_empty() && !self.chat_attach(&paths) {
+            self.paste_paths(&paths);
+        }
+    }
+
+    /// Files pasted (a Finder copy: their paths): pictures into a chat's message ([`Self::chat_attach`]); else into a
+    /// terminal as words its shell reads back as those paths (quoted where they need it), anywhere else as the paths, a
+    /// space apart.
     pub fn paste_paths(&mut self, paths: &[String]) {
+        if self.chat_attach(paths) {
+            return;
+        }
         let terminal = self.palette.is_none() && !self.archive_focused() && !self.chat_focused() && !self.renaming();
         let words: Vec<String> = paths.iter().map(|p| if terminal { term::shell_quote(p) } else { p.clone() }).collect();
         self.paste(&words.join(" "));

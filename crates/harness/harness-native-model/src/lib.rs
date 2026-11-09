@@ -9,8 +9,9 @@
 //!   pipeline stages has one child per stage: [`StageNo`], `(Kind, Stage)`, its text, its own status, exit code and times.
 //! - A run goes under its session, else under the session that owns its REPL (the daemon's `owner`), else on the device.
 //!   One whose session or owner the daemon no longer lists is an [`Orphan`].
-//! - [`Expanded`] on a session or run shows all its children in the tree; without it (every node starts so) only the
-//!   running ones (and the selected one) show, so finished runs fold away on their own.
+//! - A session or run shows its live children in the tree (every node starts so): running, with something running
+//!   under them, ended less than [`Linger`] ago (their done mark shows), or selected; so what finished leaves on its own
+//!   for the Archive. [`Folded`] on one (its chevron closed) shows none of them but the selected one.
 //! - [`Archived`] on an object takes it out of the tree and into the Archive pane. The `ArchiveRule` system sets it from
 //!   tags and relations alone: [`Closed`] (cmd+W) always, [`Pinned`] never, else a finished object whose parent session
 //!   ended or left the tree, an [`Orphan`] run, a finished run on the device [`ArchiveAfter`] it ended, and a finished
@@ -145,9 +146,10 @@ pub struct Ended {
     pub ms: u64,
 }
 
-/// On a session or run: the tree shows all its children. Without it only the running ones and the selected one show.
+/// On a session or run: its chevron is closed and the tree shows none of its children but the selected one. Without it
+/// (every node starts so) its live children show ([`rows`]).
 #[derive(Component, Clone, Copy, Debug, Default)]
-pub struct Expanded;
+pub struct Folded;
 
 /// On an object: the user killed it with cmd+W (or the palette's or menu's Kill). It leaves the tree for the sidebar's
 /// Archive, where it stays selectable; an object that ended on its own stays in the tree.
@@ -213,6 +215,18 @@ pub struct ArchiveAfter {
 impl ArchiveAfter {
     /// Ten minutes for a run, a week for a past session.
     pub const DEFAULT: Self = Self { ms: 600_000, past_ms: 7 * 24 * 3_600_000 };
+}
+
+/// Singleton: how long a finished child stays among a folded node's rows after it ended (the scene's `tree_linger`
+/// token), so its done mark shows before it folds away.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct Linger {
+    pub ms: u64,
+}
+
+impl Linger {
+    /// Five seconds.
+    pub const DEFAULT: Self = Self { ms: 5_000 };
 }
 
 /// Singleton: the older history's paging: a page asked for and not in yet, and whether the daemon has no older runs.
@@ -393,7 +407,7 @@ pub fn register(world: &World) {
     world.component::<Run>().writable();
     world.component::<StageNo>().writable();
     world.component::<Ended>().writable();
-    world.component::<Expanded>();
+    world.component::<Folded>();
     world.component::<Archived>();
     world.component::<Closed>();
     world.component::<Pinned>();
@@ -405,8 +419,10 @@ pub fn register(world: &World) {
     world.component::<Paged>();
     world.component::<ArchiveView>();
     world.component::<ArchiveAfter>().writable();
+    world.component::<Linger>().writable();
     world.component::<History>().writable();
     world.set(ArchiveAfter::DEFAULT);
+    world.set(Linger::DEFAULT);
     world.set(History::default());
     world.component::<Selected>().add_trait::<flecs::Exclusive>().on_delete_target(flecs::Cleanup::Remove);
     world.component::<Shows>().add_trait::<flecs::Exclusive>().on_delete_target(flecs::Cleanup::Remove);
@@ -991,6 +1007,67 @@ pub fn tree(world: WorldRef<'_>) -> Vec<(u64, usize)> {
     out
 }
 
+/// The tree's walk ([`rows`]): what is selected, which status is running and since when a finished child lingers.
+struct Walk<'a> {
+    w: WorldRef<'a>,
+    sel: Option<u64>,
+    sel_parent: Option<u64>,
+    running: u64,
+    /// Ended after this (ms since the epoch): still lingering.
+    since: u64,
+    out: Vec<Row>,
+}
+impl<'a> Walk<'a> {
+    fn new(world: WorldRef<'a>) -> Self {
+        let sel = selected(world);
+        Walk {
+            w: world,
+            sel: sel.map(|s| *s.id()),
+            sel_parent: sel.and_then(|s| s.parent()).map(|p| *p.id()),
+            running: *world.component_id::<Running>(),
+            since: now_ms().saturating_sub(linger(world)),
+            out: Vec::new(),
+        }
+    }
+    fn running(&self, c: EntityView<'_>) -> bool {
+        c.target(Status::id(), 0).is_some_and(|t| *t.id() == self.running)
+    }
+    /// Running, or something under it is.
+    fn active(&self, c: EntityView<'_>) -> bool {
+        self.running(c) || live_kids(c).into_iter().any(|k| self.active(k))
+    }
+    fn live(&self, c: EntityView<'_>) -> bool {
+        let id = *c.id();
+        self.sel == Some(id)
+            || self.sel_parent == Some(id)
+            || self.active(c)
+            || c.try_cloned::<&Ended>().is_some_and(|t| t.ms > self.since)
+    }
+    fn walk(&mut self, e: EntityView<'_>, depth: usize) {
+        let all = depth == 0;
+        let folded = e.has(Folded::id());
+        let mut kids: Vec<(u8, u64, u64)> = Vec::new();
+        for c in live_kids(e) {
+            let id = Some(*c.id());
+            let shown = if folded { self.sel == id || self.sel_parent == id } else { all || self.live(c) };
+            if !shown {
+                continue;
+            }
+            let key = match c.try_cloned::<&StageNo>() {
+                Some(s) => u64::from(s.k),
+                None => c.try_cloned::<&Created>().map_or(0, |c| c.ms),
+            };
+            // A sub-agent that is up but idle ([`sleeping`]) goes after the ones at work.
+            kids.push((u8::from(depth > 0 && sleeping(c, self.running)), key, *c.id()));
+        }
+        kids.sort_unstable();
+        for (_, _, k) in kids {
+            self.out.push(Row { e: k, depth });
+            self.walk(self.w.entity_from_id(k), depth + 1);
+        }
+    }
+}
+
 /// A row of the sidebar's tree: a session, run or stage at its depth under the device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Row {
@@ -998,58 +1075,44 @@ pub struct Row {
     pub depth: usize,
 }
 
-/// The sidebar's rows: sessions, their runs and stages in tree order (siblings by start, stages by index). The device's
-/// sessions always show; under a session or run, an [`Expanded`] one shows all its children and any other only those
-/// still running and the selected one (and its parent), so what finished folds away and the tree lists what is live.
+/// The sidebar's rows: sessions, their runs and stages in tree order (siblings by start, stages by index, a sub-agent
+/// that sleeps after those at work). The device's
+/// sessions always show; under a session or run only the live ones: running, with something running under them, ended
+/// less than [`Linger`] ago, and the selected one (and its parent); under a [`Folded`] one only the selected one. So what
+/// finished shows its mark a moment, then folds away, and the tree lists what is live.
 #[must_use]
 pub fn rows(world: WorldRef<'_>) -> Vec<Row> {
-    struct Walk<'a> {
-        w: WorldRef<'a>,
-        sel: Option<u64>,
-        sel_parent: Option<u64>,
-        running: u64,
-        out: Vec<Row>,
-    }
-    impl Walk<'_> {
-        fn live(&self, c: EntityView<'_>) -> bool {
-            let id = *c.id();
-            self.sel == Some(id)
-                || self.sel_parent == Some(id)
-                || c.target(Status::id(), 0).is_some_and(|t| *t.id() == self.running)
-        }
-        fn walk(&mut self, e: EntityView<'_>, depth: usize) {
-            let all = depth == 0 || e.has(Expanded::id());
-            let mut kids: Vec<(u64, u64)> = Vec::new();
-            for c in live_kids(e) {
-                if !all && !self.live(c) {
-                    continue;
-                }
-                let key = match c.try_cloned::<&StageNo>() {
-                    Some(s) => u64::from(s.k),
-                    None => c.try_cloned::<&Created>().map_or(0, |c| c.ms),
-                };
-                kids.push((key, *c.id()));
-            }
-            kids.sort_unstable();
-            for (_, k) in kids {
-                self.out.push(Row { e: k, depth });
-                self.walk(self.w.entity_from_id(k), depth + 1);
-            }
-        }
-    }
-    let sel = selected(world);
-    let mut walk = Walk {
-        w: world,
-        sel: sel.map(|s| *s.id()),
-        sel_parent: sel.and_then(|s| s.parent()).map(|p| *p.id()),
-        running: *world.component_id::<Running>(),
-        out: Vec::new(),
-    };
+    let mut walk = Walk::new(world);
     let dev = world.lookup(LOCAL);
     if dev.is_alive() && *dev.id() != 0 {
         walk.walk(dev, 0);
     }
     walk.out
+}
+
+/// A session that is up (running) but not at work (no [`Busy`]): a sub-agent done with its turn, waiting.
+fn sleeping(c: EntityView<'_>, running: u64) -> bool {
+    c.has(Object::id()) && !c.has(Run::id()) && c.target(Status::id(), 0).is_some_and(|t| *t.id() == running) && !c.has(Busy::id())
+}
+
+/// The [`Linger`] the scene set (ms).
+fn linger(world: WorldRef<'_>) -> u64 {
+    world.try_get::<&Linger>(|l| l.ms).unwrap_or(Linger::DEFAULT.ms)
+}
+
+/// How long until the soonest lingering child's linger runs out (ms; None: none lingers), so an idle app wakes then and
+/// [`rows`] folds it away.
+#[must_use]
+pub fn linger_due(world: WorldRef<'_>) -> Option<u64> {
+    let (now, ms) = (now_ms(), linger(world));
+    let mut due: Option<u64> = None;
+    world.query::<&Ended>().without(Archived::id()).build().each(|t| {
+        let end = t.ms.saturating_add(ms);
+        if end > now {
+            due = Some(due.map_or(end - now, |d| d.min(end - now)));
+        }
+    });
+    due
 }
 
 /// `e`'s children in the tree: those with a Kind that are not archived, and in place of an archived one, what under it
@@ -1094,14 +1157,22 @@ pub fn archive_view(world: WorldRef<'_>) -> u64 {
     *world.lookup(ARCHIVE).id()
 }
 
-/// Expand `e` (all its children show in the tree) or fold it back (only the running ones do).
-pub fn set_expanded(world: WorldRef<'_>, e: u64, open: bool) {
+/// Fold `e` (its chevron closed: none of its children show in the tree) or open it again (its live ones do).
+pub fn set_folded(world: WorldRef<'_>, e: u64, folded: bool) {
     let e = world.entity_from_id(e);
-    if open {
-        e.add(Expanded::id());
-    } else if e.has(Expanded::id()) {
-        e.remove(Expanded::id());
+    if folded {
+        e.add(Folded::id());
+    } else if e.has(Folded::id()) {
+        e.remove(Folded::id());
     }
+}
+
+/// Whether `e` has live children ([`rows`]'s: running, active under, lingering or selected): what its chevron opens and
+/// folds, so a row whose children have all finished has none.
+#[must_use]
+pub fn has_live_kids(world: WorldRef<'_>, e: u64) -> bool {
+    let walk = Walk::new(world);
+    live_kids(world.entity_from_id(e)).into_iter().any(|c| walk.live(c))
 }
 
 /// The selected object, if any.

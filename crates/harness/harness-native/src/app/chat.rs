@@ -4,7 +4,10 @@
 //! headings, list items, quotes and code blocks, thinking and tool calls folded to a line, a turn's foot) in a
 //! `ui.LazyList`, so only the rows in view are entities. It scrolls on AppKit's physics and sticks to the bottom while
 //! the agent writes unless the person scrolled up. The input is a `ui.TextArea` edited here (`Draft`, keys in
-//! scene/20-keys.flecs ctx.Chat): Return sends, Shift+Return breaks the line, Escape interrupts.
+//! scene/20-keys.flecs ctx.Chat): Return sends, Shift+Return breaks the line, Escape interrupts. A draft that starts with a
+//! space is an aside: the composer takes the aside's tint, and Return asks it of a fork of the conversation instead
+//! (`Link::chat_aside`), its answer in a card over the composer ([`Aside`]) that Escape or its button closes; the
+//! conversation never has it.
 use super::*;
 use harness_native_ui_motion_api::{CopyFlash, Follow, Paced};
 use harness_native_ui_timeline_api::GlyphsArrive;
@@ -280,10 +283,80 @@ pub struct ChatState {
     /// Kept at the bottom on a spring while it sticks; the pane clock's time it was last stepped.
     follow: Follow,
     stepped: f64,
+    /// A pane showed it last frame: what comes now is written while the person watches. Shown again after a frame
+    /// without (another tab was in front), what came meanwhile is there at once, not written in ([`ChatState::catch_up`]).
+    on_screen: bool,
     /// The chip under the pointer, its hover card, and the GitHub refs its words name (chat/peek.rs).
     peek: peek::Peek,
     /// The `@` file mention menu over the composer (chat/mention.rs).
     mention: mention::Mention,
+    /// The pictures pasted into the message being written (absolute paths of PNG or JPEG files), sent with it.
+    images: Vec<String>,
+    /// The context popover pressed open to the whole account (chat/context.rs), until another press or Escape.
+    ctx_open: bool,
+    /// The draft as native.json keeps it (`drafts`): read once, when the pane first shows it, and what was last written
+    /// there (its words and pictures), so [`App::flush_drafts`] writes only what changed.
+    draft_read: bool,
+    draft_saved: (String, Vec<String>),
+    /// Each picture's size in pixels as its header says (None: not one this app can show), read once: the composer's
+    /// and the transcript's thumbnails.
+    sizes: HashMap<String, Option<(u32, u32)>>,
+    /// The aside asked from this composer, shown over it until closed ([`Aside`]).
+    aside: Option<Aside>,
+}
+
+/// What an aside's answer is as the link delivers it: the fork's words (markdown), or why there are none.
+type AsideAnswer = Result<String, String>;
+
+/// An aside asked from a chat's composer (Return on a draft that starts with a space): the question, and its answer
+/// once it came. The link's thread puts the answer in `slot` (`Link::chat_aside`); the pane takes it from there as it
+/// fills. A new aside replaces this one, and the old one's answer, if it still comes, lands in a slot no one reads.
+pub(super) struct Aside {
+    asked: String,
+    slot: Arc<std::sync::Mutex<Option<AsideAnswer>>>,
+    answer: Option<AsideAnswer>,
+}
+
+impl Aside {
+    /// Its answer taken from the link's slot, once the link put it there.
+    fn pull(&mut self) {
+        if self.answer.is_none() {
+            self.answer = self.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        }
+    }
+}
+
+/// Whether a draft is an aside: it starts with a space.
+fn is_aside(d: &Draft) -> bool {
+    d.text.starts_with(' ')
+}
+
+impl ChatState {
+    /// Take chat `sid`'s draft from native.json (`drafts`: `{"s14": {"text", "images"}}`), what was being written when
+    /// the app last quit; a picture whose file is gone is left out.
+    fn read_draft(&mut self, sid: u64) {
+        self.draft_read = true;
+        let Some(d) = crate::prefs::get("drafts").and_then(|v| v.get(format!("s{sid}")).cloned()) else { return };
+        let text = d["text"].as_str().unwrap_or("").to_owned();
+        let images: Vec<String> =
+            d["images"].as_array().into_iter().flatten().filter_map(Value::as_str).filter(|p| std::path::Path::new(p).is_file()).map(str::to_owned).collect();
+        let n = text.len();
+        self.draft = Draft { text: text.clone(), caret: n, anchor: n, ..Draft::default() };
+        self.images.clone_from(&images);
+        self.draft_saved = (text, images);
+    }
+
+    /// Shown again after another tab was in front: every text block as it is now shows whole and at rest (no pace, no
+    /// glyphs fading in), as history does on an attach, so only what comes from here on is written in.
+    fn catch_up(&mut self, t: &Transcript) {
+        for item in &t.items {
+            let Item::Text { block, text, done } = item else { continue };
+            let have = settled_len(text, *done);
+            self.stream.insert(block.clone(), Stream { paced: Paced::at(have), live: false }); // alloc: one entry per text block, kept with the pane
+        }
+        self.cut.clear();
+        self.row_born.clear();
+    }
 }
 
 /// One text block of a chat's transcript as it shows: its pace, and whether it streamed in while the pane watched (its
@@ -353,8 +426,15 @@ impl Default for ChatState {
             row_born: HashMap::new(),
             follow: Follow::default(),
             stepped: 0.0,
+            on_screen: false,
             peek: peek::Peek::default(),
             mention: mention::Mention::default(),
+            images: Vec::new(),
+            ctx_open: false,
+            draft_read: false,
+            draft_saved: (String::new(), Vec::new()),
+            sizes: HashMap::new(),
+            aside: None,
         }
     }
 }
@@ -362,7 +442,10 @@ impl Default for ChatState {
 /// A row of the transcript.
 #[derive(Clone, Debug)]
 enum Row {
-    User(String),
+    /// What the person wrote; true when their pictures are over it (a row of its own, [`Row::Pictures`]).
+    User(String, bool),
+    /// The pictures the person sent with a message, over its words (absolute paths); true when no words came with them.
+    Pictures(Vec<String>, bool),
     Prose(String),
     Heading(u8, String),
     ListItem { depth: usize, mark: String, text: String },
@@ -390,7 +473,10 @@ enum Row {
 impl Row {
     fn prefab(&self) -> &'static str {
         match self {
-            Row::User(_) => "hn.ChatUser",
+            Row::User(_, false) => "hn.ChatUser",
+            Row::User(_, true) => "hn.ChatUserUnder",
+            Row::Pictures(_, false) => "hn.ChatSentPictures",
+            Row::Pictures(_, true) => "hn.ChatSentPicturesLast",
             Row::Prose(_) => "hn.ChatProse",
             Row::Heading(1, _) => "hn.ChatH1",
             Row::Heading(2, _) => "hn.ChatH2",
@@ -688,7 +774,15 @@ fn item_rows(t: &Transcript, n: usize, shows: Shows<'_>, out: &mut Vec<(String, 
     let fold = shows.fold;
     let mut part = Vec::new();
     match &t.items[n] {
-        Item::User { text } => part.push(Row::User(text.clone())),
+        Item::User { text, images } => {
+            let words = !text.trim().is_empty();
+            if !images.is_empty() {
+                part.push(Row::Pictures(images.clone(), !words));
+            }
+            if words || images.is_empty() {
+                part.push(Row::User(text.clone(), !images.is_empty()));
+            }
+        }
         Item::Text { block, text, done } => match shows.cut.get(block) {
             Some(&k) => blocks(&text[..k.min(text.len())], true, &mut part),
             None => blocks(text, !done, &mut part),
@@ -877,7 +971,7 @@ fn word_around(s: &str, i: usize) -> (usize, usize) {
 /// [`fill_row`] gives it) and whether it is inline markdown.
 fn texts(r: &Row) -> Vec<(&'static [&'static str], String, bool)> {
     match r {
-        Row::User(s) => vec![(&["bubble", "text"], s.clone(), false)],
+        Row::User(s, _) => vec![(&["bubble", "text"], s.clone(), false)],
         Row::Prose(s) | Row::Heading(_, s) | Row::Quote(s) => vec![(&["text"], s.clone(), true)],
         Row::ListItem { mark, text, .. } => vec![(&["mark"], mark.clone(), false), (&["text"], text.clone(), true)],
         Row::Code { text, .. } => vec![(&["card", "text"], text.clone(), false)],
@@ -889,7 +983,7 @@ fn texts(r: &Row) -> Vec<(&'static [&'static str], String, bool)> {
         Row::Note(s) | Row::Error(s) => vec![(&["text"], s.clone(), false)],
         Row::Steps(l) => vec![(&["head", "words"], l.words.clone(), false)],
         Row::Out(o) => o.texts(),
-        Row::Tool { .. } | Row::Thinking { .. } | Row::Grid { .. } | Row::Table(_) | Row::Ui { .. } => Vec::new(),
+        Row::Tool { .. } | Row::Thinking { .. } | Row::Grid { .. } | Row::Table(_) | Row::Ui { .. } | Row::Pictures(..) => Vec::new(),
     }
 }
 
@@ -930,7 +1024,8 @@ impl Row {
     /// The row as markdown, for a copy that takes it whole (None: its words as shown).
     fn markdown(&self) -> Option<String> {
         Some(match self {
-            Row::User(s) | Row::Prose(s) | Row::Note(s) | Row::Error(s) => s.clone(),
+            Row::User(s, _) | Row::Prose(s) | Row::Note(s) | Row::Error(s) => s.clone(),
+            Row::Pictures(images, _) => images.iter().map(|p| format!("![image]({p})")).collect::<Vec<_>>().join("\n"),
             Row::Heading(n, s) => format!("{} {s}", "#".repeat(usize::from(*n))),
             Row::ListItem { depth, mark, text } => {
                 let mark = match mark.as_str() {
@@ -1115,6 +1210,9 @@ impl App {
         let pv = View::of(w.entity_from_id(pane));
         let mut states = self.chat.borrow_mut();
         let st = states.entry(sid).or_default();
+        if !st.draft_read {
+            st.read_draft(sid);
+        }
         // Its own stream of events: attach (again a second after a try while it runs, once when it ended). The stream
         // outlives the agent (a resume's events come on it), and a past chat's is its log replayed by the daemon. A stream
         // the link holds from before the session was known to be a chat is a terminal's: dropped for ours.
@@ -1158,6 +1256,16 @@ impl App {
         let empty = Transcript::default();
         let t = chats.get(&sid).unwrap_or(&empty);
         let (rows, nested) = rows_nested(t, Shows::of(st));
+        // The pictures shown (a sent message's, the draft's): each one's size read once.
+        let pics = rows.iter().flat_map(|(_, r)| match r {
+            Row::Pictures(images, _) => images.as_slice(),
+            _ => &[],
+        });
+        for p in pics.chain(st.images.iter()) {
+            if !st.sizes.contains_key(p) {
+                st.sizes.insert(p.clone(), mention::image_size(p)); // alloc: one entry per picture, kept with the pane
+            }
+        }
         // The rows of blocks that streamed in while this pane watched: their glyphs fade in as they come, from when the row
         // was first laid out (a row first painted long after, scrolled back to, shows at rest).
         let came = crate::look::arrive(w, "chat_stream");
@@ -1191,6 +1299,7 @@ impl App {
             let mut paint = self.paint.borrow_mut();
             let mut measure = |s: &str, style: &TextStyle, md: bool| paint.width(s, style, md);
             let rows_open = &st.rows_open;
+            let sizes = &st.sizes;
             let fresh_rows = |row: View<'_>, i: usize, new: bool| {
                 if new {
                     row.set(HoverAmt::default());
@@ -1198,7 +1307,7 @@ impl App {
                         h.set(HoverAmt::default());
                     }
                 }
-                let ctx = RowCtx { sid, key: &rows[i].0, open: rows_open.get(&rows[i].0).copied(), ui: Some(&self.genui), playing: t.busy, cells: Some(&t.details) };
+                let ctx = RowCtx { sid, sizes: Some(sizes), key: &rows[i].0, open: rows_open.get(&rows[i].0).copied(), ui: Some(&self.genui), playing: t.busy, cells: Some(&t.details) };
                 fill_row(row, &rows[i].1, &ctx, &mut measure);
                 if let Some(mut pad) = view::prefab(w, rows[i].1.prefab()).and_then(|p| p.try_cloned::<&harness_native_ui_layout_api::Padding>()) {
                     if nested.contains(&rows[i].0) {
@@ -1277,16 +1386,38 @@ impl App {
         self.fill_chat_peek(pv, st, t, &rows, focused, &cwd);
         self.fill_chat_mention(pv, sid, st, &cwd, focused);
         let ended = self.status_of(e) != "running";
+        // The pictures pasted into the message, over its words, each with its remove button.
+        if let Some(strip) = composer(pv).and_then(|c| c.part("entry")).and_then(|e| e.part("attach")) {
+            let h = crate::look::width(w, "chat_attach_tall");
+            fill_pictures(strip, &st.images, Some(&st.sizes), h, "hn.ChatAttach", Some(sid));
+        }
+        self.fill_chat_aside(pv, sid, st);
+        // A draft that starts with a space is an aside (chat_send_draft): the card takes the aside's tint while it is.
+        let aside = is_aside(&st.draft);
+        if let Some(card) = composer(pv) {
+            let (fill, line) = if aside { ("aside", "aside_line") } else { ("card", "line") };
+            let f = crate::look::tone(w, fill);
+            if card.entity().try_cloned::<&Fill>() != Some(f) {
+                card.entity().set(f);
+            }
+            let l = crate::look::tone(w, line);
+            let edge = harness_native_ui_look_api::Edge { dark: l.dark, light: l.light };
+            if card.entity().try_cloned::<&harness_native_ui_look_api::Edge>() != Some(edge) {
+                card.entity().set(edge);
+            }
+        }
         if let Some(area) = composer_area(pv) {
             let (shown, [caret, anchor, lo, hi]) = st.draft.shown();
             if let Some(h) = area.part("hint_at").and_then(|a| a.part("hint")) {
-                // Its agent's name ("Message Codex" in a Codex session), and that a message resumes an ended one.
+                // Its agent's name ("Message Codex" in a Codex session), and that a message resumes an ended one; an
+                // aside's, while it asks nothing past its space, that it stays out of the conversation.
                 let agent = match model::kind_name(w.entity_from_id(e)) {
                     "codex" => "Codex",
                     "cursor" => "Cursor",
                     _ => "Claude",
                 };
                 let hint = match (shown.is_empty(), ended) {
+                    _ if aside && shown.trim().is_empty() => format!("Ask {agent} aside: the answer stays out of the conversation"),
                     (false, _) => String::new(),
                     (true, false) => format!("Message {agent}"),
                     (true, true) => format!("Message {agent} to resume"),
@@ -1314,13 +1445,44 @@ impl App {
             // say.
             let listed = o.try_cloned::<&model::AgentModel>().unwrap_or_default();
             let listed = (listed.s.as_str(), listed.effort.as_str());
-            self.fill_chat_pick(bar, sid, t, model::kind_name(o), st.pick, &mut st.pick_nav, &mut st.effort, listed, ended);
-            // While the agent works, its breathing ring (hn.ChatWorking), else nothing: Return sends, Escape stops.
-            if let Some(act) = bar.part("act") {
-                let working = t.busy && !ended;
-                view::for_each_of(act, working.then_some(("working", "hn.ChatWorking", ())), |_, (), _| {});
+            self.fill_chat_pick(bar, sid, t, model::kind_name(o), st.pick, &mut st.pick_nav, &mut st.effort, listed, ended, st.ctx_open);
+        }
+    }
+
+    /// Chat pane `pv`'s aside card (its foot's `aside` slot, hn.ChatAside) while chat `sid` has one: the working ring
+    /// and the question in a quiet note while it is asked, then the answer's words as the transcript draws them, or the
+    /// error naming what failed; its close button closes it (`chat:aside_close:<sid>`).
+    fn fill_chat_aside(&self, pv: View<'_>, sid: u64, st: &mut ChatState) {
+        let Some(slot) = pv.part("foot").and_then(|f| f.part("aside")) else { return };
+        let rows: Option<Vec<Row>> = st.aside.as_mut().map(|a| {
+            a.pull();
+            let mut rows = Vec::new(); // alloc: the card's few rows, this frame's
+            match &a.answer {
+                None => rows.push(Row::Note(a.asked.clone())),
+                Some(Ok(words)) => blocks(words, false, &mut rows),
+                Some(Err(why)) => rows.push(Row::Error(why.clone())),
+            }
+            rows
+        });
+        let asking = st.aside.as_ref().is_some_and(|a| a.answer.is_none());
+        view::for_each_of(slot, rows.is_some().then_some(("card", "hn.ChatAside", ())), |_, (), _| {});
+        let (Some(rows), Some(plate)) = (rows, slot.part("card").and_then(|c| c.part("plate"))) else { return };
+        if let Some(head) = plate.part("head") {
+            if let Some(act) = head.part("act") {
+                view::for_each_of(act, asking.then_some(("working", "hn.ChatAsideWorking", ())), |_, (), _| {});
+            }
+            if let Some(b) = head.part("close") {
+                b.action(&format!("chat:aside_close:{sid}"));
+                if let Some(icon) = b.part("icon") {
+                    icon.icon(REMOVE_ICON);
+                }
             }
         }
+        let Some(body) = plate.part("body") else { return };
+        let mut paint = self.paint.borrow_mut();
+        let mut measure = |s: &str, style: &TextStyle, md: bool| paint.width(s, style, md);
+        let keyed = rows.iter().enumerate().map(|(i, r)| (format!("r{i}"), r.prefab(), r));
+        view::for_each_of(body, keyed, |v, r, _| fill_row(v, r, &RowCtx::NOWHERE, &mut measure));
     }
 
     /// Once a frame's layout has settled: every chat pane whose transcript was laid out at a new width this frame (a cmd+S
@@ -1365,6 +1527,30 @@ impl App {
     pub(super) fn step_chat_scroll(&mut self) {
         let w = self.world.world_ref();
         let mut moving = false;
+        // The chats a pane shows this frame; one that no pane showed last frame comes back caught up.
+        let shown: HashSet<u64> = self
+            .panes()
+            .into_iter()
+            .filter_map(|p| model::shows(w, p).filter(|o| model::pane_kind(*o) == model::PaneKind::Chat))
+            .filter_map(|o| self.session_of(*o.id()))
+            .collect();
+        let mut back = HashSet::new();
+        {
+            let chats = self.chats.borrow();
+            let mut states = self.chat.borrow_mut();
+            for &sid in &shown {
+                let st = states.entry(sid).or_default();
+                if !st.on_screen {
+                    if let Some(t) = chats.get(&sid) {
+                        st.catch_up(t);
+                    }
+                    back.insert(sid);
+                }
+            }
+            for (sid, st) in states.iter_mut() {
+                st.on_screen = shown.contains(sid);
+            }
+        }
         for p in self.panes() {
             let Some(o) = model::shows(w, p) else { continue };
             if model::pane_kind(o) != model::PaneKind::Chat {
@@ -1375,6 +1561,7 @@ impl App {
             let Some(l) = list.entity().try_cloned::<&Laid>().filter(|l| l.h > 0.0) else { continue };
             let mut states = self.chat.borrow_mut();
             let st = states.entry(sid).or_default();
+            let reshown = back.contains(&sid);
             // A drag or a page on the overlay scroller moved the list: that is the origin now, off the bottom.
             if let Some(s) = list.entity().try_cloned::<&ScrollState>().filter(|s| (s.y - st.y).abs() > 0.01)
                 && list.entity().try_cloned::<&ScrollerGrip>().is_some_and(|g| g.drag != 0 || g.page != 0)
@@ -1398,7 +1585,7 @@ impl App {
                 // height moved it as far), instead of the view jumping a line at a time.
                 st.follow.shift(st.shift);
                 // While the log replays (a pane just opened) it lands on the end: the history was there, not written now.
-                let replay = st.tried.is_some_and(|a| self.time - a < REPLAY_SECS);
+                let replay = reshown || st.tried.is_some_and(|a| self.time - a < REPLAY_SECS);
                 let far = if replay { 0.0 } else { crate::look::width(w, "chat_stream") };
                 let (y, going) = st.follow.step(max, crate::look::tune(w, "chat_stream"), far, dt);
                 if (y - st.y).abs() > 0.01 {
@@ -1616,22 +1803,68 @@ impl App {
         true
     }
 
-    /// Send chat `sid`'s draft (Return), the draft emptied;
-    /// nothing while it holds only blanks.
+    /// Send chat `sid`'s draft (Return) with the pictures pasted into it, the draft emptied; nothing while it holds only
+    /// blanks and no picture. A draft that starts with a space is asked aside instead ([`App::chat_ask_aside`]).
     pub(in crate::app) fn chat_send_draft(&mut self, sid: u64) {
-        let text = {
+        if self.chat.borrow().get(&sid).is_some_and(|st| is_aside(&st.draft)) {
+            return self.chat_ask_aside(sid);
+        }
+        let (text, images) = {
+            let mut states = self.chat.borrow_mut();
+            let Some(st) = states.get_mut(&sid) else { return };
+            let d = &mut st.draft;
+            if d.text.trim().is_empty() && st.images.is_empty() {
+                return;
+            }
+            let text = std::mem::take(&mut d.text).trim_end().to_owned();
+            (d.caret, d.anchor, d.marked) = (0, 0, None);
+            st.stick = true;
+            (text, std::mem::take(&mut st.images))
+        };
+        self.link.chat_send(sid, &text, images);
+        self.poke();
+    }
+
+    /// Ask chat `sid`'s draft (an aside: it starts with a space) of a fork of its conversation, trimmed, the draft
+    /// emptied and its card over the composer asking; the pictures pasted into the draft stay for the next message (an
+    /// aside takes none). Nothing while the draft holds only blanks.
+    fn chat_ask_aside(&mut self, sid: u64) {
+        let (text, slot) = {
             let mut states = self.chat.borrow_mut();
             let Some(st) = states.get_mut(&sid) else { return };
             let d = &mut st.draft;
             if d.text.trim().is_empty() {
                 return;
             }
-            let text = std::mem::take(&mut d.text).trim_end().to_owned();
+            let text = std::mem::take(&mut d.text).trim().to_owned();
             (d.caret, d.anchor, d.marked) = (0, 0, None);
-            st.stick = true;
-            text
+            let slot: Arc<std::sync::Mutex<Option<AsideAnswer>>> = Arc::default();
+            st.aside = Some(Aside { asked: text.clone(), slot: Arc::clone(&slot), answer: None });
+            (text, slot)
         };
-        self.link.chat_send(sid, &text);
+        self.link.chat_aside(sid, &text, move |a| *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(a));
+        self.poke();
+    }
+
+    /// Escape in the focused chat: its aside's card closed, if one shows. Whether one did.
+    fn chat_aside_close(&mut self) -> bool {
+        let Some((_, _, sid)) = self.focused_chat() else { return false };
+        let closed = self.chat.borrow_mut().get_mut(&sid).is_some_and(|st| st.aside.take().is_some());
+        if closed {
+            self.poke();
+        }
+        closed
+    }
+
+    /// An aside card's close button (`chat:aside_close:<sid>`): chat `sid`'s aside closed.
+    pub(in crate::app) fn chat_aside_dismiss(&mut self, rest: &str) {
+        let Ok(sid) = rest.parse::<u64>() else {
+            eprintln!("harness-native: chat:aside_close:{rest} names no session");
+            return;
+        };
+        if let Some(st) = self.chat.borrow_mut().get_mut(&sid) {
+            st.aside = None;
+        }
         self.poke();
     }
 
@@ -1657,9 +1890,9 @@ impl App {
         {
             return;
         }
-        // Escape closes the picker's menu, and what a cell floats over the transcript (a popover, a menu, a dialog),
-        // before it interrupts.
-        if op == "interrupt" && (self.chat_pick_close() || self.genui_escape()) {
+        // Escape closes the picker's menu, what a cell floats over the transcript (a popover, a menu, a dialog), and an
+        // aside's card, before it interrupts.
+        if op == "interrupt" && (self.chat_pick_close() || self.genui_escape() || self.chat_aside_close() || self.chat_ctx_close()) {
             return;
         }
         let Some((_, _, sid)) = self.focused_chat() else { return };
@@ -1698,6 +1931,96 @@ impl App {
                 }
             }
             _ => eprintln!("harness-native: keys: act.Edit has no edit {op:?}"),
+        }
+        self.poke();
+    }
+
+    /// Write every chat draft that changed since it was last written to native.json (`drafts`, by session; an empty one
+    /// leaves it), in one write: the window calls this as it goes idle, so a pause in typing keeps the draft across a
+    /// quit without a write per key.
+    pub(crate) fn flush_drafts(&self) {
+        let mut states = self.chat.borrow_mut();
+        let changed: Vec<(u64, String, Vec<String>)> = states
+            .iter()
+            .filter(|(_, st)| st.draft_read && (st.draft.text.as_str(), st.images.as_slice()) != (st.draft_saved.0.as_str(), st.draft_saved.1.as_slice()))
+            .map(|(sid, st)| (*sid, st.draft.text.clone(), st.images.clone()))
+            .collect();
+        if changed.is_empty() {
+            return;
+        }
+        let mut drafts = crate::prefs::get("drafts").and_then(|v| v.as_object().cloned()).unwrap_or_default();
+        for (sid, text, images) in changed {
+            let key = format!("s{sid}");
+            if text.trim().is_empty() && images.is_empty() {
+                drafts.remove(&key);
+            } else {
+                drafts.insert(key, serde_json::json!({"text": text, "images": images}));
+            }
+            if let Some(st) = states.get_mut(&sid) {
+                st.draft_saved = (text, images);
+            }
+        }
+        crate::prefs::set("drafts", Value::Object(drafts));
+    }
+
+    /// Pictures pasted into the focused chat's message (absolute paths of PNG or JPEG files this app can show): shown over
+    /// its words and sent with it. Whether a chat took them (false while a name or a cell's field has the keys, or the
+    /// palette is open, or no chat has them, or one of them is not such a picture).
+    pub(in crate::app) fn chat_attach(&mut self, paths: &[String]) -> bool {
+        if self.palette.is_some() || self.renaming() || self.genui_editing() || paths.is_empty() {
+            return false;
+        }
+        let Some((_, _, sid)) = self.focused_chat() else { return false };
+        let sizes: Vec<_> = paths.iter().map(|p| mention::image_size(p)).collect();
+        if sizes.iter().any(Option::is_none) {
+            return false;
+        }
+        let mut states = self.chat.borrow_mut();
+        let st = states.entry(sid).or_default();
+        for (p, wh) in paths.iter().zip(sizes) {
+            st.sizes.insert(p.clone(), wh);
+            if !st.images.contains(p) {
+                st.images.push(p.clone());
+            }
+        }
+        st.reading = false;
+        drop(states);
+        self.poke();
+        true
+    }
+
+    /// A press on the context meter (`chat:ctx:<sid>`): its popover opens to the whole account, or closes again.
+    pub(in crate::app) fn chat_ctx_toggle(&mut self, rest: &str) {
+        let Ok(sid) = rest.parse::<u64>() else {
+            eprintln!("harness-native: chat:ctx:{rest} names no session");
+            return;
+        };
+        if let Some(st) = self.chat.borrow_mut().get_mut(&sid) {
+            st.ctx_open = !st.ctx_open;
+        }
+        self.poke();
+    }
+
+    /// Escape: the focused chat's opened context popover closes. Whether one was open.
+    fn chat_ctx_close(&mut self) -> bool {
+        let Some((_, _, sid)) = self.focused_chat() else { return false };
+        let closed = self.chat.borrow_mut().get_mut(&sid).is_some_and(|st| std::mem::take(&mut st.ctx_open));
+        if closed {
+            self.poke();
+        }
+        closed
+    }
+
+    /// A pasted picture's remove button (`chat:unattach:<sid>:<i>`): picture `i` out of chat `sid`'s message.
+    pub(in crate::app) fn chat_unattach(&mut self, rest: &str) {
+        let Some((sid, i)) = rest.split_once(':').and_then(|(s, i)| Some((s.parse::<u64>().ok()?, i.parse::<usize>().ok()?))) else {
+            eprintln!("harness-native: chat:unattach:{rest} names no session and picture");
+            return;
+        };
+        if let Some(st) = self.chat.borrow_mut().get_mut(&sid)
+            && i < st.images.len()
+        {
+            st.images.remove(i);
         }
         self.poke();
     }
@@ -2120,8 +2443,8 @@ impl App {
     }
 
     /// Open what transcript place `s` of session `sid` is on: an inline component (`<Path loc="...">`, through the scene's
-    /// `ui.inline`, relative paths from the session's directory) or a markdown link, in the app its kind opens in; an
-    /// Option-press shows a file in the Finder. A component that cannot open says why in the log, naming it.
+    /// `ui.inline`, relative paths from the session's directory) or a markdown link, in the browser pane on the right; an
+    /// Option-press opens it outside ([`App::open_target`]). A component that cannot open says why in the log, naming it.
     fn chat_open_at(&mut self, sid: u64, s: Spot) {
         let rows = self.chat_rows(sid);
         let Some((_, src, true)) = rows.get(s.row).and_then(|(_, r)| texts(r).into_iter().nth(s.part)) else { return };
@@ -2147,7 +2470,7 @@ impl App {
         } else {
             return;
         };
-        crate::open::open(&target, self.press.1.alt);
+        self.open_target(&target, self.press.1.alt);
     }
 
     /// Session `sid`'s transcript as rows.
@@ -2201,6 +2524,8 @@ fn along_lines(d: &mut Draft, lay: &Layout, m: Move) -> Option<usize> {
 /// Where a transcript row is, for the parts that act on it: its session, its key, and the table row opened in it.
 struct RowCtx<'k> {
     sid: u64,
+    /// The pictures' sizes ([`ChatState::sizes`]), for a sent message's thumbnails.
+    sizes: Option<&'k HashMap<String, Option<(u32, u32)>>>,
     key: &'k str,
     open: Option<usize>,
     /// The app's cell controls in use, for a cell's UI (None: drawn from the tree alone).
@@ -2213,7 +2538,7 @@ struct RowCtx<'k> {
 
 impl RowCtx<'static> {
     /// A row drawn outside the transcript (in a cell's generated UI): its tables' rows do not open.
-    const NOWHERE: Self = RowCtx { sid: 0, key: "", open: None, ui: None, playing: false, cells: None };
+    const NOWHERE: Self = RowCtx { sid: 0, sizes: None, key: "", open: None, ui: None, playing: false, cells: None };
 }
 
 impl RowCtx<'_> {
@@ -2226,6 +2551,42 @@ impl RowCtx<'_> {
 /// A table's measure: words (in a style, inline markdown or not) to their one-line width in points.
 type Measure<'m> = dyn FnMut(&str, &TextStyle, bool) -> f32 + 'm;
 
+/// Keep `strip`'s pictures (one `prefab` each, its `pic` part or itself the picture) in step with `images`: each `h` tall at
+/// its own aspect, no wider than chat_attach_max_w for a draft's. With `remove` (the chat's session), each one's remove
+/// button takes it out of the draft (`chat:unattach:<sid>:<i>`).
+fn fill_pictures(strip: View<'_>, images: &[String], sizes: Option<&HashMap<String, Option<(u32, u32)>>>, h: f32, prefab: &str, remove: Option<u64>) {
+    let w = strip.entity().world();
+    let widest = if remove.is_some() { crate::look::width(w, "chat_attach_wide") } else { f32::INFINITY };
+    let shows = images.iter().enumerate().filter_map(|(i, p)| sizes.and_then(|s| s.get(p).copied().flatten()).map(|wh| (format!("p{i}"), prefab, (i, p, wh))));
+    view::for_each_of(strip, shows, |v, (i, path, (iw, ih)), _| {
+        let k = (h / ih.max(1) as f32).min(widest / iw.max(1) as f32);
+        let size = Size {
+            w: Sizing { kind: SizeKind::Fixed, value: (iw as f32 * k).round(), min: 0.0, max: 0.0 },
+            h: Sizing { kind: SizeKind::Fixed, value: (ih as f32 * k).round(), min: 0.0, max: 0.0 },
+        };
+        let pic = v.part("pic").unwrap_or(v).entity();
+        if pic.try_cloned::<&Size>() != Some(size) {
+            pic.set(size);
+        }
+        let handle = harness_native_ui_text_api::Picture { handle: path.as_str().into() };
+        if pic.try_cloned::<&harness_native_ui_text_api::Picture>() != Some(handle.clone()) {
+            pic.set(handle);
+        }
+        if let (Some(sid), Some(b)) = (remove, v.part("corner").and_then(|c| c.part("remove"))) {
+            let action = Action { name: format!("chat:unattach:{sid}:{i}").as_str().into() };
+            if b.entity().try_cloned::<&Action>() != Some(action.clone()) {
+                b.entity().set(action);
+            }
+            if let Some(icon) = b.part("icon") {
+                icon.icon(REMOVE_ICON);
+            }
+        }
+    });
+}
+
+/// The remove button's glyph on a pasted picture (codicon's close).
+const REMOVE_ICON: &str = "\u{EA76}";
+
 /// Fill one transcript row from what it shows.
 fn fill_row(row: View<'_>, r: &Row, ctx: &RowCtx<'_>, measure: &mut Measure<'_>) {
     let text = |name: &str, s: &str| {
@@ -2234,10 +2595,14 @@ fn fill_row(row: View<'_>, r: &Row, ctx: &RowCtx<'_>, measure: &mut Measure<'_>)
         }
     };
     match r {
-        Row::User(s) => {
+        Row::User(s, _) => {
             if let Some(t) = row.part("bubble").and_then(|b| b.part("text")) {
                 t.text(s);
             }
+        }
+        Row::Pictures(images, _) => {
+            let h = crate::look::width(row.entity().world(), "chat_sent_tall");
+            fill_pictures(row, images, ctx.sizes, h, "hn.ChatSentPicture", None);
         }
         Row::Prose(s) | Row::Heading(_, s) | Row::Quote(s) | Row::Note(s) | Row::Error(s) => text("text", s),
         Row::ListItem { depth, mark, text: s } => {

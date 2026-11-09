@@ -17,6 +17,9 @@ export type ObjInfo = {
 };
 export type SpawnOpts = {
   name?: string; prompt?: string; cmd?: string; cwd?: string; env?: Record<string, string>; args?: string[];
+  /** Agents: the model and reasoning effort it runs on. A sub agent (one with a parent) must give a name, a model and,
+   *  when that model lists efforts, the effort (skill: agents). Never in args (--model/--effort there are refused). */
+  model?: string; effort?: string;
   /** Parent object (default: this agent; procs: the run this REPL runs in, else this agent). null for none. */
   parent?: string | Obj | null;
   /** proc: initial stdin text; the pipe stays open for .stdin() unless liveStdin: false. */
@@ -251,7 +254,15 @@ async function spawnObject(kind: Kind, opts: SpawnOpts): Promise<Obj> {
     };
   } else {
     if (opts.parent === undefined) parent = selfSession();
-    body = { args: opts.args ?? [], cwd: opts.cwd ?? process.cwd(), env: opts.env ?? {}, prompt: opts.prompt ?? null, cols: opts.cols ?? 140, rows: opts.rows ?? 45 };
+    if (parent !== null && AGENTS.has(kind)) {
+      // effort: the daemon requires it when the model's listed entry takes efforts (it knows the lists).
+      const missing = [!opts.name && "name", !opts.model && "model"].filter(Boolean);
+      if (missing.length) throw new Error(`a ${kind} sub agent needs an explicit ${missing.join(", ")}: spawn('${kind}', { name, model, effort, prompt })`);
+    }
+    body = {
+      args: opts.args ?? [], cwd: opts.cwd ?? process.cwd(), env: opts.env ?? {}, prompt: opts.prompt ?? null, cols: opts.cols ?? 140, rows: opts.rows ?? 45,
+      model: opts.model ?? null, effort: opts.effort ?? null,
+    };
   }
   const r = await req<{ id: string; existing: boolean }>({ op: "spawn_object", kind, name: opts.name ?? null, parent, ...body });
   const o = await obj(r.id);

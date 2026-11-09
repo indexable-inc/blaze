@@ -3,7 +3,7 @@
 //! running objects), a parent, append-only streams (indexed in db.rs) and RPC methods.
 //!
 //! Socket ops (daemon.rs routes them here):
-//!   spawn_object {kind, name?, prompt?, cmd?, cwd?, env?, args?, parent?: "s5"|"r9"|5, session?, stdin?, live_stdin?, cols?, rows?, mode?: "chat"|"tui"}
+//!   spawn_object {kind, name?, model?, effort?, prompt?, cmd?, cwd?, env?, args?, parent?: "s5"|"r9"|5, session?, stdin?, live_stdin?, cols?, rows?, mode?: "chat"|"tui"}
 //!       -> {id, kind, name, existing}. Get-or-create: a live object holding `name` is returned instead
 //!       (error if it is another kind). Atomic: one lock covers the lookup and the start.
 //!       Procs get a live stdin pipe unless live_stdin: false.
@@ -126,14 +126,17 @@ pub fn spawn(d: &Arc<Daemon>, v: &Value) -> Result<Value> {
         r["id"].as_str().unwrap_or_default().to_string()
     } else {
         let mut args: Vec<String> = serde_json::from_value(v["args"].clone()).unwrap_or_default();
-        // Claude and Codex are chat sessions unless asked for their terminal UI (`mode: "tui"`, or `--tui` in args).
-        if v["mode"] == "tui" {
-            args.push("--tui".into());
-        }
         let parent = session_num(&v["parent"])?;
+        let model = v["model"].as_str().map(str::to_string);
+        let effort = v["effort"].as_str().map(str::to_string);
+        if parent.is_some() {
+            explicit_sub_agent(kind, name.as_deref(), model.as_deref(), effort.as_deref(), &args)?;
+        }
+        // Claude and Codex are chat sessions unless asked for their terminal UI (`mode: "tui"`, or `--tui` in args).
+        let choice = crate::daemon::launch_choice(kind, &mut args, model, effort, v["mode"] == "tui")?;
         let cols = v["cols"].as_u64().map_or(140, |c| c as u16);
         let rows = v["rows"].as_u64().map_or(45, |r| r as u16);
-        let n = d.spawn_named(kind, &args, parent, cwd, v["prompt"].as_str(), name.clone(), &env, cols, rows)?;
+        let n = d.spawn_full(kind, &args, parent, cwd, v["prompt"].as_str(), name.clone(), &env, cols, rows, choice)?;
         format!("s{n}")
     };
     Ok(json!({ "id": id, "kind": kind, "name": name, "existing": false }))
@@ -213,9 +216,13 @@ pub fn rpc(d: &Daemon, id: &str, method: &str, args: &Value, handle: impl Fn(Req
     match parse(&id) {
         Some(Target::Session(n)) => match method {
             "prompt" | "send" => handle(Req::Send {
-                id: n, text: a("text").context("prompt needs args.text")?, raw: false, submit: args["submit"].as_bool(),
+                id: n,
+                text: a("text").context("prompt needs args.text")?,
+                raw: false,
+                submit: args["submit"].as_bool(),
+                images: args["images"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect(),
             }),
-            "input" => handle(Req::Send { id: n, text: a("data").context("input needs args.data")?, raw: true, submit: None }),
+            "input" => handle(Req::Send { id: n, text: a("data").context("input needs args.data")?, raw: true, submit: None, images: Vec::new() }),
             "interrupt" => {
                 let s = d.get(n)?;
                 if s.chat.is_some() && a("key").is_none() {
@@ -276,4 +283,39 @@ fn read(id: String, stage: Option<usize>, args: &Value) -> Result<Value> {
         id, stage, stream: args["stream"].as_str().unwrap_or("out").to_string(), offset: args["offset"].as_u64().unwrap_or(0),
         max_bytes: args["max_bytes"].as_u64().map(|n| n as usize), wait_ms: args["wait_ms"].as_u64().unwrap_or(0),
     })
+}
+
+/// An agent another agent starts says what it is: a name (its row in the tree, and how it is found again), the model
+/// and, when the model's listed entry takes one, the reasoning effort. A default picked silently is how a lane ran at the wrong
+/// effort (2026-11-09), so none is picked here. `--model`/`--effort` in `args` are refused for the same reason: the
+/// fields are the one place they are said.
+///
+/// # Errors
+/// Naming each missing or doubled field.
+fn explicit_sub_agent(kind: &str, name: Option<&str>, model: Option<&str>, effort: Option<&str>, args: &[String]) -> Result<()> {
+    if !matches!(kind, "claude" | "codex" | "cursor") {
+        return Ok(());
+    }
+    let mut missing = Vec::new();
+    if name.is_none_or(str::is_empty) {
+        missing.push("name");
+    }
+    if model.is_none_or(str::is_empty) {
+        missing.push("model");
+    }
+    // The effort is required exactly when the model's listed entry takes efforts: a kind that has listed none yet
+    // (codex before its first start) or a model without efforts (cursor) cannot be given one (models::check).
+    let takes_effort = model.is_some_and(|m| {
+        crate::chat::models::snapshot().get(kind).and_then(|l| l.iter().find(|c| c.is(m))).is_some_and(|c| !c.efforts.is_empty())
+    });
+    if takes_effort && effort.is_none_or(str::is_empty) {
+        missing.push("effort");
+    }
+    if !missing.is_empty() {
+        bail!("a {kind} sub agent needs an explicit {}: spawn('{kind}', {{ name, model, effort, prompt }})", missing.join(", "));
+    }
+    if let Some(flag) = args.iter().find(|a| ["--model", "--effort"].iter().any(|f| a == f || a.starts_with(&format!("{f}=")))) {
+        bail!("{flag} in args: say the model and effort as spawn's own model and effort fields");
+    }
+    Ok(())
 }

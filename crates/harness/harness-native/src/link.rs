@@ -155,7 +155,13 @@ fn open(first: &Up) -> std::io::Result<UnixStream> {
 /// One request on a fresh connection: its reply, or the daemon's refusal (the inner error, naming why). The outer error
 /// is the socket's (no daemon, a closed connection).
 pub fn request(r: Request) -> std::io::Result<Result<Reply, String>> {
+    request_within(r, REPLY_WAIT)
+}
+
+/// [`request`], its answer waited for up to `wait` (a request the daemon may take minutes over, an aside's).
+fn request_within(r: Request, wait: Duration) -> std::io::Result<Result<Reply, String>> {
     let mut s = open(&Up::Req(r))?;
+    s.set_read_timeout(Some(wait))?;
     match recv(&mut s)? {
         Down::Reply(reply) => Ok(Ok(reply)),
         Down::Error { error } => Ok(Err(error)),
@@ -631,16 +637,43 @@ impl Link {
         }
     }
 
-    /// A message from the person into chat session `id` (the daemon writes it to the agent as a user turn).
-    pub fn chat_send(&self, id: u64, text: &str) {
+    /// A message from the person into chat session `id`, with the pictures at `images` (the daemon writes it to the agent
+    /// as a user turn).
+    pub fn chat_send(&self, id: u64, text: &str, images: Vec<String>) {
         let (text, poke) = (text.to_owned(), self.poke.clone());
         std::thread::spawn(move || {
-            match request(Request::Send { id, text, raw: false, submit: None }) {
+            match request(Request::Send { id, text, raw: false, submit: None, images }) {
                 Ok(Err(e)) => eprintln!("harness-native: send {id}: {e}"),
                 Ok(Ok(_)) => {}
                 Err(e) => eprintln!("harness-native: send {id}: {e}"),
             }
             let _ = poke.send(());
+        });
+    }
+
+    /// An aside to chat session `id` (`Request::Aside`): `text` asked of a fork of its conversation as one turn, the fork
+    /// then discarded, so the conversation never has it. `then` gets the fork's answer (markdown), or why there is none
+    /// (the daemon's refusal, naming the chat, or the socket's error), on the asking thread; the main thread is woken
+    /// after. The reply is waited for the daemon's own bound on the fork ([`harness_proto::msg::ASIDE_SECS`]) and a
+    /// little more, never past it.
+    pub fn chat_aside(&self, id: u64, text: &str, then: impl FnOnce(Result<String, String>) + Send + 'static) {
+        let (text, wake) = (text.to_owned(), self.wake.clone());
+        std::thread::spawn(move || {
+            let wait = Duration::from_secs(harness_proto::msg::ASIDE_SECS) + REPLY_WAIT;
+            let answer = match request_within(Request::Aside { id, text }, wait) {
+                Ok(Ok(Reply::Aside { text })) => Ok(text),
+                Ok(Ok(r)) => Err(format!("the daemon answered the aside to chat s{id} with {r:?}")),
+                Ok(Err(e)) => Err(e),
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                    Err(format!("the daemon did not answer the aside to chat s{id} within {}s", wait.as_secs()))
+                }
+                Err(e) => Err(format!("asking chat s{id} aside: {e}")),
+            };
+            if let Err(e) = &answer {
+                eprintln!("harness-native: aside {id}: {e}");
+            }
+            then(answer);
+            wake();
         });
     }
 

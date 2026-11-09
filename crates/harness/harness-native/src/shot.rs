@@ -55,6 +55,10 @@ pub fn run(path: &str) -> Result<(), String> {
             app.palette_query(&q);
         }
     }
+    // HARNESS_NATIVE_SHOT_OPEN `<url>|<path>`: opened as a press on a link to it would (the browser pane on the right).
+    if let Ok(t) = std::env::var("HARNESS_NATIVE_SHOT_OPEN") {
+        app.open_target(&t, false);
+    }
     // A session id, a run (`r12`) or one of its stages (`r12.0`).
     if let Ok(s) = std::env::var("HARNESS_NATIVE_SHOT_SELECT") {
         if s == "archive" {
@@ -293,6 +297,8 @@ pub fn run(path: &str) -> Result<(), String> {
     let px = renderer.read(&tex);
     write_png(path, &app, &px, (w * backing) as u32, (h * backing) as u32)?;
     eprintln!("harness-native: wrote {path}");
+    // As the window does when the app quits: the chats' drafts are kept for the next launch.
+    app.flush_drafts();
     if let Ok(pfm) = std::env::var("HARNESS_NATIVE_SHOT_PFM") {
         write_pfm(&pfm, &renderer.read_float(&tex), (w * backing) as usize, (h * backing) as usize)?;
     }
@@ -414,14 +420,19 @@ fn press(app: &mut App, spec: &str) {
     };
     eprintln!("harness-native: shot key {spec}: {out:?}");
     // A selector goes up the responder chain to the view (src/window.rs): this app plays the view's part, with
-    // HARNESS_NATIVE_SHOT_CLIP as the pasteboard (`\n` in it a newline); what a copy or cut would put on it is logged.
+    // HARNESS_NATIVE_SHOT_CLIP as the pasteboard (`\n` in it a newline), or HARNESS_NATIVE_SHOT_CLIP_PICTURE (a PNG file)
+    // as a picture on it; what a copy or cut would put on it is logged.
     if let crate::app::Outcome::Selector(sel) = out {
         let clip = std::env::var("HARNESS_NATIVE_SHOT_CLIP").unwrap_or_default().replace("\\n", "\n");
         let took = match sel.as_str() {
             "copy:" => app.copy(),
             "cut:" => app.cut(),
             "paste:" => {
-                app.paste(&clip);
+                match std::env::var("HARNESS_NATIVE_SHOT_CLIP_PICTURE").map(std::fs::read) {
+                    Ok(Ok(png)) => app.paste_pictures(&[png]),
+                    Ok(Err(e)) => eprintln!("harness-native: shot paste: HARNESS_NATIVE_SHOT_CLIP_PICTURE: {e}"),
+                    Err(_) => app.paste(&clip),
+                }
                 None
             }
             _ => None,

@@ -125,8 +125,9 @@ template hn.ObjRow {
 
 ## Tokens, theme and look
 
-- One theme: every colour is a role at the top of 00-tokens.flecs (`tone_<role>`, the blaze site's palette, dark and
-  light): grounds `ground`, `sidebar`, `card`, `raised` (menus, popovers), `well` (fields, code), `term_ground`; lines
+- One theme: every colour is a role at the top of 00-tokens.flecs (`tone_<role>`; dark is near-black with a cool
+  undertone and one electric blue, light the blaze site's paper): grounds `ground`, `sidebar`, `card`, `raised`, `glass`
+  and `glass_edge` (what floats in a window of its own), `well` (fields, code), `term_ground`; lines
   `line`, `line_strong`; inks `ink_strong`, `ink`, `ink_muted`, `ink_faint`; washes `hover`, `wash`, `selection`,
   `selection_focus`, `press`, `scrim`; `accent`, `accent_wash`, `on_accent`, `link`, `code_ink`; states `success`,
   `warning`, `error` and their `_wash`. Below them sit the palettes (kinds, brand marks, file types, chart series,
@@ -139,9 +140,28 @@ template hn.ObjRow {
   `tone`) and panics on a missing one.
 - The sidebar is the main card's own ground with one `line` hairline (hn.Seam) between them: no lighter slab, no
   shadow. Only the terminal follows the user's Ghostty theme: its palette, cursor, font, padding and `term_ground` (a
-  terminal pane's ground, src/app/ghostty.rs); the app's chrome stays the theme's.
-- Taste: native macOS, minimal. One font family for UI (Inter) at macOS sizes, hierarchy by weight/size/tone,
-  no noise on rows, meta on hover, highlights hug their target, motion on springs, never a step.
+  terminal pane's ground, src/app/ghostty.rs); the app's chrome, and code in a chat (`code_ink.*`, JetBrains' Islands
+  Dark editor scheme), stay the theme's.
+- Taste: dark, sleek and quiet, a cockpit at night, native macOS underneath. Concretely:
+  - **Near-black, few steps.** Grounds a step or two apart on a cool near-black; hairlines barely over the ground; no
+    grey slabs. Colour only where it means something (a state, the one accent, a series), never per kind for fun.
+  - **Glass only for what floats.** What sits in a window of its own (ui.Menu: menus, popovers, hover cards) is glass:
+    `Frost` on its node puts the system's vibrancy behind its window (src/window/overlay.rs), seen through
+    `tone_glass` and edged by `tone_glass_edge`. Panels under it stay solid.
+  - **Type is the hierarchy.** One UI family (Inter) at macOS sizes; weight, size and ink tone separate levels before
+    any box or rule does. Rows carry no noise: what matters now trails a row (what an agent is doing, the command or
+    file), when is a tooltip, never a timestamp column.
+  - **State by light, not marks.** Working breathes, idle fades, done earns a brief check (or a cross), failure is the
+    error ink. No badges for states that are already visible.
+  - **Show what changed, not what was looked at.** Summaries name their targets ("Edited chat.rs, ran cargo test");
+    reads and listings are said only when nothing else happened.
+  - **Lists are live.** A tree shows what is running or just finished; what is done leaves on its own for the Archive.
+  - **Chrome only when asked.** A pane shows its content; its toolbar comes when it is used (the browser pane's
+    address on cmd+L), a detail view when its summary is pressed (the context donut opening to its parts).
+  - **Motion lands, it does not glide.** Springs settle in under a tenth of a second; selection is where it is at once;
+    rows arriving or leaving still move so the eye can follow. Never a step, never a slide that reads as lag.
+  - **Nothing written while you were away animates.** Text arriving in a pane you are watching streams in; switching
+    to it shows what came meanwhile at rest.
 
 ## Keybindings are data
 

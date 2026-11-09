@@ -33,8 +33,15 @@ hn {
       Flex: {axis: Column, gap: 0, align: Center, justify: Start, wrap: false}
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
       Padding: {l: $chat_pad, r: $chat_pad, t: $chat_foot_pad_t, b: $chat_foot_pad_b}
+      // An aside's answer over the composer while it shows (hn.ChatAside, src/app/chat.rs fill_chat_aside); empty, it
+      // takes no room.
+      aside : ui.Column {
+        Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+        Size: {w: {kind: Grow, value: 1, min: 0, max: $chat_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      }
       // The composer: one card, the words over a bar of controls, as wide as the transcript's column. A press anywhere
-      // on it that no control takes gives the words the keys.
+      // on it that no control takes gives the words the keys. While its draft starts with a space (an aside) it takes
+      // the aside's tint (src/app/chat.rs sets its Fill and Edge from hn.Theme.aside and aside_line).
       card : ui.Column {
         Fill: $tone_card
         Edge: {dark: $tone_line.dark, light: $tone_line.light}
@@ -51,18 +58,24 @@ hn {
         mention : ui.Node {
           Overlay
         }
-        entry : ui.Row {
-          Flex: {axis: Row, gap: 0, align: Start, justify: Start, wrap: false}
+        // The words, under the pictures pasted into the message (hn.ChatAttach each, src/app/chat.rs fill_pictures): each
+        // thumbnail brings the space under it, so with none the strip takes no room and the card's spacing is as it was.
+        entry : ui.Column {
+          Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
           Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
           Padding: {l: $chat_composer_text_inset, r: $chat_composer_text_inset, t: 0, b: 0}
+          attach : ui.Row {
+            Flex: {axis: Row, gap: $chat_attach_gap, align: Start, justify: Start, wrap: true}
+            Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+          }
           // Grows with its words to most of the pane, then scrolls (src/app/chat.rs steps its FieldScroll).
           area : ui.field.GrowingTextArea {
             GrowLimit: {share: $textarea_grow_share, keep: $chat_input_keep}
           }
         }
         // The controls (src/app/chat.rs and chat/pick.rs keep each slot, each only while it has something to say): the
-        // model and effort (hn.ChatPick) at the leading edge; the context meter (hn.ChatContext) and, while the agent works, its
-        // breathing ring (hn.ChatWorking) at the trailing one. No buttons: Return sends, Escape stops.
+        // model and effort (hn.ChatPick) at the leading edge; at the trailing one the context meter (hn.ChatContext), its
+        // one ring breathing while the agent works. No buttons: Return sends, Escape stops.
         bar : ui.Row {
           Cursor: {shape: Arrow}
           Flex: {axis: Row, gap: $chat_bar_gap, align: Center, justify: Start, wrap: false}
@@ -73,10 +86,6 @@ hn {
           }
           spacer : ui.Spacer {}
           meter : ui.Row {
-            Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
-            Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-          }
-          act : ui.Row {
             Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
             Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
           }
@@ -266,9 +275,10 @@ hn {
 
   // The context meter (den's): a small ring filling as the conversation fills its model's window, in a square that takes
   // the pointer; muted, then hn.ChatContextTone's warn from 80% and full from 95% (pick.rs). Under the pointer,
-  // hn.ChatContextPop (widgets/context.flecs) says how full (the percentage at its head) and with what.
+  // hn.ChatContextPop (widgets/context.flecs) shows how full as a donut of its parts; a press opens it to every part.
   prefab ChatContext : ui.Row {
     Hoverable
+    Pressable
     Cursor: {shape: Arrow}
     Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
     Size: {w: {kind: Fixed, value: $chat_bar_h, min: 0, max: 0}, h: {kind: Fixed, value: $chat_bar_h, min: 0, max: 0}}
@@ -328,6 +338,108 @@ hn {
         TextStyle: {size: $size_chat, line: $line_chat_bubble, role: 0, bold: 0}
       }
     }
+  }
+
+  // An aside's answer (src/app/chat.rs fill_chat_aside): a question asked of a fork of the conversation (Return on a
+  // draft that starts with a space), never part of it. A card over the composer in the aside's tint (tone_aside, the
+  // composer's own while a draft is one), chat_aside_gap above it: its head the quiet word "Aside", the working ring
+  // (hn.ChatAsideWorking, in `head.act`) while it asks and a close button (Escape closes it too); its body the answer's words
+  // as the transcript draws them (hn.ChatProse and its kin), or the question in a quiet note while it asks, or the
+  // error naming what failed (hn.ChatError). Gone once closed; a new aside takes its place.
+  prefab ChatAside : ui.Column {
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 0, r: 0, t: 0, b: $chat_aside_gap}
+    plate : ui.Column {
+      Fill: $tone_aside
+      Edge: {dark: $tone_aside_line.dark, light: $tone_aside_line.light}
+      Shape: {radius: $chat_aside_radius, n: 4, border: 1, feather: 0}
+      Cursor: {shape: Arrow}
+      Flex: {axis: Column, gap: $chat_aside_head_gap, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      Padding: {l: $chat_aside_pad_x, r: $chat_aside_pad_x, t: $chat_aside_pad_t, b: $chat_aside_pad_b}
+      head : ui.Row {
+        Flex: {axis: Row, gap: $chat_bar_gap, align: Center, justify: Start, wrap: false}
+        Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $chat_bar_h, min: 0, max: 0}}
+        label : ui.Line {
+          Text: {s: "Aside"}
+          Fill: $tone_ink_muted
+          TextStyle: {size: $size_chrome, line: $line_chrome, role: 0, bold: 0}
+        }
+        act : ui.Row {
+          Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+          Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+        }
+        spacer : ui.Spacer {}
+        close : ui.IconButton {
+          Action: {name: ""}
+          Tooltip: {text: "Close  esc"}
+          AlignSelf: {align: Center}
+          Size: {w: {kind: Fixed, value: $chat_aside_close, min: 0, max: 0}, h: {kind: Fixed, value: $chat_aside_close, min: 0, max: 0}}
+          icon : ui.Symbol {
+            Size: {w: {kind: Fixed, value: $chat_aside_icon, min: 0, max: 0}, h: {kind: Fixed, value: $chat_aside_icon, min: 0, max: 0}}
+          }
+        }
+      }
+      body : ui.Column {
+        Cursor: {shape: Text}
+        Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+        Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      }
+    }
+  }
+
+  // An aside's working ring (in its head while it is asked): the composer's, saying what Escape does here.
+  prefab ChatAsideWorking : hn.ChatWorking {
+    Tooltip: {text: "Asking aside  esc to close"}
+  }
+
+  // The words of a message sent with pictures, under them: no turn's gap over it (the pictures took it).
+  prefab ChatUserUnder : hn.ChatUser {
+    Padding: {l: $chat_bubble_lead, r: 0, t: 0, b: $chat_gap_reply - $chat_block_half}
+  }
+
+  // A picture attached to the message being written: its thumbnail (sized by fill_attach to chat_attach_h tall at its
+  // aspect), rounded, with a remove button over its top trailing corner on a raised plate so it reads over any picture.
+  prefab ChatAttach : ui.ZStack {
+    Cursor: {shape: Arrow}
+    Flex: {axis: Z, gap: 0, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 0, r: 0, t: 0, b: $chat_attach_below}
+    pic : ui.Node {
+      Picture: {handle: ""}
+      Clip
+      Shape: {radius: $chat_attach_radius, n: 4, border: 0, feather: 0}
+    }
+    corner : ui.Row {
+      Flex: {axis: Row, gap: 0, align: Start, justify: End, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+      Padding: {l: 0, r: $chat_attach_inset, t: $chat_attach_inset, b: 0}
+      remove : ui.IconButton {
+        Fill: $tone_raised
+        Shape: {radius: $chat_attach_remove / 2, n: 2, border: 0, feather: 0}
+        Size: {w: {kind: Fixed, value: $chat_attach_remove, min: 0, max: 0}, h: {kind: Fixed, value: $chat_attach_remove, min: 0, max: 0}}
+        Tooltip: {text: "Remove picture"}
+        icon : ui.Symbol {
+          Size: {w: {kind: Fixed, value: $chat_attach_icon, min: 0, max: 0}, h: {kind: Fixed, value: $chat_attach_icon, min: 0, max: 0}}
+        }
+      }
+    }
+  }
+  // A sent message's pictures, over its bubble at the trailing edge (Row::Pictures): the same thumbnails, larger, with
+  // no remove button.
+  prefab ChatSentPictures : ui.Row {
+    Flex: {axis: Row, gap: $chat_attach_gap, align: Start, justify: End, wrap: true}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: $chat_bubble_lead, r: 0, t: $chat_gap_turn - $chat_block_half, b: $chat_attach_gap}
+  }
+  prefab ChatSentPicturesLast : hn.ChatSentPictures {
+    Padding: {l: $chat_bubble_lead, r: 0, t: $chat_gap_turn - $chat_block_half, b: $chat_gap_reply - $chat_block_half}
+  }
+  prefab ChatSentPicture : ui.Node {
+    Picture: {handle: ""}
+    Clip
+    Shape: {radius: $chat_attach_radius, n: 4, border: 0, feather: 0}
   }
 
   // A paragraph of the agent's words (inline markdown): the body ink, bold a semibold step in the strong ink, inline code

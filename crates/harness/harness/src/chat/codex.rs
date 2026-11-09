@@ -3,7 +3,9 @@
 //! protocol is `codex app-server generate-ts` (openai/codex `codex-rs/app-server-protocol`, v2).
 //!
 //! The session: `initialize` (answered), the `initialized` notification, `thread/start` in the session's cwd (answered
-//! with the thread and its model), or for a resumed chat `thread/resume` of its thread (answered the same way); then each user message is a `turn/start` on that thread. Messages sent before the
+//! with the thread and its model), or for a resumed chat `thread/resume` of its thread, or for an aside `thread/fork` of it
+//! (ephemeral: the fork is never written, so it goes with its process) (each answered the same way); then each user
+//! message is a `turn/start` on that thread. Messages sent before the
 //! thread exists, or while a turn is in flight, wait here and go one turn each, in order (as Claude queues them).
 //!
 //! What Codex sends per turn: `turn/started`, then per item `item/started` / `item/completed` (an `agentMessage`, a
@@ -27,6 +29,15 @@ use harness_proto::event::{Body, ContextCall, ContextUse, Kind, ModelChoice};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 
+/// A message's `turn/start` input: each picture as a `localImage` (Codex reads the file), then the words.
+fn input_items(text: &str, images: &[String]) -> Value {
+    let mut items: Vec<Value> = images.iter().map(|p| json!({"type": "localImage", "path": p})).collect();
+    if !text.is_empty() || items.is_empty() {
+        items.push(json!({"type": "text", "text": text, "text_elements": []}));
+    }
+    Value::Array(items)
+}
+
 /// Notifications this client never reads, asked off at initialize so the raw record stays small.
 const OPT_OUT: &[&str] = &[
     "turn/moderationMetadata",
@@ -40,10 +51,17 @@ const OPT_OUT: &[&str] = &[
     "rawResponse/completed",
 ];
 
+/// Which thread a session runs on: a new one, a resumed chat's own, or an aside's fork of a chat's (by Codex's id for it).
+enum Begin {
+    New,
+    Resume(String),
+    Fork(String),
+}
+
 /// What a request of ours was, so its answer can be read.
 enum Pending {
     Initialize,
-    /// `thread/start`, or `thread/resume` (answered alike).
+    /// `thread/start`, `thread/resume` or `thread/fork` (answered alike).
     ThreadStart,
     TurnStart,
     Interrupt,
@@ -65,8 +83,8 @@ struct Open {
 
 pub struct Codex {
     cwd: String,
-    /// The thread to resume instead of starting one.
-    resume: Option<String>,
+    /// The thread it starts, resumes or forks.
+    begin: Begin,
     next_id: u64,
     pending: HashMap<u64, Pending>,
     thread: Option<String>,
@@ -78,7 +96,7 @@ pub struct Codex {
     turn: Option<String>,
     /// An interrupt asked for before the turn started.
     interrupt_pending: bool,
-    queue: VecDeque<String>,
+    queue: VecDeque<(String, Vec<String>)>,
     out: Vec<String>,
     open: HashMap<String, Open>,
     seq: u64,
@@ -109,19 +127,26 @@ pub struct Codex {
 impl Codex {
     #[must_use]
     pub fn new(cwd: &str) -> Self {
-        Self::with_thread(cwd, None)
+        Self::with_thread(cwd, Begin::New)
     }
 
     /// A chat that resumes Codex's thread `thread` (its id from the chat's log).
     #[must_use]
     pub fn resume(cwd: &str, thread: &str) -> Self {
-        Self::with_thread(cwd, Some(thread.to_owned()))
+        Self::with_thread(cwd, Begin::Resume(thread.to_owned()))
     }
 
-    fn with_thread(cwd: &str, resume: Option<String>) -> Self {
+    /// An aside on Codex's thread `thread` (a chat's, from its log): an ephemeral fork of it, which takes the aside's one
+    /// turn and is never written, so the chat's own thread is untouched.
+    #[must_use]
+    pub fn fork(cwd: &str, thread: &str) -> Self {
+        Self::with_thread(cwd, Begin::Fork(thread.to_owned()))
+    }
+
+    fn with_thread(cwd: &str, begin: Begin) -> Self {
         Self {
             cwd: cwd.to_owned(),
-            resume,
+            begin,
             next_id: 0,
             pending: HashMap::new(),
             thread: None,
@@ -162,13 +187,13 @@ impl Codex {
         json!({"id": id, "method": method, "params": params}).to_string()
     }
 
-    fn turn_start(&mut self, text: &str) -> String {
+    fn turn_start(&mut self, text: &str, images: &[String]) -> String {
         self.in_turn = true;
         self.turn = None;
         let thread = self.thread.clone().unwrap_or_default();
         let mut params = json!({
             "threadId": thread,
-            "input": [{"type": "text", "text": text, "text_elements": []}],
+            "input": input_items(text, images),
             "summary": "auto",
         });
         if let Some(m) = &self.model {
@@ -183,8 +208,8 @@ impl Codex {
     /// Start the next waiting message's turn, when the thread can take one.
     fn pump(&mut self) {
         if self.thread.is_some() && !self.in_turn {
-            if let Some(text) = self.queue.pop_front() {
-                let line = self.turn_start(&text);
+            if let Some((text, images)) = self.queue.pop_front() {
+                let line = self.turn_start(&text, &images);
                 self.out.push(line);
             }
         }
@@ -217,8 +242,11 @@ impl Codex {
                     return self.refuse_waiting(&format!("codex app-server refused initialize: {e}"));
                 }
                 self.out.push(json!({"method": "initialized"}).to_string());
-                let list = self.request("model/list", json!({"includeHidden": false}), Pending::ModelList(Vec::new()));
-                self.out.push(list);
+                // A fork answers one question and goes: the chat it forks keeps the models event, so it lists none.
+                if !matches!(self.begin, Begin::Fork(_)) {
+                    let list = self.request("model/list", json!({"includeHidden": false}), Pending::ModelList(Vec::new()));
+                    self.out.push(list);
+                }
                 let mut params = json!({"cwd": self.cwd, "approvalPolicy": "never", "sandbox": "danger-full-access"});
                 if let Some(m) = &self.model {
                     params["model"] = json!(m);
@@ -228,14 +256,22 @@ impl Codex {
                 if let Some(e) = &self.effort {
                     params["config"] = json!({"model_reasoning_effort": e});
                 }
-                let method = match &self.resume {
-                    Some(thread) => {
+                let method = match &self.begin {
+                    Begin::Resume(thread) => {
                         // Its turns are already in the chat's log: only the thread's state comes back.
                         params["threadId"] = json!(thread);
                         params["excludeTurns"] = json!(true);
                         "thread/resume"
                     }
-                    None => "thread/start",
+                    Begin::Fork(thread) => {
+                        // The v2 ThreadForkParams: loaded from disk by id, the history carried over but not sent back,
+                        // and `ephemeral` so the fork is never persisted.
+                        params["threadId"] = json!(thread);
+                        params["excludeTurns"] = json!(true);
+                        params["ephemeral"] = json!(true);
+                        "thread/fork"
+                    }
+                    Begin::New => "thread/start",
                 };
                 let line = self.request(method, params, Pending::ThreadStart);
                 self.out.push(line);
@@ -244,9 +280,10 @@ impl Codex {
             Pending::ThreadStart => {
                 if let Some(e) = err {
                     self.dead = true;
-                    let what = match &self.resume {
-                        Some(t) => format!("thread/resume of thread {t}"),
-                        None => "thread/start".to_owned(),
+                    let what = match &self.begin {
+                        Begin::Resume(t) => format!("thread/resume of thread {t}"),
+                        Begin::Fork(t) => format!("thread/fork of thread {t}"),
+                        Begin::New => "thread/start".to_owned(),
                     };
                     return self.refuse_waiting(&format!("codex app-server refused {what}: {e}"));
                 }
@@ -254,7 +291,7 @@ impl Codex {
                 self.thread = r["thread"]["id"].as_str().map(str::to_owned);
                 self.pump();
                 let model = r["model"].as_str().or_else(|| r["thread"]["model"].as_str()).unwrap_or("");
-                // The v2 ThreadStartResponse and ThreadResumeResponse both carry `reasoningEffort` (a string, or null
+                // The v2 ThreadStartResponse, ThreadResumeResponse and ThreadForkResponse all carry `reasoningEffort` (a string, or null
                 // when the model has none): the effort the thread runs with.
                 let effort = r["reasoningEffort"].as_str().filter(|e| !e.is_empty()).map(str::to_owned);
                 self.runs = (model.to_owned(), effort.clone());
@@ -655,13 +692,13 @@ impl super::Adapter for Codex {
         std::mem::take(&mut self.out)
     }
 
-    fn user(&mut self, text: &str) -> Vec<String> {
+    fn user(&mut self, text: &str, images: &[String]) -> Vec<String> {
         if self.dead {
             // The thread never started, so nothing would answer (the error said why); the turn ends when Codex exits.
             return Vec::new();
         }
         self.ledger.user(text);
-        self.queue.push_back(text.to_owned());
+        self.queue.push_back((text.to_owned(), images.to_vec()));
         self.pump();
         std::mem::take(&mut self.out)
     }

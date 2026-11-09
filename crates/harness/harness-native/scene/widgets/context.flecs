@@ -1,6 +1,6 @@
 // The context meter's popover (src/app/chat/context.rs): while the pointer is on the meter (hn.ChatContext, chat.flecs)
 // or on the popover itself, a plate over it says what the context holds, part by part. Its lines are a keyed list the
-// host keeps (harness_native_ui_view::for_each_of): a head, the window as a bar with a segment a part, a row a part (its
+// host keeps (harness_native_ui_view::for_each_of): a head, the window as a donut with a slice a part, a row a part (its
 // splits under it, quieter), and a foot. Each line is a template; the host sets its props from the chat's last
 // `context` event (harness-proto ContextUse) and flecs re-runs only what reads a prop that changed. The look is all here:
 // the host passes words, numbers and an ink slot, never a colour or a size. Templates only: in flecs 4.2.0 a template
@@ -42,14 +42,23 @@ hn {
     }
   }
 
-  // One part's segment: its share of the window (0 to 1), in its ink.
+  // One part's slice of the donut: a ring segment (`d`, the host's path in a 100-point square, clockwise from the top)
+  // filled in its ink, laid over the whole chart.
   @tree ChildOf
-  template ChatContextSeg {
-    prop share: f64 = 0
+  template ChatContextSlice {
+    prop d: string = ""
     prop ink: string = ""
+    prop dim: bool = false
     (IsA, ui.Node)
+    Overlay
     hn.ChatContextInk: {ink: $ink}
-    Size: {w: {kind: Percent, value: $share, min: 0, max: 0}, h: {kind: Percent, value: 1, min: 0, max: 0}}
+    Vector: {d: $d, view_x: 0, view_y: 0, view_w: 100, view_h: 100, stroke_w: 0}
+    // Dimmed while the pointer is on another slice (that one's name is in the middle).
+    if $dim {
+      Pose: {dx: 0, dy: 0, shrink: 0, fade: $chat_ctx_dim, cut: 0}
+    } else {
+      Pose: {dx: 0, dy: 0, shrink: 0, fade: 0, cut: 0}
+    }
   }
 
   // A part: its dot in its ink, its name, then its tokens and its share of the window flush right. A split (`split`,

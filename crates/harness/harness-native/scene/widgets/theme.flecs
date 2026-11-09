@@ -37,6 +37,9 @@ hn {
     accent { Fill: $tone_accent }
     accent_wash { Fill: $tone_accent_wash }
     on_accent { Fill: $tone_on_accent }
+    // An aside's tint: the composer's card while its draft is one, and its edge (src/app/chat.rs fill_chat_pane).
+    aside { Fill: $tone_aside }
+    aside_line { Fill: $tone_aside_line }
     link { Fill: $tone_link }
     code_ink { Fill: $tone_code_ink }
     // States (a status dot's: running success, lost warning, failed or killed error, ended ink_faint; src/app.rs dot_tone).
@@ -54,6 +57,14 @@ hn {
     // How long after it ended a finished run with no session leaves the tree for the Archive (seconds, as a width).
     archive_after {
       Size: {w: {kind: Fixed, value: $archive_after_s, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+    // How far the context ring breathes down while the agent works (chat/pick.rs breathe; a share, as a width).
+    chat_working_breath_at {
+      Size: {w: {kind: Fixed, value: $chat_working_breath, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+    // How long a finished child keeps its row (and its done mark) under a folded node (seconds, as a width).
+    tree_linger_for {
+      Size: {w: {kind: Fixed, value: $tree_linger_s, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
     }
     // The same for a top-level session from before the daemon started.
     archive_past_after {
@@ -82,6 +93,17 @@ hn {
     // How far a nested list item steps in a level (src/app/chat.rs fill_row; points, as a width).
     chat_list_nest {
       Size: {w: {kind: Fixed, value: $chat_list_nest_w, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+    // A pasted picture's thumbnail height and widest in the composer, and a sent message's pictures' height
+    // (src/app/chat.rs fill_pictures; points, as a width).
+    chat_attach_tall {
+      Size: {w: {kind: Fixed, value: $chat_attach_h, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+    chat_attach_wide {
+      Size: {w: {kind: Fixed, value: $chat_attach_max_w, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+    chat_sent_tall {
+      Size: {w: {kind: Fixed, value: $chat_sent_h, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
     }
     // A chip's hover card (src/app/chat/peek.rs, scene/widgets/peek.flecs): how long the pointer rests on a chip before
     // it opens (seconds), and how many of a file's lines a path's card shows (each as Size.w's value).

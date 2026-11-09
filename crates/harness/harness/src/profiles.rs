@@ -30,7 +30,7 @@ pub const KINDS: &[&str] = &["claude", "codex", "cursor", "shell"];
 /// The note every agent gets on top of its own system prompt (claude's `--append-system-prompt`, codex's
 /// `developer_instructions`, cursor's MCP server instructions): the always-on topics, one file per topic under
 /// `system_note/`, each with its topic's name (what a chat's context popover names its row), joined in this order with
-/// a blank line between them, then the skills index ([`Note`]). A topic only some tasks need is a skill (skills.rs),
+/// a blank line between them, then the session's AGENTS.md files (instructions.rs), then the skills index ([`Note`]). A topic only some tasks need is a skill (skills.rs),
 /// not a part here.
 pub const SYSTEM_NOTE_PARTS: &[(&str, &str)] = &[
     ("tools", include_str!("system_note/tools.md")),     // the one tool, ts, and its typed calls
@@ -51,9 +51,17 @@ struct Note {
 
 impl Note {
     fn of(ctx: &Ctx) -> anyhow::Result<Note> {
-        let skills = crate::skills::Skills::discover(std::path::Path::new(ctx.cwd))?;
+        let cwd = std::path::Path::new(ctx.cwd);
+        let skills = crate::skills::Skills::discover(cwd)?;
+        let instructions = crate::instructions::Instructions::discover(cwd)?.note();
         let index = skills.index();
-        let text = SYSTEM_NOTE_PARTS.iter().map(|(_, part)| part.trim()).chain([index.as_str()]).collect::<Vec<_>>().join("\n\n");
+        let text = SYSTEM_NOTE_PARTS
+            .iter()
+            .map(|(_, part)| part.trim())
+            .chain([instructions.as_str(), index.as_str()])
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
         Ok(Note { text, skills })
     }
 }
@@ -172,7 +180,9 @@ fn claude(ctx: &Ctx, note: &Note) -> anyhow::Result<Launch> {
         ("DISABLE_TELEMETRY", "1"),
         ("DISABLE_ERROR_REPORTING", "1"),
         ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
-        ("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "1"),  // no CLAUDE.md / AGENTS.md from any level
+        // No CLAUDE.md / AGENTS.md from claude's own loader: harness puts AGENTS.md in the note for every kind alike
+        // (instructions.rs).
+        ("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "1"),
         ("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1"),
         ("CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS", "1"),
         // Show the real cursor at the input instead of hiding it (?25l) and painting an inverse block. Claude takes
@@ -224,7 +234,7 @@ fn codex(ctx: &Ctx, note: &Note) -> anyhow::Result<Launch> {
         "-c".into(), "mcp_servers.harness.default_tools_approval_mode=\"approve\"".into(), // ts runs without prompts
         "-c".into(), "web_search=\"disabled\"".into(),
         "-c".into(), "tools.experimental_request_user_input={enabled=false}".into(),
-        "-c".into(), "project_doc_max_bytes=0".into(), // no AGENTS.md from the repo (global one is out via CODEX_HOME)
+        "-c".into(), "project_doc_max_bytes=0".into(), // AGENTS.md comes in the note (instructions.rs), not codex's loader
         "-c".into(), "skills.include_instructions=false".into(),
         "-c".into(), "skills.bundled={enabled=false}".into(),
         "-c".into(), format!("developer_instructions={}", toml_str(&note.text)),
