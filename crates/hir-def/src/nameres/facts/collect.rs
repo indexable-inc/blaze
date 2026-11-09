@@ -160,6 +160,15 @@ pub(crate) fn crate_data(db: &Db, krate: Crate) -> Arc<DefMapCrateData> {
             crate_data.handles = true;
             continue;
         }
+        // `#![blaze::views]`: a receiver may name the fields it borrows, `&self.{a, b}`
+        // (`DefMap::views`, docs/v2/plan/design/edition.md, change 3).
+        if let [tool, name] = attr.path.segments()
+            && tool.symbol().as_str() == "blaze"
+            && name.symbol().as_str() == "views"
+        {
+            crate_data.views = true;
+            continue;
+        }
         let Some(attr_name) = attr.path.as_ident() else { continue };
 
         match () {

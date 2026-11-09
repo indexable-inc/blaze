@@ -43,6 +43,7 @@ mod relation;
 mod rows;
 mod scan;
 pub mod timings;
+pub mod views;
 
 #[cfg(test)]
 mod budget;
@@ -58,6 +59,8 @@ mod handles_tests;
 mod missing_body_tests;
 #[cfg(test)]
 mod rpitit_tests;
+#[cfg(test)]
+mod views_tests;
 #[cfg(test)]
 mod served;
 
@@ -395,6 +398,15 @@ fn check_def<'db>(
         result.not_checked = Some(NotChecked::Off);
         return result;
     }
+    // `#![blaze::views]`: a view written on a receiver that is refused (in a crate without
+    // the attribute, on a trait method, naming what is not a field of `Self`) refuses the
+    // method, with or without a body.
+    if let DefWithBodyId::FunctionId(func) = def {
+        views::check_method(db, func, None, &mut result.diagnostics);
+        if !result.diagnostics.is_empty() {
+            return result;
+        }
+    }
     // A fn, const or static written without a body, or a variant without a discriminant: rustc
     // builds no MIR for it, so there is nothing to check and nothing to refuse (where Rust
     // requires a body, AST validation reports its absence). A body that is written but lowered
@@ -528,6 +540,7 @@ fn check_owner<'db>(
                 it.is_error()
                     && it.code != hir_ty_linear::LinearDiagnostic::CODE
                     && it.code != hir_ty_mir::mir::handles::ImpliedCopy::CODE
+                    && it.code != views::CODE
             })
     {
         return alpha;
@@ -758,6 +771,12 @@ fn check_owner_once<'db>(
             drop_check: None,
         }));
     }
+    // `#![blaze::views]`: in a method with a view written, `self` is used only through it.
+    if let (Some(DefWithBodyId::FunctionId(func)), Some(&(body, None, None))) =
+        (def, bodies.first())
+    {
+        views::check_method(db, func, Some(body), &mut result.diagnostics);
+    }
     if debugging(db, owner) {
         if let Some(skipped) = &result.skipped {
             eprintln!("skipped {skipped}");
@@ -949,6 +968,10 @@ pub(crate) struct Ctx<'a, 'db> {
     glue: RefCell<FMap<'a, Ty<'db>, hir_ty::drop::DropGlue>>,
     /// The type of every place the checks name, each found once.
     pub(crate) places: RefCell<places::Places<'a, 'db>>,
+    /// `#![blaze::views]`: the fields of the view of the method each receiver borrow is made
+    /// for, by where it is made ([`views::call_views`]). Empty in a body that calls no method
+    /// with a view.
+    pub(crate) call_views: FMap<'a, cfg::Location, &'db [hir_ty_mir::mir::FieldIndex]>,
     /// The body's task's frame: what the checks of this body build.
     pub(crate) frame: &'a Frame,
 }
@@ -1038,6 +1061,7 @@ impl<'a, 'db> Ctx<'a, 'db> {
             copy: RefCell::new(mem::map(frame)),
             glue: RefCell::new(mem::map(frame)),
             places: RefCell::new(places::Places::new(frame, body)),
+            call_views: views::call_views(db, krate, body, frame),
             frame,
         }
     }

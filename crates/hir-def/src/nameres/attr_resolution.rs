@@ -142,6 +142,9 @@ impl DefMap {
                         // (docs/v2/plan/design/edition.md, change 1).
                         | "handles"
                         | "norefcount"
+                        // `#![blaze::views]`, from `DefMap::views`
+                        // (`hir_ty_borrowck::views`, docs/v2/plan/design/edition.md).
+                        | "views"
                         // `#[blaze::reflect]`, from `AttrFlags::BLAZE_REFLECT`
                         // (`hir_ty_comptime::struct_domain`, docs/v2/plan/design/comptime.md).
                         | "reflect"

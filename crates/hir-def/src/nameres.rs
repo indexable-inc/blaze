@@ -384,6 +384,9 @@ struct DefMapCrateData {
     /// blaze: `#![blaze::handles]`, under which a move of a `Share` value that is used again
     /// later is a copy (docs/v2/plan/design/edition.md, change 1; `hir_ty_mir::mir::handles`).
     handles: bool,
+    /// blaze: `#![blaze::views]`, under which a method's receiver may name the fields it
+    /// borrows, `&self.{a, b}` (docs/v2/plan/design/edition.md, change 3).
+    views: bool,
 
     edition: Edition,
     recursion_limit: Option<u32>,
@@ -404,6 +407,7 @@ impl DefMapCrateData {
             proc_macro: false,
             arbitrary_ints: false,
             handles: false,
+            views: false,
             edition,
             recursion_limit: None,
         }
@@ -422,6 +426,7 @@ impl DefMapCrateData {
             proc_macro: _,
             arbitrary_ints: _,
             handles: _,
+            views: _,
             edition: _,
             recursion_limit: _,
         } = self;
@@ -1179,6 +1184,13 @@ impl DefMap {
     #[inline]
     pub fn handles(&self) -> bool {
         self.data.handles
+    }
+
+    /// Whether the crate says `#![blaze::views]`: a method's receiver may name the fields it
+    /// borrows, and a private method's are inferred from its body (`hir_ty_borrowck::views`).
+    #[inline]
+    pub fn views(&self) -> bool {
+        self.data.views
     }
 
     /// The integer of an arbitrary width `name` names in this crate, as the builtin scope's
