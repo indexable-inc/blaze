@@ -94,6 +94,10 @@ enum Do {
     Zoom(i32),
 }
 
+/// What cmd+N starts a chat of an agent kind on before the person ever chose for it (kind, model id, effort): Fable 5.2 at
+/// medium for Claude. Any other kind starts as its agent does by default.
+const FIRST_CHOICE: &[(&str, &str, &str)] = &[("claude", "claude-fable-5-2", "medium")];
+
 /// A model and effort remembered for an agent kind (cmd+N's).
 #[derive(Clone, Debug, Default)]
 struct Choice {
@@ -1678,12 +1682,16 @@ impl App {
         self.choices.insert(kind.to_owned(), c);
     }
 
-    /// The model and effort last chosen for `kind` (here, else native.json `chat_choice`).
+    /// The model and effort last chosen for `kind` (here, else native.json `chat_choice`); for a kind never chosen for,
+    /// its [`FIRST_CHOICE`] when it has one.
     fn choice_of(&self, kind: &str) -> Choice {
         self.choices.get(kind).cloned().unwrap_or_else(|| {
-            let v = crate::prefs::get("chat_choice").and_then(|v| v.get(kind).cloned()).unwrap_or_default();
-            let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_owned);
-            Choice { model: s("model"), effort: s("effort") }
+            let v = crate::prefs::get("chat_choice").and_then(|v| v.get(kind).cloned());
+            let s = |k: &str| v.as_ref().and_then(|v| v.get(k)).and_then(|x| x.as_str()).map(str::to_owned);
+            match (v.is_some(), FIRST_CHOICE.iter().find(|(k, ..)| *k == kind)) {
+                (false, Some(&(_, model, effort))) => Choice { model: Some(model.to_owned()), effort: Some(effort.to_owned()) },
+                _ => Choice { model: s("model"), effort: s("effort") },
+            }
         })
     }
 
