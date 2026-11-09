@@ -33,6 +33,7 @@ hn {
     clear { Fill: $tone_clear }
     text_selection { Fill: $tone_text_selection }
     copy_sheen { Fill: $tone_copy_sheen }
+    sheen { Fill: $tone_sheen }
     // Accent, links, code.
     accent { Fill: $tone_accent }
     accent_wash { Fill: $tone_accent_wash }
@@ -133,6 +134,10 @@ hn {
     // least; and the spring the window rides back on after an over-drag pulled it aside.
     side_drag {
       SideDrag: {min: $side_min, max: $side_max, latch: $side_latch, give: $side_give, soft: $side_soft, rearm: $side_rearm, grab: $side_grab, reach: $side_reach, keep: $side_keep}
+    }
+    // Dragging the browser pane's left edge (src/app/web_drag.rs): its range, grab band and the main card's least.
+    web_drag {
+      PaneDrag: {min: $web_pane_min, max: $web_pane_max, grab: $web_grab, keep: $web_keep}
     }
     window_back { Motion: {omega: $window_back_omega, zeta: $window_back_zeta} }
     // The chat's effort under a sideways swipe over its control (src/app/chat/pick.rs): the travel a stop takes, when the

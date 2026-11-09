@@ -57,6 +57,15 @@ export const copy_tilt = 0.6
 export const copy_ink = 0.6
 export const copy_add_dark = 1
 export const copy_add_light = 1
+// ui.Shimmer's sheen (harness-native's sheen_think_* and sheen_still, 00-tokens.flecs): a slow drift of light through
+// the words, a pass of sheen_think_period seconds and sheen_think_rest at rest, a band sheen_think_band points either side
+// of its middle lifting them sheen_think_strength toward tone_sheen; steady at sheen_still of it under Reduce Motion.
+export const sheen_think_period = 2.6
+export const sheen_think_rest = 1.1
+export const sheen_think_band = 36
+export const sheen_think_strength = 0.7
+export const sheen_think_ease = 0.6
+export const sheen_still = 0.35
 export const caret_w = 1.5
 export const caret_h = 1.25
 export const caret_radius = 0.75
@@ -118,6 +127,8 @@ export const tone_scrim: Fill = {dark: {0, 0, 0, 0.36}, light: {0, 0, 0, 0.36}}
 export const tone_clear: Fill = {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
 export const tone_text_selection: Fill = {dark: {0.941, 0.965, 0.988, 0.22}, light: {0.941, 0.965, 0.988, 0.22}}
 export const tone_copy_sheen: Fill = {dark: {1.0, 0.878, 0.741, 0.26}, light: {1.0, 0.878, 0.741, 0.26}}
+// The ink a Sheen's band lifts words toward (ui.Shimmer; harness-native's tone_sheen): the warm white of the copy light.
+export const tone_sheen: Fill = {dark: {1.0, 0.957, 0.902, 1}, light: {1.0, 0.957, 0.902, 1}}
 export const tone_accent: Fill = {dark: {1.0, 0.561, 0.122, 1}, light: {1.0, 0.561, 0.122, 1}}
 export const tone_accent_wash: Fill = {dark: {1.0, 0.561, 0.122, 0.24}, light: {1.0, 0.561, 0.122, 0.24}}
 export const tone_on_accent: Fill = {dark: {1, 1, 1, 1}, light: {1, 1, 1, 1}}

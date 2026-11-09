@@ -399,6 +399,20 @@ impl App {
         }
     }
 
+    /// A press on the models' "older" row (`chat:older:<sid>:<kind>`): that kind's older models shown, the menu kept open
+    /// and the highlight on the first of them.
+    pub(in crate::app) fn chat_pick_older(&mut self, rest: &str) {
+        let Some((sid, kind)) = rest.split_once(':') else { return };
+        let Ok(sid) = sid.parse::<u64>() else { return };
+        let mut states = self.chat.borrow_mut();
+        let Some(st) = states.get_mut(&sid).filter(|st| st.pick.is_some()) else { return };
+        if !st.pick_nav.older.iter().any(|k| k == kind) {
+            st.pick_nav.older.push(kind.to_owned());
+        }
+        drop(states);
+        self.poke();
+    }
+
     /// A pick from the menu (`chat:set:<sid>:model:<id>` or `...:effort:<level>`): sent to the daemon, the menu closed.
     pub(in crate::app) fn chat_pick_set(&mut self, rest: &str) {
         let Some((sid, rest)) = rest.split_once(':') else { return };
@@ -511,7 +525,7 @@ impl App {
         let w = self.world.world_ref();
         let menus = [view::prefab(w, "ui.Menu"), view::prefab(w, "ui.SearchMenu"), view::prefab(w, "hn.ChatPickMenu")];
         let ours = |n: EntityView<'_>| {
-            n.try_cloned::<&Action>().is_some_and(|a| ["chat:pick:", "chat:set:", "chat:spawn:"].iter().any(|p| a.name.as_str().starts_with(p)))
+            n.try_cloned::<&Action>().is_some_and(|a| ["chat:pick:", "chat:set:", "chat:spawn:", "chat:older:"].iter().any(|p| a.name.as_str().starts_with(p)))
                 || menus.iter().flatten().any(|m| n.owns((flecs::IsA::ID, *m.id())))
         };
         let hovered = w.entity_named(APP).target(Hovered::id(), 0);
@@ -739,6 +753,7 @@ impl App {
                 match pick.as_deref() {
                     Some(a) if a.starts_with("chat:set:") => self.chat_pick_set(&a["chat:set:".len()..]),
                     Some(a) if a.starts_with("chat:spawn:") => self.chat_pick_spawn(&a["chat:spawn:".len()..]),
+                    Some(a) if a.starts_with("chat:older:") => self.chat_pick_older(&a["chat:older:".len()..]),
                     _ => {
                         self.chat_pick_close();
                     }
@@ -870,6 +885,8 @@ pub struct PickNav {
     error: Option<String>,
     slider: Option<u64>,
     efforts: Vec<String>,
+    /// The agent kinds whose older models are shown (their "older" row pressed), until the menu closes.
+    older: Vec<String>,
     /// The highlight has been put on the model the chat runs, once per opening (so keys start from it).
     seeded: bool,
 }
@@ -918,6 +935,54 @@ fn split_about(name: &str, about: &str) -> (String, String) {
     (meta.to_owned(), rest.trim().to_owned())
 }
 
+/// A model's row in the menu: its name, its version quiet after it, and the line about it. Claude lists a short name
+/// ("Opus") with its version at the head of its line ("Opus 5.5 · Best for everyday, complex tasks"); Codex lists one
+/// id-like name ("GPT-6.1-Sol"), read here as its family ("Sol") and version ("6.1"): no maker's prefix (the section's
+/// head and mark say whose it is) and no dashes. A line that only says the name again ("GPT-6.1 Terra Codex model.")
+/// is dropped.
+fn row_words(m: &ModelChoice) -> (String, String, String) {
+    let name = if m.name.is_empty() { m.id.as_str() } else { m.name.as_str() };
+    if m.about.contains(" · ") {
+        let (meta, about) = split_about(name, &m.about);
+        return (name.to_owned(), meta, about);
+    }
+    let (family, version) = family_version(name);
+    let about = m.about.trim();
+    let restates = about.to_ascii_lowercase().starts_with(&name.to_ascii_lowercase());
+    (family, version, if restates { String::new() } else { about.to_owned() })
+}
+
+/// An id-like model name read as its family and version: "GPT-6.1-Sol" and "GPT-6.1 Terra" are ("Sol", "6.1") and
+/// ("Terra", "6.1"), "gpt-5.6" is ("GPT", "5.6"), "o4-mini" is ("o4 Mini", ""). The maker's prefix goes, a word with no
+/// digit in it is capitalised, the first all-digit word is the version.
+fn family_version(name: &str) -> (String, String) {
+    let mut maker: Option<&str> = None;
+    let mut version = String::new();
+    let mut words: Vec<String> = Vec::new(); // alloc: a few words of one model's name, while the menu is open
+    for (i, t) in name.split(['-', ' ', '_']).filter(|t| !t.is_empty()).enumerate() {
+        match t.to_ascii_lowercase().as_str() {
+            "gpt" if i == 0 => maker = Some("GPT"),
+            "claude" if i == 0 => maker = Some("Claude"),
+            _ if version.is_empty() && t.starts_with(|c: char| c.is_ascii_digit()) && t.chars().all(|c| c.is_ascii_digit() || c == '.') => {
+                t.clone_into(&mut version);
+            }
+            _ if t.chars().any(|c| c.is_ascii_digit()) => words.push(t.to_owned()),
+            _ => {
+                let mut c = t.chars();
+                words.push(c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default());
+            }
+        }
+    }
+    let family = if words.is_empty() { maker.unwrap_or(name).to_owned() } else { words.join(" ") };
+    (family, version)
+}
+
+/// Version `a` is newer than `b` ("6.1" after "6", "6" after "5.6"); an empty one is never newer.
+fn newer(a: &str, b: &str) -> bool {
+    let parts = |v: &str| v.split('.').map(|p| p.parse::<u32>().unwrap_or(0)).collect::<Vec<_>>();
+    !a.is_empty() && parts(a) > parts(b)
+}
+
 /// The menu's models (hn.ChatPickModels `list`): every kind's under its head led by its maker's mark, the chat's own
 /// first, filtered by what is typed; what cannot be chosen says why instead. The highlight goes where the pointer (on
 /// `hovered`) or the keys put it (`nav`); the line about the highlighted model (else the chat's own) shows under them.
@@ -938,10 +1003,21 @@ fn model_rows(w: WorldRef<'_>, list: View<'_>, c: &MenuCtx<'_>, hovered: Option<
             continue;
         }
         let own = kind == c.kind;
-        rows.extend(models.iter().map(|m| {
-            let label = if m.name.is_empty() { m.id.clone() } else { m.name.clone() };
-            let (meta, about) = split_about(&label, &m.about);
-            let on = own && c.cur.is_some_and(|x| x.id == m.id);
+        let words: Vec<(String, String, String)> = models.iter().map(row_words).collect(); // alloc: a row's words per model
+        // A model with a newer version of its family in the list is older: folded behind one quiet row until that row is
+        // pressed (or anything is typed: search finds every model), unless the chat runs it.
+        let searching = !nav.search.query.trim().is_empty();
+        let older = |i: usize| words.iter().any(|(f, v, _)| *f == words[i].0 && newer(v, &words[i].1));
+        let runs = |m: &ModelChoice| own && c.cur.is_some_and(|x| x.id == m.id);
+        let fold = !searching && !nav.older.iter().any(|k| k == kind);
+        let folded: Vec<bool> = (0..models.len()).map(|i| fold && older(i) && !runs(&models[i])).collect(); // alloc: per model
+        let hidden = folded.iter().filter(|f| **f).count();
+        // The newest first, then (opened) the older ones, each kept in the order the agent lists them.
+        let order: Vec<usize> = (0..models.len()).filter(|&i| !older(i) || runs(&models[i])).chain((0..models.len()).filter(|&i| older(i) && !runs(&models[i]))).collect(); // alloc: per model
+        let shown: Vec<(&ModelChoice, &(String, String, String))> = order.iter().filter(|&&i| !folded[i]).map(|&i| (&models[i], &words[i])).collect(); // alloc: per model
+        rows.extend(shown.into_iter().map(|(m, (label, meta, about))| {
+            let (label, meta, about) = (label.clone(), meta.clone(), about.clone());
+            let on = runs(m);
             let detail = if own { about } else { format!("Starts a new {title} chat. {about}").trim_end().to_owned() };
             if on {
                 own_detail.clone_from(&detail);
@@ -961,6 +1037,18 @@ fn model_rows(w: WorldRef<'_>, list: View<'_>, c: &MenuCtx<'_>, hovered: Option<
                 },
             }
         }));
+        if hidden > 0 {
+            rows.push(Entry::Item {
+                text: String::new(),
+                data: Choice {
+                    label: String::new(),
+                    meta: format!("{hidden} older"),
+                    detail: "Earlier versions of these models.".to_owned(),
+                    on: false,
+                    action: format!("chat:older:{}:{kind}", c.sid),
+                },
+            });
+        }
     }
     let rows = search::filter(&nav.search.query, rows);
     // An error leads (cmd+N's remembered model no longer offered), until something is typed.
@@ -1099,6 +1187,23 @@ mod tests {
         assert_eq!(s("Opus", "Best for everyday tasks"), (String::new(), "Best for everyday tasks".into()));
         assert_eq!(s("gpt-6.1", "A frontier agentic coding model for long work \u{b7} reasoning"), (String::new(), "A frontier agentic coding model for long work \u{b7} reasoning".into()));
         assert_eq!(s("Sonnet", "Sonnet \u{b7} Fast"), (String::new(), "Fast".into()));
+    }
+
+    /// Codex's id-like names read as a family and a quiet version, no maker's prefix and no dashes; Claude's keep their
+    /// name, the version from the head of their line; a line that only restates the name is dropped. Older versions of a
+    /// family are told by their version.
+    #[test]
+    fn model_rows_read_as_a_family_and_a_version() {
+        assert_eq!(family_version("GPT-6.1-Sol"), ("Sol".into(), "6.1".into()));
+        assert_eq!(family_version("GPT-6.1 Terra"), ("Terra".into(), "6.1".into()));
+        assert_eq!(family_version("GPT-6-Astra"), ("Astra".into(), "6".into()));
+        assert_eq!(family_version("gpt-5.6"), ("GPT".into(), "5.6".into()));
+        assert_eq!(family_version("o4-mini"), ("o4 Mini".into(), String::new()));
+        let m = |name: &str, about: &str| ModelChoice { id: name.to_ascii_lowercase(), name: name.into(), about: about.into(), ..ModelChoice::default() };
+        assert_eq!(row_words(&m("GPT-6.1 Terra", "GPT-6.1 Terra Codex model.")), ("Terra".into(), "6.1".into(), String::new()));
+        assert_eq!(row_words(&m("GPT-6-Luna", "Fast and affordable model for easier tasks.")), ("Luna".into(), "6".into(), "Fast and affordable model for easier tasks.".into()));
+        assert_eq!(row_words(&m("Opus", "Opus 5.5 · Best for everyday, complex tasks")), ("Opus".into(), "5.5".into(), "Best for everyday, complex tasks".into()));
+        assert!(newer("6.1", "6") && newer("6", "5.6") && !newer("5.6", "6") && !newer("", "6") && !newer("6", "6"));
     }
 
     use harness_proto::event::{Body, Event};

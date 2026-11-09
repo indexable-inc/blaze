@@ -701,6 +701,10 @@ impl App {
             self.side_drag_move();
             return;
         }
+        if self.web_dragging() {
+            self.web_drag_move();
+            return;
+        }
         // Over a live browser page, or holding a press on one: the page's (app/browser.rs).
         if self.browser_pointer_move(m) {
             self.poke();
@@ -747,6 +751,11 @@ impl App {
         // On the sidebar's right edge (or the window's left edge, folded): drag it wider, narrower, shut or open.
         if b == Button::Left && self.on_side_edge() {
             self.side_drag_start();
+            return;
+        }
+        // On the browser pane's left edge: drag it wider or narrower (app/browser/drag.rs).
+        if b == Button::Left && self.on_web_edge() {
+            self.web_drag_start();
             return;
         }
         // A right press or a control-click on a sidebar row opens its menu at the pointer, the selection left where it is;
@@ -814,6 +823,10 @@ impl App {
         self.mods = m;
         if self.drag.active() {
             self.side_drag_end();
+            return;
+        }
+        if self.web_dragging() {
+            self.web_drag_end();
             return;
         }
         if b == Button::Left {

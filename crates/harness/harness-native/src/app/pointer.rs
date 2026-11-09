@@ -4,12 +4,13 @@
 //! the shape changes and again on AppKit's `cursorUpdate:`.
 //!
 //! What decides, first to last:
-//! 1. A drag in progress: the sidebar's edge (column resize, one-way folded or at its widest; src/app/side_drag.rs), a terminal selection (I-beam),
+//! 1. A drag in progress: the sidebar's edge (column resize, one-way folded or at its widest; src/app/side_drag.rs), the
+//!    browser pane's (one-way at its narrowest or widest; src/app/browser/drag.rs), a terminal selection (I-beam),
 //!    a press reported to a terminal's program (arrow), a press on a node (the shape it went down with).
 //!    Before the press on a node: an inline chip in the focused chat's words (`<Link>`, `<Path>`, `<PR>`, `<Issue>`;
 //!    src/app/chat/peek.rs), the pointing hand, macOS's shape for a link, hovered or held.
 //! 2. The sidebar's draggable edge zone, or the window's left edge while it is folded (the same test a press uses,
-//!    `on_side_edge`).
+//!    `on_side_edge`), or the browser pane's left edge (`on_web_edge`).
 //! 3. The topmost hit node under the pointer: its `Cursor`, or its nearest ancestor's, said on the primitives and prefabs in
 //!    script (prims.flecs: `ui.Field` is Text) and resolved by the input pass into `PointerShape`
 //!    (harness-native-ui-input); a node that says none is the arrow.
@@ -28,6 +29,9 @@ impl App {
         if self.drag.active() {
             return (self.side_edge_pointer(), "drag: sidebar edge");
         }
+        if self.web_dragging() {
+            return (self.web_edge_pointer(), "drag: browser edge");
+        }
         if let Some(s) = self.term_drag_pointer() {
             return s;
         }
@@ -42,6 +46,9 @@ impl App {
         // A press on no node holds no edge: only a hover finds it.
         if !self.pointer.down && self.on_side_edge() {
             return (self.side_edge_pointer(), "sidebar edge");
+        }
+        if !self.pointer.down && self.on_web_edge() {
+            return (self.web_edge_pointer(), "browser edge");
         }
         if scene.node {
             return (scene.shape, "node");

@@ -175,7 +175,7 @@ pub struct Past;
 pub struct Orphan;
 
 /// On a session: its program wrote output lately (the daemon's `busy`; a daemon that does not say counts as busy), so
-/// its tree row's title breathes. A live shell sitting at its prompt is not busy, and draws nothing.
+/// a band of light sweeps through its tree row's title (a Sheen). A live shell sitting at its prompt is not busy, and draws nothing.
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Busy;
 
