@@ -9,6 +9,8 @@ hn {
   prefab ChatPane : hn.Pane {
     // The chat's page: the theme's ground (tone_ground), the main card's own.
     Fill: $tone_ground
+    // A chat nothing was sent in yet shows the night sky (src/app/chat.rs turns it on); the first message puts it out.
+    sky : ui.Sky {}
     // Through a cmd+S fold the transcript's column and the composer follow the moving pane, centred in it, and their
     // words re-wrap live at the width they have each frame (the glyphs a new break moves glide there), the row at the
     // top of the view held still (src/app/chat.rs).
