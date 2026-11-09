@@ -1571,9 +1571,9 @@ impl App {
         let o = w.entity_from_id(e);
         let mut items: Vec<(String, &'static str, String, String)> = Vec::new(); // alloc: a few items, a frame
         let working = t.busy && !ended;
+        let now = model::now_ms();
         if working {
-            let words = turn_doing(t).unwrap_or_else(|| "Working\u{2026}".to_owned());
-            items.push(("step".to_owned(), ACT_STEP, words, String::new()));
+            items.push(("step".to_owned(), ACT_STEP, turn_doing(t, now), String::new()));
         }
         o.each_child(|c| {
             let id = *c.id();
@@ -1582,10 +1582,17 @@ impl App {
             }
             if self.run_of(id).is_some() {
                 let name = c.try_cloned::<&model::Name>().map(|n| super::short_cmd(n.s.as_str())).unwrap_or_default();
-                items.push((format!("r{id}"), ACT_RUN, name, format!("select:{id}")));
+                let ran = c.try_cloned::<&model::Created>().map(|s| format!(" \u{b7} {}", span_ms(now.saturating_sub(s.ms)))).unwrap_or_default();
+                items.push((format!("r{id}"), ACT_RUN, format!("{name}{ran}"), format!("select:{id}")));
             } else if c.has(model::Object::id()) && c.has(model::Busy::id()) {
                 let name = c.try_cloned::<&model::Name>().map(|n| n.s.as_str().split_whitespace().collect::<Vec<_>>().join(" ")).unwrap_or_default();
-                items.push((format!("s{id}"), ACT_AGENT, name, format!("select:{id}")));
+                // What it is doing, when its transcript is here (it was shown), after its name.
+                let doing = c
+                    .try_cloned::<&model::Object>()
+                    .and_then(|ob| self.chats.borrow().get(&ob.id).filter(|st| st.busy).map(|st| turn_doing(st, now)))
+                    .map(|d| format!(" \u{b7} {d}"))
+                    .unwrap_or_default();
+                items.push((format!("s{id}"), ACT_AGENT, format!("{name}{doing}"), format!("select:{id}")));
             }
         });
         // Messages sent since the turn in flight began, which the agent reads only once it ends.
@@ -1617,6 +1624,24 @@ impl App {
             let a = Action { name: action.into() };
             if v.entity().try_cloned::<&Action>() != Some(a.clone()) {
                 v.entity().set(a);
+            }
+            // The turn's step: its glyph breathes while the agent works (and the frames that keep coming tick its
+            // times), its tooltip how long the turn has run and how to stop it.
+            let step = glyph == ACT_STEP;
+            if let Some(i) = v.part("icon") {
+                let low = if step { crate::look::width(w, "chat_working_breath_at") } else { 1.0 };
+                match i.entity().try_cloned::<&crate::look::Breath>() {
+                    Some(b) if (b.low - low).abs() < 1e-3 => {}
+                    Some(b) => _ = i.entity().set(crate::look::Breath { low, ..b }),
+                    None => _ = i.entity().set(crate::look::Breath { spring: Spring::at(1.0), up: false, low }),
+                }
+            }
+            let tip = match (step, t.turn_since) {
+                (true, Some(at)) => format!("The turn has run {} \u{b7} Escape stops it", span_ms(now.saturating_sub(at))),
+                _ => String::new(),
+            };
+            if v.entity().try_cloned::<&Tooltip>().map(|x| x.text.as_str().to_owned()) != Some(tip.clone()) {
+                v.entity().set(Tooltip { text: tip.as_str().into() });
             }
         });
     }
@@ -2766,27 +2791,55 @@ const ACT_AGENT: &str = "\u{EC10}";
 const ACT_QUEUED: &str = "\u{EA6B}";
 const ACT_MORE: &str = "\u{EA7C}";
 
-/// What the turn in flight does now, in a few words: the step its running cell is on, else its running tool's main
-/// argument ("Bash: cargo test"), else what its newest words or reasoning are (None before it says anything).
-fn turn_doing(t: &Transcript) -> Option<String> {
-    let since = t.items.iter().rposition(|i| matches!(i, Item::User { .. }))?;
-    t.items[since..].iter().rev().find_map(|i| match i {
-        Item::Tool { block, name, input, result: None, .. } => Some(match t.details.get(block) {
-            Some(d) => d
-                .effects
-                .iter()
-                .rev()
-                .find(|e| e.status == "running")
-                .map_or_else(|| "Running code\u{2026}".to_owned(), |e| format!("{}\u{2026}", e.doing)),
-            None => {
-                let arg = model::chat::main_arg(input);
-                if arg.is_empty() { format!("{name}\u{2026}") } else { format!("{name}: {arg}") }
-            }
-        }),
-        Item::Thinking { done: false, .. } => Some("Thinking\u{2026}".to_owned()),
-        Item::Text { done: false, .. } => Some("Writing\u{2026}".to_owned()),
-        _ => None,
-    })
+/// What the turn in flight does now, with the numbers that say it is moving (at `now`, ms since the epoch): the step its
+/// running cell is on and how long that step has run ("Running blaze check · 18m 2s"), its running tool's main argument
+/// and how long ("Bash: cargo test · 12s"), its reasoning or words as they come and about how many tokens so far
+/// ("Thinking · 1.2k tokens · 14s"), else how long the turn has run.
+fn turn_doing(t: &Transcript, now: u64) -> String {
+    let since = |at: Option<u64>| at.map(|a| format!(" \u{b7} {}", span_ms(now.saturating_sub(a)))).unwrap_or_default();
+    let step = since(t.step_since);
+    let last = t.items.iter().rposition(|i| matches!(i, Item::User { .. })).unwrap_or(0);
+    let newest = t.items.len().saturating_sub(1);
+    let found = t.items[last..].iter().enumerate().rev().find_map(|(k, i)| {
+        let newest = last + k == newest;
+        let step = if newest { step.as_str() } else { "" };
+        match i {
+            Item::Tool { block, name, input, result: None, .. } => Some(match t.details.get(block) {
+                Some(d) => match d.effects.iter().rev().find(|e| e.status == "running") {
+                    Some(e) => format!("{}{}", e.doing, since(e.started_ms)),
+                    None => format!("Running code{step}"),
+                },
+                None => {
+                    let arg = model::chat::main_arg(input);
+                    if arg.is_empty() { format!("{name}{step}") } else { format!("{name}: {arg}{step}") }
+                }
+            }),
+            Item::Thinking { text, done: false, .. } => Some(format!("Thinking \u{b7} {} tokens{step}", tokens_of(text))),
+            Item::Text { text, done: false, .. } => Some(format!("Writing \u{b7} {} tokens{step}", tokens_of(text))),
+            _ => None,
+        }
+    });
+    found.unwrap_or_else(|| format!("Working{}", since(t.turn_since)))
+}
+
+/// About how many tokens `text` is (four characters each), in a few figures: `240`, `1.2k`, `18k`.
+fn tokens_of(text: &str) -> String {
+    let n = text.chars().count().div_ceil(4);
+    match n {
+        0..1000 => n.to_string(),
+        1000..10_000 => format!("{:.1}k", n as f64 / 1000.0),
+        _ => format!("{}k", n / 1000),
+    }
+}
+
+/// A time a chip says, to the second: `14s`, `2m 14s`, `1h 4m`.
+fn span_ms(ms: u64) -> String {
+    let s = ms / 1000;
+    match s {
+        0..60 => format!("{s}s"),
+        60..3600 => format!("{}m {}s", s / 60, s % 60),
+        _ => format!("{}h {}m", s / 3600, (s % 3600) / 60),
+    }
 }
 
 /// The remove button's glyph on a pasted picture (codicon's close).
