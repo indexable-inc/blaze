@@ -44,6 +44,14 @@ fn charge(cx: &Cx, key: &StripeKey, api: &Net, cfg: &Dir<ReadOnly>) -> Result<()
 }
 ```
 
+## The one rule
+
+**With no capability, code is pure computation.** A function that is handed nothing can take its
+arguments, compute, and return. It cannot read or write a file, a socket, the clock, the
+environment, a device or another process; it cannot wait; it cannot allocate from a heap it was
+not given; it cannot keep state between calls. Everything else in this document is a way of
+handing something over, and every such thing is a value in a parameter list.
+
 ## Layers
 
 Each layer uses only the ones below it.
@@ -431,18 +439,22 @@ choice a value the program passes, like every other.
 
 ```rust
 #[blaze::memo]                      // a pure function chosen as a point the evaluator sees
-fn layout(ty: &Type, target: &Target) -> Layout { .. }
+fn layout(points: &mut Nested, ty: &Type) -> Layout { .. }
 
-fn size_of(eval: &Eval, s: &Struct, target: &Target) -> u64 {
-    s.fields.iter().map(|f| eval.call(layout, (&f.ty, target)).size).sum()
+#[blaze::memo]
+fn size_of(points: &mut Nested, s: &Struct) -> u64 {
+    s.fields.iter().map(|f| points.call(layout, &f.ty).size).sum()   // a nested point
 }
 
 fn main(cx: &Cx, io: Io) -> Result<(), Error> {
-    let eval = Eval::memo(&io.need_mem()?);            // or direct(), stored(..), handler(..)
-    compile(cx, &eval, &krate)
+    let eval = Eval::memo(&io.need_mem()?, limit)?;    // or direct(), stored(..), handler(..)
+    let size = eval.call(cx, size_of, &my_struct);
+    ..
 }
 ```
 
+A memo point's first parameter is `&mut Nested`, through which it calls other points: a point is
+pure, so it cannot hold the evaluator itself, and `Nested` is what carries "who called whom".
 `Eval` is an ordinary parameter, passed down like `cx`. Calling `layout(..)` directly still
 works and simply runs it.
 
