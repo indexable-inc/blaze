@@ -225,7 +225,7 @@ not ambient and is never fetched from a thread-local; `main` receives the root o
 | `Host` | `io.host()` | | the process id, core count, host name, signals, and exiting with a status |
 | `Clock` | `io.clock()` | | `Instant`, wall time, `Deadline` |
 | `Rng` | `io.rng()` | `fork()` | random bytes; seeded in the simulation |
-| `Process` | `io.process()` | `only(programs)` | child processes |
+| `Sandboxes` | `io.sandboxes()` | a smaller budget | `Sandbox`: the one way to run a program (below) |
 | `Out` | `io.out()` | | standard input, output and error |
 | `Mem` | `io.mem()` | | named arenas and caches against the memory budget |
 
@@ -333,9 +333,7 @@ function. ([may-suspend](may-suspend.md) is the analysis underneath.)
 - **`Drop` may wait.** A value holds the capability it was made with, so closing a file or
   flushing a connection on drop goes through the same wait.
 - **A panic fails its task** with a typed error to its scope (rule `panics-fail-one-job`).
-- **A child process is handed capabilities.** `process.spawn(cx, program, dirs, env)` gives the
-  child exactly those; the driver's sandbox enforces it. This is the sandbox blaze already builds
-  for build scripts, as one API.
+- **A program runs only in a `Sandbox`** (below). There is no bare `spawn`.
 - **Code that uses `async` still builds** as the pinned nightly builds it. The bridge is one
   function: wait on a `Future` (poll it, park the task while it is pending, its waker unparks).
 
@@ -386,6 +384,47 @@ Deterministic simulation tests of the scheduler, scopes and cancellation with an
 planted bug; a differential test that runs the same programs under `Fibers` and `Frames` and
 compares outputs and the order of cancellations, drops and panics; and a UI test for each error
 above.
+
+## Sandbox: the one way to run a program
+
+There is no "start a process" call. A program runs in a `Sandbox`, and a sandbox is a value with
+a definition, so what a command could see and touch is written down before it runs.
+
+```rust
+let sb = io.sandboxes().open(cx, &SandboxSpec {
+    root: Root::Dirs(&[(path!("src"), &src.read_only()), (path!("out"), &out)]),
+    env: &env.only(&[var!("CC")]),
+    net: NetPolicy::None,
+    limits: Limits { cores: 4, memory: 2 << 30, wall: Duration::from_secs(60) },
+    isolation: Isolation::Process,
+})?;
+let run = sb.run(cx, &Command::new(prog!("cc")).args(&["-c", "main.c"]))?;   // status, output streams
+```
+
+- **The spec is capabilities and limits.** The file system is the `Dir`s handed in, at the paths
+  the program should see them; the environment is an `Env`; the network is nothing, a narrowed
+  `Net`, or a proxy the parent runs for host-level rules; the limits are cores, memory and time.
+  A sandbox can never hold more than what its maker held.
+- **Isolation is a provider**, as `Http`'s is: the same spec and the same `Sandbox` type over
+  - `Process`: the OS sandbox (Landlock, seccomp and namespaces on Linux; a sandbox profile on
+    macOS; AppContainer and a job object on Windows), for trusted-ish tools at full speed;
+  - `Vm`: a micro VM, for hostile code or another OS or architecture;
+  - `Wasm`: a WASI module with the `Dir`s as preopens, where the program is wasm.
+  A host that cannot build the isolation asked for refuses, naming what it could not enforce.
+- **A sandbox is reused.** Opening one is the expensive part; `run` is cheap, so a build opens
+  one per kind of work and runs many commands in it. It ends with its scope, like a task.
+- **Every run is recorded.** The sandbox traces what the program read and wrote, so a run is a
+  function of its command, its spec and the content it read. That is a cache key: the same
+  command over the same inputs is a store hit ([caching](caching.md)), which is exactly how blaze
+  already treats build scripts. With a `Root::View`, the root is a view of the Merkle tree
+  ([vfs](vfs.md)) and the run's output is the difference between two roots.
+- **A bstd program inside one** gets an `Io` built from the spec: its `main` sees those
+  capabilities and no others. Any other program sees an ordinary system that happens to contain
+  only what was granted.
+
+This is one API for what blaze has three of today (the build-script sandbox, the proc-macro
+host, `ix` VMs for lanes), and the shape of wasm-host's sandbox ops (a spec, a handle, `exec`,
+events) with capabilities as the spec.
 
 ## Shared mutation
 
