@@ -74,6 +74,7 @@ mod lock_held_across_slow;
 mod loops;
 mod lossy_as;
 mod missing_size_hint;
+mod mut_ref;
 mod native_contracts;
 mod open_wait_loop;
 mod outline_generic_body;
@@ -238,6 +239,7 @@ pub enum Lint {
     LossyAs,
     GlobalState,
     AsyncFn,
+    MutRef,
 }
 
 /// Which workspaces a lint is for.
@@ -407,6 +409,7 @@ impl Lint {
         Lint::LossyAs,
         Lint::GlobalState,
         Lint::AsyncFn,
+        Lint::MutRef,
     ];
 
     /// Which workspaces the lint is for ([`Kind`]); written out per lint, so a new one chooses.
@@ -466,7 +469,7 @@ impl Lint {
                 Kind::PedanticPerf
             }
             // What the blaze edition removes; right for any crate getting ready for it.
-            Lint::LossyAs | Lint::GlobalState | Lint::AsyncFn => Kind::Edition,
+            Lint::LossyAs | Lint::GlobalState | Lint::AsyncFn | Lint::MutRef => Kind::Edition,
             // `blaze::hot` and its comments (`// clone:`, `// alloc:`, `// dyn:`).
             Lint::HotClone
             | Lint::HotAlloc
@@ -611,6 +614,7 @@ impl Lint {
             Lint::LossyAs => "lossy_as",
             Lint::GlobalState => "global_state",
             Lint::AsyncFn => "async_fn",
+            Lint::MutRef => "mut_ref",
         }
     }
 
@@ -706,6 +710,7 @@ impl Lint {
             Lint::LossyAs => concat!(general_docs!(), "#lossy_as"),
             Lint::GlobalState => concat!(general_docs!(), "#global_state"),
             Lint::AsyncFn => concat!(general_docs!(), "#async_fn"),
+            Lint::MutRef => concat!(general_docs!(), "#mut_ref"),
             Lint::FiberBoundary => {
                 "https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan.md"
             }
@@ -963,6 +968,9 @@ impl Lint {
             Lint::AsyncFn => {
                 "write it as a plain function run on a fiber: a wait parks the fiber and the may-suspend effect is inferred, so neither `async` nor `.await` is written; or say why with `#[expect(blaze::async_fn, reason = \"..\")]`"
             }
+            Lint::MutRef => {
+                "spell the unique reference `&uniq` (`ref uniq` in a pattern), as `blaze check --fix` does; or say why with `#[expect(blaze::mut_ref, reason = \"..\")]`"
+            }
             Lint::FrozenCollection => {
                 "make the field a `Box<[T]>` (`Box<str>` for a string), built once with `into_boxed_slice()` / `into_boxed_str()`; or say why it stays growable with `#[expect(blaze::frozen_collection, reason = \"..\")]`"
             }
@@ -1033,6 +1041,15 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     }
     if matches!(node.kind(), syntax::SyntaxKind::BLOCK_EXPR | syntax::SyntaxKind::CLOSURE_EXPR) {
         async_fn::check_expr(cx, node);
+    }
+    if matches!(
+        node.kind(),
+        syntax::SyntaxKind::REF_TYPE
+            | syntax::SyntaxKind::REF_EXPR
+            | syntax::SyntaxKind::SELF_PARAM
+            | syntax::SyntaxKind::IDENT_PAT
+    ) {
+        mut_ref::check(cx, node);
     }
     if let Some(item) = ast::Static::cast(node) {
         global_state::check(cx, item);

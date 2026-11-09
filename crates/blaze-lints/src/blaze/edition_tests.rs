@@ -1,7 +1,7 @@
-//! The lints of `blaze::edition` (`lossy_as`, `global_state`, `async_fn`): what each finds and
-//! leaves alone, and that the group is off until turned on, over an `std` of their own: a
-//! `thread_local!` that declares one `const` key per item and calls itself for the rest, as
-//! std's does, and an atomic holding an `UnsafeCell`.
+//! The lints of `blaze::edition` (`lossy_as`, `global_state`, `async_fn`, `mut_ref`): what each
+//! finds and leaves alone, `mut_ref`'s fix, and that the group is off until turned on, over an
+//! `std` of their own: a `thread_local!` that declares one `const` key per item and calls itself
+//! for the rest, as std's does, and an atomic holding an `UnsafeCell`.
 
 use crate::tests::lint;
 
@@ -195,4 +195,150 @@ fn edition_group_is_off_by_default_and_turns_all_three_on() {
     assert!(on.contains("this `as` in `fn narrow` casts `u64` to `u32`"), "{on}");
     assert!(on.contains("`static mut COUNT: u32` is global state"), "{on}");
     assert!(on.contains("`async fn fetch` is `async`"), "{on}");
+}
+
+/// `mut_ref`'s crate: each unique reference spelled with `mut` (receivers with and without a
+/// lifetime, types, borrows, one whose operand starts with `<`, a `ref mut` binding), beside
+/// what it leaves alone (a `&uniq` already, `let mut`, a `mut` binding, `*mut`, `&raw mut`,
+/// and what a macro writes).
+const UNIQ_MAIN: &str = r#"
+#![blaze::uniq]
+pub struct S { pub n: u32 }
+impl S {
+    pub fn make() -> S { S { n: 0 } }
+    pub fn bump(&mut self) { self.n = 1; }
+    pub fn at<'a>(&'a mut self) -> &'a mut u32 { &mut self.n }
+    pub fn done(&uniq self) {}
+}
+pub fn take(r: &mut u32) { *r = 1; }
+pub fn call() {
+    let mut x = 0u32;
+    take(&mut x);
+    let ref mut y = 1u32;
+    take(y);
+    let p: *mut u32 = &raw mut x;
+    let _ = p;
+    let mut z = 1u32;
+    z = 2;
+    let _ = z;
+}
+pub fn wraps() -> u32 {
+    let r = &mut <S>::make();
+    r.n
+}
+macro_rules! made {
+    () => { pub fn made(r: &mut u32) { *r = 1; } };
+}
+made!();
+"#;
+
+/// The findings of `mut_ref`: one per unique reference spelled with `mut` in the file's own
+/// text, none for the shapes it leaves alone.
+#[test]
+fn mut_ref_finds_each_unique_reference_spelled_mut() {
+    let found = only("mut_ref", UNIQ_MAIN);
+    assert_eq!(found.matches("which `#![blaze::uniq]` spells").count(), 8, "{found}");
+    assert!(
+        found.contains("the receiver in `fn bump` is spelled `&mut self`, which `#![blaze::uniq]` spells `&uniq self`"),
+        "{found}"
+    );
+    assert_eq!(found.matches("the receiver in `fn at`").count(), 1, "{found}");
+    assert!(found.contains("the reference type in `fn at` is spelled `&mut`"), "{found}");
+    assert!(found.contains("the borrow in `fn at` is spelled `&mut`"), "{found}");
+    assert!(found.contains("the reference type in `fn take` is spelled `&mut`"), "{found}");
+    assert!(found.contains("the borrow in `fn call` is spelled `&mut`"), "{found}");
+    assert!(
+        found.contains("the binding in `fn call` is spelled `ref mut`, which `#![blaze::uniq]` spells `ref uniq`"),
+        "{found}"
+    );
+    assert!(found.contains("the borrow in `fn wraps` is spelled `&mut`"), "{found}");
+    assert!(found.contains("blaze::mut_ref"), "{found}");
+    for clean in ["fn done", "fn made", "fn make"] {
+        assert!(!found.contains(&format!("in `{clean}`")), "`{clean}`: {found}");
+    }
+    assert_eq!(found.matches("in `fn call`").count(), 2, "{found}");
+}
+
+/// The fix spells each finding `uniq`, putting an operand that starts with `<` in
+/// parentheses, and leaves the rest of the text as it was; the fixed file lints clean of
+/// `mut_ref`.
+#[test]
+fn mut_ref_fix_respells_mut_as_uniq() {
+    let after = fixed_mut_ref(UNIQ_MAIN);
+    for want in [
+        "pub fn bump(&uniq self) { self.n = 1; }",
+        "pub fn at<'a>(&'a uniq self) -> &'a uniq u32 { &uniq self.n }",
+        "pub fn done(&uniq self) {}",
+        "pub fn take(r: &uniq u32) { *r = 1; }",
+        "take(&uniq x);",
+        "let ref uniq y = 1u32;",
+        "let p: *mut u32 = &raw mut x;",
+        "let mut x = 0u32;",
+        "let mut z = 1u32;",
+        "let r = &uniq (<S>::make());",
+        "() => { pub fn made(r: &mut u32) { *r = 1; } };",
+    ] {
+        assert!(after.contains(want), "{want:?} in:\n{after}");
+    }
+    assert_eq!(after.matches("uniq").count(), 1 + 1 + 8, "{after}");
+}
+
+/// In a crate without `#![blaze::uniq]`, `uniq` is no keyword, so `mut_ref` says nothing.
+#[test]
+fn mut_ref_is_silent_without_the_gate() {
+    let ungated = UNIQ_MAIN
+        .replace("#![blaze::uniq]\n", "")
+        .replace("    pub fn done(&uniq self) {}\n", "");
+    let found = only("mut_ref", &ungated);
+    assert!(!found.contains("blaze::mut_ref"), "{found}");
+    assert!(!found.contains("which `#![blaze::uniq]` spells"), "{found}");
+}
+
+/// `src/lib.rs` of `main` as `mut_ref`'s fix leaves it, after checking that the fix changed it
+/// and that linting it again finds no `mut_ref`.
+fn fixed_mut_ref(main: &str) -> String {
+    use base_db::FileId;
+    use blaze_hash::HashMap;
+    use hir_expand::fixture;
+    use std::alloc::Global;
+
+    use crate::{
+        check::{Setup, check},
+        conf::Conf,
+        fix::fix,
+        level::CommandLine,
+    };
+
+    let text = format!("{MINICORE}{STD}{MAIN}{}", main.trim_start_matches('\n'));
+    let fx = fixture::db(&text);
+    let file = *fx.files().last().expect("src/lib.rs");
+    let mut db = fx.into_db();
+    let krate = blaze_query::db::attach(&db, || crate::tests::main_crate(&db));
+    let file = file.file_id(&db);
+    let before = db.file_text(file).text(&db).to_string();
+    let mut names: HashMap<FileId, String, Global> = HashMap::new_in(Global);
+    names.insert(file, "src/lib.rs".to_owned());
+    let name_of = |file: FileId| names.get(&file).cloned();
+    let flags: Vec<String> = "-A clippy::all --warn=blaze::mut_ref"
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect();
+    let setup = Setup {
+        command_line: CommandLine::parse(&flags).expect("the flags read"),
+        conf: Conf::default(),
+    };
+    let made = fix(&mut db, krate, &setup, &name_of).unwrap_or_else(|error| panic!("{error}"));
+    let after = db.file_text(file).text(&db).to_string();
+    assert_ne!(after, before, "the fix of `mut_ref` changed the file");
+    assert!(made.applied > 0, "the fix of `mut_ref` made a suggestion");
+    blaze_query::db::attach(&db, || {
+        let found = check(&db, krate, &setup, &name_of).expect("the file is named");
+        let left: Vec<&str> = found
+            .iter()
+            .map(|it| it.diagnostic.message.as_str())
+            .filter(|it| it.contains("#![blaze::uniq]"))
+            .collect();
+        assert!(left.is_empty(), "the fixed file has no `mut_ref`:\n{after}\n{left:#?}");
+    });
+    after
 }

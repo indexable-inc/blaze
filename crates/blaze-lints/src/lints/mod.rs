@@ -958,6 +958,7 @@ mod tests {
             edition.intersects(blaze::Lint::LossyAs.bit())
                 && edition.intersects(blaze::Lint::GlobalState.bit())
                 && edition.intersects(blaze::Lint::AsyncFn.bit())
+                && edition.intersects(blaze::Lint::MutRef.bit())
                 && !edition.intersects(blaze::Lint::HashTwice.bit())
         );
         assert!(

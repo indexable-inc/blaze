@@ -127,7 +127,10 @@ fn own_code(db: &Db, krate: Crate) -> ContentId {
             return whole(&mut hasher);
         };
         let code = match path.ends_with(".rs") {
-            true => code_text(db, EditionedFileId::new(db, file, data.edition)),
+            true => {
+                let gates = krate.syntax_gates(db);
+                code_text(db, EditionedFileId::new_gated(db, file, data.edition, gates))
+            }
             false => None,
         };
         files.push((path, file, code));

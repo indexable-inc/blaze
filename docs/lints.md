@@ -19,10 +19,10 @@ the release build reports, only by its flags). `checkfree`,
 `nopanic`, `noalloc` and `nonblocking` are in `blaze::general` but `deny` by default, and fire
 only on functions marked with their attribute (`#[blaze::checkfree]`, `#[blaze::nopanic]`, ...).
 
-The group `blaze::edition` (`async_fn`, `global_state`, `lossy_as`) flags what the blaze
-edition removes (docs/v2/plan/design/edition.md); it is allowed unless a workspace or crate
-turns it on to get ready for the edition (`edition = "warn"` in `[workspace.metadata.blaze.lints]`,
-or `#![warn(blaze::edition)]`). None of its lints has a fix.
+The group `blaze::edition` (`async_fn`, `global_state`, `lossy_as`, `mut_ref`) flags what the
+blaze edition removes or respells (docs/v2/plan/design/edition.md); it is allowed unless a
+workspace or crate turns it on to get ready for the edition (`edition = "warn"` in
+`[workspace.metadata.blaze.lints]`, or `#![warn(blaze::edition)]`). Only `mut_ref` has a fix.
 
 Several lints come from ideas of the Goose language (no global heap, data stacks, bump
 growth, inline nested data, narrow relative links, variable-size enums, in-place construction
@@ -680,6 +680,39 @@ their buffer by doubling (reallocating and copying) instead of allocating once, 
 ExactSizeIterator for ..` when the count is exact.
 
 **Allowing it.** `#[expect(blaze::missing_size_hint, reason = "..")]` on the impl.
+
+## `mut_ref`
+
+In `blaze::edition`, allowed by default; says nothing in a crate without `#![blaze::uniq]`.
+
+**What it catches.** In a crate that says `#![blaze::uniq]`, a unique reference spelled with
+`mut`: `&mut T` and `&'a mut T` in a type, `&mut expr` in an expression, `&mut self` and
+`&'a mut self` as a receiver, and `ref mut x` in a pattern.
+
+**Why it matters.** Under `#![blaze::uniq]`, `&uniq T` is `&mut T`, spelled for what it
+guarantees: no other reference to the place is live while it is. Mutation through it follows
+from that. The two spellings are the same type and are accepted for each other, so the lint
+only brings a crate to the one spelling the edition uses.
+
+**How to fix it.** `blaze check --fix`: the fix is machine-applicable and only respells `mut`
+as `uniq`. An operand that starts with `<`, `::`, `!` (or, in an expression, `.`, `{` or
+`#`) would keep `uniq` a name there, so the fix puts it in parentheses:
+`&mut <T>::new()` becomes `&uniq (<T>::new())`.
+
+**The gate.** `#![blaze::uniq]`, written as itself among the crate root's leading inner
+attributes (not through `cfg_attr` or a macro), makes `uniq` a keyword in exactly those four
+places, told by the token after it: `&uniq;`, `&uniq.x`, `&uniq::X`, `&uniq<T>` and
+`&uniq!()` stay a variable, path or macro named `uniq`. Under the gate `&uniq (x)`, `&uniq [0]`,
+`&uniq - 1` and `&uniq * x` are unique borrows of the operand, where rustc would read a call,
+an index or arithmetic on `uniq`. Types print as `&uniq T` in the crate's diagnostics. Without
+the gate, `&uniq T` is the syntax error it is in rustc.
+
+**Not found.** `let mut x` and any `mut` binding without `ref`, `mut self`, `*mut T`,
+`&raw mut place`, a `&mut pat` reference pattern (which has no `uniq` spelling), a reference
+already spelled `uniq`, and what a macro writes or is handed: macro input and expansions parse
+without the gate, so `&uniq` there is not yet accepted.
+
+**Allowing it.** `#[expect(blaze::mut_ref, reason = "..")]` on the function or item.
 
 ## `native_contracts`
 

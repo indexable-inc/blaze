@@ -121,7 +121,13 @@ impl ModDir {
                         };
                         return Ok((
                             // FIXME: Edition, is this rightr?
-                            EditionedFileId::new(db, file_id, orig_file_id.edition(db)),
+                            // The module's file is the crate's, read under its syntax gates.
+                            EditionedFileId::new_gated(
+                                db,
+                                file_id,
+                                orig_file_id.edition(db),
+                                orig_file_id.gates(db),
+                            ),
                             is_mod_rs,
                             ModDir { dir_path, root_non_dir_owner: !root_dir_owner, depth },
                         ));

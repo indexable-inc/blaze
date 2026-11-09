@@ -253,7 +253,9 @@ fn opt_self_param(p: &mut Parser<'_>, m: Marker) -> Result<(), Marker> {
         if p.nth_at(self_pos, LIFETIME_IDENT) {
             self_pos += 1;
         }
-        if p.nth_at(self_pos, T![mut]) {
+        // `&uniq self`, `&'a uniq self` (`#![blaze::uniq]`): `uniq` where `mut` would be.
+        let uniq = uniq::nth_at_receiver(p, self_pos);
+        if p.nth_at(self_pos, T![mut]) || uniq {
             self_pos += 1;
         }
         if !is_isolated_self(p, self_pos) {
@@ -264,7 +266,9 @@ fn opt_self_param(p: &mut Parser<'_>, m: Marker) -> Result<(), Marker> {
         if p.at(LIFETIME_IDENT) {
             lifetime(p);
         }
-        p.eat(T![mut]);
+        if !p.eat(T![mut]) && uniq {
+            p.bump_remap(T![mut]);
+        }
         self_as_name(p);
     }
     m.complete(p, SELF_PARAM);

@@ -37,6 +37,7 @@ mod params;
 mod paths;
 mod patterns;
 mod types;
+mod uniq;
 mod verify;
 
 use crate::{

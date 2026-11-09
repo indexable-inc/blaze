@@ -137,6 +137,9 @@ impl DefMap {
                         // `#![blaze::arbitrary_ints]`, from `DefMap::arbitrary_ints`
                         // (docs/v2/plan/design/arbitrary-ints.md).
                         | "arbitrary_ints"
+                        // `#![blaze::uniq]`, read off the root's tokens before any parse
+                        // (`base_db::Crate::syntax_gates`, docs/v2/plan/design/edition.md).
+                        | "uniq"
                         // `#[blaze::reflect]`, from `AttrFlags::BLAZE_REFLECT`
                         // (`hir_ty_comptime::struct_domain`, docs/v2/plan/design/comptime.md).
                         | "reflect"

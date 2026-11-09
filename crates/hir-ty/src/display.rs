@@ -46,7 +46,7 @@ use rustc_type_ir::{
     inherent::{GenericArgs as _, IntoKind, Term as _, Ty as _, Tys as _},
 };
 use smallvec::SmallVec;
-use span::Edition;
+use span::{Edition, SyntaxGates};
 use std::alloc::Global;
 use stdx::never;
 
@@ -508,17 +508,28 @@ impl<'db> HirFormatter<'_, 'db> {
 pub struct DisplayTarget {
     krate: Crate,
     pub edition: Edition,
+    /// The crate's syntax gates ([`Crate::syntax_gates`], a query, so what is displayed for
+    /// the crate depends on them): under `#![blaze::uniq]` a unique reference is `&uniq T`.
+    gates: SyntaxGates,
 }
 
 impl DisplayTarget {
     pub fn from_crate(db: &Db, krate: Crate) -> Self {
         let edition = krate.data(db).edition;
-        Self { krate, edition }
+        Self { krate, edition, gates: krate.syntax_gates(db) }
     }
 
     pub fn from_crate_and_edition(db: &Db, krate: Crate, edition: Edition) -> Self {
-        let _ = db;
-        Self { krate, edition }
+        Self { krate, edition, gates: krate.syntax_gates(db) }
+    }
+
+    /// What a unique reference's `&` is followed by: `uniq ` in a crate that says
+    /// `#![blaze::uniq]`, which writes it so, else `mut `.
+    pub fn unique_ref(&self) -> &'static str {
+        match self.gates.uniq() {
+            true => "uniq ",
+            false => "mut ",
+        }
     }
 }
 
@@ -1337,7 +1348,7 @@ impl<'db> Ty<'db> {
                 }
                 match m {
                     rustc_ast_ir::Mutability::Not => (),
-                    rustc_ast_ir::Mutability::Mut => f.write_str("mut ")?,
+                    rustc_ast_ir::Mutability::Mut => f.write_str(f.display_target.unique_ref())?,
                 }
 
                 f.trait_bounds_need_parens = true;
@@ -2503,7 +2514,7 @@ impl<'db> HirDisplayWithExpressionStore<'db> for TypeRefId {
             TypeRef::Reference(ref_) => {
                 let mutability = match ref_.mutability {
                     hir_def::type_ref::Mutability::Shared => "",
-                    hir_def::type_ref::Mutability::Mut => "mut ",
+                    hir_def::type_ref::Mutability::Mut => f.display_target.unique_ref(),
                 };
                 write!(f, "&")?;
                 if let Some(lifetime) = &ref_.lifetime {

@@ -427,6 +427,12 @@ impl<'t> Parser<'t> {
     pub(crate) fn current_edition(&self) -> Edition {
         self.inp.edition(self.pos)
     }
+
+    /// Whether the parse is of a crate that says `#![blaze::uniq]`
+    /// ([`crate::SyntaxGates::uniq`]): only then does `grammar/uniq.rs` take `uniq` as a keyword.
+    pub(crate) fn uniq_gate(&self) -> bool {
+        self.inp.gates().uniq()
+    }
 }
 
 /// See [`Parser::start`].

@@ -5,7 +5,7 @@ use std::{hash::Hash, sync::Arc};
 
 use crate::FileId;
 use blaze_ids::ContentId;
-use span::Edition;
+use span::{Edition, SyntaxGates};
 use syntax::{SyntaxError, ast};
 
 use crate::{Db, trees::Trees};
@@ -22,7 +22,10 @@ pub struct EditionedFileId {
 /// the trees count against that tag.
 #[blaze_query::tracked(self_ty = EditionedFileId, lru, weigh = syntax::Parse::heap_bytes, mem_tag = Parse, returns(ref))]
 fn parse_(db: &Db, file: EditionedFileId) -> syntax::Parse<ast::SourceFile> {
+    // The key is the interned file id, which holds the crate's syntax gates beside the edition
+    // (`span::EditionedFileId::gates`): a gated crate's file is another key, and another parse.
     let (file_id, edition) = file.unpack(db);
+    let gates = file.gates(db);
     let span = tracing::info_span!("parse_query", function = tracing::field::Empty);
     if !span.is_disabled() {
         // alloc: only while a subscriber records the span, which interns it
@@ -34,7 +37,8 @@ fn parse_(db: &Db, file: EditionedFileId) -> syntax::Parse<ast::SourceFile> {
     let _p = span.entered();
     let input = db.file_text(file_id);
     let stored = db.trees().map(|it| &**it);
-    let parse = input.reparse_field(db).parse(input.text(db), edition, file.is_library(db), stored);
+    let reparse = input.reparse_field(db);
+    let parse = reparse.parse(input.text(db), edition, gates, file.is_library(db), stored);
     parse.unwrap_or_else(|error| {
         let root = db.source_root(db.file_source_root(file_id).source_root_id(db));
         let path = root.source_root_ref(db).path_for_file(&file_id).cloned();
@@ -92,9 +96,24 @@ impl EditionedFileId {
         parse_(db, self)
     }
 
+    /// The file read in `edition` for a crate that turns on no syntax gates.
     #[inline]
     pub fn new(db: &Db, file_id: FileId, edition: Edition) -> Self {
         Self::from_span_file_id(db, span::EditionedFileId::new(file_id, edition))
+    }
+
+    /// The file read in `edition` for a crate whose syntax `gates` are on
+    /// ([`crate::Crate::syntax_gates`]): a file of the crate is always made with them, so it
+    /// parses and prints under them.
+    #[inline]
+    pub fn new_gated(db: &Db, file_id: FileId, edition: Edition, gates: SyntaxGates) -> Self {
+        Self::from_span_file_id(db, span::EditionedFileId::new_gated(file_id, edition, gates))
+    }
+
+    /// The syntax gates of the crate the file is read for.
+    #[inline]
+    pub fn gates(self, db: &Db) -> SyntaxGates {
+        self.field(db).gates()
     }
 
     #[inline]
@@ -136,7 +155,9 @@ impl EditionedFileId {
         parse: &syntax::Parse<ast::SourceFile>,
     ) -> bool {
         let (file_id, edition) = self.unpack(db);
+        let gates = self.gates(db);
         let input = db.file_text(file_id);
-        input.content(db) == content && input.reparse_field(db).seed(input.text(db), edition, parse)
+        input.content(db) == content
+            && input.reparse_field(db).seed(input.text(db), edition, gates, parse)
     }
 }

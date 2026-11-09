@@ -19,6 +19,7 @@ mod named;
 mod reparse;
 mod settings;
 mod source_path;
+mod syntax_gates;
 mod table;
 pub mod target;
 #[cfg(test)]

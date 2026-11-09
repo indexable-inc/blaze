@@ -31,4 +31,5 @@ mod rpitit_nested;
 mod sizedness;
 mod struct_paths;
 mod trait_item_imports;
+mod uniq_refs;
 mod variant_hygiene;
