@@ -38,8 +38,80 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use super::why::{Answer, Answers, Ledger, file::File};
 
 /// The variable naming the DuckDB `blaze debug sql` and the explorer run: an absolute path,
-/// which blaze's Nix wrapper sets to `nix run .#duckdb`'s. Never looked up on `PATH`.
+/// which blaze's Nix wrapper sets to `nix run .#duckdb`'s. Never looked up on `PATH`. Unset,
+/// the history's readers run the DuckDB blaze pins ([`Pin`]), fetched on first use
+/// (`cli/duckdb.rs`).
 pub const DUCKDB: &str = "BLAZE_DUCKDB";
+
+/// The DuckDB blaze pins: flake.nix's `duckdb` asserts the same version.
+pub const DUCKDB_VERSION: &str = "1.5.5";
+
+/// Where DuckDB's releases are.
+const DUCKDB_RELEASES: &str = "https://github.com/duckdb/duckdb/releases/download";
+
+/// The pinned DuckDB CLI of one host: an asset of DuckDB's release [`DUCKDB_VERSION`] (a gzip
+/// of the one program) and the SHA-256 of that asset, which the fetch is checked against.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Pin {
+    pub asset: &'static str,
+    pub sha256: &'static str,
+}
+
+/// Each host's pin, by `<arch>-<os>` (`std::env::consts`).
+pub const DUCKDB_PINS: &[(&str, Pin)] = &[
+    (
+        "aarch64-linux",
+        Pin {
+            asset: "duckdb_cli-linux-arm64.gz",
+            sha256: "50c719e603a4e599d435e5321542458edc1cfc5f7eed65979fe9bc5ae4e3ba23",
+        },
+    ),
+    (
+        "x86_64-linux",
+        Pin {
+            asset: "duckdb_cli-linux-amd64.gz",
+            sha256: "c61f21485e6e41d3a0c28ce9904ea18346309cf427b4cf9479bc3564348dc885",
+        },
+    ),
+    (
+        "aarch64-macos",
+        Pin {
+            asset: "duckdb_cli-osx-arm64.gz",
+            sha256: "37144723eb43639a96b47207b44036e6dedc084f81afbf0c18625e7f3deac810",
+        },
+    ),
+    (
+        "x86_64-macos",
+        Pin {
+            asset: "duckdb_cli-osx-universal.gz",
+            sha256: "cbd6e7d472c33083db32e1e78d71ab9eefb32da872c349423294de370b8f4ca9",
+        },
+    ),
+];
+
+impl Pin {
+    /// This host's pin; `None` for a host DuckDB's release has no CLI blaze pins for.
+    pub fn host() -> Option<&'static Pin> {
+        let host = (std::env::consts::ARCH, std::env::consts::OS);
+        DUCKDB_PINS.iter().find_map(|(name, pin)| {
+            (name.split_once('-') == Some(host)).then_some(pin)
+        })
+    }
+
+    /// Where the asset is fetched from.
+    pub fn url(&self) -> String {
+        format!("{DUCKDB_RELEASES}/v{DUCKDB_VERSION}/{}", self.asset) // alloc: once per first use, or an error
+    }
+
+    /// Where the program is once laid out under the state directory `state`: a directory named
+    /// by the version and the asset's SHA-256, so another pin is another place and a path that
+    /// exists holds this pin's program.
+    pub fn laid_out(&self, state: &Path) -> PathBuf {
+        let short = self.sha256.get(..16).unwrap_or(self.sha256);
+        // alloc: once per lookup
+        state.join("duckdb").join(format!("{DUCKDB_VERSION}-{short}")).join("duckdb")
+    }
+}
 
 /// The DuckDB [`DUCKDB`] names: `None` unset, and an error naming the variable and its value
 /// when set to anything but an absolute path to a file.

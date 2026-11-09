@@ -4,10 +4,12 @@
 //! explain`, a rule's long text, the last build's failure of a package with all it blocks, or a
 //! named view of that history; and `blaze why`, what the last build computed again and why.
 //!
-//! `blaze debug sql` and `blaze explain` run the DuckDB [`observe::DUCKDB`] names, here in
+//! `blaze debug sql` and `blaze explain` run the DuckDB `BLAZE_DUCKDB` names
+//! ([`crate::serve::observe::DUCKDB`]), here in
 //! the CLI over the history's files, after asking the daemon that writes the history to flush
 //! ([`history_source`]), so they read every row it recorded before they asked, each once.
-//! Unset, they fail naming `nix run .#duckdb`: nothing looks for a DuckDB on `PATH`.
+//! Unset, they run the DuckDB blaze pins, fetched by its SHA-256 on first use (`duckdb.rs`):
+//! nothing looks for a DuckDB on `PATH`.
 
 use std::{
     ffi::OsString,
@@ -31,7 +33,6 @@ use super::{
     daemon::{self, Api, Start},
     say,
 };
-use crate::serve::observe;
 
 const EXPLORE_USAGE: &str = "blaze explore [--dev] [--print]: the explorer's link, opened in the browser (`--print`: printed only; \
                              `--dev`: the page's development server, http://localhost:5173, may connect too)";
@@ -372,10 +373,7 @@ fn gate(words: Vec<OsString>) -> Result<(), Refusal> {
     }
     let (duckdb, dir) = match dir {
         Some(dir) => {
-            let duckdb = observe::duckdb(std::env::var_os(observe::DUCKDB))?.ok_or_else(|| {
-                format!("{} is unset: it names the DuckDB `nix run .#duckdb` pins, which blaze's own package sets", observe::DUCKDB)
-            })?;
-            (duckdb, dir)
+            (super::duckdb::path()?, dir)
         }
         None => history_source()?,
     };
@@ -794,16 +792,16 @@ fn argument(view: &views::View, key: &str, value: &str) -> Result<Value, Refusal
     })
 }
 
-/// `sql` over the history in the daemon's state directory, by the DuckDB [`observe::DUCKDB`]
-/// names.
+/// `sql` over the history in the daemon's state directory, by the DuckDB `duckdb.rs`
+/// finds.
 fn run(sql: &str) -> Result<Vec<RecordBatch>, Refusal> {
     let (duckdb, dir) = history_source()?;
     let query = sql::Query { duckdb: &duckdb, history: &dir, scope: sql::Scope::All, sql };
     Ok(sql::run(&query).map_err(|error| error.to_string())?)
 }
 
-/// The DuckDB [`observe::DUCKDB`] names, and the history in the daemon's state directory,
-/// flushed: what every reader of the history (`blaze debug sql`, `blaze explain`, `blaze
+/// The DuckDB that reads the history (`BLAZE_DUCKDB`'s, or blaze's pin, fetched on first
+/// use: `duckdb.rs`), and the history in the daemon's state directory, flushed: what every reader of the history (`blaze debug sql`, `blaze explain`, `blaze
 /// slow`, `blaze debug time`) reads through.
 ///
 /// A daemon that writes the history ([`history::writer`]) holds rows it has recorded and not
@@ -822,9 +820,7 @@ fn history_source() -> Result<(PathBuf, PathBuf), Refusal> {
 /// The DuckDB that reads the history, and the history's directory: an error names what is
 /// missing.
 pub(super) fn history_paths() -> Result<(PathBuf, PathBuf), String> {
-    let duckdb = observe::duckdb(std::env::var_os(observe::DUCKDB))?.ok_or_else(|| {
-        format!("{} is unset: it names the DuckDB `nix run .#duckdb` pins, which blaze's own package sets", observe::DUCKDB)
-    })?;
+    let duckdb = super::duckdb::path()?;
     let state: PathBuf = crate::serve::state().map_err(|error| format!("{error:#}"))?;
     let dir = history::dir_in(&state);
     if let Some(pid) = history::writer(&dir) {

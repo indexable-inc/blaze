@@ -31,6 +31,7 @@ pub mod clean;
 pub mod client_rows;
 pub mod daemon;
 pub mod doc;
+mod duckdb;
 pub mod fetch_url;
 pub mod fix;
 pub mod inspect;
