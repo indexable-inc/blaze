@@ -98,6 +98,10 @@ ordinary typed code: no derive macro, no generated tokens, errors on real lines,
 compile to wasm and sandbox. A type opts in by naming a policy for its fields, not by deriving.
 The formats are bstd's: deterministic CBOR (the agent API's), JSON, and `record` for zero-copy.
 Decoding takes an allocator, as everything does, and a size limit, since input is untrusted.
+A union decodes by a tag naming its member. A type that holds a capability or a `Secret` has no
+`Decode`, and saying so is a compile error naming the field: bytes can describe what is wanted
+(a `Path`, a `VarName`), and only code holding the authority can turn that description into a
+capability by narrowing its own.
 The same field walk gives tracing its encoders and `Secret` its redaction. `blaze-serde` remains
 for crates from crates.io that speak serde; blaze's own crates move to `data` once reflection
 lands.
