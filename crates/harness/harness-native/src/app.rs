@@ -179,6 +179,8 @@ struct Ids {
     archive_row: u64,
     /// The sidebar's foot: the focused chat's status bar, and the plan meter's slot.
     side_chat: u64,
+    /// The work bar over the window's top edge (hn.WorkBar).
+    work_bar: u64,
     side_plan: u64,
     /// The overlay on screen and what it is (made again when the mode changes).
     palette: Option<(u64, Mode)>,
@@ -272,6 +274,8 @@ pub struct App {
     pending_archive: bool,
     /// The ids the daemon no longer lists were dropped (once, on its first list).
     pruned: bool,
+    /// The work bar's band is sweeping (the window keeps drawing, at its calm rate).
+    work_live: bool,
     /// Remember the selected object in native.json (not for the offscreen shot).
     pub persist: bool,
     /// An offscreen shot's `HARNESS_NATIVE_SHOT_WORKING` (src/shot.rs): every session row and every run row shows at
@@ -512,6 +516,7 @@ impl App {
         let main = root.child("hn.Main");
         // The browser pane on the right (scene/widgets/web.flecs): its clip folds, the pane inside keeps its width.
         let web_clip = root.child("hn.WebClip");
+        let work_bar = root.child("hn.WorkBar").id();
         let web_pane = web_clip.child("hn.WebPane").id();
         let web_clip = web_clip.id();
         let bar = View::root(w, "hn.TitleBar");
@@ -525,6 +530,7 @@ impl App {
             main: main.id(),
             archive_row: archive_row.id(),
             side_chat: side_chat.id(),
+            work_bar,
             side_plan: side_plan.id(),
             palette: None,
             bar: bar.id(),
@@ -580,6 +586,7 @@ impl App {
             pinned: crate::prefs::keys("pinned").unwrap_or_default(),
             pending_archive: false,
             pruned: false,
+            work_live: false,
             persist: true,
             shot_working: false,
             shot_plan: Vec::new(), // alloc: empty but in a shot
@@ -1749,6 +1756,36 @@ impl App {
         crate::audio::start(level, if on("music") { music } else { 0.0 }, if on("ambient") { ambient } else { 0.0 }, &rain, cues, moods)
     }
 
+    /// The work bar (hn.WorkBar): while the chat in front works, its band sweeps along the window's top edge, placed by
+    /// the track's padding; at rest the band has no width. Under Reduce Motion the whole hairline shows, still.
+    fn step_work_bar(&mut self) {
+        use harness_native_ui_layout_api::Padding;
+        let w = self.world.world_ref();
+        let Some(track) = View::of(w.entity_from_id(self.ids.work_bar)).part("track") else { return };
+        let whole = track.entity().try_cloned::<&Laid>().map_or(0.0, |l| l.w);
+        let busy = self.focused_chat().is_some_and(|(_, _, sid)| self.chats.borrow().get(&sid).is_some_and(|t| t.busy));
+        let still = harness_native_api::reduced(w);
+        let pad = if !busy || whole < 1.0 {
+            Padding { l: whole, r: 0.0, t: 0.0, b: 0.0 }
+        } else if still {
+            Padding::default()
+        } else {
+            let look = crate::look::role(w, "work_bar").try_cloned::<&Size>().unwrap_or_default();
+            let (share, period) = (look.w.value.clamp(0.02, 1.0), look.h.value.max(0.1));
+            let time = w.try_get::<&Clock>(|c| c.time).unwrap_or(0.0);
+            let phase = (time / period).rem_euclid(1.0);
+            let eased = phase * phase * (3.0 - 2.0 * phase);
+            let len = whole * share;
+            let x0 = -len + (whole + len) * eased;
+            let (a, z) = (x0.max(0.0), (x0 + len).min(whole));
+            Padding { l: a.round(), r: (whole - z).max(0.0).round(), t: 0.0, b: 0.0 }
+        };
+        if track.entity().try_cloned::<&Padding>() != Some(pad) {
+            track.set(pad);
+        }
+        self.work_live = busy && !still && whole >= 1.0;
+    }
+
     /// The agent kind cmd+N starts a chat of: the one last used (here, else native.json `chat_kind`), else the picker's
     /// last pick when that is an agent (`new_kind`), else Claude.
     fn chat_kind(&self) -> String {
@@ -1855,6 +1892,7 @@ impl App {
         self.browser_frame_start(dt);
         self.step_fold(dt);
         self.step_tree_scroll(dt);
+        self.step_work_bar();
         // The sound follows the chat in front (src/audio.rs; silent unless the window started it).
         {
             let front = self.focused_chat().is_some_and(|(_, _, sid)| self.chats.borrow().get(&sid).is_some_and(|t| t.busy));
@@ -2067,6 +2105,7 @@ impl App {
         crate::look::breathing(self.world.world_ref())
             || paint.shimmering
             || paint.blocks_live
+            || self.work_live
             || matches!(paint.kip_wake, harness_native_render::kips::Wake::Calm(_))
     }
 

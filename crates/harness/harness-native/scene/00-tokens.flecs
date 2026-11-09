@@ -163,6 +163,11 @@ export const line_row = 16
 // corners radius_row.
 export const pill_inset = 2
 export const radius_row = 6
+// The work bar (frame.flecs hn.WorkBar): work_bar_h tall, its band work_bar_share of the window long, crossing in
+// work_bar_period seconds.
+export const work_bar_h = 2
+export const work_bar_share = 0.28
+export const work_bar_period = 1.6
 // ui.Block (prims.flecs): a pixel-art block block_size across (16 texels: 1.5 points each), turning to a new face over
 // block_turn seconds.
 export const block_size = 24
