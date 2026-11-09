@@ -466,6 +466,35 @@ socket. It is the `Device` of the GPU plan ([gpu](../../../future/gpu/plan.md)) 
 - Narrowing: `gpu.only(&[kernels])`, and a smaller memory budget.
 - The providers are Metal, Vulkan, CUDA and the CPU, one `Gpu` type, chosen as any provider is.
 
+**Getting data to the device, and unified memory.** A kernel's arguments are `Buffer<T>`s, never
+plain slices, so a copy is never hidden. What a buffer costs depends on the machine, and the same
+code is right on both kinds:
+
+| | unified memory (Apple silicon, integrated GPUs) | separate memory (a discrete card) |
+|---|---|---|
+| `Vec::new_in(gpu.alloc())`, `gpu.buffer(n)` | page-aligned memory both processors address | pinned host memory, with device memory behind it |
+| the host writes it (`buf.host_mut()`) | writes the bytes the device will read | writes host memory and marks the range dirty |
+| `launch` | no copy | uploads the dirty ranges first |
+| the host reads a result (`buf.host(cx)`) | ready at once, no copy | a wait: downloads what the device changed |
+| a file read into it | disk to device-visible pages, no copy | then an upload |
+
+- **Allocate where the data will be used.** Because every collection takes its allocator, data
+  built in `gpu.alloc()` is a device buffer from its first byte. That is the whole optimization
+  on unified memory: nothing is ever copied in either direction.
+- **The borrow checker carries the rule that makes it safe on both.** A launch borrows its inputs
+  shared and its outputs uniquely until the device finishes (the scope), so the host cannot read
+  a buffer the device is writing. On unified memory that prevents a race; on separate memory it
+  is the same rule, and it is why the dirty ranges are always known.
+- **Reading back is a wait** (`host(cx)`), so it has a deadline everywhere and costs nothing where
+  nothing needs copying.
+- **`Buffer<T, DeviceOnly>` has no host view at all**, for intermediates between kernels. On a
+  discrete card it never crosses the bus; on unified memory the driver may keep it private.
+- **Which kind a device is**: a constant where the target decides it (Metal on Apple silicon, so
+  the dirty tracking compiles out), otherwise `gpu.memory()` at run time for a program that wants
+  to pick a strategy, such as keeping data on the device across many launches.
+- `gpu.upload(cx, &slice)` is the explicit copy from ordinary memory, for data that already
+  exists somewhere else.
+
 **A codec is a sans-IO core.** `bstd::video::Encoder` takes frames and returns packets;
 `Decoder` the reverse; a `Muxer` takes packets and returns the bytes of a container. None of
 them takes a capability or reads a clock: frame times are data. Where the work is done is a
