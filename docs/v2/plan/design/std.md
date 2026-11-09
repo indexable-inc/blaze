@@ -234,6 +234,7 @@ not ambient and is never fetched from a thread-local; `main` receives the root o
 | `Sandboxes` | `io.sandboxes()` | a smaller budget | `OsSandbox`, `Vm`, `WasmSandbox`, and the `Runner` each makes (below) |
 | `Out` | `io.out()` | | standard input, output and error |
 | `Mem` | `io.mem()` | | named arenas and caches against the memory budget |
+| `AudioOut`, `AudioIn` | `io.audio()` | a device | playing and recording sound (below) |
 | `Gpu` | `io.gpu()` | `only(kernels)`, a memory budget | a device: buffers, kernel launches, offscreen render targets (below) |
 
 Rules that hold for all of them:
@@ -597,6 +598,40 @@ Writing a file is the caller's: packets go to a `File` it holds. So rendering a 
 pixels, or the reverse, with a size limit on decode since input is untrusted. PNG first; no
 capability, no IO.
 
+## Sound, and the device capabilities
+
+The rule for hardware: **the capability is in bstd whenever it is authority a program should not
+have by default; the implementation is in bstd only when most programs need it and it is the same
+on every target.**
+
+**Sound is in.** `io.audio()` gives `AudioOut` and, separately, `AudioIn`: a microphone is as
+sensitive as the file system, so listening is its own capability, narrowed to a device.
+
+- A device is a provider (CoreAudio, PipeWire or ALSA, WASAPI, the browser's in a wasm host;
+  silence, a buffer or a file in the simulation), one type each for input and output.
+- The stream is pulled by the device. The callback that fills or reads a buffer must be
+  `nonblocking` and `noalloc`, checked, since the audio thread may never wait; it talks to the
+  rest of the program through a bounded queue.
+- Mixing, resampling and codecs are sans-IO cores, samples in and samples out, like `video`'s.
+  Sample times are data on the injected clock, so a simulated run produces exact samples a test
+  can compare.
+- Kept small: devices, PCM buffers, a mixer, resampling, one lossless and one lossy codec, and an
+  audio track in the MP4 muxer. Synthesis, effect graphs and spatial audio are libraries.
+
+**Device capabilities** have a type and ops on the boundary in bstd, so that code cannot reach
+them unasked and a host can say it has none, and nothing more. Their protocol logic lives outside
+bstd as sans-IO cores over the capability.
+
+| capability | narrowed to | why it is authority |
+|---|---|---|
+| `AudioIn` | a device | listens |
+| `Camera`, `Screen` | a device, a window | watches |
+| `Location` | a precision | says where the user is |
+| `Bluetooth` | a device, a service | scanning reveals location; pairing reaches other devices |
+| `Usb`, `Serial` | a device | reaches hardware directly |
+| `Clipboard` | read or write | holds whatever the user last copied |
+| `Notify` | | interrupts the user |
+
 ## Shared mutation
 
 One naming rule: **the plain name is safe across threads; `Local` marks the cheaper version for
@@ -782,6 +817,7 @@ Interface first, bottom last, so nothing waits on the runtime and every step lan
 | S1d | The facade: bstd re-exports the crates of "What is in it", the interner and helper crates are merged, and the piece crates' names are banned outside bstd | `blaze check` with the bans on; no blaze crate outside bstd names a piece crate |
 | S1e | `bstd::image` (PNG), `bstd::video` (the encoder core, the muxer, the VideoToolbox provider moved out of `harness-video`, which then uses bstd's), and `Gpu` as a capability with the CPU provider and offscreen targets | a round trip of an image; a clip encoded from fixed frames is byte-identical twice; `harness-video` builds on it |
 | S1f | The page pool moves from `blaze-cas` to `bstd::mem::pool`; `file.pin`, pooled receive buffers, records read in place; no `mmap` anywhere in bstd | the pool's simulation test still passes from its new home; the store builds on it |
+| S1g | `bstd::audio`: `AudioOut`, `AudioIn`, PCM buffers, the mixer and resampler as cores, the simulation's provider and one native one; the audio track in the muxer; the types of the device capabilities | a simulated run's samples equal a model's; the callback's effects are refused when it waits or allocates |
 | S3b | The `Frames` layout: the calling convention, the slab, unwinding, and the profiler and backtraces walking the frame chain | the differential test against `Fibers` passes |
 | S4 | The bottom: `bstd::sys` and `bstd::rt`, `blaze-core`'s drivers move in as `bstd::driver`, and bstd is `#![no_std]` | no blaze crate links Rust's `std`; C1 still passes |
 | S5 | The edition: `edition = "blaze-2026.11"` makes `std` name bstd, `fn main(io: Io)` is the entry, and the OS sandbox of a program is derived from what `main` hands out | a program of the edition that never opens the network cannot, checked by the sandbox |
