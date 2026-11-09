@@ -176,6 +176,9 @@ struct Ids {
     main: u64,
     /// The Archive's row pinned to the sidebar's bottom (pressed, the Archive pane opens).
     archive_row: u64,
+    /// The sidebar's foot: what a new chat starts on, and the plan meter's slot.
+    side_model: u64,
+    side_plan: u64,
     /// The overlay on screen and what it is (made again when the mode changes).
     palette: Option<(u64, Mode)>,
     /// The title-bar strip's root (`hn.TitleBar`): only the back chevron, no title.
@@ -492,10 +495,14 @@ impl App {
         let tree = side.child("hn.Tree");
         let foot = side.child("hn.SideFoot");
         let link_note = foot.child("hn.LinkNote");
-        let archive_row = foot
+        let status = foot.child("hn.SideStatus");
+        let archive_row = status
             .child("hn.ArchiveRow")
             .props("hn.ArchiveRow", &[("selected", Prop::Bool(false))]);
         archive_row.set(HoverAmt::default());
+        let side_model = status.child("hn.SideModel");
+        status.child("ui.Spacer");
+        let side_plan = status.child("hn.SidePlan");
         side_clip.child("hn.Seam");
         // The panes: sync_panes makes the first (and swaps each one's prefab by what it shows).
         let main = root.child("hn.Main");
@@ -513,6 +520,8 @@ impl App {
             link_note: link_note.id(),
             main: main.id(),
             archive_row: archive_row.id(),
+            side_model: side_model.id(),
+            side_plan: side_plan.id(),
             palette: None,
             bar: bar.id(),
             row_menu: row_menu.id(),
@@ -1698,6 +1707,22 @@ impl App {
         })
     }
 
+    /// The sidebar's foot (hn.SideStatus): what cmd+N starts a chat on (the model's name as its agent lists it, then
+    /// the effort) and how much of that agent's plan is used. Written only on change.
+    fn sync_side_status(&mut self) {
+        let kind = self.chat_kind();
+        let c = self.choice_of(&kind);
+        let models = self.link.agent_models();
+        let name = c.model.as_deref().map(|m| {
+            models.get(&kind).and_then(|l| l.iter().find(|x| x.is(m))).map(|x| x.name.as_str()).filter(|n| !n.is_empty()).unwrap_or(m).to_owned()
+        });
+        let words = [name, c.effort].into_iter().flatten().collect::<Vec<_>>().join(" \u{b7} ");
+        let w = self.world.world_ref();
+        View::of(w.entity_from_id(self.ids.side_model)).text(&words);
+        let windows = self.chat_plan(&kind);
+        chat::plan::fill_plan(View::of(w.entity_from_id(self.ids.side_plan)), &windows, &kind, tone(w, "ink_muted"), model::now_ms() / 1000);
+    }
+
     /// The agent kind cmd+N starts a chat of: the one last used (here, else native.json `chat_kind`), else the picker's
     /// last pick when that is an agent (`new_kind`), else Claude.
     fn chat_kind(&self) -> String {
@@ -1803,6 +1828,7 @@ impl App {
         self.browser_frame_start(dt);
         self.step_fold(dt);
         self.step_tree_scroll(dt);
+        self.sync_side_status();
         self.step_archive_scroll();
         self.step_chat_scroll();
         let w = self.world.world_ref();

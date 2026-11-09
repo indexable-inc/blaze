@@ -341,11 +341,6 @@ impl App {
             }
         });
         let agent = if t.agent.is_empty() { kind } else { t.agent.as_str() };
-        // How much of the plan is used: the account's, so the latest any chat of this kind was told.
-        if let Some(slot) = bar.part("plan") {
-            let windows = self.chat_plan(agent);
-            super::plan::fill_plan(slot, &windows, agent, ink.hot, model::now_ms() / 1000);
-        }
         // Under the pointer, the meter's popover (context.rs), anchored to the ring; never over the open menu.
         if let Some(pop) = bar.part("pop") {
             super::context::fill_context_pop(
