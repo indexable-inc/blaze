@@ -728,6 +728,7 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                 (Some(Word::blaze), Some(Word::nonblocking)) => AttrFlags::NONBLOCKING,
                 (Some(Word::blaze), Some(Word::linear)) => AttrFlags::LINEAR,
                 (Some(Word::blaze), Some(Word::consumes)) => AttrFlags::CONSUMES,
+                (Some(Word::blaze), Some(Word::memo)) => AttrFlags::BLAZE_MEMO,
                 (Some(Word::blaze), Some(Word::reflect)) => AttrFlags::BLAZE_REFLECT,
                 (Some(Word::blaze), Some(Word::sealed)) => AttrFlags::BLAZE_SEALED,
                 (Some(Word::clippy), Some(Word::has_significant_drop)) => {
@@ -924,6 +925,7 @@ name_set! {
     marker,
     may_dangle,
     may_suspend,
+    memo,
     must_not_suspend,
     must_use,
     naked,
@@ -1186,6 +1188,14 @@ bitflags::bitflags! {
         /// `#[blaze::nonblocking]` or `#[blaze::nonblocking(..)]`: as [`AttrFlags::NOPANIC`],
         /// for no call that blocks the thread (`blaze::nonblocking`).
         const NONBLOCKING = 1 << 99;
+        /// `#[blaze::memo]`, a word, on a function: a blaze extension (inert under rustc with
+        /// `#![register_tool(blaze)]`), the function is a memo point of `bstd::eval`
+        /// (docs/v2/plan/design/std.md, "Eval"). It is held pure as if written
+        /// `#[blaze::pure]` ([`AttrFlags::pure_attr`] answers `Checked` for it), and its item
+        /// type alone is `core::reflect::MemoPoint` (`hir_ty::comptime::reflect_is_memo_point`).
+        /// It changes diagnostics and which trait goals hold, never code: no codegen key reads
+        /// it.
+        const BLAZE_MEMO = 1 << 101;
         /// `#[blaze::sealed]`, a word, on a trait: a blaze extension (inert under rustc with
         /// `#![register_tool(blaze)]`). No crate but the trait's may implement it or name it as
         /// a supertrait, and when every impl of it is for a local type, a type parameter
@@ -2108,10 +2118,13 @@ impl AttrFlags {
     }
 
     /// What `#[blaze::pure]` on `owner` says ([`PureAttr`]); `None` without it, one bit test.
+    /// `#[blaze::memo]` without it says `Checked`: a memo point is held pure, so every reader
+    /// of this (the lint `blaze::pure`, the purity check) holds it with no rule of its own.
     #[inline]
     pub fn pure_attr(db: &Db, owner: AttrDefId) -> Option<PureAttr> {
-        if !AttrFlags::query(db, owner).contains(AttrFlags::PURE) {
-            return None;
+        let flags = AttrFlags::query(db, owner);
+        if !flags.contains(AttrFlags::PURE) {
+            return flags.contains(AttrFlags::BLAZE_MEMO).then_some(PureAttr::Checked);
         }
         return pure_attr(db, owner);
 

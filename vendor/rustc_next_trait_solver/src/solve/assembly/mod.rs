@@ -751,7 +751,8 @@ where
                     | SolverTraitLangItem::ReflectEnum
                     | SolverTraitLangItem::ReflectField
                     | SolverTraitLangItem::ReflectVariant
-                    | SolverTraitLangItem::ReflectFnItem),
+                    | SolverTraitLangItem::ReflectFnItem
+                    | SolverTraitLangItem::ReflectMemoPoint),
                 ) => G::consider_builtin_reflect_candidate(self, goal, item),
                 _ => Err(NoSolution.into()),
             }

@@ -3916,6 +3916,7 @@ dependencies = [
  "hir-ty",
  "hir-ty-mir",
  "hir-ty-share",
+ "inventory",
  "rustc_abi",
  "rustc_type_ir",
  "smallvec",

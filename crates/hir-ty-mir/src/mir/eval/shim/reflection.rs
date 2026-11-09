@@ -357,6 +357,22 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 }
                 destination.write_from_bytes(self, &bytes[..destination.size])?;
             }
+            Intrinsic::BlazeCodeId => {
+                // `[u8; 32]`: the behaviour identity of the fn item or closure type, compiled
+                // in the crate this evaluation is of. hir-ty-identity is above this crate, so
+                // it answers through hir-ty's table; no table, or code with no identity, is
+                // this constant's error, naming the type and why.
+                let callable = arg(0)?;
+                let env = self.param_env.store();
+                let id = match hir_ty::providers::code_identity() {
+                    Ok(table) => (table.fn_code_id)(self.db, callable, &env),
+                    Err(why) => Err(why),
+                };
+                match id {
+                    Ok(id) => destination.write_from_bytes(self, &id)?,
+                    Err(why) => not_supported!("{intrinsic} of {callable:?}: {why}"),
+                }
+            }
             _ => not_supported!("{intrinsic} is none of `core::reflect`'s intrinsics"),
         }
         Ok(())

@@ -632,6 +632,50 @@ bstd as sans-IO cores over the capability.
 | `Clipboard` | read or write | holds whatever the user last copied |
 | `Notify` | | interrupts the user |
 
+## The rest of the set
+
+The test for a capability: could code use it to learn or change something outside its own values
+that its caller did not hand it? Everything an OS or a browser lets a process do passes through
+one of these, so "what can this function reach" always has an answer.
+
+**Roots, beyond those above.**
+
+| capability | from | narrowed to | gives |
+|---|---|---|---|
+| `Term` | `io.term()` | | the terminal as a device: size, raw mode, cursor and colour, key events. `Out` is only bytes |
+| `Keys` | `io.keys()` | a named key | the OS keychain and hardware keys: sign, decrypt, fetch a `Secret`. A key in hardware never leaves it |
+| `Roots` | `io.roots()` | a set of authorities | whom TLS trusts. Chosen explicitly, so no connection trusts the machine's store unasked |
+| `Locale` | `io.locale()` | | time zone, language, formats. Ambient and different per machine, so a deterministic program takes it or does without |
+| `User` | `io.user()` | | who is running: name, home, ids. Not in `Env`, so reading variables does not reveal it |
+| `Procs` | `io.host().procs()` | a process | other processes: list, signal, inspect. Separate from one's own exit and pid |
+| `Code` | `io.code()` | a module | make memory executable, load native code. What live patching and a JIT hold; nothing else can turn data into instructions |
+| `Window` | `io.windows()` | a window | a surface to draw on and the input sent to it. Input to *other* windows is `Automation` |
+| `Automation` | `io.automation()` | an application | drive other applications: synthesize input, read their UI |
+| `Opener` | `io.opener()` | a scheme | hand a URL or a file to the user's default application |
+| `Power` | `io.power()` | | keep the machine awake, read the battery |
+
+**Layered**, each made from a lower one or offered by the host directly, as `Http` is:
+
+| capability | made from | or from a host that offers |
+|---|---|---|
+| `Http` | `Net`, `Clock`, `Roots` | requests |
+| `Streams` | `Datagrams`, `Clock`, `Roots` (`quic`) | WebTransport |
+| `Resolver` | `Net` | name lookup alone, for code that should resolve and not connect |
+| `Local` | a `Dir` (a socket's path), or a pair made in memory | pipes and local sockets between processes |
+| `Kv`, `Blobs` | a `Dir` | a key-value or object store, which is all a wasm host may offer in place of files |
+| `Shared` memory | `Mem` | a region two processes map, handed to a child through its sandbox |
+| `Runner` | a sandbox | running a command |
+| `Eval` | `Mem`, a store | computing or recalling a pure function |
+
+**Budgets ride the same way.** Cores and time are in `Cx` (a scope is given a share of workers and
+a deadline), memory in `Mem`, disk in a `Dir`'s quota, network in a `Net`'s byte and rate limits,
+device memory in `Gpu`. A capability with a limit is narrower than one without, and exceeding it
+is a typed outcome, never a stall.
+
+**Deliberately not capabilities:** panicking and purity (effects of the code, with nothing to
+hand over); `unsafe` and foreign calls (the trusted list); arithmetic, formatting and the
+collections (they reach nothing).
+
 ## Shared mutation
 
 One naming rule: **the plain name is safe across threads; `Local` marks the cheaper version for

@@ -521,6 +521,10 @@ pub trait Interner:
     /// blaze: whether `ty` is an enum (`core::reflect::Enum`).
     fn reflect_is_enum(self, ty: Self::Ty) -> bool;
 
+    /// blaze: whether `ty` is the item type of a function written `#[blaze::memo]`
+    /// (`core::reflect::MemoPoint`).
+    fn reflect_is_memo_point(self, ty: Self::Ty) -> bool;
+
     /// blaze: `env` with `clauses` added, for a member of a field binder entering the
     /// environment (`rustc_next_trait_solver`'s `env_with_reflected_member`).
     fn param_env_with_clauses(

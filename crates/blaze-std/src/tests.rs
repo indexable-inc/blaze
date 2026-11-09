@@ -24,6 +24,8 @@
 //! - [`inflight`]: a `Pending` op waited for or cancelled never lands after it returned.
 //! - [`missing`]: a withheld capability is `None` at the root and its `need_` names it.
 //! - [`close`]: closing a writable file syncs it, or returns the sync's failure.
+//! - [`eval`]: an evaluator gives a memo point's own value, a memo stays within its limit, and
+//!   provenance records exactly the calls made.
 //!
 //! The compile-time half, that dropping a `Scope`, `Task`, `Pending` or `File<ReadWrite>`
 //! unfinished is an error, is in crates/hir-ty-linear's fixtures (`bstd_*`): that harness
@@ -40,6 +42,7 @@ mod contexts;
 mod crash;
 mod deadlines;
 mod env;
+mod eval;
 mod inflight;
 mod missing;
 mod names;

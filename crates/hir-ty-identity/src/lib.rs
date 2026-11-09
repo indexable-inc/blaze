@@ -72,6 +72,23 @@ use hir_ty_mir::mir::dispatch::Body;
 pub use instance::instance_identity;
 pub use walk::{code_id, fn_code_id};
 
+/// const eval's answer to `core::reflect::code_id_of::<F>()`, registered for every binary that
+/// links this crate (`hir_ty::providers::CodeIdentity`).
+fn provided_code_id<'db>(
+    db: &'db Db,
+    callable: hir_ty::next_solver::Ty<'db>,
+    env: &hir_ty::traits::StoredParamEnvAndCrate,
+) -> Result<[u8; 32], String> {
+    match fn_code_id(db, callable, env) {
+        Ok(id) => Ok(id.0.0),
+        Err(unidentified) => Err(unidentified.to_string()), // alloc: error path
+    }
+}
+
+inventory::submit! {
+    hir_ty::providers::CodeIdentity { fn_code_id: provided_code_id, own_tests: cfg!(test) }
+}
+
 /// The domain of a compile identity. 3: an inlined callee's promoted constants are read, so
 /// no identity made when two instances that differ only there shared one is reused. 4: a
 /// callee of the same body, a callee whose constant is computed from parameters, and a callee

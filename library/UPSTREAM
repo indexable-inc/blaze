@@ -17,7 +17,7 @@ rust-src https://static.rust-lang.org/dist/2026-10-27/rust-src-nightly.tar.xz a9
 # - core/src/reflect.rs (new) with its `pub mod reflect;` in core/src/lib.rs and
 #   `pub use core::reflect;` in std/src/lib.rs: blaze's compile-time reflection,
 #   `#![feature(blaze_comptime)]` (`Struct`, `Enum`, `Field<Base>`, `Variant<Base>`, `Marked`,
-#   `Unmarked`, `fields_of`, `variants_of`, `FnItem`, `fn_info`). Every item is unstable under
+#   `Unmarked`, `fields_of`, `variants_of`, `FnItem`, `fn_info`, `MemoPoint`, `code_id_of`). Every item is unstable under
 #   `blaze_comptime`, its lang items are `blaze_*`, and its intrinsics (`blaze_*`, private to the
 #   module) are answered only by blaze's const evaluator; nothing else in library/ refers to it,
 #   so a crate without the feature sees std as the nightly's

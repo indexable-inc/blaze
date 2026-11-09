@@ -142,6 +142,9 @@ impl DefMap {
                         | "reflect"
                         // `#[blaze::sealed]`, from `AttrFlags::BLAZE_SEALED` (`hir-ty-coherence`).
                         | "sealed"
+                        // `#[blaze::memo]`, from `AttrFlags::BLAZE_MEMO`: a memo point of
+                        // `bstd::eval` (`AttrFlags::pure_attr`, `core::reflect::MemoPoint`).
+                        | "memo"
                 )
             {
                 return true;

@@ -26,6 +26,8 @@
 //!   a [`Path`], an [`env::VarName`], a [`net::HostPort`], each checked as it is made, and a
 //!   literal checked as the crate compiles ([`path!`], [`var!`], [`host!`]).
 //! - Every wait ends in a typed outcome: what it waited for, or a [`Stopped`].
+//! - How a pure function's value is got is a value too: [`eval::Eval`] runs a memo point
+//!   (`#[blaze::memo]`), remembers it or hands it to a handler ([`eval`]).
 //!
 //! What S1 does not have yet, and why, is in the crate's report and in std.md: the calling
 //! fiber does not park on a scheduler (the tree has no fiber park yet); a call waits by
@@ -66,7 +68,14 @@
 //! allocator ([`mem::Bytes`]).
 
 #![deny(unsafe_code)]
-#![feature(allocator_api, generic_atomic, register_tool, custom_inner_attributes)]
+#![feature(
+    allocator_api,
+    allocator_ext,
+    blaze_comptime,
+    custom_inner_attributes,
+    generic_atomic,
+    register_tool
+)]
 #![register_tool(blaze)]
 
 pub mod args;
@@ -78,6 +87,8 @@ pub mod cell;
 pub mod clock;
 pub mod cx;
 pub mod env;
+/// Who decides how a pure function is computed: `Eval` and its providers, memo points, keys.
+pub mod eval;
 pub mod fs;
 pub mod host;
 pub mod io;
@@ -219,6 +230,7 @@ pub use crate::{
     clock::Clock,
     cx::Cx,
     env::VarName,
+    eval::Eval,
     io::{Io, Missing, Offers},
     net::HostPort,
     path::Path,
@@ -301,4 +313,12 @@ pub(crate) enum Plant {
     JoinDropsFailure,
     /// Every root accessor of `Io` hands its capability out, offered or not.
     OffersIgnored,
+    /// A tuple's key leaves its last element out: two calls that differ only there share one.
+    KeyIgnoresLast,
+    /// `Eval::memo` never drops a generation: its entries pass its limit.
+    MemoNeverEvicts,
+    /// `Eval::memo` keeps every entry under one point: two points with equal arguments share.
+    MemoSharesPoints,
+    /// A nested call is handed its caller's parent as its own: provenance skips a level.
+    NestedUnderGrandparent,
 }

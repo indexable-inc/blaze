@@ -153,6 +153,12 @@ impl Arena {
         Bytes::new_in(&self.frame, self.name)
     }
 
+    /// The arena's frame itself, its limit kept: for an owner that shares it between a
+    /// collection and its elements ([`crate::eval`]'s generations).
+    pub(crate) fn into_frame(self) -> Frame {
+        self.frame
+    }
+
     /// The allocator, for a collection of the caller's (`Vec::new_in(arena.alloc())`), grown
     /// through its `try_` forms.
     pub fn alloc(&self) -> &Frame {

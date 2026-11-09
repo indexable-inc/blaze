@@ -783,7 +783,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             | Intrinsic::BlazeFieldAttrs
             | Intrinsic::BlazeFieldIndex
             | Intrinsic::BlazeVariantDiscriminant
-            | Intrinsic::BlazeVariantIndex => {
+            | Intrinsic::BlazeVariantIndex
+            | Intrinsic::BlazeCodeId => {
                 return self
                     .exec_blaze_reflection_intrinsic(intrinsic, generic_args, destination)
                     .map(|()| true);

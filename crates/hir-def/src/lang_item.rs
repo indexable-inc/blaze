@@ -827,6 +827,8 @@ language_item_table! { LangItems =>
     ReflectVariants,         sym::blaze_variants,      StructId;
     /// `core::reflect::FnItem`: fn item and closure types, never fn pointers.
     ReflectFnItem,           sym::blaze_fn_item,       TraitId;
+    /// `core::reflect::MemoPoint`: the item type of a function written `#[blaze::memo]`.
+    ReflectMemoPoint,        sym::blaze_memo_point,    TraitId;
 
     RangeMin,                sym::RangeMin,            ConstId;
     /// `SizedTypeProperties::SIZE` and `::ALIGN`.
