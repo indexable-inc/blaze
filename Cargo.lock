@@ -856,6 +856,7 @@ dependencies = [
  "intern",
  "ix-prof",
  "libmimalloc-sys",
+ "llvm-sys",
  "lzma-rust2",
  "serde_json",
  "stdx",

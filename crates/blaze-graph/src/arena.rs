@@ -37,7 +37,7 @@ use crossbeam_queue::SegQueue;
 
 use crate::Budget;
 
-pub use global::Holders;
+pub use global::{Holders, Malloc};
 
 /// How far a thread's count may move before it is added to [`HELD`] (Linux's
 /// `percpu_counter`): an allocation then costs a few thread-local adds and no atomic, and
@@ -150,6 +150,12 @@ impl Drop for Exit {
 /// once: what the thread's other destructors free still counts. What it added.
 fn exit_flush(local: &Local) -> i64 {
     local.batch.set(0);
+    fold_all(local)
+}
+
+/// Adds what the thread's count moved since it last did to [`HELD`] and each holder's to its
+/// tag line. What it added to [`HELD`].
+fn fold_all(local: &Local) -> i64 {
     let left = local.unflushed.replace(0);
     add(local, left);
     for (at, moved) in local.holders.iter().enumerate() {
@@ -167,6 +173,37 @@ fn exit_flush(local: &Local) -> i64 {
         }
     }
     left
+}
+
+/// Folds what this thread's count moved since it last did into [`held`] and the tags' lines
+/// (`blaze_mem::tag::Counters::heap`), which otherwise take it once it moves [`BATCH`]: a
+/// reading after it is exact for what this thread allocated and freed, within [`BATCH`] for
+/// each other thread. Allocates nothing.
+pub fn fold_here() {
+    with_local(|local| {
+        fold_all(local);
+    });
+}
+
+/// [`count`] for a thread whose thread-locals are not there to count into
+/// ([`Locals::Gone`]): straight to [`HELD`] and the holder's tag line, two atomic adds, and
+/// to no account (the task that ran on the thread is over, or none began). Touches no
+/// thread-local.
+fn count_shared(holder: Option<Tag>, delta: i64) {
+    HELD.0.fetch_add(delta, Ordering::Relaxed);
+    blaze_mem::tag::heap_moved(holder, delta);
+}
+
+/// Where a block C allocated or freed is counted ([`Counting::c_malloc`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Locals {
+    /// In the thread's counts and its job's account, as a block of Rust's is.
+    Live,
+    /// Straight to the process's totals ([`count_shared`]), touching no thread-local: on
+    /// macOS, dyld makes a thread's thread-locals with `malloc` the first time the thread
+    /// touches one, and frees them with `free` as the thread ends, so a `malloc` or `free`
+    /// there that counted through them would make them again, through itself.
+    Gone,
 }
 
 #[cfg_attr(not(test), allow(unused_variables))]
@@ -344,7 +381,7 @@ mod global {
 
     use blaze_mem::Tag;
 
-    use super::{Counting, count, signed};
+    use super::{Counting, Locals, count, count_shared, signed};
 
     /// What [`Counting`] asks of the allocator under it to name the holder of a block: the
     /// blaze-mem tag whose task allocated it, kept apart so that a free, on any thread, finds
@@ -384,6 +421,39 @@ mod global {
             layout: Layout,
             new_size: usize,
         ) -> *mut u8;
+    }
+
+    /// What [`Counting`] asks of the allocator under it to serve C's `malloc`, `free` and
+    /// `realloc` (blaze-engine's `malloc.rs`), which name no layout: a block's owner and size
+    /// from its address alone. Every block C allocates through it is counted at its usable size,
+    /// as it is made and again as it is freed, so the two cancel whatever size was asked.
+    pub trait Malloc: Holders {
+        /// Whether `ptr` is in a block of this allocator's. Any address may be asked, one of
+        /// another allocator's too. Allocates nothing.
+        fn owns(&self, ptr: *const u8) -> bool;
+
+        /// The bytes `ptr`'s block holds: what C may use of it, and what it is counted at.
+        ///
+        /// # Safety
+        ///
+        /// `ptr` is a live block of this allocator.
+        unsafe fn usable(&self, ptr: *mut u8) -> usize;
+
+        /// Frees `ptr`, whatever layout it was made with.
+        ///
+        /// # Safety
+        ///
+        /// `ptr` is a live block of this allocator, not used after.
+        unsafe fn free(&self, ptr: *mut u8);
+
+        /// C's `realloc` of `ptr` to `new_size` bytes, at `malloc`'s alignment, putting the
+        /// block among `into`'s blocks when it moves, as [`Holders::realloc_for`] does.
+        ///
+        /// # Safety
+        ///
+        /// `ptr` is a live block of this allocator; once this returns non-null, `ptr` is
+        /// not used again.
+        unsafe fn realloc_in(&self, into: Option<Tag>, ptr: *mut u8, new_size: usize) -> *mut u8;
     }
 
     /// std's allocator keeps no blocks apart: its bytes are counted, not named.
@@ -502,6 +572,99 @@ mod global {
             new
         }
     }
+
+    /// C's allocator, over `A`: the entry points blaze's `malloc`, `free` and `realloc` (and
+    /// on macOS its malloc zone) call, so a block C or C++ allocates (LLVM, through its C API
+    /// and its `operator new`) is made for the running task's tag and counted as Rust's are.
+    /// A block is counted at its usable size ([`Malloc::usable`]).
+    impl<A: Malloc> Counting<A> {
+        /// `malloc` (`zeroed`: `calloc`), and with `align` past a word `posix_memalign`,
+        /// `aligned_alloc` and the rest: a block of at least `size` bytes, in the running
+        /// task's tag, counted in this thread's counts ([`Locals::Live`]). Null where the
+        /// allocator has none, or `size` and `align` make no layout.
+        ///
+        /// # Safety
+        ///
+        /// `align` is a power of two; the thread's thread-locals are there to count into.
+        pub unsafe fn c_malloc(&self, size: usize, align: usize, zeroed: bool) -> *mut u8 {
+            // `malloc(0)` is a block of its own, as mimalloc makes it; a layout of 0 bytes is
+            // outside `GlobalAlloc`'s contract.
+            let Ok(layout) = Layout::from_size_align(size.max(1), align) else {
+                return std::ptr::null_mut();
+            };
+            let holder = Self::running();
+            // SAFETY: a valid layout of a nonzero size.
+            let ptr = unsafe {
+                match (holder, zeroed) {
+                    (Some(tag), _) => self.0.alloc_for(tag, layout, zeroed),
+                    (None, true) => self.0.alloc_zeroed(layout),
+                    (None, false) => self.0.alloc(layout),
+                }
+            };
+            if !ptr.is_null() {
+                // SAFETY: the live block just made.
+                count(holder, signed(unsafe { self.0.usable(ptr) }));
+            }
+            ptr
+        }
+
+        /// `free` of `ptr`, a live block of `A` (`usable`: its size, where the caller has it
+        /// from `A` already), taken off the tag whose heap holds it, wherever it was made.
+        ///
+        /// # Safety
+        ///
+        /// `ptr` is a live block of `A`, not used after; `usable`, if given, is
+        /// [`Malloc::usable`] of it.
+        pub unsafe fn c_free(&self, ptr: *mut u8, usable: Option<usize>, locals: Locals) {
+            // SAFETY: the caller says `ptr` is a live block of `A`.
+            let (holder, bytes) = unsafe {
+                (self.holder(ptr), usable.unwrap_or_else(|| self.0.usable(ptr)))
+            };
+            // SAFETY: as above, freed once.
+            unsafe { self.0.free(ptr) };
+            tally(locals, holder, -signed(bytes));
+        }
+
+        /// `realloc` of `ptr`, a live block of `A`, to `new_size` bytes: one that moves goes
+        /// to the running task's tag ([`Locals::Live`]; the untagged blocks where the thread's
+        /// thread-locals are gone, which name no task), as Rust's do. Null, `ptr` untouched,
+        /// where the allocator has no room.
+        ///
+        /// # Safety
+        ///
+        /// `ptr` is a live block of `A`, not used again once this returns non-null.
+        pub unsafe fn c_realloc(&self, ptr: *mut u8, new_size: usize, locals: Locals) -> *mut u8 {
+            // SAFETY: the caller says `ptr` is a live block of `A`.
+            let (was, old) = unsafe { (self.holder(ptr), self.0.usable(ptr)) };
+            let into = match locals {
+                Locals::Live => Self::running(),
+                Locals::Gone => None,
+            };
+            // SAFETY: as above; `realloc(p, 0)` keeps a block, as `malloc(0)` makes one.
+            let new = unsafe { self.0.realloc_in(into, ptr, new_size.max(1)) };
+            if !new.is_null() {
+                // SAFETY: `new` is the live block the realloc gave.
+                let (now, bytes) = unsafe { (self.holder(new), self.0.usable(new)) };
+                match now == was {
+                    true => tally(locals, was, signed(bytes) - signed(old)),
+                    false => {
+                        tally(locals, was, -signed(old));
+                        tally(locals, now, signed(bytes));
+                    }
+                }
+            }
+            new
+        }
+    }
+
+    /// Counts `delta` bytes of `holder`'s where `locals` says.
+    #[inline(always)]
+    fn tally(locals: Locals, holder: Option<Tag>, delta: i64) {
+        match locals {
+            Locals::Live => count(holder, delta),
+            Locals::Gone => count_shared(holder, delta),
+        }
+    }
 }
 
 /// How far a thread's bytes for its account may move before they are charged to it: the
@@ -551,8 +714,10 @@ struct Slot {
 /// Every account's slot, in segments that double, each made the first time an index in it is
 /// opened and never freed: a slot's address is fixed for the process's life, so the allocator's
 /// charges reach it with an acquire load and no lock. A segment is taken from the system
-/// allocator, zeroed (a zeroed [`Slot`] is a free one), outside [`Counting`]: making one charges
-/// no account and never reenters a charge.
+/// allocator, zeroed (a zeroed [`Slot`] is a free one), outside [`Counting`]'s Rust entry points:
+/// making one charges no account ([`uncharged`]) and never reenters a charge. In the daemon the
+/// system allocator is blaze's C allocator (blaze-engine's `malloc.rs`, [`Counting::c_malloc`]),
+/// so its bytes are in [`held`] and the heap's tag lines like any C block's.
 static SEGMENTS: [AtomicPtr<Slot>; SEGMENT_COUNT] =
     [const { AtomicPtr::new(std::ptr::null_mut()) }; SEGMENT_COUNT];
 

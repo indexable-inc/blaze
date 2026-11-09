@@ -106,7 +106,9 @@ Want to Use MMAP in Your DBMS?" (CIDR 2022) for why not mmap.
 ## What exists and what is planned (2026-11-09)
 
 - Built: blaze-mem (frames, arenas, pools, regions, tags, `MADV_FREE_REUSABLE`); mimalloc 3 with
-  a heap per tag (`crates/blaze-engine/src/heaps.rs`); blaze-format (`Persist`, records read in
+  a heap per tag (`crates/blaze-engine/src/heaps.rs`), which C's and C++'s `malloc` (LLVM's) go
+  through too, counted to the running task's tag (`crates/blaze-engine/src/malloc.rs`: exported
+  symbols on Linux, a malloc zone made first on macOS); blaze-format (`Persist`, records read in
   place); the daemon image and the store's packs read from mapped files; `for const` and
   `for<F: Field<T>>` bounds (blaze_comptime phase 2); const heap (`const_allocate`,
   `const_make_global`) in the const evaluator.
