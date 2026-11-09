@@ -12,26 +12,6 @@ const DEFAULT_PAD: [f32; 4] = [18.0, 18.0, 16.0, 16.0];
 /// ground, alone.
 const TOKENS: [&str; 1] = ["tone_term_ground"];
 
-/// Each `code_ink` capture (scene/00-tokens.flecs) and the ANSI colour a themed appearance colours it with, as editors
-/// that follow the terminal's palette do: keywords magenta, functions blue, types yellow, strings green, numbers and
-/// escapes cyan, fields red, comments bright black.
-const CODE_ANSI: [(&str, usize); 14] = [
-    ("keyword", 5),
-    ("function", 4),
-    ("type", 3),
-    ("constructor", 3),
-    ("attribute", 3),
-    ("string", 2),
-    ("escape", 6),
-    ("number", 6),
-    ("constant", 6),
-    ("property", 1),
-    ("label", 1),
-    ("operator", 6),
-    ("comment", 8),
-    ("variable::builtin", 1),
-];
-
 /// What the app takes from the config.
 pub(super) struct Look {
     pub live: harness_ghostty_config::Live,
@@ -42,8 +22,6 @@ pub(super) struct Look {
     pub pad: [f32; 4],
     /// The scene's value of each of [`TOKENS`], read before the first tint.
     scene: Option<Vec<Fill>>,
-    /// The scene's Fill of each of [`CODE_ANSI`]'s captures (None: the scene has none for it).
-    code: Option<Vec<Option<Fill>>>,
     /// The scene's selection plate (`ui.selection`'s Fill), read before the first tint.
     selection: Option<Fill>,
 }
@@ -58,7 +36,6 @@ impl Look {
             size: TERM_SIZE,
             pad: DEFAULT_PAD,
             scene: None,
-            code: None,
             selection: None,
         }
     }
@@ -190,7 +167,7 @@ impl App {
     }
 
     /// The terminal's ground from each appearance's theme where it sets a background (`themed`: light, dark), else the
-    /// scene's; and code's colours from its ANSI palette likewise.
+    /// scene's. Code in a chat keeps the app's theme (`code_ink`), as the chat does: only the terminal follows Ghostty.
     fn tint_tokens(&mut self, themed: [bool; 2]) {
         let w = self.world.world_ref();
         let scene = self
@@ -207,20 +184,6 @@ impl App {
             };
             if token(w, name) != Some(f) {
                 retint(w, name, f);
-            }
-        }
-        // Code's colours: the theme's ANSI colours where it themes the appearance, else the scene's.
-        let code = self.look.code.get_or_insert_with(|| {
-            CODE_ANSI.iter().map(|(c, _)| w.try_lookup(&format!("code_ink::{c}")).and_then(|e| e.try_cloned::<&Fill>())).collect()
-        });
-        for (k, (capture, ansi)) in CODE_ANSI.iter().enumerate() {
-            let (Some(e), Some(s)) = (w.try_lookup(&format!("code_ink::{capture}")), code[k]) else { continue };
-            let f = Fill {
-                light: if themed[0] { rgba(l.palette[*ansi]) } else { s.light },
-                dark: if themed[1] { rgba(d.palette[*ansi]) } else { s.dark },
-            };
-            if e.try_cloned::<&Fill>() != Some(f) {
-                e.set(f);
             }
         }
     }

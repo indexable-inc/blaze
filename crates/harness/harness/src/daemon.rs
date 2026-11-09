@@ -678,23 +678,7 @@ impl Daemon {
             Req::Rpc { id, method, args } => crate::object::rpc(self, &id, &method, &args, |r| self.handle(r))?,
             Req::Spawn { kind, mut args, parent, cwd, prompt, name, cols, rows, mode, model, effort } => {
                 let tui = mode.as_deref() == Some("tui");
-                let codex_chat = kind == "codex" && !tui;
-                // The model and effort it starts on: checked against its kind's list, then its launch's own flags
-                // (claude's and cursor's `--model`, claude's `--effort`), or for a Codex chat its thread/start.
-                chat::models::check(&kind, model.as_deref(), effort.as_deref())?;
-                if !codex_chat {
-                    if let Some(m) = &model {
-                        args.extend(["--model".to_owned(), m.clone()]);
-                    }
-                    if let Some(e) = &effort {
-                        anyhow::ensure!(kind == "claude", "{kind} takes no effort at launch, so effort {e:?} is refused");
-                        args.extend(["--effort".to_owned(), e.clone()]);
-                    }
-                }
-                if tui {
-                    args.push("--tui".into());
-                }
-                let choice = if codex_chat && (model.is_some() || effort.is_some()) { Some((model, effort)) } else { None };
+                let choice = launch_choice(&kind, &mut args, model, effort, tui)?;
                 let id = self.spawn_full(&kind, &args, parent, cwd, prompt.as_deref(), name, &BTreeMap::new(), cols.unwrap_or(120), rows.unwrap_or(40), choice)?;
                 Reply::Spawned { id }
             }
@@ -1404,4 +1388,30 @@ mod tests {
         send(&mut c2, &list()).await.expect("send");
         assert!(matches!(recv(&mut c2).await.expect("a new connection answered"), Down::Reply(Reply::Sessions { .. })));
     }
+}
+
+/// What a launch of `kind` starts on: `model` and `effort` checked against its kind's list, then its launch's own flags
+/// (claude's and cursor's `--model`, claude's `--effort`), or for a Codex chat the choice its thread/start carries
+/// (returned). `tui` adds `--tui`. The one home for both spawn requests (`spawn` and `spawn_object`).
+///
+/// # Errors
+/// A model or effort its kind does not list, or an effort for a kind that takes none at launch.
+pub fn launch_choice(
+    kind: &str, args: &mut Vec<String>, model: Option<String>, effort: Option<String>, tui: bool,
+) -> Result<Option<(Option<String>, Option<String>)>> {
+    let codex_chat = kind == "codex" && !tui;
+    chat::models::check(kind, model.as_deref(), effort.as_deref())?;
+    if !codex_chat {
+        if let Some(m) = &model {
+            args.extend(["--model".to_owned(), m.clone()]);
+        }
+        if let Some(e) = &effort {
+            anyhow::ensure!(kind == "claude", "{kind} takes no effort at launch, so effort {e:?} is refused");
+            args.extend(["--effort".to_owned(), e.clone()]);
+        }
+    }
+    if tui {
+        args.push("--tui".into());
+    }
+    Ok(if codex_chat && (model.is_some() || effort.is_some()) { Some((model, effort)) } else { None })
 }

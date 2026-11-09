@@ -18,6 +18,9 @@ hn {
   @tree ChildOf
   template ObjRow : Row {
     prop look: string = "rest"
+    prop mark: string = ""
+    prop doing: string = ""
+    prop doing_tip: string = ""
     prop busy: bool = false
     prop alarm: bool = false
     prop meta: string = ""
@@ -29,7 +32,7 @@ hn {
     Action: {name: "select:{obj}"}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $tree_row_h, min: 0, max: 0}}
     Padding: {l: indent($depth, $tree_pad, $indent_step) + $tree_gutter, r: $tree_pad_r, t: 0, b: 0}
-    hang { hn.Hang: {obj: $obj, depth: $depth, kids: $kids, open: $open} }
+    hang { hn.Hang: {obj: $obj, depth: $depth, kids: $kids, open: $open, mark: $mark} }
     name : hn.tree.Head {
       Text: {s: $name}
       if $look == "on" {
@@ -48,6 +51,22 @@ hn {
         Breath: {spring: {x: 1, v: 0}, up: false, low: $breath_title_low}
       } else {
         Breath: {spring: {x: 1, v: 0}, up: false, low: 1}
+      }
+    }
+    // What a working agent is doing now (src/app.rs doing_of: thinking, a command, an edit, a read, the web, a sub-agent,
+    // its reply), a glyph after its title in the muted ink, named by its tooltip; nothing at rest.
+    doing : ui.Symbol {
+      Tooltip: {text: $doing_tip}
+      if $doing == "" {
+        Icon: {glyph: ""}
+        Fill: $tone_clear
+        Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $tree_doing, min: 0, max: 0}}
+        Padding: {l: 0, r: 0, t: 0, b: 0}
+      } else {
+        Icon: {glyph: $doing}
+        Fill: $tone_ink_muted
+        Size: {w: {kind: Fixed, value: $tree_doing + $tree_doing_gap, min: 0, max: 0}, h: {kind: Fixed, value: $tree_doing, min: 0, max: 0}}
+        Padding: {l: $tree_doing_gap, r: 0, t: 0, b: 0}
       }
     }
     spacer : ui.Spacer {}
@@ -101,6 +120,7 @@ hn {
   @tree ChildOf
   template RunRow : Row {
     prop look: string = "rest"
+    prop mark: string = ""
     prop busy: bool = false
     prop alarm: bool = false
     prop meta: string = ""
@@ -110,7 +130,7 @@ hn {
     Action: {name: "select:{obj}"}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $tree_run_h, min: 0, max: 0}}
     Padding: {l: indent($depth, $tree_pad, $indent_step) + $tree_gutter, r: $tree_pad_r, t: 0, b: 0}
-    hang { hn.Hang: {obj: $obj, depth: $depth, kids: $kids, open: $open} }
+    hang { hn.Hang: {obj: $obj, depth: $depth, kids: $kids, open: $open, mark: $mark} }
     name : hn.tree.Cmd {
       Text: {s: $name}
       if $look == "on" {

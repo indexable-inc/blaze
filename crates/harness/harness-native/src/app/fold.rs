@@ -1,13 +1,14 @@
-//! Folding the sidebar's tree: a folded node (every node starts so) shows only its running children and the selected
-//! one, so a run that finishes folds away on its own; each row's disclosure chevron (left of its icon, Finder's) expands
-//! it to all of them or folds it back, as does a double click on a session's row, Left and Right while the tree has the
-//! keyboard, and Option on any of them for every sibling at once. Rows come and go on one spring each (`RowFold`, the
+//! Folding the sidebar's tree: an open node (every node starts so) shows its live children (running, with something
+//! running under them, just finished, or selected: the model's `rows`), so a run that finishes folds away on its own; a
+//! folded one shows none of them but the selected one. Each row's disclosure chevron (left of its title, Finder's) folds
+//! it or opens it again, as do a double click on a session's row, Left and Right while the tree has the keyboard, and
+//! Option on any of them for every sibling at once. Rows come and go on one spring each (`RowFold`, the
 //! `tree_fold` tune of the sidebar's one spring family): a row that comes grows in from no height, pushing the rows under
 //! it down, and its words fade in and settle into place once there is room for them; one that goes lets its words go
 //! first and then closes. Its selection pill is not part of that: it is the tree's one matched pill, which holds where it
 //! was while the row opens (the row is `Settling`) and then slides to it at its full height, so it never squeezes under
-//! the row's words. Under Reduce Motion rows come and go at once. What is expanded is kept in native.json (`folds`, by
-//! stable key: `false` for expanded, as it was saved before).
+//! the row's words. Under Reduce Motion rows come and go at once. What is folded is kept in native.json (`folds`, by
+//! stable key: `true` folded, `false` open).
 use std::collections::{HashMap, HashSet};
 
 use super::*;
@@ -229,7 +230,7 @@ impl App {
             if let Some(folded) =
                 fold_key(e).and_then(|k| saved.get(&k)).and_then(serde_json::Value::as_bool)
             {
-                model::set_expanded(w, id, !folded);
+                model::set_folded(w, id, folded);
             }
         }
     }
@@ -238,7 +239,7 @@ impl App {
     pub(super) fn toggle_fold_of(&mut self, e: u64, all: bool) {
         let w = self.world.world_ref();
         let o = w.entity_from_id(e);
-        let fold = o.has(model::Expanded::id());
+        let fold = !o.has(model::Folded::id());
         let mut targets = vec![e];
         if all && let Some(p) = o.parent() {
             p.each_child(|c| {
@@ -251,7 +252,7 @@ impl App {
             crate::prefs::get("folds").and_then(|v| v.as_object().cloned()).unwrap_or_default();
         for t in targets {
             let c = w.entity_from_id(t);
-            model::set_expanded(w, t, !fold);
+            model::set_folded(w, t, fold);
             if let Some(k) = fold_key(c) {
                 saved.insert(k, serde_json::Value::Bool(fold));
             }
@@ -260,35 +261,32 @@ impl App {
         self.poke();
     }
 
-    /// Left in the tree (scene/20-keys.flecs, ctx.Tree): fold the selected row back to its running children, or go to its
-    /// parent when it is folded or has no rows under it (Finder's, Xcode's); with `all`, its siblings fold too.
+    /// Left in the tree (scene/20-keys.flecs, ctx.Tree): fold the selected row, or go to its parent when it is folded or
+    /// has no rows under it (Finder's, Xcode's); with `all`, its siblings fold too.
     pub(super) fn tree_fold(&mut self, all: bool) {
         let w = self.world.world_ref();
         let Some(s) = self.selected().map(|s| w.entity_from_id(s)) else { return };
-        if has_kids(s) && s.has(model::Expanded::id()) {
+        if has_kids(s) && !s.has(model::Folded::id()) {
             self.toggle_fold_of(*s.id(), all);
         } else if let Some(p) = s.parent().filter(|p| p.target(model::Kind::id(), 0).is_some()) {
             self.select(Some(*p.id()));
         }
     }
 
-    /// Right in the tree: expand the selected row to all its children.
+    /// Right in the tree: open the selected row again (its live children show).
     pub(super) fn tree_unfold(&mut self, all: bool) {
         let w = self.world.world_ref();
         let Some(s) = self.selected().map(|s| w.entity_from_id(s)) else { return };
-        if has_kids(s) && !s.has(model::Expanded::id()) {
+        if has_kids(s) && s.has(model::Folded::id()) {
             self.toggle_fold_of(*s.id(), all);
         }
     }
 }
 
-/// Whether `e` has rows under it in the tree (objects, not archived): what a disclosure folds.
+/// Whether `e` has live rows under it in the tree (the model's `has_live_kids`): what its chevron folds, so a row whose
+/// children have all finished shows none.
 pub fn has_kids(e: EntityView<'_>) -> bool {
-    let mut any = false;
-    e.each_child(|c| {
-        any |= c.target(model::Kind::id(), 0).is_some() && !c.has(model::Archived::id())
-    });
-    any
+    model::has_live_kids(e.world(), *e.id())
 }
 
 /// The key an object's fold is kept by across launches: its daemon session (`s14`) or its run (`r12`).
