@@ -28,6 +28,10 @@
 //! The compile-time half, that dropping a `Scope`, `Task`, `Pending` or `File<ReadWrite>`
 //! unfinished is an error, is in crates/hir-ty-linear's fixtures (`bstd_*`): that harness
 //! builds small crates over minicore and cannot reach this one, so they mirror its types.
+//! - [`image`]: PNG decode of encode is the image for every colour type and depth, and decode
+//!   of any bytes never panics nor asks its allocator past its limit; fixed vectors.
+//! - [`mp4`]: the muxer's boxes parse back to the packets, in both layouts, the same packets
+//!   give the same bytes, and out-of-order packets are refused by name.
 //!
 //! Replay: a failure prints its plan, the simulation's seed in it; a control prints the seed of
 //! the plan that caught its plant.
@@ -42,6 +46,8 @@ mod deadlines;
 mod env;
 mod inflight;
 mod missing;
+mod image;
+mod mp4;
 mod names;
 mod narrowing;
 mod paths;

@@ -33,6 +33,15 @@ blaze-reclaim.workspace = true
 blaze-report.workspace = true
 blaze-sha256.workspace = true
 blaze-spin.workspace = true
+# bstd::image's inflate: miniz_oxide's no-alloc core, into the buffer decode sized and limited.
+miniz_oxide.workspace = true
+
+# bstd::video's VideoToolbox provider (src/video/videotoolbox.rs).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation.workspace = true
+objc2-core-media.workspace = true
+objc2-core-video.workspace = true
+objc2-video-toolbox.workspace = true
 
 [dev-dependencies]
 hegeltest.workspace = true

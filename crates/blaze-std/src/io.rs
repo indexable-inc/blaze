@@ -43,6 +43,7 @@ use crate::{
     cx::Cx,
     env::Env,
     fs::Fs,
+    gpu::Gpu,
     host::{Exit, Host, HostFacts},
     mem::{Mem, TASK_FRAME},
     net::Net,
@@ -478,6 +479,13 @@ impl Io {
 
     pub fn need_net(&self) -> Result<Net, Missing> {
         self.net().ok_or(Missing { capability: "net" })
+    }
+
+    /// The graphics device, if this world has one: a native macOS world does; the simulation
+    /// and other targets do not yet ([`Gpu`], a placeholder until the GPU plan's device).
+    pub fn gpu(&self) -> Option<Gpu> {
+        let native = self.world.lock().driver.sim().is_none();
+        Gpu::offered(native)
     }
 
     /// `f` on the simulation, for a test to change the world (advance the clock, fail syncs,
