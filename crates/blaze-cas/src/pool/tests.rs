@@ -518,7 +518,15 @@ impl World {
                 let page = page - ours.window.first_page();
                 ours.rotted.iter().any(|block| block * BLOCK / PAGE == page)
             }
-            _ => false,
+            PoolError::Load(LoadFailure::Abandoned { .. } | LoadFailure::NoFile { .. })
+            | PoolError::Reserve { .. }
+            | PoolError::Full { .. }
+            | PoolError::Busy { .. }
+            | PoolError::Give { .. }
+            | PoolError::Reuse { .. }
+            | PoolError::Abandoned { .. }
+            | PoolError::Starved { .. }
+            | PoolError::LoadsFull { .. } => false,
         };
         match explained {
             true => Ok(()),

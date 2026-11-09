@@ -273,9 +273,10 @@ impl Loads {
             return;
         };
         if pool.planted(Plant::LoadedAtAsk) {
+            // Published as the read is asked: a pin can take the page while the read writes it.
             for page in load.first..load.first + u64::from(load.pages) {
                 let word = pool.word_now(page);
-                pool.word(page).store(Word::loaded(word.version(), 1, Referenced::Set).0, Ordering::Release);
+                pool.word(page).store(Word::loaded(word.version(), 0, Referenced::Clear).0, Ordering::Release);
             }
         }
         let reads = u64::from(load.pages).div_ceil(PAGES_PER_READ);
@@ -378,7 +379,6 @@ impl Loads {
             let page = load.first + i as u64;
             let word = pool.word_now(page);
             let next = match end {
-                PageEnd::Good if pool.planted(Plant::LoadedAtAsk) => continue,
                 // The asker's pin, set as the page is published.
                 PageEnd::Good => Word::loaded(word.version(), 1, Referenced::Set),
                 PageEnd::Again | PageEnd::Bad => {

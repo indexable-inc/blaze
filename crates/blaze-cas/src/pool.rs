@@ -353,12 +353,13 @@ impl<G: Give> Pool<G> {
     #[inline(always)]
     pub(crate) fn planted(&self, plant: Plant) -> bool {
         #[cfg(test)]
-        return self.plant == plant;
+        let planted = self.plant == plant;
         #[cfg(not(test))]
-        {
+        let planted = {
             _ = plant;
             false
-        }
+        };
+        planted
     }
 
     pub(crate) fn give(&self) -> &G {
