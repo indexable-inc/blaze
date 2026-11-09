@@ -408,6 +408,10 @@ impl Loads {
 }
 
 /// The first block of `part` that fails its check, and its page.
+#[expect(
+    blaze::sans_io_core,
+    reason = "the CRC-32C is a pure function of the bytes; the syscall is std's one-time CPU feature detection (sysctl on macOS), read once and cached, never IO the core decides on"
+)]
 fn check<G: Give>(pool: &Pool<G>, file: &File, part: Part) -> Option<(u64, u64)> {
     let blocks = part.want.div_ceil(BLOCK);
     (0..blocks).find_map(|b| {
