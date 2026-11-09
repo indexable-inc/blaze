@@ -36,15 +36,21 @@ reviewed it.
 
 ## invariants-are-stated (rule 53)
 
-What code must always do is written once, in the code: a doc comment opening `/// The invariant:` on
-the test whose oracle checks it, `/// The refinement:` on a test that runs an implementation against
-its model (or against another implementation) and compares, and `/// The reference model:` on the
-simple executable model itself. An invariant or a refinement needs a control in the same file, a
-test named `the_oracle_catches_<the planted bug>`. `harness/v2/invariants.py` collects every
-statement into `docs/v2/plan/invariants.md` (`write`) and fails the gate (`check`) when one has no
-control, a control has no statement, or the list is stale, so adding, rewording or dropping a
-guarantee is a visible line in the pull request. Before changing or regenerating code, read the
-invariants its crate states; they are what the new code is judged against.
+What code must always do is written once, in blaze, and every check reads the same text. A contract
+(`requires`, `ensures`) says what one call does. A reference model is a small, pure, sequential
+implementation of what a component means, an ordinary type in the crate under `/// The reference
+model:`. `/// The invariant:` goes on the test whose oracle checks an invariant, and `/// The
+refinement:` on the test that runs an implementation against its model (or another implementation)
+and compares. Each needs a control in the same file, a test named `the_oracle_catches_<the planted
+bug>`. The statement then climbs a ladder without being rewritten: tested (a property test),
+simulated (the deterministic simulation with faults and crashes), model-checked (every interleaving
+to a bound), proved (Lean, from the same contract and model; say it as `/// The invariant (proved:
+<proof file>):`). Durable, concurrent and crash-recovering code is at least simulated; prove the
+sans-IO cores and what must never be wrong; a disagreement between two levels is a bug in one of
+them. `harness/v2/invariants.py` collects every statement with its level into
+`docs/v2/plan/invariants.md` (`write`) and fails the gate (`check`) when one has no control, names a
+missing proof, or the list is stale. Before changing or regenerating code, read the invariants its
+crate states: they are what the new code is judged against.
 
 See [docs/v2/plan.md#11-proof-by-check-not-by-review](../../../docs/v2/plan.md#11-proof-by-check-not-by-review).
 

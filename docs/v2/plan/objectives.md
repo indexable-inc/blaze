@@ -13,7 +13,7 @@ remembered. How rows are picked, worked and landed is
 `harness/v2/ledger.py`. A check in *italics* is not written yet, and writing it is the first
 part of the work. `?` is not measured; "last known" is a lead, not a status.
 
-78 objectives: 0 met, 0 open, 0 blocked, 78 not measured.
+79 objectives: 0 met, 0 open, 0 blocked, 79 not measured.
 
 ## Targets
 
@@ -50,9 +50,10 @@ What must hold for any of the speed to count.
 | C6 | blaze rejects what rustc rejects, with the same code and primary span, and accepts what it accepts | `corpus.py {"projects": ["rejections"]}`; *write: confirm corpus.py's rejections cover rustc's UI tests, or add them* |  | ? |
 | C7 | No `todo!`, `unimplemented!` or fallback path in crates/ | *write: a lint in `blaze check`* |  | ? |
 | V1 | Every invariant blaze states has a planted-bug control, and all are listed in invariants.md | `invariants.py {"command": "check"}` |  | ? |
-| V2 | Each subsystem with a simulation test has a reference model (a small pure implementation of what it means), and one generic harness checks the real code refines it | *write: a refinement stated for the store, the pool, the vfs and bstd's Fs, each with a planted difference* |  | ? |
+| V2 | Each subsystem with a simulation test has a reference model as an ordinary type in its crate, one generic harness (bstd::test's Refines) checks the real code refines it, and the model is what is translated to Lean | *write: a refinement stated for the store, the pool, the vfs and bstd's Fs, each with a planted difference* |  | ? |
 | V3 | bstd's public functions carry contracts (requires and ensures), each run as a generated property test | *write: contracts on bstd's API and the generator of reflect.md item 7* |  | ? |
 | V4 | The simulated driver refines each native driver on the effects both run | *write: one test per native driver that replays seeded effect sequences on both and compares completions* |  | ? |
+| V5 | A reference model translated to Lean has a property proved about it, and the compiled Lean model agrees with blaze-built code on drawn inputs | *write: the first proof in the tree, named by a `(proved: ..)` statement, checked in the train* |  | ? |
 
 ## The design, part by part
 
@@ -125,6 +126,5 @@ The app in `crates/harness/`, where people watch the work ([tasks](design/tasks.
 
 Decide with evidence, fold the answer into the plan, delete the question.
 
-- Two verifiers are specified (design/verus.md, an SMT fork; design/formal-verification.md, MIR to Lean 4). Keep both only if each proves something the other cannot; otherwise one.
 - The explorer carries its own HTTP/3 and WebTransport stack (design/http3-sans-io.md). Show what it does that HTTP/1.1 streaming on a local socket cannot, or remove it.
 - Several specs describe one concept and should be one each: scheduler, fibers and concurrency; memory, memory-budget and memory-pool; code-identity, item-hash, name-free-identity and caching; explore, explore-core and explore-generic; profile-history and perf-history.

@@ -130,9 +130,10 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 52. **cache-by-code-id**: A cache of a function's results is keyed by the function's code identity
     (`fn_info(&f).code_id`) and its arguments; nothing invalidates entries by hand. Skill:
     `memory-and-data`.
-53. **invariants-are-stated**: State an invariant once, as `/// The invariant: ...` on the test whose
-    oracle checks it, with a planted-bug control beside it; `harness/v2/invariants.py` lists them
-    all and the gate holds each to its control. Skill: `testing`.
+53. **invariants-are-stated**: State what code promises once (a contract, a reference model, `/// The
+    invariant:` or `/// The refinement:` on its test) and raise its level of evidence as needed:
+    tested, simulated, model-checked, proved in Lean; `harness/v2/invariants.py` lists them and the
+    gate holds each to its control. Skill: `testing`.
 
 ## Code Review Rules
 
