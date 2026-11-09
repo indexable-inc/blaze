@@ -260,6 +260,9 @@ struct Lowering {
     set: usize,
     /// A `RunCustomBuild` unit's `OUT_DIR`.
     out_dir: Option<String>,
+    /// A device unit's MSL (`UnitPlan::gpu_msl`): the outside file its dependents'
+    /// `include_str!(env!("BLAZE_GPU_MSL_<CRATE>"))` reads, set by [`Lowered::gpu_msl`].
+    gpu_msl: Option<String>,
     /// The units depending on it directly.
     dependents: Vec<usize>,
     /// Its cfg and env before any run applied.
@@ -623,6 +626,7 @@ fn lower_writes<T: blaze_query::Tree>(
             what: whats[index].clone(),
             set: set_of[unit.pkg_id.as_str()],
             out_dir: plan.out_dir.clone().filter(|_| !compiles),
+            gpu_msl: plan.gpu_msl.clone(),
             dependents: Vec::new(),
             cfg: CfgOptions::default(),
             env: Vec::new(),
@@ -1284,6 +1288,37 @@ impl Lowered {
                 lowering.what.clone(),
             )),
         }
+    }
+
+    /// Whether unit `unit` writes MSL ([`Lowered::gpu_msl`]): an error naming it if not.
+    pub fn check_gpu_msl(&self, unit: usize) -> Result<&str, LowerError> {
+        let Some(lowering) = self.crates.units.get(unit) else {
+            return Err(LowerError::new(format!("the build has no unit {unit}")));
+        };
+        lowering.gpu_msl.as_deref().ok_or_else(|| {
+            LowerError::at(
+                // alloc: error path
+                format!(
+                    "{} writes no MSL: only the device unit of an `artifact = \"gpu\"` dependency does",
+                    lowering.what
+                ),
+                lowering.what.clone(),
+            )
+        })
+    }
+
+    /// The MSL device unit `unit` wrote, `msl`, set as the bytes of its file (`UnitPlan::gpu_msl`)
+    /// for its dependents' `include_str!(env!("BLAZE_GPU_MSL_<CRATE>"))` to read, before and
+    /// whatever placement puts on disk ([`Db::set_included_file`]). A crate that read the file
+    /// before reads it again; one keyed by it is keyed by these bytes. A write, as
+    /// [`Lowered::ran`] is.
+    pub fn gpu_msl(&mut self, unit: usize, msl: &[u8]) -> Result<(), LowerError> {
+        let path = abs(self.check_gpu_msl(unit)?)?;
+        self.identities.clear();
+        let trigger = Trigger::of("a device build's MSL applied", &self.crates.units[unit].what);
+        let bytes = std::sync::Arc::<[u8]>::from(msl);
+        Db::batch_in(&mut self.db, |db| db, trigger, |db| db.set_included_file(&path, bytes));
+        Ok(())
     }
 
     /// The expanders of proc-macro unit `unit` once it is built (or why it has none), for the
