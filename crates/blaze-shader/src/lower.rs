@@ -1281,6 +1281,7 @@ impl<'d, 'db> EntryCx<'d, 'db> {
                 }
                 Kind::Uniform { size } => {
                     let TyKind::Ref(_, inner, _) = ty.kind() else { return Err((format!("uniform `{}` is not a `&T`", param.name), why::INTERFACE)) }; // alloc: an error
+                    self.host_shared(inner, &param.name)?;
                     let actual = self.dev.with_layout(inner, |l| l.size.bytes())?;
                     if actual != u64::from(*size) {
                         return Err((format!("uniform `{}`: its descriptor says {size} bytes, its type has {actual}", param.name), why::INTERFACE)); // alloc: an error
@@ -1298,6 +1299,7 @@ impl<'d, 'db> EntryCx<'d, 'db> {
                         },
                         _ => return Err((format!("storage `{}` is not a `&[T]`", param.name), why::INTERFACE)), // alloc: an error
                     };
+                    self.host_shared(elem, &param.name)?;
                     let actual = self.dev.with_layout(elem, |l| l.size.bytes())?;
                     if actual != u64::from(*stride) {
                         return Err((format!("storage `{}`: its descriptor says a stride of {stride}, its type has {actual}", param.name), why::INTERFACE)); // alloc: an error
@@ -1346,6 +1348,31 @@ impl<'d, 'db> EntryCx<'d, 'db> {
         };
         self.result = Some(result);
         Ok(())
+    }
+
+    /// That a resource's type holds no enum: an enum's naga layout is the device's own (see
+    /// [`Shape::Enum`]), so one in memory the host writes would read other bytes than it wrote.
+    fn host_shared(&mut self, ty: Ty<'db>, param: &str) -> Result<(), Refused> {
+        let ty = self.dev.normalize(ty);
+        match ty.kind() {
+            TyKind::Adt(def, _) if matches!(def.def_id(), AdtId::EnumId(_)) => {
+                // alloc: an error
+                Err((format!("resource `{param}` holding the enum `{ty:?}`, whose device layout is not the host's"), why::ENUMS))
+            }
+            TyKind::Array(elem, _) => self.host_shared(elem, param),
+            TyKind::Adt(..) | TyKind::Tuple(..) => {
+                if let TyKind::Adt(def, _) = ty.kind()
+                    && device_ty(self.dev.db, def.def_id()).is_some()
+                {
+                    return Ok(());
+                }
+                for field in self.dev.field_tys(ty)? {
+                    self.host_shared(field, param)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 
     fn value_ty(&mut self, ty: ValueTy) -> Handle<Type> {

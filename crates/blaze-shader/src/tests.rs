@@ -354,3 +354,10 @@ fn a_reference_chosen_at_run_time_is_refused() {
         why::POINTERS,
     );
 }
+
+#[test]
+fn an_enum_in_a_storage_buffer_is_refused() {
+    let source = fragment("", "    vec4(0.0, 0.0, 0.0, 1.0)")
+        .replace("pub fn fs(v: V, g: &Globals, data: &[IVec4])", "#[derive(Copy, Clone)]\n#[repr(u32)]\npub enum Mode { A, B }\n#[derive(Copy, Clone)]\n#[repr(C)]\npub struct Item { pub mode: Mode, pub x: u32, pub y: u32, pub z: u32 }\npub fn fs(v: V, g: &Globals, data: &[Item])");
+    refused(&source, "holding the enum", why::ENUMS);
+}

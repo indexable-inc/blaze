@@ -96,8 +96,11 @@ pub mod why {
     /// Control flow that is not reducible, or that unwinds.
     pub const CONTROL: &str = "a shader's control flow is reducible and never unwinds: a panic ends the invocation \
                                (docs/future/gpu/shaders.md, \"Panics\")";
-    /// Enums: phase 2 lowers none.
-    pub const ENUMS: &str = "enums are not lowered yet (docs/future/gpu/shaders.md, phase 3)";
+    /// Enums: values inside a shader lower, with a layout of the device's own; none crosses
+    /// into a resource, and a constant's bytes must be one of its variants.
+    pub const ENUMS: &str = "an enum lowers as a value inside a shader, with the device's own layout, so no \
+                             uniform or storage buffer may hold one (docs/future/gpu/shaders.md, \"Phase 2 as \
+                             built\")";
     /// A statics read: a shader's only memory outside its frame is its resources.
     pub const STATICS: &str = "a shader reads no statics: its memory is its parameters' resources \
                                (docs/future/gpu/shaders.md, \"Resources\")";
