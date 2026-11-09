@@ -402,6 +402,79 @@ pub(crate) fn member_assumptions<'db>(
     Clauses::new_from_iter(rustc_type_ir::elaborate::elaborate(interner, added))
 }
 
+/// A function's elaborated environment `clauses` with every field binder in it instantiated at
+/// each type the environment says is a member of the binder's container: for `P: Field<C>`
+/// (`P: Variant<C>`) among `clauses`, each field binder over `C` in that domain with `P` in place
+/// of its variable, elaborated (docs/v2/plan/design/comptime.md, "Building a struct"). Rule 1
+/// for a type parameter: `fn take<F: Field<T>>(..)` under `for<G: Field<T>> G::Type: Decode`
+/// has `<F as core::field::Field>::Type: Decode`, as a loop's binder or the solver's placeholder
+/// member has it. Sound because anything that instantiates `P` proves `P: Field<C>`, so it is a
+/// member, and the binder holds of every member.
+///
+/// `clauses` itself when none is a field binder: a crate without `#![feature(blaze_comptime)]`
+/// cannot write one, so its environments are unchanged. The added clauses follow `clauses`, in
+/// the order of the membership clauses, then the binders (deterministic-output).
+pub(crate) fn with_member_bounds<'db>(
+    interner: DbInterner<'db>,
+    clauses: crate::next_solver::Clauses<'db>,
+) -> crate::next_solver::Clauses<'db> {
+    use rustc_type_ir::{
+        ClausePolarity, Upcast,
+        inherent::Clause as _,
+        reflect::{first_reflected_var, instantiate_reflected_var},
+    };
+    use smallvec::SmallVec;
+
+    use crate::next_solver::{Clause, Clauses};
+
+    let is_field_binder = |clause: Clause<'db>| {
+        first_reflected_var::<DbInterner<'db>>(clause.kind().bound_vars()).is_some()
+    };
+    if !clauses.iter().any(is_field_binder) {
+        return clauses;
+    }
+    let lang = interner.lang_items();
+    let domain_of = |trait_: hir_def::TraitId| {
+        if Some(trait_) == lang.ReflectField {
+            Some(ReflectedDomain::Fields)
+        } else if Some(trait_) == lang.ReflectVariant {
+            Some(ReflectedDomain::Variants)
+        } else {
+            None
+        }
+    };
+    // alloc: none up to 4 members, inline in the `SmallVec`
+    let members: SmallVec<[(Ty<'db>, ReflectedDomain, Ty<'db>); 4]> = clauses
+        .iter()
+        .filter_map(|clause| {
+            let predicate = clause.as_trait_clause()?.no_bound_vars()?;
+            if predicate.polarity != ClausePolarity::Positive {
+                return None;
+            }
+            let domain = domain_of(predicate.def_id().0)?;
+            Some((predicate.self_ty(), domain, predicate.trait_ref.args.type_at(1)))
+        })
+        .collect();
+    let instantiated = members.iter().flat_map(|&(member, domain, container)| {
+        clauses.iter().filter_map(move |clause| {
+            let kind = clause.kind();
+            let (index, var) = first_reflected_var::<DbInterner<'db>>(kind.bound_vars())?;
+            (var.domain == domain && var.container == container).then(|| -> Clause<'db> {
+                instantiate_reflected_var(interner, kind, index, member).upcast(interner)
+            })
+        })
+    });
+    // alloc: none up to 8 clauses, inline in the `SmallVec`
+    let added: SmallVec<[Clause<'db>; 8]> =
+        rustc_type_ir::elaborate::elaborate(interner, instantiated)
+            .filter(|clause| !clauses.as_slice().contains(clause))
+            .collect();
+    if added.is_empty() {
+        return clauses;
+    }
+    Clauses::new_from_iter(clauses.iter().chain(added))
+}
+
 /// The field binder `clause` (`for<F: Field<C>> P(F)`) normalized in `at`'s environment as the
 /// solver enters one (rule 2): its variables become placeholders, each reflected one, in
 /// binder order, a member of its container (normalized with the ones before it entered, so a
