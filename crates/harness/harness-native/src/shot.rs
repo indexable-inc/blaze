@@ -427,7 +427,7 @@ fn press(app: &mut App, spec: &str) {
             "cut:" => app.cut(),
             "paste:" => {
                 match std::env::var("HARNESS_NATIVE_SHOT_CLIP_PICTURE").map(std::fs::read) {
-                    Ok(Ok(png)) => app.paste_picture(&png),
+                    Ok(Ok(png)) => app.paste_pictures(&[png]),
                     Ok(Err(e)) => eprintln!("harness-native: shot paste: HARNESS_NATIVE_SHOT_CLIP_PICTURE: {e}"),
                     Err(_) => app.paste(&clip),
                 }

@@ -423,6 +423,8 @@ impl App {
             ms: (crate::look::width(w, "archive_after").max(0.0) * 1000.0) as u64,
             past_ms: (crate::look::width(w, "archive_past_after").max(0.0) as f64 * 1000.0) as u64,
         });
+        // How long a finished child keeps its row (and its done mark) under a folded node (seconds).
+        world.set(model::Linger { ms: (crate::look::width(w, "tree_linger_for").max(0.0) * 1000.0) as u64 });
         harness_native_ui_layout::install(w);
         harness_native_ui_input::install(w);
         harness_native_ui_motion::install(w);
@@ -895,9 +897,12 @@ impl App {
             let code = o.try_cloned::<&model::ExitCode>().map(|c| c.code).filter(|&c| c != 0);
             let failed = status == "killed" || code.is_some();
             let selected = sel == Some(e);
+            // A sub-agent up but idle sleeps: its title muted like what ended, a pause mark in its gutter, and it sorts
+            // after the ones at work (the model's rows).
+            let sleeps = me.run_of(e).is_none() && depth > 0 && status == "running" && !o.has(model::Busy::id());
             let look = if selected {
                 "on"
-            } else if status == "running" {
+            } else if status == "running" && !sleeps {
                 "rest"
             } else {
                 "done"
@@ -907,7 +912,7 @@ impl App {
                 ("selected", Prop::Bool(selected)),
                 ("depth", Prop::Int(depth as i64)),
                 ("kids", Prop::Bool(fold::has_kids(o))),
-                ("open", Prop::Bool(o.has(model::Expanded::id()))),
+                ("open", Prop::Bool(!o.has(model::Folded::id()))),
                 ("focus", Prop::Bool(selected && me.tree_focus && me.focused)),
                 ("look", Prop::Str(look)),
             ];
@@ -927,6 +932,7 @@ impl App {
                             ("alarm", Prop::Bool(failed)),
                             ("meta", Prop::Str(&meta)),
                             ("keep", Prop::Bool(keep)),
+                            ("mark", Prop::Str(done_mark(status, code, depth.max(1)))),
                         ],
                     ]
                     .concat(),
@@ -948,13 +954,21 @@ impl App {
                     && (o.has(model::Busy::id())
                         || o.try_cloned::<&model::Object>()
                             .is_some_and(|ob| me.chats.borrow().get(&ob.id).is_some_and(|t| t.busy)));
+                // What it is doing while it works (its glyph after the title, the command or file trailing it); else how
+                // it went wrong; else the folder it works in. When it started or ended is the trailing words' tooltip.
+                let doing = if busy { o.try_cloned::<&model::Object>().and_then(|ob| me.chats.borrow().get(&ob.id).and_then(doing_of)) } else { None };
+                let when = ago(now.saturating_sub(model::when(o)));
+                let folder = o.try_cloned::<&model::Cwd>().map(|c| folder_of(c.s.as_str())).unwrap_or_default();
                 let (meta, why) = match (status, code) {
-                    ("killed", _) => ("killed".to_owned(), "Killed".to_owned()),
-                    (_, Some(c)) => (format!("exit {c}"), format!("Exited with code {c}")),
+                    ("killed", _) => ("killed".to_owned(), format!("Killed {when} ago")),
+                    (_, Some(c)) => (format!("exit {c}"), format!("Exited with code {c} {when} ago")),
                     ("lost", _) => ("lost".to_owned(), "Lost (the daemon restarted under it)".to_owned()),
-                    ("running", _) => (ago(now.saturating_sub(model::when(o))), "Started".to_owned()),
-                    _ => (ago(now.saturating_sub(model::when(o))), "Ended".to_owned()),
+                    ("running", _) => (doing.as_ref().map_or(folder, |d| d.detail.clone()), format!("Started {when} ago")),
+                    _ => (folder, format!("Ended {when} ago")),
                 };
+                // A sub-agent up but idle sleeps: its title muted, a pause mark in its gutter (and it sorts after the
+                // ones at work, the model's rows).
+                let mark = if sleeps { "sleep" } else { done_mark(status, code, depth) };
                 // Its name being renamed (chat/rename.rs): the field's words in its place, still (no breath) and alone
                 // on the row (no trailing words or shortcut).
                 let edit = me.rename_shown(e);
@@ -974,6 +988,9 @@ impl App {
                             ("why", Prop::Str(&why)),
                             ("hint", Prop::Str(&hint)),
                             ("edit", Prop::Bool(edit.is_some())),
+                            ("mark", Prop::Str(mark)),
+                            ("doing", Prop::Str(doing.as_ref().map_or("", |d| d.glyph))),
+                            ("doing_tip", Prop::Str(doing.as_ref().map_or("", |d| d.what))),
                         ],
                     ]
                     .concat(),
@@ -1892,6 +1909,16 @@ impl App {
             || matches!(self.paint.borrow().kip_wake, harness_native_render::kips::Wake::Calm(_))
     }
 
+    /// How long until a finished row's linger runs out (seconds; the window, idle, wakes then and the row folds away).
+    pub fn linger_due(&self) -> Option<f64> {
+        model::linger_due(self.world.world_ref()).map(|ms| ms as f64 / 1000.0 + 0.02)
+    }
+
+    /// A linger ran out while the window slept: a frame lists the tree again.
+    pub fn linger_woke(&mut self) {
+        self.poke_why("linger");
+    }
+
     /// The Kips in view all rest: how long until one of them blinks or fidgets (the window, idle, wakes then).
     pub fn kip_nap(&self) -> Option<f64> {
         match self.paint.borrow().kip_wake {
@@ -2309,6 +2336,71 @@ fn set_side_width(side: EntityView<'_>, v: f32) {
 }
 
 /// How long ago, for a session's row, as short as it reads: `now`, `4m`, `3h`, `2d`, `5w`.
+/// The done mark a finished row shows in its gutter while it lingers (hn.Hang's `mark`): "ok" when it ended well,
+/// "fail" when it was killed or exited non-zero, "" while it runs or for a top-level session (depth 0: it stays in the
+/// tree, where a mark would only be noise).
+fn done_mark(status: &str, code: Option<i32>, depth: usize) -> &'static str {
+    match status {
+        _ if depth == 0 => "",
+        "running" | "pending" => "",
+        "killed" | "lost" => "fail",
+        _ if code.is_some() => "fail",
+        _ => "ok",
+    }
+}
+
+/// What a working agent is doing now, from its transcript's last item: the glyph after its title, the words of its
+/// tooltip, and the detail its row trails (the command, the file, the pattern, the page).
+struct Doing {
+    glyph: &'static str,
+    what: &'static str,
+    detail: String,
+}
+
+/// [`Doing`] of transcript `t` while its agent works (None at rest or before it says anything).
+fn doing_of(t: &model::chat::Transcript) -> Option<Doing> {
+    use model::chat::Item;
+    if !t.busy {
+        return None;
+    }
+    let base = |p: &str| p.rsplit('/').next().unwrap_or(p).to_owned();
+    Some(match t.items.last()? {
+        Item::Thinking { done: false, .. } => Doing { glyph: "\u{EA61}", what: "Thinking", detail: "thinking".to_owned() },
+        Item::Tool { name, input, result: None, .. } => {
+            let s = |k: &str| input[k].as_str().unwrap_or("").to_owned();
+            let n = name.to_ascii_lowercase();
+            if ["bash", "shell", "command", "exec"].iter().any(|k| n.contains(k)) {
+                Doing { glyph: "\u{EA85}", what: "Running a command", detail: short_cmd(&s("command")) }
+            } else if ["edit", "write", "patch", "filechange"].iter().any(|k| n.contains(k)) {
+                Doing { glyph: "\u{EA73}", what: "Editing", detail: base(&s("file_path")) }
+            } else if ["read", "grep", "glob", "search", "ls"].iter().any(|k| n.contains(k)) && !n.contains("web") {
+                let what = s("file_path");
+                Doing { glyph: "\u{EA6D}", what: "Reading", detail: if what.is_empty() { s("pattern") } else { base(&what) } }
+            } else if n.contains("web") || n.contains("fetch") {
+                let url = s("url");
+                let host = url.split("://").nth(1).and_then(|r| r.split('/').next()).map_or_else(|| s("query"), str::to_owned);
+                Doing { glyph: "\u{EB01}", what: "On the web", detail: host }
+            } else if n.contains("task") || n.contains("agent") {
+                Doing { glyph: "\u{EC10}", what: "Running a sub-agent", detail: s("description") }
+            } else {
+                Doing { glyph: "\u{EB6D}", what: "Using a tool", detail: name.rsplit("__").next().unwrap_or(name).to_owned() }
+            }
+        }
+        Item::Text { done: false, .. } => Doing { glyph: "\u{EA6B}", what: "Writing", detail: "writing".to_owned() },
+        _ => Doing { glyph: "\u{EA61}", what: "Thinking", detail: "thinking".to_owned() },
+    })
+}
+
+/// The last part of directory `cwd` (the home directory as `~`): where a session works, as its row trails it.
+fn folder_of(cwd: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let cwd = cwd.trim_end_matches('/');
+    if !home.is_empty() && cwd == home.trim_end_matches('/') {
+        return "~".to_owned();
+    }
+    cwd.rsplit('/').next().unwrap_or(cwd).to_owned()
+}
+
 fn ago(ms: u64) -> String {
     let m = ms / 60_000;
     match m {

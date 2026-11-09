@@ -51,16 +51,16 @@ hn {
         mention : ui.Node {
           Overlay
         }
-        // The pictures pasted into the message (hn.ChatAttach each, src/app/chat.rs fill_attach); empty, it takes no room.
-        attach : ui.Row {
-          Flex: {axis: Row, gap: $chat_attach_gap, align: Start, justify: Start, wrap: true}
+        // The words, under the pictures pasted into the message (hn.ChatAttach each, src/app/chat.rs fill_pictures): each
+        // thumbnail brings the space under it, so with none the strip takes no room and the card's spacing is as it was.
+        entry : ui.Column {
+          Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
           Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
           Padding: {l: $chat_composer_text_inset, r: $chat_composer_text_inset, t: 0, b: 0}
-        }
-        entry : ui.Row {
-          Flex: {axis: Row, gap: 0, align: Start, justify: Start, wrap: false}
-          Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-          Padding: {l: $chat_composer_text_inset, r: $chat_composer_text_inset, t: 0, b: 0}
+          attach : ui.Row {
+            Flex: {axis: Row, gap: $chat_attach_gap, align: Start, justify: Start, wrap: true}
+            Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+          }
           // Grows with its words to most of the pane, then scrolls (src/app/chat.rs steps its FieldScroll).
           area : ui.field.GrowingTextArea {
             GrowLimit: {share: $textarea_grow_share, keep: $chat_input_keep}
@@ -347,6 +347,7 @@ hn {
     Cursor: {shape: Arrow}
     Flex: {axis: Z, gap: 0, align: Start, justify: Start, wrap: false}
     Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 0, r: 0, t: 0, b: $chat_attach_below}
     pic : ui.Node {
       Picture: {handle: ""}
       Clip

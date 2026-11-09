@@ -1181,19 +1181,23 @@ impl App {
         self.chat_cut()
     }
 
-    /// A picture pasted (Command-V of a screenshot, a browser's Copy Image), as PNG bytes: saved under
-    /// `$HARNESS_HOME/pastes`, then attached to the focused chat's message, else its path pasted ([`Self::paste_paths`]).
-    pub fn paste_picture(&mut self, png: &[u8]) {
+    /// Pictures pasted (Command-V of a screenshot, a browser's Copy Image, several copied at once), as PNG bytes: each
+    /// saved under `$HARNESS_HOME/pastes`, then all attached to the focused chat's message, else their paths pasted
+    /// ([`Self::paste_paths`]).
+    pub fn paste_pictures(&mut self, pngs: &[Vec<u8>]) {
         let dir = crate::link::home().join("pastes");
         let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
-        let path = dir.join(format!("{ms}.png"));
-        if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, png)) {
-            eprintln!("harness-native: paste: saving the picture to {}: {e}", path.display());
-            return;
+        let mut paths = Vec::new(); // alloc: a paste's few pictures
+        for (i, png) in pngs.iter().enumerate() {
+            let path = dir.join(format!("{ms}-{i}.png"));
+            if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, png)) {
+                eprintln!("harness-native: paste: saving the picture to {}: {e}", path.display());
+                continue;
+            }
+            paths.push(path.to_string_lossy().into_owned());
         }
-        let p = path.to_string_lossy().into_owned();
-        if !self.chat_attach(std::slice::from_ref(&p)) {
-            self.paste_paths(&[p]);
+        if !paths.is_empty() && !self.chat_attach(&paths) {
+            self.paste_paths(&paths);
         }
     }
 
