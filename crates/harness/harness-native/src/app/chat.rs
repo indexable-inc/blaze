@@ -3473,8 +3473,8 @@ fn row_table(r: &Row) -> Option<view::table::Table> {
 }
 
 /// A JSON value as a typed table cell, `ty` its column's type (mcp/src/shown.ts; "" when none): a null dim, a bool a
-/// mark, a number or a number column's string at the end, a web link its host, a date, nested value or code-ish string in
-/// the code face, else words.
+/// mark, a number or a number column's string at the end, a web link its host, an inline reference (`<Path …/>`) its
+/// chip, a date, nested value or code-ish string in the code face, else words.
 fn value_cell(x: &Value, ty: &str) -> view::table::Cell {
     use view::table::{Cell, Kind};
     let url = |s: &str| (s.starts_with("https://") || s.starts_with("http://")) && !s.contains(char::is_whitespace);
@@ -3483,6 +3483,8 @@ fn value_cell(x: &Value, ty: &str) -> view::table::Cell {
         Value::Bool(b) => Cell::new(Kind::Bool, b.to_string()),
         Value::Number(n) => Cell::new(Kind::Number, n.to_string()),
         Value::String(s) if url(s) => Cell::new(Kind::Url, s.as_str()),
+        // A reference written as the chat's inline component (a row's source): drawn as its chip, as in a reply.
+        Value::String(s) if ["<Path ", "<Symbol ", "<Link ", "<PR ", "<Issue "].iter().any(|t| s.contains(t)) => Cell::new(Kind::Markdown, s.as_str()),
         Value::String(s) if ty == "number" => Cell::new(Kind::Number, s.as_str()),
         Value::String(s) if ty == "nested" || ty == "date" || codeish(s) => Cell::new(Kind::Code, s.as_str()),
         Value::String(s) => Cell::new(Kind::Text, s.as_str()),

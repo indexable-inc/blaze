@@ -37,12 +37,16 @@ export function skills(): Table<SkillRow> {
   return table(list());
 }
 
-/** A skill file's body: its text after the front matter. A folder skill (`<name>/SKILL.md`) says where its files are. */
+/** A skill file's body: where it is (so it can be cited), then its text after the front matter. A folder skill
+ *  (`<name>/SKILL.md`) says where its files are. */
 export function body(s: SkillRow, text: string): string {
   const fm = /^---[ \t]*\r?\n[\s\S]*?\r?\n---[ \t]*(\r?\n|$)/.exec(text);
   if (!fm) throw new Error(`skill ${s.name}: ${s.path} no longer starts with front matter (a --- line, name and description, ---); fix the file`);
   const rest = text.slice(fm[0].length).trim();
-  return s.path.endsWith("/SKILL.md") ? `(Paths this skill names are relative to ${dirname(s.path)}.)\n\n${rest}` : rest;
+  // Where it came from leads it, so what the agent says from it can point back at it (a chip the person opens).
+  const from = `(This is the ${s.name} skill, ${s.path}. When you say something from it, cite it: <Path loc="${s.path}">${s.name} skill</Path>, with line={n} when you know the line.)`;
+  const rel = s.path.endsWith("/SKILL.md") ? `\n(Paths this skill names are relative to ${dirname(s.path)}.)` : "";
+  return `${from}${rel}\n\n${rest}`;
 }
 
 /** The full instructions of one skill, read now from its file. */
