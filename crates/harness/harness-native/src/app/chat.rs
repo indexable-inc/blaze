@@ -4,7 +4,10 @@
 //! headings, list items, quotes and code blocks, thinking and tool calls folded to a line, a turn's foot) in a
 //! `ui.LazyList`, so only the rows in view are entities. It scrolls on AppKit's physics and sticks to the bottom while
 //! the agent writes unless the person scrolled up. The input is a `ui.TextArea` edited here (`Draft`, keys in
-//! scene/20-keys.flecs ctx.Chat): Return sends, Shift+Return breaks the line, Escape interrupts.
+//! scene/20-keys.flecs ctx.Chat): Return sends, Shift+Return breaks the line, Escape interrupts. A draft that starts with a
+//! space is an aside: the composer takes the aside's tint, and Return asks it of a fork of the conversation instead
+//! (`Link::chat_aside`), its answer in a card over the composer ([`Aside`]) that Escape or its button closes; the
+//! conversation never has it.
 use super::*;
 use harness_native_ui_motion_api::{CopyFlash, Follow, Paced};
 use harness_native_ui_timeline_api::GlyphsArrive;
@@ -292,6 +295,34 @@ pub struct ChatState {
     /// Each picture's size in pixels as its header says (None: not one this app can show), read once: the composer's
     /// and the transcript's thumbnails.
     sizes: HashMap<String, Option<(u32, u32)>>,
+    /// The aside asked from this composer, shown over it until closed ([`Aside`]).
+    aside: Option<Aside>,
+}
+
+/// What an aside's answer is as the link delivers it: the fork's words (markdown), or why there are none.
+type AsideAnswer = Result<String, String>;
+
+/// An aside asked from a chat's composer (Return on a draft that starts with a space): the question, and its answer
+/// once it came. The link's thread puts the answer in `slot` (`Link::chat_aside`); the pane takes it from there as it
+/// fills. A new aside replaces this one, and the old one's answer, if it still comes, lands in a slot no one reads.
+pub(super) struct Aside {
+    asked: String,
+    slot: Arc<std::sync::Mutex<Option<AsideAnswer>>>,
+    answer: Option<AsideAnswer>,
+}
+
+impl Aside {
+    /// Its answer taken from the link's slot, once the link put it there.
+    fn pull(&mut self) {
+        if self.answer.is_none() {
+            self.answer = self.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        }
+    }
+}
+
+/// Whether a draft is an aside: it starts with a space.
+fn is_aside(d: &Draft) -> bool {
+    d.text.starts_with(' ')
 }
 
 impl ChatState {
@@ -380,6 +411,7 @@ impl Default for ChatState {
             mention: mention::Mention::default(),
             images: Vec::new(),
             sizes: HashMap::new(),
+            aside: None,
         }
     }
 }
@@ -1333,16 +1365,33 @@ impl App {
             let h = crate::look::width(w, "chat_attach_tall");
             fill_pictures(strip, &st.images, Some(&st.sizes), h, "hn.ChatAttach", Some(sid));
         }
+        self.fill_chat_aside(pv, sid, st);
+        // A draft that starts with a space is an aside (chat_send_draft): the card takes the aside's tint while it is.
+        let aside = is_aside(&st.draft);
+        if let Some(card) = composer(pv) {
+            let (fill, line) = if aside { ("aside", "aside_line") } else { ("card", "line") };
+            let f = crate::look::tone(w, fill);
+            if card.entity().try_cloned::<&Fill>() != Some(f) {
+                card.entity().set(f);
+            }
+            let l = crate::look::tone(w, line);
+            let edge = harness_native_ui_look_api::Edge { dark: l.dark, light: l.light };
+            if card.entity().try_cloned::<&harness_native_ui_look_api::Edge>() != Some(edge) {
+                card.entity().set(edge);
+            }
+        }
         if let Some(area) = composer_area(pv) {
             let (shown, [caret, anchor, lo, hi]) = st.draft.shown();
             if let Some(h) = area.part("hint_at").and_then(|a| a.part("hint")) {
-                // Its agent's name ("Message Codex" in a Codex session), and that a message resumes an ended one.
+                // Its agent's name ("Message Codex" in a Codex session), and that a message resumes an ended one; an
+                // aside's, while it asks nothing past its space, that it stays out of the conversation.
                 let agent = match model::kind_name(w.entity_from_id(e)) {
                     "codex" => "Codex",
                     "cursor" => "Cursor",
                     _ => "Claude",
                 };
                 let hint = match (shown.is_empty(), ended) {
+                    _ if aside && shown.trim().is_empty() => format!("Ask {agent} aside: the answer stays out of the conversation"),
                     (false, _) => String::new(),
                     (true, false) => format!("Message {agent}"),
                     (true, true) => format!("Message {agent} to resume"),
@@ -1377,6 +1426,42 @@ impl App {
                 view::for_each_of(act, working.then_some(("working", "hn.ChatWorking", ())), |_, (), _| {});
             }
         }
+    }
+
+    /// Chat pane `pv`'s aside card (its foot's `aside` slot, hn.ChatAside) while chat `sid` has one: the working ring
+    /// and the question in a quiet note while it is asked, then the answer's words as the transcript draws them, or the
+    /// error naming what failed; its close button closes it (`chat:aside_close:<sid>`).
+    fn fill_chat_aside(&self, pv: View<'_>, sid: u64, st: &mut ChatState) {
+        let Some(slot) = pv.part("foot").and_then(|f| f.part("aside")) else { return };
+        let rows: Option<Vec<Row>> = st.aside.as_mut().map(|a| {
+            a.pull();
+            let mut rows = Vec::new(); // alloc: the card's few rows, this frame's
+            match &a.answer {
+                None => rows.push(Row::Note(a.asked.clone())),
+                Some(Ok(words)) => blocks(words, false, &mut rows),
+                Some(Err(why)) => rows.push(Row::Error(why.clone())),
+            }
+            rows
+        });
+        let asking = st.aside.as_ref().is_some_and(|a| a.answer.is_none());
+        view::for_each_of(slot, rows.is_some().then_some(("card", "hn.ChatAside", ())), |_, (), _| {});
+        let (Some(rows), Some(plate)) = (rows, slot.part("card").and_then(|c| c.part("plate"))) else { return };
+        if let Some(head) = plate.part("head") {
+            if let Some(act) = head.part("act") {
+                view::for_each_of(act, asking.then_some(("working", "hn.ChatAsideWorking", ())), |_, (), _| {});
+            }
+            if let Some(b) = head.part("close") {
+                b.action(&format!("chat:aside_close:{sid}"));
+                if let Some(icon) = b.part("icon") {
+                    icon.icon(REMOVE_ICON);
+                }
+            }
+        }
+        let Some(body) = plate.part("body") else { return };
+        let mut paint = self.paint.borrow_mut();
+        let mut measure = |s: &str, style: &TextStyle, md: bool| paint.width(s, style, md);
+        let keyed = rows.iter().enumerate().map(|(i, r)| (format!("r{i}"), r.prefab(), r));
+        view::for_each_of(body, keyed, |v, r, _| fill_row(v, r, &RowCtx::NOWHERE, &mut measure));
     }
 
     /// Once a frame's layout has settled: every chat pane whose transcript was laid out at a new width this frame (a cmd+S
@@ -1698,8 +1783,11 @@ impl App {
     }
 
     /// Send chat `sid`'s draft (Return) with the pictures pasted into it, the draft emptied; nothing while it holds only
-    /// blanks and no picture.
+    /// blanks and no picture. A draft that starts with a space is asked aside instead ([`App::chat_ask_aside`]).
     pub(in crate::app) fn chat_send_draft(&mut self, sid: u64) {
+        if self.chat.borrow().get(&sid).is_some_and(|st| is_aside(&st.draft)) {
+            return self.chat_ask_aside(sid);
+        }
         let (text, images) = {
             let mut states = self.chat.borrow_mut();
             let Some(st) = states.get_mut(&sid) else { return };
@@ -1713,6 +1801,49 @@ impl App {
             (text, std::mem::take(&mut st.images))
         };
         self.link.chat_send(sid, &text, images);
+        self.poke();
+    }
+
+    /// Ask chat `sid`'s draft (an aside: it starts with a space) of a fork of its conversation, trimmed, the draft
+    /// emptied and its card over the composer asking; the pictures pasted into the draft stay for the next message (an
+    /// aside takes none). Nothing while the draft holds only blanks.
+    fn chat_ask_aside(&mut self, sid: u64) {
+        let (text, slot) = {
+            let mut states = self.chat.borrow_mut();
+            let Some(st) = states.get_mut(&sid) else { return };
+            let d = &mut st.draft;
+            if d.text.trim().is_empty() {
+                return;
+            }
+            let text = std::mem::take(&mut d.text).trim().to_owned();
+            (d.caret, d.anchor, d.marked) = (0, 0, None);
+            let slot: Arc<std::sync::Mutex<Option<AsideAnswer>>> = Arc::default();
+            st.aside = Some(Aside { asked: text.clone(), slot: Arc::clone(&slot), answer: None });
+            (text, slot)
+        };
+        self.link.chat_aside(sid, &text, move |a| *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(a));
+        self.poke();
+    }
+
+    /// Escape in the focused chat: its aside's card closed, if one shows. Whether one did.
+    fn chat_aside_close(&mut self) -> bool {
+        let Some((_, _, sid)) = self.focused_chat() else { return false };
+        let closed = self.chat.borrow_mut().get_mut(&sid).is_some_and(|st| st.aside.take().is_some());
+        if closed {
+            self.poke();
+        }
+        closed
+    }
+
+    /// An aside card's close button (`chat:aside_close:<sid>`): chat `sid`'s aside closed.
+    pub(in crate::app) fn chat_aside_dismiss(&mut self, rest: &str) {
+        let Ok(sid) = rest.parse::<u64>() else {
+            eprintln!("harness-native: chat:aside_close:{rest} names no session");
+            return;
+        };
+        if let Some(st) = self.chat.borrow_mut().get_mut(&sid) {
+            st.aside = None;
+        }
         self.poke();
     }
 
@@ -1738,9 +1869,9 @@ impl App {
         {
             return;
         }
-        // Escape closes the picker's menu, and what a cell floats over the transcript (a popover, a menu, a dialog),
-        // before it interrupts.
-        if op == "interrupt" && (self.chat_pick_close() || self.genui_escape()) {
+        // Escape closes the picker's menu, what a cell floats over the transcript (a popover, a menu, a dialog), and an
+        // aside's card, before it interrupts.
+        if op == "interrupt" && (self.chat_pick_close() || self.genui_escape() || self.chat_aside_close()) {
             return;
         }
         let Some((_, _, sid)) = self.focused_chat() else { return };

@@ -148,6 +148,13 @@ pub enum Request {
     /// the session's index row, so it outlives the daemon and the app. Refused, naming the session, for a title over a
     /// line.
     Rename { id: u64, title: String },
+    /// A "by the way" question about chat session `id`'s conversation that stays out of it: the daemon forks the
+    /// conversation (claude's `--resume --fork-session`, never saved; codex's ephemeral `thread/fork`), runs `text` as
+    /// one turn on the fork with the chat's model and effort, and discards the fork. Answered by [`Reply::Aside`] once
+    /// the turn ends, within [`ASIDE_SECS`] (the fork is stopped past it); refused, naming the chat and why, when it is
+    /// not a chat, its log never named the agent's id for the conversation, or the fork failed or did not answer. The
+    /// chat's log and its agent are untouched.
+    Aside { id: u64, text: String },
     Screen { id: u64 },
     Resize { id: u64, cols: u16, rows: u16 },
     Kill { id: u64 },
@@ -279,6 +286,10 @@ pub enum RunReq {
     },
 }
 
+/// How long an aside's fork may take to answer ([`Request::Aside`]): the daemon stops it past this, and a client waits
+/// this long and a little more for the reply.
+pub const ASIDE_SECS: u64 = 600;
+
 fn default_stream() -> String {
     "out".into()
 }
@@ -319,6 +330,8 @@ pub enum Reply {
     GithubChecks { checks: crate::peek::GhChecks },
     /// `page_peek`.
     Page { page: crate::peek::PageMeta },
+    /// `aside`: the fork's answer, its last words (markdown).
+    Aside { text: String },
     /// A run's or an object's answer, an open record whose shape runs.rs and object.rs define.
     Record(Value),
 }

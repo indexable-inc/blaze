@@ -1999,6 +1999,8 @@ impl App {
                 self.chat_mention_action(rest);
             } else if let Some(rest) = a.strip_prefix("chat:unattach:") {
                 self.chat_unattach(rest);
+            } else if let Some(rest) = a.strip_prefix("chat:aside_close:") {
+                self.chat_aside_dismiss(rest);
             } else if let Some(rest) = a.strip_prefix("chat:row:") {
                 self.chat_row_toggle(rest);
             } else if let Some(ev) = a.strip_prefix("ui:") {
@@ -2689,7 +2691,7 @@ mod tests {
             "hn.StepKind.build", "hn.StepKind.net", "hn.StepKind.sql", "hn.StepKind.spawn", "hn.StepKind.wait", "hn.StepKind.cell", "hn.StepKind.tool", "ex.TableDemo",
             "hn.chat_status.thinking", "hn.chat_status.thought", "hn.ChatPick", "hn.ChatControlInk.rest", "hn.ChatControlInk.hot",
             "hn.ChatControlInk.off", "hn.ChatEffort", "hn.ChatEffortBar", "ui.caret",
-            "hn.ChatContext", "hn.ChatWorking",
+            "hn.ChatContext", "hn.ChatWorking", "hn.ChatAside", "hn.ChatAsideWorking", "hn.ChatNote", "hn.ChatError",
             "hn.ChatItem", "hn.ChatItemNumber", "hn.ChatItemTask",
             "hn.ChatPeek", "hn.ChatPeekAnchor", "hn.PeekSite", "hn.PeekSiteGlyph", "hn.PeekTitle", "hn.PeekState", "hn.PeekMeta", "hn.PeekBody", "hn.PeekCode",
             "hn.PeekImage", "hn.PeekPage", "hn.PeekCheckFailed", "hn.PeekCheckRunning", "hn.PeekCheckQueued", "hn.PeekChecksFolded",
@@ -2729,7 +2731,8 @@ mod tests {
             "ground", "sidebar", "card", "raised", "well", "term_ground", "line", "line_strong", "ink_strong", "ink",
             "ink_muted", "ink_faint", "hover", "wash", "selection", "selection_focus", "press", "scrim", "clear",
             "text_selection", "copy_sheen", "accent", "accent_wash", "on_accent", "link", "code_ink", "success", "warning", "error",
-            "success_wash", "warning_wash", "error_wash", "kind_claude", "kind_codex", "kind_cursor", "kind_shell",
+            "success_wash", "warning_wash", "error_wash", "kind_claude", "kind_codex", "kind_cursor", "kind_shell", "aside",
+            "aside_line",
         ] {
             let _ = crate::look::tone(w, role);
         }

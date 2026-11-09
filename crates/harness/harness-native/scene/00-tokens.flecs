@@ -59,6 +59,12 @@ export const tone_level_fill: Fill = $tone_accent
 export const tone_level_scale: Fill = $tone_ink_faint
 export const tone_accent_wash: Fill = {dark: {0.137, 0.208, 0.345, 1}, light: {0.22, 0.443, 0.882, 0.16}}
 export const tone_on_accent: Fill = {dark: {1, 1, 1, 1}, light: {1, 1, 1, 1}}
+// An aside (a chat draft that starts with a space: a question asked of a fork of the conversation, outside it): the
+// composer's card while the draft is one, and the answer's card over it, a plate of the card's ground with a little of
+// the accent in it, edged in the accent at a low alpha, so the mode reads at a glance and stays quiet. Opaque, so the
+// composer's lift does not show through it.
+export const tone_aside: Fill = {dark: {0.129, 0.162, 0.230, 1}, light: {0.904, 0.921, 0.948, 1}}
+export const tone_aside_line: Fill = {dark: {0.22, 0.443, 0.882, 0.45}, light: {0.22, 0.443, 0.882, 0.35}}
 export const tone_link: Fill = {dark: {0.443, 0.631, 0.996, 1}, light: {0.149, 0.459, 0.749, 1}}
 export const tone_code_ink: Fill = {dark: {0.808, 0.816, 0.839, 1}, light: {0.031, 0.031, 0.031, 1}}
 // States, colour that carries meaning only: success (running, passed; --ok), warning (lost, pending), error (failed,
@@ -583,6 +589,18 @@ export const chat_attach_below = $chat_composer_gap
 export const chat_composer_lift_blur = 22
 export const chat_composer_lift_alpha = 0.22
 export const chat_composer_lift_dy = 4
+// An aside's answer (hn.ChatAside, src/app/chat.rs fill_chat_aside): a card over the composer, chat_aside_gap above it,
+// chat_aside_radius round, chat_aside_pad_x in from its sides, chat_aside_pad_t under its top and chat_aside_pad_b over
+// its bottom; its head chat_bar_h tall (the quiet "Aside" at the bar's chrome size, the working ring while it asks, a
+// close button chat_aside_close across with its glyph chat_aside_icon), chat_aside_head_gap over the answer's words.
+export const chat_aside_gap = 8
+export const chat_aside_radius = 14
+export const chat_aside_pad_x = 14
+export const chat_aside_pad_t = 6
+export const chat_aside_pad_b = 10
+export const chat_aside_head_gap = 2
+export const chat_aside_close = 20
+export const chat_aside_icon = 10
 // The bar (foot.card.bar), chat_bar_h tall, its controls chat_bar_gap apart: on the left den's model and effort picker
 // as one quiet control (hn.ChatPick, src/app/chat/pick.rs: the model's name, its effort as a level meter and a small
 // chevron, chat_pick_h tall, chat_pick_pad_x in, its chevron chat_pick_chevron across chat_pick_gap after the rest, a
