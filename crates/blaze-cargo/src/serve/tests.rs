@@ -328,6 +328,7 @@ pub(super) fn unit(pkg_id: &str, kind: &str, mode: Mode, deps: &[usize]) -> Unit
                 noprelude: Some(false),
                 nounused: Some(false),
                 dev: false,
+                gpu: false,
             })
             .collect(),
     }
@@ -447,6 +448,7 @@ pub(super) fn of_graph(root: &str, manifest: String, graph: UnitGraph) -> Units 
         harness: true,
         clippy: None,
         macro_wasm: false,
+        gpu_msl: None,
     };
     let package =
         |id: &str, name: &str, version: &str, source: Option<String>, is_member| PackagePlan {

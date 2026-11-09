@@ -71,6 +71,10 @@ pub(crate) struct PlanInput<'a, F: Files> {
     /// their own even when the target's triple is the same, and their plans say
     /// [`UnitPlan::macro_wasm`].
     pub macro_wasm: Option<&'a str>,
+    /// The device's platform ([`crate::GPU_DEVICE`]): units built for it that are not the
+    /// target's (`artifact = "gpu"`) are planned as a kind of their own, after the macros', with
+    /// no rustflags, linker or runner.
+    pub gpu: Option<&'a str>,
     /// The profile asked for, by name (`dev`), and its directory's name (`debug`).
     pub requested_profile: &'a str,
     pub profile_dir: &'a str,
@@ -335,13 +339,27 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
     if let Intent::Doc { open } = input.intent {
         flags::doc_unhonored(config, input.host, input.target, &kinds, open)?;
     }
+    // The device's kind, when a unit is built for it and the build is not for it already (whose
+    // units are the target's, one kind). Its triple is its directory, as a target's: the two are
+    // never both of one build.
+    let gpu_kind = kinds.len();
+    let device = input.gpu.filter(|triple| {
+        Some(*triple) != input.target
+            && units.iter().any(|it| !it.macro_wasm && it.platform.as_deref() == Some(*triple))
+    });
+    if let Some(triple) = device {
+        kinds.push(flags::device_info(triple)?);
+        kind_hashes.push(hash::kind_fingerprint_hash(Some(triple))?);
+        layouts.push(Layout::new(input.target_dir, input.build_dir, Some(triple), input.profile_dir));
+    }
     let mut linkers = Vec::with_capacity(kinds.len());
     let mut runners = Vec::with_capacity(kinds.len());
     for (at, info) in kinds.iter().enumerate() {
         // The macros' platform is blaze's: no `[target.<triple>]` of the user's names it, even
         // one for a `--target` of the same triple (as `flags::macro_wasm_info` reads no
         // rustflags).
-        if input.macro_wasm.is_some() && at == macro_kind {
+        // Nor the device's: it links nothing and runs nowhere here.
+        if (input.macro_wasm.is_some() && at == macro_kind) || (device.is_some() && at == gpu_kind) {
             linkers.push(None);
             runners.push(Vec::new());
             continue;
@@ -416,14 +434,16 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
             (Some(triple), true) if Some(triple) == input.macro_wasm => macro_kind,
             (None, false) => 0,
             (Some(triple), false) if Some(triple) == input.target => 1,
+            (Some(triple), false) if device == Some(triple) => gpu_kind,
             _ => {
                 return Err(error(format!(
-                    "the unit graph has a unit of `{}` ({}) for {} in a build for {:?} whose proc macros are built for {:?}",
+                    "the unit graph has a unit of `{}` ({}) for {} in a build for {:?} whose proc macros are built for {:?} and whose device is {:?}",
                     unit.pkg_id,
                     unit.target.name,
                     unit.built_for(),
                     input.target,
-                    input.macro_wasm
+                    input.macro_wasm,
+                    device
                 )));
             }
         };
@@ -496,6 +516,22 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
             _ => None,
         })
         .collect();
+
+    // The MSL of each unit an `artifact = "gpu"` edge reaches, in its `deps/` beside its library,
+    // named as it: its dependents' `BLAZE_GPU_MSL_<CRATE>`.
+    let mut gpu_msls: Vec<Option<String>> = vec![None; units.len()];
+    for dep in units.iter().flat_map(|it| &it.dependencies).filter(|it| it.gpu) {
+        let Some(it) = &facts[dep.index] else {
+            return Err(error(format!(
+                "`{}` is an `artifact = \"gpu\"` dependency planned as the standard library",
+                units[dep.index].pkg_id
+            )));
+        };
+        let crate_name = it.unit.target.name.replace('-', "_");
+        let dir = layouts[it.kind].deps(shared.new_layout, &pkg_dirs[dep.index]);
+        let file = format!("{crate_name}{}.msl", metas[dep.index].extra_filename());
+        gpu_msls[dep.index] = Some(dir.join(file).display().to_string());
+    }
 
     let mut roots = vec![false; units.len()];
     for &at in input.roots {
@@ -581,6 +617,7 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
                 harness: target.harness,
                 clippy: None,
                 macro_wasm: unit.macro_wasm,
+                gpu_msl: None,
             }));
             continue;
         }
@@ -612,6 +649,16 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
                 bin_exes.push((format!("CARGO_BIN_EXE_{name}"), path));
             }
         }
+        // Each `artifact = "gpu"` dependency's MSL, by the name the dependent calls it.
+        let gpu_msl_env: Vec<(String, String)> = unit
+            .dependencies
+            .iter()
+            .filter(|dep| dep.gpu)
+            .filter_map(|dep| {
+                let path = gpu_msls[dep.index].clone()?;
+                Some((format!("BLAZE_GPU_MSL_{}", env::envify(&dep.extern_crate_name)), path))
+            })
+            .collect();
         let env = env::compile_env(
             env::CompileEnv {
                 package: package_env,
@@ -623,12 +670,13 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
                 tmpdir: test_or_bench.then(|| layout.tmp().display().to_string()),
                 out_dir,
                 bin_exes,
+                gpu_msls: gpu_msl_env,
             },
             &config_env,
         );
 
         let extra = meta.extra_hex();
-        let files = outputs::compile_outputs(&CompileFiles {
+        let mut files = outputs::compile_outputs(&CompileFiles {
             mode: it.mode,
             kind: &it.target_kind,
             name: &unit.target.name,
@@ -645,6 +693,7 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
             stop_rlib_uplift,
             is_root: roots[at],
         })?;
+        files.extend(gpu_msls[at].iter().cloned());
 
         let name = it.pkg.id.name();
         let rustflags = flags::unit_rustflags(
@@ -689,6 +738,7 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
             harness: target.harness,
             clippy,
             macro_wasm: unit.macro_wasm,
+            gpu_msl: gpu_msls[at].clone(),
         }));
     }
 

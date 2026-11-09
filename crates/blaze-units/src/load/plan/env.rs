@@ -111,6 +111,8 @@ pub(super) struct CompileEnv<'a> {
     pub out_dir: Option<&'a str>,
     /// `CARGO_BIN_EXE_<name>`, of a test or bench target.
     pub bin_exes: Vec<(String, String)>,
+    /// blaze's `BLAZE_GPU_MSL_<CRATE>`, the MSL of each `artifact = "gpu"` dependency.
+    pub gpu_msls: Vec<(String, String)>,
 }
 
 pub(super) fn compile_env(
@@ -126,7 +128,7 @@ pub(super) fn compile_env(
     if let Some(dir) = it.out_dir {
         env.set("OUT_DIR", dir);
     }
-    for (name, path) in it.bin_exes {
+    for (name, path) in it.bin_exes.into_iter().chain(it.gpu_msls) {
         env.set(name, path);
     }
     if let Some(dir) = it.tmpdir {

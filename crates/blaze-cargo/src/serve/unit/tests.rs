@@ -65,6 +65,7 @@ fn unit(pkg: &str, target: Target, mode: Mode, deps: &[usize]) -> Unit {
                 noprelude: None,
                 nounused: None,
                 dev: false,
+                gpu: false,
             })
             .collect(),
     }
@@ -89,6 +90,7 @@ fn plan(extra: &str, outputs: &[&str]) -> UnitPlan {
         harness: true,
         clippy: None,
         macro_wasm: false,
+        gpu_msl: None,
     }
 }
 
@@ -1229,6 +1231,7 @@ fn lowered_proc_macro() -> blaze_lower::Lowered {
         noprelude: Some(true),
         nounused: None,
         dev: false,
+        gpu: false,
     };
     let made = |pkg: &str, target: Target, is_std: bool, dependencies: Vec<UnitDep>| Unit {
         profile: Profile {
@@ -1570,6 +1573,7 @@ fn script_front_for(
             noprelude: Some(true),
             nounused: None,
             dev: false,
+            gpu: false,
         }],
         false => Vec::new(),
     };
@@ -2047,6 +2051,7 @@ fn front_of(pkgs: &[MemPkg<'_>]) -> MemFront {
                     noprelude: None,
                     nounused: None,
                     dev: false,
+                    gpu: false,
                 })
                 .collect();
             u

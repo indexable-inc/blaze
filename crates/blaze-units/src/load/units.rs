@@ -72,7 +72,7 @@ pub(crate) fn units(
         Ok(it) => it,
         Err(error) => return Ok(Staged::Failed(error)),
     };
-    let Platforms { host, host_flags, target, target_flags, macro_wasm } = &platforms;
+    let Platforms { host, host_flags, target, target_flags, macro_wasm, gpu } = &platforms;
     let requested = match &spec.foreign {
         Some(ask) => ask.profile.root.clone(),
         None => match requested_profile(
@@ -215,6 +215,7 @@ pub(crate) fn units(
         host,
         target: target.as_ref(),
         macro_wasm: macro_wasm.as_ref(),
+        gpu: gpu.as_ref(),
         has_dev_units: resolved.has_dev_units == HasDevUnits::Yes,
     };
     let mut graph = match crate::unit_graph(&request) {
@@ -238,6 +239,12 @@ pub(crate) fn units(
     // wasm32-wasip1 has no unwinding. Before planning, so the units' hashes say so.
     let macro_platform = macro_wasm.as_ref().map(|it| it.triple.as_str());
     for unit in graph.units.iter_mut().filter(|it| it.macro_wasm) {
+        "abort".clone_into(&mut unit.profile.panic);
+    }
+    // A device build aborts too: `naga-unknown-unknown` has no unwinding (its `panic`), and a
+    // shader's panic is the device's trap.
+    let device = gpu.as_ref().map(|it| it.triple.as_str());
+    for unit in graph.units.iter_mut().filter(|it| it.platform.is_some() && it.platform.as_deref() == device) {
         "abort".clone_into(&mut unit.profile.panic);
     }
     // cargo passes `-C panic` only for a profile's `abort`, so a unit whose profile says
@@ -332,27 +339,30 @@ pub(crate) fn units(
                 Ok(it) => it,
                 Err(error) => return Ok(fail(error)),
             };
-            // By what each unit is built for, of the build's platforms: the host, the target and
+            // By what each unit is built for, of the build's platforms: the host, the target,
             // the wasm macros (a `--target wasm32-wasip1` build has a std for its target and
-            // another for its macros, of one triple), in `BuiltFor`'s order.
+            // another for its macros, of one triple) and the device (`artifact = "gpu"`, one
+            // platform with the target's when that is the device), in `BuiltFor`'s order.
             let mut platforms_used: Vec<BuiltFor<'_>> = [
                 Some(BuiltFor { platform: None, macro_wasm: false }),
                 target
                     .as_ref()
                     .map(|it| BuiltFor { platform: Some(it.triple.as_str()), macro_wasm: false }),
                 macro_platform.map(|triple| BuiltFor { platform: Some(triple), macro_wasm: true }),
+                device.map(|triple| BuiltFor { platform: Some(triple), macro_wasm: false }),
             ]
             .into_iter()
             .flatten()
             .filter(|it| graph.units.iter().any(|unit| unit.built_for() == *it))
-            .collect(); // alloc: at most three, once per load
+            .collect(); // alloc: at most four, once per load
             platforms_used.sort();
+            platforms_used.dedup();
             if let Some(unit) =
                 graph.units.iter().find(|unit| !platforms_used.contains(&unit.built_for()))
             {
                 return Ok(fail(anyhow::anyhow!(
                     "the unit graph has a unit of `{}` ({}) built for {}, which is none of the build's \
-                     platforms: the host, its target {:?} and its wasm macros' {macro_platform:?}",
+                     platforms: the host, its target {:?}, its wasm macros' {macro_platform:?} and its device's {device:?}",
                     unit.pkg_id,
                     unit.target.name,
                     unit.built_for(),
@@ -369,9 +379,12 @@ pub(crate) fn units(
             for built_for in platforms_used {
                 let triple = built_for.platform.unwrap_or(host.triple.as_str());
                 // The wasm macros' std is planned as their units are: no rustflags, std's
-                // default crates, aborting.
+                // default crates, aborting. So is the device's, unless the build is for it.
+                let is_target = built_for.platform.is_some()
+                    && built_for.platform == target.as_ref().map(|it| it.triple.as_str());
                 let rustflags = match built_for.platform {
                     _ if built_for.macro_wasm => Vec::new(),
+                    Some(triple) if Some(triple) == device && !is_target => Vec::new(),
                     Some(_) => target_flags.clone(),
                     None => host_flags.clone(),
                 };
@@ -458,6 +471,7 @@ pub(crate) fn units(
         host: &host.triple,
         target: target.as_ref().map(|it| it.triple.as_str()),
         macro_wasm: macro_platform,
+        gpu: device,
         requested_profile: &requested,
         profile_dir: &dir_name,
         base_profile: &base_profile,
@@ -645,6 +659,9 @@ pub(crate) struct Platforms {
     /// [`super::MACRO_WASM`]'s, which proc macros are built for ([`Spec::macro_wasm`]): it
     /// may be the target's triple too, whose units [`schema::Unit::macro_wasm`] tells apart.
     pub macro_wasm: Option<Platformed>,
+    /// [`crate::GPU_DEVICE`]'s, which a dependency asked for with `artifact = "gpu"` is built
+    /// for, with no rustflags; none in a foreign load (a std's, which builds no such dependency).
+    pub gpu: Option<Platformed>,
 }
 
 fn platforms(config: &blaze_manifest::Config<Snap>, spec: &Spec) -> Result<Platforms, LoadError> {
@@ -665,6 +682,7 @@ fn platforms(config: &blaze_manifest::Config<Snap>, spec: &Spec) -> Result<Platf
                 true => Some(Platformed { triple: ask.triple.clone(), cfg: parse(&ask.cfg)? }),
                 false => None,
             },
+            gpu: None,
         });
     }
     let target = match &spec.target {
@@ -711,7 +729,12 @@ fn platforms(config: &blaze_manifest::Config<Snap>, spec: &Spec) -> Result<Platf
         }
         false => None,
     };
-    Ok(Platforms { host, host_flags, target, target_flags, macro_wasm })
+    // The device's, with no rustflags (as the wasm macros'); its units are only of a build
+    // with an `artifact = "gpu"` dependency, and only those read it.
+    let gpu = platform::target_cfgs(crate::GPU_DEVICE, &CfgArgs::default())
+        .map(|cfg| Platformed { triple: crate::GPU_DEVICE.to_owned(), cfg })
+        .map_err(error)?;
+    Ok(Platforms { host, host_flags, target, target_flags, macro_wasm, gpu: Some(gpu) })
 }
 
 /// What the feature resolver reads of the packages.
@@ -813,7 +836,11 @@ fn artifact_refusal(
 ) -> Option<LoadError> {
     for unit in &graph.units {
         let Some((id, package)) = packages.get(unit.pkg_id.as_str()) else { continue };
-        if !package.manifest.dependencies.iter().any(|dep| dep.artifact.is_some()) {
+        // blaze's `artifact = "gpu"` is built (its device unit, `Kind::Gpu` of the graph).
+        let refused = |dep: &blaze_manifest::dependency::Dependency| {
+            dep.artifact.as_ref().is_some_and(|it| !it.is_gpu())
+        };
+        if !package.manifest.dependencies.iter().any(refused) {
             continue;
         }
         let script = unit.target.is_custom_build() && unit.mode != Mode::RunCustomBuild;
@@ -830,7 +857,7 @@ fn artifact_refusal(
                 !script && unit.mode != Mode::RunCustomBuild
             }
         };
-        for dep in &package.manifest.dependencies {
+        for dep in package.manifest.dependencies.iter().filter(|it| refused(it)) {
             let Some(artifact) = &dep.artifact else { continue };
             if !used(dep.kind)
                 || !resolved
@@ -1163,6 +1190,7 @@ fn attach_std(
                 noprelude: Some(true),
                 nounused: Some(true),
                 dev: false,
+                gpu: false,
             });
         }
     }

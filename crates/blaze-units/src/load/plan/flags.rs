@@ -89,9 +89,20 @@ pub(super) fn kind_info<F: Files>(
 /// flags are for its own platforms (a host's `-C target-cpu=native` is no wasm cpu), and no
 /// `[target.<triple>]` of the user's names blaze's macro platform.
 pub(super) fn macro_wasm_info(triple: &str) -> Result<KindInfo, LoadError> {
-    let cfg_lines =
-        platform::target_cfg(triple, &CfgArgs { proc_macro: true, ..CfgArgs::default() })
-            .map_err(error)?;
+    own_platform_info(triple, true)
+}
+
+/// The kind of the device's units (`artifact = "gpu"`, [`crate::GPU_DEVICE`]), with no
+/// rustflags as the wasm macros': the build's flags are for its own platforms, and no
+/// `[target.<triple>]` of the user's names blaze's device.
+pub(super) fn device_info(triple: &str) -> Result<KindInfo, LoadError> {
+    own_platform_info(triple, false)
+}
+
+/// A platform of blaze's own (the wasm macros', the device's): its cfg, no rustflags.
+fn own_platform_info(triple: &str, proc_macro: bool) -> Result<KindInfo, LoadError> {
+    let cfg_lines = platform::target_cfg(triple, &CfgArgs { proc_macro, ..CfgArgs::default() })
+        .map_err(error)?;
     let cfgs = cfg_lines
         .iter()
         .map(|line| {

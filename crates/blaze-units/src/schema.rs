@@ -248,4 +248,10 @@ pub struct UnitDep {
     /// cargo's graph. An edge of a build script's compile is a build-dependency either way.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dev: bool,
+    /// blaze's: the edge is an `artifact = "gpu"` dependency's, to the unit that builds it for
+    /// the device ([`crate::GPU_DEVICE`]). The dependent links nothing of it and has no extern
+    /// crate of it; it is given the MSL that unit writes (`BLAZE_GPU_MSL_<CRATE>`). That unit
+    /// alone writes MSL: what it depends on is built for the device as libraries.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gpu: bool,
 }

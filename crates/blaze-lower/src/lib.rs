@@ -783,7 +783,10 @@ fn lower_writes<T: blaze_query::Tree>(
         let mut dependencies = Vec::with_capacity(unit.dependencies.len());
         for dep in &unit.dependencies {
             let on = &units.graph.units[dep.index];
-            if on.mode == Mode::RunCustomBuild {
+            // An `artifact = "gpu"` edge gives the dependent the MSL its unit writes (its
+            // `BLAZE_GPU_MSL_<CRATE>`, [`Lowered::gpu_msl`]), no crate: a `lib = true` is an edge
+            // of its own, to the library's unit.
+            if on.mode == Mode::RunCustomBuild || dep.gpu {
                 continue;
             }
             let Some(krate) = lowerings[dep.index].krate else {
