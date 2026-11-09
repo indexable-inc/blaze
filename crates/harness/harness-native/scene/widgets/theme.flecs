@@ -58,6 +58,10 @@ hn {
     archive_after {
       Size: {w: {kind: Fixed, value: $archive_after_s, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
     }
+    // How far the context ring breathes down while the agent works (chat/pick.rs breathe; a share, as a width).
+    chat_working_breath_at {
+      Size: {w: {kind: Fixed, value: $chat_working_breath, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
     // How long a finished child keeps its row (and its done mark) under a folded node (seconds, as a width).
     tree_linger_for {
       Size: {w: {kind: Fixed, value: $tree_linger_s, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}

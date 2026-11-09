@@ -324,10 +324,13 @@ impl App {
         view::for_each_of(pick, shown, |v, (), _| {
             control(v, &format!("chat:pick:{sid}:all"), &words, &tip, level, &ink, word.as_deref());
         });
-        view::for_each_of(meter_slot, context.map(|_| ("context", "hn.ChatContext", ())), |v, (), _| {
-            if let Some(c) = context {
-                meter(v, (c.used, c.window), ink.hot);
-            }
+        // One ring: how full the context is, breathing while the agent works (the composer's one sign of work: Return sends,
+        // Escape stops). Before the first turn says how full, a working agent's ring is an empty track.
+        let working = t.busy && !ended;
+        let shown = (context.is_some() || working).then_some(("context", "hn.ChatContext", ()));
+        view::for_each_of(meter_slot, shown, |v, (), _| {
+            meter(v, context.map_or((0, 1), |c| (c.used, c.window)), ink.hot);
+            breathe(v, working);
         });
         // Under the pointer, the meter's popover (context.rs), anchored to the ring; never over the open menu.
         if let Some(pop) = bar.part("pop") {
@@ -801,6 +804,23 @@ fn effort_meter(m: View<'_>, level: Option<(usize, usize)>, lit: Fill, off: Fill
 
 /// The context meter for `(used, window)` tokens: the ring's arc in its tone, the track in `ink` faintly. The number is
 /// the popover's (context.rs).
+/// The context ring's parts breathe while the agent works (down to chat_working_breath), and rest at full ink when it
+/// does not (a breath of low 1 dims nothing).
+fn breathe(v: View<'_>, working: bool) {
+    let w = v.entity().world();
+    let low = if working { crate::look::width(w, "chat_working_breath_at") } else { 1.0 };
+    let Some(ring) = v.part("ring") else { return };
+    for part in ["track", "arc"] {
+        let Some(p) = ring.part(part) else { continue };
+        let e = p.entity();
+        match e.try_cloned::<&crate::look::Breath>() {
+            Some(b) if (b.low - low).abs() < 1e-3 => {}
+            Some(b) => _ = e.set(crate::look::Breath { low, ..b }),
+            None => _ = e.set(crate::look::Breath { spring: Spring::at(1.0), up: false, low }),
+        }
+    }
+}
+
 fn meter(v: View<'_>, (used, window): (u64, u64), ink: Fill) {
     let w = v.entity().world();
     let f = used as f64 / window as f64;

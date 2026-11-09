@@ -297,6 +297,8 @@ pub fn run(path: &str) -> Result<(), String> {
     let px = renderer.read(&tex);
     write_png(path, &app, &px, (w * backing) as u32, (h * backing) as u32)?;
     eprintln!("harness-native: wrote {path}");
+    // As the window does when the app quits: the chats' drafts are kept for the next launch.
+    app.flush_drafts();
     if let Ok(pfm) = std::env::var("HARNESS_NATIVE_SHOT_PFM") {
         write_pfm(&pfm, &renderer.read_float(&tex), (w * backing) as usize, (h * backing) as usize)?;
     }

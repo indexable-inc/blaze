@@ -292,6 +292,10 @@ pub struct ChatState {
     mention: mention::Mention,
     /// The pictures pasted into the message being written (absolute paths of PNG or JPEG files), sent with it.
     images: Vec<String>,
+    /// The draft as native.json keeps it (`drafts`): read once, when the pane first shows it, and what was last written
+    /// there (its words and pictures), so [`App::flush_drafts`] writes only what changed.
+    draft_read: bool,
+    draft_saved: (String, Vec<String>),
     /// Each picture's size in pixels as its header says (None: not one this app can show), read once: the composer's
     /// and the transcript's thumbnails.
     sizes: HashMap<String, Option<(u32, u32)>>,
@@ -326,6 +330,20 @@ fn is_aside(d: &Draft) -> bool {
 }
 
 impl ChatState {
+    /// Take chat `sid`'s draft from native.json (`drafts`: `{"s14": {"text", "images"}}`), what was being written when
+    /// the app last quit; a picture whose file is gone is left out.
+    fn read_draft(&mut self, sid: u64) {
+        self.draft_read = true;
+        let Some(d) = crate::prefs::get("drafts").and_then(|v| v.get(format!("s{sid}")).cloned()) else { return };
+        let text = d["text"].as_str().unwrap_or("").to_owned();
+        let images: Vec<String> =
+            d["images"].as_array().into_iter().flatten().filter_map(Value::as_str).filter(|p| std::path::Path::new(p).is_file()).map(str::to_owned).collect();
+        let n = text.len();
+        self.draft = Draft { text: text.clone(), caret: n, anchor: n, ..Draft::default() };
+        self.images.clone_from(&images);
+        self.draft_saved = (text, images);
+    }
+
     /// Shown again after another tab was in front: every text block as it is now shows whole and at rest (no pace, no
     /// glyphs fading in), as history does on an attach, so only what comes from here on is written in.
     fn catch_up(&mut self, t: &Transcript) {
@@ -410,6 +428,8 @@ impl Default for ChatState {
             peek: peek::Peek::default(),
             mention: mention::Mention::default(),
             images: Vec::new(),
+            draft_read: false,
+            draft_saved: (String::new(), Vec::new()),
             sizes: HashMap::new(),
             aside: None,
         }
@@ -1187,6 +1207,9 @@ impl App {
         let pv = View::of(w.entity_from_id(pane));
         let mut states = self.chat.borrow_mut();
         let st = states.entry(sid).or_default();
+        if !st.draft_read {
+            st.read_draft(sid);
+        }
         // Its own stream of events: attach (again a second after a try while it runs, once when it ended). The stream
         // outlives the agent (a resume's events come on it), and a past chat's is its log replayed by the daemon. A stream
         // the link holds from before the session was known to be a chat is a terminal's: dropped for ours.
@@ -1420,11 +1443,6 @@ impl App {
             let listed = o.try_cloned::<&model::AgentModel>().unwrap_or_default();
             let listed = (listed.s.as_str(), listed.effort.as_str());
             self.fill_chat_pick(bar, sid, t, model::kind_name(o), st.pick, &mut st.pick_nav, &mut st.effort, listed, ended);
-            // While the agent works, its breathing ring (hn.ChatWorking), else nothing: Return sends, Escape stops.
-            if let Some(act) = bar.part("act") {
-                let working = t.busy && !ended;
-                view::for_each_of(act, working.then_some(("working", "hn.ChatWorking", ())), |_, (), _| {});
-            }
         }
     }
 
@@ -1912,6 +1930,34 @@ impl App {
             _ => eprintln!("harness-native: keys: act.Edit has no edit {op:?}"),
         }
         self.poke();
+    }
+
+    /// Write every chat draft that changed since it was last written to native.json (`drafts`, by session; an empty one
+    /// leaves it), in one write: the window calls this as it goes idle, so a pause in typing keeps the draft across a
+    /// quit without a write per key.
+    pub(crate) fn flush_drafts(&self) {
+        let mut states = self.chat.borrow_mut();
+        let changed: Vec<(u64, String, Vec<String>)> = states
+            .iter()
+            .filter(|(_, st)| st.draft_read && (st.draft.text.as_str(), st.images.as_slice()) != (st.draft_saved.0.as_str(), st.draft_saved.1.as_slice()))
+            .map(|(sid, st)| (*sid, st.draft.text.clone(), st.images.clone()))
+            .collect();
+        if changed.is_empty() {
+            return;
+        }
+        let mut drafts = crate::prefs::get("drafts").and_then(|v| v.as_object().cloned()).unwrap_or_default();
+        for (sid, text, images) in changed {
+            let key = format!("s{sid}");
+            if text.trim().is_empty() && images.is_empty() {
+                drafts.remove(&key);
+            } else {
+                drafts.insert(key, serde_json::json!({"text": text, "images": images}));
+            }
+            if let Some(st) = states.get_mut(&sid) {
+                st.draft_saved = (text, images);
+            }
+        }
+        crate::prefs::set("drafts", Value::Object(drafts));
     }
 
     /// Pictures pasted into the focused chat's message (absolute paths of PNG or JPEG files this app can show): shown over

@@ -607,9 +607,9 @@ export const chat_aside_icon = 10
 // wash under the pointer); the meter (hn.ChatEffort) chat_effort_lead after the name, chat_effort_h tall, a bar per
 // effort chat_effort_bar_w wide, chat_effort_gap apart, chat_effort_bar_radius round, rising from chat_effort_floor of
 // its height to all of it. On the right the context meter (hn.ChatContext: a ring chat_ring across, its stroke
-// chat_ring_stroke, in a square chat_bar_h across that takes the pointer). While the agent works, its sign
-// (hn.ChatWorking, not a button: Return sends, Escape stops) after the meter: a ring chat_working across (stroke
-// chat_working_stroke) breathing down to chat_working_breath.
+// chat_ring_stroke, in a square chat_bar_h across that takes the pointer). While the agent works that one ring breathes
+// down to chat_working_breath: the composer's sign of work, not a button (Return sends, Escape stops). An aside's card
+// shows its own working ring (hn.ChatWorking: chat_working across, stroke chat_working_stroke).
 // Everything in the bar is chrome, secondary to the words typed over it: the picker's name at size_chrome in the muted
 // ink, and its marks (chevron, level meter, rings) and their hit plates scaled to that size, not to the body's.
 // The picker's menu is a ui.SearchMenu (menu_*).
