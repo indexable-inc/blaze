@@ -3005,8 +3005,10 @@ enum PopLine {
     Head(String),
     /// Model and effort, how long: muted.
     Meta(String),
-    /// What it is doing or said last, a few lines.
+    /// What it is doing, a few plain lines (a command).
     Text(String),
+    /// One block of what it said last, as the transcript shows it: inline markdown, drawn by the same MarkdownText.
+    Said(String),
     /// One step a cell took: its kind (`hn.StepKind`) and its words ([`StepWords`]).
     Step(&'static str, StepWords),
 }
@@ -3222,10 +3224,28 @@ fn agent_pop(name: &str, state: &str, t: Option<&Transcript>, model: &str, effor
     });
     match (doing, said) {
         (Some(d), _) => out.push(PopLine::Text(d)),
-        (None, Some(s)) => out.push(PopLine::Text(clip_lines(s.trim(), POP_LINES, POP_CHARS))),
+        (None, Some(s)) => out.extend(said_lines(s)),
         (None, None) => {}
     }
     out
+}
+
+/// The first blocks of a message, as a card's lines: split as the transcript splits it ([`blocks`]: the same parse) and
+/// each drawn as inline markdown, never its source. A list item leads with its mark, a heading is strong; a code
+/// block, a table or a formula is left to the chat.
+fn said_lines(md: &str) -> Vec<PopLine> {
+    let mut rows = Vec::new();
+    blocks(md.trim(), false, &mut rows);
+    rows.into_iter()
+        .filter_map(|r| match r {
+            Row::Prose(s) | Row::Quote(s) => Some(s),
+            Row::Heading(_, s) => Some(format!("**{s}**")),
+            Row::ListItem { mark, text, .. } => Some(format!("{mark} {text}")),
+            _ => None,
+        })
+        .take(POP_LINES)
+        .map(PopLine::Said)
+        .collect()
 }
 
 /// What a sub-agent's turn in flight does now, in a few words ("Now: cargo build"), None when it says nothing yet.
@@ -3267,12 +3287,13 @@ fn fill_activity_pop(pop: View<'_>, strip: View<'_>, chips: &[Chip]) {
             PopLine::Head(_) => "hn.ChatActivityPopHead",
             PopLine::Meta(_) => "hn.ChatActivityPopMeta",
             PopLine::Text(_) => "hn.ChatActivityPopText",
+            PopLine::Said(_) => "hn.ChatActivityPopSaid",
             PopLine::Step(..) => "hn.ChatActivityPopStep",
         };
         (format!("{}{i}", c.key), prefab, l)
     });
     view::for_each_of(plate, lines, |v, l, _| match l {
-        PopLine::Head(s) | PopLine::Meta(s) | PopLine::Text(s) => {
+        PopLine::Head(s) | PopLine::Meta(s) | PopLine::Text(s) | PopLine::Said(s) => {
             v.text(s);
         }
         PopLine::Step(kind, s) => {

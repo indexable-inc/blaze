@@ -506,7 +506,7 @@ export const result_snippet_h = 36
 // a wide window.
 export const chat_pad = 24
 // How far the transcript thins out where it scrolls under the composer (and under the pane's top): soft, never a cut line.
-export const chat_fade_len = 28
+export const chat_fade_len = 12
 // A reply streaming in (theme role chat_stream): the transcript follows its end on a spring (landing at once from rest
 // when the end is more than chat_follow_far away); each glyph rises chat_glyph_rise points and fades in over
 // chat_glyph_dur seconds from the frame it came; and words show at an even pace about chat_pace_lag seconds behind what

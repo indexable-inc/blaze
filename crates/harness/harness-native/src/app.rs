@@ -1046,7 +1046,6 @@ impl App {
                         &[
                             ("name", Prop::Str(&name)),
                             ("under", Prop::Str(&under)),
-                            ("alarm", Prop::Bool(failed || status == "lost")),
                             ("meta", Prop::Str(&meta)),
                             ("why", Prop::Str(&why)),
                             ("hint", Prop::Str(&hint)),
@@ -1056,29 +1055,23 @@ impl App {
                     ]
                     .concat(),
                 );
-                // Before its title, how it stands, not what made it (its kind ends its tooltip): an agent at work is a
-                // filled dot in the strong ink, one up and waiting for the person a hollow ring in the faint ink, one
-                // that ended nothing (its title is already muted). The glyphs are the chat's own statuses
-                // (scene/widgets/chat_status.flecs `running`, `waiting`), still here. A shell keeps its terminal
-                // glyph, since it opens a terminal and not a chat, in the same two inks.
+                // Before its title, a mark only when there is something to say, so a quiet tree is plain words: a dot in
+                // the strong ink while its agent works, the same dot in the error ink when it failed (the row's one
+                // colour: its trailing words stay faint), nothing else. The dot is the chat's own running glyph
+                // (scene/widgets/chat_status.flecs), still here. Which agent it is ends the tooltip. A shell keeps its
+                // terminal glyph, since it opens a terminal and not a chat.
                 if let Some(i) = row.part("kind_icon") {
                     let kind = model::kind_name(o);
-                    if matches!(kind, "claude" | "codex" | "cursor") {
-                        let state = match (busy, status) {
-                            (true, _) => Some("running"),
-                            (false, "running") => Some("waiting"),
-                            _ => None,
-                        };
-                        let glyph = state.map(|s| {
-                            view::prefab(w, &format!("hn.chat_status.{s}"))
-                                .and_then(|p| p.try_cloned::<&harness_native_ui_text_api::Icon>())
-                                .unwrap_or_else(|| panic!("the scene's hn.chat_status.{s} has no Icon (scene/widgets/chat_status.flecs)"))
-                        });
-                        crate::look::show_glyph(i.entity(), glyph.as_ref().map_or("", |g| g.glyph.as_str()));
+                    let agent = matches!(kind, "claude" | "codex" | "cursor");
+                    if agent {
+                        let dot = view::prefab(w, "hn.chat_status.running")
+                            .and_then(|p| p.try_cloned::<&harness_native_ui_text_api::Icon>())
+                            .unwrap_or_else(|| panic!("the scene's hn.chat_status.running has no Icon (scene/widgets/chat_status.flecs)"));
+                        crate::look::show_glyph(i.entity(), if busy || failed { dot.glyph.as_str() } else { "" });
                     } else {
                         crate::look::kind_mark(w, i.entity(), kind);
                     }
-                    let f = tone(w, if busy { "ink_strong" } else { "ink_faint" });
+                    let f = tone(w, if failed && agent { "error" } else if busy { "ink_strong" } else { "ink_faint" });
                     if i.entity().try_cloned::<&Fill>() != Some(f) {
                         i.entity().set(f);
                     }
