@@ -51,7 +51,8 @@
 //!    marked: `loaded = hit + late + wasted + marked`.
 //!
 //! Planted bugs 1 to 6, 8, 9 and 10 ([`Plant`]), each a safeguard of the pool's removed, must each be caught on
-//! one of [`CONTROL_SEEDS`] seeded plans. Replay: a failure names its plan and the simulator's
+//! the plan built to expose it ([`directed`]), which passes with nothing planted; the
+//! [`CONTROL_SEEDS`] seeded plans are searched too, and whether one catches it is reported. Replay: a failure names its plan and the simulator's
 //! seed in it; a control names a seed of [`plan_of`] for [`REPLAY`].
 
 use std::{
@@ -109,7 +110,7 @@ const DRAIN: u32 = 4000;
 const TRIES: u32 = 64;
 /// The most an optimistic read copies: the store's are 16 to 96 bytes.
 const OPTIMISTIC_MOST: u64 = 256;
-/// Seeded plans a control searches for one its plant breaks.
+/// Seeded plans a control searches, after its built plan, for one its plant breaks.
 const CONTROL_SEEDS: u64 = 1024;
 /// The seed [`replay_one_seed`] runs, and its plant: set them to what a failure names.
 const REPLAY: (u64, Plant) = (0, Plant::None);
@@ -1212,9 +1213,102 @@ fn the_pool_reads_back_what_its_files_hold(tc: TestCase) {
     }
 }
 
-/// A plant the oracle must catch on one of [`CONTROL_SEEDS`] seeded plans (test-the-cause on
-/// the test itself): a green DST with a blind oracle proves nothing.
+/// A plan of one file of `sizes`' records and `acts`, with no faults: a control's, built to make
+/// the one shape its plant breaks.
+fn by_hand(sizes: &[u64], acts: Vec<Act>) -> Plan {
+    let spec = Spec { sizes: sizes.to_vec(), fill: 3, rank: Rank::Plain };
+    Plan { files: vec![spec], acts, ..quiet_plan() }
+}
+
+/// The plan built to expose `plant`: the fewest acts that make the shape its safeguard is for,
+/// so a control does not wait on a drawn plan to make it by luck. Each passes with nothing
+/// planted ([`control`] checks it). A step of 400 microseconds is past the simulation's longest
+/// completion (200), so each `Step` ends what was asked before it.
+fn directed(plant: Plant) -> Plan {
+    let read = |reader: u8| Act::Read { reader, file: 0, rec: 0, set: false };
+    let step = Act::Step { us: 400 };
+    // Reader 0 holds record 0: a slot, the load asked, its read done, the pins taken.
+    let hold = [read(0), read(0), step, read(0)];
+    let append = Act::Append { file: 0 };
+    match plant {
+        Plant::None => panic!("no plan is built for no plant"),
+        // An optimistic read looks, the page is given back and loaded again, and the read looks
+        // again at a copy it made in between: only the version tells it.
+        Plant::SameVersion => {
+            let mut acts = hold.to_vec();
+            acts.extend([
+                Act::Release { reader: 0 },
+                Act::Optimistic { reader: 1, file: 0, rec: 0 },
+                Act::Evict,
+                Act::Advance { reader: 1 },
+                read(0),
+                read(0),
+                step,
+                Act::Advance { reader: 1 },
+            ]);
+            by_hand(&[300], acts)
+        }
+        // The sweep comes by a page a reader holds.
+        Plant::EvictPinned => {
+            let mut acts = hold.to_vec();
+            acts.push(Act::Evict);
+            by_hand(&[300], acts)
+        }
+        // The sweep takes a page read once and let go.
+        Plant::NoEvicting => {
+            let mut acts = hold.to_vec();
+            acts.extend([Act::Release { reader: 0 }, Act::Evict]);
+            by_hand(&[300], acts)
+        }
+        // A second reader pins the page while the first's read of it is in flight.
+        Plant::LoadedAtAsk => by_hand(&[300], vec![read(0), read(0), read(1)]),
+        // A block rots under the record, then it is read.
+        Plant::NoCheck => {
+            let mut acts = vec![Act::Rot { file: 0, block: 0 }];
+            acts.extend(hold);
+            Plan { rot: true, ..by_hand(&[300], acts) }
+        }
+        // Reads fail one in three: forty loads of the page, each given back after, miss a
+        // failure once in ten million seeds, and this plan's seed is fixed.
+        Plant::FailedLoadKept => {
+            let mut acts = Vec::new();
+            for _ in 0..40 {
+                acts.extend(hold);
+                acts.extend([Act::Release { reader: 0 }, Act::Evict]);
+            }
+            Plan { fail_reads: true, ..by_hand(&[300], acts) }
+        }
+        // The commit pins the file's last page (three acts), writes its append into it, and the
+        // sweep comes by before the write is done; then the write, the sync and the commit.
+        Plant::UnpinnedTail => by_hand(&[300], vec![append, append, step, append, Act::Evict, step, step, step]),
+        // A demand load of the file's first page is in flight as a plan of both its pages is
+        // queued: the second page is the prefetch's to issue.
+        Plant::PrefetchFirst => by_hand(&[300, 100_000], vec![read(0), read(0), Act::Prefetch { file: 0 }]),
+        // Two blocks rot in the two pages one read of record 0 loads; record 2 lies over the
+        // second.
+        Plant::FirstBadBlock => {
+            let acts = vec![Act::Rot { file: 0, block: 0 }, Act::Rot { file: 0, block: 28 }];
+            Plan { rot: true, ..by_hand(&[110_004, 4096, 4096], acts) }
+        }
+    }
+}
+
+/// A plant the oracle must catch (test-the-cause on the test itself: a green DST with a blind
+/// oracle proves nothing). It must be caught on the plan built to expose it ([`directed`]),
+/// which must pass with nothing planted, so the catch is the plant's and nothing else's. Then
+/// the seeded plans are searched too, to say whether drawn plans reach the shape: that is
+/// reported, not required, since a drawn plan may fail to make a rare shape in any fixed number
+/// of seeds.
 fn control(plant: Plant) {
+    let plan = directed(plant);
+    if let Err(broke) = run(&plan, Plant::None) {
+        panic!("the plan built for Plant::{plant:?} fails with nothing planted, so it proves nothing: {broke}\nplan {plan:?}");
+    }
+    match run(&plan, plant) {
+        Err(Broke::Oracle(why)) => eprintln!("{plant:?} caught on its built plan: {why}"),
+        Err(broke @ Broke::Harness(_)) => panic!("the plan built for {plant:?}: {broke}\nplan {plan:?}"),
+        Ok(()) => panic!("the oracle did not catch Plant::{plant:?} on the plan built to expose it: {plan:?}"),
+    }
     for seed in 0..CONTROL_SEEDS {
         match run(&plan_of(seed), plant) {
             Err(Broke::Oracle(why)) => {
@@ -1225,9 +1319,7 @@ fn control(plant: Plant) {
             Ok(()) => {}
         }
     }
-    panic!(
-        "the oracle caught Plant::{plant:?} at none of seeds 0..{CONTROL_SEEDS}: it, or the draws, are too weak"
-    );
+    eprintln!("{plant:?} caught on its built plan and at none of seeds 0..{CONTROL_SEEDS}: drawn plans rarely make its shape");
 }
 
 #[test]
