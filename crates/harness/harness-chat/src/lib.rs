@@ -119,6 +119,10 @@ pub struct Transcript {
     pub items: Vec<Item>,
     /// A turn is in flight.
     pub busy: bool,
+    /// When the turn in flight began, and when its newest item (a block, a call, a message) began (ms since the epoch,
+    /// the events' own stamps): how long it and its current step have run. None outside a turn.
+    pub turn_since: Option<u64>,
+    pub step_since: Option<u64>,
     pub agent: String,
     pub model: String,
     /// The reasoning effort it runs with; empty when its `session` event did not say.
@@ -145,8 +149,6 @@ pub struct Transcript {
     pub details: HashMap<String, Detail>,
     /// When each tool call began (its first event's `ts`, ms since the epoch), by its block.
     pub started: HashMap<String, u64>,
-    /// When the turn in flight began (the `ts` of the `busy` that started it); None at rest.
-    pub turn_ts: Option<u64>,
     /// The person's messages sent while a turn was in flight that the agent has not taken yet (their items' indices,
     /// oldest first): Claude takes what waits with its next tool result, or as its turn ends; Codex one a turn, as the
     /// turn before it ends (the daemon's adapter queues them).
@@ -157,15 +159,16 @@ pub struct Transcript {
     buf: Vec<u8>,
 }
 
-/// Two transcripts are equal when they hold the same conversation: the redraw counter and a part frame not finished yet
-/// are bookkeeping, not state.
+/// Two transcripts are equal when they hold the same conversation: the redraw counter, a part frame not finished yet and
+/// when things began (a reattach replays a call's whole event in place of its partials, so its stamps differ) are
+/// bookkeeping, not state.
 impl PartialEq for Transcript {
     fn eq(&self, o: &Self) -> bool {
         (&self.models, &self.chosen_model, &self.chosen_effort, &self.context, self.cost_usd)
             == (&o.models, &o.chosen_model, &o.chosen_effort, &o.context, o.cost_usd)
             && (&self.items, self.busy, &self.agent, &self.model, &self.effort, &self.session_id, &self.title, &self.details, &self.at)
                 == (&o.items, o.busy, &o.agent, &o.model, &o.effort, &o.session_id, &o.title, &o.details, &o.at)
-            && (&self.started, self.turn_ts, &self.queued) == (&o.started, o.turn_ts, &o.queued)
+            && self.queued == o.queued
     }
 }
 
@@ -255,6 +258,14 @@ impl Transcript {
     /// One event.
     pub fn apply(&mut self, e: &Event) {
         self.rev = self.rev.wrapping_add(1);
+        let had = self.items.len();
+        self.apply_body(e);
+        if self.items.len() != had {
+            self.step_since = Some(e.ts);
+        }
+    }
+
+    fn apply_body(&mut self, e: &Event) {
         match &e.body {
             Body::Session { agent, model, session_id, effort } => {
                 self.agent.clone_from(agent);
@@ -290,9 +301,9 @@ impl Transcript {
             }
             Body::Busy { busy } => {
                 if *busy && !self.busy {
-                    self.turn_ts = Some(e.ts);
+                    self.turn_since = Some(e.ts);
                 } else if !*busy {
-                    self.turn_ts = None;
+                    (self.turn_since, self.step_since) = (None, None);
                 }
                 self.busy = *busy;
             }
@@ -473,7 +484,7 @@ mod tests {
             r#"{"ev":"busy","busy":true,"ts":31}"#,
         ];
         let t = fed(&start);
-        assert_eq!((t.queued.clone(), t.turn_ts, t.started["t1"]), (vec![2], Some(11), 20));
+        assert_eq!((t.queued.clone(), t.turn_since, t.started["t1"]), (vec![2], Some(11), 20));
         assert!(t.is_queued(2) && !t.is_queued(0));
         let t = fed(&[&start[..], &[r#"{"ev":"tool_result","block":"t1","text":"ok","error":false}"#]].concat());
         assert!(t.queued.is_empty(), "claude takes it with the tool's result");
@@ -482,6 +493,6 @@ mod tests {
         let t = fed(&[&codex[..], &[r#"{"ev":"tool_result","block":"t1","text":"ok","error":false}"#]].concat());
         assert_eq!(t.queued, vec![2], "codex takes it only as the turn ends");
         let t = fed(&[&codex[..], &[r#"{"ev":"turn_end","ok":true,"stop":"end_turn"}"#, r#"{"ev":"busy","busy":false}"#]].concat());
-        assert!(t.queued.is_empty() && t.turn_ts.is_none());
+        assert!(t.queued.is_empty() && t.turn_since.is_none());
     }
 }

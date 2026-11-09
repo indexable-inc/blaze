@@ -1597,13 +1597,13 @@ impl App {
         let Some(strip) = foot.part("activity") else { return };
         let w = self.world.world_ref();
         let o = w.entity_from_id(e);
-        let now = now_ms();
+        let now = model::now_ms();
         let mut chips: Vec<Chip> = Vec::new(); // alloc: a few chips, a frame
         let working = t.busy && !ended;
         if working {
             chips.push(turn_chip(t, now));
         }
-        let turn_from = t.turn_ts.unwrap_or(u64::MAX);
+        let turn_from = t.turn_since.unwrap_or(u64::MAX);
         let chats = self.chats.borrow();
         let mut watch: Vec<u64> = Vec::new(); // alloc: a few sub-agents, a frame
         o.each_child(|c| {
@@ -2931,9 +2931,14 @@ fn turn_start(t: &Transcript) -> usize {
     (0..t.items.len()).rev().find(|&k| matches!(t.items[k], Item::User { .. }) && !t.is_queued(k)).map_or(0, |k| k + 1)
 }
 
-/// Milliseconds since the epoch, now.
-fn now_ms() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+/// About how many tokens `text` is (four characters each), in a few figures: `240`, `1.2k`, `18k`.
+fn tokens_of(text: &str) -> String {
+    let n = text.chars().count().div_ceil(4);
+    match n {
+        0..1000 => n.to_string(),
+        1000..10_000 => format!("{:.1}k", n as f64 / 1000.0),
+        _ => format!("{}k", n / 1000),
+    }
 }
 
 /// How long something has run, the way a person says it: `12 s`, `1 min 20 s`, `6 min`, `1 h 5 min`.
@@ -2985,9 +2990,9 @@ pub(super) fn step_words(e: &model::chat::Effect) -> String {
 /// the steps its cells took so far ([`turn_steps`]).
 fn turn_chip(t: &Transcript, now: u64) -> Chip {
     let since = turn_start(t);
-    let turn = t.turn_ts.map(|s| ran_for(now.saturating_sub(s))).unwrap_or_default();
+    let turn = t.turn_since.map(|s| ran_for(now.saturating_sub(s))).unwrap_or_default();
     let mut words = "Working".to_owned();
-    let mut from = t.turn_ts;
+    let mut from = t.turn_since;
     for i in t.items[since.min(t.items.len())..].iter().rev() {
         match i {
             Item::Tool { block, name, input, result: None, .. } => {
@@ -3012,12 +3017,15 @@ fn turn_chip(t: &Transcript, now: u64) -> Chip {
                 }
                 break;
             }
-            Item::Thinking { done: false, .. } => {
-                words = "Thinking".to_owned();
+            // Reasoning or words as they come: about how many tokens so far, timed from when the block began.
+            Item::Thinking { text, done: false, .. } => {
+                words = format!("Thinking \u{b7} {} tokens", tokens_of(text));
+                from = t.step_since.or(from);
                 break;
             }
-            Item::Text { done: false, .. } => {
-                words = "Writing".to_owned();
+            Item::Text { text, done: false, .. } => {
+                words = format!("Writing \u{b7} {} tokens", tokens_of(text));
+                from = t.step_since.or(from);
                 break;
             }
             _ => {}
