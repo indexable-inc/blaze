@@ -12,7 +12,7 @@ The input is one JSON object (inline, a file's path, or `-`):
 
     engine    the blaze measured (engine.EngineSpec); v1 has no pure scripts, and says so
     out       the result's path (report.py's JSON)
-    work      where each project's source, trees, homes and stores go; a new directory under
+    work      where each project's source, trees and daemon homes go; a new directory under
               /tmp when empty
     sets      which projects: "crates" (pure_scripts/corpus.json, each crate built as its own
               workspace from its .crate, checked against the sparse index as corpus.py does) and
@@ -22,7 +22,7 @@ The input is one JSON object (inline, a file's path, or `-`):
     profile   dev or release (dev)
     keep      keep each project's work directory (false)
 
-Each project is built cold three times at one path into one store, each build with an empty home,
+Each project is built cold three times at one path into one store (the home's, kept across them), each build with an otherwise empty home,
 target directory and daemon of its own, timed from nothing to the end of
 `blaze build --message-format=json` (design.md section 8: no store holds only the pure keys):
 
@@ -415,21 +415,22 @@ def pass_env(env: dict[str, str], which: Pass) -> dict[str, str]:
     return out
 
 
-def cold(eng: engine.Engine, p: Project, top: Path, profile: Profile, which: Pass, store: Path) -> Built:
-    """A cold build of `p` at `top/build/<tree>` with an empty home and target directory, `store`
-    as its store (shared by the three passes) and a daemon of its own, timed; the daemon is
-    stopped after it."""
+def cold(eng: engine.Engine, p: Project, top: Path, profile: Profile, which: Pass, keep_store: bool) -> Built:
+    """A cold build of `p` at `top/build/<tree>` by a daemon of its own in `top/home`, timed; the
+    daemon is stopped after it. The home is emptied first (daemon state and build directory),
+    all of it or with `keep_store` all but its store, which is in the home (engine.layout): the
+    three passes share one store that way."""
     builds = top / "build"
     tree, home = builds / p.tree, top / "home"
-    for path in (tree, home):
-        shutil.rmtree(path, ignore_errors=True)
+    shutil.rmtree(tree, ignore_errors=True)
+    engine.empty_home(home, keep_store)
     builds.mkdir(parents=True, exist_ok=True)
     for entry in p.beside:
         if not (builds / entry).is_symlink() and not (builds / entry).exists():
             (builds / entry).symlink_to(p.source / entry)
     shutil.copytree(p.source / p.tree, tree, symlinks=True, ignore=budgets.left_out)
     ws = tree / p.sub if p.sub else tree
-    env = pass_env(eng.env(home, store, None, p.env), which)
+    env = pass_env(eng.env(home, None, p.env), which)
     release = ["--release"] if profile == "release" else []
     step = f"{p.label} {profile} ({which})"
     got = Built()
@@ -483,17 +484,15 @@ def judged(rep: report.Report, p: Project, runs: Sequence[ScriptRun], expectatio
 
 def measure(eng: engine.Engine, rep: report.Report, p: Project, top: Path, profile: Profile,
             expectations: Expectations, tally: Tally) -> None:
-    store = top / "store"
-    shutil.rmtree(store, ignore_errors=True)
-    sandboxed = cold(eng, p, top, profile, "sandboxed", store)
+    sandboxed = cold(eng, p, top, profile, "sandboxed", False)
     if sandboxed.failed is not None:
         rep.add(f"{p.label} build", "fail", f"the sandboxed build: {sandboxed.failed}", seconds=round(sandboxed.seconds, 1))
         return
     rep.add(f"{p.label} build", "pass", f"cold {sandboxed.seconds:.1f} s, {len(sandboxed.runs)} script runs",
             seconds=round(sandboxed.seconds, 1), scripts=len(sandboxed.runs))
     held, pure = judged(rep, p, sandboxed.runs, expectations, tally)
-    pure_built = cold(eng, p, top, profile, "pure", store)
-    verify = cold(eng, p, top, profile, "verify", store)
+    pure_built = cold(eng, p, top, profile, "pure", True)
+    verify = cold(eng, p, top, profile, "verify", True)
     saved = verify.seconds - pure_built.seconds
     verify_misses = pure_misses(sandboxed.runs, verify.runs) if verify.failed is None else []
     row: dict[str, report.Number] = dict(

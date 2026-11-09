@@ -31,7 +31,7 @@ The projects:
                the sha256 the sparse index (index.crates.io) lists for that version when it
                is fetched, unpacked, and its own tests run
 
-blaze does each step through the engine into the workspace's `target`. Each (project, step) is
+blaze does each step through the engine into the build directory under its daemon's home (engine.layout). Each (project, step) is
 one outcome:
 
     pass   a build exits 0; a program (`run`, `exec`) exits 0; in a test run every test that
@@ -167,8 +167,8 @@ class Found:
 
 @dataclass(frozen=True)
 class Tested:
-    """What `blaze_cli.test_results` reads of a test run: with `kept`, the tests `blaze test`
-    passed without running them again (its `tests.ndjson`)."""
+    """What `blaze_cli.test_results` reads of a test run: `kept` is the tests passed without
+    running them again, which plain `blaze test` has none of."""
 
     returncode: int
     stdout: str
@@ -422,17 +422,17 @@ def step_of(eng: engine.Engine, program: Program, step: Step, ws: Path, scratch:
         cwd = scratch / "cwd"
         cwd.mkdir(exist_ok=True)
         env = {**engine.scrubbed(), **program.env, "BLAZE_HOME": str(scratch / "program-home")}
-        ours = engine.run(name, [str(ws / "target" / "debug" / (program_name + engine.EXE)), *args], cwd, env, EXEC_SECS)
+        built = eng.build_dir(ws, ours_env) / "debug" / (program_name + engine.EXE)
+        ours = engine.run(name, [str(built), *args], cwd, env, EXEC_SECS)
         who = None
         mine = blaze_cli.program_output(ours)
     else:
-        tests = ws / "target" / "blaze" / "tests.ndjson"
-        if step.command == "test":
-            tests.unlink(missing_ok=True)
         ours = eng.build(name, ws, ours_env, step.args, command=step.command)
         who = eng.not_blazes(ours)
         if step.command == "test":
-            kept: list[str] = blaze_cli.kept_passes(str(tests))
+            # Plain `blaze test` runs every test: v2 keeps no pass without `--reached` and writes
+            # no `tests.ndjson` (docs/cargo.md, "Which tests run").
+            kept: list[str] = []
             mine = blaze_cli.test_results(Tested(ours.returncode, ours.stdout, kept))
         elif step.command == "run":
             mine = blaze_cli.program_output(ours)
@@ -452,11 +452,11 @@ def unfinished(label: str, doing: str, e: Exception) -> Found:
     return Found(f"{label}: {doing}", "error", f"{type(e).__name__}: {e}")
 
 
-def run_steps(eng: engine.Engine, program: Program, ws: Path, root: Path, home: Path, store: Path,
+def run_steps(eng: engine.Engine, program: Program, ws: Path, root: Path, home: Path,
               label: str) -> tuple[list[Found], dict[str, Outcome]]:
     """Every step of `program` through `eng` with its daemon at `home`, until a build step
     that does not pass: their outcomes named `label: <step>`, and what each gave by step."""
-    ours_env = eng.env(home, store, extra=program.env)
+    ours_env = eng.env(home, extra=program.env)
     found: list[Found] = []
     ran: dict[str, Outcome] = {}
     doing = ""
@@ -479,7 +479,7 @@ def run_steps(eng: engine.Engine, program: Program, ws: Path, root: Path, home: 
     return found, ran
 
 
-def run_program(engines: list[tuple[Forced | None, engine.Engine]], program: Program, root: Path, store: Path,
+def run_program(engines: list[tuple[Forced | None, engine.Engine]], program: Program, root: Path,
                 keep: bool) -> tuple[list[Found], str]:
     """Every outcome of `program`, built in `root` once per engine of `engines` (one per
     backend, or one with None), and the sha256 of the `Cargo.lock` every run built with (""
@@ -501,13 +501,12 @@ def run_program(engines: list[tuple[Forced | None, engine.Engine]], program: Pro
         lock = hashlib.sha256((ws / "Cargo.lock").read_bytes()).hexdigest()
         doing = "running it"
         runs: list[tuple[Forced, dict[str, Outcome]]] = []
-        for at, (backend, eng) in enumerate(engines):
-            if at:
-                # Each backend's run starts from no output of the one before it.
-                shutil.rmtree(ws / "target", ignore_errors=True)
+        for backend, eng in engines:
+            # Each backend's run starts from no output of the one before it: its home is its
+            # own, and the store and the build directory are in the home (engine.layout).
             home = root / ("h" if backend is None else f"h-{backend}")
             label = program.name if backend is None else f"{program.name} [{backend}]"
-            done, ran = run_steps(eng, program, ws, root, home, store, label)
+            done, ran = run_steps(eng, program, ws, root, home, label)
             found += done
             if backend is not None:
                 runs.append((backend, ran))
@@ -551,12 +550,18 @@ def programs_of(args: Input, corpus: Corpus, cache: Path) -> list[Program]:
     return chosen
 
 
-def engines_of(args: Input) -> list[tuple[Forced | None, engine.Engine]]:
-    """The engine of each run of a project: one per backend of `backends`, its dev tier forced
-    to it, or the input's engine alone."""
+def specs_of(args: Input) -> list[tuple[Forced | None, engine.EngineSpec]]:
+    """The engine of each run of a project, as its spec: one per backend of `backends`, its dev
+    tier forced to it, or the input's engine alone."""
     if not args.backends:
-        return [(None, engine.Engine.of(args.engine))]
-    return [(b, engine.Engine.of(dataclasses.replace(args.engine, dev_backend=b))) for b in args.backends]
+        return [(None, args.engine)]
+    return [(b, dataclasses.replace(args.engine, dev_backend=b)) for b in args.backends]
+
+
+def engines_of(args: Input) -> list[tuple[Forced | None, engine.Engine]]:
+    """`specs_of`, each made an engine (`engine.Engine.of`, which holds the binary to what the
+    harness assumes of it)."""
+    return [(backend, engine.Engine.of(spec)) for backend, spec in specs_of(args)]
 
 
 def main(args: Input) -> None:
@@ -581,11 +586,10 @@ def main(args: Input) -> None:
     rep.extra.update(work=str(work), programs=[p.name for p in programs], toolchain=engine.TOOLCHAIN,
                      backends=list(args.backends))
     print(f"work: {work}", flush=True)
-    store = work / "store"
     locks: dict[str, str] = {}
     began, wall = os.times(), time.monotonic()
     with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
-        submitted = {i: pool.submit(run_program, engines, programs[i], work / programs[i].dir, store, args.keep)
+        submitted = {i: pool.submit(run_program, engines, programs[i], work / programs[i].dir, args.keep)
                      for i in largest_first(programs)}
         running = {submitted[i]: p.name for i, p in enumerate(programs)}
         # In the order of the projects, not the order they end in: one report for one input.
@@ -596,8 +600,6 @@ def main(args: Input) -> None:
                 rep.add(found.name, found.verdict, found.detail, **found.numbers)
     rep.extra["locks"] = dict(sorted(locks.items()))
     rep.extra.update(overhead(began, os.times(), time.monotonic() - wall))
-    if not args.keep:
-        shutil.rmtree(store, ignore_errors=True)
     rep.finish()
 
 
@@ -762,8 +764,9 @@ def test_dev_backend() -> None:
         assert "LLVM" in refused(lambda: engine.Engine.of(dataclasses.replace(v2, backend="llvm")))
         both = Input(engine.EngineSpec("v2", sys.executable), "", backends=("stencil", "cranelift"))
         assert "codegen-backend" in refused(lambda: engines_of(both))
-    assert [e.spec for _, e in engines_of(Input(engine.EngineSpec("v2", sys.executable), ""))] == [
-        engine.EngineSpec("v2", sys.executable)]
+    assert specs_of(Input(engine.EngineSpec("v2", sys.executable), "")) == [(None, engine.EngineSpec("v2", sys.executable))]
+    # The interpreter is no blaze: the preflight refuses it before any build, naming what it asked.
+    assert "preflight" in refused(lambda: engines_of(Input(engine.EngineSpec("v2", sys.executable), "")))
     forced = engine.dev_backend_args
     assert forced("default", "build", ("-p", "x")) == ("-p", "x")
     assert forced("stencil", "check", ("-p", "x")) == ("-p", "x")

@@ -240,7 +240,8 @@ class Build:
 
     @property
     def program(self) -> Path:
-        return self.ws / "target" / "release" / (PACKAGE + engine.EXE)
+        # In the build directory under the daemon's home: blaze writes no `target` into the checkout.
+        return self.eng.build_dir(self.ws, self.env) / "release" / (PACKAGE + engine.EXE)
 
 
 def manifest() -> str:

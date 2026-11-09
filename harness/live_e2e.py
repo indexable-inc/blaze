@@ -48,6 +48,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import storelib
+
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 BUILD_TIMEOUT = 900
@@ -223,7 +225,7 @@ async def stop_daemon(blaze: str, home: Path, env: dict[str, str]) -> None:
         return
     except StepError as error:
         print(f"warning: {error}", file=sys.stderr)
-    lock = home / "v2" / "serve.lock"
+    lock = Path(storelib.layout(str(home)).lock)
     try:
         pid = int(lock.read_text().split()[0])
     except (OSError, ValueError, IndexError) as error:

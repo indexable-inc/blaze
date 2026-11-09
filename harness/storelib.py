@@ -99,12 +99,63 @@ def printed(executable: str) -> str:
     return ran.stdout + (f"[exit {ran.returncode}]" if ran.returncode else "")
 
 
+@dataclass(frozen=True)
+class Layout:
+    """Where the daemon of one home keeps everything, by the daemon's own rule. `home` is
+    blaze's root, which `BLAZE_HOME` names; no setting moves any of the rest out of it:
+
+        socket   <home>/v2.sock          blaze_api::client::socket (crates/blaze-api/src/client.rs)
+        state    <home>/v2               blaze_manifest::home::state (crates/blaze-manifest/src/home.rs)
+        store    <home>/v2/store         the daemon's `Store::open` of `under(&state, "store")`
+                                         (crates/blaze-cargo/src/serve/daemon.rs)
+        lock     <home>/v2/serve.lock    crates/blaze-cargo/src/serve.rs, `hold`
+        log      <home>/v2/serve.log     crates/blaze-cargo/src/cli/daemon.rs
+        profile  <home>/v2/profile       the profile history (crates/blaze-cargo/src/serve.rs)
+        builds   <home>/build            blaze_manifest::home::builds: a workspace's build directory
+                                         is `<builds>/<name>-<32 hex>` unless `--target-dir`,
+                                         `CARGO_TARGET_DIR` or `build.target-dir` names one
+        sources  <home>/sources          blaze_manifest::home::sources: the packages it fetches
+
+    So one home is one daemon and one store: a store elsewhere is not read (`BLAZE_CACHE` is
+    v1's and no v2 crate reads it), a build from nothing is a build in an empty home, and a
+    store shared or seeded across homes is copied to the new home's `store` before its daemon
+    starts. `blaze status --json` says `home`, `state` and `socket`, which
+    harness/v2/engine.py's preflight holds this table to."""
+
+    home: str
+    socket: str
+    state: str
+    store: str
+    lock: str
+    log: str
+    profile: str
+    builds: str
+    sources: str
+
+
+def layout(home: str) -> Layout:
+    """The one place the harnesses lay out a daemon's home (`Layout`): every script asks here
+    and none joins these paths itself."""
+    state = os.path.join(home, "v2")
+    return Layout(
+        home=home,
+        socket=os.path.join(home, "v2.sock"),
+        state=state,
+        store=os.path.join(state, "store"),
+        lock=os.path.join(state, "serve.lock"),
+        log=os.path.join(state, "serve.log"),
+        profile=os.path.join(state, "profile"),
+        builds=os.path.join(home, "build"),
+        sources=os.path.join(home, "sources"),
+    )
+
+
 def state_of(home: str) -> str:
-    return os.path.join(home, "v2")
+    return layout(home).state
 
 
 def store_of(home: str) -> str:
-    return os.path.join(home, "v2", "store")
+    return layout(home).store
 
 
 def kind(name: str) -> str:
@@ -184,7 +235,7 @@ def daemon_pid(home: str) -> int | None:
     answers; the lock names one that is busy, stopping or wedged too, so this is the one reader
     of the daemon's pid."""
     try:
-        with open(os.path.join(state_of(home), "serve.lock")) as lock:
+        with open(layout(home).lock) as lock:
             words = lock.read().split()
     except FileNotFoundError:
         return None
@@ -514,7 +565,7 @@ class Daemon:
     def stray(self) -> bool:
         """Whether a `blaze build` found no daemon and started one of its own; that one is
         stopped and its log moved aside, so no other daemon is on the store."""
-        log = os.path.join(state_of(self.home), "serve.log")
+        log = layout(self.home).log
         if not os.path.exists(log):
             return False
         subprocess.run(

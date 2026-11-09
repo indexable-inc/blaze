@@ -10,7 +10,7 @@ The input is one JSON object (inline, a file's path, or `-`):
 
     engine        the blaze measured (engine.EngineSpec)
     out           the result's path (report.py's JSON)
-    work          where the checkout, its home, store and target directories go; a new
+    work          where the checkout and its daemon's home (store and build directory) go; a new
                   directory under /tmp when empty
     projects      the projects of bench.PROJECTS built, at their pinned revisions (ripgrep, just;
                   name more to build more)
@@ -23,7 +23,7 @@ The input is one JSON object (inline, a file's path, or `-`):
     keep          keep the work directory (false)
 
 For each project and profile: two cold builds of the same source at the same path, each with an
-empty home, store and target directory and its own daemon, the first pinned to the first
+empty home (so an empty store and build directory) and its own daemon, the first pinned to the first
 `cores_a` of the cores this script may run on and the second to the first `cores_b`; then
 `engine.outputs` of both (every program and library a build delivers, by its BLAKE3 digest). One
 outcome per (project, profile): pass when both builds delivered the same files with the same
@@ -113,14 +113,16 @@ class Failure(Exception):
 
 
 def pinned_build(eng: engine.Engine, subject: Subject, top: Path, profile: Profile, cores: set[int]) -> tuple[Path, float]:
-    """A cold build of `subject` at `top/src`, with an empty home, store and target directory and a
-    daemon of its own, every process of it on `cores`; the target directory and the seconds."""
-    tree, home, store = top / "src", top / "home", top / "store"
-    for path in (tree, home, store):
+    """A cold build of `subject` at `top/src`, with an empty home (so an empty store and build
+    directory: engine.layout) and a daemon of its own, every process of it on `cores`; its build
+    directory (under the home, at the same path each time, as the source's path is the same)
+    and the seconds."""
+    tree, home = top / "src", top / "home"
+    for path in (tree, home):
         shutil.rmtree(path, ignore_errors=True)
     shutil.copytree(subject.source, tree, symlinks=True, ignore=budgets.left_out)
     ws = tree / subject.sub if subject.sub else tree
-    env = eng.env(home, store, None, subject.env)
+    env = eng.env(home, None, subject.env)
     if subject.path_front is not None:
         env["PATH"] = f"{subject.path_front}{os.pathsep}{env['PATH']}"
     args = [*subject.build, *(["--release"] if profile == "release" else [])]
@@ -142,7 +144,7 @@ def pinned_build(eng: engine.Engine, subject: Subject, top: Path, profile: Profi
         raise Failure(f"{step}: `blaze build` exited {ran.returncode}:\n{ran.said()}")
     if (who := eng.not_blazes(ran)) is not None:
         raise Failure(f"{step}: built by {who}, not blaze")
-    return ws / "target", took
+    return eng.build_dir(ws, env), took
 
 
 def compare(eng: engine.Engine, rep: report.Report, subject: Subject, top: Path, profile: Profile,
@@ -162,7 +164,7 @@ def compare(eng: engine.Engine, rep: report.Report, subject: Subject, top: Path,
     numbers: dict[str, report.Number] = dict(files=len(a), cores_a=len(cores_a), cores_b=len(cores_b),
                                              seconds_a=round(took_a, 1), seconds_b=round(took_b, 1))
     if not a and not b:
-        raise engine.Failed(f"{name}: neither build delivered a file under target/{sub}")
+        raise engine.Failed(f"{name}: neither build delivered a file under its build directory's {sub}")
     found = differences(a, b)
     if not found:
         rep.add(name, "pass", f"{len(a)} files the same on {len(cores_a)} and {len(cores_b)} cores", **numbers)

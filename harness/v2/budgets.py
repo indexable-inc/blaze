@@ -2,19 +2,27 @@
 code speed against rustc's, each an outcome with the number measured, the budget, today's figure from the
 table, and pass or fail.
 
-    uv run --frozen python harness/v2/budgets.py '{"engine": {"kind": "v1", "blaze": "target/release/blaze"}, "out": "/tmp/budgets.json"}'
+    uv run --frozen python harness/v2/budgets.py '{"engine": {"kind": "v2", "blaze": "target/release/blaze"}, "out": "/tmp/budgets.json"}'
     uv run --frozen python harness/v2/budgets.py '{"engine": {...}, "out": "...", "budgets": ["body", "noop"], "runs": 3}'
+    uv run --frozen python harness/v2/budgets.py '{"command": "smoke", "engine": {"kind": "v2", "blaze": "target/release/blaze"}}'
     uv run --frozen python harness/v2/budgets.py selftest
 
 The input is one JSON object (inline, a file's path, or `-`):
 
+    command         `run` (the budgets, the default) or `smoke` (below)
     engine          the blaze measured (engine.EngineSpec)
-    out             the result's path (report.py's JSON)
-    work            where checkouts, homes, stores and target directories go; a new directory
-                    under /tmp when empty (a daemon's socket is under its home, and its path
-                    has to be short)
-    projects        whose rows run, of nushell, ripgrep, ruff and blaze (this checkout); all
-    budgets         which budgets run (the names below); all
+    out             the result's path (report.py's JSON); `run` needs one
+    work            where checkouts and each one's daemon home go; a new directory under /tmp
+                    when empty (a daemon's socket is in its home, and its path has to be
+                    short). Everything a daemon keeps is under its home (engine.layout): there
+                    is no store directory to name
+    projects        whose rows run, of nushell, ripgrep, ruff and blaze (this checkout); empty
+                    for every project the budgets asked for have a row for
+    budgets         which budgets run (the names below); empty for every budget the projects
+                    asked for have a row for. Nothing asked for is dropped: a budget named here
+                    with no row for any project named in `projects`, or a project named there
+                    with no row for any budget named here, stops the run before any build,
+                    naming it and whose rows it has (`select`). `bounds` is no project's
     runs            the fewest times an edit, a no-op build, a warm start, a restart or a bound's
                     program is timed: the median is the number, with its 95% interval from 6
                     runs on (10, hyperfine's least). Runs go on until the interval is at most
@@ -69,8 +77,9 @@ their pinned revisions, except blaze, which is the files of this checkout as the
                    0.8, and its wall time at most `critical_slack` times its critical path
                    (engine.critical_path_s; unmeasured on v1)
     ci             blaze, warm after the cold build and one `blaze test`: `self_edit`, then
-                   `blaze build` and `blaze test` with BLAZE_TESTS=affected: under 120 s, every
-                   test it runs passing
+                   `blaze build` and `blaze test --reached` (only the tests the edit can have
+                   changed run; docs/cargo.md, "Which tests run"): under 120 s, every test
+                   passing
     restart        blaze (the corpus's biggest workspace), warm after its cold build: the daemon
                    stopped cleanly (`blaze stop`), or its process group sent SIGKILL, then the
                    time from a `blaze check` with nothing changed to its result: at most the
@@ -97,19 +106,35 @@ itself is not counted here): `instructions` and `cycles` are their medians, `ins
 every sample, and where they cannot be counted `counts_gap` says why. warm-start's daemon is new
 each run, so it is not counted.
 
-Each project's checkout has a blaze home and store of its own and a cargo target directory
-outside the checkout (engine.reference_env). A build blaze did not serve (`Engine.not_blazes`)
+Each project's checkout has a daemon home of its own, which holds its store and its build
+directory (engine.layout; blaze writes no `target` into the checkout), and a cargo target
+directory outside the checkout (engine.reference_env). A build blaze did not serve (`Engine.not_blazes`)
 or that fails is a fail. The program after the first of every edit's runs, and after a warm
-start, has to print what blaze's own build of the same source from nothing prints (a home, a
-store and a `target-scratch` of its own, removed after it; blaze_cli.program_output): a fast
+start, has to print what blaze's own build of the same source from nothing prints (a home
+and a target directory of its own beside the checkout, removed after it;
+blaze_cli.program_output, each build directory's path read as the same): a fast
 wrong build passes nothing. cargo is the baseline of the speed and memory rows alone, and in
 `dev-speed` and `release-speed` blaze's program has to exit 0. Every edit is varied from run to run (bench.py's statement and
 parameter with another value, blank lines and indentation by more, comments with another text,
-another name), so no run is a store's hit for the one before it. `selftest` checks the parts that
-need neither blaze nor cargo nor the network: edit generation, budget evaluation, /proc/stat.
+another name), so no run is a store's hit for the one before it.
+
+`smoke` is what keeps this script able to run against the blaze of the tree: the merge gate
+runs it with the blaze the change built (blaze-platform.yaml, `profile-gate`). After the
+engine's preflight (engine.V2.preflight) it writes fixture.py's workspace (three small crates),
+builds it cold in a new home, and measures one no-op build and one body edit through the code
+the budgets run (`Lane.noop`, `Lane.timed_edit`, with the edited program checked against a build
+from nothing in a home of its own), once each and against no budget. It exits 0 only when both
+gave a number and the daemon's lock and store are where engine.layout says; it needs no cargo
+and no network but blaze's own toolchain, and takes about a minute.
+
+`selftest` checks the parts that need neither blaze nor cargo nor the network: edit generation,
+budget evaluation, /proc/stat, which rows an input selects, the daemon home's layout against the
+daemon's rule, and that the smoke's edit applies to the fixture.
 """
 
 import bisect
+import dataclasses
+import json
 import math
 import os
 import re
@@ -134,6 +159,7 @@ import bench
 import bounds
 import blaze_cli
 import counters
+import fixture
 import memory
 import storelib
 
@@ -142,8 +168,12 @@ Budget = Literal[
     "body", "signature", "format", "comment", "rename", "move", "memory", "warm-start", "noop", "dev-speed",
     "release-speed", "big-crate", "cold-blaze", "ci", "restart", "layout", "cache-misses", "bounds",
 ]
-type Restart = Literal["clean", "kill9"]
+# Not a `type` alias: `get_args` of one is empty, and `own` runs a restart row for each of these.
+Restart = Literal["clean", "kill9"]
 Project = Literal["nushell", "ripgrep", "ruff", "blaze"]
+# A row is a project's, or the smoke's, which is of fixture.py's workspace.
+type Where = Project | Literal["fixture"]
+type Command = Literal["run", "smoke"]
 type Change = tuple[str, str | None, str]
 COLD_BLAZE_SECS = 4 * 3600
 RUN_SECS = 600
@@ -158,8 +188,6 @@ library: Callable[[], str] = getattr(bench, "library")
 fetch: Callable[[str, dict[str, Any]], str] = getattr(blaze_cli, "fetch")
 program_output: Callable[[object], tuple[int, str, str]] = getattr(blaze_cli, "program_output")
 difference: Callable[[object, object], str | None] = getattr(blaze_cli, "difference")
-test_results: Callable[[object], tuple[int, dict[tuple[str, str], int], tuple[int, ...]]] = getattr(
-    blaze_cli, "test_results")
 memory_run: Callable[..., tuple[float, subprocess.CompletedProcess[str], dict[str, int | None]]] = getattr(
     memory, "run")
 
@@ -189,10 +217,11 @@ class SelfEdit:
 @dataclass(frozen=True)
 class Input:
     engine: engine.EngineSpec
-    out: str
+    out: str = ""
+    command: Command = "run"
     work: str = ""
-    projects: tuple[Project, ...] = get_args(Project)
-    budgets: tuple[Budget, ...] = get_args(Budget)
+    projects: tuple[Project, ...] = ()
+    budgets: tuple[Budget, ...] = ()
     runs: int = 10
     most_runs: int = 60
     runtime_runs: int = 10
@@ -213,7 +242,7 @@ class Row:
 
     key: str
     budget: Budget
-    project: Project
+    project: Where
     name: str
     limit: float
     at_most: bool
@@ -274,6 +303,40 @@ ROWS = (
     Row("cache-misses", "cache-misses", "nushell", "cache misses over a body edit's build (nushell, `perf stat -a`)",
         math.inf, True, "misses", "not measured before"),
 )
+# The smoke's two rows: measured once and held to no budget, so each passes when it gave a number.
+SMOKE_ROWS = (
+    Row("noop", "noop", "fixture", "smoke: no-op build (fixture.py's workspace)", math.inf, True, "ms",
+        "no budget: the smoke asks only for a number"),
+    Row("body", "body", "fixture", "smoke: body edit, edit to result (fixture.py's workspace)", math.inf, True, "ms",
+        "no budget: the smoke asks only for a number"),
+)
+# The smoke's body edit, as bench.py writes one: a statement after the line that opens a function.
+SMOKE_FILE, SMOKE_OPENING = "base/src/a.rs", "pub fn alpha() -> u32 {"
+SMOKE_PROGRAM = "oracle_app"
+
+
+def select(projects: Sequence[Project], budgets: Sequence[Budget]) -> list[Row]:
+    """The rows an input asks for: those of `budgets` on `projects`, each empty for all. What
+    was named and has no row is a ValueError naming it and where its rows are, never dropped:
+    a budget named with no row on any project named, a project named with no row of any budget
+    named. `bounds` has no row here (its rows are docs/v2/plan/bounds.md's, measured beside
+    `blaze` on no project), so it needs none and gives a project none."""
+    chosen = [row for row in ROWS if row.budget in (budgets or get_args(Budget))
+              and row.project in (projects or get_args(Project))]
+    wrong: list[str] = []
+    for budget in dict.fromkeys(budgets):
+        if budget != "bounds" and not any(row.budget == budget for row in chosen):
+            its = ", ".join(dict.fromkeys(row.project for row in ROWS if row.budget == budget))
+            wrong.append(f"the budget {budget!r} has no row for {', '.join(projects)}: its rows are {its}'s")
+    for project in dict.fromkeys(projects):
+        if not any(row.project == project for row in chosen):
+            its = ", ".join(dict.fromkeys(row.budget for row in ROWS if row.project == project))
+            wrong.append(f"the project {project!r} has no row for {', '.join(budgets)}: its budgets are {its}")
+    if wrong:
+        raise ValueError("; ".join(wrong))
+    return chosen
+
+
 # Section 17's sizes: what `Engine.tables` names each table, and the row it is judged by.
 TABLES = {row.key: row.key.removeprefix("layout-") for row in ROWS if row.budget == "layout"}
 
@@ -782,6 +845,13 @@ def harness_floor_ms(cwd: Path, env: dict[str, str]) -> float:
     return statistics.median(engine.run("the harness's floor", [true], cwd, env).seconds for _ in range(FLOOR_RUNS)) * 1000
 
 
+def placed(said: tuple[int, str, str], build_dir: Path) -> tuple[int, str, str]:
+    """What a program said (blaze_cli.program_output), with the build directory it is in named
+    `<build>`: two builds of one source into two directories then say the same."""
+    status, out, err = said
+    return status, out.replace(str(build_dir), "<build>"), err.replace(str(build_dir), "<build>")
+
+
 def served(eng: engine.Engine, step: str, ran: engine.Ran) -> engine.Ran:
     """`ran`, when it ended well and blaze served it; else a Wrong saying what happened."""
     if ran.returncode != 0:
@@ -829,18 +899,21 @@ type Revert = Callable[[int], None]
 
 
 class Lane:
-    """One project of bench.PROJECTS checked out under `work`, with a blaze home and store and a
-    cargo target directory of its own outside the checkout."""
+    """One project checked out under `work` (bench.PROJECTS' `name`, or what `source` writes:
+    its bench.py spec and its workspace), with a daemon home of its own, which holds its store
+    and its build directory (engine.layout), and a cargo target directory of its own outside the
+    checkout."""
 
-    def __init__(self, eng: engine.Engine, args: Input, work: Path, name: str):
+    def __init__(self, eng: engine.Engine, args: Input, work: Path, name: str,
+                 source: Callable[[Path], tuple[dict[str, Any], Path]] | None = None):
         self.eng, self.args, self.name = eng, args, name
         self.top = work / name
         shutil.rmtree(self.top, ignore_errors=True)
         self.top.mkdir(parents=True)
-        self.spec, self.ws = checkout(name, self.top / "src")
+        self.spec, self.ws = checkout(name, self.top / "src") if source is None else source(self.top / "src")
         extra = project_env(self.spec)
         self.home = self.top / "home"
-        self.env = eng.env(self.home, self.top / "store", None, extra)
+        self.env = eng.env(self.home, None, extra)
         self.ref = self.top / "cargo-target"
         self.cargo_env = engine.reference_env(self.ref, extra)
         self.build_args: list[str] = list(self.spec.get("build") or [])
@@ -907,16 +980,17 @@ class Lane:
 
     def wrong(self, step: str) -> str | None:
         """None when the program the warm daemon built prints what blaze's build of the same
-        source from nothing prints: a home, a store and a target directory of its own, made for
-        it and removed after it."""
+        source from nothing prints: a home (so a store) and a target directory of its own, made
+        for it and removed after it."""
         if self.run_args is None:
             return None
         argv = [*self.build_args, "--", *self.run_args]
         mine = self.eng.build(f"{self.name}: {step}: blaze run", self.ws, self.env, argv, "run")
-        home, store, target = self.top / "scratch-home", self.top / "scratch-store", self.ws / "target-scratch"
-        for path in (home, store, target):
+        # Outside the checkout, as the warm build's directory is: the warm daemon watches the checkout.
+        home, target = self.top / "scratch-home", self.top / "scratch-target"
+        for path in (home, target):
             shutil.rmtree(path, ignore_errors=True)
-        env = self.eng.env(home, store, target, project_env(self.spec))
+        env = self.eng.env(home, target, project_env(self.spec))
         try:
             fresh = self.eng.build(f"{self.name}: {step}: blaze run from nothing", self.ws, env, argv, "run")
             served(self.eng, f"{self.name}: {step}: from nothing", fresh)
@@ -924,9 +998,11 @@ class Lane:
             try:
                 self.eng.stop(self.ws, env)
             finally:
-                for path in (home, store, target):
+                for path in (home, target):
                     shutil.rmtree(path, ignore_errors=True)
-        ours, scratch = program_output(mine), program_output(fresh)
+        # The two programs are in two build directories, which one that prints its own path names.
+        ours = placed(program_output(mine), self.eng.build_dir(self.ws, self.env))
+        scratch = placed(program_output(fresh), target)
         if ours == scratch:
             return None
         return (f"{self.name}: {step}: the warm program says something else than blaze's build of it from "
@@ -1030,7 +1106,9 @@ class Lane:
         if profile == "release":
             self.build("the release build", False, [*self.build_args, "--release"])
             self.cargo("cargo build --release", ["build", "--release", *self.build_args])
-        programs = {"blaze": self.ws / "target" / profile / program, "cargo": self.ref / profile / program}
+        # blaze's program is in the build directory under its daemon's home, not in the checkout.
+        programs = {"blaze": self.eng.build_dir(self.ws, self.env) / profile / program,
+                    "cargo": self.ref / profile / program}
         env = engine.scrubbed()
         times: dict[str, list[float]] = {label: [] for label in programs}
         said: dict[str, tuple[int, str]] = {}
@@ -1216,7 +1294,7 @@ def own(eng: engine.Engine, rep: report.Report, args: Input, work: Path, rows: d
     try:
         shutil.rmtree(top, ignore_errors=True)
         copy_checkout(engine.ROOT, ws)
-        env = eng.env(home, top / "store")
+        env = eng.env(home)
     except SETUP_ERRORS as e:
         setup_failed(rep, rows.values(), e)
         return
@@ -1260,19 +1338,36 @@ def own(eng: engine.Engine, rep: report.Report, args: Input, work: Path, rows: d
             rep.add("blaze: stopping the daemon", "error", str(e))
 
 
-def ci(eng: engine.Engine, args: Input, ws: Path, env: dict[str, str], limit_s: float) -> Measured:
-    tests = dict(env, BLAZE_TESTS="affected")
+def reached_args(self_test: Sequence[str]) -> list[str]:
+    """`blaze test`'s arguments for the CI budget: `self_test`, and before any `--` of it
+    `--reached` (the daemon runs only the tests the edit can have changed and reports a kept
+    pass as cached) with JSON messages, where each result is a `blaze-test-result` line
+    (docs/cargo.md, "Which tests run"). v1's `BLAZE_TESTS=affected` is gone with v1."""
+    at = self_test.index("--") if "--" in self_test else len(self_test)
+    return [*self_test[:at], "--reached", "--message-format=json", *self_test[at:]]
 
+
+def tests_run(step: str, ran: engine.Ran) -> int:
+    """How many tests a `blaze test --reached --message-format=json` ran (not kept from a pass
+    before), from its `blaze-test-result` lines; a Wrong when it exited other than 0 or a test
+    failed, an engine.Failed when a line cannot be read."""
+    try:
+        lines = storelib.test_results(ran.stdout)
+    except storelib.Failed as e:
+        raise engine.Failed(f"{step}: {e}") from None
+    failed = sorted(f"{line.binary}: {line.name}" for line in lines if line.outcome == "failed")
+    if ran.returncode != 0 or failed:
+        raise Wrong(f"{step}: `blaze test` exited {ran.returncode}; failed: {', '.join(failed[:20]) or 'none named'}\n"
+                    f"{ran.said()}")
+    return sum(line.cached is None and line.outcome in ("passed", "failed") for line in lines)
+
+
+def ci(eng: engine.Engine, args: Input, ws: Path, env: dict[str, str], limit_s: float) -> Measured:
     def test(step: str) -> int:
-        ran = eng.build(step, ws, tests, args.self_test, "test", timeout=COLD_BLAZE_SECS)
+        ran = eng.build(step, ws, env, reached_args(args.self_test), "test", timeout=COLD_BLAZE_SECS)
         if (who := eng.not_blazes(ran)) is not None:
             raise Wrong(f"{step}: run by {who}, not blaze")
-        status, outcomes, _ = test_results(ran)
-        failed = sorted(name for (name, outcome) in outcomes if outcome == "FAILED")
-        if status != 0 or failed:
-            raise Wrong(f"{step}: `blaze test` exited {status}; failed: {', '.join(failed[:20]) or 'none named'}\n"
-                        f"{ran.said()}")
-        return sum(n for (_, outcome), n in outcomes.items() if outcome == "ran")
+        return tests_run(step, ran)
 
     test("the first blaze test")
     edit = args.self_edit
@@ -1298,8 +1393,7 @@ def daemon_pid(home: Path) -> int:
     its pid for people only, with no machine format."""
     pid = storelib.daemon_pid(str(home))
     if pid is None:
-        raise engine.Failed(f"no daemon runs on {home}: {Path(storelib.state_of(str(home))) / 'serve.lock'} "
-                            "names none that runs")
+        raise engine.Failed(f"no daemon runs on {home}: {engine.layout(home).lock} names none that runs")
     return pid
 
 
@@ -1424,21 +1518,87 @@ def measure_bound(eng: engine.Engine, args: Input, found: bounds.Found) -> Measu
     return timed(values, b.unit, bound=b.bound, where=found.where)
 
 
+def smoke_source(into: Path) -> tuple[dict[str, Any], Path]:
+    """fixture.py's workspace in its default state written to `into`, and the bench.py spec the
+    smoke's lane reads: the body edit (`SMOKE_FILE`, `SMOKE_OPENING`), and its program built
+    and run by name."""
+    fixture.write_workspace(into)
+    spec = {"edits": {"body": [(SMOKE_FILE, SMOKE_OPENING, SMOKE_OPENING + LET)]},
+            "build": ["-p", SMOKE_PROGRAM], "run": []}
+    return spec, into
+
+
+def smoke(eng: engine.Engine, args: Input, rep: report.Report, work: Path) -> None:
+    """The smoke (the docstring's): one no-op build and one body edit of fixture.py's workspace
+    through `Lane`, each an outcome that passes only with a number, and the daemon's lock and
+    store found where engine.layout puts them."""
+    began = time.monotonic()
+    once = dataclasses.replace(args, runs=1, most_runs=1)
+    rows = {row.key: row for row in SMOKE_ROWS}
+    try:
+        lane = Lane(eng, once, work, "fixture", smoke_source)
+    except SETUP_ERRORS as e:
+        setup_failed(rep, rows.values(), e)
+        return
+    try:
+        try:
+            lane.build("the cold build", False)
+            eng.wait_ready(lane.ws, lane.env)
+            lane.count_daemon()
+        except SETUP_ERRORS as e:
+            setup_failed(rep, rows.values(), e)
+            return
+        judge(rep, rows["noop"], lambda: lane.noop(rows["noop"].limit))
+        judge(rep, rows["body"], lambda: lane.timed_edit("body edit", rows["body"].limit))
+        laid = engine.layout(lane.home)
+        missing = [f"{what} {path}" for what, path, there in (
+            ("lock", laid.lock, os.path.isfile(laid.lock)), ("store", laid.store, os.path.isdir(laid.store)),
+        ) if not there]
+        rep.add("smoke: the daemon's lock and store are where engine.layout says", "error" if missing else "pass",
+                f"after the builds, the home {lane.home} has no {' and no '.join(missing)}: the daemon keeps them "
+                "elsewhere than storelib.Layout says" if missing else f"{laid.lock}, {laid.store}")
+    finally:
+        lane.stop(rep)
+    for row in rows.values():
+        got = [o.numbers.get("measured") for o in rep.outcomes if o.name == row.name and o.verdict == "pass"]
+        if not (len(got) == 1 and isinstance(got[0], (int, float)) and math.isfinite(got[0])):
+            rep.add(f"{row.name}: a measured number", "error", f"the smoke measured no number for it: {got}")
+    rep.extra.update(seconds=round(time.monotonic() - began, 1))
+    print(f"smoke: {time.monotonic() - began:.1f} s", flush=True)
+
+
 def main(args: Input) -> None:
     if args.runs < 1 or args.runtime_runs < 1:
         fail(SCRIPT, f"runs and runtime_runs: at least 1, not {args.runs} and {args.runtime_runs}")
     if args.most_runs < args.runs:
         fail(SCRIPT, f"most_runs: at least runs ({args.runs}), not {args.most_runs}")
-    found_bounds = bounds.read_all(engine.ROOT) if "bounds" in args.budgets else []
+    if args.command == "smoke" and (args.projects or args.budgets):
+        fail(SCRIPT, "command `smoke`: it measures fixture.py's workspace alone and takes no `projects` or `budgets`")
+    if args.command == "run" and not args.out:
+        fail(SCRIPT, "out: command `run` writes its result there, and was given none")
+    try:
+        chosen = select(args.projects, args.budgets)
+    except ValueError as e:
+        fail(SCRIPT, f"projects and budgets: {e}")
+    measures_bounds = args.command == "run" and "bounds" in (args.budgets or get_args(Budget))
+    found_bounds = bounds.read_all(engine.ROOT) if measures_bounds else []
     try:
         eng = engine.Engine.of(args.engine)
     except engine.Failed as e:
         fail(SCRIPT, str(e))
     rep = report.Report(SCRIPT, args.engine, args.out)
-    work = Path(args.work or tempfile.mkdtemp(prefix="bz-budgets-", dir="/tmp")).resolve()
+    prefix = "bz-smoke-" if args.command == "smoke" else "bz-budgets-"
+    work = Path(args.work or tempfile.mkdtemp(prefix=prefix, dir="/tmp")).resolve()
     work.mkdir(parents=True, exist_ok=True)
     print(f"work: {work}", flush=True)
-    chosen = [row for row in ROWS if row.budget in args.budgets and row.project in args.projects]
+    if args.command == "smoke":
+        smoke(eng, args, rep, work)
+        if not args.keep:
+            shutil.rmtree(work / "fixture", ignore_errors=True)
+            if not args.work:
+                shutil.rmtree(work, ignore_errors=True)
+        rep.extra.update(work=str(work), blaze=getattr(eng, "version", ""))
+        rep.finish()
     for project in dict.fromkeys(row.project for row in chosen):
         rows = {row.key: row for row in chosen if row.project == project}
         print(f"{project}: {', '.join(rows)}", flush=True)
@@ -1492,6 +1652,158 @@ METHOD = "    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {"
 def expect(holds: bool, what: str) -> None:
     if not holds:
         raise SystemExit(f"{SCRIPT} selftest: {what}")
+
+
+def refused(what: str, fn: Callable[[], object], *kinds: type[BaseException]) -> str:
+    """What `fn()` is refused with (one of `kinds`); the selftest stops when it is not refused."""
+    try:
+        fn()
+    except kinds as e:
+        return str(e)
+    raise SystemExit(f"{SCRIPT} selftest: {what} is refused")
+
+
+def selftest_select() -> None:
+    """Which rows an input selects, and that nothing asked for is dropped."""
+    keys: Callable[[Sequence[Project], Sequence[Budget]], list[str]] = lambda projects, budgets: [
+        row.key for row in select(projects, budgets)]
+    expect(select((), ()) == list(ROWS), "no projects and no budgets named: every row")
+    expect(keys(("ripgrep",), ("noop", "memory")) == ["noop", "memory-ripgrep"], "ripgrep's no-op and memory rows")
+    expect(keys((), ("body",)) == ["body"] and keys((), ("memory",)) == ["memory-nushell", "memory-ripgrep", "memory-kloc"],
+           "a budget alone runs on every project that has a row for it")
+    expect({row.project for row in select(("ruff",), ())} == {"ruff"} and keys(("ruff",), ()) == ["big-crate"],
+           "a project alone runs every budget it has a row for")
+    # The run of 2026-11-09: seven budgets asked of ripgrep, which has rows for two of them.
+    asked: tuple[Budget, ...] = ("noop", "body", "comment", "format", "rename", "warm-start", "memory")
+    said = refused("budgets with no row for ripgrep", lambda: select(("ripgrep",), asked), ValueError)
+    for budget in ("body", "comment", "format", "rename", "warm-start"):
+        expect(f"the budget {budget!r} has no row for ripgrep: its rows are nushell's" in said, f"{budget} is named: {said}")
+    expect("'noop'" not in said and "'memory'" not in said, f"the budgets ripgrep has rows for are not named: {said}")
+    said = refused("a project with no row for the budgets", lambda: select(("ripgrep", "ruff"), ("noop",)), ValueError)
+    expect(said == "the project 'ruff' has no row for noop: its budgets are big-crate", said)
+    expect(select((), ("bounds",)) == [] and keys(("blaze",), ("bounds", "ci")) == ["ci"], "bounds needs no project's row")
+    refused("a project asked for bounds alone", lambda: select(("blaze",), ("bounds",)), ValueError)
+
+
+# The daemon's rule for where it keeps things (storelib.Layout, which names the code), as a
+# table: a home, then its socket, state, store, lock, log, profile history, build directories
+# and fetched sources.
+LAYOUTS = (
+    ("/tmp/bz-budgets-x/ripgrep/home", "/tmp/bz-budgets-x/ripgrep/home/v2.sock", "/tmp/bz-budgets-x/ripgrep/home/v2",
+     "/tmp/bz-budgets-x/ripgrep/home/v2/store", "/tmp/bz-budgets-x/ripgrep/home/v2/serve.lock",
+     "/tmp/bz-budgets-x/ripgrep/home/v2/serve.log", "/tmp/bz-budgets-x/ripgrep/home/v2/profile",
+     "/tmp/bz-budgets-x/ripgrep/home/build", "/tmp/bz-budgets-x/ripgrep/home/sources"),
+    ("/b", "/b/v2.sock", "/b/v2", "/b/v2/store", "/b/v2/serve.lock", "/b/v2/serve.log", "/b/v2/profile", "/b/build",
+     "/b/sources"),
+    ("/c/blaze", "/c/blaze/v2.sock", "/c/blaze/v2", "/c/blaze/v2/store", "/c/blaze/v2/serve.lock",
+     "/c/blaze/v2/serve.log", "/c/blaze/v2/profile", "/c/blaze/build", "/c/blaze/sources"),
+)
+
+
+def selftest_layout() -> None:
+    """engine.layout against the daemon's rule, the environment that names a home and nothing
+    else, a build's directory, a seeded store, and the preflight's reading of `blaze --help`."""
+    for home, *rest in LAYOUTS:
+        laid = engine.layout(Path(home))
+        got = (laid.socket, laid.state, laid.store, laid.lock, laid.log, laid.profile, laid.builds, laid.sources)
+        expect(laid.home == home and got == tuple(rest), f"the layout of the home {home}: {laid}")
+        expect(engine.store_of(Path(home)) == Path(laid.store) and storelib.store_of(home) == laid.store
+               and storelib.state_of(home) == laid.state, f"one layout, whoever asks: {home}")
+    eng = engine.V2(engine.EngineSpec("v2", sys.executable))
+    with tempfile.TemporaryDirectory() as tmp:
+        top = Path(tmp).resolve()
+        home, ws = top / "home", top / "my repo"
+        env = eng.env(home, None, {"X": "1"})
+        expect(env["BLAZE_HOME"] == str(home) and home.is_dir() and env["X"] == "1", "the environment names the home")
+        for name in ("BLAZE_CACHE", "CARGO_TARGET_DIR", "XDG_RUNTIME_DIR", "BLAZE_BACKEND"):
+            expect(name not in env, f"the environment sets no {name}: the daemon's home says where everything is")
+        named = eng.env(home, top / "t")
+        expect(named["CARGO_TARGET_DIR"] == str(top / "t") and eng.build_dir(ws, named) == top / "t",
+               "a target directory named is the build directory")
+        refused("a build directory before any build", lambda: eng.build_dir(ws, env), engine.Failed)
+        builds = Path(engine.layout(home).builds)
+        mine = builds / ("my_repo-" + "0123456789abcdef" * 2)
+        for made in (mine, builds / ("my_repo-other-" + "0" * 32), builds / "my_repo-0123", builds / ("x-" + "0" * 32)):
+            made.mkdir(parents=True)
+        expect(engine.build_dir_name(ws) == "my_repo-" and eng.build_dir(ws, env) == mine,
+               f"the default build directory of {ws} is the one named for it: {sorted(p.name for p in builds.iterdir())}")
+        (builds / ("my_repo-" + "f" * 32)).mkdir()
+        said = refused("two build directories for one name", lambda: eng.build_dir(ws, env), engine.Failed)
+        expect("2 directories" in said, said)
+        kept = top / "kept-store"
+        kept.mkdir()
+        (kept / "head").write_text("h")
+        engine.seed_store(kept, home)
+        expect((engine.store_of(home) / "head").read_text() == "h", "a seeded store is a copy at the home's store")
+        engine.seed_store(None, home)
+        expect(not engine.store_of(home).exists(), "seeded from no store, a home has none")
+        refused("a seed that is no directory", lambda: engine.seed_store(top / "none", home), engine.Failed)
+    helped = ("Commands:\n    build, b    Compile\n    tables --format=json   The size\n    debug sql QUERY   SQL\n"
+              "    stop        Make\n    tables-of X\n")
+    expect(all(engine.help_lists(helped, name) for name in ("build", "tables --format=json", "debug sql", "stop")),
+           "the commands `blaze --help` lists are found")
+    expect(not any(engine.help_lists(helped, name) for name in ("check", "tables --format=cbor", "debug live", "table", "trace --out PATH")),
+           "a command `blaze --help` does not list, or lists another way, is not found")
+    # The preflight against a binary that is no blaze: refused, naming what it assumed.
+    said = refused("a binary that is not blaze", eng.preflight, engine.Failed)
+    expect("preflight" in said and "--version" in said, said)
+    expect(placed((0, "at /h/build/src-0/debug/app\n", "/h/build/src-0"), Path("/h/build/src-0"))
+           == placed((0, "at /t/debug/app\n", "/t"), Path("/t")), "two build directories' programs say the same")
+    expect(reached_args(("-p", "x", "--", "--nocapture")) == ["-p", "x", "--reached", "--message-format=json", "--",
+                                                              "--nocapture"], "the CI budget's test arguments")
+    line = ('{"reason": "blaze-test-result", "name": "t::%s", "binary": "b", "executable": 0, "outcome": "%s", '
+            '"millis": 1, "outside": false, "output": "", "cached": %s}')
+    kept_pass = '{"basis": "executed", "why": null, "millis": 2, "outcome": "passed"}'
+    said_tests = "\n".join([line % ("a", "passed", "null"), line % ("b", "passed", kept_pass), line % ("c", "ignored", "null")])
+    ran = engine.Ran(("blaze", "test"), 1.0, 0, said_tests, "")
+    expect(tests_run("tests", ran) == 1, "of a run, a kept pass and an ignored test, one test ran")
+    failed = engine.Ran(("blaze", "test"), 1.0, 101, line % ("a", "failed", "null"), "")
+    expect("b: t::a" in refused("a failed test", lambda: tests_run("tests", failed), Wrong), "a failed test is named")
+
+
+def selftest_smoke() -> None:
+    """The smoke's input, and its edit on the workspace fixture.py writes: no blaze runs."""
+    spec = '{"command": "smoke", "engine": {"kind": "v2", "blaze": "blaze"}}'
+    given = parse(Input, spec, SCRIPT)
+    expect(given.command == "smoke" and given.out == "" and not given.projects and not given.budgets, f"the smoke's input: {given}")
+    refused("another command", lambda: parse(Input, spec.replace("smoke", "smokes"), SCRIPT), SystemExit)
+    expect([row.key for row in SMOKE_ROWS] == ["noop", "body"] and all(row.limit == math.inf for row in SMOKE_ROWS),
+           "the smoke's rows are a no-op build and a body edit, held to no budget")
+    with tempfile.TemporaryDirectory() as tmp:
+        made, ws = smoke_source(Path(tmp) / "src")
+        path = ws / SMOKE_FILE
+        before = read(path)
+        expect(before.count(SMOKE_OPENING) == 1 and (ws / "Cargo.toml").is_file(),
+               f"fixture.py's {SMOKE_FILE} opens the smoke's function once")
+        changes: list[Change] = made["edits"]["body"]
+        expect(write_edit(str(ws), varied(changes, 0), False) == 1 and read(path) != before, "the smoke's edit applies")
+        expect(write_edit(str(ws), varied(changes, 0), True) == 1 and read(path) == before, "and is taken back")
+        expect(f'name = "{SMOKE_PROGRAM}"' in read(ws / "app" / "Cargo.toml"), "the smoke's program is the fixture's")
+    once = dataclasses.replace(given, runs=1, most_runs=1)
+    expect(enough([3.0], math.inf, once) and not enough([], math.inf, once), "the smoke times each once")
+    got = timed([3.0], "ms")
+    expect(verdict(got.value, math.inf, True) == "pass" and got.interval is None, "one sample is a number, and passes no budget")
+
+
+def selftest_ledger() -> None:
+    """Every check of the objectives ledger (docs/v2/plan/objectives.json) that runs this script
+    gives it an input it takes and rows it has: a row naming a budget that is gone, or a pair
+    with no row, is found here and not when the ledger's runner gets to it."""
+    ledger = json.loads((engine.ROOT / "docs/v2/plan/objectives.json").read_text())
+    checks = [(row["id"], check) for row in ledger["rows"] for check in row["checks"]
+              if check["script"] == "harness/v2/budgets.py"]
+    expect(len(checks) > 0, "the ledger has rows this script checks")
+    for row_id, check in checks:
+        given = dict(check["input"] or {}, engine={"kind": "v2", "blaze": "blaze"}, out="o.json")
+        expect(not check["command"] and set(check["takes"]) == {"engine", "out"},
+               f"the ledger's {row_id}: this script takes one JSON value with `engine` and `out`, not {check}")
+        try:
+            it = parse(Input, json.dumps(given), SCRIPT)
+            chosen = select(it.projects, it.budgets)
+        except (SystemExit, ValueError) as e:
+            raise SystemExit(f"{SCRIPT} selftest: the ledger's {row_id} gives an input this script refuses: {e}") from None
+        expect(it.command == "run" and (bool(chosen) or "bounds" in it.budgets),
+               f"the ledger's {row_id} selects no row: {given}")
 
 
 def selftest() -> None:
@@ -1550,7 +1862,13 @@ def selftest() -> None:
            "nushell has a signature edit and ripgrep a runtime workload")
     expect(len({row.key for row in ROWS}) == len(ROWS) and len({row.name for row in ROWS}) == len(ROWS),
            "row keys and names are unique")
-    expect({row.budget for row in ROWS} == set(get_args(Budget)), "every budget has a row")
+    expect({row.budget for row in ROWS} == set(get_args(Budget)) - {"bounds"},
+           "every budget but bounds (whose rows are docs/v2/plan/bounds.md's) has a row")
+    expect({row.project for row in ROWS} == set(get_args(Project)), "every project has a row")
+    selftest_select()
+    selftest_layout()
+    selftest_smoke()
+    selftest_ledger()
     expect(verdict(30, 30, True) == "pass" and verdict(30.01, 30, True) == "fail", "at most")
     expect(verdict(0.8, 0.8, False) == "pass" and verdict(0.79, 0.8, False) == "fail", "at least")
     expect(describe(12.5, 30, True, "ms") == "12.5 ms against a budget of at most 30 ms", describe(12.5, 30, True, "ms"))
@@ -1588,7 +1906,7 @@ def selftest() -> None:
                                     "relocation"}, f"the tables of docs/v2/plan/design/data.md: {TABLES}")
     with tempfile.TemporaryDirectory() as tmp:
         home = Path(tmp)
-        lock = Path(storelib.state_of(tmp)) / "serve.lock"
+        lock = Path(engine.layout(home).lock)
         lock.parent.mkdir()
         lock.write_text(str(os.getpid()))
         expect(daemon_pid(home) == os.getpid(), "the daemon's pid from its lock")

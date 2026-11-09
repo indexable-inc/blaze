@@ -1048,7 +1048,6 @@ class Subject:
         work = runner.work
         self.ws, self.home = work / "ws" / f"e{index}", work / "h" / f"e{index}"
         self.scratch_ws, self.scratch_home = work / "ws" / f"s{index}", work / "h" / f"s{index}"
-        self.scratch_store = work / "ss" / f"s{index}"
         self.written: set[Path] = set()
         self.crate = self.program = ""
         flags = " ".join(cases.COMMON)
@@ -1078,7 +1077,7 @@ class Subject:
             raise engine.Failed(f"{target.name}: {self.file} already holds a scaffold ({BEGIN})")
         self.dir = module_dir(self.file, is_root(self.file))
         self.extra = {"RUSTFLAGS": flags}
-        self.env = runner.eng.env(self.home, runner.work / "store", extra=self.extra)
+        self.env = runner.eng.env(self.home, extra=self.extra)
 
     def files(self, text: str, files: dict[str, str]) -> dict[str, str]:
         return {self.file: text, **{f"{self.dir}/{name}": body for name, body in files.items()}}
@@ -1095,7 +1094,7 @@ class Subject:
         if said.keys or said.error is not None or said.who is not None or not self.runs:
             return Built(said), ran.stdout
         if self.target.case is not None:
-            exe = ws / "target" / "debug" / (self.member + engine.EXE)
+            exe = self.runner.eng.build_dir(ws, env) / "debug" / (self.member + engine.EXE)
             return Built(said, cases.run_program(exe, self.runner.work / "cwd", self.runner.run_env)), ran.stdout
         exe = executable_of(ran.stdout, self.target.program)
         if exe is None:
@@ -1108,9 +1107,8 @@ class Subject:
         with an empty home and the standard library's store alone."""
         copy_tree(self.ws, self.scratch_ws)
         shutil.rmtree(self.scratch_home, ignore_errors=True)
-        shutil.rmtree(self.scratch_store, ignore_errors=True)
-        shutil.copytree(self.runner.std_store, self.scratch_store, symlinks=True)
-        env = self.runner.eng.env(self.scratch_home, self.scratch_store, extra=self.extra)
+        engine.seed_store(self.runner.std_store, self.scratch_home)
+        env = self.runner.eng.env(self.scratch_home, extra=self.extra)
         try:
             built, _ = self.built(f"blaze {self.command} of {self.target.name} {label}, from nothing", self.scratch_ws, env)
             return built
@@ -1119,7 +1117,7 @@ class Subject:
                 self.runner.eng.stop(self.scratch_ws, env)
             except engine.Failed:
                 pass
-            for path in (self.scratch_ws, self.scratch_home, self.scratch_store):
+            for path in (self.scratch_ws, self.scratch_home):
                 shutil.rmtree(path, ignore_errors=True)
 
     def step(self, label: str, text: str, files: dict[str, str]) -> Stepped:
@@ -1485,7 +1483,7 @@ def main(args: Input) -> None:
     rep.extra.update(work=str(work), toolchain=engine.TOOLCHAIN, seed=args.seed, targets=len(targets),
                      scripts=len(plans), steps=dict(tally))
     if not args.keep:
-        for name in ("store", "h", "ss", "std-store"):
+        for name in ("h", "std-store"):
             shutil.rmtree(work / name, ignore_errors=True)
     rep.finish()
 

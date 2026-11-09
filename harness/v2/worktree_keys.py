@@ -784,7 +784,7 @@ async def measured(args: Input, rep: report.Report, eng: engine.Engine, work: Pa
     # place known, so a name written with one checkout's places reads as the other's.
     try:
         bare = Places.of({f"checkout {which}": at for which, at in ws.items()})
-        dirs = {which: build_dir_of(parsed(which, ws[which], it, bare), home / "build") for which, it in ran.items()}
+        dirs = {which: build_dir_of(parsed(which, ws[which], it, bare), Path(engine.layout(home).builds)) for which, it in ran.items()}
         places = Places.of({**{f"checkout {w}": at for w, at in ws.items()},
                             **{f"build dir {w}": at for w, at in dirs.items()}})
         built = {which: parsed(which, ws[which], it, places) for which, it in ran.items()}

@@ -325,6 +325,21 @@ jobs:
             '{blaze: $blaze, duckdb: $duckdb, history: $history, platform: $platform, runner: $runner, commit: $commit, out: $out}' \
             > "$RUNNER_TEMP/profile-gate.json"
           uv run --frozen --no-dev python harness/profile_gate.py "$RUNNER_TEMP/profile-gate.json"
+      # The budget harness still runs against the blaze this tree built (docs/harness.md, "The v2
+      # proof"): its preflight of the binary (version, commands, where a home's state, store and
+      # socket are), then fixture.py's three-crate workspace built in a new home, and one no-op
+      # build and one body edit measured through the code the budgets run. It holds no number to
+      # a budget; it fails when the harness and blaze no longer fit, at the change that parted them.
+      # The fixture has a build script, which runs in a sandbox of user namespaces.
+      - name: budgets.py smoke, with the blaze this tree built
+        timeout-minutes: 15
+        run: |
+          if [ "$RUNNER_OS" = Linux ] && [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
+            sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          jq -n --arg blaze "$RUNNER_TEMP/blaze/blaze" --arg out "$RUNNER_TEMP/budgets-smoke.json" \
+            '{command: "smoke", engine: {kind: "v2", blaze: $blaze}, out: $out}' > "$RUNNER_TEMP/budgets-smoke-input.json"
+          uv run --frozen --no-dev python harness/v2/budgets.py "$RUNNER_TEMP/budgets-smoke-input.json"
       - id: summary
         if: always()
         run: |

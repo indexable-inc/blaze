@@ -68,6 +68,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
 
+import storelib
 from typed_input import fail, parse
 
 SCRIPT = "incremental.py"
@@ -363,7 +364,7 @@ class Gate:
         )
 
     def serve_log(self) -> str:
-        path = self.home / "v2" / "serve.log"
+        path = Path(storelib.layout(str(self.home)).log)
         try:
             return path.read_text(errors="replace")
         except OSError as error:
