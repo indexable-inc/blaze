@@ -2924,6 +2924,8 @@ mod tests {
             base_pages_high_water: 0,
             thp: blaze_mem::huge::Thp::Unset,
             heap_outside: 1 << 30,
+            heap_outside_allocated: 0,
+            heap_outside_freed: 0,
             heap_by_tag: true,
             purged: 1 << 30,
             heap_committed: Some(7 << 30),
