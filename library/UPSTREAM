@@ -48,3 +48,7 @@ rust-src https://static.rust-lang.org/dist/2026-10-27/rust-src-nightly.tar.xz a9
 #   (std/Cargo.toml) and names it with `extern crate wasi_rt;` under the same cfg
 #   (std/src/lib.rs); Cargo.lock has its package and std's dependency on it. Every other
 #   target's std is unchanged.
+# - core/src/clone.rs: `#[lang = "blaze_handle"]` on nightly's `Share`, by which blaze's
+#   `#![blaze::handles]` finds the handles it copies where a crate would move one that it uses
+#   again (docs/v2/plan/design/edition.md, change 1). A lang item changes nothing a crate
+#   without the attribute builds.

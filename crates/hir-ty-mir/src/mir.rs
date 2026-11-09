@@ -23,6 +23,7 @@ mod ctfe_limit;
 pub mod dispatch;
 mod eval;
 mod framed;
+pub mod handles;
 pub mod home;
 pub mod location;
 mod lower;

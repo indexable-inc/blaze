@@ -47,6 +47,7 @@
 //!     coroutine: pin
 //!     global_allocator: allocator_api, derive
 //!     dispatch_from_dyn: unsize, pin
+//!     handle: clone
 //!     hash: sized
 //!     include:
 //!     include_bytes:
@@ -413,6 +414,12 @@ pub mod clone {
     #[rustc_builtin_macro]
     pub macro Clone($item:item) {}
     // endregion:derive
+
+    // region:handle
+    /// Nightly's `Share`, which `#![blaze::handles]` copies values of.
+    #[lang = "blaze_handle"]
+    pub trait Share: Clone {}
+    // endregion:handle
 }
 // endregion:clone
 

@@ -53,6 +53,8 @@ mod dropck_tests;
 #[cfg(test)]
 mod flow_tests;
 #[cfg(test)]
+mod handles_tests;
+#[cfg(test)]
 mod missing_body_tests;
 #[cfg(test)]
 mod rpitit_tests;
@@ -515,14 +517,18 @@ fn check_owner<'db>(
     let alpha = blaze_mem::frame::task(blaze_mem::Tag::Mir, |frame| {
         check_owner_once(db, owner, def, Mode::Polonius, root, frame)
     });
-    // A `#[blaze::linear]` error is the same in every mode, so only the borrow checker's own
-    // errors are a reason to check again.
+    // A `#[blaze::linear]` or `#[blaze::norefcount]` error is the same in every mode, so only
+    // the borrow checker's own errors are a reason to check again.
     if alpha.skipped.is_some()
         || alpha.not_checked.is_some()
         || !alpha
             .diagnostics
             .iter()
-            .any(|it| it.is_error() && it.code != hir_ty_linear::LinearDiagnostic::CODE)
+            .any(|it| {
+                it.is_error()
+                    && it.code != hir_ty_linear::LinearDiagnostic::CODE
+                    && it.code != hir_ty_mir::mir::handles::ImpliedCopy::CODE
+            })
     {
         return alpha;
     }
@@ -729,6 +735,29 @@ fn check_owner_once<'db>(
             drop_check: None,
         }
     }));
+    // `#[blaze::norefcount]` under `#![blaze::handles]`: each copy of a handle the built MIR
+    // makes where the function, or a closure or `async` block in it, moves one that is used
+    // again is an error at that move.
+    if let Some(DefWithBodyId::FunctionId(function)) = def
+        && hir_def::attrs::AttrFlags::query(db, function.into())
+            .contains(hir_def::attrs::AttrFlags::NOREFCOUNT)
+    {
+        let mut copies = Vec::new(); // alloc: empty unless a handle is copied (error path)
+        for &(body, _, _) in bodies.iter() {
+            hir_ty_mir::mir::handles::norefcount_errors(db, body, function, &mut copies);
+        }
+        result.diagnostics.extend(copies.into_iter().map(|it| BorrowckDiagnostic {
+            code: hir_ty_mir::mir::handles::ImpliedCopy::CODE,
+            span: it.span,
+            message: it.message,
+            at_signature: false,
+            labels: Vec::new(),      // alloc: empty
+            children: Vec::new(),    // alloc: empty
+            suggestions: Vec::new(), // alloc: empty
+            dropped_at_scope_end: None,
+            drop_check: None,
+        }));
+    }
     if debugging(db, owner) {
         if let Some(skipped) = &result.skipped {
             eprintln!("skipped {skipped}");
