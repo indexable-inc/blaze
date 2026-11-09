@@ -23,6 +23,7 @@ compared (a size apart, not a PFM). Python 3, stdlib only.
 """
 import json, struct, sys, typing
 from dataclasses import dataclass, fields
+from typing import NoReturn, cast
 
 
 @dataclass(frozen=True)
@@ -33,25 +34,26 @@ class Input:
     show: int = 10
 
 
-def refuse(what):
+def refuse(what: str) -> NoReturn:
     """An input or a frame that can't be compared: said, and exit 2, apart from a pixel past the bound's 1."""
     sys.stderr.write(f"pfmdiff.py: {what}\n")
     sys.exit(2)
 
 
-def typed(text):
+def typed(text: str) -> Input:
     """The Input from the JSON `text` (inline, a path, or `-`); exits naming the field that is wrong."""
     if text == "-":
         text = sys.stdin.read()
     elif text and not text.lstrip().startswith("{"):
         text = open(text).read()
     try:
-        value = json.loads(text or "{}")
+        value: object = json.loads(text or "{}")
     except json.JSONDecodeError as e:
         refuse(f"the input is not JSON: {e}")
     if not isinstance(value, dict):
         refuse("the input is a JSON object")
     known = {f.name for f in fields(Input)}
+    value = cast("dict[str, object]", value)
     if unknown := sorted(set(value) - known):
         refuse(f"no field {', '.join(unknown)} (fields: {', '.join(sorted(known))})")
     if missing := sorted({"before", "after"} - set(value)):
