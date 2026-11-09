@@ -4,75 +4,76 @@
 
 // ---- The theme: the one place a colour is chosen ----
 // Every surface names one of these roles, never a colour: a widget's `Fill: $tone_card`, Rust's `look::tone(w, "card")`
-// (hn.Theme, scene/widgets/theme.flecs, holds one child per role). The values are the blaze site's palette
-// (site/styles/tokens.css, the ix docs' .site ladder; https://ix.dev/blaze/learn/builds), dark from its :root and light
-// from its prefers-color-scheme: light block. Another look is another set of these values; nothing else changes. The
+// (hn.Theme, scene/widgets/theme.flecs, holds one child per role). Dark is JetBrains' Islands Dark (the IntelliJ New
+// UI's greys, one blue accent, colour only where it means something); light is the blaze site's paper
+// (site/styles/tokens.css) with the same blue. Another look is another set of these values; nothing else changes. The
 // scene test `no_raw_colours` (src/app.rs) fails on a colour literal anywhere but here and the palettes below.
 //
 // Grounds, darkest to most lifted:
-// - ground: the window and the main card under every pane (--bg, #101011 / #f2f1ee).
+// - ground: the window and the main card under every pane (#191A1C / #f2f1ee).
 // - sidebar: the sidebar. The same ground as the main card, divided from it by one `line` hairline (hn.Seam), as Linear
 //   and Notion do: one dark field, never a lighter slab beside it.
-// - card: a plate that sits on the ground: the composer, the palette's and the picker's cards, a generated Card (--bg-3).
-// - raised: what floats over everything: menus, popovers, hover cards, a user's bubble (dark --bg-4; light --bg-3, so a
+// - card: a plate that sits on the ground: the composer, the palette's and the picker's cards, a generated Card (#1E1F22).
+// - raised: what floats over everything: menus, popovers, hover cards, a user's bubble (dark #2B2D30; light --bg-3, so a
 //   popover lifts toward the light on the paper ground).
-// - well: what is sunk into a surface: a field, a code block, a rename field (--code-bg).
+// - well: what is sunk into a surface: a field, a code block, a rename field (#141517).
 // - term_ground: the terminal's own ground, under a terminal pane's grid only; the one role the user's Ghostty theme sets
-//   (src/app/ghostty.rs), since a terminal's colours are chosen against it. The built-in theme's is --bg in both.
-export const tone_ground: Fill = {dark: {0.063, 0.063, 0.067, 1}, light: {0.949, 0.945, 0.933, 1}}
+//   (src/app/ghostty.rs), since a terminal's colours are chosen against it. The built-in theme's is the dark ground in both.
+export const tone_ground: Fill = {dark: {0.098, 0.102, 0.11, 1}, light: {0.949, 0.945, 0.933, 1}}
 export const tone_sidebar: Fill = $tone_ground
-export const tone_card: Fill = {dark: {0.098, 0.098, 0.102, 1}, light: {0.965, 0.961, 0.949, 1}}
-export const tone_raised: Fill = {dark: {0.122, 0.122, 0.125, 1}, light: {0.965, 0.961, 0.949, 1}}
-export const tone_well: Fill = {dark: {0.075, 0.075, 0.078, 1}, light: {0.922, 0.918, 0.898, 1}}
-export mut tone_term_ground: Fill = {dark: {0.063, 0.063, 0.067, 1}, light: {0.063, 0.063, 0.067, 1}}
+export const tone_card: Fill = {dark: {0.118, 0.122, 0.133, 1}, light: {0.965, 0.961, 0.949, 1}}
+export const tone_raised: Fill = {dark: {0.169, 0.176, 0.188, 1}, light: {0.965, 0.961, 0.949, 1}}
+export const tone_well: Fill = {dark: {0.078, 0.082, 0.09, 1}, light: {0.922, 0.918, 0.898, 1}}
+export mut tone_term_ground: Fill = {dark: {0.098, 0.102, 0.11, 1}, light: {0.098, 0.102, 0.11, 1}}
 // Lines: a hairline (a card's edge, a rule, the sidebar's seam; --line) and the stronger one (a floating plate's edge, a
 // control's track or outline; --line-2).
-export const tone_line: Fill = {dark: {0.157, 0.157, 0.165, 1}, light: {0.863, 0.859, 0.835, 1}}
-export const tone_line_strong: Fill = {dark: {0.200, 0.200, 0.208, 1}, light: {0.804, 0.800, 0.776, 1}}
+export const tone_line: Fill = {dark: {0.169, 0.176, 0.188, 1}, light: {0.863, 0.859, 0.835, 1}}
+export const tone_line_strong: Fill = {dark: {0.224, 0.231, 0.251, 1}, light: {0.804, 0.800, 0.776, 1}}
 // Inks: strong (titles, headings, a selected row, bold), the body, muted (secondary words, icons at rest), faint (meta,
 // markers, a placeholder, what has ended); --ink-1..4.
-export const tone_ink_strong: Fill = {dark: {0.922, 0.918, 0.902, 1}, light: {0.086, 0.086, 0.090, 1}}
-export const tone_ink: Fill = {dark: {0.702, 0.698, 0.686, 1}, light: {0.275, 0.275, 0.290, 1}}
-export const tone_ink_muted: Fill = {dark: {0.529, 0.525, 0.518, 1}, light: {0.420, 0.416, 0.431, 1}}
-export const tone_ink_faint: Fill = {dark: {0.341, 0.341, 0.353, 1}, light: {0.635, 0.631, 0.616, 1}}
+export const tone_ink_strong: Fill = {dark: {0.875, 0.882, 0.898, 1}, light: {0.086, 0.086, 0.090, 1}}
+export const tone_ink: Fill = {dark: {0.737, 0.745, 0.769, 1}, light: {0.275, 0.275, 0.290, 1}}
+export const tone_ink_muted: Fill = {dark: {0.525, 0.541, 0.569, 1}, light: {0.420, 0.416, 0.431, 1}}
+export const tone_ink_faint: Fill = {dark: {0.435, 0.451, 0.478, 1}, light: {0.635, 0.631, 0.616, 1}}
 // Washes: the strong ink at an alpha, so they read on any ground. Hover (a row's, a button's), wash (a resting plate,
-// inline code's: --s-tint), selection (the selected row's pill), selection_focus (the same while its list has the
+// inline code's: --s-tint), selection (the selected row's pill), selection_focus (IntelliJ's blue while its list has the
 // keyboard, a menu's highlighted item), press (held). A scrim dims what is under a sheet.
-export const tone_hover: Fill = {dark: {0.922, 0.918, 0.902, 0.045}, light: {0.086, 0.086, 0.090, 0.04}}
-export const tone_wash: Fill = {dark: {0.922, 0.918, 0.902, 0.06}, light: {0.086, 0.086, 0.090, 0.06}}
-export const tone_selection: Fill = {dark: {0.922, 0.918, 0.902, 0.07}, light: {0.086, 0.086, 0.090, 0.06}}
-export const tone_selection_focus: Fill = {dark: {0.922, 0.918, 0.902, 0.10}, light: {0.086, 0.086, 0.090, 0.085}}
-export const tone_press: Fill = {dark: {0.922, 0.918, 0.902, 0.13}, light: {0.086, 0.086, 0.090, 0.11}}
+export const tone_hover: Fill = {dark: {0.875, 0.882, 0.898, 0.05}, light: {0.086, 0.086, 0.090, 0.04}}
+export const tone_wash: Fill = {dark: {0.875, 0.882, 0.898, 0.06}, light: {0.086, 0.086, 0.090, 0.06}}
+export const tone_selection: Fill = {dark: {0.875, 0.882, 0.898, 0.08}, light: {0.086, 0.086, 0.090, 0.06}}
+export const tone_selection_focus: Fill = {dark: {0.208, 0.455, 0.941, 0.28}, light: {0.086, 0.086, 0.090, 0.085}}
+export const tone_press: Fill = {dark: {0.875, 0.882, 0.898, 0.13}, light: {0.086, 0.086, 0.090, 0.11}}
 export const tone_scrim: Fill = {dark: {0, 0, 0, 0.36}, light: {0, 0, 0, 0.14}}
 export const tone_clear: Fill = {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
-// Selected text's plate (ui.selection; every surface's, the terminal's too): the strong ink at 22% (18% on the paper).
-export const tone_text_selection: Fill = {dark: {0.922, 0.918, 0.902, 0.22}, light: {0.086, 0.086, 0.090, 0.18}}
+// Selected text's plate (ui.selection; every surface's, the terminal's too): IntelliJ's text selection blue (the strong
+// ink at 18% on the paper).
+export const tone_text_selection: Fill = {dark: {0.129, 0.259, 0.514, 0.85}, light: {0.086, 0.086, 0.090, 0.18}}
 // The light a copy sweeps over what it took (ui.selection's CopyLook): the accent lifted toward white on the dark page,
 // where it adds to the plate, and the accent itself on the paper, where it tints; its alpha is the light at its brightest.
-export const tone_copy_sheen: Fill = {dark: {0.800, 0.820, 1.0, 0.26}, light: {0.369, 0.384, 0.902, 0.16}}
+export const tone_copy_sheen: Fill = {dark: {0.72, 0.80, 1.0, 0.26}, light: {0.208, 0.455, 0.941, 0.16}}
 // The accent: only what is on or pressable-and-chosen (a switch, a focused control, a load bar); its faint wash (a search
 // match, a highlighted cell); the ink on a solid accent or a coloured badge. A link's ink; inline code's (--doc-code-ink).
-export const tone_accent: Fill = {dark: {0.580, 0.600, 1.0, 1}, light: {0.369, 0.384, 0.902, 1}}
+export const tone_accent: Fill = {dark: {0.208, 0.455, 0.941, 1}, light: {0.208, 0.455, 0.941, 1}}
 // The level slider's fill and its ends' words (level_*, below), from the theme's inks.
 export const tone_level_fill: Fill = $tone_accent
 export const tone_level_scale: Fill = $tone_ink_faint
-export const tone_accent_wash: Fill = {dark: {0.580, 0.600, 1.0, 0.24}, light: {0.369, 0.384, 0.902, 0.18}}
+export const tone_accent_wash: Fill = {dark: {0.208, 0.455, 0.941, 0.24}, light: {0.208, 0.455, 0.941, 0.16}}
 export const tone_on_accent: Fill = {dark: {1, 1, 1, 1}, light: {1, 1, 1, 1}}
-export const tone_link: Fill = {dark: {0.322, 0.612, 0.792, 1}, light: {0.137, 0.514, 0.886, 1}}
-export const tone_code_ink: Fill = {dark: {1.0, 0.451, 0.412, 1}, light: {0.922, 0.341, 0.341, 1}}
+export const tone_link: Fill = {dark: {0.329, 0.541, 0.969, 1}, light: {0.149, 0.459, 0.749, 1}}
+export const tone_code_ink: Fill = {dark: {0.808, 0.816, 0.839, 1}, light: {0.031, 0.031, 0.031, 1}}
 // States, colour that carries meaning only: success (running, passed; --ok), warning (lost, pending), error (failed,
 // killed; --danger), each with a faint wash for a plate behind words in it.
-export const tone_success: Fill = {dark: {0.298, 0.761, 0.478, 1}, light: {0.169, 0.541, 0.310, 1}}
-export const tone_warning: Fill = {dark: {0.949, 0.733, 0.322, 1}, light: {0.78, 0.55, 0.10, 1}}
-export const tone_error: Fill = {dark: {1.0, 0.443, 0.408, 1}, light: {0.769, 0.200, 0.165, 1}}
-export const tone_success_wash: Fill = {dark: {0.298, 0.761, 0.478, 0.15}, light: {0.169, 0.541, 0.310, 0.11}}
-export const tone_warning_wash: Fill = {dark: {0.949, 0.733, 0.322, 0.15}, light: {0.78, 0.55, 0.10, 0.12}}
-export const tone_error_wash: Fill = {dark: {1.0, 0.443, 0.408, 0.14}, light: {0.769, 0.200, 0.165, 0.10}}
+export const tone_success: Fill = {dark: {0.373, 0.678, 0.396, 1}, light: {0.125, 0.541, 0.235, 1}}
+export const tone_warning: Fill = {dark: {0.949, 0.773, 0.361, 1}, light: {0.761, 0.49, 0.016, 1}}
+export const tone_error: Fill = {dark: {0.859, 0.361, 0.361, 1}, light: {0.788, 0.31, 0.31, 1}}
+export const tone_success_wash: Fill = {dark: {0.373, 0.678, 0.396, 0.14}, light: {0.125, 0.541, 0.235, 0.1}}
+export const tone_warning_wash: Fill = {dark: {0.949, 0.773, 0.361, 0.14}, light: {0.761, 0.49, 0.016, 0.11}}
+export const tone_error_wash: Fill = {dark: {0.859, 0.361, 0.361, 0.14}, light: {0.788, 0.31, 0.31, 0.1}}
 // Controls' parts: a switch's or slider's knob (a light disc in both appearances), an overlay scroller's knob and the
 // faint track it widens over (ui.Scroller; AppKit's).
 export const tone_knob: Fill = {dark: {0.95, 0.95, 0.96, 1}, light: {1, 1, 1, 1}}
-export const tone_scroller_knob: Fill = {dark: {0.922, 0.918, 0.902, 0.22}, light: {0.086, 0.086, 0.090, 0.20}}
-export const tone_scroller_track: Fill = {dark: {0.922, 0.918, 0.902, 0.04}, light: {0.086, 0.086, 0.090, 0.03}}
+export const tone_scroller_knob: Fill = {dark: {0.875, 0.882, 0.898, 0.22}, light: {0.086, 0.086, 0.090, 0.20}}
+export const tone_scroller_track: Fill = {dark: {0.875, 0.882, 0.898, 0.04}, light: {0.086, 0.086, 0.090, 0.03}}
 
 // ---- Palettes: colours that name a thing, not a surface ----
 // A kind's icon, a brand mark, a file type, a chart series, a GitHub state, code by capture, the colour well's hues and
@@ -364,14 +365,14 @@ export const icon_press_dim = 0.7
 export const spring_press_omega = 38
 export const spring_press_zeta = 0.62
 
-// The cute touch: a small warm colour per kind on its icon (a shell's is the muted ink, hn.Theme.kind_shell).
-export const tone_kind_claude: Fill = {dark: {0.886, 0.502, 0.369, 1}, light: {0.800, 0.400, 0.260, 1}}
-export const tone_kind_codex: Fill = {dark: {0.306, 0.792, 0.741, 1}, light: {0.090, 0.580, 0.540, 1}}
-export const tone_kind_cursor: Fill = {dark: {0.718, 0.588, 1.0, 1}, light: {0.510, 0.360, 0.880, 1}}
-
+// A kind's icon: in the muted ink like a shell's (hn.Theme.kind_shell), save Claude's, which keeps its brand orange.
 // The brand marks' fills (hn.Kind): Claude's orange (#D97757, its brand hex) in both appearances; OpenAI's and Cursor's
 // marks are monochrome, in the strong ink, so they turn with the appearance.
 export const tone_mark_claude: Fill = {dark: {0.851, 0.467, 0.341, 1}, light: {0.851, 0.467, 0.341, 1}}
+
+export const tone_kind_claude: Fill = $tone_mark_claude
+export const tone_kind_codex: Fill = $tone_ink_muted
+export const tone_kind_cursor: Fill = $tone_ink_muted
 
 prefab Strong {
   Fill: $tone_ink_strong
@@ -404,8 +405,8 @@ export const line_stats = 14
 export const radius_stats = 6
 export const tone_stats_plate: Fill = {dark: {0, 0, 0, 0.62}, light: {0, 0, 0, 0.62}}
 export const tone_stats_ink: Fill = {dark: {1, 1, 1, 0.90}, light: {1, 1, 1, 0.90}}
-export const tone_stats_bar: Fill = {dark: {0.298, 0.718, 0.510, 0.85}, light: {0.298, 0.718, 0.510, 0.85}}
-export const tone_stats_hot: Fill = {dark: {1.0, 0.45, 0.43, 1}, light: {1.0, 0.45, 0.43, 1}}
+export const tone_stats_bar: Fill = {dark: {0.373, 0.678, 0.396, 0.85}, light: {0.373, 0.678, 0.396, 0.85}}
+export const tone_stats_hot: Fill = {dark: {0.859, 0.361, 0.361, 1}, light: {0.859, 0.361, 0.361, 1}}
 
 // The selection's shape (harness-native-render's select.rs; its colour is the theme's tone_text_selection): one plate
 // under the glyphs wherever text is selected (a chat's transcript and input, a table's copied row, the terminal), corners
@@ -798,20 +799,20 @@ export const tone_gen_video_fill: Fill = {dark: {1, 1, 1, 0.92}, light: {1, 1, 1
 // would in the terminal.
 @tree ChildOf
 code_ink {
-  keyword { Fill: {dark: {0.776, 0.471, 0.867, 1}, light: {0.812, 0.133, 0.180, 1}} }
-  function { Fill: {dark: {0.380, 0.686, 0.937, 1}, light: {0.510, 0.314, 0.875, 1}} }
-  type { Fill: {dark: {0.898, 0.753, 0.482, 1}, light: {0.584, 0.220, 0.000, 1}} }
-  constructor { Fill: {dark: {0.898, 0.753, 0.482, 1}, light: {0.584, 0.220, 0.000, 1}} }
-  attribute { Fill: {dark: {0.898, 0.753, 0.482, 1}, light: {0.584, 0.220, 0.000, 1}} }
-  string { Fill: {dark: {0.596, 0.765, 0.475, 1}, light: {0.039, 0.188, 0.412, 1}} }
-  escape { Fill: {dark: {0.337, 0.714, 0.761, 1}, light: {0.020, 0.314, 0.682, 1}} }
-  number { Fill: {dark: {0.820, 0.604, 0.400, 1}, light: {0.020, 0.314, 0.682, 1}} }
-  constant { Fill: {dark: {0.820, 0.604, 0.400, 1}, light: {0.020, 0.314, 0.682, 1}} }
-  property { Fill: {dark: {0.878, 0.424, 0.459, 1}, light: {0.020, 0.314, 0.682, 1}} }
-  label { Fill: {dark: {0.878, 0.424, 0.459, 1}, light: {0.584, 0.220, 0.000, 1}} }
-  operator { Fill: {dark: {0.337, 0.714, 0.761, 1}, light: {0.812, 0.133, 0.180, 1}} }
-  comment { Fill: {dark: {0.498, 0.518, 0.557, 1}, light: {0.431, 0.467, 0.506, 1}} }
-  variable { builtin { Fill: {dark: {0.878, 0.424, 0.459, 1}, light: {0.812, 0.133, 0.180, 1}} } }
+  keyword { Fill: {dark: {0.812, 0.557, 0.427, 1}, light: {0, 0.2, 0.702, 1}} }
+  function { Fill: {dark: {0.337, 0.659, 0.961, 1}, light: {0, 0.384, 0.478, 1}} }
+  type { Fill: {dark: {0.737, 0.745, 0.769, 1}, light: {0, 0, 0, 1}} }
+  constructor { Fill: {dark: {0.337, 0.659, 0.961, 1}, light: {0, 0.384, 0.478, 1}} }
+  attribute { Fill: {dark: {0.702, 0.682, 0.376, 1}, light: {0.62, 0.533, 0.051, 1}} }
+  string { Fill: {dark: {0.416, 0.671, 0.451, 1}, light: {0.024, 0.49, 0.09, 1}} }
+  escape { Fill: {dark: {0.812, 0.557, 0.427, 1}, light: {0, 0.216, 0.651, 1}} }
+  number { Fill: {dark: {0.165, 0.675, 0.722, 1}, light: {0.09, 0.314, 0.922, 1}} }
+  constant { Fill: {dark: {0.78, 0.49, 0.733, 1}, light: {0.529, 0.063, 0.58, 1}} }
+  property { Fill: {dark: {0.78, 0.49, 0.733, 1}, light: {0.529, 0.063, 0.58, 1}} }
+  label { Fill: {dark: {0.737, 0.745, 0.769, 1}, light: {0, 0, 0, 1}} }
+  operator { Fill: {dark: {0.737, 0.745, 0.769, 1}, light: {0, 0, 0, 1}} }
+  comment { Fill: {dark: {0.478, 0.494, 0.522, 1}, light: {0.549, 0.549, 0.549, 1}} }
+  variable { builtin { Fill: {dark: {0.812, 0.557, 0.427, 1}, light: {0, 0.2, 0.702, 1}} } }
 }
 
 // Kip in the app's chrome (the ui.Mascot primitive's `Kip`, kip.flecs): how tall he stands where he shows. Never in a
