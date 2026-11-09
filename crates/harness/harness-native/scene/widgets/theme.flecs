@@ -37,6 +37,9 @@ hn {
     accent { Fill: $tone_accent }
     accent_wash { Fill: $tone_accent_wash }
     on_accent { Fill: $tone_on_accent }
+    // An aside's tint: the composer's card while its draft is one, and its edge (src/app/chat.rs fill_chat_pane).
+    aside { Fill: $tone_aside }
+    aside_line { Fill: $tone_aside_line }
     link { Fill: $tone_link }
     code_ink { Fill: $tone_code_ink }
     // States (a status dot's: running success, lost warning, failed or killed error, ended ink_faint; src/app.rs dot_tone).

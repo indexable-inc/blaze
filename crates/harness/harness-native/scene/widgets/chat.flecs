@@ -33,8 +33,15 @@ hn {
       Flex: {axis: Column, gap: 0, align: Center, justify: Start, wrap: false}
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
       Padding: {l: $chat_pad, r: $chat_pad, t: $chat_foot_pad_t, b: $chat_foot_pad_b}
+      // An aside's answer over the composer while it shows (hn.ChatAside, src/app/chat.rs fill_chat_aside); empty, it
+      // takes no room.
+      aside : ui.Column {
+        Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+        Size: {w: {kind: Grow, value: 1, min: 0, max: $chat_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      }
       // The composer: one card, the words over a bar of controls, as wide as the transcript's column. A press anywhere
-      // on it that no control takes gives the words the keys.
+      // on it that no control takes gives the words the keys. While its draft starts with a space (an aside) it takes
+      // the aside's tint (src/app/chat.rs sets its Fill and Edge from hn.Theme.aside and aside_line).
       card : ui.Column {
         Fill: $tone_card
         Edge: {dark: $tone_line.dark, light: $tone_line.light}
@@ -334,6 +341,60 @@ hn {
         TextStyle: {size: $size_chat, line: $line_chat_bubble, role: 0, bold: 0}
       }
     }
+  }
+
+  // An aside's answer (src/app/chat.rs fill_chat_aside): a question asked of a fork of the conversation (Return on a
+  // draft that starts with a space), never part of it. A card over the composer in the aside's tint (tone_aside, the
+  // composer's own while a draft is one), chat_aside_gap above it: its head the quiet word "Aside", the working ring
+  // (hn.ChatAsideWorking, in `head.act`) while it asks and a close button (Escape closes it too); its body the answer's words
+  // as the transcript draws them (hn.ChatProse and its kin), or the question in a quiet note while it asks, or the
+  // error naming what failed (hn.ChatError). Gone once closed; a new aside takes its place.
+  prefab ChatAside : ui.Column {
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 0, r: 0, t: 0, b: $chat_aside_gap}
+    plate : ui.Column {
+      Fill: $tone_aside
+      Edge: {dark: $tone_aside_line.dark, light: $tone_aside_line.light}
+      Shape: {radius: $chat_aside_radius, n: 4, border: 1, feather: 0}
+      Cursor: {shape: Arrow}
+      Flex: {axis: Column, gap: $chat_aside_head_gap, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      Padding: {l: $chat_aside_pad_x, r: $chat_aside_pad_x, t: $chat_aside_pad_t, b: $chat_aside_pad_b}
+      head : ui.Row {
+        Flex: {axis: Row, gap: $chat_bar_gap, align: Center, justify: Start, wrap: false}
+        Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $chat_bar_h, min: 0, max: 0}}
+        label : ui.Line {
+          Text: {s: "Aside"}
+          Fill: $tone_ink_muted
+          TextStyle: {size: $size_chrome, line: $line_chrome, role: 0, bold: 0}
+        }
+        act : ui.Row {
+          Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+          Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+        }
+        spacer : ui.Spacer {}
+        close : ui.IconButton {
+          Action: {name: ""}
+          Tooltip: {text: "Close  esc"}
+          AlignSelf: {align: Center}
+          Size: {w: {kind: Fixed, value: $chat_aside_close, min: 0, max: 0}, h: {kind: Fixed, value: $chat_aside_close, min: 0, max: 0}}
+          icon : ui.Symbol {
+            Size: {w: {kind: Fixed, value: $chat_aside_icon, min: 0, max: 0}, h: {kind: Fixed, value: $chat_aside_icon, min: 0, max: 0}}
+          }
+        }
+      }
+      body : ui.Column {
+        Cursor: {shape: Text}
+        Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+        Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      }
+    }
+  }
+
+  // An aside's working ring (in its head while it is asked): the composer's, saying what Escape does here.
+  prefab ChatAsideWorking : hn.ChatWorking {
+    Tooltip: {text: "Asking aside  esc to close"}
   }
 
   // The words of a message sent with pictures, under them: no turn's gap over it (the pictures took it).

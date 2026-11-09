@@ -86,6 +86,7 @@
 //!
 //! A log from before harness schema 1 (NDJSON) is converted once, at daemon start before it listens ([`migrate_logs`],
 //! harness-proto's `migrate`), and marked in the index (`meta.chat_log`); [`Chat::open`] refuses one it finds unconverted.
+pub mod aside;
 pub mod claude;
 pub mod codex;
 pub mod context;

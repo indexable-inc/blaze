@@ -389,11 +389,10 @@ impl Daemon {
         let mut cmd = CommandBuilder::new(&launch.program);
         cmd.args(&launch.args);
         cmd.cwd(&cwd);
-        // The daemon inherits whatever environment first started it (often another agent's shell);
-        // don't pass that agent's session markers on. The profile's own variables are set below.
+        // The profile's own variables are set below, over the daemon's less another agent's markers.
         for (k, _) in std::env::vars_os() {
             let k = k.to_string_lossy();
-            if k == "CLAUDECODE" || k == "AI_AGENT" || k.starts_with("CLAUDE_CODE_") || k.starts_with("CODEX_") {
+            if agent_marker(&k) {
                 cmd.env_remove(k.as_ref());
             }
         }
@@ -526,18 +525,7 @@ impl Daemon {
         let (id, oid) = (s.id, format!("s{}", s.id));
         let dir = db::object_dir(&oid);
         db::index_stream(&oid, "chat", &dir.join("chat"));
-        let mut cmd = std::process::Command::new(&launch.program);
-        cmd.args(&launch.args).current_dir(&s.cwd);
-        for (k, _) in std::env::vars_os() {
-            let k = k.to_string_lossy();
-            if k == "CLAUDECODE" || k == "AI_AGENT" || k.starts_with("CLAUDE_CODE_") || k.starts_with("CODEX_") {
-                cmd.env_remove(k.as_ref());
-            }
-        }
-        cmd.envs(launch.env.iter().chain(env));
-        if let Some(p) = s.parent {
-            cmd.env("HARNESS_PARENT", p.to_string());
-        }
+        let mut cmd = agent_command(s, launch, env);
         let stderr = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("stderr"))?;
         cmd.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(stderr);
         let mut child = cmd.spawn().with_context(|| format!("{oid}: spawn {}", launch.program))?;
@@ -620,57 +608,10 @@ impl Daemon {
     /// Start chat `s`'s agent again on its log, continuing its conversation by the agent's own id for it (from the log):
     /// Claude with `--resume`, Codex with `thread/resume`. An error names why it cannot; it never starts a fresh one.
     fn resume(self: &Arc<Self>, s: &Arc<Session>) -> Result<()> {
-        let c = s.chat.clone().ok_or_else(|| anyhow!("session {} is not a chat session", s.id))?;
-        let oid = format!("s{}", s.id);
-        let meta = db::object_kind_meta(&oid).map(|(_, m)| m).unwrap_or_else(|| json!({}));
-        // A Claude chat recorded before `session` events carried its id was started with `--session-id` set to the id
-        // the index keeps (spawn_named): the same id, from where it was written then.
-        let session = c.session_id().or_else(|| (s.kind == "claude").then(|| meta["claude_session"].as_str().map(str::to_owned)).flatten());
-        let Some(session) = session else {
-            anyhow::bail!("its log never named {}'s id for the conversation (it predates harness recording it), so there is nothing to resume", s.kind);
-        };
-        // The person's own args from the first launch (a model, flags), less any that chose a conversation, and less a
-        // model or effort the chat has chosen since (`choice` events), which it resumes with instead.
-        let chosen = c.chosen();
-        let mut args = Vec::new();
-        let mut user = meta["user_args"].as_array().into_iter().flatten().filter_map(Value::as_str);
-        while let Some(a) = user.next() {
-            match a {
-                "-r" | "--resume" | "--session-id" => {
-                    let _ = user.next();
-                }
-                "-m" | "--model" if chosen.0.is_some() => {
-                    let _ = user.next();
-                }
-                "--effort" if chosen.1.is_some() => {
-                    let _ = user.next();
-                }
-                a if chosen.0.is_some() && a.starts_with("--model=") => {}
-                a if chosen.1.is_some() && a.starts_with("--effort=") => {}
-                "-c" | "--continue" => {}
-                a => args.push(a.to_owned()),
-            }
-        }
-        match s.kind.as_str() {
-            "claude" => {
-                args.extend(["--resume".to_owned(), session.clone()]);
-                if let Some(m) = &chosen.0 {
-                    args.extend(["--model".to_owned(), m.clone()]);
-                }
-                if let Some(e) = &chosen.1 {
-                    args.extend(["--effort".to_owned(), e.clone()]);
-                }
-            }
-            // Codex's choice rides on its thread/resume and every turn/start (chat/codex.rs `with_choice`).
-            "codex" => {}
-            other => anyhow::bail!("{other} has no chat adapter to resume with"),
-        }
         if let Some(n) = &s.name {
             db::check_name(n)?;
         }
-        let launch = profiles::launch(
-            &s.kind, &profiles::Ctx { session: s.id, cwd: &s.cwd, sock: &paths::sock(), user_args: &args, prompt: None, chat: true },
-        )?;
+        let Relaunch { launch, session, chosen, meta } = relaunch(s, false)?;
         // Claude's adapter says the effort its launch passed, so it is made after the launch.
         let adapter: Box<dyn chat::Adapter> = if s.kind == "claude" {
             Box::new(chat::claude::Claude::new(&launch))
@@ -779,6 +720,9 @@ impl Daemon {
                 self.get(id)?.rename(&title)?;
                 Reply::Ok
             }
+            // Its one turn may take minutes: it holds only this request's connection and blocking thread (each request
+            // has its own) and no lock, so every other request goes on.
+            Req::Aside { id, text } => Reply::Aside { text: aside(&self.get(id)?, &text)? },
             Req::Screen { id } => {
                 let s = self.get(id)?;
                 Reply::Screen { text: s.screen_text(), info: s.info() }
@@ -818,6 +762,207 @@ impl Daemon {
                 anyhow::bail!("attach, watch and ui_listen hold the connection: send them as a connection's request, not through rpc")
             }
         })
+    }
+}
+
+/// A variable another agent sets in its sessions (Claude Code's, Codex's, an agent marker): the daemon inherits whatever
+/// environment first started it (often another agent's shell), and never passes these on to an agent it starts.
+fn agent_marker(k: &str) -> bool {
+    k == "CLAUDECODE" || k == "AI_AGENT" || k.starts_with("CLAUDE_CODE_") || k.starts_with("CODEX_")
+}
+
+/// The command that runs `launch` for chat `s` in its directory: the daemon's environment less [`agent_marker`]s, the
+/// profile's variables and `env` over it, its parent named. A chat's agent and an aside's fork start alike.
+fn agent_command(s: &Session, launch: &profiles::Launch, env: &BTreeMap<String, String>) -> std::process::Command {
+    let mut cmd = std::process::Command::new(&launch.program);
+    cmd.args(&launch.args).current_dir(&s.cwd);
+    for (k, _) in std::env::vars_os() {
+        let k = k.to_string_lossy();
+        if agent_marker(&k) {
+            cmd.env_remove(k.as_ref());
+        }
+    }
+    cmd.envs(launch.env.iter().chain(env));
+    if let Some(p) = s.parent {
+        cmd.env("HARNESS_PARENT", p.to_string());
+    }
+    cmd
+}
+
+/// How chat `s`'s agent starts again on its conversation, for a resume or an aside's fork ([`relaunch`]): the launch,
+/// the agent's own id for the conversation, the model and effort the chat chose since it started (each None when never
+/// chosen), and its index row's meta.
+struct Relaunch {
+    launch: profiles::Launch,
+    session: String,
+    chosen: (Option<String>, Option<String>),
+    meta: Value,
+}
+
+/// [`Relaunch`] for chat `s`, the one place its launch is built again: the person's own args from its first launch (a
+/// model, flags), less any that chose a conversation and less a model or effort the chat has chosen since (`choice`
+/// events), which it runs with instead. Claude takes `--resume <id>` and the choice as flags, and with `fork` also
+/// `--fork-session --no-session-persistence` (a new conversation from the old one's history, never written: an aside);
+/// Codex's choice and thread ride on its adapter (chat/codex.rs `resume`, `fork`, `with_choice`).
+///
+/// # Errors
+/// Not a chat; its log never named the agent's id for the conversation; a kind with no chat adapter; the launch's.
+fn relaunch(s: &Session, fork: bool) -> Result<Relaunch> {
+    let c = s.chat.clone().ok_or_else(|| anyhow!("session {} is not a chat session", s.id))?;
+    let oid = format!("s{}", s.id);
+    let meta = db::object_kind_meta(&oid).map(|(_, m)| m).unwrap_or_else(|| json!({}));
+    // A Claude chat recorded before `session` events carried its id was started with `--session-id` set to the id
+    // the index keeps (spawn_named): the same id, from where it was written then.
+    let session = c.session_id().or_else(|| (s.kind == "claude").then(|| meta["claude_session"].as_str().map(str::to_owned)).flatten());
+    let Some(session) = session else {
+        anyhow::bail!("its log never named {}'s id for the conversation (it predates harness recording it), so there is nothing to resume or fork", s.kind);
+    };
+    let chosen = c.chosen();
+    let mut args = Vec::new();
+    let mut user = meta["user_args"].as_array().into_iter().flatten().filter_map(Value::as_str);
+    while let Some(a) = user.next() {
+        match a {
+            "-r" | "--resume" | "--session-id" => {
+                let _ = user.next();
+            }
+            "-m" | "--model" if chosen.0.is_some() => {
+                let _ = user.next();
+            }
+            "--effort" if chosen.1.is_some() => {
+                let _ = user.next();
+            }
+            a if chosen.0.is_some() && a.starts_with("--model=") => {}
+            a if chosen.1.is_some() && a.starts_with("--effort=") => {}
+            "-c" | "--continue" | "--fork-session" | "--no-session-persistence" => {}
+            a => args.push(a.to_owned()),
+        }
+    }
+    match s.kind.as_str() {
+        "claude" => {
+            args.extend(["--resume".to_owned(), session.clone()]);
+            if fork {
+                args.extend(["--fork-session".to_owned(), "--no-session-persistence".to_owned()]);
+            }
+            if let Some(m) = &chosen.0 {
+                args.extend(["--model".to_owned(), m.clone()]);
+            }
+            if let Some(e) = &chosen.1 {
+                args.extend(["--effort".to_owned(), e.clone()]);
+            }
+        }
+        // Codex's choice rides on its thread/resume (or thread/fork) and every turn/start (chat/codex.rs `with_choice`).
+        "codex" => {}
+        other => anyhow::bail!("{other} has no chat adapter to resume with"),
+    }
+    let launch = profiles::launch(
+        &s.kind, &profiles::Ctx { session: s.id, cwd: &s.cwd, sock: &paths::sock(), user_args: &args, prompt: None, chat: true },
+    )?;
+    Ok(Relaunch { launch, session, chosen, meta })
+}
+
+/// An aside's fork driven through its turn: the adapter's opening lines and `text` as its one message written, then each
+/// line it writes read into `turn` (the adapter's replies written back), until the turn ends (its answer) or its stdout
+/// does (None: it exited, or the aside's watch stopped it).
+fn ask_fork(
+    adapter: &mut dyn chat::Adapter, turn: &mut chat::aside::Turn, stdin: &mut impl Write, stdout: impl Read, text: &str,
+) -> std::io::Result<Option<chat::aside::Answer>> {
+    use std::io::BufRead;
+    send_lines(stdin, &adapter.start())?;
+    send_lines(stdin, &adapter.user(text, &[]))?;
+    let mut r = std::io::BufReader::new(stdout);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if r.read_line(&mut line)? == 0 {
+            return Ok(None);
+        }
+        let l = line.trim_end_matches(['\r', '\n']);
+        if l.is_empty() {
+            continue;
+        }
+        for b in adapter.events(l) {
+            if let Some(a) = turn.see(b) {
+                return Ok(Some(a));
+            }
+        }
+        send_lines(stdin, &adapter.replies())?;
+    }
+}
+
+/// Protocol lines to an agent's stdin, each with its newline, flushed.
+fn send_lines(w: &mut impl Write, lines: &[String]) -> std::io::Result<()> {
+    for l in lines {
+        w.write_all(l.as_bytes())?;
+        w.write_all(b"\n")?;
+    }
+    w.flush()
+}
+
+/// An aside to chat `s` (`Request::Aside`): `text` (trimmed) asked of a fork of its conversation as one turn, and the
+/// fork's last words. The fork is a one-shot process of its agent, launched as a resume is ([`relaunch`], so with the
+/// chat's model and effort) but forked (claude's `--fork-session`, never saved; codex's ephemeral `thread/fork`), read
+/// through the chat's own adapter into a [`chat::aside::Turn`] and stopped once the turn ends. Nothing it says reaches
+/// the chat's log, and the chat's agent, running or not, is not touched. Its stderr goes to `aside.stderr` in the chat's
+/// object directory, written anew each aside.
+///
+/// # Errors
+/// Each names the chat: an aside with no words; the [`relaunch`]'s; the fork failing to start, failing its turn (the
+/// error it reported), exiting before answering (naming its stderr), or not answering within
+/// [`harness_proto::msg::ASIDE_SECS`] (it is stopped).
+fn aside(s: &Session, text: &str) -> Result<String> {
+    use harness_proto::msg::ASIDE_SECS;
+    let oid = format!("s{}", s.id);
+    let text = text.trim();
+    anyhow::ensure!(!text.is_empty(), "an aside to chat {oid} asks nothing");
+    let r = relaunch(s, true).with_context(|| format!("forking chat {oid} for an aside"))?;
+    let mut adapter: Box<dyn chat::Adapter> = if s.kind == "claude" {
+        Box::new(chat::claude::Claude::new(&r.launch))
+    } else {
+        Box::new(chat::codex::Codex::fork(&s.cwd, &r.session).with_choice(r.chosen))
+    };
+    let dir = db::object_dir(&oid);
+    std::fs::create_dir_all(&dir).with_context(|| format!("{oid}: making {}", dir.display()))?;
+    let err_path = dir.join("aside.stderr");
+    let stderr = std::fs::File::create(&err_path).with_context(|| format!("{oid}: opening {} for an aside", err_path.display()))?;
+    let mut cmd = agent_command(s, &r.launch, &BTreeMap::new());
+    cmd.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(stderr);
+    let mut child = cmd.spawn().with_context(|| format!("{oid}: spawning {} for an aside", r.launch.program))?;
+    let mut stdin = child.stdin.take().ok_or_else(|| anyhow!("{oid}: the aside's fork has no stdin pipe"))?;
+    let stdout = child.stdout.take().ok_or_else(|| anyhow!("{oid}: the aside's fork has no stdout pipe"))?;
+    let pid = child.id();
+    // The bound: past ASIDE_SECS the fork is stopped, its stdout ends, and the aside fails saying so. The watch ends as
+    // soon as `done` goes (the aside is over).
+    let late = Arc::new(AtomicBool::new(false));
+    let (done, over) = std::sync::mpsc::channel::<()>();
+    let watch = {
+        let late = late.clone();
+        std::thread::Builder::new().name(format!("aside-wait-{}", s.id)).spawn(move || {
+            if over.recv_timeout(std::time::Duration::from_secs(ASIDE_SECS)) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+                late.store(true, Ordering::Relaxed);
+                let _ = chat::PidKiller(pid).kill();
+            }
+        })?
+    };
+    let mut turn = chat::aside::Turn::default();
+    let said = ask_fork(adapter.as_mut(), &mut turn, &mut stdin, stdout, text);
+    // Done with it either way: stopped (one that already exited refuses the signal, which is fine), reaped, the watch ended.
+    let _ = chat::PidKiller(pid).kill();
+    let _ = child.wait();
+    drop(done);
+    let _ = watch.join();
+    let kind = &s.kind;
+    if late.load(Ordering::Relaxed) {
+        anyhow::bail!("{kind}'s fork of chat {oid} did not answer the aside within {ASIDE_SECS}s, so it was stopped");
+    }
+    let why = |what: String| match turn.error() {
+        Some(e) => format!("{what} (it last said: {e}); its stderr is in {}", err_path.display()),
+        None => format!("{what}; its stderr is in {}", err_path.display()),
+    };
+    match said {
+        Ok(Some(Ok(words))) => Ok(words),
+        Ok(Some(Err(e))) => anyhow::bail!("{kind}'s fork of chat {oid} could not answer the aside: {e}"),
+        Ok(None) => anyhow::bail!("{}", why(format!("{kind}'s fork of chat {oid} exited before answering the aside"))),
+        Err(e) => anyhow::bail!("{}", why(format!("talking to {kind}'s fork of chat {oid} for an aside: {e}"))),
     }
 }
 
