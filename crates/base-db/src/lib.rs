@@ -553,6 +553,33 @@ pub struct CrateWorkspaceData {
     pub toolchain: Option<Version>,
     /// How far the evaluation of one constant of the workspace may go.
     pub const_eval: ConstEvalBudget,
+    /// The crates the capability effects (`ambient`, `unsafe`, `global_alloc`; hir-ty-pure's
+    /// `effect_attrs`) trust: `trusted` under `[workspace.metadata.blaze]`, sorted by name, each
+    /// once. Empty for the toolchain's crates, whose trust is their origin's.
+    pub trusted: Box<[TrustedCrate]>,
+}
+
+/// A crate a workspace trusts for the capability effects: a `#![blaze::capabilities]` crate may
+/// reach its code although that code reaches ambient IO, `unsafe` or the global heap, because a
+/// person (`owner`) said why (`reason`).
+///
+/// ```toml
+/// [workspace.metadata.blaze.trusted]
+/// bstd = { owner = "runtime", reason = "the capabilities themselves: their syscalls and arenas" }
+/// ```
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+pub struct TrustedCrate {
+    /// The crate's name as code names it (`-` written `_`).
+    pub name: Box<str>,
+    /// Who answers for it.
+    pub owner: Box<str>,
+    /// Why it is trusted.
+    pub reason: Box<str>,
+}
+
+impl TrustedCrate {
+    /// The key of the table under `[workspace.metadata.blaze]`.
+    pub const KEY: &str = "trusted";
 }
 
 /// What one evaluation of a constant, static or other compile-time code may spend before it
@@ -589,8 +616,9 @@ impl Default for ConstEvalBudget {
 
 impl CrateWorkspaceData {
     /// Of the target ([`target::TargetData::content`], or 1 and why it could not be loaded),
-    /// the toolchain's version, and the const-eval budget.
-    pub const DOMAIN: &'static str = "blaze v2 crate workspace data 1";
+    /// the toolchain's version, the const-eval budget, and the trusted crates (how many, then
+    /// each one's name, owner and reason).
+    pub const DOMAIN: &'static str = "blaze v2 crate workspace data 2";
 
     pub fn content(&self) -> ContentId {
         let mut hasher = Hasher::new(CrateWorkspaceData::DOMAIN);
@@ -603,7 +631,14 @@ impl CrateWorkspaceData {
         hasher
             .update(&self.const_eval.steps.to_le_bytes())
             .update(&self.const_eval.memory.to_le_bytes())
-            .finish()
+            .update(&(self.trusted.len() as u64).to_le_bytes());
+        for trusted in &self.trusted {
+            hasher
+                .part(trusted.name.as_bytes())
+                .part(trusted.owner.as_bytes())
+                .part(trusted.reason.as_bytes());
+        }
+        hasher.finish()
     }
 
     pub fn is_atleast_187(&self) -> bool {

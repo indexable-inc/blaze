@@ -1,7 +1,8 @@
 //! The effects of the one walk (docs/v2/plan/design/pure-fns.md, "Effects"): every kind of thing
 //! an instance may do ([`Rule`]), as the bitset ([`EffectSet`]) each instance's summary carries
 //! with a witness per kind; the attribute effects that refuse some kinds ([`EffectDef`]:
-//! `#[blaze::pure]` here, `nopanic`, `noalloc` and `nonblocking` beside it); and the toolchain's
+//! `#[blaze::pure]` here, `nopanic`, `noalloc` and `nonblocking` beside it, and the crate-wide
+//! `ambient`, `unsafe` and `global_alloc` of `#![blaze::capabilities]`); and the toolchain's
 //! entry points a call of which counts as kinds at the call ([`MODELS`]).
 //!
 //! One walk answers every effect: checking one reads the root's summary, never walks again. A
@@ -57,10 +58,12 @@ pub enum Rule {
     ForeignUnwind,
     /// A call only an instance decides (a generic check only).
     Open,
+    /// `unsafe` code: an `unsafe` block written in the body, or the body of an `unsafe fn`.
+    Unsafe,
 }
 
 impl Rule {
-    pub const ALL: [Rule; 17] = [
+    pub const ALL: [Rule; 18] = [
         Rule::Io,
         Rule::Env,
         Rule::Clock,
@@ -78,6 +81,7 @@ impl Rule {
         Rule::ForeignUnknown,
         Rule::ForeignUnwind,
         Rule::Open,
+        Rule::Unsafe,
     ];
 
     /// What an instance with this kind does: "reads the environment".
@@ -100,6 +104,7 @@ impl Rule {
             Rule::ForeignUnknown => "calls a foreign function no table knows",
             Rule::ForeignUnwind => "calls a foreign function that may unwind",
             Rule::Open => "makes a call only an instance decides",
+            Rule::Unsafe => "runs `unsafe` code",
         }
     }
 
@@ -123,6 +128,7 @@ impl Rule {
             Rule::ForeignUnknown => "foreign_unknown",
             Rule::ForeignUnwind => "foreign_unwind",
             Rule::Open => "open",
+            Rule::Unsafe => "unsafe",
         }
     }
 }
@@ -191,6 +197,12 @@ pub struct EffectDef {
     /// Whether what a callee that never returns (its type's output is `!`) does counts. Not for
     /// purity: such a call gives no result to keep, so what it does can't make one differ.
     pub through_never: bool,
+    /// An effect of `#![blaze::capabilities]` (`effect_attrs::AMBIENT`, `UNSAFE`,
+    /// `GLOBAL_ALLOC`): asked of every function of a crate with the attribute, not of a marked
+    /// one; no attribute trusts a function for it, a crate's trust does
+    /// (`effect_attrs::crate_trust`); and a check does not refuse the root's parameters, as a
+    /// `dyn` or a function pointer it takes is walked where it is made.
+    pub crate_wide: bool,
 }
 
 /// What `#[blaze::pure]` refuses: everything that makes a result depend on more than the
@@ -215,15 +227,20 @@ pub const PURE: EffectDef = EffectDef {
     says: Rule::said,
     fix: "a pure function reads the outside world only through its arguments",
     through_never: false,
+    crate_wide: false,
 };
 
 /// Every attribute effect, in the order each summary keeps their sets. The effects lane appends
-/// `&NOPANIC, &NOALLOC, &NONBLOCKING` (defined in `effect_attrs`).
+/// `&NOPANIC, &NOALLOC, &NONBLOCKING` (defined in `effect_attrs`), then the crate-wide effects
+/// of `#![blaze::capabilities]`.
 pub const EFFECTS: &[&EffectDef] = &[
     &PURE,
     &crate::effect_attrs::NOPANIC,
     &crate::effect_attrs::NOALLOC,
     &crate::effect_attrs::NONBLOCKING,
+    &crate::effect_attrs::AMBIENT,
+    &crate::effect_attrs::UNSAFE,
+    &crate::effect_attrs::GLOBAL_ALLOC,
 ];
 
 /// The index of `effect` in [`EFFECTS`], by name: a copy with fewer `refuses` (a profile's

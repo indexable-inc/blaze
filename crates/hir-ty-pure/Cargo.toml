@@ -35,10 +35,12 @@ hir-ty-mir.workspace = true
 hir-ty-share.workspace = true
 intern.workspace = true
 span.workspace = true
+syntax.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
+triomphe.workspace = true
 
 [lints]
 workspace = true

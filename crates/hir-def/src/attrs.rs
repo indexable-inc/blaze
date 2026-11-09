@@ -716,6 +716,7 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                 }
                 (Some(Word::blaze), Some(Word::may_suspend)) => AttrFlags::MAY_SUSPEND,
                 (Some(Word::blaze), Some(Word::sans_io)) => AttrFlags::SANS_IO,
+                (Some(Word::blaze), Some(Word::capabilities)) => AttrFlags::CAPABILITIES,
                 (Some(Word::blaze), Some(Word::checkfree)) => AttrFlags::CHECKFREE,
                 (Some(Word::blaze), Some(Word::pure)) => AttrFlags::PURE,
                 (Some(Word::blaze), Some(Word::bits)) => AttrFlags::BLAZE_BITS,
@@ -896,6 +897,7 @@ name_set! {
     bench,
     bits,
     blaze,
+    capabilities,
     checkfree,
     clippy,
     cold,
@@ -1192,6 +1194,13 @@ bitflags::bitflags! {
         /// bounded by it counts as local in its crate's orphan check
         /// (`TraitFlags::SEALED`, `hir_ty::sealed_local_bound`, `hir-ty-coherence`).
         const BLAZE_SEALED = 1 << 100;
+        /// `#![blaze::capabilities]`, a word, inner, on a crate root: a blaze extension (inert
+        /// under rustc with `#![register_tool(blaze)]`), read by blaze-lints'
+        /// `blaze::capabilities`: no function of the crate may reach ambient IO, `unsafe` code
+        /// or the global heap outside the workspace's trusted crates (hir-ty-pure's `ambient`,
+        /// `unsafe` and `global_alloc`, docs/v2/plan/design/std.md). It changes diagnostics,
+        /// never code: no codegen key reads it.
+        const CAPABILITIES = 1 << 101;
         /// `#[blaze::linear]`, a word: a blaze extension (inert under rustc with
         /// `#![register_tool(blaze)]`), read by `hir-ty-linear`
         /// (docs/v2/plan/design/linear.md). On a struct or enum: a value of it may not be

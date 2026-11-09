@@ -237,6 +237,7 @@ impl Pack {
             }),
             toolchain: None,
             const_eval: Default::default(),
+            trusted: Box::default(),
         });
         let cwd = triomphe::Arc::new(AbsPathBuf::assert("/".into()));
         let expansions: Arc<Expansions> =

@@ -808,6 +808,46 @@ the trusted function's crate are kept in the proof. Or take the attribute off.
 
 **Allowing it.** `#[expect(blaze::pure, reason = "..")]` on the function.
 
+## `capabilities`
+
+**What it catches.** A function of a crate whose root says `#![blaze::capabilities]` (a blaze
+extension, opt-in; it changes diagnostics, never code) that, through any call, reaches one of
+three effects past the crates its workspace trusts:
+
+- `ambient`: std's file, environment, network, clock, randomness, process and thread entry
+  points, or a system call or other foreign call beneath them;
+- `unsafe`: an `unsafe` block written in the reached code, or an `unsafe fn`'s body (the block
+  `format_args!` makes, and a macro defined `#[allow_internal_unsafe]`, are not);
+- `global_alloc`: a call of the global allocator. An allocator the code is handed
+  (`Vec::new_in(arena)`) is not one.
+
+The finding names the function, the effect, the call or block that does it and the call path,
+each step with its file and line. It is `deny` by default: the crate asked for it. A crate
+without the attribute is not checked. What counts and why is in
+[v2/plan/design/std.md](v2/plan/design/std.md).
+
+**The trusted crates.** A workspace lists the crates whose code it has checked by hand:
+
+```toml
+[workspace.metadata.blaze.trusted]
+libc = { owner = "io", reason = "the C library's calls, behind bstd's Io" }
+```
+
+Each entry needs an `owner` and a `reason`; a toolchain crate can't be listed. What a trusted
+crate does itself, and what it reaches in the crates it depends on, does not count for any of
+the three effects; a closure or impl of another crate it calls still does. core and alloc are
+trusted for `ambient` and `unsafe` by default, but `alloc`'s allocation of the global heap
+(`Vec::new`) still counts for `global_alloc`; the rest of the toolchain is trusted for `unsafe`.
+
+**Why it matters.** A capability-based crate reaches the outside world only through what it is
+handed, so what a caller gives it is all it can do; the promise holds only when nothing it
+reaches, in any crate, takes the world another way.
+
+**How to fix it.** Take the IO, the allocator or the safe interface as an argument, move the
+code into a trusted crate (with an owner and a reason), or take the attribute off.
+
+**Allowing it.** `#[expect(blaze::capabilities, reason = "..")]` on the function.
+
 ## `outline_generic_body`
 
 **What it catches.** A generic function whose type parameters only feed a conversion at entry

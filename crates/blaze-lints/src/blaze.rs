@@ -227,6 +227,7 @@ pub enum Lint {
     Noalloc,
     Nonblocking,
     Pure,
+    Capabilities,
     Packable,
     SoaCandidate,
     BorrowWorkaround,
@@ -262,9 +263,16 @@ pub(crate) enum Kind {
 
 /// The lints that are `deny` by default rather than their kind's level: they fire only where
 /// the code asked for them (`#[blaze::checkfree]`, `#[blaze::nopanic]`, `#[blaze::noalloc]`,
-/// `#[blaze::nonblocking]`, `#[blaze::pure]`), so a finding is a broken promise.
-pub(crate) const DENY_BY_DEFAULT: &[Lint] =
-    &[Lint::Checkfree, Lint::Nopanic, Lint::Noalloc, Lint::Nonblocking, Lint::Pure];
+/// `#[blaze::nonblocking]`, `#[blaze::pure]`, `#![blaze::capabilities]`), so a finding is a
+/// broken promise.
+pub(crate) const DENY_BY_DEFAULT: &[Lint] = &[
+    Lint::Checkfree,
+    Lint::Nopanic,
+    Lint::Noalloc,
+    Lint::Nonblocking,
+    Lint::Pure,
+    Lint::Capabilities,
+];
 
 /// The group `blaze::hot`: every lint of hot code, a hasher nobody chose included
 /// (`default_hasher`, which grew from `hot_lint.py`'s SipHash maps), and a value that leaves
@@ -396,6 +404,7 @@ impl Lint {
         Lint::Noalloc,
         Lint::Nonblocking,
         Lint::Pure,
+        Lint::Capabilities,
         Lint::Packable,
         Lint::SoaCandidate,
         Lint::BorrowWorkaround,
@@ -456,6 +465,8 @@ impl Lint {
             | Lint::Noalloc
             | Lint::Nonblocking
             | Lint::Pure
+            // Fires only in a crate with `#![blaze::capabilities]`, `deny` there.
+            | Lint::Capabilities
             // Its fix passes stable Rust's borrow checker too, so it is right for any crate.
             | Lint::BorrowWorkaround
             // Fires only in a crate with `#![feature(blaze_verify)]`.
@@ -600,6 +611,7 @@ impl Lint {
             Lint::Noalloc => "noalloc",
             Lint::Nonblocking => "nonblocking",
             Lint::Pure => "pure",
+            Lint::Capabilities => "capabilities",
             Lint::Packable => "packable",
             Lint::SoaCandidate => "soa_candidate",
             Lint::BorrowWorkaround => "borrow_workaround",
@@ -695,6 +707,7 @@ impl Lint {
             Lint::Noalloc => concat!(general_docs!(), "#nopanic-noalloc-nonblocking"),
             Lint::Nonblocking => concat!(general_docs!(), "#nopanic-noalloc-nonblocking"),
             Lint::Pure => concat!(general_docs!(), "#pure"),
+            Lint::Capabilities => concat!(general_docs!(), "#capabilities"),
             Lint::Packable => concat!(general_docs!(), "#packable"),
             Lint::SoaCandidate => concat!(general_docs!(), "#soa_candidate"),
             Lint::BorrowWorkaround => concat!(general_docs!(), "#borrow_workaround"),
@@ -929,6 +942,9 @@ impl Lint {
             }
             Lint::Pure => {
                 "read the outside world only through the arguments (pass the value in, take a type parameter for a `dyn` or a function pointer), mark a callee proven by hand `#[blaze::pure(trusted = \"why\")]`, or take `#[blaze::pure]` off"
+            }
+            Lint::Capabilities => {
+                "take the IO, the allocator or the unsafe interface as an argument, list the crate that does it under `[workspace.metadata.blaze.trusted]` with an `owner` and a `reason`, or take `#![blaze::capabilities]` off"
             }
             Lint::Packable => {
                 "mark it `#[blaze::bits]` to store its `bool`, enum and small-integer fields at their bit widths, after checking that nothing borrows a field (`&s.f`, `&mut s.f`): a packed field has no address; or say why with `#[expect(blaze::packable, reason = \"..\")]`"

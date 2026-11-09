@@ -125,6 +125,7 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::noalloc",
             "blaze::nonblocking",
             "blaze::pure",
+            "blaze::capabilities",
             "blaze::borrow_workaround",
             "blaze::native_contracts",
             "blaze::dead",

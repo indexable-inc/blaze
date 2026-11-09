@@ -106,6 +106,7 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::Noalloc
         | Lint::Nonblocking
         | Lint::Pure
+        | Lint::Capabilities
         | Lint::Packable
         | Lint::SoaCandidate
         | Lint::BorrowWorkaround

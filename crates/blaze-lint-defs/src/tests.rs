@@ -52,7 +52,7 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
     let store = Store::default();
     let lint = lint("blaze::const_impure").expect("blaze's lint");
     assert_eq!(lint.default_level, Level::Warn);
-    assert_eq!(blaze_lints().len(), 89);
+    assert_eq!(blaze_lints().len(), 90);
     assert!(!lint.is_externally_loaded);
     // The compiler's own and the release build's; blaze-lints loads every other.
     let built: Vec<&str> =
@@ -66,13 +66,15 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
     let pedantic = group("blaze::pedantic_perf").expect("blaze's pedantic_perf group");
     let edition = group("blaze::edition").expect("blaze's edition group");
     // `deny` by default: they fire only where the code asked for them (`#[blaze::checkfree]`,
-    // `#[blaze::nopanic]`, `#[blaze::noalloc]`, `#[blaze::nonblocking]`, `#[blaze::pure]`).
+    // `#[blaze::nopanic]`, `#[blaze::noalloc]`, `#[blaze::nonblocking]`, `#[blaze::pure]`,
+    // `#![blaze::capabilities]`).
     let deny = [
         "blaze::checkfree",
         "blaze::nopanic",
         "blaze::noalloc",
         "blaze::nonblocking",
         "blaze::pure",
+        "blaze::capabilities",
     ];
     for it in &blaze_lints()[1..] {
         let in_ = |g: &Group| g.lints.iter().any(|m| m.name == it.name);

@@ -146,6 +146,18 @@ impl Refusal {
                 _ => format!("`{}`", step.name), // alloc: as above
             })
             .collect();
+        // A crate-wide effect is asked by the crate's `#![blaze::capabilities]`, not the function.
+        if EFFECTS.iter().any(|it| it.crate_wide && it.name == self.effect) {
+            return format!(
+                "`{}` is in a `#![blaze::capabilities]` crate, which refuses `{}`, but {}: {}, which {}; {}",
+                self.function,
+                self.effect,
+                self.says,
+                steps.join(" → "),
+                self.what,
+                self.fix
+            ); // alloc: as above
+        }
         format!(
             "`{}` is `#[blaze::{}]`, but {}: {}, which {}; {}",
             self.function,
@@ -263,7 +275,11 @@ fn checked(
         found.trust(db, func, reason, door);
         return FnPurity::Pure(found.proof(1));
     }
-    if let Some(refusal) = params(&cx, func, args.as_ref(), def, refuses, generic, &mut found) {
+    // A crate-wide effect checks every function of its crate as a root, so a `dyn` or function
+    // pointer parameter is the caller's to answer for, checked where that caller is.
+    if !def.crate_wide
+        && let Some(refusal) = params(&cx, func, args.as_ref(), def, refuses, generic, &mut found)
+    {
         return FnPurity::Impure(refusal);
     }
     let summary = summary(db, env.clone(), root.clone()); // clone: the query's key, reference counts
