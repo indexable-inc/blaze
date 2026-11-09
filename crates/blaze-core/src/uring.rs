@@ -1994,6 +1994,7 @@ impl Uring {
             _ => "a write from memory to",
         };
         let span = crate::spans::resolve(span, name, at, cache, what)
+            // alloc: an error path.
             .map_err(|why| io::Error::other(why.0))?;
         let direct = cache == crate::Cache::Bypassed;
         let file = self.positional_file(name, direct)?;

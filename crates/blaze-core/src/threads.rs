@@ -994,6 +994,7 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
         }
         Effect::ReadInto { file, at: from, into, cache, priority, .. } => {
             let span = crate::spans::resolve(&into, &file, from, cache, "a read into memory of")
+                // alloc: an error path.
                 .map_err(|why| io::Error::other(why.0))?;
             let read = at(root, &file, |path| {
                 let opened = fs::open_positional(path, false, cache)?;
@@ -1006,6 +1007,7 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
         }
         Effect::WriteFrom { file, at: offset, from, cache, .. } => {
             let span = crate::spans::resolve(&from, &file, offset, cache, "a write from memory to")
+                // alloc: an error path.
                 .map_err(|why| io::Error::other(why.0))?;
             at(root, &file, |path| {
                 let opened = fs::open_positional(path, true, cache)?;
@@ -1123,6 +1125,7 @@ fn at_priority<R>(
         crate::Priority::Demand => f(),
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         crate::Priority::Idle => crate::raw::idle_io(f),
+        // alloc: an error path.
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         crate::Priority::Idle => Err(io::Error::new(
             io::ErrorKind::Unsupported,

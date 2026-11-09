@@ -299,40 +299,40 @@ pub(crate) fn resolve(
     cache: Cache,
     what: &str,
 ) -> Result<Resolved, IoError> {
-    let refused = |why: String| {
-        // alloc: an error path.
-        Err(IoError(format!("{what} {file} at {at}, span {span}: {why}")))
-    };
     let Some(slot) = SLOTS.get(span.region.slot as usize) else {
-        return refused("no such region".into());
+        return Err(refusal(span, file, at, what, format_args!("no such region")));
     };
     if slot.state.load(Ordering::Acquire) != live(span.region.generation) {
-        return refused("its region is not registered".into());
+        return Err(refusal(span, file, at, what, format_args!("its region is not registered")));
     }
     let (base, len) = (slot.base.load(Ordering::Relaxed), slot.len.load(Ordering::Relaxed));
     if span.end() > len as u64 {
-        // alloc: an error path.
-        return refused(format!("past the region's end at {len}"));
+        return Err(refusal(span, file, at, what, format_args!("past the region's end at {len}")));
     }
     if span.len == 0 {
-        return refused("an empty span".into());
+        return Err(refusal(span, file, at, what, format_args!("an empty span")));
     }
     let start = base + span.offset as usize;
     if cache == Cache::Bypassed {
         let align = DIRECT_ALIGN;
         if at % align != 0 || start as u64 % align != 0 || u64::from(span.len) % align != 0 {
-            // alloc: an error path.
-            return refused(format!(
+            return Err(refusal(span, file, at, what, format_args!(
                 "bypassing the page cache takes an offset, address and length that are each a \
                  whole number of {align} bytes (blaze_core::spans::DIRECT_ALIGN); nothing goes \
                  through the cache instead"
-            ));
+            )));
         }
     }
     match NonNull::new(start as *mut u8) {
         Some(at) => Ok(Resolved { at, len: span.len as usize }),
-        None => refused("a region at address 0".into()),
+        None => Err(refusal(span, file, at, what, format_args!("a region at address 0"))),
     }
+}
+
+/// Why [`resolve`] refused `span` of the effect `what` of `file` at `at`.
+fn refusal(span: &Span, file: &FileName, at: u64, what: &str, why: fmt::Arguments<'_>) -> IoError {
+    // alloc: an error path.
+    IoError(format!("{what} {file} at {at}, span {span}: {why}"))
 }
 
 /// Memory of its own, zeroed and aligned to [`DIRECT_ALIGN`], registered for reads into and
