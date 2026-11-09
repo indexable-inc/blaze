@@ -493,19 +493,14 @@ ui {
     Padding: {l: $menu_pad, r: $menu_pad, t: $menu_pad, b: $menu_pad}
   }
   // In a window of its own (`Windowed`), as NSMenu is: past the main window's edge when it must be, kept on the screen,
-  // the system's shadow under it (its Lift is the in-window look, for a MenuPlate drawn in place).
+  // the system's shadow under it (its Lift is the in-window look, for a MenuPlate drawn in place). The plate is
+  // MenuPlate's: solid, one hairline. It is there at once and gone at once: no Transition, so an old menu never
+  // stands beside the one that replaced it.
   prefab Menu : ui.MenuPlate {
     Placed
     Windowed
-    // Glass: the system's vibrancy behind its window (src/window/overlay.rs), seen through a translucent plate edged by a
-    // faint light hairline, as a floating sheet of glass over the app.
-    Frost: {radius: 20, saturation: 1.6, sheen: 0.08}
-    Fill: $tone_glass
-    Edge: {dark: $tone_glass_edge.dark, light: $tone_glass_edge.light}
     Layer: {level: Overlay}
     Side: {edge: Top, dx: 0, dy: $menu_gap}
-    Transition: {kind: Grow, from: Bottom, scale: $menu_in_scale, fade: true}
-    Motion: {omega: $menu_omega, zeta: $menu_zeta}
   }
   // An item: the check gutter (`mark`, clear unless ui.MenuItemOn), the `label` and its `meta` just after it, then trailing muted words pushed to
   // the end (`about`, a line about it that truncates first; `keys`, its shortcut). Its highlight is a pill fading in on

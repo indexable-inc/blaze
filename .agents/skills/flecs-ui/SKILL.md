@@ -74,9 +74,9 @@ New UI need not covered here: add a primitive (component + prim prefab + a galle
 
 - A script has at most 64 reactive inputs: every distinct `$prop` and `$token` it reads and every `entity[Component]`
   read count, and past 64 the whole scene refuses to load (the app exits at launch). Keep fixed looks out of templates:
-  a token-heavy value (a Sheen preset, an icon's size and padding) goes in a prefab in a prefab-only file (tree.flecs,
+  a token-heavy value (an icon's size and padding) goes in a prefab in a prefab-only file (tree.flecs,
   parts.flecs) that the template's part inherits (`kind_icon : hn.tree.Kind {}`) or reads once
-  (`Sheen: hn.tree.SheenRun[Sheen]`); what only Rust knows (a kind's mark) Rust sets. Two changes that each fit can
+  (`Fill: hn.Kind.shell[Fill]`); what only Rust knows (a kind's mark) Rust sets. Two changes that each fit can
   together pass 64 on main: `scenes_load` is the check, run it on the merged tree.
 
 - The 4.2 changes (explicit deferral, `Copy`, Parent storage) are in the `flecs` skill. Here: mutate from systems
@@ -133,8 +133,8 @@ template hn.ObjRow {
 ## Tokens, theme and look
 
 - One theme: every colour is a role at the top of 00-tokens.flecs (`tone_<role>`; dark is near-black with a cool
-  undertone and one electric blue, light the blaze site's paper): grounds `ground`, `sidebar`, `card`, `raised`, `glass`
-  and `glass_edge` (what floats in a window of its own), `well` (fields, code), `term_ground`; lines
+  undertone and one blue for links and focus rings, light the blaze site's paper): grounds `ground`, `sidebar`, `card`, `raised`
+  (what floats, solid), `well` (fields, code), `term_ground`; lines
   `line`, `line_strong`; inks `ink_strong`, `ink`, `ink_muted`, `ink_faint`; washes `hover`, `wash`, `selection`,
   `selection_focus`, `press`, `scrim`; `accent`, `accent_wash`, `on_accent`, `link`, `code_ink`; states `success`,
   `warning`, `error` and their `_wash`. Below them sit the palettes (kinds, brand marks, file types, chart series,
@@ -152,9 +152,11 @@ template hn.ObjRow {
 - Taste: dark, sleek and quiet, a cockpit at night, native macOS underneath. Concretely:
   - **Near-black, few steps.** Grounds a step or two apart on a cool near-black; hairlines barely over the ground; no
     grey slabs. Colour only where it means something (a state, the one accent, a series), never per kind for fun.
-  - **Glass only for what floats.** What sits in a window of its own (ui.Menu: menus, popovers, hover cards) is glass:
-    `Frost` on its node puts the system's vibrancy behind its window (src/window/overlay.rs), seen through
-    `tone_glass` and edged by `tone_glass_edge`. Panels under it stay solid.
+  - **Ink only.** Four inks on one ground. A kind's mark, a brand's mark, a slider, a highlight and a selection are ink
+    or a step of grey, never a hue. The accent is for a link and a focus ring; red is for a real failure (an exit by
+    SIGINT or SIGTERM is "stopped", not a failure).
+  - **Plates only where something floats or is typed into.** One hairline, no shadow, no glass, corners of 8. A menu
+    is ui.MenuPlate's solid plate in a window of its own.
   - **Type is the hierarchy.** One UI family (Inter) at macOS sizes; weight, size and ink tone separate levels before
     any box or rule does. Rows carry no noise: what matters now trails a row (what an agent is doing, the command or
     file), when is a tooltip, never a timestamp column.
@@ -163,17 +165,18 @@ template hn.ObjRow {
     `cod-person` (`look::kind_icon`) or, on a chip, its state (`hn.chat_status`); a brand's own vector mark
     (`hn.Kind.<kind>`) is the only exception.
   - **Live work says what and how long.** Anything running shows its live step in words (the step, never the tool:
-    "blaze check · 6 min", not "ts") and its elapsed time, ticking, with the one breathing glyph, so a long wait never
+    "blaze check · 6 min", not "ts") and its elapsed time, ticking, with the one breathing glyph (the only motion left), so a long wait never
     looks hung; a card under the pointer says the rest (chat.rs `fill_chat_activity`).
-  - **State by light, not marks.** Working breathes, idle fades, done earns a brief check (or a cross), failure is the
-    error ink. No badges for states that are already visible.
+  - **State by ink, not marks.** A working row's mark is in the strong ink and its step trails it in words; at rest
+    the mark is faint; ended, the title is muted; failure is the error ink. No badges, no sheen, no dots.
   - **Show what changed, not what was looked at.** Summaries name their targets ("Edited chat.rs, ran cargo test");
     reads and listings are said only when nothing else happened.
   - **Lists are live.** A tree shows what is running or just finished; what is done leaves on its own for the Archive.
   - **Chrome only when asked.** A pane shows its content; its toolbar comes when it is used (the browser pane's
     address on cmd+L), a detail view when its summary is pressed (the context donut opening to its parts).
-  - **Motion lands, it does not glide.** Springs settle in under a tenth of a second; selection is where it is at once;
-    rows arriving or leaving still move so the eye can follow. Never a step, never a slide that reads as lag.
+  - **Nothing moves on its own and nothing eases.** A hover, a menu's highlight, a menu, a popover and a sheet are
+    there at once and gone at once (no `Transition`, no hover spring), so two states never show together. Ask before
+    adding any motion. What still moves follows the hand or the content: a scroll, a fold, text streaming in.
   - **Nothing written while you were away animates.** Text arriving in a pane you are watching streams in; switching
     to it shows what came meanwhile at rest.
 

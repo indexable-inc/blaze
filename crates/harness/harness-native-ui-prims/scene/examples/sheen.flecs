@@ -1,30 +1,12 @@
-// ui.Shimmer and Sheen: words with a band of light sweeping through them, at each rhythm a working sidebar row's title
-// takes (harness-native's scene/widgets/rows.flecs, tokens sheen_* in 00-tokens.flecs): a thought's slow drift, a
-// command's quick passes, an edit's steady cadence, a read's medium one, a sub-agent's two bands chasing. The last line's
-// Sheen has strength 0: words at rest, drawn in their own ink. A shot any time after the first second catches the bands
-// mid-pass (each line starts at its own place in its cycle).
+// ui.Shimmer and Sheen: words with a band of light sweeping through them (tokens sheen_think_* in 00-tokens.flecs). The
+// last line's Sheen has strength 0: words at rest, drawn in their own ink. The app itself uses none: nothing in it moves
+// on its own; the primitive is harness-video's.
 
 @tree ChildOf
 ex {
   prefab SheenDemo : ex.Card {
     label : ui.Label { Text: {s: "SHEEN, A BAND OF LIGHT THROUGH WORDS"} }
     think : ui.Shimmer { Text: {s: "Thinking through the tree's fold"} }
-    run : ui.Shimmer {
-      Text: {s: "cargo test -p harness-native"}
-      Sheen: {period: $sheen_run_period, rest: $sheen_run_rest, band: $sheen_run_band, strength: $sheen_run_strength, still: $sheen_still, ease: $sheen_run_ease, bands: 1, phase: 0, scatter: true, dark: $tone_sheen.dark, light: $tone_sheen.light}
-    }
-    edit : ui.Shimmer {
-      Text: {s: "Editing rows.flecs"}
-      Sheen: {period: $sheen_edit_period, rest: $sheen_edit_rest, band: $sheen_edit_band, strength: $sheen_edit_strength, still: $sheen_still, ease: $sheen_edit_ease, bands: 1, phase: 0, scatter: true, dark: $tone_sheen.dark, light: $tone_sheen.light}
-    }
-    read : ui.Shimmer {
-      Text: {s: "Reading paint.rs"}
-      Sheen: {period: $sheen_read_period, rest: $sheen_read_rest, band: $sheen_read_band, strength: $sheen_read_strength, still: $sheen_still, ease: $sheen_read_ease, bands: 1, phase: 0, scatter: true, dark: $tone_sheen.dark, light: $tone_sheen.light}
-    }
-    agent : ui.Shimmer {
-      Text: {s: "Two agents chasing a bug"}
-      Sheen: {period: $sheen_agent_period, rest: $sheen_agent_rest, band: $sheen_agent_band, strength: $sheen_agent_strength, still: $sheen_still, ease: $sheen_agent_ease, bands: $sheen_agent_bands, phase: 0, scatter: true, dark: $tone_sheen.dark, light: $tone_sheen.light}
-    }
     rest : ui.Shimmer {
       Text: {s: "At rest, its own ink"}
       Sheen: {period: 0, rest: 0, band: 0, strength: 0, still: 0, ease: 0, bands: 1, phase: 0, scatter: false, dark: $tone_sheen.dark, light: $tone_sheen.light}

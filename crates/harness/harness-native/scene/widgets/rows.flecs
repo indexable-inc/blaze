@@ -4,10 +4,9 @@
 // their runtime state across a re-run: a re-run sets components, it does not remake entities, nor remove a component an
 // arm set before (so where a part's look depends on a prop, every arm sets it).
 //
-// Notion's sidebar: calm one-line rows, no status dots. How a row stands is in its title's ink (`look`: "on" while
-// selected, "rest" while live, "done" once it ended), a band of light sweeping through its title while it works (a Sheen
-// at the pace of what it does: `pace`, `busy`; tokens sheen_* in 00-tokens.flecs), and a few muted words trailing it
-// (`meta`), red only when it went wrong (`alarm`). The parts are hn.tree's (scene/widgets/tree.flecs).
+// Calm one-line rows, no status dots, nothing that moves. How a row stands is in its title's ink (`look`: "on" while
+// selected, "rest" while live, "done" once it ended), its mark's ink (strong while it works, faint else: the host sets
+// it), and a few faint words trailing it (`meta`: what it is doing now), red only when it went wrong (`alarm`). The parts are hn.tree's (scene/widgets/tree.flecs).
 using flecs.script
 
 @tree ChildOf
@@ -20,14 +19,12 @@ hn {
   // tooltip). On hover its shortcut
   // (`hint`) takes the trailing words' place. `focus`: the selection while the tree has the keyboard. `edit`: its name is
   // being renamed (cmd+R): the name is the field's words (the host sets their caret and selection), its pill the field.
-  // `menu`: its menu is open (a right press on it, src/app/row_menu.rs): ringed in the accent. `pace`: what its agent is
-  // doing now (src/app.rs doing_of; "" at rest), the rhythm its title's sheen sweeps at; the words of it lead its tooltip.
+  // `menu`: its menu is open (a right press on it, src/app/row_menu.rs): ringed in the accent.
   @tree ChildOf
   template ObjRow : Row {
     prop look: string = "rest"
     prop under: string = ""
     prop mark: string = ""
-    prop pace: string = ""
     prop alarm: bool = false
     prop meta: string = ""
     prop why: string = ""
@@ -40,10 +37,9 @@ hn {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $tree_row_h, min: 0, max: 0}}
     Padding: {l: indent($depth, $tree_pad, $indent_step) + $tree_gutter, r: $tree_pad_r, t: 0, b: 0}
     hang { hn.Hang: {obj: $obj, depth: $depth, kids: $kids, open: $open, mark: $mark} }
-    // What it is at a glance: an agent's mark (Claude's in its orange, the others muted) or a shell's terminal glyph,
-    // tree_kind across before its title (src/app.rs sync_view sets it with look::kind_mark, outside the template's
-    // reactive inputs). A sub-agent up but idle has it breathe slowly and deep: asleep, not at work (at work its
-    // title's sheen sweeps).
+    // What it is at a glance: an agent's mark or a shell's terminal glyph, in ink only, tree_kind across before its
+    // title (src/app.rs sync_view sets it with look::kind_mark, outside the template's reactive inputs): the strong ink
+    // while it works, the faint ink else.
     kind_icon : hn.tree.Kind {}
     name : hn.tree.Head {
       Text: {s: $name}
@@ -61,34 +57,9 @@ hn {
         }
         TextStyle: {size: $size_row, line: $line_row, role: 0, bold: 0, weight: $weight_tree}
       }
-      // While it works, a band of light through its letters at the pace of what it does: a slow drift while it thinks,
-      // quick crisp passes while a command runs, steady while it edits or writes, medium while it reads or uses a tool,
-      // two bands chasing while a sub-agent works. At rest a sheen of strength 0, which lights nothing: the way a re-run
-      // stops one (it cannot remove it).
-      if $pace == "think" {
-        Sheen: hn.tree.SheenThink[Sheen]
-      } else {
-        if $pace == "run" {
-          Sheen: hn.tree.SheenRun[Sheen]
-        } else {
-          if $pace == "edit" {
-            Sheen: hn.tree.SheenEdit[Sheen]
-          } else {
-            if $pace == "read" {
-              Sheen: hn.tree.SheenRead[Sheen]
-            } else {
-              if $pace == "agent" {
-                Sheen: hn.tree.SheenAgent[Sheen]
-              } else {
-                Sheen: hn.tree.SheenRest[Sheen]
-              }
-            }
-          }
-        }
-      }
     }
     spacer : ui.Spacer {}
-    // Folded with work under it: a faint dot and how many, a command's sheen through the count; a press on the chevron
+    // Folded with work under it: a faint dot and how many; a press on the chevron
     // (or Right) opens it. Gone when nothing works under it, or once it is open and they show.
     if $under != "" {
       under : ui.Row {
@@ -102,7 +73,6 @@ hn {
         }
         count : hn.tree.Trail {
           Text: {s: $under}
-          Sheen: hn.tree.SheenRun[Sheen]
         }
       }
     }
@@ -160,7 +130,7 @@ hn {
   }
 
   // A shell run (or one of its pipeline stages) under its session, on the session rows' grid: its command, shortened
-  // (src/app.rs short_cmd) in the quieter run ink, a sheen through it at a command's pace while it runs (`busy`), and
+  // (src/app.rs short_cmd) in the quieter run ink, a step brighter while it runs (`busy`), and
   // trailing how long it took
   // (`meta`; on hover, or always when `keep`: a failure, lost, pending, skipped; red when `alarm`). A folded session
   // shows only its running runs, so a finished one folds away on its own.
@@ -186,16 +156,11 @@ hn {
       if $look == "on" {
         Fill: $tone_ink_strong
       } else {
-        if $look == "done" {
-          Fill: $tone_ink_muted
+        if $busy {
+          Fill: $tone_ink
         } else {
           Fill: $tone_ink_muted
         }
-      }
-      if $busy {
-        Sheen: hn.tree.SheenRun[Sheen]
-      } else {
-        Sheen: hn.tree.SheenRest[Sheen]
       }
     }
     spacer : ui.Spacer {}
@@ -231,23 +196,20 @@ hn {
     }
   }
 
-  // The archive row at the sidebar's bottom (`selected`: its glyph in the accent while the Archive, or an object opened
-  // from it, is selected): an archive box that rises and grows on the row's hover (its HoverAmt spring) and bounces when an object is
-  // archived (its Bump, kicked by the host). Clicked, the Archive pane (hn.ArchivePane) takes the main card.
+  // The archive row at the sidebar's bottom (`selected`: its glyph in the strong ink while the Archive, or an object opened
+  // from it, is selected): an archive box, still. Clicked, the Archive pane (hn.ArchivePane) takes the main card.
   @tree ChildOf
   template ArchiveRow : Row {
     (IsA, ui.IconButton)
     Tooltip: {text: "Archive"}
     if $selected {
-      Inks: {rest: $tone_accent, hover: $tone_accent}
+      Inks: {rest: $tone_ink_strong, hover: $tone_ink_strong}
     } else {
       Inks: {rest: $tone_ink_muted, hover: $tone_ink_strong}
     }
     icon : ui.Symbol {
       Size: {w: {kind: Fixed, value: $tree_icon, min: 0, max: 0}, h: {kind: Fixed, value: $tree_icon, min: 0, max: 0}}
       Icon: {glyph: ""}
-      HoverLift: {lift: $archive_lift, scale: $archive_scale, kick_lift: $archive_kick_lift, kick_scale: $archive_kick_scale, omega: $archive_omega, zeta: $archive_zeta}
-      Bump: {spring: {x: 0, v: 0}}
     }
     async {
       while true {

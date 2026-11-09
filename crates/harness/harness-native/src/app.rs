@@ -11,7 +11,7 @@ use crate::pack::Frame;
 use crate::pane::TermNode;
 use crate::term::{self, Button, Grid, KeyAction, MouseAct, Sel};
 use crate::text::TypeLook;
-use harness_native_api::spring::{Spring, Tune};
+use harness_native_api::spring::Spring;
 use harness_native_api::{APP, Clock, HoverAmt, HoverSteered, Lit, moving, settle};
 use harness_native_flecs::prelude::*;
 use harness_native_model as model;
@@ -189,25 +189,6 @@ pub struct Chrome {
     pub title_x: f32,
 }
 
-/// A node's motion, set in the scene (hn.ArchiveRow's icon and count): on its row's hover (the row's `HoverAmt`
-/// spring) it rises `lift` points and grows to `scale`; kicked (an object archived) its [`Bump`] spring, pushed at
-/// `omega` and ringing out at `omega` / `zeta`, adds up to `kick_lift` points of rise and `kick_scale` of size.
-#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
-pub struct HoverLift {
-    pub lift: f32,
-    pub scale: f32,
-    pub kick_lift: f32,
-    pub kick_scale: f32,
-    pub omega: f32,
-    pub zeta: f32,
-}
-
-/// The spring a [`HoverLift`] node bounces on: at rest at 0, kicked by a push of velocity.
-#[derive(Component, Clone, Copy, Debug, Default)]
-pub struct Bump {
-    pub spring: Spring,
-}
-
 pub struct App {
     pub world: World,
     /// Fonts, glyph atlas, layouts and pictures, and the paint pass shared with harness-video (harness-native-render).
@@ -285,9 +266,9 @@ pub struct App {
     pruned: bool,
     /// Remember the selected object in native.json (not for the offscreen shot).
     pub persist: bool,
-    /// An offscreen shot's `HARNESS_NATIVE_SHOT_WORKING` (src/shot.rs): every session row shows at work, at these paces in
-    /// turn, and every run row too; empty, rows show what is really at work.
-    pub shot_working: Vec<&'static str>,
+    /// An offscreen shot's `HARNESS_NATIVE_SHOT_WORKING` (src/shot.rs): every session row and every run row shows at
+    /// work; unset, rows show what is really at work.
+    pub shot_working: bool,
     /// An offscreen shot's `HARNESS_NATIVE_SHOT_PLAN` (src/shot.rs, chat/plan.rs): every chat's status bar shows this plan;
     /// empty, each shows what its agent kind last reported.
     pub shot_plan: Vec<harness_proto::event::PlanWindow>,
@@ -392,8 +373,6 @@ fn scene_world() -> Result<World, String> {
     stats::register(&world);
     crate::keys::register(&world);
     view::register(&world);
-    world.component::<HoverLift>().writable();
-    world.component::<Bump>().writable();
     world.component::<chat::GenFeel>().writable();
     world.component::<chat::GenOn>();
     script::install(&world);
@@ -450,19 +429,8 @@ impl App {
         harness_native_ui_draw::install(w);
         // den-native-hover: each hoverable's hover spring toward whether the pointer is on it.
         let app_id = *app.id();
-        // Each kicked Bump rings back to rest on its HoverLift's spring.
-        world.system_named::<(&mut Bump, &HoverLift)>("Bump").each_iter(|it, _, (b, m)| {
-            if settle(
-                &mut b.spring,
-                0.0,
-                Tune { omega: m.omega.max(1.0), zeta: m.zeta.max(0.05) },
-                it.delta_time(),
-            ) {
-                moving(&it.world());
-            }
-        });
         world.system_named::<&mut HoverAmt>("Hover").each_iter(move |it, row, h| {
-            let (e, w, dt) = (it.entity(row), it.world(), it.delta_time());
+            let (e, w) = (it.entity(row), it.world());
             // On it, or on a part of it that takes the pointer itself (a row's disclosure chevron, a control deep in a
             // chat's drawn view, whose hover shows the view's code button).
             // A menu's item lights where its owner keeps the highlight (`Lit`), which the pointer and the keys move.
@@ -473,7 +441,11 @@ impl App {
                     std::iter::successors(Some(t), |n| n.parent()).take(HOVER_DEPTH).any(|n| n.id() == e.id())
                 })
             };
-            if settle(&mut h.spring, f32::from(u8::from(on)), Tune { omega: 34.0, zeta: 1.0 }, dt) {
+            // Hover lands at once, never eased: a wash fading out on one row while it fades in on the next shows two
+            // rows lit, and in a menu two highlights with one line about only one of them.
+            let to = f32::from(u8::from(on));
+            if h.spring.x != to || h.spring.v != 0.0 {
+                h.spring = Spring::at(to);
                 moving(&w);
             }
         });
@@ -590,7 +562,7 @@ impl App {
             pending_archive: false,
             pruned: false,
             persist: true,
-            shot_working: Vec::new(), // alloc: empty but in a shot
+            shot_working: false,
             shot_plan: Vec::new(), // alloc: empty but in a shot
             focused: true,
             title: "harness".into(),
@@ -959,9 +931,8 @@ impl App {
             .map_or(0, |d| d.as_millis() as u64);
         // Each row is a template instance (scene/widgets/rows.flecs): the row's facts as props, written only when one
         // changed (View::props), and flecs re-runs only the parts that read it. A session's row leads with its kind's mark
-        // (`kind`); no status dots: how a row stands is in its title's ink (`look`), the sheen through it while it works
-        // (`pace`, `busy`) and a few muted words trailing it (`meta`). Folded rows count what works under them (`under`).
-        let mut forced = 0usize;
+        // (`kind`); no status dots: how a row stands is in its title's ink (`look`), its mark's ink while it works
+        // and a few muted words trailing it (`meta`). Folded rows count what works under them (`under`).
         view::for_each_of(tree, info, |row, r, new| {
             if new {
                 row.set(HoverAmt::default());
@@ -970,7 +941,9 @@ impl App {
             let o = w.entity_from_id(e);
             let status = me.status_of(e);
             let code = o.try_cloned::<&model::ExitCode>().map(|c| c.code).filter(|&c| c != 0);
-            let failed = status == "killed" || code.is_some();
+            // Ended by an interrupt or a terminate (128 + SIGINT, 128 + SIGTERM): stopped on purpose, not a failure.
+            let stopped = matches!(code, Some(130 | 143));
+            let failed = status == "killed" || (code.is_some() && !stopped);
             let selected = sel == Some(e);
             // A sub-agent up but idle sleeps: its title faded like what ended (no mark: only a failure earns one), and it
             // sorts after the ones at work (the model's rows).
@@ -994,8 +967,7 @@ impl App {
                 ("menu", Prop::Bool(menu_for == Some(e))),
             ];
             if me.run_of(e).is_some() {
-                // A run: its command, cut to what says what it does; a sheen through it at a command's pace while it
-                // runs; how long it took (and how it failed) on hover, a failure's always.
+                // A run: its command, cut to what says what it does; how long it took (and how it failed) on hover, a failure's always.
                 let name = o.try_cloned::<&model::Name>().map(|n| short_cmd(n.s.as_str())).unwrap_or_default();
                 let meta = me.run_meta(e);
                 let keep = failed || matches!(status, "lost" | "pending" | "skipped");
@@ -1005,18 +977,17 @@ impl App {
                         &common[..],
                         &[
                             ("name", Prop::Str(&name)),
-                            ("busy", Prop::Bool(status == "running" || !me.shot_working.is_empty())),
+                            ("busy", Prop::Bool(status == "running" || me.shot_working)),
                             ("alarm", Prop::Bool(failed)),
                             ("meta", Prop::Str(&meta)),
                             ("keep", Prop::Bool(keep)),
-                            ("mark", Prop::Str(done_mark(status, code, depth.max(1)))),
+                            ("mark", Prop::Str(done_mark(status, code.filter(|_| !stopped), depth.max(1)))),
                         ],
                     ]
                     .concat(),
                 );
             } else {
-                // A session: its title, a sheen sweeping through it while its agent works (at the pace of what it does);
-                // trailing how it ended when that went wrong, else how long ago it started or ended, and its shortcut in
+                // A session: its title; trailing how it ended when that went wrong, else how long ago it started or ended, and its shortcut in
                 // that place on hover.
                 let name = o
                     .try_cloned::<&model::Name>()
@@ -1032,25 +1003,12 @@ impl App {
                     && (o.has(model::Busy::id())
                         || o.try_cloned::<&model::Object>()
                             .is_some_and(|ob| me.chats.borrow().get(&ob.id).is_some_and(|t| t.busy)));
-                // What it is doing while it works (the pace its title's sheen sweeps at, the command or file trailing it,
-                // its words first in the tooltip), or how it went wrong; else nothing, the title has the row (its name
-                // mostly is its folder already). Where it works and when it started or ended are the row's tooltip.
+                // HARNESS_NATIVE_SHOT_WORKING: a shot shows every session at work.
+                let busy = busy || me.shot_working;
+                // What it is doing while it works (the command or file trailing it, its words first in the tooltip), or
+                // how it went wrong; else nothing, the title has the row (its name mostly is its folder already). Where
+                // it works and when it started or ended are the row's tooltip.
                 let doing = if busy { o.try_cloned::<&model::Object>().and_then(|ob| me.chats.borrow().get(&ob.id).and_then(doing_of)) } else { None };
-                // At work with nothing said yet: a program writing output keeps a command's pace, an agent a thought's.
-                let pace = match &doing {
-                    Some(d) => d.pace,
-                    None if busy && !matches!(model::kind_name(o), "claude" | "codex" | "cursor") => "run",
-                    None if busy => "think",
-                    None => "",
-                };
-                // HARNESS_NATIVE_SHOT_WORKING: a shot shows every session at work, at the paces it names in turn.
-                let (busy, pace) = match me.shot_working.get(forced % me.shot_working.len().max(1)) {
-                    Some(&p) => {
-                        forced += 1;
-                        (true, p)
-                    }
-                    None => (busy, pace),
-                };
                 let when = ago(now.saturating_sub(model::when(o)));
                 let folder = o.try_cloned::<&model::Cwd>().map(|c| folder_of(c.s.as_str())).unwrap_or_default();
                 // What it is (its icon on the row) and its number, which its name never carries: the tooltip's last words.
@@ -1063,6 +1021,7 @@ impl App {
                 };
                 let (meta, why) = match (status, code) {
                     ("killed", _) => ("killed".to_owned(), format!("{folder} \u{b7} killed {when} ago")),
+                    (_, Some(c)) if stopped => ("stopped".to_owned(), format!("{folder} \u{b7} stopped (exit {c}) {when} ago")),
                     (_, Some(c)) => (format!("exit {c}"), format!("{folder} \u{b7} exited with code {c} {when} ago")),
                     ("lost", _) => ("lost".to_owned(), format!("{folder} \u{b7} lost (the daemon restarted under it)")),
                     ("running", _) => match &doing {
@@ -1072,13 +1031,13 @@ impl App {
                     _ => (String::new(), format!("{folder} \u{b7} ended {when} ago")),
                 };
                 let why = why + &number;
-                let mark = done_mark(status, code, depth);
-                // Its name being renamed (chat/rename.rs): the field's words in its place, still (no sheen) and alone
+                let mark = done_mark(status, code.filter(|_| !stopped), depth);
+                // Its name being renamed (chat/rename.rs): the field's words in its place, alone
                 // on the row (no trailing words or shortcut).
                 let edit = me.rename_shown(e);
-                let (name, pace, meta, hint) = match &edit {
-                    Some((shown, _)) => (shown.clone(), "", String::new(), String::new()),
-                    None => (name, if busy { pace } else { "" }, meta, hint),
+                let (name, meta, hint) = match &edit {
+                    Some((shown, _)) => (shown.clone(), String::new(), String::new()),
+                    None => (name, meta, hint),
                 };
                 row.props(
                     "hn.ObjRow",
@@ -1087,7 +1046,6 @@ impl App {
                         &[
                             ("name", Prop::Str(&name)),
                             ("under", Prop::Str(&under)),
-                            ("pace", Prop::Str(pace)),
                             ("alarm", Prop::Bool(failed || status == "lost")),
                             ("meta", Prop::Str(&meta)),
                             ("why", Prop::Str(&why)),
@@ -1098,22 +1056,13 @@ impl App {
                     ]
                     .concat(),
                 );
-                // Its kind's mark before its title: Claude's in its orange, any other muted; breathing slow and deep while
-                // it sleeps (a sub-agent up but idle).
+                // Its kind's mark before its title, in ink only, and the row's one sign of work: the strong ink while its
+                // agent works, the faint ink at rest or ended. Nothing moves.
                 if let Some(i) = row.part("kind_icon") {
-                    let kind = model::kind_name(o);
-                    crate::look::kind_mark(w, i.entity(), kind);
-                    if kind != "claude" {
-                        let f = tone(w, "ink_muted");
-                        if i.entity().try_cloned::<&Fill>() != Some(f) {
-                            i.entity().set(f);
-                        }
-                    }
-                    let low = if sleeps && !selected { crate::look::width(w, "tree_sleep") } else { 1.0 };
-                    match i.entity().try_cloned::<&crate::look::Breath>() {
-                        Some(b) if (b.low - low).abs() < 1e-3 => {}
-                        Some(b) => _ = i.entity().set(crate::look::Breath { low, ..b }),
-                        None => _ = i.entity().set(crate::look::Breath { spring: Spring::at(1.0), up: false, low }),
+                    crate::look::kind_mark(w, i.entity(), model::kind_name(o));
+                    let f = tone(w, if busy { "ink_strong" } else { "ink_faint" });
+                    if i.entity().try_cloned::<&Fill>() != Some(f) {
+                        i.entity().set(f);
                     }
                 }
                 if let Some((_, units)) = edit {
@@ -1287,23 +1236,7 @@ impl App {
             o.add(model::Closed::id());
             o.remove(model::Pinned::id());
             self.save_marks();
-            self.kick_archive();
         }
-    }
-
-    /// Kick the archive row's springs (its parts with `HoverLift` and `Bump`): each rings out from a push of its omega.
-    fn kick_archive(&mut self) {
-        let row = View::of(self.world.entity_from_id(self.ids.archive_row));
-        for name in ["icon", "count"] {
-            let Some(p) = row.part(name) else { continue };
-            let e = p.entity();
-            if let (Some(m), Some(mut b)) = (e.try_cloned::<&HoverLift>(), e.try_cloned::<&Bump>())
-            {
-                b.spring.v = m.omega;
-                e.set(b);
-            }
-        }
-        self.poke();
     }
 
     /// Take object `e` back out of the Archive into the tree (its row's menu, Unarchive): no longer closed, and kept there
@@ -2232,18 +2165,6 @@ impl App {
                 self.emit_spark(d, e, rect, p.alpha);
                 continue;
             }
-            // A HoverLift node: how far its row's hover and its bump have moved it (read before the drawing borrows self).
-            let motion = e.try_cloned::<&HoverLift>().map(|m| {
-                let hover = e
-                    .parent()
-                    .and_then(|r| r.try_cloned::<&HoverAmt>())
-                    .map_or(0.0, |h| h.spring.x.clamp(0.0, 1.0));
-                let bump = e.try_cloned::<&Bump>().map_or(0.0, |b| b.spring.x);
-                (
-                    -(m.lift * hover + m.kick_lift * bump),
-                    (1.0 + (m.scale - 1.0) * hover + m.kick_scale * bump).max(0.1),
-                )
-            });
             let at = match self.paint.get_mut().node(d, e, &p, laid, p.dark(dark), held == Some(id), sc, upload) {
                 Ok(at) => at,
                 Err(err) => {
@@ -2274,18 +2195,6 @@ impl App {
             if let Some(turn) = turn {
                 for g in &mut d.glyphs[ng..] {
                     g.clip[2] = turn;
-                }
-            }
-            // A HoverLift node: its glyphs risen and scaled about its centre by its row's hover and its bump.
-            if let Some((dy, k)) = motion {
-                let (cx, cy) = (laid.x + laid.w * 0.5, laid.y + laid.h * 0.5);
-                for g in &mut d.glyphs[ng..] {
-                    g.rect = [
-                        cx + (g.rect[0] - cx) * k,
-                        cy + (g.rect[1] - cy) * k + dy,
-                        g.rect[2] * k,
-                        g.rect[3] * k,
-                    ];
                 }
             }
             // Cut to its band: soft at an edge with more beyond it (its clip's ClipFade: the tree's, a chat's; not a scroller).
@@ -2507,11 +2416,9 @@ fn done_mark(status: &str, code: Option<i32>, depth: usize) -> &'static str {
     }
 }
 
-/// What a working agent is doing now, from its transcript's last item: the pace its title's sheen sweeps at
-/// (scene/widgets/rows.flecs: `think`, `run`, `edit`, `read`, `agent`), the words its tooltip leads with, and the
+/// What a working agent is doing now, from its transcript's last item: the words its tooltip leads with, and the
 /// detail its row trails (the command, the file, the pattern, the page).
 struct Doing {
-    pace: &'static str,
     what: &'static str,
     detail: String,
 }
@@ -2538,37 +2445,37 @@ fn doing_of(t: &model::chat::Transcript) -> Option<Doing> {
     // A message still queued is not what it is on.
     let last = (0..t.items.len()).rev().find(|&k| !t.is_queued(k)).map(|k| &t.items[k])?;
     Some(match last {
-        Item::Thinking { done: false, .. } => Doing { pace: "think", what: "Thinking", detail: "thinking".to_owned() },
+        Item::Thinking { done: false, .. } => Doing { what: "Thinking", detail: "thinking".to_owned() },
         // A harness REPL cell: what its running step does ("blaze check", "Reading chat.rs"), never the tool's name.
         Item::Tool { block, result: None, .. } if t.details.contains_key(block) => {
             match t.details[block].effects.iter().rev().find(|e| e.status == "running") {
-                Some(e) if e.kind == "exec" => Doing { pace: "run", what: "Running a command", detail: chat::step_words(e) },
-                Some(e) => Doing { pace: "read", what: "Working", detail: chat::step_words(e) },
-                None => Doing { pace: "run", what: "Running code", detail: "running code".to_owned() },
+                Some(e) if e.kind == "exec" => Doing { what: "Running a command", detail: chat::step_words(e) },
+                Some(e) => Doing { what: "Working", detail: chat::step_words(e) },
+                None => Doing { what: "Running code", detail: "running code".to_owned() },
             }
         }
         Item::Tool { name, input, result: None, .. } => {
             let s = |k: &str| input[k].as_str().unwrap_or("").to_owned();
             let n = name.to_ascii_lowercase();
             if ["bash", "shell", "command", "exec"].iter().any(|k| n.contains(k)) {
-                Doing { pace: "run", what: "Running a command", detail: short_cmd(&s("command")) }
+                Doing { what: "Running a command", detail: short_cmd(&s("command")) }
             } else if ["edit", "write", "patch", "filechange"].iter().any(|k| n.contains(k)) {
-                Doing { pace: "edit", what: "Editing", detail: base(&s("file_path")) }
+                Doing { what: "Editing", detail: base(&s("file_path")) }
             } else if ["read", "grep", "glob", "search", "ls"].iter().any(|k| n.contains(k)) && !n.contains("web") {
                 let what = s("file_path");
-                Doing { pace: "read", what: "Reading", detail: if what.is_empty() { s("pattern") } else { base(&what) } }
+                Doing { what: "Reading", detail: if what.is_empty() { s("pattern") } else { base(&what) } }
             } else if n.contains("web") || n.contains("fetch") {
                 let url = s("url");
                 let host = url.split("://").nth(1).and_then(|r| r.split('/').next()).map_or_else(|| s("query"), str::to_owned);
-                Doing { pace: "read", what: "On the web", detail: host }
+                Doing { what: "On the web", detail: host }
             } else if n.contains("task") || n.contains("agent") {
-                Doing { pace: "agent", what: "Running a sub-agent", detail: s("description") }
+                Doing { what: "Running a sub-agent", detail: s("description") }
             } else {
-                Doing { pace: "read", what: "Using a tool", detail: name.rsplit("__").next().unwrap_or(name).to_owned() }
+                Doing { what: "Using a tool", detail: name.rsplit("__").next().unwrap_or(name).to_owned() }
             }
         }
-        Item::Text { done: false, .. } => Doing { pace: "edit", what: "Writing", detail: "writing".to_owned() },
-        _ => Doing { pace: "think", what: "Thinking", detail: "thinking".to_owned() },
+        Item::Text { done: false, .. } => Doing { what: "Writing", detail: "writing".to_owned() },
+        _ => Doing { what: "Thinking", detail: "thinking".to_owned() },
     })
 }
 
@@ -2765,8 +2672,9 @@ mod tests {
         assert_eq!(world2.world_ref().alive_count(), stalled, "a stalled inbox ends with the same world");
     }
 
-    /// Zoom is a uniform scale with nothing sliding: the picker's highlight (a MatchedGeometry pill on a row of a card
-    /// centred in the window, so the zoom moves the row in view points) is mid-slide to a new row when cmd+= lands; in that
+    /// Zoom is a uniform scale with nothing sliding: a MatchedGeometry pill (the test's own: the picker's highlight
+    /// lands at once, so the test matches it itself) on a row of a card centred in the window, so the zoom moves the row
+    /// in view points, is mid-slide to a new row when cmd+= lands; in that
     /// same frame the pill sits exactly on its row, and the card is the zoom times as big in window points. It fails when
     /// matched geometry runs before layout in a pass (flecs orders a phase by recycled entity ids: it read the last pass's
     /// places) or slides across a change of room. Headless (the scene world, layout and motion; no window, Metal or daemon).
@@ -2790,13 +2698,18 @@ mod tests {
         let picker = View::root(w, "hn.Picker");
         let items = picker.part("card").and_then(|c| c.part("items")).expect("hn.Picker's card.items");
         let rows: Vec<View<'_>> = (0..3).map(|_| items.child("hn.PickRowLook")).collect();
-        rows[0].child("hn.PickPill");
+        fn pill_on<'a>(row: View<'a>) -> View<'a> {
+            let pill = row.child("hn.PickPill");
+            pill.set(harness_native_ui_motion_api::MatchedGeometry { id: "test.pill".into(), jump: 0.0 });
+            pill
+        }
+        pill_on(rows[0]);
         for _ in 0..30 {
             frame(1.0);
         }
         // Down one row: the old pill goes, the new row's pill slides from where the old one was drawn.
         rows[0].entity().each_child(|c| c.destruct());
-        let pill = rows[1].child("hn.PickPill");
+        let pill = pill_on(rows[1]);
         frame(1.0);
         frame(1.0);
         let drawn = |p: View<'_>| p.entity().try_cloned::<&Drawn>().expect("the pill is drawn");
@@ -2814,7 +2727,7 @@ mod tests {
         assert!(((at.x + at.w * 0.5) * z - win_w * 0.5).abs() < 1e-2, "centred in the window at the zoom");
         // The next frame, in the same room, moving the selection slides again.
         rows[1].entity().each_child(|c| c.destruct());
-        let pill = rows[2].child("hn.PickPill");
+        let pill = pill_on(rows[2]);
         frame(z);
         frame(z);
         assert!((drawn(pill).y - laid(rows[2]).y).abs() > 1.0, "a selection still slides");
@@ -3015,8 +2928,10 @@ mod tests {
         use harness_native_ui_node_api::{Clip, Placed};
         let world = scene_world().unwrap_or_else(|e| panic!("{e}"));
         let slot = View::root(world.world_ref(), "ui.Node");
-        let card = slot.child("hn.ChatPeek");
-        assert!(card.entity().has(Transition::id()) && card.entity().has(Placed::id()), "hn.ChatPeek is no placed overlay with a Transition");
+        // The app's own overlays have no Transition (they are gone at once); the test gives the card one, as a placed
+        // overlay that fades out would have.
+        let card = slot.child("hn.ChatPeek").set(Transition::default());
+        assert!(card.entity().has(Placed::id()), "hn.ChatPeek is no placed overlay");
         view::leave(card);
         let e = card.entity();
         assert!(e.has(Leaving::id()), "the card is not leaving");
