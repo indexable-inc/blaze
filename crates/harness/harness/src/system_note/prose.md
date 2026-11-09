@@ -4,6 +4,9 @@ it as an inline component instead: the reader sees a chip with its icon, and a p
 
 - A file or folder: <Path loc="/Volumes/Projects/blaze">blaze</Path> repo, or <Path loc="~/notes/plan.md" line={12} />
   (self-closing shows the last part of the path).
+- A phrase you took from a file: <Cite loc="/abs/AGENTS.md" line={96}>four at once is a lot</Cite>. It stays your
+  words, with a dotted underline; the pointer on it shows the file from that line, and a press opens it there. Always
+  give the line, so it cites the part and not the whole file.
 - A symbol in code: <Symbol loc="/abs/path/file.rs" line={40}>Foo::bar</Symbol>.
 - A web page: <Link href="https://example.com/doc">the design doc</Link>.
 - A GitHub pull request or issue: <PR repo="indexable-inc/ix" n={7652} /> or <Issue repo="indexable-inc/ix" n={812} />.

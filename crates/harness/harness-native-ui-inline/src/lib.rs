@@ -32,6 +32,8 @@ use std::sync::RwLock;
 pub struct Form {
     pub label: String,
     pub mark: bool,
+    /// Not a chip but the words themselves, cited: no icon, the surrounding face, a dotted underline (`ui.inline.Cite`).
+    pub plain: bool,
     pub href: String,
     pub url: String,
 }
@@ -125,7 +127,7 @@ pub fn from_url(url: &str, words: Option<&str>) -> Option<Tag> {
             (k, p)
         })
         .collect();
-    let mut tag = Tag { name, props, label: String::new(), mark: form.mark, meta: String::new() };
+    let mut tag = Tag { name, props, label: String::new(), mark: form.mark, plain: form.plain, meta: String::new() };
     let words = words.map(str::trim).filter(|w| !w.is_empty() && !w.contains("://") && *w != bare(url));
     tag.label = match words {
         Some(w) => w.to_owned(),
@@ -212,6 +214,8 @@ pub struct Tag {
     pub props: Vec<(String, Prop)>,
     pub label: String,
     pub mark: bool,
+    /// Its form's `plain`: the words themselves, cited, not a chip.
+    pub plain: bool,
     pub meta: String,
 }
 
@@ -261,7 +265,7 @@ pub fn tag(chars: &[char], at: usize) -> Option<(Tag, usize)> {
                     return None;
                 }
                 let form = form(&name).unwrap_or_default();
-                let mut tag = Tag { name, props, label: String::new(), mark: form.mark, meta: String::new() };
+                let mut tag = Tag { name, props, label: String::new(), mark: form.mark, plain: form.plain, meta: String::new() };
                 // A label its props cannot fill (a missing prop) leaves the tag as words, shown as written.
                 tag.label = if form.label.is_empty() && !form.url.is_empty() {
                     // A link with no words: its address, shown bare (or what it is, `as_link`).
@@ -307,7 +311,7 @@ pub fn tag(chars: &[char], at: usize) -> Option<(Tag, usize)> {
                 return None;
             }
             let form = form(&name).unwrap_or_default();
-            let tag = Tag { name, props, label, mark: form.mark, meta: String::new() };
+            let tag = Tag { name, props, label, mark: form.mark, plain: form.plain, meta: String::new() };
             let tag = if form.url.is_empty() { tag } else { as_link(tag, &form, true) };
             return Some((tag, i + close.len()));
         }
@@ -443,6 +447,7 @@ mod tests {
             mark,
             href: format!("https://github.com/{{repo}}/{kind}/{{n}}"),
             url: String::new(),
+            plain: false,
         };
         BTreeMap::from([
             ("PR".to_owned(), gh("pull", true)),

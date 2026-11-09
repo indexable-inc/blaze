@@ -56,6 +56,9 @@ pub struct InlineRef {
     pub mark: bool,
     pub url: ScriptString,
     pub folder: bool,
+    /// Not a chip but the words themselves, cited (`ui.inline.Cite`): no icon, set in the face of the words around them,
+    /// a dotted underline under them at rest and a solid one under the pointer.
+    pub plain: bool,
 }
 
 /// What the host knows of the thing a live inline component names (a pull request), on an entity of its own the host's

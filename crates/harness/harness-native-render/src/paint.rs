@@ -810,8 +810,25 @@ impl Painter {
                         for (n, t) in tags.iter().enumerate() {
                             let here = hot.filter(|h| h.tag as usize == n);
                             let fill = here.map_or(rest, |h| crate::inline::hot(w, h.pressed, dark));
-                            if fill[3] > 0.0 {
+                            if fill[3] > 0.0 && !t.tag.plain {
                                 plate(d, t.start, t.end, fill, ref_shape);
+                            }
+                            if t.tag.plain && here.is_none() {
+                                // A cited phrase at rest: a dotted underline under its words (a dot a device pixel
+                                // tall, one on and two off), the sign that the pointer shows where they came from.
+                                let (label_lo, label_hi) = t.label();
+                                let under = crate::inline::underline(w, dark);
+                                let px = 1.0 / sc.max(1.0);
+                                let (dot, step) = ((1.5 * sc).round().max(1.0) * px, (4.0 * sc).round().max(2.0) * px);
+                                let flat = Shape { radius: 0.0, n: 4.0, border: 0.0, feather: 0.0 };
+                                for r in spans_of(&lay, label_lo, label_hi) {
+                                    let y = ((laid.y + r[1] + r[3] - 3.0) * sc).round() / sc;
+                                    let mut x = 0.0;
+                                    while x + dot <= r[2] {
+                                        d.panel(panel_from(under, [0.0; 4], flat, [laid.x + r[0] + x, y, dot, px], p.alpha));
+                                        x += step;
+                                    }
+                                }
                             }
                             if here.is_some() {
                                 // The label's underline: a hairline under its words, past the icon's hole, before its host
@@ -937,6 +954,10 @@ impl Painter {
                             let (before, _) = crate::markdown::chip_room(&units, t.start, t.end, size);
                             // The hole is REF_ICON_EM wide: the icon at its start, the rest the gap before the label.
                             let Some(hole) = spans_of(&lay, t.start, t.start + 1).into_iter().next() else { continue };
+                            // A cited phrase has no icon.
+                            if t.tag.plain {
+                                continue;
+                            }
                             if let Some(pic) = crate::inline::picture(w, &t.tag) {
                                 // Its live picture (a favicon), square, the icon's size, where the icon goes.
                                 let s = icon_style.size;
