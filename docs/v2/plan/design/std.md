@@ -337,8 +337,8 @@ function. ([may-suspend](may-suspend.md) is the analysis underneath.)
 - **Spawn is eager, and cancellation is a value.** A cancelled task learns it only as
   `Stopped::Cancelled` from its next wait. Nothing is cancelled by being dropped, and user code
   never holds a task that has not started or is half run.
-- **`Drop` may wait.** A value holds the capability it was made with, so closing a file or
-  flushing a connection on drop goes through the same wait.
+- **Finishing is explicit.** What must be closed, flushed or joined is a linear value with a
+  call that takes `cx` ("Values that must be finished"); `Drop` waits only on the panic path.
 - **A panic fails its task** with a typed error to its scope (rule `panics-fail-one-job`).
 - **A program runs only in a sandbox** (below). There is no bare `spawn`.
 - **Code that uses `async` still builds** as the pinned nightly builds it. The bridge is one
@@ -391,6 +391,36 @@ Deterministic simulation tests of the scheduler, scopes and cancellation with an
 planted bug; a differential test that runs the same programs under `Fibers` and `Frames` and
 compares outputs and the order of cancellations, drops and panics; and a UI test for each error
 above.
+
+## Values that must be finished
+
+bstd is written with linear types ([linear](linear.md)): a `#[blaze::linear]` value cannot be
+dropped or forgotten, only handed to a function that takes it by value. Rust's std cannot use
+them (its generics would have to change), and much of its shape is a workaround for that. bstd
+does not need the workarounds.
+
+- **A scope is a value, not a closure.** `let s = cx.scope(); s.spawn(..); s.join(cx)?;`. Rust
+  needs the closure form because a guard can be leaked, and a leaked guard would let a task
+  outlive what it borrowed. A linear `Scope` cannot be leaked, so the code is straight-line and
+  an early return has to go through `join`. The same holds for a GPU launch scope. The closure
+  forms remain as conveniences.
+- **An operation in flight borrows its buffer.** With completion-based IO the kernel writes into
+  a buffer after the call returns, so today's libraries make every read take an owned buffer,
+  since a forgotten future would free memory the kernel still writes. A linear
+  `Pending<'buf>` cannot be forgotten: it must be `wait`ed or `cancel`led (which also waits), so
+  `file.read_into(cx, &mut buf)` on a borrowed buffer is sound and zero-copy.
+- **Closing is a call that can fail and can wait**: `file.close(cx)?`, `conn.finish(cx)?`,
+  `vm.stop(cx)?`. A handle with unsynced writes, a connection with unsent data, a sandbox and a
+  transaction are linear, so their last error cannot be lost in a destructor and nothing has to
+  wait inside `Drop`.
+- **A task's result must be taken**: `Task<T>` is linear and `join` returns its outcome, so a
+  failure cannot be ignored by dropping the handle.
+- **On a panic** the value's abandonment path runs instead (roll back, cancel and wait, close
+  without syncing), as [linear](linear.md) says; that is the one place a destructor of these types
+  runs.
+- **bstd's containers say whether they admit linear elements.** `Vec`, `Option`, `Result` and
+  the maps do (and are then linear themselves); `Shared` and `LocalShared` do not, since a cycle
+  would leak one; there is no `forget`.
 
 ## Sandboxes: the one way to run a program
 
