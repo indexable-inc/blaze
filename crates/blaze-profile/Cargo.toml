@@ -23,6 +23,7 @@ blaze-core.workspace = true
 blaze-graph.workspace = true
 blaze-hash.workspace = true
 blaze-ids.workspace = true
+blaze-mem.workspace = true
 blaze-serde.workspace = true
 bytes.workspace = true
 blaze-v2-proof.workspace = true

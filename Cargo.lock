@@ -1578,6 +1578,7 @@ dependencies = [
  "blaze-graph",
  "blaze-hash",
  "blaze-ids",
+ "blaze-mem",
  "blaze-serde",
  "blaze-v2-proof",
  "bytes",

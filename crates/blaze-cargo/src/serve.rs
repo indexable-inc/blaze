@@ -1203,6 +1203,12 @@ pub(crate) fn engine(
         tracing::warn!("{why}");
         eprintln!("blaze serve: {why}");
     }
+    // The heap's: one allocation in every 4 MiB a thread allocates, with its stack, as
+    // `alloc_samples` rows (docs/memory-footprint.md, step 1). Said, as the CPU sampler is.
+    if let Err(why) = blaze_profile::heap::start() {
+        tracing::warn!("{why}");
+        eprintln!("blaze serve: {why}");
+    }
     signals::catch();
     signals::record_ends();
     // After `record_ends`, which leaves a signal something handles alone: the crash record's

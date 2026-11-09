@@ -526,20 +526,29 @@ key_part_diff before=N after=M`). A key with no parts has one row with a null `p
 | detail | utf8? | what changed about it |
 | seen_by | dict | watcher, rescan or request |
 
-### `alloc_samples`: about one allocation every 512 KiB allocated, on each thread
+### `alloc_samples`: one global-heap allocation in every 4 MiB a thread allocates
+
+The daemon's heap sampler (`crates/blaze-profile/src/heap.rs`, started by `blaze serve`): every
+`blaze_graph::arena::SAMPLE_EVERY` (4 MiB) bytes a thread allocates through the counting
+allocator, the allocation that crosses it is sampled, its frame pointers walked inside the
+allocator into a fixed ring of atomics (no lock, no allocation) and named at the flush, as the
+CPU samples are. Summed by `site`, the samples' `bytes` are what was allocated there, within a
+sample's: what churns the global heap, by function (`blaze explain memory`). A sample written
+over before a flush read it is counted in the flush's skipped rows.
 
 | column | type | |
 |---|---|---|
-| build_id | u64? | the build, or null |
+| build_id | u64? | the build its thread worked for, or null |
 | process | u32 | the process id |
 | thread | u32 | the thread |
 | t_ns | i64 | when |
-| bytes | u64 | the bytes the sample stands for (the sampling interval) |
+| bytes | u64 | the bytes of allocation the sample stands for: the interval, or as many of it as a larger block crossed |
 | stack | stack | the call stack, outermost first |
 | span_id | u64? | the innermost span its thread was inside |
 | stack_pcs | pcs? | as in `samples` |
-
-No writer fills `alloc_samples` yet; its `stack_pcs` is there for the one that will.
+| tag | dict? | the blaze-mem tag of the task that made the block; null outside any task |
+| block_bytes | u64 | the sampled block's own bytes |
+| site | utf8? | the innermost frame of `stack` outside the allocator and the collections that call it (`alloc::`, `core::`, `std::`, `hashbrown::`, ...) |
 
 ### `heap_by_owner`: the live heap at the end of a build, by what holds it
 

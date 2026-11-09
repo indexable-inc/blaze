@@ -947,6 +947,15 @@ pub fn counting_for(build: u32) -> Building {
 /// See [`building`]: gives back the build the thread was working for before.
 pub struct Building(u32);
 
+/// What the calling thread works for now: its build (0: none) and its innermost span (0:
+/// none). For a sample taken on the thread from inside the allocator (`crate::heap`): it
+/// claims no ring and allocates nothing, and on a thread being torn down says none.
+pub(crate) fn here_now() -> (u32, u64) {
+    let build = BUILD.try_with(Cell::get).unwrap_or(0);
+    let span = MINE.try_with(Cell::get).ok().flatten().map_or(0, Ring::innermost);
+    (build, span)
+}
+
 impl Drop for Building {
     fn drop(&mut self) {
         BUILD.with(|it| it.set(self.0));
