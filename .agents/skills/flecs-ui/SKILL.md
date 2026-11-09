@@ -72,6 +72,13 @@ New UI need not covered here: add a primitive (component + prim prefab + a galle
 
 ## Flecs 4.2 traps (the vendored version)
 
+- A script has at most 64 reactive inputs: every distinct `$prop` and `$token` it reads and every `entity[Component]`
+  read count, and past 64 the whole scene refuses to load (the app exits at launch). Keep fixed looks out of templates:
+  a token-heavy value (a Sheen preset, an icon's size and padding) goes in a prefab in a prefab-only file (tree.flecs,
+  parts.flecs) that the template's part inherits (`kind_icon : hn.tree.Kind {}`) or reads once
+  (`Sheen: hn.tree.SheenRun[Sheen]`); what only Rust knows (a kind's mark) Rust sets. Two changes that each fit can
+  together pass 64 on main: `scenes_load` is the check, run it on the merged tree.
+
 - The 4.2 changes (explicit deferral, `Copy`, Parent storage) are in the `flecs` skill. Here: mutate from systems
   through the stage (`vendor/hyperion-ecs/src/system.rs`: `Iter::world` and the stage accessor) or collect, then write;
   never rely on implicit `defer_begin`.
