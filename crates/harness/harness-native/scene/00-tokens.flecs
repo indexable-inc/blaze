@@ -124,14 +124,19 @@ export const disclose_w = 18
 // The sidebar's tree, Notion's sidebar: calm one-line rows, a title and a few muted words trailing it, no dots and no
 // marks. A session row tree_row_h tall, a run tree_run_h, packed (the air between rows is the pill's inset). Each row
 // starts its chevron gutter (tree_gutter wide) tree_pad in from its left edge plus indent_step a level, so a child's
-// chevron sits under its parent's title (gutter and step are equal) and the title column never moves; then its title,
+// chevron sits under its parent's mark or title (gutter and step are equal) and the title column never moves; then its title,
 // tree_gap, its trailing words; tree_pad_r on the right. The chevron is a thin vector mark tree_chevron across (its ink
 // about 7.5 tall), shown in tone_ink_faint where the row has rows under it (folded, it holds what finished). tree_icon is
-// the Archive button's glyph box.
+// the Archive button's glyph box. A session's row leads its title with what it is (hn.Kind's mark, tree_kind across,
+// tree_gap before the title). Folded with work under it, its row shows a faint dot (tree_under_dot) tree_under_gap
+// before how many.
 export const tree_row_h = 28
 export const tree_run_h = 22
 export const tree_gutter = 12
 export const tree_icon = 16
+export const tree_kind = 14
+export const tree_under_dot = 8
+export const tree_under_gap = 3
 export const tree_chevron = 9
 // The tree's indent guides (hn.Hang's slots): a hairline down the middle of each ancestor's chevron gutter, in
 // tone_guide (Islands' tree-indent-guide-border), for as many levels as tree_guides; a done mark in a childless row's

@@ -9,9 +9,10 @@
 //!   pipeline stages has one child per stage: [`StageNo`], `(Kind, Stage)`, its text, its own status, exit code and times.
 //! - A run goes under its session, else under the session that owns its REPL (the daemon's `owner`), else on the device.
 //!   One whose session or owner the daemon no longer lists is an [`Orphan`].
-//! - A session or run shows its live children in the tree (every node starts so): running, with something running
-//!   under them, ended less than [`Linger`] ago (their done mark shows), or selected; so what finished leaves on its own
-//!   for the Archive. [`Folded`] on one (its chevron closed) shows none of them but the selected one.
+//! - A session or run starts folded: the tree shows none of its children but the selected one, so nothing opens because
+//!   work started under it. [`Unfolded`] on one (its chevron opened by the person) shows its live children: running,
+//!   with something running under them, ended less than [`Linger`] ago (their done mark shows), or selected; so what
+//!   finished leaves on its own for the Archive. What runs under a folded one is counted on its row ([`hidden_active`]).
 //! - [`Archived`] on an object takes it out of the tree and into the Archive pane. The `ArchiveRule` system sets it from
 //!   tags and relations alone: [`Closed`] (cmd+W) always, [`Pinned`] never, else a finished object whose parent session
 //!   ended or left the tree, an [`Orphan`] run, a finished run on the device [`ArchiveAfter`] it ended, and a finished
@@ -105,8 +106,9 @@ pub struct Pending;
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Skipped;
 
-/// What an object is called where it shows (its row, the window's title, the palette): a session's rename, else its
-/// daemon name, else its kind and number (`reconcile`); a run's command.
+/// What an object is called where it shows (its row, the window's title, the palette): a session's rename, else what it
+/// is about ([`session_name`]: a sub-agent's spawn name, a chat's title from its first message), never its kind and
+/// number; a run's command.
 #[derive(Component, Clone, Debug, Default, PartialEq)]
 pub struct Name {
     pub s: ScriptString,
@@ -146,10 +148,10 @@ pub struct Ended {
     pub ms: u64,
 }
 
-/// On a session or run: its chevron is closed and the tree shows none of its children but the selected one. Without it
-/// (every node starts so) its live children show ([`rows`]).
+/// On a session or run: the person opened its chevron, so its live children show ([`rows`]). Without it (every node
+/// starts so) the tree shows none of its children but the selected one: work starting under a row never opens it.
 #[derive(Component, Clone, Copy, Debug, Default)]
-pub struct Folded;
+pub struct Unfolded;
 
 /// On an object: the user killed it with cmd+W (or the palette's or menu's Kill). It leaves the tree for the sidebar's
 /// Archive, where it stays selectable; an object that ended on its own stays in the tree.
@@ -407,7 +409,7 @@ pub fn register(world: &World) {
     world.component::<Run>().writable();
     world.component::<StageNo>().writable();
     world.component::<Ended>().writable();
-    world.component::<Folded>();
+    world.component::<Unfolded>();
     world.component::<Archived>();
     world.component::<Closed>();
     world.component::<Pinned>();
@@ -910,13 +912,7 @@ fn reconcile(w: WorldRef<'_>, dev: u64, by_id: &mut HashMap<u64, u64>, sessions:
                 e.set(code);
             }
         }
-        // What it is called: what the person renamed it to (the daemon's `label`), else its daemon name, else its kind and
-        // number (its automatic name).
-        let name = [&s["label"], &s["name"]]
-            .into_iter()
-            .find_map(|n| n.as_str().filter(|n| !n.is_empty()))
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("{} {id}", s["kind"].as_str().unwrap_or("session")));
+        let name = session_name(s);
         if e.try_cloned::<&Name>().is_none_or(|n| n.s.as_str() != name) {
             e.set(Name { s: name.as_str().into() });
         }
@@ -983,6 +979,35 @@ fn reconcile(w: WorldRef<'_>, dev: u64, by_id: &mut HashMap<u64, u64>, sessions:
     }
 }
 
+/// What a session is called ([`Name`]), from the daemon's record of it: what the person renamed it to (`label`); a
+/// sub-agent (one with a parent) the name it was spawned with; a chat the title of its first message (harness-chat's
+/// `title_of`); else its spawn name, else the title its program gave its terminal; else what it is ("New chat",
+/// "Shell"). Never its kind and number: the row's icon says the kind, and its tooltip the number.
+#[must_use]
+pub fn session_name(s: &serde_json::Value) -> String {
+    let field = |k: &str| s[k].as_str().map(str::trim).filter(|v| !v.is_empty());
+    let chat = s["mode"] == "chat";
+    let sub = s["parent"].as_u64().is_some();
+    let order: [&str; 3] = match (sub, chat) {
+        (true, _) => ["label", "name", "title"],
+        (false, true) => ["label", "title", "name"],
+        (false, false) => ["label", "name", "title"],
+    };
+    if let Some(n) = order.into_iter().find_map(field) {
+        return n.split_whitespace().collect::<Vec<_>>().join(" "); // alloc: one name per session in a reconcile
+    }
+    let kind = s["kind"].as_str().unwrap_or("");
+    match kind {
+        _ if chat => "New chat",
+        "claude" => "Claude",
+        "codex" => "Codex",
+        "cursor" => "Cursor",
+        "shell" => "Shell",
+        _ => "Session",
+    }
+    .to_owned()
+}
+
 /// The objects in tree order (depth first, siblings by creation), each with its depth under the device.
 #[must_use]
 pub fn tree(world: WorldRef<'_>) -> Vec<(u64, usize)> {
@@ -1045,7 +1070,7 @@ impl<'a> Walk<'a> {
     }
     fn walk(&mut self, e: EntityView<'_>, depth: usize) {
         let all = depth == 0;
-        let folded = e.has(Folded::id());
+        let folded = !all && !e.has(Unfolded::id());
         let mut kids: Vec<(u8, u64, u64)> = Vec::new();
         for c in live_kids(e) {
             let id = Some(*c.id());
@@ -1076,10 +1101,10 @@ pub struct Row {
 }
 
 /// The sidebar's rows: sessions, their runs and stages in tree order (siblings by start, stages by index, a sub-agent
-/// that sleeps after those at work). The device's
-/// sessions always show; under a session or run only the live ones: running, with something running under them, ended
-/// less than [`Linger`] ago, and the selected one (and its parent); under a [`Folded`] one only the selected one. So what
-/// finished shows its mark a moment, then folds away, and the tree lists what is live.
+/// that sleeps after those at work). The device's sessions always show; under a session or run only the selected one
+/// (and its parent) until the person opens it ([`Unfolded`]), then the live ones: running, with something running under
+/// them, ended less than [`Linger`] ago, and the selected one. So what finished shows its mark a moment, then folds
+/// away, and the tree lists what is live.
 #[must_use]
 pub fn rows(world: WorldRef<'_>) -> Vec<Row> {
     let mut walk = Walk::new(world);
@@ -1157,14 +1182,41 @@ pub fn archive_view(world: WorldRef<'_>) -> u64 {
     *world.lookup(ARCHIVE).id()
 }
 
-/// Fold `e` (its chevron closed: none of its children show in the tree) or open it again (its live ones do).
+/// Fold `e` (its chevron closed: none of its children show in the tree, as every node starts) or open it (its live
+/// ones do).
 pub fn set_folded(world: WorldRef<'_>, e: u64, folded: bool) {
     let e = world.entity_from_id(e);
-    if folded {
-        e.add(Folded::id());
-    } else if e.has(Folded::id()) {
-        e.remove(Folded::id());
+    if !folded {
+        e.add(Unfolded::id());
+    } else if e.has(Unfolded::id()) {
+        e.remove(Unfolded::id());
     }
+}
+
+/// Whether `e` is folded: its chevron closed, as every node starts until the person opens it.
+#[must_use]
+pub fn folded(e: EntityView<'_>) -> bool {
+    !e.has(Unfolded::id())
+}
+
+/// How many of folded `e`'s children are at work (running and not a sub-agent asleep between turns, or with something
+/// running under them) and kept out of the tree by the fold: what its row counts quietly instead of opening. 0 when `e`
+/// is open.
+#[must_use]
+pub fn hidden_active(world: WorldRef<'_>, e: u64) -> usize {
+    let o = world.entity_from_id(e);
+    if !folded(o) {
+        return 0;
+    }
+    let walk = Walk::new(world);
+    live_kids(o)
+        .into_iter()
+        .filter_map(|c| {
+            let id = Some(*c.id());
+            let at_work = (walk.running(c) && !sleeping(c, walk.running)) || live_kids(c).into_iter().any(|k| walk.active(k));
+            (walk.sel != id && walk.sel_parent != id && at_work).then_some(())
+        })
+        .count()
 }
 
 /// Whether `e` has live children ([`rows`]'s: running, active under, lingering or selected): what its chevron opens and
