@@ -472,7 +472,8 @@ export const result_snippet_h = 36
 // well, the user's words on a soft plate, code on a card, tool calls as quiet one-line rows, the input at the foot.
 // chat_w is the reading column (the words, the bubble's trailing edge, the input): centred, chat_pad clear of the pane's
 // edges either side when the pane is narrower. It is the measure: chat_measure ems of the body text, about 70
-// characters of Inter (iA Writer's and the site's measure), so a line never runs the width of a wide window.
+// characters of Inter at 35 (iA Writer's), widened for a chat that is half code, so a line still never runs the width of
+// a wide window.
 export const chat_pad = 24
 // How far the transcript thins out where it scrolls under the composer (and under the pane's top): soft, never a cut line.
 export const chat_fade_len = 28
@@ -506,8 +507,9 @@ export const chat_bubble_lead = 48
 // Body text: 14 on a 21 line (1.5).
 export const size_chat = 14
 export const line_chat = 21
-// The measure (chat_w, above).
-export const chat_measure = 35
+// The measure (chat_w, above): wide enough for code and tables beside the words (a line of prose runs about 100
+// characters of Inter at its widest).
+export const chat_measure = 52
 export const chat_w = $size_chat * $chat_measure
 // Headings: a scale of about 1.15 over the body, each semibold in the strong ink (tone_ink_strong), set by size and
 // weight, never by colour. Each sits closer to what it heads than to what came before: chat_h<n>_above over it,
@@ -547,6 +549,18 @@ export const chat_bubble_max_w = $chat_w * 0.8
 export const chat_foot_pad_t = 6
 export const chat_foot_pad_b = 14
 export const chat_composer_radius = 18
+// Pictures pasted into the message being written (hn.ChatAttach, src/app/chat.rs fill_attach): a strip of thumbnails over
+// the words, each chat_attach_h tall at its own aspect (no wider than chat_attach_max_w), chat_attach_gap apart,
+// chat_attach_radius round, a remove button chat_attach_remove across (its glyph chat_attach_icon) chat_attach_inset in
+// from the top trailing corner. A sent message's pictures show as the same thumbnails over its bubble, chat_sent_h tall.
+export const chat_attach_h = 64
+export const chat_attach_max_w = 160
+export const chat_attach_gap = 8
+export const chat_attach_radius = 8
+export const chat_attach_remove = 18
+export const chat_attach_icon = 10
+export const chat_attach_inset = 4
+export const chat_sent_h = 120
 export const chat_composer_pad = 8
 export const chat_composer_pad_t = 12
 export const chat_composer_text_inset = 6

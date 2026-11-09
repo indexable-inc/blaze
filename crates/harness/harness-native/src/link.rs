@@ -631,11 +631,12 @@ impl Link {
         }
     }
 
-    /// A message from the person into chat session `id` (the daemon writes it to the agent as a user turn).
-    pub fn chat_send(&self, id: u64, text: &str) {
+    /// A message from the person into chat session `id`, with the pictures at `images` (the daemon writes it to the agent
+    /// as a user turn).
+    pub fn chat_send(&self, id: u64, text: &str, images: Vec<String>) {
         let (text, poke) = (text.to_owned(), self.poke.clone());
         std::thread::spawn(move || {
-            match request(Request::Send { id, text, raw: false, submit: None }) {
+            match request(Request::Send { id, text, raw: false, submit: None, images }) {
                 Ok(Err(e)) => eprintln!("harness-native: send {id}: {e}"),
                 Ok(Ok(_)) => {}
                 Err(e) => eprintln!("harness-native: send {id}: {e}"),

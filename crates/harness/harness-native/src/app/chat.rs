@@ -284,6 +284,11 @@ pub struct ChatState {
     peek: peek::Peek,
     /// The `@` file mention menu over the composer (chat/mention.rs).
     mention: mention::Mention,
+    /// The pictures pasted into the message being written (absolute paths of PNG or JPEG files), sent with it.
+    images: Vec<String>,
+    /// Each picture's size in pixels as its header says (None: not one this app can show), read once: the composer's
+    /// and the transcript's thumbnails.
+    sizes: HashMap<String, Option<(u32, u32)>>,
 }
 
 /// One text block of a chat's transcript as it shows: its pace, and whether it streamed in while the pane watched (its
@@ -355,6 +360,8 @@ impl Default for ChatState {
             stepped: 0.0,
             peek: peek::Peek::default(),
             mention: mention::Mention::default(),
+            images: Vec::new(),
+            sizes: HashMap::new(),
         }
     }
 }
@@ -362,7 +369,10 @@ impl Default for ChatState {
 /// A row of the transcript.
 #[derive(Clone, Debug)]
 enum Row {
-    User(String),
+    /// What the person wrote; true when their pictures are over it (a row of its own, [`Row::Pictures`]).
+    User(String, bool),
+    /// The pictures the person sent with a message, over its words (absolute paths); true when no words came with them.
+    Pictures(Vec<String>, bool),
     Prose(String),
     Heading(u8, String),
     ListItem { depth: usize, mark: String, text: String },
@@ -390,7 +400,10 @@ enum Row {
 impl Row {
     fn prefab(&self) -> &'static str {
         match self {
-            Row::User(_) => "hn.ChatUser",
+            Row::User(_, false) => "hn.ChatUser",
+            Row::User(_, true) => "hn.ChatUserUnder",
+            Row::Pictures(_, false) => "hn.ChatSentPictures",
+            Row::Pictures(_, true) => "hn.ChatSentPicturesLast",
             Row::Prose(_) => "hn.ChatProse",
             Row::Heading(1, _) => "hn.ChatH1",
             Row::Heading(2, _) => "hn.ChatH2",
@@ -688,7 +701,15 @@ fn item_rows(t: &Transcript, n: usize, shows: Shows<'_>, out: &mut Vec<(String, 
     let fold = shows.fold;
     let mut part = Vec::new();
     match &t.items[n] {
-        Item::User { text } => part.push(Row::User(text.clone())),
+        Item::User { text, images } => {
+            let words = !text.trim().is_empty();
+            if !images.is_empty() {
+                part.push(Row::Pictures(images.clone(), !words));
+            }
+            if words || images.is_empty() {
+                part.push(Row::User(text.clone(), !images.is_empty()));
+            }
+        }
         Item::Text { block, text, done } => match shows.cut.get(block) {
             Some(&k) => blocks(&text[..k.min(text.len())], true, &mut part),
             None => blocks(text, !done, &mut part),
@@ -877,7 +898,7 @@ fn word_around(s: &str, i: usize) -> (usize, usize) {
 /// [`fill_row`] gives it) and whether it is inline markdown.
 fn texts(r: &Row) -> Vec<(&'static [&'static str], String, bool)> {
     match r {
-        Row::User(s) => vec![(&["bubble", "text"], s.clone(), false)],
+        Row::User(s, _) => vec![(&["bubble", "text"], s.clone(), false)],
         Row::Prose(s) | Row::Heading(_, s) | Row::Quote(s) => vec![(&["text"], s.clone(), true)],
         Row::ListItem { mark, text, .. } => vec![(&["mark"], mark.clone(), false), (&["text"], text.clone(), true)],
         Row::Code { text, .. } => vec![(&["card", "text"], text.clone(), false)],
@@ -889,7 +910,7 @@ fn texts(r: &Row) -> Vec<(&'static [&'static str], String, bool)> {
         Row::Note(s) | Row::Error(s) => vec![(&["text"], s.clone(), false)],
         Row::Steps(l) => vec![(&["head", "words"], l.words.clone(), false)],
         Row::Out(o) => o.texts(),
-        Row::Tool { .. } | Row::Thinking { .. } | Row::Grid { .. } | Row::Table(_) | Row::Ui { .. } => Vec::new(),
+        Row::Tool { .. } | Row::Thinking { .. } | Row::Grid { .. } | Row::Table(_) | Row::Ui { .. } | Row::Pictures(..) => Vec::new(),
     }
 }
 
@@ -930,7 +951,8 @@ impl Row {
     /// The row as markdown, for a copy that takes it whole (None: its words as shown).
     fn markdown(&self) -> Option<String> {
         Some(match self {
-            Row::User(s) | Row::Prose(s) | Row::Note(s) | Row::Error(s) => s.clone(),
+            Row::User(s, _) | Row::Prose(s) | Row::Note(s) | Row::Error(s) => s.clone(),
+            Row::Pictures(images, _) => images.iter().map(|p| format!("![image]({p})")).collect::<Vec<_>>().join("\n"),
             Row::Heading(n, s) => format!("{} {s}", "#".repeat(usize::from(*n))),
             Row::ListItem { depth, mark, text } => {
                 let mark = match mark.as_str() {
@@ -1158,6 +1180,16 @@ impl App {
         let empty = Transcript::default();
         let t = chats.get(&sid).unwrap_or(&empty);
         let (rows, nested) = rows_nested(t, Shows::of(st));
+        // The pictures shown (a sent message's, the draft's): each one's size read once.
+        let pics = rows.iter().flat_map(|(_, r)| match r {
+            Row::Pictures(images, _) => images.as_slice(),
+            _ => &[],
+        });
+        for p in pics.chain(st.images.iter()) {
+            if !st.sizes.contains_key(p) {
+                st.sizes.insert(p.clone(), mention::image_size(p)); // alloc: one entry per picture, kept with the pane
+            }
+        }
         // The rows of blocks that streamed in while this pane watched: their glyphs fade in as they come, from when the row
         // was first laid out (a row first painted long after, scrolled back to, shows at rest).
         let came = crate::look::arrive(w, "chat_stream");
@@ -1191,6 +1223,7 @@ impl App {
             let mut paint = self.paint.borrow_mut();
             let mut measure = |s: &str, style: &TextStyle, md: bool| paint.width(s, style, md);
             let rows_open = &st.rows_open;
+            let sizes = &st.sizes;
             let fresh_rows = |row: View<'_>, i: usize, new: bool| {
                 if new {
                     row.set(HoverAmt::default());
@@ -1198,7 +1231,7 @@ impl App {
                         h.set(HoverAmt::default());
                     }
                 }
-                let ctx = RowCtx { sid, key: &rows[i].0, open: rows_open.get(&rows[i].0).copied(), ui: Some(&self.genui), playing: t.busy, cells: Some(&t.details) };
+                let ctx = RowCtx { sid, sizes: Some(sizes), key: &rows[i].0, open: rows_open.get(&rows[i].0).copied(), ui: Some(&self.genui), playing: t.busy, cells: Some(&t.details) };
                 fill_row(row, &rows[i].1, &ctx, &mut measure);
                 if let Some(mut pad) = view::prefab(w, rows[i].1.prefab()).and_then(|p| p.try_cloned::<&harness_native_ui_layout_api::Padding>()) {
                     if nested.contains(&rows[i].0) {
@@ -1277,6 +1310,11 @@ impl App {
         self.fill_chat_peek(pv, st, t, &rows, focused, &cwd);
         self.fill_chat_mention(pv, sid, st, &cwd, focused);
         let ended = self.status_of(e) != "running";
+        // The pictures pasted into the message, over its words, each with its remove button.
+        if let Some(strip) = composer(pv).and_then(|c| c.part("attach")) {
+            let h = crate::look::width(w, "chat_attach_tall");
+            fill_pictures(strip, &st.images, Some(&st.sizes), h, "hn.ChatAttach", Some(sid));
+        }
         if let Some(area) = composer_area(pv) {
             let (shown, [caret, anchor, lo, hi]) = st.draft.shown();
             if let Some(h) = area.part("hint_at").and_then(|a| a.part("hint")) {
@@ -1616,22 +1654,22 @@ impl App {
         true
     }
 
-    /// Send chat `sid`'s draft (Return), the draft emptied;
-    /// nothing while it holds only blanks.
+    /// Send chat `sid`'s draft (Return) with the pictures pasted into it, the draft emptied; nothing while it holds only
+    /// blanks and no picture.
     pub(in crate::app) fn chat_send_draft(&mut self, sid: u64) {
-        let text = {
+        let (text, images) = {
             let mut states = self.chat.borrow_mut();
             let Some(st) = states.get_mut(&sid) else { return };
             let d = &mut st.draft;
-            if d.text.trim().is_empty() {
+            if d.text.trim().is_empty() && st.images.is_empty() {
                 return;
             }
             let text = std::mem::take(&mut d.text).trim_end().to_owned();
             (d.caret, d.anchor, d.marked) = (0, 0, None);
             st.stick = true;
-            text
+            (text, std::mem::take(&mut st.images))
         };
-        self.link.chat_send(sid, &text);
+        self.link.chat_send(sid, &text, images);
         self.poke();
     }
 
@@ -1698,6 +1736,46 @@ impl App {
                 }
             }
             _ => eprintln!("harness-native: keys: act.Edit has no edit {op:?}"),
+        }
+        self.poke();
+    }
+
+    /// Pictures pasted into the focused chat's message (absolute paths of PNG or JPEG files this app can show): shown over
+    /// its words and sent with it. Whether a chat took them (false while a name or a cell's field has the keys, or the
+    /// palette is open, or no chat has them, or one of them is not such a picture).
+    pub(in crate::app) fn chat_attach(&mut self, paths: &[String]) -> bool {
+        if self.palette.is_some() || self.renaming() || self.genui_editing() || paths.is_empty() {
+            return false;
+        }
+        let Some((_, _, sid)) = self.focused_chat() else { return false };
+        let sizes: Vec<_> = paths.iter().map(|p| mention::image_size(p)).collect();
+        if sizes.iter().any(Option::is_none) {
+            return false;
+        }
+        let mut states = self.chat.borrow_mut();
+        let st = states.entry(sid).or_default();
+        for (p, wh) in paths.iter().zip(sizes) {
+            st.sizes.insert(p.clone(), wh);
+            if !st.images.contains(p) {
+                st.images.push(p.clone());
+            }
+        }
+        st.reading = false;
+        drop(states);
+        self.poke();
+        true
+    }
+
+    /// A pasted picture's remove button (`chat:unattach:<sid>:<i>`): picture `i` out of chat `sid`'s message.
+    pub(in crate::app) fn chat_unattach(&mut self, rest: &str) {
+        let Some((sid, i)) = rest.split_once(':').and_then(|(s, i)| Some((s.parse::<u64>().ok()?, i.parse::<usize>().ok()?))) else {
+            eprintln!("harness-native: chat:unattach:{rest} names no session and picture");
+            return;
+        };
+        if let Some(st) = self.chat.borrow_mut().get_mut(&sid)
+            && i < st.images.len()
+        {
+            st.images.remove(i);
         }
         self.poke();
     }
@@ -2201,6 +2279,8 @@ fn along_lines(d: &mut Draft, lay: &Layout, m: Move) -> Option<usize> {
 /// Where a transcript row is, for the parts that act on it: its session, its key, and the table row opened in it.
 struct RowCtx<'k> {
     sid: u64,
+    /// The pictures' sizes ([`ChatState::sizes`]), for a sent message's thumbnails.
+    sizes: Option<&'k HashMap<String, Option<(u32, u32)>>>,
     key: &'k str,
     open: Option<usize>,
     /// The app's cell controls in use, for a cell's UI (None: drawn from the tree alone).
@@ -2213,7 +2293,7 @@ struct RowCtx<'k> {
 
 impl RowCtx<'static> {
     /// A row drawn outside the transcript (in a cell's generated UI): its tables' rows do not open.
-    const NOWHERE: Self = RowCtx { sid: 0, key: "", open: None, ui: None, playing: false, cells: None };
+    const NOWHERE: Self = RowCtx { sid: 0, sizes: None, key: "", open: None, ui: None, playing: false, cells: None };
 }
 
 impl RowCtx<'_> {
@@ -2226,6 +2306,42 @@ impl RowCtx<'_> {
 /// A table's measure: words (in a style, inline markdown or not) to their one-line width in points.
 type Measure<'m> = dyn FnMut(&str, &TextStyle, bool) -> f32 + 'm;
 
+/// Keep `strip`'s pictures (one `prefab` each, its `pic` part or itself the picture) in step with `images`: each `h` tall at
+/// its own aspect, no wider than chat_attach_max_w for a draft's. With `remove` (the chat's session), each one's remove
+/// button takes it out of the draft (`chat:unattach:<sid>:<i>`).
+fn fill_pictures(strip: View<'_>, images: &[String], sizes: Option<&HashMap<String, Option<(u32, u32)>>>, h: f32, prefab: &str, remove: Option<u64>) {
+    let w = strip.entity().world();
+    let widest = if remove.is_some() { crate::look::width(w, "chat_attach_wide") } else { f32::INFINITY };
+    let shows = images.iter().enumerate().filter_map(|(i, p)| sizes.and_then(|s| s.get(p).copied().flatten()).map(|wh| (format!("p{i}"), prefab, (i, p, wh))));
+    view::for_each_of(strip, shows, |v, (i, path, (iw, ih)), _| {
+        let k = (h / ih.max(1) as f32).min(widest / iw.max(1) as f32);
+        let size = Size {
+            w: Sizing { kind: SizeKind::Fixed, value: (iw as f32 * k).round(), min: 0.0, max: 0.0 },
+            h: Sizing { kind: SizeKind::Fixed, value: (ih as f32 * k).round(), min: 0.0, max: 0.0 },
+        };
+        let pic = v.part("pic").unwrap_or(v).entity();
+        if pic.try_cloned::<&Size>() != Some(size) {
+            pic.set(size);
+        }
+        let handle = harness_native_ui_text_api::Picture { handle: path.as_str().into() };
+        if pic.try_cloned::<&harness_native_ui_text_api::Picture>() != Some(handle.clone()) {
+            pic.set(handle);
+        }
+        if let (Some(sid), Some(b)) = (remove, v.part("corner").and_then(|c| c.part("remove"))) {
+            let action = Action { name: format!("chat:unattach:{sid}:{i}").as_str().into() };
+            if b.entity().try_cloned::<&Action>() != Some(action.clone()) {
+                b.entity().set(action);
+            }
+            if let Some(icon) = b.part("icon") {
+                icon.icon(REMOVE_ICON);
+            }
+        }
+    });
+}
+
+/// The remove button's glyph on a pasted picture (codicon's close).
+const REMOVE_ICON: &str = "\u{EA76}";
+
 /// Fill one transcript row from what it shows.
 fn fill_row(row: View<'_>, r: &Row, ctx: &RowCtx<'_>, measure: &mut Measure<'_>) {
     let text = |name: &str, s: &str| {
@@ -2234,10 +2350,14 @@ fn fill_row(row: View<'_>, r: &Row, ctx: &RowCtx<'_>, measure: &mut Measure<'_>)
         }
     };
     match r {
-        Row::User(s) => {
+        Row::User(s, _) => {
             if let Some(t) = row.part("bubble").and_then(|b| b.part("text")) {
                 t.text(s);
             }
+        }
+        Row::Pictures(images, _) => {
+            let h = crate::look::width(row.entity().world(), "chat_sent_tall");
+            fill_pictures(row, images, ctx.sizes, h, "hn.ChatSentPicture", None);
         }
         Row::Prose(s) | Row::Heading(_, s) | Row::Quote(s) | Row::Note(s) | Row::Error(s) => text("text", s),
         Row::ListItem { depth, mark, text: s } => {

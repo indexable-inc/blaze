@@ -1181,9 +1181,29 @@ impl App {
         self.chat_cut()
     }
 
-    /// Files pasted (a Finder copy: their paths): into a terminal as words its shell reads back as those paths (quoted
-    /// where they need it), anywhere else as the paths, a space apart.
+    /// A picture pasted (Command-V of a screenshot, a browser's Copy Image), as PNG bytes: saved under
+    /// `$HARNESS_HOME/pastes`, then attached to the focused chat's message, else its path pasted ([`Self::paste_paths`]).
+    pub fn paste_picture(&mut self, png: &[u8]) {
+        let dir = crate::link::home().join("pastes");
+        let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+        let path = dir.join(format!("{ms}.png"));
+        if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, png)) {
+            eprintln!("harness-native: paste: saving the picture to {}: {e}", path.display());
+            return;
+        }
+        let p = path.to_string_lossy().into_owned();
+        if !self.chat_attach(std::slice::from_ref(&p)) {
+            self.paste_paths(&[p]);
+        }
+    }
+
+    /// Files pasted (a Finder copy: their paths): pictures into a chat's message ([`Self::chat_attach`]); else into a
+    /// terminal as words its shell reads back as those paths (quoted where they need it), anywhere else as the paths, a
+    /// space apart.
     pub fn paste_paths(&mut self, paths: &[String]) {
+        if self.chat_attach(paths) {
+            return;
+        }
         let terminal = self.palette.is_none() && !self.archive_focused() && !self.chat_focused() && !self.renaming();
         let words: Vec<String> = paths.iter().map(|p| if terminal { term::shell_quote(p) } else { p.clone() }).collect();
         self.paste(&words.join(" "));

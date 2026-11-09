@@ -51,6 +51,12 @@ hn {
         mention : ui.Node {
           Overlay
         }
+        // The pictures pasted into the message (hn.ChatAttach each, src/app/chat.rs fill_attach); empty, it takes no room.
+        attach : ui.Row {
+          Flex: {axis: Row, gap: $chat_attach_gap, align: Start, justify: Start, wrap: true}
+          Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+          Padding: {l: $chat_composer_text_inset, r: $chat_composer_text_inset, t: 0, b: 0}
+        }
         entry : ui.Row {
           Flex: {axis: Row, gap: 0, align: Start, justify: Start, wrap: false}
           Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
@@ -328,6 +334,53 @@ hn {
         TextStyle: {size: $size_chat, line: $line_chat_bubble, role: 0, bold: 0}
       }
     }
+  }
+
+  // The words of a message sent with pictures, under them: no turn's gap over it (the pictures took it).
+  prefab ChatUserUnder : hn.ChatUser {
+    Padding: {l: $chat_bubble_lead, r: 0, t: 0, b: $chat_gap_reply - $chat_block_half}
+  }
+
+  // A picture attached to the message being written: its thumbnail (sized by fill_attach to chat_attach_h tall at its
+  // aspect), rounded, with a remove button over its top trailing corner on a raised plate so it reads over any picture.
+  prefab ChatAttach : ui.ZStack {
+    Cursor: {shape: Arrow}
+    Flex: {axis: Z, gap: 0, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    pic : ui.Node {
+      Picture: {handle: ""}
+      Clip
+      Shape: {radius: $chat_attach_radius, n: 4, border: 0, feather: 0}
+    }
+    corner : ui.Row {
+      Flex: {axis: Row, gap: 0, align: Start, justify: End, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+      Padding: {l: 0, r: $chat_attach_inset, t: $chat_attach_inset, b: 0}
+      remove : ui.IconButton {
+        Fill: $tone_raised
+        Shape: {radius: $chat_attach_remove / 2, n: 2, border: 0, feather: 0}
+        Size: {w: {kind: Fixed, value: $chat_attach_remove, min: 0, max: 0}, h: {kind: Fixed, value: $chat_attach_remove, min: 0, max: 0}}
+        Tooltip: {text: "Remove picture"}
+        icon : ui.Symbol {
+          Size: {w: {kind: Fixed, value: $chat_attach_icon, min: 0, max: 0}, h: {kind: Fixed, value: $chat_attach_icon, min: 0, max: 0}}
+        }
+      }
+    }
+  }
+  // A sent message's pictures, over its bubble at the trailing edge (Row::Pictures): the same thumbnails, larger, with
+  // no remove button.
+  prefab ChatSentPictures : ui.Row {
+    Flex: {axis: Row, gap: $chat_attach_gap, align: Start, justify: End, wrap: true}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: $chat_bubble_lead, r: 0, t: $chat_gap_turn - $chat_block_half, b: $chat_attach_gap}
+  }
+  prefab ChatSentPicturesLast : hn.ChatSentPictures {
+    Padding: {l: $chat_bubble_lead, r: 0, t: $chat_gap_turn - $chat_block_half, b: $chat_gap_reply - $chat_block_half}
+  }
+  prefab ChatSentPicture : ui.Node {
+    Picture: {handle: ""}
+    Clip
+    Shape: {radius: $chat_attach_radius, n: 4, border: 0, feather: 0}
   }
 
   // A paragraph of the agent's words (inline markdown): the body ink, bold a semibold step in the strong ink, inline code

@@ -117,7 +117,8 @@ pub enum Request {
     /// differently, coalesced to at most 20 a second, until the client sends anything.
     Watch,
     /// Type into a session. `submit` (default true) presses Enter afterwards; text goes in as a bracketed paste so
-    /// multi-line messages arrive as one input. `raw` writes bytes verbatim. A chat session takes it as a message.
+    /// multi-line messages arrive as one input. `raw` writes bytes verbatim. A chat session takes it as a message, with
+    /// `images`.
     Send {
         id: u64,
         text: String,
@@ -125,6 +126,9 @@ pub enum Request {
         raw: bool,
         #[serde(default)]
         submit: Option<bool>,
+        /// Pictures sent with a chat message (absolute paths of PNG or JPEG files): the agent gets each as an image.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<String>,
     },
     /// Switch chat session `id`'s model (an id from its `models` event, else from the list its agent kind last gave,
     /// [`Reply::Sessions`]'s `models`) and/or reasoning effort (one that model takes) for its turns from here on. The

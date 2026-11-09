@@ -584,8 +584,9 @@ define_class!(
             wake();
         }
 
-        /// Files on the pasteboard (a Finder copy, which carries their names as a string too) paste as their paths, else
-        /// its string pastes.
+        /// Files on the pasteboard (a Finder copy, which carries their names as a string too) paste as their paths (a
+        /// chat attaches the pictures among them), else its string pastes, else its picture (a screenshot, a browser's
+        /// Copy Image) is saved and attached to a chat's message, or its path pasted elsewhere.
         #[unsafe(method(paste:))]
         fn paste(&self, _sender: Option<&AnyObject>) {
             let pb = NSPasteboard::generalPasteboard();
@@ -595,6 +596,8 @@ define_class!(
                 let text = pb.stringForType(unsafe { NSPasteboardTypeString }).map(|s| s.to_string());
                 if let Some(text) = text {
                     with(|st| st.app.paste(&text));
+                } else if let Some(png) = pasteboard_png(&pb) {
+                    with(|st| st.app.paste_picture(&png));
                 }
             } else {
                 with(|st| st.app.paste_paths(&paths));
@@ -1705,6 +1708,21 @@ fn pasteboard_put(text: &str) {
     pb.clearContents();
     // SAFETY: NSPasteboardTypeString is a valid static pasteboard type.
     pb.setString_forType(&NSString::from_str(text), unsafe { NSPasteboardTypeString });
+}
+
+/// The picture on pasteboard `pb` as PNG bytes: its PNG as it is, else its TIFF (a screenshot's, Safari's Copy Image)
+/// converted; None when it holds no picture (or a TIFF AppKit cannot read).
+fn pasteboard_png(pb: &NSPasteboard) -> Option<Vec<u8>> {
+    // SAFETY: NSPasteboardTypePNG is a valid static pasteboard type.
+    if let Some(d) = pb.dataForType(unsafe { objc2_app_kit::NSPasteboardTypePNG }) {
+        return Some(d.to_vec());
+    }
+    // SAFETY: NSPasteboardTypeTIFF is a valid static pasteboard type.
+    let tiff = pb.dataForType(unsafe { objc2_app_kit::NSPasteboardTypeTIFF })?;
+    let rep = objc2_app_kit::NSBitmapImageRep::imageRepWithData(&tiff)?;
+    // SAFETY: an empty properties dictionary has the type the method takes.
+    let png = unsafe { rep.representationUsingType_properties(objc2_app_kit::NSBitmapImageFileType::PNG, &objc2_foundation::NSDictionary::new()) }?;
+    Some(png.to_vec())
 }
 
 /// The paths of the files on pasteboard `pb` (each item's file URL; Finder's are file reference URLs, resolved to paths).

@@ -83,6 +83,17 @@ hn {
     chat_list_nest {
       Size: {w: {kind: Fixed, value: $chat_list_nest_w, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
     }
+    // A pasted picture's thumbnail height and widest in the composer, and a sent message's pictures' height
+    // (src/app/chat.rs fill_pictures; points, as a width).
+    chat_attach_tall {
+      Size: {w: {kind: Fixed, value: $chat_attach_h, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+    chat_attach_wide {
+      Size: {w: {kind: Fixed, value: $chat_attach_max_w, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+    chat_sent_tall {
+      Size: {w: {kind: Fixed, value: $chat_sent_h, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
     // A chip's hover card (src/app/chat/peek.rs, scene/widgets/peek.flecs): how long the pointer rests on a chip before
     // it opens (seconds), and how many of a file's lines a path's card shows (each as Size.w's value).
     inline_peek_dwell {

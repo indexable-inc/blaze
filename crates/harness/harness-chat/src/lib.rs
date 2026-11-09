@@ -21,8 +21,8 @@ use serde_json::Value;
 /// One thing the transcript shows, in the order it happened.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Item {
-    /// What the person sent.
-    User { text: String },
+    /// What the person sent: their words and the pictures with them (absolute paths).
+    User { text: String, images: Vec<String> },
     /// The agent's words (markdown), streaming until `done`.
     Text { block: String, text: String, done: bool },
     /// The agent's reasoning, streaming until `done`.
@@ -260,11 +260,11 @@ impl Transcript {
                 }
             }
             Body::Context(c) => self.context = Some(c.clone()),
-            Body::User { text } => {
+            Body::User { text, images } => {
                 if self.title.is_empty() {
                     self.title = title_of(text);
                 }
-                self.push("", Item::User { text: text.clone() });
+                self.push("", Item::User { text: text.clone(), images: images.clone() });
             }
             Body::Busy { busy } => self.busy = *busy,
             Body::BlockStart { block, kind } => {

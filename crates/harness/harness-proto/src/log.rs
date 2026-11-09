@@ -106,7 +106,7 @@ mod tests {
 
     #[test]
     fn records_and_a_torn_tail() {
-        let a = Event { ts: 1, body: Body::User { text: "hi".into() } }.frame();
+        let a = Event { ts: 1, body: Body::User { text: "hi".into(), images: Vec::new() } }.frame();
         let b = Event { ts: 2, body: Body::Busy { busy: true } }.frame();
         let mut log = MAGIC.to_vec();
         log.extend_from_slice(&a);

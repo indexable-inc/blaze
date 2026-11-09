@@ -213,9 +213,13 @@ pub fn rpc(d: &Daemon, id: &str, method: &str, args: &Value, handle: impl Fn(Req
     match parse(&id) {
         Some(Target::Session(n)) => match method {
             "prompt" | "send" => handle(Req::Send {
-                id: n, text: a("text").context("prompt needs args.text")?, raw: false, submit: args["submit"].as_bool(),
+                id: n,
+                text: a("text").context("prompt needs args.text")?,
+                raw: false,
+                submit: args["submit"].as_bool(),
+                images: args["images"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect(),
             }),
-            "input" => handle(Req::Send { id: n, text: a("data").context("input needs args.data")?, raw: true, submit: None }),
+            "input" => handle(Req::Send { id: n, text: a("data").context("input needs args.data")?, raw: true, submit: None, images: Vec::new() }),
             "interrupt" => {
                 let s = d.get(n)?;
                 if s.chat.is_some() && a("key").is_none() {
