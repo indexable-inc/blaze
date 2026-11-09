@@ -26,7 +26,7 @@
 
 use std::sync::atomic::Ordering;
 
-use super::{Give, PAGE, Plant, Pool, Rank, Referenced, State, Tail, Windows, Word, ranges_of};
+use super::{Give, PAGE, Plant, Pool, Prefetch, Rank, Referenced, State, Tail, Windows, Word, ranges_of};
 
 /// Pages one batch gives back at most: one `process_madvise` on Linux, one TLB flush.
 pub(crate) const BATCH: usize = 256;
@@ -123,6 +123,10 @@ impl Sweep {
         };
         match word.compare_exchange(seen.0, next.0, Ordering::AcqRel, Ordering::Relaxed) {
             Ok(_) => {
+                if seen.prefetched() {
+                    // A prefetched page nobody read: a wrong guess, counted.
+                    pool.count_prefetch(Prefetch::Wasted, 1);
+                }
                 self.batch.push(page);
                 Visit::Taken { page }
             }

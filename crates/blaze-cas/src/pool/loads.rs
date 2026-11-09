@@ -14,18 +14,58 @@
 //! store, `Loading -> Evicting -> Unloaded` for a failed or short read (its pages given back
 //! first), `Loading -> Evicting -> Corrupt` for a block that failed its check, `Loading ->
 //! Abandoned` for a read the driver abandoned to the kernel.
+//!
+//! **Prefetch** (the design's section 5) is the same read into the same slots, asked by nobody:
+//! the core keeps a queue of runs a plan gave it ([`Loads::prefetch`]) and issues from its front
+//! ([`Loads::pump`]) in load slots of its own (the last [`PREFETCH_IN_FLIGHT`] of the table, so a
+//! demand read never waits for a slot a prefetch holds), and only while
+//!
+//! - no demand load is in flight: the priority is the pool's own, since an NVMe drive's default
+//!   scheduler ignores the idle class a prefetch read also carries ([`Priority::Idle`]);
+//! - fewer than [`PREFETCH_IN_FLIGHT`] prefetch loads are;
+//! - the pages prefetched and not yet read, in flight or loaded and still marked, stay within the
+//!   budget ([`Loads::set_budget`]). A read of a prefetched page clears its mark and makes room
+//!   for the next, so the queue is replayed at the pace its guesses are read, and a build that
+//!   has turned elsewhere stops pulling it.
+//!
+//! A page a prefetch loads is published with no pin and its mark set. The queue is dropped once
+//! the pages wasted since its plan (taken by the sweep unread) pass the pages read by
+//! [`WASTE_SLACK`]: a replay that is wrong more than it is right ends.
 
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
-use std::{collections::BTreeMap, fmt, ops::Range, sync::atomic::Ordering};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    fmt,
+    ops::Range,
+    sync::atomic::Ordering,
+};
 
 use blaze_core::{ABANDONED_SPAN, Cache, Completion, Done, Effect, FileName, IoError, Priority, Tag};
 
-use super::{BLOCK, Give, PAGE, PER_WINDOW, Plant, Pool, Referenced, State, Window, Word, block_check};
+use super::{
+    BLOCK, Give, PAGE, PER_WINDOW, Plant, Pool, Prefetch, PrefetchCounts, Referenced, Run, State, Window, Word,
+    block_check,
+};
 
 /// Loads in flight at most: a fixed table, each slot with its reusable event (the driver's).
 pub(crate) const LOADS: usize = 4096;
+
+/// Prefetch loads in flight at most, each one read of up to [`READ_MOST`]: 16 MiB, which a
+/// demand read that arrives behind them waits a few milliseconds for at worst.
+pub(crate) const PREFETCH_IN_FLIGHT: usize = 16;
+
+/// The load slots askers take, from the first: the rest are the core's own, for prefetch.
+pub(crate) const DEMAND_SLOTS: usize = LOADS - PREFETCH_IN_FLIGHT;
+
+/// Pages a plan's prefetches may be wasted past those read before its queue is dropped: 4 MiB.
+pub(crate) const WASTE_SLACK: u64 = (4 << 20) / PAGE;
+
+/// Whether `slot` is one of the core's own, for prefetch: a page `Loading` in it has no asker.
+pub(crate) fn prefetch_slot(slot: u16) -> bool {
+    slot as usize >= DEMAND_SLOTS
+}
 
 /// The most one read reads: 16 pages, a size an NVMe drive takes as one command at full speed.
 pub(crate) const READ_MOST: u64 = 1 << 20;
@@ -46,12 +86,14 @@ pub(crate) struct Load {
     pub(crate) pages: u32,
 }
 
-/// A load that ended: its asker's to wake.
+/// A load that ended: its asker's to wake. A prefetch's ([`prefetch_slot`]) has no asker: its
+/// slot's event is fired for the readers that found its pages loading and wait on it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct Ended {
     pub(crate) slot: u16,
     /// `Ok` when every page is `Loaded` and pinned for the asker; else its first failure, and
-    /// the pages that read well are `Loaded` and pinned for the asker all the same.
+    /// the pages that read well are `Loaded` and pinned for the asker all the same. (A
+    /// prefetch's pages are pinned for nobody.)
     pub(crate) outcome: Result<(), LoadFailure>,
 }
 
@@ -174,6 +216,28 @@ pub(crate) struct Loads {
     giving: Vec<u64>,
     /// Give-backs of a failed load's pages the kernel refused: memory kept, not correctness.
     refused: u64,
+    /// Demand loads in flight: while there is one, no prefetch is issued.
+    demand: usize,
+    /// The plan's runs not yet issued, in the order to read them.
+    queue: VecDeque<Run>,
+    /// The prefetch slots no load is in.
+    slots: Vec<u16>,
+    /// Prefetch loads in flight, and their pages.
+    prefetching: usize,
+    prefetching_pages: u64,
+    /// Prefetch loads in flight at most: [`PREFETCH_IN_FLIGHT`], fewer in a test.
+    most: usize,
+    /// Bytes prefetched and not yet read at most. None until it is told ([`Loads::set_budget`]):
+    /// with no room known there is no prefetch.
+    budget: u64,
+    /// The pool's counts as the queue's plan was given: what is wasted and read since is the
+    /// plan's.
+    base: PrefetchCounts,
+    /// Plans dropped for waste, runs dropped for a file retired or a kernel that refused their
+    /// pages, and prefetch loads that failed, so far.
+    stopped: u64,
+    dropped: u64,
+    failed: u64,
 }
 
 impl Loads {
@@ -188,7 +252,133 @@ impl Loads {
             in_flight: 0,
             giving: Vec::new(), // alloc: once, kept
             refused: 0,
+            demand: 0,
+            queue: VecDeque::new(), // alloc: empty, allocates nothing
+            slots: (DEMAND_SLOTS..LOADS).map(|it| it as u16).collect(), // alloc: the prefetch slots, once
+            prefetching: 0,
+            prefetching_pages: 0,
+            most: PREFETCH_IN_FLIGHT,
+            budget: 0,
+            base: PrefetchCounts::default(),
+            stopped: 0,
+            dropped: 0,
+            failed: 0,
         }
+    }
+
+    /// Demand loads in flight.
+    pub(crate) fn demand_in_flight(&self) -> usize {
+        self.demand
+    }
+
+    /// Runs of the plan not yet issued.
+    pub(crate) fn queued(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// Plans dropped for waste, runs dropped unissued, and prefetch loads that failed, so far.
+    pub(crate) fn prefetch_stops(&self) -> (u64, u64, u64) {
+        (self.stopped, self.dropped, self.failed)
+    }
+
+    /// The bytes prefetched and not yet read may reach `bytes`: the smaller of an eighth of the
+    /// ceiling and the room the plane last published, told by the driver.
+    pub(crate) fn set_budget(&mut self, bytes: u64) {
+        self.budget = bytes;
+    }
+
+    /// At most `loads` prefetch loads in flight: a test's, to meet the bound with few pages.
+    #[cfg(test)]
+    pub(crate) fn prefetch_at_most(&mut self, loads: usize) {
+        assert!(loads <= PREFETCH_IN_FLIGHT, "{loads} prefetch loads at once, of {PREFETCH_IN_FLIGHT} slots");
+        self.most = loads;
+    }
+
+    /// A plan's runs, in the order to read them, in place of what was queued: a prefetch asked
+    /// and not yet issued is dropped. What is read and wasted from now on is this plan's.
+    pub(crate) fn prefetch<G: Give>(&mut self, pool: &Pool<G>, runs: impl IntoIterator<Item = Run>) {
+        self.queue.clear();
+        self.queue.extend(runs);
+        self.base = pool.prefetch_counts();
+    }
+
+    /// The front run of the queue shortened by `pages`, and gone when none is left.
+    fn passed(&mut self, pages: u64) {
+        let front = self.queue.front_mut().expect("a run at the queue's front");
+        front.first += pages;
+        front.pages -= pages as u32;
+        if front.pages == 0 {
+            self.queue.pop_front();
+        }
+    }
+
+    /// Prefetch loads issued from the queue's front, into `effects`, while the rules of the
+    /// module's docs let one be: called by the driver once every demand ask it holds is asked,
+    /// and again as loads end. How many it issued.
+    ///
+    /// Bounded: each turn issues a load or shortens the queue, or it returns.
+    pub(crate) fn pump<G: Give>(&mut self, pool: &Pool<G>, effects: &mut Vec<Effect>, ended: &mut Vec<Ended>) -> u32 {
+        if self.queue.is_empty() {
+            return 0;
+        }
+        let counts = pool.prefetch_counts();
+        let wasted = counts.wasted.saturating_sub(self.base.wasted);
+        let read = (counts.hit + counts.late).saturating_sub(self.base.hit + self.base.late);
+        if wasted > read + WASTE_SLACK {
+            self.queue.clear();
+            self.stopped += 1;
+            return 0;
+        }
+        let mut issued = 0;
+        while let Some(&run) = self.queue.front() {
+            if run.pages == 0 {
+                self.queue.pop_front();
+                continue;
+            }
+            let demand = self.demand > 0 && !pool.planted(Plant::PrefetchFirst);
+            if demand || self.prefetching >= self.most {
+                break;
+            }
+            // The run as far as its file commits: a file retired since the plan is not read.
+            let Some(end) = self.file_of(run.first, 1).map(File::last_page) else {
+                self.queue.pop_front();
+                self.dropped += 1;
+                continue;
+            };
+            let unread = pool.prefetch_counts().unread() + self.prefetching_pages;
+            let room = (self.budget / PAGE).saturating_sub(unread);
+            if room == 0 {
+                break;
+            }
+            let most = u64::from(run.pages).min(PAGES_PER_READ).min(end - run.first).min(room);
+            let slot = *self.slots.last().expect("a free prefetch slot while fewer loads than slots are in flight");
+            let mut claimed = 0;
+            while claimed < most && pool.claim(run.first + claimed, slot).is_ok() {
+                claimed += 1;
+            }
+            if claimed == 0 {
+                // Loading or loaded already, or refused: not asked again.
+                self.passed(1);
+                continue;
+            }
+            self.passed(claimed);
+            let stretch = Run { first: run.first, pages: claimed as u32 };
+            if pool.reuse_run(stretch).is_err() {
+                for page in stretch.pages() {
+                    pool.unclaim(page);
+                }
+                self.dropped += 1;
+                continue;
+            }
+            self.slots.pop();
+            let load = Load { slot, first: stretch.first, pages: stretch.pages };
+            let asked = self.issue(pool, load, Priority::Idle, effects, ended);
+            assert!(asked, "a prefetch of a file the loads core knows was refused: {load:?}");
+            self.prefetching += 1;
+            self.prefetching_pages += claimed;
+            issued += 1;
+        }
+        issued
     }
 
     pub(crate) fn owns(&self, tag: Tag) -> bool {
@@ -278,9 +468,29 @@ impl Loads {
         Tag(self.tags + (u64::from(slot) << READS_SHIFT | n))
     }
 
-    /// `load` asked: its reads, into `effects`. A load of no file it knows ends at once, failed,
-    /// into `ended`.
+    /// `load` asked by a reader: its reads, into `effects`. A load of no file it knows ends at
+    /// once, failed, into `ended`.
     pub(crate) fn ask<G: Give>(&mut self, pool: &Pool<G>, load: Load, effects: &mut Vec<Effect>, ended: &mut Vec<Ended>) {
+        assert!(
+            !prefetch_slot(load.slot),
+            "a reader's load asked in slot {}, one of the loads core's own for prefetch",
+            load.slot
+        );
+        if self.issue(pool, load, Priority::Demand, effects, ended) {
+            self.demand += 1;
+        }
+    }
+
+    /// `load`'s reads, at `priority`, into `effects`: whether it is in flight. A load of no file
+    /// the core knows ends at once, failed, into `ended`, and is not.
+    fn issue<G: Give>(
+        &mut self,
+        pool: &Pool<G>,
+        load: Load,
+        priority: Priority,
+        effects: &mut Vec<Effect>,
+        ended: &mut Vec<Ended>,
+    ) -> bool {
         assert!(load.pages >= 1, "an empty load in slot {}", load.slot);
         assert!(
             self.table[load.slot as usize].load.is_none(),
@@ -300,7 +510,7 @@ impl Loads {
                 self.refused += 1;
             }
             ended.push(Ended { slot: load.slot, outcome: Err(failure) });
-            return;
+            return false;
         };
         if pool.planted(Plant::LoadedAtAsk) {
             // Published as the read is asked: a pin can take the page while the read writes it.
@@ -319,7 +529,7 @@ impl Loads {
                 at: part.at,
                 into: pool.span(part.first, part.len as u32),
                 cache: self.cache,
-                priority: Priority::Demand,
+                priority,
                 tag: self.tag(load.slot, n),
             });
         }
@@ -332,6 +542,7 @@ impl Loads {
         flight.ends.resize(load.pages as usize, PageEnd::Good);
         flight.failure = None;
         self.in_flight += 1;
+        true
     }
 
     /// A read of a load completed; once its load's last has, the load ends into `ended`.
@@ -405,10 +616,17 @@ impl Loads {
             failure = failure.filter(|it| !matches!(it, LoadFailure::Read { .. } | LoadFailure::Short { .. }));
         }
         self.giving.clear();
+        let prefetch = prefetch_slot(load.slot);
+        let mut good = 0;
         for (i, &end) in flight.ends.iter().enumerate() {
             let page = load.first + i as u64;
             let word = pool.word_now(page);
             let next = match end {
+                // Nobody asked: no pin, and marked until its first read.
+                PageEnd::Good if prefetch => {
+                    good += 1;
+                    Word::prefetched_page(word.version())
+                }
                 // The asker's pin, set as the page is published. Its second-chance bit stays
                 // clear: the next read that finds it loaded sets it.
                 PageEnd::Good => Word::loaded(word.version(), 1, Referenced::Clear),
@@ -434,6 +652,16 @@ impl Loads {
             self.refused += 1;
         }
         self.in_flight -= 1;
+        match prefetch {
+            true => {
+                pool.count_prefetch(Prefetch::Loaded, good);
+                self.prefetching -= 1;
+                self.prefetching_pages -= u64::from(load.pages);
+                self.slots.push(load.slot);
+                self.failed += u64::from(failure.is_some());
+            }
+            false => self.demand -= 1,
+        }
         ended.push(Ended { slot: load.slot, outcome: failure.map_or(Ok(()), Err) });
     }
 }

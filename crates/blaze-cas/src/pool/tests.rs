@@ -23,6 +23,9 @@
 //!   file's ([`Append`]). The test's files stand in for the head: an append is committed, in the
 //!   model and in the pool, as its sync completes. One that fails, or is in flight at a crash, is
 //!   not;
+//! - prefetch: a plan of a whole file's pages, or of the view's trace (a build's end keeps one
+//!   from its misses, a build's start replays it), queued in the loads core and issued by its
+//!   pump as the rules allow; and the budget moved;
 //! - file retirements (its windows freed and taken by a new file), crashes and reopens.
 //!
 //! The test's [`Poison`] stands in for the kernel: what it is given back it poisons with `0xDB`
@@ -40,10 +43,12 @@
 //! 4. The pages the process holds (what `Tag::Pool` counts) are exactly the pages `Loading`,
 //!    `Loaded`, `Evicting` or `Abandoned`; the pins in the words are exactly the guards' alive.
 //! 5. Every load ends, and every reading ends, within a bound of polls.
+//! 6. No prefetch read is submitted while a demand load is in flight, nor past the budget of
+//!    pages prefetched and not yet read, nor past the prefetch loads allowed at once. Every
+//!    prefetched page is counted once as loaded and once as hit, late or wasted, or is still
+//!    marked: `loaded = hit + late + wasted + marked`.
 //!
-//! (Section 7's sixth, the prefetch budget, is lane 6's.)
-//!
-//! Planted bugs 1 to 6 and 8 ([`Plant`]), each a safeguard of the pool's removed, must each be caught on
+//! Planted bugs 1 to 6, 8 and 9 ([`Plant`]), each a safeguard of the pool's removed, must each be caught on
 //! one of [`CONTROL_SEEDS`] seeded plans. Replay: a failure names its plan and the simulator's
 //! seed in it; a control names a seed of [`plan_of`] for [`REPLAY`].
 
@@ -56,7 +61,7 @@ use std::{
 };
 
 use blaze_core::{
-    Cache, Completion, Done, Driver, Effect, FileName, Tag,
+    Cache, Completion, Done, Driver, Effect, FileName, Priority, Tag,
     sim::{Faults, Rng, SCRIBBLE, Sim},
     wait::Deadline,
 };
@@ -65,9 +70,12 @@ use hegel::{TestCase, generators as gs};
 
 use super::{
     Append, BLOCK, Ended, FileId, Give, Kernel, LoadFailure, Loads, Opened, Optimistic, PAGE, PinSet, Pins,
-    Plant, Pool, PoolError, Rank, ReadStep, Reading, Seen, State, WINDOW, Window, Windows, checks_of,
+    Plant, Pool, PoolError, PrefetchCounts, Rank, ReadStep, Reading, Run, Seen, State, WINDOW, Window, Windows,
+    checks_of,
     drive::Loader,
     evict::{Sweep, Visit},
+    loads::prefetch_slot,
+    prefetch::{PLAN_FUEL, Recorder, Trace, plan as plan_prefetch},
 };
 
 /// Windows of the test's pool: 4 pages each (a test's `PACK_MOST`), room for every file a run
@@ -79,6 +87,10 @@ const COMMITTER: usize = READERS;
 /// The tags of the commit's writes, from this one, and of its sync: none a load's.
 const WRITE_TAG: u64 = 1000;
 const SYNC_TAG: u64 = 999;
+/// Prefetch loads the test's loads core issues at once: few, so a run meets the bound.
+const PREFETCHES: usize = 2;
+/// Pages prefetched and not yet read at most, as a world begins.
+const BUDGET: u64 = 6;
 /// Load slots the test hands its readers: few, so a reader meets a full table.
 const SLOTS: u16 = 3;
 /// What a page given back holds: the design's stand-in for the kernel's zeros or anything.
@@ -196,6 +208,14 @@ enum Act {
     Retire { file: u8 },
     /// The commit's next step: an append to a file begun, or the one under way stepped.
     Append { file: u8 },
+    /// A plan of every page of a file, in place of the one queued.
+    Prefetch { file: u8 },
+    /// A build's end: the view's trace kept from its misses and what is still loaded.
+    BuildEnd,
+    /// A build's start: the view's trace planned and queued.
+    BuildStart,
+    /// The prefetch budget moved to `pages` pages.
+    Budget { pages: u8 },
     Crash,
 }
 
@@ -271,7 +291,7 @@ fn plan(d: &mut impl Draw) -> Plan {
     for _ in 0..n {
         let reader = d.int(0, READERS as u64 - 1) as u8;
         let (file, rec) = (d.int(0, 2) as u8, d.int(0, 2) as u8);
-        acts.push(match d.int(0, 25) {
+        acts.push(match d.int(0, 29) {
             0..=3 => Act::Read { reader, file, rec, set: false },
             4 | 5 => Act::Read { reader, file, rec, set: true },
             6 | 7 => Act::Optimistic { reader, file, rec },
@@ -288,6 +308,10 @@ fn plan(d: &mut impl Draw) -> Plan {
             21 => Act::Step { us: 0 },
             22 => Act::Retire { file },
             23 | 24 => Act::Append { file },
+            25 => Act::Prefetch { file },
+            26 => Act::BuildEnd,
+            27 => Act::BuildStart,
+            28 => Act::Budget { pages: d.int(0, 12) as u8 },
             _ => Act::Crash,
         });
     }
@@ -427,6 +451,20 @@ struct World {
     effects: Vec<Effect>,
     out: Vec<Completion>,
     ended: Vec<Ended>,
+    /// The build's misses so far, and the view's trace as its last build's end kept it (a store
+    /// record, so it outlives a crash).
+    recorder: Recorder,
+    trace: Trace,
+    /// The prefetch budget the loads core was last told, in bytes.
+    budget: u64,
+}
+
+/// A loads core as a world makes one, at its start and after each crash.
+fn loads() -> Loads {
+    let mut loads = Loads::new(TAGS, Cache::Bypassed);
+    loads.prefetch_at_most(PREFETCHES);
+    loads.set_budget(BUDGET * PAGE);
+    loads
 }
 
 impl Drop for World {
@@ -452,7 +490,7 @@ impl World {
             pool,
             plant,
             windows: Windows::new(WINDOWS),
-            loads: Loads::new(TAGS, Cache::Bypassed),
+            loads: loads(),
             sweep: Sweep::new(),
             files: Vec::new(),
             spares: 0,
@@ -462,6 +500,9 @@ impl World {
             effects: Vec::new(),
             out: Vec::new(),
             ended: Vec::new(),
+            recorder: Recorder::new(),
+            trace: Trace::default(),
+            budget: BUDGET * PAGE,
         };
         for spec in &plan.files {
             let file = world.make(spec)?;
@@ -600,12 +641,15 @@ impl World {
                 }
             }
         }
-        let (mut held, mut pins) = (0u64, 0u64);
+        let (mut held, mut pins, mut marked) = (0u64, 0u64, 0u64);
         for page in 0..self.pool.total() {
             let word = self.pool.word_now(page);
             match word.state() {
                 State::Loading | State::Loaded | State::Evicting | State::Abandoned => held += 1,
                 State::Unloaded | State::Corrupt => {}
+            }
+            if word.state() == State::Loaded && word.prefetched() {
+                marked += 1;
             }
             if matches!(word.state(), State::Loaded | State::Evicting) {
                 pins += u64::from(word.pins());
@@ -621,6 +665,58 @@ impl World {
         if pins != guards {
             return Err(Broke::Oracle(format!("the pages' words hold {pins} pins, and the guards alive {guards}")));
         }
+        let counts = self.pool.prefetch_counts();
+        if counts.loaded != counts.hit + counts.late + counts.wasted + marked {
+            return Err(Broke::Oracle(format!(
+                "prefetched pages are not each counted once: {counts:?}, and {marked} pages are still marked"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Pages prefetched and not yet read (loading in a prefetch slot, or loaded and marked), and
+    /// the prefetch loads in flight: counted from the words, not from the core's own books.
+    fn prefetching(&self) -> (u64, usize) {
+        let (mut unread, mut slots) = (0u64, BTreeSet::new());
+        for page in 0..self.pool.total() {
+            let word = self.pool.word_now(page);
+            match word.state() {
+                State::Loading if prefetch_slot(word.slot()) => {
+                    unread += 1;
+                    slots.insert(word.slot());
+                }
+                State::Loaded if word.prefetched() => unread += 1,
+                _ => {}
+            }
+        }
+        (unread, slots.len())
+    }
+
+    /// The loads core's pump, after every demand ask of the act; then what the act asked
+    /// submitted, the oracle's sixth rule checked on it first.
+    fn submit(&mut self) -> Result<(), Broke> {
+        self.loads.pump(&self.pool, &mut self.effects, &mut self.ended);
+        let idle = |it: &&Effect| matches!(it, Effect::ReadInto { priority: Priority::Idle, .. });
+        let prefetches = self.effects.iter().filter(idle).count();
+        if prefetches > 0 {
+            if !self.owners.is_empty() {
+                return Err(Broke::Oracle(format!(
+                    "{prefetches} prefetch reads submitted while {} demand loads are in flight",
+                    self.owners.len()
+                )));
+            }
+            let (unread, flying) = self.prefetching();
+            if unread * PAGE > self.budget {
+                return Err(Broke::Oracle(format!(
+                    "a prefetch issued with {unread} pages prefetched and not yet read, past the budget of {} bytes",
+                    self.budget
+                )));
+            }
+            if flying > PREFETCHES {
+                return Err(Broke::Oracle(format!("{flying} prefetch loads in flight, of {PREFETCHES} allowed")));
+            }
+        }
+        self.sim.submit(&mut self.effects);
         Ok(())
     }
 
@@ -668,6 +764,7 @@ impl World {
                 }
                 ReadStep::Ask(load) => {
                     self.owners.insert(load.slot, i);
+                    self.recorder.missed(Run { first: load.first, pages: load.pages });
                     self.loads.ask(&self.pool, load, &mut self.effects, &mut self.ended);
                     Actor::Reading { file, rec, keep, reading }
                 }
@@ -691,14 +788,18 @@ impl World {
             held @ (Actor::Idle | Actor::Holding { .. } | Actor::Appending { .. }) => held,
         };
         self.actors[i] = next;
-        self.sim.submit(&mut self.effects);
-        self.deliver()
+        self.deliver()?;
+        self.submit()
     }
 
     /// Each load that ended told to the reading that asked it.
     fn deliver(&mut self) -> Result<(), Broke> {
         let mut ended = std::mem::take(&mut self.ended);
         for Ended { slot, outcome } in ended.drain(..) {
+            if prefetch_slot(slot) {
+                // Nobody's: a reader that waits on it looks at its page again at its next step.
+                continue;
+            }
             let Some(i) = self.owners.remove(&slot) else {
                 return Err(Broke::Harness(format!("load slot {slot} ended with no reader")));
             };
@@ -724,8 +825,32 @@ impl World {
         }
         self.out = out;
         self.deliver()?;
-        self.sim.submit(&mut self.effects);
-        Ok(())
+        self.submit()
+    }
+
+    /// A plan of every committed page of a drawn file, in place of the one queued.
+    fn prefetch(&mut self, file: u8) -> Result<(), Broke> {
+        let (file, _) = self.pick(file, 0);
+        let window = self.files[file].window;
+        let run = Run { first: window.first_page(), pages: window.pages() as u32 };
+        self.loads.prefetch(&self.pool, [run]);
+        self.submit()
+    }
+
+    /// A build's end: the view's trace kept, and the recorder emptied for the next build.
+    fn build_end(&mut self) {
+        self.trace = Trace::after(&self.trace, &self.recorder, &self.pool, &self.windows);
+        self.recorder.clear();
+    }
+
+    /// A build's start: the view's trace planned and queued.
+    fn build_start(&mut self) -> Result<(), Broke> {
+        let (runs, planned) = plan_prefetch(&[&self.trace], &self.pool, &self.windows, PLAN_FUEL);
+        if planned.walked != planned.of {
+            return Err(Broke::Harness(format!("a plan of a test's trace ran out of fuel: {planned:?}")));
+        }
+        self.loads.prefetch(&self.pool, runs);
+        self.submit()
     }
 
     fn read(&mut self, plan: &Plan, reader: u8, file: u8, rec: u8, keep: Keep) -> Result<(), Broke> {
@@ -879,7 +1004,9 @@ impl World {
         self.set_held.clear();
         self.pool = pool;
         self.windows = Windows::new(WINDOWS);
-        self.loads = Loads::new(TAGS, Cache::Bypassed);
+        self.loads = loads();
+        self.budget = BUDGET * PAGE;
+        self.recorder.clear();
         self.sweep = Sweep::new();
         self.free = (0..SLOTS).collect();
         self.owners.clear();
@@ -938,6 +1065,17 @@ impl World {
             }
             Act::Retire { file } => self.retire(plan, file),
             Act::Append { file } => self.append(plan, file),
+            Act::Prefetch { file } => self.prefetch(file),
+            Act::BuildEnd => {
+                self.build_end();
+                Ok(())
+            }
+            Act::BuildStart => self.build_start(),
+            Act::Budget { pages } => {
+                self.budget = u64::from(pages) * PAGE;
+                self.loads.set_budget(self.budget);
+                self.submit()
+            }
             Act::Crash => self.crash(plan),
         }
     }
@@ -1102,6 +1240,65 @@ fn the_oracle_catches_a_failed_load_kept() {
 #[test]
 fn the_oracle_catches_a_commit_that_does_not_pin_its_file_s_last_page() {
     control(Plant::UnpinnedTail);
+}
+
+#[test]
+fn the_oracle_catches_a_prefetch_issued_while_a_demand_load_is_in_flight() {
+    control(Plant::PrefetchFirst);
+}
+
+/// A view's trace by hand, with no faults: a miss is recorded and kept; after a restart its
+/// page is prefetched, and the build's read of it is a hit that asks nothing and records
+/// nothing; a page prefetched and never read is counted wasted when the sweep takes it, and
+/// drops out of the trace.
+#[test]
+fn a_trace_replays_what_a_build_missed_and_a_wrong_guess_is_made_once() {
+    let plan = quiet_plan();
+    let ok = |done: Result<(), Broke>| done.unwrap_or_else(|broke| panic!("{broke}"));
+    let mut world = World::new(&plan, Plant::None).unwrap_or_else(|broke| panic!("{broke}"));
+    let counts = |loaded, hit, wasted| PrefetchCounts { loaded, hit, late: 0, wasted };
+    // Every prefetch the loads core holds issued and ended.
+    let settle = |world: &mut World| {
+        for _ in 0..DRAIN {
+            if world.loads.in_flight() == 0 && world.loads.queued() == 0 {
+                return;
+            }
+            world.step(100).unwrap_or_else(|broke| panic!("{broke}"));
+        }
+        panic!("a prefetch with no faults did not end in {DRAIN} polls");
+    };
+
+    read_once(&mut world, &plan);
+    assert_eq!(world.recorder.runs().len(), 1, "the build's one miss");
+    world.build_end();
+    let kept = world.trace.clone();
+    assert_eq!(kept.entries().len(), 1);
+
+    // A restart: nothing is loaded, and the trace brings the page before anything asks.
+    ok(world.crash(&plan));
+    ok(world.build_start());
+    settle(&mut world);
+    let page = world.files[0].window.first_page();
+    let word = world.pool.word_now(page);
+    assert!(word.state() == State::Loaded && word.prefetched() && word.pins() == 0, "{word:?}");
+    assert_eq!(world.pool.prefetch_counts(), counts(1, 0, 0));
+    read_once(&mut world, &plan);
+    assert!(world.recorder.runs().is_empty(), "a hit asks no load and records nothing");
+    assert_eq!(world.pool.prefetch_counts(), counts(1, 1, 0));
+    world.build_end();
+    assert_eq!(world.trace, kept, "a page that was read stays in the trace");
+
+    // A restart again, and this build never reads the page: the sweep takes it first, it is
+    // counted, and the next trace does not name it.
+    ok(world.crash(&plan));
+    ok(world.build_start());
+    settle(&mut world);
+    assert_eq!(world.sweep.visit(&world.pool, &world.windows), Visit::Taken { page });
+    world.sweep.give(&world.pool).unwrap();
+    assert_eq!(world.pool.prefetch_counts(), counts(1, 0, 1));
+    world.build_end();
+    assert!(world.trace.entries().is_empty(), "{:?}", world.trace);
+    ok(world.check());
 }
 
 /// An append with no faults, by hand: its records are not the file's until its sync completes,

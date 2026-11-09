@@ -28,9 +28,14 @@
 //! A commit writes through the pool too ([`append`]): its new bytes go into their file's window,
 //! are written from there, and are the file's loaded pages once the commit is durable.
 //!
+//! Prefetch is the pool's own ([`prefetch`], and the loads core's queue): the same reads into the
+//! same slots, issued only while no demand load is in flight and within a budget of pages
+//! prefetched and not yet read, each page counted once as loaded and once as hit, late or wasted
+//! ([`Pool::prefetch_counts`]).
+//!
 //! Proof: `pool/tests.rs`, a deterministic simulation test of the real word, reading, loads
-//! core, sweep and append under `blaze_core::sim::Sim`, with planted bugs 1 to 6 and 8 of the
-//! design's section 7 ([`Plant`]).
+//! core, sweep, append and prefetch under `blaze_core::sim::Sim`, with planted bugs 1 to 6, 8
+//! and 9 of the design's section 7 ([`Plant`]).
 
 use std::{
     cell::Cell,
@@ -49,6 +54,7 @@ pub(crate) mod append;
 pub(crate) mod drive;
 pub(crate) mod evict;
 pub(crate) mod loads;
+pub(crate) mod prefetch;
 #[cfg(test)]
 mod tests;
 
@@ -180,6 +186,12 @@ impl Word {
         Word::of(State::Abandoned, version, 0)
     }
 
+    /// A page a prefetch loaded: `Loaded` with no pin, its second-chance bit clear, and marked
+    /// until its first read.
+    pub(crate) fn prefetched_page(version: u64) -> Word {
+        Word(Word::of(State::Loaded, version, 0).0 | Word::PREFETCHED)
+    }
+
     pub(crate) fn state(self) -> State {
         match (self.0 & Word::STATE) >> Word::STATE_SHIFT {
             0 => State::Unloaded,
@@ -250,7 +262,7 @@ impl fmt::Debug for Word {
 // --- Planted bugs ------------------------------------------------------------------------------
 
 /// A safeguard of the pool's removed, for the DST's controls (the design's section 7, bugs 1 to
-/// 6 and 8): each is caught by the oracle within its case budget, or the oracle is too weak. Only a
+/// 6, 8 and 9): each is caught by the oracle within its case budget, or the oracle is too weak. Only a
 /// test's pool plants one ([`Pool::planted`] is `false` in every build of blaze).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Plant {
@@ -272,6 +284,59 @@ pub(crate) enum Plant {
     /// 8: a commit writes into its file's last committed page without pinning it, so the sweep
     /// gives the page back in the middle of the write.
     UnpinnedTail,
+    /// 9: a prefetch read is issued while a demand load is in flight.
+    PrefetchFirst,
+}
+
+// --- Counting prefetched pages -------------------------------------------------------------------
+
+/// What a pin found of its page.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Pin {
+    Plain,
+    /// It is the first read of a page a prefetch loaded: the pin cleared the page's mark.
+    Prefetched,
+}
+
+/// How a prefetched page is counted: once as `Loaded`, then exactly once as one of the others.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Prefetch {
+    /// A prefetch read it and published it, marked.
+    Loaded,
+    /// Its first read found it loaded.
+    Hit,
+    /// Its first read waited on the prefetch's load: asked too late to save the wait, and the
+    /// read was still not issued twice.
+    Late,
+    /// The sweep or a retirement took it unread.
+    Wasted,
+}
+
+/// The pool's count of prefetched pages. Each is written once in a prefetched page's life (never
+/// on a hit of a page already read), by whoever moves the page's word.
+#[derive(Default)]
+struct Prefetched {
+    loaded: AtomicU64,
+    hit: AtomicU64,
+    late: AtomicU64,
+    wasted: AtomicU64,
+}
+
+/// [`Pool::prefetch_counts`]: pages, since the pool was made.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) struct PrefetchCounts {
+    pub(crate) loaded: u64,
+    pub(crate) hit: u64,
+    pub(crate) late: u64,
+    pub(crate) wasted: u64,
+}
+
+impl PrefetchCounts {
+    /// Pages prefetched and not yet read or taken: those still marked. (Saturating: the four are
+    /// read one after another while other threads count.)
+    pub(crate) fn unread(self) -> u64 {
+        self.loaded.saturating_sub(self.hit + self.late + self.wasted)
+    }
 }
 
 // --- Giving pages to and taking them from the kernel -------------------------------------------
@@ -323,6 +388,7 @@ pub(crate) struct Pool<G: Give> {
     /// Give-backs the kernel refused outside the sweep's batches (an append given up): memory
     /// kept, counted.
     refused: AtomicU64,
+    prefetched: Prefetched,
     #[cfg(test)]
     plant: Plant,
 }
@@ -351,7 +417,8 @@ impl<G: Give> Pool<G> {
             .map_err(|full| PoolError::Reserve { what: "a registration", windows, why: full.to_string() })?;
         #[cfg(test)]
         let plant = Plant::None;
-        Ok(Pool { spans, pages, words, total, give, refused: AtomicU64::new(0), #[cfg(test)] plant })
+        let (refused, prefetched) = (AtomicU64::new(0), Prefetched::default());
+        Ok(Pool { spans, pages, words, total, give, refused, prefetched, #[cfg(test)] plant })
     }
 
     /// A test's pool with `plant` planted.
@@ -425,6 +492,25 @@ impl<G: Give> Pool<G> {
         self.refused.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Prefetched pages so far, and how each ended: `loaded = hit + late + wasted + unread`.
+    pub(crate) fn prefetch_counts(&self) -> PrefetchCounts {
+        let of = |it: &AtomicU64| it.load(Ordering::Relaxed);
+        let counts = &self.prefetched;
+        PrefetchCounts { loaded: of(&counts.loaded), hit: of(&counts.hit), late: of(&counts.late), wasted: of(&counts.wasted) }
+    }
+
+    /// `pages` prefetched pages counted as `what`, by whoever just moved their words.
+    pub(crate) fn count_prefetch(&self, what: Prefetch, pages: u64) {
+        let counts = &self.prefetched;
+        let count = match what {
+            Prefetch::Loaded => &counts.loaded,
+            Prefetch::Hit => &counts.hit,
+            Prefetch::Late => &counts.late,
+            Prefetch::Wasted => &counts.wasted,
+        };
+        count.fetch_add(pages, Ordering::Relaxed);
+    }
+
     /// The address of the pool's byte `at`.
     fn addr(&self, at: u64) -> *mut u8 {
         assert!(at <= self.total * PAGE, "byte {at} of a store pool of {} pages", self.total);
@@ -438,9 +524,10 @@ impl<G: Give> Pool<G> {
 
     // --- Pins ---
 
-    /// One pin of `page`, if it is `Loaded`: one compare-and-swap that adds to its pins, sets its CLOCK
-    /// bit and clears its `prefetched` bit. Otherwise the word that refused it.
-    pub(crate) fn try_pin(&self, page: u64) -> Result<(), Word> {
+    /// One pin of `page`, if it is `Loaded`: one compare-and-swap that adds to its pins, sets its
+    /// second-chance bit and clears its `prefetched` mark, and whether it cleared one (the caller
+    /// counts the page, [`Pool::count_prefetch`]). Otherwise the word that refused it.
+    pub(crate) fn try_pin(&self, page: u64) -> Result<Pin, Word> {
         let word = self.word(page);
         let mut seen = word.load(Ordering::Acquire);
         // Lock-free, not a wait: a compare that fails means another pin or the sweep moved the
@@ -457,7 +544,8 @@ impl<G: Give> Pool<G> {
             );
             let next = Word::loaded(now.version(), now.pins() + 1, Referenced::Set);
             match word.compare_exchange_weak(seen, next.0, Ordering::Acquire, Ordering::Acquire) {
-                Ok(_) => return Ok(()),
+                Ok(_) if now.prefetched() => return Ok(Pin::Prefetched),
+                Ok(_) => return Ok(Pin::Plain),
                 Err(moved) => seen = moved,
             }
         }
@@ -654,13 +742,18 @@ impl<G: Give> Pool<G> {
     /// already: one compare-and-swap a page a lap of the sweep, and nothing written after. For a
     /// copy that validated, so a page read only optimistically (every index page) is not taken
     /// while it is in use. A swap that fails is not tried again: a pin or the sweep moved the word,
-    /// and the next read marks it.
+    /// and the next read marks it. A page a prefetch loaded has its mark cleared in the same
+    /// swap, and is counted as hit: this is its first read.
     pub(crate) fn touch(&self, seen: &Seen) {
         for i in 0..seen.pages as usize {
             let word = self.word(seen.first + i as u64);
             let now = Word(word.load(Ordering::Relaxed));
-            if now.state() == State::Loaded && !now.referenced() {
-                _ = word.compare_exchange(now.0, now.0 | Word::REFERENCED, Ordering::Release, Ordering::Relaxed);
+            if now.state() == State::Loaded && (!now.referenced() || now.prefetched()) {
+                let next = (now.0 | Word::REFERENCED) & !Word::PREFETCHED;
+                let swapped = word.compare_exchange(now.0, next, Ordering::Release, Ordering::Relaxed).is_ok();
+                if swapped && now.prefetched() {
+                    self.count_prefetch(Prefetch::Hit, 1);
+                }
             }
         }
     }
@@ -910,6 +1003,13 @@ impl Windows {
         *window
     }
 
+    /// The open file whose committed pages hold the pool's page `page`.
+    pub(crate) fn file_at(&self, page: u64) -> Option<&Window> {
+        let window = u32::try_from(page / PER_WINDOW).ok()?;
+        let (_, file) = self.by_first.range(..=window).next_back()?;
+        (page < file.first_page() + file.pages()).then_some(file)
+    }
+
     /// Whether the sweep passes over `id`'s last page.
     pub(crate) fn set_tail(&mut self, id: FileId, tail: Tail) {
         if let Some(window) = self.ids.get(&id).and_then(|first| self.by_first.get_mut(first)) {
@@ -941,7 +1041,12 @@ impl Windows {
                 State::Loaded if seen.pins() == 0 => {
                     let next = Word::evicting(seen.next_version());
                     match pool.word(page).compare_exchange(seen.0, next.0, Ordering::AcqRel, Ordering::Acquire) {
-                        Ok(_) => taken.push(page),
+                        Ok(_) => {
+                            if seen.prefetched() {
+                                pool.count_prefetch(Prefetch::Wasted, 1);
+                            }
+                            taken.push(page);
+                        }
                         Err(now) => {
                             release(pool, &taken);
                             return Err(busy(page, Word(now)));
@@ -1170,6 +1275,11 @@ pub(crate) struct Reading {
     asked: Option<Asked>,
     /// Waits and spins so far: at [`WAITS_MOST`] it is starved.
     waits: u32,
+    /// The page it last waited for a prefetch's load of: its pin of it, if it is the page's
+    /// first, is a late hit.
+    late: Option<u64>,
+    /// Prefetched pages it was the first to read.
+    prefetched: u32,
 }
 
 #[derive(Debug)]
@@ -1201,7 +1311,7 @@ pub(crate) enum ReadStep<G: Give, P: Deref<Target = Pool<G>>> {
 impl Reading {
     /// A read of the `len` (at least one) bytes at the pool's byte `at`.
     pub(crate) fn new(at: u64, len: u64) -> Reading {
-        Reading { at, len, run: Run::of(at, len), pinned: 0, slot: None, asked: None, waits: 0 }
+        Reading { at, len, run: Run::of(at, len), pinned: 0, slot: None, asked: None, waits: 0, late: None, prefetched: 0 }
     }
 
     pub(crate) fn run(&self) -> Run {
@@ -1211,6 +1321,11 @@ impl Reading {
     /// Pages of its run it holds pins of now.
     pub(crate) fn held(&self) -> u32 {
         self.pinned
+    }
+
+    /// Prefetched pages it was the first to read, so far: each made room for the next prefetch.
+    pub(crate) fn prefetched(&self) -> u32 {
+        self.prefetched
     }
 
     /// Whether a load it asked has not ended.
@@ -1306,7 +1421,15 @@ impl Reading {
         while self.pinned < self.run.pages {
             let page = self.run.first + u64::from(self.pinned);
             let word = match pool.try_pin(page) {
-                Ok(()) => {
+                Ok(pin) => {
+                    if pin == Pin::Prefetched {
+                        let how = match self.late == Some(page) {
+                            true => Prefetch::Late,
+                            false => Prefetch::Hit,
+                        };
+                        pool.count_prefetch(how, 1);
+                        self.prefetched += 1;
+                    }
                     self.pinned += 1;
                     continue;
                 }
@@ -1342,6 +1465,9 @@ impl Reading {
                 }
                 State::Loading => {
                     let slot = word.slot();
+                    if loads::prefetch_slot(slot) {
+                        self.late = Some(page);
+                    }
                     return self.waited(pool, page, ReadStep::Wait { page, slot });
                 }
                 State::Evicting => return self.waited(pool, page, ReadStep::Spin { page }),
@@ -1454,8 +1580,8 @@ impl fmt::Display for PoolError {
             }
             PoolError::LoadsFull { waits } => write!(
                 f,
-                "the store's pool had no free load slot of {} (pool::loads::LOADS) through {waits} waits for one",
-                loads::LOADS
+                "the store's pool had no free load slot of {} (pool::loads::DEMAND_SLOTS) through {waits} waits for one",
+                loads::DEMAND_SLOTS
             ),
         }
     }

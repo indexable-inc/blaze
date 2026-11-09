@@ -24,6 +24,12 @@
 //!
 //! On Linux the reads go through the loader's own io_uring, around the page cache; on macOS
 //! through its kqueue driver's file threads, `F_NOCACHE`.
+//!
+//! Prefetch: a plan's runs ([`Loader::prefetch`]) and the budget ([`Loader::set_budget`]) go to
+//! the core on the loader's thread, which issues from the plan after every demand ask it holds
+//! ([`super::Loads::pump`]). While the plan waits for room in its budget with nothing in flight,
+//! the loader is parked; a reader that was the first to read a prefetched page, which makes that
+//! room, wakes it ([`Shared::waiting`], one swap a park, and only on a first read).
 
 #![allow(
     clippy::disallowed_types,
@@ -54,8 +60,8 @@ use blaze_spin::SpinWait;
 use crossbeam_queue::{ArrayQueue, SegQueue};
 
 use super::{
-    Ended, Give, Load, LoadFailure, Loads, Opened, Pins, Pool, PoolError, ReadStep, Reading, State, Window,
-    loads::LOADS,
+    Ended, Give, Load, LoadFailure, Loads, Opened, Pins, Pool, PoolError, ReadStep, Reading, Run, State, Window,
+    loads::{DEMAND_SLOTS, LOADS, prefetch_slot},
 };
 
 /// How long the loader's poll waits, while reads are in flight, before it looks for new asks.
@@ -71,6 +77,14 @@ struct Slot {
     failure: Lock<Option<LoadFailure>>,
 }
 
+/// What a planner tells the core of its prefetch.
+enum PlanAsk {
+    /// The runs to prefetch, in order, in place of those queued.
+    Runs(Vec<Run>),
+    /// The bytes prefetched and not yet read at most.
+    Budget(u64),
+}
+
 /// A change to the files the core reads.
 enum FileAsk {
     Open(Opened),
@@ -82,6 +96,11 @@ struct Shared<G: Give> {
     pool: Pool<G>,
     asks: ArrayQueue<Load>,
     files: SegQueue<FileAsk>,
+    plans: SegQueue<PlanAsk>,
+    /// Whether the core's plan has runs it has not issued, as of the loader's last pass: set
+    /// before the pass issues, and taken (swapped off) by the first reader to read a prefetched
+    /// page after, who wakes the loader to issue into the room that read made.
+    waiting: AtomicBool,
     free: ArrayQueue<u16>,
     slots: Box<[Slot]>,
     /// Fired as a slot comes back to the free list.
@@ -108,8 +127,9 @@ impl<G: Give + Send + Sync + 'static> Loader<G> {
         tags: u64,
         cache: Cache,
     ) -> io::Result<Loader<G>> {
-        let free = ArrayQueue::new(LOADS);
-        for slot in 0..LOADS as u16 {
+        // The slots past them are the core's own, for prefetch.
+        let free = ArrayQueue::new(DEMAND_SLOTS);
+        for slot in 0..DEMAND_SLOTS as u16 {
             assert!(free.push(slot).is_ok(), "the free list has room for every load slot");
         }
         let slot = || Slot {
@@ -120,6 +140,8 @@ impl<G: Give + Send + Sync + 'static> Loader<G> {
             pool,
             asks: ArrayQueue::new(LOADS),
             files: SegQueue::new(),
+            plans: SegQueue::new(),
+            waiting: AtomicBool::new(false),
             free,
             slots: (0..LOADS).map(|_| slot()).collect(), // alloc: the table of slots, once
             room: Lock::new("store.pool.room", Event::new()),
@@ -184,6 +206,20 @@ impl<G: Give + Send + Sync + 'static> Loader<G> {
         self.wake();
     }
 
+    /// A plan's runs to prefetch, in the order to read them, in place of those queued
+    /// ([`super::prefetch::plan`]).
+    pub(crate) fn prefetch(&self, runs: Vec<Run>) {
+        self.shared.plans.push(PlanAsk::Runs(runs));
+        self.wake();
+    }
+
+    /// The bytes prefetched and not yet read at most: the smaller of an eighth of the ceiling and
+    /// the room the plane last published. None until it is told.
+    pub(crate) fn set_budget(&self, bytes: u64) {
+        self.shared.plans.push(PlanAsk::Budget(bytes));
+        self.wake();
+    }
+
     /// The `len` bytes at the pool's byte `at` pinned, loaded first where they are not in memory:
     /// the calling task yields on each load (a fiber switches out; a thread parks), never blocking
     /// a worker in the kernel.
@@ -221,6 +257,13 @@ impl<G: Give + Send + Sync + 'static> Loader<G> {
         };
         if let Some(slot) = reading.take_slot() {
             self.free_slot(slot);
+        }
+        // Its first read of a prefetched page made room in the prefetch budget: the loader, if
+        // its plan waits for room, issues the next. One reader a park takes the flag.
+        let shared = &self.shared;
+        if reading.prefetched() > 0 && shared.waiting.load(Ordering::Relaxed) && shared.waiting.swap(false, Ordering::AcqRel)
+        {
+            self.wake();
         }
         result
     }
@@ -317,6 +360,16 @@ fn run<G: Give, D: Driver>(shared: &Shared<G>, mut driver: D, tags: u64, cache: 
     // completes or parks until an ask comes.
     loop {
         take_files(shared, &mut loads);
+        while let Some(plan) = shared.plans.pop() {
+            match plan {
+                PlanAsk::Runs(runs) => loads.prefetch(&shared.pool, runs),
+                PlanAsk::Budget(bytes) => loads.set_budget(bytes),
+            }
+        }
+        if shared.stop.load(Ordering::Acquire) {
+            // Stopping: nothing more is prefetched.
+            loads.prefetch(&shared.pool, std::iter::empty());
+        }
         while let Some(load) = shared.asks.pop() {
             // An ask can be seen before the file it reads, pushed first on another queue.
             if !loads.knows(load.first) {
@@ -324,13 +377,19 @@ fn run<G: Give, D: Driver>(shared: &Shared<G>, mut driver: D, tags: u64, cache: 
             }
             loads.ask(&shared.pool, load, &mut effects, &mut ended);
         }
+        // Said before the pump reads the counts: a first read after this wakes the loader, so
+        // none that makes room is missed between the pump and the park.
+        let queued = loads.queued() > 0;
+        shared.waiting.store(queued, Ordering::Release);
+        // After every demand ask: a prefetch is never ahead of a demand read in a submission.
+        loads.pump(&shared.pool, &mut effects, &mut ended);
         driver.submit(&mut effects);
         tell(shared, &mut ended);
         if driver.in_flight() == 0 {
             if shared.stop.load(Ordering::Acquire) && shared.asks.is_empty() {
                 return;
             }
-            park(shared);
+            park(shared, queued);
             continue;
         }
         driver.poll(&mut out, Deadline::after(driver.now(), TICK));
@@ -356,17 +415,28 @@ fn take_files<G: Give>(shared: &Shared<G>, loads: &mut Loads) {
 
 /// Each ended load's failure kept for its asker, then its event fired and armed again.
 fn tell<G: Give>(shared: &Shared<G>, ended: &mut Vec<Ended>) {
-    for Ended { slot, outcome } in ended.drain(..) {
-        let slot = &shared.slots[slot as usize];
-        *slot.failure.lock() = outcome.err();
+    for Ended { slot: number, outcome } in ended.drain(..) {
+        let slot = &shared.slots[number as usize];
+        // A prefetch has no asker to take its failure: its pages are unloaded again, the core
+        // counted it, and a reader that waited on it looks at the page again and loads it.
+        if !prefetch_slot(number) {
+            *slot.failure.lock() = outcome.err();
+        }
         slot.event.lock().rearm();
     }
 }
 
-/// Parks the loader until an ask, a file or the stop comes.
-fn park<G: Give>(shared: &Shared<G>) {
+/// Parks the loader until an ask, a file, a plan or the stop comes; or, when its plan has runs
+/// it has not issued (`queued`), until a reader takes [`Shared::waiting`] for a first read of a
+/// prefetched page.
+fn park<G: Give>(shared: &Shared<G>, queued: bool) {
     let mut idle = shared.idle.lock();
-    while shared.asks.is_empty() && shared.files.is_empty() && !shared.stop.load(Ordering::Acquire) {
+    while shared.asks.is_empty()
+        && shared.files.is_empty()
+        && shared.plans.is_empty()
+        && !shared.stop.load(Ordering::Acquire)
+        && !(queued && !shared.waiting.load(Ordering::Acquire))
+    {
         *idle = true;
         shared.woken.wait(&mut idle);
     }
