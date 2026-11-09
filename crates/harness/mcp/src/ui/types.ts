@@ -197,9 +197,9 @@ export interface DropZoneProps extends CommonProps { label?: string; ondrop?: Ha
 export interface GridProps extends CommonProps { columns?: number; fit?: number; gap?: number; pad?: number }
 /** Where a Layer is pinned in its Stack, and where a Stack puts the children that are not Layers. */
 export type LayerAnchor = 'top-left' | 'top' | 'top-right' | 'left' | 'center' | 'right' | 'bottom-left' | 'bottom' | 'bottom-right';
-/** Children on top of one another in one box, as big as its largest child that is not a Layer, each where `align` puts it. */
+/** Children on top of one another in one box, as big as its largest child (Layers included), each that is not a Layer where `align` puts it; later ones are above. */
 export interface StackProps extends CommonProps { align?: LayerAnchor }
-/** A child of a Stack (only there) pinned at `anchor` (top-left), moved by `x`, `y` points; a higher `z` is above. It adds no size. A press sends its `value`. */
+/** A child of a Stack (only there) pinned at `anchor` (top-left), moved by `x`, `y` points; a higher `z` is above. Its content counts towards the Stack's size (`x` and `y` do not), and its content is laid in the Stack's whole frame. A press sends its `value`. */
 export interface LayerProps extends CommonProps { anchor?: LayerAnchor; x?: number; y?: number; z?: number; value?: unknown; onclick?: Handle }
 /** Children left to right, wrapping to the next line; gap 8. */
 export interface WrapProps extends CommonProps { gap?: number }
