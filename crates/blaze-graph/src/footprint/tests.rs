@@ -8,7 +8,11 @@
 //! allocated with no gate, as the daemon's allocator does. Growth past its grant, or growth that
 //! would pass the ceiling, goes through the real gate ([`past_ceiling`]). The driver gives the
 //! plane each running task's realized bytes and a footprint reading every few ticks and right
-//! after gated growth, and purges when the plane or the gate asks.
+//! after gated growth, and purges when the plane or the gate asks. The gate's purge is done at
+//! once (the guard's thread waits for it); the plane's lands a drawn lag of ticks after its ask,
+//! as the daemon's purger thread's does, with readings before it not marked purged. A task that
+//! ends or gives way in the lag frees bytes the purge may not reach (a worker that already gave
+//! back keeps them), so the driver asks again rather than read it as purged.
 //!
 //! After every act the oracle checks:
 //! - the footprint is at most the ceiling;
@@ -21,7 +25,7 @@
 //! At the end every other task has been built within [`MOST_TICKS`]: no deadlock
 //! (bounded-progress).
 //!
-//! Two plants ([`Plant`]) prove the oracle catches what it claims to, each in a control.
+//! Four plants ([`Plant`]) prove the oracle catches what it claims to, each in a control.
 //! Replay: a control or [`replay_one_seed`] names a seed of [`plan_of`]; the Hegel test prints
 //! its plan.
 
@@ -65,6 +69,12 @@ enum Plant {
     /// A driver that never purges: it ignores [`Plane::purge_due`], and the gate is told a
     /// purge was always tried.
     NoPurge,
+    /// The daemon before 2026-11-09: a plane's purge read as purged as it is asked, with what
+    /// the workers keep still in the footprint.
+    EarlyPurged,
+    /// A plane's purge read as purged when it lands though a task freed bytes in its lag, which
+    /// the purge left kept.
+    LandsDespiteFrees,
 }
 
 // --- The plan ------------------------------------------------------------------------------
@@ -96,6 +106,9 @@ struct Plan {
     most_stuck: u64,
     /// The scheduler's choices: which running task acts each tick.
     seed: u64,
+    /// Ticks from a plane's purge ask to its landing: the purger's thread's wait for the
+    /// workers' heaps.
+    purge_lag: u64,
 }
 
 /// A source of draws: Hegel's (shrunk, replayed by Hegel) or a seed's ([`plan_of`]).
@@ -149,6 +162,7 @@ fn plan(d: &mut impl Draw) -> Plan {
         sticky: d.int(0, 4),
         most_stuck: d.int(0, ceiling / 4),
         seed: d.int(0, u64::MAX),
+        purge_lag: d.int(0, 4),
     }
 }
 
@@ -220,6 +234,19 @@ struct Sim<'p> {
     finished: Option<bool>,
     /// The plane asked a purge since the driver last did one.
     purge_due: bool,
+    /// The plane's purge asked of the purger and not yet landed.
+    purging: Option<Purging>,
+}
+
+/// A plane's purge on its way ([`Sim::ask_purge`]).
+#[derive(Debug, Clone, Copy)]
+struct Purging {
+    /// The tick clock it lands at.
+    lands: u64,
+    /// What the allocator kept as it was asked: what it gives back.
+    kept: u64,
+    /// A task freed bytes since it was asked.
+    freed: bool,
 }
 
 impl<'p> Sim<'p> {
@@ -244,6 +271,7 @@ impl<'p> Sim<'p> {
             stamps: 0,
             finished: None,
             purge_due: false,
+            purging: None,
         };
         sim.step(PlaneInput::Open {
             at_ns: 0,
@@ -337,9 +365,37 @@ impl<'p> Sim<'p> {
         self.step(PlaneInput::Footprint { at_ns, bytes, kept: self.kept, purged })
     }
 
+    /// The gate's purge: done at once.
     fn purge(&mut self) -> Result<(), Broke> {
         self.kept = 0;
         self.purge_due = false;
+        self.read_after(true)
+    }
+
+    /// The plane's purge is asked of the purger: it lands [`Plan::purge_lag`] ticks on.
+    fn ask_purge(&mut self) -> Result<(), Broke> {
+        self.purge_due = false;
+        let lands = self.clock + self.plan.purge_lag * TICK_NS;
+        self.purging = Some(Purging { lands, kept: self.kept, freed: false });
+        if self.plant == Plant::EarlyPurged {
+            return self.read_after(true);
+        }
+        Ok(())
+    }
+
+    /// A plane's purge whose time came lands: what the allocator kept at its ask is given back
+    /// and the plane reads it purged; or, a task having freed bytes since, it is asked again.
+    fn land_purge(&mut self) -> Result<(), Broke> {
+        let Some(purging) = self.purging else { return Ok(()) };
+        if self.clock < purging.lands {
+            return Ok(());
+        }
+        self.kept -= purging.kept.min(self.kept);
+        if purging.freed && self.plant != Plant::LandsDespiteFrees {
+            self.purging = None;
+            return self.ask_purge();
+        }
+        self.purging = None;
         self.read_after(true)
     }
 
@@ -350,6 +406,9 @@ impl<'p> Sim<'p> {
         self.kept += bytes - stuck;
         for job in self.jobs.iter_mut() {
             job.tried = false;
+        }
+        if let Some(purging) = &mut self.purging {
+            purging.freed = true;
         }
     }
 
@@ -371,12 +430,17 @@ impl<'p> Sim<'p> {
         })
     }
 
-    /// One tick: the clock moves, a purge the plane asked is done, and one running task acts.
+    /// One tick: the clock moves, a purge the plane asked is asked of the purger and one whose
+    /// lag passed lands, and one running task acts.
     fn tick(&mut self, tick: u64, rng: &mut SplitMix64) -> Result<(), Broke> {
         self.clock += TICK_NS;
-        if self.purge_due && self.plant != Plant::NoPurge {
-            self.purge()?;
+        // As the daemon's plane does: an ask while one is on its way is dropped, since the
+        // plane asks no other until a reading after a purge.
+        let due = std::mem::take(&mut self.purge_due);
+        if due && self.plant != Plant::NoPurge && self.purging.is_none() {
+            self.ask_purge()?;
         }
+        self.land_purge()?;
         if self.jobs.is_empty() || tick % self.plan.read_every == 0 {
             self.read()?;
         }
@@ -574,6 +638,16 @@ fn the_oracle_catches_admission_by_grants_only() {
 #[test]
 fn the_oracle_catches_a_gate_that_never_purges() {
     control(Plant::NoPurge);
+}
+
+#[test]
+fn the_oracle_catches_a_purge_read_before_it_lands() {
+    control(Plant::EarlyPurged);
+}
+
+#[test]
+fn the_oracle_catches_a_purge_read_purged_though_a_task_freed_in_its_lag() {
+    control(Plant::LandsDespiteFrees);
 }
 
 /// One seeded plan, [`REPLAY`]'s: set it to a seed a failure names to run that case alone.

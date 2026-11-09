@@ -249,6 +249,22 @@ struct Realizing {
     told: u64,
 }
 
+/// A purge admission asked of the purger's thread ([`crate::raw::memory::Purger`]), not yet
+/// heard done.
+#[derive(Clone, Copy, Debug)]
+struct Purging {
+    /// Its ticket: done once [`crate::raw::memory::Purger::done`] reaches it.
+    ticket: u64,
+    /// A task ended or gave way since it was asked, so freed bytes its reading would hold.
+    freed: bool,
+}
+
+impl Purging {
+    fn asked() -> Purging {
+        Purging { ticket: crate::raw::memory::purger().ask(), freed: false }
+    }
+}
+
 /// How much a running task's realized bytes grow before the plane is told again: 1/16 of its
 /// grant, and at least 64 MiB. Each telling is a step of the plane; past its grant it is told
 /// at once ([`Plane::realized`]).
@@ -736,6 +752,8 @@ pub struct Plane<W: Work, P: Predict> {
     realizing: HashMap<NodeId, Realizing, Global>, // alloc: the plane's, an entry a running task
     /// The plane asked a purge since the loop last did one ([`Graph::purge_due`]).
     purge_due: bool,
+    /// The purge asked of the purger's thread and not yet done ([`Purging`]).
+    purging: Option<Purging>,
     /// Each request's live model, fed every record the plane says of it ([`Folds`]).
     folds: Folds,
 }
@@ -899,6 +917,7 @@ impl<W: Work, P: Predict> Plane<W, P> {
             began,
             realizing: HashMap::new_in(Global), // alloc: the plane's, once
             purge_due: false,
+            purging: None,
             folds: Folds::new(),
         })
     }
@@ -1459,6 +1478,9 @@ impl<W: Work, P: Predict> Plane<W, P> {
         self.runner.take(&mut ran);
         for Ran { task, ended, peak, ran_ns, puts } in ran.drain(..) {
             let id = task.id;
+            if let Some(purging) = &mut self.purging {
+                purging.freed = true;
+            }
             self.realizing.remove(&id);
             if !puts.is_empty() {
                 self.happened.push(Happened::Kept { id, puts });
@@ -1507,11 +1529,31 @@ impl<W: Work, P: Predict> Plane<W, P> {
         }
         self.ran = ran;
         self.measure(at, false);
-        if std::mem::take(&mut self.purge_due) {
-            // Admission held work back while the allocators may keep freed memory: it goes
-            // back before any task waits for it, and the plane hears the footprint after.
-            crate::raw::memory::purge();
-            self.measure(at, true);
+        if std::mem::take(&mut self.purge_due) && self.purging.is_none() {
+            // Admission held work back while the allocators may keep freed memory: the purger's
+            // thread gives it back (it waits for every worker's heaps, which the loop must not),
+            // and the plane hears a reading marked purged only once that purge ended. Until
+            // then its readings say nothing of what a purge gives back, so it neither asks again
+            // nor lets a task start alone (`blaze_graph::footprint::Charge::read`).
+            self.purging = Some(Purging::asked());
+        }
+        if let Some(purging) = self.purging {
+            // A purger that stopped serves no purge again, and admission waits on one: the
+            // daemon stops naming why, as it does when the plane refuses what it is told.
+            let done = crate::raw::memory::purger().done().unwrap_or_else(|why| {
+                panic!("admission waits on a memory purge that cannot finish: {why}")
+            });
+            if done >= purging.ticket {
+                if purging.freed {
+                    // A task ended or gave way after the ask: what it freed, a worker that
+                    // already gave back keeps, so a reading now would call kept bytes gone.
+                    // Asked again; bounded, since each round needs another task to end.
+                    self.purging = Some(Purging::asked());
+                } else {
+                    self.purging = None;
+                    self.measure(at, true);
+                }
+            }
         }
         // The pressure cap, given as it changes: on an event, and once it passes.
         let cap = self.pressure.cap(ns(at));
@@ -1554,12 +1596,10 @@ impl<W: Work, P: Predict> Plane<W, P> {
         self.realizing = realizing;
         let snapshot = blaze_mem::tag::snapshot();
         let footprint = arena::own_of(&snapshot);
-        // What the footprint holds past the live heap and what blaze-mem keeps committed and
-        // resident: the free pages the allocators keep. An estimate (it holds the code and the
-        // stacks too, never purged), so a purge is asked at most every
+        // The free pages the allocators keep ([`arena::kept_of`]). An estimate (it holds the
+        // code and the stacks too, never purged), so a purge is asked at most every
         // `blaze_graph::footprint::PURGE_EVERY_NS` while work is held back.
-        let kept =
-            footprint.saturating_sub(arena::held().saturating_add(snapshot.resident_committed()));
+        let kept = arena::kept_of(&snapshot, footprint);
         let input = PlaneInput::Footprint { at_ns, bytes: footprint, kept, purged };
         self.step(input).unwrap_or_else(|error| panic!("the plane refused the footprint: {error}"));
     }

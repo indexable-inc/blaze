@@ -373,13 +373,17 @@ impl Memory {
         let mut footprint = footprint;
         if look == CeilingLook::Purge {
             // Past the ceiling: what the allocators keep freed goes back first, and only a
-            // footprint still past it after that ends the daemon.
-            crate::raw::memory::purge();
-            footprint = crate::raw::memory::own_footprint().unwrap_or(footprint);
+            // footprint still past it after that ends the daemon. The purge reads it once every
+            // worker gave back its heaps' free pages (or its wait passed), on this thread, the
+            // guard's, never the loop's: a reading at once still held what they kept.
+            let purged = crate::raw::memory::purge();
+            footprint = purged.after.unwrap_or(footprint);
             look = self.watch.look(footprint, ceiling);
             tracing::warn!(
                 target: "blaze",
-                "blaze serve: pid {pid} passed its memory ceiling of {ceiling} bytes and purged what its allocators kept freed: {footprint} bytes after"
+                "blaze serve: pid {pid} passed its memory ceiling of {ceiling} bytes and purged what its allocators kept freed: {footprint} bytes after, {} returned, workers' give-back {:?}",
+                purged.returned(),
+                purged.settle,
             );
         }
         let (at, of) = (Gib(footprint), Gib(ceiling));

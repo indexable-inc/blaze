@@ -106,6 +106,27 @@ const STALL_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
 #[cfg(not(blaze_check))]
 pub const STOP_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// The pools whose workers run threads of their own, while they live: what a heap give-back
+/// wakes ([`wake_for_give_back`]). Pushed as such a pool starts, pruned of dropped ones then.
+#[cfg(not(blaze_check))]
+static LIVE: Lock<Vec<std::sync::Weak<Shared>>> = Lock::new("graph.pool.live", Vec::new());
+
+/// Wakes every idle worker of every live pool, so it gives back the free pages its heaps keep
+/// as it goes idle again ([`blaze_mem::tag::settle_heap`] in [`Local::park`]) rather than at its
+/// next job: what [`blaze_mem::tag::ask_heap_give_back`] calls, and a purge then waits for
+/// every worker's give-back (docs/memory-footprint.md, step 2). A worker woken with no job
+/// parks again; nothing is signalled.
+#[cfg(not(blaze_check))]
+fn wake_for_give_back() {
+    // Taken out of the lock before any wake: a wake is a system call (rule
+    // standard-structures: a lock is held for a field update alone).
+    // alloc: a few pools, once a purge
+    let live: Vec<Arc<Shared>> = LIVE.lock().iter().filter_map(std::sync::Weak::upgrade).collect();
+    for shared in live {
+        shared.unpark_workers();
+    }
+}
+
 /// What the queues hold: a pointer to a job's [`Header`], which says how to run it. One pointer
 /// (8 bytes on 64-bit targets), so a line of a deque's buffer holds eight jobs there.
 pub(crate) struct Job(NonNull<Header>);
@@ -983,6 +1004,14 @@ impl Pool {
             #[cfg(blaze_check)]
             unreachable!("the model checker's targets have threads");
         }
+        #[cfg(not(blaze_check))]
+        {
+            let mut live = LIVE.lock();
+            live.retain(|it| it.strong_count() > 0);
+            live.push(Arc::downgrade(&shared)); // alloc: a pool's entry, once a pool
+            drop(live);
+            blaze_mem::tag::heap_wakes_by(wake_for_give_back);
+        }
         let (ready_tx, ready_rx) = crossbeam_channel::unbounded::<io::Result<()>>();
         let mut threads = Vec::with_capacity(deques.len());
         let mut failed = None;
@@ -1002,6 +1031,9 @@ impl Pool {
                     // clone: a reference count, once per worker thread
                     let after = Arc::clone(&shared);
                     if ok {
+                        // A worker counts for every heap give-back while its loop runs: a purge
+                        // waits for its give-back before it reads the footprint.
+                        let _settles = blaze_mem::tag::count_heap_settles();
                         let group = shared.slots[index].group as usize;
                         work(
                             &Local {

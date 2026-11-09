@@ -767,10 +767,19 @@ pub enum Plot {
     /// A counter no other plot names, its name in its row ([`plot_named`],
     /// [`CounterRow::named`]): its `counters.name` is that name.
     Named,
+    /// Bytes the process's footprint holds past the live heap and blaze-mem's resident
+    /// committed memory: what the allocators keep freed and resident, the bytes a purge can
+    /// give back. mimalloc's own committed count is no measure of it, since a purge never
+    /// lowers that count (`mi_os_decommit_ex` on a release build). Sampled by the daemon with
+    /// [`Plot::Footprint`].
+    AllocatorKeptBytes,
+    /// Bytes purges gave back so far, each one's footprint before less its footprint after
+    /// once every worker gave back its heaps (`blaze_cargo::raw::memory::purged_bytes`).
+    AllocatorPurgedBytes,
 }
 
 impl Plot {
-    pub const ALL: [Plot; 30] = [
+    pub const ALL: [Plot; 32] = [
         Plot::MemoHits,
         Plot::MemoMisses,
         Plot::Joined,
@@ -801,6 +810,8 @@ impl Plot {
         Plot::ProfileNamesLinked,
         Plot::ProfileNamesLost,
         Plot::Named,
+        Plot::AllocatorKeptBytes,
+        Plot::AllocatorPurgedBytes,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -835,6 +846,8 @@ impl Plot {
             Plot::ProfileNamesLinked => "profile names linked",
             Plot::ProfileNamesLost => "profile names lost",
             Plot::Named => "named",
+            Plot::AllocatorKeptBytes => "allocator kept bytes",
+            Plot::AllocatorPurgedBytes => "allocator purged bytes",
         }
     }
 

@@ -728,6 +728,15 @@ pub fn own_of(snapshot: &blaze_mem::tag::Snapshot) -> u64 {
     blaze_mem::tag::resident().unwrap_or_else(|| snapshot.footprint(held()))
 }
 
+/// What `footprint` holds past the live heap and what blaze-mem keeps committed and resident in
+/// `snapshot`: the free pages the allocators keep, the bytes a purge can give back
+/// (`blaze_cargo::raw::memory::purge`). An estimate, an upper bound: it holds the code, the
+/// stacks and the system zones too. mimalloc's own committed count is no measure of it, since a
+/// purge never lowers that count (`mi_os_decommit_ex`, os.c, on a release build).
+pub fn kept_of(snapshot: &blaze_mem::tag::Snapshot, footprint: u64) -> u64 {
+    footprint.saturating_sub(held().saturating_add(snapshot.resident_committed()))
+}
+
 /// The share of each of the machine's own memory limits (`hw.memsize`, `MemTotal`, a cgroup's
 /// `memory.max`) that blaze may hold, as (numerator, denominator): 3/4 (docs/memory-budget.md
 /// section 7, "The machine budget"). The quarter left is the kernel's, the compressor's and the
