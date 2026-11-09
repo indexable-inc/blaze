@@ -422,12 +422,21 @@ impl App {
         self.browser.url = None;
     }
 
-    /// Whether the pane shows: open, and with a page to show (its view, not closed) or a reason the harness browser gave
-    /// for having none. It never stands open on nothing: asked for with no page yet, it opens once the page is made.
+    /// Whether the pane shows: open, with its page's picture in (or a reason the harness browser gave for there being
+    /// none: a refused link or open, a view it closed or whose frames it could not take). It never stands open on nothing:
+    /// asked for before the page is made and has drawn, it opens on the page's first frame.
     pub(super) fn web_shown(&self) -> bool {
         let s = self.web();
         let b = &self.browser;
-        s.open && ((s.view != 0 && !b.closed.contains_key(&s.view)) || matches!(b.conn, Conn::Failed(_)) || b.note.is_some())
+        if !s.open {
+            return false;
+        }
+        if matches!(b.conn, Conn::Failed(_)) || b.note.is_some() {
+            return true;
+        }
+        s.view != 0
+            && !b.closed.contains_key(&s.view)
+            && (b.errors.contains_key(&s.view) || b.media.as_ref().is_some_and(|m| m.borrow().browser_showing(s.view)))
     }
 
     /// Open `url` in the pane, as a view of its own (the pane shows it once the host made it; what the pane showed stays
