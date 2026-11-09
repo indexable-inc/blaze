@@ -422,7 +422,7 @@ impl App {
         // (seconds).
         world.set(model::ArchiveAfter {
             ms: (crate::look::width(w, "archive_after").max(0.0) * 1000.0) as u64,
-            past_ms: (crate::look::width(w, "archive_past_after").max(0.0) as f64 * 1000.0) as u64,
+            done_ms: (crate::look::width(w, "archive_done_after").max(0.0) as f64 * 1000.0) as u64,
         });
         // How long a finished child keeps its row (and its done mark) under a folded node (seconds).
         world.set(model::Linger { ms: (crate::look::width(w, "tree_linger_for").max(0.0) * 1000.0) as u64 });
