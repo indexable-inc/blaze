@@ -487,6 +487,8 @@ pub(super) fn fill_line(row: View<'_>, l: &Line) {
             block.face = kind.into();
             e.set(block);
         }
+        // The step it is on, to the ear (src/audio.rs: a new one plays its cue).
+        crate::audio::step(kind);
     }
     let tally: &[(&'static str, usize)] = if l.live.is_some() { &[] } else { &l.tally };
     if let Some(items) = h.part("items") {

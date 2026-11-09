@@ -513,8 +513,13 @@ pub struct Evaluator<'db, M: Machine<'db> = Plain> {
     /// constant's or static's initializer ([`Self::limits_frames`]), which the lint is of; it
     /// fires at [`LINT_TERMINATOR_LIMIT`]. A step is a run of a block rustc counts
     /// ([`ctfe_limit`](super::ctfe_limit)): a call or a loop's back edge, not every block
-    /// [`Self::steps_left`] counts.
+    /// [`Self::steps_left`] counts. The count is of one constant: a `const { .. }` block run
+    /// by this evaluation ([`Self::inline_const_in_heap`]) has its own, from zero, as rustc
+    /// evaluates the block by an evaluation of its own.
     lint_steps: u64,
+    /// The steps the `const { .. }` blocks this evaluation ran spent of their own counts, which
+    /// [`Self::lint_steps`] leaves out: what a profile adds to say what the evaluation cost.
+    lint_steps_inner: u64,
     /// [`ctfe_limit::counted_blocks`](super::ctfe_limit::counted_blocks) of each body run in
     /// an evaluation the lint is of, by the body's address.
     counted_blocks: HashMap<usize, Arc<[u64]>, std::alloc::Global>,
@@ -796,8 +801,9 @@ pub fn interpret_mir<'db>(
 ) -> Result<'db, (Result<'db, Allocation<'db>>, MirOutput)> {
     // What an evaluation spent, over its runs: `blocks` of the budget (every block run) and
     // `steps` of `long_running_const_eval` (the calls and loop turns rustc counts, 2,000,000 at
-    // most without an `#[allow]`), so a profile says which constant took the time and in which
-    // unit it would hit a limit.
+    // most without an `#[allow]` in the constant and in each `const { .. }` block it runs, whose
+    // steps are added here), so a profile says which constant took the time and in which unit
+    // it would hit a limit.
     let span = tracing::info_span!(
         target: "blaze",
         "const eval",
@@ -818,7 +824,7 @@ pub fn interpret_mir<'db>(
         evaluator.read_statics = Some(mem::take(&mut read_statics));
         let it = evaluator.evaluate(body, ty);
         blocks += evaluator.budget.steps - evaluator.steps_left;
-        steps += evaluator.lint_steps;
+        steps += evaluator.lint_steps + evaluator.lint_steps_inner;
         runs += 1;
         read_statics = evaluator.read_statics.take().unwrap_or_default();
         if let Some(read) = evaluator.missing_static.take()
@@ -1056,6 +1062,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             steps_left: budget.steps,
             memory_peak: 0,
             lint_steps: 0,
+            lint_steps_inner: 0,
             counted_blocks: HashMap::new_in(std::alloc::Global),
             inherited_overflow_checks: None,
             layout_cache: RefCell::new(Default::default()),
@@ -3852,7 +3859,14 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             MirEvalError::ConstEvalError(name, Box::new(ConstEvalError::MirLowerError(e)))
         })?;
         let mark = self.stack.len();
-        let result = self.interpret_mir(body, iter::empty(), None)?;
+        // The block is a constant of its own to `long_running_const_eval`: rustc evaluates an
+        // inline const by an evaluation of its own, whose count of steps starts at zero, and
+        // what it spends is not spent of the constant that uses it. The budget
+        // ([`Self::steps_left`]) is this whole evaluation's and goes on.
+        let outer = mem::replace(&mut self.lint_steps, 0);
+        let result = self.interpret_mir(body, iter::empty(), None);
+        self.lint_steps_inner += mem::replace(&mut self.lint_steps, outer);
+        let result = result?;
         let ty = body.locals[return_slot()].ty.as_ref();
         let align = self.size_align_of_sized(ty, locals, "the value of a constant")?.1;
         let addr = self.heap_allocate(result.size, align)?;

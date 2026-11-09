@@ -642,8 +642,8 @@ export const chat_aside_pad_b = 10
 export const chat_aside_head_gap = 2
 export const chat_aside_close = 20
 export const chat_aside_icon = 10
-// The status bar (foot.status), chat_status_t under the composer's card, its sides chat_composer_pad in (the card's inner
-// edges), no plate; its controls chat_bar_h tall, chat_bar_gap apart: on the left den's model and effort picker
+// The focused chat's status bar, at the sidebar's foot (frame.flecs hn.SideChat; nothing sits under the composer), no
+// plate; its controls chat_bar_h tall, chat_bar_gap apart: on the left den's model and effort picker
 // as one quiet control (hn.ChatPick, src/app/chat/pick.rs: the model's name, its effort as a level meter and a small
 // chevron, chat_pick_h tall, chat_pick_pad_x in, its chevron chat_pick_chevron across chat_pick_gap after the rest, a
 // wash under the pointer); the meter (hn.ChatEffort) chat_effort_lead after the name, chat_effort_h tall, a bar per
@@ -716,8 +716,8 @@ export const chat_pick_swipe_step = 22
 export const chat_pick_commit_secs = 0.35
 export const chat_pick_word_secs = 1.2
 // What the chat pane shows around the composer's words besides the transcript (the foot's insets, the card's insets,
-// the status bar): the words grow to textarea_grow_share of the pane less it.
-export const chat_input_keep = $chat_foot_pad_t + $chat_foot_pad_b + $chat_composer_pad_t + $chat_composer_pad_b + $chat_status_t + $chat_bar_h
+// nothing else): the words grow to textarea_grow_share of the pane less it.
+export const chat_input_keep = $chat_foot_pad_t + $chat_foot_pad_b + $chat_composer_pad_t + $chat_composer_pad_b
 // The meter's popover while the pointer is on it (scene/widgets/context.flecs hn.ChatContextPop, src/app/chat/context.rs):
 // a menu plate (ui.Menu's place over what opened it, its lift and motion) chat_ctx_w wide, chat_ctx_pad in, its lines
 // chat_ctx_gap apart: a head, the window as a donut chat_ctx_pie across with how full it is in its middle (size_ctx_pct;

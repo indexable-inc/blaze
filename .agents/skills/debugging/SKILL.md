@@ -64,9 +64,12 @@ after from the same query.
 ## Running DuckDB
 
 blaze never links DuckDB and never looks for it on `PATH`. `BLAZE_DUCKDB` names the binary as
-an absolute path. `nix develop` sets it, and so does the installed `blaze` wrapper. Outside
-both, run `nix run .#duckdb` (DuckDB 1.5.5, pinned in `flake.nix`) or set
-`BLAZE_DUCKDB=$(nix build --no-link --print-out-paths .#duckdb)/bin/duckdb`.
+an absolute path; `nix develop` sets it. Unset, `blaze slow`, `blaze explain <view>` and
+`blaze debug sql` run the DuckDB blaze pins (1.5.5, by SHA-256 per host in
+`crates/blaze-cargo/src/serve/observe.rs`, the version `flake.nix` asserts too), which the
+first of them fetches through the daemon's store and lays out under the state directory
+(`<state>/duckdb/1.5.5-<sha256>/duckdb`, `crates/blaze-cargo/src/cli/duckdb.rs`). To run it by
+hand, set `BLAZE_DUCKDB` to that path.
 
 - `blaze debug sql "<query>"` runs one query over the history with every table and view of
   `crates/blaze-profile/sql/views.sql` defined. `--json` prints rows as JSON for a script or a

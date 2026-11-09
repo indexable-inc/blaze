@@ -6,7 +6,8 @@
 # docs/harness.md ("CI").
 #
 #   pull request, merge queue (about 5 minutes): the unit tests and the build on Linux AArch64,
-#       `blaze check --workspace` with the release on Linux AArch64,
+#       `blaze check --workspace` and `blaze check --workspace --all-targets` (every crate's
+#       test targets type-check) with the release on Linux AArch64,
 #       the lint baselines (crates/blaze-lints/baselines) with the blaze the tree builds, on
 #       Linux AArch64,
 #       `harness/imports.py` and `harness/rustcsites.py`, actionlint over the workflows. No `blaze fmt --check`: fmt.yaml
@@ -133,6 +134,11 @@ jobs:
       - run: |
           uv run --frozen python harness/v2/ledger.py selftest
           uv run --frozen python harness/v2/ledger.py '{"command": "check"}'
+      # Every stated invariant has a control beside it, and docs/v2/plan/invariants.md lists them
+      # (harness/v2/invariants.py).
+      - run: |
+          uv run --frozen python harness/v2/invariants.py selftest
+          uv run --frozen python harness/v2/invariants.py '{"command": "check"}'
       # Each hash domain in crates/ is written once outside tests (tools/v2/domains.py).
       - run: |
           uv run --frozen python tools/v2/domains.py '{"root": "."}'
@@ -309,6 +315,14 @@ jobs:
           job: check
           llvm: true
       - run: blaze check --workspace --message-format short
+      # Every target, the test targets among them: a test that no longer type-checks against
+      # the code it tests fails here, in every crate, where the unit tests job compiles the test
+      # targets of harness/unittests.py's CRATES alone (2026-11-09: blaze-cas's place_race.rs and
+      # hir-ty-mir's tests/consteval/comptime.rs did not compile on main). A step of its own,
+      # after the libraries', so the log says which of the two failed; what the first checked
+      # is not checked again.
+      - name: blaze check --workspace --all-targets (the test targets compile)
+        run: blaze check --workspace --all-targets --message-format short
       # astlog's rules (tools/astlog/rules) over the crates and tools, each file on its own: a
       # finding of an error rule fails the job (tools/astlog/README.md#rules-in-blaze).
       - run: blaze build -p astlog

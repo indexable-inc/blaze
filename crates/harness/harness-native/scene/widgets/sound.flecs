@@ -1,0 +1,109 @@
+// The app's sound (src/audio.rs, src/music.rs). Data only.
+// - cue: a soft sound as an agent's step changes, each a few Sounds (harness-native-blaze's voices: Bell, Mallet, Bass,
+//   Click, Thud, Whoosh) with its Onset, Pitch, Lasts, Gain and Pan; a cue's own Gain is how loud it plays. The names
+//   are the step items a running line shows (harness-native-render block.rs: exec read edit search net build spawn wait
+//   sql think), `ready` (the app is up) and `done` (the turn ended).
+// - mood: the music, below.
+// `hn.sound`'s Gain is the master. native.json `sound: false` turns it all off, `music: false` the music.
+
+@tree ChildOf
+hn {
+  sound {
+    Gain: {amp: 1}
+    // A3.
+    key { Pitch: {hz: 220} }
+
+    cue {
+      // A command: two dry ticks, a prompt and its cursor.
+      exec {
+        Gain: {amp: 0.31}
+        a { Sound: {voice: Click}; Onset: {at: 0}; Pitch: {hz: 880}; Gain: {amp: 0.05}; Pan: {pos: -0.2, sweep: 0} }
+        b { Sound: {voice: Click}; Onset: {at: 0.07}; Pitch: {hz: 1320}; Gain: {amp: 0.05}; Pan: {pos: 0.2, sweep: 0} }
+      }
+      // A file read: a page, two soft bars.
+      read {
+        Gain: {amp: 0.27}
+        a { Sound: {voice: Mallet}; Onset: {at: 0}; Lasts: {dur: 0.8}; Pitch: {hz: 440}; Gain: {amp: 0.05} }
+        b { Sound: {voice: Mallet}; Onset: {at: 0.09}; Lasts: {dur: 0.9}; Pitch: {hz: 554.37}; Gain: {amp: 0.04} }
+      }
+      // An edit: a pencil's three taps.
+      edit {
+        Gain: {amp: 0.27}
+        a { Sound: {voice: Click}; Onset: {at: 0}; Pitch: {hz: 1100}; Gain: {amp: 0.04}; Pan: {pos: -0.3, sweep: 0} }
+        b { Sound: {voice: Click}; Onset: {at: 0.06}; Pitch: {hz: 1100}; Gain: {amp: 0.04} }
+        c { Sound: {voice: Click}; Onset: {at: 0.12}; Pitch: {hz: 1320}; Gain: {amp: 0.05}; Pan: {pos: 0.3, sweep: 0} }
+      }
+      // A search: something passing over, then a find.
+      search {
+        Gain: {amp: 0.25}
+        a { Sound: {voice: Whoosh}; Onset: {at: 0}; Lasts: {dur: 0.35}; Pitch: {hz: 1800}; Gain: {amp: 0.04}; Pan: {pos: -0.5, sweep: 1} }
+        b { Sound: {voice: Click}; Onset: {at: 0.3}; Pitch: {hz: 1760}; Gain: {amp: 0.04}; Pan: {pos: 0.4, sweep: 0} }
+      }
+      // A page fetched: two far bells, a fifth apart.
+      net {
+        Gain: {amp: 0.23}
+        a { Sound: {voice: Bell}; Onset: {at: 0}; Lasts: {dur: 1.6}; Pitch: {hz: 659.25}; Gain: {amp: 0.03}; Pan: {pos: -0.4, sweep: 0} }
+        b { Sound: {voice: Bell}; Onset: {at: 0.12}; Lasts: {dur: 1.8}; Pitch: {hz: 880}; Gain: {amp: 0.025}; Pan: {pos: 0.4, sweep: 0} }
+      }
+      // A build: a low wooden bar, struck once.
+      build {
+        Gain: {amp: 0.35}
+        a { Sound: {voice: Mallet}; Onset: {at: 0}; Lasts: {dur: 1}; Pitch: {hz: 110}; Gain: {amp: 0.06} }
+        b { Sound: {voice: Click}; Onset: {at: 0.01}; Pitch: {hz: 660}; Gain: {amp: 0.05} }
+      }
+      // An agent started: lift-off, then a high bar.
+      spawn {
+        Gain: {amp: 0.27}
+        a { Sound: {voice: Whoosh}; Onset: {at: 0}; Lasts: {dur: 0.6}; Pitch: {hz: 3000}; Gain: {amp: 0.04}; Pan: {pos: -0.6, sweep: 1.2} }
+        b { Sound: {voice: Mallet}; Onset: {at: 0.45}; Lasts: {dur: 1}; Pitch: {hz: 880}; Gain: {amp: 0.05}; Pan: {pos: 0.5, sweep: 0} }
+      }
+      // Waiting: one low bar.
+      wait {
+        Gain: {amp: 0.19}
+        a { Sound: {voice: Mallet}; Onset: {at: 0}; Lasts: {dur: 1.2}; Pitch: {hz: 329.63}; Gain: {amp: 0.04} }
+      }
+      // A query: three rows, rising.
+      sql {
+        Gain: {amp: 0.25}
+        a { Sound: {voice: Mallet}; Onset: {at: 0}; Lasts: {dur: 0.6}; Pitch: {hz: 277.18}; Gain: {amp: 0.04} }
+        b { Sound: {voice: Mallet}; Onset: {at: 0.06}; Lasts: {dur: 0.6}; Pitch: {hz: 329.63}; Gain: {amp: 0.04} }
+        c { Sound: {voice: Mallet}; Onset: {at: 0.12}; Lasts: {dur: 0.8}; Pitch: {hz: 440}; Gain: {amp: 0.04} }
+      }
+      // Thinking: one far bell.
+      think {
+        Gain: {amp: 0.15}
+        a { Sound: {voice: Bell}; Onset: {at: 0}; Lasts: {dur: 2}; Pitch: {hz: 554.37}; Gain: {amp: 0.03} }
+      }
+      // The app is up and its sound is ready: one far bell.
+      ready {
+        Gain: {amp: 0.25}
+        a { Sound: {voice: Bell}; Onset: {at: 0}; Lasts: {dur: 3}; Pitch: {hz: 440}; Gain: {amp: 0.03} }
+      }
+      // The turn ended: the chord, climbing home.
+      done {
+        Gain: {amp: 0.39}
+        a { Sound: {voice: Mallet}; Onset: {at: 0}; Lasts: {dur: 1}; Pitch: {hz: 440}; Gain: {amp: 0.05}; Pan: {pos: -0.3, sweep: 0} }
+        b { Sound: {voice: Mallet}; Onset: {at: 0.1}; Lasts: {dur: 1}; Pitch: {hz: 554.37}; Gain: {amp: 0.05} }
+        c { Sound: {voice: Mallet}; Onset: {at: 0.2}; Lasts: {dur: 1.2}; Pitch: {hz: 659.25}; Gain: {amp: 0.05}; Pan: {pos: 0.3, sweep: 0} }
+        d { Sound: {voice: Bell}; Onset: {at: 0.32}; Lasts: {dur: 2.2}; Pitch: {hz: 880}; Gain: {amp: 0.035} }
+      }
+    }
+
+    // The music (src/music.rs): a band that plays itself, in the mood that fits what is going on (src/audio.rs `scene`
+    // climbs these, calmest first, as the step in front gets busier and more agents work at once). A mood is a tempo,
+    // a scale by day and one by night, a chord a bar (steps of the scale) and how loud each layer plays; the band glides
+    // from one to the next over a bar or two and changes scale on the bar line. Its Gain is the music's level under the
+    // master.
+    mood {
+      Gain: {amp: 0.55}
+      // Thinking, reading, waiting: a pad, a slow plucked line, far bells. Tea.
+      calm { Mood: {tempo: 60, scale: "0 2 4 7 9", night: "0 2 3 7 8", chords: "0 2 3 0", pad: 0.55, bass: 0, arp: 0, lead: 0.32, bell: 0.3, drums: 0} }
+      // Editing, searching, fetching: a bass comes in under it and the chord starts to move.
+      flow { Mood: {tempo: 80, scale: "0 2 4 7 9", night: "0 2 3 7 8", chords: "0 3 2 4", pad: 0.45, bass: 0.4, arp: 0.42, lead: 0.4, bell: 0.15, drums: 0} }
+      // A command, a build, a new agent: quicker, the drums in.
+      drive { Mood: {tempo: 104, scale: "0 2 4 7 9", night: "0 2 3 7 8", chords: "0 0 3 4", pad: 0.35, bass: 0.6, arp: 0.7, lead: 0.45, bell: 0.08, drums: 0.5} }
+      // Many agents at once: the minor scale, fast, everything up.
+      battle { Mood: {tempo: 132, scale: "0 3 5 7 10", night: "0 3 5 7 10", chords: "0 0 2 3", pad: 0.3, bass: 0.8, arp: 0.9, lead: 0.6, bell: 0, drums: 0.9} }
+    }
+  }
+}

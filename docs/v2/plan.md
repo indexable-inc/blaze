@@ -12,6 +12,7 @@ and CI job shares. This page is the whole plan. Three more things hold the rest:
 - **[plan/objectives.md](plan/objectives.md)**: every objective, the check that decides it, and
   where it stands. Work is picked from there and nowhere else.
 - **[plan/bounds.md](plan/bounds.md)**: the speed-of-light bounds a program measures.
+- **[plan/invariants.md](plan/invariants.md)**: every invariant the code states, with its check.
 - **`plan/design/`**: one spec per design that is not fully built and needs more than a paragraph
   here. A spec is deleted, or becomes a `current` doc, when its design is built.
 
@@ -91,8 +92,11 @@ Spec: [data](plan/design/data.md).
 
 ### 5. One store
 
-`blaze-cas` keeps every result under its key: mapped and plain when hot, packed when warm,
-compressed when cold. Reads never lock. A commit is one atomic flip. The remote cache is the same
+`blaze-cas` keeps every result under its key: plain when hot, packed when warm, compressed when
+cold. It reads through its own buffer pool, not `mmap`: a reserved address range, explicit
+reads on the IO driver in parallel, and eviction by advice, so a page fault never stalls a worker
+and the pool's memory is counted in the one budget ([store-pool](plan/design/store-pool.md)).
+Reads never lock. A commit is one atomic flip. The remote cache is the same
 store off the critical path with the same keys, so a cold build is mostly a download, and a
 second checkout's outputs are clones. Trust is by verification: a sampled share of hits is
 recomputed and compared, and a model checker drives the real store through crashes.
@@ -118,6 +122,9 @@ Specs: [scheduler](plan/design/scheduler.md), [fibers](plan/design/fibers.md),
 ### 7. Code per function, and no link in the dev loop
 
 A codegen unit is one function instance, keyed by its code identity; equal instances are one.
+MIR is lowered once to LIR, blaze's own low-level IR (after layout, ABI and drops; before
+instruction selection; columns), and every producer of code reads it: the stencils, LLVM, and
+the wasm emitter. Cranelift IR is no longer an input of code generation.
 A dev build compiles a function when it is first called (lazy), by copy-and-patch from stencils,
 into the running process (no binary on disk, no link), and an edit patches the new code in place
 and rolls it back if checks fail. Stencil code is the first tier, not the last: a function the
@@ -176,6 +183,40 @@ Specs: [profiling](../profiling.md), [ix-prof-format](../ix-prof-format.md),
 | concurrent, durable or crash-recovering code is right | a deterministic simulation test with an invariant oracle and a planted bug |
 | lock-free code is right | the model checker ([model-checker](plan/design/model-checker.md)) |
 | unsafe code is sound | blaze's own UB checker on the MIR evaluator, and fuzzing ([unsafe](plan/design/unsafe.md)) |
+
+**One statement, a ladder of evidence.** What the code promises is written once, in blaze, and
+every kind of check reads that same text:
+
+- a **contract** (`requires`, `ensures`) says what one call does ([contracts](plan/design/contracts.md));
+- a **reference model** is a small, pure, sequential implementation of what a component means
+  ("a store is a map from key to bytes"), an ordinary type in the crate;
+- a **refinement** says the real component behaves as its model, or as another implementation
+  (an incremental build as a build from nothing, `Frames` as `Fibers`, the simulated driver as a
+  native one).
+
+A statement then climbs as far as it needs to, unchanged:
+
+| level | what checked it | says |
+|---|---|---|
+| tested | a property test generated from the contract or the refinement | no counterexample in N tries |
+| simulated | the same, under the deterministic simulation with faults, crashes and interleavings, and a planted bug | none under adversarial schedules |
+| model-checked | every interleaving to a bound | none up to the bound |
+| proved | Lean, from the same contract and model ([formal-verification](plan/design/formal-verification.md)) | none |
+
+The model is the object all four share: the simulation runs the real code against it, and it is
+the first thing translated to Lean, where properties of the model are proved; the compiled Lean
+model run against blaze-built code on drawn inputs is one more refinement. Proofs go to the
+sans-IO cores, which the capability rules make provably free of IO, clock and globals; the
+simulation covers the drivers around them and the binary as built. Durable, concurrent and
+crash-recovering code is at least simulated; what must never be wrong (a key's hash, a format's
+round trip) is proved. When two levels disagree, one of them has a bug, and that is a finding.
+
+In the code, a statement is a doc comment opening `/// The invariant:`, `/// The refinement:` or
+`/// The reference model:`. `harness/v2/invariants.py` collects them, with the level each has
+reached, into [invariants.md](plan/invariants.md), and fails the gate when one has no planted-bug
+control beside it or names a proof that is not there. So what blaze guarantees, and how strongly,
+is read in one place; dropping or weakening a guarantee is a visible line in a pull request; and
+generated code is judged against that list, not against itself.
 
 How each harness is run is in [harness.md](../harness.md).
 

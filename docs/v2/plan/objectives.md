@@ -13,7 +13,7 @@ remembered. How rows are picked, worked and landed is
 `harness/v2/ledger.py`. A check in *italics* is not written yet, and writing it is the first
 part of the work. `?` is not measured; "last known" is a lead, not a status.
 
-72 objectives: 0 met, 0 open, 0 blocked, 72 not measured.
+79 objectives: 0 met, 0 open, 0 blocked, 79 not measured.
 
 ## Targets
 
@@ -49,6 +49,11 @@ What must hold for any of the speed to count.
 | C5 | blaze runs rustc nowhere (docs/no-rustc.md lists what is left) | *write: one check per remaining step of docs/no-rustc.md* |  | ? |
 | C6 | blaze rejects what rustc rejects, with the same code and primary span, and accepts what it accepts | `corpus.py {"projects": ["rejections"]}`; *write: confirm corpus.py's rejections cover rustc's UI tests, or add them* |  | ? |
 | C7 | No `todo!`, `unimplemented!` or fallback path in crates/ | *write: a lint in `blaze check`* |  | ? |
+| V1 | Every invariant blaze states has a planted-bug control, and all are listed in invariants.md | `invariants.py {"command": "check"}` |  | ? |
+| V2 | Each subsystem with a simulation test has a reference model as an ordinary type in its crate, one generic harness (bstd::test's Refines) checks the real code refines it, and the model is what is translated to Lean | *write: a refinement stated for the store, the pool, the vfs and bstd's Fs, each with a planted difference* |  | ? |
+| V3 | bstd's public functions carry contracts (requires and ensures), each run as a generated property test | *write: contracts on bstd's API and the generator of reflect.md item 7* |  | ? |
+| V4 | The simulated driver refines each native driver on the effects both run | *write: one test per native driver that replays seeded effect sequences on both and compares completions* |  | ? |
+| V5 | A reference model translated to Lean has a property proved about it, and the compiled Lean model agrees with blaze-built code on drawn inputs | *write: the first proof in the tree, named by a `(proved: ..)` statement, checked in the train* |  | ? |
 
 ## The design, part by part
 
@@ -98,10 +103,12 @@ The parts of [the design](../plan.md#the-design) no check has shown yet.
 | E4 | View types: methods with disjoint field views do not conflict | *write: fixtures accepted and refused; ABI unchanged* |  | ? |
 | E5 | Records and named arguments with defaults | *write: fixtures for equality in any field order, defaults, and one layout across crates* |  | ? |
 | E6 | Contexts: the `with` clause passes bstd's capabilities and Cx by name | *write: bstd's tests rewritten with `with` and passing* |  | ? |
-| E7 | Effects are inferred inside a crate and required on pub functions; closures pass theirs through; no async in crates on fibers | *write: blaze::undeclared_effects at zero in blaze's crates* |  | ? |
+| E7 | Effects are inferred inside a crate and required on pub functions; closures pass theirs through; no async in crates on fibers | *write: the blaze::unmarked_* lints at zero in blaze's crates* |  | ? |
 | E8 | edition = "blaze-2026.11" turns every change on and every removed thing into an error; blaze fix --edition migrates | *write: one real crate migrated by the tool and passing its tests* |  | ? |
 | E9 | `&uniq T` is accepted as `&mut T` under `#![blaze::uniq]`, and blaze::mut_ref rewrites one to the other | *write: fixtures: both spellings are one type; the fix round-trips a crate; a crate without the gate is unchanged* |  | ? |
 | E10 | Pattern types cover enum variants under `#![blaze::pattern_types]`: `T is Variant(..)`, narrowing in match and if-let, free widening, same layout | *write: fixtures: a function taking one variant; narrowing after match; a refused whole-value write through a unique reference; layout equal to the enum's* |  | ? |
+| L1 | Code generation takes LIR, blaze's own low-level IR, not Cranelift IR: one builder from MIR, read by the stencils, LLVM and the wasm emitter | *write: blaze-lir's round-trip and verifier tests; then C1 with every producer reading LIR and no CLIF outside Wasmtime (branch lir-ir-1109)* |  | ? |
+| P1 | The store reads through its own buffer pool (reserved address range, explicit reads, eviction by advice); no store file is mapped | *write: the pool's simulation test with its planted bugs; then budgets warm-start and memory with mmap of store files banned (branch pool-core-1109)* |  | ? |
 
 ## The agent app
 
@@ -119,6 +126,5 @@ The app in `crates/harness/`, where people watch the work ([tasks](design/tasks.
 
 Decide with evidence, fold the answer into the plan, delete the question.
 
-- Two verifiers are specified (design/verus.md, an SMT fork; design/formal-verification.md, MIR to Lean 4). Keep both only if each proves something the other cannot; otherwise one.
 - The explorer carries its own HTTP/3 and WebTransport stack (design/http3-sans-io.md). Show what it does that HTTP/1.1 streaming on a local socket cannot, or remove it.
 - Several specs describe one concept and should be one each: scheduler, fibers and concurrency; memory, memory-budget and memory-pool; code-identity, item-hash, name-free-identity and caching; explore, explore-core and explore-generic; profile-history and perf-history.

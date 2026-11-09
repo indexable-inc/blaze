@@ -17,7 +17,10 @@ use crate::{
 /// The `ComptimeError` an evaluation stopped with, through the constants and frames it is in.
 fn comptime_of<'a, 'db>(mut error: &'a ConstEvalError<'db>) -> Option<&'a ComptimeError<'db>> {
     loop {
-        let ConstEvalError::MirEvalError(mut inner) = error else { return None };
+        // Bound by reference, then made `mut`: `mut inner` in the pattern, under a `&`, is refused
+        // by edition 2024 (and bound by value before it).
+        let ConstEvalError::MirEvalError(first) = error else { return None };
+        let mut inner = first;
         loop {
             match inner {
                 MirEvalError::InFunction(it, _) => inner = &**it,
