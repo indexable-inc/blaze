@@ -1874,10 +1874,6 @@ impl App {
         if self.paint.get_mut().arriving {
             self.poke_why("glyphs arriving");
         }
-        // A block turning to a new face (harness-native-render block.rs): draw until it has.
-        if self.paint.get_mut().turning {
-            self.poke_why("block turning");
-        }
         // A caret that jumped sweeps into its place (harness-native-render caret.rs): draw until it has.
         if self.paint.get_mut().gliding {
             self.poke_why("caret glide");
@@ -2007,6 +2003,7 @@ impl App {
         let paint = self.paint.borrow();
         crate::look::breathing(self.world.world_ref())
             || paint.shimmering
+            || paint.blocks_live
             || matches!(paint.kip_wake, harness_native_render::kips::Wake::Calm(_))
     }
 
