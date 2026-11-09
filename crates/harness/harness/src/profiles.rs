@@ -172,7 +172,8 @@ fn claude(ctx: &Ctx, note: &Note) -> anyhow::Result<Launch> {
         ("DISABLE_TELEMETRY", "1"),
         ("DISABLE_ERROR_REPORTING", "1"),
         ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
-        ("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "1"),  // no CLAUDE.md / AGENTS.md from any level
+        // CLAUDE.md / AGENTS.md are read: the project's AGENTS.md is how a repo tells its agents its rules. The user's own
+        // ~/.claude files come too; that is the user's choice, as in their own claude.
         ("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1"),
         ("CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS", "1"),
         // Show the real cursor at the input instead of hiding it (?25l) and painting an inverse block. Claude takes
@@ -224,7 +225,7 @@ fn codex(ctx: &Ctx, note: &Note) -> anyhow::Result<Launch> {
         "-c".into(), "mcp_servers.harness.default_tools_approval_mode=\"approve\"".into(), // ts runs without prompts
         "-c".into(), "web_search=\"disabled\"".into(),
         "-c".into(), "tools.experimental_request_user_input={enabled=false}".into(),
-        "-c".into(), "project_doc_max_bytes=0".into(), // no AGENTS.md from the repo (global one is out via CODEX_HOME)
+        // The project's AGENTS.md is read (Codex's default cap); the user's global one stays out via CODEX_HOME.
         "-c".into(), "skills.include_instructions=false".into(),
         "-c".into(), "skills.bundled={enabled=false}".into(),
         "-c".into(), format!("developer_instructions={}", toml_str(&note.text)),
