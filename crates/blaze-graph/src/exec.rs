@@ -1299,8 +1299,8 @@ unsafe fn run_pooled<R: Runner>(header: NonNull<Header>) {
 /// cancelling it unwinds from here with [`frame::Cancelled`].
 fn measured<R: Runner>(runner: &R, live: &Live<R::Work>) -> (Result<Did, Cancelled>, Measure) {
     let start = Instant::now();
-    let (did, peak) = admission::run_as(live.kind, || runner.run(&live.work));
-    (did, Measure { peak, ran_ns: ns(start) })
+    let (did, spent) = admission::run_as(live.kind, || runner.run(&live.work));
+    (did, Measure { peak: spent.peak, ran_ns: ns(start) })
 }
 
 /// Runs an IO task on this thread; posted again, behind what is queued for the IO threads,
