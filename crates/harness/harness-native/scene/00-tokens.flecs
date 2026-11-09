@@ -723,7 +723,7 @@ export const chat_view_code_hang = $chat_view_code + 2
 // words, in tone_code_ink on tone_wash, chat_code_radius round.
 export const chat_code_radius = 5
 // Inline components (harness-native-ui-prims/scene/inline.flecs): the chip under the pointer brightens a step
-// (tone_selection_focus over inline code's tone_wash) and underlines its label (tone_ink_faint), held down a step more
+// (tone_wash: a chip at rest has no plate) and underlines its label (tone_ink_faint), held down a step more
 // (tone_press). A GitHub pull request's or issue's state picks its icon's ink, as GitHub's Primer draws them (open green, draft and not planned grey,
 // merged and completed purple, closed red), and its head commit's checks the mark after it (success green, failure red,
 // pending amber).
