@@ -50,6 +50,7 @@ fn alone(text: &str) -> Vec<(String, PreludeError)> {
             target: Err("no target in tests".into()),
             toolchain: None,
             const_eval: Default::default(),
+            trusted: Box::default(),
         }),
     );
     let krate = graph.set_in_db(&mut db)[&krate];

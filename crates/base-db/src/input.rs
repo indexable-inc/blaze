@@ -1971,6 +1971,7 @@ mod tests {
             target: Err("".into()),
             toolchain: None,
             const_eval: Default::default(),
+            trusted: Box::default(),
         })
     }
 

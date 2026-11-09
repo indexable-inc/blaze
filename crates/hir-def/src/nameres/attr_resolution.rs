@@ -142,6 +142,9 @@ impl DefMap {
                         | "reflect"
                         // `#[blaze::sealed]`, from `AttrFlags::BLAZE_SEALED` (`hir-ty-coherence`).
                         | "sealed"
+                        // `#![blaze::capabilities]`, from `AttrFlags::CAPABILITIES`
+                        // (blaze-lints' `blaze::capabilities`, docs/v2/plan/design/std.md).
+                        | "capabilities"
                 )
             {
                 return true;

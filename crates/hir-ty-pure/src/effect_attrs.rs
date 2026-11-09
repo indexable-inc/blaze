@@ -1,5 +1,7 @@
 //! `#[blaze::nopanic]`, `#[blaze::noalloc]` and `#[blaze::nonblocking]`
-//! (docs/v2/plan/design/effects.md): their [`EffectDef`]s, and the rules and tables the walk
+//! (docs/v2/plan/design/effects.md), and the crate-wide effects of `#![blaze::capabilities]`
+//! ([`AMBIENT`], [`UNSAFE`], [`GLOBAL_ALLOC`], docs/v2/plan/design/std.md) with the trust a
+//! crate has for them ([`crate_trust`]): their [`EffectDef`]s, and the rules and tables the walk
 //! ([`crate::walk`]) asks for the kinds of a site: an `Assert` ([`assert_rule`]), a method of an
 //! allocator ([`allocator_rule`]), a foreign function ([`foreign_kinds`]), inline assembly
 //! ([`asm_kinds`]), an intrinsic ([`intrinsic_kinds`]) and a function of a library outside the
@@ -15,7 +17,7 @@
 //! `<Global as Allocator>::allocate`, `Alloc`, which it refuses. By type, never by data flow; the
 //! allocator's own body is not walked.
 
-use base_db::{Crate, CrateOrigin, Db, LangCrateOrigin};
+use base_db::{Crate, CrateOrigin, Db, LangCrateOrigin, TrustedCrate};
 use blaze_hash::HashMap;
 use hir_def::{
     AdtId, AttrDefId, FunctionId, HasModule, ItemContainerId, Lookup, ModuleDefId, ModuleId,
@@ -39,7 +41,7 @@ use intern::Symbol;
 use rustc_type_ir::inherent::IntoKind as _;
 use std::alloc::Global;
 
-use crate::effects::{EffectDef, EffectSet, Rule};
+use crate::effects::{EffectDef, EffectSet, Rule, effect_index};
 
 // The attribute effects.
 
@@ -53,6 +55,7 @@ pub const NOPANIC: EffectDef = EffectDef {
     says,
     fix: "a nopanic function and everything it calls cannot panic or abort: check the index or the arithmetic (`get`, `checked_*`, `wrapping_*`), or mark a callee proven by hand `#[blaze::nopanic(trusted = \"why\")]`",
     through_never: true,
+    crate_wide: false,
 };
 
 /// [`NOPANIC`] where the crate built drops optional overflow checks (release without
@@ -71,6 +74,7 @@ pub const NOALLOC: EffectDef = EffectDef {
     says,
     fix: "allocate from the task's frame (`Vec::new_in(frame)`, `Box::new_in(.., frame)` with `blaze_mem::frame::current`), or mark a callee proven by hand `#[blaze::noalloc(trusted = \"why\")]`",
     through_never: true,
+    crate_wide: false,
 };
 
 /// `#[blaze::nonblocking]`: no call that can block the thread (std's and `parking_lot`'s locks,
@@ -82,7 +86,139 @@ pub const NONBLOCKING: EffectDef = EffectDef {
     says,
     fix: "on a pool thread or fiber wait through the scheduler (a key, a counter, a `sched::Event`) and do IO on a driver thread, or mark a callee proven by hand `#[blaze::nonblocking(trusted = \"why\")]`",
     through_never: true,
+    crate_wide: false,
 };
+
+/// `ambient`, of `#![blaze::capabilities]`: no reach of the outside world but through what the
+/// code is handed. Std's file, environment, network, clock, random, process and thread entry
+/// points count at the call (the models' leaves and `MODELS` rows), and a system call anywhere
+/// beneath as a foreign call not known to be deterministic ([`foreign_kinds`],
+/// `effects::deterministic_foreign`), past the trusted crates ([`crate_trust`]).
+pub const AMBIENT: EffectDef = EffectDef {
+    name: "ambient",
+    refuses: EffectSet::of(&[
+        Rule::Io,
+        Rule::Env,
+        Rule::Clock,
+        Rule::Thread,
+        Rule::Random,
+        Rule::Foreign,
+        Rule::ForeignUnknown,
+        Rule::Unchecked,
+    ]),
+    attr: no_attr,
+    says: capability_says,
+    fix: "take what it reaches as an argument (bstd's `Io` or the capability cut from it), or list the crate that reaches it under `[workspace.metadata.blaze.trusted]` with an owner and a reason",
+    through_never: true,
+    crate_wide: true,
+};
+
+/// `unsafe`, of `#![blaze::capabilities]`: no `unsafe` block written in reached code (nor an
+/// `unsafe fn`'s body), past the trusted crates ([`crate_trust`]). A block lowering makes
+/// (`format_args!`'s) or a macro defined `#[allow_internal_unsafe]` expands to is not one, as
+/// rustc's `unsafe_code` lint says (the walk's `unsafe_code`).
+pub const UNSAFE: EffectDef = EffectDef {
+    name: "unsafe",
+    refuses: EffectSet::of(&[Rule::Unsafe, Rule::Unchecked]),
+    attr: no_attr,
+    says: capability_says,
+    fix: "move the `unsafe` code into a crate listed under `[workspace.metadata.blaze.trusted]` with an owner and a reason, or reach a safe interface that one gives",
+    through_never: true,
+    crate_wide: true,
+};
+
+/// `global_alloc`, of `#![blaze::capabilities]`: [`NOALLOC`]'s kinds, crate-wide: no call of the
+/// global allocator, past the trusted crates ([`crate_trust`]); an `Allocator` the code is handed
+/// (`Vec::new_in(frame)`) is [`Rule::AllocIn`], which it allows.
+pub const GLOBAL_ALLOC: EffectDef = EffectDef {
+    name: "global_alloc",
+    refuses: NOALLOC.refuses,
+    attr: no_attr,
+    says: capability_says,
+    fix: "allocate from an allocator it is handed (`Vec::new_in(arena)`, bstd's `Mem`), or list the crate that allocates under `[workspace.metadata.blaze.trusted]` with an owner and a reason",
+    through_never: true,
+    crate_wide: true,
+};
+
+/// No attribute trusts a function for a crate-wide effect: a crate's listing does.
+fn no_attr(_: &Db, _: AttrDefId) -> Option<PureAttr> {
+    None
+}
+
+/// What a kind is said as in the crate-wide effects' refusals.
+fn capability_says(rule: Rule) -> &'static str {
+    match rule {
+        Rule::Io => "does input or output through ambient authority",
+        Rule::Env => "reads the environment through ambient authority",
+        Rule::Clock => "reads the clock through ambient authority",
+        Rule::Thread => "uses threads through ambient authority",
+        Rule::Random => "uses the system's randomness through ambient authority",
+        Rule::Foreign => "makes a system call or another foreign call",
+        Rule::Unsafe => "runs `unsafe` code outside the trusted crates",
+        Rule::Alloc => "allocates from the global heap instead of an allocator it is handed",
+        other => says(other),
+    }
+}
+
+/// The crate-wide effects (bit `i` for `EFFECTS[i]`) a body of `krate` is trusted for: what it
+/// does itself, and what its calls reach in it or the crates it depends on, does not count for
+/// them (a closure or impl of another crate it calls still does; the walk's `Fold`).
+///
+/// - core and alloc: `ambient` and `unsafe`. They are the language's base, and what they do of
+///   the outside world is the allocator's shims and the panic runtime's. Not `global_alloc`:
+///   `Vec::new` reaches `Global`, which is what that effect is about.
+/// - the rest of the toolchain (std and the crates it is made of): `unsafe`, which is rustc's
+///   own, the same in every workspace. Not `ambient`: its IO is what that effect is about.
+/// - a crate its workspace lists under `[workspace.metadata.blaze.trusted]` ([`trusted_entry`]):
+///   all three. The toolchain's crates are never listed (blaze-lower refuses them), so a
+///   summary of their bodies, shared by every workspace, reads no workspace's list.
+pub(crate) fn crate_trust(db: &Db, krate: Crate) -> u32 {
+    let (ambient, unsafe_, global) = (bit(&AMBIENT), bit(&UNSAFE), bit(&GLOBAL_ALLOC));
+    match &krate.data(db).origin {
+        CrateOrigin::Lang(LangCrateOrigin::Core | LangCrateOrigin::Alloc) => ambient | unsafe_,
+        CrateOrigin::Lang(_) => unsafe_,
+        CrateOrigin::Local { .. } | CrateOrigin::Library { .. } | CrateOrigin::Rustc { .. } => {
+            match trusted_entry(db, krate) {
+                Some(_) => ambient | unsafe_ | global,
+                None => 0,
+            }
+        }
+    }
+}
+
+/// The bit of `effect` in a mask over [`crate::effects::EFFECTS`].
+fn bit(effect: &EffectDef) -> u32 {
+    effect_index(effect).map_or(0, |index| 1 << index)
+}
+
+/// Whether `krate`'s root says `#![blaze::capabilities]`: every function of it is checked for
+/// [`AMBIENT`], [`UNSAFE`] and [`GLOBAL_ALLOC`]. Read from the root's source, so a check's key
+/// has it as it has the source.
+pub fn capabilities_asked(db: &Db, krate: Crate) -> bool {
+    let root = hir_def::nameres::crate_def_map(db, krate).root_module_id();
+    hir_def::attrs::AttrFlags::query(db, AttrDefId::ModuleId(root))
+        .contains(hir_def::attrs::AttrFlags::CAPABILITIES)
+}
+
+/// The entries of `[workspace.metadata.blaze.trusted]` of the crates `krate` reaches (itself
+/// and every crate it depends on), sorted by name, each once: what `blaze explain trusted`
+/// says of a target, each with its owner and reason.
+pub fn trusted_reached(db: &Db, krate: Crate) -> Vec<&TrustedCrate> {
+    // alloc: an explanation's rows, once
+    let mut found: Vec<&TrustedCrate> =
+        krate.transitive_deps(db).iter().filter_map(|&it| trusted_entry(db, it)).collect();
+    found.sort_by(|a, b| a.name.cmp(&b.name));
+    found.dedup_by(|a, b| a.name == b.name);
+    found
+}
+
+/// The entry of `[workspace.metadata.blaze.trusted]` of `krate`'s workspace that names it, by
+/// its crate name.
+pub fn trusted_entry(db: &Db, krate: Crate) -> Option<&TrustedCrate> {
+    let display = krate.extra_data(db).display_name.as_ref()?;
+    let name = display.crate_name().symbol().as_str();
+    krate.workspace_data(db).trusted.iter().find(|it| &*it.name == name)
+}
 
 /// The `nopanic` a check uses for a crate built with `overflow_checks`
 /// (`hir_ty_mir::mir::overflow::crate_checks_overflow` of the crate that makes the instance):

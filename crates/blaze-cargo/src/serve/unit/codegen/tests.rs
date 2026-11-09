@@ -21,7 +21,7 @@ const HOST: &str = "x86_64-unknown-linux-gnu";
 fn a_crate_layout_override_is_refused_before_codegen_can_reuse_another_layouts_key() {
     let target = blaze_lower::target_data(HOST).unwrap();
     let mut workspace = base_db::CrateWorkspaceData {
-        target: Ok(target), toolchain: None, const_eval: Default::default(),
+        target: Ok(target), toolchain: None, const_eval: Default::default(), trusted: Box::default(),
     };
     assert_eq!(super::verify_target_data(HOST, &workspace), Ok(()));
     let original = workspace.target.clone(); // clone: restore the layout after each control

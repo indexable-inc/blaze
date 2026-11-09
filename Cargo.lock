@@ -4029,6 +4029,8 @@ dependencies = [
  "rustc_type_ir",
  "smallvec",
  "span",
+ "syntax",
+ "triomphe",
 ]
 
 [[package]]

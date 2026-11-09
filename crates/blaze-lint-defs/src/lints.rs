@@ -1062,6 +1062,8 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::pure", Deny, "detects a `#[blaze::pure]` function that may read or change the world outside its arguments (the environment, the clock, files, threads, state that changes, an address, randomness, foreign code), through any call")
         .externally_loaded(),
+    l("blaze::capabilities", Deny, "detects a function of a `#![blaze::capabilities]` crate that may reach ambient IO, run `unsafe` code or call the global allocator past the crates its workspace trusts, through any call")
+        .externally_loaded(),
     l("blaze::packable", Allow, "detects a struct held in a collection whose `bool` and fieldless enum fields need far fewer bits than they take, which `#[blaze::bits]` would pack")
         .externally_loaded(),
     l("blaze::soa_candidate", Allow, "detects a struct held in a `Vec`, slice or array whose loops read or write only a small part of each element, which a struct of arrays would store as columns")

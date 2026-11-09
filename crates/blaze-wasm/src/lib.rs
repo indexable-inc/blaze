@@ -289,6 +289,7 @@ impl Compiler {
             target: Ok(target_data()),
             toolchain: None,
             const_eval: Default::default(),
+            trusted: Box::default(),
         });
         let cwd = TArc::new(AbsPathBuf::assert("/".into()));
         let mut graph = CrateGraphBuilder::default();

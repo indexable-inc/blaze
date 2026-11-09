@@ -8,7 +8,7 @@ use std::borrow::Cow;
 
 use base_db::{
     BuiltDependency, ConstEvalBudget, Crate, CrateName, CrateOrigin, CrateType, CrateTypes,
-    CrateWorkspaceData, LangCrateOrigin, TargetKind, Version,
+    CrateWorkspaceData, LangCrateOrigin, TargetKind, TrustedCrate, Version,
     target::{Arch, TargetData},
 };
 use blaze_units::{
@@ -109,16 +109,18 @@ pub(crate) fn toolchain() -> Result<Version, LowerError> {
 }
 
 /// What every crate built for `triple` shares: its target's data layout (blaze's table), the
-/// toolchain and the const-eval budget.
+/// toolchain, the const-eval budget and the trusted crates.
 pub(crate) fn workspace_data(
     triple: &str,
     toolchain: &Version,
     const_eval: ConstEvalBudget,
+    trusted: Box<[TrustedCrate]>,
 ) -> Result<Arc<CrateWorkspaceData>, LowerError> {
     Ok(Arc::new(CrateWorkspaceData {
         target: Ok(target_data(triple)?),
         toolchain: Some(toolchain.clone()),
         const_eval,
+        trusted,
     }))
 }
 
@@ -714,6 +716,8 @@ pub(crate) struct Root {
     pub(crate) dir: Option<String>,
     /// `const-eval` under `[workspace.metadata.blaze]`.
     pub(crate) const_eval: ConstEvalBudget,
+    /// `trusted` under `[workspace.metadata.blaze]`, sorted by name.
+    pub(crate) trusted: Box<[TrustedCrate]>,
 }
 
 /// The first manifest with a `[workspace]` that does not exclude the first member, from that
@@ -724,7 +728,11 @@ pub(crate) fn root<T: blaze_query::Tree>(
     tree: &files::Mounts<'_, T>,
 ) -> Result<Root, LowerError> {
     let Some(member) = units.packages.iter().find(|it| it.is_member) else {
-        return Ok(Root { dir: None, const_eval: ConstEvalBudget::default() });
+        return Ok(Root {
+            dir: None,
+            const_eval: ConstEvalBudget::default(),
+            trusted: Box::default(),
+        });
     };
     let own = files::parent(&member.manifest_path);
     let mut dir = own;
@@ -754,7 +762,8 @@ pub(crate) fn root<T: blaze_query::Tree>(
                     });
                 if !excluded {
                     let const_eval = const_eval(workspace, &manifest)?;
-                    return Ok(Root { dir: Some(dir.to_owned()), const_eval });
+                    let trusted = trusted(workspace, &manifest)?;
+                    return Ok(Root { dir: Some(dir.to_owned()), const_eval, trusted });
                 }
             }
         }
@@ -764,7 +773,88 @@ pub(crate) fn root<T: blaze_query::Tree>(
         }
         dir = up;
     }
-    Ok(Root { dir: Some(own.to_owned()), const_eval: ConstEvalBudget::default() })
+    Ok(Root {
+        dir: Some(own.to_owned()),
+        const_eval: ConstEvalBudget::default(),
+        trusted: Box::default(),
+    })
+}
+
+/// `trusted` under `[workspace.metadata.blaze]`: the crates the capability effects trust, each
+/// `name = { owner = "..", reason = ".." }`, both said and not blank, sorted by name; an error
+/// naming the key for anything else. A crate of the toolchain is never listed: its trust is
+/// blaze's (hir-ty-pure's `effect_attrs::crate_trust`), the same in every workspace.
+pub(crate) fn trusted(
+    workspace: &toml::Value,
+    manifest: &str,
+) -> Result<Box<[TrustedCrate]>, LowerError> {
+    let key = TrustedCrate::KEY;
+    let Some(value) =
+        workspace.get("metadata").and_then(|it| it.get("blaze")).and_then(|it| it.get(key))
+    else {
+        return Ok(Box::default());
+    };
+    let Some(table) = value.as_table() else {
+        return Err(LowerError::at(
+            format!(
+                "`{key}` under `[workspace.metadata.blaze]` is a table: `[workspace.metadata.blaze.{key}]` with `crate = {{ owner = \"..\", reason = \"..\" }}`"
+            ),
+            manifest,
+        ));
+    };
+    const TOOLCHAIN: &[&str] = &[
+        "core",
+        "alloc",
+        "std",
+        "proc_macro",
+        "test",
+        "compiler_builtins",
+        "panic_unwind",
+        "panic_abort",
+    ];
+    // alloc: once per lowering, the workspace's trusted crates
+    let mut trusted = Vec::with_capacity(table.len());
+    for (name, entry) in table {
+        let normalized = name.replace('-', "_"); // alloc: as above
+        if TOOLCHAIN.contains(&normalized.as_str()) {
+            return Err(LowerError::at(
+                format!(
+                    "`{key}.{name}`: `{name}` is the toolchain's, whose trust is blaze's, not a workspace's"
+                ),
+                manifest,
+            ));
+        }
+        let text = |field: &str| -> Result<Box<str>, LowerError> {
+            match entry.get(field).and_then(toml::Value::as_str).map(str::trim) {
+                Some(it) if !it.is_empty() => Ok(it.into()),
+                _ => Err(LowerError::at(
+                    format!(
+                        "`{key}.{name}` says who answers for it and why: `{name} = {{ owner = \"..\", reason = \"..\" }}`, with `{field}` a string that is not blank"
+                    ),
+                    manifest,
+                )),
+            }
+        };
+        let (owner, reason) = (text("owner")?, text("reason")?);
+        let unknown = entry
+            .as_table()
+            .and_then(|it| it.keys().find(|it| !matches!(it.as_str(), "owner" | "reason")));
+        if let Some(other) = unknown {
+            return Err(LowerError::at(
+                format!("`{key}.{name}.{other}` is not a setting (known: `owner`, `reason`)"),
+                manifest,
+            ));
+        }
+        if trusted.iter().any(|it: &TrustedCrate| it.name.as_ref() == normalized.as_str()) {
+            return Err(LowerError::at(
+                format!("`{key}` lists the crate `{normalized}` twice"),
+                manifest,
+            ));
+        }
+        trusted.push(TrustedCrate { name: normalized.into_boxed_str(), owner, reason });
+    }
+    trusted.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(trusted.into_boxed_slice())
 }
 
 /// `const-eval` under `[workspace.metadata.blaze]`: the default for what it leaves out, an
