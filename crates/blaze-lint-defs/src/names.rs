@@ -143,6 +143,10 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "blaze::edition",
+        &["blaze::lossy_as", "blaze::global_state", "blaze::async_fn"],
+    ),
+    (
         "blaze::internal",
         &[
             "blaze::hot_clone",

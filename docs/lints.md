@@ -19,6 +19,11 @@ the release build reports, only by its flags). `checkfree`,
 `nopanic`, `noalloc` and `nonblocking` are in `blaze::general` but `deny` by default, and fire
 only on functions marked with their attribute (`#[blaze::checkfree]`, `#[blaze::nopanic]`, ...).
 
+The group `blaze::edition` (`async_fn`, `global_state`, `lossy_as`) flags what the blaze
+edition removes (docs/v2/plan/design/edition.md); it is allowed unless a workspace or crate
+turns it on to get ready for the edition (`edition = "warn"` in `[workspace.metadata.blaze.lints]`,
+or `#![warn(blaze::edition)]`). None of its lints has a fix.
+
 Several lints come from ideas of the Goose language (no global heap, data stacks, bump
 growth, inline nested data, narrow relative links, variable-size enums, in-place construction
 and `checkfree` functions): `bounded_heap_field`, `box_large_new`, `boxed_recursive_node`,
@@ -136,6 +141,25 @@ read it under epoch or hazard-pointer reclamation (arc-swap's guards, `crossbeam
 clone lives.
 
 **Allowing it.** `#[expect(blaze::arc_clone_only_borrowed, reason = "..")]` on the function.
+
+## `async_fn`
+
+In `blaze::edition`, allowed by default.
+
+**What it catches.** An `async fn`, an `async` block and an `async` closure: one finding per
+outermost one, so an `.await`, or an `async` block inside an `async fn`, goes with the finding
+of the construct it is in. An `async fn` declared inside another function is found on its own.
+
+**Why it matters.** The blaze edition has no `async` or `.await`: code runs on a fiber, a call
+that waits parks the fiber, and the may-suspend effect is inferred from the body. `async`
+splits every API into two colours and every caller has to choose one.
+
+**How to fix it.** Write it as a plain function run on a fiber, and call what it awaited
+directly.
+
+**Not found.** What a macro wrote with no input of the file (a macro's own `async` block).
+
+**Allowing it.** `#[expect(blaze::async_fn, reason = "..")]` on the function or item.
 
 ## `blocking_in_async`
 
@@ -518,6 +542,32 @@ each constant time. Or reverse the `Vec` once and work at its end with `pop` and
 **Allowing it.** `#[expect(blaze::front_vec_ops, reason = "..")]`, for a `Vec` known to stay
 a few elements long.
 
+## `global_state`
+
+In `blaze::edition`, allowed by default.
+
+**What it catches.** State of the whole program any code can reach by name: a `static mut`; a
+`static` whose type has interior mutability, decided by the type system (its type is not
+`Freeze`: an atomic, a `Mutex`, `RwLock`, `OnceLock` or `LazyLock`, a `Cell`, `RefCell` or
+`UnsafeCell`, a `blaze_core::lock` lock, or anything holding one); and each item of std's
+`thread_local!`. The message lists where in the crate it is used, each body once, in a fixed
+order: for a `static mut` the functions that write it and those that only read it, for the
+rest those that use it (a use through `&` may write).
+
+**Why it matters.** Every access to a `static mut` is `unsafe`, and nothing orders one
+thread's write before another's read. Interior-mutable statics and thread-locals are state
+shared by every caller, invisible in any signature; a thread-local's value can change under
+code on a fiber that moves between threads. The blaze edition removes all three.
+
+**How to fix it.** Choose the owner from the uses the message lists, and hand the state (or a
+handle to it) to the code that uses it as a context. For a `static mut` of an integer, `bool`
+or pointer that must stay shared, the message names the atomic that fits.
+
+**Not found.** A `static` of plain data that is not `mut` (`static NAMES: [&str; 2]`), a
+`const`, and what a macro wrote with no input of the file.
+
+**Allowing it.** `#[expect(blaze::global_state, reason = "..")]` on the item.
+
 ## `hash_twice`
 
 **What it catches.** A lookup of a key in a hash map or set (`get`, `contains_key`, `contains`,
@@ -587,6 +637,31 @@ once per row.
 found.
 
 **Allowing it.** `#[expect(blaze::jagged_vec, reason = "..")]` on the struct.
+
+## `lossy_as`
+
+In `blaze::edition`, allowed by default.
+
+**What it catches.** An `as` cast that can lose value or sign, or that goes between a pointer
+and an integer, by the types the front end inferred: an integer to a narrower one
+(`u64 as u32`), between signed and unsigned (`i32 as u32`, `u32 as i32`), a float to an
+integer (drops the fraction, saturates), an integer to a float whose mantissa can't hold it
+(`u64 as f64`), a float to a narrower float, a `char` to an integer narrower than 21 bits, a
+pointer to an integer (drops provenance) and an integer to a pointer. `usize` and `isize` count
+as 32 to 64 bits, so `usize as u32` and `u64 as usize` are both found. The message names the
+two types and what can be lost; the note names the conversion that says it (`T::try_from`,
+`cast_signed`, `cast_unsigned`, `wrapping_*`, `ptr.addr()`, `ptr::with_exposed_provenance`).
+
+**Why it matters.** `as` silently truncates, wraps, rounds or saturates, and the cast looks
+the same whether it can lose or not. The blaze edition removes the lossy forms.
+
+**How to fix it.** `From` where nothing can be lost (`u64::from(x)`), `T::try_from(x)` where
+it can, or the method that names the loss.
+
+**Not found.** A cast that can't lose (`u8 as u32`, `bool as u8`, `f32 as f64`), a cast to its
+own type, and a cast of a literal or a `const` whose value fits the target.
+
+**Allowing it.** `#[expect(blaze::lossy_as, reason = "..")]`.
 
 ## `missing_size_hint`
 

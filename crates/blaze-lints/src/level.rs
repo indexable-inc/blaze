@@ -75,6 +75,11 @@ pub(crate) const BLAZE_INTERNAL: On = blaze_kind(blaze::Kind::Internal);
 /// see whether the code is hot, allowed until a workspace or crate turns it on.
 pub(crate) const BLAZE_PEDANTIC_PERF: On = blaze_kind(blaze::Kind::PedanticPerf);
 
+/// The group `blaze::edition`: what the blaze edition removes (`lossy_as`, `global_state`,
+/// `async_fn`), allowed until a workspace or crate turns it on to get ready for the edition
+/// (docs/v2/plan/design/edition.md).
+pub(crate) const BLAZE_EDITION: On = blaze_kind(blaze::Kind::Edition);
+
 /// The lints `deny` by default ([`blaze::DENY_BY_DEFAULT`]), as a [`Target::Blaze`] has them.
 const BLAZE_DENY: On = {
     let mut bits = On::EMPTY;
@@ -128,6 +133,7 @@ impl Target {
             "general" => return Some(BLAZE_GENERAL),
             "internal" => return Some(BLAZE_INTERNAL),
             "pedantic_perf" => return Some(BLAZE_PEDANTIC_PERF),
+            "edition" => return Some(BLAZE_EDITION),
             _ => {}
         }
         blaze::Lint::named(name).map(blaze::Lint::bit)
@@ -178,7 +184,9 @@ impl Lint<'_> {
             Lint::Blaze(lint) if BLAZE_DENY.intersects(lint.bit()) => Level::Deny,
             Lint::Blaze(lint) => match lint.kind() {
                 blaze::Kind::General => Level::Warn,
-                blaze::Kind::Internal | blaze::Kind::PedanticPerf => Level::Allow,
+                blaze::Kind::Internal | blaze::Kind::PedanticPerf | blaze::Kind::Edition => {
+                    Level::Allow
+                }
             },
             Lint::Warnings | Lint::Rustc(_) => Level::Warn,
         }

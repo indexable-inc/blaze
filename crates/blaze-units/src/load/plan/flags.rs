@@ -297,7 +297,7 @@ pub(super) fn workspace_lints(
     let rank = |flag: &String| {
         let name = flag.split_once('=').map_or("", |it| it.1);
         let order = match name {
-            "blaze::general" | "blaze::internal" | "blaze::pedantic_perf" => 0,
+            "blaze::general" | "blaze::internal" | "blaze::pedantic_perf" | "blaze::edition" => 0,
             "blaze::hot" | "blaze::reach" => 1,
             _ => 2,
         };

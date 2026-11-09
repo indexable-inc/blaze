@@ -1076,6 +1076,12 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::lenient_deserialize", Allow, "detects a struct or enum deriving serde's `Deserialize` without `#[serde(deny_unknown_fields)]`, which silently drops a field of its input it doesn't know")
         .externally_loaded(),
+    l("blaze::lossy_as", Allow, "detects an `as` cast that can lose value or sign, or that goes between a pointer and an integer, which `From`, `TryFrom` or a method naming the loss says")
+        .externally_loaded(),
+    l("blaze::global_state", Allow, "detects a `static mut`, a `static` whose type has interior mutability and a `thread_local!` item, global state the blaze edition removes")
+        .externally_loaded(),
+    l("blaze::async_fn", Allow, "detects an `async fn`, `async` block or `async` closure, which the blaze edition removes: a wait parks the fiber and the may-suspend effect is inferred")
+        .externally_loaded(),
     // Emitted by the release build, which reads it from the code LLVM made, never by `blaze check`.
     l("blaze::vecreport", Allow, "reports a bounds check, overflow check or panic path the optimizer kept inside a loop, and a loop it left unvectorized with its reason, read from the optimized code; only hot loops when the build has a profile"),
 ];
