@@ -84,7 +84,41 @@ pub enum TyLoweringDiagnostic {
         def: GenericDefId,
         query: CycleQuery,
     },
+    /// An error union `A | B` (blaze, `#![blaze::error_unions]`) refused for `reason`, at
+    /// `source`: the member refused, or the union when the refusal is the whole union's.
+    ErrorUnionRefused {
+        source: TypeRefId,
+        reason: ErrorUnionRefusal,
+    },
 }
+
+/// Why an error union is refused ([`TyLoweringDiagnostic::ErrorUnionRefused`]).
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+pub enum ErrorUnionRefusal {
+    /// The crate does not say `#![blaze::error_unions]` plainly among the inner attributes that
+    /// open its root (under `cfg_attr` it is not read): its file is parsed with the syntax only
+    /// because another crate of its source root says it.
+    NotEnabled,
+    /// `core` declares no `#[lang = "error_union"]` type to lower the union to.
+    NoLangItem,
+    /// A member is or names a type parameter: a union's members are known types, so that its
+    /// members and their order are known where it is written.
+    TypeParam,
+    /// A member that is not a named type (a struct, enum or union, or a scalar) with named
+    /// arguments: `impl Trait`, `dyn Trait`, `_`, a reference, a tuple, a fn pointer, or an
+    /// argument that is a const.
+    NotNamed,
+    /// Two members of one identity (the item's crate, module path and name, and its
+    /// arguments) that are different types: items of one name in two blocks of one module, or
+    /// arguments that differ only in lifetimes.
+    Ambiguous,
+    /// More members than core's `ErrorUnion` takes ([`ERROR_UNION_MAX_MEMBERS`]).
+    TooMany,
+}
+
+/// The most members an error union has: the largest tuple core implements its
+/// `error_union::Members` for.
+pub const ERROR_UNION_MAX_MEMBERS: usize = 12;
 
 /// The query of `def` whose computation needed itself, in a [`TyLoweringDiagnostic::QueryCycle`].
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]

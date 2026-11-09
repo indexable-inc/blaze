@@ -1,6 +1,7 @@
 //! See [`Input`].
 
 use edition::{Edition, SyntaxGates};
+use edition::{Edition, Extensions};
 
 use crate::SyntaxKind;
 
@@ -24,6 +25,9 @@ use crate::SyntaxKind;
 /// warm input allocates nothing.
 pub struct Input {
     words: blaze_mem::scratch::Lent<InputWords>,
+    /// The syntax extensions the tokens are parsed under ([`Input::set_extensions`]): none
+    /// unless the file's crate turns one on.
+    extensions: Extensions,
 }
 
 crate::event::per_thread_buffer! {
@@ -85,7 +89,15 @@ impl Input {
         let mut words = blaze_mem::scratch::lend::<InputWords>();
         words.reserve(capacity + PAD);
         words.extend([EOF_WORD; PAD]);
-        Self { words }
+        Self { words, extensions: Extensions::NONE }
+    }
+
+    /// Parses the tokens under `extensions`, the syntax extensions of the file's crate
+    /// (`#![blaze::error_unions]`): with [`Extensions::NONE`], the default, the parser is
+    /// Rust's.
+    #[inline]
+    pub fn set_extensions(&mut self, extensions: Extensions) {
+        self.extensions = extensions;
     }
 
     /// The input's words, as [`Tokens::new`] reads them, copied out: the buffer goes back to
@@ -183,6 +195,7 @@ impl Input {
             fragments: true,
             first_fragment: true,
             gates: SyntaxGates::NONE,
+            extensions: self.extensions,
         }
     }
     #[inline]
@@ -227,6 +240,9 @@ pub struct Tokens<'t> {
     /// Whether a fragment start on token 0 counts ([`Tokens::without_first_fragment`]).
     first_fragment: bool,
     gates: SyntaxGates,
+    /// The syntax extensions the tokens are parsed under: an [`Input`]'s, and none for a token
+    /// tree's ([`Tokens::new`]).
+    extensions: Extensions,
 }
 
 impl<'t> Tokens<'t> {
@@ -263,6 +279,13 @@ impl<'t> Tokens<'t> {
     #[inline]
     pub(crate) fn gates(self) -> SyntaxGates {
         self.gates
+        Tokens { words, fragments, first_fragment: true, extensions: Extensions::NONE }
+    }
+
+    /// The syntax extensions the tokens are parsed under.
+    #[inline]
+    pub(crate) fn extensions(self) -> Extensions {
+        self.extensions
     }
 
     /// The same tokens, with a fragment start on token 0 not counted: a token tree's view that

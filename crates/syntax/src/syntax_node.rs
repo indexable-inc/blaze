@@ -87,9 +87,15 @@ impl SyntaxTreeBuilder {
         mut self,
         edition: parser::Edition,
         gates: parser::SyntaxGates,
+    /// [`crate::parsing::expand_lazy`] in `edition` and under `extensions`.
+    pub(crate) fn finish_raw(
+        mut self,
+        edition: parser::Edition,
+        extensions: parser::Extensions,
     ) -> (FlatTree, Vec<SyntaxError>) {
         if self.lazy {
             let data = crate::parsing::lazy_data(edition, gates);
+            let data = crate::parsing::lazy_data(edition, extensions);
             self.inner.expand_with(crate::parsing::expand_lazy, data);
         }
         (self.inner.finish(), self.errors)
@@ -106,6 +112,7 @@ impl SyntaxTreeBuilder {
 
     fn finish_as<T>(self) -> Parse<T> {
         let (tree, errors) = self.finish_raw(parser::Edition::CURRENT, parser::SyntaxGates::NONE);
+        let (tree, errors) = self.finish_raw(parser::Edition::CURRENT, parser::Extensions::NONE);
         let tree = Tree(Arc::new(tree)); // alloc: the tree's one shared box, once per parse
         // Disable block validation, see https://github.com/rust-lang/rust-analyzer/pull/10357
         #[allow(clippy::overly_complex_bool_expr)]

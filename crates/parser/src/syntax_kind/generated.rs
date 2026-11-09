@@ -359,6 +359,9 @@ pub enum SyntaxKind {
     // too. Only ever a contextual kind: where the grammar takes it as the keyword it goes in
     // the tree as a `MUT_KW` token, so no tree holds this kind.
     UNIQ_KW,
+    // blaze's error unions (`#![blaze::error_unions]`, docs/v2/plan/design/edition.md), after
+    // the others too.
+    UNION_TYPE,
     #[doc(hidden)]
     __LAST,
 }
@@ -478,6 +481,7 @@ impl SyntaxKind {
             | UNSAFE_BINDER_CAST_EXPR
             | UNSAFE_BINDER_TYPE
             | SPEC_CLAUSE
+            | UNION_TYPE
             | OR_PAT
             | PARAM
             | PARAM_LIST

@@ -1431,6 +1431,14 @@ impl Printer<'_> {
                 w!(self, " is ");
                 self.print_pat(pat);
             }
+            TypeRef::Union(members) => {
+                for (i, member) in members.iter().enumerate() {
+                    if i != 0 {
+                        w!(self, " | ");
+                    }
+                    self.print_type_ref(*member);
+                }
+            }
             TypeRef::UnsafeBinder { lifetimes, ty } => {
                 if lifetimes.is_empty() {
                     w!(self, "unsafe ");

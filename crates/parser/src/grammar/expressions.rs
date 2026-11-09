@@ -706,8 +706,8 @@ fn cast_expr(p: &mut Parser<'_>, lhs: CompletedMarker) -> CompletedMarker {
     let m = lhs.precede(p);
     p.bump(T![as]);
     // Use type_no_bounds(), because cast expressions are not
-    // allowed to have bounds.
-    types::type_no_bounds(p);
+    // allowed to have bounds. blaze: nor an error union, as `x as u8 | y` is an or.
+    p.with_unions(false, types::type_no_bounds);
     m.complete(p, CAST_EXPR)
 }
 

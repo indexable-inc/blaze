@@ -776,9 +776,49 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                     );
                     Ok(Some(current))
                 }
+                Adjust::ErrorUnion => {
+                    let Some((p, current)) =
+                        self.lower_expr_as_place_with_adjust(current, expr_id, true, rest)?
+                    else {
+                        return Ok(None);
+                    };
+                    let source = match rest.last() {
+                        Some(it) => it.target.as_ref(),
+                        None => self.expr_ty_without_adjust(expr_id),
+                    };
+                    self.lower_error_union_widen(
+                        current,
+                        Operand { kind: OperandKind::Copy(p.store()), span: None },
+                        source,
+                        last.target.as_ref(),
+                        place,
+                        expr_id.into(),
+                    )
+                }
             },
             None => self.lower_expr_to_place_without_adjust(expr_id, place, current),
         }
+    }
+
+    /// `place = core::error_union::widen::<source, target>(value)`: a member of the error
+    /// union `target`, or a union of some of its members, put in it (`Adjust::ErrorUnion`).
+    fn lower_error_union_widen(
+        &mut self,
+        current: BasicBlockId,
+        value: Operand,
+        source: Ty<'db>,
+        target: Ty<'db>,
+        place: Place<'db>,
+        span: MirSpan,
+    ) -> Result<'db, Option<BasicBlockId>> {
+        let widen = self.lang_items().ErrorUnionWiden.ok_or(MirLowerError::LangItemNotFound)?;
+        let widen = Operand::const_zst(Ty::new_fn_def(
+            self.interner(),
+            CallableDefId::FunctionId(widen).into(),
+            GenericArgs::new_from_slice(&[source.into(), target.into()]),
+        ));
+        // alloc: the call's arguments, kept in the body
+        self.lower_call(widen, Box::new([value]), place, current, false, span)
     }
 
     fn lower_expr_to_place_with_borrow_adjust(

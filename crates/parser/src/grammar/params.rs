@@ -36,6 +36,12 @@ enum Flavor {
 }
 
 fn list_(p: &mut Parser<'_>, flavor: Flavor) {
+    // blaze: a closure's parameters end at a `|`, so no type in them is an error union
+    // (`#![blaze::error_unions]`) unless parenthesized; the others are delimited.
+    p.with_unions(flavor != Flavor::Closure, |p| list_in(p, flavor));
+}
+
+fn list_in(p: &mut Parser<'_>, flavor: Flavor) {
     use Flavor::*;
 
     let (bra, ket) = match flavor {

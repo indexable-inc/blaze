@@ -292,6 +292,10 @@ pub mod reflect;
 // changes).
 #[unstable(feature = "blaze_verify", issue = "none")]
 pub mod blaze;
+// blaze's error unions, the type of `A | B` under `#![blaze::error_unions]` (`library/UPSTREAM`
+// lists it among blaze's changes).
+#[unstable(feature = "blaze_error_unions", issue = "none")]
+pub mod error_union;
 pub mod index;
 pub mod marker;
 pub mod ops;

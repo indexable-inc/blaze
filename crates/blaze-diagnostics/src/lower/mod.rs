@@ -19,6 +19,7 @@ pub(crate) mod bad_rtn;
 pub(crate) mod conflicting_assoc_type_bindings;
 pub(crate) mod const_param_ty_not_allowed;
 pub(crate) mod elided_lifetimes_in_path;
+pub(crate) mod error_union_refused;
 pub(crate) mod fn_trait_args_not_tuple;
 pub(crate) mod generic_args_prohibited;
 pub(crate) mod generic_default_refers_to_self;
@@ -226,6 +227,7 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> 
         AnyDiagnostic::MissingSelfDefaultParams(d) => missing_self_default_params::lower(cx, &d),
         AnyDiagnostic::ObjectWithoutTrait(d) => object_without_trait::lower(cx, &d),
         AnyDiagnostic::PatternTypeNotLowered(d) => pattern_type_not_lowered::lower(cx, &d),
+        AnyDiagnostic::ErrorUnionRefused(d) => error_union_refused::lower(cx, &d),
         AnyDiagnostic::QueryCycle(d) => query_cycle::lower(cx, &d),
         AnyDiagnostic::NotAStructPath(d) => not_a_struct_path::lower(cx, &d),
         AnyDiagnostic::AutoderefRecursionLimit(d) => autoderef_recursion_limit::lower(cx, &d),

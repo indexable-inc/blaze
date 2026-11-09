@@ -180,6 +180,7 @@ fn has_implicit_borrow(adjustment: &Adjustment) -> Option<(Mutability, bool)> {
         )),
         Adjust::NeverToAny
         | Adjust::Pointer(_)
+        | Adjust::ErrorUnion
         | Adjust::Deref(None)
         | Adjust::Borrow(AutoBorrow::RawPtr(_)) => None,
     }

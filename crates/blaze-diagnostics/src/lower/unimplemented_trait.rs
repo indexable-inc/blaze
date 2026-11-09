@@ -143,6 +143,7 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::UnimplementedTrait<'db>) -> 
         diag.span_help(cx.span(range), "this trait has no implementations, consider adding one");
     }
     note_derived(cx, d, &mut diag);
+    note_not_a_member(cx, leaf, &mut diag);
     obligation_cause::note(cx, &mut diag, d.cause, Some(root_ref.trait_()));
 
     for pred in std::iter::once(leaf).chain(&d.parent_trait_predicates) {
@@ -160,6 +161,38 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::UnimplementedTrait<'db>) -> 
     code_fact(cx, &mut diag, d.span.map(|it| it.syntax_node_ptr()));
     // alloc: the error's parts, for an error hir found
     vec![Found::new(diag, Phase::Bodies)]
+}
+
+/// blaze: a widening into an error union (`#![blaze::error_unions]`: a coercion, `?` or
+/// `From`) that failed because the source is not a subset of the union, one note per source
+/// member the union lacks: "`X` is not a member of `A | B`".
+fn note_not_a_member<'db>(cx: &Cx<'_, 'db>, pred: &hir::TraitClause<'db>, diag: &mut Diag) {
+    let tr = pred.trait_ref();
+    if !is_lang(cx, tr.trait_(), LangItem::ErrorUnionFrom) {
+        return;
+    }
+    let (Some(union), Some(source)) = (tr.get_type_argument(0), tr.get_type_argument(1)) else {
+        return;
+    };
+    let members = match union.type_arguments().next() {
+        Some(members) => members.tuple_fields(cx.db),
+        None => return,
+    };
+    let sources = match (source.as_adt(), union.as_adt()) {
+        (Some(of_source), Some(of_union)) if of_source == of_union => {
+            match source.type_arguments().next() {
+                Some(sources) => sources.tuple_fields(cx.db),
+                None => return,
+            }
+        }
+        // alloc: the error's parts, for an error hir found
+        _ => vec![source],
+    };
+    let union_text = cx.ty(&union);
+    for missing in sources.iter().filter(|it| !members.contains(it)) {
+        // alloc: the error's text, for an error hir found
+        diag.note(format!("`{}` is not a member of `{union_text}`", cx.ty(missing)));
+    }
 }
 
 /// rustc's `get_explanation_based_on_obligation`: "the trait `Trait` is not implemented for

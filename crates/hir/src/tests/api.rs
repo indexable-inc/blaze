@@ -431,6 +431,7 @@ fn adjustments_convert_as_before() {
                 Adjust::Borrow(AutoBorrow::Ref(mutability(m.into())))
             }
             hir_ty::Adjust::Pointer(pc) => Adjust::Pointer(pc),
+            hir_ty::Adjust::ErrorUnion => Adjust::ErrorUnion,
         }
     };
     let mut cases = vec![
@@ -438,6 +439,7 @@ fn adjustments_convert_as_before() {
         hir_ty::Adjust::Deref(None),
         hir_ty::Adjust::Pointer(PointerCast::ReifyFnPointer),
         hir_ty::Adjust::Pointer(PointerCast::Unsize),
+        hir_ty::Adjust::ErrorUnion,
         hir_ty::Adjust::Borrow(hir_ty::AutoBorrow::Ref(AutoBorrowMutability::Not)),
     ];
     for two_phase in [AllowTwoPhase::Yes, AllowTwoPhase::No] {

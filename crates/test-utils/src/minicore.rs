@@ -39,6 +39,7 @@
 //!     env: option
 //!     eq: sized, unary_ops, builtin_impls
 //!     error: fmt
+//!     error_union: error, from, clone, hash
 //!     float_consts: unary_ops, builtin_impls
 //!     fmt: option, result, transmute, coerce_unsized, copy, clone, derive
 //!     fn: sized, tuple
@@ -2831,6 +2832,139 @@ pub mod error {
     }
 }
 // endregion:error
+
+// region:error_union
+pub mod error_union {
+    use crate::{clone::Clone, convert::From, error::Error, fmt, hash::{Hash, Hasher}};
+
+    pub trait Members {
+        type Repr;
+    }
+
+    #[lang = "error_union"]
+    pub struct ErrorUnion<M: Members>(pub M::Repr);
+
+    #[lang = "error_union_from"]
+    pub trait UnionFrom<S> {
+        type Path;
+    }
+
+    pub trait Inject<S, P> {
+        fn inject(value: S) -> Self;
+    }
+
+    #[lang = "error_union_widen"]
+    pub fn widen<S, U>(value: S) -> U
+    where
+        U: UnionFrom<S> + Inject<S, <U as UnionFrom<S>>::Path>,
+    {
+        <U as Inject<S, <U as UnionFrom<S>>::Path>>::inject(value)
+    }
+
+    impl<S, U> From<S> for U
+    where
+        U: UnionFrom<S> + Inject<S, <U as UnionFrom<S>>::Path>,
+    {
+        fn from(value: S) -> U {
+            widen(value)
+        }
+    }
+
+    pub enum Of2<T0, T1> {
+        M0(T0),
+        M1(T1),
+    }
+    pub enum Of3<T0, T1, T2> {
+        M0(T0),
+        M1(T1),
+        M2(T2),
+    }
+    impl<T0, T1> Members for (T0, T1) {
+        type Repr = Of2<T0, T1>;
+    }
+    impl<T0, T1, T2> Members for (T0, T1, T2) {
+        type Repr = Of3<T0, T1, T2>;
+    }
+
+    impl<T0, T1> Inject<T0, ()> for ErrorUnion<(T0, T1)> {
+        fn inject(value: T0) -> Self {
+            ErrorUnion(Of2::M0(value))
+        }
+    }
+    impl<T0, T1> Inject<T1, ((),)> for ErrorUnion<(T0, T1)> {
+        fn inject(value: T1) -> Self {
+            ErrorUnion(Of2::M1(value))
+        }
+    }
+    impl<T0, T1, T2> Inject<T0, ()> for ErrorUnion<(T0, T1, T2)> {
+        fn inject(value: T0) -> Self {
+            ErrorUnion(Of3::M0(value))
+        }
+    }
+    impl<T0, T1, T2> Inject<T1, ((),)> for ErrorUnion<(T0, T1, T2)> {
+        fn inject(value: T1) -> Self {
+            ErrorUnion(Of3::M1(value))
+        }
+    }
+    impl<T0, T1, T2> Inject<T2, (((),),)> for ErrorUnion<(T0, T1, T2)> {
+        fn inject(value: T2) -> Self {
+            ErrorUnion(Of3::M2(value))
+        }
+    }
+    impl<U, T0, T1, P0, P1> Inject<ErrorUnion<(T0, T1)>, (P0, P1)> for U
+    where
+        U: Inject<T0, P0> + Inject<T1, P1>,
+    {
+        fn inject(value: ErrorUnion<(T0, T1)>) -> U {
+            match value.0 {
+                Of2::M0(it) => <U as Inject<T0, P0>>::inject(it),
+                Of2::M1(it) => <U as Inject<T1, P1>>::inject(it),
+            }
+        }
+    }
+
+    impl<T0: fmt::Display, T1: fmt::Display> fmt::Display for ErrorUnion<(T0, T1)> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match &self.0 {
+                Of2::M0(it) => fmt::Display::fmt(it, f),
+                Of2::M1(it) => fmt::Display::fmt(it, f),
+            }
+        }
+    }
+    impl<T0: fmt::Debug, T1: fmt::Debug> fmt::Debug for ErrorUnion<(T0, T1)> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match &self.0 {
+                Of2::M0(it) => fmt::Debug::fmt(it, f),
+                Of2::M1(it) => fmt::Debug::fmt(it, f),
+            }
+        }
+    }
+    impl<T0: Error, T1: Error> Error for ErrorUnion<(T0, T1)> {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            match &self.0 {
+                Of2::M0(it) => it.source(),
+                Of2::M1(it) => it.source(),
+            }
+        }
+    }
+    impl<T0: Clone, T1: Clone> Clone for ErrorUnion<(T0, T1)> {
+        fn clone(&self) -> Self {
+            match &self.0 {
+                Of2::M0(it) => ErrorUnion(Of2::M0(it.clone())),
+                Of2::M1(it) => ErrorUnion(Of2::M1(it.clone())),
+            }
+        }
+    }
+    impl<T0: Hash, T1: Hash> Hash for ErrorUnion<(T0, T1)> {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            match &self.0 {
+                Of2::M0(it) => it.hash(state),
+                Of2::M1(it) => it.hash(state),
+            }
+        }
+    }
+}
+// endregion:error_union
 
 // region:float_consts
 impl f32 {

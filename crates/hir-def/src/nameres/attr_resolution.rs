@@ -151,6 +151,9 @@ impl DefMap {
                         // `#![blaze::pattern_types]`, from `DefMap::pattern_types`
                         // (docs/v2/plan/design/edition.md, section 8).
                         | "pattern_types"
+                        // `#![blaze::error_unions]`, read off the crate root's tokens by
+                        // `base_db::crate_extensions` (the parser's `A | B` types).
+                        | "error_unions"
                         // `#[blaze::reflect]`, from `AttrFlags::BLAZE_REFLECT`
                         // (`hir_ty_comptime::struct_domain`, docs/v2/plan/design/comptime.md).
                         | "reflect"

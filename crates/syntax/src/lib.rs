@@ -65,6 +65,7 @@ pub use crate::{
     },
 };
 pub use parser::{Edition, LexedStr, SyntaxGates, SyntaxKind, T};
+pub use parser::{Edition, Extensions, LexedStr, SyntaxKind, T};
 pub use rustc_literal_escaper as unescape;
 pub use smol_str::{SmolStr, SmolStrBuilder, ToSmolStr, format_smolstr};
 pub use syntax_tree::{
@@ -87,17 +88,22 @@ pub struct Parse<T> {
     /// The crate's syntax gates the text was parsed under (`#![blaze::uniq]`), under which an
     /// outline's lazy bodies and every reparse are parsed too.
     gates: SyntaxGates,
+    /// The syntax extensions the text was parsed under (its crate's, `edition::Extensions`):
+    /// an outline's lazy bodies and every reparse use them too.
+    extensions: Extensions,
     _ty: PhantomData<fn() -> T>,
 }
 
 /// What the derived `PartialEq` compares, without bounding the marker `T`: the tree's content
 /// (never its address), the errors, the outline's edition and the syntax gates.
+/// (never its address), the errors, the outline's edition and the extensions.
 impl<T> std::hash::Hash for Parse<T> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.tree.hash(state);
         self.errors.hash(state);
         self.outline.hash(state);
         self.gates.hash(state);
+        self.extensions.hash(state);
     }
 }
 
@@ -108,6 +114,7 @@ impl<T> Clone for Parse<T> {
             errors: self.errors.clone(),
             outline: self.outline,
             gates: self.gates,
+            extensions: self.extensions,
             _ty: PhantomData,
         }
     }
@@ -115,15 +122,21 @@ impl<T> Clone for Parse<T> {
 
 impl<T> Parse<T> {
     fn new(tree: Tree, errors: Vec<SyntaxError>) -> Parse<T> {
-        Parse::with_outline(tree, errors, None)
+        Parse::with_outline(tree, errors, None, Extensions::NONE)
     }
 
-    fn with_outline(tree: Tree, errors: Vec<SyntaxError>, outline: Option<Edition>) -> Parse<T> {
+    fn with_outline(
+        tree: Tree,
+        errors: Vec<SyntaxError>,
+        outline: Option<Edition>,
+        extensions: Extensions,
+    ) -> Parse<T> {
         Parse {
             tree: Some(tree),
             errors: if errors.is_empty() { None } else { Some(errors.into()) },
             outline,
             gates: SyntaxGates::NONE,
+            extensions,
             _ty: PhantomData,
         }
     }
@@ -137,6 +150,9 @@ impl<T> Parse<T> {
     /// The crate's syntax gates this parse was made under ([`SourceFile::parse_gated`]).
     pub fn gates(&self) -> SyntaxGates {
         self.gates
+    /// The syntax extensions this was parsed under.
+    pub fn extensions(&self) -> Extensions {
+        self.extensions
     }
 
     fn take(&mut self) -> Parse<SyntaxNode> {
@@ -145,6 +161,7 @@ impl<T> Parse<T> {
             errors: self.errors.take(),
             outline: self.outline,
             gates: self.gates,
+            extensions: self.extensions,
             _ty: PhantomData,
         }
     }
@@ -180,6 +197,7 @@ impl<T> Parse<T> {
             errors: self.errors.clone(),
             outline: self.outline,
             gates: self.gates,
+            extensions: self.extensions,
             _ty: PhantomData,
         }
     }
@@ -267,6 +285,7 @@ pub struct WeakParse<T> {
     errors: Option<Arc<[SyntaxError]>>,
     outline: Option<Edition>,
     gates: SyntaxGates,
+    extensions: Extensions,
     _ty: PhantomData<fn() -> T>,
 }
 
@@ -279,6 +298,7 @@ impl<T> WeakParse<T> {
             errors: self.errors.clone(),
             outline: self.outline,
             gates: self.gates,
+            extensions: self.extensions,
             _ty: PhantomData,
         })
     }
@@ -317,6 +337,7 @@ impl Parse<SyntaxNode> {
                 errors: self.errors.take(),
                 outline: self.outline,
                 gates: self.gates,
+                extensions: self.extensions,
                 _ty: PhantomData,
             })
         } else {
@@ -366,10 +387,12 @@ impl Parse<SourceFile> {
             self.errors.as_deref().unwrap_or_default().iter().cloned(),
             edition,
             self.gates,
+            self.extensions,
             self.outline,
         )?;
         let tree = Tree::new(std::sync::Arc::new(tree));
         Some(Parse::with_outline(tree, errors, self.outline).under(self.gates))
+        Some(Parse::with_outline(tree, errors, self.outline, self.extensions))
     }
 
     fn full_reparse(&self, delete: TextRange, insert: &str, edition: Edition) -> Parse<SourceFile> {
@@ -379,9 +402,16 @@ impl Parse<SourceFile> {
             insert,
             &source[usize::from(delete.end())..],
         ]);
+        self.parse_again(text, edition)
+    }
+
+    /// A whole parse of `text` of this parse's kind (an outline or not) and extensions.
+    fn parse_again(&self, text: Text, edition: Edition) -> Parse<SourceFile> {
         match self.outline {
             Some(_) => SourceFile::parse_outline_gated(text, edition, self.gates),
             None => SourceFile::parse_gated(text, edition, self.gates),
+            Some(_) => SourceFile::parse_outline_with(text, edition, self.extensions),
+            None => SourceFile::parse_shared_with(text, edition, self.extensions),
         }
     }
 
@@ -417,14 +447,20 @@ impl Parse<SourceFile> {
         let (gates, outline) = (self.gates, self.outline);
         match parsing::incremental_reparse_onto(tree, delete, &text, errors, edition, gates, outline)
         {
+        let (extensions, outline) = (self.extensions, self.outline);
+        match parsing::incremental_reparse_onto(
+            tree, delete, &text, errors, edition, extensions, outline,
+        ) {
             Some((tree, errors, _reparsed)) => {
                 let tree = Tree::new(std::sync::Arc::new(tree));
                 Parse::with_outline(tree, errors, outline).under(gates)
+                Parse::with_outline(tree, errors, outline, extensions)
             }
             None => match outline {
                 Some(_) => SourceFile::parse_outline_gated(text, edition, gates),
                 None => SourceFile::parse_gated(text, edition, gates),
             },
+            None => self.parse_again(text, edition),
         }
     }
 
@@ -451,6 +487,7 @@ impl Parse<SourceFile> {
                 errors,
                 edition,
                 self.gates,
+                self.extensions,
                 self.outline,
             ),
         };
@@ -458,11 +495,13 @@ impl Parse<SourceFile> {
             Some((tree, errors)) => {
                 let tree = Tree::new(std::sync::Arc::new(tree));
                 Parse::with_outline(tree, errors, self.outline).under(self.gates)
+                Parse::with_outline(tree, errors, self.outline, self.extensions)
             }
             None => match self.outline {
                 Some(_) => SourceFile::parse_outline_gated(text, edition, self.gates),
                 None => SourceFile::parse_gated(text, edition, self.gates),
             },
+            None => self.parse_again(text, edition),
         }
     }
 
@@ -564,13 +603,24 @@ impl SourceFile {
         text: impl Into<Text>,
         edition: Edition,
         gates: SyntaxGates,
+        SourceFile::parse_shared_with(text, edition, Extensions::NONE)
+    }
+
+    /// [`SourceFile::parse_shared`] under a crate's syntax extensions (`edition::Extensions`):
+    /// with none, exactly that parse.
+    pub fn parse_shared_with(
+        text: impl Into<Text>,
+        edition: Edition,
+        extensions: Extensions,
     ) -> Parse<SourceFile> {
         let _p = tracing::info_span!(target: "blaze", "SourceFile::parse").entered();
         let (tree, errors) = parsing::parse_text(&text.into(), edition, gates, false);
+        let (tree, errors) = parsing::parse_text(&text.into(), edition, extensions, false);
         let root = tree.root();
 
         assert_eq!(root.kind(), SyntaxKind::SOURCE_FILE);
         Parse::new(tree, errors).under(gates)
+        Parse::with_outline(tree, errors, None, extensions)
     }
 
     /// An outline of `text`, for the files of dependency crates (#1294): every `fn` item's body
@@ -588,13 +638,24 @@ impl SourceFile {
         text: impl Into<Text>,
         edition: Edition,
         gates: SyntaxGates,
+        SourceFile::parse_outline_with(text, edition, Extensions::NONE)
+    }
+
+    /// [`SourceFile::parse_outline`] under a crate's syntax extensions, which its lazy bodies
+    /// are parsed under too.
+    pub fn parse_outline_with(
+        text: impl Into<Text>,
+        edition: Edition,
+        extensions: Extensions,
     ) -> Parse<SourceFile> {
         let _p = tracing::info_span!(target: "blaze", "SourceFile::parse_outline").entered();
         let (tree, errors) = parsing::parse_text(&text.into(), edition, gates, true);
+        let (tree, errors) = parsing::parse_text(&text.into(), edition, extensions, true);
         let root = tree.root();
 
         assert_eq!(root.kind(), SyntaxKind::SOURCE_FILE);
         Parse::with_outline(tree, errors, Some(edition)).under(gates)
+        Parse::with_outline(tree, errors, Some(edition), extensions)
     }
 }
 

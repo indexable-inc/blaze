@@ -49,6 +49,11 @@ pub(crate) struct Parser<'t> {
     /// whole file or expansion, where `T is` was never valid; false for a macro fragment
     /// (`$t:ty`), so a `macro_rules!` matcher takes exactly the tokens it took before.
     bare_pattern_types: bool,
+    /// Whether a type here may be an error union `A | B` (`#![blaze::error_unions]`): the
+    /// input's extension, off while a type is read where Rust lets a `|` follow one (a
+    /// closure's parameters, after `as`) and inside one union's members
+    /// ([`Parser::with_unions`]).
+    unions: bool,
 }
 
 const PARSER_STEP_LIMIT: usize = if cfg!(debug_assertions) { 150_000 } else { 15_000_000 };
@@ -65,6 +70,7 @@ impl<'t> Parser<'t> {
             outline: false,
             closed_curlies: None,
             bare_pattern_types: true,
+            unions: inp.extensions().error_unions(),
         }
     }
 
@@ -77,6 +83,18 @@ impl<'t> Parser<'t> {
     /// Whether a bare `T is PAT` is a type here (`#![blaze::pattern_types]`).
     pub(crate) fn bare_pattern_types(&self) -> bool {
         self.bare_pattern_types
+    /// Whether a type parsed here may be an error union `A | B`.
+    pub(crate) fn unions(&self) -> bool {
+        self.unions
+    }
+
+    /// Runs `parse` with error unions allowed (`true`, inside a delimiter: only when the
+    /// input's extensions have them) or not (`false`), then puts back what was allowed before.
+    pub(crate) fn with_unions(&mut self, allowed: bool, parse: impl FnOnce(&mut Parser<'t>)) {
+        let allowed = allowed && self.inp.extensions().error_unions();
+        let before = std::mem::replace(&mut self.unions, allowed);
+        parse(self);
+        self.unions = before;
     }
 
     pub(super) fn new_outline(inp: impl Into<Tokens<'t>>) -> Parser<'t> {
