@@ -684,7 +684,6 @@ fn touch(touched: &mut Vec<(FileName, bool)>, effect: &Effect) {
         | Effect::ReadLink { file, .. }
         | Effect::Stat { file, .. }
         | Effect::Lstat { file, .. }
-        | Effect::ReadInto { file, .. }
         | Effect::Map { file, .. } => named(file, false),
         Effect::Append { file, .. }
         | Effect::Sync { file, .. }
@@ -702,7 +701,7 @@ fn touch(touched: &mut Vec<(FileName, bool)>, effect: &Effect) {
             named(to, true);
         }
         Effect::List { dir, .. } | Effect::Entries { dir, .. } | Effect::Watch { dir, .. } => named(dir, false),
-        Effect::Private { dir, .. } => named(dir, true),
+        Effect::Private { dir, .. } | Effect::MakeDir { dir, .. } | Effect::RemoveDir { dir, .. } => named(dir, true),
         Effect::Journal { dir, .. } => named(dir, false),
         Effect::Unlock { .. }
         | Effect::Unwatch { .. }
@@ -717,7 +716,15 @@ fn touch(touched: &mut Vec<(FileName, bool)>, effect: &Effect) {
         | Effect::Recv { .. }
         | Effect::Send { .. }
         | Effect::Hangup { .. }
-        | Effect::Pressure { .. } => {}
+        | Effect::Pressure { .. }
+        | Effect::Bind { .. }
+        | Effect::SendTo { .. }
+        | Effect::RecvFrom { .. }
+        | Effect::Unbind { .. }
+        | Effect::ReadStdin { .. }
+        | Effect::WriteOut { .. }
+        | Effect::Now { .. }
+        | Effect::Random { .. } => {}
     }
 }
 
