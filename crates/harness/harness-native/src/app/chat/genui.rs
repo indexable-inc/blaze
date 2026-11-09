@@ -966,8 +966,12 @@ mod tests {
             assert!(l.w > 0.0 && l.h > 0.0, "{what} has no room: {l:?}");
             l
         };
-        let option = |c: View<'_>, n: usize| c.part(&format!("o{n}")).unwrap_or_else(|| panic!("option o{n}"));
-        let label = |o: View<'_>| o.part("label").expect("an option's label");
+        fn option(c: View<'_>, n: usize) -> View<'_> {
+            c.part(&format!("o{n}")).unwrap_or_else(|| panic!("option o{n}"))
+        }
+        fn label(o: View<'_>) -> View<'_> {
+            o.part("label").expect("an option's label")
+        }
         let natural = |o: View<'_>| label(o).entity().try_cloned::<&Intrinsic>().expect("a measured label");
         for c in [el(0), el(1)] {
             for n in 0..3 {
