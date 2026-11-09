@@ -16,6 +16,7 @@
 //!   its CPUs, and answers `blaze explore`, `blaze debug live` and a reader's ask to flush the
 //!   history (`blaze_api::Request::Flush`) itself ([`observe`]).
 
+mod breakdown;
 pub mod ceiling;
 mod daemon;
 mod fetch;

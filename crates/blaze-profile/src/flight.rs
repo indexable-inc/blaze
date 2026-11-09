@@ -934,6 +934,16 @@ pub fn building(build: u32) -> Building {
     Building(BUILD.with(|it| it.replace(build)))
 }
 
+/// While the result lives, the counters this thread plots ([`plot`], [`plot_named`]) are of
+/// build `build` (0: none), and nothing else of the thread is: for a thread that samples
+/// process-wide counters (the daemon's loop) while a build is under way, so its rows carry that
+/// build's `build_id` and a build's counters are found by it, not by the daemon's pid. Unlike
+/// [`building`] it does not make the thread's job the build's.
+#[must_use]
+pub fn counting_for(build: u32) -> Building {
+    Building(BUILD.with(|it| it.replace(build)))
+}
+
 /// See [`building`]: gives back the build the thread was working for before.
 pub struct Building(u32);
 

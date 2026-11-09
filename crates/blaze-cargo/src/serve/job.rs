@@ -2862,6 +2862,20 @@ impl<S: Steps> Jobs<S> {
             + self.jobs.values().filter(|job| !job.idle && job.durable_since.is_none()).count()
     }
 
+    /// The newest build under way: the highest request of a job that is not idle and not
+    /// finished, 0 for none. What the daemon's process-wide counters are said to be of
+    /// (`blaze_profile::flight::counting_for`): two builds that overlap share their counters,
+    /// and the newer one is named.
+    pub fn build_under_way(&self) -> u32 {
+        self.jobs
+            .values()
+            .filter(|job| !job.idle && !job.finished)
+            .filter_map(|job| job.request)
+            .map(|request| request.0)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Whether a run of user code (a build script, a test, a run) of any job has not ended:
     /// work under way though nothing of the build moves meanwhile.
     pub fn runs_live(&self) -> bool {
