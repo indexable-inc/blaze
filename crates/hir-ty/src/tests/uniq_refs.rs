@@ -1,7 +1,7 @@
 //! `&uniq T` under `#![blaze::uniq]` (docs/v2/plan/design/edition.md, change 10) is `&mut T`:
 //! each spelling is accepted where the other is asked for, in arguments, `let` types, returns,
-//! receivers and `ref` bindings, both ways; a shared reference is still not; and the crate's
-//! types display as it spells them, `&uniq u32`.
+//! receivers, `ref` bindings and reference patterns, both ways; a shared reference is still
+//! not; and the crate's types display as it spells them, `&uniq u32`.
 
 use hir_def::{
     AssocItemId, DefWithBodyId, FunctionId, ModuleDefId,
@@ -51,6 +51,19 @@ pub fn main() {
 }
 pub fn refused(r: &u32) {
     takes_uniq(r);
+}
+pub fn takes_u32(_: u32) {}
+pub fn patterns(a: &uniq u32, b: &mut u32, c: (&uniq u32, u8)) {
+    let &uniq by_uniq = a;
+    takes_u32(by_uniq);
+    let &uniq of_mut = b;
+    takes_u32(of_mut);
+    let (&mut in_tuple, _) = c;
+    takes_u32(in_tuple);
+    let closure = |&uniq in_closure: &uniq u32| takes_u32(in_closure);
+}
+pub fn refused_pattern(r: &u32) {
+    let &uniq x = r;
 }
 "#;
 
@@ -104,6 +117,26 @@ fn uniq_and_mut_references_are_accepted_for_each_other() {
         let def = DefWithBodyId::FunctionId(function(&db, "refused"));
         let infer = InferenceResult::of(&db, InferBodyId::DefWithBodyId(def));
         assert!(infer.has_type_mismatches(), "`&u32` is accepted as `&uniq u32`");
+    });
+}
+
+/// `&uniq pat` is the reference pattern `&mut pat`: it takes a unique reference apart, of
+/// either spelling, binding what it refers to; and it is refused a shared reference, as
+/// `&mut pat` is.
+#[test]
+fn a_uniq_reference_pattern_is_a_mut_reference_pattern() {
+    let db = fixture::db(ACCEPTED).into_db();
+    blaze_query::db::attach(&db, || {
+        let krate = fixture::test_crate(&db);
+        for binding in ["by_uniq", "of_mut", "in_tuple", "in_closure"] {
+            let (shown, mismatched) = binding_ty(&db, krate, "patterns", binding);
+            assert_eq!(shown, "u32", "`{binding}`");
+            assert!(!mismatched, "`patterns` has a type mismatch");
+        }
+        // The control: a shared reference does not match a unique reference pattern.
+        let def = DefWithBodyId::FunctionId(function(&db, "refused_pattern"));
+        let infer = InferenceResult::of(&db, InferBodyId::DefWithBodyId(def));
+        assert!(infer.has_type_mismatches(), "`&uniq x` matches a `&u32`");
     });
 }
 

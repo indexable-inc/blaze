@@ -846,6 +846,14 @@ fn a_token_keeps_its_crates_syntax_extensions_through_a_macro() {
     let (matched, dump, errors) = expanded_across(none, passed, both, "&uniq n");
     assert!(matched && errors == 0 && has_uniq_keyword(&dump), "{dump}");
 
+    // A `$p:pat` fragment: `&uniq x` is a pattern of a caller with the gate only.
+    let pattern = "($p:pat) => { fn f() { let $p = r; } };";
+    let (matched, dump, errors) = expanded_across(none, pattern, Extensions::UNIQ, "&uniq x");
+    assert!(matched && errors == 0 && has_uniq_keyword(&dump), "{dump}");
+    assert!(dump.contains("REF_PAT"), "{dump}");
+    let (matched, _, _) = expanded_across(Extensions::UNIQ, pattern, none, "&uniq x");
+    assert!(!matched, "`&uniq x` is no pattern in a crate without the gate");
+
     // Each extension by itself turns on its own form only.
     let borrow = "($e:expr) => { fn f() { let r = &uniq $e; } };";
     let (_, dump, errors) = expanded_across(Extensions::UNIQ, borrow, none, "n");

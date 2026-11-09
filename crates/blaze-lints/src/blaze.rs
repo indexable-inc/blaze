@@ -1021,7 +1021,7 @@ impl Lint {
                 "write `#[blaze::nonblocking]` above the function (`blaze check --fix` does); or say why it stays unmarked with `#[expect(blaze::unmarked_nonblocking, reason = \"..\")]`"
             }
             Lint::MutRef => {
-                "spell the unique reference `&uniq` (`ref uniq` in a pattern), as `blaze check --fix` does; or say why with `#[expect(blaze::mut_ref, reason = \"..\")]`"
+                "spell the unique reference `&uniq` (`ref uniq` in a binding), as `blaze check --fix` does; or say why with `#[expect(blaze::mut_ref, reason = \"..\")]`"
             }
             Lint::FrozenCollection => {
                 "make the field a `Box<[T]>` (`Box<str>` for a string), built once with `into_boxed_slice()` / `into_boxed_str()`; or say why it stays growable with `#[expect(blaze::frozen_collection, reason = \"..\")]`"
@@ -1100,6 +1100,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
             | syntax::SyntaxKind::REF_EXPR
             | syntax::SyntaxKind::SELF_PARAM
             | syntax::SyntaxKind::IDENT_PAT
+            | syntax::SyntaxKind::REF_PAT
     ) {
         mut_ref::check(cx, node);
     }

@@ -1,14 +1,15 @@
 //! `mut_ref` (in `blaze::edition`, allowed by default): in a crate that says `#![blaze::uniq]`
 //! (docs/v2/plan/design/edition.md, change 10), a unique reference spelled with `mut`: `&mut T`
 //! and `&'a mut T` in a type, `&mut expr` in an expression, `&mut self` and `&'a mut self` as a
-//! receiver, and `ref mut x` in a pattern. Each is the same reference as its `uniq` spelling
+//! receiver, and `ref mut x` and `&mut pat` in a pattern. Each is the same reference as its
+//! `uniq` spelling
 //! from the syntax tree on (the parser reads `uniq` there as the `mut` token), so the fix,
 //! machine-applicable, only respells it: `mut` becomes `uniq`.
 //!
 //! An operand whose first token would keep `uniq` a name of its own (`parser`'s
 //! `grammar/uniq.rs`: `<`, `::` and `!` after it in a type, those and `.`, `{` and `#` in an
-//! expression) is put in parentheses by the fix, as that rule says to write it:
-//! `&mut <T>::new()` becomes `&uniq (<T>::new())`.
+//! expression, those of a type and `.` in a pattern) is put in parentheses by the fix, as that
+//! rule says to write it: `&mut <T>::new()` becomes `&uniq (<T>::new())`.
 //!
 //! What a macro call of the file is handed is found as the file's own code is: the arguments
 //! of `vec![..]` or `assert!(..)`, and an item under an attribute macro such as `#[test]`. A
@@ -16,8 +17,8 @@
 //! (`syntax_bridge`'s parser input), so `&uniq` there is the same reference after the fix.
 //!
 //! Not found: `let mut x` and any `mut` binding without `ref`, `mut self`, `*mut T`,
-//! `&raw mut place`, a `&mut pat` reference pattern (the gate has no `uniq` spelling of it), a
-//! `mut` already spelled `uniq`, and what a macro wrote itself (a macro's definition is token
+//! `&raw mut place`, a `&pin mut pat` reference pattern (the gate has no `uniq` spelling of
+//! it), a `mut` already spelled `uniq`, and what a macro wrote itself (a macro's definition is token
 //! trees, with no reference to find until it is expanded, and then not where it is written).
 //! In a crate without the gate the lint says nothing: `uniq` is no keyword there.
 
@@ -33,13 +34,20 @@ use crate::{check::Cx, diag::Applicability};
 const LINT: Lint = Lint::MutRef;
 
 /// The first tokens of a type after which `uniq` stays a name: a path's `<` or `::`, a type
-/// macro's `!`.
-const TYPE_GOES_ON: &[SyntaxKind] = &[T![<], T![:], T![!]];
+/// macro's `!`. A tree's token, so `::` is one token here where the grammar's rule reads its
+/// first `:`.
+const TYPE_GOES_ON: &[SyntaxKind] = &[T![<], T![:], T![::], T![!]];
 
 /// The first tokens of an expression after which `uniq` stays an expression of its own: a
-/// path's `<` or `::`, a macro call's `!`, a field's, method's or range's `.`, a struct
-/// literal's `{` and an attribute's `#`.
-const EXPR_GOES_ON: &[SyntaxKind] = &[T![<], T![:], T![!], T![.], T!['{'], T![#]];
+/// path's `<` or `::`, a macro call's `!`, a field's, method's or range's `.` (a range's
+/// operator is one token of a tree), a struct literal's `{` and an attribute's `#`.
+const EXPR_GOES_ON: &[SyntaxKind] =
+    &[T![<], T![:], T![::], T![!], T![.], T![..], T![..=], T![...], T!['{'], T![#]];
+
+/// The first tokens of a pattern after which `uniq` stays a pattern of its own: a path's `<`
+/// or `::`, a macro call's `!`, and a range's operator.
+const PAT_GOES_ON: &[SyntaxKind] =
+    &[T![<], T![:], T![::], T![!], T![.], T![..], T![..=], T![...]];
 
 /// A unique reference spelled with `mut`.
 struct Found<'t> {
@@ -56,8 +64,8 @@ struct Found<'t> {
     fixed: &'static str,
 }
 
-/// `node`, when it is a reference type, a borrow, a receiver or a `ref` binding spelled with
-/// `mut`, in a crate that says `#![blaze::uniq]`: written in the file, or handed whole to the
+/// `node`, when it is a reference type, a borrow, a receiver, a `ref` binding or a reference
+/// pattern spelled with `mut`, in a crate that says `#![blaze::uniq]`: written in the file, or handed whole to the
 /// macro call the walk is in the expansion of, where the finding and its fix are at the tokens
 /// as the file writes them.
 pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
@@ -134,6 +142,19 @@ fn found(node: ast::Node<'_>) -> Option<Found<'_>> {
             let mut_ = it.mut_token().filter(|&it| spelled_mut(it))?;
             let (written, fixed) = ("&mut self", "&uniq self");
             Some(Found { first, mut_, wrap: None, what: "the receiver", written, fixed })
+        }
+        REF_PAT => {
+            let it = ast::RefPat::cast(node)?;
+            // `&pin mut pat` has no `uniq` spelling.
+            if it.pin_token().is_some() {
+                return None;
+            }
+            let mut_ = it.mut_token().filter(|&it| spelled_mut(it))?;
+            let pat = it.pat()?.syntax();
+            let wrap = goes_on(mut_, PAT_GOES_ON).then_some(pat);
+            let first = it.amp_token()?;
+            let (written, fixed) = ("&mut", "&uniq");
+            Some(Found { first, mut_, wrap, what: "the reference pattern", written, fixed })
         }
         IDENT_PAT => {
             let it = ast::IdentPat::cast(node)?;

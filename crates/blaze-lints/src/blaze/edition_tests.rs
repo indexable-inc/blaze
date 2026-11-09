@@ -881,6 +881,52 @@ fn under_test() {
     assert!(after.contains("let mut x = 0u32;"), "{after}");
 }
 
+/// Reference patterns spelled with `mut` (over a tuple, a tuple struct and a binding), beside
+/// one already spelled `uniq`, a shared one, and a `mut` binding.
+const UNIQ_PATS: &str = r#"
+#![blaze::uniq]
+pub struct P(pub u32);
+pub fn pats(r: &uniq (u32, u32), q: &uniq P, o: Option<&uniq u32>) {
+    let &mut (ref a, _) = r;
+    let &mut P(ref b) = q;
+    if let Some(&mut c) = o { let _ = c; }
+    let _ = (a, b);
+}
+pub fn kept(r: &uniq u32, s: &u32) {
+    let &uniq d = r;
+    let &e = s;
+    let mut f = d;
+    f = e;
+    let _ = f;
+}
+"#;
+
+/// A reference pattern `&mut pat` is found and respelled `&uniq pat`, which is the same
+/// pattern (the fixed file lints clean and has no new error); `&uniq pat`, `&pat` and a `mut`
+/// binding are left alone.
+#[test]
+fn mut_ref_finds_and_fixes_reference_patterns() {
+    let found = only("mut_ref", UNIQ_PATS);
+    assert_eq!(found.matches("which `#![blaze::uniq]` spells `&uniq`").count(), 3, "{found}");
+    assert_eq!(
+        found.matches("the reference pattern in `fn pats` is spelled `&mut`").count(),
+        3,
+        "{found}"
+    );
+    assert!(!found.contains("in `fn kept`"), "{found}");
+    let after = fixed_mut_ref(UNIQ_PATS);
+    for want in [
+        "let &uniq (ref a, _) = r;",
+        "let &uniq P(ref b) = q;",
+        "if let Some(&uniq c) = o { let _ = c; }",
+        "let &uniq d = r;",
+        "let &e = s;",
+        "let mut f = d;",
+    ] {
+        assert!(after.contains(want), "{want:?} in:\n{after}");
+    }
+}
+
 /// In a crate without `#![blaze::uniq]`, `uniq` is no keyword, so `mut_ref` says nothing.
 #[test]
 fn mut_ref_is_silent_without_the_gate() {

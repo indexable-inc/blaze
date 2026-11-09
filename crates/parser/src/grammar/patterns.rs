@@ -513,7 +513,7 @@ fn wildcard_pat(p: &mut Parser<'_>) -> CompletedMarker {
 //     let &(0..=1) = ();
 // }
 /// `&pat`, `&mut pat`, `&pin const pat` and `&pin mut pat` (rustc's `parse_pat_deref`, with
-/// `parse_pin_and_mut`).
+/// `parse_pin_and_mut`), and under `#![blaze::uniq]` `&uniq pat`.
 fn ref_pat(p: &mut Parser<'_>) -> CompletedMarker {
     assert!(p.at(T![&]));
     let m = p.start();
@@ -523,8 +523,9 @@ fn ref_pat(p: &mut Parser<'_>) -> CompletedMarker {
         if !p.eat(T![mut]) {
             p.bump(T![const]);
         }
-    } else {
-        p.eat(T![mut]);
+    } else if !p.eat(T![mut]) && uniq::at_ref_pat(p) {
+        // `&uniq pat` (`#![blaze::uniq]`): the `mut` of `&mut pat`, spelled `uniq`.
+        p.bump_remap(T![mut]);
     }
     let (_, range_op) = pattern_single_r(p, PAT_RECOVERY_SET);
     ban_pat_range_if_ambiguous(p, range_op);

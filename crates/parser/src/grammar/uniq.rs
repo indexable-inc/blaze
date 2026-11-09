@@ -1,7 +1,7 @@
 //! `&uniq` and `ref uniq` (`#![blaze::uniq]`, docs/v2/plan/design/edition.md, change 10).
 //!
 //! In a crate that says `#![blaze::uniq]` ([`crate::Extensions::UNIQ`]), `uniq` is a keyword
-//! in exactly four places and an identifier everywhere else; in every other crate it is always
+//! in exactly five places and an identifier everywhere else; in every other crate it is always
 //! an identifier and the grammar is rustc's, token for token. The crate is the one whose source
 //! wrote the `uniq` token (`Parser::uniq_gate`): in a macro's expansion, the macro's crate for
 //! the macro's own tokens and the caller's for the tokens it passed, as with editions. Where
@@ -18,16 +18,22 @@
 //!   `!`, `.`, `{` and `#`, which go on with an expression `uniq` (a path, a macro call, a field
 //!   or method, a range, a struct literal) or start an attribute;
 //! - a receiver, `&uniq self` and `&'a uniq self`: `self` follows (and no `::`, as for `mut`);
-//! - a binding, `ref uniq x`: an identifier follows.
+//! - a binding, `ref uniq x`: an identifier follows;
+//! - a reference pattern, `&uniq pat`: the next token starts a pattern and is none of `<`,
+//!   `::`, `!` and `.`, which go on with a pattern `uniq` (a path, a macro call, a range from
+//!   a constant).
 //!
 //! So `&uniq` before `;`, `,`, `)`, `]`, `}`, `.`, `::`, `<`, `=`, `as` or `?` is a shared borrow
-//! of the variable `uniq`, as in rustc. Under the gate, a token that starts an expression and
-//! could also go on with `uniq` (`-`, `*`, `&`, `&&`, `|`, `||`, `(`, `[`) starts the operand:
-//! `&uniq - 1`, `&uniq * x`, `&uniq (x)` and `&uniq [0]`, which rustc reads as arithmetic on, a
-//! call of or an index into `uniq`, are unique borrows of `-1`, `*x`, `(x)` and `[0]`, and
-//! `&uniq (A)` in a type is a unique reference to `(A)`, not the `Fn`-style path `uniq(A)`: the
-//! gate is the crate's opt-in to that reading. An operand that starts with one of the tokens
-//! left out is written in parentheses: `&uniq (<T>::new())`.
+//! of the variable `uniq`, as in rustc, and in a pattern `&uniq` before `,`, `)`, `]`, `}`,
+//! `=`, `:`, `|`, `@`, `if`, `in` or `=>` is a shared reference pattern that binds `uniq`.
+//! Under the gate, a token that starts an expression and could also go on with `uniq` (`-`,
+//! `*`, `&`, `&&`, `|`, `||`, `(`, `[`) starts the operand: `&uniq - 1`, `&uniq * x`,
+//! `&uniq (x)` and `&uniq [0]`, which rustc reads as arithmetic on, a call of or an index into
+//! `uniq`, are unique borrows of `-1`, `*x`, `(x)` and `[0]`; `&uniq (A)` in a type is a
+//! unique reference to `(A)`, not the `Fn`-style path `uniq(A)`; and `&uniq (a, b)` in a
+//! pattern is a unique reference pattern over the tuple `(a, b)`, not a shared one over a
+//! tuple struct `uniq(a, b)`: the gate is the crate's opt-in to that reading. An operand that
+//! starts with one of the tokens left out is written in parentheses: `&uniq (<T>::new())`.
 
 use super::*;
 
@@ -40,6 +46,19 @@ const TYPE_GOES_ON: TokenSet = TokenSet::new(&[T![<], T![:], T![!], LIFETIME_IDE
 /// `#`.
 const EXPR_GOES_ON: TokenSet =
     TokenSet::new(&[T![<], T![:], T![!], T![.], T!['{'], T![#]]);
+
+/// The tokens after `uniq` that keep it a pattern of its own: a path's `<` or `::`, a macro
+/// call's `!`, and the `.` of a range from a constant `uniq`.
+const PAT_GOES_ON: TokenSet = TokenSet::new(&[T![<], T![:], T![!], T![.]]);
+
+/// Whether the parser, just past the `&` of a reference pattern, is at the keyword `uniq` of
+/// `&uniq pat`.
+pub(super) fn at_ref_pat(p: &Parser<'_>) -> bool {
+    p.at_contextual_kw(T![uniq])
+        && p.uniq_gate(0)
+        && !PAT_GOES_ON.contains(p.nth(1))
+        && patterns::PATTERN_FIRST.contains(p.nth(1))
+}
 
 /// Whether the parser, just past the `&` and lifetime of a reference type, is at the keyword
 /// `uniq` of `&uniq T`.

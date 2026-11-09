@@ -690,7 +690,7 @@ In `blaze::edition`, allowed by default; says nothing in a crate without `#![bla
 
 **What it catches.** In a crate that says `#![blaze::uniq]`, a unique reference spelled with
 `mut`: `&mut T` and `&'a mut T` in a type, `&mut expr` in an expression, `&mut self` and
-`&'a mut self` as a receiver, and `ref mut x` in a pattern.
+`&'a mut self` as a receiver, and `ref mut x` and `&mut pat` in a pattern.
 
 **Why it matters.** Under `#![blaze::uniq]`, `&uniq T` is `&mut T`, spelled for what it
 guarantees: no other reference to the place is live while it is. Mutation through it follows
@@ -699,15 +699,17 @@ only brings a crate to the one spelling the edition uses.
 
 **How to fix it.** `blaze check --fix`: the fix is machine-applicable and only respells `mut`
 as `uniq`. An operand that starts with `<`, `::`, `!` (or, in an expression, `.`, `{` or
-`#`) would keep `uniq` a name there, so the fix puts it in parentheses:
+`#`; in a pattern, `.`) would keep `uniq` a name there, so the fix puts it in parentheses:
 `&mut <T>::new()` becomes `&uniq (<T>::new())`.
 
 **The gate.** `#![blaze::uniq]`, written as itself among the crate root's leading inner
-attributes (not through `cfg_attr` or a macro), makes `uniq` a keyword in exactly those four
+attributes (not through `cfg_attr` or a macro), makes `uniq` a keyword in exactly those five
 places, told by the token after it: `&uniq;`, `&uniq.x`, `&uniq::X`, `&uniq<T>` and
-`&uniq!()` stay a variable, path or macro named `uniq`. Under the gate `&uniq (x)`, `&uniq [0]`,
-`&uniq - 1` and `&uniq * x` are unique borrows of the operand, where rustc would read a call,
-an index or arithmetic on `uniq`. Types print as `&uniq T` in the crate's diagnostics. Without
+`&uniq!()` stay a variable, path or macro named `uniq`, and in a pattern `&uniq =`, `&uniq,`
+and `&uniq::X` stay a shared reference pattern that binds or names `uniq`. Under the gate
+`&uniq (x)`, `&uniq [0]`, `&uniq - 1` and `&uniq * x` are unique borrows of the operand, where
+rustc would read a call, an index or arithmetic on `uniq`, and the pattern `&uniq (a, b)` is a
+unique reference pattern over a tuple, where rustc would read a tuple struct `uniq`. Types print as `&uniq T` in the crate's diagnostics. Without
 the gate, `&uniq T` is the syntax error it is in rustc.
 
 **In macros.** A token is parsed under the gate of the crate whose source wrote it, wherever
@@ -718,8 +720,8 @@ finds what a macro call of the file is handed (a call's arguments, an item under
 macro) as it finds the file's other code.
 
 **Not found.** `let mut x` and any `mut` binding without `ref`, `mut self`, `*mut T`,
-`&raw mut place`, a `&mut pat` reference pattern (which has no `uniq` spelling), a reference
-already spelled `uniq`, and what a macro's definition writes (token trees, respelled by
+`&raw mut place`, a `&pin mut pat` reference pattern (which has no `uniq` spelling), a
+reference already spelled `uniq`, and what a macro's definition writes (token trees, respelled by
 hand).
 
 **Allowing it.** `#[expect(blaze::mut_ref, reason = "..")]` on the function or item.

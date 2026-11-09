@@ -107,8 +107,8 @@ pub struct Extensions {
 impl Extensions {
     /// No extension: Rust's syntax.
     pub const NONE: Extensions = Extensions { bits: 0 };
-    /// `#![blaze::uniq]`: `&uniq T`, `&'a uniq T`, `&uniq expr`, `&uniq self` and
-    /// `ref uniq x` are the unique reference, spelled for what it guarantees; each is exactly
+    /// `#![blaze::uniq]`: `&uniq T`, `&'a uniq T`, `&uniq expr`, `&uniq self`, `ref uniq x`
+    /// and the pattern `&uniq pat` are the unique reference, spelled for what it guarantees; each is exactly
     /// its `mut` spelling from the syntax tree on (docs/v2/plan/design/edition.md, change 10).
     pub const UNIQ: Extensions = Extensions { bits: 1 << 0 };
     /// `#![blaze::error_unions]`: `A | B` in type position (docs/v2/plan/design/edition.md,
