@@ -1886,6 +1886,7 @@ impl<'db> Interner for DbInterner<'db> {
             SolverTraitLangItem::ArbitrarySigned => lang_items.ArbitrarySigned,
             SolverTraitLangItem::IntFrom => lang_items.IntFrom,
             SolverTraitLangItem::IntTryFrom => lang_items.IntTryFrom,
+            SolverTraitLangItem::ErrorUnionFrom => lang_items.ErrorUnionFrom,
             SolverTraitLangItem::ReflectEnum => lang_items.ReflectEnum,
             SolverTraitLangItem::ReflectField => lang_items.ReflectField,
             SolverTraitLangItem::ReflectFnItem => lang_items.ReflectFnItem,
@@ -1902,6 +1903,7 @@ impl<'db> Interner for DbInterner<'db> {
             SolverAdtLangItem::Poll => lang_items.Poll.map(Into::into),
             SolverAdtLangItem::DynMetadata => lang_items.DynMetadata.map(Into::into),
             SolverAdtLangItem::OwnedBox => lang_items.OwnedBox.map(Into::into),
+            SolverAdtLangItem::ErrorUnion => lang_items.ErrorUnion.map(Into::into),
         };
         AdtIdWrapper(lang_item.expect("Lang item required but not found."))
     }
@@ -1954,6 +1956,7 @@ impl<'db> Interner for DbInterner<'db> {
             ArbitrarySigned,
             IntFrom,
             IntTryFrom,
+            ErrorUnionFrom,
             ReflectEnum,
             ReflectField,
             ReflectFnItem,
@@ -2022,6 +2025,7 @@ impl<'db> Interner for DbInterner<'db> {
             ArbitrarySigned,
             IntFrom,
             IntTryFrom,
+            ErrorUnionFrom,
             ReflectEnum,
             ReflectField,
             ReflectFnItem,
@@ -2074,6 +2078,7 @@ impl<'db> Interner for DbInterner<'db> {
             Poll,
             DynMetadata,
             OwnedBox,
+            ErrorUnion,
         )
     }
 

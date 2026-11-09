@@ -417,7 +417,7 @@ fn candidate_of(tag: u8, bits: u64) -> Option<CandidateId> {
 }
 
 /// Every [`Adjust`], by its code.
-const ADJUSTS: [Adjust; 16] = [
+const ADJUSTS: [Adjust; 17] = [
     Adjust::NeverToAny,
     Adjust::Deref(None),
     Adjust::Deref(Some(OverloadedDeref(Mutability::Not))),
@@ -438,6 +438,7 @@ const ADJUSTS: [Adjust; 16] = [
     Adjust::Pointer(PointerCast::MutToConstPointer),
     Adjust::Pointer(PointerCast::ArrayToPointer),
     Adjust::Pointer(PointerCast::Unsize),
+    Adjust::ErrorUnion,
 ];
 
 fn adjust_code(adjust: &Adjust) -> u8 {
@@ -462,6 +463,7 @@ fn adjust_code(adjust: &Adjust) -> u8 {
         Adjust::Pointer(PointerCast::MutToConstPointer) => 13,
         Adjust::Pointer(PointerCast::ArrayToPointer) => 14,
         Adjust::Pointer(PointerCast::Unsize) => 15,
+        Adjust::ErrorUnion => 16,
     }
 }
 
@@ -1033,7 +1035,8 @@ impl Persist for InferenceRecord {
         // 25: `comptime_loops`, after the named pattern types in the side table words.
         // 26: `SolverDiagnosticKind::ReflectedMemberUnmet` (solver kind 9).
         // 27: `InferenceDiagnostic::PrivateField::at`, an `offset_of!` field's position.
-        Part::U64(27),
+        // 28: `Adjust::ErrorUnion` (adjust code 16).
+        Part::U64(28),
         Part::Schema(<InferRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = InferenceRecordRef<'a>;

@@ -33,9 +33,14 @@ rust-src https://static.rust-lang.org/dist/2026-10-27/rust-src-nightly.tar.xz a9
 # - core/src/error_union.rs (new) with its `pub mod error_union;` in core/src/lib.rs: the type
 #   of blaze's error unions `A | B` (`#![blaze::error_unions]`), `ErrorUnion<M>` over a tuple
 #   of members (`#[lang = "error_union"]`, which hir-ty lowers a union to), the trait `Members`
-#   and the enums `Of2`..`Of12` that hold one member's value, and `Debug`, `Display` and `Error`
-#   by delegation to the member held. Unstable under `blaze_error_unions`; nothing else in
-#   library/ refers to it.
+#   and the enums `Of2`..`Of12` that hold one member's value; `Debug`, `Display`, `Error`,
+#   `Clone` and `Hash` by delegation to the member held; and the widening of a member or a
+#   subset union into a union: the marker `UnionFrom<S>` (`#[lang = "error_union_from"]`,
+#   `#[rustc_deny_explicit_impl]`, answered only by blaze's trait solver, its `Path` saying
+#   where each value goes), `Inject<S, P>` over those paths, `widen` (`#[lang =
+#   "error_union_widen"]`, which a coercion to a union calls) and a blanket `From<S>` for a
+#   union over them, which no type but an error union can satisfy. Unstable under
+#   `blaze_error_unions`; nothing else in library/ refers to it.
 # - core/src/blaze.rs (new) with its `pub mod blaze;` in core/src/lib.rs: blaze's own attribute
 #   macros, `contract_test` (`#[rustc_builtin_macro]`, expanded by blaze's `hir-expand`), which
 #   the attribute path `blaze::contract_test` names in every crate. Unstable under

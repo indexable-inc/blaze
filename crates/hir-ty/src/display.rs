@@ -1474,6 +1474,22 @@ impl<'db> Ty<'db> {
                     ret.hir_fmt(f)?;
                 }
             }
+            // blaze: an error union (`#![blaze::error_unions]`) prints as it is written, its
+            // members in their canonical order.
+            TyKind::Adt(def, parameters)
+                if f.lang_items()
+                    .ErrorUnion
+                    .is_some_and(|it| def.def_id() == hir_def::AdtId::StructId(it))
+                    && matches!(
+                        parameters.types().next().map(|it| it.kind()),
+                        Some(TyKind::Tuple(_))
+                    ) =>
+            {
+                if let Some(TyKind::Tuple(members)) = parameters.types().next().map(|it| it.kind())
+                {
+                    f.write_joined(members.as_slice(), " | ")?;
+                }
+            }
             TyKind::Adt(def, parameters) => {
                 let def_id = def.def_id();
                 match f.display_kind {

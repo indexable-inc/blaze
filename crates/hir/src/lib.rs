@@ -6633,6 +6633,8 @@ pub enum Adjust {
     /// Take the address and produce either a `&` or `*` pointer.
     Borrow(AutoBorrow),
     Pointer(PointerCast),
+    /// blaze: a member, or a union of some members, put in the error union that is the target.
+    ErrorUnion,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -6661,6 +6663,7 @@ impl From<hir_ty::Adjust> for Adjust {
                 Adjust::Borrow(AutoBorrow::Ref(hir_ty::hir_mutability(m.into())))
             }
             hir_ty::Adjust::Pointer(pc) => Adjust::Pointer(pc),
+            hir_ty::Adjust::ErrorUnion => Adjust::ErrorUnion,
         }
     }
 }

@@ -544,6 +544,12 @@ language_item_table! { LangItems =>
     /// The type of blaze's error unions `A | B` (`#![blaze::error_unions]`): core's
     /// `error_union::ErrorUnion<(A, B)>`, which hir-ty lowers a union to.
     ErrorUnion,              sym::error_union,         StructId;
+    /// `U: UnionFrom<S>`: `U` is an error union and `S` one of its members or a union of some
+    /// of them; the solver answers it and its `Path`, never an impl.
+    ErrorUnionFrom,          sym::error_union_from,    TraitId;
+    /// `core::error_union::widen::<S, U>`, the conversion a coercion of a member or a smaller
+    /// union to an error union calls.
+    ErrorUnionWiden,         sym::error_union_widen,   FunctionId;
 
     Freeze,                  sym::freeze,              TraitId;
 

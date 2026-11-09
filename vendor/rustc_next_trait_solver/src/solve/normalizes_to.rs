@@ -1150,6 +1150,32 @@ where
     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
         panic!("the `#[blaze::arbitrary_ints]` markers have no associated types: {:?}", goal)
     }
+
+    /// blaze: `<U as UnionFrom<S>>::Path`, `UnionFrom`'s one associated type: where each value
+    /// of `S` goes in the error union `U` ([`EvalCtxt::error_union_from`]). Of any other self
+    /// type there is no candidate, so a generic `<U as UnionFrom<S>>::Path` stays rigid.
+    fn consider_builtin_error_union_from_candidate(
+        ecx: &mut EvalCtxt<'_, D>,
+        goal: Goal<I, Self>,
+    ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
+        use crate::solve::error_union::{UnionFrom, error_union_members};
+
+        let Some(members) = error_union_members(ecx.cx(), goal.predicate.self_ty()) else {
+            return Err(NoSolution.into());
+        };
+        let source = goal.predicate.alias.args.type_at(1);
+        ecx.probe_builtin_trait_candidate(BuiltinImplSource::Misc).enter(|ecx| {
+            match ecx.error_union_from(goal.param_env, members, source)? {
+                UnionFrom::Holds(path) => {
+                    ecx.instantiate_normalizes_to_term(goal, path.into())?;
+                    ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
+                }
+                UnionFrom::Ambiguous => {
+                    ecx.evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS)
+                }
+            }
+        })
+    }
 }
 
 impl<D, I> EvalCtxt<'_, D>

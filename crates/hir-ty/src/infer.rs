@@ -1141,6 +1141,10 @@ pub enum Adjust {
     /// Take the address and produce either a `&` or `*` pointer.
     Borrow(AutoBorrow),
     Pointer(PointerCast),
+    /// blaze (`#![blaze::error_unions]`): a value of a member of the error union that is the
+    /// target, or of a union of some of its members, put in the union by a call of
+    /// `core::error_union::widen` (lang item `error_union_widen`). A value, never a place.
+    ErrorUnion,
 }
 
 /// An overloaded autoderef step, representing a `Deref(Mut)::deref(_mut)`
