@@ -446,6 +446,9 @@ enum Row {
     User(String, bool),
     /// The pictures the person sent with a message, over its words (absolute paths); true when no words came with them.
     Pictures(Vec<String>, bool),
+    /// A pull request or issue said on its own (its source, `<PR …/>`): its card, filled as its hover card is
+    /// (chat/peek.rs fill_card).
+    RefCard(String),
     Prose(String),
     Heading(u8, String),
     ListItem { depth: usize, mark: String, text: String },
@@ -477,6 +480,7 @@ impl Row {
             Row::User(_, true) => "hn.ChatUserUnder",
             Row::Pictures(_, false) => "hn.ChatSentPictures",
             Row::Pictures(_, true) => "hn.ChatSentPicturesLast",
+            Row::RefCard(_) => "hn.ChatRefCard",
             Row::Prose(_) => "hn.ChatProse",
             Row::Heading(1, _) => "hn.ChatH1",
             Row::Heading(2, _) => "hn.ChatH2",
@@ -518,7 +522,9 @@ fn blocks(md: &str, live: bool, out: &mut Vec<Row>) {
     let mut para: Vec<&str> = Vec::new();
     let flush = |para: &mut Vec<&str>, out: &mut Vec<Row>| {
         if !para.is_empty() {
-            out.push(Row::Prose(lines_of(para.iter().copied())));
+            let words = lines_of(para.iter().copied());
+            // A pull request or issue said on its own is the thing itself: its card, not a chip in a sentence.
+            out.push(if !live && alone_ref(&words) { Row::RefCard(words) } else { Row::Prose(words) });
             para.clear();
         }
     };
@@ -645,6 +651,18 @@ fn md_table(t: &harness_native_render::markdown::Table) -> view::table::Table {
         .map(|r| r.iter().map(|c| Cell::new(if number(c) { Kind::Number } else { Kind::Markdown }, c.as_str())).collect())
         .collect();
     view::table::Table { cols, rows, head: true }
+}
+
+/// Whether paragraph `words` is one `<PR …/>` or `<Issue …/>` and nothing else: the component's block form, its card
+/// (hn.ChatRefCard), where in a sentence it is its chip.
+fn alone_ref(words: &str) -> bool {
+    let w = words.trim();
+    let m = harness_native_render::markdown::inline(w);
+    m.tags.len() == 1
+        && matches!(m.tags[0].tag.name.as_str(), "PR" | "Issue")
+        && w.starts_with('<')
+        && (w.ends_with("/>") || w.ends_with("</PR>") || w.ends_with("</Issue>"))
+        && w.matches('<').count() == 1 + usize::from(w.ends_with('>') && !w.ends_with("/>"))
 }
 
 /// A list item's mark (`•` for a bullet, `3.` for a number) and its words.
@@ -1061,7 +1079,7 @@ fn texts(r: &Row) -> Vec<(&'static [&'static str], String, bool)> {
         Row::Note(s) | Row::Error(s) => vec![(&["text"], s.clone(), false)],
         Row::Steps(l) => vec![(&["head", "words"], l.words.clone(), false)],
         Row::Out(o) => o.texts(),
-        Row::Tool { .. } | Row::Thinking { .. } | Row::Grid { .. } | Row::Table(_) | Row::Ui { .. } | Row::Pictures(..) => Vec::new(),
+        Row::Tool { .. } | Row::Thinking { .. } | Row::Grid { .. } | Row::Table(_) | Row::Ui { .. } | Row::Pictures(..) | Row::RefCard(_) => Vec::new(),
     }
 }
 
@@ -1104,6 +1122,7 @@ impl Row {
         Some(match self {
             Row::User(s, _) | Row::Prose(s) | Row::Note(s) | Row::Error(s) => s.clone(),
             Row::Pictures(images, _) => images.iter().map(|p| format!("![image]({p})")).collect::<Vec<_>>().join("\n"),
+            Row::RefCard(src) => src.clone(),
             Row::Heading(n, s) => format!("{} {s}", "#".repeat(usize::from(*n))),
             Row::ListItem { depth, mark, text } => {
                 let mark = match mark.as_str() {
@@ -1366,6 +1385,8 @@ impl App {
         }
         // A run's rows sit in from its line by `chat_nest` (each row's own padding, from its prefab, plus that).
         let nest_by = view::prefab(w, "hn.ChatNest").and_then(|p| p.try_cloned::<&harness_native_ui_layout_api::Padding>()).map_or(0.0, |p| p.l);
+        // The pull request and issue cards in view, filled after the stack (their rows' entities, their rows).
+        let mut cards: Vec<(u64, usize)> = Vec::new();
         if let Some(list) = pv.part("list")
             && let Some(stack) = list.part("rows")
         {
@@ -1379,6 +1400,9 @@ impl App {
             let rows_open = &st.rows_open;
             let sizes = &st.sizes;
             let fresh_rows = |row: View<'_>, i: usize, new: bool| {
+                if matches!(rows[i].1, Row::RefCard(_)) {
+                    cards.push((row.id(), i)); // alloc: the cards in view, this frame
+                }
                 if new {
                     row.set(HoverAmt::default());
                     if let Some(h) = row.part("head") {
@@ -1462,6 +1486,14 @@ impl App {
             .try_cloned::<&model::Cwd>()
             .map_or_else(|| std::env::var("HOME").unwrap_or_default(), |c| c.s.as_str().to_owned());
         self.fill_chat_peek(pv, st, t, &rows, focused, &cwd);
+        // Each card in view as its hover card would be: the same lines, from the same answers.
+        for (id, i) in cards {
+            let Row::RefCard(src) = &rows[i].1 else { continue };
+            let Some(tag) = harness_native_render::markdown::inline(src).tags.into_iter().next() else { continue };
+            if let Some(card) = View::of(w.entity_from_id(id)).part("card") {
+                self.fill_card(card, st, &tag.tag, &cwd);
+            }
+        }
         self.fill_chat_mention(pv, sid, st, &cwd, focused);
         let ended = self.status_of(e) != "running";
         // The pictures pasted into the message, over its words, each with its remove button.
@@ -2678,6 +2710,8 @@ fn fill_row(row: View<'_>, r: &Row, ctx: &RowCtx<'_>, measure: &mut Measure<'_>)
                 t.text(s);
             }
         }
+        // Filled by the app after the stack (chat/peek.rs fill_card), as a hover card is.
+        Row::RefCard(_) => {}
         Row::Pictures(images, _) => {
             let h = crate::look::width(row.entity().world(), "chat_sent_tall");
             fill_pictures(row, images, ctx.sizes, h, "hn.ChatSentPicture", None);
@@ -3112,6 +3146,22 @@ mod tests {
         let (all, nested) = rows_nested(&t, Shows { fold: &open, cut: &cut, all: false });
         assert!(all.iter().any(|(k, r)| matches!(r, Row::Steps(_)) && k.starts_with("run:") && nested.contains(k)), "opened, its run shows nested");
         assert_eq!(all.last().map(|(_, r)| r.prefab()), Some("hn.ChatProse"), "the answer stays last");
+    }
+
+    /// A pull request or issue said alone, as its own paragraph once its words are whole, is its card; in a sentence, or
+    /// next to other words, it stays a chip in the prose.
+    #[test]
+    fn a_ref_alone_is_its_card() {
+        let mut out = Vec::new();
+        blocks("Landed it:\n\n<PR repo=\"indexable-inc/blaze\" n={1904} />\n\nSee <PR repo=\"a/b\" n={2} /> too.", false, &mut out);
+        let kinds: Vec<&str> = out.iter().map(Row::prefab).collect();
+        assert_eq!(kinds, ["hn.ChatProse", "hn.ChatRefCard", "hn.ChatProse"], "{kinds:?}");
+        assert!(alone_ref("<Issue repo=\"a/b\" n={3}>the bug</Issue>"));
+        assert!(!alone_ref("<PR repo=\"a/b\" n={1} /> and <PR repo=\"a/b\" n={2} />"));
+        assert!(!alone_ref("<Path loc=\"/x\" />"), "only a pull request or issue has a card");
+        let mut live = Vec::new();
+        blocks("<PR repo=\"a/b\" n={1} />", true, &mut live);
+        assert_eq!(live.iter().map(Row::prefab).collect::<Vec<_>>(), ["hn.ChatProse"], "still streaming, a chip until it is whole");
     }
 
     #[test]

@@ -216,7 +216,12 @@ impl App {
             let mut places: Vec<(String, String, EntityView<'_>)> = Vec::new(); // alloc: this pass's places
             let mut live = self.peek_live.borrow_mut();
             for (_, r) in rows {
-                for (_, src, md) in texts(r) {
+                // A card's component is asked after as a chip's is.
+                let card = match r {
+                    Row::RefCard(src) => Some((&[] as &[&str], src.clone(), true)),
+                    _ => None,
+                };
+                for (_, src, md) in texts(r).into_iter().chain(card) {
                     if !md {
                         continue;
                     }
@@ -416,7 +421,7 @@ impl App {
     /// The card's lines for `tag`: what the link knows of its GitHub item, its page, or the file or folder it names (a
     /// relative one from `cwd`, the session's directory). A link's card carries its page's [`PageView`] (the live view's
     /// seam), and its live view line only once a browser host made one.
-    fn fill_card(&self, card: View<'_>, st: &mut ChatState, tag: &Tag, cwd: &str) {
+    pub(super) fn fill_card(&self, card: View<'_>, st: &mut ChatState, tag: &Tag, cwd: &str) {
         let w = self.world.world_ref();
         let dark = self.chat_dark();
         let mut lines: Vec<(&'static str, &'static str, Line)> = Vec::new(); // alloc: a handful of lines, while it is up

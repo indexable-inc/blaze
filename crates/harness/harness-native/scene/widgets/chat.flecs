@@ -442,6 +442,24 @@ hn {
     Shape: {radius: $chat_attach_radius, n: 4, border: 0, feather: 0}
   }
 
+  // A pull request or issue said on its own in the agent's words: the component's block form, its card in the flow of
+  // the words (src/app/chat.rs Row::RefCard). The same lines as its hover card (chat/peek.rs fill_card: where it is,
+  // its title, its state and checks, who and how much, its description's start) on a solid card, chat_ref_w wide at
+  // most; in the flow, so solid: glass is only for what floats.
+  prefab ChatRefCard : ui.Row {
+    Flex: {axis: Row, gap: 0, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 0, r: 0, t: $chat_block_half, b: $chat_block_half}
+    card : ui.Column {
+      Fill: $tone_card
+      Edge: {dark: $tone_line.dark, light: $tone_line.light}
+      Shape: {radius: $inline_peek_radius, n: 4, border: 1, feather: 0}
+      Flex: {axis: Column, gap: $inline_peek_gap, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: $chat_ref_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      Padding: {l: $inline_peek_pad, r: $inline_peek_pad, t: $inline_peek_pad, b: $inline_peek_pad}
+    }
+  }
+
   // A paragraph of the agent's words (inline markdown): the body ink, bold a semibold step in the strong ink, inline code
   // in the code face in the site's coral on its faint plate.
   prefab ChatProse : ui.Column {

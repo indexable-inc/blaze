@@ -745,6 +745,8 @@ export const tone_gh_ci_pending: Fill = {dark: {0.824, 0.600, 0.133, 1}, light: 
 // inline_peek_check_gap apart and inline_peek_check_pad in from its wash's ends (inline_peek_check_radius round).
 export const inline_peek_dwell_s = 0.35
 export const inline_peek_w = 360
+// A pull request or issue said on its own: its card in the words (hn.ChatRefCard), at most this wide.
+export const chat_ref_w = 520
 export const inline_peek_pad = 12
 export const inline_peek_gap = 6
 export const inline_peek_image_h = 160
