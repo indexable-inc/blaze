@@ -137,6 +137,9 @@ impl DefMap {
                         // `#![blaze::arbitrary_ints]`, from `DefMap::arbitrary_ints`
                         // (docs/v2/plan/design/arbitrary-ints.md).
                         | "arbitrary_ints"
+                        // `#![blaze::views]`, from `DefMap::views`
+                        // (`hir_ty_borrowck::views`, docs/v2/plan/design/edition.md).
+                        | "views"
                         // `#[blaze::reflect]`, from `AttrFlags::BLAZE_REFLECT`
                         // (`hir_ty_comptime::struct_domain`, docs/v2/plan/design/comptime.md).
                         | "reflect"

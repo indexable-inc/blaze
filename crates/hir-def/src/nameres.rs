@@ -381,6 +381,9 @@ struct DefMapCrateData {
     /// blaze: `#![blaze::arbitrary_ints]`, under which `u1`..`u128` and `i1`..`i128` are
     /// primitive integer types (docs/v2/plan/design/arbitrary-ints.md).
     arbitrary_ints: bool,
+    /// blaze: `#![blaze::views]`, under which a method's receiver may name the fields it
+    /// borrows, `&self.{a, b}` (docs/v2/plan/design/edition.md, change 3).
+    views: bool,
 
     edition: Edition,
     recursion_limit: Option<u32>,
@@ -400,6 +403,7 @@ impl DefMapCrateData {
             no_std: false,
             proc_macro: false,
             arbitrary_ints: false,
+            views: false,
             edition,
             recursion_limit: None,
         }
@@ -417,6 +421,7 @@ impl DefMapCrateData {
             no_std: _,
             proc_macro: _,
             arbitrary_ints: _,
+            views: _,
             edition: _,
             recursion_limit: _,
         } = self;
@@ -1167,6 +1172,13 @@ impl DefMap {
     #[inline]
     pub fn arbitrary_ints(&self) -> bool {
         self.data.arbitrary_ints
+    }
+
+    /// Whether the crate says `#![blaze::views]`: a method's receiver may name the fields it
+    /// borrows, and a private method's are inferred from its body (`hir_ty_borrowck::views`).
+    #[inline]
+    pub fn views(&self) -> bool {
+        self.data.views
     }
 
     /// The integer of an arbitrary width `name` names in this crate, as the builtin scope's

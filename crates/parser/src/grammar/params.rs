@@ -266,12 +266,40 @@ fn opt_self_param(p: &mut Parser<'_>, m: Marker) -> Result<(), Marker> {
         }
         p.eat(T![mut]);
         self_as_name(p);
+        if p.at(T![.]) && p.nth_at(1, T!['{']) {
+            self_view(p);
+        }
     }
     m.complete(p, SELF_PARAM);
     if !p.at(T![')']) {
         p.expect(T![,]);
     }
     Ok(())
+}
+
+/// `#![blaze::views]`'s view of a receiver, `&self.{a, b}` or `&mut self.{a}`: the fields of
+/// `Self` the method borrows (docs/v2/plan/design/edition.md, change 3). The `.`, the braces
+/// and a `NAME_REF` per field are children of the `SELF_PARAM`. Parsed in every crate, as
+/// blaze_verify's clauses are: no Rust program has a `.` after a `self` parameter, so every
+/// program rustc parses parses as before, and the borrow check refuses a view in a crate
+/// without the attribute (`hir_ty_borrowck::views`).
+fn self_view(p: &mut Parser<'_>) {
+    p.bump(T![.]);
+    p.bump(T!['{']);
+    while !p.at(EOF) && !p.at(T!['}']) {
+        if p.at(IDENT) {
+            let m = p.start();
+            p.bump(IDENT);
+            m.complete(p, NAME_REF);
+        } else {
+            p.err_and_bump("expected a field name in the view of `self`");
+            continue;
+        }
+        if !p.at(T!['}']) && !p.expect(T![,]) {
+            break;
+        }
+    }
+    p.expect(T!['}']);
 }
 
 fn self_as_name(p: &mut Parser<'_>) {

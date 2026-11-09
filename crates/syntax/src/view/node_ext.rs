@@ -860,6 +860,13 @@ impl<'t> ast::SelfParam<'t> {
             SelfParamKind::Owned
         }
     }
+
+    /// `#![blaze::views]`'s view, `&self.{a, b}`: the fields written, or `None` for a receiver
+    /// written without one.
+    pub fn view_fields(self) -> Option<AstChildren<'t, ast::NameRef<'t>>> {
+        support::token(self.syntax, T![.])?;
+        Some(support::children(self.syntax))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
