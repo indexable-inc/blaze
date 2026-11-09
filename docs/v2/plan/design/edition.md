@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: The blaze edition. Rust with nine opt-in changes (handles that copy themselves, error unions, view types, records, contexts, effects at the border, values that must be used up, contracts and pattern types, compile-time reflection), what it removes, the lints that get a crate ready for it, and the order it is built in.
+summary: The blaze edition. Rust with ten opt-in changes (handles that copy themselves, error unions, view types, records, contexts, effects at the border, values that must be used up, contracts and pattern types, compile-time reflection, `&uniq`), what it removes, the lints that get a crate ready for it, and the order it is built in.
 date: 2026-11-09
 ---
 # The blaze edition
@@ -27,7 +27,7 @@ Three tests decide what goes in:
    functions and written on every `pub` one.
 3. **Each addition deletes something**: a pattern, a crate or a tool people use today.
 
-## The nine changes
+## The ten changes
 
 Each is its own feature attribute first (`#![blaze::handles]`, ...), usable in any crate, and the
 edition turns them all on. The spec column is where the design lives; this page does not repeat
@@ -44,6 +44,7 @@ it.
 | 7 | **Values that must be used up.** A `#[blaze::linear]` value cannot be dropped; every path hands it to a function that takes it by value. | forgotten commits, drop bombs | [linear](linear.md) | medium |
 | 8 | **Contracts and pattern types.** `requires` and `ensures` on a function; `usize is 1..` puts a range in the type. | preconditions in doc comments, restated checks | [contracts](contracts.md) | small |
 | 9 | **Compile-time reflection.** `for const f in fields_of::<T>()` in ordinary typed code. | most derive proc macros | [comptime](comptime.md) | large |
+| 10 | **`&uniq T`.** The unique reference is spelled for what it guarantees. `&mut T` means the same and is the old spelling. | the belief that `&` means immutable and `&mut` means mutable | here | small |
 
 ### Rules for the four that have no spec yet
 
@@ -92,6 +93,18 @@ the same under the edition. `with x = expr { .. }` binds for a block. A function
 closure type and a `dyn` method carry their contexts in their type. `main` is
 `fn main() with cx: &Cx, io: Io`.
 
+**10. `&uniq`.**
+- `&uniq T`, `&uniq self`, `&uniq expr` and `ref uniq` in patterns are exactly `&mut T`,
+  `&mut self`, `&mut expr` and `ref mut`: the same type, so code in the two spellings mixes
+  freely, across crates too. `uniq` is a keyword only in those positions.
+- What `&` and `&uniq` promise is aliasing: shared, or unique. Whether the target can change
+  follows from that (unique: yes; shared: only through a cell or a lock), which is why
+  `&Atomic<u32>` can be written to and the old names mislead.
+- `let mut x` stays: it says the binding may be reassigned or borrowed uniquely, which is a
+  different thing. `*mut T` and `*const T` stay.
+- Diagnostics and docs say "shared" and "unique" in every crate; under the gate they print
+  `&uniq`.
+
 ## What the edition removes
 
 Each is a hard error in the edition and a lint (below) in any crate before it.
@@ -104,6 +117,7 @@ Each is a hard error in the edition and a lint (below) in any crate before it.
 | the global allocator | an allocator the code was handed |
 | global mutable state: `static mut`, a `static` with interior mutability, thread-locals | a value someone owns and passes, or a context |
 | `unsafe` outside the trusted list | safe code, or a reviewed entry in the list |
+| the spelling `&mut` | `&uniq` |
 | derive proc macros that reflection covers | `fields_of` and friends; proc macros stay for foreign syntax |
 
 Not touched: ownership and borrowing, traits and coherence, monomorphization, enums and `match`,
@@ -124,6 +138,7 @@ is an error. Where a mechanical fix exists, `blaze check --fix` applies it.
 | `blaze::ambient` | reaching ambient IO (the effect of [std](std.md)) | none: names the capability to take |
 | `blaze::global_alloc` | allocating from the global heap | `new_in(..)` when an allocator is in scope |
 | `blaze::untrusted_unsafe` | `unsafe` outside the trusted list | none |
+| `blaze::mut_ref` | `&mut` and `ref mut` where `&uniq` is available | rewrites to `&uniq` and `ref uniq` |
 | `blaze::handle_clone` | `.clone()` on a `Handle` (once change 1 exists) | removes it |
 | `blaze::error_wrapper` | an error enum that is only `From` variants (once change 2 exists) | rewrites to a union |
 | `blaze::undeclared_effects` | a `pub` function without its effects written (once change 6 infers them) | writes the inferred ones |
@@ -143,6 +158,7 @@ Payoff per unit of compiler work, and what leans on what.
 | E3 | Error unions (change 2) and `error_wrapper` | nothing |
 | E4 | View types (change 3) | nothing |
 | E5 | Records and named arguments (change 4) | nothing |
+| E5b | `&uniq` (change 10) and `mut_ref` with its fix; blaze's own crates rewritten by the fix | nothing |
 | E6 | Contexts (change 5): the `with` clause over bstd's parameters | S1, S2 of [std](std.md) |
 | E7 | Effects inferred and declared at the border; closures pass their effects through; `async` removed for crates on fibers (change 6) | E6 |
 | E8 | Linear values, contracts and pattern types, reflection (changes 7 to 9), each finishing its own spec | their specs |
