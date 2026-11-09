@@ -16,7 +16,7 @@ use harness_native_ui_look_api::{Edge, Fill, HoverInk, HoverLook, Lift, MathLook
 use harness_native_ui_motion_api::{CopyFlash, Pose};
 use harness_native_ui_node_api::Laid;
 use harness_native_ui_text_api::{
-    BlazeMark, Caret, Drawing, Frames, Highlight, Kip, Mark, MarkdownText, OneLine, Picture, Pixelated, Surface, Text, TextRange,
+    BlazeMark, Caret, Drawing, Frames, Highlight, Kip, Mark, MarkdownText, OneLine, Picture, PixelBlock, Pixelated, Surface, Text, TextRange,
     TextEdit, Truncate, TruncateMode, Vector, VectorFit, VectorText,
 };
 use harness_native_ui_timeline_api::{GlyphsArrive, GlyphsIn};
@@ -63,6 +63,10 @@ pub struct Painter {
     sheets: HashMap<String, Rc<Sheet>>,
     /// Each `BlazeMark` node's fire, by entity and appearance: its automaton runs on from frame to frame.
     marks: HashMap<(u64, bool), harness_native_blaze::mark::Blaze>,
+    /// Each `PixelBlock` node's turn (block.rs).
+    blocks: crate::block::Blocks,
+    /// A block painted in the last frame is still turning ([`Painter::end_frame`]): the host draws another.
+    pub turning: bool,
     /// Each `Kip` node's mascot, stepped while it is painted (kips.rs).
     kips: crate::kips::Kips,
     /// What the Kips painted in the last frame want next ([`Painter::end_frame`]).
@@ -308,6 +312,8 @@ impl Painter {
             widths: HashMap::new(),
             sheets: HashMap::new(),
             marks: HashMap::new(),
+            blocks: crate::block::Blocks::default(),
+            turning: false,
             kips: crate::kips::Kips::default(),
             kip_wake: crate::kips::Wake::None,
             paths: HashMap::new(),
@@ -506,6 +512,7 @@ impl Painter {
     /// After a frame: an overflowed atlas is emptied (true: draw again, its glyphs are gone) and a big layout cache dropped.
     pub fn end_frame(&mut self) -> bool {
         self.kip_wake = self.kips.end_frame();
+        self.turning = self.blocks.end_frame();
         self.arriving = self.arrivals.end_frame();
         self.gliding = self.carets.end_frame();
         self.shimmering = std::mem::take(&mut self.sheening);
@@ -1293,6 +1300,10 @@ impl Painter {
         if let Some(k) = e.try_cloned::<&Kip>() {
             let laid = e.try_cloned::<&Laid>().map_or(rect, |l| [l.x, l.y, l.w, l.h]);
             return self.kips.paint(d, e, &k, rect, laid, alpha, dark, sc, time);
+        }
+        if let Some(b) = e.try_cloned::<&PixelBlock>() {
+            self.blocks.paint(d, e.id().0, &b, rect, alpha, sc, time);
+            return Ok(());
         }
         if let Some(m) = e.try_cloned::<&BlazeMark>() {
             let rest = e.try_cloned::<&Laid>().map_or(rect, |l| [l.x, l.y, l.w, l.h]);

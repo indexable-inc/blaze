@@ -43,6 +43,7 @@ pub const EXAMPLES: &[(&str, &str)] = &[
     ("98-ex-browser", include_str!("../scene/examples/browser.flecs")),
     ("98-ex-art", include_str!("../scene/examples/art.flecs")),
     ("98-ex-sheen", include_str!("../scene/examples/sheen.flecs")),
+    ("98-ex-block", include_str!("../scene/examples/block.flecs")),
     ("99-ex-gallery", include_str!("../scene/examples/99-gallery.flecs")),
 ];
 

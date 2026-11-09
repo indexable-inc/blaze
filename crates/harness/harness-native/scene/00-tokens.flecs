@@ -8,6 +8,8 @@
 // 2. Nothing moves on its own, and nothing eases. A hover, a highlight, a menu and a sheet are there at once and gone at
 //    once, so no two states ever show together. Work is said in words and a ticking time; the one motion left is the
 //    small status glyph's breath in a chat while something runs (it also keeps that time ticking).
+// The one exception to 1 and 2, asked for by name: the block on a running step's line (ui.Block): pixel art in its
+//    own colours, a game's item icon, that turns to a new face when the step changes and is still between turns.
 // 3. A plate only where something floats or is typed into: one hairline, no shadow, no glass, corners of 8.
 // 4. Type is the hierarchy: size, weight and ink before any box, rule or icon.
 //
@@ -161,6 +163,10 @@ export const line_row = 16
 // corners radius_row.
 export const pill_inset = 2
 export const radius_row = 6
+// ui.Block (prims.flecs): a pixel-art block block_size across (16 texels: 1.5 points each), turning to a new face over
+// block_turn seconds.
+export const block_size = 24
+export const block_turn = 0.32
 // ui.Shimmer's default Sheen (prims.flecs; harness-video's captions use the primitive, the app's own views do not: rule
 // 2): a pass of sheen_think_period seconds, then sheen_think_rest at rest; the band sheen_think_band points either side
 // of its middle, lifting the letters sheen_think_strength of the way to tone_sheen; sheen_think_ease of an ease-in-out;

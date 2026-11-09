@@ -1870,6 +1870,10 @@ impl App {
         if self.paint.get_mut().arriving {
             self.poke_why("glyphs arriving");
         }
+        // A block turning to a new face (harness-native-render block.rs): draw until it has.
+        if self.paint.get_mut().turning {
+            self.poke_why("block turning");
+        }
         // A caret that jumped sweeps into its place (harness-native-render caret.rs): draw until it has.
         if self.paint.get_mut().gliding {
             self.poke_why("caret glide");

@@ -193,6 +193,16 @@ pub struct Frames {
     pub fps: f32,
 }
 
+/// A small block of pixel art, a game's item icon: its front face a material with an emblem, named by `face` (what a
+/// step does: `exec`, `read`, `edit`, `net`, `think`, ...; harness-native-render block.rs draws each, none is a file).
+/// When `face` changes the block turns a quarter about its upright axis to the new one over `turn` seconds (0: at once);
+/// at rest it is still. A picture without a file, its texels on whole device pixels, centred in the node's box.
+#[derive(Component, Clone, Debug, Default, PartialEq)]
+pub struct PixelBlock {
+    pub face: ScriptString,
+    pub turn: f32,
+}
+
 /// blaze's wordmark set on fire (harness-native-blaze), drawn as pixel art over the node's width: its letters start
 /// falling in from the top of the view at `start` seconds on the frame clock, the fire catches a beat after the last lands,
 /// and from `exit` (when it is after `start`) the letters burn away into embers. A picture without a file. `glow` is how
@@ -358,6 +368,7 @@ hyperion_api_layouts::api_layouts! {
     "Pixelated" => alias Pixelated,
     "Frames" => alias Frames,
     "BlazeMark" => alias BlazeMark,
+    "PixelBlock" => alias PixelBlock,
     "Kip" => alias Kip,
     "KipStand" => alias KipStand,
     "Caret" => alias Caret,
@@ -391,6 +402,7 @@ pub fn register(world: &World) {
     world.component::<Pixelated>().writable();
     world.component::<Frames>().writable();
     world.component::<BlazeMark>().writable();
+    world.component::<PixelBlock>().writable();
     world.component::<Kip>().writable();
     world.component::<KipStand>().writable();
     world.component::<Caret>().writable();

@@ -128,6 +128,13 @@ hn {
       chevron : hn.StepChevron {}
     }
   }
+  // While it runs: a block showing the step it is on (ui.Block: it turns to the next step's face), and no marks yet.
+  prefab StepLineLive : hn.StepLine {
+    head : hn.StepSum {
+      block : ui.Block {}
+      chevron : hn.StepChevron {}
+    }
+  }
   prefab StepLineFailed : hn.StepLine {
     head : hn.StepSum {
       mark : hn.StepMark {}
