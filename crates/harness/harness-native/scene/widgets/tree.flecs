@@ -18,6 +18,28 @@ prefab CmdKind : Kind {
   Fill: $tone_ink_faint
 }
 
+// The sheens a working row's title sweeps with, by the pace of what it does (rows.flecs reads the one its `pace` names,
+// `hn.tree.SheenRun[Sheen]`: one reactive input each, where the tokens would be a dozen; flecs allows a script 64). Rest
+// is a sheen of strength 0, which lights nothing: the way a re-run stops one (it cannot remove it).
+prefab SheenThink {
+  Sheen: {period: $sheen_think_period, rest: $sheen_think_rest, band: $sheen_think_band, strength: $sheen_think_strength, still: $sheen_still, ease: $sheen_think_ease, bands: 1, phase: 0, scatter: true, dark: $tone_sheen.dark, light: $tone_sheen.light}
+}
+prefab SheenRun {
+  Sheen: {period: $sheen_run_period, rest: $sheen_run_rest, band: $sheen_run_band, strength: $sheen_run_strength, still: $sheen_still, ease: $sheen_run_ease, bands: 1, phase: 0, scatter: true, dark: $tone_sheen.dark, light: $tone_sheen.light}
+}
+prefab SheenEdit {
+  Sheen: {period: $sheen_edit_period, rest: $sheen_edit_rest, band: $sheen_edit_band, strength: $sheen_edit_strength, still: $sheen_still, ease: $sheen_edit_ease, bands: 1, phase: 0, scatter: true, dark: $tone_sheen.dark, light: $tone_sheen.light}
+}
+prefab SheenRead {
+  Sheen: {period: $sheen_read_period, rest: $sheen_read_rest, band: $sheen_read_band, strength: $sheen_read_strength, still: $sheen_still, ease: $sheen_read_ease, bands: 1, phase: 0, scatter: true, dark: $tone_sheen.dark, light: $tone_sheen.light}
+}
+prefab SheenAgent {
+  Sheen: {period: $sheen_agent_period, rest: $sheen_agent_rest, band: $sheen_agent_band, strength: $sheen_agent_strength, still: $sheen_still, ease: $sheen_agent_ease, bands: $sheen_agent_bands, phase: 0, scatter: true, dark: $tone_sheen.dark, light: $tone_sheen.light}
+}
+prefab SheenRest {
+  Sheen: {period: 0, rest: 0, band: 0, strength: 0, still: 0, ease: 0, bands: 1, phase: 0, scatter: false, dark: $tone_sheen.dark, light: $tone_sheen.light}
+}
+
 // A session's title: 13, a touch over regular, one line that gives way first (ui.Lead) when the row runs out of room.
 // Renamed in place (cmd+R, src/app/chat/rename.rs), the host sets its TextEdit's caret and selection; at rest nothing.
 prefab Head : ui.Lead {

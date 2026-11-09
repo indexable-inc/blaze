@@ -66,21 +66,21 @@ hn {
       // two bands chasing while a sub-agent works. At rest a sheen of strength 0, which lights nothing: the way a re-run
       // stops one (it cannot remove it).
       if $pace == "think" {
-        Sheen: {period: $sheen_think_period, rest: $sheen_think_rest, band: $sheen_think_band, strength: $sheen_think_strength, still: $sheen_still, ease: $sheen_think_ease, bands: 1, phase: 0, scatter: true, dark: $tone_sheen.dark, light: $tone_sheen.light}
+        Sheen: hn.tree.SheenThink[Sheen]
       } else {
         if $pace == "run" {
-          Sheen: {period: $sheen_run_period, rest: $sheen_run_rest, band: $sheen_run_band, strength: $sheen_run_strength, still: $sheen_still, ease: $sheen_run_ease, bands: 1, phase: 0, scatter: true, dark: $tone_sheen.dark, light: $tone_sheen.light}
+          Sheen: hn.tree.SheenRun[Sheen]
         } else {
           if $pace == "edit" {
-            Sheen: {period: $sheen_edit_period, rest: $sheen_edit_rest, band: $sheen_edit_band, strength: $sheen_edit_strength, still: $sheen_still, ease: $sheen_edit_ease, bands: 1, phase: 0, scatter: true, dark: $tone_sheen.dark, light: $tone_sheen.light}
+            Sheen: hn.tree.SheenEdit[Sheen]
           } else {
             if $pace == "read" {
-              Sheen: {period: $sheen_read_period, rest: $sheen_read_rest, band: $sheen_read_band, strength: $sheen_read_strength, still: $sheen_still, ease: $sheen_read_ease, bands: 1, phase: 0, scatter: true, dark: $tone_sheen.dark, light: $tone_sheen.light}
+              Sheen: hn.tree.SheenRead[Sheen]
             } else {
               if $pace == "agent" {
-                Sheen: {period: $sheen_agent_period, rest: $sheen_agent_rest, band: $sheen_agent_band, strength: $sheen_agent_strength, still: $sheen_still, ease: $sheen_agent_ease, bands: $sheen_agent_bands, phase: 0, scatter: true, dark: $tone_sheen.dark, light: $tone_sheen.light}
+                Sheen: hn.tree.SheenAgent[Sheen]
               } else {
-                Sheen: {period: 0, rest: 0, band: 0, strength: 0, still: 0, ease: 0, bands: 1, phase: 0, scatter: false, dark: $tone_sheen.dark, light: $tone_sheen.light}
+                Sheen: hn.tree.SheenRest[Sheen]
               }
             }
           }
@@ -102,7 +102,7 @@ hn {
         }
         count : hn.tree.Trail {
           Text: {s: $under}
-          Sheen: {period: $sheen_run_period, rest: $sheen_run_rest, band: $sheen_run_band, strength: $sheen_run_strength, still: $sheen_still, ease: $sheen_run_ease, bands: 1, phase: 0, scatter: true, dark: $tone_sheen.dark, light: $tone_sheen.light}
+          Sheen: hn.tree.SheenRun[Sheen]
         }
       }
     }
@@ -193,9 +193,9 @@ hn {
         }
       }
       if $busy {
-        Sheen: {period: $sheen_run_period, rest: $sheen_run_rest, band: $sheen_run_band, strength: $sheen_run_strength, still: $sheen_still, ease: $sheen_run_ease, bands: 1, phase: 0, scatter: true, dark: $tone_sheen.dark, light: $tone_sheen.light}
+        Sheen: hn.tree.SheenRun[Sheen]
       } else {
-        Sheen: {period: 0, rest: 0, band: 0, strength: 0, still: 0, ease: 0, bands: 1, phase: 0, scatter: false, dark: $tone_sheen.dark, light: $tone_sheen.light}
+        Sheen: hn.tree.SheenRest[Sheen]
       }
     }
     spacer : ui.Spacer {}
