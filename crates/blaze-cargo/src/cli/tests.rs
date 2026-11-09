@@ -320,6 +320,60 @@ fn a_failed_build_runs_nothing() {
     assert!(err.ends_with("error: the daemon's connection: the daemon hung up\n"), "{err}");
 }
 
+/// A build whose dependency failed exits nonzero and names what was not built, for every
+/// command that builds, whatever the daemon's `Done` says: 0.20261028.7's daemon ended
+/// `blaze build -p blaze-engine --release` ok with blaze-profile failed and both binaries behind
+/// it, and the client exited 0 with nothing placed.
+#[test]
+fn a_build_that_left_units_behind_a_failure_exits_nonzero_and_names_them() {
+    let unchecked = || {
+        Response::Unchecked(blaze_api::Unchecked {
+            open: Vec::new(),
+            tests: Vec::new(),
+            behind: vec![blaze_api::Behind {
+                id: None,
+                why: "errors in its code".to_owned(),
+                unit: "dep v0.1.0 (lib)".to_owned(),
+                units: vec!["foo v0.1.0 (lib)".to_owned(), "foo v0.1.0 (bin \"foo\")".to_owned()],
+            }],
+            stopped: false,
+        })
+    };
+    for words in [
+        &["blaze", "build"][..],
+        &["blaze", "build", "--release"],
+        &["blaze", "check"],
+        &["blaze", "test"],
+        &["blaze", "test", "--fail-fast"],
+        &["blaze", "run"],
+    ] {
+        // The daemon as it is: a failed build's `Done` is not ok. And the planted bug: a daemon
+        // that says ok after it named what it left.
+        for done in [false, true] {
+            let mut api = FakeApi::answering(vec![
+                foo_compiling(),
+                unchecked(),
+                Response::Done { ok: done },
+            ]);
+            let mut programs = Fake::default();
+            let (then, _, err) = driven(&mut api, words, &mut programs);
+            assert_eq!(then, Then::Exit(101), "{words:?}, Done {{ ok: {done} }}: {err}");
+            assert!(programs.ran.is_empty(), "{words:?}: nothing built, nothing runs");
+            assert!(
+                err.contains("2 units not checked, behind what failed:\n")
+                    && err.contains("behind dep v0.1.0 (lib) (errors in its code): 2 units\n")
+                    && err.contains("foo v0.1.0 (bin \"foo\")"),
+                "{words:?}: {err}"
+            );
+            assert_eq!(
+                err.contains("the daemon said the build passed after it left 2 unit(s)"),
+                done,
+                "{words:?}: {err}"
+            );
+        }
+    }
+}
+
 #[test]
 fn by_default_the_tests_that_built_run_past_a_failed_unit() {
     // A unit failed (the daemon said which, by name) and the rest built: their tests still run,
