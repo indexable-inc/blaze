@@ -38,9 +38,9 @@ mod thread;
 
 pub(super) use thread::{Process, Resume, TlsData};
 
-/// The `extern "C"` functions a `const static { .. }` block may call (`#![feature(blaze_comptime)]`):
-/// those [`Evaluator::exec_extern_c`] answers from the evaluation's memory alone, with no
-/// outside effect and the same answer every time.
+/// The `extern "C"` functions a `const static { .. }` block may call
+/// (`#![feature(blaze_comptime)]`): those [`Evaluator::exec_extern_c`] answers from the
+/// evaluation's memory alone, with no outside effect and the same answer every time.
 const PURE_C_FUNCTIONS: [&str; 5] = ["memcmp", "memcpy", "memmove", "memset", "strlen"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

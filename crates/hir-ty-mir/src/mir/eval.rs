@@ -5005,7 +5005,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                             let bytes = this.read_memory(addr, size)?;
                             mm.memory.insert(addr_usize, bytes);
                             this.note_align(mm, addr_usize);
-                            rec(this, bytes, t, locals, mm, stack_depth_limit - 1, pointee_shared)?;
+                            let depth = stack_depth_limit - 1;
+                            rec(this, bytes, t, locals, mm, depth, pointee_shared)?;
                         }
                         None => {
                             let mut check_inner = None;
