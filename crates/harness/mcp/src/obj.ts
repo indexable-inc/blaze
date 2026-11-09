@@ -17,8 +17,8 @@ export type ObjInfo = {
 };
 export type SpawnOpts = {
   name?: string; prompt?: string; cmd?: string; cwd?: string; env?: Record<string, string>; args?: string[];
-  /** Agents: the model and reasoning effort it runs on. A sub agent (one with a parent) must give both, and a name;
-   *  cursor takes no effort. Never in args (--model/--effort there are refused). */
+  /** Agents: the model and reasoning effort it runs on. A sub agent (one with a parent) must give a name, a model and,
+   *  when that model lists efforts, the effort (skill: agents). Never in args (--model/--effort there are refused). */
   model?: string; effort?: string;
   /** Parent object (default: this agent; procs: the run this REPL runs in, else this agent). null for none. */
   parent?: string | Obj | null;
@@ -255,7 +255,8 @@ async function spawnObject(kind: Kind, opts: SpawnOpts): Promise<Obj> {
   } else {
     if (opts.parent === undefined) parent = selfSession();
     if (parent !== null && AGENTS.has(kind)) {
-      const missing = [!opts.name && "name", !opts.model && "model", kind !== "cursor" && !opts.effort && "effort"].filter(Boolean);
+      // effort: the daemon requires it when the model's listed entry takes efforts (it knows the lists).
+      const missing = [!opts.name && "name", !opts.model && "model"].filter(Boolean);
       if (missing.length) throw new Error(`a ${kind} sub agent needs an explicit ${missing.join(", ")}: spawn('${kind}', { name, model, effort, prompt })`);
     }
     body = {

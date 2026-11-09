@@ -286,7 +286,7 @@ fn read(id: String, stage: Option<usize>, args: &Value) -> Result<Value> {
 }
 
 /// An agent another agent starts says what it is: a name (its row in the tree, and how it is found again), the model
-/// and, for a kind that takes one, the reasoning effort. A default picked silently is how a lane ran at the wrong
+/// and, when the model's listed entry takes one, the reasoning effort. A default picked silently is how a lane ran at the wrong
 /// effort (2026-11-09), so none is picked here. `--model`/`--effort` in `args` are refused for the same reason: the
 /// fields are the one place they are said.
 ///
@@ -303,8 +303,12 @@ fn explicit_sub_agent(kind: &str, name: Option<&str>, model: Option<&str>, effor
     if model.is_none_or(str::is_empty) {
         missing.push("model");
     }
-    // Cursor takes no effort at launch (launch_choice refuses one), so only claude and codex must name it.
-    if kind != "cursor" && effort.is_none_or(str::is_empty) {
+    // The effort is required exactly when the model's listed entry takes efforts: a kind that has listed none yet
+    // (codex before its first start) or a model without efforts (cursor) cannot be given one (models::check).
+    let takes_effort = model.is_some_and(|m| {
+        crate::chat::models::snapshot().get(kind).and_then(|l| l.iter().find(|c| c.is(m))).is_some_and(|c| !c.efforts.is_empty())
+    });
+    if takes_effort && effort.is_none_or(str::is_empty) {
         missing.push("effort");
     }
     if !missing.is_empty() {
