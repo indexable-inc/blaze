@@ -492,12 +492,14 @@ fn touch(touched: &mut Vec<(FileName, bool)>, effect: &Effect) {
         | Effect::ReadLink { file, .. }
         | Effect::Stat { file, .. }
         | Effect::Lstat { file, .. }
+        | Effect::ReadInto { file, .. }
         | Effect::Map { file, .. } => named(file, false),
         Effect::Append { file, .. }
         | Effect::Sync { file, .. }
         | Effect::Truncate { file, .. }
         | Effect::Write { file, .. }
         | Effect::WriteAt { file, .. }
+        | Effect::WriteFrom { file, .. }
         | Effect::Mode { file, .. }
         | Effect::Seal { file, .. }
         | Effect::Times { file, .. }

@@ -116,7 +116,11 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::LenientDeserialize
         // A hasher is chosen in the type, or kept with `#[expect(blaze::default_hasher, reason = ..)]`:
         // an allocation's comment says nothing about it.
-        | Lint::DefaultHasher => None,
+        | Lint::DefaultHasher
+        // The edition's lints name a construct the edition removes, not a cost on a line.
+        | Lint::LossyAs
+        | Lint::GlobalState
+        | Lint::AsyncFn => None,
     }
 }
 
