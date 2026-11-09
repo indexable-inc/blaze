@@ -34,6 +34,20 @@ such code is right: it finds candidates, and each one it finds becomes a case th
 before the fix lands. A change to such code without a DST that covers it is unfinished, whoever
 reviewed it.
 
+## invariants-are-stated (rule 53)
+
+What code must always do is written once, in the code: a doc comment opening `/// The invariant:` on
+the test whose oracle checks it, `/// The refinement:` on a test that runs an implementation against
+its model (or against another implementation) and compares, and `/// The reference model:` on the
+simple executable model itself. An invariant or a refinement needs a control in the same file, a
+test named `the_oracle_catches_<the planted bug>`. `harness/v2/invariants.py` collects every
+statement into `docs/v2/plan/invariants.md` (`write`) and fails the gate (`check`) when one has no
+control, a control has no statement, or the list is stale, so adding, rewording or dropping a
+guarantee is a visible line in the pull request. Before changing or regenerating code, read the
+invariants its crate states; they are what the new code is judged against.
+
+See [docs/v2/plan.md#11-proof-by-check-not-by-review](../../../docs/v2/plan.md#11-proof-by-check-not-by-review).
+
 <!-- End of the generated rules. Hand-written notes follow. -->
 
 This skill is the one home for how blaze tests its own code. Other skills and docs point here:

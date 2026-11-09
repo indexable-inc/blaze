@@ -133,6 +133,11 @@ jobs:
       - run: |
           uv run --frozen python harness/v2/ledger.py selftest
           uv run --frozen python harness/v2/ledger.py '{"command": "check"}'
+      # Every stated invariant has a control beside it, and docs/v2/plan/invariants.md lists them
+      # (harness/v2/invariants.py).
+      - run: |
+          uv run --frozen python harness/v2/invariants.py selftest
+          uv run --frozen python harness/v2/invariants.py '{"command": "check"}'
       # Each hash domain in crates/ is written once outside tests (tools/v2/domains.py).
       - run: |
           uv run --frozen python tools/v2/domains.py '{"root": "."}'

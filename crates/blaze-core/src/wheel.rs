@@ -327,7 +327,7 @@ mod tests {
     use super::*;
     use crate::sim::Rng;
 
-    /// The model: every timer with its deadline and insertion number, fired by sorting.
+    /// The reference model: every timer with its deadline and insertion number, fired by sorting.
     #[derive(Default)]
     struct Model {
         now: u64,
