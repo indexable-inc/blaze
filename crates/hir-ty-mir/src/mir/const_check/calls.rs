@@ -77,8 +77,7 @@ impl<'db> Checker<'_, 'db> {
             },
             _ => return,
         };
-        let receiver = args.first().and_then(|it| operand_ty(self.body, it));
-        if is_dyn_dispatch(db, callee, fn_args, receiver) && deferred() {
+        if is_dyn_dispatch(db, callee, fn_args) && deferred() {
             return;
         }
         let Some(source) = self.source(expr, callee) else { return };

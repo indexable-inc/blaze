@@ -125,29 +125,16 @@ pub fn defers_dispatch_check(db: &Db, krate: Crate) -> bool {
 }
 
 /// Whether the call of `callee` with `args` goes through a vtable: `callee` is a trait's method
-/// (`Fn::call` and the rest included) and its `Self` or its receiver `receiver` (the type of the
-/// call's first argument), behind references, is `dyn Trait`. The receiver is asked too: a
-/// body's method call may record `Self` unresolved (`<_ as Trait>::m`) where its receiver's
-/// type is known.
-pub fn is_dyn_dispatch<'db>(
-    db: &Db,
-    callee: FunctionId,
-    args: GenericArgs<'db>,
-    receiver: Option<TyKind<'db>>,
-) -> bool {
+/// (`Fn::call` and the rest included) and its `Self`, behind references, is `dyn Trait`.
+pub fn is_dyn_dispatch(db: &Db, callee: FunctionId, args: GenericArgs<'_>) -> bool {
     if !matches!(callee.lookup(db).container, ItemContainerId::TraitId(_)) {
         return false;
     }
-    let self_ty = args.as_slice().first().and_then(|it| it.ty()).map(|it| it.kind());
-    self_ty.is_some_and(is_dyn_behind_refs) || receiver.is_some_and(is_dyn_behind_refs)
-}
-
-/// Whether `ty`, behind references, is `dyn Trait`.
-fn is_dyn_behind_refs(mut ty: TyKind<'_>) -> bool {
-    while let TyKind::Ref(_, inner, _) = ty {
-        ty = inner.kind();
+    let Some(mut ty) = args.as_slice().first().and_then(|it| it.ty()) else { return false };
+    while let TyKind::Ref(_, inner, _) = ty.kind() {
+        ty = inner;
     }
-    matches!(ty, TyKind::Dynamic(..))
+    matches!(ty.kind(), TyKind::Dynamic(..))
 }
 
 /// Whether evaluating `owner`'s body checks the target of each call it makes through a
@@ -356,7 +343,7 @@ struct Walk<'a, 'db> {
     found: Vec<(ExprId, NonConst<'db>)>,
 }
 
-impl<'db> Walk<'_, 'db> {
+impl Walk<'_, '_> {
     fn expr(&mut self, expr: ExprId) {
         match self.body.expr(expr) {
             Expr::Closure { body, .. } => {
@@ -377,17 +364,6 @@ impl<'db> Walk<'_, 'db> {
         body.walk_child_exprs_without_pats(expr, |child| self.expr(child));
     }
 
-    /// The type of the receiver of the method call `expr`, or of the first argument of the call
-    /// `expr`: what [`is_dyn_dispatch`] reads besides the callee's `Self`.
-    fn receiver(&self, expr: ExprId) -> Option<TyKind<'db>> {
-        let first = match self.body.expr(expr) {
-            Expr::MethodCall { receiver, .. } => receiver,
-            Expr::Call { args, .. } => *args.first()?,
-            _ => return None,
-        };
-        Some(self.infer.expr_ty(first).kind())
-    }
-
     fn call(&mut self, expr: ExprId, callee: Option<ExprId>) {
         let callee_ty = callee.map(|callee| self.infer.expr_ty(callee));
         let error = match callee_ty.map(|ty| ty.kind()) {
@@ -398,8 +374,7 @@ impl<'db> Walk<'_, 'db> {
             }
             kind => match (self.infer.method_resolution(expr), kind) {
                 (Some((func, args)), _)
-                    if self.defers_dispatch
-                        && is_dyn_dispatch(self.db, func, args, self.receiver(expr)) =>
+                    if self.defers_dispatch && is_dyn_dispatch(self.db, func, args) =>
                 {
                     None
                 }
@@ -409,9 +384,7 @@ impl<'db> Walk<'_, 'db> {
                 (None, Some(TyKind::FnDef(def, args))) => match def.0 {
                     crate::CallableDefId::FunctionId(func) => {
                         let args = args.no_bound_vars().unwrap();
-                        if self.defers_dispatch
-                            && is_dyn_dispatch(self.db, func, args, self.receiver(expr))
-                        {
+                        if self.defers_dispatch && is_dyn_dispatch(self.db, func, args) {
                             None
                         } else {
                             const_call_error(self.db, self.env, self.constness, func, args)
