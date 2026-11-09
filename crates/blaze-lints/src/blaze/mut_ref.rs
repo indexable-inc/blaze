@@ -10,11 +10,16 @@
 //! expression) is put in parentheses by the fix, as that rule says to write it:
 //! `&mut <T>::new()` becomes `&uniq (<T>::new())`.
 //!
+//! What a macro call of the file is handed is found as the file's own code is: the arguments
+//! of `vec![..]` or `assert!(..)`, and an item under an attribute macro such as `#[test]`. A
+//! token is parsed under the syntax of the crate that wrote it wherever a macro carries it
+//! (`syntax_bridge`'s parser input), so `&uniq` there is the same reference after the fix.
+//!
 //! Not found: `let mut x` and any `mut` binding without `ref`, `mut self`, `*mut T`,
 //! `&raw mut place`, a `&mut pat` reference pattern (the gate has no `uniq` spelling of it), a
-//! `mut` already spelled `uniq`, and everything a macro wrote or is handed (a macro's
-//! definition is token trees, and an expansion is not the file's text to respell). In a crate
-//! without the gate the lint says nothing: `uniq` is no keyword there.
+//! `mut` already spelled `uniq`, and what a macro wrote itself (a macro's definition is token
+//! trees, with no reference to find until it is expanded, and then not where it is written).
+//! In a crate without the gate the lint says nothing: `uniq` is no keyword there.
 
 use syntax::{
     SyntaxKind::{self, *},
@@ -52,17 +57,30 @@ struct Found<'t> {
 }
 
 /// `node`, when it is a reference type, a borrow, a receiver or a `ref` binding spelled with
-/// `mut`, in a crate that says `#![blaze::uniq]`.
+/// `mut`, in a crate that says `#![blaze::uniq]`: written in the file, or handed whole to the
+/// macro call the walk is in the expansion of, where the finding and its fix are at the tokens
+/// as the file writes them.
 pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
-    if !cx.on_blaze(LINT) || !cx.in_file() || !cx.krate().extensions(cx.db()).uniq() {
+    if !cx.on_blaze(LINT) || !cx.krate().extensions(cx.db()).uniq() {
+        return;
+    }
+    if cx.expansion().is_some() || !cx.is_written(node) {
         return;
     }
     let Some(found) = found(node) else { return };
-    let start = found.first.text_range().start();
-    let span = cx.span(TextRange::new(start, found.mut_.text_range().end()));
-    let mut parts = vec![(cx.span(found.mut_.text_range()), "uniq".to_owned())]; // alloc: a fix's parts
-    if let Some(operand) = found.wrap {
-        let range = operand.text_range();
+    let (Some(first), Some(mut_)) = (cx.token_range(found.first), cx.token_range(found.mut_))
+    else {
+        return;
+    };
+    let wrap = match found.wrap.map(|operand| cx.range(operand)) {
+        None => None,
+        Some(Some(range)) => Some(range),
+        // An operand a macro made of other tokens: no place in the file to wrap.
+        Some(None) => return,
+    };
+    let span = cx.span(TextRange::new(first.start(), mut_.end()));
+    let mut parts = vec![(cx.span(mut_), "uniq".to_owned())]; // alloc: a fix's parts
+    if let Some(range) = wrap {
         parts.push((cx.span(TextRange::empty(range.start())), "(".to_owned())); // alloc: as above
         parts.push((cx.span(TextRange::empty(range.end())), ")".to_owned())); // alloc: as above
     }

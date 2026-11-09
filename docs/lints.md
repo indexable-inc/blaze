@@ -710,10 +710,17 @@ places, told by the token after it: `&uniq;`, `&uniq.x`, `&uniq::X`, `&uniq<T>` 
 an index or arithmetic on `uniq`. Types print as `&uniq T` in the crate's diagnostics. Without
 the gate, `&uniq T` is the syntax error it is in rustc.
 
+**In macros.** A token is parsed under the gate of the crate whose source wrote it, wherever
+a macro carries it: `&uniq x` in `vec![..]` or `assert!(..)`, in a function under `#[test]`,
+and in the body of a `macro_rules!` of a crate with the gate, expanded in any crate. What a
+crate without the gate writes stays Rust, also when it is handed to such a macro. The lint
+finds what a macro call of the file is handed (a call's arguments, an item under an attribute
+macro) as it finds the file's other code.
+
 **Not found.** `let mut x` and any `mut` binding without `ref`, `mut self`, `*mut T`,
 `&raw mut place`, a `&mut pat` reference pattern (which has no `uniq` spelling), a reference
-already spelled `uniq`, and what a macro writes or is handed: macro input and expansions parse
-without the gate, so `&uniq` there is not yet accepted.
+already spelled `uniq`, and what a macro's definition writes (token trees, respelled by
+hand).
 
 **Allowing it.** `#[expect(blaze::mut_ref, reason = "..")]` on the function or item.
 

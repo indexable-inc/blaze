@@ -4,7 +4,8 @@
 //!
 //! A parse's record, little-endian, from a multiple of 8, every offset from its start: a head
 //! of [`HEAD`] `u32`s (magic, the record's length, [`TREE_VERSION`], the outline's edition
-//! plus one or 0 for a full parse, how many errors, where their rows are, where their messages
+//! plus one or 0 for a full parse with the parse's syntax extensions in the byte above, how
+//! many errors, where their rows are, where their messages
 //! are and how long, where the tree's record is and how long, two 0s), the lexer's and
 //! parser's errors as rows `[start, end, message offset, message length]`, their messages,
 //! and the tree's record (`syntax_tree`'s `FlatTree::write_image`).
@@ -15,16 +16,21 @@ use blaze_bytes::{Bytes, le::get_u32 as u32_at};
 pub use syntax_tree::ImageError;
 
 use crate::{
-    Edition, FlatTree, Parse, RustLanguage, SourceFile, SyntaxError, SyntaxKind, Text, TextRange,
-    TextSize, Tree, parsing,
+    Edition, Extensions, FlatTree, Parse, RustLanguage, SourceFile, SyntaxError, SyntaxKind, Text,
+    TextRange, TextSize, Tree, parsing,
 };
 
-/// What a stored tree depends on besides its text, its edition and the tree record's layout
+/// What a stored tree depends on besides its text, its edition, its syntax extensions and the
+/// tree record's layout
 /// (`syntax_tree::IMAGE_LAYOUT`): the lexer, the parser, the grammar's kinds and how a tree
 /// is built of their output. Bump it with any change to the tree or the errors some text
 /// parses to; `the_tree_version_names_the_trees_parsed` fails when a file of the parser's test
 /// data parses to another tree under the same version.
-pub const TREE_VERSION: u32 = 2;
+///
+/// 3: a token is parsed under the extensions of the crate that wrote it (a macro's expansion
+/// reads `&uniq` and `A | B`), `&uniq pat` is a pattern, and a parse made under extensions is
+/// stored and read back under them.
+pub const TREE_VERSION: u32 = 3;
 
 const MAGIC: u32 = u32::from_le_bytes(*b"bzp1");
 const HEAD: usize = 12;
@@ -34,8 +40,9 @@ const ERROR: usize = 4;
 /// Appends `parse` (its tree, the bodies parsed so far, and its lexer's and parser's errors)
 /// to `out` as a record [`read`] maps back: from the next multiple of 8 of `out`'s length,
 /// which is where in `out` it is. The record keeps the syntax extensions the parse was made
-/// under beside the outline's edition, and [`read`] takes a record under none only, so one made
-/// under an extension never reads back as one made under none.
+/// under beside the outline's edition, and [`read`] takes a record only under the extensions
+/// it was made under, so one made under an extension never reads back as one made under
+/// another set or none.
 pub fn write(parse: &Parse<SourceFile>, out: &mut Vec<u8>) -> Range<usize> {
     pad(out);
     let start = out.len();
@@ -65,8 +72,7 @@ pub fn write(parse: &Parse<SourceFile>, out: &mut Vec<u8>) -> Range<usize> {
     head[1] = offset(out, start);
     head[2] = TREE_VERSION;
     // The syntax extensions above the edition (`Extensions::bits`, shifted 8).
-    head[3] = parse.outline.map_or(0, |edition| edition as u32 + 1)
-        | u32::from(parse.extensions.bits()) << 8;
+    head[3] = kind_word(parse.outline, parse.extensions);
     head[4] = to_u32(errors.len());
     head[8] = to_u32(tree.start - start);
     head[9] = to_u32(tree.len());
@@ -76,17 +82,25 @@ pub fn write(parse: &Parse<SourceFile>, out: &mut Vec<u8>) -> Range<usize> {
     start..out.len()
 }
 
-/// The parse of `text` in `edition` (an outline when `outline`) stored at byte `at` of `bytes`
-/// by [`write`], its tree read in place from `bytes`. An error says what about the bytes is
-/// not that parse: another parser's tree ([`TREE_VERSION`]), another edition's or kind of
-/// parse, one made under a syntax extension (`edition::Extensions`, which no stored parse is
-/// read under), or a tree of another text's length.
+/// A record's word for what parse it is of: the outline's edition plus one, or 0 for a full
+/// parse, and above it the syntax extensions it was made under (`Extensions::bits`, shifted
+/// 8).
+fn kind_word(outline: Option<Edition>, extensions: Extensions) -> u32 {
+    outline.map_or(0, |edition| edition as u32 + 1) | u32::from(extensions.bits()) << 8
+}
+
+/// The parse of `text` in `edition` under `extensions` (an outline when `outline`) stored at
+/// byte `at` of `bytes` by [`write`], its tree read in place from `bytes`. An error says what
+/// about the bytes is not that parse: another parser's tree ([`TREE_VERSION`]), another
+/// edition's or kind of parse, one made under other syntax extensions
+/// (`edition::Extensions`), or a tree of another text's length.
 pub fn read(
     bytes: &Bytes,
     at: usize,
     text: &Text,
     edition: Edition,
     outline: bool,
+    extensions: Extensions,
 ) -> Result<Parse<SourceFile>, ImageError> {
     let wrong = |what| ImageError { at, what };
     let mut head = [0u32; HEAD];
@@ -99,7 +113,7 @@ pub fn read(
     if head[2] != TREE_VERSION {
         return Err(wrong("a tree of another parser version"));
     }
-    if head[3] != if outline { edition as u32 + 1 } else { 0 } {
+    if head[3] != kind_word(outline.then_some(edition), extensions) {
         return Err(wrong("a tree of another edition, syntax extensions or kind of parse"));
     }
     let len = head[1] as usize;
@@ -146,7 +160,7 @@ pub fn read(
     }
     // alloc: the parse's shared tree, once per file read
     let tree = Tree::new(Arc::new(tree));
-    Ok(Parse::with_outline(tree, errors, outline.then_some(edition), crate::Extensions::NONE))
+    Ok(Parse::with_outline(tree, errors, outline.then_some(edition), extensions))
 }
 
 fn pad(out: &mut Vec<u8>) {
@@ -175,7 +189,7 @@ mod tests {
     use test_utils::project_root;
 
     use super::{TREE_VERSION, read, write};
-    use crate::{AstNode, Edition, Parse, SourceFile, SyntaxNode, Text};
+    use crate::{AstNode, Edition, Extensions, Parse, SourceFile, SyntaxNode, Text};
 
     /// The `.rs` files under `dir`, at any depth, sorted.
     fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -236,7 +250,7 @@ mod tests {
                     let _ = tree.part(at);
                 }
                 let (bytes, at) = stored(&parse);
-                let read = read(&bytes, at, &text, edition, outline)
+                let read = read(&bytes, at, &text, edition, outline, Extensions::NONE)
                     .unwrap_or_else(|it| panic!("{name}: {it}"));
                 let mapped = read.tree.as_ref().unwrap().flat().clone();
                 assert!(mapped.is_read_in_place(), "{name}");
@@ -249,9 +263,50 @@ mod tests {
                 let fresh = SourceFile::parse_shared(text.clone(), edition);
                 assert_eq!(elements(read.tree().syntax()), elements(&fresh.syntax_node()));
                 let other = read_other(&bytes, at, &text, edition, outline);
-                assert_eq!(other, Some("a tree of another edition or kind of parse"), "{name}");
+                assert_eq!(other, Some(OTHER), "{name}");
+                let gated = super::read(&bytes, at, &text, edition, outline, Extensions::UNIQ);
+                assert_eq!(gated.err().map(|it| it.what), Some(OTHER), "{name}: under uniq");
             }
         });
+    }
+
+    /// What [`read`] says of a record of another edition, syntax extensions or kind of parse.
+    const OTHER: &str = "a tree of another edition, syntax extensions or kind of parse";
+
+    /// A file that only parses under each set of syntax extensions, with a body an outline
+    /// leaves lazy: stored and read back under the set it is the same parse (the same tree,
+    /// its lazy body parsed under the set too, the same errors, none), and its record is
+    /// refused under every other set, so a gated tree never reads back as Rust's or the
+    /// reverse.
+    #[test]
+    fn a_stored_gated_parse_reads_back_under_its_extensions_only() {
+        let edition = Edition::CURRENT;
+        let both = Extensions::UNIQ.with(Extensions::ERROR_UNIONS);
+        let sets = [Extensions::NONE, Extensions::UNIQ, Extensions::ERROR_UNIONS, both];
+        let source = "fn f(x: &uniq u8) -> &uniq u8 { let y: &uniq u8 = &uniq *x; y }\n\
+                      fn g(e: A | B) { h(e) }\n";
+        for extensions in sets {
+            let text = Text::from(source);
+            for outline in [false, true] {
+                let parse = match outline {
+                    true => SourceFile::parse_outline_with(text.clone(), edition, extensions),
+                    false => SourceFile::parse_shared_with(text.clone(), edition, extensions),
+                };
+                assert_eq!(parse.errors_with_bodies().is_empty(), extensions == both);
+                let (bytes, at) = stored(&parse);
+                let read = super::read(&bytes, at, &text, edition, outline, extensions)
+                    .unwrap_or_else(|it| panic!("{extensions:?}: {it}"));
+                assert_eq!(read, parse, "{extensions:?}");
+                assert_eq!(read.extensions(), extensions);
+                assert_eq!(read.errors_with_bodies(), parse.errors_with_bodies());
+                let fresh = SourceFile::parse_shared_with(text.clone(), edition, extensions);
+                assert_eq!(elements(read.tree().syntax()), elements(&fresh.syntax_node()));
+                for other in sets.into_iter().filter(|&it| it != extensions) {
+                    let refused = super::read(&bytes, at, &text, edition, outline, other);
+                    assert_eq!(refused.err().map(|it| it.what), Some(OTHER), "{other:?}");
+                }
+            }
+        }
     }
 
     fn read_other(
@@ -261,7 +316,7 @@ mod tests {
         edition: Edition,
         outline: bool,
     ) -> Option<&'static str> {
-        read(bytes, at, text, edition, !outline).err().map(|it| it.what)
+        read(bytes, at, text, edition, !outline, Extensions::NONE).err().map(|it| it.what)
     }
 
     /// The digest of what `text` parses to, in full and as an outline with every body

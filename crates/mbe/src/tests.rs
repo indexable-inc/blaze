@@ -762,3 +762,99 @@ fn a_repetitions_separator_is_one_glued_token_and_its_operator_is_one_character(
     assert!(parse("($($a:ident),?) => {}").err().is_some());
     assert!(parse("($($a:ident),+=) => {}").err().is_some());
 }
+
+/// What `decl`, a `macro_rules!` body written in a crate whose syntax extensions are `def`,
+/// expands `arg` to when a crate whose extensions are `call` calls it: whether a rule matched,
+/// and the expansion parsed as items, as its dump and its syntax errors. Each token's span is
+/// anchored in its crate's file, whose id holds the crate's extensions, as every span is.
+fn expanded_across(
+    def: span::Extensions,
+    decl: &str,
+    call: span::Extensions,
+    arg: &str,
+) -> (bool, String, usize) {
+    let edition = Edition::CURRENT;
+    let anchor = |file: u32, extensions| SpanAnchor {
+        file_id: EditionedFileId::new_with_extensions(FileId::from_raw(file), edition, extensions),
+        ast_id: ROOT_ERASED_FILE_AST_ID,
+    };
+    let ctx = SyntaxContext::root(edition);
+    let db = base_db::Db::for_tests();
+    let decl = syntax_bridge::parse_to_token_tree(edition, anchor(0, def), ctx, decl).unwrap();
+    let mac = DeclarativeMacro::parse_macro_rules(&decl, |_| edition);
+    assert!(mac.err().is_none(), "{:?}", mac.err());
+    let call_anchor = anchor(1, call);
+    let arg_tt = syntax_bridge::parse_to_token_tree(edition, call_anchor, ctx, arg).unwrap();
+    let call_site = Span { range: TextRange::up_to(TextSize::of(arg)), anchor: call_anchor, ctx };
+    let res = mac.expand(&db, &arg_tt, |_| (), crate::MacroCallStyle::FnLike, call_site);
+    let entry = parser::TopEntryPoint::MacroItems;
+    let (node, _) =
+        syntax_bridge::token_tree_to_syntax_node(res.value.0.view(), entry, &mut |_| edition);
+    let (old, _) =
+        syntax_bridge::reference::token_tree_to_syntax_node(&res.value.0, entry, &mut |_| edition);
+    assert_eq!(node.debug_dump(), old.debug_dump(), "the tree the old conversion parses");
+    (res.err.is_none(), node.debug_dump(), node.errors().len())
+}
+
+/// Whether `dump` has a `mut` token spelled `uniq`: the keyword of `#![blaze::uniq]`.
+fn has_uniq_keyword(dump: &str) -> bool {
+    dump.lines().any(|line| line.contains("MUT_KW") && line.contains("\"uniq\""))
+}
+
+/// A token is parsed under the syntax extensions of the crate whose source wrote it, in a
+/// matcher's fragment and in the expansion: the macro's own tokens under its crate's, what the
+/// caller handed it under the caller's, whichever of the two crates has the extensions.
+#[test]
+fn a_token_keeps_its_crates_syntax_extensions_through_a_macro() {
+    use span::Extensions;
+    let both = Extensions::UNIQ.with(Extensions::ERROR_UNIONS);
+    let none = Extensions::NONE;
+
+    // The macro's own `&uniq` and `|`: its crate's, also when a crate with no extension calls.
+    let own = "($e:expr, $a:ty, $b:ty) => { fn f(x: $a | $b) { let r = &uniq $e; } };";
+    for call in [none, both] {
+        let (matched, dump, errors) = expanded_across(both, own, call, "n, A, B");
+        assert!(matched && errors == 0, "{call:?}: {errors} errors in\n{dump}");
+        assert!(dump.contains("UNION_TYPE") && has_uniq_keyword(&dump), "{call:?}:\n{dump}");
+    }
+    // The same macro written in a crate with no extension is Rust's, whoever calls it.
+    for call in [none, both] {
+        let (matched, dump, errors) = expanded_across(none, own, call, "n, A, B");
+        assert!(matched && errors > 0, "{call:?}: Rust has no `A | B` type or `&uniq e`\n{dump}");
+        assert!(!dump.contains("UNION_TYPE") && !has_uniq_keyword(&dump), "{call:?}:\n{dump}");
+    }
+
+    // What the caller hands a macro: the caller's. Its fragments are matched under its
+    // extensions (`$e:expr` takes `&uniq n` whole, `$t:ty` takes `A | B`), and parse so in
+    // the expansion of a macro whose crate has none.
+    let handed = "($e:expr, $t:ty) => { fn f(x: $t) { let r = $e; } };";
+    for def in [none, both] {
+        let (matched, dump, errors) = expanded_across(def, handed, both, "&uniq n, A | B");
+        assert!(matched && errors == 0, "{def:?}: {errors} errors in\n{dump}");
+        assert!(dump.contains("UNION_TYPE") && has_uniq_keyword(&dump), "{def:?}:\n{dump}");
+    }
+    // A caller with no extension hands Rust: no rule takes `&uniq n` as an expression, also
+    // in a macro of a crate with the extension.
+    for def in [none, both] {
+        let (matched, _, _) = expanded_across(def, handed, none, "&uniq n, A");
+        assert!(!matched, "{def:?}: `&uniq n` is no expression in a crate without the gate");
+    }
+    // And its tokens stay Rust's where a macro with the extension only passes them on.
+    let passed = "($($t:tt)*) => { fn f() { let r = $($t)*; } };";
+    let (matched, dump, errors) = expanded_across(both, passed, none, "&uniq n");
+    assert!(matched && errors > 0 && !has_uniq_keyword(&dump), "{dump}");
+    let (matched, dump, errors) = expanded_across(none, passed, both, "&uniq n");
+    assert!(matched && errors == 0 && has_uniq_keyword(&dump), "{dump}");
+
+    // Each extension by itself turns on its own form only.
+    let borrow = "($e:expr) => { fn f() { let r = &uniq $e; } };";
+    let (_, dump, errors) = expanded_across(Extensions::UNIQ, borrow, none, "n");
+    assert!(errors == 0 && has_uniq_keyword(&dump), "{dump}");
+    let (_, dump, errors) = expanded_across(Extensions::ERROR_UNIONS, borrow, none, "n");
+    assert!(errors > 0 && !has_uniq_keyword(&dump), "{dump}");
+    let union = "($a:ty, $b:ty) => { fn f(x: $a | $b) {} };";
+    let (_, dump, errors) = expanded_across(Extensions::ERROR_UNIONS, union, none, "A, B");
+    assert!(errors == 0 && dump.contains("UNION_TYPE"), "{dump}");
+    let (_, dump, errors) = expanded_across(Extensions::UNIQ, union, none, "A, B");
+    assert!(errors > 0 && !dump.contains("UNION_TYPE"), "{dump}");
+}

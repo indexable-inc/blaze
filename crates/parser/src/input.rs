@@ -20,10 +20,18 @@ use crate::SyntaxKind;
 /// [`Input::extend_from_words`] with its kinds checked, and only the flag bits [`JOINT`] and
 /// [`FRAGMENT`], above both kinds, are set after.
 ///
+/// A word also holds the syntax extensions its token is parsed under, in the four bits above
+/// [`FRAGMENT`] ([`Input::mark_extensions`]): the extensions of the crate whose source wrote
+/// the token, which a token tree's tokens carry one by one, as they carry their editions. A
+/// whole file's tokens hold none there: its parse names the file's crate's once
+/// ([`Tokens::with_extensions`]).
+///
 /// The words are the thread's [`InputWords`], back on its shelf when the input is dropped, so a
 /// warm input allocates nothing.
 pub struct Input {
     words: blaze_mem::scratch::Lent<InputWords>,
+    /// Every extension some word is marked with ([`Tokens::marked`]).
+    marked: Extensions,
 }
 
 crate::event::per_thread_buffer! {
@@ -45,9 +53,34 @@ const EDITION_MASK: u32 = 0b111;
 pub const JOINT: u32 = 1 << (EDITION_SHIFT + 3);
 /// The bit of a word saying its token is the first of a fragment a macro transcribed.
 pub const FRAGMENT: u32 = JOINT << 1;
+/// Where a word holds its token's syntax extensions ([`Extensions::bits`]), above [`FRAGMENT`].
+const EXTENSIONS_SHIFT: u32 = EDITION_SHIFT + 5;
+const EXTENSIONS_MASK: u32 = 0b1111;
 
 const _: () = assert!((SyntaxKind::__LAST as u32) <= KIND_MASK, "a kind fits in KIND_BITS");
 const _: () = assert!((Edition::LATEST as u32) <= EDITION_MASK, "an edition fits in 3 bits");
+const _: () = assert!(FRAGMENT << 1 == 1 << EXTENSIONS_SHIFT, "the extensions are above FRAGMENT");
+const _: () = assert!(
+    Extensions::BITS <= EXTENSIONS_MASK.count_ones(),
+    "the syntax extensions fit in a word's 4 bits"
+);
+
+/// The extensions a word is marked with. Panics on a bit that is no extension's: a word is
+/// made here, from an [`Extensions`].
+#[inline]
+fn extensions_of(word: u32) -> Extensions {
+    let bits = ((word >> EXTENSIONS_SHIFT) & EXTENSIONS_MASK) as u8;
+    match Extensions::from_bits(bits) {
+        Some(extensions) => extensions,
+        None => panic!("a parser word is marked with syntax extensions {bits:#b} that are none"),
+    }
+}
+
+/// Every extension some word of `words` is marked with.
+#[inline]
+fn marked_in(words: &[u32]) -> Extensions {
+    extensions_of(words.iter().fold(0, |all, &word| all | word))
+}
 
 /// The word of a token of `kind` and `contextual_kind` in `edition`, neither joint nor a
 /// fragment's start.
@@ -85,7 +118,7 @@ impl Input {
         let mut words = blaze_mem::scratch::lend::<InputWords>();
         words.reserve(capacity + PAD);
         words.extend([EOF_WORD; PAD]);
-        Self { words }
+        Self { words, marked: Extensions::NONE }
     }
 
     /// The input's words, as [`Tokens::new`] reads them, copied out: the buffer goes back to
@@ -101,6 +134,7 @@ impl Input {
     pub fn clear(&mut self) {
         self.words.truncate(PAD);
         self.words.fill(EOF_WORD);
+        self.marked = Extensions::NONE;
     }
 
     /// Makes room for `additional` more tokens.
@@ -118,6 +152,7 @@ impl Input {
             words.iter().fold(true, |valid, &word| valid & has_valid_kinds(word)),
             "a parser word holds a kind that is no SyntaxKind"
         );
+        self.marked = self.marked.with(marked_in(words));
         let len = self.len();
         self.words.truncate(len);
         self.words.extend_from_slice(words);
@@ -171,6 +206,25 @@ impl Input {
         assert!(n < len, "fragment start {n} of {len} tokens");
         self.words[n] |= FRAGMENT;
     }
+    /// Marks every token from `from` on as parsed under `extensions` too: the tokens just
+    /// pushed for a token of a crate that turned them on (`#![blaze::uniq]`,
+    /// `#![blaze::error_unions]`), wherever a macro carried it
+    /// ([`Tokens::extensions_at`]).
+    #[inline]
+    pub fn mark_extensions(&mut self, from: usize, extensions: Extensions) {
+        if extensions.is_none() {
+            return;
+        }
+        let len = self.len();
+        assert!(from <= len, "extensions from token {from} of {len}");
+        let bits = u32::from(extensions.bits()) << EXTENSIONS_SHIFT;
+        for word in &mut self.words[from..len] {
+            *word |= bits;
+        }
+        if from < len {
+            self.marked = self.marked.with(extensions);
+        }
+    }
 }
 
 /// pub(crate) impl used by the parser to consume `Tokens`.
@@ -179,7 +233,8 @@ impl Input {
     #[inline]
     pub fn tokens(&self) -> Tokens<'_> {
         let (fragments, first_fragment) = (true, true);
-        Tokens { words: &self.words, fragments, first_fragment, extensions: Extensions::NONE }
+        let (extensions, marked) = (Extensions::NONE, self.marked);
+        Tokens { words: &self.words, fragments, first_fragment, extensions, marked }
     }
     #[inline]
     pub(crate) fn kind(&self, idx: usize) -> SyntaxKind {
@@ -214,17 +269,21 @@ impl Input {
 /// kind fields of every word are a `SyntaxKind`, so a kind is read with no range check.
 /// `is_fragment_start` reads `false` past the end at any index, and `edition` panics there.
 ///
-/// `extensions` are the crate's syntax extensions the parse is made under
-/// ([`Tokens::with_extensions`]): none unless the caller names them, so every parse that does
-/// not is Rust's grammar.
+/// A token is parsed under the syntax extensions of the crate whose source wrote it
+/// ([`Tokens::extensions_at`]): those the caller names for all of them, a file's crate's
+/// ([`Tokens::with_extensions`]), and those its own word is marked with, a token tree's
+/// ([`Input::mark_extensions`]). With neither, the parse is Rust's grammar.
 #[derive(Clone, Copy, Debug)]
 pub struct Tokens<'t> {
     words: &'t [u32],
     fragments: bool,
     /// Whether a fragment start on token 0 counts ([`Tokens::without_first_fragment`]).
     first_fragment: bool,
-    /// The syntax extensions the tokens are parsed under ([`edition::Extensions`]).
+    /// The syntax extensions every token is parsed under ([`edition::Extensions`]).
     extensions: Extensions,
+    /// Every extension some word is marked with: none for most inputs, whose tokens then
+    /// read no mark.
+    marked: Extensions,
 }
 
 impl<'t> Tokens<'t> {
@@ -247,21 +306,40 @@ impl<'t> Tokens<'t> {
             words.iter().fold(true, |valid, &word| valid & has_valid_kinds(word)),
             "a parser word holds a kind that is no SyntaxKind"
         );
-        Tokens { words, fragments, first_fragment: true, extensions: Extensions::NONE }
+        let (extensions, marked) = (Extensions::NONE, marked_in(words));
+        Tokens { words, fragments, first_fragment: true, extensions, marked }
     }
 
-    /// The same tokens, parsed under `extensions`: a file of a crate that turned them on
-    /// (`#![blaze::uniq]`, `#![blaze::error_unions]`). A parse's tree depends on them, so its
-    /// key must hold them.
+    /// The same tokens, every one parsed under `extensions` too: a file of a crate that turned
+    /// them on (`#![blaze::uniq]`, `#![blaze::error_unions]`). A parse's tree depends on them,
+    /// so its key must hold them.
     #[inline]
     pub fn with_extensions(self, extensions: Extensions) -> Tokens<'t> {
         Tokens { extensions, ..self }
     }
 
-    /// The syntax extensions the tokens are parsed under.
+    /// Every extension some token is parsed under: none means Rust's grammar throughout.
     #[inline]
-    pub(crate) fn extensions(self) -> Extensions {
-        self.extensions
+    pub(crate) fn any_extensions(self) -> Extensions {
+        self.extensions.with(self.marked)
+    }
+
+    /// The syntax extensions token `idx` is parsed under: the whole input's and its own
+    /// word's. The grammar asks it of the token that makes the extension's form (the `uniq`
+    /// of `&uniq T`, the `|` of `A | B`), so a macro's tokens and its caller's each keep
+    /// their own crate's syntax in one expansion.
+    #[inline]
+    pub(crate) fn extensions_at(self, idx: usize) -> Extensions {
+        match self.marked.is_none() {
+            true => self.extensions,
+            false => self.extensions.with(extensions_of(self.words[idx])),
+        }
+    }
+
+    /// Every extension some word is marked with ([`Input::mark_extensions`]).
+    #[inline]
+    pub fn marked(self) -> Extensions {
+        self.marked
     }
 
     /// The same tokens, with a fragment start on token 0 not counted: a token tree's view that
@@ -405,6 +483,40 @@ mod tests {
         assert!(!input.is_joint(input.len()) && !input.is_fragment_start(input.len() + 7));
         input.clear();
         assert!(input.is_empty());
+    }
+
+    /// A token marked with extensions is parsed under them and the input's, another token of
+    /// the same input under the input's alone, and the marks disturb no other field.
+    #[test]
+    fn a_marked_token_has_its_extensions() {
+        let mut input = Input::with_capacity(0);
+        input.push(SyntaxKind::AMP, Edition::Edition2021);
+        let from = input.len();
+        input.push_ident(SyntaxKind::UNIQ_KW, Edition::Edition2021);
+        input.was_joint();
+        input.mark_extensions(from, Extensions::UNIQ);
+        input.mark_extensions(input.len(), Extensions::ERROR_UNIONS);
+        input.push(SyntaxKind::PIPE, Edition::Edition2015);
+        input.mark_extensions(input.len(), Extensions::NONE);
+        let tokens = input.tokens();
+        assert_eq!(tokens.marked(), Extensions::UNIQ);
+        assert_eq!(tokens.any_extensions(), Extensions::UNIQ);
+        let at = |tokens: Tokens<'_>| [0, 1, 2].map(|i| tokens.extensions_at(i));
+        assert_eq!(at(tokens), [Extensions::NONE, Extensions::UNIQ, Extensions::NONE]);
+        let both = Extensions::UNIQ.with(Extensions::ERROR_UNIONS);
+        let unions = tokens.with_extensions(Extensions::ERROR_UNIONS);
+        assert_eq!(unions.any_extensions(), both);
+        assert_eq!(at(unions), [Extensions::ERROR_UNIONS, both, Extensions::ERROR_UNIONS]);
+        let ident = (SyntaxKind::IDENT, SyntaxKind::UNIQ_KW, Edition::Edition2021, true, false);
+        assert_eq!(tokens.token(1), ident);
+        let words: Vec<u32> = tokens.words.to_vec();
+        let borrowed = Tokens::new(&words, true);
+        assert_eq!((borrowed.marked(), at(borrowed)), (tokens.marked(), at(tokens)));
+        let mut copy = Input::with_capacity(0);
+        copy.extend_from_words(&words[1..2]);
+        assert_eq!(copy.tokens().extensions_at(0), Extensions::UNIQ);
+        copy.clear();
+        assert_eq!(copy.tokens().marked(), Extensions::NONE);
     }
 
     /// The unpadded words of `input`'s tokens, read as before the pad: through

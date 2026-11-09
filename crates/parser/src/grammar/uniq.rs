@@ -2,9 +2,12 @@
 //!
 //! In a crate that says `#![blaze::uniq]` ([`crate::Extensions::UNIQ`]), `uniq` is a keyword
 //! in exactly four places and an identifier everywhere else; in every other crate it is always
-//! an identifier and the grammar is rustc's, token for token. Where it is the keyword it goes in
-//! the tree as a `mut` token whose text is `uniq` (`Parser::bump_remap`), so the tree has the
-//! shape of the `mut` spelling and everything after the parser reads one form of each.
+//! an identifier and the grammar is rustc's, token for token. The crate is the one whose source
+//! wrote the `uniq` token (`Parser::uniq_gate`): in a macro's expansion, the macro's crate for
+//! the macro's own tokens and the caller's for the tokens it passed, as with editions. Where
+//! it is the keyword it goes in the tree as a `mut` token whose text is `uniq`
+//! (`Parser::bump_remap`), so the tree has the shape of the `mut` spelling and everything after
+//! the parser reads one form of each.
 //!
 //! Which `uniq` is the keyword is told by the token after it, as `&raw const` and `&raw mut`
 //! are told from a borrow of a variable named `raw`:
@@ -41,8 +44,8 @@ const EXPR_GOES_ON: TokenSet =
 /// Whether the parser, just past the `&` and lifetime of a reference type, is at the keyword
 /// `uniq` of `&uniq T`.
 pub(super) fn at_type(p: &Parser<'_>) -> bool {
-    p.uniq_gate()
-        && p.at_contextual_kw(T![uniq])
+    p.at_contextual_kw(T![uniq])
+        && p.uniq_gate(0)
         && !TYPE_GOES_ON.contains(p.nth(1))
         && types::TYPE_FIRST.contains(p.nth(1))
 }
@@ -50,8 +53,8 @@ pub(super) fn at_type(p: &Parser<'_>) -> bool {
 /// Whether the parser, just past the `&` of a borrow, is at the keyword `uniq` of
 /// `&uniq expr`.
 pub(super) fn at_expr(p: &Parser<'_>) -> bool {
-    p.uniq_gate()
-        && p.at_contextual_kw(T![uniq])
+    p.at_contextual_kw(T![uniq])
+        && p.uniq_gate(0)
         && !EXPR_GOES_ON.contains(p.nth(1))
         && expressions::EXPR_FIRST.contains(p.nth(1))
 }
@@ -59,11 +62,11 @@ pub(super) fn at_expr(p: &Parser<'_>) -> bool {
 /// Whether token `n` is the `uniq` of a receiver `&uniq self`; the caller checks that an
 /// isolated `self` follows it.
 pub(super) fn nth_at_receiver(p: &Parser<'_>, n: usize) -> bool {
-    p.uniq_gate() && p.nth_at_contextual_kw(n, T![uniq])
+    p.nth_at_contextual_kw(n, T![uniq]) && p.uniq_gate(n)
 }
 
 /// Whether the parser, just past the `ref` of a binding, is at the keyword `uniq` of
 /// `ref uniq x`.
 pub(super) fn at_ref_binding(p: &Parser<'_>) -> bool {
-    p.uniq_gate() && p.at_contextual_kw(T![uniq]) && p.nth_at(1, IDENT)
+    p.at_contextual_kw(T![uniq]) && p.uniq_gate(0) && p.nth_at(1, IDENT)
 }

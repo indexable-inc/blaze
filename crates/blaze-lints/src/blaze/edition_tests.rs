@@ -743,7 +743,7 @@ pub fn mix(a: u32, b: u32) -> u32 {
 /// `mut_ref`'s crate: each unique reference spelled with `mut` (receivers with and without a
 /// lifetime, types, borrows, one whose operand starts with `<`, a `ref mut` binding), beside
 /// what it leaves alone (a `&uniq` already, `let mut`, a `mut` binding, `*mut`, `&raw mut`,
-/// and what a macro writes).
+/// and what a macro's definition writes).
 const UNIQ_MAIN: &str = r#"
 #![blaze::uniq]
 pub struct S { pub n: u32 }
@@ -824,6 +824,61 @@ fn mut_ref_fix_respells_mut_as_uniq() {
         assert!(after.contains(want), "{want:?} in:\n{after}");
     }
     assert_eq!(after.matches("uniq").count(), 1 + 1 + 8, "{after}");
+}
+
+/// A crate that hands a macro call unique references spelled with `mut`: the arguments of a
+/// `macro_rules!` call, and what the macro's own definition writes (left alone).
+const UNIQ_HANDED: &str = r#"
+#![blaze::uniq]
+pub fn take(r: &uniq u32) { *r = 1; }
+macro_rules! pass {
+    ($e:expr) => { { let mut own = 0u32; take(&mut own); $e } };
+}
+pub fn handed() {
+    let mut x = 0u32;
+    pass!(take(&mut x));
+    pass!(take(&uniq x));
+}
+"#;
+
+/// What a macro call of the file is handed is found where the file writes it and fixed there,
+/// and the fixed call still expands, parses and lints clean (`fixed_mut_ref` lints it again):
+/// a token keeps its crate's syntax through the macro. What the macro's definition wrote is
+/// left alone.
+#[test]
+fn mut_ref_finds_and_fixes_what_a_macro_call_is_handed() {
+    let found = only("mut_ref", UNIQ_HANDED);
+    assert_eq!(found.matches("which `#![blaze::uniq]` spells").count(), 1, "{found}");
+    assert!(found.contains("pass!(take(&mut x));"), "at the call's own text:\n{found}");
+    let after = fixed_mut_ref(UNIQ_HANDED);
+    for want in [
+        "    pass!(take(&uniq x));\n    pass!(take(&uniq x));\n",
+        "($e:expr) => { { let mut own = 0u32; take(&mut own); $e } };",
+        "let mut x = 0u32;",
+    ] {
+        assert!(after.contains(want), "{want:?} in:\n{after}");
+    }
+}
+
+/// A function under an attribute macro (`#[test]`), which is linted as the expansion the
+/// macro makes of it: its `&mut` is found and fixed in the file, and the fixed function, read
+/// again through the expansion, lints clean.
+#[test]
+fn mut_ref_finds_and_fixes_a_function_under_an_attribute_macro() {
+    const MAIN: &str = r#"
+#![blaze::uniq]
+pub fn take(r: &uniq u32) { *r = 1; }
+#[test]
+fn under_test() {
+    let mut x = 0u32;
+    take(&mut x);
+}
+"#;
+    let found = only("mut_ref", MAIN);
+    assert_eq!(found.matches("which `#![blaze::uniq]` spells").count(), 1, "{found}");
+    let after = fixed_mut_ref(MAIN);
+    assert!(after.contains("    take(&uniq x);\n"), "{after}");
+    assert!(after.contains("let mut x = 0u32;"), "{after}");
 }
 
 /// In a crate without `#![blaze::uniq]`, `uniq` is no keyword, so `mut_ref` says nothing.

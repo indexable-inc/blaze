@@ -115,8 +115,8 @@ impl Reparse {
 
     /// The parse of `text` (this one's text) in `edition` and under `extensions`, an outline
     /// when `outline`, made from the kept parse when there is one, else read from `stored` when
-    /// it has the text's ([`Trees`], which keeps parses under no extensions only); kept for the
-    /// next text. A stored parse that is not the text's is an error.
+    /// it has the text's under those extensions ([`Trees`]); kept for the next text. A stored
+    /// parse that is not the text's is an error.
     pub(crate) fn parse(
         &self,
         text: &Text,
@@ -129,7 +129,6 @@ impl Reparse {
         if let Some(own) = self.own(edition, extensions, outline) {
             return Ok(own);
         }
-        let stored = stored.filter(|_| extensions.is_none());
         let parse = match self.previous(edition, extensions, outline) {
             Some((previous, delete)) => {
                 #[cfg(test)]
@@ -142,11 +141,13 @@ impl Reparse {
                 parse
             }
             None => match stored {
-                Some(stored) => match stored.map(self.slot.id, text, edition, outline)? {
-                    Some(parse) => parse,
-                    // clone: a refcount, as above.
-                    None => whole(text.clone(), edition, extensions, outline),
-                },
+                Some(stored) => {
+                    match stored.map(self.slot.id, text, edition, outline, extensions)? {
+                        Some(parse) => parse,
+                        // clone: a refcount, as above.
+                        None => whole(text.clone(), edition, extensions, outline),
+                    }
+                }
                 // clone: a refcount, as above.
                 None => whole(text.clone(), edition, extensions, outline),
             },
@@ -165,16 +166,17 @@ impl Reparse {
         self.slot.id
     }
 
-    /// The live outlines of this text made under no syntax extensions, by edition: what the
-    /// image stores of a library file (its key holds no extensions, so one made under an
-    /// extension is never stored).
-    pub(crate) fn kept_outlines(&self) -> impl Iterator<Item = (Edition, Parse<SourceFile>)> + '_ {
+    /// The live outlines of this text, by edition and syntax extensions: what the image
+    /// stores of a library file, each under its own key.
+    pub(crate) fn kept_outlines(
+        &self,
+    ) -> impl Iterator<Item = (Edition, Extensions, Parse<SourceFile>)> + '_ {
         self.slot
             .kept
             .iter()
             .filter_map(OnceLock::get)
-            .filter(|kept| kept.outline && kept.extensions.is_none())
-            .filter_map(|kept| Some((kept.edition, kept.parse.upgrade()?)))
+            .filter(|kept| kept.outline)
+            .filter_map(|kept| Some((kept.edition, kept.extensions, kept.parse.upgrade()?)))
     }
 
     /// Takes `parse`, a full parse its caller made of this text in `edition` (an edit's tree

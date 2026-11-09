@@ -49,10 +49,10 @@ pub(crate) struct Parser<'t> {
     /// whole file or expansion, where `T is` was never valid; false for a macro fragment
     /// (`$t:ty`), so a `macro_rules!` matcher takes exactly the tokens it took before.
     bare_pattern_types: bool,
-    /// Whether a type here may be an error union `A | B` (`#![blaze::error_unions]`): the
-    /// input's extension, off while a type is read where Rust lets a `|` follow one (a
-    /// closure's parameters, after `as`) and inside one union's members
-    /// ([`Parser::with_unions`]).
+    /// Whether a type here may be an error union `A | B` (`#![blaze::error_unions]`): whether
+    /// some token of the input has the extension, off while a type is read where Rust lets a
+    /// `|` follow one (a closure's parameters, after `as`) and inside one union's members
+    /// ([`Parser::with_unions`]). The `|` itself must have it ([`Parser::union_bar_gate`]).
     unions: bool,
 }
 
@@ -70,7 +70,7 @@ impl<'t> Parser<'t> {
             outline: false,
             closed_curlies: None,
             bare_pattern_types: true,
-            unions: inp.extensions().error_unions(),
+            unions: inp.any_extensions().error_unions(),
         }
     }
 
@@ -90,10 +90,18 @@ impl<'t> Parser<'t> {
         self.unions
     }
 
-    /// Runs `parse` with error unions allowed (`true`, inside a delimiter: only when the
-    /// input's extensions have them) or not (`false`), then puts back what was allowed before.
+    /// Whether the current token, the `|` after a type, is of a crate that says
+    /// `#![blaze::error_unions]`: only then does it go on with an error union. A `|` another
+    /// crate wrote (a macro's own, expanded here) ends the type, as in Rust.
+    pub(crate) fn union_bar_gate(&self) -> bool {
+        self.inp.extensions_at(self.pos).error_unions()
+    }
+
+    /// Runs `parse` with error unions allowed (`true`, inside a delimiter: only when some
+    /// token of the input has the extension) or not (`false`), then puts back what was allowed
+    /// before.
     pub(crate) fn with_unions(&mut self, allowed: bool, parse: impl FnOnce(&mut Parser<'t>)) {
-        let allowed = allowed && self.inp.extensions().error_unions();
+        let allowed = allowed && self.inp.any_extensions().error_unions();
         let before = std::mem::replace(&mut self.unions, allowed);
         parse(self);
         self.unions = before;
@@ -465,10 +473,12 @@ impl<'t> Parser<'t> {
         self.inp.edition(self.pos)
     }
 
-    /// Whether the parse is of a crate that says `#![blaze::uniq]`
-    /// ([`crate::Extensions::uniq`]): only then does `grammar/uniq.rs` take `uniq` as a keyword.
-    pub(crate) fn uniq_gate(&self) -> bool {
-        self.inp.extensions().uniq()
+    /// Whether token `n` from here, a `uniq`, is of a crate that says `#![blaze::uniq]`
+    /// ([`crate::Extensions::uniq`]): only then does `grammar/uniq.rs` take it as a keyword.
+    /// Asked of the `uniq` itself, so one a macro of another crate wrote keeps that crate's
+    /// reading wherever it is expanded.
+    pub(crate) fn uniq_gate(&self, n: usize) -> bool {
+        self.inp.extensions_at(self.pos + n).uniq()
     }
 }
 

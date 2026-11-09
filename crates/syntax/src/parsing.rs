@@ -35,17 +35,19 @@ pub(crate) fn parse_text(
     (Tree::new(Arc::new(tree)), errors)
 }
 
+/// The tree of `text` read at `entry` under `extensions`, those of the crate that wrote it.
 pub(crate) fn parse_text_at(
     text: &Text,
     entry: parser::TopEntryPoint,
     edition: Edition,
+    extensions: Extensions,
 ) -> (Tree, Vec<SyntaxError>) {
     let _p = tracing::info_span!(target: "blaze", "parse_text_at").entered();
     let lexed = parser::LexedStr::new(edition, text);
     let parser_input = lexed.to_input(edition);
-    let parser_output = entry.parse(&parser_input);
+    let parser_output = entry.parse(parser_input.tokens().with_extensions(extensions));
     let (tree, errors, _eof) =
-        build_tree(text.clone(), &lexed, &parser_output, edition, Extensions::NONE);
+        build_tree(text.clone(), &lexed, &parser_output, edition, extensions);
     (Tree::new(Arc::new(tree)), errors)
 }
 
