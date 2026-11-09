@@ -432,14 +432,21 @@ choice a value the program passes, like every other.
 #[blaze::memo]                      // a pure function chosen as a point the evaluator sees
 fn layout(ty: &Type, target: &Target) -> Layout { .. }
 
-fn main(cx: &Cx, io: Io) {
-    let eval = Eval::stored(&io.mem(), &store);        // or Eval::direct(), Eval::handler(my)
-    with eval { compile(cx, &krate) }                  // every memo point below goes through it
+fn size_of(eval: &Eval, s: &Struct, target: &Target) -> u64 {
+    s.fields.iter().map(|f| eval.call(layout, (&f.ty, target)).size).sum()
+}
+
+fn main(cx: &Cx, io: Io) -> Result<(), Error> {
+    let eval = Eval::memo(&io.need_mem()?);            // or direct(), stored(..), handler(..)
+    compile(cx, &eval, &krate)
 }
 ```
 
-- **A memo point is a pure function marked `#[blaze::memo]`.** A call to it becomes
-  `eval.run(point, &args, || body)`: the point's code identity, the arguments, and a way to
+`Eval` is an ordinary parameter, passed down like `cx`. Calling `layout(..)` directly still
+works and simply runs it.
+
+- **A memo point is a pure function marked `#[blaze::memo]`.** `eval.call(f, args)` hands the
+  evaluator the point's code identity, the arguments, and a way to
   compute. Purity is what makes this sound: the arguments are everything the result depends on.
   Only marked functions pay for it; an ordinary pure call is an ordinary call.
 - **The key is derived, not written**: the function's code identity plus its arguments, by
@@ -462,8 +469,8 @@ fn main(cx: &Cx, io: Io) {
   its inputs, so the evaluator holds the whole graph of what was computed from what. `blaze why`
   is that graph for the compiler; a program gets the same for its own values by choosing an
   evaluator that keeps it.
-- With no `Eval` in scope the default is direct, so a library can mark points without making its
-  users choose anything.
+- A library that marks points takes `&Eval` where it calls them; a caller with no opinion passes
+  `Eval::direct()`.
 
 This is the third place bstd lets a program supply its own machinery, after the host behind `Io`
 (the boundary) and a capability's provider (`Http::handler`). None of them is a compiler plug-in:
