@@ -114,12 +114,16 @@ fn emit_tag(out: &mut Inline, at: &mut usize, tag: harness_native_ui_inline::Tag
     if tag.mark {
         push(out, at, crate::text::HOLE);
     }
-    out.runs.push(Run { start, end: *at, face: Face::InlineRef });
+    // A cited phrase keeps the face of the words around it; a chip has its own.
+    if !tag.plain {
+        out.runs.push(Run { start, end: *at, face: Face::InlineRef });
+    }
     out.tags.push(InlineTag { start, end: *at, meta, tag });
 }
 
 impl Inline {
-    /// The holes in the words, in order, for words set at `size`: the components' icons [`REF_ICON_EM`] wide, as tall as
+    /// The holes in the words, in order, for words set at `size`: the components' icons [`REF_ICON_EM`] wide (none wide
+    /// for a cited phrase, which has no icon), as tall as
     /// the words, and after a label with a mark, [`MARK_EM`] wide; each formula as wide and tall as `look` sets it
     /// ([`InlineMath::hole`]).
     #[must_use]
@@ -128,7 +132,7 @@ impl Inline {
         let mut out: Vec<Hole> = self
             .tags
             .iter()
-            .flat_map(|t| std::iter::once(hole(t.start, REF_ICON_EM)).chain(t.mark().map(|m| hole(m, MARK_EM))))
+            .flat_map(|t| std::iter::once(hole(t.start, if t.tag.plain { 0.0 } else { REF_ICON_EM })).chain(t.mark().map(|m| hole(m, MARK_EM))))
             .chain(self.math.iter().map(|f| f.hole(size, look)))
             .collect();
         out.sort_by_key(|h| h.start);
@@ -896,7 +900,7 @@ mod tests {
     #[test]
     fn links_to_pull_requests_are_chips() {
         use harness_native_ui_inline::{Form, install};
-        let pr = Form { label: "#{n}".to_owned(), mark: true, href: "https://github.com/{repo}/pull/{n}".to_owned(), url: String::new() };
+        let pr = Form { label: "#{n}".to_owned(), mark: true, href: "https://github.com/{repo}/pull/{n}".to_owned(), url: String::new(), plain: false };
         let link = Form { url: "href".to_owned(), ..Form::default() };
         install(std::collections::BTreeMap::from([("PR".to_owned(), pr), ("Link".to_owned(), link)]));
         let url = "https://github.com/indexable-inc/blaze/pull/1770";
