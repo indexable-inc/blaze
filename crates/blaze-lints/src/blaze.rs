@@ -11,6 +11,7 @@
 
 mod alloc;
 mod arc_clone_only_borrowed;
+mod async_fn;
 mod blocking_in_async;
 mod blocking_on_pool;
 mod bool_param;
@@ -33,6 +34,8 @@ mod dos_hasher_on_input;
 mod dropped_error;
 mod dyn_fn_param;
 mod dyn_in_hot_field;
+#[cfg(test)]
+mod edition_tests;
 mod effects;
 #[cfg(test)]
 mod effects_tests;
@@ -48,6 +51,7 @@ mod fixed_key_lookup;
 mod fmt_allocates;
 mod front_vec_ops;
 mod frozen_collection;
+mod global_state;
 mod general_facts;
 mod goose_fields;
 mod goose_locals;
@@ -68,6 +72,7 @@ mod lenient_deserialize_tests;
 mod lock_across_query;
 mod lock_held_across_slow;
 mod loops;
+mod lossy_as;
 mod missing_size_hint;
 mod native_contracts;
 mod open_wait_loop;
@@ -230,6 +235,9 @@ pub enum Lint {
     ThreadLocalInWaitingFn,
     LenientDeserialize,
     LockHeldAcrossSlow,
+    LossyAs,
+    GlobalState,
+    AsyncFn,
 }
 
 /// Which workspaces a lint is for.
@@ -246,6 +254,10 @@ pub(crate) enum Kind {
     /// depends on) or it can't see whether the code is hot: allowed until a workspace or crate
     /// turns it, or the group `blaze::pedantic_perf`, on.
     PedanticPerf,
+    /// It flags what the blaze edition removes (docs/v2/plan/design/edition.md): allowed until
+    /// a workspace or crate turns it, or the group `blaze::edition`, on to get ready for the
+    /// edition; under the edition each is an error.
+    Edition,
 }
 
 /// The lints that are `deny` by default rather than their kind's level: they fire only where
@@ -392,6 +404,9 @@ impl Lint {
         Lint::ThreadLocalInWaitingFn,
         Lint::LenientDeserialize,
         Lint::LockHeldAcrossSlow,
+        Lint::LossyAs,
+        Lint::GlobalState,
+        Lint::AsyncFn,
     ];
 
     /// Which workspaces the lint is for ([`Kind`]); written out per lint, so a new one chooses.
@@ -450,6 +465,8 @@ impl Lint {
             Lint::DeepDropAtExit | Lint::PodSerializedByField | Lint::Packable | Lint::SoaCandidate => {
                 Kind::PedanticPerf
             }
+            // What the blaze edition removes; right for any crate getting ready for it.
+            Lint::LossyAs | Lint::GlobalState | Lint::AsyncFn => Kind::Edition,
             // `blaze::hot` and its comments (`// clone:`, `// alloc:`, `// dyn:`).
             Lint::HotClone
             | Lint::HotAlloc
@@ -591,6 +608,9 @@ impl Lint {
             Lint::ThreadLocalInWaitingFn => "thread_local_in_waiting_fn",
             Lint::LenientDeserialize => "lenient_deserialize",
             Lint::LockHeldAcrossSlow => "lock_held_across_slow",
+            Lint::LossyAs => "lossy_as",
+            Lint::GlobalState => "global_state",
+            Lint::AsyncFn => "async_fn",
         }
     }
 
@@ -683,6 +703,9 @@ impl Lint {
             Lint::ThreadLocalInWaitingFn => concat!(docs!(), "#thread_local_in_waiting_fn"),
             Lint::LenientDeserialize => concat!(docs!(), "#lenient_deserialize"),
             Lint::LockHeldAcrossSlow => concat!(docs!(), "#lock_held_across_slow"),
+            Lint::LossyAs => concat!(general_docs!(), "#lossy_as"),
+            Lint::GlobalState => concat!(general_docs!(), "#global_state"),
+            Lint::AsyncFn => concat!(general_docs!(), "#async_fn"),
             Lint::FiberBoundary => {
                 "https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan.md"
             }
@@ -931,6 +954,15 @@ impl Lint {
             Lint::DynInHotField => {
                 "take the implementation as a type parameter (`struct S<F: Fn(..)>`) so the call is direct and inlinable, which costs one copy of the code per type used; or say why with `#[expect(blaze::dyn_in_hot_field, reason = \"..\")]`"
             }
+            Lint::LossyAs => {
+                "convert with `From` where it can't lose (`u64::from(x)`), `T::try_from(x)` where it can, or the method that names the loss (`cast_signed`, `cast_unsigned`, `wrapping_*`, `ptr.addr()`); or say why with `#[expect(blaze::lossy_as, reason = \"..\")]`"
+            }
+            Lint::GlobalState => {
+                "give the state one owner and pass it, or a handle to it, as a context to the code the finding lists as using it; or say why it stays global with `#[expect(blaze::global_state, reason = \"..\")]`"
+            }
+            Lint::AsyncFn => {
+                "write it as a plain function run on a fiber: a wait parks the fiber and the may-suspend effect is inferred, so neither `async` nor `.await` is written; or say why with `#[expect(blaze::async_fn, reason = \"..\")]`"
+            }
             Lint::FrozenCollection => {
                 "make the field a `Box<[T]>` (`Box<str>` for a string), built once with `into_boxed_slice()` / `into_boxed_str()`; or say why it stays growable with `#[expect(blaze::frozen_collection, reason = \"..\")]`"
             }
@@ -997,6 +1029,16 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         cold_error::check_fn(cx, f);
         profiled::check_fn(cx, f);
         native_contracts::check(cx, f);
+        async_fn::check_fn(cx, f);
+    }
+    if matches!(node.kind(), syntax::SyntaxKind::BLOCK_EXPR | syntax::SyntaxKind::CLOSURE_EXPR) {
+        async_fn::check_expr(cx, node);
+    }
+    if let Some(item) = ast::Static::cast(node) {
+        global_state::check(cx, item);
+    }
+    if let Some(call) = ast::MacroCall::cast(node) {
+        global_state::check_thread_local(cx, call);
     }
     if let Some(item) = ast::Enum::cast(node) {
         large_move::check_enum(cx, item);
@@ -1076,6 +1118,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         front_vec_ops::check(cx);
         fmt_allocates::check(cx);
         stable_sort_needless::check(cx);
+        lossy_as::check(cx);
         check_body(cx);
     }
 }

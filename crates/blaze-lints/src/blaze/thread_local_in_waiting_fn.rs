@@ -241,8 +241,8 @@ fn item_path(db: &Db, module: hir::Module, name: &str) -> String {
     path
 }
 
-/// How a finding names the body `def`: `` `fn Build::walk` ``.
-fn owner_said(db: &Db, def: DefWithBodyId) -> String {
+/// How a finding names the body `def`: `` `fn Build::walk` `` (`global_state` names its uses so).
+pub(super) fn owner_said(db: &Db, def: DefWithBodyId) -> String {
     match def {
         DefWithBodyId::FunctionId(f) => fn_said(db, f),
         _ => {
