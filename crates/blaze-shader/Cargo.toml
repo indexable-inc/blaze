@@ -21,9 +21,11 @@ rustc_type_ir.workspace = true
 
 base-db.workspace = true
 hir-def.workspace = true
+hir-expand.workspace = true
 hir-ty.workspace = true
 hir-ty-mir.workspace = true
 hir-ty-pure.workspace = true
+intern.workspace = true
 
 # naga's IR, validator and writers (MSL for Metal; SPIR-V and WGSL for the other back ends the plan
 # names). Pinned exactly: the IR is the backend's interface, and a minor release changes it.
