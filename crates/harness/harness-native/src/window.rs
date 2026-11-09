@@ -626,33 +626,6 @@ define_class!(
             wake();
         }
 
-        /// A right click (or control-click) on a tree row: what can be done to its object.
-        #[unsafe(method_id(menuForEvent:))]
-        fn menu_for_event(&self, event: &NSEvent) -> Option<Retained<NSMenu>> {
-            self.context_menu(event)
-        }
-
-        #[unsafe(method(ctxKill:))]
-        fn ctx_kill(&self, sender: &NSMenuItem) {
-            let e = sender.tag() as u64;
-            with(|st| st.app.kill_object(e));
-            wake();
-        }
-
-        #[unsafe(method(ctxPin:))]
-        fn ctx_pin(&self, sender: &NSMenuItem) {
-            let e = sender.tag() as u64;
-            with(|st| st.app.toggle_pin(e));
-            wake();
-        }
-
-        #[unsafe(method(ctxUnarchive:))]
-        fn ctx_unarchive(&self, sender: &NSMenuItem) {
-            let e = sender.tag() as u64;
-            with(|st| st.app.unarchive(e));
-            wake();
-        }
-
         #[unsafe(method(windowDidBecomeKey:))]
         fn did_become_key(&self, _note: &NSNotification) {
             with(|st| {
@@ -911,35 +884,6 @@ impl HarnessView {
         });
         play(&pulses.unwrap_or_default());
         wake();
-    }
-
-    fn context_menu(&self, event: &NSEvent) -> Option<Retained<NSMenu>> {
-        let p = self.local(event);
-        let (x, y) = (p.x as f32, p.y as f32);
-        let mtm = self.mtm();
-        let menu = NSMenu::new(mtm);
-        menu.setAutoenablesItems(false);
-        let add = |title: &str, action: objc2::runtime::Sel, tag: u64| {
-            let it = item(mtm, title, action, "");
-            // SAFETY: the view outlives the menu it pops up; the item only holds it weakly.
-            unsafe { it.setTarget(Some(self)) };
-            it.setTag(tag as isize);
-            menu.addItem(&it);
-        };
-        let e = with(|st| st.app.object_at(x, y)).flatten()?;
-        let (archived, pinned, object) =
-            with(|st| (st.app.is_archived(e), st.app.is_pinned(e), st.app.is_object(e)))
-                .unwrap_or_default();
-        if !object {
-            return None;
-        }
-        if archived {
-            add("Unarchive", sel!(ctxUnarchive:), e);
-        } else {
-            add(if pinned { "Don't Keep in Tree" } else { "Keep in Tree" }, sel!(ctxPin:), e);
-            add("Kill", sel!(ctxKill:), e);
-        }
-        Some(menu)
     }
 
     /// Tell the app where the title bar is (Ghostty's layout: the traffic lights centred in a strip as tall as AppKit's

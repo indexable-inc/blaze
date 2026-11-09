@@ -932,6 +932,81 @@ mod tests {
         assert_eq!(activated, [Some(r#"ui:["test.0","h1",null]"#.to_owned())], "the press activates the button and only it");
     }
 
+    /// Property `choice-wraps-never-cuts`: a Choice whose options fit stays one row; one whose options do not wraps them
+    /// onto more rows inside the room it has, each short option at its own full width (never cut for a long neighbour's
+    /// sake), and an option wider than the whole row wraps its own words onto more lines within the row.
+    #[test]
+    fn choice_wraps_never_cuts() {
+        use harness_native_ui_layout_api::Intrinsic;
+        use harness_native_ui_text_api::{OneLine, Truncate};
+        let world = crate::app::scene_world().unwrap_or_else(|e| panic!("{e}"));
+        let w = world.world_ref();
+        harness_native_ui_layout::install(w);
+        harness_native_ui_input::install(w);
+        harness_native_ui_motion::install(w);
+        world.set(Clock::default());
+        world.set(Viewport { w: 360.0, h: 1400.0 });
+        let long = "Mix: comet while it works, ember while it rests, and the wordmark on the splash screen until the first frame lands";
+        let ui = serde_json::json!([
+            {"type": "Choice", "props": {"options": ["A", "B", "C"], "selected": "B", "onChange": "h1"}, "children": []},
+            {"type": "Choice", "props": {"options": ["Comet", "Pixel art", "Ember", long], "selected": "Comet", "onChange": "h2"}, "children": []}
+        ]);
+        let row = View::root(w, "hn.ChatUi");
+        let mut measure = |s: &str, st: &TextStyle, _md: bool| s.chars().count() as f32 * st.size.max(1.0) * 0.55;
+        for _ in 0..8 {
+            fill(row, &ui, "test.0", None, false, &mut measure);
+            harness_native_ui_layout::typeset::typeset(w, &mut harness_native_ui_layout::typeset::Estimate);
+            world.get::<&mut Clock>(|c| c.time += 1.0 / 60.0);
+            world.progress_time(1.0 / 60.0);
+        }
+        let body = row.part("body").expect("body");
+        let el = |i: usize| body.part(&format!("g{i}")).unwrap_or_else(|| panic!("element {i}"));
+        let laid = |v: View<'_>, what: &str| {
+            let l = v.entity().try_cloned::<&Laid>().unwrap_or_else(|| panic!("{what} is not laid out"));
+            assert!(l.w > 0.0 && l.h > 0.0, "{what} has no room: {l:?}");
+            l
+        };
+        fn option(c: View<'_>, n: usize) -> View<'_> {
+            c.part(&format!("o{n}")).unwrap_or_else(|| panic!("option o{n}"))
+        }
+        fn label(o: View<'_>) -> View<'_> {
+            o.part("label").expect("an option's label")
+        }
+        let natural = |o: View<'_>| label(o).entity().try_cloned::<&Intrinsic>().expect("a measured label");
+        for c in [el(0), el(1)] {
+            for n in 0..3 {
+                let l = label(option(c, n));
+                assert!(!l.entity().has(OneLine::id()) && !l.entity().has(Truncate::id()), "an option's words are never cut to one line");
+            }
+        }
+
+        // Three short options fit: one row, side by side, each at its own width.
+        let few = laid(el(0), "the short choice");
+        let tops: Vec<f32> = (0..3).map(|n| laid(option(el(0), n), "a short option").y).collect();
+        assert!(tops.iter().all(|y| (y - tops[0]).abs() < 0.5), "options that fit share one row: {tops:?}");
+        assert!(few.h < 40.0, "a choice that fits is one control tall: {few:?}");
+
+        // Four that do not fit: they wrap, none past the plate, the short ones whole and the long one wrapped in the row.
+        let plate = laid(el(1), "the wrapping choice");
+        assert!(plate.w <= 360.0 + 0.5, "the choice keeps to the room it has: {plate:?}");
+        let opts: Vec<Laid> = (0..4).map(|n| laid(option(el(1), n), "an option")).collect();
+        for (n, o) in opts.iter().enumerate() {
+            assert!(o.x >= plate.x - 0.5 && o.x + o.w <= plate.x + plate.w + 0.5, "option o{n} stays inside the plate: {o:?} in {plate:?}");
+            assert!(o.y >= plate.y - 0.5 && o.y + o.h <= plate.y + plate.h + 0.5, "the plate is as tall as its rows: o{n} {o:?} in {plate:?}");
+        }
+        for n in 0..3 {
+            let (o, words) = (option(el(1), n), natural(option(el(1), n)));
+            let l = laid(label(o), "a short option's words");
+            assert!(l.w + 0.5 >= words.w, "short option o{n} keeps its full width: {l:?} for {words:?}");
+        }
+        let (big, words) = (opts[3], natural(option(el(1), 3)));
+        let big_words = laid(label(option(el(1), 3)), "the long option's words");
+        assert!(words.w > plate.w, "the long option is wider than the row: {words:?} vs {plate:?}");
+        assert!(big.y > opts[0].y + 0.5, "the long option wraps onto a row of its own: {big:?} after {:?}", opts[0]);
+        assert!(big_words.w < words.w && big_words.h > 16.0 * 1.5, "the long option wraps its words: {big_words:?} for {words:?}");
+        assert!(big.h > opts[0].h, "and is as tall as its lines: {big:?} vs {:?}", opts[0]);
+    }
+
     /// Property `tier-three-draws-and-sends`: every tier-3 element draws from a tree (laid out, with room), each press
     /// is armed with the events it sends (a tab its value, a disclosure's head `!open`, an accordion's closed head the open
     /// one's close then its own open, a popover's trigger and its button `!open`, a menu row its pick then the close, a
@@ -1068,7 +1143,7 @@ mod tests {
         assert!((pic.w - 96.0).abs() < 0.5 && (pic.h - 96.0).abs() < 0.5, "a 96 by 96 image: {pic:?}");
         assert_eq!(el(1).part("g0").and_then(|i| i.part("pic")).and_then(|p| p.entity().try_cloned::<&harness_native_ui_text_api::Picture>()).map(|p| p.handle.as_str().to_owned()), Some(icon.clone()));
         let badge = laid(part(el(1), "g1.g0"), "the layer's badge");
-        assert!((stack.w - 96.0).abs() < 0.5, "a layer adds no size to its stack: {stack:?}");
+        assert!((stack.w - 96.0).abs() < 0.5 && (stack.h - 96.0).abs() < 0.5, "a stack is as big as its largest child, here the image over a smaller layer: {stack:?}");
         assert!((badge.x + badge.w - (stack.x + stack.w - 4.0)).abs() < 0.5 && (badge.y - stack.y - 4.0).abs() < 0.5, "the badge at the top right, 4 in: {badge:?} in {stack:?}");
         assert_eq!(action(part(el(2), "g0")), Some(one("h2", "true")), "a chip with no value sends !selected");
         assert!(is(part(el(2), "g1"), "hn.GenChipOn"));
@@ -1267,6 +1342,62 @@ mod tests {
             let t = words_of(el(i));
             assert!(t.contains(says), "element {i} is refused in words: {t:?}");
         }
+    }
+
+    /// Property `layers-size-their-stack`: a Stack whose children are all Layers is as big as its largest Layer's content
+    /// (here a 280 by 30 Shader), not 0 by 0, and a Text in another Layer is proposed the stack's width, so it sits on one
+    /// line at its anchor (the left, centred down) instead of wrapping a character a line.
+    #[test]
+    fn layers_size_their_stack() {
+        use harness_native_ui_layout_api::Intrinsic;
+        let world = crate::app::scene_world().unwrap_or_else(|e| panic!("{e}"));
+        let w = world.world_ref();
+        harness_native_ui_layout::install(w);
+        harness_native_ui_input::install(w);
+        harness_native_ui_motion::install(w);
+        world.set(Clock::default());
+        world.set(Viewport { w: 900.0, h: 2600.0 });
+        let ui = serde_json::json!([
+            {"type": "Stack", "props": {}, "children": [
+                {"type": "Layer", "props": {}, "children": [
+                    {"type": "Shader", "props": {"msl": "// msl", "key": "00000000000000ad", "uniforms": [], "textures": [],
+                        "width": 280, "height": 30, "animate": false, "pointer": false}, "children": []}]},
+                {"type": "Layer", "props": {"anchor": "left"}, "children": [
+                    {"type": "Text", "props": {"text": "fix model picker"}, "children": []}]}]},
+            {"type": "Text", "props": {"text": "after the stack"}, "children": []}
+        ]);
+        let live = std::cell::RefCell::new(Live::default());
+        let row = View::root(w, "hn.ChatUi");
+        let mut measure = |s: &str, st: &TextStyle, _md: bool| s.chars().count() as f32 * st.size.max(1.0) * 0.55;
+        for _ in 0..6 {
+            fill(row, &ui, "test.0", Some(&live), false, &mut measure);
+            harness_native_ui_layout::typeset::typeset(w, &mut harness_native_ui_layout::typeset::Estimate);
+            world.get::<&mut Clock>(|c| c.time += 1.0 / 60.0);
+            world.progress_time(1.0 / 60.0);
+        }
+        let body = row.part("body").expect("body");
+        let el = |i: usize| body.part(&format!("g{i}")).unwrap_or_else(|| panic!("element {i}"));
+        fn part<'w>(v: View<'w>, path: &str) -> View<'w> {
+            path.split('.').try_fold(v, |v, p| v.part(p)).unwrap_or_else(|| panic!("no part {path}"))
+        }
+        let laid = |v: View<'_>, what: &str| {
+            let l = v.entity().try_cloned::<&Laid>().unwrap_or_else(|| panic!("{what} is not laid out"));
+            assert!(l.w > 0.0 && l.h > 0.0, "{what} has no room: {l:?}");
+            l
+        };
+        let stack = laid(el(0), "the stack");
+        let fx = laid(part(el(0), "g0.g0"), "the shader");
+        assert!((fx.w - 280.0).abs() < 0.5 && (fx.h - 30.0).abs() < 0.5, "a 280 by 30 shader: {fx:?}");
+        assert!((stack.w - 280.0).abs() < 0.5 && (stack.h - 30.0).abs() < 0.5, "a stack of layers is its largest layer's size: {stack:?}");
+        let words = part(el(0), "g1.g0");
+        let t = laid(words, "the layer's text");
+        let unwrapped = words.entity().try_cloned::<&Intrinsic>().map_or(0.0, |i| i.w);
+        let line = words.entity().try_cloned::<&TextStyle>().map_or(0.0, |s| s.line);
+        assert!(unwrapped > 0.0 && unwrapped < 280.0, "the words are measured, narrower than the shader: {unwrapped}");
+        assert!(t.w + 0.5 >= unwrapped && t.h < line * 1.5, "the text is on one line: {t:?}, {unwrapped} wide unwrapped, lines {line} tall");
+        assert!((t.x - stack.x).abs() < 0.5 && t.y >= stack.y - 0.5 && t.y + t.h <= stack.y + stack.h + line, "the text at the stack's left: {t:?} in {stack:?}");
+        let after = laid(el(1), "the text after the stack");
+        assert!(after.y >= stack.y + stack.h - 0.5, "what follows the stack starts below it: {after:?} after {stack:?}");
     }
 }
 
