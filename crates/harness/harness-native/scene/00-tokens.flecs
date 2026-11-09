@@ -296,9 +296,9 @@ export const arch_time_w = 84
 export const tree_linger_s = 5
 // A finished run with no session leaves the live tree this long after it ended (seconds).
 export const archive_after_s = 600
-// How long after it ended a top-level session from before the daemon started (a chat restored after a restart) stays in
-// the tree before the Archive files it (seconds; a week).
-export const archive_past_after_s = 604800
+// How long after it ended a top-level session (a chat that exited, was stopped or lost its daemon) stays in the tree
+// before the Archive files it on its own (seconds; an hour). A message to it in the Archive brings it back.
+export const archive_done_after_s = 3600
 
 // Overlays over the window: the command palette (cmd+K) and the new-object picker (cmd+N), each a card on a scrim
 // (hn.Scrim, hn.OverlayCard in scene/widgets/palette.flecs), there at once and gone at once.
