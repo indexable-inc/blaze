@@ -1557,6 +1557,68 @@ impl App {
             let listed = (listed.s.as_str(), listed.effort.as_str());
             self.fill_chat_pick(bar, sid, t, model::kind_name(o), st.pick, &mut st.pick_nav, &mut st.effort, listed, ended, st.ctx_open);
         }
+        if let Some(strip) = pv.part("foot").and_then(|f| f.part("activity")) {
+            self.fill_chat_activity(strip, e, t, ended);
+        }
+    }
+
+    /// The strip over chat `e`'s composer: what runs for it now, one item each, in this order: its turn's step (what
+    /// the agent does), each command still running under it (its line), each sub-agent at work (its name), and the
+    /// messages it has not read yet. A command's or sub-agent's press selects it in the sidebar. Past
+    /// [`ACTIVITY_MAX`] items, one more says how many are left. Empty while nothing runs, and then without its air.
+    fn fill_chat_activity(&self, strip: View<'_>, e: u64, t: &Transcript, ended: bool) {
+        let w = self.world.world_ref();
+        let o = w.entity_from_id(e);
+        let mut items: Vec<(String, &'static str, String, String)> = Vec::new(); // alloc: a few items, a frame
+        let working = t.busy && !ended;
+        if working {
+            let words = turn_doing(t).unwrap_or_else(|| "Working\u{2026}".to_owned());
+            items.push(("step".to_owned(), ACT_STEP, words, String::new()));
+        }
+        o.each_child(|c| {
+            let id = *c.id();
+            if self.status_of(id) != "running" {
+                return;
+            }
+            if self.run_of(id).is_some() {
+                let name = c.try_cloned::<&model::Name>().map(|n| super::short_cmd(n.s.as_str())).unwrap_or_default();
+                items.push((format!("r{id}"), ACT_RUN, name, format!("select:{id}")));
+            } else if c.has(model::Object::id()) && c.has(model::Busy::id()) {
+                let name = c.try_cloned::<&model::Name>().map(|n| n.s.as_str().split_whitespace().collect::<Vec<_>>().join(" ")).unwrap_or_default();
+                items.push((format!("s{id}"), ACT_AGENT, name, format!("select:{id}")));
+            }
+        });
+        // Messages sent since the turn in flight began, which the agent reads only once it ends.
+        if working {
+            let since = t.items.iter().rposition(|i| matches!(i, Item::TurnEnd { .. })).map_or(0, |k| k + 1);
+            let sent = t.items[since..].iter().filter(|i| matches!(i, Item::User { .. })).count();
+            if sent > 1 {
+                let n = sent - 1;
+                items.push(("queued".to_owned(), ACT_QUEUED, format!("{n} message{} queued", if n == 1 { "" } else { "s" }), String::new()));
+            }
+        }
+        if items.len() > ACTIVITY_MAX {
+            let more = items.len() - (ACTIVITY_MAX - 1);
+            items.truncate(ACTIVITY_MAX - 1);
+            items.push(("more".to_owned(), ACT_MORE, format!("{more} more"), String::new()));
+        }
+        let air = if items.is_empty() { 0.0 } else { crate::look::width(w, "chat_activity_air") };
+        let pad = harness_native_ui_layout_api::Padding { l: 0.0, r: 0.0, t: 0.0, b: air };
+        if strip.entity().try_cloned::<&harness_native_ui_layout_api::Padding>() != Some(pad) {
+            strip.set(pad);
+        }
+        view::for_each(strip, "hn.ChatActivityItem", items.iter().map(|(k, g, s, a)| (k.as_str(), (*g, s.as_str(), a.as_str()))), |v, (glyph, words, action), _| {
+            if let Some(i) = v.part("icon") {
+                i.icon(glyph);
+            }
+            if let Some(l) = v.part("words") {
+                l.text(words);
+            }
+            let a = Action { name: action.into() };
+            if v.entity().try_cloned::<&Action>() != Some(a.clone()) {
+                v.entity().set(a);
+            }
+        });
     }
 
     /// Chat pane `pv`'s aside card (its foot's `aside` slot, hn.ChatAside) while chat `sid` has one: the working ring
@@ -2692,6 +2754,39 @@ fn fill_pictures(strip: View<'_>, images: &[String], sizes: Option<&HashMap<Stri
             }
         }
     });
+}
+
+/// The most items the activity strip shows before one says how many more (fill_chat_activity).
+const ACTIVITY_MAX: usize = 5;
+/// The activity strip's glyphs (codicons): the turn's step (sync), a command (terminal), a sub-agent (sparkle), the
+/// queued messages (comment), the rest (ellipsis).
+const ACT_STEP: &str = "\u{EA77}";
+const ACT_RUN: &str = "\u{EA85}";
+const ACT_AGENT: &str = "\u{EC10}";
+const ACT_QUEUED: &str = "\u{EA6B}";
+const ACT_MORE: &str = "\u{EA7C}";
+
+/// What the turn in flight does now, in a few words: the step its running cell is on, else its running tool's main
+/// argument ("Bash: cargo test"), else what its newest words or reasoning are (None before it says anything).
+fn turn_doing(t: &Transcript) -> Option<String> {
+    let since = t.items.iter().rposition(|i| matches!(i, Item::User { .. }))?;
+    t.items[since..].iter().rev().find_map(|i| match i {
+        Item::Tool { block, name, input, result: None, .. } => Some(match t.details.get(block) {
+            Some(d) => d
+                .effects
+                .iter()
+                .rev()
+                .find(|e| e.status == "running")
+                .map_or_else(|| "Running code\u{2026}".to_owned(), |e| format!("{}\u{2026}", e.doing)),
+            None => {
+                let arg = model::chat::main_arg(input);
+                if arg.is_empty() { format!("{name}\u{2026}") } else { format!("{name}: {arg}") }
+            }
+        }),
+        Item::Thinking { done: false, .. } => Some("Thinking\u{2026}".to_owned()),
+        Item::Text { done: false, .. } => Some("Writing\u{2026}".to_owned()),
+        _ => None,
+    })
 }
 
 /// The remove button's glyph on a pasted picture (codicon's close).

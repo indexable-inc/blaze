@@ -113,7 +113,7 @@ export const weight_label = 600
 // The Archive's rows (hn.Arch*): 24 tall, children indented indent_step a level (the tree's step too), icons 14 in a 16
 // box, its disclosure slot disclose_w wide with a chevron_box chevron. The sidebar's tree has its own (tree_* below).
 export const row_h = 24
-export const indent_step = 16
+export const indent_step = 12
 export const icon_box = 16
 export const chevron_box = 12
 export const disclose_w = 18
@@ -124,9 +124,9 @@ export const disclose_w = 18
 // tree_gap, its trailing words; tree_pad_r on the right. The chevron is a thin vector mark tree_chevron across (its ink
 // about 7.5 tall), shown in tone_ink_faint where the row has rows under it (folded, it holds what finished). tree_icon is
 // the Archive button's glyph box.
-export const tree_row_h = 30
-export const tree_run_h = 24
-export const tree_gutter = 16
+export const tree_row_h = 28
+export const tree_run_h = 22
+export const tree_gutter = 12
 export const tree_icon = 16
 export const tree_chevron = 9
 // The tree's indent guides (hn.Hang's slots): a hairline down the middle of each ancestor's chevron gutter, in
@@ -573,6 +573,17 @@ export const chat_bubble_max_w = $chat_w * 0.8
 export const chat_foot_pad_t = 6
 export const chat_foot_pad_b = 14
 export const chat_composer_radius = 18
+// What runs for a chat, over its composer (hn.ChatActivityItem): items chat_activity_h tall, chat_activity_gap apart,
+// chat_activity_radius round, chat_activity_pad in, a glyph chat_activity_icon across chat_activity_icon_gap before
+// its words, at most chat_activity_max_w wide (the words cut first); chat_activity_below of air under the strip.
+export const chat_activity_h = 22
+export const chat_activity_gap = 6
+export const chat_activity_radius = 7
+export const chat_activity_pad = 8
+export const chat_activity_icon = 11
+export const chat_activity_icon_gap = 5
+export const chat_activity_max_w = 260
+export const chat_activity_below = 8
 // Pictures pasted into the message being written (hn.ChatAttach, src/app/chat.rs fill_attach): a strip of thumbnails over
 // the words, each chat_attach_h tall at its own aspect (no wider than chat_attach_max_w), chat_attach_gap apart,
 // chat_attach_radius round, a remove button chat_attach_remove across (its glyph chat_attach_icon) chat_attach_inset in

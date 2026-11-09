@@ -62,6 +62,10 @@ hn {
     chat_working_breath_at {
       Size: {w: {kind: Fixed, value: $chat_working_breath, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
     }
+    // The air under the composer's activity strip while it holds items (src/app/chat.rs fill_chat_activity).
+    chat_activity_air {
+      Size: {w: {kind: Fixed, value: $chat_activity_below, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
     // How long a finished child keeps its row (and its done mark) under a folded node (seconds, as a width).
     tree_linger_for {
       Size: {w: {kind: Fixed, value: $tree_linger_s, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
