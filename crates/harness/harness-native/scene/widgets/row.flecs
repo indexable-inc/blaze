@@ -17,8 +17,8 @@ hn {
 
   // A tree row's gutter, Xcode's source list and IntelliJ's tree: a layer over the whole row (out of its flow). First the
   // indent guides, one slot `indent_step` wide per ancestor level, each a hairline (tone_guide) down its middle, so they
-  // run under each ancestor's chevron and join from row to row into one line per level (rows are packed); up to six
-  // levels, a slot past the row's depth taking no room. Then the row's own chevron slot, `tree_gutter` wide, so the title
+  // run under each ancestor's chevron and join from row to row into one line per level (rows are packed); up to
+  // tree_guides levels, a slot past the row's depth taking no room. Then the row's own chevron slot, `tree_gutter` wide, so the title
   // column never moves whether or not the row has rows under it. With rows under the row it is a thin chevron (a vector
   // mark, hn's own: icons/chevron.svg) pointing at the title, in the muted ink, always shown so the tree reads as one,
   // turned a quarter to point down on the `turn` spring as it opens; its hit target is the whole slot. Else the slot
@@ -32,99 +32,23 @@ hn {
     Overlay
     Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}
     Padding: {l: $tree_pad, r: 0, t: 0, b: 0}
-    g0 : ui.Row {
-      Flex: {axis: Row, gap: 0, align: Stretch, justify: Center, wrap: false}
-      if $depth > 0 {
-        Size: {w: {kind: Fixed, value: $indent_step, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
-      } else {
-        Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
-      }
-      line : ui.Node {
-        Size: {w: {kind: Fixed, value: $tree_guide_w, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
-        if $depth > 0 {
-          Fill: $tone_guide
+    // One slot a level, written once: a slot past the row's depth takes no room and draws nothing (a re-run sets
+    // components, it never removes them: so both arms set the Size and the Fill).
+    for i in 0..$tree_guides {
+      "g{i}" : ui.Row {
+        Flex: {axis: Row, gap: 0, align: Stretch, justify: Center, wrap: false}
+        if $depth > i {
+          Size: {w: {kind: Fixed, value: $indent_step, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
         } else {
-          Fill: $tone_clear
+          Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
         }
-      }
-    }
-    g1 : ui.Row {
-      Flex: {axis: Row, gap: 0, align: Stretch, justify: Center, wrap: false}
-      if $depth > 1 {
-        Size: {w: {kind: Fixed, value: $indent_step, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
-      } else {
-        Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
-      }
-      line : ui.Node {
-        Size: {w: {kind: Fixed, value: $tree_guide_w, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
-        if $depth > 1 {
-          Fill: $tone_guide
-        } else {
-          Fill: $tone_clear
-        }
-      }
-    }
-    g2 : ui.Row {
-      Flex: {axis: Row, gap: 0, align: Stretch, justify: Center, wrap: false}
-      if $depth > 2 {
-        Size: {w: {kind: Fixed, value: $indent_step, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
-      } else {
-        Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
-      }
-      line : ui.Node {
-        Size: {w: {kind: Fixed, value: $tree_guide_w, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
-        if $depth > 2 {
-          Fill: $tone_guide
-        } else {
-          Fill: $tone_clear
-        }
-      }
-    }
-    g3 : ui.Row {
-      Flex: {axis: Row, gap: 0, align: Stretch, justify: Center, wrap: false}
-      if $depth > 3 {
-        Size: {w: {kind: Fixed, value: $indent_step, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
-      } else {
-        Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
-      }
-      line : ui.Node {
-        Size: {w: {kind: Fixed, value: $tree_guide_w, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
-        if $depth > 3 {
-          Fill: $tone_guide
-        } else {
-          Fill: $tone_clear
-        }
-      }
-    }
-    g4 : ui.Row {
-      Flex: {axis: Row, gap: 0, align: Stretch, justify: Center, wrap: false}
-      if $depth > 4 {
-        Size: {w: {kind: Fixed, value: $indent_step, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
-      } else {
-        Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
-      }
-      line : ui.Node {
-        Size: {w: {kind: Fixed, value: $tree_guide_w, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
-        if $depth > 4 {
-          Fill: $tone_guide
-        } else {
-          Fill: $tone_clear
-        }
-      }
-    }
-    g5 : ui.Row {
-      Flex: {axis: Row, gap: 0, align: Stretch, justify: Center, wrap: false}
-      if $depth > 5 {
-        Size: {w: {kind: Fixed, value: $indent_step, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
-      } else {
-        Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
-      }
-      line : ui.Node {
-        Size: {w: {kind: Fixed, value: $tree_guide_w, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
-        if $depth > 5 {
-          Fill: $tone_guide
-        } else {
-          Fill: $tone_clear
+        line : ui.Node {
+          Size: {w: {kind: Fixed, value: $tree_guide_w, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+          if $depth > i {
+            Fill: $tone_guide
+          } else {
+            Fill: $tone_clear
+          }
         }
       }
     }

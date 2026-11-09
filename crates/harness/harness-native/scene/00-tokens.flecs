@@ -150,6 +150,7 @@ export const tree_trail_max = 84
 // tone_guide (Islands' tree-indent-guide-border), for as many levels as tree_guides; a done mark in a childless row's
 // gutter (tree_mark across: a check in tone_success, a cross in tone_error).
 export const tree_guide_w = 1
+export const tree_guides = 6
 export const tree_mark = 11
 export const tone_guide: Fill = {dark: {0.122, 0.133, 0.153, 1}, light: {0.086, 0.086, 0.090, 0.10}}
 export const tree_pad = 2
