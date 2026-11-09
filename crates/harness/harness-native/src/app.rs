@@ -2435,7 +2435,8 @@ fn done_mark(status: &str, code: Option<i32>, depth: usize) -> &'static str {
 }
 
 /// What a working agent is doing now, from its transcript's last item: the words its tooltip leads with, and the
-/// detail its row trails (the command, the file, the pattern, the page).
+/// detail its row trails (the command, the file, the pattern, the page): only what names a thing. A state alone
+/// (thinking, writing) trails nothing, since the row's dot already says it is at work.
 struct Doing {
     what: &'static str,
     detail: String,
@@ -2463,13 +2464,13 @@ fn doing_of(t: &model::chat::Transcript) -> Option<Doing> {
     // A message still queued is not what it is on.
     let last = (0..t.items.len()).rev().find(|&k| !t.is_queued(k)).map(|k| &t.items[k])?;
     Some(match last {
-        Item::Thinking { done: false, .. } => Doing { what: "Thinking", detail: "thinking".to_owned() },
+        Item::Thinking { done: false, .. } => Doing { what: "Thinking", detail: String::new() },
         // A harness REPL cell: what its running step does ("blaze check", "Reading chat.rs"), never the tool's name.
         Item::Tool { block, result: None, .. } if t.details.contains_key(block) => {
             match t.details[block].effects.iter().rev().find(|e| e.status == "running") {
                 Some(e) if e.kind == "exec" => Doing { what: "Running a command", detail: chat::step_words(e) },
                 Some(e) => Doing { what: "Working", detail: chat::step_words(e) },
-                None => Doing { what: "Running code", detail: "running code".to_owned() },
+                None => Doing { what: "Running code", detail: String::new() },
             }
         }
         Item::Tool { name, input, result: None, .. } => {
@@ -2492,8 +2493,8 @@ fn doing_of(t: &model::chat::Transcript) -> Option<Doing> {
                 Doing { what: "Using a tool", detail: name.rsplit("__").next().unwrap_or(name).to_owned() }
             }
         }
-        Item::Text { done: false, .. } => Doing { what: "Writing", detail: "writing".to_owned() },
-        _ => Doing { what: "Thinking", detail: "thinking".to_owned() },
+        Item::Text { done: false, .. } => Doing { what: "Writing", detail: String::new() },
+        _ => Doing { what: "Thinking", detail: String::new() },
     })
 }
 
