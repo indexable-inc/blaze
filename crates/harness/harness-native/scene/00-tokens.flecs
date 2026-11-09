@@ -514,6 +514,15 @@ export const caret_fade = 0.09
 export const strike_w = 1
 export const strike_rise_em = 0.27
 export const strike_alpha = 0.7
+// LaTeX math (prims.flecs ui.formula; inline markdown's $…$, a chat's displayed formula): set at math_inline_scale of
+// its words' size in a line, math_display_scale displayed (Computer Modern's x-height is smaller than Inter's, hence above
+// 1), keeping math_inline_pad or math_display_pad points clear above and below in its line; strokes math_stroke_em thick
+// (KaTeX's 1.5 px at its 40 px em). den's MathLook.
+export const math_inline_scale = 1.1
+export const math_display_scale = 1.25
+export const math_inline_pad = 2
+export const math_display_pad = 10
+export const math_stroke_em = 0.0375
 // Inline code's chip (MarkdownText).
 export const textarea_max_h = 132
 // A growing text area (ui.field.GrowingTextArea): it grows with its words to textarea_grow_share of its pane's height
@@ -604,14 +613,14 @@ export const line_chat_code = 17
 export const chat_bubble_radius = 12
 // The widest a user's bubble gets before its words wrap: about three quarters of the column, as iMessage and ChatGPT do.
 export const chat_bubble_max_w = $chat_w * 0.8
-// The composer (hn.ChatPane's foot.card): one card holding the words over a bar of controls, centred in the reading
-// column (chat_w wide at most, as the transcript), chat_foot_pad_t over it and chat_foot_pad_b under it. The card is a
-// step lighter than the chat's ground with a hairline a few percent of white and a soft lift (no heavy border),
-// chat_composer_radius round, chat_composer_pad in from its edges; the words sit a further chat_composer_text_inset in
-// (so they start where the model control's words do, its wash hanging into the inset), chat_composer_pad_t under its
-// top, chat_composer_gap over the bar.
+// The composer (hn.ChatPane's foot.card): one card holding the words, centred in the reading column (chat_w wide at
+// most, as the transcript), chat_foot_pad_t over it; the status bar (foot.status) under it, chat_foot_pad_b over the
+// pane's foot. The card is a step lighter than the chat's ground with a hairline a few percent of white and a soft lift
+// (no heavy border), chat_composer_radius round, chat_composer_pad in from its sides; the words sit a further
+// chat_composer_text_inset in (so they start where the status bar's model control's words do), chat_composer_pad_t under
+// its top and chat_composer_pad_b over its bottom.
 export const chat_foot_pad_t = 6
-export const chat_foot_pad_b = 14
+export const chat_foot_pad_b = 8
 export const chat_composer_radius = 18
 // What runs for a chat, over its composer (hn.ChatActivityItem): items chat_activity_h tall, chat_activity_gap apart,
 // chat_activity_radius round, chat_activity_pad in, a glyph chat_activity_icon across chat_activity_icon_gap before
@@ -653,6 +662,7 @@ export const chat_attach_inset = 4
 export const chat_sent_h = 120
 export const chat_composer_pad = 8
 export const chat_composer_pad_t = 12
+export const chat_composer_pad_b = 10
 export const chat_composer_text_inset = 6
 export const chat_composer_gap = 6
 // The space under the pasted pictures' strip, over the words: the card's own gap between its parts.
@@ -672,22 +682,33 @@ export const chat_aside_pad_b = 10
 export const chat_aside_head_gap = 2
 export const chat_aside_close = 20
 export const chat_aside_icon = 10
-// The bar (foot.card.bar), chat_bar_h tall, its controls chat_bar_gap apart: on the left den's model and effort picker
+// The status bar (foot.status), chat_status_t under the composer's card, its sides chat_composer_pad in (the card's inner
+// edges), no plate; its controls chat_bar_h tall, chat_bar_gap apart: on the left den's model and effort picker
 // as one quiet control (hn.ChatPick, src/app/chat/pick.rs: the model's name, its effort as a level meter and a small
 // chevron, chat_pick_h tall, chat_pick_pad_x in, its chevron chat_pick_chevron across chat_pick_gap after the rest, a
 // wash under the pointer); the meter (hn.ChatEffort) chat_effort_lead after the name, chat_effort_h tall, a bar per
 // effort chat_effort_bar_w wide, chat_effort_gap apart, chat_effort_bar_radius round, rising from chat_effort_floor of
 // its height to all of it. On the right the context meter (hn.ChatContext: a ring chat_ring across, its stroke
 // chat_ring_stroke, in a square chat_bar_h across that takes the pointer). While the agent works that one ring breathes
-// down to chat_working_breath: the composer's sign of work, not a button (Return sends, Escape stops). An aside's card
-// shows its own working ring (hn.ChatWorking: chat_working across, stroke chat_working_stroke).
+// down to chat_working_breath: the composer's sign of work, not a button (Return sends, Escape stops). After it, how much
+// of the person's plan is used (hn.ChatPlan, src/app/chat/plan.rs): chat_plan_lead after the ring, a bar
+// chat_plan_meter_w by chat_plan_meter_h, chat_plan_meter_radius round, chat_plan_gap before its words, chat_plan_trail
+// of air after them. An aside's card shows its own working ring (hn.ChatWorking: chat_working across, stroke
+// chat_working_stroke).
 // Everything in the bar is chrome, secondary to the words typed over it: the picker's name at size_chrome in the muted
 // ink, and its marks (chevron, level meter, rings) and their hit plates scaled to that size, not to the body's.
 // The picker's menu is a ui.SearchMenu (menu_*).
 export const size_chat_status = 12
 export const line_chat_status = 15
+export const chat_status_t = 4
 export const chat_bar_h = 24
 export const chat_bar_gap = 2
+export const chat_plan_lead = 4
+export const chat_plan_trail = 2
+export const chat_plan_gap = 5
+export const chat_plan_meter_w = 18
+export const chat_plan_meter_h = 3
+export const chat_plan_meter_radius = 1.5
 export const chat_pick_h = 22
 export const chat_pick_pad_x = 6
 export const chat_pick_radius = 7
@@ -732,9 +753,9 @@ export const chat_pick_level_b = 4
 export const chat_pick_swipe_step = 22
 export const chat_pick_commit_secs = 0.35
 export const chat_pick_word_secs = 1.2
-// What the chat pane shows around the composer's words besides the transcript (the foot's insets, the card's insets
-// and gap, the bar): the words grow to textarea_grow_share of the pane less it.
-export const chat_input_keep = $chat_foot_pad_t + $chat_foot_pad_b + $chat_composer_pad_t + $chat_composer_pad + $chat_composer_gap + $chat_bar_h
+// What the chat pane shows around the composer's words besides the transcript (the foot's insets, the card's insets,
+// the status bar): the words grow to textarea_grow_share of the pane less it.
+export const chat_input_keep = $chat_foot_pad_t + $chat_foot_pad_b + $chat_composer_pad_t + $chat_composer_pad_b + $chat_status_t + $chat_bar_h
 // The meter's popover while the pointer is on it (scene/widgets/context.flecs hn.ChatContextPop, src/app/chat/context.rs):
 // a menu plate (ui.Menu's place over what opened it, its lift and motion) chat_ctx_w wide, chat_ctx_pad in, its lines
 // chat_ctx_gap apart: a head, the window as a donut chat_ctx_pie across with how full it is in its middle (size_ctx_pct;

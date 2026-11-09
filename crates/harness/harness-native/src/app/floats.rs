@@ -12,13 +12,18 @@ use harness_native_ui_layout_api::Screen;
 /// One windowed overlay's draw this frame: the `Windowed` node `id`, the part of the main view its window shows (`rect`,
 /// view points: its `Laid`, out to whole device pixels), and what it draws there (`draw`, whose frame's `view` is the
 /// rect's size and `place` its corner). `glass`: the node is frosted (`Frost`), so its window has the system's
-/// vibrancy behind what it draws, cut to the node's corners (`radius`, view points).
+/// vibrancy behind what it draws, cut to the node's corners (`radius`, view points), where the plate is drawn this frame
+/// (`plate`: x, y, w, h from the rect's corner, view points, the node's transition scale applied) and as shown as it is
+/// (`alpha`): mid-transition the glass grows, shrinks and fades with the plate, never a frosted shape left standing
+/// while what was on it fades away.
 pub struct Float {
     pub id: u64,
     pub rect: [f32; 4],
     pub draw: Draw,
     pub glass: bool,
     pub radius: f32,
+    pub plate: [f32; 4],
+    pub alpha: f32,
 }
 
 impl App {
@@ -90,8 +95,13 @@ pub(super) fn finish(w: WorldRef<'_>, floats: Vec<(u64, Draw)>, sc: f32) -> Vec<
         draw.frame.place = [rect[0], rect[1], 0.0, 0.0];
         let node = w.entity_from_id(id);
         let glass = node.has(harness_native_ui_look_api::Frost::id());
-        let radius = node.try_cloned::<&harness_native_ui_look_api::Shape>().map_or(0.0, |s| s.radius);
-        out.push(Float { id, rect, draw, glass, radius });
+        // Where the draw pass put the plate this frame (moved and scaled by its transition) and how shown it is.
+        let painted = node.try_cloned::<&harness_native_ui_draw_api::Painted>();
+        let (plate, alpha, scale) = painted.map_or(([l.x - rect[0], l.y - rect[1], l.w, l.h], 1.0, 1.0), |p| {
+            ([p.x - rect[0], p.y - rect[1], p.w * p.scale, p.h * p.scale], p.alpha.clamp(0.0, 1.0), p.scale)
+        });
+        let radius = node.try_cloned::<&harness_native_ui_look_api::Shape>().map_or(0.0, |s| s.radius) * scale;
+        out.push(Float { id, rect, draw, glass, radius, plate, alpha });
     }
     out
 }

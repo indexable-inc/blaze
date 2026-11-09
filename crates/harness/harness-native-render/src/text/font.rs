@@ -5,6 +5,8 @@
 //! same on both.
 use read_fonts::model::Source;
 
+use crate::math::PathSeg;
+
 pub use super::font_mac::Font;
 
 /// A font at one size: what [`super::Fonts`] holds and registers by its PostScript name and size.
@@ -72,6 +74,14 @@ pub trait FontSource: Clone + Sized {
     );
 }
 
+/// `segs` (ems, y down) filled (even-odd, each piece on its own) or stroked `stroke` ems wide into `buf`, a `w` by `h`
+/// coverage bitmap whose bottom-left pixel is (`x0`, `y0`) in pixels from the outline's origin (y up), at `scale` pixels
+/// to the em and shifted `subx` pixels right. Rows top first.
+#[allow(clippy::too_many_arguments)]
+pub fn fill_outline(segs: &[PathSeg], fill: bool, stroke: f32, buf: &mut [u8], w: usize, h: usize, x0: i32, y0: i32, scale: f64, subx: f64) {
+    super::font_mac::fill_outline(segs, fill, stroke, buf, w, h, x0, y0, scale, subx);
+}
+
 /// A glyph or outline drawn for the atlas: `w` by `h` premultiplied RGBA pixels (a plain glyph's coverage as white), its
 /// left edge `left` pixels right of the origin and its top `top` pixels over the baseline; `colour` when it is drawn as
 /// it is, not tinted (an emoji).
@@ -106,4 +116,38 @@ pub fn raster_glyph(font: &Font, glyph: u16, scale: f32, subx: f64) -> Bitmap {
     font.draw(glyph, &mut buf, w, h, x0, y0, s, subx);
     let rgba = if colour { buf } else { buf.iter().flat_map(|&c| [c; 4]).collect() };
     Bitmap { left: x0, top: y1, w: w as u32, h: h as u32, colour, rgba }
+}
+
+/// A formula's outline (`segs`, in ems from its origin, y down) at `scale` pixels to the em, `subx` of a pixel right
+/// of the grid, filled (each piece on its own, so overlaps do not cancel) or stroked `stroke` ems wide.
+pub fn raster_outline(segs: &[PathSeg], fill: bool, stroke: f32, scale: f32, subx: f64) -> Bitmap {
+    let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+    for s in segs {
+        let (points, n) = match *s {
+            PathSeg::Move(a) | PathSeg::Line(a) => ([a; 3], 1),
+            PathSeg::Quad(a, b) => ([a, b, b], 2),
+            PathSeg::Cubic(a, b, c) => ([a, b, c], 3),
+            PathSeg::Close => ([[0.0; 2]; 3], 0),
+        };
+        for p in &points[..n] {
+            for k in 0..2 {
+                lo[k] = lo[k].min(p[k]);
+                hi[k] = hi[k].max(p[k]);
+            }
+        }
+    }
+    if lo[0] > hi[0] {
+        return Bitmap::EMPTY;
+    }
+    let reach = if fill { 0.0 } else { stroke * 0.5 };
+    let s = f64::from(scale);
+    let x0 = (f64::from(lo[0] - reach) * s + subx).floor() as i32 - 1;
+    let x1 = (f64::from(hi[0] + reach) * s + subx).ceil() as i32 + 1;
+    // y is down in a formula and up in a bitmap: the shape's top is its greatest height over the origin.
+    let y0 = (-f64::from(hi[1] + reach) * s).floor() as i32 - 1;
+    let y1 = (-f64::from(lo[1] - reach) * s).ceil() as i32 + 1;
+    let (w, h) = ((x1 - x0) as usize, (y1 - y0) as usize);
+    let mut buf = vec![0u8; w * h];
+    fill_outline(segs, fill, stroke, &mut buf, w, h, x0, y0, s, subx);
+    Bitmap { left: x0, top: y1, w: w as u32, h: h as u32, colour: false, rgba: buf.iter().flat_map(|&c| [c; 4]).collect() }
 }

@@ -8,9 +8,14 @@ An agent another agent starts must say its `name`, `model` and, when that model 
 harness refuses the spawn otherwise, and refuses `--model`/`--effort` in `args`. Nothing is defaulted, so the
 choice is always written down where the person can see it.
 
+The name is what the person reads in the sidebar, so write it as a short plain title in words, with spaces and
+capitals as in a sentence: `LaTeX rendering`, `Sidebar titles and icons`, `Fix comptime dyn`. Never kebab case, never
+the repository or app name as a prefix (`harness-latex` says less than `LaTeX rendering`), never a branch or ticket
+id. Two agents at once get names a person can tell apart.
+
 ```ts
 const a = await spawn('claude', {
-  name: 'comptime-dyn',             // kebab case, what it does; the tree row and how to find it again
+  name: 'Comptime dyn calls',      // a plain title in words: the sidebar row and how to find it again
   model: 'claude-opus-5-5',
   effort: 'medium',
   cwd: '/path/to/its/worktree',

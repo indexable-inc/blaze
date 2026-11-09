@@ -32,6 +32,7 @@ mod genui;
 mod mention;
 mod peek;
 mod pick;
+mod plan;
 mod rename;
 mod steps;
 
@@ -455,6 +456,9 @@ enum Row {
     ListItem { depth: usize, mark: String, text: String },
     Quote(String),
     Code { lang: String, text: String },
+    /// A displayed formula (`$$…$$` or `\[…\]` on lines of its own, a ```math fence): its LaTeX, which typesets
+    /// ([`math_row`]). Drawn centred, set as `$$…$$` inline markdown; a selection takes it whole and copies its source.
+    Math(String),
     /// An agent's own tool call: its line (the tool's name, its main argument, how it is going: its `hn.chat_status`,
     /// running or no_result, while it has no result; a small mark when it failed) and, opened, its input and result.
     Tool { block: String, name: String, arg: String, state: Option<&'static str>, shown: Shown, failed: bool, input: String, result: String },
@@ -492,6 +496,7 @@ impl Row {
             Row::ListItem { .. } => "hn.ChatItem",
             Row::Quote(_) => "hn.ChatQuote",
             Row::Code { .. } => "hn.ChatCode",
+            Row::Math(_) => "hn.ChatMath",
             Row::Tool { shown: Shown::Full, failed: true, .. } => "hn.ChatToolOpenFailed",
             Row::Tool { shown: Shown::Full, .. } => "hn.ChatToolOpen",
             Row::Tool { failed: true, .. } => "hn.ChatToolFailed",
@@ -509,9 +514,52 @@ impl Row {
     }
 }
 
+/// A displayed formula's row: the formula, or when RaTeX cannot read it a card of its source (a displayed formula's
+/// source as inline code would be a chip alone in the column).
+fn math_row(tex: String) -> Row {
+    match harness_native_render::math::typeset(&tex, true) {
+        Ok(_) => Row::Math(tex),
+        Err(_) => Row::Code { lang: "latex".into(), text: tex },
+    }
+}
+
+/// The displayed formula `lines` start with: a line that opens with `$$` or `\[`, to the first line that ends with its
+/// closer (the same one or a later one, before any blank line): its LaTeX and how many lines it takes. None when they do not
+/// start one: the closer is not at a line's end (inline math in a sentence), or has not come yet (still streaming: its words
+/// show as written until it does).
+fn display_math(lines: &[&str]) -> Option<(String, usize)> {
+    let first = lines.first()?.trim();
+    let (open, close) = if first.starts_with("$$") {
+        ("$$", "$$")
+    } else if first.starts_with("\\[") {
+        ("\\[", "\\]")
+    } else {
+        return None;
+    };
+    let mut body: Vec<&str> = Vec::new();
+    for (k, l) in lines.iter().enumerate() {
+        let t = l.trim();
+        let t = if k == 0 { &t[open.len()..] } else { t };
+        if k > 0 && t.is_empty() {
+            return None;
+        }
+        match t.find(close) {
+            Some(at) if at + close.len() == t.len() => {
+                body.push(&t[..at]);
+                let tex = body.join("\n").trim().to_owned();
+                return (!tex.is_empty()).then_some((tex, k + 1));
+            }
+            Some(_) => return None,
+            None => body.push(t),
+        }
+    }
+    None
+}
+
 /// Markdown split into the rows it is drawn as: paragraphs, headings, list items (with their continuation lines), quotes
 /// (each kept a line apart, less its indent and the block's trailing white space, so inline markdown reads a soft break
-/// as a space and two trailing spaces or a backslash as a hard one), fenced code (an unclosed fence, still streaming, runs to the end) and GitHub tables (lines of pipes
+/// as a space and two trailing spaces or a backslash as a hard one), displayed formulas (`$$…$$` or `\[…\]` on lines of
+/// their own, a ```math fence: [`Row::Math`]), fenced code (an unclosed fence, still streaming, runs to the end) and GitHub tables (lines of pipes
 /// that are no table, as code). While it is `live` (still streaming) a table's row arrives whole: a last row not yet ended
 /// is held back, and so is a head whose delimiter line has not come.
 fn blocks(md: &str, live: bool, out: &mut Vec<Row>) {
@@ -543,13 +591,25 @@ fn blocks(md: &str, live: bool, out: &mut Vec<Row>) {
                 code.push(lines[i]);
                 i += 1;
             }
-            out.push(Row::Code { lang, text: code.join("\n") });
+            // A ```math fence, once closed, is the formula it holds (its blank lines dropped: a formula is one paragraph);
+            // a ```latex or ```tex one is source to show, code.
+            if lang == "math" && i < lines.len() {
+                out.push(math_row(code.iter().filter(|l| !l.trim().is_empty()).copied().collect::<Vec<_>>().join("\n")));
+            } else {
+                out.push(Row::Code { lang, text: code.join("\n") });
+            }
             i += 1;
             continue;
         }
         if t.is_empty() {
             flush(&mut para, out);
             i += 1;
+            continue;
+        }
+        if let Some((tex, used)) = display_math(&lines[i..]) {
+            flush(&mut para, out);
+            out.push(math_row(tex));
+            i += used;
             continue;
         }
         let hashes = t.chars().take_while(|&c| c == '#').count();
@@ -1092,7 +1152,9 @@ fn texts(r: &Row) -> Vec<(&'static [&'static str], String, bool)> {
         Row::Note(s) | Row::Error(s) => vec![(&["text"], s.clone(), false)],
         Row::Steps(l) => vec![(&["head", "words"], l.words.clone(), false)],
         Row::Out(o) => o.texts(),
-        Row::Tool { .. } | Row::Thinking { .. } | Row::Grid { .. } | Row::Table(_) | Row::Ui { .. } | Row::Pictures(..) | Row::RefCard(_) => Vec::new(),
+        Row::Tool { .. } | Row::Thinking { .. } | Row::Grid { .. } | Row::Table(_) | Row::Ui { .. } | Row::Pictures(..) | Row::RefCard(_) | Row::Math(_) => {
+            Vec::new()
+        }
     }
 }
 
@@ -1104,6 +1166,25 @@ fn tool_result(result: &str) -> &str {
 /// What words given `src` show (inline markdown: the markers out), which a [`Spot`]'s units count in.
 fn shown(src: &str, md: bool) -> String {
     if md { harness_native_render::markdown::inline(src).text } else { src.to_owned() }
+}
+
+/// The words given `src` from unit `a` to `b` of what they show ([`shown`]), for the pasteboard: a formula in them as its
+/// LaTeX as written (`$x^2$`), not the hole it leaves.
+fn shown_cut(src: &str, md: bool, a: usize, b: usize) -> String {
+    if !md {
+        return src[byte_of(src, a)..byte_of(src, b)].to_owned();
+    }
+    let m = harness_native_render::markdown::inline(src);
+    let s = m.text.as_str();
+    let mut out = String::new();
+    let mut from = a;
+    for f in m.math.iter().filter(|f| (a..b).contains(&f.at)) {
+        out.push_str(&s[byte_of(s, from)..byte_of(s, f.at)]);
+        out.push_str(&f.source);
+        from = f.at + 1;
+    }
+    out.push_str(&s[byte_of(s, from)..byte_of(s, b)]);
+    out
 }
 
 /// The units of row `row`'s `part`th words (`len` long) the selection `lo..hi` covers, if any.
@@ -1148,6 +1229,7 @@ impl Row {
             }
             Row::Quote(s) => format!("> {s}"),
             Row::Code { lang, text } => format!("```{lang}\n{text}\n```"),
+            Row::Math(tex) => format!("$$\n{tex}\n$$"),
             Row::Table(t) => t.markdown(),
             Row::Grid { v, .. } => grid_table(v).markdown(),
             Row::Out(o) => return o.markdown(),
@@ -1176,7 +1258,7 @@ fn transcript_text(rows: &[(String, Row)], lo: Spot, hi: Spot) -> String {
             };
             whole &= a == 0 && b == n;
             if a < b {
-                bits.push(s[byte_of(&s, a)..byte_of(&s, b)].to_owned());
+                bits.push(shown_cut(src, *md, a, b));
             }
         }
         // A row with no words to select (a table) is taken whole when the selection reaches past its middle.
@@ -1240,9 +1322,14 @@ fn keep_in_view(from: f32, at: f32, view: f32, len: f32) -> f32 {
     to.clamp(0.0, (len - view).max(0.0))
 }
 
-/// Chat pane `pv`'s composer card (scene/widgets/chat.flecs hn.ChatPane's foot.card: the words over the bar).
+/// Chat pane `pv`'s composer card (scene/widgets/chat.flecs hn.ChatPane's foot.card: the words and their pictures).
 fn composer(pv: View<'_>) -> Option<View<'_>> {
     pv.part("foot")?.part("card")
+}
+
+/// Chat pane `pv`'s status bar under its composer (hn.ChatPane's foot.status: model and effort, context, plan).
+fn status_bar(pv: View<'_>) -> Option<View<'_>> {
+    pv.part("foot")?.part("status")
 }
 
 /// Chat pane `pv`'s composer's words' area (its ui.field.GrowingTextArea).
@@ -1572,7 +1659,7 @@ impl App {
                 // Grown past its most, it scrolls on its FieldScroll (step_chat_inputs), the caret kept in view.
             }
         }
-        if let Some(bar) = composer(pv).and_then(|c| c.part("bar")) {
+        if let Some(bar) = status_bar(pv) {
             let o = w.entity_from_id(e);
             // The model and the effort it runs with, as den's picker (chat/pick.rs `Label`), the daemon's listing its last
             // say.
@@ -2646,9 +2733,8 @@ impl App {
         let w = self.world.world_ref();
         let pv = View::of(w.entity_from_id(p));
         let over = |v: Option<View<'_>>| v.and_then(|v| v.entity().try_cloned::<&Laid>()).is_some_and(|l| l.contains(x, y));
-        // On the composer's card but off its bar of controls is on the words (its insets too).
-        let card = composer(pv);
-        let in_input = over(card) && !over(card.and_then(|c| c.part("bar")));
+        // On the composer's card is on the words (its insets too): the controls are the status bar's, under it.
+        let in_input = over(composer(pv));
         let in_list = over(pv.part("list"));
         // A press on a cell's control is the control's (genui/control.rs): it starts no selection in the transcript.
         let on_control = w.entity_named(APP).target(Hovered::id(), 0).is_some_and(|h| {
@@ -3185,6 +3271,8 @@ fn fill_row(row: View<'_>, r: &Row, ctx: &RowCtx<'_>, measure: &mut Measure<'_>)
             fill_pictures(row, images, ctx.sizes, h, "hn.ChatSentPicture", None);
         }
         Row::Prose(s) | Row::Heading(_, s) | Row::Quote(s) | Row::Note(s) | Row::Error(s) => text("text", s),
+        // The formula alone, as inline markdown sets it in display style.
+        Row::Math(tex) => text("text", &format!("$${tex}$$")),
         Row::ListItem { depth, mark, text: s } => {
             text("mark", mark);
             text("text", s);
@@ -3679,6 +3767,25 @@ mod tests {
 - [x] done", false, &mut out);
         let kinds: Vec<&str> = out.iter().map(Row::prefab).collect();
         assert_eq!(kinds, ["hn.ChatItemNumber", "hn.ChatItemNumber", "hn.ChatItemTask", "hn.ChatItemTask"]);
+    }
+
+    /// A displayed formula on lines of its own (`$$…$$`, `\[…\]`, one line or several) or in a ```math fence is a row of its
+    /// own, breaking the paragraph round it; one RaTeX cannot read is a card of its source, as a ```latex fence always is;
+    /// `$$` inside a sentence, or one not closed yet, stays in the words.
+    #[test]
+    fn displayed_math_is_a_row_of_its_own() {
+        let src = "Take $x$:\n$$\n\\frac{a}{b}\n$$\nso\n\n\\[ x^2 \\]\n\n```math\n\\sum_i i\n```\n\n```latex\nx^2\n```\n\n$$\\frac{1}{$$\n\nsay $$x$$ here";
+        let mut out = Vec::new();
+        blocks(src, false, &mut out);
+        let kinds: Vec<&str> = out.iter().map(Row::prefab).collect();
+        assert_eq!(kinds, ["hn.ChatProse", "hn.ChatMath", "hn.ChatProse", "hn.ChatMath", "hn.ChatMath", "hn.ChatCode", "hn.ChatCode", "hn.ChatProse"]);
+        let tex: Vec<&str> = out.iter().filter_map(|r| if let Row::Math(t) = r { Some(t.as_str()) } else { None }).collect();
+        assert_eq!(tex, ["\\frac{a}{b}", "x^2", "\\sum_i i"]);
+        assert!(matches!(&out[6], Row::Code { lang, text } if lang == "latex" && text == "\\frac{1}{"), "{:?}", out[6].prefab());
+        assert_eq!(out[1].markdown().as_deref(), Some("$$\n\\frac{a}{b}\n$$"), "copied whole as its source");
+        let mut live = Vec::new();
+        blocks("so\n\n$$\n\\frac{a}{", true, &mut live);
+        assert_eq!(live.iter().map(Row::prefab).collect::<Vec<_>>(), ["hn.ChatProse", "hn.ChatProse"], "unclosed, its words for now");
     }
 
     /// A markdown table becomes one table row: typed cells, its alignment, numbers at the end; while it streams, its last
