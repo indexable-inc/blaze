@@ -222,7 +222,7 @@ const GEM: Sprite = &[
 ];
 
 /// The item a face names: what a step does, and `think` for a turn between steps. A name not here is `build` (a tool).
-fn item(face: &str) -> &'static str {
+pub fn item(face: &str) -> &'static str {
     match face {
         "exec" | "cell" => "exec",
         "read" | "skill" => "read",
