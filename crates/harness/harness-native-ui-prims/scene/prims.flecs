@@ -625,6 +625,15 @@ ui {
   prefab caret {
     CaretLook: {w: $caret_w, h: $caret_h, radius: $caret_radius, glide: $caret_glide, hold: $caret_hold, blink: $caret_blink, fade: $caret_fade}
   }
+  // Words with light running through them, the sign that something is at work (a working row's title): a Sheen
+  // (harness-native-ui-look-api; drawn by harness-native-render paint.rs, glyph by glyph) sweeps a soft band left to right
+  // through the letters, lifting them toward tone_sheen, and rests between passes; under Reduce Motion they sit steadily a
+  // little brighter instead. Its defaults are the slow drift of sheen_think_*; a place that means another rhythm sets its
+  // own Sheen (scene/widgets/rows.flecs: one per activity). A Sheen of strength 0 lights nothing and costs nothing, the
+  // way a template turns one off. Only words in view with a moving sheen keep frames coming, at the calm rate.
+  prefab Shimmer : ui.Line {
+    Sheen: {period: $sheen_think_period, rest: $sheen_think_rest, band: $sheen_think_band, strength: $sheen_think_strength, still: $sheen_still, ease: $sheen_think_ease, bands: 1, phase: 0, scatter: true, dark: $tone_sheen.dark, light: $tone_sheen.light}
+  }
   // Struck-through words' one look (harness-native-render paint.rs, inline markdown's ~~struck~~): a hairline through
   // the glyphs about the middle of their x-height, in the text's own ink at reduced alpha.
   prefab strike {

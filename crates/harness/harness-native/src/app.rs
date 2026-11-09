@@ -279,6 +279,9 @@ pub struct App {
     pruned: bool,
     /// Remember the selected object in native.json (not for the offscreen shot).
     pub persist: bool,
+    /// An offscreen shot's `HARNESS_NATIVE_SHOT_WORKING` (src/shot.rs): every session row shows at work, at these paces in
+    /// turn, and every run row too; empty, rows show what is really at work.
+    pub shot_working: Vec<&'static str>,
     pub focused: bool,
     pub title: String,
     /// The title-bar strip the window reports, and the (strip, zoom) last written into the view.
@@ -576,6 +579,7 @@ impl App {
             pending_archive: false,
             pruned: false,
             persist: true,
+            shot_working: Vec::new(), // alloc: empty but in a shot
             focused: true,
             title: "harness".into(),
             chrome: Chrome::default(),
@@ -902,7 +906,9 @@ impl App {
             .map_or(0, |d| d.as_millis() as u64);
         // Each row is a template instance (scene/widgets/rows.flecs): the row's facts as props, written only when one
         // changed (View::props), and flecs re-runs only the parts that read it. No dots and no marks: how a row stands is
-        // in its title's ink (`look`), its breath while it works (`busy`) and a few muted words trailing it (`meta`).
+        // in its title's ink (`look`), the sheen through it while it works (`pace`, `busy`) and a few muted words
+        // trailing it (`meta`).
+        let mut forced = 0usize;
         view::for_each_of(tree, info, |row, r, new| {
             if new {
                 row.set(HoverAmt::default());
@@ -935,8 +941,8 @@ impl App {
                 ("menu", Prop::Bool(menu_for == Some(e))),
             ];
             if me.run_of(e).is_some() {
-                // A run: its command, cut to what says what it does; breathing while it runs; how long it took (and how
-                // it failed) on hover, a failure's always.
+                // A run: its command, cut to what says what it does; a sheen through it at a command's pace while it
+                // runs; how long it took (and how it failed) on hover, a failure's always.
                 let name = o.try_cloned::<&model::Name>().map(|n| short_cmd(n.s.as_str())).unwrap_or_default();
                 let meta = me.run_meta(e);
                 let keep = failed || matches!(status, "lost" | "pending" | "skipped");
@@ -946,7 +952,7 @@ impl App {
                         &common[..],
                         &[
                             ("name", Prop::Str(&name)),
-                            ("busy", Prop::Bool(status == "running")),
+                            ("busy", Prop::Bool(status == "running" || !me.shot_working.is_empty())),
                             ("alarm", Prop::Bool(failed)),
                             ("meta", Prop::Str(&meta)),
                             ("keep", Prop::Bool(keep)),
@@ -956,8 +962,9 @@ impl App {
                     .concat(),
                 );
             } else {
-                // A session: its title, breathing while its agent works; trailing how it ended when that went wrong,
-                // else how long ago it started or ended, and its shortcut in that place on hover.
+                // A session: its title, a sheen sweeping through it while its agent works (at the pace of what it does);
+                // trailing how it ended when that went wrong, else how long ago it started or ended, and its shortcut in
+                // that place on hover.
                 let name = o
                     .try_cloned::<&model::Name>()
                     .map(|n| n.s.as_str().split_whitespace().collect::<Vec<_>>().join(" "))
@@ -972,26 +979,44 @@ impl App {
                     && (o.has(model::Busy::id())
                         || o.try_cloned::<&model::Object>()
                             .is_some_and(|ob| me.chats.borrow().get(&ob.id).is_some_and(|t| t.busy)));
-                // What it is doing while it works (its glyph after the title, the command or file trailing it), or how it
-                // went wrong; else nothing, the title has the row (its name mostly is its folder already). Where it works
-                // and when it started or ended are the row's tooltip.
+                // What it is doing while it works (the pace its title's sheen sweeps at, the command or file trailing it,
+                // its words first in the tooltip), or how it went wrong; else nothing, the title has the row (its name
+                // mostly is its folder already). Where it works and when it started or ended are the row's tooltip.
                 let doing = if busy { o.try_cloned::<&model::Object>().and_then(|ob| me.chats.borrow().get(&ob.id).and_then(doing_of)) } else { None };
+                // At work with nothing said yet: a program writing output keeps a command's pace, an agent a thought's.
+                let pace = match &doing {
+                    Some(d) => d.pace,
+                    None if busy && !matches!(model::kind_name(o), "claude" | "codex" | "cursor") => "run",
+                    None if busy => "think",
+                    None => "",
+                };
+                // HARNESS_NATIVE_SHOT_WORKING: a shot shows every session at work, at the paces it names in turn.
+                let (busy, pace) = match me.shot_working.get(forced % me.shot_working.len().max(1)) {
+                    Some(&p) => {
+                        forced += 1;
+                        (true, p)
+                    }
+                    None => (busy, pace),
+                };
                 let when = ago(now.saturating_sub(model::when(o)));
                 let folder = o.try_cloned::<&model::Cwd>().map(|c| folder_of(c.s.as_str())).unwrap_or_default();
                 let (meta, why) = match (status, code) {
                     ("killed", _) => ("killed".to_owned(), format!("{folder} \u{b7} killed {when} ago")),
                     (_, Some(c)) => (format!("exit {c}"), format!("{folder} \u{b7} exited with code {c} {when} ago")),
                     ("lost", _) => ("lost".to_owned(), format!("{folder} \u{b7} lost (the daemon restarted under it)")),
-                    ("running", _) => (doing.as_ref().map_or_else(String::new, |d| d.detail.clone()), format!("{folder} \u{b7} started {when} ago")),
+                    ("running", _) => match &doing {
+                        Some(d) => (d.detail.clone(), format!("{} \u{b7} {folder} \u{b7} started {when} ago", d.tip())),
+                        None => (String::new(), format!("{folder} \u{b7} started {when} ago")),
+                    },
                     _ => (String::new(), format!("{folder} \u{b7} ended {when} ago")),
                 };
                 let mark = done_mark(status, code, depth);
-                // Its name being renamed (chat/rename.rs): the field's words in its place, still (no breath) and alone
+                // Its name being renamed (chat/rename.rs): the field's words in its place, still (no sheen) and alone
                 // on the row (no trailing words or shortcut).
                 let edit = me.rename_shown(e);
-                let (name, busy, meta, hint) = match &edit {
-                    Some((shown, _)) => (shown.clone(), false, String::new(), String::new()),
-                    None => (name, busy, meta, hint),
+                let (name, pace, meta, hint) = match &edit {
+                    Some((shown, _)) => (shown.clone(), "", String::new(), String::new()),
+                    None => (name, if busy { pace } else { "" }, meta, hint),
                 };
                 row.props(
                     "hn.ObjRow",
@@ -999,15 +1024,13 @@ impl App {
                         &common[..],
                         &[
                             ("name", Prop::Str(&name)),
-                            ("busy", Prop::Bool(busy)),
+                            ("pace", Prop::Str(pace)),
                             ("alarm", Prop::Bool(failed || status == "lost")),
                             ("meta", Prop::Str(&meta)),
                             ("why", Prop::Str(&why)),
                             ("hint", Prop::Str(&hint)),
                             ("edit", Prop::Bool(edit.is_some())),
                             ("mark", Prop::Str(mark)),
-                            ("doing", Prop::Str(doing.as_ref().map_or("", |d| d.glyph))),
-                            ("doing_tip", Prop::Str(doing.as_ref().map_or("", |d| d.what))),
                         ],
                     ]
                     .concat(),
@@ -1936,11 +1959,14 @@ impl App {
         self.side_x.x.max(self.corner_x.x).clamp(0.0, 1.0)
     }
 
-    /// Whether something breathes (a working row's title, a chat status) or a Kip in view breathes, blinks or springs (the
-    /// window keeps drawing, at a calm rate, while the app is otherwise idle).
+    /// Whether something breathes (a chat status), a sheen moved through words drawn last frame (a working row's title),
+    /// or a Kip in view breathes, blinks or springs (the window keeps drawing, at a calm rate, while the app is otherwise
+    /// idle). A sheen out of view, or still under Reduce Motion, keeps nothing drawing.
     pub fn breathing(&self) -> bool {
+        let paint = self.paint.borrow();
         crate::look::breathing(self.world.world_ref())
-            || matches!(self.paint.borrow().kip_wake, harness_native_render::kips::Wake::Calm(_))
+            || paint.shimmering
+            || matches!(paint.kip_wake, harness_native_render::kips::Wake::Calm(_))
     }
 
     /// How long until a finished row's linger runs out (seconds; the window, idle, wakes then and the row folds away).
@@ -2032,6 +2058,8 @@ impl App {
                 self.chat_pick_set(rest);
             } else if let Some(rest) = a.strip_prefix("chat:spawn:") {
                 self.chat_pick_spawn(rest);
+            } else if let Some(rest) = a.strip_prefix("chat:older:") {
+                self.chat_pick_older(rest);
             } else if let Some(rest) = a.strip_prefix("chat:mention:") {
                 self.chat_mention_action(rest);
             } else if let Some(rest) = a.strip_prefix("chat:ctx:") {
@@ -2396,12 +2424,25 @@ fn done_mark(status: &str, code: Option<i32>, depth: usize) -> &'static str {
     }
 }
 
-/// What a working agent is doing now, from its transcript's last item: the glyph after its title, the words of its
-/// tooltip, and the detail its row trails (the command, the file, the pattern, the page).
+/// What a working agent is doing now, from its transcript's last item: the pace its title's sheen sweeps at
+/// (scene/widgets/rows.flecs: `think`, `run`, `edit`, `read`, `agent`), the words its tooltip leads with, and the
+/// detail its row trails (the command, the file, the pattern, the page).
 struct Doing {
-    glyph: &'static str,
+    pace: &'static str,
     what: &'static str,
     detail: String,
+}
+
+impl Doing {
+    /// Its tooltip's words: what it does and on what ("Running a command: cargo test"), or only what when the detail says
+    /// no more ("Thinking").
+    fn tip(&self) -> String {
+        if self.detail.is_empty() || self.detail.eq_ignore_ascii_case(self.what) {
+            self.what.to_owned()
+        } else {
+            format!("{}: {}", self.what, self.detail)
+        }
+    }
 }
 
 /// [`Doing`] of transcript `t` while its agent works (None at rest or before it says anything).
@@ -2412,29 +2453,29 @@ fn doing_of(t: &model::chat::Transcript) -> Option<Doing> {
     }
     let base = |p: &str| p.rsplit('/').next().unwrap_or(p).to_owned();
     Some(match t.items.last()? {
-        Item::Thinking { done: false, .. } => Doing { glyph: "\u{EA61}", what: "Thinking", detail: "thinking".to_owned() },
+        Item::Thinking { done: false, .. } => Doing { pace: "think", what: "Thinking", detail: "thinking".to_owned() },
         Item::Tool { name, input, result: None, .. } => {
             let s = |k: &str| input[k].as_str().unwrap_or("").to_owned();
             let n = name.to_ascii_lowercase();
             if ["bash", "shell", "command", "exec"].iter().any(|k| n.contains(k)) {
-                Doing { glyph: "\u{EA85}", what: "Running a command", detail: short_cmd(&s("command")) }
+                Doing { pace: "run", what: "Running a command", detail: short_cmd(&s("command")) }
             } else if ["edit", "write", "patch", "filechange"].iter().any(|k| n.contains(k)) {
-                Doing { glyph: "\u{EA73}", what: "Editing", detail: base(&s("file_path")) }
+                Doing { pace: "edit", what: "Editing", detail: base(&s("file_path")) }
             } else if ["read", "grep", "glob", "search", "ls"].iter().any(|k| n.contains(k)) && !n.contains("web") {
                 let what = s("file_path");
-                Doing { glyph: "\u{EA6D}", what: "Reading", detail: if what.is_empty() { s("pattern") } else { base(&what) } }
+                Doing { pace: "read", what: "Reading", detail: if what.is_empty() { s("pattern") } else { base(&what) } }
             } else if n.contains("web") || n.contains("fetch") {
                 let url = s("url");
                 let host = url.split("://").nth(1).and_then(|r| r.split('/').next()).map_or_else(|| s("query"), str::to_owned);
-                Doing { glyph: "\u{EB01}", what: "On the web", detail: host }
+                Doing { pace: "read", what: "On the web", detail: host }
             } else if n.contains("task") || n.contains("agent") {
-                Doing { glyph: "\u{EC10}", what: "Running a sub-agent", detail: s("description") }
+                Doing { pace: "agent", what: "Running a sub-agent", detail: s("description") }
             } else {
-                Doing { glyph: "\u{EB6D}", what: "Using a tool", detail: name.rsplit("__").next().unwrap_or(name).to_owned() }
+                Doing { pace: "read", what: "Using a tool", detail: name.rsplit("__").next().unwrap_or(name).to_owned() }
             }
         }
-        Item::Text { done: false, .. } => Doing { glyph: "\u{EA6B}", what: "Writing", detail: "writing".to_owned() },
-        _ => Doing { glyph: "\u{EA61}", what: "Thinking", detail: "thinking".to_owned() },
+        Item::Text { done: false, .. } => Doing { pace: "edit", what: "Writing", detail: "writing".to_owned() },
+        _ => Doing { pace: "think", what: "Thinking", detail: "thinking".to_owned() },
     })
 }
 
@@ -2775,7 +2816,7 @@ mod tests {
         for role in [
             "ground", "sidebar", "card", "raised", "well", "term_ground", "line", "line_strong", "ink_strong", "ink",
             "ink_muted", "ink_faint", "hover", "wash", "selection", "selection_focus", "press", "scrim", "clear",
-            "text_selection", "copy_sheen", "accent", "accent_wash", "on_accent", "link", "code_ink", "success", "warning", "error",
+            "text_selection", "copy_sheen", "sheen", "accent", "accent_wash", "on_accent", "link", "code_ink", "success", "warning", "error",
             "success_wash", "warning_wash", "error_wash", "kind_claude", "kind_codex", "kind_cursor", "kind_shell", "aside",
             "aside_line",
         ] {

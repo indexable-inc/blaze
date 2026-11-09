@@ -2,7 +2,7 @@ module hn.tree
 
 // The sidebar tree's parts (scene/widgets/rows.flecs builds its rows of them), Notion's sidebar: a title and a few muted
 // words trailing it, nothing else. Type and ink from the tokens (00-tokens.flecs: size_row, weight_tree, tone_row_*);
-// each row sets only what its state changes (its ink, its weight, its breath). Prefabs only, leaves only (no children),
+// each row sets only what its state changes (its ink, its weight, its sheen). Prefabs only, leaves only (no children),
 // so an instance in a template is the part itself.
 
 // A session's title: 13, a touch over regular, one line that gives way first (ui.Lead) when the row runs out of room.

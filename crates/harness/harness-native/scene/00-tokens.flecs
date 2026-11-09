@@ -56,6 +56,10 @@ export const tone_text_selection: Fill = {dark: {0.122, 0.227, 0.42, 0.9}, light
 // The light a copy sweeps over what it took (ui.selection's CopyLook): the accent lifted toward white on the dark page,
 // where it adds to the plate, and the accent itself on the paper, where it tints; its alpha is the light at its brightest.
 export const tone_copy_sheen: Fill = {dark: {0.72, 0.82, 1.0, 0.24}, light: {0.22, 0.443, 0.882, 0.16}}
+// The ink a Sheen's band lifts words toward (a working row's title, ui.Shimmer): on the dark page past the strong ink, to a
+// near-white with a breath of the accent's cool in it, so the band still reads as light over a selected row's strong title;
+// on the paper a deep accent ink, since brightening dark words toward the paper would only fade them.
+export const tone_sheen: Fill = {dark: {0.9, 0.95, 1.0, 1}, light: {0.11, 0.30, 0.74, 1}}
 // The accent: only what is on or pressable-and-chosen (a switch, a focused control, a load bar); its faint wash (a search
 // match, a highlighted cell); the ink on a solid accent or a coloured badge. A link's ink; inline code's (--doc-code-ink).
 export const tone_accent: Fill = {dark: {0.302, 0.557, 1, 1}, light: {0.22, 0.443, 0.882, 1}}
@@ -131,12 +135,9 @@ export const tree_icon = 16
 export const tree_chevron = 9
 // The tree's indent guides (hn.Hang's slots): a hairline down the middle of each ancestor's chevron gutter, in
 // tone_guide (Islands' tree-indent-guide-border), for as many levels as tree_guides; a done mark in a childless row's
-// gutter (tree_mark across: a check in tone_success, a cross in tone_error); a working agent's activity glyph after its
-// title (tree_doing across, tree_doing_gap after the words, in the muted ink).
+// gutter (tree_mark across: a check in tone_success, a cross in tone_error).
 export const tree_guide_w = 1
 export const tree_mark = 11
-export const tree_doing = 12
-export const tree_doing_gap = 6
 export const tone_guide: Fill = {dark: {0.122, 0.133, 0.153, 1}, light: {0.086, 0.086, 0.090, 0.10}}
 export const tree_pad = 2
 export const tree_pad_r = 8
@@ -146,9 +147,48 @@ export const line_row = 16
 // corners radius_row.
 export const pill_inset = 2
 export const radius_row = 6
-// A working row's title breathes (src/look.rs Breath) between full and breath_title_low: slow and shallow, a shimmer
-// rather than a blink, and only while its program or agent is at work, so an idle tree draws nothing.
-export const breath_title_low = 0.45
+// A working row's title is its own sign of work: a band of light sweeps through its letters, left to right (a Sheen,
+// harness-native-ui-look-api; ui.Shimmer), lifting them toward tone_sheen and leaving them at their own ink behind it.
+// Its rhythm says what the agent does (src/app.rs doing_of), quietly: each pace a pass of sheen_<pace>_period seconds,
+// then sheen_<pace>_rest at rest; the band sheen_<pace>_band points either side of its middle; its middle lifting the
+// letters sheen_<pace>_strength of the way to the sheen's ink; sheen_<pace>_ease of an ease-in-out (0: constant speed),
+// so the band slows only where it is half off the words. Every row starts at its own place in the cycle (scatter), so
+// several working rows never sweep in step. Only while at work, and only rows in view keep frames coming (the calm
+// rate); a row at rest has strength 0 and costs nothing.
+// - think: a slow, gentle drift, a wide soft band and a long rest between passes.
+export const sheen_think_period = 2.6
+export const sheen_think_rest = 1.1
+export const sheen_think_band = 36
+export const sheen_think_strength = 0.7
+export const sheen_think_ease = 0.6
+// - run (a command, a shell run): quicker, crisper passes, a narrow band, barely a rest.
+export const sheen_run_period = 1.1
+export const sheen_run_rest = 0.25
+export const sheen_run_band = 18
+export const sheen_run_strength = 0.85
+export const sheen_run_ease = 0.3
+// - edit (editing a file, writing the reply): a steady medium cadence.
+export const sheen_edit_period = 1.6
+export const sheen_edit_rest = 0.45
+export const sheen_edit_band = 24
+export const sheen_edit_strength = 0.8
+export const sheen_edit_ease = 0.45
+// - read (reading, searching, the web, any other tool): medium, a little softer than edit.
+export const sheen_read_period = 1.8
+export const sheen_read_rest = 0.6
+export const sheen_read_band = 28
+export const sheen_read_strength = 0.75
+export const sheen_read_ease = 0.5
+// - agent (a sub-agent at work): two bands chasing one another half a pass apart, no rest.
+export const sheen_agent_period = 2.2
+export const sheen_agent_rest = 0
+export const sheen_agent_band = 22
+export const sheen_agent_strength = 0.75
+export const sheen_agent_ease = 0.4
+export const sheen_agent_bands = 2
+// Under Reduce Motion nothing sweeps: a working title sits steadily sheen_still of its pace's strength toward the
+// sheen's ink, a little brighter than at rest, so it still reads as at work.
+export const sheen_still = 0.35
 // The group header (the device's name) over the tree, group_h tall, its words label_inset in from the sidebar's edge:
 // in line with the depth-0 chevrons.
 export const group_h = 28
