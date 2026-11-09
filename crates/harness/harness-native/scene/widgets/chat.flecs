@@ -74,8 +74,8 @@ hn {
           }
         }
         // The controls (src/app/chat.rs and chat/pick.rs keep each slot, each only while it has something to say): the
-        // model and effort (hn.ChatPick) at the leading edge; the context meter (hn.ChatContext) and, while the agent works, its
-        // breathing ring (hn.ChatWorking) at the trailing one. No buttons: Return sends, Escape stops.
+        // model and effort (hn.ChatPick) at the leading edge; at the trailing one the context meter (hn.ChatContext), its
+        // one ring breathing while the agent works. No buttons: Return sends, Escape stops.
         bar : ui.Row {
           Cursor: {shape: Arrow}
           Flex: {axis: Row, gap: $chat_bar_gap, align: Center, justify: Start, wrap: false}
@@ -86,10 +86,6 @@ hn {
           }
           spacer : ui.Spacer {}
           meter : ui.Row {
-            Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
-            Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-          }
-          act : ui.Row {
             Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
             Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
           }

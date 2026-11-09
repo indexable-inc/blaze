@@ -1087,6 +1087,8 @@ impl HarnessView {
                     if let Some(secs) = st.app.linger_due() {
                         arm_linger(secs);
                     }
+                    // A pause in typing: the chats' drafts are kept for the next launch.
+                    st.app.flush_drafts();
                     if st.app.headroom.potential > 1.0 {
                         arm_headroom_watch();
                     }
@@ -1630,6 +1632,8 @@ define_class!(
 
         #[unsafe(method(applicationWillTerminate:))]
         fn will_terminate(&self, _note: &NSNotification) {
+            // What was typed since the last pause is kept too.
+            with(|st| st.app.flush_drafts());
             single::release();
         }
 
