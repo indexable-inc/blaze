@@ -2071,6 +2071,7 @@ impl Enc<'_> {
             arbitrary_ints,
             handles,
             views,
+            pattern_types,
             edition,
             recursion_limit,
         } = &**data;
@@ -2086,6 +2087,7 @@ impl Enc<'_> {
         self.bool(*arbitrary_ints);
         self.bool(*handles);
         self.bool(*views);
+        self.bool(*pattern_types);
         self.option(*recursion_limit, |enc, it| {
             enc.u32(it);
             Ok(())
@@ -3483,6 +3485,7 @@ impl Dec<'_> {
         data.arbitrary_ints = self.bool()?;
         data.handles = self.bool()?;
         data.views = self.bool()?;
+        data.pattern_types = self.bool()?;
         data.recursion_limit = self.option(Self::u32)?;
         data.registered_tools = self.many(Self::symbol)?;
         let mut features = UnstableFeatures::default();

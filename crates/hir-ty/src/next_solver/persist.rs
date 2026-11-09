@@ -1473,6 +1473,10 @@ impl<'db> Code<'db> for PatternKind<'db> {
                 pats.put(sink);
             }
             PatternKind::NotNull => sink.word(2),
+            PatternKind::Variant { index } => {
+                sink.word(3);
+                sink.word(index);
+            }
         }
     }
 
@@ -1481,6 +1485,7 @@ impl<'db> Code<'db> for PatternKind<'db> {
             0 => PatternKind::Range { start: Code::get(source)?, end: Code::get(source)? },
             1 => PatternKind::Or(Code::get(source)?),
             2 => PatternKind::NotNull,
+            3 => PatternKind::Variant { index: source.word()? },
             _ => return Err(source.invalid("a pattern")),
         })
     }
@@ -1809,7 +1814,8 @@ blaze_format::record! {
 /// kinds of the pinned `rustc_type_ir`. Changes with any change to a `Code` impl.
 /// 3: `BoundVariableKind::Reflected` (tag 3), blaze's field binders.
 /// 4: `SolverDefId::RpititId` (tag 18), a trait method's `impl Trait` item.
-pub const FORMAT_VERSION: u64 = 4;
+/// 5: `PatternKind::Variant` (tag 3), blaze's refinements by enum variants.
+pub const FORMAT_VERSION: u64 = 5;
 
 /// The schema of a persisted type table, for the schema of a buffer that holds one: a table
 /// written by another codec reads as a schema mismatch, never as other values.
@@ -2426,6 +2432,11 @@ mod tests {
                 Pattern::intern(PatternKind::NotNull),
             ])),
             PatternKind::NotNull,
+            PatternKind::Variant { index: 2 },
+            PatternKind::Or(PatList::new_from_slice(&[
+                Pattern::intern(PatternKind::Variant { index: 0 }),
+                Pattern::intern(PatternKind::Variant { index: 3 }),
+            ])),
         ];
 
         let clause = |kind| Binder::dummy(PredicateKind::Clause(kind));
@@ -2615,7 +2626,9 @@ mod tests {
                     pats.iter().fold(TypeFlags::empty(), |flags, pat| flags | pat.flags()),
                     pats.iter().map(|pat| pat.outer_exclusive_binder()).max().unwrap_or(INNERMOST),
                 ),
-                PatternKind::NotNull => (TypeFlags::empty(), INNERMOST),
+                PatternKind::NotNull | PatternKind::Variant { .. } => {
+                    (TypeFlags::empty(), INNERMOST)
+                }
             };
             assert_eq!(pattern.flags(), flags);
             assert_eq!(pattern.outer_exclusive_binder(), binder);

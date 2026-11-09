@@ -280,6 +280,7 @@ diagnostics![AnyDiagnostic<'db> ->
     InheritedRefMutabilityMismatch,
     FnTraitArgsNotTuple,
     SelfCtorNotTupleOrUnit<'db>,
+    WholeValueWriteThroughRefinement<'db>,
     ConstParamTyNotAllowed<'db>,
     ValTreeError<'db>,
     UnplacedDiagnostic,
@@ -2135,6 +2136,14 @@ pub struct FnTraitArgsNotTuple {
 pub struct SelfCtorNotTupleOrUnit<'db> {
     pub expr: InFile<ExprOrPatPtr>,
     pub self_ty: Type<'db>,
+}
+
+/// blaze: a whole-value write to `place`, of the refinement `ty` (`#![blaze::pattern_types]`),
+/// through a unique reference (rule pattern-types-unique-ref).
+#[derive(Debug)]
+pub struct WholeValueWriteThroughRefinement<'db> {
+    pub place: InFile<ExprOrPatPtr>,
+    pub ty: Type<'db>,
 }
 
 /// rustc's two errors of `check_expr_unsafe_binder_cast`: for `Wrap`, "`wrap_binder!()` can
@@ -4885,6 +4894,13 @@ impl<'db> AnyDiagnostic<'db> {
                 }
                 .into()
             }
+            InferenceDiagnostic::WholeValueWriteThroughRefinement { place, ty } => {
+                WholeValueWriteThroughRefinement {
+                    place: expr_syntax(*place)?,
+                    ty: new_ty(ty.as_ref()),
+                }
+                .into()
+            }
             InferenceDiagnostic::UnsafeBinderCastOfNonBinder { expr, kind, found } => {
                 UnsafeBinderCastOfNonBinder {
                     expr: expr_syntax(*expr)?,
@@ -5930,6 +5946,11 @@ fn unplaced_inference_text<'db>(
         InferenceDiagnostic::SelfCtorNotTupleOrUnit { self_ty, .. } => format!(
             "the `Self` constructor can only be used with tuple or unit structs, and `Self` is `{}`",
             ty(self_ty)
+        ),
+        InferenceDiagnostic::WholeValueWriteThroughRefinement { ty: refined, .. } => format!(
+            "a whole value of `{}` is written through a unique reference; only its fields may be \
+             (rule pattern-types-unique-ref)",
+            ty(refined)
         ),
     };
     let place = match d {

@@ -113,6 +113,20 @@ pub enum PatternTypeUnsupported {
     /// A range's ends are always lowered: hir-def makes `a..b` and `a..` inclusive as rustc's
     /// `lower_excluded_range_end` and `lower_ty_pat_range_end` do.
     Pattern,
+    /// blaze: a pattern of enum variants in a crate without `#![blaze::pattern_types]`
+    /// (docs/v2/plan/design/edition.md, section 8).
+    VariantsNeedGate,
+    /// blaze: a pattern of enum variants whose base type is not an enum.
+    VariantsOfNonEnum,
+    /// blaze: an alternative of a set of variants that is not a variant of the base enum, or not
+    /// a variant pattern at all (a set mixed with a range).
+    NotAVariant,
+    /// blaze: a variant pattern with something inside other than `_` and `..`: a type's pattern
+    /// says which variant, never what its fields hold.
+    VariantFieldNotWildcard,
+    /// blaze: a variant pattern of another shape than its variant: a path for a tuple or
+    /// struct variant, a tuple pattern of the wrong length, or a field the variant lacks.
+    VariantShape,
 }
 
 /// Where a lifetime is left out.

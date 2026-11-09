@@ -148,6 +148,9 @@ impl DefMap {
                         // `#![blaze::uniq]`, read off the root's tokens before any parse
                         // (`base_db::Crate::syntax_gates`, docs/v2/plan/design/edition.md).
                         | "uniq"
+                        // `#![blaze::pattern_types]`, from `DefMap::pattern_types`
+                        // (docs/v2/plan/design/edition.md, section 8).
+                        | "pattern_types"
                         // `#[blaze::reflect]`, from `AttrFlags::BLAZE_REFLECT`
                         // (`hir_ty_comptime::struct_domain`, docs/v2/plan/design/comptime.md).
                         | "reflect"

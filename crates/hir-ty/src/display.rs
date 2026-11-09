@@ -1854,6 +1854,33 @@ impl<'db> Ty<'db> {
                 }
             }
             TyKind::CoroutineWitness(..) => write!(f, "{{coroutine witness}}")?,
+            // blaze: a refinement by variants (`#![blaze::pattern_types]`) prints as written,
+            // `Conn is Conn::Open { .. } | Conn::Closed`.
+            TyKind::Pat(base, _) if let Some(enum_) = crate::pattern_types::enum_of(*self) => {
+                base.hir_fmt(f)?;
+                let enum_name = EnumSignature::of(db, enum_).name.clone();
+                let variants = &enum_.enum_variants(db).variants;
+                let pattern = crate::pattern_types::refinement(*self).map(|(_, it)| it);
+                let indices = pattern.map(crate::pattern_types::variants).unwrap_or_default();
+                for (n, &index) in indices.iter().enumerate() {
+                    write!(f, "{}", if n == 0 { " is " } else { " | " })?;
+                    let Some((name, &(_, shape))) = variants.get_index(index as usize) else {
+                        write!(f, "{{variant {index}}}")?;
+                        continue;
+                    };
+                    write!(
+                        f,
+                        "{}::{}",
+                        enum_name.display(db, f.edition()),
+                        name.display(db, f.edition())
+                    )?;
+                    match shape {
+                        FieldsShape::Record => write!(f, " {{ .. }}")?,
+                        FieldsShape::Tuple => write!(f, "(..)")?,
+                        FieldsShape::Unit => {}
+                    }
+                }
+            }
             TyKind::Pat(_, _) => write!(f, "{{pat}}")?,
             TyKind::UnsafeBinder(_) => write!(f, "{{unsafe binder}}")?,
             TyKind::Alias(..) => write!(f, "{{alias}}")?,

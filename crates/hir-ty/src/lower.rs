@@ -1243,6 +1243,12 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             }
             TypeRef::PatternType(ty, pat) => {
                 let ty = self.lower_ty(ty);
+                // blaze: a set of enum variants (`#![blaze::pattern_types]`), in its canonical
+                // form (`crate::pattern_types::refine`).
+                if self.is_variant_pattern(pat) {
+                    let refined = self.lower_variant_pattern_type(type_ref_id, pat, ty);
+                    return (refined.unwrap_or(self.types.types.error), res);
+                }
                 let Some(pat) = self.lower_pattern_type(type_ref_id, pat, ty) else {
                     return (self.types.types.error, res);
                 };
@@ -1263,6 +1269,127 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             TypeRef::Error => self.types.types.error,
         };
         (ty, res)
+    }
+
+    /// blaze: whether the pattern of a pattern type names enum variants: a path, tuple-struct
+    /// or record pattern, or an `|` with one among its alternatives.
+    fn is_variant_pattern(&self, pat: PatId) -> bool {
+        match self.store.pat(pat) {
+            hir_def::hir::Pat::Path(_)
+            | hir_def::hir::Pat::TupleStruct { .. }
+            | hir_def::hir::Pat::Record { .. } => true,
+            hir_def::hir::Pat::Or(pats) => pats.iter().any(|&it| self.is_variant_pattern(it)),
+            _ => false,
+        }
+    }
+
+    /// blaze: `base is V1 | V2 ..`, a refinement of the enum `base` by the variants the pattern
+    /// names (`#![blaze::pattern_types]`, docs/v2/plan/design/edition.md, section 8). Each
+    /// alternative is a variant of `base` with only `_` and `..` inside; anything else is
+    /// reported, naming the type and the rule, and gives `None`. The gate is the crate's
+    /// `DefMap::pattern_types`, which the def map query keys on the crate root's attributes.
+    fn lower_variant_pattern_type(
+        &mut self,
+        source: TypeRefId,
+        pat: PatId,
+        base: Ty<'db>,
+    ) -> Option<Ty<'db>> {
+        let unsupported = |reason| TyLoweringDiagnostic::PatternTypeNotLowered { source, reason };
+        if !hir_def::nameres::crate_def_map(self.db, self.resolver.krate()).pattern_types() {
+            self.push_diagnostic(unsupported(PatternTypeUnsupported::VariantsNeedGate));
+            return None;
+        }
+        let enum_ = match base.kind() {
+            TyKind::Adt(def, _) => match def.def_id() {
+                AdtId::EnumId(it) => it,
+                _ => {
+                    self.push_diagnostic(unsupported(PatternTypeUnsupported::VariantsOfNonEnum));
+                    return None;
+                }
+            },
+            TyKind::Error(_) => return None,
+            _ => {
+                self.push_diagnostic(unsupported(PatternTypeUnsupported::VariantsOfNonEnum));
+                return None;
+            }
+        };
+        let alternatives: SmallVec<[PatId; 4]> = match self.store.pat(pat) {
+            hir_def::hir::Pat::Or(pats) => pats.iter().copied().collect(), // alloc: inline to four
+            _ => SmallVec::from_slice(&[pat]),
+        };
+        let mut indices = crate::pattern_types::Variants::new();
+        for alternative in alternatives {
+            match self.variant_of_pattern(enum_, alternative) {
+                Ok(index) => indices.push(index),
+                Err(Some(reason)) => {
+                    self.push_diagnostic(unsupported(reason));
+                    return None;
+                }
+                Err(None) => return None,
+            }
+        }
+        let variant_count = enum_.enum_variants(self.db).variants.len();
+        crate::pattern_types::refine(self.interner, base, indices, variant_count)
+    }
+
+    /// blaze: the index of the variant of `enum_` one alternative of a set of variants names,
+    /// or why it names none (`None` for a parse error, which is reported already).
+    fn variant_of_pattern(
+        &self,
+        enum_: EnumId,
+        pat: PatId,
+    ) -> Result<u32, Option<PatternTypeUnsupported>> {
+        use hir_def::hir::Pat;
+        let (path, shape_ok) = match self.store.pat(pat) {
+            Pat::Path(path) => (path, None),
+            Pat::TupleStruct { path, args, ellipsis } => {
+                for &arg in args {
+                    if !matches!(self.store.pat(arg), Pat::Wild) {
+                        return Err(Some(PatternTypeUnsupported::VariantFieldNotWildcard));
+                    }
+                }
+                (path, Some((FieldsShape::Tuple, args.len(), ellipsis.is_some(), None)))
+            }
+            Pat::Record { path, args, ellipsis } => {
+                for field in args {
+                    if !matches!(self.store.pat(field.pat), Pat::Wild) {
+                        return Err(Some(PatternTypeUnsupported::VariantFieldNotWildcard));
+                    }
+                }
+                (path, Some((FieldsShape::Record, args.len(), ellipsis, Some(args))))
+            }
+            Pat::Missing => return Err(None),
+            _ => return Err(Some(PatternTypeUnsupported::NotAVariant)),
+        };
+        let hygiene = self.store.pat_path_hygiene(pat);
+        let variant = match self.resolver.resolve_path_in_type_ns_hygienic(self.db, path, hygiene) {
+            Some((TypeNs::EnumVariantId(it), None, ..)) => it,
+            _ => return Err(Some(PatternTypeUnsupported::NotAVariant)),
+        };
+        if variant.lookup(self.db).parent != enum_ {
+            return Err(Some(PatternTypeUnsupported::NotAVariant));
+        }
+        let index = variant.index(self.db);
+        let Some((_, &(_, shape))) = enum_.enum_variants(self.db).variants.get_index(index) else {
+            return Err(Some(PatternTypeUnsupported::NotAVariant));
+        };
+        let fields = variant.fields(self.db);
+        let fits = match shape_ok {
+            // A path names a unit variant only, as in a body.
+            None => shape == FieldsShape::Unit,
+            Some((FieldsShape::Tuple, len, ellipsis, _)) => {
+                shape == FieldsShape::Tuple && (ellipsis || len == fields.len())
+            }
+            // A record pattern fits a variant of any shape, as in a body, naming its fields.
+            Some((_, len, ellipsis, written)) => {
+                written.is_none_or(|it| it.iter().all(|field| fields.field(&field.name).is_some()))
+                    && (ellipsis || len == fields.len())
+            }
+        };
+        if !fits {
+            return Err(Some(PatternTypeUnsupported::VariantShape));
+        }
+        Ok(index as u32)
     }
 
     /// `None` when the pattern is missing (a parse error) or is not lowered, which is reported.

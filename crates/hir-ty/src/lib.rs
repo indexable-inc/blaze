@@ -51,6 +51,7 @@ pub mod lang_items;
 pub mod layout;
 pub mod method_resolution;
 pub mod mir;
+pub mod pattern_types;
 pub mod primitive;
 pub mod providers;
 pub mod solver_errors;
