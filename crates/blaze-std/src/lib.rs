@@ -18,6 +18,10 @@
 //!   a [`Path`], an [`env::VarName`], a [`net::HostPort`], each checked as it is made, and a
 //!   literal checked as the crate compiles ([`path!`], [`var!`], [`host!`]).
 //! - Every wait ends in a typed outcome: what it waited for, or a [`Stopped`].
+//! - Media as pure cores: [`image`] (PNG decode and encode, functions of bytes, an allocator
+//!   and limits) and [`video`] (an MP4 muxer, and an HEVC [`video::Encoder`] whose one provider
+//!   is VideoToolbox on macOS, made from a [`gpu::Gpu`], a placeholder had only from
+//!   [`io::Io::gpu`]).
 //!
 //! What S1 does not have yet, and why, is in the crate's report and in std.md: the calling
 //! fiber does not park on a scheduler (the tree has no fiber park yet); a call waits by
@@ -71,7 +75,9 @@ pub mod clock;
 pub mod cx;
 pub mod env;
 pub mod fs;
+pub mod gpu;
 pub mod host;
+pub mod image;
 pub mod io;
 pub mod mem;
 pub mod net;
@@ -81,6 +87,7 @@ pub mod rng;
 pub mod sync;
 pub mod task;
 pub mod trace;
+pub mod video;
 
 /// Bytes held without a copy: their own `Arc`, a range their owner keeps in place, or a
 /// `'static` slice (blaze-bytes). Not [`mem::Bytes`], which are bytes being written into an

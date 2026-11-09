@@ -19,6 +19,10 @@
 //! - [`cell`]: one token reads and writes every cell of its kind, behind one lock across
 //!   threads too.
 //! - [`names`]: the compile-time checks of `path!`, `var!` and `host!` are the run-time ones.
+//! - [`image`]: PNG decode of encode is the image for every colour type and depth, and decode
+//!   of any bytes never panics nor asks its allocator past its limit; fixed vectors.
+//! - [`mp4`]: the muxer's boxes parse back to the packets, in both layouts, the same packets
+//!   give the same bytes, and out-of-order packets are refused by name.
 //!
 //! Replay: a failure prints its plan, the simulation's seed in it; a control prints the seed of
 //! the plan that caught its plant.
@@ -30,6 +34,8 @@ mod contexts;
 mod crash;
 mod deadlines;
 mod env;
+mod image;
+mod mp4;
 mod names;
 mod narrowing;
 mod paths;
