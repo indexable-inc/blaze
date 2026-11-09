@@ -85,6 +85,18 @@ pub struct PickFeel {
     pub word: f32,
 }
 
+/// The chat's `@` mention preview (`hn.Theme.chat_mention`, src/app/chat/mention.rs): the `cols` characters a file's line
+/// is read to, the height of a line of code (`line`) and of a folder's entry (`entry`), and the `image_w` by `image_h`
+/// box (points) under the path: a picture is drawn whole in it, and as many lines or entries are read as fit it.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct MentionLook {
+    pub cols: u32,
+    pub line: f32,
+    pub entry: f32,
+    pub image_w: f32,
+    pub image_h: f32,
+}
+
 /// How a sidebar row's content comes in as the row folds in (and goes as it folds away), on the row's one fold spring
 /// (src/app/fold.rs): its words show only once the row has `lead` of its height (0 to 1), easing in over the rest, and
 /// settle down `rise` points into place as they do.
@@ -103,6 +115,7 @@ pub struct PressAmt {
 pub fn register(world: &World) {
     world.component::<SideDrag>().writable();
     world.component::<PickFeel>().writable();
+    world.component::<MentionLook>().writable();
     world.component::<FoldIn>().writable();
     world.component::<PressAmt>();
     // The row templates (scene/widgets/rows.flecs) set these.
@@ -161,6 +174,11 @@ pub fn side_drag(w: WorldRef<'_>) -> SideDrag {
 /// The chat effort's swipe and commit timings (`hn.Theme.chat_pick`).
 pub fn pick_feel(w: WorldRef<'_>) -> PickFeel {
     role(w, "chat_pick").try_cloned::<&PickFeel>().unwrap_or_else(|| panic!("hn.Theme.chat_pick has no PickFeel"))
+}
+
+/// The `@` mention preview's look (`hn.Theme.chat_mention`).
+pub fn mention_look(w: WorldRef<'_>) -> MentionLook {
+    role(w, "chat_mention").try_cloned::<&MentionLook>().unwrap_or_else(|| panic!("hn.Theme.chat_mention has no MentionLook"))
 }
 
 /// How a sidebar row's content folds in and away (`hn.Theme.tree_fold`).

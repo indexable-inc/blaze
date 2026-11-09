@@ -2607,7 +2607,7 @@ mod tests {
             "hn.GenChartBar", "hn.GenChartGroup", "hn.GenChartStack", "hn.GenChartHit", "hn.GenChartLabel",
             "hn.GenChartLegend", "hn.GenChartKey", "hn.GenChartPie", "hn.GenChartCenter", "hn.GenTone.faint",
             "hn.GenTone.series1", "hn.GenTone.series8", "ui.Browser", "hn.GenBrowser", "hn.WebClip", "hn.WebPane",
-            "hn.WebMenu", "hn.WebPopup", "ui.MenuItem", "ui.MenuNote", "ui.MenuSep", "hn.ChatMention", "hn.ChatMentionItem",
+            "hn.WebMenu", "hn.WebPopup", "ui.MenuItem", "ui.MenuNote", "ui.MenuSep", "hn.ChatMention", "hn.ChatMentionItem", "hn.ChatMentionHead", "hn.ChatMentionCode", "hn.ChatMentionImage", "hn.PeekList", "hn.PeekEntry", "hn.PeekMeta",
         ]
         .into_iter()
         .filter(|p| harness_native_ui_view::prefab(world.world_ref(), p).is_none())
