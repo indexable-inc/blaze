@@ -35,6 +35,7 @@ mod keys;
 pub use floats::Float;
 mod panes;
 mod pointer;
+mod row_menu;
 mod side_drag;
 mod sidebar;
 mod stats;
@@ -175,6 +176,9 @@ struct Ids {
     palette: Option<(u64, Mode)>,
     /// The title-bar strip's root (`hn.TitleBar`): only the back chevron, no title.
     bar: u64,
+    /// The point a row's menu opens at (`hn.RowMenuAt`, placed where the press was), holding the menu while it is open
+    /// (src/app/row_menu.rs).
+    row_menu: u64,
 }
 
 /// The window's title-bar strip as AppKit lays it out, in points: how tall it is (0 in fullscreen, where it is hidden)
@@ -313,6 +317,8 @@ pub struct App {
     floats: Vec<floats::Float>,
     /// The embedded browser: its link to the host, the pane, the views' input (app/browser.rs).
     browser: browser::Browser,
+    /// A sidebar row's menu while it is open (a right press or a control-click on the row; src/app/row_menu.rs).
+    row_menu: Option<row_menu::RowMenu>,
 }
 
 /// The fill of the theme's role `name` (`success`: `hn.Theme.success`).
@@ -508,6 +514,9 @@ impl App {
         let web_pane = web_clip.child("hn.WebPane").id();
         let web_clip = web_clip.id();
         let bar = View::root(w, "hn.TitleBar");
+        // Out of the window row's flow (Placed): layout keeps the place row_menu.rs gives it.
+        let row_menu = root.child("hn.RowMenuAt");
+        row_menu.set(Laid::default());
         let ids = Ids {
             tree: tree.id(),
             device: device.id(),
@@ -516,6 +525,7 @@ impl App {
             archive_row: archive_row.id(),
             palette: None,
             bar: bar.id(),
+            row_menu: row_menu.id(),
         };
         let mut paint = Painter::new(TypeLook { code_scale: 1.0, ..TypeLook::default() });
         let grid = Grid::new(&mut paint.fonts, TERM_SIZE, 2.0);
@@ -587,6 +597,7 @@ impl App {
             screen: None,
             floats: Vec::new(), // alloc: empty until an overlay's window shows
             browser: browser::Browser::new(browser_wake, web_clip, web_pane),
+            row_menu: None,
         };
         app.apply_ghostty();
         app.load_keys()?;
@@ -766,6 +777,8 @@ impl App {
         self.read_folds();
         // A rename whose row is no longer the selection (or under the palette) is saved before the rows are filled.
         self.rename_settle();
+        // An open row menu's rows for its object as it is now (one whose object went closes); its row is marked below.
+        self.sync_row_menu();
         let w = self.world.world_ref();
         let up = w
             .lookup(model::LOCAL)
@@ -880,6 +893,7 @@ impl App {
             .collect();
         // Rows that left the list stay while they fold away.
         let info = self.fold.merge(info, w);
+        let menu_for = self.row_menu_for();
         let me = &*self;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -915,6 +929,8 @@ impl App {
                 ("open", Prop::Bool(!o.has(model::Folded::id()))),
                 ("focus", Prop::Bool(selected && me.tree_focus && me.focused)),
                 ("look", Prop::Str(look)),
+                // Its menu is open (row_menu.rs): ringed, the selection left where it is.
+                ("menu", Prop::Bool(menu_for == Some(e))),
             ];
             if me.run_of(e).is_some() {
                 // A run: its command, cut to what says what it does; breathing while it runs; how long it took (and how
@@ -1183,7 +1199,7 @@ impl App {
         self.poke();
     }
 
-    /// Take object `e` back out of the Archive into the tree (right-click, Unarchive): no longer closed, and kept there
+    /// Take object `e` back out of the Archive into the tree (its row's menu, Unarchive): no longer closed, and kept there
     /// so the rule does not take it straight back.
     pub fn unarchive(&mut self, e: u64) {
         let Some(key) = self.key_of(e) else { return };
@@ -1196,7 +1212,7 @@ impl App {
         self.poke();
     }
 
-    /// Keep object `e` in the tree whatever the rule says (right-click, Keep in Tree), or stop.
+    /// Keep object `e` in the tree whatever the rule says (its row's menu, Keep in Tree), or stop.
     pub fn toggle_pin(&mut self, e: u64) {
         let Some(key) = self.key_of(e) else { return };
         let o = self.world.entity_from_id(e);
@@ -1250,8 +1266,10 @@ impl App {
         hit.filter(|&e| w.entity_from_id(e).is_alive())
     }
 
-    /// The context menu's Kill on object `e` (no asking): as cmd+W, it goes to the Archive.
-    pub fn kill_object(&mut self, e: u64) {
+    /// Close object `e` from its row's menu (no asking), as cmd+W closes the selected one: its session (or a run that
+    /// runs) is killed and it goes to the Archive. The selected one goes through cmd+W itself, so what takes its place is
+    /// selected; another leaves the selection where it is.
+    pub fn close_object(&mut self, e: u64) {
         if !self.world.entity_from_id(e).is_alive() {
             return;
         }
@@ -1265,6 +1283,21 @@ impl App {
                 self.link.kill_run(n);
             }
             self.archive_object(e);
+        }
+        self.poke();
+    }
+
+    /// Kill object `e` from its row's menu (no asking) while it runs: its session's process, or the run, is stopped and
+    /// its row stays where it is (the rule archives it as it would any that ended). Close is the one that also puts it
+    /// away.
+    pub fn kill_object(&mut self, e: u64) {
+        if !self.world.entity_from_id(e).is_alive() || self.status_of(e) != "running" {
+            return;
+        }
+        if let Some((n, None)) = self.run_of(e) {
+            self.link.kill_run(n);
+        } else if let Some(sid) = self.session_of(e) {
+            self.link.kill(sid);
         }
         self.poke();
     }
@@ -1987,6 +2020,9 @@ impl App {
                 self.request_older();
             } else if let Some(b) = a.strip_prefix("chat:open:") {
                 self.chat_toggle(b);
+            } else if let Some(rest) = a.strip_prefix("row:") {
+                // An item of a sidebar row's menu (row_menu.rs).
+                self.row_menu_action(rest);
             } else if let Some(rest) = a.strip_prefix("chat:pick:") {
                 self.chat_pick_action(rest);
             } else if let Some(rest) = a.strip_prefix("chat:set:") {

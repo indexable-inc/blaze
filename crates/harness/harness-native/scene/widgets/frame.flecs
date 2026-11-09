@@ -100,6 +100,37 @@ hn {
     }
   }
 
+  // The ring round a tree row while its menu is open (src/app/row_menu.rs), Finder's: a Background on the selection pill's
+  // frame, its plate clear inside a hairline, drawn over the pill (Z) when the row is selected too. The row sets the
+  // hairline's ink (rows.flecs `menu`: tone_accent while its menu is open, clear else), so the part is always there and
+  // nothing is made or removed as menus open and close.
+  prefab RowMenuMark : ui.Row {
+    Background
+    Z: {z: 1}
+    Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Padding: {l: $pill_inset, r: $pill_inset, t: $pill_inset, b: $pill_inset}
+    plate : ui.Node {
+      Fill: $tone_clear
+      Edge: {dark: $tone_clear.dark, light: $tone_clear.light}
+      Shape: {radius: $radius_row, n: 4, border: 1, feather: 0}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+    }
+  }
+
+  // Where a sidebar row's menu opens (src/app/row_menu.rs): a node of the window's out of its flow (Placed: layout keeps
+  // the Laid the host gives it, the point the right press was), drawing nothing; the menu hangs from it while open.
+  prefab RowMenuAt : ui.Node {
+    Placed
+    Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 0, min: 0, max: 0}}
+  }
+
+  // A sidebar row's menu (src/app/row_menu.rs): ui.Menu's plate with its corner on the point (hn.RowMenuAt), opening
+  // down from it (up when there is no room below, slid in from the screen's edge), its rows ui.MenuItem and ui.MenuSep.
+  prefab RowMenu : ui.Menu {
+    Side: {edge: Bottom, dx: 0, dy: 0}
+    Transition: {kind: Grow, from: Top, scale: $menu_in_scale, fade: true}
+  }
+
   // The main card: an opaque plate in the theme's ground from the window's top edge to its right and bottom edges (the
   // window's corners round it). Nothing sits over its top (no title); hn.Seam is the line between it and the sidebar. Inside it the panes sit side by side: one
   // per pane node (src/app/panes.rs), each `(Shows, object)` and made from the prefab its object's Kind picks. One today;
