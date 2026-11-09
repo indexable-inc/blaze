@@ -12,7 +12,7 @@
 //! amount of work, so it can't make an insert walk every key before it.
 //!
 //! The switch is sticky: a table that has seen a flood stays keyed, as whoever sent it can send
-//! it again. Nothing output may depend on which hash a table uses (AGENTS.md rule 22): a key's
+//! it again. Nothing output may depend on which hash a table uses (AGENTS.md rule 25): a key's
 //! id is the table's counter, never where it lands.
 //!
 //! The signal, per kind of table:

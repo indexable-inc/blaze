@@ -171,7 +171,7 @@ pub(crate) struct Spec {
     /// A foreign workspace's ask: its units are a standard library's.
     pub foreign: Option<ForeignAsk>,
     /// Proc macros are built for [`MACRO_WASM`] to run as wasm modules: every build of a
-    /// workspace's (rule 8, `proc-macros-on-wasm`), with no flag and no way back to the
+    /// workspace's (rule 10, `proc-macros-on-wasm`), with no flag and no way back to the
     /// evaluator from the command line. Off only for a foreign workspace (a standard library,
     /// which has no proc macros) and in tests that plan host-built macros on purpose.
     pub macro_wasm: bool,

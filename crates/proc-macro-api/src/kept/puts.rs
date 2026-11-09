@@ -89,7 +89,7 @@ thread_local! {
 /// as a thread ends with puts left, and drained by a take that sees [`ORPHANED`]. One process
 /// holds it, so with two daemons in it (the simulation) one may publish another's put into its
 /// own store: a [`Keep::Run`] or [`Keep::Machine`] put is under the key of every input it was
-/// made from (rule 18), so that is a value the other store lacks, never a wrong one. A
+/// made from (rule 21), so that is a value the other store lacks, never a wrong one. A
 /// [`Keep::Durable`] put is never here (see the module's docs).
 static ORPHANS: SegQueue<Put> = SegQueue::new();
 static ORPHANED: AtomicBool = AtomicBool::new(false);
@@ -102,7 +102,7 @@ fn orphan(puts: impl IntoIterator<Item = Put>) {
 }
 
 /// Leaves `put` for this thread's next [`take_puts`]. A [`Keep::Durable`] one is a bug of the
-/// caller, a panic naming it (rule 17: it fails the one query): it goes through its daemon
+/// caller, a panic naming it (rule 20: it fails the one query): it goes through its daemon
 /// (`super::Keeping::put`), as the module's docs say why.
 pub fn put(put: Put) {
     if matches!(put.keep, Keep::Durable { .. }) {

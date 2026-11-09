@@ -1,5 +1,5 @@
 //! `untyped_error`: a function's signature whose error is a type that can't name what failed for
-//! the caller to match on (AGENTS.md rule 14): `Result<_, String>`, `Result<_, Box<dyn Error>>`
+//! the caller to match on (AGENTS.md rule 19): `Result<_, String>`, `Result<_, Box<dyn Error>>`
 //! (any auto traits beside), and `anyhow::Error` (`anyhow::Result<T>` is `Result<T,
 //! anyhow::Error>`), anywhere in the return type or a parameter's type.
 //!

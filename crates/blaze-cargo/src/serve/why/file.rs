@@ -1,6 +1,6 @@
 //! `blaze why`'s ledger file ([`super::LEDGER`]), driven on the `blaze-history` thread: the
 //! restore, each build's explaining and append, and the compaction. None of it runs on the
-//! daemon's start path or its loop (rule 14: each has its span).
+//! daemon's start path or its loop (rule 16: each has its span).
 //!
 //! - **Restore** ([`File::restore`]): a file never written whole (empty, or part of the magic)
 //!   is cut to nothing; a last record cut short (or zeros after the last whole one), as a crash
@@ -10,7 +10,7 @@
 //!   is in [`GAP`] (a tail with nothing before it is cut in place: it holds no gap); a file that can't be read, is
 //!   another version's or has a record that does not decode is moved aside
 //!   (`why.ledger.<why>.<n>`, the newest [`ASIDE`] of each kind kept) and never written over,
-//!   a gap marked after the records read before the one that does not decode (rule 23). Stale
+//!   a gap marked after the records read before the one that does not decode (rule 26). Stale
 //!   hidden files of a whole write a crash cut short are removed.
 //! - **Append** ([`File::write`]): a build's record, synced; the directory synced too when the
 //!   append made the file. One that fails is cut back to the length before it, and the build is
@@ -223,7 +223,7 @@ impl File {
                     self.behind = Some(0);
                 }
                 // What is cut is copied aside first: a corrupt length in a middle record reads
-                // as a cut tail too, and no byte of the file is destroyed unread (rule 23).
+                // as a cut tail too, and no byte of the file is destroyed unread (rule 26).
                 let cut = &bytes[keep..];
                 let held = !self.ledger.is_empty();
                 let copied = match copy_aside(&self.dir, "tail", cut) {
@@ -240,7 +240,7 @@ impl File {
                 };
                 if held {
                     // Not cut in place: the restore writes the ledger whole over the file, and a
-                    // crash before that must still find the tail, and so the gap (rule 23).
+                    // crash before that must still find the tail, and so the gap (rule 26).
                     self.torn_at = Some(keep as u64);
                     // alloc: error path
                     return notes.push(format!(
@@ -429,7 +429,7 @@ impl File {
 
     /// Appends `record`, with the magic first when the file is empty, synced (the directory
     /// too when this made the file). A write that fails is cut back to the length before it,
-    /// so no torn record sits before the next one (rule 23). The file's length after.
+    /// so no torn record sits before the next one (rule 26). The file's length after.
     fn append(&self, record: &[u8]) -> Result<u64, String> {
         use std::io::Write as _;
         let path = &self.path;

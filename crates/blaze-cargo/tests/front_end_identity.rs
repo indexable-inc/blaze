@@ -10,7 +10,7 @@ use std::path::Path;
 /// the front end's crates, as their dep-info says, and every one their build scripts say they read
 /// (`blaze_codegen_code::coverage::hold`). Anything else would be an input missing from the key
 /// of every image, check outcome, checked body, constant, goal and kept expansion (AGENTS.md
-/// rule 18), and is named here.
+/// rule 21), and is named here.
 #[test]
 fn the_front_end_identity_hashes_every_input_the_front_end_read() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -41,7 +41,7 @@ fn the_front_end_identity_hashes_every_input_the_front_end_read() {
 /// blaze-cargo and the crates it is built from (but the packages the identity cuts, which are no
 /// input), and every one their build scripts say they read. Anything else would be an input
 /// missing from every unit record's key and the standard library's shared directory (AGENTS.md
-/// rule 18), and is named here.
+/// rule 21), and is named here.
 #[test]
 fn the_record_identity_hashes_every_input_what_makes_a_record_read() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));

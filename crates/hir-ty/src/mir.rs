@@ -1792,7 +1792,7 @@ pub struct Inlined<'db> {
     /// targets counts), or [`devirt::ABSENT`]; each once, in the order first read
     /// ([`Inlined::read_devirt`]). The pass runs before and after `Inline` and looks again at
     /// a call it kept, which reads the same facts again. The code generator keys the body's
-    /// code on them (rule 18), so a body built against a world it no longer matches is not
+    /// code on them (rule 21), so a body built against a world it no longer matches is not
     /// reused.
     pub devirtualized: Vec<[u8; 32]>,
     /// By block, ascending; each block once. Written by the last pass, so the blocks are the

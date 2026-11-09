@@ -136,7 +136,7 @@ fn how_blaze_is_built_is_in_the_code() {
     assert!(!env().vars.contains_key("HOME"), "$HOME is no input");
 }
 
-/// Rule 22: the same tree in another place, its files made in another order, is one code.
+/// Rule 25: the same tree in another place, its files made in another order, is one code.
 #[test]
 fn the_code_is_of_the_contents_alone() {
     let a = Workspace::new("one", false).work_out().unwrap();
@@ -540,7 +540,7 @@ fn the_front_end_is_keyed_by_its_own_code_alone() {
     assert_ne!(
         work_out_of(&read, &FRONT_END, &other).unwrap().code,
         worked.code,
-        "how blaze is built is an input (rule 18)"
+        "how blaze is built is an input (rule 21)"
     );
     assert_ne!(
         worked.code,
@@ -616,7 +616,7 @@ fn an_extra_whose_reader_is_outside_the_closure_is_an_error() {
 
 /// A package an identity cuts is no input, nor what only it is built from, though a root is
 /// built from it: an edit of it keeps the identity, and an edit of a root still moves it. A cut
-/// that names no package the program links, or a root, is refused, naming it (rule 18: a cut
+/// that names no package the program links, or a root, is refused, naming it (rule 21: a cut
 /// names a package that is there, never one gone stale).
 #[test]
 fn a_cut_package_is_no_input_and_a_stale_cut_is_refused() {

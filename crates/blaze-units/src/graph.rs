@@ -927,7 +927,7 @@ impl<'r, 'a> State<'r, 'a> {
     }
 
     /// The features `pkg` is built with for `features_for`, interned. A pair the feature
-    /// resolve did not activate is an error naming the package, never a panic (rule 17):
+    /// resolve did not activate is an error naming the package, never a panic (rule 20):
     /// [`State::root_is_host_only`] keeps the roots off such pairs, so reaching one is a bug
     /// in the walk, said as one.
     fn features_of(&mut self, pkg: u32, features_for: FeaturesFor) -> anyhow::Result<u32> {

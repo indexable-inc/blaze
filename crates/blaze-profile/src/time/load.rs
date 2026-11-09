@@ -926,7 +926,7 @@ fn path_spans(
 }
 
 /// The process whose rows are of `build`, `None` when no row is. Rows of one build from more
-/// than one process are a [`TimeError::ManyProcesses`] naming each (rule 18): daemons that each
+/// than one process are a [`TimeError::ManyProcesses`] naming each (rule 21): daemons that each
 /// numbered a build so in one history, whose workers and windows read as one build would be
 /// summed (selfbuild4, 2026-11-03: four daemons' build 1 read as one of 72 workers and 2296 s).
 fn build_process(source: &Source<'_>, build: u64) -> Result<Option<u32>, TimeError> {

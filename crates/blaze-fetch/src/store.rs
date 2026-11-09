@@ -14,7 +14,7 @@
 //!   graph, a pure step over its inputs to its output. Each record is a value of its own under
 //!   the origin's key: 41 bytes, the object's form, BLAKE3 and length. Two objects for one
 //!   origin is the store's [`blaze_cas::Mismatch`], a typed refusal, never an overwrite
-//!   (AGENTS.md rule 18).
+//!   (AGENTS.md rule 21).
 //! - Only this crate files: `check_and_file` hashes what a producer made itself, and the
 //!   caller never hands in a hash to be believed. Outside it, [`Objects::keep_pinned`] and
 //!   [`Objects::keep_step`] are the ways in.

@@ -1,4 +1,4 @@
-//! `shared_collection_lock`: a collection shared behind one lock where AGENTS.md rule 9 names
+//! `shared_collection_lock`: a collection shared behind one lock where AGENTS.md rule 12 names
 //! the structure to use instead.
 //!
 //! - A field, a static, or a local in an `Arc` whose type is a `Mutex` or `RwLock` (std's, or

@@ -183,7 +183,7 @@ fn calls_of_one_session_wait_their_turn_switched_out(workers: usize) {
     Arc::try_unwrap(pool).ok().expect("every job of the pool ended").stop(DEADLINE).unwrap();
 }
 
-/// A session's turn is a scheduler hold, never a lock held across a wait (rules 10 and 24):
+/// A session's turn is a scheduler hold, never a lock held across a wait (rules 12 and 27):
 /// the one worker asks for the turn while its holder is switched out, and the holder still
 /// gets the worker back.
 #[test]

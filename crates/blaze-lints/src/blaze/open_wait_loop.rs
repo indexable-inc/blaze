@@ -1,4 +1,4 @@
-//! `open_wait_loop`: a loop that waits for progress with no bound (AGENTS.md rule 13: every
+//! `open_wait_loop`: a loop that waits for progress with no bound (AGENTS.md rule 18: every
 //! loop that waits for progress has fuel, a depth or a deadline, and ends in a typed outcome).
 //!
 //! A `loop` or `while` loop waits when its body, outside the loops and closures inside it,
