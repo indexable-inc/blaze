@@ -706,7 +706,10 @@ impl Daemon {
             }
             // Its one turn may take minutes: it holds only this request's connection and blocking thread (each request
             // has its own) and no lock, so every other request goes on.
-            Req::Aside { id, text } => Reply::Aside { text: aside(&self.get(id)?, &text)? },
+            Req::Aside { id, text } => {
+                let s = self.get(id)?;
+                Reply::Aside { text: aside(&s, &text)? }
+            }
             Req::Screen { id } => {
                 let s = self.get(id)?;
                 Reply::Screen { text: s.screen_text(), info: s.info() }
