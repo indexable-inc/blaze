@@ -901,7 +901,12 @@ impl Iocp {
                 self.to_threads(Work::File(effect));
                 Ok(())
             }
+            // A read into memory of the asker's, or a write from it, on a file thread
+            // (`threads::run`), `FILE_FLAG_NO_BUFFERING` where it bypasses the cache; an idle
+            // one fails there, as Windows has no IO class per read.
             effect @ (Effect::ReadAll { .. }
+            | Effect::ReadInto { .. }
+            | Effect::WriteFrom { .. }
             | Effect::ReadLink { .. }
             | Effect::Sync { .. }
             | Effect::Truncate { .. }

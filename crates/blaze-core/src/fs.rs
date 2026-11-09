@@ -219,6 +219,129 @@ pub(crate) fn write_at(path: &Path, at: u64, bytes: &[u8]) -> io::Result<()> {
     }
 }
 
+/// The file at `path`, which exists, opened for [`crate::Effect::ReadInto`] (`write` false) or
+/// [`crate::Effect::WriteFrom`] at offsets: never for appending, which on Linux would put a
+/// positional write at the end. With [`crate::Cache::Bypassed`], around the page cache: Linux
+/// `O_DIRECT`, macOS `F_NOCACHE`, Windows `FILE_FLAG_NO_BUFFERING`; WASI has none, and fails.
+pub(crate) fn open_positional(path: &Path, write: bool, cache: crate::Cache) -> io::Result<std::fs::File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(write);
+    let bypass = cache == crate::Cache::Bypassed;
+    #[cfg(target_os = "linux")]
+    if bypass {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_DIRECT);
+    }
+    #[cfg(windows)]
+    if bypass {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        /// `FILE_FLAG_NO_BUFFERING` (`winbase.h`): reads and writes of whole sectors, around
+        /// the system's cache.
+        const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+        options.custom_flags(FILE_FLAG_NO_BUFFERING);
+    }
+    #[cfg(target_os = "wasi")]
+    if bypass {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            // alloc: an error path.
+            format!(
+                "{}: WASI (the wasm32-wasip1 seed) has no read or write around the page cache",
+                path.display()
+            ),
+        ));
+    }
+    let file = options.open(path)?;
+    // macOS opens no file around its cache; `F_NOCACHE` on the descriptor keeps its reads and
+    // writes out of the unified buffer cache from then on.
+    #[cfg(target_os = "macos")]
+    if bypass {
+        use std::os::fd::AsFd as _;
+        crate::raw::no_cache(file.as_fd())?;
+    }
+    _ = bypass;
+    Ok(file)
+}
+
+/// How many times one read or write at an offset is asked again after the system cut it short
+/// with `EINTR` before it fails: a bound on the loop (rule bounded-progress), far past what a
+/// signal storm makes of a regular file's read.
+const INTERRUPTS: u32 = 64;
+
+/// `into` filled from `at` of `file` (opened by [`open_positional`]): how many bytes were read,
+/// fewer than `into` only at the end of the file. Around the page cache, a read that ends short
+/// of a whole block is at the end, and none follows it (one at an unaligned offset is refused).
+pub(crate) fn read_into(
+    file: &std::fs::File,
+    into: &mut [u8],
+    at: u64,
+    cache: crate::Cache,
+) -> io::Result<usize> {
+    let (mut read, mut interrupted) = (0, 0);
+    while read < into.len() {
+        match read_at(file, &mut into[read..], at + read as u64) {
+            Ok(0) => break,
+            Ok(n) => {
+                read += n;
+                if cache == crate::Cache::Bypassed && read as u64 % crate::DIRECT_ALIGN != 0 {
+                    break;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted && interrupted < INTERRUPTS => {
+                interrupted += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(read)
+}
+
+/// All of `from` written at `at` of `file` (opened by [`open_positional`] to write).
+pub(crate) fn write_from(file: &std::fs::File, from: &[u8], at: u64) -> io::Result<()> {
+    let (mut done, mut interrupted) = (0, 0);
+    while done < from.len() {
+        match write_at_once(file, &from[done..], at + done as u64) {
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
+            Ok(n) => done += n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted && interrupted < INTERRUPTS => {
+                interrupted += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_at(file: &std::fs::File, buffer: &mut [u8], at: u64) -> io::Result<usize> {
+    std::os::unix::fs::FileExt::read_at(file, buffer, at)
+}
+
+#[cfg(windows)]
+fn read_at(file: &std::fs::File, buffer: &mut [u8], at: u64) -> io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_read(file, buffer, at)
+}
+
+#[cfg(target_os = "wasi")]
+fn read_at(file: &std::fs::File, buffer: &mut [u8], at: u64) -> io::Result<usize> {
+    std::os::wasi::fs::FileExt::read_at(file, buffer, at)
+}
+
+#[cfg(unix)]
+fn write_at_once(file: &std::fs::File, bytes: &[u8], at: u64) -> io::Result<usize> {
+    std::os::unix::fs::FileExt::write_at(file, bytes, at)
+}
+
+#[cfg(windows)]
+fn write_at_once(file: &std::fs::File, bytes: &[u8], at: u64) -> io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_write(file, bytes, at)
+}
+
+#[cfg(target_os = "wasi")]
+fn write_at_once(file: &std::fs::File, bytes: &[u8], at: u64) -> io::Result<usize> {
+    std::os::wasi::fs::FileExt::write_at(file, bytes, at)
+}
+
 /// [`crate::Effect::Mode`]: `path`'s permission bits set to `mode`, through a symbolic link
 /// (`chmod`).
 #[cfg(unix)]

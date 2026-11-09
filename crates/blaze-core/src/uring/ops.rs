@@ -37,6 +37,15 @@ pub(super) enum Kind {
     Load,
     /// Its buffer at the end of its kept file ([`Hot::of`]).
     Append,
+    /// [`crate::Effect::ReadInto`]: from [`Cold::at`] of its kept positional file ([`Hot::of`])
+    /// into memory of the asker's, whose address and length are in [`Cold::names`] (the low
+    /// half of the address in the first, the high in the second, the length in the third: it
+    /// has no names), [`Hot::done`] of it read. With [`DIRECT`] its file bypasses the page
+    /// cache, with [`IDLE`] it is read at idle priority.
+    ReadInto,
+    /// [`crate::Effect::WriteFrom`]: memory of the asker's, as a [`Kind::ReadInto`] names it,
+    /// written at [`Cold::at`] of its kept positional file ([`Hot::of`]).
+    WriteFrom,
     /// Its buffer at [`Cold::at`] of the file named first, opened into a slot of its own
     /// ([`Cold::slots`] 0) by the first link of its chain. With [`DIRECT`] the descriptor
     /// bypasses the page cache, and each piece is copied into the registered buffer
@@ -126,6 +135,13 @@ pub(super) const NO_FOLLOW: u8 = 1 << 3;
 /// A [`Kind::Clone`] whose source is no regular file, failing with
 /// [`crate::CLONE_OF_NO_FILE`] once its target is unlinked (the bit [`WHOLE`] is).
 pub(super) const NOT_REGULAR: u8 = 1 << 3;
+
+/// A [`Kind::Open`] of a kept file for reads into and writes from memory at offsets
+/// ([`Kind::ReadInto`], [`Kind::WriteFrom`]): opened without `O_APPEND`, which on Linux puts a
+/// positional write at the end, and with [`DIRECT`] `O_DIRECT` (the bit [`WHOLE`] is).
+pub(super) const POSITIONAL: u8 = 1 << 3;
+/// A [`Kind::ReadInto`] at `IOPRIO_CLASS_IDLE` (the bit [`WHOLE`] is).
+pub(super) const IDLE: u8 = 1 << 3;
 
 /// In [`Hot::buffer`]: none.
 pub(super) const NO_BUFFER: u16 = u16::MAX;

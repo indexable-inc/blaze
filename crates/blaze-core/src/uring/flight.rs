@@ -52,6 +52,15 @@ pub(super) fn filled(bytes: &mut Vec<u8>, res: i32) -> bool {
     bytes.len() < bytes.capacity()
 }
 
+/// The asker's memory a [`Kind::ReadInto`] or [`Kind::WriteFrom`] reads into or writes from:
+/// its address and length, kept in its cold record's `names` (it has none).
+pub(super) fn memory_of(cold: &Cold) -> (u64, u32) {
+    (u64::from(cold.names[0]) | u64::from(cold.names[1]) << 32, cold.names[2])
+}
+
+/// A read's `ioprio` at `IOPRIO_CLASS_IDLE` (`linux/ioprio.h`: the class in the bits from 13).
+const IOPRIO_IDLE: u16 = 3 << 13;
+
 /// The completions the kernel still owes the request `hot`: one per link asked whose last
 /// completion is not in (so an open ahead of a chain is one more), and for a zero-copy send
 /// one per notification owed and one for its send in flight.
@@ -156,7 +165,7 @@ impl Uring {
     pub(super) fn end(&mut self, id: Id) {
         let (hot, buf, cold) = self.ops.remove(id).expect("a request in flight");
         match hot.kind {
-            Kind::Read | Kind::Append | Kind::Sync => {
+            Kind::Read | Kind::Append | Kind::Sync | Kind::ReadInto | Kind::WriteFrom => {
                 unkeep(&mut self.kept, Handle::from_bits(hot.of));
             }
             Kind::Close => {}
@@ -239,6 +248,29 @@ impl Uring {
             Kind::Sync => {
                 let (fd, flags) = kept();
                 Sqe { opcode: OP_FSYNC, flags, fd, user_data, ..Sqe::default() }
+            }
+            // The asker's memory, which stays where it is until the request's last completion
+            // (`Effect::ReadInto`'s and `Effect::WriteFrom`'s contract, `Spans::register`'s).
+            Kind::ReadInto | Kind::WriteFrom => {
+                let (fd, flags) = kept();
+                let (addr, len) = memory_of(cold);
+                let opcode = if hot.kind == Kind::ReadInto { OP_READ } else { OP_WRITE };
+                let ioprio = if hot.kind == Kind::ReadInto && hot.flags & ops::IDLE != 0 {
+                    IOPRIO_IDLE
+                } else {
+                    0
+                };
+                Sqe {
+                    opcode,
+                    flags,
+                    ioprio,
+                    fd,
+                    off: cold.at + hot.done,
+                    addr: addr + hot.done,
+                    len: len - hot.done as u32,
+                    user_data,
+                    ..Sqe::default()
+                }
             }
             Kind::Watch => {
                 let watching = self
@@ -474,6 +506,13 @@ impl Uring {
                 | Kind::Wake
                 | Kind::Open
                 | Kind::Close => {}
+                // The kernel may still read or write the asker's memory: the failure says so, and
+                // the span is never to be used again (`crate::ABANDONED_SPAN`).
+                Kind::ReadInto | Kind::WriteFrom => {
+                    // alloc: the error path, once per effect in flight.
+                    let why = IoError(format!("{why}: {}", crate::ABANDONED_SPAN));
+                    ready.push(Completion { tag: hot.tag, done: Done::Failed(why) });
+                }
                 // The kernel may still read its bytes: they stay in the slot, abandoned, and an
                 // empty buffer comes back in their place.
                 Kind::Send => {
@@ -586,6 +625,33 @@ impl Uring {
                 let put = self.progress(id, res);
                 match (put < self.ops.buf(id).len(), res) {
                     (false, _) => Step::Ends(Some(Done::Appended)),
+                    (true, 0) => Step::Ends(failed(-libc::EIO)),
+                    (true, _) => Step::Again,
+                }
+            }
+            Kind::ReadInto => {
+                if res < 0 {
+                    return Step::Ends(failed(res));
+                }
+                let read = self.progress(id, res) as u64;
+                let (_, len) = memory_of(self.ops.cold(id));
+                // The end of the file: nothing more, or, around the page cache, a read that
+                // ended short of a whole block (the next, at an unaligned offset, is refused).
+                let ended = res == 0
+                    || (hot.flags & DIRECT != 0 && read % crate::DIRECT_ALIGN != 0);
+                match read < u64::from(len) && !ended {
+                    true => Step::Again,
+                    false => Step::Ends(Some(Done::ReadInto { len: read as u32 })),
+                }
+            }
+            Kind::WriteFrom => {
+                if res < 0 {
+                    return Step::Ends(failed(res));
+                }
+                let put = self.progress(id, res) as u64;
+                let (_, len) = memory_of(self.ops.cold(id));
+                match (put < u64::from(len), res) {
+                    (false, _) => Step::Ends(Some(Done::Written)),
                     (true, 0) => Step::Ends(failed(-libc::EIO)),
                     (true, _) => Step::Again,
                 }
