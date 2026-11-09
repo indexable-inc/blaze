@@ -39,7 +39,7 @@ const BLOOM: usize = 1024;
 
 /// The reads one run may record (its own and those replayed into it, counted before they are
 /// deduplicated: what it holds on its thread's edge stack and what [`Local::full`] and a
-/// capture's close dropped as repeats) before it fails with [`super::Runaway`] (rule 15). A stored row holds at most [`super::row::span::MAX_LEN`] (2^24) distinct reads,
+/// capture's close dropped as repeats) before it fails with [`super::Runaway`] (rule 18). A stored row holds at most [`super::row::span::MAX_LEN`] (2^24) distinct reads,
 /// and [`Local::read`] drops a read equal to the last, so a run past 2^28 reads 16 times more
 /// than any run can keep: a loop that keeps reading. No profile yet counts a run's reads (the
 /// "query stack reads" memory row now does); in run m2 of lane checkheap the edge, pending and
@@ -49,7 +49,7 @@ const BLOOM: usize = 1024;
 pub(crate) const RUN_READS: u64 = 1 << 28;
 
 /// Rows a task's pending list may hold past the storage's node count before the verify that
-/// holds them fails with [`super::Runaway`] (rule 15). Each row has one node, and a row
+/// holds them fails with [`super::Runaway`] (rule 18). Each row has one node, and a row
 /// reached again while it is pending is answered from the list ([`Local::pending_head`],
 /// [`Local::repoint_pending`]), so a list longer than the rows that exist holds rows proved
 /// again and again: the exponential re-verify that filled run m2's list (24-byte entries) to

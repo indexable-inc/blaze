@@ -105,7 +105,7 @@ fn stack_pointer() -> usize {
 /// `sched::stack`), and nothing can grow it: a call that would leave less than the red zone of
 /// a fiber's stack stops with a panic naming how much is left, instead of running on into the
 /// memory below. wasm32-wasip1 builds with panic=abort (its target spec's `panic-strategy`), so
-/// that panic aborts the whole seed, naming it, rather than failing one job: rule 17 can't hold
+/// that panic aborts the whole seed, naming it, rather than failing one job: rule 20 can't hold
 /// there until blaze's wasm codegen supports exception handling (docs/future/bootstrap.md, "Fibers
 /// in the seed"). Off a fiber (limit 0) it runs as is: the module's own stack is the linker's
 /// ("Stack in the seed").

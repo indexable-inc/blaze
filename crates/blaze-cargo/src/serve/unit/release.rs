@@ -183,7 +183,7 @@ impl Release<Crate> {
     /// With the front end exclusive (no reader alive): lets go of what the finished crates
     /// keep, and of every MIR when no unit is open or memory made this release due, then under
     /// memory pressure sweeps the values kept by bytes under the squeeze's caps. A span names
-    /// what it let go and what blaze held before and after (rule 14).
+    /// what it let go and what blaze held before and after (rule 16).
     pub(crate) fn release(&mut self, lowered: &mut Lowered) {
         let Some(Plan { crates, mir, pressed, ended }) = self.plan() else { return };
         RELEASES.fetch_add(1, Ordering::Relaxed);

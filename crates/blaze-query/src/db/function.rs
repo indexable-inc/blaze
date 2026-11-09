@@ -99,7 +99,7 @@ pub trait Function: 'static {
     /// The heap bytes `value` holds, which dropping it frees (`weigh = ..`); only a
     /// [`Function::BUDGETED`] function's values are weighed.
     fn weigh(value: &Self::Value) -> usize;
-    /// Writes `key` as an error about its row names it (rule 16): its value as its `Debug`
+    /// Writes `key` as an error about its row names it (rule 19): its value as its `Debug`
     /// shows it, read through the attached database ([`super::attach`]), or its ID where its
     /// type has none. Generated queries write their key's `Debug` (each argument's, for a key of
     /// several); this default writes the ID.
@@ -476,7 +476,7 @@ fn refresh<F: Function>(
     }
 }
 
-/// The most times one [`refresh`] may go round before the row comes up to date (rule 15). A
+/// The most times one [`refresh`] may go round before the row comes up to date (rule 18). A
 /// round ends in an answer or follows progress: a compare-and-swap another task won, a cycle
 /// head's flight that ended, a claim-free walk that marked the row, a run or verify under the
 /// flight. So a refresh goes round a few times; this bound turns a row that never comes up to
@@ -933,7 +933,7 @@ fn run<F: Function>(
     loop {
         // A run makes its text (an error's, a diagnostic's) with its own database lent to the
         // `Debug`s that read one, whichever worker runs it: the text is the same on every thread
-        // (rules 17 and 22), and nothing inside a query formats with none attached.
+        // (rules 20 and 25), and nothing inside a query formats with none attached.
         let new = blaze_mem::frame::task(F::TAG, |_| super::attach(db, || F::execute(db, key)));
         crate::ran_one();
         let done = ran(at);

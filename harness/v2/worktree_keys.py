@@ -30,7 +30,7 @@ The input is one JSON object (inline, a file's path, or `-` for stdin):
               runs and expansions miss by design and C's are the first that can hit. C's
               outcomes say which of B's misses were that step and which are a key that differs
     tree      what the blaze under test was built from, as a content digest of its sources,
-              kept in the result as given (rule 19); the blaze binary's BLAKE3 is added
+              kept in the result as given (rule 22); the blaze binary's BLAKE3 is added
     work      the directory everything goes in; empty: a new one under /tmp
     keep      keep the work directory after the run
 
@@ -509,7 +509,7 @@ def instances_verdict(which: str, a: dict[str, str], b: dict[str, str]) -> Verdi
     lines = [(f"{len(only_b)} instance keys only {which} has (their identity holds where {which} is), "
              f"{len(only_a)} only A has; blaze names no instance by its key (`Built.debug_names` is not printed)")]
     lines += [f"only {which}: {k}" for k in only_b[:10]] + [f"only A: {k}" for k in only_a[:10]]
-    lines += [f"key {k}: code hash {a[k]} in A, {b[k]} in {which} (two values under one key, rule 18)"
+    lines += [f"key {k}: code hash {a[k]} in A, {b[k]} in {which} (two values under one key, rule 21)"
               for k in clash[:10]]
     return ("fail", "\n".join(lines), numbers)
 
@@ -693,7 +693,7 @@ def unique_json(step: str, text: str) -> object:
         for key, value in items:
             if key in out:
                 raise engine.Failed(f"{step}: key {key} twice, {out[key]!r} and {value!r} (two values under one "
-                                    "key, rule 18)")
+                                    "key, rule 21)")
             out[key] = value
         return out
 
@@ -965,7 +965,7 @@ def selftest() -> None:
     expect(instances_verdict("B", {"k1": "c1"}, {"k1": "c1"})[0] == "pass", "the same instances pass")
     verdict, detail, numbers = instances_verdict("B", {"k1": "c1", "k2": "c2"}, {"k1": "c9", "k3": "c2"})
     expect(verdict == "fail" and numbers["only_a"] == 1 and numbers["only_b"] == 1 and numbers["clashing"] == 1
-           and "only B: k3" in detail and "rule 18" in detail, detail)
+           and "only B: k3" in detail and "rule 21" in detail, detail)
 
     expect(keys_verdict(a, good, places) == ("error", KEYS_MISSING, {}), "no keys line is an error naming it")
     ka = made("A", [work_line(0, 1), key_line("function", "rg::search::<u8>", "f0", "compiled",

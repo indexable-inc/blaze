@@ -1,5 +1,5 @@
 //! `error_debug`: an error's message that formats a value with `{:?}`, or formats a value whose
-//! formatting needs the attached database outside `blaze_query::db::attach` (AGENTS.md rule 15:
+//! formatting needs the attached database outside `blaze_query::db::attach` (AGENTS.md rule 20:
 //! formatting an error must not panic; the 2026-11-01 macro-eval panic).
 //!
 //! An error's message is one of:

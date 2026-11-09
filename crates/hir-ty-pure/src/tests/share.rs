@@ -606,7 +606,7 @@ fn the_order_scripts_are_asked_in_changes_no_summary() {
     // goes through `ping`, and the two scripts enter the cycle at opposite ends. Shared,
     // whichever is asked first heads the cycle, and with `pong` at its head the first pass sees
     // `ping`'s initial value: every summary (its witnesses and the path an impurity goes
-    // through too) still comes out the same (rule 22).
+    // through too) still comes out the same (rule 25).
     const CYCLE: &str = r#"
 //- /lib.rs crate:lib deps:std
 pub fn ping(n: u32) {

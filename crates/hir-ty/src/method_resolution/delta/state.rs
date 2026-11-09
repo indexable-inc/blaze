@@ -365,7 +365,7 @@ pub(crate) fn run_nodes(db: &Db, state: &mut State, last: &LastWrite, written: &
         }))
     };
     // A node that could not run again is the cause of whatever followed it (its dependents'
-    // reads of its slot, abandoned): named first (rule 17). Before the pass fails, each slot it
+    // reads of its slot, abandoned): named first (rule 20). Before the pass fails, each slot it
     // left unfilled is abandoned, so no reader gives way for a rerun that won't come.
     if let Some(failed) = nodes.failed.lock().take() {
         abandon_unfilled(db, &nodes);
@@ -396,7 +396,7 @@ pub(crate) fn run_nodes(db: &Db, state: &mut State, last: &LastWrite, written: &
 /// Every slot of the pass not filled, marked abandoned ([`blaze_query::db::Slot::abandon`]):
 /// the pass is failing, so no rerun will fill one given back and no node will claim one never
 /// claimed. A reader reads [`SlotError::Abandoned`] naming it at once, never gives way and is
-/// posted again without a bound (rule 15). Called once every task of the loop has ended, so no
+/// posted again without a bound (rule 18). Called once every task of the loop has ended, so no
 /// task holds a claim.
 fn abandon_unfilled(db: &Db, nodes: &Nodes<'_>) {
     #[cfg(test)]
@@ -448,7 +448,7 @@ fn tests_read_slots(db: &Db, nodes: &Nodes<'_>) -> Vec<(Box<str>, SlotRead)> {
         .collect()
 }
 
-/// Ends before any wait (rule 24).
+/// Ends before any wait (rule 27).
 #[cfg(test)]
 #[inline(never)]
 fn tests_record_failed_pass(before: Vec<(Box<str>, SlotRead)>, after: Vec<(Box<str>, SlotRead)>) {
@@ -675,7 +675,7 @@ static WORKING: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
 
 /// Debug builds: the running job's entry in [`WORKING`] while its node's work changes its
 /// state; let go of as it ends or unwinds. Tied to the job, not the thread, so it holds
-/// across a wait that resumes the job elsewhere (rule 24).
+/// across a wait that resumes the job elsewhere (rule 27).
 #[cfg(debug_assertions)]
 struct Working(Option<&'static AtomicU64>);
 

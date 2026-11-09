@@ -500,7 +500,7 @@ query!(Link, u64, |db, key| {
     below.map_or(0, |it| *get::<Link>(db, Cell(it))) + key.a(db)
 });
 
-/// A walk is bounded (rule 15): past its fuel it unwinds with [`super::OutOfFuel`] naming the
+/// A walk is bounded (rule 18): past its fuel it unwinds with [`super::OutOfFuel`] naming the
 /// query, how far it got and how deep, the rows it left are run again by a later call, and no
 /// bound outlives the call.
 #[test]
@@ -636,7 +636,7 @@ fn runaway_of(f: impl FnOnce()) -> super::Runaway {
     }
 }
 
-/// A run that keeps reading (rule 15) fails once it recorded more reads than a run may, with a
+/// A run that keeps reading (rule 18) fails once it recorded more reads than a run may, with a
 /// [`super::Runaway`] naming the query, its key, where it is on its task's stack and what it
 /// holds; the stack is left empty, the database answers the next ask, the same ask fails the
 /// same way again (its row was emptied, not poisoned), and with room it ends. Its stack holds
@@ -827,7 +827,7 @@ query!(Stepper, u64, |db, key| {
     below.map_or(0, |it| *get::<Stepper>(db, Cell(it))) + key.a(db)
 });
 
-/// A walk bounded by its own steps (rule 15) counts each distinct step once; past its bound it
+/// A walk bounded by its own steps (rule 18) counts each distinct step once; past its bound it
 /// unwinds with [`super::OutOfSteps`] naming the step, the rows it left are run again by a later
 /// call, no bound outlives the call, and a step given outside any bound costs nothing.
 #[test]

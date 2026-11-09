@@ -222,7 +222,7 @@ struct Walk<'a, 'db> {
 impl<'db> Walk<'_, 'db> {
     /// rustc's `dtorck_constraint_for_ty_inner`: what dropping `ty`, reached at `depth`,
     /// needs, added to `constraints`. One level of Rust stack per level of `ty`, each with
-    /// stack to spare (rule 17).
+    /// stack to spare (rule 20).
     fn constraint_for_ty(&self, depth: usize, ty: Ty<'db>, constraints: &mut Constraint<'_, 'db>) {
         stdx::ensure_sufficient_stack(|| self.constraint_for_ty_level(depth, ty, constraints))
     }

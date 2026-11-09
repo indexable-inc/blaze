@@ -1,5 +1,5 @@
 //! `thread_local_in_waiting_fn`: a thread-local read in a function that may park the fiber, or
-//! in a function that can be inlined into one (AGENTS.md rule 24). LLVM treats a thread-local's
+//! in a function that can be inlined into one (AGENTS.md rule 27). LLVM treats a thread-local's
 //! address as constant inside one function, so a function that reads `CACHES.with(..)` and also
 //! waits takes the address once and goes on using it after the fiber resumed on another worker:
 //! the 2026-11-02 "RefCell already borrowed" in `blaze_graph`'s pool, where `CACHES.with` and
@@ -96,7 +96,7 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
             );
             let note = format!(
                 "LLVM takes a thread-local's address once per function, so after a wait resumes the fiber on another \
-                 worker, {owner} can go on using the first thread's slot (AGENTS.md rule 24); `#[inline(never)]` on \
+                 worker, {owner} can go on using the first thread's slot (AGENTS.md rule 27); `#[inline(never)]` on \
                  {owner} does not help, its own wait splits it the same way"
             );
             facts::push(&mut found, Lint::ThreadLocalInWaitingFn, range, message, Some(note));
@@ -116,7 +116,7 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
         );
         let note = format!(
             "{callee} is {why}: inlined, its thread-local's address is taken once for all of {owner} and can be used \
-             after a wait resumes the fiber on another worker (AGENTS.md rule 24)"
+             after a wait resumes the fiber on another worker (AGENTS.md rule 27)"
         );
         facts::push(&mut found, Lint::ThreadLocalInWaitingFn, range, message, Some(note));
     }

@@ -6,7 +6,7 @@
 //! leader filed into.
 //!
 //! A follower's wait is a receive on a channel the leader's end disconnects, bounded by a
-//! deadline and in a span naming the pin (AGENTS.md rules 13 and 15). Nothing is handed from
+//! deadline and in a span naming the pin (AGENTS.md rules 15 and 18). Nothing is handed from
 //! leader to follower but that the leader ended: the follower reads the store, so it is only
 //! ever given bytes the store verified.
 

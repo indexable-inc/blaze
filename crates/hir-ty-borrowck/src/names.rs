@@ -60,7 +60,7 @@ impl fmt::Write for Text<'_> {
 /// `ty` as a message of the borrow check writes it, rustc's `Box<impl Fn() -> u32>`: rendered
 /// with `db` in hand, never through `Debug`, whose names read a database attached to the
 /// thread. The check runs on any worker, attached or not, and its result is cached, so text
-/// read from the thread would differ by where it ran (rule 17, rule 22). The one way the
+/// read from the thread would differ by where it ran (rule 20, rule 25). The one way the
 /// check's messages write a type.
 pub(crate) fn shown_ty<'a, 'db>(
     db: &'db base_db::Db,

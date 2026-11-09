@@ -19,7 +19,7 @@
 //! (a socket, a file), and keys from a parameter of another type.
 //!
 //! A workspace that turns on `blaze::internal` (blaze itself, which keys maps by a fixed-seed
-//! hasher for deterministic output, AGENTS.md rule 22) has this lint allowed by default: it is
+//! hasher for deterministic output, AGENTS.md rule 25) has this lint allowed by default: it is
 //! in the general lints that yield to `blaze::internal` (`blaze::YIELDS_TO_INTERNAL`), decided
 //! by the group's level, not by the lint's name.
 

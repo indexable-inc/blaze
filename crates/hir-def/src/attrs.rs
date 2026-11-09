@@ -1152,7 +1152,7 @@ bitflags::bitflags! {
         const MUST_NOT_SUSPEND = 1 << 91;
         /// `#![blaze::sans_io]`, a word, inner, on a module or a crate root: a blaze extension
         /// (inert under rustc with `#![register_tool(blaze)]`), read by blaze-lints'
-        /// `blaze::sans_io_core` (the module is a sans-IO core, AGENTS.md rule 12).
+        /// `blaze::sans_io_core` (the module is a sans-IO core, AGENTS.md rule 14).
         const SANS_IO = 1 << 92;
         /// `#[blaze::checkfree]`, a word, on a function: a blaze extension (inert under rustc
         /// with `#![register_tool(blaze)]`), read by blaze-lints' `blaze::checkfree` and the

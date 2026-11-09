@@ -231,7 +231,7 @@ fn made(out: &Path) {
             "the stencil libraries the pinned LLVM made from this tree on {host} are not the ones {} \
              pins and {} holds: {}. If the change to what the generator makes is meant, pin and \
              commit what it made: `cp {} {} && cp {} {}/`. If nothing it reads changed, the \
-             generator's output is not deterministic (AGENTS.md rule 22): {host} makes other bytes \
+             generator's output is not deterministic (AGENTS.md rule 25): {host} makes other bytes \
              than the host that made the pin",
             pin_path().display(),
             prebuilt_dir().display(),

@@ -62,7 +62,7 @@ version = "0.20261105.4"
 # saying what moved (docs/cargo.md, "Lock files").
 lock = "required"
 
-# blaze-lints' own lints (AGENTS.md rules 3, 9, 11, 13-15, 20, 22). Each is `warn` until its
+# blaze-lints' own lints (AGENTS.md rules 3, 12, 14, 18-20, 25, 27). Each is `warn` until its
 # count in crates/blaze-lints/baselines/ reaches zero, then `deny`. The other `hot_*` lints are
 # set by the hot crates that opt in. Here, not in `[workspace.lints]`: cargo hands that to rustc, which
 # refuses the tool `blaze` (E0602).
@@ -88,21 +88,21 @@ shared_collection_lock = "warn"
 open_wait_loop = "warn"
 unnamed_wait = "warn"
 wall_clock = "warn"
-# Was `std_hashmap`; every hash collection whose hasher nobody chose (AGENTS.md rules 10, 22).
+# Was `std_hashmap`; every hash collection whose hasher nobody chose (AGENTS.md rules 12, 25).
 default_hasher = "warn"
 dropped_error = "warn"
 untyped_error = "warn"
 hash_order_output = "warn"
 # Keys known at compile time looked up by a map filled at run time or a run of compares
-# (AGENTS.md rule 10); its baseline starts at the first self-build's counts.
+# (AGENTS.md rule 12); its baseline starts at the first self-build's counts.
 fixed_key_lookup = "warn"
 # Code written by agents: a new field or a new answer forces a decision at every site. A struct
 # literal of the workspace writes every field (no `..base`), and a parameter that chooses is an
 # enum named for the choice, not a `bool` (docs/v2/plan/lanes/lints/blaze.md).
 struct_update = "warn"
 bool_param = "warn"
-# A `#![blaze::sans_io]` core that reaches the wall clock or IO (AGENTS.md rule 12), and a
-# hand-written key that leaves a field out unnamed (rule 18); baselines from the first
+# A `#![blaze::sans_io]` core that reaches the wall clock or IO (AGENTS.md rule 14), and a
+# hand-written key that leaves a field out unnamed (rule 21); baselines from the first
 # self-build's counts.
 sans_io_core = "warn"
 key_ignores_field = "warn"
@@ -134,7 +134,7 @@ frozen_collection = "warn"
 # Correctness: a blocking call in async code, a `Relaxed` flag that guards data, a panic in an
 # `extern "C"` fn or in `Drop::drop`, and growth per round of a loop that reads input.
 # `dos_hasher_on_input` is not named: it yields to `blaze::internal` (on above), since this
-# workspace keys maps by fixed-seed hashers on purpose (AGENTS.md rule 22).
+# workspace keys maps by fixed-seed hashers on purpose (AGENTS.md rule 25).
 blocking_in_async = "warn"
 relaxed_publish = "warn"
 unwind_across_ffi = "warn"

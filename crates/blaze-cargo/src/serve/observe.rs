@@ -160,7 +160,7 @@ pub struct Profiling {
 
 /// How long a `blaze why` waits for the builds that ended before it was asked to be explained,
 /// on the loop's clock, before it fails naming the build and what the history's thread is
-/// doing (rule 15).
+/// doing (rule 18).
 pub const WHY_WAIT: Duration = Duration::from_secs(30);
 
 /// What the history's thread is doing, as the loop reads it: a step in the top byte and the
@@ -291,7 +291,7 @@ enum ToHistory {
 }
 
 /// How long a reader's flush ([`blaze_api::Request::Flush`]) may take, on the loop's clock,
-/// before it fails naming what the history's thread is doing (rule 15). A flush is about
+/// before it fails naming what the history's thread is doing (rule 18). A flush is about
 /// 10-100 ms; a build's end flush, which merges, a few seconds.
 pub const FLUSH_WAIT: Duration = Duration::from_secs(30);
 
