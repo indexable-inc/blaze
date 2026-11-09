@@ -288,6 +288,8 @@ pub struct App {
     pub headroom: harness_native_render::hdr::Headroom,
     /// The sidebar tree's scroll (src/app/sidebar.rs).
     tree: sidebar::TreeScroll,
+    /// The Archive list's scroll (app/archive.rs).
+    arch_scroll: archive::ListScroll,
     /// The sidebar tree's rows across frames, for folding rows in and away (src/app/fold.rs).
     fold: fold::TreeFold,
     /// The tree has the keyboard (a tree row was pressed): arrows move in it until a pane is pressed or another key typed.
@@ -575,6 +577,7 @@ impl App {
             dark: true,
             headroom: harness_native_render::hdr::Headroom::SDR,
             tree: sidebar::TreeScroll::default(),
+            arch_scroll: archive::ListScroll::default(),
             fold: fold::TreeFold::default(),
             tree_focus: false,
             press: (0, KeyMods::default()),
@@ -1800,6 +1803,7 @@ impl App {
         self.browser_frame_start(dt);
         self.step_fold(dt);
         self.step_tree_scroll(dt);
+        self.step_archive_scroll();
         self.step_chat_scroll();
         let w = self.world.world_ref();
         if w.try_get::<&Viewport>(|v| (v.w, v.h)) != Some(view) {
