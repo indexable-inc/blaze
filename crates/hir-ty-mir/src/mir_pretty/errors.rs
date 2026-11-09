@@ -316,9 +316,9 @@ pub fn comptime_error_text(
                 // alloc: the text of a diagnostic, made when it is reported
                 Dispatch::FnPointer => "a function pointer".to_owned(),
                 Dispatch::Vtable { dyn_ty } => {
-                    let dyn_ty = dyn_ty.as_ref().display(db, display_target);
+                    let dyn_ty = dyn_ty.as_ref();
                     // alloc: the text of a diagnostic, made when it is reported
-                    format!("the vtable of `{dyn_ty}`")
+                    format!("the vtable of `{}`", dyn_ty.display(db, display_target))
                 }
             };
             let (callee, why) = match callee {
