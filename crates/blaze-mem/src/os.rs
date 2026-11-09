@@ -968,6 +968,265 @@ pub(crate) unsafe fn reuse(_ptr: NonNull<u8>, _bytes: usize) -> io::Result<()> {
     Ok(())
 }
 
+/// The most ranges one [`evict`] call hands the kernel: the pool's evictor gives back a batch
+/// of up to 256 pages, merged into ranges, so a batch is one call (one TLB flush on Linux).
+/// The `iovec`s live on the caller's stack, 4 KiB of them.
+pub(crate) const EVICT_BATCH: usize = 256;
+
+/// Gives the pages of each of `ranges` (byte offsets from `base`) back to the kernel, every byte
+/// still readable and writable after, and says how many bytes went. The ranges go in order and a
+/// refusal stops the call, so the bytes given back are those of a prefix of `ranges`, each range
+/// whole; a refused range leaves its pages resident, which costs memory and not correctness.
+///
+/// - Linux: `MADV_DONTNEED`, so the pages leave the resident set and the cgroup's charge now and
+///   read zeros when next touched. Each [`EVICT_BATCH`] ranges are one `process_madvise` of this
+///   process (`PIDFD_SELF_THREAD_GROUP`, no descriptor to open or leak into a child), which
+///   gathers the TLB once for the whole call (`vector_madvise` in `mm/madvise.c`) rather than
+///   flushing every core running the process once per range, and takes the `mmap_lock` for
+///   reading. It returns the bytes of the leading ranges it finished, which is this function's
+///   prefix rule. [`check_evict`] proves once per process that the kernel takes it.
+/// - macOS: `MADV_FREE_REUSABLE` per range, which takes the pages out of `phys_footprint` at
+///   once; their contents are unspecified after, and [`reuse`] (`MADV_FREE_REUSE`) counts them
+///   back before they are written.
+/// - Windows: `MEM_DECOMMIT` per range, which also returns their commit charge. A decommitted
+///   page faults when read, unlike the others: see [`crate::Region::evict`].
+///
+/// Never plain `MADV_FREE`: it is lazy, and the kernel goes on counting the pages (macOS's
+/// footprint, Linux's resident set and cgroup charge) until it gets round to them, the "freed but
+/// still counted" gap rule `one-memory-measure` forbids.
+///
+/// # Safety
+///
+/// Each range is page-aligned at both ends and inside one live sparse reservation of
+/// [`reserve_sparse`] at `base`, and nothing reads or writes it through a plain reference
+/// meanwhile (only [`crate::racy`]'s atomic copies, which may see any bytes).
+#[cfg(target_os = "linux")]
+pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[std::ops::Range<usize>]) -> usize {
+    let mut given = 0;
+    for batch in ranges.chunks(EVICT_BATCH) {
+        let mut iov = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; EVICT_BATCH];
+        let mut want = 0;
+        for (slot, range) in iov.iter_mut().zip(batch) {
+            slot.iov_base = base.as_ptr().wrapping_add(range.start).cast();
+            slot.iov_len = range.len();
+            want += range.len();
+        }
+        // SAFETY: `iov` holds `batch.len()` live entries the kernel only reads; each names a
+        // range the caller says is page-aligned inside a live reservation of ours that nothing
+        // references, so dropping its pages loses only bytes no one reads through a reference.
+        let got = timed(Kind::Purge, || unsafe {
+            libc::syscall(
+                libc::SYS_process_madvise,
+                PIDFD_SELF_THREAD_GROUP,
+                iov.as_ptr(),
+                batch.len(),
+                libc::MADV_DONTNEED,
+                0 as libc::c_uint,
+            )
+        });
+        let Ok(got) = usize::try_from(got) else { break };
+        given += got;
+        if got != want {
+            break;
+        }
+    }
+    given
+}
+
+/// `fcntl.h`'s `PIDFD_SELF_THREAD_GROUP` (Linux 6.14): the calling process, as a pidfd, with
+/// none opened. A forked child that called [`evict`] would name itself, never its parent, which
+/// a pidfd opened by the parent and inherited would.
+#[cfg(target_os = "linux")]
+const PIDFD_SELF_THREAD_GROUP: libc::c_int = -10001;
+
+#[cfg(target_os = "macos")]
+pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[std::ops::Range<usize>]) -> usize {
+    let mut given = 0;
+    for range in ranges {
+        let at = base.as_ptr().wrapping_add(range.start);
+        // SAFETY: the caller says the range is page-aligned inside a live reservation of ours
+        // that nothing references; marking it reusable loses only bytes no one reads.
+        let rc = timed(Kind::Purge, || unsafe {
+            libc::madvise(at.cast(), range.len(), libc::MADV_FREE_REUSABLE)
+        });
+        if rc != 0 {
+            break;
+        }
+        given += range.len();
+    }
+    given
+}
+
+/// The other Unixes have no reusable advice and no vector call: `MADV_DONTNEED` per range,
+/// which drops a private anonymous page now there too.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[std::ops::Range<usize>]) -> usize {
+    let mut given = 0;
+    for range in ranges {
+        let at = base.as_ptr().wrapping_add(range.start);
+        // SAFETY: as on macOS.
+        let rc = timed(Kind::Purge, || unsafe {
+            libc::madvise(at.cast(), range.len(), libc::MADV_DONTNEED)
+        });
+        if rc != 0 {
+            break;
+        }
+        given += range.len();
+    }
+    given
+}
+
+#[cfg(windows)]
+pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[std::ops::Range<usize>]) -> usize {
+    use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
+    let mut given = 0;
+    for range in ranges {
+        let at = base.as_ptr().wrapping_add(range.start);
+        // SAFETY: the caller says the range is inside a live reservation of ours that nothing
+        // references or reads.
+        if unsafe { VirtualFree(at.cast(), range.len(), MEM_DECOMMIT) } == 0 {
+            break;
+        }
+        given += range.len();
+    }
+    given
+}
+
+/// Through the seed's runner, which leaves the pages reading zeros, as on Linux.
+#[cfg(all(not(any(unix, windows)), target_arch = "wasm64"))]
+pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[std::ops::Range<usize>]) -> usize {
+    let mut given = 0;
+    for range in ranges {
+        // SAFETY: the caller says the range is inside a live reservation of ours, grown linear
+        // memory, that nothing references.
+        unsafe { runner::decommit(base.as_ptr().wrapping_add(range.start), range.len()) };
+        given += range.len();
+    }
+    given
+}
+
+/// Nothing gives pages back here ([`check_evict`] says so).
+#[cfg(all(not(any(unix, windows)), not(target_arch = "wasm64")))]
+pub(crate) unsafe fn evict(_base: NonNull<u8>, _ranges: &[std::ops::Range<usize>]) -> usize {
+    0
+}
+
+/// Whether [`check_evict`] passed in this process.
+static EVICT_CHECKED: atomic::AtomicBool = atomic::AtomicBool::new(false);
+
+/// Proves, once per process, that this kernel gives a sparse reservation's pages back through
+/// [`evict`]: two pages of a fresh sparse reservation are written, given back in one call, and
+/// must come back whole (and, on Linux, read zeros). On Linux that is `process_madvise` of the
+/// calling process with `MADV_DONTNEED`, which needs 6.13 (any advice for the caller's own
+/// process; before it only `MADV_COLD`, `MADV_PAGEOUT`, `MADV_WILLNEED` and `MADV_COLLAPSE`)
+/// and 6.14 (`PIDFD_SELF_THREAD_GROUP`); blaze's floor is 7.2. An error names the call, what
+/// the kernel said and its release: the store's pool stops on it, since without it no page it
+/// loads would ever leave (rule `no-fallback`).
+pub(crate) fn check_evict() -> io::Result<()> {
+    if EVICT_CHECKED.load(atomic::Ordering::Acquire) {
+        return Ok(());
+    }
+    probe_evict()?;
+    EVICT_CHECKED.store(true, atomic::Ordering::Release);
+    Ok(())
+}
+
+#[cfg(any(unix, windows, target_arch = "wasm64"))]
+fn probe_evict() -> io::Result<()> {
+    let page = page_size();
+    let bytes = 2 * page;
+    let base = reserve_sparse(bytes)?;
+    for at in [0, page] {
+        // SAFETY: `at` is inside the sparse reservation just made, readable and writable.
+        unsafe { base.as_ptr().add(at).write_volatile(0xA5) };
+    }
+    let ranges = [0..page, page..bytes];
+    // SAFETY: two page-aligned ranges of the fresh reservation, which nothing else knows of.
+    let given = unsafe { evict(base, &ranges) };
+    let why = (given != bytes).then(io::Error::last_os_error);
+    // Only Linux promises what a page given back reads (zeros); a Windows page decommitted
+    // faults when read.
+    let kept = if cfg!(target_os = "linux") {
+        // SAFETY: as above: on Linux the range stays readable and writable after a give-back.
+        [0, page].map(|at| unsafe { base.as_ptr().add(at).read_volatile() })
+    } else {
+        [0, 0]
+    };
+    // SAFETY: the reservation just made, released whole, unused after.
+    unsafe { release(base, bytes) };
+    if let Some(why) = why {
+        return Err(io::Error::new(
+            why.kind(),
+            // alloc: the error of a kernel that cannot give pages back, once
+            format!(
+                "{EVICT_CALL} gave back {given} of {bytes} bytes of this process's own sparse pages: {why}; \
+                 {EVICT_NEEDS} (this is {})",
+                system_release()
+            ),
+        ));
+    }
+    if kept != [0, 0] {
+        return Err(io::Error::other(
+            // alloc: as above
+            format!(
+                "{EVICT_CALL} said it gave back {bytes} bytes of this process's own pages, but they still \
+                 hold what was written ({kept:?}): the pages did not leave ({})",
+                system_release()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(not(any(unix, windows)), not(target_arch = "wasm64")))]
+fn probe_evict() -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "without virtual memory a reservation is the global allocator's, and none of its pages can be given back",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+const EVICT_CALL: &str = "process_madvise(PIDFD_SELF_THREAD_GROUP, MADV_DONTNEED)";
+#[cfg(target_os = "linux")]
+const EVICT_NEEDS: &str = "blaze needs Linux 6.13 for any advice to its own process and 6.14 for \
+     PIDFD_SELF_THREAD_GROUP (its floor is 7.2)";
+#[cfg(target_os = "macos")]
+const EVICT_CALL: &str = "madvise(MADV_FREE_REUSABLE)";
+#[cfg(windows)]
+const EVICT_CALL: &str = "VirtualFree(MEM_DECOMMIT)";
+#[cfg(all(
+    any(unix, target_arch = "wasm64"),
+    not(any(target_os = "linux", target_os = "macos"))
+))]
+const EVICT_CALL: &str = "giving pages back";
+#[cfg(all(any(unix, windows, target_arch = "wasm64"), not(target_os = "linux")))]
+const EVICT_NEEDS: &str = "the store's pool cannot give its pages back on this system";
+
+/// The kernel's name and release, for an error: `uname`'s `sysname` and `release`.
+#[cfg(unix)]
+#[cold]
+fn system_release() -> std::string::String {
+    // SAFETY: `utsname` is plain bytes, valid zeroed.
+    let mut name: libc::utsname = unsafe { std::mem::zeroed() };
+    // SAFETY: `uname` writes the live struct it is given.
+    if unsafe { libc::uname(&mut name) } != 0 {
+        return "a kernel uname does not name".to_owned(); // alloc: an error's text, once
+    }
+    let text = |field: &[libc::c_char]| {
+        let bytes = field.iter().take_while(|&&c| c != 0).map(|&c| c as u8);
+        let bytes: Vec<u8> = bytes.collect(); // alloc: an error's text, once
+        std::string::String::from_utf8_lossy(&bytes).into_owned()
+    };
+    format!("{} {}", text(&name.sysname), text(&name.release)) // alloc: as above
+}
+
+#[cfg(any(windows, all(not(unix), target_arch = "wasm64")))]
+#[cold]
+fn system_release() -> std::string::String {
+    std::env::consts::OS.to_owned() // alloc: an error's text, once
+}
+
 /// Releases a whole reservation.
 ///
 /// # Safety

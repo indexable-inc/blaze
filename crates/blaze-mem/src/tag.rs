@@ -74,10 +74,14 @@ pub enum Tag {
     /// The trait solver's caches of solved goals: hir-ty's `tls_cache` tables and the blocks of
     /// each `GlobalCache` (rustc_type_ir).
     Solver,
+    /// The store's buffer pool (docs/v2/plan/design/store-pool.md): its pages loaded or being
+    /// loaded, counted as each run is made the process's ([`crate::Region::reuse`]) and given
+    /// back ([`crate::Region::evict`]). [`Tag::Store`] keeps the store's tables and segments.
+    Pool,
 }
 
 impl Tag {
-    pub const COUNT: usize = 22;
+    pub const COUNT: usize = 23;
 
     pub const ALL: [Tag; Tag::COUNT] = [
         Tag::Parse,
@@ -102,6 +106,7 @@ impl Tag {
         Tag::Profile,
         Tag::Other,
         Tag::Solver,
+        Tag::Pool,
     ];
 
     pub const fn index(self) -> usize {
@@ -132,6 +137,7 @@ impl Tag {
             Tag::Profile => "profile",
             Tag::Other => "other",
             Tag::Solver => "solver",
+            Tag::Pool => "pool",
         }
     }
 

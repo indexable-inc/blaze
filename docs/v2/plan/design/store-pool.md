@@ -404,10 +404,15 @@ ranges, and the batch is given back in as few calls as the system allows. The ne
 
 - **Linux: `MADV_DONTNEED`.** The pages are freed now, the resident set and the cgroup charge
   fall at once, and the next touch reads zeros. The whole batch is one `process_madvise` of the
-  daemon's own pidfd with one iovec per range. Linux 6.13 lets `process_madvise` take any advice
+  daemon itself (`PIDFD_SELF_THREAD_GROUP`, Linux 6.14, so no descriptor is opened or inherited by a
+  child) with one iovec per range. Linux 6.13 lets `process_madvise` take any advice
   for the caller's own process, and 6.16 flushes the TLB once per call for `MADV_DONTNEED` rather
-  than once per range. blaze's floor is 7.2 ([memory-pool.md section 7](../../../memory-pool.md#7-what-the-kernel-does-for-it-linux-72-macos)). Lane 1 checks both against
-  `mm/madvise.c` of that kernel before relying on them.
+  than once per range. blaze's floor is 7.2 ([memory-pool.md section 7](../../../memory-pool.md#7-what-the-kernel-does-for-it-linux-72-macos)). Lane 1 read both in
+  `mm/madvise.c` (7.4-rc2): `process_madvise` skips its remote-only advice check when the target's
+  mm is the caller's, and `vector_madvise` gathers the TLB once around every range for
+  `MADV_DONTNEED`. It returns the bytes of the leading ranges it finished, so `Region::evict`
+  gives back a prefix of its ranges. `os::check_evict` proves the call once per process and stops
+  naming the kernel's release if it fails.
 - **macOS: `MADV_FREE_REUSABLE`** per range, which takes the pages out of `phys_footprint` at
   once (`os::purge` does this already). A load's first step on macOS is `MADV_FREE_REUSE` over the
   run (`os::reuse`), so the footprint counts the pages again before they are written. A loader
