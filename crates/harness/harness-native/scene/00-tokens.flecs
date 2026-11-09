@@ -514,6 +514,15 @@ export const caret_fade = 0.09
 export const strike_w = 1
 export const strike_rise_em = 0.27
 export const strike_alpha = 0.7
+// LaTeX math (prims.flecs ui.formula; inline markdown's $…$, a chat's displayed formula): set at math_inline_scale of
+// its words' size in a line, math_display_scale displayed (Computer Modern's x-height is smaller than Inter's, hence above
+// 1), keeping math_inline_pad or math_display_pad points clear above and below in its line; strokes math_stroke_em thick
+// (KaTeX's 1.5 px at its 40 px em). den's MathLook.
+export const math_inline_scale = 1.1
+export const math_display_scale = 1.25
+export const math_inline_pad = 2
+export const math_display_pad = 10
+export const math_stroke_em = 0.0375
 // Inline code's chip (MarkdownText).
 export const textarea_max_h = 132
 // A growing text area (ui.field.GrowingTextArea): it grows with its words to textarea_grow_share of its pane's height

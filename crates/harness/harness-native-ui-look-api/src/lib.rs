@@ -326,6 +326,20 @@ pub struct StrikeLook {
     pub alpha: f32,
 }
 
+/// LaTeX math's one look (`ui.formula` in prims.flecs; harness-native-render's math.rs and paint.rs): a formula is set at
+/// `inline_scale` (in a line of words) or `display_scale` (displayed, on a line of its own) times its words' size (Computer
+/// Modern's x-height is smaller than Inter's, hence above 1), keeps `inline_pad` or `display_pad` points clear above and
+/// below in its line, and the typesetter's strokes (a bracket's curve, a stretchy arrow) are `stroke` ems thick, as KaTeX
+/// draws them.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct MathLook {
+    pub inline_scale: f32,
+    pub display_scale: f32,
+    pub inline_pad: f32,
+    pub display_pad: f32,
+    pub stroke: f32,
+}
+
 /// A band across the node's width that joins two other nodes' heights, as a merge view joins a chunk in one pane to the same
 /// chunk in the next: its left end spans the height of `(RibbonFrom, a)`, its right end that of `(RibbonTo, b)`, and its edges
 /// ease between them. Drawn in the node's Fill, cut to the clip it sits in. An end shorter than `min` (a side with no lines
@@ -454,6 +468,7 @@ hyperion_api_layouts::api_layouts! {
     "Sheen" => alias Sheen,
     "CaretLook" => alias CaretLook,
     "StrikeLook" => alias StrikeLook,
+    "MathLook" => alias MathLook,
     "Scheme" => alias Scheme,
     "MascotLook" => alias MascotLook,
     "MascotMotion" => alias MascotMotion,
@@ -482,6 +497,7 @@ pub fn register(world: &World) {
     world.component::<Sheen>().writable();
     world.component::<CaretLook>().writable();
     world.component::<StrikeLook>().writable();
+    world.component::<MathLook>().writable();
     world.component::<Ribbon>().writable();
     world.component::<Scheme>().writable();
     world.component::<MascotLook>().writable();
