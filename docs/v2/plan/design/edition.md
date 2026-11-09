@@ -42,7 +42,7 @@ it.
 | 5 | **Contexts.** `fn f() with fs: &Fs, cx: &Cx` is a parameter passed by name from the caller's scope. With [bstd](std.md), a function with no `with fs` cannot reach the disk. | ambient files, clock, network, allocator; threading `cx` by hand | [std](std.md) | large |
 | 6 | **Effects at the border.** pure, nopanic, noalloc, nonblocking, ambient, unsafe and may-suspend are inferred inside a crate and written on `pub` functions; a function that takes a closure does what the closure does. | `async`/`await`, and the async, const and `try_` twins of every API | [effects](effects.md), [pure-fns](pure-fns.md), [may-suspend](may-suspend.md) | medium |
 | 7 | **Values that must be used up.** A `#[blaze::linear]` value cannot be dropped; every path hands it to a function that takes it by value. | forgotten commits, drop bombs | [linear](linear.md) | medium |
-| 8 | **Contracts and pattern types.** `requires` and `ensures` on a function; `usize is 1..` puts a range in the type. | preconditions in doc comments, restated checks | [contracts](contracts.md) | small |
+| 8 | **Contracts and pattern types.** `requires` and `ensures` on a function; `usize is 1..` puts a range in the type, and `Conn is Conn::Open { .. }` a variant. | preconditions in doc comments, restated checks, `unreachable!()` after a match already made | [contracts](contracts.md), here | medium |
 | 9 | **Compile-time reflection.** `for const f in fields_of::<T>()` in ordinary typed code. | most derive proc macros | [comptime](comptime.md) | large |
 | 10 | **`&uniq T`.** The unique reference is spelled for what it guarantees. `&mut T` means the same and is the old spelling. | the belief that `&` means immutable and `&mut` means mutable | here | small |
 
@@ -105,6 +105,26 @@ closure type and a `dyn` method carry their contexts in their type. `main` is
 - Diagnostics and docs say "shared" and "unique" in every crate; under the gate they print
   `&uniq`.
 
+**8. Pattern types cover enum variants.** (The rest of change 8 is in [contracts](contracts.md).)
+- `T is PAT` is `T` restricted to the values that match `PAT`. A range is one case
+  (`usize is 1..`); a variant is another: `Provider is Provider::Host(_)`,
+  `Option<T> is Some(_)`, `Conn is Conn::Open { .. } | Conn::Draining { .. }`. There is no
+  separate "variant type" feature.
+- **Same bytes.** A narrowed value has the enum's layout, so `T is PAT` to `T`, and
+  `&(T is PAT)` to `&T`, are free and implicit. The other direction needs proof.
+- **A constructor has the enum's type** (`Some(x)` is an `Option`), as today. Narrowing happens
+  in two places only: where the type is written, and where control flow proves it. In a `match`
+  arm or after `if let`/`let else`, the scrutinee, when it is a local that is not reassigned, has
+  the type narrowed to that arm's pattern, and can be passed to a function that asks for it.
+- **A `match` on a narrowed type needs only its variants**, and a field of the variant can be
+  read directly (`conn.socket` on a `Conn is Conn::Open { .. }`): no `unreachable!()`, no second
+  match.
+- **A unique reference cannot change the variant.** Through `&uniq (T is PAT)` the fields may be
+  written, but the whole value may not be assigned or swapped, since that could store a value
+  outside `PAT`.
+- With error unions: handling one member in a `match` leaves the rest narrowed
+  (`E is not io::Error` is written as the union of the remaining members).
+
 ## What the edition removes
 
 Each is a hard error in the edition and a lint (below) in any crate before it.
@@ -159,6 +179,7 @@ Payoff per unit of compiler work, and what leans on what.
 | E4 | View types (change 3) | nothing |
 | E5 | Records and named arguments (change 4) | nothing |
 | E5b | `&uniq` (change 10) and `mut_ref` with its fix; blaze's own crates rewritten by the fix | nothing |
+| E5c | Pattern types over enum variants, with narrowing in `match` and `if let` (change 8) | nothing |
 | E6 | Contexts (change 5): the `with` clause over bstd's parameters | S1, S2 of [std](std.md) |
 | E7 | Effects inferred and declared at the border; closures pass their effects through; `async` removed for crates on fibers (change 6) | E6 |
 | E8 | Linear values, contracts and pattern types, reflection (changes 7 to 9), each finishing its own spec | their specs |

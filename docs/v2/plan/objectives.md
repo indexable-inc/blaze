@@ -13,7 +13,7 @@ remembered. How rows are picked, worked and landed is
 `harness/v2/ledger.py`. A check in *italics* is not written yet, and writing it is the first
 part of the work. `?` is not measured; "last known" is a lead, not a status.
 
-71 objectives: 0 met, 0 open, 0 blocked, 71 not measured.
+72 objectives: 0 met, 0 open, 0 blocked, 72 not measured.
 
 ## Targets
 
@@ -101,6 +101,7 @@ The parts of [the design](../plan.md#the-design) no check has shown yet.
 | E7 | Effects are inferred inside a crate and required on pub functions; closures pass theirs through; no async in crates on fibers | *write: blaze::undeclared_effects at zero in blaze's crates* |  | ? |
 | E8 | edition = "blaze-2026.11" turns every change on and every removed thing into an error; blaze fix --edition migrates | *write: one real crate migrated by the tool and passing its tests* |  | ? |
 | E9 | `&uniq T` is accepted as `&mut T` under `#![blaze::uniq]`, and blaze::mut_ref rewrites one to the other | *write: fixtures: both spellings are one type; the fix round-trips a crate; a crate without the gate is unchanged* |  | ? |
+| E10 | Pattern types cover enum variants under `#![blaze::pattern_types]`: `T is Variant(..)`, narrowing in match and if-let, free widening, same layout | *write: fixtures: a function taking one variant; narrowing after match; a refused whole-value write through a unique reference; layout equal to the enum's* |  | ? |
 
 ## The agent app
 
