@@ -128,9 +128,14 @@ hn {
       chevron : hn.StepChevron {}
     }
   }
-  // While it runs: a block showing the step it is on (ui.Block: it turns to the next step's face), and no marks yet.
+  // While it runs: the item of the step it is on (ui.Block), flush left under the newest words, and no marks yet.
   prefab StepLineLive : hn.StepLine {
+    Padding: {l: 0, r: 0, t: 6, b: 2}
     head : hn.StepSum {
+      // Flush with the words over it: no inset, no gap before the item.
+      Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+      Padding: {l: 0, r: $chat_line_pad, t: 0, b: 0}
+      Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $block_size, min: 0, max: 0}}
       block : ui.Block {}
       chevron : hn.StepChevron {}
     }
