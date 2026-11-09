@@ -170,7 +170,7 @@ is an error. Where a mechanical fix exists, `blaze check --fix` applies it.
 | `blaze::mut_ref` | `&mut` and `ref mut` where `&uniq` is available | rewrites to `&uniq` and `ref uniq` |
 | `blaze::handle_clone` | `.clone()` on a `Handle` (once change 1 exists) | removes it |
 | `blaze::error_wrapper` | an error enum that is only `From` variants (once change 2 exists) | rewrites to a union |
-| `blaze::undeclared_effects` | a `pub` function without its effects written (once change 6 infers them) | writes the inferred ones |
+| `blaze::unmarked_pure`, `blaze::unmarked_nopanic`, `blaze::unmarked_noalloc`, `blaze::unmarked_nonblocking` | a function at the border the effects walk proves has the effect and that lacks its attribute ([lints.md](../../../lints.md#unmarked_pure-unmarked_nopanic-unmarked_noalloc-unmarked_nonblocking)); ambient, unsafe and may-suspend follow once change 6 infers them | writes the attributes |
 | `blaze::derivable_by_reflection` | a derive that reflection covers (once change 9 exists) | none at first |
 
 The first three need nothing new and are built first. `lossy_as` is one lint with one message in

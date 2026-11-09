@@ -112,6 +112,7 @@ mod thread_local_in_waiting_fn;
 mod thread_local_tests;
 mod unbounded_from_input;
 mod unbuffered_io;
+mod unmarked_effects;
 mod unnamed_wait;
 mod unrecorded_span;
 mod untyped_error;
@@ -239,6 +240,10 @@ pub enum Lint {
     LossyAs,
     GlobalState,
     AsyncFn,
+    UnmarkedPure,
+    UnmarkedNopanic,
+    UnmarkedNoalloc,
+    UnmarkedNonblocking,
 }
 
 /// Which workspaces a lint is for.
@@ -255,7 +260,8 @@ pub(crate) enum Kind {
     /// depends on) or it can't see whether the code is hot: allowed until a workspace or crate
     /// turns it, or the group `blaze::pedantic_perf`, on.
     PedanticPerf,
-    /// It flags what the blaze edition removes (docs/v2/plan/design/edition.md): allowed until
+    /// It flags what the blaze edition removes, or an effect it writes at a crate's border
+    /// that the code lacks (docs/v2/plan/design/edition.md): allowed until
     /// a workspace or crate turns it, or the group `blaze::edition`, on to get ready for the
     /// edition; under the edition each is an error.
     Edition,
@@ -416,6 +422,10 @@ impl Lint {
         Lint::LossyAs,
         Lint::GlobalState,
         Lint::AsyncFn,
+        Lint::UnmarkedPure,
+        Lint::UnmarkedNopanic,
+        Lint::UnmarkedNoalloc,
+        Lint::UnmarkedNonblocking,
     ];
 
     /// Which workspaces the lint is for ([`Kind`]); written out per lint, so a new one chooses.
@@ -478,6 +488,11 @@ impl Lint {
             }
             // What the blaze edition removes; right for any crate getting ready for it.
             Lint::LossyAs | Lint::GlobalState | Lint::AsyncFn => Kind::Edition,
+            // What the blaze edition writes at a crate's border: an effect the code already has.
+            Lint::UnmarkedPure
+            | Lint::UnmarkedNopanic
+            | Lint::UnmarkedNoalloc
+            | Lint::UnmarkedNonblocking => Kind::Edition,
             // `blaze::hot` and its comments (`// clone:`, `// alloc:`, `// dyn:`).
             Lint::HotClone
             | Lint::HotAlloc
@@ -623,6 +638,10 @@ impl Lint {
             Lint::LossyAs => "lossy_as",
             Lint::GlobalState => "global_state",
             Lint::AsyncFn => "async_fn",
+            Lint::UnmarkedPure => "unmarked_pure",
+            Lint::UnmarkedNopanic => "unmarked_nopanic",
+            Lint::UnmarkedNoalloc => "unmarked_noalloc",
+            Lint::UnmarkedNonblocking => "unmarked_nonblocking",
         }
     }
 
@@ -719,6 +738,10 @@ impl Lint {
             Lint::LossyAs => concat!(general_docs!(), "#lossy_as"),
             Lint::GlobalState => concat!(general_docs!(), "#global_state"),
             Lint::AsyncFn => concat!(general_docs!(), "#async_fn"),
+            Lint::UnmarkedPure
+            | Lint::UnmarkedNopanic
+            | Lint::UnmarkedNoalloc
+            | Lint::UnmarkedNonblocking => concat!(general_docs!(), "#unmarked_pure-unmarked_nopanic-unmarked_noalloc-unmarked_nonblocking"),
             Lint::FiberBoundary => {
                 "https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan.md"
             }
@@ -979,6 +1002,18 @@ impl Lint {
             Lint::AsyncFn => {
                 "write it as a plain function run on a fiber: a wait parks the fiber and the may-suspend effect is inferred, so neither `async` nor `.await` is written; or say why with `#[expect(blaze::async_fn, reason = \"..\")]`"
             }
+            Lint::UnmarkedPure => {
+                "write `#[blaze::pure]` above the function (`blaze check --fix` does); or say why it stays unmarked with `#[expect(blaze::unmarked_pure, reason = \"..\")]`"
+            }
+            Lint::UnmarkedNopanic => {
+                "write `#[blaze::nopanic]` above the function (`blaze check --fix` does); or say why it stays unmarked with `#[expect(blaze::unmarked_nopanic, reason = \"..\")]`"
+            }
+            Lint::UnmarkedNoalloc => {
+                "write `#[blaze::noalloc]` above the function (`blaze check --fix` does); or say why it stays unmarked with `#[expect(blaze::unmarked_noalloc, reason = \"..\")]`"
+            }
+            Lint::UnmarkedNonblocking => {
+                "write `#[blaze::nonblocking]` above the function (`blaze check --fix` does); or say why it stays unmarked with `#[expect(blaze::unmarked_nonblocking, reason = \"..\")]`"
+            }
             Lint::FrozenCollection => {
                 "make the field a `Box<[T]>` (`Box<str>` for a string), built once with `into_boxed_slice()` / `into_boxed_str()`; or say why it stays growable with `#[expect(blaze::frozen_collection, reason = \"..\")]`"
             }
@@ -1129,6 +1164,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         box_large_new::check(cx);
         checkfree::check(cx);
         effects::check(cx);
+        unmarked_effects::check(cx);
         unbuffered_io::check(cx);
         stdout_lock_in_loop::check(cx);
         front_vec_ops::check(cx);

@@ -108,6 +108,11 @@ impl Allocators {
         }
     }
 
+    /// `core::alloc::Allocator`, where the crate's graph has it.
+    pub(super) fn allocator_trait(&self) -> Option<hir::Trait> {
+        self.allocator
+    }
+
     fn heap(&self, adt: AdtId) -> Option<Heap> {
         let is = |it: Option<AdtId>| it == Some(adt);
         if is(self.string) {
@@ -125,7 +130,7 @@ impl Allocators {
 
     /// The allocator parameter of `adt`, if it has one: a type parameter bounded by std's
     /// `Allocator` or defaulting to `Global`, as its place among the type parameters.
-    fn allocator_param(&self, db: &Db, adt: AdtId) -> Option<(usize, hir::Name)> {
+    pub(super) fn allocator_param(&self, db: &Db, adt: AdtId) -> Option<(usize, hir::Name)> {
         if let Some(known) = self.params.borrow().get(&adt) {
             return known.clone(); // clone: an interned name
         }

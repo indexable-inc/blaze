@@ -81,7 +81,11 @@ fn step_notes(
 }
 
 /// What `#[blaze::<effect>]` on `func`, or on the trait whose method it is or implements, says.
-fn marked(db: &base_db::Db, func: FunctionId, effect: &EffectDef) -> Option<PureAttr> {
+pub(super) fn marked(
+    db: &base_db::Db,
+    func: FunctionId,
+    effect: &EffectDef,
+) -> Option<PureAttr> {
     if let Some(it) = (effect.attr)(db, AttrDefId::FunctionId(func)) {
         return Some(it);
     }
