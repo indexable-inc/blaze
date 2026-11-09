@@ -72,6 +72,11 @@ pub fn run(path: &str) -> Result<(), String> {
     if let Ok(t) = std::env::var("HARNESS_NATIVE_SHOT_OPEN") {
         app.open_target(&t, false);
     }
+    // HARNESS_NATIVE_SHOT_FIXTURE <json>: a recorded world (the daemon's list and runs, chats' events) instead of the
+    // daemon's (App::shot_fixture); run with a private HARNESS_HOME and no daemon.
+    if let Ok(f) = std::env::var("HARNESS_NATIVE_SHOT_FIXTURE") {
+        app.shot_fixture(&f)?;
+    }
     // A session id, a run (`r12`) or one of its stages (`r12.0`).
     if let Ok(s) = std::env::var("HARNESS_NATIVE_SHOT_SELECT") {
         if s == "archive" {
@@ -88,6 +93,11 @@ pub fn run(path: &str) -> Result<(), String> {
                 app.shot_chat_pick(sid, &page);
             }
         }
+    }
+    // HARNESS_NATIVE_SHOT_PLAN `5h=0.08,week=0.79` (a `!` after a share: refused): every chat's status bar shows that plan
+    // as if its agent had reported it (src/app/chat/plan.rs), so a shot shows the plan meter before any agent has.
+    if let Ok(spec) = std::env::var("HARNESS_NATIVE_SHOT_PLAN") {
+        app.set_shot_plan(&spec)?;
     }
     // HARNESS_NATIVE_SHOT_CHROME `strip,title_x`: a title-bar strip as the window would report it (points), so the title
     // bar and its subtitle show; HARNESS_NATIVE_SHOT_UNFOCUSED: drawn as a window that is not key (the title dimmed).

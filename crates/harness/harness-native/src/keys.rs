@@ -418,6 +418,21 @@ impl Keymap {
             .map(|b| &b.chord)
     }
 
+    /// Every binding of the action named `name` that nothing shadows, in any context, as hints in the order the keys file
+    /// binds them (`⎋`, `⌘.`); a control chord is left out (a terminal's habit, kept working but not said).
+    #[must_use]
+    pub fn hints_of(&self, name: &str) -> Vec<String> {
+        let Some(a) = self.act_named(name) else { return Vec::new() };
+        let mut out: Vec<String> = Vec::new();
+        for b in self.binds.iter().filter(|b| b.action == a.id && !b.chord.ctrl && !shadowed(&self.binds, b)) {
+            let h = b.chord.hint();
+            if !out.contains(&h) {
+                out.push(h);
+            }
+        }
+        out
+    }
+
     /// [`primary`](Self::primary)'s hint for the action named `name`, or nothing.
     #[must_use]
     pub fn hint_of(&self, name: &str) -> String {

@@ -328,4 +328,9 @@ impl App {
     pub(super) fn hint(&self, name: &str) -> String {
         self.keymap.hint_of(name)
     }
+
+    /// Every key that runs the action named `name`, as one hint (`⎋ or ⌘.`), or nothing.
+    pub(super) fn hints(&self, name: &str) -> String {
+        self.keymap.hints_of(name).join(" or ")
+    }
 }

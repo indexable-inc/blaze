@@ -1,6 +1,7 @@
-//! Den's model and effort picker in a chat's composer bar (scene/widgets/chat.flecs `hn.ChatPick`), and its context meter.
+//! Den's model and effort picker in a chat's status bar under its composer (scene/widgets/chat.flecs `hn.ChatPick`,
+//! in hn.ChatPane's `foot.status`), its context meter, and its plan meter (plan.rs).
 //!
-//! The bar's leading edge shows one quiet control, the model's name, its effort as a level meter (a bar per effort the
+//! The status bar's leading edge shows one quiet control, the model's name, its effort as a level meter (a bar per effort the
 //! model takes, those up to the effort lit) and a small chevron, on a wash under the pointer, its words and lit bars
 //! easing toward the ink. Its tooltip says the model and effort and how to change them; never while its menu is open.
 //!
@@ -30,7 +31,8 @@
 //!
 //! At the bar's trailing edge, the context meter: a small ring filling as the conversation fills its model's window
 //! (den's: muted, the warning tone from [`WARN`], the failed tone from [`FULL`]); under the pointer, its popover
-//! (context.rs) says how full, with the percentage, and with what.
+//! (context.rs) says how full, with the percentage, and with what. After it, how much of the person's plan is used
+//! (plan.rs), once any agent of the chat's kind has said.
 use super::*;
 use harness_native_ui_look_api::Stroke;
 use harness_native_ui_text_api::Vector;
@@ -45,7 +47,7 @@ use std::collections::BTreeMap;
 const WARN: f64 = 0.8;
 const FULL: f64 = 0.95;
 /// The track under the ring: the ink at this alpha (den's).
-const TRACK_ALPHA: f32 = 0.18;
+pub(super) const TRACK_ALPHA: f32 = 0.18;
 
 /// Which of the picker's menus is open: the models, the efforts, or both.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -192,17 +194,17 @@ fn mix(a: Rgba, b: Rgba, k: f32) -> Rgba {
 }
 
 /// The Fill of scene prefab `path` (`hn.ChatControlInk.rest`); the scene always has it.
-fn fill_of(w: WorldRef<'_>, path: &str) -> Fill {
+pub(super) fn fill_of(w: WorldRef<'_>, path: &str) -> Fill {
     view::prefab(w, path).and_then(|p| p.try_cloned::<&Fill>()).unwrap_or_else(|| panic!("scene/widgets/chat.flecs has no Fill on {path}"))
 }
 
-fn set_fill(v: View<'_>, f: Fill) {
+pub(super) fn set_fill(v: View<'_>, f: Fill) {
     if v.entity().try_cloned::<&Fill>() != Some(f) {
         v.set(f);
     }
 }
 
-/// The composer bar's quiet controls' inks (hn.ChatControlInk): at rest, under the pointer, and a level's unlit bars.
+/// The status bar's quiet controls' inks (hn.ChatControlInk): at rest, under the pointer, and a level's unlit bars.
 pub(super) struct ControlInk {
     pub rest: Fill,
     pub hot: Fill,
@@ -288,8 +290,9 @@ fn efforts_of(t: &Transcript, kind: &str, kept: &BTreeMap<String, Vec<ModelChoic
 }
 
 impl App {
-    /// The composer bar's picker and meter for chat `sid` (transcript `t`, an agent of kind `kind`, `listed` the daemon's
-    /// `(model, effort)` for it, `ended` when no agent runs it), and its menu while `open`.
+    /// The status bar's picker, context meter and plan meter for chat `sid` (`bar`: hn.ChatPane's foot.status; transcript
+    /// `t`, an agent of kind `kind`, `listed` the daemon's `(model, effort)` for it, `ended` when no agent runs it), and
+    /// its menu while `open`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn fill_chat_pick(
         &self, bar: View<'_>, sid: u64, t: &Transcript, kind: &str, open: Option<Pick>, nav: &mut PickNav, eff: &mut EffortState,
@@ -337,9 +340,14 @@ impl App {
                 v.entity().set(action);
             }
         });
+        let agent = if t.agent.is_empty() { kind } else { t.agent.as_str() };
+        // How much of the plan is used: the account's, so the latest any chat of this kind was told.
+        if let Some(slot) = bar.part("plan") {
+            let windows = self.chat_plan(agent);
+            super::plan::fill_plan(slot, &windows, agent, ink.hot, model::now_ms() / 1000);
+        }
         // Under the pointer, the meter's popover (context.rs), anchored to the ring; never over the open menu.
         if let Some(pop) = bar.part("pop") {
-            let agent = if t.agent.is_empty() { kind } else { t.agent.as_str() };
             super::context::fill_context_pop(
                 pop,
                 meter_slot.part("context"),
@@ -693,7 +701,7 @@ impl App {
                 if model::pane_kind(o) != model::PaneKind::Chat {
                     return None;
                 }
-                let control = super::composer(View::of(w.entity_from_id(p)))?.part("bar")?.part("pick")?.part("model")?;
+                let control = super::status_bar(View::of(w.entity_from_id(p)))?.part("pick")?.part("model")?;
                 over(control.entity()).then(|| self.session_of(*o.id())).flatten()
             })
         })

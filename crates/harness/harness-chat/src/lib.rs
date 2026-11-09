@@ -139,6 +139,11 @@ pub struct Transcript {
     /// How much of the model's context window the conversation fills, as the agent last said (its `context` event: the
     /// tokens, the window (0: unknown), the last call's split and the parts); None before it said.
     pub context: Option<ev::ContextUse>,
+    /// How much of the person's plan is used, window by window, as the agent last said in this chat (its latest `plan`
+    /// event), and when it said it (the event's stamp, ms since the epoch): the account's, so the app shows the latest of
+    /// any chat of the same agent kind. Empty before it said.
+    pub plan: Vec<ev::PlanWindow>,
+    pub plan_at: u64,
     /// What the conversation has cost so far (the sum of its turns' `cost_usd`); None while no turn said.
     pub cost_usd: Option<f64>,
     /// The first user message's first line, cut to [`TITLE_CHARS`].
@@ -147,20 +152,28 @@ pub struct Transcript {
     pub rev: u64,
     /// Each tool call's REPL cell, by the call's block.
     pub details: HashMap<String, Detail>,
+    /// When each tool call began (its first event's `ts`, ms since the epoch), by its block.
+    pub started: HashMap<String, u64>,
+    /// The person's messages sent while a turn was in flight that the agent has not taken yet (their items' indices,
+    /// oldest first): Claude takes what waits with its next tool result, or as its turn ends; Codex one a turn, as the
+    /// turn before it ends (the daemon's adapter queues them).
+    pub queued: Vec<usize>,
     /// The item each block id is, for its deltas and its final form.
     at: HashMap<String, usize>,
     /// Bytes of a frame not finished yet.
     buf: Vec<u8>,
 }
 
-/// Two transcripts are equal when they hold the same conversation: the redraw counter and a part frame not finished yet
-/// are bookkeeping, not state.
+/// Two transcripts are equal when they hold the same conversation: the redraw counter, a part frame not finished yet and
+/// when things began (a reattach replays a call's whole event in place of its partials, so its stamps differ) are
+/// bookkeeping, not state.
 impl PartialEq for Transcript {
     fn eq(&self, o: &Self) -> bool {
-        (&self.models, &self.chosen_model, &self.chosen_effort, &self.context, self.cost_usd)
-            == (&o.models, &o.chosen_model, &o.chosen_effort, &o.context, o.cost_usd)
+        (&self.models, &self.chosen_model, &self.chosen_effort, &self.context, &self.plan, self.plan_at, self.cost_usd)
+            == (&o.models, &o.chosen_model, &o.chosen_effort, &o.context, &o.plan, o.plan_at, o.cost_usd)
             && (&self.items, self.busy, &self.agent, &self.model, &self.effort, &self.session_id, &self.title, &self.details, &self.at)
                 == (&o.items, o.busy, &o.agent, &o.model, &o.effort, &o.session_id, &o.title, &o.details, &o.at)
+            && self.queued == o.queued
     }
 }
 
@@ -201,6 +214,12 @@ pub fn title_of(text: &str) -> String {
 }
 
 impl Transcript {
+    /// Whether item `n` is a message of the person's the agent has not taken yet ([`Transcript::queued`]).
+    #[must_use]
+    pub fn is_queued(&self, n: usize) -> bool {
+        self.queued.contains(&n)
+    }
+
     /// The name of tool call `block`, once its call came.
     #[must_use]
     pub fn tool_name(&self, block: &str) -> Option<&str> {
@@ -297,9 +316,17 @@ impl Transcript {
                 }
             }
             Body::Context(c) => self.context = Some(c.clone()),
+            Body::Plan { windows } => {
+                self.plan.clone_from(windows);
+                self.plan_at = e.ts;
+            }
             Body::User { text, images } => {
                 if self.title.is_empty() {
                     self.title = title_of(text);
+                }
+                // Sent while a turn runs, it waits until the agent takes it.
+                if self.busy {
+                    self.queued.push(self.items.len());
                 }
                 self.push("", Item::User { text: text.clone(), images: images.clone() });
             }
@@ -334,6 +361,7 @@ impl Transcript {
                 }
             }
             Body::ToolStart { block, name } => {
+                self.started.entry(block.clone()).or_insert(e.ts);
                 let item = Item::Tool {
                     block: block.clone(),
                     name: name.clone(),
@@ -349,7 +377,10 @@ impl Transcript {
                     partial.push_str(json);
                 }
             }
-            Body::ToolCall { block, name, input } => match self.get(block) {
+            Body::ToolCall { block, name, input } => match {
+                self.started.entry(block.clone()).or_insert(e.ts);
+                self.get(block)
+            } {
                 Some(Item::Tool { name: n, input: i, partial, done, .. }) => {
                     n.clone_from(name);
                     i.clone_from(input);
@@ -375,6 +406,10 @@ impl Transcript {
                     Some(Item::Tool { result, .. }) => *result = Some(r),
                     _ => self.push("", Item::Note { text: r.text }),
                 }
+                // Claude hands what the person sent meanwhile to the model with a tool's result.
+                if self.agent == "claude" {
+                    self.queued.clear();
+                }
             }
             Body::ToolDetail(d) => {
                 self.details.insert(d.block.clone(), Detail::of(d));
@@ -396,6 +431,14 @@ impl Transcript {
                     "",
                     Item::TurnEnd { ok: *ok, stop: stop.clone(), duration_ms: *duration_ms, cost_usd: *cost_usd },
                 );
+                // What waited is taken now: all of it by Claude, the next one by Codex (one a turn).
+                if self.agent == "codex" {
+                    if !self.queued.is_empty() {
+                        self.queued.remove(0);
+                    }
+                } else {
+                    self.queued.clear();
+                }
             }
         }
     }
@@ -463,5 +506,39 @@ mod tests {
         assert!(!t.busy);
         assert_eq!(t.details["t1"].effects[0].done, "Read a");
         assert_eq!(main_arg(&serde_json::json!({"code": "1 +\n 1"})), "1 + 1");
+    }
+
+    fn fed(lines: &[&str]) -> Transcript {
+        let mut t = Transcript::default();
+        for l in lines {
+            t.apply(&Event::from_json(&serde_json::from_str(l).unwrap()).unwrap());
+        }
+        t
+    }
+
+    /// A message sent mid-turn waits until the agent takes it: Claude with its next tool result, Codex as the turn ends;
+    /// when the turn and each call began is kept.
+    #[test]
+    fn mid_turn_messages_wait_until_taken() {
+        let start = [
+            r#"{"ev":"session","agent":"claude","model":"m"}"#,
+            r#"{"ev":"user","text":"go","ts":10}"#,
+            r#"{"ev":"busy","busy":true,"ts":11}"#,
+            r#"{"ev":"tool_start","block":"t1","name":"ts","ts":20}"#,
+            r#"{"ev":"tool_call","block":"t1","name":"ts","input":{},"ts":25}"#,
+            r#"{"ev":"user","text":"also this","ts":30}"#,
+            r#"{"ev":"busy","busy":true,"ts":31}"#,
+        ];
+        let t = fed(&start);
+        assert_eq!((t.queued.clone(), t.turn_since, t.started["t1"]), (vec![2], Some(11), 20));
+        assert!(t.is_queued(2) && !t.is_queued(0));
+        let t = fed(&[&start[..], &[r#"{"ev":"tool_result","block":"t1","text":"ok","error":false}"#]].concat());
+        assert!(t.queued.is_empty(), "claude takes it with the tool's result");
+        let codex = start.map(|l| l.replace("claude", "codex"));
+        let codex: Vec<&str> = codex.iter().map(String::as_str).collect();
+        let t = fed(&[&codex[..], &[r#"{"ev":"tool_result","block":"t1","text":"ok","error":false}"#]].concat());
+        assert_eq!(t.queued, vec![2], "codex takes it only as the turn ends");
+        let t = fed(&[&codex[..], &[r#"{"ev":"turn_end","ok":true,"stop":"end_turn"}"#, r#"{"ev":"busy","busy":false}"#]].concat());
+        assert!(t.queued.is_empty() && t.turn_since.is_none());
     }
 }

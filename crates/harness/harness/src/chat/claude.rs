@@ -14,8 +14,13 @@
 //! `models` event), `set_model` (answered with the model it resolved to), and `apply_flag_settings` with `effortLevel`
 //! (answered with success even for a level it ignores, so it is followed by `get_settings` and the effort its effective
 //! settings read is what the `session` event says, an `error` when it is not the one asked for).
+//!
+//! Around each call to the model Claude says how much of the person's plan is used: a `rate_limit_event` whose
+//! `rate_limit_info` carries `unifiedWindows` (`five_hour`, `seven_day`, ...: each a `utilization` 0 to 1, `resetsAt` in
+//! unix seconds, a `status` of `allowed`, `allowed_warning` or `rejected`, and a `surpassedThreshold` once warned),
+//! read as the `plan` event.
 use super::context;
-use harness_proto::event::{Body, ContextCall, ContextUse, Kind, ModelChoice};
+use harness_proto::event::{Body, ContextCall, ContextUse, Kind, ModelChoice, PlanWindow};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
@@ -361,6 +366,62 @@ fn window(v: &Value, model: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// A `rate_limit_event`'s `rate_limit_info` as the `plan` event: a window each of its `unifiedWindows`, shortest first
+/// (with none, the one window it is about, `rateLimitType` with its own `utilization`). A window warns once its status
+/// is `allowed_warning` or it is past its `surpassedThreshold` (else [`PlanWindow::WARN`]), and is limited once
+/// `rejected` or used up. None when it names no window with a utilization (an `allowed` line before any use).
+fn plan(info: &Value) -> Option<Body> {
+    let window = |key: &str, w: &Value| {
+        let used = w["utilization"].as_f64()?;
+        let status = w["status"].as_str().unwrap_or("");
+        let threshold = w["surpassedThreshold"].as_f64().unwrap_or(PlanWindow::WARN);
+        Some(PlanWindow {
+            name: window_name(key),
+            used,
+            resets_at: w["resetsAt"].as_u64(),
+            warn: status == "allowed_warning" || used >= threshold,
+            limited: status == "rejected" || used >= 1.0,
+        })
+    };
+    let mut keyed: Vec<(&str, PlanWindow)> =
+        info["unifiedWindows"].as_object().into_iter().flatten().filter_map(|(k, w)| Some((k.as_str(), window(k.as_str(), w)?))).collect();
+    if keyed.is_empty()
+        && let Some(k) = info["rateLimitType"].as_str()
+    {
+        keyed.extend(window(k, info).map(|w| (k, w)));
+    }
+    keyed.sort_by_key(|&(k, _)| (window_rank(k), k));
+    let windows: Vec<PlanWindow> = keyed.into_iter().map(|(_, w)| w).collect();
+    (!windows.is_empty()).then_some(Body::Plan { windows })
+}
+
+/// Where Claude's window `key` sorts among a plan's: the five-hour one, then the weekly ones, then any other.
+fn window_rank(key: &str) -> u8 {
+    match key {
+        "five_hour" => 0,
+        "seven_day" => 1,
+        k if k.starts_with("seven_day") => 2,
+        _ => 3,
+    }
+}
+
+/// Claude's window `key` as the status bar names it: `five_hour` is `5h`, `seven_day` `week`, a model's weekly
+/// window (`seven_day_opus`) `Opus week`, any other its key in words.
+fn window_name(key: &str) -> String {
+    match key {
+        "five_hour" => "5h".to_owned(),
+        "seven_day" => "week".to_owned(),
+        k => match k.strip_prefix("seven_day_") {
+            Some(m) => {
+                let mut c = m.chars();
+                let model: String = c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default();
+                format!("{} week", model.replace('_', " "))
+            }
+            None => k.replace('_', " "),
+        },
+    }
+}
+
 /// The tool's name as a person reads it: the harness REPL's MCP name is just `ts`.
 fn tool_name(n: &str) -> String {
     n.strip_prefix("mcp__harness__").or_else(|| n.strip_prefix("mcp__")).unwrap_or(n).to_owned()
@@ -400,6 +461,7 @@ impl super::Adapter for Claude {
             "assistant" => self.assistant(&v),
             "user" => self.from_user(&v),
             "result" => self.result(&v),
+            "rate_limit_event" => plan(&v["rate_limit_info"]).into_iter().collect(),
             _ => vec![],
         }
     }
@@ -445,6 +507,33 @@ impl super::Adapter for Claude {
 mod tests {
     use super::*;
     use crate::chat::Adapter;
+
+    /// Claude's `rate_limit_event` lines (as a real session wrote them) are `plan` events: both windows, five-hour first,
+    /// the weekly one warned past its threshold; a line that names no window's use is none; a rejected window is limited.
+    #[test]
+    fn rate_limit_events_are_the_plan() {
+        let warned = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1794470400,"rateLimitType":"seven_day","utilization":0.78,"overageStatus":"rejected","overageDisabledReason":"org_level_disabled","isUsingOverage":false,"surpassedThreshold":0.75,"unifiedWindows":{"seven_day":{"utilization":0.78,"resetsAt":1794470400,"status":"allowed_warning","surpassedThreshold":0.75},"five_hour":{"utilization":0.05,"resetsAt":1794253800,"status":"allowed"}},"overageEnabled":false},"uuid":"2b7f270b-d730-4f58-9f26-5aa2a2df9756","session_id":"f088ac1a-54ed-4adf-bd6d-ca98cd560259"}"#;
+        let out = Claude::default().events(warned);
+        assert_eq!(
+            out,
+            vec![Body::Plan {
+                windows: vec![
+                    PlanWindow { name: "5h".into(), used: 0.05, resets_at: Some(1_794_253_800), warn: false, limited: false },
+                    PlanWindow { name: "week".into(), used: 0.78, resets_at: Some(1_794_470_400), warn: true, limited: false },
+                ],
+            }]
+        );
+        // An `allowed` line: no top-level utilization, its windows' own (an integer 0 among them).
+        let allowed = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1793884800,"rateLimitType":"five_hour","overageStatus":"rejected","overageDisabledReason":"org_level_disabled","isUsingOverage":false,"unifiedWindows":{"five_hour":{"utilization":0.01,"resetsAt":1793884800,"status":"allowed"},"seven_day":{"utilization":0,"resetsAt":1794470400,"status":"allowed"}}},"uuid":"fc0a6cc1-c225-4c68-935e-0271756090f5","session_id":"fe41695e-d6e4-4b78-ab47-6e966dfd33f6"}"#;
+        let Body::Plan { windows } = &Claude::default().events(allowed)[0] else { panic!("not a plan event") };
+        assert_eq!(windows.iter().map(|w| (w.name.as_str(), w.used, w.warn)).collect::<Vec<_>>(), [("5h", 0.01, false), ("week", 0.0, false)]);
+        // Without windows, the one it is about; with no use named, nothing.
+        let one = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1794253800,"rateLimitType":"five_hour","utilization":1.0}}"#;
+        let Body::Plan { windows } = &Claude::default().events(one)[0] else { panic!("not a plan event") };
+        assert_eq!((windows.len(), windows[0].name.as_str(), windows[0].limited, windows[0].warn), (1, "5h", true, true));
+        assert!(Claude::default().events(r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}"#).is_empty());
+        assert_eq!(window_name("seven_day_opus"), "Opus week");
+    }
 
     /// A message with a picture is one user line whose content is the picture's bytes as an image block, then the words.
     #[test]

@@ -4,7 +4,7 @@
 // their runtime state across a re-run: a re-run sets components, it does not remake entities, nor remove a component an
 // arm set before (so where a part's look depends on a prop, every arm sets it).
 //
-// Notion's sidebar: calm one-line rows, a session's led by its kind's mark (hn.Kind), no status dots. How a row stands is in its title's ink (`look`: "on" while
+// Notion's sidebar: calm one-line rows, no status dots. How a row stands is in its title's ink (`look`: "on" while
 // selected, "rest" while live, "done" once it ended), a band of light sweeping through its title while it works (a Sheen
 // at the pace of what it does: `pace`, `busy`; tokens sheen_* in 00-tokens.flecs), and a few muted words trailing it
 // (`meta`), red only when it went wrong (`alarm`). The parts are hn.tree's (scene/widgets/tree.flecs).
@@ -13,7 +13,7 @@ using flecs.script
 @tree ChildOf
 hn {
   // A session: its chevron gutter at its depth (hn.Hang; folded, as every row starts, nothing under it shows but the
-  // selection), what it is (`kind`: its agent's mark, hn.Kind, or a shell's terminal glyph), its title on one line (its
+  // selection), what it is (`kind_icon`), its title on one line (its
   // rename, a sub-agent's spawn name, a chat's first message: never its kind and number, which end its tooltip), how
   // many things are at work under it while it is folded (`under`: a faint dot and count, "" when none or open, so work
   // starting under a row never opens it), and trailing how long ago it started or ended, or how it went wrong (`why` its
@@ -25,7 +25,6 @@ hn {
   @tree ChildOf
   template ObjRow : Row {
     prop look: string = "rest"
-    prop kind: string = "shell"
     prop under: string = ""
     prop mark: string = ""
     prop pace: string = ""
@@ -41,35 +40,11 @@ hn {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $tree_row_h, min: 0, max: 0}}
     Padding: {l: indent($depth, $tree_pad, $indent_step) + $tree_gutter, r: $tree_pad_r, t: 0, b: 0}
     hang { hn.Hang: {obj: $obj, depth: $depth, kids: $kids, open: $open, mark: $mark} }
-    // What it is, the way the picker and the Archive show it (hn.Kind): Claude's starburst in its orange, OpenAI's
-    // blossom for Codex and Cursor's cube in the muted ink, a shell's terminal glyph; faint once it ended, like its title.
-    glyph : ui.Symbol {
-      Size: {w: {kind: Fixed, value: $tree_kind, min: 0, max: 0}, h: {kind: Fixed, value: $tree_kind, min: 0, max: 0}}
-      FixedSize: {h: true, v: true}
-      const k = match $kind { "claude": hn.Kind.claude; "codex": hn.Kind.codex; "cursor": hn.Kind.cursor; "shell": hn.Kind.shell; _: hn.Kind.other }
-      if k?[Mark] {
-        Mark: k[Mark]
-      } else {
-        Icon: k[Icon]
-      }
-      if $look == "done" {
-        Fill: $tone_ink_faint
-      } else {
-        if $kind == "claude" {
-          Fill: $tone_kind_claude
-        } else {
-          if $kind == "codex" {
-            Fill: $tone_kind_codex
-          } else {
-            if $kind == "cursor" {
-              Fill: $tone_kind_cursor
-            } else {
-              Fill: $tone_ink_muted
-            }
-          }
-        }
-      }
-    }
+    // What it is at a glance: an agent's mark (Claude's in its orange, the others muted) or a shell's terminal glyph,
+    // tree_kind across before its title (src/app.rs sync_view sets it with look::kind_mark, outside the template's
+    // reactive inputs). A sub-agent up but idle has it breathe slowly and deep: asleep, not at work (at work its
+    // title's sheen sweeps).
+    kind_icon : hn.tree.Kind {}
     name : hn.tree.Head {
       Text: {s: $name}
       // What it is doing while it works ("Running a command: cargo test"), where it works and when it started or ended
@@ -204,6 +179,8 @@ hn {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $tree_run_h, min: 0, max: 0}}
     Padding: {l: indent($depth, $tree_pad, $indent_step) + $tree_gutter, r: $tree_pad_r, t: 0, b: 0}
     hang { hn.Hang: {obj: $obj, depth: $depth, kids: $kids, open: $open, mark: $mark} }
+    // A command, at a glance: the terminal glyph, faint, tree_kind across before its line.
+    kind_icon : hn.tree.CmdKind {}
     name : hn.tree.Cmd {
       Text: {s: $name}
       if $look == "on" {
