@@ -722,6 +722,10 @@ impl Writer<Fake> for FakeWriter {
         ))
     }
 
+    fn gpu_msl(&mut self, unit: usize, _: Vec<u8>) -> Result<(), ApiError> {
+        Err(ApiError::new(format!("the fakes build no device unit, and unit {unit} is not one"), None))
+    }
+
     fn waiting(&self) -> bool {
         !self.asked.is_empty()
     }
@@ -1166,6 +1170,7 @@ impl Front<Fake> for FakeFront {
             outputs,
             artifact: None,
             macros: None,
+            gpu_msl: None,
             links: Vec::new(),
             misses: Vec::new(),
         }))

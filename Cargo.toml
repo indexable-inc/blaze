@@ -322,6 +322,7 @@ blaze-resolve = { path = "crates/blaze-resolve" }
 blaze-source = { path = "crates/blaze-source" }
 blaze-units = { path = "crates/blaze-units" }
 blaze-lower = { path = "crates/blaze-lower" }
+blaze-shader = { path = "crates/blaze-shader" }
 blaze-wasm-pack = { path = "crates/blaze-wasm-pack" }
 blaze-doc = { path = "crates/blaze-doc" }
 blaze-fmt = { path = "crates/blaze-fmt" }

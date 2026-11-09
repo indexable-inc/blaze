@@ -561,6 +561,7 @@ impl<S: Steps> plane::Work for Step<S> {
                             outputs: Vec::new(),
                             artifact: None,
                             macros: None,
+                            gpu_msl: None,
                             links: Vec::new(),
                             misses: Vec::new(),
                         }))
@@ -606,6 +607,7 @@ impl<S: Steps> plane::Work for Step<S> {
                             outputs: Vec::new(),
                             artifact: None,
                             macros: None,
+                            gpu_msl: None,
                             links: Vec::new(),
                             misses: Vec::new(),
                         })
@@ -4966,6 +4968,11 @@ impl<S: Steps> Jobs<S> {
         }
         if let (Some(macros), Stage::Units(build)) = (compiled.macros.take(), &mut job.stage)
             && let Err(error) = build.writer.macros(unit, macros)
+        {
+            job.over.get_or_insert((false, Some(error)));
+        }
+        if let (Some(msl), Stage::Units(build)) = (compiled.gpu_msl.take(), &mut job.stage)
+            && let Err(error) = build.writer.gpu_msl(unit, msl)
         {
             job.over.get_or_insert((false, Some(error)));
         }

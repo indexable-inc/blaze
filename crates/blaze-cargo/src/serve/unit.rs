@@ -426,6 +426,7 @@ impl Steps for Real {
                     ready: Vec::new(),
                     runs: Vec::new(),
                     macros: Vec::new(),
+                    msls: Vec::new(),
                     deps,
                     flushed,
                     broke: Vec::new(),
@@ -782,6 +783,8 @@ pub struct UnitWriter {
     runs: Vec<(usize, Ran)>,
     /// Proc macros' loads asked for, checked, in the order asked.
     macros: Vec<(usize, ProcMacroLoadResult)>,
+    /// Device units' MSL asked for, checked, in the order asked.
+    msls: Vec<(usize, Vec<u8>)>,
     /// What this job's serves served of crates whose key moved ([`deps::serve`]), for the front
     /// end's images to be stored with it: none when no key moved.
     deps: Option<deps::Kept>,
@@ -826,8 +829,14 @@ impl Writer<Real> for UnitWriter {
         Ok(())
     }
 
+    fn gpu_msl(&mut self, unit: usize, msl: Vec<u8>) -> Result<(), ApiError> {
+        self.front.check_gpu_msl(unit).map_err(lower_error)?;
+        self.msls.push((unit, msl));
+        Ok(())
+    }
+
     fn waiting(&self) -> bool {
-        !self.runs.is_empty() || !self.macros.is_empty() || self.release.due()
+        !self.runs.is_empty() || !self.macros.is_empty() || !self.msls.is_empty() || self.release.due()
     }
 
     fn began(&mut self, unit: usize) {
@@ -861,7 +870,7 @@ impl Writer<Real> for UnitWriter {
         // First, with the readers stopped for it or for the writes below: what the crates
         // finished so far keep ([`release`]).
         self.release.release(lowered);
-        if self.runs.is_empty() && self.macros.is_empty() {
+        if self.runs.is_empty() && self.macros.is_empty() && self.msls.is_empty() {
             return Ok(true);
         }
         self.ready.clear();
@@ -871,15 +880,22 @@ impl Writer<Real> for UnitWriter {
             .iter()
             .map(|(unit, _)| *unit as u32)
             .chain(self.runs.iter().map(|(run, _)| *run as u32))
+            .chain(self.msls.iter().map(|(unit, _)| *unit as u32))
             .collect();
         let trigger_of =
             touched.iter().map(|&unit| lowered.what(unit as usize)).collect::<Vec<_>>().join(", "); // alloc: as `touched`
         let trigger =
-            Trigger::of("proc macros loaded and build scripts' runs applied", &trigger_of);
+            Trigger::of("proc macros loaded, build scripts' runs and device builds' MSL applied", &trigger_of);
         // alloc: once an apply, the proc macros it loaded
         let mut loaded: Vec<u32> = Vec::with_capacity(self.macros.len());
-        let (waits, ready, broke, macros, runs) =
-            (&mut self.waits, &mut self.ready, &mut self.broke, &mut self.macros, &mut self.runs);
+        let (waits, ready, broke, macros, runs, msls) = (
+            &mut self.waits,
+            &mut self.ready,
+            &mut self.broke,
+            &mut self.macros,
+            &mut self.runs,
+            &mut self.msls,
+        );
         let first = touched[0] as usize;
         // Each write's failure, an error or a panic, is its unit's ([`Writer::broke`]): the
         // writes after it are still applied, and only the units that depend on it are refused.
@@ -898,6 +914,20 @@ impl Writer<Real> for UnitWriter {
                     let applied = applying_fallible(run, "a build script's run", || {
                         lowered.ran(run, &ran).map_err(lower_error)?;
                         waits.applied(run as u32, ready);
+                        Ok(())
+                    });
+                    if let Err(it) = applied {
+                        ready.truncate(from);
+                        broke.push(it);
+                    }
+                }
+                // A device unit's MSL is, to its dependents, what a run is: what their crates
+                // read, once applied ([`graph::flag::GPU_MSL`]).
+                for (unit, msl) in msls.drain(..) {
+                    let from = ready.len();
+                    let applied = applying_fallible(unit, "a device build's MSL", || {
+                        lowered.gpu_msl(unit, &msl).map_err(lower_error)?;
+                        waits.applied(unit as u32, ready);
                         Ok(())
                     });
                     if let Err(it) = applied {
@@ -1514,6 +1544,9 @@ pub(crate) fn checks_only(goal: Goal, unit: &Unit) -> bool {
     match unit.mode {
         Mode::Check => true,
         Mode::Build if unit.target.is_custom_build() || unit.target.is_proc_macro() => false,
+        // A device unit's link is where its MSL is written (`UnitPlan::gpu_msl`), which a
+        // checked dependent's front end reads as a built one's does: under every goal.
+        Mode::Build if unit.for_device() => false,
         _ => goal == Goal::Check,
     }
 }

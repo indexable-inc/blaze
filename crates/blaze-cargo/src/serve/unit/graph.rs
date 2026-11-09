@@ -172,7 +172,7 @@ fn flags_of(unit: &Unit) -> u8 {
     if unit.mode == Mode::Test {
         flags |= flag::TEST;
     }
-    if !unit.macro_wasm && unit.platform.as_deref() == Some(blaze_units::GPU_DEVICE) {
+    if unit.for_device() {
         flags |= flag::DEVICE;
     }
     flags
