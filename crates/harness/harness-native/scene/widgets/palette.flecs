@@ -4,9 +4,8 @@
 
 @tree ChildOf
 hn {
-  // The scrim every overlay stands on: over everything, dimming the window, and a press beside the card closes it. It
-  // fades in when made and out when the host sends it away (harness_native_ui_view::leave); a leaving overlay takes no
-  // pointer.
+  // The scrim every overlay stands on: over everything, dimming the window, and a press beside the card closes it. It is
+  // there at once and gone at once (no Transition).
   prefab Scrim : ui.Column {
     Layer: {level: Overlay}
     Pressable
@@ -14,20 +13,14 @@ hn {
     Fill: $tone_scrim
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
     Flex: {axis: Column, gap: 0, align: Center, justify: Start, wrap: false}
-    Transition: {kind: Opacity, from: Top, scale: 1, fade: true}
-    Motion: {omega: $overlay_omega, zeta: $overlay_zeta}
   }
 
-  // An overlay's card: a plate lifted off the window that grows in from a touch smaller as its scrim fades in (and
-  // shrinks back as it goes). Each overlay's card is in tone_card, the theme's.
+  // An overlay's card: a plate on the scrim, one hairline round it, no shadow. Each overlay's card is in tone_card.
   prefab OverlayCard : ui.Column, Plate {
     Hoverable
-    Lift: {blur: $overlay_lift_blur, alpha: $overlay_lift_alpha, dy: $overlay_lift_dy}
     Shape: {radius: $overlay_radius, n: 4, border: 1, feather: 0}
     Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}
     Padding: {l: $overlay_pad, r: $overlay_pad, t: $overlay_pad, b: $overlay_pad}
-    Transition: {kind: Scale, from: Top, scale: $overlay_scale, fade: false}
-    Motion: {omega: $overlay_omega, zeta: $overlay_zeta}
   }
 
   // The command palette (cmd+K): a card near the top of the window.
@@ -112,14 +105,12 @@ hn {
     Padding: {l: 10, r: 8, t: 0, b: 0}
   }
 
-  // The picker's highlight: a pill under the highlighted row, matched by id so it slides from row to row as the arrows
-  // move it (the sidebar's hn.Selection, on an id of its own).
+  // The picker's highlight: a pill under the highlighted row, where the highlight is at once (the sidebar's
+  // hn.Selection: no slide, so two rows never show part of one pill).
   prefab PickPill : ui.Node {
     Background
-    MatchedGeometry: {id: "hn.picker", jump: 0}
     Fill: $tone_selection
     Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
-    Motion: {omega: $pill_omega, zeta: $pill_zeta}
   }
 
   // A key as a small cap: the key that picks a picker row.

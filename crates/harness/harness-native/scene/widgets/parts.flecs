@@ -58,19 +58,19 @@ hn {
 
   // Each kind's mark, what its session shows on an Archive row, a picker entry and a palette entry (src/look.rs `kind_mark`
   // copies the kind's Mark or Icon and its Fill onto the row's glyph): Claude's starburst, OpenAI's blossom for Codex and
-  // Cursor's cube as vector outlines (ui.Icon; icons/SOURCE.txt), a shell's terminal glyph (cod-terminal, U+EA85) as it was.
+  // Cursor's cube as vector outlines, all in the strong ink (no brand's colour) (ui.Icon; icons/SOURCE.txt), a shell's terminal glyph (cod-terminal, U+EA85) as it was.
   prefab Kind {
     claude : ui.Icon {
       Mark: {name: "claude"}
-      Fill: $tone_mark_claude
+      Fill: $tone_ink_muted
     }
     codex : ui.Icon {
       Mark: {name: "openai"}
-      Fill: $tone_ink_strong
+      Fill: $tone_ink_muted
     }
     cursor : ui.Icon {
       Mark: {name: "cursor"}
-      Fill: $tone_ink_strong
+      Fill: $tone_ink_muted
     }
     shell : ui.Symbol {
       Icon: {glyph: ""}

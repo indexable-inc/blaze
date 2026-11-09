@@ -1,6 +1,6 @@
 ---
 name: agents
-description: Starting and running other agents from ts (spawn / agents.spawn): which kind, model and effort to pick for a task (Opus 5.5 at medium by default, high only where a wrong answer is silent, Codex or a small model for gathering and read-only work), the name, model and effort every sub agent must state, how to write its prompt, and how to follow, answer and end it. Read before starting any agent.
+description: Starting and running other agents from ts (spawn / agents.spawn): which kind, model and effort to pick for a task (Fable 5.2 at medium by default, high only where a wrong answer is silent, Codex or a small model for gathering, read-only and mechanical work), the name, model and effort every sub agent must state, how to write its prompt, and how to follow, answer and end it. Read before starting any agent.
 ---
 # Starting agents
 
@@ -16,7 +16,7 @@ id. Two agents at once get names a person can tell apart.
 ```ts
 const a = await spawn('claude', {
   name: 'Comptime dyn calls',      // a plain title in words: the sidebar row and how to find it again
-  model: 'claude-opus-5-5',
+  model: 'claude-fable-5-2',
   effort: 'medium',
   cwd: '/path/to/its/worktree',
   prompt: '...',
@@ -28,15 +28,17 @@ await a.reply();                    // waits for its turn to end, returns its la
 
 | The task | Kind, model | Effort |
 |---|---|---|
-| General work: a change, a fix, a design, a review | claude, Opus 5.5 (`claude-opus-5-5`) | medium |
-| A wrong answer would be silent: compiler semantics, const eval, unsafe code, allocators, concurrency, persisted or crash-recovering state | claude, Opus 5.5 | high |
+| General work: a change, a fix, a design, a plan, a review | claude, Fable 5.2 (`claude-fable-5-2`) | medium |
+| A wrong answer would be silent: compiler semantics, const eval, unsafe code, allocators, concurrency, persisted or crash-recovering state | claude, Fable 5.2 | high |
 | Gathering: find, read, list, summarize, collect facts or logs; read-only work | codex, its small fast model from the list; or claude, Haiku 5.5 / Sonnet 5.5 | low |
 | Simple and mechanical: rename across files, fix links, port a pattern where the target is spelled out | codex, or claude Sonnet 5.5 | low or medium |
 
 Pick by what a mistake costs, not by how big the task looks: a long mechanical port is low effort, a ten-line change
-to the const checker is high. Default to medium when unsure. Codex's models are the ones it lists (they are learned
-when a codex first starts, `$HARNESS_HOME/models.cbor`); name one from that list, never a guess. Until codex has
-listed its models the harness takes no effort for it, so give only the model.
+to the const checker is high. Default to Fable 5.2 at medium when unsure. Fable is the strongest model and the most
+expensive per token, so do not spend it on reading: hand gathering and mechanical work to a small model and give
+Fable the report. Codex's models are the ones it lists (they are learned when a codex first starts,
+`$HARNESS_HOME/models.cbor`); name one from that list, never a guess. Until codex has listed its models the harness
+takes no effort for it, so give only the model.
 
 ## The prompt
 

@@ -931,7 +931,7 @@ fn rows_nested(t: &Transcript, shows: Shows<'_>) -> (Vec<(String, Row)>, HashSet
         let turn = &g.pieces[w[0]..w[1]];
         let Some((Piece::Item(u), rest)) = turn.split_first().filter(|(p, _)| is_user(p)) else {
             for piece in turn {
-                piece_rows(t, piece, shows, &mut out, &mut nested);
+                piece_rows(t, piece, shows, false, &mut out, &mut nested);
             }
             continue;
         };
@@ -958,7 +958,7 @@ fn rows_nested(t: &Transcript, shows: Shows<'_>) -> (Vec<(String, Row)>, HashSet
         item_rows(t, *u, shows, &mut out);
         if shows.all || !folds {
             for piece in rest {
-                piece_rows(t, piece, shows, &mut out, &mut nested);
+                piece_rows(t, piece, shows, false, &mut out, &mut nested);
             }
             continue;
         }
@@ -983,10 +983,13 @@ fn rows_nested(t: &Transcript, shows: Shows<'_>) -> (Vec<(String, Row)>, HashSet
         if live || open {
             out.push((key.clone(), Row::Steps(steps::turn_line(&key, &calls, t, ended.flatten(), live, open))));
         }
+        // A turn whose steps are one run: the turn's line already is that run's (the same marks), so the run shows
+        // opened under it with no line of its own, never two identical lines one inside the other.
+        let lone_run = rest.iter().filter(|p| matches!(p, Piece::Run(_))).count() == 1;
         for piece in rest {
             if open || item(piece).is_some_and(shown) {
                 let from = out.len();
-                piece_rows(t, piece, shows, &mut out, &mut nested);
+                piece_rows(t, piece, shows, lone_run, &mut out, &mut nested);
                 if open && item(piece).is_none_or(|n| !shown(n)) {
                     nested.extend(out[from..].iter().map(|(k, _)| k.clone()));
                 }
@@ -998,17 +1001,20 @@ fn rows_nested(t: &Transcript, shows: Shows<'_>) -> (Vec<(String, Row)>, HashSet
 
 /// One piece's rows: an item's, or a run as its one line ([`steps::run_line`]) and nothing else until the person opens
 /// it; opened, each cell's outputs ([`steps::outs`], set in by their own prefabs) and each agent tool call and reasoning
-/// between them as its own folded line, nested. A text block shows as far as its cut says ([`Shows`]).
-fn piece_rows(t: &Transcript, piece: &Piece, shows: Shows<'_>, out: &mut Vec<(String, Row)>, nested: &mut HashSet<String>) {
+/// between them as its own folded line, nested. `headless`: the run has no line of its own and shows opened (its turn's
+/// line stands for it). A text block shows as far as its cut says ([`Shows`]).
+fn piece_rows(t: &Transcript, piece: &Piece, shows: Shows<'_>, headless: bool, out: &mut Vec<(String, Row)>, nested: &mut HashSet<String>) {
     let fold = shows.fold;
     match piece {
         Piece::Item(n) => item_rows(t, *n, shows, out),
         Piece::Run(run) => {
             let key = run.key();
-            let open = fold.get(&key).copied().unwrap_or(false);
-            out.push((key.clone(), Row::Steps(steps::run_line(&key, run, t, open))));
-            if !open {
-                return;
+            if !headless {
+                let open = fold.get(&key).copied().unwrap_or(false);
+                out.push((key.clone(), Row::Steps(steps::run_line(&key, run, t, open))));
+                if !open {
+                    return;
+                }
             }
             for &n in &run.items {
                 let from = out.len();
@@ -1150,9 +1156,8 @@ fn texts(r: &Row) -> Vec<(&'static [&'static str], String, bool)> {
         ],
         Row::Thinking { open: true, text, .. } => vec![(&["body", "text"], text.trim().to_owned(), false)],
         Row::Note(s) | Row::Error(s) => vec![(&["text"], s.clone(), false)],
-        Row::Steps(l) => vec![(&["head", "words"], l.words.clone(), false)],
         Row::Out(o) => o.texts(),
-        Row::Tool { .. } | Row::Thinking { .. } | Row::Grid { .. } | Row::Table(_) | Row::Ui { .. } | Row::Pictures(..) | Row::RefCard(_) | Row::Math(_) => {
+        Row::Steps(_) | Row::Tool { .. } | Row::Thinking { .. } | Row::Grid { .. } | Row::Table(_) | Row::Ui { .. } | Row::Pictures(..) | Row::RefCard(_) | Row::Math(_) => {
             Vec::new()
         }
     }
@@ -3006,8 +3011,10 @@ enum PopLine {
     Head(String),
     /// Model and effort, how long: muted.
     Meta(String),
-    /// What it is doing or said last, a few lines.
+    /// What it is doing, a few plain lines (a command).
     Text(String),
+    /// One block of what it said last, as the transcript shows it: inline markdown, drawn by the same MarkdownText.
+    Said(String),
     /// One step a cell took: its kind (`hn.StepKind`) and its words ([`StepWords`]).
     Step(&'static str, StepWords),
 }
@@ -3223,10 +3230,28 @@ fn agent_pop(name: &str, state: &str, t: Option<&Transcript>, model: &str, effor
     });
     match (doing, said) {
         (Some(d), _) => out.push(PopLine::Text(d)),
-        (None, Some(s)) => out.push(PopLine::Text(clip_lines(s.trim(), POP_LINES, POP_CHARS))),
+        (None, Some(s)) => out.extend(said_lines(s)),
         (None, None) => {}
     }
     out
+}
+
+/// The first blocks of a message, as a card's lines: split as the transcript splits it ([`blocks`]: the same parse) and
+/// each drawn as inline markdown, never its source. A list item leads with its mark, a heading is strong; a code
+/// block, a table or a formula is left to the chat.
+fn said_lines(md: &str) -> Vec<PopLine> {
+    let mut rows = Vec::new();
+    blocks(md.trim(), false, &mut rows);
+    rows.into_iter()
+        .filter_map(|r| match r {
+            Row::Prose(s) | Row::Quote(s) => Some(s),
+            Row::Heading(_, s) => Some(format!("**{s}**")),
+            Row::ListItem { mark, text, .. } => Some(format!("{mark} {text}")),
+            _ => None,
+        })
+        .take(POP_LINES)
+        .map(PopLine::Said)
+        .collect()
 }
 
 /// What a sub-agent's turn in flight does now, in a few words ("Now: cargo build"), None when it says nothing yet.
@@ -3268,12 +3293,13 @@ fn fill_activity_pop(pop: View<'_>, strip: View<'_>, chips: &[Chip]) {
             PopLine::Head(_) => "hn.ChatActivityPopHead",
             PopLine::Meta(_) => "hn.ChatActivityPopMeta",
             PopLine::Text(_) => "hn.ChatActivityPopText",
+            PopLine::Said(_) => "hn.ChatActivityPopSaid",
             PopLine::Step(..) => "hn.ChatActivityPopStep",
         };
         (format!("{}{i}", c.key), prefab, l)
     });
     view::for_each_of(plate, lines, |v, l, _| match l {
-        PopLine::Head(s) | PopLine::Meta(s) | PopLine::Text(s) => {
+        PopLine::Head(s) | PopLine::Meta(s) | PopLine::Text(s) | PopLine::Said(s) => {
             v.text(s);
         }
         PopLine::Step(kind, s) => {
@@ -3754,7 +3780,10 @@ mod tests {
         let open = HashMap::from([("turn:0".to_owned(), true)]);
         let (all, nested) = rows_nested(&t, Shows { fold: &open, cut: &cut, all: false });
         assert!(matches!(&all[1].1, Row::Steps(l) if l.key == "turn:0" && l.open && l.words.contains("couldn't")), "opened, its line names what failed");
-        assert!(all.iter().any(|(k, r)| matches!(r, Row::Steps(_)) && k.starts_with("run:") && nested.contains(k)), "opened, its run shows nested");
+        // Its steps are one run, whose line the turn's already is: the run's outputs show under the turn's line, with no
+        // second line of the same marks inside it.
+        assert_eq!(all.iter().filter(|(_, r)| matches!(r, Row::Steps(_))).count(), 1, "opened, one line: {:?}", all.iter().map(|(_, r)| r.prefab()).collect::<Vec<_>>());
+        assert!(all.iter().any(|(k, r)| matches!(r, Row::Out(_)) && nested.contains(k)), "opened, its run's outputs show nested");
         assert_eq!(all.last().map(|(_, r)| r.prefab()), Some("hn.ChatProse"), "the answer stays last");
     }
 

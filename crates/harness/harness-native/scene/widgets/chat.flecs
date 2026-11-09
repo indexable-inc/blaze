@@ -63,7 +63,6 @@ hn {
         Fill: $tone_card
         Edge: {dark: $tone_line.dark, light: $tone_line.light}
         Shape: {radius: $chat_composer_radius, n: 4, border: 1, feather: 0}
-        Lift: {blur: $chat_composer_lift_blur, alpha: $chat_composer_lift_alpha, dy: $chat_composer_lift_dy}
         Cursor: {shape: Text}
         Pressable
         Action: {name: "chat:focus"}
@@ -273,9 +272,12 @@ hn {
       Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     }
+    // Always chat_pick_detail_h tall (two lines of it), whatever the line says or whether there is one: the menu keeps
+    // its height as the highlight moves, so nothing in it jumps.
     detail : ui.Column {
+      Clip
       Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
-      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_detail_h, min: 0, max: 0}}
     }
   }
   prefab ChatPickDetail : ui.Row {
@@ -299,7 +301,8 @@ hn {
   }
 
   // The context meter (den's): a small ring filling as the conversation fills its model's window, in a square that takes
-  // the pointer; muted, then hn.ChatContextTone's warn from 80% and full from 95% (pick.rs). Under the pointer,
+  // the pointer; muted, then hn.ChatContextTone's warn from 80% (the strong ink: brighter, not a colour) and full from 95% (the
+  // error ink, the one colour) (pick.rs). Under the pointer,
   // hn.ChatContextPop (widgets/context.flecs) shows how full as a donut of its parts; a press opens it to every part.
   prefab ChatContext : ui.Row {
     Hoverable
@@ -325,7 +328,7 @@ hn {
   }
   prefab ChatContextTone {
     ok { Fill: $tone_ink_muted }
-    warn { Fill: $tone_warning }
+    warn { Fill: $tone_ink_strong }
     full { Fill: $tone_error }
   }
 
@@ -539,7 +542,7 @@ hn {
     Hoverable
     Pressable
     Cursor: {shape: Arrow}
-    Fill: $tone_wash
+    Fill: $tone_clear
     HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0, radius: -1}
     Shape: {radius: $chat_activity_radius, n: 4, border: 0, feather: 0}
     Flex: {axis: Row, gap: $chat_activity_icon_gap, align: Center, justify: Start, wrap: false}
@@ -566,7 +569,6 @@ hn {
   // it is doing or said last (a few lines), or the steps the turn's cells took so far, one a line.
   prefab ChatActivityPop : ui.Menu {
     Side: {edge: Top, dx: 0, dy: $menu_gap}
-    Transition: {kind: Grow, from: Bottom, scale: $menu_in_scale, fade: true}
     Flex: {axis: Column, gap: $chat_activity_pop_gap, align: Stretch, justify: Start, wrap: false}
     Size: {w: {kind: Fixed, value: $chat_activity_pop_w, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     Padding: {l: $chat_activity_pop_pad, r: $chat_activity_pop_pad, t: $chat_activity_pop_pad, b: $chat_activity_pop_pad}
@@ -580,6 +582,16 @@ hn {
   }
   prefab ChatActivityPopText : ui.Words, Ink {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    TextStyle: {size: $size_peek_body, line: $line_peek_meta, role: 0, bold: 0}
+  }
+  // A block of what it said last: the transcript's inline markdown (hn.ChatProse's MarkdownText: strong words, code,
+  // a path's or a pull request's chip), at the card's size.
+  prefab ChatActivityPopSaid : ui.Words, Ink {
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    MarkdownText: {chip_dark: $tone_wash.dark, chip_light: $tone_wash.light,
+      link_dark: $tone_link.dark, link_light: $tone_link.light,
+      code_dark: $tone_code_ink.dark, code_light: $tone_code_ink.light,
+      strong_dark: $tone_ink_strong.dark, strong_light: $tone_ink_strong.light, chip_radius: $chat_code_radius}
     TextStyle: {size: $size_peek_body, line: $line_peek_meta, role: 0, bold: 0}
   }
   // One step a cell took, one line: its kind's glyph (hn.StepKind), its verb in the UI's words ("Ran", "Read"), then

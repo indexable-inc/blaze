@@ -455,6 +455,14 @@ impl Chat {
         Ok(lines)
     }
 
+    /// Whether the agent ever said or did anything in this conversation (words, a thought, a call). False for a chat
+    /// no turn of which reached its agent: Claude writes a conversation only once a turn runs, so there is none to
+    /// resume and a relaunch starts it instead.
+    pub fn agent_spoke(&self) -> bool {
+        use harness_chat::Item;
+        self.store.lock().transcript.items.iter().any(|i| matches!(i, Item::Text { .. } | Item::Thinking { .. } | Item::Tool { .. }))
+    }
+
     /// The agent's own id for this conversation (what resumes it), when its log said one.
     pub fn session_id(&self) -> Option<String> {
         Some(self.store.lock().transcript.session_id.clone()).filter(|s| !s.is_empty())
