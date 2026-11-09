@@ -209,9 +209,8 @@ fn count(holder: Option<Tag>, delta: i64) {
             false => (&local.churn_freed[at], delta.unsigned_abs()),
         };
         let churn_now = churned.get() + gross;
-        if churn_now < CHURN_BATCH {
-            churned.set(churn_now);
-        } else {
+        churned.set(churn_now);
+        if churn_now >= CHURN_BATCH {
             churn(local, at);
         }
         if delta > 0 {
@@ -1575,6 +1574,22 @@ mod tests {
     }
 
     const MB: usize = 1 << 20;
+
+    /// An account's churn is every byte its work allocated and freed, never netted: a task
+    /// that frees and allocates again churns far past its peak (docs/memory-footprint.md,
+    /// cause 2), and its peak alone would not say so.
+    #[test]
+    fn an_accounts_churn_is_what_its_work_allocated_and_freed_in_all() {
+        let ((), spent) = measured(|| {
+            for _ in 0..8 {
+                drop(std::hint::black_box(vec![1u8; MB]));
+            }
+        });
+        assert!(spent.allocated >= 8 * MB as u64, "{spent:?}");
+        assert!(spent.freed >= 8 * MB as u64, "{spent:?}");
+        assert!(spent.peak < 2 * MB as u64, "one block at a time: {spent:?}");
+        assert!(spent.allocated < 9 * MB as u64, "nothing else: {spent:?}");
+    }
 
     #[test]
     fn an_account_says_what_its_work_held_at_most() {
