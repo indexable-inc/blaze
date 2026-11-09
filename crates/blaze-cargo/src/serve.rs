@@ -16,6 +16,7 @@
 //!   its CPUs, and answers `blaze explore`, `blaze debug live` and a reader's ask to flush the
 //!   history (`blaze_api::Request::Flush`) itself ([`observe`]).
 
+mod breakdown;
 pub mod ceiling;
 mod daemon;
 mod fetch;
@@ -1199,6 +1200,12 @@ pub(crate) fn engine(
     };
     // A sampler that can't be made is no other path: every dump and history says it is off.
     if let Err(why) = blaze_profile::sampler::start(blaze_profile::sampler::HZ) {
+        tracing::warn!("{why}");
+        eprintln!("blaze serve: {why}");
+    }
+    // The heap's: one allocation in every 4 MiB a thread allocates, with its stack, as
+    // `alloc_samples` rows (docs/memory-footprint.md, step 1). Said, as the CPU sampler is.
+    if let Err(why) = blaze_profile::heap::start() {
         tracing::warn!("{why}");
         eprintln!("blaze serve: {why}");
     }

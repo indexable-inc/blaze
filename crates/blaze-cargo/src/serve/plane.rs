@@ -317,14 +317,18 @@ fn run_measured<W: Work>(
     }
     .open();
     let start = Instant::now();
-    let (result, peak) = admission::run_as(kind, || {
+    let (result, spent) = admission::run_as(kind, || {
         let _job = InJob::enter();
         catch_unwind(AssertUnwindSafe(|| work.run(arg, readers)))
     });
     let ran_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let ended = matches!(result, Ok(Some(_)));
     span.ended(blaze_profile::span::TaskEnded {
-        peak: matches!(result, Ok(Some(_))).then_some(peak),
+        peak: ended.then_some(spent.peak),
+        heap_allocated: ended.then_some(spent.heap.allocated),
+        heap_freed: ended.then_some(spent.heap.freed),
     });
+    let peak = spent.peak;
     match result {
         Ok(None) => (None, peak, ran_ns, Vec::new()),
         Ok(Some(did)) => (Some(Ended::Did(did)), peak, ran_ns, proc_macro_api::kept::take_puts()),
