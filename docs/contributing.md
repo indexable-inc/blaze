@@ -105,7 +105,7 @@ crates.io's `ra-ap-rustc_abi`, the same way. The fork repositories
 
 New code that is the language's semantics goes in the front end's crates: building MIR and
 the passes over it, borrow checking, const evaluation, layout, and the hashes that say what a
-function's code is made from, as salsa queries. These are what rustc keeps in `rustc_middle`,
+function's code is made from, as queries on blaze's own engine (`blaze_query::db`, derived from salsa). These are what rustc keeps in `rustc_middle`,
 `rustc_mir_transform` and `rustc_borrowck`; rust-analyzer could take them, and a query lives
 with the database it reads. Where rust-analyzer's MIR differs from rustc's, the fix goes in
 the fork's lowering or in a pass of its runtime MIR queries, and the code generator relies on

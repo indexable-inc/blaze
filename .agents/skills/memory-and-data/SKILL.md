@@ -1,6 +1,6 @@
 ---
 name: memory-and-data
-description: "How blaze holds memory and keeps what it computes: an owner per lifetime (a task's frame, a heap of its own for a big task, the store for what outlives it), footprint as the one measure, outputs as blaze-format records written once and read in place from mapped files, persistence from one generic impl over `for const`, and caches keyed by code identity. Load before allocating in a task, adding a query result or anything persisted, touching blaze-mem, blaze-format, the store, admission, the allocator or the memory ceiling, caching a function's results, or explaining where a build's memory went."
+description: "How blaze holds memory and keeps what it computes: an owner per lifetime (a task's frame, a heap of its own for a big task, the store for what outlives it), footprint as the one measure, outputs as blaze-format records written once and read in place from mapped files, persistence from one generic impl over `for const`, and caches keyed by code identity. Load before allocating in a task, adding a query result or anything persisted, touching blaze-mem, blaze-format, the store, admission, the allocator or the memory ceiling, or caching a function's results. Finding where a build's memory went is the `debugging` skill."
 ---
 
 # Memory and durable data
@@ -45,12 +45,13 @@ See [crates/blaze-format/src/lib.rs](../../../crates/blaze-format/src/lib.rs).
 ## cache-by-code-id (rule 48)
 
 A cache of what a function returns is keyed by that function's behaviour identity,
-`fn_info(&f).code_id` (a Merkle hash of its code and everything it reaches), together with its
-arguments, so an edit to the function or anything it calls makes new keys and old entries are never
-read again; garbage collection drops them later. Nothing invalidates entries by hand, compares
-timestamps or keeps a dependency list beside the key. A function the identity walk cannot follow (a
-`dyn` it cannot see through, a body that does not lower) is an error naming it, never a cache keyed
-on less.
+`fn_info(&f).code_id` (a Merkle hash of its code and everything it reaches; const eval does not
+answer `fn_info` yet, docs/const.md, so today the same identity is `hir_ty_identity::code_id`, which
+`crates/hir-ty-codegen/fncache.rs` hands to `#[blaze::cache]`), together with its arguments, so an
+edit to the function or anything it calls makes new keys and old entries are never read again;
+garbage collection drops them later. Nothing invalidates entries by hand, compares timestamps or
+keeps a dependency list beside the key. A function the identity walk cannot follow (a `dyn` it
+cannot see through, a body that does not lower) is an error naming it, never a cache keyed on less.
 
 See [docs/v2/plan/design/comptime.md](../../../docs/v2/plan/design/comptime.md).
 
