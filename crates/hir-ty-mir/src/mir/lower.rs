@@ -558,7 +558,8 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         // blaze: a refinement by enum variants (`#![blaze::pattern_types]`) has its base's
         // layout and code, so a local holds the base: places project through it as through
         // the enum, and a signature naming the refinement relates to it as its base.
-        let ty = hir_ty::pattern_types::erase(self.interner(), local.ty.as_ref());
+        let Local { ty: written } = local;
+        let ty = hir_ty::pattern_types::erase(self.interner(), written.as_ref());
         self.building.locals.push(Local { ty: ty.store() });
         id
     }
