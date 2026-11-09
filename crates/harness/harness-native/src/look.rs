@@ -75,6 +75,16 @@ pub struct SideDrag {
     pub keep: f32,
 }
 
+/// Dragging the browser pane's left edge (src/app/web_drag.rs), all points: its width's range, how near the edge a press
+/// grabs it (`grab`), and the least the main card keeps beside it (`keep`, which lowers `max` in a narrow window).
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct PaneDrag {
+    pub min: f32,
+    pub max: f32,
+    pub grab: f32,
+    pub keep: f32,
+}
+
 /// How the chat's effort moves under a sideways swipe (`hn.Theme.chat_pick`, src/app/chat/pick.rs): the fingers' travel
 /// a stop takes (`step`, points), how long after the last step the effort is sent (`commit`, seconds), and how long the
 /// control keeps saying it in words once it stops moving (`word`, seconds).
@@ -114,6 +124,7 @@ pub struct PressAmt {
 
 pub fn register(world: &World) {
     world.component::<SideDrag>().writable();
+    world.component::<PaneDrag>().writable();
     world.component::<PickFeel>().writable();
     world.component::<MentionLook>().writable();
     world.component::<FoldIn>().writable();
@@ -169,6 +180,11 @@ pub fn pace(w: WorldRef<'_>, name: &str) -> Pace {
 /// The sidebar drag's numbers (`hn.Theme.side_drag`).
 pub fn side_drag(w: WorldRef<'_>) -> SideDrag {
     role(w, "side_drag").try_cloned::<&SideDrag>().unwrap_or_else(|| panic!("hn.Theme.side_drag has no SideDrag"))
+}
+
+/// The browser pane drag's numbers (`hn.Theme.web_drag`).
+pub fn web_drag(w: WorldRef<'_>) -> PaneDrag {
+    role(w, "web_drag").try_cloned::<&PaneDrag>().unwrap_or_else(|| panic!("hn.Theme.web_drag has no PaneDrag"))
 }
 
 /// The chat effort's swipe and commit timings (`hn.Theme.chat_pick`).

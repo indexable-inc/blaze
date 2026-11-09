@@ -1011,10 +1011,16 @@ export const gen_shape_zeta = 1
 // page at gen_browser_aspect (width over height, 16:10) above its title and address, a gen_browser_load hairline in
 // tone_accent along the picture's foot while the page loads. The pane (hn.WebPane, cmd+shift+B) sits on the right
 // web_pane_w wide, opening and folding on the sidebar's spring; its toolbar is web_toolbar_h tall with the address in a
-// web_url_h field, the extensions menu web_menu_w wide, and an extension's popup web_popup_w by web_popup_h.
+// web_url_h field, the extensions menu web_menu_w wide, and an extension's popup web_popup_w by web_popup_h. Its left
+// edge drags (src/app/web_drag.rs): a press within web_grab of it grabs it, and the width stays between web_pane_min and
+// web_pane_max, less in a narrow window so the main card keeps web_keep beside it.
 export const gen_browser_aspect = 1.6
 export const gen_browser_load = 2
 export const web_pane_w = 520
+export const web_pane_min = 320
+export const web_pane_max = 1200
+export const web_grab = 5
+export const web_keep = 360
 export const web_toolbar_h = 40
 export const web_url_h = 26
 export const web_menu_w = 240

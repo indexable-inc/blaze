@@ -605,6 +605,8 @@ impl App {
         };
         app.apply_ghostty();
         app.load_keys()?;
+        // The browser pane's width as it was last dragged (native.json `web_width`).
+        app.web_restore_width();
         // F3's overlay as it was left (native.json `stats`), or HARNESS_NATIVE_STATS=1|0 over that.
         let stats = match std::env::var("HARNESS_NATIVE_STATS").as_deref() {
             Ok("1") => true,
