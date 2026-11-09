@@ -132,6 +132,14 @@ pub(super) fn check<'db>(
     }
     let offset = usize::from(first.coloncolon_token().is_some());
     let single = offset == 0 && prefixes.len() == 1;
+    // A binder's type parameter, alone or with the path relative to it (`F::Type`): what rustc
+    // resolves to the parameter and leaves the rest of to the type checker.
+    if offset == 0
+        && (!single || source == Source::Type)
+        && is_binder_param(signature, path, first)
+    {
+        return None;
+    }
     if single
         && source == Source::Type
         && (is_own_type_param(signature, path, first) || is_primitive(signature, first))
@@ -562,17 +570,40 @@ fn is_own_type_param(
                     .and_then(ast::GenericParamList::cast),
             )
     };
-    // `for<T>` (`non_lifetime_binders`, gated apart) declares `T` for what it binds.
-    let binds = |node: ast::Node<'_>| {
-        node.children().filter(|it| it.kind() == SyntaxKind::FOR_BINDER).any(|binder| {
-            names(
-                binder
-                    .child_where(ast::GenericParamList::can_cast)
-                    .and_then(ast::GenericParamList::cast),
-            )
+    declares(item) || (inner != item && declares(inner))
+}
+
+/// Whether the first segment `first` of `path` in `signature` names a type parameter of a
+/// `for<..>` binder around it: `for<T>` (`non_lifetime_binders`, gated apart) and a field
+/// binder `for<F: Field<C>>` (`#![feature(blaze_comptime)]`, docs/v2/plan/design/comptime.md)
+/// declare their parameters for what they bind and for the bounds in the binder itself
+/// (`for<V: Variant<C>, F: Field<V::View>>`), as rustc's `with_generic_param_rib` scopes them.
+/// hir's resolver knows none of them, so the syntax answers: `F::Type` is relative to `F`,
+/// never an undeclared type. Only in a file of source, as [`is_own_type_param`].
+fn is_binder_param(
+    signature: &Signature<'_>,
+    path: ast::Path<'_>,
+    first: ast::PathSegment<'_>,
+) -> bool {
+    if signature.node.file_id.is_macro() || first.generic_arg_list().is_some() {
+        return false;
+    }
+    let Some(ast::PathSegmentKind::Name(name)) = first.kind() else { return false };
+    let name = name.text();
+    let declares = |list: ast::GenericParamList<'_>| {
+        list.type_or_const_params().any(|it| match it {
+            ast::TypeOrConstParam::Type(param) => param.name().is_some_and(|it| it.text() == name),
+            ast::TypeOrConstParam::Const(_) => false,
         })
     };
-    declares(item) || (inner != item && declares(inner)) || path.syntax().ancestors().any(binds)
+    path.syntax().ancestors().any(|node| {
+        node.children().filter(|it| it.kind() == SyntaxKind::FOR_BINDER).any(|binder| {
+            binder
+                .child_where(ast::GenericParamList::can_cast)
+                .and_then(ast::GenericParamList::cast)
+                .is_some_and(declares)
+        })
+    })
 }
 
 /// Whether the one-segment path of first segment `first` names a primitive type, which the
