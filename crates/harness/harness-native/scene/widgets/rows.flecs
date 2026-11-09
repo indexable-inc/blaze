@@ -35,6 +35,11 @@ hn {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $tree_row_h, min: 0, max: 0}}
     Padding: {l: indent($depth, $tree_pad, $indent_step) + $tree_gutter, r: $tree_pad_r, t: 0, b: 0}
     hang { hn.Hang: {obj: $obj, depth: $depth, kids: $kids, open: $open, mark: $mark} }
+    // What it is at a glance: an agent's mark (Claude's in its orange, the others muted) or a shell's terminal glyph,
+    // tree_kind across before its title (src/app.rs sync_view sets it with look::kind_mark, outside the template's
+    // reactive inputs). A sub-agent up but idle has it breathe slowly and deep: asleep, not at work (at work its
+    // title's sheen sweeps).
+    kind_icon : hn.tree.Kind {}
     name : hn.tree.Head {
       Text: {s: $name}
       // What it is doing while it works ("Running a command: cargo test"), where it works and when it started or ended
@@ -151,6 +156,8 @@ hn {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $tree_run_h, min: 0, max: 0}}
     Padding: {l: indent($depth, $tree_pad, $indent_step) + $tree_gutter, r: $tree_pad_r, t: 0, b: 0}
     hang { hn.Hang: {obj: $obj, depth: $depth, kids: $kids, open: $open, mark: $mark} }
+    // A command, at a glance: the terminal glyph, faint, tree_kind across before its line.
+    kind_icon : hn.tree.CmdKind {}
     name : hn.tree.Cmd {
       Text: {s: $name}
       if $look == "on" {

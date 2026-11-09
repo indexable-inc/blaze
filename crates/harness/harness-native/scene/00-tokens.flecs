@@ -133,6 +133,11 @@ export const tree_run_h = 22
 export const tree_gutter = 12
 export const tree_icon = 16
 export const tree_chevron = 9
+// A row's kind at a glance (an agent's mark, a terminal glyph): tree_kind across, tree_kind_gap before its title; a
+// sleeping sub-agent's breathes down to tree_sleep_low.
+export const tree_kind = 12
+export const tree_kind_gap = 6
+export const tree_sleep_low = 0.3
 // The tree's indent guides (hn.Hang's slots): a hairline down the middle of each ancestor's chevron gutter, in
 // tone_guide (Islands' tree-indent-guide-border), for as many levels as tree_guides; a done mark in a childless row's
 // gutter (tree_mark across: a check in tone_success, a cross in tone_error).

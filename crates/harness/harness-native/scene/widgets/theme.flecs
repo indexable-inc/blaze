@@ -67,6 +67,10 @@ hn {
     chat_activity_air {
       Size: {w: {kind: Fixed, value: $chat_activity_below, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
     }
+    // How far a sleeping sub-agent's mark breathes down (src/app.rs sync_view; a share, as a width).
+    tree_sleep {
+      Size: {w: {kind: Fixed, value: $tree_sleep_low, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
     // How long a finished child keeps its row (and its done mark) under a folded node (seconds, as a width).
     tree_linger_for {
       Size: {w: {kind: Fixed, value: $tree_linger_s, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
