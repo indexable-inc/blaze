@@ -89,14 +89,16 @@ pub struct Bar {
 impl Carets {
     /// The caret panel for node `node`'s caret `b` at frame time `now`: its bar, and its sweep while one runs.
     pub fn panel(&mut self, node: u64, b: &Bar, look: &CaretLook, now: f32) -> PanelInst {
+        // A glide of 0 turns the sweep off (the default, 00-tokens.flecs caret_glide): the caret only ever snaps.
+        let sweeps = look.glide > 0.0;
         let span = look.glide.max(1e-3);
-        (self.now, self.span) = (now, span);
+        (self.now, self.span) = (now, if sweeps { span } else { 0.0 });
         let (g, seen) = self.glides.entry(node).or_default();
         *seen = true;
         g.track(b.rest, now, span);
         let at = |r: [f32; 4]| [b.at.0 + r[0], b.at.1 + r[1], r[2], r[3]];
         let to = at(b.rest);
-        let from = g.from.filter(|_| g.active(now, span)).map_or([0.0; 4], at);
+        let from = g.from.filter(|_| sweeps && g.active(now, span)).map_or([0.0; 4], at);
         let mut bound = to;
         if from[2] > 0.0 {
             let (x0, y0) = (to[0].min(from[0]), to[1].min(from[1]));
@@ -127,7 +129,7 @@ impl Carets {
     pub fn end_frame(&mut self) -> bool {
         self.glides.retain(|_, (_, seen)| std::mem::take(seen));
         let (now, span) = (self.now, self.span);
-        self.glides.values().any(|(g, _)| g.active(now, span))
+        span > 0.0 && self.glides.values().any(|(g, _)| g.active(now, span))
     }
 }
 

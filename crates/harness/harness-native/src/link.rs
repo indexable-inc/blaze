@@ -497,6 +497,11 @@ impl Link {
         link
     }
 
+    /// What wakes the main thread: for work the app runs on a thread of its own (chat/mention.rs's index).
+    pub fn waker(&self) -> Wake {
+        self.wake.clone()
+    }
+
     /// The last `list` round trip to the daemon, milliseconds (None before the first answer).
     pub fn rtt_ms(&self) -> Option<f32> {
         let us = self.rtt_us.load(Ordering::Relaxed);

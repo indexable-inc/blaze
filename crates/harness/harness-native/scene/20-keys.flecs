@@ -150,6 +150,8 @@ act {
   ChatNewline : act.Edit { EditOp: {op: "newline"} }
   // Command-Return: sends the chat's message, and submits a cell's TextArea (where Return breaks the line).
   ChatSubmit : act.Edit { EditOp: {op: "submit"} }
+  // Tab: takes the `@` mention menu's highlighted place (chat/mention.rs); with no menu open, types a tab.
+  ChatComplete : act.Edit { EditOp: {op: "complete"} }
   ChatInterrupt : act.Edit { EditOp: {op: "interrupt"} }
   // The model and effort picker under the composer (src/app/chat/pick.rs): open its models, step its effort.
   ChatPickModel : act.Edit { EditOp: {op: "pick_model"} }
@@ -397,6 +399,7 @@ key {
   chat_send { Keybind: {key: "return"}; (Does, act.ChatSend); (When, ctx.Chat) }
   chat_send_enter { Keybind: {key: "enter"}; (Does, act.ChatSend); (When, ctx.Chat) }
   chat_newline { Keybind: {key: "return", shift: 1}; (Does, act.ChatNewline); (When, ctx.Chat) }
+  chat_complete { Keybind: {key: "tab"}; (Does, act.ChatComplete); (When, ctx.Chat) }
   chat_submit { Keybind: {key: "return", cmd: 1}; (Does, act.ChatSubmit); (When, ctx.Chat) }
   chat_pick_model { Keybind: {key: "/", cmd: 1}; (Does, act.ChatPickModel); (When, ctx.Chat) }
   chat_effort_next { Keybind: {key: "/", cmd: 1, shift: 1}; (Does, act.ChatEffortNext); (When, ctx.Chat) }

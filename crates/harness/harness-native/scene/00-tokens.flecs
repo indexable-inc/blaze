@@ -435,11 +435,11 @@ export const copy_add_light = 0
 // font's size tall about its line's middle, caret_radius round. A jump farther than its height sweeps from where it was
 // over caret_glide seconds on an ease-out cubic, its tail at half the bar's ink; after it last moved it stays solid
 // caret_hold seconds, then blinks once every caret_blink seconds (on for the first half), each turn eased over caret_fade
-// of the cycle. Its ink is tone_ink_strong.
+// of the cycle. Its ink is tone_ink_strong. The sweep is off by default (caret_glide 0: the caret snaps); 0.2 turns it on.
 export const caret_w = 1.5
 export const caret_h = 1.25
 export const caret_radius = 0.75
-export const caret_glide = 0.2
+export const caret_glide = 0
 export const caret_hold = 0.5
 export const caret_blink = 1.06
 export const caret_fade = 0.09
@@ -592,6 +592,10 @@ export const chat_effort_floor = 0.3
 // it), a pulse on the trackpad at each; the effort is sent chat_pick_commit_secs after the last step (one switch for a
 // swipe through several), and the control says the effort in words while it moves and chat_pick_word_secs after.
 export const chat_pick_menu_w = 252
+// The `@` mention menu (hn.ChatMention, chat/mention.rs): chat_mention_w wide over the composer, its leading edge on the
+// card's; a row each place, its kind's icon chat_mention_icon square, its name, then its folder quiet at the end.
+export const chat_mention_w = 420
+export const chat_mention_icon = 16
 export const size_chat_pick_detail = 11.5
 export const line_chat_pick_detail = 15
 export const chat_pick_detail_t = 3
