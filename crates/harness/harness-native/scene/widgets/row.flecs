@@ -22,8 +22,8 @@ hn {
   // column never moves whether or not the row has rows under it. With rows under the row it is a thin chevron (a vector
   // mark, hn's own: icons/chevron.svg) pointing at the title, in the muted ink, always shown so the tree reads as one,
   // turned a quarter to point down on the `turn` spring as it opens; its hit target is the whole slot. Else the slot
-  // holds the row's done `mark` while a finished row lingers ("ok": a check in tone_success, "fail": a cross in
-  // tone_error, "": nothing) and no hit target (the row takes the press). Its click is script (flecs.script.input):
+  // holds the row's `mark` while a finished row lingers ("fail": a cross in tone_error; "": nothing, a row that
+  // ended well fading instead) and no hit target (the row takes the press). Its click is script (flecs.script.input):
   // `hn.act` hands the host the toggle, with Option for every sibling.
   @tree ChildOf
   template Hang : Row {
@@ -152,22 +152,16 @@ hn {
           Fill: $tone_clear
         }
       }
-      // The done mark of a childless row that finished (its glyph, ink and size set in every arm).
+      // The mark of a childless row that failed (its glyph, ink and size set in every arm).
       done : ui.Symbol {
-        if $kids == false && $mark == "ok" {
-          Icon: {glyph: ""}
-          Fill: $tone_success
+        if $kids == false && $mark == "fail" {
+          Icon: {glyph: ""}
+          Fill: $tone_error
           Size: {w: {kind: Fixed, value: $tree_mark, min: 0, max: 0}, h: {kind: Fixed, value: $tree_mark, min: 0, max: 0}}
         } else {
-          if $kids == false && $mark == "fail" {
-            Icon: {glyph: ""}
-            Fill: $tone_error
-            Size: {w: {kind: Fixed, value: $tree_mark, min: 0, max: 0}, h: {kind: Fixed, value: $tree_mark, min: 0, max: 0}}
-          } else {
-            Icon: {glyph: ""}
-            Fill: $tone_clear
-            Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 0, min: 0, max: 0}}
-          }
+          Icon: {glyph: ""}
+          Fill: $tone_clear
+          Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 0, min: 0, max: 0}}
         }
       }
       async {
