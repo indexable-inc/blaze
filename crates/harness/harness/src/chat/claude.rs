@@ -352,8 +352,27 @@ fn models(a: &Value) -> Vec<ModelChoice> {
         .filter(|m| !m.id.is_empty())
         .collect();
     let aliased = |m: &ModelChoice| m.id == "default" && all.iter().any(|o| o.id != "default" && !m.model.is_empty() && o.model == m.model);
-    all.iter().filter(|m| !aliased(m)).cloned().collect()
+    let mut kept: Vec<ModelChoice> = all.iter().filter(|m| !aliased(m)).cloned().collect();
+    for &(model, name, about) in OFFERED {
+        if !kept.iter().any(|m| m.model == model || m.id == model) {
+            kept.push(ModelChoice {
+                id: model.to_owned(),
+                model: model.to_owned(),
+                name: name.to_owned(),
+                about: about.to_owned(),
+                efforts: ["low", "medium", "high", "xhigh", "max"].map(str::to_owned).to_vec(),
+                effort: None,
+            });
+        }
+    }
+    kept
 }
+
+/// Models the picker and `spawn` offer for claude whether or not this Claude Code lists them yet (model id, name, line):
+/// a model released after the installed Claude Code, which `set_model` and `--model` take by its full id all the same.
+/// Once Claude Code lists one itself, its own entry is the one kept; drop it from here then.
+const OFFERED: &[(&str, &str, &str)] =
+    &[("claude-fable-5-2", "Fable 5.2", "For the hardest planning and design; the most capable and the most expensive")];
 
 /// The context window a turn's `result` says its model has (den-claude's reading): `modelUsage[model].contextWindow`,
 /// else the widest window it names; 0 when it names none. What the turn filled is its last main-loop assistant message's
