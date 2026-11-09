@@ -102,7 +102,7 @@ Each is a hard error in the edition and a lint (below) in any crate before it.
 | `async` and `await` | fibers and the inferred may-suspend effect |
 | the ambient file, clock, network, environment, process and thread APIs | capabilities of [bstd](std.md) |
 | the global allocator | an allocator the code was handed |
-| `static mut` | an atomic, a named lock, or a context |
+| global mutable state: `static mut`, a `static` with interior mutability, thread-locals | a value someone owns and passes, or a context |
 | `unsafe` outside the trusted list | safe code, or a reviewed entry in the list |
 | derive proc macros that reflection covers | `fields_of` and friends; proc macros stay for foreign syntax |
 
@@ -119,7 +119,7 @@ is an error. Where a mechanical fix exists, `blaze check --fix` applies it.
 | lint | flags | fix |
 |---|---|---|
 | `blaze::lossy_as` | an `as` cast that can lose value or sign, or goes between pointer and integer | `T::from(x)` when lossless; else suggests `try_from` or the named method |
-| `blaze::static_mut` | any `static mut` | none: says which of atomic, lock or context fits the uses |
+| `blaze::global_state` | a `static mut`, a `static` whose type has interior mutability (an atomic, a lock, a cell), a `thread_local!` | none: says where the state is used, so its owner can be chosen |
 | `blaze::async_fn` | `async fn`, `async` blocks, `.await` | none until fibers are the runtime of the crate |
 | `blaze::ambient` | reaching ambient IO (the effect of [std](std.md)) | none: names the capability to take |
 | `blaze::global_alloc` | allocating from the global heap | `new_in(..)` when an allocator is in scope |
@@ -138,7 +138,7 @@ Payoff per unit of compiler work, and what leans on what.
 
 | step | what | needs |
 |---|---|---|
-| E1 | The lint group with `lossy_as`, `static_mut`, `async_fn`; turned on in blaze's own crates one at a time | nothing |
+| E1 | The lint group with `lossy_as`, `global_state`, `async_fn`; turned on in blaze's own crates one at a time | nothing |
 | E2 | Handles (change 1) and `handle_clone` | nothing |
 | E3 | Error unions (change 2) and `error_wrapper` | nothing |
 | E4 | View types (change 3) | nothing |
