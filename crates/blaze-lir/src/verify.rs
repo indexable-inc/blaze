@@ -832,18 +832,18 @@ fn dominance(view: &View<'_>, cfg: &Cfg, of: &[u32], value: usize, at: usize) ->
     if view.ty(Value(value as u32)).is_none() {
         return Some("a use of an instruction that makes no value");
     }
-    let (def_block, def_at) = match view.op(value) {
-        // An invoke's or asm_br's value is defined at the head of the block it returns to.
-        Op::Invoke | Op::InvokeIndirect | Op::AsmBr => {
-            let mut operands = view.operands(value);
-            operands.word();
-            if view.op(value) != Op::AsmBr {
-                operands.sig();
-            }
-            let normal = operands.block();
-            (normal.0, view.block(normal).start)
+    let defining = view.op(value);
+    // An invoke's or asm_br's value is defined at the head of the block it returns to.
+    let (def_block, def_at) = if matches!(defining, Op::Invoke | Op::InvokeIndirect | Op::AsmBr) {
+        let mut operands = view.operands(value);
+        operands.word();
+        if defining != Op::AsmBr {
+            operands.sig();
         }
-        _ => (of[value], value + 1),
+        let normal = operands.block();
+        (normal.0, view.block(normal).start)
+    } else {
+        (of[value], value + 1)
     };
     let use_block = of[at];
     if !cfg.reachable(def_block) {

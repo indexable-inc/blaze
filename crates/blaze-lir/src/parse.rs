@@ -142,23 +142,19 @@ impl<'t, 'a> Line<'t, 'a> {
     }
 
     fn word(&mut self, what: &'static str) -> Result<&'a str> {
-        match self.peek() {
-            Some(Tok::Word(word)) => {
-                self.at += 1;
-                Ok(word)
-            }
-            _ => Err(self.err(what)),
+        if let Some(Tok::Word(word)) = self.peek() {
+            self.at += 1;
+            return Ok(*word);
         }
+        Err(self.err(what))
     }
 
     fn keyword(&mut self, keyword: &'static str) -> Result<()> {
-        match self.peek() {
-            Some(Tok::Word(word)) if *word == keyword => {
-                self.at += 1;
-                Ok(())
-            }
-            _ => Err(self.err(keyword)),
+        if self.is_keyword(keyword) {
+            self.at += 1;
+            return Ok(());
         }
+        Err(self.err(keyword))
     }
 
     fn is_keyword(&self, keyword: &str) -> bool {
@@ -166,13 +162,11 @@ impl<'t, 'a> Line<'t, 'a> {
     }
 
     fn punct(&mut self, c: char, what: &'static str) -> Result<()> {
-        match self.peek() {
-            Some(Tok::Punct(it)) if *it == c => {
-                self.at += 1;
-                Ok(())
-            }
-            _ => Err(self.err(what)),
+        if self.is_punct(c) {
+            self.at += 1;
+            return Ok(());
         }
+        Err(self.err(what))
     }
 
     fn is_punct(&self, c: char) -> bool {
@@ -180,13 +174,11 @@ impl<'t, 'a> Line<'t, 'a> {
     }
 
     fn string(&mut self) -> Result<&'t str> {
-        match self.peek() {
-            Some(Tok::Str(text)) => {
-                self.at += 1;
-                Ok(text)
-            }
-            _ => Err(self.err("a quoted string")),
+        if let Some(Tok::Str(text)) = self.peek() {
+            self.at += 1;
+            return Ok(text.as_str());
         }
+        Err(self.err("a quoted string"))
     }
 
     fn number<T: std::str::FromStr>(&mut self, what: &'static str) -> Result<T> {

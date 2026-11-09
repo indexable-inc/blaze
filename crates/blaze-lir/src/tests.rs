@@ -224,7 +224,7 @@ impl<S: Sink> Gen<S> {
                     Scalar::I1 | Scalar::I8 | Scalar::I16 | Scalar::I32 | Scalar::I64 | Scalar::I128 => {
                         let value = match seed % 4 {
                             0 => seed as u128,
-                            1 => (seed as u128) << 40 | 0xffff,
+                            1 => ((seed as u128) << 40) | 0xffff,
                             2 => u128::MAX - seed as u128,
                             _ => (seed as u128) << 100,
                         };
@@ -895,7 +895,7 @@ fn constants_take_the_narrowest_form() {
     assert_eq!(view.op(small.index()), Op::Iconst, "-1 fits a word sign-extended");
     assert_eq!(view.data[small.index()], u32::MAX);
     assert_eq!(view.op(wide.index()), Op::IconstWide);
-    assert_eq!(view.operands(wide.index()).constant(), &[0, 1 << 8]);
+    assert_eq!(view.operands(wide.index()).constant(), &[0u32, 1 << 8][..]);
     assert_eq!(view.data[byte.index()], 0xff, "a constant is truncated to its width");
     let _ = verify::structure(view);
 }
