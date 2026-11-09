@@ -22,6 +22,8 @@ pub mod paint;
 pub mod photo;
 pub mod reflow;
 pub mod select;
+#[cfg(test)]
+mod shader_port;
 pub mod slug;
 pub mod text;
 pub mod vector;
