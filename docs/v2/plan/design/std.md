@@ -208,6 +208,37 @@ The runtime keeps one real thread-local, the pointer to the current worker, insi
 **Secrets.** `#[derive(bstd::Secret)]` gives a type no `Debug`, `Display` or `Clone`, zeroes it on
 drop, and hands its bytes only to functions of its own module.
 
+### Capabilities are layered, and each has providers
+
+A capability names what a program needs, not how the host supplies it. `Http` is one: "may make
+requests to these origins". It has more than one provider:
+
+| provider | how it answers a request |
+|---|---|
+| `Http::over(&net, &clock, &roots)` | bstd's sans-IO HTTP core over connections from that `Net`; never reaches further than the `Net` does |
+| `io.http()` | the host does it: `fetch` in a wasm worker, where there are no sockets at all |
+| `Http::handler(f)` | a function you pass: a fake for a test, a cache, a proxy |
+
+All three are the same type, `Http`, so `fn sync(cx: &Cx, http: &Http)` runs natively, in a
+worker and in a test unchanged. The provider is a field, chosen where the capability is made; a
+request is already far more work than one indirect call. `http.only(origin)` narrows whichever
+it is.
+
+Three rules come out of this:
+
+- **Ask for the highest capability that does the job.** A function that takes `&Http` runs
+  anywhere a request can be made; one that takes `&Net` runs only where there are sockets. The
+  same goes for `Streams` (WebTransport: `quic` natively, the browser's in a worker) over
+  `Datagrams`.
+- **`Io` has the shape of its host.** Which root capabilities exist is per target: a native
+  process has `io.net()`, `io.fs()`, `io.process()`; a wasm worker has `io.http()` and
+  `io.streams()` and no `io.net()`, and code that asks for one there does not compile.
+- **A lower capability can always make the higher one**, never the reverse: `Net` gives `Http`,
+  `Datagrams` gives `Streams`, a `Dir` gives a key-value store. That is narrowing: the higher one
+  can do strictly less.
+
+The protocol logic is the sans-IO core in every case; a provider is only its driver.
+
 ## Tasks and waiting
 
 There is no `async` and no `.await` in a capabilities crate. A function that waits is an ordinary
