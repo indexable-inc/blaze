@@ -58,8 +58,8 @@ use blaze_mem::MemError;
 use hegel::{TestCase, generators as gs};
 
 use super::{
-    BLOCK, Ended, FileId, Give, Kernel, LoadFailure, Loads, Opened, PAGE, PinSet, Pins, Plant, Pool,
-    PoolError, Rank, ReadStep, Reading, Seen, State, Window, Windows, checks_of,
+    BLOCK, Ended, FileId, Give, Kernel, LoadFailure, Loads, Opened, Optimistic, PAGE, PinSet, Pins, Plant,
+    Pool, PoolError, Rank, ReadStep, Reading, Seen, State, Window, Windows, checks_of,
     drive::Loader,
     evict::{Sweep, Visit},
 };
@@ -647,6 +647,7 @@ impl World {
             Actor::Copied { file, rec, seen, copy } => {
                 if self.pool.still(&seen) {
                     self.same(file, rec, &copy, "an optimistic read that validated")?;
+                    self.pool.touch(&seen);
                 }
                 Actor::Idle
             }
@@ -980,6 +981,67 @@ fn replay_one_seed() {
     if let Err(broke) = run(&plan_of(seed), plant) {
         panic!("seed {seed}, Plant::{plant:?}: {broke}");
     }
+}
+
+/// A plan of one file of one short record, with no acts and no faults: for the tests that step a
+/// world by hand.
+fn quiet_plan() -> Plan {
+    let spec = Spec { sizes: vec![300], fill: 3, rank: Rank::Plain };
+    Plan {
+        seed: 7,
+        fail_one_in: 0,
+        fail_reads: false,
+        short_reads: false,
+        hold_reads: false,
+        rot: false,
+        files: vec![spec.clone()],
+        spares: vec![spec],
+        acts: Vec::new(),
+    }
+}
+
+/// Reader 0 reads record 0 of file 0 to its end and lets its pins go.
+fn read_once(world: &mut World, plan: &Plan) {
+    world.read(plan, 0, 0, 0, Keep::Hold).unwrap_or_else(|broke| panic!("{broke}"));
+    for _ in 0..DRAIN {
+        if matches!(world.actors[0], Actor::Holding { .. }) {
+            world.actors[0] = Actor::Idle;
+            return;
+        }
+        world.step(100).unwrap_or_else(|broke| panic!("{broke}"));
+        world.advance(plan, 0).unwrap_or_else(|broke| panic!("{broke}"));
+    }
+    panic!("a read with no faults did not end in {DRAIN} polls");
+}
+
+/// The sweep's policy (the design's section 4): a page read once is taken on the first pass after
+/// its pin is let go; one pinned again, or read optimistically, since it was loaded has its lap.
+#[test]
+fn the_sweep_takes_a_page_read_once_and_passes_over_one_read_again() {
+    let plan = quiet_plan();
+    let mut world = World::new(&plan, Plant::None).unwrap_or_else(|broke| panic!("{broke}"));
+    let page = world.files[0].window.first_page();
+    let visit = |world: &mut World| world.sweep.visit(&world.pool, &world.windows);
+
+    read_once(&mut world, &plan);
+    assert_eq!(visit(&mut world), Visit::Taken { page }, "read once");
+    world.sweep.give(&world.pool).unwrap();
+
+    read_once(&mut world, &plan);
+    read_once(&mut world, &plan);
+    assert_eq!(visit(&mut world), Visit::Passed { page }, "pinned again since its load");
+    assert_eq!(visit(&mut world), Visit::Taken { page }, "its lap over");
+    world.sweep.give(&world.pool).unwrap();
+
+    read_once(&mut world, &plan);
+    let (at, _) = world.place(0, 0);
+    let mut out = [0u8; 16];
+    assert_eq!(world.pool.read_optimistic(at, &mut out), Optimistic::Read);
+    world.same(0, 0, &out, "an optimistic read").unwrap_or_else(|broke| panic!("{broke}"));
+    assert_eq!(visit(&mut world), Visit::Passed { page }, "read optimistically since its load");
+    assert_eq!(visit(&mut world), Visit::Taken { page }, "its lap over");
+    world.sweep.give(&world.pool).unwrap();
+    world.check().unwrap_or_else(|broke| panic!("{broke}"));
 }
 
 /// The loader's thread end to end on a real file system: a file's records pinned through it,

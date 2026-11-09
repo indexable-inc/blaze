@@ -1,10 +1,12 @@
-//! The pool's sweep, as a sans-IO core: CLOCK over the open files' pages, taking the unpinned
-//! and unreferenced ones `Loaded -> Evicting` in batches of up to [`BATCH`] and giving each batch
-//! back to the kernel in as few calls as the system allows ([`super::Give::evict`]), then
-//! `Evicting -> Unloaded` (docs/v2/plan/design/store-pool.md, section 4).
+//! The pool's sweep, as a sans-IO core: a second-chance sweep over the open files' pages, in
+//! address order, taking the unpinned and unreferenced ones `Loaded -> Evicting` in batches of up
+//! to [`BATCH`] and giving each batch back to the kernel in as few calls as the system allows
+//! ([`super::Give::evict`]), then `Evicting -> Unloaded` (docs/v2/plan/design/store-pool.md,
+//! section 4).
 //!
-//! - A page with its CLOCK bit set (a pin since the sweep last came by) has it cleared and is
-//!   passed over: its second chance.
+//! - A page with its second-chance bit set (read again since it was loaded, or since the sweep
+//!   last came by) has it cleared and is passed over. A load leaves the bit clear, so a page read
+//!   once is taken on the first pass after its pin is let go.
 //! - A pinned page is passed over; so is a page loading, being given back, or refused.
 //! - An index page counts four times its bytes: the sweep takes it on one lap in four, since one
 //!   index miss stalls every lookup it covers.

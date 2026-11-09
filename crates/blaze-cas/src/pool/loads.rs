@@ -379,8 +379,9 @@ impl Loads {
             let page = load.first + i as u64;
             let word = pool.word_now(page);
             let next = match end {
-                // The asker's pin, set as the page is published.
-                PageEnd::Good => Word::loaded(word.version(), 1, Referenced::Set),
+                // The asker's pin, set as the page is published. Its second-chance bit stays
+                // clear: the next read that finds it loaded sets it.
+                PageEnd::Good => Word::loaded(word.version(), 1, Referenced::Clear),
                 PageEnd::Again | PageEnd::Bad => {
                     self.giving.push(page);
                     Word::evicting(word.version())

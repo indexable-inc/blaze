@@ -13,8 +13,8 @@
 //! - **Pinned reads** ([`Reading`], [`Pins`], [`PinSet`]) hand out a reference: a pin is a
 //!   count in the word, not a thread's slot, so it may be held across a fiber wait and moved.
 //! - **Optimistic reads** ([`Pool::read_optimistic`]) copy bytes out with
-//!   [`blaze_mem::racy::copy_out`] and check the word did not move: a seqlock that writes no
-//!   shared line.
+//!   [`blaze_mem::racy::copy_out`] and check the word did not move: a seqlock that writes a
+//!   shared line once a page a lap of the sweep ([`Pool::touch`]) and nothing after.
 //!
 //! Records are immutable, so no page is ever dirty: a page is loaded by an explicit read into its
 //! slot ([`blaze_core::Effect::ReadInto`]) that its asker yields on, checked block by block
@@ -97,7 +97,9 @@ pub(crate) enum State {
     Abandoned,
 }
 
-/// Whether a pin sets the page's CLOCK bit, so the sweep passes it over once.
+/// Whether a page's second-chance bit is set, so the sweep passes it over once. A load leaves it
+/// clear, and the first pin or optimistic read that finds the page loaded sets it: a page read
+/// once is the sweep's on its first pass, one read again has its lap (the design's section 4).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Referenced {
     Set,
@@ -574,8 +576,24 @@ impl<G: Give> Pool<G> {
         })
     }
 
-    /// `out.len()` bytes at `at` (at most a page) copied out with no pin and nothing written to a shared
-    /// line: the store's index probes, record headers and block checks.
+    /// The pages `seen` saw marked as read since the sweep last came by, where they are not marked
+    /// already: one compare-and-swap a page a lap of the sweep, and nothing written after. For a
+    /// copy that validated, so a page read only optimistically (every index page) is not taken
+    /// while it is in use. A swap that fails is not tried again: a pin or the sweep moved the word,
+    /// and the next read marks it.
+    pub(crate) fn touch(&self, seen: &Seen) {
+        for i in 0..seen.pages as usize {
+            let word = self.word(seen.first + i as u64);
+            let now = Word(word.load(Ordering::Relaxed));
+            if now.state() == State::Loaded && !now.referenced() {
+                _ = word.compare_exchange(now.0, now.0 | Word::REFERENCED, Ordering::Release, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// `out.len()` bytes at `at` (at most a page) copied out with no pin: the store's index
+    /// probes, record headers and block checks. It writes a shared line only to mark a page the
+    /// sweep has unmarked ([`Pool::touch`]).
     pub(crate) fn read_optimistic(&self, at: u64, out: &mut [u8]) -> Optimistic {
         let seen = match self.begin(at, out.len()) {
             Ok(seen) => seen,
@@ -583,7 +601,10 @@ impl<G: Give> Pool<G> {
         };
         self.copy(at, out);
         match self.still(&seen) {
-            true => Optimistic::Read,
+            true => {
+                self.touch(&seen);
+                Optimistic::Read
+            }
             false => Optimistic::Moved,
         }
     }
