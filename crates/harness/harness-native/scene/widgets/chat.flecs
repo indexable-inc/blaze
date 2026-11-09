@@ -582,7 +582,9 @@ hn {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     TextStyle: {size: $size_peek_body, line: $line_peek_meta, role: 0, bold: 0}
   }
-  // One step a cell took: its kind's glyph (hn.StepKind), then its words, one line.
+  // One step a cell took, one line: its kind's glyph (hn.StepKind), its verb in the UI's words ("Ran", "Read"), then
+  // what it was done to in the code face, a notch smaller and muted (a command, a path: src/app/chat.rs StepWords),
+  // which gives up its room first: a path cut in its middle so its file shows, a command at its end.
   prefab ChatActivityPopStep : ui.Row {
     Flex: {axis: Row, gap: $chat_activity_icon_gap, align: Center, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
@@ -590,8 +592,12 @@ hn {
       Fill: $tone_ink_muted
       Size: {w: {kind: Fixed, value: $chat_activity_icon, min: 0, max: 0}, h: {kind: Fixed, value: $chat_activity_icon, min: 0, max: 0}}
     }
-    words : ui.Lead, Ink {
+    words : ui.Line, Ink {
+      LayoutPriority: {value: 1}
       TextStyle: {size: $size_peek_body, line: $line_peek_meta, role: 0, bold: 0}
+    }
+    what : ui.Lead, Muted {
+      TextStyle: {size: $size_code, line: $line_peek_meta, role: 9, bold: 0}
     }
   }
 

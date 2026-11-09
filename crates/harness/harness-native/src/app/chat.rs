@@ -3008,8 +3008,8 @@ enum PopLine {
     Meta(String),
     /// What it is doing or said last, a few lines.
     Text(String),
-    /// One step a cell took: its kind (`hn.StepKind`) and its words.
-    Step(&'static str, String),
+    /// One step a cell took: its kind (`hn.StepKind`) and its words ([`StepWords`]).
+    Step(&'static str, StepWords),
 }
 
 /// Where the turn in flight's items begin: after the newest message the agent took (one still queued is not its yet).
@@ -3126,6 +3126,50 @@ fn turn_chip(t: &Transcript, now: u64) -> Chip {
 /// The steps the turn from item `since` on took outside its cells, so far, as a card lists them (the newest
 /// [`POP_STEPS`], a line first saying how many came before): files read and written, commands run, agents started,
 /// pages fetched; waiting is bookkeeping and is left out. A failed one says what it could not do.
+/// A step's words as a line says them: the verb in the UI's words ("Ran", "Read", "Couldn't run"), then what it was
+/// done to in the code face (a command, a path), a path cut in its middle so its file shows, a command at its end so its
+/// program shows.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct StepWords {
+    pub verb: String,
+    pub what: String,
+    pub path: bool,
+}
+
+impl StepWords {
+    /// Split `words` (what the step says it does or did) about its target `target` (its command or path; `exec`: a
+    /// command): the words before the target are the verb, the target (a command shortened as a row says it, a path
+    /// from `~`) what. Words that do not name their target are the verb alone.
+    pub(super) fn of(words: &str, target: &str, exec: bool) -> Self {
+        let target = target.lines().next().unwrap_or("").trim();
+        let what = if exec { super::short_cmd(target) } else { tilde_path(target) };
+        // Where the target begins in the words: its first few characters, else its first word (a command the words
+        // shortened past its directory).
+        let head: String = target.chars().take(12).collect();
+        let first = target.split_whitespace().next().unwrap_or("");
+        let at = (!head.is_empty())
+            .then(|| words.find(&head))
+            .flatten()
+            .or_else(|| (!what.is_empty()).then(|| words.find(what.as_str())).flatten())
+            .or_else(|| (!first.is_empty()).then(|| words.find(&format!(" {first}")).map(|i| i + 1)).flatten());
+        match at {
+            Some(i) if !what.is_empty() => {
+                StepWords { verb: words[..i].trim().trim_end_matches(':').to_owned(), what, path: !exec && target.contains('/') }
+            }
+            _ => StepWords { verb: words.trim().to_owned(), what: String::new(), path: false },
+        }
+    }
+}
+
+/// `p` from the home directory as `~` when it is under it.
+fn tilde_path(p: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    match p.strip_prefix(home.trim_end_matches('/')).filter(|r| !home.is_empty() && (r.is_empty() || r.starts_with('/'))) {
+        Some(r) => format!("~{r}"),
+        None => p.to_owned(),
+    }
+}
+
 fn turn_steps(t: &Transcript, since: usize) -> Vec<PopLine> {
     let mut all: Vec<PopLine> = Vec::new(); // alloc: a turn's steps, while its card is up
     for i in &t.items[since.min(t.items.len())..] {
@@ -3133,13 +3177,15 @@ fn turn_steps(t: &Transcript, since: usize) -> Vec<PopLine> {
         let Some(d) = t.details.get(block) else { continue };
         for e in d.effects.iter().filter(|e| e.kind != "wait") {
             let kind = steps::effect_kind(e);
+            let doing = e.doing.trim().trim_end_matches('\u{2026}').trim_end_matches("...").trim();
             let words = match e.status.as_str() {
-                "running" => format!("{}\u{2026}", step_words(e)),
-                "error" => format!("Couldn't: {}", if e.done.is_empty() { step_words(e) } else { e.done.clone() }),
+                "running" if !doing.is_empty() => doing.to_owned(),
+                "running" => step_words(e),
+                "error" => steps::tried(doing, &e.done),
                 _ if e.done.is_empty() => step_words(e),
                 _ => e.done.clone(),
             };
-            all.push(PopLine::Step(kind, words));
+            all.push(PopLine::Step(kind, StepWords::of(&words, &e.target, e.kind == "exec" || e.kind == "build")));
         }
     }
     if all.is_empty() {
@@ -3235,7 +3281,14 @@ fn fill_activity_pop(pop: View<'_>, strip: View<'_>, chips: &[Chip]) {
                 i.icon(&steps::kind_glyph(w, kind));
             }
             if let Some(t) = v.part("words") {
-                t.text(s);
+                t.text(&s.verb);
+            }
+            if let Some(t) = v.part("what") {
+                t.text(&s.what);
+                let mode = harness_native_ui_text_api::Truncate { mode: if s.path { harness_native_ui_text_api::TruncateMode::Middle } else { harness_native_ui_text_api::TruncateMode::Tail } };
+                if t.entity().try_cloned::<&harness_native_ui_text_api::Truncate>() != Some(mode) {
+                    t.entity().set(mode);
+                }
             }
         }
     });
@@ -3727,7 +3780,15 @@ mod tests {
         }
         let c = turn_chip(&t, 4_000 + 360_000);
         assert_eq!((c.words.as_str(), c.took.as_str()), ("blaze check", "6 min"));
-        assert!(c.pop.iter().any(|l| matches!(l, PopLine::Step(_, s) if s == "Read a.rs")), "its card lists the steps so far");
+        assert!(c.pop.iter().any(|l| matches!(l, PopLine::Step(_, s) if s.verb == "Read a.rs")), "its card lists the steps so far");
+        assert!(
+            c.pop.iter().any(|l| matches!(l, PopLine::Step(_, s) if s.verb == "Running" && s.what == "blaze check" && !s.path)),
+            "a command: its verb in words, what it runs in the code face"
+        );
+        let read = StepWords::of("Read /Volumes/x/crates/a.rs", "/Volumes/x/crates/a.rs", false);
+        assert_eq!((read.verb.as_str(), read.what.as_str(), read.path), ("Read", "/Volumes/x/crates/a.rs", true), "a path, cut in its middle");
+        let failed = StepWords::of("Couldn't run git -C /x fetch", "git -C /x fetch", true);
+        assert_eq!((failed.verb.as_str(), failed.what.as_str()), ("Couldn't run", "git -C /x fetch"));
         // The message sent meanwhile waits over the composer, not in the transcript, until Claude takes it.
         assert_eq!(t.queued, vec![2]);
         let (fold, cut) = (HashMap::new(), HashMap::new());

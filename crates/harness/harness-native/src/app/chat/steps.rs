@@ -196,7 +196,7 @@ pub(super) fn run_line(key: &str, run: &group::Run, t: &Transcript, open: bool) 
 
 /// What a failed step could not do, from its words while it ran ("Searching Google for x" → "Couldn't search Google
 /// for x"); its done words when its verb is not one the kernel says.
-fn tried(doing: &str, done: &str) -> String {
+pub(super) fn tried(doing: &str, done: &str) -> String {
     const VERBS: [(&str, &str); 30] = [
         ("Searching", "search"),
         ("Fetching", "fetch"),
