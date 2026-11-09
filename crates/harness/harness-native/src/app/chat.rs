@@ -1491,7 +1491,7 @@ impl App {
             let Row::RefCard(src) = &rows[i].1 else { continue };
             let Some(tag) = harness_native_render::markdown::inline(src).tags.into_iter().next() else { continue };
             if let Some(card) = View::of(w.entity_from_id(id)).part("card") {
-                self.fill_card(card, st, &tag.tag, &cwd);
+                self.fill_card(card, st, &tag.tag, &cwd, true);
             }
         }
         self.fill_chat_mention(pv, sid, st, &cwd, focused);
