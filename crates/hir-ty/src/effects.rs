@@ -384,9 +384,10 @@ impl Walk<'_, '_> {
                 (None, Some(TyKind::FnDef(def, args))) => match def.0 {
                     crate::CallableDefId::FunctionId(func) => {
                         let args = args.no_bound_vars().unwrap();
-                        match self.defers_dispatch && is_dyn_dispatch(self.db, func, args) {
-                            true => None,
-                            false => const_call_error(self.db, self.env, self.constness, func, args),
+                        if self.defers_dispatch && is_dyn_dispatch(self.db, func, args) {
+                            None
+                        } else {
+                            const_call_error(self.db, self.env, self.constness, func, args)
                         }
                     }
                     crate::CallableDefId::StructId(_) | crate::CallableDefId::EnumVariantId(_) => {
