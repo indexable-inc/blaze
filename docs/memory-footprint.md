@@ -104,6 +104,14 @@ in the front end too, not only codegen.
 - `blaze explain memory [build]`: the timeline, the tasks with the largest peaks, the breakdown at the
   peak. `blaze debug profile` answers in frames under the frame limit.
 
+Built on `heap-telemetry-1109` (crate and unit on task spans, and `allocator kept bytes`, are the
+`kept-memory-1109` lane's): counters carry the build under way as `build_id`; the breakdown is
+named counters once a second (`crates/blaze-cargo/src/serve/breakdown.rs`); each `task` span ends
+with `heap_allocated_bytes` and `heap_freed_bytes`; each tag counts its global-heap churn; the heap
+sampler fills `alloc_samples` with one stack per 4 MiB a thread allocates and its call site
+(`crates/blaze-profile/src/heap.rs`); and `blaze explain memory` reads them. `blaze debug profile`'s
+frame limit is not done yet.
+
 ### 2. One measure, one ceiling that holds
 
 Footprint is the one number admission, the front end's release and the ceiling read (rule

@@ -175,6 +175,13 @@ WHERE a.hash IS DISTINCT FROM b.hash ORDER BY item, part
   build first.
 
 **Memory by task.**
+- `blaze explain memory [N]` is the one-screen answer to "who owned the memory": the timeline per
+  minute (footprint, live heap, blaze-mem, kept), the tasks with the largest peaks with crate,
+  unit and global-heap churn (`heap_allocated_bytes` against `peak_bytes`), the breakdown by tag
+  at the footprint's peak (the `tag ... bytes: <tag>` counters), and the call sites that
+  allocated the most (`alloc_samples`, one sample per 4 MiB a thread allocates). Each part is
+  also a view of its own: `memory_timeline`, `memory_peak_tasks`, `memory_at_peak`,
+  `memory_sites`. Counters carry the build under way as `build_id`.
 - `blaze explain task_memory build=N` shows, per task kind, the memory granted against the peak
   held, and how many tasks went over their grant. A kind that is often over its grant has a
   forecast that is too low.
