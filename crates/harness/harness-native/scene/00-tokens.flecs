@@ -8,6 +8,8 @@
 // 2. Nothing moves on its own, and nothing eases. A hover, a highlight, a menu and a sheet are there at once and gone at
 //    once, so no two states ever show together. Work is said in words and a ticking time; the one motion left is the
 //    small status glyph's breath in a chat while something runs (it also keeps that time ticking).
+// The one exception to 1 and 2, asked for by name: the block on a running step's line (ui.Block): pixel art in its
+//    own colours, a game's item icon, that turns to a new face when the step changes and is still between turns.
 // 3. A plate only where something floats or is typed into: one hairline, no shadow, no glass, corners of 8.
 // 4. Type is the hierarchy: size, weight and ink before any box, rule or icon.
 //
@@ -161,6 +163,10 @@ export const line_row = 16
 // corners radius_row.
 export const pill_inset = 2
 export const radius_row = 6
+// ui.Block (prims.flecs): a pixel-art block block_size across (16 texels: 1.5 points each), turning to a new face over
+// block_turn seconds.
+export const block_size = 24
+export const block_turn = 0.32
 // ui.Shimmer's default Sheen (prims.flecs; harness-video's captions use the primitive, the app's own views do not: rule
 // 2): a pass of sheen_think_period seconds, then sheen_think_rest at rest; the band sheen_think_band points either side
 // of its middle, lifting the letters sheen_think_strength of the way to tone_sheen; sheen_think_ease of an ease-in-out;
@@ -290,9 +296,9 @@ export const arch_time_w = 84
 export const tree_linger_s = 5
 // A finished run with no session leaves the live tree this long after it ended (seconds).
 export const archive_after_s = 600
-// How long after it ended a top-level session from before the daemon started (a chat restored after a restart) stays in
-// the tree before the Archive files it (seconds; a week).
-export const archive_past_after_s = 604800
+// How long after it ended a top-level session (a chat that exited, was stopped or lost its daemon) stays in the tree
+// before the Archive files it on its own (seconds; an hour). A message to it in the Archive brings it back.
+export const archive_done_after_s = 3600
 
 // Overlays over the window: the command palette (cmd+K) and the new-object picker (cmd+N), each a card on a scrim
 // (hn.Scrim, hn.OverlayCard in scene/widgets/palette.flecs), there at once and gone at once.
@@ -506,7 +512,7 @@ export const result_snippet_h = 36
 // a wide window.
 export const chat_pad = 24
 // How far the transcript thins out where it scrolls under the composer (and under the pane's top): soft, never a cut line.
-export const chat_fade_len = 28
+export const chat_fade_len = 12
 // A reply streaming in (theme role chat_stream): the transcript follows its end on a spring (landing at once from rest
 // when the end is more than chat_follow_far away); each glyph rises chat_glyph_rise points and fades in over
 // chat_glyph_dur seconds from the frame it came; and words show at an even pace about chat_pace_lag seconds behind what
@@ -636,8 +642,8 @@ export const chat_aside_pad_b = 10
 export const chat_aside_head_gap = 2
 export const chat_aside_close = 20
 export const chat_aside_icon = 10
-// The status bar (foot.status), chat_status_t under the composer's card, its sides chat_composer_pad in (the card's inner
-// edges), no plate; its controls chat_bar_h tall, chat_bar_gap apart: on the left den's model and effort picker
+// The focused chat's status bar, at the sidebar's foot (frame.flecs hn.SideChat; nothing sits under the composer), no
+// plate; its controls chat_bar_h tall, chat_bar_gap apart: on the left den's model and effort picker
 // as one quiet control (hn.ChatPick, src/app/chat/pick.rs: the model's name, its effort as a level meter and a small
 // chevron, chat_pick_h tall, chat_pick_pad_x in, its chevron chat_pick_chevron across chat_pick_gap after the rest, a
 // wash under the pointer); the meter (hn.ChatEffort) chat_effort_lead after the name, chat_effort_h tall, a bar per
@@ -710,8 +716,8 @@ export const chat_pick_swipe_step = 22
 export const chat_pick_commit_secs = 0.35
 export const chat_pick_word_secs = 1.2
 // What the chat pane shows around the composer's words besides the transcript (the foot's insets, the card's insets,
-// the status bar): the words grow to textarea_grow_share of the pane less it.
-export const chat_input_keep = $chat_foot_pad_t + $chat_foot_pad_b + $chat_composer_pad_t + $chat_composer_pad_b + $chat_status_t + $chat_bar_h
+// nothing else): the words grow to textarea_grow_share of the pane less it.
+export const chat_input_keep = $chat_foot_pad_t + $chat_foot_pad_b + $chat_composer_pad_t + $chat_composer_pad_b
 // The meter's popover while the pointer is on it (scene/widgets/context.flecs hn.ChatContextPop, src/app/chat/context.rs):
 // a menu plate (ui.Menu's place over what opened it, its lift and motion) chat_ctx_w wide, chat_ctx_pad in, its lines
 // chat_ctx_gap apart: a head, the window as a donut chat_ctx_pie across with how full it is in its middle (size_ctx_pct;

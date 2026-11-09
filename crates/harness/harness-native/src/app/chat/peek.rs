@@ -465,6 +465,11 @@ impl App {
                     };
                     lines.push(header(ChipIcon::Drawing(files::drawing(kind)), None, path.to_owned()));
                     match peeked {
+                        // A markdown file's lines read as the chat reads markdown (the transcript's own blocks and
+                        // inline faces), never as its source; any other file's as code.
+                        Peeked::Text(text) if matches!(files::kind_of(path), "markdown") => {
+                            lines.push(("body", "hn.PeekMarkdown", Line::Markdown(text.clone())));
+                        }
                         Peeked::Text(text) => {
                             lines.push(("code", "hn.PeekCode", Line::Code { text: text.clone(), file: path.to_owned() }));
                         }

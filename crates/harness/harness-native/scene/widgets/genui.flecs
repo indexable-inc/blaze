@@ -90,6 +90,8 @@ hn {
   // numbers at the end, nulls dim; a foot says how many rows.
   prefab GenTable : hn.ChatGrid {
     Padding: {l: 0, r: 0, t: 0, b: 0}
+    // No guide: a drawn table is not nested under a step's line (ChatGrid's hairline showed as a tick under its card).
+    guide { line { Fill: $tone_clear } }
   }
 
   // A short word on a chip, in a tone. Its ground is opaque and edged, so it reads over any picture as on the page.

@@ -34,6 +34,26 @@ such code is right: it finds candidates, and each one it finds becomes a case th
 before the fix lands. A change to such code without a DST that covers it is unfinished, whoever
 reviewed it.
 
+## invariants-are-stated (rule 53)
+
+What code must always do is written once, in blaze, and every check reads the same text. A contract
+(`requires`, `ensures`) says what one call does. A reference model is a small, pure, sequential
+implementation of what a component means, an ordinary type in the crate under `/// The reference
+model:`. `/// The invariant:` goes on the test whose oracle checks an invariant, and `/// The
+refinement:` on the test that runs an implementation against its model (or another implementation)
+and compares. Each needs a control in the same file, a test named `the_oracle_catches_<the planted
+bug>`. The statement then climbs a ladder without being rewritten: tested (a property test),
+simulated (the deterministic simulation with faults and crashes), model-checked (every interleaving
+to a bound), proved (Lean, from the same contract and model; say it as `/// The invariant (proved:
+<proof file>):`). Durable, concurrent and crash-recovering code is at least simulated; prove the
+sans-IO cores and what must never be wrong; a disagreement between two levels is a bug in one of
+them. `harness/v2/invariants.py` collects every statement with its level into
+`docs/v2/plan/invariants.md` (`write`) and fails the gate (`check`) when one has no control, names a
+missing proof, or the list is stale. Before changing or regenerating code, read the invariants its
+crate states: they are what the new code is judged against.
+
+See [docs/v2/plan.md#11-proof-by-check-not-by-review](../../../docs/v2/plan.md#11-proof-by-check-not-by-review).
+
 <!-- End of the generated rules. Hand-written notes follow. -->
 
 This skill is the one home for how blaze tests its own code. Other skills and docs point here:

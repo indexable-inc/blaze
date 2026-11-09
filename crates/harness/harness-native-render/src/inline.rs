@@ -36,6 +36,7 @@ pub fn install(w: WorldRef<'_>) {
             let form = Form {
                 label: r.label.as_str().to_owned(),
                 mark: r.mark,
+                plain: r.plain,
                 href: r.href.as_str().to_owned(),
                 url: r.url.as_str().to_owned(),
             };

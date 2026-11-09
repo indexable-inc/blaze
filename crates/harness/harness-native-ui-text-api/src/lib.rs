@@ -56,6 +56,9 @@ pub struct InlineRef {
     pub mark: bool,
     pub url: ScriptString,
     pub folder: bool,
+    /// Not a chip but the words themselves, cited (`ui.inline.Cite`): no icon, set in the face of the words around them,
+    /// a dotted underline under them at rest and a solid one under the pointer.
+    pub plain: bool,
 }
 
 /// What the host knows of the thing a live inline component names (a pull request), on an entity of its own the host's
@@ -191,6 +194,16 @@ pub struct Pixelated;
 pub struct Frames {
     pub count: u32,
     pub fps: f32,
+}
+
+/// A small pixel-art item, a game's dropped item, that floats and does what it stands for, named by `face` (what a
+/// step does: `exec` a terminal with a blinking cursor, `read` a book turning a page, `net` the world turning, `think` a
+/// crystal, ...; harness-native-render block.rs draws each, none is a file). When `face` changes the old item sinks away
+/// and the new one rises in over `turn` seconds (0: at once). A picture without a file, its texels on whole device pixels, centred in the node's box.
+#[derive(Component, Clone, Debug, Default, PartialEq)]
+pub struct PixelBlock {
+    pub face: ScriptString,
+    pub turn: f32,
 }
 
 /// blaze's wordmark set on fire (harness-native-blaze), drawn as pixel art over the node's width: its letters start
@@ -358,6 +371,7 @@ hyperion_api_layouts::api_layouts! {
     "Pixelated" => alias Pixelated,
     "Frames" => alias Frames,
     "BlazeMark" => alias BlazeMark,
+    "PixelBlock" => alias PixelBlock,
     "Kip" => alias Kip,
     "KipStand" => alias KipStand,
     "Caret" => alias Caret,
@@ -391,6 +405,7 @@ pub fn register(world: &World) {
     world.component::<Pixelated>().writable();
     world.component::<Frames>().writable();
     world.component::<BlazeMark>().writable();
+    world.component::<PixelBlock>().writable();
     world.component::<Kip>().writable();
     world.component::<KipStand>().writable();
     world.component::<Caret>().writable();

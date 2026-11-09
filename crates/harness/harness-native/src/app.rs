@@ -71,6 +71,7 @@ const SCENE: &[(&str, &str)] = &[
     ("scene/widgets/picker.flecs", include_str!("../scene/widgets/picker.flecs")),
     ("scene/widgets/theme.flecs", include_str!("../scene/widgets/theme.flecs")),
     ("scene/widgets/stats.flecs", include_str!("../scene/widgets/stats.flecs")),
+    ("scene/widgets/sound.flecs", include_str!("../scene/widgets/sound.flecs")),
 ];
 
 /// The terminal's font size at zoom 1 (points) when the Ghostty config sets none (src/app/ghostty.rs).
@@ -93,6 +94,10 @@ enum Do {
     Sidebar,
     Zoom(i32),
 }
+
+/// What cmd+N starts a chat of an agent kind on before the person ever chose for it (kind, model id, effort): Fable 5.2 at
+/// medium for Claude. Any other kind starts as its agent does by default.
+const FIRST_CHOICE: &[(&str, &str, &str)] = &[("claude", "claude-fable-5-2", "medium")];
 
 /// A model and effort remembered for an agent kind (cmd+N's).
 #[derive(Clone, Debug, Default)]
@@ -172,6 +177,9 @@ struct Ids {
     main: u64,
     /// The Archive's row pinned to the sidebar's bottom (pressed, the Archive pane opens).
     archive_row: u64,
+    /// The sidebar's foot: the focused chat's status bar, and the plan meter's slot.
+    side_chat: u64,
+    side_plan: u64,
     /// The overlay on screen and what it is (made again when the mode changes).
     palette: Option<(u64, Mode)>,
     /// The title-bar strip's root (`hn.TitleBar`): only the back chevron, no title.
@@ -284,6 +292,8 @@ pub struct App {
     pub headroom: harness_native_render::hdr::Headroom,
     /// The sidebar tree's scroll (src/app/sidebar.rs).
     tree: sidebar::TreeScroll,
+    /// The Archive list's scroll (app/archive.rs).
+    arch_scroll: archive::ListScroll,
     /// The sidebar tree's rows across frames, for folding rows in and away (src/app/fold.rs).
     fold: fold::TreeFold,
     /// The tree has the keyboard (a tree row was pressed): arrows move in it until a pane is pressed or another key typed.
@@ -374,6 +384,10 @@ fn scene_world() -> Result<World, String> {
     crate::keys::register(&world);
     view::register(&world);
     world.component::<chat::GenFeel>().writable();
+    world.component::<crate::audio::Mood>().writable();
+    world.component::<crate::audio::Instrument>().writable();
+    world.component::<crate::audio::Part>().writable();
+    world.component::<crate::audio::RainOn>().writable();
     world.component::<chat::GenOn>();
     script::install(&world);
     let _ = world.entity_named(APP);
@@ -418,7 +432,7 @@ impl App {
         // (seconds).
         world.set(model::ArchiveAfter {
             ms: (crate::look::width(w, "archive_after").max(0.0) * 1000.0) as u64,
-            past_ms: (crate::look::width(w, "archive_past_after").max(0.0) as f64 * 1000.0) as u64,
+            done_ms: (crate::look::width(w, "archive_done_after").max(0.0) as f64 * 1000.0) as u64,
         });
         // How long a finished child keeps its row (and its done mark) under a folded node (seconds).
         world.set(model::Linger { ms: (crate::look::width(w, "tree_linger_for").max(0.0) * 1000.0) as u64 });
@@ -486,10 +500,13 @@ impl App {
         let tree = side.child("hn.Tree");
         let foot = side.child("hn.SideFoot");
         let link_note = foot.child("hn.LinkNote");
-        let archive_row = foot
+        let status = foot.child("hn.SideStatus");
+        let archive_row = status
             .child("hn.ArchiveRow")
             .props("hn.ArchiveRow", &[("selected", Prop::Bool(false))]);
         archive_row.set(HoverAmt::default());
+        let side_chat = status.child("hn.SideChat");
+        let side_plan = status.child("hn.SidePlan");
         side_clip.child("hn.Seam");
         // The panes: sync_panes makes the first (and swaps each one's prefab by what it shows).
         let main = root.child("hn.Main");
@@ -507,6 +524,8 @@ impl App {
             link_note: link_note.id(),
             main: main.id(),
             archive_row: archive_row.id(),
+            side_chat: side_chat.id(),
+            side_plan: side_plan.id(),
             palette: None,
             bar: bar.id(),
             row_menu: row_menu.id(),
@@ -571,6 +590,7 @@ impl App {
             dark: true,
             headroom: harness_native_render::hdr::Headroom::SDR,
             tree: sidebar::TreeScroll::default(),
+            arch_scroll: archive::ListScroll::default(),
             fold: fold::TreeFold::default(),
             tree_focus: false,
             press: (0, KeyMods::default()),
@@ -784,6 +804,9 @@ impl App {
 
     fn select(&mut self, e: Option<u64>) {
         if e != self.selected() {
+            if e.is_some() {
+                crate::audio::cue("select");
+            }
             self.reset_focused_term();
             self.pressed.clear();
             model::select(self.world.world_ref(), e);
@@ -1046,7 +1069,6 @@ impl App {
                         &[
                             ("name", Prop::Str(&name)),
                             ("under", Prop::Str(&under)),
-                            ("alarm", Prop::Bool(failed || status == "lost")),
                             ("meta", Prop::Str(&meta)),
                             ("why", Prop::Str(&why)),
                             ("hint", Prop::Str(&hint)),
@@ -1056,29 +1078,23 @@ impl App {
                     ]
                     .concat(),
                 );
-                // Before its title, how it stands, not what made it (its kind ends its tooltip): an agent at work is a
-                // filled dot in the strong ink, one up and waiting for the person a hollow ring in the faint ink, one
-                // that ended nothing (its title is already muted). The glyphs are the chat's own statuses
-                // (scene/widgets/chat_status.flecs `running`, `waiting`), still here. A shell keeps its terminal
-                // glyph, since it opens a terminal and not a chat, in the same two inks.
+                // Before its title, a mark only when there is something to say, so a quiet tree is plain words: a dot in
+                // the strong ink while its agent works, the same dot in the error ink when it failed (the row's one
+                // colour: its trailing words stay faint), nothing else. The dot is the chat's own running glyph
+                // (scene/widgets/chat_status.flecs), still here. Which agent it is ends the tooltip. A shell keeps its
+                // terminal glyph, since it opens a terminal and not a chat.
                 if let Some(i) = row.part("kind_icon") {
                     let kind = model::kind_name(o);
-                    if matches!(kind, "claude" | "codex" | "cursor") {
-                        let state = match (busy, status) {
-                            (true, _) => Some("running"),
-                            (false, "running") => Some("waiting"),
-                            _ => None,
-                        };
-                        let glyph = state.map(|s| {
-                            view::prefab(w, &format!("hn.chat_status.{s}"))
-                                .and_then(|p| p.try_cloned::<&harness_native_ui_text_api::Icon>())
-                                .unwrap_or_else(|| panic!("the scene's hn.chat_status.{s} has no Icon (scene/widgets/chat_status.flecs)"))
-                        });
-                        crate::look::show_glyph(i.entity(), glyph.as_ref().map_or("", |g| g.glyph.as_str()));
+                    let agent = matches!(kind, "claude" | "codex" | "cursor");
+                    if agent {
+                        let dot = view::prefab(w, "hn.chat_status.running")
+                            .and_then(|p| p.try_cloned::<&harness_native_ui_text_api::Icon>())
+                            .unwrap_or_else(|| panic!("the scene's hn.chat_status.running has no Icon (scene/widgets/chat_status.flecs)"));
+                        crate::look::show_glyph(i.entity(), if busy || failed { dot.glyph.as_str() } else { "" });
                     } else {
                         crate::look::kind_mark(w, i.entity(), kind);
                     }
-                    let f = tone(w, if busy { "ink_strong" } else { "ink_faint" });
+                    let f = tone(w, if failed && agent { "error" } else if busy { "ink_strong" } else { "ink_faint" });
                     if i.entity().try_cloned::<&Fill>() != Some(f) {
                         i.entity().set(f);
                     }
@@ -1250,6 +1266,7 @@ impl App {
         let Some(key) = self.key_of(e) else { return };
         let pinned = self.pinned.remove(&key);
         if self.closed.insert(key) || pinned {
+            crate::audio::cue("archive");
             let o = self.world.entity_from_id(e);
             o.add(model::Closed::id());
             o.remove(model::Pinned::id());
@@ -1685,13 +1702,51 @@ impl App {
         self.choices.insert(kind.to_owned(), c);
     }
 
-    /// The model and effort last chosen for `kind` (here, else native.json `chat_choice`).
+    /// The model and effort last chosen for `kind` (here, else native.json `chat_choice`); for a kind never chosen for,
+    /// its [`FIRST_CHOICE`] when it has one.
     fn choice_of(&self, kind: &str) -> Choice {
         self.choices.get(kind).cloned().unwrap_or_else(|| {
-            let v = crate::prefs::get("chat_choice").and_then(|v| v.get(kind).cloned()).unwrap_or_default();
-            let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_owned);
-            Choice { model: s("model"), effort: s("effort") }
+            let v = crate::prefs::get("chat_choice").and_then(|v| v.get(kind).cloned());
+            let s = |k: &str| v.as_ref().and_then(|v| v.get(k)).and_then(|x| x.as_str()).map(str::to_owned);
+            match (v.is_some(), FIRST_CHOICE.iter().find(|(k, ..)| *k == kind)) {
+                (false, Some(&(_, model, effort))) => Choice { model: Some(model.to_owned()), effort: Some(effort.to_owned()) },
+                _ => Choice { model: s("model"), effort: s("effort") },
+            }
         })
+    }
+
+    /// The sidebar's foot (hn.SideStatus): how much of the plan is used (the focused chat's agent's, else the agent a
+    /// new chat is of), and, with no chat in front, the chat's status bar emptied (a chat in front fills it, chat.rs).
+    fn sync_side_status(&mut self) {
+        let w = self.world.world_ref();
+        let kind = match self.focused_chat() {
+            Some((_, e, _)) => model::kind_name(w.entity_from_id(e)).to_owned(),
+            None => {
+                let bar = View::of(w.entity_from_id(self.ids.side_chat));
+                for slot in ["pick", "meter", "menu", "pop"] {
+                    if let Some(s) = bar.part(slot) {
+                        view::for_each_of(s, std::iter::empty::<(&str, &str, ())>(), |_, (), _| {});
+                    }
+                }
+                self.chat_kind()
+            }
+        };
+        let windows = self.chat_plan(&kind);
+        chat::plan::fill_plan(View::of(w.entity_from_id(self.ids.side_plan)), &windows, &kind, tone(w, "ink_muted"), model::now_ms() / 1000, false);
+    }
+
+    /// Start the app's sound from the scene's `hn.sound` (scene/widgets/sound.flecs, src/audio.rs): the window's, never
+    /// an offscreen shot's. native.json `sound: false` keeps it silent, `music: false` leaves the music out, `ambient: false` the rain.
+    ///
+    /// # Errors
+    /// The scene's sound is malformed (named), or the system refused the output.
+    pub fn start_sound(&self) -> Result<(), String> {
+        let on = |k: &str| crate::prefs::get(k).and_then(|v| v.as_bool()).unwrap_or(true);
+        if !on("sound") {
+            return Ok(());
+        }
+        let (level, music, ambient, rain, cues, moods) = scene_sound(self.world.world_ref())?;
+        crate::audio::start(level, if on("music") { music } else { 0.0 }, if on("ambient") { ambient } else { 0.0 }, &rain, cues, moods)
     }
 
     /// The agent kind cmd+N starts a chat of: the one last used (here, else native.json `chat_kind`), else the picker's
@@ -1724,6 +1779,7 @@ impl App {
             self.poke();
             return;
         }
+        crate::audio::cue("fresh");
         let kind = self.chat_kind();
         let c = self.choice_of(&kind);
         let kept = self.link.agent_models();
@@ -1799,6 +1855,18 @@ impl App {
         self.browser_frame_start(dt);
         self.step_fold(dt);
         self.step_tree_scroll(dt);
+        // The sound follows the chat in front (src/audio.rs; silent unless the window started it).
+        {
+            let front = self.focused_chat().is_some_and(|(_, _, sid)| self.chats.borrow().get(&sid).is_some_and(|t| t.busy));
+            let agents = self.chats.borrow().values().filter(|t| t.busy).count();
+            // Whether the chat in front's turn ended on an error: its ending rings low, not home.
+            let failed = self.focused_chat().is_some_and(|(_, _, sid)| {
+                self.chats.borrow().get(&sid).is_some_and(|t| t.items.iter().rev().find(|i| !matches!(i, model::chat::Item::TurnEnd { .. })).is_some_and(|i| matches!(i, model::chat::Item::Error { .. })))
+            });
+            crate::audio::scene(agents, front, failed, chat::plan::night(model::now_ms() / 1000));
+        }
+        self.sync_side_status();
+        self.step_archive_scroll();
         self.step_chat_scroll();
         let w = self.world.world_ref();
         if w.try_get::<&Viewport>(|v| (v.w, v.h)) != Some(view) {
@@ -1998,6 +2066,7 @@ impl App {
         let paint = self.paint.borrow();
         crate::look::breathing(self.world.world_ref())
             || paint.shimmering
+            || paint.blocks_live
             || matches!(paint.kip_wake, harness_native_render::kips::Wake::Calm(_))
     }
 
@@ -2398,6 +2467,7 @@ impl App {
 
     /// Open the palette (the shot's `HARNESS_NATIVE_SHOT_PALETTE`).
     pub fn open_palette(&mut self) {
+        crate::audio::cue("open");
         self.palette = Some(Palette::new());
         self.poke();
     }
@@ -2633,6 +2703,77 @@ fn set_if(v: View<'_>, fill: Fill) {
     }
 }
 
+/// The scene's sound (`hn.sound`, scene/widgets/sound.flecs): its master level, its cues and its themes.
+///
+/// # Errors
+/// A part of it is missing or malformed, named.
+/// The scene's sound as [`scene_sound`] reads it: the master, the music's and the rain's levels, the places the rain
+/// falls, the cues and the moods.
+type SceneSound = (f32, f32, f32, Vec<crate::music::RainSource>, Vec<crate::audio::Cue>, HashMap<String, crate::music::Mood>);
+
+fn scene_sound(w: WorldRef<'_>) -> Result<SceneSound, String> {
+    use harness_native_blaze::sound::{Note, Voice as V};
+    use harness_native_ui_timeline_api::{Gain, Lasts, Onset, Pan, Pitch, Sound, Voice};
+    let at = |path: &str| w.try_lookup(path).ok_or_else(|| format!("the scene has no {path} (scene/widgets/sound.flecs)"));
+    let voice = |v: Voice| match v {
+        Voice::Bell => V::Bell,
+        Voice::Mallet => V::Mallet,
+        Voice::Bass => V::Bass,
+        Voice::Click => V::Click,
+        Voice::Thud => V::Thud,
+        Voice::Whoosh => V::Whoosh,
+        Voice::Fire => V::Fire,
+    };
+    let gain = |e: EntityView<'_>| e.try_cloned::<&Gain>().map_or(0.0, |g| g.amp);
+    let lasts = |e: EntityView<'_>| e.try_cloned::<&Lasts>().map_or(0.0, |l| l.dur);
+    let key = at("hn::sound::key")?.try_cloned::<&Pitch>().map(|p| p.hz).filter(|hz| *hz > 0.0).ok_or("hn.sound.key has no Pitch")?;
+    let mut cues = Vec::new(); // alloc: the scene's sounds, read once
+    at("hn::sound::cue")?.each_child(|c| {
+        let mut notes = Vec::new();
+        c.each_child(|n| {
+            if let (Some(s), Some(o)) = (n.try_cloned::<&Sound>(), n.try_cloned::<&Onset>()) {
+                let Pan { pos, sweep } = n.try_cloned::<&Pan>().unwrap_or_default();
+                let freq = n.try_cloned::<&Pitch>().map_or(0.0, |p| p.hz);
+                notes.push(Note { voice: voice(s.voice), at: o.at.max(0.0), dur: lasts(n), freq, amp: gain(n), pan: pos.clamp(-1.0, 1.0), sweep });
+            }
+        });
+        notes.sort_by(|a, b| a.at.total_cmp(&b.at));
+        cues.push(crate::audio::Cue(c.name(), gain(c), notes));
+    });
+    let mut moods = HashMap::new(); // alloc: the scene's moods, read once
+    let mut bad = None;
+    at("hn::sound::mood")?.each_child(|m| {
+        let Some(mood) = m.try_cloned::<&crate::audio::Mood>() else { return };
+        // Its parts: each child that is a part (a `hn.sound.part` prefab's instance, its instrument inherited with it).
+        let mut parts = Vec::new();
+        m.each_child(|c| {
+            let (Some(part), Some(inst)) = (c.try_cloned::<&crate::audio::Part>(), c.try_cloned::<&crate::audio::Instrument>()) else { return };
+            match inst.read(&c.path()).and_then(|i| part.read(c.name(), i, gain(c), &c.path())) {
+                Ok(p) => parts.push(p),
+                Err(e) => bad = Some(e),
+            }
+        });
+        parts.sort_by(|a, b| a.name.cmp(&b.name));
+        match mood.read(parts, &m.path()) {
+            Ok(read) => _ = moods.insert(m.name(), read),
+            Err(e) => bad = Some(e),
+        }
+    });
+    if let Some(e) = bad {
+        return Err(e);
+    }
+    cues.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut rain = Vec::new(); // alloc: the places the rain falls, read once
+    at("hn::sound::ambient")?.each_child(|c| {
+        if let Some(r) = c.try_cloned::<&crate::audio::RainOn>() {
+            rain.push((c.name(), crate::music::RainSource { azimuth: r.azimuth, elevation: r.elevation, distance: r.distance, gain: gain(c), hiss: r.hiss, rate: r.rate, low: r.low, high: r.high, ring: r.ring, bend: r.bend }));
+        }
+    });
+    rain.sort_by(|a, b| a.0.cmp(&b.0));
+    let rain = rain.into_iter().map(|(_, r)| r).collect();
+    Ok((gain(at("hn::sound")?), gain(at("hn::sound::mood")?), gain(at("hn::sound::ambient")?), rain, cues, moods))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2750,6 +2891,21 @@ mod tests {
         frame(z);
         frame(z);
         assert!((drawn(pill).y - laid(rows[2]).y).abs() > 1.0, "a selection still slides");
+    }
+
+    /// The scene's sound reads whole: every step item has a cue, `ready` and `done` ring, and every mood of the ladder is there.
+    #[test]
+    fn the_scenes_sound_reads() {
+        let world = scene_world().unwrap_or_else(|e| panic!("{e}"));
+        let (level, music, ambient, rain, cues, moods) = scene_sound(world.world_ref()).unwrap_or_else(|e| panic!("{e}"));
+        assert!(level > 0.0 && music > 0.0 && ambient > 0.0 && rain.len() >= 3 && rain.iter().all(|r| r.gain > 0.0 && r.high > r.low));
+        for item in ["exec", "read", "edit", "search", "net", "build", "spawn", "wait", "sql", "think"] {
+            assert!(cues.iter().any(|c| c.0 == item && c.1 > 0.0 && !c.2.is_empty()), "no cue for {item}");
+        }
+        assert!(["ready", "done"].iter().all(|n| cues.iter().any(|c| c.0 == *n && !c.2.is_empty())));
+        for mood in ["rest", "calm", "flow", "drive", "battle"] {
+            assert!(moods.get(mood).is_some_and(|m| m.tempo > 0.0 && !m.scale.is_empty() && !m.chords.is_empty() && m.parts.len() >= 2 && m.parts.iter().all(|p| p.level > 0.0 && !p.instrument.partials.is_empty() || p.instrument.noise > 0.0)), "mood {mood} is missing or has no parts");
+        }
     }
 
     /// Every scene script loads, headless (no window, Metal or daemon): the tokens, the primitives, the harness scene and

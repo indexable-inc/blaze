@@ -77,6 +77,12 @@ Path {
   file { InlineRef: {file_icon: true} }
   unknown { InlineRef: {file_icon: true} }
 }
+// A cited phrase, `<Cite loc="/abs/AGENTS.md" line={96}>four at once is a lot</Cite>`: the words themselves, in the face
+// of the words around them, with a dotted underline; under the pointer the underline is solid and the card shows the
+// file from that line (the part cited, not the whole file); a press opens it there. Not a chip: no icon, no plate.
+Cite {
+  InlineRef: {target: "loc", line: "line", file_icon: false, plain: true}
+}
 // A cell's FileRef, by the same name and props as in a ts cell's UI.
 FileRef {
   InlineRef: {target: "path", line: "line", file_icon: true, key: "path:\{path}", feed: "fs"}

@@ -32,7 +32,7 @@ mod genui;
 mod mention;
 mod peek;
 mod pick;
-mod plan;
+pub(super) mod plan;
 mod rename;
 mod steps;
 
@@ -931,7 +931,7 @@ fn rows_nested(t: &Transcript, shows: Shows<'_>) -> (Vec<(String, Row)>, HashSet
         let turn = &g.pieces[w[0]..w[1]];
         let Some((Piece::Item(u), rest)) = turn.split_first().filter(|(p, _)| is_user(p)) else {
             for piece in turn {
-                piece_rows(t, piece, shows, &mut out, &mut nested);
+                piece_rows(t, piece, shows, false, &mut out, &mut nested);
             }
             continue;
         };
@@ -958,7 +958,7 @@ fn rows_nested(t: &Transcript, shows: Shows<'_>) -> (Vec<(String, Row)>, HashSet
         item_rows(t, *u, shows, &mut out);
         if shows.all || !folds {
             for piece in rest {
-                piece_rows(t, piece, shows, &mut out, &mut nested);
+                piece_rows(t, piece, shows, false, &mut out, &mut nested);
             }
             continue;
         }
@@ -983,10 +983,13 @@ fn rows_nested(t: &Transcript, shows: Shows<'_>) -> (Vec<(String, Row)>, HashSet
         if live || open {
             out.push((key.clone(), Row::Steps(steps::turn_line(&key, &calls, t, ended.flatten(), live, open))));
         }
+        // A turn whose steps are one run: the turn's line already is that run's (the same marks), so the run shows
+        // opened under it with no line of its own, never two identical lines one inside the other.
+        let lone_run = rest.iter().filter(|p| matches!(p, Piece::Run(_))).count() == 1;
         for piece in rest {
             if open || item(piece).is_some_and(shown) {
                 let from = out.len();
-                piece_rows(t, piece, shows, &mut out, &mut nested);
+                piece_rows(t, piece, shows, lone_run, &mut out, &mut nested);
                 if open && item(piece).is_none_or(|n| !shown(n)) {
                     nested.extend(out[from..].iter().map(|(k, _)| k.clone()));
                 }
@@ -998,17 +1001,20 @@ fn rows_nested(t: &Transcript, shows: Shows<'_>) -> (Vec<(String, Row)>, HashSet
 
 /// One piece's rows: an item's, or a run as its one line ([`steps::run_line`]) and nothing else until the person opens
 /// it; opened, each cell's outputs ([`steps::outs`], set in by their own prefabs) and each agent tool call and reasoning
-/// between them as its own folded line, nested. A text block shows as far as its cut says ([`Shows`]).
-fn piece_rows(t: &Transcript, piece: &Piece, shows: Shows<'_>, out: &mut Vec<(String, Row)>, nested: &mut HashSet<String>) {
+/// between them as its own folded line, nested. `headless`: the run has no line of its own and shows opened (its turn's
+/// line stands for it). A text block shows as far as its cut says ([`Shows`]).
+fn piece_rows(t: &Transcript, piece: &Piece, shows: Shows<'_>, headless: bool, out: &mut Vec<(String, Row)>, nested: &mut HashSet<String>) {
     let fold = shows.fold;
     match piece {
         Piece::Item(n) => item_rows(t, *n, shows, out),
         Piece::Run(run) => {
             let key = run.key();
-            let open = fold.get(&key).copied().unwrap_or(false);
-            out.push((key.clone(), Row::Steps(steps::run_line(&key, run, t, open))));
-            if !open {
-                return;
+            if !headless {
+                let open = fold.get(&key).copied().unwrap_or(false);
+                out.push((key.clone(), Row::Steps(steps::run_line(&key, run, t, open))));
+                if !open {
+                    return;
+                }
             }
             for &n in &run.items {
                 let from = out.len();
@@ -1326,11 +1332,6 @@ fn composer(pv: View<'_>) -> Option<View<'_>> {
     pv.part("foot")?.part("card")
 }
 
-/// Chat pane `pv`'s status bar under its composer (hn.ChatPane's foot.status: model and effort, context, plan).
-fn status_bar(pv: View<'_>) -> Option<View<'_>> {
-    pv.part("foot")?.part("status")
-}
-
 /// Chat pane `pv`'s composer's words' area (its ui.field.GrowingTextArea).
 fn composer_area(pv: View<'_>) -> Option<View<'_>> {
     composer(pv)?.part("entry")?.part("area")
@@ -1378,7 +1379,7 @@ impl App {
     }
 
     /// The focused pane, its chat session's object and session id, when it shows one.
-    fn focused_chat(&self) -> Option<(u64, u64, u64)> {
+    pub(in crate::app) fn focused_chat(&self) -> Option<(u64, u64, u64)> {
         let p = self.focused_pane()?;
         let o = model::shows(self.world.world_ref(), p)?;
         if model::pane_kind(o) != model::PaneKind::Chat {
@@ -1625,7 +1626,7 @@ impl App {
         if let Some(area) = composer_area(pv) {
             let (shown, [caret, anchor, lo, hi]) = st.draft.shown();
             if let Some(h) = area.part("hint_at").and_then(|a| a.part("hint")) {
-                // Its agent's name ("Message Codex" in a Codex session), and that a message resumes an ended one; an
+                // Nothing while it is empty (how to stop a running turn, while one runs); an
                 // aside's, while it asks nothing past its space, that it stays out of the conversation.
                 let agent = match model::kind_name(w.entity_from_id(e)) {
                     "codex" => "Codex",
@@ -1637,9 +1638,10 @@ impl App {
                 let hint = match (shown.is_empty(), ended) {
                     _ if aside && shown.trim().is_empty() => format!("Ask {agent} aside: the answer stays out of the conversation"),
                     (false, _) => String::new(),
-                    (true, false) if t.busy && !stop.is_empty() => format!("Message {agent} (queued) \u{b7} {stop} to stop"),
-                    (true, false) => format!("Message {agent}"),
-                    (true, true) => format!("Message {agent} to resume"),
+                    // An empty field says nothing: a field under a chat needs no label. Only what is not obvious shows:
+                    // how to stop a running turn.
+                    (true, false) if t.busy && !stop.is_empty() => format!("{stop} to stop"),
+                    (true, _) => String::new(),
                 };
                 h.text(&hint);
             }
@@ -1658,7 +1660,8 @@ impl App {
                 // Grown past its most, it scrolls on its FieldScroll (step_chat_inputs), the caret kept in view.
             }
         }
-        if let Some(bar) = status_bar(pv) {
+        // Its status bar is the sidebar's (hn.SideChat): the chat in front fills it.
+        if let Some(bar) = (self.focused_pane() == Some(pv.id())).then(|| View::of(w.entity_from_id(self.ids.side_chat))) {
             let o = w.entity_from_id(e);
             // The model and the effort it runs with, as den's picker (chat/pick.rs `Label`), the daemon's listing its last
             // say.
@@ -1685,10 +1688,9 @@ impl App {
         let o = w.entity_from_id(e);
         let now = model::now_ms();
         let mut chips: Vec<Chip> = Vec::new(); // alloc: a few chips, a frame
+        // The turn itself has no chip: its line in the transcript shows what it is on (its item, steps.rs), and a
+        // chip saying it again in words was noise. The strip is for what runs beside it: sub-agents and commands.
         let working = t.busy && !ended;
-        if working {
-            chips.push(turn_chip(t, now));
-        }
         let turn_from = t.turn_since.unwrap_or(u64::MAX);
         let chats = self.chats.borrow();
         let mut watch: Vec<u64> = Vec::new(); // alloc: a few sub-agents, a frame
@@ -2208,6 +2210,7 @@ impl App {
                 return;
             }
             let text = std::mem::take(&mut d.text).trim_end().to_owned();
+            crate::audio::cue("send");
             (d.caret, d.anchor, d.marked) = (0, 0, None);
             st.stick = true;
             (text, std::mem::take(&mut st.images))
@@ -3005,8 +3008,10 @@ enum PopLine {
     Head(String),
     /// Model and effort, how long: muted.
     Meta(String),
-    /// What it is doing or said last, a few lines.
+    /// What it is doing, a few plain lines (a command).
     Text(String),
+    /// One block of what it said last, as the transcript shows it: inline markdown, drawn by the same MarkdownText.
+    Said(String),
     /// One step a cell took: its kind (`hn.StepKind`) and its words ([`StepWords`]).
     Step(&'static str, StepWords),
 }
@@ -3073,6 +3078,7 @@ pub(super) fn step_words(e: &model::chat::Effect) -> String {
 /// and how long that step has run), else its running tool's main argument (a shell's command), else what its newest
 /// words or reasoning are, timed from the turn's start. Its card: what the turn is on, how long the turn has run, and
 /// the steps its cells took so far ([`turn_steps`]).
+#[cfg(test)]
 fn turn_chip(t: &Transcript, now: u64) -> Chip {
     let since = turn_start(t);
     let turn = t.turn_since.map(|s| ran_for(now.saturating_sub(s))).unwrap_or_default();
@@ -3222,10 +3228,28 @@ fn agent_pop(name: &str, state: &str, t: Option<&Transcript>, model: &str, effor
     });
     match (doing, said) {
         (Some(d), _) => out.push(PopLine::Text(d)),
-        (None, Some(s)) => out.push(PopLine::Text(clip_lines(s.trim(), POP_LINES, POP_CHARS))),
+        (None, Some(s)) => out.extend(said_lines(s)),
         (None, None) => {}
     }
     out
+}
+
+/// The first blocks of a message, as a card's lines: split as the transcript splits it ([`blocks`]: the same parse) and
+/// each drawn as inline markdown, never its source. A list item leads with its mark, a heading is strong; a code
+/// block, a table or a formula is left to the chat.
+fn said_lines(md: &str) -> Vec<PopLine> {
+    let mut rows = Vec::new();
+    blocks(md.trim(), false, &mut rows);
+    rows.into_iter()
+        .filter_map(|r| match r {
+            Row::Prose(s) | Row::Quote(s) => Some(s),
+            Row::Heading(_, s) => Some(format!("**{s}**")),
+            Row::ListItem { mark, text, .. } => Some(format!("{mark} {text}")),
+            _ => None,
+        })
+        .take(POP_LINES)
+        .map(PopLine::Said)
+        .collect()
 }
 
 /// What a sub-agent's turn in flight does now, in a few words ("Now: cargo build"), None when it says nothing yet.
@@ -3267,12 +3291,13 @@ fn fill_activity_pop(pop: View<'_>, strip: View<'_>, chips: &[Chip]) {
             PopLine::Head(_) => "hn.ChatActivityPopHead",
             PopLine::Meta(_) => "hn.ChatActivityPopMeta",
             PopLine::Text(_) => "hn.ChatActivityPopText",
+            PopLine::Said(_) => "hn.ChatActivityPopSaid",
             PopLine::Step(..) => "hn.ChatActivityPopStep",
         };
         (format!("{}{i}", c.key), prefab, l)
     });
     view::for_each_of(plate, lines, |v, l, _| match l {
-        PopLine::Head(s) | PopLine::Meta(s) | PopLine::Text(s) => {
+        PopLine::Head(s) | PopLine::Meta(s) | PopLine::Text(s) | PopLine::Said(s) => {
             v.text(s);
         }
         PopLine::Step(kind, s) => {
@@ -3446,8 +3471,8 @@ fn row_table(r: &Row) -> Option<view::table::Table> {
 }
 
 /// A JSON value as a typed table cell, `ty` its column's type (mcp/src/shown.ts; "" when none): a null dim, a bool a
-/// mark, a number or a number column's string at the end, a web link its host, a date, nested value or code-ish string in
-/// the code face, else words.
+/// mark, a number or a number column's string at the end, a web link its host, an inline reference (`<Path …/>`) its
+/// chip, a date, nested value or code-ish string in the code face, else words.
 fn value_cell(x: &Value, ty: &str) -> view::table::Cell {
     use view::table::{Cell, Kind};
     let url = |s: &str| (s.starts_with("https://") || s.starts_with("http://")) && !s.contains(char::is_whitespace);
@@ -3456,6 +3481,8 @@ fn value_cell(x: &Value, ty: &str) -> view::table::Cell {
         Value::Bool(b) => Cell::new(Kind::Bool, b.to_string()),
         Value::Number(n) => Cell::new(Kind::Number, n.to_string()),
         Value::String(s) if url(s) => Cell::new(Kind::Url, s.as_str()),
+        // A reference written as the chat's inline component (a row's source): drawn as its chip, as in a reply.
+        Value::String(s) if ["<Path ", "<Symbol ", "<Link ", "<PR ", "<Issue "].iter().any(|t| s.contains(t)) => Cell::new(Kind::Markdown, s.as_str()),
         Value::String(s) if ty == "number" => Cell::new(Kind::Number, s.as_str()),
         Value::String(s) if ty == "nested" || ty == "date" || codeish(s) => Cell::new(Kind::Code, s.as_str()),
         Value::String(s) => Cell::new(Kind::Text, s.as_str()),
@@ -3753,7 +3780,10 @@ mod tests {
         let open = HashMap::from([("turn:0".to_owned(), true)]);
         let (all, nested) = rows_nested(&t, Shows { fold: &open, cut: &cut, all: false });
         assert!(matches!(&all[1].1, Row::Steps(l) if l.key == "turn:0" && l.open && l.words.contains("couldn't")), "opened, its line names what failed");
-        assert!(all.iter().any(|(k, r)| matches!(r, Row::Steps(_)) && k.starts_with("run:") && nested.contains(k)), "opened, its run shows nested");
+        // Its steps are one run, whose line the turn's already is: the run's outputs show under the turn's line, with no
+        // second line of the same marks inside it.
+        assert_eq!(all.iter().filter(|(_, r)| matches!(r, Row::Steps(_))).count(), 1, "opened, one line: {:?}", all.iter().map(|(_, r)| r.prefab()).collect::<Vec<_>>());
+        assert!(all.iter().any(|(k, r)| matches!(r, Row::Out(_)) && nested.contains(k)), "opened, its run's outputs show nested");
         assert_eq!(all.last().map(|(_, r)| r.prefab()), Some("hn.ChatProse"), "the answer stays last");
     }
 

@@ -25,8 +25,29 @@ A report is progressive: the verdict on one line, each part (what changed, risks
 </Column>
 ```
 
+An explanation is a comic: two to four panels side by side, each a `Card` holding one small drawing (SVG, about 160 by
+110, a few simple shapes and lines in tone inks: people as a circle on a line, a thing as its outline, an arrow for
+what changes) and one caption line under it. One moment a panel, in order, so the row reads as a story; the last
+panel lands the point. Draw the idea, never decorate; leave air; no more than a dozen shapes a panel. `Kip` may be the
+character (he has moods).
+
+```svelte
+<Grid columns={3}>
+  <Card>
+    <svg viewBox="0 0 160 110">
+      <circle cx="50" cy="40" r="10" stroke="ink" fill="none" /><line x1="50" y1="50" x2="50" y2="82" stroke="ink" />
+      <circle cx="112" cy="46" r="10" stroke="muted" fill="none" /><line x1="112" y1="56" x2="112" y2="86" stroke="muted" />
+    </svg>
+    <Text tone="muted">Two people, each with their own day.</Text>
+  </Card>
+  <Card>...the next moment...</Card>
+  <Card>...the point...</Card>
+</Grid>
+```
+
 Content: Column, Row, Text (tone: ink muted strong error accent success warning), Markdown, Code, Table (rows of
-records; query, onselect), Badge, Stat (label, value, note), Card (title), Divider and Spacer.
+records; query, onselect; a cell that is an inline reference, `from: '<Path loc="/abs/file.md" line={12}>rule 48</Path>'`,
+draws as its chip: give a row its source that way), Badge, Stat (label, value, note), Card (title), Divider and Spacer.
 
 Charts: <Chart kind="bar|stacked|line|area|scatter|pie|donut" data={[...]} or series={[{name, data}]} labels={[...]}
 unit height /> (pie and donut take data as [{label, value}]); never draw a chart by hand.

@@ -1,0 +1,240 @@
+// The app's sound (src/audio.rs, src/music.rs). Data only.
+// - cue: a soft sound as an agent's step changes, each a few Sounds (harness-native-blaze's voices: Bell, Mallet, Bass,
+//   Click, Thud, Whoosh) with its Onset, Pitch, Lasts, Gain and Pan; a cue's own Gain is how loud it plays. The names
+//   are the step items a running line shows (harness-native-render block.rs: exec read edit search net build spawn wait
+//   sql think), and what the person does or what happens: `ready`, `fresh`, `send`, `select`, `open`,
+//   `archive`, `done`, `fail`.
+// - mood: the music, below.
+// `hn.sound`'s Gain is the master. native.json `sound: false` turns it all off, `music: false` the music, `ambient: false`
+// the rain.
+
+@tree ChildOf
+hn {
+  sound {
+    Gain: {amp: 1}
+    // A3.
+    key { Pitch: {hz: 220} }
+    // Rain (src/music.rs Rain): what plays when nothing else does, and far quieter under the music, so the app is never
+    // silent. You sit in a small wooden room; each child is a place the rain falls, heard from there by ear (on
+    // headphones it comes from that side: the far ear later, quieter and duller). A RainOn says where (degrees round
+    // from ahead, positive to the right; degrees up; metres) and what rain sounds like on it: a steady wash (`hiss`,
+    // between `low` and `high` Hz) and single drops (`rate` a second, each ringing between `low` and `high`, dying at
+    // `ring`, its pitch bending by `bend`). `ambient`'s Gain is the rain's level under the master.
+    ambient {
+      Gain: {amp: 0.05}
+      // The roof, overhead: a dull, dense patter on wood.
+      roof { RainOn: {azimuth: 0, elevation: 80, distance: 2.5, hiss: 0.35, rate: 45, low: 160, high: 480, ring: 48, bend: 0}; Gain: {amp: 1} }
+      // A window at your left: fewer, sharper taps on glass.
+      window { RainOn: {azimuth: -75, elevation: 5, distance: 1.4, hiss: 0.1, rate: 9, low: 2400, high: 5200, ring: 95, bend: 0}; Gain: {amp: 0.6} }
+      // The gutter's drip into a stone basin, behind your right shoulder: slow, each one rising.
+      basin { RainOn: {azimuth: 120, elevation: -25, distance: 3, hiss: 0, rate: 1.4, low: 620, high: 1100, ring: 20, bend: 0.35}; Gain: {amp: 0.7} }
+      // The garden through the open door ahead and a little right: the open rain, far, all wash.
+      garden { RainOn: {azimuth: 25, elevation: 0, distance: 9, hiss: 1, rate: 0, low: 500, high: 6500, ring: 1, bend: 0}; Gain: {amp: 2.2} }
+    }
+
+    cue {
+      // A command: two dry ticks, a prompt and its cursor.
+      exec {
+        Gain: {amp: 0.31}
+        a { Sound: {voice: Click}; Onset: {at: 0}; Pitch: {hz: 880}; Gain: {amp: 0.05}; Pan: {pos: -0.2, sweep: 0} }
+        b { Sound: {voice: Click}; Onset: {at: 0.07}; Pitch: {hz: 1320}; Gain: {amp: 0.05}; Pan: {pos: 0.2, sweep: 0} }
+      }
+      // A file read: a page, two soft bars.
+      read {
+        Gain: {amp: 0.27}
+        a { Sound: {voice: Mallet}; Onset: {at: 0}; Lasts: {dur: 0.8}; Pitch: {hz: 440}; Gain: {amp: 0.05} }
+        b { Sound: {voice: Mallet}; Onset: {at: 0.09}; Lasts: {dur: 0.9}; Pitch: {hz: 554.37}; Gain: {amp: 0.04} }
+      }
+      // An edit: a pencil's three taps.
+      edit {
+        Gain: {amp: 0.27}
+        a { Sound: {voice: Click}; Onset: {at: 0}; Pitch: {hz: 1100}; Gain: {amp: 0.04}; Pan: {pos: -0.3, sweep: 0} }
+        b { Sound: {voice: Click}; Onset: {at: 0.06}; Pitch: {hz: 1100}; Gain: {amp: 0.04} }
+        c { Sound: {voice: Click}; Onset: {at: 0.12}; Pitch: {hz: 1320}; Gain: {amp: 0.05}; Pan: {pos: 0.3, sweep: 0} }
+      }
+      // A search: something passing over, then a find.
+      search {
+        Gain: {amp: 0.25}
+        a { Sound: {voice: Whoosh}; Onset: {at: 0}; Lasts: {dur: 0.35}; Pitch: {hz: 1800}; Gain: {amp: 0.04}; Pan: {pos: -0.5, sweep: 1} }
+        b { Sound: {voice: Click}; Onset: {at: 0.3}; Pitch: {hz: 1760}; Gain: {amp: 0.04}; Pan: {pos: 0.4, sweep: 0} }
+      }
+      // A page fetched: two far bells, a fifth apart.
+      net {
+        Gain: {amp: 0.23}
+        a { Sound: {voice: Bell}; Onset: {at: 0}; Lasts: {dur: 1.6}; Pitch: {hz: 659.25}; Gain: {amp: 0.03}; Pan: {pos: -0.4, sweep: 0} }
+        b { Sound: {voice: Bell}; Onset: {at: 0.12}; Lasts: {dur: 1.8}; Pitch: {hz: 880}; Gain: {amp: 0.025}; Pan: {pos: 0.4, sweep: 0} }
+      }
+      // A build: a low wooden bar, struck once.
+      build {
+        Gain: {amp: 0.35}
+        a { Sound: {voice: Mallet}; Onset: {at: 0}; Lasts: {dur: 1}; Pitch: {hz: 110}; Gain: {amp: 0.06} }
+        b { Sound: {voice: Click}; Onset: {at: 0.01}; Pitch: {hz: 660}; Gain: {amp: 0.05} }
+      }
+      // An agent started: lift-off, then a high bar.
+      spawn {
+        Gain: {amp: 0.27}
+        a { Sound: {voice: Whoosh}; Onset: {at: 0}; Lasts: {dur: 0.6}; Pitch: {hz: 3000}; Gain: {amp: 0.04}; Pan: {pos: -0.6, sweep: 1.2} }
+        b { Sound: {voice: Mallet}; Onset: {at: 0.45}; Lasts: {dur: 1}; Pitch: {hz: 880}; Gain: {amp: 0.05}; Pan: {pos: 0.5, sweep: 0} }
+      }
+      // Waiting: one low bar.
+      wait {
+        Gain: {amp: 0.19}
+        a { Sound: {voice: Mallet}; Onset: {at: 0}; Lasts: {dur: 1.2}; Pitch: {hz: 329.63}; Gain: {amp: 0.04} }
+      }
+      // A query: three rows, rising.
+      sql {
+        Gain: {amp: 0.25}
+        a { Sound: {voice: Mallet}; Onset: {at: 0}; Lasts: {dur: 0.6}; Pitch: {hz: 277.18}; Gain: {amp: 0.04} }
+        b { Sound: {voice: Mallet}; Onset: {at: 0.06}; Lasts: {dur: 0.6}; Pitch: {hz: 329.63}; Gain: {amp: 0.04} }
+        c { Sound: {voice: Mallet}; Onset: {at: 0.12}; Lasts: {dur: 0.8}; Pitch: {hz: 440}; Gain: {amp: 0.04} }
+      }
+      // Thinking: one far bell.
+      think {
+        Gain: {amp: 0.15}
+        a { Sound: {voice: Bell}; Onset: {at: 0}; Lasts: {dur: 2}; Pitch: {hz: 554.37}; Gain: {amp: 0.03} }
+      }
+      // A new chat: a page turned and two bars opening upward.
+      fresh {
+        Gain: {amp: 0.3}
+        a { Sound: {voice: Whoosh}; Onset: {at: 0}; Lasts: {dur: 0.25}; Pitch: {hz: 2400}; Gain: {amp: 0.02}; Pan: {pos: -0.4, sweep: 0.8} }
+        b { Sound: {voice: Mallet}; Onset: {at: 0.08}; Lasts: {dur: 1.2}; Pitch: {hz: 440}; Gain: {amp: 0.045}; Pan: {pos: -0.2, sweep: 0} }
+        c { Sound: {voice: Mallet}; Onset: {at: 0.2}; Lasts: {dur: 1.6}; Pitch: {hz: 659.25}; Gain: {amp: 0.045}; Pan: {pos: 0.2, sweep: 0} }
+      }
+      // A message sent: one soft bar, rising.
+      send {
+        Gain: {amp: 0.22}
+        a { Sound: {voice: Mallet}; Onset: {at: 0}; Lasts: {dur: 0.7}; Pitch: {hz: 554.37}; Gain: {amp: 0.04} }
+        b { Sound: {voice: Mallet}; Onset: {at: 0.07}; Lasts: {dur: 0.9}; Pitch: {hz: 739.99}; Gain: {amp: 0.035} }
+      }
+      // The selection moved: a wooden tick, barely there.
+      select {
+        Gain: {amp: 0.1}
+        a { Sound: {voice: Click}; Onset: {at: 0}; Pitch: {hz: 740}; Gain: {amp: 0.03} }
+      }
+      // The palette opened: a small breath.
+      open {
+        Gain: {amp: 0.14}
+        a { Sound: {voice: Whoosh}; Onset: {at: 0}; Lasts: {dur: 0.2}; Pitch: {hz: 3200}; Gain: {amp: 0.02}; Pan: {pos: 0, sweep: 0} }
+      }
+      // Filed in the Archive: two bars stepping down, put away.
+      archive {
+        Gain: {amp: 0.2}
+        a { Sound: {voice: Mallet}; Onset: {at: 0}; Lasts: {dur: 0.6}; Pitch: {hz: 440}; Gain: {amp: 0.04} }
+        b { Sound: {voice: Mallet}; Onset: {at: 0.09}; Lasts: {dur: 1}; Pitch: {hz: 329.63}; Gain: {amp: 0.04} }
+      }
+      // The turn ended on an error: two low bars, the second a step under, unresolved.
+      fail {
+        Gain: {amp: 0.28}
+        a { Sound: {voice: Mallet}; Onset: {at: 0}; Lasts: {dur: 1.2}; Pitch: {hz: 220}; Gain: {amp: 0.05} }
+        b { Sound: {voice: Mallet}; Onset: {at: 0.16}; Lasts: {dur: 1.8}; Pitch: {hz: 196}; Gain: {amp: 0.05} }
+      }
+      // The app is up and its sound is ready: one far bell.
+      ready {
+        Gain: {amp: 0.25}
+        a { Sound: {voice: Bell}; Onset: {at: 0}; Lasts: {dur: 3}; Pitch: {hz: 440}; Gain: {amp: 0.03} }
+      }
+      // The turn ended: the chord, climbing home.
+      done {
+        Gain: {amp: 0.39}
+        a { Sound: {voice: Mallet}; Onset: {at: 0}; Lasts: {dur: 1}; Pitch: {hz: 440}; Gain: {amp: 0.05}; Pan: {pos: -0.3, sweep: 0} }
+        b { Sound: {voice: Mallet}; Onset: {at: 0.1}; Lasts: {dur: 1}; Pitch: {hz: 554.37}; Gain: {amp: 0.05} }
+        c { Sound: {voice: Mallet}; Onset: {at: 0.2}; Lasts: {dur: 1.2}; Pitch: {hz: 659.25}; Gain: {amp: 0.05}; Pan: {pos: 0.3, sweep: 0} }
+        d { Sound: {voice: Bell}; Onset: {at: 0.32}; Lasts: {dur: 2.2}; Pitch: {hz: 880}; Gain: {amp: 0.035} }
+      }
+    }
+
+    // The music (src/music.rs): a band that plays itself. Three kinds of thing, each built from the one before:
+    // - inst: an instrument, a recipe for one note. Partials (pairs: a ratio to the pitch and a level), an attack, a
+    //   decay (or `hold`: the note is held, then dies), `damp` (higher partials die faster: a string), FM (a bell), a
+    //   pitch that drops in (a drum), noise (a hat), and how much goes to the room.
+    // - part: an instrument with a role in the bar. A part prefab inherits its instrument's prefab and adds a Part:
+    //   chord (hold the bar's chord), root (its root), arp (climb it), motif (the lead's melody, which the band writes
+    //   and varies), sparkle (a chord note now and then, by `chance`) or hit (a drum at `hz`), on `steps` of the 16.
+    // - mood: a tempo, a scale by day and by night, a chord a bar (steps of the scale), and the parts that play in it,
+    //   each an instance of a part prefab at its own Gain. src/audio.rs `scene` climbs the moods, calmest first, as the
+    //   step in front gets busier and more agents work at once. A part with the same name in two moods is the same
+    //   player: going from one to the other its level glides; one the next mood lacks fades out. Scale and chords change
+    //   on the bar line. A new instrument, part or mood is entities here; nothing in Rust lists them.
+    inst {
+      // A soft swell: three partials, the upper two a hair out of tune so it moves.
+      prefab Pad { Instrument: {partials: "1 0.33  2.004 0.14  2.997 0.06", attack: 1.2, decay: 1.4, hold: true, damp: 0, fm: 0, fm_ratio: 1, fm_decay: 1, drop: 0, drop_rate: 1, noise: 0, noise_decay: 1, room: 0.35} }
+      // A round low note.
+      prefab Bass { Instrument: {partials: "1 1  2 0.28", attack: 0.008, decay: 2.6, hold: false, damp: 0, fm: 0, fm_ratio: 1, fm_decay: 1, drop: 0, drop_rate: 1, noise: 0, noise_decay: 1, room: 0.12} }
+      // A plucked string, a koto's: six harmonics, the high ones gone first.
+      prefab Pluck { Instrument: {partials: "1 0.7  2.002 0.35  3.005 0.23  4.01 0.17  5.015 0.14  6.02 0.11", attack: 0.0025, decay: 1.6, hold: false, damp: 1.3, fm: 0, fm_ratio: 1, fm_decay: 1, drop: 0, drop_rate: 1, noise: 0, noise_decay: 1, room: 0.32} }
+      // A small bell: one partial bent by FM as it is struck.
+      prefab Bell { Instrument: {partials: "1 0.6", attack: 0.003, decay: 1.1, hold: false, damp: 0, fm: 1.6, fm_ratio: 3.5, fm_decay: 2.2, drop: 0, drop_rate: 1, noise: 0, noise_decay: 1, room: 0.45} }
+      // A kick: a sine whose pitch falls in.
+      prefab Kick { Instrument: {partials: "1 1", attack: 0.001, decay: 9, hold: false, damp: 0, fm: 0, fm_ratio: 1, fm_decay: 1, drop: 90, drop_rate: 32, noise: 0, noise_decay: 1, room: 0.03} }
+      // A low drum, a taiko far off: a falling pitch and a stick's click.
+      prefab Taiko { Instrument: {partials: "1 1", attack: 0.001, decay: 6.5, hold: false, damp: 0, fm: 0, fm_ratio: 1, fm_decay: 1, drop: 50, drop_rate: 22, noise: 0.25, noise_decay: 70, room: 0.25} }
+      // A hat: noise, very short.
+      prefab Hat { Instrument: {partials: "", attack: 0.001, decay: 55, hold: false, damp: 0, fm: 0, fm_ratio: 1, fm_decay: 1, drop: 0, drop_rate: 1, noise: 0.5, noise_decay: 55, room: 0.03} }
+    }
+    part {
+      prefab Pad : hn.sound.inst.Pad { Part: {role: "chord", steps: "0", octave: 1, pan: 0, chance: 1, beats: 4, hz: 0} }
+      prefab Bass : hn.sound.inst.Bass { Part: {role: "root", steps: "0 8", octave: 0, pan: 0, chance: 1, beats: 1, hz: 0} }
+      prefab BassPush : hn.sound.inst.Bass { Part: {role: "root", steps: "0 6 8 14", octave: 0, pan: 0, chance: 1, beats: 1, hz: 0} }
+      prefab Arp : hn.sound.inst.Pluck { Part: {role: "arp", steps: "0 2 4 6 8 10 12 14", octave: 2, pan: 0, chance: 1, beats: 1, hz: 0} }
+      prefab ArpFast : hn.sound.inst.Pluck { Part: {role: "arp", steps: "0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15", octave: 2, pan: 0, chance: 1, beats: 1, hz: 0} }
+      prefab Lead : hn.sound.inst.Pluck { Part: {role: "motif", steps: "", octave: 2, pan: 0, chance: 1, beats: 1, hz: 0} }
+      prefab LeadSparse : hn.sound.inst.Pluck { Part: {role: "motif", steps: "", octave: 2, pan: 0, chance: 0.3, beats: 1, hz: 0} }
+      prefab BellsRare : hn.sound.inst.Bell { Part: {role: "sparkle", steps: "0 8", octave: 3, pan: 0, chance: 0.1, beats: 1, hz: 0} }
+      prefab Bells : hn.sound.inst.Bell { Part: {role: "sparkle", steps: "0 4 8 12", octave: 3, pan: 0, chance: 0.22, beats: 1, hz: 0} }
+      prefab Kick : hn.sound.inst.Kick { Part: {role: "hit", steps: "0 8", octave: 0, pan: 0, chance: 1, beats: 1, hz: 46} }
+      prefab KickBusy : hn.sound.inst.Kick { Part: {role: "hit", steps: "0 3 8 11", octave: 0, pan: 0, chance: 1, beats: 1, hz: 46} }
+      prefab Taiko : hn.sound.inst.Taiko { Part: {role: "hit", steps: "4 12", octave: 0, pan: 0.2, chance: 1, beats: 1, hz: 96} }
+      prefab TaikoBusy : hn.sound.inst.Taiko { Part: {role: "hit", steps: "4 12 14", octave: 0, pan: 0.2, chance: 1, beats: 1, hz: 96} }
+      prefab Hat : hn.sound.inst.Hat { Part: {role: "hit", steps: "2 6 10 14", octave: 0, pan: -0.3, chance: 1, beats: 1, hz: 0} }
+      prefab HatBusy : hn.sound.inst.Hat { Part: {role: "hit", steps: "1 2 3 5 6 7 9 10 11 13 14 15", octave: 0, pan: -0.3, chance: 1, beats: 1, hz: 0} }
+    }
+    mood {
+      Gain: {amp: 0.55}
+      // No agent at work: ambient music, nearly nothing: a slow pad, a plucked note once in a long while, a far bell.
+      rest {
+        Mood: {tempo: 48, scale: "0 2 4 7 9", night: "0 2 3 7 8", chords: "0 3 0 2"}
+        pad : hn.sound.part.Pad { Gain: {amp: 0.04} }
+        lead : hn.sound.part.LeadSparse { Gain: {amp: 0.045} }
+        bells : hn.sound.part.BellsRare { Gain: {amp: 0.025} }
+      }
+      // Thinking, reading, waiting: a pad, a slow plucked line, far bells. Tea.
+      calm {
+        Mood: {tempo: 60, scale: "0 2 4 7 9", night: "0 2 3 7 8", chords: "0 2 3 0"}
+        pad : hn.sound.part.Pad { Gain: {amp: 0.06} }
+        lead : hn.sound.part.Lead { Gain: {amp: 0.065} }
+        bells : hn.sound.part.Bells { Gain: {amp: 0.03} }
+      }
+      // Editing, searching, fetching: a bass comes in under it and the chord starts to move.
+      flow {
+        Mood: {tempo: 80, scale: "0 2 4 7 9", night: "0 2 3 7 8", chords: "0 3 2 4"}
+        pad : hn.sound.part.Pad { Gain: {amp: 0.05} }
+        bass : hn.sound.part.Bass { Gain: {amp: 0.12} }
+        arp : hn.sound.part.Arp { Gain: {amp: 0.055} }
+        lead : hn.sound.part.Lead { Gain: {amp: 0.08} }
+        bells : hn.sound.part.Bells { Gain: {amp: 0.015} }
+      }
+      // A command, a build, a new agent: quicker, the drums in.
+      drive {
+        Mood: {tempo: 104, scale: "0 2 4 7 9", night: "0 2 3 7 8", chords: "0 0 3 4"}
+        pad : hn.sound.part.Pad { Gain: {amp: 0.04} }
+        bass : hn.sound.part.BassPush { Gain: {amp: 0.18} }
+        arp : hn.sound.part.ArpFast { Gain: {amp: 0.09} }
+        lead : hn.sound.part.Lead { Gain: {amp: 0.09} }
+        kick : hn.sound.part.Kick { Gain: {amp: 0.25} }
+        taiko : hn.sound.part.Taiko { Gain: {amp: 0.16} }
+        hat : hn.sound.part.Hat { Gain: {amp: 0.045} }
+      }
+      // Many agents at once: the minor scale, fast, everything up.
+      battle {
+        Mood: {tempo: 132, scale: "0 3 5 7 10", night: "0 3 5 7 10", chords: "0 0 2 3"}
+        pad : hn.sound.part.Pad { Gain: {amp: 0.033} }
+        bass : hn.sound.part.BassPush { Gain: {amp: 0.24} }
+        arp : hn.sound.part.ArpFast { Gain: {amp: 0.12} }
+        lead : hn.sound.part.Lead { Gain: {amp: 0.12} }
+        kick : hn.sound.part.KickBusy { Gain: {amp: 0.45} }
+        taiko : hn.sound.part.TaikoBusy { Gain: {amp: 0.3} }
+        hat : hn.sound.part.HatBusy { Gain: {amp: 0.08} }
+      }
+    }
+  }
+}

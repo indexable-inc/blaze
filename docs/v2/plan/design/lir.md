@@ -215,7 +215,7 @@ an integer" set is replaced by pointer operations, and the operations CLIF lacks
   flags, as rustc gives LLVM), `switch` (MIR's `SwitchInt`; LLVM's `switch`, a stencil jump
   table), `return`, `unreachable`, `trap` (with a code), `call`, `call_indirect`, `invoke` and
   `invoke_indirect` (a call with an unwind edge, which ends its block), `tail_call` and
-  `tail_call_indirect` (`become`, [tail-calls.md](../lanes/codegen/tail-calls.md)), `asm_br`
+  `tail_call_indirect` (`become`, [tail-calls.md](tail-calls.md)), `asm_br`
   (an `asm!` with `label` operands), `resume`.
 - **Facts as instructions:** `assume` (`core::intrinsics::assume`, `assert_unchecked`); `freeze`
   (where the builder needs a value LLVM may not treat as poison).
@@ -544,7 +544,7 @@ Deleted with no replacement:
 ### Stencils
 
 `blaze_stencil::compile_to(func: &lir::Func, target, sink)`. The patcher's passes
-([stencil.md](../lanes/fastcompile/stencil.md)) are unchanged in kind: scan, select, slots,
+are unchanged in kind: scan, select, slots,
 frame, size, emit, edges, finish. They read columns instead of matching `ir::InstructionData`.
 
 - **Keying.** `Shape { op: lir::Op, ty: lir::Ty, aux, srcs, dst }`, packed by `Shape::key` as
@@ -666,7 +666,7 @@ This work is independent of LIR and lands first (lane `llvm-memory`).
 
 ### wasm, for proc macros
 
-A proc macro is a `wasm32-wasip1` module ([macros.md](../lanes/usercode/macros.md)), and so is
+A proc macro is a `wasm32-wasip1` module, and so is
 the code of a user's `--target wasm32-wasip1` build and of the wasm seed. That code comes from
 LIR through blaze's own emitter: `wasm::lower` and `wasm/v128.rs` ported to read LIR,
 moved to `crates/blaze-lir-wasm`. It does not come from LLVM, since the pinned LLVM has no
@@ -970,10 +970,5 @@ disk").
 
 - [code-identity.md](code-identity.md): the compile identity the `LirKey` starts from.
 - [caching.md](caching.md): keys of content only.
-- [../lanes/fastcompile/stencil.md](../lanes/fastcompile/stencil.md): the patcher, whose input
-  this replaces.
-- [../lanes/codegen/speed-backend-llvm.md](../lanes/codegen/speed-backend-llvm.md),
-  [../lanes/codegen/speed-backend-intrinsics.md](../lanes/codegen/speed-backend-intrinsics.md):
-  the LLVM path and the intrinsics work this makes native.
-- [../lanes/codegen/icf.md](../lanes/codegen/icf.md): folding before and after codegen.
-- [../lanes/usercode/macros.md](../lanes/usercode/macros.md): proc macros as wasm.
+- [icf.md](icf.md): folding before and after codegen.
+- [tail-calls.md](tail-calls.md): `become`, which `tail_call` carries.

@@ -11,6 +11,8 @@ name = "harness-native"
 path = "src/main.rs"
 
 [dependencies]
+harness-native-blaze = { path = "../harness-native-blaze" }
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 harness-native-model = { path = "../harness-native-model" }
 harness-native-ui-inline = { path = "../harness-native-ui-inline" }
 harness-native-flecs = { path = "../harness-native-flecs", features = ["json"] }

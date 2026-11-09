@@ -628,6 +628,13 @@ ui {
   prefab caret {
     CaretLook: {w: $caret_w, h: $caret_h, radius: $caret_radius, glide: $caret_glide, hold: $caret_hold, blink: $caret_blink, fade: $caret_fade}
   }
+  // A small pixel-art item, a game's dropped item (PixelBlock, harness-native-render block.rs): its face names what it
+  // is and does (`exec` a terminal, `read` a book, `net` the world turning, `think` a crystal, ...); it floats and moves
+  // while shown; set another face and the old item sinks as the new one rises in over block_turn seconds. block_size across, its texels on whole device pixels.
+  prefab Block : ui.Node {
+    PixelBlock: {face: "cell", turn: $block_turn}
+    Size: {w: {kind: Fixed, value: $block_size, min: 0, max: 0}, h: {kind: Fixed, value: $block_size, min: 0, max: 0}}
+  }
   // Words with light running through them, the sign that something is at work (a working row's title): a Sheen
   // (harness-native-ui-look-api; drawn by harness-native-render paint.rs, glyph by glyph) sweeps a soft band left to right
   // through the letters, lifting them toward tone_sheen, and rests between passes; under Reduce Motion they sit steadily a

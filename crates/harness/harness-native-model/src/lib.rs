@@ -16,8 +16,7 @@
 //! - [`Archived`] on an object takes it out of the tree and into the Archive pane. The `ArchiveRule` system sets it from
 //!   tags and relations alone: [`Closed`] (cmd+W) always, [`Pinned`] never, else a finished object whose parent session
 //!   ended or left the tree, an [`Orphan`] run, a finished run on the device [`ArchiveAfter`] it ended, and a finished
-//!   top-level [`Past`] session (one from before the daemon started, a chat restored after a restart) `past_ms` after it
-//!   ended. A running object and any other finished top-level session stay.
+//!   top-level session `done_ms` after it ended. Only what runs stays on its own.
 //! - The Archive pane shows the [`ArchiveView`] entity ([`ARCHIVE`]); older runs come a page at a time ([`Paged`],
 //!   [`History`]) rather than all at once.
 //! - `(Selected, object)` on the app entity is the selection (exclusive). Each pane node of the view holds the exclusive
@@ -167,8 +166,7 @@ pub struct Closed;
 pub struct Pinned;
 
 /// On a session: it ended before the daemon started (the daemon's `past`: a chat from before a restart, listed from its
-/// index). The rule treats it as any finished session of this daemon's, except that a top-level one leaves the tree for
-/// the Archive [`ArchiveAfter`]'s `past_ms` after it ended; resumed, it runs again where it is.
+/// index). The rule treats it as any finished session of this daemon's; resumed, it runs again where it is.
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Past;
 
@@ -210,13 +208,13 @@ pub const ARCHIVE: &str = "views::archive";
 pub struct ArchiveAfter {
     /// A finished run on the device (no session).
     pub ms: u64,
-    /// A finished top-level [`Past`] session (one from before the daemon started).
-    pub past_ms: u64,
+    /// A finished top-level session.
+    pub done_ms: u64,
 }
 
 impl ArchiveAfter {
-    /// Ten minutes for a run, a week for a past session.
-    pub const DEFAULT: Self = Self { ms: 600_000, past_ms: 7 * 24 * 3_600_000 };
+    /// Ten minutes for a run, an hour for a session.
+    pub const DEFAULT: Self = Self { ms: 600_000, done_ms: 3_600_000 };
 }
 
 /// Singleton: how long a finished child stays among a folded node's rows after it ended (the scene's `tree_linger`
@@ -580,9 +578,8 @@ pub fn now_ms() -> u64 {
 /// - Running: kept.
 /// - Finished, under a session: archived once that session ended or left the tree (its runs go with it).
 /// - A finished run that is an [`Orphan`]: archived; one on the device: archived [`ArchiveAfter`] it ended.
-/// - A finished top-level [`Past`] session (it ended before the daemon started): archived [`ArchiveAfter`]'s `past_ms`
-///   after it ended (so a restart leaves recent chats in the tree, dimmed by their status like any finished session).
-/// - Any other finished top-level session: kept until it is closed.
+/// - A finished top-level session (of this daemon or from before it started): archived [`ArchiveAfter`]'s `done_ms`
+///   after it ended, so the tree keeps what runs and what just ended and files the rest on its own.
 ///
 /// One level a frame: a session archived this frame takes its runs with it the next.
 fn install_rule(world: WorldRef<'_>) {
@@ -602,8 +599,7 @@ fn install_rule(world: WorldRef<'_>) {
             match e.parent().filter(|p| p.has(Object::id())) {
                 Some(p) => p.has(Archived::id()) || !is_running(p),
                 None if e.has(Run::id()) => e.has(Orphan::id()) || ended().saturating_add(after.ms) <= now_ms(),
-                None if e.has(Past::id()) => ended().saturating_add(after.past_ms) <= now_ms(),
-                None => false,
+                None => ended().saturating_add(after.done_ms) <= now_ms(),
             }
         };
         if e.has(Archived::id()) != want {
