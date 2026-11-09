@@ -1983,8 +1983,8 @@ impl App {
                 // A press on a cell's Shader or Video (chat/genui/surface.rs): play, mute, resume.
                 self.media_action(m);
             } else if let Some(target) = a.strip_prefix("open:") {
-                // A link in a view (the browser), or a file (a cell's FileRef) in the app its kind opens in, at its line.
-                crate::open::open(target, alt);
+                // A link in a view (in the browser pane), or a file (a cell's FileRef) in the app its kind opens in, at its line.
+                self.open_target(target, alt);
             } else if a == "chat:focus" {
                 self.tree_focus = false;
             } else if a == "pal:close" {

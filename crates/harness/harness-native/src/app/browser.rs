@@ -22,8 +22,10 @@
 //! has it the keys go there (`AppUp::Key` with the Mac key code and the characters) after the bindings in ctx.Browser
 //! (cmd+L, cmd+[, cmd+], cmd+R: scene/20-keys.flecs), and the input method's work goes through the window's
 //! NSTextInputClient path as `AppUp::Ime` (setMarkedText: Set, insertText: Commit, unmarkText: Finish). A card's press
-//! opens its view in the pane; a `web:open:<url>` action (a check's row on a pull request's hover card) opens that page
-//! in the pane as a view of its own.
+//! opens its view in the pane; a `web:open:<url>` action (a check's row on a pull request's hover card), an `open:` web
+//! link and a chat's link or chip (a pull request, an issue, a page) open that page in the pane as a view of its own
+//! ([`App::open_target`]), and so does a file a chat or a cell names, as a `file://` page; Option-pressed, either opens
+//! outside (the system's browser, the file's own app).
 use super::*;
 use harness_mach::iosurface::Surface as IoSurface;
 use harness_mach::{Msg, RecvPort, SendRight, Source};
@@ -38,6 +40,19 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, TryRecvError};
+
+/// The `file://` URL of absolute path `path`: each byte outside the unreserved set and `/` percent-encoded.
+fn file_url(path: &str) -> String {
+    let mut out = String::from("file://");
+    for b in path.bytes() {
+        if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
 
 /// The pane's state, on `hn.web` (scene/widgets/web.flecs): the view it shows (0 none yet), whether it is open, its width
 /// in points (0: hn.WebPane's).
@@ -408,6 +423,29 @@ impl App {
         let s = self.web();
         self.set_web(WebState { open: true, ..s });
         self.web_focus_page();
+    }
+
+    /// Open what a press on a link names (an `open:` action, a chat's link or inline component: `<url>`, `<path>` or
+    /// `<line>:<path>`) in the pane on the right, as a view of its own: a web page, or a file or folder as a `file://`
+    /// page. With Option held (`alt`) it opens outside instead, as crate::open says: a page in the system's browser, a
+    /// file in the app its kind opens in, at its line.
+    pub(crate) fn open_target(&mut self, target: &str, alt: bool) {
+        if alt {
+            return crate::open::open(target, false);
+        }
+        let path = match target.split_once(':') {
+            Some((n, rest)) if rest.starts_with('/') && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => rest,
+            _ => target,
+        };
+        if target.starts_with("https://") || target.starts_with("http://") || target.starts_with("file://") {
+            self.web_open(target);
+        } else if path.starts_with('/') {
+            self.web_open(&file_url(path));
+        } else {
+            eprintln!("harness-native: open {target:?}: not a web link or an absolute path");
+            return;
+        }
+        self.poke();
     }
 
     /// Open the pane on `view`, its page focused.
