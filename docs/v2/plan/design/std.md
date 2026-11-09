@@ -121,6 +121,69 @@ and no second copy of each API.
 A sans-IO core takes no `Io` at all. It takes bytes and returns bytes and effects, as rule
 `sans-io-cores` already asks; with capabilities that is a fact of its signature, not a lint.
 
+## The boundary: ops out, events in
+
+Under every capability is one boundary between a program and whatever hosts it. The program
+writes **ops** (open, read, send, connect, set a timer); the host answers with **events**
+(opened, data, sent, accepted, a datagram, the timer fired). Both are fixed-layout records in two
+rings, exchanged in batches, each op carrying a token its event returns. Nothing else crosses.
+
+The io_uring driver, the kqueue and IOCP drivers, the simulation and a wasm host are all hosts of
+this one boundary, which is why a program cannot tell them apart. It is `blaze-core`'s
+`Effect`/`Completion` made flat, and the shape wasm-host's guest ABI already proved at speed
+(`ix-abi`, `ix-worker`). Taken from there:
+
+- **Records are plain words** with one layout on every target, so a ring can be shared memory
+  between a guest and its host, and a batch costs one crossing however many ops it holds.
+- **Ids are dense with a generation**: a stream id indexes a slab directly, no hash map, and a
+  stale id is caught by its generation.
+- **Events lend their bytes.** Data arrives as a view into a host buffer, valid for the event;
+  `retain` turns it into an owned buffer from the pool, and dropping that queues its release.
+  An op's body is static, owned or pool memory. Receives are zero-copy end to end.
+- **The host terminates protocols it is better placed to** (TLS, HTTP/1.1, 2 and 3, WebSocket
+  and WebTransport framing in a wasm host) and hands over protocol-neutral events: a request is a
+  request whichever version carried it.
+
+### Three kinds of code on it
+
+| kind | takes | is |
+|---|---|---|
+| a **core** | nothing: no `Cx`, no capability | a state machine. Inputs (bytes, events, the time) go in, outputs (bytes, ops, the next deadline) come out. `quic`, `http`, TLS, a journal, the build graph. Testable with no host at all |
+| a **driver** | a `Cx` and the capabilities it needs | a thin loop: feed the core what the capability delivers, do what the core asks. A few dozen lines per core per capability |
+| **straight-line code** | a `Cx` and capabilities | ordinary functions that wait. The runtime turns each wait into an op and a park, and its event into a wake-up |
+
+Straight-line code and a hand-written machine are the same thing at the boundary. Under the
+`Frames` layout the compiler makes the state machine from the straight-line function, so "write a
+function, get a machine" is the default, and a machine is written by hand only for a core: logic
+worth testing with no host, or reused under several drivers.
+
+A program can also be a machine at the top: `impl Worker { fn event(&mut self, cx, ev) }`, called
+once per batch with no runtime underneath. That is the right shape for a wasm guest and for the
+hottest paths.
+
+### When a capability is missing
+
+A host need not offer everything. A wasm worker has no sockets; a sandboxed child was handed two
+directories; a test gives a fake.
+
+- **What a host offers is known at start**, from a table it hands over before `main` (the
+  manifest). Nothing is discovered by an op failing halfway through.
+- **`main` says what it needs, and that is the program's manifest.** A required capability the
+  host does not offer stops the program before `main` runs, naming it. An optional one is an
+  `Option` in `main`'s hands: `io.net()` returns `Option<Net>`.
+- **Code below `main` never asks whether a capability exists.** It takes `&Http` or it does not;
+  absence is settled once, at the top, where the program chooses a provider:
+
+  ```rust
+  let http = match (io.http(), io.net()) {
+      (Some(host), _) => host,                              // the host makes requests for us
+      (None, Some(net)) => Http::over(&net, &clock, &roots), // we do, over its sockets
+      (None, None) => return Err(Missing("http")),
+  };
+  ```
+
+  `Http::best(&io)` is that match, for the common case.
+
 ## Cx: the task's context
 
 A capability says what code may touch. `Cx` says on whose behalf it runs. Every task has one, and
@@ -230,9 +293,8 @@ Three rules come out of this:
   anywhere a request can be made; one that takes `&Net` runs only where there are sockets. The
   same goes for `Streams` (WebTransport: `quic` natively, the browser's in a worker) over
   `Datagrams`.
-- **`Io` has the shape of its host.** Which root capabilities exist is per target: a native
-  process has `io.net()`, `io.fs()`, `io.process()`; a wasm worker has `io.http()` and
-  `io.streams()` and no `io.net()`, and code that asks for one there does not compile.
+- **`Io` has the shape of its host**, known at start (above): a native process offers `net`,
+  `fs` and `process`; a wasm worker offers `http` and `streams` and no `net`.
 - **A lower capability can always make the higher one**, never the reverse: `Net` gives `Http`,
   `Datagrams` gives `Streams`, a `Dir` gives a key-value store. That is narrowing: the higher one
   can do strictly less.
@@ -503,6 +565,6 @@ with its path, or put on the trusted list with a reason.
 
 cap-std and WASI preopens (directories with no ambient authority), Zig's `std.Io` (IO passed
 explicitly, swappable for tests), Trio and Kotlin (structured concurrency, cancel scopes),
-TigerBeetle and FoundationDB (one IO interface, deterministic simulation), Austral and Pony
+TigerBeetle and FoundationDB (one IO interface, deterministic simulation), quinn-proto and wasm-host's guest ABI (protocols and programs as explicit state machines over ops and events), Austral and Pony
 (capabilities in the language), E and Fuchsia (narrowing, handles with rights), Capsicum and
 Landlock (the OS side).
