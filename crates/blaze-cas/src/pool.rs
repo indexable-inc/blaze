@@ -557,8 +557,9 @@ impl<G: Give> Pool<G> {
     /// One pin of `page` given back: one `fetch_sub`.
     pub(crate) fn unpin(&self, page: u64) {
         let before = Word(self.word(page).fetch_sub(1, Ordering::Release));
-        // An `Evicting` page holds pins only under a planted bug (`Plant::EvictPinned`), which the
-        // DST's oracle names before this matters.
+        // An `Evicting` page holds pins only under a planted bug (`Plant::EvictPinned`). The
+        // DST's oracle names it as the page is given back, and its run ends there with its
+        // guards lost, not given back (`Pins::lost`), so no pin of that page comes here after.
         assert!(
             matches!(before.state(), State::Loaded | State::Evicting) && before.pins() > 0,
             "a pin of page {page} of the store's pool given back, whose word is {before:?}: given back twice"
@@ -1165,6 +1166,12 @@ impl<G: Give, P: Deref<Target = Pool<G>>> Pins<G, P> {
         self.len
     }
 
+    /// Dropped with the process's memory as a run of the DST ends, its pins gone with the pool.
+    #[cfg(test)]
+    pub(crate) fn lost(mut self) {
+        self.owned = false;
+    }
+
     /// The pins, no longer this guard's to give back: a [`PinSet`] takes them.
     fn disown(mut self) -> Run {
         self.owned = false;
@@ -1232,6 +1239,12 @@ impl<G: Give, P: Deref<Target = Pool<G>> + Clone> PinSet<G, P> {
         self.held.set(held as u8 + 1);
         // SAFETY: as in `find`: the set holds the run's pins until a `&mut self` call.
         Ok(unsafe { self.pool.bytes(at, len) })
+    }
+
+    /// Its pins gone with the process's memory as a run of the DST ends: none given back.
+    #[cfg(test)]
+    pub(crate) fn lost(&mut self) {
+        self.held.set(0);
     }
 
     /// Runs held.

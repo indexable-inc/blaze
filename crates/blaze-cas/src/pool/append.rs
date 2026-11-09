@@ -178,6 +178,16 @@ impl<G: Give, P: Deref<Target = Pool<G>> + Clone> Append<G, P> {
         parts
     }
 
+    /// Dropped with the process's memory as a run of the DST ends: its pins gone with the pool,
+    /// and nothing given back.
+    #[cfg(test)]
+    pub(crate) fn lost(mut self) {
+        self.fresh = 0;
+        if let Some(tail) = self.tail.take() {
+            tail.lost();
+        }
+    }
+
     /// The append made the file's: called once its writes and their sync have completed and the
     /// head names the new length. The file's window as it is now. Its pages stay `Loaded`, their
     /// second-chance bit set (what was just made is the likeliest thing to be read next), and are

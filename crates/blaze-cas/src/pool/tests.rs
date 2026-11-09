@@ -341,17 +341,39 @@ fn file_bytes(spec: &Spec) -> (Vec<u8>, Vec<(u64, u64)>) {
 
 // --- A run -----------------------------------------------------------------------------------
 
-/// Why a run failed: the oracle, or the harness itself.
+/// Which of the oracle's rules (the module's docs) a finding is of: what a control matches its
+/// plant against, so it passes on the finding its plant must cause and on no other.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Rule {
+    /// 1: a read handed back bytes that were not the record's, or the pin set lost a record.
+    Bytes,
+    /// 1: a read failed, and no fault the plan drew explains it.
+    Unexplained,
+    /// 2: a page given back while pinned or not `Evicting`, or made the process's twice.
+    GivenBack,
+    /// 3: a record never read back, or a page with a rotted block loaded after a reopen.
+    ReadBack,
+    /// 4: the pages the process holds are not the pages in use.
+    Held,
+    /// 4: the pins in the words are not the guards alive.
+    Pins,
+    /// 5: a load or a reading did not end.
+    Ends,
+    /// 6: a prefetch issued against its rules, or prefetched pages miscounted.
+    Prefetch,
+}
+
+/// Why a run failed: the oracle (the rule, and what it found), or the harness itself.
 #[derive(Debug)]
 enum Broke {
-    Oracle(String),
+    Oracle(Rule, String),
     Harness(String),
 }
 
 impl std::fmt::Display for Broke {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Broke::Oracle(why) => write!(f, "the oracle: {why}"),
+            Broke::Oracle(rule, why) => write!(f, "the oracle ({rule:?}): {why}"),
             Broke::Harness(why) => write!(f, "the harness: {why}"),
         }
     }
@@ -472,12 +494,19 @@ fn loads() -> Loads {
 
 impl Drop for World {
     fn drop(&mut self) {
-        // A run that stops mid-read drops its readings with the process's memory.
+        // A run that stops (at its end, or at the oracle's finding) ends its process: every
+        // guard goes with the process's memory, none giving its pins back. A finding may have
+        // left the words wrong (a pinned page given back under a plant), and a pin given back
+        // to such a word would panic in the pool before the finding is reported.
         for actor in &mut self.actors {
-            if let Actor::Reading { reading, .. } = std::mem::replace(actor, Actor::Idle) {
-                reading.lost();
+            match std::mem::replace(actor, Actor::Idle) {
+                Actor::Reading { reading, .. } => reading.lost(),
+                Actor::Holding { pins, .. } => pins.lost(),
+                Actor::Appending { append, .. } => append.lost(),
+                Actor::Idle | Actor::Begun { .. } | Actor::Copied { .. } => {}
             }
         }
+        self.set.lost();
     }
 }
 
@@ -565,7 +594,7 @@ impl World {
             return Ok(());
         }
         let first = bytes.iter().zip(want).position(|(a, b)| a != b);
-        Err(Broke::Oracle(format!(
+        Err(Broke::Oracle(Rule::Bytes, format!(
             "{what} of record {rec} of {} handed back bytes that were not put: first wrong at {first:?}, \
              {:#04x?} where {:#04x?} was put",
             self.files[file].name,
@@ -607,7 +636,7 @@ impl World {
         };
         match explained {
             true => Ok(()),
-            false => Err(Broke::Oracle(format!(
+            false => Err(Broke::Oracle(Rule::Unexplained, format!(
                 "a read of record {rec} of {} failed, and no fault the plan drew explains it: {error}",
                 ours.name
             ))),
@@ -618,7 +647,7 @@ impl World {
     /// taken, what the process holds, and the pins.
     fn check(&self) -> Result<(), Broke> {
         if let Some(why) = self.pool.give().broke.borrow().clone() {
-            return Err(Broke::Oracle(why));
+            return Err(Broke::Oracle(Rule::GivenBack, why));
         }
         let mut guards = self.set.pages();
         for actor in &self.actors {
@@ -637,7 +666,7 @@ impl World {
             match self.set.find(at, len) {
                 Some(bytes) => self.same(file, rec, bytes, "a read the task's pin set holds")?,
                 None => {
-                    return Err(Broke::Oracle(format!(
+                    return Err(Broke::Oracle(Rule::Bytes, format!(
                         "the task's pin set lost record {rec} of {}",
                         self.files[file].name
                     )));
@@ -660,17 +689,17 @@ impl World {
         }
         let resident = self.pool.give().held.borrow().len() as u64;
         if held != resident {
-            return Err(Broke::Oracle(format!(
+            return Err(Broke::Oracle(Rule::Held, format!(
                 "{held} pages are loading, loaded or being given back, and the process holds {resident}: \
                  Tag::Pool would not count them"
             )));
         }
         if pins != guards {
-            return Err(Broke::Oracle(format!("the pages' words hold {pins} pins, and the guards alive {guards}")));
+            return Err(Broke::Oracle(Rule::Pins, format!("the pages' words hold {pins} pins, and the guards alive {guards}")));
         }
         let counts = self.pool.prefetch_counts();
         if counts.loaded != counts.hit + counts.late + counts.wasted + marked {
-            return Err(Broke::Oracle(format!(
+            return Err(Broke::Oracle(Rule::Prefetch, format!(
                 "prefetched pages are not each counted once: {counts:?}, and {marked} pages are still marked"
             )));
         }
@@ -703,20 +732,20 @@ impl World {
         let prefetches = self.effects.iter().filter(idle).count();
         if prefetches > 0 {
             if !self.owners.is_empty() {
-                return Err(Broke::Oracle(format!(
+                return Err(Broke::Oracle(Rule::Prefetch, format!(
                     "{prefetches} prefetch reads submitted while {} demand loads are in flight",
                     self.owners.len()
                 )));
             }
             let (unread, flying) = self.prefetching();
             if unread * PAGE > self.budget {
-                return Err(Broke::Oracle(format!(
+                return Err(Broke::Oracle(Rule::Prefetch, format!(
                     "a prefetch issued with {unread} pages prefetched and not yet read, past the budget of {} bytes",
                     self.budget
                 )));
             }
             if flying > PREFETCHES {
-                return Err(Broke::Oracle(format!("{flying} prefetch loads in flight, of {PREFETCHES} allowed")));
+                return Err(Broke::Oracle(Rule::Prefetch, format!("{flying} prefetch loads in flight, of {PREFETCHES} allowed")));
             }
         }
         self.sim.submit(&mut self.effects);
@@ -1101,7 +1130,7 @@ impl World {
             }
             self.check()?;
         }
-        Err(Broke::Oracle(format!(
+        Err(Broke::Oracle(Rule::Ends, format!(
             "after {DRAIN} polls {} loads and some readings have not ended",
             self.loads.in_flight()
         )))
@@ -1141,7 +1170,7 @@ impl World {
                     }
                     self.actors[0] = Actor::Idle;
                     if !ended {
-                        return Err(Broke::Oracle(format!(
+                        return Err(Broke::Oracle(Rule::Ends, format!(
                             "a read of record {rec} of {} did not end in {DRAIN} polls",
                             self.files[file].name
                         )));
@@ -1151,7 +1180,7 @@ impl World {
                     }
                 }
                 if !read && !self.rotted(file, rec) {
-                    return Err(Broke::Oracle(format!(
+                    return Err(Broke::Oracle(Rule::ReadBack, format!(
                         "record {rec} of {} never read back in {TRIES} tries, and no rot explains it",
                         self.files[file].name
                     )));
@@ -1170,7 +1199,7 @@ impl World {
                 let page = file.window.first_page() + block * BLOCK / PAGE;
                 let word = self.pool.word_now(page);
                 if word.state() == State::Loaded {
-                    return Err(Broke::Oracle(format!(
+                    return Err(Broke::Oracle(Rule::ReadBack, format!(
                         "page {page} of the pool is {word:?} after a reopen, and block {block} of {}, which it \
                          holds, rotted on disk: its load did not refuse it",
                         file.name
@@ -1293,33 +1322,58 @@ fn directed(plant: Plant) -> Plan {
     }
 }
 
+/// The rule of the oracle's that must name `plant` on the plan built for it.
+fn rule_of(plant: Plant) -> Rule {
+    match plant {
+        Plant::None => panic!("no rule names no plant"),
+        // A read handed back bytes that were not the record's: a stale copy validated, a page
+        // served while its read was in flight, a rotted block or a failed read served.
+        Plant::SameVersion | Plant::LoadedAtAsk | Plant::NoCheck | Plant::FailedLoadKept | Plant::FirstBadBlock => {
+            Rule::Bytes
+        }
+        // The kernel's stand-in was given a page that was pinned, or not `Evicting`.
+        Plant::EvictPinned | Plant::NoEvicting => Rule::GivenBack,
+        // The append reached the disk as whatever the kernel left: its block fails its check
+        // when it is read back, and nothing rotted.
+        Plant::UnpinnedTail => Rule::Unexplained,
+        Plant::PrefetchFirst => Rule::Prefetch,
+    }
+}
+
 /// A plant the oracle must catch (test-the-cause on the test itself: a green DST with a blind
-/// oracle proves nothing). It must be caught on the plan built to expose it ([`directed`]),
-/// which must pass with nothing planted, so the catch is the plant's and nothing else's. Then
-/// the seeded plans are searched too, to say whether drawn plans reach the shape: that is
-/// reported, not required, since a drawn plan may fail to make a rare shape in any fixed number
-/// of seeds.
+/// oracle proves nothing). It must be caught on the plan built to expose it ([`directed`]), by
+/// the rule that names it ([`rule_of`]); that plan must pass with nothing planted, so the
+/// finding is the plant's and nothing else's. A panic anywhere fails the control: only the
+/// oracle's own finding of that rule passes it. Then the seeded plans are searched too, to say
+/// whether drawn plans reach the shape: that is reported, not required, since a drawn plan may
+/// fail to make a rare shape in any fixed number of seeds.
 fn control(plant: Plant) {
-    let plan = directed(plant);
+    let (plan, rule) = (directed(plant), rule_of(plant));
     if let Err(broke) = run(&plan, Plant::None) {
         panic!("the plan built for Plant::{plant:?} fails with nothing planted, so it proves nothing: {broke}\nplan {plan:?}");
     }
     match run(&plan, plant) {
-        Err(Broke::Oracle(why)) => eprintln!("{plant:?} caught on its built plan: {why}"),
-        Err(broke @ Broke::Harness(_)) => panic!("the plan built for {plant:?}: {broke}\nplan {plan:?}"),
+        Err(Broke::Oracle(found, why)) if found == rule => eprintln!("{plant:?} caught on its built plan by {rule:?}: {why}"),
+        Err(broke) => panic!("the plan built for Plant::{plant:?} must end in the oracle's {rule:?}, and ended in {broke}\nplan {plan:?}"),
         Ok(()) => panic!("the oracle did not catch Plant::{plant:?} on the plan built to expose it: {plan:?}"),
     }
+    let mut other = None;
     for seed in 0..CONTROL_SEEDS {
         match run(&plan_of(seed), plant) {
-            Err(Broke::Oracle(why)) => {
-                eprintln!("{plant:?} caught at seed {seed} (REPLAY = ({seed}, Plant::{plant:?})): {why}");
+            Err(Broke::Oracle(found, why)) if found == rule => {
+                eprintln!("{plant:?} caught at seed {seed} (REPLAY = ({seed}, Plant::{plant:?})) by {rule:?}: {why}");
                 return;
             }
+            // Another rule's finding under the plant: reported, not counted as its catch.
+            Err(Broke::Oracle(found, why)) => _ = other.get_or_insert((seed, found, why)),
             Err(broke @ Broke::Harness(_)) => panic!("seed {seed}, {plant:?}: {broke}"),
             Ok(()) => {}
         }
     }
-    eprintln!("{plant:?} caught on its built plan and at none of seeds 0..{CONTROL_SEEDS}: drawn plans rarely make its shape");
+    eprintln!(
+        "{plant:?} caught on its built plan and by {rule:?} at none of seeds 0..{CONTROL_SEEDS}: drawn plans rarely \
+         make its shape (the first finding of another rule: {other:?})"
+    );
 }
 
 #[test]
