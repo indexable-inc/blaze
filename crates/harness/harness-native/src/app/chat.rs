@@ -1687,10 +1687,9 @@ impl App {
         let o = w.entity_from_id(e);
         let now = model::now_ms();
         let mut chips: Vec<Chip> = Vec::new(); // alloc: a few chips, a frame
+        // The turn itself has no chip: its line in the transcript shows what it is on (its item, steps.rs), and a
+        // chip saying it again in words was noise. The strip is for what runs beside it: sub-agents and commands.
         let working = t.busy && !ended;
-        if working {
-            chips.push(turn_chip(t, now));
-        }
         let turn_from = t.turn_since.unwrap_or(u64::MAX);
         let chats = self.chats.borrow();
         let mut watch: Vec<u64> = Vec::new(); // alloc: a few sub-agents, a frame
@@ -3077,6 +3076,7 @@ pub(super) fn step_words(e: &model::chat::Effect) -> String {
 /// and how long that step has run), else its running tool's main argument (a shell's command), else what its newest
 /// words or reasoning are, timed from the turn's start. Its card: what the turn is on, how long the turn has run, and
 /// the steps its cells took so far ([`turn_steps`]).
+#[cfg(test)]
 fn turn_chip(t: &Transcript, now: u64) -> Chip {
     let since = turn_start(t);
     let turn = t.turn_since.map(|s| ran_for(now.saturating_sub(s))).unwrap_or_default();
