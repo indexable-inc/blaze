@@ -13,9 +13,20 @@
 //! caller makes in an arena itself (`Vec::new_in(arena.alloc())`) must grow through its
 //! `try_` forms (`try_reserve`): an infallible growth past the limit is `alloc`'s allocation
 //! failure, until bstd's own collections (S4) turn it into the task's failure.
+//!
+//! The rest of blaze-mem's allocators by lifetime are re-exported here as they are: a
+//! request's arena ([`RequestArena`], blaze-mem's `Arena`, named so beside bstd's own
+//! [`Arena`]), pools and their caches, slabs with generational handles, revisions, regions and
+//! the vectors over them, kept blocks, the subsystem [`Tag`]s, and owned text in an allocator
+//! ([`String`], [`format_in!`]). The functions of blaze-mem that reach a frame through the
+//! thread (`frame::current`, `frame::task`) are left out: in bstd the frame is `cx.frame()`.
 
-use blaze_mem::Tag;
-pub use blaze_mem::Frame;
+pub use blaze_mem::{
+    AppendVec, ArenaLocal, Block, Built, Cache, Column, Frame, FromUtf8Error, HUGE_PAGE, Handle,
+    Kept, Marker, MemError, Pool, Pooled, Region, RegionVec, Revisions, Slab, String, Tag,
+    format_in, page_size,
+};
+pub use blaze_mem::Arena as RequestArena;
 
 use crate::{Plant, Stopped, io::Io};
 

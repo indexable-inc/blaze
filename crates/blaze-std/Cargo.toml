@@ -1,6 +1,6 @@
 [package]
 name = "blaze-std"
-description = "bstd, blaze's own capability-based standard library (docs/v2/plan/design/std.md): one Io over blaze-core's drivers and its simulation, capabilities made only from it or by narrowing, a task context (Cx) with a deadline, cancellation, a span and a frame, and memory from named allocators"
+description = "bstd, blaze's own capability-based standard library (docs/v2/plan/design/std.md): one Io over blaze-core's drivers and its simulation, capabilities made only from it or by narrowing, a task context (Cx) with a deadline, cancellation, a span and a frame, and memory from named allocators; and the facade over blaze's piece crates (mem, bytes, map, id, sync, cell, sort, digest, record, report, quic, http, test)"
 publish = false
 
 version.workspace = true
@@ -18,6 +18,21 @@ doctest = false
 blaze-core.workspace = true
 blaze-mem.workspace = true
 blaze-rng.workspace = true
+# The facade (lib.rs, "Batteries"): each re-exported under bstd's names, none depending on bstd.
+blaze-alloc-count.workspace = true
+blaze-bytes.workspace = true
+blaze-check.workspace = true
+blaze-format.workspace = true
+blaze-hash.workspace = true
+# The sans-IO cores only: its `tokio` feature (the drivers) stays off.
+blaze-http.workspace = true
+blaze-ids.workspace = true
+blaze-phf.workspace = true
+blaze-radix.workspace = true
+blaze-reclaim.workspace = true
+blaze-report.workspace = true
+blaze-sha256.workspace = true
+blaze-spin.workspace = true
 
 [dev-dependencies]
 hegeltest.workspace = true

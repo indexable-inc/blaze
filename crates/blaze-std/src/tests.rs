@@ -16,16 +16,21 @@
 //! - [`env`]: `Env::only` never widens.
 //! - [`world`]: `Args`, `Host`, the trace and `spawn_concurrent`'s refusal under `Inline`, each
 //!   once.
+//! - [`cell`]: one token reads and writes every cell of its kind, behind one lock across
+//!   threads too.
+//! - [`names`]: the compile-time checks of `path!`, `var!` and `host!` are the run-time ones.
 //!
 //! Replay: a failure prints its plan, the simulation's seed in it; a control prints the seed of
 //! the plan that caught its plant.
 
 mod arena;
 mod cancel;
+mod cell;
 mod contexts;
 mod crash;
 mod deadlines;
 mod env;
+mod names;
 mod narrowing;
 mod paths;
 mod world;

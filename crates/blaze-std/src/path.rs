@@ -33,39 +33,77 @@ pub enum PathWhy {
 
 impl fmt::Display for PathError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let why = match self.why {
-            PathWhy::Empty => "is empty",
-            PathWhy::Rooted => "starts at a root: a bstd path is relative to its directory",
-            PathWhy::Parent => "has a `..`: a bstd path never leaves its directory",
-            PathWhy::NotCanonical => "has a `.` or an empty part: write it as one relative path",
-            PathWhy::Forbidden => "has a `\\` or a NUL",
-        };
-        write!(f, "path {:?} {why}", self.path)
+        write!(f, "path {:?} {}", self.path, self.why.says())
     }
 }
 
 impl std::error::Error for PathError {}
 
-/// Why `raw` is no path, if it is not. `parent` lets `..` through, for the test that plants it.
-fn refused(raw: &str, parent: bool) -> Option<PathWhy> {
-    if raw.is_empty() {
-        return Some(PathWhy::Empty);
-    }
-    if raw.starts_with('/') || raw.as_bytes().get(1) == Some(&b':') {
-        return Some(PathWhy::Rooted);
-    }
-    if raw.contains(['\\', '\0']) {
-        return Some(PathWhy::Forbidden);
-    }
-    for part in raw.split('/') {
-        match part {
-            ".." if parent => {}
-            ".." => return Some(PathWhy::Parent),
-            "" | "." => return Some(PathWhy::NotCanonical),
-            _ => {}
+impl PathWhy {
+    const fn says(self) -> &'static str {
+        match self {
+            PathWhy::Empty => "is empty",
+            PathWhy::Rooted => "starts at a root: a bstd path is relative to its directory",
+            PathWhy::Parent => "has a `..`: a bstd path never leaves its directory",
+            PathWhy::NotCanonical => "has a `.` or an empty part: write it as one relative path",
+            PathWhy::Forbidden => "has a `\\` or a NUL",
         }
     }
+}
+
+/// Why `raw` is no path, if it is not. `parent` lets `..` through, for the test that plants it.
+/// A `const fn`, so [`crate::path!`] checks a literal as the crate compiles by the same rule
+/// [`Path::new`] checks at run time.
+const fn refused(raw: &str, parent: bool) -> Option<PathWhy> {
+    let bytes = raw.as_bytes();
+    if bytes.is_empty() {
+        return Some(PathWhy::Empty);
+    }
+    if bytes[0] == b'/' || (bytes.len() > 1 && bytes[1] == b':') {
+        return Some(PathWhy::Rooted);
+    }
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'\\' || bytes[at] == 0 {
+            return Some(PathWhy::Forbidden);
+        }
+        at += 1;
+    }
+    // Each `/`-separated part, from `start` to the separator (or the end) at `at`.
+    let (mut start, mut at) = (0, 0);
+    while at <= bytes.len() {
+        if at == bytes.len() || bytes[at] == b'/' {
+            let len = at - start;
+            if len == 2 && bytes[start] == b'.' && bytes[start + 1] == b'.' {
+                if !parent {
+                    return Some(PathWhy::Parent);
+                }
+            } else if len == 0 || (len == 1 && bytes[start] == b'.') {
+                return Some(PathWhy::NotCanonical);
+            }
+            start = at + 1;
+        }
+        at += 1;
+    }
     None
+}
+
+/// [`Path::new`]'s check, as a compile-time panic: what [`crate::path!`] evaluates in a
+/// `const`.
+pub const fn check_literal(raw: &str) {
+    if let Some(why) = refused(raw, false) {
+        panic!("{}", why.says());
+    }
+}
+
+/// A [`Path`] from a string literal, checked as the crate compiles: `path!("data/log")`. A bad
+/// literal (`path!("../x")`) is a compile error saying why.
+#[macro_export]
+macro_rules! path {
+    ($raw:literal) => {{
+        const _: () = $crate::path::check_literal($raw);
+        $crate::path::Path::new($raw).expect("a path! literal was checked as the crate compiled")
+    }};
 }
 
 impl Path {

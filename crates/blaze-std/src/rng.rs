@@ -2,8 +2,11 @@
 //! the world's generator. Seeded in the simulation; on a real driver seeded by the entry
 //! ([`crate::io::NativeWorld::seed`]) until blaze-core has an effect that asks the system for
 //! randomness. Not for keys or anything an attacker may predict.
+//!
+//! The generator itself is re-exported as it is ([`SplitMix64`], its [`mix`] and [`GAMMA`]),
+//! for a sans-IO core that is handed a seed rather than the capability.
 
-use blaze_rng::SplitMix64;
+pub use blaze_rng::{GAMMA, SplitMix64, mix};
 
 /// A generator of its own. Not `Clone`: a copy would draw the same numbers; [`Rng::fork`]
 /// makes another that draws others.
