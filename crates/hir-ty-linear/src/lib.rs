@@ -12,10 +12,17 @@
 //! has one (its abandonment path, a rollback) or its fields' drop glue, and with `panic=abort`
 //! runs nothing. Every call may unwind, so a rule over unwind edges would leave no call legal.
 //!
+//! An exit that returns a failure abandons: where a body that returns a `Result` or an
+//! `Option` writes `Err(..)`, `None` or what `?` propagates as its return value, a live value
+//! whose linear types have an abandonment path (a `Drop` impl of the marked type, or of a
+//! guard field of it) is dropped as a panic drops it, and that is no error. A linear type
+//! with no such path must still be consumed before the exit ([`drops`]).
+//!
 //! Generic code drops what it holds unseen, so a linear type is an argument only of a type
 //! parameter marked `#[blaze::linear]` (Swift's `~Copyable`, the `?Drop` of Rust's must-move
 //! discussions): every function a body names, with the type arguments it names it with, is
-//! checked here ([`generic`]). The design, the prior art and what is not checked yet are in
+//! checked here ([`generic`]). `Option` and `Result` admit a linear payload through the
+//! marks library/core puts on the impls whose methods hand it on. The design, the prior art and what is not checked yet are in
 //! docs/v2/plan/design/linear.md.
 //!
 //! [`check_body`] is called by the borrow check for each body it checks
