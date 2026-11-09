@@ -4,7 +4,7 @@
 //! outlines (Slug), selection plates and the bundled Berkeley Mono cut. Code is set in an installed monospace font.
 //!
 //! den's own typesetter shapes and breaks (text/shaper.rs: HarfRust, ICU4X and unicode-bidi,
-//! docs/research/text-shaping.md), on macOS and Linux alike. Choosing fonts and the font a character falls back to, font
+//! fed1eb428d:docs/research/text-shaping.md), on macOS and Linux alike. Choosing fonts and the font a character falls back to, font
 //! metrics, advances and rasterising are the platform's ([`font::FontSource`]: CoreText on macOS, fontdb, skrifa and
 //! tiny-skia on Linux).
 //!

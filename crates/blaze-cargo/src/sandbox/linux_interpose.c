@@ -347,7 +347,7 @@ static void lend_rest(void) {
 
 // Whether the program proves std alone walks its environment: its executable exports
 // `__blaze_std_says_walks`, which blaze's linker puts in an executable no other code of which
-// reads `environ` (`docs/v2/requests/usercode.md`, item 6).
+// reads `environ` (`fed1eb428d:docs/v2/requests/usercode.md`, item 6).
 static int proves_walks(void) {
     void *marker = dlsym(RTLD_DEFAULT, "__blaze_std_says_walks");
     Dl_info at, program;

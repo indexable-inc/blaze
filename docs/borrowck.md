@@ -42,7 +42,7 @@ such an error still builds.
   naive rules (`crates/hir-ty-borrowck/src/flow.rs`) also find it live. Those rules kill a
   loan when its path is overwritten and propagate subsets along the control flow. A universal
   region error is dropped only when those rules find no failing pair. This accepts the cases
-  in section 2.5 of [the research](research/borrowck.md) that the alpha rejects and legacy
+  in section 2.5 of the research that the alpha rejects and legacy
   Polonius accepts: the linked-list cursors of issues 57165, 63908 and 108704,
   `flow-sensitive-invariance.rs` and issue 46589. Neither checker can find a live set smaller
   than the real one, so their intersection is sound.
@@ -59,7 +59,7 @@ Any other value stops blaze with an error naming the value and the four choices.
 ## What rustc rules it follows
 
 All of these are rustc's, written from `compiler/rustc_borrowck` at the pinned nightly
-([research/borrowck.md](research/borrowck.md) has the sources):
+(research/borrowck.md has the sources):
 
 - Moves and initialization: moves out of places, partial moves, maybe-uninitialized reads,
   assignment to immutable locals (E0381, E0382, E0384, E0505, E0507, E0508, E0509). A `match`
@@ -530,7 +530,7 @@ long enough") and rust-analyzer (1, E0515) got errors rustc does not give.
 Three checks hold `polonius-flow` to "accepts more, never less":
 
 - `harness/v2/frontend/borrowck_flow.py` runs the 46 tests with a Polonius revision that are
-  vendored in `docs/upstream/borrowck/rust-lang-rust/tests-ui` in both modes. It fails on any
+  vendored in `fed1eb428d:docs/upstream/borrowck/rust-lang-rust/tests-ui` in both modes. It fails on any
   of the following:
   - `polonius-flow` rejects something `polonius` accepts.
   - `polonius-flow` accepts a test that every upstream revision rejects.

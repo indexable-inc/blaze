@@ -13,7 +13,7 @@ This is the state of each platform blaze v1 was run on, as of its integration in
 in CI yet. The
 numbers are from GitHub Actions run 39057174862 on commit 888e87df74, the last recorded run
 that covered all four native platforms under both backends, unless a line says otherwise.
-The report behind it is [reports/PLAT-ABI2.md](reports/PLAT-ABI2.md). The table of what is
+The report behind it is reports/PLAT-ABI2.md. The table of what is
 supported where is in [support.md](support.md); this page says how each port works and what
 is specific to it.
 
@@ -251,7 +251,7 @@ ship). With a store
 that starts empty, the workspace load compiles every build script at once, a blaze process
 each of up to a few GB: on a 16 GB machine `CARGO_BUILD_JOBS=2` kept it at 9.6 GB, where the
 default was killed at 14 GB. wasm-bindgen runs again after every edit, 0.27 to 0.36 s on a hello world
-([reports/WASM32.md](reports/WASM32.md)). There is no LLVM backend for wasm.
+(reports/WASM32.md). There is no LLVM backend for wasm.
 
 Running the compiler itself in a browser is a separate experiment in `crates/blaze-wasm`.
 

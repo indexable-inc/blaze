@@ -25,7 +25,7 @@ where v1 had a setting or command v2 lacks, the section says so. v2's design is
     cargo +nightly-2026-10-27 install --locked blaze-engine
 
 From the release after 0.1.0, `--profile dist` builds the profile a release is built with, less
-the PGO a release adds ([reports/RELEASE-BUILD.md](reports/RELEASE-BUILD.md)); 0.1.0 has no such
+the PGO a release adds (reports/RELEASE-BUILD.md); 0.1.0 has no such
 profile and fails with it. From a checkout, the release's own recipe builds all of it with the
 blaze on PATH (the stage 0 `.github/blaze-version` names), for this machine's target:
 
@@ -924,7 +924,7 @@ v1 could compile a build script for `wasm32-wasip1` and run it under Wasmtime (`
 v2 does neither, and their crates are deleted: every build script runs natively in the
 sandbox. Nothing in blaze reads v1's variables or manifest lists for them, so setting them
 changes nothing. The comparison of the two ways of running scripts is
-[reports/BSWASI.md](reports/BSWASI.md).
+reports/BSWASI.md.
 
 ### Which tests run
 

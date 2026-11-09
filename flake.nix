@@ -345,7 +345,7 @@
         devShells.bench = pkgs.mkShell bench;
         # Python-only work needs neither LLVM nor a Rust toolchain.
         devShells.scripts = pkgs.mkShell scripts;
-        # What harness/bench.py measures bun in (bunprep.py, docs/research/bun.md):
+        # What harness/bench.py measures bun in (bunprep.py, fed1eb428d:docs/research/bun.md):
         # bun's own pinned nightly in place of blaze's, for the cargo side (blaze ignores the pin
         # and compiles its own library/), with rust-src, which bun's own build of its Rust
         # (`-Zbuild-std`, run by bunprep.py's plan step) reads std from, and

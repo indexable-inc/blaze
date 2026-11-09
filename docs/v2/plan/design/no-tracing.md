@@ -766,7 +766,7 @@ Docs: `docs/profiling.md` (tracing targets, the keep table, column docs that say
 target" or "tracing event"); `crates/blaze-profile/src/schema.rs` docs; `docs/cargo.md` (one
 mention); `docs/v2/plan.md`; `tools/agents/rules.ts` rule 16's
 `tracing::info_span!(target: "blaze", ...)` becomes `blaze_trace::span!(...)`, then `bun
-tools/agents/rules.ts --write` regenerates `AGENTS.md` and the skills. docs/v2/requests and lane
+tools/agents/rules.ts --write` regenerates `AGENTS.md` and the skills. fed1eb428d:docs/v2/requests and lane
 plans are dated records or plans and stay as written.
 
 ### 8.3 What the deletions cost nothing of

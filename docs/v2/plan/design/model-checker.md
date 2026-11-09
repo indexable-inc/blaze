@@ -213,4 +213,4 @@ the crate where its owners are done, as a request to them where not.
 | `blaze-reclaim` | slots, `enter`/`Guard`, `Grace`, `Limbo` | concurrency |
 
 The tests and switches for crates whose owners are still at work are requests in
-`docs/v2/requests/<owner>.md`, ready to paste.
+`fed1eb428d:docs/v2/requests/<owner>.md`, ready to paste.

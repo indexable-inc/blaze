@@ -703,7 +703,7 @@ since the release before and the title of each change merged since.
   the program's as a compile of it alone is. It is not the default: on 16 cores helix builds
   in 71.1 s against 69.7 s and runs 1.28x of cargo's release build against 1.21x, and LLVM
   takes four times rustc's time for code of the same size either way
-  ([codegen-units.md](research/codegen-units.md)). Imports are linked into a compile's
+  (codegen-units.md). Imports are linked into a compile's
   module once, after being linked to each other two at a time, which took the lowering of a
   module of many functions from 23.7 s to 8.1 s summed over ripgrep's cores.
 
@@ -732,7 +732,7 @@ since the release before and the title of each change merged since.
   the pinned nightly ICEs on it.
 - The daemon's workers hold at most half of the machine's memory together, or what
   `RA_JIT_MEMORY_MAX` says (a size, or `off`). Over it, the worker asked longest ago is
-  stopped; `cargo ra-jit status` shows the limit and what each worker holds. `docs/reports/SOAK.md`
+  stopped; `cargo ra-jit status` shows the limit and what each worker holds. `fed1eb428d:docs/reports/SOAK.md`
   described the variable, but it was never brought over from the soak branch (#60).
 - `RA_JIT_OTHER_TOOLCHAIN=1` has `cargo ra-jit` build with a rustc other than 1.99.0, for a
   project pinned to a nightly of the next release that 1.99.0 can't build (bun's
@@ -761,7 +761,7 @@ since the release before and the title of each change merged since.
   name the stacks on macOS, and `harness/heap.py` gives the bytes to the salsa query whose
   value or record holds them. What they found
   ([#39](https://github.com/indexable-inc/ra-jit/issues/39),
-  [docs/research/daemon-memory.md](research/daemon-memory.md)): nushell's worker holds
+  fed1eb428d:docs/research/daemon-memory.md): nushell's worker holds
   10.0 GB live once ready, 2.7 GB of it what a debugger is told of types; ripgrep's 1.6 GB;
   and the spare worker the daemon starts after the first build holds 940 MB more on ripgrep.
   salsa's `lru` cannot evict `infer` or MIR (they have cycle handling), and on `described`
@@ -794,7 +794,7 @@ since the release before and the title of each change merged since.
   needs none, folding constant branches, simplifying the control flow and instructions),
   `RA_JIT_MIR_OPT=2` what it runs above `-Copt-level=0` that is ported (also dead stores and
   unreachable blocks). Off by default. The interpreter's tests run every program at all three
-  levels and require the same result ([docs/research/mir-gap.md](research/mir-gap.md)).
+  levels and require the same result (fed1eb428d:docs/research/mir-gap.md).
 - `ra-jit mir <dir> --crate <name> [--level N]` prints a crate's MIR as ra-jit compiles it,
   in rustc's `-Zunpretty=mir` format, and `harness/mirparity.py` compares it with rustc's
   function by function: at level 1, 21.5% of functions are identical to rustc's, against 4.0%
@@ -805,9 +805,9 @@ since the release before and the title of each change merged since.
   output differs from cargo's is never published. The first, on Linux x86-64, has every
   program's output the same as cargo's; on macOS arm64, ripgrep, fd, bat and jsonrt do not
   build whole yet (NEON intrinsics ra-jit does not have).
-- [docs/research/](research/): what 2026's Rust compiler work means for ra-jit,
+- fed1eb428d:docs/research/: what 2026's Rust compiler work means for ra-jit,
   and the MIR gap with rustc with the production gaps ranked; rustc's pass sources in
-  [docs/upstream/rustc-mir-transform/](upstream/rustc-mir-transform/SOURCE.md).
+  fed1eb428d:docs/upstream/rustc-mir-transform/.
 
 - Tiers ([#6](https://github.com/indexable-inc/ra-jit/issues/6)): a program that takes
   edits with `ra-jit-live` is sampled while it runs, and the functions it spends its time in
@@ -1086,7 +1086,7 @@ since the release before and the title of each change merged since.
   18 where 156 and takes as long, 0.53 to 0.70 s: what is left on both is the code that
   changed, compiled on a cold database (main before #360 compiled everything at the start and
   took 0.09 s and 0.37 s, its start 4.8 s longer on nushell)
-  ([warm-start.md](research/warm-start.md)). A stored mark no longer hashes where the
+  (warm-start.md). A stored mark no longer hashes where the
   named locals are kept for a debugger, which a full build and a later compile of the same
   code can tell apart, and which had every edit after a restart compile such code again.
   Entries are kept under new keys. `storetracked.py` has the edits of one body take some
@@ -1208,7 +1208,7 @@ since the release before and the title of each change merged since.
   restarted daemon's build on a store that has everything takes 38.3 s instead of 106.5, its
   "store read" 130.8 s of thread time instead of 561.1, the first edit's rebuild 12.2 s instead
   of 45.5, and a second checkout is ready 59.0 s after its build instead of 113.0; nushell's
-  takes 35.4 s instead of 37.8 ([research/warm-start.md](research/warm-start.md)).
+  takes 35.4 s instead of 37.8 (research/warm-start.md).
 - `unused_mut` a source denies fails the build, with the seven deny lints before it (#84).
   `harness/lints_ui.py --deny unused_mut` scores it on every rustc UI test: 51 right, 0 wrong,
   5 missed against the nightly, 49, 0, 5 against 1.99.0. `RA_JIT_BORROWCK_REFUSE=0` turns it
@@ -1348,7 +1348,7 @@ since the release before and the title of each change merged since.
   snmalloc start colder and edit no faster (an edit spends 1.8% of its time allocating, 73%
   revalidating salsa's memos). `release` itself is unchanged and stays the build to work with,
   so rebuilding ra-jit after a change takes as long as before
-  ([docs/reports/RELEASE-BUILD.md](reports/RELEASE-BUILD.md)).
+  (fed1eb428d:docs/reports/RELEASE-BUILD.md).
 - Under `RA_JIT_BACKEND=llvm`, a body of more than 10 000 Cranelift instructions is compiled
   by Cranelift. Since LLVM lowers a handler that takes more than the exception (tiers), it
   compiled every function, and an edit of nushell's `main` (35 778 instructions) waited
@@ -2379,7 +2379,7 @@ since the release before and the title of each change merged since.
 - Merge origin/main into the linux-speed merge
 - #[ra_jit::cache] keeps the results of pure functions across runs, keyed by the code they reach (#17)
 - release binaries are thin LTO (`dist`) with PGO; a worker loaded beside cargo's first build ends with its daemon
-- benchreport: the build table says it times ra-jit's `cargo build --release`, and that release binaries are `dist` with PGO (docs/reports/RELEASE-BUILD.md)
+- benchreport: the build table says it times ra-jit's `cargo build --release`, and that release binaries are `dist` with PGO (fed1eb428d:docs/reports/RELEASE-BUILD.md)
 - Merge origin/main into the build-profile merge (CHANGELOG: both Changed entries kept)
 - the first edits patch what rustc linked, so the daemon is ready as cargo finishes (#11)
 - Merge origin/main into the cold-start merge
@@ -2513,13 +2513,13 @@ since the release before and the title of each change merged since.
 - #[ra_jit::cache] keeps each function's results for its last three codes, and cargo ra-jit cache lists and clears stale ones (#143)
 - bun's whole program at 1.28x release (was 5.9x) and linking on macOS (#35); adding a function to bun a 0.6 s patch (was 19.8 s); a regression test for the rust-src check (#142)
 - ra-jit allocates with jemalloc on Unix: the daemon after edits 1.57 GB instead of 2.03 on ripgrep, 9.52 instead of 10.80 on nushell, 11.07 instead of 12.13 on helix (#39) (#146)
-- the daemon loads build scripts and proc macros from cargo's build instead of building them again (bevy's target 16.2 to 15.8 GB, ready 30 to 20 s), packs go to a remote compressed once, and docs/research/disk.md after F/G projected (#153)
+- the daemon loads build scripts and proc macros from cargo's build instead of building them again (bevy's target 16.2 to 15.8 GB, ready 30 to 20 s), packs go to a remote compressed once, and fed1eb428d:docs/research/disk.md after F/G projected (#153)
 - #[ra_jit::cache] takes Rc, Arc and HashMap arguments, keys by the sysroot's metadata hash, and looks through the MIR of core and alloc: _rdtsc and the like refused, inlining hides no address (#18 items 1-3) (#150)
 - Linux x86-64 bench at 28f22ff4a8: bevy edits faster than cargo (a function 3.15 s to 650 ms, a widely used one 10.69 s to 240 ms) (#156)
 - docs say the workflows that commit to main push with RA_JIT_BOT_TOKEN past the ruleset, not GITHUB_TOKEN (#157)
 - Merge borrowck-7: borrowck 1509/1505 of rustc's tests (floor 1506): the super lets of format_args! and pin! extend their temporaries only when a let extends them, as rustc since #145784, a variable another crate's macro declares is a temporary in the messages, and an error at what a macro lowers to is at the macro call (#151)
 - link only what is reached of the standard library: the unit at line tables, split into an archive of 17 parts lld reads in parallel; hello's link 160 -> 130 ms, executables 20.4 -> 15.2 MB and ripgrep's 55.1 -> 50.1 MB (#87) (#152)
-- the daemon keeps ra-jit.o zstd-packed between the links that read it on Linux (helix's target 5.0 to 4.5 GB, nushell 6.2 to 5.8), and docs/research/disk.md with it (#158)
+- the daemon keeps ra-jit.o zstd-packed between the links that read it on Linux (helix's target 5.0 to 4.5 GB, nushell 6.2 to 5.8), and fed1eb428d:docs/research/disk.md with it (#158)
 - Release parity: a returned local is built in the caller's memory and a moved argument shares its slot (NRVO), rustc's ThinLTO pre-link and link pipelines, the SLP vectorizer on again, NEON's 16-byte addp as iadd_pairwise, and a trait's provided method's inner functions compiled with the crate ra-jit names. Runtime against cargo's release: nbody 1.26 to 0.98 on x86-64 and 1.29 to 1.05 on Graviton4, qsort 1.11 to 1.04, eza 1.08 to 1.00-1.06, words 1.28 to 1.24 on Graviton4 (#160)
 - Debug type sets share what each type is told as (#55); the own base gives memory back before giving up (#163)
 - borrowck: no false errors on tracing 0.1.44's trace! fields (#109) or on a trait object given for a parameter bounded T: 'a (#84) (#164)
@@ -2567,7 +2567,7 @@ since the release before and the title of each change merged since.
 - f32::max in a constant is evaluated (core's fallback body), so nsh apps' builds stay whole-program and their edits patch; a trait method left without an impl names its Self type (#224) (#228)
 - biome: the first edit after a cargo build stays the daemon's, memory bounds follow the control group, biome in the bench set (#229)
 - cargo ra-jit test: RA_JIT_TESTS=affected runs only the tests an edit reached since they passed, from the daemon's hash of each test's code and all it calls (#227) (#230)
-- docs/research: the store's block cache measured on helix's warm start (no gain), and bbtree against papaya and DashMap for ra-jit's shared maps (#231)
+- fed1eb428d:docs/research: the store's block cache measured on helix's warm start (no gain), and bbtree against papaya and DashMap for ra-jit's shared maps (#231)
 - AGENTS.md: own the whole stack, and stay a superset of Rust (#234)
 - cargo ra-jit check writes rustc's JSON diagnostics as cargo check does (424/424 fields against rustc), -Z, --exclude and several targets checked by the daemon; the borrow checker's 4 trait-solver panics fixed at their causes; the 5,204-arm else-if chain in 4.5 s (#206); ide-diagnostics passes and runs in the fast tier (#222)
 - Affected tests: TypeId::of and the dyn Any methods are leaves of the hash walk (#238)

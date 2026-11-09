@@ -8,7 +8,7 @@ date: 2026-11-02
 ## What it is for
 
 The default checker is rustc's Polonius alpha ([borrowck.md](../../../borrowck.md)). Section 2.5
-of [the research](../../../research/borrowck.md) lists five tests that the alpha rejects and
+of the research lists five tests that the alpha rejects and
 legacy (datalog) Polonius accepts:
 
 - `nll/polonius/iterating-updating-cursor-issue-57165.rs`
@@ -35,7 +35,7 @@ cheaper NLLs find possible issues" (lqd, rust-lang/goals#118).
 
 **The second pass.** `crates/hir-ty-borrowck/src/flow.rs` computes loan liveness and the subset
 errors among universal regions as polonius-engine's naive rules do
-(`docs/upstream/borrowck/polonius/book_src_rules_relations.md`). The rules run over blaze's
+(`fed1eb428d:docs/upstream/borrowck/polonius/book_src_rules_relations.md`). The rules run over blaze's
 points, liveness and constraints:
 
 - A subset holds at the point of its constraint, or everywhere.
@@ -79,7 +79,7 @@ the same way in both modes.
 ## Proof on the tests
 
 - `harness/v2/frontend/borrowck_flow.py` runs the 46 tests with a Polonius revision. They are
-  vendored verbatim in `docs/upstream/borrowck/rust-lang-rust/tests-ui` (32 of them added by this
+  vendored verbatim in `fed1eb428d:docs/upstream/borrowck/rust-lang-rust/tests-ui` (32 of them added by this
   lane; SOURCE.md). The script runs each in both modes and fails on any of these:
   - `polonius-flow` rejects something `polonius` accepts.
   - `polonius-flow` accepts something every upstream revision rejects.
@@ -91,7 +91,7 @@ the same way in both modes.
   rejects must stay rejected: polonius-smoke-test, subset-relations,
   lending-iterator-sanity-checks, assignment-to-differing-field and get_default.
 
-The vendored suite is all of rustc's borrowck UI tests that live in `docs/upstream`. The wider
+The vendored suite is all of rustc's borrowck UI tests that live in `fed1eb428d:docs/upstream`. The wider
 suite of about 1590 units, which the old harness scored, was deleted on 2026-10-30
 ([borrowck.md](../../../borrowck.md#how-it-is-tested)).
 
@@ -119,7 +119,7 @@ check plus `Phase::Flow`. `flow_tests::flow_cost_per_body` (ignored, run with `-
   NLL problem case 3 with a higher-order API. A blaze program in `polonius-flow` mode needs no
   such workaround for the cursor cases.
 - The Niko Matsakis "Polonius revisited" posts (2023;
-  `docs/upstream/borrowck/blog/babysteps-2023-polonius-revisited-excerpts.md`) set out the
+  `fed1eb428d:docs/upstream/borrowck/blog/babysteps-2023-polonius-revisited-excerpts.md`) set out the
   location-sensitive design the alpha implements.
 
 A GitHub search (`polonius borrow checker pushed:>2025-06-01`) found no other implementation

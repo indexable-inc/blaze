@@ -2,7 +2,7 @@
 status: superseded
 summary: Tiers as blaze v1 did them (the engine's tier.rs): hot functions of a live program compiled again with LLVM and swapped in while it ran.
 date: 2026-10-30
-superseded_by: v2/plan/lanes/codegen.md
+superseded_by: v2/plan/design/codegen.md
 ---
 # Tiers
 

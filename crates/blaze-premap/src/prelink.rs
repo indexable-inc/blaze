@@ -2,7 +2,7 @@
 //! shared image whose undefined and weakly defined names are bound by the run
 //! ([`Prelinked::binds`]), with every function, static and global name in a table.
 //!
-//! [`Prelink`] is the hook into blaze-link (`docs/v2/requests/fastcompile.md`, fastcompile-premap
+//! [`Prelink`] is the hook into blaze-link (`fed1eb428d:docs/v2/requests/fastcompile.md`, fastcompile-premap
 //! 1): blaze-link's stage runs it, in parallel as any full link is. [`build`] asks for it,
 //! checks what came back against what was asked (every piece placed, segments page-aligned
 //! and apart, every bind and init cell inside a writable segment) and encodes the image.

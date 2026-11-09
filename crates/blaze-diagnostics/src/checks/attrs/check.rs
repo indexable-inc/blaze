@@ -17,7 +17,7 @@
 //!
 //! Not here: `check_proc_macro`'s `ProcMacroBadSig` compares the function's signature with
 //! `fn(TokenStream) -> TokenStream` in the trait solver (asked of the front end,
-//! `docs/v2/requests/diagnostics.md`); `check_eii_impl` is of the externally implementable items'
+//! `fed1eb428d:docs/v2/requests/diagnostics.md`); `check_eii_impl` is of the externally implementable items'
 //! attribute macros, which no builtin parser here takes. In this checkout E0517 (a hint on
 //! what it cannot be applied to) is `repr`'s parser's target check (`parsers::codegen`), and
 //! E0084 and E0587 are `rustc_hir_analysis`' (`check/check.rs`), not `check_mod_attrs`'.

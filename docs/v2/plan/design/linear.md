@@ -148,7 +148,7 @@ set, so the bound has to relax a default rather than add one.
   - `#[must_use]`: only warns, and only for an unused expression, not for a value dropped later.
 
 Found with `gh api -X GET search/repositories -f q="linear types rust"` and `"drop bomb rust"`, Exa,
-and docs/research (nothing about linear types there).
+and fed1eb428d:docs/research (nothing about linear types there).
 
 ## Applied in blaze
 

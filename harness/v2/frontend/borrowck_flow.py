@@ -52,7 +52,7 @@ SUITE = ROOT / "docs" / "upstream" / "borrowck" / "rust-lang-rust" / "tests-ui"
 TABLE_NAME = "ui-polonius-revisions-table.md"
 AREA = "borrowck"
 MODES = ("polonius", "polonius-flow")
-# docs/research/borrowck.md section 2.5: rejected by the alpha, accepted by legacy Polonius.
+# fed1eb428d:docs/research/borrowck.md section 2.5: rejected by the alpha, accepted by legacy Polonius.
 TARGETS = frozenset({
     "tests/ui/nll/polonius/iterating-updating-cursor-issue-57165.rs",
     "tests/ui/nll/polonius/iterating-updating-cursor-issue-63908.rs",

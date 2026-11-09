@@ -835,7 +835,7 @@ segments, a few hundred milliseconds.
 
 After this the fetch is not the long pole. helix's warm start spent 129 to 131 s of thread time
 turning store records back into the daemon's values
-([research/warm-start.md](research/warm-start.md), **read**); that cost is the store's, and #216 is
+(research/warm-start.md, **read**); that cost is the store's, and #216 is
 its fix.
 
 ### HTTP versions

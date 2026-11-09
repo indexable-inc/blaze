@@ -16,7 +16,7 @@ and CI job shares. This page is the whole plan. Three more things hold the rest:
   here. A spec is deleted, or becomes a `current` doc, when its design is built.
 
 "v2" is only this directory's name. It merged into main on 2026-11-01; there is one blaze. The
-415 lane notes this page replaces are in git at `c2da9d01ae` (`git show c2da9d01ae:docs/v2/plan.md`).
+415 lane notes this page replaces are in git at `fed1eb428d` (`git show fed1eb428d:docs/v2/plan.md`).
 
 ## Rules
 
@@ -52,8 +52,10 @@ are that idea at each layer, and each names the one thing the others must use.
 The daemon's source of truth is a content-addressed tree, not the disk. A **view** (a branch, a
 pull request, a CI job, an agent's what-if patch) is a root hash; unchanged subtrees are shared.
 An edit is an atomic transaction that makes a new root. What changed is the diff of two roots,
-which skips equal subtrees by hash. Disk is one writer and one projection; OS change journals
-(FSEvents, USN, a statx sweep on Linux) say what changed while the daemon was down.
+which skips equal subtrees by hash. Disk is one writer and one projection. While the daemon is
+up the OS reports changes (fanotify on Linux, FSEvents on macOS, the USN journal on Windows);
+after a restart the journals, or on Linux one parallel statx sweep, say what changed, and no file
+is read whose metadata did not move.
 Specs: [vfs](plan/design/vfs.md), [vfs-sync](plan/design/vfs-sync.md),
 [restore](plan/design/restore.md).
 
@@ -118,7 +120,11 @@ Specs: [scheduler](plan/design/scheduler.md), [fibers](plan/design/fibers.md),
 A codegen unit is one function instance, keyed by its code identity; equal instances are one.
 A dev build compiles a function when it is first called (lazy), by copy-and-patch from stencils,
 into the running process (no binary on disk, no link), and an edit patches the new code in place
-and rolls it back if checks fail. Dependencies arrive as one premapped image. A release build goes
+and rolls it back if checks fail. Stencil code is the first tier, not the last: a function the
+running program shows hot is recompiled by the optimizing tier in the background and patched in
+the same way, so dev code is fast without any edit waiting for an optimizer. Dependencies are
+compiled optimized once, shared by every checkout through the store, and arrive as one premapped
+image. A release build goes
 through blaze's pinned LLVM with per-function summaries, and blaze's own linker writes ELF,
 Mach-O and COFF in parallel, in place. blaze never runs rustc; what still does is listed in
 [no-rustc](../no-rustc.md).
@@ -225,7 +231,7 @@ processes exist ([tasks](plan/design/tasks.md)).
 
 **Docs stay small.** This page, the ledger, the bounds and one spec per unbuilt design. No lane
 notes, no pass reports, no indexes of indexes: what was done is the pull request and the commit; a
-measurement worth keeping is a `record` under `docs/reports/`. A design that changes edits its
+measurement worth keeping is a `record` under `fed1eb428d:docs/reports/`. A design that changes edits its
 spec in place. When a section here stops being true, fix it in the same change.
 
 ## Settled

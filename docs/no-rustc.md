@@ -315,7 +315,7 @@ there is the user's command):
 
 bun was not counted. Its workspace builds only after bun's own configure step has generated
 code and built its C and C++ (`harness/bunprep.py` under `nix develop .#bench-bun`), which the
-host did not have. What is known from [research/bun.md](research/bun.md) and the issues: bun
+host did not have. What is known from research/bun.md and the issues: bun
 needs `BLAZE_OTHER_TOOLCHAIN=1` for its pinned nightly; the whole-program report left 1,645
 functions to rustc, 907 of them reaching `type_info` and 304 `adt_const_params` (#34, #35); a
 signature edit goes to cargo because `posix_signal_handler` is left to rustc and writes a

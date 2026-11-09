@@ -357,7 +357,7 @@ daemon did not serve it (#84).
 `memsplit.py` says what each process of the daemon holds (the daemon, the project's worker, the
 spare) and of what kind of page, once ready, once the daemon has built its own base and after
 edits, with `--env` to try an allocator setting
-([research/daemon-memory.md](research/daemon-memory.md#2026-10-23-the-own-base-and-the-allocator)).
+(research/daemon-memory.md).
 `spare.py` starts a daemon with a tiny project, then builds one of `bench.py`'s projects under it
 from an empty target directory and again once it has built it, for builds of blaze given as
 `--variant LABEL:BIN[:VAR=VALUE...]` in interleaved rounds: the second project's cold and warm
@@ -366,12 +366,12 @@ worker's default ([cargo.md](cargo.md#what-a-build-does)); v2 has no spare worke
 until ready, so it measures the build and the memory alone.
 `heap.py` gives a heap profile's bytes to the salsa query whose value or record holds them, and to
 blaze's own structures; `heapfold.py` makes of a profile on macOS what `jeprof --collapsed` makes
-of it on Linux, for `heap.py` to read ([research/daemon-memory.md](research/daemon-memory.md)); `heap.py --syntax`
+of it on Linux, for `heap.py` to read (research/daemon-memory.md); `heap.py --syntax`
 says what of it is syntax trees, of which kind and from which query, and `cpufold.py` folds a
 `perf script` the same way for time ([flat-syntax.md](flat-syntax.md)). `leanprof.py` runs a
 project's cold start, own base, edits and warm start as phases with the times they began and
 ended, and `cpufold.py --phases` cuts a `perf` profile of the run by them, with what salsa was
-revalidating and who asked ([research/lean-frontend.md](research/lean-frontend.md)). `realbench.py` times
+revalidating and who asked (research/lean-frontend.md). `realbench.py` times
 `blaze build` against `cargo build` on ripgrep, just and nushell (cold, no-op and
 three kinds of edit), each `blaze build` row saying from its `blaze-work` line how the daemon
 linked it; the numbers are in [results.md](results.md#11-real-projects). `coldprof.py`
@@ -386,7 +386,7 @@ times a start on a warm store with nothing of rustc's ([#41](https://github.com/
 a first checkout on an empty store, a second on the store it filled, that daemon stopped and
 started, and once more, each followed by a body edit and its undoing; it keeps what each worker
 said in `WORK/said-STEP.txt` and exits 1 when a program's output is not what blaze's run of its checkout from nothing prints
-([research/warm-start.md](research/warm-start.md)). Their docstrings say how to run them.
+(research/warm-start.md). Their docstrings say how to run them.
 `bench.py` on real projects, with `benchreport.py`, is also what writes the benchmark
 tables and the README's numbers: [benchmarks.md](benchmarks.md). It runs every blaze build
 under `--message-format=json` and reads how it linked, what it compiled and its steps' times
@@ -400,7 +400,7 @@ edits, in interleaved rounds: an edit's wall time, its steps' times from the `bl
 line's `steps_us`, the daemon's cycles and instructions (counters.py; the cold start's on macOS
 alone), the cold start, and the daemon's peak memory. v1's edit-to-binary time, from a worker's
 log, has no v2 counterpart and is gone. It is how the release build's
-profile was chosen ([reports/RELEASE-BUILD.md](reports/RELEASE-BUILD.md)), and with `--train` it
+profile was chosen (reports/RELEASE-BUILD.md), and with `--train` it
 is the training of its PGO. `hotpatch.py` times an edit of a running program under Dioxus's
 subsecond against `blaze build` and `cargo build` with a restart; its program is
 `harness/hotpatch`. `benchhistory.py` appends a run to `docs/benchmarks/history/` (what the

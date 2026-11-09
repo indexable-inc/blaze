@@ -1,7 +1,7 @@
 """macroeval_corpus.py: blaze-macro-eval's corpus of real proc macros, each call expanded by
 blaze's evaluator and held to what the corpus says of it: the fixture crate's own tests of what
 each expansion does, built by blaze, the corpus's checks of every call, and kept expansions
-found again only when every input matches (`fastcompile-macros 6` in docs/v2/requests/fastcompile.md; the tests are
+found again only when every input matches (`fastcompile-macros 6` in fed1eb428d:docs/v2/requests/fastcompile.md; the tests are
 crates/blaze-macro-eval/tests/corpus.rs and kept.rs, and the fixture's
 tests/corpus/ws/calls/src/tests.rs). Nothing is compared with rustc's build (docs/harness.md).
 

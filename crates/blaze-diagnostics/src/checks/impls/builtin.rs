@@ -5,7 +5,7 @@
 //!
 //! A field of an enum whose type has the enum's parameters in it, other than one of them
 //! alone, is the front end's to type in the impl's environment (`hir::Type::fields` gives
-//! only a struct's or a union's); asked of it in `docs/v2/requests/diagnostics.md`
+//! only a struct's or a union's); asked of it in `fed1eb428d:docs/v2/requests/diagnostics.md`
 //! (`diagnostics-items-impls`), as are the notes of a field whose own `Copy` impl wants more
 //! than the impl gives (E0204's `ImplForTyRequires`) and E0367.
 //!
