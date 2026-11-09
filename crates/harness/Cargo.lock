@@ -914,6 +914,7 @@ dependencies = [
  "harness-ghostty-config",
  "harness-mach",
  "harness-native-api",
+ "harness-native-blaze",
  "harness-native-ecs",
  "harness-native-flecs",
  "harness-native-model",

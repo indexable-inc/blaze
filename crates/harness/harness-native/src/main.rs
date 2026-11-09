@@ -1,5 +1,6 @@
 //! harness-native: the harness as a native macOS app (AppKit, Metal, flecs), on den's native stack. See README.md.
 mod app;
+mod audio;
 use harness_native_render::{boxdraw, draw, gpu, pack, text};
 mod gallery;
 mod haptic;

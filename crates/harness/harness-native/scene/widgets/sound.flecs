@@ -1,0 +1,106 @@
+// The app's sound (src/audio.rs): a soft cue as an agent's step changes and a slow, quiet music that follows what it
+// does: bells and wooden bars, long tails and long silences, meant to be peaceful to work beside. Data
+// only: each cue a few Sounds (harness-native-blaze's voices: Bell, Mallet, Bass, Click, Thud, Whoosh), each with its
+// Onset, Pitch, Lasts, Gain and Pan; each theme a voice (its Sound, Lasts and Gain) and a Theme: a note about every
+// `every` seconds from `degrees`, semitones over the key. Everything is in one key (A, its major pentatonic: 0 2 4 7 9
+// and their octaves), so one theme hands over to the next with nothing to resolve: the notes still ringing belong to
+// both. A cue's or a theme's own Gain is how loud it plays; `hn.sound`'s is the master. native.json `sound: false`
+// turns it all off, `music: false` the themes.
+//
+// The names are the step items a running line shows (harness-native-render block.rs): exec read edit search net build
+// spawn wait sql think; and the cues `done` (the turn ended) .
+
+@tree ChildOf
+hn {
+  sound {
+    Gain: {amp: 0.5}
+    // A3.
+    key { Pitch: {hz: 220} }
+
+    cue {
+      // A command: two dry ticks, a prompt and its cursor.
+      exec {
+        Gain: {amp: 0.088}
+        a { Sound: {voice: Click}; Onset: {at: 0}; Pitch: {hz: 880}; Gain: {amp: 0.05}; Pan: {pos: -0.2, sweep: 0} }
+        b { Sound: {voice: Click}; Onset: {at: 0.07}; Pitch: {hz: 1320}; Gain: {amp: 0.05}; Pan: {pos: 0.2, sweep: 0} }
+      }
+      // A file read: a page, two soft bars.
+      read {
+        Gain: {amp: 0.077}
+        a { Sound: {voice: Mallet}; Onset: {at: 0}; Lasts: {dur: 0.8}; Pitch: {hz: 440}; Gain: {amp: 0.05} }
+        b { Sound: {voice: Mallet}; Onset: {at: 0.09}; Lasts: {dur: 0.9}; Pitch: {hz: 554.37}; Gain: {amp: 0.04} }
+      }
+      // An edit: a pencil's three taps.
+      edit {
+        Gain: {amp: 0.077}
+        a { Sound: {voice: Click}; Onset: {at: 0}; Pitch: {hz: 1100}; Gain: {amp: 0.04}; Pan: {pos: -0.3, sweep: 0} }
+        b { Sound: {voice: Click}; Onset: {at: 0.06}; Pitch: {hz: 1100}; Gain: {amp: 0.04} }
+        c { Sound: {voice: Click}; Onset: {at: 0.12}; Pitch: {hz: 1320}; Gain: {amp: 0.05}; Pan: {pos: 0.3, sweep: 0} }
+      }
+      // A search: something passing over, then a find.
+      search {
+        Gain: {amp: 0.072}
+        a { Sound: {voice: Whoosh}; Onset: {at: 0}; Lasts: {dur: 0.35}; Pitch: {hz: 1800}; Gain: {amp: 0.04}; Pan: {pos: -0.5, sweep: 1} }
+        b { Sound: {voice: Click}; Onset: {at: 0.3}; Pitch: {hz: 1760}; Gain: {amp: 0.04}; Pan: {pos: 0.4, sweep: 0} }
+      }
+      // A page fetched: two far bells, a fifth apart.
+      net {
+        Gain: {amp: 0.066}
+        a { Sound: {voice: Bell}; Onset: {at: 0}; Lasts: {dur: 1.6}; Pitch: {hz: 659.25}; Gain: {amp: 0.03}; Pan: {pos: -0.4, sweep: 0} }
+        b { Sound: {voice: Bell}; Onset: {at: 0.12}; Lasts: {dur: 1.8}; Pitch: {hz: 880}; Gain: {amp: 0.025}; Pan: {pos: 0.4, sweep: 0} }
+      }
+      // A build: a low wooden bar, struck once.
+      build {
+        Gain: {amp: 0.099}
+        a { Sound: {voice: Mallet}; Onset: {at: 0}; Lasts: {dur: 1}; Pitch: {hz: 110}; Gain: {amp: 0.06} }
+        b { Sound: {voice: Click}; Onset: {at: 0.01}; Pitch: {hz: 660}; Gain: {amp: 0.05} }
+      }
+      // An agent started: lift-off, then a high bar.
+      spawn {
+        Gain: {amp: 0.077}
+        a { Sound: {voice: Whoosh}; Onset: {at: 0}; Lasts: {dur: 0.6}; Pitch: {hz: 3000}; Gain: {amp: 0.04}; Pan: {pos: -0.6, sweep: 1.2} }
+        b { Sound: {voice: Mallet}; Onset: {at: 0.45}; Lasts: {dur: 1}; Pitch: {hz: 880}; Gain: {amp: 0.05}; Pan: {pos: 0.5, sweep: 0} }
+      }
+      // Waiting: one low bar.
+      wait {
+        Gain: {amp: 0.055}
+        a { Sound: {voice: Mallet}; Onset: {at: 0}; Lasts: {dur: 1.2}; Pitch: {hz: 329.63}; Gain: {amp: 0.04} }
+      }
+      // A query: three rows, rising.
+      sql {
+        Gain: {amp: 0.072}
+        a { Sound: {voice: Mallet}; Onset: {at: 0}; Lasts: {dur: 0.6}; Pitch: {hz: 277.18}; Gain: {amp: 0.04} }
+        b { Sound: {voice: Mallet}; Onset: {at: 0.06}; Lasts: {dur: 0.6}; Pitch: {hz: 329.63}; Gain: {amp: 0.04} }
+        c { Sound: {voice: Mallet}; Onset: {at: 0.12}; Lasts: {dur: 0.8}; Pitch: {hz: 440}; Gain: {amp: 0.04} }
+      }
+      // Thinking: one far bell.
+      think {
+        Gain: {amp: 0.044}
+        a { Sound: {voice: Bell}; Onset: {at: 0}; Lasts: {dur: 2}; Pitch: {hz: 554.37}; Gain: {amp: 0.03} }
+      }
+      // The turn ended: the chord, climbing home.
+      done {
+        Gain: {amp: 0.110}
+        a { Sound: {voice: Mallet}; Onset: {at: 0}; Lasts: {dur: 1}; Pitch: {hz: 440}; Gain: {amp: 0.05}; Pan: {pos: -0.3, sweep: 0} }
+        b { Sound: {voice: Mallet}; Onset: {at: 0.1}; Lasts: {dur: 1}; Pitch: {hz: 554.37}; Gain: {amp: 0.05} }
+        c { Sound: {voice: Mallet}; Onset: {at: 0.2}; Lasts: {dur: 1.2}; Pitch: {hz: 659.25}; Gain: {amp: 0.05}; Pan: {pos: 0.3, sweep: 0} }
+        d { Sound: {voice: Bell}; Onset: {at: 0.32}; Lasts: {dur: 2.2}; Pitch: {hz: 880}; Gain: {amp: 0.035} }
+      }
+    }
+
+    // Slow and sparse, a tea house at the edge of hearing: a bell or a soft wooden bar every few seconds, long tails,
+    // long silences. A busier step is a little nearer and a little quicker, never fast.
+    theme {
+      think { Theme: {every: 4.5, degrees: "0 7 12 16 19"}; Sound: {voice: Bell}; Lasts: {dur: 5}; Gain: {amp: 0.03} }
+      exec { Theme: {every: 2.2, degrees: "0 4 7 12"}; Sound: {voice: Mallet}; Lasts: {dur: 2.4}; Gain: {amp: 0.04} }
+      read { Theme: {every: 3, degrees: "4 7 9 12 16"}; Sound: {voice: Mallet}; Lasts: {dur: 3}; Gain: {amp: 0.035} }
+      edit { Theme: {every: 2.4, degrees: "7 9 12 14 16"}; Sound: {voice: Mallet}; Lasts: {dur: 2.4}; Gain: {amp: 0.04} }
+      search { Theme: {every: 2.8, degrees: "0 2 4 7 9"}; Sound: {voice: Mallet}; Lasts: {dur: 2.6}; Gain: {amp: 0.035} }
+      net { Theme: {every: 3.6, degrees: "12 14 16 19 21"}; Sound: {voice: Bell}; Lasts: {dur: 4.5}; Gain: {amp: 0.028} }
+      build { Theme: {every: 2, degrees: "-12 -5 0 4 7"}; Sound: {voice: Mallet}; Lasts: {dur: 2.4}; Gain: {amp: 0.045} }
+      spawn { Theme: {every: 2.2, degrees: "0 7 12 19 24"}; Sound: {voice: Mallet}; Lasts: {dur: 2.4}; Gain: {amp: 0.04} }
+      wait { Theme: {every: 6, degrees: "0 7"}; Sound: {voice: Bell}; Lasts: {dur: 6}; Gain: {amp: 0.025} }
+      sql { Theme: {every: 2.8, degrees: "-5 0 4 7 9"}; Sound: {voice: Mallet}; Lasts: {dur: 2.6}; Gain: {amp: 0.035} }
+    }
+  }
+}

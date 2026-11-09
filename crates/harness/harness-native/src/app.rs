@@ -71,6 +71,7 @@ const SCENE: &[(&str, &str)] = &[
     ("scene/widgets/picker.flecs", include_str!("../scene/widgets/picker.flecs")),
     ("scene/widgets/theme.flecs", include_str!("../scene/widgets/theme.flecs")),
     ("scene/widgets/stats.flecs", include_str!("../scene/widgets/stats.flecs")),
+    ("scene/widgets/sound.flecs", include_str!("../scene/widgets/sound.flecs")),
 ];
 
 /// The terminal's font size at zoom 1 (points) when the Ghostty config sets none (src/app/ghostty.rs).
@@ -383,6 +384,7 @@ fn scene_world() -> Result<World, String> {
     crate::keys::register(&world);
     view::register(&world);
     world.component::<chat::GenFeel>().writable();
+    world.component::<crate::audio::Theme>().writable();
     world.component::<chat::GenOn>();
     script::install(&world);
     let _ = world.entity_named(APP);
@@ -1726,6 +1728,67 @@ impl App {
         chat::plan::fill_plan(View::of(w.entity_from_id(self.ids.side_plan)), &windows, &kind, tone(w, "ink_muted"), model::now_ms() / 1000, false);
     }
 
+    /// Start the app's sound from the scene's `hn.sound` (scene/widgets/sound.flecs, src/audio.rs): the window's, never
+    /// an offscreen shot's. native.json `sound: false` keeps it silent, `music: false` plays the cues alone.
+    ///
+    /// # Errors
+    /// The scene's sound is malformed (named), or the system refused the output.
+    pub fn start_sound(&self) -> Result<(), String> {
+        use harness_native_blaze::sound::{Note, Voice as V};
+        use harness_native_ui_timeline_api::{Gain, Lasts, Onset, Pan, Pitch, Sound, Voice};
+        let on = |k: &str| crate::prefs::get(k).and_then(|v| v.as_bool()).unwrap_or(true);
+        if !on("sound") {
+            return Ok(());
+        }
+        let w = self.world.world_ref();
+        let at = |path: &str| w.try_lookup(path).ok_or_else(|| format!("the scene has no {path} (scene/widgets/sound.flecs)"));
+        let voice = |v: Voice| match v {
+            Voice::Bell => V::Bell,
+            Voice::Mallet => V::Mallet,
+            Voice::Bass => V::Bass,
+            Voice::Click => V::Click,
+            Voice::Thud => V::Thud,
+            Voice::Whoosh => V::Whoosh,
+            Voice::Fire => V::Fire,
+        };
+        let gain = |e: EntityView<'_>| e.try_cloned::<&Gain>().map_or(0.0, |g| g.amp);
+        let lasts = |e: EntityView<'_>| e.try_cloned::<&Lasts>().map_or(0.0, |l| l.dur);
+        let key = at("hn::sound::key")?.try_cloned::<&Pitch>().map(|p| p.hz).filter(|hz| *hz > 0.0).ok_or("hn.sound.key has no Pitch")?;
+        let mut cues = Vec::new(); // alloc: the scene's sounds, read once
+        at("hn::sound::cue")?.each_child(|c| {
+            let mut notes = Vec::new();
+            c.each_child(|n| {
+                if let (Some(s), Some(o)) = (n.try_cloned::<&Sound>(), n.try_cloned::<&Onset>()) {
+                    let Pan { pos, sweep } = n.try_cloned::<&Pan>().unwrap_or_default();
+                    let freq = n.try_cloned::<&Pitch>().map_or(0.0, |p| p.hz);
+                    notes.push(Note { voice: voice(s.voice), at: o.at.max(0.0), dur: lasts(n), freq, amp: gain(n), pan: pos.clamp(-1.0, 1.0), sweep });
+                }
+            });
+            notes.sort_by(|a, b| a.at.total_cmp(&b.at));
+            cues.push(crate::audio::Cue(c.name(), gain(c), notes));
+        });
+        let mut themes = Vec::new(); // alloc: the scene's themes, read once
+        let mut bad = None;
+        at("hn::sound::theme")?.each_child(|t| {
+            let (Some(th), Some(s)) = (t.try_cloned::<&crate::audio::Theme>(), t.try_cloned::<&Sound>()) else { return };
+            let degrees: Result<Vec<f32>, _> = th.degrees.as_str().split_whitespace().map(str::parse::<f32>).collect();
+            match degrees {
+                Ok(mut d) if !d.is_empty() && th.every > 0.0 => {
+                    d.sort_by(f32::total_cmp);
+                    let notes = d.iter().map(|semi| Note { voice: voice(s.voice), at: 0.0, dur: lasts(t), freq: key * 2f32.powf(semi / 12.0), amp: 0.05, pan: 0.0, sweep: 0.0 }).collect();
+                    themes.push(crate::audio::Tune(t.name(), th.every, gain(t), notes));
+                }
+                _ => bad = Some(format!("{}: Theme needs every > 0 and degrees as numbers in words (\"0 7 12\"), not {:?}", t.path(), th.degrees.as_str())),
+            }
+        });
+        if let Some(e) = bad {
+            return Err(e);
+        }
+        cues.sort_by(|a, b| a.0.cmp(&b.0));
+        themes.sort_by(|a, b| a.0.cmp(&b.0));
+        crate::audio::start(gain(at("hn::sound")?), on("music"), cues, themes)
+    }
+
     /// The agent kind cmd+N starts a chat of: the one last used (here, else native.json `chat_kind`), else the picker's
     /// last pick when that is an agent (`new_kind`), else Claude.
     fn chat_kind(&self) -> String {
@@ -1831,6 +1894,8 @@ impl App {
         self.browser_frame_start(dt);
         self.step_fold(dt);
         self.step_tree_scroll(dt);
+        // The sound follows the chat in front (src/audio.rs; silent unless the window started it).
+        crate::audio::working(self.focused_chat().is_some_and(|(_, _, sid)| self.chats.borrow().get(&sid).is_some_and(|t| t.busy)));
         self.sync_side_status();
         self.step_archive_scroll();
         self.step_chat_scroll();
