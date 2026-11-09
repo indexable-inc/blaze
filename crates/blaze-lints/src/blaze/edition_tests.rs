@@ -4,7 +4,7 @@
 //! std's does, and an atomic holding an `UnsafeCell`. Then the four `unmarked_*` lints, over
 //! the effects tests' toolchain (an `Allocator`, a `Vec` that allocates through one, a
 //! `Mutex::lock`, `env::var` and `SystemTime::now` at the paths the models name): what each
-//! finds, what it leaves, and the one fix of a function.
+//! finds, what it leaves, and where each fix writes its attribute.
 
 use std::path::PathBuf;
 
@@ -296,7 +296,6 @@ pub fn mix(a: u32, b: u32) -> u32 {
         "{out}"
     );
     assert!(out.contains("blaze::unmarked_pure"), "{out}");
-    assert!(!out.contains("also stands for"), "one lint is on:\n{out}");
     let text = fixed(&["unmarked_pure"], "", MAIN);
     let want = r#"
 /// The two mixed.
@@ -554,11 +553,12 @@ pub fn waits(m: &std::sync::Mutex<u32>) -> u32 {
     assert_eq!(proved(&out, "waits"), 0, "{out}");
 }
 
-/// A function all four hold of has one finding, under `unmarked_pure`, naming all four, and
-/// one fix that writes the four attributes, one per line at the item's indentation, in the
-/// order pure, nopanic, noalloc, nonblocking.
+/// A function all four hold of has one finding per lint, each at its name with its own
+/// one-attribute fix; `blaze check --fix` makes them one per pass and leaves the four
+/// attributes, one per line at the item's indentation, in the order pure, nopanic, noalloc,
+/// nonblocking.
 #[test]
-fn a_function_all_four_hold_of_has_one_finding_and_one_fix() {
+fn a_function_all_four_hold_of_has_a_finding_per_lint_and_ends_marked_in_order() {
     const MAIN: &str = r#"
 pub struct Pair(u32, u32);
 impl Pair {
@@ -569,17 +569,14 @@ impl Pair {
 }
 "#;
     let out = unmarked(&UNMARKED, " cfg:overflow_checks", Conf::default(), MAIN);
-    assert_eq!(proved(&out, "mix"), 1, "{out}");
-    assert!(
-        out.contains(
-            "`fn mix` is proved pure, nopanic, noalloc and nonblocking through every call it makes, and is not marked `#[blaze::pure]`, `#[blaze::nopanic]`, `#[blaze::noalloc]` and `#[blaze::nonblocking]`"
-        ),
-        "{out}"
-    );
-    assert!(
-        out.contains("also stands for `blaze::unmarked_nopanic`, `blaze::unmarked_noalloc` and `blaze::unmarked_nonblocking`"),
-        "{out}"
-    );
+    assert_eq!(proved(&out, "mix"), 4, "{out}");
+    for word in ["pure", "nopanic", "noalloc", "nonblocking"] {
+        let message = format!(
+            "`fn mix` is proved {word} through every call it makes, and is not marked `#[blaze::{word}]`"
+        );
+        assert!(out.contains(&message), "{word}:\n{out}");
+        assert!(out.contains(&format!("blaze::unmarked_{word}")), "{word}:\n{out}");
+    }
     let text = fixed(&UNMARKED, " cfg:overflow_checks", MAIN);
     let want = r#"
 pub struct Pair(u32, u32);
@@ -597,6 +594,133 @@ impl Pair {
     assert_eq!(text, want.trim_start_matches('\n'));
 }
 
+/// With only `unmarked_pure` on, a function all four hold of has its one finding, and the fix
+/// writes `#[blaze::pure]` alone.
+#[test]
+fn only_the_lints_that_are_on_find_and_mark() {
+    const MAIN: &str = r#"
+pub fn mix(a: u32, b: u32) -> u32 {
+    a ^ b
+}
+"#;
+    let out = unmarked(&["unmarked_pure"], " cfg:overflow_checks", Conf::default(), MAIN);
+    assert_eq!(proved(&out, "mix"), 1, "{out}");
+    assert!(out.contains("`fn mix` is proved pure "), "{out}");
+    let text = fixed(&["unmarked_pure"], " cfg:overflow_checks", MAIN);
+    let want = r#"
+#[blaze::pure]
+pub fn mix(a: u32, b: u32) -> u32 {
+    a ^ b
+}
+"#;
+    assert_eq!(text, want.trim_start_matches('\n'));
+}
+
+/// `#[expect(blaze::unmarked_noalloc)]` on a function all four hold of is fulfilled by its
+/// finding, which is not said; the other three are, and the fix writes their three attributes
+/// and not `noalloc`.
+#[test]
+fn an_expected_lint_is_fulfilled_and_its_attribute_is_not_written() {
+    const MAIN: &str = r#"
+#[expect(blaze::unmarked_noalloc, reason = "its table may move to the heap")]
+pub fn mix(a: u32, b: u32) -> u32 {
+    a ^ b
+}
+"#;
+    let out = unmarked(&UNMARKED, " cfg:overflow_checks", Conf::default(), MAIN);
+    assert_eq!(proved(&out, "mix"), 3, "{out}");
+    assert!(!out.contains("`fn mix` is proved noalloc"), "{out}");
+    assert!(!out.contains("unfulfilled"), "the expectation is met:\n{out}");
+    let text = fixed(&UNMARKED, " cfg:overflow_checks", MAIN);
+    let want = r#"
+#[expect(blaze::unmarked_noalloc, reason = "its table may move to the heap")]
+#[blaze::pure]
+#[blaze::nopanic]
+#[blaze::nonblocking]
+pub fn mix(a: u32, b: u32) -> u32 {
+    a ^ b
+}
+"#;
+    assert_eq!(text, want.trim_start_matches('\n'));
+}
+
+/// The fix keeps the order pure, nopanic, noalloc, nonblocking around the attributes a
+/// function has, moving none: `pure` goes above a `nopanic`; `pure`, `nopanic` and `noalloc`
+/// go above a `nonblocking`, in order; `nopanic` goes between a `pure` and a `noalloc`.
+#[test]
+fn the_fix_keeps_the_effect_attributes_in_order() {
+    let above = fixed(
+        &["unmarked_pure"],
+        " cfg:overflow_checks",
+        r#"
+#[blaze::nopanic]
+pub fn mix(a: u32, b: u32) -> u32 {
+    a ^ b
+}
+"#,
+    );
+    let want = r#"
+#[blaze::pure]
+#[blaze::nopanic]
+pub fn mix(a: u32, b: u32) -> u32 {
+    a ^ b
+}
+"#;
+    assert_eq!(above, want.trim_start_matches('\n'));
+
+    let three = fixed(
+        &UNMARKED,
+        " cfg:overflow_checks",
+        r#"
+/// The two mixed.
+#[inline]
+#[blaze::nonblocking]
+pub fn mix(a: u32, b: u32) -> u32 {
+    a ^ b
+}
+"#,
+    );
+    let want = r#"
+/// The two mixed.
+#[inline]
+#[blaze::pure]
+#[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
+pub fn mix(a: u32, b: u32) -> u32 {
+    a ^ b
+}
+"#;
+    assert_eq!(three, want.trim_start_matches('\n'));
+
+    let between = fixed(
+        &["unmarked_nopanic"],
+        " cfg:overflow_checks",
+        r#"
+pub struct Pair(u32, u32);
+impl Pair {
+    #[blaze::pure]
+    #[blaze::noalloc]
+    pub fn mix(&self) -> u32 {
+        self.0 ^ self.1
+    }
+}
+"#,
+    );
+    let want = r#"
+pub struct Pair(u32, u32);
+impl Pair {
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    pub fn mix(&self) -> u32 {
+        self.0 ^ self.1
+    }
+}
+"#;
+    assert_eq!(between, want.trim_start_matches('\n'));
+}
+
 /// The four are in `blaze::edition`: silent until the group, or one of them, is turned on.
 #[test]
 fn the_unmarked_lints_are_off_until_the_edition_group_is_on() {
@@ -608,6 +732,8 @@ pub fn mix(a: u32, b: u32) -> u32 {
     let off = lint(&effects_fixture("", MAIN), "-A clippy::all");
     assert!(!off.contains(" is proved "), "{off}");
     let on = lint(&effects_fixture("", MAIN), "-A clippy::all --warn=blaze::edition");
-    assert_eq!(proved(&on, "mix"), 1, "{on}");
-    assert!(on.contains("`fn mix` is proved pure, noalloc and nonblocking"), "no overflow checks, so no nopanic:\n{on}");
+    assert_eq!(proved(&on, "mix"), 3, "no overflow checks, so no nopanic:\n{on}");
+    for word in ["pure", "noalloc", "nonblocking"] {
+        assert!(on.contains(&format!("`fn mix` is proved {word} ")), "{word}:\n{on}");
+    }
 }

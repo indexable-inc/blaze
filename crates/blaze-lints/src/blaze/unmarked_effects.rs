@@ -41,12 +41,23 @@
 //! in `clippy.toml` extends it to every function. A method of an impl may be marked whether or
 //! not its trait is: the check reads the function's own attribute first.
 //!
-//! One finding per function, at its name, under the first of the four lints (in the order
-//! pure, nopanic, noalloc, nonblocking) that is on and proved, naming every one that is: two
-//! fixes inserting at one place clash in `blaze check --fix` (`fix::overlaps`), so the
-//! function has one fix, machine-applicable, that writes each attribute on its own line above
-//! the signature, under the doc comments and the attributes already there, at the item's
-//! indentation and in that order.
+//! One finding per lint that is on and proved, each at the function's name, so a level set
+//! on the function (`#[expect(blaze::unmarked_noalloc)]`, `#[allow(..)]`) works per lint as
+//! for any other. Each finding has its own machine-applicable fix, of its one attribute: the
+//! level of a lint at an item is decided after this query (`check::Driver::finish`, from the
+//! command line and every attribute around the item, which the query is not keyed by), so no
+//! finding here can know which of the others is allowed or expected, and one fix for all of
+//! them would write an attribute its lint was told not to ask for.
+//!
+//! Where a fix writes its attribute keeps the function's effect attributes in the order
+//! pure, nopanic, noalloc, nonblocking, moving none it has: on a line of its own before the
+//! first effect attribute written that comes later in that order; else after the last one
+//! written; else directly above the signature, under the doc comments and the other
+//! attributes, at the item's indentation. Two of them can land at one place (a function with
+//! no effect attribute has all of them above its signature), which `blaze check --fix` takes
+//! as a clash (`fix::overlaps`) and makes one per pass, in the order of the findings, which is
+//! that order: each pass places the next against what the last one wrote, so four attributes
+//! take `fix::PASSES` passes and come out in order.
 
 use base_db::Db;
 use hir::HasVisibility as _;
@@ -62,7 +73,7 @@ use hir_ty_pure::{
 };
 use syntax::{
     NodeOrToken, SyntaxKind, TextRange, TextSize,
-    view::{self as ast, AstNode as _, HasName as _, HasVisibility as _},
+    view::{self as ast, AstNode as _, HasAttrs as _, HasName as _, HasVisibility as _},
 };
 
 use super::{Lint, effects, facts, implicit_allocator::Allocators};
@@ -80,14 +91,13 @@ const EFFECTS: [(Lint, &EffectDef); 4] = [
     (Lint::UnmarkedNonblocking, &NONBLOCKING),
 ];
 
-/// The finding of the function `cx` walks the body of.
+/// One lint's finding of the function `cx` walks the body of.
 struct Found {
-    /// The first lint on and proved: the one the finding is reported under.
     lint: Lint,
     name: TextRange,
     message: String,
     notes: Vec<String>,
-    /// Where the signature starts: the fix is inserted there.
+    /// Where the fix writes the attribute.
     insert: TextSize,
     fix: String,
     label: String,
@@ -97,25 +107,29 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>) {
     if !EFFECTS.iter().any(|(lint, _)| cx.on_blaze(*lint)) {
         return;
     }
-    let Some(found) = find(cx) else { return };
     let root = cx.root();
-    let span = cx.span(found.name);
-    let insert = cx.span(TextRange::empty(found.insert));
-    let lint = found.lint;
-    let diagnostic = cx.blaze(lint, root, span, found.message);
-    for note in found.notes {
-        diagnostic.note(note);
+    for found in find(cx).unwrap_or_default() {
+        let span = cx.span(found.name);
+        let insert = cx.span(TextRange::empty(found.insert));
+        let lint = found.lint;
+        let diagnostic = cx.blaze(lint, root, span, found.message);
+        for note in found.notes {
+            diagnostic.note(note);
+        }
+        diagnostic.multipart_suggestion(
+            found.label,
+            // alloc: the fix's one part
+            vec![(insert, found.fix)],
+            Applicability::MachineApplicable,
+        );
+        diagnostic
+            .help(lint.help())
+            .help(format!("for further information visit {}", lint.docs_url()));
     }
-    diagnostic.multipart_suggestion(
-        found.label,
-        // alloc: the fix's one part
-        vec![(insert, found.fix)],
-        Applicability::MachineApplicable,
-    );
-    diagnostic.help(lint.help()).help(format!("for further information visit {}", lint.docs_url()));
 }
 
-fn find<'t>(cx: &Cx<'_, 't>) -> Option<Found> {
+/// The findings of the function, one per lint on and proved, in the order of [`EFFECTS`].
+fn find<'t>(cx: &Cx<'_, 't>) -> Option<Vec<Found>> {
     let root = cx.root();
     let f = ast::Fn::cast(root)?;
     if cx.is_in_test(root) {
@@ -138,9 +152,17 @@ fn find<'t>(cx: &Cx<'_, 't>) -> Option<Found> {
         return None;
     }
     let krate = HasModule::krate(&func, db);
-    // Each effect proved, by its attribute's word, with whether its proof leaves a call open.
-    let mut proved: Vec<(Lint, &'static str, bool)> = Vec::new(); // alloc: at most four, once per finding
-    for (lint, effect) in EFFECTS {
+    let name = f.name()?;
+    let name_range = cx.range(name.syntax())?;
+    let whole = cx.range(root)?;
+    let text = cx.text();
+    // A place of the function's tree in the text the fix is made in.
+    let in_text = |at: TextSize| whole.start() + (at - root.text_range().start());
+    let signature = signature_start(f)?;
+    let written = written_effects(f);
+
+    let mut found = Vec::new(); // alloc: at most four findings, once per function that has one
+    for (place, (lint, effect)) in EFFECTS.into_iter().enumerate() {
         if !cx.on_blaze(lint) || effects::marked(db, func, effect).is_some() {
             continue;
         }
@@ -157,77 +179,89 @@ fn find<'t>(cx: &Cx<'_, 't>) -> Option<Found> {
         {
             continue;
         }
-        proved.push((lint, effect.name, proof.open));
-    }
-    let &(lint, ..) = proved.first()?;
-    let name = f.name()?;
-    let name_range = cx.range(name.syntax())?;
-    let whole = cx.range(root)?;
-    let insert = whole.start() + (signature_start(f)? - root.text_range().start());
-
-    let words: Vec<&str> = proved.iter().map(|&(_, word, _)| word).collect(); // alloc: a message's parts
-    let attrs: Vec<String> = words.iter().map(|word| format!("`#[blaze::{word}]`")).collect(); // alloc: as above
-    let attrs: Vec<&str> = attrs.iter().map(String::as_str).collect(); // alloc: as above
-    let relies =
-        if lint == Lint::UnmarkedPure { "callers and the cache" } else { "callers" };
-    let message = format!(
-        "`fn {}` is proved {} through every call it makes, and is not marked {}: marking it lets {relies} rely on it",
-        name.text(),
-        listed(&words),
-        listed(&attrs),
-    );
-    let mut notes = Vec::new(); // alloc: a finding's notes, at most three, once per finding
-    if proved.iter().any(|&(.., open)| open) {
-        notes.push(
-            "what only an instance decides (a type parameter's method, its drop, a parameter of a type parameter's type) is left to each instance, as it is for a marked generic function"
-                .to_owned(), // alloc: a note
+        let word = effect.name;
+        let relies =
+            if lint == Lint::UnmarkedPure { "callers and the cache" } else { "callers" };
+        let message = format!(
+            "`fn {}` is proved {word} through every call it makes, and is not marked `#[blaze::{word}]`: marking it lets {relies} rely on it",
+            name.text(),
         );
-    }
-    if proved.iter().any(|&(it, ..)| it == Lint::UnmarkedNopanic) {
-        notes.push(
-            "`nopanic` holds with this crate's overflow checks on, so the mark holds without them too"
-                .to_owned(), // alloc: a note
-        );
-    }
-    if proved.len() > 1 {
-        let others: Vec<String> =
-            proved[1..].iter().map(|&(it, ..)| format!("`blaze::{}`", it.name())).collect(); // alloc: a note's parts
-        let others: Vec<&str> = others.iter().map(String::as_str).collect(); // alloc: as above
-        notes.push(format!(
-            "this one finding also stands for {}: the fix writes every attribute, one per line, in the order pure, nopanic, noalloc, nonblocking",
-            listed(&others)
-        ));
-    }
-
-    // The attributes go where the signature starts: on lines of their own at its indentation
-    // when it starts its line, before it on its line otherwise.
-    let text = cx.text();
-    let at = usize::from(insert).min(text.len());
-    let line = &text[text[..at].rfind('\n').map_or(0, |it| it + 1)..at];
-    let own_line = line.trim().is_empty();
-    let mut fix = String::new(); // alloc: the fix's text
-    for word in &words {
-        fix.push_str("#[blaze::");
-        fix.push_str(word);
-        fix.push(']');
-        if own_line {
-            fix.push('\n');
-            fix.push_str(line);
-        } else {
-            fix.push(' ');
+        let mut notes = Vec::new(); // alloc: a finding's notes, at most two
+        if proof.open {
+            notes.push(
+                "what only an instance decides (a type parameter's method, its drop, a parameter of a type parameter's type) is left to each instance, as it is for a marked generic function"
+                    .to_owned(), // alloc: a note
+            );
         }
+        if lint == Lint::UnmarkedNopanic {
+            notes.push(
+                "`nopanic` holds with this crate's overflow checks on, so the mark holds without them too"
+                    .to_owned(), // alloc: a note
+            );
+        }
+        // Before the first effect attribute written that comes later in the order, else after
+        // the last one written, else where the signature starts.
+        let later = written
+            .iter()
+            .filter(|&&(at, _)| at > place)
+            .map(|&(_, range)| range)
+            .min_by_key(|range| range.start());
+        let last = written.iter().map(|&(_, range)| range).max_by_key(|range| range.end());
+        let (insert, fix) = match (later, last) {
+            (Some(next), _) => before(text, in_text(next.start()), word),
+            (None, Some(last)) => after(text, in_text(last.start()), in_text(last.end()), word),
+            (None, None) => before(text, in_text(signature), word),
+        };
+        let label = format!("mark it `#[blaze::{word}]`");
+        found.push(Found { lint, name: name_range, message, notes, insert, fix, label });
     }
-    let label = format!("mark it {}", listed(&attrs));
-    Some(Found { lint, name: name_range, message, notes, insert, fix, label })
+    Some(found)
 }
 
-/// `items` as a sentence lists them: "a", "a and b", "a, b and c".
-fn listed(items: &[&str]) -> String {
-    match items {
-        [] => String::new(),
-        [one] => (*one).to_owned(), // alloc: a message's part
-        [head @ .., last] => format!("{} and {last}", head.join(", ")),
+/// What of `text` is on its line before `at`.
+fn line_before(text: &str, at: TextSize) -> &str {
+    let at = usize::from(at).min(text.len());
+    &text[text[..at].rfind('\n').map_or(0, |it| it + 1)..at]
+}
+
+/// The edit that writes `#[blaze::<word>]` before what starts at `at`: on a line of its own at
+/// that line's indentation when `at` starts its line, before it on its line otherwise.
+fn before(text: &str, at: TextSize, word: &str) -> (TextSize, String) {
+    let lead = line_before(text, at);
+    match lead.trim().is_empty() {
+        true => (at, format!("#[blaze::{word}]\n{lead}")), // alloc: the fix's text
+        false => (at, format!("#[blaze::{word}] ")),       // alloc: the fix's text
     }
+}
+
+/// The edit that writes `#[blaze::<word>]` after the attribute from `start` to `end`: on the
+/// next line at its indentation when the attribute starts its line, after it otherwise.
+fn after(text: &str, start: TextSize, end: TextSize, word: &str) -> (TextSize, String) {
+    let lead = line_before(text, start);
+    match lead.trim().is_empty() {
+        true => (end, format!("\n{lead}#[blaze::{word}]")), // alloc: the fix's text
+        false => (end, format!(" #[blaze::{word}]")),       // alloc: the fix's text
+    }
+}
+
+/// The effect attributes written on `f`, a `cfg_attr`'s included: each one's place in
+/// [`EFFECTS`] and where its attribute is in `f`'s tree. Read as the front end reads a tool
+/// attribute, by its path's two segments (`hir_def::attrs`); whether the function is marked
+/// is the front end's answer ([`effects::marked`]), this only places the fix.
+fn written_effects(f: ast::Fn<'_>) -> Vec<(usize, TextRange)> {
+    let mut found = Vec::new(); // alloc: the few effect attributes of one function
+    for attr in f.attrs() {
+        for meta in attr.skip_cfg_attrs() {
+            let Some(path) = meta.path() else { continue };
+            let path: String =
+                path.syntax().text().chars().filter(|it| !it.is_whitespace()).collect(); // alloc: one attribute's path
+            let Some(word) = path.strip_prefix("blaze::") else { continue };
+            if let Some(place) = EFFECTS.iter().position(|(_, effect)| effect.name == word) {
+                found.push((place, attr.syntax().text_range()));
+            }
+        }
+    }
+    found
 }
 
 /// Where `f`'s signature starts in its tree: past its doc comments and attributes, at its

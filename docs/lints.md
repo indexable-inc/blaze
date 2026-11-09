@@ -1234,9 +1234,9 @@ a visibility written (`pub`, `pub(crate)`, `pub(in ..)`), or a method of a trait
 of one, whose trait has one. `unmarked-effects-private = true` in `clippy.toml` finds every
 function.
 
-One finding per function, at its name. When several of the four are on and proved, the finding
-is reported under the first (in the order pure, nopanic, noalloc, nonblocking) and names them
-all, because `blaze check --fix` refuses two fixes that insert at one place.
+One finding per lint that is on and proved, each at the function's name with its own fix, so a
+level set on the function (`#[expect(blaze::unmarked_noalloc, reason = "..")]`, `#[allow(..)]`)
+works per lint, and `--fix` writes only the attributes of the lints left on there.
 
 - A generic function is proved as a marked one is checked: in its own where-clauses, with what
   only an instance decides (a type parameter's method, its drop) left to each instance.
@@ -1257,9 +1257,12 @@ border. A mark the code already earns lets callers rely on it (a `pure` caller n
 `trusted`, the kernel caches a pure step), and from then on its lint refuses a change that
 breaks it, naming the call chain.
 
-**How to fix it.** `blaze check --fix` writes each attribute on its own line directly above the
-signature, under the doc comments and the attributes already there, at the item's indentation,
-in the order pure, nopanic, noalloc, nonblocking.
+**How to fix it.** `blaze check --fix` writes each attribute on its own line at the item's
+indentation, keeping the function's effect attributes in the order pure, nopanic, noalloc,
+nonblocking and moving none it has: before the first one written that comes later in that
+order, else after the last one written, else directly above the signature, under the doc
+comments and the other attributes. Attributes that land at one place are written one per pass
+of `--fix`, so a function gaining all four takes its four passes.
 
 **Not found.** A function already marked in any form (the bare word, `trusted = ".."`, a
 malformed attribute, or the attribute on its trait); a trait method with no body; a test, a
