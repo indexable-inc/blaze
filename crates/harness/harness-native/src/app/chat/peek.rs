@@ -36,7 +36,7 @@ use harness_native_render::paint::spans_of;
 use harness_native_ui_inline::{Tag, files};
 use harness_native_ui_look_api::Fill;
 use harness_native_ui_node_api::Laid;
-use harness_native_ui_text_api::{Icon, InlineHot, InlineLive, InlineMark, InlineState, PageView, Picture};
+use harness_native_ui_text_api::{Highlight, Icon, InlineHot, InlineLive, InlineMark, InlineState, PageView, Picture};
 use super::checks;
 use harness_proto::peek::{GhCheckState, GhChecks, GhCi, GhItem, GhKind, GhRef, GhState, PageMeta};
 use std::collections::BTreeMap;
@@ -465,7 +465,9 @@ impl App {
                     };
                     lines.push(header(ChipIcon::Drawing(files::drawing(kind)), None, path.to_owned()));
                     match peeked {
-                        Peeked::Text(text) => lines.push(("code", "hn.PeekCode", Line::Words(text.clone()))),
+                        Peeked::Text(text) => {
+                            lines.push(("code", "hn.PeekCode", Line::Code { text: text.clone(), file: path.to_owned() }));
+                        }
                         Peeked::Note(note) => lines.push(("why", "hn.PeekMeta", Line::Words(note.clone()))),
                         Peeked::Folder { entries, more } => {
                             lines.push(("entries", "hn.PeekList", Line::Entries(entries.clone())));
@@ -490,6 +492,21 @@ impl App {
                 v.text(s);
             }
             Line::Markdown(s) => markdown = Some((v, s.clone())),
+            // Code as the editor shows it: coloured by its language (tree-sitter, `code_ink.*`), each line whole and cut by
+            // the card's edge, never wrapped onto the next (a wrapped line lost its indent and read as dedented).
+            Line::Code { text, file } => {
+                if let Some(c) = v.part("text") {
+                    c.text(text);
+                    let e = c.entity();
+                    if harness_native_render::highlight::knows(file) {
+                        if e.try_cloned::<&Highlight>().is_none_or(|h| h.file.as_str() != file.as_str()) {
+                            e.set(Highlight { file: file.as_str().into() });
+                        }
+                    } else if e.has(Highlight::id()) {
+                        e.remove(Highlight::id());
+                    }
+                }
+            }
             Line::Site { glyph, ink, name } => {
                 if let Some(i) = v.part("icon") {
                     set_if(i, Icon { glyph: glyph.as_str().into() });
@@ -701,6 +718,8 @@ fn breathe(m: View<'_>, on: bool) {
 /// One line of a card.
 enum Line {
     Words(String),
+    /// A file's lines from where the place points, and the file (its language colours them).
+    Code { text: String, file: String },
     /// A description as markdown: its blocks as the transcript's rows draw them (hn.PeekMarkdown holds them).
     Markdown(String),
     /// The title, strong, flush left.

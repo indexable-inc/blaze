@@ -180,13 +180,35 @@ impl PartialEq for Transcript {
 /// How many characters of the first user line a title keeps.
 pub const TITLE_CHARS: usize = 60;
 
-/// A chat's title from its first user message: the first non-blank line, cut to [`TITLE_CHARS`] with an ellipsis.
+/// A chat's title from its first user message: its first line with words on it (a heading's or a quote's marks taken
+/// off), its whitespace folded to single spaces, cut at the last word that fits in [`TITLE_CHARS`] with an ellipsis (a
+/// first word longer than that is cut inside it), and no comma or colon left before the ellipsis.
 #[must_use]
 pub fn title_of(text: &str) -> String {
-    let first = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
-    let mut s: String = first.chars().take(TITLE_CHARS).collect();
-    if first.chars().count() > TITLE_CHARS {
-        s.push('\u{2026}');
+    let first = text
+        .lines()
+        .map(|l| l.trim().trim_start_matches(['#', '>']).trim())
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    let mut s = String::new();
+    let mut n = 0;
+    for word in first.split_whitespace() {
+        let len = word.chars().count();
+        let gap = usize::from(n > 0);
+        if n + gap + len > TITLE_CHARS {
+            if n == 0 {
+                s.extend(word.chars().take(TITLE_CHARS));
+            }
+            let kept = s.trim_end_matches([',', ';', ':', '-', '.', ' ']).len();
+            s.truncate(kept);
+            s.push('\u{2026}');
+            return s;
+        }
+        if gap == 1 {
+            s.push(' ');
+        }
+        s.push_str(word);
+        n += gap + len;
     }
     s
 }
@@ -437,6 +459,21 @@ pub fn main_arg(input: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A title is the first line with words, its spaces folded, cut between words with an ellipsis and never mid-word
+    /// (but a single word too long for it), no comma left hanging before the ellipsis.
+    #[test]
+    fn a_title_is_cut_between_words() {
+        assert_eq!(title_of("\n\n  ## fix   the\tbuild  \nmore"), "fix the build");
+        let long = "please look at why the sidebar rows read claude and a number, then make them say what they are";
+        let t = title_of(long);
+        assert_eq!(t, "please look at why the sidebar rows read claude and a\u{2026}");
+        assert!(t.chars().count() <= TITLE_CHARS + 1 && long.starts_with(t.trim_end_matches('\u{2026}')));
+        assert_eq!(title_of("one two three four five six seven eight nine ten eleven, twelve thirteen"), "one two three four five six seven eight nine ten eleven\u{2026}");
+        let word = "x".repeat(TITLE_CHARS + 5);
+        assert_eq!(title_of(&word), format!("{}\u{2026}", "x".repeat(TITLE_CHARS)));
+        assert_eq!(title_of("   "), "");
+    }
 
     #[test]
     fn partials_grow_and_the_final_replaces_them() {

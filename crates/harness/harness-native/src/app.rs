@@ -958,9 +958,9 @@ impl App {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as u64);
         // Each row is a template instance (scene/widgets/rows.flecs): the row's facts as props, written only when one
-        // changed (View::props), and flecs re-runs only the parts that read it. No dots and no marks: how a row stands is
-        // in its title's ink (`look`), the sheen through it while it works (`pace`, `busy`) and a few muted words
-        // trailing it (`meta`).
+        // changed (View::props), and flecs re-runs only the parts that read it. A session's row leads with its kind's mark
+        // (`kind`); no status dots: how a row stands is in its title's ink (`look`), the sheen through it while it works
+        // (`pace`, `busy`) and a few muted words trailing it (`meta`). Folded rows count what works under them (`under`).
         let mut forced = 0usize;
         view::for_each_of(tree, info, |row, r, new| {
             if new {
@@ -987,7 +987,7 @@ impl App {
                 ("selected", Prop::Bool(selected)),
                 ("depth", Prop::Int(depth as i64)),
                 ("kids", Prop::Bool(fold::has_kids(o))),
-                ("open", Prop::Bool(!o.has(model::Folded::id()))),
+                ("open", Prop::Bool(!model::folded(o))),
                 ("focus", Prop::Bool(selected && me.tree_focus && me.focused)),
                 ("look", Prop::Str(look)),
                 // Its menu is open (row_menu.rs): ringed, the selection left where it is.
@@ -1053,6 +1053,14 @@ impl App {
                 };
                 let when = ago(now.saturating_sub(model::when(o)));
                 let folder = o.try_cloned::<&model::Cwd>().map(|c| folder_of(c.s.as_str())).unwrap_or_default();
+                // What it is (its icon on the row) and its number, which its name never carries: the tooltip's last words.
+                let kind = model::kind_name(o);
+                let number = o.try_cloned::<&model::Object>().map(|ob| format!(" \u{b7} {} s{}", capitalised(kind), ob.id)).unwrap_or_default();
+                // Folded (as every row starts), what is at work under it is counted here rather than opening it.
+                let under = match model::hidden_active(w, e) {
+                    0 => String::new(),
+                    n => n.to_string(),
+                };
                 let (meta, why) = match (status, code) {
                     ("killed", _) => ("killed".to_owned(), format!("{folder} \u{b7} killed {when} ago")),
                     (_, Some(c)) => (format!("exit {c}"), format!("{folder} \u{b7} exited with code {c} {when} ago")),
@@ -1063,6 +1071,7 @@ impl App {
                     },
                     _ => (String::new(), format!("{folder} \u{b7} ended {when} ago")),
                 };
+                let why = why + &number;
                 let mark = done_mark(status, code, depth);
                 // Its name being renamed (chat/rename.rs): the field's words in its place, still (no sheen) and alone
                 // on the row (no trailing words or shortcut).
@@ -1077,6 +1086,7 @@ impl App {
                         &common[..],
                         &[
                             ("name", Prop::Str(&name)),
+                            ("under", Prop::Str(&under)),
                             ("pace", Prop::Str(pace)),
                             ("alarm", Prop::Bool(failed || status == "lost")),
                             ("meta", Prop::Str(&meta)),

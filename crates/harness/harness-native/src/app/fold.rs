@@ -1,14 +1,15 @@
-//! Folding the sidebar's tree: an open node (every node starts so) shows its live children (running, with something
-//! running under them, just finished, or selected: the model's `rows`), so a run that finishes folds away on its own; a
-//! folded one shows none of them but the selected one. Each row's disclosure chevron (left of its title, Finder's) folds
+//! Folding the sidebar's tree: every node starts folded and shows none of its children but the selected one, so a
+//! sub-agent or a shell starting under a chat never opens it (its row counts what runs under it instead: `under`); an
+//! open node, one the person opened, shows its live children (running, with something running under them, just
+//! finished, or selected: the model's `rows`), so a run that finishes folds away on its own. Each row's disclosure chevron (left of its title, Finder's) folds
 //! it or opens it again, as do a double click on a session's row, Left and Right while the tree has the keyboard, and
 //! Option on any of them for every sibling at once. Rows come and go on one spring each (`RowFold`, the
 //! `tree_fold` tune of the sidebar's one spring family): a row that comes grows in from no height, pushing the rows under
 //! it down, and its words fade in and settle into place once there is room for them; one that goes lets its words go
 //! first and then closes. Its selection pill is not part of that: it is the tree's one matched pill, which holds where it
 //! was while the row opens (the row is `Settling`) and then slides to it at its full height, so it never squeezes under
-//! the row's words. Under Reduce Motion rows come and go at once. What is folded is kept in native.json (`folds`, by
-//! stable key: `true` folded, `false` open).
+//! the row's words. Under Reduce Motion rows come and go at once. What is open is kept in native.json (`folds`, by
+//! stable key: `true` folded, `false` open; a node with no entry is folded).
 use std::collections::{HashMap, HashSet};
 
 use super::*;
@@ -243,7 +244,7 @@ impl App {
     pub(super) fn toggle_fold_of(&mut self, e: u64, all: bool) {
         let w = self.world.world_ref();
         let o = w.entity_from_id(e);
-        let fold = !o.has(model::Folded::id());
+        let fold = !model::folded(o);
         let mut targets = vec![e];
         if all && let Some(p) = o.parent() {
             p.each_child(|c| {
@@ -270,7 +271,7 @@ impl App {
     pub(super) fn tree_fold(&mut self, all: bool) {
         let w = self.world.world_ref();
         let Some(s) = self.selected().map(|s| w.entity_from_id(s)) else { return };
-        if has_kids(s) && !s.has(model::Folded::id()) {
+        if has_kids(s) && !model::folded(s) {
             self.toggle_fold_of(*s.id(), all);
         } else if let Some(p) = s.parent().filter(|p| p.target(model::Kind::id(), 0).is_some()) {
             self.select(Some(*p.id()));
@@ -281,7 +282,7 @@ impl App {
     pub(super) fn tree_unfold(&mut self, all: bool) {
         let w = self.world.world_ref();
         let Some(s) = self.selected().map(|s| w.entity_from_id(s)) else { return };
-        if has_kids(s) && s.has(model::Folded::id()) {
+        if has_kids(s) && model::folded(s) {
             self.toggle_fold_of(*s.id(), all);
         }
     }
