@@ -726,6 +726,13 @@ fn layout_of_ty_in(
             return Err(LayoutError::NotImplemented);
         }
 
+        // blaze: a refinement by enum variants (`#![blaze::pattern_types]`) has its base
+        // enum's layout exactly, the same fields, niche and ABI: no narrower valid range and no
+        // wrapping field, so `T is PAT` to `T` and `&(T is PAT)` to `&T` move no bytes
+        // (docs/v2/plan/design/edition.md, section 8).
+        TyKind::Pat(ty, pat) if pat.kind().is_variants() => {
+            return db.layout_of_ty(ty.store(), trait_env);
+        }
         TyKind::Pat(ty, pat) => {
             // clone: a pattern type's layout is its base's with a narrower valid range, made once per pattern type into its memo
             let mut layout = db.layout_of_ty(ty.store(), trait_env.clone())?.0.clone();
@@ -851,7 +858,11 @@ fn layout_of_ty_in(
                     }
                     PatternKind::NotNull => panic!("or patterns can't contain `!null` patterns"),
                     PatternKind::Or(..) => panic!("patterns cannot have nested or patterns"),
+                    // A set of variants took the arm above; an `Or` mixing a variant with a
+                    // range is never lowered.
+                    PatternKind::Variant { .. } => return Err(LayoutError::HasErrorType),
                 },
+                PatternKind::Variant { .. } => return Err(LayoutError::HasErrorType),
             }
             // Pattern types contain their base as their sole field.
             // This allows the rest of the compiler to process pattern types just like

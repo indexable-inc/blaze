@@ -1054,7 +1054,9 @@ fn pattern_flags(kind: PatternKind<'_>) -> (TypeFlags, rustc_type_ir::DebruijnIn
             .fold((TypeFlags::empty(), rustc_type_ir::INNERMOST), |(flags, binder), pat| {
                 (flags | pat.flags(), binder.max(pat.outer_exclusive_binder()))
             }),
-        PatternKind::NotNull => (TypeFlags::empty(), rustc_type_ir::INNERMOST),
+        PatternKind::NotNull | PatternKind::Variant { .. } => {
+            (TypeFlags::empty(), rustc_type_ir::INNERMOST)
+        }
     }
 }
 
@@ -1142,9 +1144,18 @@ impl<'db> rustc_type_ir::relate::Relate<DbInterner<'db>> for Pattern<'db> {
                 Ok(Pattern::new(tcx, PatternKind::Or(pats)))
             }
             (PatternKind::NotNull, PatternKind::NotNull) => Ok(a),
-            (PatternKind::Range { .. } | PatternKind::Or(_) | PatternKind::NotNull, _) => {
-                Err(TypeError::Mismatch)
+            // blaze: a variant of the base enum (`#![blaze::pattern_types]`); a set is
+            // canonical (sorted, no variant twice), so equal sets are equal patterns.
+            (PatternKind::Variant { index: a_index }, PatternKind::Variant { index: b_index }) => {
+                if a_index == b_index { Ok(a) } else { Err(TypeError::Mismatch) }
             }
+            (
+                PatternKind::Range { .. }
+                | PatternKind::Or(_)
+                | PatternKind::NotNull
+                | PatternKind::Variant { .. },
+                _,
+            ) => Err(TypeError::Mismatch),
         }
     }
 }

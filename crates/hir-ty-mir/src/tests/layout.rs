@@ -675,6 +675,25 @@ fn arbitrary_ints_layout() {
     );
 }
 
+/// blaze: a refinement of an enum by a set of its variants (`#![blaze::pattern_types]`,
+/// docs/v2/plan/design/edition.md, section 8) has its enum's layout, field for field: a value
+/// widens to the enum for free, and a `&(E is ..)` is a `&E`.
+#[test]
+fn pattern_type_of_variants_has_its_enums_layout() {
+    let fixture = |goal: &str| {
+        format!(
+            "#![blaze::pattern_types]\n\
+             enum E {{ A(u32, u8), B, C {{ x: u64 }} }}\n\
+             type Goal = {goal};"
+        )
+    };
+    let base = eval_goal(&fixture("E"), "").unwrap();
+    for refined in ["E is E::A(..)", "E is E::A(_, _) | E::B", "E is E::C { .. }", "E is E::B"] {
+        let layout = eval_goal(&fixture(refined), "").unwrap();
+        assert_eq!(*layout, *base, "`{refined}` has the layout of `E`");
+    }
+}
+
 #[test]
 fn const_eval_simple() {
     size_and_align! {

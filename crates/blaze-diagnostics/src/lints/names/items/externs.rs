@@ -305,6 +305,8 @@ impl<'c, 'a, 'db> Types<'c, 'a, 'db> {
             }
             PatternKind::NotNull => true,
             PatternKind::Or(pats) => pats.iter().all(|it| self.pat_is_known_nonnull(it)),
+            // A set of variants restricts which variant, never what a pointer in it holds.
+            PatternKind::Variant { .. } => false,
         }
     }
 

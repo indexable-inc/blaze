@@ -22,6 +22,7 @@ mod inhabitedness;
 mod lowering_errors;
 mod member_hygiene;
 mod method_resolutions;
+mod pattern_variants;
 mod probe_errors;
 mod qualifier_resolutions;
 mod query_span_names;

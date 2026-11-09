@@ -4043,6 +4043,22 @@ impl<'db> ExprCollector<'db> {
             ast::Pat::MacroPat(pat) => {
                 self.collect_macro_pat_with(pat, |this, pat| this.collect_ty_pat(pat))
             }
+            // blaze: a variant of an enum, `Conn is Conn::Open { .. }`
+            // (`#![blaze::pattern_types]`, docs/v2/plan/design/edition.md, section 8), lowered
+            // as the pattern it is in a body. The type lowering checks it names a variant of the
+            // base type and holds nothing but `_` and `..`, and refuses it without the gate.
+            ast::Pat::PathPat(_) | ast::Pat::TupleStructPat(_) | ast::Pat::RecordPat(_) => {
+                self.collect_pat(pat, &mut BindingList::default())
+            }
+            // A lone name, `E is A` after `use E::*`: always a path here, as a type's pattern
+            // binds nothing.
+            ast::Pat::IdentPat(bp)
+                if bp.mut_token().is_none() && bp.ref_token().is_none() && bp.pat().is_none() =>
+            {
+                let name = bp.name().map(|nr| nr.as_name()).unwrap_or_else(Name::missing);
+                let id = self.store.alloc_name_path_pat(name);
+                self.map_pat(id, ptr)
+            }
             // rustc's "pattern not supported in pattern types": the type lowering reports
             // anything but a range, an or-pattern and `!null`; `Missing` is a parse error's.
             _ => self.alloc_pat(Pat::Wild, ptr),

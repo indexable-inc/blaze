@@ -555,7 +555,11 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
 
     fn alloc_local(&mut self, local: Local) -> LocalId {
         let id = LocalId::from_raw(RawIdx::from_u32(self.building.locals.len() as u32));
-        self.building.locals.push(local);
+        // blaze: a refinement by enum variants (`#![blaze::pattern_types]`) has its base's
+        // layout and code, so a local holds the base: places project through it as through
+        // the enum, and a signature naming the refinement relates to it as its base.
+        let ty = hir_ty::pattern_types::erase(self.interner(), local.ty.as_ref());
+        self.building.locals.push(Local { ty: ty.store() });
         id
     }
 
@@ -2542,11 +2546,17 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                 }
                 *place = place.project(ProjectionElem::Field(FieldIndex(index)));
             } else {
-                let field = self
-                    .infer
-                    .field_resolution(expr_id)
-                    .ok_or(MirLowerError::UnresolvedField)?
-                    .either(|f| f.local_id.into(), |t| FieldIndex(t.index));
+                let field =
+                    self.infer.field_resolution(expr_id).ok_or(MirLowerError::UnresolvedField)?;
+                // blaze: a field of an enum's variant, read on a refinement by that one variant
+                // (`conn.socket` on a `Conn is Conn::Open { .. }`, `#![blaze::pattern_types]`):
+                // the place is the enum, so it is downcast to the variant first.
+                if let Either::Left(it) = field
+                    && let hir_def::VariantId::EnumVariantId(variant) = it.parent
+                {
+                    *place = place.project(ProjectionElem::Downcast(variant.into()));
+                }
+                let field = field.either(|f| f.local_id.into(), |t| FieldIndex(t.index));
                 *place = place.project(ProjectionElem::Field(field));
             }
         } else {

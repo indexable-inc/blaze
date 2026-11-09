@@ -445,6 +445,16 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     pat_info,
                 )
             }
+            // blaze: a constructor pattern on a refinement by variants (`Conn is Conn::Open
+            // { .. }`, `#![blaze::pattern_types]`) is a pattern of its base enum, as the
+            // constructor is (docs/v2/plan/design/edition.md, section 8): the refinement widens
+            // for free, and a variant outside its set is an unreachable arm (matchck).
+            Pat::Path(_) | Pat::TupleStruct { .. } | Pat::Record { .. }
+                if let Some((base, _)) =
+                    crate::pattern_types::refinement(self.table.shallow_resolve(expected)) =>
+            {
+                self.infer_pat_inner(pat, opt_path_res, adjust_mode, base, pat_info)
+            }
             Pat::Missing => self.types.types.error,
             Pat::Wild | Pat::Rest | Pat::NotNull => expected,
             // We allow any type here; we ensure that the type is uninhabited during match checking.

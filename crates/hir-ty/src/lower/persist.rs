@@ -912,6 +912,11 @@ pub(crate) fn put_diagnostic(w: &mut Vec<u32>, diagnostic: &TyLoweringDiagnostic
             put_local(w, *source);
             w.push(match reason {
                 PatternTypeUnsupported::Pattern => 0,
+                PatternTypeUnsupported::VariantsNeedGate => 1,
+                PatternTypeUnsupported::VariantsOfNonEnum => 2,
+                PatternTypeUnsupported::NotAVariant => 3,
+                PatternTypeUnsupported::VariantFieldNotWildcard => 4,
+                PatternTypeUnsupported::VariantShape => 5,
             });
         }
         TyLoweringDiagnostic::QueryCycle { def, query } => {
@@ -1230,6 +1235,11 @@ impl Words<'_> {
                 source: self.local()?,
                 reason: match self.u32()? {
                     0 => PatternTypeUnsupported::Pattern,
+                    1 => PatternTypeUnsupported::VariantsNeedGate,
+                    2 => PatternTypeUnsupported::VariantsOfNonEnum,
+                    3 => PatternTypeUnsupported::NotAVariant,
+                    4 => PatternTypeUnsupported::VariantFieldNotWildcard,
+                    5 => PatternTypeUnsupported::VariantShape,
                     _ => return Err(self.invalid("a pattern type not lowered for no reason")),
                 },
             },
@@ -1495,6 +1505,14 @@ mod tests {
             TyLoweringDiagnostic::PatternTypeNotLowered {
                 source,
                 reason: PatternTypeUnsupported::Pattern,
+            },
+            TyLoweringDiagnostic::PatternTypeNotLowered {
+                source,
+                reason: PatternTypeUnsupported::VariantsNeedGate,
+            },
+            TyLoweringDiagnostic::PatternTypeNotLowered {
+                source,
+                reason: PatternTypeUnsupported::VariantShape,
             },
             TyLoweringDiagnostic::QueryCycle { def, query: CycleQuery::Predicates },
             TyLoweringDiagnostic::QueryCycle { def: trait_def, query: CycleQuery::SuperClauses },

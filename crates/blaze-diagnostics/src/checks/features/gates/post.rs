@@ -111,6 +111,26 @@ impl Visitor<'_, '_, '_, '_> {
                 }
             }
             SyntaxKind::FOR_BINDER => self.binder(file, node),
+            // blaze: a bare `T is PAT`, without `builtin # pattern_type(..)`, is a type only
+            // under `#![blaze::pattern_types]` (docs/v2/plan/design/edition.md, section 8).
+            SyntaxKind::PATTERN_TYPE if token(node, T![builtin]).is_none() => {
+                if !hir_def::nameres::crate_def_map(self.cx.db, self.cx.krate.base())
+                    .pattern_types()
+                {
+                    let message = format!(
+                        "`{}` is a pattern type, which needs `#![blaze::pattern_types]` \
+                         at the crate root (rule pattern-types-gate)",
+                        node.text()
+                    );
+                    let mut diag = Diag::error(
+                        None,
+                        message,
+                        self.cx.span(InFile::new(file, node.text_range())),
+                    );
+                    diag.help("add `#![blaze::pattern_types]` to the crate root");
+                    self.push(file, node, diag, false);
+                }
+            }
             SyntaxKind::PATTERN_TYPE => {
                 self.gate(
                     file,

@@ -3885,6 +3885,12 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
             (TyKind::Array(x, _), TyKind::Array(y, _)) | (TyKind::Slice(x), TyKind::Slice(y)) => {
                 self.relate(x, y, variance, at)
             }
+            // blaze: a pattern type holds its base's regions (`&'a T is PAT` none of its own),
+            // so it relates as its base: a variant refinement's MIR local is its base enum
+            // (`#![blaze::pattern_types]`) where a signature still names the refinement.
+            (TyKind::Pat(x, _), TyKind::Pat(y, _)) => self.relate(x, y, variance, at),
+            (TyKind::Pat(x, _), _) => self.relate(x, b, variance, at),
+            (_, TyKind::Pat(y, _)) => self.relate(a, y, variance, at),
             // Higher-ranked subtyping, as rustc's `TypeRelating::binders`: `a <: b` holds
             // when `b`'s `for<'a>` instantiated with placeholders is a supertype of `a`'s
             // instantiated with variables; invariant, both ways, each still invariant. A region

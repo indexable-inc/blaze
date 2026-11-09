@@ -1033,7 +1033,8 @@ impl Persist for InferenceRecord {
         // 25: `comptime_loops`, after the named pattern types in the side table words.
         // 26: `SolverDiagnosticKind::ReflectedMemberUnmet` (solver kind 9).
         // 27: `InferenceDiagnostic::PrivateField::at`, an `offset_of!` field's position.
-        Part::U64(27),
+        // 28: `InferenceDiagnostic::WholeValueWriteThroughRefinement` (tag 90).
+        Part::U64(28),
         Part::Schema(<InferRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = InferenceRecordRef<'a>;
@@ -2634,6 +2635,10 @@ impl Sink {
                 self.words.extend([55, local(*expr)]);
                 self.ty(tys, self_ty);
             }
+            D::WholeValueWriteThroughRefinement { place, ty } => {
+                self.words.extend([90, local(*place)]);
+                self.ty(tys, ty);
+            }
         }
     }
 
@@ -3683,6 +3688,7 @@ impl Source<'_> {
             54 => D::FnTraitArgsNotTuple { call_expr: self.local()? },
             55 => D::SelfCtorNotTupleOrUnit { expr: self.local()?, self_ty: self.ty(tys)? },
             56 => D::TyvarBehindRawPointer { span: self.span()? },
+            90 => D::WholeValueWriteThroughRefinement { place: self.local()?, ty: self.ty(tys)? },
             _ => return Err(self.invalid("an inference diagnostic of no kind")),
         })
     }
@@ -4097,6 +4103,7 @@ mod tests {
             D::InheritedRefMutabilityMismatch { pat: pat(3) },
             D::FnTraitArgsNotTuple { call_expr: expr(9) },
             D::SelfCtorNotTupleOrUnit { expr: expr(2), self_ty: ty(types.never) },
+            D::WholeValueWriteThroughRefinement { place: expr(3), ty: ty(types.never) },
             D::NotAStructPath {
                 node: pat(2).into(),
                 found: StructPathFound::TypeRelative(StructPathDef::SelfCtor),

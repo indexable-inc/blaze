@@ -386,6 +386,18 @@ fn path_or_macro_type(p: &mut Parser<'_>, allow_bounds: bool) {
 
     let path = r.complete(p, kind);
 
+    // test bare_pattern_type
+    // type A = E is E::A(..) | E::B;
+    if kind == PATH_TYPE && p.bare_pattern_types() && p.at_contextual_kw(T![is]) {
+        // `#![blaze::pattern_types]`'s `T is PAT`: the feature gate refuses it in a crate
+        // without the gate, and before the gate `T is` was never a valid type.
+        let m = path.precede(p);
+        p.bump_remap(T![is]);
+        pat_top(p);
+        m.complete(p, PATTERN_TYPE);
+        return;
+    }
+
     if allow_bounds {
         opt_type_bounds_as_dyn_trait_type(p, path);
     }

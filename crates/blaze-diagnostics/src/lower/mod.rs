@@ -139,6 +139,7 @@ pub(crate) mod unreachable_label;
 pub(crate) mod unused_must_use;
 pub(crate) mod val_tree_error;
 pub(crate) mod verify_refused;
+pub(crate) mod whole_value_write_through_refinement;
 pub(crate) mod yield_outside_coroutine;
 
 /// When rustc gives a diagnostic, by the pass that gives it: the driver writes them in this
@@ -232,6 +233,9 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> 
         AnyDiagnostic::InheritedRefMutabilityMismatch(d) => inherited_ref_mutability_mismatch::lower(cx, &d),
         AnyDiagnostic::MethodOnUnknownRawPointee(d) => method_on_unknown_raw_pointee::lower(cx, &d),
         AnyDiagnostic::SelfCtorNotTupleOrUnit(d) => self_ctor_not_tuple_or_unit::lower(cx, &d),
+        AnyDiagnostic::WholeValueWriteThroughRefinement(d) => {
+            whole_value_write_through_refinement::lower(cx, &d)
+        }
         AnyDiagnostic::TyvarBehindRawPointer(d) => tyvar_behind_raw_pointer::lower(cx, &d),
         AnyDiagnostic::LateBoundLifetimeArgs(d) => late_bound_lifetime_args::lower(cx, &d),
         AnyDiagnostic::MacroDefError(d) => macro_def_error::lower(cx, &d),

@@ -407,7 +407,12 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
 
                 let condition_diverges = mem::replace(&mut self.diverges, Diverges::Maybe);
 
+                // blaze: the condition's `let`s narrow their locals in the success branch
+                // (`#![blaze::pattern_types]`, `infer::narrow`).
+                let narrowed = self.narrowed_mark();
+                self.narrow_by_condition(condition);
                 let then_ty = self.infer_expr_inner(then_branch, expected, ExprIsRead::Yes);
+                self.unnarrow(narrowed);
                 let then_diverges = mem::replace(&mut self.diverges, Diverges::Maybe);
                 let mut coercion_sites = [then_branch, tgt_expr];
                 if let Some(else_branch) = else_branch {
@@ -573,6 +578,10 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
 
                     for arm in arms.iter() {
                         self.diverges = Diverges::Maybe;
+                        // blaze: the arm's pattern narrows a plain-local scrutinee in its guard
+                        // and body (`#![blaze::pattern_types]`, `infer::narrow`).
+                        let narrowed = self.narrowed_mark();
+                        self.narrow_by_pattern(expr, arm.pat);
                         if let Some(guard_expr) = arm.guard {
                             self.infer_expr_coerce_never(
                                 guard_expr,
@@ -584,6 +593,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                         // body unreachable, and the arm diverge.
 
                         let arm_ty = self.infer_expr_inner(arm.expr, &expected, ExprIsRead::Yes);
+                        self.unnarrow(narrowed);
                         all_arms_diverge &= self.diverges;
                         // An arm of type `!` does not count as a prior arm: it does not shape
                         // the type later arms must agree with.
@@ -799,6 +809,8 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     self.infer_expr_coerce(value, &Expectation::has_type(lhs_ty), ExprIsRead::Yes);
                     if let Pat::Expr(lhs) = self.store.pat(target) {
                         self.check_lhs_assignable(lhs, tgt_expr, None);
+                        // blaze: rule pattern-types-unique-ref (`infer::narrow`).
+                        self.check_refinement_write(lhs);
                     }
                 } else {
                     // Let the target pattern constrain the RHS coercion target. In particular,
@@ -1777,6 +1789,8 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
 
         let (ctxt, tail_expr_ty) =
             self.with_breakable_ctx(BreakableKind::Block, Some(coerce_ty), label, |this| {
+                // blaze: what a `let else` narrows holds to the end of the block.
+                let narrowed = this.narrowed_mark();
                 for (index, stmt) in statements.iter().enumerate() {
                     if matches!(stmt, Statement::Item(_)) {
                         continue;
@@ -1824,6 +1838,11 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                                     else_ty,
                                 );
                                 this.diverges = previous_diverges;
+                                // blaze: after a `let else`, its pattern narrows a plain-local
+                                // initializer (`#![blaze::pattern_types]`, `infer::narrow`).
+                                if let Some(initializer) = initializer {
+                                    this.narrow_by_pattern(initializer, pat);
+                                }
                             }
                         }
                         Statement::Expr { expr, has_semi } => {
@@ -1844,7 +1863,10 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
 
                 // check the tail expression **without** holding the
                 // `enclosing_breakables` lock below.
-                tail.map(|expr| (expr, this.infer_expr_inner(expr, expected, ExprIsRead::Yes)))
+                let tail =
+                    tail.map(|expr| (expr, this.infer_expr_inner(expr, expected, ExprIsRead::Yes)));
+                this.unnarrow(narrowed);
+                tail
             });
 
         let mut coerce = ctxt.coerce.unwrap();
@@ -2020,6 +2042,20 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     }
                     hir_def::AdtId::EnumId(_) => return None,
                 },
+                // blaze: a refinement by one variant (`conn.socket` on a `Conn is Conn::Open
+                // { .. }`, `#![blaze::pattern_types]`) reads that variant's field directly; MIR
+                // projects it through a downcast to the variant.
+                TyKind::Pat(base, _) => {
+                    let variant = crate::pattern_types::single_variant(self.db, derefed_ty)?;
+                    let TyKind::Adt(_, parameters) = base.kind() else { return None };
+                    let local_id = variant.fields(self.db).field_written(
+                        self.db,
+                        variant.into(),
+                        name,
+                        hygiene,
+                    )?;
+                    (FieldId { parent: variant.into(), local_id }, parameters)
+                }
                 _ => return None,
             };
             // Its privacy is checked from the def site of the name (rustc's `check_field`).
