@@ -13,7 +13,7 @@ remembered. How rows are picked, worked and landed is
 `harness/v2/ledger.py`. A check in *italics* is not written yet, and writing it is the first
 part of the work. `?` is not measured; "last known" is a lead, not a status.
 
-62 objectives: 0 met, 0 open, 0 blocked, 62 not measured.
+70 objectives: 0 met, 0 open, 0 blocked, 70 not measured.
 
 ## Targets
 
@@ -92,6 +92,14 @@ The parts of [the design](../plan.md#the-design) no check has shown yet.
 | S3 | Every crate in crates/ is on bstd with `#![blaze::capabilities]` | *write: a count of crates without the attribute, which must be zero* |  | ? |
 | S4 | bstd is `#![no_std]` with its own sys and runtime; no blaze crate links Rust's std | *write: a link-time check that no blaze binary holds a std symbol* |  | ? |
 | S5 | The blaze edition: `std` names bstd, `fn main(io: Io)` is the entry, and a program's OS sandbox is what main hands out | *write: a program of the edition that never takes Net and cannot open a socket* |  | ? |
+| E1 | The lint group blaze::edition exists with lossy_as, static_mut and async_fn, and is on in blaze's own crates | *write: the lints' tests; a count of blaze crates with the group allowed, which must be zero* |  | ? |
+| E2 | Handles copy themselves under `#![blaze::handles]`; the last use moves | *write: fixtures: copies counted per path; a crate without the attribute builds to the same bytes* |  | ? |
+| E3 | Error unions: `A | B` in type position, `?` widens, match is exhaustive | *write: fixtures for widening, exhaustiveness, a refused type parameter and one identity across crates* |  | ? |
+| E4 | View types: methods with disjoint field views do not conflict | *write: fixtures accepted and refused; ABI unchanged* |  | ? |
+| E5 | Records and named arguments with defaults | *write: fixtures for equality in any field order, defaults, and one layout across crates* |  | ? |
+| E6 | Contexts: the `with` clause passes bstd's capabilities and Cx by name | *write: bstd's tests rewritten with `with` and passing* |  | ? |
+| E7 | Effects are inferred inside a crate and required on pub functions; closures pass theirs through; no async in crates on fibers | *write: blaze::undeclared_effects at zero in blaze's crates* |  | ? |
+| E8 | edition = "blaze-2026.11" turns every change on and every removed thing into an error; blaze fix --edition migrates | *write: one real crate migrated by the tool and passing its tests* |  | ? |
 
 ## The agent app
 
