@@ -1798,6 +1798,7 @@ dependencies = [
  "base-db",
  "blaze-hash",
  "blaze-items",
+ "blaze-query",
  "expect-test",
  "hegeltest",
  "hir-def",

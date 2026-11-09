@@ -4,6 +4,19 @@
 //! for stops the device build (`no-fallback`).
 use std::fmt;
 
+use base_db::{Crate, Db};
+use hir_ty::{
+    display::{DisplayTarget, HirDisplay as _},
+    next_solver::Ty,
+};
+
+/// `ty` as a refusal names it: rendered with the database (`HirDisplay`), as a person reads it
+/// in `krate`. Never `Debug`: a type's `Debug` reads a database only when one is attached, and
+/// is not text for a person.
+pub(crate) fn ty_name<'db>(db: &'db Db, krate: Crate, ty: Ty<'db>) -> String {
+    ty.display(db, DisplayTarget::from_crate(db, krate)).to_string() // alloc: a refusal's text
+}
+
 /// One construct the backend does not lower.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Refusal {

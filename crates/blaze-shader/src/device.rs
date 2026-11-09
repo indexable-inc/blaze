@@ -42,7 +42,15 @@ pub struct DeviceBuild {
 
 /// The device build of `krate`: every entry of its `GPU_ENTRIES`, lowered, validated and written
 /// as MSL. Every refusal met in every entry is in the error, not only the first.
+///
+/// A refusal names types with the database in hand (`refuse::ty_name`); what it shows of the
+/// front end's own values (a MIR terminator, a projection, a lowering error) is their `Debug`,
+/// made while `db` is attached so that it can read it.
 pub fn device_msl(db: &Db, krate: Crate) -> Result<DeviceBuild, Error> {
+    blaze_query::db::attach(db, || build(db, krate))
+}
+
+fn build(db: &Db, krate: Crate) -> Result<DeviceBuild, Error> {
     let entries = entries::entries(db, krate)?;
     let mut device = Device::new(db, krate);
     let mut refusals = Vec::new(); // alloc: the build's refusals

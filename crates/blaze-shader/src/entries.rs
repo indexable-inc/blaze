@@ -24,7 +24,7 @@ use intern::Symbol;
 use rustc_abi::{Endian, TargetDataLayout};
 use rustc_type_ir::inherent::{AdtDef as _, GenericArgs as _, IntoKind as _};
 
-use crate::refuse::Error;
+use crate::refuse::{Error, ty_name};
 
 /// The static a device build roots at, at the crate root (docs/future/gpu/shaders.md).
 pub const ENTRIES: &str = "GPU_ENTRIES";
@@ -153,6 +153,7 @@ struct Value<'a, 'db> {
 
 struct Reader<'db> {
     db: &'db Db,
+    krate: Crate,
     interner: DbInterner<'db>,
     env: StoredParamEnvAndCrate,
     dl: &'db TargetDataLayout,
@@ -162,6 +163,16 @@ struct Reader<'db> {
 }
 
 impl<'db> Reader<'db> {
+    /// `ty` as an error names it.
+    fn shown(&self, ty: Ty<'db>) -> String {
+        ty_name(self.db, self.krate, ty)
+    }
+
+    /// The bytes of a value of `ty` are fewer than its layout reads.
+    fn short(&self, ty: Ty<'db>) -> String {
+        format!("the bytes of a `{}` are cut short", self.shown(ty)) // alloc: an error
+    }
+
     fn new(db: &'db Db, krate: Crate, statik: StaticId) -> Result<Reader<'db>, String> {
         let allocation = db
             .const_eval_static(statik)
@@ -172,6 +183,7 @@ impl<'db> Reader<'db> {
         let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate }.store();
         Ok(Reader {
             db,
+            krate,
             interner: DbInterner::new_with(db, krate),
             env,
             dl,
@@ -320,7 +332,7 @@ impl<'db> Reader<'db> {
         let layout = self
             .db
             .layout_of_ty(ty.store(), self.env.clone()) // clone: a stored handle
-            .map_err(|e| format!("the layout of `{ty:?}`: {e:?}"))?; // alloc: an error
+            .map_err(|e| format!("the layout of `{ty}`: {e:?}", ty = self.shown(ty)))?; // alloc: an error
         Ok(f(&layout))
     }
 
@@ -331,7 +343,7 @@ impl<'db> Reader<'db> {
     fn expect_adt(&self, value: Value<'_, 'db>, path: &str) -> Result<(), String> {
         let found = match value.ty.kind() {
             TyKind::Adt(def, _) => blaze_items::key::path(self.db, blaze_items::ItemId::Adt(def.def_id())),
-            _ => format!("{:?}", value.ty), // alloc: an error
+            _ => self.shown(value.ty),
         };
         if found != path {
             // alloc: an error
@@ -343,21 +355,21 @@ impl<'db> Reader<'db> {
     /// The field `name` of a struct value (a tuple struct's fields are named `0`, `1`, ...).
     fn field<'a>(&self, value: Value<'a, 'db>, name: &str) -> Result<Value<'a, 'db>, String> {
         let TyKind::Adt(def, args) = value.ty.kind() else {
-            return Err(format!("`{:?}` has no field `{name}`: it is not a struct", value.ty)); // alloc: an error
+            return Err(format!("`{}` has no field `{name}`: it is not a struct", self.shown(value.ty))); // alloc: an error
         };
         let AdtId::StructId(id) = def.def_id() else {
-            return Err(format!("`{:?}` has no field `{name}`: it is not a struct", value.ty)); // alloc: an error
+            return Err(format!("`{}` has no field `{name}`: it is not a struct", self.shown(value.ty))); // alloc: an error
         };
         let variant = VariantId::StructId(id);
         let Some(local) = variant.fields(self.db).field(&Name::new_symbol_root(Symbol::intern(name))) else {
             // alloc: an error
-            return Err(format!("`{:?}` has no field `{name}`: the gpu crate's descriptors changed", value.ty));
+            return Err(format!("`{}` has no field `{name}`: the gpu crate's descriptors changed", self.shown(value.ty)));
         };
         let index = local.into_raw().into_u32() as usize;
         let ty = self.field_ty(variant, index, args)?;
         let at = self.with_layout(value.ty, |l| l.fields.offset(index).bytes() as usize)?;
         let size = self.size(ty)?;
-        let bytes = value.bytes.get(at..at + size).ok_or_else(|| short(value.ty))?;
+        let bytes = value.bytes.get(at..at + size).ok_or_else(|| self.short(value.ty))?;
         Ok(Value { ty, bytes })
     }
 
@@ -379,10 +391,10 @@ impl<'db> Reader<'db> {
     /// An enum value's variant, by name, with its fields' values.
     fn variant<'a>(&self, value: Value<'a, 'db>) -> Result<(String, Vec<Value<'a, 'db>>), String> {
         let TyKind::Adt(def, args) = value.ty.kind() else {
-            return Err(format!("`{:?}` is not an enum", value.ty)); // alloc: an error
+            return Err(format!("`{}` is not an enum", self.shown(value.ty))); // alloc: an error
         };
         let AdtId::EnumId(e) = def.def_id() else {
-            return Err(format!("`{:?}` is not an enum", value.ty)); // alloc: an error
+            return Err(format!("`{}` is not an enum", self.shown(value.ty))); // alloc: an error
         };
         let (db, dl, bytes) = (self.db, self.dl, value.bytes);
         let found = self.with_layout(value.ty, |layout| {
@@ -394,14 +406,14 @@ impl<'db> Reader<'db> {
             })
         })?;
         let (variant, offsets) =
-            found.ok_or_else(|| format!("no variant of `{:?}` has these bytes", value.ty))?; // alloc: an error
+            found.ok_or_else(|| format!("no variant of `{}` has these bytes", self.shown(value.ty)))?; // alloc: an error
         let name = variant_name(self.db, e, variant)?;
         let mut fields = Vec::new(); // alloc: a variant's fields
         let id = VariantId::EnumVariantId(variant);
         for (index, at) in offsets.into_iter().enumerate() {
             let ty = self.field_ty(id, index, args)?;
             let size = self.size(ty)?;
-            let bytes = value.bytes.get(at..at + size).ok_or_else(|| short(value.ty))?;
+            let bytes = value.bytes.get(at..at + size).ok_or_else(|| self.short(value.ty))?;
             fields.push(Value { ty, bytes });
         }
         Ok((name, fields))
@@ -423,7 +435,7 @@ impl<'db> Reader<'db> {
     }
 
     fn u32(&self, value: Value<'_, 'db>) -> Result<u32, String> {
-        let bytes: [u8; 4] = value.bytes.try_into().map_err(|_| short(value.ty))?;
+        let bytes: [u8; 4] = value.bytes.try_into().map_err(|_| self.short(value.ty))?;
         Ok(match self.dl.endian {
             Endian::Little => u32::from_le_bytes(bytes),
             Endian::Big => u32::from_be_bytes(bytes),
@@ -433,7 +445,7 @@ impl<'db> Reader<'db> {
     /// What a thin reference points to.
     fn deref<'a>(&'a self, value: Value<'_, 'db>) -> Result<Value<'a, 'db>, String> {
         let TyKind::Ref(_, pointee, _) = value.ty.kind() else {
-            return Err(format!("`{:?}` is not a reference", value.ty)); // alloc: an error
+            return Err(format!("`{}` is not a reference", self.shown(value.ty))); // alloc: an error
         };
         let addr = self.word(value.bytes)? as usize;
         let size = self.size(pointee)?;
@@ -444,14 +456,14 @@ impl<'db> Reader<'db> {
     /// The elements of a `&[T]`.
     fn slice<'a>(&'a self, value: Value<'_, 'db>) -> Result<Vec<Value<'a, 'db>>, String> {
         let TyKind::Ref(_, pointee, _) = value.ty.kind() else {
-            return Err(format!("`{:?}` is not a slice reference", value.ty)); // alloc: an error
+            return Err(format!("`{}` is not a slice reference", self.shown(value.ty))); // alloc: an error
         };
         let TyKind::Slice(elem) = pointee.kind() else {
-            return Err(format!("`{:?}` is not a slice reference", value.ty)); // alloc: an error
+            return Err(format!("`{}` is not a slice reference", self.shown(value.ty))); // alloc: an error
         };
         let ptr = self.dl.pointer_size().bytes() as usize;
         let addr = self.word(value.bytes)? as usize;
-        let len = self.word(value.bytes.get(ptr..).ok_or_else(|| short(value.ty))?)? as usize;
+        let len = self.word(value.bytes.get(ptr..).ok_or_else(|| self.short(value.ty))?)? as usize;
         let stride = self.size(elem)?;
         let bytes = self.memory_at(addr, len * stride, pointee)?;
         Ok((0..len).map(|i| Value { ty: elem, bytes: &bytes[i * stride..(i + 1) * stride] }).collect())
@@ -459,14 +471,14 @@ impl<'db> Reader<'db> {
 
     fn str(&self, value: Value<'_, 'db>) -> Result<String, String> {
         let TyKind::Ref(_, pointee, _) = value.ty.kind() else {
-            return Err(format!("`{:?}` is not a `&str`", value.ty)); // alloc: an error
+            return Err(format!("`{}` is not a `&str`", self.shown(value.ty))); // alloc: an error
         };
         if !matches!(pointee.kind(), TyKind::Str) {
-            return Err(format!("`{:?}` is not a `&str`", value.ty)); // alloc: an error
+            return Err(format!("`{}` is not a `&str`", self.shown(value.ty))); // alloc: an error
         }
         let ptr = self.dl.pointer_size().bytes() as usize;
         let addr = self.word(value.bytes)? as usize;
-        let len = self.word(value.bytes.get(ptr..).ok_or_else(|| short(value.ty))?)? as usize;
+        let len = self.word(value.bytes.get(ptr..).ok_or_else(|| self.short(value.ty))?)? as usize;
         let bytes = self.memory_at(addr, len, pointee)?;
         String::from_utf8(bytes.to_vec()).map_err(|_| "a name that is not UTF-8".to_owned()) // alloc: a name
     }
@@ -477,7 +489,7 @@ impl<'db> Reader<'db> {
         }
         self.map
             .get(addr, size)
-            .ok_or_else(|| format!("the memory of a `{ty:?}` at {addr:#x} is not in the evaluated static")) // alloc: an error
+            .ok_or_else(|| format!("the memory of a `{ty}` at {addr:#x} is not in the evaluated static", ty = self.shown(ty))) // alloc: an error
     }
 }
 
@@ -487,7 +499,8 @@ fn variant_name(db: &Db, e: EnumId, variant: hir_def::EnumVariantId) -> Result<S
         .iter()
         .find(|(_, (id, _))| *id == variant)
         .map(|(name, _)| name.as_str().to_owned()) // alloc: a name
-        .ok_or_else(|| format!("a variant of `{e:?}`")) // alloc: an error
+        // alloc: an error
+        .ok_or_else(|| format!("a variant of `{}`", blaze_items::key::path(db, blaze_items::ItemId::Adt(AdtId::EnumId(e)))))
 }
 
 fn one<'a, 'db>(fields: &[Value<'a, 'db>], what: &str) -> Result<Value<'a, 'db>, String> {
@@ -505,6 +518,3 @@ fn unknown(ty: &str, variant: &str) -> String {
     )
 }
 
-fn short(ty: Ty<'_>) -> String {
-    format!("the bytes of a `{ty:?}` are cut short") // alloc: an error
-}

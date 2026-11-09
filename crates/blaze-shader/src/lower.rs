@@ -64,7 +64,7 @@ use rustc_type_ir::{
 use crate::{
     entries::{self, Entry, FieldKind, Interp, Kind, Out, Stage, Table, ValueTy},
     intrinsics::{self, CoreOp, DeviceFn, DeviceTy, cmath, core_op, device_fn, device_ty},
-    refuse::{Refusal, why},
+    refuse::{Refusal, ty_name, why},
     structure::{self, Cfg, Shaped},
 };
 
@@ -280,13 +280,24 @@ impl<'db> Device<'db> {
         normalize_or_keep(&self.infcx, self.env.param_env, ty)
     }
 
+    /// `ty` as a refusal names it.
+    fn shown(&self, ty: Ty<'db>) -> String {
+        ty_name(self.db, self.env.krate, ty)
+    }
+
+    /// A constant of `ty` with `have` bytes where its layout needs `want`.
+    fn cut(&self, ty: Ty<'db>, have: usize, want: usize) -> Refused {
+        // alloc: an error
+        (format!("a constant of `{}` with {have} bytes, where its layout needs {want}", self.shown(ty)), why::OPERATIONS)
+    }
+
     /// `f` of the front end's layout of `ty`, the one native codegen uses.
     pub(crate) fn with_layout<R>(&self, ty: Ty<'db>, f: impl FnOnce(&Layout) -> R) -> Result<R, Refused> {
         let layout = self
             .db
             .layout_of_ty(ty.store(), self.stored.clone()) // clone: a stored handle
             // alloc: an error
-            .map_err(|e| (format!("a value of `{ty:?}`, which has no layout ({e:?})"), why::TYPES))?;
+            .map_err(|e| (format!("a value of `{ty}`, which has no layout ({e:?})", ty = self.shown(ty)), why::TYPES))?;
         Ok(f(&layout))
     }
 
@@ -318,11 +329,11 @@ impl<'db> Device<'db> {
                 match size(self)? {
                     4 => self.scalar(if signed { Scalar::I32 } else { Scalar::U32 }),
                     // alloc: an error
-                    n => return Err((format!("the {}-bit integer type `{ty:?}`", n * 8), why::WIDTH)),
+                    n => return Err((format!("the {}-bit integer type `{ty}`", n * 8, ty = self.shown(ty)), why::WIDTH)),
                 }
             }
             TyKind::Float(FloatTy::F32) => self.scalar(Scalar::F32),
-            TyKind::Float(_) => return Err((format!("the float type `{ty:?}`"), why::TYPES)), // alloc: an error
+            TyKind::Float(_) => return Err((format!("the float type `{ty}`", ty = self.shown(ty)), why::TYPES)), // alloc: an error
             TyKind::Never => Lowered { naga: None, shape: Shape::Zst },
             TyKind::Tuple(fields) => {
                 let fields: Vec<Ty<'db>> = fields.iter().collect(); // alloc: a tuple's field types
@@ -356,7 +367,7 @@ impl<'db> Device<'db> {
                             self.lower_struct(ty, Some(name), &fields)?
                         }
                         AdtId::EnumId(id) => self.lower_enum(ty, id, args)?,
-                        AdtId::UnionId(_) => return Err((format!("the union `{ty:?}`"), why::TYPES)), // alloc: an error
+                        AdtId::UnionId(_) => return Err((format!("the union `{ty}`", ty = self.shown(ty)), why::TYPES)), // alloc: an error
                     },
                 }
             }
@@ -365,7 +376,7 @@ impl<'db> Device<'db> {
                     FieldsShape::Array { count, stride } => Some((count, stride.bytes())),
                     _ => None,
                 })?
-                .ok_or_else(|| (format!("the array `{ty:?}`, laid out as no array"), why::TYPES))?; // alloc: an error
+                .ok_or_else(|| (format!("the array `{ty}`, laid out as no array", ty = self.shown(ty)), why::TYPES))?; // alloc: an error
                 let elem_lowered = self.lower_ty(elem)?;
                 match (elem_lowered.naga, std::num::NonZeroU32::new(count as u32)) {
                     (Some(base), Some(len)) => {
@@ -377,9 +388,9 @@ impl<'db> Device<'db> {
             }
             TyKind::Ref(..) | TyKind::RawPtr(..) => {
                 // alloc: an error
-                return Err((format!("a reference or pointer `{ty:?}` held in a value"), why::POINTERS));
+                return Err((format!("a reference or pointer `{ty}` held in a value", ty = self.shown(ty)), why::POINTERS));
             }
-            _ => return Err((format!("the type `{ty:?}`"), why::TYPES)), // alloc: an error
+            _ => return Err((format!("the type `{ty}`", ty = self.shown(ty)), why::TYPES)), // alloc: an error
         })
     }
 
@@ -427,7 +438,7 @@ impl<'db> Device<'db> {
                 .db
                 .const_eval_discriminant(variant)
                 // alloc: an error
-                .map_err(|e| (format!("the discriminant of a variant of `{ty:?}`, which did not evaluate ({e:?})"), why::ENUMS))?;
+                .map_err(|e| (format!("the discriminant of a variant of `{ty}`, which did not evaluate ({e:?})", ty = self.shown(ty)), why::ENUMS))?;
             let mut map = Vec::new(); // alloc: a variant's members
             let fields: Vec<Ty<'db>> = self
                 .db
@@ -461,6 +472,12 @@ impl<'db> Device<'db> {
         }
         let lowered = self.lower_ty(ty)?;
         let Some(naga_ty) = lowered.naga else { return Ok(None) };
+        // A constant is as many bytes as its type's layout: every part below is read at the
+        // offsets that layout gives.
+        let size = self.with_layout(ty, |l| l.size.bytes_usize())?;
+        if bytes.len() != size {
+            return Err(self.cut(ty, bytes.len(), size));
+        }
         let init = self.const_expr(ty, &lowered, bytes)?;
         let handle = self.module.constants.append(naga::Constant { name: None, ty: naga_ty, init }, Span::UNDEFINED);
         self.consts.insert((ty, Box::from(bytes)), handle); // alloc: the key
@@ -489,7 +506,7 @@ impl<'db> Device<'db> {
                     let Some(k) = map[i] else { continue };
                     let field_lowered = self.lower_ty(*field)?;
                     let size = self.with_layout(*field, |l| l.size.bytes() as usize)?;
-                    let part = bytes.get(offsets[i]..offsets[i] + size).ok_or_else(cut)?;
+                    let part = bytes.get(offsets[i]..offsets[i] + size).ok_or_else(|| self.cut(ty, bytes.len(), offsets[i] + size))?;
                     members.push((k, self.const_expr(*field, &field_lowered, part)?));
                 }
                 members.sort_by_key(|(k, _)| *k);
@@ -501,7 +518,7 @@ impl<'db> Device<'db> {
                 let stride = self.with_layout(elem, |l| l.size.bytes() as usize)?;
                 let mut components = Vec::new(); // alloc: an array constant's elements
                 for i in 0..*len as usize {
-                    let part = bytes.get(i * stride..(i + 1) * stride).ok_or_else(cut)?;
+                    let part = bytes.get(i * stride..(i + 1) * stride).ok_or_else(|| self.cut(ty, bytes.len(), (i + 1) * stride))?;
                     components.push(self.const_expr(elem, &elem_lowered, part)?);
                 }
                 Expression::Compose { ty: naga_ty, components }
@@ -523,7 +540,7 @@ impl<'db> Device<'db> {
                     })
                 })?;
                 // alloc: an error
-                let (variant, offsets) = found.ok_or_else(|| (format!("a constant of `{ty:?}` whose bytes are no variant"), why::ENUMS))?;
+                let (variant, offsets) = found.ok_or_else(|| (format!("a constant of `{ty}` whose bytes are no variant", ty = self.shown(ty)), why::ENUMS))?;
                 let at = variants.iter().position(|v| v.id == variant).expect("a variant of the enum");
                 let TypeInner::Struct { members, .. } = &self.module.types[naga_ty].inner else { unreachable!() };
                 let member_tys: Vec<Handle<Type>> = members.iter().map(|m| m.ty).collect(); // alloc: member types
@@ -540,7 +557,7 @@ impl<'db> Device<'db> {
                     let Some(k) = variants[at].members[i] else { continue };
                     let field_lowered = self.lower_ty(*field)?;
                     let size = self.with_layout(*field, |l| l.size.bytes() as usize)?;
-                    let part = bytes.get(offsets[i]..offsets[i] + size).ok_or_else(cut)?;
+                    let part = bytes.get(offsets[i]..offsets[i] + size).ok_or_else(|| self.cut(ty, bytes.len(), offsets[i] + size))?;
                     components[k as usize] = Some(self.const_expr(*field, &field_lowered, part)?);
                 }
                 let components = components
@@ -551,13 +568,15 @@ impl<'db> Device<'db> {
                 Expression::Compose { ty: naga_ty, components }
             }
             Shape::Zst | Shape::Texture | Shape::Sampler => {
-                return Err((format!("a constant of type `{ty:?}`"), why::OPERATIONS)); // alloc: an error
+                return Err((format!("a constant of type `{ty}`", ty = self.shown(ty)), why::OPERATIONS)); // alloc: an error
             }
         };
         Ok(self.module.global_expressions.append(expr, Span::UNDEFINED))
     }
 
     fn literal(&self, scalar: Scalar, bytes: &[u8]) -> Result<Literal, Refused> {
+        // alloc: an error
+        let cut = || (format!("a scalar constant of {} bytes, read as one of {}", bytes.len(), scalar.width), why::OPERATIONS);
         let word: [u8; 4] = match scalar.width {
             4 => bytes.try_into().map_err(|_| cut())?,
             1 => [bytes.first().copied().ok_or_else(cut)?, 0, 0, 0],
@@ -584,9 +603,9 @@ impl<'db> Device<'db> {
                     .iter()
                     .map(|(_, f)| self.normalize(f.ty().instantiate(self.interner, args).skip_norm_wip()))
                     .collect(), // alloc: field types
-                _ => return Err((format!("the fields of `{ty:?}`"), why::ENUMS)), // alloc: an error
+                _ => return Err((format!("the fields of `{ty}`", ty = self.shown(ty)), why::ENUMS)), // alloc: an error
             },
-            _ => return Err((format!("the fields of `{ty:?}`"), why::TYPES)), // alloc: an error
+            _ => return Err((format!("the fields of `{ty}`", ty = self.shown(ty)), why::TYPES)), // alloc: an error
         })
     }
 
@@ -658,10 +677,6 @@ impl<'db> Device<'db> {
         });
         Ok(bindings)
     }
-}
-
-fn cut() -> Refused {
-    ("a constant whose bytes are cut short".to_owned(), why::OPERATIONS) // alloc: an error
 }
 
 /// What a place is, once its pointer is built.
@@ -998,7 +1013,7 @@ impl<'d, 'db> EntryCx<'d, 'db> {
         };
         let from = self.place_ty(frame, of);
         let (Some(from_pointee), Some(to_pointee)) = (pointee(from), pointee(to)) else {
-            return Err((format!("a cast from `{from:?}` to `{to:?}`"), why::POINTERS)); // alloc: an error
+            return Err((format!("a cast from `{from}` to `{to}`", from = self.dev.shown(from), to = self.dev.shown(to)), why::POINTERS)); // alloc: an error
         };
         let (from_pointee, to_pointee) = (self.dev.normalize(from_pointee), self.dev.normalize(to_pointee));
         let mut sym = self.sym_of_ref_value(frame, of)?;
@@ -1012,11 +1027,11 @@ impl<'d, 'db> EntryCx<'d, 'db> {
                     Ok(sym)
                 }
                 // alloc: an error
-                _ => Err((format!("an unsizing of `{from:?}` to `{to:?}` (only an array to a slice lowers)"), why::POINTERS)),
+                _ => Err((format!("an unsizing of `{from}` to `{to}` (only an array to a slice lowers)", from = self.dev.shown(from), to = self.dev.shown(to)), why::POINTERS)),
             },
             m::CastKind::PtrToPtr | m::CastKind::PointerCoercion(PointerCast::MutToConstPointer) if from_pointee == to_pointee => Ok(sym),
             // alloc: an error
-            _ => Err((format!("a `{kind:?}` cast from `{from:?}` to `{to:?}`, which changes what it points at"), why::POINTERS)),
+            _ => Err((format!("a `{kind:?}` cast from `{from}` to `{to}`, which changes what it points at", from = self.dev.shown(from), to = self.dev.shown(to)), why::POINTERS)),
         }
     }
 
@@ -1107,7 +1122,9 @@ impl<'d, 'db> EntryCx<'d, 'db> {
 
     /// The naga member of field `field` of `ty`, of its variant `variant` for an enum.
     fn member(&mut self, ty: Ty<'db>, variant: Option<VariantId>, field: usize) -> Result<u32, Refused> {
-        let none = || (format!("field {field} of `{ty:?}`, which has no size"), why::TYPES); // alloc: an error
+        // The database and crate, not `self`: `lower_ty` below borrows the device mutably.
+        let (db, krate) = (self.dev.db, self.dev.env.krate);
+        let none = || (format!("field {field} of `{ty}`, which has no size", ty = ty_name(db, krate, ty)), why::TYPES); // alloc: an error
         match (self.dev.lower_ty(ty)?.shape, variant) {
             (Shape::Vector, _) => Ok(field as u32),
             (Shape::Struct(map), _) => map.get(field).copied().flatten().ok_or_else(none),
@@ -1116,7 +1133,7 @@ impl<'d, 'db> EntryCx<'d, 'db> {
                 .find(|x| x.id == v)
                 .and_then(|x| x.members.get(field).copied().flatten())
                 .ok_or_else(none),
-            _ => Err((format!("a field of `{ty:?}`"), why::TYPES)), // alloc: an error
+            _ => Err((format!("a field of `{ty}`", ty = self.dev.shown(ty)), why::TYPES)), // alloc: an error
         }
     }
 
@@ -1138,7 +1155,7 @@ impl<'d, 'db> EntryCx<'d, 'db> {
             None => Slot::Zst,
             Some(naga_ty) => {
                 if matches!(lowered.shape, Shape::Texture | Shape::Sampler) {
-                    return Err((format!("a `{ty:?}` held by value"), why::TYPES)); // alloc: an error
+                    return Err((format!("a `{ty}` held by value", ty = self.dev.shown(ty)), why::TYPES)); // alloc: an error
                 }
                 let name = format!("{}_{i}", short_name(&self.frames[frame].item)); // alloc: a name
                 let init = Some(self.func.expressions.append(Expression::ZeroValue(naga_ty), Span::UNDEFINED));
@@ -1175,7 +1192,7 @@ impl<'d, 'db> EntryCx<'d, 'db> {
             m::TerminatorKind::Drop { place, target, .. } => {
                 let ty = self.place_ty(frame, place);
                 if !matches!(has_drop_glue(&self.dev.infcx, ty, self.dev.env.param_env), DropGlue::None) {
-                    return Err((format!("a drop of a `{ty:?}`, which runs code"), why::OPERATIONS)); // alloc: an error
+                    return Err((format!("a drop of a `{ty}`, which runs code", ty = self.dev.shown(ty)), why::OPERATIONS)); // alloc: an error
                 }
                 vec![self.node_of(frame, *target)] // alloc: an edge
             }
@@ -1334,7 +1351,7 @@ impl<'d, 'db> EntryCx<'d, 'db> {
             Out::Color => {
                 let vec4 = self.value_ty(ValueTy::Vec4);
                 if self.dev.lower_ty(ret_ty)?.naga != Some(vec4) {
-                    return Err((format!("a fragment stage returning `{ret_ty:?}`, not a `Vec4`"), why::INTERFACE)); // alloc: an error
+                    return Err((format!("a fragment stage returning `{ret_ty}`, not a `Vec4`", ret_ty = self.dev.shown(ret_ty)), why::INTERFACE)); // alloc: an error
                 }
                 let binding = Binding::Location { location: 0, interpolation: None, sampling: None, blend_src: None, per_primitive: false };
                 self.func.result = Some(naga::FunctionResult { ty: vec4, binding: Some(binding) });
@@ -1357,7 +1374,7 @@ impl<'d, 'db> EntryCx<'d, 'db> {
         match ty.kind() {
             TyKind::Adt(def, _) if matches!(def.def_id(), AdtId::EnumId(_)) => {
                 // alloc: an error
-                Err((format!("resource `{param}` holding the enum `{ty:?}`, whose device layout is not the host's"), why::ENUMS))
+                Err((format!("resource `{param}` holding the enum `{ty}`, whose device layout is not the host's", ty = self.dev.shown(ty)), why::ENUMS))
             }
             TyKind::Array(elem, _) => self.host_shared(elem, param),
             TyKind::Adt(..) | TyKind::Tuple(..) => {
@@ -1614,7 +1631,7 @@ impl<'d, 'db> EntryCx<'d, 'db> {
     fn varyings_in(&mut self, arg: Handle<Expression>, names: &[String], ty: Ty<'db>) -> Result<Handle<Expression>, Refused> {
         let lowered = self.dev.lower_ty(ty)?;
         let (Some(naga_ty), Shape::Struct(map)) = (lowered.naga, lowered.shape) else {
-            return Err((format!("the varyings `{ty:?}` are not a struct"), why::INTERFACE)); // alloc: an error
+            return Err((format!("the varyings `{ty}` are not a struct", ty = self.dev.shown(ty)), why::INTERFACE)); // alloc: an error
         };
         let fields = self.dev.field_tys(ty)?;
         let rust_names = self.field_names(ty);
@@ -1672,7 +1689,7 @@ impl<'d, 'db> EntryCx<'d, 'db> {
                 let inner = self.wrap(value, io, inner)?;
                 Ok(self.expr(Expression::Compose { ty: naga_ty, components: vec![inner] })) // alloc: one member
             }
-            _ => Err((format!("an interface value of `{ty:?}`, which is not its descriptor's type or a newtype of it"), why::INTERFACE)), // alloc: an error
+            _ => Err((format!("an interface value of `{ty}`, which is not its descriptor's type or a newtype of it", ty = self.dev.shown(ty)), why::INTERFACE)), // alloc: an error
         }
     }
 
@@ -1689,7 +1706,7 @@ impl<'d, 'db> EntryCx<'d, 'db> {
                 let inner = self.expr(Expression::AccessIndex { base: value, index: 0 });
                 self.unwrap(inner, io, inner_ty)
             }
-            _ => Err((format!("an interface value of `{ty:?}`, which is not its descriptor's type or a newtype of it"), why::INTERFACE)), // alloc: an error
+            _ => Err((format!("an interface value of `{ty}`, which is not its descriptor's type or a newtype of it", ty = self.dev.shown(ty)), why::INTERFACE)), // alloc: an error
         }
     }
 
@@ -1705,7 +1722,7 @@ impl<'d, 'db> EntryCx<'d, 'db> {
             Out::Varyings(fields) => {
                 let lowered = self.dev.lower_ty(ty)?;
                 let Shape::Struct(map) = lowered.shape else {
-                    return Err((format!("varyings `{ty:?}` that are not a struct"), why::INTERFACE)); // alloc: an error
+                    return Err((format!("varyings `{ty}` that are not a struct", ty = self.dev.shown(ty)), why::INTERFACE)); // alloc: an error
                 };
                 let rust_names = self.field_names(ty);
                 let field_tys = self.dev.field_tys(ty)?;
@@ -1877,17 +1894,17 @@ impl<'d, 'db> EntryCx<'d, 'db> {
                     _ => None,
                 };
                 let Some(bits) = bits else {
-                    return Err((format!("a constant of type `{ty:?}`"), why::OPERATIONS)); // alloc: an error
+                    return Err((format!("a constant of type `{ty}`", ty = self.dev.shown(ty)), why::OPERATIONS)); // alloc: an error
                 };
                 let Shape::Scalar(scalar) = lowered.shape else {
-                    return Err((format!("a constant of type `{ty:?}`"), why::OPERATIONS)); // alloc: an error
+                    return Err((format!("a constant of type `{ty}`", ty = self.dev.shown(ty)), why::OPERATIONS)); // alloc: an error
                 };
                 let lit = match scalar.kind {
                     ScalarKind::Bool => Literal::Bool(bits != 0),
                     ScalarKind::Sint => Literal::I32(bits as u32 as i32),
                     ScalarKind::Uint => Literal::U32(bits as u32),
                     ScalarKind::Float => Literal::F32(f32::from_bits(bits as u32)),
-                    _ => return Err((format!("a constant of type `{ty:?}`"), why::OPERATIONS)), // alloc: an error
+                    _ => return Err((format!("a constant of type `{ty}`", ty = self.dev.shown(ty)), why::OPERATIONS)), // alloc: an error
                 };
                 Ok(Some(self.expr(Expression::Literal(lit))))
             }
@@ -1897,7 +1914,7 @@ impl<'d, 'db> EntryCx<'d, 'db> {
                 }
                 let allocation = allocation.as_ref();
                 if !matches!(allocation.memory_map, MemoryMap::Empty) && !allocation.memory_map.value_pointers().is_empty() {
-                    return Err((format!("a constant of `{:?}` that holds references", allocation.ty), why::POINTERS)); // alloc: an error
+                    return Err((format!("a constant of `{}` that holds references", self.dev.shown(allocation.ty)), why::POINTERS)); // alloc: an error
                 }
                 match self.dev.constant(allocation.ty, &allocation.memory)? {
                     Some(c) => Ok(Some(self.expr(Expression::Constant(c)))),
@@ -1920,7 +1937,7 @@ impl<'d, 'db> EntryCx<'d, 'db> {
     fn scalar_of(&mut self, ty: Ty<'db>) -> Result<Scalar, Refused> {
         match self.dev.lower_ty(ty)?.shape {
             Shape::Scalar(s) => Ok(s),
-            _ => Err((format!("an operation on `{ty:?}`, which is not a scalar"), why::OPERATIONS)), // alloc: an error
+            _ => Err((format!("an operation on `{ty}`, which is not a scalar", ty = self.dev.shown(ty)), why::OPERATIONS)), // alloc: an error
         }
     }
 
@@ -1951,7 +1968,7 @@ impl<'d, 'db> EntryCx<'d, 'db> {
                         let sym = self.sym_of_ref_value(frame, &m::Place::from(place.local).store())?;
                         Some(self.sym_len(&sym)?)
                     }
-                    _ => return Err((format!("the length of `{ty:?}`"), why::OPERATIONS)), // alloc: an error
+                    _ => return Err((format!("the length of `{ty}`", ty = self.dev.shown(ty)), why::OPERATIONS)), // alloc: an error
                 }
             }
             m::Rvalue::Repeat(op, _) => {
@@ -2014,7 +2031,7 @@ impl<'d, 'db> EntryCx<'d, 'db> {
                         members.into_iter().map(|(_, v)| v).collect()
                     }
                     Shape::Vector | Shape::Array { .. } => values.into_iter().map(|v| self.need(v)).collect::<Result<_, _>>()?,
-                    _ => return Err((format!("a value of `{dest_ty:?}` built from parts"), why::TYPES)), // alloc: an error
+                    _ => return Err((format!("a value of `{dest_ty}` built from parts", dest_ty = self.dev.shown(dest_ty)), why::TYPES)), // alloc: an error
                 };
                 Some(self.expr(Expression::Compose { ty: naga_ty, components }))
             }
@@ -2024,7 +2041,7 @@ impl<'d, 'db> EntryCx<'d, 'db> {
                 match self.dev.lower_ty(ty)?.shape {
                     Shape::Enum(_) => {
                         let Ptr::Pointer(pointer, _) = self.place_ptr(frame, place)? else {
-                            return Err((format!("the discriminant of `{ty:?}`, which has no value"), why::ENUMS)); // alloc: an error
+                            return Err((format!("the discriminant of `{ty}`, which has no value", ty = self.dev.shown(ty)), why::ENUMS)); // alloc: an error
                         };
                         let tag = self.expr(Expression::AccessIndex { base: pointer, index: 0 });
                         let tag = self.expr(Expression::Load { pointer: tag });
@@ -2050,7 +2067,7 @@ impl<'d, 'db> EntryCx<'d, 'db> {
         let lowered = self.dev.lower_ty(dest_ty)?;
         let (Some(naga_ty), Shape::Enum(variants)) = (lowered.naga, lowered.shape) else { return Ok(None) };
         let Some(this) = variants.iter().find(|v| v.id == variant) else {
-            return Err((format!("a variant that is not of `{dest_ty:?}`"), why::ENUMS)); // alloc: an error
+            return Err((format!("a variant that is not of `{dest_ty}`", dest_ty = self.dev.shown(dest_ty)), why::ENUMS)); // alloc: an error
         };
         let TypeInner::Struct { members, .. } = &self.dev.module.types[naga_ty].inner else { unreachable!("an enum is a struct") };
         let member_tys: Vec<Handle<Type>> = members.iter().map(|m| m.ty).collect(); // alloc: member types
@@ -2092,7 +2109,7 @@ impl<'d, 'db> EntryCx<'d, 'db> {
             m::CastKind::IntToFloat => self.expr(Expression::As { expr: value, kind: ScalarKind::Float, convert: Some(4) }),
             m::CastKind::FloatToFloat if from_s == to_s => value,
             m::CastKind::FloatToInt => self.float_to_int(value, to_s)?,
-            other => return Err((format!("a `{other:?}` cast from `{from:?}` to `{to:?}`"), why::OPERATIONS)), // alloc: an error
+            other => return Err((format!("a `{other:?}` cast from `{from}` to `{to}`", from = self.dev.shown(from), to = self.dev.shown(to)), why::OPERATIONS)), // alloc: an error
         })
     }
 
@@ -2107,7 +2124,7 @@ impl<'d, 'db> EntryCx<'d, 'db> {
             (Shape::Scalar(a), Shape::Scalar(b)) if a.width == 4 && b.width == 4 => {
                 Ok(self.expr(Expression::As { expr: value, kind: b.kind, convert: None }))
             }
-            _ => Err((format!("a transmute from `{from:?}` to `{to:?}`"), why::OPERATIONS)), // alloc: an error
+            _ => Err((format!("a transmute from `{from}` to `{to}`", from = self.dev.shown(from), to = self.dev.shown(to)), why::OPERATIONS)), // alloc: an error
         }
     }
 

@@ -16,6 +16,7 @@ doctest = false
 [dependencies]
 blaze-hash.workspace = true
 blaze-items.workspace = true
+blaze-query.workspace = true
 rustc_abi.workspace = true
 rustc_type_ir.workspace = true
 
