@@ -400,7 +400,7 @@ types, each with exactly the spec that is valid for it and the operations it rea
 | `WasmSandbox` | a module, `Dir`s as preopens, an `Env`, fuel and memory limits | a WASI module in the runtime | call an export, meter fuel |
 
 ```rust
-let sb = io.sandboxes().os(cx, &OsSpec {
+let sb: OsSandbox = io.sandboxes().open(cx, &OsSpec {
     dirs: &[(path!("src"), &src.read_only()), (path!("out"), &out)],
     env: &env.only(&[var!("CC")]),
     net: NetPolicy::None,
@@ -414,6 +414,10 @@ fn compile(cx: &Cx, run: &Runner) -> Result<(), Error> {
 }
 ```
 
+- **One `open`; the spec's type picks the sandbox's type.** Each spec names its sandbox
+  (`trait Spec { type Sandbox; }`), so `open(cx, &VmSpec { .. })` returns a `Vm` and
+  `open(cx, &OsSpec { .. })` an `OsSandbox`. A spec for one kind cannot hold a field of another,
+  and an operation a kind lacks does not exist on its type.
 - **`Runner` is what they share**: run a command, get its status and its output streams. It is
   the higher capability each of the three can make (as `Net` makes `Http`), one concrete type
   with the provider inside. Code that only runs commands takes `&Runner`; code that snapshots
