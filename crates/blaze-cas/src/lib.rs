@@ -29,6 +29,9 @@
 //! (docs/v2/plan/design/memory.md): a lookup that hits and a warm put allocate nothing.
 
 #![feature(allocator_api)]
+// `#![blaze::sans_io]` marks a sans-IO core for `blaze::sans_io_core` (the pool's loads and sweep).
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
 
 pub mod chunk;
 mod cold;
@@ -43,6 +46,14 @@ mod index;
 #[cfg(all(test, blaze_check))]
 mod model;
 mod peers;
+// The store's buffer pool (docs/v2/plan/design/store-pool.md): its core and its DST. Its atomics
+// are laid over reserved memory, which the model checker's do not model.
+#[cfg(not(blaze_check))]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "lane 3 of docs/v2/plan/design/store-pool.md: the store reads through the pool from lane 4")
+)]
+mod pool;
 mod read;
 pub mod remote;
 mod segment;
