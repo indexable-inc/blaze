@@ -751,6 +751,9 @@ export const chat_line_inset = 22
 export const chat_nest = $chat_line_inset - $chat_line_pad
 // Between a line's words, its argument and its detail.
 export const chat_line_word_gap = 5
+// A folded line's marks (hn.StepTally): chat_tally_gap between a kind's glyph and its count, chat_tally_between kinds.
+export const chat_tally_gap = 3
+export const chat_tally_between = 10
 // A drawn view's code button's glyph.
 export const chat_line_icon = 14
 // A drawn view's code button: hung in the column's gutter, left of the view, shown while the view is hovered.

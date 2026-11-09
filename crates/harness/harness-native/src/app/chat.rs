@@ -1150,9 +1150,8 @@ fn texts(r: &Row) -> Vec<(&'static [&'static str], String, bool)> {
         ],
         Row::Thinking { open: true, text, .. } => vec![(&["body", "text"], text.trim().to_owned(), false)],
         Row::Note(s) | Row::Error(s) => vec![(&["text"], s.clone(), false)],
-        Row::Steps(l) => vec![(&["head", "words"], l.words.clone(), false)],
         Row::Out(o) => o.texts(),
-        Row::Tool { .. } | Row::Thinking { .. } | Row::Grid { .. } | Row::Table(_) | Row::Ui { .. } | Row::Pictures(..) | Row::RefCard(_) | Row::Math(_) => {
+        Row::Steps(_) | Row::Tool { .. } | Row::Thinking { .. } | Row::Grid { .. } | Row::Table(_) | Row::Ui { .. } | Row::Pictures(..) | Row::RefCard(_) | Row::Math(_) => {
             Vec::new()
         }
     }
