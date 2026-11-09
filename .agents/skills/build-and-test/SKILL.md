@@ -77,11 +77,14 @@ When a lane is done, delete its build directory (`blaze clean`), worktree, ix VM
 
 ## ledger-decides (rule 46)
 
-`docs/v2/plan/objectives.md` has one row per objective: the outcome, the check that decides it, its
-status. Pick work from it. Before starting, run the row's check on main and write the result and the
-commit into the row. A row with no check gets one written first, as part of the work. Done means the
-check passes on a named commit and has joined the gate or the release train, so it cannot regress
-silently. A row that fails twice records what blocks it and stops.
+The ledger is `docs/v2/plan/objectives.json`, one row per objective: the outcome, the check that
+decides it as a command, its paths, its status (`docs/v2/plan/objectives.md` is its generated
+table). `harness/v2/ledger.py` picks work that does not collide (`pick`), runs a row's check and
+writes its status with the commit (`run`), and regenerates the table (`write`); never type a status
+by hand, except `blocked` with why. Before starting a row, run its check on main. A row with no
+check gets one written first, as part of the work. Done means the check passes on a named commit and
+has joined the gate or the release train, so it cannot regress silently. A row that fails twice
+records what blocks it and stops.
 
 See [docs/v2/plan.md#how-the-work-is-run](../../../docs/v2/plan.md#how-the-work-is-run).
 

@@ -200,9 +200,13 @@ The old way (70 agent windows, lanes that owned paths, request files between the
 compiled until every lane said done) produced code nobody had run and notes nobody could read.
 This replaces it.
 
-**The ledger decides.** [objectives.md](plan/objectives.md) has one row per objective: an outcome,
-the check that decides it, its status. Nobody argues whether something is done; the check is run
-on a named tree. An objective without a check gets one written first, as part of the work.
+**The ledger decides.** The ledger is data, `plan/objectives.json`: one row per objective, with
+the outcome, the check that decides it as a command, the paths it touches, what it needs first,
+and its status. `harness/v2/ledger.py` runs a row's check and writes the status with the commit
+(`run`), says what to work on next without two tasks colliding (`pick`), and writes the table
+people read, [objectives.md](plan/objectives.md) (`write`). Nobody types "done" and nobody argues
+it. An objective without a check says which one is missing, and writing it is the first part of
+the work; until then the row cannot be met.
 
 **Every agent has one task.** A task is an objective id, or a named piece of one. An agent with no
 task is not started; a task says its outcome and its check in one line each. The agent app's
@@ -211,10 +215,10 @@ processes exist ([tasks](plan/design/tasks.md)).
 
 **The loop**, run by one coordinator (the main agent of a session):
 
-1. **Measure.** Run the checks of the rows about to be worked on, on main's exact tree. Write
-   the result and the commit into the ledger. Never start from a status someone remembered.
-2. **Pick** a few open rows whose paths do not overlap, highest leverage first: a failing check
-   that blocks others, then the largest gap to a target.
+1. **Measure.** `ledger.py` `run` on main's exact tree, for the rows about to be worked on. Never
+   start from a status someone remembered.
+2. **Pick.** `ledger.py` `pick` gives rows that are ready and whose paths do not overlap, in the
+   ledger's order; take fewer when one is large.
 3. **Brief.** Each task gets the objective's row, the section of this page and the spec it
    belongs to, the paths it may touch, and what "done" prints. A row that needs a design gets
    its spec written first, by the same task that then builds it.
@@ -226,8 +230,8 @@ processes exist ([tasks](plan/design/tasks.md)).
 6. **Land** what passes, one pull request per objective, through `land.py`. What fails goes back
    to its worker once with the check's output; a second failure is written into the row as what
    blocks it, and the task stops.
-7. **Ratchet.** A row that is met has its check added to the gate or the release train, so it
-   cannot regress silently. Then update the row and go to 1.
+7. **Ratchet.** The release train runs every met row again (`run` with `only: "met"`) and fails
+   when one is no longer met, so nothing regresses silently. Then go to 1.
 
 **Docs stay small.** This page, the ledger, the bounds and one spec per unbuilt design. No lane
 notes, no pass reports, no indexes of indexes: what was done is the pull request and the commit; a

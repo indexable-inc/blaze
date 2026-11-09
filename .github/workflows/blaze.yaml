@@ -129,6 +129,10 @@ jobs:
       # Each doc says what it is, the current ones hold against the tree, and docs/README.md is
       # their index (tools/docs.py).
       - run: python3 tools/docs.py check
+      # The objectives ledger's rows are well formed and its table is current (harness/v2/ledger.py).
+      - run: |
+          uv run --frozen python harness/v2/ledger.py selftest
+          uv run --frozen python harness/v2/ledger.py '{"command": "check"}'
       # Each hash domain in crates/ is written once outside tests (tools/v2/domains.py).
       - run: |
           uv run --frozen python tools/v2/domains.py '{"root": "."}'
