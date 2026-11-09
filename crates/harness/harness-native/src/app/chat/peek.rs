@@ -809,7 +809,7 @@ fn first_text_lines(s: &str, n: usize) -> String {
 
 /// What a path's card shows of its place, read once and kept with the chat.
 #[derive(Clone)]
-enum Peeked {
+pub(super) enum Peeked {
     /// A file's first lines, in the code face.
     Text(String),
     /// A quiet line: why the place could not be read (naming it), that a file is binary, that a folder is empty.
@@ -820,7 +820,7 @@ enum Peeked {
 
 /// What a path target (`<line>:<path>` from that line) shows: a file's first `n` lines from there, a folder's first
 /// `entries` entries; what could not be read says why, naming it.
-fn peek_place(target: &str, n: usize, entries: usize) -> Peeked {
+pub(super) fn peek_place(target: &str, n: usize, entries: usize) -> Peeked {
     let (from, path) = match target.split_once(':') {
         Some((l, p)) if l.parse::<usize>().is_ok() => (l.parse::<usize>().unwrap_or(1).max(1), p),
         _ => (1, target),

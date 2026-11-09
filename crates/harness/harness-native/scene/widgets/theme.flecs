@@ -114,6 +114,14 @@ hn {
     chat_pick {
       PickFeel: {step: $chat_pick_swipe_step, commit: $chat_pick_commit_secs, word: $chat_pick_word_secs}
     }
+    // The `@` mention menu's preview (src/app/chat/mention.rs): how much of a place it reads, and the box a picture fits.
+    chat_mention {
+      MentionLook: {
+        cols: $chat_mention_cols_n, line: $line_chat_code, entry: $line_peek_entry + $inline_peek_entry_gap,
+        image_w: $chat_mention_preview_w - 2 * $chat_mention_preview_pad,
+        image_h: $chat_mention_preview_h - 2 * $chat_mention_preview_pad - $line_peek_meta - $inline_peek_gap
+      }
+    }
     // A tree row folding in or away: its height on the spring, its words in once there is room (src/app/fold.rs).
     tree_fold {
       Motion: {omega: $tree_fold_omega, zeta: $tree_fold_zeta}

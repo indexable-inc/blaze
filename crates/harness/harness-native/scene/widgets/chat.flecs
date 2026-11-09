@@ -173,16 +173,47 @@ hn {
   // The `@` mention menu (chat/mention.rs): ui.Menu's plate above the composer's card, chat_mention_w wide, its rows
   // under `items` (hn.ChatMentionItem, or a ui.MenuNote saying why there are none). Instant: no grow or fade in or out,
   // and it follows what is typed without a spring (ui.Menu less its Transition and Motion).
+  // The list (`list.items`) at the leading side, the highlighted place's preview (`preview`) past a hairline.
   prefab ChatMention : ui.MenuPlate {
     Placed
     Windowed
     Layer: {level: Overlay}
     Side: {edge: Top, dx: 0, dy: $menu_gap}
-    Size: {w: {kind: Fixed, value: $chat_mention_w, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-    items : ui.Column {
+    Flex: {axis: Row, gap: $menu_pad, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    list : ui.Column {
       Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
-      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      Size: {w: {kind: Fixed, value: $chat_mention_w, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      items : ui.Column {
+        Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+        Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      }
     }
+    seam : hn.Seam {}
+    preview : ui.Column {
+      Clip
+      Flex: {axis: Column, gap: $inline_peek_gap, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Fixed, value: $chat_mention_preview_w, min: 0, max: 0}, h: {kind: Fixed, value: $chat_mention_preview_h, min: 0, max: 0}}
+      Padding: {l: $chat_mention_preview_pad, r: $chat_mention_preview_pad, t: $chat_mention_preview_pad, b: $chat_mention_preview_pad}
+    }
+  }
+  // The preview's path, quiet, one line (cut in its middle).
+  prefab ChatMentionHead : ui.LineMiddle, Muted {
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    TextStyle: {size: $size_peek_meta, line: $line_peek_meta, role: 0, bold: 0}
+  }
+  // A file's first lines in the code face, coloured by its language (chat/mention.rs sets Highlight), never wrapped: the box cuts them.
+  prefab ChatMentionCode : ui.Words {
+    Fill: $tone_ink
+    FixedSize: {h: true, v: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    TextStyle: {size: $size_code, line: $line_chat_code, role: 9, bold: 0}
+  }
+  // A picture, drawn whole at the size chat/mention.rs fits it to, a little rounded.
+  prefab ChatMentionImage : ui.Node {
+    Picture: {handle: ""}
+    Clip
+    Shape: {radius: $inline_peek_radius, n: 4, border: 0, feather: 0}
   }
   // A place: its kind's icon (files.rs's drawing) before its name, its folder quiet at the end (`about`, cut first).
   prefab ChatMentionItem : ui.MenuItem {

@@ -594,8 +594,16 @@ export const chat_effort_floor = 0.3
 export const chat_pick_menu_w = 252
 // The `@` mention menu (hn.ChatMention, chat/mention.rs): chat_mention_w wide over the composer, its leading edge on the
 // card's; a row each place, its kind's icon chat_mention_icon square, its name, then its folder quiet at the end.
-export const chat_mention_w = 420
+export const chat_mention_w = 340
 export const chat_mention_icon = 16
+// Its preview of the highlighted place (chat/mention.rs), beside the list past a hairline: a chat_mention_preview_w by
+// chat_mention_preview_h box (as tall as the most rows, so the menu keeps its size), chat_mention_preview_pad in from
+// its edges: the path, then a picture drawn whole, as many of a file's first lines as fit in the code face (each read
+// to chat_mention_cols_n characters; the box cuts what is wider), or as many of a folder's first entries as fit.
+export const chat_mention_preview_w = 380
+export const chat_mention_preview_h = 8 * $menu_item_h
+export const chat_mention_preview_pad = 10
+export const chat_mention_cols_n = 64
 export const size_chat_pick_detail = 11.5
 export const line_chat_pick_detail = 15
 export const chat_pick_detail_t = 3
