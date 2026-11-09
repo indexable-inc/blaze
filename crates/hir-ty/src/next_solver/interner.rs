@@ -2217,7 +2217,7 @@ impl<'db> Interner for DbInterner<'db> {
                 // This causes a compiler error if any new integer kinds are added. blaze: an
                 // integer variable never becomes an arbitrary width (`#![blaze::arbitrary_ints]`)
                 // through an impl, only by unifying with one, so their impls are not listed
-                // here (docs/v2/plan/lanes/frontend/arbitrary-ints.md).
+                // here (docs/v2/plan/design/arbitrary-ints.md).
                 let (I8 | I16 | I32 | I64 | I128 | Isize | IntTy::Bits(_)): IntTy;
                 let (U8 | U16 | U32 | U64 | U128 | Usize | UintTy::Bits(_)): UintTy;
                 let possible_integers = [

@@ -1,4 +1,4 @@
-//! Codegen's identical code folding, `blaze_codegen::dedupe` (docs/v2/plan/lanes/codegen/icf.md),
+//! Codegen's identical code folding, `blaze_codegen::dedupe` (docs/v2/plan/design/icf.md),
 //! on a build shaped like a generic-heavy crate:
 //!
 //! - `dedupe/generic_chains`: [`BODIES`] generic bodies of [`INSTANCES`] instances each, the

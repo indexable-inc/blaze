@@ -1,6 +1,6 @@
 """edits.py: blaze's incremental path held to blaze's own build of the same state from nothing,
 over edit sequences, the proof of lane dbsp's maintained name resolution, impl tables and trait
-candidate sets (docs/v2/plan/design/dbsp.md section 12; notes in docs/v2/plan/lanes/dbsp/proof.md).
+candidate sets (docs/v2/plan/design/dbsp.md section 12; notes in docs/v2/plan/design/dbsp.md).
 
     uv run --frozen python harness/v2/dbsp/edits.py '{"engine": {"kind": "v2", "blaze": "target/release/blaze"}, "out": "/tmp/edits.json"}'
     uv run --frozen python harness/v2/dbsp/edits.py '{"engine": {...}, "out": "...", "projects": [{"kind": "harness", "name": "ripgrep"}]}'

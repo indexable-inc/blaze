@@ -1,4 +1,4 @@
-//! A unit's check beside its codegen (docs/v2/plan/lanes/frontend/fast-bodies-tasks.md).
+//! A unit's check beside its codegen (docs/v2/plan/design/frontend.md).
 //!
 //! The check is the unit's [`Phase::Bodies`](crate::serve::work::Phase), its codegen
 //! [`Phase::Codegen`](crate::serve::work::Phase), two nodes of the plane that run side by side

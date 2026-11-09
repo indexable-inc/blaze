@@ -15,7 +15,7 @@
 //! becomes an indirect call in the body.
 //!
 //! What a bucket is, a masked IR without its constants' values ([`Form`]), is hash-consed
-//! (docs/v2/plan/lanes/fastcompile/hashcons.md): its content ID is computed once, when it is
+//! (docs/v2/plan/design/compile-time.md): its content ID is computed once, when it is
 //! interned, and [`groups`] compares those IDs without hashing any IR.
 
 #![forbid(unsafe_code)]

@@ -348,7 +348,7 @@ pub enum SyntaxKind {
     WRAP_BINDER_KW,
     UNSAFE_BINDER_CAST_EXPR,
     UNSAFE_BINDER_TYPE,
-    // blaze_verify's specification clauses (docs/v2/plan/lanes/verus.md), after the others too.
+    // blaze_verify's specification clauses (docs/v2/plan/design/verus.md), after the others too.
     DECREASES_KW,
     ENSURES_KW,
     INVARIANT_KW,

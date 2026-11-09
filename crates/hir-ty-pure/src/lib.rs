@@ -1,4 +1,4 @@
-//! Whether a build script is pure, proved from its MIR (docs/v2/plan/lanes/pure-scripts/design.md):
+//! Whether a build script is pure, proved from its MIR (docs/v2/plan.md):
 //! its whole reachable call graph, monomorphized from `main` through its build dependencies and
 //! std, only reads the variables cargo gives a build script ([`allowed_env`]), reads its
 //! package's files and writes its `OUT_DIR` at paths made only from those, and prints. A pure

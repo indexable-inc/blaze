@@ -81,7 +81,7 @@ own IR. The MIR evaluator stays for const eval and as the reference a macro's wa
 against; nothing hand-rolls a wasm-style sandbox (`blaze-macro-eval`'s `tier.rs` is replaced by
 this).
 
-See [docs/v2/plan/lanes/usercode/macros.md](../../../docs/v2/plan/lanes/usercode/macros.md).
+See [docs/v2/plan/design/proc-macros.md](../../../docs/v2/plan/design/proc-macros.md).
 
 ## keys-cover-every-input (rule 21)
 

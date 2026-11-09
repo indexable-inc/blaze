@@ -12,7 +12,7 @@ use harness_native_flecs::prelude::*;
 use harness_native_ui_draw_api::{PaintKind, Painted};
 use harness_native_ui_layout::typeset;
 use harness_native_ui_layout_api::Intrinsic;
-use harness_native_ui_look_api::{Edge, Fill, HoverInk, HoverLook, Lift, PressLook, Rgba, Shape, StrikeLook, Stroke, TextStyle};
+use harness_native_ui_look_api::{Edge, Fill, HoverInk, HoverLook, Lift, MathLook, PressLook, Rgba, Shape, Sheen, StrikeLook, Stroke, TextStyle};
 use harness_native_ui_motion_api::{CopyFlash, Pose};
 use harness_native_ui_node_api::Laid;
 use harness_native_ui_text_api::{
@@ -24,7 +24,9 @@ use harness_native_ui_timeline_api::{GlyphsArrive, GlyphsIn};
 use crate::draw::{ATLAS_SIZE, Draw};
 use crate::select;
 use crate::pack::{GlyphInst, ImageInst, LineInst, PanelInst, PathInst, SurfaceInst};
-use crate::text::{Face, Fonts, Glyph, GlyphCache, Layout, Run, SUBPX, Shaped, Style, TypeLook};
+use crate::markdown::InlineMath;
+use crate::math::Item;
+use crate::text::{AtlasGlyph, Face, Fonts, Glyph, GlyphCache, Layout, Run, SUBPX, Shaped, Style, TypeLook};
 
 /// The atlas uploader a frame is drawn with: `(x, y, w, h, bytes)` into the glyph atlas.
 pub type Upload<'a> = dyn FnMut(u32, u32, u32, u32, &[u8]) + 'a;
@@ -78,6 +80,14 @@ pub struct Painter {
     carets: crate::caret::Carets,
     /// A caret painted in the last frame is still sweeping ([`Painter::end_frame`]): the host draws another.
     pub gliding: bool,
+    /// Words painted this frame carry a moving [`Sheen`].
+    sheening: bool,
+    /// Words painted in the last frame carried a moving [`Sheen`] ([`Painter::end_frame`]): the host keeps drawing, at its
+    /// calm rate (a sheen is slow light, not motion that wants every frame). False under Reduce Motion, where it is still.
+    pub shimmering: bool,
+    /// LaTeX math's look (`ui.formula`), read from the scene each [`Painter::typeset`]: how large a formula is set, so the
+    /// hole markdown leaves for it ([`crate::markdown::Inline::holes`]); a change shapes every text again.
+    math: MathLook,
 }
 
 /// The most points one `Vector` node flattens to; past it the path is cut and the node's paint fails, named.
@@ -305,8 +315,11 @@ impl Painter {
             arriving: false,
             carets: crate::caret::Carets::default(),
             gliding: false,
+            sheening: false,
+            shimmering: false,
             highlight: crate::highlight::Highlighter::default(),
             media: None,
+            math: MathLook::default(),
         }
     }
 
@@ -359,7 +372,7 @@ impl Painter {
         }
         let shaped = Rc::new(if md {
             let m = crate::markdown::inline(text);
-            Shaped::new(&mut self.fonts, &m.text, &m.runs, &[], &m.holes(st.size), st, 0.0)
+            Shaped::new(&mut self.fonts, &m.text, &m.runs, &[], &m.holes(st.size, &self.math), st, 0.0)
         } else {
             let runs: Vec<Run> = face.map(|face| Run { start: 0, end: text.encode_utf16().count(), face }).into_iter().collect();
             Shaped::new(&mut self.fonts, text, &runs, &[], &[], st, 0.0)
@@ -394,7 +407,7 @@ impl Painter {
     fn layout_md_cut(&mut self, src: &str, style: &TextStyle, room: f32) -> (Rc<Layout>, crate::markdown::Inline) {
         let mut m = crate::markdown::inline(src);
         let st = set_of(style);
-        let holes = m.holes(st.size);
+        let holes = m.holes(st.size, &self.math);
         let rich = |fonts: &mut Fonts, text: &str, runs: &[crate::text::Run]| {
             let n = text.encode_utf16().count();
             let holes: Vec<crate::text::Hole> = holes.iter().copied().filter(|h| h.end <= n).collect();
@@ -431,12 +444,21 @@ impl Painter {
             t.end = t.end.min(keep);
             t.start < t.end
         });
+        m.math.retain(|f| f.at < keep);
         m.text = cut;
         (Rc::new(lay), m)
     }
 
     /// Measure every text node layout asked about and hand the sizes back; how many changed (layout runs again while any do).
     pub fn typeset(&mut self, world: WorldRef<'_>) -> usize {
+        let math = math_look(world);
+        if math != self.math {
+            // Every formula's hole is another size: shape and break the words again.
+            self.math = math;
+            self.shaped.clear();
+            self.layouts.clear();
+            self.widths.clear();
+        }
         let wanted = typeset::wanted(world);
         let sizes: Vec<Intrinsic> = wanted
             .iter()
@@ -486,6 +508,7 @@ impl Painter {
         self.kip_wake = self.kips.end_frame();
         self.arriving = self.arrivals.end_frame();
         self.gliding = self.carets.end_frame();
+        self.shimmering = std::mem::take(&mut self.sheening);
         if self.cache.overflowed() {
             self.cache.clear();
             return true;
@@ -809,6 +832,30 @@ impl Painter {
                     grow,
                     &mut look,
                 );
+                // Formulas, over their holes: each in the ink, fade and arrival of the words it stands in (the hole's own
+                // glyph's, as `look` gives it: a link's, bold's, a heading's), not drawn while its hole is cut (words typed on).
+                let formulas = shown_md.as_ref().map_or(&[][..], |m| m.math.as_slice());
+                if !formulas.is_empty() {
+                    let size = set_of(&style).size;
+                    let stroke = self.math.stroke;
+                    let mut n = 0usize;
+                    let mut stood: Vec<Option<(usize, Glyph)>> = vec![None; formulas.len()];
+                    for g in lay.lines.iter().flat_map(|l| &l.glyphs) {
+                        if let Ok(k) = formulas.binary_search_by_key(&g.idx, |f| f.at) {
+                            stood[k] = Some((n, *g));
+                        }
+                        n += 1;
+                    }
+                    for (f, at) in formulas.iter().zip(stood) {
+                        let shown = match at {
+                            Some((n, g)) => look(n, &g),
+                            None => Some((ink, p.alpha, 0.0)),
+                        };
+                        let Some((col, alpha, dy)) = shown else { continue };
+                        let em = f.em(size, &self.math);
+                        emit_math(d, &mut self.fonts, &mut self.cache, f, em, &lay, (laid.x, laid.y + dy), col, alpha, stroke, sc, upload);
+                    }
+                }
                 if let Some((pulse, plates)) = &lit {
                     pulse.light_glyphs(&mut d.glyphs[first_glyph..], plates);
                 }
@@ -819,6 +866,30 @@ impl Painter {
                         }
                         pulse.light_glyph(g);
                     }
+                }
+                // A sheen: its band of light through the words, each glyph lit by where its middle is (the widest line
+                // the span it crosses). Words at rest (none, or one of strength 0) cost one lookup.
+                if let Some(s) = e.try_cloned::<&Sheen>().filter(Sheen::live) {
+                    let still = harness_native_api::reduced(e.world());
+                    let span = lay.lines.iter().map(|l| l.width).fold(0.0, f32::max);
+                    let lift = rgba(if dark { s.dark } else { s.light });
+                    let t = time + s.offset(e.id().0);
+                    for g in &mut d.glyphs[first_glyph..] {
+                        // Colour glyphs (emoji) keep their own colours.
+                        if g.kind[0] > 0.5 {
+                            continue;
+                        }
+                        let k = s.lit(t, span, g.rect[0] + g.rect[2] * 0.5 - laid.x, still);
+                        if k <= 0.0 {
+                            continue;
+                        }
+                        for col in [&mut g.col_d, &mut g.col_l] {
+                            for (c, to) in col.iter_mut().zip(lift).take(3) {
+                                *c += (to - *c) * k;
+                            }
+                        }
+                    }
+                    self.sheening |= !still;
                 }
                 if md.is_some() {
                     let size = set_of(&style).size;
@@ -1355,6 +1426,104 @@ impl Painter {
         let sheet = Rc::new(Sheet { w: info.width, h, frames, peak: None });
         self.sheets.insert(handle.to_owned(), sheet.clone());
         Ok(sheet)
+    }
+}
+
+/// `ui.formula`'s look (prims.flecs): LaTeX math's sizes and strokes. The scene is compiled in, so one without it is a bug:
+/// this panics naming it.
+fn math_look(w: WorldRef<'_>) -> MathLook {
+    w.try_lookup("ui::formula")
+        .unwrap_or_else(|| panic!("the scene has no ui::formula (prims.flecs)"))
+        .try_cloned::<&MathLook>()
+        .unwrap_or_else(|| panic!("ui::formula has no MathLook"))
+}
+
+/// Formula `f` of words laid out in `lay` with their origin at `(ox, oy)`, drawn over its hole at `em` points to its em, in
+/// `ink` (a `\color` it chose wins) at `alpha`: its glyphs from the bundled KaTeX fonts through the atlas, on the quarter-
+/// pixel grid text is placed on; its rules as plates, at least a device pixel thick and on the pixel grid while thin; its
+/// outlines (radicals, tall brackets, stretchy arrows) rasterised into the atlas, strokes `stroke` ems wide.
+#[allow(clippy::too_many_arguments)]
+fn emit_math(
+    d: &mut Draw,
+    fonts: &mut Fonts,
+    cache: &mut GlyphCache,
+    f: &InlineMath,
+    em: f32,
+    lay: &Layout,
+    (ox, oy): (f32, f32),
+    ink: [f32; 4],
+    alpha: f32,
+    stroke: f32,
+    sc: f32,
+    upload: &mut Upload<'_>,
+) {
+    let (left, line) = lay.caret(f.at);
+    let Some(row) = lay.lines.get(line) else { return };
+    let set = &f.set;
+    let (x0, top) = (ox + left, oy + row.baseline - set.height * em);
+    let asz = cache.size as f32;
+    let own = |c: Option<[f32; 4]>| c.unwrap_or(ink);
+    // The pixel an origin at `x` points falls in, and the quarter of it: as text is placed.
+    let across = |x: f32| {
+        let xp = x * sc;
+        let ix = xp.floor();
+        (ix, (((xp - ix) * SUBPX as f32).floor() as u32).min(SUBPX - 1))
+    };
+    let put = |d: &mut Draw, e: AtlasGlyph, ix: f32, base: f32, c: [f32; 4]| {
+        let col = [c[0], c[1], c[2], c[3] * alpha];
+        d.glyph(GlyphInst {
+            rect: [(ix + e.left as f32) / sc, (base - e.top as f32) / sc, e.w as f32 / sc, e.h as f32 / sc],
+            uv: [e.x as f32 / asz, e.y as f32 / asz, (e.x + e.w) as f32 / asz, (e.y + e.h) as f32 / asz],
+            col_d: col,
+            col_l: col,
+            anim: [-1.0e9, 30.0, 0.0, 1.0],
+            kind: [0.0; 4],
+            ..Default::default()
+        });
+    };
+    // Rules first (a box's ground under what it holds, a bar beside its numerator), then the marks over them: one run of
+    // plates and one of glyphs, not a draw call for each.
+    let rules = set.items.iter().filter(|i| matches!(i, Item::Rule { .. }));
+    let marks = set.items.iter().filter(|i| !matches!(i, Item::Rule { .. }));
+    for item in rules.chain(marks) {
+        match item {
+            Item::Glyph { font, ch, at, em: k, ink: c } => {
+                // A character the bundled font lacks (CJK or emoji in `\text{}`) draws nothing, as RaTeX's own fonts do.
+                let Some(id) = fonts.math_font(*font) else { continue };
+                let Some(glyph) = fonts.math_glyph(id, *ch) else { continue };
+                let (ix, sub) = across(x0 + at[0] * em);
+                let base = ((top + at[1] * em) * sc).round();
+                let Some(e) = cache.get(fonts, id, glyph, em * k * sc, sub, upload) else { continue };
+                if e.w > 0 {
+                    put(d, e, ix, base, own(*c));
+                }
+            }
+            Item::Rule { rect: [rx, ry, rw, rh], ink: c } => {
+                let (xl, xr) = (x0 + rx * em, x0 + (rx + rw) * em);
+                let (yt, yb) = (top + ry * em, top + (ry + rh) * em);
+                // A rule is at least a device pixel thick and, while it is thin, sits on the pixel grid so it is as sharp as
+                // a stem; a box's ground is left where it is.
+                let thick = ((yb - yt) * sc).max(1.0);
+                let rect = if thick < 3.0 {
+                    let t = thick.round().max(1.0);
+                    let y = ((yt + yb) * 0.5 * sc - t * 0.5).round();
+                    let (a, b) = ((xl * sc).round(), (xr * sc).round());
+                    [a / sc, y / sc, (b - a).max(1.0) / sc, t / sc]
+                } else {
+                    [xl, yt, xr - xl, yb - yt]
+                };
+                let flat = Shape { radius: 0.0, n: 4.0, border: 0.0, feather: 0.0 };
+                d.panel(panel_from(own(*c), [0.0; 4], flat, rect, alpha));
+            }
+            Item::Path { at, segs, fill, ink: c, key } => {
+                let (ix, sub) = across(x0 + at[0] * em);
+                let base = ((top + at[1] * em) * sc).round();
+                let Some(e) = cache.outline(*key, segs, *fill, stroke, em * sc, sub, upload) else { continue };
+                if e.w > 0 {
+                    put(d, e, ix, base, own(*c));
+                }
+            }
+        }
     }
 }
 

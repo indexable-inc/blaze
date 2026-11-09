@@ -1,5 +1,5 @@
 //! `#[blaze::nopanic]`, `#[blaze::noalloc]` and `#[blaze::nonblocking]`
-//! (docs/v2/plan/lanes/effects.md): their [`EffectDef`]s, and the rules and tables the walk
+//! (docs/v2/plan/design/effects.md): their [`EffectDef`]s, and the rules and tables the walk
 //! ([`crate::walk`]) asks for the kinds of a site: an `Assert` ([`assert_rule`]), a method of an
 //! allocator ([`allocator_rule`]), a foreign function ([`foreign_kinds`]), inline assembly
 //! ([`asm_kinds`]), an intrinsic ([`intrinsic_kinds`]) and a function of a library outside the

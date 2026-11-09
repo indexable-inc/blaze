@@ -29,12 +29,12 @@ rust-src https://static.rust-lang.org/dist/2026-10-27/rust-src-nightly.tar.xz a9
 #   over the lang-item markers `ArbitraryInt`, `ArbitrarySigned`, `IntFrom<S>` and
 #   `IntTryFrom<S>`, which only blaze's trait solver answers and nothing can implement. Every
 #   impl's self type or argument must be such an integer, so no other type gains an impl
-#   (docs/v2/plan/lanes/frontend/arbitrary-ints.md).
+#   (docs/v2/plan/design/arbitrary-ints.md).
 # - core/src/blaze.rs (new) with its `pub mod blaze;` in core/src/lib.rs: blaze's own attribute
 #   macros, `contract_test` (`#[rustc_builtin_macro]`, expanded by blaze's `hir-expand`), which
 #   the attribute path `blaze::contract_test` names in every crate. Unstable under
 #   `blaze_verify`; nothing else in library/ refers to it
-#   (docs/v2/plan/lanes/contracts.md, part 2).
+#   (docs/v2/plan/design/contracts.md, part 2).
 # - wasm64-blaze-wasip1 (64-bit WASI preview 1): vendor/wasip1-1.0.0/src/lib_generated.rs takes
 #   every pointer and witx `size` argument of the raw imports as `usize` and imports them from
 #   `wasi_snapshot_preview1` on 32-bit and `wasi_snapshot_preview1_64` on 64-bit (wasm32 is

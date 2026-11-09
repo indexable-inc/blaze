@@ -1,5 +1,5 @@
 //! Edits by meaning and declared intent (docs/v2/plan/design/compile-time.md, ideas 9 and 10;
-//! docs/v2/plan/lanes/fastcompile/intent.md).
+//! docs/v2/plan/design/compile-time.md).
 //!
 //! [`apply`] makes a request's [`Edit`]s in the files of a view the front end has lowered:
 //! each finds its target by path ([`path`]), replaces only that text and reparses only what it

@@ -133,7 +133,7 @@ function, the `unsafe` block and the call path that reached it.
 
 The check is another effect in the existing walk (`crates/hir-ty-pure`, one memoized summary per
 monomorphized instance, the same walk that proves `#[blaze::pure]`, `nopanic`, `noalloc` and
-`nonblocking`; see [effects.md](../v2/plan/lanes/effects.md)). Two effects are new:
+`nonblocking`; see [effects.md](../v2/plan/design/effects.md)). Two effects are new:
 
 - **`unsafe`**: reaches an `unsafe` block outside the trusted list.
 - **`ambient`**: reaches a syscall or ambient std API (file, env, net, clock, random, process,

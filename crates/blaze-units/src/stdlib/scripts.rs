@@ -1,4 +1,4 @@
-//! What the standard library's own build scripts print (docs/v2/plan/lanes/usercode/scripts.md,
+//! What the standard library's own build scripts print (docs/v2/plan.md,
 //! "The standard library's own scripts"). std's scripts can't be compiled: blaze has no
 //! sysroot, and a host std to build them against is built from this same library, whose units
 //! need these scripts' output first. So each one the pinned nightly's `library/` has is ported

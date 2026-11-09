@@ -1,7 +1,7 @@
 //! `parallelizable` and `serial_dependence`: a sequential loop or iterator chain whose
 //! iterations are independent and worth running in parallel, and one that would be but for
 //! one carried dependence
-//! ([docs/v2/plan/lanes/lints/parallel.md](../../../../docs/v2/plan/lanes/lints/parallel.md)).
+//! ([docs/lints.md](../../../../docs/lints.md)).
 //!
 //! Judged on the body's MIR, so a finding is exact: a `for` loop's iterations write only memory
 //! no other iteration reads or writes, carry values only as reductions whose operator is

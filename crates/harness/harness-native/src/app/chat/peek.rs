@@ -36,7 +36,7 @@ use harness_native_render::paint::spans_of;
 use harness_native_ui_inline::{Tag, files};
 use harness_native_ui_look_api::Fill;
 use harness_native_ui_node_api::Laid;
-use harness_native_ui_text_api::{Icon, InlineHot, InlineLive, InlineMark, InlineState, PageView, Picture};
+use harness_native_ui_text_api::{Highlight, Icon, InlineHot, InlineLive, InlineMark, InlineState, PageView, Picture};
 use super::checks;
 use harness_proto::peek::{GhCheckState, GhChecks, GhCi, GhItem, GhKind, GhRef, GhState, PageMeta};
 use std::collections::BTreeMap;
@@ -199,7 +199,7 @@ impl App {
             anchor.set(laid);
         }
         card.anchored(anchor.id());
-        self.fill_card(card, st, &c.tag, cwd);
+        self.fill_card(card, st, &c.tag, cwd, false);
     }
 
     /// Gather the chat's GitHub refs, links and places when its words change, and ask after the refs: fresh as the chat
@@ -216,7 +216,12 @@ impl App {
             let mut places: Vec<(String, String, EntityView<'_>)> = Vec::new(); // alloc: this pass's places
             let mut live = self.peek_live.borrow_mut();
             for (_, r) in rows {
-                for (_, src, md) in texts(r) {
+                // A card's component is asked after as a chip's is.
+                let card = match r {
+                    Row::RefCard(src) => Some((&[] as &[&str], src.clone(), true)),
+                    _ => None,
+                };
+                for (_, src, md) in texts(r).into_iter().chain(card) {
                     if !md {
                         continue;
                     }
@@ -416,7 +421,9 @@ impl App {
     /// The card's lines for `tag`: what the link knows of its GitHub item, its page, or the file or folder it names (a
     /// relative one from `cwd`, the session's directory). A link's card carries its page's [`PageView`] (the live view's
     /// seam), and its live view line only once a browser host made one.
-    fn fill_card(&self, card: View<'_>, st: &mut ChatState, tag: &Tag, cwd: &str) {
+    /// Card `card` for component `tag`: a hover card, or (`block`) a card in the transcript, where the checks not passed
+    /// are listed without the pointer and more of the description shows.
+    pub(super) fn fill_card(&self, card: View<'_>, st: &mut ChatState, tag: &Tag, cwd: &str, block: bool) {
         let w = self.world.world_ref();
         let dark = self.chat_dark();
         let mut lines: Vec<(&'static str, &'static str, Line)> = Vec::new(); // alloc: a handful of lines, while it is up
@@ -428,8 +435,12 @@ impl App {
             };
             self.ask_checks(st, &r, item.as_ref(), checks.as_ref());
             // The checks' list opens while the pointer is on the state line or the list (one hit target, PeekState).
-            let open = card.part("state").is_some_and(|s| under_pointer(w, s));
-            let at = Checks { known: checks.as_ref(), open, now: unix_now() };
+            // Listed at once on a card in the transcript, or whenever anything failed (what failed is the news); else
+            // while the pointer is on the state line.
+            let failed = item.as_ref().is_some_and(|it| it.ci == Some(GhCi::Failure))
+                || checks.as_ref().is_some_and(|c| c.checks.iter().any(|k| k.state == GhCheckState::Failed));
+            let open = block || failed || card.part("state").is_some_and(|s| under_pointer(w, s));
+            let at = Checks { known: checks.as_ref(), open, now: unix_now(), expand: block };
             gh_lines(w, tag, &r, item.as_ref(), &at, dark, &mut lines);
         } else {
             let home = std::env::var("HOME").unwrap_or_default();
@@ -454,7 +465,9 @@ impl App {
                     };
                     lines.push(header(ChipIcon::Drawing(files::drawing(kind)), None, path.to_owned()));
                     match peeked {
-                        Peeked::Text(text) => lines.push(("code", "hn.PeekCode", Line::Words(text.clone()))),
+                        Peeked::Text(text) => {
+                            lines.push(("code", "hn.PeekCode", Line::Code { text: text.clone(), file: path.to_owned() }));
+                        }
                         Peeked::Note(note) => lines.push(("why", "hn.PeekMeta", Line::Words(note.clone()))),
                         Peeked::Folder { entries, more } => {
                             lines.push(("entries", "hn.PeekList", Line::Entries(entries.clone())));
@@ -473,9 +486,26 @@ impl App {
             None if card.entity().has(PageView::id()) => _ = card.entity().remove(PageView::id()),
             None => {}
         }
+        let mut markdown = None;
         view::for_each_of(card, lines.iter().map(|(k, p, l)| (*k, *p, l)), |v, l, _| match l {
             Line::Words(s) | Line::Title(s) => {
                 v.text(s);
+            }
+            Line::Markdown(s) => markdown = Some((v, s.clone())),
+            // Code as the editor shows it: coloured by its language (tree-sitter, `code_ink.*`), each line whole and cut by
+            // the card's edge, never wrapped onto the next (a wrapped line lost its indent and read as dedented).
+            Line::Code { text, file } => {
+                if let Some(c) = v.part("text") {
+                    c.text(text);
+                    let e = c.entity();
+                    if harness_native_render::highlight::knows(file) {
+                        if e.try_cloned::<&Highlight>().is_none_or(|h| h.file.as_str() != file.as_str()) {
+                            e.set(Highlight { file: file.as_str().into() });
+                        }
+                    } else if e.has(Highlight::id()) {
+                        e.remove(Highlight::id());
+                    }
+                }
             }
             Line::Site { glyph, ink, name } => {
                 if let Some(i) = v.part("icon") {
@@ -538,6 +568,22 @@ impl App {
             Line::Image(path) => set_if(v, Picture { handle: path.as_str().into() }),
             Line::Page(key) => set_if(v, harness_native_ui_text_api::Surface { key: *key, cover: 1 }),
         });
+        // The description as the transcript draws markdown: a row a block (a paragraph, a list item, a heading, code),
+        // each filled as a transcript row is.
+        if let Some((v, md)) = markdown {
+            let mut rows = Vec::new();
+            super::blocks(&md, false, &mut rows);
+            let mut paint = self.paint.borrow_mut();
+            let mut measure = |s: &str, style: &TextStyle, md: bool| paint.width(s, style, md);
+            // In the card's type: its body size and line (hn.PeekBody's), a step under its title, for every block's words.
+            let body = view::prefab(w, "hn.PeekBody").and_then(|p| p.try_cloned::<&TextStyle>());
+            view::for_each_of(v, rows.iter().enumerate().map(|(k, r)| (format!("b{k}"), r.prefab(), r)), |row, r, _| {
+                super::fill_row(row, r, &super::RowCtx::NOWHERE, &mut measure);
+                if let Some(b) = body {
+                    card_type(row.entity(), b);
+                }
+            });
+        }
     }
 
     /// A pull request's open card asks after its checks one by one while the rollup says some run or failed: once as it
@@ -579,6 +625,8 @@ struct Checks<'a> {
     known: Option<&'a GhChecks>,
     open: bool,
     now: i64,
+    /// A card in the transcript (not a hover card): more of the description.
+    expand: bool,
 }
 
 /// One row of the checks' list.
@@ -670,6 +718,10 @@ fn breathe(m: View<'_>, on: bool) {
 /// One line of a card.
 enum Line {
     Words(String),
+    /// A file's lines from where the place points, and the file (its language colours them).
+    Code { text: String, file: String },
+    /// A description as markdown: its blocks as the transcript's rows draw them (hn.PeekMarkdown holds them).
+    Markdown(String),
     /// The title, strong, flush left.
     Title(String),
     /// The header row: an icon in an ink (a pull request's state's; None: the look's) and where the thing is.
@@ -695,6 +747,18 @@ fn header(icon: ChipIcon, ink: Option<Fill>, name: String) -> (&'static str, &'s
         ChipIcon::Glyph(glyph, _) => ("site", "hn.PeekSiteGlyph", Line::Site { glyph, ink, name }),
         ChipIcon::Drawing(drawing) => ("site", "hn.PeekSiteArt", Line::Art { drawing, name }),
     }
+}
+
+/// Every words node under `e` in a card's type (`body`'s size and line, each node's own role, weight and boldness kept):
+/// the transcript's rows drawn smaller, on a card.
+fn card_type(e: EntityView<'_>, body: TextStyle) {
+    if let Some(s) = e.try_cloned::<&TextStyle>() {
+        let want = TextStyle { size: body.size, line: body.line, ..s };
+        if want != s {
+            e.set(want);
+        }
+    }
+    e.each_child(|c| card_type(c, body));
 }
 
 /// `v`'s `c`, set only when it differs.
@@ -765,9 +829,9 @@ fn gh_lines(w: WorldRef<'_>, tag: &Tag, r: &GhRef, it: Option<&GhItem>, at: &Che
     if !meta.is_empty() {
         out.push(("meta", "hn.PeekMeta", Line::Words(meta.join(" · "))));
     }
-    let body = first_text_lines(&it.body, 5);
+    let body = first_markdown(&it.body, if at.expand { 12 } else { 6 });
     if !body.is_empty() {
-        out.push(("body", "hn.PeekBody", Line::Words(body)));
+        out.push(("body", "hn.PeekMarkdown", Line::Markdown(body)));
     }
 }
 
@@ -799,6 +863,31 @@ fn page_lines(url: &str, page: Option<&PageMeta>, globe: &ChipIcon, view: Option
     if let Some(v) = view.filter(|v| v.ready) {
         out.push(("page", "hn.PeekPage", Line::Page(v.key)));
     }
+}
+
+/// The first `n` lines with words of a markdown description, as markdown (its HTML comments, which GitHub's templates
+/// leave, out): what a card renders as the transcript's rows.
+fn first_markdown(s: &str, n: usize) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut comment = false;
+    for l in s.lines() {
+        let t = l.trim();
+        if comment || t.starts_with("<!--") {
+            comment = !t.contains("-->");
+            continue;
+        }
+        if t.is_empty() {
+            if out.last().is_some_and(|p| !p.trim().is_empty()) {
+                out.push("");
+            }
+            continue;
+        }
+        out.push(l.trim_end());
+        if out.iter().filter(|l| !l.is_empty()).count() >= n {
+            break;
+        }
+    }
+    out.join("\n").trim().to_owned()
 }
 
 /// The first `n` lines with words of a description (markdown's heading marks off).

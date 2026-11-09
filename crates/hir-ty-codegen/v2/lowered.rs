@@ -1,6 +1,6 @@
 //! What an instance is for a caller that compiles its IR itself: the compiled tier of proc
 //! macros (change 20 of docs/v2/plan/design/compile-time.md; its design in
-//! docs/v2/plan/lanes/fastcompile/macros-tier.md, "What hir-ty-codegen must emit, and the
+//! docs/v2/plan/design/compile-time.md, "What hir-ty-codegen must emit, and the
 //! confining pass"). The tier confines the IR copy-and-patch would compile and compiles it
 //! with `blaze_stencil`. The IR is the one [`super::Prepared::Stencil`] holds, made by the
 //! same function ([`backend::built_function`]) and lowered by the same pass

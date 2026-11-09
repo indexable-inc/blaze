@@ -1,5 +1,5 @@
 //! What a function's optimized code still does inside its loops, as LLVM says it: the report
-//! the `blaze::vecreport` lint reads (docs/v2/plan/lanes/codegen/vecreport.md).
+//! the `blaze::vecreport` lint reads (docs/v2/plan/design/vecreport.md).
 //!
 //! Two kinds of finding, both read from the code LLVM is about to write, never guessed:
 //!

@@ -27,8 +27,8 @@
 //! The suggested type is rustc's `ty_to_string`: `print::let_type`'s `ClosureEraser` over the
 //! type hir names each variable of (`named_term`), when that type is the `let`'s.
 //!
-//! What the front end does not give yet (requested in `docs/v2/requests/diagnostics-infer2-solver.md`
-//! and `docs/v2/requests/db-ty.md`): the named type of a `let` that is not the one writeback found
+//! What the front end does not give yet (requested in `fed1eb428d:docs/v2/requests/diagnostics-infer2-solver.md`
+//! and `fed1eb428d:docs/v2/requests/db-ty.md`): the named type of a `let` that is not the one writeback found
 //! undecided, so an ambiguous goal's `let` (`: Foo<_, &_, W, Z>`) prints every variable `_`;
 //! the other places rustc's visitor weighs (every expression whose type holds the variable), so
 //! a path is a source only when its item has that one generic parameter; the causes of the
@@ -293,7 +293,7 @@ fn inference_failure<'db>(
 /// `named_term` when the type writeback found undecided is the `let`'s, or that of the function
 /// item the initializer calls, at whose path the variable was made, when the call's type is the
 /// `let`'s. For an ambiguous goal `top_term` is the goal's variable alone, and hir does not say
-/// how the `let`'s other variables are named (asked in `docs/v2/requests/db-ty.md`), so none is.
+/// how the `let`'s other variables are named (asked in `fed1eb428d:docs/v2/requests/db-ty.md`), so none is.
 fn let_named<'db>(
     cx: &Cx<'_, 'db>,
     d: &hir::TypeMustBeKnown<'db>,

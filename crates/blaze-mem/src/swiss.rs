@@ -1,4 +1,4 @@
-//! The SwissTable group probe every interner's table shares (docs/v2/plan/design/hardware.md,
+//! The SwissTable group probe every interner's table shares (docs/v2/plan/design/data.md,
 //! "interner and memo lookups"): `intern`'s arena store and mapped index, and the query engine's
 //! interned key map. `intern` re-exports it as `intern::swiss`; it lives here, a
 //! leaf every table's crate already depends on, so `blaze-query` and `blaze-ids` reach it without

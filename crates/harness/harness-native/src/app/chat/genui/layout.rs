@@ -136,9 +136,10 @@ fn anchored(anchor: &str) -> ((Align, Justify), (Align, Justify)) {
     (at(across), at(down))
 }
 
-/// A Layer in a Stack: laid on the stack's frame, its children at its `anchor` (the column's alignment across and down)
-/// moved by `x` and `y` (its padding: what it gives on one side it takes on the other), above the rest by `z`. A press on
-/// it sends its onClick (null).
+/// A Layer in a Stack: its content's size towards the stack's (a Stack is as big as its largest child, Layers included),
+/// stretched over the stack's whole frame (`hn.GenLayer`'s AlignSelf), its children at its `anchor` (the column's
+/// alignment across and down) moved by `x` and `y` (its padding: what it gives on one side it takes on the other, so
+/// the offset adds no size), above its siblings by `z`. A press on it sends its onClick (null).
 fn layer(v: View<'_>, node: &Value, kids: &[&Value], depth: usize, b: &mut Budget<'_, '_>) {
     let (across, down) = anchored(prop(node, "anchor").as_str().unwrap_or("top-left"));
     let base = view::prefab(v.entity().world(), "hn.GenLayer").and_then(|p| p.try_cloned::<&Flex>()).unwrap_or_default();

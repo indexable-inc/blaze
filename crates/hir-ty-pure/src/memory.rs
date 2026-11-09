@@ -1,5 +1,5 @@
 //! What memory an instance reads and writes, inferred from its monomorphized MIR for every
-//! instance the walk reaches, attribute or not (docs/v2/plan/lanes/pure-fns.md, "Inferred
+//! instance the walk reaches, attribute or not (docs/v2/plan/design/pure-fns.md, "Inferred
 //! facts"): LLVM's `memory(..)`, `nounwind` and `willreturn`, but over the whole program and
 //! for the stencil backend, which has no LLVM.
 //!

@@ -18,7 +18,7 @@
 //!   resolves like any other, since the run process's hook ([`crate::hook`]) uses no
 //!   thread-local of its own. A first call from a signal handler resolves the same way only
 //!   while the hook's ask is async-signal-safe, which waits on blaze-inproc's channel
-//!   taking requests with no lock and no allocation (docs/v2/requests/fastcompile.md,
+//!   taking requests with no lock and no allocation (fed1eb428d:docs/v2/requests/fastcompile.md,
 //!   fastcompile-lazy 1).
 //! - **What runs before `main` or around it**, which every run executes: the entry (the
 //!   `main` symbol's shim and what it calls first) and every function a static in an

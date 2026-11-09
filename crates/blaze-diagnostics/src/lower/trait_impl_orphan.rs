@@ -252,7 +252,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::TraitImplOrphan) -> Vec<Found> {
 /// reach of it, [`crate::check_reached_only`]). The knowability rule and the expansion argument of
 /// sealing assume every crate that can name a sealed trait obeys rustc's orphan rule, and a
 /// registry crate that depends on a blaze-only one was never checked by rustc
-/// (docs/v2/plan/lanes/frontend/sealed-orphan.md, "Where the checks run"). Only what rustc
+/// (docs/v2/plan/design/sealed-orphan.md, "Where the checks run"). Only what rustc
 /// refuses is refused (E0117, E0210), never what only hir's stricter `check_orphan_rules` does;
 /// the `uncovered_param_in_projection` lint is left out, as `--cap-lints` leaves a dependency's.
 /// Each error's message names the impl, its trait, the rule and the crate that seals.

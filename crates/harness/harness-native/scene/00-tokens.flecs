@@ -56,6 +56,10 @@ export const tone_text_selection: Fill = {dark: {0.122, 0.227, 0.42, 0.9}, light
 // The light a copy sweeps over what it took (ui.selection's CopyLook): the accent lifted toward white on the dark page,
 // where it adds to the plate, and the accent itself on the paper, where it tints; its alpha is the light at its brightest.
 export const tone_copy_sheen: Fill = {dark: {0.72, 0.82, 1.0, 0.24}, light: {0.22, 0.443, 0.882, 0.16}}
+// The ink a Sheen's band lifts words toward (a working row's title, ui.Shimmer): on the dark page past the strong ink, to a
+// near-white with a breath of the accent's cool in it, so the band still reads as light over a selected row's strong title;
+// on the paper a deep accent ink, since brightening dark words toward the paper would only fade them.
+export const tone_sheen: Fill = {dark: {0.9, 0.95, 1.0, 1}, light: {0.11, 0.30, 0.74, 1}}
 // The accent: only what is on or pressable-and-chosen (a switch, a focused control, a load bar); its faint wash (a search
 // match, a highlighted cell); the ink on a solid accent or a coloured badge. A link's ink; inline code's (--doc-code-ink).
 export const tone_accent: Fill = {dark: {0.302, 0.557, 1, 1}, light: {0.22, 0.443, 0.882, 1}}
@@ -113,30 +117,35 @@ export const weight_label = 600
 // The Archive's rows (hn.Arch*): 24 tall, children indented indent_step a level (the tree's step too), icons 14 in a 16
 // box, its disclosure slot disclose_w wide with a chevron_box chevron. The sidebar's tree has its own (tree_* below).
 export const row_h = 24
-export const indent_step = 16
+export const indent_step = 12
 export const icon_box = 16
 export const chevron_box = 12
 export const disclose_w = 18
 // The sidebar's tree, Notion's sidebar: calm one-line rows, a title and a few muted words trailing it, no dots and no
 // marks. A session row tree_row_h tall, a run tree_run_h, packed (the air between rows is the pill's inset). Each row
 // starts its chevron gutter (tree_gutter wide) tree_pad in from its left edge plus indent_step a level, so a child's
-// chevron sits under its parent's title (gutter and step are equal) and the title column never moves; then its title,
+// chevron sits under its parent's mark or title (gutter and step are equal) and the title column never moves; then its title,
 // tree_gap, its trailing words; tree_pad_r on the right. The chevron is a thin vector mark tree_chevron across (its ink
 // about 7.5 tall), shown in tone_ink_faint where the row has rows under it (folded, it holds what finished). tree_icon is
-// the Archive button's glyph box.
-export const tree_row_h = 30
-export const tree_run_h = 24
-export const tree_gutter = 16
+// the Archive button's glyph box. Folded with work under it, a session's row shows a faint dot (tree_under_dot)
+// tree_under_gap before how many.
+export const tree_row_h = 28
+export const tree_run_h = 22
+export const tree_gutter = 12
 export const tree_icon = 16
+export const tree_under_dot = 8
+export const tree_under_gap = 3
 export const tree_chevron = 9
+// A row's kind at a glance (an agent's mark, a terminal glyph): tree_kind across, tree_kind_gap before its title; a
+// sleeping sub-agent's breathes down to tree_sleep_low.
+export const tree_kind = 12
+export const tree_kind_gap = 6
+export const tree_sleep_low = 0.3
 // The tree's indent guides (hn.Hang's slots): a hairline down the middle of each ancestor's chevron gutter, in
 // tone_guide (Islands' tree-indent-guide-border), for as many levels as tree_guides; a done mark in a childless row's
-// gutter (tree_mark across: a check in tone_success, a cross in tone_error); a working agent's activity glyph after its
-// title (tree_doing across, tree_doing_gap after the words, in the muted ink).
+// gutter (tree_mark across: a check in tone_success, a cross in tone_error).
 export const tree_guide_w = 1
 export const tree_mark = 11
-export const tree_doing = 12
-export const tree_doing_gap = 6
 export const tone_guide: Fill = {dark: {0.122, 0.133, 0.153, 1}, light: {0.086, 0.086, 0.090, 0.10}}
 export const tree_pad = 2
 export const tree_pad_r = 8
@@ -146,9 +155,48 @@ export const line_row = 16
 // corners radius_row.
 export const pill_inset = 2
 export const radius_row = 6
-// A working row's title breathes (src/look.rs Breath) between full and breath_title_low: slow and shallow, a shimmer
-// rather than a blink, and only while its program or agent is at work, so an idle tree draws nothing.
-export const breath_title_low = 0.45
+// A working row's title is its own sign of work: a band of light sweeps through its letters, left to right (a Sheen,
+// harness-native-ui-look-api; ui.Shimmer), lifting them toward tone_sheen and leaving them at their own ink behind it.
+// Its rhythm says what the agent does (src/app.rs doing_of), quietly: each pace a pass of sheen_<pace>_period seconds,
+// then sheen_<pace>_rest at rest; the band sheen_<pace>_band points either side of its middle; its middle lifting the
+// letters sheen_<pace>_strength of the way to the sheen's ink; sheen_<pace>_ease of an ease-in-out (0: constant speed),
+// so the band slows only where it is half off the words. Every row starts at its own place in the cycle (scatter), so
+// several working rows never sweep in step. Only while at work, and only rows in view keep frames coming (the calm
+// rate); a row at rest has strength 0 and costs nothing.
+// - think: a slow, gentle drift, a wide soft band and a long rest between passes.
+export const sheen_think_period = 2.6
+export const sheen_think_rest = 1.1
+export const sheen_think_band = 36
+export const sheen_think_strength = 0.7
+export const sheen_think_ease = 0.6
+// - run (a command, a shell run): quicker, crisper passes, a narrow band, barely a rest.
+export const sheen_run_period = 1.1
+export const sheen_run_rest = 0.25
+export const sheen_run_band = 18
+export const sheen_run_strength = 0.85
+export const sheen_run_ease = 0.3
+// - edit (editing a file, writing the reply): a steady medium cadence.
+export const sheen_edit_period = 1.6
+export const sheen_edit_rest = 0.45
+export const sheen_edit_band = 24
+export const sheen_edit_strength = 0.8
+export const sheen_edit_ease = 0.45
+// - read (reading, searching, the web, any other tool): medium, a little softer than edit.
+export const sheen_read_period = 1.8
+export const sheen_read_rest = 0.6
+export const sheen_read_band = 28
+export const sheen_read_strength = 0.75
+export const sheen_read_ease = 0.5
+// - agent (a sub-agent at work): two bands chasing one another half a pass apart, no rest.
+export const sheen_agent_period = 2.2
+export const sheen_agent_rest = 0
+export const sheen_agent_band = 22
+export const sheen_agent_strength = 0.75
+export const sheen_agent_ease = 0.4
+export const sheen_agent_bands = 2
+// Under Reduce Motion nothing sweeps: a working title sits steadily sheen_still of its pace's strength toward the
+// sheen's ink, a little brighter than at rest, so it still reads as at work.
+export const sheen_still = 0.35
 // The group header (the device's name) over the tree, group_h tall, its words label_inset in from the sidebar's edge:
 // in line with the depth-0 chevrons.
 export const group_h = 28
@@ -474,6 +522,15 @@ export const caret_fade = 0.09
 export const strike_w = 1
 export const strike_rise_em = 0.27
 export const strike_alpha = 0.7
+// LaTeX math (prims.flecs ui.formula; inline markdown's $…$, a chat's displayed formula): set at math_inline_scale of
+// its words' size in a line, math_display_scale displayed (Computer Modern's x-height is smaller than Inter's, hence above
+// 1), keeping math_inline_pad or math_display_pad points clear above and below in its line; strokes math_stroke_em thick
+// (KaTeX's 1.5 px at its 40 px em). den's MathLook.
+export const math_inline_scale = 1.1
+export const math_display_scale = 1.25
+export const math_inline_pad = 2
+export const math_display_pad = 10
+export const math_stroke_em = 0.0375
 // Inline code's chip (MarkdownText).
 export const textarea_max_h = 132
 // A growing text area (ui.field.GrowingTextArea): it grows with its words to textarea_grow_share of its pane's height
@@ -564,15 +621,41 @@ export const line_chat_code = 17
 export const chat_bubble_radius = 12
 // The widest a user's bubble gets before its words wrap: about three quarters of the column, as iMessage and ChatGPT do.
 export const chat_bubble_max_w = $chat_w * 0.8
-// The composer (hn.ChatPane's foot.card): one card holding the words over a bar of controls, centred in the reading
-// column (chat_w wide at most, as the transcript), chat_foot_pad_t over it and chat_foot_pad_b under it. The card is a
-// step lighter than the chat's ground with a hairline a few percent of white and a soft lift (no heavy border),
-// chat_composer_radius round, chat_composer_pad in from its edges; the words sit a further chat_composer_text_inset in
-// (so they start where the model control's words do, its wash hanging into the inset), chat_composer_pad_t under its
-// top, chat_composer_gap over the bar.
+// The composer (hn.ChatPane's foot.card): one card holding the words, centred in the reading column (chat_w wide at
+// most, as the transcript), chat_foot_pad_t over it; the status bar (foot.status) under it, chat_foot_pad_b over the
+// pane's foot. The card is a step lighter than the chat's ground with a hairline a few percent of white and a soft lift
+// (no heavy border), chat_composer_radius round, chat_composer_pad in from its sides; the words sit a further
+// chat_composer_text_inset in (so they start where the status bar's model control's words do), chat_composer_pad_t under
+// its top and chat_composer_pad_b over its bottom.
 export const chat_foot_pad_t = 6
-export const chat_foot_pad_b = 14
+export const chat_foot_pad_b = 8
 export const chat_composer_radius = 18
+// What runs for a chat, over its composer (hn.ChatActivityItem): items chat_activity_h tall, chat_activity_gap apart,
+// chat_activity_radius round, chat_activity_pad in, a glyph chat_activity_icon across chat_activity_icon_gap before
+// its words, at most chat_activity_max_w wide (the words cut first); chat_activity_below of air under the strip.
+export const chat_activity_h = 22
+export const chat_activity_gap = 6
+export const chat_activity_radius = 7
+export const chat_activity_pad = 8
+export const chat_activity_icon = 11
+export const chat_activity_icon_gap = 5
+export const chat_activity_max_w = 260
+export const chat_activity_below = 8
+// A chip's hover card (hn.ChatActivityPop, src/app/chat.rs fill_activity_pop): chat_activity_pop_w wide over the chip,
+// chat_activity_pop_pad in, its lines chat_activity_pop_gap apart, a step's glyph chat_activity_icon across.
+export const chat_activity_pop_w = 300
+export const chat_activity_pop_pad = 12
+export const chat_activity_pop_gap = 4
+// Messages sent while a turn runs and not yet taken (hn.ChatQueued, src/app/chat.rs fill_chat_queued): bubbles at the
+// trailing edge over the composer, chat_queued_gap apart, in a dashed-quiet look: the bubble's ground at
+// chat_queued_fade, a clock glyph chat_activity_icon across and the word "Queued" before it.
+export const chat_queued_gap = 6
+export const chat_queued_fade = 0.35
+// A finished turn's steps button (hn.ChatTurnSteps): beside the person's bubble on hover, chat_turn_steps square, its
+// glyph chat_turn_steps_icon across, chat_turn_steps_gap before the bubble.
+export const chat_turn_steps = 22
+export const chat_turn_steps_icon = 13
+export const chat_turn_steps_gap = 4
 // Pictures pasted into the message being written (hn.ChatAttach, src/app/chat.rs fill_attach): a strip of thumbnails over
 // the words, each chat_attach_h tall at its own aspect (no wider than chat_attach_max_w), chat_attach_gap apart,
 // chat_attach_radius round, a remove button chat_attach_remove across (its glyph chat_attach_icon) chat_attach_inset in
@@ -587,6 +670,7 @@ export const chat_attach_inset = 4
 export const chat_sent_h = 120
 export const chat_composer_pad = 8
 export const chat_composer_pad_t = 12
+export const chat_composer_pad_b = 10
 export const chat_composer_text_inset = 6
 export const chat_composer_gap = 6
 // The space under the pasted pictures' strip, over the words: the card's own gap between its parts.
@@ -606,22 +690,33 @@ export const chat_aside_pad_b = 10
 export const chat_aside_head_gap = 2
 export const chat_aside_close = 20
 export const chat_aside_icon = 10
-// The bar (foot.card.bar), chat_bar_h tall, its controls chat_bar_gap apart: on the left den's model and effort picker
+// The status bar (foot.status), chat_status_t under the composer's card, its sides chat_composer_pad in (the card's inner
+// edges), no plate; its controls chat_bar_h tall, chat_bar_gap apart: on the left den's model and effort picker
 // as one quiet control (hn.ChatPick, src/app/chat/pick.rs: the model's name, its effort as a level meter and a small
 // chevron, chat_pick_h tall, chat_pick_pad_x in, its chevron chat_pick_chevron across chat_pick_gap after the rest, a
 // wash under the pointer); the meter (hn.ChatEffort) chat_effort_lead after the name, chat_effort_h tall, a bar per
 // effort chat_effort_bar_w wide, chat_effort_gap apart, chat_effort_bar_radius round, rising from chat_effort_floor of
 // its height to all of it. On the right the context meter (hn.ChatContext: a ring chat_ring across, its stroke
 // chat_ring_stroke, in a square chat_bar_h across that takes the pointer). While the agent works that one ring breathes
-// down to chat_working_breath: the composer's sign of work, not a button (Return sends, Escape stops). An aside's card
-// shows its own working ring (hn.ChatWorking: chat_working across, stroke chat_working_stroke).
+// down to chat_working_breath: the composer's sign of work, not a button (Return sends, Escape stops). After it, how much
+// of the person's plan is used (hn.ChatPlan, src/app/chat/plan.rs): chat_plan_lead after the ring, a bar
+// chat_plan_meter_w by chat_plan_meter_h, chat_plan_meter_radius round, chat_plan_gap before its words, chat_plan_trail
+// of air after them. An aside's card shows its own working ring (hn.ChatWorking: chat_working across, stroke
+// chat_working_stroke).
 // Everything in the bar is chrome, secondary to the words typed over it: the picker's name at size_chrome in the muted
 // ink, and its marks (chevron, level meter, rings) and their hit plates scaled to that size, not to the body's.
 // The picker's menu is a ui.SearchMenu (menu_*).
 export const size_chat_status = 12
 export const line_chat_status = 15
+export const chat_status_t = 4
 export const chat_bar_h = 24
 export const chat_bar_gap = 2
+export const chat_plan_lead = 4
+export const chat_plan_trail = 2
+export const chat_plan_gap = 5
+export const chat_plan_meter_w = 18
+export const chat_plan_meter_h = 3
+export const chat_plan_meter_radius = 1.5
 export const chat_pick_h = 22
 export const chat_pick_pad_x = 6
 export const chat_pick_radius = 7
@@ -666,9 +761,9 @@ export const chat_pick_level_b = 4
 export const chat_pick_swipe_step = 22
 export const chat_pick_commit_secs = 0.35
 export const chat_pick_word_secs = 1.2
-// What the chat pane shows around the composer's words besides the transcript (the foot's insets, the card's insets
-// and gap, the bar): the words grow to textarea_grow_share of the pane less it.
-export const chat_input_keep = $chat_foot_pad_t + $chat_foot_pad_b + $chat_composer_pad_t + $chat_composer_pad + $chat_composer_gap + $chat_bar_h
+// What the chat pane shows around the composer's words besides the transcript (the foot's insets, the card's insets,
+// the status bar): the words grow to textarea_grow_share of the pane less it.
+export const chat_input_keep = $chat_foot_pad_t + $chat_foot_pad_b + $chat_composer_pad_t + $chat_composer_pad_b + $chat_status_t + $chat_bar_h
 // The meter's popover while the pointer is on it (scene/widgets/context.flecs hn.ChatContextPop, src/app/chat/context.rs):
 // a menu plate (ui.Menu's place over what opened it, its lift and motion) chat_ctx_w wide, chat_ctx_pad in, its lines
 // chat_ctx_gap apart: a head, the window as a donut chat_ctx_pie across with how full it is in its middle (size_ctx_pct;
@@ -745,6 +840,8 @@ export const tone_gh_ci_pending: Fill = {dark: {0.824, 0.600, 0.133, 1}, light: 
 // inline_peek_check_gap apart and inline_peek_check_pad in from its wash's ends (inline_peek_check_radius round).
 export const inline_peek_dwell_s = 0.35
 export const inline_peek_w = 360
+// A pull request or issue said on its own: its card in the words (hn.ChatRefCard), at most this wide.
+export const chat_ref_w = 520
 export const inline_peek_pad = 12
 export const inline_peek_gap = 6
 export const inline_peek_image_h = 160
@@ -958,10 +1055,16 @@ export const gen_shape_zeta = 1
 // page at gen_browser_aspect (width over height, 16:10) above its title and address, a gen_browser_load hairline in
 // tone_accent along the picture's foot while the page loads. The pane (hn.WebPane, cmd+shift+B) sits on the right
 // web_pane_w wide, opening and folding on the sidebar's spring; its toolbar is web_toolbar_h tall with the address in a
-// web_url_h field, the extensions menu web_menu_w wide, and an extension's popup web_popup_w by web_popup_h.
+// web_url_h field, the extensions menu web_menu_w wide, and an extension's popup web_popup_w by web_popup_h. Its left
+// edge drags (src/app/web_drag.rs): a press within web_grab of it grabs it, and the width stays between web_pane_min and
+// web_pane_max, less in a narrow window so the main card keeps web_keep beside it.
 export const gen_browser_aspect = 1.6
 export const gen_browser_load = 2
 export const web_pane_w = 520
+export const web_pane_min = 320
+export const web_pane_max = 1200
+export const web_grab = 5
+export const web_keep = 360
 export const web_toolbar_h = 40
 export const web_url_h = 26
 export const web_menu_w = 240

@@ -1,5 +1,5 @@
 //! The round loop of a crate's collection and the assembly of its `DefMap`
-//! (`docs/v2/plan/lanes/frontend/nameres-core.md` §5 `driver.rs`), and a block's collection on
+//! (`docs/v2/plan/design/frontend.md` §5 `driver.rs`), and a block's collection on
 //! one unit.
 //!
 //! A crate's rounds are queries: `round_modules` (the round's modules in order), `module_round`

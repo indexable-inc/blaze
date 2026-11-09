@@ -1,5 +1,5 @@
 //! Where two byte strings first differ: the one byte comparison of blaze's checks
-//! (docs/v2/plan/design/hardware.md). The store check ([`crate::compare`]) names with it the
+//! (docs/v2/plan/design/data.md). The store check ([`crate::compare`]) names with it the
 //! first byte a recomputed value differs at, and the invalidation oracle (`blaze-v2-proof`, its
 //! `bytes` module) compares whole outputs and traces with it, across cores for long files.
 //!

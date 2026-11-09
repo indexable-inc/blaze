@@ -13,7 +13,7 @@
 //! byte from the clear top bits (`trailing_zeros`) and packs the 7-bit groups by three
 //! shift-and-mask steps (the unrolled form of protobuf's `ReadVarint64` and `varint-simd`, no
 //! BMI2 `pext`, which is slow on AMD before Zen 3). The encode is the same steps backwards and
-//! one 8-byte store. docs/v2/plan/lanes/dedup/codec-leb.md gives the bound.
+//! one 8-byte store. docs/v2/plan/design/data.md gives the bound.
 
 use std::fmt;
 

@@ -353,7 +353,7 @@ fn a_map_lookup_allocates_nothing() {
     freed(&map);
 }
 
-/// Model tests (docs/v2/plan/lanes/safety/model.md): each structure from two or three threads
+/// Model tests (docs/v2/plan/design/model-checker.md): each structure from two or three threads
 /// under every interleaving and every value its loads may read. What a lock, a
 /// read-modify-write or a join orders is checked against a sequential model; what a lone
 /// acquire load sees is asserted directly, since it may be older than a store that came

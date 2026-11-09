@@ -1,4 +1,4 @@
-//! blaze_verify's native contracts checked at run time (docs/v2/plan/lanes/contracts.md,
+//! blaze_verify's native contracts checked at run time (docs/v2/plan/design/contracts.md,
 //! part 1).
 //!
 //! A function's clause groups are ghost (`ExpressionStore::spec_clause`): MIR building leaves

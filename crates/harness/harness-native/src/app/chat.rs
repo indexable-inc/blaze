@@ -4,7 +4,7 @@
 //! headings, list items, quotes and code blocks, thinking and tool calls folded to a line, a turn's foot) in a
 //! `ui.LazyList`, so only the rows in view are entities. It scrolls on AppKit's physics and sticks to the bottom while
 //! the agent writes unless the person scrolled up. The input is a `ui.TextArea` edited here (`Draft`, keys in
-//! scene/20-keys.flecs ctx.Chat): Return sends, Shift+Return breaks the line, Escape interrupts. A draft that starts with a
+//! scene/20-keys.flecs ctx.Chat): Return sends, Shift+Return breaks the line, Escape or Cmd+. interrupts. A draft that starts with a
 //! space is an aside: the composer takes the aside's tint, and Return asks it of a fork of the conversation instead
 //! (`Link::chat_aside`), its answer in a card over the composer ([`Aside`]) that Escape or its button closes; the
 //! conversation never has it.
@@ -32,6 +32,7 @@ mod genui;
 mod mention;
 mod peek;
 mod pick;
+mod plan;
 mod rename;
 mod steps;
 
@@ -442,15 +443,22 @@ impl Default for ChatState {
 /// A row of the transcript.
 #[derive(Clone, Debug)]
 enum Row {
-    /// What the person wrote; true when their pictures are over it (a row of its own, [`Row::Pictures`]).
-    User(String, bool),
+    /// What the person wrote; true when their pictures are over it (a row of its own, [`Row::Pictures`]); and, for a
+    /// finished turn whose steps fold away, its fold key and whether it is open (its hover-only steps button).
+    User(String, bool, Option<(String, bool)>),
     /// The pictures the person sent with a message, over its words (absolute paths); true when no words came with them.
     Pictures(Vec<String>, bool),
+    /// A pull request or issue said on its own (its source, `<PR …/>`): its card, filled as its hover card is
+    /// (chat/peek.rs fill_card).
+    RefCard(String),
     Prose(String),
     Heading(u8, String),
     ListItem { depth: usize, mark: String, text: String },
     Quote(String),
     Code { lang: String, text: String },
+    /// A displayed formula (`$$…$$` or `\[…\]` on lines of its own, a ```math fence): its LaTeX, which typesets
+    /// ([`math_row`]). Drawn centred, set as `$$…$$` inline markdown; a selection takes it whole and copies its source.
+    Math(String),
     /// An agent's own tool call: its line (the tool's name, its main argument, how it is going: its `hn.chat_status`,
     /// running or no_result, while it has no result; a small mark when it failed) and, opened, its input and result.
     Tool { block: String, name: String, arg: String, state: Option<&'static str>, shown: Shown, failed: bool, input: String, result: String },
@@ -473,10 +481,11 @@ enum Row {
 impl Row {
     fn prefab(&self) -> &'static str {
         match self {
-            Row::User(_, false) => "hn.ChatUser",
-            Row::User(_, true) => "hn.ChatUserUnder",
+            Row::User(_, false, _) => "hn.ChatUser",
+            Row::User(_, true, _) => "hn.ChatUserUnder",
             Row::Pictures(_, false) => "hn.ChatSentPictures",
             Row::Pictures(_, true) => "hn.ChatSentPicturesLast",
+            Row::RefCard(_) => "hn.ChatRefCard",
             Row::Prose(_) => "hn.ChatProse",
             Row::Heading(1, _) => "hn.ChatH1",
             Row::Heading(2, _) => "hn.ChatH2",
@@ -487,6 +496,7 @@ impl Row {
             Row::ListItem { .. } => "hn.ChatItem",
             Row::Quote(_) => "hn.ChatQuote",
             Row::Code { .. } => "hn.ChatCode",
+            Row::Math(_) => "hn.ChatMath",
             Row::Tool { shown: Shown::Full, failed: true, .. } => "hn.ChatToolOpenFailed",
             Row::Tool { shown: Shown::Full, .. } => "hn.ChatToolOpen",
             Row::Tool { failed: true, .. } => "hn.ChatToolFailed",
@@ -504,9 +514,52 @@ impl Row {
     }
 }
 
+/// A displayed formula's row: the formula, or when RaTeX cannot read it a card of its source (a displayed formula's
+/// source as inline code would be a chip alone in the column).
+fn math_row(tex: String) -> Row {
+    match harness_native_render::math::typeset(&tex, true) {
+        Ok(_) => Row::Math(tex),
+        Err(_) => Row::Code { lang: "latex".into(), text: tex },
+    }
+}
+
+/// The displayed formula `lines` start with: a line that opens with `$$` or `\[`, to the first line that ends with its
+/// closer (the same one or a later one, before any blank line): its LaTeX and how many lines it takes. None when they do not
+/// start one: the closer is not at a line's end (inline math in a sentence), or has not come yet (still streaming: its words
+/// show as written until it does).
+fn display_math(lines: &[&str]) -> Option<(String, usize)> {
+    let first = lines.first()?.trim();
+    let (open, close) = if first.starts_with("$$") {
+        ("$$", "$$")
+    } else if first.starts_with("\\[") {
+        ("\\[", "\\]")
+    } else {
+        return None;
+    };
+    let mut body: Vec<&str> = Vec::new();
+    for (k, l) in lines.iter().enumerate() {
+        let t = l.trim();
+        let t = if k == 0 { &t[open.len()..] } else { t };
+        if k > 0 && t.is_empty() {
+            return None;
+        }
+        match t.find(close) {
+            Some(at) if at + close.len() == t.len() => {
+                body.push(&t[..at]);
+                let tex = body.join("\n").trim().to_owned();
+                return (!tex.is_empty()).then_some((tex, k + 1));
+            }
+            Some(_) => return None,
+            None => body.push(t),
+        }
+    }
+    None
+}
+
 /// Markdown split into the rows it is drawn as: paragraphs, headings, list items (with their continuation lines), quotes
 /// (each kept a line apart, less its indent and the block's trailing white space, so inline markdown reads a soft break
-/// as a space and two trailing spaces or a backslash as a hard one), fenced code (an unclosed fence, still streaming, runs to the end) and GitHub tables (lines of pipes
+/// as a space and two trailing spaces or a backslash as a hard one), displayed formulas (`$$…$$` or `\[…\]` on lines of
+/// their own, a ```math fence: [`Row::Math`]), fenced code (an unclosed fence, still streaming, runs to the end) and GitHub tables (lines of pipes
 /// that are no table, as code). While it is `live` (still streaming) a table's row arrives whole: a last row not yet ended
 /// is held back, and so is a head whose delimiter line has not come.
 fn blocks(md: &str, live: bool, out: &mut Vec<Row>) {
@@ -518,7 +571,9 @@ fn blocks(md: &str, live: bool, out: &mut Vec<Row>) {
     let mut para: Vec<&str> = Vec::new();
     let flush = |para: &mut Vec<&str>, out: &mut Vec<Row>| {
         if !para.is_empty() {
-            out.push(Row::Prose(lines_of(para.iter().copied())));
+            let words = lines_of(para.iter().copied());
+            // A pull request or issue said on its own is the thing itself: its card, not a chip in a sentence.
+            out.push(if !live && alone_ref(&words) { Row::RefCard(words) } else { Row::Prose(words) });
             para.clear();
         }
     };
@@ -536,13 +591,25 @@ fn blocks(md: &str, live: bool, out: &mut Vec<Row>) {
                 code.push(lines[i]);
                 i += 1;
             }
-            out.push(Row::Code { lang, text: code.join("\n") });
+            // A ```math fence, once closed, is the formula it holds (its blank lines dropped: a formula is one paragraph);
+            // a ```latex or ```tex one is source to show, code.
+            if lang == "math" && i < lines.len() {
+                out.push(math_row(code.iter().filter(|l| !l.trim().is_empty()).copied().collect::<Vec<_>>().join("\n")));
+            } else {
+                out.push(Row::Code { lang, text: code.join("\n") });
+            }
             i += 1;
             continue;
         }
         if t.is_empty() {
             flush(&mut para, out);
             i += 1;
+            continue;
+        }
+        if let Some((tex, used)) = display_math(&lines[i..]) {
+            flush(&mut para, out);
+            out.push(math_row(tex));
+            i += used;
             continue;
         }
         let hashes = t.chars().take_while(|&c| c == '#').count();
@@ -645,6 +712,18 @@ fn md_table(t: &harness_native_render::markdown::Table) -> view::table::Table {
         .map(|r| r.iter().map(|c| Cell::new(if number(c) { Kind::Number } else { Kind::Markdown }, c.as_str())).collect())
         .collect();
     view::table::Table { cols, rows, head: true }
+}
+
+/// Whether paragraph `words` is one `<PR …/>` or `<Issue …/>` and nothing else: the component's block form, its card
+/// (hn.ChatRefCard), where in a sentence it is its chip.
+fn alone_ref(words: &str) -> bool {
+    let w = words.trim();
+    let m = harness_native_render::markdown::inline(w);
+    m.tags.len() == 1
+        && matches!(m.tags[0].tag.name.as_str(), "PR" | "Issue")
+        && w.starts_with('<')
+        && (w.ends_with("/>") || w.ends_with("</PR>") || w.ends_with("</Issue>"))
+        && w.matches('<').count() == 1 + usize::from(w.ends_with('>') && !w.ends_with("/>"))
 }
 
 /// A list item's mark (`•` for a bullet, `3.` for a number) and its words.
@@ -774,13 +853,15 @@ fn item_rows(t: &Transcript, n: usize, shows: Shows<'_>, out: &mut Vec<(String, 
     let fold = shows.fold;
     let mut part = Vec::new();
     match &t.items[n] {
+        // Waiting for the agent to take it: it shows over the composer (fill_chat_queued), not here yet.
+        Item::User { .. } if t.is_queued(n) => {}
         Item::User { text, images } => {
             let words = !text.trim().is_empty();
             if !images.is_empty() {
                 part.push(Row::Pictures(images.clone(), !words));
             }
             if words || images.is_empty() {
-                part.push(Row::User(text.clone(), !images.is_empty()));
+                part.push(Row::User(text.clone(), !images.is_empty(), None));
             }
         }
         Item::Text { block, text, done } => match shows.cut.get(block) {
@@ -828,42 +909,86 @@ fn item_rows(t: &Transcript, n: usize, shows: Shows<'_>, out: &mut Vec<(String, 
     }
 }
 
-/// The transcript as rows ([`Grouped`]: runs of calls under one line), and the keys of the rows nested under a run.
-/// A run is its one line ([`steps::run_line`]) and nothing else until the person opens it; opened, each cell's outputs
-/// ([`steps::outs`], set in by their own prefabs) and each agent tool call and reasoning between them as its own folded
-/// line, nested. A text block shows as far as its cut says ([`Shows`]).
+/// The transcript as rows ([`Grouped`]), and the keys of the rows nested under a run. A turn (the person's message to
+/// its turn's end) that did anything on the way shows as the message and its last answer, its one line for all of it
+/// ([`steps::turn_line`]) folded away behind the message's hover-only steps button once the turn is done: what the agent said last is the answer, what came before (its narration, its calls, its
+/// reasoning) is how it got there, and opens under the line when the person presses it. While the turn runs, its line
+/// says what it is doing and its newest words show as they come. Everything shows, as runs, when the person keeps
+/// every step (native.json `chat_steps: "all"`, [`Shows::all`]).
 fn rows_nested(t: &Transcript, shows: Shows<'_>) -> (Vec<(String, Row)>, HashSet<String>) {
     let fold = shows.fold;
     let g = Grouped::of(t);
     let mut out = Vec::new();
     let mut nested = HashSet::new();
-    for piece in &g.pieces {
-        match piece {
-            Piece::Item(n) => item_rows(t, *n, shows, &mut out),
-            Piece::Run(run) => {
-                let key = run.key();
-                let open = fold.get(&key).copied().unwrap_or(false);
-                out.push((key.clone(), Row::Steps(steps::run_line(&key, run, t, open))));
-                if !open {
-                    continue;
-                }
-                for &n in &run.items {
-                    let from = out.len();
-                    let cell = match &t.items[n] {
-                        Item::Tool { block, .. } => t.details.get(block).map(|d| (block, d)),
-                        _ => None,
-                    };
-                    match cell {
-                        Some((block, d)) => {
-                            let mut part = Vec::new();
-                            steps::outs(block, d, fold, &mut part);
-                            out.extend(part.into_iter().enumerate().map(|(k, r)| (format!("i{n}.{k}"), r)));
-                        }
-                        None => {
-                            item_rows(t, n, shows, &mut out);
-                            nested.extend(out[from..].iter().map(|(k, _)| k.clone()));
-                        }
-                    }
+    let is_user = |p: &Piece| matches!(p, Piece::Item(n) if matches!(t.items[*n], Item::User { .. }) && !t.is_queued(*n));
+    let starts: Vec<usize> = g.pieces.iter().enumerate().filter(|(_, p)| is_user(p)).map(|(i, _)| i).collect();
+    // Before the first message (a log's own start), then each message's turn.
+    let mut bounds = vec![0];
+    bounds.extend(starts.iter().copied().filter(|&s| s > 0));
+    bounds.push(g.pieces.len());
+    bounds.dedup();
+    for w in bounds.windows(2) {
+        let turn = &g.pieces[w[0]..w[1]];
+        let Some((Piece::Item(u), rest)) = turn.split_first().filter(|(p, _)| is_user(p)) else {
+            for piece in turn {
+                piece_rows(t, piece, shows, &mut out, &mut nested);
+            }
+            continue;
+        };
+        let item = |p: &Piece| match p {
+            Piece::Item(n) => Some(*n),
+            Piece::Run(_) => None,
+        };
+        let ended = rest.iter().filter_map(item).find_map(|n| match &t.items[n] {
+            Item::TurnEnd { duration_ms, .. } => Some(*duration_ms),
+            _ => None,
+        });
+        // Its answer: the last words it said; what always shows beside it: a view a cell drew (the view is the message),
+        // a failure, a note.
+        let answer = rest.iter().filter_map(item).filter(|&n| matches!(t.items[n], Item::Text { .. })).last();
+        let draws = |n: usize| match &t.items[n] {
+            Item::Tool { block, .. } => t.details.get(block).is_some_and(|d| !empty_value(&d.ui)),
+            _ => false,
+        };
+        let shown = |n: usize| {
+            Some(n) == answer || draws(n) || matches!(t.items[n], Item::Error { .. } | Item::Note { .. } | Item::TurnEnd { .. })
+        };
+        let folds = rest.iter().any(|p| item(p).is_none_or(|n| !shown(n)));
+        let message = out.len();
+        item_rows(t, *u, shows, &mut out);
+        if shows.all || !folds {
+            for piece in rest {
+                piece_rows(t, piece, shows, &mut out, &mut nested);
+            }
+            continue;
+        }
+        let key = format!("turn:{u}");
+        let open = fold.get(&key).copied().unwrap_or(false);
+        let calls: Vec<group::Call> = rest
+            .iter()
+            .flat_map(|p| match p {
+                Piece::Item(n) => vec![*n],
+                Piece::Run(r) => r.items.clone(),
+            })
+            .filter_map(|n| group::call(t, n))
+            .collect();
+        let live = ended.is_none() && t.busy;
+        // A finished turn's line stays folded away: its steps button on the message's row (hover-only) shows it, and
+        // the steps under it; while the turn runs, its line says what it is doing.
+        if !live
+            && let Some((_, Row::User(_, _, steps))) = out[message..].iter_mut().find(|(_, r)| matches!(r, Row::User(..)))
+        {
+            *steps = Some((key.clone(), open));
+        }
+        if live || open {
+            out.push((key.clone(), Row::Steps(steps::turn_line(&key, &calls, t, ended.flatten(), live, open))));
+        }
+        for piece in rest {
+            if open || item(piece).is_some_and(shown) {
+                let from = out.len();
+                piece_rows(t, piece, shows, &mut out, &mut nested);
+                if open && item(piece).is_none_or(|n| !shown(n)) {
+                    nested.extend(out[from..].iter().map(|(k, _)| k.clone()));
                 }
             }
         }
@@ -871,23 +996,67 @@ fn rows_nested(t: &Transcript, shows: Shows<'_>) -> (Vec<(String, Row)>, HashSet
     (out, nested)
 }
 
+/// One piece's rows: an item's, or a run as its one line ([`steps::run_line`]) and nothing else until the person opens
+/// it; opened, each cell's outputs ([`steps::outs`], set in by their own prefabs) and each agent tool call and reasoning
+/// between them as its own folded line, nested. A text block shows as far as its cut says ([`Shows`]).
+fn piece_rows(t: &Transcript, piece: &Piece, shows: Shows<'_>, out: &mut Vec<(String, Row)>, nested: &mut HashSet<String>) {
+    let fold = shows.fold;
+    match piece {
+        Piece::Item(n) => item_rows(t, *n, shows, out),
+        Piece::Run(run) => {
+            let key = run.key();
+            let open = fold.get(&key).copied().unwrap_or(false);
+            out.push((key.clone(), Row::Steps(steps::run_line(&key, run, t, open))));
+            if !open {
+                return;
+            }
+            for &n in &run.items {
+                let from = out.len();
+                let cell = match &t.items[n] {
+                    Item::Tool { block, .. } => t.details.get(block).map(|d| (block, d)),
+                    _ => None,
+                };
+                match cell {
+                    Some((block, d)) => {
+                        let mut part = Vec::new();
+                        steps::outs(block, d, fold, &mut part);
+                        out.extend(part.into_iter().enumerate().map(|(k, r)| (format!("i{n}.{k}"), r)));
+                    }
+                    None => {
+                        item_rows(t, n, shows, out);
+                        nested.extend(out[from..].iter().map(|(k, _)| k.clone()));
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The transcript as rows.
 fn rows(t: &Transcript, shows: Shows<'_>) -> Vec<(String, Row)> {
     rows_nested(t, shows).0
 }
 
-/// What decides how the transcript shows besides itself: the folds the person set, and how far each text block still
-/// streaming shows (byte offset, by block; a block not in it shows whole).
+/// What decides how the transcript shows besides itself: the folds the person set, how far each text block still
+/// streaming shows (byte offset, by block; a block not in it shows whole), and whether every step shows (`all`:
+/// native.json `chat_steps: "all"`) rather than each turn folded to its answer.
 #[derive(Clone, Copy)]
 struct Shows<'a> {
     fold: &'a HashMap<String, bool>,
     cut: &'a HashMap<String, usize>,
+    all: bool,
 }
 
 impl<'a> Shows<'a> {
     fn of(st: &'a ChatState) -> Self {
-        Self { fold: &st.fold, cut: &st.cut }
+        Self { fold: &st.fold, cut: &st.cut, all: all_steps() }
     }
+}
+
+/// Whether the person keeps every step of a turn in view (native.json `chat_steps: "all"`), read once per launch.
+fn all_steps() -> bool {
+    static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ALL.get_or_init(|| crate::prefs::get("chat_steps").and_then(|v| v.as_str().map(|s| s == "all")).unwrap_or(false))
 }
 
 /// How much of a text block still streaming in can show without what shows changing as more comes (byte offset): up to
@@ -971,7 +1140,7 @@ fn word_around(s: &str, i: usize) -> (usize, usize) {
 /// [`fill_row`] gives it) and whether it is inline markdown.
 fn texts(r: &Row) -> Vec<(&'static [&'static str], String, bool)> {
     match r {
-        Row::User(s, _) => vec![(&["bubble", "text"], s.clone(), false)],
+        Row::User(s, ..) => vec![(&["bubble", "text"], s.clone(), false)],
         Row::Prose(s) | Row::Heading(_, s) | Row::Quote(s) => vec![(&["text"], s.clone(), true)],
         Row::ListItem { mark, text, .. } => vec![(&["mark"], mark.clone(), false), (&["text"], text.clone(), true)],
         Row::Code { text, .. } => vec![(&["card", "text"], text.clone(), false)],
@@ -983,7 +1152,9 @@ fn texts(r: &Row) -> Vec<(&'static [&'static str], String, bool)> {
         Row::Note(s) | Row::Error(s) => vec![(&["text"], s.clone(), false)],
         Row::Steps(l) => vec![(&["head", "words"], l.words.clone(), false)],
         Row::Out(o) => o.texts(),
-        Row::Tool { .. } | Row::Thinking { .. } | Row::Grid { .. } | Row::Table(_) | Row::Ui { .. } | Row::Pictures(..) => Vec::new(),
+        Row::Tool { .. } | Row::Thinking { .. } | Row::Grid { .. } | Row::Table(_) | Row::Ui { .. } | Row::Pictures(..) | Row::RefCard(_) | Row::Math(_) => {
+            Vec::new()
+        }
     }
 }
 
@@ -995,6 +1166,25 @@ fn tool_result(result: &str) -> &str {
 /// What words given `src` show (inline markdown: the markers out), which a [`Spot`]'s units count in.
 fn shown(src: &str, md: bool) -> String {
     if md { harness_native_render::markdown::inline(src).text } else { src.to_owned() }
+}
+
+/// The words given `src` from unit `a` to `b` of what they show ([`shown`]), for the pasteboard: a formula in them as its
+/// LaTeX as written (`$x^2$`), not the hole it leaves.
+fn shown_cut(src: &str, md: bool, a: usize, b: usize) -> String {
+    if !md {
+        return src[byte_of(src, a)..byte_of(src, b)].to_owned();
+    }
+    let m = harness_native_render::markdown::inline(src);
+    let s = m.text.as_str();
+    let mut out = String::new();
+    let mut from = a;
+    for f in m.math.iter().filter(|f| (a..b).contains(&f.at)) {
+        out.push_str(&s[byte_of(s, from)..byte_of(s, f.at)]);
+        out.push_str(&f.source);
+        from = f.at + 1;
+    }
+    out.push_str(&s[byte_of(s, from)..byte_of(s, b)]);
+    out
 }
 
 /// The units of row `row`'s `part`th words (`len` long) the selection `lo..hi` covers, if any.
@@ -1024,8 +1214,9 @@ impl Row {
     /// The row as markdown, for a copy that takes it whole (None: its words as shown).
     fn markdown(&self) -> Option<String> {
         Some(match self {
-            Row::User(s, _) | Row::Prose(s) | Row::Note(s) | Row::Error(s) => s.clone(),
+            Row::User(s, ..) | Row::Prose(s) | Row::Note(s) | Row::Error(s) => s.clone(),
             Row::Pictures(images, _) => images.iter().map(|p| format!("![image]({p})")).collect::<Vec<_>>().join("\n"),
+            Row::RefCard(src) => src.clone(),
             Row::Heading(n, s) => format!("{} {s}", "#".repeat(usize::from(*n))),
             Row::ListItem { depth, mark, text } => {
                 let mark = match mark.as_str() {
@@ -1038,6 +1229,7 @@ impl Row {
             }
             Row::Quote(s) => format!("> {s}"),
             Row::Code { lang, text } => format!("```{lang}\n{text}\n```"),
+            Row::Math(tex) => format!("$$\n{tex}\n$$"),
             Row::Table(t) => t.markdown(),
             Row::Grid { v, .. } => grid_table(v).markdown(),
             Row::Out(o) => return o.markdown(),
@@ -1066,7 +1258,7 @@ fn transcript_text(rows: &[(String, Row)], lo: Spot, hi: Spot) -> String {
             };
             whole &= a == 0 && b == n;
             if a < b {
-                bits.push(s[byte_of(&s, a)..byte_of(&s, b)].to_owned());
+                bits.push(shown_cut(src, *md, a, b));
             }
         }
         // A row with no words to select (a table) is taken whole when the selection reaches past its middle.
@@ -1130,9 +1322,14 @@ fn keep_in_view(from: f32, at: f32, view: f32, len: f32) -> f32 {
     to.clamp(0.0, (len - view).max(0.0))
 }
 
-/// Chat pane `pv`'s composer card (scene/widgets/chat.flecs hn.ChatPane's foot.card: the words over the bar).
+/// Chat pane `pv`'s composer card (scene/widgets/chat.flecs hn.ChatPane's foot.card: the words and their pictures).
 fn composer(pv: View<'_>) -> Option<View<'_>> {
     pv.part("foot")?.part("card")
+}
+
+/// Chat pane `pv`'s status bar under its composer (hn.ChatPane's foot.status: model and effort, context, plan).
+fn status_bar(pv: View<'_>) -> Option<View<'_>> {
+    pv.part("foot")?.part("status")
 }
 
 /// Chat pane `pv`'s composer's words' area (its ui.field.GrowingTextArea).
@@ -1238,8 +1435,14 @@ impl App {
                 if let Some((m, e)) = &st.started {
                     chats.entry(sid).or_default().start_on(m.as_deref(), e.as_deref());
                 }
-                drop(chats);
-                self.link.attach(sid, 80, 24, true);
+                // A shot's recorded chat stands in for the daemon's stream.
+                match self.shot_feed.get(&sid) {
+                    Some(bytes) => chats.entry(sid).or_default().feed(bytes),
+                    None => {
+                        drop(chats);
+                        self.link.attach(sid, 80, 24, true);
+                    }
+                }
             }
         }
         // Drawn in the window's appearance on the theme's ground (`tone_ground`, not the terminal's): a chat is a page, so it
@@ -1252,6 +1455,7 @@ impl App {
                 v.entity().set(scheme);
             }
         }
+        self.watch_chats();
         let chats = self.chats.borrow();
         let empty = Transcript::default();
         let t = chats.get(&sid).unwrap_or(&empty);
@@ -1288,6 +1492,8 @@ impl App {
         }
         // A run's rows sit in from its line by `chat_nest` (each row's own padding, from its prefab, plus that).
         let nest_by = view::prefab(w, "hn.ChatNest").and_then(|p| p.try_cloned::<&harness_native_ui_layout_api::Padding>()).map_or(0.0, |p| p.l);
+        // The pull request and issue cards in view, filled after the stack (their rows' entities, their rows).
+        let mut cards: Vec<(u64, usize)> = Vec::new();
         if let Some(list) = pv.part("list")
             && let Some(stack) = list.part("rows")
         {
@@ -1301,6 +1507,9 @@ impl App {
             let rows_open = &st.rows_open;
             let sizes = &st.sizes;
             let fresh_rows = |row: View<'_>, i: usize, new: bool| {
+                if matches!(rows[i].1, Row::RefCard(_)) {
+                    cards.push((row.id(), i)); // alloc: the cards in view, this frame
+                }
                 if new {
                     row.set(HoverAmt::default());
                     if let Some(h) = row.part("head") {
@@ -1384,6 +1593,14 @@ impl App {
             .try_cloned::<&model::Cwd>()
             .map_or_else(|| std::env::var("HOME").unwrap_or_default(), |c| c.s.as_str().to_owned());
         self.fill_chat_peek(pv, st, t, &rows, focused, &cwd);
+        // Each card in view as its hover card would be: the same lines, from the same answers.
+        for (id, i) in cards {
+            let Row::RefCard(src) = &rows[i].1 else { continue };
+            let Some(tag) = harness_native_render::markdown::inline(src).tags.into_iter().next() else { continue };
+            if let Some(card) = View::of(w.entity_from_id(id)).part("card") {
+                self.fill_card(card, st, &tag.tag, &cwd, true);
+            }
+        }
         self.fill_chat_mention(pv, sid, st, &cwd, focused);
         let ended = self.status_of(e) != "running";
         // The pictures pasted into the message, over its words, each with its remove button.
@@ -1416,9 +1633,12 @@ impl App {
                     "cursor" => "Cursor",
                     _ => "Claude",
                 };
+                // While a turn runs, how to stop it (the bindings of act.ChatInterrupt, scene/20-keys.flecs).
+                let stop = self.hints("ChatInterrupt");
                 let hint = match (shown.is_empty(), ended) {
                     _ if aside && shown.trim().is_empty() => format!("Ask {agent} aside: the answer stays out of the conversation"),
                     (false, _) => String::new(),
+                    (true, false) if t.busy && !stop.is_empty() => format!("Message {agent} (queued) \u{b7} {stop} to stop"),
                     (true, false) => format!("Message {agent}"),
                     (true, true) => format!("Message {agent} to resume"),
                 };
@@ -1439,7 +1659,7 @@ impl App {
                 // Grown past its most, it scrolls on its FieldScroll (step_chat_inputs), the caret kept in view.
             }
         }
-        if let Some(bar) = composer(pv).and_then(|c| c.part("bar")) {
+        if let Some(bar) = status_bar(pv) {
             let o = w.entity_from_id(e);
             // The model and the effort it runs with, as den's picker (chat/pick.rs `Label`), the daemon's listing its last
             // say.
@@ -1447,6 +1667,166 @@ impl App {
             let listed = (listed.s.as_str(), listed.effort.as_str());
             self.fill_chat_pick(bar, sid, t, model::kind_name(o), st.pick, &mut st.pick_nav, &mut st.effort, listed, ended, st.ctx_open);
         }
+        if let Some(foot) = pv.part("foot") {
+            self.fill_chat_activity(foot, e, t, ended);
+            self.fill_chat_queued(foot, t);
+        }
+    }
+
+    /// The strip over chat `e`'s composer: what runs for it now, one chip each, in this order: its turn's step (what the
+    /// agent does, named by the step its cell is on, never the tool: "blaze check · 6 min"), each command still running
+    /// under it, and each sub-agent this turn has (at work, waiting for input, done or failed). Each says how it stands by
+    /// its glyph and, while it runs, how long it has, ticking (the running glyph breathes, so frames keep coming). A
+    /// command's or sub-agent's press selects it in the sidebar; under the pointer, a chip's card says more
+    /// ([`App::fill_activity_pop`]). Past [`ACTIVITY_MAX`] chips, one more says how many are left. Empty while nothing
+    /// runs, and then without its air.
+    fn fill_chat_activity(&self, foot: View<'_>, e: u64, t: &Transcript, ended: bool) {
+        let Some(strip) = foot.part("activity") else { return };
+        let w = self.world.world_ref();
+        let o = w.entity_from_id(e);
+        let now = model::now_ms();
+        let mut chips: Vec<Chip> = Vec::new(); // alloc: a few chips, a frame
+        let working = t.busy && !ended;
+        if working {
+            chips.push(turn_chip(t, now));
+        }
+        let turn_from = t.turn_since.unwrap_or(u64::MAX);
+        let chats = self.chats.borrow();
+        let mut watch: Vec<u64> = Vec::new(); // alloc: a few sub-agents, a frame
+        o.each_child(|c| {
+            let id = *c.id();
+            let status = self.status_of(id);
+            let start = c.try_cloned::<&model::Created>().map(|c| c.ms).filter(|&m| m > 0);
+            let end = c.try_cloned::<&model::Ended>().map(|c| c.ms);
+            let name = || c.try_cloned::<&model::Name>().map(|n| n.s.as_str().split_whitespace().collect::<Vec<_>>().join(" ")).unwrap_or_default();
+            if self.run_of(id).is_some() {
+                if status != "running" {
+                    return;
+                }
+                let cmd = c.try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).unwrap_or_default();
+                let took = start.map(|s| ran_for(now.saturating_sub(s))).unwrap_or_default();
+                let mut pop = vec![PopLine::Head(super::short_cmd(&cmd)), PopLine::Meta(meta(&["Command", &running_for(&took)]))];
+                if cmd.trim() != super::short_cmd(&cmd) {
+                    pop.push(PopLine::Text(clip_lines(cmd.trim(), POP_LINES, POP_CHARS)));
+                }
+                chips.push(Chip { key: format!("r{id}"), state: "running", words: super::short_cmd(&cmd), took, action: format!("select:{id}"), pop });
+                return;
+            }
+            if !c.has(model::Object::id()) {
+                return;
+            }
+            // A sub-agent: up and at work, up and waiting for the person, or ended during this turn (done or failed).
+            let code = c.try_cloned::<&model::ExitCode>().map(|x| x.code).filter(|&x| x != 0);
+            let state = match status {
+                "running" if c.has(model::Busy::id()) => "running",
+                "running" => "waiting",
+                _ if !working || end.is_none_or(|m| m < turn_from) => return,
+                "killed" | "lost" => "failed",
+                _ if code.is_some() => "failed",
+                _ => "done",
+            };
+            let ran = start.map(|s| end.unwrap_or(now).saturating_sub(s));
+            let took = if state == "running" { ran.map(ran_for).unwrap_or_default() } else { String::new() };
+            let sid = c.try_cloned::<&model::Object>().map(|ob| ob.id);
+            if let Some(sid) = sid.filter(|_| c.has(model::ChatMode::id())) {
+                watch.push(sid);
+            }
+            let sub = sid.and_then(|sid| chats.get(&sid));
+            let listed = c.try_cloned::<&model::AgentModel>().unwrap_or_default();
+            let pop = agent_pop(&name(), state, sub, listed.s.as_str(), listed.effort.as_str(), ran);
+            chips.push(Chip { key: format!("s{id}"), state, words: name(), took, action: format!("select:{id}"), pop });
+        });
+        drop(chats);
+        for sid in watch {
+            self.watch_chat(sid);
+        }
+        if chips.len() > ACTIVITY_MAX {
+            let more = chips.len() - (ACTIVITY_MAX - 1);
+            let rest: Vec<String> = chips[ACTIVITY_MAX - 1..].iter().map(|c| c.words.clone()).collect();
+            chips.truncate(ACTIVITY_MAX - 1);
+            let pop = rest.into_iter().map(PopLine::Text).collect();
+            chips.push(Chip { key: "more".to_owned(), state: "more", words: format!("{more} more"), took: String::new(), action: String::new(), pop });
+        }
+        let air = if chips.is_empty() { 0.0 } else { crate::look::width(w, "chat_activity_air") };
+        let pad = harness_native_ui_layout_api::Padding { l: 0.0, r: 0.0, t: 0.0, b: air };
+        if strip.entity().try_cloned::<&harness_native_ui_layout_api::Padding>() != Some(pad) {
+            strip.set(pad);
+        }
+        view::for_each(strip, "hn.ChatActivityItem", chips.iter().map(|c| (c.key.as_str(), c)), |v, c, _| {
+            if let Some(i) = v.part("icon") {
+                if c.state == "more" {
+                    status_on(i, None);
+                    i.icon(ACT_MORE);
+                } else {
+                    status_on(i, Some(c.state));
+                }
+            }
+            if let Some(l) = v.part("words") {
+                l.text(&c.words);
+            }
+            if let Some(l) = v.part("took") {
+                l.text(&if c.took.is_empty() { String::new() } else { format!("\u{b7} {}", c.took) });
+            }
+            let a = Action { name: c.action.as_str().into() };
+            if v.entity().try_cloned::<&Action>() != Some(a.clone()) {
+                v.entity().set(a);
+            }
+        });
+        if let Some(pop) = foot.part("activity_pop") {
+            fill_activity_pop(pop, strip, &chips);
+        }
+    }
+
+    /// Attach chat `sid`'s events once, for a look only (its transcript then fills as a shown chat's does): a sub-agent
+    /// whose chip shows over its parent's composer. A shot's recorded chat is fed instead.
+    /// Asked while the transcripts are borrowed (the pane's fill), so it waits for the next fill ([`App::watch_chats`]).
+    fn watch_chat(&self, sid: u64) {
+        let mut w = self.watched.borrow_mut();
+        if !w.0.contains(&sid) {
+            w.0.insert(sid);
+            w.1.push(sid);
+        }
+    }
+
+    /// Attach the chats [`App::watch_chat`] asked for, before a pane's fill borrows the transcripts.
+    fn watch_chats(&self) {
+        let due = std::mem::take(&mut self.watched.borrow_mut().1);
+        for sid in due {
+            if self.link.attached(sid) || self.chats.borrow().contains_key(&sid) {
+                continue;
+            }
+            match self.shot_feed.get(&sid) {
+                Some(bytes) => self.chats.borrow_mut().entry(sid).or_default().feed(bytes),
+                None => self.link.attach(sid, 80, 24, true),
+            }
+        }
+    }
+
+    /// The messages chat `e`'s person sent while its turn runs that the agent has not taken yet, over the composer (the
+    /// foot's `queued` slot, hn.ChatQueued each), oldest first; they join the transcript as the agent takes them.
+    fn fill_chat_queued(&self, foot: View<'_>, t: &Transcript) {
+        let Some(slot) = foot.part("queued") else { return };
+        let air = crate::look::width(self.world.world_ref(), "chat_activity_air");
+        let pad = harness_native_ui_layout_api::Padding { l: 0.0, r: 0.0, t: 0.0, b: if t.queued.is_empty() { 0.0 } else { air } };
+        if slot.entity().try_cloned::<&harness_native_ui_layout_api::Padding>() != Some(pad) {
+            slot.set(pad);
+        }
+        let shown = t.queued.iter().filter_map(|&n| match t.items.get(n)? {
+            Item::User { text, images } => {
+                let words = match (text.trim().is_empty(), images.len()) {
+                    (false, _) => text.trim().to_owned(),
+                    (true, 1) => "1 picture".to_owned(),
+                    (true, k) => format!("{k} pictures"),
+                };
+                Some((format!("q{n}"), words))
+            }
+            _ => None,
+        });
+        view::for_each(slot, "hn.ChatQueued", shown, |v, words, _| {
+            if let Some(t) = v.part("bubble").and_then(|b| b.part("text")) {
+                t.text(&words);
+            }
+        });
     }
 
     /// Chat pane `pv`'s aside card (its foot's `aside` slot, hn.ChatAside) while chat `sid` has one: the working ring
@@ -1775,6 +2155,18 @@ impl App {
         let st = states.entry(sid).or_default();
         let open = is_open(&st.fold, block);
         st.fold.insert(block.to_owned(), !open);
+        drop(states);
+        self.poke();
+    }
+
+    /// A finished turn's steps button (`{sid}:{turn key}`): show its steps under its message, or fold them again. It names
+    /// its chat, so it works in a pane that does not have the keyboard.
+    pub(super) fn chat_turn_toggle(&mut self, rest: &str) {
+        let Some((sid, key)) = rest.split_once(':').and_then(|(s, k)| Some((s.parse::<u64>().ok()?, k))) else { return };
+        let mut states = self.chat.borrow_mut();
+        let st = states.entry(sid).or_default();
+        let open = is_open(&st.fold, key);
+        st.fold.insert(key.to_owned(), !open);
         drop(states);
         self.poke();
     }
@@ -2341,9 +2733,8 @@ impl App {
         let w = self.world.world_ref();
         let pv = View::of(w.entity_from_id(p));
         let over = |v: Option<View<'_>>| v.and_then(|v| v.entity().try_cloned::<&Laid>()).is_some_and(|l| l.contains(x, y));
-        // On the composer's card but off its bar of controls is on the words (its insets too).
-        let card = composer(pv);
-        let in_input = over(card) && !over(card.and_then(|c| c.part("bar")));
+        // On the composer's card is on the words (its insets too): the controls are the status bar's, under it.
+        let in_input = over(composer(pv));
         let in_list = over(pv.part("list"));
         // A press on a cell's control is the control's (genui/control.rs): it starts no selection in the transcript.
         let on_control = w.entity_named(APP).target(Hovered::id(), 0).is_some_and(|h| {
@@ -2558,7 +2949,11 @@ fn fill_pictures(strip: View<'_>, images: &[String], sizes: Option<&HashMap<Stri
     let w = strip.entity().world();
     let widest = if remove.is_some() { crate::look::width(w, "chat_attach_wide") } else { f32::INFINITY };
     let shows = images.iter().enumerate().filter_map(|(i, p)| sizes.and_then(|s| s.get(p).copied().flatten()).map(|wh| (format!("p{i}"), prefab, (i, p, wh))));
-    view::for_each_of(strip, shows, |v, (i, path, (iw, ih)), _| {
+    view::for_each_of(strip, shows, |v, (i, path, (iw, ih)), new| {
+        // Its hover spring (a HoverGroup's): what shows its remove button only while the pointer is on it.
+        if new && remove.is_some() {
+            v.set(HoverAmt::default());
+        }
         let k = (h / ih.max(1) as f32).min(widest / iw.max(1) as f32);
         let size = Size {
             w: Sizing { kind: SizeKind::Fixed, value: (iw as f32 * k).round(), min: 0.0, max: 0.0 },
@@ -2584,6 +2979,321 @@ fn fill_pictures(strip: View<'_>, images: &[String], sizes: Option<&HashMap<Stri
     });
 }
 
+/// The most chips the activity strip shows before one says how many more (fill_chat_activity).
+const ACTIVITY_MAX: usize = 5;
+/// The glyph of the chip that says how many more there are (codicon's ellipsis).
+const ACT_MORE: &str = "\u{EA7C}";
+/// The most lines, and characters, of words a chip's card shows (an agent's last message, a command).
+const POP_LINES: usize = 4;
+const POP_CHARS: usize = 280;
+/// The most steps a turn chip's card lists (the newest), before a line says how many came before.
+const POP_STEPS: usize = 8;
+
+/// One chip of the activity strip: its key, its `hn.chat_status` (or "more"), its words, how long it has run (empty when
+/// it is not running), its press's action and its card's lines.
+struct Chip {
+    key: String,
+    state: &'static str,
+    words: String,
+    took: String,
+    action: String,
+    pop: Vec<PopLine>,
+}
+
+/// One line of a chip's card (hn.ChatActivityPop*).
+enum PopLine {
+    /// What it is, strong.
+    Head(String),
+    /// Model and effort, how long: muted.
+    Meta(String),
+    /// What it is doing or said last, a few lines.
+    Text(String),
+    /// One step a cell took: its kind (`hn.StepKind`) and its words ([`StepWords`]).
+    Step(&'static str, StepWords),
+}
+
+/// Where the turn in flight's items begin: after the newest message the agent took (one still queued is not its yet).
+fn turn_start(t: &Transcript) -> usize {
+    (0..t.items.len()).rev().find(|&k| matches!(t.items[k], Item::User { .. }) && !t.is_queued(k)).map_or(0, |k| k + 1)
+}
+
+/// About how many tokens `text` is (four characters each), in a few figures: `240`, `1.2k`, `18k`.
+fn tokens_of(text: &str) -> String {
+    let n = text.chars().count().div_ceil(4);
+    match n {
+        0..1000 => n.to_string(),
+        1000..10_000 => format!("{:.1}k", n as f64 / 1000.0),
+        _ => format!("{}k", n / 1000),
+    }
+}
+
+/// How long something has run, the way a person says it: `12 s`, `1 min 20 s`, `6 min`, `1 h 5 min`.
+fn ran_for(ms: u64) -> String {
+    let s = ms / 1000;
+    match s {
+        0..60 => format!("{s} s"),
+        60..300 if s % 60 != 0 => format!("{} min {} s", s / 60, s % 60),
+        60..3600 => format!("{} min", s / 60),
+        _ if (s / 60) % 60 == 0 => format!("{} h", s / 3600),
+        _ => format!("{} h {} min", s / 3600, (s / 60) % 60),
+    }
+}
+
+/// "Running for 6 min", or "Running" when when it began is not known.
+fn running_for(took: &str) -> String {
+    if took.is_empty() { "Running".to_owned() } else { format!("Running for {took}") }
+}
+
+/// Words joined by a middle dot, the empty ones left out.
+fn meta(parts: &[&str]) -> String {
+    parts.iter().filter(|p| !p.trim().is_empty()).copied().collect::<Vec<_>>().join(" \u{b7} ")
+}
+
+/// `s` cut to its first `lines` lines and `chars` characters, an ellipsis where it was cut.
+fn clip_lines(s: &str, lines: usize, chars: usize) -> String {
+    let kept: Vec<&str> = s.lines().filter(|l| !l.trim().is_empty()).take(lines).collect();
+    let mut out: String = kept.join("\n").chars().take(chars).collect();
+    if out.len() < s.trim().len() {
+        out.push('\u{2026}');
+    }
+    out
+}
+
+/// A step's words as a chip says them: a command by what it runs (`blaze check`), anything else by its own words while
+/// it runs (`Reading chat.rs`), without the ellipsis (its time follows).
+pub(super) fn step_words(e: &model::chat::Effect) -> String {
+    let cmd = super::short_cmd(&e.target);
+    if e.kind == "exec" && !cmd.is_empty() {
+        return cmd;
+    }
+    let w = e.doing.trim().trim_end_matches('\u{2026}').trim_end_matches("...").trim();
+    if w.is_empty() { e.done.trim().to_owned() } else { w.to_owned() }
+}
+
+/// The turn's chip: what the turn in flight does now, named by the step running in its newest running cell (its words
+/// and how long that step has run), else its running tool's main argument (a shell's command), else what its newest
+/// words or reasoning are, timed from the turn's start. Its card: what the turn is on, how long the turn has run, and
+/// the steps its cells took so far ([`turn_steps`]).
+fn turn_chip(t: &Transcript, now: u64) -> Chip {
+    let since = turn_start(t);
+    let turn = t.turn_since.map(|s| ran_for(now.saturating_sub(s))).unwrap_or_default();
+    let mut words = "Working".to_owned();
+    let mut from = t.turn_since;
+    for i in t.items[since.min(t.items.len())..].iter().rev() {
+        match i {
+            Item::Tool { block, name, input, result: None, .. } => {
+                from = t.started.get(block).copied().or(from);
+                match t.details.get(block) {
+                    Some(d) => match d.effects.iter().rev().find(|e| e.status == "running") {
+                        Some(e) => {
+                            words = step_words(e);
+                            from = e.started_ms.or(from);
+                        }
+                        None => words = "Running code".to_owned(),
+                    },
+                    None => {
+                        let arg = model::chat::main_arg(input);
+                        let bash = ["bash", "shell", "exec", "command"].iter().any(|k| name.to_ascii_lowercase().contains(k));
+                        words = match (bash, arg.is_empty()) {
+                            (true, false) => super::short_cmd(&arg),
+                            (false, false) => format!("{}: {arg}", name.rsplit("__").next().unwrap_or(name)),
+                            (_, true) => name.rsplit("__").next().unwrap_or(name).to_owned(),
+                        };
+                    }
+                }
+                break;
+            }
+            // Reasoning or words as they come: about how many tokens so far, timed from when the block began.
+            Item::Thinking { text, done: false, .. } => {
+                words = format!("Thinking \u{b7} {} tokens", tokens_of(text));
+                from = t.step_since.or(from);
+                break;
+            }
+            Item::Text { text, done: false, .. } => {
+                words = format!("Writing \u{b7} {} tokens", tokens_of(text));
+                from = t.step_since.or(from);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let took = from.map(|s| ran_for(now.saturating_sub(s))).unwrap_or_default();
+    let mut pop = vec![PopLine::Head(words.clone()), PopLine::Meta(meta(&["This turn", &running_for(&turn)]))];
+    pop.extend(turn_steps(t, since));
+    Chip { key: "step".to_owned(), state: "running", words, took, action: String::new(), pop }
+}
+
+/// The steps the turn from item `since` on took outside its cells, so far, as a card lists them (the newest
+/// [`POP_STEPS`], a line first saying how many came before): files read and written, commands run, agents started,
+/// pages fetched; waiting is bookkeeping and is left out. A failed one says what it could not do.
+/// A step's words as a line says them: the verb in the UI's words ("Ran", "Read", "Couldn't run"), then what it was
+/// done to in the code face (a command, a path), a path cut in its middle so its file shows, a command at its end so its
+/// program shows.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct StepWords {
+    pub verb: String,
+    pub what: String,
+    pub path: bool,
+}
+
+impl StepWords {
+    /// Split `words` (what the step says it does or did) about its target `target` (its command or path; `exec`: a
+    /// command): the words before the target are the verb, the target (a command shortened as a row says it, a path
+    /// from `~`) what. Words that do not name their target are the verb alone.
+    pub(super) fn of(words: &str, target: &str, exec: bool) -> Self {
+        let target = target.lines().next().unwrap_or("").trim();
+        let what = if exec { super::short_cmd(target) } else { tilde_path(target) };
+        // Where the target begins in the words: its first few characters, else its first word (a command the words
+        // shortened past its directory).
+        let head: String = target.chars().take(12).collect();
+        let first = target.split_whitespace().next().unwrap_or("");
+        let at = (!head.is_empty())
+            .then(|| words.find(&head))
+            .flatten()
+            .or_else(|| (!what.is_empty()).then(|| words.find(what.as_str())).flatten())
+            .or_else(|| (!first.is_empty()).then(|| words.find(&format!(" {first}")).map(|i| i + 1)).flatten());
+        match at {
+            Some(i) if !what.is_empty() => {
+                StepWords { verb: words[..i].trim().trim_end_matches(':').to_owned(), what, path: !exec && target.contains('/') }
+            }
+            _ => StepWords { verb: words.trim().to_owned(), what: String::new(), path: false },
+        }
+    }
+}
+
+/// `p` from the home directory as `~` when it is under it.
+fn tilde_path(p: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    match p.strip_prefix(home.trim_end_matches('/')).filter(|r| !home.is_empty() && (r.is_empty() || r.starts_with('/'))) {
+        Some(r) => format!("~{r}"),
+        None => p.to_owned(),
+    }
+}
+
+fn turn_steps(t: &Transcript, since: usize) -> Vec<PopLine> {
+    let mut all: Vec<PopLine> = Vec::new(); // alloc: a turn's steps, while its card is up
+    for i in &t.items[since.min(t.items.len())..] {
+        let Item::Tool { block, .. } = i else { continue };
+        let Some(d) = t.details.get(block) else { continue };
+        for e in d.effects.iter().filter(|e| e.kind != "wait") {
+            let kind = steps::effect_kind(e);
+            let doing = e.doing.trim().trim_end_matches('\u{2026}').trim_end_matches("...").trim();
+            let words = match e.status.as_str() {
+                "running" if !doing.is_empty() => doing.to_owned(),
+                "running" => step_words(e),
+                "error" => steps::tried(doing, &e.done),
+                _ if e.done.is_empty() => step_words(e),
+                _ => e.done.clone(),
+            };
+            all.push(PopLine::Step(kind, StepWords::of(&words, &e.target, e.kind == "exec" || e.kind == "build")));
+        }
+    }
+    if all.is_empty() {
+        return all;
+    }
+    let cut = all.len().saturating_sub(POP_STEPS);
+    let mut out = Vec::new();
+    if cut > 0 {
+        out.push(PopLine::Meta(format!("{cut} earlier step{}", if cut == 1 { "" } else { "s" })));
+    }
+    out.extend(all.into_iter().skip(cut));
+    out
+}
+
+/// A sub-agent's card: its name, its model and effort and how long it ran, then what it does now, else the last thing
+/// it said (a few lines).
+fn agent_pop(name: &str, state: &str, t: Option<&Transcript>, model: &str, effort: &str, ran: Option<u64>) -> Vec<PopLine> {
+    let model = t.map(|t| t.model.as_str()).filter(|m| !m.is_empty()).unwrap_or(model);
+    // Its name as the agent lists it ("Opus 5.5"), when it did.
+    let model = t.and_then(|t| t.models.iter().find(|c| c.is(model))).map_or(model, |c| if c.name.is_empty() { model } else { c.name.as_str() });
+    let effort = t.map(|t| t.effort.as_str()).filter(|e| !e.is_empty()).unwrap_or(effort);
+    let ran = ran.map(ran_for).unwrap_or_default();
+    let how = match state {
+        "running" => running_for(&ran),
+        "waiting" => "Waiting for input".to_owned(),
+        "failed" => if ran.is_empty() { "Failed".to_owned() } else { format!("Failed after {ran}") },
+        _ => if ran.is_empty() { "Done".to_owned() } else { format!("Done in {ran}") },
+    };
+    let mut out = vec![PopLine::Head(name.to_owned()), PopLine::Meta(meta(&[model, effort, &how]))];
+    let Some(t) = t else { return out };
+    let doing = (state == "running").then(|| turn_chip_words(t)).flatten();
+    let said = t.items.iter().rev().find_map(|i| match i {
+        Item::Text { text, .. } if !text.trim().is_empty() => Some(text.as_str()),
+        _ => None,
+    });
+    match (doing, said) {
+        (Some(d), _) => out.push(PopLine::Text(d)),
+        (None, Some(s)) => out.push(PopLine::Text(clip_lines(s.trim(), POP_LINES, POP_CHARS))),
+        (None, None) => {}
+    }
+    out
+}
+
+/// What a sub-agent's turn in flight does now, in a few words ("Now: cargo build"), None when it says nothing yet.
+fn turn_chip_words(t: &Transcript) -> Option<String> {
+    let since = turn_start(t);
+    t.items[since..].iter().rev().find_map(|i| match i {
+        Item::Tool { block, input, name, result: None, .. } => Some(match t.details.get(block).and_then(|d| d.effects.iter().rev().find(|e| e.status == "running")) {
+            Some(e) => step_words(e),
+            None => {
+                let arg = model::chat::main_arg(input);
+                if arg.is_empty() { name.clone() } else { arg }
+            }
+        }),
+        Item::Thinking { done: false, .. } => Some("Thinking".to_owned()),
+        Item::Text { done: false, text, .. } => Some(clip_lines(text.trim(), POP_LINES, POP_CHARS)).filter(|s| !s.is_empty()).or(Some("Writing".to_owned())),
+        _ => None,
+    }).map(|s| if s.contains('\n') { s } else { format!("Now: {s}") })
+}
+
+/// The card of the activity chip under the pointer (or the one whose card the pointer crossed onto), over it in
+/// `pop` (the foot's `activity_pop` overlay slot): a ui.Menu, its lines by key. None while the pointer is elsewhere.
+fn fill_activity_pop(pop: View<'_>, strip: View<'_>, chips: &[Chip]) {
+    let w = pop.entity().world();
+    let hovered = w.entity_named(APP).target(Hovered::id(), 0);
+    let plate = pop.part("plate");
+    let under = |id: u64| hovered.is_some_and(|h| std::iter::successors(Some(h), |n| n.parent()).take(64).any(|n| *n.id() == id));
+    // The chip its card is open on, while the pointer is on the card.
+    let held = plate.filter(|p| under(p.id())).and_then(|p| p.entity().target(harness_native_ui_layout_api::AnchoredTo::id(), 0)).map(|t| *t.id());
+    let on = |chip: View<'_>| {
+        let id = chip.id();
+        under(id) || held == Some(id) || plate.is_some_and(|p| view::bridged(w.entity_from_id(id), p.entity()))
+    };
+    let shown = chips.iter().find_map(|c| strip.part(&c.key).filter(|v| on(*v)).map(|v| (v, c))).filter(|(_, c)| !c.pop.is_empty());
+    view::for_each_of(pop, shown.map(|_| ("plate", "hn.ChatActivityPop", ())), |_, (), _| {});
+    let (Some(plate), Some((chip, c))) = (pop.part("plate"), shown) else { return };
+    plate.anchored(chip.id());
+    let lines = c.pop.iter().enumerate().map(|(i, l)| {
+        let prefab = match l {
+            PopLine::Head(_) => "hn.ChatActivityPopHead",
+            PopLine::Meta(_) => "hn.ChatActivityPopMeta",
+            PopLine::Text(_) => "hn.ChatActivityPopText",
+            PopLine::Step(..) => "hn.ChatActivityPopStep",
+        };
+        (format!("{}{i}", c.key), prefab, l)
+    });
+    view::for_each_of(plate, lines, |v, l, _| match l {
+        PopLine::Head(s) | PopLine::Meta(s) | PopLine::Text(s) => {
+            v.text(s);
+        }
+        PopLine::Step(kind, s) => {
+            if let Some(i) = v.part("icon") {
+                i.icon(&steps::kind_glyph(w, kind));
+            }
+            if let Some(t) = v.part("words") {
+                t.text(&s.verb);
+            }
+            if let Some(t) = v.part("what") {
+                t.text(&s.what);
+                let mode = harness_native_ui_text_api::Truncate { mode: if s.path { harness_native_ui_text_api::TruncateMode::Middle } else { harness_native_ui_text_api::TruncateMode::Tail } };
+                if t.entity().try_cloned::<&harness_native_ui_text_api::Truncate>() != Some(mode) {
+                    t.entity().set(mode);
+                }
+            }
+        }
+    });
+}
+
 /// The remove button's glyph on a pasted picture (codicon's close).
 const REMOVE_ICON: &str = "\u{EA76}";
 
@@ -2595,16 +3305,27 @@ fn fill_row(row: View<'_>, r: &Row, ctx: &RowCtx<'_>, measure: &mut Measure<'_>)
         }
     };
     match r {
-        Row::User(s, _) => {
+        Row::User(s, _, steps) => {
             if let Some(t) = row.part("bubble").and_then(|b| b.part("text")) {
                 t.text(s);
             }
+            // A finished turn's steps button: shows the steps folded away under the message, or folds them again.
+            if let Some(slot) = row.part("steps") {
+                view::for_each_of(slot, steps.as_ref().map(|s| ("b", "hn.ChatTurnSteps", s)), |b, (key, open), _| {
+                    b.action(&format!("chat:turn:{}:{key}", ctx.sid));
+                    tooltip(b, if *open { "Hide steps" } else { "Show steps" });
+                });
+            }
         }
+        // Filled by the app after the stack (chat/peek.rs fill_card), as a hover card is.
+        Row::RefCard(_) => {}
         Row::Pictures(images, _) => {
             let h = crate::look::width(row.entity().world(), "chat_sent_tall");
             fill_pictures(row, images, ctx.sizes, h, "hn.ChatSentPicture", None);
         }
         Row::Prose(s) | Row::Heading(_, s) | Row::Quote(s) | Row::Note(s) | Row::Error(s) => text("text", s),
+        // The formula alone, as inline markdown sets it in display style.
+        Row::Math(tex) => text("text", &format!("$${tex}$$")),
         Row::ListItem { depth, mark, text: s } => {
             text("mark", mark);
             text("text", s);
@@ -3001,7 +3722,7 @@ mod tests {
             t.apply(&harness_proto::event::Event::from_json(l).unwrap());
         }
         let (fold, cut) = (HashMap::new(), HashMap::new());
-        let (rows, nested) = rows_nested(&t, Shows { fold: &fold, cut: &cut });
+        let (rows, nested) = rows_nested(&t, Shows { fold: &fold, cut: &cut, all: true });
         let kinds: Vec<(&str, &str)> = rows.iter().map(|(k, r)| (k.as_str(), r.prefab())).collect();
         assert_eq!(kinds[1].1, "hn.StepLineFailed", "{kinds:?}");
         assert!(matches!(&rows[1].1, Row::Steps(l) if !l.open && !l.why.is_empty() && l.words.contains("couldn't")), "{kinds:?}");
@@ -3011,15 +3732,84 @@ mod tests {
         assert_eq!(rows.len(), 4, "user, run, view, prose: {kinds:?}");
         // Opened, its cells' outputs show; the table only as its folded preview.
         let key = rows[1].0.clone();
-        let opened = super::rows(&t, Shows { fold: &HashMap::from([(key, true)]), cut: &cut });
+        let opened = super::rows(&t, Shows { fold: &HashMap::from([(key, true)]), cut: &cut, all: true });
         let shown: Vec<&str> = opened.iter().map(|(_, r)| r.prefab()).collect();
         assert!(opened.iter().any(|(_, r)| matches!(r, Row::Out(steps::Out::Value { open: false, .. }))), "{shown:?}");
         assert!(!opened.iter().any(|(_, r)| matches!(r, Row::Grid { .. })), "{shown:?}");
         // The view's code button shows the cell's code under the view.
         let code = HashMap::from([(code_key("d"), true)]);
         let cut = HashMap::new();
-        let shown = super::rows(&t, Shows { fold: &code, cut: &cut });
+        let shown = super::rows(&t, Shows { fold: &code, cut: &cut, all: true });
         assert!(matches!(&shown[3].1, Row::Code { lang, .. } if lang == "ts"), "{:?}", shown.iter().map(|(_, r)| r.prefab()).collect::<Vec<_>>());
+        // By default a finished turn is its message (its steps button standing for how it got there), the view a cell drew,
+        // and its answer; opened, its line (naming what failed) shows, and the steps nested under it.
+        let fold = HashMap::new();
+        let (turned, nested) = rows_nested(&t, Shows { fold: &fold, cut: &cut, all: false });
+        let kinds: Vec<&str> = turned.iter().map(|(_, r)| r.prefab()).collect();
+        assert_eq!(turned.len(), 3, "message, view, answer (the turn's line folded away): {kinds:?}");
+        assert!(matches!(&turned[0].1, Row::User(_, _, Some((k, false))) if k == "turn:0"), "its steps button: {kinds:?}");
+        assert!(matches!(&turned[1].1, Row::Ui { block, .. } if block == "d"), "{kinds:?}");
+        assert!(matches!(&turned[2].1, Row::Prose(s) if s == "Done."), "{kinds:?}");
+        assert!(nested.is_empty());
+        let open = HashMap::from([("turn:0".to_owned(), true)]);
+        let (all, nested) = rows_nested(&t, Shows { fold: &open, cut: &cut, all: false });
+        assert!(matches!(&all[1].1, Row::Steps(l) if l.key == "turn:0" && l.open && l.words.contains("couldn't")), "opened, its line names what failed");
+        assert!(all.iter().any(|(k, r)| matches!(r, Row::Steps(_)) && k.starts_with("run:") && nested.contains(k)), "opened, its run shows nested");
+        assert_eq!(all.last().map(|(_, r)| r.prefab()), Some("hn.ChatProse"), "the answer stays last");
+    }
+
+    /// How long something ran reads as a person says it, and the turn's chip names the step its cell is on (a command
+    /// by what it runs), never the tool, with how long that step has run.
+    #[test]
+    fn the_turn_chip_names_the_step_and_its_time() {
+        assert_eq!([ran_for(12_000), ran_for(80_000), ran_for(360_000), ran_for(3_900_000)], ["12 s", "1 min 20 s", "6 min", "1 h 5 min"]);
+        let lines = [
+            serde_json::json!({"ev": "session", "agent": "claude", "model": "m"}),
+            serde_json::json!({"ev": "user", "text": "check it", "ts": 1_000}),
+            serde_json::json!({"ev": "busy", "busy": true, "ts": 1_000}),
+            serde_json::json!({"ev": "tool_call", "block": "c", "name": "mcp__harness__ts", "input": {"code": "await follow('blaze check')"}, "ts": 2_000}),
+            serde_json::json!({"ev": "tool_detail", "block": "c", "cell": "repl.t1", "status": "running", "code": "",
+                "effects": [{"kind": "read", "doing": "Reading a.rs", "done": "Read a.rs", "status": "ok"},
+                            {"kind": "exec", "doing": "Running blaze check", "target": "cd /x && blaze check", "status": "running", "started_ms": 4_000}]}),
+            serde_json::json!({"ev": "user", "text": "and then land it", "ts": 5_000}),
+            serde_json::json!({"ev": "busy", "busy": true, "ts": 5_000}),
+        ];
+        let mut t = Transcript::default();
+        for l in &lines {
+            t.apply(&harness_proto::event::Event::from_json(l).unwrap());
+        }
+        let c = turn_chip(&t, 4_000 + 360_000);
+        assert_eq!((c.words.as_str(), c.took.as_str()), ("blaze check", "6 min"));
+        assert!(c.pop.iter().any(|l| matches!(l, PopLine::Step(_, s) if s.verb == "Read a.rs")), "its card lists the steps so far");
+        assert!(
+            c.pop.iter().any(|l| matches!(l, PopLine::Step(_, s) if s.verb == "Running" && s.what == "blaze check" && !s.path)),
+            "a command: its verb in words, what it runs in the code face"
+        );
+        let read = StepWords::of("Read /Volumes/x/crates/a.rs", "/Volumes/x/crates/a.rs", false);
+        assert_eq!((read.verb.as_str(), read.what.as_str(), read.path), ("Read", "/Volumes/x/crates/a.rs", true), "a path, cut in its middle");
+        let failed = StepWords::of("Couldn't run git -C /x fetch", "git -C /x fetch", true);
+        assert_eq!((failed.verb.as_str(), failed.what.as_str()), ("Couldn't run", "git -C /x fetch"));
+        // The message sent meanwhile waits over the composer, not in the transcript, until Claude takes it.
+        assert_eq!(t.queued, vec![2]);
+        let (fold, cut) = (HashMap::new(), HashMap::new());
+        let shown = rows(&t, Shows { fold: &fold, cut: &cut, all: false });
+        assert!(!shown.iter().any(|(_, r)| matches!(r, Row::User(s, ..) if s == "and then land it")));
+    }
+
+    /// A pull request or issue said alone, as its own paragraph once its words are whole, is its card; in a sentence, or
+    /// next to other words, it stays a chip in the prose.
+    #[test]
+    fn a_ref_alone_is_its_card() {
+        let mut out = Vec::new();
+        blocks("Landed it:\n\n<PR repo=\"indexable-inc/blaze\" n={1904} />\n\nSee <PR repo=\"a/b\" n={2} /> too.", false, &mut out);
+        let kinds: Vec<&str> = out.iter().map(Row::prefab).collect();
+        assert_eq!(kinds, ["hn.ChatProse", "hn.ChatRefCard", "hn.ChatProse"], "{kinds:?}");
+        assert!(alone_ref("<Issue repo=\"a/b\" n={3}>the bug</Issue>"));
+        assert!(!alone_ref("<PR repo=\"a/b\" n={1} /> and <PR repo=\"a/b\" n={2} />"));
+        assert!(!alone_ref("<Path loc=\"/x\" />"), "only a pull request or issue has a card");
+        let mut live = Vec::new();
+        blocks("<PR repo=\"a/b\" n={1} />", true, &mut live);
+        assert_eq!(live.iter().map(Row::prefab).collect::<Vec<_>>(), ["hn.ChatProse"], "still streaming, a chip until it is whole");
     }
 
     #[test]
@@ -3038,6 +3828,25 @@ mod tests {
 - [x] done", false, &mut out);
         let kinds: Vec<&str> = out.iter().map(Row::prefab).collect();
         assert_eq!(kinds, ["hn.ChatItemNumber", "hn.ChatItemNumber", "hn.ChatItemTask", "hn.ChatItemTask"]);
+    }
+
+    /// A displayed formula on lines of its own (`$$…$$`, `\[…\]`, one line or several) or in a ```math fence is a row of its
+    /// own, breaking the paragraph round it; one RaTeX cannot read is a card of its source, as a ```latex fence always is;
+    /// `$$` inside a sentence, or one not closed yet, stays in the words.
+    #[test]
+    fn displayed_math_is_a_row_of_its_own() {
+        let src = "Take $x$:\n$$\n\\frac{a}{b}\n$$\nso\n\n\\[ x^2 \\]\n\n```math\n\\sum_i i\n```\n\n```latex\nx^2\n```\n\n$$\\frac{1}{$$\n\nsay $$x$$ here";
+        let mut out = Vec::new();
+        blocks(src, false, &mut out);
+        let kinds: Vec<&str> = out.iter().map(Row::prefab).collect();
+        assert_eq!(kinds, ["hn.ChatProse", "hn.ChatMath", "hn.ChatProse", "hn.ChatMath", "hn.ChatMath", "hn.ChatCode", "hn.ChatCode", "hn.ChatProse"]);
+        let tex: Vec<&str> = out.iter().filter_map(|r| if let Row::Math(t) = r { Some(t.as_str()) } else { None }).collect();
+        assert_eq!(tex, ["\\frac{a}{b}", "x^2", "\\sum_i i"]);
+        assert!(matches!(&out[6], Row::Code { lang, text } if lang == "latex" && text == "\\frac{1}{"), "{:?}", out[6].prefab());
+        assert_eq!(out[1].markdown().as_deref(), Some("$$\n\\frac{a}{b}\n$$"), "copied whole as its source");
+        let mut live = Vec::new();
+        blocks("so\n\n$$\n\\frac{a}{", true, &mut live);
+        assert_eq!(live.iter().map(Row::prefab).collect::<Vec<_>>(), ["hn.ChatProse", "hn.ChatProse"], "unclosed, its words for now");
     }
 
     /// A markdown table becomes one table row: typed cells, its alignment, numbers at the end; while it streams, its last

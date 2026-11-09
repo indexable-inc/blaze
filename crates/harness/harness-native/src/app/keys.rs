@@ -292,6 +292,8 @@ impl App {
     /// A Command key from the window's key equivalents (or the shot): what came of it.
     pub fn shortcut(&mut self, code: u16, unshifted: Option<char>, m: KeyMods) -> Outcome {
         self.poke();
+        // A Command key closes an open row menu (row_menu.rs) and goes on to its binding.
+        self.row_menu_close();
         Chord::of(code, unshifted, m).map_or(Outcome::None, |c| self.dispatch(&c))
     }
 
@@ -325,5 +327,10 @@ impl App {
     /// The hint of the binding that runs the action named `name` (`SpawnShell`: `⌘N`), or nothing.
     pub(super) fn hint(&self, name: &str) -> String {
         self.keymap.hint_of(name)
+    }
+
+    /// Every key that runs the action named `name`, as one hint (`⎋ or ⌘.`), or nothing.
+    pub(super) fn hints(&self, name: &str) -> String {
+        self.keymap.hints_of(name).join(" or ")
     }
 }

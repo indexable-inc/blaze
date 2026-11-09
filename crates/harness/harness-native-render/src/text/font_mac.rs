@@ -3,6 +3,7 @@
 //! Apple's tracking in it), hands over their tables to shape from (`CTFontCopyTable`), and CoreGraphics rasterises
 //! glyphs and formula outlines for the atlas. Shaping, breaking, bidi, carets and hits are den's own (text/shaper.rs).
 use super::font::FontSource;
+use crate::math::PathSeg;
 use objc2_core_foundation::{
     CFArray, CFData, CFDictionary, CFNumber, CFRange, CFRetained, CFString, CFType,
     CGAffineTransform, CGFloat, CGPoint, CGRect, CGSize,
@@ -560,8 +561,62 @@ fn context(buf: &mut [u8], w: usize, h: usize, px: usize) -> Option<CFRetained<C
     CGContext::set_should_antialias(Some(&ctx), true);
     CGContext::set_allows_antialiasing(Some(&ctx), true);
     // No font smoothing: it thickens every stem (0.15 px a side at 16 px to the em), and den's text is a browser's
-    // with `-webkit-font-smoothing: antialiased`, as the brand site sets it (docs/research/colour-pipeline.md).
+    // with `-webkit-font-smoothing: antialiased`, as the brand site sets it (fed1eb428d:docs/research/colour-pipeline.md).
     CGContext::set_allows_font_smoothing(Some(&ctx), false);
     CGContext::set_should_smooth_fonts(Some(&ctx), false);
     Some(ctx)
+}
+
+/// [`super::font::fill_outline`] with CoreGraphics: a filled outline even-odd, each piece (from one move to the next) on its
+/// own as RaTeX's renderer fills them, or stroked `stroke` ems wide.
+#[allow(clippy::too_many_arguments)]
+pub fn fill_outline(segs: &[PathSeg], fill: bool, stroke: f32, buf: &mut [u8], w: usize, h: usize, x0: i32, y0: i32, s: f64, subx: f64) {
+    let Some(ctx) = context(buf, w, h, 1) else { return };
+    CGContext::set_gray_fill_color(Some(&ctx), 1.0, 1.0);
+    CGContext::set_gray_stroke_color(Some(&ctx), 1.0, 1.0);
+    CGContext::translate_ctm(Some(&ctx), -f64::from(x0), -f64::from(y0));
+    CGContext::translate_ctm(Some(&ctx), subx, 0.0);
+    CGContext::scale_ctm(Some(&ctx), s, -s);
+    let pt = |p: [f32; 2]| (f64::from(p[0]), f64::from(p[1]));
+    let mut open = false;
+    let finish = |ctx: &CGContext, open: &mut bool| {
+        if *open {
+            if fill {
+                CGContext::eo_fill_path(Some(ctx));
+            } else {
+                CGContext::stroke_path(Some(ctx));
+            }
+            *open = false;
+        }
+    };
+    CGContext::set_line_width(Some(&ctx), f64::from(stroke));
+    CGContext::begin_path(Some(&ctx));
+    for seg in segs {
+        match *seg {
+            PathSeg::Move(a) => {
+                // A filled outline's pieces are filled one at a time: where they overlap they must not cancel.
+                if fill {
+                    finish(&ctx, &mut open);
+                    CGContext::begin_path(Some(&ctx));
+                }
+                let (x, y) = pt(a);
+                CGContext::move_to_point(Some(&ctx), x, y);
+                open = true;
+            }
+            PathSeg::Line(a) => {
+                let (x, y) = pt(a);
+                CGContext::add_line_to_point(Some(&ctx), x, y);
+            }
+            PathSeg::Quad(a, b) => {
+                let ((cx, cy), (x, y)) = (pt(a), pt(b));
+                CGContext::add_quad_curve_to_point(Some(&ctx), cx, cy, x, y);
+            }
+            PathSeg::Cubic(a, b, c) => {
+                let ((c1x, c1y), (c2x, c2y), (x, y)) = (pt(a), pt(b), pt(c));
+                CGContext::add_curve_to_point(Some(&ctx), c1x, c1y, c2x, c2y, x, y);
+            }
+            PathSeg::Close => CGContext::close_path(Some(&ctx)),
+        }
+    }
+    finish(&ctx, &mut open);
 }

@@ -1,4 +1,4 @@
-//! Who waits for whom, for every driver of the process at once (docs/v2/plan/lanes/sched.md):
+//! Who waits for whom, for every driver of the process at once (docs/v2/plan/design/fibers.md):
 //! a job waits for another job's end, a key's flight (and so its claimer) or a counter (every
 //! job counted towards it). A wait that would close a cycle is refused with the [`Cycle`]. One
 //! graph spans every driver, so a cycle through jobs of two pools is seen as one of a single

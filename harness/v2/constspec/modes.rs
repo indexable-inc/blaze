@@ -1,6 +1,6 @@
 //! The program `harness/v2/constspec.py` times: hot loops that branch on an argument each call
 //! passes as a constant, which `hir-ty-mir`'s `Specialize` gives a copy of the callee knowing
-//! it (docs/v2/plan/lanes/codegen/constspec.md). One callee of each kind of parameter a copy may
+//! it (docs/v2/plan/design/constspec.md). One callee of each kind of parameter a copy may
 //! know (an enum, a `bool`, an integer compared with 0), each called with several values so no
 //! constant reaches the callee by interprocedural propagation alone, and one called once an
 //! element from the caller's loop, where unswitching the callee's loop cannot help.

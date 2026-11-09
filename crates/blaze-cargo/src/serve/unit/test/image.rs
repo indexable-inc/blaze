@@ -1,4 +1,4 @@
-//! A test binary as blaze-testsel selects its tests (docs/v2/plan/lanes/fastcompile/select.md):
+//! A test binary as blaze-testsel selects its tests (docs/v2/plan/design/compile-time.md):
 //! its execution table, made beside its link and kept with its record ([`table`]), the
 //! [`Image`] a selector reads it as ([`image`]), what a test executed as a [`Record`]
 //! ([`record`]), and the daemon's one [`Selector`] per suite ([`Selectors`]).

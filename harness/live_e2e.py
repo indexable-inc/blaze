@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Live edits end to end under blaze v2: a running dev program takes each edit of a function as a
-patch applied in place, from the daemon's code memory (docs/v2/plan/lanes/fastcompile/inproc.md).
+patch applied in place, from the daemon's code memory (docs/v2/plan/design/compile-time.md).
 
 usage: live_e2e.py '<json>'   (or a path to a JSON file, or - for stdin)
 

@@ -646,7 +646,7 @@ fn empty(dir: &Path) -> Result<(), String> {
 ///
 /// An entry's kind is the listing's (`d_type`), so a directory costs no call of its own, and a
 /// file is opened once, its mode and length read on the descriptor: open, fstat, two reads and
-/// close, the path resolved once (docs/v2/plan/lanes/usercode/speed-of-light.md, "A run's
+/// close, the path resolved once (docs/v2/plan.md, "A run's
 /// `OUT_DIR`").
 pub fn collect(dir: &Path) -> Result<Vec<OutFile>, String> {
     use std::io::Read as _;

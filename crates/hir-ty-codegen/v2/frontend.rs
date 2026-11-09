@@ -1040,7 +1040,7 @@ impl HirInstance {
     /// `body`'s ([`code_of`]: `body` itself, a closure or coroutine written in it, the start
     /// of a `main` that is it, a shim adapting it), or its type arguments name a closure or
     /// coroutine written in it (`block_on::<its future>`, its drop glue). No other instance's
-    /// key reads a body (docs/v2/plan/lanes/firewall/notes.md).
+    /// key reads a body (docs/v2/plan/design/item-hash.md).
     pub fn of_body(&self, db: &Db, body: DefWithBodyId) -> bool {
         let instance = match &self.0 {
             Kind::Code(instance, _) => instance,

@@ -1,5 +1,5 @@
 //! What a sandbox saw a program read, from the line it notes as each read happens to the
-//! [`Traced`] its result is keyed by (docs/v2/plan/lanes/usercode/notes.md, "The record").
+//! [`Traced`] its result is keyed by (docs/v2/plan.md, "The record").
 //!
 //! A sandbox appends one [`Line`] per thing it saw, as it sees it, to the run's live record:
 //! a warm process (a proc-macro server, a fork server) serves many requests, each bracketed by

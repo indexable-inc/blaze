@@ -1,4 +1,4 @@
-//! The queries of the per-module resolver (`docs/v2/plan/lanes/frontend/nameres.md` §3,
+//! The queries of the per-module resolver (`docs/v2/plan/design/frontend.md` §3,
 //! `nameres-core.md` §3). Every key is content (crate, round, module, anchor module), never a
 //! dense index, and every key's `Debug` names its module. Each query here is a thin entry; the
 //! work is in `collect`, `unit`, `macros` and `driver`.

@@ -25,7 +25,7 @@ After every kill a new daemon starts in the same home (half the time with the VF
 the database's image the kill left, half the time with the store alone): it has to open the
 store, and its build has to print what blaze's build from nothing prints. A store it refuses
 to open is a finding: a kill at any moment leaves a store whose head names only whole bytes
-(docs/v2-store.md, "A group commit").
+(docs/v2/plan/design/store.md, "A group commit").
 """
 import os, random, shutil, sys, threading, time
 from dataclasses import dataclass

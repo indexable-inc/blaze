@@ -43,6 +43,19 @@ pub fn run(path: &str) -> Result<(), String> {
     if let Some(h) = std::env::var("HARNESS_NATIVE_SHOT_HEADROOM").ok().and_then(|s| s.trim().parse::<f32>().ok()) {
         app.headroom = harness_native_render::hdr::Headroom { current: h, potential: h, reference: 0.0 };
     }
+    // HARNESS_NATIVE_SHOT_WORKING `think,run,edit,read,agent` (any of them, in any order; `all` for those five): every
+    // session row shows at work, its title's sheen at those paces in turn down the tree, and every run row at a command's,
+    // so a shot catches a sweep with nothing really at work. With HARNESS_NATIVE_SHOT_SEQ the frames show it moving.
+    if let Ok(v) = std::env::var("HARNESS_NATIVE_SHOT_WORKING") {
+        const PACES: [&str; 5] = ["think", "run", "edit", "read", "agent"];
+        app.shot_working = if v.trim() == "all" {
+            PACES.to_vec()
+        } else {
+            v.split(',')
+                .map(|p| PACES.into_iter().find(|k| *k == p.trim()).ok_or_else(|| format!("HARNESS_NATIVE_SHOT_WORKING={v}: {p:?} is not one of {PACES:?} or all")))
+                .collect::<Result<_, _>>()?
+        };
+    }
     if std::env::var("HARNESS_NATIVE_SIDEBAR").as_deref() == Ok("0") {
         app.fold_sidebar_now();
     }
@@ -58,6 +71,11 @@ pub fn run(path: &str) -> Result<(), String> {
     // HARNESS_NATIVE_SHOT_OPEN `<url>|<path>`: opened as a press on a link to it would (the browser pane on the right).
     if let Ok(t) = std::env::var("HARNESS_NATIVE_SHOT_OPEN") {
         app.open_target(&t, false);
+    }
+    // HARNESS_NATIVE_SHOT_FIXTURE <json>: a recorded world (the daemon's list and runs, chats' events) instead of the
+    // daemon's (App::shot_fixture); run with a private HARNESS_HOME and no daemon.
+    if let Ok(f) = std::env::var("HARNESS_NATIVE_SHOT_FIXTURE") {
+        app.shot_fixture(&f)?;
     }
     // A session id, a run (`r12`) or one of its stages (`r12.0`).
     if let Ok(s) = std::env::var("HARNESS_NATIVE_SHOT_SELECT") {
@@ -75,6 +93,11 @@ pub fn run(path: &str) -> Result<(), String> {
                 app.shot_chat_pick(sid, &page);
             }
         }
+    }
+    // HARNESS_NATIVE_SHOT_PLAN `5h=0.08,week=0.79` (a `!` after a share: refused): every chat's status bar shows that plan
+    // as if its agent had reported it (src/app/chat/plan.rs), so a shot shows the plan meter before any agent has.
+    if let Ok(spec) = std::env::var("HARNESS_NATIVE_SHOT_PLAN") {
+        app.set_shot_plan(&spec)?;
     }
     // HARNESS_NATIVE_SHOT_CHROME `strip,title_x`: a title-bar strip as the window would report it (points), so the title
     // bar and its subtitle show; HARNESS_NATIVE_SHOT_UNFOCUSED: drawn as a window that is not key (the title dimmed).
@@ -122,6 +145,12 @@ pub fn run(path: &str) -> Result<(), String> {
         .filter(|v| v.len() == 3)
         .collect();
     let mut hovered: Option<(f32, f32)> = None;
+    // HARNESS_NATIVE_SHOT_ROW_MENU `x,y,t[,ctrl]`: a right press on the sidebar row at (x, y) (window points) at t seconds
+    // (with a fourth value of 1, a control-click instead), handed on as the window hands one: that row's menu opens at the
+    // point (src/app/row_menu.rs), and what it offers is logged. HARNESS_NATIVE_SHOT_KEY `none+down,t` then moves its
+    // highlight, `none+return,t` runs it, `none+escape,t` closes it.
+    let mut row_menu =
+        std::env::var("HARNESS_NATIVE_SHOT_ROW_MENU").ok().map(|s| nums(&s)).filter(|v| v.len() == 3 || v.len() == 4);
     // HARNESS_NATIVE_SHOT_KEY `k,t`: Command-k at t seconds, into this offscreen app only (`w,2.4`: archive the selected
     // object, which kills its session). With a `+`, the keys as a binding names them: `cmd+shift+t,1.5`, `none+down,2`
     // (`none+` a key with no modifiers: a tree arrow, the palette's Return), dispatched as the window would.
@@ -230,6 +259,17 @@ pub fn run(path: &str) -> Result<(), String> {
         }
         if let Some((text, _)) = typed.take_if(|k| t >= k.1) {
             app.commit_text(&text);
+        }
+        if let Some(v) = row_menu.take_if(|v| t >= v[2]) {
+            let (b, m) = if v.get(3).is_some_and(|c| *c != 0.0) {
+                (left, crate::app::KeyMods { ctrl: true, ..none })
+            } else {
+                (crate::term::Button::Right, none)
+            };
+            app.pointer_move(v[0], v[1], m);
+            app.pointer_down(v[0], v[1], b, 1, m);
+            app.pointer_up(v[0], v[1], b, m);
+            eprintln!("harness-native: shot row menu at {},{}: {}", v[0], v[1], app.row_menu_line());
         }
         while keys.first().is_some_and(|k| t >= k.1) {
             let (k, _) = keys.remove(0);

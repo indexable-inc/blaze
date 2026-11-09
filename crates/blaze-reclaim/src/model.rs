@@ -1,4 +1,4 @@
-//! Model tests (docs/v2/plan/lanes/safety/model.md) of the slots, `enter`/`Guard`, `Grace`,
+//! Model tests (docs/v2/plan/design/model-checker.md) of the slots, `enter`/`Guard`, `Grace`,
 //! `Horizon` and `Limbo`, from 2 or 3 threads under every interleaving to the preemption bound and every
 //! value C11 lets a load read. A retired value holds a tracked cell its readers read and its
 //! drop writes, so a free not ordered after a read is a data race the checker reports. What

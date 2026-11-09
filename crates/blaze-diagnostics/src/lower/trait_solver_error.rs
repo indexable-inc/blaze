@@ -21,7 +21,7 @@
 //! rustc never reports as unmet, the old solver's errors the next solver never gives, and an
 //! E0271 whose local impl blaze cannot pick (a generic one, or two for the same self type: the
 //! front end does not give the impl selected). Not given yet (requested in
-//! `docs/v2/requests/diagnostics-infer2-solver.md`): E0271's label where what the alias normalized to
+//! `fed1eb428d:docs/v2/requests/diagnostics-infer2-solver.md`): E0271's label where what the alias normalized to
 //! equals the goal's term (rustc's original type error), a bound on a closure to return itself,
 //! an impl's `#[diagnostic::on_const]` (a blaze error), and rustc's shortening of a requirement
 //! longer than 50 characters. A `[const] Trait` bound whose impl is not `const` gets "trait

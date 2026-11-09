@@ -3,7 +3,7 @@
 //! while that compile is under way goes on with its other functions and then waits for that one
 //! function; one that asks after takes the shape the memo keeps its template under, and prepares
 //! nothing. Two proc macros of a job that both reach `syn`'s parser compile it once
-//! (docs/v2/plan/lanes/compile-time-sched/notes.md).
+//! (docs/v2/plan/design/compile-time.md).
 //!
 //! A function's compile is a run of the scheduler's ([`pump::Flights`]) under its flight key,
 //! from the moment a build asks for it until it lands ([`Flights::ask`]): one function, never a

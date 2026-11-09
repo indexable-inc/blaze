@@ -1,5 +1,5 @@
 //! [`crate::Effect::Stamp`] and [`crate::Effect::Entries`] on Windows: what a file is now, as
-//! much as a sweep compares (docs/v2/plan/lanes/frontend/journal/windows.md).
+//! much as a sweep compares (docs/v2/plan/design/restore.md).
 //!
 //! A name is stamped by a handle that asks for its attributes only, with every opener let in
 //! and a link or junction opened itself: its file index (the NTFS file reference number), its

@@ -1,6 +1,6 @@
 """pure_scripts.py: build scripts proved pure from their MIR, checked and timed
-(docs/v2/plan/lanes/pure-scripts/design.md section 8; how to run it and read it:
-docs/v2/plan/lanes/pure-scripts/measure.md). A script is pure when its whole call graph only reads
+(docs/v2/plan.md section 8; how to run it and read it:
+docs/v2/plan.md). A script is pure when its whole call graph only reads
 cargo's variables and its package's files, writes its `OUT_DIR` and prints; its result is then kept
 under a key of its code's identity and those inputs, and found there before it is compiled.
 

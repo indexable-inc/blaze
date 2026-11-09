@@ -1,7 +1,7 @@
 //! blaze's HIR, typed by blaze's inference, lowered into Verus's VIR: the port of
 //! `rust_verify`'s `rust_to_vir` (`rust_to_vir_func.rs`'s `check_item_fn` and
 //! `rust_to_vir_expr.rs`'s `expr_to_vir`), rule by rule, for the slice
-//! docs/v2/plan/lanes/verus.md lists: a free, non-generic function over integers and booleans,
+//! docs/v2/plan/design/verus.md lists: a free, non-generic function over integers and booleans,
 //! with `requires`, `ensures` (and a named return), `decreases`, `let`, assignment, `if`,
 //! `loop` and `while` with `invariant`, `ensures` and `decreases`, `break`, `continue` and
 //! `return`. Anything else is an [`Unsupported`] naming the construct and where it is, never a
@@ -323,7 +323,7 @@ pub(crate) fn lower_function(db: &Db, func: FunctionId) -> Result<Lowered, Refus
         external_types: Vec::new(),     // alloc: VIR
         path_as_rust_names: Vec::new(), // alloc: VIR
         // Every target blaze builds for has 64-bit `usize`; this becomes the target's once
-        // `blaze check --verify` passes the target in (docs/v2/plan/lanes/verus.md).
+        // `blaze check --verify` passes the target in (docs/v2/plan/design/verus.md).
         arch: v::Arch { word_bits: v::ArchWordBits::Exactly(64) },
         opaque_types: Vec::new(), // alloc: VIR
     });

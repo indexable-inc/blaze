@@ -357,7 +357,7 @@ daemon did not serve it (#84).
 `memsplit.py` says what each process of the daemon holds (the daemon, the project's worker, the
 spare) and of what kind of page, once ready, once the daemon has built its own base and after
 edits, with `--env` to try an allocator setting
-([research/daemon-memory.md](research/daemon-memory.md#2026-10-23-the-own-base-and-the-allocator)).
+(research/daemon-memory.md).
 `spare.py` starts a daemon with a tiny project, then builds one of `bench.py`'s projects under it
 from an empty target directory and again once it has built it, for builds of blaze given as
 `--variant LABEL:BIN[:VAR=VALUE...]` in interleaved rounds: the second project's cold and warm
@@ -366,12 +366,12 @@ worker's default ([cargo.md](cargo.md#what-a-build-does)); v2 has no spare worke
 until ready, so it measures the build and the memory alone.
 `heap.py` gives a heap profile's bytes to the salsa query whose value or record holds them, and to
 blaze's own structures; `heapfold.py` makes of a profile on macOS what `jeprof --collapsed` makes
-of it on Linux, for `heap.py` to read ([research/daemon-memory.md](research/daemon-memory.md)); `heap.py --syntax`
+of it on Linux, for `heap.py` to read (research/daemon-memory.md); `heap.py --syntax`
 says what of it is syntax trees, of which kind and from which query, and `cpufold.py` folds a
 `perf script` the same way for time ([flat-syntax.md](flat-syntax.md)). `leanprof.py` runs a
 project's cold start, own base, edits and warm start as phases with the times they began and
 ended, and `cpufold.py --phases` cuts a `perf` profile of the run by them, with what salsa was
-revalidating and who asked ([research/lean-frontend.md](research/lean-frontend.md)). `realbench.py` times
+revalidating and who asked (research/lean-frontend.md). `realbench.py` times
 `blaze build` against `cargo build` on ripgrep, just and nushell (cold, no-op and
 three kinds of edit), each `blaze build` row saying from its `blaze-work` line how the daemon
 linked it; the numbers are in [results.md](results.md#11-real-projects). `coldprof.py`
@@ -386,7 +386,7 @@ times a start on a warm store with nothing of rustc's ([#41](https://github.com/
 a first checkout on an empty store, a second on the store it filled, that daemon stopped and
 started, and once more, each followed by a body edit and its undoing; it keeps what each worker
 said in `WORK/said-STEP.txt` and exits 1 when a program's output is not what blaze's run of its checkout from nothing prints
-([research/warm-start.md](research/warm-start.md)). Their docstrings say how to run them.
+(research/warm-start.md). Their docstrings say how to run them.
 `bench.py` on real projects, with `benchreport.py`, is also what writes the benchmark
 tables and the README's numbers: [benchmarks.md](benchmarks.md). It runs every blaze build
 under `--message-format=json` and reads how it linked, what it compiled and its steps' times
@@ -400,7 +400,7 @@ edits, in interleaved rounds: an edit's wall time, its steps' times from the `bl
 line's `steps_us`, the daemon's cycles and instructions (counters.py; the cold start's on macOS
 alone), the cold start, and the daemon's peak memory. v1's edit-to-binary time, from a worker's
 log, has no v2 counterpart and is gone. It is how the release build's
-profile was chosen ([reports/RELEASE-BUILD.md](reports/RELEASE-BUILD.md)), and with `--train` it
+profile was chosen (reports/RELEASE-BUILD.md), and with `--train` it
 is the training of its PGO. `hotpatch.py` times an edit of a running program under Dioxus's
 subsecond against `blaze build` and `cargo build` with a restart; its program is
 `harness/hotpatch`. `benchhistory.py` appends a run to `docs/benchmarks/history/` (what the
@@ -436,7 +436,7 @@ zed's libraries are in `.#bench-zed`, since every library directory slows each l
 
 ### The v2 proof
 
-`harness/v2/` proves blaze v2 ([v2/proof.md](v2/plan/lanes/proof.md)). Every script takes one typed JSON
+`harness/v2/` proves blaze v2 ([v2/proof.md](v2/plan.md)). Every script takes one typed JSON
 value with an `engine`, `{"kind": "v2", "blaze": PATH}` (`Engine.of` refuses `"v1"`, whose
 worker logs and `ready` lines v2 doesn't have), and drives blaze only through
 the `blaze` command line and `engine.py`. It was written to run against v1 first and v2 later,
@@ -469,13 +469,13 @@ harness/v2/<script>.py '<json>'`. They are not in CI yet.
 | Script | What it checks |
 |---|---|
 | `proof.py '{"engine": ..., "out": DIR}'` | Runs every check below with one engine (or those `checks` names, each with its own `given` input), and writes `DIR/report.json` and `DIR/report.md`: a line per check, the budgets as a table, every outcome that did not pass |
-| `oracle.py run '{"engine": ...}'` | The invalidation oracle. Random edit sequences over `fixture.py`'s three-crate workspace, one slot per kind of edit of [v2/items.md](v2/plan/lanes/items.md) section 6, plus fixed sequences for [#906](https://github.com/indexable-inc/blaze/issues/906), [#1325](https://github.com/indexable-inc/blaze/issues/1325), [#1326](https://github.com/indexable-inc/blaze/issues/1326) and [#805](https://github.com/indexable-inc/blaze/issues/805). The slots cover bodies, signatures, impls, renames, moves, formatting, comments, cfgs, features, closure captures, `include_str!` inputs deleted, literal whitespace, names `type_name` and `module_path!` read, positions `line!` and `#[track_caller]` read, and the environment. After every edit, a daemon kept for the sequence must build what a daemon with an empty home and a std-only store builds of the same source: the same errors, program output and tests, and on v2 the same output bytes, codegen inputs and query trace (compared by `crates/blaze-v2-proof`). A state `fixture.py` marks as one Rust refuses has to be refused by both builds (`refuses/...`). An edit [v2/plan/targets.md](v2/plan/goals/targets.md) says compiles nothing (formatting, comments, renames and moves nothing reads, `PATH`) fails if it compiles anything. Findings land in `found/`, reduced, and `oracle.py replay` builds them again |
+| `oracle.py run '{"engine": ...}'` | The invalidation oracle. Random edit sequences over `fixture.py`'s three-crate workspace, one slot per kind of edit of [v2/items.md](v2/plan/design/item-hash.md) section 6, plus fixed sequences for [#906](https://github.com/indexable-inc/blaze/issues/906), [#1325](https://github.com/indexable-inc/blaze/issues/1325), [#1326](https://github.com/indexable-inc/blaze/issues/1326) and [#805](https://github.com/indexable-inc/blaze/issues/805). The slots cover bodies, signatures, impls, renames, moves, formatting, comments, cfgs, features, closure captures, `include_str!` inputs deleted, literal whitespace, names `type_name` and `module_path!` read, positions `line!` and `#[track_caller]` read, and the environment. After every edit, a daemon kept for the sequence must build what a daemon with an empty home and a std-only store builds of the same source: the same errors, program output and tests, and on v2 the same output bytes, codegen inputs and query trace (compared by `crates/blaze-v2-proof`). A state `fixture.py` marks as one Rust refuses has to be refused by both builds (`refuses/...`). An edit [v2/plan/targets.md](v2/plan/objectives.md) says compiles nothing (formatting, comments, renames and moves nothing reads, `PATH`) fails if it compiles anything. Findings land in `found/`, reduced, and `oracle.py replay` builds them again |
 | `corpus.py` | blaze, nushell, ripgrep, helix and the 52 pinned crates.io crates of `corpus.json` (each `.crate` checked against the sparse index's checksum), built, run and tested by blaze: each build exits 0, each run exits 0, and each test passes by its own verdict (`blaze_cli.test_verdict`) unless the project's `OPEN` list names it; the backends are held to each other. It still resolves each project with `cargo fetch`, a no-rustc bug; whole workspaces are [realprojects.py's](#real-projects-the-verdict) |
 | `frontend/cases.py` | The front end's cases under `frontend/cases/<area>/`, each held to its own header: `//@ expect: reject KEYS` has blaze give exactly those errors, `accept` none, and an accepted program exits 0 (or panics, with `//@ run: panic`) and prints its `.stdout` when one is beside it. `rejects/` holds the cases of [#1522](https://github.com/indexable-inc/blaze/issues/1522) and [#1440](https://github.com/indexable-inc/blaze/issues/1440); `bodies-cache/` is built twice on one store, the second serving each dependency from it |
 | `determinism.py` | Two cold builds at the same path, pinned to different core counts (Linux), dev and release, of pinned projects and the oracle's fixture, must be byte for byte the same |
 | `worktree_keys.py` | `a_second_checkout_at_another_path_reuses_every_key` (after kache's benchmark): one commit of ripgrep copied to checkouts at three paths and built in order by one daemon with one store, A from an empty store. B and C must compile nothing A compiled: every unit `fresh`, every build-script run found and naming only its own checkout's places, no `macro expand` span and no `compiled` macro module in their builds' history, the same `codegen-inputs`. C tells the portable keys' first-use verification apart from a key that differs. Naming each function B compiled with its key's parts needs `blaze-keys` lines blaze does not print yet, an error until it does |
 | `tightmemory.py` | A cold build in a cgroup limited to 1.0 and 0.5 times cargo's peak, with swap off and `BLAZE_MEMORY_BUDGET` set (which no v2 crate reads yet), finishes with a program that prints what the unlimited cold build's prints, or refuses below 1.0 saying what it needs. It must never be OOM-killed or hang (Linux; `systemd-run --user` or a writable cgroup) |
-| `budgets.py` | The targets of [v2/plan/targets.md](v2/plan/goals/targets.md) as rows, each with the number measured, the budget and today's figure: edit to result, signature and formatting edits, no-op, warm start, memory against cargo, dev and release code speed, a big crate, the cold build's core use and critical path, CI for a small PR. [v2/plan/data.md](v2/plan/design/data.md)'s rows: bytes per token, node, expression, statement, memo, edge and relocation, memory per thousand lines, and cache misses per edit |
+| `budgets.py` | The targets of [v2/plan/targets.md](v2/plan/objectives.md) as rows, each with the number measured, the budget and today's figure: edit to result, signature and formatting edits, no-op, warm start, memory against cargo, dev and release code speed, a big crate, the cold build's core use and critical path, CI for a small PR. [v2/plan/data.md](v2/plan/design/data.md)'s rows: bytes per token, node, expression, statement, memo, edge and relocation, memory per thousand lines, and cache misses per edit |
 
 The fixtures and adapters beside them are `fixture.py` (the oracle's workspace, a pure function
 of a state), `engine.py` (the v2 adapter, the v1 one kept only for `proof.py`'s selftest of its log reader, and
@@ -555,7 +555,7 @@ The build and the unit tests of the `gate` and `warm` tiers install no rustup an
 checkout, then `.github/actions/blaze`, which installs the release of blaze as a user does, with
 install.sh fetching its own Rust (the release's pinned `rustc`, `cargo`, `rust-std` and
 `rust-src`, into `~/.blaze/toolchains`,
-[self-contained.md](self-contained.md#blazes-own-toolchain-the-stopgap)), and for the build the
+[self-contained.md](v2/plan.md)), and for the build the
 pinned LLVM as a contributor outside Nix gets it
 ([contributing.md](contributing.md#llvm)): `.github/scripts/llvm.py` with `{"command": "fetch", ...}`
 into `/usr/local/lib/blaze-llvm/<triple>`, checked against `crates/hir-ty-codegen/llvm.json`'s
@@ -666,7 +666,7 @@ What stays on GitHub's hosted runners, and why:
   so that the binaries ask for an old glibc (`build_release.py` refuses one newer than RHEL 9's
   2.34); the ix image's glibc is 2.39. **TODO(sysroot)**: blaze has no `--sysroot`; it finds crt
   objects and libc through `$CC_<triple> -print-search-dirs`, and the sysroot archives of
-  [toolchain-c.md](v2/plan/toolchain-c.md) are not built. A driver given one
+  [toolchain-c.md](v2/plan/design/toolchain-c.md) are not built. A driver given one
   (`CC_aarch64_unknown_linux_gnu="gcc --sysroot=<glibc 2.34 tree>"`) finds the old glibc's files,
   but blaze-link then takes the ELF interpreter from inside that tree, as libc's directory is not
   an FHS one (`crates/blaze-link/src/target.rs`, `fhs`), so the binaries would not run elsewhere. Once blaze links against an old glibc

@@ -56,7 +56,7 @@ springs, drawing (shared with harness-video in `harness-native-render`: Metal, t
 | Scrolling | `ui.Scroll` (clips, shifts by `ScrollState`) carries `ui.Scroller`, macOS's overlay scroller: knob and track parts (`ScrollerPart`) layout places from `ScrollExtent`, motion fades and widens (`ScrollerState`), input drags and pages (`ScrollerGrip`); tokens `scroller_*`, `NoScroller` turns it off, `ScrollFed` lets a host feed the extent (the terminal), `scroll_quietly` moves without showing it. A host running its own physics (the tree's, harness-native-scroll-physics, in `harness-native/src/app/sidebar.rs`; a chat's) adopts a `ScrollState` the scroller wrote |
 | Motion | `MatchedGeometry {id}` (selection pill), `Transition: {kind: Opacity/Slide/Scale/Move}`, `Animate`, `HoverAmt`/`HoverLift` springs; spring params are tokens |
 | Pose / timeline | `Pose: {dx, dy, shrink, fade, cut}` (0 at rest; draw folds it into the subtree, layout ignores it); a `Cue` child animates any member by path over the clock (`harness-native-ui-timeline`, used by `harness-video`) |
-| Text motion, code colour | `GlyphsIn: {at, per, dur, by, ease}` (glyph-by-glyph arrival), `Caret: {at, until, blink, ink}`, `Highlight: {file}` (tree-sitter, inks from `code_ink.<capture>` tokens). Words always break at the width their box has this frame, so they re-wrap live through a fold, instantly (only broken again over glyphs shaped once, `Layout::wrap`). Never lay words out at a rest width: `LaysAtRest` is for a terminal's grid only |
+| Text motion, code colour | `GlyphsIn: {at, per, dur, by, ease}` (glyph-by-glyph arrival), `Caret: {at, until, blink, ink}`, `Sheen: {period, rest, band, strength, still, ease, bands, phase, scatter, dark, light}` (a band of light sweeping through the words, the sign of work: `ui.Shimmer`, a working row's title; strength 0 is off and free), `Highlight: {file}` (tree-sitter, inks from `code_ink.<capture>` tokens). Words always break at the width their box has this frame, so they re-wrap live through a fold, instantly (only broken again over glyphs shaped once, `Layout::wrap`). Never lay words out at a rest width: `LaysAtRest` is for a terminal's grid only |
 | Pixel art | `Picture: {handle}` + `Pixelated`, `Frames: {count, fps}` for a sheet; `BlazeMark: {start, exit}` for the live fire wordmark (`harness-native-blaze`). Drawn as one texture, texels fetched not filtered: never a panel per cell (those seam when scaled) |
 | Clip | `Clip` (the sidebar fold lays out at full width and clips; never relayout at in-between widths) |
 
@@ -71,6 +71,13 @@ New UI need not covered here: add a primitive (component + prim prefab + a galle
 - Write new views so they convert mechanically to the 4.2 style below: data in, parts derived from it.
 
 ## Flecs 4.2 traps (the vendored version)
+
+- A script has at most 64 reactive inputs: every distinct `$prop` and `$token` it reads and every `entity[Component]`
+  read count, and past 64 the whole scene refuses to load (the app exits at launch). Keep fixed looks out of templates:
+  a token-heavy value (a Sheen preset, an icon's size and padding) goes in a prefab in a prefab-only file (tree.flecs,
+  parts.flecs) that the template's part inherits (`kind_icon : hn.tree.Kind {}`) or reads once
+  (`Sheen: hn.tree.SheenRun[Sheen]`); what only Rust knows (a kind's mark) Rust sets. Two changes that each fit can
+  together pass 64 on main: `scenes_load` is the check, run it on the merged tree.
 
 - The 4.2 changes (explicit deferral, `Copy`, Parent storage) are in the `flecs` skill. Here: mutate from systems
   through the stage (`crates/harness/vendor/hyperion-ecs/src/system.rs`: `Iter::world` and the stage accessor) or collect, then write;
@@ -151,6 +158,13 @@ template hn.ObjRow {
   - **Type is the hierarchy.** One UI family (Inter) at macOS sizes; weight, size and ink tone separate levels before
     any box or rule does. Rows carry no noise: what matters now trails a row (what an agent is doing, the command or
     file), when is a tooltip, never a timestamp column.
+  - **No sparkles.** Every glyph is monochrome and minimal, one weight (the codicons' line): never a sparkle, star
+    burst, gradient or any other decorative "AI" mark, for an agent, a model, a suggestion or anything else. An agent is
+    `cod-person` (`look::kind_icon`) or, on a chip, its state (`hn.chat_status`); a brand's own vector mark
+    (`hn.Kind.<kind>`) is the only exception.
+  - **Live work says what and how long.** Anything running shows its live step in words (the step, never the tool:
+    "blaze check · 6 min", not "ts") and its elapsed time, ticking, with the one breathing glyph, so a long wait never
+    looks hung; a card under the pointer says the rest (chat.rs `fill_chat_activity`).
   - **State by light, not marks.** Working breathes, idle fades, done earns a brief check (or a cross), failure is the
     error ink. No badges for states that are already visible.
   - **Show what changed, not what was looked at.** Summaries name their targets ("Edited chat.rs, ran cargo test");

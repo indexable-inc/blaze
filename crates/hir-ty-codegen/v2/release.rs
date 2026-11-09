@@ -1,4 +1,4 @@
-//! Release units (docs/v2-codegen.md, "Release"; #899, #176): LLVM per function, with what
+//! Release units (docs/v2/plan/design/codegen.md, "Release"; #899, #176): LLVM per function, with what
 //! cross-function optimization needs carried by summaries.
 //!
 //! [`summarize`] lowers an LLVM unit's IR and runs ThinLTO's pre-link pipeline on it once:

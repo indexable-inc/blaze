@@ -33,7 +33,7 @@ pub(crate) enum Launch {
     /// From its executable as linked: a profile compiled whole (a release one, as
     /// `blaze_lazy::allow` decides), or a run under `target.<triple>.runner`, which takes a file.
     File,
-    /// On the daemon's code memory (docs/v2/plan/lanes/fastcompile/inproc.md): a dev
+    /// On the daemon's code memory (docs/v2/plan/design/compile-time.md): a dev
     /// executable ([`inproc::runs_in_process`]), linked with the start hook's reservations and
     /// held by the daemon ([`inproc::DevRuns`]), started from the file its memory writes and
     /// overlaid by the memory before `main`. Its code is compiled whole, as a live build
@@ -45,7 +45,7 @@ pub(crate) enum Launch {
 /// How blaze gives a dev profile's process its start hook, and where it can't, said after the
 /// reason a unit is not a dev executable ([`inproc::not_in_process`]).
 pub(crate) const NOT_IN_PROCESS: &str = "blaze runs a dev profile's process on its code memory, never \
-    from its file (docs/v2/plan/lanes/fastcompile/inproc.md): the program's start hook \
+    from its file (docs/v2/plan/design/compile-time.md): the program's start hook \
     (`blaze_inproc_start`, blaze's dev runtime) lays the daemon's code memory over its code before \
     `main`. blaze links that runtime into every binary and test of a dev build of this machine's \
     own target as it links std (library/blaze_inproc_rt), on Linux (x86_64, AArch64) and macOS \

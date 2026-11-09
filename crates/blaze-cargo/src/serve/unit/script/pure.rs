@@ -1,4 +1,4 @@
-//! Pure build scripts (docs/v2/plan/lanes/pure-scripts/design.md): a script `hir_ty_pure`
+//! Pure build scripts (docs/v2/plan.md): a script `hir_ty_pure`
 //! proves pure from its MIR is looked up under its pure key ([`blaze_usercode::pure`]) as its
 //! compile begins, on the worker that has the front end. When every run of it hits, it is
 //! neither built nor run: each run's value is the kept one, its `OUT_DIR` written back. When a

@@ -1,6 +1,6 @@
 //! The persistent goal cache (docs/v2/plan/design/compile-time.md change 17;
-//! docs/v2/plan/lanes/frontend/fast-trait.md section 3; notes in
-//! docs/v2/plan/lanes/frontend/fast-trait-store.md): a shareable global goal's answer, kept by
+//! docs/v2/plan/design/frontend.md section 3; notes in
+//! docs/v2/plan/design/frontend.md): a shareable global goal's answer, kept by
 //! content in the driver's store and reused by every later build while every fact its
 //! evaluation read hashes the same.
 //!

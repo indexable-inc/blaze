@@ -1,4 +1,4 @@
-//! The checks of the attribute effects over the one walk (docs/v2/plan/lanes/pure-fns.md):
+//! The checks of the attribute effects over the one walk (docs/v2/plan/design/pure-fns.md):
 //! `#[blaze::pure]` ([`fn_purity`], [`fn_purity_generic`]) and any other [`EffectDef`]
 //! ([`check`], [`check_generic`]). A check reads the root's [`walk::summary`], never walks again:
 //! the kinds the effect refuses that the root has through no function trusted for it, and for

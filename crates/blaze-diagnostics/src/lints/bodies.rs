@@ -23,7 +23,7 @@
 //! `compiler/rustc_lint/src/lib.rs` (`BuiltinCombinedLateLintModPass`: the order of the passes)
 //! (MIT or Apache-2.0).
 //!
-//! Speed (`docs/v2/plan/lanes/diagnostics/speed-of-light.md`, "Bodies"): a pass whose every lint
+//! Speed (`docs/v2/plan.md`, "Bodies"): a pass whose every lint
 //! is allowed in the crate is not run (rustc's `lints_that_dont_need_to_run`). The late passes
 //! are one walk per body, each node's tag indexing a table, built once per crate, of the passes
 //! that look at that kind of node; a pass is a variant of [`Pass`], called by `match`, never
@@ -912,7 +912,7 @@ impl Passes {
         };
         // blaze: in a crate of `#![blaze::arbitrary_ints]`, `TypeLimits` also refuses a literal
         // out of the range of a `u3`, which is an error at every lint level, so it runs even
-        // where none of its lints may fire (docs/v2/plan/lanes/frontend/arbitrary-ints.md).
+        // where none of its lints may fire (docs/v2/plan/design/arbitrary-ints.md).
         let arbitrary_ints =
             hir_def::nameres::crate_def_map(cx.db, cx.krate.base()).arbitrary_ints();
         for index in 0..PASSES {

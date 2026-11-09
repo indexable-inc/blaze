@@ -75,7 +75,7 @@ fn lint_overflowing_int_136675() {
 /// blaze: a literal out of the range of an integer of `#![blaze::arbitrary_ints]` is an error
 /// naming the literal as written, its type and the type's range, at every lint level: with
 /// all of `TypeLimits`' lints allowed the pass still runs
-/// (docs/v2/plan/lanes/frontend/arbitrary-ints.md).
+/// (docs/v2/plan/design/arbitrary-ints.md).
 #[test]
 fn arbitrary_int_literal_out_of_range_is_refused() {
     use crate::tests::{Expect, assert_reports, error};

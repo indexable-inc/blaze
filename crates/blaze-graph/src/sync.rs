@@ -1,6 +1,6 @@
 //! The synchronization types of the crate's lock-free code: `std`'s atomics and
 //! `blaze_core::lock`'s named lock, or under `--cfg blaze_check` the model checker's, behind the
-//! same API (docs/v2/plan/lanes/safety/model.md, "The switch"). `arena`'s allocator counts stay
+//! same API (docs/v2/plan/design/model-checker.md, "The switch"). `arena`'s allocator counts stay
 //! `std`'s: the checker allocates, and what it allocates goes through them.
 
 #[cfg(not(blaze_check))]

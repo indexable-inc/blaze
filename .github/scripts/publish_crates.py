@@ -559,7 +559,7 @@ def staged_manifest(c: Crate, by_dir: dict[Path, Crate], stage: Path) -> dict[st
 def shipped_profiles() -> dict[str, Any]:
     """The profiles `cargo install` builds blaze with. Cargo reads profiles only from the root
     manifest, and an installed crate is its own root, so blaze's carries them: `--profile dist`
-    is the build a release ships (docs/reports/RELEASE-BUILD.md), short of its PGO."""
+    is the build a release ships (fed1eb428d:docs/reports/RELEASE-BUILD.md), short of its PGO."""
     profiles = load(ROOT / "Cargo.toml")["profile"]
     return {name: profiles[name] for name in ("release", "dist")}
 

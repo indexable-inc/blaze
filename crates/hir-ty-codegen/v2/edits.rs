@@ -1,6 +1,6 @@
 //! The edit fuzzer: an incremental build after any sequence of edits gives what a clean build
 //! of the edited source does (docs/v2/plan/design/verify.md), judged by the invalidation oracle
-//! (`blaze-v2-proof`, docs/v2/plan/lanes/proof.md).
+//! (`blaze-v2-proof`, docs/v2/plan.md).
 //!
 //! A small real crate (a struct, consts, an `#[inline]` callee, a pair of `cfg`-chosen
 //! functions, a generic, a static, and a boxed struct whose `Drop` comes and goes, boxed by a

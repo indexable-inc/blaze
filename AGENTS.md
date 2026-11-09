@@ -110,13 +110,24 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 45. **macos-private-apis**: On macOS use a private or undocumented API (Mach, ulock, workloops, kperf,
     sandbox, ...) where it is more efficient or more capable than the public one; comment which and
     why, and test that its symbol exists. Skill: `runtime-code`.
-46. **one-memory-measure**: Footprint, the number the kernel enforces, is the one memory measure:
+46. **ledger-decides**: Work is picked from the objectives ledger (`docs/v2/plan/objectives.md`) and is
+    done when its row's check passes on a named commit; never from a status someone remembered.
+    Skill: `build-and-test`.
+47. **every-agent-has-a-task**: Every agent is started on one task (an objective id or a named piece of
+    one) that says its outcome and its check; people follow tasks, not agents. Skill:
+    `build-and-test`.
+48. **agents-are-a-cost**: Use the fewest agents that do the work: a worker only for a piece that is
+    independent and large enough to pay for its context; four is a lot. Skill: `build-and-test`.
+49. **docs-stay-small**: Keep docs few and short: the plan, the ledger, the bounds and one spec per
+    unbuilt design; no lane notes, pass reports or indexes; delete a doc when it stops being true or
+    needed. Skill: `docs-and-scripts`.
+50. **one-memory-measure**: Footprint, the number the kernel enforces, is the one memory measure:
     admission, the front end's release and the ceiling all decide on it. Skill: `memory-and-data`.
-47. **outputs-are-records**: What outlives its task (a query result, a compiled function, object code)
+51. **outputs-are-records**: What outlives its task (a query result, a compiled function, object code)
     is a blaze-format record written once into the store and read in place through the store's
     buffer pool; never a heap tree kept until something serializes it, and never an mmap of a store
     file for the hot tier. Skill: `memory-and-data`.
-48. **cache-by-code-id**: A cache of a function's results is keyed by the function's code identity
+52. **cache-by-code-id**: A cache of a function's results is keyed by the function's code identity
     (`fn_info(&f).code_id`) and its arguments; nothing invalidates entries by hand. Skill:
     `memory-and-data`.
 

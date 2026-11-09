@@ -1,4 +1,4 @@
-//! Positions the program observes, filled at link time (docs/v2/plan/lanes/link/notes.md, "Positions").
+//! Positions the program observes, filled at link time (docs/v2/plan.md, "Positions").
 //!
 //! Code never holds a position: `line!()`, `file!()`, `column!()`, a panic's and a
 //! `#[track_caller]` function's `Location` are a [`blaze_codegen::Target::Position`]

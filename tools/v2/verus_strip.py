@@ -1,4 +1,4 @@
-"""tools/v2/verus_strip.py: takes vstd out of `verus! { ... }` (docs/v2/plan/lanes/verus.md).
+"""tools/v2/verus_strip.py: takes vstd out of `verus! { ... }` (docs/v2/plan/design/verus.md).
 
 usage: uv run --frozen tools/v2/verus_strip.py '{"root": "vendor/verus/vstd"}'
        uv run --frozen tools/v2/verus_strip.py '{"root": "vendor/verus/vstd", "check": true}'

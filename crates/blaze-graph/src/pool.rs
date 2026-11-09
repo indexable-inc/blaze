@@ -1,4 +1,4 @@
-//! The threads the plane's tasks run on (docs/v2/plan/lanes/core.md section 4, docs/v2/plan/lanes/core/plane.md "The
+//! The threads the plane's tasks run on (docs/v2/plan.md section 4, docs/v2/plan.md "The
 //! executor"): one worker per CPU of a [`Topology`], stealing work nearest first.
 //!
 //! Each worker has a deque of its own (crossbeam's Chase-Lev deque, as Rayon's) and a LIFO
@@ -43,7 +43,7 @@
 //! a time until its wait ends; where a worker of its own thread would park, a driven one gives
 //! its turn back, and its thread looks at the clock's next due wait, then for a stall.
 //!
-//! A job allocates nothing once its thread is warm (docs/v2/plan/lanes/mem/core/plane.md). Its
+//! A job allocates nothing once its thread is warm (docs/v2/plan/design/memory.md). Its
 //! closure goes in a cell of 128, 512 or 2048 bytes from one of three process-wide
 //! [`blaze_mem::Pool`]s, through a cache of the thread that submits it, and its cell goes back
 //! to the cache of the thread that runs it before the closure runs. A closure no cell holds is

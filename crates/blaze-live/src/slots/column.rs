@@ -7,7 +7,7 @@
 //! `mprotect`, `VirtualAlloc` with `MEM_RESERVE` then `MEM_COMMIT`), and [`image::rows`] views
 //! the committed bytes as rows; this module has no unsafe. Not blaze-mem's `RegionVec`: this
 //! crate links into the program with no dependencies, and reserves only what a long session
-//! needs (docs/v2/plan/lanes/link/speed-of-light.md, "The live runtime").
+//! needs (docs/v2/plan.md, "The live runtime").
 
 use std::{
     marker::PhantomData,

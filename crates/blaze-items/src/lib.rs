@@ -1,4 +1,4 @@
-//! Items by content (docs/v2/plan/lanes/items.md section 6), from blaze-next's `blaze-items` (#344): a
+//! Items by content (docs/v2/plan/design/item-hash.md section 6), from blaze-next's `blaze-items` (#344): a
 //! front-end crate, next to `hir-ty`.
 //!
 //! An item (fn, struct, enum, union, trait, impl, const, static, type alias, macro) has two
@@ -240,7 +240,7 @@ pub const NAME_DOMAIN: &str = "blaze v2 name 1";
 /// A scope names resolve in: a module's or a block's [`ItemKey`].
 pub type Scope = ItemKey;
 
-/// The narrowest thing a query read (docs/v2/plan/lanes/items.md section 6.2), and what invalidates it.
+/// The narrowest thing a query read (docs/v2/plan/design/item-hash.md section 6.2), and what invalidates it.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Fact {
     /// F's signature hash ([`SignatureHash`]): read by callers' type checking. What a body

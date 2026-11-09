@@ -12,7 +12,7 @@
 //! rustc runs these checks in a crate with `#![feature(min_specialization)]` and lets a
 //! specializing impl add a bound on a `#[rustc_unsafe_specialization_marker]` trait, which is
 //! unsound (`Copy`, `FusedIterator`). blaze's subset refuses those and allows only `default fn`
-//! to be specialized; docs/v2/plan/lanes/frontend/specialization.md has the design and the
+//! to be specialized; docs/v2/plan/design/specialization.md has the design and the
 //! prior art. Codegen picks the specialized impl through `hir_ty::specialized_ancestor`
 //! and the solver's preference for a specializing candidate, as rustc does; nothing here
 //! changes that choice, it only refuses impls outside the rule.

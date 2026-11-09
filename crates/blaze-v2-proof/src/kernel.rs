@@ -1,4 +1,4 @@
-//! The kernel's entries as rows of a [`Trace`] (blaze-kernel, docs/v2/plan/lanes/kernel.md), so
+//! The kernel's entries as rows of a [`Trace`] (blaze-kernel, docs/v2/plan/design/kernel.md), so
 //! [`crate::under`] and [`crate::over`] hold them to a build from scratch as they hold a query.
 //!
 //! An entry is one result: its key is its step's kind ([`kinds::KERNEL_ENTRIES`], `0x6800 +

@@ -50,7 +50,7 @@ impl App {
     }
 
     /// The fold's clip (hn.SideClip) as last laid out: its right edge is the sidebar's visible edge.
-    fn side_clip(&self) -> Option<Laid> {
+    pub(super) fn side_clip(&self) -> Option<Laid> {
         self.sidebar()?.parent()?.try_cloned::<&Laid>()
     }
 

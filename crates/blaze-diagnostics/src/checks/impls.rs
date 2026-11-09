@@ -5,7 +5,7 @@
 //! inherent one) and each trait impl item against its trait's (`compare_impl_item`).
 //!
 //! What needs trait solving or inference is the front end's and asked of it
-//! (`docs/v2/requests/diagnostics.md`, `diagnostics-items-impls`): overlap (E0119, E0592 across
+//! (`fed1eb428d:docs/v2/requests/diagnostics.md`, `diagnostics-items-impls`): overlap (E0119, E0592 across
 //! impls), unconstrained parameters (E0207), signatures that differ in type (E0053), lifetime
 //! parameters that differ in being early or late bound (E0195), `Drop` impls with more bounds
 //! than their type (E0367), the coercion traits (E0374 to E0378).
@@ -154,7 +154,7 @@ pub(crate) fn check(cx: &Cx<'_, '_>, scopes: &[hir::Module]) -> Vec<Found> {
 }
 
 /// rustc's `coherent_trait` of `trait_`, as far as it is decided here (overlap is the front
-/// end's, `docs/v2/requests/diagnostics.md`): whether no impl of it in the crate has an error of
+/// end's, `fed1eb428d:docs/v2/requests/diagnostics.md`): whether no impl of it in the crate has an error of
 /// coherence, here or hir's (an orphan impl, an impl whose safety is not the trait's). When it
 /// has one, rustc checks no impl's items against the trait (E0046 and `compare_impl_item`).
 pub(crate) fn coherent(cx: &Cx<'_, '_>, trait_: hir::Trait) -> bool {

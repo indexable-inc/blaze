@@ -260,7 +260,7 @@ fn a_memo_made_on_a_warm_thread_allocates_nothing() {
     assert_eq!(store.bytes(&task, memo), Some(&8u64.to_le_bytes()[..]));
 }
 
-/// Model tests (docs/v2/plan/lanes/safety/model.md) of the store's lock-free parts: a memo's
+/// Model tests (docs/v2/plan/design/model-checker.md) of the store's lock-free parts: a memo's
 /// value word and the inline copy that follows it, and the segments' hold counts. The bytes
 /// segments copy in, read and free are tracked (`crate::sync`'s hooks), so a read the atomics
 /// don't order after its copy, or before its segment's free, is a finding.

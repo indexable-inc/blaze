@@ -1,5 +1,5 @@
 //! A check as plane tasks: one per body, and one per file module for its items' checks
-//! (docs/v2/plan/lanes/frontend/fast-bodies-tasks.md).
+//! (docs/v2/plan/design/frontend.md).
 //!
 //! [`Plan::new`] lists the bodies the collector meets at each file module's level, in the order
 //! it meets them. [`Plan::run`] is one batch of [`Db::run_all`]: a module's task walks the

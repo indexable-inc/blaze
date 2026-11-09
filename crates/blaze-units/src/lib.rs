@@ -54,7 +54,7 @@ pub enum Intent {
     Test,
     /// `test --doc`: the doctests of the selected libraries only (cargo's `UserIntent::Doctest`),
     /// each library's examples built and run by blaze, never by rustdoc
-    /// (docs/v2/plan/doctests.md).
+    /// (docs/v2/plan/design/doctests.md).
     Doctest,
     Bench,
     /// `cargo doc`: the targets cargo documents, checked, for the front end the pages are

@@ -1,4 +1,4 @@
-//! Where a task's memory is measured (docs/v2/plan/lanes/core.md section 4, "Memory-budget
+//! Where a task's memory is measured (docs/v2/plan.md section 4, "Memory-budget
 //! admission").
 //!
 //! [`Counting`] is the daemon's global allocator: it counts the bytes the process holds

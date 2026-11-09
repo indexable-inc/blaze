@@ -1,4 +1,4 @@
-//! What solving allocates (docs/v2/plan/lanes/mem/db-solver.md, "Budget tests"): nothing for a
+//! What solving allocates (docs/v2/plan/design/memory.md, "Budget tests"): nothing for a
 //! goal answered from the global cache, nothing for a cached canonical response met by a fresh
 //! context, and nothing for re-solving an unchanged body's goals on warm storage.
 //!

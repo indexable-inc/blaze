@@ -10,7 +10,7 @@ a reboot, takes about as long as the same answer from a warm daemon, plus a few 
 
 - **The state is one mapped image.** Results, interners, edges, fingerprints, the VFS tree
   and the plane's history live in the store's packs and the database image
-  ([db.md](../lanes/db.md)), laid out to be used in place ([data.md](data.md)). Restoring is
+  ([db.md](../../plan.md)), laid out to be used in place ([data.md](data.md)). Restoring is
   `mmap` and checking one header: nothing is deserialized, rebuilt or rehashed. Pages come in
   when a query touches them, so a restart costs only what the next request reads.
 - **IDs are stable across restarts.** Interned symbols, item IDs and query keys are indexes
@@ -64,5 +64,5 @@ a reboot, takes about as long as the same answer from a warm daemon, plus a few 
   `base_db` database with its def maps, inference and MIR of the members) lives in memory
   only. A restarted daemon lowers the workspace again and resolves its members again, reading
   dependencies from their images. Restoring it needs the front end's memos in the image as
-  `Persist` values, the work [query-unify](../lanes/db/query-unify.md) names.
+  `Persist` values, the work [query-unify](../../plan.md) names.
 

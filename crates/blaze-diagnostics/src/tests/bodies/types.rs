@@ -965,7 +965,7 @@ fn main() {}
 }
 
 #[test]
-#[ignore = "needs the named type of a `let` an ambiguous goal's variable is in (`docs/v2/requests/db-ty.md`): `top_term` is the goal's variable alone, so `W` and `Z` print `_`"]
+#[ignore = "needs the named type of a `let` an ambiguous goal's variable is in (`fed1eb428d:docs/v2/requests/db-ty.md`): `top_term` is the goal's variable alone, so `W` and `Z` print `_`"]
 fn a_let_of_an_ambiguous_call_erases_its_decided_parameters() {
     // tests/ui/inference/erase-type-params-in-label.rs
     let source = r#"fn main() {
@@ -1038,7 +1038,7 @@ For more information about this error, try `rustc --explain E0283`.
 }
 
 #[test]
-#[ignore = "needs the named type of a `let` an ambiguous goal's variable is in (`docs/v2/requests/db-ty.md`): `top_term` is the goal's variable alone, so `T` and `U` print `_`"]
+#[ignore = "needs the named type of a `let` an ambiguous goal's variable is in (`fed1eb428d:docs/v2/requests/db-ty.md`): `top_term` is the goal's variable alone, so `T` and `U` print `_`"]
 fn a_let_assigned_later_names_both_parameters() {
     // tests/ui/traits/next-solver/well-formed-in-relate.rs
     let source = "fn main() {

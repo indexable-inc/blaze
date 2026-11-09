@@ -1,5 +1,5 @@
 //! Lazy compilation, per function (docs/v2/plan/design/compile-time.md, change 1;
-//! docs/v2/plan/lanes/fastcompile/lazy.md).
+//! docs/v2/plan/design/compile-time.md).
 //!
 //! A dev run or test compiles only the functions that execute. Every function is called
 //! through its jump-table slot (blaze-link's stubs); a lazy function's slot starts at its

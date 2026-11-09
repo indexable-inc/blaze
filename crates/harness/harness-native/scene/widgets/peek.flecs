@@ -156,8 +156,10 @@ hn {
       TextStyle: {size: $size_peek_meta, line: $line_peek_meta, role: 10, bold: 0}
     }
   }
-  // A failed one: the cross, in the failing checks' ink (oct-x).
+  // A failed one: the cross and its name in the failing checks' ink (oct-x), its name a step heavier: what failed is
+  // what the card is for.
   prefab PeekCheckFailed : hn.PeekCheck {
+    name : ui.Line { Fill: $tone_gh_ci_failure; TextStyle: {size: $size_peek_meta, line: $line_peek_meta, role: 0, bold: 0, weight: 560} }
     mark : ui.Symbol { Icon: {glyph: ""}; Fill: $tone_gh_ci_failure }
   }
   // A running one: the running dot, breathing while it shows, in the pending checks' ink (cod-circle_small_filled).
@@ -193,16 +195,32 @@ hn {
     TextStyle: {size: $size_peek_meta, line: $line_peek_meta, role: 0, bold: 0}
   }
 
-  // A description's first lines (a pull request's, a page's), in the body ink.
+  // A description in markdown (a pull request's): its blocks as the transcript's own rows (src/app/chat.rs blocks and
+  // fill_row), so a list reads as a list, code as code, a heading as a heading, as they would in the chat.
+  prefab PeekMarkdown : ui.Column {
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+
+  // A description's first lines (a page's), in the body ink.
   prefab PeekBody : ui.Words, Ink {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     TextStyle: {size: $size_peek_body, line: $line_peek_body, role: 0, bold: 0}
   }
 
-  // A file's first lines, in the code face.
-  prefab PeekCode : ui.Words, Ink {
+  // A file's lines from the place named, in the code face and coloured by its language (src/app/chat/peek.rs sets
+  // `text`'s Highlight), as the transcript's code and the mention preview (chat.flecs ChatMentionCode) draw it: each
+  // line whole, never wrapped (a wrapped line starts at the left edge and reads as dedented), cut by this box's edge.
+  prefab PeekCode : ui.Column {
+    Clip
+    Flex: {axis: Column, gap: 0, align: Start, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-    TextStyle: {size: $size_peek_meta, line: $line_peek_meta, role: 9, bold: 0}
+    text : ui.Words {
+      Fill: $tone_ink
+      FixedSize: {h: true, v: false}
+      Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      TextStyle: {size: $size_peek_meta, line: $line_peek_meta, role: 9, bold: 0}
+    }
   }
 
   // A page's og:image (the daemon saves it as a file), cut to the plate's width and inline_peek_image_h, rounded; only on

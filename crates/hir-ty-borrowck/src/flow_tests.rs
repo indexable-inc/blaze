@@ -1,4 +1,4 @@
-//! `BLAZE_BORROWCK=polonius-flow` against the cases of docs/research/borrowck.md section 2.5:
+//! `BLAZE_BORROWCK=polonius-flow` against the cases of fed1eb428d:docs/research/borrowck.md section 2.5:
 //! what the alpha rejects and datalog Polonius accepts is accepted, what all of them reject stays
 //! rejected. Each upstream test is written here without `std` (a `Box` is a `&'static mut`, a
 //! `Vec` a slice, a `Cell` an invariant `fn` pointer, `String` a `u32`), keeping the borrows and

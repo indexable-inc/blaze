@@ -134,7 +134,7 @@ jobs:
   # every crate for 50 minutes and more, at random (04:27Z and 07:02Z on 2026-10-28).
   # build_release.py refuses a binary that asks for a glibc newer than RHEL 9's.
   # TODO(sysroot): hosted Ubuntu 22.04 only for its glibc (2.35, near RHEL 9's 2.34). Move to an
-  # ix runner once blaze can link against an older glibc sysroot (docs/v2/plan/toolchain-c.md,
+  # ix runner once blaze can link against an older glibc sysroot (docs/v2/plan/design/toolchain-c.md,
   # "sysroot"); blaze has no --sysroot today (docs/harness.md "ix runners").
   archive:
     name: this commit's build

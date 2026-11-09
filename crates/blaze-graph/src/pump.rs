@@ -1,4 +1,4 @@
-//! The rule for a wait inside a task (#1301, docs/v2/plan/lanes/core.md "Issues this lane takes in"): a
+//! The rule for a wait inside a task (#1301, docs/v2/plan.md "Issues this lane takes in"): a
 //! task that waits for what another task makes holds no thread while it waits, and a wait that
 //! would close a cycle gives way at once with [`Cancelled`], so the task that asked unwinds,
 //! releases what it holds and is posted again. No wait can deadlock: every wait is checked
@@ -16,7 +16,7 @@
 //! key's bucket latch and ended with one compare-and-swap ([`table`]); its flight in the
 //! scheduler is claimed by its first waiter, for it, and ended by the runner only if one was.
 //!
-//! Nothing here allocates once warm (docs/v2/plan/lanes/mem/core/plane.md) but a value's
+//! Nothing here allocates once warm (docs/v2/plan/design/memory.md) but a value's
 //! clones: a waiter is a node on its own stack, linked into its run's entry, and the runner
 //! writes each waiter its clone.
 

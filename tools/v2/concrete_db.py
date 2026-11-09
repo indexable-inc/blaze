@@ -3,7 +3,7 @@
 Input: `{"root": "<workspace>", "crates": ["hir-def", ...]}` (inline, a path, or `-`),
 `"write": true` to change the files (without it, only what would change is printed), and
 `"paths": ["crates/hir-ty/src/traits.rs", ...]` to change only the files under those. For each
-crate's `.rs` files it rewrites what is mechanical (docs/v2/plan/lanes/frontend/db.md, "The
+crate's `.rs` files it rewrites what is mechanical (docs/v2/plan/design/frontend.md, "The
 migration"):
 
 - `dyn HirDatabase`, `dyn SourceDatabase`, `dyn salsa::Database` (any path, `+ 'a` or not, behind

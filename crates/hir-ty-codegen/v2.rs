@@ -1,4 +1,4 @@
-//! blaze v2's codegen of the front end (docs/v2/plan/lanes/codegen.md): this crate's IR builder behind
+//! blaze v2's codegen of the front end (docs/v2/plan/design/codegen.md): this crate's IR builder behind
 //! [`blaze_codegen`]'s per-function interfaces.
 //!
 //! [`HirFrontend`] says what an instance is and what it refers to, without compiling it: its
@@ -70,7 +70,7 @@ pub use release::{give_profile, profile_id};
 pub use roots::{RootKind, RootTest, Roots, harness::MODULE as HARNESS_MODULE};
 pub use toolchain::{CodegenCode, Runs, code, select, set_code, toolchain, toolchain_for};
 
-/// What the items lane says of the front end's items by content (docs/v2/plan/lanes/items.md): the
+/// What the items lane says of the front end's items by content (docs/v2/plan/design/item-hash.md): the
 /// keys the code generator puts in place of the database's dense ids, which differ from one
 /// run to the next.
 pub trait Hashes: Sync {

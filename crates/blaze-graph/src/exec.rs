@@ -1,4 +1,4 @@
-//! Does what the plane asks (docs/driver.md, "The executor"; docs/v2/plan/lanes/core/plane.md, "The executor").
+//! Does what the plane asks (docs/v2/plan.md, "The executor"; docs/v2/plan.md, "The executor").
 //!
 //! [`drive`] runs one build of a [`Machine`] on the thread that calls it, which is the only one
 //! that steps the machine: its work nodes on a worker pool lent to the build alone, its IO nodes
@@ -748,7 +748,7 @@ impl<W> Handle<W> {
     }
 }
 
-/// The daemon's one scheduler (docs/v2/plan/lanes/core/plane.md): requests from any thread, through
+/// The daemon's one scheduler (docs/v2/plan.md): requests from any thread, through
 /// [`Handle`]s; the plane stepped on its owner thread; tasks on a worker pool, IO tasks on
 /// threads of their own. Dropping it waits for the tasks under way (pool and IO, each posted
 /// again until it ends; what came of them is not taken), then stops the owner thread and the

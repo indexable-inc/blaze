@@ -1,4 +1,4 @@
-//! Name resolution per module, with facts (`docs/v2/plan/lanes/frontend/nameres.md`).
+//! Name resolution per module, with facts (`docs/v2/plan/design/frontend.md`).
 //!
 //! rust-analyzer's `DefCollector` rules, on a schedule that memoizes per module: each module's round-0
 //! declarations are a query (`module_decls`) whose value is an op log; each expansion round

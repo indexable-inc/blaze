@@ -24,8 +24,8 @@ since the release before and the title of each change merged since.
 - Downloads say how far they have come and stop when stalled. A pinned release's fetch, `blaze update` and the daemon's downloads (the standard library, blaze's Rust, pinned native inputs, registry crates, git fetches) each report bytes done of the total, the rate and the time left: `blaze: blaze-v0.20261105.2-aarch64-apple-darwin.tar.xz: 12.3 of 52.1 MB (23%), 6.8 MB/s, 6 s left`, redrawn in place on a terminal and every five seconds off one, then `fetched …: 52.1 MB in 8 s, 6.5 MB/s`. A download that gets no byte for 30 s stops with an error naming the address, how long it went quiet and how much had come; a live download counts as progress for the build's stall bound. A large HTTP download comes in 8 MiB ranges, eight at once (one connection to GitHub's release CDN can be held to a few hundred KB/s), and a pinned download resumes from its partial file (named by the pin's hash) with a ranged request, checked against the pin at the end.
 - Releases ship a `.tar.xz` beside the `.tar.gz`, with `blaze` a hard link to `blaze-engine` (one program, linked twice before): about a third of the old size. blaze, install.sh and `cargo binstall` fetch the `.tar.xz`; the `.tar.gz` stays for blazes from before.
 - A release, and a pull request that changes blaze-profile's schema version, is refused unless the deployed explorer at ix.dev/explore reads that schema (`.github/scripts/explore_page.py`), so `blaze explore` never opens a page that refuses the daemon's hello; the page now names which side is behind and the command that fixes it.
-- `blaze check` lints which configurations of a package use each item, over every unit it checked at once (the lib, the lib's tests, bins, tests, benches, examples; `--all-targets` for all): `blaze::dead` (none does; it replaces rustc's `dead_code` in linted crates, so an item another configuration uses is never called dead), `blaze::test_only` (only the tests do; `--fix` adds `#[cfg(test)]`, with the type's impls) and `blaze::cfg_only` (only some features or platforms do, with the narrowest exact `#[cfg]`). Each warns by default; the group `blaze::reach` sets all three (`reach = "deny"` under `[lints.blaze]` is the strict mode). A fix is machine-applicable only when nothing a configuration keeps names the item (docs/v2/plan/multiconfig-check.md).
-- Lock policy: under CI (`CI` set and not empty, `false` or `0`, or `TF_BUILD`) a build that would write or change `Cargo.lock` is refused, naming each package added, removed or moved (old → new) and which manifest requirement asked for it, with the fix (`blaze lock`, then commit); `--no-locked` lets it write, and `BLAZE_LOCK=write` says the same once for everything a harness starts (a typed `--locked` still wins). Locally a build still writes the lock file but never silently: a new one says `wrote Cargo.lock: 143 packages, index as of … (commit it)`, a changed one each move. `blaze.lock`, beside `Cargo.lock` (which stays what cargo writes), pins the blaze release and its nightly (only for a workspace that pins a blaze version), the newest index publish time the resolve used, and every pinned native input's digests; a pinned input that disagrees with it is a lock change. `[workspace.metadata.blaze] lock = "required"` refuses locally too; blaze's own tree sets it. `blaze lock` resolves, writes the lock files and stops, checking nothing; blaze-metadata's commands decide their lock files in the same place (docs/cargo.md, "Lock files"; docs/v2/plan/lock-policy.md; #864).
+- `blaze check` lints which configurations of a package use each item, over every unit it checked at once (the lib, the lib's tests, bins, tests, benches, examples; `--all-targets` for all): `blaze::dead` (none does; it replaces rustc's `dead_code` in linted crates, so an item another configuration uses is never called dead), `blaze::test_only` (only the tests do; `--fix` adds `#[cfg(test)]`, with the type's impls) and `blaze::cfg_only` (only some features or platforms do, with the narrowest exact `#[cfg]`). Each warns by default; the group `blaze::reach` sets all three (`reach = "deny"` under `[lints.blaze]` is the strict mode). A fix is machine-applicable only when nothing a configuration keeps names the item (docs/v2/plan/design/multiconfig-check.md).
+- Lock policy: under CI (`CI` set and not empty, `false` or `0`, or `TF_BUILD`) a build that would write or change `Cargo.lock` is refused, naming each package added, removed or moved (old → new) and which manifest requirement asked for it, with the fix (`blaze lock`, then commit); `--no-locked` lets it write, and `BLAZE_LOCK=write` says the same once for everything a harness starts (a typed `--locked` still wins). Locally a build still writes the lock file but never silently: a new one says `wrote Cargo.lock: 143 packages, index as of … (commit it)`, a changed one each move. `blaze.lock`, beside `Cargo.lock` (which stays what cargo writes), pins the blaze release and its nightly (only for a workspace that pins a blaze version), the newest index publish time the resolve used, and every pinned native input's digests; a pinned input that disagrees with it is a lock change. `[workspace.metadata.blaze] lock = "required"` refuses locally too; blaze's own tree sets it. `blaze lock` resolves, writes the lock files and stops, checking nothing; blaze-metadata's commands decide their lock files in the same place (docs/cargo.md, "Lock files"; docs/v2/plan/design/lock-policy.md; #864).
 - Machine formats: under a JSON `--message-format` every build, check, run, test and bench ends its build with one `build-finished` line that carries, beyond cargo's `success`, the profile, whether the daemon served it, `took_ms`, the daemon's `build_id` (what `blaze slow --build N` takes), the units built and replayed and each link by how (first, spliced, unchanged, full); every field is always present, `null` where there is nothing to say. `blaze status --json` prints one object: this blaze's version and API schema, its home, state directory and socket, and the daemon's pid, build hash, uptime, memory and budget, bug count, requests, views and settings, or `"daemon": null` with none running. `blaze toolchain --json` prints the toolchain's names, rustc version, commit, the host's tuple and its sysroot. The API schema is 40 (`Status::uptime_ms`; `Worked::build_id` came with schema 38). Harnesses read these through typed readers in harness/storelib.py instead of the human `Finished` and `blaze status` lines, and no longer run `rustc -vV`, `rustc --print sysroot`, `rustc -O`, `cargo generate-lockfile` (now `blaze lock`) or a `cargo run` reference; harness/norustc/setup.sh is setup.py and, like toolchain_bump.py's checks, builds blaze with a stage-0 blaze, and norustc counts runs of blaze's own toolchain rather than rustup's (docs/cargo.md, "Commands" and "The daemon").
 - Updates: blaze says on stderr, before each command, when a newer release is out (`blaze <new> is out (this is <cur>): blaze update`), when the workspace pins an older one (`blaze pin <new>`), and, loudly and under CI too, when the release that runs is yanked. The daemon reads `https://ix.dev/blaze/latest.json` every five minutes in the background (ETag, `304` when unchanged); no command waits on the network. `blaze update` installs the newest release of the channel, checked as a pin's fetch is, as the default the installed `blaze` runs outside pinned workspaces, and prints its notes; `[update] mode = "auto"` in `~/.blaze/config.toml` has the daemon do so by itself, `"off"` silences all but yanks, `"offline"` makes no network call at all (so a later yank goes unsaid). A pin is never moved; `blaze pin VERSION` pins a given release. Releases are yanked with yank.yaml (docs/install.md, "Updates"; docs/release.md, "latest.json").
 - Pinned native inputs: `[workspace.metadata.blaze.native.<name>]` in the root manifest names a pin file (per target, an archive under an `https://` release and its sha256), a variable and the packages (`name`, or `name/feature`) whose build scripts get it. blaze fetches the archive through its store by that digest, unpacks it with every path checked (two names one under Unicode's canonical caseless match refused) and the unpacked bytes held to the pin, read-only at `~/.blaze/native/sha256-<hex>` with a mark listing every file's BLAKE3, which each daemon checks the layout against once before using it, and sets the variable to it for those scripts, over the shell's; the sandbox lets them read it and link from it, and the digest is part of each run's key. blaze declares its LLVM so (`crates/hir-ty-codegen/llvm.json`), so `blaze build -p blaze-engine --release` on a clean Mac or Linux machine needs no Nix and no `LLVM_SYS_231_PREFIX`. `build-script-env` leaves blaze's own manifest (docs/cargo.md, "Pinned native inputs").
@@ -59,10 +59,10 @@ since the release before and the title of each change merged since.
 - The daemon now applies that limit: it set no budget and no release limit, so none was ever due (coord-105, 49 GB). It says its limit as it starts and one line per release (why, what went, blaze's memory before and after, the limit). A unit's generated code is let go once it is linked, not when the build ends (the 8 GiB codegen heap of coord-105).
 - The trait solver's caches cost nothing until written: a lookup no longer makes a query's cache, nor a table in an empty one, and a query's cache has one shard, not four per core (144 KiB). In coord-98 those empty caches, waiting to be freed, filled blaze-mem's 160 KiB block class (16 GiB) in one 21-crate `blaze test`. Their bytes are the new `solver` memory tag. An allocation that fails in the daemon panics, naming its size, and fails only its job: one parsed tree's block that the full class could not give had aborted the daemon, losing every crate's tests.
 - blaze-query: the dependency graph frees what it no longer needs. A capture of reads (each trait goal the solver caches) holds each read once, naming the captures nested in it instead of copying their reads, and is freed when its view ends; rows' replaced edge spans are compacted at the next view; every row and capture keeps each dependency once. A full edge array names the query whose reads did not fit, and the memory report has rows for the dependency nodes, edges and captured reads. `Storage::compact` is gone (it ran only in a test). This was `blaze check --workspace` on blaze stopping at "the query database's edge array is full (4294967296)".
-- blaze-graph: each pool, fiber driver and client thread has a scheduler of its own, not one for the process. Two join for good once their jobs meet (a wait, a claim, a scope or a stop across them), so cycles across pools are still found and their waits woken. Pairs of threads that wait on each other's runs no longer share one lock: 4.7x the throughput at 18 threads and 8x at 32 (docs/v2/plan/lanes/sched.md, "A scheduler per pool").
+- blaze-graph: each pool, fiber driver and client thread has a scheduler of its own, not one for the process. Two join for good once their jobs meet (a wait, a claim, a scope or a stop across them), so cycles across pools are still found and their waits woken. Pairs of threads that wait on each other's runs no longer share one lock: 4.7x the throughput at 18 threads and 8x at 32 (docs/v2/plan/design/fibers.md, "A scheduler per pool").
 - The query engine keeps memoized values by their bytes, not by a count: a function marked `lru, weigh = <fn>` counts what each value holds, each memory tag's values stay under that tag's budget (set by the daemon from the machine's memory), and over it a pass drops the least recently used. `parse_macro_expansion` and `ast_id_map` (capped at 512 and 1,024 values against about 500 k a self-build), the item signatures, bodies, docs and cfgs, the file parses (which `Db::admit_parses` used to cap) and the inference results work this way now. `lru = N` with N > 0 is refused, and `set_lru_capacity`, the W-TinyLFU admission rule and the profile's `query_counts.refused` column are gone.
-- `asm!`, `naked_asm!` and `global_asm!` are assembled only by blaze's pinned LLVM, in process: the machine's clang or `cc` never assembles a block. A blaze built without LLVM, and a set `BLAZE_ASSEMBLER` (which picked the C compiler), are errors that say so (docs/v2/plan/toolchain-c.md, slice 1).
-- blaze never reads rustup's directory, not even when it has the pinned nightly: the sanitizer runtimes and wasi-libc come only from blaze's own copy, checked by sha256, which pins wasm32-wasip1's standard library again for the wasi-libc proc macros link with (docs/v2/plan/toolchain-c.md, slice 2).
+- `asm!`, `naked_asm!` and `global_asm!` are assembled only by blaze's pinned LLVM, in process: the machine's clang or `cc` never assembles a block. A blaze built without LLVM, and a set `BLAZE_ASSEMBLER` (which picked the C compiler), are errors that say so (docs/v2/plan/design/toolchain-c.md, slice 1).
+- blaze never reads rustup's directory, not even when it has the pinned nightly: the sanitizer runtimes and wasi-libc come only from blaze's own copy, checked by sha256, which pins wasm32-wasip1's standard library again for the wasi-libc proc macros link with (docs/v2/plan/design/toolchain-c.md, slice 2).
 - `blaze-engine cache build` prints what this build's store keys are made with apart from the toolchain (the store's format and the hash of blaze's sources), and fails for a build keyed by its executable's bytes: CI will name the remote's project by it instead of by the release, so a release whose compiled-in sources did not change keeps the store (docs/cache.md).
 - Releases: a canary is cut as soon as main's Linux x86-64 build of a commit passes, without waiting for the unit tests; stable now also needs main's merge gate on that commit green, with the unit tests run and passed on Linux x86-64, Linux ARM64 and macOS (docs/release.md).
 
@@ -95,14 +95,14 @@ since the release before and the title of each change merged since.
 ### Merged
 
 - canary.yaml: a canary of every green main, by a tag on main's own commit (no release commit racing merges); release.yaml stamps the tag's version into its checkout; one promote gate at a time, the newest canary first (#953)
-- docs/driver.md: the build driver as a sans-IO build graph (design note) (#955)
+- docs/v2/plan.md: the build driver as a sans-IO build graph (design note) (#955)
 - install.sh: the archive's folder check as an if (shellcheck SC2015) (#954)
 - vectors in the Win64 C ABI; corpus const_traits builds without nightly (#945)
 - promote.yaml: the one-gate-at-a-time group is main's runs only, so a dispatch on a branch (a check of the gate) never holds a canary up (#958)
 - a workspace the daemon could not load names the functions blaze could not compile (#905)
 - const macros stage 0: derive expanded by the const evaluator (#915)
 - answers test asks a spec every host agrees on (Windows tests) (#957)
-- blaze-graph: the build driver's graph as a state machine that does no IO, its executor and replayable traces (docs/driver.md step 1) (#956)
+- blaze-graph: the build driver's graph as a state machine that does no IO, its executor and replayable traces (docs/v2/plan.md step 1) (#956)
 - canary.py cut: the newest commit of main whose ci is green (HEAD is seldom green yet: main moves faster than its gate), and a release.yaml run on a branch does not hold a cut (#962)
 - const macros: the const-macros key loads a file as the package's macro crate, behind experimental = ["const-macros"] (#959)
 - canary.py stamp runs on Python 3.10: release.yaml's ubuntu-22.04 builds of the first canary v0.20261028.4 failed on 'No module named tomllib' (#966)
@@ -616,7 +616,7 @@ since the release before and the title of each change merged since.
   write back byte for byte). A registry read from a lock file before its manifest is now named
   as cargo names it.
 - `crates/blaze-registry`, registries read and packages fetched as cargo 1.99 does, with no
-  cargo, used by nothing yet (`docs/self-contained.md`, #298). The sparse
+  cargo, used by nothing yet (`docs/v2/plan.md`, #298). The sparse
   index (crates.io's and any other's): `config.json` and its `dl` templates, the index paths,
   each line read as cargo reads it (schema `v`, `features2`, `rust_version`, `pubtime`,
   `yanked`, `links`, renamed and other-registry dependencies, unknown fields, and the lines
@@ -703,7 +703,7 @@ since the release before and the title of each change merged since.
   the program's as a compile of it alone is. It is not the default: on 16 cores helix builds
   in 71.1 s against 69.7 s and runs 1.28x of cargo's release build against 1.21x, and LLVM
   takes four times rustc's time for code of the same size either way
-  ([codegen-units.md](research/codegen-units.md)). Imports are linked into a compile's
+  (codegen-units.md). Imports are linked into a compile's
   module once, after being linked to each other two at a time, which took the lowering of a
   module of many functions from 23.7 s to 8.1 s summed over ripgrep's cores.
 
@@ -732,7 +732,7 @@ since the release before and the title of each change merged since.
   the pinned nightly ICEs on it.
 - The daemon's workers hold at most half of the machine's memory together, or what
   `RA_JIT_MEMORY_MAX` says (a size, or `off`). Over it, the worker asked longest ago is
-  stopped; `cargo ra-jit status` shows the limit and what each worker holds. `docs/reports/SOAK.md`
+  stopped; `cargo ra-jit status` shows the limit and what each worker holds. `fed1eb428d:docs/reports/SOAK.md`
   described the variable, but it was never brought over from the soak branch (#60).
 - `RA_JIT_OTHER_TOOLCHAIN=1` has `cargo ra-jit` build with a rustc other than 1.99.0, for a
   project pinned to a nightly of the next release that 1.99.0 can't build (bun's
@@ -761,7 +761,7 @@ since the release before and the title of each change merged since.
   name the stacks on macOS, and `harness/heap.py` gives the bytes to the salsa query whose
   value or record holds them. What they found
   ([#39](https://github.com/indexable-inc/ra-jit/issues/39),
-  [docs/research/daemon-memory.md](research/daemon-memory.md)): nushell's worker holds
+  fed1eb428d:docs/research/daemon-memory.md): nushell's worker holds
   10.0 GB live once ready, 2.7 GB of it what a debugger is told of types; ripgrep's 1.6 GB;
   and the spare worker the daemon starts after the first build holds 940 MB more on ripgrep.
   salsa's `lru` cannot evict `infer` or MIR (they have cycle handling), and on `described`
@@ -794,7 +794,7 @@ since the release before and the title of each change merged since.
   needs none, folding constant branches, simplifying the control flow and instructions),
   `RA_JIT_MIR_OPT=2` what it runs above `-Copt-level=0` that is ported (also dead stores and
   unreachable blocks). Off by default. The interpreter's tests run every program at all three
-  levels and require the same result ([docs/research/mir-gap.md](research/mir-gap.md)).
+  levels and require the same result (fed1eb428d:docs/research/mir-gap.md).
 - `ra-jit mir <dir> --crate <name> [--level N]` prints a crate's MIR as ra-jit compiles it,
   in rustc's `-Zunpretty=mir` format, and `harness/mirparity.py` compares it with rustc's
   function by function: at level 1, 21.5% of functions are identical to rustc's, against 4.0%
@@ -805,9 +805,9 @@ since the release before and the title of each change merged since.
   output differs from cargo's is never published. The first, on Linux x86-64, has every
   program's output the same as cargo's; on macOS arm64, ripgrep, fd, bat and jsonrt do not
   build whole yet (NEON intrinsics ra-jit does not have).
-- [docs/research/](research/): what 2026's Rust compiler work means for ra-jit,
+- fed1eb428d:docs/research/: what 2026's Rust compiler work means for ra-jit,
   and the MIR gap with rustc with the production gaps ranked; rustc's pass sources in
-  [docs/upstream/rustc-mir-transform/](upstream/rustc-mir-transform/SOURCE.md).
+  fed1eb428d:docs/upstream/rustc-mir-transform/.
 
 - Tiers ([#6](https://github.com/indexable-inc/ra-jit/issues/6)): a program that takes
   edits with `ra-jit-live` is sampled while it runs, and the functions it spends its time in
@@ -1040,7 +1040,7 @@ since the release before and the title of each change merged since.
   build and says what (the targets `--bins`, `--tests` and their kin pick, several
   `--target`s, `--target-dir`, `--message-format`, `-Z`, `--build-plan`). A build of
   libraries alone is the daemon's check of them. The cold build is slower than cargo's for
-  now (docs/self-contained.md has the figures). blaze's link gives the program a GNU build ID on Linux, by which it takes live edits. On macOS a program finds the statics and functions of the standard library blaze built once by their names without Mach-O's leading underscore, as it asks for them, so std's `GLOBAL_PANIC_COUNT` is no longer refused as having no symbol. A patch compiles its own copy of a function of the program the link left out, as LLVM does one it inlined into every caller, instead of asking for it by name and restarting the program. A
+  now (docs/v2/plan.md has the figures). blaze's link gives the program a GNU build ID on Linux, by which it takes live edits. On macOS a program finds the statics and functions of the standard library blaze built once by their names without Mach-O's leading underscore, as it asks for them, so std's `GLOBAL_PANIC_COUNT` is no longer refused as having no symbol. A patch compiles its own copy of a function of the program the link left out, as LLVM does one it inlined into every caller, instead of asking for it by name and restarting the program. A
   patch the splice declines (one that calls what the link left out as unreached) has the
   program built in full and linked, where the link of the object alone left the edit out. A
   workspace with no lock file, or one its manifests no longer agree with, has it written by
@@ -1086,7 +1086,7 @@ since the release before and the title of each change merged since.
   18 where 156 and takes as long, 0.53 to 0.70 s: what is left on both is the code that
   changed, compiled on a cold database (main before #360 compiled everything at the start and
   took 0.09 s and 0.37 s, its start 4.8 s longer on nushell)
-  ([warm-start.md](research/warm-start.md)). A stored mark no longer hashes where the
+  (warm-start.md). A stored mark no longer hashes where the
   named locals are kept for a debugger, which a full build and a later compile of the same
   code can tell apart, and which had every edit after a restart compile such code again.
   Entries are kept under new keys. `storetracked.py` has the edits of one body take some
@@ -1208,7 +1208,7 @@ since the release before and the title of each change merged since.
   restarted daemon's build on a store that has everything takes 38.3 s instead of 106.5, its
   "store read" 130.8 s of thread time instead of 561.1, the first edit's rebuild 12.2 s instead
   of 45.5, and a second checkout is ready 59.0 s after its build instead of 113.0; nushell's
-  takes 35.4 s instead of 37.8 ([research/warm-start.md](research/warm-start.md)).
+  takes 35.4 s instead of 37.8 (research/warm-start.md).
 - `unused_mut` a source denies fails the build, with the seven deny lints before it (#84).
   `harness/lints_ui.py --deny unused_mut` scores it on every rustc UI test: 51 right, 0 wrong,
   5 missed against the nightly, 49, 0, 5 against 1.99.0. `RA_JIT_BORROWCK_REFUSE=0` turns it
@@ -1348,7 +1348,7 @@ since the release before and the title of each change merged since.
   snmalloc start colder and edit no faster (an edit spends 1.8% of its time allocating, 73%
   revalidating salsa's memos). `release` itself is unchanged and stays the build to work with,
   so rebuilding ra-jit after a change takes as long as before
-  ([docs/reports/RELEASE-BUILD.md](reports/RELEASE-BUILD.md)).
+  (fed1eb428d:docs/reports/RELEASE-BUILD.md).
 - Under `RA_JIT_BACKEND=llvm`, a body of more than 10 000 Cranelift instructions is compiled
   by Cranelift. Since LLVM lowers a handler that takes more than the exception (tiers), it
   compiled every function, and an edit of nushell's `main` (35 778 instructions) waited
@@ -2379,7 +2379,7 @@ since the release before and the title of each change merged since.
 - Merge origin/main into the linux-speed merge
 - #[ra_jit::cache] keeps the results of pure functions across runs, keyed by the code they reach (#17)
 - release binaries are thin LTO (`dist`) with PGO; a worker loaded beside cargo's first build ends with its daemon
-- benchreport: the build table says it times ra-jit's `cargo build --release`, and that release binaries are `dist` with PGO (docs/reports/RELEASE-BUILD.md)
+- benchreport: the build table says it times ra-jit's `cargo build --release`, and that release binaries are `dist` with PGO (fed1eb428d:docs/reports/RELEASE-BUILD.md)
 - Merge origin/main into the build-profile merge (CHANGELOG: both Changed entries kept)
 - the first edits patch what rustc linked, so the daemon is ready as cargo finishes (#11)
 - Merge origin/main into the cold-start merge
@@ -2479,7 +2479,7 @@ since the release before and the title of each change merged since.
 - a let's written type keeps the lifetimes an alias or a _ shares, constant patterns ascribed contravariantly (borrowck 1430/1426, floor 1427) (#113)
 - a static a body's macro declares finds rustc's symbol: helix's own base in one round (#37, no-rustc E) (#114)
 - const { .. } blocks checked with their function, as rustc checks inline consts (borrowck 1433/1429, floor 1430) (#115)
-- docs/glancer.md: #56 merged, #57 closed, #55 restarted (#116)
+- docs/v2/plan.md: #56 merged, #57 closed, #55 restarted (#116)
 - a callee's projection bounds relate regions, array subslice moves checked per element (borrowck 1440/1436, floor 1437) (#117)
 - bun as a regular project in every README benchmark table and chart, and in the geometric means (#118)
 - Runtime numbers of main 9c31e64d83 on macOS arm64, Linux aarch64 (first time) and Linux x86-64, every program matching cargo's output (#119)
@@ -2513,13 +2513,13 @@ since the release before and the title of each change merged since.
 - #[ra_jit::cache] keeps each function's results for its last three codes, and cargo ra-jit cache lists and clears stale ones (#143)
 - bun's whole program at 1.28x release (was 5.9x) and linking on macOS (#35); adding a function to bun a 0.6 s patch (was 19.8 s); a regression test for the rust-src check (#142)
 - ra-jit allocates with jemalloc on Unix: the daemon after edits 1.57 GB instead of 2.03 on ripgrep, 9.52 instead of 10.80 on nushell, 11.07 instead of 12.13 on helix (#39) (#146)
-- the daemon loads build scripts and proc macros from cargo's build instead of building them again (bevy's target 16.2 to 15.8 GB, ready 30 to 20 s), packs go to a remote compressed once, and docs/research/disk.md after F/G projected (#153)
+- the daemon loads build scripts and proc macros from cargo's build instead of building them again (bevy's target 16.2 to 15.8 GB, ready 30 to 20 s), packs go to a remote compressed once, and fed1eb428d:docs/research/disk.md after F/G projected (#153)
 - #[ra_jit::cache] takes Rc, Arc and HashMap arguments, keys by the sysroot's metadata hash, and looks through the MIR of core and alloc: _rdtsc and the like refused, inlining hides no address (#18 items 1-3) (#150)
 - Linux x86-64 bench at 28f22ff4a8: bevy edits faster than cargo (a function 3.15 s to 650 ms, a widely used one 10.69 s to 240 ms) (#156)
 - docs say the workflows that commit to main push with RA_JIT_BOT_TOKEN past the ruleset, not GITHUB_TOKEN (#157)
 - Merge borrowck-7: borrowck 1509/1505 of rustc's tests (floor 1506): the super lets of format_args! and pin! extend their temporaries only when a let extends them, as rustc since #145784, a variable another crate's macro declares is a temporary in the messages, and an error at what a macro lowers to is at the macro call (#151)
 - link only what is reached of the standard library: the unit at line tables, split into an archive of 17 parts lld reads in parallel; hello's link 160 -> 130 ms, executables 20.4 -> 15.2 MB and ripgrep's 55.1 -> 50.1 MB (#87) (#152)
-- the daemon keeps ra-jit.o zstd-packed between the links that read it on Linux (helix's target 5.0 to 4.5 GB, nushell 6.2 to 5.8), and docs/research/disk.md with it (#158)
+- the daemon keeps ra-jit.o zstd-packed between the links that read it on Linux (helix's target 5.0 to 4.5 GB, nushell 6.2 to 5.8), and fed1eb428d:docs/research/disk.md with it (#158)
 - Release parity: a returned local is built in the caller's memory and a moved argument shares its slot (NRVO), rustc's ThinLTO pre-link and link pipelines, the SLP vectorizer on again, NEON's 16-byte addp as iadd_pairwise, and a trait's provided method's inner functions compiled with the crate ra-jit names. Runtime against cargo's release: nbody 1.26 to 0.98 on x86-64 and 1.29 to 1.05 on Graviton4, qsort 1.11 to 1.04, eza 1.08 to 1.00-1.06, words 1.28 to 1.24 on Graviton4 (#160)
 - Debug type sets share what each type is told as (#55); the own base gives memory back before giving up (#163)
 - borrowck: no false errors on tracing 0.1.44's trace! fields (#109) or on a trait object given for a parameter bounded T: 'a (#84) (#164)
@@ -2567,7 +2567,7 @@ since the release before and the title of each change merged since.
 - f32::max in a constant is evaluated (core's fallback body), so nsh apps' builds stay whole-program and their edits patch; a trait method left without an impl names its Self type (#224) (#228)
 - biome: the first edit after a cargo build stays the daemon's, memory bounds follow the control group, biome in the bench set (#229)
 - cargo ra-jit test: RA_JIT_TESTS=affected runs only the tests an edit reached since they passed, from the daemon's hash of each test's code and all it calls (#227) (#230)
-- docs/research: the store's block cache measured on helix's warm start (no gain), and bbtree against papaya and DashMap for ra-jit's shared maps (#231)
+- fed1eb428d:docs/research: the store's block cache measured on helix's warm start (no gain), and bbtree against papaya and DashMap for ra-jit's shared maps (#231)
 - AGENTS.md: own the whole stack, and stay a superset of Rust (#234)
 - cargo ra-jit check writes rustc's JSON diagnostics as cargo check does (424/424 fields against rustc), -Z, --exclude and several targets checked by the daemon; the borrow checker's 4 trait-solver panics fixed at their causes; the 5,204-arm else-if chain in 4.5 s (#206); ide-diagnostics passes and runs in the fast tier (#222)
 - Affected tests: TypeId::of and the dyn Any methods are leaves of the hash walk (#238)
@@ -2587,11 +2587,11 @@ since the release before and the title of each change merged since.
 - Test harness: a test in a private module named as a public function beside it is reached; helix-core's edits are the daemon's again (#227) (#256)
 - a tracked function's interned arguments can be kept for good, and six hot ones whose arguments salsa never collects are; cpufold.py counts samples by period; lean-frontend.md, slices 2 to 4 (#253)
 - Doctests: one load of the workspace for every library's examples, and the daemon's store; warm cargo ra-jit test --doc on ripgrep 82.6 -> 3.3 s, helix 125.3 -> 9.7 s (#28, #227) (#248)
-- docs/ci-runner.md: our own CI runner on ix, a warm ra-jit seed per repository and a copy-on-write fork per branch (#264) (#266)
+- docs/v2/plan.md: our own CI runner on ix, a warm ra-jit seed per repository and a copy-on-write fork per branch (#264) (#266)
 - a daemon's first start after a cold build finds what that build stored: one toolchain identity either way (nushell restart 0 to 103,750 functions found, cold compile 17.9 s to 11.9 s) (#267)
 - tests that reach outside their code run in a Linux sandbox and rerun only when what they touched changed (#257) (#263)
 - ra-jit is renamed blaze: `cargo blaze` is the command, `cargo-blaze` the crate and binary, BLAZE_* the settings; `cargo ra-jit` and RA_JIT_* keep working (#268)
-- docs/roadmap.md: blaze-next, the floor of an edit for coding agents: Merkle VFS, sans-IO core, push invalidation, image state, agent API, lints (#279) (#280)
+- docs/v2/plan.md: blaze-next, the floor of an edit for coding agents: Merkle VFS, sans-IO core, push invalidation, image state, agent API, lints (#279) (#280)
 - frozen def maps of a crate with a build script are shared by every checkout: OUT_DIR keyed from cargo's build dir and named by a mark in the bytes (nushell second checkout 221 to 374 of 478 crates) (#281)
 - research: lean-frontend.md, slice 4's four functions measured alone, and #236's rest left for blaze-next (#282)
 - Unit tests: an edit to a library they link is the daemon's, not cargo's; ripgrep's edits run the tests they affect (#258, #84) (#265)
@@ -2606,7 +2606,7 @@ since the release before and the title of each change merged since.
 - patch marks keyed by stable names: a daemon started on a store takes the checkout's code as it is, no rebuild before the first edit (nushell restart 30.8 to 21.4 s) (#295)
 - README heading: ix mark vertically centered on the blaze wordmark (#297)
 - cargo blaze builds with Rust 1.99.0 whatever toolchain the project pins (#269): no build goes to cargo for it; plain errors when 1.99.0 or rust-src is missing (#296)
-- docs/self-contained.md: the plan for a blaze with no rustup and no cargo that resolves as cargo does (#298) (#301)
+- docs/v2/plan.md: the plan for a blaze with no rustup and no cargo that resolves as cargo does (#298) (#301)
 - blaze-build-script: the environment cargo 1.99.0 gives a build script, computed with no cargo (#89, #298) (#304)
 - README: an animated pixel-fire header and a short, scannable README; the long parts move to docs/install.md, docs/usage.md and docs/benchmarks.md (#308)
 - docs: J, K and M planned together (#298): J first, K behind it, M last (#313)
@@ -2624,7 +2624,7 @@ since the release before and the title of each change merged since.
 - install.sh without rustup, blaze brings its Rust; install.yaml on a machine with no Rust (#298) (#340)
 - J: proc macros are blaze's by default: the daemon's loads, the checker and build scripts expand with libraries ra-jit makes from each crate's record, kept in the store by content; macroserver.py builds each app again over the store (#348)
 - blaze-registry fetches every source a lock file names as cargo 1.99 does ([source] replacement, vendored directories, git checkouts), held to cargo fetch by harness/fetchdiff.py (#298) (#324)
-- docs/self-contained.md: the no-rustup install measured on a clean machine, the metadata switch (#298) (#352)
+- docs/v2/plan.md: the no-rustup install measured on a clean machine, the metadata switch (#298) (#352)
 - a workspace resolved as cargo 1.99.0 does around its resolver: two resolves, [patch] and the lock file's locks (#298) (#339)
 - a name is looked up in an index of the names in rustc's function symbols: biome's first body edit 6.63 s to 5.25 s (#325) (#356)
 - The store keyed by what ra-jit was built from, crate ids below CARGO_HOME, build-script runs keyed with the checkout and target directory apart (#105) (#326)

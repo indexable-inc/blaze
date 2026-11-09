@@ -1,6 +1,6 @@
 [package]
 name = "blaze-graph"
-description = "blaze's build driver as a graph that does no IO: a state machine of nodes, and the executor that does what it asks (docs/driver.md)"
+description = "blaze's build driver as a graph that does no IO: a state machine of nodes, and the executor that does what it asks (docs/v2/plan.md)"
 publish = false
 
 version.workspace = true

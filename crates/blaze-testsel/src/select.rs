@@ -1,4 +1,4 @@
-//! Whether a test runs, and how it ran (docs/v2/plan/lanes/fastcompile/select.md, "Selection").
+//! Whether a test runs, and how it ran (docs/v2/plan/design/compile-time.md, "Selection").
 //!
 //! A pass is kept in the store under a [`RunKey`] whose code is the test's name, its
 //! attributes and a [`Set`] of functions (by identity and bound code), and whose given is its

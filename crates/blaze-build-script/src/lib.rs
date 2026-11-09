@@ -9,7 +9,7 @@
 //! (blaze's sandbox does). A script is any executable the caller places (`Unit::script`);
 //! nothing here assumes where or by what it was compiled.
 //!
-//! For blaze v2 (docs/v2/plan/lanes/usercode.md): scripts that only print constant directives are read
+//! For blaze v2 (docs/v2/plan.md): scripts that only print constant directives are read
 //! rather than run ([`elide`](mod@elide), #1296); the environment says what cargo sets from the unit and
 //! what it passes through ([`Env::origin`], #805); and what cargo's rule watches of a run
 //! is data ([`watch`]), for a run keyed as cargo keys it (#1450).
@@ -17,7 +17,7 @@
 //! Each reads its input in one pass over borrowed bytes: what a script prints is read line by
 //! line into a [`output::Sink`] ([`output::read`]), the root file elision reads is lexed a
 //! token at a time ([`elide::lex::Tokens`]), and a run is judged from its bytes alone
-//! ([`run::judge`]). docs/v2/plan/lanes/usercode/scripts.md says how each compares with the
+//! ([`run::judge`]). docs/v2/plan.md says how each compares with the
 //! fastest known way.
 //!
 //! [#89]: https://github.com/indexable-inc/blaze/issues/89

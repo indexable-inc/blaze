@@ -296,7 +296,7 @@ there a repeated name is not a repeated key.
 | since | u64? | the last build that computed it (however that build ended), which it is compared with |
 
 `blaze why` reads the same rows from the daemon (`Request::Rebuilt`). How each cause is worked
-out is in docs/v2/plan/lanes/why.md.
+out is in docs/v2/plan/design/why.md.
 
 The fiber driver notes the four `fiber stack` counters when a job ends, as one row in the
 recorder (`blaze_profile::fiber_stack`):
@@ -816,7 +816,7 @@ The daemon gives both to `History::linked` and `History::crate_graph` (`crates/b
 
 `blaze perf record` writes both, one pair of files a run (`perf-<run>.<table>.parquet`, which the
 history's cap never deletes), and `blaze perf diff` compares two runs function by function, joined by
-`identity`, with a noise bound and a cause class: docs/v2/plan/lanes/perf-history.md.
+`identity`, with a noise bound and a cause class: docs/v2/plan/design/perf-history.md.
 
 ### `open`: the spans live threads are inside
 

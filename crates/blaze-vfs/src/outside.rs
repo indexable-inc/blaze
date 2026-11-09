@@ -1,4 +1,4 @@
-//! What changed outside every view (docs/v2/plan/lanes/vfs/outside.md): the directories user
+//! What changed outside every view (docs/v2/plan/design/vfs.md): the directories user
 //! code reads that no view holds (the toolchain, the C compiler's, `/usr/include`, each traced
 //! path's parent), watched so a check asks "has anything under this changed since then?" of a
 //! table, not of the disk.

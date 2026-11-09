@@ -1,4 +1,4 @@
-//! User code (docs/v2/plan/lanes/usercode.md section 6.5; #1450, #1480, #1296, #1297, #1443, #804).
+//! User code (docs/v2/plan.md section 6.5; #1450, #1480, #1296, #1297, #1443, #804).
 //!
 //! - A build script's or proc macro's run happens in a [`blaze_core::Sandbox`] that traces
 //!   what it read ([`blaze_core::Traced`]). Its result is keyed by its own code hash and
@@ -14,8 +14,8 @@
 //! rule for what can't be traced; [`run`] is a run as a state machine, from the store or a
 //! sandboxed spawn to a kept result; [`script`] and [`pool`] are build scripts and the warm
 //! processes proc macros run in; [`pure`] keeps a build script proved pure under a key that
-//! needs no compile (docs/v2/plan/lanes/pure-scripts/design.md); [`test`] selects and runs tests
-//! (docs/v2/plan/lanes/usercode/notes.md).
+//! needs no compile (docs/v2/plan.md); [`test`] selects and runs tests
+//! (docs/v2/plan.md).
 
 #![feature(allocator_api, allocator_ext)]
 #![forbid(unsafe_code)]

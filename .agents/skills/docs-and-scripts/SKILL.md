@@ -12,7 +12,7 @@ description: "Conventions for blaze's documents, scripts and agent-facing interf
 No MCP. Agent-facing interfaces are a Unix socket or HTTP with one versioned schema in deterministic
 CBOR; the CLI is a client of the same API.
 
-See [docs/roadmap.md#8-the-agent-api](../../../docs/roadmap.md#8-the-agent-api).
+See [docs/v2/plan.md#9-one-interface](../../../docs/v2/plan.md#9-one-interface).
 
 ## docs-say-what-they-are (rule 41)
 
@@ -28,6 +28,16 @@ See [docs/contributing.md#documents](../../../docs/contributing.md#documents).
 A script takes one JSON value (a file path, `-` or inline), parsed into a frozen dataclass that
 refuses unknown fields, not a set of flags or hidden environment variables. An existing script moves
 to this when next changed.
+
+## docs-stay-small (rule 49)
+
+The plan is one page (`docs/v2/plan.md`), with the ledger, the bounds and one spec per design that
+is not yet built. Write no lane notes, pass reports, status files or indexes of indexes: what was
+done is the commit and the pull request. A design that changes edits its spec in place; a spec whose
+design is built is deleted or becomes a current doc. Delete a doc that is no longer true or needed
+in the same change; git keeps it.
+
+See [docs/v2/plan.md#how-the-work-is-run](../../../docs/v2/plan.md#how-the-work-is-run).
 
 <!-- End of the generated rules. Hand-written notes follow. -->
 

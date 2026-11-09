@@ -386,7 +386,7 @@ pub struct IntLiteralTooLarge {
 }
 
 /// A `blaze_verify` specification clause or named return type lowering refused
-/// (docs/v2/plan/lanes/verus.md): `node` is the clause (`requires ..`) or the return type.
+/// (docs/v2/plan/design/verus.md): `node` is the clause (`requires ..`) or the return type.
 #[derive(Debug)]
 pub struct VerifyRefused {
     pub node: InFile<SyntaxNodePtr>,
@@ -5505,7 +5505,7 @@ impl<'db> AnyDiagnostic<'db> {
 
 /// A body's source map, asked for the first time a diagnostic of the body is placed. The map
 /// holds file positions, so it is made again on every edit before the body in its file; a
-/// body with nothing to report never reads it (docs/v2/plan/lanes/firewall/notes.md).
+/// body with nothing to report never reads it (docs/v2/plan/design/item-hash.md).
 struct Placing<'db> {
     db: &'db Db,
     def: DefWithBodyId,

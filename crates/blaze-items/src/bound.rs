@@ -1,4 +1,4 @@
-//! An item's bound hash (`docs/v2/requests/fastcompile.md`, fastcompile-ident-select 6): its code
+//! An item's bound hash (`fed1eb428d:docs/v2/requests/fastcompile.md`, fastcompile-ident-select 6): its code
 //! hash and what its code binds to by identity, for test selection.
 //!
 //! A code hash fills each ref by its interface hash, so a call of `a` and a call of `b` with

@@ -1,4 +1,4 @@
-//! Model tests (docs/v2/plan/lanes/safety/model.md) of the tagged lock-free stack every pool
+//! Model tests (docs/v2/plan/design/model-checker.md) of the tagged lock-free stack every pool
 //! and the chunk cache move batches through: 2 or 3 threads under every interleaving to the
 //! preemption bound and every value C11 lets a load read, against a sequential model (the
 //! multiset of indices on the stack or held). And the frame cap (`frame::Cap`): its waits and

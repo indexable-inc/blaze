@@ -1,4 +1,4 @@
-//! The workspace load and the unit graph as queries of blaze's database (docs/v2/plan/lanes/cargo/notes.md;
+//! The workspace load and the unit graph as queries of blaze's database (docs/v2/plan.md;
 //! #1450's 238 s load): pure functions of a view's `Cargo.toml`s, lock file and config, and of
 //! the sources mounted beside it, so nothing is loaded again on start (the daemon's image has
 //! it) and an edit reruns only what read what changed.

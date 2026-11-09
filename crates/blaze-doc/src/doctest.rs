@@ -1,4 +1,4 @@
-//! A library's doctests, built by blaze with no rustdoc (docs/v2/plan/doctests.md): every
+//! A library's doctests, built by blaze with no rustdoc (docs/v2/plan/design/doctests.md): every
 //! code block of its documentation that is Rust is found as rustdoc finds it ([`examples`])
 //! and turned into the program rustdoc makes of it ([`Program::of`]), one crate per example.
 //! blaze never merges examples into one crate, in any edition: each is its own unit, built,

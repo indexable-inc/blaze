@@ -717,7 +717,7 @@ pub fn sealed_bounds(db: &Db, impl_: ImplId) -> impl Iterator<Item = (TypeParamI
 /// in its orphan check, if one does: a direct bound `param: S` ([`sealed_bounds`]) where every
 /// impl of `S` is for a local type of the crate ([`sealed_closure`]), the first such bound in
 /// where-clause order. Then a blanket impl over `S` stands for one impl per impl of `S`, each of
-/// which the orphan rules allow in the crate (docs/v2/plan/lanes/frontend/sealed-orphan.md,
+/// which the orphan rules allow in the crate (docs/v2/plan/design/sealed-orphan.md,
 /// "Why it is sound"); `hir-ty-coherence` checks the rest (sealing in other crates, overlap,
 /// the traits it may not relax).
 pub fn sealed_local_bound(db: &Db, impl_: ImplId, param: TypeParamId) -> Option<TraitId> {

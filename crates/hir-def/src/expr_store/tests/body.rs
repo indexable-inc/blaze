@@ -1588,7 +1588,7 @@ fn f(x: u32) -> Option<u32> {{
     }
 }
 
-/// `#[blaze::contract_test]` (docs/v2/plan/lanes/contracts.md, part 2): the path resolves to
+/// `#[blaze::contract_test]` (docs/v2/plan/design/contracts.md, part 2): the path resolves to
 /// `core::blaze::contract_test` without a `blaze` crate, and the function is kept beside a test
 /// `f_contract` that assumes the `requires`, calls `f` and checks the `ensures`. `main` has
 /// `core` and no `std`, so the fixture makes it `no_std` and it imports

@@ -701,6 +701,10 @@ impl App {
             self.side_drag_move();
             return;
         }
+        if self.web_dragging() {
+            self.web_drag_move();
+            return;
+        }
         // Over a live browser page, or holding a press on one: the page's (app/browser.rs).
         if self.browser_pointer_move(m) {
             self.poke();
@@ -749,9 +753,23 @@ impl App {
             self.side_drag_start();
             return;
         }
+        // On the browser pane's left edge: drag it wider or narrower (app/browser/drag.rs).
+        if b == Button::Left && self.on_web_edge() {
+            self.web_drag_start();
+            return;
+        }
+        // A right press or a control-click on a sidebar row opens its menu at the pointer, the selection left where it is;
+        // a press off an open one closes it and goes no further (row_menu.rs).
+        if self.row_menu_down(x, y, b, m) {
+            return;
+        }
         if b == Button::Left {
             self.pointer.down = true;
             self.pointer.went_down = true;
+        }
+        // A press on the open row menu is its items' (the UI layer's press), not a pane's or a terminal's under it.
+        if self.on_row_menu() {
+            return;
         }
         // A press off the row whose name is being renamed saves the rename (chat/rename.rs), and does what it does.
         self.rename_press();
@@ -805,6 +823,10 @@ impl App {
         self.mods = m;
         if self.drag.active() {
             self.side_drag_end();
+            return;
+        }
+        if self.web_dragging() {
+            self.web_drag_end();
             return;
         }
         if b == Button::Left {
@@ -1003,6 +1025,10 @@ impl App {
     /// send up the responder chain), else typing for whatever has the keyboard.
     pub fn key(&mut self, k: &term::KeyIn<'_>) -> super::Outcome {
         self.poke_why("key");
+        // An open row menu has the keys while it is open, as NSMenu has (row_menu.rs).
+        if self.row_menu_key(k) {
+            return super::Outcome::None;
+        }
         // An element of a cell's UI that has the keys hears them first (genui/common.rs).
         if self.genui_common_key(k) {
             return super::Outcome::None;
@@ -1072,6 +1098,10 @@ impl App {
 
     /// Text an input method, the emoji picker or dictation committed: sent as typed to the focused terminal.
     pub fn commit_text(&mut self, text: &str) {
+        // Typing while a row menu is open goes nowhere, as under an open NSMenu.
+        if self.row_menu_open() {
+            return;
+        }
         if self.palette.is_none() && self.browser_commit(text) {
             return;
         }

@@ -1,12 +1,12 @@
 //! The oracle's cases for name resolution and the impl buckets (docs/v2/plan/design/frontend.md
-//! items 1 to 3; docs/v2/plan/lanes/frontend/nameres-oracle.md). Each [`Case`] is one slot of
+//! items 1 to 3; docs/v2/plan/design/frontend.md). Each [`Case`] is one slot of
 //! `harness/v2/fixture.py` aimed at them, and says what an edit of that slot, between any two
 //! of its variants, may change and must rerun. [`check`] holds three traces to it: the build
 //! before the edit, the incremental build after it and the build from scratch of the same
 //! source.
 //!
 //! A case counts only keys that name no expansion round: the facts of
-//! docs/v2/plan/lanes/items.md section 6.2 (`Resolves`, `Implements`, `Method`), `module_decls`
+//! docs/v2/plan/design/item-hash.md section 6.2 (`Resolves`, `Implements`, `Method`), `module_decls`
 //! and `module_impls`. So it holds however many rounds a crate needs. The keys that do name one
 //! (`scc_state`, `macro_step`, `fact_handle`, `ModuleScope::name`, ...) are held to the rules
 //! that need no count: a result that reran read something that changed, a result kept read

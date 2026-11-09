@@ -213,7 +213,7 @@ static CONTRACT_TEST: std::sync::LazyLock<[Name; 3]> = std::sync::LazyLock::new(
 });
 
 /// The path an attribute macro's `path` resolves as: `blaze::contract_test` is blaze's builtin
-/// `::core::blaze::contract_test` (docs/v2/plan/lanes/contracts.md, part 2) in every crate,
+/// `::core::blaze::contract_test` (docs/v2/plan/design/contracts.md, part 2) in every crate,
 /// whatever else `blaze` names there, as `blaze::pure` and the other inert `blaze::` attributes
 /// are (`DefMap::is_builtin_or_registered_attr`). Every other path is itself.
 fn attr_path_alias(path: &ModPath, expected: Option<MacroSubNs>) -> (PathKind, Segments<'_>) {

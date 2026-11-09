@@ -19,7 +19,7 @@ call reaches.
 
 See [docs/v2/plan/design/memory.md](../../../docs/v2/plan/design/memory.md).
 
-## one-memory-measure (rule 46)
+## one-memory-measure (rule 50)
 
 The footprint (macOS `phys_footprint`, Linux's cgroup charge) is the one measure of blaze's memory,
 because it is the number the kernel enforces. Admission, the front end's release and the daemon's
@@ -30,7 +30,7 @@ threshold around.
 
 See [docs/memory-footprint.md](../../../docs/memory-footprint.md).
 
-## outputs-are-records (rule 47)
+## outputs-are-records (rule 51)
 
 A value that outlives the task that made it (a query result, a compiled function, a unit's object
 code) is a blaze-format record: no pointer, position-independent, written once and read in place
@@ -49,7 +49,7 @@ skill's.
 
 See [crates/blaze-format/src/lib.rs](../../../crates/blaze-format/src/lib.rs).
 
-## cache-by-code-id (rule 48)
+## cache-by-code-id (rule 52)
 
 A cache of what a function returns is keyed by that function's behaviour identity,
 `fn_info(&f).code_id` (a Merkle hash of its code and everything it reaches; const eval does not

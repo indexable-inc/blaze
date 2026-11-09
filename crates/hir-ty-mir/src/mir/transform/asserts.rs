@@ -425,7 +425,7 @@ fn int_const<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>, bound: Bound) -> Operand {
 
 /// How many bits a value of the integer type `ty` has: its size's, but for an integer of
 /// `#![blaze::arbitrary_ints]`, whose value is narrower than what it is stored in (`u3` in a
-/// `u8`; docs/v2/plan/lanes/frontend/arbitrary-ints.md).
+/// `u8`; docs/v2/plan/design/arbitrary-ints.md).
 fn value_bits<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>) -> u64 {
     let width = match ty.kind() {
         TyKind::Int(it) => it.arbitrary_width(),

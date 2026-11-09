@@ -28,7 +28,7 @@
 //! it lends the kernel, and what only its submission and end read; its handle is the
 //! `user_data` of its completions. The machinery that asks the kernel and steps completions is
 //! in [`flight`]. A large send on a TCP connection goes from the asker's pages
-//! (`IORING_OP_SEND_ZC`). docs/v2/plan/lanes/core/speed-uring.md has the costs per request and
+//! (`IORING_OP_SEND_ZC`). docs/v2/plan.md has the costs per request and
 //! how they compare with other runtimes.
 //!
 //! Why unsafe: the rings are memory shared with the kernel (`mmap` of the ring's file), read and
@@ -185,7 +185,7 @@ const AT_STATX_DONT_SYNC: i32 = 0x4000;
 /// Names a stamper claims at once: enough to make the claim's atomic add and the reopen of a
 /// chunk's first directory a percent or two of them (64 `statx`es are ~30 µs), few enough that
 /// the cores' last chunks end within ~30 µs of each other, under 5% of 100 000 names' sweep on
-/// 64 cores (docs/v2/plan/lanes/frontend/journal/linux.md, "Speed of light").
+/// 64 cores (docs/v2/plan/design/restore.md, "Speed of light").
 const STAMP_CHUNK: usize = 64;
 
 /// Requests the ring holds at once, enough to keep an NVMe queue full; more wait in the
@@ -1537,7 +1537,7 @@ impl Job {
 /// Threads, one per core, that stamp [`Effect::Stamp`]'s names with `statx` calls of their own.
 /// The ring would prepare each `IORING_OP_STATX` on its one submission thread and run it on a
 /// worker after, two handoffs per name that take longer than the `statx` itself
-/// (docs/v2/plan/lanes/frontend/journal/linux.md, "Speed of light"). A job reaches stamper 0,
+/// (docs/v2/plan/design/restore.md, "Speed of light"). A job reaches stamper 0,
 /// and stamper `i` hands it on to `2i + 1` and `2i + 2` before it starts, as far as the job has
 /// chunks for: every core is at work after log2 of them wake-ups, none from the ring's thread
 /// but the first. [`Effect::Entries`]' listings go to one stamper each, in turn, where a thread
@@ -3708,7 +3708,7 @@ mod tests {
     }
 
     /// docs/v2/plan/design/restore.md's budget, a warm sweep of 100 000 tracked names in 50 ms,
-    /// and the speed of light (docs/v2/plan/lanes/frontend/journal/linux.md): the kernel's own
+    /// and the speed of light (docs/v2/plan/design/restore.md): the kernel's own
     /// work for every name, measured as one thread's plain `statx` calls of them, over the
     /// cores. The sweep comes within 10% of it; the reference sweep's time is printed beside.
     #[test]
@@ -3982,7 +3982,7 @@ mod tests {
     /// The rounds before this one open what is kept and grow what is reused.
     const WARM: u64 = 3;
 
-    /// docs/v2/plan/lanes/mem/core/linux.md's budget: a warm sync, stat and read of a file kept
+    /// docs/v2/plan/design/memory.md's budget: a warm sync, stat and read of a file kept
     /// open allocate the read's bytes and nothing else.
     #[test]
     fn a_warm_cycle_allocates_the_read_alone() {

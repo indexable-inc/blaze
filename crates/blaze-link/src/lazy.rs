@@ -27,7 +27,7 @@
 //! slide: [`LazyPlacer::new`] takes it (`blaze_inproc::host::Session::slide` of the first) and
 //! every absolute word it writes is the linked address plus it. A process whose slide differs
 //! must be refused before it runs ([`LazyPlacer::slide`]); the launcher starts lazy runs with
-//! one slide (docs/v2/requests/requests.md, "lazy runs: the image's runtime and one slide").
+//! one slide (fed1eb428d:docs/v2/requests/requests.md, "lazy runs: the image's runtime and one slide").
 //!
 //! # History
 //!

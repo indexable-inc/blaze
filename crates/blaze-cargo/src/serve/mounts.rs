@@ -1,4 +1,4 @@
-//! Where each fetched source and the standard library are mounted (docs/v2/plan/lanes/cargo/notes.md
+//! Where each fetched source and the standard library are mounted (docs/v2/plan.md
 //! section 3): `at -> root`, kept durable in the VFS's journal as one head per mount, so a
 //! restart recovers every source fetched before and fetches none of them again. A path read
 //! where it is on the disk ([`LocalRead`]) is mounted the same way but kept in memory only:

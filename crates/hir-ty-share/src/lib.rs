@@ -1,6 +1,6 @@
 //! The building blocks of compile identity (`hir-ty-identity`'s `instance_identity`, which
 //! decides which generic instances compile to one body: idea 2 of
-//! `docs/v2/plan/design/compile-time.md`, `docs/v2/plan/lanes/fastcompile/share.md`), and the
+//! `docs/v2/plan/design/compile-time.md`, `docs/v2/plan/design/compile-time.md`), and the
 //! code generator's spelling of types and bodies by content:
 //!
 //! - `fact`: what code that moves, copies, projects or passes a value of a type reads (its

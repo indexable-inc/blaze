@@ -1,4 +1,4 @@
-//! Codegen's steps in the kernel (`blaze_kernel`, docs/v2/plan/lanes/kernel.md).
+//! Codegen's steps in the kernel (`blaze_kernel`, docs/v2/plan/design/kernel.md).
 //!
 //! A dev template is the kernel's entry with no reads of [`DevTemplate`]. Its identity is the
 //! instance as the driver keeps it ([`crate::driver::placed`] of [`crate::driver::stored`]: the

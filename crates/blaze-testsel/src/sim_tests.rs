@@ -1,5 +1,5 @@
-//! A deterministic simulation of record, edit and select (docs/v2/plan/lanes/fastcompile/
-//! select.md, "Proof"). A program of functions, each version of which calls others (some only
+//! A deterministic simulation of record, edit and select (docs/v2/plan/design/compile-time.md,
+//! exact test selection). A program of functions, each version of which calls others (some only
 //! under a bit of an input file it reads), reads or not, fails or not, and observes its own
 //! position or not, is edited at random: a body edited, reverted, or moved by a line added or
 //! removed above it, its code unchanged. After each edit every test is chosen for, then run for

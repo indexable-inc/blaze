@@ -1,4 +1,4 @@
-//! A job's edits by meaning and its build ahead (docs/v2/plan/lanes/fastcompile/intent.md),
+//! A job's edits by meaning and its build ahead (docs/v2/plan/design/compile-time.md),
 //! [`blaze_intent`] over the job's view: an edit reads the view's files as the VFS has them
 //! and builds nothing; a build ahead picks the test units its filters select and runs nothing.
 

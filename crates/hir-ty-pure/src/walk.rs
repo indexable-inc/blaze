@@ -1764,7 +1764,7 @@ impl<'a, 'db> Walk<'a, 'db> {
     /// allocator's choice, and comparing function pointers at all, since whether two are equal
     /// is the code generator's. Equality of raw pointers is not counted: two live allocations
     /// never overlap, so it says only whether they are one (a dangling pointer compared with a
-    /// fresh allocation is the gap, docs/v2/plan/lanes/pure-fns.md). The toolchain's own
+    /// fresh allocation is the gap, docs/v2/plan/design/pure-fns.md). The toolchain's own
     /// orderings stay within one allocation (a slice iterator's end).
     fn compare(&mut self, op: &BinOp, left: &Operand) {
         if !self.workspace {

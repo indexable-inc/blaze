@@ -41,6 +41,8 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
+mod drag;
+
 /// The `file://` URL of absolute path `path`: each byte outside the unreserved set and `/` percent-encoded.
 fn file_url(path: &str) -> String {
     let mut out = String::from("file://");
@@ -54,8 +56,8 @@ fn file_url(path: &str) -> String {
     out
 }
 
-/// The pane's state, on `hn.web` (scene/widgets/web.flecs): the view it shows (0 none yet), whether it is open, its width
-/// in points (0: hn.WebPane's).
+/// The pane's state, on `hn.web` (scene/widgets/web.flecs): the view it shows (0 none yet), whether it is open (asked
+/// for: it shows only once it has a page, [`App::web_shown`]), its width in points as last dragged (0: hn.WebPane's).
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct WebState {
     pub view: u64,
@@ -162,6 +164,8 @@ pub(super) struct Browser {
     popup: Option<u64>,
     /// A page to open in the pane as a view of its own once the link is up (a check's log from a chat card, `web:open:`).
     go: Option<String>,
+    /// The pane's left edge while it is dragged (drag.rs).
+    drag: Option<drag::Grab>,
 }
 
 impl Browser {
@@ -200,6 +204,7 @@ impl Browser {
             extensions: None,
             popup: None,
             go: None,
+            drag: None,
         }
     }
 
@@ -405,11 +410,33 @@ impl App {
             self.set_web(s);
             self.web_focus_page();
         } else {
-            self.set_web(s);
-            self.web_blur();
-            self.browser.menu = false;
-            self.browser.url = None;
+            self.web_shut(s);
         }
+    }
+
+    /// Shut the pane at `s` (its `open` cleared): the keyboard, the address and the extensions menu leave with it.
+    fn web_shut(&mut self, s: WebState) {
+        self.set_web(WebState { open: false, ..s });
+        self.web_blur();
+        self.browser.menu = false;
+        self.browser.url = None;
+    }
+
+    /// Whether the pane shows: open, with its page's picture in (or a reason the harness browser gave for there being
+    /// none: a refused link or open, a view it closed or whose frames it could not take). It never stands open on nothing:
+    /// asked for before the page is made and has drawn, it opens on the page's first frame.
+    pub(super) fn web_shown(&self) -> bool {
+        let s = self.web();
+        let b = &self.browser;
+        if !s.open {
+            return false;
+        }
+        if matches!(b.conn, Conn::Failed(_)) || b.note.is_some() {
+            return true;
+        }
+        s.view != 0
+            && !b.closed.contains_key(&s.view)
+            && (b.errors.contains_key(&s.view) || b.media.as_ref().is_some_and(|m| m.borrow().browser_showing(s.view)))
     }
 
     /// Open `url` in the pane, as a view of its own (the pane shows it once the host made it; what the pane showed stays
@@ -743,6 +770,15 @@ impl App {
                 if let Some(m) = media {
                     m.borrow_mut().browser_forget(view);
                 }
+                // The pane never stands empty: it moves to the newest page left, or shuts when none is.
+                let s = self.web();
+                if s.view == view {
+                    let next = self.browser.views.keys().copied().filter(|v| !self.browser.closed.contains_key(v)).max();
+                    match next {
+                        Some(next) => self.set_web(WebState { view: next, ..s }),
+                        None => self.web_shut(WebState { view: 0, ..s }),
+                    }
+                }
             }
             AppDown::Extensions { req, extensions } => {
                 if b.ext_req == Some(req) {
@@ -761,17 +797,13 @@ impl App {
         }
     }
 
-    /// Spring the pane's clip toward its width (open) or 0 (shut), on the sidebar's spring; the pane keeps its full width.
+    /// Spring the pane's clip toward its width (shown) or 0 (shut, or open with no page yet), on the sidebar's spring; the
+    /// pane keeps its full width.
     fn browser_fold(&mut self, dt: f32) {
-        let s = self.web();
         let mut moved = false;
+        let full = self.web_width();
+        let target = f32::from(u8::from(self.web_shown()));
         let w = self.world.world_ref();
-        let full = if s.width > 0.0 {
-            s.width
-        } else {
-            view::prefab(w, "hn.WebPane").and_then(|p| p.try_cloned::<&Size>()).map_or(0.0, |z| z.w.value)
-        };
-        let target = f32::from(u8::from(s.open));
         if !self.browser.x.settled(target) {
             let tune = crate::look::tune(w, "sidebar");
             if !settle(&mut self.browser.x, target, tune, dt) {
@@ -808,7 +840,8 @@ impl App {
             if let Some(why) = b.note.as_ref().filter(|_| src.is_empty()) {
                 return format!("The harness browser refused: {why}");
             }
-            return if src.is_empty() { "No page".into() } else { format!("Opening {}", short(src)) };
+            // The pane has no page only while it folds away (it shuts when its last page goes): no words over it.
+            return if src.is_empty() { String::new() } else { format!("Opening {}", short(src)) };
         };
         if let Some(why) = b.closed.get(&view) {
             return format!("The harness browser closed this page: {why}");
@@ -916,7 +949,7 @@ impl App {
                 t.text(&shown);
             }
         }
-        if let Some(l) = pane.part("load") {
+        if let Some(l) = pane.part("page").and_then(|p| p.part("load")) {
             hairline(l.entity(), info.as_ref().is_some_and(|i| i.loading));
         }
         let Some(holder) = pane.part("menu") else { return };

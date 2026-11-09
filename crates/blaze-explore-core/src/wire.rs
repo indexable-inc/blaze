@@ -1,5 +1,5 @@
 //! The daemon's framing, decoded exactly as blaze-explore writes it (its `frame` and `server`
-//! modules; docs/v2/plan/lanes/observe/explore.md, "Frames").
+//! modules; docs/v2/plan/design/explore.md, "Frames").
 //!
 //! - An **answer**, on a request's stream: `u32 LE` header length, the header's JSON padded
 //!   with spaces so the IPC after it starts 8-aligned, then one Arrow IPC stream or nothing.

@@ -1,5 +1,5 @@
 //! blaze: which configurations of a package use each of its items, and the lints that says
-//! (docs/v2/plan/multiconfig-check.md): `blaze::dead` (no configuration checked uses it, rustc's
+//! (docs/v2/plan/design/multiconfig-check.md): `blaze::dead` (no configuration checked uses it, rustc's
 //! `dead_code` over every configuration at once), `blaze::test_only` (only the tests do: a
 //! `#[cfg(test)]` would leave it out of the rest) and `blaze::cfg_only` (only some features,
 //! platforms or targets do, with the narrowest `#[cfg]` that names them exactly, when one

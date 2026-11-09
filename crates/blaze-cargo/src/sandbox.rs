@@ -1150,7 +1150,7 @@ mod tests {
     use super::*;
 
     /// Counts each test thread's allocations, for the allocation-budget tests
-    /// (docs/v2/plan/goals/principles.md): this crate's test binary has its one global allocator
+    /// (docs/v2/plan.md): this crate's test binary has its one global allocator
     /// here.
     #[global_allocator]
     static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;

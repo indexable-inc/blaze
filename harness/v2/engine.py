@@ -97,7 +97,7 @@ DEV_BACKEND_MISSING = (
     "the v2 daemon has no setting for the dev tier's backend yet: cargo's `codegen-backend` profile key "
     "(`-Zcodegen-backend --config 'profile.dev.codegen-backend=\"stencil\"'`) is parsed by blaze-manifest and "
     "not read into `blaze_codegen::plan::Policy`, which compiles opt-level 0 and 1 with Cranelift whatever it says; "
-    "requested in docs/v2/requests/requests-backend-axis.md (codegen: `Profile::codegen_backend` in plan.rs; cargo: "
+    "requested in fed1eb428d:docs/v2/requests/requests-backend-axis.md (codegen: `Profile::codegen_backend` in plan.rs; cargo: "
     "`serve/unit/codegen.rs::policy` reading it; coordinator: blaze-manifest's `-Zcodegen-backend` gate)"
 )
 
@@ -499,7 +499,7 @@ class Engine(ABC):
     @abstractmethod
     def codegen_inputs(self, ws: Path, env: dict[str, str]) -> dict[str, str]:
         """The input of every function's code generation in the last build of `ws`, by the
-        instance's content key: what the oracle compares bit for bit (docs/v2/plan/lanes/proof.md)."""
+        instance's content key: what the oracle compares bit for bit (docs/v2/plan.md)."""
 
     @abstractmethod
     def critical_path_s(self, ws: Path, env: dict[str, str]) -> float:
