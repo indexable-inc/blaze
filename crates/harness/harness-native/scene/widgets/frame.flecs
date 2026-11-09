@@ -124,11 +124,10 @@ hn {
     Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 0, min: 0, max: 0}}
   }
 
-  // A sidebar row's menu (src/app/row_menu.rs): ui.Menu's plate with its corner on the point (hn.RowMenuAt), opening
+  // A sidebar row's menu (src/app/row_menu.rs): ui.Menu's plate with its corner on the point (hn.RowMenuAt), there at once,
   // down from it (up when there is no room below, slid in from the screen's edge), its rows ui.MenuItem and ui.MenuSep.
   prefab RowMenu : ui.Menu {
     Side: {edge: Bottom, dx: 0, dy: 0}
-    Transition: {kind: Grow, from: Top, scale: $menu_in_scale, fade: true}
   }
 
   // The main card: an opaque plate in the theme's ground from the window's top edge to its right and bottom edges (the

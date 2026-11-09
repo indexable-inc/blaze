@@ -17,7 +17,6 @@ hn {
   // The plate: under the chip (above it when there is no room below), inline_peek_w wide, a column of lines.
   prefab ChatPeek : ui.Menu {
     Side: {edge: Bottom, dx: 0, dy: $menu_gap}
-    Transition: {kind: Grow, from: Top, scale: $menu_in_scale, fade: true}
     Flex: {axis: Column, gap: $inline_peek_gap, align: Stretch, justify: Start, wrap: false}
     Size: {w: {kind: Fixed, value: $inline_peek_w, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     Padding: {l: $inline_peek_pad, r: $inline_peek_pad, t: $inline_peek_pad, b: $inline_peek_pad}
