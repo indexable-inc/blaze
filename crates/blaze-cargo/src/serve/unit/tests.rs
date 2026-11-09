@@ -21,6 +21,9 @@ use blaze_usercode::run::Value;
 
 use super::{artifact, codegen, compile, graph, pack, run, script, test, unit_target};
 
+/// `artifact = "gpu"` dependencies, their device build and its MSL applied to the host.
+mod gpu;
+
 const HOST: &str = "x86_64-unknown-linux-gnu";
 
 fn target(name: &str, kind: &str, src: &str) -> Target {
