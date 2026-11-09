@@ -152,6 +152,30 @@ fn doing(d: &Detail) -> Option<String> {
     Some(d.effects.iter().rev().find(|e| e.status == "running").map_or_else(|| "Running\u{2026}".to_owned(), |e| format!("{}\u{2026}", e.doing)))
 }
 
+/// A turn's one line, all its steps folded under it (only its last answer shows beside it): what one of its `calls` is
+/// doing now while it runs (`live`), else what they did, named ("Edited chat.rs, ran cargo test"), failures marked;
+/// how long the turn took (`ms`) its tooltip.
+pub(super) fn turn_line(key: &str, calls: &[group::Call], t: &Transcript, ms: Option<u64>, live: bool, open: bool) -> Line {
+    let now = if live { calls.iter().rev().filter(|c| c.running).find_map(|c| t.details.get(&c.block).and_then(doing)) } else { None };
+    let names: Vec<(Act, String)> = calls.iter().flat_map(|c| c.names.iter().cloned()).collect();
+    let did = group::told_named(calls.iter().flat_map(|c| c.acts.iter().copied()), &names, calls.iter().flat_map(|c| c.fails.iter().copied()));
+    let words = match now {
+        Some(n) => n,
+        None if live && did.is_empty() => "Working\u{2026}".to_owned(),
+        None if live => format!("{did}\u{2026}"),
+        None if did.is_empty() => "Thought it through".to_owned(),
+        None => did,
+    };
+    let mut why: Vec<String> = Vec::new();
+    for w in calls.iter().flat_map(|c| &c.why) {
+        if !why.contains(w) {
+            why.push(w.clone());
+        }
+    }
+    let tip = ms.map(|ms| format!("Worked {}", secs(ms))).unwrap_or_default();
+    Line { key: key.to_owned(), kind: lead_kind(calls), words, why: why.join("\n"), tip, open }
+}
+
 /// A lone cell's line: what it is doing now, else what it did ([`group::Call::summary`]).
 pub(super) fn call_line(key: &str, c: &group::Call, d: &Detail, open: bool) -> Line {
     let words = doing(d).unwrap_or_else(|| c.summary());
