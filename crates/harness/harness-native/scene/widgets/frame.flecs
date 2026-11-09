@@ -75,16 +75,36 @@ hn {
     Padding: {l: $side_inset, r: 0, t: 0, b: 0}
   }
 
-  // The sidebar's last row: the Archive button, then what belongs to the account and not to one chat: what a new chat
-  // starts on (`model`: "Fable 5.2 · medium", quiet) and, at the end, how much of the plan is used (`plan`: hn.ChatPlan,
-  // src/app/chat/plan.rs). The host fills both (src/app.rs sync_side_status).
+  // The sidebar's last row: the Archive button, the focused chat's status bar (hn.SideChat) and, at the end, how much of
+  // the account's plan is used (`plan`: hn.ChatPlan, src/app/chat/plan.rs; src/app.rs sync_side_status).
   prefab SideStatus : ui.Row {
     Flex: {axis: Row, gap: $tree_gap, align: Center, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
   }
-  prefab SideModel : ui.Lead, Faint {
-    Tooltip: {text: "What a new chat starts on (the model and effort last picked)"}
-    TextStyle: {size: $size_chrome, line: $line_chrome, role: 0, bold: 0}
+  // The focused chat's status bar (src/app/chat.rs and chat/pick.rs keep each slot, each only while it has something to
+  // say; empty with no chat in front): its model and effort (hn.ChatPick, its menu hanging from it), then at the end its
+  // context ring (hn.ChatContext), breathing while its agent works. Here, out of the way, not under the composer.
+  prefab SideChat : ui.Row {
+    Cursor: {shape: Arrow}
+    Flex: {axis: Row, gap: $chat_bar_gap, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    pick : ui.Row {
+      Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $chat_bar_h, min: 0, max: 0}}
+    }
+    spacer : ui.Spacer {}
+    meter : ui.Row {
+      Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    }
+    // The picker's menu while it is open: out of the row's flow, its plate placed above the control.
+    menu : ui.Node {
+      Overlay
+    }
+    // The context meter's popover while the pointer is on the ring or on it (src/app/chat/context.rs).
+    pop : ui.Node {
+      Overlay
+    }
   }
   prefab SidePlan : ui.Row {
     Flex: {axis: Row, gap: 0, align: Center, justify: End, wrap: false}

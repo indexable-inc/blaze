@@ -90,35 +90,6 @@ hn {
           }
         }
       }
-      // The chat's status bar, under the composer (src/app/chat.rs and chat/pick.rs keep each slot, each only while it has
-      // something to say): one quiet line in small type with no plate of its own, its edges on the card's inner ones, so
-      // the picker's words start where the typed words do. At its leading edge the model and effort (hn.ChatPick, its menu
-      // hanging from it); at its trailing one the context meter (hn.ChatContext), its one ring breathing while the agent
-      // works, then how much of the person's plan is used (hn.ChatPlan, chat/plan.rs). No buttons: Return sends, Escape
-      // stops.
-      status : ui.Row {
-        Cursor: {shape: Arrow}
-        Flex: {axis: Row, gap: $chat_bar_gap, align: Center, justify: Start, wrap: false}
-        Size: {w: {kind: Grow, value: 1, min: 0, max: $chat_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-        Padding: {l: $chat_composer_pad, r: $chat_composer_pad, t: $chat_status_t, b: 0}
-        pick : ui.Row {
-          Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
-          Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $chat_bar_h, min: 0, max: 0}}
-        }
-        spacer : ui.Spacer {}
-        meter : ui.Row {
-          Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
-          Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-        }
-        // The picker's menu while it is open: out of the row's flow, its plate placed above the control.
-        menu : ui.Node {
-          Overlay
-        }
-        // The context meter's popover while the pointer is on the ring or on it (src/app/chat/context.rs).
-        pop : ui.Node {
-          Overlay
-        }
-      }
     }
   }
 

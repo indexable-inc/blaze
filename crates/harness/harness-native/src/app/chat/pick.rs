@@ -696,7 +696,10 @@ impl App {
                 if model::pane_kind(o) != model::PaneKind::Chat {
                     return None;
                 }
-                let control = super::status_bar(View::of(w.entity_from_id(p)))?.part("pick")?.part("model")?;
+                if self.focused_pane() != Some(p) {
+                    return None;
+                }
+                let control = View::of(w.entity_from_id(self.ids.side_chat)).part("pick")?.part("model")?;
                 over(control.entity()).then(|| self.session_of(*o.id())).flatten()
             })
         })
