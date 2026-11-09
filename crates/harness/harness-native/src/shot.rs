@@ -72,6 +72,11 @@ pub fn run(path: &str) -> Result<(), String> {
     if let Ok(t) = std::env::var("HARNESS_NATIVE_SHOT_OPEN") {
         app.open_target(&t, false);
     }
+    // HARNESS_NATIVE_SHOT_FIXTURE <json>: a recorded world (the daemon's list and runs, chats' events) instead of the
+    // daemon's (App::shot_fixture); run with a private HARNESS_HOME and no daemon.
+    if let Ok(f) = std::env::var("HARNESS_NATIVE_SHOT_FIXTURE") {
+        app.shot_fixture(&f)?;
+    }
     // A session id, a run (`r12`) or one of its stages (`r12.0`).
     if let Ok(s) = std::env::var("HARNESS_NATIVE_SHOT_SELECT") {
         if s == "archive" {

@@ -38,3 +38,22 @@ prefab no_result {
   Fill: $tone_ink_faint
   Tooltip: {text: "No result"}
 }
+
+// An agent's state on its chip over the composer (src/app/chat.rs fill_chat_activity), beside `running` above (at work,
+// breathing): up but waiting for the person (a hollow ring, still), finished (a check in the success ink), failed (a
+// cross in the error ink).
+prefab waiting {
+  Icon: {glyph: ""}
+  Fill: $tone_ink_muted
+  Tooltip: {text: "Waiting for input"}
+}
+prefab done {
+  Icon: {glyph: ""}
+  Fill: $tone_success
+  Tooltip: {text: "Done"}
+}
+prefab failed {
+  Icon: {glyph: ""}
+  Fill: $tone_error
+  Tooltip: {text: "Failed"}
+}
