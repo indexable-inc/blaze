@@ -26,6 +26,18 @@ oracle proves nothing).
     root      the checkout (".")
 
 An entry's id is `<crate>::<item>`, so it moves only when the item is renamed.
+
+Each invariant and refinement has a level, the strength of the evidence for it (docs/v2/plan.md,
+"The ladder"):
+
+    tested         a property test found no counterexample
+    simulated      nor did the deterministic simulation, with faults, crashes and interleavings
+    model-checked  none exists up to a bound (`blaze_check::model`)
+    proved         none exists: a Lean proof, named in the statement
+
+The level is read from the file (it uses the simulation, or the model checker), or said in the
+statement's opening, which wins: `/// The invariant (proved: proofs/Store/Map.lean): ...`. A proof
+named must be a file in the tree.
 """
 
 import re
@@ -43,7 +55,8 @@ SCRIPT = "invariants.py"
 LIST = "docs/v2/plan/invariants.md"
 type Kind = Literal["invariant", "refinement", "model"]
 KINDS: dict[Kind, str] = {"invariant": "Invariants", "refinement": "Refinements", "model": "Reference models"}
-OPEN = re.compile(r"^\s*/// The (invariant|refinement|reference model): (.*)$")
+OPEN = re.compile(r"^\s*/// The (invariant|refinement|reference model)(?: \(([a-z-]+)(?:: ([^)]+))?\))?: (.*)$")
+LEVELS = ("tested", "simulated", "model-checked", "proved")
 DOC = re.compile(r"^\s*///(?: (.*))?$")
 ITEM = re.compile(r"^\s*(?:pub(?:\([^)]*\))? )?(?:const |async |unsafe )*(?:fn|struct|enum|trait|type) (\w+)")
 CONTROL = re.compile(r"^\s*fn (the_oracle_catches_\w+)\(")
@@ -57,6 +70,8 @@ class Entry:
     statement: str
     path: str
     line: int
+    level: str = ""
+    proof: str = ""
 
     @property
     def id(self) -> str:
@@ -81,6 +96,15 @@ def crate_of(path: str) -> str:
     return parts[at - 1] if at >= 1 else parts[0]
 
 
+def inferred(text: str) -> str:
+    """The level a file's own machinery gives its statements."""
+    if "blaze_check::" in text:
+        return "model-checked"
+    if re.search(r"\bsim::|\bSim\b|hegel::sim", text):
+        return "simulated"
+    return "tested"
+
+
 def scan(path: str, text: str) -> tuple[list[Entry], list[str]]:
     """The statements and the controls of one file."""
     entries: list[Entry] = []
@@ -94,7 +118,7 @@ def scan(path: str, text: str) -> tuple[list[Entry], list[str]]:
         if opened is None or (i > 0 and DOC.match(lines[i - 1]) is not None):
             i += 1
             continue
-        start, words = i, [opened.group(2)]
+        start, words = i, [opened.group(4)]
         i += 1
         while i < len(lines) and (more := DOC.match(lines[i])) is not None:
             words.append(more.group(1) or "")
@@ -105,7 +129,11 @@ def scan(path: str, text: str) -> tuple[list[Entry], list[str]]:
         if item is None:
             raise SystemExit(f"{SCRIPT}: {path}:{start + 1}: the statement is on no fn, struct, enum, trait or type")
         statement = " ".join(w.strip() for w in words if w.strip())
-        entries.append(Entry(opened.group(1).removeprefix("reference "), crate_of(path), item.group(1), statement, path, start + 1))  # type: ignore[arg-type]
+        kind = opened.group(1).removeprefix("reference ")
+        level = opened.group(2) or ("" if kind == "model" else inferred(text))
+        if level and level not in LEVELS:
+            raise SystemExit(f"{SCRIPT}: {path}:{start + 1}: the level `{level}` is none of {', '.join(LEVELS)}")
+        entries.append(Entry(kind, crate_of(path), item.group(1), statement, path, start + 1, level, opened.group(3) or ""))  # type: ignore[arg-type]
     return entries, controls
 
 
@@ -130,8 +158,13 @@ def find(root: Path) -> Found:
     return Found(tuple(entries), controls)
 
 
-def problems(found: Found) -> list[str]:
+def problems(found: Found, root: Path | None = None) -> list[str]:
     out: list[str] = []
+    for e in found.entries:
+        if e.level == "proved" and not e.proof:
+            out.append(f"{e.path}:{e.line}: {e.id} says proved and names no proof: `(proved: <path to the proof>)`")
+        if e.proof and root is not None and not (root / e.proof).is_file():
+            out.append(f"{e.path}:{e.line}: {e.id}'s proof {e.proof} is not a file in the tree")
     ids = [e.id for e in found.entries]
     out += [f"{i}: two statements have this id; rename one item" for i in sorted({i for i in ids if ids.count(i) > 1})]
     stated = {e.path for e in found.entries if e.kind != "model"}
@@ -158,7 +191,8 @@ def listing(found: Found) -> str:
         "opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:`; an invariant or a",
         "refinement counts only with a control in its file, a test that plants a bug its oracle must",
         "catch. A change to this file in a pull request is a promise added, reworded or dropped.", "",
-        f"{counts['invariant']} invariants, {counts['refinement']} refinements, {counts['model']} reference models.", "",
+        f"{counts['invariant']} invariants, {counts['refinement']} refinements, {counts['model']} reference models.",
+        "By level: " + ", ".join(f"{sum(e.level == lv for e in found.entries)} {lv}" for lv in LEVELS) + ".", "",
     ]
     for kind, title in KINDS.items():
         of_kind = [e for e in found.entries if e.kind == kind]
@@ -168,7 +202,8 @@ def listing(found: Found) -> str:
         for krate in sorted({e.krate for e in of_kind}):
             lines += [f"### {krate}", ""]
             for e in (e for e in of_kind if e.krate == krate):
-                lines.append(f"- **`{e.item}`** (`{e.path}`): {e.statement}")
+                level = f" *{e.level}*" + (f" (`{e.proof}`)" if e.proof else "") if e.level else ""
+                lines.append(f"- **`{e.item}`**{level} (`{e.path}`): {e.statement}")
                 if kind != "model" and (its := found.controls.get(e.path)):
                     lines.append("  Controls: " + ", ".join(f"`{c.removeprefix('the_oracle_catches_')}`" for c in its) + ".")
             lines.append("")
@@ -182,7 +217,7 @@ def main(it: Input) -> None:
     if it.command == "write":
         (root / LIST).write_text(text)
         return
-    wrong = problems(found)
+    wrong = problems(found, root)
     if not (root / LIST).is_file() or (root / LIST).read_text() != text:
         wrong.append(f"{LIST} is stale: run {SCRIPT} with command `write` and commit it")
     if wrong:
@@ -230,6 +265,18 @@ def selftest() -> None:
         expect(False, "a statement on no item is refused")
     except SystemExit as e:
         expect("a.rs:1" in str(e), f"the refusal names the place: {e}")
+    expect(entries[0].level == "tested" and entries[1].level == "", f"levels: {entries}")
+    simmed, _ = scan("a.rs", "use blaze_core::sim::Sim;\n\n/// The invariant: x.\nfn t() {}\n")
+    expect(simmed[0].level == "simulated", f"a file on the simulation is simulated: {simmed}")
+    proved, _ = scan("a.rs", "/// The refinement (proved: proofs/A.lean): the map is the model.\nfn t() {}\n")
+    expect((proved[0].level, proved[0].proof, proved[0].statement) == ("proved", "proofs/A.lean", "the map is the model."), f"{proved}")
+    bare, _ = scan("a.rs", "/// The invariant (proved): x.\nfn t() {}\n")
+    expect(any("names no proof" in p for p in problems(Found(tuple(bare), {"a.rs": ("the_oracle_catches_y",)}))), "proved needs its proof")
+    try:
+        scan("a.rs", "/// The invariant (certain): x.\nfn t() {}\n")
+        expect(False, "an unknown level is refused")
+    except SystemExit as e:
+        expect("certain" in str(e), f"{e}")
     print(f"{SCRIPT} selftest: ok")
 
 

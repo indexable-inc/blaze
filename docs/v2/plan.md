@@ -184,14 +184,39 @@ Specs: [profiling](../profiling.md), [ix-prof-format](../ix-prof-format.md),
 | lock-free code is right | the model checker ([model-checker](plan/design/model-checker.md)) |
 | unsafe code is sound | blaze's own UB checker on the MIR evaluator, and fuzzing ([unsafe](plan/design/unsafe.md)) |
 
-**What the code promises is written down once, where a tool can hold it.** An invariant is a doc
-comment opening `/// The invariant:` on the test whose oracle checks it; a refinement (this
-implementation behaves as that model, or as that other implementation) opens `/// The
-refinement:`; a reference model opens `/// The reference model:`. `harness/v2/invariants.py`
-collects them into [invariants.md](plan/invariants.md) and fails the gate when one has no
-planted-bug control beside it, so the list of what blaze guarantees is read in one place, and
-dropping or rewording a guarantee is a visible line in a pull request. Generated code is judged
-against that list, not against itself.
+**One statement, a ladder of evidence.** What the code promises is written once, in blaze, and
+every kind of check reads that same text:
+
+- a **contract** (`requires`, `ensures`) says what one call does ([contracts](plan/design/contracts.md));
+- a **reference model** is a small, pure, sequential implementation of what a component means
+  ("a store is a map from key to bytes"), an ordinary type in the crate;
+- a **refinement** says the real component behaves as its model, or as another implementation
+  (an incremental build as a build from nothing, `Frames` as `Fibers`, the simulated driver as a
+  native one).
+
+A statement then climbs as far as it needs to, unchanged:
+
+| level | what checked it | says |
+|---|---|---|
+| tested | a property test generated from the contract or the refinement | no counterexample in N tries |
+| simulated | the same, under the deterministic simulation with faults, crashes and interleavings, and a planted bug | none under adversarial schedules |
+| model-checked | every interleaving to a bound | none up to the bound |
+| proved | Lean, from the same contract and model ([formal-verification](plan/design/formal-verification.md)) | none |
+
+The model is the object all four share: the simulation runs the real code against it, and it is
+the first thing translated to Lean, where properties of the model are proved; the compiled Lean
+model run against blaze-built code on drawn inputs is one more refinement. Proofs go to the
+sans-IO cores, which the capability rules make provably free of IO, clock and globals; the
+simulation covers the drivers around them and the binary as built. Durable, concurrent and
+crash-recovering code is at least simulated; what must never be wrong (a key's hash, a format's
+round trip) is proved. When two levels disagree, one of them has a bug, and that is a finding.
+
+In the code, a statement is a doc comment opening `/// The invariant:`, `/// The refinement:` or
+`/// The reference model:`. `harness/v2/invariants.py` collects them, with the level each has
+reached, into [invariants.md](plan/invariants.md), and fails the gate when one has no planted-bug
+control beside it or names a proof that is not there. So what blaze guarantees, and how strongly,
+is read in one place; dropping or weakening a guarantee is a visible line in a pull request; and
+generated code is judged against that list, not against itself.
 
 How each harness is run is in [harness.md](../harness.md).
 
