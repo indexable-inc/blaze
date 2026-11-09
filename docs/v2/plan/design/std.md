@@ -28,10 +28,10 @@ built except the driver layer it starts from (`crates/blaze-core`).
 
 ```rust
 fn main(cx: &Cx, io: Io) -> Result<(), Error> {
-    let data: Dir<ReadWrite> = io.fs().open_dir(cx, "data")?;
+    let data: Dir<ReadWrite> = io.fs().open_dir(cx, path!("data"))?;
     let cfg: Dir<ReadOnly> = data.read_only();               // narrow
-    let key = StripeKey::from_env(&io.env().only(&["STRIPE_KEY"]))?;
-    let api = io.net().connect_only("api.stripe.com:443");   // one host
+    let key = StripeKey::from_env(&io.env().only(&[var!("STRIPE_KEY")]))?;
+    let api = io.net().connect_only(host!("api.stripe.com:443"));   // one host
     let cx = cx.until(io.clock().after(Duration::from_secs(5)));   // a deadline only shrinks
     charge(&cx, &key, &api, &cfg)
 }
@@ -241,6 +241,50 @@ planted bug; a differential test that runs the same programs under `Fibers` and 
 compares outputs and the order of cancellations, drops and panics; and a UI test for each error
 above.
 
+## Shared mutation
+
+One naming rule: **the plain name is safe across threads; `Local` marks the cheaper version for
+one thread.** Docs and diagnostics say "shared" and "unique" for `&` and `&mut`, which is what
+they mean.
+
+| bstd | Rust's std | |
+|---|---|---|
+| `Shared<T>` / `LocalShared<T>` | `Arc` / `Rc` | both are `Handle`s ([edition](edition.md), change 1) |
+| `Lock<T>`, `RwLock<T>` / `LocalLock<T>` | `Mutex`, `RwLock` / `RefCell` | the first waits, the second panics; the same operation |
+| `Once<T>`, `Lazy<T>` / `LocalOnce<T>`, `LocalLazy<T>` | `OnceLock`, `LazyLock` / `OnceCell`, `LazyCell` | |
+| `Atomic<T>` | `AtomicU32`, `AtomicBool`, ... | one generic type |
+| `Cell<T>` | `Cell` | unchanged |
+| `RawCell<T>` | `UnsafeCell` | trusted code only |
+
+- **These are the named locks of rule `standard-structures`**, in their one home: a `Lock` is
+  made with its name, records who waited behind whom, and its `lock(cx)` is the one wait, so it
+  has a deadline and can be cancelled. The removed names are banned by lint.
+- **No poisoning.** `lock` returns the guard, not a `Result`. A panic while holding a lock fails
+  that task and the lock unlocks.
+- **`Freeze` is a public bound**: no shared mutation anywhere inside the type. `&T where T:
+  Freeze` is truly immutable, which `pure` and every data-flow analysis want to say. A `static`
+  must be `Freeze` (the `global_state` check above); the only way around it is the trusted list,
+  not a mark on the item.
+- **Token cells.** `TokenCell<T, K>` holds data; a `Token<K>` is the permission to touch every
+  cell of its kind. `cell.get(&token)` and `cell.get_mut(&mut token)` are checked by the borrow
+  checker, with no run-time flag and no panic. Put the token behind one `Lock` and that lock
+  guards a whole graph of cells. It is the idea of the rest of bstd: authority is a value you
+  pass. `LocalLock` stays for what a token cannot express.
+- **Projection through cells** (`&Cell<Struct>` to `&Cell<Field>`) is a library method built on
+  reflection ([comptime](comptime.md)) before any syntax is considered.
+- Kept from Rust: a lock owns its data, the `Send`/`Sync` split, and shared mutation as an
+  opt-in per type.
+
+## Names are typed, and authority is stored
+
+- **A capability's methods take specific types, never strings**: `dir.open(cx, &Path)`,
+  `net.connect(cx, &HostPort)`, `env.get(&VarName)`. A field's type then says which capability it
+  is for, and the set of places a name meets authority is closed, so a later analysis can follow
+  a value from a field to the capability call it reaches.
+- **Store the narrowed capability, not the name.** A struct holds `file: File<ReadOnly>`, not a
+  `path` to be combined with an `Fs` later. A name joined to authority far from where it was
+  checked is where confused-deputy bugs come from.
+
 ## Errors
 
 One error type per area (`FsError`, `NetError`, ...), each naming the operation, the thing (the
@@ -301,6 +345,7 @@ Interface first, bottom last, so nothing waits on the runtime and every step lan
 | S1 | The crate `crates/blaze-std` (`bstd`): `Cx`, `Io`, every capability above, the allocators, the scopes and deadlines, the errors, over `blaze-core`'s drivers and its simulation | its simulation tests pass; one planted bug per invariant is caught |
 | S2 | The `ambient` and `unsafe` effects, `#![blaze::capabilities]`, `blaze explain trusted` | a crate with the attribute that calls `std::fs` is refused, naming the call path |
 | S3 | blaze's crates move, leaves first: a sans-IO core takes nothing, a driver takes the piece it needs, `blaze`'s `main` takes `Io`. Each move is a `.clippy.toml` ban and `blaze check --fix` (rule `fix-through-blaze-lints`) | every crate in `crates/` has `#![blaze::capabilities]` |
+| S1b | `bstd::{sync, cell}`: the table of "Shared mutation", token cells, `Freeze` as a bound, typed names (`HostPort`, `VarName`) in place of strings, and bans on the removed names | misuse tests: two live `get_mut` on one token do not compile; a static that is not `Freeze` is refused |
 | S3b | The `Frames` layout: the calling convention, the slab, unwinding, and the profiler and backtraces walking the frame chain | the differential test against `Fibers` passes |
 | S4 | The bottom: `bstd::sys` and `bstd::rt`, `blaze-core`'s drivers move in as `bstd::driver`, and bstd is `#![no_std]` | no blaze crate links Rust's `std`; C1 still passes |
 | S5 | The edition: `edition = "blaze-2026.11"` makes `std` name bstd, `fn main(io: Io)` is the entry, and the OS sandbox of a program is derived from what `main` hands out | a program of the edition that never opens the network cannot, checked by the sandbox |
