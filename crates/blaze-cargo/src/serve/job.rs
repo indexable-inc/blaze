@@ -2410,7 +2410,7 @@ impl<S: Steps> Job<S> {
             _ => Vec::new(),
         };
         // Sorted, so what `blaze why` keeps of the build is not down to the order its units
-        // and runs ended in (rule 22).
+        // and runs ended in (rule 25).
         let mut misses = std::mem::take(&mut self.misses);
         misses.sort_unstable();
         misses.dedup();
@@ -2860,6 +2860,20 @@ impl<S: Steps> Jobs<S> {
     pub fn under_way(&self) -> usize {
         self.asked.len()
             + self.jobs.values().filter(|job| !job.idle && job.durable_since.is_none()).count()
+    }
+
+    /// The newest build under way: the highest request of a job that is not idle and not
+    /// finished, 0 for none. What the daemon's process-wide counters are said to be of
+    /// (`blaze_profile::flight::counting_for`): two builds that overlap share their counters,
+    /// and the newer one is named.
+    pub fn build_under_way(&self) -> u32 {
+        self.jobs
+            .values()
+            .filter(|job| !job.idle && !job.finished)
+            .filter_map(|job| job.request)
+            .map(|request| request.0)
+            .max()
+            .unwrap_or(0)
     }
 
     /// Whether a run of user code (a build script, a test, a run) of any job has not ended:
@@ -4529,7 +4543,7 @@ impl<S: Steps> Jobs<S> {
         let mut next = first.0;
         // Each unit's source bytes, what its phases' memory is predicted from
         // (`Plane::push_sized`): a stat of each `.rs` file under its modules' directories,
-        // once a directory a build, named so its time is its own (rule 14).
+        // once a directory a build, named so its time is its own (rule 16).
         let sizing = tracing::info_span!(target: "blaze", "unit source sizes", units = built);
         let mut seen = HashMap::new_in(Global); // alloc: once per build, a directory an entry
         for offset in 0..built {
@@ -6129,7 +6143,7 @@ impl<S: Steps> Jobs<S> {
             // What its kept front end left for the store ([`Job::stored`]) and the retractions it
             // put ([`Job::durable`]) are durable first; the store was flushed as they were put.
             // A store that broke never makes them durable, nor does one that stopped committing:
-            // the job fails naming why and which, rather than wait with no end (rule 15).
+            // the job fails naming why and which, rather than wait with no end (rule 18).
             // Wait for everything (the store model's `Wait::Everything`): a value a job read is
             // handed back with no ticket, so it may be another job's put that is not durable
             // yet, and answering on it before a crash loses it gives what a restart can't. Once,

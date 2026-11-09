@@ -191,3 +191,25 @@ through_pointer: fn pointer call
 "#,
     );
 }
+
+/// With blaze's `#![feature(blaze_comptime)]` a call through a function pointer or of a `dyn`
+/// method is checked when it is evaluated, and a `const static { .. }` block not at all: none of
+/// them is a non-const call here. The same calls of a direct callee are still refused.
+#[test]
+fn comptime_defers_dispatch_and_skips_const_static_blocks() {
+    check(
+        r#"
+//- minicore: fn
+#![feature(blaze_comptime)]
+trait Tr { fn m(&self) -> u8; }
+fn helper() -> u8 { 3 }
+const fn through_pointer(f: fn() -> u8) -> u8 { f() }
+const fn through_dyn(t: &dyn Tr) -> u8 { t.m() }
+const IN_BLOCK: u8 = const static { helper() };
+const fn direct() -> u8 { helper() }
+"#,
+        r#"
+direct: `helper` is not const
+"#,
+    );
+}

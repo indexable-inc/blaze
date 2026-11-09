@@ -1,5 +1,5 @@
 //! `implicit_allocator`: a value whose allocator is left to its default, `Global` (AGENTS.md
-//! rule 9, bump-allocate: every value names its allocator).
+//! rule 11, bump-allocate: every value names its allocator).
 //!
 //! A type is implicit when it is, or holds, an ADT whose allocator parameter has `Global` as
 //! its argument (`Vec<String>` is `Vec<String, Global>`), the parameter found by what it is

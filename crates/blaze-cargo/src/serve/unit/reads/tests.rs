@@ -244,7 +244,7 @@ fn a_slot_that_does_not_decode_is_an_error_naming_it() {
 
 /// A record whose closure read `CARGO_PRIMARY_PACKAGE` is filed by whether the request made its
 /// package primary, and by nothing else of the request: found while that is as it was, missed
-/// once it moves (rule 18). When not primary, the process's variable is what `env!` read, so it
+/// once it moves (rule 21). When not primary, the process's variable is what `env!` read, so it
 /// is filed by the value read, not by how the value came.
 #[test]
 fn a_record_that_read_primary_package_is_filed_by_it() {

@@ -146,13 +146,25 @@ pub const fn tag_of(kind: TaskKind) -> Tag {
 /// included ([`crate::arena::account`]), and its frames' together, the peak [`Estimates`]
 /// learn from.
 /// Every runner of tasks (the exec scheduler's, the daemon's plane) runs a task's work through
-/// this, so a task's memory has one home whoever runs it.
-pub fn run_as<R>(kind: TaskKind, f: impl FnOnce() -> R) -> (R, u64) {
+/// this, so a task's memory has one home whoever runs it. Says its global-heap churn too
+/// ([`TaskSpent::heap`]), for its `task` span.
+pub fn run_as<R>(kind: TaskKind, f: impl FnOnce() -> R) -> (R, TaskSpent) {
     let tag = tag_of(kind);
-    let ((out, bytes), frames) = blaze_mem::frame::measure(|| {
-        crate::arena::account(|| blaze_mem::frame::task(tag, |_| f()))
+    let ((out, heap), frames) = blaze_mem::frame::measure(|| {
+        crate::arena::measured(|| blaze_mem::frame::task(tag, |_| f()))
     });
-    (out, bytes + frames as u64)
+    (out, TaskSpent { peak: heap.peak + frames as u64, heap })
+}
+
+/// What a task spent ([`run_as`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TaskSpent {
+    /// The most it held at once: its global allocations, its fan-out's included, and its
+    /// frames' together.
+    pub peak: u64,
+    /// Its global allocations alone ([`crate::arena::Spent`]): their peak, and what it
+    /// allocated and freed in all.
+    pub heap: crate::arena::Spent,
 }
 
 /// Each subsystem's budget as a share of the machine's, in 64ths. The shares sum past 64 on
@@ -165,7 +177,7 @@ pub const fn share(tag: Tag) -> u64 {
     match tag {
         Tag::Infer | Tag::Codegen | Tag::Link | Tag::Frames => 32,
         Tag::Mir | Tag::Query => 24,
-        Tag::Nameres | Tag::Intern | Tag::Diagnostics | Tag::Solver => 16,
+        Tag::Nameres | Tag::Intern | Tag::Diagnostics | Tag::Solver | Tag::Pool => 16,
         Tag::Parse | Tag::Expand | Tag::Store | Tag::Vfs | Tag::Chunks | Tag::Fuzz => 8,
         Tag::Usercode | Tag::Other => 4,
         Tag::Plane | Tag::Io | Tag::Api | Tag::Profile => 2,

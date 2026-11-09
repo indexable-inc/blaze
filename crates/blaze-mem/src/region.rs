@@ -17,6 +17,7 @@
 
 use std::{
     io,
+    ops::Range,
     ptr::NonNull,
     sync::{PoisonError, atomic::AtomicUsize, atomic::Ordering},
 };
@@ -56,6 +57,10 @@ pub struct Region {
     /// Made by [`Region::reserve_sparse`]: every byte readable and writable from the start, and
     /// `committed` the prefix its owner said it uses.
     sparse: bool,
+    /// Of a sparse region counted by ranges ([`Region::reuse`], [`Region::evict`]), the bytes
+    /// made the process's and not given back since: what its tag holds of it besides
+    /// `committed`, which such a region leaves at what its reservation counted.
+    held: AtomicUsize,
     tag: Tag,
 }
 
@@ -107,6 +112,12 @@ impl Region {
     /// index but written in a few (the query database's page directories): a read past the
     /// committed prefix is valid and finds zero. Windows commits it whole, and counts it so.
     /// Never decommitted ([`Region::decommit_after`] refuses).
+    ///
+    /// Its owner counts what it uses one of two ways, never both: a prefix ([`Region::ensure`]),
+    /// or ranges anywhere in it, each made the process's with [`Region::reuse`] and given back
+    /// with [`Region::evict`] (the store's buffer pool, docs/v2/plan/design/store-pool.md, whose
+    /// windows are slots of 1 GiB in a reservation of terabytes). Mixing them panics, naming the
+    /// region.
     pub fn reserve_sparse(bytes: usize, tag: Tag) -> Result<Region, MemError> {
         let granule = os::page_size().max(64 << 10);
         let reserved = crate::align::checked_align_up(bytes.max(1), granule)
@@ -126,6 +137,7 @@ impl Region {
             pages: Pages::Base,
             node: None,
             sparse: true,
+            held: AtomicUsize::new(0),
             tag,
         };
         if cfg!(windows) {
@@ -161,6 +173,7 @@ impl Region {
             pages,
             node,
             sparse: false,
+            held: AtomicUsize::new(0),
             tag,
         })
     }
@@ -319,6 +332,9 @@ impl Region {
             return Ok(());
         }
         if self.sparse {
+            if self.held.load(Ordering::Acquire) != 0 {
+                self.mixed("committing a prefix of");
+            }
             // Readable and writable already: only the count moves.
             self.publish(target);
             return Ok(());
@@ -503,12 +519,26 @@ impl Region {
     /// into the footprint, Windows commits them; elsewhere nothing to do. An error when the
     /// kernel refuses (Windows' commit limit).
     ///
+    /// Of a sparse region ([`Region::reserve_sparse`]) counted by ranges, it is how a range
+    /// becomes the owner's: any range of the reservation, page-aligned at both ends, counted to
+    /// the region's tag from now until [`Region::evict`] gives it back. On macOS the pages,
+    /// which an eviction marked reusable, count in the footprint again before they are written
+    /// (`MADV_FREE_REUSE`), and their bytes are unspecified, so its owner writes all of them
+    /// (the pool's loader zeroes what a short read left, [`crate::racy::zero`]); on Linux they
+    /// read zeros until written. Its owner reuses a range it does not hold: one held already
+    /// would be counted twice.
+    ///
     /// # Panics
     ///
     /// When the range passes what is committed, naming both and the region's tag: only pages
-    /// once committed are ever purged.
+    /// once committed are ever purged. Of a sparse region, when the range is not page-aligned,
+    /// passes the reservation, or the region is counted by its prefix ([`Region::ensure`]),
+    /// naming the region.
     #[track_caller]
     pub fn reuse(&self, from: usize, len: usize) -> Result<(), MemError> {
+        if self.sparse {
+            return self.reuse_range(from, len);
+        }
         let page = os::page_size();
         let start = crate::align::align_down(from, page);
         let end =
@@ -533,8 +563,156 @@ impl Region {
     }
 }
 
+impl Region {
+    /// [`Region::reuse`] of a sparse region: counts the range and makes it the process's.
+    #[track_caller]
+    fn reuse_range(&self, from: usize, len: usize) -> Result<(), MemError> {
+        let end = self.checked_range(from, len, "reusing");
+        if end == from {
+            return Ok(());
+        }
+        self.by_ranges("reusing");
+        self.held.fetch_add(len, Ordering::AcqRel);
+        tag::add(self.tag, len);
+        tag::committed(len);
+        // SAFETY: `[from, end)` is page-aligned inside this live reservation (checked above),
+        // every byte of which is mapped readable and writable.
+        if let Err(os) = unsafe { os::reuse(self.at(from), len) } {
+            self.held.fetch_sub(len, Ordering::AcqRel);
+            tag::sub(self.tag, len);
+            tag::decommitted(len);
+            return Err(MemError::Commit { tag: self.tag, bytes: len, os });
+        }
+        Ok(())
+    }
+
+    /// Gives the pages of `ranges` (byte offsets, each page-aligned at both ends) of a sparse
+    /// region counted by ranges back to the kernel, and says how many bytes went: the store's
+    /// pool evicting a batch of pages no one pins (docs/v2/plan/design/store-pool.md "Giving
+    /// pages back"). The region's tag falls by those bytes now, as the system's own count does:
+    ///
+    /// - Linux: `MADV_DONTNEED`, every 256 ranges one `process_madvise` of this process, so a
+    ///   batch costs one TLB flush. The pages read zeros when next touched.
+    /// - macOS: `MADV_FREE_REUSABLE` per range, out of `phys_footprint` at once; their bytes are
+    ///   unspecified until [`Region::reuse`] and a write.
+    /// - Windows: `MEM_DECOMMIT` per range. A decommitted page faults when read, so there an
+    ///   optimistic read ([`crate::racy::copy_out`]) of a page being given back is not defined;
+    ///   the pool on Windows is not designed yet.
+    ///
+    /// Never plain `MADV_FREE`, which the kernel goes on counting (rule `one-memory-measure`).
+    ///
+    /// The ranges go in order, and the kernel's refusal stops the call: the bytes given back are
+    /// those of the ranges of a prefix of `ranges`, each whole, and the rest stay resident and
+    /// counted. That costs memory, not correctness, and the owner finds which went by summing
+    /// lengths. Adjacent ranges are best merged by the owner first: a range is an `iovec`.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::Evict`] when this system cannot give the pages back at all, checked once per
+    /// process (`os::check_evict`): on Linux a kernel without `process_madvise` of any advice
+    /// for its own process. Nothing is given back then.
+    ///
+    /// # Panics
+    ///
+    /// When the region is not sparse (a committed prefix is given back with
+    /// [`Region::purge`] or [`Region::decommit_after`]), is counted by its prefix, a range is
+    /// not page-aligned or passes the reservation, or the ranges come to more than the region
+    /// holds; each names the region.
+    ///
+    /// # Safety
+    ///
+    /// Nothing holds a reference into the ranges or reads them but through
+    /// [`crate::racy::copy_out`] (the pool's pins are none, its state words `Evicting`), and
+    /// each range was made the process's with [`Region::reuse`] and not given back since.
+    #[track_caller]
+    pub unsafe fn evict(&self, ranges: &[Range<usize>]) -> Result<usize, MemError> {
+        if !self.sparse {
+            panic!(
+                "evicting pages of a {:?} region of {} reserved bytes that is not sparse: give a \
+                 committed prefix back with purge or decommit_after",
+                self.tag, self.reserved,
+            );
+        }
+        self.by_ranges("evicting");
+        let mut asked = 0usize;
+        for range in ranges {
+            self.checked_range(range.start, range.len(), "evicting");
+            asked += range.len();
+        }
+        let held = self.held.load(Ordering::Acquire);
+        assert!(
+            asked <= held,
+            "evicting {asked} bytes of a {:?} region of {} reserved bytes that holds {held}: a \
+             range given back twice, or never reused",
+            self.tag,
+            self.reserved,
+        );
+        if asked == 0 {
+            return Ok(0);
+        }
+        os::check_evict().map_err(|os| MemError::Evict { tag: self.tag, os })?;
+        // SAFETY: each range is page-aligned inside this live sparse reservation (checked
+        // above), and the caller says nothing references or reads them but atomically.
+        let given = unsafe { os::evict(self.base, ranges) };
+        self.held.fetch_sub(given, Ordering::AcqRel);
+        tag::sub(self.tag, given);
+        tag::decommitted(given);
+        Ok(given)
+    }
+
+    /// The bytes of a sparse region counted by ranges that are the process's now: what
+    /// [`Region::reuse`] made so and [`Region::evict`] has not given back.
+    pub fn held(&self) -> usize {
+        self.held.load(Ordering::Acquire)
+    }
+
+    /// The end of `[from, from + len)`, checked page-aligned and inside the reservation.
+    #[track_caller]
+    fn checked_range(&self, from: usize, len: usize, doing: &str) -> usize {
+        let page = os::page_size();
+        let end = from.checked_add(len).filter(|&end| end <= self.reserved);
+        match end {
+            Some(end) if from % page == 0 && end % page == 0 => end,
+            _ => panic!(
+                "{doing} bytes {from} to {} of a sparse {:?} region of {} reserved bytes: a range \
+                 must be whole pages of {page} bytes inside the reservation",
+                from.saturating_add(len),
+                self.tag,
+                self.reserved,
+            ),
+        }
+    }
+
+    /// Panics unless this sparse region is counted by ranges: nothing committed past what its
+    /// reservation counted (all of it on Windows, none elsewhere).
+    #[track_caller]
+    fn by_ranges(&self, doing: &str) {
+        let initial = if cfg!(windows) { self.reserved } else { 0 };
+        if self.committed() != initial {
+            self.mixed(doing);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    #[track_caller]
+    fn mixed(&self, doing: &str) -> ! {
+        panic!(
+            "{doing} a sparse {:?} region of {} reserved bytes counted both by its prefix ({} \
+             committed) and by ranges ({} held): its owner counts one way",
+            self.tag,
+            self.reserved,
+            self.committed(),
+            self.held(),
+        )
+    }
+}
+
 impl Drop for Region {
     fn drop(&mut self) {
+        let held = *self.held.get_mut();
+        tag::sub(self.tag, held);
+        tag::decommitted(held);
         let committed = *self.committed.get_mut();
         tag::sub(self.tag, committed);
         tag::decommitted(committed);
@@ -557,6 +735,10 @@ impl std::fmt::Debug for Region {
             .field("pages", &self.pages)
             .field("node", &self.node)
             .field("sparse", &self.sparse)
+            .field("held", &self.held())
             .finish()
     }
 }
+
+#[cfg(all(test, not(blaze_check)))]
+mod tests;

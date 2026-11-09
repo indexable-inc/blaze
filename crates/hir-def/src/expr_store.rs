@@ -365,9 +365,9 @@ pub enum ExpressionStoreDiagnostics {
     IntLiteralTooLarge {
         node: InFile<AstPtr<ast::Literal>>,
     },
-    /// `for const`, `x.[f]` or a bounded type parameter of a where predicate's `for<..>` binder
-    /// in a crate without `#![feature(blaze_comptime)]`: an expression lowers to `Missing`, a
-    /// binder parameter is not recorded.
+    /// `for const`, `x.[f]`, `const static { .. }` or a bounded type parameter of a where
+    /// predicate's `for<..>` binder in a crate without `#![feature(blaze_comptime)]`: an
+    /// expression lowers to `Missing`, a binder parameter is not recorded.
     ComptimeWithoutFeature {
         node: InFile<SyntaxNodePtr>,
         form: ComptimeForm,
@@ -466,6 +466,8 @@ pub enum ComptimeForm {
     ReflectedField,
     /// `for<F: Bound> ..` in a where predicate.
     BinderBound,
+    /// `const static { .. }`, a `const` block evaluated with no const checking.
+    Block,
 }
 
 impl ComptimeForm {
@@ -475,6 +477,18 @@ impl ComptimeForm {
             ComptimeForm::ForConst => "`for const`",
             ComptimeForm::ReflectedField => "a reflected field access `base.[field]`",
             ComptimeForm::BinderBound => "a bounded type parameter in a `for<..>` binder",
+            ComptimeForm::Block => "a `const static { .. }` block",
+        }
+    }
+
+    /// Which part of the extension the form is, for a message: its reflection, or its
+    /// evaluation of any code at compile time.
+    pub fn part(self) -> &'static str {
+        match self {
+            ComptimeForm::ForConst | ComptimeForm::ReflectedField | ComptimeForm::BinderBound => {
+                "compile-time reflection"
+            }
+            ComptimeForm::Block => "compile-time evaluation",
         }
     }
 }

@@ -365,7 +365,7 @@ fn debug_reads_the_attached_database() {
     );
 }
 
-/// A bound that trips names the key's value, not its number (rule 16): an argument's `Debug`
+/// A bound that trips names the key's value, not its number (rule 19): an argument's `Debug`
 /// through the database the walk ran on, each argument of a key of several, and `()` for none.
 #[test]
 fn out_of_fuel_names_the_keys_value() {

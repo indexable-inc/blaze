@@ -10,7 +10,7 @@
 //! ([`crate::query::Units::is_primary`]). A plan is in its unit's record key whole, and
 //! `--workspace` then `-p one` would otherwise key every dependency of `one` anew. The front
 //! end gives it to the crates of primary units (`base_db::set_primary_crates`), and a record is
-//! keyed by it only when a crate read it (rule 18).
+//! keyed by it only when a crate read it (rule 21).
 
 use std::path::Path;
 

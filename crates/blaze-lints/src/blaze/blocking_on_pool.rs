@@ -1,5 +1,5 @@
 //! `blocking_on_pool`: a call that blocks the OS thread, made by a function that runs on a fiber
-//! or a pool thread (AGENTS.md rule 9: on a pool thread or fiber, a wait goes through the
+//! or a pool thread (AGENTS.md rule 12: on a pool thread or fiber, a wait goes through the
 //! scheduler, never a `Condvar`, a channel receive, `thread::sleep` or a raw `spin_loop`). A
 //! blocked pool thread runs no other job until the call returns.
 //!
@@ -159,7 +159,7 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
         let message = format!("{what} blocks the pool thread `{owner_name}` runs on");
         let note = format!(
             "`{owner_name}` runs on a fiber or a pool thread (the fiber driver reaches it, or it may suspend), and a \
-             blocked pool thread runs no other job until the call returns (AGENTS.md rule 9): {}",
+             blocked pool thread runs no other job until the call returns (AGENTS.md rule 12): {}",
             instead.say()
         );
         facts::push(&mut found, Lint::BlockingOnPool, range, message, Some(note));

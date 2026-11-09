@@ -36,6 +36,7 @@ pub mod errors;
 pub mod facts;
 pub mod flight;
 pub mod gate;
+pub mod heap;
 pub mod history;
 pub mod hot;
 pub mod identity;

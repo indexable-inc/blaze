@@ -299,7 +299,7 @@ pub(crate) const PROFILE_NOTES: &[Lint] = &[
 /// allowed by default where the workspace turns `blaze::internal` on (`level::Levels`), so a
 /// workspace that chose blaze's conventions is not told the opposite. `dos_hasher_on_input`
 /// asks for a randomly seeded hasher where blaze keys every map by a fixed seed for
-/// deterministic output (AGENTS.md rules 10 and 22). Set by the group's level, never by a lint's
+/// deterministic output (AGENTS.md rules 12 and 25). Set by the group's level, never by a lint's
 /// name; a level set for the lint itself, or for `blaze::general`, still wins.
 pub(crate) const YIELDS_TO_INTERNAL: &[Lint] = &[Lint::DosHasherOnInput];
 

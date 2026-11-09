@@ -300,7 +300,7 @@ fn main() {
 }
 
 /// The dumps of the block def maps of `main`'s body, and for each keyed name of them the id of
-/// its key's context with the position of the macro call that wrote it (rule 22's check). With
+/// its key's context with the position of the macro call that wrote it (rule 25's check). With
 /// `first`, those calls are interned and expanded in the reverse of their order before the
 /// body is lowered, so their contexts are numbered the other way round.
 fn main_blocks(
@@ -345,7 +345,7 @@ fn main_blocks(
 
 #[test]
 fn hygienic_names_of_one_text_list_in_the_order_they_were_bound() {
-    // Rule 22: two hygienic `S`s in one block, a struct from `a!` and a function from `b!`,
+    // Rule 25: two hygienic `S`s in one block, a struct from `a!` and a function from `b!`,
     // list in the order the block bound them whatever their contexts' ids are. The second build
     // interns the calls' contexts in the reverse order; ordered by context id the dump swaps.
     let fixture = r#"

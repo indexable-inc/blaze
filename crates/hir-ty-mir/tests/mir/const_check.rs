@@ -7,9 +7,10 @@
 use hir_def::{
     AssocItemId, DefWithBodyId,
     expr_store::{Body, ExpressionStore},
+    hir::Expr,
 };
 use hir_expand::fixture;
-use hir_ty::InferenceResult;
+use hir_ty::{InferBodyId, InferenceResult};
 use hir_ty_mir::mir::{
     MirSpan,
     const_check::{
@@ -565,4 +566,112 @@ const fn two() -> W {
 }
 ";
     assert_eq!(reported(&check("panic", src, func("two"))), NONE);
+}
+
+/// blaze's `#![feature(blaze_comptime)]` (docs/v2/plan/design/comptime.md, "Phase 2b"): a call
+/// through a function pointer or of a `dyn` method in a `const fn` is checked when it is
+/// evaluated, where its target is known, not refused here. Without the feature both are refused
+/// as rustc refuses them. `dispatch_from_dyn`: without its lang items a `&self` method is not
+/// dispatchable, so `Get` would not be dyn-compatible and `x.get()` no vtable call.
+#[test]
+fn comptime_defers_fn_pointer_and_dyn_calls_to_evaluation() {
+    let src = "\
+pub trait Get {
+    fn get(&self) -> u8;
+}
+
+const fn by_pointer(f: fn() -> u8) -> u8 {
+    f()
+}
+
+const fn by_dyn(x: &dyn Get) -> u8 {
+    x.get()
+}
+";
+    let minicore = "fn, dispatch_from_dyn";
+    let found = check(minicore, src, func("by_pointer"));
+    assert_eq!(
+        reported(&found),
+        [("", "function pointer calls are not allowed in constant functions", "f()")]
+    );
+    let found = check(minicore, src, func("by_dyn"));
+    let [(refused, at)] = &found[..] else { panic!("{} diagnostics", found.len()) };
+    assert_eq!((refused.code, at.as_str()), ("E0015", "x.get()"));
+    assert!(matches!(refused.kind, ConstCheckKind::NonConstFn { conditionally: false, .. }));
+
+    let opted = format!("#![feature(blaze_comptime)]\n{src}");
+    assert_eq!(reported(&check(minicore, &opted, func("by_pointer"))), NONE);
+    assert_eq!(reported(&check(minicore, &opted, func("by_dyn"))), NONE);
+}
+
+/// Under `#![feature(blaze_comptime)]` only a call the evaluator dispatches through a vtable is
+/// deferred: a method of an impl written for a `dyn` type is a direct call, which the evaluator
+/// does not check, so it is refused here as without the feature.
+#[test]
+fn comptime_refuses_a_method_of_an_impl_for_a_dyn_type() {
+    let src = "\
+#![feature(blaze_comptime)]
+pub trait Get {
+    fn get(&self) -> u8;
+}
+pub trait Other {
+    fn other(&self) -> u8;
+}
+impl Other for dyn Get {
+    fn other(&self) -> u8 {
+        0
+    }
+}
+
+const fn by_impl(x: &dyn Get) -> u8 {
+    x.other()
+}
+";
+    let found = check("fn, dispatch_from_dyn", src, func("by_impl"));
+    let [(refused, at)] = &found[..] else { panic!("{} diagnostics", found.len()) };
+    assert_eq!((refused.code, at.as_str()), ("E0015", "x.other()"));
+    assert!(matches!(refused.kind, ConstCheckKind::NonConstFn { conditionally: false, .. }));
+}
+
+/// A `const static { .. }` block (`#![feature(blaze_comptime)]`) is evaluated with no const
+/// checking: its call of a function that is not `const` is not refused, where the same call in
+/// a `const { .. }` block beside it is.
+#[test]
+fn a_const_static_block_is_not_const_checked() {
+    let src = "\
+#![feature(blaze_comptime)]
+fn f(x: usize) -> usize { x }
+fn main() {
+    let _ = const static { f(1) };
+    let _ = const { f(2) };
+}
+";
+    let fx = fixture::db(&format!("//- minicore: sized\n{src}"));
+    let _ = fx.only_file();
+    let db = fx.into_db();
+    blaze_query::db::attach(&db, || {
+        let main = function(&db, "main");
+        let def = DefWithBodyId::from(main);
+        let (body, map) = (Body::of(&db, def), Body::source_map(&db, def));
+        let infer = InferenceResult::of(&db, main);
+        let mut refused = Vec::new();
+        let mut blocks = 0;
+        for (expr, it) in body.exprs() {
+            if !matches!(it, Expr::Const(_)) {
+                continue;
+            }
+            blocks += 1;
+            let owner = InferBodyId::DefWithBodyId(def);
+            let konst = hir_ty_mir::mir::inline_const_at(&db, owner, infer, expr)
+                .expect("a function's inline const is a constant of its own");
+            for it in &anon_const_check(&db, konst).diagnostics {
+                let MirSpan::ExprId(at) = it.span else { panic!("a span of no expression") };
+                let range = map.expr_syntax(at).expect("written syntax").value.text_range();
+                let text = &src[usize::from(range.start())..usize::from(range.end())];
+                refused.push((it.code, text.to_owned()));
+            }
+        }
+        assert_eq!(blocks, 2);
+        assert_eq!(refused, [("E0015", "f(2)".to_owned())]);
+    })
 }

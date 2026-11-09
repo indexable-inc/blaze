@@ -987,7 +987,7 @@ pub(super) struct Wants {
     /// Every function and data object asked for, in the order asked, one asked for before
     /// included: kept only where it is `Some`, which the reference walk sets
     /// (`v2::refs::pass`), as which earlier ask an ask is one with is what its
-    /// `v2::refs::placement` reads (rule 18). `None` in a compile.
+    /// `v2::refs::placement` reads (rule 21). `None` in a compile.
     pub(super) asks: Option<Vec<Asked>>,
 }
 
@@ -1515,7 +1515,7 @@ impl<'db> Recorder<'db> {
         // The v2 unit's settings the function is built under, from its caller's key; `None` in
         // v1. Never read off the thread: a compile can wait inside
         // (`instance_body` is a query), and a fiber resumes on any thread, whose unit is another
-        // compile's or none (rule 24), while what it builds is memoized by its own key (rule 18).
+        // compile's or none (rule 27), while what it builds is memoized by its own key (rule 21).
         unit: Option<super::v2::build::Build>,
     ) -> Self {
         Recorder {

@@ -2,8 +2,10 @@
 //! `soft-feature-gate-*.rs`, `soft-syntax-gates-*.rs`): the parser's gated spans before expansion,
 //! the soft gates `feature_warn` gives, and `PostExpansionVisitor`'s gates.
 
-use super::{ui, ui_core};
-use crate::tests::{assert_reports, error, lints::bodies::types::ui_std};
+use super::{ui, ui_core, ui_fixture};
+use crate::tests::{
+    LIBRARY_FEATURES, assert_reports, error, library_features, lints::bodies::types::ui_std,
+};
 
 #[test]
 fn become_is_gated_before_expansion() {
@@ -377,6 +379,81 @@ fn a_type_parameter_in_a_binder_is_gated() {
 fn main() {}
 "#;
     assert_reports(&ui("feature-gate-non_lifetime_binders.rs", "2015", source), &[error(1, &[])]);
+}
+
+/// The `main.rs` of a field binder test: `#![feature(blaze_comptime)]` and what of
+/// `library/core/src/{field,reflect}.rs` the binders name, then `source`, as a crate whose
+/// `blaze_comptime` is the library feature core's is (`#[unstable(feature = "blaze_comptime")]`).
+fn field_binder(source: &str) -> String {
+    let features = library_features(&["blaze_comptime"]);
+    ui_fixture(&format!(
+        "//- minicore: sized, copy\n{features}\
+         //- /field_binder.rs crate:other:main edition:2021 deps:{LIBRARY_FEATURES}\n{REFLECT}\
+         {source}\nfn main() {{}}\n"
+    ))
+}
+
+/// The head of [`field_binder`]'s `main.rs`.
+const REFLECT: &str = r#"#![feature(blaze_comptime, lang_items)]
+#[lang = "field"]
+pub unsafe trait FieldOf: Copy {
+    #[lang = "field_base"]
+    type Base: ?Sized;
+    #[lang = "field_type"]
+    type Type: ?Sized;
+}
+#[lang = "blaze_field"]
+pub unsafe trait Field<B: ?Sized>: FieldOf {}
+#[lang = "blaze_variant"]
+pub unsafe trait Variant<B>: Copy {
+    #[lang = "blaze_variant_view"]
+    type View;
+}
+pub trait Flat {}
+"#;
+
+#[test]
+fn a_field_binder_is_blazes_with_blaze_comptime() {
+    // docs/v2/plan/design/comptime.md, "Syntax": with the feature, `for<F: Field<T>>` is
+    // neither `non_lifetime_binders` nor a forbidden bound, and `F` names the binder's
+    // parameter in what it binds (`F::Type`), not an undeclared type (E0433)
+    let stderr = field_binder("pub fn each<T>() where for<F: Field<T>> F::Type: Flat {}");
+    assert_reports(&stderr, &[]);
+}
+
+#[test]
+fn a_field_binder_over_a_binders_variant_is_blazes_with_blaze_comptime() {
+    // A later parameter's bound names an earlier one (`V::View`), in scope there as rustc's
+    // `with_generic_param_rib` scopes a binder's parameters
+    let stderr = field_binder(
+        "pub fn each<T>() where for<V: Variant<T>, F: Field<V::View>> F::Type: Flat {}",
+    );
+    assert_reports(&stderr, &[]);
+}
+
+#[test]
+fn a_field_binder_without_blaze_comptime_is_gated_as_rustc_gates_it() {
+    // Without the feature, the pinned nightly's `check_late_bound_lifetime_defs`: the type
+    // parameter is `non_lifetime_binders`', its trait bound a forbidden bound that stops
+    // rustc, so nothing after it (no E0433 at `F::Type`, which rustc resolves to `F` anyway)
+    let source = r#"pub trait Field<B> {
+    type Type;
+}
+pub trait Flat {}
+
+fn each<T>() where for<F: Field<T>> F::Type: Flat {}
+//~^ ERROR only lifetime parameters can be used in this context
+//~| ERROR bounds cannot be used in this context
+
+fn main() {}
+"#;
+    assert_reports(
+        &ui("field_binder.rs", "2021", source),
+        &[
+            error(6, &["E0658", "only lifetime parameters", "non_lifetime_binders"]),
+            error(6, &["bounds cannot be used in this context"]),
+        ],
+    );
 }
 
 #[test]

@@ -18,7 +18,7 @@
 //! finding S5: `blaze_phf::name_hash` inverts step by step). The overlay's key is drawn at
 //! random when the table is made and never leaves the process; the mapped index's is in the
 //! image's [`Root`], BLAKE3 of the values it keeps, so the image's bytes are a function of its
-//! values (AGENTS.md rule 22) and no value can be picked to collide before the key exists. A new value takes an ID the image's GC freed first, then the
+//! values (AGENTS.md rule 25) and no value can be picked to collide before the key exists. A new value takes an ID the image's GC freed first, then the
 //! next: no ID of a live value is ever given to another, and nothing is renumbered.
 //!
 //! GC is [`Table::write`]: the image keeps the values whose IDs the owners of the other

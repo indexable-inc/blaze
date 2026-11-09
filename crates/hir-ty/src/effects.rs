@@ -6,7 +6,7 @@
 //! `HostEffect` clauses. Only [`const_call_error`] (and so [`non_const_calls`]) does, in an
 //! environment of its own, so non-const code pays nothing for this.
 
-use base_db::Db;
+use base_db::{Crate, Db};
 use either::Either;
 use hir_def::{
     AdtId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, GenericDefId, HasModule, ImplId,
@@ -14,13 +14,14 @@ use hir_def::{
     expr_store::{Body, ExpressionStore},
     hir::{Expr, ExprId},
     signatures::{FnFlags, FunctionSignature, ImplSignature, TraitFlags, TraitSignature},
+    unstable_features::UnstableFeatures,
 };
 use rustc_type_ir::{BoundConstness, ClauseKind, TypeVisitableExt, TypingMode, inherent::IntoKind};
 use syntax::view as ast;
 
 use crate::{
-    InferenceResult, ParamEnvAndCrate,
-    db::{HirDatabase, InternedClosure, InternedClosureId},
+    InferBodyId, InferenceResult, ParamEnvAndCrate,
+    db::{AnonConstId, HirDatabase, InternedClosure, InternedClosureId},
     next_solver::{
         AnyImplId, Binder, Clause, Clauses, DbInterner, EarlyBinder, GenericArgs, ParamEnv,
         StoredClauses, TraitRef, TyKind, Unnormalized,
@@ -85,6 +86,84 @@ fn closure_expr_is_const(db: &Db, owner: ExpressionStoreOwnerId, expr: ExprId) -
         syntax = inner;
     }
     matches!(syntax, ast::Expr::ClosureExpr(closure) if closure.const_token().is_some())
+}
+
+/// Whether the inline const `expr` of `owner` is a `const static { .. }` block
+/// (`#![feature(blaze_comptime)]`, docs/v2/plan/design/comptime.md, "Phase 2b"): a constant of
+/// its own, evaluated with no const checking. Read off the syntax, as a closure's `const` is, and
+/// only in a crate with the feature, whose lowering is the only one that keeps such a block.
+pub fn const_block_is_comptime(db: &Db, owner: ExpressionStoreOwnerId, expr: ExprId) -> bool {
+    // `of_root`, not `query`: a const macro's evaluation may run while a def map is built.
+    if !UnstableFeatures::of_root(db, owner.module(db).krate(db)).blaze_comptime {
+        return false;
+    }
+    if !matches!(ExpressionStore::of(db, owner).expr(expr), Expr::Const(_)) {
+        return false;
+    }
+    let (_, source_map) = ExpressionStore::with_source_map(db, owner);
+    let Ok(source) = source_map.expr_syntax(expr) else { return false };
+    let Either::Left(syntax) = source.value.to_view(source.file_id.root(db)) else {
+        return false;
+    };
+    matches!(syntax.peel_parens(), ast::Expr::BlockExpr(block) if block.is_comptime())
+}
+
+/// Whether `konst` is a `const static { .. }` block ([`const_block_is_comptime`]): an inline
+/// const of a body, or the whole of an array length or const argument written as one.
+pub fn anon_const_is_comptime(db: &Db, konst: AnonConstId<'_>) -> bool {
+    let loc = konst.loc(db);
+    const_block_is_comptime(db, loc.owner, loc.expr)
+}
+
+/// Whether a call in a const context of `krate` through a function pointer or a `dyn` method
+/// ([`is_dyn_dispatch`]) is checked when it is evaluated, where its target is known, rather
+/// than refused: the crate has `#![feature(blaze_comptime)]`. The one rule of both checkers,
+/// hir-ty-mir's `const_check` and [`non_const_calls`].
+pub fn defers_dispatch_check(db: &Db, krate: Crate) -> bool {
+    // `of_root`, not `query`: a const macro's evaluation may run while a def map is built.
+    UnstableFeatures::of_root(db, krate).blaze_comptime
+}
+
+/// Whether the call of `callee` with `args` goes through a vtable as the evaluator decides it
+/// (hir-ty-mir's `exec_fn_trait` and `get_mir_or_dyn_index`), so that every call deferred here
+/// is one the evaluator checks: `Fn::call`, `FnMut::call_mut` or `FnOnce::call_once` whose
+/// `Self`, behind references, is `dyn Trait` (the evaluator reads the vtable behind them), or
+/// another trait's method whose `Self` is a `dyn` type with the trait among its principal's
+/// supertraits ([`crate::method_resolution::is_dyn_method`]). A method of an impl for a `dyn`
+/// type, or for a reference to one, is a direct call and is checked statically as any other.
+pub fn is_dyn_dispatch<'db>(
+    db: &'db Db,
+    krate: Crate,
+    callee: FunctionId,
+    args: GenericArgs<'db>,
+) -> bool {
+    if !matches!(callee.lookup(db).container, ItemContainerId::TraitId(_)) {
+        return false;
+    }
+    let interner = DbInterner::new_with(db, krate);
+    let lang = interner.lang_items();
+    if [lang.Fn_call, lang.FnMut_call_mut, lang.FnOnce_call_once].contains(&Some(callee)) {
+        let Some(mut ty) = args.as_slice().first().and_then(|it| it.ty()) else { return false };
+        while let TyKind::Ref(_, inner, _) = ty.kind() {
+            ty = inner;
+        }
+        return matches!(ty.kind(), TyKind::Dynamic(..));
+    }
+    crate::method_resolution::is_dyn_method(interner, ParamEnv::empty(), callee, args).is_some()
+}
+
+/// Whether evaluating `owner`'s body checks the target of each call it makes through a
+/// function pointer or a vtable: the body is a const context of a crate whose check of such a
+/// call is deferred ([`defers_dispatch_check`]), so the static check let the call through.
+/// The evaluator asks it only at compile time and outside a `const static` block.
+pub fn dispatch_checked_at_eval(db: &Db, owner: InferBodyId<'_>) -> bool {
+    if !defers_dispatch_check(db, owner.module(db).krate(db)) {
+        return false;
+    }
+    match owner {
+        InferBodyId::DefWithBodyId(def) => body_constness(db, def).is_some(),
+        InferBodyId::AnonConstId(_) => true,
+    }
 }
 
 /// rustc's `is_conditionally_const`: whether `def` can be used in a const context, given that its
@@ -182,7 +261,9 @@ fn const_param_env_query(db: &Db, def: GenericDefId) -> StoredClauses {
 pub enum NonConst<'db> {
     /// The callee is not a const fn, nor a method of a const trait or const impl.
     Fn(FunctionId),
-    /// A call through a function pointer: the nightly refuses these in const.
+    /// A call through a function pointer: the nightly refuses these in const. With
+    /// `#![feature(blaze_comptime)]` it is checked at evaluation instead
+    /// ([`defers_dispatch_check`]).
     FnPointer,
     /// The called closure is not a `const` closure.
     Closure,
@@ -246,7 +327,9 @@ pub fn const_call_error<'db>(
 }
 
 /// The calls in `def`'s body that are not const, when the body is const. Bodies of closures that
-/// are not `const` are skipped (making such a closure is fine, calling it is not).
+/// are not `const` are skipped (making such a closure is fine, calling it is not), and so are
+/// `const static { .. }` blocks, which are not const checked. With `#![feature(blaze_comptime)]`
+/// a call through a function pointer or a `dyn` method is not one: it is checked at evaluation.
 pub fn non_const_calls<'db>(db: &'db Db, def: DefWithBodyId) -> Vec<(ExprId, NonConst<'db>)> {
     let Some(constness) = body_constness(db, def) else { return Vec::new() }; // alloc: empty
     let mut walk = Walk {
@@ -256,6 +339,7 @@ pub fn non_const_calls<'db>(db: &'db Db, def: DefWithBodyId) -> Vec<(ExprId, Non
         infer: InferenceResult::of(db, def),
         env: const_param_env(db, def.generic_def(db)),
         constness,
+        defers_dispatch: defers_dispatch_check(db, def.module(db).krate(db)),
         found: Vec::new(), // alloc: error path, pushed only for a call that is not const
     };
     walk.expr(walk.body.root_expr());
@@ -269,6 +353,8 @@ struct Walk<'a, 'db> {
     infer: &'a InferenceResult<'db>,
     env: ParamEnvAndCrate<'db>,
     constness: BoundConstness,
+    /// [`defers_dispatch_check`] of the body's crate.
+    defers_dispatch: bool,
     found: Vec<(ExprId, NonConst<'db>)>,
 }
 
@@ -281,6 +367,7 @@ impl Walk<'_, '_> {
                 }
                 return;
             }
+            Expr::Const(_) if const_block_is_comptime(self.db, self.owner, expr) => return,
             Expr::Call { callee, .. } => self.call(expr, Some(callee)),
             Expr::MethodCall { .. }
             | Expr::BinaryOp { .. }
@@ -295,18 +382,31 @@ impl Walk<'_, '_> {
     fn call(&mut self, expr: ExprId, callee: Option<ExprId>) {
         let callee_ty = callee.map(|callee| self.infer.expr_ty(callee));
         let error = match callee_ty.map(|ty| ty.kind()) {
+            Some(TyKind::FnPtr(..)) if self.defers_dispatch => None,
             Some(TyKind::FnPtr(..)) => Some(NonConst::FnPointer),
             Some(TyKind::Closure(closure, _)) if !closure_is_const(self.db, closure.0) => {
                 Some(NonConst::Closure)
             }
             kind => match (self.infer.method_resolution(expr), kind) {
+                (Some((func, args)), _)
+                    if self.defers_dispatch
+                        && is_dyn_dispatch(self.db, self.env.krate, func, args) =>
+                {
+                    None
+                }
                 (Some((func, args)), _) => {
                     const_call_error(self.db, self.env, self.constness, func, args)
                 }
                 (None, Some(TyKind::FnDef(def, args))) => match def.0 {
                     crate::CallableDefId::FunctionId(func) => {
                         let args = args.no_bound_vars().unwrap();
-                        const_call_error(self.db, self.env, self.constness, func, args)
+                        if self.defers_dispatch
+                            && is_dyn_dispatch(self.db, self.env.krate, func, args)
+                        {
+                            None
+                        } else {
+                            const_call_error(self.db, self.env, self.constness, func, args)
+                        }
                     }
                     crate::CallableDefId::StructId(_) | crate::CallableDefId::EnumVariantId(_) => {
                         None

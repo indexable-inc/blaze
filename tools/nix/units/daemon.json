@@ -11073,7 +11073,7 @@
   },
   "blaze-spin@0.0.0": {
    "authors": "blaze contributors",
-   "description": "blaze's one bounded spin (AGENTS.md rules 9 and 13): a wait for a step another running thread is in the middle of spins, yields, then says to park or panics naming what it waited for",
+   "description": "blaze's one bounded spin (AGENTS.md rules 12 and 18): a wait for a step another running thread is in the middle of spins, yields, then says to park or panics naming what it waited for",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
    "license_file": "",

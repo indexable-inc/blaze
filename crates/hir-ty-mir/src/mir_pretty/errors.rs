@@ -15,7 +15,7 @@ use hir_ty::{
     InferBodyId,
     consteval::ConstEvalError,
     db::HirDatabase,
-    mir::{MirEvalError, MirLowerError, MirSpan},
+    mir::{ComptimeError, ComptimeErrorKind, Dispatch, MirEvalError, MirLowerError, MirSpan},
 };
 use macros::extension;
 use span::{FileId, TextRange};
@@ -229,6 +229,15 @@ impl MirEvalError<'_> {
             | MirEvalError::MachineStop
             | MirEvalError::InvalidVTableId(_) => writeln!(f, "{err:?}")?,
             MirEvalError::ComptimeUnexpanded(it) => writeln!(f, "{it}")?,
+            MirEvalError::Comptime(it) => {
+                f.push_str(&comptime_error_text(db, it, display_target));
+                if let Some((owner, span)) = it.at
+                    && let Some((file_id, range)) = source_range(db, owner, span)
+                {
+                    write!(f, " at {}", span_formatter(file_id, range))?;
+                }
+                writeln!(f)?;
+            }
         }
         Ok(())
     }
@@ -290,5 +299,66 @@ impl ConstEvalError<'_> {
                 e.pretty_print(f, db, span_formatter, display_target)
             }
         }
+    }
+}
+
+/// What blaze's `#![feature(blaze_comptime)]` refused (docs/v2/plan/design/comptime.md, "Phase
+/// 2b"), as a diagnostic says it: the function, the dispatch or the read, by name. Where it
+/// happened is the error's `at`, which the caller places.
+pub fn comptime_error_text(
+    db: &Db,
+    error: &ComptimeError<'_>,
+    display_target: DisplayTarget,
+) -> String {
+    match &error.kind {
+        ComptimeErrorKind::NonConstTarget { callee, args, through, bounds } => {
+            let through = match through {
+                // alloc: the text of a diagnostic, made when it is reported
+                Dispatch::FnPointer => "a function pointer".to_owned(),
+                Dispatch::Vtable { dyn_ty } => {
+                    let dyn_ty = dyn_ty.as_ref();
+                    // alloc: the text of a diagnostic, made when it is reported
+                    format!("the vtable of `{}`", dyn_ty.display(db, display_target))
+                }
+            };
+            let (callee, why) = match callee {
+                Either::Left(func) => {
+                    let args = args.as_ref();
+                    let name = hir_ty_print::rustc_function_name(db, *func, args.as_slice())
+                        .unwrap_or_else(|| {
+                            // alloc: the text of a diagnostic, made when it is reported
+                            FunctionSignature::of(db, *func).name.as_str().to_owned()
+                        });
+                    let why = match bounds {
+                        true => "a const function whose `[const]` bounds do not hold const here",
+                        false => "which is not a `const fn` nor a method of a `const impl`",
+                    };
+                    // alloc: the text of a diagnostic, made when it is reported
+                    (format!("`{name}`"), why)
+                }
+                // alloc: the text of a diagnostic, made when it is reported
+                Either::Right(_) => ("a closure".to_owned(), "which is not a `const` closure"),
+            };
+            // alloc: the text of a diagnostic, made when it is reported
+            format!(
+                "a call through {through} in a const context reached {callee}, {why}: \
+                 `#![feature(blaze_comptime)]` checks such a call when it is evaluated, and \
+                 only const code runs in a constant outside a `const static {{ .. }}` block"
+            )
+        }
+        ComptimeErrorKind::Foreign { func } => {
+            let name = FunctionSignature::of(db, *func).name.as_str();
+            // alloc: the text of a diagnostic, made when it is reported
+            format!(
+                "a `const static {{ .. }}` block called the foreign function `{name}`, which \
+                 cannot run at compile time: I/O, time, randomness, threads, the environment and \
+                 system calls are refused"
+            )
+        }
+        // alloc: the text of a diagnostic, made when it is reported
+        ComptimeErrorKind::PointerAddress { how } => format!(
+            "a `const static {{ .. }}` block read a pointer's address as an integer ({how}): \
+             the evaluator's addresses are not the program's"
+        ),
     }
 }

@@ -363,7 +363,7 @@ impl<'f> Defs<'f> {
     }
 }
 
-/// The body's owner as a span names it: an item by its path, never an interned id (rule 22).
+/// The body's owner as a span names it: an item by its path, never an interned id (rule 25).
 fn owner_path(db: &Db, owner: InferBodyId<'_>) -> String {
     match owner {
         InferBodyId::DefWithBodyId(def) => blaze_items::key::path(db, ItemId::of_body(db, def)),

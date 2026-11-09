@@ -839,7 +839,7 @@ fn walk_of_f(db: &Db) -> (CompileIdentity, CompileIdentity, CodeId) {
     })
 }
 
-/// Rule 18: a trait method's `impl Trait` is the impl's once the implementing type is known,
+/// Rule 21: a trait method's `impl Trait` is the impl's once the implementing type is known,
 /// so the code identity of an instance that reaches it through the trait (`walk::<F>`) covers
 /// the impl's hidden type: another layout (`Wide`) or the same layout with other code
 /// (`Twice`) changes every identity of it, and of `run`'s step, and the same program keeps

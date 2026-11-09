@@ -1,5 +1,5 @@
 //! `unnamed_wait`: a wait through `blaze_graph`'s API that does not say what it waits for
-//! (AGENTS.md rule 12: a thread or fiber that blocks opens a span naming the awaited key, lock,
+//! (AGENTS.md rule 15: a thread or fiber that blocks opens a span naming the awaited key, lock,
 //! channel, IO or child). The profile test fails on such a wait when it runs; this finds it where
 //! it is written. It goes once the typed wait API (%195) makes the name part of the call's type.
 //!
@@ -196,7 +196,7 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
         };
         let note = format!(
             "a wait opens a span naming what it waits for, and the profile test fails on one with no name (AGENTS.md \
-             rule 12): {}",
+             rule 15): {}",
             instead.say()
         );
         facts::push(&mut found, Lint::UnnamedWait, range, message, Some(note));

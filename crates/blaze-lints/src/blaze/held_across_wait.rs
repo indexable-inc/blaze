@@ -1,5 +1,5 @@
 //! `held_across_wait`: a value tied to its thread live across a call that may park the fiber
-//! (AGENTS.md rule 22: a fiber may resume on another thread after any wait). The calls and what
+//! (AGENTS.md rule 27: a fiber may resume on another thread after any wait). The calls and what
 //! is live across each are the may-suspend check's ([`hir_ty_suspend::suspend_points`]); a value
 //! it already rejects (not `Send`, or `#[must_not_suspend]`: `why` is set) is its error and not
 //! repeated here. What `Send` does not catch, and this lint does:
@@ -113,7 +113,7 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
             ),
         };
         let note = format!(
-            "the call parks the fiber through {}, and a parked fiber may resume on another thread (AGENTS.md rule 22), \
+            "the call parks the fiber through {}, and a parked fiber may resume on another thread (AGENTS.md rule 27), \
              where this still points into, or gives back to, the thread it was made on; its type is `Send`, so the \
              may-suspend check lets it through: end it before the call, or read the thread-local again after it",
             point.path_said(db)

@@ -854,7 +854,7 @@ impl std::error::Error for FixpointLimit {}
 
 /// The error a caught panic's payload is, when it is one of name resolution's typed stops
 /// ([`Unmaintained`], [`FixpointLimit`], [`frozen::Unreadable`]): what a driver fails the one
-/// job that asked with (rule 17). `None` for any other payload.
+/// job that asked with (rule 20). `None` for any other payload.
 // dyn: a caught panic's payload, read once
 pub fn stopped(payload: &(dyn std::any::Any + Send)) -> Option<String> {
     if let Some(it) = Unmaintained::of_payload(payload) {

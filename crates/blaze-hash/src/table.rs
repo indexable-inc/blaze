@@ -1,5 +1,5 @@
 //! The single-owner tables, [`Map`] and [`Set`]: hashbrown's, on a hasher of this crate's, in
-//! the allocator the type names (AGENTS.md rule 9, bump-allocate). [`HashMap`](crate::HashMap),
+//! the allocator the type names (AGENTS.md rule 11, bump-allocate). [`HashMap`](crate::HashMap),
 //! [`HashSet`](crate::HashSet), [`ByHash`](crate::ByHash) and [`ByHashSet`](crate::ByHashSet)
 //! are these on [`FixedState`](crate::FixedState) or [`BuildKeyHasher`](crate::BuildKeyHasher).
 //!

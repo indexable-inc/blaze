@@ -37,7 +37,7 @@ use crate::{
 };
 
 /// How many more failing assertions a refuted query is asked for before only earlier ones are
-/// (`--multiple-errors`), and the bound on asking at all (rule 15).
+/// (`--multiple-errors`), and the bound on asking at all (rule 18).
 const MORE_ERRORS: u32 = 8;
 const MAX_PROBES: u32 = 64;
 
@@ -124,7 +124,7 @@ impl QueryResultObserver for Capture {
 }
 
 /// Proves `lowered` with `config`. A panic in vendored code fails this function's verdict
-/// with the panic's message, and nothing else (rule 17).
+/// with the panic's message, and nothing else (rule 20).
 pub(crate) fn prove(lowered: &Lowered, config: &Config) -> Outcome {
     let diags = Collect::default();
     let result = catch_unwind(AssertUnwindSafe(|| prove_inner(lowered, config, &diags)));

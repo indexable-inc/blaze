@@ -98,6 +98,8 @@ blaze-codegen-code.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+# tests/malloc.rs: an LLVM context made and disposed of in a task, through LLVM's C API.
+llvm-sys.workspace = true
 # as_rustc's tests: what blaze answers `rustc -vV` is a compiler the code identity takes.
 blaze-codegen-code.workspace = true
 

@@ -1,5 +1,5 @@
 //! What a user sets of the collector: `<root>/gc.json`, one JSON object whose every field is
-//! optional and whose unknown fields are refused, naming them (AGENTS.md rule 35): the levels
+//! optional and whose unknown fields are refused, naming them (AGENTS.md rule 42): the levels
 //! of free space ([`crate::pace::Levels`]), and whether the daemon collects on its own:
 //!
 //! ```json

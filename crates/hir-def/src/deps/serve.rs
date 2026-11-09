@@ -143,7 +143,7 @@ pub enum Refused {
     ModuleFileMissing { what: String },
     /// The crate's key as the database has it when its image would be written is not the one
     /// it was served under: something it is made from changed between the serve and the
-    /// store, so the image would be filed under a key that does not name it (rule 18).
+    /// store, so the image would be filed under a key that does not name it (rule 21).
     KeyMoved { served: ContentId, now: Option<ContentId> },
     /// A part of it holds a path its key writes as a marker ([`Base`]): the image would not be
     /// the same in another checkout with the same key.

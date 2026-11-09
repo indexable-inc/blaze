@@ -1792,7 +1792,7 @@ pub struct Inlined<'db> {
     /// targets counts), or [`devirt::ABSENT`]; each once, in the order first read
     /// ([`Inlined::read_devirt`]). The pass runs before and after `Inline` and looks again at
     /// a call it kept, which reads the same facts again. The code generator keys the body's
-    /// code on them (rule 18), so a body built against a world it no longer matches is not
+    /// code on them (rule 21), so a body built against a world it no longer matches is not
     /// reused.
     pub devirtualized: Vec<[u8; 32]>,
     /// By block, ascending; each block once. Written by the last pass, so the blocks are the
@@ -2733,6 +2733,67 @@ pub enum MirEvalError<'db> {
     InternalError(Box<str>),
     /// A comptime form only generic MIR holds, met by the evaluator.
     ComptimeUnexpanded(ComptimeUnexpanded),
+    /// What blaze's `#![feature(blaze_comptime)]` refuses when it is evaluated: a call through a
+    /// function pointer or vtable in const that reaches a function that is not const, or what
+    /// a `const static { .. }` block cannot do at compile time.
+    Comptime(Box<ComptimeError<'db>>),
+}
+
+/// What the evaluator refused under blaze's `#![feature(blaze_comptime)]`
+/// (docs/v2/plan/design/comptime.md, "Phase 2b"), and where: the body and the place in it of
+/// the call or cast, when known. The frames around it are the `InFunction`s it is wrapped in.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)]
+pub struct ComptimeError<'db> {
+    pub kind: ComptimeErrorKind<'db>,
+    pub at: Option<(InferBodyId<'db>, MirSpan)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)]
+pub enum ComptimeErrorKind<'db> {
+    /// A call in a const context through `through` reached `callee` (with `args`; a trait's
+    /// method named by the impl's that runs), which is not const: not a `const fn`, not a
+    /// method of a `const impl`, not a `const` closure. `bounds`: it is const, but its
+    /// `[const]` bounds do not hold const for these arguments.
+    NonConstTarget {
+        callee: Either<FunctionId, InternedClosureId<'db>>,
+        args: StoredGenericArgs,
+        through: Dispatch,
+        bounds: bool,
+    },
+    /// A `const static { .. }` block called the foreign function `func`: I/O, time, randomness,
+    /// threads, the environment, a system call; nothing the evaluator answers purely.
+    Foreign { func: FunctionId },
+    /// A `const static { .. }` block read a pointer's address as an integer, by `how`: the
+    /// evaluator's addresses are its own, and would differ from the program's.
+    PointerAddress { how: AddressRead },
+}
+
+/// How a call reached its target without naming it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)]
+pub enum Dispatch {
+    /// Through a function pointer.
+    FnPointer,
+    /// Through the vtable of `dyn_ty`, a `dyn Trait` (behind references, as the call's
+    /// `Self` has it).
+    Vtable { dyn_ty: StoredTy },
+}
+
+/// How a pointer's address was read as an integer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+pub enum AddressRead {
+    /// An `as` cast to an integer (`PointerExposeAddress`: `ptr as usize`, `expose_provenance`).
+    Cast,
+    /// A `transmute` of a value with a pointer in it to a type with none (`ptr.addr()`).
+    Transmute,
+}
+
+impl std::fmt::Display for AddressRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            AddressRead::Cast => "a cast of a pointer to an integer",
+            AddressRead::Transmute => "a transmute of a pointer to a type with no pointer in it",
+        })
+    }
 }
 
 /// A comptime form of generic MIR (`#![feature(blaze_comptime)]`) that a pass met where it
@@ -2835,6 +2896,7 @@ impl std::fmt::Debug for MirEvalError<'_> {
                 f.debug_struct("WithStack").field("error", e).field("stack", &stack).finish()
             }
             Self::ComptimeUnexpanded(it) => write!(f, "{it}"),
+            Self::Comptime(it) => f.debug_tuple("Comptime").field(it).finish(),
         }
     }
 }

@@ -18,7 +18,7 @@ use crate::{
         AtomicOp, AtomicOrdering, AtomicOrders, FloatWidth, Intrinsic, SimdOp, atomic_orderings,
         intrinsic_of,
     },
-    mir::MirLowerError,
+    mir::{AddressRead, ComptimeErrorKind, MirLowerError},
     mir::eval::{
         Address, AdtId, Evaluator, FunctionId, GenericArgs, Interned, InternedLayout, Interval,
         IntervalAndTy, IntervalOrOwned, IsSigned, ItemContainerId, Layout, Locals, Lookup,
@@ -37,6 +37,11 @@ mod simd;
 mod thread;
 
 pub(super) use thread::{Process, Resume, TlsData};
+
+/// The `extern "C"` functions a `const static { .. }` block may call
+/// (`#![feature(blaze_comptime)]`): those [`Evaluator::exec_extern_c`] answers from the
+/// evaluation's memory alone, with no outside effect and the same answer every time.
+const PURE_C_FUNCTIONS: [&str; 5] = ["memcmp", "memcpy", "memmove", "memset", "strlen"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EvalLangItem {
@@ -108,6 +113,14 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             _ => false,
         };
         if is_extern_c {
+            // blaze: a `const static { .. }` block (`#![feature(blaze_comptime)]`) calls no
+            // foreign code but the memory functions answered here purely: what else an
+            // `extern "C"` function does (I/O, time, randomness, threads, the environment) cannot
+            // happen at compile time.
+            if self.comptime && !PURE_C_FUNCTIONS.contains(&function_data.name.as_str()) {
+                let kind = ComptimeErrorKind::Foreign { func: def };
+                return Err(super::comptime_error(kind, Some((locals.body.owner, span))));
+            }
             return self
                 .exec_extern_c(
                     function_data.name.as_str(),
@@ -417,6 +430,28 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 Ok(Vec::new()) // alloc: empty, allocates nothing
             }
         }
+    }
+
+    /// Whether `transmute::<Src, Dst>(arg)` reads a pointer's address as data: `Dst` has no
+    /// pointer in it, and `arg` has one (with provenance, where the machine tracks it).
+    fn transmute_reads_address(
+        &self,
+        arg: &IntervalAndTy<'db>,
+        generic_args: GenericArgs<'db>,
+    ) -> Result<'db, bool> {
+        let Some(dst) = generic_args.as_slice().get(1).and_then(|it| it.ty()) else {
+            return Ok(false);
+        };
+        if !self.holds_no_pointer(dst) {
+            return Ok(false);
+        }
+        if !M::CHECKS {
+            return Ok(!self.holds_no_pointer(arg.ty));
+        }
+        let (_, shadow) = self.read_shadowed(arg.interval.addr, arg.interval.size)?;
+        let mut found = false;
+        shadow.pointers(arg.interval.size, self.ptr_size(), |_| found = true);
+        Ok(found)
     }
 
     fn exec_syscall(
@@ -1231,6 +1266,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         "transmute arg is not provided".into(),
                     ));
                 };
+                if self.comptime && self.transmute_reads_address(arg, generic_args)? {
+                    let kind = ComptimeErrorKind::PointerAddress { how: AddressRead::Transmute };
+                    return Err(super::comptime_error(kind, Some((locals.body.owner, span))));
+                }
                 destination.write_from_interval(self, arg.interval)
             }
             Intrinsic::BlackBox => {

@@ -290,7 +290,7 @@ mod tests {
         assert_eq!(to_bytes(&result), to_bytes(&result.clone()));
     }
 
-    /// rule 23: a restored row whose id word is corrupt (0, past `Id::MAX_U32`, past 32 bits)
+    /// rule 26: a restored row whose id word is corrupt (0, past `Id::MAX_U32`, past 32 bits)
     /// is the row's typed error naming the byte and the word, never a panic in `Id::from_u32`.
     #[test]
     fn a_corrupt_persisted_id_is_a_typed_error_naming_its_bits() {

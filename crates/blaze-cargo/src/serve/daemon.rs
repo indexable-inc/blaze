@@ -142,7 +142,7 @@ pub struct Still {
     /// The worker pool's jobs parked on a wait.
     pub parked: usize,
     /// Every job that waits in the wait graph and what on: a parked job's own spans are on no
-    /// thread while it waits (rule 13).
+    /// thread while it waits (rule 15).
     pub graph: blaze_graph::sched::Waits,
     pub waits: Vec<StillWait>,
     /// Lowerings the loop holds until their root's kept front end is stored, which have no
@@ -216,7 +216,7 @@ impl fmt::Display for Still {
 
 /// The plane's thread tasks that run (a pool job's or an IO thread's), each by its node's name
 /// and unit, as a stall names what the loop waits on: the loop's wait for a task is a wait for
-/// its job's `done`, which opens no span of its own (rule 13).
+/// its job's `done`, which opens no span of its own (rule 15).
 struct RunningTasks<'a, W: super::plane::Work, P: blaze_graph::admission::Predict>(&'a Plane<W, P>);
 
 impl<W: super::plane::Work, P: blaze_graph::admission::Predict> fmt::Display
@@ -272,7 +272,7 @@ impl fmt::Display for DownloadsNow<'_> {
 /// The builds clients wait on, as a stall names them: how many jobs of requests the session
 /// has not seen finish, and each job of the build with its stage and what it waits on there.
 /// A request the session waits on with no job of the build left for it is a lost job, said
-/// so (rule 13: the client's wait names what it waits on).
+/// so (rule 15: the client's wait names what it waits on).
 struct BuildsWaited<'a, S: Steps>(usize, WaitedOn<'a, S>);
 
 impl<S: Steps> fmt::Display for BuildsWaited<'_, S> {
@@ -538,6 +538,10 @@ pub struct Daemon<D: Driver, S: Steps> {
     completions: u64,
     /// When the plots were last written, on the driver's clock.
     plotted: Duration,
+    /// When the memory's breakdown by area was last plotted ([`super::breakdown::EVERY`]), on
+    /// the driver's clock, and which tags it wrote so far.
+    broken_down: Duration,
+    shown: super::breakdown::Shown,
     /// When the builds were last looked at ([`doing::EVERY`]), on the driver's clock.
     looked: Duration,
     /// What that look found of each build a client waits on, for `blaze status`
@@ -1521,6 +1525,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             pulse: Arc::default(), // alloc: once a daemon
             completions: 0,
             plotted: Duration::ZERO,
+            broken_down: Duration::ZERO,
+            shown: super::breakdown::Shown::default(),
             looked: Duration::ZERO,
             builds: Vec::new(), // alloc: none until a build is looked at
             memory_logged: Duration::ZERO,
@@ -1810,7 +1816,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         if until.passed(now) {
             self.driver.poll(&mut done, until);
         } else {
-            // The loop's time between its turns, said as a wait on what ends it (rule 13).
+            // The loop's time between its turns, said as a wait on what ends it (rule 15).
             let driver = &mut self.driver;
             blaze_graph::wait::wait(woken.on(), None, || driver.poll(&mut done, until));
         }
@@ -2206,13 +2212,15 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     }
 
     /// The plane's and the memory's plots, at most once each [`PLOT_EVERY`] of the driver's
-    /// clock.
+    /// clock, and the memory's breakdown by area once each [`super::breakdown::EVERY`]: each
+    /// row of the build under way ([`Jobs::build_under_way`]), 0 while none is.
     fn plot(&mut self) {
         let now = self.driver.now();
         if now.saturating_sub(self.plotted) < PLOT_EVERY {
             return;
         }
         self.plotted = now;
+        let _build = blaze_profile::flight::counting_for(self.jobs.build_under_way());
         blaze_profile::plot(Plot::Running, self.plane.running() as u64);
         let memory = blaze_mem::tag::snapshot();
         blaze_profile::plot(Plot::FrameBytes, memory.get(blaze_mem::Tag::Frames).live);
@@ -2232,6 +2240,10 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let (span_map_bytes, span_map_pieces) = ::span::kept_maps();
         blaze_profile::plot(Plot::SpanMapBytes, span_map_bytes);
         blaze_profile::plot(Plot::SpanMapPieces, span_map_pieces);
+        if now.saturating_sub(self.broken_down) >= super::breakdown::EVERY {
+            self.broken_down = now;
+            super::breakdown::plot(&memory, blaze_graph::arena::held(), &mut self.shown);
+        }
         if now.saturating_sub(self.memory_logged) >= MEMORY_LOG_EVERY {
             self.memory_logged = now;
             log_memory(&memory);
@@ -2924,6 +2936,8 @@ mod tests {
             base_pages_high_water: 0,
             thp: blaze_mem::huge::Thp::Unset,
             heap_outside: 1 << 30,
+            heap_outside_allocated: 0,
+            heap_outside_freed: 0,
             heap_by_tag: true,
             purged: 1 << 30,
             heap_committed: Some(7 << 30),

@@ -537,7 +537,7 @@ impl S { #[proc_macros::reading] pub fn m() {} }
 
 /// A proc macro among an impl's items makes an item the image holds, so what it read files
 /// the image: once that value is another, the image is not served though the crate's key is
-/// the same (rule 18).
+/// the same (rule 21).
 #[test]
 fn a_read_of_a_proc_macro_among_an_impls_items_files_the_image() {
     let _turn = TURN.lock();
@@ -574,7 +574,7 @@ fn a_read_of_a_proc_macro_among_an_impls_items_files_the_image() {
 /// A crate's image holds what its dependencies' expansions made (`app` imports `lib`'s
 /// `Shown`, which an expansion gave back), and neither crate's key covers what those
 /// expansions read: once a value one of them read is another, the dependent's image is not
-/// served either, though its key is the same (rule 18). Its reads are the same whether the
+/// served either, though its key is the same (rule 21). Its reads are the same whether the
 /// dependency was resolved or served as it was imaged, so either files it under one key.
 #[test]
 fn a_dependents_image_is_not_served_once_a_dependencys_expansion_reads_another_value() {
@@ -1489,7 +1489,7 @@ fn an_edit_of_a_file_that_is_not_utf8_gives_a_new_key() {
     assert_eq!(stored.written, vec![lib]);
 }
 
-/// Making a crate's key reads its files and writes nothing (rule 22): what the caches that hash
+/// Making a crate's key reads its files and writes nothing (rule 25): what the caches that hash
 /// the files read outside the VFS hold (`blaze-items`' crate facts and a kept proc-macro
 /// expansion's tracked reads, both made from `Files::included_by` and `included_files`) is
 /// the same whether the key was made before or after the crate's expansions, and the bytes

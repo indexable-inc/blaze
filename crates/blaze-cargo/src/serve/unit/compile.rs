@@ -356,7 +356,7 @@ const FILED_BEYOND: &str =
 /// compares it with its last miss by ([`blaze_kernel::Miss::subject`]).
 pub(super) fn unit_subject(job: &Job, u: &Unit) -> Result<ContentId, String> {
     // The workspace's root too: one `BLAZE_HOME`'s ledger holds every workspace's units, and a
-    // registry crate's package id is the same in each (rule 18).
+    // registry crate's package id is the same in each (rule 21).
     let workspace = &job.input.config.invocation.root;
     let named = (
         workspace,
@@ -2161,7 +2161,7 @@ impl fmt::Display for ModuleError {
 /// the macro crate, never run another way. A proc macro built for the host (a plan with
 /// `Spec::macro_wasm` off, which no build makes) is refused naming it: blaze's MIR evaluator
 /// is const eval's and the reference the wasm host is tested against, never a build's macro
-/// host (AGENTS.md rule 8).
+/// host (AGENTS.md rule 10).
 ///
 /// Asked again each time the unit compiles or its record is reused, as the front end it reads
 /// may have changed.
