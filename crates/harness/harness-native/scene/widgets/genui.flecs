@@ -672,15 +672,17 @@ hn {
     GridColumns: {min: 120, max: 0}
     Flex: {axis: Column, gap: 12, align: Stretch, justify: Start, wrap: false}
   }
-  // Children on top of one another, centred, the box as big as the largest; a GenLayer over them adds no size: laid on
-  // the stack's frame (out of the flow), its children at its anchor moved by x and y (genui/layout.rs sets its alignment
-  // and padding), above the rest by its z.
+  // Children on top of one another, centred, the box as big as the largest of them, GenLayers included (SwiftUI's ZStack:
+  // its frame is the union of its children's), later ones and a higher z above.
   prefab GenStack : ui.ZStack {
     Flex: {axis: Z, gap: 0, align: Center, justify: Center, wrap: false}
     Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
   }
+  // A Stack's child that is its content's size and is stretched over the stack's whole frame, so its children are
+  // proposed the stack's width and sit at its anchor moved by x and y (genui/layout.rs sets its alignment and padding;
+  // x and y add no size), above its siblings by its z.
   prefab GenLayer : ui.Column {
-    Overlay
+    AlignSelf: {align: Stretch}
     Flex: {axis: Column, gap: 0, align: Start, justify: Start, wrap: false}
   }
   // Children left to right, wrapping, `gap` apart.

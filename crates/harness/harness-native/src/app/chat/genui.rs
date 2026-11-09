@@ -1068,7 +1068,7 @@ mod tests {
         assert!((pic.w - 96.0).abs() < 0.5 && (pic.h - 96.0).abs() < 0.5, "a 96 by 96 image: {pic:?}");
         assert_eq!(el(1).part("g0").and_then(|i| i.part("pic")).and_then(|p| p.entity().try_cloned::<&harness_native_ui_text_api::Picture>()).map(|p| p.handle.as_str().to_owned()), Some(icon.clone()));
         let badge = laid(part(el(1), "g1.g0"), "the layer's badge");
-        assert!((stack.w - 96.0).abs() < 0.5, "a layer adds no size to its stack: {stack:?}");
+        assert!((stack.w - 96.0).abs() < 0.5 && (stack.h - 96.0).abs() < 0.5, "a stack is as big as its largest child, here the image over a smaller layer: {stack:?}");
         assert!((badge.x + badge.w - (stack.x + stack.w - 4.0)).abs() < 0.5 && (badge.y - stack.y - 4.0).abs() < 0.5, "the badge at the top right, 4 in: {badge:?} in {stack:?}");
         assert_eq!(action(part(el(2), "g0")), Some(one("h2", "true")), "a chip with no value sends !selected");
         assert!(is(part(el(2), "g1"), "hn.GenChipOn"));
@@ -1267,6 +1267,62 @@ mod tests {
             let t = words_of(el(i));
             assert!(t.contains(says), "element {i} is refused in words: {t:?}");
         }
+    }
+
+    /// Property `layers-size-their-stack`: a Stack whose children are all Layers is as big as its largest Layer's content
+    /// (here a 280 by 30 Shader), not 0 by 0, and a Text in another Layer is proposed the stack's width, so it sits on one
+    /// line at its anchor (the left, centred down) instead of wrapping a character a line.
+    #[test]
+    fn layers_size_their_stack() {
+        use harness_native_ui_layout_api::Intrinsic;
+        let world = crate::app::scene_world().unwrap_or_else(|e| panic!("{e}"));
+        let w = world.world_ref();
+        harness_native_ui_layout::install(w);
+        harness_native_ui_input::install(w);
+        harness_native_ui_motion::install(w);
+        world.set(Clock::default());
+        world.set(Viewport { w: 900.0, h: 2600.0 });
+        let ui = serde_json::json!([
+            {"type": "Stack", "props": {}, "children": [
+                {"type": "Layer", "props": {}, "children": [
+                    {"type": "Shader", "props": {"msl": "// msl", "key": "00000000000000ad", "uniforms": [], "textures": [],
+                        "width": 280, "height": 30, "animate": false, "pointer": false}, "children": []}]},
+                {"type": "Layer", "props": {"anchor": "left"}, "children": [
+                    {"type": "Text", "props": {"text": "fix model picker"}, "children": []}]}]},
+            {"type": "Text", "props": {"text": "after the stack"}, "children": []}
+        ]);
+        let live = std::cell::RefCell::new(Live::default());
+        let row = View::root(w, "hn.ChatUi");
+        let mut measure = |s: &str, st: &TextStyle, _md: bool| s.chars().count() as f32 * st.size.max(1.0) * 0.55;
+        for _ in 0..6 {
+            fill(row, &ui, "test.0", Some(&live), false, &mut measure);
+            harness_native_ui_layout::typeset::typeset(w, &mut harness_native_ui_layout::typeset::Estimate);
+            world.get::<&mut Clock>(|c| c.time += 1.0 / 60.0);
+            world.progress_time(1.0 / 60.0);
+        }
+        let body = row.part("body").expect("body");
+        let el = |i: usize| body.part(&format!("g{i}")).unwrap_or_else(|| panic!("element {i}"));
+        fn part<'w>(v: View<'w>, path: &str) -> View<'w> {
+            path.split('.').try_fold(v, |v, p| v.part(p)).unwrap_or_else(|| panic!("no part {path}"))
+        }
+        let laid = |v: View<'_>, what: &str| {
+            let l = v.entity().try_cloned::<&Laid>().unwrap_or_else(|| panic!("{what} is not laid out"));
+            assert!(l.w > 0.0 && l.h > 0.0, "{what} has no room: {l:?}");
+            l
+        };
+        let stack = laid(el(0), "the stack");
+        let fx = laid(part(el(0), "g0.g0"), "the shader");
+        assert!((fx.w - 280.0).abs() < 0.5 && (fx.h - 30.0).abs() < 0.5, "a 280 by 30 shader: {fx:?}");
+        assert!((stack.w - 280.0).abs() < 0.5 && (stack.h - 30.0).abs() < 0.5, "a stack of layers is its largest layer's size: {stack:?}");
+        let words = part(el(0), "g1.g0");
+        let t = laid(words, "the layer's text");
+        let unwrapped = words.entity().try_cloned::<&Intrinsic>().map_or(0.0, |i| i.w);
+        let line = words.entity().try_cloned::<&TextStyle>().map_or(0.0, |s| s.line);
+        assert!(unwrapped > 0.0 && unwrapped < 280.0, "the words are measured, narrower than the shader: {unwrapped}");
+        assert!(t.w + 0.5 >= unwrapped && t.h < line * 1.5, "the text is on one line: {t:?}, {unwrapped} wide unwrapped, lines {line} tall");
+        assert!((t.x - stack.x).abs() < 0.5 && t.y >= stack.y - 0.5 && t.y + t.h <= stack.y + stack.h + line, "the text at the stack's left: {t:?} in {stack:?}");
+        let after = laid(el(1), "the text after the stack");
+        assert!(after.y >= stack.y + stack.h - 0.5, "what follows the stack starts below it: {after:?} after {stack:?}");
     }
 }
 
