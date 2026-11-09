@@ -5,6 +5,19 @@ module hn.tree
 // each row sets only what its state changes (its ink, its weight, its sheen). Prefabs only, leaves only (no children),
 // so an instance in a template is the part itself.
 
+// A row's kind at a glance, before its title: tree_kind across, tree_kind_gap after (the host sets an agent's mark or a
+// shell's glyph on it, src/app.rs sync_view).
+prefab Kind : ui.Symbol {
+  Size: {w: {kind: Fixed, value: $tree_kind, min: 0, max: 0}, h: {kind: Fixed, value: $tree_kind, min: 0, max: 0}}
+  Padding: {l: 0, r: $tree_kind_gap, t: 0, b: 0}
+}
+
+// A command's: the terminal glyph, faint (cod-terminal).
+prefab CmdKind : Kind {
+  Icon: {glyph: ""}
+  Fill: $tone_ink_faint
+}
+
 // A session's title: 13, a touch over regular, one line that gives way first (ui.Lead) when the row runs out of room.
 // Renamed in place (cmd+R, src/app/chat/rename.rs), the host sets its TextEdit's caret and selection; at rest nothing.
 prefab Head : ui.Lead {

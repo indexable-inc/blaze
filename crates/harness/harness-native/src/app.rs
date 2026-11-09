@@ -1039,6 +1039,24 @@ impl App {
                     ]
                     .concat(),
                 );
+                // Its kind's mark before its title: Claude's in its orange, any other muted; breathing slow and deep while
+                // it sleeps (a sub-agent up but idle).
+                if let Some(i) = row.part("kind_icon") {
+                    let kind = model::kind_name(o);
+                    crate::look::kind_mark(w, i.entity(), kind);
+                    if kind != "claude" {
+                        let f = tone(w, "ink_muted");
+                        if i.entity().try_cloned::<&Fill>() != Some(f) {
+                            i.entity().set(f);
+                        }
+                    }
+                    let low = if sleeps && !selected { crate::look::width(w, "tree_sleep") } else { 1.0 };
+                    match i.entity().try_cloned::<&crate::look::Breath>() {
+                        Some(b) if (b.low - low).abs() < 1e-3 => {}
+                        Some(b) => _ = i.entity().set(crate::look::Breath { low, ..b }),
+                        None => _ = i.entity().set(crate::look::Breath { spring: Spring::at(1.0), up: false, low }),
+                    }
+                }
                 if let Some((_, units)) = edit {
                     me.rename_caret(row, units);
                 }
@@ -2458,6 +2476,23 @@ fn doing_of(t: &model::chat::Transcript) -> Option<Doing> {
     let base = |p: &str| p.rsplit('/').next().unwrap_or(p).to_owned();
     Some(match t.items.last()? {
         Item::Thinking { done: false, .. } => Doing { pace: "think", what: "Thinking", detail: "thinking".to_owned() },
+        // A harness REPL cell: the step it is on (a command, a file, a page), not the tool's name.
+        Item::Tool { block, result: None, .. } if t.details.contains_key(block) => {
+            let d = &t.details[block];
+            match d.effects.iter().rev().find(|e| e.status == "running") {
+                Some(e) => {
+                    let (pace, what) = match e.kind.as_str() {
+                        "exec" | "build" => ("run", "Running"),
+                        "write" | "delete" => ("edit", "Editing"),
+                        "spawn" => ("agent", "Starting a session"),
+                        _ => ("read", "Reading"),
+                    };
+                    let detail = if e.kind == "exec" || e.kind == "build" { short_cmd(&e.target) } else { base(&e.target) };
+                    Doing { pace, what, detail: if detail.is_empty() { e.doing.clone() } else { detail } }
+                }
+                None => Doing { pace: "run", what: "Running code", detail: String::new() },
+            }
+        }
         Item::Tool { name, input, result: None, .. } => {
             let s = |k: &str| input[k].as_str().unwrap_or("").to_owned();
             let n = name.to_ascii_lowercase();
