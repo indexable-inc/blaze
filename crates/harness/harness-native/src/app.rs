@@ -804,6 +804,9 @@ impl App {
 
     fn select(&mut self, e: Option<u64>) {
         if e != self.selected() {
+            if e.is_some() {
+                crate::audio::cue("select");
+            }
             self.reset_focused_term();
             self.pressed.clear();
             model::select(self.world.world_ref(), e);
@@ -1263,6 +1266,7 @@ impl App {
         let Some(key) = self.key_of(e) else { return };
         let pinned = self.pinned.remove(&key);
         if self.closed.insert(key) || pinned {
+            crate::audio::cue("archive");
             let o = self.world.entity_from_id(e);
             o.add(model::Closed::id());
             o.remove(model::Pinned::id());
@@ -1775,6 +1779,7 @@ impl App {
             self.poke();
             return;
         }
+        crate::audio::cue("fresh");
         let kind = self.chat_kind();
         let c = self.choice_of(&kind);
         let kept = self.link.agent_models();
@@ -1854,7 +1859,11 @@ impl App {
         {
             let front = self.focused_chat().is_some_and(|(_, _, sid)| self.chats.borrow().get(&sid).is_some_and(|t| t.busy));
             let agents = self.chats.borrow().values().filter(|t| t.busy).count();
-            crate::audio::scene(agents, front, chat::plan::night(model::now_ms() / 1000));
+            // Whether the chat in front's turn ended on an error: its ending rings low, not home.
+            let failed = self.focused_chat().is_some_and(|(_, _, sid)| {
+                self.chats.borrow().get(&sid).is_some_and(|t| t.items.iter().rev().find(|i| !matches!(i, model::chat::Item::TurnEnd { .. })).is_some_and(|i| matches!(i, model::chat::Item::Error { .. })))
+            });
+            crate::audio::scene(agents, front, failed, chat::plan::night(model::now_ms() / 1000));
         }
         self.sync_side_status();
         self.step_archive_scroll();
@@ -2458,6 +2467,7 @@ impl App {
 
     /// Open the palette (the shot's `HARNESS_NATIVE_SHOT_PALETTE`).
     pub fn open_palette(&mut self) {
+        crate::audio::cue("open");
         self.palette = Some(Palette::new());
         self.poke();
     }

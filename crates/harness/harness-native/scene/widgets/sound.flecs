@@ -2,7 +2,8 @@
 // - cue: a soft sound as an agent's step changes, each a few Sounds (harness-native-blaze's voices: Bell, Mallet, Bass,
 //   Click, Thud, Whoosh) with its Onset, Pitch, Lasts, Gain and Pan; a cue's own Gain is how loud it plays. The names
 //   are the step items a running line shows (harness-native-render block.rs: exec read edit search net build spawn wait
-//   sql think), `ready` (the app is up) and `done` (the turn ended).
+//   sql think), and what the person does or what happens: `ready`, `fresh`, `send`, `select`, `open`,
+//   `archive`, `done`, `fail`.
 // - mood: the music, below.
 // `hn.sound`'s Gain is the master. native.json `sound: false` turns it all off, `music: false` the music, `ambient: false`
 // the rain.
@@ -91,6 +92,41 @@ hn {
       think {
         Gain: {amp: 0.15}
         a { Sound: {voice: Bell}; Onset: {at: 0}; Lasts: {dur: 2}; Pitch: {hz: 554.37}; Gain: {amp: 0.03} }
+      }
+      // A new chat: a page turned and two bars opening upward.
+      fresh {
+        Gain: {amp: 0.3}
+        a { Sound: {voice: Whoosh}; Onset: {at: 0}; Lasts: {dur: 0.25}; Pitch: {hz: 2400}; Gain: {amp: 0.02}; Pan: {pos: -0.4, sweep: 0.8} }
+        b { Sound: {voice: Mallet}; Onset: {at: 0.08}; Lasts: {dur: 1.2}; Pitch: {hz: 440}; Gain: {amp: 0.045}; Pan: {pos: -0.2, sweep: 0} }
+        c { Sound: {voice: Mallet}; Onset: {at: 0.2}; Lasts: {dur: 1.6}; Pitch: {hz: 659.25}; Gain: {amp: 0.045}; Pan: {pos: 0.2, sweep: 0} }
+      }
+      // A message sent: one soft bar, rising.
+      send {
+        Gain: {amp: 0.22}
+        a { Sound: {voice: Mallet}; Onset: {at: 0}; Lasts: {dur: 0.7}; Pitch: {hz: 554.37}; Gain: {amp: 0.04} }
+        b { Sound: {voice: Mallet}; Onset: {at: 0.07}; Lasts: {dur: 0.9}; Pitch: {hz: 739.99}; Gain: {amp: 0.035} }
+      }
+      // The selection moved: a wooden tick, barely there.
+      select {
+        Gain: {amp: 0.1}
+        a { Sound: {voice: Click}; Onset: {at: 0}; Pitch: {hz: 740}; Gain: {amp: 0.03} }
+      }
+      // The palette opened: a small breath.
+      open {
+        Gain: {amp: 0.14}
+        a { Sound: {voice: Whoosh}; Onset: {at: 0}; Lasts: {dur: 0.2}; Pitch: {hz: 3200}; Gain: {amp: 0.02}; Pan: {pos: 0, sweep: 0} }
+      }
+      // Filed in the Archive: two bars stepping down, put away.
+      archive {
+        Gain: {amp: 0.2}
+        a { Sound: {voice: Mallet}; Onset: {at: 0}; Lasts: {dur: 0.6}; Pitch: {hz: 440}; Gain: {amp: 0.04} }
+        b { Sound: {voice: Mallet}; Onset: {at: 0.09}; Lasts: {dur: 1}; Pitch: {hz: 329.63}; Gain: {amp: 0.04} }
+      }
+      // The turn ended on an error: two low bars, the second a step under, unresolved.
+      fail {
+        Gain: {amp: 0.28}
+        a { Sound: {voice: Mallet}; Onset: {at: 0}; Lasts: {dur: 1.2}; Pitch: {hz: 220}; Gain: {amp: 0.05} }
+        b { Sound: {voice: Mallet}; Onset: {at: 0.16}; Lasts: {dur: 1.8}; Pitch: {hz: 196}; Gain: {amp: 0.05} }
       }
       // The app is up and its sound is ready: one far bell.
       ready {
