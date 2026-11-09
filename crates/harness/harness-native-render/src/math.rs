@@ -225,14 +225,17 @@ mod tests {
         assert!(set.width > 0.0 && set.height > 0.0 && set.depth > 0.0);
     }
 
-    /// Display style sets a sum's limits above and below it, text style beside it; a radical draws an outline.
+    /// Display style sets a sum's limits above and below it, text style beside it; a stretchy arrow and tall delimiters
+    /// draw outlines (a radical is glyphs from KaTeX's Size fonts and a rule, at any height).
     #[test]
     fn display_style_stacks_limits_and_a_root_draws_an_outline() {
         let src = "\\sum_{i=1}^{n} i";
         let (d, t) = (typeset(src, true).unwrap(), typeset(src, false).unwrap());
         assert!(d.height + d.depth > t.height + t.depth, "stacked limits make it taller: {d:?} against {t:?}");
-        let root = typeset("\\sqrt{\\frac{a}{b}}", true).unwrap();
-        assert!(root.items.iter().any(|i| matches!(i, Item::Path { .. })), "{root:?}");
+        for src in ["\\xrightarrow{abc}", "\\left(\\begin{matrix}a\\\\b\\\\c\\\\d\\\\e\\end{matrix}\\right)"] {
+            let set = typeset(src, true).unwrap();
+            assert!(set.items.iter().any(|i| matches!(i, Item::Path { .. })), "{src}: {set:?}");
+        }
     }
 
     #[test]

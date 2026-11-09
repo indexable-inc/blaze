@@ -832,7 +832,9 @@ mod tests {
         assert_eq!(maths(&inline("so $$\\frac{a}{b}$$ and \\[x\\]")), [("$$\\frac{a}{b}$$", true), ("\\[x\\]", true)]);
         let m = inline("$a_1*b_2$ and **bold**");
         assert_eq!(maths(&m), [("$a_1*b_2$", false)]);
-        assert_eq!(m.runs.iter().map(|r| (&m.text[r.start..r.end], r.face)).collect::<Vec<_>>(), [("bold", Face::Bold)], "no emphasis was made of it");
+        let units: Vec<u16> = m.text.encode_utf16().collect();
+        let faces: Vec<(String, Face)> = m.runs.iter().map(|r| (String::from_utf16_lossy(&units[r.start..r.end]), r.face)).collect();
+        assert_eq!(faces, [("bold".to_owned(), Face::Bold)], "no emphasis was made of it");
         let m = inline("`$x$` then");
         assert!(m.math.is_empty() && m.text == "$x$ then", "{m:?}");
         // Across a soft break, inside a link's words.
