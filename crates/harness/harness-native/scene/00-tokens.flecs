@@ -638,6 +638,21 @@ export const chat_activity_icon = 11
 export const chat_activity_icon_gap = 5
 export const chat_activity_max_w = 260
 export const chat_activity_below = 8
+// A chip's hover card (hn.ChatActivityPop, src/app/chat.rs fill_activity_pop): chat_activity_pop_w wide over the chip,
+// chat_activity_pop_pad in, its lines chat_activity_pop_gap apart, a step's glyph chat_activity_icon across.
+export const chat_activity_pop_w = 300
+export const chat_activity_pop_pad = 12
+export const chat_activity_pop_gap = 4
+// Messages sent while a turn runs and not yet taken (hn.ChatQueued, src/app/chat.rs fill_chat_queued): bubbles at the
+// trailing edge over the composer, chat_queued_gap apart, in a dashed-quiet look: the bubble's ground at
+// chat_queued_fade, a clock glyph chat_activity_icon across and the word "Queued" before it.
+export const chat_queued_gap = 6
+export const chat_queued_fade = 0.35
+// A finished turn's steps button (hn.ChatTurnSteps): beside the person's bubble on hover, chat_turn_steps square, its
+// glyph chat_turn_steps_icon across, chat_turn_steps_gap before the bubble.
+export const chat_turn_steps = 22
+export const chat_turn_steps_icon = 13
+export const chat_turn_steps_gap = 4
 // Pictures pasted into the message being written (hn.ChatAttach, src/app/chat.rs fill_attach): a strip of thumbnails over
 // the words, each chat_attach_h tall at its own aspect (no wider than chat_attach_max_w), chat_attach_gap apart,
 // chat_attach_radius round, a remove button chat_attach_remove across (its glyph chat_attach_icon) chat_attach_inset in

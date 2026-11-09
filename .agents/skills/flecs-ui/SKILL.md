@@ -151,6 +151,13 @@ template hn.ObjRow {
   - **Type is the hierarchy.** One UI family (Inter) at macOS sizes; weight, size and ink tone separate levels before
     any box or rule does. Rows carry no noise: what matters now trails a row (what an agent is doing, the command or
     file), when is a tooltip, never a timestamp column.
+  - **No sparkles.** Every glyph is monochrome and minimal, one weight (the codicons' line): never a sparkle, star
+    burst, gradient or any other decorative "AI" mark, for an agent, a model, a suggestion or anything else. An agent is
+    `cod-person` (`look::kind_icon`) or, on a chip, its state (`hn.chat_status`); a brand's own vector mark
+    (`hn.Kind.<kind>`) is the only exception.
+  - **Live work says what and how long.** Anything running shows its live step in words (the step, never the tool:
+    "blaze check · 6 min", not "ts") and its elapsed time, ticking, with the one breathing glyph, so a long wait never
+    looks hung; a card under the pointer says the rest (chat.rs `fill_chat_activity`).
   - **State by light, not marks.** Working breathes, idle fades, done earns a brief check (or a cross), failure is the
     error ink. No badges for states that are already visible.
   - **Show what changed, not what was looked at.** Summaries name their targets ("Edited chat.rs, ran cargo test");

@@ -237,6 +237,12 @@ pub struct App {
     swiping: Option<u64>,
     /// A run (and stage) to select once the runs show it.
     pending_run: Option<(u64, Option<u32>)>,
+    /// A shot's recorded chats (HARNESS_NATIVE_SHOT_FIXTURE, [`App::shot_fixture`]): each chat's event frames, fed in
+    /// place of an attach.
+    shot_feed: HashMap<u64, Vec<u8>>,
+    /// Chats attached for a look only (a sub-agent's chip over its parent's composer: its card says its step or last
+    /// words), by session id: attached once each (chat.rs `watch_chat`); and those asked for and not attached yet.
+    watched: std::cell::RefCell<(std::collections::HashSet<u64>, Vec<u64>)>,
     link: Link,
     grid: Grid,
     zoom: usize,
@@ -548,6 +554,8 @@ impl App {
             gen_prims: std::cell::RefCell::default(),
             watching: HashMap::new(),
             pending_run: None,
+            shot_feed: HashMap::new(),
+            watched: std::cell::RefCell::default(),
             side_w,
             drag: side_drag::SideDrag::default(),
             swiping: None,
@@ -706,6 +714,47 @@ impl App {
         } else {
             "running"
         }
+    }
+
+    /// A shot's recorded world (`HARNESS_NATIVE_SHOT_FIXTURE=<json>`, src/shot.rs): `{list, runs, chats: {"<id>": [event]}}`,
+    /// the daemon's `list` and `runs` answers and each chat's events as its log holds them (harness-proto's JSON form),
+    /// posted to the inbox as the link would; a chat's events are fed in place of its attach. A time field (`ts`,
+    /// `started_ms`, `created_ms`, `ended_ms`, `start_ms`, `end_ms`) given as a negative number is that many ms before now,
+    /// so a shot shows a turn that has run for minutes.
+    pub fn shot_fixture(&mut self, path: &str) -> Result<(), String> {
+        fn rel(v: &mut serde_json::Value, now: i64) {
+            match v {
+                serde_json::Value::Object(m) => {
+                    for (k, x) in m.iter_mut() {
+                        match x.as_i64() {
+                            Some(n) if n < 0 && ["ts", "started_ms", "created_ms", "ended_ms", "start_ms", "end_ms"].contains(&k.as_str()) => *x = (now + n).into(),
+                            _ => rel(x, now),
+                        }
+                    }
+                }
+                serde_json::Value::Array(a) => a.iter_mut().for_each(|x| rel(x, now)),
+                _ => {}
+            }
+        }
+        let text = std::fs::read_to_string(path).map_err(|e| format!("HARNESS_NATIVE_SHOT_FIXTURE {path}: {e}"))?;
+        let mut f: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("HARNESS_NATIVE_SHOT_FIXTURE {path}: {e}"))?;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
+        rel(&mut f, now);
+        // No daemon comes up to restore a selection after: the shot's own (HARNESS_NATIVE_SHOT_SELECT) is the one.
+        self.restore = None;
+        let mail = self.link.mailbox();
+        mail.send(model::Msg::List(f["list"].as_array().cloned().unwrap_or_default()));
+        mail.send(model::Msg::Runs(f["runs"].as_array().cloned().unwrap_or_default()));
+        for (id, evs) in f["chats"].as_object().into_iter().flatten() {
+            let id: u64 = id.parse().map_err(|_| format!("HARNESS_NATIVE_SHOT_FIXTURE {path}: chat id {id} is not a number"))?;
+            let mut bytes = Vec::new();
+            for e in evs.as_array().into_iter().flatten() {
+                let ev = harness_proto::event::Event::from_json(e).ok_or_else(|| format!("HARNESS_NATIVE_SHOT_FIXTURE {path}: not an event: {e}"))?;
+                bytes.extend(ev.frame());
+            }
+            self.shot_feed.insert(id, bytes);
+        }
+        Ok(())
     }
 
     /// A run (or stage): its number and stage index.
@@ -2071,6 +2120,8 @@ impl App {
                 self.request_older();
             } else if let Some(b) = a.strip_prefix("chat:open:") {
                 self.chat_toggle(b);
+            } else if let Some(rest) = a.strip_prefix("chat:turn:") {
+                self.chat_turn_toggle(rest);
             } else if let Some(rest) = a.strip_prefix("row:") {
                 // An item of a sidebar row's menu (row_menu.rs).
                 self.row_menu_action(rest);
@@ -2474,23 +2525,16 @@ fn doing_of(t: &model::chat::Transcript) -> Option<Doing> {
         return None;
     }
     let base = |p: &str| p.rsplit('/').next().unwrap_or(p).to_owned();
-    Some(match t.items.last()? {
+    // A message still queued is not what it is on.
+    let last = (0..t.items.len()).rev().find(|&k| !t.is_queued(k)).map(|k| &t.items[k])?;
+    Some(match last {
         Item::Thinking { done: false, .. } => Doing { pace: "think", what: "Thinking", detail: "thinking".to_owned() },
-        // A harness REPL cell: the step it is on (a command, a file, a page), not the tool's name.
+        // A harness REPL cell: what its running step does ("blaze check", "Reading chat.rs"), never the tool's name.
         Item::Tool { block, result: None, .. } if t.details.contains_key(block) => {
-            let d = &t.details[block];
-            match d.effects.iter().rev().find(|e| e.status == "running") {
-                Some(e) => {
-                    let (pace, what) = match e.kind.as_str() {
-                        "exec" | "build" => ("run", "Running"),
-                        "write" | "delete" => ("edit", "Editing"),
-                        "spawn" => ("agent", "Starting a session"),
-                        _ => ("read", "Reading"),
-                    };
-                    let detail = if e.kind == "exec" || e.kind == "build" { short_cmd(&e.target) } else { base(&e.target) };
-                    Doing { pace, what, detail: if detail.is_empty() { e.doing.clone() } else { detail } }
-                }
-                None => Doing { pace: "run", what: "Running code", detail: String::new() },
+            match t.details[block].effects.iter().rev().find(|e| e.status == "running") {
+                Some(e) if e.kind == "exec" => Doing { pace: "run", what: "Running a command", detail: chat::step_words(e) },
+                Some(e) => Doing { pace: "read", what: "Working", detail: chat::step_words(e) },
+                None => Doing { pace: "run", what: "Running code", detail: "running code".to_owned() },
             }
         }
         Item::Tool { name, input, result: None, .. } => {
