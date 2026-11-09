@@ -3990,6 +3990,37 @@ mod tests {
         assert_eq!(rx.recv_timeout(LONG).unwrap(), "after the fire");
     }
 
+    /// An event rearmed ends the waits on it before, as a fire does, and is armed again: a
+    /// waiter taken after waits for the next fire, a job on a worker parked meanwhile, and its
+    /// last fire (the drop) ends that wait too.
+    #[test]
+    fn a_rearmed_event_ends_the_waits_before_and_holds_the_ones_after() {
+        use crate::sched::{Event, EventWait};
+        let pool = Pool::new(&Topology::flat(1), false).unwrap();
+        let mut event = Event::new();
+        let first: EventWait = event.waiter();
+        event.rearm();
+        first.wait().unwrap();
+        let second: EventWait = event.waiter();
+        assert_ne!(first, second, "a rearmed event waits under a new key");
+        let (tx, rx) = unbounded::<&'static str>();
+        pool.submit(
+            None,
+            move || {
+                second.wait().unwrap();
+                "the second waiter"
+            },
+            move |it| _ = tx.send(it.unwrap()),
+        );
+        until("the second waiter to park", || pool.shared.parked.load(Ordering::SeqCst) == 1);
+        assert!(rx.try_recv().is_err(), "the second waiter waits for the next fire");
+        event.rearm();
+        assert_eq!(rx.recv_timeout(LONG).unwrap(), "the second waiter");
+        let third = event.waiter();
+        std::thread::spawn(move || event.fire()).join().unwrap();
+        third.wait().unwrap();
+    }
+
     /// On a pool of one worker, a job waits on the pool's clock and holds no thread: it parks,
     /// the worker runs another job meanwhile, then sleeps with nothing queued, and wakes for the
     /// deadline. The job goes on no earlier than it; a wait for a time gone by ends at once.
