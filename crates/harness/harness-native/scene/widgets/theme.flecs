@@ -55,6 +55,10 @@ hn {
     archive_after {
       Size: {w: {kind: Fixed, value: $archive_after_s, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
     }
+    // How long a finished child keeps its row (and its done mark) under a folded node (seconds, as a width).
+    tree_linger_for {
+      Size: {w: {kind: Fixed, value: $tree_linger_s, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
     // The same for a top-level session from before the daemon started.
     archive_past_after {
       Size: {w: {kind: Fixed, value: $archive_past_after_s, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}

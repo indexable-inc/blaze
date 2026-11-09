@@ -280,6 +280,9 @@ pub struct ChatState {
     /// Kept at the bottom on a spring while it sticks; the pane clock's time it was last stepped.
     follow: Follow,
     stepped: f64,
+    /// A pane showed it last frame: what comes now is written while the person watches. Shown again after a frame
+    /// without (another tab was in front), what came meanwhile is there at once, not written in ([`ChatState::catch_up`]).
+    on_screen: bool,
     /// The chip under the pointer, its hover card, and the GitHub refs its words name (chat/peek.rs).
     peek: peek::Peek,
     /// The `@` file mention menu over the composer (chat/mention.rs).
@@ -289,6 +292,20 @@ pub struct ChatState {
     /// Each picture's size in pixels as its header says (None: not one this app can show), read once: the composer's
     /// and the transcript's thumbnails.
     sizes: HashMap<String, Option<(u32, u32)>>,
+}
+
+impl ChatState {
+    /// Shown again after another tab was in front: every text block as it is now shows whole and at rest (no pace, no
+    /// glyphs fading in), as history does on an attach, so only what comes from here on is written in.
+    fn catch_up(&mut self, t: &Transcript) {
+        for item in &t.items {
+            let Item::Text { block, text, done } = item else { continue };
+            let have = settled_len(text, *done);
+            self.stream.insert(block.clone(), Stream { paced: Paced::at(have), live: false }); // alloc: one entry per text block, kept with the pane
+        }
+        self.cut.clear();
+        self.row_born.clear();
+    }
 }
 
 /// One text block of a chat's transcript as it shows: its pace, and whether it streamed in while the pane watched (its
@@ -358,6 +375,7 @@ impl Default for ChatState {
             row_born: HashMap::new(),
             follow: Follow::default(),
             stepped: 0.0,
+            on_screen: false,
             peek: peek::Peek::default(),
             mention: mention::Mention::default(),
             images: Vec::new(),
@@ -1311,7 +1329,7 @@ impl App {
         self.fill_chat_mention(pv, sid, st, &cwd, focused);
         let ended = self.status_of(e) != "running";
         // The pictures pasted into the message, over its words, each with its remove button.
-        if let Some(strip) = composer(pv).and_then(|c| c.part("attach")) {
+        if let Some(strip) = composer(pv).and_then(|c| c.part("entry")).and_then(|e| e.part("attach")) {
             let h = crate::look::width(w, "chat_attach_tall");
             fill_pictures(strip, &st.images, Some(&st.sizes), h, "hn.ChatAttach", Some(sid));
         }
@@ -1403,6 +1421,30 @@ impl App {
     pub(super) fn step_chat_scroll(&mut self) {
         let w = self.world.world_ref();
         let mut moving = false;
+        // The chats a pane shows this frame; one that no pane showed last frame comes back caught up.
+        let shown: HashSet<u64> = self
+            .panes()
+            .into_iter()
+            .filter_map(|p| model::shows(w, p).filter(|o| model::pane_kind(*o) == model::PaneKind::Chat))
+            .filter_map(|o| self.session_of(*o.id()))
+            .collect();
+        let mut back = HashSet::new();
+        {
+            let chats = self.chats.borrow();
+            let mut states = self.chat.borrow_mut();
+            for &sid in &shown {
+                let st = states.entry(sid).or_default();
+                if !st.on_screen {
+                    if let Some(t) = chats.get(&sid) {
+                        st.catch_up(t);
+                    }
+                    back.insert(sid);
+                }
+            }
+            for (sid, st) in states.iter_mut() {
+                st.on_screen = shown.contains(sid);
+            }
+        }
         for p in self.panes() {
             let Some(o) = model::shows(w, p) else { continue };
             if model::pane_kind(o) != model::PaneKind::Chat {
@@ -1413,6 +1455,7 @@ impl App {
             let Some(l) = list.entity().try_cloned::<&Laid>().filter(|l| l.h > 0.0) else { continue };
             let mut states = self.chat.borrow_mut();
             let st = states.entry(sid).or_default();
+            let reshown = back.contains(&sid);
             // A drag or a page on the overlay scroller moved the list: that is the origin now, off the bottom.
             if let Some(s) = list.entity().try_cloned::<&ScrollState>().filter(|s| (s.y - st.y).abs() > 0.01)
                 && list.entity().try_cloned::<&ScrollerGrip>().is_some_and(|g| g.drag != 0 || g.page != 0)
@@ -1436,7 +1479,7 @@ impl App {
                 // height moved it as far), instead of the view jumping a line at a time.
                 st.follow.shift(st.shift);
                 // While the log replays (a pane just opened) it lands on the end: the history was there, not written now.
-                let replay = st.tried.is_some_and(|a| self.time - a < REPLAY_SECS);
+                let replay = reshown || st.tried.is_some_and(|a| self.time - a < REPLAY_SECS);
                 let far = if replay { 0.0 } else { crate::look::width(w, "chat_stream") };
                 let (y, going) = st.follow.step(max, crate::look::tune(w, "chat_stream"), far, dt);
                 if (y - st.y).abs() > 0.01 {

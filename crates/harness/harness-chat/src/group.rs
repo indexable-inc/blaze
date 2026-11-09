@@ -113,7 +113,36 @@ impl Act {
     }
 }
 
-/// Acts counted by kind in the order each kind first came: `(act, n)`.
+impl Act {
+    /// Where it comes in a run's words, what matters first: what changed (edits, writes, deletes), then what ran
+    /// (builds, commands, sessions, queries), then what was looked at; waiting last.
+    fn rank(self) -> u8 {
+        match self {
+            Act::Edit => 0,
+            Act::Write => 1,
+            Act::Delete => 2,
+            Act::Build => 3,
+            Act::Shell => 4,
+            Act::Spawn => 5,
+            Act::Query => 6,
+            Act::Fetch => 7,
+            Act::Search => 8,
+            Act::Cell => 9,
+            Act::Other => 10,
+            Act::Read => 11,
+            Act::List => 12,
+            Act::Skill => 13,
+            Act::Wait => 14,
+        }
+    }
+
+    /// Only looking (a file read, a folder listed, a skill loaded, a wait): not worth saying beside anything else.
+    fn looks(self) -> bool {
+        matches!(self, Act::Read | Act::List | Act::Skill | Act::Wait)
+    }
+}
+
+/// Acts counted by kind, what matters first ([`Act::rank`]): `(act, n)`.
 fn counted(acts: impl IntoIterator<Item = Act>) -> Vec<(Act, usize)> {
     let mut counts: Vec<(Act, usize)> = Vec::new();
     for a in acts {
@@ -122,6 +151,7 @@ fn counted(acts: impl IntoIterator<Item = Act>) -> Vec<(Act, usize)> {
             None => counts.push((a, 1)),
         }
     }
+    counts.sort_by_key(|(a, _)| a.rank());
     counts
 }
 
@@ -130,21 +160,28 @@ fn capitalised(s: &str) -> String {
     c.next().map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())
 }
 
-/// Acts in words, counted by kind in the order each kind first came, capitalised: "Read 3 files, searched 2 times".
+/// Acts in words, counted by kind, what matters first, capitalised: "Edited 2 files, ran 1 build".
 #[must_use]
 pub fn summary(acts: impl IntoIterator<Item = Act>) -> String {
     told(acts, [])
 }
 
-/// What went well and what failed, in words: the acts that went well counted by kind, then those that failed ("Searched
-/// once, couldn't fetch 1 page"), capitalised. Waiting for a cell is left out when anything else was done.
+/// What went well and what failed, in words: the acts that went well counted by kind, what changed first, then those
+/// that failed ("Edited 2 files, couldn't run 1 build"), capitalised. Looking (reads, listings, skills, waits) is said
+/// only when nothing that went well did more than look: the person cares what changed, not what was read on the way.
 #[must_use]
 pub fn told(ok: impl IntoIterator<Item = Act>, failed: impl IntoIterator<Item = Act>) -> String {
     let (ok, failed) = (counted(ok), counted(failed));
+    let did = ok.iter().any(|(a, _)| !a.looks());
     let busy = ok.iter().chain(&failed).any(|(a, _)| *a != Act::Wait);
-    let keep = |(a, _): &&(Act, usize)| !busy || *a != Act::Wait;
-    let words: Vec<String> =
-        ok.iter().filter(keep).map(|(a, n)| a.words(*n)).chain(failed.iter().filter(keep).map(|(a, n)| a.failed_words(*n))).collect();
+    let keep_ok = |(a, _): &&(Act, usize)| if did { !a.looks() } else { !busy || *a != Act::Wait };
+    let keep_failed = |(a, _): &&(Act, usize)| !busy || *a != Act::Wait;
+    let words: Vec<String> = ok
+        .iter()
+        .filter(keep_ok)
+        .map(|(a, n)| a.words(*n))
+        .chain(failed.iter().filter(keep_failed).map(|(a, n)| a.failed_words(*n)))
+        .collect();
     capitalised(&words.join(", "))
 }
 
@@ -468,15 +505,18 @@ mod tests {
         assert_eq!(rs[0].summary(), "Ran 2 shell commands, couldn't run 1 shell command");
         assert_eq!(rs[0].why(), ["Exited with code 1"]);
         assert!(g.pieces.contains(&Piece::Item(3)), "the view stands alone");
-        assert_eq!(rs[1].summary(), "Ran 1 cell, searched once, couldn't fetch 1 page");
+        assert_eq!(rs[1].summary(), "Searched once, ran 1 cell, couldn't fetch 1 page");
         assert_eq!(rs[1].why(), ["No browser is connected"]);
         assert_eq!(told([Act::Wait], []), "Waited for 1 cell");
     }
 
-    /// The REPL's typed calls count as what they did: reads, searches, listings and builds, never shell commands.
+    /// The REPL's typed calls count as what they did: reads, searches, listings and builds, never shell commands; what
+    /// ran leads, and the looking on the way is left unsaid beside it.
     #[test]
     fn typed_calls_sum_up_in_words() {
         let kinds = ["skill", "read", "read", "search", "read", "list", "search", "build"];
-        assert_eq!(summary(kinds.map(Act::of_effect)), "Read 1 skill, read 3 files, searched 2 times, listed 1 folder, ran 1 build");
+        assert_eq!(summary(kinds.map(Act::of_effect)), "Ran 1 build, searched 2 times");
+        let looked = ["read", "list", "read", "skill"];
+        assert_eq!(summary(looked.map(Act::of_effect)), "Read 2 files, listed 1 folder, read 1 skill", "only looking is said when it is all");
     }
 }

@@ -227,6 +227,24 @@ fn arm_kip_nap(secs: f64) {
     });
 }
 
+/// The app went idle with a finished row lingering in the tree: wake in `secs`, when its linger is out and it folds
+/// away, unless a frame was drawn meanwhile (that frame armed the next wake itself, if one is still due).
+fn arm_linger(secs: f64) {
+    let at = FRAMES_DRAWN.load(Ordering::SeqCst);
+    let Ok(when) = dispatch2::DispatchTime::try_from(std::time::Duration::from_secs_f64(secs.clamp(0.02, 60.0))) else {
+        return;
+    };
+    let _ = DispatchQueue::main().after(when, move || {
+        if FRAMES_DRAWN.load(Ordering::SeqCst) != at {
+            return;
+        }
+        with(|st| {
+            st.app.linger_woke();
+            st.link.setPaused(false);
+        });
+    });
+}
+
 /// The headroom of the screen `view`'s window is on (SDR when it is on none). Public NSScreen API: CoreDisplay's private
 /// `CoreDisplay_Display_Get{Current,Potential,Reference}Headroom` were measured to return the same numbers (macOS 27,
 /// built-in XDR: 1.0, 16.0, 0.0), so they would add nothing (rule macos-private-apis).
@@ -596,8 +614,11 @@ define_class!(
                 let text = pb.stringForType(unsafe { NSPasteboardTypeString }).map(|s| s.to_string());
                 if let Some(text) = text {
                     with(|st| st.app.paste(&text));
-                } else if let Some(png) = pasteboard_png(&pb) {
-                    with(|st| st.app.paste_picture(&png));
+                } else {
+                    let pngs = pasteboard_pngs(&pb);
+                    if !pngs.is_empty() {
+                        with(|st| st.app.paste_pictures(&pngs));
+                    }
                 }
             } else {
                 with(|st| st.app.paste_paths(&paths));
@@ -1062,6 +1083,9 @@ impl HarnessView {
                     }
                     if let Some(secs) = st.app.kip_nap() {
                         arm_kip_nap(secs);
+                    }
+                    if let Some(secs) = st.app.linger_due() {
+                        arm_linger(secs);
                     }
                     if st.app.headroom.potential > 1.0 {
                         arm_headroom_watch();
@@ -1710,19 +1734,28 @@ fn pasteboard_put(text: &str) {
     pb.setString_forType(&NSString::from_str(text), unsafe { NSPasteboardTypeString });
 }
 
-/// The picture on pasteboard `pb` as PNG bytes: its PNG as it is, else its TIFF (a screenshot's, Safari's Copy Image)
-/// converted; None when it holds no picture (or a TIFF AppKit cannot read).
-fn pasteboard_png(pb: &NSPasteboard) -> Option<Vec<u8>> {
-    // SAFETY: NSPasteboardTypePNG is a valid static pasteboard type.
-    if let Some(d) = pb.dataForType(unsafe { objc2_app_kit::NSPasteboardTypePNG }) {
-        return Some(d.to_vec());
+/// The pictures on pasteboard `pb` as PNG bytes, one for each item that holds one (a copy of several pictures is
+/// several items): its PNG as it is, else its TIFF (a screenshot's, Safari's Copy Image) converted. Empty when none holds
+/// a picture (or only TIFFs AppKit cannot read).
+fn pasteboard_pngs(pb: &NSPasteboard) -> Vec<Vec<u8>> {
+    let Some(items) = pb.pasteboardItems() else { return Vec::new() };
+    let mut out = Vec::new(); // alloc: a paste's few pictures
+    for item in &items {
+        // SAFETY: NSPasteboardTypePNG is a valid static pasteboard type.
+        if let Some(d) = item.dataForType(unsafe { objc2_app_kit::NSPasteboardTypePNG }) {
+            out.push(d.to_vec());
+            continue;
+        }
+        // SAFETY: NSPasteboardTypeTIFF is a valid static pasteboard type.
+        let Some(tiff) = item.dataForType(unsafe { objc2_app_kit::NSPasteboardTypeTIFF }) else { continue };
+        let Some(rep) = objc2_app_kit::NSBitmapImageRep::imageRepWithData(&tiff) else { continue };
+        // SAFETY: an empty properties dictionary has the type the method takes.
+        let png = unsafe { rep.representationUsingType_properties(objc2_app_kit::NSBitmapImageFileType::PNG, &objc2_foundation::NSDictionary::new()) };
+        if let Some(png) = png {
+            out.push(png.to_vec());
+        }
     }
-    // SAFETY: NSPasteboardTypeTIFF is a valid static pasteboard type.
-    let tiff = pb.dataForType(unsafe { objc2_app_kit::NSPasteboardTypeTIFF })?;
-    let rep = objc2_app_kit::NSBitmapImageRep::imageRepWithData(&tiff)?;
-    // SAFETY: an empty properties dictionary has the type the method takes.
-    let png = unsafe { rep.representationUsingType_properties(objc2_app_kit::NSBitmapImageFileType::PNG, &objc2_foundation::NSDictionary::new()) }?;
-    Some(png.to_vec())
+    out
 }
 
 /// The paths of the files on pasteboard `pb` (each item's file URL; Finder's are file reference URLs, resolved to paths).
