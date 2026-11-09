@@ -77,7 +77,7 @@ impl<'db> Checker<'_, 'db> {
             },
             _ => return,
         };
-        if is_dyn_dispatch(db, callee, fn_args) && deferred() {
+        if is_dyn_dispatch(db, krate, callee, fn_args) && deferred() {
             return;
         }
         let Some(source) = self.source(expr, callee) else { return };

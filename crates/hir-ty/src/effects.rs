@@ -124,17 +124,32 @@ pub fn defers_dispatch_check(db: &Db, krate: Crate) -> bool {
     UnstableFeatures::of_root(db, krate).blaze_comptime
 }
 
-/// Whether the call of `callee` with `args` goes through a vtable: `callee` is a trait's method
-/// (`Fn::call` and the rest included) and its `Self`, behind references, is `dyn Trait`.
-pub fn is_dyn_dispatch(db: &Db, callee: FunctionId, args: GenericArgs<'_>) -> bool {
+/// Whether the call of `callee` with `args` goes through a vtable as the evaluator decides it
+/// (hir-ty-mir's `exec_fn_trait` and `get_mir_or_dyn_index`), so that every call deferred here
+/// is one the evaluator checks: `Fn::call`, `FnMut::call_mut` or `FnOnce::call_once` whose
+/// `Self`, behind references, is `dyn Trait` (the evaluator reads the vtable behind them), or
+/// another trait's method whose `Self` is a `dyn` type with the trait among its principal's
+/// supertraits ([`crate::method_resolution::is_dyn_method`]). A method of an impl for a `dyn`
+/// type, or for a reference to one, is a direct call and is checked statically as any other.
+pub fn is_dyn_dispatch<'db>(
+    db: &'db Db,
+    krate: Crate,
+    callee: FunctionId,
+    args: GenericArgs<'db>,
+) -> bool {
     if !matches!(callee.lookup(db).container, ItemContainerId::TraitId(_)) {
         return false;
     }
-    let Some(mut ty) = args.as_slice().first().and_then(|it| it.ty()) else { return false };
-    while let TyKind::Ref(_, inner, _) = ty.kind() {
-        ty = inner;
+    let interner = DbInterner::new_with(db, krate);
+    let lang = interner.lang_items();
+    if [lang.Fn_call, lang.FnMut_call_mut, lang.FnOnce_call_once].contains(&Some(callee)) {
+        let Some(mut ty) = args.as_slice().first().and_then(|it| it.ty()) else { return false };
+        while let TyKind::Ref(_, inner, _) = ty.kind() {
+            ty = inner;
+        }
+        return matches!(ty.kind(), TyKind::Dynamic(..));
     }
-    matches!(ty.kind(), TyKind::Dynamic(..))
+    crate::method_resolution::is_dyn_method(interner, ParamEnv::empty(), callee, args).is_some()
 }
 
 /// Whether evaluating `owner`'s body checks the target of each call it makes through a
@@ -374,7 +389,8 @@ impl Walk<'_, '_> {
             }
             kind => match (self.infer.method_resolution(expr), kind) {
                 (Some((func, args)), _)
-                    if self.defers_dispatch && is_dyn_dispatch(self.db, func, args) =>
+                    if self.defers_dispatch
+                        && is_dyn_dispatch(self.db, self.env.krate, func, args) =>
                 {
                     None
                 }
@@ -384,7 +400,9 @@ impl Walk<'_, '_> {
                 (None, Some(TyKind::FnDef(def, args))) => match def.0 {
                     crate::CallableDefId::FunctionId(func) => {
                         let args = args.no_bound_vars().unwrap();
-                        if self.defers_dispatch && is_dyn_dispatch(self.db, func, args) {
+                        if self.defers_dispatch
+                            && is_dyn_dispatch(self.db, self.env.krate, func, args)
+                        {
                             None
                         } else {
                             const_call_error(self.db, self.env, self.constness, func, args)

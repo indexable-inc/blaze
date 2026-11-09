@@ -490,9 +490,12 @@ method call on `dyn Trait` of a trait that is not const (`NonConstFn`); `effects
 refuses the same. With it, in a crate that has it, neither is a static error: the call is
 checked where its target is known, when it is evaluated.
 
-- **Which calls.** A `TerminatorKind::Call` whose callee is a function pointer, and a call of a
-  trait's method whose `Self` (behind references) is `dyn Trait`, `Fn`/`FnMut`/`FnOnce`'s
-  included. `effects::defers_dispatch_check` (the crate has the feature) and
+- **Which calls.** A `TerminatorKind::Call` whose callee is a function pointer, and a call the
+  evaluator makes through a vtable: `Fn::call`, `FnMut::call_mut` or `FnOnce::call_once` whose
+  `Self`, behind references, is `dyn Trait`, or another trait's method whose `Self` is a `dyn`
+  type with the trait among its principal's supertraits (`is_dyn_method`). A method of an impl
+  written for a `dyn` type, or for a reference to one, is a direct call the evaluator does not
+  check, so it stays a static error. `effects::defers_dispatch_check` (the crate has the feature) and
   `effects::is_dyn_dispatch` are the one rule both checkers read.
 - **The target.** The evaluator already runs these calls: a function pointer's bytes are a
   `VTableMap` id of the `FnDef` or closure it was made from, a vtable's id names the concrete
