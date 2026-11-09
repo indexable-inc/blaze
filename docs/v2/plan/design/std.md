@@ -82,7 +82,8 @@ What is about building Rust (the cargo graph, the store, codegen) stays out.
 | `data` | serialization by compile-time reflection (below) | new, replacing `blaze-serde` in blaze's crates |
 | `record` | zero-copy records: bytes in memory are the bytes on disk | `blaze-format` |
 | `report` | the `Report`: what a program says to a person or an agent, as data | `blaze-report` |
-| `http` | the sans-IO HTTP client and server cores over a `Conn` | `blaze-http` |
+| `quic` | QUIC as a sans-IO core: datagrams and time in, datagrams and stream events out; the driver is a `Net` datagram socket and the `Clock` | `blaze-http`'s QUIC core ([http3-sans-io](http3-sans-io.md)) |
+| `http` | sans-IO HTTP/1.1 over a `Conn`, and HTTP/3 and WebTransport over `quic` | `blaze-http` |
 | `trace` | spans and events through `Cx` | `blaze-trace` (no-tracing) |
 | `test` | the simulation, property tests, the model checker for lock-free code, allocation counting | `blaze_core::sim`, hegel, `blaze-check`, `blaze-alloc-count` |
 | `io`, `fs`, `net`, ... | the capabilities of the sections below | new, on `blaze-core` |
@@ -144,7 +145,7 @@ not ambient and is never fetched from a thread-local; `main` receives the root o
 | `Fs` | `io.fs()` | `open_dir(path)` | directories |
 | `Dir<P>` | `Fs`, a `Dir` | `subdir`, `read_only` | files beneath it, by relative path only |
 | `File<P>` | `Dir` | `read_only` | positional reads and writes, sync, mapping |
-| `Net` | `io.net()` | `connect_only(host)`, `listen_only(addr)` | `Conn`, `Listener`, name lookup |
+| `Net` | `io.net()` | `connect_only(host)`, `listen_only(addr)` | `Conn`, `Listener`, `Datagrams` (UDP), name lookup |
 | `Env` | `io.env()` | `only(names)` | environment variables |
 | `Args` | `io.args()` | | the command line |
 | `Host` | `io.host()` | | the process id, core count, host name, signals, and exiting with a status |
