@@ -972,7 +972,7 @@ impl App {
             let code = o.try_cloned::<&model::ExitCode>().map(|c| c.code).filter(|&c| c != 0);
             let failed = status == "killed" || code.is_some();
             let selected = sel == Some(e);
-            // A sub-agent up but idle sleeps: its title faded like what ended (no mark: only finishing earns one), and it
+            // A sub-agent up but idle sleeps: its title faded like what ended (no mark: only a failure earns one), and it
             // sorts after the ones at work (the model's rows).
             let sleeps = me.run_of(e).is_none() && depth > 0 && status == "running" && !o.has(model::Busy::id());
             let look = if selected {
@@ -2494,16 +2494,16 @@ fn set_side_width(side: EntityView<'_>, v: f32) {
 }
 
 /// How long ago, for a session's row, as short as it reads: `now`, `4m`, `3h`, `2d`, `5w`.
-/// The done mark a finished row shows in its gutter while it lingers (hn.Hang's `mark`): "ok" when it ended well,
-/// "fail" when it was killed or exited non-zero, "" while it runs or for a top-level session (depth 0: it stays in the
-/// tree, where a mark would only be noise).
+/// The mark a finished row shows in its gutter while it lingers (hn.Hang's `mark`): "fail" when it was killed, lost
+/// or exited non-zero; "" otherwise. A row that ended well gets no mark: its title fades (`look` "done") as an agent's
+/// does, and a check on every finished step was only noise. A top-level session (depth 0) never gets one.
 fn done_mark(status: &str, code: Option<i32>, depth: usize) -> &'static str {
     match status {
         _ if depth == 0 => "",
-        "running" | "pending" => "",
         "killed" | "lost" => "fail",
+        "running" | "pending" => "",
         _ if code.is_some() => "fail",
-        _ => "ok",
+        _ => "",
     }
 }
 
