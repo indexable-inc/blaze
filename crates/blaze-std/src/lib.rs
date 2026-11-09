@@ -10,7 +10,15 @@
 //! - The capabilities ([`fs::Fs`], [`fs::Dir`], [`fs::File`], [`clock::Clock`], [`rng::Rng`],
 //!   [`env::Env`], [`args::Args`], [`host::Host`], [`mem::Mem`], [`net::Net`]) have private
 //!   fields and are made only from an `Io` or by narrowing one, which never widens.
-//! - Tasks are started by a context: [`cx::Cx::scope`] ([`task`]), in the `Inline` layout.
+//! - Tasks are started by a context: [`cx::Cx::scope`] makes a [`task::Scope`] value and
+//!   [`task::Scope::spawn`] a [`task::Task`] ([`task`]), in the `Inline` layout.
+//! - What must be finished is linear (`#[blaze::linear]`, crates/hir-ty-linear): a
+//!   [`task::Scope`] and its [`task::Task`]s are joined, an op in flight
+//!   ([`pending::Pending`]) is waited for or cancelled, a writable [`fs::File`] is closed and a
+//!   [`net::Conn`] or [`net::Listener`] is finished. Leaving one is a compile error; a panic
+//!   that unwinds past one runs its abandonment path, which each type's doc names.
+//! - A capability the host does not offer is `None` at the root ([`io::Io::fs`], ...;
+//!   [`io::Offers`]), with a `need_` form whose [`io::Missing`] names it.
 //! - Nothing is global: the crate holds no `static` with interior mutability, no `static mut`
 //!   and no thread-local. Spans and events go through [`cx::Cx`] into the recorder its world
 //!   owns ([`trace::Trace`]).
@@ -76,6 +84,7 @@ pub mod io;
 pub mod mem;
 pub mod net;
 pub mod path;
+pub mod pending;
 pub mod quic;
 pub mod rng;
 pub mod sync;
@@ -206,7 +215,16 @@ mod tests;
 
 use std::{fmt, time::Duration};
 
-pub use crate::{clock::Clock, cx::Cx, env::VarName, io::Io, net::HostPort, path::Path};
+pub use crate::{
+    clock::Clock,
+    cx::Cx,
+    env::VarName,
+    io::{Io, Missing, Offers},
+    net::HostPort,
+    path::Path,
+    pending::Pending,
+    task::{Scope, Task},
+};
 pub use blaze_core::wait::Deadline;
 
 /// Why a wait or an allocation stopped short of what it was for. Every blocking call ends in
@@ -245,6 +263,11 @@ impl fmt::Display for Stopped {
 
 impl std::error::Error for Stopped {}
 
+/// Consumes a linear value that has no fields left to move out (a fieldless marker such as
+/// [`fs::ReadWrite`]): the one way such a value ends, besides its type's own consuming calls.
+#[blaze::consumes]
+pub(crate) fn consume<#[blaze::linear] T>(_: T) {}
+
 /// A safeguard a test turns off to prove its oracle sees the bug (skill `testing`, planted-bug
 /// controls). Always [`Plant::None`] outside this crate's tests: only their constructor
 /// (`Io::planted`) sets another.
@@ -270,4 +293,12 @@ pub(crate) enum Plant {
     SyncSkipped,
     /// `Env::only` replaces what is allowed rather than narrowing it.
     EnvOnlyReplaces,
+    /// `Pending::cancel` returns without waiting for its op to end.
+    CancelSkipsWait,
+    /// `File::close` says it closed without syncing.
+    CloseSkipsSync,
+    /// `Scope::join` returns `Ok` though a task failed.
+    JoinDropsFailure,
+    /// Every root accessor of `Io` hands its capability out, offered or not.
+    OffersIgnored,
 }

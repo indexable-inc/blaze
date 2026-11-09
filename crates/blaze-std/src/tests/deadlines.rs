@@ -12,8 +12,9 @@ use hegel::TestCase;
 
 use super::{Draw, Drawn, Seeds, check, control, path, root};
 use crate::{
-    Plant, Stopped,
-    clock::SleepError,
+    Cx, Plant, Stopped,
+    clock::{Clock, SleepError},
+    fs::{Dir, File, ReadWrite},
     io::{Io, SimWorld},
 };
 
@@ -57,16 +58,28 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
     world.faults = Faults { max_latency: Duration::from_micros(plan.latency_us), ..Faults::default() };
     let io = Io::planted(world, plant);
     let cx = root(&io);
-    let clock = io.clock();
-    let fs = io.fs();
+    let clock = io.need_clock().map_err(|e| format!("harness: {e}"))?;
+    let fs = io.need_fs().map_err(|e| format!("harness: {e}"))?;
     let slow = fs.open_dir(&cx, &path("slow")).map_err(|e| format!("harness: {e}"))?;
     let held = fs.open_dir(&cx, &path("held")).map_err(|e| format!("harness: {e}"))?;
-    let file = held.create(&cx, &path("f")).map_err(|e| format!("harness: {e}"))?;
+    // The file is linear: the calls run in a function of their own, then it is closed. Its
+    // syncs are held for ever, so its close is given a short deadline and ends in one.
+    let file = match held.create(&cx, &path("f")) {
+        Ok(file) => file,
+        Err(error) => return Err(format!("harness: {error}")),
+    };
     let (slow_name, held_name): (FileName, FileName) = (slow.name().clone(), held.name().clone());
     io.with_sim(|sim| {
         sim.slow_writes(slow_name, SLOW);
         sim.hold_syncs(held_name);
     });
+    let called = calls(plan, &cx, &clock, &slow, &file);
+    let _ = file.close(&cx.until(clock.after(Duration::from_millis(1))));
+    called
+}
+
+/// The plan's calls, each checked against its deadline.
+fn calls(plan: &Plan, cx: &Cx, clock: &Clock, slow: &Dir<ReadWrite>, file: &File<ReadWrite>) -> Result<(), String> {
     for (at, &(call, ms)) in plan.calls.iter().enumerate() {
         let started = clock.now();
         let deadline = clock.after(Duration::from_millis(ms));

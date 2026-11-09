@@ -13,8 +13,8 @@ use hegel::TestCase;
 
 use super::{Draw, Drawn, Seeds, check, control, path, root};
 use crate::{
-    Plant,
-    fs::FsKind,
+    Cx, Plant,
+    fs::{Dir, File, FsKind, ReadWrite},
     io::{Io, SimWorld},
 };
 
@@ -57,8 +57,25 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
     world.faults = Faults { max_latency: Duration::from_micros(plan.latency_us), ..Faults::default() };
     let io = Io::planted(world, plant);
     let cx = root(&io);
-    let dir = io.fs().open_dir(&cx, &path("data")).map_err(|e| format!("harness: {e}"))?;
-    let file = dir.create(&cx, &path("log")).map_err(|e| format!("harness: {e}"))?;
+    let dir = io.need_fs().map_err(|e| format!("harness: {e}"))?.open_dir(&cx, &path("data")).map_err(|e| format!("harness: {e}"))?;
+    // The file is linear: the acts run in a function of their own, then it is closed whatever
+    // they found, and a close whose sync the swarm fails is no finding.
+    let file = match dir.create(&cx, &path("log")) {
+        Ok(file) => file,
+        Err(error) => return Err(format!("harness: {error}")),
+    };
+    let acted = acts(plan, &io, &cx, &dir, &file);
+    let closed = file.close(&cx);
+    match (acted, closed) {
+        (Err(why), _) => Err(why),
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(error)) if plan.fail_syncs && matches!(error.kind, FsKind::Driver(_)) => Ok(()),
+        (Ok(()), Err(error)) => Err(format!("harness: close: {error}")),
+    }
+}
+
+/// The plan's acts on `file`, each checked.
+fn acts(plan: &Plan, io: &Io, cx: &Cx, dir: &Dir<ReadWrite>, file: &File<ReadWrite>) -> Result<(), String> {
     let fail_syncs = |io: &Io| {
         if plan.fail_syncs {
             // clone: the directory's name, a refcount.
@@ -66,7 +83,7 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
             io.with_sim(|sim| sim.fail_syncs(name));
         }
     };
-    fail_syncs(&io);
+    fail_syncs(io);
     // What a crash keeps whole, and what it keeps a prefix of.
     let (mut durable, mut pending): (Vec<u8>, Vec<u8>) = (Vec::new(), Vec::new());
     let mut written: u8 = 0;
@@ -80,24 +97,24 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
     };
     let read = |at: usize| -> Result<Vec<u8>, String> {
         let mut into = cx.bytes();
-        file.read_all(&cx, &mut into).map_err(|e| format!("harness: act {at}: {e}"))?;
+        file.read_all(cx, &mut into).map_err(|e| format!("harness: act {at}: {e}"))?;
         Ok(into.as_slice().to_vec())
     };
     for (at, &act) in plan.acts.iter().enumerate() {
         match act {
             Act::Append(len) => {
                 let bytes = next(len);
-                file.append(&cx, &bytes).map_err(|e| format!("harness: act {at}: {e}"))?;
+                file.append(cx, &bytes).map_err(|e| format!("harness: act {at}: {e}"))?;
                 pending.extend_from_slice(&bytes);
             }
-            Act::Sync => match file.sync(&cx) {
+            Act::Sync => match file.sync(cx) {
                 Ok(()) => durable.append(&mut pending),
                 Err(error) if plan.fail_syncs && matches!(error.kind, FsKind::Driver(_)) => {}
                 Err(error) => return Err(format!("harness: act {at}: {error}")),
             },
             Act::Replace(len) => {
                 let bytes = next(len);
-                file.replace(&cx, &bytes).map_err(|e| format!("harness: act {at}: {e}"))?;
+                file.replace(cx, &bytes).map_err(|e| format!("harness: act {at}: {e}"))?;
                 durable = bytes;
                 pending.clear();
             }
@@ -128,7 +145,7 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
                 // What survived is on the disk: durable from here.
                 durable = got;
                 pending.clear();
-                fail_syncs(&io);
+                fail_syncs(io);
             }
         }
     }

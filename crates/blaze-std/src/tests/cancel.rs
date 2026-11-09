@@ -59,18 +59,18 @@ enum Ended {
 fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
     let io = world(plan.seed, plant);
     let cx = root(&io);
-    let clock = io.clock();
-    let dir = io.fs().open_dir(&cx, &path("data")).map_err(|e| format!("harness: {e}"))?;
+    let clock = io.need_clock().map_err(|e| format!("harness: {e}"))?;
+    let dir = io.need_fs().map_err(|e| format!("harness: {e}"))?.open_dir(&cx, &path("data")).map_err(|e| format!("harness: {e}"))?;
     dir.write(&cx, &path("f"), b"bytes").map_err(|e| format!("harness: {e}"))?;
     let mut ended: Vec<(usize, Ended, Ended)> = Vec::new();
-    let result = cx.scope(|s| {
+    let result = cx.scope_with(|s| {
         for (at, &kind) in plan.tasks.iter().enumerate() {
             if plan.cancel_at == Some(at as u64) {
                 s.cancel();
             }
             let ended = &mut ended;
             let (clock, dir) = (&clock, &dir);
-            s.spawn(NAMES[at], move |cx| -> Result<(), String> {
+            let task = s.spawn(NAMES[at], move |cx| -> Result<(), String> {
                 match kind {
                     Kind::Fails => return Err("this task fails".to_owned()),
                     Kind::Panics => panic!("this task panics (a planted panic of the cancel test)"),
@@ -92,6 +92,8 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
                 ended.push((at, slept, read));
                 Ok(())
             });
+            // Its own outcome; the scope's first failure is checked below.
+            let _ = task.join(s.cx());
         }
     });
     // The first task whose spawn found the scope cancelled, or that cancelled it.

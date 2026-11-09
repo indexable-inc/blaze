@@ -8,7 +8,11 @@
 
 use std::{num::NonZero, sync::Arc};
 
-use crate::io::Io;
+use crate::io::{Io, Offers};
+
+/// What a native world offers: everything its target's driver has. The wasi driver keeps no
+/// sockets (blaze-core's `threads` driver runs them on unix only), so there `net` is `None`.
+pub const OFFERS: Offers = Offers { net: !cfg!(target_os = "wasi"), ..Offers::ALL };
 
 /// What a world says about the machine it runs on.
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: a test's description of a world

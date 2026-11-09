@@ -35,7 +35,7 @@ fn plan(d: &mut impl Draw) -> Plan {
 fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
     let io = world(plan.seed, plant);
     let cx = root(&io);
-    let jail = io.fs().open_dir(&cx, &path("jail/in")).map_err(|e| format!("harness: {e}"))?;
+    let jail = io.need_fs().map_err(|e| format!("harness: {e}"))?.open_dir(&cx, &path("jail/in")).map_err(|e| format!("harness: {e}"))?;
     io.record();
     for raw in &plan.raws {
         let before = io.touched().len();

@@ -1,9 +1,18 @@
 //! Connections (docs/v2/plan/design/std.md, `Net`): connects and listens on blaze-core's
 //! sockets, narrowed by [`Net::connect_only`] and [`Net::listen_only`], which never widen.
 //!
-//! Addresses are socket addresses and Unix sockets beneath the driver's root. A peer named by
-//! its host is a [`HostPort`], checked as it is made, never a string; blaze-core has no effect
-//! for name lookup yet, so a [`Net`] cannot connect to one by name until it has.
+//! Addresses are a [`HostPort`] for TCP and a [`Path`] beneath the driver's root for a Unix
+//! socket, each checked as it is made, never a string or a socket address parsed from one.
+//! blaze-core has no effect for name lookup yet, so a host that is a DNS name, not an IP
+//! address, is refused ([`NetKind::NoLookup`]) until it has.
+//!
+//! **Finishing.** A [`Conn`] and a [`Listener`] are linear (`#[blaze::linear]`): leaving one is
+//! a compile error, and each ends with a call that waits for its end and says how it went:
+//! [`Conn::finish`] hangs up, [`Listener::close`] stops listening. A panic that unwinds past
+//! one runs its abandonment path, its `Drop`: the connection is hung up, or the listen ended,
+//! without waiting, and what comes of either is dropped as it arrives. There is no abortive
+//! close (`reset`, TCP's RST) yet: blaze-core has no effect for one. Receives and sends in
+//! flight are [`Pending`] values ([`Conn::read_into`], [`Conn::write_from`]).
 //!
 //! There is no UDP socket ([`Net`]'s `Datagrams`) yet: blaze-core's `Effect` has no datagram
 //! effects (a bind of a UDP socket, a send to an address, a receive with its sender).
@@ -18,23 +27,31 @@ use crate::{
     io::{Ends, Io},
     mem::Bytes,
     path::Path,
+    pending::{self, Pending},
 };
 
 /// Where to connect or listen.
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: a refcount or a copy
 pub enum Addr {
-    Tcp(SocketAddr),
+    /// A TCP host and port. Its host must be an IP address until blaze-core can look a name up.
+    Tcp(HostPort),
     /// A Unix socket beneath the driver's root.
     Unix(Path),
 }
 
 impl Addr {
-    fn address(&self) -> Address {
+    /// The driver's address, or `None` for a host that would need a name lookup.
+    fn address(&self) -> Option<Address> {
         match self {
-            Addr::Tcp(at) => Address::Tcp(*at),
+            Addr::Tcp(at) => at.socket_addr().map(Address::Tcp),
             // clone: the socket's name, a refcount.
-            Addr::Unix(path) => Address::Unix(path.name().clone()),
+            Addr::Unix(path) => Some(Address::Unix(path.name().clone())),
         }
+    }
+
+    /// The driver's address, or the error of `op` that it needs a name lookup.
+    fn reach(&self, op: NetOp) -> Result<Address, NetError> {
+        self.address().ok_or_else(|| error(op, self, NetKind::NoLookup))
     }
 }
 
@@ -338,13 +355,21 @@ pub enum NetOp {
     Accept,
     Send,
     Recv,
+    /// [`Listener::close`].
     Close,
+    /// [`Conn::finish`].
+    Finish,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: an error
 pub enum NetKind {
     /// The capability does not reach the address (rule: narrowing never widens).
     NotAllowed,
+    /// The host is a DNS name, and blaze-core has no effect that looks one up yet.
+    NoLookup,
+    /// [`Listener::close`] took more than [`CLOSE_MOST`] connections made while it closed,
+    /// and stopped waiting for the listen's end.
+    Unending { accepted: usize },
     Stopped(Stopped),
     /// The driver failed it, saying this.
     Driver(String),
@@ -367,6 +392,16 @@ impl fmt::Display for NetError {
             NetKind::NotAllowed => {
                 write!(f, "bstd::net {op:?} to {addr}: this Net does not reach it (it was narrowed)")
             }
+            NetKind::NoLookup => write!(
+                f,
+                "bstd::net {op:?} to {addr}: its host is a name, and blaze-core has no effect that \
+                 looks a name up yet: give its IP address"
+            ),
+            NetKind::Unending { accepted } => write!(
+                f,
+                "bstd::net {op:?} to {addr}: {accepted} connections were made while it closed, more \
+                 than {CLOSE_MOST}, and the listen's end never came (rule bounded-progress)"
+            ),
             NetKind::Stopped(stopped) => write!(f, "bstd::net {op:?} to {addr}: {stopped}"),
             NetKind::Driver(said) => write!(f, "bstd::net {op:?} to {addr}: {said}"),
             NetKind::Answered(done) => {
@@ -416,62 +451,60 @@ impl Net {
         Net { io: self.io.clone(), connect: Allowed::Nothing, listen: self.listen.narrowed(at) }
     }
 
+    /// A connection to `at`: finished with [`Conn::finish`].
     pub fn connect(&self, cx: &Cx, at: &Addr) -> Result<Conn, NetError> {
         if !self.connect.allows(at) {
             return Err(error(NetOp::Connect, at, NetKind::NotAllowed));
         }
-        let address = at.address();
+        let address = at.reach(NetOp::Connect)?;
         let done = self
             .io
             .call(cx, |tag| Effect::Connect { at: address, tag })
             .map_err(|stopped| error(NetOp::Connect, at, NetKind::Stopped(stopped)))?;
         match done {
             // clone: the connection's peer, for its errors.
-            Done::Connected { conn } => Ok(Conn { io: self.io.clone(), conn, peer: at.clone(), open: true }),
+            Done::Connected { conn } => Ok(Conn::new(&self.io, conn, at.clone())),
             done => Err(unexpected(NetOp::Connect, at, done)),
         }
     }
 
-    /// Listens on `at`: each connection made to it is [`Listener::accept`]ed.
+    /// Listens on `at`: each connection made to it is [`Listener::accept`]ed. Finished with
+    /// [`Listener::close`].
     pub fn listen(&self, cx: &Cx, at: &Addr) -> Result<Listener, NetError> {
         if !self.listen.allows(at) {
             return Err(error(NetOp::Listen, at, NetKind::NotAllowed));
         }
         cx.check().map_err(|stopped| error(NetOp::Listen, at, NetKind::Stopped(stopped)))?;
-        let address = at.address();
+        let address = at.reach(NetOp::Listen)?;
         let tag = self.io.submit(|tag| Effect::Listen { at: address, tag });
+        let listening = Listening { io: self.io.clone(), tag, open: true };
         // clone: the listener's address, for its errors.
-        Ok(Listener { io: self.io.clone(), tag, at: at.clone(), open: true })
+        Ok(Listener { listening, at: at.clone() })
     }
 }
 
-/// A listen in flight: dropping it ends it.
+/// The most connections [`Listener::close`] hangs up while it waits for the listen's end,
+/// before it stops waiting (rule bounded-progress).
+pub const CLOSE_MOST: usize = 1024;
+
+/// A listen in flight, finished with [`Listener::close`]. Linear (see the module's doc): a
+/// panic that drops one ends the listen without waiting, and drops what comes of it.
+#[blaze::linear]
+#[must_use = "a listener is finished with close(cx)"]
 pub struct Listener {
+    listening: Listening,
+    at: Addr,
+}
+
+/// A listen's tag and its abandonment path.
+struct Listening {
     io: Io,
     tag: Tag,
-    at: Addr,
+    /// Whether the listen may still bring completions: cleared when it fails or is closed.
     open: bool,
 }
 
-impl Listener {
-    /// The next connection made to it.
-    pub fn accept(&mut self, cx: &Cx) -> Result<Conn, NetError> {
-        let done = cx
-            .wait(&self.io, self.tag, Ends::Stream)
-            .map_err(|stopped| error(NetOp::Accept, &self.at, NetKind::Stopped(stopped)))?;
-        match done {
-            // clone: the connection's address, for its errors.
-            Done::Accepted { conn } => Ok(Conn { io: self.io.clone(), conn, peer: self.at.clone(), open: true }),
-            done => {
-                // A failed listen has ended: nothing more comes of its tag.
-                self.open = false;
-                Err(unexpected(NetOp::Accept, &self.at, done))
-            }
-        }
-    }
-}
-
-impl Drop for Listener {
+impl Drop for Listening {
     fn drop(&mut self) {
         if self.open {
             let tag = self.tag;
@@ -481,70 +514,78 @@ impl Drop for Listener {
     }
 }
 
-/// A connection.
+impl Listener {
+    /// The next connection made to it: finished with [`Conn::finish`].
+    pub fn accept(&mut self, cx: &Cx) -> Result<Conn, NetError> {
+        let listening = &mut self.listening;
+        let done = cx
+            .wait(&listening.io, listening.tag, Ends::Stream)
+            .map_err(|stopped| error(NetOp::Accept, &self.at, NetKind::Stopped(stopped)))?;
+        match done {
+            // clone: the connection's address, for its errors.
+            Done::Accepted { conn } => Ok(Conn::new(&listening.io, conn, self.at.clone())),
+            done => {
+                // A failed listen has ended: nothing more comes of its tag.
+                listening.open = false;
+                Err(unexpected(NetOp::Accept, &self.at, done))
+            }
+        }
+    }
+
+    /// The listen ended: it waits, until `cx`'s deadline, for the driver to say so, hanging up
+    /// each connection made meanwhile, at most [`CLOSE_MOST`] of them. The one way a
+    /// `Listener` ends.
+    #[blaze::consumes]
+    pub fn close(mut self, cx: &Cx) -> Result<(), NetError> {
+        let listening = &mut self.listening;
+        if !listening.open {
+            return Ok(());
+        }
+        listening.open = false;
+        let (io, tag) = (listening.io.clone(), listening.tag);
+        let _ = io.submit(|_| Effect::Unlisten { tag });
+        let mut accepted = 0;
+        while accepted <= CLOSE_MOST {
+            let done = match cx.wait(&io, tag, Ends::Stream) {
+                Ok(done) => done,
+                Err(stopped) => {
+                    io.forget(tag, Ends::Stream);
+                    return Err(error(NetOp::Close, &self.at, NetKind::Stopped(stopped)));
+                }
+            };
+            match done {
+                Done::Unlistened => return Ok(()),
+                Done::Accepted { conn } => {
+                    accepted += 1;
+                    let hangup = io.submit(|tag| Effect::Hangup { conn, tag });
+                    io.forget(hangup, Ends::Once);
+                }
+                done => return Err(unexpected(NetOp::Close, &self.at, done)),
+            }
+        }
+        io.forget(tag, Ends::Stream);
+        Err(error(NetOp::Close, &self.at, NetKind::Unending { accepted }))
+    }
+}
+
+/// A connection, finished with [`Conn::finish`]. Linear (see the module's doc): a panic that
+/// drops one hangs it up without waiting.
+#[blaze::linear]
+#[must_use = "a connection is finished with finish(cx)"]
 pub struct Conn {
+    link: Link,
+    peer: Addr,
+}
+
+/// A connection's driver handle and its abandonment path.
+struct Link {
     io: Io,
     conn: blaze_core::Conn,
-    peer: Addr,
+    /// Whether it is still to be hung up: cleared by [`Conn::finish`].
     open: bool,
 }
 
-impl Conn {
-    pub fn peer(&self) -> &Addr {
-        &self.peer
-    }
-
-    /// All of `bytes` sent.
-    pub fn send(&self, cx: &Cx, bytes: &[u8]) -> Result<(), NetError> {
-        let conn = self.conn;
-        // alloc: the effect's bytes, which blaze-core's `Effect` owns.
-        let bytes = bytes.to_vec();
-        let done = self
-            .io
-            .call(cx, |tag| Effect::Send { conn, bytes, tag })
-            .map_err(|stopped| error(NetOp::Send, &self.peer, NetKind::Stopped(stopped)))?;
-        match done {
-            Done::Sent(_) => Ok(()),
-            done => Err(unexpected(NetOp::Send, &self.peer, done)),
-        }
-    }
-
-    /// The bytes the peer sent since the last receive, at most `most`, added to `into`; how
-    /// many, 0 once the peer has hung up.
-    pub fn recv(&self, cx: &Cx, most: usize, into: &mut Bytes<'_>) -> Result<usize, NetError> {
-        let conn = self.conn;
-        // alloc: the effect's buffer, which blaze-core's `Effect` owns.
-        let buffer = Vec::new();
-        let done = self
-            .io
-            .call(cx, |tag| Effect::Recv { conn, most, into: buffer, tag })
-            .map_err(|stopped| error(NetOp::Recv, &self.peer, NetKind::Stopped(stopped)))?;
-        match done {
-            Done::Read(bytes) => {
-                into.try_extend(&bytes)
-                    .map_err(|stopped| error(NetOp::Recv, &self.peer, NetKind::Stopped(stopped)))?;
-                Ok(bytes.len())
-            }
-            done => Err(unexpected(NetOp::Recv, &self.peer, done)),
-        }
-    }
-
-    /// The connection closed: the peer's receives get nothing more.
-    pub fn close(mut self, cx: &Cx) -> Result<(), NetError> {
-        self.open = false;
-        let conn = self.conn;
-        let done = self
-            .io
-            .call(cx, |tag| Effect::Hangup { conn, tag })
-            .map_err(|stopped| error(NetOp::Close, &self.peer, NetKind::Stopped(stopped)))?;
-        match done {
-            Done::HungUp => Ok(()),
-            done => Err(unexpected(NetOp::Close, &self.peer, done)),
-        }
-    }
-}
-
-impl Drop for Conn {
+impl Drop for Link {
     fn drop(&mut self) {
         if self.open {
             let conn = self.conn;
@@ -554,9 +595,100 @@ impl Drop for Conn {
     }
 }
 
+impl Conn {
+    fn new(io: &Io, conn: blaze_core::Conn, peer: Addr) -> Conn {
+        Conn { link: Link { io: io.clone(), conn, open: true }, peer }
+    }
+
+    pub fn peer(&self) -> &Addr {
+        &self.peer
+    }
+
+    /// A send of all of `from`, in flight. The bytes are copied as it starts (see
+    /// [`crate::pending`]), and stay lent until it ends.
+    pub fn write_from<'buf>(&'buf self, from: &'buf [u8]) -> Pending<'buf, Result<(), NetError>> {
+        let conn = self.link.conn;
+        // alloc: the effect's bytes, which blaze-core's `Effect` owns.
+        let bytes = from.to_vec();
+        let peer = &self.peer;
+        let effect = |tag| Effect::Send { conn, bytes, tag };
+        pending::start(&self.link.io, "bstd::net write_from", &mut [], effect, move |_: &mut [u8], done| {
+            match done {
+                Ok(Done::Sent(_)) => Ok(()),
+                Ok(done) => Err(unexpected(NetOp::Send, peer, done)),
+                Err(stopped) => Err(error(NetOp::Send, peer, NetKind::Stopped(stopped))),
+            }
+        })
+    }
+
+    /// All of `bytes` sent: its [`Conn::write_from`], waited for.
+    pub fn send(&self, cx: &Cx, bytes: &[u8]) -> Result<(), NetError> {
+        cx.stopped_by(self.link.io.now())
+            .map_err(|stopped| error(NetOp::Send, &self.peer, NetKind::Stopped(stopped)))?;
+        self.write_from(bytes).wait(cx)
+    }
+
+    /// A receive into `into` of the bytes the peer sent since the last receive, at most
+    /// `into.len()`, in flight: its outcome is how many, 0 once the peer has hung up.
+    pub fn read_into<'buf>(&'buf self, into: &'buf mut [u8]) -> Pending<'buf, Result<usize, NetError>> {
+        let conn = self.link.conn;
+        let most = into.len();
+        let peer = &self.peer;
+        // alloc: the effect's buffer, which blaze-core's `Effect` owns.
+        let effect = |tag| Effect::Recv { conn, most, into: Vec::new(), tag };
+        pending::start(&self.link.io, "bstd::net read_into", into, effect, move |into: &mut [u8], done| {
+            match done {
+                Ok(Done::Read(bytes)) if bytes.len() <= into.len() => {
+                    into[..bytes.len()].copy_from_slice(&bytes);
+                    Ok(bytes.len())
+                }
+                Ok(done) => Err(unexpected(NetOp::Recv, peer, done)),
+                Err(stopped) => Err(error(NetOp::Recv, peer, NetKind::Stopped(stopped))),
+            }
+        })
+    }
+
+    /// The bytes the peer sent since the last receive, at most `most`, added to `into`; how
+    /// many, 0 once the peer has hung up. Its [`Conn::read_into`], waited for.
+    pub fn recv(&self, cx: &Cx, most: usize, into: &mut Bytes<'_>) -> Result<usize, NetError> {
+        let stopped = |stopped| error(NetOp::Recv, &self.peer, NetKind::Stopped(stopped));
+        cx.stopped_by(self.link.io.now()).map_err(stopped)?;
+        let start = into.len();
+        let slot = into.grow_zeroed(most).map_err(stopped)?;
+        let read = self.read_into(slot).wait(cx);
+        match read {
+            Ok(read) => {
+                into.truncate(start + read);
+                Ok(read)
+            }
+            Err(error) => {
+                into.truncate(start);
+                Err(error)
+            }
+        }
+    }
+
+    /// The connection finished: hung up, so the peer's receives get nothing more, and the
+    /// driver's word that it is, or why not, op [`NetOp::Finish`]. The one way a `Conn` ends.
+    #[blaze::consumes]
+    pub fn finish(mut self, cx: &Cx) -> Result<(), NetError> {
+        self.link.open = false;
+        let conn = self.link.conn;
+        let done = self
+            .link
+            .io
+            .call(cx, |tag| Effect::Hangup { conn, tag })
+            .map_err(|stopped| error(NetOp::Finish, &self.peer, NetKind::Stopped(stopped)))?;
+        match done {
+            Done::HungUp => Ok(()),
+            done => Err(unexpected(NetOp::Finish, &self.peer, done)),
+        }
+    }
+}
+
 impl fmt::Debug for Conn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Conn({:?} to {})", self.conn, self.peer)
+        write!(f, "Conn({:?} to {})", self.link.conn, self.peer)
     }
 }
 

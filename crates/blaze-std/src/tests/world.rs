@@ -21,11 +21,11 @@ fn args_and_host_are_the_worlds() {
     world.args = vec!["prog".to_owned(), "--flag".to_owned()];
     world.host = HostFacts { pid: 42, cores: NonZero::<usize>::MIN.saturating_add(7), name: Arc::from("box") };
     let io = Io::simulated(world);
-    let args = io.args();
+    let args = io.args().expect("Io::sim offers args");
     assert_eq!(args.each().collect::<Vec<_>>(), ["prog", "--flag"]);
     assert_eq!(args.get(1), Some("--flag"));
     assert_eq!(args.get(2), None);
-    let host = io.host();
+    let host = io.host().expect("Io::sim offers host");
     assert_eq!((host.pid(), host.cores().get(), &*host.name()), (42, 8, "box"));
 }
 
@@ -33,11 +33,12 @@ fn args_and_host_are_the_worlds() {
 fn a_simulated_exit_unwinds_its_task_and_the_world_remembers_it() {
     let io = Io::sim(1);
     let cx = root(&io);
-    let host = io.host();
+    let host = io.host().expect("Io::sim offers host");
     let ended = catch_unwind(AssertUnwindSafe(|| {
         // An exit inside a task passes through its scope rather than failing the task.
-        let _ = cx.scope(|s| {
-            s.spawn("exits", |_cx| -> Result<(), String> { host.exit(3) });
+        let _ = cx.scope_with(|s| {
+            let task = s.spawn("exits", |_cx| -> Result<(), String> { host.exit(3) });
+            let _ = task.join(s.cx());
         });
     }));
     let payload = ended.expect_err("an exit does not return");
@@ -70,12 +71,12 @@ fn spawn_concurrent_is_refused_under_inline_and_its_task_never_runs() {
     let io = Io::sim(3);
     let cx = root(&io);
     let mut ran = false;
-    let result = cx.scope(|s| {
+    let result = cx.scope_with(|s| {
         let refused = s.spawn_concurrent("overlaps", |_cx| -> Result<(), String> {
             ran = true;
             Ok(())
         });
-        assert!(refused.is_err());
+        assert!(refused.join(s.cx()).is_err());
     });
     assert!(!ran);
     assert_eq!(
