@@ -384,12 +384,16 @@ impl Visitor<'_, '_, '_, '_> {
 
     /// `check_late_bound_lifetime_defs` of a `for<..>` binder: parameters that are not
     /// lifetimes, const parameters even with `non_lifetime_binders`, bounds (a trait bound
-    /// stops rustc).
+    /// stops rustc). With `#![feature(blaze_comptime)]`, a field binder's parameters are none
+    /// of these ([`is_field_binder_param`]).
     fn binder(&mut self, file: HirFileId, node: ast::Node<'_>) {
         let Some(params) = child(node, SyntaxKind::GENERIC_PARAM_LIST) else { return };
+        let comptime = self.features.enabled("blaze_comptime")
+            && node.parent().is_some_and(|it| it.kind() == SyntaxKind::WHERE_PRED);
+        let rustcs = move |param: &ast::Node<'_>| !(comptime && is_field_binder_param(*param));
         // The name of each parameter that is not a lifetime, and whether it is a const's.
-        let non_lifetimes = || {
-            params.children().filter_map(|param| {
+        let non_lifetimes = move || {
+            params.children().filter(rustcs).filter_map(|param| {
                 let is_const = match param.kind() {
                     SyntaxKind::TYPE_PARAM => false,
                     SyntaxKind::CONST_PARAM => true,
@@ -424,7 +428,7 @@ impl Visitor<'_, '_, '_, '_> {
         ) {
             self.push(file, node, diag, false);
         }
-        for param in params.children() {
+        for param in params.children().filter(rustcs) {
             let Some(list) = child(param, SyntaxKind::TYPE_BOUND_LIST) else { continue };
             let bounds = || list.children().filter(|it| it.kind() == SyntaxKind::TYPE_BOUND);
             let fatal = bounds().any(|it| {
@@ -463,6 +467,19 @@ impl Visitor<'_, '_, '_, '_> {
         }
         self.gate(file, node, feature, item_range(node), explain, None);
     }
+}
+
+/// Whether `param`, a parameter of a where predicate's `for<..>` binder in a crate with
+/// `#![feature(blaze_comptime)]`, is a field binder's (docs/v2/plan/design/comptime.md,
+/// "Syntax"): a type parameter with a bound, `F` of `for<F: Field<C>>`, `V` and `F` of
+/// `for<V: Variant<C>, F: Field<V::View>>`. It is blaze's, not `non_lifetime_binders`' and not
+/// a forbidden bound: hir-def lowers it as a binder parameter (`lower_binder_params`, by the
+/// same rule) and hir-ty refuses, with a typed error, a bound that is not one `Field<C>` or
+/// `Variant<C>`. A parameter with no bound (`for<T>`) is rustc's, gated as rustc gates it.
+fn is_field_binder_param(param: ast::Node<'_>) -> bool {
+    param.kind() == SyntaxKind::TYPE_PARAM
+        && child(param, SyntaxKind::TYPE_BOUND_LIST)
+            .is_some_and(|list| list.children().any(|it| it.kind() == SyntaxKind::TYPE_BOUND))
 }
 
 /// An error with no code at each of `spans`, if there is one.
