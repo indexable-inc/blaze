@@ -109,7 +109,6 @@ not ambient and is never fetched from a thread-local; `main` receives the root o
 | `Host` | `io.host()` | | the process id, core count, host name, signals, and exiting with a status |
 | `Clock` | `io.clock()` | | `Instant`, wall time, `Deadline` |
 | `Rng` | `io.rng()` | `fork()` | random bytes; seeded in the simulation |
-| `Tasks` | `io.tasks()` | | scopes of named tasks |
 | `Process` | `io.process()` | `only(programs)` | child processes |
 | `Out` | `io.out()` | | standard input, output and error |
 | `Mem` | `io.mem()` | | named arenas and caches against the memory budget |
@@ -167,18 +166,80 @@ The runtime keeps one real thread-local, the pointer to the current worker, insi
 **Secrets.** `#[derive(bstd::Secret)]` gives a type no `Debug`, `Display` or `Clone`, zeroes it on
 drop, and hands its bytes only to functions of its own module.
 
-## Time, waiting and tasks
+## Tasks and waiting
 
-- **Every wait has a deadline.** Every blocking call takes the task's `Cx` and ends in a typed
-  outcome that includes `Stopped::Deadline` and `Stopped::Cancelled`. There is no call that can
-  wait for ever (rules `bounded-progress`, `deadline-waits`).
-- **Concurrency is structured.** `tasks.scope(cx, |s| s.spawn("name", |cx| ..))`: each task gets
-  its own `Cx` (its name, its frame, the scope's deadline), cannot outlive its scope, and an
-  error or a deadline cancels its siblings. There is no detached thread.
-- **A panic fails its task** with a typed error to the scope (rule `panics-fail-one-job`).
-- **A child process is handed capabilities.** `process.spawn(program, dirs, env)` gives the child
-  exactly those; the driver's sandbox enforces it. This is the sandbox blaze already builds for
-  build scripts, as one API.
+There is no `async` and no `.await` in a capabilities crate. A function that waits is an ordinary
+function. ([may-suspend](may-suspend.md) is the analysis underneath.)
+
+- **One wait.** `Cx` has the single wait primitive: wait for this, until the deadline, with a
+  typed outcome (`Ready`, `Stopped::Deadline`, `Stopped::Cancelled`). Locks, channels, sleeps and
+  every IO call are built on it, which is why each takes a `Cx`. Nothing can wait for ever (rules
+  `bounded-progress`, `deadline-waits`).
+- **Structured only.** `cx.scope(|s| s.spawn("name", |cx| ..))`. The child's `cx` is borrowed
+  from the scope, so a task cannot outlive it; children may borrow from the parent, as
+  `std::thread::scope` allows. There is no detached task and no `io.tasks()`: starting work is
+  something a `Cx` does.
+- **`spawn` means "may run in any order"; `spawn_concurrent` means "must overlap"** and is a
+  compile error where the layout cannot overlap.
+- **Spawn is eager, and cancellation is a value.** A cancelled task learns it only as
+  `Stopped::Cancelled` from its next wait. Nothing is cancelled by being dropped, and user code
+  never holds a task that has not started or is half run.
+- **`Drop` may wait.** A value holds the capability it was made with, so closing a file or
+  flushing a connection on drop goes through the same wait.
+- **A panic fails its task** with a typed error to its scope (rule `panics-fail-one-job`).
+- **A child process is handed capabilities.** `process.spawn(cx, program, dirs, env)` gives the
+  child exactly those; the driver's sandbox enforces it. This is the sandbox blaze already builds
+  for build scripts, as one API.
+- **Code that uses `async` still builds** as the pinned nightly builds it. The bridge is one
+  function: wait on a `Future` (poll it, park the task while it is pending, its waker unparks).
+
+### Layouts
+
+How a waiting task's frames are stored is the **layout**. Programs behave the same in every
+layout they compile under: same outputs, same order of cancellation, drops and panics.
+
+| layout | a task is | a wait |
+|---|---|---|
+| `Inline` | run to completion at `spawn` | nothing else runs; no runtime at all |
+| `Threads` | a pool thread | blocks the thread |
+| `Fibers` | its own stack (the scheduler of section 6) | switches stacks |
+| `Frames` | a bump slab holding the frames of its functions that can wait, each made on call and freed on return; code that cannot wait runs on the worker's stack | returns to the scheduler |
+
+`Frames` is the long-term one: no stack per task, and recursion and `dyn` calls work because the
+callee makes its own frame. Frames never move, so there is no `Pin`. Fusing a known,
+non-recursive callee's frame into its caller's is a later optimization, not another layout. A
+panic unwinds across slab frames by a second return path each may-suspend call checks.
+
+The simulation is not a layout: `Io::sim(seed)` picks a seeded scheduler and world at run time,
+under any layout.
+
+**The layout is chosen per build, not per signature.** `Cx` and the capabilities are concrete
+types; the build configuration says which layout they are, as it says which IO driver a target
+gets. Functions are compiled once, and no signature carries a type parameter for it. (The
+alternative, `cx: &impl Tasks` with functions that wait monomorphized over the layout type, lets
+two layouts live in one binary at the price of a generic on every waiting signature and two
+copies of the code. The differential test below builds twice instead.)
+
+### What the compiler checks
+
+- A `!Send` or `#[must_not_suspend]` value live across a call that may wait is an error naming
+  the value, the call and the path to the wait, in every layout.
+- May-suspend is inferred exactly, from the wait primitive; "takes a `Cx`" is only the usual
+  sign, since a value can hold its capability out of sight. The `#[blaze::may_suspend]` mark on
+  `dyn` methods and function-pointer fields is also the calling-convention fact `Frames` needs.
+- What `Frames` cannot do is an error with the call path, never a quiet switch to a fiber (rule
+  `no-fallback`): for one, a foreign (C) frame live across a wait.
+- `spawn_concurrent` under `Inline` is an error.
+- A task cannot outlive its scope: the lifetime on the child's `cx` enforces it.
+- In ordinary crates, where thread-locals still exist, their address is reloaded after any call
+  that may wait.
+
+### Proof
+
+Deterministic simulation tests of the scheduler, scopes and cancellation with an oracle and a
+planted bug; a differential test that runs the same programs under `Fibers` and `Frames` and
+compares outputs and the order of cancellations, drops and panics; and a UI test for each error
+above.
 
 ## Errors
 
@@ -240,6 +301,7 @@ Interface first, bottom last, so nothing waits on the runtime and every step lan
 | S1 | The crate `crates/blaze-std` (`bstd`): `Cx`, `Io`, every capability above, the allocators, the scopes and deadlines, the errors, over `blaze-core`'s drivers and its simulation | its simulation tests pass; one planted bug per invariant is caught |
 | S2 | The `ambient` and `unsafe` effects, `#![blaze::capabilities]`, `blaze explain trusted` | a crate with the attribute that calls `std::fs` is refused, naming the call path |
 | S3 | blaze's crates move, leaves first: a sans-IO core takes nothing, a driver takes the piece it needs, `blaze`'s `main` takes `Io`. Each move is a `.clippy.toml` ban and `blaze check --fix` (rule `fix-through-blaze-lints`) | every crate in `crates/` has `#![blaze::capabilities]` |
+| S3b | The `Frames` layout: the calling convention, the slab, unwinding, and the profiler and backtraces walking the frame chain | the differential test against `Fibers` passes |
 | S4 | The bottom: `bstd::sys` and `bstd::rt`, `blaze-core`'s drivers move in as `bstd::driver`, and bstd is `#![no_std]` | no blaze crate links Rust's `std`; C1 still passes |
 | S5 | The edition: `edition = "blaze-2026.11"` makes `std` name bstd, `fn main(io: Io)` is the entry, and the OS sandbox of a program is derived from what `main` hands out | a program of the edition that never opens the network cannot, checked by the sandbox |
 | S6 | C dependencies as wasm, the registry, the migration (`blaze fix --edition`) | each has its own row when S5 is met |
@@ -258,7 +320,8 @@ with its path, or put on the trusted list with a reason.
   the driver either way.
 - **`Io` is a concrete value**, as Zig's `std.Io` is passed explicitly, without Zig's vtable in
   every signature and without a generic.
-- **Fibers, not `async`.** One API, no colour.
+- **No `async`.** One kind of function; fibers first, task frames after.
+- **The layout is a build setting**, not a type parameter.
 - **Context is a parameter**, as Go's `context` and Zig's allocator are, never a thread-local: a
   thread-local context is ambient authority over time and memory.
 - **No global heap.** Out of memory fails a task, never the process.
