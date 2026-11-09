@@ -26,6 +26,7 @@ use std::sync::Arc;
 mod checks;
 mod context;
 mod genui;
+mod mention;
 mod peek;
 mod pick;
 mod rename;
@@ -281,6 +282,8 @@ pub struct ChatState {
     stepped: f64,
     /// The chip under the pointer, its hover card, and the GitHub refs its words name (chat/peek.rs).
     peek: peek::Peek,
+    /// The `@` file mention menu over the composer (chat/mention.rs).
+    mention: mention::Mention,
 }
 
 /// One text block of a chat's transcript as it shows: its pace, and whether it streamed in while the pane watched (its
@@ -351,6 +354,7 @@ impl Default for ChatState {
             follow: Follow::default(),
             stepped: 0.0,
             peek: peek::Peek::default(),
+            mention: mention::Mention::default(),
         }
     }
 }
@@ -1271,6 +1275,7 @@ impl App {
             .try_cloned::<&model::Cwd>()
             .map_or_else(|| std::env::var("HOME").unwrap_or_default(), |c| c.s.as_str().to_owned());
         self.fill_chat_peek(pv, st, t, &rows, focused, &cwd);
+        self.fill_chat_mention(pv, sid, st, &cwd, focused);
         let ended = self.status_of(e) != "running";
         if let Some(area) = composer_area(pv) {
             let (shown, [caret, anchor, lo, hi]) = st.draft.shown();
@@ -1642,6 +1647,10 @@ impl App {
         if op == "pick_model" || op == "effort_next" {
             return self.chat_pick_key(op);
         }
+        // An open `@` mention menu takes the arrows, Tab, Return and Escape (chat/mention.rs).
+        if self.chat_mention_key(op) {
+            return;
+        }
         // An open picker menu takes the arrows and Return (chat/pick.rs).
         if let Some((_, _, sid)) = self.focused_chat()
             && self.chat_pick_nav(sid, op)
@@ -1673,6 +1682,8 @@ impl App {
         }
         match op {
             "newline" => _ = self.with_draft(|d| d.insert("\n")),
+            // Tab with no mention menu open types a tab, as before it was bound.
+            "complete" => _ = self.with_draft(|d| d.insert("\t")),
             // Return, or Command-Return (which submits a cell's TextArea).
             "send" | "submit" => self.chat_send_draft(sid),
             "interrupt" => {

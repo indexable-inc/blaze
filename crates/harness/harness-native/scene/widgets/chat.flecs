@@ -46,6 +46,11 @@ hn {
         Flex: {axis: Column, gap: $chat_composer_gap, align: Stretch, justify: Start, wrap: false}
         Size: {w: {kind: Grow, value: 1, min: 0, max: $chat_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
         Padding: {l: $chat_composer_pad, r: $chat_composer_pad, t: $chat_composer_pad_t, b: $chat_composer_pad}
+        // The `@` mention menu while the draft ends in an `@` word (src/app/chat/mention.rs): out of the flow, its plate
+        // placed above the card.
+        mention : ui.Node {
+          Overlay
+        }
         entry : ui.Row {
           Flex: {axis: Row, gap: 0, align: Start, justify: Start, wrap: false}
           Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
@@ -163,6 +168,26 @@ hn {
     effort : ui.Column {
       Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    }
+  }
+  // The `@` mention menu (chat/mention.rs): a ui.Menu above the composer's card, chat_mention_w wide, its rows under
+  // `items` (hn.ChatMentionItem, or a ui.MenuNote saying why there are none).
+  prefab ChatMention : ui.Menu {
+    Size: {w: {kind: Fixed, value: $chat_mention_w, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    items : ui.Column {
+      Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    }
+  }
+  // A place: its kind's icon (files.rs's drawing) before its name, its folder quiet at the end (`about`, cut first).
+  prefab ChatMentionItem : ui.MenuItem {
+    lead {
+      icon : ui.Art {
+        Size: {w: {kind: Fixed, value: $chat_mention_icon, min: 0, max: 0}, h: {kind: Fixed, value: $chat_mention_icon, min: 0, max: 0}}
+      }
+      after : ui.Node {
+        Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+      }
     }
   }
   // The models, searchable (search_menu.flecs's filter over `items`): each agent kind's under its head led by its maker's
