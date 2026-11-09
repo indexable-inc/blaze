@@ -274,8 +274,6 @@ pub struct App {
     pending_archive: bool,
     /// The ids the daemon no longer lists were dropped (once, on its first list).
     pruned: bool,
-    /// The work bar's band is sweeping (the window keeps drawing, at its calm rate).
-    work_live: bool,
     /// Remember the selected object in native.json (not for the offscreen shot).
     pub persist: bool,
     /// An offscreen shot's `HARNESS_NATIVE_SHOT_WORKING` (src/shot.rs): every session row and every run row shows at
@@ -586,7 +584,6 @@ impl App {
             pinned: crate::prefs::keys("pinned").unwrap_or_default(),
             pending_archive: false,
             pruned: false,
-            work_live: false,
             persist: true,
             shot_working: false,
             shot_plan: Vec::new(), // alloc: empty but in a shot
@@ -1756,17 +1753,48 @@ impl App {
         crate::audio::start(level, if on("music") { music } else { 0.0 }, if on("ambient") { ambient } else { 0.0 }, &rain, cues, moods)
     }
 
-    /// The work bar (hn.WorkBar): while the chat in front works, its band sweeps along the window's top edge, placed by
-    /// the track's padding; at rest the band has no width. Under Reduce Motion the whole hairline shows, still.
+    /// How long a turn takes, by the turns already finished in every chat: their middle length (ms), once there are at
+    /// least three. An estimate and no more: the work bar says "about".
+    fn turn_estimate(&self) -> Option<u64> {
+        let chats = self.chats.borrow();
+        let mut took: Vec<u64> = chats // alloc: the finished turns' lengths, a frame while one runs
+            .values()
+            .flat_map(|t| t.items.iter())
+            .filter_map(|i| match i {
+                model::chat::Item::TurnEnd { duration_ms: Some(ms), .. } if *ms > 0 => Some(*ms),
+                _ => None,
+            })
+            .collect();
+        if took.len() < 3 {
+            return None;
+        }
+        took.sort_unstable();
+        Some(took[took.len() / 2])
+    }
+
+    /// The work bar (hn.WorkBar): while the chat in front works, a band along the window's top edge, placed by the
+    /// track's padding. With an estimate ([`Self::turn_estimate`]) it fills from the left as the turn nears it and
+    /// `eta` says about how long is left; with none, or past it, it sweeps. At rest it has no width. Drawn every frame
+    /// the display gives while it moves; under Reduce Motion a sweep is the whole hairline, still.
     fn step_work_bar(&mut self) {
         use harness_native_ui_layout_api::Padding;
         let w = self.world.world_ref();
-        let Some(track) = View::of(w.entity_from_id(self.ids.work_bar)).part("track") else { return };
+        let bar = View::of(w.entity_from_id(self.ids.work_bar));
+        let Some(track) = bar.part("track") else { return };
         let whole = track.entity().try_cloned::<&Laid>().map_or(0.0, |l| l.w);
-        let busy = self.focused_chat().is_some_and(|(_, _, sid)| self.chats.borrow().get(&sid).is_some_and(|t| t.busy));
+        let since = self.focused_chat().and_then(|(_, _, sid)| self.chats.borrow().get(&sid).filter(|t| t.busy).map(|t| t.turn_since));
+        let busy = since.is_some() && whole >= 1.0;
         let still = harness_native_api::reduced(w);
-        let pad = if !busy || whole < 1.0 {
+        // How far through the estimate the turn is, while it has not outrun it; and how long is left.
+        let run = since.flatten().map(|from| model::now_ms().saturating_sub(from));
+        let toward = run.zip(self.turn_estimate()).filter(|(run, est)| run < est);
+        let mut left = String::new();
+        let pad = if !busy {
             Padding { l: whole, r: 0.0, t: 0.0, b: 0.0 }
+        } else if let Some((run, est)) = toward {
+            let mins = (est - run).div_ceil(60_000);
+            left = if est - run < 45_000 { "under a minute".to_owned() } else { format!("about {mins} min") };
+            Padding { l: 0.0, r: (whole * (1.0 - run as f32 / est as f32)).max(0.0), t: 0.0, b: 0.0 }
         } else if still {
             Padding::default()
         } else {
@@ -1778,12 +1806,18 @@ impl App {
             let len = whole * share;
             let x0 = -len + (whole + len) * eased;
             let (a, z) = (x0.max(0.0), (x0 + len).min(whole));
-            Padding { l: a.round(), r: (whole - z).max(0.0).round(), t: 0.0, b: 0.0 }
+            Padding { l: a, r: (whole - z).max(0.0), t: 0.0, b: 0.0 }
         };
         if track.entity().try_cloned::<&Padding>() != Some(pad) {
             track.set(pad);
         }
-        self.work_live = busy && !still && whole >= 1.0;
+        if let Some(eta) = bar.part("foot").and_then(|f| f.part("eta")) {
+            eta.text(&left);
+        }
+        // It moves: every frame the display gives (a sweep at a calm rate steps visibly).
+        if busy && !(still && toward.is_none()) {
+            self.poke_why("work bar");
+        }
     }
 
     /// The agent kind cmd+N starts a chat of: the one last used (here, else native.json `chat_kind`), else the picker's
@@ -2105,7 +2139,6 @@ impl App {
         crate::look::breathing(self.world.world_ref())
             || paint.shimmering
             || paint.blocks_live
-            || self.work_live
             || matches!(paint.kip_wake, harness_native_render::kips::Wake::Calm(_))
     }
 
