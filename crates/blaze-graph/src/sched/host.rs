@@ -1126,15 +1126,34 @@ static EVENTS: crate::sync::atomic::AtomicU64 = crate::sync::atomic::AtomicU64::
 impl Event {
     #[expect(clippy::new_without_default, reason = "each one claims a key in the graph")]
     pub fn new() -> Event {
+        let key = Event::fresh_key();
+        let sched = Scheduler::new(1);
+        assert!(sched.lock().claim(key, None), "event key {key:?} is new");
+        Event { key, sched }
+    }
+
+    /// A key no event has had.
+    fn fresh_key() -> Key {
         let mut key = [0u8; 32];
         key[..8].copy_from_slice(
             &EVENTS.fetch_add(1, crate::sync::atomic::Ordering::Relaxed).to_le_bytes(),
         );
         key[8..].copy_from_slice(b"an event, of sched::host");
-        let key = Key(key);
-        let sched = Scheduler::new(1);
-        assert!(sched.lock().claim(key, None), "event key {key:?} is new");
-        Event { key, sched }
+        Key(key)
+    }
+
+    /// Fires it, ending every wait on it as [`Event::fire`] does, and arms it again under a
+    /// fresh key in the scheduler it has: a waiter taken from [`Event::waiter`] before waits for
+    /// this fire, one taken after for the next. One event made per slot of a table of loads (the
+    /// store's pool's, docs/v2/plan/design/store-pool.md), each load's waiters on that load
+    /// alone, claims no scheduler per load.
+    pub fn rearm(&mut self) {
+        let next = Event::fresh_key();
+        let mut g = self.sched.lock();
+        g.world.key_done(self.key);
+        dispatch(&mut g, None);
+        assert!(g.claim(next, None), "event key {next:?} is new");
+        self.key = next;
     }
 
     pub fn waiter(&self) -> EventWait {

@@ -93,9 +93,9 @@ the measurement in section 7.
 Size of the reservation: 4 TiB by default, which is 4096 windows. The store's open checks it
 against the head (live packs plus externals plus the two index slots, with room to double). A store
 that needs more stops, with an error that names the store, its live files and the reservation
-(rule `no-fallback`). Whether macOS grants a reservation that large to a user process is an
-open question for the first lane to measure. The fallback-free answer, if it does not, is a smaller
-default and the same error.
+(rule `no-fallback`). macOS grants a reservation that large to a user process (decided below: blaze
+already reserves thousands of GiB there), and lane 1's reservation test keeps it so; were it ever
+refused, the fallback-free answer is a smaller default and the same error.
 
 ### The page state word
 
@@ -295,8 +295,7 @@ The store does the same per **block**:
 - BLAKE3 stays once per record per process, under its `Flag::Verified` bit (`crates/blaze-cas/src/flags.rs`). A reload of bytes that matched
   their hash before, and match their block CRCs now, is the same bytes for any change that is not
   deliberate. Deliberate changes are kept out by the store directory being the user's alone
-  (`Effect::Private`). Whether that is enough, or every reload should hash again, is an open
-  question.
+  (`Effect::Private`). That is enough (decided below): a reload does not hash again.
 
 The sidecar changes the store's format. `FORMAT` goes from 3 to 4, and a store of format 3 refuses
 to open, naming both, as every change of format does (docs/v2-store.md, "Opening"). There is no
@@ -737,6 +736,24 @@ it touches concurrent or durable code. Lanes 1 and 2 can run side by side. The r
      short reads, failures, and torn `WriteFrom` on a crash.
    - The drivers' differential tests (`crates/blaze-core/src/tests.rs`) cover the new effects.
      `sched::host::Event::rearm` lands here too.
+   - Built on branch pool-effects-1109 (`crates/blaze-core/src/spans.rs`). The asker says how
+     with two fields: `cache: Cache` (`Kept` or `Bypassed`; bypassing takes an offset, address
+     and length of whole `DIRECT_ALIGN` = 4 KiB blocks on every driver, `Sim` too, and a file
+     system that cannot bypass fails, naming the file) and, on a read, `priority: Priority`
+     (`Demand` or `Idle`; Windows refuses `Idle`, having no IO class per read). A
+     `WriteFrom` completes with `Done::Written`. A read's span past what it read holds
+     anything (a read around the cache writes whole blocks), so the loader zeroes it, as
+     section 4 says. io_uring keeps a positional descriptor per file (never `O_APPEND`, which
+     on Linux turns a positional write into an append) and reads into the span's address;
+     kqueue's and IOCP's file threads `pread` and `pwrite` through `threads::run`, opening per
+     effect for now. A ring that fails with one in flight fails it with `ABANDONED_SPAN`: the
+     kernel may still write the span, so the pool never uses that page again. `Sim` scribbles a
+     read's span as it is submitted, takes a write's bytes as it completes, lands any of a failed
+     or in-flight write's 512-byte sectors, tears unsynced writes from memory by sector at a
+     crash, and has `hold_reads`, `fail_reads`, `short_reads` and `rot`. `Memory` is a
+     registered buffer for tests. `crates/blaze-core/src/sim/pages.rs` is a Hegel DST of a
+     pool-shaped page store on them, with planted bugs 4 to 8 of section 7 in miniature: the
+     scaffolding lane 3's DST grows from.
 3. **blaze-cas: the pool core and its DST.**
    - `pool.rs` (`Pool`, `Word`, `Windows`, `Run`, `PinSet`, pins and optimistic reads).
    - `pool/loads.rs`, `pool/evict.rs` and the driver `pool/drive.rs`.
@@ -801,18 +818,23 @@ Superseded by this design:
 - memory-pool.md section 7's droppable arenas and `memory.reclaim` for store-backed caches (section 4).
 - memory-pool.md section 3's "link inputs ... (mmapped)": link inputs move onto the pool in lane 7.
 
+## Decided
+
+Andrew's answers, 2026-11-09:
+
+- **Re-verification.** A CRC32C per 4 KiB block on every load is enough; BLAKE3 stays once per
+  record per process (section 2).
+- **The format bump.** Format 4 refuses stores of format 3 with no migration; the store is
+  rebuilt.
+- **The macOS reservation.** blaze already reserves thousands of GiB on macOS (its memory line
+  showed 4913 GiB reserved), so the 4 TiB reservation is assumed to be granted; lane 1 keeps the
+  reservation test.
+- **The image.** The daemon image stays mapped for now, the one exception besides compiled wasm
+  modules (`Kind::Machine`). Moving it onto the pool (lane 10) comes after, measured.
+
 ## Open questions
 
-1. **Re-verification.** Is a CRC per block on every load, plus BLAKE3 once per record per process,
-   enough? Or should every reload hash again (BLAKE3 at about 5 GB/s per core on a miss path of 50
-   to 100 \u00B5s per 64 KiB)?
-2. **One page size.** Is 64 KiB right, or should files of their own (large objects) get 2 MiB pages?
+1. **One page size.** Is 64 KiB right, or should files of their own (large objects) get 2 MiB pages?
    Lane 5's measurement decides.
-3. **The format bump.** Format 4 refuses existing stores, which are then rebuilt, with no migration.
-   Is that acceptable for the release train?
-4. **The macOS reservation.** Does macOS give a user process 4 TiB of reserved range? If not, what is
-   the smaller default? Lane 1 finds out.
-5. **The loader thread, or rings per worker.** Start with the loader thread, and move submission onto
+2. **The loader thread, or rings per worker.** Start with the loader thread, and move submission onto
    the workers only if the hand-off shows in the spans?
-6. **The image.** Move it onto the pool (lane 10), or keep it mapped as the one exception besides
-   `Kind::Machine`?
