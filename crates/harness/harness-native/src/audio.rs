@@ -1,50 +1,67 @@
-//! The app's sound: a short cue as an agent's step changes and a quiet music that follows what it is doing, mixed live
-//! to the default output.
+//! The app's sound: a short cue as an agent's step changes and music that follows what is going on, mixed live to the
+//! default output.
 //!
-//! What plays is the scene's (scene/widgets/sound.flecs, `hn.sound`): each cue a few `Sound`s (the voices
-//! harness-native-blaze synthesises: a bell, a mallet, a click, a thud, a whoosh), each theme a voice, a tempo and the
-//! degrees it plays over one key. Every theme is in that key, so moving from one to the next is only a change of
-//! register, pace and instrument: the notes still ringing belong to both.
-//!
-//! - [`start`] opens the output (an AudioQueue: AudioToolbox's, linked here, no crate) and renders every cue and every
-//!   theme's notes once, on a thread of its own, each through the soundtrack's room (its reverb).
-//! - [`step`] says the step a running turn is on; a new one plays its cue. [`working`], called each frame, keeps the
-//!   theme of that step playing while the chat in front works and plays `done` when it stops.
-//! - The mixer runs in the queue's callback: it starts the theme's notes itself (a walk over its degrees, a few note
-//!   lengths), so the music keeps time whatever the window draws. With nothing sounding for a few seconds the queue
-//!   pauses, and the output device rests.
+//! - **Cues** are the scene's (scene/widgets/sound.flecs, `hn.sound.cue`): each a few `Sound`s in the voices
+//!   harness-native-blaze synthesises, rendered once on a thread of their own through its room.
+//! - **Music** is the band's ([`crate::music`]): composed and synthesised live in the callback, in the mood the scene
+//!   names (`hn.sound.mood`: calm, flow, drive, battle). [`scene`], called each frame, picks the mood from what the
+//!   agents are doing and how many are at it; the band glides there.
+//! - [`start`] opens the output (an AudioQueue: AudioToolbox's, linked here, no crate). With nothing sounding for a few
+//!   seconds the queue pauses, and the output device rests.
 //!
 //! Nothing here runs unless [`start`] did: an offscreen shot and the tests make no sound.
+use crate::music::{self, Band};
 use harness_native_blaze::sound::{Note, soundtrack};
 use harness_native_flecs::prelude::*;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
-/// A theme of `hn.sound.theme`: a note about every `every` seconds, from `degrees` (semitones over the key, a list in
-/// words: `"0 7 12 16"`). Its voice, how long a note rings and its level are its `Sound`, `Lasts` and `Gain`.
+/// A mood of `hn.sound.mood`, as the scene writes it ([`music::Mood`]): `scale`, `night` and `chords` are lists in
+/// words (`"0 2 4 7 9"`).
 #[derive(Component, Clone, Debug, Default, PartialEq)]
-pub struct Theme {
-    pub every: f32,
-    pub degrees: ScriptString,
+pub struct Mood {
+    pub tempo: f32,
+    pub scale: ScriptString,
+    pub night: ScriptString,
+    pub chords: ScriptString,
+    pub pad: f32,
+    pub bass: f32,
+    pub arp: f32,
+    pub lead: f32,
+    pub bell: f32,
+    pub drums: f32,
 }
 
-const SR: u32 = 48_000;
+impl Mood {
+    /// The mood as the band plays it.
+    ///
+    /// # Errors
+    /// A list that is not numbers, an empty scale or no chords, a tempo not over 0: named as `at`'s.
+    pub fn read(&self, at: &str) -> Result<music::Mood, String> {
+        let list = |name: &str, s: &ScriptString| {
+            s.as_str().split_whitespace().map(str::parse::<i32>).collect::<Result<Vec<_>, _>>().map_err(|e| format!("{at}: Mood {name} {:?}: {e}", s.as_str()))
+        };
+        let (scale, night, chords) = (list("scale", &self.scale)?, list("night", &self.night)?, list("chords", &self.chords)?);
+        if scale.is_empty() || chords.is_empty() || self.tempo <= 0.0 {
+            return Err(format!("{at}: a Mood needs a tempo over 0, a scale and chords"));
+        }
+        Ok(music::Mood { tempo: self.tempo, scale, night, chords, pad: self.pad, bass: self.bass, arp: self.arp, lead: self.lead, bell: self.bell, drums: self.drums })
+    }
+}
+
+const SR: u32 = music::SR as u32;
 /// Frames a buffer of the queue holds (about 21 ms).
 const FRAMES: usize = 1024;
 /// Seconds of nothing sounding before the queue pauses.
 const REST: u64 = 3;
-/// Seconds a theme plays on without [`working`] saying so again (the window stopped drawing).
+/// Seconds the music plays on without [`scene`] saying so again (the window stopped drawing).
 const HOLD: u64 = 20;
+/// The moods, calmest first: [`scene`] climbs them as more is going on.
+const LADDER: [&str; 4] = ["calm", "flow", "drive", "battle"];
 
 type Buf = Arc<[[f32; 2]]>;
-
-/// A theme as the mixer plays it: its notes, low to high, and the seconds between them.
-struct Music {
-    every: f32,
-    notes: Vec<Buf>,
-}
 
 struct Playing {
     buf: Buf,
@@ -53,36 +70,28 @@ struct Playing {
 
 struct Mixer {
     level: f32,
+    /// The music's level under the master.
+    music: f32,
     playing: Vec<Playing>,
-    music: Option<Arc<Music>>,
-    /// The frame the theme stops at unless it is asked for again.
+    band: Band,
+    /// The frame the music fades at unless it is asked for again.
     until: u64,
     clock: u64,
-    /// The frame the theme's next note starts at, the note it last played and its walk's state.
-    next: u64,
-    at: usize,
-    rng: u64,
     idle: u64,
     paused: bool,
 }
 
 impl Mixer {
     fn render(&mut self, out: &mut [[f32; 2]]) {
-        if let Some(mu) = self.music.clone() {
-            if self.clock >= self.until {
-                self.music = None;
-            } else if self.clock >= self.next && !mu.notes.is_empty() {
-                self.rng ^= self.rng << 13;
-                self.rng ^= self.rng >> 7;
-                self.rng ^= self.rng << 17;
-                let r = (self.rng >> 24) as usize;
-                // A walk: a step or two up or down the theme's notes, so it wanders and never leaps.
-                let by = [-2i64, -1, -1, 1, 1, 2][r % 6];
-                self.at = (self.at as i64 + by).rem_euclid(mu.notes.len() as i64) as usize;
-                self.playing.push(Playing { buf: mu.notes[self.at].clone(), at: 0 }); // alloc: a handful sounding at once
-                let beats = [1.0f32, 1.0, 0.5, 1.5, 2.0][(r >> 8) % 5];
-                self.next = self.clock + (mu.every * beats * SR as f32) as u64;
-            }
+        if self.clock >= self.until {
+            self.band.set(None, false);
+        }
+        let mut band = [[0.0f32; 2]; FRAMES];
+        let n = out.len().min(FRAMES);
+        self.band.render(&mut band[..n]);
+        for (o, b) in out.iter_mut().zip(&band[..n]) {
+            o[0] += b[0] * self.music * self.level;
+            o[1] += b[1] * self.music * self.level;
         }
         for p in &mut self.playing {
             for (o, s) in out.iter_mut().zip(&p.buf[p.at..]) {
@@ -95,22 +104,15 @@ impl Mixer {
         for o in out.iter_mut() {
             *o = o.map(f32::tanh);
         }
-        self.idle = if self.playing.is_empty() && self.music.is_none() { self.idle + out.len() as u64 } else { 0 };
+        self.idle = if self.playing.is_empty() && !self.band.playing() { self.idle + out.len() as u64 } else { 0 };
         self.clock += out.len() as u64;
     }
 }
 
-/// What was rendered: each cue's sound and each theme's music, by name.
-#[derive(Default)]
-struct Lib {
-    cues: HashMap<String, Buf>,
-    themes: HashMap<String, Arc<Music>>,
-}
-
 static MIXER: OnceLock<Mutex<Mixer>> = OnceLock::new();
-static LIB: OnceLock<Mutex<Lib>> = OnceLock::new();
+static CUES: OnceLock<Mutex<HashMap<String, Buf>>> = OnceLock::new();
+static MOODS: OnceLock<HashMap<String, music::Mood>> = OnceLock::new();
 static QUEUE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
-static MUSIC: AtomicBool = AtomicBool::new(true);
 /// The step the running turn is on, and whether the chat in front was working last frame.
 static NOW: Mutex<(String, bool)> = Mutex::new((String::new(), false));
 
@@ -183,24 +185,21 @@ fn render(notes: &[Note], gain: f32, seed: u64) -> Buf {
     soundtrack(SR, seconds, None, &[], notes, seed).into_iter().map(|f| f.map(|s| s * gain)).collect()
 }
 
-/// A cue of the scene: its name, its level and its notes. A theme: its name, its seconds between notes, its level and
-/// its notes, low to high (one a degree).
+/// A cue of the scene: its name, its level and its notes.
 pub struct Cue(pub String, pub f32, pub Vec<Note>);
-pub struct Tune(pub String, pub f32, pub f32, pub Vec<Note>);
 
-/// Open the output at `level` (the scene's master) and render `cues` and `themes` on a thread of their own; `music`:
-/// whether themes play at all.
+/// Open the output at `level` (the scene's master) with the music at `music` under it (0: none), render `cues` on a
+/// thread of their own, and keep `moods` for [`scene`].
 ///
 /// # Errors
 /// The system refused the queue or a buffer (its status, named).
-pub fn start(level: f32, music: bool, cues: Vec<Cue>, themes: Vec<Tune>) -> Result<(), String> {
+pub fn start(level: f32, music: f32, cues: Vec<Cue>, moods: HashMap<String, music::Mood>) -> Result<(), String> {
     if MIXER.get().is_some() {
         return Ok(());
     }
-    MUSIC.store(music, Ordering::Relaxed);
-    let _ = LIB.set(Mutex::new(Lib::default()));
-    let mixer = Mixer { level, playing: Vec::new(), music: None, until: 0, clock: 0, next: 0, at: 0, rng: 0x9e37_79b9_7f4a_7c15, idle: 0, paused: false };
-    let _ = MIXER.set(Mutex::new(mixer));
+    let _ = CUES.set(Mutex::new(HashMap::new()));
+    let _ = MOODS.set(moods);
+    let _ = MIXER.set(Mutex::new(Mixer { level, music, playing: Vec::new(), band: Band::default(), until: 0, clock: 0, idle: 0, paused: false }));
     // 32-bit float, interleaved stereo ('lpcm'; float | packed).
     let format = Format { sample_rate: f64::from(SR), format_id: 0x6C70_636D, format_flags: 1 | 8, bytes_per_packet: 8, frames_per_packet: 1, bytes_per_frame: 8, channels_per_frame: 2, bits_per_channel: 32, reserved: 0 };
     let mut queue = std::ptr::null_mut();
@@ -226,17 +225,10 @@ pub fn start(level: f32, music: bool, cues: Vec<Cue>, themes: Vec<Tune>) -> Resu
     std::thread::Builder::new()
         .name("harness-sound".to_owned())
         .spawn(move || {
-            let lib = || LIB.get().map(|l| l.lock().unwrap_or_else(PoisonError::into_inner));
             for (i, Cue(name, gain, notes)) in cues.into_iter().enumerate() {
                 let buf = render(&notes, gain, 7 + i as u64);
-                if let Some(mut l) = lib() {
-                    l.cues.insert(name, buf); // alloc: the library, kept for the process
-                }
-            }
-            for (i, Tune(name, every, gain, notes)) in themes.into_iter().enumerate() {
-                let notes = notes.iter().enumerate().map(|(k, n)| render(std::slice::from_ref(n), gain, 101 + (i * 16 + k) as u64)).collect();
-                if let Some(mut l) = lib() {
-                    l.themes.insert(name, Arc::new(Music { every, notes })); // alloc: the library, kept for the process
+                if let Some(l) = CUES.get() {
+                    l.lock().unwrap_or_else(PoisonError::into_inner).insert(name, buf); // alloc: the library, kept for the process
                 }
             }
             // Everything is rendered: one bell says the sound is ready.
@@ -253,7 +245,7 @@ fn with_mixer(f: impl FnOnce(&mut Mixer)) {
     let wake = {
         let mut m = m.lock().unwrap_or_else(PoisonError::into_inner);
         f(&mut m);
-        let wake = m.paused && !queue.is_null() && (!m.playing.is_empty() || m.music.is_some());
+        let wake = m.paused && !queue.is_null() && (!m.playing.is_empty() || m.band.playing());
         if wake {
             m.paused = false;
             m.idle = 0;
@@ -269,7 +261,7 @@ fn with_mixer(f: impl FnOnce(&mut Mixer)) {
 
 /// Play cue `name` (nothing before [`start`], or while it is still being rendered).
 pub fn cue(name: &str) {
-    let Some(buf) = LIB.get().and_then(|l| l.lock().unwrap_or_else(PoisonError::into_inner).cues.get(name).cloned()) else { return };
+    let Some(buf) = CUES.get().and_then(|l| l.lock().unwrap_or_else(PoisonError::into_inner).get(name).cloned()) else { return };
     with_mixer(|m| m.playing.push(Playing { buf, at: 0 })); // alloc: a handful sounding at once
 }
 
@@ -287,68 +279,53 @@ pub fn step(kind: &str) {
     }
 }
 
-/// Each frame: whether the chat in front is working. While it is, the theme of its step plays; when it stops, the
-/// music rings out and `done` plays.
-pub fn working(busy: bool) {
+/// How far up the [`LADDER`] the music goes: by the step the chat in front is on (thinking, reading and waiting are
+/// calm; editing, searching, querying and fetching flow; a command, a build or a new agent drives), a rung more with
+/// three agents at work at once and another with six.
+fn rung(item: &str, agents: usize) -> usize {
+    let by_step = match item {
+        "edit" | "search" | "sql" | "net" => 1,
+        "exec" | "build" | "spawn" => 2,
+        _ => 0,
+    };
+    (by_step + usize::from(agents >= 3) + usize::from(agents >= 6)).min(LADDER.len() - 1)
+}
+
+/// Each frame: how many agents are at work, whether the chat in front is one of them, and whether it is night. While
+/// any works the music plays in the mood that fits ([`rung`]); when the chat in front stops, `done` rings; with none at
+/// work the music fades out.
+pub fn scene(agents: usize, front: bool, night: bool) {
     if MIXER.get().is_none() {
         return;
     }
     let mut now = NOW.lock().unwrap_or_else(PoisonError::into_inner);
-    let (was, kind) = (now.1, now.0.clone());
-    now.1 = busy;
-    if !busy {
+    let (was, item) = (now.1, now.0.clone());
+    now.1 = front;
+    if !front {
         now.0.clear();
     }
     drop(now);
-    if busy && MUSIC.load(Ordering::Relaxed) {
-        let name = if kind.is_empty() { "think" } else { kind.as_str() };
-        let theme = LIB.get().and_then(|l| l.lock().unwrap_or_else(PoisonError::into_inner).themes.get(name).cloned());
-        with_mixer(|m| {
-            if let Some(t) = theme
-                && !m.music.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, &t))
-            {
-                // The next theme takes over at the beat the last one would have played.
-                m.at = m.at.min(t.notes.len().saturating_sub(1));
-                m.music = Some(t);
-            }
-            m.until = m.clock + HOLD * u64::from(SR);
-        });
-    } else if was && !busy {
-        with_mixer(|m| m.music = None);
+    if was && !front {
         cue("done");
     }
+    let mood = (agents > 0).then(|| MOODS.get().and_then(|m| m.get(LADDER[rung(&item, agents)]))).flatten();
+    with_mixer(|m| {
+        m.band.set(mood, night);
+        if mood.is_some() {
+            m.until = m.clock + HOLD * u64::from(SR);
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_native_blaze::sound::Voice;
 
-    /// A theme's notes start on their own in the mixer, a new one about every `every` seconds, the mix stays under
-    /// full scale, and once the theme is let go and its notes have rung out the mixer counts itself idle.
+    /// More going on is a higher rung, never past the top.
     #[test]
-    fn a_theme_plays_itself_and_rings_out() {
-        let note = |hz: f32| render(&[Note { voice: Voice::Mallet, at: 0.0, dur: 1.0, freq: hz, amp: 0.05, pan: 0.0, sweep: 0.0 }], 0.05, 1);
-        let music = Arc::new(Music { every: 0.5, notes: vec![note(220.0), note(330.0), note(440.0)] });
-        assert!(music.notes[0].iter().flatten().any(|s| s.abs() > 0.001), "a rendered note is not silent");
-        let mut m = Mixer { level: 0.5, playing: Vec::new(), music: Some(music), until: 10 * u64::from(SR), clock: 0, next: 0, at: 0, rng: 7, idle: 0, paused: false };
-        let (mut peak, mut started) = (0.0f32, 0usize);
-        let mut out = [[0.0f32; 2]; FRAMES];
-        for _ in 0..(4 * SR as usize / FRAMES) {
-            let before = m.playing.len();
-            out.fill([0.0; 2]);
-            m.render(&mut out);
-            started += usize::from(m.playing.len() > before);
-            peak = out.iter().flatten().fold(peak, |p, s| p.max(s.abs()));
-        }
-        assert!((3..=16).contains(&started), "{started} notes started in 4 s at one about every 0.5 s");
-        assert!(peak > 0.0005 && peak < 0.5, "peak {peak}");
-        m.music = None;
-        for _ in 0..(8 * SR as usize / FRAMES) {
-            out.fill([0.0; 2]);
-            m.render(&mut out);
-        }
-        assert!(m.playing.is_empty() && m.idle > u64::from(SR), "rung out and idle");
+    fn the_mood_climbs_with_the_work() {
+        assert_eq!([rung("think", 1), rung("edit", 1), rung("exec", 1), rung("exec", 3), rung("exec", 9)], [0, 1, 2, 3, 3]);
+        assert_eq!(rung("", 4), 1);
     }
 }
 
@@ -356,24 +333,21 @@ mod tests {
 mod live {
     use super::*;
     use harness_native_blaze::sound::Voice;
-    /// By hand (`--ignored`): opens the real output and plays one cue.
+    /// By hand (`--ignored`): opens the real output, plays one cue, then the band for a few seconds.
     #[test]
     #[ignore]
     fn plays_out_loud() {
         let n = |at: f32, hz: f32| Note { voice: Voice::Mallet, at, dur: 1.0, freq: hz, amp: 0.05, pan: 0.0, sweep: 0.0 };
-        start(0.5, true, vec![Cue("done".into(), 0.4, vec![n(0.0, 440.0), n(0.15, 554.37), n(0.3, 659.25)])], Vec::new()).unwrap();
-        for _ in 0..50 {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            if LIB.get().unwrap().lock().unwrap().cues.contains_key("done") { break; }
-        }
+        let flow = music::Mood { tempo: 84.0, scale: vec![0, 2, 4, 7, 9], night: vec![], chords: vec![0, 3, 2, 4], pad: 0.45, bass: 0.4, arp: 0.45, lead: 0.4, bell: 0.15, drums: 0.0 };
+        start(1.0, 0.6, vec![Cue("done".into(), 0.3, vec![n(0.0, 440.0), n(0.15, 554.37), n(0.3, 659.25)])], HashMap::from([("flow".to_owned(), flow)])).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1500));
         cue("done");
-        let m = MIXER.get().unwrap();
-        {
-            let g = m.lock().unwrap();
-            println!("after cue: playing {} paused {}", g.playing.len(), g.paused);
+        for _ in 0..80 {
+            scene(1, true, false);
+            step("edit");
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        std::thread::sleep(std::time::Duration::from_millis(2500));
-        let g = m.lock().unwrap();
-        println!("later: clock {} playing {} paused {}", g.clock, g.playing.len(), g.paused);
+        let g = MIXER.get().unwrap().lock().unwrap();
+        println!("clock {} paused {} band {}", g.clock, g.paused, g.band.playing());
     }
 }

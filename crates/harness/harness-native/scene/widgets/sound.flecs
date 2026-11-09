@@ -1,14 +1,10 @@
-// The app's sound (src/audio.rs): a soft cue as an agent's step changes and a slow, quiet music that follows what it
-// does: bells and wooden bars, long tails and long silences, meant to be peaceful to work beside. Data
-// only: each cue a few Sounds (harness-native-blaze's voices: Bell, Mallet, Bass, Click, Thud, Whoosh), each with its
-// Onset, Pitch, Lasts, Gain and Pan; each theme a voice (its Sound, Lasts and Gain) and a Theme: a note about every
-// `every` seconds from `degrees`, semitones over the key. Everything is in one key (A, its major pentatonic: 0 2 4 7 9
-// and their octaves), so one theme hands over to the next with nothing to resolve: the notes still ringing belong to
-// both. A cue's or a theme's own Gain is how loud it plays; `hn.sound`'s is the master. native.json `sound: false`
-// turns it all off, `music: false` the themes.
-//
-// The names are the step items a running line shows (harness-native-render block.rs): exec read edit search net build
-// spawn wait sql think; and the cues `ready` (the app is up) and `done` (the turn ended).
+// The app's sound (src/audio.rs, src/music.rs). Data only.
+// - cue: a soft sound as an agent's step changes, each a few Sounds (harness-native-blaze's voices: Bell, Mallet, Bass,
+//   Click, Thud, Whoosh) with its Onset, Pitch, Lasts, Gain and Pan; a cue's own Gain is how loud it plays. The names
+//   are the step items a running line shows (harness-native-render block.rs: exec read edit search net build spawn wait
+//   sql think), `ready` (the app is up) and `done` (the turn ended).
+// - mood: the music, below.
+// `hn.sound`'s Gain is the master. native.json `sound: false` turns it all off, `music: false` the music.
 
 @tree ChildOf
 hn {
@@ -93,19 +89,21 @@ hn {
       }
     }
 
-    // Slow and sparse, a tea house at the edge of hearing: a bell or a soft wooden bar every few seconds, long tails,
-    // long silences. A busier step is a little nearer and a little quicker, never fast.
-    theme {
-      think { Theme: {every: 4.5, degrees: "0 7 12 16 19"}; Sound: {voice: Bell}; Lasts: {dur: 5}; Gain: {amp: 0.12} }
-      exec { Theme: {every: 2.2, degrees: "0 4 7 12"}; Sound: {voice: Mallet}; Lasts: {dur: 2.4}; Gain: {amp: 0.16} }
-      read { Theme: {every: 3, degrees: "4 7 9 12 16"}; Sound: {voice: Mallet}; Lasts: {dur: 3}; Gain: {amp: 0.14} }
-      edit { Theme: {every: 2.4, degrees: "7 9 12 14 16"}; Sound: {voice: Mallet}; Lasts: {dur: 2.4}; Gain: {amp: 0.16} }
-      search { Theme: {every: 2.8, degrees: "0 2 4 7 9"}; Sound: {voice: Mallet}; Lasts: {dur: 2.6}; Gain: {amp: 0.14} }
-      net { Theme: {every: 3.6, degrees: "12 14 16 19 21"}; Sound: {voice: Bell}; Lasts: {dur: 4.5}; Gain: {amp: 0.11} }
-      build { Theme: {every: 2, degrees: "-12 -5 0 4 7"}; Sound: {voice: Mallet}; Lasts: {dur: 2.4}; Gain: {amp: 0.18} }
-      spawn { Theme: {every: 2.2, degrees: "0 7 12 19 24"}; Sound: {voice: Mallet}; Lasts: {dur: 2.4}; Gain: {amp: 0.16} }
-      wait { Theme: {every: 6, degrees: "0 7"}; Sound: {voice: Bell}; Lasts: {dur: 6}; Gain: {amp: 0.10} }
-      sql { Theme: {every: 2.8, degrees: "-5 0 4 7 9"}; Sound: {voice: Mallet}; Lasts: {dur: 2.6}; Gain: {amp: 0.14} }
+    // The music (src/music.rs): a band that plays itself, in the mood that fits what is going on (src/audio.rs `scene`
+    // climbs these, calmest first, as the step in front gets busier and more agents work at once). A mood is a tempo,
+    // a scale by day and one by night, a chord a bar (steps of the scale) and how loud each layer plays; the band glides
+    // from one to the next over a bar or two and changes scale on the bar line. Its Gain is the music's level under the
+    // master.
+    mood {
+      Gain: {amp: 0.55}
+      // Thinking, reading, waiting: a pad, a slow plucked line, far bells. Tea.
+      calm { Mood: {tempo: 60, scale: "0 2 4 7 9", night: "0 2 3 7 8", chords: "0 2 3 0", pad: 0.55, bass: 0, arp: 0, lead: 0.32, bell: 0.3, drums: 0} }
+      // Editing, searching, fetching: a bass comes in under it and the chord starts to move.
+      flow { Mood: {tempo: 80, scale: "0 2 4 7 9", night: "0 2 3 7 8", chords: "0 3 2 4", pad: 0.45, bass: 0.4, arp: 0.42, lead: 0.4, bell: 0.15, drums: 0} }
+      // A command, a build, a new agent: quicker, the drums in.
+      drive { Mood: {tempo: 104, scale: "0 2 4 7 9", night: "0 2 3 7 8", chords: "0 0 3 4", pad: 0.35, bass: 0.6, arp: 0.7, lead: 0.45, bell: 0.08, drums: 0.5} }
+      // Many agents at once: the minor scale, fast, everything up.
+      battle { Mood: {tempo: 132, scale: "0 3 5 7 10", night: "0 3 5 7 10", chords: "0 0 2 3", pad: 0.3, bass: 0.8, arp: 0.9, lead: 0.6, bell: 0, drums: 0.9} }
     }
   }
 }

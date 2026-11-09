@@ -77,6 +77,12 @@ impl Clock {
     }
 }
 
+/// Whether unix second `secs` is at night here (from seven in the evening to six in the morning): the music's scale.
+pub(in crate::app) fn night(secs: u64) -> bool {
+    let h = Clock::local(secs).hour;
+    !(6..19).contains(&h)
+}
+
 const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 

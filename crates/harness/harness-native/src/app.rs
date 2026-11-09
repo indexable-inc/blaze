@@ -384,7 +384,7 @@ fn scene_world() -> Result<World, String> {
     crate::keys::register(&world);
     view::register(&world);
     world.component::<chat::GenFeel>().writable();
-    world.component::<crate::audio::Theme>().writable();
+    world.component::<crate::audio::Mood>().writable();
     world.component::<chat::GenOn>();
     script::install(&world);
     let _ = world.entity_named(APP);
@@ -1738,8 +1738,8 @@ impl App {
         if !on("sound") {
             return Ok(());
         }
-        let (level, cues, themes) = scene_sound(self.world.world_ref())?;
-        crate::audio::start(level, on("music"), cues, themes)
+        let (level, music, cues, moods) = scene_sound(self.world.world_ref())?;
+        crate::audio::start(level, if on("music") { music } else { 0.0 }, cues, moods)
     }
 
     /// The agent kind cmd+N starts a chat of: the one last used (here, else native.json `chat_kind`), else the picker's
@@ -1848,7 +1848,11 @@ impl App {
         self.step_fold(dt);
         self.step_tree_scroll(dt);
         // The sound follows the chat in front (src/audio.rs; silent unless the window started it).
-        crate::audio::working(self.focused_chat().is_some_and(|(_, _, sid)| self.chats.borrow().get(&sid).is_some_and(|t| t.busy)));
+        {
+            let front = self.focused_chat().is_some_and(|(_, _, sid)| self.chats.borrow().get(&sid).is_some_and(|t| t.busy));
+            let agents = self.chats.borrow().values().filter(|t| t.busy).count();
+            crate::audio::scene(agents, front, chat::plan::night(model::now_ms() / 1000));
+        }
         self.sync_side_status();
         self.step_archive_scroll();
         self.step_chat_scroll();
@@ -2690,7 +2694,7 @@ fn set_if(v: View<'_>, fill: Fill) {
 ///
 /// # Errors
 /// A part of it is missing or malformed, named.
-fn scene_sound(w: WorldRef<'_>) -> Result<(f32, Vec<crate::audio::Cue>, Vec<crate::audio::Tune>), String> {
+fn scene_sound(w: WorldRef<'_>) -> Result<(f32, f32, Vec<crate::audio::Cue>, HashMap<String, crate::music::Mood>), String> {
     use harness_native_blaze::sound::{Note, Voice as V};
     use harness_native_ui_timeline_api::{Gain, Lasts, Onset, Pan, Pitch, Sound, Voice};
     let at = |path: &str| w.try_lookup(path).ok_or_else(|| format!("the scene has no {path} (scene/widgets/sound.flecs)"));
@@ -2719,26 +2723,21 @@ fn scene_sound(w: WorldRef<'_>) -> Result<(f32, Vec<crate::audio::Cue>, Vec<crat
         notes.sort_by(|a, b| a.at.total_cmp(&b.at));
         cues.push(crate::audio::Cue(c.name(), gain(c), notes));
     });
-    let mut themes = Vec::new(); // alloc: the scene's themes, read once
+    let mut moods = HashMap::new(); // alloc: the scene's moods, read once
     let mut bad = None;
-    at("hn::sound::theme")?.each_child(|t| {
-        let (Some(th), Some(s)) = (t.try_cloned::<&crate::audio::Theme>(), t.try_cloned::<&Sound>()) else { return };
-        let degrees: Result<Vec<f32>, _> = th.degrees.as_str().split_whitespace().map(str::parse::<f32>).collect();
-        match degrees {
-            Ok(mut d) if !d.is_empty() && th.every > 0.0 => {
-                d.sort_by(f32::total_cmp);
-                let notes = d.iter().map(|semi| Note { voice: voice(s.voice), at: 0.0, dur: lasts(t), freq: key * 2f32.powf(semi / 12.0), amp: 0.05, pan: 0.0, sweep: 0.0 }).collect();
-                themes.push(crate::audio::Tune(t.name(), th.every, gain(t), notes));
+    at("hn::sound::mood")?.each_child(|m| {
+        if let Some(mood) = m.try_cloned::<&crate::audio::Mood>() {
+            match mood.read(&m.path()) {
+                Ok(read) => _ = moods.insert(m.name(), read),
+                Err(e) => bad = Some(e),
             }
-            _ => bad = Some(format!("{}: Theme needs every > 0 and degrees as numbers in words (\"0 7 12\"), not {:?}", t.path(), th.degrees.as_str())),
         }
     });
     if let Some(e) = bad {
         return Err(e);
     }
     cues.sort_by(|a, b| a.0.cmp(&b.0));
-    themes.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok((gain(at("hn::sound")?), cues, themes))
+    Ok((gain(at("hn::sound")?), gain(at("hn::sound::mood")?), cues, moods))
 }
 
 #[cfg(test)]
@@ -2860,17 +2859,19 @@ mod tests {
         assert!((drawn(pill).y - laid(rows[2]).y).abs() > 1.0, "a selection still slides");
     }
 
-    /// The scene's sound reads whole: every step item has a cue and a theme, each with notes, and `ready` and `done` ring.
+    /// The scene's sound reads whole: every step item has a cue, `ready` and `done` ring, and every mood of the ladder is there.
     #[test]
     fn the_scenes_sound_reads() {
         let world = scene_world().unwrap_or_else(|e| panic!("{e}"));
-        let (level, cues, themes) = scene_sound(world.world_ref()).unwrap_or_else(|e| panic!("{e}"));
-        assert!(level > 0.0);
+        let (level, music, cues, moods) = scene_sound(world.world_ref()).unwrap_or_else(|e| panic!("{e}"));
+        assert!(level > 0.0 && music > 0.0);
         for item in ["exec", "read", "edit", "search", "net", "build", "spawn", "wait", "sql", "think"] {
             assert!(cues.iter().any(|c| c.0 == item && c.1 > 0.0 && !c.2.is_empty()), "no cue for {item}");
-            assert!(themes.iter().any(|t| t.0 == item && t.1 > 0.0 && t.2 > 0.0 && t.3.len() >= 2), "no theme for {item}");
         }
         assert!(["ready", "done"].iter().all(|n| cues.iter().any(|c| c.0 == *n && !c.2.is_empty())));
+        for mood in ["calm", "flow", "drive", "battle"] {
+            assert!(moods.get(mood).is_some_and(|m| m.tempo > 0.0 && !m.scale.is_empty() && !m.chords.is_empty()), "no mood {mood}");
+        }
     }
 
     /// Every scene script loads, headless (no window, Metal or daemon): the tokens, the primitives, the harness scene and
