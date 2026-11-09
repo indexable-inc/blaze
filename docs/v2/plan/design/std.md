@@ -85,6 +85,8 @@ What is about building Rust (the cargo graph, the store, codegen) stays out.
 | `quic` | QUIC as a sans-IO core: datagrams and time in, datagrams and stream events out; the driver is a `Net` datagram socket and the `Clock` | `blaze-http`'s QUIC core ([http3-sans-io](http3-sans-io.md)) |
 | `http` | sans-IO HTTP/1.1 over a `Conn`, and HTTP/3 and WebTransport over `quic` | `blaze-http` |
 | `trace` | spans and events through `Cx` | `blaze-trace` (no-tracing) |
+| `gpu` | the device behind the `Gpu` capability: buffers, launches, render targets | new, with [gpu](../../../future/gpu/plan.md) |
+| `video`, `image` | codecs as sans-IO cores; image decode and encode as functions | `harness-video`'s encoder, moved; `png` |
 | `test` | the simulation, property tests, the model checker for lock-free code, allocation counting | `blaze_core::sim`, hegel, `blaze-check`, `blaze-alloc-count` |
 | `io`, `fs`, `net`, ... | the capabilities of the sections below | new, on `blaze-core` |
 
@@ -232,6 +234,7 @@ not ambient and is never fetched from a thread-local; `main` receives the root o
 | `Sandboxes` | `io.sandboxes()` | a smaller budget | `OsSandbox`, `Vm`, `WasmSandbox`, and the `Runner` each makes (below) |
 | `Out` | `io.out()` | | standard input, output and error |
 | `Mem` | `io.mem()` | | named arenas and caches against the memory budget |
+| `Gpu` | `io.gpu()` | `only(kernels)`, a memory budget | a device: buffers, kernel launches, offscreen render targets (below) |
 
 Rules that hold for all of them:
 
@@ -446,6 +449,41 @@ This is one design for what blaze has three of today (the build-script sandbox, 
 host, `ix` VMs for lanes), and the shape of wasm-host's sandbox ops (a spec, a handle, `exec`,
 events) with capabilities as the spec.
 
+## Gpu, video and images
+
+**`Gpu` is a capability.** A program can use a graphics device only if it was handed one, like a
+socket. It is the `Device` of the GPU plan ([gpu](../../../future/gpu/plan.md)) moved under `Io`:
+
+- `io.gpu()` is `None` on a host with no device; `Gpu::cpu()` is always available and runs the
+  same kernels as host code, which is what tests and the simulation use.
+- **Running Rust on it is the GPU plan's job, not bstd's**: a `#[gpu::kernel]` function in the
+  same crate is compiled by blaze for Metal, Vulkan, CUDA and the CPU, and
+  `gpu.scope(cx, |s| s.launch(&kernel, grid, args))` is type-checked against its signature. bstd
+  supplies what that plan called the runtime crate: the device, `Buffer<T>` made in an allocator
+  the caller hands over and counted against the memory budget, the launch that goes through the
+  one wait (so it has a deadline, and host buffers stay borrowed until the device finishes), and
+  offscreen render targets.
+- Narrowing: `gpu.only(&[kernels])`, and a smaller memory budget.
+- The providers are Metal, Vulkan, CUDA and the CPU, one `Gpu` type, chosen as any provider is.
+
+**A codec is a sans-IO core.** `bstd::video::Encoder` takes frames and returns packets;
+`Decoder` the reverse; a `Muxer` takes packets and returns the bytes of a container. None of
+them takes a capability or reads a clock: frame times are data. Where the work is done is a
+provider:
+
+| provider | made from | |
+|---|---|---|
+| the platform's hardware encoder (VideoToolbox; VA-API and NVENC later) | a `Gpu` | fast, HDR; what the agent app's video tool uses today |
+| a software encoder | nothing | anywhere, including the simulation |
+
+Writing a file is the caller's: packets go to a `File` it holds. So rendering a video is
+`Gpu` renders a frame into a buffer, `Encoder` turns frames into packets, `Muxer` into bytes,
+`File` takes the bytes, and each step can be tested without the others.
+
+**Images are functions.** `bstd::image::{decode, encode}` take bytes and an allocator and return
+pixels, or the reverse, with a size limit on decode since input is untrusted. PNG first; no
+capability, no IO.
+
 ## Shared mutation
 
 One naming rule: **the plain name is safe across threads; `Local` marks the cheaper version for
@@ -602,6 +640,7 @@ Interface first, bottom last, so nothing waits on the runtime and every step lan
 | S1b | `bstd::{sync, cell}`: the table of "Shared mutation", token cells, `Freeze` as a bound, typed names (`HostPort`, `VarName`) in place of strings, and bans on the removed names | misuse tests: two live `get_mut` on one token do not compile; a static that is not `Freeze` is refused |
 | S1c | Tracing on bstd: the span in `Cx` and the scheduler's own events first; then the compile-time site table and the ring; then reflection encoders and redaction; disabled-site patching and keep-or-drop last | the emit budget holds; the ring's simulation test and the round trip pass |
 | S1d | The facade: bstd re-exports the crates of "What is in it", the interner and helper crates are merged, and the piece crates' names are banned outside bstd | `blaze check` with the bans on; no blaze crate outside bstd names a piece crate |
+| S1e | `bstd::image` (PNG), `bstd::video` (the encoder core, the muxer, the VideoToolbox provider moved out of `harness-video`, which then uses bstd's), and `Gpu` as a capability with the CPU provider and offscreen targets | a round trip of an image; a clip encoded from fixed frames is byte-identical twice; `harness-video` builds on it |
 | S3b | The `Frames` layout: the calling convention, the slab, unwinding, and the profiler and backtraces walking the frame chain | the differential test against `Fibers` passes |
 | S4 | The bottom: `bstd::sys` and `bstd::rt`, `blaze-core`'s drivers move in as `bstd::driver`, and bstd is `#![no_std]` | no blaze crate links Rust's `std`; C1 still passes |
 | S5 | The edition: `edition = "blaze-2026.11"` makes `std` name bstd, `fn main(io: Io)` is the entry, and the OS sandbox of a program is derived from what `main` hands out | a program of the edition that never opens the network cannot, checked by the sandbox |
