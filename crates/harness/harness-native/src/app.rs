@@ -954,17 +954,18 @@ impl App {
                     && (o.has(model::Busy::id())
                         || o.try_cloned::<&model::Object>()
                             .is_some_and(|ob| me.chats.borrow().get(&ob.id).is_some_and(|t| t.busy)));
-                // What it is doing while it works (its glyph after the title, the command or file trailing it); else how
-                // it went wrong; else the folder it works in. When it started or ended is the trailing words' tooltip.
+                // What it is doing while it works (its glyph after the title, the command or file trailing it), or how it
+                // went wrong; else nothing, the title has the row (its name mostly is its folder already). Where it works
+                // and when it started or ended are the row's tooltip.
                 let doing = if busy { o.try_cloned::<&model::Object>().and_then(|ob| me.chats.borrow().get(&ob.id).and_then(doing_of)) } else { None };
                 let when = ago(now.saturating_sub(model::when(o)));
                 let folder = o.try_cloned::<&model::Cwd>().map(|c| folder_of(c.s.as_str())).unwrap_or_default();
                 let (meta, why) = match (status, code) {
-                    ("killed", _) => ("killed".to_owned(), format!("Killed {when} ago")),
-                    (_, Some(c)) => (format!("exit {c}"), format!("Exited with code {c} {when} ago")),
-                    ("lost", _) => ("lost".to_owned(), "Lost (the daemon restarted under it)".to_owned()),
-                    ("running", _) => (doing.as_ref().map_or(folder, |d| d.detail.clone()), format!("Started {when} ago")),
-                    _ => (folder, format!("Ended {when} ago")),
+                    ("killed", _) => ("killed".to_owned(), format!("{folder} \u{b7} killed {when} ago")),
+                    (_, Some(c)) => (format!("exit {c}"), format!("{folder} \u{b7} exited with code {c} {when} ago")),
+                    ("lost", _) => ("lost".to_owned(), format!("{folder} \u{b7} lost (the daemon restarted under it)")),
+                    ("running", _) => (doing.as_ref().map_or_else(String::new, |d| d.detail.clone()), format!("{folder} \u{b7} started {when} ago")),
+                    _ => (String::new(), format!("{folder} \u{b7} ended {when} ago")),
                 };
                 let mark = done_mark(status, code, depth);
                 // Its name being renamed (chat/rename.rs): the field's words in its place, still (no breath) and alone

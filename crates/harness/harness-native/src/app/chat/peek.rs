@@ -554,8 +554,13 @@ impl App {
             super::blocks(&md, false, &mut rows);
             let mut paint = self.paint.borrow_mut();
             let mut measure = |s: &str, style: &TextStyle, md: bool| paint.width(s, style, md);
+            // In the card's type: its body size and line (hn.PeekBody's), a step under its title, for every block's words.
+            let body = view::prefab(w, "hn.PeekBody").and_then(|p| p.try_cloned::<&TextStyle>());
             view::for_each_of(v, rows.iter().enumerate().map(|(k, r)| (format!("b{k}"), r.prefab(), r)), |row, r, _| {
                 super::fill_row(row, r, &super::RowCtx::NOWHERE, &mut measure);
+                if let Some(b) = body {
+                    card_type(row.entity(), b);
+                }
             });
         }
     }
@@ -719,6 +724,18 @@ fn header(icon: ChipIcon, ink: Option<Fill>, name: String) -> (&'static str, &'s
         ChipIcon::Glyph(glyph, _) => ("site", "hn.PeekSiteGlyph", Line::Site { glyph, ink, name }),
         ChipIcon::Drawing(drawing) => ("site", "hn.PeekSiteArt", Line::Art { drawing, name }),
     }
+}
+
+/// Every words node under `e` in a card's type (`body`'s size and line, each node's own role, weight and boldness kept):
+/// the transcript's rows drawn smaller, on a card.
+fn card_type(e: EntityView<'_>, body: TextStyle) {
+    if let Some(s) = e.try_cloned::<&TextStyle>() {
+        let want = TextStyle { size: body.size, line: body.line, ..s };
+        if want != s {
+            e.set(want);
+        }
+    }
+    e.each_child(|c| card_type(c, body));
 }
 
 /// `v`'s `c`, set only when it differs.
