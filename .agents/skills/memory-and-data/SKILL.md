@@ -1,6 +1,6 @@
 ---
 name: memory-and-data
-description: "How blaze holds memory and keeps what it computes: an owner per lifetime (a task's frame, a heap of its own for a big task, the store for what outlives it), footprint as the one measure, outputs as blaze-format records written once and read in place from mapped files, persistence from one generic impl over `for const`, and caches keyed by code identity. Load before allocating in a task, adding a query result or anything persisted, touching blaze-mem, blaze-format, the store, admission, the allocator or the memory ceiling, or caching a function's results. Finding where a build's memory went is the `debugging` skill."
+description: "How blaze holds memory and keeps what it computes: an owner per lifetime (a task's frame, reset per item in a long task; the store for what outlives it), footprint as the one measure, outputs as blaze-format records written once and read in place through the store's own buffer pool (vmcache-style: reserved address range, explicit io_uring/kqueue reads, MADV_DONTNEED/MADV_FREE_REUSABLE eviction, no mmap), persistence from one generic impl over `for const`, and caches keyed by code identity. Load before allocating in a task, adding a query result or anything persisted, touching blaze-mem, blaze-format, the store, admission, the allocator or the memory ceiling, or caching a function's results. Finding where a build's memory went is the `debugging` skill."
 ---
 
 # Memory and durable data
@@ -34,11 +34,18 @@ See [docs/memory-footprint.md](../../../docs/memory-footprint.md).
 
 A value that outlives the task that made it (a query result, a compiled function, a unit's object
 code) is a blaze-format record: no pointer, position-independent, written once and read in place
-through its `Persist::Ref`. Where the store takes it, the task writes it straight into the store's
-mapped file, so its pages are file pages the kernel can drop and read back, not heap. A new
-persisted type gets `Persist` from the one generic impl over `for const` (`#[blaze::reflect]` on the
-struct, `for<F: Field<T>> F::Type: Flat`) once that lands, never a new hand-written impl; until then
-a hand-written one names the generic impl's issue. Its round-trip test is the `testing` skill's.
+through its `Persist::Ref`. Where the store takes it, the task appends it to the store's pack with
+explicit I/O (io_uring on Linux, kqueue and the read threads on macOS, through blaze-core), and
+readers reach it through the store's buffer pool: one reserved address range with a fixed slot per
+page, a page loaded by an explicit read the task yields on (never a page fault that blocks the
+worker), and evicted by blaze's one evictor with `MADV_DONTNEED` (Linux) or `MADV_FREE_REUSABLE`
+(macOS), never plain `MADV_FREE`, which the kernel still counts. Records are immutable, so no page
+is ever dirty and eviction writes nothing. The hot tier never mmaps a store file: a fault there
+blocks a worker thread, eviction and write-back are the kernel's, and a failed read is a SIGBUS. A
+new persisted type gets `Persist` from the one generic impl over `for const` (`#[blaze::reflect]` on
+the struct, `for<F: Field<T>> F::Type: Flat`) once that lands, never a new hand-written impl; until
+then a hand-written one names the generic impl's issue. Its round-trip test is the `testing`
+skill's.
 
 See [crates/blaze-format/src/lib.rs](../../../crates/blaze-format/src/lib.rs).
 
@@ -64,8 +71,8 @@ Every byte has an owner chosen by how long it lives, and what outlives a task is
 | What | Lives | Where it goes |
 |---|---|---|
 | Scratch of blaze's own code in a task | the task | the task's `Frame` (`blaze_mem::frame::task`), freed whole when the task ends |
-| Scratch of code that takes no allocator (Cranelift, std collections inside dependencies) in a big task | the task | the task's own mimalloc heap, deleted and purged when the task ends (planned; today the tag's heap) |
-| A task's output: a query result, a compiled function, object code | past the task | a blaze-format record, written straight into the store's mapped file where the store takes it |
+| A long task's scratch, item by item (a function in a codegen unit, a body in MIR) | one item | the task's frame, reset to a marker after each item, so the peak is one item's scratch |
+| A task's output: a query result, a compiled function, object code | past the task | a blaze-format record appended to the store's pack, read through the store's buffer pool |
 | Names, types, paths | the daemon | the interner's tables (`u32` IDs), regions blaze-mem owns |
 | Small, long-lived, rare | the daemon | the global heap (mimalloc), with `// alloc: <why>` |
 | Constant text | the program | a `&'static str` (`concat!`, const_format), not `format!` into a `String` |
@@ -73,14 +80,19 @@ Every byte has an owner chosen by how long it lives, and what outlives a task is
 Why the gap between footprint and live happens: memory goes back to the kernel a page at a time,
 and a page goes back only when every block on it is free. When a big unit's scratch shares pages
 (the same heap) with long-lived data, a few live blocks pin each page, and the freed scratch stays
-counted. Separating by lifetime (a frame, a heap per big task, the store) is what lets a task's
+counted. Separating by lifetime (a frame reset per item, the store) is what lets a task's
 memory leave when it ends; a release call or a purge threshold cannot undo a mixed page.
 
-Why the store's mapped files and not heap: a record written into a file mapped `MAP_SHARED` is
-the file's own bytes. Once written back its pages are clean, so the kernel drops them under
-pressure and reads them back on the next touch, without swap and without blaze's own evictor; a
-start maps the index and decodes nothing. `MAP_PRIVATE` would copy each written page into
-anonymous memory, which is heap again.
+Why a buffer pool of our own and not mmap: the store's hot tier is one reserved address range (address
+space, not memory) with a fixed slot per page, so page `n` is at `base + n * page_size`: finding it is
+arithmetic plus one state word, an evicted page comes back at the same address (record views and
+relative references stay valid), and a record spanning pages is one contiguous slice. A miss is an
+explicit read (io_uring, kqueue) the task yields on, where an mmap fault would block the worker thread;
+blaze's evictor chooses what leaves and drops it with `MADV_DONTNEED` / `MADV_FREE_REUSABLE`, which take
+it out of the footprint at once (plain `MADV_FREE` does not); a failed read is an error for one task,
+not a SIGBUS. Records are immutable, so a page is never dirty and eviction never writes. A cold start
+may still map the daemon image. Prior art: vmcache (Leis et al., SIGMOD 2023), and "Are You Sure You
+Want to Use MMAP in Your DBMS?" (CIDR 2022) for why not mmap.
 
 ## Checking it
 
@@ -98,6 +110,7 @@ anonymous memory, which is heap again.
   place); the daemon image and the store's packs read from mapped files; `for const` and
   `for<F: Field<T>>` bounds (blaze_comptime phase 2); const heap (`const_allocate`,
   `const_make_global`) in the const evaluator.
-- Planned: a heap per big task; the generic `Persist` over `for const`; codegen writing object
-  code into the mapped store; query memos as records over the store; `fn_info(&f).code_id`
+- Planned: frame markers per item in long tasks (codegen, MIR); a per-task budget on global-heap bytes;
+  the generic `Persist` over `for const`; the store's buffer pool (vmcache-style) with codegen
+  outputs and query memos on it; native code from stencils, not Cranelift; `fn_info(&f).code_id`
   answered by const eval; types from const code (`type_of!`, phase 3).

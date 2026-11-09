@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: Why a stage5 self-build's daemon reached 75.7 GiB against a 47 GiB limit on the Mac (memory the allocator kept after blaze freed it, one giant codegen unit, query storage that only grows), and the order of fixes, telemetry first.
+summary: Why a stage5 self-build's daemon reached 75.7 GiB against a 47 GiB limit on the Mac (freed memory pinned by long-lived blocks on the same heap, query storage that only grows, two measures of memory), and the fix: an owner per lifetime (frames reset per item, outputs as records in the store's own vmcache-style buffer pool), footprint as the one measure, telemetry first.
 date: 2026-11-09
 ---
 # Memory: what the stage5 self-build showed, and the fixes
@@ -85,86 +85,57 @@ enough to name the job, and the evidence was spread across three places:
 
 ## The plan
 
-Each step is one pull request, landed with `.github/scripts/land.py`. The order follows
-`slow-is-p0-traced`: the telemetry that names the cause lands before the fix it measures.
+Revised 2026-11-09 after the review with Andrew: the root cause is lifetimes mixed on one heap, so
+the fix is an owner per lifetime, not releasing kept memory after the fact. `malloc_zone_pressure_relief`
+does not reach mimalloc (blaze's global heap), and a release threshold cannot undo pages pinned by
+a few long-lived blocks; both are dropped. The rules are in the `memory-and-data` skill. Each step is
+one pull request, landed with `.github/scripts/land.py`, telemetry first (`slow-is-p0-traced`).
 
-### 1. Memory telemetry that answers without hand-written SQL
+A plain `blaze check` of blaze (2026-11-09) showed the same shape: 77.7 GiB resident, 36.7 GiB of it
+freed but kept by mimalloc, query storage 31.5 GiB, and MIR's heap peaking at 27.6 GiB, so the churn is
+in the front end too, not only codegen.
 
-- Counter rows carry `build_id`, as span rows do.
-- The area breakdown in `serve.log` becomes counter rows, one per area:
-  `area bytes{area=query|intern|frames|link|codegen|store|...}` and `area heap bytes{area}`,
-  sampled with the other counters. The log line stays and reads the same values.
-- New counters:
-  - `allocator kept bytes`, committed less live;
-  - `allocator purged bytes`, cumulative;
-  - `query storage bytes{query_kind}`.
-- Task spans name their `crate` and `unit`. This is written in the admission lane
-  (`admit-footprint-1106`, `8b252bf9fe`).
-- `unit codegen` names its crate instead of `?`. This is a separate bug: find where the unit's
-  crate name is lost.
-- `blaze explain memory [build]` prints the timeline above, the five tasks with the largest
-  peaks (with crate and unit), and the breakdown at the peak. It reads only the profile (rule
-  `ask-the-profile-first`).
-- `blaze debug profile` sends its answer in frames under the limit, so no answer has to fit in
-  one frame.
+### 1. Telemetry that names the owner
 
-**Done when:** `blaze explain memory 54` (or the same build rerun) prints the cause in one
-command: the gap, the task and the area.
+- Counter rows carry `build_id`; the area breakdown in `serve.log` becomes counter rows per tag.
+- Task spans name their `crate` and `unit` (and `unit codegen` stops saying `?`).
+- Global-heap bytes allocated per task and per call site, from the counting allocator, so the
+  question "what churns the global heap" has an answer before anything moves.
+- `blaze explain memory [build]`: the timeline, the tasks with the largest peaks, the breakdown at the
+  peak. `blaze debug profile` answers in frames under the frame limit.
 
-### 2. Give kept memory back
+### 2. One measure, one ceiling that holds
 
-This builds memory-pool.md section 7 (macOS) and memory-budget.md section 7.
+Footprint is the one number admission, the front end's release and the ceiling read (rule
+`one-memory-measure`). Test the ceiling on the release binary with `BLAZE_DAEMON_MEMORY_GB=4`.
 
-- **Release before refusing.** Before admission refuses a task, and before the ceiling stops
-  the daemon, call `malloc_zone_pressure_relief(NULL, 0)`. Then read the footprint again and
-  decide on that reading. This is written in `admit-footprint-1106`; it is a private-ish macOS
-  API, so rule `macos-private-apis` applies: a comment saying which API and why, and a test
-  that its symbol exists.
-- **Release on a high-water mark.** When `allocator kept bytes` passes a quarter of the budget,
-  the evictor's thread releases kept memory, never the loop. Its span records the bytes it
-  returned.
-- **Long term, keep churn off the global heap.** Codegen's working memory moves into a per-unit
-  frame (rule `bump-allocate`), mapped so that ending the frame returns it to the kernel
-  (`MADV_FREE_REUSABLE` on macOS, an unmap on Linux). The 13.67 GiB codegen heap then leaves
-  when the unit ends, with no allocator in between.
+### 3. Scratch on frames, reset per item
 
-**Proof:**
+- Long tasks reset their frame to a marker after each item: a function in a codegen unit, a body in
+  MIR lowering and optimization. A task's peak is one item's scratch plus its outputs.
+- What step 1 shows still churning the global heap moves onto the frame at its call site.
+- A per-task budget on global-heap bytes fails tests and the self-build, naming the task: the check
+  that holds new code to this, where `blaze::implicit_allocator` only judges call sites.
 
-- The admission lane's DST covers release-before-refusing.
-- `test-the-cause`: rerun the same tree with the release turned off, and the gap of about 47 GiB
-  returns. With the release on, the gap stays under a quarter of the footprint.
+### 4. Outputs as records in the store's buffer pool
 
-### 3. One measure, one ceiling that holds
+- `Persist` from one generic impl over `for const` (`#[blaze::reflect]`, `for<F: Field<T>> F::Type:
+  Flat`), replacing the hand-written impls (about 20,000 lines in ten `persist.rs` files).
+- The store's hot tier as a vmcache-style buffer pool: one reserved address range with a fixed slot per
+  page, misses read with explicit I/O through blaze-core (io_uring, kqueue) that the task yields on,
+  eviction by the one evictor with `MADV_DONTNEED` / `MADV_FREE_REUSABLE`. Records are immutable, so
+  eviction never writes. No mmap of store files for the hot tier (rule `outputs-are-records`).
+- Codegen outputs (`CompiledFunction`, object code) and then the query memos move onto it, written once
+  by the task that made them.
 
-- The front-end release, admission and the ceiling all read the footprint, the number the
-  kernel enforces. "blaze held" as resident memory goes away; ban its name (rule
-  `one-concept-one-home`).
-- Test the ceiling on the release binary. Start a daemon with `BLAZE_DAEMON_MEMORY_GB=4` on the
-  Mac, run a build that needs more, and expect exit 77 within one watch tick past the line.
-  Run it against 0.20261105.4 to confirm cause 5, then against the tree. If the release lacks
-  the watch, the next release must carry it; it is a ranked blocker for promoting stage 0.
+### 5. Code generation
 
-### 4. Split the giant unit
-
-This builds memory-budget.md section 4, codegen that streams.
-
-- The final binary's codegen splits into partitions, each with a predicted peak below a quarter
-  of the budget, so admission can schedule them beside other work instead of granting the whole
-  budget to one task.
-- Each partition's output streams to the store as it finishes. Nothing holds the whole binary's
-  objects in memory.
-
-**Done when:** the profile shows no task granted more than half the budget in a blaze
-self-build.
-
-### 5. Query storage that can shrink
-
-This builds memory-pool.md sections 3 and 4.
-
-- Use step 1's `query storage bytes{query_kind}` to rank which memos make up the 15 GiB.
-- Those memos move onto the pool as evictable hot entries over the store, with the one evictor
-  (memory-pool.md section 4). Eviction then reaches the memos, not just the inference and MIR
-  results.
+- Native code from stencils, not Cranelift (rule `proc-macros-on-wasm`); Cranelift's scratch is not
+  worth moving onto frames while it is on the way out.
+- LLVM (release) allocates through the system malloc, which blaze's accounting cannot see: a context
+  per unit, disposed when the unit ends, then `malloc_zone_pressure_relief` for the system zone. Routing
+  malloc to mimalloc (its macOS zone override) for accounting comes after step 1 measures how much
+  system malloc a release build uses.
 
 ## Acceptance
 

@@ -113,8 +113,9 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 46. **one-memory-measure**: Footprint, the number the kernel enforces, is the one memory measure:
     admission, the front end's release and the ceiling all decide on it. Skill: `memory-and-data`.
 47. **outputs-are-records**: What outlives its task (a query result, a compiled function, object code)
-    is a blaze-format record written once, into the store where it can be, and read in place; never
-    a heap tree kept until something serializes it. Skill: `memory-and-data`.
+    is a blaze-format record written once into the store and read in place through the store's
+    buffer pool; never a heap tree kept until something serializes it, and never an mmap of a store
+    file for the hot tier. Skill: `memory-and-data`.
 48. **cache-by-code-id**: A cache of a function's results is keyed by the function's code identity
     (`fn_info(&f).code_id`) and its arguments; nothing invalidates entries by hand. Skill:
     `memory-and-data`.
