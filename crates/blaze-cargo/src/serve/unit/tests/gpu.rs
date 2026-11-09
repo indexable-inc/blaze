@@ -350,9 +350,9 @@ fn a_gpu_dependencys_msl_is_validated_deterministic_and_read_by_its_dependent() 
     assert_eq!(read, [(path.clone(), content)], "the host read the device build's MSL");
 
     // Applied again with other bytes (an edit of the shader), the host reads those.
-    let edited = [msl, b"\n// edited\n"].concat();
+    let edited = [msl, b"\n// edited\n".as_slice()].concat();
     first.gpu_msl(SHADERS_UNIT, &edited).unwrap();
-    let content = base_db::IncludedFile::content_of(Ok(&edited));
+    let content = base_db::IncludedFile::content_of(Ok(edited.as_slice()));
     assert_eq!(host_reads(&first), [(path, content)]);
 }
 
