@@ -156,7 +156,7 @@ impl<'db, 'a> TypeFolder<DbInterner<'db>> for CanonicalInstantiator<'db, 'a> {
                 } else if let Some(&t) = self.cache.get(&t) {
                     t
                 } else {
-                    // One guard per level of the type, as deep as a program builds it (rule 17).
+                    // One guard per level of the type, as deep as a program builds it (rule 20).
                     let res = stdx::ensure_sufficient_stack(|| t.super_fold_with(self));
                     assert!(self.cache.insert(t, res));
                     res

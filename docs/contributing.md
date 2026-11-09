@@ -105,7 +105,7 @@ crates.io's `ra-ap-rustc_abi`, the same way. The fork repositories
 
 New code that is the language's semantics goes in the front end's crates: building MIR and
 the passes over it, borrow checking, const evaluation, layout, and the hashes that say what a
-function's code is made from, as salsa queries. These are what rustc keeps in `rustc_middle`,
+function's code is made from, as queries on blaze's own engine (`blaze_query::db`, derived from salsa). These are what rustc keeps in `rustc_middle`,
 `rustc_mir_transform` and `rustc_borrowck`; rust-analyzer could take them, and a query lives
 with the database it reads. Where rust-analyzer's MIR differs from rustc's, the fix goes in
 the fork's lowering or in a pass of its runtime MIR queries, and the code generator relies on
@@ -427,7 +427,7 @@ the library hashes to the id in its header, and that this id is the pinned one:
 
   The libraries themselves are committed in `crates/blaze-stencil/prebuilt/` (about 570 KB
   each), and the build also stops when what it made differs from them. If nothing the
-  generator reads changed, the output isn't deterministic, which is a bug (rule 22).
+  generator reads changed, the output isn't deterministic, which is a bug (rule 25).
 - The seed profile (`blaze-engine --no-default-features --features seed`) has no LLVM. It
   includes the committed libraries in `crates/blaze-stencil/prebuilt/`; no variable points
   elsewhere. A library whose bytes aren't the pinned ones is refused, and the error names the

@@ -11,7 +11,7 @@
 //! instance's arguments substituted and references taken off, is alloc's `Global` or std's
 //! `System`, the global heap ([`Rule::Alloc`]); every method of a `GlobalAlloc` impl is
 //! [`Rule::Alloc`]. So `Vec::new_in(frame).push(x)` reaches `<&Frame as Allocator>::allocate`,
-//! `AllocIn`, which `noalloc` allows (AGENTS.md rule 9's proof), and `Vec::new().push(x)` reaches
+//! `AllocIn`, which `noalloc` allows (AGENTS.md rule 11's proof), and `Vec::new().push(x)` reaches
 //! `<Global as Allocator>::allocate`, `Alloc`, which it refuses. By type, never by data flow; the
 //! allocator's own body is not walked.
 

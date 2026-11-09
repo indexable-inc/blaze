@@ -1790,7 +1790,7 @@ fn instance_body<'db>(
 /// The error of a body whose MIR did not build or fill: the body by its path (a closure's or
 /// coroutine's by the body it is written in), and the lowering error in words, which for a call
 /// with no function is the callee as written, where the call is and why it resolved to nothing,
-/// in the body it was met in (rule 16).
+/// in the body it was met in (rule 19).
 fn mir_failed(
     db: &Db,
     owner: MirOwner<'_>,
@@ -2459,7 +2459,7 @@ fn compile<'db>(
 /// `inlining` is what the compile may build in ([`tier::Inlining`]): the compile's `Recorder`
 /// holds it while the IR is built, and it is handed back with what was built in, which a
 /// compile at a level above 1 reads. The caller owns it, never the thread: the build waits
-/// in queries, and a fiber resumes on any thread (rule 24).
+/// in queries, and a fiber resumes on any thread (rule 27).
 #[allow(clippy::too_many_arguments)]
 fn compile_as<'db>(
     db: &'db Db,
@@ -2590,7 +2590,7 @@ fn verified(func: &ir::Function, isa: &dyn isa::TargetIsa, stage: &'static str) 
 
 /// Whether the verifier's `error` is a limit of Cranelift's own code generator rather than of
 /// the IR: a `return_call` whose callee's calling convention is one Cranelift's machine
-/// backends can't tail call from. None of blaze's backends is Cranelift's (rule 8): the
+/// backends can't tail call from. None of blaze's backends is Cranelift's (rule 10): the
 /// stencils lower a tail call under the platform's convention (blaze-stencil's
 /// `return_call_signature`) and LLVM makes it a `musttail` call; which targets take a tail call
 /// at all is [`refuse_tail_calls`]'s to say. The verifier's other rules for a tail call (the
@@ -2960,7 +2960,7 @@ fn built_in_body(
     // The callees the MIR inliner put in the body under `unit`'s settings are in it as much
     // as the ones built in: a caller that builds this body in has their code, so its walk
     // lists them as built in (`v2/refs.rs` `Walk::instance_call`) and its key holds their code
-    // (rule 18). The callee's own unit may inline none of them: `winnow`'s
+    // (rule 21). The callee's own unit may inline none of them: `winnow`'s
     // `#[inline(always)] <&str as Stream>::eof_offset`, built into an `opt-level = 3` caller,
     // has `<str>::len` and `<str>::as_bytes` in it, which at its crate's level 0 it calls.
     let built_in = built_in_of(&mut cg, Some(&*body));
@@ -3362,7 +3362,7 @@ struct Relocations<'a, 'db> {
     map: &'a MemoryMap<'db>,
     /// The type of the constant whose value this relocates, for an error to name.
     of: Ty<'db>,
-    /// Which constant it is, for an error to name (rule 16).
+    /// Which constant it is, for an error to name (rule 19).
     whose: ConstOf<'db>,
     in_static: bool,
     /// The data object of each allocation made so far, by start.
@@ -3907,7 +3907,7 @@ fn body_path(db: &Db, owner: InferBodyId<'_>) -> String {
 }
 
 /// Which constant a value [`FunctionCx::allocation_blob`] relocates is, for its errors to
-/// name by path (rule 16), not only by type.
+/// name by path (rule 19), not only by type.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ConstOf<'db> {
     /// A named constant, a static, or an anonymous constant.

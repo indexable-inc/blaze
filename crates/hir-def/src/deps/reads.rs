@@ -67,7 +67,7 @@ pub struct Reads {
     /// location of an item in one), and their keys cover only what they were given, never
     /// what their expansions read, nor whether a value verified across checkouts was
     /// retracted since; so without these an image would be served once a dependency's
-    /// expansion makes something else (rule 18). Only [`Reads::of`] (an image) has them: a
+    /// expansion makes something else (rule 21). Only [`Reads::of`] (an image) has them: a
     /// check's reads ([`super::checked_reads`]) are its own.
     deps: Vec<(u32, Vec<(Arc<[u8]>, Option<ContentId>)>)>,
     /// The crates of the closure whose `env!` or `option_env!` read `CARGO_PRIMARY_PACKAGE`

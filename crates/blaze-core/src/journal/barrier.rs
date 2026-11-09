@@ -14,14 +14,14 @@
 //! that waits asks for the read to be asked again without waiting ([`Decision::Hurry`]): such
 //! a read returns at once, at the journal's end. A read without waiting that moves no further
 //! while a flush waits short of its mark fails that flush, naming the mark and where the
-//! reader stopped: bounded (rule 15), never a loop and never a sleep.
+//! reader stopped: bounded (rule 18), never a loop and never a sleep.
 //!
 //! A journal deleted and made again has a new ID and starts over: a mark of the old one is
 //! passed once the reader has moved on (its batch telling the whole directory lost went
 //! first), and a mark of a new one the reader has not reached yet waits until it reads that one
 //! up to it.
 //!
-//! Sans-IO (rule 12): the driver tells it marks and reads and takes its decisions; it owns no
+//! Sans-IO (rule 14): the driver tells it marks and reads and takes its decisions; it owns no
 //! handle, thread or clock.
 
 use std::fmt::Write as _;

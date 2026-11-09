@@ -82,7 +82,7 @@ fn summary(n: u8) -> Summary {
 }
 
 /// A second summary under one flight key is one when equal, and refused when other: the
-/// kept one stays (rule 18).
+/// kept one stays (rule 21).
 #[test]
 fn another_summary_under_a_kept_key_is_refused() {
     let flights = Flights::new();
@@ -310,7 +310,7 @@ fn a_plan_replays_a_transcript_of_asks_and_waits() {
 }
 
 /// A function every other build lets go of is given up after [`ASKS`] asks, an error the
-/// driver names it by, never asked for without end (rule 15).
+/// driver names it by, never asked for without end (rule 18).
 #[test]
 fn a_function_let_go_of_without_end_is_given_up() {
     let mut plan = Plan::new(1);

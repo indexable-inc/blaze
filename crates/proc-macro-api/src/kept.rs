@@ -126,7 +126,7 @@ pub struct Keeping {
 }
 
 /// What a warm front end is kept by, besides its units and config: whether a value verified
-/// across checkouts that it may have been given has been retracted since (rule 18). Such a
+/// across checkouts that it may have been given has been retracted since (rule 21). Such a
 /// value is a tracked expansion and, through `hir_def::deps`, a crate's image; neither is asked
 /// again while its database is kept, so a record put later would not reach it. The store of
 /// expansions has one writer, its daemon (`blaze-cargo`'s `daemon.rs` opens it once), so every

@@ -2592,7 +2592,7 @@ impl<M: Memo> Plane<M> {
     /// blaze's own refused behind a prediction of 15.78 GB with 31 GB held and none of it
     /// granted) would fail a unit that waiting could never help, since nothing granted is left
     /// to end and give memory back; what the process holds besides is the driver's to let go
-    /// ([`Plane::short`]), and a prediction is a guess, not a measure (rule 15: the wait ends,
+    /// ([`Plane::short`]), and a prediction is a guess, not a measure (rule 18: the wait ends,
     /// in a start).
     ///
     /// "The budget" here is [`Plane::budget_now`]: with the machine's ledger, a task within the

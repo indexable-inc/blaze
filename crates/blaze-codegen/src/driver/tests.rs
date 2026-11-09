@@ -1052,10 +1052,10 @@ fn a_store_hit_is_read_in_place() {
     assert!(out.errors.is_empty());
 }
 
-/// Rule 18 within one build: two puts under one key are one when their kind and bytes are
+/// Rule 21 within one build: two puts under one key are one when their kind and bytes are
 /// equal, and of another kind or other bytes the build is refused as the store refuses the
 /// second, the error naming both putters, the key and both content IDs. Which put is first is
-/// the same in whatever order they were pushed (rule 22).
+/// the same in whatever order they were pushed (rule 25).
 #[test]
 fn a_second_put_of_other_bytes_under_one_key_is_refused() {
     let unit = |n: u8| Unit {
@@ -1287,7 +1287,7 @@ fn a_release_compile_of_other_bytes_than_the_memos_under_its_key_fails_the_build
     let errors =
         build(&program, &Machine::default(), &policy, &memo, &Store::default()).unwrap_err();
     assert!(errors.iter().any(|it| it.what.contains("the memo already kept")), "{errors:?}");
-    assert!(errors.iter().all(|it| it.what.contains("rule 18")), "{errors:?}");
+    assert!(errors.iter().all(|it| it.what.contains("rule 21")), "{errors:?}");
 }
 
 /// A release compile's key covers the bodies each import builds in: an edit of one moves no
@@ -1325,7 +1325,7 @@ fn a_release_key_covers_the_bodies_its_imports_build_in() {
 /// A release compile's key covers each import's unit as its export is built: in a live
 /// build's tier-up the import is named by its first tier's key, while its export is built at
 /// the next tier's settings (another opt level), so a key of the name alone would keep `f`'s
-/// code made against the other export (rule 18).
+/// code made against the other export (rule 21).
 #[test]
 fn a_release_key_covers_its_imports_settings() {
     let instance = Instance {
@@ -1371,7 +1371,7 @@ fn a_release_key_covers_its_imports_settings() {
 /// the other: the first's template holds its own code there
 /// (`Ref::Own`), the second's the place (the template test of a call of itself), so their dev
 /// and release keys and their memo shapes differ. Two that each call themselves
-/// keep one key: their templates are one (rule 20, and name-free sharing kept).
+/// keep one key: their templates are one (rule 21, and name-free sharing kept).
 #[test]
 fn a_template_key_covers_which_place_is_the_function_itself() {
     let template = Instance {
@@ -1486,7 +1486,7 @@ fn a_mismatched_profile_is_counted_compiled_or_stored() {
     out.profiled(crate::settings::Pgo::None);
     assert!(out.stats.profiles.is_empty());
     assert_eq!(out.errors.len(), 1, "{:?}", out.errors);
-    // It names the first function built with the profile, by key and item (rule 16).
+    // It names the first function built with the profile, by key and item (rule 19).
     assert_eq!((out.errors[0].unit, out.errors[0].item), (key, named), "{:?}", out.errors);
 }
 
@@ -1556,7 +1556,7 @@ fn an_edit_of_a_body_an_import_builds_in_compiles_its_importer_again() {
 
 /// Another build's summary kept under the flight key this build claims a summary by, and
 /// not equal to this build's, fails the build naming the function: the key misses an input
-/// of the summary (rule 18), and neither is taken.
+/// of the summary (rule 21), and neither is taken.
 #[test]
 fn another_summary_under_a_summarys_flight_key_fails_the_build() {
     let (program, policy) = (program(), policy(OptLevel::O3, Mode::Output));
@@ -1580,7 +1580,7 @@ fn another_summary_under_a_summarys_flight_key_fails_the_build() {
 
 /// A fold candidate is prepared before its stored key is claimed; when another build of the
 /// memo landed another shape under that key, the function is refused naming both shapes
-/// (rule 18), never given the landed template.
+/// (rule 21), never given the landed template.
 #[test]
 fn a_fold_candidate_prepared_as_another_shape_than_the_landed_fails_the_build() {
     let (program, policy) = (program(), folding_policy());
@@ -1599,7 +1599,7 @@ fn a_fold_candidate_prepared_as_another_shape_than_the_landed_fails_the_build() 
 /// Each that calls the next is one generic's code, as instances whose code reads their
 /// arguments alike are; the last, which calls nothing, is other code (the base case's impl),
 /// as a front end describes it: one code with one reference fewer would be one instance key
-/// for two bodies, which the walk refuses (rule 18).
+/// for two bodies, which the walk refuses (rule 21).
 fn chain(count: u32, drop_glue: bool, limit: u32) -> Program {
     let mut program = Program { recursion_limit: Some(limit), ..Program::default() };
     for id in 1..=count {
@@ -1835,7 +1835,7 @@ fn a_refusal_of_an_early_pass_is_gone_once_the_deferred_are_described() {
 
 /// A release compile that says it built in a code none of its own bodies, its imports or
 /// theirs is fails the build naming the function, the code and its template's key, never
-/// keeps the template under a key that misses that body (rule 18).
+/// keeps the template under a key that misses that body (rule 21).
 #[test]
 fn a_release_compile_that_built_in_unkept_code_fails_the_build() {
     let (mut program, policy) = (program(), policy(OptLevel::O3, Mode::Output));
@@ -1887,7 +1887,7 @@ fn the_release_store_check_refuses_code_its_key_does_not_hold() {
 /// In a whole live build's tier-up an import is named by its first tier, which an edit of
 /// its own opt level leaves as it was; its export is built at the new level. `f2`, which
 /// imports `f4`, is compiled again, never taken from the store as made against `f4`'s other
-/// export (rule 18).
+/// export (rule 21).
 #[test]
 fn a_tier_up_recompiles_its_importer_when_an_imports_tier_changes() {
     let live = |memchr: Option<OptLevel>| {
@@ -1966,7 +1966,7 @@ fn one_instance_asked_for_by_two_origins_is_two_functions_of_its_test_binary() {
 /// One instance whose two askers' describes give one key is one function across versions
 /// and across edits,
 /// with one ID whichever asker's describe the walk kept: the least origin's, never the first
-/// described (rule 22).
+/// described (rule 25).
 #[test]
 fn one_key_of_two_origins_has_one_id_whichever_was_described_first() {
     let policy = policy(OptLevel::O0, Mode::Output);

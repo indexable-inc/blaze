@@ -340,7 +340,7 @@ pub(super) struct Request {
 /// caller hands it in and takes it back (`compile_as`'s `inlining`), and a body built in
 /// ([`build_body`]) moves it into its own `Recorder` and back. Never the thread's: a compile
 /// waits in queries, and a fiber resumes on any thread, whose state would be another
-/// compile's or none (rule 24). A query run inside a compile builds with a `Recorder` of its
+/// compile's or none (rule 27). A query run inside a compile builds with a `Recorder` of its
 /// own, which holds none, so what the database keeps never depends on what a compile builds
 /// in.
 pub(super) struct Inlining {

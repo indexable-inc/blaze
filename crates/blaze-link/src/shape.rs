@@ -22,7 +22,7 @@
 //! The cost is one event a region, and a few a stage for the code, from the regions the layout
 //! has and the sizes of the code's pieces: no byte is read. A full link's walk of its live
 //! pieces is a few milliseconds a million pieces, two map updates a piece of code. Every list is in address order, or
-//! sorted by bytes then name, so one image always says the same (rule 22).
+//! sorted by bytes then name, so one image always says the same (rule 25).
 
 use std::alloc::Global;
 use std::borrow::Cow;

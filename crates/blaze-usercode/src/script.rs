@@ -292,7 +292,7 @@ fn shown(value: Option<&OsStr>) -> String {
 /// read, is the one a check sees ([`Prepared::env`]): its entries are what is left once the
 /// given names and those of the run alone are taken out, and its names' hash
 /// ([`ALL_ENV_NAME`]) is made again over them, so a check that hashes [`Prepared::env`] whole
-/// makes the same key (rule 18: one input, one value, on both sides). make's variables are
+/// makes the same key (rule 21: one input, one value, on both sides). make's variables are
 /// kept by their value without the jobserver ([`make_flags`]), as the check has them.
 ///
 /// What is left must be what [`Prepared::env`] says, each variable read by its value there
@@ -324,7 +324,7 @@ pub fn keyed(prepared: &Prepared, traced: &mut Traced) -> Result<(), Error> {
             // alloc: error path
             return Err(Error(format!(
                 "{} was traced reading `{}` as {}, and a check of it reads {}: its \
-                 result would be kept under a key no check makes (rule 18, a bug in blaze; \
+                 result would be kept under a key no check makes (rule 21, a bug in blaze; \
                  the values are not shown, as a variable can hold a secret)",
                 prepared.spec.command.program.display(),
                 name.display(),
@@ -341,7 +341,7 @@ pub fn keyed(prepared: &Prepared, traced: &mut Traced) -> Result<(), Error> {
             // alloc: error path
             return Err(Error(format!(
                 "{} read its whole environment, and its trace has no `{}`, which a check of \
-                 it reads: its result would be kept under a key no check makes (rule 18, a bug in blaze)",
+                 it reads: its result would be kept under a key no check makes (rule 21, a bug in blaze)",
                 prepared.spec.command.program.display(),
                 name.display()
             )));
@@ -671,7 +671,7 @@ mod tests {
         ]
     }
 
-    /// The key rule for what a script is lent (rule 20, keys cover every input): its key
+    /// The key rule for what a script is lent (rule 21, keys cover every input): its key
     /// holds the variables it read and no other. Two shells that differ only in variables the
     /// run never read (`OLDPWD`, `SHLVL`, the shell's temporary directory) find the run one
     /// kept; one whose value of a variable it read differs does not. The program's environment

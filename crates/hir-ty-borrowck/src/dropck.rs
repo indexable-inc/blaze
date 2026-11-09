@@ -177,7 +177,7 @@ fn outlive_free_regions<'f>(
 }
 
 /// rustc's `DropCheckOverflow` (E0320) at `local`'s span, its message naming the body's owner
-/// and the limit as well (rule 16).
+/// and the limit as well (rule 19).
 fn overflow<'db>(
     ctx: &Ctx<'_, 'db>,
     body: &MirBody<'db>,

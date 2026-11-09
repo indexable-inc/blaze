@@ -1,5 +1,5 @@
 //! `key_ignores_field`: a key that leaves a field of the type it is built from out without
-//! saying so (AGENTS.md rule 18, keys-cover-every-input: a key covers every input its value
+//! saying so (AGENTS.md rule 21, keys-cover-every-input: a key covers every input its value
 //! depends on).
 //!
 //! Checked are the bodies of a hand-written `impl Hash`, `impl PartialEq` or `impl Ord` (a
@@ -42,7 +42,7 @@ use super::{
 use crate::check::Cx;
 
 /// The rule every message ends with.
-const RULE: &str = "a key covers every input its value depends on (AGENTS.md rule 18): name every field, and \
+const RULE: &str = "a key covers every input its value depends on (AGENTS.md rule 21): name every field, and \
                     mark one left out on purpose `field: _` with `// not in key: <why>`";
 
 /// The tag of the comment that says why a field is left out.
@@ -386,7 +386,7 @@ pub struct Derived {
 }
 "#,
         );
-        assert_eq!(found.matches("AGENTS.md rule 18").count(), 3, "{found}");
+        assert_eq!(found.matches("AGENTS.md rule 21").count(), 3, "{found}");
         assert!(
             found.contains("`impl Hash for Partial` reads some fields of `Partial` but leaves `cache` out of the key"),
             "{found}"
@@ -436,7 +436,7 @@ fn whole(_: &Job) -> u32 {
 }
 "#,
         );
-        assert_eq!(found.matches("AGENTS.md rule 18").count(), 1, "{found}");
+        assert_eq!(found.matches("AGENTS.md rule 21").count(), 1, "{found}");
         assert!(
             found.contains("the key `Job::key` builds reads some fields of `Job` but leaves `b`, `stored` out of the key"),
             "{found}"

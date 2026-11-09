@@ -142,7 +142,7 @@ pub struct Still {
     /// The worker pool's jobs parked on a wait.
     pub parked: usize,
     /// Every job that waits in the wait graph and what on: a parked job's own spans are on no
-    /// thread while it waits (rule 13).
+    /// thread while it waits (rule 15).
     pub graph: blaze_graph::sched::Waits,
     pub waits: Vec<StillWait>,
     /// Lowerings the loop holds until their root's kept front end is stored, which have no
@@ -216,7 +216,7 @@ impl fmt::Display for Still {
 
 /// The plane's thread tasks that run (a pool job's or an IO thread's), each by its node's name
 /// and unit, as a stall names what the loop waits on: the loop's wait for a task is a wait for
-/// its job's `done`, which opens no span of its own (rule 13).
+/// its job's `done`, which opens no span of its own (rule 15).
 struct RunningTasks<'a, W: super::plane::Work, P: blaze_graph::admission::Predict>(&'a Plane<W, P>);
 
 impl<W: super::plane::Work, P: blaze_graph::admission::Predict> fmt::Display
@@ -272,7 +272,7 @@ impl fmt::Display for DownloadsNow<'_> {
 /// The builds clients wait on, as a stall names them: how many jobs of requests the session
 /// has not seen finish, and each job of the build with its stage and what it waits on there.
 /// A request the session waits on with no job of the build left for it is a lost job, said
-/// so (rule 13: the client's wait names what it waits on).
+/// so (rule 15: the client's wait names what it waits on).
 struct BuildsWaited<'a, S: Steps>(usize, WaitedOn<'a, S>);
 
 impl<S: Steps> fmt::Display for BuildsWaited<'_, S> {
@@ -1810,7 +1810,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         if until.passed(now) {
             self.driver.poll(&mut done, until);
         } else {
-            // The loop's time between its turns, said as a wait on what ends it (rule 13).
+            // The loop's time between its turns, said as a wait on what ends it (rule 15).
             let driver = &mut self.driver;
             blaze_graph::wait::wait(woken.on(), None, || driver.poll(&mut done, until));
         }
