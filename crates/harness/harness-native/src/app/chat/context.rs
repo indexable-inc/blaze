@@ -60,7 +60,7 @@ fn lines(plate: View<'_>, c: &ContextUse, agent: &str) {
     });
     // alloc: a dozen parts' keys, while the popover is up
     let parts: Vec<(String, &str, Line<'_>)> = inked.map(|(p, ink)| (format!("p.{}", p.id), "hn.ChatContextRow", Line::Part(p, ink))).collect();
-    let rows = [("head".to_owned(), "hn.ChatContextHead", Line::Head), ("bar".to_owned(), "hn.ChatContextBar", Line::Bar)] // alloc: two keys
+    let rows = [("head".to_owned(), "hn.ChatContextHead", Line::Head), ("pie".to_owned(), "hn.ChatContextPie", Line::Bar)] // alloc: two keys
         .into_iter()
         .chain(parts)
         .chain([("foot".to_owned(), "hn.ChatContextFoot", Line::Foot)]); // alloc: one key
@@ -70,8 +70,13 @@ fn lines(plate: View<'_>, c: &ContextUse, agent: &str) {
             v.props("hn.ChatContextHead", &[("used", Prop::Str(&used)), ("window", Prop::Str(&window)), ("pct", Prop::Str(&pct))]);
         }
         Line::Bar => {
-            if let Some(track) = v.part("track") {
-                segments(track, c);
+            if let Some(chart) = v.part("chart") {
+                if let Some(pct) = chart.part("pct") {
+                    pct.text(&share(c.used, c.window));
+                }
+                if let Some(slices) = chart.part("slices") {
+                    pie(slices, c);
+                }
             }
         }
         Line::Part(p, ink) => {
@@ -97,25 +102,47 @@ fn lines(plate: View<'_>, c: &ContextUse, agent: &str) {
     });
 }
 
-/// The bar's segments on `track`: one for each part of the whole that holds tokens, its share of the window, in its
-/// row's ink. Laid end to end they never pass the track's end (claude's own counts can sum a little past its total).
-fn segments(track: View<'_>, c: &ContextUse) {
+/// The donut's slices in `slices`: one for each part of the whole that holds tokens, its share of the window clockwise
+/// from the top after the ones before it, in its row's ink. They never pass the ring's end (claude's own counts can sum
+/// a little past its total), and each gives up a hair at its end so neighbours read apart.
+fn pie(slices: View<'_>, c: &ContextUse) {
     let mut slot = 0;
-    let mut left = 1.0_f64;
-    let segs = c.parts.iter().filter(|p| p.of.is_empty()).filter_map(|p| {
+    let mut at = 0.0_f64;
+    let parts = c.parts.iter().filter(|p| p.of.is_empty()).filter_map(|p| {
         let ink = if p.estimate == ContextPart::REST {
             REST_INK
         } else {
             slot += 1;
             INKS[(slot - 1) % INKS.len()]
         };
-        let f = (p.tokens as f64 / c.window as f64).min(left);
-        left -= f;
-        (p.tokens > 0).then(|| (format!("seg.{}", p.id), "hn.ChatContextSeg", (f, ink))) // alloc: a key a part
+        let f = (p.tokens as f64 / c.window as f64).min(1.0 - at);
+        let from = at;
+        at += f;
+        (p.tokens > 0 && f > 0.0).then(|| (format!("slice.{}", p.id), "hn.ChatContextSlice", (ring_path(from, at - f.min(SLICE_GAP) * 0.5), ink))) // alloc: a key a part
     });
-    view::for_each_of(track, segs, |v, (f, ink), _| {
-        v.props("hn.ChatContextSeg", &[("share", Prop::Float(f)), ("ink", Prop::Str(ink))]);
+    view::for_each_of(slices, parts, |v, (d, ink), _| {
+        v.props("hn.ChatContextSlice", &[("d", Prop::Str(&d)), ("ink", Prop::Str(ink))]);
     });
+}
+
+/// The share of the ring each slice gives up at its end, so neighbours read apart.
+const SLICE_GAP: f64 = 0.006;
+
+/// A ring segment from `a` to `b` (shares of a turn, clockwise from the top) in a 100-point square: outside radius 48,
+/// inside 34, as hn.ChatContextPie's track. A whole turn is drawn as two halves (one arc cannot close on itself).
+fn ring_path(a: f64, b: f64) -> String {
+    const R: f64 = 48.0;
+    const IN: f64 = 34.0;
+    if b - a >= 0.9999 {
+        return format!("{} {}", ring_path(0.0, 0.5), ring_path(0.5, 1.0));
+    }
+    let p = |t: f64, r: f64| {
+        let th = t * std::f64::consts::TAU;
+        (50.0 + r * th.sin(), 50.0 - r * th.cos())
+    };
+    let large = u8::from(b - a > 0.5);
+    let ((x0, y0), (x1, y1), (x2, y2), (x3, y3)) = (p(a, R), p(b, R), p(b, IN), p(a, IN));
+    format!("M{x0:.2} {y0:.2} A{R} {R} 0 {large} 1 {x1:.2} {y1:.2} L{x2:.2} {y2:.2} A{IN} {IN} 0 {large} 0 {x3:.2} {y3:.2} Z")
 }
 
 /// `n` as a share of `of`: `12%`, `<1%` for a part that holds less than half a percent.

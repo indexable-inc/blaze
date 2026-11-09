@@ -86,19 +86,16 @@ hn {
   }
 
   // The selected tree row's pill: a Background under the row (src/app.rs), its plate inset `pill_inset` from the row's
-  // frame on every side so it hugs the row's content with air between neighbours, and matched by id: the tree's one
-  // highlight, whichever row holds it, its position springing (the tree's spring family) from where it was drawn to the
-  // new row while its size is always the new row's, so it is never shorter than the words it sits under. A row still
-  // folding in is Settling: its pill holds where it was until the row has opened, then slides in. The row picks the plate's Fill (tone_selection, or tone_selection_focus while the tree has the keyboard).
+  // frame on every side so it hugs the row's content with air between neighbours. It is where the selection is at once:
+  // no slide between rows (Finder's and Xcode's lists; a list clicked through all day reads a glide as lag). The row
+  // picks the plate's Fill (tone_selection, or tone_selection_focus while the tree has the keyboard).
   prefab Selection : ui.Row {
     Background
     Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}
     Padding: {l: $pill_inset, r: $pill_inset, t: $pill_inset, b: $pill_inset}
     plate : ui.Node {
-      MatchedGeometry: {id: "hn.selection", jump: $pill_jump_rows}
       Fill: $tone_selection
       Shape: {radius: $radius_row, n: 4, border: 0, feather: 0}
-      Motion: {omega: $pill_omega, zeta: $pill_zeta}
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
     }
   }
