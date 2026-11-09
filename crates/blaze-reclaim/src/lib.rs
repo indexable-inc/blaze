@@ -175,7 +175,7 @@ pub struct Guard {
 ///
 /// Out of line, as is the guard's drop: a guard is held across waits (a job's whole task), and
 /// a fiber that waits may resume on another thread, so the thread-local this reads must not be
-/// inlined into a caller that could keep its address across the wait (AGENTS.md rule 24). A
+/// inlined into a caller that could keep its address across the wait (AGENTS.md rule 27). A
 /// hot reader that never waits inside its read takes [`pinned`] instead.
 #[inline(never)]
 pub fn enter() -> Guard {
@@ -193,7 +193,7 @@ pub fn enter() -> Guard {
 /// as it returns (or unwinds). What `f` reads from a shared table stays valid until it returns,
 /// and nothing of it after. One thread-local access, which spans `f`, so `f` must never wait: a
 /// fiber that waits may resume on another thread, and this would then end the task of the
-/// thread it left (AGENTS.md rule 24). This crate is below the scheduler, so it cannot check
+/// thread it left (AGENTS.md rule 27). This crate is below the scheduler, so it cannot check
 /// that; a caller that can marks `f` a `NoWait` region (blaze-graph). For a lookup of a hot
 /// table that probes it and returns (hir-ty's interner index), where [`enter`]'s guard costs
 /// two out-of-line calls.

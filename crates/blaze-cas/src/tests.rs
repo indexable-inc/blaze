@@ -247,7 +247,7 @@ const GATE_WAIT: Duration = Duration::from_secs(30);
 /// Two threads' meeting point, met by each in turn (a put's hook and the test driving it): a
 /// wait returns once the other thread has come to its matching wait, and fails the test,
 /// naming the gate's count, if it has not within [`GATE_WAIT`]. A hook a change skips fails
-/// the test rather than hang it (rule 15).
+/// the test rather than hang it (rule 18).
 #[derive(Default)]
 struct Gate {
     arrived: std::sync::atomic::AtomicU64,
@@ -1632,7 +1632,7 @@ fn a_map_that_comes_after_a_lost_move_broke_the_store_changes_nothing() {
     assert_eq!(store.verify(None), Vec::new());
 }
 
-/// Rule 20 for review 9 C1: of a key's moves, `finish_batches` makes the first from where the
+/// Rule 23 for review 9 C1: of a key's moves, `finish_batches` makes the first from where the
 /// key is, and an index written while they wait names that move's record: not the key's first
 /// move (one from a place it left, as a stale copy's), nor its last (one more from where it is).
 #[test]

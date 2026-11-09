@@ -1,4 +1,4 @@
-//! What the collector keeps across restarts (AGENTS.md rule 23): when its last run ended, so
+//! What the collector keeps across restarts (AGENTS.md rule 26): when its last run ended, so
 //! the periodic deadline does not restart with the daemon, and its last [`REPORTS_KEPT`] runs'
 //! reports (without verdicts), which status shows. In `<state>/gc-ledger.json`, written whole
 //! (temporary, sync, rename).

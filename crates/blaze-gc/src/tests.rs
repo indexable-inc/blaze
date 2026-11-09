@@ -1,4 +1,4 @@
-//! Transcripts of the planner on a fake clock (AGENTS.md rule 12): roots appear, builds pin,
+//! Transcripts of the planner on a fake clock (AGENTS.md rule 14): roots appear, builds pin,
 //! the clock advances, the budget is crossed; each test plays the driver's part by hand.
 
 use crate::{
@@ -782,7 +782,7 @@ fn a_rename_stopped_by_a_new_use_keeps_it() {
     assert_eq!(report.swept_objects, 0);
 }
 
-/// The same inventory, roots and clock give the same decisions (rule 22).
+/// The same inventory, roots and clock give the same decisions (rule 25).
 #[test]
 fn decisions_are_the_same_for_the_same_inputs() {
     let transcript = || {
@@ -813,7 +813,7 @@ fn decisions_are_the_same_for_the_same_inputs() {
     assert_eq!(transcript(), transcript());
 }
 
-/// Rule 23: the ledger round-trips, and a collector restored from it keeps the periodic
+/// Rule 26: the ledger round-trips, and a collector restored from it keeps the periodic
 /// deadline and the run numbers.
 #[test]
 fn the_ledger_round_trips_and_restores_the_deadline() {

@@ -1,6 +1,6 @@
 ---
 name: runtime-code
-description: "How code inside blaze is written: no fallbacks, allocation by lifetime, the one standard data structure per need (locks, maps, queues, channels, waits), sans-IO cores, named and bounded waits, errors that name the thing, panics that fail one job, nothing thread-bound across a fiber wait. Load before writing or reviewing Rust in blaze's crates, especially the scheduler, daemon, query engine, store or anything concurrent."
+description: "How code inside blaze is written: no fallbacks, the one standard data structure per need (locks, maps, queues, channels, waits), sans-IO cores, named and bounded waits, errors that name the thing, panics that fail one job, nothing thread-bound across a fiber wait. Allocation by lifetime and what is persisted are the `memory-and-data` skill. Load before writing or reviewing Rust in blaze's crates, especially the scheduler, daemon, query engine, store or anything concurrent."
 ---
 
 # Writing blaze's runtime code
@@ -15,18 +15,6 @@ older cached result, a default guessed for a missing value). A fallback that onl
 still a fallback. A change that touches an existing fallback turns it into an error, and a bench or
 test that hits one fails instead of timing the slow path.
 
-## bump-allocate (rule 11)
-
-Allocate by lifetime, never from the global heap by default: a collection that lives within one task
-(a query run, a codegen unit, a maintainer pass) names its allocator, `Vec::new_in(frame)` /
-`Box::new_in(.., frame)` from `blaze_mem::frame::current`, and longer lifetimes use the request,
-revision or image allocator. A global allocation (`Vec::new`, `vec![]`, `collect` into a heap `Vec`,
-`Box::new`, `to_owned`) needs `// alloc: <why>` on its line. `blaze::implicit_allocator` enforces
-this, warning everywhere and denied wherever `blaze::hot` is, with `blaze::hot_alloc` for what a
-call reaches.
-
-See [docs/v2/plan/design/memory.md](../../../docs/v2/plan/design/memory.md).
-
 ## standard-structures (rule 12)
 
 One choice per need, never a hand-rolled or std stand-in: a lock is `blaze_core::lock::{Lock,
@@ -37,13 +25,13 @@ banned in `.clippy.toml` outside `crates/blaze-core/src/lock.rs`, and a contende
 waited behind whom into the profile's `lock_waits` (`blaze debug locks` ranks them and says what to
 use instead: arc-swap or RCU for reads, papaya for a map, an atomic for an integer, a channel for a
 queue, an owner for one holder); a shared map is `papaya::HashMap`; a single-owner map or set is
-`blaze_hash::{HashMap<K, V, A>, HashSet<K, A>}` (foldhash with a fixed seed, its allocator named: a
-frame's for a task, `Global` with a reason otherwise), with `blaze_hash::KeyHasher` for keys that
-are already content hashes and `blaze_hash::Blake3Hasher` for persisted content IDs; results of
-parallel items come back from `blaze_graph::par` in order, never pushed into a `Mutex<Vec>`; a queue
-is `crossbeam::queue::{SegQueue, ArrayQueue}`; a channel is `crossbeam-channel`; a counter or flag
-is an atomic. How a thread or fiber waits is `deadline-waits`. `BTreeMap` only where iteration order
-is part of the output.
+`blaze_hash::{HashMap<K, V, A>, HashSet<K, A>}` (foldhash with a fixed seed, its allocator named as
+`bump-allocate` says: a frame's for a task, `Global` with a reason otherwise), with
+`blaze_hash::KeyHasher` for keys that are already content hashes and `blaze_hash::Blake3Hasher` for
+persisted content IDs; results of parallel items come back from `blaze_graph::par` in order, never
+pushed into a `Mutex<Vec>`; a queue is `crossbeam::queue::{SegQueue, ArrayQueue}`; a channel is
+`crossbeam-channel`; a counter or flag is an atomic. How a thread or fiber waits is
+`deadline-waits`. `BTreeMap` only where iteration order is part of the output.
 
 ## sans-io-cores (rule 14)
 
@@ -119,9 +107,10 @@ the pool's idle park block in the kernel: a fiber that waits, with a deadline or
 the scheduler (a key, a counter, a job, a timer on the driver's wheel), never a `Condvar`, a channel
 receive, `thread::sleep` or a raw `spin_loop`; elsewhere a spin is the one bounded spin-then-park
 helper. Nothing sends a signal to a pool or driver thread: the sampler reads the kernel's samples
-(Linux `perf_event_open`) or stops the thread (macOS `thread_suspend`, Windows `SuspendThread`). The
-DST in `crates/blaze-core/src/wait/tests.rs` interrupts every wait and checks that it ends by its
-deadline, with a planted relative-timeout retry it must catch.
+(Linux `perf_event_open`) or stops the thread (macOS `thread_suspend`; Windows `SuspendThread` is
+the target, there is no Windows sampler yet). The DST in `crates/blaze-core/src/wait/tests.rs`
+interrupts every wait and checks that it ends by its deadline, with a planted relative-timeout retry
+it must catch.
 
 See [docs/v2/plan/design/deadline-waits.md](../../../docs/v2/plan/design/deadline-waits.md).
 

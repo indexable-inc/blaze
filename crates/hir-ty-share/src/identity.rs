@@ -182,7 +182,7 @@ impl<'db> Spell<'db> {
     /// Spells `ty`, one frame per level of it. A callee's arguments are as deep as the program
     /// built them (only an instance's own are bounded, by its `SHARED_DEPTH`), so each level
     /// first makes sure of its stack: an overflow aborts the process, where an error fails one
-    /// job (rule 17). [`Self::konst`] and [`Self::pattern`] do the same; every recursion of a
+    /// job (rule 20). [`Self::konst`] and [`Self::pattern`] do the same; every recursion of a
     /// spelling passes through one of the three.
     fn ty(&mut self, ty: Ty<'db>) -> Result<(), Unshared> {
         stdx::ensure_sufficient_stack(|| self.ty_level(ty))

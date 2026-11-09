@@ -1,6 +1,6 @@
 //! `infinite_loop`: a `loop` that nothing leaves, in a function that does not return `!`: the
 //! signature says it ends and the loop says it doesn't. A loop that waits for progress needs a
-//! bound and an outcome (AGENTS.md rule 13); one meant to run forever says so with `-> !`.
+//! bound and an outcome (AGENTS.md rule 18); one meant to run forever says so with `-> !`.
 //!
 //! Follows clippy's `clippy_lints/src/loops/infinite_loop.rs` (MIT or Apache-2.0), read from
 //! indexable-inc's fork at c2308e38 (nightly-2026-05-27), the nearest checkout to the pinned
@@ -90,7 +90,7 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, lp: ast::LoopExpr<'t>) {
             .note("if it is meant to run forever, the function's return type says so: `-> !`"),
     };
     diagnostic.help(
-        "a loop that waits for progress needs a bound (fuel, a deadline) and ends in a typed outcome (AGENTS.md rule 13)",
+        "a loop that waits for progress needs a bound (fuel, a deadline) and ends in a typed outcome (AGENTS.md rule 18)",
     );
 }
 

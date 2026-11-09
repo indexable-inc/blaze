@@ -466,7 +466,7 @@ pub fn layout_of_ty_query(
     }
     // A field's layout is a query inside its ADT's, one per level of a type as deep as the
     // program built it (`Option` 130 deep): an overflow aborts the process, so each level makes
-    // sure of its stack (rule 17).
+    // sure of its stack (rule 20).
     stdx::ensure_sufficient_stack(|| {
         blaze_mem::frame::current(|frame| layout_of_ty_in(db, ty, trait_env, frame))
     })

@@ -13,11 +13,13 @@ A change that moves a type, path, API or idiom across the code is a ban with a `
 `.clippy.toml` (mirrored in the hot crates' `clippy.toml`), which blaze-lints'
 `disallowed_types`/`disallowed_methods`/`disallowed_macros` enforce with a MachineApplicable fix, or
 a `blaze::` lint where the rule needs types or MIR; either is applied with `blaze check --fix`, and
-its count lives in `crates/blaze-lints/baselines/`, which may only shrink; a one-off move of a path
-is `blaze check --replace A=B`. Both find code by name resolution (imports, renames, globs,
-re-exports, macro output), never by text, and leave it compiling and lint-clean, so the rule keeps
-holding after the port. `sed`, `rg` replace and syntax-only rewriters (astlog) are for syntax-only
-shapes, scoped and checked by a build afterward.
+its count lives in `crates/blaze-lints/baselines/`, which may only shrink (no baseline file exists
+yet, because blaze cannot yet finish its own check of the workspace: `blaze check --baselines DIR
+--new-baseline LINT` starts one, and the merge gate's `lint-baselines` job, docs/cargo.md#lints,
+holds them once they exist); a one-off move of a path is `blaze check --replace A=B`. Both find code
+by name resolution (imports, renames, globs, re-exports, macro output), never by text, and leave it
+compiling and lint-clean, so the rule keeps holding after the port. `sed`, `rg` replace and
+syntax-only rewriters (astlog) are for syntax-only shapes, scoped and checked by a build afterward.
 
 ## whole-ports (rule 24)
 
@@ -33,7 +35,7 @@ spend the effort on proving it right: real crates' own test suites passing under
 property tests and deterministic simulation of blaze's own invariants (`testing` skill), and fuzzing
 of parsers of hostile bytes.
 
-See [docs/contributing.md#rules-for-code](../../../docs/contributing.md#rules-for-code).
+See [docs/contributing.md#what-a-change-needs](../../../docs/contributing.md#what-a-change-needs).
 
 ## spec-then-build (rule 29)
 
@@ -47,7 +49,7 @@ pull request as the first code that implements it, and is marked `current` (or r
 what was built) once the work lands. A spec with no code behind it is unfinished work, not a result;
 a lane that cannot build what it specified says what blocks it and who it handed the work to.
 
-See [docs/contributing.md#rules-for-code](../../../docs/contributing.md#rules-for-code).
+See [docs/contributing.md#documents](../../../docs/contributing.md#documents).
 
 ## one-concept-one-home (rule 30)
 

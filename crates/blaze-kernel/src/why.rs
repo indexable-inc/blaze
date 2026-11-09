@@ -89,7 +89,7 @@ pub struct Miss {
     /// by its identity, origin and settings within its unit; a unit by package, target, mode,
     /// platform and profile): what the daemon compares it with the last time by. Two
     /// different misses of one step under one subject in one build are refused, never one
-    /// kept over the other (rule 18).
+    /// kept over the other (rule 21).
     pub subject: ContentId,
     /// What of, by path, for a person only: a function, a unit (`app v0.1.0 (lib)`), a
     /// package's build script.

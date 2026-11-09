@@ -1,6 +1,6 @@
 //! `rc_mutex`: the type `Rc<Mutex<_>>`. An `Rc` never crosses a thread, so the lock guards
 //! against no one: a `RefCell` does that job on one thread, an `Arc<Mutex<_>>` across them.
-//! AGENTS.md rule 9: one choice per need.
+//! AGENTS.md rule 12: one choice per need.
 //!
 //! Follows clippy's `clippy_lints/src/types/rc_mutex.rs` (MIT or Apache-2.0), read from
 //! indexable-inc's fork at c2308e38 (nightly-2026-05-27), the nearest checkout to the pinned

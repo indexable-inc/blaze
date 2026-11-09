@@ -376,7 +376,7 @@ fn the_versions_are_the_ones_blaze_is_built_with() {
     }
 }
 
-/// Rule 23 and the point of the code identity: a dev template one blaze build kept is read by
+/// Rule 26 and the point of the code identity: a dev template one blaze build kept is read by
 /// the next after a restart of the store, when the next differs from it only outside the code
 /// generator (its CLI), and by no build whose code generator differs. The two blaze builds are
 /// `blaze_codegen_code`'s made-up workspace before and after each edit, their codes worked out
@@ -421,7 +421,7 @@ fn a_template_kept_by_one_blaze_build_is_read_by_the_next() {
         };
         blaze_codegen::kernel::template(&stored, &spec.settings(), &spec.toolchain.id)
     };
-    // Rule 22: one key for one code, whenever it is worked out.
+    // Rule 25: one key for one code, whenever it is worked out.
     assert_eq!(key(built), key(built));
     assert_eq!(
         key(cli_edited),

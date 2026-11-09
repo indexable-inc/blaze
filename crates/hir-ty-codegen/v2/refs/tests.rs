@@ -433,7 +433,7 @@ pub fn roots() -> u32 { g() }
 "#;
 
 /// A body whose MIR does not lower is refused naming the body by its path and, for a call with
-/// no function, the callee as written and where the call is (rule 16), never a bare
+/// no function, the callee as written and where the call is (rule 19), never a bare
 /// `MissingFunctionDefinition(FunctionId(..), Expr ..)`.
 #[test]
 fn a_body_whose_mir_does_not_lower_is_refused_naming_it_and_the_call() {

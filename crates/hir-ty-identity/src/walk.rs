@@ -47,7 +47,7 @@ use crate::{
 };
 
 /// The most instances of one recursion: past it the walk stops with an error naming the
-/// instance it was at (rule 15).
+/// instance it was at (rule 18).
 const INSTANCES: usize = 1 << 20;
 
 /// Why the walk stops at a function.

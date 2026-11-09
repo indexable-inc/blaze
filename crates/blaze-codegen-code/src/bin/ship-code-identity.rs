@@ -3,7 +3,7 @@
 //! of the program at `program` (`blaze_codegen_code::Tree::shipped`, one file per identity named
 //! by `Identity::shipped`), so that the program's build script, run where there is no checkout
 //! (a published crate), works out the identity a build of the checkout would. Run by
-//! .github/scripts/publish_crates.py. One JSON value in (AGENTS.md rule 36); a failure names the
+//! .github/scripts/publish_crates.py. One JSON value in (AGENTS.md rule 41); a failure names the
 //! file and the identity, and exits 1.
 
 use std::path::{Path, PathBuf};

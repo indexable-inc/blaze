@@ -686,7 +686,7 @@ fn a_lookup_or_offer_with_no_store_allocates_nothing() {
     offered_with_no_store(&db, Knob::new(&db, Durability::LOW, 1, true, krate));
 }
 
-/// Rule 18, the solver's code: an edit of the vendored solver's source is another front-end
+/// Rule 21, the solver's code: an edit of the vendored solver's source is another front-end
 /// identity (`blaze_codegen_code::FRONT_END`, as blaze-engine's build script works it out and its
 /// main hands it over as `build`), so another solver version, and an answer kept by the solver
 /// before the edit misses in the goal store of the solver after it, and is found again by the one
