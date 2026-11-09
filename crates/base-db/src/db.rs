@@ -279,6 +279,21 @@ impl Db {
         })
     }
 
+    /// See [`Files::set_included_file`].
+    pub fn set_included_file(&mut self, path: &AbsPath, bytes: std::sync::Arc<[u8]>) -> bool {
+        let files = Arc::clone(&self.files);
+        self.write("Db::set_included_file", |db| {
+            let changed = files.set_included_file(db, path, bytes);
+            if changed && let Some(file) = files.find_included(path) {
+                db.note(Note::Included(file));
+                if let Some(source) = files.included_source_file(path) {
+                    db.note(Note::Set(source));
+                }
+            }
+            changed
+        })
+    }
+
     /// Reads again each file outside the VFS that `include_bytes!` or `include_str!` read,
     /// through the one reader that read it first ([`Files::reload_included_file`]), and sets
     /// those whose read moved in one batch named by `trigger`: so exactly their readers run
