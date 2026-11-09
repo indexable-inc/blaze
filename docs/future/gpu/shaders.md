@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: Vertex and fragment shaders written in Rust and compiled by blaze (MIR to naga IR, then MSL, SPIR-V or WGSL), replacing the harness app's Slang, with a binding table generated from the Rust signatures.
+summary: Vertex and fragment shaders, and compute kernels with inline ray query, written in Rust and compiled by blaze (MIR to naga IR, then MSL, SPIR-V or WGSL), replacing the harness app's Slang, with a binding table generated from the Rust signatures.
 date: 2026-11-06
 ---
 # Shaders in Rust
@@ -382,6 +382,87 @@ How `artifact = "gpu"` goes through the build, crate by crate, as the daemon run
   - The device build lowers every entry of `GPU_ENTRIES`, so a crate with Slang still in `SLANG`
     must lower all of its entries before any of its MSL is written. For harness-native-shaders that
     includes the 14 harness entries.
+
+## Compute kernels and inline ray query (phase 3b)
+
+The first user is orrery's light pass (indexable-inc/orrery, `crates/orrery-web/shaders/light.slang`):
+a compute kernel, one thread a device pixel, that casts an orthographic ray per pixel with an inline
+ray query, picks a window light by resampled importance, casts a shadow ray, and keeps a running
+mean per pixel as packed halves in a read-write buffer. It runs on Metal through wgpu's MSL
+passthrough. This is the third stage of the one descriptor (as "Consistency with plan.md" says)
+and the first piece of [raytracing.md](raytracing.md)'s inline query, scoped to what that pass
+needs; plan.md's `Out<T>` partitions and `Shared<T>` phases come later on the same machinery.
+
+```rust
+use gpu::prelude::*;
+
+#[gpu::kernel(threads = (8, 8))]
+pub fn light_cs(t: Thread, view: &LightView, scene: &Tlas, insts: &[Inst], acc: &RawOut<UVec2>) {
+    let id = t.global();
+    if id.x >= view.region.z || id.y >= view.region.w {
+        return;
+    }
+    let at = (id.y * view.region.z + id.x) as usize;
+    let ray = Ray { origin: o, dir, tmin: 0.0, tmax: 1e7 };
+    let Some(hit) = scene.trace(ray, 0xff) else {
+        // SAFETY: each thread writes only its own pixel, `at`, which no other thread computes.
+        unsafe { acc.write(at, uvec2(0, 0)) };
+        return;
+    };
+    let inst = insts[hit.instance_index as usize];
+    let lit = !scene.occluded(Ray { origin: from, dir: to, tmin: 0.0, tmax: len }, 0xff);
+    // SAFETY: as above.
+    let before = unsafe { acc.read(at) };
+    // ...
+}
+```
+
+| Slang | Rust | Kind |
+|---|---|---|
+| `[shader("compute")] [numthreads(8, 8, 1)]` | `#[gpu::kernel(threads = (8, 8))]` (`threads = 64`, `(x, y)` or `(x, y, z)`) | `Stage::Compute { x, y, z }` |
+| `uint3 id : SV_DispatchThreadID`, `SV_GroupThreadID`, `SV_GroupID` | `t: Thread`, then `t.global()`, `t.local()`, `t.group()` (each a `UVec3`) | `Kind::Thread` |
+| `RWStructuredBuffer<T> acc` | `acc: &RawOut<T>`, `unsafe { acc.read(i) }`, `unsafe { acc.write(i, v) }`, `acc.len()` | `Kind::RawOut { stride }` |
+| `RaytracingAccelerationStructure scene` | `scene: &Tlas` | `Kind::Tlas` |
+| `RayDesc` | `Ray { origin, dir, tmin, tmax }` | library |
+| `RayQuery<FORCE_OPAQUE>`, `TraceRayInline`, `while (q.Proceed()) {}`, `CommittedStatus() == COMMITTED_TRIANGLE_HIT`, `CommittedRayT()`, `CommittedInstanceIndex()`, `CommittedPrimitiveIndex()` | `scene.trace(ray, mask) -> Option<Hit>`; `hit.t`, `hit.instance_index`, `hit.primitive_index`, `hit.instance_custom_index`, `hit.geometry_index`, `hit.barycentrics`, `hit.front_face` | intrinsic |
+| the same with `ACCEPT_FIRST_HIT_AND_END_SEARCH`, `CommittedStatus() == COMMITTED_NOTHING` | `scene.occluded(ray, mask) -> bool` | intrinsic |
+| `f32tof16(x)`, `f16tof32(u)` | `f32tof16(x)`, `f16tof32(u)` (Slang's names; round to nearest even, the low 16 bits) | intrinsic with a host body |
+| `uint2`, `uint3` | `UVec2`, `UVec3` | library |
+
+- **A kernel returns nothing** and takes no `VertexIndex`, `InstanceIndex` or varyings; `Thread`
+  and `RawOut` are a kernel's alone. `gpu::check` refuses each at compile time with the rule, as it
+  does for the graphics stages, and refuses a workgroup of no thread or of more than Metal's 1024.
+  The workgroup size is in the descriptor (`ENTRY.stage`), so the host dispatches by the same
+  numbers the shader was compiled with; wgpu's MSL passthrough takes it from there.
+- **`Thread` is the thread's identity**, made only by the kernel ABI: not `Copy` or `Clone`, with no
+  public constructor, as plan.md says, so the safe write paths plan.md adds later can key on it.
+  On the device it is three built-in arguments (global, local and workgroup invocation ids).
+- **Writes are `unsafe` and named.** plan.md's rule: `&mut [T]` would hand every thread a `&mut` to
+  one buffer, so it is not a `Param` (the trait's `on_unimplemented` names `RawOut`). `RawOut<T>`
+  is plan.md's raw writer: `read` and `write` check the index against `len()` (a failed check ends
+  the invocation, like every panic) and are `unsafe` for the one thing a check can't see, two
+  threads touching one element. The light pass's `SAFETY:` is that each thread owns its pixel.
+  Like `Texture2d`, a `RawOut` and a `Tlas` exist only on the device: their methods' host bodies
+  panic naming themselves until plan.md's CPU backend.
+- **Inline query, opaque only.** `trace` runs the whole query (initialize, proceed until done,
+  read the committed hit) with `FORCE_OPAQUE`, so every triangle the ray meets is a candidate the
+  hardware commits itself and no candidate loop is needed; `occluded` adds
+  `ACCEPT_FIRST_HIT_AND_END_SEARCH` and says whether anything was committed. The query object never
+  appears in Rust, so it can't be moved, copied or read before it is initialized. raytracing.md's
+  `RayQuery` with `Candidate` arms, `commit` and `commit_at` (alpha-tested and procedural
+  geometry) is the next step and adds to this; it replaces nothing.
+- **Slots.** Metal binds an acceleration structure in the buffer table, so `&T`, `&[T]`,
+  `&RawOut<T>` and `&Tlas` take the next buffer slot in parameter order, textures and samplers
+  their own tables, and the storage sizes buffer the slot after the last buffer, counting `&[T]`
+  and `&RawOut<T>` (`gpu::layout` and `gpu::sizes_slot`, unchanged in shape). wgpu's Metal backend
+  numbers a bind group's buffers and acceleration structures together in entry order, so a host
+  that lays its bind group entries in parameter order, with the sizes buffer as a uniform after
+  them, binds what the MSL reads.
+- **The module's capabilities** are what it uses: the validator gets `RAY_QUERY` when an entry
+  traces, and nothing else beyond the base set.
+
+What is left after it: `Out<T>` and its partitions, `Shared<T>`, barriers and atomics (plan.md);
+`RayQuery` with candidates (raytracing.md); a kernel on the CPU.
 
 ## Migration and verification
 
