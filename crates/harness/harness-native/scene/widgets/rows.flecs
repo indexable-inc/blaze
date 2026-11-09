@@ -35,6 +35,9 @@ hn {
     hang { hn.Hang: {obj: $obj, depth: $depth, kids: $kids, open: $open, mark: $mark} }
     name : hn.tree.Head {
       Text: {s: $name}
+      // Where it works and when it started or ended (the trailing words carry only what is new: what it does, how it
+      // failed).
+      Tooltip: {text: $why}
       if $look == "on" {
         Fill: $tone_ink_strong
         TextStyle: {size: $size_row, line: $line_row, role: 0, bold: 0, weight: $weight_tree_on}

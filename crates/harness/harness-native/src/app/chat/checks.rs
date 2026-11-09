@@ -31,23 +31,24 @@ pub(super) fn summary(checks: &[GhCheck], total: u64, now: i64) -> String {
     "All checks passed".to_owned()
 }
 
-/// The checks the list shows, one row each: every one not passed or skipped, failed first, then running, then queued;
-/// within each the one started first first (an unknown start last), then by name.
+/// The checks the list shows, one row each: every one that failed or runs, failed first; within each the one started
+/// first first (an unknown start last), then by name. What only waits has not run: it is counted in the folded row.
 pub(super) fn listed(checks: &[GhCheck]) -> Vec<(usize, &GhCheck)> {
     let mut rows: Vec<(usize, &GhCheck)> = checks
         .iter()
         .enumerate()
-        .filter(|(_, c)| !matches!(c.state, GhCheckState::Passed | GhCheckState::Skipped))
+        .filter(|(_, c)| matches!(c.state, GhCheckState::Failed | GhCheckState::Running))
         .collect();
     rows.sort_by(|(_, a), (_, b)| (a.state, a.started == 0, a.started, &a.name).cmp(&(b.state, b.started == 0, b.started, &b.name)));
     rows
 }
 
-/// The row the rest fold into: `7 passed`, `7 passed, 2 skipped`, and how many GitHub has past what was read; None when
+/// The row the rest fold into: `5 queued · 7 passed, 2 skipped`, and how many GitHub has past what was read; None when
 /// there are none.
 pub(super) fn folded(checks: &[GhCheck], total: u64) -> Option<String> {
     let passed = checks.iter().filter(|c| c.state == GhCheckState::Passed).count();
     let skipped = checks.iter().filter(|c| c.state == GhCheckState::Skipped).count();
+    let queued = checks.iter().filter(|c| c.state == GhCheckState::Queued).count();
     let more = total.saturating_sub(checks.len() as u64);
     let mut parts = Vec::new(); // alloc: a row's words, while the card is up
     if passed > 0 {
@@ -59,7 +60,12 @@ pub(super) fn folded(checks: &[GhCheck], total: u64) -> Option<String> {
     if more > 0 {
         parts.push(format!("{more} more not shown"));
     }
-    (!parts.is_empty()).then(|| parts.join(", "))
+    let done = (!parts.is_empty()).then(|| parts.join(", "));
+    match (queued, done) {
+        (0, done) => done,
+        (q, None) => Some(format!("{q} queued")),
+        (q, Some(d)) => Some(format!("{q} queued \u{b7} {d}")),
+    }
 }
 
 /// How long `c` has run or waited (until `now`), or took (a finished one); None when GitHub gave no start.
@@ -124,9 +130,10 @@ mod tests {
         assert_eq!((clock(35), clock(252), clock(3_852)), ("0:35".into(), "4:12".into(), "1:04:12".into()));
     }
 
-    /// Failed, then running (the longest first), then queued; passed and skipped fold into one row.
+    /// Failed, then running (the longest first), a row each; what only waits has not run, so it folds with the passed
+    /// and skipped into one row.
     #[test]
-    fn rows_failed_then_running_then_queued() {
+    fn rows_failed_then_running_the_rest_folded() {
         use GhCheckState::*;
         let cs = [
             check("queued", Queued, 50),
@@ -138,11 +145,12 @@ mod tests {
             check("nostart", Running, 0),
         ];
         let names: Vec<&str> = listed(&cs).into_iter().map(|(_, c)| c.name.as_str()).collect();
-        assert_eq!(names, ["broke", "early", "late", "nostart", "queued"]);
+        assert_eq!(names, ["broke", "early", "late", "nostart"]);
         assert_eq!(listed(&cs)[0].0, 3, "a row keeps its place in the answer, its key");
-        assert_eq!(folded(&cs, 7).as_deref(), Some("1 passed, 1 skipped"));
-        assert_eq!(folded(&cs, 9).as_deref(), Some("1 passed, 1 skipped, 2 more not shown"));
-        assert_eq!(folded(&cs[..1], 1), None);
+        assert_eq!(folded(&cs, 7).as_deref(), Some("1 queued \u{b7} 1 passed, 1 skipped"));
+        assert_eq!(folded(&cs, 9).as_deref(), Some("1 queued \u{b7} 1 passed, 1 skipped, 2 more not shown"));
+        assert_eq!(folded(&cs[..1], 1).as_deref(), Some("1 queued"));
+        assert_eq!(folded(&cs[3..4], 1), None, "a failure alone folds nothing");
         assert_eq!(elapsed(&cs[2], 360), Some(60));
         assert_eq!(elapsed(&GhCheck { completed: 260, ..cs[3].clone() }, 9_999), Some(60));
         assert_eq!(elapsed(&cs[3], 9_999), None);
