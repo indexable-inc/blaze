@@ -13,6 +13,7 @@ mod paths;
 mod profiles;
 mod queries;
 mod runs;
+mod instructions;
 mod skills;
 mod ui_feed;
 
