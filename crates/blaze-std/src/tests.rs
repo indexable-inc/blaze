@@ -26,6 +26,15 @@
 //! - [`close`]: closing a writable file syncs it, or returns the sync's failure.
 //! - [`eval`]: an evaluator gives a memo point's own value, a memo stays within its limit, and
 //!   provenance records exactly the calls made.
+//! - [`narrows`]: narrowing never widens, for every capability of "The rest of the set" that
+//!   has a narrowing: one harness over a trait of cases, one control a case.
+//! - [`kv`]: `Kv` agrees with a model map through crashes.
+//! - [`local`]: a local pair delivers bytes in order, exactly once.
+//! - [`budget`]: a `Net`'s byte limit and a `Dir`'s quota are never exceeded, and spent
+//!   exactly.
+//! - [`requests`]: `Http::handler` and `Http::over` give the same answer to the same request,
+//!   and refuse the same ones once narrowed.
+//! - [`hosted`]: each simulated provider once, a scripted value in and a recorded one out.
 //!
 //! The compile-time half, that dropping a `Scope`, `Task`, `Pending` or `File<ReadWrite>`
 //! unfinished is an error, is in crates/hir-ty-linear's fixtures (`bstd_*`): that harness
@@ -35,6 +44,7 @@
 //! the plan that caught its plant.
 
 mod arena;
+mod budget;
 mod cancel;
 mod cell;
 mod close;
@@ -43,11 +53,16 @@ mod crash;
 mod deadlines;
 mod env;
 mod eval;
+mod hosted;
 mod inflight;
+mod kv;
+mod local;
 mod missing;
 mod names;
 mod narrowing;
+mod narrows;
 mod paths;
+mod requests;
 mod scopes;
 mod world;
 
