@@ -1046,7 +1046,7 @@ impl<'d, 'db> EntryCx<'d, 'db> {
         let elems = of.projection.as_slice();
         let (mut sym, ty, rest) = match elems.first() {
             Some(m::ProjectionElem::Deref) => {
-                let sym = self.sym_of_ref_value(frame, &m::StoredPlace { local: of.local, projection: Default::default() })?;
+                let sym = self.sym_of_ref_value(frame, &m::Place::from(of.local).store())?;
                 // alloc: an error
                 let inner = pointee(self.local_ty(frame, of.local)).ok_or_else(|| ("a deref of a non-reference".to_owned(), why::POINTERS))?;
                 (sym, self.dev.normalize(inner), &elems[1..])
@@ -1188,7 +1188,7 @@ impl<'d, 'db> EntryCx<'d, 'db> {
                         if !dest.projection.as_slice().is_empty() {
                             return Err(("a returned reference stored into a field".to_owned(), why::POINTERS)); // alloc: an error
                         }
-                        let sym = self.sym_of_ref_value(frame, &m::StoredPlace { local: ret, projection: Default::default() })?;
+                        let sym = self.sym_of_ref_value(frame, &m::Place::from(ret).store())?;
                         self.bind(caller, dest.local, sym)?;
                     }
                     vec![after] // alloc: an edge
@@ -1774,7 +1774,7 @@ impl<'d, 'db> EntryCx<'d, 'db> {
         let elems = place.projection.as_slice();
         let (mut ptr, ty, rest) = match elems.first() {
             Some(m::ProjectionElem::Deref) => {
-                let sym = self.sym_of_ref_value(frame, &m::StoredPlace { local: place.local, projection: Default::default() })?;
+                let sym = self.sym_of_ref_value(frame, &m::Place::from(place.local).store())?;
                 // alloc: an error
                 let inner = pointee(self.local_ty(frame, place.local)).ok_or_else(|| ("a deref of a non-reference".to_owned(), why::POINTERS))?;
                 let Some(ptr) = self.sym_ptr(&sym) else { return Ok(Ptr::Zst) };
@@ -1948,7 +1948,7 @@ impl<'d, 'db> EntryCx<'d, 'db> {
                         let [m::ProjectionElem::Deref] = place.projection.as_slice() else {
                             return Err(("the length of a slice not reached through a reference".to_owned(), why::POINTERS)); // alloc: an error
                         };
-                        let sym = self.sym_of_ref_value(frame, &m::StoredPlace { local: place.local, projection: Default::default() })?;
+                        let sym = self.sym_of_ref_value(frame, &m::Place::from(place.local).store())?;
                         Some(self.sym_len(&sym)?)
                     }
                     _ => return Err((format!("the length of `{ty:?}`"), why::OPERATIONS)), // alloc: an error
@@ -2128,7 +2128,8 @@ impl<'d, 'db> EntryCx<'d, 'db> {
         let max = self.expr(Expression::Literal(max));
         let saturated = self.expr(Expression::Select { condition: past, accept: max, reject: converted });
         let nan = self.expr(Expression::Binary { op: BinaryOperator::NotEqual, left: x, right: x });
-        let zero = self.expr(Expression::ZeroValue(self.dev.module.types.insert(Type { name: None, inner: TypeInner::Scalar(to) }, Span::UNDEFINED)));
+        let zero_ty = self.dev.module.types.insert(Type { name: None, inner: TypeInner::Scalar(to) }, Span::UNDEFINED);
+        let zero = self.expr(Expression::ZeroValue(zero_ty));
         Ok(self.expr(Expression::Select { condition: nan, accept: zero, reject: saturated }))
     }
 
@@ -2188,7 +2189,7 @@ impl<'d, 'db> EntryCx<'d, 'db> {
         };
         let mut parts = [(map[0], value), (map[1], overflowed)];
         parts.sort_by_key(|(k, _)| *k);
-        Ok(self.expr(Expression::Compose { ty: tuple_ty, components: parts.iter().map(|(_, e)| *e).collect() }))
+        Ok(self.expr(Expression::Compose { ty: tuple_ty, components: parts.iter().map(|(_, e)| e.clone()).collect() }))
     }
 
     /// Whether `value = left op right` overflowed, for 32-bit integers.
