@@ -351,10 +351,10 @@ fn structure_tables(view: &View<'_>) -> Result {
         }
     }
     for (r, rec) in view.intrinsics.iter().enumerate() {
-        if !within(rec.name_first, rec.name_len, view.text.len()) || rec.sig as usize >= view.sigs.len() {
-            return Err(row("intrinsics", r, "a name past `text` or a signature past `sigs`"));
+        if !within(rec.name_first, rec.name_len, view.names.len()) || rec.sig as usize >= view.sigs.len() {
+            return Err(row("intrinsics", r, "a name past `names` or a signature past `sigs`"));
         }
-        if std::str::from_utf8(view.text(rec.name_first, rec.name_len)).is_err() {
+        if std::str::from_utf8(&view.names[rec.name_first as usize..][..rec.name_len as usize]).is_err() {
             return Err(row("intrinsics", r, "a name that is not UTF-8"));
         }
     }
@@ -366,7 +366,7 @@ fn structure_tables(view: &View<'_>) -> Result {
     for (r, rec) in view.asms.iter().enumerate() {
         if !within(rec.pieces_first, rec.pieces_len, view.asm_pieces.len())
             || !within(rec.operands_first, rec.operands_len, view.asm_operands.len())
-            || !within(rec.clobbers_first, rec.clobbers_len, view.text.len())
+            || !within(rec.clobbers_first, rec.clobbers_len, view.asm_text.len())
         {
             return Err(row("asms", r, "pieces, operands or clobbers past their columns"));
         }
@@ -374,7 +374,7 @@ fn structure_tables(view: &View<'_>) -> Result {
         if rec.options & !options != 0 {
             return Err(row("asms", r, "an option of no known meaning"));
         }
-        if std::str::from_utf8(view.text(rec.clobbers_first, rec.clobbers_len)).is_err() {
+        if std::str::from_utf8(view.asm_str(rec.clobbers_first, rec.clobbers_len)).is_err() {
             return Err(row("asms", r, "clobbers that are not UTF-8"));
         }
         let pieces = &view.asm_pieces[rec.pieces_first as usize..][..rec.pieces_len as usize];
@@ -382,10 +382,10 @@ fn structure_tables(view: &View<'_>) -> Result {
         for piece in pieces {
             match piece.kind {
                 AsmPieceRec::TEXT => {
-                    if !within(piece.a, piece.b, view.text.len())
-                        || std::str::from_utf8(view.text(piece.a, piece.b)).is_err()
+                    if !within(piece.a, piece.b, view.asm_text.len())
+                        || std::str::from_utf8(view.asm_str(piece.a, piece.b)).is_err()
                     {
-                        return Err(row("asms", r, "template text past `text` or not UTF-8"));
+                        return Err(row("asms", r, "template text past `asm_text` or not UTF-8"));
                     }
                     if piece.b == 0 || text_before {
                         return Err(row("asms", r, "an empty text piece or two in a row, which are written as one"));
@@ -406,12 +406,12 @@ fn structure_tables(view: &View<'_>) -> Result {
             let Some(kind) = AsmOperandKind::from_byte(operand.kind) else {
                 return Err(row("asms", r, "an operand of no known kind"));
             };
-            if !within(operand.reg_first, operand.reg_len, view.text.len())
-                || std::str::from_utf8(view.text(operand.reg_first, operand.reg_len)).is_err()
+            if !within(operand.reg_first, operand.reg_len, view.asm_text.len())
+                || std::str::from_utf8(view.asm_str(operand.reg_first, operand.reg_len)).is_err()
                 || operand.class > 1
                 || operand.pad != [0; 2]
             {
-                return Err(row("asms", r, "an operand's register past `text`, or its class or padding of no meaning"));
+                return Err(row("asms", r, "an operand's register past `asm_text`, or its class or padding of no meaning"));
             }
             if matches!(kind, AsmOperandKind::Sym) && operand.aux as usize >= view.refs.len() {
                 return Err(row("asms", r, "a `sym` operand naming no reference"));
@@ -421,7 +421,58 @@ fn structure_tables(view: &View<'_>) -> Result {
     if std::str::from_utf8(view.features).is_err() {
         return Err(func("target features that are not UTF-8"));
     }
-    Ok(())
+    canonical(view)
+}
+
+/// Whether the ranges `(first, len)` follow one another from 0 and end at `total`.
+fn tiles(ranges: impl Iterator<Item = (u32, u32)>, total: usize) -> bool {
+    let mut at = 0u64;
+    for (first, len) in ranges {
+        if first as u64 != at {
+            return false;
+        }
+        at += len as u64;
+    }
+    at == total as u64
+}
+
+/// Each list table's rows lie one after another in their columns, in row order, and fill
+/// them: so one function has one encoding, and equal functions are equal bytes.
+fn canonical(view: &View<'_>) -> Result {
+    let checks: [(&'static str, bool); 8] = [
+        ("compounds", tiles(view.compounds.iter().map(|it| (it.first, it.len)), view.compound_tys.len())),
+        (
+            "sigs",
+            tiles(
+                view.sigs.iter().map(|it| (it.first, it.params as u32 + it.rets as u32)),
+                view.sig_params.len(),
+            ),
+        ),
+        ("datas", tiles(view.datas.iter().map(|it| (it.bytes_first, it.bytes_len)), view.data_bytes.len())),
+        ("datas", tiles(view.datas.iter().map(|it| (it.relocs_first, it.relocs_len)), view.data_relocs.len())),
+        ("intrinsics", tiles(view.intrinsics.iter().map(|it| (it.name_first, it.name_len)), view.names.len())),
+        ("asms", tiles(view.asms.iter().map(|it| (it.pieces_first, it.pieces_len)), view.asm_pieces.len())),
+        ("asms", tiles(view.asms.iter().map(|it| (it.operands_first, it.operands_len)), view.asm_operands.len())),
+        ("asms", {
+            // Each block's text: its template's text pieces, its operands' registers, then
+            // its clobbers.
+            let text = view.asms.iter().flat_map(|rec| {
+                let pieces = view.asm_pieces[rec.pieces_first as usize..][..rec.pieces_len as usize]
+                    .iter()
+                    .filter(|it| it.kind == AsmPieceRec::TEXT)
+                    .map(|it| (it.a, it.b));
+                let regs = view.asm_operands[rec.operands_first as usize..][..rec.operands_len as usize]
+                    .iter()
+                    .map(|it| (it.reg_first, it.reg_len));
+                pieces.chain(regs).chain(std::iter::once((rec.clobbers_first, rec.clobbers_len)))
+            });
+            tiles(text, view.asm_text.len())
+        }),
+    ];
+    match checks.iter().find(|it| !it.1) {
+        Some(&(table, _)) => Err(row(table, 0, "rows that do not follow one another in their columns, in row order")),
+        None => Ok(()),
+    }
 }
 
 fn structure_debug(view: &View<'_>) -> Result {

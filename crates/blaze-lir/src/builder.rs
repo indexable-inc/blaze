@@ -573,13 +573,14 @@ impl<A: Allocator + Clone, S: Sink> Builder<A, S> {
         let same = |row: u32| {
             let rec = func.intrinsics[row as usize];
             rec.sig == sig.0
-                && func.text[rec.name_first as usize..][..rec.name_len as usize] == *name.as_bytes()
+                && func.names[rec.name_first as usize..][..rec.name_len as usize] == *name.as_bytes()
         };
         let rows = self.func.intrinsics.len() as u32;
         match intern(&mut self.intrinsic_rows, hash, rows, same) {
             Ok(row) => IntrinsicId(row),
             Err(row) => {
-                let name_first = self.push_text(name);
+                let name_first = self.func.names.len() as u32;
+                self.func.names.extend_from_slice(name.as_bytes());
                 self.func.intrinsics.push(IntrinsicRec {
                     name_first,
                     name_len: name.len() as u32,
@@ -591,8 +592,8 @@ impl<A: Allocator + Clone, S: Sink> Builder<A, S> {
     }
 
     fn push_text(&mut self, text: &str) -> u32 {
-        let first = self.func.text.len() as u32;
-        self.func.text.extend_from_slice(text.as_bytes());
+        let first = self.func.asm_text.len() as u32;
+        self.func.asm_text.extend_from_slice(text.as_bytes());
         first
     }
 

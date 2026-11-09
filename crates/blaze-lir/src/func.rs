@@ -500,7 +500,7 @@ blaze_format::record! {
 }
 
 blaze_format::record! {
-    /// A target intrinsic (`core::arch`'s `link_name = "llvm.*"`): its name in `text` and
+    /// A target intrinsic (`core::arch`'s `link_name = "llvm.*"`): its name in `names` and
     /// its signature, a row of `sigs`.
     #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
     pub struct IntrinsicRec: 1 {
@@ -559,7 +559,7 @@ blaze_format::record! {
 
 blaze_format::record! {
     /// An `asm!` block: its template's pieces, its operands, its options and the ABIs it
-    /// clobbers (`clobber_abi`, comma-separated in `text`).
+    /// clobbers (`clobber_abi`, comma-separated in `asm_text`).
     #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
     pub struct AsmRec: 1 {
         pub pieces_first: u32,
@@ -597,7 +597,7 @@ impl AsmRec {
 }
 
 blaze_format::record! {
-    /// A piece of an `asm!` template: text (`kind` 0, `text[a..][..b]`), or an operand
+    /// A piece of an `asm!` template: text (`kind` 0, `asm_text[a..][..b]`), or an operand
     /// (`kind` 1, operand `a` of the block, `b` its modifier character or 0).
     #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
     pub struct AsmPieceRec: 1 {
@@ -680,7 +680,7 @@ impl AsmOperandKind {
 }
 
 blaze_format::record! {
-    /// An `asm!` operand: its register or register class (`text[reg_first..][..reg_len]`, empty
+    /// An `asm!` operand: its register or register class (`asm_text[reg_first..][..reg_len]`, empty
     /// for `sym` and `label`), and `aux` as its kind says.
     #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
     pub struct AsmOperandRec: 1 {
@@ -779,8 +779,10 @@ macro_rules! columns {
             asms: AsmRec,
             asm_pieces: AsmPieceRec,
             asm_operands: AsmOperandRec,
-            /// Names and text: intrinsic names, asm templates and registers.
-            text: u8,
+            /// The intrinsics' names, in row order.
+            names: u8,
+            /// The asm blocks' text (template pieces, registers, clobbers), in row order.
+            asm_text: u8,
             /// The span table `locs` names: position-free spans.
             spans: SpanRef,
             /// Empty, or per span its scope (`SCOPE_*`).
@@ -965,9 +967,9 @@ impl<'a> View<'a> {
         self.locs.get(inst)?.checked_sub(1).map(|row| self.spans[row as usize])
     }
 
-    /// `text[first..first + len]`.
-    pub fn text(&self, first: u32, len: u32) -> &'a [u8] {
-        &self.text[first as usize..][..len as usize]
+    /// `asm_text[first..first + len]`.
+    pub fn asm_str(&self, first: u32, len: u32) -> &'a [u8] {
+        &self.asm_text[first as usize..][..len as usize]
     }
 
     pub fn reference(&self, id: RefId) -> RefRec {
@@ -988,7 +990,7 @@ impl<'a> View<'a> {
 
     pub fn intrinsic_name(&self, id: IntrinsicId) -> &'a [u8] {
         let rec = self.intrinsics[id.index()];
-        self.text(rec.name_first, rec.name_len)
+        &self.names[rec.name_first as usize..][..rec.name_len as usize]
     }
 
     pub fn asm_pieces_of(&self, id: AsmId) -> &'a [AsmPieceRec] {
