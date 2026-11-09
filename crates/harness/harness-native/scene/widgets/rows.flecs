@@ -5,8 +5,9 @@
 // arm set before (so where a part's look depends on a prop, every arm sets it).
 //
 // Notion's sidebar: calm one-line rows, no dots and no marks. How a row stands is in its title's ink (`look`: "on" while
-// selected, "rest" while live, "done" once it ended), its title breathing slowly while it works (`busy`), and a few muted
-// words trailing it (`meta`), red only when it went wrong (`alarm`). The parts are hn.tree's (scene/widgets/tree.flecs).
+// selected, "rest" while live, "done" once it ended), a band of light sweeping through its title while it works (a Sheen
+// at the pace of what it does: `pace`, `busy`; tokens sheen_* in 00-tokens.flecs), and a few muted words trailing it
+// (`meta`), red only when it went wrong (`alarm`). The parts are hn.tree's (scene/widgets/tree.flecs).
 using flecs.script
 
 @tree ChildOf
@@ -15,14 +16,13 @@ hn {
   // line, and trailing how long ago it started or ended, or how it went wrong (`why` its tooltip). On hover its shortcut
   // (`hint`) takes the trailing words' place. `focus`: the selection while the tree has the keyboard. `edit`: its name is
   // being renamed (cmd+R): the name is the field's words (the host sets their caret and selection), its pill the field.
-  // `menu`: its menu is open (a right press on it, src/app/row_menu.rs): ringed in the accent.
+  // `menu`: its menu is open (a right press on it, src/app/row_menu.rs): ringed in the accent. `pace`: what its agent is
+  // doing now (src/app.rs doing_of; "" at rest), the rhythm its title's sheen sweeps at; the words of it lead its tooltip.
   @tree ChildOf
   template ObjRow : Row {
     prop look: string = "rest"
     prop mark: string = ""
-    prop doing: string = ""
-    prop doing_tip: string = ""
-    prop busy: bool = false
+    prop pace: string = ""
     prop alarm: bool = false
     prop meta: string = ""
     prop why: string = ""
@@ -37,8 +37,8 @@ hn {
     hang { hn.Hang: {obj: $obj, depth: $depth, kids: $kids, open: $open, mark: $mark} }
     name : hn.tree.Head {
       Text: {s: $name}
-      // Where it works and when it started or ended (the trailing words carry only what is new: what it does, how it
-      // failed).
+      // What it is doing while it works ("Running a command: cargo test"), where it works and when it started or ended
+      // (the trailing words carry only what is new: what it works on, how it failed).
       Tooltip: {text: $why}
       if $look == "on" {
         Fill: $tone_ink_strong
@@ -51,27 +51,30 @@ hn {
         }
         TextStyle: {size: $size_row, line: $line_row, role: 0, bold: 0, weight: $weight_tree}
       }
-      // A breath of low 1 does not dim: the way a re-run stops one (it cannot remove it).
-      if $busy {
-        Breath: {spring: {x: 1, v: 0}, up: false, low: $breath_title_low}
+      // While it works, a band of light through its letters at the pace of what it does: a slow drift while it thinks,
+      // quick crisp passes while a command runs, steady while it edits or writes, medium while it reads or uses a tool,
+      // two bands chasing while a sub-agent works. At rest a sheen of strength 0, which lights nothing: the way a re-run
+      // stops one (it cannot remove it).
+      if $pace == "think" {
+        Sheen: {period: $sheen_think_period, rest: $sheen_think_rest, band: $sheen_think_band, strength: $sheen_think_strength, still: $sheen_still, ease: $sheen_think_ease, bands: 1, phase: 0, scatter: true, dark: $tone_sheen.dark, light: $tone_sheen.light}
       } else {
-        Breath: {spring: {x: 1, v: 0}, up: false, low: 1}
-      }
-    }
-    // What a working agent is doing now (src/app.rs doing_of: thinking, a command, an edit, a read, the web, a sub-agent,
-    // its reply), a glyph after its title in the muted ink, named by its tooltip; nothing at rest.
-    doing : ui.Symbol {
-      Tooltip: {text: $doing_tip}
-      if $doing == "" {
-        Icon: {glyph: ""}
-        Fill: $tone_clear
-        Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $tree_doing, min: 0, max: 0}}
-        Padding: {l: 0, r: 0, t: 0, b: 0}
-      } else {
-        Icon: {glyph: $doing}
-        Fill: $tone_ink_muted
-        Size: {w: {kind: Fixed, value: $tree_doing + $tree_doing_gap, min: 0, max: 0}, h: {kind: Fixed, value: $tree_doing, min: 0, max: 0}}
-        Padding: {l: $tree_doing_gap, r: 0, t: 0, b: 0}
+        if $pace == "run" {
+          Sheen: {period: $sheen_run_period, rest: $sheen_run_rest, band: $sheen_run_band, strength: $sheen_run_strength, still: $sheen_still, ease: $sheen_run_ease, bands: 1, phase: 0, scatter: true, dark: $tone_sheen.dark, light: $tone_sheen.light}
+        } else {
+          if $pace == "edit" {
+            Sheen: {period: $sheen_edit_period, rest: $sheen_edit_rest, band: $sheen_edit_band, strength: $sheen_edit_strength, still: $sheen_still, ease: $sheen_edit_ease, bands: 1, phase: 0, scatter: true, dark: $tone_sheen.dark, light: $tone_sheen.light}
+          } else {
+            if $pace == "read" {
+              Sheen: {period: $sheen_read_period, rest: $sheen_read_rest, band: $sheen_read_band, strength: $sheen_read_strength, still: $sheen_still, ease: $sheen_read_ease, bands: 1, phase: 0, scatter: true, dark: $tone_sheen.dark, light: $tone_sheen.light}
+            } else {
+              if $pace == "agent" {
+                Sheen: {period: $sheen_agent_period, rest: $sheen_agent_rest, band: $sheen_agent_band, strength: $sheen_agent_strength, still: $sheen_still, ease: $sheen_agent_ease, bands: $sheen_agent_bands, phase: 0, scatter: true, dark: $tone_sheen.dark, light: $tone_sheen.light}
+              } else {
+                Sheen: {period: 0, rest: 0, band: 0, strength: 0, still: 0, ease: 0, bands: 1, phase: 0, scatter: false, dark: $tone_sheen.dark, light: $tone_sheen.light}
+              }
+            }
+          }
+        }
       }
     }
     spacer : ui.Spacer {}
@@ -129,7 +132,8 @@ hn {
   }
 
   // A shell run (or one of its pipeline stages) under its session, on the session rows' grid: its command, shortened
-  // (src/app.rs short_cmd) in the quieter run ink, breathing while it runs (`busy`), and trailing how long it took
+  // (src/app.rs short_cmd) in the quieter run ink, a sheen through it at a command's pace while it runs (`busy`), and
+  // trailing how long it took
   // (`meta`; on hover, or always when `keep`: a failure, lost, pending, skipped; red when `alarm`). A folded session
   // shows only its running runs, so a finished one folds away on its own.
   @tree ChildOf
@@ -159,9 +163,9 @@ hn {
         }
       }
       if $busy {
-        Breath: {spring: {x: 1, v: 0}, up: false, low: $breath_title_low}
+        Sheen: {period: $sheen_run_period, rest: $sheen_run_rest, band: $sheen_run_band, strength: $sheen_run_strength, still: $sheen_still, ease: $sheen_run_ease, bands: 1, phase: 0, scatter: true, dark: $tone_sheen.dark, light: $tone_sheen.light}
       } else {
-        Breath: {spring: {x: 1, v: 0}, up: false, low: 1}
+        Sheen: {period: 0, rest: 0, band: 0, strength: 0, still: 0, ease: 0, bands: 1, phase: 0, scatter: false, dark: $tone_sheen.dark, light: $tone_sheen.light}
       }
     }
     spacer : ui.Spacer {}

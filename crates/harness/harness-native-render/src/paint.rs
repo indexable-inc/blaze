@@ -12,7 +12,7 @@ use harness_native_flecs::prelude::*;
 use harness_native_ui_draw_api::{PaintKind, Painted};
 use harness_native_ui_layout::typeset;
 use harness_native_ui_layout_api::Intrinsic;
-use harness_native_ui_look_api::{Edge, Fill, HoverInk, HoverLook, Lift, PressLook, Rgba, Shape, StrikeLook, Stroke, TextStyle};
+use harness_native_ui_look_api::{Edge, Fill, HoverInk, HoverLook, Lift, PressLook, Rgba, Shape, Sheen, StrikeLook, Stroke, TextStyle};
 use harness_native_ui_motion_api::{CopyFlash, Pose};
 use harness_native_ui_node_api::Laid;
 use harness_native_ui_text_api::{
@@ -78,6 +78,11 @@ pub struct Painter {
     carets: crate::caret::Carets,
     /// A caret painted in the last frame is still sweeping ([`Painter::end_frame`]): the host draws another.
     pub gliding: bool,
+    /// Words painted this frame carry a moving [`Sheen`].
+    sheening: bool,
+    /// Words painted in the last frame carried a moving [`Sheen`] ([`Painter::end_frame`]): the host keeps drawing, at its
+    /// calm rate (a sheen is slow light, not motion that wants every frame). False under Reduce Motion, where it is still.
+    pub shimmering: bool,
 }
 
 /// The most points one `Vector` node flattens to; past it the path is cut and the node's paint fails, named.
@@ -305,6 +310,8 @@ impl Painter {
             arriving: false,
             carets: crate::caret::Carets::default(),
             gliding: false,
+            sheening: false,
+            shimmering: false,
             highlight: crate::highlight::Highlighter::default(),
             media: None,
         }
@@ -486,6 +493,7 @@ impl Painter {
         self.kip_wake = self.kips.end_frame();
         self.arriving = self.arrivals.end_frame();
         self.gliding = self.carets.end_frame();
+        self.shimmering = std::mem::take(&mut self.sheening);
         if self.cache.overflowed() {
             self.cache.clear();
             return true;
@@ -819,6 +827,30 @@ impl Painter {
                         }
                         pulse.light_glyph(g);
                     }
+                }
+                // A sheen: its band of light through the words, each glyph lit by where its middle is (the widest line
+                // the span it crosses). Words at rest (none, or one of strength 0) cost one lookup.
+                if let Some(s) = e.try_cloned::<&Sheen>().filter(Sheen::live) {
+                    let still = harness_native_api::reduced(e.world());
+                    let span = lay.lines.iter().map(|l| l.width).fold(0.0, f32::max);
+                    let lift = rgba(if dark { s.dark } else { s.light });
+                    let t = time + s.offset(e.id().0);
+                    for g in &mut d.glyphs[first_glyph..] {
+                        // Colour glyphs (emoji) keep their own colours.
+                        if g.kind[0] > 0.5 {
+                            continue;
+                        }
+                        let k = s.lit(t, span, g.rect[0] + g.rect[2] * 0.5 - laid.x, still);
+                        if k <= 0.0 {
+                            continue;
+                        }
+                        for col in [&mut g.col_d, &mut g.col_l] {
+                            for (c, to) in col.iter_mut().zip(lift).take(3) {
+                                *c += (to - *c) * k;
+                            }
+                        }
+                    }
+                    self.sheening |= !still;
                 }
                 if md.is_some() {
                     let size = set_of(&style).size;

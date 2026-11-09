@@ -43,5 +43,6 @@ swiftui_gallery : ui.Column {
     level : ex.LevelDemo {}
     browser : ex.BrowserDemo {}
     art : ex.ArtDemo {}
+    sheen : ex.SheenDemo {}
   }
 }
