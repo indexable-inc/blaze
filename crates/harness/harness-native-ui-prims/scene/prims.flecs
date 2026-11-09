@@ -559,6 +559,14 @@ ui {
   prefab MenuItemOn : ui.MenuItem {
     mark : ui.Check { Fill: $tone_ink_strong }
   }
+  // An item that is not a choice but more of the list (a fold's "4 older"): its label quiet, at the meta's size, in
+  // line with the labels over it.
+  prefab MenuItemQuiet : ui.MenuItem {
+    label {
+      Fill: $tone_ink_muted
+      TextStyle: {size: $size_menu_meta, line: $line_menu, role: 0, bold: 0}
+    }
+  }
   // A section's head: small, muted, in line with the items' labels.
   prefab MenuHead : ui.Row {
     Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
