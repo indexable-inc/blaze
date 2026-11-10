@@ -326,6 +326,8 @@ fn start(mtm: MainThreadMarker, scene: &UIWindowScene) -> Result<(), String> {
     app.set_media(renderer.media());
     // A phone has no room for the tree beside the chat: it starts folded.
     app.fold_sidebar_now();
+    // No vibrancy under the Metal view here: the sidebar's ground is drawn opaque.
+    app.opaque_sidebar();
     if let Err(e) = app.start_sound() {
         eprintln!("harness-native: sound: {e}");
     }
