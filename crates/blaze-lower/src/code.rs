@@ -950,9 +950,10 @@ pub(crate) fn planted(_plant: Plant) -> bool {
 ///   type or const parameter, no `where`, and no `impl Trait` or macro in its signature;
 /// - no attribute of it names `inline` (one that gives it to a macro already keeps it: the
 ///   walk leaves no shape where a macro sees);
-/// - it is under nothing but modules and `impl`s with no type or const parameter, no `where`
-///   and no `const`: never in a trait (a default method is instantiated for each `Self`), a
-///   function or a macro's tokens;
+/// - it is under nothing but modules and `impl`s with no type or const parameter, no `where`,
+///   no `const` and no `impl Trait` anywhere in them (an associated type that hides its type
+///   takes it from the `impl`'s bodies): never in a trait (a default method is instantiated
+///   for each `Self`), a function or a macro's tokens;
 /// - it holds no item, no attribute that gives anything to a macro, and no macro call but a
 ///   [`plain_call`], which makes no item ([`CodeText::unplain`] says when one of those names
 ///   could mean another macro, and the crate then keeps every body).
@@ -1006,14 +1007,18 @@ pub(crate) fn plain_body(body: &SyntaxNode) -> bool {
         | SyntaxKind::ITEM_LIST
         | SyntaxKind::ASSOC_ITEM_LIST
         | SyntaxKind::MODULE => true,
-        SyntaxKind::IMPL => at.children_with_tokens().all(|element| match element {
-            NodeOrToken::Token(token) => token.kind() != SyntaxKind::CONST_KW,
-            NodeOrToken::Node(node) => match node.kind() {
-                SyntaxKind::WHERE_CLAUSE => false,
-                SyntaxKind::GENERIC_PARAM_LIST => lifetimes_only(&node),
-                _ => true,
-            },
-        }),
+        SyntaxKind::IMPL => {
+            at.children_with_tokens().all(|element| match element {
+                NodeOrToken::Token(token) => token.kind() != SyntaxKind::CONST_KW,
+                NodeOrToken::Node(node) => match node.kind() {
+                    SyntaxKind::WHERE_CLAUSE => false,
+                    SyntaxKind::GENERIC_PARAM_LIST => lifetimes_only(&node),
+                    _ => true,
+                },
+            // An associated type that hides its type (`type Item = impl Trait;`) is given it
+            // by the bodies of its `impl`'s functions, whatever their signatures say.
+            }) && !at.descendants().any(|it| it.kind() == SyntaxKind::IMPL_TRAIT_TYPE)
+        }
         SyntaxKind::TRAIT => planted(Plant::Trait),
         _ => false,
     });

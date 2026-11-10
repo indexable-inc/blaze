@@ -574,6 +574,18 @@ fn the_oracle_catches_a_shape_with_no_line_count() {
     caught(Plant::Positions, Kind::Plain, Edit::Lines);
 }
 
+/// A body that gives an associated type its hidden type is kept, though its own signature
+/// names no `impl Trait`.
+#[test]
+fn a_body_that_defines_an_associated_types_hidden_type_is_kept() {
+    let text = |value: u8| {
+        format!(
+            "impl Iterator for S {{\n    type Item = impl Sized;\n    fn next(&mut self) -> Option<Self::Item> {{\n        Some({value})\n    }}\n}}\n"
+        )
+    };
+    assert_ne!(code(&text(1)).interface, code(&text(2)).interface);
+}
+
 /// The cutoff, directed: a plain function's body edit that moves no line, and a comment, are
 /// in no interface text; the same body edit is in the code text, which the crate's own code
 /// and every unit that builds code read.
