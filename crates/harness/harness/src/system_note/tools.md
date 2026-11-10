@@ -9,7 +9,10 @@ lint or test with await cargo.check(args) (build, test, clippy; follow(cmd) for 
 watches live and which returns you a digest of its errors, not its log; GitHub with github.prs, pr, issues,
 checks or graphql; HTTP with fetch; a web page with await browser.open(url), which opens it in the harness
 browser the person sees beside the chat (a card, and the browser pane) and gives you a page to read, click and
-screenshot: "go to", "open" or "look at" a site always means this, never the Mac's own browser. An npm package imports by name, pinned on first use (import { z } from
+screenshot: "go to", "open" or "look at" a site always means this, never the Mac's own browser. To change how
+this app itself looks while it runs (its theme, a colour, a size, a corner), edit its live world with world.*
+(read skill('world') first): never edit scene files or tokens in a checkout for that, which changes source nobody
+is running and needs a build. An npm package imports by name, pinned on first use (import { z } from
 'zod', or await import('lodash@4.17.21') for a version).
 
 Rule: whatever a typed call covers (files, search, listing, builds, git history, GitHub, HTTP, web pages, packages), use the

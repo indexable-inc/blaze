@@ -282,6 +282,8 @@ pub struct App {
     /// its calls have run.
     world_rx: Option<std::sync::mpsc::Receiver<crate::world_api::Pending>>,
     world_scripts: u32,
+    /// The chat (its session) whose window the person asked to tuck away, until the window takes it ([`App::take_tuck`]).
+    tuck: Option<u64>,
     /// Remember the selected object in native.json (not for the offscreen shot).
     pub persist: bool,
     /// An offscreen shot's `HARNESS_NATIVE_SHOT_WORKING` (src/shot.rs): every session row and every run row shows at
@@ -596,6 +598,7 @@ impl App {
             relit: 0.0,
             world_rx: None,
             world_scripts: 0,
+            tuck: None,
             persist: true,
             shot_working: false,
             shot_plan: Vec::new(), // alloc: empty but in a shot
@@ -1918,6 +1921,23 @@ impl App {
         self.palette = None;
     }
 
+    /// The chat the person asked to tuck the window away for, once.
+    pub fn take_tuck(&mut self) -> Option<u64> {
+        self.tuck.take()
+    }
+
+    /// What a tucked-away window's item shows for chat `sid` (src/window/mini.rs): the item of the step it is on while
+    /// its turn runs, `done` once it ended, `fail` when it ended on an error; and whether it still runs.
+    pub fn tucked(&self, sid: u64) -> (&'static str, bool) {
+        let chats = self.chats.borrow();
+        let Some(t) = chats.get(&sid) else { return ("done", false) };
+        if t.busy {
+            return (harness_native_render::block::item(chat::live_face()), true);
+        }
+        let failed = t.items.iter().rev().find(|i| !matches!(i, model::chat::Item::TurnEnd { .. })).is_some_and(|i| matches!(i, model::chat::Item::Error { .. }));
+        (if failed { "fail" } else { "done" }, false)
+    }
+
     // ---- the frame ----
 
     /// One frame at `points` (the window's size in points) on a display of `backing` pixels a point.
@@ -2278,6 +2298,9 @@ impl App {
             } else if let Some(target) = a.strip_prefix("open:") {
                 // A link in a view (in the browser pane), or a file (a cell's FileRef) in the app its kind opens in, at its line.
                 self.open_target(target, alt);
+            } else if a == "chat:tuck" {
+                // Put the window away until the chat in front is done (src/window/mini.rs).
+                self.tuck = self.focused_chat().map(|(_, _, sid)| sid);
             } else if a == "chat:focus" {
                 self.tree_focus = false;
             } else if a == "pal:close" {

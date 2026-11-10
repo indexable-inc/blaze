@@ -5,7 +5,16 @@ description: The harness app's own flecs world from ts (world.*): read and chang
 The harness app is drawn from a flecs world: every view is an entity made from a prefab, every colour, size, radius
 and spring is a component or a scene token. `world.*` in a ts cell reads and edits that world while the app runs.
 Use it when he asks to change the app itself ("make the accent orange", "bigger chat text", "what colour is the
-sidebar"): an edit here shows at once and needs no build. A change to what the app can do is still code.
+sidebar", "make the theme closer to my Ghostty config"): an edit here shows at once and needs no build. Never
+edit `00-tokens.flecs` or any scene file in a checkout to restyle the running app: that is source nobody is
+running. A change to what the app can do is still code.
+
+A whole theme is a handful of tokens. Read his colours (Ghostty: `~/.config/ghostty/config` and the theme file it
+names; `background`, `foreground`, `palette = N=#hex`), then set the grounds (`tone_ground`, `tone_sidebar`,
+`tone_card`, `tone_raised`, `tone_well`), the inks (`tone_ink_strong`, `tone_ink`, `tone_ink_muted`,
+`tone_ink_faint`), the lines (`tone_line`, `tone_line_strong`) and `tone_accent`, the `dark` member only for a dark
+theme, a few at a time, looking at the app between. `world.query('Fill, (ChildOf, hn.Theme), Prefab')` lists every
+role with its colour now.
 
 Names: an entity is its path with dots (`hn.Theme.card`, `hn.ChatPane`); a component is its name (`Fill`, `Size`,
 `TextStyle`, `Shape`, `Padding`); a token is a variable of scene/00-tokens.flecs (`tone_accent`, `size_body`).

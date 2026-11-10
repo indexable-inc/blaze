@@ -38,6 +38,7 @@ mod rename;
 mod steps;
 
 pub(super) use rename::Rename;
+pub(super) use steps::live_face;
 
 pub(super) use genui::Live as GenLive;
 pub(super) use peek::Live as PeekLive;

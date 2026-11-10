@@ -161,6 +161,16 @@ fn tally<'c>(calls: impl IntoIterator<Item = &'c group::Call>) -> Vec<(&'static 
     out
 }
 
+thread_local! {
+    /// The step the live line last filled is on (the chat in front's turn): what a tucked-away window's item shows.
+    static LIVE_FACE: std::cell::Cell<&'static str> = const { std::cell::Cell::new("think") };
+}
+
+/// The step the turn in front is on, as its live line last showed it.
+pub(in crate::app) fn live_face() -> &'static str {
+    LIVE_FACE.with(std::cell::Cell::get)
+}
+
 /// The kind of step `calls` are on now: the newest step of the newest call still running; `think` when none runs (the
 /// agent is between steps).
 fn now_kind<'c>(calls: impl DoubleEndedIterator<Item = &'c group::Call>) -> &'static str {
@@ -487,8 +497,9 @@ pub(super) fn fill_line(row: View<'_>, l: &Line) {
             block.face = kind.into();
             e.set(block);
         }
-        // The step it is on, to the ear (src/audio.rs: a new one plays its cue).
+        // The step it is on, to the ear (src/audio.rs: a new one plays its cue), and for a tucked-away window's item.
         crate::audio::step(kind);
+        LIVE_FACE.with(|f| f.set(kind));
     }
     let tally: &[(&'static str, usize)] = if l.live.is_some() { &[] } else { &l.tally };
     if let Some(items) = h.part("items") {
