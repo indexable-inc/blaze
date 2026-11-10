@@ -3912,6 +3912,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "hir-ty-lean"
+version = "0.0.0"
+dependencies = [
+ "base-db",
+ "blaze-ids",
+ "blaze-query",
+ "cfg",
+ "expect-test",
+ "hegeltest",
+ "hir-def",
+ "hir-expand",
+ "hir-ty",
+ "hir-ty-borrowck",
+ "hir-ty-mir",
+ "intern",
+ "rustc_type_ir",
+ "syntax",
+]
+
+[[package]]
 name = "hir-ty-linear"
 version = "0.0.0"
 dependencies = [

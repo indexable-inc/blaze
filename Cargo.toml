@@ -307,6 +307,7 @@ hir-ty-print = { path = "crates/hir-ty-print", version = "0.0.0" }
 hir-ty-identity = { path = "crates/hir-ty-identity" }
 hir-ty-verus = { path = "crates/hir-ty-verus", version = "0.0.0" }
 hir-ty-charon = { path = "crates/hir-ty-charon", version = "0.0.0" }
+hir-ty-lean = { path = "crates/hir-ty-lean", version = "0.0.0" }
 hir-ty-pure = { path = "crates/hir-ty-pure", version = "0.0.0" }
 hir-ty-suspend = { path = "crates/hir-ty-suspend", version = "0.0.0" }
 hir-ty-share = { path = "crates/hir-ty-share", version = "0.0.0" }
