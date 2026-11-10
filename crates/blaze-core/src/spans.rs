@@ -329,6 +329,39 @@ pub(crate) fn resolve(
     }
 }
 
+/// A read into `span` carried out by a driver outside this crate (a model's file system, which
+/// holds its files' bytes itself): `bytes`, what the file holds from `at` on, copied into the
+/// span's first bytes, as many as fit, and how many that was. The span's bytes past them are
+/// left as they were. Refused as every driver refuses a span ([`resolve`]).
+pub fn read_into(
+    span: &Span,
+    file: &FileName,
+    at: u64,
+    cache: Cache,
+    bytes: &[u8],
+) -> Result<u32, IoError> {
+    let resolved = resolve(span, file, at, cache, "reading")?;
+    Ok(resolved.with_mut(|into| {
+        let len = into.len().min(bytes.len());
+        into[..len].copy_from_slice(&bytes[..len]);
+        len as u32
+    }))
+}
+
+/// A write from `span` carried out by a driver outside this crate: the span's bytes as they
+/// are now, copied, for the driver to put at `at` of `file`. Refused as every driver refuses a
+/// span ([`resolve`]).
+pub fn written_from(
+    span: &Span,
+    file: &FileName,
+    at: u64,
+    cache: Cache,
+) -> Result<Vec<u8>, IoError> {
+    let resolved = resolve(span, file, at, cache, "writing")?;
+    // alloc: a model's driver keeps the bytes as its file's change; never a build's path.
+    Ok(resolved.with(<[u8]>::to_vec))
+}
+
 /// Why [`resolve`] refused `span` of the effect `what` of `file` at `at`.
 fn refusal(span: &Span, file: &FileName, at: u64, what: &str, why: fmt::Arguments<'_>) -> IoError {
     // alloc: an error path.
