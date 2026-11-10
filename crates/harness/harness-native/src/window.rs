@@ -69,8 +69,54 @@ struct State {
     rest: Option<NSPoint>,
     /// The windows the open menus, popovers and hover cards float in (overlay.rs).
     overlays: overlay::Overlays,
+    /// The window is tucked away: its turn's item floating at the screen's corner (mini.rs).
+    mini: Option<mini::Mini>,
 }
 
+/// Tuck the window away for chat `sid`: it is ordered out and the chat's item floats until a press on it (or the Dock
+/// icon) brings the window back ([`untuck`]).
+fn tuck(st: &mut State, sid: u64) {
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    if let Some(old) = st.mini.take() {
+        old.close();
+    }
+    let block = block2::RcBlock::new(move |_: std::ptr::NonNull<objc2_foundation::NSTimer>| {
+        let now = objc2_quartz_core::CACurrentMediaTime();
+        with(|st| {
+            let Some(m) = st.mini.as_mut() else { return };
+            let (face, running) = st.app.tucked(m.sid);
+            m.step(now, face, running);
+        });
+    });
+    // SAFETY: the block runs on the main thread (a main-run-loop timer) and touches only main-thread state.
+    let timer = unsafe { objc2_foundation::NSTimer::timerWithTimeInterval_repeats_block(1.0 / 12.0, true, &block) };
+    // SAFETY: the main run loop, common modes.
+    unsafe { NSRunLoop::mainRunLoop().addTimer_forMode(&timer, NSRunLoopCommonModes) };
+    st.mini = Some(mini::Mini::show(mtm, &st.window, sid, timer, objc2_quartz_core::CACurrentMediaTime()));
+    st.window.orderOut(None);
+}
+
+/// Bring a tucked-away window back, on the chat it was tucked for. Nothing when it is not tucked.
+fn untuck() {
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let back = with(|st| {
+        let Some(m) = st.mini.take() else { return false };
+        let sid = m.sid;
+        m.close();
+        st.app.select_session(sid);
+        st.app.poke();
+        st.link.setPaused(false);
+        st.window.makeKeyAndOrderFront(None);
+        true
+    });
+    if back == Some(true) {
+        // The person pressed the item (or the Dock icon): the app comes to the front with its window.
+        #[allow(deprecated)]
+        NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
+    }
+}
+
+mod mini;
 mod overlay;
 
 thread_local! {
@@ -964,6 +1010,10 @@ impl HarnessView {
                 dt,
                 &mut |x, y, w, h, b| renderer.upload_atlas(x, y, w, h, b),
             );
+            // The live line's tuck button: the window goes away until its turn is done (mini.rs).
+            if let Some(sid) = st.app.take_tuck() {
+                tuck(st, sid);
+            }
             let built = objc2_quartz_core::CACurrentMediaTime();
             // The open overlays into their own windows, drawn in the same command buffer as the window.
             let floats = st.app.take_floats();
@@ -1441,6 +1491,7 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
             inside: false,
             rest: None,
             overlays,
+            mini: None,
         })
     });
     // The sidebar's material behind the whole window (Finder's, Zed's): the main card covers it with an opaque plate.
@@ -1588,6 +1639,13 @@ define_class!(
             // What was typed since the last pause is kept too.
             with(|st| st.app.flush_drafts());
             single::release();
+        }
+
+        /// The Dock icon pressed: a tucked-away window comes back.
+        #[unsafe(method(applicationShouldHandleReopen:hasVisibleWindows:))]
+        fn handle_reopen(&self, _app: &NSApplication, _visible: bool) -> bool {
+            untuck();
+            true
         }
 
         #[unsafe(method(applicationShouldTerminateAfterLastWindowClosed:))]

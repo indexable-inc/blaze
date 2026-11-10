@@ -129,9 +129,11 @@ hn {
     }
   }
   // While it runs: the item of the step it is on (ui.Block), flush left under the newest words, and no marks yet. A
-  // column of its own (not hn.StepLine's: that head's hover-only chevron comes first and pushed the item in).
-  prefab StepLineLive : ui.Column {
-    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+  // row of its own (not hn.StepLine's: that head's hover-only chevron comes first and pushed the item in). At its far
+  // end, `tuck`: put the window away until the turn is done (src/window/mini.rs: the item floats at the screen's corner
+  // meanwhile, and a press on it brings the window back).
+  prefab StepLineLive : ui.Row {
+    Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     Padding: {l: 0, r: 0, t: 6, b: 2}
     guide : hn.ChatGuideOff {}
@@ -141,8 +143,18 @@ hn {
       Cursor: {shape: Arrow}
       Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
       Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $block_size, min: 0, max: 0}}
-      AlignSelf: {align: Start}
       block : ui.Block {}
+    }
+    room : ui.Spacer {}
+    tuck : ui.IconButton {
+      Action: {name: "chat:tuck"}
+      Tooltip: {text: "Tuck away until this is done"}
+      AlignSelf: {align: Center}
+      Size: {w: {kind: Fixed, value: 24, min: 0, max: 0}, h: {kind: Fixed, value: 24, min: 0, max: 0}}
+      icon : ui.Symbol {
+        Icon: {glyph: ""}
+        Size: {w: {kind: Fixed, value: 14, min: 0, max: 0}, h: {kind: Fixed, value: 14, min: 0, max: 0}}
+      }
     }
   }
   prefab StepLineFailed : hn.StepLine {
