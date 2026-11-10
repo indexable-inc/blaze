@@ -64,6 +64,11 @@ pub trait PackageTargets {
     fn has_proc_macro_lib(&self, package_id: PackageId) -> bool;
     /// Whether a `[target.'cfg(..)'.dependencies]` platform holds for `kind`.
     fn platform_activated(&self, platform: &Platform, kind: CompileKind) -> bool;
+    /// Whether a platform holds for a build dependency or a dependency under a proc macro:
+    /// the host's, as in cargo. blaze, which builds proc macros for wasm, adds that platform.
+    fn host_dep_activated(&self, platform: &Platform) -> bool {
+        self.platform_activated(platform, CompileKind::Host)
+    }
 }
 
 /// The platform a unit is built for: the host, or a `--target`.
@@ -722,7 +727,7 @@ impl<'a, T: PackageTargets> FeatureResolver<'a, T> {
                     // We always care about build-dependencies, and they are always
                     // Host. If we are computing dependencies "for a build script",
                     // even normal dependencies are host-only.
-                    targets.platform_activated(platform, CompileKind::Host)
+                    targets.host_dep_activated(platform)
                 }
                 (_, FeaturesFor::NormalOrDev) => {
                     requested_targets.iter().any(|kind| targets.platform_activated(platform, *kind))

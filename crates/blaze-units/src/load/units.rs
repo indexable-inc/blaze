@@ -132,7 +132,13 @@ pub(crate) fn units(
         Ok(it) => it,
         Err(error) => return Ok(fail(error)),
     };
-    let targets = Targets { reads: &resolved.reads, host, target: target.as_ref() };
+    let targets = Targets {
+        reads: &resolved.reads,
+        host,
+        target: target.as_ref(),
+        // A foreign (std) load builds for the wasm macros as its target, not under a macro.
+        macro_wasm: macro_wasm.as_ref().filter(|_| spec.foreign.is_none()),
+    };
     let kinds = match target {
         Some(target) => vec![CompileKind::Target(InternedString::new(&target.triple))],
         None => vec![CompileKind::Host],
@@ -719,6 +725,8 @@ struct Targets<'a> {
     reads: &'a HashMap<PackageId, Read, Global>,
     host: &'a Platformed,
     target: Option<&'a Platformed>,
+    /// The platform proc macros are built for, when they are built for wasm.
+    macro_wasm: Option<&'a Platformed>,
 }
 
 impl PackageTargets for Targets<'_> {
@@ -735,6 +743,12 @@ impl PackageTargets for Targets<'_> {
             CompileKind::Host => self.host.activates(platform),
             CompileKind::Target(_) => self.target.unwrap_or(self.host).activates(platform),
         }
+    }
+
+    /// The host's, or the wasm macros': the unit graph builds a proc macro's dependencies for
+    /// wasm, and asks for the features of each one either platform activates.
+    fn host_dep_activated(&self, platform: &Platform) -> bool {
+        self.host.activates(platform) || self.macro_wasm.is_some_and(|it| it.activates(platform))
     }
 }
 
