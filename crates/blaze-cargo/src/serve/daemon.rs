@@ -1185,7 +1185,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             effects.push(Effect::Connect { at: Address::Unix(socket.clone()), tag: DIAL });
         }
         let store_config =
-            blaze_cas::Config { dir: under(&state, "store"), layers: Vec::new(), tags: STORE };
+            blaze_cas::Config {
+                dir: under(&state, "store"),
+                layers: Vec::new(),
+                tags: STORE,
+                loader: blaze_cas::Loader::Thread,
+            };
         let mut store = Store::open(store_config, &mut effects);
         store.encode_columns(blaze_format::Spans::columns());
         store.encode_columns(hir_def::item_tree::ItemTree::columns());
@@ -1193,6 +1198,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             root: under(&options.std, "store"),
             writer: options.writer,
             tags: STD_STORE,
+            loader: blaze_cas::Loader::Thread,
         };
         let mut std = Store::open_shared(shared, &mut effects);
         let mut read =

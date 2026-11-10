@@ -56,7 +56,7 @@ fn race(case: Race, plant: bool) -> Result<(), String> {
     let mut sim = Sim::new(case.seed, Faults { max_latency: latency, ..Faults::default() });
     let (kind, bytes) = value_of(case.shape, case.seed ^ 0x5eed);
     let mut stores = [("a/store", 1u64 << 40), ("b/store", 2 << 40)].map(|(dir, tags)| {
-        let mut store = open_with(&mut sim, Config { dir: name(dir), layers: Vec::new(), tags });
+        let mut store = open_with(&mut sim, Config { dir: name(dir), layers: Vec::new(), tags, loader: crate::Loader::Pumped });
         store.plant_clear_then_clone = plant;
         store.put(key(1), kind, &bytes).unwrap();
         flush(&mut sim, &mut store);

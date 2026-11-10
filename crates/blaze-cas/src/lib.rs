@@ -477,6 +477,23 @@ pub struct Config {
     pub layers: Vec<FileName>,
     /// Tags it asks with are `tags..tags + 2^32`.
     pub tags: u64,
+    /// How its reads' misses are loaded.
+    pub loader: Loader,
+}
+
+/// How a store loads the pages a read needs that are not in memory
+/// (docs/v2/plan/design/store-pool.md, lane 4b). The store itself does no IO either way: a miss
+/// asks for its pages as effects, and this says who completes them. Nothing reads it until the
+/// store's reads are on its buffer pool; a store maps what it reads until then.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Loader {
+    /// A thread of the store's own drives the pool's reads on the target's native driver, and a
+    /// task that reads waits for its load through the one deadline wait: the daemon's.
+    #[default]
+    Thread,
+    /// Whoever drives the store's effects loads a miss by pumping them to completion where the
+    /// read is made: a test on the simulation, a tool. The store starts no thread.
+    Pumped,
 }
 
 /// Why a store stopped: it could not open, or its IO failed [`FAILURES_MOST`] times in a row.

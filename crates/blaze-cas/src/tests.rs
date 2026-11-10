@@ -17,7 +17,7 @@ fn name(it: &str) -> FileName {
 }
 
 fn config(dir: &str) -> Config {
-    Config { dir: name(dir), layers: Vec::new(), tags: 1 << 40 }
+    Config { dir: name(dir), layers: Vec::new(), tags: 1 << 40, loader: crate::Loader::Pumped }
 }
 
 fn key(n: u64) -> Key {
@@ -2505,7 +2505,7 @@ fn a_layer_is_read_after_the_store_and_never_written() {
     let before = sim.contents(&name("base/head"));
     let mut store = open_with(
         &mut sim,
-        Config { dir: name("mine"), layers: vec![name("base")], tags: 1 << 40 },
+        Config { dir: name("mine"), layers: vec![name("base")], tags: 1 << 40, loader: crate::Loader::Pumped },
     );
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), b"from the base");
     assert_eq!(bytes_of(&store, &key(2)).unwrap(), noise(400 << 10, 2));
@@ -2524,7 +2524,7 @@ fn a_missing_layer_stops_the_store() {
     let mut sim = Sim::new(12, quiet());
     let mut effects = Vec::new();
     let mut store = Store::open(
-        Config { dir: name("mine"), layers: vec![name("nowhere")], tags: 0 },
+        Config { dir: name("mine"), layers: vec![name("nowhere")], tags: 0, loader: crate::Loader::Pumped },
         &mut effects,
     );
     drive(&mut sim, &mut store, &mut effects);
@@ -2537,7 +2537,12 @@ fn writer(n: u64) -> ContentId {
 
 /// Writer `n` of the shared directory `shared`, with tags of its own.
 fn shared(n: u64) -> SharedConfig {
-    SharedConfig { root: name("shared"), writer: writer(n), tags: (1 << 40) + (n << 33) }
+    SharedConfig {
+        root: name("shared"),
+        writer: writer(n),
+        tags: (1 << 40) + (n << 33),
+        loader: Loader::Pumped,
+    }
 }
 
 fn writer_file(n: u64, file: &str) -> FileName {
@@ -3021,7 +3026,7 @@ fn machine_code_is_never_kept_from_a_fetch_and_a_value_says_its_directory() {
     drop(base);
     let mut store = open_with(
         &mut sim,
-        Config { dir: name("mine"), layers: vec![name("base")], tags: 1 << 40 },
+        Config { dir: name("mine"), layers: vec![name("base")], tags: 1 << 40, loader: crate::Loader::Pumped },
     );
     store.put(key(8), Kind::Machine, b"my code").unwrap();
     let mut remote = Recorded(Vec::new(), Vec::new());
