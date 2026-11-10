@@ -46,15 +46,14 @@ character (he has moods).
 ```
 
 Numbers are drawn. Parts of a whole (a disk's volumes, memory by process, a budget's lines) are one segmented bar
-with its legend, the total as a Stat over it and the few facts that matter in a small Table under it, never a
-sentence and never a bar chart of the parts:
+with its legend and the total as a Stat over it: never a sentence, never a bar chart of the parts, and no table
+repeating what the legend already says. The cell is the whole answer; write nothing after it.
 
 ```svelte
 <Column>
   <Stat label="Container disk3" value="7.72 TB" note="469 GB free" />
   <Chart kind="segments" unit="GB" data={[{label: 'Data', value: 2920}, {label: 'Projects', value: 2740},
     {label: 'Nix Store', value: 1480}, {label: 'VM', value: 87}, {label: 'Free', value: 469}]} />
-  <Table rows={[{what: 'Capacity', value: '7.72 TB'}, {what: 'Used', value: '7.25 TB'}, {what: 'Free', value: '469 GB'}]} />
 </Column>
 ```
 

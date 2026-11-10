@@ -516,7 +516,7 @@ fn segments(v: View<'_>, slices: Vec<(String, f64)>, unit: &str, b: &mut Budget<
         view::for_each_of(bar, parts.iter().enumerate().map(|(i, p)| (format!("s{i}"), "hn.GenSegment", p)), |sv, (_, value, k), _| {
             ink_on(sv, *k);
             // As long as its share; a sliver keeps a hairline of weight so it still shows.
-            let w = Size { w: Sizing { value: ((*value / total) as f32).max(0.002), ..Sizing::GROW }, h: Sizing::GROW };
+            let w = Size { w: Sizing { value: ((*value / total) as f32).max(0.002), min: 3.0, ..Sizing::GROW }, h: Sizing::GROW };
             if sv.entity().try_cloned::<&Size>() != Some(w) {
                 sv.set(w);
             }
