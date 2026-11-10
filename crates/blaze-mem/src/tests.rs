@@ -1410,6 +1410,28 @@ fn frames_after_a_build_hold_at_most_the_warm_shelf_a_worker() {
     cache.reset();
 }
 
+/// The control: the bound's reading is not blind. A shelf that kept everything its tasks
+/// held is past [`frame::WARM`] by the same reading: the task's frame, read while it holds
+/// twice the bound, says so; and the shelf it leaves is seen (not zero) until it is trimmed.
+#[test]
+fn the_oracle_catches_a_shelf_that_keeps_what_its_task_held() {
+    thread::spawn(|| {
+        let ((), peak) = frame::measure(|| {
+            frame::task(Tag::Mir, |frame| {
+                frame.alloc_slice_fill_with(1024, |i| i as u8);
+                frame.alloc_slice_fill_with(2 * frame::WARM, |i| i as u8);
+            });
+        });
+        assert!(peak > frame::WARM, "kept whole, the task's {peak} bytes are past the bound");
+        let spare = frame::spare_bytes();
+        assert!(spare > 0 && spare <= frame::WARM, "the shelf is seen and bounded: {spare}");
+        frame::trim_spare(0);
+        assert_eq!(frame::spare_bytes(), 0, "and seen to go");
+    })
+    .join()
+    .expect("the control's thread");
+}
+
 #[test]
 fn frame_matches_a_model_on_random_allocations_grows_shrinks_and_rollbacks() {
     use std::{alloc::Allocator, ptr::NonNull, slice};

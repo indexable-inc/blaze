@@ -614,6 +614,40 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// The control: a manifest rewritten in place with its stamp put back is the one change
+    /// the kept file cannot see, so there the oracle (kept and read agree) fails. It shows the
+    /// kept file is what answers while every stamp stands, and is the case [`SETTLED_NS`]
+    /// keeps out of the file.
+    #[test]
+    fn the_oracle_catches_a_manifest_rewritten_under_its_stamp() {
+        let root = std::env::temp_dir().join(format!("blaze-pin-control-{}", std::process::id()));
+        let start = root.join("src");
+        std::fs::create_dir_all(&start).unwrap();
+        let file = root.join("kept");
+        let manifest = root.join("Cargo.toml");
+        let pins = |version: &str| {
+            format!("[workspace]\n\n[workspace.metadata.blaze]\nversion = \"{version}\"\n")
+        };
+        manifest_aged(&manifest, &pins("0.20261027.1"), 60);
+        found_kept_in(&start, Some(&file)).unwrap();
+        assert!(kept(&file, &start).is_some(), "a settled lookup is kept");
+        let was = std::fs::metadata(&manifest).unwrap().modified().unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&manifest)
+            .and_then(|mut it| {
+                std::io::Write::write_all(&mut it, pins("0.20261027.2").as_bytes())?;
+                it.set_modified(was)
+            })
+            .unwrap();
+        assert_ne!(
+            found_kept_in(&start, Some(&file)).unwrap(),
+            found_kept_in(&start, None).unwrap(),
+            "kept and read disagree: the oracle sees it"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn the_root_manifest_holds_the_pin() {
         let root = std::env::temp_dir().join(format!("blaze-pin-{}", std::process::id()));

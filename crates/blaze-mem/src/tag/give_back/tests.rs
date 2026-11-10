@@ -202,6 +202,9 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
     sim.settle_all()
 }
 
+/// The invariant: when a purge may read, the generation settled is the one asked now, at or
+/// after the purge's own, and every thread counted then has given back beginning after it was
+/// asked; and once every counted thread gives back after the last ask, the purge settles.
 #[hegel::test(test_cases = 400)]
 fn a_purge_reads_only_once_every_counted_thread_gave_back_after_its_ask(tc: TestCase) {
     let plan = plan(&mut Drawn(&tc));

@@ -513,17 +513,59 @@ mod tests {
     /// (`file_mapped`, `shmem_thp`) is not the field.
     #[test]
     fn a_cgroups_footprint_is_its_charge_less_the_file_cache_the_kernel_can_drop() {
-        const GIB: u64 = 1 << 30;
-        let stat = format!(
+        assert_eq!(directed_case(super::charged), Some(5 * GIB));
+        let stat = directed_stat();
+        assert_eq!(super::charged(GIB, stat.as_bytes()), Some(0), "never below nothing");
+        assert_eq!(super::charged(10 * GIB, b"anon 5\nfile 3\n"), None, "no shmem line");
+        assert_eq!(super::charged(10 * GIB, b"anon 5\nshmem 3\n"), None, "no file line");
+    }
+
+    const GIB: u64 = 1 << 30;
+
+    /// The directed case's `memory.stat`: 6 GiB of file cache, 1 of it shared memory, among
+    /// lines that only begin with those fields' names.
+    fn directed_stat() -> String {
+        format!(
             "anon {}\nfile_mapped 7\nfile {}\nkernel 123\nshmem_thp 9\nshmem {}\nfile_dirty 0\n",
             4 * GIB,
             6 * GIB,
             GIB
-        );
-        assert_eq!(super::charged(10 * GIB, stat.as_bytes()), Some(5 * GIB));
-        assert_eq!(super::charged(GIB, stat.as_bytes()), Some(0), "never below nothing");
-        assert_eq!(super::charged(10 * GIB, b"anon 5\nfile 3\n"), None, "no shmem line");
-        assert_eq!(super::charged(10 * GIB, b"anon 5\nshmem 3\n"), None, "no file line");
+        )
+    }
+
+    /// What `charged` says of the directed case: a cgroup of 10 GiB with [`directed_stat`].
+    fn directed_case(charged: fn(u64, &[u8]) -> Option<u64>) -> Option<u64> {
+        charged(10 * GIB, directed_stat().as_bytes())
+    }
+
+    /// The control: the directed case tells the real rule from the two wrong ones beside it.
+    /// Shared memory counted as droppable (all of `file` taken off) says 4 GiB; no file cache
+    /// taken off says 10; a field matched by its prefix reads `file_mapped`'s 7 bytes as
+    /// `file`.
+    #[test]
+    fn the_oracle_catches_shared_memory_dropped_and_file_cache_kept() {
+        fn field(stat: &[u8], name: &[u8]) -> Option<u64> {
+            stat.split(|&it| it == b'\n')
+                .find_map(|line| super::decimal(line.strip_prefix(name)?.strip_prefix(b" ")?))
+        }
+        fn shmem_dropped(current: u64, stat: &[u8]) -> Option<u64> {
+            Some(current.saturating_sub(field(stat, b"file")?))
+        }
+        fn cache_kept(current: u64, _: &[u8]) -> Option<u64> {
+            Some(current)
+        }
+        fn by_prefix(current: u64, stat: &[u8]) -> Option<u64> {
+            let first = |name: &[u8]| {
+                stat.split(|&it| it == b'\n').find_map(|line| {
+                    let rest = line.strip_prefix(name)?;
+                    super::decimal(&rest[rest.iter().position(|&it| it == b' ')?..])
+                })
+            };
+            Some(current.saturating_sub(first(b"file")?.saturating_sub(first(b"shmem")?)))
+        }
+        assert_eq!(directed_case(shmem_dropped), Some(4 * GIB));
+        assert_eq!(directed_case(cache_kept), Some(10 * GIB));
+        assert_ne!(directed_case(by_prefix), Some(5 * GIB));
     }
 
     /// A cgroup whose files cannot be read has no footprint: never another measure in its

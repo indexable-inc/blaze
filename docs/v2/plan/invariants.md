@@ -11,14 +11,15 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-24 invariants, 1 refinements, 1 reference models.
-By level: 12 tested, 13 simulated, 0 model-checked, 0 proved.
+25 invariants, 1 refinements, 1 reference models.
+By level: 12 tested, 14 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
 ### blaze-cargo
 
 - **`a_cgroups_footprint_is_its_charge_less_the_file_cache_the_kernel_can_drop`** *tested* (`crates/blaze-cargo/src/raw/memory.rs`): the cgroup's footprint is its charge less the file cache the kernel can drop, and nothing else is taken off. The directed case: a cgroup of 10 GiB of which 6 are file cache, 1 of that shared memory, is 5 GiB (the control: counting all of `file` as droppable says 4, counting none says 10). A line that only begins with a field's name (`file_mapped`, `shmem_thp`) is not the field.
+  Controls: `shared_memory_dropped_and_file_cache_kept`.
 - **`a_noop_is_replayed_only_while_a_walk_would_say_the_same`** *tested* (`crates/blaze-cargo/src/serve/job/tests.rs`): a kept answer is replayed only in a state where the walk would say the same, and in the state where nothing changed it is replayed.
   Controls: `a_noop_that_ignores_a_deleted_output`, `a_noop_that_ignores_a_traced_file_outside_the_view`, `a_noop_that_ignores_the_view_and_the_config`, `a_noop_that_ignores_another_job`.
 - **`every_recomputed_step_ends_in_a_terminal_reason`** *tested* (`crates/blaze-cargo/src/serve/why.rs`): every recomputed step of a build has a reason whose chain ends in a terminal reason other than `Unexplained`.
@@ -60,6 +61,7 @@ By level: 12 tested, 13 simulated, 0 model-checked, 0 proved.
 ### blaze-engine
 
 - **`a_kept_lookup_answers_as_the_manifests_do`** *tested* (`crates/blaze-engine/src/pin.rs`): a kept lookup answers what reading the manifests answers, whatever changed on the way since it was kept (the pin edited to one of the same length, a manifest added nearer, the root removed), and an unsettled manifest keeps nothing. The control at its end shows the kept answer is the one served while every stamp stands: a manifest rewritten in place with its stamp put back answers as kept, which is the very case [`SETTLED_NS`] keeps out of the file.
+  Controls: `a_manifest_rewritten_under_its_stamp`.
 
 ### blaze-graph
 
@@ -82,7 +84,10 @@ By level: 12 tested, 13 simulated, 0 model-checked, 0 proved.
 
 ### blaze-mem
 
+- **`a_purge_reads_only_once_every_counted_thread_gave_back_after_its_ask`** *simulated* (`crates/blaze-mem/src/tag/give_back/tests.rs`): when a purge may read, the generation settled is the one asked now, at or after the purge's own, and every thread counted then has given back beginning after it was asked; and once every counted thread gives back after the last ask, the purge settles.
+  Controls: `an_ack_for_a_generation_not_collected_for`, `a_leave_that_keeps_its_ack`.
 - **`frames_after_a_build_hold_at_most_the_warm_shelf_a_worker`** *tested* (`crates/blaze-mem/src/tests.rs`): once a build's tasks have all ended, the frame memory each of its worker threads still holds is at most [`frame::WARM`], whatever the tasks held, however they nested and in whatever order they ran; nothing else of the frames outlives them. What does outlive a build is a named owner's (here a [`Frame`] of the test's, standing for a cache), and its bytes are its own count, unchanged by the tasks. A build-shaped run: four workers, each a seeded sequence of tasks of the sizes a build's are, nested up to three deep, then one of twice the bound. The control: the same reading sees the memory while it is held (each worker's measured peak is at least its largest task's scratch, far past the bound), so a bound that holds after is not a reading that sees nothing. The directed case: twelve tasks nested, each holding a span of 8 MiB at once, more spans than a shelf keeps and 96 MiB together; the thread still ends within the bound.
+  Controls: `a_shelf_that_keeps_what_its_task_held`.
 
 ### blaze-profile
 
