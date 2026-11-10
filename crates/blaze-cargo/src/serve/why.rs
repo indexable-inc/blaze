@@ -145,11 +145,26 @@ struct Record {
 /// subject. A `BTreeMap`, as the file is written in its order (rule 25).
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Ledger {
+    /// A bug a test plants to show its oracle catches it ([`Plant`]).
+    plant: Plant,
     items: BTreeMap<(String, ContentId), Last>,
     /// Records from builds before this one may lack a later compute of their subject: a build's
     /// record did not reach the file (an append failed, or the daemon stopped mid-append).
     gap: Option<u64>,
     dropped: Option<u64>,
+}
+
+/// A bug the tests plant to show their oracles catch it: never in a build of blaze.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum Plant {
+    #[default]
+    None,
+    /// Every part of a key is said to have changed, whether its hash did.
+    BlameEveryPart,
+    /// A part that is another step's result is not followed.
+    FollowNothing,
+    /// A step's ends are left in the order they were reached in, each as often as reached.
+    EndsAsReached,
 }
 
 /// A build's misses explained: what it computed again, sorted by item, then step, so an item's
@@ -302,6 +317,9 @@ impl Ledger {
             // A part that is another step's result: that step's reasons, in this build or as
             // the ledger recorded them in a build since `since`.
             let mut follow = |name: Option<&str>, part: &str, since: u64, mine: &mut Vec<Reason>| {
+                if self.plant == Plant::FollowNothing {
+                    return;
+                }
                 let Some(name) = name.or(miss.via.as_deref()) else {
                     // alloc: once a miss
                     return mine.push(Reason::Unexplained {
@@ -448,8 +466,10 @@ impl Ledger {
                         all.extend(theirs.iter().cloned()); // clone: once an edge
                     }
                 }
-                all.sort();
-                all.dedup();
+                if self.plant != Plant::EndsAsReached {
+                    all.sort();
+                    all.dedup();
+                }
                 if all.is_empty() {
                     // alloc: once a miss
                     all.push(Reason::Unexplained {
@@ -695,7 +715,7 @@ impl Ledger {
                 None => RebuildCause::Lost { since },
             };
         }
-        let changed = changed(&last.parts, &miss.parts);
+        let changed = changed(&last.parts, &miss.parts, self.plant == Plant::BlameEveryPart);
         match changed.is_empty() {
             true => RebuildCause::Unnamed { since },
             false => RebuildCause::Parts {
@@ -999,7 +1019,7 @@ pub fn version() -> ContentId {
 /// The parts whose hashes differ between `was` and `now`, by name, in name order: both are
 /// sorted by name, and each name is once in `now` ([`Miss::of_parts`]) and in `was` (kept
 /// from a miss that was).
-fn changed(was: &[Kept], now: &[Part]) -> Vec<PartChanged> {
+fn changed(was: &[Kept], now: &[Part], blame_all: bool) -> Vec<PartChanged> {
     // alloc: once a miss, the names either side has
     let mut names: Vec<&str> = was
         .iter()
@@ -1014,7 +1034,7 @@ fn changed(was: &[Kept], now: &[Part]) -> Vec<PartChanged> {
         let then = was.iter().find(|it| it.name == name);
         let is = now.iter().find(|it| it.name == name);
         let (old, new) = (then.and_then(|it| it.hash), is.and_then(|it| it.hash));
-        if old == new {
+        if old == new && !blame_all {
             continue;
         }
         // clone: once a part that changed
@@ -1543,5 +1563,377 @@ mod tests {
         assert_eq!(causes(&answers, "a"), [RebuildCause::Twice { count: 2 }]);
         assert_eq!(causes(&answers, "b"), [RebuildCause::Twice { count: 2 }]);
         assert!(ledger.items.is_empty());
+    }
+    /// A workspace as its producers see it, shaped as the ripgrep edits that began lane
+    /// why-always: each file's bytes and what code can observe of it.
+    #[derive(Clone, PartialEq, Eq, Debug)]
+    struct World {
+        files: BTreeMap<&'static str, (u8, u8)>,
+    }
+
+    const MATCHER_RS: &str = "/w/crates/matcher/src/lib.rs";
+    const GREP_RS: &str = "/w/crates/grep/src/lib.rs";
+    const MAIN_RS: &str = "/w/crates/core/main.rs";
+    const MATCHER: &str = "grep-matcher v0.1.8 (lib)";
+    const GREP: &str = "grep v0.4.1 (lib)";
+    const RG: &str = "ripgrep v15.1.0 (bin \"rg\")";
+    const TEMPLATE: &str = "codegen dev template";
+
+    impl World {
+        fn new() -> World {
+            World { files: [(MATCHER_RS, (1, 1)), (GREP_RS, (2, 2)), (MAIN_RS, (3, 3))].into() }
+        }
+
+        /// `path` edited: its bytes move, and with `code` what code can observe of it too.
+        fn edit(&mut self, path: &str, code: bool) {
+            let file = self.files.get_mut(path).unwrap();
+            file.0 += 100;
+            if code {
+                file.1 += 100;
+            }
+        }
+
+        fn file(&self, path: &str) -> Part {
+            let (bytes, code) = self.files[path];
+            Part::file(path, Some(id(bytes)), Some(id(code)))
+        }
+
+        /// Every step of a build of it, each as the miss its producer would give: three units
+        /// (the program depends on both libraries, one of which depends on the other) and the
+        /// program's two functions, whose code is what code can observe of its file.
+        fn steps(&self) -> Vec<Miss> {
+            let key = |parts: &[Part]| {
+                let mut hasher = Hasher::new("blaze v2 test why 1");
+                for part in parts {
+                    hasher.part(part.name.as_bytes()).opt_part(part.hash.map(|it| it.0));
+                }
+                hasher.finish()
+            };
+            let unit = |item: &str, subject: u8, parts: Vec<Part>| {
+                Miss::of_parts("unit", id(subject), item.to_owned(), key(&parts), parts)
+            };
+            let dep = |name: &str, item: &str, identity: ContentId| {
+                Part::result(format!("the crate `{name}` it depends on"), Some(identity), Some(item.to_owned()))
+            };
+            let toolchain = || Part::new("the toolchain", Some(id(9)));
+            let matcher = unit(MATCHER, 1, vec![toolchain(), self.file(MATCHER_RS)]);
+            let grep = unit(
+                GREP,
+                2,
+                vec![toolchain(), self.file(GREP_RS), dep("grep_matcher", MATCHER, matcher.key)],
+            );
+            let rg = unit(
+                RG,
+                3,
+                vec![
+                    toolchain(),
+                    self.file(MAIN_RS),
+                    dep("grep", GREP, grep.key),
+                    dep("grep_matcher", MATCHER, matcher.key),
+                ],
+            );
+            let template = |item: &str, subject: u8| {
+                let code = id(self.files[MAIN_RS].1 ^ subject);
+                let parts = vec![toolchain(), Part::result("its code", Some(code), None)];
+                let mut miss =
+                    Miss::of_parts(TEMPLATE, id(subject), item.to_owned(), key(&parts), parts);
+                miss.via = Some(RG.to_owned());
+                miss
+            };
+            let mut steps = vec![matcher, grep, rg, template("main", 4), template("rg::main", 5)];
+            steps.sort();
+            steps
+        }
+    }
+
+    /// A daemon as `blaze why` sees it: the ledger, and the keys whose values the store holds.
+    #[derive(Default)]
+    struct Daemon {
+        ledger: Ledger,
+        store: BTreeSet<ContentId>,
+        builds: u64,
+    }
+
+    impl Daemon {
+        /// A build of `world`: the steps whose keys the store lacks are computed and kept,
+        /// their misses given in `order` (sorted, as a job gives them, or turned by a number).
+        fn build(&mut self, world: &World, order: usize) -> Explained {
+            let mut misses: Vec<Miss> =
+                world.steps().into_iter().filter(|it| self.store.insert(it.key)).collect();
+            if !misses.is_empty() {
+                let by = order % misses.len();
+                misses.rotate_left(by);
+                if order % 2 == 1 {
+                    misses.reverse();
+                }
+            }
+            self.builds += 1;
+            self.ledger.explain(self.builds, true, misses)
+        }
+    }
+
+    /// A cold build of the workspace, then `edit` and a second build: the worlds before and
+    /// after, and the second build explained.
+    fn edited(plant: Plant, order: usize, edit: impl FnOnce(&mut World)) -> (World, World, Explained) {
+        let mut daemon = Daemon::default();
+        daemon.ledger.plant = plant;
+        let before = World::new();
+        daemon.build(&before, 0);
+        let mut after = before.clone();
+        edit(&mut after);
+        let explained = daemon.build(&after, order);
+        (before, after, explained)
+    }
+
+    /// The edits a seed draws: each file left alone, its comments edited, or its code.
+    fn drawn(seed: u64) -> impl FnOnce(&mut World) {
+        move |world: &mut World| {
+            for (at, path) in [MATCHER_RS, GREP_RS, MAIN_RS].into_iter().enumerate() {
+                match (seed >> (2 * at)) % 3 {
+                    0 => {}
+                    1 => world.edit(path, false),
+                    _ => world.edit(path, true),
+                }
+            }
+        }
+    }
+
+    /// Every way the three files can each be left, commented or edited, and then some orders.
+    const SEEDS: u64 = 64;
+
+    /// Whether every step `explained` says was computed again has a chain that ends, and in
+    /// no bug of blaze's.
+    fn ends_explained(explained: &Explained) -> Result<(), String> {
+        for it in &explained.rebuilt {
+            if it.ends.is_empty() {
+                return Err(format!("{} ({}) has no end", it.item, it.step));
+            }
+            for end in &it.ends {
+                if let Reason::Unexplained { what } = end {
+                    return Err(format!("{} ({}) is unexplained: {what}", it.item, it.step));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether every input `explained` blames is a file whose bytes differ between `before`
+    /// and `after`, said to be trivia exactly when what code observes of it is the same.
+    fn blames_what_changed(
+        before: &World,
+        after: &World,
+        explained: &Explained,
+    ) -> Result<(), String> {
+        for it in &explained.rebuilt {
+            for end in &it.ends {
+                let Reason::InputChanged { input, trivia, .. } = end else { continue };
+                let (Some(was), Some(now)) =
+                    (before.files.get(input.as_str()), after.files.get(input.as_str()))
+                else {
+                    return Err(format!("{} blames `{input}`, which is no file of the build", it.item));
+                };
+                if was.0 == now.0 {
+                    return Err(format!("{} blames {input}, which did not change", it.item));
+                }
+                if *trivia != (was.1 == now.1) {
+                    return Err(format!("{}: {input} trivia {trivia}, wrongly", it.item));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The invariant: every recomputed step of a build has a reason whose chain ends in a
+    /// terminal reason other than `Unexplained`.
+    #[test]
+    fn every_recomputed_step_ends_in_a_terminal_reason() {
+        for seed in 0..SEEDS {
+            let (_, _, explained) = edited(Plant::None, seed as usize, drawn(seed));
+            ends_explained(&explained).unwrap_or_else(|why| panic!("seed {seed}: {why}"));
+        }
+    }
+
+    /// The control of [`every_recomputed_step_ends_in_a_terminal_reason`]: with a result part
+    /// not followed, a library's edit leaves the units that depend on it with no end.
+    #[test]
+    fn the_oracle_catches_a_result_part_not_followed() {
+        let edit = |world: &mut World| world.edit(MATCHER_RS, true);
+        ends_explained(&edited(Plant::None, 0, edit).2).unwrap();
+        let planted = ends_explained(&edited(Plant::FollowNothing, 0, edit).2);
+        assert!(planted.is_err_and(|why| why.contains(GREP) || why.contains(RG)), "the plant was missed");
+    }
+
+    /// The invariant: a chain's input is one the build's inputs really changed between the
+    /// two builds, and it is called trivia exactly when no code changed in it.
+    #[test]
+    fn a_chain_blames_only_inputs_that_changed() {
+        for seed in 0..SEEDS {
+            let (before, after, explained) = edited(Plant::None, seed as usize, drawn(seed));
+            blames_what_changed(&before, &after, &explained)
+                .unwrap_or_else(|why| panic!("seed {seed}: {why}"));
+        }
+    }
+
+    /// The control of [`a_chain_blames_only_inputs_that_changed`]: with every part said to
+    /// have changed, an edit of the program's file blames the toolchain too.
+    #[test]
+    fn the_oracle_catches_an_unchanged_part_blamed() {
+        let edit = |world: &mut World| world.edit(MAIN_RS, true);
+        let (before, after, explained) = edited(Plant::None, 0, edit);
+        blames_what_changed(&before, &after, &explained).unwrap();
+        let (before, after, explained) = edited(Plant::BlameEveryPart, 0, edit);
+        let planted = blames_what_changed(&before, &after, &explained);
+        assert!(planted.is_err_and(|why| why.contains("the toolchain")), "the plant was missed");
+    }
+
+    /// The invariant: the summary is deterministic for a given pair of trees: the same
+    /// reports, and the same reasons, whatever order the build's misses arrive in.
+    #[test]
+    fn the_summary_is_the_same_whatever_order_the_misses_arrive_in() {
+        for seed in 0..SEEDS {
+            let sorted = edited(Plant::None, 0, drawn(seed)).2;
+            for order in 1..6 {
+                let turned = edited(Plant::None, order, drawn(seed)).2;
+                assert_eq!(turned.rebuilt, sorted.rebuilt, "seed {seed}, order {order}");
+                assert_eq!(summary(&turned.rebuilt), summary(&sorted.rebuilt), "seed {seed}");
+            }
+        }
+    }
+
+    /// The control of [`the_summary_is_the_same_whatever_order_the_misses_arrive_in`]: with a
+    /// step's ends left as reached, the program, which follows both libraries, ends in another
+    /// list when their misses arrive the other way round.
+    #[test]
+    fn the_oracle_catches_ends_in_the_order_reached() {
+        let edit = |world: &mut World| {
+            world.edit(MATCHER_RS, true);
+            world.edit(GREP_RS, true);
+        };
+        let same = |plant: Plant| {
+            let sorted = summary(&edited(plant, 0, edit).2.rebuilt);
+            (1..6).all(|order| summary(&edited(plant, order, edit).2.rebuilt) == sorted)
+        };
+        assert!(same(Plant::None));
+        assert!(!same(Plant::EndsAsReached), "the plant was missed");
+    }
+
+    /// A summary as a person reads it piped, paths from the workspace `/w`.
+    fn said(explained: &Explained) -> String {
+        let roots = blaze_report::Roots { workspace: Some("/w"), home: None };
+        summary(&explained.rebuilt)
+            .iter()
+            .map(|it| blaze_report::render(it, blaze_report::Caps::PLAIN, &roots))
+            .collect()
+    }
+
+    /// The three edits of ripgrep that began the lane, each summed up in one report that names
+    /// the file: a body edit recomputes the program's unit and the functions whose code
+    /// changed; a comment in the same file recomputes the unit alone, and one in a leaf crate
+    /// every unit above it, both said to have changed no item, as wasted work.
+    #[test]
+    fn the_three_edits_name_the_file_and_say_when_no_item_changed() {
+        let body = edited(Plant::None, 0, |world| world.edit(MAIN_RS, true)).2;
+        let text = said(&body);
+        assert_eq!(summary(&body.rebuilt).len(), 1, "{text}");
+        assert!(text.starts_with("note: recomputed 3 steps because crates/core/main.rs changed"), "{text}");
+        assert!(text.contains("codegen dev template: main, rg::main"), "{text}");
+        assert!(text.contains("unit: ripgrep v15.1.0 (bin \"rg\")"), "{text}");
+        assert!(!text.contains("comments only"), "{text}");
+
+        let comment = edited(Plant::None, 0, |world| world.edit(MAIN_RS, false)).2;
+        let text = said(&comment);
+        assert_eq!(summary(&comment.rebuilt).len(), 1, "{text}");
+        assert!(
+            text.starts_with("warning: recomputed 1 step because crates/core/main.rs changed, though no item in it did (comments only): wasted work"),
+            "{text}"
+        );
+        assert!(!text.contains(TEMPLATE), "no function was compiled again: {text}");
+
+        let leaf = edited(Plant::None, 0, |world| world.edit(MATCHER_RS, false)).2;
+        let text = said(&leaf);
+        assert_eq!(summary(&leaf.rebuilt).len(), 1, "{text}");
+        assert!(
+            text.starts_with("warning: recomputed 3 steps because crates/matcher/src/lib.rs changed, though no item in it did (comments only)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("unit: grep v0.4.1 (lib), grep-matcher v0.1.8 (lib), ripgrep v15.1.0 (bin \"rg\")"),
+            "{text}"
+        );
+        // The chain of the program's unit ends at the leaf's file, through both libraries.
+        let rg = leaf.rebuilt.iter().find(|it| it.item == RG).unwrap();
+        assert_eq!(
+            rg.ends,
+            [Reason::InputChanged { file: true, input: MATCHER_RS.to_owned(), trivia: true }]
+        );
+    }
+
+    /// Each terminal reason from the case that makes it (all but `KeyUnstable` and an eviction
+    /// by memory or age, which nothing records yet), and what the summary says of it.
+    #[test]
+    fn each_terminal_reason_is_told_from_the_others() {
+        let world = World::new();
+        let ends = |explained: &Explained, item: &str| {
+            explained.rebuilt.iter().find(|it| it.item == item).unwrap().ends.clone()
+        };
+
+        // A cold build: every step for the first time, in one line.
+        let mut daemon = Daemon::default();
+        let cold = daemon.build(&world, 0);
+        assert!(cold.rebuilt.iter().all(|it| it.ends == [Reason::FirstTime]), "{:?}", cold.rebuilt);
+        assert_eq!(summary(&cold.rebuilt).len(), 1);
+        assert!(said(&cold).starts_with("note: computed 5 steps for the first time"), "{}", said(&cold));
+        // A build that computes nothing again says nothing.
+        assert!(said(&daemon.build(&world, 0)).is_empty());
+
+        // The cap shrank the records to tombstones: evicted by it, never a first compute.
+        let mut edited = world.clone();
+        edited.edit(MAIN_RS, true);
+        assert_eq!(daemon.ledger.prune_to(0, TOMBS), 5);
+        let evicted = daemon.build(&edited, 0);
+        let by_cap = [Reason::Evicted { by: EvictedBy::Cap, when: 1 }];
+        assert_eq!(ends(&evicted, RG), by_cap);
+        assert_eq!(ends(&evicted, "main"), by_cap);
+        assert!(said(&evicted).contains("ledger dropped its records"), "{}", said(&evicted));
+        // Written whole and read back, a tombstone is one still.
+        let restored = Ledger::restore(&daemon.ledger.file()).ledger;
+        assert_eq!(restored.items, daemon.ledger.items);
+        // Past the tombstones' own cap the oldest go, which is said.
+        assert!(daemon.ledger.prune_to(0, 0) > 0 && daemon.ledger.dropped().is_some());
+
+        // A compute in a build that failed, and the same key again.
+        let mut ledger = Ledger::default();
+        let rg = || world.steps().into_iter().filter(|it| it.item == RG).collect::<Vec<_>>();
+        ledger.explain(1, false, rg());
+        let failed = ledger.explain(2, true, rg());
+        assert_eq!(ends(&failed, RG), [Reason::PreviousFailed { since: 1 }]);
+
+        // The same key after a build that ended well: nothing recorded dropped its value.
+        let lost = ledger.explain(3, true, rg());
+        assert!(
+            matches!(ends(&lost, RG).as_slice(), [Reason::Unexplained { .. }]),
+            "{:?}",
+            lost.rebuilt
+        );
+        let text = said(&lost);
+        assert!(
+            text.starts_with("warning: 1 step recomputed for no recorded reason: a blaze bug (`blaze why --unexplained`)"),
+            "{text}"
+        );
+        let mut answers = Answers::new(false);
+        answers.add(Answer::new(3, "/w".to_owned(), "build".to_owned(), lost.rebuilt.clone()), None);
+        let asked = answers.asked(&Ask { unexplained: true, build: Some(3), ..Ask::default() });
+        assert_eq!((asked.count, asked.rebuilt.len()), (1, 1));
+        assert_eq!(answers.asked(&Ask { build: Some(2), ..Ask::default() }).build, None);
+
+        // A build script that runs outside the sandbox runs every build, as asked.
+        let mut run = Miss::of_parts("build script run", id(7), "z v1 (build script run)".to_owned(), id(0), Vec::new());
+        run.missed = Missed::Always("it runs outside the sandbox".to_owned());
+        let forced = Ledger::default().explain(1, true, vec![run]);
+        assert_eq!(
+            forced.rebuilt[0].ends,
+            [Reason::Forced { how: "it runs outside the sandbox".to_owned() }]
+        );
+        assert!(said(&forced).contains("that was asked for: it runs outside the sandbox"));
     }
 }
