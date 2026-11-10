@@ -405,16 +405,6 @@ pub const RECORD_CUT: &[Cut] = &[
         }],
     },
     Cut {
-        package: "blaze-web",
-        why: "the build page blaze-explore serves: built into blaze-explore alone",
-        named_in: &[],
-    },
-    Cut {
-        package: "flecs-c",
-        why: "the ECS blaze-web's page is made with: built into blaze-web alone",
-        named_in: &[],
-    },
-    Cut {
         package: "blaze-history",
         why: "the plane's costs and peaks learned from past runs (`serve::plane`, kept in the daemon's \
               image by `serve::image`): it orders and admits work, and what a unit makes does not \

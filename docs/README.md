@@ -120,7 +120,6 @@ Designs not (fully) built, newest first.
 Research, reports and measurements, true on their date and not brought up to date. Newest first.
 
 - [CHANGELOG.md](CHANGELOG.md) (2026-11-03): Changelog: every user-visible change, by release, with [Unreleased] on top.
-- [web.md](web.md) (2026-10-30): The build page v1's blaze ui served, every function of the build drawn live on the GPU from a Flecs world of the program. v2 has no blaze ui and its daemon does not start the page.
 - [support.md](support.md) (2026-10-30): What blaze v1 supported, cell by cell, each pointing at the report or harness run behind it. v2 has none of these measurements yet.
 - [platforms.md](platforms.md) (2026-10-30): The state of each platform under blaze v1 (rustc's link line, the splice, `blaze-engine weaken`), from v1's last CI run that covered them all. v2 has not been run on any platform yet.
 - [fn-cache.md](fn-cache.md) (2026-10-30): #[blaze::cache]: results of pure functions kept across runs, keyed by the code they reach. Its library crates were deleted on 2026-10-30.

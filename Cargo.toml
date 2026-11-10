@@ -333,7 +333,6 @@ blaze-profile = { path = "crates/blaze-profile" }
 ix-prof = { path = "crates/ix-prof", default-features = false }
 blaze-explore = { path = "crates/blaze-explore" }
 blaze-explore-core = { path = "crates/blaze-explore-core" }
-blaze-web = { path = "crates/blaze-web" }
 blaze-protocol = { path = "crates/blaze-protocol" }
 blaze-report = { path = "crates/blaze-report" }
 blaze-serde = { path = "crates/blaze-serde" }
@@ -389,8 +388,6 @@ blaze-vfs = { path = "crates/blaze-vfs" }
 # (docs/future/bootstrap.md).
 blaze-wasi = { path = "crates/blaze-wasi" }
 blaze-seed-run = { path = "crates/blaze-seed-run" }
-# Flecs's C and its read-only REST, for the build page's world (vendor/flecs-c/SOURCE.md).
-flecs-c = { path = "vendor/flecs-c" }
 intern = { path = "crates/intern", version = "0.0.0" }
 mbe = { path = "crates/mbe", version = "0.0.0" }
 parser = { path = "crates/parser", version = "0.0.0" }
@@ -623,7 +620,6 @@ rustc_hashes = { version = "0.179.0", package = "ra-ap-rustc_hashes" }
 rustc_index = { version = "0.179.0", package = "ra-ap-rustc_index", default-features = false }
 rustfmt-unicode-width = { version = "=0.1.14", package = "unicode-width" }
 serde-untagged = "0.1.9"
-sha1 = "0.11.0"
 shell-escape = "=0.1.5"
 stacker = "0.1.25"
 syn = "2.0.117"

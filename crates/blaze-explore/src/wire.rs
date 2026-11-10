@@ -10,7 +10,7 @@ use serde_json::{Map, Value};
 use crate::tiles::Lane;
 
 /// Every op of the `blaze` layer, as the page names it.
-pub const OPS: [&str; 7] = ["builds", "sql", "views", "view", "spans", "tiles", "world"];
+pub const OPS: [&str; 6] = ["builds", "sql", "views", "view", "spans", "tiles"];
 
 /// A request, its arguments typed.
 #[derive(Debug, PartialEq, serde_derive::Deserialize)]
@@ -40,8 +40,6 @@ pub enum Request {
         #[serde(default)]
         lane: Lane,
     },
-    /// Flecs's REST over the build's world: `path` as Flecs takes it, `/entity/...`, `/query?...`.
-    World { path: String },
 }
 
 /// What went wrong in the `blaze` layer, as the page tells it apart; the core's kinds
@@ -52,10 +50,6 @@ pub enum Kind {
     Sql,
     NoSuchBuild,
     NoSuchView,
-    /// The daemon keeps no build world to answer `world` from; `message` names what is missing.
-    NoWorld,
-    /// Flecs answered the `world` request with an error; `detail.code` is its HTTP status.
-    World,
     /// The daemon could not flush the history before the query (`ops::Flush`), so the query
     /// was not run: it would have missed the rows recorded since the last flush.
     Flush,
@@ -67,8 +61,6 @@ impl Kind {
             Kind::Sql => "sql",
             Kind::NoSuchBuild => "no_such_build",
             Kind::NoSuchView => "no_such_view",
-            Kind::NoWorld => "no_world",
-            Kind::World => "world",
             Kind::Flush => "flush",
         }
     }
@@ -136,10 +128,6 @@ mod tests {
                 bucket_ns: 10,
                 lane: Lane::Job
             }))
-        );
-        assert_eq!(
-            parse(r#"{"op":"world","path":"/query?expr=Function"}"#),
-            Some(Ok(Request::World { path: "/query?expr=Function".to_owned() }))
         );
     }
 
