@@ -531,3 +531,74 @@ fn two_daemons_builds_numbered_alike_in_one_history_stay_apart() {
     load::run(&source, Some(1)).unwrap_or_else(|error| panic!("{error}"));
     _ = std::fs::remove_dir_all(&apart);
 }
+
+/// Every query `blaze slow` asks beside the time model (`load::facts`: the build's row, threads,
+/// spans by name, misses, query counts, sampled stacks by span, threads' CPU and, with a window,
+/// memory and the recorder) is one the pinned DuckDB binds and answers, with and without a
+/// window; and the stacks are the [`STACKS`] commonest of each span name, a sample counted for
+/// its span and that span's ancestors. DuckDB 1.5.5 refused the stacks' query ("Cannot mix
+/// aggregates with non-aggregated columns"), so `blaze slow` failed on every build.
+#[test]
+#[ignore = "needs the pinned DuckDB: BLAZE_DUCKDB=$(nix build --print-out-paths .#duckdb)/bin/duckdb"]
+fn every_query_of_slow_is_answered_and_the_stacks_are_the_commonest_of_each_span() {
+    let duckdb = std::path::PathBuf::from(
+        std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"),
+    );
+    // A root span and a leaf inside it. The leaf's samples: `a b` twice, four other stacks
+    // once each, and one blocked; the root has one sample of its own.
+    let fixture = "COPY (SELECT * FROM (VALUES (1::UBIGINT, 1000::BIGINT, 100::BIGINT, 'ok', '/work', 'build')) \
+            AS t(build_id, started_ns, dur_ns, outcome, workspace, command)) TO '{d}/1-00000002.builds.parquet';\n\
+         COPY (SELECT * FROM (VALUES \
+            (1::UBIGINT, 8::UINTEGER, 10::UINTEGER, 1::UBIGINT, NULL::UBIGINT, 0::USMALLINT, 'root', 1000::BIGINT, 100::BIGINT), \
+            (1, 8, 10, 2, 1, 1, 'leaf', 1010, 50)) \
+            AS t(build_id, process, thread, span_id, parent, depth, name, start_ns, dur_ns)) TO '{d}/1-00000001.spans.parquet';\n\
+         COPY (SELECT * FROM (VALUES \
+            (1::UBIGINT, 8::UINTEGER, 10::UINTEGER, 1011::BIGINT, ['a', 'b'], 2::UBIGINT, 'on'), \
+            (1, 8, 10, 1012, ['a', 'b'], 2, 'on'), (1, 8, 10, 1013, ['a', 'c'], 2, 'on'), \
+            (1, 8, 10, 1014, ['a', 'd'], 2, 'on'), (1, 8, 10, 1015, ['a', 'e'], 2, 'on'), \
+            (1, 8, 10, 1016, ['a', 'f'], 2, 'on'), (1, 8, 10, 1017, ['w'], 2, 'off'), \
+            (1, 8, 10, 1070, ['a'], 1, 'on')) \
+            AS t(build_id, process, thread, t_ns, stack, span_id, cpu)) TO '{d}/1-00000001.samples.parquet';\n\
+         COPY (SELECT * FROM (VALUES \
+            (NULL::UBIGINT, 8::UINTEGER, 'live bytes', 900::BIGINT, 5::DOUBLE), \
+            (1, 8, 'live bytes', 1010, 7), (1, 8, 'live bytes', 1050, 9), \
+            (NULL, 8, 'profile spans made', 900, 1), (1, 8, 'profile spans made', 1090, 3)) \
+            AS t(build_id, process, name, t_ns, value)) TO '{d}/1-00000001.counters.parquet';\n";
+    let dir = history_of(&duckdb, "facts", fixture);
+    let source = crate::time::load::Source { duckdb: &duckdb, history: &dir };
+    let stack = |name: &str, on_cpu, frames: &[&str], samples| SpanStack {
+        name: name.to_owned(),
+        on_cpu,
+        frames: frames.iter().map(|it| (*it).to_owned()).collect(),
+        samples,
+    };
+    let stacks = [
+        stack("leaf", true, &["a", "b"], 2),
+        stack("leaf", true, &["a", "c"], 1),
+        stack("leaf", true, &["a", "d"], 1),
+        stack("leaf", false, &["w"], 1),
+        stack("root", true, &["a", "b"], 2),
+        stack("root", true, &["a"], 1),
+        stack("root", true, &["a", "c"], 1),
+        stack("root", false, &["w"], 1),
+    ];
+    for window in [Some((1000, 1100)), None] {
+        let facts = load::facts(&source, 1, window, Some(8))
+            .unwrap_or_else(|error| panic!("window {window:?}: {error}"));
+        assert_eq!(facts.build.outcome.as_deref(), Some("ok"), "window {window:?}");
+        assert_eq!(facts.span_stacks, stacks, "window {window:?}");
+        let kinds: Vec<(&str, u64)> =
+            facts.span_kinds.iter().map(|it| (it.name.as_str(), it.runs)).collect();
+        assert_eq!(kinds, [("leaf", 1), ("root", 1)], "window {window:?}");
+        let cpu: Vec<(u32, u32, u64)> =
+            facts.thread_cpu.iter().map(|it| (it.process, it.thread, it.uncounted)).collect();
+        assert_eq!(cpu, [(8, 10, 2)], "window {window:?}");
+        assert!(facts.misses.is_empty() && facts.query_counts.is_empty(), "window {window:?}");
+        if window.is_some() {
+            let memory = (facts.memory.live_before, facts.memory.live_first, facts.memory.live_peak);
+            assert_eq!(memory, (Some(5), Some(7), Some(9)), "the window's memory");
+            assert_eq!(facts.recorder.spans_made, Some(2), "the window's recorder");
+        }
+    }
+    _ = std::fs::remove_dir_all(&dir);
+}
