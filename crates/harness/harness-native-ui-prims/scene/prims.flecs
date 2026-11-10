@@ -633,7 +633,7 @@ ui {
   // its parent's frame out of the flow. Its owner turns it `on` while there is nothing else to show.
   prefab Lamp : ui.Node {
     Background
-    Lantern: {on: false}
+    Lantern: {on: false, lit: 0}
   }
   // A small pixel-art item, a game's dropped item (PixelBlock, harness-native-render block.rs): its face names what it
   // is and does (`exec` a terminal, `read` a book, `net` the world turning, `think` a crystal, ...); it floats and moves

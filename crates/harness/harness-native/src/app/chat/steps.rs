@@ -503,7 +503,9 @@ pub(super) fn fill_line(row: View<'_>, l: &Line) {
         });
     }
     chevron(h, l.open);
-    tooltip(h, &[l.words.as_str(), l.tip.as_str()].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<_>>().join(" \u{b7} "));
+    // While it runs its card says it (chat.rs fill_activity_pop): no tooltip beside the card.
+    let tip = if l.live.is_some() { String::new() } else { [l.words.as_str(), l.tip.as_str()].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<_>>().join(" \u{b7} ") };
+    tooltip(h, &tip);
     if let Some(m) = h.part("mark") {
         tooltip(m, &l.why);
     }
