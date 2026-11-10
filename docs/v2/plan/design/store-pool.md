@@ -918,11 +918,22 @@ is next. Lane 5 waits on 4b and on admission by footprint reaching main.
          `SharedConfig`; the daemon's stores say `Thread`, every other site `Pumped`), the
          store model's rules, and the chained checks. Not built: `Pump`, `Reader::read` and
          `Reader::pin` on the pool.
-       - Found on the way, to settle as the reads move: a pool registers its pages as one of
-         blaze-core's `spans::REGIONS` (64 a process), so a test binary that holds more than 64
-         stores at once would be refused its pool; and the loads core asks with a tag range of
-         its own, 2^32 wide, while `Config::tags` gives the store one such range and the daemon
-         packs its ranges 2^32 apart, so `Config` needs a second range for the loads.
+       - Found on the way and decided: blaze-core's span registry grows by chunks (it held 64
+         regions a process, and a test binary holds a pool a store); and `Config::load_tags`
+         is a second range of 2^32 tags, the loads core's own (the daemon's `LOADS` and
+         `STD_LOADS`), refused as the store is made when it overlaps `Config::tags`.
+       - The read port's six steps, in order, each a commit that leaves the tree whole: (1) the
+         pool, the windows and the loads core inside the store, each pack opened with its
+         checks (`crates/blaze-cas/src/hot.rs`: built); (2) `Pump`, for the simulation and a
+         native inline driver; (3) `Reader::read` and `Reader::pin` beside the old readers;
+         (4) the index probes, the recovery scan and the commit (`Append`, `WriteFrom`) on the
+         pool; (5) the callers, crate by crate, and the tests' reads through one helper;
+         (6) the old readers and every mapping but `Kind::Machine`'s deleted. Until (4), a
+         commit's bytes reach a pack by a write of the store's, so growing a pack gives back
+         the one page its committed bytes ended in (`Pool::drop_stale`); and a tier opened
+         afresh (another writer's) closes its windows at once, which is sound only while
+         nothing reads through them: (3) must hold a replaced tier's windows through its
+         readers' grace.
        - *The checks' effects are chained* behind their pack's own sync (cut, write, sync, one
          at a time), so the store model's search over a commit's orders still ends. That costs
          commit latency: a second sync in series a pack. Running them beside the pack's again

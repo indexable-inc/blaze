@@ -272,6 +272,35 @@ fn the_oracle_catches_a_head_written_before_its_syncs() {
     );
 }
 
+/// Each pack is open in the store's pool as far as it is committed, from its tier's opening and
+/// through every commit, and a removed pack's windows go with it.
+#[test]
+fn every_pack_is_open_in_the_pool_as_far_as_it_is_committed() {
+    let mut sim = Sim::new(8, quiet());
+    let mut store = open(&mut sim, "store");
+    assert_eq!(store.hot.pack_open(0, 0), None, "no pack yet");
+    let open_as_committed = |store: &Store| {
+        for (number, pack) in store.tiers[0].packs.iter().enumerate() {
+            let want = (!pack.removed).then_some(pack.committed);
+            assert_eq!(store.hot.pack_open(0, number), want, "{}", pack.file);
+        }
+    };
+    for round in 0..3u64 {
+        for n in 0..6 {
+            store.put(key(round * 10 + n), Kind::Code, &noise(40_000, round * 10 + n)).unwrap();
+        }
+        flush(&mut sim, &mut store);
+        assert!(store.broken().is_none(), "{:?}", store.broken());
+        open_as_committed(&store);
+    }
+    assert!(store.tiers[0].packs.len() > 1, "the puts fill more than one pack");
+    drop(store);
+    let mut store = open(&mut sim, "store");
+    open_as_committed(&store);
+    assert_eq!(store.hot.pack_removed(0, 0), Ok(()));
+    assert_eq!(store.hot.pack_open(0, 0), None);
+}
+
 /// A block of a pack changed on disk under what was committed (rot) stops the store as it
 /// opens, naming the pack and the block: the recovery scan checks every block it reads.
 #[test]

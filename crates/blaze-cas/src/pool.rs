@@ -641,6 +641,38 @@ impl<G: Give> Pool<G> {
         unsafe { blaze_mem::racy::copy_in(self.addr(at), bytes) }
     }
 
+    /// `page` given back because a commit that did not write through the pool made its bytes
+    /// stale (its file's committed bytes ended inside it, and grew): `Ok(true)` when it was in
+    /// memory and is `Unloaded` now at a raised version, so its next read loads it whole and a
+    /// stale optimistic copy fails its check; `Ok(false)` when it was not in memory. For the
+    /// store until its commit appends through the pool ([`Append`]), which pins that page and
+    /// writes into it instead.
+    ///
+    /// # Errors
+    ///
+    /// The page is pinned, loading or being given back: its word. Nothing changed.
+    pub(crate) fn drop_stale(&self, page: u64) -> Result<bool, Word> {
+        let seen = self.word_now(page);
+        match seen.state() {
+            State::Unloaded | State::Corrupt | State::Abandoned => Ok(false),
+            State::Loaded if seen.pins() == 0 => {
+                let next = Word::evicting(seen.next_version());
+                self.word(page)
+                    .compare_exchange(seen.0, next.0, Ordering::AcqRel, Ordering::Acquire)
+                    .map_err(Word)?;
+                if seen.prefetched() {
+                    self.count_prefetch(Prefetch::Wasted, 1);
+                }
+                if !loads::give_back(self, &[page], |_| Word::unloaded) {
+                    // The kernel kept it: memory, counted; its next load writes it whole.
+                    self.count_refused();
+                }
+                Ok(true)
+            }
+            State::Loaded | State::Loading | State::Evicting => Err(seen),
+        }
+    }
+
     /// The pages of `run` made the process's before a load writes them.
     fn reuse_run(&self, run: Run) -> Result<(), MemError> {
         self.give.reuse(self, (run.first * PAGE) as usize, (u64::from(run.pages) * PAGE) as usize)

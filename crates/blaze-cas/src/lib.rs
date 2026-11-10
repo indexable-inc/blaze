@@ -46,6 +46,7 @@ mod disk;
 mod driven;
 mod flags;
 mod handle;
+mod hot;
 mod index;
 #[cfg(all(test, blaze_check))]
 mod model;
@@ -55,7 +56,7 @@ mod peers;
 #[cfg(not(blaze_check))]
 #[cfg_attr(
     not(test),
-    allow(dead_code, reason = "lane 3 of docs/v2/plan/design/store-pool.md: the store reads through the pool from lane 4")
+    allow(dead_code, reason = "lane 4b of docs/v2/plan/design/store-pool.md: the store opens its packs in the pool (`hot`); its reads move onto it next")
 )]
 mod pool;
 mod read;
@@ -685,6 +686,8 @@ pub struct Store {
     failures: u32,
     /// What it publishes for readers and writers.
     shared: Arc<Shared>,
+    /// Its buffer pool, and which of its files are open in it ([`hot`]).
+    hot: hot::Hot,
     /// Its own writer (segment 0): its puts, and the records a settle moves.
     own: Own,
     /// Each writer's segment as far as it has been drained, by number.
@@ -1458,13 +1461,15 @@ impl Store {
         // names it, tells its staged names from those of any other daemon's store.
         let staging = ContentId::of(STAGING_DOMAIN, config.dir.as_str().as_bytes());
         let staging = u64::from_le_bytes(staging.0[..8].try_into().expect("8 bytes"));
-        Store {
+        let hot = hot::Hot::new(config.load_tags);
+        let mut store = Store {
             tags: Tags { range: blaze_core::Tags::new(config.tags), ops: HashMap::new_in(Global) }, // alloc: the store's own table, for its life
             config,
             tiers,
             broken: None,
             failures: 0,
             shared,
+            hot,
             own,
             drains,
             draining: Batch::default(),
@@ -1507,7 +1512,16 @@ impl Store {
             plant_head_before_syncs: false,
             #[cfg(test)]
             plant_no_drain: false,
+        };
+        // A pool the system refused to reserve stops the store, naming why: nothing is read
+        // another way.
+        // alloc: the error that breaks the store
+        if let Some(why) = store.hot.refused().map(str::to_owned) {
+            // clone: the error that breaks the store
+            let dir = store.config.dir.clone();
+            store.fail(dir, why);
         }
+        store
     }
 
     /// Asks that the store's directory be made the user's alone, and checked to be with all in
@@ -4215,6 +4229,15 @@ impl Store {
             pack.indexed = written.indexed;
         }
         own.head = commit.head;
+        // What the commit made durable of each pack is the pool's to read from now on.
+        for &(at, to) in &commit.packs {
+            let pack = &self.tiers[0].packs[at];
+            if let Err(why) = self.hot.pack_committed(0, at, &pack.file, to, &pack.checks) {
+                // clone: the error that breaks the store
+                let file = pack.file.clone();
+                self.fail(file, why);
+            }
+        }
         for at in 0..self.tiers[0].packs.len() {
             let pack = &mut self.tiers[0].packs[at];
             if std::mem::take(&mut pack.retiring) {
@@ -4225,6 +4248,11 @@ impl Store {
                 // alloc: empty, allocates nothing; it lets go of the pack's checks
                 pack.checks = Vec::new();
                 self.remove_pack(at, effects);
+                if let Err(why) = self.hot.pack_removed(0, at) {
+                    let file = &self.tiers[0].packs[at].file;
+                    // alloc: a problem reported
+                    self.problems.push(format!("{file} was removed and its pages are kept: {why}"));
+                }
             }
         }
         let mut batch = commit.batch;
@@ -4532,7 +4560,7 @@ impl Store {
     }
 
     fn finish_open(&mut self, at: usize) {
-        match open_tier(&mut self.tiers[at]) {
+        match open_tier(&mut self.tiers[at]).and_then(|()| self.open_in_pool(at)) {
             Ok(()) => {
                 let tier = &mut self.tiers[at];
                 tier.opened = true;
@@ -4544,6 +4572,22 @@ impl Store {
             }
             Err((file, why)) => self.tier_failed(at, file, why),
         }
+    }
+
+    /// Tier `at`, read and checked, opened in the pool: each pack with its blocks' checks, in
+    /// place of what the pool held of the tier as it was open before (another writer's store
+    /// whose head changed is opened afresh).
+    fn open_in_pool(&mut self, at: usize) -> Result<(), (FileName, String)> {
+        let tier = &self.tiers[at];
+        // clone: the error that stops the opening
+        self.hot.tier_closed(at).map_err(|why| (tier.dir.clone(), why))?;
+        for (number, pack) in tier.packs.iter().enumerate().filter(|(_, it)| !it.removed) {
+            self.hot
+                .pack_committed(at, number, &pack.file, pack.committed, &pack.checks)
+                // clone: the error that stops the opening
+                .map_err(|why| (pack.file.clone(), why))?;
+        }
+        Ok(())
     }
 
     /// One mapping of batch `batch` came: its moves are made once all have.
