@@ -1176,6 +1176,7 @@ dependencies = [
  "blaze-core",
  "blaze-format",
  "blaze-ids",
+ "hegeltest",
 ]
 
 [[package]]

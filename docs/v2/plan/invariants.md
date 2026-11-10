@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-25 invariants, 1 refinements, 1 reference models.
-By level: 12 tested, 14 simulated, 0 model-checked, 0 proved.
+26 invariants, 1 refinements, 1 reference models.
+By level: 12 tested, 15 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
@@ -69,6 +69,11 @@ By level: 12 tested, 14 simulated, 0 model-checked, 0 proved.
   Controls: `admission_by_grants_only`, `a_gate_that_never_purges`, `a_purge_read_before_it_lands`, `a_purge_read_purged_though_a_task_freed_in_its_lag`.
 - **`live_grants_fit_the_machine_budget_after_any_crash`** *tested* (`crates/blaze-graph/src/ledger/tests.rs`): whatever crashes, restarts and pid reuse, the live daemons' grants never sum past the machine budget, nor does what they may grant with no turn (each one's room: its charge and its lease), none grants or has room the ledger does not hold for it, none admits while the others' charges fill the machine, and every task that fits starts.
   Controls: `a_read_modify_write_without_the_lock`, `a_prune_that_ignores_start_time`, `an_allowance_that_leaves_out_a_daemon`, `a_lease_the_ledger_does_not_record`.
+
+### blaze-image
+
+- **`the_images_file_is_always_one_image_whole`** *simulated* (`crates/blaze-image/src/place/tests.rs`): after any run of images placed, let go, failed and cut by a crash, the image's file holds one image whole, byte for byte what a fresh build wrote: the one placed once the placing said so (and after a crash then), the one before it when the placing was let go, and one of the two when it failed or the power went; and it opens and verifies. `HEGEL_TEST_CASES=<n>` runs it longer.
+  Controls: `a_rename_without_its_sync`, `blocks_shared_from_bytes_the_file_no_longer_holds`.
 
 ### blaze-link
 

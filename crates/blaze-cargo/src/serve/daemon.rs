@@ -90,7 +90,8 @@ const UNLINK: Tag = Tag(OWN + 7);
 const HANG_UP: Tag = Tag(OWN + 8);
 /// A stall's trace, written once: the daemon stops after it.
 const STALL: Tag = Tag(OWN + 9);
-/// The image's write and its map ([`Images`]).
+/// The image's placing (its clone, writes, sync and rename, one in flight at a time) and its
+/// map ([`Images`]).
 const IMAGE: u64 = OWN + 10;
 /// The watch of the system's memory pressure ([`Effect::Pressure`], [`Daemon::pressure`]),
 /// after the image's two.
@@ -1311,6 +1312,10 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let macros =
             blaze_macro_eval::Macros::new(proc_macro_api::kept::Keeps::In(keeping), Some(sources));
         let mapping = read.image.flatten();
+        // The image's file as it is on disk, for the next image to share its blocks
+        // ([`Images::new`]).
+        // clone: a count of the mapping, once a start.
+        let on_disk = mapping.clone();
         let mut started = Started::default();
         // clone: a count of the mapping, shared by the VFS and the image the rest read.
         let opened = match mapping.clone().map(|it| opening(Image::open(it))).transpose() {
@@ -1511,7 +1516,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             plane,
             mounts,
             heads: Heads::new(FLUSHES, WATCHERS, RUNS, Outside::new(options.outside, "/", OUTSIDE)),
-            images: Images::new(image, IMAGE),
+            images: Images::new(image, IMAGE, on_disk),
             jobs,
             steps,
             replies: Vec::new(),
@@ -1769,14 +1774,17 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         // A settle image asked with nothing changed since is the daemon as it is now: the stop
         // waits for it ([`Images::done`]) rather than makes the same image again after it.
         if !(self.settling && !self.changed_since_settle) {
-            self.ask_image();
+            self.ask_image(true);
         }
         self.store.flush(&mut self.effects);
         self.std.flush(&mut self.effects);
         self.vfs.flush(&mut self.effects);
     }
 
-    fn ask_image(&mut self) {
+    /// Asks for an image of the daemon as it is now. `waited`: someone waits for it (the
+    /// stop), so no request lets go of it; the settle's, asked between requests, is let go
+    /// when one comes ([`Daemon::let_go_of_image`]).
+    fn ask_image(&mut self, waited: bool) {
         let front = self.jobs.front_db();
         let parts = Parts {
             db: &self.db,
@@ -1785,7 +1793,21 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             predict: self.plane.predict(),
             effects: &mut self.effects,
         };
-        self.images.ask(parts);
+        match waited {
+            true => self.images.ask(parts),
+            false => self.images.ask_between(parts),
+        }
+    }
+
+    /// A request is under way while the settle's image is being written: the image is let go
+    /// ([`Images::let_go`]), so the request shares neither the disk nor the loop with it, and
+    /// asked again once the daemon is idle (`between`). The database stays as it is until
+    /// that image is mapped.
+    fn let_go_of_image(&mut self) {
+        if self.stopping.is_none() && !self.jobs.idle() && self.images.let_go() {
+            self.jobs.cold = true;
+            self.settling = false;
+        }
     }
 
     /// One turn of the loop: what is asked submitted, what completed taken, the plane and the
@@ -1855,6 +1877,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.watch();
         self.doing();
         self.plot();
+        self.let_go_of_image();
         let idle = self.effects.is_empty() && self.driver.in_flight() == 0;
         let front = self.jobs.front_db();
         let parts = Parts {
@@ -2729,7 +2752,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             self.jobs.cold = false;
             self.settling = true;
             self.changed_since_settle = false;
-            self.ask_image();
+            self.ask_image(false);
         }
         if self.settling
             && self.images.done()

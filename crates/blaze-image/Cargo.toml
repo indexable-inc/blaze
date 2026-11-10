@@ -21,6 +21,7 @@ blaze-ids.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+hegeltest.workspace = true
 
 [lints]
 workspace = true
