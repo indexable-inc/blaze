@@ -77,7 +77,12 @@ said; each has a span.
 - `devirt world` (a final binary): reads the walk facts of every reached function from
   their memos. Unchanged by this design.
 
-Statics are described every build; a program has few.
+A static's describe is a memo too (`described_static_memo`): an unchanged static costs its
+verification, not an evaluation. One whose value holds a `file!()` path is described each
+build, as a body that names a file is.
+
+After a leaf body edit, with N functions, R references and C changed describes: describes
+O(C); every pass above O(N + R) of hash and vector work or memo verifications.
 
 ## Whole-program dyn facts
 
@@ -106,8 +111,33 @@ dependencies, generics of one key, statics, a dyn site, a check root), up to eig
 compares the two builds after each. Three controls plant a bug each. A counter test holds an
 edit of one leaf among 300 functions to one describe.
 
-## Not built
+## Not built: the patched walk
 
+The walk is replayed, so each pass above is still O(N + R). Patching the kept result for the
+changed set is the next step, and it is not a change of the walk alone:
+
+- **`Built` is the whole program.** It holds every compiled function, name, owner and digest,
+  and the link reads all of it. A codegen step of O(C) needs `Built` to be a kept value plus a
+  delta, which is the link's interface (blaze-cargo's `unit/codegen.rs`, another lane's now).
+- **The recursion limit's check is order-dependent.** It is rustc's depth-first walk in root
+  and reference order; an added edge can change which path claims a node anywhere after it.
+  Exact patching needs the claim order kept and re-run from the first changed claim.
+- **Candidates without a visit.** The engine verifies memo by memo. A row's durability and
+  `Storage::unchanged_since` are private to blaze-query; exposing "this row is `HIGH`" and
+  "the view `HIGH` inputs last changed at" would let the driver skip every library-only node
+  as one group and verify only the rest, O(nodes that read workspace inputs). The engine keeps
+  no reverse index from written fields to rows.
+- **Deletion.** With reverse edges kept, reachability after removed edges is DRed: drop each
+  node whose support count reaches zero, then re-derive from the roots over the dropped set
+  only, which restores a node still supported through a cycle. Not written.
+- **Dependencies of each kept structure**, for the patch: a caller's places and summary key
+  name its callees' keys; `built_in` is the closure over built-in callees; `rebind` is a fixed
+  point over references to patchable nodes and built-in rebound ones; owners and symbols read
+  one node each plus its references' owners; a dedupe class is keyed by code bytes and places.
+- **Dyn facts by digest.** Rekeying only bodies whose read digests changed needs the body
+  query keyed by the facts read, not `MirOptions::world` (hir-ty-mir).
+- **Persistence.** A kept describe names `HirInstance`, ids interned by one database. Item
+  keys, instance keys and code hashes are content ids, so a record keyed by the walk's inputs
+  could hold the graph by instance key; restoring it needs a way to make a `HirInstance` again
+  from content (re-intern its item path and arguments), which does not exist.
 - `blaze why` does not print the `fresh` reason yet; it is on the span and in `Built::walk`.
-- `Counted`, statics, `devirt world`, and the passes after the walk stay linear in the program.
-- The walk itself is replayed, not patched: its cost is linear with a small constant.

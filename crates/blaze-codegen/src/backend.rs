@@ -134,7 +134,7 @@ impl<I, S> Described<I, S> {
 }
 
 /// What the front end says of a static.
-#[derive(Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: copied out of the front end's memo, once per static described
 pub struct DescribedStatic<I, S> {
     pub item: ItemKey,
     /// Which instance of the item: a generic's thread-local or a promoted constant's owner;

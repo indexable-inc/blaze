@@ -437,6 +437,52 @@ fn described_memo(db: &Db, instance: HirInstance, requester: Origin, facing: Fac
     Memoed::Described(front.described(db, &instance, &requester, facing.world))
 }
 
+/// Whether the value of `value` holds what the build calls a file: a `file!()` path, alone
+/// or in a text, among the data its initializer asks for. Exactly when placing its requests
+/// asks the hashes for a file's name (`places::place_requests`, which reads the same list).
+/// A static whose value has no source here (its describe gives the error) names none.
+fn static_names_files(db: &Db, value: HirStatic) -> bool {
+    use crate::fragment::{DataRequest, TextPart};
+    let Ok(super::statics::Source::Compiled(compiled)) = super::statics::source(db, value.0)
+    else {
+        return false;
+    };
+    compiled.requests.datas.iter().any(|it| match it {
+        DataRequest::FilePath(_) => true,
+        DataRequest::Text(parts) => parts.iter().any(|it| matches!(it, TextPart::FilePath(_))),
+        _ => false,
+    })
+}
+
+/// What the database keeps of a static's describe, as [`Memoed`] of a function's.
+#[derive(PartialEq, Eq, Debug)]
+pub(crate) enum MemoedStatic {
+    Described(Result<DescribedStatic<HirInstance, HirStatic>, CodegenError>),
+    /// Its value holds a file's name ([`static_names_files`]): described by the build's own
+    /// front end, each build.
+    NamesFiles,
+}
+
+/// The describe of the static `value` by a front end of `facing`
+/// ([`HirFrontend::described_static`]), kept by the database as a function's is
+/// ([`described_memo`]): the next build verifies it, and evaluates and shapes the value
+/// again only where something it read changed. `facing` holds no world: a static's value is
+/// built against none.
+#[blaze_query::tracked(returns(ref))]
+fn described_static_memo(db: &Db, value: HirStatic, facing: Facing) -> MemoedStatic {
+    if static_names_files(db, value) {
+        return MemoedStatic::NamesFiles;
+    }
+    let front = match facing.front(db) {
+        Ok(front) => front,
+        Err(what) => {
+            let named = super::StaticNamed(db, value.0);
+            return MemoedStatic::Described(Err(undescribed(db, &named, None, what)));
+        }
+    };
+    MemoedStatic::Described(front.described_static(db, &value))
+}
+
 /// How many kept walks ([`HirFrontend::kept`]) a process holds: the least recently asked for
 /// goes when one more is made. A walk is of one database and configuration, and a daemon
 /// builds a few checkouts in a few configurations (a program's, its build-time code's, a
@@ -1053,7 +1099,11 @@ impl Frontend for HirFrontend<'_> {
         &self,
         value: &HirStatic,
     ) -> Result<DescribedStatic<HirInstance, HirStatic>, CodegenError> {
-        self.with(|db| self.described_static(db, value))
+        self.with(|db| match described_static_memo(db, *value, self.facing(None)) {
+            // clone: copied out of the database's memo, once per static described
+            MemoedStatic::Described(described) => described.clone(),
+            MemoedStatic::NamesFiles => self.described_static(db, value),
+        })
     }
 
     fn reached(&self, functions: &[(HirInstance, Origin)], statics: &[HirStatic]) {
