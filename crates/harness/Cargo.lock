@@ -873,6 +873,7 @@ dependencies = [
 name = "harness-browser"
 version = "0.1.0"
 dependencies = [
+ "block2",
  "cef",
  "crossbeam-channel",
  "harness-mach",

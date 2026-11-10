@@ -25,6 +25,7 @@ mod keys;
 mod location;
 mod manage;
 mod parent;
+mod places;
 mod ring;
 mod slots;
 

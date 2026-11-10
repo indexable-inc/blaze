@@ -8,6 +8,9 @@ import { Repl } from "./repl.ts";
 import { setConfirm } from "./host.ts";
 
 // stdout is the MCP channel; anything logged outside a cell must go to stderr.
+// A promise nobody awaited that rejects (a timer's, a dropped connection's) fails nothing but itself: it is said on stderr
+// and the kernel keeps serving. Bun's default ends the process, and with it the REPL's state and the agent's turn.
+process.on("unhandledRejection", (e) => { console.error("[kernel] an unawaited promise rejected:", e); });
 console.log = console.error;
 
 // cursor runs in an empty private workspace (so it loads no repo rules) and passes the real one here.
