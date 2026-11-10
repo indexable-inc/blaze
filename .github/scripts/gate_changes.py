@@ -54,6 +54,13 @@ CODE = (
     # fixtures are under crates/).
     "harness/profile_gate.py",
     "harness/profile-gate-known.toml",
+    # The same job's smoke of the budget harness against the blaze the build made: the script,
+    # the engine adapter and its layout of a daemon's home, the fixture it builds, its result.
+    "harness/v2/budgets.py",
+    "harness/v2/engine.py",
+    "harness/v2/fixture.py",
+    "harness/v2/report.py",
+    "harness/storelib.py",
     "flake.nix",
     "flake.lock",
     # The release of blaze that builds and tests blaze (.github/actions/blaze), and its installer.

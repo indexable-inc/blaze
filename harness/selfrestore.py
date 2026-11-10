@@ -40,6 +40,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "tools", "typed-input", "src"))
 from typed_input import fail, parse
 
+import storelib
+
 SCRIPT = "selfrestore.py"
 LISTENING = re.compile(r"^blaze serve: listening on .* \(pid (\d+)\)$", re.M)
 COMPILING = re.compile(r"^\s*Compiling ", re.M)
@@ -78,7 +80,7 @@ def build(it: Input, home: str, target: str, what: str) -> tuple[float, str, fro
 
 
 def serve_log(home: str) -> str:
-    path = os.path.join(home, "v2", "serve.log")
+    path = storelib.layout(home).log
     with open(path, errors="replace") as f:
         return f.read()
 

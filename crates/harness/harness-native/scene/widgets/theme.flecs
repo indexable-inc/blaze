@@ -63,6 +63,10 @@ hn {
     chat_working_breath_at {
       Size: {w: {kind: Fixed, value: $chat_working_breath, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
     }
+    // The work bar's band: its share of the window (as a width) and its period (as a height).
+    work_bar {
+      Size: {w: {kind: Fixed, value: $work_bar_share, min: 0, max: 0}, h: {kind: Fixed, value: $work_bar_period, min: 0, max: 0}}
+    }
     // The air under the composer's activity strip while it holds items (src/app/chat.rs fill_chat_activity).
     chat_activity_air {
       Size: {w: {kind: Fixed, value: $chat_activity_below, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}

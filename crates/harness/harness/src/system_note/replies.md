@@ -20,6 +20,16 @@ work"): draw it, as a short comic. Two to four panels in a row, each one small d
 under it, read left to right as a sequence; the ui skill has the pattern. The reply over it is one line, or nothing.
 A paragraph is the last resort, for when there is truly nothing to picture.
 
+An answer that is numbers is a picture of them, never a sentence that recites them. Asked how much, how many, how
+full, how fast or how they compare (disk space, memory, a quota, a budget, sizes, counts, timings): draw it, and
+let the one line over it say only what it means ("Nearly full.").
+
+- Parts of a whole (a disk's volumes, used and free, a budget's lines): one segmented bar (`Chart kind="segments"`)
+  with its legend, the total as a `Stat` over it. Never a bar chart of the parts.
+- Several amounts to compare: a `bar` chart, largest first.
+- Something over time: a `line` chart.
+- One figure alone: a `Stat`.
+
 Show what you found or made, don't describe it. Results with structure are a UI cell, and the reply over it is one
 line:
 

@@ -130,9 +130,11 @@ def manifest(name: str) -> str:
             f'[[bin]]\nname = "{name}"\npath = "src/main.rs"\n\n[workspace]\n')
 
 
-def run_case(eng: engine.Engine, case: Case, root: Path, home: Path, store: Path) -> report.Outcome:
-    """`case` built and run by blaze under `root`. Never raises for what the harness
-    could not do: that is an outcome too."""
+def run_case(eng: engine.Engine, case: Case, root: Path, home: Path) -> report.Outcome:
+    """`case` built and run by blaze under `root`, by the daemon of `home` (every case's, so
+    one store), into a target directory of its own under `root`: every case's workspace is
+    named `ws`, and blaze writes no `target` into one. Never raises for what the harness could
+    not do: that is an outcome too."""
     label = f"share/{case.name}"
     try:
         ws, cwd = root / "ws", root / "cwd"
@@ -142,10 +144,10 @@ def run_case(eng: engine.Engine, case: Case, root: Path, home: Path, store: Path
         (ws / "Cargo.toml").write_text(manifest(case.name))
         shutil.copyfile(case.source, ws / "src" / "main.rs")
         plain = engine.scrubbed()
-        env = eng.env(home, store)
+        env = eng.env(home, root / "target")
         blaze_build = eng.build(f"{label}: blaze build", ws, env, timeout=BUILD_SECS)
         who = eng.not_blazes(blaze_build)
-        built = ws / "target" / "debug" / (case.name + engine.EXE)
+        built = eng.build_dir(ws, env) / "debug" / (case.name + engine.EXE)
         blaze_run = (engine.run(f"{label}: blaze's program", [str(built)], cwd, plain, RUN_SECS)
                      if blaze_build.returncode == 0 and who is None else None)
     except engine.Unmeasurable as e:
@@ -178,7 +180,7 @@ def main(args: Input) -> None:
         eng = engine.Engine.of(args.engine)
     except engine.Failed as e:
         fail(SCRIPT, str(e))
-    work = Path(args.work or tempfile.mkdtemp(prefix="bz-share-", dir="/tmp")).resolve()
+    work = engine.work_dir(args.work, "bz-share-")
     work.mkdir(parents=True, exist_ok=True)
     rep = report.Report(SCRIPT, args.engine, args.out)
     rep.extra.update(work=str(work), dir=str(directory), programs=[c.name for c in picked],
@@ -187,10 +189,10 @@ def main(args: Input) -> None:
     for name in lone:
         rep.add(f"share/{name}", "error", f"{directory / name} has no {Path(name).stem}.stdout beside it: "
                 "every program of the directory is a case")
-    home, store = work / "h", work / "store"
+    home = work / "h"
     try:
         with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
-            running = [pool.submit(run_case, eng, c, work / c.name, home, store) for c in picked]
+            running = [pool.submit(run_case, eng, c, work / c.name, home) for c in picked]
             # In the order of the programs, not the order they end in: one report for one input.
             for done in running:
                 outcome = done.result()
@@ -198,7 +200,7 @@ def main(args: Input) -> None:
     finally:
         try:
             if home.is_dir():
-                eng.stop(work, eng.env(home, store))
+                eng.stop(work, eng.env(home))
         except engine.Failed as e:
             rep.add("share: stopping the daemon", "error", str(e))
         if not args.keep:

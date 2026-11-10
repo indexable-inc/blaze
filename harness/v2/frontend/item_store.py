@@ -10,7 +10,7 @@ The input is one JSON object (inline, a file's path, or `-` for stdin):
 
     engine      the blaze under test (engine.EngineSpec); v2 only, as v1 has no item store
     out         the path the result JSON is written to (report.py)
-    work        the directory the daemon's home and store go in; empty: a new one under /tmp
+    work        the directory the daemons' homes go in; empty: a new one under /tmp
     apps        which entries of harness/apps/apps.json run, by name; empty: every one with `edits`
     seed        the seed (0): step `i` of app `a` is chosen by `random.Random("item-store:<seed>:<a>")`
                 drawn in order, from what the files hold at that step, so a seed and a checkout
@@ -27,7 +27,7 @@ Each app is checked out, its dependencies put beside it and its setup run as app
 (`checkout`, `prepare`, `localize`, `setup`). blaze builds it with `BLAZE_ITEM_STORE=verify`:
 every body step the item store holds is run fresh as well and a difference stops the build with
 an error naming the body. blaze also builds the same source from nothing, with
-`BLAZE_ITEM_STORE=off`: a home and a store of its own, made for the step and removed after it
+`BLAZE_ITEM_STORE=off`: a home (so a store) of its own, made for the step and removed after it
 (as budgets.py's `wrong`), into the same target path, the other build's waiting aside (as
 oracle.py's `bytes`), then moved to `target-scratch`. Then each step changes the source, one of:
 
@@ -589,8 +589,8 @@ class App:
         flags = f"--cap-lints allow {apps.own_flags(spec)}".strip()
         extra = {**spec.get("build_env", {}), "RUSTFLAGS": flags}
         self.blaze_target, self.fresh_target = self.ws / "target-item-store", self.ws / "target-scratch"
-        self.env = eng.env(work / name / "home", work / name / "store", self.blaze_target, {**extra, ITEM_STORE: "verify"})
-        self.fresh_home, self.fresh_store = work / name / "scratch-home", work / name / "scratch-store"
+        self.env = eng.env(work / name / "home", self.blaze_target, {**extra, ITEM_STORE: "verify"})
+        self.fresh_home = work / name / "scratch-home"
         self.fresh_extra = {**extra, ITEM_STORE: "off"}
         self.fresh_env: dict[str, str] | None = None
         self.args = ["-p", spec["package"], *spec.get("cargo_args", [])]
@@ -626,7 +626,7 @@ class App:
         self.blaze_target.mkdir(parents=True, exist_ok=True)
         os.rename(self.blaze_target, aside)
         try:
-            self.fresh_env = self.eng.env(self.fresh_home, self.fresh_store, self.blaze_target, self.fresh_extra)
+            self.fresh_env = self.eng.env(self.fresh_home, self.blaze_target, self.fresh_extra)
             fresh = self.eng.build(f"{label}: from nothing", self.ws, self.fresh_env, self.args)
         finally:
             if self.blaze_target.exists():
@@ -649,7 +649,7 @@ class App:
             pass
         finally:
             self.fresh_env = None
-            for path in (self.fresh_home, self.fresh_store, self.fresh_target):
+            for path in (self.fresh_home, self.fresh_target):
                 shutil.rmtree(path, ignore_errors=True)
 
     def behaviours(self, made: Step) -> list[tuple[str, Behaviour, Behaviour]]:
@@ -742,7 +742,7 @@ def main(args: Input) -> None:
         eng = engine.Engine.of(args.engine)
     except engine.Failed as e:
         fail(SCRIPT, str(e))
-    work = Path(args.work or tempfile.mkdtemp(prefix="bz-item-store-", dir="/tmp")).resolve()
+    work = engine.work_dir(args.work, "bz-item-store-")
     work.mkdir(parents=True, exist_ok=True)
     rep = report.Report(SCRIPT, args.engine, args.out)
     rep.extra.update(work=str(work), apps=names, seed=args.seed, steps=args.steps, toolchain=engine.TOOLCHAIN)

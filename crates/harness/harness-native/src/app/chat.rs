@@ -980,8 +980,12 @@ fn rows_nested(t: &Transcript, shows: Shows<'_>) -> (Vec<(String, Row)>, HashSet
         {
             *steps = Some((key.clone(), open));
         }
-        if live || open {
-            out.push((key.clone(), Row::Steps(steps::turn_line(&key, &calls, t, ended.flatten(), live, open))));
+        // Opened, the line heads the steps under it. While the turn runs (and it is not opened) its line comes last,
+        // under the newest words, where the next thing will appear: the item marks where the work is.
+        let line = (live || open).then(|| (key.clone(), Row::Steps(steps::turn_line(&key, &calls, t, ended.flatten(), live, open))));
+        let last = live && !open;
+        if !last {
+            out.extend(line.clone());
         }
         // A turn whose steps are one run: the turn's line already is that run's (the same marks), so the run shows
         // opened under it with no line of its own, never two identical lines one inside the other.
@@ -994,6 +998,9 @@ fn rows_nested(t: &Transcript, shows: Shows<'_>) -> (Vec<(String, Row)>, HashSet
                     nested.extend(out[from..].iter().map(|(k, _)| k.clone()));
                 }
             }
+        }
+        if last {
+            out.extend(line);
         }
     }
     (out, nested)
@@ -1068,8 +1075,15 @@ fn all_steps() -> bool {
 /// How much of a text block still streaming in can show without what shows changing as more comes (byte offset): up to
 /// its last whitespace (a word still coming would hop to the next line as it grows), short of an inline code span or a
 /// bold run not closed yet (its markers would show, then vanish and restyle it), and short of a last line that is only a
-/// block's opening so far (a list's `-`, a heading's `#`, a fence: the line would change kind). Done, all of it.
+/// block's opening so far (a list's `-`, a heading's `#`, a fence: the line would change kind), and short of an inline
+/// component still coming (`<Cite loc="…">four at` with no `</Cite>` yet: its tag would show as written, then turn
+/// into its chip). Done, all of it.
 fn settled_len(text: &str, done: bool) -> usize {
+    settled_len_with(text, done, harness_native_ui_inline::known)
+}
+
+/// [`settled_len`] with `component` saying which tag names are inline components.
+fn settled_len_with(text: &str, done: bool, component: impl Fn(&str) -> bool) -> usize {
     if done {
         return text.len();
     }
@@ -1098,6 +1112,24 @@ fn settled_len(text: &str, done: bool) -> usize {
     let tail = &text[para..end];
     if tail.matches("**").count() % 2 == 1 {
         end = para + tail.rfind("**").unwrap_or(0);
+    }
+    // The last component tag opened in the paragraph: held back until it is whole (`<Name … />`, or `<Name …>` and its
+    // `</Name>`). Only names of the vocabulary: `Vec<T>` and `a < b` are words.
+    let tail = &text[para..end];
+    let opened = tail.char_indices().rev().find_map(|(i, c)| {
+        let name: &str = tail[i..].strip_prefix('<')?.split(|c: char| !c.is_ascii_alphanumeric()).next()?;
+        (c == '<' && component(name)).then_some((i, name))
+    });
+    if let Some((i, name)) = opened {
+        let rest = &tail[i..];
+        let whole = match rest.find('>') {
+            None => false,
+            Some(close) if rest[..close].ends_with('/') => true,
+            Some(_) => rest.contains(&format!("</{name}>")),
+        };
+        if !whole {
+            end = para + i;
+        }
     }
     end
 }
@@ -1658,6 +1690,13 @@ impl App {
                     txt.entity().set(te);
                 }
                 // Grown past its most, it scrolls on its FieldScroll (step_chat_inputs), the caret kept in view.
+            }
+        }
+        // The lantern, while nothing was sent in it yet.
+        if let Some(sky) = pv.part("lantern") {
+            let on = harness_native_ui_text_api::Lantern { on: !t.items.iter().any(|i| matches!(i, Item::User { .. })) };
+            if sky.entity().try_cloned::<&harness_native_ui_text_api::Lantern>() != Some(on) {
+                sky.set(on);
             }
         }
         // Its status bar is the sidebar's (hn.SideChat): the chat in front fills it.
@@ -2544,6 +2583,7 @@ impl App {
         if hit.is_empty() {
             return;
         }
+        crate::audio::cue("copy");
         let pulse = CopyFlash { whole: matches!(what, Copied::TableRow(..)), ..harness_native_render::select::Look::of(w).kick() };
         for id in hit {
             w.entity_from_id(id).set(pulse);
@@ -3415,13 +3455,14 @@ fn fill_row(row: View<'_>, r: &Row, ctx: &RowCtx<'_>, measure: &mut Measure<'_>)
         }
         Row::Ui { v, cell, block, code } => {
             genui::fill_in(row, v, cell, ctx.cells, ctx.ui, ctx.playing, measure);
-            // Its code: a quiet button in the gutter, shown while the view is hovered or its code is open.
+            // Its code's button, in the gutter.
             if let Some(b) = row.part("code_at").and_then(|z| z.part("code")).filter(|_| !block.is_empty()) {
-                b.action(&format!("chat:open:{}", code_key(block)));
-                tooltip(b, if *code { "Hide code" } else { "Show code" });
+                // Only while its code is open (to shut it): nothing appears beside a view under the pointer.
+                b.action(&if *code { format!("chat:open:{}", code_key(block)) } else { String::new() });
+                tooltip(b, if *code { "Hide code" } else { "" });
                 if let Some(i) = b.part("icon") {
-                    i.icon(CODE_ICON);
-                    crate::look::hover_show(i.entity(), *row.entity().id(), *code);
+                    i.icon(if *code { CODE_ICON } else { "" });
+                    crate::look::hover_show(i.entity(), *row.entity().id(), true);
                 }
             }
         }
@@ -3713,6 +3754,13 @@ mod tests {
         assert_eq!(at("Done.\n```rus"), "Done.\n");
         assert_eq!(at("```\nlet a = **b "), "```\nlet a = **b ");
         assert_eq!(settled_len("half a wo", true), 9);
+        // A component still coming is held back whole; one that is whole shows; a type's angle brackets are words.
+        let on = |t: &str| t[..settled_len_with(t, false, |n| n == "Cite" || n == "Path")].to_owned();
+        assert_eq!(on("Use <Cite loc=\"/a.md\" line={3}>as few "), "Use ");
+        assert_eq!(on("Use <Cite loc=\"/a.md\" "), "Use ");
+        assert_eq!(on("Use <Cite loc=\"/a.md\">as few</Cite> agents no"), "Use <Cite loc=\"/a.md\">as few</Cite> agents ");
+        assert_eq!(on("See <Path loc=\"/a\" /> and mo"), "See <Path loc=\"/a\" /> and ");
+        assert_eq!(on("a Vec<T> is fi"), "a Vec<T> is ");
     }
 
     /// A run is one folded line and nothing under it, its table and its failure included, until the person opens it; its

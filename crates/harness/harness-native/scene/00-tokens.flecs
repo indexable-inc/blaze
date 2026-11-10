@@ -163,6 +163,11 @@ export const line_row = 16
 // corners radius_row.
 export const pill_inset = 2
 export const radius_row = 6
+// The work bar (frame.flecs hn.WorkBar): work_bar_h tall, its band work_bar_share of the window long, crossing in
+// work_bar_period seconds.
+export const work_bar_h = 2
+export const work_bar_share = 0.28
+export const work_bar_period = 1.6
 // ui.Block (prims.flecs): a pixel-art block block_size across (16 texels: 1.5 points each), turning to a new face over
 // block_turn seconds.
 export const block_size = 24
@@ -450,10 +455,10 @@ export const plate_selection_n = 2
 // 0), and the glyphs it crosses take copy_ink of its colour where it is brightest. Under Reduce Motion nothing grows or
 // moves: the shape and its glyphs brighten by the light and fade back over copy_secs. At its end the pulse is exactly at
 // rest and the frame goes idle.
-export const copy_secs = 0.3
+export const copy_secs = 0.16
 export const copy_rise = 0.18
 export const copy_grow = 0.025
-export const copy_sweep = 0.55
+export const copy_sweep = 0.28
 export const copy_band = 30
 export const copy_tilt = 0.6
 export const copy_ink = 0.6

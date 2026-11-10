@@ -8,7 +8,7 @@ import { table, Table, LazyTable, col, lit, tableDocs } from "../table.ts";
 import { gitLog } from "../git-log.ts";
 import { nuon } from "../nuon.ts";
 import { tasks, task, taskValue, wait as waitTask } from "../tasks.ts";
-import { effect } from "../effects.ts";
+import { effect, progress, progressDocs } from "../effects.ts";
 import { brief } from "../shown.ts";
 import { agents } from "../agents.ts";
 import { sql } from "../sql.ts";
@@ -32,12 +32,13 @@ const wait = (id: string | number, timeoutMs?: number) =>
     show: v.status === "running" ? undefined : taskValue(id),
   }));
 
-export const functions = { skill, skills, rg, ls, glob, du, cargo, follow, $, pmap, image, vfs, spawn, obj, objects, tree, sql, googleSearch, gmail, github, browser, withHiddenPage, table, Table, LazyTable, col, lit, gitLog, nuon, tasks, task, taskValue, wait, sh, procs, out, err, lines, kill, ptree, runs, stage, runInfo, agents };
+export const functions = { progress, skill, skills, rg, ls, glob, du, cargo, follow, $, pmap, image, vfs, spawn, obj, objects, tree, sql, googleSearch, gmail, github, browser, withHiddenPage, table, Table, LazyTable, col, lit, gitLog, nuon, tasks, task, taskValue, wait, sh, procs, out, err, lines, kill, ptree, runs, stage, runInfo, agents };
 
 /** Shown in the MCP tool description so the model knows what it can call. A call only some tasks need keeps its long
  *  reference in a skill (mcp/skills/) and a one-line pointer here. */
 export const docs: Record<keyof typeof functions, string> = {
   ...skillDocs,
+  ...progressDocs,
   ...searchDocs,
   ...followDocs,
   $: "$`cmd ${arg}`: thenable of { stdout, stderr, exitCode, ok, text(), lines(), json() } — runs a program through sh(); each ${value} is one quoted word (arrays several), $.raw(s) unquoted. Chain before awaiting: .nothrow(), .cwd(dir), .env(vars), .timeout(ms), .stdin(data), .why(reason). A non-zero exit throws with the stderr tail. `await $`git log --oneline -5`.lines()`.",

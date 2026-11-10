@@ -46,6 +46,12 @@ pub fn install(forms: BTreeMap<String, Form>) {
     *FORMS.write().unwrap_or_else(std::sync::PoisonError::into_inner) = forms;
 }
 
+/// Whether `name` is a component of the installed vocabulary (`Path`, `Cite`, ...).
+#[must_use]
+pub fn known(name: &str) -> bool {
+    FORMS.read().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(name)
+}
+
 fn form(name: &str) -> Option<Form> {
     FORMS.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(name).cloned()
 }

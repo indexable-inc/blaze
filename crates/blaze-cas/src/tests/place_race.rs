@@ -73,6 +73,10 @@ fn race(case: Race, plant: bool) -> Result<(), String> {
     tags[case.first] = stores[case.first].place(&key(1), to.clone(), &mut effects);
     let second = 1 - case.first;
     let (mut asked, mut seen, mut done) = (false, 0, Vec::new());
+    // The bound of the loop, on the simulation's clock: a completion is at most `latency` (some
+    // microseconds) away, so two places end in milliseconds, and a store that keeps asking for
+    // effects without ending is an `Err` naming the race, not a test that never returns.
+    let end = blaze_core::wait::Deadline::after(sim.now(), Duration::from_secs(60));
     loop {
         // The second store asks once the first's effects have had `lead` completions, or
         // once nothing is in flight, whichever comes first.
@@ -87,7 +91,17 @@ fn race(case: Race, plant: bool) -> Result<(), String> {
                 false => continue,
             }
         }
-        sim.poll(&mut done, Duration::from_secs(60));
+        sim.poll(&mut done, end);
+        // Effects are in flight (checked above), so a poll that delivers none either reached
+        // `end` or holds effects that will never complete: both end the race.
+        if done.is_empty() {
+            return Err(format!(
+                "the places did not end by {end:?} on the simulation's clock (now {:?}): {} \
+                 effects in flight and none completed",
+                sim.now(),
+                sim.in_flight()
+            ));
+        }
         for completion in done.drain(..) {
             seen += 1;
             if let Some(store) = stores.iter_mut().find(|store| store.owns(completion.tag)) {

@@ -289,7 +289,8 @@ jobs:
     needs: build
     if: inputs.harnesses == '' && !startsWith(inputs.os, 'windows')
     runs-on: ${{ inputs.platform == 'linux-arm64' && fromJSON('["ix", "arm64", "ix-cpu-16", "blaze-profile-gate"]') || inputs.os }}
-    timeout-minutes: 30
+    # The gate itself is a few minutes; the budgets smoke after it has 20 of its own.
+    timeout-minutes: 45
     permissions:
       contents: read
     env:
@@ -325,6 +326,23 @@ jobs:
             '{blaze: $blaze, duckdb: $duckdb, history: $history, platform: $platform, runner: $runner, commit: $commit, out: $out}' \
             > "$RUNNER_TEMP/profile-gate.json"
           uv run --frozen --no-dev python harness/profile_gate.py "$RUNNER_TEMP/profile-gate.json"
+      # The budget harness still runs against the blaze this tree built (docs/harness.md, "The v2
+      # proof"): its preflight of the binary (version, commands, where a home's state, store and
+      # socket are), then fixture.py's three-crate workspace built in a new home, and one no-op
+      # build and one body edit measured through the code the budgets run. It holds no number to
+      # a budget; it fails when the harness and blaze no longer fit, at the change that parted them.
+      # The fixture has a build script, which runs in a sandbox of user namespaces.
+      # 64 s with a release on 32 cores; this runner has 16 and the tree's blaze, whose own code
+      # runs slower (#899). The step prints each command's seconds: tighten the bound from them.
+      - name: budgets.py smoke, with the blaze this tree built
+        timeout-minutes: 20
+        run: |
+          if [ "$RUNNER_OS" = Linux ] && [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
+            sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          jq -n --arg blaze "$RUNNER_TEMP/blaze/blaze" --arg out "$RUNNER_TEMP/budgets-smoke.json" \
+            '{command: "smoke", engine: {kind: "v2", blaze: $blaze}, out: $out}' > "$RUNNER_TEMP/budgets-smoke-input.json"
+          uv run --frozen --no-dev python harness/v2/budgets.py "$RUNNER_TEMP/budgets-smoke-input.json"
       - id: summary
         if: always()
         run: |

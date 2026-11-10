@@ -1195,6 +1195,7 @@ impl App {
         let t = self.focused_term()?;
         let sel = self.get::<TermSelection>(t).get()?;
         let text = self.with_parser(t, |p| term::selection_text(p, sel.ordered())).filter(|s| !s.is_empty())?;
+        crate::audio::cue("copy");
         let pulse = harness_native_render::select::Look::of(self.world.world_ref()).kick();
         self.put(t, pulse);
         self.poke();

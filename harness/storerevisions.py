@@ -50,7 +50,7 @@ from typed_input import fail, parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from storelib import Failed, artifact, worked
+from storelib import Failed, artifact, store_of, worked
 
 SCRIPT = "storerevisions.py"
 Case = Literal[
@@ -278,7 +278,7 @@ async def build(env: Env, ws: Path, seed: Path | None, label: str, exe: str) -> 
     if (ws / "target").exists():
         raise Failed(f"{label}: {ws} has a target directory before its first build")
     home = Path(tempfile.mkdtemp(prefix="h", dir=env.root))
-    store = home / "v2" / "store"
+    store = Path(store_of(str(home)))
     if seed is not None:
         shutil.copytree(seed, store)
     variables = env.of(home)

@@ -242,6 +242,7 @@ fn prefab_for(world: WorldRef<'_>, node: &Value, within: &Within, live: Option<&
     }
     match (kind, node["props"]["kind"].as_str()) {
         ("Chart", Some("pie" | "donut")) => "hn.GenChartPie",
+        ("Chart", Some("segments")) => "hn.GenChartSegments",
         _ => prefab_of(kind),
     }
 }
