@@ -79,6 +79,8 @@ use crate::{
     wheel::{self, Wheel},
 };
 
+/// `IORING_OP_NOP`: completes with 0 and does nothing, where a chain's sync is left out.
+const OP_NOP: u8 = 0;
 const OP_FSYNC: u8 = 3;
 const OP_WRITE_FIXED: u8 = 5;
 const OP_POLL_ADD: u8 = 6;
@@ -2435,7 +2437,12 @@ impl Driver for Uring {
             }
             self.in_flight += 1;
             let started = match effect {
-                Effect::Write { file, bytes, .. } => self.write(tag, file, bytes).map(|()| None),
+                Effect::Write { file, bytes, .. } => {
+                    self.write(tag, file, bytes, 0).map(|()| None)
+                }
+                Effect::WriteUnsynced { file, bytes, .. } => {
+                    self.write(tag, file, bytes, ops::UNSYNCED).map(|()| None)
+                }
                 Effect::Clone { from, to, .. } => {
                     self.copy(tag, Kind::Clone, &from, &to).map(|()| None)
                 }
@@ -2451,7 +2458,10 @@ impl Driver for Uring {
                 Effect::WriteAt { file, at, bytes, .. } => {
                     self.write_at(tag, &file, at, bytes).map(|()| None)
                 }
-                Effect::Rename { from, to, .. } => self.rename(tag, &from, &to).map(|()| None),
+                Effect::Rename { from, to, .. } => self.rename(tag, &from, &to, 0).map(|()| None),
+                Effect::RenameUnsynced { from, to, .. } => {
+                    self.rename(tag, &from, &to, ops::UNSYNCED).map(|()| None)
+                }
                 Effect::Mode { file, mode, .. } => {
                     under(&self.root, &file, |path| crate::fs::set_mode(path, mode))
                         .map(|()| Some(Done::Moded))

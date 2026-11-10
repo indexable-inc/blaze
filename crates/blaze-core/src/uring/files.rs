@@ -31,7 +31,10 @@ use blaze_mem::RegionVec;
 
 use super::{
     flight::{error, failed, filled, raw, spare_of},
-    ops::{DIRECT, LINKS, MADE, MAKE, NO_FOLLOW, NO_SLOT, NOT_REGULAR, SECOND, WHOLE, arena_of},
+    ops::{
+        DIRECT, LINKS, MADE, MAKE, NO_FOLLOW, NO_SLOT, NOT_REGULAR, SECOND, UNSYNCED, WHOLE,
+        arena_of,
+    },
     *,
 };
 
@@ -107,6 +110,16 @@ fn open(path: *const u8, flags: i32, mode: u32, slot: u32, link: u8, user_data: 
 /// `opcode` on the file in `slot`.
 fn on_slot(opcode: u8, slot: u32, link: u8, user_data: u64) -> Sqe {
     Sqe { opcode, flags: SQE_FIXED_FILE | link, fd: slot as i32, user_data, ..Sqe::default() }
+}
+
+/// The sync of `slot` in a write's or a rename's chain: an `fsync`, or for a request that
+/// waits for none ([`UNSYNCED`]) a no-op in its place, which completes with 0 as a sync that
+/// succeeded does, so the chain's links and the results read by their place stay as they are.
+fn sync_of(hot: &Hot, slot: u32, link: u8, user_data: u64) -> Sqe {
+    match hot.flags & UNSYNCED {
+        0 => on_slot(OP_FSYNC, slot, link, user_data),
+        _ => Sqe { opcode: OP_NOP, flags: link, user_data, ..Sqe::default() },
+    }
 }
 
 fn unlink(path: *const u8, flags: i32, user_data: u64) -> Sqe {
@@ -327,10 +340,17 @@ impl Uring {
 
     /// Starts [`Effect::Write`] `tag` of `bytes` over `file`: the chain that opens its
     /// directory, makes its temporary next to it, writes, syncs and renames it over the file
-    /// and syncs the directory.
-    pub(super) fn write(&mut self, tag: Tag, file: FileName, bytes: Vec<u8>) -> io::Result<()> {
+    /// and syncs the directory. With `flags` [`UNSYNCED`] ([`Effect::WriteUnsynced`]) the
+    /// same chain with a no-op where each sync is.
+    pub(super) fn write(
+        &mut self,
+        tag: Tag,
+        file: FileName,
+        bytes: Vec<u8>,
+        flags: u8,
+    ) -> io::Result<()> {
         let mut hot = Hot::new(tag, Kind::Write, 0);
-        hot.flags |= MAKE;
+        hot.flags |= MAKE | flags;
         let push = |path: &Path, names: &mut RegionVec<u8>, at: &mut [u32; 5]| {
             at[0] = push_temporary(names, path)?;
             at[1] = push_c(names, path.as_os_str().as_bytes())?;
@@ -347,12 +367,19 @@ impl Uring {
     }
 
     /// Starts [`Effect::Rename`] `tag` of `from` over `to`, after the opens of the directory
-    /// of each and linked to their syncs.
-    pub(super) fn rename(&mut self, tag: Tag, from: &FileName, to: &FileName) -> io::Result<()> {
+    /// of each and linked to their syncs. With `flags` [`UNSYNCED`]
+    /// ([`Effect::RenameUnsynced`]) the same chain with a no-op where each sync is.
+    pub(super) fn rename(
+        &mut self,
+        tag: Tag,
+        from: &FileName,
+        to: &FileName,
+        flags: u8,
+    ) -> io::Result<()> {
         self.forget(from);
         self.forget(to);
         let mut hot = Hot::new(tag, Kind::Rename, 0);
-        hot.flags |= MAKE;
+        hot.flags |= MAKE | flags;
         let root = Arc::clone(&self.root); // clone: a reference count.
         let push = |source: &Path, names: &mut RegionVec<u8>, at: &mut [u32; 5]| {
             at[0] = push_c(names, source.as_os_str().as_bytes())?;
@@ -806,9 +833,9 @@ impl Uring {
                     len: left,
                     ..on_slot(OP_WRITE, temporary, SQE_IO_LINK, ud(2))
                 };
-                sqes[n + 1] = on_slot(OP_FSYNC, temporary, SQE_IO_LINK, ud(3));
+                sqes[n + 1] = sync_of(hot, temporary, SQE_IO_LINK, ud(3));
                 sqes[n + 2] = two_names(OP_RENAMEAT, name(0), name(1), SQE_IO_LINK, ud(4));
-                sqes[n + 3] = on_slot(OP_FSYNC, dir, 0, ud(5));
+                sqes[n + 3] = sync_of(hot, dir, 0, ud(5));
                 n + 4
             }
             (Kind::Rename, _) => {
@@ -821,10 +848,10 @@ impl Uring {
                     n += 1;
                 }
                 sqes[n] = two_names(OP_RENAMEAT, name(0), name(1), SQE_IO_LINK, ud(2));
-                sqes[n + 1] = on_slot(OP_FSYNC, to_dir, if two { SQE_IO_LINK } else { 0 }, ud(3));
+                sqes[n + 1] = sync_of(hot, to_dir, if two { SQE_IO_LINK } else { 0 }, ud(3));
                 n += 2;
                 if two {
-                    sqes[n] = on_slot(OP_FSYNC, from_dir, 0, ud(4));
+                    sqes[n] = sync_of(hot, from_dir, 0, ud(4));
                     n += 1;
                 }
                 n
