@@ -109,7 +109,7 @@ returns a promise settled from that thread, and any number may be under way at o
 with no call under way does not keep the process alive.
 
 To build it: build the package `blaze-napi` with blaze, then copy its library
-(`libblaze_napi.dylib` on macOS, `libblaze_napi.so` on Linux) to `crates/blaze-napi/blaze.node`,
+(`libblaze_napi.dylib` on macOS, `libblaze_napi.so` on Linux) to `blaze.node` in `crates/blaze-napi`,
 or name the file in `BLAZE_NAPI`. The smoke test connects, asks the status, builds a crate it
 writes, times a warm request and closes:
 
