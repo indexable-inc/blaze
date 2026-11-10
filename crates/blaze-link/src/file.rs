@@ -145,6 +145,28 @@ impl<'s> Layout<'s> {
     }
 }
 
+/// A state's file read at any offset, with no file made: what its digest hashes
+/// ([`crate::digest`]).
+pub(crate) struct FileBytes<'s>(Layout<'s>);
+
+impl<'s> FileBytes<'s> {
+    pub(crate) fn of(state: &'s State) -> FileBytes<'s> {
+        FileBytes(Layout::of(state))
+    }
+
+    /// The file's bytes in `at..at + out.len()` copied into `out`, which is zeros: what is in
+    /// no region and no part stays zero.
+    pub(crate) fn copy(&self, at: u64, out: &mut [u8]) {
+        self.0.copy(at, out);
+    }
+
+    /// Every range of the file anything is in, sorted, none overlapping: outside them the
+    /// file is zeros.
+    pub(crate) fn extents(&self) -> Vec<(u64, u64)> {
+        self.0.extents(0)
+    }
+}
+
 /// The byte ranges of `state`'s file outside its regions: the writer's parts, then the debug
 /// sections, borrowed from the lists ([`crate::model::File::debug`]).
 fn file_parts(state: &State) -> impl Iterator<Item = (u64, Part<'_>)> {

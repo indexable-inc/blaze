@@ -23,6 +23,7 @@ mod arena;
 mod commit;
 mod counter;
 mod cow;
+pub mod digest;
 mod dwarf;
 mod elf;
 mod file;
@@ -34,6 +35,7 @@ mod macho;
 mod model;
 mod native;
 mod output;
+mod patch;
 mod pe;
 mod place;
 mod position;
@@ -74,6 +76,7 @@ use std::alloc::Global;
 pub use layout::Heat;
 pub use live::descriptor_of;
 pub use lazy::{LazyPlacer, Slots};
+pub use patch::Patch;
 pub use output::{
     Debug, DevRun, Format, LinkArgs, Live, Native, NativeKind, Output, OutputKind, Platform,
     Undefined,
@@ -215,6 +218,11 @@ pub enum Refusal {
     /// islands through the code and takes the change. `branch` is the branch, its code, its
     /// target and how far that is, as the build says them.
     NoThunk { branch: String },
+    /// A file is not the one the image's last link left ([`Image::verify`]): `len` bytes where
+    /// the link state has `kept`, first differing in `block` (of [`digest::BLOCK`] bytes). A
+    /// write cut short by a crash, or a file changed by another hand. The kept image patches
+    /// only the file its digest names, so it is let go and linked from scratch.
+    Torn { block: u64, len: u64, kept: u64 },
 }
 
 /// What a laid-out image is past ([`Refusal::OutOfReach`]).
@@ -271,10 +279,14 @@ impl LinkError {
     /// The refusal, when the image refused the stage for want of room: [`Refusal::NoRoom`],
     /// `NoRegion`, `TableFull`, `TlsMoved`, or an incremental stage's `OutOfReach`, which a
     /// link from scratch takes. Never `NotFound` or `FieldRange`, which one does not, nor
-    /// `NoThunk`, which is no want of room ([`LinkError::no_thunk`]).
+    /// `NoThunk`, which is no want of room ([`LinkError::no_thunk`]), nor `Torn`, which is of
+    /// a file and not of the image ([`LinkError::torn`]).
     pub fn no_room(&self) -> Option<&Refusal> {
         self.refusal.as_ref().filter(|it| match it {
-            Refusal::NotFound(_) | Refusal::FieldRange | Refusal::NoThunk { .. } => false,
+            Refusal::NotFound(_)
+            | Refusal::FieldRange
+            | Refusal::NoThunk { .. }
+            | Refusal::Torn { .. } => false,
             Refusal::OutOfReach(reach) => reach.scratch,
             _ => true,
         })
@@ -287,6 +299,12 @@ impl LinkError {
             Some(Refusal::NoThunk { branch }) => Some(branch),
             _ => None,
         }
+    }
+
+    /// Whether a file was refused as not the one the image's last link left
+    /// ([`Refusal::Torn`]): the kept image is let go and linked from scratch.
+    pub fn torn(&self) -> bool {
+        matches!(self.refusal, Some(Refusal::Torn { .. }))
     }
 
     /// The limit the laid-out image is past, when that refused it.
@@ -350,6 +368,8 @@ pub struct Image {
     /// The counter pairs [`LazyPlacer`] gave since the last commit, which a commit of a stage
     /// made before them carries over ([`Image::carry_placed_pairs`]).
     placed_pairs: Vec<(symbols::IdNo, u32)>,
+    /// The file's identity, kept as commits change it ([`Image::digest`]).
+    filed: patch::Filed,
 }
 
 impl Image {
@@ -456,6 +476,7 @@ impl Image {
             lazy: None,
             // alloc: none until the lazy placer gives a pair
             placed_pairs: Vec::new(),
+            filed: patch::Filed::new(),
         })
     }
 

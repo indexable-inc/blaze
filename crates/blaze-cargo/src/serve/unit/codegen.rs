@@ -1652,13 +1652,13 @@ pub(crate) enum LinkCause {
 impl std::fmt::Display for LinkCause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            // blaze-link refuses a change it has no room for and never lays the image out whole
-            // in its place; the image is the daemon's, kept in memory, so the way to a whole
-            // link is to let the daemon go.
+            // A kept image with no room for a change is linked from scratch, said on the link
+            // line ([`Full::NoRoom`]); what reaches here is a refusal that link could not take
+            // either.
             LinkCause::Linker { step, error } if error.no_room().is_some() => write!(
                 f,
-                "{}: {error}. The image is kept by the daemon: `blaze stop` lets it go, and the next build links it \
-                 from scratch",
+                "{}: {error}. A link of the image from scratch has no room for it either: the limit is the \
+                 output's, not the kept image's",
                 step.name()
             ),
             LinkCause::Linker { step, error } => write!(f, "{}: {error}", step.name()),
@@ -1826,11 +1826,24 @@ fn link_at(
     // build says which branch ([`LinkMade::whole`]). The kept image is let go first, so the
     // two are never held at once; a link from scratch that fails too is the build's error,
     // and the next link starts from an image never laid out.
+    // A splice refused for want of room ([`blaze_link::LinkError::no_room`]) is taken the same
+    // way, and said the same way ([`Full::NoRoom`]): only where an image was kept, since one
+    // just made that has no room is refused for good.
     let mut whole = None;
-    if let Err(LinkCause::Linker { step: LinkStep::Stage, error }) = &made
-        && let Some(branch) = error.no_thunk()
-    {
-        let why = full_link_note(branch);
+    let patched = changed.is_some_and(OutputFields::is_empty) && !relaid;
+    let scratch = match &made {
+        Err(LinkCause::Linker { step: LinkStep::Stage, error }) => match error.no_thunk() {
+            Some(branch) => Some((Full::NoThunk, full_link_note(branch))),
+            None if patched && error.no_room().is_some() => Some((
+                Full::NoRoom,
+                // alloc: once per link from scratch
+                format!("full link: the kept image has no room for the change: {error}"),
+            )),
+            None => None,
+        },
+        _ => None,
+    };
+    if let Some((reason, why)) = scratch {
         tracing::info!(target: "blaze", unit = %path, why = %why, "link from scratch");
         match fresh_image(path, &output, weights.map(super::layout::Weights::id)) {
             Ok(fresh) => {
@@ -1847,7 +1860,7 @@ fn link_at(
                     heat.as_ref(),
                     &mut linked,
                 );
-                whole = Some(why);
+                whole = Some((reason, why));
             }
             Err(cause) => {
                 images.push(KeptImage { path: path.to_owned(), kept: linked });
@@ -1856,6 +1869,7 @@ fn link_at(
         }
     }
     // What address holds which function, for a profile of this build to be read through.
+    let tables = tracing::info_span!(target: "blaze", "link tables", unit = %path).entered();
     let mapped = match (&made, profiles) {
         (Ok(_), Some(profiles)) => profiles.write_map(
             path,
@@ -1875,12 +1889,13 @@ fn link_at(
         }
         Err(_) => Ok(()),
     };
+    drop(tables);
     images.push(KeptImage { path: path.to_owned(), kept: linked });
     let (bytes, read, table, laid, told) = made?;
     mapped?;
     perf_mapped?;
     let how = match (&whole, relaid && changed.is_some_and(OutputFields::is_empty)) {
-        (Some(_), _) => Linking::Full(Full::NoThunk),
+        (Some((reason, _)), _) => Linking::Full(*reason),
         (None, true) => Linking::Full(Full::Layout),
         (None, false) => linking(changed, laid, output.incremental),
     };
@@ -1888,7 +1903,7 @@ fn link_at(
         super::run::inproc::Told::Restart { why } => Some(why),
         super::run::inproc::Told::Nothing | super::run::inproc::Told::Patched { .. } => None,
     };
-    Ok(LinkMade { bytes, read, table, how, restart, whole })
+    Ok(LinkMade { bytes, read, table, how, restart, whole: whole.map(|it| it.1) })
 }
 
 /// The image to link `output` laid out by profile `layout` into at `path`, taken out of
@@ -2118,6 +2133,16 @@ fn relink(
         }
         None => None,
     };
+    // What of the image this build changes: its natives, function rows, static rows and
+    // names against the columns the image keeps.
+    let delta = tracing::info_span!(
+        target: "blaze",
+        "link delta",
+        unit = %path,
+        gone = tracing::field::Empty,
+        new = tracing::field::Empty,
+    )
+    .entered();
     // Each native input by the hash of its contents, through the process's table of files by
     // their `stat`: one `stat` for a library the image already has, read only when it is new.
     let mut files = blaze_usercode::inputs::Disk::new(Vec::new());
@@ -2172,6 +2197,8 @@ fn relink(
     let (functions, removed, added_keys) =
         function_rows(&linked.functions, &built.functions, &built.debug_names)?;
     let (statics, gone_statics, new_statics) = static_rows(&linked.statics, &built.statics)?;
+    delta.record("gone", removed.len() + gone_statics.len());
+    delta.record("new", added_keys.len() + new_statics.len());
     let mut patchable: Vec<InstanceKey> = built.patchable.iter().copied().collect();
     patchable.sort_unstable();
     let mut names: Vec<(String, Target)> =
@@ -2300,6 +2327,20 @@ fn relink(
         }
         None => (Vec::new(), None),
     };
+    drop(delta);
+    // The stage and its commit: what the change places and writes. A link placed into the
+    // room the image kept is taken as a patch ([`Image::patch`]), so the span says what a
+    // writer of the file in place would write (`written` bytes in `ranges`), and the file's
+    // identity is kept by the blocks written (docs/v2/plan/design/patch-in-place.md).
+    let patching = tracing::info_span!(
+        target: "blaze",
+        "link patch",
+        unit = %path,
+        full = tracing::field::Empty,
+        written = tracing::field::Empty,
+        ranges = tracing::field::Empty,
+    )
+    .entered();
     let made = linked
         .image
         .stage(change)
@@ -2326,11 +2367,27 @@ fn relink(
                 .map_err(|what| LinkCause::Given(format!("{path}: {what}"))),
                 None => linked
                     .image
-                    .bytes(staged)
+                    .patch(staged)
+                    .and_then(|patch| {
+                        patching.record("full", patch.full);
+                        patching.record("written", patch.written());
+                        patching.record("ranges", patch.writes.len());
+                        // The store takes the file whole: this copy is the length of the
+                        // file, and the span says so until the store takes a patch.
+                        let _span = tracing::info_span!(
+                            target: "blaze",
+                            "link copy",
+                            unit = %path,
+                            bytes = patch.len,
+                        )
+                        .entered();
+                        whole_file(&linked.image, patch)
+                    })
                     .map(|bytes| (bytes, laid, super::run::inproc::Told::Nothing))
                     .map_err(|error| LinkCause::Linker { step: LinkStep::Bytes, error }),
             }
         });
+    drop(patching);
     let (bytes, laid, told) = match made {
         Ok(made) => made,
         Err(cause) => {
@@ -2348,8 +2405,26 @@ fn relink(
     linked.slotted = slotted;
     linked.assumed = assumed;
     linked.given = Some(given);
-    let table = tests_table(test, path, generated, side, linked)?;
+    let table = {
+        let _span = tracing::info_span!(target: "blaze", "link tables", unit = %path).entered();
+        tests_table(test, path, generated, side, linked)?
+    };
     Ok((bytes, read, table, laid, told))
+}
+
+/// The whole file a link left, for the store: a file written whole is its patch's writes
+/// over zeros, and one patched is read from the image's state ([`Image::file`]).
+fn whole_file(image: &Image, patch: blaze_link::Patch) -> Result<Vec<u8>, blaze_link::LinkError> {
+    if !patch.full {
+        return image.file();
+    }
+    // alloc: the file, which the store takes
+    let mut out = vec![0; patch.len as usize];
+    for (at, bytes) in &patch.writes {
+        let at = *at as usize;
+        out[at..at + bytes.len()].copy_from_slice(bytes);
+    }
+    Ok(out)
 }
 
 /// A test binary's table, by which its tests are selected and which only its link numbers;

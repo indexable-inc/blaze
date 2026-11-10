@@ -394,6 +394,10 @@ impl Linking {
             Linking::Full(Full::NoThunk) => {
                 blaze_api::LinkHow::Full { why: vec!["no thunk in reach".to_owned()] }
             }
+            // alloc: one name, for a link that was not spliced
+            Linking::Full(Full::NoRoom) => {
+                blaze_api::LinkHow::Full { why: vec!["no room".to_owned()] }
+            }
         }
     }
 }
@@ -416,6 +420,9 @@ impl std::fmt::Display for Linking {
             Linking::Full(Full::NoThunk) => f.write_str(
                 "not spliced: full link: the splice could not place a thunk in a branch's reach",
             ),
+            Linking::Full(Full::NoRoom) => f.write_str(
+                "not spliced: full link: the kept image has no room for the change",
+            ),
         }
     }
 }
@@ -437,6 +444,10 @@ pub enum Full {
     /// ([`blaze_link::Refusal::NoThunk`]). The image was linked from scratch, and the build
     /// says which branch.
     NoThunk,
+    /// The kept image refused the change for want of room: a region, the jump table or the
+    /// patch region is full, or its thread-locals would move ([`blaze_link::LinkError::no_room`]).
+    /// The image was linked from scratch, with room again, and the build says what was full.
+    NoRoom,
 }
 
 /// Fields of [`blaze_link::Output`] as a set, a bit each in [`OutputFields::NAMES`]'s order.

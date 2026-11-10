@@ -395,6 +395,12 @@ fn how_a_link_went_is_first_only_with_nothing_kept() {
     // A splice refused for a thunk: the link from scratch is said on the link line, and the
     // build names the branch.
     assert!(Linking::Full(Full::NoThunk).placed());
+    // A splice refused for want of room: linked from scratch, and said so.
+    assert!(Linking::Full(Full::NoRoom).placed());
+    assert_eq!(
+        Linking::Full(Full::NoRoom).to_string(),
+        "not spliced: full link: the kept image has no room for the change"
+    );
     assert_eq!(
         Linking::Full(Full::NoThunk).to_string(),
         "not spliced: full link: the splice could not place a thunk in a branch's reach"
@@ -457,10 +463,12 @@ fn a_kept_image_is_taken_only_for_its_own_output_and_layout() {
     );
 }
 
-/// A link blaze-link refused for want of room names the image, what overflowed and the command
-/// that links it from scratch; any other refusal names no such command.
+/// A link blaze-link refused for want of room, which a link from scratch could not take
+/// either (a kept image out of room is linked from scratch first, `Full::NoRoom`), names the
+/// image, what overflowed and that the limit is the output's; any other refusal says no such
+/// thing.
 #[test]
-fn a_link_out_of_room_names_the_image_and_how_to_link_it_whole() {
+fn a_link_out_of_room_names_the_image_and_whose_limit_it_is() {
     let refused = |refusal| blaze_link::LinkError {
         function: None,
         what: "Patch needs 70000000 bytes and has room for 67108864: link the image from scratch"
@@ -480,6 +488,6 @@ fn a_link_out_of_room_names_the_image_and_how_to_link_it_whole() {
         "{no_room}"
     );
     assert!(no_room.contains("Patch needs 70000000 bytes and has room for 67108864"), "{no_room}");
-    assert!(no_room.contains("`blaze stop`"), "{no_room}");
-    assert!(!failed(None).contains("`blaze stop`"));
+    assert!(no_room.contains("the limit is the output's"), "{no_room}");
+    assert!(!failed(None).contains("the limit is the output's"));
 }
