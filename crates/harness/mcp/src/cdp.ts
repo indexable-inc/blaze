@@ -423,9 +423,10 @@ export async function host(): Promise<Host> {
 const owner = () => `${REPL_ID}/${currentTask()?.id ?? "kernel"}`;
 
 /** A page of the harness browser, its Page and Runtime domains on; at `url`, loaded, when given. `keep`: it outlives
- *  this kernel's connection (a page opened for the person). */
-export async function newPage(opts: { url?: string; keep?: boolean } = {}): Promise<Page> {
-  const v = await (await host()).open(opts.url ?? "about:blank", { owner: owner(), keep: opts.keep });
+ *  this kernel's connection (a page opened for the person). `size`: its view's size in points until the app draws it
+ *  (the app sizes a view to the box it is drawn in). */
+export async function newPage(opts: { url?: string; keep?: boolean; size?: [number, number] } = {}): Promise<Page> {
+  const v = await (await host()).open(opts.url ?? "about:blank", { owner: owner(), keep: opts.keep, size: opts.size });
   const page = new Page(v, String(v.info.view), v.info.target, v.info.url, v.info.title);
   try {
     await Promise.all([page.send("Page.enable"), page.send("Runtime.enable")]);

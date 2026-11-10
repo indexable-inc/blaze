@@ -94,7 +94,8 @@ export async function dispatch(id: string, handler: string, value: unknown): Pro
 /** Mount `component` with `props` as task `t`'s UI, replacing any it had (its questions stay); what the first render throws is thrown here. */
 export function show(t: Task, component: unknown, props: Record<string, unknown> = {}): UiTree {
   const shown = shownOf(t);
-  shown.main?.unmount();
+  // What it showed is replaced: its Maps' views close with it.
+  shown.main?.unmount(true);
   const tree = treeOf(t, shown);
   shown.main = tree;
   try { tree.mount(component, props); }
@@ -210,7 +211,7 @@ export function installUi(scope: Record<string, unknown>): void {
         unmount: () => {
           const shown = live.get(t);
           if (!shown || shown.main !== tree) return;
-          tree.unmount();
+          tree.unmount(true);
           shown.main = undefined;
           update(t, shown);
         },
