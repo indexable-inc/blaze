@@ -58,7 +58,7 @@ jobs:
       # library/, which a blaze with no checkout of its commit downloads once and checks
       # against its digest (crates/blaze-cargo/src/cargo/toolchain/library.rs). The digest is
       # BLAKE3, by the uv workspace's `blake3` (the Rust crate through PyO3): no system package.
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: '0.13.5'
           checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (ix runners are arm64)
@@ -108,7 +108,7 @@ jobs:
           job: release
           llvm: true
       # build_release.py runs in the repository's Python workspace (typed_input).
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: '0.13.5'
           enable-cache: false
@@ -215,7 +215,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: '0.13.5'
           checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (ix runners are arm64)
@@ -237,7 +237,7 @@ jobs:
         with:
           path: out
           merge-multiple: true
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: '0.13.5'
           checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (ix runners are arm64)
