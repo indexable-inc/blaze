@@ -13,7 +13,7 @@
 //! in memory beside that database and is never written to the store. Whoever makes a [`Kept`]
 //! keeps it for one database and one configuration of the front end (`hir-ty-codegen`'s
 //! `HirFrontend::kept`); a restart begins with none and the first walk describes everything,
-//! which [`Walk::fresh`] says.
+//! which [`Walk::fresh`] says ([`Fresh::Restart`]).
 
 use std::{
     hash::Hash,
@@ -25,6 +25,7 @@ use std::{
 
 use blaze_hash::SharedMap;
 
+use super::delta::{Fresh, Last};
 use crate::{InstanceKey, backend::Described, plan::Origin};
 
 /// The rounds of a walk whose describes are kept apart: the first, and the one over the facts
@@ -44,6 +45,9 @@ pub struct Kept<I, S> {
     /// sorted. Read only to count what a walk dropped ([`Walk::dropped`]); nothing is built
     /// or left out by it, so two keys of one first word only miscount by one.
     programs: SharedMap<u64, Arc<[u64]>>,
+    /// What each program's last build gave, by [`program`] of every input of the build: its
+    /// ID and its entries, which the next build's [`super::Delta`] is made against.
+    built: SharedMap<u64, Arc<Last>>,
 }
 
 impl<I: Eq + Hash, S> Default for Kept<I, S> {
@@ -51,6 +55,7 @@ impl<I: Eq + Hash, S> Default for Kept<I, S> {
         Kept {
             rounds: std::array::from_fn(|_| SharedMap::default()),
             programs: SharedMap::default(),
+            built: SharedMap::default(),
         }
     }
 }
@@ -85,6 +90,17 @@ impl<I: Clone + Eq + Hash + Send + Sync, S: Send + Sync> Kept<I, S> {
     pub(super) fn keep(&self, round: usize, asked: &(I, Origin), described: Arc<Described<I, S>>) {
         // clone: the walk's handle of the function and who asks for it, once per describe
         self.rounds[round.min(ROUNDS - 1)].pin().insert(asked.clone(), described);
+    }
+
+    /// What `program`'s last build gave, if one was kept.
+    pub(super) fn last(&self, program: u64) -> Option<Arc<Last>> {
+        // clone: a reference count, once per build
+        self.built.pin().get(&program).cloned()
+    }
+
+    /// Keeps `built` as what `program`'s last build gave.
+    pub(super) fn built(&self, program: u64, built: Arc<Last>) {
+        self.built.pin().insert(program, built);
     }
 
     /// Records `keys`, the functions of `program`'s walk in key order, as its last walk, and
@@ -128,29 +144,6 @@ fn missing(before: &[u64], now: &[u64]) -> usize {
 pub(super) fn program<T: Hash>(roots: &T) -> u64 {
     use std::hash::BuildHasher as _;
     blaze_hash::FixedState.hash_one(roots)
-}
-
-/// Why a walk used no kept describe ([`Walk::fresh`]).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Fresh {
-    /// The build was given nothing to keep describes in ([`super::Build::keeping`]).
-    Unkept,
-    /// Nothing was kept yet for the front end's database and configuration: the first build
-    /// since the daemon started or since the database was made again.
-    Empty,
-}
-
-impl Fresh {
-    /// The reason, as a span's field and `blaze why` say it.
-    pub fn why(self) -> &'static str {
-        match self {
-            Fresh::Unkept => "the build keeps no walk",
-            Fresh::Empty => {
-                "no walk was kept for this front end's database and settings: the first build \
-                 since the daemon started or the database was made again"
-            }
-        }
-    }
 }
 
 /// What a walk did: the fields of the `codegen walk` span, and [`super::Built::walk`].

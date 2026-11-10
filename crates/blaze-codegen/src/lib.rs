@@ -46,7 +46,7 @@ pub mod template;
 pub mod unwind;
 pub mod wasm;
 
-pub use driver::Owner;
+pub use driver::{BuiltId, Changes, Delta, Fresh, Owner, StaticId};
 pub use exec::ExecTable;
 pub use relocs::{Reloc, Relocation, Relocs, RelocsView};
 

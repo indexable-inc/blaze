@@ -264,6 +264,8 @@ fn difference(
     same!(identities);
     same!(cold);
     same!(made);
+    // The ID is of the lists alone: a build with nothing kept gives the same one.
+    same!(id);
     same!(stats.instances);
     same!(stats.statics);
     same!(walk.reached);
@@ -290,6 +292,8 @@ fn first_difference(
     program.engine.misses_facts = plant == Some(Plant::DynFact);
     let kept = Kept::new();
     let stays: Vec<u32> = [1].into_iter().chain(run.check).collect();
+    // The last build over kept describes that was not refused: the base of the next delta.
+    let mut base: Option<Built> = None;
     for build in 0..=edits.len() {
         if let Some((edit, picks)) = build.checked_sub(1).map(|at| edits[at]) {
             apply(&mut program, edit, picks, &stays, plant);
@@ -300,8 +304,51 @@ fn first_difference(
         if let Some(what) = difference(&over_kept, &fresh) {
             return Some(format!("build {build}: {what}"));
         }
+        if let Ok(now) = over_kept {
+            if let Some(what) = delta_differs(base.as_ref(), &now) {
+                return Some(format!("build {build}: {what}"));
+            }
+            base = Some(now);
+        }
     }
     None
+}
+
+/// What a delta from entries `before` to entries `now` must be, made another way than the
+/// driver makes it: by key, through a map.
+fn changes_between<K: Copy + Ord>(
+    before: &[(K, ContentId)],
+    now: &[(K, ContentId)],
+) -> Changes<K> {
+    let (before, now): (BTreeMap<K, ContentId>, BTreeMap<K, ContentId>) =
+        (before.iter().copied().collect(), now.iter().copied().collect());
+    Changes {
+        added: now.keys().filter(|it| !before.contains_key(*it)).copied().collect(),
+        changed: (now.iter())
+            .filter(|(key, entry)| before.get(*key).is_some_and(|was| was != *entry))
+            .map(|(key, _)| *key)
+            .collect(),
+        removed: before.keys().filter(|it| !now.contains_key(*it)).copied().collect(),
+    }
+}
+
+/// The oracle of a build's delta: `now.delta` is relative to `base`, the last build of the
+/// program that was kept, and names exactly the functions and statics whose entries (all
+/// that a `Built` says of each) are added, other or gone, so `base` with the delta applied
+/// is `now`. With no base it says why and names nothing.
+fn delta_differs(base: Option<&Built>, now: &Built) -> Option<String> {
+    let Some(base) = base else {
+        let none = now.delta.base.is_none() && now.delta.fresh.is_some();
+        let empty = now.delta.functions.is_empty() && now.delta.statics.is_empty();
+        return (!(none && empty)).then(|| format!("a first build's delta is {:?}", now.delta));
+    };
+    let want = Delta {
+        base: Some(base.id),
+        functions: changes_between(&delta::function_entries(base), &delta::function_entries(now)),
+        statics: changes_between(&delta::static_entries(base), &delta::static_entries(now)),
+        fresh: None,
+    };
+    (now.delta != want).then(|| format!("the delta is {:?}, where it is {want:?}", now.delta))
 }
 
 /// A program of 3 to 8 functions, `main` (1) a member's, each calling the next and some of
@@ -457,7 +504,7 @@ fn describes(program: &Program) -> (usize, usize) {
 
 /// The walk's cost in describes is the edit's, not the program's: of 300 functions, an edit
 /// of one leaf's body describes that leaf alone, and a build after no edit describes nothing.
-/// The first build describes them all and says why ([`Fresh::Empty`]).
+/// The first build describes them all and says why ([`Fresh::Restart`]).
 #[test]
 fn an_edit_of_one_leaf_describes_it_alone() {
     const COUNT: usize = 300;
@@ -472,7 +519,7 @@ fn an_edit_of_one_leaf_describes_it_alone() {
         (walk, (after.0 - before.0, after.1 - before.1))
     };
     let (first, asked) = walk(&program);
-    let fresh = Some(Fresh::Empty);
+    let fresh = Some(Fresh::Restart);
     let all = Walk { described: COUNT, verified: 0, reached: COUNT, dropped: 0, fresh };
     assert_eq!((first, asked), (all, (COUNT, 0)));
     assert_eq!(kept.len(), COUNT);
@@ -527,4 +574,32 @@ fn each_round_of_a_walk_keeps_its_own_describes() {
     set_fact(&mut program, 2, 3);
     let flipped = walk(&program);
     assert_eq!((flipped.described, flipped.verified, flipped.reached), (1, 9, 5));
+}
+
+/// A function's entry holds what the link reads of it beside its code: a leaf whose owner
+/// alone changes keeps its key and its bytes, and the delta names it changed, alone.
+#[test]
+fn a_delta_names_a_function_whose_owner_alone_changed() {
+    let mut program = program();
+    let kept = Kept::new();
+    program.begin_build();
+    let before = built(&program, WHOLE, Some(&kept), None).unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!((before.delta.base, before.delta.fresh), (None, Some(Fresh::Restart)));
+    program.functions.get_mut(&5).expect("a leaf").owner = Owner::Dependency;
+    program.touch(5);
+    program.begin_build();
+    let after = built(&program, WHOLE, Some(&kept), None).unwrap_or_else(|e| panic!("{e:?}"));
+    let leaf = key_named(&after, 5);
+    assert_eq!(key_named(&before, 5), leaf, "its owner is no part of its key");
+    assert_eq!(after.delta.base, Some(before.id));
+    assert_ne!(after.id, before.id);
+    let changed = Changes { added: Vec::new(), changed: vec![leaf], removed: Vec::new() };
+    assert_eq!(after.delta.functions, changed);
+    assert!(after.delta.statics.is_empty());
+
+    // A build after no edit changes nothing and is the same `Built`.
+    program.begin_build();
+    let again = built(&program, WHOLE, Some(&kept), None).unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!((again.id, again.delta.base), (after.id, Some(after.id)));
+    assert!(again.delta.functions.is_empty() && again.delta.statics.is_empty());
 }

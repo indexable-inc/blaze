@@ -254,6 +254,13 @@ pub struct Built {
     /// What the walk did: how many describes it asked the front end for, how many kept ones
     /// it took, and why it took none ([`Walk::fresh`]). Nothing is keyed by it.
     pub walk: Walk,
+    /// Which whole `Built` this is, by content ([`BuiltId`]): every field above but the
+    /// counts of the build's own work. The ID a build with nothing kept gives the same lists.
+    pub id: BuiltId,
+    /// What this `Built` changed since the last one of the same program, whose ID is its
+    /// base: a consumer that holds state for the base applies it and reads nothing else;
+    /// any other reads the whole lists ([`Delta`]).
+    pub delta: Delta,
 }
 
 impl Built {
@@ -694,7 +701,8 @@ struct StaticNode<B: Prepare> {
     refs: Vec<Target>,
 }
 
-type StaticId = (ItemKey, ContentId);
+/// Which static of a build: its item and which instance of it.
+pub type StaticId = (ItemKey, ContentId);
 
 /// A walk's nodes in key order, sorted once when the walk ends, each found by one hash of its
 /// key: per entry its key, its value and a 4-byte slot of `at`.
@@ -1979,7 +1987,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         let counts = kept::Counts::default();
         let fresh = match self.kept {
             None => Some(Fresh::Unkept),
-            Some(kept) if kept.is_empty() => Some(Fresh::Empty),
+            Some(kept) if kept.is_empty() => Some(Fresh::Restart),
             Some(_) => None,
         };
         let mut nodes: blaze_hash::HashMap<InstanceKey, Node<B>, Global> =
@@ -2881,7 +2889,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         if !errors.is_empty() {
             return Err(errors);
         }
-        Ok(Built {
+        let mut built = Built {
             functions,
             statics: compiled_statics,
             roots: root_keys,
@@ -2910,7 +2918,39 @@ impl<'a, B: Prepare> Build<'a, B> {
             kernel,
             misses,
             walk,
-        })
+            id: BuiltId::default(),
+            delta: Delta::default(),
+        };
+        // What the build changed since the last build of the same program: the program is
+        // every input of the walk beside the front end's own, which the kept walk is of
+        // (its database and configuration): the roots, the check's roots, the policy and
+        // which kind of build with which entry.
+        let span = tracing::info_span!(
+            target: "blaze",
+            "codegen delta",
+            functions = built.inputs.len(),
+            added = tracing::field::Empty,
+            changed = tracing::field::Empty,
+            removed = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+        let now = delta::Last::of(&built);
+        let program = kept::program(&(roots, static_roots, check, self.policy.id().0, later));
+        let before = self.kept.and_then(|kept| kept.last(program));
+        let fresh = match self.kept {
+            None => Some(Fresh::Unkept),
+            Some(_) => Some(walk.fresh.unwrap_or(Fresh::First)),
+        };
+        built.delta = delta::between(before.as_ref(), &now, fresh);
+        built.id = now.id;
+        span.record("added", built.delta.functions.added.len());
+        span.record("changed", built.delta.functions.changed.len());
+        span.record("removed", built.delta.functions.removed.len());
+        if let Some(kept) = self.kept {
+            // alloc: once per build, what the next build's delta is made against
+            kept.built(program, Arc::new(now));
+        }
+        Ok(built)
     }
 
     /// A live build's tiered functions at their last tier (#807): LLVM's code for the slots
@@ -4414,8 +4454,10 @@ pub(crate) mod reach;
 pub use reach::Reach;
 mod owners;
 pub use owners::Owner;
+mod delta;
+pub use delta::{BuiltId, Changes, Delta, Fresh};
 mod kept;
-pub use kept::{Fresh, Kept, Walk};
+pub use kept::{Kept, Walk};
 mod later;
 mod recursion;
 pub use later::{Later, Walked, runs_at_start};
