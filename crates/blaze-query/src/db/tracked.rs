@@ -65,6 +65,7 @@ impl Vtable {
             reset: None,
             weighed: None,
             explicit: None,
+            unread: None,
             relocate: None,
             restamp: None,
             write_key: None,

@@ -125,6 +125,21 @@ Footprint is the one number admission, the front end's release and the ceiling r
 - A per-task budget on global-heap bytes fails tests and the self-build, naming the task: the check
   that holds new code to this, where `blaze::implicit_allocator` only judges call sites.
 
+Built on `fast-mem-1110` (2026-11-10), not yet measured:
+
+- A thread's frame shelf keeps one chunk's worth of each span and at most eight spans
+  (`blaze_mem::frame::WARM`, 32 MiB a thread). Before, a span went back to the shelf with every
+  page its task had committed, and nothing called `trim_spare`, so each worker held the peak of
+  the largest tasks it had run.
+- mimalloc gives a freed page back as it frees it (`purge_delay` 0, `heaps::purge_at_once`).
+- A build's end lets go of the evictable query values the last two builds that wrote did not
+  read (`blaze_query::db::Storage::end_epoch`). Values of functions that are not `lru` are
+  still kept for good, as are the rows, edges and interned tables.
+
+Not built: moving global-heap call sites onto frames, and the per-task budget on global-heap
+bytes. Both need `blaze explain memory`'s call sites and task churn from a build of this tree to
+choose the sites and the budget.
+
 ### 4. Outputs as records in the store's buffer pool
 
 Design: [v2/plan/design/store-pool.md](v2/plan/design/store-pool.md).

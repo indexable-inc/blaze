@@ -127,6 +127,35 @@ fn check_page_map(heap: *mut mi_heap_t) {
     }
 }
 
+/// `mi_option_purge_delay` of mimalloc 3's `mi_option_e` (include/mimalloc.h): the sixteenth
+/// option, after `mi_option_deprecated_eager_commit_delay` (14, which libmimalloc-sys names
+/// `mi_option_eager_commit_delay`) and before `mi_option_use_numa_nodes` (16). libmimalloc-sys
+/// 0.1.49 does not name it; `the_purge_delay_is_the_option_this_names` holds the number to
+/// mimalloc's default for it.
+const PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
+
+/// mimalloc's default `purge_delay`, in milliseconds (src/options.c).
+#[cfg(test)]
+const PURGE_DELAY_DEFAULT: std::ffi::c_long = 1000;
+
+/// Has mimalloc give a page back to the system as it frees it to its arena, not `purge_delay`
+/// (1 s) later: a delayed purge runs only as some thread next takes or frees a page, at most
+/// once per tenth of the delay and over a quarter of the arenas, so what a burst of frees left
+/// stayed in the footprint until allocation went on, and an idle daemon kept it until asked
+/// ([`give_back_here`]). At 0 an empty page is decommitted where it is freed
+/// (`mi_arena_schedule_purge`: `MADV_DONTNEED` on Linux, `MADV_FREE_REUSABLE` on macOS, both
+/// out of the footprint at once; never `MADV_FREE`, since `purge_decommits` stays 1). mimalloc
+/// still keeps, per thread and size class, the pages it allocates from and
+/// `page_full_retain` (2) empty ones, so a loop that frees and allocates again does not pay a
+/// system call each turn. What this cannot give back is a page with a live block on it, or one
+/// whose blocks another thread freed until its owner collects ([`give_back_here`]). Called
+/// once, before the first query (docs/memory-footprint.md, cause 1).
+pub(crate) fn purge_at_once() {
+    // SAFETY: sets one option word, which mimalloc reads each time it frees a page to an
+    // arena; mimalloc documents options as settable from any thread at any time.
+    unsafe { libmimalloc_sys::mi_option_set(PURGE_DELAY, 0) };
+}
+
 /// mimalloc, a heap per tag ([`Holders`]).
 pub(crate) struct Heaps;
 
@@ -623,6 +652,27 @@ mod tests {
                 BLOCK * BLOCKS,
             );
         });
+    }
+
+    /// [`PURGE_DELAY`] is the option `purge_at_once` means: it reads mimalloc's default for
+    /// `purge_delay`, which neither neighbour in `mi_option_e` has (`eager_commit_delay` is 1
+    /// and `use_numa_nodes` 0). No test of this binary sets it, since those above measure what
+    /// a give-back purges under the default; `MIMALLOC_PURGE_DELAY` in the environment would.
+    #[test]
+    fn the_purge_delay_is_the_option_this_names() {
+        // SAFETY: reads option words; callable from any thread.
+        let (before, delay, after) = unsafe {
+            (
+                libmimalloc_sys::mi_option_get(PURGE_DELAY - 1),
+                libmimalloc_sys::mi_option_get(PURGE_DELAY),
+                libmimalloc_sys::mi_option_get(PURGE_DELAY + 1),
+            )
+        };
+        assert_eq!(
+            (before, delay, after),
+            (1, PURGE_DELAY_DEFAULT, 0),
+            "option 15 of libmimalloc-sys's mimalloc is not purge_delay at its default"
+        );
     }
 
     /// Two blocks handed to another thread to free.

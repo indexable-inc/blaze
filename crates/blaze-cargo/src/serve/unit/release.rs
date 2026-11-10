@@ -204,6 +204,7 @@ impl Release<Crate> {
             const_eval = tracing::field::Empty,
             solver_caches = tracing::field::Empty,
             intern_tables = tracing::field::Empty,
+            unread = tracing::field::Empty,
             left = tracing::field::Empty,
             query_storage = tracing::field::Empty,
         );
@@ -213,6 +214,13 @@ impl Release<Crate> {
         if pressed {
             db.storage_mut().sweep_values(&Squeeze::caps(before));
         }
+        // The build is over: what neither it nor the build before it read of the front end's
+        // evictable values goes, the results of revisions no edit since has asked for. Only
+        // here, with the build's reads all made; a build that wrote nothing lets nothing go.
+        let unread = match ended {
+            true => db.storage_mut().end_epoch(),
+            false => blaze_query::db::Unread::default(),
+        };
         // What was let go goes back to the system now, not when mimalloc's purge delay and the
         // next page taken get to it: this thread's heaps and every freed page at once, each
         // other thread's heaps as it next allocates or idles (memcap5).
@@ -227,6 +235,7 @@ impl Release<Crate> {
         span.record("const_eval", dropped.const_eval);
         span.record("solver_caches", dropped.solver_caches);
         span.record("intern_tables", dropped.intern_tables);
+        span.record("unread", unread.values);
         span.record("left", after.held);
         // What the query storage still holds after the drops. On a release memory made due, by
         // ingredient (memcap6): its rows in use are a walk of every function's rows made, a
@@ -246,7 +255,17 @@ impl Release<Crate> {
         // query storage's largest holders.
         eprintln!(
             "blaze serve: {}",
-            Said { crates: crates.len(), mir, pressed, ended, dropped, before, after, storage }
+            Said {
+                crates: crates.len(),
+                mir,
+                pressed,
+                ended,
+                dropped,
+                unread,
+                before,
+                after,
+                storage,
+            }
         );
     }
 }
@@ -259,6 +278,9 @@ pub(crate) struct Said {
     pub(crate) pressed: bool,
     pub(crate) ended: bool,
     pub(crate) dropped: hir::evict::Dropped,
+    /// What the build's end let go of that two builds left unread
+    /// ([`blaze_query::db::Storage::end_epoch`]).
+    pub(crate) unread: blaze_query::db::Unread,
     pub(crate) before: Pressure,
     pub(crate) after: Pressure,
     pub(crate) storage: Holders,
@@ -334,7 +356,8 @@ impl std::fmt::Display for Holders {
 impl std::fmt::Display for Said {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let gib = |bytes: u64| bytes as f64 / f64::from(1u32 << 30);
-        let Said { crates, mir, pressed, ended, dropped, before, after, storage: _ } = self;
+        let Said { crates, mir, pressed, ended, dropped, unread, before, after, storage: _ } =
+            self;
         f.write_str("front end release (")?;
         match (*pressed, before.over) {
             (true, _) if before.squeezed() => write!(
@@ -364,6 +387,9 @@ impl std::fmt::Display for Said {
         write!(f, " and {} trait solver caches", dropped.solver_caches)?;
         if *pressed {
             f.write_str(", and swept the front end's values to their fair shares")?;
+        }
+        if unread.values != 0 {
+            write!(f, ", and {} values the last two builds did not read", unread.values)?;
         }
         write!(f, "; blaze held {:.2} GiB, now {:.2} GiB", gib(before.held), gib(after.held))?;
         match before.held.checked_sub(after.held) {

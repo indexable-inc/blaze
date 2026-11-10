@@ -1285,6 +1285,43 @@ fn frame_span_grows_in_place_and_comes_back_warm() {
     assert_eq!(frame::spare_frames(), 0, "trimming to nothing gives every warm block back");
 }
 
+/// A task's frame holds no memory once the task ends, past what its thread keeps warm
+/// ([`frame::WARM`]), however much the task held: its span's pages go back to the kernel as it
+/// ends. On a thread of its own, whose shelf starts empty. The cause, tested by removing it:
+/// without the decommit in `Shelf::give_span` the shelf keeps the span's 64 MiB and the first
+/// bound fails.
+#[test]
+fn frame_task_leaves_at_most_the_warm_shelf_however_much_it_held() {
+    const HELD: usize = 64 << 20;
+    const { assert!(HELD > frame::WARM) };
+    thread::spawn(|| {
+        assert_eq!(frame::spare_bytes(), 0, "a new thread keeps nothing warm");
+        for round in 0..3 {
+            frame::task(Tag::Codegen, |frame| {
+                // Small allocations first, in chunks, as a task's other scratch is; then one
+                // past a chunk, in a span.
+                for _ in 0..64 {
+                    frame.alloc_slice_fill_with(100 << 10, |i| i as u8);
+                }
+                let big = frame.alloc_slice_fill_with(HELD, |i| i as u8);
+                assert!(frame.committed() >= HELD);
+                assert_eq!(big[HELD - 1], (HELD - 1) as u8);
+            });
+            let spare = frame::spare_bytes();
+            assert!(
+                spare <= frame::WARM,
+                "round {round}: the thread keeps {spare} bytes warm after a task of {HELD}, past {}",
+                frame::WARM
+            );
+            assert!(spare > 0, "round {round}: the next task starts warm");
+        }
+        frame::trim_spare(0);
+        assert_eq!(frame::spare_bytes(), 0, "trimming to nothing gives every warm page back");
+    })
+    .join()
+    .expect("the task's thread");
+}
+
 #[test]
 fn frame_matches_a_model_on_random_allocations_grows_shrinks_and_rollbacks() {
     use std::{alloc::Allocator, ptr::NonNull, slice};
