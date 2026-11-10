@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-8 invariants, 0 refinements, 1 reference models.
-By level: 1 tested, 7 simulated, 0 model-checked, 0 proved.
+9 invariants, 1 refinements, 1 reference models.
+By level: 2 tested, 7 simulated, 0 model-checked, 1 proved.
 
 ## Invariants
 
@@ -40,6 +40,18 @@ By level: 1 tested, 7 simulated, 0 model-checked, 0 proved.
   Controls: `a_foreign_name_written_with_no_link`, `a_generation_begun_with_no_gen_row`, `a_reader_that_ignores_the_window`, `a_table_kept_across_a_park`.
 - **`every_row_is_in_the_history_once_after_any_crash`** *simulated* (`crates/blaze-profile/src/history/files/tests.rs`): whatever the faults, wherever the power goes out, every row handed to the history is listed, handed back or left to read, exactly once, and the history opens.
   Controls: `a_rename_with_no_sync_before`, `what_a_flush_consumed_marked_after_its_commit`.
+
+### hir-ty-lean
+
+- **`fnv1a_from_is_the_fold_of_its_bytes`** *proved* (`crates/blaze-graph/lean/BlazeGraph/Ledger.lean`) (`crates/hir-ty-lean/src/tests.rs`): the ledger's checksum loop `fnv1a_from` never panics (no index out of bounds, no counter overflow) and returns FNV-1a's fold of the seed over the bytes, for every seed and every slice. The proof is of the model this test holds to the tree's source: the function's text is read from crates/blaze-graph/src/ledger.rs, its emitted Lean must be the checked-in module the proof imports, and its structured MIR runs to the same fold on the inputs here.
+  Controls: `a_continue_made_a_break`, `an_else_branch_dropped_at_a_join`, `an_xor_made_an_add`.
+
+## Refinements
+
+### hir-ty-lean
+
+- **`structured_code_runs_as_its_graph`** *tested* (`crates/hir-ty-lean/src/tests.rs`): structured control flow reconstructed from a control-flow graph runs as the graph does, from every state, to the same end, variables and trace; and what `reconstruct` returns is well formed and a fixed point of lowering and reconstructing.
+  Controls: `a_continue_made_a_break`, `an_else_branch_dropped_at_a_join`, `an_xor_made_an_add`.
 
 ## Reference models
 

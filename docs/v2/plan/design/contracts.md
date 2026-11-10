@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: Function contracts (nightly's `#![feature(contracts)]`) in blaze — the same as the pinned nightly first, then checked by default in dev and test profiles, tested by Hegel-generated property tests, proved by lane verus (`#[blaze::verify]`), and used by the optimizer only once proved.
+summary: Function contracts (nightly's `#![feature(contracts)]`) in blaze — the same as the pinned nightly first, then checked by default in dev and test profiles, tested by Hegel-generated property tests, proved in Lean (formal-verification.md; the Z3 tier was retired on 2026-11-10), and used by the optimizer only once proved.
 date: 2026-11-02
 ---
 # Contracts: checked, generated, proved, used
@@ -9,15 +9,15 @@ Lane `contracts`, approved by Andrew on 2026-11-02 (tier 4, "proved", added the 
 handoff is `/tmp/blaze-lanes/v2-contracts.md`.
 
 **One spec form (Andrew, 2026-11-02).** blaze's contracts are Verus's syntax made native
-grammar, gated per crate, which lane `verus` parses and lowers
-(`/tmp/blaze-lanes/v2-verus.md`):
+grammar, gated per crate, parsed and lowered to clause groups in hir-def
+([verus.md](verus.md), which records the lane that built it):
 
 ```text
 fn f(x: u32) -> (r: u32) requires x < 10 ensures r > x { .. }
 ```
 
 The same lane owns loop `invariant`, `spec fn`, `forall` and `==>`. This lane parses no second
-syntax. Parts 1 to 3 read the native clauses from HIR, in the shape lane verus defines in its
+syntax. Parts 1 to 3 read the native clauses from HIR, in the shape hir-def's clause groups have in its
 `## Interface`.
 
 Nightly's `#[core::contracts::requires(expr)]` / `#[core::contracts::ensures(|ret| expr)]`
@@ -36,7 +36,9 @@ The parts:
    opt-out per profile.
 2. **Tested by generation.** A function with native clauses gets a Hegel property test.
 3. **Used by the optimizer, once proved.** A fact is used only when a proof stands behind it.
-4. **Proved.** Lane `verus` proves `ensures` from `requires` and the body.
+4. **Proved.** Lean checks a proof of `ensures` from `requires` and the model of the body
+   ([formal-verification.md](formal-verification.md)); the Z3 tier that proved it with no
+   proof written was retired on 2026-11-10.
 
 ## 0. What the pinned nightly does (nightly-2026-10-27, rustc 16d1ffac17ad)
 
@@ -179,7 +181,7 @@ blaze before this lane:
   attributes keep nightly's default and follow only `-Zcontract-checks` (part 0). The setting
   reaches the front end as the crate cfg atom `blaze::contract_checks`, a name no source can
   write, since a cfg name is never a path. `blaze-lower`'s `cfg` adds it after the target's cfgs,
-  so `--print cfg` is unchanged. Lane verus's lowering of a native clause reads it, as rustc's
+  so `--print cfg` is unchanged. hir-def's lowering of a native clause reads it, as rustc's
   lowering reads `contract_checks`.
 - **Keys.** The atom is part of the crate's cfg, which is an input of every body lowering. The
   unit's profile hash (`blaze-units` `graph.rs`, `load/plan/hash.rs`) includes it, so switching
@@ -199,7 +201,7 @@ These are blaze's, under the rule useful-not-parity.
   returned `7`". The value is shown with its `Debug` when it has one.
 
 How they are made:
-- **Who emits the check.** Lane verus lowers a native clause to HIR, in its interface's shape.
+- **Who emits the check.** hir-def lowers a native clause to HIR, as a clause group.
   This lane emits the run-time check from that HIR, after type inference, while building MIR
   (`hir-ty-mir` lowering of a function with clauses).
   - A `requires` is checked at the top of the body.
@@ -241,7 +243,7 @@ How they are made:
     whose `ensures` is checked.
   - Not built yet: the caller-side check (and so the caller's file and line), the `Debug` of
     the returned value, and spec arithmetic: a clause runs as machine arithmetic (`n + 1` can
-    overflow), where verus reads it as an unbounded `int`.
+    overflow), where a proof reads it as an unbounded `int`.
 
 ## 2. Tested by generation
 
@@ -322,13 +324,13 @@ How they are made:
     expression reduces to such a fact about the return place at every `Return` is proved. A
     caller then uses it: `let r = f(xs); xs[r]` drops the bounds check when
     `ensures(|r| *r < xs.len())` is proved and `xs` is the same place.
-  - **Proved by lane verus** (`proved(..)` in part 4: `Proved` verdicts only, never `Unknown`).
+  - **Proved in Lean** (`proved(..)` in part 4: a proof the pinned Lean checked, nothing less).
   - **Requires discharged at a call site.** When the caller proves the `requires` at a direct
     call, it calls the callee's unchecked entry. The callee then has two entries: its checked
     entry, for indirect calls, and the unchecked one.
 - **Identity (rule 18).** Each use is a fact in the caller's code identity:
   `(callee instance identity, clause hash, how proved)`, where "how proved" is either the pass
-  name or lane verus's `ProofKey`. The facts feed `hir-ty-identity`'s facts, and are folded as lane
+  name or the Lean proof's `ProofKey`. The facts feed `hir-ty-identity`'s facts, and are folded as lane
   identity folds lane pure's memory facts. A change to the callee's contract or body changes its
   instance identity, and with it every caller that used the fact.
 - **Report.** A span `contracts.fact` (target `blaze`) records the callee, the clause, how it
@@ -338,55 +340,57 @@ How they are made:
   `use_proved_contracts(db, &mut MirBody) -> Vec<Fact>` removes a bounds check
   `assert(idx < LEN)` on a constant-length array when `idx` comes (through single-assignment
   copies and unsigned casts) from a call of a non-generic function whose `ensures` has an item
-  `r < K` (or `<=`, `>`, `>=` forms) with `K <= LEN`, and `proved(.., Clause::Ensures)` answers
-  `Some`. A callee with a `requires` qualifies only when its crate has `contract_checks()`
+  `r < K` (or `<=`, `>`, `>=` forms) with `K <= LEN`, and the prover it is given
+  (`hir_ty_lean::proved`) answers `Ok`. An `ensures` that is not proved is reported by name with
+  why (the event `contracts.not_proved`) and its check stays. A callee with a `requires` qualifies only when its crate has `contract_checks()`
   (the `requires` is then checked at its entry, part 1). Each use is a `Fact { callee: ItemKey,
-  clause, how: How::Verus(ProofKey), entry, used }` recorded under the span `contracts.fact`.
-  - Not wired into `optimize::passes`. It needs `proved` as a cached query with Z3 as a tracked
-    input (today it runs Z3 on every call and reads `BLAZE_Z3` itself) and a typed error when
-    Z3 is missing, from lane verus; and `contract_facts` in `Inlined` hashed by `identity_of`,
-    from lane identity.
-  - Not built: `requires_discharged` and the unchecked entry (`proved` answers `None` for
-    `Requires`), generic callees (`None` for non-empty args), slices, and the range-fact prover.
+  clause, how: How::Lean(ProofKey), entry, used }` recorded under the span `contracts.fact`.
+  - Not wired into `optimize::passes`. It needs `proved` as a cached query with the Lean
+    toolchain as a tracked input (today each call runs Lean, which reads `BLAZE_LEAN_PROVER`
+    itself), the place of each crate's `lean/`, and `contract_facts` in `Inlined` hashed by
+    `identity_of`, from lane identity.
+  - Not built: `requires_discharged` and the unchecked entry (`proved` says a `requires` is not
+    proved), generic callees (not translated), slices, and the range-fact prover.
+  - **Since 2026-11-10 (the Z3 tier retired).** The clause this part reads, `r < K` over
+    integers, was proved by Z3 with no proof written. Lean proves it only where the callee's
+    crate has a proof file, so until one is written each such clause is "not proved: there is
+    no proof file" and the bounds check stays.
 
-## 4. Proved (`#[blaze::verify]`): lane `verus`
+## 4. Proved: Lean
 
-Lane `verus` (handoff `/tmp/blaze-lanes/v2-verus.md`) owns the proof tier. It forks Verus and keeps
-Verus's rustc-free `vir`, `air` and `vstd` (Z3 backend), and replaces `rust_verify`'s rustc-HIR
-lowering with a lowering from blaze's typed HIR/MIR into VIR. This lane builds no VC generator
-and no solver binding. Prior art for both lanes (Verus, Creusot, Prusti, Kani, SPARK, Eiffel,
-the contracts project goal) is in section "Prior art" below.
+The proof tier is [formal-verification.md](formal-verification.md): blaze translates a
+function's MIR to a Lean model, states its clauses over the model, and the pinned Lean checks
+the proof the crate keeps in its `lean/`. Until 2026-11-10 a fork of Verus (VIR, AIR, Z3)
+proved arithmetic clauses with no proof written ([verus.md](verus.md) records it and what it
+did that nothing does now).
 
-The interface between the lanes is one fact each way.
+The interface between the two is one fact each way.
 
-- **Specs in.** The nightly clauses become VIR's own: `#[core::contracts::requires(e)]` is
-  `requires e`, and `#[core::contracts::ensures(|r| e)]` is `ensures |r| e`. `#[blaze::verify]`
-  on a function, or `#![blaze::verify]` on a crate, asks lane verus to prove them. This lane hands
-  over the clauses as the front end lowered them (`hir_def::expr_store::Contract`, below): the
-  `requires` closure's body expression, its declarations, the `ensures` closure, and the
-  function. So both lanes read one parse of the attributes.
-- **Verdicts out.** Lane verus answers per function instance with `Proved`, `Refuted`
-  (with the clause and a counterexample) or `Unknown` (out of resources; never a pass). This
-  lane's part 3 reads only `Proved`, through one function whose shape is fixed here and which
-  lane verus implements:
+- **Specs in.** One parse of the clauses: the clause groups in the function's body
+  (`ExpressionStore::spec_clauses`), which this lane reads for its checks and facts and
+  `hir-ty-lean` for the Lean statement.
+- **Verdicts out.** Part 3 reads only a proof, through one function:
 
   ```rust
-  /// Whether `clause` of `func<args>` is proved, and the key of that proof (the kernel step's
-  /// identity, which a caller optimised on it puts in its own code identity).
-  pub fn proved(db: &Db, func: FunctionId, args: StoredGenericArgs, clause: Clause) -> Option<ProofKey>;
+  /// Whether `clause` of `func<args>` is proved, and the key of that proof (which a caller
+  /// optimised on it puts in its own code identity); else why it is not.
+  pub fn proved(db: &Db, func: FunctionId, args: StoredGenericArgs, clause: Clause, proofs: &Proofs)
+      -> Result<ProofKey, NotProved>;
   pub enum Clause { Requires, Ensures }
-  pub struct ProofKey(pub ContentId);
+  pub struct ProofKey { pub how: Prover, pub id: ContentId }
   ```
 
-  Until lane verus lands it, part 3 uses only the facts blaze's own passes prove.
+  `NotProved` names the function, the clause and why: no proof file, a construct v0 does not
+  translate, a generic function, a `requires` (proved at call sites, which v0 does not lower),
+  Lean refusing the proof, an axiom that is not allowed. It is never a pass.
 - **Hegel stays the cheap first pass.** Part 2's generated test runs first, and a counterexample
-  it finds is reported before a proof is tried. Lane verus's counterexamples come back as
-  part 2's test, seeded with the values from the model.
+  it finds is reported before a proof is tried. It is now the only source of counterexamples.
 
 ### Prior art
 
 - **Verus**: SMT, Rust-syntax specs, modular verification by callee contracts, a deterministic
-  resource limit in place of a timeout. Taken whole by lane verus.
+  resource limit in place of a timeout. Its syntax is blaze's spec form; its prover was used
+  until 2026-11-10.
 - **Creusot**: conditions from MIR, prophecies for `&mut`, loop `#[invariant]`.
 - **Prusti**: `old(e)`, pure functions usable in specs (here lane pure's `#[blaze::pure]`).
 - **Kani**: bounded checking. It drives rustc, so it is not used.

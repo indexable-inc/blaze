@@ -1,8 +1,8 @@
 //! Spec lowering: a function's clause groups as Lean propositions over its model (step 2 of
 //! the pipeline).
 //!
-//! The clauses are lane verus's, read where it reads them: the groups hir-def lowers each
-//! clause to (`ExpressionStore::spec_clauses`), typed by inference. A clause's arithmetic is
+//! The clauses have one home, the source, and one reading of where they are: the groups
+//! hir-def lowers each clause to (`ExpressionStore::spec_clauses`), typed by inference. A clause's arithmetic is
 //! over mathematical integers, so an integer is its model's `.val : Int` and a `bool` is the
 //! proposition that it is `true`.
 //!
@@ -11,7 +11,7 @@
 //! comparisons, `&&`, `||`, a field, and `len()` of a slice. `forall`, `==>`, `old` and
 //! `spec fn` are not parsed on main yet; when they are, they lower to [`Term::Forall`],
 //! [`Infix::Implies`], the entry value's variable and a Lean `def`. A loop's `invariant` is a
-//! hint to lane verus's solver and states nothing of the function, so it is not lowered: a
+//! hint to a solver (the Z3 tier, retired 2026-11-10) and states nothing of the function, so it is not lowered: a
 //! Lean proof brings its own induction. `decreases` (termination), `recommends` and a loop's
 //! `ensures` are refused, naming the clause: lowering the rest without them would state less
 //! than the function's spec says.

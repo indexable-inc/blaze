@@ -1,4 +1,5 @@
-//! The proof check: pipeline step 4, as hir-ty-verus's driver is for Z3.
+//! The proof check: pipeline step 4, and the one `proved` interface ([`proved`], [`ProofKey`],
+//! [`Clause`]) since the Z3 tier (`hir-ty-verus`) was retired on 2026-11-10.
 //!
 //! The pinned Lean is the executable `BLAZE_LEAN_PROVER` names, an absolute path: there is no
 //! other place it is looked for (no `PATH`, no elan). Its `--version` must say
@@ -7,8 +8,7 @@
 //! library, the models and the check module are written; the proof file is read where the
 //! crate keeps it and never written.
 //!
-//! Like lane verus's Z3, Lean is not run in blaze's sandbox yet. Unlike Z3 it runs what the
-//! proof file says (a tactic may do IO), so the command that runs this for code blaze did not
+//! Lean is not run in blaze's sandbox yet, and it runs what the proof file says (a tactic may do IO), so the command that runs this for code blaze did not
 //! write must put it in the sandbox first (`sandbox-everything`).
 
 use std::{
@@ -19,6 +19,7 @@ use std::{
 
 use base_db::{ContentId, Db};
 use hir_def::FunctionId;
+use hir_ty::next_solver::StoredGenericArgs;
 
 use crate::{
     Emitted, LIBRARY, NotTranslated, TRANSLATOR,
@@ -380,9 +381,109 @@ pub fn check_emitted(
     })
 }
 
-/// Whether `func`'s `ensures` are proved in Lean by `proof`, and the key of that proof: what
-/// lane verus's `proved` answers for Z3. Only a proof answers `Some`.
-pub fn proved(db: &Db, func: FunctionId, proof: &ProofFile, out: PathBuf) -> Option<ProofKey> {
-    let config = Config::from_env(out).ok()?;
-    check(db, func, proof, &config).ok().map(|it| it.key)
+/// A clause of a function, for [`proved`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Clause {
+    /// The function's `requires`, holding at every call site.
+    Requires,
+    /// The function's `ensures`, given its `requires`.
+    Ensures,
+}
+
+impl Clause {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Clause::Requires => "requires",
+            Clause::Ensures => "ensures",
+        }
+    }
+}
+
+/// A clause that is not proved, and why: never a pass, never another prover's answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotProved {
+    /// The function, `krate::module::name`.
+    pub function: String,
+    pub clause: Clause,
+    pub why: String,
+}
+
+impl fmt::Display for NotProved {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "`{}`'s `{}` is not proved: {}", self.function, self.clause.keyword(), self.why)
+    }
+}
+
+impl std::error::Error for NotProved {}
+
+/// Where a crate's proofs are and where blaze may write.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Proofs {
+    /// The crate's `lean/`, beside its `src/`.
+    pub root: PathBuf,
+    /// A directory blaze owns ([`Config::out`]).
+    pub out: PathBuf,
+}
+
+impl Proofs {
+    /// The proof file of the function at `path` (the crate, the modules, the name): one file
+    /// per Rust module, each segment in upper camel case, `Lib` for the crate's root:
+    /// `blaze_graph::ledger::fnv1a_from` is proved in `BlazeGraph.Ledger`.
+    pub fn file_of(&self, path: &[String]) -> ProofFile {
+        let camel = |segment: &String| -> String {
+            segment
+                .split('_')
+                .map(|word| {
+                    let mut chars = word.chars();
+                    match chars.next() {
+                        Some(first) => first.to_uppercase().chain(chars).collect::<String>(),
+                        None => String::new(),
+                    }
+                })
+                .collect()
+        };
+        let modules = &path[..path.len().saturating_sub(1)];
+        let mut segments: Vec<String> = modules.iter().map(camel).collect();
+        if segments.len() <= 1 {
+            segments.push("Lib".to_owned());
+        }
+        ProofFile { root: self.root.clone(), module: segments.join(".") }
+    }
+}
+
+/// Whether `clause` of `func<args>` is proved in Lean, and the key of that proof: the one
+/// interface a caller that uses a proved fact reads (docs/v2/plan/design/contracts.md, part
+/// 4). Only a proof the pinned Lean checked answers `Ok`; everything else says why not.
+///
+/// Lean v0 proves what a proof file proves. It runs no solver of its own, so a clause with no
+/// proof in the crate's `lean/` is not proved, whatever it says. A `requires` is proved at
+/// each call site, which v0 does not lower; a generic function is not translated.
+pub fn proved(
+    db: &Db,
+    func: FunctionId,
+    args: StoredGenericArgs,
+    clause: Clause,
+    proofs: &Proofs,
+) -> Result<ProofKey, NotProved> {
+    let path = crate::body::function_path(db, func);
+    let not = |why: String| NotProved { function: path.join("::"), clause, why };
+    if !args.as_ref().is_empty() {
+        return Err(not("a generic function is not translated to Lean in v0".to_owned()));
+    }
+    if clause == Clause::Requires {
+        return Err(not(
+            "a `requires` is proved where the function is called, and v0 lowers no call site's              obligation"
+                .to_owned(),
+        ));
+    }
+    let config = Config::from_env(proofs.out.clone()).map_err(|err| not(err.to_string()))?;
+    let proof = proofs.file_of(&path);
+    match check(db, func, &proof, &config) {
+        Ok(proved) => Ok(proved.key),
+        Err(LeanError::NoProof { path, .. }) => Err(not(format!(
+            "there is no proof file {}: Lean checks the proof a person or an agent wrote and              searches for none itself",
+            path.display()
+        ))),
+        Err(err) => Err(not(err.to_string())),
+    }
 }

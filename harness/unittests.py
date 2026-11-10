@@ -37,7 +37,7 @@ CRATES = [
     "hir-ty", "hir-ty-mir", "hir-ty-borrowck", "hir-ty-wfcheck", "hir-def", "parser", "syntax", "const-ast", "blaze-diagnostics",
 ]
 CRATES += ["proc-macro-api"]
-# MIR to Charon's LLBC (vendor/charon): needs no solver or tool outside the tree, unlike hir-ty-verus.
+# MIR to Charon's LLBC (vendor/charon): needs no tool outside the tree.
 CRATES += ["hir-ty-charon"]
 
 # The failures known, each with its owner and cause: harness/known-failures.toml (failures.py).

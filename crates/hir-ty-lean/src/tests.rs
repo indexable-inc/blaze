@@ -876,8 +876,8 @@ fn a_proof_key_covers_the_model_the_proof_and_the_check() {
     assert_ne!(key, crate::proof_key(&changed, "check", "proof"));
 }
 
-/// End to end, with the pinned Lean from `BLAZE_LEAN_PROVER`; without it the test fails, as
-/// lane verus's do without `BLAZE_Z3`.
+/// End to end, with the pinned Lean from `BLAZE_LEAN_PROVER`; without it the test fails,
+/// never skips.
 #[test]
 fn lean_checks_the_first_proof_and_its_axioms() {
     let db = db(&fnv1a_fixture());

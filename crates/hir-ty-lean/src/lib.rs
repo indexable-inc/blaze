@@ -43,8 +43,8 @@ use hir_def::{DefWithBodyId, FunctionId};
 use hir_ty::InferenceResult;
 
 pub use driver::{
-    ALLOWED_AXIOMS, Config, LEAN_VERSION, LeanError, ProofFile, ProofKey, Proved, Prover, check,
-    check_emitted, proof_key, proved,
+    ALLOWED_AXIOMS, Clause, Config, LEAN_VERSION, LeanError, NotProved, ProofFile, ProofKey,
+    Proofs, Proved, Prover, check, check_emitted, proof_key, proved,
 };
 pub use spec::Spec;
 
@@ -65,8 +65,8 @@ pub const LIBRARY: &[(&str, &str)] = &[
     ("Blaze", include_str!("../../../lean/Blaze.lean")),
 ];
 
-/// A construct v0 does not translate. Lane verus's `VerifyRefused` names the same three
-/// things; the plan's rule names (`Unsafe`, `RawPointer`, `NoModel`, ..) are in `what`.
+/// A construct v0 does not translate: the function, the construct and where it is. The plan's
+/// rule names (`Unsafe`, `RawPointer`, `NoModel`, ..) are in `what`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NotTranslated {
     /// The function, `krate::module::name`.

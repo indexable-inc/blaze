@@ -2,7 +2,7 @@
 name = "hir-ty-contracts"
 version = "0.0.0"
 repository.workspace = true
-description = "The optimizer's use of proved function contracts: a fact a native `ensures` states is used only once lane verus proves it, and each use is a fact the caller's code identity covers (docs/v2/plan/design/contracts.md, part 3)."
+description = "The optimizer's use of proved function contracts: a fact a native `ensures` states is used only once Lean proves it, and each use is a fact the caller's code identity covers (docs/v2/plan/design/contracts.md, part 3)."
 
 authors.workspace = true
 edition.workspace = true
@@ -24,14 +24,14 @@ rustc_type_ir.workspace = true
 base-db.workspace = true
 hir-def.workspace = true
 hir-ty.workspace = true
-hir-ty-verus.workspace = true
+hir-ty-lean.workspace = true
 syntax.workspace = true
 
 [dev-dependencies]
 blaze-query.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
 # MIR building, registered into hir-ty's provider table; the pass itself reads hir-ty's MIR types
-# only, so hir-ty-mir's pipeline can call it through a hook without depending on Verus.
+# only, so hir-ty-mir's pipeline can call it through a hook without depending on the prover.
 hir-ty-mir.workspace = true
 intern.workspace = true
 
