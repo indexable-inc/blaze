@@ -198,10 +198,12 @@ pub struct Frames {
 
 /// A lit paper lantern hanging in the middle of the node (harness-native-render lantern.rs draws it, no file), its
 /// light flickering a little and falling on the ground under it: pixel art, as a step's item is. For a pane with
-/// nothing in it yet. `on`: whether it shows.
+/// nothing in it yet. `on`: whether it shows. `lit`: a stamp (the frame clock's time, say) its owner changes to have it
+/// struck again: it goes dark and lights anew, flaring a little past full before it settles.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct Lantern {
     pub on: bool,
+    pub lit: f32,
 }
 
 /// A small pixel-art item, a game's dropped item, that floats and does what it stands for, named by `face` (what a

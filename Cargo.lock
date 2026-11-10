@@ -1392,6 +1392,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-lir"
+version = "0.0.0"
+dependencies = [
+ "blaze-format",
+ "blaze-hash",
+ "blaze-ids",
+ "hegeltest",
+]
+
+[[package]]
 name = "blaze-live"
 version = "0.1.0"
 dependencies = [

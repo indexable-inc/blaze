@@ -105,12 +105,12 @@ fn read(world: WorldRef<'_>, node: &Value) -> Result<(String, Vec<String>, Strin
         .map(|a| a.iter().map(|l| l.as_str().map_or_else(|| l.to_string(), str::to_owned)).collect())
         .unwrap_or_default();
     let tone = words(node, "tone");
-    if kind == "pie" || kind == "donut" {
+    if kind == "pie" || kind == "donut" || kind == "segments" {
         let slices = slices_of(node, &kind, &labels)?;
         return Ok((kind, labels, unit, Data::Pie(slices)));
     }
     if !["bar", "line", "area", "scatter", "stacked"].contains(&kind.as_str()) {
-        return Err(format!("<Chart kind=\"{kind}\">: the kinds are bar, line, area, scatter, stacked, pie, donut"));
+        return Err(format!("<Chart kind=\"{kind}\">: the kinds are bar, line, area, scatter, stacked, pie, donut, segments"));
     }
     // Its series: `series`, or `data` as one.
     let mut series = Vec::new(); // alloc: this frame's series, laid onto the chart and dropped
@@ -165,6 +165,7 @@ fn read(world: WorldRef<'_>, node: &Value) -> Result<(String, Vec<String>, Strin
 pub(super) fn chart(v: View<'_>, node: &Value, b: &mut Budget<'_, '_>) -> Result<(), String> {
     let (kind, labels, unit, data) = read(v.entity().world(), node)?;
     let series = match data {
+        Data::Pie(slices) if kind == "segments" => return segments(v, slices, &unit, b),
         Data::Pie(slices) => return pie(v, node, &kind, slices, &unit, b),
         Data::Plot(series) => series,
     };
@@ -480,6 +481,51 @@ fn keys(v: View<'_>, entries: Vec<(String, Rgba2, String)>, b: &mut Budget<'_, '
             }
         }
     });
+}
+
+/// Parts of a whole as one bar (a disk's volumes, a budget's lines): each part a segment as long as its share, in a
+/// series slot's ink (one called `other...` or `free...` in the quiet ink), and under it a legend, each part's swatch,
+/// name and value.
+fn segments(v: View<'_>, slices: Vec<(String, f64)>, unit: &str, b: &mut Budget<'_, '_>) -> Result<(), String> {
+    let world = v.entity().world();
+    let total: f64 = slices.iter().map(|s| s.1).sum();
+    if !(total > 0.0) {
+        return Err("<Chart kind=\"segments\"> has nothing to show: its values sum to 0".to_owned());
+    }
+    if slices.len() * 2 + 4 > b.left {
+        b.cut = true;
+        return Ok(());
+    }
+    let quiet = |l: &str| ["other", "free", "unused", "left"].iter().any(|q| l.to_lowercase().starts_with(q));
+    // What is left (free, other) goes last, whatever its size: the bar reads as what is taken, then what is not.
+    let mut slices = slices;
+    slices.sort_by_key(|(l, _)| quiet(l));
+    let mut parts = Vec::new(); // alloc: this frame's segments of one bar
+    let mut slot = 0;
+    for (label, value) in &slices {
+        let k = if quiet(label) {
+            ink(world, "muted", 0.35)?
+        } else {
+            slot += 1;
+            ink(world, &format!("series{}", (slot - 1) % 8 + 1), 1.0)?
+        };
+        parts.push((label.clone(), *value, k.ok_or("a segment has no ink")?));
+    }
+    b.left -= parts.len();
+    if let Some(bar) = v.part("bar") {
+        view::for_each_of(bar, parts.iter().enumerate().map(|(i, p)| (format!("s{i}"), "hn.GenSegment", p)), |sv, (_, value, k), _| {
+            ink_on(sv, *k);
+            // As long as its share; a sliver keeps a hairline of weight so it still shows.
+            let w = Size { w: Sizing { value: ((*value / total) as f32).max(0.002), min: 3.0, ..Sizing::GROW }, h: Sizing::GROW };
+            if sv.entity().try_cloned::<&Size>() != Some(w) {
+                sv.set(w);
+            }
+        });
+    }
+    if let Some(legend) = v.part("legend") {
+        keys(legend, parts.into_iter().map(|(l, value, k)| (l, k, with_unit(value, unit))).collect(), b);
+    }
+    Ok(())
 }
 
 /// A pie or a donut: its slices largest first (one called `other...` last, in the quiet ink), each a series slot's ink,

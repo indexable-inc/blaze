@@ -544,6 +544,15 @@ hn {
     Size: {w: {kind: Fixed, value: $chat_activity_pop_w, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     Padding: {l: $chat_activity_pop_pad, r: $chat_activity_pop_pad, t: $chat_activity_pop_pad, b: $chat_activity_pop_pad}
   }
+  // The running step's item, large, at the card's top: the picture of what it is doing.
+  prefab ChatActivityPopItem : ui.Row {
+    Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 0, r: 0, t: 0, b: 4}
+    block : ui.Block {
+      Size: {w: {kind: Fixed, value: $chat_activity_pop_item, min: 0, max: 0}, h: {kind: Fixed, value: $chat_activity_pop_item, min: 0, max: 0}}
+    }
+  }
   prefab ChatActivityPopHead : ui.Lead, Strong {
     TextStyle: {size: $size_peek_body, line: $line_peek_title, role: 0, bold: 1}
   }

@@ -97,8 +97,8 @@ const GONE: f32 = 0.5;
 #[derive(Default)]
 pub struct Lanterns {
     made: Vec<(u32, Rc<[u8]>)>,
-    /// By node: whether it is lit, and the frame time that began.
-    seen: Vec<(u64, bool, f32)>,
+    /// By node: whether it is lit, the frame time that began, and the stamp it was last struck at.
+    seen: Vec<(u64, bool, f32, f32)>,
     /// A lantern was painted this frame: its flame moves.
     live: bool,
 }
@@ -106,10 +106,10 @@ pub struct Lanterns {
 impl Lanterns {
     /// Paint node `id`'s lantern (lit while `on`) in the middle of `rect`, a little above its centre, at frame time
     /// `time`: [`TEXEL`] points a texel on whole device pixels (`sc` a point). It lights over [`LIGHT`] seconds and,
-    /// put out, goes over [`OUT`]: never there or gone in a frame. Nothing in the light appearance, or in a pane too
+    /// put out, goes over [`OUT`]: never there or gone in a frame. A new `lit` stamp strikes it again. Nothing in the light appearance, or in a pane too
     /// small for it.
     #[allow(clippy::too_many_arguments)]
-    pub fn paint(&mut self, d: &mut Draw, id: u64, on: bool, rect: [f32; 4], alpha: f32, dark: bool, sc: f32, time: f32) {
+    pub fn paint(&mut self, d: &mut Draw, id: u64, on: bool, lit: f32, rect: [f32; 4], alpha: f32, dark: bool, sc: f32, time: f32) {
         let cell = (TEXEL * sc).round().max(1.0) / sc;
         let (w, h) = (W as f32 * cell, H as f32 * cell);
         if !dark || rect[2] < w || rect[3] < h * 1.2 {
@@ -117,20 +117,23 @@ impl Lanterns {
         }
         let since = match self.seen.iter_mut().find(|s| s.0 == id) {
             Some(s) => {
-                if s.1 != on {
-                    (s.1, s.2) = (on, time);
+                // Put out or lit; or struck again (its stamp moved): it lights anew.
+                if s.1 != on || (on && s.3 != lit) {
+                    (s.1, s.2, s.3) = (on, time, lit);
                 }
                 time - s.2
             }
             // First seen put out: there is nothing to put out. First seen lit: it lights.
             None if !on => return,
             None => {
-                self.seen.push((id, true, time)); // alloc: one entry a lantern in view
+                self.seen.push((id, true, time, lit)); // alloc: one entry a lantern in view
                 0.0
             }
         };
         // How high the flame stands (1: lit) and how much of the lantern shows.
-        let (stand, show) = if on { ((since / LIGHT).min(1.0), (since / (LIGHT * 0.5)).min(1.0)) } else { ((1.0 - since / (OUT - GONE)).max(0.0), ((OUT - since) / GONE).clamp(0.0, 1.0)) };
+        // Lighting, the flame catches: up past full (a flare) two thirds of the way in, then down to steady.
+        let catching = |k: f32| if k < 0.66 { k / 0.66 * 1.3 } else { 1.3 - 0.3 * ((k - 0.66) / 0.34).min(1.0) };
+        let (stand, show) = if on { (catching((since / LIGHT).min(1.0)), (since / (LIGHT * 0.5)).min(1.0)) } else { ((1.0 - since / (OUT - GONE)).max(0.0), ((OUT - since) / GONE).clamp(0.0, 1.0)) };
         if show <= 0.0 {
             return;
         }

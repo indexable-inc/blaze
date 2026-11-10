@@ -228,7 +228,7 @@ hn {
   }
   // A legend: a swatch in the series' ink, its name in the ink, its value quiet.
   prefab GenChartLegend : ui.Row {
-    Flex: {axis: Row, gap: 14, align: Center, justify: Start, wrap: true}
+    Flex: {axis: Row, gap: 12, align: Center, justify: Start, wrap: true}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
   }
   prefab GenChartKey : ui.Row {
@@ -259,6 +259,23 @@ hn {
       Flex: {axis: Column, gap: 5, align: Start, justify: Start, wrap: false}
       Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     }
+  }
+  // Parts of a whole as one bar (chart.rs segments): its segments side by side, each as long as its share and each a
+  // rounded block of its own with a little ground between them (a clip is a rectangle, so the bar cannot round what is
+  // inside it: the segments round themselves), and the legend under it.
+  prefab GenChartSegments : ui.Column {
+    Flex: {axis: Column, gap: 10, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    bar : ui.Row {
+      Flex: {axis: Row, gap: 2, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 18, min: 0, max: 0}}
+    }
+    legend : hn.GenChartLegend {}
+  }
+  prefab GenSegment : ui.Node {
+    Fill: $tone_accent
+    Shape: {radius: 4, n: 4, border: 0, feather: 0}
+    Size: {w: {kind: Grow, value: 1, min: 3, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
   }
   prefab GenChartCenter : ui.Column {
     Overlay

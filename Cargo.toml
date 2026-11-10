@@ -355,6 +355,7 @@ blaze-hash = { path = "crates/blaze-hash" }
 # blaze's sans-IO HTTP/1.1 client and its tokio driver (blaze-registry's `HyperHttp`).
 blaze-http = { path = "crates/blaze-http", default-features = false }
 blaze-ids = { path = "crates/blaze-ids" }
+blaze-lir = { path = "crates/blaze-lir" }
 blaze-lint-defs = { path = "crates/blaze-lint-defs", version = "0.0.0" }
 blaze-radix = { path = "crates/blaze-radix" }
 blaze-rng = { path = "crates/blaze-rng" }
