@@ -2154,7 +2154,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                     .and_then(|it| self.node(&asked.0, asked.1, it))
             });
             // alloc: per build, sized by its units
-            let described_statics: Vec<_> = par::map(&level.statics, |value| {
+            let level_statics: Vec<_> = par::map(&level.statics, |value| {
                 self.frontend.describe_static(value).and_then(|it| self.static_node(value, it))
             });
             let current = std::mem::replace(&mut level, recursion::Level::new());
@@ -2239,7 +2239,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             }
             let statics_of =
                 current.statics.into_iter().zip(current.static_items).zip(current.static_from);
-            for (((value, item), at), node) in statics_of.zip(described_statics) {
+            for (((value, item), at), node) in statics_of.zip(level_statics) {
                 let node = match node {
                     Ok(node) => node,
                     Err(why) => {
