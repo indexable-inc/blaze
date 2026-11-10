@@ -49,6 +49,12 @@ pub use self::{
 )]
 mod direct;
 #[cfg(target_os = "linux")]
+#[expect(
+    unsafe_code,
+    reason = "test support: the seccomp filter a case runs under, and io_uring_setup asked once to see it refused"
+)]
+pub mod filtered;
+#[cfg(target_os = "linux")]
 #[expect(unsafe_code, reason = "Linux's waits: io_uring_enter, one call")]
 mod linux;
 #[cfg(target_os = "macos")]

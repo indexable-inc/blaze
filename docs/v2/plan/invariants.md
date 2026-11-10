@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-39 invariants, 10 refinements, 3 reference models.
-By level: 30 tested, 19 simulated, 0 model-checked, 0 proved.
+40 invariants, 10 refinements, 3 reference models.
+By level: 31 tested, 19 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
@@ -62,6 +62,8 @@ By level: 30 tested, 19 simulated, 0 model-checked, 0 proved.
   Controls: `a_hot_lock_on_the_turn_loop`.
 - **`pages_read_back_what_was_put_after_any_crash`** *simulated* (`crates/blaze-core/src/sim/pages.rs`): whatever the faults, wherever the power goes out, a read hands back the bytes put or a refusal the disk's rot explains, the open finds what completed, and every load ends.
   Controls: `a_page_loaded_as_its_read_is_asked`, `a_failed_load_kept`, `a_load_with_no_check`, `an_eviction_of_a_page_the_commit_pinned`, `a_head_written_before_the_data_s_sync`.
+- **`every_public_wait_ends_in_a_sandboxed_process`** *tested* (`crates/blaze-core/src/wait/filtered.rs`): in a process the sandbox launcher marked, under a filter that refuses io_uring as the sandbox's does, every wait `blaze_core::wait` gives ends, on the direct driver, and no ring is asked for.
+  Controls: `a_sandboxed_process_waiting_on_the_ring`.
 - **`every_wait_ends_by_its_deadline_under_interruption`** *simulated* (`crates/blaze-core/src/wait/tests.rs`): whatever interrupts it, every wait ends by its deadline, never says it passed before it did, and is ready whenever its event came first.
   Controls: `a_retry_with_the_first_timeout`, `a_lost_wakeup`, `a_reaped_child_never_reported`, `a_lost_wakeup_through_the_direct_driver`, `a_reaped_child_never_reported_through_the_direct_driver`.
 - **`no_unpark_is_lost_under_interruption`** *simulated* (`crates/blaze-core/src/wait/tests.rs`): whatever interrupts it and whenever its unpark comes, no wakeup is lost and every park ends by its deadline.

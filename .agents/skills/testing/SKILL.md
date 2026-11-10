@@ -238,6 +238,17 @@ point, and checks: every row recorded and flushed appears exactly once; no file 
 generation lists is deleted; a reader opened after any crash sees only listed files; a restart
 reaches its first answer within its bound. Each row of the table is a planted bug it must catch.
 
+## Waits under the sandbox's filter
+
+Every wait that reaches the real kernel (a new system call, a new driver, a pool or loop that
+parks on one) gets one test that runs it in a process of its own under the build-script sandbox's
+seccomp filter, marked as the sandbox launcher marks one, with a bound: list the case and call
+`blaze_core::wait::filtered::{take_over, run}` (`crates/blaze-core/src/wait/filtered.rs`; its own
+tests cover every public wait of `blaze_core::wait`, blaze-graph's `pool.rs` the workers' park), and
+match on `Ended`, where a wait that does not end is `Ended::Hung` naming the case, never a hung
+test. Its control is the same case not marked, which has to fail naming `io_uring_setup`. Linux
+only: macOS's sandbox filters no system call by number and has one wait driver.
+
 ## Persisted state and causes
 
 - `persisted-state-round-trips` (above): a restore equals a fresh build byte for byte; a DST adds
