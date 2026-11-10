@@ -7,8 +7,9 @@
 //! directory's own entries, folders first. What starts with `/`, `~/` or `~` names a folder by itself: its entries whose
 //! names start with the rest (dotfiles only once a `.` is typed).
 //!
-//! Up and down move the highlight (the pointer moves it too), Tab or Return takes it: the `@` word becomes `@<path>` and
-//! a space after a file, so the next word starts; a folder takes no space and keeps the menu open on its entries.
+//! Up and down move the highlight (the pointer moves it too), Tab or Return takes it: a file becomes one atom in the
+//! draft (chat.rs `Atom`: a chip of its icon and name, moved over, selected and erased whole, sent as `@<path>`) and a
+//! space, so the next word starts; a folder becomes `@<path>/` in words and keeps the menu open on its entries.
 //! Return with nothing matched sends the draft as usual. Escape closes the menu until the caret leaves that `@` word.
 //!
 //! Beside the list, a preview of the highlighted place (`preview`, a fixed box so the menu keeps its size as the highlight
@@ -586,7 +587,8 @@ impl App {
         self.chat_mention_take(sid, i);
     }
 
-    /// Chat `sid`'s draft takes mention row `i`: its `@` word becomes `@<path>`, a space after a file.
+    /// Chat `sid`'s draft takes mention row `i`: its `@` word becomes the file, one atom (a chip: its icon and name)
+    /// and a space after it; a folder stays words, `@<path>/`, so the menu goes on into it.
     fn chat_mention_take(&mut self, sid: u64, i: usize) {
         {
             let mut states = self.chat.borrow_mut();
@@ -595,7 +597,12 @@ impl App {
             let Some((start, _)) = token(&st.draft) else { return };
             let d = &mut st.draft;
             d.anchor = start;
-            d.insert(&format!("@{}{}", p.path, if p.dir { "" } else { " " }));
+            if p.dir {
+                d.insert(&format!("@{}", p.path));
+            } else {
+                d.insert_atom(&p.path);
+                d.insert(" ");
+            }
             st.mention.key = None;
             st.reading = false;
         }
