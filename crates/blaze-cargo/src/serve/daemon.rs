@@ -2577,6 +2577,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             } else {
                 it
             };
+            // Every word of a job passes here once, as it is told: a build that may be answered
+            // again later has what it says noted ([`Jobs::heard`]).
+            self.jobs.heard(&it);
             match it {
                 Said::Report(job, response) => {
                     self.session.report(&mut cx!(self), job, response, &mut replies)

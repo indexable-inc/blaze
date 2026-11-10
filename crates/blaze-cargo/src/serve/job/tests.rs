@@ -96,6 +96,8 @@ fn job(views: Vec<Opened>) -> Job<Real> {
         missed: 0,
         durable_wait: None,
         look_wait: None,
+        placed_any: false,
+        replayed: false,
     }
 }
 
@@ -618,4 +620,162 @@ fn a_diagnostic_of_no_unit_is_said_once_a_job_and_a_units_each_time() {
         said_once(&mut said, &of(None, "error: the front end fails on `std::g` ...\n")),
         "another report is said"
     );
+}
+
+/// What a test's watches say of everything outside the views, and of each directory.
+struct Says {
+    quiet: bool,
+    moved: &'static [&'static str],
+}
+
+impl Vouches for Says {
+    fn quiet_since(&self, _: u64) -> bool {
+        self.quiet
+    }
+
+    fn unchanged_since(&self, dir: &std::path::Path, _: u64) -> bool {
+        !self.moved.iter().any(|it| std::path::Path::new(it) == dir)
+    }
+}
+
+/// A state a build with `BLAZE_NOOP=replay` is asked in after a kept answer: what happened
+/// since, as the daemon sees it, and whether a walk would still give that answer.
+struct NoopState {
+    what: &'static str,
+    same_key: bool,
+    alone: bool,
+    says: Says,
+    walk_says_the_same: bool,
+}
+
+const NOOP_STATES: [NoopState; 6] = [
+    NoopState {
+        what: "nothing changed",
+        same_key: true,
+        alone: true,
+        says: Says { quiet: true, moved: &[] },
+        walk_says_the_same: true,
+    },
+    // The key is the view's root and the whole config: the request's environment is in it.
+    NoopState {
+        what: "a source file, a flag or a variable of the request changed",
+        same_key: false,
+        alone: true,
+        says: Says { quiet: true, moved: &[] },
+        walk_says_the_same: false,
+    },
+    NoopState {
+        what: "another job is under way",
+        same_key: true,
+        alone: false,
+        says: Says { quiet: true, moved: &[] },
+        walk_says_the_same: false,
+    },
+    NoopState {
+        what: "a file outside the view that a build script traced changed",
+        same_key: true,
+        alone: true,
+        says: Says { quiet: false, moved: &[] },
+        walk_says_the_same: false,
+    },
+    // A change under a directory of outputs is a change outside the views too, but the
+    // outputs are asked of on their own: a directory not watched since before the walk
+    // vouches for nothing though nothing was heard.
+    NoopState {
+        what: "an output was deleted",
+        same_key: true,
+        alone: true,
+        says: Says { quiet: true, moved: &["/b/debug"] },
+        walk_says_the_same: false,
+    },
+    NoopState {
+        what: "`blaze clean` removed the build directory",
+        same_key: true,
+        alone: true,
+        says: Says { quiet: false, moved: &["/b/debug", "/b/release"] },
+        walk_says_the_same: false,
+    },
+];
+
+/// The oracle of a no-op's replay: each state of [`NOOP_STATES`] where
+/// [`LastAnswer::replayable`] and the walk disagree, with `plant` planted.
+fn noop_findings(plant: Option<Plant>) -> Vec<&'static str> {
+    let key = ContentId([1; 32]);
+    let answer = LastAnswer {
+        key,
+        generation: 7,
+        dirs: vec![std::path::PathBuf::from("/b/debug"), std::path::PathBuf::from("/b/release")]
+            .into(),
+        responses: Vec::new().into(),
+        worked: None,
+    };
+    PLANTED.set(plant);
+    let found = NOOP_STATES
+        .iter()
+        .filter(|it| {
+            let asked = if it.same_key { key } else { ContentId([2; 32]) };
+            answer.replayable(asked, it.alone, &it.says).is_ok() != it.walk_says_the_same
+        })
+        .map(|it| it.what)
+        .collect();
+    PLANTED.set(None);
+    found
+}
+
+/// The invariant: a kept answer is replayed only in a state where the walk would say the
+/// same, and in the state where nothing changed it is replayed.
+#[test]
+fn a_noop_is_replayed_only_while_a_walk_would_say_the_same() {
+    assert_eq!(noop_findings(None), Vec::<&str>::new());
+}
+
+#[test]
+fn the_oracle_catches_a_noop_that_ignores_a_deleted_output() {
+    assert_eq!(noop_findings(Some(Plant::IgnoresOutputs)), ["an output was deleted"]);
+}
+
+#[test]
+fn the_oracle_catches_a_noop_that_ignores_a_traced_file_outside_the_view() {
+    assert_eq!(
+        noop_findings(Some(Plant::IgnoresOutside)),
+        ["a file outside the view that a build script traced changed"]
+    );
+}
+
+#[test]
+fn the_oracle_catches_a_noop_that_ignores_the_view_and_the_config() {
+    assert_eq!(
+        noop_findings(Some(Plant::IgnoresKey)),
+        ["a source file, a flag or a variable of the request changed"]
+    );
+}
+
+#[test]
+fn the_oracle_catches_a_noop_that_ignores_another_job() {
+    assert_eq!(noop_findings(Some(Plant::IgnoresOthers)), ["another job is under way"]);
+}
+
+/// The directories asked of are each output's first directory under its build dir, never the
+/// build dir itself (every build writes its record there); an output no such directory holds
+/// leaves the answer unkept.
+#[test]
+fn a_builds_outputs_are_vouched_for_by_the_directories_under_its_build_dirs() {
+    let dirs = |outputs: &[&'static str]| output_dirs_of(["/b", "/t"], outputs.iter().copied());
+    assert_eq!(
+        dirs(&["/b/debug/deps/liba.rlib", "/b/debug/app", "/t/x86_64/debug/app", "/b/debug/b"]),
+        Some(vec!["/b/debug".into(), "/t/x86_64".into()])
+    );
+    assert_eq!(dirs(&[]), Some(Vec::new()));
+    assert_eq!(dirs(&["/b/app"]), None, "an output right in the build dir");
+    assert_eq!(dirs(&["/elsewhere/debug/app"]), None, "an output under no build dir");
+}
+
+#[test]
+fn the_noop_variable_asks_for_a_replay_or_a_walk_and_refuses_anything_else() {
+    let env = |value: &str| vec![(NOOP.to_owned(), value.to_owned())];
+    assert_eq!(noop_asked(&[]).ok(), Some(false));
+    assert_eq!(noop_asked(&env("walk")).ok(), Some(false));
+    assert_eq!(noop_asked(&env("replay")).ok(), Some(true));
+    let refused = noop_asked(&env("yes")).unwrap_err();
+    assert!(refused.what.contains("BLAZE_NOOP") && refused.what.contains("`yes`"), "{}", refused.what);
 }
