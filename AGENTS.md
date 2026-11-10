@@ -140,6 +140,9 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
     invariant:` or `/// The refinement:` on its test) and raise its level of evidence as needed:
     tested, simulated, model-checked, proved in Lean; `harness/v2/invariants.py` lists them and the
     gate holds each to its control. Skill: `testing`.
+54. **guard-the-cause**: When you find bad code or a bad decision, find why it was made and remove that
+    cause with a guard (a lint, a check in the gate, a rule or a skill's instruction), so it cannot
+    be written again; do this unasked. Skill: `changing-code`.
 
 ## Code Review Rules
 
