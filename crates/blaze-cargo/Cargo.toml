@@ -38,6 +38,12 @@ hir-ty-pure.workspace = true
 blaze-doc.workspace = true
 # `blaze fmt`: blaze's formatter, run in the client's process; it asks nothing of the daemon.
 blaze-fmt.workspace = true
+# `blaze new` and `blaze init` (`cli/new.rs`), in the client's process.
+blaze-new.workspace = true
+# `blaze tree` and `blaze metadata` (`cli/tree.rs`, `cli/metadata.rs`), in the client's process:
+# with `native`, as blaze-metadata fetches what the lock file names (blaze-registry's `net`).
+blaze-tree = { workspace = true, optional = true }
+blaze-metadata = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tracing.workspace = true
@@ -151,7 +157,8 @@ default = ["native"]
 # (hir-ty-codegen's `llvm`), fetching over HTTPS (rustls on ring) and the global cache's client
 # (`net`), `blaze explore` and `blaze debug sql`'s Arrow IPC (blaze-explore, on Flecs and
 # blaze-http's HTTP/3), mimalloc as the allocator (`raw::memory::purge_freed_pages` asks it), `blaze
-# test`'s live view on a terminal (`cli/live.rs`, crossterm, which has no wasm32), `blaze serve`
+# test`'s live view on a terminal (`cli/live.rs`, crossterm, which has no wasm32), `blaze tree` and `blaze metadata` (blaze-metadata
+# fetches over the network), `blaze serve`
 # with its socket (`socket.rs`) and the CLI's client of it (`cli/daemon.rs`), and `blaze pprof`
 # (`cli/pprof.rs`). Without it each command runs the same engine in its own process for its one
 # request and exits (`serve/once.rs`), and what needs any of the above is refused, naming it.
@@ -160,6 +167,8 @@ native = [
     "blaze-registry/net",
     "blaze-global/net",
     "dep:blaze-explore",
+    "dep:blaze-tree",
+    "dep:blaze-metadata",
     "dep:libmimalloc-sys",
     "ratatui/crossterm",
 ]

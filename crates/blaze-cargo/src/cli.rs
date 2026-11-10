@@ -20,6 +20,9 @@
 //! - [`clean`]: `clean`, a workspace's build directory under blaze's root removed; `--list`
 //!   and `--all`, every workspace's.
 //! - [`cache`]: `cache gc`, one run of the collector of what blaze keeps on disk.
+//! - [`new`], [`tree`], [`metadata`]: cargo's `new`, `init`, `tree` and `metadata`, each answered
+//!   in this process from the workspace's files (blaze-new, blaze-tree, blaze-metadata), with
+//!   the command-line reader they share in [`own`].
 
 #![forbid(unsafe_code)]
 
@@ -35,7 +38,11 @@ pub mod fix;
 pub mod inspect;
 pub mod json;
 pub mod live;
+#[cfg(feature = "native")]
+pub mod metadata;
+pub mod new;
 pub mod observe;
+pub mod own;
 pub mod perf;
 pub mod place;
 #[cfg(feature = "native")]
@@ -47,6 +54,8 @@ pub mod run;
 pub mod say;
 pub mod terminal;
 pub mod test;
+#[cfg(feature = "native")]
+pub mod tree;
 
 use std::{
     ffi::OsString,
@@ -90,6 +99,10 @@ Commands:
                 prints the daemon's last runs)
     fmt         Format the workspace's packages with blaze's own rustfmt (`--check`, `-p NAME`,
                 `--all`, `-- RUSTFMT_ARGS`), or the `.rs` files named; `blaze fmt --help`
+    new, init   Create a package at <PATH>, or in the directory it is run in (`--bin`, `--lib`,
+                `--name`, `--edition`, `--vcs`), as cargo writes one
+    tree        The workspace's dependency graph, with cargo's flags (`-e`, `-i`, `-p`, `--depth`)
+    metadata    The workspace and its resolve as `cargo metadata --format-version 1` prints them
     serve       Run the daemon the other commands are clients of
     stop        Make the daemon's state durable and stop it
     status      What the daemon is doing (`--json`: one object, docs/cargo.md)
@@ -265,8 +278,8 @@ pub fn command(words: Vec<OsString>) -> i32 {
         Asked::Unknown(name) => {
             let what = format!(
                 "no such command: `{name}`\n\nhelp: blaze's commands are build, check, run, test, bench, \
-                 doc, clean, cache, fmt, serve, stop, status, toolchain, daemon, codegen-inputs, trace, tables, explore, debug, \
-                 explain, why, reach and slow"
+                 doc, clean, cache, fmt, new, init, tree, metadata, serve, stop, status, toolchain, daemon, \
+                 codegen-inputs, trace, tables, explore, debug, explain, why, reach and slow"
             );
             eprint!("{}", say::error(&what, auto_color()));
             Exit::Failed.code()
@@ -325,6 +338,15 @@ pub fn command(words: Vec<OsString>) -> i32 {
         Asked::Cache(words) => cache::main(&words, auto_color()),
         Asked::FetchUrl(words) => fetch_url::main(&words, auto_color()),
         Asked::Fmt(words) => fmt(words),
+        Asked::New { init, words } => new::main(init, words, auto_color()),
+        #[cfg(feature = "native")]
+        Asked::Tree(words) => tree::main(words, auto_color()),
+        #[cfg(feature = "native")]
+        Asked::Metadata(words) => metadata::main(words, auto_color()),
+        #[cfg(not(feature = "native"))]
+        Asked::Tree(_) | Asked::Metadata(_) => said(Err(anyhow::anyhow!(
+            "blaze tree and blaze metadata fetch the packages the lock file names: this blaze is built without blaze-cargo's `native` feature (the seed profile, docs/future/bootstrap.md), which has no network"
+        ))),
         Asked::Cargo(asked) => cargo(&asked),
     }
 }

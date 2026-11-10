@@ -86,6 +86,10 @@ a build first needs it.
     blaze doc   [cargo's flags]                                       (d)
     blaze fmt   [--check] [-p NAME]... [--all] [--manifest-path PATH] [-v|-q] [-- RUSTFMT_ARGS]
     blaze fmt   [RUSTFMT_ARGS] FILE.rs...
+    blaze new   [--bin|--lib] [--name NAME] [--edition YEAR] [--vcs VCS] [--registry NAME] PATH
+    blaze init  [--bin|--lib] [--name NAME] [--edition YEAR] [--vcs VCS] [--registry NAME] [PATH]
+    blaze tree  [cargo tree's flags]
+    blaze metadata [--format-version 1] [--no-deps] [--filter-platform TRIPLE] [the feature flags] [--manifest-path PATH]
     blaze serve [--socket PATH] [--http ADDR] [--activated] [--ready-fd N] [--stall-bound SECS]
     blaze stop
     blaze status [--json]
@@ -1403,14 +1407,17 @@ plugin (`cargo-<name>` on the path).
 v2's client has only the commands of [Commands](#commands) (`crates/blaze-cargo/src/cli.rs`);
 any other fails with status 101 and does nothing:
 
-    error: no such command: `tree`
+    error: no such command: `vendor`
 
-    help: blaze's commands are build, check, run, test, bench, doc, clean, cache, fmt, serve, stop, status, toolchain, daemon, codegen-inputs, trace, tables, explore, debug, explain, why, reach and slow
+    help: blaze's commands are build, check, run, test, bench, doc, clean, cache, fmt, new, init, tree, metadata, serve, stop, status, toolchain, daemon, codegen-inputs, trace, tables, explore, debug, explain, why, reach and slow
 
 The table below is a record of what v1 had (as of 2026-10-30): the crates it names
 (blaze-metadata, blaze-fmt, blaze-lints, ...) are still in the tree, and a command comes back
-once the client asks the daemon for it. None of it runs in v2, except `fmt`, which is back as
-[above](#commands).
+once the client is given it. None of it runs in v2, except `fmt`, `new`, `init`, `tree` and
+`metadata`, which are back as [above](#commands): each runs in the client's process
+(`crates/blaze-cargo/src/cli/new.rs`, `crates/blaze-cargo/src/cli/tree.rs`,
+`crates/blaze-cargo/src/cli/metadata.rs`) and asks the daemon nothing. `tree` and `metadata`
+decide the lock files as a build does ([Lock files](#lock-files)).
 
 | Command | blaze's | What it is, and what it waits for |
 |---|---|---|

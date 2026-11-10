@@ -315,6 +315,8 @@ hir-ty-codegen = { path = "crates/hir-ty-codegen", default-features = false }
 blaze-macro-eval = { path = "crates/blaze-macro-eval" }
 blaze-manifest = { path = "crates/blaze-manifest" }
 blaze-metadata = { path = "crates/blaze-metadata" }
+blaze-new = { path = "crates/blaze-new" }
+blaze-tree = { path = "crates/blaze-tree" }
 blaze-resolve = { path = "crates/blaze-resolve" }
 blaze-source = { path = "crates/blaze-source" }
 blaze-units = { path = "crates/blaze-units" }

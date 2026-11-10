@@ -217,8 +217,7 @@ published archives, installed with `install.sh --version <v>` as a user installs
 (Apple silicon) and Linux (x86-64 and ARM64):
 
 - the install checks: `blaze --version` is the release's, `blaze new` + `blaze run` prints
-  `Hello, world!` (v2's blaze has no `new` command, so a v2 release fails this check until it
-  has one or the check makes the package itself);
+  `Hello, world!`;
 - the whole smoke corpus (below), dev and `--release`, `blaze run` and `blaze test`;
 - each application of the corpus (below), in two jobs of its own per platform: **works** (its
   dev and release builds run, its tests pass under `blaze test`) and **speed** (`harness/bench.py`

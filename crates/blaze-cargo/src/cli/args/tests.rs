@@ -193,6 +193,16 @@ fn commands_and_their_aliases() {
         Ok(Asked::Inspect(Inspected::Trace, os(&["--out", "t"])))
     );
     assert_eq!(parse(os(&["tables"])), Ok(Asked::Inspect(Inspected::Tables, Vec::new())));
+    assert_eq!(
+        parse(os(&["new", "--lib", "hello"])),
+        Ok(Asked::New { init: false, words: os(&["--lib", "hello"]) })
+    );
+    assert_eq!(parse(os(&["init"])), Ok(Asked::New { init: true, words: Vec::new() }));
+    assert_eq!(parse(os(&["tree", "-e", "features"])), Ok(Asked::Tree(os(&["-e", "features"]))));
+    assert_eq!(
+        parse(os(&["metadata", "--format-version", "1", "--no-deps"])),
+        Ok(Asked::Metadata(os(&["--format-version", "1", "--no-deps"])))
+    );
     assert_eq!(parse(os(&["frobnicate"])), Ok(Asked::Unknown("frobnicate".to_owned())));
 }
 
