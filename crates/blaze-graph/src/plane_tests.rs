@@ -1066,6 +1066,23 @@ struct Planned {
     batches: u32,
 }
 
+/// The model's handle on the memo the driver writes: a newtype so `Model` can derive `Default` (a named lock has
+/// no default name); a default one is an empty memo of its own, replaced by the driver's in every real run.
+struct ModelDb(Db);
+
+impl Default for ModelDb {
+    fn default() -> Self {
+        ModelDb(Arc::new(Lock::new("graph.test.plane.db", HashMap::default())))
+    }
+}
+
+impl std::ops::Deref for ModelDb {
+    type Target = Db;
+    fn deref(&self) -> &Db {
+        &self.0
+    }
+}
+
 /// What the simulation knows of the plane, from what it said, to check it after every step.
 #[derive(Default)]
 struct Model {
@@ -1082,7 +1099,7 @@ struct Model {
     granted: u64,
     /// What the database has: keys whose task ended well, some that failed, less those
     /// dropped since.
-    db: Db,
+    db: ModelDb,
     finished: HashMap<u32, bool, Global>, // alloc: a test's model
     cancelled: HashSet<u32, Global>,      // alloc: a test's model
     /// The requests idle now.
@@ -1477,7 +1494,7 @@ fn simulate(seed: u64, release: bool, idle: bool) -> Simulated {
     let by_key: Vec<(u64, Pool)> = (0..keys)
         .map(|_| (memory(&mut random), if random.one_in(3) { Pool::Io } else { Pool::Work }))
         .collect();
-    let mut model = Model { seed, budget, db: Arc::clone(&db), ..Model::default() };
+    let mut model = Model { seed, budget, db: ModelDb(Arc::clone(&db)), ..Model::default() };
     let mut planned: Vec<Planned> = (0..1 + random.below(5))
         .map(|_| Planned {
             weight: 1 + random.below(4) as u32,

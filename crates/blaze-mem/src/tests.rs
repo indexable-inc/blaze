@@ -1322,6 +1322,94 @@ fn frame_task_leaves_at_most_the_warm_shelf_however_much_it_held() {
     .expect("the task's thread");
 }
 
+/// A task of a build-shaped run: scratch of a drawn size (a few KB, a few MB or tens of MB),
+/// read back, with up to `depth` tasks inside it that run while it still holds its own.
+/// Returns the most one task of it asked for.
+fn build_task(rng: &mut SplitMix64, depth: u32) -> usize {
+    let bytes = match rng.below(8) {
+        0 => (16 << 20) + rng.below(16 << 20) as usize,
+        1..=3 => (1 << 20) + rng.below(6 << 20) as usize,
+        _ => 1 + rng.below(64 << 10) as usize,
+    };
+    let tag = if rng.below(2) == 0 { Tag::Mir } else { Tag::Codegen };
+    frame::task(tag, |frame| {
+        let scratch = frame.alloc_slice_fill_with(bytes, |i| i as u8);
+        let mut most = bytes;
+        for _ in 0..(if depth == 0 { 0 } else { rng.below(3) }) {
+            most = most.max(build_task(rng, depth - 1));
+        }
+        assert_eq!(scratch[bytes - 1], (bytes - 1) as u8, "kept past the tasks inside it");
+        most
+    })
+}
+
+/// The invariant: once a build's tasks have all ended, the frame memory each of its worker
+/// threads still holds is at most [`frame::WARM`], whatever the tasks held, however they
+/// nested and in whatever order they ran; nothing else of the frames outlives them. What does
+/// outlive a build is a named owner's (here a [`Frame`] of the test's, standing for a cache),
+/// and its bytes are its own count, unchanged by the tasks.
+///
+/// A build-shaped run: four workers, each a seeded sequence of tasks of the sizes a build's
+/// are, nested up to three deep, then one of twice the bound. The control: the same reading sees the memory while it is
+/// held (each worker's measured peak is at least its largest task's scratch, far past the
+/// bound), so a bound that holds after is not a reading that sees nothing. The directed case:
+/// twelve tasks nested, each holding a span of 8 MiB at once, more spans than a shelf keeps
+/// and 96 MiB together; the thread still ends within the bound.
+#[test]
+fn frames_after_a_build_hold_at_most_the_warm_shelf_a_worker() {
+    const WORKERS: u64 = 4;
+    const TASKS: usize = 24;
+    let mut cache = Frame::new(Tag::Query).expect("the cache's frame");
+    cache.alloc_slice_fill_with(3 << 20, |i| i as u8);
+    let cached = cache.committed();
+    let workers: Vec<_> = (0..WORKERS)
+        .map(|worker| {
+            thread::spawn(move || {
+                let mut rng = SplitMix64::new(0x6a09_e667_f3bc_c908 ^ worker);
+                let (most, peak) = frame::measure(|| {
+                    let drawn =
+                        (0..TASKS).map(|_| build_task(&mut rng, 2)).max().expect("some tasks");
+                    // One task past the bound whatever was drawn, so the control is of it.
+                    frame::task(Tag::Mir, |frame| {
+                        frame.alloc_slice_fill_with(2 * frame::WARM, |i| i as u8);
+                    });
+                    drawn.max(2 * frame::WARM)
+                });
+                // The directed case.
+                fn nested(depth: usize) {
+                    frame::task(Tag::Codegen, |frame| {
+                        let span = frame.alloc_slice_fill_with(8 << 20, |i| i as u8);
+                        if depth > 1 {
+                            nested(depth - 1);
+                        }
+                        assert_eq!(span[4096], 4096usize as u8);
+                    });
+                }
+                let ((), nested_peak) = frame::measure(|| nested(12));
+                (most, peak, nested_peak, frame::spare_bytes())
+            })
+        })
+        .collect();
+    for (worker, done) in workers.into_iter().enumerate() {
+        let (most, peak, nested_peak, spare) = done.join().expect("a worker");
+        assert!(
+            peak >= most && most > frame::WARM,
+            "worker {worker}: the control: its frames held {peak} at once, its largest task {most}"
+        );
+        assert!(
+            nested_peak >= 12 * (8 << 20),
+            "worker {worker}: the control: twelve spans held at once, {nested_peak}"
+        );
+        assert!(
+            spare <= frame::WARM,
+            "worker {worker} keeps {spare} bytes of frames after its tasks, past {}",
+            frame::WARM
+        );
+    }
+    assert_eq!(cache.committed(), cached, "the named owner's bytes are its own, as it left them");
+    cache.reset();
+}
+
 #[test]
 fn frame_matches_a_model_on_random_allocations_grows_shrinks_and_rollbacks() {
     use std::{alloc::Allocator, ptr::NonNull, slice};

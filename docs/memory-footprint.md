@@ -117,6 +117,27 @@ frame limit is not done yet.
 Footprint is the one number admission, the front end's release and the ceiling read (rule
 `one-memory-measure`). Test the ceiling on the release binary with `BLAZE_DAEMON_MEMORY_GB=4`.
 
+Built on `kept-memory-1109` (design: [v2/plan/admission-by-footprint.md](v2/plan/admission-by-footprint.md)):
+
+- The plane charges the larger of its grants and the footprint plus the grants not yet realized,
+  asks a purge before it holds work back or starts a task alone, and fails alone a task that
+  grows past the ceiling (`blaze_graph::footprint`, `TooBig`), proved by a Hegel DST with planted
+  bugs. The ceiling guard purges on its first look past the ceiling and ends the daemon only if
+  the footprint is still past it.
+- A purge reads the footprint only once it took effect. mimalloc 3 keeps freed pages per thread,
+  and only the owning thread may collect them, so `blaze_cargo::raw::memory::purge` asks, wakes
+  the idle workers, waits at most 250 ms under a span until every counted worker gave back
+  (`blaze_mem::tag::give_back`, with its own DST), purges, and reads again. The plane asks it of
+  a purger thread. The daemon also asks when `allocator kept bytes` passes a quarter of the
+  budget.
+- On Linux the footprint is the charge of the daemon's own cgroup where the kernel holds its
+  ceiling there: `memory.current` less the file cache the kernel can drop (`memory.stat`'s `file`
+  less `shmem`). Where no cgroup is delegated it is the process's resident set, and the daemon's
+  own watch is the bound (`blaze_cargo::raw::memory::own_footprint`, on `fast-mem-1110`).
+- `allocator kept bytes` is the footprint less the live heap and blaze-mem's resident committed
+  memory (`blaze_graph::arena::kept_of`). mimalloc's committed count is no measure of it: a
+  purge never lowers it on a release build. `allocator purged bytes` is cumulative.
+
 ### 3. Scratch on frames, reset per item
 
 - Long tasks reset their frame to a marker after each item: a function in a codegen unit, a body in

@@ -115,6 +115,7 @@ pub const VIEWS: &[View] = &[
     const { view("cycle_reruns", &[BUILD, LIMIT]) },
     const { view("key_part_diff", &[BEFORE, AFTER, LIMIT]) },
     const { view("task_memory", &[BUILD]) },
+    const { view("task_grants", &[BUILD, LIMIT]) },
     const { view("memory_timeline", &[BUILD]) },
     const { view("memory_peak_tasks", &[BUILD, LIMIT]) },
     const { view("memory_at_peak", &[BUILD]) },

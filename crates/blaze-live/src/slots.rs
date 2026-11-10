@@ -159,6 +159,26 @@ mod os {
     }
 }
 
+/// What the daemon announces to a program ([`Live::announcements`]): a counter that grows
+/// with each patch it has for it.
+#[derive(Clone, Copy)]
+pub struct Announcements {
+    attached: &'static Attached,
+}
+
+impl Announcements {
+    /// What the daemon announced last: one load.
+    pub fn announced(&self) -> u64 {
+        self.attached.announced()
+    }
+
+    /// Sleeps while what the daemon announced is `seen`, until it announces more or `timeout`
+    /// passes: what is announced then, which may still be `seen`.
+    pub fn wait(&self, seen: u64, timeout: Duration) -> u64 {
+        self.attached.wait_announced(seen, timeout)
+    }
+}
+
 /// What became of a message, or of a panic under [`Live::guard`].
 #[derive(PartialEq, Eq, Debug)]
 pub enum Outcome {
@@ -276,6 +296,14 @@ impl Live {
             // alloc: grown to the largest answer once, then reused for every answer
             answer: Vec::new(),
         })
+    }
+
+    /// A handle another thread can wait on for the daemon's next announcement, for a program
+    /// whose loop sleeps while it is idle (a window that draws only on events): the waiting
+    /// thread wakes the loop, and the loop's [`Live::poll`] applies the patch. It applies
+    /// nothing itself.
+    pub fn announcements(&self) -> Announcements {
+        Announcements { attached: self.attached }
     }
 
     /// The generation the program runs.

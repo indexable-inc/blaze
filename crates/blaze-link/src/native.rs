@@ -5,7 +5,11 @@
 //! what is strongly undefined wherever the archive is on the line (in rounds, each round's
 //! members in link-line order), the first COMDAT group of a name wins, a strong definition
 //! beats a weak one beats a common one, and sections nothing reachable refers to are dropped
-//! (`--gc-sections`).
+//! (`--gc-sections`). Rust's names are first on the line: a strong one beats every weak
+//! native and is the duplicate symbol error beside a strong one; a weak one
+//! ([`crate::state::RustName::weak`], `#[linkage = "weak"]`) beats weak natives and commons and
+//! loses to a strong native, whose definition every reference to the name, Rust's included
+//! (codegen refers to a weak definition only by its name), then binds to.
 //!
 //! What a stage pays is what changed. An input is read, checked and indexed once
 //! ([`Parsed`]: its symbols interned, each section's referenced and defined symbols, its
@@ -1162,7 +1166,8 @@ impl Exports {
 }
 
 // A slot's flags.
-/// Rust defines the name.
+/// Rust's definition is the name's: Rust defines it strongly, or weakly ([`RUST_WEAK`]) and
+/// nothing defines it strongly.
 const RUST: u16 = 1;
 /// Archives are searched for it: strongly undefined in a loaded object, a searching
 /// fallback, a directive's, or a strong root.
@@ -1184,6 +1189,11 @@ const WANTED: u16 = 256;
 /// The image this one is linked beside defines it, and wins ([`crate::Outside`]): its
 /// definition is [`Graph::outside`]'s, and `best` is NONE64.
 const OUTSIDE: u16 = 512;
+/// Rust defines the name weakly ([`crate::state::RustName::weak`]). With [`RUST`] while
+/// nothing defines it strongly; a strong native definition (`best`, then) or the image
+/// beside's ([`OUTSIDE`]) takes the name, and [`RUST`] goes, so the slot is resolved as one
+/// Rust does not define.
+const RUST_WEAK: u16 = 1024;
 
 /// A global of the graph: a name loaded objects mention, or Rust refers to or defines.
 #[derive(Clone, Copy)]
@@ -1874,7 +1884,7 @@ pub(crate) struct Resolved {
     removals: u64,
     /// What it was resolved from.
     inputs: Arc<Vec<Input>>,
-    names: Arc<BTreeMap<NameId, Sym>>,
+    names: Arc<BTreeMap<NameId, crate::state::RustName>>,
     wasm: Arc<HashMap<NameId, blaze_codegen::wasm::Import, std::alloc::Global>>,
     graph: Option<Arc<Graph>>,
     marks: Marks,
@@ -2644,7 +2654,11 @@ impl<'a> Stage<'a> {
             };
             let it = b.graph.slots[slot as usize];
             if it.flags & RUST != 0 {
-                if strength == 3 {
+                // Rust's definition is first on the line: it beats a weak one and a common.
+                if strength < 3 {
+                    continue;
+                }
+                if it.flags & RUST_WEAK == 0 {
                     return Err(error(
                         None,
                         // alloc: error path
@@ -2655,6 +2669,12 @@ impl<'a> Stage<'a> {
                         ),
                     ));
                 }
+                // A strong definition beats Rust's weak one, as ld64 and lld take it: the name is
+                // this one's, and a later strong one is the duplicate symbol error with it.
+                let it = &mut b.graph.slots[slot as usize];
+                it.flags &= !RUST;
+                it.best = pack(load, at as u32);
+                it.strength = 3;
                 continue;
             }
             let take = match b.graph.best(slot) {
@@ -3120,15 +3140,19 @@ impl<'a> Stage<'a> {
             for &sym in gained {
                 // A gained name is new to the names: nothing but Rust refers to it.
                 let weak = if refs.class(sym) == 2 { 0 } else { O_WEAK };
+                let slot = graph.slot_of.get(&sym).copied();
+                // A weak Rust name a strong definition took is resolved as that one's.
+                let taken = slot.is_some_and(|it| {
+                    graph.slots[it as usize].flags & (RUST | RUST_WEAK) == RUST_WEAK
+                });
                 let rust = match symbols.key(sym) {
-                    SymKey::Name(id) => self.new.names.contains_key(&id),
+                    SymKey::Name(id) => self.new.names.contains_key(&id) && !taken,
                     _ => false,
                 };
                 if rust {
                     outcomes.push((sym, O_RUST | weak));
                     continue;
                 }
-                let slot = graph.slot_of.get(&sym).copied();
                 if O::ANY {
                     // No loaded object mentions a name new to the graph, so only archives
                     // could define it, and the image beside comes before them.
@@ -3307,7 +3331,8 @@ impl<'a> Stage<'a> {
     /// Where the image beside defines a name the loads mention, a whole link's rule picks
     /// between its definition and theirs: strong beats weak (a common is weaker than
     /// either), of two weak ones the first on the line wins, two strong ones are the
-    /// duplicate symbol error. Rust's names lose to none.
+    /// duplicate symbol error. Rust's names are first on the line: a strong one loses to
+    /// none, a weak one only to a strong definition.
     fn beside_names<O: Outside>(
         &self,
         b: &mut Build,
@@ -3329,10 +3354,11 @@ impl<'a> Stage<'a> {
                 )
             };
             let wins = if it.flags & RUST != 0 {
-                if strength == 3 {
-                    return Err(duplicate("Rust code defines it"));
+                match (strength, it.flags & RUST_WEAK != 0) {
+                    (3, false) => return Err(duplicate("Rust code defines it")),
+                    (3, true) => true,
+                    _ => false,
                 }
-                false
             } else {
                 match b.graph.best(slot) {
                     None => true,
@@ -3371,7 +3397,7 @@ impl<'a> Stage<'a> {
                 let it = &mut b.graph.slots[slot as usize];
                 it.best = NONE64;
                 it.strength = 0;
-                it.flags |= OUTSIDE;
+                it.flags = (it.flags & !RUST) | OUTSIDE;
                 b.graph.outside.insert(slot, outside_def(theirs));
             }
         }
@@ -3396,12 +3422,11 @@ impl<'a> Stage<'a> {
         // few and grow it at most once.
         b.reserve(names.len() + refs.names.len() + 3);
         let mut rust: Vec<(Sym, Sym)> = Vec::with_capacity(names.len());
-        rust.extend(
-            names.iter().map(|(name, target)| (self.symbols.intern(SymKey::Name(*name)), *target)),
-        );
-        for (sym, _) in &rust {
-            let slot = b.slot(*sym);
-            b.flag(slot, RUST);
+        for (name, it) in names.iter() {
+            let sym = self.symbols.intern(SymKey::Name(*name));
+            rust.push((sym, it.target));
+            let slot = b.slot(sym);
+            b.flag(slot, if it.weak { RUST | RUST_WEAK } else { RUST });
         }
         for sym in refs.names.iter() {
             match refs.class(*sym) {
@@ -3509,6 +3534,19 @@ impl<'a> Stage<'a> {
             next.sort_unstable();
             round = next;
             pulled = true;
+        }
+        // A weak Rust name whose strong native definition a later COMDAT group's win dropped,
+        // with no other strong one, is Rust's again: Rust's beats what weak ones are left.
+        for (sym, _) in &rust {
+            let slot = b.graph.slot_of[sym];
+            if b.graph.slots[slot as usize].flags & (RUST | RUST_WEAK) == RUST_WEAK
+                && b.graph.best(slot).is_none()
+            {
+                let it = &mut b.graph.slots[slot as usize];
+                it.flags |= RUST;
+                it.best = NONE64;
+                it.strength = 0;
+            }
         }
         match output.format {
             Format::Pe => default_libraries(&b.graph, &inputs)?,
@@ -3744,6 +3782,11 @@ impl<'a> Stage<'a> {
             defined.push(it.sym);
         }
         for (sym, target) in &rust {
+            // A weak name a native or the image beside defines strongly is theirs, defined
+            // above: Rust's own symbol stays its own, and nothing reaches it by this name.
+            if graph.slots[graph.slot_of[sym] as usize].flags & RUST == 0 {
+                continue;
+            }
             self.define(*sym, Def::Alias(*target));
             defined.push(*sym);
         }
