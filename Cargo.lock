@@ -1332,6 +1332,7 @@ dependencies = [
  "blaze-mem",
  "blaze-sha256",
  "gimli",
+ "hegeltest",
  "object 0.40.0",
  "smallvec",
  "tracing",

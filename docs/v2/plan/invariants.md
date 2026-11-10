@@ -11,10 +11,15 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-8 invariants, 0 refinements, 1 reference models.
-By level: 1 tested, 7 simulated, 0 model-checked, 0 proved.
+10 invariants, 0 refinements, 1 reference models.
+By level: 3 tested, 7 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
+
+### blaze-codegen
+
+- **`rebound_functions_are_reached_through_their_slots`** *tested* (`crates/blaze-codegen/src/driver/tests.rs`): in a build that reaches edited code through slots, every function an edit fills again under its own key is reached through its slot by every caller, so no caller a splice keeps in place holds a direct branch to code the splice replaced.
+  Controls: `a_refilled_function_called_directly`.
 
 ### blaze-core
 
@@ -33,6 +38,11 @@ By level: 1 tested, 7 simulated, 0 model-checked, 0 proved.
 
 - **`live_grants_fit_the_machine_budget_after_any_crash`** *tested* (`crates/blaze-graph/src/ledger/tests.rs`): whatever crashes, restarts and pid reuse, the live daemons' grants never sum past the machine budget, none grants room the ledger does not hold for it, none admits while the others' charges fill the machine, and every task that fits starts.
   Controls: `a_read_modify_write_without_the_lock`, `a_prune_that_ignores_start_time`, `an_allowance_that_leaves_out_a_daemon`.
+
+### blaze-link
+
+- **`every_call_reaches_the_code_an_edit_left`** *tested* (`crates/blaze-link/src/tests/thunks.rs`): after any splice that succeeds, every branch in the image reaches its target directly or through a thunk, and every call to code an edit replaced reaches the replacement. Drawn: whether the callers call the leaves through their slots or directly, and up to three edits, each a leaf filled again under its own key. A splice refused must be the typed one for a thunk out of reach, and the link from scratch that takes its place is held to the same oracle. Each case links 200 MiB, so there are few.
+  Controls: `a_stale_direct_branch_to_replaced_code`, `a_slot_left_on_replaced_code`, `an_edit_the_image_does_not_hold`.
 
 ### blaze-profile
 

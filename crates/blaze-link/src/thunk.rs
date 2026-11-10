@@ -26,7 +26,13 @@
 //!   the patch region, and no island of the full link holds a thunk of the moved function
 //!   when the two were in reach before: no thunk can be put in that branch's reach without
 //!   moving code, so the stage is refused, typed ([`Refusal::NoThunk`]), and the build links
-//!   the image from scratch, saying so.
+//!   the image from scratch, saying so. That is the last resort, not the plan: a build whose
+//!   edited code is reached through slots calls every function an edit can replace through
+//!   its slot (`blaze_codegen::driver`'s `rebind`; docs/v2/plan/design/codegen.md, "Slots
+//!   and a splice's reach"), so the callers of replaced code hold a branch to a slot's stub,
+//!   which no stage moves, and are never written again. What still gets here is a direct
+//!   caller of code the classification did not name, or an image of a build with no slots
+//!   in its calls; `tests/thunks.rs` holds the invariant.
 //!
 //! [`Stage::thunks`] runs in each placement round (`Image::stage_with`) until it makes nothing,
 //! and never removes a thunk within a stage after its first round, so the rounds settle: each
