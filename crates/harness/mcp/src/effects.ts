@@ -26,8 +26,9 @@ import { brief, shown, type Shown, type ShownKind } from "./shown.ts";
 
 /** `list`: a directory listing or file walk (ls, glob, du); `build`: a build, lint or test followed to a digest (follow,
  *  cargo.*); `wait`: waiting for another cell (wait), its value the value that cell gave; `skill`: a skill's instructions
- *  loaded (skills.ts), drawn as a quiet step and counted apart from file reads. */
-export type EffectKind = "exec" | "read" | "write" | "delete" | "net" | "search" | "list" | "build" | "spawn" | "sql" | "wait" | "skill";
+ *  loaded (skills.ts), drawn as a quiet step and counted apart from file reads; `progress`: a cell saying how far along
+ *  its own work is ([`progress`]). */
+export type EffectKind = "exec" | "read" | "write" | "delete" | "net" | "search" | "list" | "build" | "spawn" | "sql" | "wait" | "skill" | "progress";
 
 /** One step, as it is posted (the raw result is kept on the side, for telling a cell's value apart from its steps'). */
 export type Effect = {
@@ -112,6 +113,30 @@ export async function effect<T>(
     throw err;
   }
 }
+
+const progressing = new WeakMap<Task, Step>();
+
+/** Say how far along the running cell's work is: `done` of `total` (of anything: files, rows, pages), and in a few words
+ *  what (`what`). The app's work bar fills to that share and says about how long is left, from how fast it has gone.
+ *  Call it as the work moves; at `done >= total` the step ends. Outside a cell it does nothing. */
+export function progress(done: number, total: number, what = "Working"): void {
+  const t = currentTask();
+  if (!t || !(total > 0)) return;
+  const at = Math.max(0, Math.min(Math.round(done), Math.round(total)));
+  let s = progressing.get(t);
+  if (!s || s.e.status !== "running") {
+    const made = step("progress", what, what, "");
+    if (!made) return;
+    progressing.set(t, (s = made));
+  }
+  s.update({ doing: `${what} \u{b7} ${at}/${Math.round(total)}` });
+  if (at >= Math.round(total)) s.end(true, `${at}/${Math.round(total)}`);
+}
+
+export const progressDocs = {
+  progress:
+    "progress(done, total, what? = 'Working'): void — say how far along this cell's own long work is (files, rows, pages); the person's work bar fills to that share and says about how long is left. Call it as the work moves: `for (const [i, f] of files.entries()) { progress(i, files.length, 'Converting'); await convert(f) }`.",
+};
 
 /** Bytes for a step's detail: "812 B", "3.2 KB", "1.4 MB". */
 export function bytes(n: number): string {

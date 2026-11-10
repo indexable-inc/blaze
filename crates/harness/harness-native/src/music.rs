@@ -1,19 +1,21 @@
 //! The app's music: a small band that plays itself and follows a mood, a game's adaptive score. It is synthesised
 //! and composed live, sample by sample, in the audio callback ([`crate::audio`]); nothing is a recording or a loop.
 //!
-//! - **Layers.** A pad holding the bar's chord, a bass under it, an arpeggio through it, a plucked lead playing a motif
-//!   it repeats and varies, far bells, and drums (a kick, a low drum, a hat). Each has a level; a mood is mostly which
-//!   layers are up.
-//! - **Moods** (the scene's, `hn.sound.mood`: scene/widgets/sound.flecs): each a tempo, a scale by day and one by night,
-//!   a chord progression (a root a bar, as steps of the scale) and its layers' levels. `calm` is a pad, a slow lead and
-//!   bells; `flow` adds bass and a gentle arpeggio; `drive` quickens and brings the drums in; `battle` is the minor
-//!   scale, fast, everything up.
-//! - **Transitions.** A new mood never cuts: the layers' levels and the tempo glide to it over a bar or two, and its
-//!   scale and chords take over on the next bar line, where every part changes together. Going to no mood at all fades
-//!   every layer out and the band rests.
+//! Everything the band is made of is the scene's (scene/widgets/sound.flecs, read by [`crate::audio`]):
+//! - An [`Instrument`] is a recipe for one note: partials and how fast each dies, an attack, a decay or a held note
+//!   with a release, optional FM (a bell), a falling pitch (a drum) and noise (a hat). `hn.sound.inst.*` prefabs.
+//! - A [`Part`] is an instrument with a role in the bar: hold the chord, play its root, climb it, play the lead's
+//!   motif, ring now and then, or hit on its steps. `hn.sound.part.*` prefabs, each inheriting its instrument.
+//! - A [`Mood`] is a tempo, a scale by day and one by night, a chord a bar, and the parts that play in it, each at a
+//!   level. `hn.sound.mood.*`, each a few part prefabs' instances.
+//!
+//! A new mood never cuts: every part's level glides to its level in the new mood (a part the new mood lacks fades out,
+//! one it adds fades in), the tempo glides, and the scale and chords take over on the next bar line, where every part
+//! changes together. With no mood the band fades out, rings out and rests.
 //!
 //! No IO and no clock but the samples asked for: [`Band::render`] is the whole of it, so a test plays it offline.
 use std::f32::consts::TAU;
+use std::sync::Arc;
 
 /// Samples a second the band is rendered at.
 pub const SR: f32 = 48_000.0;
@@ -22,99 +24,135 @@ const STEPS: usize = 16;
 /// The key's root: A2.
 const ROOT: f32 = 110.0;
 /// The most voices sounding at once (the oldest gives way).
-const VOICES: usize = 40;
+const VOICES: usize = 48;
+
+/// A recipe for one note.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Instrument {
+    /// Each partial: its ratio to the note's pitch and its level.
+    pub partials: Vec<(f32, f32)>,
+    /// Seconds to full level.
+    pub attack: f32,
+    /// How fast the note dies (1/s) from its start; with `hold`, from its release.
+    pub decay: f32,
+    /// The note is held for its length, then dies (a pad); else it dies from the start (a pluck).
+    pub hold: bool,
+    /// How much faster each higher partial dies (1/s a partial): a plucked string's brightness going first.
+    pub damp: f32,
+    /// FM: how far partial phases are bent at the onset, by a sine at `fm_ratio` of the pitch, dying at `fm_decay`.
+    pub fm: f32,
+    pub fm_ratio: f32,
+    pub fm_decay: f32,
+    /// A pitch that falls in: Hz over the note's at its onset, falling at `drop_rate` (1/s): a drum's skin.
+    pub drop: f32,
+    pub drop_rate: f32,
+    /// Noise with its lows taken out, at this level, dying at `noise_decay` (1/s): a hat, a stick.
+    pub noise: f32,
+    pub noise_decay: f32,
+    /// How much of it goes to the room.
+    pub room: f32,
+}
+
+/// What a part does in the bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// The bar's chord (its root and the notes two and four steps of the scale over it), all three, on its steps.
+    Chord,
+    /// The chord's root.
+    Root,
+    /// Up through the chord over two octaves, a note a step of its.
+    Arp,
+    /// The lead: the band's motif (two bars it repeats and varies), over the chord's root; its steps are the motif's.
+    Motif,
+    /// A note of the chord now and then (`chance`), on its steps.
+    Sparkle,
+    /// A hit at its own pitch (`hz`), on its steps: a drum.
+    Hit,
+}
+
+impl Role {
+    #[must_use]
+    pub fn named(s: &str) -> Option<Self> {
+        Some(match s {
+            "chord" => Self::Chord,
+            "root" => Self::Root,
+            "arp" => Self::Arp,
+            "motif" => Self::Motif,
+            "sparkle" => Self::Sparkle,
+            "hit" => Self::Hit,
+            _ => return None,
+        })
+    }
+}
+
+/// An instrument's role in the bar.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Part {
+    /// What it goes by across moods: the same name in the next mood is the same player, its level gliding.
+    pub name: String,
+    pub instrument: Arc<Instrument>,
+    pub role: Role,
+    /// The steps of the bar (0 to 15) it plays on.
+    pub steps: Vec<u8>,
+    /// Octaves over the key's root.
+    pub octave: i32,
+    pub level: f32,
+    pub pan: f32,
+    /// How likely each of its steps sounds (1: always).
+    pub chance: f32,
+    /// Beats a held note lasts.
+    pub beats: f32,
+    /// A [`Role::Hit`]'s pitch.
+    pub hz: f32,
+}
 
 /// A mood: its tempo (quarter notes a minute), its scale (semitones over the key) by day and by night, its chords (a
-/// root a bar, as steps of the scale) and how loud each layer plays (0: silent).
+/// root a bar, as steps of the scale) and its parts.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Mood {
     pub tempo: f32,
     pub scale: Vec<i32>,
     pub night: Vec<i32>,
     pub chords: Vec<i32>,
-    pub pad: f32,
-    pub bass: f32,
-    pub arp: f32,
-    pub lead: f32,
-    pub bell: f32,
-    pub drums: f32,
+    pub parts: Vec<Part>,
 }
 
-impl Mood {
-    fn levels(&self) -> [f32; 6] {
-        [self.pad, self.bass, self.arp, self.lead, self.bell, self.drums]
-    }
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum Kind {
-    Pad,
-    Bass,
-    Pluck,
-    Bell,
-    Kick,
-    Drum,
-    Hat,
-}
-
-#[derive(Clone, Copy)]
 struct Voice {
-    kind: Kind,
+    inst: Arc<Instrument>,
     freq: f32,
     amp: f32,
     pan: f32,
-    /// Samples played, and how many it holds before its release.
+    /// Samples played, and how many a held note holds before its release.
     t: u32,
     hold: u32,
     phase: f32,
+    last: f32,
 }
 
 impl Voice {
     /// The voice's next sample and whether it has ended.
     fn next(&mut self, noise: f32) -> (f32, bool) {
+        let i = &*self.inst;
         let t = self.t as f32 / SR;
         self.t += 1;
-        let w = TAU * self.freq * t;
-        match self.kind {
-            Kind::Pad => {
-                // A slow swell and a slow release: three soft partials, the upper two a hair out of tune so it moves.
-                let hold = self.hold as f32 / SR;
-                let env = (t / 1.2).min(1.0) * if t > hold { (-(t - hold) * 1.4).exp() } else { 1.0 };
-                let s = w.sin() + 0.42 * (w * 2.004).sin() + 0.18 * (w * 2.997).sin();
-                (0.33 * env * s * (1.0 + 0.08 * (TAU * 0.21 * t + self.pan).sin()), t > hold + 4.0)
-            }
-            Kind::Bass => {
-                let env = (t * 120.0).min(1.0) * (-t * 2.6).exp();
-                (env * (w.sin() + 0.28 * (2.0 * w).sin()), t > 2.0)
-            }
-            Kind::Pluck => {
-                // A plucked string: harmonics that die the faster the higher they are.
-                let mut s = 0.0;
-                for h in 1..=6 {
-                    let h = h as f32;
-                    s += (w * h * (1.0 + 0.0006 * h * h)).sin() / h * (-t * (1.6 + 1.3 * h)).exp();
-                }
-                ((t * 400.0).min(1.0) * 0.7 * s, t > 3.0)
-            }
-            Kind::Bell => {
-                let s = (w + 1.6 * (-t * 2.2).exp() * (w * 3.5).sin()).sin();
-                ((t * 300.0).min(1.0) * (-t * 1.1).exp() * 0.6 * s, t > 5.0)
-            }
-            Kind::Kick => {
-                self.phase += TAU * (46.0 + 90.0 * (-t * 32.0).exp()) / SR;
-                ((-t * 9.0).exp() * self.phase.sin(), t > 0.6)
-            }
-            Kind::Drum => {
-                self.phase += TAU * (self.freq + 50.0 * (-t * 22.0).exp()) / SR;
-                ((-t * 6.5).exp() * self.phase.sin() + 0.25 * (-t * 70.0).exp() * noise, t > 0.9)
-            }
-            Kind::Hat => {
-                // Noise with its lows taken out (the difference of two samples), very short.
-                let s = noise - self.phase;
-                self.phase = noise;
-                (0.5 * (-t * 55.0).exp() * s, t > 0.12)
-            }
+        self.phase += TAU * (self.freq + i.drop * (-t * i.drop_rate).exp()) / SR;
+        if self.phase > TAU * 4096.0 {
+            self.phase -= TAU * 4096.0;
         }
+        let bend = if i.fm > 0.0 { i.fm * (-t * i.fm_decay).exp() * (self.phase * i.fm_ratio).sin() } else { 0.0 };
+        let mut s = 0.0;
+        for (k, (ratio, level)) in i.partials.iter().enumerate() {
+            let dies = if i.damp > 0.0 { (-t * i.damp * k as f32).exp() } else { 1.0 };
+            s += level * dies * (self.phase * ratio + bend).sin();
+        }
+        if i.noise > 0.0 {
+            s += i.noise * (-t * i.noise_decay).exp() * (noise - self.last);
+            self.last = noise;
+        }
+        let held = self.hold as f32 / SR;
+        let since = if i.hold { (t - held).max(0.0) } else { t };
+        let env = (t / i.attack.max(0.0005)).min(1.0) * (-since * i.decay).exp();
+        (s * env, since * i.decay.max(0.05) > 7.0)
     }
 }
 
@@ -158,16 +196,175 @@ impl Room {
     }
 }
 
+/// One place the rain falls, heard from where the listener sits (the scene's `hn.sound.ambient.*`): where it is, and
+/// what the rain sounds like on it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RainSource {
+    /// Degrees round from straight ahead (positive: to the right; 180: behind), degrees up from the ears' level
+    /// (90: overhead), and how far, in metres.
+    pub azimuth: f32,
+    pub elevation: f32,
+    pub distance: f32,
+    pub gain: f32,
+    /// The steady wash of rain on it: its level, between `low` and `high` Hz.
+    pub hiss: f32,
+    /// Single drops: how many a second, each ringing at a pitch between `low` and `high`, dying at `ring` (1/s: a
+    /// dull roof high, glass higher, water low), its pitch bending by `bend` of itself as it rings (a drip into water
+    /// rises).
+    pub rate: f32,
+    pub low: f32,
+    pub high: f32,
+    pub ring: f32,
+    pub bend: f32,
+}
+
+/// The longest an ear waits for a sound the other heard first, in samples (about 0.7 ms: a head's width).
+const HEAD: usize = 34;
+
+/// A source as it plays: its drops, its wash's filters, and the last samples it made, for the later ear.
+struct Falling {
+    at: RainSource,
+    fast: f32,
+    slow: f32,
+    /// Drops sounding: each its pitch and its samples so far.
+    drops: [(f32, u32); 6],
+    line: [f32; 64],
+    head: usize,
+    /// Each ear: how many samples late it hears the source, how loud, and how much of its highs the head keeps.
+    ears: [(usize, f32, f32); 2],
+    shade: [f32; 2],
+    /// How much goes to the room: more the farther it is.
+    room: f32,
+}
+
+impl Falling {
+    fn new(at: RainSource) -> Self {
+        let (az, el) = (at.azimuth.to_radians(), at.elevation.to_radians());
+        // How far to the right it is, -1 to 1: nothing overhead, all of it at the side.
+        let side = az.sin() * el.cos();
+        let behind = (az.cos() * el.cos()).min(0.0).abs();
+        let near = 1.0 / at.distance.max(0.5);
+        let ear = |right: bool| {
+            let toward = if right { side } else { -side };
+            // The far ear hears it later, quieter, and duller (the head's shadow); from behind both are a little duller.
+            let late = if toward < 0.0 { (-toward * HEAD as f32) as usize } else { 0 };
+            let level = near * (0.62 + 0.38 * toward);
+            let open = (0.85 - 0.6 * (-toward).max(0.0) - 0.25 * behind - 0.03 * at.distance).clamp(0.08, 1.0);
+            (late, level, open)
+        };
+        Self { at, fast: 0.0, slow: 0.0, drops: [(0.0, u32::MAX); 6], line: [0.0; 64], head: 0, ears: [ear(false), ear(true)], shade: [0.0; 2], room: (0.08 * at.distance).min(0.6) }
+    }
+
+    /// Its next sample in each ear, and what it sends to the room.
+    fn next(&mut self, noise: f32, chance: f32, pick: f32) -> ([f32; 2], f32) {
+        let a = self.at;
+        let pole = |hz: f32| 1.0 - (-TAU * hz / SR).exp();
+        self.fast += (noise - self.fast) * pole(a.high.max(a.low + 1.0));
+        self.slow += (noise - self.slow) * pole(a.low.max(20.0));
+        let mut s = a.hiss * (self.fast - self.slow);
+        if chance < a.rate / SR
+            && let Some(free) = self.drops.iter().position(|d| d.1 == u32::MAX)
+        {
+            self.drops[free] = (a.low + (a.high - a.low) * pick, 0);
+        }
+        for d in &mut self.drops {
+            if d.1 == u32::MAX {
+                continue;
+            }
+            let t = d.1 as f32 / SR;
+            let dies = (-t * a.ring).exp();
+            s += 0.5 * dies * (TAU * d.0 * (1.0 + a.bend * (1.0 - dies)) * t).sin();
+            d.1 = if dies < 0.002 { u32::MAX } else { d.1 + 1 };
+        }
+        let s = s * a.gain;
+        self.head = (self.head + 1) % self.line.len();
+        self.line[self.head] = s;
+        let mut out = [0.0; 2];
+        for (side, o) in out.iter_mut().enumerate() {
+            let (late, level, open) = self.ears[side];
+            let heard = self.line[(self.head + self.line.len() - late) % self.line.len()];
+            self.shade[side] += (heard - self.shade[side]) * open;
+            *o = self.shade[side] * level;
+        }
+        (out, s * self.room)
+    }
+}
+
+/// Rain in a room, for when nothing else plays (and, far quieter, under the music): each place it falls a source of
+/// its own ([`RainSource`]), placed round the listener by ear (the later, quieter, duller far ear: on headphones it
+/// comes from there), the farther ones more in the room.
+pub struct Rain {
+    rng: u64,
+    sources: Vec<Falling>,
+    room: Room,
+    level: f32,
+    want: f32,
+}
+
+impl Rain {
+    #[must_use]
+    pub fn new(sources: &[RainSource]) -> Self {
+        Self { rng: 0x9e37_79b9_7f4a_7c15, sources: sources.iter().map(|s| Falling::new(*s)).collect(), room: Room::new(), level: 0.0, want: 0.0 }
+    }
+
+    /// Rain at `level` from here on (it comes and goes over a few seconds).
+    pub fn set(&mut self, level: f32) {
+        self.want = level;
+    }
+
+    #[must_use]
+    pub fn playing(&self) -> bool {
+        !self.sources.is_empty() && (self.want > 0.0 || self.level > 0.0005)
+    }
+
+    fn rand(&mut self) -> f32 {
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 7;
+        self.rng ^= self.rng << 17;
+        (self.rng >> 40) as f32 / (1u64 << 24) as f32
+    }
+
+    /// Add the rain's next `out.len()` frames to `out`.
+    pub fn render(&mut self, out: &mut [[f32; 2]]) {
+        if !self.playing() {
+            return;
+        }
+        for frame in out {
+            self.level += (self.want - self.level) * 0.000_02;
+            let (mut ears, mut send) = ([0.0f32; 2], 0.0f32);
+            for k in 0..self.sources.len() {
+                let (noise, chance, pick) = (self.rand() * 2.0 - 1.0, self.rand(), self.rand());
+                let (e, r) = self.sources[k].next(noise, chance, pick);
+                ears[0] += e[0];
+                ears[1] += e[1];
+                send += r;
+            }
+            let wet = self.room.next(send);
+            frame[0] += self.level * (ears[0] + wet[0]);
+            frame[1] += self.level * (ears[1] + wet[1]);
+        }
+    }
+}
+
+/// A part as the band plays it now: its definition and its level on the way to the mood's.
+struct Player {
+    part: Part,
+    level: f32,
+    want: f32,
+    /// How many notes it has played this bar (an arpeggio's place).
+    n: usize,
+}
+
 /// The band: its voices, its room, where it is in the bar, and the mood it plays and the one it is moving to.
 pub struct Band {
     voices: Vec<Voice>,
     room: Room,
     rng: u64,
-    /// The mood being played (its scale and chords change on a bar line; None: nothing yet) and the next.
-    mood: Option<Mood>,
+    /// The scale and chords being played (they change on a bar line), and the mood asked for.
+    scale: Vec<i32>,
+    chords: Vec<i32>,
     next: Option<Mood>,
-    /// The layers' levels now (pad, bass, arp, lead, bell, drums) and the tempo now.
-    levels: [f32; 6],
+    players: Vec<Player>,
     tempo: f32,
     night: bool,
     step: usize,
@@ -191,9 +388,10 @@ impl Band {
             voices: Vec::with_capacity(VOICES), // alloc: the pool, made once
             room: Room::new(),
             rng: seed | 1,
-            mood: None,
+            scale: Vec::new(),
+            chords: Vec::new(),
             next: None,
-            levels: [0.0; 6],
+            players: Vec::new(),
             tempo: 72.0,
             night: false,
             step: 0,
@@ -203,18 +401,32 @@ impl Band {
         }
     }
 
-    /// Play toward `mood` (None: fade out and rest), by `night` its night scale.
+    /// Play toward `mood` (None: fade out and rest), by `night` its night scale. Each of its parts is the player of
+    /// that name, at its new level; players it lacks fade out.
     pub fn set(&mut self, mood: Option<&Mood>, night: bool) {
         self.night = night;
-        if self.next.as_ref() != mood {
-            self.next = mood.cloned();
+        if self.next.as_ref() == mood {
+            return;
+        }
+        self.next = mood.cloned();
+        for p in &mut self.players {
+            p.want = 0.0;
+        }
+        for part in mood.into_iter().flat_map(|m| &m.parts) {
+            match self.players.iter_mut().find(|p| p.part.name == part.name) {
+                Some(p) => {
+                    p.want = part.level;
+                    p.part = part.clone();
+                }
+                None => self.players.push(Player { part: part.clone(), level: 0.0, want: part.level, n: 0 }), // alloc: a player a part, on a change of mood
+            }
         }
     }
 
     /// Whether anything sounds or is about to: false once it has faded out and rung out.
     #[must_use]
     pub fn playing(&self) -> bool {
-        self.next.is_some() || !self.voices.is_empty() || self.levels.iter().any(|l| *l > 0.003)
+        self.next.is_some() || !self.voices.is_empty() || !self.players.is_empty()
     }
 
     fn rand(&mut self) -> f32 {
@@ -222,16 +434,6 @@ impl Band {
         self.rng ^= self.rng >> 7;
         self.rng ^= self.rng << 17;
         (self.rng >> 40) as f32 / (1u64 << 24) as f32
-    }
-
-    fn play(&mut self, kind: Kind, freq: f32, amp: f32, pan: f32, hold: f32) {
-        if amp < 0.002 {
-            return;
-        }
-        if self.voices.len() >= VOICES {
-            self.voices.remove(0);
-        }
-        self.voices.push(Voice { kind, freq, amp, pan, t: 0, hold: (hold * SR) as u32, phase: 0.0 });
     }
 
     /// The pitch of step `degree` of `scale` (past its end: the octaves above; below 0: those below), `octave` up.
@@ -245,8 +447,7 @@ impl Band {
     fn compose(&mut self) {
         let mut at = 2i32;
         for i in 0..self.motif.len() {
-            let strong = i % 4 == 0;
-            let chance = if strong { 0.62 } else if i % 2 == 0 { 0.3 } else { 0.08 };
+            let chance = if i % 4 == 0 { 0.62 } else if i % 2 == 0 { 0.3 } else { 0.08 };
             self.motif[i] = if self.rand() < chance {
                 at = (at + [-2, -1, -1, 1, 1, 2, 3][(self.rand() * 7.0) as usize % 7]).clamp(-2, 9);
                 Some(at as i8)
@@ -258,15 +459,15 @@ impl Band {
         self.motif[2 * STEPS - 4] = Some(0);
     }
 
-    /// One step of the bar: what each layer plays on it.
+    /// One step of the bar: what each player plays on it.
     fn tick(&mut self) {
         if self.step == 0 {
             // The bar line: the next mood's scale and chords take over here, every part at once.
-            if self.next != self.mood && (self.next.is_some() || self.levels.iter().all(|l| *l < 0.01)) {
-                let fresh = self.mood.is_none();
-                self.mood.clone_from(&self.next);
-                if fresh {
-                    self.bar = 0;
+            if let Some(m) = &self.next {
+                let scale = if self.night && !m.night.is_empty() { &m.night } else { &m.scale };
+                if &self.scale != scale || self.chords != m.chords {
+                    self.scale.clone_from(scale);
+                    self.chords.clone_from(&m.chords);
                 }
             }
             if self.bar % 8 == 0 {
@@ -278,64 +479,70 @@ impl Band {
                     self.motif[i] = Some((i32::from(d) + if self.rand() < 0.5 { 1 } else { -1 }).clamp(-2, 9) as i8);
                 }
             }
+            for p in &mut self.players {
+                p.n = 0;
+            }
         }
-        // Toward the mood asked for: levels and tempo glide (about a bar), never jump.
-        let want = self.next.as_ref().map_or([0.0; 6], Mood::levels);
-        for (l, w) in self.levels.iter_mut().zip(want) {
-            *l += (w - *l) * 0.09;
+        // Toward the mood asked for: levels and tempo glide (about a bar), never jump. A player faded out leaves.
+        for p in &mut self.players {
+            p.level += (p.want - p.level) * 0.09;
         }
+        self.players.retain(|p| p.want > 0.0 || p.level > 0.004);
         if let Some(n) = &self.next {
             self.tempo += (n.tempo - self.tempo) * 0.06;
         }
-        let Some(mood) = self.mood.clone() else { return };
-        let scale = if self.night && !mood.night.is_empty() { &mood.night } else { &mood.scale };
-        let [pad, bass, arp, lead, bell, drums] = self.levels;
+        if self.scale.is_empty() || self.chords.is_empty() {
+            return;
+        }
         let (step, bar) = (self.step, self.bar);
-        let root = mood.chords.get(bar % mood.chords.len().max(1)).copied().unwrap_or(0);
-        let beat = 60.0 / self.tempo.max(30.0);
-        // The chord: the root and the notes two and four steps of the scale over it.
+        let root = self.chords[bar % self.chords.len()];
         let chord = [root, root + 2, root + 4];
-        if step == 0 {
-            for (k, d) in chord.iter().enumerate() {
-                self.play(Kind::Pad, Self::pitch(scale, *d, 1), 0.11 * pad, [-0.5, 0.0, 0.5][k], beat * 4.0);
+        let beat = 60.0 / self.tempo.max(30.0);
+        let len = self.scale.len() as i32;
+        for k in 0..self.players.len() {
+            let (role, on, chance) = {
+                let p = &self.players[k];
+                (p.part.role, p.part.steps.contains(&(step as u8)), p.part.chance)
+            };
+            let motif = if role == Role::Motif { self.motif[(bar % 2) * STEPS + step] } else { None };
+            if !(on || motif.is_some()) || (role == Role::Motif && motif.is_none()) {
+                continue;
             }
-        }
-        // The bass: the root on the bar, again on its middle once it is up, and pushed notes when it drives.
-        let on_bass = step == 0 || (step == 8 && bass > 0.3) || (matches!(step, 6 | 14) && bass > 0.65);
-        if on_bass {
-            self.play(Kind::Bass, Self::pitch(scale, root, 0), 0.3 * bass, 0.0, 0.0);
-        }
-        // The arpeggio: up through the chord over two octaves, in eighths, in sixteenths when it is high.
-        if arp > 0.02 && (step % 2 == 0 || arp > 0.65) {
-            let n = if arp > 0.65 { step } else { step / 2 };
-            let d = chord[n % 3] + (scale.len() as i32) * ((n / 3) % 2) as i32;
-            let accent = if step % 4 == 0 { 1.0 } else { 0.62 };
-            self.play(Kind::Pluck, Self::pitch(scale, d, 2), 0.13 * arp * accent, if n % 2 == 0 { -0.35 } else { 0.35 }, 0.0);
-        }
-        // The lead: its motif, over the chord's root.
-        if lead > 0.02
-            && let Some(d) = self.motif[(bar % 2) * STEPS + step]
-        {
-            let pan = self.rand() * 0.4 - 0.2;
-            self.play(Kind::Pluck, Self::pitch(scale, root + i32::from(d), 2), 0.2 * lead, pan, 0.0);
-        }
-        // Bells: now and then, high, on a beat.
-        if bell > 0.02 && step % 4 == 0 && self.rand() < 0.22 {
-            let d = chord[(self.rand() * 3.0) as usize % 3];
-            let pan = self.rand() * 1.2 - 0.6;
-            self.play(Kind::Bell, Self::pitch(scale, d, 3), 0.1 * bell, pan, 0.0);
-        }
-        // Drums: the kick on the bar and its middle, the low drum on the beats between, a hat on the off eighths; fuller
-        // as the level rises.
-        if drums > 0.02 {
-            if step == 0 || step == 8 || (drums > 0.7 && matches!(step, 3 | 11)) {
-                self.play(Kind::Kick, 0.0, 0.5 * drums, 0.0, 0.0);
+            if chance < 1.0 && self.rand() >= chance {
+                continue;
             }
-            if matches!(step, 4 | 12) || (drums > 0.7 && step == 14) {
-                self.play(Kind::Drum, 96.0, 0.33 * drums, 0.2, 0.0);
+            let pick = (self.rand() * 3.0) as usize % 3;
+            let p = &mut self.players[k];
+            let (part, level) = (&p.part, p.level);
+            if level < 0.003 {
+                continue;
             }
-            if step % 4 == 2 || (drums > 0.5 && step % 2 == 1) {
-                self.play(Kind::Hat, 0.0, 0.09 * drums, -0.3, 0.0);
+            let accent = if step % 4 == 0 { 1.0 } else { 0.7 };
+            let hold = (part.beats * beat * SR) as u32;
+            let mut notes: [Option<(f32, f32)>; 3] = [None; 3];
+            match role {
+                Role::Chord => {
+                    for (j, d) in chord.iter().enumerate() {
+                        notes[j] = Some((Self::pitch(&self.scale, *d, part.octave), part.pan + [-0.5, 0.0, 0.5][j]));
+                    }
+                }
+                Role::Root => notes[0] = Some((Self::pitch(&self.scale, root, part.octave), part.pan)),
+                Role::Arp => {
+                    let d = chord[p.n % 3] + len * ((p.n / 3) % 2) as i32;
+                    notes[0] = Some((Self::pitch(&self.scale, d, part.octave), if p.n % 2 == 0 { -0.35 } else { 0.35 }));
+                }
+                Role::Motif => notes[0] = motif.map(|d| (Self::pitch(&self.scale, root + i32::from(d), part.octave), part.pan)),
+                Role::Sparkle => notes[0] = Some((Self::pitch(&self.scale, chord[pick], part.octave), part.pan + pick as f32 * 0.5 - 0.5)),
+                Role::Hit => notes[0] = Some((part.hz, part.pan)),
+            }
+            p.n += 1;
+            let inst = part.instrument.clone();
+            let amp = level * if matches!(role, Role::Chord) { 1.0 } else { accent };
+            for (freq, pan) in notes.into_iter().flatten() {
+                if self.voices.len() >= VOICES {
+                    self.voices.remove(0);
+                }
+                self.voices.push(Voice { inst: inst.clone(), freq, amp, pan: pan.clamp(-1.0, 1.0), t: 0, hold, phase: 0.0, last: 0.0 });
             }
         }
     }
@@ -363,8 +570,7 @@ impl Band {
                 let s = s * v.amp;
                 dry[0] += s * (0.5 - 0.4 * v.pan);
                 dry[1] += s * (0.5 + 0.4 * v.pan);
-                // The drums stay dry; everything else sits in the room.
-                send += s * if matches!(v.kind, Kind::Kick | Kind::Hat) { 0.03 } else { 0.3 };
+                send += s * v.inst.room;
                 !ended
             });
             let wet = self.room.next(send);
@@ -378,9 +584,13 @@ impl Band {
 mod tests {
     use super::*;
 
-    fn mood(tempo: f32, levels: [f32; 6]) -> Mood {
-        let [pad, bass, arp, lead, bell, drums] = levels;
-        Mood { tempo, scale: vec![0, 2, 4, 7, 9], night: vec![0, 2, 3, 7, 8], chords: vec![0, 3, 2, 4], pad, bass, arp, lead, bell, drums }
+    fn part(name: &str, role: Role, steps: &[u8], level: f32, hold: bool) -> Part {
+        let instrument = Arc::new(Instrument { partials: vec![(1.0, 1.0), (2.0, 0.4)], attack: if hold { 1.0 } else { 0.003 }, decay: if hold { 1.4 } else { 3.0 }, hold, damp: 1.0, room: 0.3, ..Instrument::default() });
+        Part { name: name.to_owned(), instrument, role, steps: steps.to_vec(), octave: 1, level, pan: 0.0, chance: 1.0, beats: 4.0, hz: 60.0 }
+    }
+
+    fn mood(tempo: f32, parts: Vec<Part>) -> Mood {
+        Mood { tempo, scale: vec![0, 2, 4, 7, 9], night: vec![0, 2, 3, 7, 8], chords: vec![0, 3, 2, 4], parts }
     }
 
     fn seconds(b: &mut Band, s: f32) -> (f32, f32) {
@@ -392,10 +602,12 @@ mod tests {
     }
 
     /// The band plays a mood under full scale, a fuller mood is louder, a change of mood glides (no step in level
-    /// between one second and the next), and with no mood it fades out, rings out and rests.
+    /// within its first second), a part the new mood lacks leaves, and with no mood it fades out, rings out and rests.
     #[test]
     fn the_band_follows_its_mood_and_rests() {
-        let (calm, battle) = (mood(66.0, [0.5, 0.0, 0.0, 0.35, 0.3, 0.0]), mood(132.0, [0.3, 0.8, 0.9, 0.6, 0.0, 0.9]));
+        let calm = mood(66.0, vec![part("pad", Role::Chord, &[0], 0.06, true), part("lead", Role::Motif, &[], 0.06, false)]);
+        let all: Vec<u8> = (0..16).collect();
+        let battle = mood(132.0, vec![part("lead", Role::Motif, &[], 0.12, false), part("arp", Role::Arp, &all, 0.12, false), part("kick", Role::Hit, &[0, 8], 0.3, false)]);
         let mut b = Band::new(7);
         assert!(!b.playing());
         b.set(Some(&calm), false);
@@ -406,10 +618,38 @@ mod tests {
         assert!(first < quiet * 6.0, "the change jumped: {quiet} to {first} within a second");
         let (peak, loud) = seconds(&mut b, 12.0);
         assert!(peak < 0.98 && loud > quiet * 1.5, "battle peaks at {peak}, rms {loud} over calm's {quiet}");
+        assert!(b.players.iter().all(|p| p.part.name != "pad"), "the pad, which battle lacks, never left");
         b.set(None, false);
         seconds(&mut b, 30.0);
         assert!(!b.playing(), "it never came to rest");
         let (peak, _) = seconds(&mut b, 1.0);
         assert!(peak == 0.0, "at rest it still sounds: {peak}");
+    }
+
+    /// Rain comes in, stays under its level, and goes; a source at the left is louder and earlier in the left ear, one
+    /// overhead the same in both.
+    #[test]
+    fn rain_falls_where_it_is_placed() {
+        let on = |azimuth: f32, elevation: f32| RainSource { azimuth, elevation, distance: 1.5, gain: 1.0, hiss: 0.5, rate: 20.0, low: 800.0, high: 3000.0, ring: 60.0, bend: 0.0 };
+        let ears = |src: RainSource| {
+            let mut r = Rain::new(&[src]);
+            r.set(0.1);
+            let mut out = vec![[0.0f32; 2]; (8.0 * SR) as usize];
+            r.render(&mut out);
+            let tail = &out[out.len() - 2 * SR as usize..];
+            let rms = |side: usize| (tail.iter().map(|f| f[side] * f[side]).sum::<f32>() / tail.len() as f32).sqrt();
+            (rms(0), rms(1), tail.iter().flatten().fold(0.0f32, |p, x| p.max(x.abs())))
+        };
+        let (l, r, peak) = ears(on(-80.0, 0.0));
+        assert!(l > r * 1.4 && r > 0.0005 && peak < 0.3, "at the left: {l} against {r}, peak {peak}");
+        let (l, r, _) = ears(on(0.0, 90.0));
+        assert!((l / r - 1.0).abs() < 0.15, "overhead: {l} against {r}");
+        let mut r = Rain::new(&[on(0.0, 0.0)]);
+        assert!(!r.playing());
+        r.set(0.1);
+        r.render(&mut vec![[0.0f32; 2]; SR as usize]);
+        r.set(0.0);
+        r.render(&mut vec![[0.0f32; 2]; (20.0 * SR) as usize]);
+        assert!(!r.playing());
     }
 }

@@ -18,6 +18,7 @@ pub mod icons;
 pub mod inline;
 pub mod kip;
 pub mod kips;
+pub mod lantern;
 pub mod markdown;
 pub mod math;
 pub mod media;

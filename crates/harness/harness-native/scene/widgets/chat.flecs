@@ -9,13 +9,17 @@ hn {
   prefab ChatPane : hn.Pane {
     // The chat's page: the theme's ground (tone_ground), the main card's own.
     Fill: $tone_ground
+    // A chat nothing was sent in yet shows a lit lantern (src/app/chat.rs turns it on); the first message puts it out.
+    lantern : ui.Lamp {}
     // Through a cmd+S fold the transcript's column and the composer follow the moving pane, centred in it, and their
     // words re-wrap live at the width they have each frame (the glyphs a new break moves glide there), the row at the
     // top of the view held still (src/app/chat.rs).
     list : ui.Scroll {
       Cursor: {shape: Text}
       ClipFade: {len: $chat_fade_len}
-      Flex: {axis: Column, gap: 0, align: Center, justify: Start, wrap: false}
+      // The conversation stands on the composer: a short one sits at the foot of the pane, new words coming in from the
+      // bottom, and what is older rises and fades out at the top (a game's chat).
+      Flex: {axis: Column, gap: 0, align: Center, justify: End, wrap: false}
       rows : ui.LazyList {
         LazyStack: {estimate: $chat_row_estimate, overscan: 600}
         Size: {w: {kind: Grow, value: 1, min: 0, max: $chat_w + 2 * $chat_pad}, h: {kind: Fit, value: 0, min: 0, max: 0}}

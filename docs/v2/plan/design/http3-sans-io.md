@@ -6,7 +6,7 @@ date: 2026-11-04
 # HTTP/3 and WebTransport, sans-IO
 
 The owner has decided: blaze's QUIC and WebTransport stack follows rule 14 (sans-io-cores), as
-the HTTP/1.1 client already does (`crates/blaze-http`, `HANDOFF-http1-client.md`). Protocol
+the HTTP/1.1 client already does (`crates/blaze-http`). Protocol
 logic lives in synchronous state machines that take bytes, completions and the time, and hand
 back bytes, events and deadlines. One thin driver per IO backend does the IO.
 

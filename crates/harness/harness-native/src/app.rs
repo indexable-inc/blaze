@@ -179,6 +179,8 @@ struct Ids {
     archive_row: u64,
     /// The sidebar's foot: the focused chat's status bar, and the plan meter's slot.
     side_chat: u64,
+    /// The work bar over the window's top edge (hn.WorkBar).
+    work_bar: u64,
     side_plan: u64,
     /// The overlay on screen and what it is (made again when the mode changes).
     palette: Option<(u64, Mode)>,
@@ -385,6 +387,9 @@ fn scene_world() -> Result<World, String> {
     view::register(&world);
     world.component::<chat::GenFeel>().writable();
     world.component::<crate::audio::Mood>().writable();
+    world.component::<crate::audio::Instrument>().writable();
+    world.component::<crate::audio::Part>().writable();
+    world.component::<crate::audio::RainOn>().writable();
     world.component::<chat::GenOn>();
     script::install(&world);
     let _ = world.entity_named(APP);
@@ -509,6 +514,7 @@ impl App {
         let main = root.child("hn.Main");
         // The browser pane on the right (scene/widgets/web.flecs): its clip folds, the pane inside keeps its width.
         let web_clip = root.child("hn.WebClip");
+        let work_bar = root.child("hn.WorkBar").id();
         let web_pane = web_clip.child("hn.WebPane").id();
         let web_clip = web_clip.id();
         let bar = View::root(w, "hn.TitleBar");
@@ -522,6 +528,7 @@ impl App {
             main: main.id(),
             archive_row: archive_row.id(),
             side_chat: side_chat.id(),
+            work_bar,
             side_plan: side_plan.id(),
             palette: None,
             bar: bar.id(),
@@ -801,6 +808,9 @@ impl App {
 
     fn select(&mut self, e: Option<u64>) {
         if e != self.selected() {
+            if e.is_some() {
+                crate::audio::cue("select");
+            }
             self.reset_focused_term();
             self.pressed.clear();
             model::select(self.world.world_ref(), e);
@@ -1260,6 +1270,7 @@ impl App {
         let Some(key) = self.key_of(e) else { return };
         let pinned = self.pinned.remove(&key);
         if self.closed.insert(key) || pinned {
+            crate::audio::cue("archive");
             let o = self.world.entity_from_id(e);
             o.add(model::Closed::id());
             o.remove(model::Pinned::id());
@@ -1729,7 +1740,7 @@ impl App {
     }
 
     /// Start the app's sound from the scene's `hn.sound` (scene/widgets/sound.flecs, src/audio.rs): the window's, never
-    /// an offscreen shot's. native.json `sound: false` keeps it silent, `music: false` plays the cues alone.
+    /// an offscreen shot's. native.json `sound: false` keeps it silent, `music: false` leaves the music out, `ambient: false` the rain.
     ///
     /// # Errors
     /// The scene's sound is malformed (named), or the system refused the output.
@@ -1738,8 +1749,86 @@ impl App {
         if !on("sound") {
             return Ok(());
         }
-        let (level, music, cues, moods) = scene_sound(self.world.world_ref())?;
-        crate::audio::start(level, if on("music") { music } else { 0.0 }, cues, moods)
+        let (level, music, ambient, rain, cues, moods) = scene_sound(self.world.world_ref())?;
+        crate::audio::start(level, if on("music") { music } else { 0.0 }, if on("ambient") { ambient } else { 0.0 }, &rain, cues, moods)
+    }
+
+    /// How long a turn takes, by the turns already finished in every chat: their middle length (ms), once there are at
+    /// least three. An estimate and no more: the work bar says "about".
+    fn turn_estimate(&self) -> Option<u64> {
+        let chats = self.chats.borrow();
+        let mut took: Vec<u64> = chats // alloc: the finished turns' lengths, a frame while one runs
+            .values()
+            .flat_map(|t| t.items.iter())
+            .filter_map(|i| match i {
+                model::chat::Item::TurnEnd { duration_ms: Some(ms), .. } if *ms > 0 => Some(*ms),
+                _ => None,
+            })
+            .collect();
+        if took.len() < 3 {
+            return None;
+        }
+        took.sort_unstable();
+        Some(took[took.len() / 2])
+    }
+
+    /// The work bar (hn.WorkBar): while the chat in front works, a band along the window's top edge, placed by the
+    /// track's padding. With an estimate ([`Self::turn_estimate`]) it fills from the left as the turn nears it and
+    /// `eta` says about how long is left; with none, or past it, it sweeps. At rest it has no width. Drawn every frame
+    /// the display gives while it moves; under Reduce Motion a sweep is the whole hairline, still.
+    fn step_work_bar(&mut self) {
+        use harness_native_ui_layout_api::Padding;
+        let w = self.world.world_ref();
+        let bar = View::of(w.entity_from_id(self.ids.work_bar));
+        let Some(track) = bar.part("track") else { return };
+        let whole = track.entity().try_cloned::<&Laid>().map_or(0.0, |l| l.w);
+        let since = self.focused_chat().and_then(|(_, _, sid)| self.chats.borrow().get(&sid).filter(|t| t.busy).map(|t| t.turn_since));
+        let busy = since.is_some() && whole >= 1.0;
+        let still = harness_native_api::reduced(w);
+        // How far along it is. A step that says so itself ("Checking blaze-core \u{b7} 132/388": a build, a test, a
+        // cell's `progress`) is the truth: that share, and how long is left at the rate it has gone. Else the estimate:
+        // how far through the middle length of finished turns this one is, while it has not outrun it.
+        let told = self.focused_chat().and_then(|(_, _, sid)| self.chats.borrow().get(&sid).and_then(step_share));
+        let run = since.flatten().map(|from| model::now_ms().saturating_sub(from));
+        let toward = match told {
+            Some((done, total, started)) => {
+                let gone = started.map_or(0, |s| model::now_ms().saturating_sub(s));
+                // As if the whole took `whole` ms and `at` of it had gone.
+                let whole = if done > 0 { gone * total / done } else { 0 };
+                Some((gone.max(1), whole.max(gone + 1))).filter(|_| done > 0 && done < total)
+            }
+            None => run.zip(self.turn_estimate()).filter(|(run, est)| run < est),
+        };
+        let mut left = String::new();
+        let pad = if !busy {
+            Padding { l: whole, r: 0.0, t: 0.0, b: 0.0 }
+        } else if let Some((run, est)) = toward {
+            let mins = (est - run).div_ceil(60_000);
+            left = if est - run < 45_000 { "under a minute".to_owned() } else { format!("about {mins} min") };
+            Padding { l: 0.0, r: (whole * (1.0 - run as f32 / est as f32)).max(0.0), t: 0.0, b: 0.0 }
+        } else if still {
+            Padding::default()
+        } else {
+            let look = crate::look::role(w, "work_bar").try_cloned::<&Size>().unwrap_or_default();
+            let (share, period) = (look.w.value.clamp(0.02, 1.0), look.h.value.max(0.1));
+            let time = w.try_get::<&Clock>(|c| c.time).unwrap_or(0.0);
+            let phase = (time / period).rem_euclid(1.0);
+            let eased = phase * phase * (3.0 - 2.0 * phase);
+            let len = whole * share;
+            let x0 = -len + (whole + len) * eased;
+            let (a, z) = (x0.max(0.0), (x0 + len).min(whole));
+            Padding { l: a, r: (whole - z).max(0.0), t: 0.0, b: 0.0 }
+        };
+        if track.entity().try_cloned::<&Padding>() != Some(pad) {
+            track.set(pad);
+        }
+        if let Some(eta) = bar.part("foot").and_then(|f| f.part("eta")) {
+            eta.text(&left);
+        }
+        // It moves: every frame the display gives (a sweep at a calm rate steps visibly).
+        if busy && !(still && toward.is_none()) {
+            self.poke_why("work bar");
+        }
     }
 
     /// The agent kind cmd+N starts a chat of: the one last used (here, else native.json `chat_kind`), else the picker's
@@ -1772,6 +1861,7 @@ impl App {
             self.poke();
             return;
         }
+        crate::audio::cue("fresh");
         let kind = self.chat_kind();
         let c = self.choice_of(&kind);
         let kept = self.link.agent_models();
@@ -1847,11 +1937,16 @@ impl App {
         self.browser_frame_start(dt);
         self.step_fold(dt);
         self.step_tree_scroll(dt);
+        self.step_work_bar();
         // The sound follows the chat in front (src/audio.rs; silent unless the window started it).
         {
             let front = self.focused_chat().is_some_and(|(_, _, sid)| self.chats.borrow().get(&sid).is_some_and(|t| t.busy));
             let agents = self.chats.borrow().values().filter(|t| t.busy).count();
-            crate::audio::scene(agents, front, chat::plan::night(model::now_ms() / 1000));
+            // Whether the chat in front's turn ended on an error: its ending rings low, not home.
+            let failed = self.focused_chat().is_some_and(|(_, _, sid)| {
+                self.chats.borrow().get(&sid).is_some_and(|t| t.items.iter().rev().find(|i| !matches!(i, model::chat::Item::TurnEnd { .. })).is_some_and(|i| matches!(i, model::chat::Item::Error { .. })))
+            });
+            crate::audio::scene(agents, front, failed, chat::plan::night(model::now_ms() / 1000));
         }
         self.sync_side_status();
         self.step_archive_scroll();
@@ -2055,6 +2150,7 @@ impl App {
         crate::look::breathing(self.world.world_ref())
             || paint.shimmering
             || paint.blocks_live
+            || paint.lantern_live
             || matches!(paint.kip_wake, harness_native_render::kips::Wake::Calm(_))
     }
 
@@ -2455,6 +2551,7 @@ impl App {
 
     /// Open the palette (the shot's `HARNESS_NATIVE_SHOT_PALETTE`).
     pub fn open_palette(&mut self) {
+        crate::audio::cue("open");
         self.palette = Some(Palette::new());
         self.poke();
     }
@@ -2489,6 +2586,30 @@ fn done_mark(status: &str, code: Option<i32>, depth: usize) -> &'static str {
         _ if code.is_some() => "fail",
         _ => "",
     }
+}
+
+/// The share of its work the running step of transcript `t` says it has done ("\u{2026} \u{b7} 132/388" in its words: a
+/// build's, a test's, a cell's `progress`): done, total and when the step began. None when no running step says.
+fn step_share(t: &model::chat::Transcript) -> Option<(u64, u64, Option<u64>)> {
+    use model::chat::Item;
+    let block = t.items.iter().rev().find_map(|i| match i {
+        Item::Tool { block, result: None, .. } => Some(block),
+        _ => None,
+    })?;
+    let e = t.details.get(block)?.effects.iter().rev().find(|e| e.status == "running")?;
+    let (done, total) = share_in(&e.doing)?;
+    Some((done, total, e.started_ms))
+}
+
+/// The last `done/total` in `words` ("Checking blaze-core \u{b7} 132/388"): digits either side of a slash, the total
+/// over 0 and at least the done.
+fn share_in(words: &str) -> Option<(u64, u64)> {
+    words.match_indices('/').rev().find_map(|(i, _)| {
+        let done: String = words[..i].chars().rev().take_while(char::is_ascii_digit).collect::<Vec<_>>().into_iter().rev().collect();
+        let total: String = words[i + 1..].chars().take_while(char::is_ascii_digit).collect();
+        let (done, total) = (done.parse::<u64>().ok()?, total.parse::<u64>().ok()?);
+        (total > 0 && done <= total).then_some((done, total))
+    })
 }
 
 /// What a working agent is doing now, from its transcript's last item: the words its tooltip leads with, and the
@@ -2694,7 +2815,11 @@ fn set_if(v: View<'_>, fill: Fill) {
 ///
 /// # Errors
 /// A part of it is missing or malformed, named.
-fn scene_sound(w: WorldRef<'_>) -> Result<(f32, f32, Vec<crate::audio::Cue>, HashMap<String, crate::music::Mood>), String> {
+/// The scene's sound as [`scene_sound`] reads it: the master, the music's and the rain's levels, the places the rain
+/// falls, the cues and the moods.
+type SceneSound = (f32, f32, f32, Vec<crate::music::RainSource>, Vec<crate::audio::Cue>, HashMap<String, crate::music::Mood>);
+
+fn scene_sound(w: WorldRef<'_>) -> Result<SceneSound, String> {
     use harness_native_blaze::sound::{Note, Voice as V};
     use harness_native_ui_timeline_api::{Gain, Lasts, Onset, Pan, Pitch, Sound, Voice};
     let at = |path: &str| w.try_lookup(path).ok_or_else(|| format!("the scene has no {path} (scene/widgets/sound.flecs)"));
@@ -2726,18 +2851,35 @@ fn scene_sound(w: WorldRef<'_>) -> Result<(f32, f32, Vec<crate::audio::Cue>, Has
     let mut moods = HashMap::new(); // alloc: the scene's moods, read once
     let mut bad = None;
     at("hn::sound::mood")?.each_child(|m| {
-        if let Some(mood) = m.try_cloned::<&crate::audio::Mood>() {
-            match mood.read(&m.path()) {
-                Ok(read) => _ = moods.insert(m.name(), read),
+        let Some(mood) = m.try_cloned::<&crate::audio::Mood>() else { return };
+        // Its parts: each child that is a part (a `hn.sound.part` prefab's instance, its instrument inherited with it).
+        let mut parts = Vec::new();
+        m.each_child(|c| {
+            let (Some(part), Some(inst)) = (c.try_cloned::<&crate::audio::Part>(), c.try_cloned::<&crate::audio::Instrument>()) else { return };
+            match inst.read(&c.path()).and_then(|i| part.read(c.name(), i, gain(c), &c.path())) {
+                Ok(p) => parts.push(p),
                 Err(e) => bad = Some(e),
             }
+        });
+        parts.sort_by(|a, b| a.name.cmp(&b.name));
+        match mood.read(parts, &m.path()) {
+            Ok(read) => _ = moods.insert(m.name(), read),
+            Err(e) => bad = Some(e),
         }
     });
     if let Some(e) = bad {
         return Err(e);
     }
     cues.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok((gain(at("hn::sound")?), gain(at("hn::sound::mood")?), cues, moods))
+    let mut rain = Vec::new(); // alloc: the places the rain falls, read once
+    at("hn::sound::ambient")?.each_child(|c| {
+        if let Some(r) = c.try_cloned::<&crate::audio::RainOn>() {
+            rain.push((c.name(), crate::music::RainSource { azimuth: r.azimuth, elevation: r.elevation, distance: r.distance, gain: gain(c), hiss: r.hiss, rate: r.rate, low: r.low, high: r.high, ring: r.ring, bend: r.bend }));
+        }
+    });
+    rain.sort_by(|a, b| a.0.cmp(&b.0));
+    let rain = rain.into_iter().map(|(_, r)| r).collect();
+    Ok((gain(at("hn::sound")?), gain(at("hn::sound::mood")?), gain(at("hn::sound::ambient")?), rain, cues, moods))
 }
 
 #[cfg(test)]
@@ -2859,18 +3001,27 @@ mod tests {
         assert!((drawn(pill).y - laid(rows[2]).y).abs() > 1.0, "a selection still slides");
     }
 
+    /// A step's own share is read from its words; a path or a date is not one.
+    #[test]
+    fn a_steps_share_is_read_from_its_words() {
+        assert_eq!(share_in("Checking blaze-core \u{b7} 132/388"), Some((132, 388)));
+        assert_eq!(share_in("Converting \u{b7} 0/12"), Some((0, 12)));
+        assert_eq!(share_in("Reading src/app.rs"), None);
+        assert_eq!(share_in("9/3 of them"), None);
+    }
+
     /// The scene's sound reads whole: every step item has a cue, `ready` and `done` ring, and every mood of the ladder is there.
     #[test]
     fn the_scenes_sound_reads() {
         let world = scene_world().unwrap_or_else(|e| panic!("{e}"));
-        let (level, music, cues, moods) = scene_sound(world.world_ref()).unwrap_or_else(|e| panic!("{e}"));
-        assert!(level > 0.0 && music > 0.0);
+        let (level, music, ambient, rain, cues, moods) = scene_sound(world.world_ref()).unwrap_or_else(|e| panic!("{e}"));
+        assert!(level > 0.0 && music > 0.0 && ambient > 0.0 && rain.len() >= 3 && rain.iter().all(|r| r.gain > 0.0 && r.high > r.low));
         for item in ["exec", "read", "edit", "search", "net", "build", "spawn", "wait", "sql", "think"] {
             assert!(cues.iter().any(|c| c.0 == item && c.1 > 0.0 && !c.2.is_empty()), "no cue for {item}");
         }
         assert!(["ready", "done"].iter().all(|n| cues.iter().any(|c| c.0 == *n && !c.2.is_empty())));
-        for mood in ["calm", "flow", "drive", "battle"] {
-            assert!(moods.get(mood).is_some_and(|m| m.tempo > 0.0 && !m.scale.is_empty() && !m.chords.is_empty()), "no mood {mood}");
+        for mood in ["rest", "calm", "flow", "drive", "battle"] {
+            assert!(moods.get(mood).is_some_and(|m| m.tempo > 0.0 && !m.scale.is_empty() && !m.chords.is_empty() && m.parts.len() >= 2 && m.parts.iter().all(|p| p.level > 0.0 && !p.instrument.partials.is_empty() || p.instrument.noise > 0.0)), "mood {mood} is missing or has no parts");
         }
     }
 

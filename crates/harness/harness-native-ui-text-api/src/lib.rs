@@ -196,6 +196,14 @@ pub struct Frames {
     pub fps: f32,
 }
 
+/// A lit paper lantern hanging in the middle of the node (harness-native-render lantern.rs draws it, no file), its
+/// light flickering a little and falling on the ground under it: pixel art, as a step's item is. For a pane with
+/// nothing in it yet. `on`: whether it shows.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct Lantern {
+    pub on: bool,
+}
+
 /// A small pixel-art item, a game's dropped item, that floats and does what it stands for, named by `face` (what a
 /// step does: `exec` a terminal with a blinking cursor, `read` a book turning a page, `net` the world turning, `think` a
 /// crystal, ...; harness-native-render block.rs draws each, none is a file). When `face` changes the old item sinks away
@@ -372,6 +380,7 @@ hyperion_api_layouts::api_layouts! {
     "Frames" => alias Frames,
     "BlazeMark" => alias BlazeMark,
     "PixelBlock" => alias PixelBlock,
+    "Lantern" => alias Lantern,
     "Kip" => alias Kip,
     "KipStand" => alias KipStand,
     "Caret" => alias Caret,
@@ -406,6 +415,7 @@ pub fn register(world: &World) {
     world.component::<Frames>().writable();
     world.component::<BlazeMark>().writable();
     world.component::<PixelBlock>().writable();
+    world.component::<Lantern>().writable();
     world.component::<Kip>().writable();
     world.component::<KipStand>().writable();
     world.component::<Caret>().writable();

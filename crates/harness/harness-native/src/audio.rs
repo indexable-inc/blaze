@@ -6,11 +6,12 @@
 //! - **Music** is the band's ([`crate::music`]): composed and synthesised live in the callback, in the mood the scene
 //!   names (`hn.sound.mood`: calm, flow, drive, battle). [`scene`], called each frame, picks the mood from what the
 //!   agents are doing and how many are at it; the band glides there.
+//! - **Rain** ([`music::Rain`]) plays when nothing else does, and quieter under the music, so the app is never silent.
 //! - [`start`] opens the output (an AudioQueue: AudioToolbox's, linked here, no crate). With nothing sounding for a few
 //!   seconds the queue pauses, and the output device rests.
 //!
 //! Nothing here runs unless [`start`] did: an offscreen shot and the tests make no sound.
-use crate::music::{self, Band};
+use crate::music::{self, Band, Rain};
 use harness_native_blaze::sound::{Note, soundtrack};
 use harness_native_flecs::prelude::*;
 use std::collections::HashMap;
@@ -18,36 +19,124 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
+/// The numbers in `s`, a list in words (`"0 2 4 7 9"`), as `what` of `at`.
+fn numbers<T: std::str::FromStr>(s: &ScriptString, what: &str, at: &str) -> Result<Vec<T>, String>
+where
+    T::Err: std::fmt::Display,
+{
+    s.as_str().split_whitespace().map(str::parse::<T>).collect::<Result<Vec<_>, _>>().map_err(|e| format!("{at}: {what} {:?}: {e}", s.as_str()))
+}
+
+/// An instrument of `hn.sound.inst`, as the scene writes it ([`music::Instrument`]): `partials` is pairs in words, each
+/// a ratio to the note's pitch and a level (`"1 1  2 0.4  3 0.2"`).
+#[derive(Component, Clone, Debug, Default, PartialEq)]
+pub struct Instrument {
+    pub partials: ScriptString,
+    pub attack: f32,
+    pub decay: f32,
+    pub hold: bool,
+    pub damp: f32,
+    pub fm: f32,
+    pub fm_ratio: f32,
+    pub fm_decay: f32,
+    pub drop: f32,
+    pub drop_rate: f32,
+    pub noise: f32,
+    pub noise_decay: f32,
+    pub room: f32,
+}
+
+impl Instrument {
+    /// # Errors
+    /// Partials that are not pairs of numbers, or no decay: named as `at`'s.
+    pub fn read(&self, at: &str) -> Result<music::Instrument, String> {
+        let flat: Vec<f32> = numbers(&self.partials, "Instrument partials", at)?;
+        if flat.len() % 2 != 0 || self.decay <= 0.0 {
+            return Err(format!("{at}: an Instrument needs partials as pairs (a ratio and a level each) and a decay over 0"));
+        }
+        Ok(music::Instrument {
+            partials: flat.chunks_exact(2).map(|c| (c[0], c[1])).collect(),
+            attack: self.attack,
+            decay: self.decay,
+            hold: self.hold,
+            damp: self.damp,
+            fm: self.fm,
+            fm_ratio: self.fm_ratio,
+            fm_decay: self.fm_decay,
+            drop: self.drop,
+            drop_rate: self.drop_rate,
+            noise: self.noise,
+            noise_decay: self.noise_decay,
+            room: self.room,
+        })
+    }
+}
+
+/// A place the rain falls (`hn.sound.ambient.*`), as the scene writes it ([`music::RainSource`]); its level is its
+/// `Gain`.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct RainOn {
+    pub azimuth: f32,
+    pub elevation: f32,
+    pub distance: f32,
+    pub hiss: f32,
+    pub rate: f32,
+    pub low: f32,
+    pub high: f32,
+    pub ring: f32,
+    pub bend: f32,
+}
+
+/// A part of `hn.sound.part`, as the scene writes it ([`music::Part`]): `role` is chord, root, arp, motif, sparkle or
+/// hit; `steps` the steps of the bar it plays on, in words (`"0 8"`). Its instrument is the `Instrument` on the same
+/// entity (a part prefab inherits an instrument prefab) and its level its `Gain`.
+#[derive(Component, Clone, Debug, Default, PartialEq)]
+pub struct Part {
+    pub role: ScriptString,
+    pub steps: ScriptString,
+    pub octave: i32,
+    pub pan: f32,
+    pub chance: f32,
+    pub beats: f32,
+    pub hz: f32,
+}
+
+impl Part {
+    /// The part named `name`, playing `instrument` at `level`.
+    ///
+    /// # Errors
+    /// A role that is none of them, steps that are not 0 to 15: named as `at`'s.
+    pub fn read(&self, name: String, instrument: music::Instrument, level: f32, at: &str) -> Result<music::Part, String> {
+        let role = music::Role::named(self.role.as_str()).ok_or_else(|| format!("{at}: Part role {:?} is not chord, root, arp, motif, sparkle or hit", self.role.as_str()))?;
+        let steps: Vec<u8> = numbers(&self.steps, "Part steps", at)?;
+        if steps.iter().any(|s| *s > 15) {
+            return Err(format!("{at}: Part steps {:?}: a bar's steps are 0 to 15", self.steps.as_str()));
+        }
+        Ok(music::Part { name, instrument: Arc::new(instrument), role, steps, octave: self.octave, level, pan: self.pan, chance: self.chance, beats: self.beats, hz: self.hz })
+    }
+}
+
 /// A mood of `hn.sound.mood`, as the scene writes it ([`music::Mood`]): `scale`, `night` and `chords` are lists in
-/// words (`"0 2 4 7 9"`).
+/// words. Its parts are its children.
 #[derive(Component, Clone, Debug, Default, PartialEq)]
 pub struct Mood {
     pub tempo: f32,
     pub scale: ScriptString,
     pub night: ScriptString,
     pub chords: ScriptString,
-    pub pad: f32,
-    pub bass: f32,
-    pub arp: f32,
-    pub lead: f32,
-    pub bell: f32,
-    pub drums: f32,
 }
 
 impl Mood {
-    /// The mood as the band plays it.
+    /// The mood as the band plays it, with `parts`.
     ///
     /// # Errors
     /// A list that is not numbers, an empty scale or no chords, a tempo not over 0: named as `at`'s.
-    pub fn read(&self, at: &str) -> Result<music::Mood, String> {
-        let list = |name: &str, s: &ScriptString| {
-            s.as_str().split_whitespace().map(str::parse::<i32>).collect::<Result<Vec<_>, _>>().map_err(|e| format!("{at}: Mood {name} {:?}: {e}", s.as_str()))
-        };
-        let (scale, night, chords) = (list("scale", &self.scale)?, list("night", &self.night)?, list("chords", &self.chords)?);
+    pub fn read(&self, parts: Vec<music::Part>, at: &str) -> Result<music::Mood, String> {
+        let (scale, night, chords) = (numbers(&self.scale, "Mood scale", at)?, numbers(&self.night, "Mood night", at)?, numbers(&self.chords, "Mood chords", at)?);
         if scale.is_empty() || chords.is_empty() || self.tempo <= 0.0 {
             return Err(format!("{at}: a Mood needs a tempo over 0, a scale and chords"));
         }
-        Ok(music::Mood { tempo: self.tempo, scale, night, chords, pad: self.pad, bass: self.bass, arp: self.arp, lead: self.lead, bell: self.bell, drums: self.drums })
+        Ok(music::Mood { tempo: self.tempo, scale, night, chords, parts })
     }
 }
 
@@ -58,6 +147,8 @@ const FRAMES: usize = 1024;
 const REST: u64 = 3;
 /// Seconds the music plays on without [`scene`] saying so again (the window stopped drawing).
 const HOLD: u64 = 20;
+/// How much of the rain stays under the music.
+const UNDER: f32 = 0.15;
 /// The moods, calmest first: [`scene`] climbs them as more is going on.
 const LADDER: [&str; 4] = ["calm", "flow", "drive", "battle"];
 
@@ -72,9 +163,15 @@ struct Mixer {
     level: f32,
     /// The music's level under the master.
     music: f32,
+    /// Rain's level under the master when nothing else plays (0: none); under the music it is [`UNDER`] of it.
+    ambient: f32,
+    rain: Rain,
     playing: Vec<Playing>,
     band: Band,
-    /// The frame the music fades at unless it is asked for again.
+    /// What the band plays when no agent works (the scene's `rest` mood), and whether it is night.
+    rest: Option<music::Mood>,
+    night: bool,
+    /// The frame the music goes back to `rest` at unless a mood is asked for again.
     until: u64,
     clock: u64,
     idle: u64,
@@ -84,11 +181,13 @@ struct Mixer {
 impl Mixer {
     fn render(&mut self, out: &mut [[f32; 2]]) {
         if self.clock >= self.until {
-            self.band.set(None, false);
+            self.band.set(self.rest.as_ref(), self.night);
         }
         let mut band = [[0.0f32; 2]; FRAMES];
         let n = out.len().min(FRAMES);
         self.band.render(&mut band[..n]);
+        self.rain.set(self.ambient * self.level * if self.band.playing() { UNDER } else { 1.0 });
+        self.rain.render(out);
         for (o, b) in out.iter_mut().zip(&band[..n]) {
             o[0] += b[0] * self.music * self.level;
             o[1] += b[1] * self.music * self.level;
@@ -104,7 +203,7 @@ impl Mixer {
         for o in out.iter_mut() {
             *o = o.map(f32::tanh);
         }
-        self.idle = if self.playing.is_empty() && !self.band.playing() { self.idle + out.len() as u64 } else { 0 };
+        self.idle = if self.playing.is_empty() && !self.band.playing() && !self.rain.playing() { self.idle + out.len() as u64 } else { 0 };
         self.clock += out.len() as u64;
     }
 }
@@ -189,17 +288,19 @@ fn render(notes: &[Note], gain: f32, seed: u64) -> Buf {
 pub struct Cue(pub String, pub f32, pub Vec<Note>);
 
 /// Open the output at `level` (the scene's master) with the music at `music` under it (0: none), render `cues` on a
-/// thread of their own, and keep `moods` for [`scene`].
+/// thread of their own, and keep `moods` for [`scene`]. `ambient`: the rain's level (0: none) and `rain` the
+/// places it falls; with rain the output never rests.
 ///
 /// # Errors
 /// The system refused the queue or a buffer (its status, named).
-pub fn start(level: f32, music: f32, cues: Vec<Cue>, moods: HashMap<String, music::Mood>) -> Result<(), String> {
+pub fn start(level: f32, music: f32, ambient: f32, rain: &[music::RainSource], cues: Vec<Cue>, moods: HashMap<String, music::Mood>) -> Result<(), String> {
     if MIXER.get().is_some() {
         return Ok(());
     }
     let _ = CUES.set(Mutex::new(HashMap::new()));
+    let rest = moods.get("rest").cloned();
     let _ = MOODS.set(moods);
-    let _ = MIXER.set(Mutex::new(Mixer { level, music, playing: Vec::new(), band: Band::default(), until: 0, clock: 0, idle: 0, paused: false }));
+    let _ = MIXER.set(Mutex::new(Mixer { level, music, ambient, rain: Rain::new(rain), playing: Vec::new(), band: Band::default(), rest: None, night: false, until: 0, clock: 0, idle: 0, paused: false }));
     // 32-bit float, interleaved stereo ('lpcm'; float | packed).
     let format = Format { sample_rate: f64::from(SR), format_id: 0x6C70_636D, format_flags: 1 | 8, bytes_per_packet: 8, frames_per_packet: 1, bytes_per_frame: 8, channels_per_frame: 2, bits_per_channel: 32, reserved: 0 };
     let mut queue = std::ptr::null_mut();
@@ -217,9 +318,15 @@ pub fn start(level: f32, music: f32, cues: Vec<Cue>, moods: HashMap<String, musi
         }
         fill(std::ptr::null_mut(), queue, b);
     }
-    QUEUE.store(queue, Ordering::Release);
-    // Paused until something plays.
     if let Some(m) = MIXER.get() {
+        m.lock().unwrap_or_else(PoisonError::into_inner).rest = rest;
+    }
+    QUEUE.store(queue, Ordering::Release);
+    // Paused until something plays; with rain, something always does.
+    if (ambient > 0.0 && !rain.is_empty()) || MOODS.get().is_some_and(|m| m.contains_key("rest")) {
+        // SAFETY: the queue just made.
+        unsafe { AudioQueueStart(queue, std::ptr::null()) };
+    } else if let Some(m) = MIXER.get() {
         m.lock().unwrap_or_else(PoisonError::into_inner).paused = true;
     }
     std::thread::Builder::new()
@@ -292,9 +399,10 @@ fn rung(item: &str, agents: usize) -> usize {
 }
 
 /// Each frame: how many agents are at work, whether the chat in front is one of them, and whether it is night. While
-/// any works the music plays in the mood that fits ([`rung`]); when the chat in front stops, `done` rings; with none at
-/// work the music fades out.
-pub fn scene(agents: usize, front: bool, night: bool) {
+/// any works the music plays in the mood that fits ([`rung`]); when the chat in front stops, `done` rings (`fail` when it ended
+/// on an error); with none at
+/// work the band goes back to its `rest` mood.
+pub fn scene(agents: usize, front: bool, failed: bool, night: bool) {
     if MIXER.get().is_none() {
         return;
     }
@@ -306,13 +414,18 @@ pub fn scene(agents: usize, front: bool, night: bool) {
     }
     drop(now);
     if was && !front {
-        cue("done");
+        cue(if failed { "fail" } else { "done" });
     }
     let mood = (agents > 0).then(|| MOODS.get().and_then(|m| m.get(LADDER[rung(&item, agents)]))).flatten();
     with_mixer(|m| {
-        m.band.set(mood, night);
-        if mood.is_some() {
-            m.until = m.clock + HOLD * u64::from(SR);
+        m.night = night;
+        match mood {
+            Some(mood) => {
+                m.band.set(Some(mood), night);
+                m.until = m.clock + HOLD * u64::from(SR);
+            }
+            // No agent at work: the rest mood (ambient music), from the next callback.
+            None => m.until = 0,
         }
     });
 }
@@ -338,12 +451,14 @@ mod live {
     #[ignore]
     fn plays_out_loud() {
         let n = |at: f32, hz: f32| Note { voice: Voice::Mallet, at, dur: 1.0, freq: hz, amp: 0.05, pan: 0.0, sweep: 0.0 };
-        let flow = music::Mood { tempo: 84.0, scale: vec![0, 2, 4, 7, 9], night: vec![], chords: vec![0, 3, 2, 4], pad: 0.45, bass: 0.4, arp: 0.45, lead: 0.4, bell: 0.15, drums: 0.0 };
-        start(1.0, 0.6, vec![Cue("done".into(), 0.3, vec![n(0.0, 440.0), n(0.15, 554.37), n(0.3, 659.25)])], HashMap::from([("flow".to_owned(), flow)])).unwrap();
+        let inst = |hold: bool| Arc::new(music::Instrument { partials: vec![(1.0, 1.0), (2.0, 0.4)], attack: if hold { 1.0 } else { 0.003 }, decay: if hold { 1.4 } else { 3.0 }, hold, damp: 1.2, room: 0.3, ..music::Instrument::default() });
+        let part = |name: &str, role, steps: &[u8], level, hold| music::Part { name: name.to_owned(), instrument: inst(hold), role, steps: steps.to_vec(), octave: 1, level, pan: 0.0, chance: 1.0, beats: 4.0, hz: 60.0 };
+        let flow = music::Mood { tempo: 84.0, scale: vec![0, 2, 4, 7, 9], night: vec![], chords: vec![0, 3, 2, 4], parts: vec![part("pad", music::Role::Chord, &[0], 0.08, true), part("lead", music::Role::Motif, &[], 0.15, false)] };
+        start(1.0, 0.6, 0.08, &[], vec![Cue("done".into(), 0.3, vec![n(0.0, 440.0), n(0.15, 554.37), n(0.3, 659.25)])], HashMap::from([("flow".to_owned(), flow)])).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1500));
         cue("done");
         for _ in 0..80 {
-            scene(1, true, false);
+            scene(1, true, false, false);
             step("edit");
             std::thread::sleep(std::time::Duration::from_millis(100));
         }

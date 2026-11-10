@@ -10,6 +10,35 @@ hn {
     Padding: {l: 0, r: 0, t: 0, b: 0}
   }
 
+  // The work bar: a hairline along the window's top edge with a band sweeping along it while the chat in front works
+  // (Ghostty's progress bar; src/app.rs step_work_bar places the band by the track's padding). With an estimate
+  // (the middle length of the turns already finished, once there are a few) the band is the turn's progress toward
+  // it, filling from the left, and `eta` says about how long is left; with none, or once the turn has outrun it, the
+  // band sweeps and says only that work is going on. A layer over the window, out of its
+  // flow, taking no pointer.
+  prefab WorkBar : ui.Column {
+    Overlay
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    track : ui.Row {
+      Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $work_bar_h, min: 0, max: 0}}
+      Padding: {l: 0, r: 0, t: 0, b: 0}
+      band : ui.Node {
+        Fill: $tone_ink_muted
+        Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+      }
+    }
+    // How long is left, by the estimate ("~3 min"), quiet at the bar's trailing end; empty when there is none.
+    foot : ui.Row {
+      Flex: {axis: Row, gap: 0, align: Center, justify: End, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      Padding: {l: 0, r: 10, t: 5, b: 0}
+      eta : ui.Line, Faint {
+        TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+      }
+    }
+  }
+
   // The title-bar strip over the window, Ghostty's: as tall as AppKit's title bar. It shows no title: the traffic lights
   // sit on the sidebar's vibrancy and the main card runs to the window's top; only the back chevron lives here.
   // The host sets its height and left inset (src/app.rs lay_chrome).
