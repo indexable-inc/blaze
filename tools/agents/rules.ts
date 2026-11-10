@@ -93,7 +93,7 @@ type Rule = {
 
 const header = `# blaze
 
-This codebase is yours: what it's for and how it's built are your call, and you'll keep building on it. You own it: when anything in it is not state of the art, or is subpar, fix it immediately rather than wait.
+This codebase is yours: what it's for and how it's built are your call, and you'll keep building on it. You own it: when anything in it is not state of the art, or is subpar, fix it immediately rather than wait. State of the art means on the Pareto frontier of incremental speed, memory use, disk use and the rest of what blaze is measured by: nothing else is better on one without being worse on another.
 
 How to build, test and change blaze: docs/contributing.md. Every doc: docs/README.md. What the harnesses check: docs/harness.md. These rules are generated from tools/agents/rules.ts (edit there, then \`bun tools/agents/rules.ts --write\`).
 
