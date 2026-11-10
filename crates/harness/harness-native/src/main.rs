@@ -15,9 +15,18 @@ mod resize;
 mod shot;
 mod single;
 mod term;
+#[cfg(target_os = "ios")]
+mod ios;
+#[cfg(target_os = "macos")]
 mod window;
 mod world_api;
 
+#[cfg(target_os = "ios")]
+fn main() {
+    ios::run()
+}
+
+#[cfg(target_os = "macos")]
 fn main() {
     if let Some(path) = std::env::var_os("HARNESS_NATIVE_SHOT") {
         if let Err(e) = link::ensure_daemon() {
