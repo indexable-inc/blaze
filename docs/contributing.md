@@ -30,8 +30,8 @@ one level down:
     harness/                  the test harnesses and their fixtures
     tools/                    what builds, releases and measures blaze: agents/ (the agent rules
                               AGENTS.md is generated from), nix/ (the flake's unit graphs), pgo/
-                              (the pinned PGO profiles), bench/results/ (recorded results),
-                              remote-cache/ (the cache gateway Worker), typed-input/ (the Python
+                              (the pinned PGO profiles), bench/remote-cache/ (the cache gateway's
+                              measurements), remote-cache/ (the cache gateway Worker), typed-input/ (the Python
                               workspace's shared helper), v2/ (the lanes' scripts and queue)
     docs/                     these documents; docs/future/ the plans for work not started,
                               fed1eb428d:docs/reports/ working reports, docs/v2/ the v2 plan and the lanes'

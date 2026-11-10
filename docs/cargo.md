@@ -682,7 +682,7 @@ itself (`CARGO_PKG_*`, `CARGO_MANIFEST_DIR`, `OUT_DIR`, `RUSTC*`, ...); what car
 build scripts (`CARGO_CFG_*`, `CARGO_FEATURE_*`, `CARGO_ENCODED_RUSTFLAGS`) it may forward, as
 rav1e's does. Anything
 else fails the build, naming the script and each line. Over the bench corpus's 587 runs the
-rules refuse none (`tools/bench/results/2026-10-27-bscache/directives.md`).
+rules refuse none (counted 2026-10-27).
 
 and, for a package of the workspace, in its own manifest:
 
