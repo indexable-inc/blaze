@@ -436,7 +436,13 @@ fn locate_all(
         let checksum = checksums.get(&id).and_then(Option::as_deref);
         match files.with_cx(|cx| sources.locate(cx, id, checksum))? {
             Located::Here { manifest } => here.push((id, manifest)),
-            Located::Needs(fetch) => needs.push(fetch),
+            // Once per place: a git repository's packages share its checkout.
+            Located::Needs(fetch) => {
+                if let Err(error) = fetch.ask_once(&mut needs) {
+                    let at = format!("{} v{}", id.name(), id.version()); // alloc: an error, once
+                    failed.push((load_error(&error, Some(at)), false));
+                }
+            }
             Located::Failed(error) => failed.push((error, false)),
             Located::Unfetched(error) => failed.push((error, true)),
         }

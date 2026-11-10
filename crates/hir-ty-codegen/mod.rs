@@ -466,7 +466,7 @@ fn x86_lanewise(name: &str) -> Option<(Lanewise, Type)> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum OverflowOp {
+pub(crate) enum OverflowOp {
     Add,
     Sub,
     Mul,
@@ -477,6 +477,48 @@ enum OverflowOp {
     Shr,
     DivByZero,
     RemByZero,
+}
+
+impl OverflowOp {
+    /// The check an `Assert` of `msg` makes, when it is an arithmetic one: `Err` with the
+    /// operator of an overflow check core has no panic for. The one map of them, which the IR
+    /// builder compiles and the reference walk (`v2::refs`) lists.
+    pub(crate) fn of(msg: &AssertKind) -> Option<std::result::Result<Self, BinOp>> {
+        Some(Ok(match msg {
+            AssertKind::Overflow(BinOp::Add, ..) => OverflowOp::Add,
+            AssertKind::Overflow(BinOp::Sub, ..) => OverflowOp::Sub,
+            AssertKind::Overflow(BinOp::Mul, ..) => OverflowOp::Mul,
+            AssertKind::Overflow(BinOp::Div, ..) => OverflowOp::Div,
+            AssertKind::Overflow(BinOp::Rem, ..) => OverflowOp::Rem,
+            AssertKind::Overflow(BinOp::Shl, ..) => OverflowOp::Shl,
+            AssertKind::Overflow(BinOp::Shr, ..) => OverflowOp::Shr,
+            AssertKind::Overflow(op, ..) => return Some(Err(op.clone())),
+            AssertKind::OverflowNeg(_) => OverflowOp::Neg,
+            AssertKind::DivisionByZero(_) => OverflowOp::DivByZero,
+            AssertKind::RemainderByZero(_) => OverflowOp::RemByZero,
+            AssertKind::BoundsCheck { .. }
+            | AssertKind::MisalignedPointerDereference { .. }
+            | AssertKind::NullPointerDereference
+            | AssertKind::NullReferenceConstructed
+            | AssertKind::InvalidEnumConstruction(_) => return None,
+        }))
+    }
+
+    /// Core's `panic_const_*` a failed check of this calls (`FunctionCx::panic_if`).
+    pub(crate) fn panic(self) -> &'static str {
+        match self {
+            OverflowOp::Add => "panic_const_add_overflow",
+            OverflowOp::Sub => "panic_const_sub_overflow",
+            OverflowOp::Mul => "panic_const_mul_overflow",
+            OverflowOp::Div => "panic_const_div_overflow",
+            OverflowOp::Rem => "panic_const_rem_overflow",
+            OverflowOp::Neg => "panic_const_neg_overflow",
+            OverflowOp::Shl => "panic_const_shl_overflow",
+            OverflowOp::Shr => "panic_const_shr_overflow",
+            OverflowOp::DivByZero => "panic_const_div_by_zero",
+            OverflowOp::RemByZero => "panic_const_rem_by_zero",
+        }
+    }
 }
 
 /// How a value crosses a call boundary in rustc's Rust ABI.
@@ -2290,6 +2332,34 @@ pub fn exported_static(db: &Db, id: StaticId) -> Option<intern::Symbol> {
     })
 }
 
+/// How a function or static Rust code defines under a name ([`exported_symbol`],
+/// [`linked_symbol`], [`exported_static`]) is defined, read off its `#[linkage]`: the one
+/// place the linkage of a named definition is decided, which codegen's driver and the linker
+/// take as it is ([`blaze_codegen::Linkage`]). rustc gives `weak`, `weak_odr`, `linkonce` and
+/// `linkonce_odr` a weak symbol in the object (LLVM's `WeakAny`, `WeakODR`, `LinkOnceAny`,
+/// `LinkOnceODR`), and `external` or no attribute a strong one. Any other linkage on a named
+/// definition (`internal`, `private`, `available_externally`, `common`, `appending`,
+/// `extern_weak`) is refused naming it: blaze links every named definition as one global
+/// symbol, and taking it for a strong one would link another program than rustc's.
+pub fn exported_linkage(
+    db: &Db,
+    owner: hir_def::AttrDefId,
+) -> std::result::Result<blaze_codegen::Linkage, String> {
+    let Some(linkage) = AttrFlags::linkage(db, owner) else {
+        return Ok(blaze_codegen::Linkage::Strong);
+    };
+    match linkage.as_str() {
+        "external" => Ok(blaze_codegen::Linkage::Strong),
+        "weak" | "weak_odr" | "linkonce" | "linkonce_odr" => Ok(blaze_codegen::Linkage::Weak),
+        // alloc: the error's message
+        other => Err(format!(
+            "`#[linkage = \"{other}\"]` on a definition outside code names by its symbol: blaze links a named \
+             definition strongly (`external`, or no `#[linkage]`) or weakly (`weak`, `weak_odr`, `linkonce`, \
+             `linkonce_odr`), never as `{other}`"
+        )),
+    }
+}
+
 /// The symbol an item of an `extern` block links to, on its crate's target. A target that
 /// does not load is an error: the symbol depends on it.
 pub fn link_name(db: &Db, func: FunctionId) -> Result<Option<String>> {
@@ -3433,36 +3503,53 @@ impl<'db> Relocations<'_, 'db> {
         matches!(self.map, MemoryMap::Complex(_))
     }
 
-    /// Notes that the `size` bytes at `start` of the memory at `kept` are a number.
+    /// Notes that the `size` bytes at `start` of the memory at `kept` are a number. The ranges
+    /// of one memory are kept sorted, disjoint and merged where they touch, so a table of N
+    /// numbers is one range and [`Self::is_number`] is a binary search: a linear scan per word
+    /// made a constant's check quadratic (`half`'s conversion tables held a build 18 minutes).
+    /// A walk goes through a memory in ascending order, so the insert is almost always a push
+    /// or a merge with the last range.
     fn number(&mut self, kept: Option<usize>, start: usize, size: usize) {
-        if size > 0 {
-            // alloc: the numbers of one allocation, for its walk
-            self.numbers.entry(kept).or_insert_with(Vec::new).push((start, start + size));
+        if size == 0 {
+            return;
         }
+        // alloc: the numbers of one allocation, for its walk
+        add_number_range(self.numbers.entry(kept).or_insert_with(Vec::new), start, start + size);
     }
 
     /// Whether a type says every byte of the `word` at `at` of the memory at `kept` is a
-    /// number.
+    /// number: one merged range holds all of them.
     fn is_number(&self, kept: Option<usize>, at: usize, word: usize) -> bool {
-        let Some(ranges) = self.numbers.get(&kept) else { return false };
-        let mut pos = at;
-        // Each step moves `pos` to the end of a range that holds it, so at most one a range.
-        for _ in 0..=ranges.len() {
-            if pos >= at + word {
-                return true;
-            }
-            match ranges.iter().find(|&&(start, end)| start <= pos && pos < end) {
-                Some(&(_, end)) => pos = end,
-                None => return false,
-            }
-        }
-        pos >= at + word
+        self.numbers.get(&kept).is_some_and(|ranges| numbers_cover(ranges, at, at + word))
     }
 
     /// The union the byte at `at` of the memory at `kept` is in, if a walk went through one.
     fn union_at(&self, kept: Option<usize>, at: usize) -> Option<Ty<'db>> {
         (self.unions.iter()).find(|it| it.0 == kept && it.1 <= at && at < it.2).map(|it| it.3)
     }
+}
+
+/// Adds `lo..hi` to `ranges`, kept sorted, disjoint and merged where two touch, so a run of
+/// number bytes is one range. A walk goes through a memory in ascending order, so this is almost
+/// always a push or a merge with the last range.
+fn add_number_range(ranges: &mut Vec<(usize, usize)>, mut lo: usize, mut hi: usize) {
+    // The first range that ends at or after `lo`: it touches or follows the new one.
+    let first = ranges.partition_point(|&(_, end)| end < lo);
+    // Every range from `first` that starts at or before `hi` touches it: merged into one.
+    let mut last = first;
+    while last < ranges.len() && ranges[last].0 <= hi {
+        lo = lo.min(ranges[last].0);
+        hi = hi.max(ranges[last].1);
+        last += 1;
+    }
+    ranges.splice(first..last, [(lo, hi)]);
+}
+
+/// Whether `ranges` (as [`add_number_range`] keeps them) hold every byte of `lo..hi`: merged
+/// ranges never touch, so the run is in exactly one, the last starting at or before `lo`.
+fn numbers_cover(ranges: &[(usize, usize)], lo: usize, hi: usize) -> bool {
+    let after = ranges.partition_point(|&(start, _)| start <= lo);
+    after > 0 && ranges[after - 1].1 >= hi
 }
 
 /// Whether a value of `ty` is a number, with no pointer in it.
@@ -3858,6 +3945,15 @@ const UNRESUMED: i64 = 0;
 const RETURNED: i64 = 1;
 const PANICKED: i64 = 2;
 const SUSPENDED: i64 = 3;
+
+/// The panics of an `async` body polled again after it ended, as rustc's coroutine transform
+/// has them: core's at the first path once it `RETURNED`, at the second once it `PANICKED`.
+/// The one list of them: [`FunctionCx::resumed_after_end`] calls them, and the reference walk
+/// (`v2::refs`) lists them for every `async` body, so the two cannot disagree.
+pub(crate) const RESUMED_AFTER_END: [&[&str]; 2] = [
+    &["panicking", "panic_const", "panic_const_async_fn_resumed"],
+    &["panicking", "panic_const", "panic_const_async_fn_resumed_panic"],
+];
 
 /// The local a body's caller gets the value of. An `async` body computes the value of its
 /// block in the return slot, and hands back a `Poll` of it.
@@ -4839,6 +4935,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     };
                     for (field, ty) in self.cg.db.field_types(variant).iter() {
                         let ty = ty.ty().instantiate(self.interner, subst).skip_norm_wip();
+                        // A field may be a projection the arguments resolve (`T::Inner`).
+                        let ty = self.normalize(ty);
                         let field = layout.fields.offset(u32::from(field.into_raw()) as usize);
                         self.scalar_leaves(ty, offset + field.bytes(), leaves)?;
                     }
@@ -8661,7 +8759,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if track_caller(db, callee) {
             return self.reified(fn_ty, false);
         }
-        let sig = self.interner.instantiate_bound_regions_with_erased(fn_ty.fn_sig(self.interner));
+        let sig = self.abi_sig(fn_ty)?;
         let inputs = Self::abi_inputs(sig.abi(), sig.inputs())?;
         let abi = self.fn_abi(sig.abi(), sig.output(), inputs.iter().copied())?;
         let mut sig = self.signature(&abi.args, abi.ret);
@@ -9223,18 +9321,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// `panic_const_*`, or for a check of an arbitrary width `checked`, core's `panic` with
     /// the message naming it.
     fn panic_if(&mut self, cond: Value, op: OverflowOp, checked: Option<NarrowInt>) -> Result<()> {
-        let name = match op {
-            OverflowOp::Add => "panic_const_add_overflow",
-            OverflowOp::Sub => "panic_const_sub_overflow",
-            OverflowOp::Mul => "panic_const_mul_overflow",
-            OverflowOp::Div => "panic_const_div_overflow",
-            OverflowOp::Rem => "panic_const_rem_overflow",
-            OverflowOp::Neg => "panic_const_neg_overflow",
-            OverflowOp::Shl => "panic_const_shl_overflow",
-            OverflowOp::Shr => "panic_const_shr_overflow",
-            OverflowOp::DivByZero => "panic_const_div_by_zero",
-            OverflowOp::RemByZero => "panic_const_rem_by_zero",
-        };
+        let name = op.panic();
         let panic_block = self.builder.create_block();
         let ok_block = self.builder.create_block();
         self.builder.set_cold_block(panic_block);
@@ -9671,17 +9758,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                             self.ub_check_panic_if(failed, name, &[source])?;
                             None
                         }
-                        AssertKind::Overflow(BinOp::Add, ..) => Some(OverflowOp::Add),
-                        AssertKind::Overflow(BinOp::Sub, ..) => Some(OverflowOp::Sub),
-                        AssertKind::Overflow(BinOp::Mul, ..) => Some(OverflowOp::Mul),
-                        AssertKind::Overflow(BinOp::Div, ..) => Some(OverflowOp::Div),
-                        AssertKind::Overflow(BinOp::Rem, ..) => Some(OverflowOp::Rem),
-                        AssertKind::Overflow(BinOp::Shl, ..) => Some(OverflowOp::Shl),
-                        AssertKind::Overflow(BinOp::Shr, ..) => Some(OverflowOp::Shr),
-                        AssertKind::Overflow(op, ..) => unsupported!("overflow check of {op:?}"),
-                        AssertKind::OverflowNeg(_) => Some(OverflowOp::Neg),
-                        AssertKind::DivisionByZero(_) => Some(OverflowOp::DivByZero),
-                        AssertKind::RemainderByZero(_) => Some(OverflowOp::RemByZero),
+                        AssertKind::Overflow(..)
+                        | AssertKind::OverflowNeg(_)
+                        | AssertKind::DivisionByZero(_)
+                        | AssertKind::RemainderByZero(_) => match OverflowOp::of(msg) {
+                            Some(Ok(op)) => Some(op),
+                            Some(Err(op)) => unsupported!("overflow check of {op:?}"),
+                            None => unsupported!("{msg:?}, which is no arithmetic check"),
+                        },
                     };
                     // A check of an arbitrary width names it in the panic.
                     let checked = match msg {
@@ -10163,6 +10247,34 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.copy(field, src, size);
         }
         Ok(tuple)
+    }
+
+    /// The signature of the fn item or fn pointer type `ty` as its ABI is computed from:
+    /// lifetimes erased and every projection normalized under this function's `ParamEnv`, as
+    /// rustc's `fn_sig_for_fn_abi` normalizes erasing regions. A fn item's declared signature
+    /// can name a projection the instance's arguments resolve, as objc2's `define_class!`
+    /// writes a method's return as `<CGRect as ConvertReturn<()>>::Inner`, and a calling
+    /// convention classifies the type it stands for, never the alias. Where it does not
+    /// normalize, the signature is refused, naming `ty`.
+    fn abi_sig(&self, ty: Ty<'db>) -> Result<rustc_type_ir::FnSig<DbInterner<'db>>> {
+        use rustc_type_ir::TypeVisitableExt;
+        let sig = self.interner.instantiate_bound_regions_with_erased(ty.fn_sig(self.interner));
+        if !sig.has_aliases() {
+            return Ok(sig);
+        }
+        let normalized = hir_ty::next_solver::obligation_ctxt::ObligationCtxt::new(&self.infcx)
+            .deeply_normalize(
+                &hir_ty::next_solver::infer::traits::ObligationCause::dummy(),
+                self.env.param_env,
+                sig,
+            );
+        match normalized {
+            Ok(normalized) if !normalized.has_infer() => Ok(normalized),
+            Ok(normalized) => {
+                unsupported!("the signature of `{ty:?}` normalizes to `{normalized:?}`, unsolved")
+            }
+            Err(why) => unsupported!("the signature of `{ty:?}` does not normalize: {why:?}"),
+        }
     }
 
     /// The types a function with this signature is passed, one by one: the final tuple of a
@@ -10892,11 +11004,55 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.cg.callee(closure, parent_args, self.env, &sig)
     }
 
-    /// The `ReifyShim` of a fn item or fn pointer type.
+    /// The `ReifyShim` of a fn item or fn pointer type, of the item the call resolves to
+    /// ([`Self::resolved_fn_item`]).
     fn reified(&mut self, ty: Ty<'db>, receiver: bool) -> Result<FuncId> {
+        let ty = self.resolved_fn_item(ty)?;
         let sig = self.reify_signature(ty, receiver)?.1;
         let args = GenericArgs::new_from_slice(&[ty.into()]);
         self.cg.callee(InstanceDef::ReifyShim { receiver }, args, self.env, &sig)
+    }
+
+    /// The fn item type of the function a call of the fn item `ty` runs: for a trait method
+    /// named through its trait (`<C as Tr>::f`, monomorphized), the method of the impl its
+    /// arguments select, or the trait's default body where the impl has none, as rustc's
+    /// shims call what `Instance::resolve` gives. A `ReifyShim` is keyed and compiled as the
+    /// function it calls (v2's code identity, `frontend::code_of`, reads the item its type
+    /// names), so a shim of the trait's declaration would be one of a function with no body,
+    /// and one of a default body the impl overrides would be keyed by the wrong code. Every
+    /// other type, and a call whose callee is not a plain function (`dyn`'s vtable slot, a
+    /// builtin derive, the compiler's `Clone` or `FnPtr`, an `async` block's `poll`), is `ty`
+    /// itself: the shim's body resolves those as any call does (`call_direct`).
+    fn resolved_fn_item(&self, ty: Ty<'db>) -> Result<Ty<'db>> {
+        let TyKind::FnDef(def, generic_args) = ty.kind() else {
+            return Ok(ty);
+        };
+        let CallableDefId::FunctionId(func) = def.0 else {
+            return Ok(ty);
+        };
+        let generic_args = generic_args.skip_binder();
+        let db = self.cg.db;
+        if FunctionSignature::is_intrinsic(db, func) {
+            return Ok(ty);
+        }
+        let callee =
+            dispatch::callee(&self.infcx, self.env, func, generic_args).map_err(|why| {
+                CodegenError::Refused(no_impl_method(db, func, generic_args, why))
+            })?;
+        Ok(match callee {
+            dispatch::Callee::Fn(callee, callee_args)
+                if callee != func || callee_args != generic_args =>
+            {
+                let def = CallableDefId::FunctionId(callee).into();
+                Ty::new_fn_def(self.interner, def, callee_args)
+            }
+            dispatch::Callee::Fn(..)
+            | dispatch::Callee::Poll(..)
+            | dispatch::Callee::Virtual
+            | dispatch::Callee::Derived(..)
+            | dispatch::Callee::CloneBuiltin(_)
+            | dispatch::Callee::FnPtr(_) => ty,
+        })
     }
 
     /// What a `ReifyShim` is called with and how.
@@ -10908,7 +11064,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if !matches!(ty.kind(), TyKind::FnDef(..) | TyKind::FnPtr(..)) {
             unsupported!("Fn-trait vtable of {ty:?}");
         }
-        let fn_sig = self.interner.instantiate_bound_regions_with_erased(ty.fn_sig(self.interner));
+        let fn_sig = self.abi_sig(ty)?;
         if fn_sig.c_variadic() {
             unsupported!("shim for a variadic function");
         }
@@ -15447,14 +15603,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         // rustc's panic here unwinds straight out (`UnwindAction::Continue`): it does not
         // poison the state, so a future polled after it returned says so on every poll.
         self.in_cleanup = true;
-        for (block, name) in [
-            (returned, "panic_const_async_fn_resumed"),
-            (panicked, "panic_const_async_fn_resumed_panic"),
-        ] {
+        for (block, path) in [returned, panicked].into_iter().zip(RESUMED_AFTER_END) {
             self.builder.set_cold_block(block);
             self.builder.switch_to_block(block);
             let location = self.caller_location()?;
-            self.call_panic(&["panicking", "panic_const", name], &[location])?;
+            self.call_panic(path, &[location])?;
             self.builder.ins().trap(TrapCode::user(1).expect("non-zero trap code"));
         }
         self.in_cleanup = false;
@@ -16622,6 +16775,47 @@ type LaneValues = smallvec::SmallVec<[Value; 64]>;
 #[cfg(test)]
 #[global_allocator]
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
+#[cfg(test)]
+mod number_ranges {
+    use super::{add_number_range, numbers_cover};
+
+    /// The merged ranges answer as the byte set they stand for: every byte of `lo..hi` was
+    /// added. Ranges in a scrambled order, touching, overlapping and apart, against a byte
+    /// model; and a table of many numbers stays one range.
+    #[test]
+    fn number_ranges_answer_as_the_bytes_they_hold() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n) as usize
+        };
+        for _ in 0..200 {
+            let mut ranges = Vec::new();
+            let mut bytes = [false; 96];
+            for _ in 0..next(12) {
+                let lo = next(90);
+                let hi = lo + 1 + next(6);
+                add_number_range(&mut ranges, lo, hi);
+                bytes[lo..hi].iter_mut().for_each(|b| *b = true);
+            }
+            assert!(ranges.windows(2).all(|w| w[0].1 < w[1].0), "sorted, apart: {ranges:?}");
+            for lo in 0..88 {
+                for word in [1, 4, 8] {
+                    let want = bytes[lo..lo + word].iter().all(|&b| b);
+                    assert_eq!(numbers_cover(&ranges, lo, lo + word), want, "{ranges:?} {lo} {word}");
+                }
+            }
+        }
+        let mut table = Vec::new();
+        for i in 0..65_536 {
+            add_number_range(&mut table, i * 4, i * 4 + 4);
+        }
+        assert_eq!(table, [(0, 65_536 * 4)]);
+    }
+}
 
 #[cfg(test)]
 mod tests {

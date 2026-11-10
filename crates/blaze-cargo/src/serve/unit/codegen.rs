@@ -48,8 +48,15 @@ pub(crate) enum Makes {
     Shared { proc_macro: bool },
 }
 
-/// What `unit` makes; an error for what blaze does not make.
-pub(crate) fn makes(unit: &Unit) -> Result<Makes, String> {
+/// Whether the build is asked for `unit` itself (a root of its unit graph: a plain `build` or
+/// `--lib` of its package), not only built for what depends on it.
+pub(crate) fn asked(job: &Job, unit: usize) -> bool {
+    job.units().graph.roots.contains(&unit)
+}
+
+/// What `unit` makes, `asked` saying whether the build is asked for it ([`asked`]); an error
+/// for what blaze does not make.
+pub(crate) fn makes(unit: &Unit, asked: bool) -> Result<Makes, String> {
     let target = &unit.target;
     let has = |kind: &str| {
         target.crate_types.iter().any(|it| it == kind) || target.kind.iter().any(|it| it == kind)
@@ -66,11 +73,27 @@ pub(crate) fn makes(unit: &Unit) -> Result<Makes, String> {
     }
     if has("staticlib") || has("dylib") {
         let kind = if has("staticlib") { "staticlib" } else { "dylib" };
-        return Err(format!(
-            "`{}` asks for a `{kind}`, which blaze's linker does not write: crate types `lib`, \
-             `rlib`, `cdylib`, `proc-macro` and `bin` are what it builds",
-            target.name
-        ));
+        // cargo writes every crate type a library lists, a dependency's too, but a dependency's
+        // `staticlib` or `dylib` is a file no step of the build reads: what depends on the
+        // library links its `rlib`, and an archive or dylib in `deps/` is no output a program
+        // links (only an artifact dependency would name one). So a library a
+        // build only depends on, which is also an `rlib` (`lib`), is built as that rlib and
+        // nothing else; the programs that link it behave as under cargo (tree-sitter-highlight's
+        // `crate-type = ["lib", "staticlib"]`). Where the build is asked for the library itself,
+        // or it has no rlib to link, the file is what is asked for, and this linker does not
+        // write it: an error naming it, never a build that quietly leaves it out.
+        let rlib = has("lib") || has("rlib");
+        if asked || !rlib {
+            let why = match asked {
+                true => "the build is asked for this library",
+                false => "it has no `lib` or `rlib` its dependents could link instead",
+            };
+            return Err(format!(
+                "`{}` asks for a `{kind}`, which blaze's linker does not write ({why}): crate \
+                 types `lib`, `rlib`, `cdylib`, `proc-macro` and `bin` are what it builds",
+                target.name
+            ));
+        }
     }
     Ok(Makes::Library)
 }
@@ -2123,16 +2146,26 @@ fn relink(
     patchable.sort_unstable();
     let mut names: Vec<(String, Target)> =
         Vec::with_capacity(built.symbols.len() + built.static_symbols.len());
-    for (key, name) in &built.symbols {
+    // The names Rust defines weakly (`#[linkage = "weak"]`, as compiler-builtins' are): a
+    // strong definition beside them wins the link, as it would under ld64 or lld.
+    let mut weak_names: Vec<String> = Vec::new(); // alloc: per link, the few weak names
+    for (key, name, linkage) in &built.symbols {
         let target = match patchable.binary_search(key).is_ok() {
             true => Target::Function(*key),
             false => Target::Direct(*key),
         };
+        if *linkage == blaze_codegen::Linkage::Weak {
+            weak_names.push(name.clone()); // clone: the few weak names, once per link
+        }
         names.push((name.clone(), target));
     }
-    for (item, instance, name) in &built.static_symbols {
+    for (item, instance, name, linkage) in &built.static_symbols {
+        if *linkage == blaze_codegen::Linkage::Weak {
+            weak_names.push(name.clone()); // clone: the few weak names, once per link
+        }
         names.push((name.clone(), Target::Static { item: *item, instance: *instance }));
     }
+    weak_names.sort_unstable();
     let (slots, slotted) = match linked.output.live {
         Some(_) => edited_slots(&linked.slotted, &patchable, &built.identities, &built.debug_names)
             // alloc: error path
@@ -2141,7 +2174,8 @@ fn relink(
     };
     let mut now_named: Vec<&str> = names.iter().map(|it| it.0.as_str()).collect();
     let (kept_names, unnamed) = renamed(std::mem::take(&mut linked.names), &mut now_named);
-    let given = given_id(&names, &side.debug_names, &side.spans, &built.cold, &native_ids);
+    let given =
+        given_id(&names, &weak_names, &side.debug_names, &side.spans, &built.cold, &native_ids);
     // Nothing to link: every row kept, the same names, natives and span tables, and a file
     // patched in place (no code memory, no slots). Staging it would make a new generation
     // whose file differs only in its build id, so an image whose inputs did not change (a
@@ -2191,6 +2225,7 @@ fn relink(
             .collect(),
         removed_statics: gone_statics.iter().map(|row| (row.0, row.1)).collect(),
         names,
+        weak_names,
         unnamed,
         // clone: once per image linked, a unit links one or two
         debug_names: side.debug_names.clone(),
@@ -2312,10 +2347,12 @@ fn tests_table(
 }
 
 /// What a link is given besides its function and static rows, as one id: each name and what
-/// it names, the debug names, the span tables, the cold functions and the natives in their
-/// order. Two links of one image with the same rows and this id stage the same image.
+/// it names, which names are weak, the debug names, the span tables, the cold functions and the
+/// natives in their order. Two links of one image with the same rows and this id stage the same
+/// image.
 fn given_id(
     names: &[(String, Target)],
+    weak_names: &[String],
     debug_names: &[(InstanceKey, String)],
     spans: &[(ContentId, Vec<u8>)],
     cold: &[InstanceKey],
@@ -2333,6 +2370,11 @@ fn given_id(
             // it is, so it can never match a link that named something else.
             other => hasher.update(&[3]).part(format!("{other:?}").as_bytes()), // alloc: never reached by `relink`'s names
         };
+    }
+    // A name turning weak changes who wins it, so it is an input of the link.
+    hasher.update(&(weak_names.len() as u64).to_le_bytes());
+    for name in weak_names {
+        hasher.part(name.as_bytes());
     }
     hasher.update(&(debug_names.len() as u64).to_le_bytes());
     for (key, name) in debug_names {

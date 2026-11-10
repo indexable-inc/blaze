@@ -1002,10 +1002,12 @@ span_kinds! {
         /// One run of a daemon plane task on a thread (`blaze_cargo::serve::plane`): `kind` its
         /// task kind and subsystem (`unit bodies (infer)`), `node` the plane node it ran as,
         /// `granted` the memory the plane granted it (its predicted peak) and `passed` the
-        /// times it was passed over for memory before it started; as it ends, `peak` the most
-        /// it held, and `heap_allocated` and `heap_freed` what it allocated and freed of the
-        /// global heap in all. The unit phase and query spans of its work are under it.
-        Task = "task" { kind: Name => Function, node: u64 => Node, granted: u64 => GrantedBytes, passed: u64 => Passed }
+        /// times it was passed over for memory before it started, `krate` and `unit` the unit
+        /// it is a phase of as the unit phase spans name it (none for a task of no unit); as
+        /// it ends, `peak` the most it held, and `heap_allocated` and `heap_freed` what it
+        /// allocated and freed of the global heap in all. The unit phase and query spans of its
+        /// work are under it.
+        Task = "task" { kind: Name => Function, node: u64 => Node, granted: u64 => GrantedBytes, passed: u64 => Passed, krate: Option<Name> => Crate, unit: Option<Name> => Unit }
             => TaskEnded { peak: Option<u64> => PeakBytes, heap_allocated: Option<u64> => HeapAllocated, heap_freed: Option<u64> => HeapFreed }
         /// A daemon plane task's wait for admission (`blaze_cargo::serve::plane`): from the
         /// step its node became ready to the step it started, `kind` its task kind as its

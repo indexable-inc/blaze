@@ -905,6 +905,13 @@ pub trait Front<S: Steps>: Send + Sync + 'static {
     /// The error that unit `unit` can't be made, saying `what`: a diagnostic of the unit,
     /// named and rendered as its others are, for a compile that panicked.
     fn refused(&self, unit: usize, what: String) -> Diagnostic;
+    /// On a worker, as a phase task of unit `unit` starts: the unit's crate (its target's
+    /// name) and the unit as its phase spans name it (`serde v1.0.219 (lib)`), for its `task`
+    /// span. `None` for a front that names no units.
+    fn subject(&self, unit: usize) -> Option<(String, String)> {
+        let _ = unit;
+        None
+    }
     /// On the loop: the run of build script unit `unit` (mode `RunCustomBuild`). Its run
     /// reports [`Response::BuildScript`] (and cargo's warnings as diagnostics), and before it
     /// ends applies its directives as cargo does to the units they reach (`rustc-cfg`,

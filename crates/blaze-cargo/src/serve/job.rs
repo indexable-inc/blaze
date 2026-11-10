@@ -444,6 +444,13 @@ impl<S: Steps> plane::Work for Step<S> {
     type Value = Value<S>;
     type Readers = Readers<S>;
 
+    fn subject(&self, arg: u32) -> Option<(String, String)> {
+        match &self.does {
+            Does::Compile { front, .. } => front.subject(Phase::of(arg).0),
+            _ => None,
+        }
+    }
+
     fn run(&self, arg: u32, readers: Readers<S>) -> Option<Did<Value<S>>> {
         let at = arg as usize;
         let _span = match &self.does {
@@ -4491,6 +4498,8 @@ impl<S: Steps> Jobs<S> {
         // request stays open after it.
         let applying = job.applying.is_some();
         let all = &input.units.graph.units;
+        // The units the build is asked for (`codegen::asked`), which a program key reads.
+        let all_roots = &input.units.graph.roots;
         let picked = match picked {
             None => None,
             Some(picked) => {
@@ -4622,7 +4631,7 @@ impl<S: Steps> Jobs<S> {
                 };
                 // A program's codegen and link are each admitted by what that program's held,
                 // one never measured alone.
-                match program.zip(super::unit::program_key(unit, phase)) {
+                match program.zip(super::unit::program_key(unit, all_roots.contains(&at), phase)) {
                     Some((kind, key)) => _ = w.plane.push_program(&mut nodes, spec, kind, arg, key),
                     None => {
                         let learn = super::unit::cost_key(unit, Some(phase));

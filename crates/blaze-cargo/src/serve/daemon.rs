@@ -98,11 +98,15 @@ pub(super) const LAST_EFFECTS: Duration = Duration::from_secs(2);
 const PLOT_EVERY: Duration = Duration::from_millis(10);
 /// How often the memory by tag goes to the log while the daemon works, at most.
 const MEMORY_LOG_EVERY: Duration = Duration::from_secs(30);
-/// How often, at most, the daemon past its limit's line asks every thread to give back the free
-/// pages its heaps keep (`blaze_mem::tag::give_back_heap`), between releases or with none due
-/// (a check's build releases nothing): a forced collect of each thread's heaps costs it a walk
-/// of their pages, so not at every plot.
+/// How often, at most, the daemon past its limit's line, past [`KEPT_HIGH_WATER`] or pressed
+/// asks the purger for a purge (`crate::raw::memory::Purger::ask`), between releases or with
+/// none due (a check's build releases nothing): a forced collect of each thread's heaps costs
+/// it a walk of their pages, so not at every plot.
 const GIVE_BACK_EVERY: Duration = Duration::from_secs(1);
+/// The share of the budget past which the allocators' kept free pages
+/// ([`blaze_graph::arena::kept_of`]) get a purge whatever the footprint: one in 4. Freed pages
+/// kept past it are memory admission cannot grant and the ceiling counts.
+const KEPT_HIGH_WATER: u64 = 4;
 /// How often, at most, the daemon looks for builds held back for memory to tell their clients
 /// ([`Jobs::tell_paused`]): a quarter of the second a build waits before it is told.
 const PAUSED_EVERY: Duration = Duration::from_millis(250);
@@ -2126,7 +2130,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 }
                 if now.saturating_sub(self.given_back) >= GIVE_BACK_EVERY {
                     self.given_back = now;
-                    blaze_mem::tag::give_back_heap();
+                    crate::raw::memory::purger().ask();
                 }
             }
             Done::Unwatched => self.pressure_watched = false,
@@ -2228,13 +2232,22 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         if let Some(bytes) = crate::raw::memory::footprint(std::process::id()) {
             blaze_profile::plot(Plot::Footprint, bytes);
+            let kept = blaze_graph::arena::kept_of(&memory, bytes);
+            blaze_profile::plot(Plot::AllocatorKeptBytes, kept);
             let limit = blaze_graph::admission::limit();
             let pressure = blaze_graph::admission::Pressure { held: bytes, limit, over: None };
-            if pressure.squeezed() && now.saturating_sub(self.given_back) >= GIVE_BACK_EVERY {
+            // Past the limit's line, or keeping more than a quarter of the budget freed (the
+            // high water): the purger's thread gives it back, never the loop, since a purge
+            // waits for each worker's heaps ([`crate::raw::memory::purge`]).
+            let high_water = kept > limit / KEPT_HIGH_WATER;
+            if (pressure.squeezed() || high_water)
+                && now.saturating_sub(self.given_back) >= GIVE_BACK_EVERY
+            {
                 self.given_back = now;
-                blaze_mem::tag::give_back_heap();
+                crate::raw::memory::purger().ask();
             }
         }
+        blaze_profile::plot(Plot::AllocatorPurgedBytes, crate::raw::memory::purged_bytes());
         blaze_profile::plot(Plot::CommittedBytes, memory.committed);
         blaze_profile::plot(Plot::ReservedBytes, memory.reserved);
         let (span_map_bytes, span_map_pieces) = ::span::kept_maps();

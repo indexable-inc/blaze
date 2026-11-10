@@ -620,15 +620,20 @@ fn value_of(state: &State, mut sym: Sym) -> Option<(u64, Kind, u64)> {
     None
 }
 
-/// Every global name the image defines, sorted by name: Rust's, strong and after every
-/// native, then the natives' as resolution chose them.
+/// Every global name the image defines, sorted by name: Rust's, after every native, strong
+/// or weak as Rust defines them, then the natives' as resolution chose them. A weak Rust name
+/// a native defines strongly is the native's.
 fn names(state: &State, symbols: &Symbols) -> Vec<(String, Def)> {
     let natives = state.resolved.native_defs(&state.inputs);
     // alloc: the answer's names, once per prelink or layout
     let mut out: Vec<(String, Def)> = Vec::with_capacity(state.names.len());
-    for (name, target) in state.names.iter() {
-        let Some((value, kind, size)) = value_of(state, *target) else { continue };
-        let def = Def { value, size, kind, strength: Strength::Strong, order: u32::MAX };
+    for (name, it) in state.names.iter() {
+        if it.weak && !rust_takes(state, symbols, *name, it.target) {
+            continue;
+        }
+        let Some((value, kind, size)) = value_of(state, it.target) else { continue };
+        let strength = if it.weak { Strength::Weak } else { Strength::Strong };
+        let def = Def { value, size, kind, strength, order: u32::MAX };
         // alloc: the answer owns its names, once per name
         out.push((symbols.str(*name).to_owned(), def));
     }
@@ -648,8 +653,17 @@ fn names(state: &State, symbols: &Symbols) -> Vec<(String, Def)> {
     out
 }
 
+/// Whether the name Rust defines as `target` is defined as Rust's: a weak one is not when a
+/// native or the image beside defines it strongly ([`crate::native`]).
+fn rust_takes(state: &State, symbols: &Symbols, name: crate::symbols::NameId, target: Sym) -> bool {
+    symbols
+        .find(SymKey::Name(name))
+        .is_some_and(|sym| state.def(sym) == state::Def::Alias(target))
+}
+
 /// The cells the run binds: those to imports (GOT cells, pointers in data), and those to a
-/// name the image defines only weakly, which a strong definition beside wins. With them, the
+/// name the image defines only weakly, which a strong definition beside wins: a native's or
+/// Rust's. With them, the
 /// weakly defined names the image reaches some other way ([`Prelinked::reached_directly`]).
 fn binds(state: &State, symbols: &Symbols) -> Result<(Vec<Bind>, Vec<String>), LinkError> {
     let imports = &state.resolved.imports;
@@ -693,9 +707,14 @@ fn binds(state: &State, symbols: &Symbols) -> Result<(Vec<Bind>, Vec<String>), L
             weak: import.weak,
         });
     }
-    // alloc: the weakly defined natives, once per prelink
-    let weak: HashSet<Sym, Global> =
+    // alloc: the weakly defined natives and Rust names, once per prelink
+    let mut weak: HashSet<Sym, Global> =
         state.resolved.native_defs(&state.inputs).filter(|it| it.weak).map(|it| it.sym).collect();
+    for (name, it) in state.names.iter() {
+        if it.weak && rust_takes(state, symbols, *name, it.target) {
+            weak.extend(symbols.find(SymKey::Name(*name)));
+        }
+    }
     if !weak.is_empty() {
         for piece in state.live_pieces() {
             let name = |sym: Sym| symbols.name_of(sym).map(str::to_owned);
@@ -892,7 +911,7 @@ impl<'a> Stage<'a> {
             let piece = self.new.piece(id).expect("a fresh piece is live");
             wanted.extend(piece.fixups().iter().map(|it| it.target).filter(rust));
         }
-        wanted.extend(self.new.names.values().copied().filter(rust));
+        wanted.extend(self.new.names.values().map(|it| it.target).filter(rust));
         wanted.sort_unstable_by_key(|it| it.0);
         wanted.dedup();
         for sym in wanted {
