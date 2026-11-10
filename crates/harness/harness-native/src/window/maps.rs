@@ -172,40 +172,8 @@ define_class!(
         /// Open button, and any other annotation as MapKit's own (nil).
         #[unsafe(method_id(mapView:viewForAnnotation:))]
         fn view_for(&self, _map: &MKMapView, annotation: &AnyObject) -> Option<Retained<NSView>> {
-            let pin = annotation.downcast_ref::<MapPin>()?;
-            let mtm = self.mtm();
-            let none: Option<&NSString> = None;
-            if pin.ivars().here {
-                // SAFETY: MKAnnotationView's designated initialiser, with a live annotation and no reuse identifier.
-                let dot: Retained<MKAnnotationView> =
-                    unsafe { msg_send![MKAnnotationView::alloc(mtm), initWithAnnotation: annotation, reuseIdentifier: none] };
-                dot.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(DOT, DOT)));
-                dot.setWantsLayer(true);
-                if let Some(l) = dot.layer() {
-                    l.setCornerRadius(DOT / 2.0);
-                    l.setBackgroundColor(Some(&NSColor::systemBlueColor().CGColor()));
-                    l.setBorderColor(Some(&NSColor::whiteColor().CGColor()));
-                    l.setBorderWidth(DOT_RING);
-                }
-                return Some(dot.into_super());
-            }
-            if pin.ivars().href.is_empty() {
-                return None;
-            }
-            // SAFETY: MKAnnotationView's designated initialiser, as above.
-            let marker: Retained<MKMarkerAnnotationView> =
-                unsafe { msg_send![MKMarkerAnnotationView::alloc(mtm), initWithAnnotation: annotation, reuseIdentifier: none] };
-            let target: &AnyObject = self;
-            // SAFETY: this delegate implements `openPin:`, taking the button; it outlives every map (Maps holds it).
-            let open = unsafe { NSButton::buttonWithTitle_target_action(ns_string!("Open"), Some(target), Some(sel!(openPin:)), mtm) };
-            // The page it opens, said under the pointer and read back by `openPin:`.
-            open.setToolTip(Some(&NSString::from_str(&pin.ivars().href)));
-            // SAFETY: MKAnnotationView's setters: a BOOL, and a view it retains.
-            unsafe {
-                let _: () = msg_send![&*marker, setCanShowCallout: true];
-                let _: () = msg_send![&*marker, setRightCalloutAccessoryView: &*open];
-            }
-            Some(marker.into_super().into_super())
+            // In a method of its own: an early return cannot leave the macro's method body.
+            self.annotation_view(annotation)
         }
 
         /// A callout's Open button: its place's page opens as a chat's link does, in the browser pane.
@@ -222,6 +190,44 @@ define_class!(
 );
 
 impl MapDelegate {
+    /// What `mapView:viewForAnnotation:` answers.
+    fn annotation_view(&self, annotation: &AnyObject) -> Option<Retained<NSView>> {
+        let pin = annotation.downcast_ref::<MapPin>()?;
+        let mtm = self.mtm();
+        let none: Option<&NSString> = None;
+        if pin.ivars().here {
+            // SAFETY: MKAnnotationView's designated initialiser, with a live annotation and no reuse identifier.
+            let dot: Retained<MKAnnotationView> =
+                unsafe { msg_send![MKAnnotationView::alloc(mtm), initWithAnnotation: annotation, reuseIdentifier: none] };
+            dot.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(DOT, DOT)));
+            dot.setWantsLayer(true);
+            if let Some(l) = dot.layer() {
+                l.setCornerRadius(DOT / 2.0);
+                l.setBackgroundColor(Some(&NSColor::systemBlueColor().CGColor()));
+                l.setBorderColor(Some(&NSColor::whiteColor().CGColor()));
+                l.setBorderWidth(DOT_RING);
+            }
+            return Some(dot.into_super());
+        }
+        if pin.ivars().href.is_empty() {
+            return None;
+        }
+        // SAFETY: MKAnnotationView's designated initialiser, as above.
+        let marker: Retained<MKMarkerAnnotationView> =
+            unsafe { msg_send![MKMarkerAnnotationView::alloc(mtm), initWithAnnotation: annotation, reuseIdentifier: none] };
+        let target: &AnyObject = self;
+        // SAFETY: this delegate implements `openPin:`, taking the button; it outlives every map (Maps holds it).
+        let open = unsafe { NSButton::buttonWithTitle_target_action(ns_string!("Open"), Some(target), Some(sel!(openPin:)), mtm) };
+        // The page it opens, said under the pointer and read back by `openPin:`.
+        open.setToolTip(Some(&NSString::from_str(&pin.ivars().href)));
+        // SAFETY: MKAnnotationView's setters: a BOOL, and a view it retains.
+        unsafe {
+            let _: () = msg_send![&*marker, setCanShowCallout: true];
+            let _: () = msg_send![&*marker, setRightCalloutAccessoryView: &*open];
+        }
+        Some(marker.into_super().into_super())
+    }
+
     fn new(mtm: MainThreadMarker) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(());
         // SAFETY: init is NSObject's designated initialiser.
