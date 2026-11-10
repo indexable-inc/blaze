@@ -42,7 +42,7 @@ test("the page is one document: the vendored MapLibre GL inline, the places as J
   const spec = mapOf({ markers: [{ lat: 1, lon: 2, label: "</script><script>alert(1)</script>" }] });
   if (typeof spec === "string") throw new Error(spec);
   const page = mapPage(spec, lib);
-  expect(page).toContain("https://tiles.openfreemap.org/styles/dark");
+  expect(page).toContain("https://tiles.openfreemap.org/styles/liberty");
   expect(page).toMatch(/fadeDuration: 0/);
   expect(page).not.toContain("<script>alert(1)");
   // Exactly the three scripts the page writes: the spec, MapLibre GL, its own.
