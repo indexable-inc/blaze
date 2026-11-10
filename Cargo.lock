@@ -920,6 +920,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-ext-host"
+version = "0.0.0"
+dependencies = [
+ "base-db",
+ "blaze-diagnostics",
+ "blaze-ext",
+ "blaze-hash",
+ "blaze-ids",
+ "blaze-inproc",
+ "blaze-items",
+ "blaze-lints",
+ "blaze-mem",
+ "blaze-query",
+ "hegeltest",
+ "hir",
+ "hir-def",
+ "hir-expand",
+ "hir-ty",
+ "hir-ty-mir",
+ "panic-in-drop",
+ "rustc_lexer",
+ "syntax",
+ "toml",
+]
+
+[[package]]
 name = "blaze-fetch"
 version = "0.0.0"
 dependencies = [
@@ -5088,6 +5114,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e6eb142958d64335fb0e345c5b9ead2ecd6fc438c307e9d7d3c4fd428dbaf12"
 dependencies = [
  "libm",
+]
+
+[[package]]
+name = "panic-in-drop"
+version = "0.1.0"
+dependencies = [
+ "blaze-ext",
 ]
 
 [[package]]

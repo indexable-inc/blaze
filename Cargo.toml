@@ -356,6 +356,7 @@ blaze-codegen-code = { path = "crates/blaze-codegen-code" }
 blaze-dbsp = { path = "crates/blaze-dbsp" }
 blaze-diagnostics = { path = "crates/blaze-diagnostics", version = "0.0.0" }
 blaze-ext = { path = "crates/blaze-ext" }
+blaze-ext-host = { path = "crates/blaze-ext-host" }
 blaze-fetch = { path = "crates/blaze-fetch" }
 blaze-format = { path = "crates/blaze-format" }
 blaze-hash = { path = "crates/blaze-hash" }

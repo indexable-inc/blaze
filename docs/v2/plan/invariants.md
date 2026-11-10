@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-8 invariants, 0 refinements, 1 reference models.
-By level: 1 tested, 7 simulated, 0 model-checked, 0 proved.
+11 invariants, 1 refinements, 2 reference models.
+By level: 5 tested, 7 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
@@ -29,6 +29,15 @@ By level: 1 tested, 7 simulated, 0 model-checked, 0 proved.
 - **`every_reaped_child_is_reported_under_interruption`** *simulated* (`crates/blaze-core/src/wait/tests.rs`): whatever interrupts the wait and whenever the child exits, every child is reaped once and its exit reported, by the reap's deadline or after it.
   Controls: `a_retry_with_the_first_timeout`, `a_lost_wakeup`, `a_reaped_child_never_reported`.
 
+### blaze-ext-host
+
+- **`facts_equal_the_reference_fixpoint_after_any_edits`** *tested* (`crates/blaze-ext-host/src/facts/tests.rs`): after any edits, rewirings and switches of extension, against whatever an earlier solve kept, every fact of every item equals the least fixpoint of its function over the call graph as it stands; a solve with nothing kept gives the same bytes; and a solve after no change computes nothing.
+  Controls: `a_fact_not_recomputed_when_a_callee_s_fact_changed`, `a_cache_hit_across_two_extensions_code_identities`.
+- **`the_key_covers_blaze_the_source_and_the_grants`** *tested* (`crates/blaze-ext-host/src/key.rs`): a build's key changes with each of its inputs, and with nothing else.
+  Controls: `a_key_that_leaves_blaze_out`.
+- **`two_builds_give_the_same_diagnostics`** *tested* (`crates/blaze-ext-host/src/tests.rs`): two checks of the same source, on two databases, give the same diagnostics, byte for byte, in the same order; and so does a check that runs every job twice with its arena elsewhere.
+  Controls: `an_extension_that_misses_a_finding`, `a_result_that_depends_on_an_address`.
+
 ### blaze-graph
 
 - **`live_grants_fit_the_machine_budget_after_any_crash`** *tested* (`crates/blaze-graph/src/ledger/tests.rs`): whatever crashes, restarts and pid reuse, the live daemons' grants never sum past the machine budget, none grants room the ledger does not hold for it, none admits while the others' charges fill the machine, and every task that fits starts.
@@ -41,8 +50,19 @@ By level: 1 tested, 7 simulated, 0 model-checked, 0 proved.
 - **`every_row_is_in_the_history_once_after_any_crash`** *simulated* (`crates/blaze-profile/src/history/files/tests.rs`): whatever the faults, wherever the power goes out, every row handed to the history is listed, handed back or left to read, exactly once, and the history opens.
   Controls: `a_rename_with_no_sync_before`, `what_a_flush_consumed_marked_after_its_commit`.
 
+## Refinements
+
+### blaze-ext-host
+
+- **`the_worked_example_finds_what_the_in_tree_lint_finds`** *tested* (`crates/blaze-ext-host/src/tests.rs`): over the same source, the extension `panic-in-drop` reports exactly what blaze's own `blaze::panic_in_drop` does: the same messages at the same places.
+  Controls: `an_extension_that_misses_a_finding`, `a_result_that_depends_on_an_address`.
+
 ## Reference models
 
 ### blaze-core
 
 - **`Model`** (`crates/blaze-core/src/wheel.rs`): every timer with its deadline and insertion number, fired by sorting.
+
+### blaze-ext-host
+
+- **`reference`** (`crates/blaze-ext-host/src/facts/tests.rs`): every item from its bottom, whole sweeps until one changes nothing. No components, no order, no cache: the least fixpoint by its definition.
