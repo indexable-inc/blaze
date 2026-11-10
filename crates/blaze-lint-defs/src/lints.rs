@@ -9,7 +9,7 @@ use edition::Edition::{Edition2018, Edition2021, Edition2024};
 
 use super::{
     Level::{Allow, Deny, Warn},
-    Lint,
+    Lint, ready,
     Reason::{
         Custom, EditionAndFutureReleaseError, EditionAndFutureReleaseSemanticsChange, EditionError,
         EditionSemanticsChange, FutureReleaseError,
@@ -1075,6 +1075,16 @@ pub(super) const BLAZE: &[Lint] = &[
     l("blaze::thread_local_in_waiting_fn", Allow, "detects a thread-local read in, or inlinable into, a function that may park the fiber, which can keep the first thread's address after resuming on another")
         .externally_loaded(),
     l("blaze::lenient_deserialize", Allow, "detects a struct or enum deriving serde's `Deserialize` without `#[serde(deny_unknown_fields)]`, which silently drops a field of its input it doesn't know")
+        .externally_loaded(),
+    // The lints of code blaze cannot analyse (group `blaze::edition`): each warns by default once
+    // what its help names is in the tree (`ready`), and is allowed until then.
+    l("blaze::proc_macro_derive", ready::level(ready::REFLECTION_REPLACES_MACROS), "detects a derive procedural macro a workspace crate defines, opaque code that rewrites tokens at build time, which a generic impl over the type's fields by compile-time reflection replaces")
+        .externally_loaded(),
+    l("blaze::proc_macro_attribute", ready::level(ready::REFLECTION_REPLACES_MACROS), "detects an attribute procedural macro a workspace crate defines, opaque code that rewrites tokens at build time, which reflection over the item and a generic function replace")
+        .externally_loaded(),
+    l("blaze::proc_macro_fn_like", Warn, "detects a function-like procedural macro a workspace crate defines, opaque code that rewrites tokens at build time, which a `const fn` or a `const` block replaces unless it parses a foreign syntax")
+        .externally_loaded(),
+    l("blaze::build_script_ambient", ready::level(ready::CAPABILITIES_FOR_BUILD_SCRIPTS), "detects a build script of the workspace that reaches the file system, the environment, a process, the network or the clock through the standard library by itself, where a capability it is handed says what it can touch")
         .externally_loaded(),
     // Emitted by the release build, which reads it from the code LLVM made, never by `blaze check`.
     l("blaze::vecreport", Allow, "reports a bounds check, overflow check or panic path the optimizer kept inside a loop, and a loop it left unvectorized with its reason, read from the optimized code; only hot loops when the build has a profile"),

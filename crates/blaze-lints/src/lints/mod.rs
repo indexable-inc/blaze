@@ -953,11 +953,37 @@ mod tests {
             pedantic.intersects(blaze::Lint::DeepDropAtExit.bit())
                 && !pedantic.intersects(blaze::Lint::HashTwice.bit())
         );
+        let (edition, _) = named_in("#[warn(blaze::edition)]");
+        let (macros, _) = named_in("#[allow(blaze::proc_macro)]");
+        assert!(
+            edition.intersects(blaze::Lint::BuildScriptAmbient.bit())
+                && !edition.intersects(blaze::Lint::HashTwice.bit())
+        );
+        assert_eq!(
+            named(macros),
+            [
+                "blaze::proc_macro_attribute",
+                "blaze::proc_macro_derive",
+                "blaze::proc_macro_fn_like",
+            ],
+            "`blaze::proc_macro` is the three macro lints, each of `blaze::edition`"
+        );
+        assert_eq!(macros.without(edition), On::EMPTY);
         assert!(
             !(general.intersects(pedantic) || internal.intersects(pedantic)),
             "the kinds are disjoint"
         );
-        assert_eq!(general | internal | pedantic, On::BLAZE, "every blaze lint is of one kind");
+        assert!(
+            !(general.intersects(edition)
+                || internal.intersects(edition)
+                || pedantic.intersects(edition)),
+            "the kinds are disjoint"
+        );
+        assert_eq!(
+            general | internal | pedantic | edition,
+            On::BLAZE,
+            "every blaze lint is of one kind"
+        );
         for text in
             ["notclippy::needless_bool", "clippy::not_a_lint", "clippy needless_bool", "blaze::"]
         {

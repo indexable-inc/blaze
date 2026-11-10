@@ -66,7 +66,9 @@ pub(super) const ALIASES: &[(&str, &str)] = &[("bad_style", "nonstandard_style")
 /// (blaze-lints' `blaze::HOT`, which its tests hold to this); `blaze::general`, the lints on
 /// at `warn` in every workspace; `blaze::internal`, the ones of blaze's own types and
 /// conventions, allowed until a workspace turns them on (blaze-lints' `blaze::Kind`);
-/// `blaze::reach`, the cross-configuration reachability lints, which a workspace makes strict.
+/// `blaze::reach`, the cross-configuration reachability lints, which a workspace makes strict;
+/// `blaze::edition`, what the blaze edition removes (blaze-lints' `blaze::Kind::Edition`), and
+/// `blaze::proc_macro`, the procedural-macro lints among them.
 pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
     (
         "blaze::hot",
@@ -142,6 +144,18 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::vecreport",
         ],
     ),
+    // What the blaze edition removes (docs/v2/plan/design/edition.md), here the code blaze
+    // cannot analyse: allowed until a workspace turns the group on, but for the members whose
+    // advice this blaze already has (`ready`), which warn.
+    (
+        "blaze::edition",
+        &[
+            "blaze::proc_macro_derive",
+            "blaze::proc_macro_attribute",
+            "blaze::proc_macro_fn_like",
+            "blaze::build_script_ambient",
+        ],
+    ),
     (
         "blaze::internal",
         &[
@@ -185,6 +199,12 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
     // The cross-configuration reachability lints (docs/v2/plan/design/multiconfig-check.md), also in
     // `blaze::general`: one name to make them strict, `reach = "deny"`.
     ("blaze::reach", &["blaze::dead", "blaze::test_only", "blaze::cfg_only"]),
+    // The three kinds of procedural macro a workspace crate defines, also in `blaze::edition`:
+    // one name for all of them, `proc_macro = "warn"` or `#![allow(blaze::proc_macro)]`.
+    (
+        "blaze::proc_macro",
+        &["blaze::proc_macro_derive", "blaze::proc_macro_attribute", "blaze::proc_macro_fn_like"],
+    ),
 ];
 
 /// `register_renamed`: the old name and the new.

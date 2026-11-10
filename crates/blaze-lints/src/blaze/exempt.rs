@@ -113,6 +113,12 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::NativeContracts
         // Kept with `#[expect(..)]` on the item: what a format accepts is the type's choice.
         | Lint::LenientDeserialize
+        // Kept with `#[expect(..)]` on the macro's function or the script: a macro and a
+        // script's reach are the item's choice, not one line's.
+        | Lint::ProcMacroDerive
+        | Lint::ProcMacroAttribute
+        | Lint::ProcMacroFnLike
+        | Lint::BuildScriptAmbient
         // A hasher is chosen in the type, or kept with `#[expect(blaze::default_hasher, reason = ..)]`:
         // an allocation's comment says nothing about it.
         | Lint::DefaultHasher => None,

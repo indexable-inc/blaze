@@ -292,13 +292,14 @@ pub(super) fn workspace_lints(
         flags.push(format!("{flag}=blaze::{lint}"));
     }
     // The wide groups first, then the narrow ones (`hot`, part of `internal`; `reach`, part of
-    // `general`), then single lints, each by name: the later flag wins, so `internal = "warn"`
-    // with `hot_alloc = "deny"` denies `hot_alloc`, and `reach = "deny"` outranks `general`.
+    // `general`; `proc_macro`, part of `edition`), then single lints, each by name: the later
+    // flag wins, so `internal = "warn"` with `hot_alloc = "deny"` denies `hot_alloc`, and
+    // `reach = "deny"` outranks `general`.
     let rank = |flag: &String| {
         let name = flag.split_once('=').map_or("", |it| it.1);
         let order = match name {
-            "blaze::general" | "blaze::internal" | "blaze::pedantic_perf" => 0,
-            "blaze::hot" | "blaze::reach" => 1,
+            "blaze::general" | "blaze::internal" | "blaze::pedantic_perf" | "blaze::edition" => 0,
+            "blaze::hot" | "blaze::reach" | "blaze::proc_macro" => 1,
             _ => 2,
         };
         (order, name.to_owned()) // alloc: a sort key of a few flags, once per load

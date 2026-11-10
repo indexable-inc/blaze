@@ -19,6 +19,29 @@ the release build reports, only by its flags). `checkfree`,
 `nopanic`, `noalloc` and `nonblocking` are in `blaze::general` but `deny` by default, and fire
 only on functions marked with their attribute (`#[blaze::checkfree]`, `#[blaze::nopanic]`, ...).
 
+The group `blaze::edition` flags what the blaze edition removes
+([the plan](v2/plan/design/edition.md)). Its lints here are those of code blaze cannot analyse:
+a procedural macro a crate of the workspace defines ([`proc_macro`](#proc_macro), one lint per
+kind, the three also a group of their own, `blaze::proc_macro`) and a build script that uses
+the standard library's ambient IO ([`build_script_ambient`](#build_script_ambient)). Each tells
+code to move to something of blaze's, so each warns by default only once that thing is in the
+tree, and is `allow` until then, saying in its help that the replacement is planned. The
+switches are the two constants of `crates/blaze-lint-defs/src/ready.rs`; a test holds this
+table to the levels the lints have:
+
+| lint | default | the replacement it names | warns by default once |
+|---|---|---|---|
+| `blaze::proc_macro_derive` | `allow` | a generic impl over the type's fields (`for const f in fields_of::<T>()`) | `REFLECTION_REPLACES_MACROS` is `true`: phase 2 of [compile-time reflection](v2/plan/design/comptime.md) is built and its tests pass |
+| `blaze::proc_macro_attribute` | `allow` | reflection over the item and a generic function | the same switch |
+| `blaze::proc_macro_fn_like` | `warn` | a `const fn` or a `const` block; a macro that parses a foreign syntax may stay | now: `const fn` is Rust's |
+| `blaze::build_script_ambient` | `allow` | a capability the script is handed (`Fs`, `Env`, `Process`, `Net`, `Clock`) | `CAPABILITIES_FOR_BUILD_SCRIPTS` is `true`: [blaze's standard library](v2/plan/design/std.md) is in the tree and a build script is handed its capabilities |
+
+`edition = "warn"` (or `#![warn(blaze::edition)]`) turns all four on whatever the switches
+say; `proc_macro = "allow"` (or `#![allow(blaze::proc_macro)]`) turns the three macro lints
+off. They look only at the workspace's own crates, as every lint here does: `blaze check` lints
+the workspace's packages, and a registry or git crate is checked, not linted, its lints capped
+at `allow`. None has a fix: neither rewrite is mechanical.
+
 Several lints come from ideas of the Goose language (no global heap, data stacks, bump
 growth, inline nested data, narrow relative links, variable-size enums, in-place construction
 and `checkfree` functions): `bounded_heap_field`, `box_large_new`, `boxed_recursive_node`,
@@ -278,6 +301,62 @@ relative links.
 (`struct NodeId(u32)`): one allocation, nodes next to each other, freed at once.
 
 **Allowing it.** `#[expect(blaze::boxed_recursive_node, reason = "..")]` on the type.
+
+## `build_script_ambient`
+
+In `blaze::edition`; its default is in [the table above](#the-general-lints).
+
+**What it catches.** A build script of the workspace (`build.rs`, or the file the manifest's
+`build =` names) that uses the standard library's ambient authority, reaching by itself for:
+
+- the file system: a function of `std::fs`, or of its `File`, `OpenOptions`, `DirBuilder`,
+  `ReadDir` or `DirEntry`;
+- the environment: `std::env`'s `var`, `var_os`, `vars`, `vars_os`, `set_var`, `remove_var`,
+  `current_dir`, `set_current_dir`, `args`, `args_os`, `current_exe`, `temp_dir`, `home_dir`;
+- processes: `std::process`'s `Command` and `Child`, `exit`, `abort`, `id`;
+- the network: `std::net`'s `TcpStream`, `TcpListener`, `UdpSocket`;
+- the clock: `Instant::now`, `SystemTime::now`.
+
+A use is a path that names the function, called or not, found by what the path resolves to:
+through a `use`, an alias, a glob or a re-export, never by the text written. There is one
+finding per distinct item per script (a free function, or the type for a type's functions), at
+its first use, with the count of its uses in the whole script:
+
+```text
+warning: `std::env::var`, used 2 times in this build script, reads or changes the environment by itself
+  = note: a build script that reaches for the file system, the environment or a process by itself cannot be analysed: blaze must run it in a sandbox, trace what it read, and rerun it whenever anything it might have read changes
+  = note: the capability that replaces `std::env::var` is `Env` (`Args` for the command line), of blaze's standard library, which is planned and not in this blaze
+  = help: nothing to change yet: the replacement is a capability the script is handed (`Fs`, `Env`, `Process`, `Net`, `Clock` of blaze's standard library, docs/v2/plan/design/std.md), which states in the script's signature what it can touch, lets blaze prove what it reads, and reruns it only when that changes; that library is not in this blaze, and this lint is `allow` by default until it is
+```
+
+Once the library is in the tree the second note reads "take `Env` (`Args` for the command
+line) as a parameter in place of `std::env::var`" and the help "take the capability as a
+parameter instead (..)".
+
+**Why it matters.** blaze cannot tell what such a script depends on without running it. It runs
+every build script in a sandbox, traces the files and variables it read, and keys the run by
+them ([cargo.md](cargo.md#build-scripts-and-proc-macros-run-in-a-sandbox)); a script that walks
+its environment or starts a program is keyed by all of it. A script that is handed a capability
+states in its signature what it can touch, so what it reads is proved before it runs and it
+reruns only when that changes.
+
+**How to fix it.** Nothing yet, while the lint is `allow` by default: the capabilities are
+[bstd's](v2/plan/design/std.md) (`Fs` and a `Dir` of it, `Env` and `Args`, `Process` and the
+`Runner` that runs a command in a sandbox, `Net`, `Clock`), which is planned. A script that
+only prints constant directives is already read and never run.
+
+**Not found.** `println!("cargo::..")` (and `cargo:..`): that is how a script talks to the
+build, and information, not ambient authority. A method call on a value (`file.set_len(0)`,
+`cmd.status()`): the value came from a path that is counted. A type only named in a signature,
+an item only code a macro wrote uses, and `env!` and `option_env!`, which the compile reads.
+The same code in a crate that is not a build script (that is the edition's `blaze::ambient`,
+not built yet). Whether a script is needed at all is not judged.
+
+**No fix.** Which capability a script is handed, and by whom, is not a mechanical rewrite.
+
+**Allowing it.** `#![allow(blaze::build_script_ambient)]` at the top of the script, or
+`#[expect(blaze::build_script_ambient, reason = "..")]` on the function with the first use of
+an item, which keeps that item's finding.
 
 ## `checkfree`
 
@@ -825,6 +904,62 @@ machine's byte order.
 
 **Why it is off.** The lint can't see whether the values are serialized often enough to
 matter, nor whether the format needs serde's (text, or a fixed byte order).
+
+## `proc_macro`
+
+The group `blaze::proc_macro` of three lints, `proc_macro_derive`, `proc_macro_attribute` and
+`proc_macro_fn_like`, each in `blaze::edition`; their defaults are in
+[the table above](#the-general-lints).
+
+**What it catches.** A procedural macro a crate of the workspace defines: a `#[proc_macro]`,
+`#[proc_macro_derive(..)]` or `#[proc_macro_attribute]` function of a crate with
+`proc-macro = true`. One finding per macro, at the function's name, naming the macro as it is
+called (a derive by the name it is derived by) and its kind:
+
+```text
+warning: the function-like macro `sql` is a procedural macro, which blaze cannot see through
+  = note: a procedural macro is opaque code that runs at build time and rewrites tokens: what it generates is not checked until it is expanded, cannot be analysed or cached per item, and reruns whenever the tokens of its input move
+  = help: a macro that builds data at compile time is a `const fn` or a `const { .. }` block, which blaze checks once, analyses and caches as ordinary code (`core::mem::type_info` answers there, docs/v2/plan/design/comptime.md); a macro that parses a foreign syntax (a DSL in a string or in tokens) is not replaced by reflection and may stay: say so with `#[expect(blaze::proc_macro_fn_like, reason = "parses ..")]`
+```
+
+The first line is the same for "the derive macro `Describe`" and "the attribute macro
+`route`"; the help is the kind's:
+
+| kind | lint | help today |
+|---|---|---|
+| derive | `proc_macro_derive` | "nothing to change yet: the replacement is a generic impl over the type's fields by compile-time reflection (`for const f in fields_of::<T>()`), phase 2 of docs/v2/plan/design/comptime.md, which is behind the opt-in `#![feature(blaze_comptime)]` and not complete in this blaze; this lint is `allow` by default until it is" |
+| attribute | `proc_macro_attribute` | "nothing to change yet: the replacement is reflection over the item (`fields_of::<T>()`, `fn_info(&f)`) and a generic function that does what the generated impls or registrations do, phase 2 of docs/v2/plan/design/comptime.md, which is behind the opt-in `#![feature(blaze_comptime)]` and not complete in this blaze; this lint is `allow` by default until it is" |
+| function-like | `proc_macro_fn_like` | as above |
+
+Once phase 2 is built the first two say what to write: "write the derive as a generic impl over
+the type's fields by compile-time reflection: `for const f in fields_of::<T>()` reading
+`value.[f]`, bounded by `for<F: Field<T>> F::Type: Trait`, under `#![feature(blaze_comptime)]`"
+and "write what the attribute generates as a generic function over the item by compile-time
+reflection: its fields with `for const f in fields_of::<T>()`, a function's facts with
+`fn_info(&f)`".
+
+**Why it matters.** blaze checks, caches and reruns code per item. A procedural macro is a
+program that takes tokens and returns tokens: nothing about what it generates is known until it
+has run, an error in its output is reported in code nobody wrote, and it runs again whenever
+the tokens of its input move, a comment or a reordering included. Code written with
+[compile-time reflection](v2/plan/design/comptime.md) is ordinary typed code, checked once.
+
+**How to fix it.** A function-like macro that builds data at compile time: a `const fn` or a
+`const` block, today. A derive or an attribute macro: nothing yet; phase 1 of reflection
+(`core::mem::type_info`) is in blaze's const evaluator, and phase 2, which replaces them, is
+behind the opt-in `#![feature(blaze_comptime)]` and not complete. A macro that parses a
+foreign syntax (a query language, a template, a grammar in a string or in tokens) is not
+replaced by reflection and may stay.
+
+**Not found.** A use of a macro another crate defines (`#[derive(Serialize)]`): a workspace
+cannot rewrite serde, so only definitions are findings, and there is no lint that lists uses.
+A `macro_rules!` macro, which blaze expands and sees through. A dependency's proc-macro crate,
+which is not linted.
+
+**No fix.** The rewrite is the author's.
+
+**Allowing it.** `#[expect(blaze::proc_macro_fn_like, reason = "parses ..")]` (or the kind's
+lint) on the macro's function, or `#![allow(blaze::proc_macro)]` for the crate.
 
 ## `profile_hot`
 
