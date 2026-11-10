@@ -2294,3 +2294,118 @@ fn a_root_passed_two_ways_is_two_crates_with_two_names() {
         "{refused}"
     );
 }
+
+/// The whole identity and the narrowed identities ([`Lowered::narrowed`]) of the lib and of
+/// the bin that depends on it, in the units of [`units`] lowered from nothing over the view
+/// with the lib's root as `lib`.
+fn narrowed_over(lib: &'static [u8]) -> [(ContentId, super::Narrowed); 2] {
+    let tree = MemTree::default();
+    let root = changed(&tree, &[("a/src/lib.rs", Some(lib))]);
+    let config = config(root, library(&tree));
+    let units = units();
+    let mut front =
+        lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None })
+            .unwrap();
+    [LIB, BIN].map(|unit| {
+        let whole = front.identity(unit).unwrap_or_else(|| panic!("unit {unit} has no identity"));
+        let narrowed = front
+            .narrowed(unit)
+            .unwrap_or_else(|| panic!("unit {unit}, a workspace crate's, has no narrowed identity"));
+        (whole, narrowed)
+    })
+}
+
+/// The lib's root as a plain function, and the same after an edit of each kind.
+const LIB_PLAIN: &[u8] = b"pub fn gen() -> u8 {\n    1\n}\n";
+const LIB_COMMENTED: &[u8] = b"pub fn gen() -> u8 { // made up\n    1 // the value\n}\n";
+const LIB_BODY: &[u8] = b"pub fn gen() -> u8 {\n    2\n}\n";
+const LIB_LINE: &[u8] = b"pub fn gen() -> u8 {\n\n    1\n}\n";
+const LIB_SIGNATURE: &[u8] = b"pub fn gen() -> u16 {\n    1\n}\n";
+
+/// What an edit of the lib's root from [`LIB_PLAIN`] to `lib` must leave as it was and must
+/// move, of the lib's keys and of the bin's above it: the oracle of the narrowed identities.
+/// `comment`: the edit is of comments alone. `body`: of a plain body, keeping its lines.
+/// Any other edit is one every reader observes.
+fn check_edit(lib: &'static [u8], comment: bool, body: bool) -> Result<(), String> {
+    let [(lib_whole, lib_was), (bin_whole, bin_was)] = narrowed_over(LIB_PLAIN);
+    let [(lib_whole_now, lib_now), (bin_whole_now, bin_now)] = narrowed_over(lib);
+    let said = |what: &str| Err(format!("{}: {what}", String::from_utf8_lossy(lib)));
+    // The bytes changed: the whole identities, which the keys of units that read comments
+    // hold, always move.
+    if lib_whole == lib_whole_now || bin_whole == bin_whole_now {
+        return said("a whole identity is as it was");
+    }
+    // What code can observe: a comment edit moves none of it, anything else all of it.
+    if comment != (lib_was.code == lib_now.code) {
+        return said("the lib's code identity");
+    }
+    if comment != (bin_was.code == bin_now.code) {
+        return said("the code identity of the bin, which builds the lib's code");
+    }
+    if comment != (lib_was.checked == lib_now.checked) {
+        return said("the lib's own check's identity");
+    }
+    // What a check of the bin can observe of the lib: its interface, which a comment and a
+    // plain body leave as it was.
+    if (comment || body) != (bin_was.checked == bin_now.checked) {
+        return said("the identity of the bin's check, which reads the lib's interface");
+    }
+    Ok(())
+}
+
+/// The invariant: an edit that leaves a crate's interface as it was (a comment; a plain
+/// function's body that keeps its lines) leaves the key identity of every unit that only
+/// checks against it as it was, and an edit of comments alone leaves every narrowed identity
+/// as it was, in the crate and above it; any other edit (a body, for a unit that builds code;
+/// a line moved; a signature) moves the identity of every unit that can observe it.
+#[test]
+fn a_dependents_key_moves_only_with_what_it_observes_of_a_dependency() {
+    assert_eq!(check_edit(LIB_COMMENTED, true, false), Ok(()));
+    assert_eq!(check_edit(LIB_BODY, false, true), Ok(()));
+    assert_eq!(check_edit(LIB_LINE, false, false), Ok(()));
+    assert_eq!(check_edit(LIB_SIGNATURE, false, false), Ok(()));
+}
+
+/// With a check keyed by its dependencies' code, a plain body's edit moves the checking
+/// dependent's key: the cutoff is gone, and the oracle says where.
+#[test]
+fn the_oracle_catches_a_check_keyed_by_its_dependencies_code() {
+    assert_eq!(check_edit(LIB_BODY, false, true), Ok(()));
+    assert_eq!(
+        crate::code::planting(crate::code::Plant::Deep, || check_edit(LIB_BODY, false, true)),
+        Err(format!(
+            "{}: the identity of the bin's check, which reads the lib's interface",
+            String::from_utf8_lossy(LIB_BODY)
+        ))
+    );
+}
+
+/// With a unit that builds code keyed by its dependencies' interfaces, a body's edit leaves
+/// the program's key as it was, a stale program: the oracle says where.
+#[test]
+fn the_oracle_catches_a_program_keyed_by_its_dependencies_interfaces() {
+    assert_eq!(check_edit(LIB_BODY, false, true), Ok(()));
+    assert_eq!(
+        crate::code::planting(crate::code::Plant::Shallow, || check_edit(LIB_BODY, false, true)),
+        Err(format!(
+            "{}: the code identity of the bin, which builds the lib's code",
+            String::from_utf8_lossy(LIB_BODY)
+        ))
+    );
+}
+
+/// What takes the cutoff away, each kept whole: a dependency that runs at compile time (a
+/// proc macro) is read by its code; a crate that names blaze's extensions, whose proofs read
+/// bodies across crates, gives and takes no interface.
+#[test]
+fn a_crate_whose_bodies_a_check_may_read_gives_no_interface() {
+    let [_, (_, plain)] = narrowed_over(LIB_PLAIN);
+    let [_, (_, body)] = narrowed_over(LIB_BODY);
+    assert_eq!(plain.checked, body.checked);
+    let [_, (_, pure)] = narrowed_over(b"#[blaze::pure]\npub fn gen() -> u8 {\n    1\n}\n");
+    let [_, (_, pure_body)] = narrowed_over(b"#[blaze::pure]\npub fn gen() -> u8 {\n    2\n}\n");
+    assert_ne!(pure.checked, pure_body.checked, "an effect is proved over the body");
+    let [_, (_, inline)] = narrowed_over(b"#[inline]\npub fn gen() -> u8 {\n    1\n}\n");
+    let [_, (_, inline_body)] = narrowed_over(b"#[inline]\npub fn gen() -> u8 {\n    2\n}\n");
+    assert_ne!(inline.checked, inline_body.checked, "an `#[inline]` body");
+}

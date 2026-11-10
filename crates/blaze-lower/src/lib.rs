@@ -1717,7 +1717,10 @@ fn narrow_of(
             }
             hasher.finish()
         };
-        let code = folded(NARROW_CODE, own_code, |it| it.code);
+        let code = match code::planted(code::Plant::Shallow) {
+            true => folded(NARROW_CODE, own_code, |it| it.interface),
+            false => folded(NARROW_CODE, own_code, |it| it.code),
+        };
         // Only a library that runs nowhere at compile time is read through its interface.
         let library = matches!(data.target_kind, base_db::TargetKind::Lib { is_proc_macro: false })
             && const_macros.iter().all(|it| it.krate != at);
@@ -1727,7 +1730,7 @@ fn narrow_of(
             }
             _ => code,
         };
-        let checked = match extends || own.reaches {
+        let checked = match extends || own.reaches || code::planted(code::Plant::Deep) {
             true => code,
             false => folded(NARROW_CHECKED, own_code, |it| it.interface),
         };

@@ -19,6 +19,8 @@
 //! of the code after it (`line!()`, a panic's location, debug info): its shape stays, the count
 //! of its lines and, for a block comment, the bytes and characters of its last line, so every
 //! token after it keeps its line and column.
+//! A plain `//` comment ends its line, so it moves nothing: it and the spaces before it are
+//! left out whole, and adding or removing one at the end of a line changes no code text.
 //!
 //! An attribute is inert, giving its item to no macro, when it is one of the compiler's own
 //! that never runs user code on the item (`inline`, `doc`, `cfg`, `allow`, `repr`, a tool's
@@ -29,6 +31,19 @@
 //!
 //! Files of a library source root (the standard library, registry crates) keep their whole
 //! text: they rarely change, and their outlines would have to be parsed in full.
+//!
+//! # The interface text
+//!
+//! What a crate that only checks against this one can observe of a file
+//! ([`CodeText::interface`]): the code text with each function body no other crate's check
+//! can read ([`plain_body`]) as its shape. It is the crate interface identity of
+//! docs/v2/plan/design/item-hash.md (section 15) as it can be built today: everything such a
+//! dependent observes stays as text (signatures, types, visibility, attributes, re-exports,
+//! macro definitions, generic, `const`, `#[inline]` and `impl Trait` bodies, constants), and
+//! so do positions, through the shapes: a diagnostic that points into this crate, a location
+//! in code instantiated from it and its span tables all read lines and columns, which no
+//! side table holds apart from the code yet. [`crate::Lowered::narrowed`] says which unit
+//! reads which text.
 
 use std::alloc::Global;
 
@@ -574,7 +589,8 @@ impl Masked {
     /// `token`, a comment at `range` of `text`, as its shape: a byte no UTF-8 text has, its
     /// kind, the count of its lines' ends and, for a block comment, the bytes and characters
     /// after its last line's end (all of it on one line): what the line and column of every
-    /// token after it are made of.
+    /// token after it are made of. A plain `//` comment has no shape: it is left out, with
+    /// the spaces before it.
     fn mask(&mut self, text: &str, token: &SyntaxToken) {
         let range = token.text_range();
         let (start, end) = (usize::from(range.start()), usize::from(range.end()));
@@ -585,13 +601,25 @@ impl Masked {
         if comment.contains(READ_IN_COMMENTS) {
             return;
         }
-        self.hasher.update(&text.as_bytes()[self.from..start]);
         let kind: u8 = match token.kind() {
             SyntaxKind::OUTER_DOC_COMMENT => 1,
             SyntaxKind::INNER_DOC_COMMENT => 2,
             _ => 3,
         };
         let block = comment.starts_with("/*");
+        if kind == 3 && !block {
+            // A plain `//` comment runs to its line's end, so nothing is after it on its line:
+            // it, and the spaces and tabs before it, move no token and are no token. Whether
+            // it is there at all is nothing code can observe, so it leaves nothing, where a doc
+            // comment (an attribute of its item) and a block comment (the columns after it)
+            // leave their shape. The line's end after it is text, as every line's.
+            let before = &text.as_bytes()[self.from..start];
+            let kept = before.iter().rposition(|it| !matches!(it, b' ' | b'\t')).map_or(0, |at| at + 1);
+            self.hasher.update(&before[..kept]);
+            self.from = end;
+            return;
+        }
+        self.hasher.update(&text.as_bytes()[self.from..start]);
         self.hasher.update(&[0xFF, kind, u8::from(block)]);
         self.hasher.update(&(comment.matches('\n').count() as u64).to_le_bytes());
         if block {
@@ -611,18 +639,25 @@ impl Masked {
         let body = &text[start..end];
         self.hasher.update(&text.as_bytes()[self.from..start]);
         let last = body.rsplit('\n').next().unwrap_or(body);
+        let lines = match planted(Plant::Positions) {
+            true => 0,
+            false => body.matches('\n').count(),
+        };
         self.hasher
             .update(&[0xFE])
-            .update(&(body.matches('\n').count() as u64).to_le_bytes())
+            .update(&(lines as u64).to_le_bytes())
             .update(&(last.len() as u64).to_le_bytes())
             .update(&(last.chars().count() as u64).to_le_bytes())
             .update(&(last.encode_utf16().count() as u64).to_le_bytes());
         self.from = end;
     }
 
+    /// The hash of the text with what was left out: the rest of the text, and nothing of its
+    /// length, which a comment's own length is part of (until CODE_TEXT 2 it was hashed, so a
+    /// comment edit that made the file longer changed every code text). Each shape starts
+    /// with a byte no text has and has a fixed length, so no two streams read the same.
     fn finish(mut self, text: &str) -> ContentId {
         self.hasher.update(&text.as_bytes()[self.from..]);
-        self.hasher.update(&(text.len() as u64).to_le_bytes());
         self.hasher.finish()
     }
 }
@@ -849,6 +884,60 @@ fn plain_call(node: &SyntaxNode) -> bool {
         })
 }
 
+/// A safeguard of the interface text a test takes away, to see its oracle find the edit the
+/// safeguard is there for (`code/tests.rs`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Plant {
+    /// A body with a type parameter is left out.
+    Generic,
+    /// A `const fn`'s body is left out.
+    Const,
+    /// An `#[inline]` body is left out.
+    Inline,
+    /// A body whose signature hides a type (`impl Trait`) is left out.
+    Hidden,
+    /// A trait's default method's body is left out.
+    Trait,
+    /// A body that defines an item is left out.
+    Items,
+    /// A body that calls a macro of unknown expansion is left out.
+    Macros,
+    /// A left-out body's shape holds no line count.
+    Positions,
+    /// A unit that only checks is keyed by the code of the crates it depends on, not their
+    /// interfaces: no cutoff ([`crate::Narrowed::checked`]).
+    Deep,
+    /// A unit that builds code is keyed by the interfaces of the crates it depends on, not
+    /// their code: a stale program ([`crate::Narrowed::code`]).
+    Shallow,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The safeguard this thread's test took away.
+    static PLANTED: std::cell::Cell<Option<Plant>> = const { std::cell::Cell::new(None) };
+}
+
+/// `run` with `plant` taken away, on this thread.
+#[cfg(test)]
+pub(crate) fn planting<T>(plant: Plant, run: impl FnOnce() -> T) -> T {
+    PLANTED.with(|it| it.set(Some(plant)));
+    let out = run();
+    PLANTED.with(|it| it.set(None));
+    out
+}
+
+/// Whether a test planted `plant`: never, outside this crate's tests.
+#[cfg(test)]
+pub(crate) fn planted(plant: Plant) -> bool {
+    PLANTED.with(|it| it.get() == Some(plant))
+}
+
+#[cfg(not(test))]
+pub(crate) fn planted(_plant: Plant) -> bool {
+    false
+}
+
 /// Whether `body`, a block, is a function's body that no other crate's check can read, so the
 /// crate's interface holds its shape in place of its text. A check of another crate reads a
 /// body of this one only to: infer a type the signature hides (`impl Trait`, `async`, a
@@ -888,17 +977,23 @@ pub(crate) fn plain_body(body: &SyntaxNode) -> bool {
                 | SyntaxKind::FN_KW
                 | SyntaxKind::UNSAFE_KW
                 | SyntaxKind::SAFE_KW
-        ),
+        ) || (token.kind() == SyntaxKind::CONST_KW && planted(Plant::Const)),
         NodeOrToken::Node(node) => match node.kind() {
-            SyntaxKind::ATTR => !node
-                .descendants_with_tokens()
-                .filter_map(NodeOrToken::into_token)
-                .any(|it| it.kind() == SyntaxKind::IDENT && it.text() == "inline"),
+            SyntaxKind::ATTR => {
+                planted(Plant::Inline)
+                    || !node
+                        .descendants_with_tokens()
+                        .filter_map(NodeOrToken::into_token)
+                        .any(|it| it.kind() == SyntaxKind::IDENT && it.text() == "inline")
+            }
             SyntaxKind::VISIBILITY | SyntaxKind::ABI | SyntaxKind::NAME => true,
-            SyntaxKind::GENERIC_PARAM_LIST => lifetimes_only(&node),
-            SyntaxKind::PARAM_LIST | SyntaxKind::RET_TYPE => !node.descendants().any(|it| {
-                matches!(it.kind(), SyntaxKind::IMPL_TRAIT_TYPE | SyntaxKind::MACRO_CALL)
-            }),
+            SyntaxKind::GENERIC_PARAM_LIST => lifetimes_only(&node) || planted(Plant::Generic),
+            SyntaxKind::PARAM_LIST | SyntaxKind::RET_TYPE => {
+                planted(Plant::Hidden)
+                    || !node.descendants().any(|it| {
+                        matches!(it.kind(), SyntaxKind::IMPL_TRAIT_TYPE | SyntaxKind::MACRO_CALL)
+                    })
+            }
             SyntaxKind::BLOCK_EXPR => true,
             _ => false,
         },
@@ -919,15 +1014,16 @@ pub(crate) fn plain_body(body: &SyntaxNode) -> bool {
                 _ => true,
             },
         }),
+        SyntaxKind::TRAIT => planted(Plant::Trait),
         _ => false,
     });
     placed
         && body.descendants().all(|node| match node.kind() {
-            SyntaxKind::MACRO_CALL => plain_call(&node),
+            SyntaxKind::MACRO_CALL => plain_call(&node) || planted(Plant::Macros),
             SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF => false,
             _ => match ast::Attr::cast(node.clone()) {
                 Some(attr) => attr_seen(&attr) == Seen::No,
-                None => ast::Item::cast(node).is_none(),
+                None => ast::Item::cast(node).is_none() || planted(Plant::Items),
             },
         })
 }
