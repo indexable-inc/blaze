@@ -16,6 +16,7 @@ use harness_native_ui_layout_api::{ScrollState, ScrollerGrip, scroll_quietly};
 use harness_native_ui_text_api::{Highlight, TextEdit};
 use crate::pane::Unit;
 use harness_native_render::text::Layout;
+use harness_native_render::markdown;
 use harness_native_ui_input_api::Tooltip;
 use harness_native_ui_look_api::TextStyle;
 use harness_native_ui_text_api::{MarkdownText, Text};
@@ -42,11 +43,30 @@ pub(super) use genui::Live as GenLive;
 pub(super) use peek::Live as PeekLive;
 pub(super) use genui::{GenFeel, GenOn, Prims as GenPrims};
 
+/// A completed `@` mention in a [`Draft`]: one thing, not words. In the draft's text it is the chip as drawn (a
+/// [`HOLE`] its icon stands in, then its label, the path's last part) from byte `at` for `len`; the caret is never
+/// inside it, a selection takes it whole, erasing back over it takes it whole. Sent and copied it is `@<path>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Atom {
+    pub at: usize,
+    pub len: usize,
+    pub path: String,
+}
+
+/// What stands in a draft's text where an atom's icon is drawn (the painter's hole).
+const HOLE: char = harness_native_render::text::HOLE;
+
 /// The text being written in a chat's input: its words, the caret and the selection's other end (byte offsets), and an
 /// input method's marked text at the caret.
+///
+/// The invariant: `atoms` are in order and apart, each on character boundaries of `text` starting with a [`HOLE`]; the
+/// caret and the anchor are never strictly inside one; `text` holds no [`HOLE`] outside an atom and none of the
+/// painter's atom marks.
 #[derive(Clone, Debug, Default)]
 pub struct Draft {
     pub text: String,
+    /// The completed mentions in `text`, in order.
+    pub atoms: Vec<Atom>,
     pub caret: usize,
     pub anchor: usize,
     pub marked: Option<String>,
@@ -111,21 +131,113 @@ impl Draft {
         &self.text[a..b]
     }
 
-    /// Put `s` where the selection is.
+    /// The selection as it is copied: each mention in it as `@<path>`.
+    pub fn picked(&self) -> String {
+        let (a, b) = self.sel();
+        self.wire_of(a, b).0
+    }
+
+    /// Bytes `a..b` of the text as they are sent, saved and copied: each mention as `@<path>`; and where each mention
+    /// starts in that and its path, to make the draft again ([`Self::from_wire`]).
+    fn wire_of(&self, a: usize, b: usize) -> (String, Vec<(usize, String)>) {
+        let (mut out, mut at, mut mentions) = (String::new(), a, Vec::new()); // alloc: the message, made when sent, saved or copied
+        for t in self.atoms.iter().filter(|t| t.at >= a && t.at + t.len <= b) {
+            out.push_str(&self.text[at..t.at]);
+            mentions.push((out.len(), t.path.clone()));
+            out.push('@');
+            out.push_str(&t.path);
+            at = t.at + t.len;
+        }
+        out.push_str(&self.text[at..b]);
+        (out, mentions)
+    }
+
+    /// The whole draft as it is sent, with where its mentions are in that.
+    pub fn wire(&self) -> (String, Vec<(usize, String)>) {
+        self.wire_of(0, self.text.len())
+    }
+
+    /// The draft that sends as `wire`, each of `mentions` (where its `@<path>` starts in `wire`, and the path) an atom
+    /// again; one that is not there as said stays words. The caret at the end.
+    pub fn from_wire(wire: &str, mentions: &[(usize, String)]) -> Self {
+        let mut d = Self::default();
+        let mut at = 0;
+        for (start, path) in mentions {
+            let there = *start >= at && wire.get(*start..).is_some_and(|w| w.strip_prefix('@').is_some_and(|w| w.starts_with(path.as_str())));
+            if !there {
+                continue;
+            }
+            d.insert(&wire[at..*start]);
+            d.insert_atom(path);
+            at = start + 1 + path.len();
+        }
+        d.insert(&wire[at..]);
+        d
+    }
+
+    /// The draft taken to be sent: what it sends, the draft left empty.
+    fn take_wire(&mut self) -> String {
+        let wire = self.wire().0;
+        *self = Self::default();
+        wire
+    }
+
+    /// The atom byte `i` is strictly inside, as its start and end.
+    fn atom_over(&self, i: usize) -> Option<(usize, usize)> {
+        self.atoms.iter().find(|t| t.at < i && i < t.at + t.len).map(|t| (t.at, t.at + t.len))
+    }
+
+    /// Byte `i`, or the nearer edge of the atom it is inside.
+    fn snap(&self, i: usize) -> usize {
+        self.atom_over(i).map_or(i, |(a, b)| if i - a <= b - i { a } else { b })
+    }
+
+    /// Put mention `path` where the selection is, as one atom: its chip's hole and label.
+    pub fn insert_atom(&mut self, path: &str) {
+        self.insert("");
+        let at = self.caret;
+        let mut chip = String::from(HOLE); // alloc: one chip's words, on a completion
+        chip.extend(harness_native_ui_inline::tail(path).chars().filter(|c| !c.is_control() && !marks(*c)));
+        let len = chip.len();
+        self.text.insert_str(at, &chip);
+        for t in self.atoms.iter_mut().filter(|t| t.at >= at) {
+            t.at += len;
+        }
+        let k = self.atoms.partition_point(|t| t.at < at);
+        self.atoms.insert(k, Atom { at, len, path: path.to_owned() });
+        (self.caret, self.anchor, self.goal) = (at + len, at + len, None);
+    }
+
+    /// Put `s` where the selection is: the mentions in the selection go with it, those after it move. What only an atom
+    /// may hold is not typed or pasted in: a no-break space comes in as a space, the painter's marks not at all.
     pub fn insert(&mut self, s: &str) {
         let (a, b) = self.sel();
+        let clean: std::borrow::Cow<'_, str> = if s.chars().any(marks) {
+            s.chars().filter(|c| !matches!(*c, markdown::ATOM | markdown::PLAIN)).map(|c| if c == HOLE { ' ' } else { c }).collect::<String>().into()
+        } else {
+            s.into()
+        };
+        let s = clean.as_ref();
+        self.atoms.retain(|t| t.at + t.len <= a || t.at >= b);
+        for t in self.atoms.iter_mut().filter(|t| t.at >= b) {
+            t.at = t.at - (b - a) + s.len();
+        }
         self.text.replace_range(a..b, s);
         self.caret = a + s.len();
         self.anchor = self.caret;
         self.goal = None;
     }
 
+    /// The place before byte `i`: a character back, or a whole mention.
     fn prev(&self, i: usize) -> usize {
-        self.text[..i].char_indices().next_back().map_or(0, |(k, _)| k)
+        let k = self.text[..i].char_indices().next_back().map_or(0, |(k, _)| k);
+        self.atoms.iter().find(|t| t.at <= k && k < t.at + t.len).map_or(k, |t| t.at)
     }
 
+    /// The place after byte `i`: a character on, or a whole mention.
     fn next(&self, i: usize) -> usize {
-        self.text[i..].chars().next().map_or(i, |c| i + c.len_utf8())
+        let k = self.text[i..].chars().next().map_or(i, |c| i + c.len_utf8());
+        self.atoms.iter().find(|t| t.at < k && k <= t.at + t.len).map_or(k, |t| t.at + t.len)
     }
 
     fn line_start(&self, i: usize) -> usize {
@@ -181,7 +293,7 @@ impl Draft {
         if !select && a != b && matches!(m, Move::Left | Move::Right) {
             self.caret = if m == Move::Left { a } else { b };
         } else {
-            self.caret = to;
+            self.caret = self.snap(to);
         }
         if !select {
             self.anchor = self.caret;
@@ -212,6 +324,13 @@ impl Draft {
     /// for a drag from it to keep whole ([`Self::drag_to`]).
     fn press(&mut self, i: usize, unit: Unit) -> (usize, usize) {
         let span = self.span(i, unit);
+        // A mention is taken whole: a press in one puts the caret at its nearer edge, a word or line reaches round it.
+        let span = if span.0 == span.1 {
+            let at = self.snap(span.0);
+            (at, at)
+        } else {
+            (self.atom_over(span.0).map_or(span.0, |t| t.0), self.atom_over(span.1).map_or(span.1, |t| t.1))
+        };
         (self.anchor, self.caret, self.goal) = (span.0, span.1, None);
         span
     }
@@ -220,7 +339,7 @@ impl Draft {
     /// `unit` takes at `i`, so the pressed word or line stays whole whichever way the drag goes.
     fn drag_to(&mut self, i: usize, unit: Unit, held: (usize, usize)) {
         let s = self.span(i, unit);
-        (self.anchor, self.caret) = if s.0 < held.0 { (held.1, s.0) } else { (held.0, s.1) };
+        (self.anchor, self.caret) = if s.0 < held.0 { (held.1, self.atom_over(s.0).map_or(s.0, |t| t.0)) } else { (held.0, self.atom_over(s.1).map_or(s.1, |t| t.1)) };
     }
 
     /// The words shown (the marked text in at the caret) and the TextEdit's units: caret, anchor, marked range (UTF-16).
@@ -237,6 +356,34 @@ impl Draft {
             None => (self.text.clone(), [u(&self.text[..self.caret]), u(&self.text[..self.anchor]), 0, 0]),
         }
     }
+
+    /// [`Self::shown`] for a field that draws mentions as chips (a chat's composer, its words `MarkdownText`): the
+    /// words as the painter reads plain words with atoms ([`markdown::PLAIN`]), which it sets as the words of
+    /// [`Self::shown`], so the units are those.
+    fn shown_chips(&self) -> (String, [u32; 4]) {
+        let (plain, units) = self.shown();
+        // The marked text went in at the caret: the atoms after it are that much on.
+        let pushed = self.marked.as_ref().map_or(0, String::len);
+        let mut out = String::from(markdown::PLAIN); // alloc: the composer's words, when they change
+        let mut at = 0;
+        for t in &self.atoms {
+            let start = t.at + if t.at >= self.caret { pushed } else { 0 };
+            out.push_str(&plain[at..start]);
+            out.push(markdown::ATOM);
+            out.push_str(&t.path);
+            out.push(markdown::ATOM);
+            out.push_str(&plain[start + HOLE.len_utf8()..start + t.len]);
+            out.push(markdown::ATOM);
+            at = start + t.len;
+        }
+        out.push_str(&plain[at..]);
+        (out, units)
+    }
+}
+
+/// Whether `c` is a character only an atom may hold in a draft: its hole, or one of the painter's marks.
+fn marks(c: char) -> bool {
+    matches!(c, HOLE | markdown::ATOM | markdown::PLAIN)
 }
 
 /// A chat pane's own state, by session: its rows' heights, the folds the person set (by call, run, thinking or code key:
@@ -341,10 +488,16 @@ impl ChatState {
         let text = d["text"].as_str().unwrap_or("").to_owned();
         let images: Vec<String> =
             d["images"].as_array().into_iter().flatten().filter_map(Value::as_str).filter(|p| std::path::Path::new(p).is_file()).map(str::to_owned).collect();
-        let n = text.len();
-        self.draft = Draft { text: text.clone(), caret: n, anchor: n, ..Draft::default() };
+        // Its mentions: where each `@<path>` starts in the text, and the path.
+        let mentions: Vec<(usize, String)> = d["mentions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|m| Some((usize::try_from(m.get(0)?.as_u64()?).ok()?, m.get(1)?.as_str()?.to_owned())))
+            .collect();
+        self.draft = Draft::from_wire(&text, &mentions);
         self.images.clone_from(&images);
-        self.draft_saved = (text, images);
+        self.draft_saved = (self.draft.text.clone(), images);
     }
 
     /// Shown again after another tab was in front: every text block as it is now shows whole and at rest (no pace, no
@@ -1656,7 +1809,8 @@ impl App {
             }
         }
         if let Some(area) = composer_area(pv) {
-            let (shown, [caret, anchor, lo, hi]) = st.draft.shown();
+            let (shown, [caret, anchor, lo, hi]) = st.draft.shown_chips();
+            let blank = st.draft.text.is_empty() && st.draft.marked.is_none();
             if let Some(h) = area.part("hint_at").and_then(|a| a.part("hint")) {
                 // Nothing while it is empty (how to stop a running turn, while one runs); an
                 // aside's, while it asks nothing past its space, that it stays out of the conversation.
@@ -1667,8 +1821,8 @@ impl App {
                 };
                 // While a turn runs, how to stop it (the bindings of act.ChatInterrupt, scene/20-keys.flecs).
                 let stop = self.hints("ChatInterrupt");
-                let hint = match (shown.is_empty(), ended) {
-                    _ if aside && shown.trim().is_empty() => format!("Ask {agent} aside: the answer stays out of the conversation"),
+                let hint = match (blank, ended) {
+                    _ if aside && st.draft.text.trim().is_empty() && st.draft.marked.is_none() => format!("Ask {agent} aside: the answer stays out of the conversation"),
                     (false, _) => String::new(),
                     // An empty field says nothing: a field under a chat needs no label. Only what is not obvious shows:
                     // how to stop a running turn.
@@ -1678,6 +1832,10 @@ impl App {
                 h.text(&hint);
             }
             if let Some(txt) = area.part("text") {
+                // Its words are plain words with atoms (the painter's inline reader draws each mention as a chip).
+                if !txt.entity().has(MarkdownText::id()) {
+                    txt.entity().set(MarkdownText::default());
+                }
                 txt.text(&shown);
                 let mut te = txt.entity().try_cloned::<&TextEdit>().unwrap_or_default();
                 // The caret blinks as the terminal's cursor does (Ghostty's cursor-style-blink), solid again as it moves.
@@ -1694,7 +1852,7 @@ impl App {
         }
         // The lantern, while nothing was sent in it yet.
         if let Some(sky) = pv.part("lantern") {
-            let on = harness_native_ui_text_api::Lantern { on: !t.items.iter().any(|i| matches!(i, Item::User { .. })) };
+            let on = harness_native_ui_text_api::Lantern { on: !t.items.iter().any(|i| matches!(i, Item::User { .. })), lit: self.relit };
             if sky.entity().try_cloned::<&harness_native_ui_text_api::Lantern>() != Some(on) {
                 sky.set(on);
             }
@@ -2260,9 +2418,8 @@ impl App {
             if d.text.trim().is_empty() && st.images.is_empty() {
                 return;
             }
-            let text = std::mem::take(&mut d.text).trim_end().to_owned();
+            let text = d.take_wire().trim_end().to_owned();
             crate::audio::cue("send");
-            (d.caret, d.anchor, d.marked) = (0, 0, None);
             st.stick = true;
             (text, std::mem::take(&mut st.images))
         };
@@ -2281,8 +2438,7 @@ impl App {
             if d.text.trim().is_empty() {
                 return;
             }
-            let text = std::mem::take(&mut d.text).trim().to_owned();
-            (d.caret, d.anchor, d.marked) = (0, 0, None);
+            let text = d.take_wire().trim().to_owned();
             let slot: Arc<std::sync::Mutex<Option<AsideAnswer>>> = Arc::default();
             st.aside = Some(Aside { asked: text.clone(), slot: Arc::clone(&slot), answer: None });
             (text, slot)
@@ -2385,21 +2541,21 @@ impl App {
     /// quit without a write per key.
     pub(crate) fn flush_drafts(&self) {
         let mut states = self.chat.borrow_mut();
-        let changed: Vec<(u64, String, Vec<String>)> = states
+        let changed: Vec<(u64, String, Vec<String>, (String, Vec<(usize, String)>))> = states
             .iter()
             .filter(|(_, st)| st.draft_read && (st.draft.text.as_str(), st.images.as_slice()) != (st.draft_saved.0.as_str(), st.draft_saved.1.as_slice()))
-            .map(|(sid, st)| (*sid, st.draft.text.clone(), st.images.clone()))
+            .map(|(sid, st)| (*sid, st.draft.text.clone(), st.images.clone(), st.draft.wire()))
             .collect();
         if changed.is_empty() {
             return;
         }
         let mut drafts = crate::prefs::get("drafts").and_then(|v| v.as_object().cloned()).unwrap_or_default();
-        for (sid, text, images) in changed {
+        for (sid, text, images, (wire, mentions)) in changed {
             let key = format!("s{sid}");
             if text.trim().is_empty() && images.is_empty() {
                 drafts.remove(&key);
             } else {
-                drafts.insert(key, serde_json::json!({"text": text, "images": images}));
+                drafts.insert(key, serde_json::json!({"text": wire, "images": images, "mentions": mentions}));
             }
             if let Some(st) = states.get_mut(&sid) {
                 st.draft_saved = (text, images);
@@ -2500,7 +2656,7 @@ impl App {
     pub(super) fn chat_cut(&mut self) -> Option<String> {
         let mut cut = String::new();
         self.with_draft(|d| {
-            cut = d.selected().to_owned();
+            cut = d.picked();
             if !cut.is_empty() {
                 d.insert("");
             }
@@ -2543,9 +2699,9 @@ impl App {
             let text = transcript_text(&rows, a.min(b), a.max(b));
             return Some((!text.is_empty()).then_some((text, Copied::Transcript)));
         }
-        let picked = st.draft.selected();
+        let picked = st.draft.picked();
         if !picked.is_empty() {
-            return Some(Some((picked.to_owned(), Copied::Input)));
+            return Some(Some((picked, Copied::Input)));
         }
         // A table row: the one under the pointer, else the first one opened, as a markdown table of its header and it.
         let chats = self.chats.borrow();
@@ -3989,6 +4145,53 @@ mod tests {
         let mut head = Vec::new();
         blocks("Hi\n\n| a | b |", true, &mut head);
         assert_eq!(head.iter().map(Row::prefab).collect::<Vec<_>>(), ["hn.ChatProse"]);
+    }
+
+    /// The invariant: a mention is one thing. The caret steps over it, erasing back takes it whole, typing before it
+    /// moves it, it is sent and saved as `@<path>` and comes back an atom, and the painter sets the composer's words
+    /// as the draft's own text, so a caret's units mean the same place in both.
+    #[test]
+    fn a_mention_is_one_atom() {
+        let mut d = Draft::default();
+        d.insert("see ");
+        d.insert_atom("crates/harness/src/main.rs");
+        d.insert(" now");
+        let chip = format!("{HOLE}main.rs");
+        assert_eq!(d.text, format!("see {chip} now"));
+        assert_eq!(d.wire().0, "see @crates/harness/src/main.rs now");
+        // Over it in one step each way, never inside.
+        let end = 4 + chip.len();
+        (d.caret, d.anchor) = (end, end);
+        let to = d.target(Move::Left).unwrap();
+        d.go(Move::Left, to, false);
+        assert_eq!(d.caret, 4);
+        let to = d.target(Move::Right).unwrap();
+        d.go(Move::Right, to, false);
+        assert_eq!(d.caret, end);
+        // A press in it lands on its nearer edge; a word pressed in it is all of it.
+        d.press(6, Unit::Cell);
+        assert_eq!((d.anchor, d.caret), (4, 4));
+        assert_eq!(d.press(7, Unit::Word), (4, end));
+        assert_eq!(d.picked(), "@crates/harness/src/main.rs");
+        // Typed before it, it moves; what the painter reads sets the same words.
+        (d.caret, d.anchor) = (0, 0);
+        d.insert("do ");
+        assert_eq!(d.atoms[0].at, 7);
+        let (shown, _) = d.shown_chips();
+        let set = markdown::inline(&shown);
+        assert_eq!(set.text, d.text);
+        assert_eq!((set.tags.len(), set.tags[0].start, set.tags[0].end), (1, 7, 7 + units(&chip)));
+        // Saved and read back, it is an atom again.
+        let (wire, mentions) = d.wire();
+        let back = Draft::from_wire(&wire, &mentions);
+        assert_eq!((back.text.as_str(), &back.atoms), (d.text.as_str(), &d.atoms));
+        // Erased back from its end, it goes whole; a pasted hole is a space.
+        let end = d.atoms[0].at + d.atoms[0].len;
+        (d.caret, d.anchor) = (end, end);
+        d.erase(d.target(Move::Left).unwrap());
+        assert_eq!((d.text.as_str(), d.atoms.len()), ("do see  now", 0));
+        d.insert(&format!("a{HOLE}b"));
+        assert!(!d.text.contains(HOLE));
     }
 
     #[test]

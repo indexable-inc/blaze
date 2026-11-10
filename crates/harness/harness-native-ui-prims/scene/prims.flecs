@@ -415,6 +415,31 @@ ui {
         link_dark: $tone_accent.dark, link_light: $tone_accent.light}
     }
   }
+  // A stacked table's row (a small table too wide for its room, table.rs `stacks`): its first cell as the title, then
+  // every other field by name (the look's Field), whole and wrapped; a hairline between rows.
+  prefab TableStackRow : ui.Column {
+    Pressable
+    Action: {name: ""}
+    Flex: {axis: Column, gap: 3, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: $table_pad, r: $table_pad, t: 9, b: 9}
+    title : ui.Words, Strong {
+      Cursor: {shape: Text}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      TextStyle: {size: $size_body, line: 20, role: 0, bold: 1}
+    }
+    fields : ui.Column {
+      Flex: {axis: Column, gap: 3, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    }
+  }
+  prefab TableStackRowMd : ui.TableStackRow {
+    title : ui.Words, Strong {
+      MarkdownText: {chip_dark: $tone_wash.dark, chip_light: $tone_wash.light,
+        link_dark: $tone_accent.dark, link_light: $tone_accent.light}
+    }
+  }
+  prefab TableStackRule : ui.Divider {}
   prefab Table : ui.Column {
     Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
@@ -436,6 +461,11 @@ ui {
           Lazy: {count: 0, row: $table_row, overscan: 8}
         }
       }
+    }
+    // The rows stacked, when they are (TableStackRow): empty while the grid shows.
+    stack : ui.Column {
+      Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     }
   }
 
@@ -633,7 +663,7 @@ ui {
   // its parent's frame out of the flow. Its owner turns it `on` while there is nothing else to show.
   prefab Lamp : ui.Node {
     Background
-    Lantern: {on: false}
+    Lantern: {on: false, lit: 0}
   }
   // A small pixel-art item, a game's dropped item (PixelBlock, harness-native-render block.rs): its face names what it
   // is and does (`exec` a terminal, `read` a book, `net` the world turning, `think` a crystal, ...); it floats and moves

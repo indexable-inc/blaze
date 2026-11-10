@@ -89,6 +89,36 @@ impl InlineTag {
     }
 }
 
+/// A text that starts with this is not markdown but plain words with atoms ([`plain_atoms`]): a field's draft, where
+/// what is typed is shown as typed and a completed mention is a chip. A private-use character: never typed.
+pub const PLAIN: char = '\u{E001}';
+/// In such a text, an atom: this, the path it names, this, its label, this. It is set as a `Path` chip, its icon's
+/// hole and its label, so the words shown are the draft's own and a caret's units are the same in both.
+pub const ATOM: char = '\u{E000}';
+
+/// `src` (after its [`PLAIN`]) as words with atoms: every character as written, each atom a `Path` chip.
+fn plain_atoms(src: &str) -> Inline {
+    let mut out = Inline::default();
+    let mut at = 0usize;
+    let mut parts = src.split(ATOM);
+    while let Some(words) = parts.next() {
+        out.text.push_str(words);
+        at += words.encode_utf16().count();
+        // After words, an atom's path and label (the split's next two parts); words alone end the text.
+        let (Some(path), Some(label)) = (parts.next(), parts.next()) else { break };
+        let tag = harness_native_ui_inline::Tag {
+            name: "Path".to_owned(),
+            props: vec![("loc".to_owned(), harness_native_ui_inline::Prop::Text(path.to_owned()))], // alloc: one chip's tag, when a draft with one is shaped
+            label: label.to_owned(),
+            mark: false,
+            plain: false,
+            meta: String::new(),
+        };
+        emit_tag(&mut out, &mut at, tag);
+    }
+    out
+}
+
 /// Inline component `tag` set into `out` at `at`: its icon's hole, its label, its meta, its mark's hole, in the chip's
 /// face.
 fn emit_tag(out: &mut Inline, at: &mut usize, tag: harness_native_ui_inline::Tag) {
@@ -272,6 +302,9 @@ pub fn chip_room(units: &[u16], lo: usize, hi: usize, size: f32) -> (f32, f32) {
 /// `src` read as inline markdown.
 #[must_use]
 pub fn inline(src: &str) -> Inline {
+    if let Some(plain) = src.strip_prefix(PLAIN) {
+        return plain_atoms(plain);
+    }
     let chars: Vec<char> = src.chars().collect();
     let mut out = Inline::default();
     // The UTF-16 length of what is out so far, and where each open emphasis started (in it). An open strike also keeps

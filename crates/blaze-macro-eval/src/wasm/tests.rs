@@ -170,9 +170,12 @@ fn expand_in(
     use std::sync::Arc;
     let input = [a_plus()];
     let g = given(&input);
-    let mut server = crate::server::Server::new(g.sites, g.edition, g.forced_keywords);
+    let new_server = || crate::server::Server::new(g.sites, g.edition, g.forced_keywords);
+    let mut server = new_server();
     let mut wire = Vec::new();
     server.input(g.inputs, &mut wire);
+    let mut calls = vec![super::host::Call { index: 0, server, input: wire }];
+    let placeholder = new_server();
     let pre = library.pre.clone();
     let statics = Arc::clone(&library.statics);
     let db = Db::new();
@@ -187,8 +190,9 @@ fn expand_in(
                 memory_len: 0,
                 started: false,
             };
-            let mut cx = super::host::Cx::new(link, server, crate::os::Os::wasm_in(&env, &cwd));
-            let (output, _) = super::host::expand(&pre, &mut cx, 0, &wire, &mut watch);
+            let mut cx =
+                super::host::Cx::new(link, placeholder, crate::os::Os::wasm_in(&env, &cwd));
+            let (output, _) = super::host::expand(&pre, &mut cx, &mut calls, &mut watch);
             let seen = cx.os.seen().map(|(seen, what)| (seen, what.to_owned())).collect();
             let output = match output {
                 Ok(Ok(_)) => Ok(()),
@@ -213,7 +217,7 @@ fn a_relative_path_a_module_reads_starts_in_the_calling_packages_directory() {
     let input = [a_plus()];
     let mut spent = Spent::default();
     let ran = library
-        .expand(&Db::new(), &ws.env(), 0, &given(&input), &[], &ws.path("pkg"), &mut spent)
+        .expand(&Db::new(), &ws.env(), &[(0, given(&input))], &[], &ws.path("pkg"), &mut spent)
         .unwrap();
     assert!(ran.output.is_ok(), "{:?}", ran.output.err());
     assert!(ran.seen.contains(&(Seen::Read, ws.path("pkg/data/a.txt"))), "{:?}", ran.seen);
@@ -545,7 +549,7 @@ fn a_kept_modules_machine_code_loads_in_another_process_without_compiling() {
     let input = [a_plus()];
     let mut spent = Spent::default();
     let ran =
-        library.expand(&db, &Env::default(), 0, &given(&input), &[], "/", &mut spent).unwrap();
+        library.expand(&db, &Env::default(), &[(0, given(&input))], &[], "/", &mut spent).unwrap();
     let output = ran.output.unwrap();
     assert!(matches!(output.trees(), [Tree::Ident { .. }, Tree::Punct { ch: b'+', .. }]));
 }
@@ -566,7 +570,7 @@ fn an_expansion_in_a_module_gives_back_its_streams_tokens_and_reads_nothing() {
     let input = [a_plus()];
     let mut spent = Spent::default();
     let first =
-        library.expand(&db, &Env::default(), 0, &given(&input), &[], "/", &mut spent).unwrap();
+        library.expand(&db, &Env::default(), &[(0, given(&input))], &[], "/", &mut spent).unwrap();
     assert!(!spent.evaluated && spent.steps > 0 && spent.over.is_none(), "{spent:?}");
     assert!(
         first.seen.is_empty() && first.unkeyable.is_none() && !first.asked,
@@ -574,11 +578,12 @@ fn an_expansion_in_a_module_gives_back_its_streams_tokens_and_reads_nothing() {
     );
     // A fresh instance each time: the second run is the first again.
     let second =
-        library.expand(&db, &Env::default(), 0, &given(&input), &[], "/", &mut spent).unwrap();
+        library.expand(&db, &Env::default(), &[(0, given(&input))], &[], "/", &mut spent).unwrap();
     assert_eq!(first.output.unwrap().trees().len(), second.output.unwrap().trees().len());
 
-    let missing =
-        library.expand(&db, &Env::default(), 7, &given(&input), &[], "/", &mut spent).unwrap_err();
+    let missing = library
+        .expand(&db, &Env::default(), &[(7, given(&input))], &[], "/", &mut spent)
+        .unwrap_err();
     assert!(missing.0.contains("no macro at index 7"), "{missing}");
 }
 
@@ -598,7 +603,7 @@ fn an_expansion_is_found_again_when_only_a_variable_it_never_read_differs() {
     let input = [a_plus()];
     let mut spent = Spent::default();
     let first = env("1", "/tmp/blaze-lanes/profile-1855");
-    let ran = library.expand(&db, &first, 0, &given(&input), &[], "/", &mut spent).unwrap();
+    let ran = library.expand(&db, &first, &[(0, given(&input))], &[], "/", &mut spent).unwrap();
     assert_eq!(
         ran.seen,
         [(Seen::Env, "A".to_owned())],
@@ -881,17 +886,19 @@ fn a_static_a_run_changes_is_carried_into_the_next_calls_instance() {
     let input = [a_plus()];
     let mut spent = Spent::default();
     // Unresolved, it runs nothing.
-    let error =
-        library.expand(&db, &Env::default(), 0, &given(&input), &[], "/", &mut spent).unwrap_err();
+    let error = library
+        .expand(&db, &Env::default(), &[(0, given(&input))], &[], "/", &mut spent)
+        .unwrap_err();
     assert!(error.0.contains("not resolved"), "{error}");
 
     library.watch(&db, krate).unwrap();
     let first =
-        library.expand(&db, &Env::default(), 0, &given(&input), &[], "/", &mut spent).unwrap();
+        library.expand(&db, &Env::default(), &[(0, given(&input))], &[], "/", &mut spent).unwrap();
     assert_eq!(first.statics, [(id, vec![1, 0, 0, 0], false)]);
     let preset = [(id, first.statics[0].1.clone())];
-    let second =
-        library.expand(&db, &Env::default(), 0, &given(&input), &preset, "/", &mut spent).unwrap();
+    let second = library
+        .expand(&db, &Env::default(), &[(0, given(&input))], &preset, "/", &mut spent)
+        .unwrap();
     assert_eq!(
         second.statics,
         [(id, vec![2, 0, 0, 0], false)],
@@ -900,25 +907,87 @@ fn a_static_a_run_changes_is_carried_into_the_next_calls_instance() {
 
     // A preset of another size is refused, naming nothing it can't.
     let error = library
-        .expand(&db, &Env::default(), 0, &given(&input), &[(id, vec![0; 3])], "/", &mut spent)
+        .expand(&db, &Env::default(), &[(0, given(&input))], &[(id, vec![0; 3])], "/", &mut spent)
         .unwrap_err();
     assert!(error.0.contains("3 bytes of state"), "{error}");
 }
 
-/// A static left holding an address of the heap stops the expansion naming the static: no
-/// next instance has that heap.
+/// [`counting`] whose macro keeps a pointer into its heap in the static: the first call stores
+/// the heap's 5000 there, each later call in the same instance moves it on by 4. A fresh
+/// instance has 0 there whatever calls ran before in others.
+fn pointing(item: &[u8; 32]) -> String {
+    let entry = super::statics::encode::entry(4096, item, &[(64, 4)]);
+    ECHO.replacen(
+        "(@custom \"blaze.statics\" \"\")",
+        &format!("(@custom \"blaze.statics\" \"{}\")", super::statics::encode::wat_string(&entry)),
+        1,
+    )
+    .replacen(
+        "(i32.store8 (i32.const 0) (i32.const 0))",
+        "(i32.store (i32.const 64) (select (i32.const 5000) (i32.add (i32.load (i32.const 64)) \
+         (i32.const 4)) (i32.eqz (i32.load (i32.const 64)))))\n    \
+         (i32.store8 (i32.const 0) (i32.const 0))",
+        1,
+    )
+}
+
+/// A static left holding an address of the heap is said to hold one, with its bytes, as the
+/// evaluator says it, and the expansion's output is still given.
 #[test]
-fn a_static_left_holding_a_heap_address_stops_naming_it() {
-    let (db, krate, _, item) = counter_crate();
+fn a_static_left_holding_a_heap_address_is_said_to_hold_one() {
+    let (db, krate, id, item) = counter_crate();
     let (mut library, _) =
         Library::load_with(&modules(), &binary(&counting(&item, true)), None, WHAT).unwrap();
     library.watch(&db, krate).unwrap();
     let input = [a_plus()];
     let mut spent = Spent::default();
-    let error =
-        library.expand(&db, &Env::default(), 0, &given(&input), &[], "/", &mut spent).unwrap_err();
+    let ran =
+        library.expand(&db, &Env::default(), &[(0, given(&input))], &[], "/", &mut spent).unwrap();
+    assert!(ran.output.is_ok(), "{:?}", ran.output);
+    assert_eq!(ran.statics, [(id, 5000u32.to_le_bytes().to_vec(), true)]);
+}
+
+/// The calls of a run run in order in one instance, each from what the one before left on its
+/// heap, as the session's calls run in one process under rustc: three calls leave the pointer
+/// moved on twice, where one call alone leaves it where a fresh instance starts it.
+#[test]
+fn a_runs_calls_run_in_order_in_one_instance_from_the_heap_the_ones_before_left() {
+    let (db, krate, id, item) = counter_crate();
+    let (mut library, _) =
+        Library::load_with(&modules(), &binary(&pointing(&item)), None, WHAT).unwrap();
+    library.watch(&db, krate).unwrap();
+    let input = [a_plus()];
+    let mut spent = Spent::default();
+    let one =
+        library.expand(&db, &Env::default(), &[(0, given(&input))], &[], "/", &mut spent).unwrap();
+    assert_eq!(one.statics, [(id, 5000u32.to_le_bytes().to_vec(), true)]);
+    let alone = spent.steps;
+    let calls = [(0, given(&input)), (0, given(&input)), (0, given(&input))];
+    let three = library.expand(&db, &Env::default(), &calls, &[], "/", &mut spent).unwrap();
+    assert!(three.output.is_ok(), "{:?}", three.output);
+    assert_eq!(
+        three.statics,
+        [(id, 5008u32.to_le_bytes().to_vec(), true)],
+        "the second and third calls ran from the first's heap, in one instance"
+    );
+    assert!(spent.steps > alone, "the fuel of all three calls: {} after {alone}", spent.steps);
+}
+
+/// A call run again before the one expanded that stops stops the run, naming which of the
+/// earlier calls it was and why: here one asking for a macro the module has not.
+#[test]
+fn an_earlier_call_that_stops_stops_the_run_naming_it() {
+    let (db, krate, _, item) = counter_crate();
+    let (mut library, _) =
+        Library::load_with(&modules(), &binary(&pointing(&item)), None, WHAT).unwrap();
+    library.watch(&db, krate).unwrap();
+    let input = [a_plus()];
+    let mut spent = Spent::default();
+    let calls = [(0, given(&input)), (7, given(&input)), (0, given(&input))];
+    let error = library.expand(&db, &Env::default(), &calls, &[], "/", &mut spent).unwrap_err();
     assert!(
-        error.0.contains("address of its heap in the static `") && error.0.contains("COUNT`"),
+        error.0.contains("call 2 of the 2 its session made before this one")
+            && error.0.contains("no macro at index 7"),
         "{error}"
     );
 }

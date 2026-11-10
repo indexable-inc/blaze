@@ -408,6 +408,19 @@ fn a_promoted_temporary_with_its_place_in_it_runs() {
     assert_eq!(case.ok(&["run"]), "main.rs:16\nmain.rs:11\n");
 }
 
+/// An `async` body with an `.await` in a branch a constant condition rules out (`if F::ON { ..
+/// .await }` of an associated constant, or of a `const`) builds and runs: the branch's blocks are
+/// not compiled, so its yield has no arm in the switch that resumes or drops the future. Each
+/// `.await` that runs suspends once, and the last future is dropped suspended.
+#[test]
+fn an_await_a_constant_condition_rules_out_builds() {
+    let case = Case::new("an_await_a_constant_condition_rules_out_builds");
+    assert_eq!(
+        case.ok(&["run"]),
+        "dropped early\ndropped early\n(7, 2) (8, 2)\n(2, 1) (7, 2)\n(8, 2)\ndropped early\n"
+    );
+}
+
 /// sqlx's `#[sqlx::test(migrations = "..")]` passes `&Migrator { migrations: Cow::Borrowed(const
 /// { &[..] }), .., ..Migrator::DEFAULT }` where a `&'static Migrator` is wanted: a record literal
 /// with a constant base, and a `const { .. }` block, are promoted, as rustc promotes them. blaze
@@ -630,6 +643,23 @@ fn a_proc_macro_package_tests_build() {
     for test in ["the_lib_test_runs", "the_macro_expands"] {
         assert!(said.contains(&format!("test {test} ... ok")), "`{test}` did not pass:\n{said}");
     }
+}
+
+/// `#[blaze::contract_test]` (docs/v2/plan/design/contracts.md, part 2): a function whose
+/// `#![no_std]` proc-macro crates of every edition, an attribute macro among them (as
+/// multiversion_no_op's), and one that declares its own `extern crate std`, each built as a
+/// wasm module and expanded: the glue blaze appends to a macro crate's root names std only
+/// through its own `extern crate std as __blaze_std`, so a crate whose extern prelude has no
+/// `std`, or that already declares one, builds.
+#[test]
+fn a_no_std_proc_macro_expands() {
+    let case = Case::new("a_no_std_proc_macro_expands");
+    let out = case.ok_in("", &["test"]);
+    let said = format!("{}{}", out.stdout, out.stderr);
+    assert!(
+        said.contains("test every_no_std_macro_expands ... ok"),
+        "`every_no_std_macro_expands` did not pass:\n{said}"
+    );
 }
 
 /// `#[blaze::contract_test]` (docs/v2/plan/design/contracts.md, part 2): a function whose

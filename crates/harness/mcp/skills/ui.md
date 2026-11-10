@@ -46,15 +46,14 @@ character (he has moods).
 ```
 
 Numbers are drawn. Parts of a whole (a disk's volumes, memory by process, a budget's lines) are one segmented bar
-with its legend, the total as a Stat over it and the few facts that matter in a small Table under it, never a
-sentence and never a bar chart of the parts:
+with its legend and the total as a Stat over it: never a sentence, never a bar chart of the parts, and no table
+repeating what the legend already says. The cell is the whole answer; write nothing after it.
 
 ```svelte
 <Column>
   <Stat label="Container disk3" value="7.72 TB" note="469 GB free" />
   <Chart kind="segments" unit="GB" data={[{label: 'Data', value: 2920}, {label: 'Projects', value: 2740},
     {label: 'Nix Store', value: 1480}, {label: 'VM', value: 87}, {label: 'Free', value: 469}]} />
-  <Table rows={[{what: 'Capacity', value: '7.72 TB'}, {what: 'Used', value: '7.25 TB'}, {what: 'Free', value: '469 GB'}]} />
 </Column>
 ```
 
@@ -98,4 +97,14 @@ Every element also takes width, height (and min/max), grow, padX, padY, a sprung
 z, hover={{scale: 1.05}}, enter and exit (or Svelte's in:, out:, transition: fly fade scale slide, and animate:flip),
 and onpointerdown/move/up, ondrag, onwheel, onhover, onkeydown, onfocus, onblur.
 
-To ask the person and wait for the answer, await ask(text, {options, default}).
+To ask the person, await ask(text, {options, default, detail}): it waits for the answer and returns the label picked.
+The question is one short line ("Stop both daemons?"), at most 140 characters; the facts it rests on go in detail (one
+line) or in a Table or Stat shown above it in the same cell; an option is a few words. default is the option you
+recommend, shown picked: it is never taken for the person. block: false (with a default) goes ahead with it at once
+and leaves the question up; use it only for a choice that is cheap to change, never for one that stops, deletes,
+sends or spends. An answer always reaches you: as the cell's result while your call waits, else as a message from
+him ("Answer to ..."), so after a cell says it is backgrounded on an ask, end your turn and wait; do not poll it.
+A question that rests on numbers shows them above it in the same cell as a picture, not as sentences: a Chart of
+segments for shares of a whole, Stats for two or three figures, a Table for several things; then the question in a
+few words (render(svelte`<Chart .../>`, props); await ask("Stop both?", {options})). The cell is the whole reply: write no prose that says the question or its facts again, and once
+answered, do the thing and say only what happened.

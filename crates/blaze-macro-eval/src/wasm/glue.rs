@@ -7,6 +7,10 @@
 //! Each listed macro is the pinned bridge's own `Client`, made by `Client::expand1` (a derive,
 //! a function-like macro) or `expand2` (an attribute) of the macro's function, as rustc's
 //! proc-macro harness makes it: the glue runs it through the client's `run` pointer.
+//!
+//! [`MODULE`] declares its own `extern crate std as __blaze_std`, and the list and the glue name
+//! std only through it: a `#![no_std]` macro crate has no `std` in its extern prelude, and an
+//! `extern crate std` at the crate's root would clash with one the crate declares itself.
 
 use std::fmt::Write as _;
 
@@ -47,11 +51,12 @@ pub fn wasm_glue(db: &Db, krate: Crate) -> Result<String, String> {
     text.push_str(MARK);
     text.push_str(
         "#[doc(hidden)]\n#[allow(warnings, clippy::all)]\npub mod __blaze_proc_macros {\n    \
-         extern crate proc_macro as __blaze_proc_macro;\n\n    \
+         extern crate proc_macro as __blaze_proc_macro;\n    \
+         extern crate std as __blaze_std;\n\n    \
          /// The bridge's client of the macro at `index`, the macros numbered by the name each is\n    \
          /// invoked by: made when asked, not in a static, as `Client::expand1` is no stable const fn.\n    \
-         pub fn listed(index: u32) -> ::std::option::Option<__blaze_proc_macro::bridge::client::Client> {\n        \
-         ::std::option::Option::Some(match index {\n",
+         pub fn listed(index: u32) -> __blaze_std::option::Option<__blaze_proc_macro::bridge::client::Client> {\n        \
+         __blaze_std::option::Option::Some(match index {\n",
     );
     for (at, (invoked, kind, function)) in functions.iter().enumerate() {
         let expand = match kind {
@@ -65,7 +70,9 @@ pub fn wasm_glue(db: &Db, krate: Crate) -> Result<String, String> {
             invoked = invoked.as_str(),
         );
     }
-    text.push_str("            _ => return ::std::option::Option::None,\n        })\n    }\n\n");
+    text.push_str(
+        "            _ => return __blaze_std::option::Option::None,\n        })\n    }\n\n",
+    );
     text.push_str(ENTRY);
     text.push_str("}\n");
     Ok(text)

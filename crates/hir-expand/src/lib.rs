@@ -1201,11 +1201,17 @@ fn ignored_semicolon(db: &Db, loc: &MacroCallLoc, semicolon: Option<Span>) -> Op
 }
 
 /// The tokens before the semicolon an expansion ends in, and the semicolon's span: what rustc
-/// drops where a `macro_rules!` macro is called as an expression.
+/// drops where a `macro_rules!` macro is called as an expression. An expansion whose top has
+/// delimiters is that one group (a proc macro's lone `{ .. }`, which the wire makes the tree's
+/// top, `proc_macro_api::bridge::wire::top_subtree`): it ends in the group's closing delimiter,
+/// and a `;` last inside it is its last statement's, not one the expansion ends in.
 fn without_last_semicolon<'f>(
     frame: &'f Frame,
     tt: tt::SubtreeView<'_>,
 ) -> Option<(tt::TopSubtree<&'f Frame>, Span)> {
+    if tt.top_subtree().delimiter.kind != tt::DelimiterKind::Invisible {
+        return None;
+    }
     let mut rest = tt.token_trees().iter();
     let start = rest.savepoint();
     let mut before = rest.from_savepoint(start);

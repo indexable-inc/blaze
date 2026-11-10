@@ -4,23 +4,25 @@ import { MAX_LABEL, MAX_OPTIONS } from './element.ts';
  * `ask(text, options)`: put a question to the person watching, in the calling cell's own UI. It is drawn with the same elements
  * (a Card holding a Choice or Select of the options, and an Input when the person may type) and its answer comes back the same way
  * every control's does (the app's ui_event, index.ts `dispatch`): there is no other channel. Copied from den's repl/src/ask.ts, which
- * asks through den's hub instead; the rules are den's. With a `default` it does not wait: it returns that option at once, the cell
- * carries on, and the question stays up; if the person later answers something else, the cell's logs say so. With `block: true`
- * (or no `default`) the cell waits for the answer, however long it takes, until the cell stops with an error (its timeout), which
- * withdraws the question. Where it goes: below whatever the cell already shows, and it stays there answered.
+ * asks through den's hub instead; the rules are den's but one: here a question always waits. The cell waits for the
+ * answer, however long it takes, until the cell stops with an error (its timeout), which withdraws the question. A `default` is
+ * the option recommended: it shows picked, with an OK that gives it; it is never taken for the person. Only `block: false` (with
+ * a default) goes ahead: it returns the default at once, the cell carries on, and the question stays up; if the person later
+ * answers something else, the cell's logs say so. The question is one line (at most ASK_MAX characters): what it rests on goes in
+ * `detail`, or is shown above it. Where it goes: below whatever the cell already shows, and it stays there answered.
  */
 
 export interface AskOption { label: string; detail?: string }
 export interface AskOptions {
   /** The choices: labels, or `{label, detail}`. Without any the question is free text. */
   options?: readonly (string | AskOption)[];
-  /** The option you go ahead with when nobody has answered: its label, or its index. */
+  /** The option you recommend, shown picked: its label, or its index. Never taken for the person unless `block: false`. */
   default?: string | number;
   /** One line of context under the question. */
   detail?: string;
   /** Let the person type an answer too (always on when there are no options). */
   allowText?: boolean;
-  /** Wait for the answer. Default: only when there is no `default`. */
+  /** Wait for the answer (the default). `false` with a `default`: go ahead with it at once, for a choice that is cheap to change. */
   block?: boolean;
 }
 
@@ -34,10 +36,13 @@ export interface AskPlan {
   block: boolean;
 }
 
+/** The most characters a question runs to: one line a person reads at a glance. */
+export const ASK_MAX = 140;
+
 /** The question for `text` and `options`, checked: every mistake is the caller's, so each throws before anything is shown. */
 export function planAsk(text: string, options: AskOptions = {}): AskPlan {
   if (typeof text !== 'string' || !text.trim()) throw new TypeError('ask(text, options) needs the question as a non-empty string');
-  if (text.length > 2000) throw new RangeError(`ask: the question is ${text.length} characters; at most 2000 (put the rest in detail, or show it above)`);
+  if (text.length > ASK_MAX) throw new RangeError(`ask: the question is ${text.length} characters; at most ${ASK_MAX}. Ask only the question ("Stop them?"); what it rests on goes in detail, or in a Table or Stat shown above it`);
   if (typeof options !== 'object' || options === null || Array.isArray(options)) throw new TypeError('ask(text, options) takes an options object');
   const stray = Object.keys(options).find(key => !['options', 'default', 'detail', 'allowText', 'block'].includes(key));
   if (stray) throw new TypeError(`ask: no option ${JSON.stringify(stray)}; it takes options, default, detail, allowText, block`);
@@ -58,7 +63,7 @@ export function planAsk(text: string, options: AskOptions = {}): AskPlan {
       throw new RangeError(`ask: default ${JSON.stringify(options.default)} is not one of the options (${choices.map(choice => JSON.stringify(choice.label)).join(', ') || 'none'})`);
     }
   }
-  const block = options.block ?? preset === undefined;
+  const block = options.block ?? true;
   if (typeof block !== 'boolean') throw new TypeError('ask: block takes true or false');
   if (!block && preset === undefined) throw new TypeError('ask: a question that does not wait needs a default to go ahead with');
   if (options.detail !== undefined && typeof options.detail !== 'string') throw new TypeError('ask: detail takes a string');

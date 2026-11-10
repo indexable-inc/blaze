@@ -16,6 +16,9 @@ export class Task {
   /** Formatted result: NUON, raw string, or the error stack. */
   result = "";
   readonly logs: string[] = [];
+  /** The tool call that ran it has replied while it still ran (mcp.ts): the agent no longer waits on it, so what it
+   * learns from the person later (an answer to its ask) is sent to the agent as a message. */
+  returned = false;
   /** What the cell did outside the REPL, in order (effects.ts), and how many steps past the cap were not kept. */
   readonly effects: Effect[] = [];
   effectsDropped = 0;

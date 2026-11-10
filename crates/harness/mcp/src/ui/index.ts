@@ -5,6 +5,7 @@ import { askProps, planAsk, type AskOptions } from './ask.ts';
 import { UiTree, interval } from './tree.ts';
 import type { UiNode } from './tree.ts';
 import { currentTask, inTask, taskCall, taskCount, type Task } from '../tasks.ts';
+import { req } from '../daemon.ts';
 
 /*
  * What a cell is handed for UI: the element components (`Column`, `Text`, ...), `render`, `svelte` (a template tag compile.ts expands
@@ -106,9 +107,27 @@ export function show(t: Task, component: unknown, props: Record<string, unknown>
 }
 
 /**
+ * Say `text` to this kernel's own agent as a message in its chat (the daemon's `prompt`, as agents.send types one): how an
+ * answer given after the agent stopped waiting reaches it, and wakes it. With no session (a kernel run by hand) or no daemon
+ * it is only in the cell's logs.
+ */
+function tellAgent(t: Task, text: string) {
+  t.logs.push(`[ask] ${text}`);
+  t.touch();
+  const sid = process.env.HARNESS_SESSION;
+  if (!sid) return;
+  req({ op: 'rpc', id: `s${sid}`, method: 'prompt', args: { text, submit: true } }).catch((error) => {
+    t.logs.push(`[ask] that answer could not be sent to the agent: ${error instanceof Error ? error.message : String(error)}`);
+    t.touch();
+  });
+}
+
+/**
  * `ask(text, {options, default, detail, allowText, block})` (ask.ts): the question goes below what the calling cell shows, drawn
  * with the cell's elements, and the person's answer comes back through `dispatch` as any control's does. Resolves with the label
- * picked or the words typed; with a default and no `block`, at once with the default.
+ * picked or the words typed; with a default and `block: false`, at once with the default. An answer always reaches the agent:
+ * as the cell's result while its tool call still waits, else (the call replied "backgrounded", or the cell went ahead with a
+ * default) as a message in the agent's chat ([`tellAgent`]), which wakes it.
  */
 export function ask(text: string, options?: AskOptions): Promise<string> {
   const t = currentTask();
@@ -130,12 +149,15 @@ export function ask(text: string, options?: AskOptions): Promise<string> {
     },
   };
   const answer = (said: string) => {
-    if (waiting) { waiting = false; resolve(said); return; }
-    // It did not wait: the cell went ahead with the default; an answer that differs is said where the agent reads the cell.
-    if (said !== preset) {
-      t.logs.push(`[ask] ${JSON.stringify(text)}: the person answered ${JSON.stringify(said)}; the cell went ahead with ${JSON.stringify(preset)}`);
-      t.touch();
+    if (waiting) {
+      waiting = false;
+      resolve(said);
+      // The tool call gave up waiting on the cell: nothing reads its result, so the answer goes to the agent's chat.
+      if (t.returned) tellAgent(t, `Answer to ${JSON.stringify(text)}: ${said}`);
+      return;
     }
+    // It did not wait: the cell went ahead with the default; an answer that differs is the person changing it.
+    if (said !== preset) tellAgent(t, `Answer to ${JSON.stringify(text)}: ${said} (you went ahead with ${JSON.stringify(preset)}; change it)`);
   };
   shown.asks.push(prompt);
   try { tree.mount(askComponent, { ...elementGlobals(), ...askProps(plan), answer }); }

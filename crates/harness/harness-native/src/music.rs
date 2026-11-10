@@ -8,6 +8,8 @@
 //!   motif, ring now and then, or hit on its steps. `hn.sound.part.*` prefabs, each inheriting its instrument.
 //! - A [`Mood`] is a tempo, a scale by day and one by night, a chord a bar, and the parts that play in it, each at a
 //!   level. `hn.sound.mood.*`, each a few part prefabs' instances.
+//! - A [`Song`] is a key, a scale by day and by night, chords and a few parts of its own (a flute for the lead). The
+//!   band plays one for its bars, goes quiet a few bars, then plays another. `hn.sound.song.*`.
 //!
 //! A new mood never cuts: every part's level glides to its level in the new mood (a part the new mood lacks fades out,
 //! one it adds fades in), the tempo glides, and the scale and chords take over on the next bar line, where every part
@@ -106,8 +108,28 @@ pub struct Part {
     pub hz: f32,
 }
 
-/// A mood: its tempo (quarter notes a minute), its scale (semitones over the key) by day and by night, its chords (a
-/// root a bar, as steps of the scale) and its parts.
+/// A song: a piece the band plays for a while before it moves to another. It gives the key (`transpose` semitones from
+/// A), the scale by day and by night, the chords (a root a bar, as steps of the scale: `chords` for eight bars, then
+/// `bridge` for eight, and round again), how fast it goes against the mood's tempo, how many bars it lasts, and any
+/// parts of its own: one named like a mood's part plays in its place, at the mood's level (a flute for the lead).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Song {
+    pub name: String,
+    pub transpose: i32,
+    pub tempo: f32,
+    pub bars: u32,
+    pub scale: Vec<i32>,
+    pub night: Vec<i32>,
+    pub chords: Vec<i32>,
+    pub bridge: Vec<i32>,
+    pub parts: Vec<Part>,
+}
+
+/// Bars of quiet between one song and the next (the band fades out, rests, and the next song fades in).
+const BETWEEN: u32 = 4;
+
+/// A mood: its tempo (quarter notes a minute), its parts, and, when it has them, a scale (semitones over the key) by day
+/// and by night and chords of its own, which it plays whatever the song (a battle's minor); without, the song's.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Mood {
     pub tempo: f32,
@@ -365,6 +387,11 @@ pub struct Band {
     chords: Vec<i32>,
     next: Option<Mood>,
     players: Vec<Player>,
+    /// The songs, the one playing, the bars it has left, and the bars of quiet left before the next.
+    songs: Vec<Song>,
+    song: usize,
+    left: u32,
+    quiet: u32,
     tempo: f32,
     night: bool,
     step: usize,
@@ -392,6 +419,10 @@ impl Band {
             chords: Vec::new(),
             next: None,
             players: Vec::new(),
+            songs: Vec::new(),
+            song: 0,
+            left: 0,
+            quiet: 0,
             tempo: 72.0,
             night: false,
             step: 0,
@@ -399,6 +430,13 @@ impl Band {
             wait: 0.0,
             motif: [None; 2 * STEPS],
         }
+    }
+
+    /// The songs the band plays, one after another (it starts on one of them by its seed).
+    pub fn set_songs(&mut self, songs: Vec<Song>) {
+        self.song = if songs.is_empty() { 0 } else { (self.rand() * songs.len() as f32) as usize % songs.len() };
+        self.left = songs.get(self.song).map_or(0, |s| s.bars);
+        self.songs = songs;
     }
 
     /// Play toward `mood` (None: fade out and rest), by `night` its night scale. Each of its parts is the player of
@@ -409,10 +447,26 @@ impl Band {
             return;
         }
         self.next = mood.cloned();
+        self.cast();
+    }
+
+    /// The players for the mood asked for, in the song playing: each of the mood's parts, or the song's part of that
+    /// name in its place (at the mood's level).
+    fn cast(&mut self) {
         for p in &mut self.players {
             p.want = 0.0;
         }
-        for part in mood.into_iter().flat_map(|m| &m.parts) {
+        let song = self.songs.get(self.song);
+        let parts: Vec<Part> = self // alloc: a part a player, on a change of mood or song
+            .next
+            .iter()
+            .flat_map(|m| &m.parts)
+            .map(|part| match song.and_then(|s| s.parts.iter().find(|sp| sp.name == part.name)) {
+                Some(own) => Part { level: part.level, ..own.clone() },
+                None => part.clone(),
+            })
+            .collect();
+        for part in &parts {
             match self.players.iter_mut().find(|p| p.part.name == part.name) {
                 Some(p) => {
                     p.want = part.level;
@@ -436,10 +490,11 @@ impl Band {
         (self.rng >> 40) as f32 / (1u64 << 24) as f32
     }
 
-    /// The pitch of step `degree` of `scale` (past its end: the octaves above; below 0: those below), `octave` up.
-    fn pitch(scale: &[i32], degree: i32, octave: i32) -> f32 {
+    /// The pitch of step `degree` of `scale` (past its end: the octaves above; below 0: those below), `octave` up, in
+    /// the key `transpose` semitones from A.
+    fn pitch(scale: &[i32], degree: i32, octave: i32, transpose: i32) -> f32 {
         let n = scale.len().max(1) as i32;
-        let semis = scale.get(degree.rem_euclid(n) as usize).copied().unwrap_or(0) + 12 * (degree.div_euclid(n) + octave);
+        let semis = transpose + scale.get(degree.rem_euclid(n) as usize).copied().unwrap_or(0) + 12 * (degree.div_euclid(n) + octave);
         ROOT * 2f32.powf(semis as f32 / 12.0)
     }
 
@@ -462,12 +517,42 @@ impl Band {
     /// One step of the bar: what each player plays on it.
     fn tick(&mut self) {
         if self.step == 0 {
-            // The bar line: the next mood's scale and chords take over here, every part at once.
+            // The bar line. A song that has run its bars gives way: the band goes quiet for a few bars, then the next
+            // song (never the same one twice running) comes in with its own key, chords and parts.
+            if self.quiet > 0 {
+                self.quiet -= 1;
+                if self.quiet == 0 && self.songs.len() > 1 {
+                    let step = 1 + (self.rand() * (self.songs.len() - 1) as f32) as usize % (self.songs.len() - 1);
+                    self.song = (self.song + step) % self.songs.len();
+                    self.left = self.songs[self.song].bars;
+                    self.bar = 0;
+                    self.compose();
+                    self.cast();
+                }
+            } else if !self.songs.is_empty() && self.next.is_some() {
+                self.left = self.left.saturating_sub(1);
+                if self.left == 0 && self.songs.len() > 1 {
+                    self.quiet = BETWEEN;
+                }
+            }
+            // The scale and chords take over here, every part at once: the mood's own when it has them, else the
+            // song's (its bridge every other eight bars).
             if let Some(m) = &self.next {
-                let scale = if self.night && !m.night.is_empty() { &m.night } else { &m.scale };
-                if &self.scale != scale || self.chords != m.chords {
+                let song = self.songs.get(self.song);
+                let own = !m.scale.is_empty();
+                let (day, night) = match song.filter(|_| !own) {
+                    Some(s) => (&s.scale, &s.night),
+                    None => (&m.scale, &m.night),
+                };
+                let scale = if self.night && !night.is_empty() { night } else { day };
+                let chords = match song.filter(|_| !own || m.chords.is_empty()) {
+                    Some(s) if (self.bar / 8) % 2 == 1 && !s.bridge.is_empty() => &s.bridge,
+                    Some(s) => &s.chords,
+                    None => &m.chords,
+                };
+                if &self.scale != scale || &self.chords != chords {
                     self.scale.clone_from(scale);
-                    self.chords.clone_from(&m.chords);
+                    self.chords.clone_from(chords);
                 }
             }
             if self.bar % 8 == 0 {
@@ -484,12 +569,14 @@ impl Band {
             }
         }
         // Toward the mood asked for: levels and tempo glide (about a bar), never jump. A player faded out leaves.
+        let hush = self.quiet > 0;
         for p in &mut self.players {
-            p.level += (p.want - p.level) * 0.09;
+            p.level += (if hush { 0.0 } else { p.want } - p.level) * 0.09;
         }
         self.players.retain(|p| p.want > 0.0 || p.level > 0.004);
         if let Some(n) = &self.next {
-            self.tempo += (n.tempo - self.tempo) * 0.06;
+            let pace = self.songs.get(self.song).map_or(1.0, |s| if s.tempo > 0.0 { s.tempo } else { 1.0 });
+            self.tempo += (n.tempo * pace - self.tempo) * 0.06;
         }
         if self.scale.is_empty() || self.chords.is_empty() {
             return;
@@ -499,6 +586,7 @@ impl Band {
         let chord = [root, root + 2, root + 4];
         let beat = 60.0 / self.tempo.max(30.0);
         let len = self.scale.len() as i32;
+        let key = self.songs.get(self.song).map_or(0, |s| s.transpose);
         for k in 0..self.players.len() {
             let (role, on, chance) = {
                 let p = &self.players[k];
@@ -523,16 +611,16 @@ impl Band {
             match role {
                 Role::Chord => {
                     for (j, d) in chord.iter().enumerate() {
-                        notes[j] = Some((Self::pitch(&self.scale, *d, part.octave), part.pan + [-0.5, 0.0, 0.5][j]));
+                        notes[j] = Some((Self::pitch(&self.scale, *d, part.octave, key), part.pan + [-0.5, 0.0, 0.5][j]));
                     }
                 }
-                Role::Root => notes[0] = Some((Self::pitch(&self.scale, root, part.octave), part.pan)),
+                Role::Root => notes[0] = Some((Self::pitch(&self.scale, root, part.octave, key), part.pan)),
                 Role::Arp => {
                     let d = chord[p.n % 3] + len * ((p.n / 3) % 2) as i32;
-                    notes[0] = Some((Self::pitch(&self.scale, d, part.octave), if p.n % 2 == 0 { -0.35 } else { 0.35 }));
+                    notes[0] = Some((Self::pitch(&self.scale, d, part.octave, key), if p.n % 2 == 0 { -0.35 } else { 0.35 }));
                 }
-                Role::Motif => notes[0] = motif.map(|d| (Self::pitch(&self.scale, root + i32::from(d), part.octave), part.pan)),
-                Role::Sparkle => notes[0] = Some((Self::pitch(&self.scale, chord[pick], part.octave), part.pan + pick as f32 * 0.5 - 0.5)),
+                Role::Motif => notes[0] = motif.map(|d| (Self::pitch(&self.scale, root + i32::from(d), part.octave, key), part.pan)),
+                Role::Sparkle => notes[0] = Some((Self::pitch(&self.scale, chord[pick], part.octave, key), part.pan + pick as f32 * 0.5 - 0.5)),
                 Role::Hit => notes[0] = Some((part.hz, part.pan)),
             }
             p.n += 1;
@@ -624,6 +712,37 @@ mod tests {
         assert!(!b.playing(), "it never came to rest");
         let (peak, _) = seconds(&mut b, 1.0);
         assert!(peak == 0.0, "at rest it still sounds: {peak}");
+    }
+
+    /// With songs, the band plays one for its bars, goes quiet between, and comes in again on another, in that song's
+    /// key and with its own part in the mood's place.
+    #[test]
+    fn the_band_moves_from_song_to_song() {
+        let song = |name: &str, transpose: i32, lead: Option<Part>| Song { name: name.to_owned(), transpose, tempo: 1.0, bars: 2, scale: vec![0, 2, 4, 7, 9], night: vec![], chords: vec![0, 3], bridge: vec![], parts: lead.into_iter().collect() };
+        let own = part("lead", Role::Root, &[0, 4, 8, 12], 1.0, true);
+        let mut m = mood(240.0, vec![part("lead", Role::Root, &[0, 8], 0.1, false)]);
+        (m.scale, m.night, m.chords) = (Vec::new(), Vec::new(), Vec::new());
+        let mut b = Band::new(3);
+        b.set_songs(vec![song("a", 0, None), song("b", 5, Some(own))]);
+        b.set(Some(&m), false);
+        let first = b.song;
+        let mut heard = vec![first];
+        let mut hushed = false;
+        for _ in 0..40 {
+            seconds(&mut b, 1.0);
+            hushed |= b.quiet > 0;
+            if heard.last() != Some(&b.song) {
+                heard.push(b.song);
+            }
+        }
+        assert!(hushed, "no quiet between songs");
+        assert!(heard.len() >= 3 && heard.windows(2).all(|w| w[0] != w[1]), "the songs it played: {heard:?}");
+        // In song b the lead is b's own part (it holds its notes), at the mood's level.
+        while b.song != 1 || b.quiet > 0 {
+            seconds(&mut b, 0.5);
+        }
+        let lead = b.players.iter().find(|p| p.part.name == "lead").expect("a lead");
+        assert!(lead.part.instrument.hold && (lead.want - 0.1).abs() < 1e-6, "song b's lead is not its own part at the mood's level");
     }
 
     /// Rain comes in, stays under its level, and goes; a source at the left is louder and earlier in the left ear, one

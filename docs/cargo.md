@@ -404,6 +404,17 @@ start-file-less links (`-static`, `-nostartfiles`), `-z lazy`, `-z execstack`, `
 `cargo:rustc-link-lib` with `cargo:rustc-link-search`), and every link argument of a Windows or
 wasm target, which rustc gives `link.exe` or `wasm-ld` directly.
 
+A crate's bundled static libraries (`static` without `-bundle`, from its rustflags' `-l`s, its
+build script's `cargo:rustc-link-lib`s or its `#[link]`s) are found first in the directories its
+own compile searches, the `-L`s rustc is given for that crate: its rustflags', then the build
+scripts' of it and of what it depends on, its own `OUT_DIR` first; then the linked program's
+directories and the toolchain's are searched. So two crates whose build scripts each make a
+static library of one name in their own `OUT_DIR` (two copies of one `-sys` crate) link two
+libraries, each its own crate's, as rustc bundles each into the crate that names it. Every
+other kind (a dylib, a framework, a `-bundle` static library) is found as the final link finds
+it, in the program's directories (`crates/blaze-link/src/target.rs`, `CrateLibs`). The linked
+crates' rustflags' `-L`s are in the program's key.
+
 The rest of the rustflags that are the link's, rather than the code's, are read by
 `crates/blaze-link/src/args/rustflags.rs`, and none is dropped:
 
@@ -903,9 +914,12 @@ rustc: the link lists each static of the macro's crates its code can write in th
 `blaze.statics` section, and the host writes what the calls before left into each fresh
 instance before the macro runs, then reads back what it changed (`src/wasm/statics.rs`). A
 module without that section is refused at load. A static left holding an address of the heap
-stops the expansion with an error naming the static, since a fresh instance has no such heap.
-A call is kept and found under the state it started from, and only when it left that state as
-it was.
+(a lazily built table, a cache behind a pointer: logos's, `proc-macro-crate`'s) can't be given
+to a fresh instance, which has no such heap; from then on the calling crate's earlier calls of
+the macro run again, in order, in the next call's instance before it, as they ran in one
+process under rustc, and as the evaluator runs them. A call is kept and found under the state
+it started from, and only when it left that state as it was; one after the earlier calls run
+again is never kept.
 
 Each expansion is kept in the store (`crates/proc-macro-api/src/kept.rs`) by the macro's
 library, its name, input and attribute tokens, the crate's variables, its directory and the
