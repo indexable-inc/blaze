@@ -1153,6 +1153,11 @@ impl<T> Drop for Held<T> {
 /// Unit `unit`'s identity set from the front end, once every run of its closure is applied:
 /// from then on nothing changes what its crate is made from.
 fn identify(lowered: &mut Lowered, job: &Job, unit: u32) {
+    // The narrowed identities first: a reader that finds the identity set finds them set.
+    if let Some(slot) = job.narrowed.get(unit as usize) {
+        let _span = tracing::info_span!(target: "blaze", "unit narrowed identity", unit).entered();
+        let _ = slot.set(lowered.narrowed(unit as usize));
+    }
     if let Some(slot) = job.identities.get(unit as usize) {
         let _ = slot.set(lowered.identity(unit as usize));
     }
@@ -1272,6 +1277,10 @@ pub(crate) struct Job {
     /// Each unit's identity in the front end (what its crate is made from, deeply), set by the
     /// writer once no run left to apply changes it; unset, the unit's record is not known.
     pub(crate) identities: Box<[OnceLock<Option<ContentId>>]>,
+    /// Each unit's crate as the keys that leave trivia out know it
+    /// ([`blaze_lower::Lowered::narrowed`]), set by the writer with its identity: none for a
+    /// crate that keeps its whole text.
+    pub(crate) narrowed: Box<[OnceLock<Option<blaze_lower::Narrowed>>]>,
     /// What each build script's run told cargo, by its run unit. Each slot is written once,
     /// when the run ends, and read with no lock by every unit after it.
     pub(crate) scripts: Box<[OnceLock<script::Applied>]>,
@@ -1283,6 +1292,9 @@ pub(crate) struct Job {
     /// Each unit's record key, worked out once: `fresh` on the loop and `compile` on a worker
     /// both read it.
     pub(crate) keys: Box<[OnceLock<Option<blaze_cas::Key>>]>,
+    /// Each unit's narrow record key ([`compile::RecordInputs::key`] of its narrowed identity),
+    /// worked out once, as `keys` is.
+    pub(crate) narrow_keys: Box<[OnceLock<Option<blaze_cas::Key>>]>,
     /// The view and the mounts, as paths.
     pub(crate) mounted: Arc<files::Mounted>,
     /// What each build script prints, by its compile unit, when it provably prints only
@@ -1360,12 +1372,14 @@ impl Job {
             shared,
             graph,
             identities: (0..slots).map(|_| Default::default()).collect(),
+            narrowed: (0..slots).map(|_| Default::default()).collect(),
             scripts: (0..slots).map(|_| Default::default()).collect(),
             made: (0..slots).map(|_| Default::default()).collect(),
             phases: (0..slots)
                 .map(|_| Lock::new("serve.unit.phases", compile::Phases::default()))
                 .collect(),
             keys: (0..slots).map(|_| Default::default()).collect(),
+            narrow_keys: (0..slots).map(|_| Default::default()).collect(),
             runs: (0..slots).map(|_| Default::default()).collect(),
             mounted,
             inert: (0..slots).map(|_| Default::default()).collect(),
