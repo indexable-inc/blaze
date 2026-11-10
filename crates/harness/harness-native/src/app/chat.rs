@@ -2583,6 +2583,7 @@ impl App {
         if hit.is_empty() {
             return;
         }
+        crate::audio::cue("copy");
         let pulse = CopyFlash { whole: matches!(what, Copied::TableRow(..)), ..harness_native_render::select::Look::of(w).kick() };
         for id in hit {
             w.entity_from_id(id).set(pulse);
@@ -3454,13 +3455,14 @@ fn fill_row(row: View<'_>, r: &Row, ctx: &RowCtx<'_>, measure: &mut Measure<'_>)
         }
         Row::Ui { v, cell, block, code } => {
             genui::fill_in(row, v, cell, ctx.cells, ctx.ui, ctx.playing, measure);
-            // Its code: a quiet button in the gutter, shown while the view is hovered or its code is open.
+            // Its code's button, in the gutter.
             if let Some(b) = row.part("code_at").and_then(|z| z.part("code")).filter(|_| !block.is_empty()) {
-                b.action(&format!("chat:open:{}", code_key(block)));
-                tooltip(b, if *code { "Hide code" } else { "Show code" });
+                // Only while its code is open (to shut it): nothing appears beside a view under the pointer.
+                b.action(&if *code { format!("chat:open:{}", code_key(block)) } else { String::new() });
+                tooltip(b, if *code { "Hide code" } else { "" });
                 if let Some(i) = b.part("icon") {
-                    i.icon(CODE_ICON);
-                    crate::look::hover_show(i.entity(), *row.entity().id(), *code);
+                    i.icon(if *code { CODE_ICON } else { "" });
+                    crate::look::hover_show(i.entity(), *row.entity().id(), true);
                 }
             }
         }
