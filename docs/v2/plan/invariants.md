@@ -11,13 +11,16 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-17 invariants, 1 refinements, 1 reference models.
-By level: 6 tested, 12 simulated, 0 model-checked, 0 proved.
+24 invariants, 1 refinements, 1 reference models.
+By level: 12 tested, 13 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
 ### blaze-cargo
 
+- **`a_cgroups_footprint_is_its_charge_less_the_file_cache_the_kernel_can_drop`** *tested* (`crates/blaze-cargo/src/raw/memory.rs`): the cgroup's footprint is its charge less the file cache the kernel can drop, and nothing else is taken off. The directed case: a cgroup of 10 GiB of which 6 are file cache, 1 of that shared memory, is 5 GiB (the control: counting all of `file` as droppable says 4, counting none says 10). A line that only begins with a field's name (`file_mapped`, `shmem_thp`) is not the field.
+- **`a_noop_is_replayed_only_while_a_walk_would_say_the_same`** *tested* (`crates/blaze-cargo/src/serve/job/tests.rs`): a kept answer is replayed only in a state where the walk would say the same, and in the state where nothing changed it is replayed.
+  Controls: `a_noop_that_ignores_a_deleted_output`, `a_noop_that_ignores_a_traced_file_outside_the_view`, `a_noop_that_ignores_the_view_and_the_config`, `a_noop_that_ignores_another_job`.
 - **`every_recomputed_step_ends_in_a_terminal_reason`** *tested* (`crates/blaze-cargo/src/serve/why.rs`): every recomputed step of a build has a reason whose chain ends in a terminal reason other than `Unexplained`.
   Controls: `a_result_part_not_followed`, `an_unchanged_part_blamed`, `ends_in_the_order_reached`.
 - **`a_chain_blames_only_inputs_that_changed`** *tested* (`crates/blaze-cargo/src/serve/why.rs`): a chain's input is one the build's inputs really changed between the two builds, and it is called trivia exactly when no code changed in it.
@@ -54,8 +57,14 @@ By level: 6 tested, 12 simulated, 0 model-checked, 0 proved.
 - **`every_reaped_child_is_reported_under_interruption`** *simulated* (`crates/blaze-core/src/wait/tests.rs`): whatever interrupts the wait and whenever the child exits, every child is reaped once and its exit reported, by the reap's deadline or after it.
   Controls: `a_retry_with_the_first_timeout`, `a_lost_wakeup`, `a_reaped_child_never_reported`.
 
+### blaze-engine
+
+- **`a_kept_lookup_answers_as_the_manifests_do`** *tested* (`crates/blaze-engine/src/pin.rs`): a kept lookup answers what reading the manifests answers, whatever changed on the way since it was kept (the pin edited to one of the same length, a manifest added nearer, the root removed), and an unsettled manifest keeps nothing. The control at its end shows the kept answer is the one served while every stamp stands: a manifest rewritten in place with its stamp put back answers as kept, which is the very case [`SETTLED_NS`] keeps out of the file.
+
 ### blaze-graph
 
+- **`footprint_stays_under_the_ceiling_unless_one_task_alone_exceeds_it`** *simulated* (`crates/blaze-graph/src/footprint/tests.rs`): whatever the peaks, the grants and what the allocator keeps, the footprint never passes the ceiling; growth within a grant never needs the gate; a task fails only when it alone passes the ceiling, with [`TooBig`]; every other task is built.
+  Controls: `admission_by_grants_only`, `a_gate_that_never_purges`, `a_purge_read_before_it_lands`, `a_purge_read_purged_though_a_task_freed_in_its_lag`.
 - **`live_grants_fit_the_machine_budget_after_any_crash`** *tested* (`crates/blaze-graph/src/ledger/tests.rs`): whatever crashes, restarts and pid reuse, the live daemons' grants never sum past the machine budget, none grants room the ledger does not hold for it, none admits while the others' charges fill the machine, and every task that fits starts.
   Controls: `a_read_modify_write_without_the_lock`, `a_prune_that_ignores_start_time`, `an_allowance_that_leaves_out_a_daemon`.
 
@@ -63,6 +72,17 @@ By level: 6 tested, 12 simulated, 0 model-checked, 0 proved.
 
 - **`every_call_reaches_the_code_an_edit_left`** *tested* (`crates/blaze-link/src/tests/thunks.rs`): after any splice that succeeds, every branch in the image reaches its target directly or through a thunk, and every call to code an edit replaced reaches the replacement. Drawn: whether the callers call the leaves through their slots or directly, and up to three edits, each a leaf filled again under its own key. A splice refused must be the typed one for a thunk out of reach, and the link from scratch that takes its place is held to the same oracle. Each case links 200 MiB, so there are few.
   Controls: `a_stale_direct_branch_to_replaced_code`, `a_slot_left_on_replaced_code`, `an_edit_the_image_does_not_hold`.
+
+### blaze-lower
+
+- **`the_interface_text_moves_exactly_with_what_a_dependent_observes`** *tested* (`crates/blaze-lower/src/code/tests.rs`): any edit of a file that changes what a crate checking against it can observe (a signature, an item added or removed, a constant's value, a macro's tokens, a generic, `const`, `#[inline]`, `impl Trait` or default-method body, a body that defines an item or calls an unknown macro, a `cfg`, a line moved) changes its interface text, and an edit of a comment or of a plain function's body that moves no line leaves it as it was. Drawn: up to five items of any kind, and one edit of one of them.
+  Controls: `a_generic_body_left_out`, `a_const_body_left_out`, `an_inline_body_left_out`, `a_body_a_signature_hides_a_type_of_left_out`, `a_default_methods_body_left_out`, `a_body_that_defines_an_item_left_out`, `a_body_that_calls_an_unknown_macro_left_out`, `a_shape_with_no_line_count`.
+- **`a_dependents_key_moves_only_with_what_it_observes_of_a_dependency`** *tested* (`crates/blaze-lower/src/tests.rs`): an edit that leaves a crate's interface as it was (a comment; a plain function's body that keeps its lines) leaves the key identity of every unit that only checks against it as it was, and an edit of comments alone leaves every narrowed identity as it was, in the crate and above it; any other edit (a body, for a unit that builds code; a line moved; a signature) moves the identity of every unit that can observe it.
+  Controls: `a_check_keyed_by_its_dependencies_code`, `a_program_keyed_by_its_dependencies_interfaces`.
+
+### blaze-mem
+
+- **`frames_after_a_build_hold_at_most_the_warm_shelf_a_worker`** *tested* (`crates/blaze-mem/src/tests.rs`): once a build's tasks have all ended, the frame memory each of its worker threads still holds is at most [`frame::WARM`], whatever the tasks held, however they nested and in whatever order they ran; nothing else of the frames outlives them. What does outlive a build is a named owner's (here a [`Frame`] of the test's, standing for a cache), and its bytes are its own count, unchanged by the tasks. A build-shaped run: four workers, each a seeded sequence of tasks of the sizes a build's are, nested up to three deep, then one of twice the bound. The control: the same reading sees the memory while it is held (each worker's measured peak is at least its largest task's scratch, far past the bound), so a bound that holds after is not a reading that sees nothing. The directed case: twelve tasks nested, each holding a span of 8 MiB at once, more spans than a shelf keeps and 96 MiB together; the thread still ends within the bound.
 
 ### blaze-profile
 
