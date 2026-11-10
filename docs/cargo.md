@@ -417,7 +417,8 @@ The rest of the rustflags that are the link's, rather than the code's, are read 
 | `-C strip` | `none` is taken, `debuginfo` links the image without debug info, `symbols` is refused: blaze always writes the functions' local symbols |
 | `-C linker` | taken when it names a C driver or a system linker (`cc`, `gcc`, `clang`, `ld`, `ld.lld`, `mold`, ..., with a version or a cross prefix): blaze's linker writes what it would; any other program (a wrapper script, `zig cc`) is refused, since it can change the link in ways blaze cannot see |
 | `-C linker-flavor` | taken when it is the spelling blaze reads the target's link arguments in (`gcc`, `gnu-cc` on Linux, `darwin-cc` on macOS, `msvc` on Windows, `wasm-ld`); refused otherwise |
-| `-C default-linker-libraries`, `-C link-self-contained`, `-C prefer-dynamic`, `-C target-feature=+crt-static` | off is taken; on is refused |
+| `-C default-linker-libraries`, `-C link-self-contained`, `-C prefer-dynamic` | off is taken; on is refused |
+| `-C target-feature=+crt-static` | off is taken; on is taken for Windows (MSVC), where the standard library names `libcmt`, and refused elsewhere |
 
 A refused option fails the link with an error naming the flag as written, that it came from the
 rustflags, the target and why. A unit that links nothing (a library) is not refused for one, as

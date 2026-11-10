@@ -235,7 +235,7 @@ mod why {
     pub(super) const SELF_CONTAINED: &str = "blaze links the C runtime of the target's system, \
                                              never rustc's self-contained copies";
     pub(super) const CRT_STATIC: &str = "blaze links the C runtime dynamically, and a static C \
-                                         runtime is not implemented";
+                                         runtime is implemented only for Windows";
     pub(super) const PREFER_DYNAMIC: &str = "blaze links the standard library and every Rust \
                                              crate into the image, and has no `libstd-*.so` to \
                                              load instead";
@@ -331,6 +331,10 @@ pub(super) fn set(output: &mut Output, option: &CodegenOption) -> Result<(), &'s
         CodegenOption::PreferDynamic(true) => return Err(why::PREFER_DYNAMIC),
         // The C runtime linked dynamically, as blaze links it.
         CodegenOption::CrtStatic(false) => {}
+        // PE: the standard library and libc name `libcmt` for it (`#[link(.., cfg(target_feature
+        // = "crt-static"))]`), which blaze finds on the search path as it finds `msvcrt`, and
+        // follows its `/DEFAULTLIB`s.
+        CodegenOption::CrtStatic(true) if output.format == Format::Pe => {}
         CodegenOption::CrtStatic(true) => return Err(why::CRT_STATIC),
     }
     Ok(())
