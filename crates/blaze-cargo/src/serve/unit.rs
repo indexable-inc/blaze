@@ -711,6 +711,14 @@ impl UnitReader {
         self.front.db()
     }
 
+    /// What unit `unit`'s identity is made of ([`Lowered::identity_parts`]), for `blaze why`.
+    pub(crate) fn identity_parts(
+        &self,
+        unit: usize,
+    ) -> Result<Vec<blaze_lower::IdentityPart>, String> {
+        self.front.identity_parts(unit)
+    }
+
     pub(crate) fn checks(&self) -> &blaze_diagnostics::cache::Served {
         &self.checks
     }

@@ -364,6 +364,17 @@ fn own_code(db: &Db, krate: Crate) -> ContentId {
     hasher.finish()
 }
 
+/// What `krate`'s code can observe of its workspace file `file` ([`CodeText::strict`], so a
+/// crate that shadows a standard derive is covered too), for `blaze why` to tell an edit of
+/// comments from one of code ([`crate::Lowered::identity_parts`]). None for a file with no
+/// text, and for one whose crate keeps its whole text ([`CodeText::whole`]).
+pub(crate) fn observed(db: &Db, krate: Crate, file: base_db::FileId) -> Option<ContentId> {
+    let edition = krate.data(db).edition;
+    code_text(db, EditionedFileId::new(db, file, edition))
+        .filter(|code| !code.whole)
+        .map(|code| code.strict)
+}
+
 /// [`code_text_of`] of `file`'s parse; none for a file with no text (bytes that are not
 /// UTF-8), which [`own_code`] takes by its bytes' content and the compiler refuses to parse.
 ///

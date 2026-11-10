@@ -382,7 +382,7 @@ const SUBJECT: &str = "blaze v2 why unit subject 3";
 /// the daemon tells apart against the unit's last compute. Made on a miss only. The parts are
 /// made from inputs gathered again, and refused unless they make the very key the record was
 /// looked up under, so they never describe other inputs than the key's.
-fn missed(job: &Job, unit: usize) -> blaze_kernel::Miss {
+fn missed(job: &Job, reader: &UnitReader, unit: usize) -> blaze_kernel::Miss {
     use blaze_kernel::{Miss, Missed};
     let (item, subject) = match job.unit(unit) {
         Ok(u) => (span_unit(u), unit_subject(job, u)),
@@ -427,10 +427,13 @@ fn missed(job: &Job, unit: usize) -> blaze_kernel::Miss {
             // alloc: once a miss
             return Err("its record has no key, though its crate's identity is set".to_owned());
         };
-        let (key, parts) = with_record_inputs(job, unit, identity, |inputs| {
+        let (key, mut parts) = with_record_inputs(job, unit, identity, |inputs| {
             Ok((inputs.key(unit)?, inputs.parts(unit)?))
         })
         .map_err(|error| error.what)?;
+        // In place of its crate's identity as one part: what that identity is made of, so the
+        // file, setting or dependency that changed is the one named.
+        parts.extend(identity_named(job, unit, reader.identity_parts(unit)?)?);
         if key != looked {
             // alloc: once a miss
             return Err("its inputs changed between its record's lookup and now (a profile it reads was rewritten during the build), so its parts would not describe the key it missed under".to_owned());
@@ -440,6 +443,54 @@ fn missed(job: &Job, unit: usize) -> blaze_kernel::Miss {
         Ok(miss)
     })();
     made.unwrap_or_else(|why| refused(subject, Missed::Failed(why)))
+}
+
+/// What unit `unit`'s identity in the front end is `made_of`
+/// ([`blaze_lower::Lowered::identity_parts`]) as parts of its record's key: each file by its
+/// path, and each crate it depends on as the result of that crate's unit, which a chain of
+/// reasons follows.
+fn identity_named(
+    job: &Job,
+    unit: usize,
+    made_of: Vec<blaze_lower::IdentityPart>,
+) -> Result<Vec<blaze_kernel::Part>, String> {
+    use blaze_kernel::Part;
+    use blaze_lower::IdentityPart;
+    let u = job.unit(unit).map_err(|error| error.what)?;
+    // The unit whose crate `krate` is: one this unit depends on, else (a crate of the
+    // standard library, which no unit names as a dependency) the first of the job's.
+    let unit_of = |krate| {
+        u.dependencies
+            .iter()
+            .map(|dep| dep.index)
+            .chain(0..job.graph.len())
+            .find(|&at| job.crates.krate(at) == Some(krate))
+            .and_then(|at| job.unit(at).ok())
+            .map(span_unit)
+    };
+    // alloc: once a miss, a part each thing its identity is made of
+    let mut parts = Vec::with_capacity(made_of.len());
+    for part in made_of {
+        parts.push(match part {
+            IdentityPart::Settings(id) => Part::new(
+                "its crate's settings in the front end (its root's path, cfgs, env, edition and target)",
+                Some(id),
+            ),
+            IdentityPart::File { path, content, code } => Part::file(path, Some(content), code),
+            IdentityPart::Files { what, content } => Part::new(what, Some(content)),
+            IdentityPart::Appended(id) => {
+                Part::new("the module the build appends to its root file (a test harness)", Some(id))
+            }
+            IdentityPart::Spelling(id) => Part::new("how cargo passes its root file", Some(id)),
+            // alloc: once a miss, a part's name
+            IdentityPart::Dependency { krate, name, identity } => Part::result(
+                format!("the crate `{name}` it depends on, as the front end has it"),
+                Some(identity),
+                unit_of(krate),
+            ),
+        });
+    }
+    Ok(parts)
 }
 
 /// What a unit's record key is made of. The process's environment is not among it: a record
@@ -550,7 +601,8 @@ impl RecordInputs<'_> {
 
     /// The parts of [`Self::key`] by name, each hashed alone, for `blaze why`: the unit's own
     /// fields and each dependency by the name it is used as, so a changed feature or profile
-    /// is named. Made on a miss only.
+    /// is named. Made on a miss only. All but [`Self::identity`], which its caller names by
+    /// what it is made of ([`identity_named`]).
     pub(crate) fn parts(&self, unit: usize) -> Result<Vec<blaze_kernel::Part>, ApiError> {
         use blaze_kernel::Part;
         let bytes = |name: &str, bytes: &[u8]| {
@@ -571,10 +623,6 @@ impl RecordInputs<'_> {
         let u = &self.unit;
         // alloc: once a miss, a part each part of the key
         let mut parts = vec![
-            id(
-                "the crate's identity in the front end (its sources and its dependencies')",
-                Some(&self.identity),
-            ),
             cbor("package", &u.pkg_id)?,
             cbor("target", u.target)?,
             cbor("profile", u.profile)?,
@@ -1305,7 +1353,7 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Re
         kept(job, unit)?
     };
     if kept.is_none() {
-        let miss = missed(job, unit);
+        let miss = missed(job, reader, unit);
         lock(slot).misses.push(miss);
     }
     if let Some(Kept { record, puts, profiles }) = kept {

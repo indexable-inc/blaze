@@ -1128,11 +1128,21 @@ fn label_run(tag: Tag, package: &str) {
 /// Made on a miss only.
 fn run_missed(job: &Job, unit: usize, prepared: &Prepared) -> blaze_kernel::Miss {
     use blaze_kernel::Part;
+    // The unit that compiles the script, whose result its code is: what a chain follows.
+    let compiled = job.unit(unit).ok().and_then(|run| {
+        run.dependencies
+            .iter()
+            .filter_map(|dep| job.unit(dep.index).ok())
+            .find(|it| {
+                it.target.is_custom_build() && it.mode == blaze_units::schema::Mode::Build
+            })
+            .map(super::compile::span_unit)
+    });
     run_miss(job, unit, |subject, item| {
         let key = prepared.spec.key;
         let mut hasher = blaze_ids::Hasher::new("blaze v2 why run key 1");
         hasher.id(&key.code).id(&key.given);
-        let parts = std::iter::once(Part::new("the build script's code", Some(key.code)))
+        let parts = std::iter::once(Part::result("the build script's code", Some(key.code), compiled))
             .chain(
                 prepared.made.parts().into_iter().map(|(name, hash)| Part::new(name, Some(hash))),
             )

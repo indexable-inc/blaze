@@ -1022,6 +1022,147 @@ impl Lowered {
         Some(identity_of(&self.db, krate, &self.spellings, &mut self.identities))
     }
 
+    /// What unit `unit`'s identity ([`Lowered::identity`]) is made of, one part each, for
+    /// `blaze why` to name the one that changed (docs/v2/plan/design/why.md): its crate's own
+    /// settings, each file it is made from (its root file alone for a crate that reads no
+    /// other; a library's source root as one part, as it does not change; else every file of
+    /// its source root by path, a workspace crate's Rust files with what code can observe of
+    /// them, the first [`FILES_NAMED`] by path and the rest as one part), the module the
+    /// build appended to its root, how cargo passes its root, and each crate it depends on
+    /// with that crate's identity. Asked on a miss of the unit's record only, with the
+    /// identity worked out ([`Lowered::identity`]) since the last write.
+    ///
+    /// The parts that are not files are hashed here as [`identity_of`] hashes them and
+    /// refused unless they make the identity the front end holds, so they never describe
+    /// another identity than the one a key was made from; the files are those of the source
+    /// root whose content that identity holds.
+    pub fn identity_parts(&self, unit: usize) -> Result<Vec<IdentityPart>, String> {
+        let db = &self.db;
+        let Some(krate) = self.crates.krate(unit) else {
+            return Err("it has no crate in the front end".to_owned()); // alloc: error path
+        };
+        let Some(known) = self.identities.get(&krate).copied() else {
+            // alloc: error path
+            return Err(
+                "its crate's identity was not worked out since the front end's last write"
+                    .to_owned(),
+            );
+        };
+        let data = krate.data(db);
+        let root_file = data.root_file_id;
+        let root = db.source_root(db.file_source_root(root_file).source_root_id(db));
+        let settings = krate.content(db);
+        let alone = code::root_alone(db, krate);
+        let mut hasher = Hasher::new(IDENTITY);
+        hasher.id(&settings).id(&db.file_text(root_file).content(db));
+        match alone {
+            true => hasher.update(ROOT_ALONE),
+            false => hasher.id(&root.content(db)),
+        };
+        let mut spelled = Hasher::new(IDENTITY_PART);
+        match self.spellings.of(krate) {
+            None => {
+                hasher.update(&[0]);
+                spelled.update(&[0]);
+            }
+            Some(spelling) => {
+                hasher.update(&[1]);
+                spelled.update(&[1]);
+                for text in [&spelling.dir, &spelling.passed] {
+                    hasher.update(&(text.len() as u64).to_le_bytes());
+                    hasher.update(text.as_bytes());
+                    spelled.part(text.as_bytes());
+                }
+            }
+        }
+        // alloc: once a unit's record missed, a part each thing its identity is made of
+        let mut parts = vec![IdentityPart::Settings(settings)];
+        let set = root.source_root_ref(db);
+        let path = |file: &FileId| {
+            set.path_for_file(file).and_then(|it| it.as_path()).map(|it| it.as_str())
+        };
+        let file = |path: &str, file: FileId| IdentityPart::File {
+            path: path.to_owned(), // alloc: as above
+            content: db.file_content(file),
+            code: match !set.is_library && path.ends_with(".rs") {
+                true => code::observed(db, krate, file),
+                false => None,
+            },
+        };
+        // alloc: as above
+        let mut files: Vec<(&str, FileId)> = Vec::new();
+        let mut unpathed = false;
+        if !alone && !set.is_library {
+            for at in set.iter() {
+                match path(&at) {
+                    Some(path) => files.push((path, at)),
+                    None => unpathed = true,
+                }
+            }
+            files.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        }
+        match (alone, path(&root_file)) {
+            (true, Some(path)) => parts.push(file(path, root_file)),
+            (true, None) => parts.push(IdentityPart::Files {
+                what: "its root file (which has no path)",
+                content: db.file_content(root_file),
+            }),
+            (false, _) if set.is_library => parts.push(IdentityPart::Files {
+                what: "its source files (a library's, taken as one)",
+                content: root.content(db),
+            }),
+            (false, _) if unpathed => parts.push(IdentityPart::Files {
+                what: "the files of its source root (one of which has no path)",
+                content: root.content(db),
+            }),
+            (false, _) => {
+                let named = files.len().min(FILES_NAMED);
+                for (path, at) in &files[..named] {
+                    parts.push(file(path, *at));
+                }
+                if files.len() > named {
+                    let mut rest = Hasher::new(IDENTITY_PART);
+                    for (path, at) in &files[named..] {
+                        rest.part(path.as_bytes()).id(&db.file_content(*at));
+                    }
+                    parts.push(IdentityPart::Files {
+                        what: "the files of its source root past the first 4096 by path",
+                        content: rest.finish(),
+                    });
+                }
+            }
+        }
+        let appended = db.file_text(root_file).appended_root_module(db);
+        parts.push(IdentityPart::Appended(
+            Hasher::new(IDENTITY_PART).opt_part(appended).finish(),
+        ));
+        parts.push(IdentityPart::Spelling(spelled.finish()));
+        hasher.update(&(data.dependencies.len() as u64).to_le_bytes());
+        for dep in &data.dependencies {
+            let Some(identity) = self.identities.get(&dep.crate_id).copied() else {
+                // alloc: error path
+                return Err(format!(
+                    "the identity of `{}`, a crate it depends on, was not worked out since the front end's last write",
+                    dep.name
+                ));
+            };
+            hasher.id(&identity);
+            parts.push(IdentityPart::Dependency {
+                krate: dep.crate_id,
+                name: dep.name.to_string(), // alloc: as `parts`
+                identity,
+            });
+        }
+        if hasher.finish() != known {
+            // alloc: error path
+            return Err(
+                "what its crate's identity is made of now does not make the identity the front end holds, so its parts would not describe the key it missed under"
+                    .to_owned(),
+            );
+        }
+        Ok(parts)
+    }
+
     /// The first variable of the process that a crate of the front end read through `env!` or
     /// `option_env!` ([`base_db::process_env_reads`], sorted by crate and name) whose value in
     /// `now`, a request's environment, is not the one the database holds, with the crate that
@@ -1421,6 +1562,32 @@ const INCLUDED_MOVED: Trigger<'static> =
     Trigger::named("files include_bytes! or include_str! read moved on disk");
 
 const IDENTITY: &str = "blaze v2 cargo unit identity 5";
+
+/// The domain of a part of an identity hashed alone ([`Lowered::identity_parts`]).
+const IDENTITY_PART: &str = "blaze v2 cargo unit identity part 1";
+
+/// The most files of a source root [`Lowered::identity_parts`] names one by one.
+pub const FILES_NAMED: usize = 4096;
+
+/// One thing a unit's identity is made of ([`Lowered::identity_parts`]).
+#[derive(Clone)]
+pub enum IdentityPart {
+    /// Its crate's own settings ([`base_db::Crate::content`]: its root's path, cfgs, env,
+    /// edition, target and the rest).
+    Settings(ContentId),
+    /// A file it is made from, by its absolute path: its bytes' content, and for a Rust file
+    /// of a workspace crate what code can observe of it (its text with each comment no macro
+    /// sees as its shape), so an edit that moves the first and not the second changed no item.
+    File { path: String, content: ContentId, code: Option<ContentId> },
+    /// Files it is made from that are not named one by one: which (`what`), and their content.
+    Files { what: &'static str, content: ContentId },
+    /// The module the build appended to its root (a test harness), or that there is none.
+    Appended(ContentId),
+    /// How cargo passes its root file.
+    Spelling(ContentId),
+    /// A crate it depends on, by the name its code uses, with that crate's identity.
+    Dependency { krate: Crate, name: String, identity: ContentId },
+}
 
 /// What an identity holds in place of its source root's content for a crate that reads its
 /// root file alone ([`code::root_alone`]). No content ID is these bytes' length, so no
