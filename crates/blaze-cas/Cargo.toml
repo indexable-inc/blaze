@@ -17,11 +17,15 @@ doctest = false
 blaze-bytes.workspace = true
 blaze-core.workspace = true
 blaze-format.workspace = true
+blaze-graph.workspace = true
 blaze-hash.workspace = true
 blaze-ids.workspace = true
 blaze-mem.workspace = true
 blaze-reclaim.workspace = true
 blaze-serde.workspace = true
+blaze-spin.workspace = true
+crossbeam-channel.workspace = true
+crossbeam-queue.workspace = true
 lz4_flex.workspace = true
 serde = { workspace = true, features = ["derive"] }
 tracing.workspace = true

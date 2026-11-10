@@ -275,7 +275,7 @@ fn at(start: u32, end: u32) -> Span {
 /// A store in `sim`, open and ready.
 fn opened(sim: &mut Sim) -> Store {
     let mut effects = Vec::new();
-    let config = Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48 };
+    let config = Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48, load_tags: (1 << 48) + (1 << 32), loader: blaze_cas::Loader::Pumped };
     let mut store = Store::open(config, &mut effects);
     run_until_idle(sim, &mut effects, |completion, effects| {
         let durable = store.complete(completion, effects);
@@ -294,7 +294,7 @@ fn modules() -> Modules {
 fn opened_in(sim: &mut Sim, dir: &str, layers: &[&str]) -> Store {
     let mut effects = Vec::new();
     let layers = layers.iter().map(|it| FileName::new(it).unwrap()).collect();
-    let config = Config { dir: FileName::new(dir).unwrap(), layers, tags: 1 << 48 };
+    let config = Config { dir: FileName::new(dir).unwrap(), layers, tags: 1 << 48, load_tags: (1 << 48) + (1 << 32), loader: blaze_cas::Loader::Pumped };
     let mut store = Store::open(config, &mut effects);
     run_until_idle(sim, &mut effects, |completion, effects| {
         store.complete(completion, effects);

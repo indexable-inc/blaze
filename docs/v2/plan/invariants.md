@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-15 invariants, 0 refinements, 1 reference models.
-By level: 8 tested, 7 simulated, 0 model-checked, 0 proved.
+17 invariants, 1 refinements, 1 reference models.
+By level: 6 tested, 12 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
@@ -24,6 +24,17 @@ By level: 8 tested, 7 simulated, 0 model-checked, 0 proved.
   Controls: `a_result_part_not_followed`, `an_unchanged_part_blamed`, `ends_in_the_order_reached`.
 - **`the_summary_is_the_same_whatever_order_the_misses_arrive_in`** *tested* (`crates/blaze-cargo/src/serve/why.rs`): the summary is deterministic for a given pair of trees: the same reports, and the same reasons, whatever order the build's misses arrive in.
   Controls: `a_result_part_not_followed`, `an_unchanged_part_blamed`, `ends_in_the_order_reached`.
+
+### blaze-cas
+
+- **`the_pool_reads_back_what_its_files_hold`** *simulated* (`crates/blaze-cas/src/pool/tests.rs`): whatever the faults, the schedule, the evictions and the crashes, a read hands back the bytes its file holds or a refusal its faults explain, nothing pinned or loading is given back, the process holds exactly the pages in use, and every load ends.
+  Controls: `an_eviction_that_keeps_the_version`, `an_eviction_of_a_pinned_page`, `pages_unloaded_before_they_are_given_back`, `a_page_loaded_as_its_read_is_asked`, `a_load_with_no_block_checks`, `a_failed_load_kept`, `a_commit_that_does_not_pin_its_file_s_last_page`, `a_prefetch_issued_while_a_demand_load_is_in_flight`, `block_checks_that_stop_at_the_first_bad_block`.
+- **`a_crash_at_any_point_loses_nothing_durable_and_serves_nothing_torn`** *simulated* (`crates/blaze-cas/src/tests.rs`): at any point of any number of commits, under injected IO failures, a crash loses no put that was reported durable, and the store opens with only whole values.
+  Controls: `a_put_reported_durable_that_no_sync_made_so`.
+- **`a_crash_leaves_every_pack_and_its_checks_as_the_head_names_them`** *simulated* (`crates/blaze-cas/src/tests/block_checks.rs`): after a crash at any point of any number of commits, under injected IO failures, the store opens; each pack's checks file holds the checks of the blocks its head names, and the store holds the same; every put reported durable reads back the bytes it was given; and no value reads back other bytes than were put. `HEGEL_TEST_CASES=<n>` runs it longer.
+  Controls: `a_head_written_before_its_syncs`.
+- **`two_stores_placing_one_value_at_one_path_both_succeed_in_any_order`** *simulated* (`crates/blaze-cas/src/tests/place_race.rs`): any schedule of two stores placing the same value at one shared path ends with both Ok and the path holding the value. `HEGEL_TEST_CASES=<n>` runs it longer.
+  Controls: `a_remove_then_clone_onto_the_path`.
 
 ### blaze-codegen
 
@@ -53,19 +64,19 @@ By level: 8 tested, 7 simulated, 0 model-checked, 0 proved.
 - **`every_call_reaches_the_code_an_edit_left`** *tested* (`crates/blaze-link/src/tests/thunks.rs`): after any splice that succeeds, every branch in the image reaches its target directly or through a thunk, and every call to code an edit replaced reaches the replacement. Drawn: whether the callers call the leaves through their slots or directly, and up to three edits, each a leaf filled again under its own key. A splice refused must be the typed one for a thunk out of reach, and the link from scratch that takes its place is held to the same oracle. Each case links 200 MiB, so there are few.
   Controls: `a_stale_direct_branch_to_replaced_code`, `a_slot_left_on_replaced_code`, `an_edit_the_image_does_not_hold`.
 
-### blaze-lower
-
-- **`the_interface_text_moves_exactly_with_what_a_dependent_observes`** *tested* (`crates/blaze-lower/src/code/tests.rs`): any edit of a file that changes what a crate checking against it can observe (a signature, an item added or removed, a constant's value, a macro's tokens, a generic, `const`, `#[inline]`, `impl Trait` or default-method body, a body that defines an item or calls an unknown macro, a `cfg`, a line moved) changes its interface text, and an edit of a comment or of a plain function's body that moves no line leaves it as it was. Drawn: up to five items of any kind, and one edit of one of them.
-  Controls: `a_generic_body_left_out`, `a_const_body_left_out`, `an_inline_body_left_out`, `a_body_a_signature_hides_a_type_of_left_out`, `a_default_methods_body_left_out`, `a_body_that_defines_an_item_left_out`, `a_body_that_calls_an_unknown_macro_left_out`, `a_shape_with_no_line_count`.
-- **`a_dependents_key_moves_only_with_what_it_observes_of_a_dependency`** *tested* (`crates/blaze-lower/src/tests.rs`): an edit that leaves a crate's interface as it was (a comment; a plain function's body that keeps its lines) leaves the key identity of every unit that only checks against it as it was, and an edit of comments alone leaves every narrowed identity as it was, in the crate and above it; any other edit (a body, for a unit that builds code; a line moved; a signature) moves the identity of every unit that can observe it.
-  Controls: `a_check_keyed_by_its_dependencies_code`, `a_program_keyed_by_its_dependencies_interfaces`.
-
 ### blaze-profile
 
 - **`every_name_reads_back_as_recorded_or_is_counted_forgotten`** *simulated* (`crates/blaze-profile/src/flight/names/tests.rs`): every name a row holds reads back as the text recorded or is counted as forgotten, never as another text; and nothing is forgotten in a run that lost no row.
   Controls: `a_foreign_name_written_with_no_link`, `a_generation_begun_with_no_gen_row`, `a_reader_that_ignores_the_window`, `a_table_kept_across_a_park`.
 - **`every_row_is_in_the_history_once_after_any_crash`** *simulated* (`crates/blaze-profile/src/history/files/tests.rs`): whatever the faults, wherever the power goes out, every row handed to the history is listed, handed back or left to read, exactly once, and the history opens.
   Controls: `a_rename_with_no_sync_before`, `what_a_flush_consumed_marked_after_its_commit`.
+
+## Refinements
+
+### blaze-cas
+
+- **`the_store_reads_back_what_a_map_holds`** *simulated* (`crates/blaze-cas/src/tests/model_check.rs`): the store is a map. Any run of puts, gets, flushes, settles and reopens reads back what a `BTreeMap` given the same puts holds, refuses other bytes under a key it has, and verifies clean. `HEGEL_TEST_CASES=<n>` runs it longer.
+  Controls: `a_flush_that_commits_nothing`.
 
 ## Reference models
 

@@ -12,7 +12,10 @@
 //!   lookup.
 //! - **Verified**: [`Store::get`] checks a value's content hash before handing it out; a value
 //!   that fails is [`Corrupt`], never served. Paths of archives and outputs can't escape their
-//!   directory.
+//!   directory. Each pack has a CRC-32C per 4 KiB block beside it (`checks-<n>`, [`checks`]),
+//!   durable before the head that names the blocks: the open checks every block its recovery
+//!   scan reads, and a reload into the store's buffer pool is checked by them
+//!   (docs/v2/plan/design/store-pool.md).
 //! - **Only the daemon writes the store**: user code's outputs are hashed and checked by the
 //!   daemon before they are put. Each tenant has a store; only the read-only base layer of
 //!   public dependencies is shared.
@@ -29,7 +32,11 @@
 //! (docs/v2/plan/design/memory.md): a lookup that hits and a warm put allocate nothing.
 
 #![feature(allocator_api)]
+// `#![blaze::sans_io]` marks a sans-IO core for `blaze::sans_io_core` (the pool's loads and sweep).
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
 
+mod checks;
 pub mod chunk;
 mod cold;
 mod copy;
@@ -39,10 +46,25 @@ mod disk;
 mod driven;
 mod flags;
 mod handle;
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "lane 4b of docs/v2/plan/design/store-pool.md: the pinned read and the sweep are the readers' to call once they are on the pool (the read port's step 3)")
+)]
+mod hot;
 mod index;
 #[cfg(all(test, blaze_check))]
 mod model;
 mod peers;
+// The store's buffer pool (docs/v2/plan/design/store-pool.md): its core and its DST. Its atomics
+// are `std`'s under the model checker too (`cfg(blaze_check)`): they are laid over reserved
+// memory, which the model checker's do not model, so a model run does not schedule the pool's
+// state words or its pins. Their proof is the pool's own DST (`pool/tests.rs`), not a model.
+#[cfg_attr(
+    any(not(test), blaze_check),
+    allow(dead_code, reason = "lane 4b of docs/v2/plan/design/store-pool.md: the store commits through the pool (`hot`); its reads move onto it next, and its tests are not built under the model checker")
+)]
+mod pool;
+mod pump;
 mod read;
 pub mod remote;
 mod segment;
@@ -58,7 +80,7 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 use std::{collections::VecDeque, fmt, sync::Arc};
 
-use blaze_core::{Completion, Done, Effect, FileName, Mapping, Tag};
+use blaze_core::{Cache, Completion, Done, Effect, FileName, Mapping, Tag};
 use blaze_format::{SchemaHash, tiers::BufferColumns};
 use blaze_hash::{ByHash, ByHashSet, HashMap, HashSet};
 use blaze_ids::{ContentId, Hasher, radix};
@@ -77,6 +99,7 @@ pub use crate::driven::Driven;
 use crate::flags::{FLAGS, Flag, Row};
 pub use crate::handle::Handle;
 pub use crate::peers::SharedConfig;
+pub use crate::pump::{Inline, Pump, PumpError};
 pub use crate::read::Pinned;
 use crate::read::{
     ExternalView, Index, Look, PackView, Place, Seg, Shared, Spot, TierView, View, carry_flags,
@@ -88,8 +111,9 @@ use crate::segment::{COPY, Chunk, ChunkRef, FRAME, Own, Segment};
 use crate::table::{Held, Table};
 
 /// The format of everything in a store's directory. A store of another refuses to open, naming
-/// both; nothing reads it as this one.
-pub(crate) const FORMAT: u32 = 3;
+/// both; nothing reads it as this one, and there is no migration: the store is rebuilt from
+/// what made it. Format 4 added each pack's block checks ([`checks`], `checks-<n>`).
+pub(crate) const FORMAT: u32 = 4;
 
 /// A pack is closed for appends once it is this long; a record longer than that has a pack of
 /// its own.
@@ -461,6 +485,37 @@ pub struct Config {
     pub layers: Vec<FileName>,
     /// Tags it asks with are `tags..tags + 2^32`.
     pub tags: u64,
+    /// Tags the loads of its buffer pool ask with: `load_tags..load_tags + 2^32`, a range
+    /// apart from `tags`'s (a load's tag names its slot and its read, so the loads core takes
+    /// a whole range of its own; `pool::Loads`). A store whose two ranges overlap is refused
+    /// as it is made.
+    pub load_tags: u64,
+    /// How its reads' misses are loaded.
+    pub loader: Loader,
+}
+
+impl Config {
+    /// Whether its two tag ranges, each 2^32 wide, are apart and inside a `u64`.
+    fn tags_apart(&self) -> bool {
+        const WIDE: u64 = 1 << 32;
+        let inside = |from: u64| from.checked_add(WIDE).is_some();
+        inside(self.tags) && inside(self.load_tags) && self.tags.abs_diff(self.load_tags) >= WIDE
+    }
+}
+
+/// How a store loads the pages a read needs that are not in memory
+/// (docs/v2/plan/design/store-pool.md, lane 4b). The store itself does no IO either way: a miss
+/// asks for its pages as effects, and this says who completes them. Nothing reads it until the
+/// store's reads are on its buffer pool; a store maps what it reads until then.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Loader {
+    /// A thread of the store's own drives the pool's reads on the target's native driver, and a
+    /// task that reads waits for its load through the one deadline wait: the daemon's.
+    #[default]
+    Thread,
+    /// Whoever drives the store's effects loads a miss by pumping them to completion where the
+    /// read is made: a test on the simulation, a tool. The store starts no thread.
+    Pumped,
 }
 
 /// Why a store stopped: it could not open, or its IO failed [`FAILURES_MOST`] times in a row.
@@ -638,6 +693,8 @@ pub struct Store {
     failures: u32,
     /// What it publishes for readers and writers.
     shared: Arc<Shared>,
+    /// Its buffer pool, and which of its files are open in it ([`hot`]).
+    hot: hot::Hot,
     /// Its own writer (segment 0): its puts, and the records a settle moves.
     own: Own,
     /// Each writer's segment as far as it has been drained, by number.
@@ -714,6 +771,16 @@ pub struct Store {
     /// value at the same path can lose to.
     #[cfg(test)]
     plant_clear_then_clone: bool,
+    /// A planted bug for the commit's crash tests (docs/v2/plan/design/store-pool.md, section 7,
+    /// bug 7): the head is written once a commit's writes have completed, before the syncs of
+    /// its packs and their checks have, so a crash can leave a head naming bytes that are not
+    /// durable.
+    #[cfg(test)]
+    plant_head_before_syncs: bool,
+    /// A planted bug for the refinement against a map (`tests::model_check`): a commit drains
+    /// no writer's segment, so a flush makes nothing durable and a reopen has lost every put.
+    #[cfg(test)]
+    plant_no_drain: bool,
 }
 
 /// A way to read a store from any thread, with no lock: [`Store::reader`].
@@ -907,6 +974,29 @@ enum Op {
     Sync {
         pack: usize,
     },
+    /// A pack's block checks read as its tier opens ([`checks`]).
+    Checks {
+        tier: usize,
+        pack: usize,
+    },
+    /// A pack's checks cut back to those of its committed blocks, before a commit adds to them.
+    TruncateChecks {
+        pack: usize,
+    },
+    /// The checks of the blocks a commit adds to a pack, written after those committed.
+    WriteChecks {
+        pack: usize,
+    },
+    SyncChecks {
+        pack: usize,
+    },
+    /// The checks of a pack removed, removed with it.
+    RemoveChecks {
+        pack: usize,
+    },
+    /// A sync the planted commit does not wait for (`Store::plant_head_before_syncs`).
+    #[cfg(test)]
+    Unwaited,
     WriteExternal {
         content: ContentId,
     },
@@ -1145,6 +1235,9 @@ struct Pack {
     memory: Vec<u8>,
     /// What the head on disk says is the store's.
     committed: u64,
+    /// The check of each block of its committed bytes ([`checks`]): what `checks-<n>` holds as
+    /// far as the head names, kept for the pack's life.
+    checks: Vec<u32>,
     indexed: u64,
     end: u64,
     dead: u64,
@@ -1228,6 +1321,13 @@ impl Training {
 struct Commit {
     /// Each pack written and the end it is written to.
     packs: Vec<(usize, u64)>,
+    /// The check of each block it adds to each of `packs`, in their order.
+    checks: Vec<Vec<u32>>,
+    /// Its append to each of `packs`, in their order, once begun: the pins of the pool's pages
+    /// its bytes are written from, held until the head names them or the commit is given up.
+    appends: Vec<Option<hot::PackAppend>>,
+    /// The writes of each of `packs` not yet answered: its sync is asked after its last.
+    writes: Vec<u32>,
     externals: Vec<ContentId>,
     /// The slot of the index table it wrote, and the last batch that table holds.
     index: Option<(u8, u64)>,
@@ -1240,8 +1340,10 @@ struct Commit {
 }
 
 impl Commit {
-    fn to(&self, pack: usize) -> Option<u64> {
-        self.packs.iter().find(|(it, _)| *it == pack).map(|(_, to)| *to)
+    /// The checks of the blocks it adds to `pack`.
+    fn checks_of(&self, pack: usize) -> Option<&[u32]> {
+        let at = self.packs.iter().position(|(it, _)| *it == pack)?;
+        self.checks.get(at).map(Vec::as_slice)
     }
 }
 
@@ -1311,6 +1413,18 @@ fn clones_from_file(header: &RecordHeader, form: Form) -> bool {
     header.kind == Kind::Output && header.raw >= CLONE_FROM && form != Form::External
 }
 
+/// The op a commit's sync is asked as: `op`, which the head waits for, or (`waited` false, only
+/// ever under a test's planted bug) one it does not.
+fn sync_op(op: Op, waited: bool) -> Op {
+    #[cfg(test)]
+    let op = match waited {
+        true => op,
+        false => Op::Unwaited,
+    };
+    debug_assert!(waited || cfg!(test), "a commit's head waits for every sync");
+    op
+}
+
 fn describe(done: &Done) -> String {
     match done {
         // clone: the message of an error
@@ -1330,6 +1444,14 @@ impl Store {
     }
 
     fn new(config: Config, peers: Option<peers::Peers>) -> Store {
+        assert!(
+            config.tags_apart(),
+            "the store in {} is given tags from {} and its pool's loads tags from {}: the two \
+             ranges, 2^32 wide each, overlap (Config::tags, Config::load_tags)",
+            config.dir,
+            config.tags,
+            config.load_tags
+        );
         // alloc: setup, once per store
         let mut tiers = vec![Tier::new(config.dir.clone())];
         tiers.extend(config.layers.iter().cloned().map(Tier::new));
@@ -1347,13 +1469,15 @@ impl Store {
         // names it, tells its staged names from those of any other daemon's store.
         let staging = ContentId::of(STAGING_DOMAIN, config.dir.as_str().as_bytes());
         let staging = u64::from_le_bytes(staging.0[..8].try_into().expect("8 bytes"));
-        Store {
+        let hot = hot::Hot::new(config.load_tags);
+        let mut store = Store {
             tags: Tags { range: blaze_core::Tags::new(config.tags), ops: HashMap::new_in(Global) }, // alloc: the store's own table, for its life
             config,
             tiers,
             broken: None,
             failures: 0,
             shared,
+            hot,
             own,
             drains,
             draining: Batch::default(),
@@ -1392,7 +1516,20 @@ impl Store {
             move_probed: None,
             #[cfg(test)]
             plant_clear_then_clone: false,
+            #[cfg(test)]
+            plant_head_before_syncs: false,
+            #[cfg(test)]
+            plant_no_drain: false,
+        };
+        // A pool the system refused to reserve stops the store, naming why: nothing is read
+        // another way.
+        // alloc: the error that breaks the store
+        if let Some(why) = store.hot.refused().map(str::to_owned) {
+            // clone: the error that breaks the store
+            let dir = store.config.dir.clone();
+            store.fail(dir, why);
         }
+        store
     }
 
     /// Asks that the store's directory be made the user's alone, and checked to be with all in
@@ -2025,10 +2162,15 @@ impl Store {
         }
     }
 
+    /// Asks that the file of the own pack `pack`, which the head names removed, be removed, and
+    /// its checks with it.
     fn remove_pack(&mut self, pack: usize, effects: &mut Vec<Effect>) {
         let tag = self.tags.ask(Op::RemovePack { pack });
         // clone: the effect owns its file name; once per pack removed
         effects.push(Effect::Remove { file: self.tiers[0].packs[pack].file.clone(), tag });
+        let tag = self.tags.ask(Op::RemoveChecks { pack });
+        let file = self.tiers[0].file(&disk::checks_file(pack));
+        effects.push(Effect::Remove { file, tag });
     }
 
     /// Checks every value of `kind` (all, for `None`): what a scrub or the oracle runs.
@@ -2788,7 +2930,7 @@ impl Store {
     }
 
     pub fn owns(&self, tag: Tag) -> bool {
-        self.tags.range.owns(tag)
+        self.tags.range.owns(tag) || self.hot.owns(tag)
     }
 
     /// Takes a completion of its own: a mapping, an append, a sync. Says which puts its
@@ -2797,6 +2939,9 @@ impl Store {
     /// no completion, so a waiter checks [`Store::durable`] rather than wait on this list.
     pub fn complete(&mut self, completion: Completion, effects: &mut Vec<Effect>) -> Vec<Ticket> {
         self.tidy();
+        if self.hot.owns(completion.tag) {
+            return self.tail_loaded(completion, effects);
+        }
         // alloc: empty, allocates nothing
         let Some(op) = self.tags.ops.remove(&completion.tag) else { return Vec::new() };
         let done = completion.done;
@@ -3009,6 +3154,20 @@ impl Store {
                     ));
                 }
             }
+            Op::RemoveChecks { pack } => {
+                if !matches!(done, Done::Removed) {
+                    let file = self.tiers[0].file(&disk::checks_file(pack));
+                    // alloc: a problem reported
+                    self.problems.push(format!(
+                        "{file} was left behind (it is removed at the next open): {}",
+                        describe(&done)
+                    ));
+                }
+            }
+            Op::Checks { tier, pack } => self.checks_read(tier, pack, done, effects),
+            // The planted commit wrote its head without it.
+            #[cfg(test)]
+            Op::Unwaited => {}
             Op::Peers => self.peers_listed(done, effects),
             Op::Announce => self.announced(&done, effects),
             op => return self.step(&op, &done, effects),
@@ -3058,6 +3217,8 @@ impl Store {
             // alloc: once per pack made (a unit's first, or one past `PACK_MOST`); appends then reuse it
             memory: disk::pack_header(unit.0).to_vec(),
             committed: 0,
+            // alloc: empty, allocates nothing
+            checks: Vec::new(),
             indexed: 0,
             end: PACK_HEADER,
             dead: 0,
@@ -3700,9 +3861,15 @@ impl Store {
         if self.broken.is_some() {
             return;
         }
+        #[cfg(test)]
+        let drains = !self.plant_no_drain;
+        #[cfg(not(test))]
+        let drains = true;
         // In a task of the store's tag, so the packs' bytes the drain copies are named on the
         // daemon's memory line, whichever thread commits.
-        blaze_mem::frame::task(blaze_mem::Tag::Store, |_| self.drain());
+        if drains {
+            blaze_mem::frame::task(blaze_mem::Tag::Store, |_| self.drain());
+        }
         // A record the drain found against the claim's rule broke the store (`record_home`).
         if self.broken.is_some() {
             return;
@@ -3810,14 +3977,18 @@ impl Store {
             }
             index = Some((slot, bytes));
         }
+        // The check of each block this commit adds to each pack: `committed` and the end are
+        // block ends, so they are whole blocks, and none of them changes after.
+        let checks: Vec<Vec<u32>> = packs
+            .iter()
+            .map(|&(at, to)| {
+                let pack = &own.packs[at];
+                let added = (pack.committed - pack.usable) as usize..(to - pack.usable) as usize;
+                checks::of(&pack.memory[added])
+            })
+            // alloc: once per commit, the checks it writes, held in the `Commit`
+            .collect();
         let mut steps = 0;
-        for &(at, _) in &packs {
-            let pack = &own.packs[at];
-            let tag = self.tags.ask(Op::Truncate { pack: at });
-            // clone: the effect owns its file name; once per pack a commit
-            effects.push(Effect::Truncate { file: pack.file.clone(), len: pack.committed, tag });
-            steps += 1;
-        }
         for content in &externals {
             let external = &own.externals[content];
             // clone: the write owns its bytes, and a commit that fails writes them again from these
@@ -3836,8 +4007,14 @@ impl Store {
             steps += 1;
             (slot, batch.id)
         });
+        let written = packs.len();
         self.commit = Some(Commit {
             packs,
+            checks,
+            // alloc: once per commit, a place for each pack's append
+            appends: (0..written).map(|_| None).collect(),
+            // alloc: once per commit, a count for each pack
+            writes: vec![0; written],
             externals,
             index,
             head,
@@ -3846,6 +4023,14 @@ impl Store {
             failed: None,
             head_sent: false,
         });
+        for n in 0..written {
+            self.begin_pack(n, effects);
+        }
+        // Every append failed to begin with nothing else asked: no completion will come to
+        // move the commit, so it is tried again (or the store stopped) from here.
+        if self.commit.as_ref().is_some_and(|it| it.steps == 0 && it.failed.is_some()) {
+            _ = self.commit_moves(effects);
+        }
     }
 
     /// What the next index table holds: every own record a lookup finds, at its place in a
@@ -3899,6 +4084,12 @@ impl Store {
     }
 
     fn step(&mut self, op: &Op, done: &Done, effects: &mut Vec<Effect>) -> Vec<Ticket> {
+        // Whether the head waits for the syncs of the packs and their checks: always, but
+        // under the planted bug.
+        #[cfg(test)]
+        let waited = !self.plant_head_before_syncs;
+        #[cfg(not(test))]
+        let waited = true;
         // alloc: empty, allocates nothing
         let Some(commit) = self.commit.as_mut() else { return Vec::new() };
         commit.steps -= 1;
@@ -3908,6 +4099,9 @@ impl Store {
             Op::Truncate { pack } | Op::WritePack { pack } | Op::Sync { pack } => {
                 // clone: the error of a step that failed
                 own.packs[*pack].file.clone()
+            }
+            Op::TruncateChecks { pack } | Op::WriteChecks { pack } | Op::SyncChecks { pack } => {
+                own.file(&disk::checks_file(*pack))
             }
             // clone: the error of a step that failed
             Op::WriteExternal { content } => own.externals[content].file.clone(),
@@ -3919,33 +4113,95 @@ impl Store {
                 if commit.failed.is_none() {
                     let at = *pack;
                     let pack = &own.packs[at];
-                    let to = commit.to(at).expect("a pack the commit truncated it writes");
-                    let bytes = pack.memory
-                        [(pack.committed - pack.usable) as usize..(to - pack.usable) as usize]
-                        // alloc: the write owns its bytes, and the pack keeps its memory until a mapping covers it; once per pack a commit
-                        .to_vec();
-                    // `committed` and `to` are block ends (each commit pads its packs), so on a
-                    // driver that can, a long write skips the page cache.
-                    let tag = self.tags.ask(Op::WritePack { pack: at });
+                    let n = commit
+                        .packs
+                        .iter()
+                        .position(|(it, _)| *it == at)
+                        .expect("a pack the commit truncated it writes");
+                    // Written from the pool's pages its append put the bytes into, around the
+                    // page cache: `committed` and the end are block ends (each commit pads its
+                    // packs), and the pages are the write's buffer, pinned by the append until
+                    // the commit ends.
+                    let parts =
+                        commit.appends[n].as_ref().expect("a pack cut by the commit has its append").parts();
+                    commit.writes[n] = parts.len() as u32;
+                    for (at, from) in parts {
+                        let tag = self.tags.ask(Op::WritePack { pack: commit.packs[n].0 });
+                        // clone: the effect owns its file name; once per write of a pack a commit
+                        effects.push(Effect::WriteFrom {
+                            file: pack.file.clone(),
+                            at,
+                            from,
+                            cache: Cache::Bypassed,
+                            tag,
+                        });
+                        commit.steps += 1;
+                    }
+                }
+            }
+            (Op::WritePack { pack }, Done::Written) => {
+                let n = commit.packs.iter().position(|(it, _)| it == pack);
+                let last = n.is_none_or(|n| {
+                    commit.writes[n] = commit.writes[n].saturating_sub(1);
+                    commit.writes[n] == 0
+                });
+                if commit.failed.is_none() && last {
+                    let tag = self.tags.ask(sync_op(Op::Sync { pack: *pack }, waited));
                     // clone: the effect owns its file name; once per pack a commit
-                    effects.push(Effect::WriteAt {
-                        file: pack.file.clone(),
-                        at: pack.committed,
-                        bytes,
+                    effects.push(Effect::Sync { file: own.packs[*pack].file.clone(), tag });
+                    commit.steps += usize::from(waited);
+                    if !waited {
+                        // The planted commit waits for no sync: its checks follow the write.
+                        let tag = self.tags.ask(Op::TruncateChecks { pack: *pack });
+                        effects.push(Effect::Truncate {
+                            file: own.file(&disk::checks_file(*pack)),
+                            len: checks::len_of(own.packs[*pack].committed),
+                            tag,
+                        });
+                        commit.steps += 1;
+                    }
+                }
+            }
+            // A pack's checks follow its own sync, one effect at a time: cut to those of what
+            // is committed (a torn append of an earlier commit that failed, or that a crash cut
+            // short, goes first), written, synced. In a chain behind the pack rather than beside
+            // it, so the store model's search over a commit's orders stays within its bound
+            // (docs/v2/plan/design/store-pool.md, lane 4b).
+            (Op::Sync { pack }, Done::Synced) => {
+                if commit.failed.is_none() {
+                    let tag = self.tags.ask(Op::TruncateChecks { pack: *pack });
+                    effects.push(Effect::Truncate {
+                        file: own.file(&disk::checks_file(*pack)),
+                        len: checks::len_of(own.packs[*pack].committed),
                         tag,
                     });
                     commit.steps += 1;
                 }
             }
-            (Op::WritePack { pack }, Done::Written) => {
+            (Op::TruncateChecks { pack }, Done::Truncated) => {
                 if commit.failed.is_none() {
-                    let tag = self.tags.ask(Op::Sync { pack: *pack });
-                    // clone: the effect owns its file name; once per pack a commit
-                    effects.push(Effect::Sync { file: own.packs[*pack].file.clone(), tag });
+                    let at = *pack;
+                    let added =
+                        commit.checks_of(at).expect("a pack whose checks it cut the commit writes");
+                    let tag = self.tags.ask(Op::WriteChecks { pack: at });
+                    effects.push(Effect::WriteAt {
+                        file: own.file(&disk::checks_file(at)),
+                        at: checks::len_of(own.packs[at].committed),
+                        bytes: checks::encode(added),
+                        tag,
+                    });
                     commit.steps += 1;
                 }
             }
-            (Op::Sync { .. }, Done::Synced)
+            (Op::WriteChecks { pack }, Done::Written) => {
+                if commit.failed.is_none() {
+                    let tag = self.tags.ask(sync_op(Op::SyncChecks { pack: *pack }, waited));
+                    let file = own.file(&disk::checks_file(*pack));
+                    effects.push(Effect::Sync { file, tag });
+                    commit.steps += usize::from(waited);
+                }
+            }
+            (Op::SyncChecks { .. }, Done::Synced)
             | (Op::WriteExternal { .. } | Op::WriteIndex, Done::Written) => {}
             (Op::WriteHead, Done::Written) => return self.finish_commit(effects),
             (op, done) => {
@@ -3954,12 +4210,22 @@ impl Store {
                 }
             }
         }
+        self.commit_moves(effects)
+    }
+
+    /// What a commit does once a step of it has answered and none is in flight: after a
+    /// failure, the commit again (or, [`FAILURES_MOST`] in a row, the store stopped); else the
+    /// head, once everything it names is durable.
+    fn commit_moves(&mut self, effects: &mut Vec<Effect>) -> Vec<Ticket> {
+        // alloc: empty, allocates nothing
+        let Some(commit) = self.commit.as_mut() else { return Vec::new() };
         if commit.steps > 0 {
             // alloc: empty, allocates nothing
             return Vec::new();
         }
         if let Some(failed) = commit.failed.take() {
             // What it drained is still in the packs' memory: the next commit writes it again.
+            // Its appends go with it: the pages they took are given back.
             self.draining = self.commit.take().expect("a commit in flight").batch;
             self.failures += 1;
             if self.failures >= FAILURES_MOST {
@@ -3981,7 +4247,7 @@ impl Store {
             commit.steps += 1;
             let tag = self.tags.ask(Op::WriteHead);
             effects.push(Effect::Write {
-                file: own.file(HEAD_FILE),
+                file: self.tiers[0].file(HEAD_FILE),
                 bytes: commit.head.encode(),
                 tag,
             });
@@ -3990,16 +4256,89 @@ impl Store {
         Vec::new()
     }
 
+    /// The append of the commit in flight to its `n`th pack begun, and its bytes written into
+    /// the pool; or, when the page the pack's committed bytes end in must be read first, that
+    /// read asked, as a step of the commit ([`Store::tail_loaded`] goes on from it).
+    fn begin_pack(&mut self, n: usize, effects: &mut Vec<Effect>) {
+        let commit = self.commit.as_mut().expect("a commit in flight");
+        let (at, to) = commit.packs[n];
+        let file = &self.tiers[0].packs[at].file;
+        match self.hot.begin_append(at, file, to, effects) {
+            Ok(Some(append)) => self.write_pack(n, append, effects),
+            Ok(None) => commit.steps += 1,
+            Err(why) => {
+                // clone: the error of a commit that fails
+                commit.failed.get_or_insert(Broken { file: file.clone(), what: why });
+            }
+        }
+    }
+
+    /// The bytes the commit in flight adds to its `n`th pack put into the pack's window through
+    /// `append`, at the offsets they will have on disk, and the pack's file asked to be cut to
+    /// what is committed: its write, from the pool's pages, follows the cut.
+    fn write_pack(&mut self, n: usize, mut append: hot::PackAppend, effects: &mut Vec<Effect>) {
+        let commit = self.commit.as_mut().expect("a commit in flight");
+        let (at, to) = commit.packs[n];
+        let pack = &self.tiers[0].packs[at];
+        let added = (pack.committed - pack.usable) as usize..(to - pack.usable) as usize;
+        if let Err(err) = append.put(&pack.memory[added]) {
+            // clone: the error of a commit that fails
+            // alloc: the error of a commit that fails
+            commit.failed.get_or_insert(Broken { file: pack.file.clone(), what: err.to_string() });
+            return;
+        }
+        debug_assert_eq!(append.end(), to, "{}", pack.file);
+        commit.appends[n] = Some(append);
+        let tag = self.tags.ask(Op::Truncate { pack: at });
+        // clone: the effect owns its file name; once per pack a commit
+        effects.push(Effect::Truncate { file: pack.file.clone(), len: pack.committed, tag });
+        commit.steps += 1;
+    }
+
+    /// A read of the pool's loads completed: a pack's last committed page, which an append of
+    /// the commit in flight waits to pin. The append goes on, or the commit fails with why.
+    fn tail_loaded(&mut self, completion: Completion, effects: &mut Vec<Effect>) -> Vec<Ticket> {
+        for (pack, begun) in self.hot.loaded(completion, effects) {
+            // No commit in flight: the append, begun for none, gives its pin back.
+            let Some(commit) = self.commit.as_mut() else { continue };
+            commit.steps -= 1;
+            self.commit_steps += 1;
+            let n = commit.packs.iter().position(|(it, _)| *it == pack);
+            match (begun, n) {
+                (Ok(append), Some(n)) if commit.failed.is_none() => {
+                    self.write_pack(n, append, effects);
+                }
+                (Ok(_), _) => {}
+                (Err(why), _) => {
+                    // clone: the error of a commit that fails
+                    let file = self.tiers[0].packs[pack].file.clone();
+                    commit.failed.get_or_insert(Broken { file, what: why });
+                }
+            }
+        }
+        self.commit_moves(effects)
+    }
+
     fn finish_commit(&mut self, effects: &mut Vec<Effect>) -> Vec<Ticket> {
-        let commit = self.commit.take().expect("a commit in flight");
+        let mut commit = self.commit.take().expect("a commit in flight");
         let own = &mut self.tiers[0];
-        for &(at, to) in &commit.packs {
-            own.packs[at].committed = to;
+        for (&(at, to), added) in commit.packs.iter().zip(&commit.checks) {
+            let pack = &mut own.packs[at];
+            pack.committed = to;
+            pack.checks.extend_from_slice(added);
+            debug_assert_eq!(pack.checks.len() as u64, to / disk::BLOCK, "{}", pack.file);
         }
         for (pack, written) in own.packs.iter_mut().zip(&commit.head.packs) {
             pack.indexed = written.indexed;
         }
         own.head = commit.head;
+        // What the commit wrote of each pack is durable and named: the pages it wrote from are
+        // the pack's loaded pages, read in place from now on.
+        for (n, &(at, _)) in commit.packs.iter().enumerate() {
+            let append = commit.appends[n].take().expect("a pack the commit wrote has its append");
+            self.hot.committed(at, append, &commit.checks[n]);
+        }
+        self.hot.commit_ended();
         for at in 0..self.tiers[0].packs.len() {
             let pack = &mut self.tiers[0].packs[at];
             if std::mem::take(&mut pack.retiring) {
@@ -4007,7 +4346,14 @@ impl Store {
                 pack.mapping = None;
                 // alloc: empty, allocates nothing; it lets go of the pack's memory
                 pack.memory = Vec::new();
+                // alloc: empty, allocates nothing; it lets go of the pack's checks
+                pack.checks = Vec::new();
                 self.remove_pack(at, effects);
+                if let Err(why) = self.hot.pack_removed(0, at) {
+                    let file = &self.tiers[0].packs[at].file;
+                    // alloc: a problem reported
+                    self.problems.push(format!("{file} was removed and its pages are kept: {why}"));
+                }
             }
         }
         let mut batch = commit.batch;
@@ -4095,6 +4441,45 @@ impl Store {
         effects.push(Effect::Map { file, tag });
     }
 
+    /// Asks for the block checks of pack `pack` of tier `tier`, whole: 1/1024 of their pack,
+    /// kept for the pack's life.
+    fn ask_checks(&mut self, tier: usize, pack: usize, effects: &mut Vec<Effect>) {
+        let file = self.tiers[tier].file(&disk::checks_file(pack));
+        let tag = self.tags.ask(Op::Checks { tier, pack });
+        effects.push(Effect::ReadAll { file, tag });
+    }
+
+    /// The block checks of pack `number` of tier `at` came, as its tier opens: kept as far as
+    /// the head's committed length. A file that holds fewer stops the opening, naming it.
+    fn checks_read(&mut self, at: usize, number: usize, done: Done, effects: &mut Vec<Effect>) {
+        let file = self.tiers[at].file(&disk::checks_file(number));
+        let bytes = match done {
+            Done::Read(bytes) => bytes,
+            done if self.is_peer(at) => return self.peer_failed(at, file, describe(&done)),
+            done => {
+                if self.retry(&file, &done) {
+                    self.ask_checks(at, number, effects);
+                }
+                return;
+            }
+        };
+        let tier = &mut self.tiers[at];
+        let opening = !tier.opened;
+        let Some(pack) = tier.packs.get_mut(number) else { return };
+        match checks::decode(&bytes, pack.committed) {
+            Ok(checks) => pack.checks = checks,
+            Err(why) => return self.tier_failed(at, file, why),
+        }
+        self.failures = 0;
+        if opening {
+            let tier = &mut self.tiers[at];
+            tier.waiting -= 1;
+            if tier.waiting == 0 && tier.head_read {
+                self.finish_open(at);
+            }
+        }
+    }
+
     fn read_head(&mut self, at: usize, bytes: &[u8], effects: &mut Vec<Effect>) {
         let file = self.tiers[at].file(HEAD_FILE);
         let head = match (bytes.is_empty(), at) {
@@ -4123,6 +4508,8 @@ impl Store {
                 // alloc: empty, allocates nothing
                 memory: Vec::new(),
                 committed: it.committed,
+                // alloc: empty, allocates nothing: read from its file below
+                checks: Vec::new(),
                 indexed: it.indexed,
                 end: it.committed,
                 dead: it.dead,
@@ -4160,6 +4547,9 @@ impl Store {
         let removed: Vec<usize> =
             // alloc: opening, once per tier
             packs.iter().enumerate().filter(|(_, it)| it.removed).map(|(at, _)| at).collect();
+        let checked: Vec<usize> =
+            // alloc: opening, once per tier, the packs whose checks it reads
+            packs.iter().enumerate().filter(|(_, it)| !it.removed).map(|(at, _)| at).collect();
         // alloc: opening, once per tier, sorted so the mappings are asked for in one order
         let mut contents: Vec<&ContentId> = externals.keys().collect();
         contents.sort_unstable();
@@ -4190,9 +4580,12 @@ impl Store {
         tier.units = head.units.clone();
         tier.head = head;
         tier.head_read = true;
-        tier.waiting = maps.len();
+        tier.waiting = maps.len() + checked.len();
         for (file, what) in maps {
             self.ask_map(at, file, what, effects);
+        }
+        for pack in checked {
+            self.ask_checks(at, pack, effects);
         }
         if at == 0 {
             for pack in removed {
@@ -4268,7 +4661,7 @@ impl Store {
     }
 
     fn finish_open(&mut self, at: usize) {
-        match open_tier(&mut self.tiers[at]) {
+        match open_tier(&mut self.tiers[at]).and_then(|()| self.open_in_pool(at)) {
             Ok(()) => {
                 let tier = &mut self.tiers[at];
                 tier.opened = true;
@@ -4280,6 +4673,22 @@ impl Store {
             }
             Err((file, why)) => self.tier_failed(at, file, why),
         }
+    }
+
+    /// Tier `at`, read and checked, opened in the pool: each pack with its blocks' checks, in
+    /// place of what the pool held of the tier as it was open before (another writer's store
+    /// whose head changed is opened afresh).
+    fn open_in_pool(&mut self, at: usize) -> Result<(), (FileName, String)> {
+        let tier = &self.tiers[at];
+        // clone: the error that stops the opening
+        self.hot.tier_closed(at).map_err(|why| (tier.dir.clone(), why))?;
+        for (number, pack) in tier.packs.iter().enumerate().filter(|(_, it)| !it.removed) {
+            self.hot
+                .pack_opened(at, number, &pack.file, pack.committed, &pack.checks)
+                // clone: the error that stops the opening
+                .map_err(|why| (pack.file.clone(), why))?;
+        }
+        Ok(())
     }
 
     /// One mapping of batch `batch` came: its moves are made once all have.
@@ -4437,6 +4846,19 @@ fn open_tier(tier: &mut Tier) -> Result<(), (FileName, String)> {
                 ));
             }
             at = end;
+        }
+        // Every block the scan read, against the pack's checks: a record's header is checked
+        // by its own CRC above, and this is what says its payload is the bytes committed.
+        let scanned = pack.indexed.max(PACK_HEADER).min(pack.committed) / disk::BLOCK
+            ..pack.committed / disk::BLOCK;
+        if let Some(block) = checks::first_bad(&pack.checks, all, scanned) {
+            // alloc: the error that stops the opening
+            return Err(fail(format!(
+                "its block {block} (bytes {}..{}) does not match its check in {}",
+                block * disk::BLOCK,
+                (block + 1) * disk::BLOCK,
+                disk::checks_file(number)
+            )));
         }
     }
     let delta: Table<Spot> = Table::new(DELTA_FIRST.max(found.len() * 2), FLAGS);

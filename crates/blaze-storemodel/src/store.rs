@@ -160,7 +160,7 @@ impl Ledger {
 
 /// The store's config in every model: one directory, no layers.
 pub fn config() -> Config {
-    Config { dir: FileName::new("store").expect("a name"), layers: Vec::new(), tags: 1 << 40 }
+    Config { dir: FileName::new("store").expect("a name"), layers: Vec::new(), tags: 1 << 40, load_tags: (1 << 40) + (1 << 32), loader: blaze_cas::Loader::Pumped }
 }
 
 /// Runs `effects` and what they lead to, each completing in the order asked, until none is
