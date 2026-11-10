@@ -292,7 +292,8 @@ impl<'a> Graph<'a> {
     fn slot(&self, pkg: Pkg, features_for: FeaturesFor, kind: Kind) -> usize {
         pkg.index() * self.stride
             + match features_for {
-                FeaturesFor::HostDep => 0,
+                // The tree resolves without wasm macros, so it never asks for `MacroWasm`.
+                FeaturesFor::HostDep | FeaturesFor::MacroWasm => 0,
                 FeaturesFor::NormalOrDev => 1 + kind.0 as usize,
             }
     }
@@ -705,7 +706,7 @@ impl<'g> Builder<'g, '_> {
     /// dependencies. Returns the index to the package node.
     fn add_pkg(&mut self, pkg: Pkg, features_for: FeaturesFor, requested: Kind) -> NodeId {
         let node_kind = match features_for {
-            FeaturesFor::HostDep => Kind::HOST,
+            FeaturesFor::HostDep | FeaturesFor::MacroWasm => Kind::HOST,
             FeaturesFor::NormalOrDev => requested,
         };
         let slot = self.graph.slot(pkg, features_for, node_kind);
@@ -722,7 +723,9 @@ impl<'g> Builder<'g, '_> {
             // A package built for the host as a host dependency and as a normal one is one
             // node when its features are the same.
             let other = match features_for {
-                FeaturesFor::HostDep => self.graph.slot(pkg, FeaturesFor::NormalOrDev, Kind::HOST),
+                FeaturesFor::HostDep | FeaturesFor::MacroWasm => {
+                    self.graph.slot(pkg, FeaturesFor::NormalOrDev, Kind::HOST)
+                }
                 FeaturesFor::NormalOrDev => self.graph.slot(pkg, FeaturesFor::HostDep, Kind::HOST),
             };
             let same = self.graph.slots[other];
@@ -761,7 +764,7 @@ impl<'g> Builder<'g, '_> {
             // a normal one's are built as cargo's old rules have them: normal and dev
             // dependencies for the dependent's platform, build dependencies for the host.
             let dep_features_for = match features_for {
-                FeaturesFor::HostDep => FeaturesFor::HostDep,
+                FeaturesFor::HostDep | FeaturesFor::MacroWasm => FeaturesFor::HostDep,
                 FeaturesFor::NormalOrDev
                     if dep.is_build() || self.graph.packages.any_proc_macro(dep_pkg) =>
                 {

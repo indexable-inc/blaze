@@ -483,6 +483,87 @@ mod load {
         );
     }
 
+    /// A proc macro's dependency only `wasm32-wasip1` activates (getrandom's on `wasi`) is
+    /// built for the wasm macro, so the feature resolve must activate it too; the host's own
+    /// wasi-only dependency stays out.
+    #[test]
+    fn a_proc_macros_wasi_only_dependency_is_built_for_wasm32_wasip1() {
+        let a = "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+                 [dependencies]\nm = { path = \"m\" }\n\n\
+                 [target.'cfg(target_os = \"wasi\")'.dependencies]\nc = { path = \"c\" }\n";
+        let c = "[package]\nname = \"c\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
+        let m = "[package]\nname = \"m\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+                 [lib]\nproc-macro = true\n\n\
+                 [target.'cfg(target_os = \"wasi\")'.dependencies]\nb = { path = \"../b\" }\n";
+        let files = [
+            ("ws/Cargo.toml", a),
+            ("ws/src/lib.rs", ""),
+            ("ws/b/Cargo.toml", B),
+            ("ws/b/src/lib.rs", ""),
+            ("ws/c/Cargo.toml", c),
+            ("ws/c/src/lib.rs", ""),
+            ("ws/m/Cargo.toml", m),
+            ("ws/m/src/lib.rs", ""),
+        ];
+        let (_, graph) = graph(&files, &[]);
+        assert!(libs(&graph, "c").is_empty(), "the host is not wasi");
+        let (_, m) = lib(&graph, "m");
+        let (b_at, b) = lib(&graph, "b");
+        assert_eq!((b.platform.as_deref(), b.macro_wasm), (Some(crate::load::MACRO_WASM), true));
+        assert!(m.dependencies.iter().any(|it| it.index == b_at), "m uses its wasi-only b");
+    }
+
+    /// `b` with a feature `w` that enables nothing.
+    const B_W: &str = "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+                       [features]\nw = []\n";
+
+    #[test]
+    fn a_build_scripts_wasi_only_features_stay_off_the_host() {
+        let a = "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+                 [build-dependencies]\nb = { path = \"b\" }\n\n\
+                 [target.'cfg(target_os = \"wasi\")'.build-dependencies]\n\
+                 b = { path = \"b\", features = [\"w\"] }\n";
+        let files = [
+            ("ws/Cargo.toml", a),
+            ("ws/build.rs", "fn main() {}\n"),
+            ("ws/src/lib.rs", ""),
+            ("ws/b/Cargo.toml", B_W),
+            ("ws/b/src/lib.rs", ""),
+        ];
+        let (_, graph) = graph(&files, &[]);
+        let (_, b) = lib(&graph, "b");
+        assert_eq!((b.platform.as_deref(), b.macro_wasm), (None, false));
+        assert!(b.features.is_empty(), "the host is not wasi: {:?}", b.features);
+    }
+
+    #[test]
+    fn a_proc_macros_wasi_only_features_are_its_own() {
+        let a = "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+                 [dependencies]\nm = { path = \"m\" }\n\n\
+                 [build-dependencies]\nb = { path = \"b\" }\n";
+        let m = "[package]\nname = \"m\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+                 [lib]\nproc-macro = true\n\n\
+                 [target.'cfg(target_os = \"wasi\")'.dependencies]\n\
+                 b = { path = \"../b\", features = [\"w\"] }\n";
+        let files = [
+            ("ws/Cargo.toml", a),
+            ("ws/build.rs", "fn main() {}\n"),
+            ("ws/src/lib.rs", ""),
+            ("ws/b/Cargo.toml", B_W),
+            ("ws/b/src/lib.rs", ""),
+            ("ws/m/Cargo.toml", m),
+            ("ws/m/src/lib.rs", ""),
+        ];
+        let (_, graph) = graph(&files, &[]);
+        let mut b: Vec<(Option<&str>, bool, &[String])> = libs(&graph, "b")
+            .into_iter()
+            .map(|(_, it)| (it.platform.as_deref(), it.macro_wasm, it.features.as_slice()))
+            .collect();
+        b.sort();
+        let w = ["w".to_owned()];
+        assert_eq!(b, [(None, false, &[][..]), (Some(crate::load::MACRO_WASM), true, &w[..])]);
+    }
+
     #[test]
     fn the_wasm_macros_flag_is_accepted_and_changes_nothing() {
         let (_, flagged) = graph(&with_a_proc_macro(), &["-Z", "wasm-macros"]);

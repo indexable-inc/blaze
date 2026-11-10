@@ -125,6 +125,9 @@ struct Dep {
     /// [`NONE`] when the dependency is not renamed.
     dep_name: u32,
     unit_for: UnitFor,
+    /// The features the unit is built with: [`features_for`]'s, but a build script's are its
+    /// run's, under a wasm macro too.
+    features_for: FeaturesFor,
     public: bool,
     dev: bool,
 }
@@ -158,8 +161,12 @@ fn crate_name(t: &Target) -> Cow<'_, str> {
     if t.name.contains('-') { Cow::Owned(t.name.replace('-', "_")) } else { Cow::Borrowed(&t.name) }
 }
 
-fn features_for(unit_for: UnitFor) -> FeaturesFor {
-    FeaturesFor::from_for_host(unit_for.is_for_host_features())
+/// The features a unit of `kind` is built with: a wasm macro's own, else cargo's.
+fn features_key(unit_for: UnitFor, kind: Kind) -> FeaturesFor {
+    match kind {
+        Kind::MacroWasm => FeaturesFor::MacroWasm,
+        _ => FeaturesFor::from_for_host(unit_for.is_for_host_features()),
+    }
 }
 
 /// cargo's `check_or_build_mode`: what a dependency of a unit in `mode` is built as, the
@@ -665,7 +672,7 @@ struct State<'r, 'a> {
     /// Each unit's edges in `built`, in the order computed; [`NONE`] until it is walked.
     ranges: Vec<(u32, u32)>,
     built: Vec<Dep>,
-    stack: Vec<(u32, UnitFor)>,
+    stack: Vec<(u32, UnitFor, FeaturesFor)>,
 
     profiles: Profiles,
     /// The profile of a package's unit for a use and kind (cargo's `get_profile`).
@@ -737,7 +744,7 @@ fn build_graph(request: &Request<'_>) -> anyhow::Result<schema::UnitGraph> {
         } else {
             UnitFor::new_normal()
         };
-        state.deps_of(root, unit_for)?;
+        state.deps_of(root, unit_for, features_key(unit_for, row.key.kind))?;
     }
     let graph = state.connect_and_sort()?;
     let shared = state.share(&graph, &roots);
@@ -816,7 +823,7 @@ impl<'r, 'a> State<'r, 'a> {
             run_profile_of: Vec::with_capacity(8),
             features: FeatureSets::default(),
             // alloc: a column per build.
-            features_of: vec![NONE; n * 2],
+            features_of: vec![NONE; n * 3],
             dep_features: HashMap::new_in(Global),
             dep_feature_pairs: Vec::with_capacity(16),
             names: Names::default(),
@@ -931,7 +938,12 @@ impl<'r, 'a> State<'r, 'a> {
     /// [`State::root_is_host_only`] keeps the roots off such pairs, so reaching one is a bug
     /// in the walk, said as one.
     fn features_of(&mut self, pkg: u32, features_for: FeaturesFor) -> anyhow::Result<u32> {
-        let slot = pkg as usize * 2 + usize::from(features_for == FeaturesFor::HostDep);
+        let column = match features_for {
+            FeaturesFor::NormalOrDev => 0,
+            FeaturesFor::HostDep => 1,
+            FeaturesFor::MacroWasm => 2,
+        };
+        let slot = pkg as usize * 3 + column;
         let known = self.features_of[slot];
         if known != NONE {
             return Ok(known);
@@ -941,6 +953,7 @@ impl<'r, 'a> State<'r, 'a> {
             let what = match features_for {
                 FeaturesFor::NormalOrDev => "the target",
                 FeaturesFor::HostDep => "the host (as a build dependency or under a proc macro)",
+                FeaturesFor::MacroWasm => "a proc macro built for wasm",
             };
             bail!(
                 "the unit graph asks for the features of `{id}` built for {what}, which the feature \
@@ -1120,8 +1133,13 @@ impl<'r, 'a> State<'r, 'a> {
             }
             mode => mode,
         };
-        let features =
-            self.features_of(pkg, FeaturesFor::from_for_host(target.proc_macro || host_only))?;
+        let kind =
+            self.kind_for(Kind::Target, target.for_host || host_only, target.proc_macro, mode);
+        let features = match kind {
+            Kind::MacroWasm => FeaturesFor::MacroWasm,
+            _ => FeaturesFor::from_for_host(target.proc_macro || host_only),
+        };
+        let features = self.features_of(pkg, features)?;
         let unit_for = if initial.is_any_test() {
             if host_only { UnitFor::new_host_test() } else { UnitFor::new_test() }
         } else if host_only {
@@ -1133,8 +1151,6 @@ impl<'r, 'a> State<'r, 'a> {
         };
         let profile =
             self.profile(pkg, unit_for, if host_only { Kind::Host } else { Kind::Target });
-        let kind =
-            self.kind_for(Kind::Target, target.for_host || host_only, target.proc_macro, mode);
         let class = self.profiles.class_of[profile as usize];
         Ok(self.intern(Key { pkg, target: at, features, class, kind, mode }, profile))
     }
@@ -1347,23 +1363,33 @@ impl<'r, 'a> State<'r, 'a> {
     /// Walks the graph from `root` depth first, each unit's dependencies in the order computed,
     /// as cargo's recursive `deps_of` does: a unit reached again is not walked again, whatever
     /// it is reached for.
-    fn deps_of(&mut self, root: u32, unit_for: UnitFor) -> anyhow::Result<()> {
-        self.stack.push((root, unit_for));
-        while let Some((unit, unit_for)) = self.stack.pop() {
+    fn deps_of(
+        &mut self,
+        root: u32,
+        unit_for: UnitFor,
+        features_for: FeaturesFor,
+    ) -> anyhow::Result<()> {
+        self.stack.push((root, unit_for, features_for));
+        while let Some((unit, unit_for, features_for)) = self.stack.pop() {
             if self.ranges[unit as usize].0 != NONE {
                 continue;
             }
-            self.compute_deps(unit, unit_for)?;
+            self.compute_deps(unit, unit_for, features_for)?;
             let (start, len) = self.ranges[unit as usize];
             for at in (start..start + len).rev() {
                 let dep = self.built[at as usize];
-                self.stack.push((dep.unit, dep.unit_for));
+                self.stack.push((dep.unit, dep.unit_for, dep.features_for));
             }
         }
         Ok(())
     }
 
-    fn compute_deps(&mut self, id: u32, unit_for: UnitFor) -> anyhow::Result<()> {
+    fn compute_deps(
+        &mut self,
+        id: u32,
+        unit_for: UnitFor,
+        features_for: FeaturesFor,
+    ) -> anyhow::Result<()> {
         let row = self.units[id as usize];
         let pkg = row.key.pkg;
         let (deps_start, deps_len) = self.package_deps(pkg);
@@ -1378,7 +1404,7 @@ impl<'r, 'a> State<'r, 'a> {
                 id,
                 pkg,
                 target,
-                script_for,
+                (script_for, features_for),
                 Kind::Host,
                 Mode::Build,
                 None,
@@ -1395,7 +1421,7 @@ impl<'r, 'a> State<'r, 'a> {
             kind: row.key.kind,
             custom_build,
             dev: is_test(target) || is_example(target) || row.key.mode.is_any_test(),
-            features_for: features_for(unit_for),
+            features_for,
         };
         for at in deps_start..deps_start + deps_len {
             let dep = self.pkg_deps[at as usize];
@@ -1414,6 +1440,7 @@ impl<'r, 'a> State<'r, 'a> {
             let mode = check_or_build_mode(row.key.mode, lib.for_host);
             let dep_for = unit_for.with_dependency(custom_build, lib.for_host, lib.proc_macro);
             let kind = self.kind_for(row.key.kind, lib.for_host, lib.proc_macro, mode);
+            let dep_for = (dep_for, features_key(dep_for, kind));
             let mut edge =
                 self.new_unit_dep(id, dep_pkg, lib.at, dep_for, kind, mode, None, dep.public)?;
             edge.dev = !transitive;
@@ -1431,7 +1458,7 @@ impl<'r, 'a> State<'r, 'a> {
                     id,
                     pkg,
                     script,
-                    script_for,
+                    (script_for, features_key(script_for, row.key.kind)),
                     row.key.kind,
                     Mode::RunCustomBuild,
                     Some(profile),
@@ -1447,6 +1474,7 @@ impl<'r, 'a> State<'r, 'a> {
                     let dep_for =
                         unit_for.with_dependency(custom_build, lib.for_host, lib.proc_macro);
                     let kind = self.kind_for(row.key.kind, lib.for_host, lib.proc_macro, mode);
+                    let dep_for = (dep_for, features_key(dep_for, kind));
                     let dep =
                         self.new_unit_dep(id, pkg, lib.at, dep_for, kind, mode, None, own_public)?;
                     self.built.push(dep);
@@ -1476,7 +1504,7 @@ impl<'r, 'a> State<'r, 'a> {
                             id,
                             pkg,
                             bin_at,
-                            UnitFor::new_normal(),
+                            (UnitFor::new_normal(), features_key(UnitFor::new_normal(), kind)),
                             kind,
                             Mode::Build,
                             None,
@@ -1518,7 +1546,7 @@ impl<'r, 'a> State<'r, 'a> {
         parent: u32,
         pkg: u32,
         target: u32,
-        unit_for: UnitFor,
+        (unit_for, features_for): (UnitFor, FeaturesFor),
         kind: Kind,
         mode: Mode,
         profile: Option<u32>,
@@ -1530,10 +1558,10 @@ impl<'r, 'a> State<'r, 'a> {
         };
         let parent_pkg = self.units[parent as usize].key.pkg;
         let (extern_crate_name, dep_name) = self.extern_names(parent_pkg, pkg, target)?;
-        let features = self.features_of(pkg, features_for(unit_for))?;
+        let features = self.features_of(pkg, features_for)?;
         let class = self.profiles.class_of[profile as usize];
         let unit = self.intern(Key { pkg, target, features, class, kind, mode }, profile);
-        Ok(Dep { unit, extern_crate_name, dep_name, unit_for, public, dev: false })
+        Ok(Dep { unit, extern_crate_name, dep_name, unit_for, features_for, public, dev: false })
     }
 
     /// cargo's `connect_run_custom_build_deps` (the run of a build script waits for the runs of
