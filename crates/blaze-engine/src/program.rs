@@ -17,6 +17,14 @@ use crate::{as_rustc, pin, update, versions};
 pub fn main() -> ExitCode {
     // The client's time is counted from here (`client_rows`), not from blaze's cargo's start.
     blaze_cargo::cli::began();
+    // Which system calls this process's threads wait with, chosen before any thread exists or
+    // waits: direct ones where blaze's sandbox launched it (blaze as the `rustc` of a build
+    // script, whose filter refuses io_uring), each thread's wait ring otherwise. Read from the
+    // launcher's mark, never found by trying the ring (`blaze_core::wait::choose_from_env`).
+    if let Err(why) = blaze_core::wait::choose_from_env() {
+        eprintln!("error: {why}");
+        return ExitCode::FAILURE;
+    }
     // C's and C++'s allocations (LLVM's) are blaze's allocator's, counted to the running task's
     // tag as Rust's are (`malloc.rs`); a process where they are not stops here, saying why.
     #[cfg(feature = "native")]
