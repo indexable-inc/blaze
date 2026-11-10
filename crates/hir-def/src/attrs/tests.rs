@@ -241,6 +241,9 @@ fn old_match_attr_flags(
                             attr_flags.insert(AttrFlags::PURE_TRUSTED);
                         }
                     }
+                    "blaze" if &*second_segment == "differentiable" => {
+                        attr_flags.insert(AttrFlags::DIFFERENTIABLE)
+                    }
                     "blaze" if &*second_segment == "bits" => {
                         attr_flags.insert(AttrFlags::BLAZE_BITS)
                     }
@@ -363,6 +366,7 @@ fn old_match_attr_flags(
                         "sans_io" => attr_flags.insert(AttrFlags::SANS_IO),
                         "checkfree" => attr_flags.insert(AttrFlags::CHECKFREE),
                         "pure" => attr_flags.insert(AttrFlags::PURE),
+                        "differentiable" => attr_flags.insert(AttrFlags::DIFFERENTIABLE),
                         "bits" => attr_flags.insert(AttrFlags::BLAZE_BITS),
                         "nopanic" => attr_flags.insert(AttrFlags::NOPANIC),
                         "noalloc" => attr_flags.insert(AttrFlags::NOALLOC),

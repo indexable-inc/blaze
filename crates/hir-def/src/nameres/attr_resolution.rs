@@ -142,6 +142,9 @@ impl DefMap {
                         | "reflect"
                         // `#[blaze::sealed]`, from `AttrFlags::BLAZE_SEALED` (`hir-ty-coherence`).
                         | "sealed"
+                        // `#[blaze::differentiable]`, from `AttrFlags::DIFFERENTIABLE`
+                        // (`blaze-diff-mir`, docs/future/autodiff.md).
+                        | "differentiable"
                 )
             {
                 return true;

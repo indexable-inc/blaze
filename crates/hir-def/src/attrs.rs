@@ -571,6 +571,11 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                             attr_flags.insert(AttrFlags::PURE_TRUSTED);
                         }
                     }
+                    // `#[blaze::differentiable(symbolic)]`; the mode is
+                    // [`AttrFlags::differentiable_attr`]'s to read and refuse.
+                    (Some(Word::blaze), Some(Word::differentiable)) => {
+                        attr_flags.insert(AttrFlags::DIFFERENTIABLE)
+                    }
                     // `#[blaze::bits(u32)]`; the backing integer is
                     // [`AttrFlags::blaze_bits`]'s to read and refuse.
                     (Some(Word::blaze), Some(Word::bits)) => {
@@ -718,6 +723,7 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                 (Some(Word::blaze), Some(Word::sans_io)) => AttrFlags::SANS_IO,
                 (Some(Word::blaze), Some(Word::checkfree)) => AttrFlags::CHECKFREE,
                 (Some(Word::blaze), Some(Word::pure)) => AttrFlags::PURE,
+                (Some(Word::blaze), Some(Word::differentiable)) => AttrFlags::DIFFERENTIABLE,
                 (Some(Word::blaze), Some(Word::bits)) => AttrFlags::BLAZE_BITS,
                 (Some(Word::blaze), Some(Word::specialization)) => AttrFlags::BLAZE_SPECIALIZATION,
                 (Some(Word::blaze), Some(Word::specialization_trait)) => {
@@ -905,6 +911,7 @@ name_set! {
     define_opaque,
     deprecated,
     diagnostic,
+    differentiable,
     do_not_recommend,
     doc,
     export_name,
@@ -1192,6 +1199,12 @@ bitflags::bitflags! {
         /// bounded by it counts as local in its crate's orphan check
         /// (`TraitFlags::SEALED`, `hir_ty::sealed_local_bound`, `hir-ty-coherence`).
         const BLAZE_SEALED = 1 << 100;
+        /// `#[blaze::differentiable]` or `#[blaze::differentiable(..)]`, on a function: a blaze
+        /// extension (inert under rustc with `#![register_tool(blaze)]`), read by
+        /// `blaze-diff-mir` ([`AttrFlags::differentiable_attr`], docs/future/autodiff.md): the
+        /// function has a derivative blaze can be asked for. It changes no code of a function
+        /// that is not asked for its derivative: no codegen key reads it.
+        const DIFFERENTIABLE = 1 << 101;
         /// `#[blaze::linear]`, a word: a blaze extension (inert under rustc with
         /// `#![register_tool(blaze)]`), read by `hir-ty-linear`
         /// (docs/v2/plan/design/linear.md). On a struct or enum: a value of it may not be
@@ -1714,6 +1727,46 @@ fn pure_args(tt: ast::TokenTree<'_>) -> PureAttr {
     }
 }
 
+/// What `#[blaze::differentiable]` on a function says: a blaze extension (inert under rustc
+/// with `#![register_tool(blaze)]`), read by `blaze-diff-mir` (docs/future/autodiff.md).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum DifferentiableAttr {
+    /// `#[blaze::differentiable]`: by automatic differentiation on MIR (layer 1).
+    Auto,
+    /// `#[blaze::differentiable(symbolic)]` or `(symbolic, fast_math)`: by a symbolic
+    /// derivative of the function lifted to an expression (layer 2); with `fast_math`, simplified
+    /// by the algebraic rewrites too, which are not exact in IEEE 754.
+    Symbolic { fast_math: bool },
+    /// `#[blaze::differentiable(..)]` with arguments that are neither: their text, for the
+    /// error.
+    Malformed(Symbol),
+}
+
+/// What the arguments of `#[blaze::differentiable(..)]` say: nothing, `symbolic`, or
+/// `symbolic, fast_math`.
+fn differentiable_args(tt: ast::TokenTree<'_>) -> DifferentiableAttr {
+    // Without the delimiters, whitespace and comments.
+    let tokens: SmallVec<[NodeOrToken<_, _>; 4]> = TokenTreeChildren::new(tt).take(4).collect(); // alloc: inline, the few tokens of one attribute
+    match tokens.as_slice() {
+        [] => DifferentiableAttr::Auto,
+        [NodeOrToken::Token(mode)]
+            if mode.kind() == SyntaxKind::IDENT && mode.text() == "symbolic" =>
+        {
+            DifferentiableAttr::Symbolic { fast_math: false }
+        }
+        [NodeOrToken::Token(mode), NodeOrToken::Token(sep), NodeOrToken::Token(option)]
+            if mode.kind() == SyntaxKind::IDENT
+                && mode.text() == "symbolic"
+                && sep.kind() == T![,]
+                && option.kind() == SyntaxKind::IDENT
+                && option.text() == "fast_math" =>
+        {
+            DifferentiableAttr::Symbolic { fast_math: true }
+        }
+        _ => DifferentiableAttr::Malformed(Symbol::intern(&tt.syntax().text().to_string())),
+    }
+}
+
 /// Which of the effect attributes `hir-ty-effects` checks (docs/v2/plan/design/effects.md): the
 /// word after `blaze::`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -2124,6 +2177,37 @@ impl AttrFlags {
                         match attr.token_tree() {
                             Some(tt) => pure_args(tt),
                             None => PureAttr::Checked,
+                        }
+                    }
+                    _ => return ControlFlow::Continue(()),
+                };
+                ControlFlow::Break(read)
+            })
+        }
+    }
+
+    /// What `#[blaze::differentiable]` on `owner` says ([`DifferentiableAttr`]); `None` without
+    /// it, one bit test.
+    #[inline]
+    pub fn differentiable_attr(db: &Db, owner: AttrDefId) -> Option<DifferentiableAttr> {
+        if !AttrFlags::query(db, owner).contains(AttrFlags::DIFFERENTIABLE) {
+            return None;
+        }
+        return differentiable_attr(db, owner);
+
+        #[blaze_query::tracked(returns(clone), mem_tag = Nameres)]
+        fn differentiable_attr(db: &Db, owner: AttrDefId) -> Option<DifferentiableAttr> {
+            collect_attrs(db, owner, |attr| {
+                let read = match attr {
+                    ast::Meta::PathMeta(attr) if is_blaze_word(attr.path(), "differentiable") => {
+                        DifferentiableAttr::Auto
+                    }
+                    ast::Meta::TokenTreeMeta(attr)
+                        if is_blaze_word(attr.path(), "differentiable") =>
+                    {
+                        match attr.token_tree() {
+                            Some(tt) => differentiable_args(tt),
+                            None => DifferentiableAttr::Auto,
                         }
                     }
                     _ => return ControlFlow::Continue(()),

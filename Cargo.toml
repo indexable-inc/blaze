@@ -353,6 +353,8 @@ blaze-spin = { path = "crates/blaze-spin" }
 blaze-codegen = { path = "crates/blaze-codegen" }
 blaze-codegen-code = { path = "crates/blaze-codegen-code" }
 blaze-dbsp = { path = "crates/blaze-dbsp" }
+blaze-diff = { path = "crates/blaze-diff", version = "0.0.0" }
+blaze-diff-mir = { path = "crates/blaze-diff-mir", version = "0.0.0" }
 blaze-diagnostics = { path = "crates/blaze-diagnostics", version = "0.0.0" }
 blaze-fetch = { path = "crates/blaze-fetch" }
 blaze-format = { path = "crates/blaze-format" }
