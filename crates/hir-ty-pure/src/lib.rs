@@ -25,6 +25,8 @@ pub mod effect_attrs;
 pub mod effects;
 mod function;
 mod identity;
+mod loops;
+pub mod may;
 mod memory;
 pub mod models;
 mod values;
@@ -43,7 +45,7 @@ use intern::Symbol;
 pub use effects::{EFFECTS, EffectDef, EffectSet, PURE, Rule};
 pub use function::{
     EffectProof, FnPurity, Place, PureProof, Refusal, Step, Trusted, check, check_generic,
-    fn_memory, fn_purity, fn_purity_generic, instance_effects,
+    derived_pure, fn_memory, fn_purity, fn_purity_generic, instance_effects,
 };
 pub use memory::{Access, MemoryEffects};
 pub use walk::{ScriptProof, main_of, script_proof, script_purity};

@@ -65,13 +65,15 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
     let internal = group("blaze::internal").expect("blaze's internal group");
     let pedantic = group("blaze::pedantic_perf").expect("blaze's pedantic_perf group");
     // `deny` by default: they fire only where the code asked for them (`#[blaze::checkfree]`,
-    // `#[blaze::nopanic]`, `#[blaze::noalloc]`, `#[blaze::nonblocking]`, `#[blaze::pure]`).
+    // `#[blaze::nopanic]`, `#[blaze::noalloc]`, `#[blaze::nonblocking]`, `#[blaze::pure]`, a
+    // `#[blaze::may(..)]` or `#![blaze::effects]`).
     let deny = [
         "blaze::checkfree",
         "blaze::nopanic",
         "blaze::noalloc",
         "blaze::nonblocking",
         "blaze::pure",
+        "blaze::undeclared_effect",
     ];
     for it in &blaze_lints()[1..] {
         let in_ = |g: &Group| g.lints.iter().any(|m| m.name == it.name);
