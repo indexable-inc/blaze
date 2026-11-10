@@ -868,6 +868,7 @@ impl Gen {
             command: self.maybe_text(),
             dropped: if self.yes() { Some(self.wide()) } else { None },
             rebuilt: self.many(depth, |g| crate::Rebuild {
+                ends: g.many(depth, |g| g.reason()),
                 item: g.text(),
                 step: g.text(),
                 cause: g.rebuild_cause(depth),
@@ -877,9 +878,29 @@ impl Gen {
         }
     }
 
+    fn reason(&mut self) -> crate::Reason {
+        use crate::{EvictedBy, Reason};
+        match self.below(7) {
+            0 => Reason::InputChanged { file: self.yes(), input: self.text(), trivia: self.yes() },
+            1 => Reason::FirstTime,
+            2 => Reason::Evicted {
+                by: match self.below(3) {
+                    0 => EvictedBy::Memory,
+                    1 => EvictedBy::Age,
+                    _ => EvictedBy::Cap,
+                },
+                when: self.wide(),
+            },
+            3 => Reason::PreviousFailed { since: self.wide() },
+            4 => Reason::Forced { how: self.text() },
+            5 => Reason::KeyUnstable { part: self.text() },
+            _ => Reason::Unexplained { what: self.text() },
+        }
+    }
+
     fn rebuild_cause(&mut self, depth: u32) -> crate::RebuildCause {
         use crate::{PartChanged, RebuildCause};
-        match self.below(14) {
+        match self.below(15) {
             0 => RebuildCause::First,
             1 => RebuildCause::Parts {
                 parts: self.u32(),
@@ -887,8 +908,14 @@ impl Gen {
                 changed: self.many(depth, |g| PartChanged {
                     now: g.maybe_id(),
                     was: g.maybe_id(),
+                    kind: match g.below(3) {
+                        0 => crate::PartIs::Input,
+                        1 => crate::PartIs::File,
+                        _ => crate::PartIs::Result,
+                    },
                     part: g.text(),
                     names: g.maybe_text(),
+                    trivia: g.yes(),
                 }),
             },
             2 => RebuildCause::Lost { since: self.wide() },
@@ -910,6 +937,7 @@ impl Gen {
             10 => RebuildCause::Always { why: self.text() },
             11 => RebuildCause::NotExplained { what: self.text() },
             12 => RebuildCause::Unfinished { since: self.wide() },
+            13 => RebuildCause::Dropped { since: self.wide() },
             _ => RebuildCause::Failed { why: self.text() },
         }
     }

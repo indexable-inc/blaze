@@ -523,6 +523,7 @@ fn env_miss(kept: &KeptLowered, moved: &EnvMoved) -> blaze_kernel::Miss {
         kept: None,
         parts: Vec::new(), // alloc: none
         beyond: None,
+        via: None,
     }
 }
 

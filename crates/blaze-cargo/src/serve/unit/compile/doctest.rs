@@ -697,7 +697,8 @@ pub(super) fn link(
         false,
     ));
     // Moved, not copied: the store keeps them as they are.
-    let subject = super::unit_subject(job, u);
+    // What a chain of reasons follows from a function's code: the unit that built it.
+    let via = super::span_unit(u);
     let mut used = Vec::new(); // alloc: once per doctest unit linked
     for Linking { code, .. } in &mut built {
         let Code::Built(parts, _) = code else { continue };
@@ -708,16 +709,7 @@ pub(super) fn link(
             bytes: it.bytes,
         }));
         for mut miss in std::mem::take(&mut parts.built.misses) {
-            match &subject {
-                Ok(subject) => miss.subject = super::within(*subject, miss.subject),
-                Err(why) => {
-                    miss.subject = blaze_ids::ContentId::default();
-                    // alloc: error path, once a miss
-                    miss.missed =
-                        blaze_kernel::Missed::Failed(format!("its unit has no subject: {why}"));
-                    miss.parts.clear();
-                }
-            }
+            miss.via = Some(via.clone()); // clone: once a miss
             phases.misses.push(miss);
         }
         used.extend(std::mem::take(&mut parts.built.memo_used));

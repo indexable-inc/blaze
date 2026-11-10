@@ -48,7 +48,7 @@ pub use crate::entry::{
 };
 pub use crate::reads::{Reads, Trace};
 pub use crate::store::{Get, Put, Reading, Writing};
-pub use crate::why::{Miss, Missed, Part};
+pub use crate::why::{Miss, Missed, Part, PartKind};
 
 /// The most shapes one identity's chain holds. A step whose reads differ by shape more often
 /// than this reads too much of what varies, so its keys should be split. Reaching the bound is

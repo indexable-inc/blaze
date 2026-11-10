@@ -765,8 +765,11 @@ mod tests {
                 ("codegen dev template".to_owned(), ContentId([1; 32])),
                 super::super::Last {
                     key: ContentId([1; 32]),
+                    ends: Vec::new(),
+                    item: "app::f".to_owned(),
                     kept: None,
                     step: "codegen dev template".to_owned(),
+                    tomb: false,
                     build: 7,
                     parts: Vec::new(),
                     beyond: None,

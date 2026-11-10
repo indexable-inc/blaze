@@ -110,6 +110,13 @@ fn reason(cause: &RebuildCause, exact: bool) -> String {
                 false => String::new(),
             }
         ),
+        RebuildCause::Dropped { since: build } => format!(
+            "it was last computed{}, and blaze why's ledger dropped what its key was made of then to stay under its cap, so what changed since is not known",
+            match exact {
+                true => format!(" in build {build}"),
+                false => String::new(),
+            }
+        ),
         RebuildCause::Beyond { what, since: build } => format!(
             "its key is the one it had when last computed{}, so {what} differ, or that compute did not keep it: which, is not explained yet",
             match exact {

@@ -32,11 +32,13 @@
 //!   Replayed in order, later records winning; compacted to one record once the appends pass
 //!   the live size, the oldest subjects dropped past [`CAP_BYTES`] ([`Ledger::prune`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use blaze_api::{PartChanged, Rebuild, RebuildCause, RebuildGroup, Rebuilt};
+use blaze_api::{
+    EvictedBy, PartChanged, PartIs, Reason, Rebuild, RebuildCause, RebuildGroup, Rebuilt,
+};
 use blaze_ids::{ContentId, Hasher};
-use blaze_kernel::{Miss, Missed, Part, Seen};
+use blaze_kernel::{Miss, Missed, Part, PartKind, Seen};
 use blaze_profile::facts::MissRow;
 use blaze_protocol::cbor;
 use serde::{Deserialize, Serialize};
@@ -52,10 +54,18 @@ const MAGIC: [u8; 16] = *b"blaze why ledger";
 /// How many items a group lists unless every one is asked for.
 const LISTED: usize = 8;
 
-/// About how many bytes of subjects the ledger keeps ([`Ledger::prune`]): one per `BLAZE_HOME`
-/// holds every workspace's, so it is bounded by size, the subjects last computed longest ago
-/// dropped first.
+/// About how many bytes of subjects the ledger keeps whole ([`Ledger::prune`]): one per
+/// `BLAZE_HOME` holds every workspace's, so it is bounded by size, the subjects last computed
+/// longest ago shrunk to tombstones first (no parts: their next miss is
+/// [`Reason::Evicted`] by the cap, never read as a first compute).
 pub const CAP_BYTES: usize = 64 << 20;
+
+/// The most tombstones the ledger keeps ([`Ledger::prune`]): past it the oldest are removed,
+/// which every answer notes ([`Ledger::dropped`]), as their next miss reads as a first compute.
+pub const TOMBS: usize = 1_000_000;
+
+/// The most terminal reasons a step keeps ([`Rebuild::ends`]): the first in their order.
+pub const ENDS: usize = 8;
 
 /// The file is compacted once it is past this and twice the size of its last whole write.
 pub const COMPACT_MIN: u64 = 4 << 20;
@@ -70,17 +80,28 @@ const WORKSPACES: usize = 16;
 /// executable" part became its three makers' code identities (`RecordMakers`). 4: a dev
 /// template's callees that share a path and an origin are told apart by their subject, and
 /// one its build did not walk by its key. 5: a build script's run that ended has each read it
-/// traced as a part (`script::with_reads`), and its key covers them.
-const NAMING: u32 = 5;
+/// traced as a part (`script::with_reads`), and its key covers them. 6: a part has a kind and
+/// a file's code text, a unit's crate identity is the parts it is made of
+/// (`blaze_lower::Lowered::identity_parts`), and a dev template's subject is its function and
+/// settings, of no unit.
+const NAMING: u32 = 6;
 
 /// What the ledger holds of a subject: its key and the parts of it when it was last computed,
 /// by a build however it ended. Fields in the order deterministic CBOR sorts their names.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 struct Last {
     key: ContentId,
+    /// What its chain of reasons ended in when it was computed ([`Rebuild::ends`]): what a
+    /// step that names it, computed in a later build it took no part in, ends in too.
+    ends: Vec<Reason>,
+    /// Its name, for a person and for a part that names it ([`Part::names`]).
+    item: String,
     /// The entry the kernel kept for it then, for a step the kernel computes.
     kept: Option<ContentId>,
     step: String,
+    /// Whether its parts, ends and kept entry were dropped to keep the ledger under its cap
+    /// ([`Ledger::prune`]): it was computed in `build`, and that is all that is known of it.
+    tomb: bool,
     build: u64,
     parts: Vec<Kept>,
     beyond: Option<String>,
@@ -94,7 +115,10 @@ struct Last {
 /// A part of a key, as the file keeps it.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 struct Kept {
+    /// A file's code text ([`Part::code`]).
+    code: Option<ContentId>,
     hash: Option<ContentId>,
+    kind: PartIs,
     name: String,
     names: Option<String>,
 }
@@ -165,41 +189,70 @@ impl Ledger {
     /// well left every subject of a run of failed builds with no record at all, each miss read
     /// as computed first, and so explained nothing of why it was computed again.
     pub fn explain(&mut self, build: u64, ended_well: bool, misses: Vec<Miss>) -> Explained {
-        // How many different misses each (step, subject) has: more than one is refused. Only
+        // The different keys each (step, subject) missed under: more than one is refused. Only
         // a miss compared by its subject counts; one that failed has no subject to speak of.
+        // Two misses of one key are one compute said twice (two units that both built a shared
+        // generic before either's put landed): the first in the misses' order is kept.
         // alloc: once a build, an entry a subject that missed
+        let mut keys: BTreeSet<(&str, ContentId, ContentId)> = BTreeSet::new();
+        let misses: Vec<Miss> = misses // alloc: once a build
+            .into_iter()
+            .filter(|miss| !compared(miss) || keys.insert((miss.step, miss.subject, miss.key)))
+            .collect();
+        // alloc: as above
         let mut twice: BTreeMap<(&str, ContentId), u32> = BTreeMap::new();
-        for miss in misses.iter().filter(|it| compared(it)) {
-            *twice.entry((miss.step, miss.subject)).or_default() += 1;
+        for (step, subject, _) in &keys {
+            *twice.entry((*step, *subject)).or_default() += 1;
         }
-        let count = |miss: &Miss| twice.get(&(miss.step, miss.subject)).copied().filter(|n| *n > 1);
-        // alloc: once a build, an item each miss
-        let mut rebuilt = Vec::with_capacity(misses.len());
-        for miss in &misses {
-            let cause = match count(miss).filter(|_| compared(miss)) {
+        let count = |miss: &Miss| {
+            twice.get(&(miss.step, miss.subject)).copied().filter(|n| *n > 1 && compared(miss))
+        };
+        // alloc: once a build, a cause each miss
+        let causes: Vec<RebuildCause> = misses
+            .iter()
+            .map(|miss| match count(miss) {
                 Some(count) => RebuildCause::Twice { count },
                 None => self.cause(miss),
-            };
+            })
+            .collect();
+        let ends = self.ends(&misses, &causes);
+        // alloc: once a build, an item each miss
+        let mut rebuilt = Vec::with_capacity(misses.len());
+        for ((miss, cause), ends) in misses.iter().zip(&causes).zip(&ends) {
             // clone: once a miss
-            rebuilt.push(Rebuild { item: miss.item.clone(), step: miss.step.to_owned(), cause });
+            rebuilt.push(Rebuild {
+                ends: ends.clone(),
+                item: miss.item.clone(),
+                step: miss.step.to_owned(),
+                cause: cause.clone(),
+            });
         }
         rebuilt.sort_by(|a, b| (&a.item, &a.step).cmp(&(&b.item, &b.step)));
         // alloc: as above
         let mut items = Vec::new();
         let refused: Vec<bool> = misses.iter().map(|it| count(it).is_some()).collect(); // alloc: once a build
-        for (miss, refused) in misses.into_iter().zip(refused) {
+        for ((miss, refused), ends) in misses.into_iter().zip(refused).zip(ends) {
             if refused || !compared(&miss) {
                 continue;
             }
             let parts = miss
                 .parts
                 .into_iter()
-                .map(|Part { name, hash, names }| Kept { hash, name, names })
+                .map(|Part { name, hash, names, kind, code }| Kept {
+                    code,
+                    hash,
+                    kind: part_is(kind),
+                    name,
+                    names,
+                })
                 .collect();
             let last = Last {
                 key: miss.key,
+                ends,
+                item: miss.item,
                 kept: miss.kept,
                 step: miss.step.to_owned(),
+                tomb: false,
                 build,
                 parts,
                 beyond: miss.beyond.map(str::to_owned),
@@ -216,6 +269,205 @@ impl Ledger {
             false => frame(&Record { gap: None, build, items, dropped: None }),
         };
         Explained { rebuilt, rows, record }
+    }
+
+    /// What each of `misses`' chains ends in ([`Rebuild::ends`]), in their order, each caused
+    /// as `causes` says, against the ledger as it was before their build: a miss's own
+    /// terminal reasons, and those of each step of the build one of its changed parts names
+    /// (or, for a result that names none, of the step that computed it, [`Miss::via`]). Each
+    /// step is visited once and each edge once, with a stack of its own, so the walk is
+    /// bounded by the build's misses and the parts they name (rule 18); a step that names one
+    /// that names it back takes nothing from it.
+    fn ends(&self, misses: &[Miss], causes: &[RebuildCause]) -> Vec<Vec<Reason>> {
+        // alloc: once a build, the misses by item
+        let mut by_item: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+        for (at, miss) in misses.iter().enumerate() {
+            by_item.entry(miss.item.as_str()).or_default().push(at);
+        }
+        // The ledger's records by item, made the first time a part names a step this build
+        // did not compute.
+        let mut recorded: Option<BTreeMap<&str, Vec<&Last>>> = None;
+        // alloc: once a build, each miss's own reasons and the misses it follows
+        let mut own: Vec<Vec<Reason>> = Vec::with_capacity(misses.len());
+        let mut follows: Vec<Vec<usize>> = Vec::with_capacity(misses.len());
+        for (at, (miss, cause)) in misses.iter().zip(causes).enumerate() {
+            let (mut mine, mut theirs) = (Vec::new(), Vec::new()); // alloc: as above
+            // A part that is another step's result: that step's reasons, in this build or as
+            // the ledger recorded them in a build since `since`.
+            let mut follow = |name: Option<&str>, part: &str, since: u64, mine: &mut Vec<Reason>| {
+                let Some(name) = name.or(miss.via.as_deref()) else {
+                    // alloc: once a miss
+                    return mine.push(Reason::Unexplained {
+                        what: format!(
+                            "`{part}` of {} is another step's result, which blaze does not record yet, and nothing says which step computed it",
+                            miss.item
+                        ),
+                    });
+                };
+                if let Some(found) = by_item.get(name) {
+                    theirs.extend(found.iter().copied().filter(|it| *it != at));
+                    if found.iter().any(|it| *it != at) {
+                        return;
+                    }
+                }
+                let recorded = recorded.get_or_insert_with(|| {
+                    // alloc: once a build that names a step it did not compute
+                    let mut by: BTreeMap<&str, Vec<&Last>> = BTreeMap::new();
+                    for last in self.items.values() {
+                        by.entry(last.item.as_str()).or_default().push(last);
+                    }
+                    by
+                });
+                let newer: Vec<&Last> = recorded // alloc: once a part followed into the ledger
+                    .get(name)
+                    .map(|it| it.iter().copied().filter(|it| it.build > since && !it.tomb).collect())
+                    .unwrap_or_default();
+                match newer.is_empty() {
+                    // clone: once a part followed into the ledger
+                    false => mine.extend(newer.iter().flat_map(|it| it.ends.iter().cloned())),
+                    // alloc: once a miss
+                    true => mine.push(Reason::Unexplained {
+                        what: format!(
+                            "`{part}` of {} changed, yet blaze has no record of {name} being computed since build {since}: it was reused under another key (hits are not recorded yet), or it came out different from the same inputs",
+                            miss.item
+                        ),
+                    }),
+                }
+            };
+            // alloc: once a miss
+            let bug = |what: String| Reason::Unexplained { what };
+            match cause {
+                RebuildCause::First => mine.push(Reason::FirstTime),
+                RebuildCause::Dropped { since } => {
+                    mine.push(Reason::Evicted { by: EvictedBy::Cap, when: *since });
+                }
+                RebuildCause::Unfinished { since } => {
+                    mine.push(Reason::PreviousFailed { since: *since });
+                }
+                RebuildCause::Parts { since, changed, .. } => {
+                    for it in changed {
+                        match it.kind {
+                            // clone: once a part that changed
+                            PartIs::Input | PartIs::File => mine.push(Reason::InputChanged {
+                                file: it.kind == PartIs::File,
+                                input: it.part.clone(),
+                                trivia: it.trivia,
+                            }),
+                            PartIs::Result => {
+                                follow(it.names.as_deref(), &it.part, *since, &mut mine);
+                            }
+                        }
+                    }
+                }
+                RebuildCause::Read { read, names, since, .. } => match names {
+                    Some(name) => follow(Some(name.as_str()), read, since.unwrap_or(0), &mut mine),
+                    // clone: once a miss
+                    None => mine.push(Reason::InputChanged {
+                        file: false,
+                        input: read.clone(),
+                        trivia: false,
+                    }),
+                },
+                // A build script named to run outside the sandbox runs every build, as asked.
+                RebuildCause::Always { why } if miss.step == "build script run" => {
+                    mine.push(Reason::Forced { how: why.clone() }); // clone: once a miss
+                }
+                RebuildCause::Always { why } => mine.push(bug(why.clone())), // clone: once a miss
+                RebuildCause::Lost { since } => mine.push(bug(format!(
+                    "{}: nothing is kept under its key, the one it had when last computed in build {since}, and what dropped it did not record doing so",
+                    miss.item
+                ))),
+                RebuildCause::Beyond { what, since } => mine.push(bug(format!(
+                    "{}: its key is the one it had when last computed in build {since}, so {what} differ, whose values blaze does not keep yet",
+                    miss.item
+                ))),
+                RebuildCause::Unnamed { since } => mine.push(bug(format!(
+                    "{}: its key changed since build {since} though every part it names is the same, so its key has a part it does not name",
+                    miss.item
+                ))),
+                RebuildCause::Twice { count } => mine.push(bug(format!(
+                    "{}: this build computed it {count} times under different keys, so blaze told the instances apart by less than their keys",
+                    miss.item
+                ))),
+                RebuildCause::Unrecorded => mine.push(bug(format!(
+                    "{}: shapes of its reads are kept, but blaze has no record of the entry it kept last",
+                    miss.item
+                ))),
+                RebuildCause::Collected => mine.push(bug(format!(
+                    "{}: the entry blaze recorded as kept last is not in the store, and what dropped it did not record doing so",
+                    miss.item
+                ))),
+                RebuildCause::Unshaped => mine.push(bug(format!(
+                    "{}: every read of the entry kept last hashes as it did, yet no shape of reads names it",
+                    miss.item
+                ))),
+                RebuildCause::NotExplained { what } => {
+                    mine.push(bug(format!("{}: {what}", miss.item)));
+                }
+                RebuildCause::Failed { why } => mine.push(bug(format!(
+                    "{}: the reason could not be worked out: {why}",
+                    miss.item
+                ))),
+            }
+            theirs.sort_unstable();
+            theirs.dedup();
+            own.push(mine);
+            follows.push(theirs);
+        }
+        // alloc: once a build
+        let mut ends: Vec<Option<Vec<Reason>>> = vec![None; misses.len()];
+        let mut reached = vec![false; misses.len()]; // alloc: once a build
+        let mut stack: Vec<(usize, usize)> = Vec::new(); // alloc: once a build
+        for root in 0..misses.len() {
+            if reached[root] {
+                continue;
+            }
+            reached[root] = true;
+            stack.push((root, 0));
+            while let Some(top) = stack.last_mut() {
+                let at = top.0;
+                if let Some(&to) = follows[at].get(top.1) {
+                    top.1 += 1;
+                    if !reached[to] {
+                        reached[to] = true;
+                        stack.push((to, 0));
+                    }
+                    continue;
+                }
+                let mut all = std::mem::take(&mut own[at]);
+                for &to in &follows[at] {
+                    // One still on the stack names this one back: nothing of it is known yet.
+                    if let Some(theirs) = &ends[to] {
+                        all.extend(theirs.iter().cloned()); // clone: once an edge
+                    }
+                }
+                all.sort();
+                all.dedup();
+                if all.is_empty() {
+                    // alloc: once a miss
+                    all.push(Reason::Unexplained {
+                        what: format!(
+                            "{}: every step its changed parts name names it back",
+                            misses[at].item
+                        ),
+                    });
+                }
+                if all.len() > ENDS {
+                    // An unexplained end sorts last: one is kept, so a cut never hides a bug.
+                    let bug = all[ENDS..]
+                        .iter()
+                        .find(|it| matches!(it, Reason::Unexplained { .. }))
+                        .cloned(); // clone: once a miss past its ends
+                    all.truncate(ENDS);
+                    if let Some(bug) = bug {
+                        all[ENDS - 1] = bug;
+                    }
+                }
+                ends[at] = Some(all);
+                stack.pop();
+            }
+        }
+        ends.into_iter().map(Option::unwrap_or_default).collect()
     }
 
     /// The ledger the file `bytes` holds, records replayed in order, and what was wrong with
@@ -325,33 +577,60 @@ impl Ledger {
         self.items.is_empty()
     }
 
-    /// Drops the subjects last computed longest ago (ties in key order) until the ledger is
-    /// about three quarters of `cap` bytes, once it is past `cap`; how many it dropped. A
-    /// dropped subject's next miss reads as computed first, which every answer notes.
+    /// Once the ledger is past `cap` bytes, shrinks the subjects last computed longest ago
+    /// (ties in key order) to tombstones, their parts, ends and kept entry dropped, until it
+    /// is about three quarters of `cap`: a tombstone's next miss is [`Reason::Evicted`] by the
+    /// cap, never read as a first compute. Past [`TOMBS`] tombstones the oldest are removed
+    /// down to three quarters of that, which every answer notes ([`Ledger::dropped`]). How
+    /// many it shrank or removed.
     pub fn prune(&mut self, cap: usize) -> usize {
+        self.prune_to(cap, TOMBS)
+    }
+
+    /// [`Ledger::prune`] with at most `tombs` tombstones kept.
+    fn prune_to(&mut self, cap: usize, tombs: usize) -> usize {
         let mut total: usize = self.items.values().map(weight).sum();
-        if total <= cap {
-            return 0;
-        }
-        // alloc: once a compaction past the cap, on the history's thread
-        let mut order: Vec<(u64, &(String, ContentId), usize)> =
-            self.items.iter().map(|(key, last)| (last.build, key, weight(last))).collect();
-        order.sort_unstable();
-        let goal = cap / 4 * 3;
-        // alloc: as above
-        let mut drop = Vec::new();
-        for (build, key, weight) in order {
-            if total <= goal {
-                break;
+        let mut changed = 0;
+        if total > cap {
+            // alloc: once a compaction past the cap, on the history's thread
+            let mut order: Vec<(u64, (String, ContentId))> = self
+                .items
+                .iter()
+                .filter(|(_, last)| !last.tomb)
+                .map(|(key, last)| (last.build, key.clone())) // clone: as above
+                .collect();
+            order.sort_unstable();
+            let goal = cap / 4 * 3;
+            for (_, key) in order {
+                if total <= goal {
+                    break;
+                }
+                let Some(last) = self.items.get_mut(&key) else { continue };
+                let was = weight(last);
+                last.parts = Vec::new(); // alloc: none
+                last.ends = Vec::new(); // alloc: none
+                (last.kept, last.beyond, last.tomb) = (None, None, true);
+                total = total.saturating_sub(was.saturating_sub(weight(last)));
+                changed += 1;
             }
-            total -= weight;
-            self.dropped = self.dropped.max(Some(build));
-            drop.push(key.clone()); // clone: a key dropped
         }
-        for key in &drop {
-            self.items.remove(key);
+        let held = self.items.values().filter(|it| it.tomb).count();
+        if held > tombs {
+            // alloc: once a compaction past the tombstones' cap
+            let mut order: Vec<(u64, (String, ContentId))> = self
+                .items
+                .iter()
+                .filter(|(_, last)| last.tomb)
+                .map(|(key, last)| (last.build, key.clone())) // clone: as above
+                .collect();
+            order.sort_unstable();
+            for (build, key) in order.into_iter().take(held - tombs / 4 * 3) {
+                self.dropped = self.dropped.max(Some(build));
+                self.items.remove(&key);
+                changed += 1;
+            }
         }
-        drop.len()
+        changed
     }
 
     fn cause(&self, miss: &Miss) -> RebuildCause {
@@ -383,6 +662,9 @@ impl Ledger {
             return RebuildCause::First;
         };
         let since = last.build;
+        if last.tomb {
+            return RebuildCause::Dropped { since };
+        }
         if let Some(gap) = self.gap.filter(|gap| since < *gap) {
             return RebuildCause::NotExplained {
                 // alloc: once a miss
@@ -426,10 +708,32 @@ pub fn compact_due(len: u64, live: u64) -> bool {
 
 /// About how many bytes `last` takes in the file: the bound [`Ledger::prune`] keeps.
 fn weight(last: &Last) -> usize {
-    let part = |it: &Kept| 48 + it.name.len() + it.names.as_ref().map_or(0, String::len);
-    128 + last.step.len()
+    let part = |it: &Kept| {
+        56 + it.name.len()
+            + it.names.as_ref().map_or(0, String::len)
+            + it.code.map_or(0, |_| 34)
+    };
+    let end = |it: &Reason| match it {
+        Reason::InputChanged { input: text, .. }
+        | Reason::Forced { how: text }
+        | Reason::KeyUnstable { part: text }
+        | Reason::Unexplained { what: text } => 32 + text.len(),
+        Reason::FirstTime | Reason::Evicted { .. } | Reason::PreviousFailed { .. } => 32,
+    };
+    160 + last.step.len()
+        + last.item.len()
         + last.beyond.as_ref().map_or(0, String::len)
         + last.parts.iter().map(part).sum::<usize>()
+        + last.ends.iter().map(end).sum::<usize>()
+}
+
+/// A part's kind as the file and the API say it.
+fn part_is(kind: PartKind) -> PartIs {
+    match kind {
+        PartKind::Input => PartIs::Input,
+        PartKind::File => PartIs::File,
+        PartKind::Result => PartIs::Result,
+    }
 }
 
 /// A build's answer as the loop keeps it: whose build it was and what it computed again.
@@ -588,21 +892,46 @@ pub fn magic() -> [u8; 32] {
 /// another version, moved aside rather than misread (rule 26).
 pub fn version() -> ContentId {
     let id = ContentId([7; 32]);
-    let part =
-        |names: Option<String>| Kept { hash: Some(id), name: "the toolchain".to_owned(), names };
+    let part = |names: Option<String>, kind: PartIs| Kept {
+        code: Some(id),
+        hash: Some(id),
+        kind,
+        name: "the toolchain".to_owned(),
+        names,
+    };
+    let text = || "app::render".to_owned();
+    // Every kind of end: a change of any one's encoding is a new version.
+    let ends = vec![
+        Reason::InputChanged { file: true, input: text(), trivia: true },
+        Reason::FirstTime,
+        Reason::Evicted { by: EvictedBy::Memory, when: 1 },
+        Reason::Evicted { by: EvictedBy::Age, when: 1 },
+        Reason::Evicted { by: EvictedBy::Cap, when: 1 },
+        Reason::PreviousFailed { since: 1 },
+        Reason::Forced { how: text() },
+        Reason::KeyUnstable { part: text() },
+        Reason::Unexplained { what: text() },
+    ];
     let last = Last {
         key: id,
+        ends,
+        item: text(),
         kept: Some(id),
         step: "unit".to_owned(),
+        tomb: true,
         build: 1,
-        parts: vec![part(None), part(Some("app::render".to_owned()))],
+        parts: vec![
+            part(None, PartIs::Input),
+            part(Some(text()), PartIs::Result),
+            part(None, PartIs::File),
+        ],
         beyond: Some("what it read".to_owned()),
         subject: id,
         unfinished: true,
     };
     let record = Record { gap: Some(1), build: 1, items: vec![last], dropped: Some(1) };
     let bytes = cbor::to_vec(&record).expect("a ledger record is plain data, which CBOR encodes");
-    Hasher::new("blaze v2 why ledger version 2").part(&bytes).part(&NAMING.to_le_bytes()).finish()
+    Hasher::new("blaze v2 why ledger version 3").part(&bytes).part(&NAMING.to_le_bytes()).finish()
 }
 
 /// The parts whose hashes differ between `was` and `now`, by name, in name order: both are
@@ -629,7 +958,16 @@ fn changed(was: &[Kept], now: &[Part]) -> Vec<PartChanged> {
         // clone: once a part that changed
         let names =
             is.and_then(|it| it.names.clone()).or_else(|| then.and_then(|it| it.names.clone()));
-        out.push(PartChanged { now: new, was: old, part: name.to_owned(), names });
+        let kind = match (is, then) {
+            (Some(is), _) => part_is(is.kind),
+            (None, Some(then)) => then.kind,
+            (None, None) => PartIs::Input,
+        };
+        // A file whose bytes changed and whose code text, known both times, did not.
+        let trivia = kind == PartIs::File
+            && matches!((is, then), (Some(is), Some(then))
+                if is.hash.is_some() && then.hash.is_some() && is.code.is_some() && is.code == then.code);
+        out.push(PartChanged { now: new, was: old, kind, part: name.to_owned(), names, trivia });
     }
     out
 }
@@ -681,6 +1019,7 @@ fn group_of(cause: &RebuildCause) -> String {
         }
         RebuildCause::Lost { .. } => "lost".to_owned(),
         RebuildCause::Unfinished { .. } => "unfinished".to_owned(),
+        RebuildCause::Dropped { .. } => "dropped".to_owned(),
         RebuildCause::Beyond { what, .. } => format!("beyond\n{what}"),
         RebuildCause::Unnamed { .. } => "unnamed".to_owned(),
         RebuildCause::Read { read, .. } => format!("read\n{read}"),
@@ -772,6 +1111,7 @@ fn rows(build: u64, rebuilt: &[Rebuild]) -> Vec<MissRow> {
             RebuildCause::Unfinished { since } => {
                 (row.cause, row.since) = ("unfinished", Some(*since))
             }
+            RebuildCause::Dropped { since } => (row.cause, row.since) = ("dropped", Some(*since)),
             RebuildCause::Beyond { what, since } => {
                 (row.cause, row.what, row.since) = ("beyond", Some(what.clone()), Some(*since))
             }
@@ -908,8 +1248,10 @@ mod tests {
         let changed = vec![PartChanged {
             now: Some(id(8)),
             was: Some(id(6)),
+            kind: PartIs::Input,
             part: "its code".to_owned(),
             names: None,
+            trivia: false,
         }];
         assert_eq!(
             causes(&answers, "app::render"),

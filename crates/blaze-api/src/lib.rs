@@ -92,8 +92,10 @@ use serde::{Deserialize, Serialize};
 /// its running tasks, longest first (`running`), the tasks settled in the last 30 s
 /// (`recent`), the failed tasks (`failures`) and the proc-macro expansion lane (`expanding`).
 /// 44: `Now::stall`, the daemon's top stall in its wait-for graph (a deadlock or a convoy of
-/// named locks), in one line, which `blaze status` and the build view say.
-pub const SCHEMA: u32 = 44;
+/// named locks), in one line, which `blaze status` and the build view say. 45:
+/// [`Rebuild::ends`], the terminal reasons ([`Reason`]) a recomputed step's chain ends in,
+/// [`RebuildCause::Dropped`], and [`PartChanged::kind`] and [`PartChanged::trivia`].
+pub const SCHEMA: u32 = 45;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -525,6 +527,10 @@ pub struct RebuildGroup {
 /// One thing a build computed again, and why.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct Rebuild {
+    /// What its chain of reasons ends in (docs/v2/plan/design/why.md): its own `cause`
+    /// followed through each part that is another step's result, down to inputs that changed
+    /// or another terminal reason. Sorted, each once, the first 8.
+    pub ends: Vec<Reason>,
     /// What it is of, by path: a function, a unit (`app v0.1.0 (lib)`), a package's build
     /// script's run. Only for a person: two of one name (one function built for a test and
     /// for a program) are told apart by blaze, not by it.
@@ -550,6 +556,10 @@ pub enum RebuildCause {
     /// (it failed or was stopped), and nothing is kept under it: that compute likely failed or
     /// was stopped before it kept anything.
     Unfinished { since: u64 },
+    /// It was last computed in build `since`, and that is all blaze why's ledger kept of it:
+    /// its record's parts were dropped to keep the ledger under its cap, so what changed
+    /// since is not known.
+    Dropped { since: u64 },
     /// Its key is the one it had when last computed, in build `since`, so what its value is
     /// filed under past the key differs, or that compute did not keep it: `what` is filed
     /// beyond the key, which blaze does not explain yet.
@@ -589,14 +599,65 @@ pub enum RebuildCause {
     Failed { why: String },
 }
 
+/// Where a recomputed step's chain of reasons ends: a closed set. Anything blaze cannot put
+/// in one of the others is [`Reason::Unexplained`], which is a bug in blaze and said as one.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Reason {
+    /// An input of the build changed: `input` names it (a file by its absolute path, when
+    /// `file`; else a variable, a flag, a setting, the toolchain). `trivia`: a file whose
+    /// bytes changed and whose code did not (comments only), so no item changed and the
+    /// recompute was wasted work.
+    InputChanged { file: bool, input: String, trivia: bool },
+    /// blaze has no record of ever computing it.
+    FirstTime,
+    /// It was computed before, last in build `when`, and its result or its record was dropped
+    /// since, by what `by` says.
+    Evicted { by: EvictedBy, when: u64 },
+    /// Its key is the one of its last compute, in build `since`, which failed or was stopped
+    /// and kept nothing.
+    PreviousFailed { since: u64 },
+    /// It was computed because that was asked for: how.
+    Forced { how: String },
+    /// `part`, another step's result, differs though that step has not been computed since:
+    /// the same inputs gave another value (a determinism bug in blaze).
+    KeyUnstable { part: String },
+    /// No recorded reason: what is missing. A bug in blaze.
+    Unexplained { what: String },
+}
+
+/// What dropped a result or its record ([`Reason::Evicted`]).
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum EvictedBy {
+    /// The store, to stay under its memory.
+    Memory,
+    /// The store, as unused for too long.
+    Age,
+    /// `blaze why`'s ledger, to stay under its cap: the record's parts, not the result.
+    Cap,
+}
+
 /// A part of a key that changed: its hash then and now (none: absent), its name, and the item
 /// it is of, when another's (what a chain follows).
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct PartChanged {
     pub now: Option<ContentId>,
     pub was: Option<ContentId>,
+    /// What the part is: `input`, `file` (then `part` is its absolute path) or `result`
+    /// (another step's value, which a chain follows).
+    pub kind: PartIs,
     pub part: String,
     pub names: Option<String>,
+    /// For a file whose bytes changed: whether what code can observe of it did not (only
+    /// comments changed, so no item did).
+    pub trivia: bool,
+}
+
+/// What a part of a key is ([`PartChanged::kind`]).
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum PartIs {
+    Input,
+    File,
+    Result,
 }
 
 /// Which stretch of the daemon's life a [`Request::Hot`] sums.

@@ -375,15 +375,8 @@ pub(super) fn unit_subject(job: &Job, u: &Unit) -> Result<ContentId, String> {
     Ok(Hasher::new(SUBJECT).part(&bytes).finish())
 }
 
-/// The subject of a function or a run, `subject` within its build, as one of the unit whose
-/// subject is `unit`: two units' builds of one function are two subjects.
-pub(super) fn within(unit: ContentId, subject: ContentId) -> ContentId {
-    Hasher::new(WITHIN).id(&unit).id(&subject).finish()
-}
-
-/// The domains of [`unit_subject`] and [`within`].
+/// The domain of [`unit_subject`].
 const SUBJECT: &str = "blaze v2 why unit subject 3";
-const WITHIN: &str = "blaze v2 why subject within a unit 1";
 
 /// Why `unit`'s record was not in the store, for `blaze why`: its key's parts by name, which
 /// the daemon tells apart against the unit's last compute. Made on a miss only. The parts are
@@ -405,6 +398,7 @@ fn missed(job: &Job, unit: usize) -> blaze_kernel::Miss {
         // alloc: none
         parts: Vec::new(),
         beyond: None,
+        via: None,
     };
     let subject = match subject {
         Ok(it) => it,
@@ -1687,20 +1681,11 @@ fn link(
     if let Some(Ok((_, Ok(Ok(parts))))) = &mut phases.generated
         && !parts.built.misses.is_empty()
     {
-        // Its functions are subjects within the unit: another unit's build of one is another.
-        let subject = unit_subject(job, job.unit(unit)?);
+        // A function's template is the same step whichever unit built it (its subject is
+        // the driver's): the unit is only what a chain of reasons follows from its code.
+        let via = span_unit(job.unit(unit)?);
         for mut miss in std::mem::take(&mut parts.built.misses) {
-            match &subject {
-                Ok(subject) => miss.subject = within(*subject, miss.subject),
-                Err(why) => {
-                    // No subject to compare it by: said, not dropped.
-                    miss.subject = ContentId::default();
-                    // alloc: error path, once a miss
-                    miss.missed =
-                        blaze_kernel::Missed::Failed(format!("its unit has no subject: {why}"));
-                    miss.parts.clear();
-                }
-            }
+            miss.via = Some(via.clone()); // clone: once a miss
             phases.misses.push(miss);
         }
     }

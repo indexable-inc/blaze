@@ -1107,6 +1107,7 @@ fn run_miss(
             // alloc: none
             parts: Vec::new(),
             beyond: None,
+            via: None,
         },
     }
 }
@@ -1696,6 +1697,7 @@ impl ScriptRun {
                     // alloc: none
                     parts: Vec::new(),
                     beyond: None,
+                    via: None,
                 }
                 });
                 self.puts.misses.push(miss);
