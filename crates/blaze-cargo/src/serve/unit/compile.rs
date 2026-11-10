@@ -397,10 +397,11 @@ fn quotes(job: &Job, narrow: Key) -> Result<Option<Vec<String>>, ApiError> {
     };
     match job.input.store.get(&guard, &slot) {
         Ok(None) => Ok(None),
+        // alloc: the few names of a record's quoted files, once per lookup of a unit that has any
         Ok(Some(entry)) => blaze_protocol::cbor::from_slice(entry.bytes)
             .map(Some)
-            .map_err(|error| failed(format!("they do not decode: {error}"))),
-        Err(error) => Err(failed(error.to_string())),
+            .map_err(|error| failed(format!("they do not decode: {error}"))), // alloc: error path
+        Err(error) => Err(failed(error.to_string())), // alloc: error path
     }
 }
 
@@ -2071,7 +2072,9 @@ fn store(
             let kept = quotes(job, narrow)?;
             match (quoted_key(job, narrow, &names), kept) {
                 (Some(key), None) => {
+                    // alloc: the slot's bytes, once per record first kept with diagnostics
                     let bytes = blaze_protocol::cbor::to_vec(&names).map_err(|why| {
+                        // alloc: error path
                         ApiError::new(
                             format!("encoding the files the diagnostics of unit {unit} quote: {why}"),
                             None,
