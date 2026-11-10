@@ -202,6 +202,13 @@ pub enum Refusal {
     /// check ([`Refusal::OutOfReach`]) does not cover; its message shows the image's regions
     /// (`shape.rs`). Final: a link from scratch lays the same out the same.
     FieldRange,
+    /// An incremental stage wrote again, where it is, code whose AArch64 `b` or `bl` no longer
+    /// reaches its target (a callee the stage put in the patch region) nor a thunk of it: the
+    /// stage's thunks go in the patch region too (`thunk.rs`), and one in the branch's reach
+    /// would need the code around it moved. A link from scratch ([`Image::new`]) cuts its
+    /// islands through the code and takes the change. `branch` is the branch, its code, its
+    /// target and how far that is, as the build says them.
+    NoThunk { branch: String },
 }
 
 /// What a laid-out image is past ([`Refusal::OutOfReach`]).
@@ -257,13 +264,23 @@ pub enum Searched {
 impl LinkError {
     /// The refusal, when the image refused the stage for want of room: [`Refusal::NoRoom`],
     /// `NoRegion`, `TableFull`, `TlsMoved`, or an incremental stage's `OutOfReach`, which a
-    /// link from scratch takes. Never `NotFound` or `FieldRange`, which one does not.
+    /// link from scratch takes. Never `NotFound` or `FieldRange`, which one does not, nor
+    /// `NoThunk`, which is no want of room ([`LinkError::no_thunk`]).
     pub fn no_room(&self) -> Option<&Refusal> {
         self.refusal.as_ref().filter(|it| match it {
-            Refusal::NotFound(_) | Refusal::FieldRange => false,
+            Refusal::NotFound(_) | Refusal::FieldRange | Refusal::NoThunk { .. } => false,
             Refusal::OutOfReach(reach) => reach.scratch,
             _ => true,
         })
+    }
+
+    /// The branch an incremental stage could place no thunk in reach of
+    /// ([`Refusal::NoThunk`]), when that refused it: a link from scratch takes the change.
+    pub fn no_thunk(&self) -> Option<&str> {
+        match &self.refusal {
+            Some(Refusal::NoThunk { branch }) => Some(branch),
+            _ => None,
+        }
     }
 
     /// The limit the laid-out image is past, when that refused it.

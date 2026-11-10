@@ -390,6 +390,10 @@ impl Linking {
             Linking::Full(Full::Layout) => {
                 blaze_api::LinkHow::Full { why: vec!["layout".to_owned()] }
             }
+            // alloc: one name, for a link that was not spliced
+            Linking::Full(Full::NoThunk) => {
+                blaze_api::LinkHow::Full { why: vec!["no thunk in reach".to_owned()] }
+            }
         }
     }
 }
@@ -409,6 +413,9 @@ impl std::fmt::Display for Linking {
             Linking::Full(Full::Layout) => {
                 f.write_str("not spliced: the profile its code is laid out by changed")
             }
+            Linking::Full(Full::NoThunk) => f.write_str(
+                "not spliced: full link: the splice could not place a thunk in a branch's reach",
+            ),
         }
     }
 }
@@ -425,6 +432,11 @@ pub enum Full {
     /// The profile its code is laid out by changed (docs/v2/plan/design/code-layout.md): an
     /// image keeps its first link's order, so it is laid out again.
     Layout,
+    /// The kept image refused the change as a splice: a branch in code it holds in place
+    /// reaches neither its target nor the patch region, where a splice's thunks go
+    /// ([`blaze_link::Refusal::NoThunk`]). The image was linked from scratch, and the build
+    /// says which branch.
+    NoThunk,
 }
 
 /// Fields of [`blaze_link::Output`] as a set, a bit each in [`OutputFields::NAMES`]'s order.

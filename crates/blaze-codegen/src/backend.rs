@@ -76,6 +76,13 @@ pub struct Described<I, S> {
     /// not editable: no edit changes its body (an edit of its arguments' types gives another
     /// instance), and a caller may build it in (`#[inline(always)]`, [`Self::built_in`]).
     pub editable: bool,
+    /// Whether one of its type arguments names a workspace crate's type, closure, coroutine or
+    /// function item, when its own body is not editable: no edit changes its body, but one can
+    /// change which keys its references resolve to while its own key stays (a closure is a
+    /// type argument by which one it is, never by its body), so its fill changes under its
+    /// key. A live build reaches it through its slot, as it does an edited function
+    /// (`driver`'s `rebind`; docs/v2/plan/design/codegen.md, "Slots and a splice's reach").
+    pub over_editable: bool,
     /// `Some` when its MIR says (std's built without, `#[rustc_inherit_overflow_checks]`).
     pub overflow_checks: Option<bool>,
     pub address: Address,

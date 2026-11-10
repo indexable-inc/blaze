@@ -11,7 +11,8 @@ use blaze_items::ItemKey;
 
 use super::{
     Full, KeptImage, Laid, LinkCause, Linked, Linking, Mounted, OutputFields, PgoFlag, StaticRow,
-    codegen_backend, function_rows, kept_image, linking, pgo, read_profile, sanitize, static_rows,
+    codegen_backend, full_link_note, function_rows, kept_image, linking, pgo, read_profile,
+    sanitize, static_rows,
 };
 use blaze_codegen::InstanceKey;
 
@@ -391,6 +392,17 @@ fn how_a_link_went_is_first_only_with_nothing_kept() {
         "not spliced: the output changed: exports"
     );
     assert!(Linking::First.placed() && !Linking::Spliced.placed() && !Linking::Unchanged.placed());
+    // A splice refused for a thunk: the link from scratch is said on the link line, and the
+    // build names the branch.
+    assert!(Linking::Full(Full::NoThunk).placed());
+    assert_eq!(
+        Linking::Full(Full::NoThunk).to_string(),
+        "not spliced: full link: the splice could not place a thunk in a branch's reach"
+    );
+    assert_eq!(
+        full_link_note("A64Call26 at 0x114 in the function `f`"),
+        "full link: the splice could not place a thunk for A64Call26 at 0x114 in the function `f`"
+    );
 }
 
 /// The image kept at a path is the one the link stages against, taken out of the kept images;

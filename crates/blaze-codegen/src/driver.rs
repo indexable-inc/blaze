@@ -184,7 +184,8 @@ pub struct Built {
     /// Functions outside code names, with their symbols.
     pub symbols: Vec<(InstanceKey, String)>,
     pub static_symbols: Vec<(ItemKey, ContentId, String)>,
-    /// Functions reached through their slots.
+    /// Functions reached through their slots: those an edit changes the body of and those
+    /// an edit fills again under their own keys (`FnNode::slotted`).
     pub patchable: Vec<InstanceKey>,
     /// Functions of a live build whose code [`Build::tier_up`] replaces.
     pub tiered: Vec<InstanceKey>,
@@ -315,7 +316,13 @@ struct FnNode<I, S> {
     unit: Unit,
     spec: Spec,
     then: Option<Spec>,
+    /// Whether an edit changes its body, in a build that reaches edited code through slots:
+    /// reached through its slot, and never built into or imported by another function.
     patchable: bool,
+    /// Whether an edit can fill it again under its own key, though none changes its body
+    /// ([`rebind`]): reached through its slot too, so no caller the image keeps in place
+    /// holds a direct branch to code a splice replaces.
+    rebound: bool,
     instance: I,
     /// Whose code the walk first asked for it as: what describing it again takes.
     requester: Origin,
@@ -660,9 +667,17 @@ impl<I, S> FnNode<I, S> {
         )
     }
 
-    /// Whether code outside the build may call it, so nothing is assumed of its callers.
+    /// Whether its callers reach it through its slot for an edit's sake: an edit changes its
+    /// body ([`Self::patchable`]) or fills it again under its key ([`Self::rebound`]).
+    fn slotted(&self) -> bool {
+        self.patchable || self.rebound
+    }
+
+    /// Whether code outside the build may call it, so nothing is assumed of its callers; and
+    /// it is never merged with another function, so it keeps a slot of its own and its
+    /// callers' fills name its own key whatever an edit does to code equal to it.
     fn external(&self) -> bool {
-        self.patchable || self.then.is_some() || self.described.address == Address::Significant
+        self.slotted() || self.then.is_some() || self.described.address == Address::Significant
     }
 }
 
@@ -1638,6 +1653,97 @@ pub struct Build<'a, B: Prepare> {
     verify: blaze_store_check::Setting,
     /// Whether each store miss is explained ([`Build::explain_misses`]).
     why: bool,
+    /// Whether functions an edit fills again under their own keys are reached through their
+    /// slots ([`rebind`]): always, but in the control of the test that holds the rule.
+    rebinds: bool,
+}
+
+/// How many of a walk's functions are reached each way: what [`rebind`] counted, and the span
+/// `codegen classify` records.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct Reached {
+    /// Through their slots: an edit changes their bodies.
+    edited: usize,
+    /// Through their slots: another crate's code over a workspace type, closure or item.
+    over_editable: usize,
+    /// Through their slots: they refer to an edited function, or build in a rebound one.
+    refers: usize,
+    /// Through their slots for a tier-up alone.
+    tiered: usize,
+    /// Called directly.
+    direct: usize,
+}
+
+/// Marks the functions an edit can fill again under their own keys ([`FnNode::rebound`]), so
+/// the walk resolves every reference to one through its slot.
+///
+/// A fill names each callee by key, so a function's fill changes under its own key when an
+/// edit changes a callee's key and not its own. The functions that can happen to, beside
+/// the edited ones: one over a workspace type, closure or item, which the front end says and
+/// [`Build::node`] marked where the build has slots ([`Described::over_editable`]); one that
+/// refers to an edited function (whose key every edit of its body changes); and one that
+/// builds in a rebound function, whose references its own fill holds. The last is a fixed
+/// point over [`Described::built_in`]: each pass marks a function or is the last, so it
+/// ends within one pass per function and one more.
+///
+/// `asked` is the walk's key of each instance as each origin asks for it. With `rebinds`
+/// off, nothing is marked (the planted bug of the rule's test) and the count says so.
+fn rebind<I: Clone + Eq + Hash, S>(
+    nodes: &mut Sorted<InstanceKey, FnNode<I, S>>,
+    asked: &HashMap<(I, Origin), InstanceKey>,
+    rebinds: bool,
+) -> Reached {
+    // The place among the nodes of the function `node` refers to at `place`.
+    let index = |node: &FnNode<I, S>, place: usize| -> Option<usize> {
+        let FrontRef::Function(callee) = node.described.refs.get(place)? else { return None };
+        // clone: per build, the walk's key of a callee; who asks for it is a copy
+        let key = asked.get(&(callee.clone(), node.described.origin))?;
+        nodes.at.get(key).map(|at| *at as usize)
+    };
+    // alloc: per build, a flag per function
+    let mut refers: Vec<bool> = nodes
+        .values()
+        .map(|node| {
+            rebinds
+                && !node.slotted()
+                && (0..node.described.refs.len()).any(|place| {
+                    index(node, place).is_some_and(|at| nodes.values[at].patchable)
+                })
+        })
+        .collect();
+    let mut changed = rebinds;
+    while changed {
+        changed = false;
+        for (at, node) in nodes.values().enumerate() {
+            if refers[at] || node.slotted() {
+                continue;
+            }
+            let builds_in = node.described.built_in.iter().any(|place| {
+                index(node, *place as usize)
+                    .is_some_and(|it| refers[it] || nodes.values[it].rebound)
+            });
+            if builds_in {
+                refers[at] = true;
+                changed = true;
+            }
+        }
+    }
+    let mut reached = Reached::default();
+    for (node, refers) in nodes.values_mut().zip(&refers) {
+        if node.patchable {
+            reached.edited += 1;
+        } else if node.rebound {
+            reached.over_editable += 1;
+        } else if *refers {
+            node.rebound = true;
+            reached.refers += 1;
+        } else if node.then.is_some() {
+            reached.tiered += 1;
+        } else {
+            reached.direct += 1;
+        }
+    }
+    reached
 }
 
 /// The function a target names, if it names one.
@@ -1666,7 +1772,16 @@ impl<'a, B: Prepare> Build<'a, B> {
             owner: "a build",
             verify: blaze_store_check::Setting::OFF,
             why: false,
+            rebinds: true,
         }
+    }
+
+    /// The planted bug of the test that holds [`rebind`]'s rule: no function is rebound, so
+    /// one an edit fills again under its own key is called directly, as before the rule.
+    #[cfg(test)]
+    fn without_rebinding(mut self) -> Self {
+        self.rebinds = false;
+        self
     }
 
     /// Gives back why each dev template the store missed was not in it ([`Built::misses`]):
@@ -1732,6 +1847,13 @@ impl<'a, B: Prepare> Build<'a, B> {
             // Only code an edit reaches is patched: a generic of another crate a member
             // instantiates is the member's by origin, but no edit changes its body.
             patchable: choice.patchable && described.editable,
+            // Another crate's code over a workspace type, closure or item, where the build
+            // has slots: an edit fills it again under its own key. [`rebind`] adds the ones
+            // that only the walk's keys tell.
+            rebound: self.rebinds
+                && choice.patchable
+                && !described.editable
+                && described.over_editable,
             // clone: per build, the walk's handle of the instance
             instance: instance.clone(),
             requester,
@@ -2004,9 +2126,30 @@ impl<'a, B: Prepare> Build<'a, B> {
         }
         let (mut nodes, mut statics) = (Sorted::of(nodes), Sorted::of(statics));
 
+        // Which functions are reached through their slots, before any reference is resolved:
+        // every caller of one then names its slot.
+        {
+            let span = tracing::info_span!(
+                target: "blaze",
+                "codegen classify",
+                functions = nodes.len(),
+                edited = tracing::field::Empty,
+                over_editable = tracing::field::Empty,
+                refers = tracing::field::Empty,
+                tiered = tracing::field::Empty,
+                direct = tracing::field::Empty,
+            );
+            let _entered = span.enter();
+            let reached = rebind(&mut nodes, &asked, self.rebinds);
+            span.record("edited", reached.edited);
+            span.record("over_editable", reached.over_editable);
+            span.record("refers", reached.refers);
+            span.record("tiered", reached.tiered);
+            span.record("direct", reached.direct);
+        }
         let through_slot: HashMap<InstanceKey, bool> =
             // alloc: per build, sized by its units
-            nodes.iter().map(|(key, node)| (*key, node.patchable || node.then.is_some())).collect();
+            nodes.iter().map(|(key, node)| (*key, node.slotted() || node.then.is_some())).collect();
         let resolve = |refs: &[FrontRef<FrontInstance<B>, FrontStatic<B>>], requester: &Origin| {
             refs.iter()
                 .map(|it| match it {
@@ -2493,7 +2636,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             // alloc: per build, what it gives the linker
             .collect();
         // alloc: per build, what it gives the linker
-        let patchable = nodes.iter().filter(|it| it.1.patchable).map(|it| *it.0).collect();
+        let patchable = nodes.iter().filter(|it| it.1.slotted()).map(|it| *it.0).collect();
         // alloc: per build, what it gives the linker
         let tiered = nodes.iter().filter(|it| it.1.then.is_some()).map(|it| *it.0).collect();
         // alloc: per build, what it gives the linker and the store's record
@@ -3506,10 +3649,17 @@ impl<'a, B: Prepare> Build<'a, B> {
             out.errors.iter().map(|it| it.unit).collect();
         // `None` for a function the decision has no entry of: one with no summary, which is
         // refused, never compiled as if it imported nothing.
+        // A rebound function's body is no edit's, so a copy of it never goes stale; but the
+        // importer's fill then holds its references, which an edit renames: only a function
+        // itself reached through its slot imports one.
+        let rebound = |key: &InstanceKey| nodes.get(key).is_some_and(|node| node.rebound);
         let imports_of = |name: &InstanceKey| -> Option<Imports> {
             // clone: per release unit, its decision, trimmed of what it may not import
             let mut imports = decided.get(name)?.clone();
-            imports.imported.retain(|it| !patchable(it) && by_name.contains_key(it));
+            let slotted = nodes.get(name).is_some_and(|node| node.slotted());
+            imports.imported.retain(|it| {
+                !patchable(it) && (slotted || !rebound(it)) && by_name.contains_key(it)
+            });
             imports.callees.retain(|it| !patchable(&it.0));
             imports.dead.retain(|it| !patchable(&it.0));
             Some(imports)
