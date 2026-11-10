@@ -927,7 +927,7 @@ pub fn restore(dir: &Path, files: &[OutFile]) -> Result<(), String> {
                 #[cfg(unix)]
                 written.push((file.path.as_str(), stamp(&meta)));
                 #[cfg(not(unix))]
-                _ = (meta, &mut written);
+                let _unstamped = (meta, &mut written);
             }
         }
     }
