@@ -5969,8 +5969,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             held.locals.binary_search(&local).ok()
         };
         // In an `async` body a temporary may be kept in the future where its binding is not.
-        let mut forwarded =
-            if frame.is_none() { forwarded_temps(body) } else { HashMap::new_in(Global) };
+        let mut forwarded = if frame.is_none() {
+            forwarded_temps(body, self.frame)
+        } else {
+            HashMap::new_in(self.frame)
+        };
         let in_place = match self.ret_mode {
             PassMode::Indirect if frame.is_none() => {
                 returned_in_place(body, &forwarded).filter(|it| !forwarded.contains_key(it))
@@ -5983,7 +5986,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         // A local kept in a register gets a slot only when it needs memory: see `local_slot`.
         let mut registers = Vec::new_in(self.frame);
         if frame.is_none() {
-            for local in register_locals(body, &forwarded) {
+            for local in register_locals(body, &forwarded, self.frame) {
                 if !self.locals.contains_idx(local)
                     && let Some(ty) = self.register_ty(body.locals[local].ty.as_ref())
                 {
@@ -5996,13 +5999,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.registers.insert(local, Register { var, ty });
         }
         if frame.is_none() {
-            for (temp, from) in moved_arguments(body, &forwarded) {
+            for (temp, from) in moved_arguments(body, &forwarded, self.frame) {
                 if !self.registers.contains_idx(temp) && !self.registers.contains_idx(from) {
                     forwarded.insert(temp, from);
                 }
             }
         }
-        let unmentioned = unmentioned_locals(body);
+        let unmentioned = unmentioned_locals(body, self.frame);
         let mut shareable: Vec<(LocalId, ir::StackSlot), &Frame> = Vec::new_in(self.frame);
         for (local, data) in body.locals.iter() {
             if self.locals.contains_idx(local)
@@ -9432,7 +9435,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         &mut self,
         body: &MirBody<'_>,
         shareable: &[(LocalId, ir::StackSlot)],
-        forwarded: &HashMap<LocalId, LocalId, Global>,
+        forwarded: &HashMap<LocalId, LocalId, &Frame>,
     ) {
         let frame = self.frame;
         // A local kept in a register gets its slot later, if ever: see `local_slot`. In index
@@ -16410,13 +16413,14 @@ fn dump_mir(body: &MirBody<'_>) {
 
 /// The locals that can be kept in a register as far as the body goes: temporaries written
 /// whole by assignments only, that nothing takes the address of.
-fn register_locals(
+fn register_locals<'f>(
     body: &MirBody<'_>,
-    forwarded: &HashMap<LocalId, LocalId, Global>,
-) -> Vec<LocalId> {
+    forwarded: &HashMap<LocalId, LocalId, &Frame>,
+    frame: &'f Frame,
+) -> Vec<LocalId, &'f Frame> {
     let whole = |place: &StoredPlace| place.projection.as_slice().is_empty().then_some(place.local);
     // Every mention of the whole local, and the ones that are a value read or an assignment.
-    let mut mentions: HashMap<LocalId, (usize, usize), Global> = HashMap::new_in(Global);
+    let mut mentions: HashMap<LocalId, (usize, usize), &Frame> = HashMap::new_in(frame);
     body.visit_places(|place| {
         if let Some(local) = whole(place) {
             mentions.entry(local).or_default().0 += 1;
@@ -16452,44 +16456,42 @@ fn register_locals(
             _ => (),
         }
     }
-    let bound: blaze_hash::HashSet<LocalId, Global> = body
-        .binding_locals
-        .values()
-        .chain(&body.param_locals)
-        .copied()
-        .chain(promoted_locals(body))
-        .chain([returned_local(body)])
-        .chain(forwarded.iter().flat_map(|(&temp, &to)| [temp, to]))
-        .collect(); // alloc: once per body, which this function has no frame for
-    body.locals
-        .iter()
-        .map(|(local, _)| local)
-        .filter(|local| {
-            !bound.contains(local) && mentions.get(local).is_none_or(|(all, plain)| all == plain)
-        })
-        .collect() // alloc: the result, once per body, which the caller takes owned
+    let bound: HashSet<LocalId, &Frame> = HashSet::from_iter_in(
+        body.binding_locals
+            .values()
+            .chain(&body.param_locals)
+            .copied()
+            .chain(promoted_locals(body))
+            .chain([returned_local(body)])
+            .chain(forwarded.iter().flat_map(|(&temp, &to)| [temp, to])),
+        frame,
+    );
+    let mut registers = Vec::new_in(frame);
+    registers.extend(body.locals.iter().map(|(local, _)| local).filter(|local| {
+        !bound.contains(local) && mentions.get(local).is_none_or(|(all, plain)| all == plain)
+    }));
+    registers
 }
 
 /// The locals of `body` that no place mentions, which hold nothing the body ever reads: their
 /// storage markers are all there is of them. The parameters, the return slot and the promoted
 /// locals are not among them, whatever mentions them: they are written from outside the body,
 /// or read by it.
-fn unmentioned_locals(body: &MirBody<'_>) -> HashSet<LocalId, Global> {
-    let mut mentioned = HashSet::new_in(Global);
+fn unmentioned_locals<'f>(body: &MirBody<'_>, frame: &'f Frame) -> HashSet<LocalId, &'f Frame> {
+    let mut mentioned: HashSet<LocalId, &Frame> = HashSet::new_in(frame);
     body.visit_places(|place| {
         mentioned.insert(place.local);
     });
-    body.locals
-        .iter()
-        .map(|(local, _)| local)
-        .filter(|local| {
+    HashSet::from_iter_in(
+        body.locals.iter().map(|(local, _)| local).filter(|local| {
             !mentioned.contains(local)
                 && !body.param_locals.contains(local)
                 && *local != returned_local(body)
                 && !is_promoted(body, *local)
                 && !body.upvars_in_place.iter().any(|it| it.0 == *local)
-        })
-        .collect() // alloc: the result, once per body, which the caller takes owned
+        }),
+        frame,
+    )
 }
 
 /// The local every return of `body` moves to the return slot, when nothing else mentions the
@@ -16498,7 +16500,7 @@ fn unmentioned_locals(body: &MirBody<'_>) -> HashSet<LocalId, Global> {
 /// or a fresh binding, so the callee reaches that memory through nothing else.
 fn returned_in_place(
     body: &MirBody<'_>,
-    forwarded: &HashMap<LocalId, LocalId, Global>,
+    forwarded: &HashMap<LocalId, LocalId, &Frame>,
 ) -> Option<LocalId> {
     if body.coroutine.is_some() {
         return None;
@@ -16572,8 +16574,11 @@ fn returned_in_place(
 
 /// How many times each local is dropped by a terminator or read by a `FakeRead`, counted in one
 /// pass: a body of many blocks has many temporaries, and neither is a use of what one holds.
-fn drops_and_fake_reads(body: &MirBody<'_>) -> HashMap<LocalId, usize, Global> {
-    let mut counted: HashMap<LocalId, usize, Global> = HashMap::new_in(Global);
+fn drops_and_fake_reads<'f>(
+    body: &MirBody<'_>,
+    frame: &'f Frame,
+) -> HashMap<LocalId, usize, &'f Frame> {
+    let mut counted: HashMap<LocalId, usize, &Frame> = HashMap::new_in(frame);
     for (_, block) in body.basic_blocks.iter() {
         for statement in &block.statements {
             if let StatementKind::FakeRead(place) = &statement.kind {
@@ -16593,13 +16598,14 @@ fn drops_and_fake_reads(body: &MirBody<'_>) -> HashMap<LocalId, usize, Global> {
 /// `f(value)` moves `value` to a temporary and the temporary to `f`. The two can be one slot,
 /// nothing reading or writing `value` between the move and the call, and the callee then gets
 /// `value`'s memory, as rustc passes a moved local.
-fn moved_arguments(
+fn moved_arguments<'f>(
     body: &MirBody<'_>,
-    forwarded: &HashMap<LocalId, LocalId, Global>,
-) -> Vec<(LocalId, LocalId)> {
+    forwarded: &HashMap<LocalId, LocalId, &Frame>,
+    frame: &'f Frame,
+) -> Vec<(LocalId, LocalId), &'f Frame> {
     let whole = |place: &StoredPlace| place.projection.as_slice().is_empty().then_some(place.local);
     let slot = return_slot();
-    let mut found = Vec::new(); // alloc: the result, once per body, which the caller takes owned
+    let mut found = Vec::new_in(frame);
     for (_, block) in body.basic_blocks.iter() {
         let Some(TerminatorKind::Call { func, args, destination, .. }) =
             block.terminator.as_ref().map(|it| &it.kind)
@@ -16655,20 +16661,21 @@ fn moved_arguments(
     if found.is_empty() {
         return found;
     }
-    let mut mentions: HashMap<LocalId, usize, Global> = HashMap::new_in(Global);
+    let mut mentions: HashMap<LocalId, usize, &Frame> = HashMap::new_in(frame);
     body.visit_places(|place| *mentions.entry(place.local).or_default() += 1);
-    let not_uses = drops_and_fake_reads(body);
+    let not_uses = drops_and_fake_reads(body, frame);
     let dropped_or_read = |local: LocalId| not_uses.get(&local).copied().unwrap_or(0);
-    let bound: blaze_hash::HashSet<LocalId, Global> = body
-        .binding_locals
-        .values()
-        .chain(&body.param_locals)
-        .copied()
-        .chain(promoted_locals(body))
-        .chain(body.upvars_in_place.iter().map(|it| it.0))
-        .chain([slot])
-        .chain(forwarded.values().copied())
-        .collect(); // alloc: once per body with a moved argument, which this has no frame for
+    let bound: HashSet<LocalId, &Frame> = HashSet::from_iter_in(
+        body.binding_locals
+            .values()
+            .chain(&body.param_locals)
+            .copied()
+            .chain(promoted_locals(body))
+            .chain(body.upvars_in_place.iter().map(|it| it.0))
+            .chain([slot])
+            .chain(forwarded.values().copied()),
+        frame,
+    );
     found.retain(|&(temp, from)| {
         !bound.contains(&temp)
             && !forwarded.contains_key(&temp)
@@ -16678,8 +16685,8 @@ fn moved_arguments(
             && mentions[&temp] - dropped_or_read(temp) == 2
             && body.locals[temp].ty == body.locals[from].ty
     });
-    // alloc: once per body with a moved argument, which this has no frame for
-    let temps: blaze_hash::HashSet<LocalId, Global> = found.iter().map(|it| it.0).collect();
+    let temps: HashSet<LocalId, &Frame> =
+        HashSet::from_iter_in(found.iter().map(|it| it.0), frame);
     found.retain(|(_, from)| !temps.contains(from));
     blaze_ids::radix::sort_copy_by_key(&mut found, |&(temp, from)| {
         blaze_ids::radix::pack_32(temp.into_raw().into_u32(), from.into_raw().into_u32())
@@ -16692,9 +16699,12 @@ fn moved_arguments(
 /// after it is written: `let buffer = [0u8; N]` builds the array in a temporary and copies it.
 /// The two can be one slot, the binding holding nothing yet when the temporary is written, and
 /// a frame is not twice the size of what it declares.
-fn forwarded_temps(body: &MirBody<'_>) -> HashMap<LocalId, LocalId, Global> {
+fn forwarded_temps<'f>(
+    body: &MirBody<'_>,
+    frame: &'f Frame,
+) -> HashMap<LocalId, LocalId, &'f Frame> {
     let whole = |place: &StoredPlace| place.projection.as_slice().is_empty().then_some(place.local);
-    let mut forwarded = HashMap::new_in(Global);
+    let mut forwarded = HashMap::new_in(frame);
     if body.coroutine.is_some() {
         return forwarded;
     }
@@ -16745,20 +16755,21 @@ fn forwarded_temps(body: &MirBody<'_>) -> HashMap<LocalId, LocalId, Global> {
         return forwarded;
     }
     // Written once and read once, and by nothing else: the binding is not what it is made of.
-    let mut mentions: HashMap<LocalId, usize, Global> = HashMap::new_in(Global);
+    let mut mentions: HashMap<LocalId, usize, &Frame> = HashMap::new_in(frame);
     body.visit_places(|place| *mentions.entry(place.local).or_default() += 1);
     // A drop of the temporary is not a use: it holds a value only between the two statements,
     // which unwind to nowhere, and a drop of it then finds the slot holding its value.
-    let not_uses = drops_and_fake_reads(body);
+    let not_uses = drops_and_fake_reads(body, frame);
     let dropped_or_read = |local: LocalId| not_uses.get(&local).copied().unwrap_or(0);
-    let bound: blaze_hash::HashSet<LocalId, Global> = body
-        .binding_locals
-        .values()
-        .chain(&body.param_locals)
-        .copied()
-        .chain(promoted_locals(body))
-        .chain([returned_local(body)])
-        .collect(); // alloc: once per body with a forwarded temporary, which this has no frame for
+    let bound: HashSet<LocalId, &Frame> = HashSet::from_iter_in(
+        body.binding_locals
+            .values()
+            .chain(&body.param_locals)
+            .copied()
+            .chain(promoted_locals(body))
+            .chain([returned_local(body)]),
+        frame,
+    );
     forwarded.retain(|&temp, to| {
         !bound.contains(&temp)
             && mentions[&temp] - dropped_or_read(temp) == 2
