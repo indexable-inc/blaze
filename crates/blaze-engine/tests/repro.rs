@@ -662,7 +662,7 @@ fn a_no_std_proc_macro_expands() {
     );
 }
 
-/// `#[blaze::contract_test]` (docs/v2/plan/lanes/contracts.md, part 2): a function whose
+/// `#[blaze::contract_test]` (docs/v2/plan/design/contracts.md, part 2): a function whose
 /// `ensures` is wrong for one input gets a generated Hegel test that fails, naming the function
 /// and the clause, with the shrunk case as a test to paste; a contract that holds passes, and
 /// `skip` generates nothing. The crate's manifest names `vendor/hegeltest` by its absolute path,
