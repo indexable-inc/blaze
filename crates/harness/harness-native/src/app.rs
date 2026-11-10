@@ -274,6 +274,9 @@ pub struct App {
     pending_archive: bool,
     /// The ids the daemon no longer lists were dropped (once, on its first list).
     pruned: bool,
+    /// When cmd+N last asked for a new chat (the frame clock): an empty chat's lantern is struck again at it, so the
+    /// key always shows, even on the chat that already is the new one.
+    relit: f32,
     /// Remember the selected object in native.json (not for the offscreen shot).
     pub persist: bool,
     /// An offscreen shot's `HARNESS_NATIVE_SHOT_WORKING` (src/shot.rs): every session row and every run row shows at
@@ -390,6 +393,7 @@ fn scene_world() -> Result<World, String> {
     world.component::<crate::audio::Instrument>().writable();
     world.component::<crate::audio::Part>().writable();
     world.component::<crate::audio::RainOn>().writable();
+    world.component::<crate::audio::Song>().writable();
     world.component::<chat::GenOn>();
     script::install(&world);
     let _ = world.entity_named(APP);
@@ -584,6 +588,7 @@ impl App {
             pinned: crate::prefs::keys("pinned").unwrap_or_default(),
             pending_archive: false,
             pruned: false,
+            relit: 0.0,
             persist: true,
             shot_working: false,
             shot_plan: Vec::new(), // alloc: empty but in a shot
@@ -1749,8 +1754,8 @@ impl App {
         if !on("sound") {
             return Ok(());
         }
-        let (level, music, ambient, rain, cues, moods) = scene_sound(self.world.world_ref())?;
-        crate::audio::start(level, if on("music") { music } else { 0.0 }, if on("ambient") { ambient } else { 0.0 }, &rain, cues, moods)
+        let (level, music, ambient, rain, cues, moods, songs) = scene_sound(self.world.world_ref())?;
+        crate::audio::start(level, if on("music") { music } else { 0.0 }, if on("ambient") { ambient } else { 0.0 }, &rain, cues, moods, songs)
     }
 
     /// How long a turn takes, by the turns already finished in every chat: their middle length (ms), once there are at
@@ -1847,11 +1852,14 @@ impl App {
     }
 
     pub(in crate::app) fn new_chat(&mut self) {
+        self.relit = self.world.try_get::<&Clock>(|c| c.time).unwrap_or(0.0);
         // Cmd-N on a chat nothing has been sent in yet does nothing: that chat already is the new one.
         if let Some(sid) = self.selected().and_then(|e| self.session_of(e))
             && self.chats.borrow().contains_key(&sid)
             && !self.sent(sid)
         {
+            // It says so: the lantern is struck again and the cue plays.
+            crate::audio::cue("fresh");
             self.poke();
             return;
         }
@@ -2810,8 +2818,8 @@ fn set_if(v: View<'_>, fill: Fill) {
 /// # Errors
 /// A part of it is missing or malformed, named.
 /// The scene's sound as [`scene_sound`] reads it: the master, the music's and the rain's levels, the places the rain
-/// falls, the cues and the moods.
-type SceneSound = (f32, f32, f32, Vec<crate::music::RainSource>, Vec<crate::audio::Cue>, HashMap<String, crate::music::Mood>);
+/// falls, the cues, the moods and the songs (by name).
+type SceneSound = (f32, f32, f32, Vec<crate::music::RainSource>, Vec<crate::audio::Cue>, HashMap<String, crate::music::Mood>, Vec<crate::music::Song>);
 
 fn scene_sound(w: WorldRef<'_>) -> Result<SceneSound, String> {
     use harness_native_blaze::sound::{Note, Voice as V};
@@ -2843,25 +2851,42 @@ fn scene_sound(w: WorldRef<'_>) -> Result<SceneSound, String> {
         cues.push(crate::audio::Cue(c.name(), gain(c), notes));
     });
     let mut moods = HashMap::new(); // alloc: the scene's moods, read once
-    let mut bad = None;
-    at("hn::sound::mood")?.each_child(|m| {
-        let Some(mood) = m.try_cloned::<&crate::audio::Mood>() else { return };
-        // Its parts: each child that is a part (a `hn.sound.part` prefab's instance, its instrument inherited with it).
-        let mut parts = Vec::new();
+    let bad = std::cell::RefCell::new(None);
+    // The parts under a mood or a song: each child that is a part (a `hn.sound.part` prefab's instance, its instrument
+    // inherited with it), by name.
+    let parts_of = |m: EntityView<'_>| {
+        let mut parts = Vec::new(); // alloc: a mood's or song's parts, read once
         m.each_child(|c| {
             let (Some(part), Some(inst)) = (c.try_cloned::<&crate::audio::Part>(), c.try_cloned::<&crate::audio::Instrument>()) else { return };
             match inst.read(&c.path()).and_then(|i| part.read(c.name(), i, gain(c), &c.path())) {
                 Ok(p) => parts.push(p),
-                Err(e) => bad = Some(e),
+                Err(e) => *bad.borrow_mut() = Some(e),
             }
         });
         parts.sort_by(|a, b| a.name.cmp(&b.name));
-        match mood.read(parts, &m.path()) {
-            Ok(read) => _ = moods.insert(m.name(), read),
-            Err(e) => bad = Some(e),
+        parts
+    };
+    let mut songs = Vec::new(); // alloc: the scene's songs, read once
+    at("hn::sound::song")?.each_child(|s| {
+        let Some(song) = s.try_cloned::<&crate::audio::Song>() else { return };
+        match song.read(s.name(), parts_of(s), &s.path()) {
+            Ok(read) => songs.push(read),
+            Err(e) => *bad.borrow_mut() = Some(e),
         }
     });
-    if let Some(e) = bad {
+    songs.sort_by(|a, b| a.name.cmp(&b.name));
+    if songs.is_empty() {
+        return Err("hn.sound.song has no songs (scene/widgets/sound.flecs)".to_owned());
+    }
+    at("hn::sound::mood")?.each_child(|m| {
+        let Some(mood) = m.try_cloned::<&crate::audio::Mood>() else { return };
+        let parts = parts_of(m);
+        match mood.read(parts, &m.path()) {
+            Ok(read) => _ = moods.insert(m.name(), read),
+            Err(e) => *bad.borrow_mut() = Some(e),
+        }
+    });
+    if let Some(e) = bad.into_inner() {
         return Err(e);
     }
     cues.sort_by(|a, b| a.0.cmp(&b.0));
@@ -2873,7 +2898,7 @@ fn scene_sound(w: WorldRef<'_>) -> Result<SceneSound, String> {
     });
     rain.sort_by(|a, b| a.0.cmp(&b.0));
     let rain = rain.into_iter().map(|(_, r)| r).collect();
-    Ok((gain(at("hn::sound")?), gain(at("hn::sound::mood")?), gain(at("hn::sound::ambient")?), rain, cues, moods))
+    Ok((gain(at("hn::sound")?), gain(at("hn::sound::mood")?), gain(at("hn::sound::ambient")?), rain, cues, moods, songs))
 }
 
 #[cfg(test)]
@@ -3008,14 +3033,21 @@ mod tests {
     #[test]
     fn the_scenes_sound_reads() {
         let world = scene_world().unwrap_or_else(|e| panic!("{e}"));
-        let (level, music, ambient, rain, cues, moods) = scene_sound(world.world_ref()).unwrap_or_else(|e| panic!("{e}"));
+        let (level, music, ambient, rain, cues, moods, songs) = scene_sound(world.world_ref()).unwrap_or_else(|e| panic!("{e}"));
+        assert!(songs.len() >= 5 && songs.iter().all(|s| s.bars >= 16 && s.scale.len() >= 5 && s.chords.len() >= 4), "the songs: {:?}", songs.iter().map(|s| &s.name).collect::<Vec<_>>());
+        // A song's own part stands in for a mood's part of that name, so every one must be a part some mood has.
+        for s in &songs {
+            for p in &s.parts {
+                assert!(moods.values().any(|m| m.parts.iter().any(|mp| mp.name == p.name)), "song {}'s part {} is in no mood", s.name, p.name);
+            }
+        }
         assert!(level > 0.0 && music > 0.0 && ambient > 0.0 && rain.len() >= 3 && rain.iter().all(|r| r.gain > 0.0 && r.high > r.low));
         for item in ["exec", "read", "edit", "search", "net", "build", "spawn", "wait", "sql", "think"] {
             assert!(cues.iter().any(|c| c.0 == item && c.1 > 0.0 && !c.2.is_empty()), "no cue for {item}");
         }
         assert!(["ready", "done"].iter().all(|n| cues.iter().any(|c| c.0 == *n && !c.2.is_empty())));
         for mood in ["rest", "calm", "flow", "drive", "battle"] {
-            assert!(moods.get(mood).is_some_and(|m| m.tempo > 0.0 && !m.scale.is_empty() && !m.chords.is_empty() && m.parts.len() >= 2 && m.parts.iter().all(|p| p.level > 0.0 && !p.instrument.partials.is_empty() || p.instrument.noise > 0.0)), "mood {mood} is missing or has no parts");
+            assert!(moods.get(mood).is_some_and(|m| m.tempo > 0.0 && m.parts.len() >= 2 && m.parts.iter().all(|p| p.level > 0.0 && !p.instrument.partials.is_empty() || p.instrument.noise > 0.0)), "mood {mood} is missing or has no parts");
         }
     }
 
