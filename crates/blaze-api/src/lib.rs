@@ -94,8 +94,10 @@ use serde::{Deserialize, Serialize};
 /// 44: `Now::stall`, the daemon's top stall in its wait-for graph (a deadlock or a convoy of
 /// named locks), in one line, which `blaze status` and the build view say. 45:
 /// [`Rebuild::ends`], the terminal reasons ([`Reason`]) a recomputed step's chain ends in,
-/// [`RebuildCause::Dropped`], and [`PartChanged::kind`] and [`PartChanged::trivia`].
-pub const SCHEMA: u32 = 45;
+/// [`RebuildCause::Dropped`], and [`PartChanged::kind`] and [`PartChanged::trivia`]. 46:
+/// [`Rebuilt::summary`] (what a build says of itself once it ends), and `build` and
+/// `unexplained` of [`Request::Rebuilt`].
+pub const SCHEMA: u32 = 46;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -423,10 +425,16 @@ pub enum Request {
     /// reason names, in order (its chain). Of the last build of the workspace holding `cwd`
     /// (an absolute path), or with none the newest build's. Answered with
     /// [`Response::Rebuilt`] by the daemon's loop, which keeps each workspace's last reasons.
+    /// With `build` (a build's own client, once it has its `Done`), of that build alone,
+    /// whatever `cwd`: answered with no build when the reasons kept are another's. With
+    /// `unexplained`, only the steps whose chain ends in [`Reason::Unexplained`], each one
+    /// (`blaze why --unexplained`).
     Rebuilt {
         all: bool,
         cwd: Option<String>,
         item: Option<String>,
+        build: Option<u64>,
+        unexplained: bool,
     },
     /// `blaze run` of a built program, before it execs it as process `pid`: what that process
     /// needs to run on the daemon's code memory when `program` (the path the build linked it
@@ -501,8 +509,13 @@ pub struct Rebuilt {
     /// Subjects last computed in this build or before were dropped from blaze why's ledger to
     /// keep it under its cap: an item read as computed first may be one of them.
     pub dropped: Option<u64>,
-    /// With a chain: its reasons in order.
+    /// With a chain: its reasons in order. Asked for the unexplained: each such step.
     pub rebuilt: Vec<Rebuild>,
+    /// Without an item: what the build says of itself once it ends
+    /// (docs/v2/plan/design/why.md, "What is printed"): a report a root cause, the most
+    /// steps first, at most four and then one counting the rest; empty for a build that
+    /// recomputed nothing.
+    pub summary: Vec<Report>,
     /// Whether the daemon is still restoring blaze why's ledger (off its start path), so what
     /// `torn` says is not known yet.
     pub restoring: bool,

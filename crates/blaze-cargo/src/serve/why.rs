@@ -35,7 +35,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use blaze_api::{
-    EvictedBy, PartChanged, PartIs, Reason, Rebuild, RebuildCause, RebuildGroup, Rebuilt,
+    EvictedBy, PartChanged, PartIs, Reason, Rebuild, RebuildCause, RebuildGroup, Rebuilt, Report,
+    Text,
 };
 use blaze_ids::{ContentId, Hasher};
 use blaze_kernel::{Miss, Missed, Part, PartKind, Seen};
@@ -66,6 +67,12 @@ pub const TOMBS: usize = 1_000_000;
 
 /// The most terminal reasons a step keeps ([`Rebuild::ends`]): the first in their order.
 pub const ENDS: usize = 8;
+
+/// The most root causes a build's summary names ([`summary`]); the rest are one line.
+pub const CAUSES: usize = 4;
+
+/// The most inputs a cause's headline, and items a step's line, name; the rest are a count.
+const NAMED: usize = 3;
 
 /// The file is compacted once it is past this and twice the size of its last whole write.
 pub const COMPACT_MIN: u64 = 4 << 20;
@@ -745,6 +752,30 @@ pub struct Answer {
     pub command: String,
     /// Sorted by item, then step ([`Explained::rebuilt`]).
     pub rebuilt: Vec<Rebuild>,
+    /// What the build says of itself once it ends ([`summary`] of `rebuilt`), made once,
+    /// where the build is explained.
+    pub summary: Vec<Report>,
+}
+
+impl Answer {
+    /// The answer of `build`, `command` in `workspace`, which computed `rebuilt` again
+    /// (sorted by item, then step), with its summary.
+    pub fn new(build: u64, workspace: String, command: String, rebuilt: Vec<Rebuild>) -> Answer {
+        let summary = summary(&rebuilt);
+        Answer { build, workspace, command, rebuilt, summary }
+    }
+}
+
+/// What a `blaze why` asks (`blaze_api::Request::Rebuilt`).
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct Ask {
+    pub all: bool,
+    pub cwd: Option<String>,
+    pub item: Option<String>,
+    /// The one build asked of, whatever `cwd`: its own client's ask, once it ended.
+    pub build: Option<u64>,
+    /// Only the steps whose chain ends in [`Reason::Unexplained`].
+    pub unexplained: bool,
 }
 
 /// What the loop answers `blaze why` from: each workspace's last answer, the newest, and what
@@ -803,16 +834,33 @@ impl Answers {
     /// names, in the order reached, each once). An `item` no item is named is matched by the
     /// items whose name starts with it, in groups.
     pub fn rebuilt(&self, cwd: Option<&str>, item: Option<&str>, all: bool) -> Rebuilt {
+        // clone: an ask's own text, once a request
+        self.asked(&Ask {
+            all,
+            cwd: cwd.map(str::to_owned),
+            item: item.map(str::to_owned),
+            build: None,
+            unexplained: false,
+        })
+    }
+
+    /// [`Answers::rebuilt`] of all an ask can say: with [`Ask::build`], of that build alone
+    /// (no build in the answer when the reasons kept are not its), and with
+    /// [`Ask::unexplained`], each step whose chain ends in [`Reason::Unexplained`]. Without an
+    /// item, the answer carries the build's summary.
+    pub fn asked(&self, ask: &Ask) -> Rebuilt {
+        let (cwd, item, all) = (ask.cwd.as_deref(), ask.item.as_deref(), ask.all);
         let _span =
             tracing::info_span!(target: "blaze", "answer blaze why", item = item.unwrap_or(""))
                 .entered();
-        let answer = match cwd {
-            Some(cwd) => self
+        let answer = match (ask.build, cwd) {
+            (Some(build), _) => self.by.values().find(|it| it.build == build),
+            (None, Some(cwd)) => self
                 .by
                 .values()
                 .filter(|it| holds(&it.workspace, cwd))
                 .max_by_key(|it| it.workspace.len()),
-            None => self.newest.as_ref().and_then(|it| self.by.get(it)),
+            (None, None) => self.newest.as_ref().and_then(|it| self.by.get(it)),
         };
         let mut out = Rebuilt {
             torn: self.torn.clone(), // clone: an answer
@@ -823,6 +871,7 @@ impl Answers {
             command: None,
             dropped: self.dropped,
             rebuilt: Vec::new(), // alloc: none
+            summary: Vec::new(), // alloc: none
             restoring: self.restoring,
             workspace: None,
         };
@@ -830,8 +879,21 @@ impl Answers {
         out.build = Some(answer.build);
         (out.command, out.workspace) =
             (Some(answer.command.clone()), Some(answer.workspace.clone())); // clone: an answer
+        if ask.unexplained {
+            // clone: once a request, the steps blaze has no reason for
+            out.rebuilt = answer
+                .rebuilt
+                .iter()
+                .filter(|it| item.is_none_or(|item| it.item.starts_with(item)))
+                .filter(|it| it.ends.iter().any(|end| matches!(end, Reason::Unexplained { .. })))
+                .cloned()
+                .collect();
+            out.count = u32::try_from(out.rebuilt.len()).unwrap_or(u32::MAX);
+            return out;
+        }
         let Some(item) = item else {
             (out.count, out.groups) = groups(answer.rebuilt.iter(), all);
+            out.summary = answer.summary.clone(); // clone: an answer
             return out;
         };
         if of(&answer.rebuilt, item).is_empty() {
@@ -1060,6 +1122,180 @@ fn groups<'a>(rebuilt: impl Iterator<Item = &'a Rebuild>, all: bool) -> (u32, Ve
     (count, groups.into_iter().map(|(_, it)| it).collect())
 }
 
+/// What a build that computed `rebuilt` again says of itself once it ends
+/// (docs/v2/plan/design/why.md, "What is printed"): a report a root cause (the ends its steps
+/// share), the most steps first and then in the ends' order, the first [`CAUSES`], and one
+/// more counting the rest. Nothing for a build that computed nothing again. A function of
+/// `rebuilt`'s steps and their ends alone, whatever order they are in (rule 25).
+pub fn summary(rebuilt: &[Rebuild]) -> Vec<Report> {
+    // alloc: once a build, a group a root cause
+    let mut by: BTreeMap<&[Reason], Vec<&Rebuild>> = BTreeMap::new();
+    for it in rebuilt {
+        by.entry(it.ends.as_slice()).or_default().push(it);
+    }
+    let mut groups: Vec<(&[Reason], Vec<&Rebuild>)> = by.into_iter().collect(); // alloc: as above
+    groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(b.0)));
+    // alloc: once a build, a report a cause said
+    let mut out: Vec<Report> =
+        groups.iter().take(CAUSES).map(|(ends, steps)| cause(ends, steps)).collect();
+    if groups.len() > CAUSES {
+        let steps: usize = groups[CAUSES..].iter().map(|it| it.1.len()).sum();
+        let text = Text::new()
+            .words("recomputed ")
+            .count(steps as u64)
+            .words(" more for ")
+            .count((groups.len() - CAUSES) as u64)
+            .words(" other causes: ")
+            .code("blaze why")
+            .words(" lists every one");
+        out.push(Report::note(text).rule("why:more"));
+    }
+    out
+}
+
+/// One root cause of a build's summary: the `steps` whose chains end in `ends`.
+fn cause(ends: &[Reason], steps: &[&Rebuild]) -> Report {
+    let count = steps.len() as u64;
+    let steps_word = if count == 1 { " step" } else { " steps" };
+    let is_bug = |it: &Reason| matches!(it, Reason::Unexplained { .. });
+    let is_first = |it: &Reason| matches!(it, Reason::FirstTime);
+    // A cold build is one line: no list of everything it made.
+    if ends.iter().all(is_first) {
+        let text = Text::new().words("computed ").count(count).words(steps_word).words(" for the first time");
+        return Report::note(text).rule("why:first");
+    }
+    let report = if ends.iter().all(is_bug) {
+        let text = Text::new()
+            .count(count)
+            .words(steps_word)
+            .words(" recomputed for no recorded reason: a blaze bug (")
+            .code("blaze why --unexplained")
+            .words(")");
+        Report::warning(text).rule("why:unexplained")
+    } else {
+        let (text, severity_rule) = because(ends, count, steps_word);
+        match severity_rule {
+            (true, rule) => Report::warning(text).rule(rule),
+            (false, rule) => Report::note(text).rule(rule),
+        }
+    };
+    // Its steps by kind, the most first, each naming its first items.
+    // alloc: once a cause said
+    let mut kinds: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for it in steps {
+        kinds.entry(it.step.as_str()).or_default().push(it.item.as_str());
+    }
+    let mut kinds: Vec<(&str, Vec<&str>)> = kinds.into_iter().collect(); // alloc: as above
+    kinds.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(b.0)));
+    kinds.into_iter().fold(report, |report, (step, mut items)| {
+        items.sort_unstable();
+        let mut text = Text::new().words(step).words(": ").words(&items[..items.len().min(NAMED)].join(", "));
+        if items.len() > NAMED {
+            text = text.words(" and ").count((items.len() - NAMED) as u64).words(" more");
+        }
+        report.fact(step, text)
+    })
+}
+
+/// The headline of a cause that is not one kind alone: `recomputed N steps because ...`, a
+/// clause each kind of end joined by `and`; and whether it is a warning (wasted work, or a
+/// bug in blaze), with its rule.
+fn because(ends: &[Reason], count: u64, steps_word: &str) -> (Text, (bool, &'static str)) {
+    let mut text = Text::new().words("recomputed ").count(count).words(steps_word).words(" because ");
+    let mut clauses = 0;
+    let join = |text: Text, clauses: &mut u32| {
+        *clauses += 1;
+        if *clauses > 1 { text.words(" and ") } else { text }
+    };
+    // The inputs that changed, named: files by path, the rest as code.
+    let inputs: Vec<(&str, bool, bool)> = ends // alloc: once a cause said
+        .iter()
+        .filter_map(|it| match it {
+            Reason::InputChanged { file, input, trivia } => Some((input.as_str(), *file, *trivia)),
+            _ => None,
+        })
+        .collect();
+    let wasted = !inputs.is_empty() && inputs.iter().all(|it| it.2);
+    if !inputs.is_empty() {
+        text = join(text, &mut clauses);
+        for (at, (input, file, trivia)) in inputs.iter().take(NAMED).enumerate() {
+            if at > 0 {
+                text = text.words(if at + 1 == inputs.len() { " and " } else { ", " });
+            }
+            text = if *file { text.path(input) } else { text.code(input) };
+            if *trivia && !wasted {
+                text = text.words(" (comments only)");
+            }
+        }
+        if inputs.len() > NAMED {
+            text = text.words(" and ").count((inputs.len() - NAMED) as u64).words(" more inputs");
+        }
+        text = text.words(" changed");
+        if wasted {
+            text = text.words(", though no item in ").words(if inputs.len() == 1 { "it" } else { "them" }).words(
+                " did (comments only): wasted work, a bug in blaze's keys",
+            );
+        }
+    }
+    let mut rule = match (wasted, inputs.is_empty()) {
+        (true, _) => (true, "why:wasted"),
+        (false, false) => (false, "why:input"),
+        (false, true) => (false, "why:first"),
+    };
+    let mut said = [false; 5];
+    for end in ends {
+        let (at, words, code, is) = match end {
+            Reason::InputChanged { .. } => continue,
+            Reason::FirstTime => (0, "some were never computed before", None, (false, "why:first")),
+            Reason::Evicted { by: EvictedBy::Cap, .. } => (
+                1,
+                "blaze why's ledger dropped its records of them to stay under its cap",
+                None,
+                (false, "why:evicted"),
+            ),
+            Reason::Evicted { .. } => {
+                (1, "their results were dropped from the store", None, (false, "why:evicted"))
+            }
+            Reason::PreviousFailed { .. } => {
+                (2, "the last compute of each failed or was stopped", None, (false, "why:failed"))
+            }
+            Reason::Forced { how } => {
+                (3, "that was asked for: ", Some(how.as_str()), (false, "why:forced"))
+            }
+            Reason::KeyUnstable { part } => (
+                4,
+                " came out different from the same inputs (a determinism bug in blaze)",
+                Some(part.as_str()),
+                (true, "why:unstable"),
+            ),
+            Reason::Unexplained { .. } => continue,
+        };
+        // One clause a kind of end, but each forced or unstable one by its name.
+        if said[at] && code.is_none() {
+            continue;
+        }
+        said[at] = true;
+        text = join(text, &mut clauses);
+        text = match (end, code) {
+            (Reason::KeyUnstable { .. }, Some(part)) => text.code(part).words(words),
+            (_, Some(how)) => text.words(words).words(how),
+            (_, None) => text.words(words),
+        };
+        // The first rule stands unless a later end is a bug, or nothing set one yet.
+        if is.0 || (inputs.is_empty() && !rule.0 && clauses == 1) {
+            rule = is;
+        }
+    }
+    if ends.iter().any(|it| matches!(it, Reason::Unexplained { .. })) {
+        text = join(text, &mut clauses)
+            .words("of something blaze did not record (a blaze bug: ")
+            .code("blaze why --unexplained")
+            .words(")");
+        rule = (true, "why:unexplained");
+    }
+    (text, rule)
+}
+
 /// `record` framed: its length, then its deterministic CBOR.
 fn frame(record: &Record) -> Vec<u8> {
     let body = cbor::to_vec(record).expect("a ledger record is plain data, which CBOR encodes");
@@ -1160,12 +1396,12 @@ mod tests {
         misses: Vec<Miss>,
     ) -> Explained {
         let explained = ledger.explain(build, well, misses);
-        let answer = Answer {
+        let answer = Answer::new(
             build,
-            workspace: "/w".to_owned(),
-            command: "build".to_owned(),
-            rebuilt: explained.rebuilt.clone(),
-        };
+            "/w".to_owned(),
+            "build".to_owned(),
+            explained.rebuilt.clone(),
+        );
         answers.add(answer, ledger.dropped());
         explained
     }

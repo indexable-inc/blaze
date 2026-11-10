@@ -288,6 +288,21 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
         Ok(())
     }
 
+    /// After [`Printer::finish`]: why the build recomputed what it did, a report a root cause
+    /// (`Rebuilt::summary`), each on stderr and, as `--message-format=json`, a line on stdout
+    /// too; written. Nothing under `-q`.
+    pub fn recomputed(&mut self, summary: Vec<Report>) -> io::Result<()> {
+        if self.shown.quiet {
+            return Ok(());
+        }
+        for report in summary {
+            self.report(report)?;
+        }
+        self.flush()?;
+        self.out.flush()?;
+        self.err.flush()
+    }
+
     /// Every report held, printed.
     fn reports(&mut self) -> io::Result<()> {
         for (_, report) in std::mem::take(&mut self.held) {

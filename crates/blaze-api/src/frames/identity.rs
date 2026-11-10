@@ -315,6 +315,8 @@ impl Gen {
                 all: self.yes(),
                 cwd: self.maybe_text(),
                 item: self.maybe_text(),
+                build: if self.yes() { Some(self.wide()) } else { None },
+                unexplained: self.yes(),
             },
             31 => Request::Launch { program: self.text(), pid: self.u32() },
             32 => Request::FetchUrl {
@@ -873,6 +875,7 @@ impl Gen {
                 step: g.text(),
                 cause: g.rebuild_cause(depth),
             }),
+            summary: self.many(depth, |g| g.report(depth + 1)),
             restoring: self.yes(),
             workspace: self.maybe_text(),
         }

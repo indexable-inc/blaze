@@ -35,7 +35,7 @@ use blaze_profile::{
 };
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
-use super::why::{Answer, Answers, Ledger, file::File};
+use super::why::{Answer, Answers, Ask, Ledger, file::File};
 
 /// The variable naming the DuckDB `blaze debug sql` and the explorer run: an absolute path,
 /// which blaze's Nix wrapper sets to `nix run .#duckdb`'s. Never looked up on `PATH`.
@@ -709,12 +709,8 @@ fn keep(
                 doing.set(Step::Explaining, build);
                 let (rebuilt, misses, record) = why.explain(build, ended_well, misses);
                 // clone: the answer's copy of whose build it is, once a build
-                let answer = Answer {
-                    build,
-                    workspace: row.workspace.clone(),
-                    command: row.command.clone(),
-                    rebuilt,
-                };
+                let answer =
+                    Answer::new(build, row.workspace.clone(), row.command.clone(), rebuilt);
                 // Sent before the record is durable: an answer may name a build whose record a
                 // crash then loses (docs/v2/plan/design/why.md, "Answered before durable").
                 _ = told.send(Told::Explained { answer, dropped: why.dropped() });
@@ -854,9 +850,7 @@ pub struct Observe {
 /// once `after` builds' have come back, failed at `until` on the loop's clock.
 struct Asked {
     to: RequestRef,
-    cwd: Option<String>,
-    item: Option<String>,
-    all: bool,
+    ask: Ask,
     after: u64,
     until: Duration,
 }
@@ -998,12 +992,12 @@ impl Observe {
                 ledger.explain(build, ended_well, std::mem::take(&mut ended.misses)).rebuilt;
             let dropped = ledger.dropped();
             // clone: whose build it is, once a build of a daemon with no history
-            let answer = Answer {
+            let answer = Answer::new(
                 build,
-                workspace: ended.row.workspace.clone(),
-                command: ended.row.command.clone(),
+                ended.row.workspace.clone(),
+                ended.row.command.clone(),
                 rebuilt,
-            };
+            );
             self.answers.add(answer, dropped);
             return;
         };
@@ -1049,24 +1043,21 @@ impl Observe {
         now: Duration,
         out: &mut Vec<Reply>,
     ) {
+        self.why_asked(to, Ask { all, cwd, item, build: None, unexplained: false }, now, out);
+    }
+
+    /// [`Observe::rebuilt`] of all an ask can say ([`Ask`]): one build's own summary, asked by
+    /// its client once it has its `Done`, and the steps blaze has no reason for.
+    pub fn why_asked(&mut self, to: RequestRef, ask: Ask, now: Duration, out: &mut Vec<Reply>) {
         if self.explained >= self.sent {
-            return answer(
-                out,
-                to,
-                Response::Rebuilt(self.answers.rebuilt(cwd.as_deref(), item.as_deref(), all)),
-            );
+            return answer(out, to, Response::Rebuilt(self.answers.asked(&ask)));
         }
         // Never answered from a build older than one that ended before it was asked (rule 3).
         match self.history_gone {
             true => fail(out, to, never_explained(self.unexplained.front().copied())),
-            false => self.asked.push(Asked {
-                to,
-                cwd,
-                item,
-                all,
-                after: self.sent,
-                until: now + WHY_WAIT,
-            }),
+            false => {
+                self.asked.push(Asked { to, ask, after: self.sent, until: now + WHY_WAIT });
+            }
         }
     }
 
@@ -1233,15 +1224,7 @@ impl Observe {
                 (&self.unexplained, self.profiling.as_ref().map(|it| &*it.doing));
             self.asked.retain(|it| {
                 if explained >= it.after {
-                    answer(
-                        out,
-                        it.to,
-                        Response::Rebuilt(answers.rebuilt(
-                            it.cwd.as_deref(),
-                            it.item.as_deref(),
-                            it.all,
-                        )),
-                    );
+                    answer(out, it.to, Response::Rebuilt(answers.asked(&it.ask)));
                     return false;
                 }
                 if gone {
@@ -1616,12 +1599,7 @@ mod tests {
     }
 
     fn explained(build: u64) -> Told {
-        let answer = Answer {
-            build,
-            workspace: "/w".to_owned(),
-            command: "build".to_owned(),
-            rebuilt: Vec::new(),
-        };
+        let answer = Answer::new(build, "/w".to_owned(), "build".to_owned(), Vec::new());
         Told::Explained { answer, dropped: None }
     }
 

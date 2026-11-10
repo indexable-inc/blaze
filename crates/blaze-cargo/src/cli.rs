@@ -118,6 +118,23 @@ Options:
 Every command takes cargo's flags; `blaze help <COMMAND>` lists them.
 ";
 
+/// After a build's `Finished`: why it recomputed what it did, as the daemon sums it up
+/// (`observe::recomputed`, docs/v2/plan/design/why.md), on the printer's streams. A build that
+/// recomputed nothing says nothing; a summary the daemon could not give is said as a
+/// warning, and the command's own outcome stands.
+fn said_recomputed<O: Write, E: Write>(
+    printer: &mut Printer<'_, O, E>,
+    shown: Shown,
+) -> io::Result<()> {
+    if shown.quiet {
+        return Ok(());
+    }
+    match observe::recomputed() {
+        Ok(summary) => printer.recomputed(summary),
+        Err(why) => printer.err().write_all(say::warning(&why, shown.color).as_bytes()),
+    }
+}
+
 /// What this client recorded of its build, sent to the daemon's history, and with
 /// `BLAZE_PROFILE` the build's trace written (its path said on `err`): a failure is said on
 /// `err` as a warning naming the step and the build, and the command's own outcome stands.
@@ -731,6 +748,7 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
         _ => None,
     };
     printer.finish(ok, started.elapsed())?;
+    said_recomputed(&mut printer, shown)?;
     // A check that failed on its findings still has its suggestions made: a deny lint's
     // finding is an error, and its fix takes it away.
     if let Some(found) = found

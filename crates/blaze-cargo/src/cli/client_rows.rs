@@ -32,6 +32,11 @@ pub const PROFILE: &str = "BLAZE_PROFILE";
 /// for none heard yet: one request a client process, so the last one heard is its.
 static BUILD: AtomicU64 = AtomicU64::new(0);
 
+/// The build the daemon said this client's request is, 0 for none heard.
+pub fn build() -> u64 {
+    BUILD.load(Ordering::Relaxed)
+}
+
 /// The daemon said the request is build `build`.
 pub fn heard(build: Option<u64>) {
     if let Some(build) = build {
