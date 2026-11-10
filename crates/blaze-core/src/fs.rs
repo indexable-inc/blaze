@@ -189,6 +189,45 @@ pub(crate) fn write_unsynced(path: &Path, bytes: &[u8]) -> io::Result<()> {
     })
 }
 
+/// [`crate::Effect::WriteBack`]: the data of the file at `path` that is only in memory written
+/// to its device, waited for here (on a driver's thread; the effect's asker waits for
+/// nothing). Opened to read, so a file sealed read-only is written back too. Nothing of the
+/// file is made durable: no metadata is committed and no drive cache flushed.
+#[cfg(target_os = "linux")]
+pub(crate) fn write_back(path: &Path) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    let file = File::open(path)?;
+    let flags = libc::SYNC_FILE_RANGE_WAIT_BEFORE
+        | libc::SYNC_FILE_RANGE_WRITE
+        | libc::SYNC_FILE_RANGE_WAIT_AFTER;
+    // SAFETY: an open descriptor, and a range of the whole file (0 bytes means to its end).
+    match unsafe { libc::sync_file_range(file.as_raw_fd(), 0, 0, flags) } {
+        0 => Ok(()),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+/// [`crate::Effect::WriteBack`] on Apple's systems and the other Unixes: `fsync`, which writes
+/// the file's data out and, on Apple's, leaves it in the drive's cache (`F_FULLFSYNC` is the
+/// durable one, and is not asked for).
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(crate) fn write_back(path: &Path) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    let file = File::open(path)?;
+    // SAFETY: an open descriptor.
+    match unsafe { libc::fsync(file.as_raw_fd()) } {
+        0 => Ok(()),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+/// [`crate::Effect::WriteBack`] where the system has no write-back short of a sync (Windows,
+/// WASI): the file's data synced. Opened to write, as a flush of a handle there needs.
+#[cfg(not(unix))]
+pub(crate) fn write_back(path: &Path) -> io::Result<()> {
+    OpenOptions::new().write(true).open(path)?.sync_data()
+}
+
 /// [`crate::Effect::RenameUnsynced`]: `from` renamed over `to`, neither directory synced;
 /// `from` is left as it was when the rename fails.
 #[cfg(any(unix, target_os = "wasi"))]

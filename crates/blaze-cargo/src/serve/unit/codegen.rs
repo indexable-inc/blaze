@@ -2470,7 +2470,16 @@ fn relink(
                     dev_run.cells,
                     refused.as_deref(),
                 )
-                .map(|(bytes, told)| (Filed::Whole(bytes), laid, told))
+                // What the commit wrote of the file, as a link with no memory gives it: the
+                // store keeps the file as the one before it with those ranges written, and
+                // its bytes are read (from the image) only where the store cannot
+                // ([`Filed::written`]).
+                .map(|(patch, told)| {
+                    patching.record("full", patch.full);
+                    patching.record("written", patch.written());
+                    patching.record("ranges", patch.writes.len());
+                    (Filed::Patch(patch), laid, told)
+                })
                 // alloc: error path
                 .map_err(|what| LinkCause::Given(format!("{path}: {what}"))),
                 None => linked

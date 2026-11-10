@@ -7026,11 +7026,16 @@ impl<S: Steps> Jobs<S> {
             };
             if let Some(what) = held {
                 if job.held_wait.as_ref().is_none_or(|(_, was)| *was != what) {
+                    // `function` is the field of an ad hoc span the profile keeps as what a
+                    // wait awaits (`blaze_profile::span`'s generic columns: `crate`,
+                    // `function`, `unit`); a field named `awaits` reaches no column, which is
+                    // why this span's reason came out empty.
                     let span = tracing::info_span!(
                         target: "blaze",
                         "the job's answer waits for what it still does",
-                        what,
+                        function = what,
                         awaits = what,
+                        what,
                         placing = job.placing,
                         runs = job.runs,
                     );

@@ -913,6 +913,7 @@ impl Iocp {
             | Effect::WriteFrom { .. }
             | Effect::ReadLink { .. }
             | Effect::Sync { .. }
+            | Effect::WriteBack { .. }
             | Effect::Truncate { .. }
             | Effect::Stat { .. }
             | Effect::Lstat { .. }

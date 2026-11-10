@@ -1029,6 +1029,11 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
             OpenOptions::new().append(true).create(true).open(path)?.sync_all()?;
             Ok(Done::Synced)
         }),
+        // Waited for on this thread; the asker waits for nothing, and nothing is durable.
+        Effect::WriteBack { file, .. } => at(root, &file, |path| {
+            fs::write_back(path)?;
+            Ok(Done::WrittenBack)
+        }),
         Effect::Truncate { file, len, .. } => at(root, &file, |path| {
             fs::truncate(path, len)?;
             Ok(Done::Truncated)

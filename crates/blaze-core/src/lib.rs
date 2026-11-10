@@ -349,6 +349,22 @@ pub enum Effect {
         file: FileName,
         tag: Tag,
     },
+    /// The file's data that is still only in memory begun to be written to its device, and
+    /// the completion told once it is there ([`Durable::Started`]): no metadata is committed
+    /// and no device cache flushed, so nothing of it is durable, and the asker waits for
+    /// nothing (what it goes on with needs no completion of this). What it buys: a file whose
+    /// write-back has completed and that nothing wrote since is clean, so a clone of it
+    /// ([`Effect::Clone`]) shares its blocks at once, where a clone of a file with data not
+    /// written back makes the kernel write all of it first and waits for it (measured on xfs,
+    /// 162 MB: 1.3 s against 1 ms). Linux: `sync_file_range` with
+    /// `WAIT_BEFORE | WRITE | WAIT_AFTER` on a thread or the ring's own; Apple's systems:
+    /// `fsync`, which writes the data out and leaves it in the drive's cache (never
+    /// `F_FULLFSYNC`); elsewhere the data sync the system has. A file that is not there
+    /// fails. Completes with [`Done::WrittenBack`].
+    WriteBack {
+        file: FileName,
+        tag: Tag,
+    },
     /// The file cut to its first `len` bytes (made if missing); durable once a later sync
     /// completes.
     Truncate {
@@ -654,6 +670,7 @@ impl Effect {
             | Effect::ReadLink { tag, .. }
             | Effect::Append { tag, .. }
             | Effect::Sync { tag, .. }
+            | Effect::WriteBack { tag, .. }
             | Effect::Truncate { tag, .. }
             | Effect::Write { tag, .. }
             | Effect::WriteUnsynced { tag, .. }
@@ -932,6 +949,28 @@ impl fmt::Display for Access {
     }
 }
 
+/// How far a file's bytes are to be taken toward the disk by what writes, renames or publishes
+/// them: an argument with no default wherever blaze's own file API takes one (the store's
+/// `publish`, and its handles of the files it wrote), so that what a caller waits for is
+/// written at the call. Only [`Durable::Yes`] waits for the device.
+///
+/// The effects themselves still say it in their names ([`Effect::Write`] and
+/// [`Effect::Rename`] are `Yes`, [`Effect::WriteUnsynced`] and [`Effect::RenameUnsynced`]
+/// `No`, [`Effect::WriteBack`] after either `Started`); one argument on each is bstd's shape
+/// (docs/v2/plan/design/std.md, "Files: whether bytes reached the disk is in the type"), and
+/// folding the variants is a port of every constructor in the workspace of its own.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Durable {
+    /// Derived data: lost at a power failure and made again. Nothing is synced or waited for.
+    No,
+    /// Write-back begun, nothing waits ([`Effect::WriteBack`]): the bytes are on their way to
+    /// the device and the file is clean once they are there, which is what a clone of it
+    /// needs to be cheap. Not durable.
+    Started,
+    /// Synced: the one that waits for the device.
+    Yes,
+}
+
 /// How an [`Effect`] went.
 #[derive(PartialEq, Eq, Debug)]
 #[cfg_attr(test, derive(Clone))] // clone: tests keep what they saw; a completion moves to its owner
@@ -945,6 +984,8 @@ pub enum Done {
     },
     Appended,
     Synced,
+    /// Of an [`Effect::WriteBack`]: the file's data was written to its device (not durably).
+    WrittenBack,
     Truncated,
     Written,
     Listed(Vec<(FileName, Meta)>),

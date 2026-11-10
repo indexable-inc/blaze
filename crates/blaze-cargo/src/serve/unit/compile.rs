@@ -1873,6 +1873,12 @@ impl Written {
     /// link or one from scratch (a full patch), a base the store never had or let go of.
     /// Having no base is not an error, and why is logged; `whole`'s error is the answer's.
     ///
+    /// A base whose whole file the store wrote and has not seen written back is no base
+    /// either (`blaze_cas::NoBase::Unflushed`, the dirty-base rule): a derive is a clone of
+    /// that file, which would wait for all of it to be written out, so the image is handed
+    /// over whole and written where it goes. That is at most one whole file per write-back
+    /// in flight; the edit after it derives again.
+    ///
     /// Give no patch for a file the daemon reads back by its bytes (a proc macro's wasm
     /// module, [`Module::bytes`]): what the store keeps of a patch is the recipe, and only a
     /// place gives the file.
