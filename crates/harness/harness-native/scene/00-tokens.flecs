@@ -2,7 +2,7 @@
 // After den-native's 00-tokens.flecs (github.com/andrewgazelka/den), cut to what harness draws. Colours are sRGB 0..1,
 // `{r, g, b, a}`, straight (not premultiplied); every Fill and Edge has a dark and a light.
 
-// ---- The rules this look keeps (calm and clear, not gloomy: asked for on 2026-11-10 in place of the terminal's black) ----
+// ---- The rules this look keeps (a terminal's: all function, nothing going on) ----
 // 1. Ink only. Four inks on one ground say everything; a kind's mark, a slider, a highlight and a selection are ink
 //    or a step of grey, never a hue. The accent is for a link and a focus ring; red is for a real failure.
 // 2. Nothing moves on its own, and nothing eases. A hover, a highlight, a menu and a sheet are there at once and gone at
@@ -10,55 +10,55 @@
 //    small status glyph's breath in a chat while something runs (it also keeps that time ticking).
 // The one exception to 1 and 2, asked for by name: the block on a running step's line (ui.Block): pixel art in its
 //    own colours, a game's item icon, that turns to a new face when the step changes and is still between turns.
-// 3. A plate only where something floats or is typed into: one hairline, no shadow, no glass, corners of 12. The one
+// 3. A plate only where something floats or is typed into: one hairline, no shadow, no glass, corners of 8. The one
 //    translucent surface, asked for by name: the sidebar (tone_sidebar), a tint over the system's blur of what is behind
 //    the window. Everything else is opaque.
 // 4. Type is the hierarchy: size, weight and ink before any box, rule or icon.
 //
 // ---- The theme: the one place a colour is chosen ----
 // Every surface names one of these roles, never a colour: a widget's `Fill: $tone_card`, Rust's `look::tone(w, "card")`
-// (hn.Theme, scene/widgets/theme.flecs, holds one child per role). Dark is a cool slate, not black: a ground of
-// #1B1D23, plates a clear step or two above it, hairlines that show, one blue (#4D8EFF) for a link and a focus
+// (hn.Theme, scene/widgets/theme.flecs, holds one child per role). Dark is near-black with a cool undertone: a ground of
+// #0A0B0D, plates a step or two above it, hairlines barely over the ground, one blue (#4D8EFF) for a link and a focus
 // ring, colour only where it means something; code keeps JetBrains' Islands Dark scheme (code_ink below); light is the blaze site's paper
 // (site/styles/tokens.css) with the same blue. Another look is another set of these values; nothing else changes. The
 // scene test `no_raw_colours` (src/app.rs) fails on a colour literal anywhere but here and the palettes below.
 //
 // Grounds, darkest to most lifted:
-// - ground: the window and the main card under every pane (#1B1D23 / #f2f1ee).
+// - ground: the window and the main card under every pane (#0A0B0D / #f2f1ee).
 // - sidebar: the sidebar. The main card's ground as a tint (its alpha is the one place the sidebar's translucency is
 //   chosen) over the window's vibrancy, the system's blur of what is behind the window (src/window.rs: the
 //   NSVisualEffectView under the Metal view), as Finder's and Maps' sidebars are; one `line` hairline (hn.Seam) divides
 //   it from the main card. Keep its colour the ground's: with nothing behind the window (an offscreen shot, iOS) the
 //   host draws it at alpha 1 (src/app.rs opaque_sidebar), which is then the ground itself.
-// - card: a plate that sits on the ground: the composer, the palette's and the picker's cards, a generated Card (#252830).
-// - raised: what floats over everything, solid (never glass): menus, popovers, hover cards, a hover card (dark #2E323C; light --bg-3, so a
+// - card: a plate that sits on the ground: the composer, the palette's and the picker's cards, a generated Card (#111216).
+// - raised: what floats over everything, solid (never glass): menus, popovers, hover cards, a user's bubble (dark #16181C; light --bg-3, so a
 //   popover lifts toward the light on the paper ground).
-// - well: what is sunk into a surface: a field, a code block, a rename field (#14161B).
+// - well: what is sunk into a surface: a field, a code block, a rename field (#070809).
 // - term_ground: the terminal's own ground, under a terminal pane's grid only; the one role the user's Ghostty theme sets
 //   (src/app/ghostty.rs), since a terminal's colours are chosen against it. The built-in theme's is the dark ground in both.
-export mut tone_ground: Fill = {dark: {0.106, 0.114, 0.137, 1}, light: {0.949, 0.945, 0.933, 1}}
-export mut tone_sidebar: Fill = {dark: {0.106, 0.114, 0.137, 0.62}, light: {0.949, 0.945, 0.933, 0.66}}
-export mut tone_card: Fill = {dark: {0.145, 0.157, 0.188, 1}, light: {0.965, 0.961, 0.949, 1}}
-export mut tone_raised: Fill = {dark: {0.18, 0.196, 0.235, 1}, light: {0.965, 0.961, 0.949, 1}}
-export mut tone_well: Fill = {dark: {0.078, 0.086, 0.106, 1}, light: {0.922, 0.918, 0.898, 1}}
+export mut tone_ground: Fill = {dark: {0.039, 0.043, 0.051, 1}, light: {0.949, 0.945, 0.933, 1}}
+export mut tone_sidebar: Fill = {dark: {0.039, 0.043, 0.051, 0.72}, light: {0.949, 0.945, 0.933, 0.66}}
+export mut tone_card: Fill = {dark: {0.067, 0.071, 0.086, 1}, light: {0.965, 0.961, 0.949, 1}}
+export mut tone_raised: Fill = {dark: {0.086, 0.094, 0.11, 1}, light: {0.965, 0.961, 0.949, 1}}
+export mut tone_well: Fill = {dark: {0.027, 0.031, 0.035, 1}, light: {0.922, 0.918, 0.898, 1}}
 export mut tone_term_ground: Fill = {dark: {0.039, 0.043, 0.051, 1}, light: {0.039, 0.043, 0.051, 1}}
 // Lines: a hairline (a card's edge, a rule, the sidebar's seam; --line) and the stronger one (a floating plate's edge, a
 // control's track or outline; --line-2).
-export mut tone_line: Fill = {dark: {0.176, 0.192, 0.227, 1}, light: {0.863, 0.859, 0.835, 1}}
-export mut tone_line_strong: Fill = {dark: {0.247, 0.267, 0.314, 1}, light: {0.804, 0.800, 0.776, 1}}
+export mut tone_line: Fill = {dark: {0.102, 0.11, 0.129, 1}, light: {0.863, 0.859, 0.835, 1}}
+export mut tone_line_strong: Fill = {dark: {0.149, 0.161, 0.188, 1}, light: {0.804, 0.800, 0.776, 1}}
 // Inks: strong (titles, headings, a selected row, bold), the body, muted (secondary words, icons at rest), faint (meta,
 // markers, a placeholder, what has ended); --ink-1..4.
-export mut tone_ink_strong: Fill = {dark: {0.957, 0.965, 0.976, 1}, light: {0.086, 0.086, 0.090, 1}}
-export mut tone_ink: Fill = {dark: {0.847, 0.863, 0.89, 1}, light: {0.275, 0.275, 0.290, 1}}
-export mut tone_ink_muted: Fill = {dark: {0.627, 0.655, 0.706, 1}, light: {0.420, 0.416, 0.431, 1}}
-export mut tone_ink_faint: Fill = {dark: {0.447, 0.475, 0.533, 1}, light: {0.635, 0.631, 0.616, 1}}
+export mut tone_ink_strong: Fill = {dark: {0.929, 0.937, 0.949, 1}, light: {0.086, 0.086, 0.090, 1}}
+export mut tone_ink: Fill = {dark: {0.761, 0.773, 0.8, 1}, light: {0.275, 0.275, 0.290, 1}}
+export mut tone_ink_muted: Fill = {dark: {0.545, 0.565, 0.6, 1}, light: {0.420, 0.416, 0.431, 1}}
+export mut tone_ink_faint: Fill = {dark: {0.353, 0.373, 0.412, 1}, light: {0.635, 0.631, 0.616, 1}}
 // Washes: the strong ink at an alpha, so they read on any ground. Hover (a row's, a button's), wash (a resting plate,
 // inline code's: --s-tint), selection (the selected row's pill), selection_focus (a step brighter, never a colour, while its list has
 // the keyboard; a menu's highlighted item), press (held). A scrim dims what is under a sheet.
 export mut tone_hover: Fill = {dark: {1, 1, 1, 0.04}, light: {0.086, 0.086, 0.090, 0.04}}
 export mut tone_wash: Fill = {dark: {1, 1, 1, 0.06}, light: {0.086, 0.086, 0.090, 0.06}}
-export mut tone_selection: Fill = {dark: {0.18, 0.196, 0.235, 1}, light: {0.086, 0.086, 0.090, 0.06}}
-export mut tone_selection_focus: Fill = {dark: {0.216, 0.235, 0.282, 1}, light: {0.086, 0.086, 0.090, 0.085}}
+export mut tone_selection: Fill = {dark: {0.102, 0.114, 0.137, 1}, light: {0.086, 0.086, 0.090, 0.06}}
+export mut tone_selection_focus: Fill = {dark: {0.137, 0.149, 0.176, 1}, light: {0.086, 0.086, 0.090, 0.085}}
 export mut tone_press: Fill = {dark: {1, 1, 1, 0.1}, light: {0.086, 0.086, 0.090, 0.11}}
 export mut tone_scrim: Fill = {dark: {0, 0, 0, 0.36}, light: {0, 0, 0, 0.14}}
 export mut tone_clear: Fill = {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
@@ -74,9 +74,6 @@ export mut tone_copy_sheen: Fill = {dark: {0.72, 0.82, 1.0, 0.24}, light: {0.22,
 export mut tone_sheen: Fill = {dark: {0.9, 0.95, 1.0, 1}, light: {0.11, 0.30, 0.74, 1}}
 // The accent: only what is on or pressable-and-chosen (a switch, a focused control, a load bar); its faint wash (a search
 // match, a highlighted cell); the ink on a solid accent or a coloured badge. A link's ink; inline code's (--doc-code-ink).
-// A message the person sent (hn.ChatUser's bubble): the one plate in colour, the accent a step deeper so white words
-// read on it, as a sent message is in Messages; its words are tone_on_accent.
-export mut tone_bubble: Fill = {dark: {0.176, 0.435, 0.925, 1}, light: {0.133, 0.431, 0.933, 1}}
 export mut tone_accent: Fill = {dark: {0.302, 0.557, 1, 1}, light: {0.22, 0.443, 0.882, 1}}
 // The level slider's fill and its ends' words (level_*, below), from the theme's inks.
 export mut tone_level_fill: Fill = $tone_ink
@@ -87,7 +84,7 @@ export mut tone_on_accent: Fill = {dark: {1, 1, 1, 1}, light: {1, 1, 1, 1}}
 // composer's card while the draft is one, and the answer's card over it, a plate of the card's ground with a little of
 // the accent in it, edged in the accent at a low alpha, so the mode reads at a glance and stays quiet. Opaque, so the
 // composer's lift does not show through it.
-export mut tone_aside: Fill = {dark: {0.133, 0.169, 0.255, 1}, light: {0.904, 0.921, 0.948, 1}}
+export mut tone_aside: Fill = {dark: {0.063, 0.094, 0.161, 1}, light: {0.904, 0.921, 0.948, 1}}
 export mut tone_aside_line: Fill = {dark: {0.302, 0.557, 1, 0.4}, light: {0.22, 0.443, 0.882, 0.35}}
 export mut tone_link: Fill = {dark: {0.478, 0.655, 1, 1}, light: {0.149, 0.459, 0.749, 1}}
 export mut tone_code_ink: Fill = {dark: {0.808, 0.816, 0.839, 1}, light: {0.031, 0.031, 0.031, 1}}
@@ -170,7 +167,7 @@ export const line_row = 16
 // The selection pill and the hover wash hug the row pill_inset in from its frame (4 points of air between neighbours),
 // corners radius_row.
 export const pill_inset = 2
-export const radius_row = 8
+export const radius_row = 6
 // The work bar (frame.flecs hn.WorkBar): work_bar_h tall, its band work_bar_share of the window long, crossing in
 // work_bar_period seconds.
 export const work_bar_h = 2
@@ -315,7 +312,7 @@ export const archive_done_after_s = 3600
 
 // Overlays over the window: the command palette (cmd+K) and the new-object picker (cmd+N), each a card on a scrim
 // (hn.Scrim, hn.OverlayCard in scene/widgets/palette.flecs), there at once and gone at once.
-export const overlay_radius = 12
+export const overlay_radius = 8
 export const overlay_pad = 6
 
 // Menus (prims.flecs ui.Menu and its parts), macOS NSMenu's: a plate menu_radius round that hugs its widest item (at
@@ -326,7 +323,7 @@ export const overlay_pad = 6
 // label), so every label starts at menu_label_x whether ticked or not. Its trailing words (a model's line, a key) are
 // muted, at least menu_trail_gap after the label. A section's head is size_menu_head, muted; a separator is a hairline
 // menu_sep_pad above and below.
-export const menu_radius = 12
+export const menu_radius = 8
 export const menu_pad = 5
 export const menu_gap = 6
 export const menu_min_w = 120
@@ -335,7 +332,7 @@ export const menu_lift_blur = 18
 export const menu_lift_alpha = 0.28
 export const menu_lift_dy = 6
 export const menu_item_h = 22
-export const menu_item_radius = 7
+export const menu_item_radius = 5
 export const menu_item_pad_r = 10
 export const menu_gutter_l = 6
 export const menu_check = 11
@@ -395,10 +392,10 @@ export const keycap_radius = 4
 export const size_keycap = 11
 export const line_keycap = 13
 
-export const radius_control = 8
-export const radius_card = 12
+export const radius_control = 6
+export const radius_card = 8
 // ui.Bubble: its corners and the most it widens to before its words wrap (about 65 characters of body text).
-export const radius_bubble = 16
+export const radius_bubble = 8
 export const bubble_max_w = 480
 
 // An icon button (ui.IconButton) has no plate: its glyph rests in tone_ink_muted and eases to tone_ink_strong under the
@@ -586,7 +583,7 @@ export const chat_item_gap = 3
 export const chat_item_half = $chat_item_gap / 2
 export const size_chat_bullet = 10
 export const line_chat_code = 17
-export const chat_bubble_radius = 16
+export const chat_bubble_radius = 8
 // The widest a user's bubble gets before its words wrap: about three quarters of the column, as iMessage and ChatGPT do.
 export const chat_bubble_max_w = $chat_w * 0.8
 // The composer (hn.ChatPane's foot.card): one card holding the words, centred in the reading column (chat_w wide at
@@ -905,7 +902,7 @@ export const gen_bone_h = 10
 // controls ride a dark plate along its foot, gen_video_bar_pad in from its edges, in light inks over the picture whatever
 // the appearance (a picture is not the ground: a palette, not a role); its scrub rail is the slider's, thinner.
 export const gen_shader_h = 200
-export const radius_gen_media = 12
+export const radius_gen_media = 8
 export const gen_video_bar_h = 32
 export const gen_video_bar_pad = 8
 export const gen_video_rail = 3
