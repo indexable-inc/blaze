@@ -218,10 +218,10 @@ impl App {
             for (_, r) in rows {
                 // A card's component is asked after as a chip's is.
                 let card = match r {
-                    Row::RefCard(src) => Some((&[] as &[&str], src.clone(), true)),
+                    Row::RefCard(src) => Some(Words::at("", src.clone(), true)),
                     _ => None,
                 };
-                for (_, src, md) in texts(r).into_iter().chain(card) {
+                for Words { src, md, .. } in texts(r).into_iter().chain(card) {
                     if !md {
                         continue;
                     }
@@ -386,11 +386,12 @@ impl App {
             if !row.entity().try_cloned::<&Laid>().is_some_and(|l| l.contains(x, y)) {
                 continue;
             }
-            for (path, src, md) in texts(r) {
-                if !md || !src.contains('<') {
+            for t in texts(r) {
+                if !t.md || !t.src.contains('<') {
                     continue;
                 }
-                let Some(node) = path.iter().try_fold(row, |v, n| v.part(n)) else { continue };
+                let Some(node) = t.node(row) else { continue };
+                let src = t.src;
                 let Some((lay, l)) = words_layout(&mut paint, node.entity()) else { continue };
                 if !l.contains(x, y) {
                     continue;

@@ -308,6 +308,17 @@ export interface ShaderProps extends CommonProps {
  */
 export interface BrowserProps extends CommonProps { view?: string; src?: string }
 
+/** A point of the earth: [lat, lon], {lat, lon}, or what `location()` returns ({latitude, longitude, ...}). */
+export type MapPoint = readonly [number, number] | { lat: number; lon: number } | { latitude: number; longitude: number };
+/** One place on a Map: its pin, the words beside it, and a line more and a link shown when it is pressed. */
+export interface MapMarker { lat: number; lon: number; label?: string; detail?: string; href?: string }
+/**
+ * Places on a real map (Apple's, a live MapKit view over the element's card) that pans and zooms: a pin and its label per marker
+ * (at most 200), fitted to them, or looking at `center` with `zoom` (a web map's: 0 the world to 19 a building); `here` is a dot for
+ * where the person is. A pin's `detail` shows when it is pressed, and its `href` opens from there (map.ts).
+ */
+export interface MapProps extends CommonProps { markers?: readonly MapMarker[]; center?: MapPoint; zoom?: number; here?: MapPoint }
+
 /** Every built-in element's props, by element name. */
 export interface ElementProps {
   Column: ColumnProps; Row: RowProps; Text: TextProps; Markdown: MarkdownProps; Code: CodeProps; Table: TableProps;
@@ -319,7 +330,7 @@ export interface ElementProps {
   Accordion: AccordionProps; Disclosure: DisclosureProps; Popover: PopoverProps; Menu: MenuProps; Dialog: DialogProps; Sheet: SheetProps;
   Toast: ToastProps; Progress: ProgressProps; Loading: LoadingProps; Skeleton: SkeletonProps; Icon: IconProps; Image: ImageProps;
   Chip: ChipProps; Tile: TileProps; FileRef: FileRefProps; File: FileProps; CellRef: CellRefProps; Kip: KipProps; Video: VideoProps; Shader: ShaderProps;
-  Browser: BrowserProps;
+  Browser: BrowserProps; Map: MapProps;
 }
 
 /** True when ElementProps names exactly the elements element.ts draws; the constant under it fails to type-check otherwise. */

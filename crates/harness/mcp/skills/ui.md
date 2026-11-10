@@ -1,6 +1,6 @@
 ---
 name: ui
-description: Cells as Svelte 5 UI: every element and prop the chat draws (text, tables, stats, charts, drawings, inputs, layout, dialogs, media, shaders, motion) and the rules; read before writing a UI cell.
+description: Cells as Svelte 5 UI: every element and prop the chat draws (text, tables, stats, charts, drawings, inputs, layout, dialogs, media, maps, shaders, motion) and the rules; read before writing a UI cell.
 ---
 To show a result as UI instead of prose (a dashboard, a comparison, a summary), write a ts cell that is Svelte 5
 markup (start it with <script> or an element); runes only ($state, $derived, $effect, $props), and the person sees it
@@ -92,6 +92,17 @@ main(ShaderInput in)` between its tags (in.uv, in.pixel, in.resolution, in.time,
 in.u.<uniform>; texture(name, uv)); uniforms and textures take values or '@id' of an element in the cell (a Slider's
 live value, a Video's frames): <Shader aspect="16:9" textures={{ clip: '@clip' }} uniforms={{ gain: '@gain' }}>float4
 main(ShaderInput in) { return texture(clip, in.uv) * in.u.gain; }</Shader>.
+
+Places: Map shows them on Apple's map, live in the transcript: the person pans and zooms it in place, a pin and its
+label each; never draw a map by hand or list coordinates. markers is at most 200 of {lat, lon, label, detail, href, place} (place: a places() row's id; its pin then shows Apple's own card of the place when pressed, with its pictures, hours and rating: always pass it for places() rows) (lat
+-90 to 90, lon -180 to 180; detail shows when a pin is pressed, and href opens from there). It is fitted to the markers,
+or looks at center={[lat, lon]} with zoom (a web map's: 0 the world, 13 a town, 19 a building); here={[lat, lon]} is a
+blue dot for where the person is, and takes what `location()` returns as it is.
+
+```svelte
+<script>const me = await location();</script>
+<Map here={me} markers={[{lat: 34.103, lon: -118.101, label: 'Cha Redefine', detail: '0.1 mi, about eight outlets', href: 'https://example.com'}]} />
+```
 
 Every element also takes width, height (and min/max), grow, padX, padY, a sprung pose (x, y, scale, rotate, opacity),
 z, hover={{scale: 1.05}}, enter and exit (or Svelte's in:, out:, transition: fly fade scale slide, and animate:flip),

@@ -1491,3 +1491,16 @@ hn {
     }
   }
 }
+
+// Places on Apple's map (src/app/chat/genui/map.rs `Map`): the card only, a quiet rounded plate gen_map_aspect wide over
+// tall, its places on it as MapPlaces (src/app/maps.rs). The map is the host's, a live MapKit view laid over the card each
+// frame and cut to its corners (src/window/maps.rs); where no host shows one (a shot, the phone) the plate stays empty.
+@tree ChildOf
+hn {
+  prefab GenMap : ui.Node {
+    Fill: $tone_wash
+    Shape: {radius: $radius_gen_media, n: 4, border: 0, feather: 0}
+    Aspect: {ratio: $gen_map_aspect}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+}

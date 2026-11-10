@@ -873,6 +873,7 @@ dependencies = [
 name = "harness-browser"
 version = "0.1.0"
 dependencies = [
+ "block2",
  "cef",
  "crossbeam-channel",
  "harness-mach",
@@ -953,9 +954,11 @@ dependencies = [
  "objc2-foundation",
  "objc2-metal",
  "objc2-quartz-core",
+ "objc2-ui-kit",
  "png",
  "pulldown-cmark",
  "read-fonts",
+ "serde",
  "serde_json",
  "unicode-bidi",
 ]
@@ -1297,6 +1300,7 @@ name = "harness-video"
 version = "0.1.0"
 dependencies = [
  "block2",
+ "harness-native",
  "harness-native-api",
  "harness-native-blaze",
  "harness-native-ecs",
@@ -1309,8 +1313,8 @@ dependencies = [
  "harness-native-ui-layout",
  "harness-native-ui-layout-api",
  "harness-native-ui-motion",
+ "harness-native-ui-motion-api",
  "harness-native-ui-node-api",
- "harness-native-ui-prims",
  "harness-native-ui-text-api",
  "harness-native-ui-timeline",
  "harness-native-ui-timeline-api",
@@ -2145,6 +2149,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc2-core-location"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca347214e24bc973fc025fd0d36ebb179ff30536ed1f80252706db19ee452009"
+dependencies = [
+ "objc2",
+ "objc2-foundation",
+]
+
+[[package]]
 name = "objc2-core-media"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2249,6 +2263,37 @@ dependencies = [
  "objc2-core-video",
  "objc2-foundation",
  "objc2-metal",
+]
+
+[[package]]
+name = "objc2-ui-kit"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d87d638e33c06f577498cbcc50491496a3ed4246998a7fbba7ccb98b1e7eab22"
+dependencies = [
+ "bitflags 2.13.2",
+ "block2",
+ "objc2",
+ "objc2-cloud-kit",
+ "objc2-core-data",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
+ "objc2-core-image",
+ "objc2-core-location",
+ "objc2-core-text",
+ "objc2-foundation",
+ "objc2-quartz-core",
+ "objc2-user-notifications",
+]
+
+[[package]]
+name = "objc2-user-notifications"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9df9128cbbfef73cda168416ccf7f837b62737d748333bfe9ab71c245d76613e"
+dependencies = [
+ "objc2",
+ "objc2-foundation",
 ]
 
 [[package]]

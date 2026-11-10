@@ -8,6 +8,9 @@ import { Repl } from "./repl.ts";
 import { setConfirm } from "./host.ts";
 
 // stdout is the MCP channel; anything logged outside a cell must go to stderr.
+// A promise nobody awaited that rejects (a timer's, a dropped connection's) fails nothing but itself: it is said on stderr
+// and the kernel keeps serving. Bun's default ends the process, and with it the REPL's state and the agent's turn.
+process.on("unhandledRejection", (e) => { console.error("[kernel] an unawaited promise rejected:", e); });
 console.log = console.error;
 
 // cursor runs in an empty private workspace (so it loads no repo rules) and passes the real one here.
@@ -27,7 +30,7 @@ server.registerTool(
       "Run TypeScript in a persistent Bun REPL. Top-level const/let/function/import persist across calls; top-level await works;",
       "the value of the last expression is returned; console.log output is captured. All Bun/Node APIs and fetch are available.",
       "Every cell is a task (t1, t2, ...) and cells run concurrently. The reply starts with a header '[t3 done 0.12s]' / '[t3 error ...]';",
-      "if the cell is still running after yield_ms (default 10000) the call returns '[t3 running 10.0s, backgrounded]' with logs so far and the cell keeps going:",
+      "if the cell is still running after yield_ms (default 30000) the call returns '[t3 running 30.0s, backgrounded]' with logs so far and the cell keeps going:",
       "check with tasks(), task('t3'), or `await wait('t3')` (logs and result are kept).",
       "Use the typed calls, which return data and show the person what they did: Bun.file(p).text() to read, rg to search, glob/ls/du to list,",
       "cargo.check/build/test/clippy or follow(cmd) for builds and tests (a digest, not the log), gitLog() for history, github.* for GitHub, fetch for HTTP.",
@@ -40,11 +43,13 @@ server.registerTool(
     ].join("\n"),
     inputSchema: {
       code: z.string().describe("TypeScript to run"),
-      yield_ms: z.number().optional().describe("wait this long before backgrounding; default 10000"),
+      yield_ms: z.number().optional().describe("wait this long before backgrounding; default 30000"),
       timeout_ms: z.number().optional().describe("hard limit for the cell, rejecting it; default none"),
     },
   },
-  async ({ code, yield_ms = 10_000, timeout_ms }, extra) => {
+  // 30 s: a cell that finishes in that time answers in the same call. Backgrounding one sooner costs the agent a
+  // whole turn to come back for it (about 6 s of its own, measured 2026-11-10), which is longer than most waits it saved.
+  async ({ code, yield_ms = 30_000, timeout_ms }, extra) => {
     // The agent names the tool call in the request's _meta (Claude as `claudecode/toolUseId`, Codex as `callId`, the
     // same id its app-server gives the mcpToolCall item); the cell carries it so the app draws the cell as that call.
     const meta = extra._meta ?? {};

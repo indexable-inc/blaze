@@ -93,6 +93,8 @@ type Rule = {
 
 const header = `# blaze
 
+This codebase is yours: what it's for and how it's built are your call, and you'll keep building on it. You own it: when anything in it is not state of the art, or is subpar, fix it immediately rather than wait. State of the art means on the Pareto frontier of incremental speed, memory use, disk use and the rest of what blaze is measured by: nothing else is better on one without being worse on another.
+
 How to build, test and change blaze: docs/contributing.md. Every doc: docs/README.md. What the harnesses check: docs/harness.md. These rules are generated from tools/agents/rules.ts (edit there, then \`bun tools/agents/rules.ts --write\`).
 
 Each rule below is one line; its full text, with how-to, is in the skill named after it, under .agents/skills/ (also .claude/skills/). Load that skill before work it covers.`;
@@ -491,6 +493,14 @@ export const rules = [
 		info: "What code must always do is written once, in blaze, and every check reads the same text. A contract (`requires`, `ensures`) says what one call does. A reference model is a small, pure, sequential implementation of what a component means, an ordinary type in the crate under `/// The reference model:`. `/// The invariant:` goes on the test whose oracle checks an invariant, and `/// The refinement:` on the test that runs an implementation against its model (or another implementation) and compares. Each needs a control in the same file, a test named `the_oracle_catches_<the planted bug>`. The statement then climbs a ladder without being rewritten: tested (a property test), simulated (the deterministic simulation with faults and crashes), model-checked (every interleaving to a bound), proved (Lean, from the same contract and model; say it as `/// The invariant (proved: <proof file>):`). Durable, concurrent and crash-recovering code is at least simulated; prove the sans-IO cores and what must never be wrong; a disagreement between two levels is a bug in one of them. `harness/v2/invariants.py` collects every statement with its level into `docs/v2/plan/invariants.md` (`write`) and fails the gate (`check`) when one has no control, names a missing proof, or the list is stale. Before changing or regenerating code, read the invariants its crate states: they are what the new code is judged against.",
 		reason: "Andrew, 2026-11-09, on a day when agents wrote about 25,000 lines: \"anyone building with agents and accumulating piles of generated code [should] start making semantics, invariants, and refinement properties first-class artifacts\"; \"try to have this as first class\"; and that tests, the simulation and the Lean verifier should be tied together rather than three separate things.",
 		link: "docs/v2/plan.md#11-proof-by-check-not-by-review",
+	},
+	{
+		id: "guard-the-cause",
+		skill: "changing-code",
+		line: "When you find bad code or a bad decision, find why it was made and remove that cause with a guard (a lint, a check in the gate, a rule or a skill's instruction), so it cannot be written again; do this unasked.",
+		info: "Bad code is a symptom. When you find some (jank, a subpar design, a bug that sat unseen, a wait nobody named, a second way to do one thing), fix it, then ask why it was written that way and why nothing caught it: a missing lint, a harness that was broken or bypassed, a rule that did not say, a skill that told nobody how, an interface that made the wrong thing the easy thing, a measurement nobody ran. Remove that cause in the same change or the next: a blaze lint with a fix that finds every other instance (`fix-through-blaze-lints`), a check that joins the gate, a rule or skill instruction that says what to do instead, or a change to the interface so the mistake cannot be expressed. The fix is not done until the guard exists and has been run over the whole tree. Do it proactively: you do not wait to be asked, and you say in your report what the cause was and what now guards it. A guard that only describes the one instance you found is not one; state the general rule it enforces.",
+		reason: "Andrew, 2026-11-10, after a day of finding that every edit dropped the front end, held its answer for a disk sync and hung inside the sandbox, none of it seen because the budget harness was broken and the gate bypassed: \"think about why these design decisions were made and try to fix root cause ... if see bad code proactively make lints or etc or better instructions to avoid it or systems to avoid\".",
+		link: "docs/contributing.md#what-a-change-needs",
 	},
 ] as const satisfies readonly Rule[];
 

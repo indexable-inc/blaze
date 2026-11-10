@@ -221,7 +221,31 @@ const GEM: Sprite = &[
     "...dd...",
 ];
 
-/// The item a face names: what a step does, and `think` for a turn between steps. A name not here is `build` (a tool).
+/// A cup of green tea on its saucer: the work is done.
+const CUP: [&str; 6] = [
+    ".wwwwwww..",
+    ".wtttttwww",
+    ".wtttttw.w",
+    ".wwwwwwwww",
+    "..wwwww...",
+    ".sssssss..",
+];
+const CUP_PAL: Palette = &[(b'w', [236, 232, 220]), (b't', [150, 190, 110]), (b's', [176, 172, 160])];
+/// A cross: the work ended on an error.
+const CROSS: [&str; 8] = ["rr....rr", "rrr..rrr", ".rrrrrr.", "..rrrr..", "..rrrr..", ".rrrrrr.", "rrr..rrr", "rr....rr"];
+const CROSS_PAL: Palette = &[(b'r', [240, 110, 110])];
+
+/// The side of an item's picture, in texels.
+pub const SIDE: usize = CANVAS;
+
+/// Item `face`'s picture at `time` seconds: [`SIDE`] by [`SIDE`] texels of straight RGBA, as the painter draws it.
+#[must_use]
+pub fn picture(face: &str, time: f32) -> Vec<u8> {
+    render(item(face), item(face), 1.0, time)
+}
+
+/// The item a face names: what a step does, `think` for a turn between steps, and `done` and `fail` for a turn that
+/// ended (a tucked-away window's, src/window/mini.rs). A name not here is `build` (a tool).
 pub fn item(face: &str) -> &'static str {
     match face {
         "exec" | "cell" => "exec",
@@ -233,6 +257,8 @@ pub fn item(face: &str) -> &'static str {
         "wait" => "wait",
         "sql" => "sql",
         "think" => "think",
+        "done" => "done",
+        "fail" => "fail",
         _ => "build",
     }
 }
@@ -304,6 +330,13 @@ fn draw(c: &mut Canvas, name: &str, n: usize, lift: i32) {
             c.blit(ROCKET, ROCKET_PAL, 5, y - up);
             c.blit(if n % 2 == 0 { FLAME_A } else { FLAME_B }, ROCKET_PAL, 6, y + 7 - up);
         }
+        "done" => {
+            c.blit(&CUP, CUP_PAL, 3, y + 4);
+            // Steam: two wisps rising, one a step behind the other.
+            c.put(5, y + 2 - (n % 3) as i32, [222, 226, 234], 150);
+            c.put(8, y + 2 - ((n + 1) % 3) as i32, [222, 226, 234], 150);
+        }
+        "fail" => c.blit(&CROSS, CROSS_PAL, 4, y + 3),
         "wait" => {
             c.blit(GLASS, GLASS_PAL, 4, y + 1);
             // A grain falls through the neck into the lower bulb.
@@ -449,11 +482,11 @@ mod tests {
     /// something, a change starts as the old item and ends as the new one, and an item moves from step to step.
     #[test]
     fn items_are_whole_and_a_change_goes_from_one_to_the_other() {
-        for (name, s) in [("TERM", TERM), ("BOOK", BOOK), ("PAPER", PAPER), ("PENCIL", PENCIL), ("LENS", LENS), ("ANVIL", ANVIL), ("ROCKET", ROCKET), ("GLASS", GLASS), ("DRUM", DRUM), ("GEM", GEM)] {
+        for (name, s) in [("TERM", TERM), ("BOOK", BOOK), ("PAPER", PAPER), ("PENCIL", PENCIL), ("LENS", LENS), ("ANVIL", ANVIL), ("ROCKET", ROCKET), ("GLASS", GLASS), ("DRUM", DRUM), ("GEM", GEM), ("CUP", &CUP), ("CROSS", &CROSS)] {
             assert!(s.iter().all(|r| r.len() == s[0].len()), "{name}'s rows are not one width");
         }
         assert!(LAND.iter().all(|r| r.len() == 24));
-        for face in ["exec", "read", "edit", "search", "net", "build", "spawn", "wait", "sql", "think", "no such kind"] {
+        for face in ["exec", "read", "edit", "search", "net", "build", "spawn", "wait", "sql", "think", "done", "fail", "no such kind"] {
             let px = render(item(face), item(face), 1.0, 0.0);
             assert!(px.chunks_exact(4).filter(|p| p[3] == 255).count() > 20, "{face} draws next to nothing");
         }

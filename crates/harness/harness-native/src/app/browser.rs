@@ -90,6 +90,10 @@ const RELOAD_ICON: &str = "\u{EB37}";
 const EXT_ICON: &str = "\u{EAE6}";
 const CLOSE_ICON: &str = "\u{EA76}";
 
+/// How often a broken link to the host is made again: this many times in this many seconds.
+const RECONNECTS: usize = 3;
+const RECONNECT_SECS: u64 = 60;
+
 /// What the main-queue handler hands the frame: messages with their port rights, or why the link broke.
 #[derive(Default)]
 struct Inbox {
@@ -126,6 +130,10 @@ pub(super) struct Browser {
     host: Rc<RefCell<Option<SendRight>>>,
     /// Errors the latch sink met (it has no App to put them on).
     latch_errors: Rc<RefCell<Vec<String>>>, // alloc: rarely more than one, read each frame
+    /// When the link was asked for again after breaking ([`Browser::fail`]), within the last RECONNECT_SECS.
+    reconnects: Vec<std::time::Instant>, // alloc: at most RECONNECTS
+    /// The host was lost and the link is being made again: the pane's view is the old host's, to let go of.
+    lost: bool,
     latch_set: bool,
     pub(in crate::app) media: Option<Rc<RefCell<Media>>>,
     wake: Wake,
@@ -176,6 +184,8 @@ impl Browser {
             inbox: Rc::default(),
             host: Rc::default(),
             latch_errors: Rc::default(),
+            reconnects: Vec::new(),
+            lost: false,
             latch_set: false,
             media: None,
             wake,
@@ -228,10 +238,25 @@ impl Browser {
 
     fn fail(&mut self, why: String) {
         eprintln!("harness-native: browser: {why}");
-        self.conn = Conn::Failed(why);
+        // A link that was up and broke is the host gone (restarted, crashed): the daemon starts another when asked, so
+        // the link is asked for again, at most RECONNECTS times in RECONNECT_SECS (a host that keeps dying is said, not
+        // chased). Its views went with it: what the app knew of them is dropped, and the pane lets go of its page.
+        let now = std::time::Instant::now();
+        self.reconnects.retain(|t| now.duration_since(*t).as_secs() < RECONNECT_SECS);
+        let again = self.live() && self.reconnects.len() < RECONNECTS;
         *self.host.borrow_mut() = None;
         self.watched.clear();
         self.sized.clear();
+        if again {
+            self.reconnects.push(now);
+            self.views.clear();
+            self.closed.clear();
+            self.errors.clear();
+            self.lost = true;
+            self.conn = Conn::Idle;
+        } else {
+            self.conn = Conn::Failed(why);
+        }
     }
 
     fn live(&self) -> bool {
@@ -617,6 +642,11 @@ impl App {
     pub(super) fn browser_frame_start(&mut self, dt: f32) {
         let mut nodes: Vec<(u64, BrowserView)> = Vec::new(); // alloc: this frame's browser nodes
         self.world.new_query::<&BrowserView>().each_entity(|e, bv| nodes.push((*e.id(), bv.clone())));
+        if std::mem::take(&mut self.browser.lost) {
+            // The host that held the pane's page is gone, and another's views are numbered from one again.
+            let s = self.web();
+            self.set_web(WebState { view: 0, ..s });
+        }
         let wanted = self.web().open || !nodes.is_empty();
         if wanted && matches!(self.browser.conn, Conn::Idle) {
             self.browser.ask();
@@ -929,9 +959,19 @@ impl App {
         let s = self.web();
         let info = self.browser.views.get(&s.view).cloned();
         if let Some(bar) = pane.part("bar") {
-            // The toolbar is out of the way: the page fills the pane, and the bar (back, forward, reload, the address)
-            // comes only while the address is edited (cmd+L) or the extensions menu is open.
-            let want = if self.browser.url.is_some() || self.browser.menu {
+            // The toolbar is out of the way: the page fills the pane, and the bar (back, forward, reload, the address,
+            // close) comes while the address is edited (cmd+L), the extensions menu is open, or the pointer is at the
+            // pane's top (over the bar, or the strip of the page it would take), so the pane can be closed with the
+            // pointer.
+            let reach = view::prefab(self.world.world_ref(), "hn.WebPane")
+                .and_then(|p| View::of(p).part("bar"))
+                .and_then(|b| b.entity().try_cloned::<&Size>())
+                .map_or(0.0, |s| s.h.value);
+            let near = pane.entity().try_cloned::<&Laid>().is_some_and(|l| {
+                let (px, py) = (self.pointer.x, self.pointer.y);
+                l.w > 0.0 && px >= l.x && px < l.x + l.w && py >= l.y && py < l.y + reach
+            });
+            let want = if self.browser.url.is_some() || self.browser.menu || near {
                 view::prefab(self.world.world_ref(), "hn.WebPane").and_then(|p| View::of(p).part("bar")).and_then(|b| b.entity().try_cloned::<&Size>())
             } else {
                 bar.entity().try_cloned::<&Size>().map(|s| Size { h: Sizing::fixed(0.0), ..s })

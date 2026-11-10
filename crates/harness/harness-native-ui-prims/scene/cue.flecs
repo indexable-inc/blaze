@@ -1,0 +1,26 @@
+// The moves a timeline makes, by name. Motion on a clock is data: a `Cue` child moves one numeric member of the node
+// above it, named by path (`Pose.fade`, `Size.w.value`), between two values over a stretch of the host's clock
+// (harness-native-ui-timeline `apply`: harness-video's frame clock, the app's seconds since launch). Each template is one
+// such cue: `cue.FadeIn show(at: 2.0)` inside the node it moves. A new move a scene needs twice goes here.
+@tree ChildOf
+cue {
+  // Fade in over `dur` from `at`, slowly at both ends.
+  template FadeIn {
+    prop at: f32 = 0
+    prop dur: f32 = 1
+    Cue: {member: "Pose.fade", from: 1, to: 0, at: $at, dur: $dur, ease: InOut}
+  }
+  // Fade out over `dur` from `at`, slowly at both ends.
+  template FadeOut {
+    prop at: f32 = 0
+    prop dur: f32 = 1
+    Cue: {member: "Pose.fade", from: 0, to: 1, at: $at, dur: $dur, ease: InOut}
+  }
+  // Grow by `by` of its size over `dur` from `at`, slowly at both ends (a camera pushing in).
+  template PushIn {
+    prop at: f32 = 0
+    prop dur: f32 = 4
+    prop by: f32 = 0.05
+    Cue: {member: "Pose.shrink", from: 0, to: 0 - $by, at: $at, dur: $dur, ease: InOut}
+  }
+}

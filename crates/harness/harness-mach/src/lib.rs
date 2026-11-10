@@ -22,7 +22,7 @@
 //! Sends never block: they carry `MACH_SEND_TIMEOUT` 0, so a receiver that stopped draining makes a send fail
 //! [`SendError::Full`] (the host drops that frame) instead of stalling the sender's main thread. Each receive port's queue
 //! is [`QUEUE_LIMIT`] deep.
-#![cfg(target_os = "macos")]
+#![cfg(target_vendor = "apple")]
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::fmt;
 

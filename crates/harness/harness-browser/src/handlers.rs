@@ -4,6 +4,28 @@ use crate::host;
 use cef::*;
 use std::ffi::c_int;
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CgRect {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGMainDisplayID() -> u32;
+    fn CGDisplayBounds(display: u32) -> CgRect;
+}
+
+/// The main display's size in points, at the origin. None when Core Graphics names no display (no screen attached).
+fn main_display() -> Option<Rect> {
+    // SAFETY: two Core Graphics calls with no preconditions; CGRect is four doubles (origin, then size).
+    let r = unsafe { CGDisplayBounds(CGMainDisplayID()) };
+    (r.w >= 1.0 && r.h >= 1.0).then(|| Rect { x: 0, y: 0, width: r.w as i32, height: r.h as i32 })
+}
+
 // ---------------------------------------------------------------- the app and the browser process
 
 wrap_app! {
@@ -214,6 +236,10 @@ wrap_render_handler! {
             si.depth = 24;
             si.depth_per_component = 8;
             si.is_monochrome = 0;
+            // The screen is the Mac's main display, not the view: a page sees a window on a screen (`screen.width`
+            // larger than its `innerWidth`), as in any browser; a screen exactly the size of the viewport is what an
+            // embedded or headless browser looks like. The view's own rect when the display cannot be read.
+            let rect = main_display().unwrap_or(rect);
             si.rect = rect.clone();
             si.available_rect = rect;
             1
