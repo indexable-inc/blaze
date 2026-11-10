@@ -42,7 +42,7 @@ pub enum FrontRef<I, S> {
 }
 
 /// What the front end says of a function instance, without compiling it.
-#[derive(Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: copied out of the front end's memo, once per function described
 pub struct Described<I, S> {
     pub item: ItemKey,
     /// Its code, with the key of the store its body is written in: what its instance key
@@ -251,6 +251,23 @@ pub trait Frontend: Sync {
         head: &Self::Instance,
         limit_of: &Self::Instance,
     ) -> CodegenError;
+
+    /// What describing `instance` for `requester` gives now, where it is other than `was`:
+    /// what this front end's database gave an earlier walk of it, which the driver kept
+    /// (`driver::Kept`). `Ok(None)` says a describe now would give `was`, decided without
+    /// the describe wherever the front end can (a memo its query engine verifies); the driver
+    /// then takes `was` and asks nothing more. The answer is exact: a front end that cannot
+    /// tell gives the new describe. The default describes again, which is the whole
+    /// computation, so a walk over it is the walk with nothing kept.
+    fn redescribe(
+        &self,
+        instance: &Self::Instance,
+        requester: &Origin,
+        was: &Described<Self::Instance, Self::Static>,
+    ) -> Result<Option<Described<Self::Instance, Self::Static>>, CodegenError> {
+        let _ = was;
+        self.describe(instance, requester).map(Some)
+    }
 
     /// Told that the walk has reached everything it was told of ([`Self::reached`]), with
     /// no error: `true` when what it reached closes facts of the whole program its bodies are

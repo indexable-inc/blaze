@@ -73,6 +73,51 @@ struct Program {
     crates: HashMap<u32, (u32, bool)>,
     /// The recursion limit of each crate other than 0.
     limits: HashMap<u32, u32>,
+    /// Each function that calls through a `dyn`, with the function the program's dyn facts
+    /// make that call direct to: a walk against them ([`Frontend::closed`]) describes it with
+    /// that callee among its references and in its code. Any at all gives the walk a second
+    /// round.
+    dyn_sites: HashMap<u32, u32>,
+    /// What stands in for the front end's query engine, for the walk over kept describes
+    /// (`tests/kept.rs`).
+    engine: Engine,
+}
+
+/// The front end's query engine, as [`Frontend::redescribe`] needs it: a revision an edit, the
+/// revision each function's describe last changed at, and the revision each was last
+/// described at, by who asked and whether against the program's dyn facts. A kept describe
+/// still holds when it was made at or after the function's last change.
+struct Engine {
+    revision: u64,
+    /// The revision at which what a describe of each function reads last changed.
+    changed: HashMap<u32, u64>,
+    /// The revision at which the dyn fact each function's body reads last changed.
+    facts: HashMap<u32, u64>,
+    /// The revision each function was last described at.
+    seen: Lock<HashMap<(u32, Origin, bool), u64>>,
+    /// Whether the walk under way is against the program's dyn facts: its second round.
+    against: AtomicBool,
+    /// Describes made, and kept describes found to hold without one.
+    describes: AtomicUsize,
+    verifies: AtomicUsize,
+    /// The planted bug of a control: a dyn fact's change is not seen, so a body built against
+    /// the old fact is said to hold.
+    misses_facts: bool,
+}
+
+impl Default for Engine {
+    fn default() -> Engine {
+        Engine {
+            revision: 0,
+            changed: HashMap::default(),
+            facts: HashMap::default(),
+            seen: Lock::new("test.codegen.driver.engine_seen", HashMap::default()),
+            against: AtomicBool::new(false),
+            describes: AtomicUsize::new(0),
+            verifies: AtomicUsize::new(0),
+            misses_facts: false,
+        }
+    }
 }
 
 impl Default for Program {
@@ -87,6 +132,8 @@ impl Default for Program {
             recursion_limit: None,
             crates: HashMap::default(),
             limits: HashMap::default(),
+            dyn_sites: HashMap::default(),
+            engine: Engine::default(),
         }
     }
 }
@@ -123,6 +170,49 @@ impl Program {
         seen.into_iter().map(|it| self.code(it)).collect()
     }
 
+    /// The function the call through a `dyn` of `id` is made direct to in the walk under way:
+    /// none in a walk's first round, before the program's dyn facts are closed.
+    fn devirtualized(&self, id: u32) -> Option<u32> {
+        match self.engine.against.load(Ordering::Relaxed) {
+            true => self.dyn_sites.get(&id).copied(),
+            false => None,
+        }
+    }
+
+    /// An edit of what a describe of `id` reads: a new revision, which `id` changed at.
+    fn touch(&mut self, id: u32) {
+        self.engine.revision += 1;
+        self.engine.changed.insert(id, self.engine.revision);
+    }
+
+    /// An edit of the dyn fact the body of `id` reads: a new revision, which the fact changed
+    /// at.
+    fn touch_fact(&mut self, id: u32) {
+        self.engine.revision += 1;
+        self.engine.facts.insert(id, self.engine.revision);
+    }
+
+    /// A build begins: its front end is a new one over the same database, with no dyn facts
+    /// closed yet.
+    fn begin_build(&self) {
+        self.engine.against.store(false, Ordering::Relaxed);
+    }
+
+    /// The same program in a database of its own, where nothing was ever described.
+    fn copy(&self) -> Program {
+        Program {
+            functions: self.functions.clone(),
+            statics: self.statics.clone(),
+            static_calls: self.static_calls.clone(),
+            bodies: self.bodies.clone(),
+            recursion_limit: self.recursion_limit,
+            crates: self.crates.clone(),
+            limits: self.limits.clone(),
+            dyn_sites: self.dyn_sites.clone(),
+            ..Program::default()
+        }
+    }
+
     fn function(&mut self, id: u32, body: u8, calls: &[u32]) -> &mut Function {
         let function = Function {
             body,
@@ -157,16 +247,35 @@ impl Frontend for Program {
     type Instance = u32;
     type Static = u32;
 
-    fn describe(&self, id: &u32, _: &Origin) -> Result<Described<u32, u32>, CodegenError> {
+    fn describe(
+        &self,
+        id: &u32,
+        requester: &Origin,
+    ) -> Result<Described<u32, u32>, CodegenError> {
         let function = &self.functions[id];
+        // Against the program's dyn facts, a call through a `dyn` is direct: one more
+        // reference, last, and another code, as the facts its body read key it.
+        let direct = self.devirtualized(*id);
+        let against = self.engine.against.load(Ordering::Relaxed);
+        self.engine.describes.fetch_add(1, Ordering::Relaxed);
+        self.engine.seen.lock().insert((*id, *requester, against), self.engine.revision);
         let refs = function
             .calls
             .iter()
             .map(|it| FrontRef::Function(*it))
             .chain(function.statics.iter().map(|it| FrontRef::Static(*it)))
             .chain([FrontRef::Extern(function.outside.to_owned())])
+            // Each reference once: a callee it already calls is that reference.
+            .chain(direct.filter(|it| !function.calls.contains(it)).map(FrontRef::Function))
             .collect();
-        let code = self.code(*id);
+        let code = match direct {
+            Some(callee) => {
+                let mut code = Hasher::new("blaze v2 test devirtualized code 1");
+                code.id(&self.code(*id).0).update(&callee.to_le_bytes());
+                CodeHash(code.finish())
+            }
+            None => self.code(*id),
+        };
         let template_code = match function.anchors {
             Some(_) => {
                 let mut template = Hasher::new("blaze v2 test template code 1");
@@ -266,6 +375,37 @@ impl Frontend for Program {
 
     fn spell(&self, id: &u32) -> String {
         format!("f{id}")
+    }
+
+    /// The kept describe holds when it was made at or after the last change of what a
+    /// describe of `id` reads ([`Engine`]): decided from two revisions, with no describe.
+    fn redescribe(
+        &self,
+        id: &u32,
+        requester: &Origin,
+        _: &Described<u32, u32>,
+    ) -> Result<Option<Described<u32, u32>>, CodegenError> {
+        let engine = &self.engine;
+        let against = engine.against.load(Ordering::Relaxed);
+        let mut changed = engine.changed.get(id).copied().unwrap_or(0);
+        if against && !engine.misses_facts {
+            changed = changed.max(engine.facts.get(id).copied().unwrap_or(0));
+        }
+        let seen = engine.seen.lock().get(&(*id, *requester, against)).copied();
+        if seen.is_some_and(|seen| seen >= changed) {
+            engine.verifies.fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        }
+        self.describe(id, requester).map(Some)
+    }
+
+    /// A program with a call through a `dyn` closes its dyn facts when its first walk ends,
+    /// and the walk runs again against them; the second walk's facts are the first's.
+    fn closed(&self) -> Result<bool, CodegenError> {
+        if self.dyn_sites.is_empty() {
+            return Ok(false);
+        }
+        Ok(!self.engine.against.swap(true, Ordering::Relaxed))
     }
 
     fn past_recursion_limit(
@@ -1554,6 +1694,7 @@ fn a_level_without_its_backend_names_the_function() {
 
 mod flight;
 mod folded;
+mod kept;
 mod later;
 mod masks;
 mod pieces;

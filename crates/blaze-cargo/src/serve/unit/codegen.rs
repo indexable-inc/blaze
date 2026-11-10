@@ -1072,6 +1072,10 @@ pub(crate) fn generate<'db>(
     let verify = blaze_store_check::Setting::from_env(&job.input.config.invocation.env)
         .map_err(|it| it.to_string())?;
     let backends = Backends::default();
+    // The describes the walks before this one kept for this database and this front end's
+    // configuration (docs/v2/plan/design/incremental-walk.md): the walk takes each one the
+    // database's memo still holds and describes only what an edit changed or newly reaches.
+    let kept = frontend.kept();
     let built = {
         let guard = blaze_cas::enter();
         let store = Reading { store: &job.input.store, guard: &guard };
@@ -1079,6 +1083,7 @@ pub(crate) fn generate<'db>(
             .owned_by(&u.target.name)
             .verify_store(verify)
             .explain_misses(true)
+            .keeping(&kept)
             .run_with_statics(&asked, &roots.statics, &roots.check_roots(origin), &store)
     };
     match built {

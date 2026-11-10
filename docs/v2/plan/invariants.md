@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-27 invariants, 1 refinements, 1 reference models.
-By level: 13 tested, 15 simulated, 0 model-checked, 0 proved.
+27 invariants, 2 refinements, 1 reference models.
+By level: 14 tested, 15 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
@@ -109,6 +109,11 @@ By level: 13 tested, 15 simulated, 0 model-checked, 0 proved.
 
 - **`the_store_reads_back_what_a_map_holds`** *simulated* (`crates/blaze-cas/src/tests/model_check.rs`): the store is a map. Any run of puts, gets, flushes, settles and reopens reads back what a `BTreeMap` given the same puts holds, refuses other bytes under a key it has, and verifies clean. `HEGEL_TEST_CASES=<n>` runs it longer.
   Controls: `a_flush_that_commits_nothing`.
+
+### blaze-codegen
+
+- **`a_walk_over_kept_describes_builds_what_a_fresh_walk_builds`** *tested* (`crates/blaze-codegen/src/driver/tests/kept.rs`): for any program and any sequence of edits (a body, a reference added or removed, a function added or removed, a static's value, a dyn fact, the recursion limit), the build whose walk takes the describes kept by the builds before it is, after every edit, the build of a walk that keeps none: the same functions and statics, the same code and places, symbols, slots, owners, dedupe and reach, and the same errors where it is refused.
+  Controls: `a_changed_function_whose_callers_keep_its_old_key`, `a_removed_ref_whose_target_stays_reached`, `a_dyn_fact_change_that_invalidates_nothing`.
 
 ## Reference models
 

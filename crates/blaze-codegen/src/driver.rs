@@ -251,6 +251,9 @@ pub struct Built {
     /// once: made only when the build was asked to ([`Build::explain_misses`]), for `blaze why`
     /// (`blaze_kernel::why`).
     pub misses: Vec<blaze_kernel::Miss>,
+    /// What the walk did: how many describes it asked the front end for, how many kept ones
+    /// it took, and why it took none ([`Walk::fresh`]). Nothing is keyed by it.
+    pub walk: Walk,
 }
 
 impl Built {
@@ -334,7 +337,9 @@ struct FnNode<I, S> {
     /// never `described.origin` (the describe kept, which a merge may swap), so it is the
     /// same whichever describe came first.
     least_origin: Origin,
-    described: Described<I, S>,
+    /// What the front end said of it: shared with the walk kept for the next build
+    /// ([`Kept`]), which then takes it again without a describe.
+    described: Arc<Described<I, S>>,
     /// [`digests::debug_name_digest`] of `described.name`, made where it is described.
     name_digest: ContentId,
     /// This build's targets of `described.refs`.
@@ -1657,6 +1662,13 @@ pub struct Build<'a, B: Prepare> {
     /// Whether functions an edit fills again under their own keys are reached through their
     /// slots ([`rebind`]): always, but in the control of the test that holds the rule.
     rebinds: bool,
+    /// The describes of the walks before this one over the same front end, which this walk
+    /// takes where the front end says they still hold and adds its own to ([`Build::keeping`]).
+    kept: Option<&'a Kept<FrontInstance<B>, FrontStatic<B>>>,
+    /// Whether the front end is asked before a kept describe is taken
+    /// ([`Frontend::redescribe`]): always, but in the control of the test that holds the
+    /// walk over kept describes to the walk over none.
+    asks: bool,
 }
 
 /// How many of a walk's functions are reached each way: what [`rebind`] counted, and the span
@@ -1774,7 +1786,27 @@ impl<'a, B: Prepare> Build<'a, B> {
             verify: blaze_store_check::Setting::OFF,
             why: false,
             rebinds: true,
+            kept: None,
+            asks: true,
         }
+    }
+
+    /// Takes from `kept` each describe an earlier walk kept that the front end says still
+    /// holds, and keeps this walk's there for the next (docs/v2/plan/design/incremental-walk.md).
+    /// `kept` is of this front end's database and configuration and of no other: its
+    /// instances are that database's. The walk reaches the same functions either way; with
+    /// it, an unchanged function costs the front end's answer in place of a describe.
+    pub fn keeping(mut self, kept: &'a Kept<FrontInstance<B>, FrontStatic<B>>) -> Self {
+        self.kept = Some(kept);
+        self
+    }
+
+    /// The planted bug of the test that holds the kept walk to the fresh one: a kept describe
+    /// is taken without asking the front end, so a changed function keeps its old describe.
+    #[cfg(test)]
+    fn trusting_kept(mut self) -> Self {
+        self.asks = false;
+        self
     }
 
     /// The planted bug of the test that holds [`rebind`]'s rule: no function is rebound, so
@@ -1818,7 +1850,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         &self,
         instance: &FrontInstance<B>,
         requester: Origin,
-        described: Described<FrontInstance<B>, FrontStatic<B>>,
+        described: Arc<Described<FrontInstance<B>, FrontStatic<B>>>,
     ) -> Result<Node<B>, CodegenError> {
         let choice =
             self.policy.choose(&described.origin, described.overflow_checks).map_err(|why| {
@@ -1868,6 +1900,51 @@ impl<'a, B: Prepare> Build<'a, B> {
         })
     }
 
+    /// What the front end says of `asked`, a function and whose code asks for it, in the
+    /// walk's round `round` (from 0): the describe an earlier walk kept, where the front end
+    /// says a describe now would give it ([`Frontend::redescribe`]); else a describe, kept
+    /// for the next walk. A describe that fails is the build's error and nothing is kept of
+    /// it, so the next walk asks again.
+    fn described(
+        &self,
+        asked: &(FrontInstance<B>, Origin),
+        round: usize,
+        counts: &kept::Counts,
+    ) -> Result<Arc<Described<FrontInstance<B>, FrontStatic<B>>>, CodegenError> {
+        let (instance, requester) = asked;
+        let now = match self.kept.and_then(|kept| kept.function(round, asked)) {
+            Some(was) if !self.asks => {
+                counts.verified();
+                return Ok(was);
+            }
+            Some(was) => match self.frontend.redescribe(instance, requester, &was) {
+                Ok(None) => {
+                    counts.verified();
+                    return Ok(was);
+                }
+                Ok(Some(now)) => {
+                    counts.described();
+                    now
+                }
+                Err(why) => {
+                    counts.described();
+                    return Err(why);
+                }
+            },
+            None => {
+                counts.described();
+                self.frontend.describe(instance, requester)?
+            }
+        };
+        // alloc: once per describe, shared by the walk's node and the walk kept
+        let now = Arc::new(now);
+        if let Some(kept) = self.kept {
+            // clone: a reference count, once per describe
+            kept.keep(round, asked, now.clone());
+        }
+        Ok(now)
+    }
+
     fn static_node(
         &self,
         value: &FrontStatic<B>,
@@ -1881,8 +1958,15 @@ impl<'a, B: Prepare> Build<'a, B> {
         Ok(StaticNode { value: value.clone(), described, spec: choice.first, refs: Vec::new() })
     }
 
-    /// Every instance and static the roots reach, each with its places resolved. With
-    /// `order`, each function's key is pushed to it once, in the order the walk reached it.
+    /// Every instance and static the roots reach, each with its places resolved, and what
+    /// the walk did ([`Walk`]). With `order`, each function's key is pushed to it once, in the
+    /// order the walk reached it.
+    ///
+    /// The walk reaches everything from the roots again every build: one hash lookup and a
+    /// few vector pushes a function, with no describe of one whose kept describe still holds
+    /// ([`Self::described`]). Every pass after the levels (what the build's own roots reach,
+    /// the order, the slots, the places, what each builds in) is over the walk's own tables,
+    /// linear in its functions and references, each under its span.
     fn walk(
         &self,
         roots: &[(FrontInstance<B>, Origin)],
@@ -1890,7 +1974,14 @@ impl<'a, B: Prepare> Build<'a, B> {
         check: &[CheckRoot<FrontInstance<B>, FrontStatic<B>>],
         mut order: Option<&mut Vec<InstanceKey>>,
         errors: &mut Vec<CodegenError>,
-    ) -> (Sorted<InstanceKey, Node<B>>, Sorted<StaticId, StaticNode<B>>, Vec<InstanceKey>) {
+    ) -> (Sorted<InstanceKey, Node<B>>, Sorted<StaticId, StaticNode<B>>, Vec<InstanceKey>, Walk)
+    {
+        let counts = kept::Counts::default();
+        let fresh = match self.kept {
+            None => Some(Fresh::Unkept),
+            Some(kept) if kept.is_empty() => Some(Fresh::Empty),
+            Some(_) => None,
+        };
         let mut nodes: blaze_hash::HashMap<InstanceKey, Node<B>, Global> =
             blaze_hash::HashMap::new_in(Global);
         let mut statics: blaze_hash::HashMap<StaticId, StaticNode<B>, Global> =
@@ -1958,18 +2049,14 @@ impl<'a, B: Prepare> Build<'a, B> {
             // deferred, never described by them, and what it reaches never walked from it.
             graph.level(self.frontend, &mut level, errors);
             self.frontend.reached(&level.functions, &level.statics);
+            // The span of a describe is the front end's, opened where it describes
+            // (`hir-ty-codegen`'s `codegen describe`, named for its function): a kept describe
+            // the front end says still holds opens none, so the spans of a level are the
+            // functions it described.
             // alloc: per build, sized by its units
-            let described: Vec<_> = par::map(&level.functions, |(instance, requester)| {
-                // One span an instance, named for its function once described: a level's
-                // describes run as a few long pool jobs (`par::split`), and a job of 149 s in a
-                // self-build said only `par::map` (spans37).
-                let span = tracing::info_span!(target: "blaze", "codegen describe", function = tracing::field::Empty);
-                let _entered = span.enter();
-                let described = self.frontend.describe(instance, requester);
-                if let Ok(it) = &described {
-                    span.record("function", it.name.as_str());
-                }
-                described.and_then(|it| self.node(instance, *requester, it))
+            let described: Vec<_> = par::map(&level.functions, |asked| {
+                self.described(asked, round - 1, &counts)
+                    .and_then(|it| self.node(&asked.0, asked.1, it))
             });
             // alloc: per build, sized by its units
             let described_statics: Vec<_> = par::map(&level.statics, |value| {
@@ -2072,6 +2159,13 @@ impl<'a, B: Prepare> Build<'a, B> {
         // What a check root alone reaches ([`CheckRoot`]) was described for the recursion
         // limit's check, never for the build: only what the build's own roots reach, through
         // each kept node's references as they resolve below, is built.
+        let reaching = tracing::info_span!(
+            target: "blaze",
+            "codegen reach",
+            functions = nodes.len(),
+            statics = statics.len(),
+        )
+        .entered();
         if graph.checks_more() {
             // alloc: per build, what its own roots reach
             let mut functions: blaze_hash::HashSet<InstanceKey, Global> =
@@ -2126,6 +2220,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             }
         }
         let (mut nodes, mut statics) = (Sorted::of(nodes), Sorted::of(statics));
+        drop(reaching);
 
         // Which functions are reached through their slots, before any reference is resolved:
         // every caller of one then names its slot.
@@ -2148,6 +2243,13 @@ impl<'a, B: Prepare> Build<'a, B> {
             span.record("tiered", reached.tiered);
             span.record("direct", reached.direct);
         }
+        let resolving = tracing::info_span!(
+            target: "blaze",
+            "codegen resolve",
+            functions = nodes.len(),
+            statics = statics.len(),
+        )
+        .entered();
         let through_slot: HashMap<InstanceKey, bool> =
             // alloc: per build, sized by its units
             nodes.iter().map(|(key, node)| (*key, node.slotted() || node.then.is_some())).collect();
@@ -2297,9 +2399,21 @@ impl<'a, B: Prepare> Build<'a, B> {
                 }
             };
         }
+        drop(resolving);
+        // What this program's last walk held that this one does not: counted for the span
+        // from the keys kept, and only of a walk that reached everything.
+        let dropped = match self.kept {
+            Some(kept) if errors.is_empty() => {
+                let program = kept::program(&(roots, static_roots, check));
+                kept.walked(program, &nodes.keys).unwrap_or(0)
+            }
+            _ => 0,
+        };
+        let (described, verified) = counts.get();
+        let walk = Walk { described, verified, reached: nodes.len(), dropped, fresh };
         // alloc: per build, sized by its roots
         let roots = roots.iter().filter_map(|it| asked.get(it).copied()).collect();
-        (nodes, statics, roots)
+        (nodes, statics, roots, walk)
     }
 
     /// `work` on each of `items` on all cores, in their order, beginning none once the front
@@ -2479,7 +2593,7 @@ impl<'a, B: Prepare> Build<'a, B> {
     ) -> Result<Reached<FrontInstance<B>, FrontStatic<B>>, Vec<CodegenError>> {
         // alloc: none unless the walk fails
         let mut errors = Vec::new();
-        let (nodes, statics, _) = self.walk(roots, static_roots, &[], None, &mut errors);
+        let (nodes, statics, _, _) = self.walk(roots, static_roots, &[], None, &mut errors);
         // The caller links what it compiles as [`Build::run_as`] does: one definition a symbol.
         symbols_defined_twice(&nodes, &statics, &mut errors);
         if !errors.is_empty() {
@@ -2513,16 +2627,34 @@ impl<'a, B: Prepare> Build<'a, B> {
         let mut out = Out::default();
         // alloc: none for a whole build; a lazy one's, sized by its units
         let mut order = Vec::new();
-        let (nodes, statics, root_keys) = {
-            let _span =
-                tracing::info_span!(target: "blaze", "codegen walk", roots = roots.len()).entered();
-            self.walk(
+        let (nodes, statics, root_keys, walk) = {
+            let span = tracing::info_span!(
+                target: "blaze",
+                "codegen walk",
+                roots = roots.len(),
+                described = tracing::field::Empty,
+                verified = tracing::field::Empty,
+                reached = tracing::field::Empty,
+                dropped = tracing::field::Empty,
+                fresh = tracing::field::Empty,
+            );
+            let _entered = span.enter();
+            let walked = self.walk(
                 roots,
                 static_roots,
                 check,
                 later.is_some().then_some(&mut order),
                 &mut out.errors,
-            )
+            );
+            let walk = &walked.3;
+            span.record("described", walk.described);
+            span.record("verified", walk.verified);
+            span.record("reached", walk.reached);
+            span.record("dropped", walk.dropped);
+            if let Some(fresh) = walk.fresh {
+                span.record("fresh", fresh.why());
+            }
+            walked
         };
         let owning =
             tracing::info_span!(target: "blaze", "codegen owners", functions = nodes.len())
@@ -2556,8 +2688,17 @@ impl<'a, B: Prepare> Build<'a, B> {
             .filter(|(_, node)| node.described.editable)
             .map(|(key, _)| *key)
             .collect();
-        symbols_defined_twice(&nodes, &statics, &mut out.errors);
         drop(owning);
+        {
+            let _span = tracing::info_span!(
+                target: "blaze",
+                "codegen symbols",
+                functions = nodes.len(),
+                statics = statics.len(),
+            )
+            .entered();
+            symbols_defined_twice(&nodes, &statics, &mut out.errors);
+        }
         // Set with `self.last`, refused or not: `tier_up` reads the two together.
         // alloc: per build, sized by its statics' references
         self.static_callees =
@@ -2621,7 +2762,12 @@ impl<'a, B: Prepare> Build<'a, B> {
             Some(node) => !node.external(),
             None => true,
         };
-        let deduped = match dedupe(&mut out.functions, &mut out.statics, &mergeable) {
+        let deduping =
+            tracing::info_span!(target: "blaze", "codegen dedupe", functions = out.functions.len())
+                .entered();
+        let deduped = dedupe(&mut out.functions, &mut out.statics, &mergeable);
+        drop(deduping);
+        let deduped = match deduped {
             Ok((deduped, renamed)) => {
                 // A static that named a function merged away has another value: its digest
                 // is made again. `static_digests` is in `statics`' order, each pushed with its
@@ -2763,6 +2909,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             made,
             kernel,
             misses,
+            walk,
         })
     }
 
@@ -4267,6 +4414,8 @@ pub(crate) mod reach;
 pub use reach::Reach;
 mod owners;
 pub use owners::Owner;
+mod kept;
+pub use kept::{Fresh, Kept, Walk};
 mod later;
 mod recursion;
 pub use later::{Later, Walked, runs_at_start};
