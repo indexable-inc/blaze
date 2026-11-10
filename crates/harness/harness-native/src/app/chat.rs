@@ -1813,7 +1813,19 @@ impl App {
             }
         });
         if let Some(pop) = foot.part("activity_pop") {
-            fill_activity_pop(pop, strip, &chips);
+            // The running turn's item in the transcript (its line's head, hn.StepLineLive) opens the turn's card: what it
+            // is on, for how long, and the steps so far.
+            let turn = working.then(|| turn_chip(t, now));
+            let head = foot.entity().parent().and_then(|pane| View::of(pane).part("list")).and_then(|l| l.part("rows")).and_then(|rows| {
+                let mut found = None;
+                rows.entity().each_child(|c| {
+                    if found.is_none() && c.name().starts_with("turn:") {
+                        found = View::of(c).part("head").filter(|h| h.part("block").is_some());
+                    }
+                });
+                found
+            });
+            fill_activity_pop(pop, strip, &chips, head.zip(turn.as_ref()));
         }
     }
 
@@ -3054,6 +3066,8 @@ enum PopLine {
     Said(String),
     /// One step a cell took: its kind (`hn.StepKind`) and its words ([`StepWords`]).
     Step(&'static str, StepWords),
+    /// The running step's item (ui.Block), large: the card's picture.
+    Item(&'static str),
 }
 
 /// Where the turn in flight's items begin: after the newest message the agent took (one still queued is not its yet).
@@ -3118,7 +3132,6 @@ pub(super) fn step_words(e: &model::chat::Effect) -> String {
 /// and how long that step has run), else its running tool's main argument (a shell's command), else what its newest
 /// words or reasoning are, timed from the turn's start. Its card: what the turn is on, how long the turn has run, and
 /// the steps its cells took so far ([`turn_steps`]).
-#[cfg(test)]
 fn turn_chip(t: &Transcript, now: u64) -> Chip {
     let since = turn_start(t);
     let turn = t.turn_since.map(|s| ran_for(now.saturating_sub(s))).unwrap_or_default();
@@ -3163,8 +3176,14 @@ fn turn_chip(t: &Transcript, now: u64) -> Chip {
         }
     }
     let took = from.map(|s| ran_for(now.saturating_sub(s))).unwrap_or_default();
-    let mut pop = vec![PopLine::Head(words.clone()), PopLine::Meta(meta(&["This turn", &running_for(&turn)]))];
-    pop.extend(turn_steps(t, since));
+    let steps = turn_steps(t, since);
+    // Its item, large, over its words: the kind of the step it is on (the newest listed; thinking between steps).
+    let kind = steps.iter().rev().find_map(|l| match l {
+        PopLine::Step(kind, _) => Some(*kind),
+        _ => None,
+    });
+    let mut pop = vec![PopLine::Item(kind.unwrap_or("think")), PopLine::Head(words.clone()), PopLine::Meta(meta(&["This turn", &running_for(&turn)]))];
+    pop.extend(steps);
     Chip { key: "step".to_owned(), state: "running", words, took, action: String::new(), pop }
 }
 
@@ -3311,7 +3330,7 @@ fn turn_chip_words(t: &Transcript) -> Option<String> {
 
 /// The card of the activity chip under the pointer (or the one whose card the pointer crossed onto), over it in
 /// `pop` (the foot's `activity_pop` overlay slot): a ui.Menu, its lines by key. None while the pointer is elsewhere.
-fn fill_activity_pop(pop: View<'_>, strip: View<'_>, chips: &[Chip]) {
+fn fill_activity_pop<'v>(pop: View<'v>, strip: View<'v>, chips: &[Chip], item: Option<(View<'v>, &Chip)>) {
     let w = pop.entity().world();
     let hovered = w.entity_named(APP).target(Hovered::id(), 0);
     let plate = pop.part("plate");
@@ -3322,7 +3341,14 @@ fn fill_activity_pop(pop: View<'_>, strip: View<'_>, chips: &[Chip]) {
         let id = chip.id();
         under(id) || held == Some(id) || plate.is_some_and(|p| view::bridged(w.entity_from_id(id), p.entity()))
     };
-    let shown = chips.iter().find_map(|c| strip.part(&c.key).filter(|v| on(*v)).map(|v| (v, c))).filter(|(_, c)| !c.pop.is_empty());
+    // A chip of the strip under the pointer, else the running turn's item in the transcript (`item`, its card the
+    // turn's).
+    // With the pointer on the item itself, its card (a chip under it would claim the pointer as crossing to its own).
+    let shown = item
+        .filter(|(v, _)| under(v.id()))
+        .or_else(|| chips.iter().find_map(|c| strip.part(&c.key).filter(|v| on(*v)).map(|v| (v, c))))
+        .or_else(|| item.filter(|(v, _)| on(*v)))
+        .filter(|(_, c)| !c.pop.is_empty());
     view::for_each_of(pop, shown.map(|_| ("plate", "hn.ChatActivityPop", ())), |_, (), _| {});
     let (Some(plate), Some((chip, c))) = (pop.part("plate"), shown) else { return };
     plate.anchored(chip.id());
@@ -3333,12 +3359,23 @@ fn fill_activity_pop(pop: View<'_>, strip: View<'_>, chips: &[Chip]) {
             PopLine::Text(_) => "hn.ChatActivityPopText",
             PopLine::Said(_) => "hn.ChatActivityPopSaid",
             PopLine::Step(..) => "hn.ChatActivityPopStep",
+            PopLine::Item(_) => "hn.ChatActivityPopItem",
         };
         (format!("{}{i}", c.key), prefab, l)
     });
     view::for_each_of(plate, lines, |v, l, _| match l {
         PopLine::Head(s) | PopLine::Meta(s) | PopLine::Text(s) | PopLine::Said(s) => {
             v.text(s);
+        }
+        PopLine::Item(kind) => {
+            if let Some(b) = v.part("block") {
+                let e = b.entity();
+                let mut block = e.try_cloned::<&harness_native_ui_text_api::PixelBlock>().unwrap_or_default();
+                if block.face.as_str() != *kind {
+                    block.face = (*kind).into();
+                    e.set(block);
+                }
+            }
         }
         PopLine::Step(kind, s) => {
             if let Some(i) = v.part("icon") {

@@ -606,6 +606,8 @@ export const chat_activity_below = 8
 export const chat_activity_pop_w = 300
 export const chat_activity_pop_pad = 12
 export const chat_activity_pop_gap = 4
+// The running step's item at the top of the turn's card (16 texels at 4 points each).
+export const chat_activity_pop_item = 64
 // Messages sent while a turn runs and not yet taken (hn.ChatQueued, src/app/chat.rs fill_chat_queued): bubbles at the
 // trailing edge over the composer, chat_queued_gap apart, in a dashed-quiet look: the bubble's ground at
 // chat_queued_fade, a clock glyph chat_activity_icon across and the word "Queued" before it.
