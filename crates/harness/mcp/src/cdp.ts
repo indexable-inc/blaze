@@ -379,7 +379,7 @@ export class Page {
 
   #where() { return this.view === null ? `target ${this.target}` : `view ${this.view}`; }
 
-  /** Load `url` and wait for its load event. On a page opened for the person (browser.open) the browser pane shows it. */
+  /** Load `url` and wait for its load event. */
   goto(url: string, timeoutMs = 20_000): Promise<void> {
     let host = url;
     try { host = new URL(url).host || url; } catch {}
@@ -452,8 +452,8 @@ export class Page {
 
   close() { return this.session.close().catch(() => {}); }
 
-  /** Opened for the person (browser.open: a view that stays): the app shows it in the browser pane beside the chat,
-   *  where they can scroll, click and type in it, not only as a card. Set by newPage. */
+  /** Opened for the person (browser.open: a view that stays): its step in the chat is a line they press to see it in
+   *  the browser pane, where they can scroll, click and type in it. Set by newPage. */
   kept = false;
 
   /** The card the app draws for it (shown.ts); `pane` when it is the person's to use ([`Page.kept`]). */

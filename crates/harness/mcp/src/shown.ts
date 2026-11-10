@@ -19,7 +19,7 @@ export type Shown =
   | { t: "text"; v: string; total: number }
   | { t: "error"; message: string; stack: string }
   /** A page of the harness browser (cdp.ts `Page`). The transcript draws nothing for it; with `pane` (a page opened for
-   *  the person, browser.open) the app opens the browser pane beside the chat on view `view`. */
+   *  the person, browser.open) its step is a line whose link shows view `view` in the browser pane when pressed. */
   | { t: "browser"; view: string; url: string; title: string; pane?: true };
 
 /** A value that says how it is shown: `[SHOWN]()` gives its Shown (a browser Page gives its card). */

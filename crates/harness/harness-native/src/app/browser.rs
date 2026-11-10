@@ -640,13 +640,6 @@ impl App {
     /// Before the world's progress: the link (asked, answered, its messages handled), the pane's fold, and every
     /// ui.Browser node's picture key, pointer shape and plate (and a card's title, address and hairline).
     pub(super) fn browser_frame_start(&mut self, dt: f32) {
-        // A page the focused chat's agent opened for the person shows in the pane: there they scroll, click and type
-        // in it. The keyboard stays where it is (the composer): the person is mid-conversation.
-        if let Some(view) = self.chat_pane_page() {
-            let s = self.web();
-            self.browser.note = None;
-            self.set_web(WebState { view, open: true, ..s });
-        }
         let mut nodes: Vec<(u64, BrowserView)> = Vec::new(); // alloc: this frame's browser nodes
         self.world.new_query::<&BrowserView>().each_entity(|e, bv| nodes.push((*e.id(), bv.clone())));
         if std::mem::take(&mut self.browser.lost) {
