@@ -365,13 +365,13 @@ hn {
       Padding: {l: 0, r: $chat_turn_steps_gap, t: $chat_bubble_pad_y + $line_chat_bubble / 2 - $chat_turn_steps / 2, b: 0}
     }
     bubble : ui.Bubble {
-      Fill: $tone_raised
+      Fill: $tone_bubble
       Padding: {l: $chat_bubble_pad_x, r: $chat_bubble_pad_x, t: $chat_bubble_pad_y, b: $chat_bubble_pad_y}
       Shape: {radius: $chat_bubble_radius, n: 4, border: 0, feather: 0}
       Size: {w: {kind: Fit, value: 0, min: 0, max: $chat_bubble_max_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
       text : ui.Words {
         Cursor: {shape: Text}
-        Fill: $tone_ink
+        Fill: $tone_on_accent
         TextStyle: {size: $size_chat, line: $line_chat_bubble, role: 0, bold: 0}
       }
     }
