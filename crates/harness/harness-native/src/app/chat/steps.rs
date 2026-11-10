@@ -88,13 +88,13 @@ impl Out {
     }
 
     /// Its words a selection can cover (see chat.rs `texts`).
-    pub(super) fn texts(&self) -> Vec<(&'static [&'static str], String, bool)> {
+    pub(super) fn texts(&self) -> Vec<Words> {
         match self {
-            Out::Head { words, .. } => vec![(&["line", "words"], words.clone(), false)],
-            Out::Text(s) => vec![(&["text"], s.clone(), false)],
-            Out::Code(s) => vec![(&["card", "text"], s.clone(), false)],
-            Out::Fail(s) => vec![(&["line", "why"], s.clone(), false)],
-            Out::Note(s) => vec![(&["text"], s.clone(), false)],
+            Out::Head { words, .. } => vec![Words::at("line/words", words.clone(), false)],
+            Out::Text(s) => vec![Words::at("text", s.clone(), false)],
+            Out::Code(s) => vec![Words::at("card/text", s.clone(), false)],
+            Out::Fail(s) => vec![Words::at("line/why", s.clone(), false)],
+            Out::Note(s) => vec![Words::at("text", s.clone(), false)],
             Out::Page { .. } | Out::File { .. } | Out::Results { .. } | Out::Value { .. } => Vec::new(),
         }
     }
