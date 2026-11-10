@@ -97,7 +97,7 @@ fn job(views: Vec<Opened>) -> Job<Real> {
         durable_wait: None,
         look_wait: None,
         placed_any: false,
-        replayed: false,
+        walks: None,
     }
 }
 
