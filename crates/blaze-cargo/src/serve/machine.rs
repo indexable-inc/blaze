@@ -37,8 +37,9 @@ pub(crate) const MACHINE_VAR: &str = "BLAZE_MACHINE_MEMORY_GB";
 /// How long a charge that moves by little goes unwritten at most.
 const EVERY: Duration = Duration::from_millis(250);
 
-/// How soon a plane that held a task back for memory takes another turn: its room may be less
-/// than the machine now allows.
+/// The floor between two turns for a task the allowance itself holds back: a turn changes
+/// nothing for it unless another daemon let go of memory since. A task the room alone holds
+/// back, or a lease that runs low, waits for no floor ([`Machine::due`]).
 const SOON: Duration = Duration::from_millis(25);
 
 /// How long a turn waits for another daemon's hold of the lock, which lasts microseconds.
@@ -56,7 +57,8 @@ pub struct Machine {
     me: Process,
     /// The machine budget this daemon brought.
     budget: u64,
-    /// When the last turn was, by the daemon's clock, and the charge it wrote.
+    /// When the last turn was, by the daemon's clock, and what the plane held or had granted
+    /// then: the charge it wrote less its lease.
     last: Option<(Duration, u64)>,
     /// The allowance the last turn gave.
     allowance: Option<u64>,
@@ -142,6 +144,8 @@ impl Machine {
             ceiling: ceiling.bytes,
             held: blaze_graph::arena::held(),
             granted: 0,
+            // None until its first turn: it grants nothing before one.
+            lease: 0,
             at_ns: wall_ns(),
             version: Label::head(
                 version.as_bytes(),
@@ -192,7 +196,11 @@ impl Machine {
 
     /// Whether a turn is due at `at`, by the daemon's clock: there was none yet, [`EVERY`]
     /// passed, the plane's charge moved by more than 1/64 of the machine budget since the last,
-    /// or the plane held a task back for memory and [`SOON`] passed.
+    /// a turn now would change what the plane may grant ([`Plane::turn_wanted`]: the room
+    /// alone holds a task back, the lease is in its last quarter, or a lease is held with no
+    /// work), or the plane held a task back for memory and [`SOON`] passed. The plane wants no
+    /// turn as one returns and until its next step, so the turns it asks for are at most one a
+    /// step of it; [`SOON`] bounds the rest.
     pub(crate) fn due<W: Work, P: Predict>(&self, at: Duration, plane: &Plane<W, P>) -> bool {
         if self.broken {
             return false;
@@ -202,11 +210,13 @@ impl Machine {
         let now = plane.held().max(plane.granted());
         since >= EVERY
             || now.abs_diff(charge) > self.budget / 64
+            || plane.turn_wanted()
             || (plane.held_any_back() && since >= SOON)
     }
 
     /// One turn at `at`, by the daemon's clock, under the lock: the dead pruned, `plane` told
-    /// its allowance (what fits starts), and the charge it is left with written. The allowance
+    /// its allowance (what fits starts), and the charge it is left with written, its lease in
+    /// it. The allowance
     /// when it differs from the last turn's, for the subsystems' budgets
     /// ([`blaze_graph::admission::set_budgets`]). An error stops the daemon; no turn is taken
     /// after one.
@@ -239,7 +249,7 @@ impl Machine {
         if turn.pruned > 0 {
             tracing::info!(target: "blaze", pruned = turn.pruned, ledger = %self.path.display(), "the machine's memory ledger dropped the records of daemons gone");
         }
-        self.last = Some((at, turn.charge));
+        self.last = Some((at, turn.charge - turn.lease));
         Ok(turn.allowance)
     }
 
@@ -291,6 +301,10 @@ impl<W: Work, P: Predict> Admits for Turning<'_, W, P> {
 
     fn granted(&self) -> u64 {
         self.plane.granted()
+    }
+
+    fn lease(&self) -> u64 {
+        self.plane.lease()
     }
 }
 

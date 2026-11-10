@@ -1196,7 +1196,8 @@ impl<W: Work, P: Predict> Plane<W, P> {
 
     /// The machine ledger's word on what this daemon may grant now, taken at `at` while the
     /// daemon holds the ledger's lock ([`PlaneInput::Allowance`], `super::machine`): what now
-    /// fits starts, and until the next one the plane grants no more than it then holds.
+    /// fits starts, and until the next one the plane grants no more than it then holds and
+    /// its lease ([`Plane::lease`]).
     pub fn allow(&mut self, at: Duration, bytes: u64) {
         self.step(PlaneInput::Allowance { at_ns: ns(at), bytes })
             .unwrap_or_else(|error| panic!("the plane refused the machine's allowance: {error}"));
@@ -1218,9 +1219,22 @@ impl<W: Work, P: Predict> Plane<W, P> {
         self.graph.room()
     }
 
+    /// What the plane may grant past what it holds or granted until the next [`Plane::allow`],
+    /// which the ledger records in this daemon's charge ([`blaze_graph::Plane::lease`]).
+    pub fn lease(&self) -> u64 {
+        self.graph.lease()
+    }
+
     /// Whether a task with memory was held back for it as the plane last dispatched.
     pub fn held_any_back(&self) -> bool {
         self.graph.held_back()
+    }
+
+    /// Whether a turn of the ledger now would change what the plane may grant
+    /// ([`blaze_graph::Plane::turn_wanted`]): the room holds a task back, the lease runs low,
+    /// or a lease is held with no work.
+    pub fn turn_wanted(&self) -> bool {
+        self.graph.turn_wanted()
     }
 
     /// The next node of `fresh`, a part of a program's build of `kind` ([`kinds::PROGRAM`], its

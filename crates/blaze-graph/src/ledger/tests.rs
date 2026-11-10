@@ -7,10 +7,15 @@
 //! turn is one atomic read-modify-write of the file, as the driver's `flock` makes it; under
 //! [`Plant::UnlockedRmw`] it is a read, then other acts, then a write of what was read.
 //!
+//! Every daemon has a request open, so each takes a lease at its turns ([`Plane::lease`]) and
+//! starts the tasks that fit it at their `Add`, with no turn between.
+//!
 //! After every act the oracle checks:
 //! - the live daemons' grants sum to at most the machine budget;
-//! - no live daemon is granted more than the ledger records of it (so what it grants between
-//!   turns is room no other daemon is told is free), and every live daemon has its record;
+//! - so do their rooms, what each may grant with no turn, its lease in it;
+//! - no live daemon is granted more than the ledger records of it, nor has more room (so what
+//!   it grants between turns is room no other daemon is told is free), and every live daemon
+//!   has its record;
 //! - a turn admits nothing while the other live daemons' charges sum to the machine budget.
 //!
 //! At the end every daemon's tasks end, round by round (each finishes what runs, says what it
@@ -18,7 +23,7 @@
 //! number of rounds; then a probe as large as one daemon may be allowed with every other idle
 //! starts at its next turn (bounded-progress).
 //!
-//! Three plants ([`Plant`]) prove the oracle catches what it claims to, each in a control.
+//! Four plants ([`Plant`]) prove the oracle catches what it claims to, each in a control.
 //! Replay: a control or [`replay_one_seed`] names a seed of [`plan_of`]; the Hegel test prints
 //! its plan.
 
@@ -267,6 +272,10 @@ impl Admits for Admitting<'_> {
     fn granted(&self) -> u64 {
         self.plane.granted()
     }
+
+    fn lease(&self) -> u64 {
+        self.plane.lease()
+    }
 }
 
 struct World<'p> {
@@ -441,6 +450,7 @@ impl<'p> World<'p> {
             ceiling: config.ceiling,
             held: config.baseline,
             granted: 0,
+            lease: 0,
             at_ns,
             version: Label::head(b"blaze 0.0.0-sim", 1),
             home: Label::tail(b"/sim/home/.blaze", fnv1a(b"/sim/home/.blaze")),
@@ -533,6 +543,20 @@ impl<'p> World<'p> {
                 self.grants()
             )));
         }
+        // A daemon is live only once its first turn is done ([`World::start`]), so each has a
+        // room: none is the `u64::MAX` of a plane never told an allowance.
+        let mut rooms = 0u64;
+        for live in self.live.iter().flatten() {
+            rooms = rooms.saturating_add(live.plane.room());
+        }
+        if rooms > self.budget {
+            return Err(oracle(format!(
+                "the live daemons' rooms, what each may grant with no turn, sum to {rooms}, over \
+                 the machine budget {}: {}",
+                self.budget,
+                self.grants()
+            )));
+        }
         let ledger = self.ledger(&self.file)?;
         for live in self.live.iter().flatten() {
             let Some(record) = ledger.record(live.process) else {
@@ -552,6 +576,18 @@ impl<'p> World<'p> {
                     self.grants()
                 )));
             }
+            if live.plane.room() > record.charge() {
+                return Err(oracle(format!(
+                    "pid {} has room to grant up to {} with no turn, more than the {} the ledger \
+                     records of it (its lease {}): the rest is room another daemon is told is \
+                     free: {}",
+                    live.process.pid,
+                    live.plane.room(),
+                    record.charge(),
+                    record.lease,
+                    self.grants()
+                )));
+            }
         }
         Ok(())
     }
@@ -564,9 +600,10 @@ impl<'p> World<'p> {
         for live in self.live.iter().flatten() {
             let charge = ledger.as_ref().and_then(|it| it.record(live.process)).map(Record::charge);
             text.push_str(&format!(
-                "[pid {} granted {} recorded {charge:?}] ",
+                "[pid {} granted {} room {} recorded {charge:?}] ",
                 live.process.pid,
-                live.plane.granted()
+                live.plane.granted(),
+                live.plane.room()
             ));
         }
         if let Some(ledger) = &ledger {
@@ -595,8 +632,12 @@ impl<'p> World<'p> {
             self.check()?;
         }
         // Each task fits alone, and in a round in which tasks wait at least one starts at the
-        // latest by the next round's turns.
-        let bound = 2 * self.submitted + 4;
+        // latest by the next round's turns. The leases do not change that: from the second
+        // round on no task was started since a daemon's last turn but at that turn, so a
+        // daemon that starts none leases 1/16 of its ceiling at most, and five baselines and
+        // four such leases leave any daemon its largest task. The first round's records may
+        // still hold the leases of the acts, which is the two rounds more.
+        let bound = 2 * self.submitted + 6;
         let mut rounds = 0;
         while self.waiting() > 0 {
             if rounds == bound {
@@ -713,8 +754,9 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), Broke> {
 // --- The tests ------------------------------------------------------------------------------
 
 /// The invariant: whatever crashes, restarts and pid reuse, the live daemons' grants never sum
-/// past the machine budget, none grants room the ledger does not hold for it, none admits while
-/// the others' charges fill the machine, and every task that fits starts.
+/// past the machine budget, nor does what they may grant with no turn (each one's room: its
+/// charge and its lease), none grants or has room the ledger does not hold for it, none admits
+/// while the others' charges fill the machine, and every task that fits starts.
 #[hegel::test(test_cases = 300)]
 fn live_grants_fit_the_machine_budget_after_any_crash(tc: TestCase) {
     let plan = plan(&mut Drawn(&tc));
@@ -758,6 +800,11 @@ fn the_oracle_catches_an_allowance_that_leaves_out_a_daemon() {
     control(Plant::AllowanceSkipsOne);
 }
 
+#[test]
+fn the_oracle_catches_a_lease_the_ledger_does_not_record() {
+    control(Plant::LeaseUnrecorded);
+}
+
 /// One seeded plan, [`REPLAY`]'s: set it to a seed a failure names to run that case alone.
 #[test]
 fn replay_one_seed() {
@@ -781,6 +828,7 @@ fn record(d: &mut impl Draw, pid: u32) -> Record {
         ceiling: d.int(0, u64::MAX),
         held: d.int(0, u64::MAX),
         granted: d.int(0, u64::MAX),
+        lease: d.int(0, u64::MAX),
         at_ns: d.int(0, u64::MAX),
         version: Label::head(&version, d.int(0, u64::MAX)),
         home: Label::tail(&home, d.int(0, u64::MAX)),
@@ -833,6 +881,51 @@ fn an_empty_file_is_an_empty_ledger_and_a_short_one_is_corrupt() {
     let error = Ledger::decode(path, &[0; 100]).expect_err("a short file");
     assert_eq!(error.why, Why::Length { len: 100 });
     assert!(error.to_string().contains(PATH));
+}
+
+/// A file of the layout before the lease is refused by its layout, naming the file and both
+/// layouts, never read as a ledger whose daemons lease nothing: a daemon of that layout would
+/// not count this one's lease.
+#[test]
+fn a_file_of_the_layout_before_the_lease_is_refused_naming_both_layouts() {
+    let path = Path::new(PATH);
+    let mut ledger = Ledger::empty(path);
+    ledger.join(record(&mut SplitMix64::new(3), 1)).expect("a free slot");
+    let mut bytes = [0; LEN];
+    ledger.encode(&mut bytes);
+    assert_eq!(bytes[8..12], FORMAT.to_le_bytes());
+    bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+    let error = Ledger::decode(path, &bytes).expect_err("layout 1");
+    assert_eq!(error.why, Why::Format { found: 1 });
+    assert!(error.why.corrupt());
+    let said = error.to_string();
+    assert!(
+        said.contains(PATH) && said.contains("layout 1") && said.contains("layout 2"),
+        "{said}"
+    );
+}
+
+/// A record's lease is part of its charge, so another daemon's allowance is less by it.
+#[test]
+fn a_lease_counts_against_every_other_daemons_allowance() {
+    let path = Path::new(PATH);
+    let mut ledger = Ledger::empty(path);
+    let of = |pid: u32, held: u64, lease: u64| Record {
+        process: Process { pid, start: 1 },
+        budget: 100,
+        ceiling: 100,
+        held,
+        granted: 0,
+        lease,
+        at_ns: 0,
+        version: Label::EMPTY,
+        home: Label::EMPTY,
+    };
+    ledger.join(of(1, 10, 20)).expect("a free slot");
+    ledger.join(of(2, 5, 0)).expect("a free slot");
+    assert_eq!(ledger.record(Process { pid: 1, start: 1 }).expect("joined").charge(), 30);
+    let allowance = ledger.allowance(Process { pid: 2, start: 1 }).expect("joined");
+    assert_eq!((allowance.bytes, allowance.others), (70, 30));
 }
 
 /// A daemon past the [`MOST`]th is refused, naming the file and the bound.

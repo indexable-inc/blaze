@@ -67,8 +67,8 @@ By level: 12 tested, 14 simulated, 0 model-checked, 0 proved.
 
 - **`footprint_stays_under_the_ceiling_unless_one_task_alone_exceeds_it`** *simulated* (`crates/blaze-graph/src/footprint/tests.rs`): whatever the peaks, the grants and what the allocator keeps, the footprint never passes the ceiling; growth within a grant never needs the gate; a task fails only when it alone passes the ceiling, with [`TooBig`]; every other task is built.
   Controls: `admission_by_grants_only`, `a_gate_that_never_purges`, `a_purge_read_before_it_lands`, `a_purge_read_purged_though_a_task_freed_in_its_lag`.
-- **`live_grants_fit_the_machine_budget_after_any_crash`** *tested* (`crates/blaze-graph/src/ledger/tests.rs`): whatever crashes, restarts and pid reuse, the live daemons' grants never sum past the machine budget, none grants room the ledger does not hold for it, none admits while the others' charges fill the machine, and every task that fits starts.
-  Controls: `a_read_modify_write_without_the_lock`, `a_prune_that_ignores_start_time`, `an_allowance_that_leaves_out_a_daemon`.
+- **`live_grants_fit_the_machine_budget_after_any_crash`** *tested* (`crates/blaze-graph/src/ledger/tests.rs`): whatever crashes, restarts and pid reuse, the live daemons' grants never sum past the machine budget, nor does what they may grant with no turn (each one's room: its charge and its lease), none grants or has room the ledger does not hold for it, none admits while the others' charges fill the machine, and every task that fits starts.
+  Controls: `a_read_modify_write_without_the_lock`, `a_prune_that_ignores_start_time`, `an_allowance_that_leaves_out_a_daemon`, `a_lease_the_ledger_does_not_record`.
 
 ### blaze-link
 
