@@ -73,6 +73,7 @@ const STD_STORE_END: u64 = 9 << 32;
 /// the shared standard library's store's.
 const LOADS: u64 = 9 << 32;
 const STD_LOADS: u64 = 10 << 32;
+const STD_LOADS_END: u64 = 11 << 32;
 const WATCHERS: u64 = 1 << 40;
 const RUNS: u64 = 1 << 50;
 const RUNS_END: u64 = 1 << 62;
@@ -2343,7 +2344,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 }
             }
             DB..STORE => self.db.complete(completion, &mut self.effects),
-            STORE..FLUSHES => {
+            // The store's own effects, and its pool's reads (a commit loading the page a pack's
+            // committed bytes end in).
+            STORE..FLUSHES | LOADS..STD_LOADS => {
                 debug_assert!(self.store.owns(completion.tag), "the store's tags are its");
                 self.job_effects += 1;
                 self.store.complete(completion, &mut self.effects);
@@ -2355,7 +2358,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 self.jobs.placed(&mut world!(self, said), placed);
                 self.said(said);
             }
-            STD_STORE..STD_STORE_END => {
+            STD_STORE..STD_STORE_END | STD_LOADS..STD_LOADS_END => {
                 debug_assert!(self.std.owns(completion.tag), "the shared store's tags are its");
                 self.std.complete(completion, &mut self.effects);
                 if let Some(broken) = self.std.broken()

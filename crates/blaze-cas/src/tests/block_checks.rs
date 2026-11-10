@@ -314,9 +314,10 @@ impl Pump for NoPump {
     }
 }
 
-/// A pumped miss: a pack's bytes pinned through the pool are the file's, loaded by reads the
-/// caller's pump carries out on the simulation and checked by block; a second read is a hit and
-/// asks nothing; given back, they load again; and a block rotted on disk meanwhile is refused,
+/// A pumped miss: a pack's bytes pinned through the pool are the file's (in memory from the
+/// commit that wrote them through the pool, a hit); a second read is a hit and asks nothing;
+/// given back, they load again, by reads the caller's pump carries out on the simulation,
+/// checked by block; and a block rotted on disk meanwhile is refused,
 /// naming the pack and the block, never served.
 #[test]
 fn a_pumped_miss_loads_a_packs_bytes_checked_and_again_once_given_back() {
@@ -348,7 +349,10 @@ fn a_pumped_miss_loads_a_packs_bytes_checked_and_again_once_given_back() {
             assert_eq!(hit.bytes(), &on_disk[70_000..70_300], "round {round}");
         }
         let swept = store.hot.evict(u64::MAX).expect("the store has a pool");
-        assert_eq!((swept.refused, swept.freed >= committed), (None, true), "round {round}");
+        // All but the pack's last page, which the sweep passes over while the pack was
+        // written in the last two commits.
+        let given = swept.freed >= committed - crate::pool::PAGE;
+        assert_eq!((swept.refused, given), (None, true), "round {round}: {}", swept.freed);
     }
     sim.rot(&file, 70_000, &[0xff; 8]);
     let mut pump = Inline::new(&mut sim);

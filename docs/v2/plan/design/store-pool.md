@@ -929,12 +929,32 @@ is next. Lane 5 waits on 4b and on admission by footprint reaching main.
          `Hot::pin_pack`, a pinned read whose miss the pump loads: built); (3) `Reader::read` and `Reader::pin` beside the old readers;
          (4) the index probes, the recovery scan and the commit (`Append`, `WriteFrom`) on the
          pool; (5) the callers, crate by crate, and the tests' reads through one helper;
-         (6) the old readers and every mapping but `Kind::Machine`'s deleted. Until (4), a
-         commit's bytes reach a pack by a write of the store's, so growing a pack gives back
-         the one page its committed bytes ended in (`Pool::drop_stale`); and a tier opened
-         afresh (another writer's) closes its windows at once, which is sound only while
-         nothing reads through them: (3) must hold a replaced tier's windows through its
-         readers' grace.
+         (6) the old readers and every mapping but `Kind::Machine`'s deleted.
+       - Decided (2026-11-10) as the port went on, each with its reason:
+         - *The commit goes onto the pool before any reader pins* (step 4's commit before
+           step 3): a commit that wrote beside the pool would have to give back the page a
+           pack's committed bytes end in, which a reader may hold pinned. Built: a commit's
+           bytes of a pack go into the pack's window through `pool::Append`
+           (`Hot::begin_append`), are written from there with `WriteFrom` around the page
+           cache, and are the pack's loaded pages once the head names them (`Hot::committed`),
+           its last page hot for two commits. When the page the committed bytes end in is not
+           in memory the store asks its load as an effect of its own, tagged from
+           `Config::load_tags`, and takes the completion as a step of the commit, so the
+           commit stays a sans-IO state machine with no pump and no thread. Still to move in
+           step 4: the index probes and the recovery scan, and `Pack::memory`, which the
+           store's own reads of bytes not yet mapped still use.
+         - *The pool is built under the model checker too* (`cfg(blaze_check)`), with no stub:
+           the commit writes from the pool's pages, so a stub would keep the old write path
+           alive beside it for the model build alone. What that leaves unchecked: the pool's
+           state words and pins are `std` atomics over reserved memory, which a model run
+           does not schedule; their proof is the pool's DST.
+         - *A pump hands back what is not its own load's*, a commit's page load among them
+           (`Loads::slot_of`): the caller gives those completions to the store, as it does
+           its driver's others.
+         - *`Loader::Thread` carries the driver's root*, a pumped caller's pump rides in its
+           `PinSet`, a tier opened afresh keeps its windows until the last pin of them goes,
+           `FileId::Index` and `FileId::External` gain their tier, and the loads core is the
+           one owner of a pack's checks: decided, for step 3; not built.
        - *The checks' effects are chained* behind their pack's own sync (cut, write, sync, one
          at a time), so the store model's search over a commit's orders still ends. That costs
          commit latency: a second sync in series a pack. Running them beside the pack's again

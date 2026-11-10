@@ -388,6 +388,11 @@ impl Loads {
         tag.0.checked_sub(self.tags).is_some_and(|it| it < 1 << 32)
     }
 
+    /// The load slot `tag`, one of its own, names.
+    pub(crate) fn slot_of(&self, tag: Tag) -> Option<u16> {
+        self.owns(tag).then(|| ((tag.0 - self.tags) >> READS_SHIFT) as u16)
+    }
+
     /// Loads in flight.
     pub(crate) fn in_flight(&self) -> usize {
         self.in_flight
