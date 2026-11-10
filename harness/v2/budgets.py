@@ -78,7 +78,7 @@ their pinned revisions, except blaze, which is the files of this checkout as the
     cold-blaze     blaze: a cold `blaze build` (empty home, store and target directory) until
                    ready: the share of the machine's cores busy over it (/proc/stat) at least
                    0.8, and its wall time at most `critical_slack` times its critical path
-                   (engine.critical_path_s; unmeasured on v1)
+                   (engine.critical_path_s)
     ci             blaze, warm after the cold build and one `blaze test`: `self_edit`, then
                    `blaze build` and `blaze test --reached` (only the tests the edit can have
                    changed run; docs/cargo.md, "Which tests run"): under 120 s, every test
@@ -99,8 +99,7 @@ their pinned revisions, except blaze, which is the files of this checkout as the
                    (`perf stat -a`, Linux); docs/v2/plan/design/data.md asks for it and sets no budget
     bounds         every speed-of-light bound (bounds.py: the `bound` blocks of
                    docs/v2/plan/bounds.md), each program beside `blaze` run
-                   until settled: at most the bound x 1.1 (at least the bound / 1.1 for a rate);
-                   unmeasured on v1, which has none of v2's components
+                   until settled: at most the bound x 1.1 (at least the bound / 1.1 for a rate)
 
 The timed budgets (body, big-crate, noop) also count the instructions and cycles the daemon's
 processes retired over each timed build, from quiet to quiet (counters.py: Linux's counters in
@@ -1513,8 +1512,6 @@ def bound_row(found: bounds.Found) -> Row:
 def measure_bound(eng: engine.Engine, args: Input, found: bounds.Found) -> Measured:
     """The bound's program, beside the measured `blaze`, run until its values settle the budget."""
     b = found.bound
-    if eng.kind == "v1":
-        raise engine.Unmeasurable(f"v1 has none of v2's components; {b.name} is v2's ({found.where})")
     program = Path(args.engine.blaze).resolve().parent / (b.program + engine.EXE)
     values: list[float] = []
     while not enough(values, found.budget, args):

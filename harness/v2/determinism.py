@@ -2,7 +2,7 @@
 (docs/v2/plan.md, "Deterministic", and docs/v2/plan.md). Linux only: a build is
 pinned to its cores with the scheduler's affinity, as `taskset -c` pins one.
 
-    uv run --frozen python harness/v2/determinism.py '{"engine": {"kind": "v1", "blaze": "target/release/blaze"}, "out": "/tmp/determinism.json"}'
+    uv run --frozen python harness/v2/determinism.py '{"engine": {"kind": "v2", "blaze": "target/release/blaze"}, "out": "/tmp/determinism.json"}'
     uv run --frozen python harness/v2/determinism.py '{"engine": {...}, "out": "...", "projects": ["ripgrep", "just", "fd"], "cores_a": 4}'
     uv run --frozen python harness/v2/determinism.py selftest
 

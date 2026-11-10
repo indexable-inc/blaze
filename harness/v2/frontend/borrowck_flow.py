@@ -215,8 +215,6 @@ async def judge_both(spec: engine.EngineSpec, work: Path, made: list[cases.Case]
 
 
 def main(args: Input) -> None:
-    if args.engine.kind != "v2":
-        fail(SCRIPT, f"engine.kind: v2 (BLAZE_BORROWCK is v2's), not {args.engine.kind!r}")
     for name, value in (("jobs", args.jobs), ("batch", args.batch)):
         if value < 1:
             fail(SCRIPT, f"{name}: at least 1, not {value}")

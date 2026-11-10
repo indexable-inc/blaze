@@ -834,8 +834,6 @@ async def measured(args: Input, rep: report.Report, eng: engine.Engine, work: Pa
 
 
 def main(args: Input) -> None:
-    if args.engine.kind != "v2":
-        fail(SCRIPT, "engine.kind: v2; this reads the v2 daemon's JSON lines and history")
     if not os.path.isabs(args.duckdb) or not os.path.isfile(args.duckdb):
         fail(SCRIPT, f"duckdb: an absolute path to the DuckDB binary, not {args.duckdb!r}")
     if args.project not in budgets.PROJECTS:
