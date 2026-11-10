@@ -190,7 +190,7 @@ machine's limits (section 1: `hw.memsize`, `MemTotal`, cgroup `memory.max`/`memo
 `BLAZE_DAEMON_MEMORY_GB` (`--memory-gb`) is one daemon's ceiling, never more than the machine
 budget.
 
-**The ledger**, `/tmp/blaze-<uid>/machine` (never under `BLAZE_HOME`: two homes are one
+**The ledger**, `/tmp/blaze-<uid>/machine.<layout>` (one file per layout of the ledger, so daemons of two blaze versions keep separate ledgers; never under `BLAZE_HOME`: two homes are one
 machine), a small file of fixed records read and rewritten under `flock`. One record a daemon:
 its pid and process start time (so a reused pid is not mistaken for it), home, version,
 ceiling, and its charge, `max(held, granted)`, rewritten as its plane takes a `Held` (at most
