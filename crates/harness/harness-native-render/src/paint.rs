@@ -1331,9 +1331,7 @@ impl Painter {
             return self.kips.paint(d, e, &k, rect, laid, alpha, dark, sc, time);
         }
         if let Some(s) = e.try_cloned::<&Lantern>() {
-            if s.on {
-                self.lanterns.paint(d, rect, alpha, dark, sc, time);
-            }
+            self.lanterns.paint(d, e.id().0, s.on, rect, alpha, dark, sc, time);
             return Ok(());
         }
         if let Some(b) = e.try_cloned::<&PixelBlock>() {

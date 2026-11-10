@@ -1075,8 +1075,15 @@ fn all_steps() -> bool {
 /// How much of a text block still streaming in can show without what shows changing as more comes (byte offset): up to
 /// its last whitespace (a word still coming would hop to the next line as it grows), short of an inline code span or a
 /// bold run not closed yet (its markers would show, then vanish and restyle it), and short of a last line that is only a
-/// block's opening so far (a list's `-`, a heading's `#`, a fence: the line would change kind). Done, all of it.
+/// block's opening so far (a list's `-`, a heading's `#`, a fence: the line would change kind), and short of an inline
+/// component still coming (`<Cite loc="…">four at` with no `</Cite>` yet: its tag would show as written, then turn
+/// into its chip). Done, all of it.
 fn settled_len(text: &str, done: bool) -> usize {
+    settled_len_with(text, done, harness_native_ui_inline::known)
+}
+
+/// [`settled_len`] with `component` saying which tag names are inline components.
+fn settled_len_with(text: &str, done: bool, component: impl Fn(&str) -> bool) -> usize {
     if done {
         return text.len();
     }
@@ -1105,6 +1112,24 @@ fn settled_len(text: &str, done: bool) -> usize {
     let tail = &text[para..end];
     if tail.matches("**").count() % 2 == 1 {
         end = para + tail.rfind("**").unwrap_or(0);
+    }
+    // The last component tag opened in the paragraph: held back until it is whole (`<Name … />`, or `<Name …>` and its
+    // `</Name>`). Only names of the vocabulary: `Vec<T>` and `a < b` are words.
+    let tail = &text[para..end];
+    let opened = tail.char_indices().rev().find_map(|(i, c)| {
+        let name: &str = tail[i..].strip_prefix('<')?.split(|c: char| !c.is_ascii_alphanumeric()).next()?;
+        (c == '<' && component(name)).then_some((i, name))
+    });
+    if let Some((i, name)) = opened {
+        let rest = &tail[i..];
+        let whole = match rest.find('>') {
+            None => false,
+            Some(close) if rest[..close].ends_with('/') => true,
+            Some(_) => rest.contains(&format!("</{name}>")),
+        };
+        if !whole {
+            end = para + i;
+        }
     }
     end
 }
@@ -3727,6 +3752,13 @@ mod tests {
         assert_eq!(at("Done.\n```rus"), "Done.\n");
         assert_eq!(at("```\nlet a = **b "), "```\nlet a = **b ");
         assert_eq!(settled_len("half a wo", true), 9);
+        // A component still coming is held back whole; one that is whole shows; a type's angle brackets are words.
+        let on = |t: &str| t[..settled_len_with(t, false, |n| n == "Cite" || n == "Path")].to_owned();
+        assert_eq!(on("Use <Cite loc=\"/a.md\" line={3}>as few "), "Use ");
+        assert_eq!(on("Use <Cite loc=\"/a.md\" "), "Use ");
+        assert_eq!(on("Use <Cite loc=\"/a.md\">as few</Cite> agents no"), "Use <Cite loc=\"/a.md\">as few</Cite> agents ");
+        assert_eq!(on("See <Path loc=\"/a\" /> and mo"), "See <Path loc=\"/a\" /> and ");
+        assert_eq!(on("a Vec<T> is fi"), "a Vec<T> is ");
     }
 
     /// A run is one folded line and nothing under it, its table and its failure included, until the person opens it; its
