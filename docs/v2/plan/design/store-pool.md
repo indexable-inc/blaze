@@ -914,6 +914,15 @@ is next. Lane 5 waits on 4b and on admission by footprint reaching main.
        - *blaze-storemodel* gets `ReadInto` and `WriteFrom` rules with the semantics of `Read`
          and `WriteAt` over a registered span, and a crash rule for a span being written as the
          crash comes.
+       - Built of these: the `Config` field (`blaze_cas::Loader`, on `Config` and
+         `SharedConfig`; the daemon's stores say `Thread`, every other site `Pumped`), the
+         store model's rules, and the chained checks. Not built: `Pump`, `Reader::read` and
+         `Reader::pin` on the pool.
+       - Found on the way, to settle as the reads move: a pool registers its pages as one of
+         blaze-core's `spans::REGIONS` (64 a process), so a test binary that holds more than 64
+         stores at once would be refused its pool; and the loads core asks with a tag range of
+         its own, 2^32 wide, while `Config::tags` gives the store one such range and the daemon
+         packs its ranges 2^32 apart, so `Config` needs a second range for the loads.
        - *The checks' effects are chained* behind their pack's own sync (cut, write, sync, one
          at a time), so the store model's search over a commit's orders still ends. That costs
          commit latency: a second sync in series a pack. Running them beside the pack's again
