@@ -466,6 +466,9 @@ pub struct ChatState {
     sizes: HashMap<String, Option<(u32, u32)>>,
     /// The aside asked from this composer, shown over it until closed ([`Aside`]).
     aside: Option<Aside>,
+    /// The step (its call's block, its place among the call's steps) whose page the browser pane was last opened on
+    /// for this chat ([`App::chat_pane_page`]): each step opens it once.
+    paned: Option<(String, usize)>,
 }
 
 /// What an aside's answer is as the link delivers it: the fork's words (markdown), or why there are none.
@@ -604,6 +607,7 @@ impl Default for ChatState {
             draft_saved: (String::new(), Vec::new()),
             sizes: HashMap::new(),
             aside: None,
+            paned: None,
         }
     }
 }
@@ -2572,6 +2576,33 @@ impl App {
             self.poke();
         }
         left
+    }
+
+    /// The page the focused chat's turn in flight just opened for the person (browser.open; its shown value says
+    /// `pane`, cdp.ts `Page.kept`), for the browser pane to show: the newest such step's view, once a step. Only a turn
+    /// in flight, so a chat read again later opens nothing; only the focused chat, so another chat's agent does not
+    /// take the pane.
+    pub(in crate::app) fn chat_pane_page(&mut self) -> Option<u64> {
+        let (_, _, sid) = self.focused_chat()?;
+        let (key, view) = {
+            let chats = self.chats.borrow();
+            let t = chats.get(&sid).filter(|t| t.busy)?;
+            t.items[turn_start(t)..].iter().rev().find_map(|i| {
+                let Item::Tool { block, .. } = i else { return None };
+                let d = t.details.get(block)?;
+                d.effects.iter().enumerate().rev().find_map(|(k, e)| {
+                    let view = genui::browser_view_id(&e.value["view"]).filter(|_| e.value["t"] == "browser" && e.value["pane"] == true)?;
+                    Some(((block.clone(), k), view))
+                })
+            })?
+        };
+        let mut chat = self.chat.borrow_mut();
+        let st = chat.get_mut(&sid)?;
+        if st.paned.as_ref() == Some(&key) {
+            return None;
+        }
+        st.paned = Some(key);
+        Some(view)
     }
 
     /// An aside card's close button (`chat:aside_close:<sid>`): chat `sid`'s aside closed.

@@ -428,9 +428,13 @@ export class Page {
 
   close() { return this.session.close().catch(() => {}); }
 
-  /** The card the app draws for it (shown.ts). */
+  /** Opened for the person (browser.open: a view that stays): the app shows it in the browser pane beside the chat,
+   *  where they can scroll, click and type in it, not only as a card. Set by newPage. */
+  kept = false;
+
+  /** The card the app draws for it (shown.ts); `pane` when it is the person's to use ([`Page.kept`]). */
   [SHOWN](): Shown {
-    return { t: "browser", view: this.view ?? "", url: this.#url, title: this.#title };
+    return { t: "browser", view: this.view ?? "", url: this.#url, title: this.#title, ...(this.kept ? { pane: true as const } : {}) };
   }
 }
 
@@ -461,6 +465,7 @@ export async function newPage(opts: { url?: string; keep?: boolean; size?: [numb
   // Always opened blank: the page is told what browser it is (asChrome) before its first request leaves.
   const v = await (await host()).open("about:blank", { owner: owner(), keep: opts.keep, size: opts.size });
   const page = new Page(v, String(v.info.view), v.info.target, v.info.url, v.info.title);
+  page.kept = !!opts.keep;
   try {
     await Promise.all([page.send("Page.enable"), asChrome(page)]);
     if (opts.url) {
