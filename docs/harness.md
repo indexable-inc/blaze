@@ -210,12 +210,12 @@ profile is.
 
 ### Under LLVM
 
-Build in the flake's dev shell, which has the LLVM 23 it pins
+blaze's default build links the LLVM 23 it pins, which blaze fetches by its sha256
 ([contributing.md](contributing.md#llvm)). Under v2 an `opt-level` of 2,
 `s` or `z` is then LLVM at `-O2` and 3 is LLVM at `-O3`, so the release profile is LLVM; a
 profile that asks for LLVM of a blaze built without it is refused.
 
-    nix develop -c cargo build -p blaze-engine --release
+    blaze build --release --locked -p blaze-engine
 
 `BLAZE_BACKEND` and `BLAZE_OPT` are v1's settings: under v2, either one set at all makes every
 unit fail, saying the variable changes code its key has no part of

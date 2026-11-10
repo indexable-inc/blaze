@@ -133,8 +133,8 @@ with blaze's changes made in place. That branch and its history are kept as
 blaze supports one toolchain, the latest nightly, pinned by date in `harness/toolchain`
 (`nightly-2026-10-27`, which says `rustc 1.101.0-nightly (16d1ffac1 2026-10-26)`). Stable
 Rust is not a separate target: what a stable release builds, the nightly builds. blaze
-itself is built with that nightly (`cargo +"$(cat harness/toolchain)"`; in `nix develop`
-plain `cargo` is it), and so are the harnesses' reference builds. The pin is written in that
+itself is built with that nightly by blaze, which brings it (`blaze toolchain`): no rustup, and
+no `cargo` or `rustc` of it is run. The pin is written in that
 one file; everything else reads it or is written from it:
 
 - `crates/blaze-cargo/src/toolchain/pins.txt` (by `harness/toolchain_pins.py '{"write": true}'`): the
@@ -234,11 +234,13 @@ files are, what they hold, the DuckDB queries that answer each question and the 
   main after the merge, and a red train opens or adds to the issue "Release train is red",
   with the commits since the last green one ([harness.md](harness.md#ci)). The gate letting a
   change through is not the harnesses passing on it.
-- blaze builds in the flake's dev shell, against the LLVM it pins:
-  `nix develop -c cargo build -p blaze-engine --release` ([LLVM](#llvm)).
+- blaze builds blaze, never cargo or rustc: with the release `.github/blaze-version` names as
+  stage 0 (`sh site/install.sh --version "$(cat .github/blaze-version)"`, as
+  `.github/actions/blaze` installs it), `blaze build --release --locked -p blaze-engine`, against
+  the LLVM blaze pins and fetches itself ([LLVM](#llvm)).
 - `blaze fmt --all` (nothing checks it, and `fmt.yaml` formats main after the merge, but a
   pull request's diff should be its change), and
-  `cargo test --release -p blaze-engine -p hir-ty -p hir-def -p parser -p syntax` from the root (or
+  `blaze test --release --locked -p blaze-engine -p hir-ty -p hir-def -p parser -p syntax` from the root (or
   `python3 harness/unittests.py`, what CI runs: every test of the workspace, with the failures it expects).
   A test that fails is new unless `harness/known-failures.toml` lists it:
   `uv run --frozen harness/failures.py '{"run": {"packages": [...]}}'` runs the
