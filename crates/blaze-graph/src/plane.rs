@@ -2460,8 +2460,15 @@ impl<M: Memo> Plane<M> {
     /// of this daemon ([`Plane::room`]). Every admission decision reads it; only [`too_big`]
     /// reads the configured budget alone.
     pub fn budget_now(&self) -> Option<u64> {
+        Some(self.budget_at_turn()?.min(self.room))
+    }
+
+    /// [`Plane::budget_now`] as the ledger's next turn leaves it: every bound but the room
+    /// between two turns, which that turn lifts. What a task held back for memory is short of
+    /// is counted against this ([`Plane::short`]): a task that fits it only waits for the turn.
+    fn budget_at_turn(&self) -> Option<u64> {
         let budget = self.config.budget.as_ref()?;
-        Some(crate::pressure::budget_under(budget.bytes, self.cap).min(self.allowance).min(self.room))
+        Some(crate::pressure::budget_under(budget.bytes, self.cap).min(self.allowance))
     }
 
     /// The task that holds back the others, while it is still to start and wanted by a
@@ -2749,11 +2756,19 @@ impl<M: Memo> Plane<M> {
         if unfit != NONE && self.short == 0 {
             // The first task held back, of the request whose turn it is: what the process
             // holds besides the grants kept it out by this much.
+            // Against what the ledger's next turn allows, never the room between two turns
+            // ([`Plane::room`]): the room is the charge the last turn recorded, so right after
+            // a turn nothing is free of it and every task with memory is held back until the
+            // next. That wait ends by itself, [`machine`'s `SOON`] later; letting go of a kept
+            // front end for it made every build lower its program anew (a one-line edit of a
+            // one-file program took 25 s: the daemon's log said "a task waits for 0.03 GiB").
             let memory = self.tasks[row_of(self.rows[unfit as usize].task)].memory;
+            let at_turn = self.budget_at_turn().expect("a budget");
+            let free_at_turn = at_turn.saturating_sub(self.charged());
             let held_besides = self.held.saturating_sub(self.granted);
-            let by_grants = whole.saturating_sub(self.granted);
+            let by_grants = at_turn.saturating_sub(self.granted);
             if memory <= by_grants {
-                self.short = memory.saturating_sub(free).min(held_besides);
+                self.short = memory.saturating_sub(free_at_turn).min(held_besides);
             }
         }
         Pick::None

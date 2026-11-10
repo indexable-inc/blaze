@@ -898,6 +898,29 @@ fn a_task_that_fits_the_budget_starts_alone_whatever_the_process_holds() {
     assert_eq!(runs(&built(&mut plane, 2)), [3]);
 }
 
+/// A task the room between two turns of the machine's ledger holds back is short of nothing:
+/// the next turn starts it, so the driver lets go of no kept front end for it. Counted against
+/// the room it was short of all the process holds besides its grants, at every build.
+#[test]
+fn a_task_that_waits_for_the_ledgers_turn_is_short_of_nothing() {
+    let mut plane = Plane::new(PlaneConfig { budget: budget(10), ..config(1, 2) }).unwrap();
+    open(&mut plane, 1, 1, true);
+    plane.step(PlaneInput::Held { at_ns: 0, bytes: 4 }).unwrap();
+    assert_eq!(runs(&add(&mut plane, 1, vec![node(1, &[], Pool::Work, 1000, None, 2)])), [1]);
+    // A turn: 10 allowed, and the room until the next is what is charged now, 4.
+    plane.step(PlaneInput::Allowance { at_ns: 0, bytes: 10 }).unwrap();
+    assert_eq!(plane.room(), 4);
+    // 3 fits the 10 allowed beside the 4 held, and not the room: it waits for the turn.
+    assert_eq!(
+        runs(&add(&mut plane, 1, vec![node(2, &[], Pool::Work, 100, None, 3)])),
+        Vec::<u32>::new()
+    );
+    assert!(plane.held_back());
+    assert_eq!(plane.short(), 0, "the turn makes the room; nothing need be let go");
+    let out = plane.step(PlaneInput::Allowance { at_ns: 1, bytes: 10 }).unwrap();
+    assert_eq!(runs(&out), [2]);
+}
+
 /// Under a pressure cap the budget is held at the cap: tasks start only within it, none starts
 /// alone past it, a task too big is still judged against the configured budget, and lifting
 /// the cap starts what waited for it.
