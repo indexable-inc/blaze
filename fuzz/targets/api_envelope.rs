@@ -296,7 +296,6 @@ fn seeds() -> Vec<Vec<u8>> {
         Request::CodegenInputs { view: head(), targets: targets(false) },
         Request::Trace { view: head(), targets: targets(false) },
         Request::Tables { view: head() },
-        Request::Pack { view: head(), targets: targets(false), program: "app".to_owned() },
         Request::Explore { dev: true },
         Request::Profile { seconds: 60 },
         Request::Live,
@@ -540,7 +539,6 @@ fn seeds() -> Vec<Vec<u8>> {
             fingerprint: Fingerprint(4),
         }]),
         Response::Tables(vec![Table { name: "memo".to_owned(), bytes: 1 << 20, elements: 7 }]),
-        Response::Packed { pack: b"{\"crates\": []}".to_vec() },
     ];
     let mut seeds: Vec<Vec<u8>> = Vec::new();
     for (at, request) in requests.into_iter().enumerate() {
