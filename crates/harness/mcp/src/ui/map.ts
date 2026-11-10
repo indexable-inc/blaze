@@ -142,63 +142,35 @@ const html = (text: string): string => text.replace(/[&<>"]/g, c => ({ '&': '&am
 /** JSON that can sit inside a <script> element: no `<` to end it early, no line separators JavaScript once refused. */
 const inScript = (value: unknown): string => JSON.stringify(value).replace(/[<\u2028\u2029]/g, c => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
 
-/** The map's style: OpenFreeMap's dark vector style (OpenMapTiles data from OpenStreetMap; no key, no account), drawn by
- *  MapLibre GL at the screen's own resolution. Vector, not pictures of a map: sharp at every zoom and scale. */
-export const MAP_STYLE = 'https://tiles.openfreemap.org/styles/dark';
+/** The map's style: OpenFreeMap's Liberty (OpenMapTiles data from OpenStreetMap; no key, no account), a map in colour as
+ *  Apple's Maps reads: blue water, green parks, warm main roads, places with their icons. Drawn by MapLibre GL as vectors at
+ *  the screen's own resolution. On the light scheme it is shown as it is; on the dark one the page turns every colour of it to
+ *  its dark counterpart (pageMain's `night`): the hue kept, the lightness turned over, so water stays blue and parks green. */
+export const MAP_STYLE = 'https://tiles.openfreemap.org/styles/liberty';
 
-/** The style's colours, retinted to the app's look before the map is made (layer id of MAP_STYLE: paint properties): its own
- *  are near-black on black, roads and names barely there. Here the ground is the app's, streets are steps of grey above it by
- *  their size, water a slate a shade off the ground, names in the app's inks. A layer the style no longer has is skipped. */
-export const MAP_TINT: Record<string, Record<string, string>> = {
-  background: { 'background-color': '#0E1013' },
-  water: { 'fill-color': '#18222E' },
-  waterway: { 'line-color': '#18222E' },
-  water_name: { 'text-color': '#62707F', 'text-halo-color': 'rgba(14,16,19,0)' },
-  landuse_residential: { 'fill-color': '#111317' },
-  landcover_wood: { 'fill-color': '#131A18' },
-  landuse_park: { 'fill-color': '#131A18' },
-  building: { 'fill-color': '#15181D', 'fill-outline-color': '#1B1F25' },
-  highway_path: { 'line-color': '#23272E' },
-  highway_minor: { 'line-color': '#2B3038' },
-  highway_major_casing: { 'line-color': '#3B414B' },
-  highway_major_inner: { 'line-color': '#333842' },
-  highway_major_subtle: { 'line-color': '#333842' },
-  highway_motorway_casing: { 'line-color': '#4C535E' },
-  highway_motorway_inner: { 'line-color': '#414852' },
-  highway_motorway_subtle: { 'line-color': '#414852' },
-  railway_transit: { 'line-color': '#2B3038' },
-  railway_minor: { 'line-color': '#2B3038' },
-  railway: { 'line-color': '#2B3038' },
-  highway_name_other: { 'text-color': '#8B919A', 'text-halo-color': '#0E1013' },
-  highway_name_motorway: { 'text-color': '#A3A9B1', 'text-halo-color': '#0E1013' },
-  boundary_state: { 'line-color': '#3B414B' },
-  'boundary_country_z0-4': { 'line-color': '#4C535E' },
-  'boundary_country_z5-': { 'line-color': '#4C535E' },
-  ...Object.fromEntries(['other', 'suburb', 'village', 'town', 'city', 'city_large', 'state', 'country_other', 'country_minor', 'country_major']
-    .map(k => [`place_${k}`, { 'text-color': '#C4C8CE', 'text-halo-color': 'rgba(14,16,19,0.9)' }])),
-};
-
-/** The app's look, as the page's: near-black ground, ink only, one blue for the pins. */
+/** The page around the map, in the scheme's colours (`body.light` on the light one): red pins with their words, the person's
+ *  place as a blue dot ringed in white. */
 const PAGE_CSS = `
 html, body, #map { height: 100%; margin: 0; }
-body { background: #0A0B0D; color: #E6E8EB; font: 12px/16px -apple-system, "SF Pro Text", system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
-.maplibregl-map { background: #0A0B0D; font: inherit; color: inherit; }
+body { --ground: #26282C; --ink: #E6E8EB; --muted: #9AA0A8; --plate: #2B2F36; --line: #3B414B; background: var(--ground); color: var(--ink); font: 12px/16px -apple-system, "SF Pro Text", system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+body.light { --ground: #F4F2EC; --ink: #1D1F23; --muted: #6B6F76; --plate: #FFFFFF; --line: #DAD5CA; }
+.maplibregl-map { background: var(--ground); font: inherit; color: inherit; }
 .maplibregl-canvas { outline: none; }
-.maplibregl-ctrl-attrib { background: rgba(10, 11, 13, 0.72) !important; color: #9AA0A8; font-size: 10px; line-height: 14px; }
-.maplibregl-ctrl-attrib a { color: #C4C8CE; text-decoration: none; }
-.maplibregl-ctrl-attrib-button { filter: invert(1); opacity: 0.6; }
-.pin { width: 12px; height: 12px; box-sizing: border-box; border-radius: 50%; background: #4D8EFF; border: 2px solid #0A0B0D; cursor: default; }
+.maplibregl-ctrl-attrib { background: color-mix(in srgb, var(--ground) 78%, transparent) !important; color: var(--muted); font-size: 10px; line-height: 14px; }
+.maplibregl-ctrl-attrib a { color: var(--muted); text-decoration: none; }
+body:not(.light) .maplibregl-ctrl-attrib-button { filter: invert(1); opacity: 0.6; }
+.pin { width: 14px; height: 14px; box-sizing: border-box; border-radius: 50%; background: #FF4F45; border: 2px solid #FFFFFF; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35); cursor: default; }
 .pin.pressable { cursor: pointer; }
-.pin b { position: absolute; left: 14px; top: -4px; white-space: nowrap; font-weight: 500; color: #E6E8EB;
-  text-shadow: 0 0 2px #0A0B0D, 0 0 2px #0A0B0D, 0 0 4px #0A0B0D, 0 0 4px #0A0B0D; }
+.pin b { position: absolute; left: 16px; top: -4px; white-space: nowrap; font-weight: 600; color: var(--ink);
+  text-shadow: 0 0 2px var(--ground), 0 0 2px var(--ground), 0 0 4px var(--ground), 0 0 4px var(--ground); }
 .dense .pin b { display: none; }
 .dense .pin:hover b { display: block; }
 .maplibregl-marker:hover { z-index: 3; }
-.here { width: 14px; height: 14px; box-sizing: border-box; border-radius: 50%; background: #4D8EFF; border: 3px solid #E6E8EB; box-shadow: 0 0 0 1px #0A0B0D; }
-.maplibregl-popup-content { background: #14161A; color: #E6E8EB; border: 1px solid #2A2D33; border-radius: 8px; box-shadow: none; padding: 8px 10px; font: inherit; line-height: 16px; max-width: 260px; }
+.here { width: 16px; height: 16px; box-sizing: border-box; border-radius: 50%; background: #2F7BF6; border: 3px solid #FFFFFF; box-shadow: 0 0 0 5px rgba(47, 123, 246, 0.22), 0 1px 3px rgba(0, 0, 0, 0.35); }
+.maplibregl-popup-content { background: var(--plate); color: var(--ink); border: 1px solid var(--line); border-radius: 8px; box-shadow: none; padding: 8px 10px; font: inherit; line-height: 16px; max-width: 260px; }
 .maplibregl-popup-content strong { display: block; font-weight: 600; }
-.maplibregl-popup-content span { display: block; color: #9AA0A8; }
-.maplibregl-popup-content a { display: block; margin-top: 4px; color: #4D8EFF; text-decoration: none; }
+.maplibregl-popup-content span { display: block; color: var(--muted); }
+.maplibregl-popup-content a { display: block; margin-top: 4px; color: #2F7BF6; text-decoration: none; }
 .maplibregl-popup-tip { display: none; }
 `;
 
@@ -208,7 +180,7 @@ body { background: #0A0B0D; color: #E6E8EB; font: 12px/16px -apple-system, "SF P
  * element's props change). Until the person moves the map, it is fitted again whenever its view changes size. `zoom` is a web
  * map's (256-pixel tiles, as OpenStreetMap's and Google's count it): MapLibre's own is one less.
  */
-async function pageMain(DENSE: number, STYLE: string, TINT: Record<string, Record<string, string>>): Promise<void> {
+async function pageMain(DENSE: number, STYLE: string): Promise<void> {
   type Spec = { markers: Array<{ lat: number; lon: number; label?: string; detail?: string; href?: string }>; center?: [number, number]; zoom?: number; here?: [number, number]; title: string };
   const M = (window as any).maplibregl;
   const fresh = JSON.parse(document.getElementById('spec')!.textContent!) as Spec;
@@ -216,7 +188,74 @@ async function pageMain(DENSE: number, STYLE: string, TINT: Record<string, Recor
   const got = await fetch(STYLE);
   if (!got.ok) { document.body.textContent = `The map's style could not be loaded (${STYLE}: ${got.status}).`; return; }
   const style = await got.json();
-  for (const layer of style.layers ?? []) if (TINT[layer.id]) layer.paint = { ...layer.paint, ...TINT[layer.id] };
+  const light = !matchMedia('(prefers-color-scheme: dark)').matches;
+  document.body.classList.toggle('light', light);
+  if (!light) {
+    // A CSS colour as hue (degrees), saturation, lightness and alpha; undefined for what is no colour (an expression's
+    // operator, a property name).
+    const hsla = (c: string): [number, number, number, number] | undefined => {
+      const t = c.trim().toLowerCase();
+      let m = /^#([0-9a-f]{3,8})$/.exec(t);
+      let rgb: number[] | undefined;
+      let alpha = 1;
+      if (m && [3, 4, 6, 8].includes(m[1]!.length)) {
+        const h = m[1]!.length <= 4 ? [...m[1]!].map(x => x + x).join('') : m[1]!;
+        rgb = [0, 2, 4].map(i => parseInt(h.slice(i, i + 2), 16) / 255);
+        if (h.length === 8) alpha = parseInt(h.slice(6, 8), 16) / 255;
+      } else if ((m = /^rgba?\(([^)]+)\)$/.exec(t))) {
+        const p = m[1]!.split(/[\s,/]+/).filter(Boolean).map(Number);
+        if (p.length < 3 || p.some(Number.isNaN)) return undefined;
+        rgb = p.slice(0, 3).map(x => x / 255);
+        alpha = p[3] ?? 1;
+      } else if ((m = /^hsla?\(([^)]+)\)$/.exec(t))) {
+        const p = m[1]!.split(/[\s,/]+/).filter(Boolean).map(x => parseFloat(x));
+        if (p.length < 3 || p.some(Number.isNaN)) return undefined;
+        return [p[0]!, p[1]! / 100, p[2]! / 100, p[3] ?? 1];
+      } else if (t === 'white' || t === 'black') {
+        rgb = t === 'white' ? [1, 1, 1] : [0, 0, 0];
+      }
+      if (!rgb) return undefined;
+      const [r, g, b] = rgb as [number, number, number];
+      const max = Math.max(r, g, b), min = Math.min(r, g, b), l = (max + min) / 2, d = max - min;
+      if (d === 0) return [0, 0, l, alpha];
+      const sat = d / (1 - Math.abs(2 * l - 1));
+      const hue = max === r ? ((g - b) / d + 6) % 6 : max === g ? (b - r) / d + 2 : (r - g) / d + 4;
+      return [hue * 60, sat, l, alpha];
+    };
+    // A colour's dark counterpart: the lightness turned over into the dark scheme's range (paper becomes a slate ground,
+    // ink becomes light words) and the hue kept where it says something: water stays blue, a park green (Liberty's
+    // yellow-greens pulled to one green), a motorway amber. Liberty's warm paper, buildings and yellow main roads would
+    // turn to browns, so warm colours lose theirs. A street is set by its kind, not turned: white on paper would sink
+    // under the ground, so it is a grey a step over the ground, its casing under.
+    type Road = 'street' | 'casing' | 'motorway' | 'motorway-casing' | undefined;
+    const night = (c: string, road: Road): string | undefined => {
+      const v = hsla(c);
+      if (!v) return undefined;
+      let [h, sat, l, alpha] = v;
+      let to = 0.15 + (1 - l) * 0.75;
+      if (road === 'street') [sat, to] = [0.06, 0.38];
+      else if (road === 'casing') [sat, to] = [0.06, 0.12];
+      else if (road === 'motorway') [h, sat, to] = [36, 0.52, 0.47];
+      else if (road === 'motorway-casing') [h, sat, to] = [36, 0.4, 0.2];
+      else if (h >= 10 && h < 65) [h, sat] = [220, Math.min(sat, 0.5) * 0.18];
+      else if (h >= 65 && h < 170) [h, sat, to] = [140, Math.min(sat, 0.6) * 0.78, Math.min(to, 0.3)];
+      else sat = Math.min(1, sat * 0.85);
+      return `hsla(${h.toFixed(0)}, ${(sat * 100).toFixed(0)}%, ${(to * 100).toFixed(0)}%, ${alpha})`;
+    };
+    const turn = (v: unknown, road: Road): unknown =>
+      typeof v === 'string' ? night(v, road) ?? v
+        : Array.isArray(v) ? v.map(x => turn(x, road))
+        : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, turn(x, road)]))
+        : v;
+    for (const layer of style.layers ?? []) {
+      const id = String(layer.id);
+      const rail = /rail|transit|ferry|pier|path|aeroway/.test(id);
+      const road: Road = layer.type !== 'line' || layer['source-layer'] !== 'transportation' || rail ? undefined
+        : id.includes('motorway') ? (id.includes('casing') ? 'motorway-casing' : 'motorway')
+        : id.includes('casing') ? 'casing' : 'street';
+      for (const [k, v] of Object.entries(layer.paint ?? {})) if (k.endsWith('-color')) layer.paint[k] = turn(v, road);
+    }
+  }
   const map = new M.Map({ container: 'map', style, center: [0, 0], zoom: 1, attributionControl: false, fadeDuration: 0, dragRotate: false, pitchWithRotate: false, touchPitch: false });
   map.touchZoomRotate.disableRotation();
   map.addControl(new M.AttributionControl({ compact: true }), 'bottom-right');
@@ -277,14 +316,14 @@ async function pageMain(DENSE: number, STYLE: string, TINT: Record<string, Recor
  * above. One document, one request; the only things it loads after are the style and its tiles, fonts and icons (tiles.openfreemap.org).
  */
 export function mapPage(spec: MapSpec, lib: { js: string; css: string }): string {
-  const main = `(${pageMain.toString()})(${DENSE_MARKERS}, ${JSON.stringify(MAP_STYLE)}, ${inScript(MAP_TINT)});`;
+  const main = `(${pageMain.toString()})(${DENSE_MARKERS}, ${JSON.stringify(MAP_STYLE)});`;
   const safe = (code: string) => code.replace(/<\/(script)/gi, '<\\/$1');
   return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="dark">
+<meta name="color-scheme" content="dark light">
 <title>${html(spec.title)}</title>
 <style>${lib.css.replace(/<\/(style)/gi, '<\\/$1')}</style>
 <style>${PAGE_CSS}</style>
