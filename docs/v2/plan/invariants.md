@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-35 invariants, 5 refinements, 2 reference models.
-By level: 22 tested, 18 simulated, 0 model-checked, 0 proved.
+36 invariants, 7 refinements, 2 reference models.
+By level: 24 tested, 19 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
@@ -39,6 +39,8 @@ By level: 22 tested, 18 simulated, 0 model-checked, 0 proved.
   Controls: `a_put_reported_durable_that_no_sync_made_so`.
 - **`a_crash_leaves_every_pack_and_its_checks_as_the_head_names_them`** *simulated* (`crates/blaze-cas/src/tests/block_checks.rs`): after a crash at any point of any number of commits, under injected IO failures, the store opens; each pack's checks file holds the checks of the blocks its head names, and the store holds the same; every put reported durable reads back the bytes it was given; and no value reads back other bytes than were put. `HEGEL_TEST_CASES=<n>` runs it longer.
   Controls: `a_head_written_before_its_syncs`.
+- **`a_place_gives_its_values_bytes_whole_through_any_crash`** *simulated* (`crates/blaze-cas/src/tests/place_crash.rs`): whatever is put, placed, replaced and derived, with `placed/` full or not, and wherever the power goes, (1) a place that ends well leaves its path holding exactly its value's bytes, so a whole file of `placed/` is cloned from only when its bytes are its value's: one written or derived by this run, or one an earlier run left that hashes to its name (a derived value's is never kept: it is made again from its base and its ranges); (2) until a place ends well its path holds what it held or the new value whole, never a part; (3) after a crash a path holds nothing, or the whole of a value once placed there, or, of a value under [`CLONE_FROM`] bytes (written where it goes, not cloned, and not synced), any of its sectors; and the store opens. `HEGEL_TEST_CASES=<n>` runs it longer.
+  Controls: `a_placed_file_used_after_a_crash_unchecked`, `a_rename_before_the_clones_bytes_are_complete`, `a_derive_that_skipped_a_range`, `a_derived_file_accepted_as_a_crash_left_it`.
 - **`two_stores_placing_one_value_at_one_path_both_succeed_in_any_order`** *simulated* (`crates/blaze-cas/src/tests/place_race.rs`): any schedule of two stores placing the same value at one shared path ends with both Ok and the path holding the value. `HEGEL_TEST_CASES=<n>` runs it longer.
   Controls: `a_remove_then_clone_onto_the_path`.
 
@@ -127,6 +129,11 @@ By level: 22 tested, 18 simulated, 0 model-checked, 0 proved.
 
 ## Refinements
 
+### blaze-cargo
+
+- **`the_rows_kept_by_deltas_are_the_rows_made_whole`** *tested* (`crates/blaze-cargo/src/serve/unit/codegen/kept/tests.rs`): for any program and sequence of edits (a body edited, a call added or dropped, a function removed, a static or a span table changed or gone), the rows, span tables and id a link keeps by applying each build's delta are those of rows made whole from the build, and what it says changed is what did.
+  Controls: `a_row_not_refreshed_for_a_caller`, `a_given_id_not_updated_for_a_removed_function`.
+
 ### blaze-cas
 
 - **`the_store_reads_back_what_a_map_holds`** *simulated* (`crates/blaze-cas/src/tests/model_check.rs`): the store is a map. Any run of puts, gets, flushes, settles and reopens reads back what a `BTreeMap` given the same puts holds, refuses other bytes under a key it has, and verifies clean. `HEGEL_TEST_CASES=<n>` runs it longer.
@@ -141,6 +148,8 @@ By level: 22 tested, 18 simulated, 0 model-checked, 0 proved.
 
 - **`a_digest_kept_by_updates_is_the_files`** *tested* (`crates/blaze-link/src/digest.rs`): after any sequence of writes and changes of length, the digest kept by updating only the blocks written is the digest of the file hashed whole, root and nodes.
   Controls: `a_block_not_rehashed`.
+- **`a_keyed_set_kept_by_edits_is_the_set_made_whole`** *tested* (`crates/blaze-link/src/keyed.rs`): after any sequence of sets and removals, the root kept by hashing only the edited entries' paths is the root of the same entries hashed whole, and so are the nodes kept.
+  Controls: `a_removed_entry_left_in_the_root`.
 - **`a_patched_file_behaves_as_a_fresh_link`** *tested* (`crates/blaze-link/src/tests/patch.rs`): after any sequence of edits (a body changed at the same size, smaller or larger than the room it had, a function added or removed, a callee set changed, a frame entry gained or lost, a static read, dropped or given another value), the file the patches make behaves as a fresh full link of the same program: the same entry, each function's code, each call resolved through its slot to the same function, each static read holding the same bytes, an unwind lookup of each function finding an entry that covers it, and the same function names in the symbol table. Each patch is of the file the last one left, never lays the image out whole, and the digest it gives is the patched file's hashed whole.
   Controls: `a_stale_unwind_entry`, `a_slot_left_on_the_old_body`, `a_removed_function_still_exported`, `a_write_the_digest_missed`, `a_check_of_the_length_alone`.
 
