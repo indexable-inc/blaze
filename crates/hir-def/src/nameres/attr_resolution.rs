@@ -111,7 +111,7 @@ impl DefMap {
             // `blaze::sans_io_core` the second from `AttrFlags::SANS_IO`, `blaze::checkfree`
             // the third from `AttrFlags::CHECKFREE`, `hir-ty-pure` the fourth from
             // `AttrFlags::PURE`, the layout and MIR the fifth from `AttrFlags::BLAZE_BITS`),
-            // and `#[blaze::nopanic]`, `#[blaze::noalloc]` and `#[blaze::nonblocking]`
+            // and `#[blaze::nopanic]`, `#[blaze::noalloc]`, `#[blaze::nonblocking]` and `#[blaze::terminates]`
             // (`hir-ty-effects`, from `AttrFlags::effect_attr`), and `#![blaze::specialization]`
             // and `#[blaze::specialization_trait]` (`hir-ty-specialization`, from
             // `AttrFlags::BLAZE_SPECIALIZATION` and `TraitFlags::BLAZE_SPECIALIZATION_TRAIT`).
@@ -129,6 +129,7 @@ impl DefMap {
                         | "nopanic"
                         | "noalloc"
                         | "nonblocking"
+                        | "terminates"
                         | "specialization"
                         | "specialization_trait"
                         // `hir-ty-linear`, from `AttrFlags::LINEAR` and `AttrFlags::CONSUMES`.

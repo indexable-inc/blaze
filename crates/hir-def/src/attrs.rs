@@ -587,6 +587,9 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                     (Some(Word::blaze), Some(Word::nonblocking)) => {
                         attr_flags.insert(AttrFlags::NONBLOCKING)
                     }
+                    (Some(Word::blaze), Some(Word::terminates)) => {
+                        attr_flags.insert(AttrFlags::TERMINATES)
+                    }
                     _ => {}
                 },
             }
@@ -726,6 +729,7 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                 (Some(Word::blaze), Some(Word::nopanic)) => AttrFlags::NOPANIC,
                 (Some(Word::blaze), Some(Word::noalloc)) => AttrFlags::NOALLOC,
                 (Some(Word::blaze), Some(Word::nonblocking)) => AttrFlags::NONBLOCKING,
+                (Some(Word::blaze), Some(Word::terminates)) => AttrFlags::TERMINATES,
                 (Some(Word::blaze), Some(Word::linear)) => AttrFlags::LINEAR,
                 (Some(Word::blaze), Some(Word::consumes)) => AttrFlags::CONSUMES,
                 (Some(Word::blaze), Some(Word::reflect)) => AttrFlags::BLAZE_REFLECT,
@@ -991,6 +995,7 @@ name_set! {
     specialization_trait,
     stable,
     target_feature,
+    terminates,
     thread_local,
     track_caller,
     unstable,
@@ -1186,6 +1191,9 @@ bitflags::bitflags! {
         /// `#[blaze::nonblocking]` or `#[blaze::nonblocking(..)]`: as [`AttrFlags::NOPANIC`],
         /// for no call that blocks the thread (`blaze::nonblocking`).
         const NONBLOCKING = 1 << 99;
+        /// `#[blaze::terminates]` or `#[blaze::terminates(..)]`: as [`AttrFlags::NOPANIC`],
+        /// for no loop the check can't bound and no recursion (`blaze::terminates`).
+        const TERMINATES = 1 << 101;
         /// `#[blaze::sealed]`, a word, on a trait: a blaze extension (inert under rustc with
         /// `#![register_tool(blaze)]`). No crate but the trait's may implement it or name it as
         /// a supertrait, and when every impl of it is for a local type, a type parameter
@@ -1725,15 +1733,26 @@ pub enum EffectWord {
     Noalloc,
     /// `#[blaze::nonblocking]`.
     Nonblocking,
+    /// `#[blaze::terminates]`.
+    Terminates,
 }
 
 impl EffectWord {
+    /// Every effect word, in the order of its index.
+    pub const ALL: [EffectWord; 4] = [
+        EffectWord::Nopanic,
+        EffectWord::Noalloc,
+        EffectWord::Nonblocking,
+        EffectWord::Terminates,
+    ];
+
     /// The word, as written after `blaze::`.
     pub const fn text(self) -> &'static str {
         match self {
             EffectWord::Nopanic => "nopanic",
             EffectWord::Noalloc => "noalloc",
             EffectWord::Nonblocking => "nonblocking",
+            EffectWord::Terminates => "terminates",
         }
     }
 
@@ -1743,6 +1762,7 @@ impl EffectWord {
             EffectWord::Nopanic => AttrFlags::NOPANIC,
             EffectWord::Noalloc => AttrFlags::NOALLOC,
             EffectWord::Nonblocking => AttrFlags::NONBLOCKING,
+            EffectWord::Terminates => AttrFlags::TERMINATES,
         }
     }
 }
@@ -2133,8 +2153,8 @@ impl AttrFlags {
         }
     }
 
-    /// What `#[blaze::nopanic]`, `#[blaze::noalloc]` or `#[blaze::nonblocking]` (`effect`) on
-    /// `owner` says, in the shape of `#[blaze::pure]`'s ([`PureAttr`]: checked, trusted with
+    /// What `#[blaze::nopanic]`, `#[blaze::noalloc]`, `#[blaze::nonblocking]` or
+    /// `#[blaze::terminates]` (`effect`) on `owner` says, in the shape of `#[blaze::pure]`'s ([`PureAttr`]: checked, trusted with
     /// its reason, or malformed); `None` without it, one bit test.
     #[inline]
     pub fn effect_attr(db: &Db, owner: AttrDefId, effect: EffectWord) -> Option<PureAttr> {
@@ -2144,12 +2164,12 @@ impl AttrFlags {
         // clone: a handle of an interned reason
         return effect_attrs(db, owner)[effect as usize].clone();
 
-        /// The three effect attributes of `owner` at once, by [`EffectWord`]'s index: an
+        /// The effect attributes of `owner` at once, by [`EffectWord`]'s index: an
         /// item with one of them has the others read in the same pass over its attributes.
         #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
-        fn effect_attrs(db: &Db, owner: AttrDefId) -> [Option<PureAttr>; 3] {
-            let mut read: [Option<PureAttr>; 3] = [None, None, None];
-            for effect in [EffectWord::Nopanic, EffectWord::Noalloc, EffectWord::Nonblocking] {
+        fn effect_attrs(db: &Db, owner: AttrDefId) -> [Option<PureAttr>; 4] {
+            let mut read: [Option<PureAttr>; 4] = [None, None, None, None];
+            for effect in EffectWord::ALL {
                 let word = effect.text();
                 read[effect as usize] = collect_attrs(db, owner, |attr| {
                     let it = match attr {

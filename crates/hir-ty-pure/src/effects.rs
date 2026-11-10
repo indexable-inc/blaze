@@ -1,7 +1,7 @@
 //! The effects of the one walk (docs/v2/plan/design/pure-fns.md, "Effects"): every kind of thing
 //! an instance may do ([`Rule`]), as the bitset ([`EffectSet`]) each instance's summary carries
 //! with a witness per kind; the attribute effects that refuse some kinds ([`EffectDef`]:
-//! `#[blaze::pure]` here, `nopanic`, `noalloc` and `nonblocking` beside it); and the toolchain's
+//! `#[blaze::pure]` here, `nopanic`, `noalloc`, `nonblocking` and `terminates` beside it); and the toolchain's
 //! entry points a call of which counts as kinds at the call ([`MODELS`]).
 //!
 //! One walk answers every effect: checking one reads the root's summary, never walks again. A
@@ -57,10 +57,14 @@ pub enum Rule {
     ForeignUnwind,
     /// A call only an instance decides (a generic check only).
     Open,
+    /// A loop: blocks of the body that reach themselves again (`crate::loops`).
+    Loop,
+    /// The instance can call itself again, through any calls (a cycle of instances).
+    Recursion,
 }
 
 impl Rule {
-    pub const ALL: [Rule; 17] = [
+    pub const ALL: [Rule; 19] = [
         Rule::Io,
         Rule::Env,
         Rule::Clock,
@@ -78,6 +82,8 @@ impl Rule {
         Rule::ForeignUnknown,
         Rule::ForeignUnwind,
         Rule::Open,
+        Rule::Loop,
+        Rule::Recursion,
     ];
 
     /// What an instance with this kind does: "reads the environment".
@@ -100,6 +106,8 @@ impl Rule {
             Rule::ForeignUnknown => "calls a foreign function no table knows",
             Rule::ForeignUnwind => "calls a foreign function that may unwind",
             Rule::Open => "makes a call only an instance decides",
+            Rule::Loop => "has a loop",
+            Rule::Recursion => "may call itself again",
         }
     }
 
@@ -123,6 +131,8 @@ impl Rule {
             Rule::ForeignUnknown => "foreign_unknown",
             Rule::ForeignUnwind => "foreign_unwind",
             Rule::Open => "open",
+            Rule::Loop => "loop",
+            Rule::Recursion => "recursion",
         }
     }
 }
@@ -218,12 +228,13 @@ pub const PURE: EffectDef = EffectDef {
 };
 
 /// Every attribute effect, in the order each summary keeps their sets. The effects lane appends
-/// `&NOPANIC, &NOALLOC, &NONBLOCKING` (defined in `effect_attrs`).
+/// `&NOPANIC, &NOALLOC, &NONBLOCKING, &TERMINATES` (defined in `effect_attrs`).
 pub const EFFECTS: &[&EffectDef] = &[
     &PURE,
     &crate::effect_attrs::NOPANIC,
     &crate::effect_attrs::NOALLOC,
     &crate::effect_attrs::NONBLOCKING,
+    &crate::effect_attrs::TERMINATES,
 ];
 
 /// The index of `effect` in [`EFFECTS`], by name: a copy with fewer `refuses` (a profile's

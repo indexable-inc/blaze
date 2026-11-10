@@ -253,6 +253,9 @@ fn old_match_attr_flags(
                     "blaze" if &*second_segment == "nonblocking" => {
                         attr_flags.insert(AttrFlags::NONBLOCKING)
                     }
+                    "blaze" if &*second_segment == "terminates" => {
+                        attr_flags.insert(AttrFlags::TERMINATES)
+                    }
                     _ => {}
                 },
             }
@@ -367,6 +370,7 @@ fn old_match_attr_flags(
                         "nopanic" => attr_flags.insert(AttrFlags::NOPANIC),
                         "noalloc" => attr_flags.insert(AttrFlags::NOALLOC),
                         "nonblocking" => attr_flags.insert(AttrFlags::NONBLOCKING),
+                        "terminates" => attr_flags.insert(AttrFlags::TERMINATES),
                         "specialization" => attr_flags.insert(AttrFlags::BLAZE_SPECIALIZATION),
                         "specialization_trait" => {
                             attr_flags.insert(AttrFlags::BLAZE_SPECIALIZATION_TRAIT)
@@ -2223,6 +2227,7 @@ mod marked {
     #[blaze::nopanic]
     #[blaze::noalloc(trusted = "the caller's frame")]
     #[blaze::nonblocking(because)]
+    #[blaze::terminates]
     pub fn f(x: u32) -> u32 { x }
 }
 mod plain {
@@ -2256,7 +2261,8 @@ fn an_effect_attribute_changes_no_signature() {
             .unwrap_or_else(|| panic!("no fn in {module}"))
     };
     let (marked, plain) = (in_module("marked"), in_module("plain"));
-    let effects = AttrFlags::NOPANIC | AttrFlags::NOALLOC | AttrFlags::NONBLOCKING;
+    let effects =
+        AttrFlags::NOPANIC | AttrFlags::NOALLOC | AttrFlags::NONBLOCKING | AttrFlags::TERMINATES;
 
     let marked_flags = AttrFlags::query(&db, marked.into());
     assert!(marked_flags.contains(effects));
@@ -2270,7 +2276,8 @@ fn an_effect_attribute_changes_no_signature() {
         Some(PureAttr::Trusted(Symbol::intern("the caller's frame")))
     );
     assert!(matches!(said(marked, EffectWord::Nonblocking), Some(PureAttr::Malformed(_))));
-    for word in [EffectWord::Nopanic, EffectWord::Noalloc, EffectWord::Nonblocking] {
+    assert_eq!(said(marked, EffectWord::Terminates), Some(PureAttr::Checked));
+    for word in EffectWord::ALL {
         assert_eq!(said(plain, word), None);
     }
 }

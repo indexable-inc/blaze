@@ -1,4 +1,4 @@
-//! `#[blaze::nopanic]`, `#[blaze::noalloc]` and `#[blaze::nonblocking]`
+//! `#[blaze::nopanic]`, `#[blaze::noalloc]`, `#[blaze::nonblocking]` and `#[blaze::terminates]`
 //! (docs/v2/plan/design/effects.md): their [`EffectDef`]s, and the rules and tables the walk
 //! ([`crate::walk`]) asks for the kinds of a site: an `Assert` ([`assert_rule`]), a method of an
 //! allocator ([`allocator_rule`]), a foreign function ([`foreign_kinds`]), inline assembly
@@ -84,6 +84,25 @@ pub const NONBLOCKING: EffectDef = EffectDef {
     through_never: true,
 };
 
+/// `#[blaze::terminates]`: its own work ends. No loop (`crate::loops`: blocks of a body that
+/// reach themselves again; none is proven bounded yet), no recursion (an instance that can call
+/// itself again, through any calls), nothing the walk can't see, transitively. A wait is not
+/// its business: it returns whenever every wait it makes does, and `nonblocking` says there is
+/// none. A panic or an abort ends it too.
+pub const TERMINATES: EffectDef = EffectDef {
+    name: "terminates",
+    refuses: EffectSet::of(&[
+        Rule::Loop,
+        Rule::Recursion,
+        Rule::ForeignUnknown,
+        Rule::Unchecked,
+    ]),
+    attr: terminates_attr,
+    says,
+    fix: "a terminates function and everything it calls has no loop and no recursion the check can't bound: write it without one, or mark a callee whose loop or recursion is proven to end by hand `#[blaze::terminates(trusted = \"why\")]`",
+    through_never: true,
+};
+
 /// The `nopanic` a check uses for a crate built with `overflow_checks`
 /// (`hir_ty_mir::mir::overflow::crate_checks_overflow` of the crate that makes the instance):
 /// the profile being built, never one guessed.
@@ -103,6 +122,10 @@ fn nonblocking_attr(db: &Db, owner: AttrDefId) -> Option<PureAttr> {
     AttrFlags::effect_attr(db, owner, EffectWord::Nonblocking)
 }
 
+fn terminates_attr(db: &Db, owner: AttrDefId) -> Option<PureAttr> {
+    AttrFlags::effect_attr(db, owner, EffectWord::Terminates)
+}
+
 /// What a kind is said as in these effects' refusals.
 fn says(rule: Rule) -> &'static str {
     match rule {
@@ -117,6 +140,8 @@ fn says(rule: Rule) -> &'static str {
             "calls a foreign function (or runs inline assembly) blaze knows nothing of"
         }
         Rule::Unchecked => "runs code the check can't see",
+        Rule::Loop => "has a loop that is not known to end",
+        Rule::Recursion => "may call itself again, and recursion is not known to end",
         other => other.said(),
     }
 }
