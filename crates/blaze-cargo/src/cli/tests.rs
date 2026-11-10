@@ -209,6 +209,60 @@ fn usage_errors_exit_1() {
     assert_eq!(command(words(os(&["blaze", "frobnicate"]))), Exit::Failed.code());
 }
 
+/// The bug this guards (2026-11-10): lane scripts ran `blaze daemon stop`, which is no command,
+/// for hours; the refusal listed thirty commands and never said that `blaze stop` is the one.
+#[test]
+fn a_command_that_does_not_exist_names_the_one_meant_and_still_fails() {
+    let said = no_such_command("daemon stop");
+    assert!(said.starts_with("no such command: `blaze daemon stop`"), "{said}");
+    assert!(said.contains("did you mean `blaze stop`?"), "{said}");
+    assert_eq!(command(words(os(&["blaze", "daemon", "stop"]))), Exit::Failed.code());
+    for (typed, meant) in [
+        ("daemon status", "`blaze status`"),
+        ("daemon start", "`blaze serve`"),
+        ("daemon instal", "`blaze daemon install`"),
+        ("daemon", "`blaze daemon install`"),
+        ("biuld", "`blaze build`"),
+        ("chekc", "`blaze check`"),
+        ("Status", "`blaze status`"),
+        ("clippy", "`blaze check`"),
+    ] {
+        let said = no_such_command(typed);
+        assert!(said.contains(&format!("did you mean {meant}?")), "{typed}: {said}");
+    }
+    assert_eq!(command(words(os(&["blaze", "biuld"]))), Exit::Failed.code());
+}
+
+#[test]
+fn a_word_far_from_every_command_is_given_no_guess_and_the_whole_list() {
+    for typed in ["frobnicate", "daemon frobnicate", "xy"] {
+        let said = no_such_command(typed);
+        assert!(!said.contains("did you mean"), "{typed}: {said}");
+        assert!(said.contains("blaze's commands are build, check, run, test"), "{said}");
+    }
+}
+
+#[test]
+fn every_command_suggested_is_one() {
+    // `blaze daemon` alone is no command: it takes a verb.
+    for name in COMMANDS.iter().filter(|it| **it != "daemon") {
+        assert_ne!(
+            args::parse(vec![OsString::from(*name)]),
+            Ok(Asked::Unknown((*name).to_owned())),
+            "`{name}` is in COMMANDS and is no command"
+        );
+    }
+    for (typed, command, _) in ALIASES {
+        let first = command.split(' ').nth(1).unwrap();
+        assert!(COMMANDS.contains(&first), "`{typed}` points at `{command}`, which is no command");
+        let typed: Vec<OsString> = typed.split(' ').map(OsString::from).collect();
+        assert!(
+            matches!(args::parse(typed.clone()), Ok(Asked::Unknown(_))),
+            "{typed:?} is a command, so its alias is never read"
+        );
+    }
+}
+
 /// Answers every request with `responses`.
 struct FakeApi {
     responses: Vec<Response>,
