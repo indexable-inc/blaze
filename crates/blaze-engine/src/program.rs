@@ -194,12 +194,13 @@ fn pinned_elsewhere(words: &[OsString], given: bool) -> Result<Ran, String> {
     }
     let cwd = std::env::current_dir()
         .map_err(|error| pin::PinError::NoWorkingDirectory(error).to_string())?;
-    let Some(manifest) =
-        pin::root_manifest(&pin::start(&text, &cwd)).map_err(|why| why.to_string())?
-    else {
+    // One lookup, kept by the directory with the manifests' stamps: a stat of each manifest on
+    // the way and one small read once kept, no manifest read or parsed (`pin::found`).
+    let found = pin::found(&pin::start(&text, &cwd)).map_err(|why| why.to_string())?;
+    let Some(manifest) = found.manifest else {
         return run_default(words, None);
     };
-    let Some(named) = pin::pinned(&manifest).map_err(|why| why.to_string())? else {
+    let Some(named) = found.pinned else {
         return run_default(words, Some(manifest));
     };
     let shown = manifest.display();
