@@ -96,8 +96,9 @@ use serde::{Deserialize, Serialize};
 /// [`Rebuild::ends`], the terminal reasons ([`Reason`]) a recomputed step's chain ends in,
 /// [`RebuildCause::Dropped`], and [`PartChanged::kind`] and [`PartChanged::trivia`]. 46:
 /// [`Rebuilt::summary`] (what a build says of itself once it ends), and `build` and
-/// `unexplained` of [`Request::Rebuilt`].
-pub const SCHEMA: u32 = 46;
+/// `unexplained` of [`Request::Rebuilt`]. 47: [`Worked::misses`], by which a build that
+/// recomputed nothing asks for no summary.
+pub const SCHEMA: u32 = 47;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -1233,6 +1234,10 @@ pub struct Worked {
     pub links: Vec<Linked>,
     /// Queries executed.
     pub reran: u64,
+    /// The steps it computed again instead of reusing, each once: the misses `blaze why`
+    /// explains and [`Rebuilt::summary`] sums up. 0 says that summary is empty, so the
+    /// build's client asks for none ([`Request::Rebuilt`] with `build`).
+    pub misses: u64,
     /// How the files of the outputs it placed in the build dir got there.
     pub placed: PlacedBytes,
     /// Each crate of the build that is not a workspace member, sorted by cargo package name:

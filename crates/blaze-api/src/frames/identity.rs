@@ -563,6 +563,7 @@ impl Gen {
                     path: g.text(),
                 }),
                 reran: self.wide(),
+                misses: self.wide(),
                 served: self.many(depth, |g| ServedCrate {
                     why: g.maybe(Gen::text),
                     bodies: ServedPart::ALL[(g.next() % 3) as usize],

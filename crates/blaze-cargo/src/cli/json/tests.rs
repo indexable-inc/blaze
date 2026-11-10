@@ -92,6 +92,7 @@ fn work_counts_each_link_by_how() {
             link(LinkHow::Full { why: vec!["a layout changed".to_owned()] }),
         ],
         reran: 0,
+        misses: 0,
         placed: blaze_api::PlacedBytes::default(),
         served: Vec::new(),
         build_id: Some(3),

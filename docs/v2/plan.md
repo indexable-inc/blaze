@@ -159,7 +159,7 @@ is a client of it. Everything blaze says is data first (a `Report`: headline, ru
 rendered for a terminal or handed to an agent as is. Diagnostics are judged by usefulness, with
 cargo's JSON kept where tools parse it. CI is the same daemon: a webhook makes a view per pull
 request, and the check run is the build and the tests that view reaches.
-Spec: [structured-output](plan/design/structured-output.md).
+Specs: [structured-output](plan/design/structured-output.md), [ci](plan/design/ci.md).
 
 ### 10. One span stream
 

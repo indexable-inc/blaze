@@ -320,8 +320,6 @@ enum Told {
     /// The flush a reader asked for ([`ToHistory::Flush`]) committed, with its number, or
     /// failed, saying why.
     Flushed { to: RequestRef, seq: Result<u64, String> },
-    /// A client's rows written, or why they were not: what its request is answered.
-    ClientWritten { to: RequestRef, written: Result<(), String> },
 }
 
 /// A build that ended, as the history's rows: its own, each image it linked, and an edge of
@@ -355,11 +353,10 @@ enum ToHistory {
     /// to the explorer's thread that waits for it ([`explorer_flush`]).
     FlushFor(Sender<Result<u64, String>>),
     /// What the client of a build sent as it ended ([`blaze_api::Request::ClientRows`]),
-    /// written at once and `to` answered once it is ([`Told::ClientWritten`]).
-    Client {
-        to: RequestRef,
-        rows: history::ClientRows,
-    },
+    /// written at once. Its request was answered as this was sent ([`Observe::client_rows`]):
+    /// no client waits for a write, and one that fails is the history's failure, said in
+    /// `blaze status` as any flush's is.
+    Client(history::ClientRows),
 }
 
 /// How long a reader's flush ([`blaze_api::Request::Flush`]) may take, on the loop's clock,
@@ -762,13 +759,10 @@ fn keep(
                 history.build_started(row);
                 (history.flush(None), false)
             }
-            Ok(ToHistory::Client { to, rows }) => {
+            Ok(ToHistory::Client(rows)) => {
                 let build = rows.build;
                 doing.set(Step::Flushing, build);
-                let flushed = history.client_rows(&rows).and_then(|()| history.flush(Some(build)));
-                let written = flushed.as_ref().map(|_| ()).map_err(ToString::to_string);
-                _ = told.send(Told::ClientWritten { to, written });
-                (flushed, false)
+                (history.client_rows(&rows).and_then(|()| history.flush(Some(build))), false)
             }
             Ok(ToHistory::Ended(Finished {
                 ended: Ended { mut row, links, crate_deps, misses, test_runs, provenance },
@@ -1089,16 +1083,21 @@ impl Observe {
     }
 
     /// What the client of a build sent as it ended: handed to the history's thread, which
-    /// writes it and then has `to` answered ([`Told::ClientWritten`]). A daemon that keeps no
-    /// history answers at once and keeps nothing, as it drops its builds' rows ([`Observe::started`]).
+    /// writes it, and `to` answered at once, before the write. The client's exit waits for no
+    /// flush (each is an fsync, behind the build's own end row's): a reader's flush
+    /// ([`Observe::flush`]) is given to the same thread after these rows, so the manifest it
+    /// then reads has them, and a write that fails is the history's failure
+    /// ([`Observe::history_error`]), not the client's. A daemon that keeps no history answers
+    /// the same and keeps nothing, as it drops its builds' rows ([`Observe::started`]).
     pub fn client_rows(&mut self, to: RequestRef, rows: history::ClientRows, out: &mut Vec<Reply>) {
         let Some(profiling) = &self.profiling else {
             return out.push(Reply { to, response: Response::Done { ok: true } });
         };
-        if profiling.ended.send(ToHistory::Client { to, rows }).is_err() {
+        if profiling.ended.send(ToHistory::Client(rows)).is_err() {
             let what = "the profile history's thread (`blaze-history`) is gone: the client's rows can't be written";
-            fail(out, to, ApiError::new(what, Some(CLIENT_ROWS.to_owned()))); // alloc: error path
+            return fail(out, to, ApiError::new(what, Some(CLIENT_ROWS.to_owned()))); // alloc: error path
         }
+        out.push(Reply { to, response: Response::Done { ok: true } });
     }
 
     /// `blaze why`: what the last build computed again and why, in groups (each listing
@@ -1267,12 +1266,6 @@ impl Observe {
                                 ),
                             ), // alloc: error path
                         }
-                    }
-                    Ok(Told::ClientWritten { to, written: Ok(()) }) => {
-                        out.push(Reply { to, response: Response::Done { ok: true } })
-                    }
-                    Ok(Told::ClientWritten { to, written: Err(why) }) => {
-                        fail(out, to, ApiError::new(why, Some(CLIENT_ROWS.to_owned()))); // alloc: error path
                     }
                     Err(crossbeam_channel::TryRecvError::Empty) => break,
                     Err(crossbeam_channel::TryRecvError::Disconnected) => {

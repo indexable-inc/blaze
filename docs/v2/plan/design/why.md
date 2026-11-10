@@ -125,7 +125,9 @@ build; not yet the live test view, `cli/live.rs`), once `Finished` is out: the C
 (`Request::Rebuilt { build: Some(id), .. }`, `Rebuilt::summary`) and draws each report with
 the one renderer (docs/v2/plan/design/structured-output.md). Under `--message-format=json`
 each is a `{"reason":"blaze-report","report":{...}}` line. Nothing is said by a build that
-recomputed nothing, under `-q`, or when no daemon ran the build.
+recomputed nothing, under `-q`, or when no daemon ran the build. A build that recomputed
+nothing says so in its `Work` (`Worked::misses` of 0, the count of the misses the summary
+is made of), and its CLI then asks nothing: a no-op build makes no second round trip.
 
 One `Report` a root cause (the set of ends a step has), the most steps first, at most 4
 (`CAUSES`); past that one line counts the rest and names `blaze why`. Each has a fact a step
