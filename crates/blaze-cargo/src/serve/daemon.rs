@@ -1924,6 +1924,21 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             let driver = &mut self.driver;
             blaze_graph::wait::wait(woken.on(), None, || driver.poll(&mut done, until));
         }
+        self.turn_after_wait(done)
+    }
+
+    /// What a turn does once its wait ended, with the completions the wait gave: everything of
+    /// a turn but the loop's one wait (`turn_untagged`'s `Driver::poll`).
+    ///
+    /// The rule: the daemon's loop thread waits in one place, the driver's poll, and nothing
+    /// else it runs may block; work that blocks (a file read or written, a lock another thread
+    /// holds for long, a channel with a bound, a child awaited) is an effect the driver carries
+    /// out or a plane task on a worker. `#[blaze::nonblocking]` holds this function and
+    /// everything it calls to that (docs/v2/plan/design/effects.md): `blaze check` refuses a
+    /// blocking call under it, naming the chain. A call proven not to wait is marked
+    /// `#[blaze::nonblocking(trusted = "why")]` where it is defined, never allowed here.
+    #[blaze::nonblocking]
+    fn turn_after_wait(&mut self, mut done: Vec<Completion>) -> bool {
         for completion in &done {
             self.ended(completion);
         }
