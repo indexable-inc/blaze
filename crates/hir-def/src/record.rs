@@ -104,8 +104,9 @@ mod tests {
         (!repeated).then_some(pairs)
     }
 
-    /// The invariant: two record types are equal exactly when their (name, type) sets are; a
-    /// repeated name has no type; and each field is found at its place.
+    /// What the property and its controls hold a pair of field lists to: the two record types
+    /// are equal exactly when their (name, type) sets are, a repeated name has no type, and
+    /// each field is found at its place.
     fn check(a: &[Field], b: &[Field], plant: Plant) -> Result<(), String> {
         let (key_a, key_b) = (key(a, plant), key(b, plant));
         let (set_a, set_b) = (pairs(a), pairs(b));
