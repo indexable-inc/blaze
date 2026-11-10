@@ -130,6 +130,10 @@ Built on `kept-memory-1109` (design: [v2/plan/admission-by-footprint.md](v2/plan
   (`blaze_mem::tag::give_back`, with its own DST), purges, and reads again. The plane asks it of
   a purger thread. The daemon also asks when `allocator kept bytes` passes a quarter of the
   budget.
+- On Linux the footprint is the charge of the daemon's own cgroup where the kernel holds its
+  ceiling there: `memory.current` less the file cache the kernel can drop (`memory.stat`'s `file`
+  less `shmem`). Where no cgroup is delegated it is the process's resident set, and the daemon's
+  own watch is the bound (`blaze_cargo::raw::memory::own_footprint`, on `fast-mem-1110`).
 - `allocator kept bytes` is the footprint less the live heap and blaze-mem's resident committed
   memory (`blaze_graph::arena::kept_of`). mimalloc's committed count is no measure of it: a
   purge never lowers it on a release build. `allocator purged bytes` is cumulative.

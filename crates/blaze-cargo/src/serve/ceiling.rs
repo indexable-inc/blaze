@@ -6,7 +6,9 @@
 //!   ([`crate::raw::memory::hold_own_footprint`], private), where XNU lets this process set one
 //!   (root, or entitled `com.apple.private.memorystatus`).
 //! - On Linux the kernel holds it with `memory.max` (and `memory.high` at 15/16) of the daemon's
-//!   own cgroup v2, where one is delegated ([`blaze_core::cgroup::hold_own`]).
+//!   own cgroup v2, where one is delegated ([`blaze_core::cgroup::hold_own`]). The footprint is
+//!   then that cgroup's charge ([`crate::raw::memory::own_footprint`]), not the process's
+//!   resident set.
 //! - Everywhere the stop's guard (`serve::stop`) reads the footprint every [`EVERY`] and ends
 //!   the daemon with [`blaze_core::exit::Exit::MemoryCeiling`] once it passes the ceiling, after
 //!   writing what it held by tag and what each thread was inside. Where the kernel holds it to
@@ -152,7 +154,12 @@ fn kernel(bytes: u64) -> anyhow::Result<Bound> {
         format!("holding the daemon's own cgroup to its memory ceiling of {bytes} bytes")
     })?;
     Ok(match held {
-        blaze_core::cgroup::OwnHeld::Held { dir } => Bound::Cgroup { dir },
+        blaze_core::cgroup::OwnHeld::Held { dir } => {
+            // The kernel holds the ceiling on this cgroup's charge, so that charge is the
+            // footprint from here on (rule one-memory-measure).
+            crate::raw::memory::count_own_cgroup(&dir);
+            Bound::Cgroup { dir }
+        }
         blaze_core::cgroup::OwnHeld::NotDelegated(why) => Bound::Watch { why },
     })
 }

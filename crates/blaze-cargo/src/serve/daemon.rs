@@ -2230,7 +2230,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         blaze_profile::plot(Plot::FrameBytes, memory.get(blaze_mem::Tag::Frames).live);
         blaze_profile::plot(Plot::LiveBytes, memory.live());
         #[cfg(any(target_os = "macos", target_os = "linux"))]
-        if let Some(bytes) = crate::raw::memory::footprint(std::process::id()) {
+        if let Some(bytes) = crate::raw::memory::own_footprint() {
             blaze_profile::plot(Plot::Footprint, bytes);
             let kept = blaze_graph::arena::kept_of(&memory, bytes);
             blaze_profile::plot(Plot::AllocatorKeptBytes, kept);

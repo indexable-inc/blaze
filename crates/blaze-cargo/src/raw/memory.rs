@@ -34,33 +34,107 @@ fn resident(status: &str) -> Option<u64> {
 }
 
 /// Bytes of memory this process holds as the system counts it, what a limit on it is held to
-/// (`blaze_mem::tag::resident_by`): its physical footprint on macOS ([`footprint`]), its
-/// resident set on Linux from `/proc/self/statm`. Allocates nothing (the path fits std's stack
-/// buffer and the file is read into one of its own), as it is read once a run ends.
+/// (`blaze_mem::tag::resident_by`): its physical footprint on macOS ([`footprint`]). Allocates
+/// nothing, as it is read once a run ends.
 #[cfg(target_os = "macos")]
 pub fn own_footprint() -> Option<u64> {
     footprint(std::process::id())
 }
 
-/// Bytes of memory this process holds on Linux: the second field of `/proc/self/statm`, its
-/// resident pages, times the page size. Allocates nothing.
+/// The daemon's own cgroup's `memory.current` and `memory.stat`, once the kernel holds its
+/// ceiling there ([`count_own_cgroup`]).
+#[cfg(target_os = "linux")]
+static OWN_CGROUP: std::sync::OnceLock<(std::path::PathBuf, std::path::PathBuf)> =
+    std::sync::OnceLock::new();
+
+/// From here on [`own_footprint`] is the charge of the cgroup at `dir`: the daemon's own, whose
+/// `memory.max` the kernel now holds its ceiling with (`serve::ceiling`). The first call wins.
+#[cfg(target_os = "linux")]
+pub fn count_own_cgroup(dir: &std::path::Path) {
+    // alloc: once a ceiling is set, the two paths
+    _ = OWN_CGROUP.set((dir.join("memory.current"), dir.join("memory.stat")));
+}
+
+/// Bytes of memory the kernel holds this daemon to on Linux (rule `one-memory-measure`):
+///
+/// - where the daemon is in a cgroup of its own with a limit ([`count_own_cgroup`]), that
+///   cgroup's charge the kernel cannot take back on its own ([`charged`]): `memory.current`
+///   less its file cache. That is every process of the cgroup, the kernel memory charged to
+///   it and shared memory, which `memory.max` counts and a resident set leaves out;
+/// - elsewhere (no cgroup v2 delegated: the daemon's own watch is the bound) the process's
+///   resident set, the second field of `/proc/self/statm` times the page size.
+///
+/// A cgroup that cannot be read is `None`, never the resident set in its place. Allocates
+/// nothing: each path fits std's stack buffer and each file is read into a buffer here.
 #[cfg(target_os = "linux")]
 pub fn own_footprint() -> Option<u64> {
-    use std::io::Read as _;
+    match OWN_CGROUP.get() {
+        Some((current, stat)) => cgroup_charge(current, stat),
+        None => own_resident(),
+    }
+}
+
+/// This process's resident set, from `/proc/self/statm`.
+#[cfg(target_os = "linux")]
+fn own_resident() -> Option<u64> {
     let mut buf = [0u8; 256];
-    let mut file = std::fs::File::open("/proc/self/statm").ok()?;
-    let len = file.read(&mut buf).ok()?;
-    let pages = statm_resident(buf.get(..len)?)?;
+    let pages = statm_resident(read_into(std::path::Path::new("/proc/self/statm"), &mut buf)?)?;
     // SAFETY: sysconf reads a constant of the system; no memory of ours.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     pages.checked_mul(u64::try_from(page).ok()?)
 }
 
+/// [`charged`] of the cgroup whose `memory.current` and `memory.stat` these are.
+#[cfg(any(target_os = "linux", test))]
+fn cgroup_charge(current: &std::path::Path, stat: &std::path::Path) -> Option<u64> {
+    let mut buf = [0u8; 64];
+    let current = decimal(read_into(current, &mut buf)?)?;
+    // `file` and `shmem` are among `memory.stat`'s first ten lines; the whole file is under
+    // 4 KiB on Linux 7.2.
+    let mut buf = [0u8; 8192];
+    charged(current, read_into(stat, &mut buf)?)
+}
+
+/// What a cgroup is charged that the kernel cannot reclaim without stopping it: `current`
+/// (`memory.current`) less the file cache of `stat` (`memory.stat`'s `file`), which the kernel
+/// drops before `memory.max` kills, except the part of it that is shared memory and tmpfs
+/// (`shmem`), which with no swap stays. `None` when `stat` lacks either line.
+#[cfg(any(target_os = "linux", test))]
+fn charged(current: u64, stat: &[u8]) -> Option<u64> {
+    let field = |name: &[u8]| {
+        stat.split(|&it| it == b'\n')
+            .find_map(|line| decimal(line.strip_prefix(name)?.strip_prefix(b" ")?))
+    };
+    let (file, shmem) = (field(b"file")?, field(b"shmem")?);
+    Some(current.saturating_sub(file.saturating_sub(shmem)))
+}
+
+/// A decimal number with space around it, as a cgroup file and a `/proc` field hold one.
+#[cfg(any(target_os = "linux", test))]
+fn decimal(text: &[u8]) -> Option<u64> {
+    std::str::from_utf8(text).ok()?.trim().parse().ok()
+}
+
+/// The start of the file at `path`, as much as `buf` holds, without allocating.
+#[cfg(any(target_os = "linux", test))]
+fn read_into<'a>(path: &std::path::Path, buf: &'a mut [u8]) -> Option<&'a [u8]> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut len = 0;
+    // Bounded by the buffer: each turn reads at least a byte or ends.
+    while len < buf.len() {
+        match file.read(&mut buf[len..]).ok()? {
+            0 => break,
+            read => len += read,
+        }
+    }
+    buf.get(..len)
+}
+
 /// The resident pages of a `/proc/<pid>/statm`: its second field.
 #[cfg(any(target_os = "linux", test))]
 fn statm_resident(statm: &[u8]) -> Option<u64> {
-    let field = statm.split(|&it| it == b' ').nth(1)?;
-    std::str::from_utf8(field).ok()?.trim().parse().ok()
+    decimal(statm.split(|&it| it == b' ').nth(1)?)
 }
 
 /// No reading of the process's footprint here.
@@ -430,6 +504,34 @@ mod tests {
     fn statm_says_its_resident_pages_second() {
         assert_eq!(super::statm_resident(b"52345 1234 567 89 0 4321 0\n"), Some(1234));
         assert_eq!(super::statm_resident(b"52345"), None);
+    }
+
+    /// The invariant: the cgroup's footprint is its charge less the file cache the kernel can
+    /// drop, and nothing else is taken off. The directed case: a cgroup of 10 GiB of which 6 are
+    /// file cache, 1 of that shared memory, is 5 GiB (the control: counting all of `file` as
+    /// droppable says 4, counting none says 10). A line that only begins with a field's name
+    /// (`file_mapped`, `shmem_thp`) is not the field.
+    #[test]
+    fn a_cgroups_footprint_is_its_charge_less_the_file_cache_the_kernel_can_drop() {
+        const GIB: u64 = 1 << 30;
+        let stat = format!(
+            "anon {}\nfile_mapped 7\nfile {}\nkernel 123\nshmem_thp 9\nshmem {}\nfile_dirty 0\n",
+            4 * GIB,
+            6 * GIB,
+            GIB
+        );
+        assert_eq!(super::charged(10 * GIB, stat.as_bytes()), Some(5 * GIB));
+        assert_eq!(super::charged(GIB, stat.as_bytes()), Some(0), "never below nothing");
+        assert_eq!(super::charged(10 * GIB, b"anon 5\nfile 3\n"), None, "no shmem line");
+        assert_eq!(super::charged(10 * GIB, b"anon 5\nshmem 3\n"), None, "no file line");
+    }
+
+    /// A cgroup whose files cannot be read has no footprint: never another measure in its
+    /// place.
+    #[test]
+    fn a_cgroup_that_cannot_be_read_has_no_footprint() {
+        let none = std::path::Path::new("/nonexistent-blaze-cgroup/memory.current");
+        assert_eq!(super::cgroup_charge(none, none), None);
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

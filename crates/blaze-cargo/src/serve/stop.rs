@@ -353,8 +353,9 @@ struct Memory {
 impl Memory {
     /// One look. Allocates nothing and takes no lock on a look that finds the footprint under
     /// the ceiling and no nearer or further than before (an atomic's load and one read of the
-    /// kernel's: `proc_pid_rusage` on macOS, `/proc/self/statm` into a buffer of the stack on
-    /// Linux); a line is said only at a crossing.
+    /// kernel's: `proc_pid_rusage` on macOS; on Linux the daemon's cgroup's `memory.current`
+    /// and `memory.stat`, or `/proc/self/statm` where it has none, into buffers of the stack);
+    /// a line is said only at a crossing.
     fn look(&mut self, pid: u32) {
         let ceiling = super::ceiling::ceiling();
         if ceiling == 0 {
