@@ -168,7 +168,7 @@ export const INKS: readonly string[] = [...TONES, 'faint', ...Array.from({ lengt
 export const isInk = (v: unknown): v is string => typeof v === 'string' && INKS.includes(v);
 /** The inks as an error lists them. */
 const INKS_SAID = `${TONES.join(', ')}, faint, series1..series8, none (series1.. for categorical data)`;
-export const CHART_KINDS = ['bar', 'line', 'pie', 'donut', 'area', 'scatter', 'stacked'] as const;
+export const CHART_KINDS = ['bar', 'line', 'pie', 'donut', 'segments', 'area', 'scatter', 'stacked'] as const;
 /** The most series a Chart draws, and the most points in one. */
 export const MAX_SERIES = 8;
 export const MAX_POINTS = 2000;
@@ -1088,7 +1088,7 @@ export function chartError(name: string, value: unknown, props: Record<string, u
     if (!Array.isArray(value)) return fail(`data is ${said(value)}, not a list`);
     if (value.length > MAX_POINTS) return fail(`data has ${value.length} points; a Chart draws at most ${MAX_POINTS} per series (sum or sample them first)`);
     const slice = (p: unknown) => typeof p === 'object' && p !== null && !Array.isArray(p) && typeof (p as { label?: unknown }).label === 'string' && numeric((p as { value?: unknown }).value);
-    if (kind === 'pie' || kind === 'donut') {
+    if (kind === 'pie' || kind === 'donut' || kind === 'segments') {
       if (value.every(slice)) return undefined;
       if (value.every(numeric)) {
         const labels = props.labels;
