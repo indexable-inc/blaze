@@ -909,6 +909,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-ext"
+version = "0.1.0"
+dependencies = [
+ "base-db",
+ "blaze-api",
+ "blaze-mem",
+ "hir-def",
+ "hir-ty-mir",
+]
+
+[[package]]
 name = "blaze-fetch"
 version = "0.0.0"
 dependencies = [
