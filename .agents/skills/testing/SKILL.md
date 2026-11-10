@@ -17,9 +17,13 @@ hold. Pin a load-bearing one with a test named for the property.
 
 Anything blaze persists (the daemon image, the store, the plane's history; what a persisted value
 is, is `outputs-are-records`) has a test that restores it and checks the result equals a fresh build
-byte for byte, and a budget for restart to first answer. A restore that silently starts empty is a
-failure the daemon reports, naming why. A format that is written while blaze runs and read after a
-crash also gets a DST (`dst-not-review`) that crashes it at every point and checks the restore.
+byte for byte, and a budget for restart to first answer. A file that another version of blaze can
+find (in the state directory, in a home, in `/tmp`) also has a test that a file of its previous
+layout is handled: refused by name with what to do, or read, or left alone under a name that carries
+its layout; docs/cargo.md, "Files that outlive a version", lists each with its test. A restore that
+silently starts empty is a failure the daemon reports, naming why. A format that is written while
+blaze runs and read after a crash also gets a DST (`dst-not-review`) that crashes it at every point
+and checks the restore.
 
 ## dst-not-review (rule 43)
 
