@@ -15,6 +15,7 @@ cef = { version = "=156.3.0", default-features = false, features = ["sandbox"] }
 harness-proto = { path = "../harness-proto" }
 harness-mach = { path = "../harness-mach" }
 objc2 = "0.6"
+block2 = "0.6"
 objc2-foundation = "0.3"
 objc2-metal = { version = "0.3", features = ["objc2-io-surface"] }
 objc2-io-surface = "0.3"

@@ -1,7 +1,7 @@
 // `browser.*`: the harness browser (embedded Chromium the daemon runs, crates/harness/harness-browser) as a cell uses it
 // directly. googleSearch, gmail and withHiddenPage drive it too; these are for a page the person should see, and for
 // what the browser holds.
-import { host, newPage, withHiddenPage, type Extension, type Fix, type Page, type ViewInfo } from "../cdp.ts";
+import { host, newPage, withHiddenPage, type Extension, type Fix, type Page, type Place, type ViewInfo } from "../cdp.ts";
 import { pmap } from "../pmap.ts";
 import { table, type Table } from "../table.ts";
 import { effect } from "../effects.ts";
@@ -63,6 +63,31 @@ function read(urls: string | string[], opts: { maxChars?: number; timeoutMs?: nu
 }
 
 export const browser = { open, read, views, extensions, manage };
+
+/** A place Apple Maps found, and how far it is from where the search was centred. */
+export type Near = Place & { distance_m: number; maps: string };
+
+/** Metres between two points on the Earth (haversine). */
+function metres(a: { latitude: number; longitude: number }, b: { latitude: number; longitude: number }): number {
+  const rad = (d: number) => (d * Math.PI) / 180;
+  const h = Math.sin(rad(b.latitude - a.latitude) / 2) ** 2 + Math.cos(rad(a.latitude)) * Math.cos(rad(b.latitude)) * Math.sin(rad(b.longitude - a.longitude) / 2) ** 2;
+  return 2 * 6_371_000 * Math.asin(Math.sqrt(h));
+}
+
+/** The places Apple Maps finds for `query` (what a person would type into Maps) near a point: where the Mac is
+ *  (location()) unless `near` says, within `radius_m`, nearest first. One call, under a second: names, addresses,
+ *  phones, their own pages, coordinates (a Map's markers as they are). */
+export function places(query: string, opts: { near?: { latitude: number; longitude: number } | [number, number]; radius_m?: number; limit?: number } = {}): Promise<Table<Near>> {
+  return effect("net", `Finding ${query} nearby`, `Found ${query} nearby`, "Apple Maps", async () => {
+    const h = await host();
+    const n = opts.near;
+    const at = Array.isArray(n) ? { latitude: n[0], longitude: n[1] } : n ?? await h.location();
+    const found = await h.places(query, at, opts.radius_m ?? 5_000, opts.limit ?? 20);
+    return table(found
+      .map((p): Near => ({ ...p, distance_m: Math.round(metres(at, p)), maps: `https://maps.apple.com/?q=${encodeURIComponent(p.name)}&ll=${p.latitude},${p.longitude}` }))
+      .sort((a, b) => a.distance_m - b.distance_m));
+  }, (t) => ({ detail: `${t.length} place${t.length === 1 ? "" : "s"}` }));
+}
 
 /** Where the Mac is now: macOS's Core Location, asked by the harness browser's host (the one signed app harness has, so
  *  the one macOS can ask the person about; the first call makes it ask). Nothing else is tried: with Location Services

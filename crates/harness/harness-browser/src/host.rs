@@ -531,6 +531,7 @@ fn kernel_msg(conn: u64, msg: KernelUp) {
             });
         }
         KernelUp::Location { req } => crate::location::request(conn, req),
+        KernelUp::Places { req, query, latitude, longitude, radius_m, limit } => crate::places::request(conn, req, &query, latitude, longitude, radius_m, limit),
         KernelUp::Manage { req, url } => {
             let r = manage::open(url.as_deref());
             with("manage", |h| match r {

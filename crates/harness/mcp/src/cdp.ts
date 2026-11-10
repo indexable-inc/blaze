@@ -36,6 +36,8 @@ export type ViewInfo = {
 /** Where the Mac is, as macOS's Core Location said it (browser.rs `KernelDown::Location`): degrees, metres (the radius
  *  it is sure of; altitude when it has one), and when it was measured (Unix ms). */
 export type Fix = { latitude: number; longitude: number; accuracy_m: number; altitude_m?: number; at_ms: number };
+/** One place Apple Maps found (browser.rs `Place`): empty strings where Maps has nothing. */
+export type Place = { name: string; latitude: number; longitude: number; address: string; phone: string; url: string; category: string };
 export type Extension = { id: string; name: string; version: string; enabled: boolean; popup?: string; source: string; path: string };
 
 /** A socket client's message (browser.rs `KernelUp`). */
@@ -48,6 +50,7 @@ type KernelUp =
   | { t: "views"; req: number }
   | { t: "extensions"; req: number }
   | { t: "location"; req: number }
+  | { t: "places"; req: number; query: string; latitude: number; longitude: number; radius_m: number; limit: number }
   | { t: "manage"; req: number; url?: string };
 /** The host's message (browser.rs `KernelDown`). */
 type KernelDown =
@@ -58,6 +61,7 @@ type KernelDown =
   | { t: "views"; req: number; views: ViewInfo[] }
   | { t: "extensions"; req: number; extensions: Extension[] }
   | ({ t: "location"; req: number } & Fix)
+  | { t: "places"; req: number; places: Place[] }
   | { t: "done"; req: number }
   | { t: "error"; req?: number | null; error: string };
 
@@ -303,6 +307,13 @@ export class Host {
     return { latitude: m.latitude, longitude: m.longitude, accuracy_m: m.accuracy_m, altitude_m: m.altitude_m, at_ms: m.at_ms };
   }
 
+  /** What Apple Maps finds for `query` within `radius_m` metres of a point, as Maps ranks it (the host asks MapKit). */
+  async places(query: string, at: { latitude: number; longitude: number }, radius_m: number, limit: number): Promise<Place[]> {
+    const m = await this.#ask(`asking Apple Maps for ${query}`, (req) => ({ t: "places", req, query, latitude: at.latitude, longitude: at.longitude, radius_m, limit }));
+    if (m.t !== "places") throw new Error(`${WHAT}: asking Apple Maps for ${query} was answered with a \`${m.t}\` message`);
+    return m.places;
+  }
+
   /** Open the manage window (a Chrome-style window of the host's own) at `url`, chrome://extensions when none. */
   async manage(url?: string): Promise<void> {
     await this.#ask(`opening the manage window${url ? ` at ${url}` : ""}`, (req) => ({ t: "manage", req, url }));
@@ -376,9 +387,22 @@ export class Page {
   }
 
   async #goto(url: string, timeoutMs: number) {
+    // Both waits are settled here and nowhere else: a wait left to reject on its own timer is an unhandled rejection,
+    // which ends the kernel (and with it the agent's REPL and everything it held).
     const loaded = this.waitFor("Page.loadEventFired", timeoutMs);
-    const r = await this.send<{ errorText?: string }>("Page.navigate", { url });
-    if (r.errorText) { loaded.catch(() => {}); throw new Error(`navigate ${url} (${this.#where()}): ${r.errorText}`); }
+    loaded.catch(() => {});
+    const went = this.send<{ errorText?: string }>("Page.navigate", { url });
+    went.catch(() => {});
+    let r: { errorText?: string };
+    try {
+      // A host that never answers holds Page.navigate for Chromium's own connect timeout (over a minute): the page's
+      // bound is `timeoutMs`, for the whole of getting there.
+      r = await bounded(went, timeoutMs, `navigate ${url} (${this.#where()})`);
+    } catch (e) {
+      await this.send("Page.stopLoading").catch(() => {});
+      throw e;
+    }
+    if (r.errorText) throw new Error(`navigate ${url} (${this.#where()}): ${r.errorText}`);
     await loaded;
     await this.refresh();
   }
@@ -469,7 +493,9 @@ export async function newPage(opts: { url?: string; keep?: boolean; size?: [numb
   try {
     await Promise.all([page.send("Page.enable"), asChrome(page)]);
     if (opts.url) {
-      const r = await page.send<{ errorText?: string }>("Page.navigate", { url: opts.url });
+      const went = page.send<{ errorText?: string }>("Page.navigate", { url: opts.url });
+      went.catch(() => {});
+      const r = await bounded(went, 20_000, `navigate ${opts.url} (view ${page.view})`);
       if (r.errorText) throw new Error(`navigate ${opts.url} (view ${page.view}): ${r.errorText}`);
       await waitLoaded(page, opts.url, 20_000);
     }
