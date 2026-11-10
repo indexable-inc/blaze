@@ -137,6 +137,9 @@ impl DefMap {
                         // `#![blaze::arbitrary_ints]`, from `DefMap::arbitrary_ints`
                         // (docs/v2/plan/design/arbitrary-ints.md).
                         | "arbitrary_ints"
+                        // `#![blaze::records]`, read off the crate root's tokens by
+                        // `base_db::crate_extensions` (docs/v2/plan/design/records.md).
+                        | "records"
                         // `#[blaze::reflect]`, from `AttrFlags::BLAZE_REFLECT`
                         // (`hir_ty_comptime::struct_domain`, docs/v2/plan/design/comptime.md).
                         | "reflect"

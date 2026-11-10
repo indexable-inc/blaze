@@ -43,7 +43,7 @@ mod tests;
 
 pub(crate) use token_set::TokenSet;
 
-pub use edition::Edition;
+pub use edition::{Edition, Extensions};
 
 pub use crate::{
     input::{FRAGMENT, Input, JOINT, Tokens, word},

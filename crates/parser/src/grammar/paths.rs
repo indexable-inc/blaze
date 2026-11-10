@@ -193,7 +193,8 @@ pub(crate) fn opt_path_type_args(p: &mut Parser<'_>) {
             || "expected type".into(),
             types::TYPE_FIRST,
             |p| {
-                let progress = types::TYPE_FIRST.contains(p.current());
+                let progress =
+                    types::TYPE_FIRST.contains(p.current()) || types::at_record_type(p);
                 generic_args::type_arg(p);
                 progress
             },
