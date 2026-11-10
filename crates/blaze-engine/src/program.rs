@@ -15,6 +15,8 @@ use crate::{as_rustc, pin, update, versions};
 
 /// The program `blaze`, whose `src/main.rs` and `src/bin/blaze.rs` are only this.
 pub fn main() -> ExitCode {
+    // The client's time is counted from here (`client_rows`), not from blaze's cargo's start.
+    blaze_cargo::cli::began();
     // C's and C++'s allocations (LLVM's) are blaze's allocator's, counted to the running task's
     // tag as Rust's are (`malloc.rs`); a process where they are not stops here, saying why.
     #[cfg(feature = "native")]
@@ -70,10 +72,23 @@ pub fn main() -> ExitCode {
     let (args, ignore_pin) = pin::take_ignore_pin(std::env::args_os());
     let words = blaze_cargo::cli::words(args.iter().cloned());
     let asks_version = matches!(words.as_slice(), [it] if it == "--version" || it == "-V");
-    match pinned_elsewhere(&words, ignore_pin) {
+    // Recorded from here: what runs before blaze's cargo is the client's time too
+    // (slow-is-p0-traced). The sandbox launcher and blaze as rustc are past.
+    blaze_cargo::cli::record();
+    let pinning =
+        tracing::info_span!(target: "blaze", "launcher: find the blaze the workspace pins")
+            .entered();
+    let pinned = pinned_elsewhere(&words, ignore_pin);
+    drop(pinning);
+    match pinned {
         Ok(Ran::Ended(ended)) => return ended,
         Ok(Ran::Here { pin: pinned, manifest }) => {
             if says_updates(&words) {
+                let _span = tracing::info_span!(
+                    target: "blaze",
+                    "launcher: read what is known of blaze's updates"
+                )
+                .entered();
                 update::say(pin::OURS, pinned.as_policy(), manifest.as_deref());
             }
         }
@@ -375,6 +390,9 @@ fn failed(why: &str) -> ExitCode {
 
 /// Becomes `command`, where a process can, else runs it and ends as it ended.
 fn ended(command: &mut std::process::Command, program: &Path) -> ExitCode {
+    // The blaze this one becomes counts this one's time in its own (`client_rows::LAUNCHED`).
+    command
+        .env(blaze_cargo::cli::client_rows::LAUNCHED, blaze_cargo::cli::client_rows::launched());
     #[cfg(unix)]
     let error = std::os::unix::process::CommandExt::exec(command);
     #[cfg(not(unix))]

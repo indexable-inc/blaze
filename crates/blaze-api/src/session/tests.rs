@@ -849,6 +849,7 @@ fn a_duplicate_id_is_refused_without_touching_the_first() {
 fn worked() -> Response {
     Response::Work(crate::Worked {
         reran: 3,
+        misses: 0,
         green: 9,
         served: Vec::new(),
         build_id: Some(3),
