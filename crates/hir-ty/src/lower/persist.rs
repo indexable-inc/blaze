@@ -37,7 +37,7 @@ use crate::{
         diagnostics::{
             AssocTypeFailure, AssocTypeQself, CycleQuery, ElidedLifetimeSite,
             GenericArgsProhibitedReason, IncorrectGenericsLenKind, MissingLifetimeKind,
-            PathGenericsSource, PathLoweringDiagnostic, PatternTypeUnsupported,
+            PathGenericsSource, PathLoweringDiagnostic, PatternTypeUnsupported, RecordRefusal,
         },
     },
     next_solver::{
@@ -914,6 +914,17 @@ pub(crate) fn put_diagnostic(w: &mut Vec<u32>, diagnostic: &TyLoweringDiagnostic
                 PatternTypeUnsupported::Pattern => 0,
             });
         }
+        TyLoweringDiagnostic::RecordRefused { source, reason } => {
+            w.push(42);
+            put_local(w, *source);
+            let (tag, field) = match reason {
+                RecordRefusal::NotEnabled => (0, 0),
+                RecordRefusal::NoLangItem => (1, 0),
+                RecordRefusal::DuplicateField(at) => (2, *at),
+                RecordRefusal::DefaultOutsideParameter(at) => (3, *at),
+            };
+            w.extend([tag, field]);
+        }
         TyLoweringDiagnostic::QueryCycle { def, query } => {
             w.push(10);
             put_generic_def(w, *def);
@@ -1233,6 +1244,16 @@ impl Words<'_> {
                     _ => return Err(self.invalid("a pattern type not lowered for no reason")),
                 },
             },
+            42 => TyLoweringDiagnostic::RecordRefused {
+                source: self.local()?,
+                reason: match (self.u32()?, self.u32()?) {
+                    (0, 0) => RecordRefusal::NotEnabled,
+                    (1, 0) => RecordRefusal::NoLangItem,
+                    (2, at) => RecordRefusal::DuplicateField(at),
+                    (3, at) => RecordRefusal::DefaultOutsideParameter(at),
+                    _ => return Err(self.invalid("a record refused for no reason")),
+                },
+            },
             10 => TyLoweringDiagnostic::QueryCycle {
                 def: self.generic_def()?,
                 query: match self.u32()? {
@@ -1495,6 +1516,16 @@ mod tests {
             TyLoweringDiagnostic::PatternTypeNotLowered {
                 source,
                 reason: PatternTypeUnsupported::Pattern,
+            },
+            TyLoweringDiagnostic::RecordRefused { source, reason: RecordRefusal::NotEnabled },
+            TyLoweringDiagnostic::RecordRefused { source, reason: RecordRefusal::NoLangItem },
+            TyLoweringDiagnostic::RecordRefused {
+                source,
+                reason: RecordRefusal::DuplicateField(3),
+            },
+            TyLoweringDiagnostic::RecordRefused {
+                source,
+                reason: RecordRefusal::DefaultOutsideParameter(1),
             },
             TyLoweringDiagnostic::QueryCycle { def, query: CycleQuery::Predicates },
             TyLoweringDiagnostic::QueryCycle { def: trait_def, query: CycleQuery::SuperClauses },

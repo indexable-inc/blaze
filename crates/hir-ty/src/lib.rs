@@ -53,6 +53,7 @@ pub mod method_resolution;
 pub mod mir;
 pub mod primitive;
 pub mod providers;
+pub mod record;
 pub mod solver_errors;
 pub mod traits;
 pub mod used_imports;

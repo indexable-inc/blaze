@@ -79,7 +79,8 @@ pub use hir_expand::BuiltinChild;
 pub use hir_ty::solver_errors::{TypeAnnotationNeeded, UnreportedSolverError};
 pub use hir_ty::{
     AssocTypeFailure, CycleQuery, GenericArgsProhibitedReason, IncorrectGenericsLenKind,
-    MissingLifetimeKind, PatternTypeUnsupported, ReturnKind, StructPathDef, StructPathFound,
+    MissingLifetimeKind, PatternTypeUnsupported, RecordRefusal, ReturnKind, StructPathDef,
+    StructPathFound,
     const_param_ty::ConstParamTyReason,
     consteval::CreateConstError,
     diagnostics::{CaseType, IdentType, IncorrectCase},
@@ -190,6 +191,7 @@ diagnostics![AnyDiagnostic<'db> ->
     MissingSelfDefaultParams,
     ObjectWithoutTrait,
     PatternTypeNotLowered,
+    RecordRefused,
     QueryCycle,
     InactiveCode,
     IncoherentImpl,
@@ -1683,6 +1685,13 @@ impl QueryCycle {
 pub struct PatternTypeNotLowered {
     pub ty: InFile<AstPtr<ast::Type>>,
     pub reason: PatternTypeUnsupported,
+}
+
+/// The record type `ty` (`{ a: T, .. }`, `#![blaze::records]`) refused for `reason`.
+#[derive(Debug)]
+pub struct RecordRefused {
+    pub ty: InFile<AstPtr<ast::Type>>,
+    pub reason: RecordRefusal,
 }
 
 #[derive(Debug)]
@@ -5466,6 +5475,10 @@ impl<'db> AnyDiagnostic<'db> {
                     reason: *reason,
                 }
                 .into()
+            }
+            TyLoweringDiagnostic::RecordRefused { source, reason } => {
+                RecordRefused { ty: Self::type_syntax(*source, source_map)?, reason: *reason }
+                    .into()
             }
             TyLoweringDiagnostic::QueryCycle { def, query } => {
                 QueryCycle::new(db, *def, *query).into()

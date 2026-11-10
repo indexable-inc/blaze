@@ -1474,6 +1474,20 @@ impl<'db> Ty<'db> {
                     ret.hir_fmt(f)?;
                 }
             }
+            // blaze: a record (`#![blaze::records]`) prints as it is written, `{ a: A, b: B }`,
+            // its fields in canonical order.
+            TyKind::Adt(..) if crate::record::record_fields(f.lang_items(), *self).is_some() => {
+                if let Some(record) = crate::record::record_fields(f.lang_items(), *self) {
+                    write!(f, "{{")?;
+                    for (at, name) in record.names().enumerate() {
+                        write!(f, "{}{name}: ", if at == 0 { " " } else { ", " })?;
+                        if let Some(ty) = record.ty(at) {
+                            ty.hir_fmt(f)?;
+                        }
+                    }
+                    write!(f, "{}", if record.is_empty() { "}" } else { " }" })?;
+                }
+            }
             TyKind::Adt(def, parameters) => {
                 let def_id = def.def_id();
                 match f.display_kind {
