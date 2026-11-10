@@ -1,7 +1,6 @@
 import { expect, test } from "bun:test";
-import { join } from "node:path";
 import { checkProp } from "./element.ts";
-import { MAX_MARKERS, mapOf, mapPage, markersOf, pointOf } from "./map.ts";
+import { MAX_MARKERS, mapOf, mapWire, markersOf, pointOf } from "./map.ts";
 
 test("a place is {lat, lon, label?, detail?, href?}, and each problem names the place and what it should be", () => {
   expect(markersOf([{ lat: 34.1, lon: -118.1, label: "Cha Redefine", detail: "0.1 mi", href: " https://example.com/a " }])).toEqual([
@@ -30,23 +29,21 @@ test("a Map needs something to look at, and says so as the element's error", () 
   expect(mapOf({ markers: [] })).toContain("has nothing to show");
   expect(mapOf({ center: [1, 2], zoom: 25 })).toContain("zoom is 25");
   expect(mapOf({ markers: [{ lat: 1, lon: 2, label: "A" }], here: { latitude: 3, longitude: 4 } })).toEqual({
-    markers: [{ lat: 1, lon: 2, label: "A" }], here: [3, 4], title: "A",
+    markers: [{ lat: 1, lon: 2, label: "A" }], here: [3, 4],
   });
   expect(checkProp("Map", "markers", [{ lat: 95, lon: 0 }], "line 1")?.message).toContain("on <Map> is not a list of at most 200 places");
   expect(checkProp("Map", "pins", [], "line 1")?.message).toContain(`has no prop "pins"`);
 });
 
-test("the page is one document: the vendored MapLibre GL inline, the places as JSON no label can break out of, the keyless vector style", async () => {
-  const dir = join(import.meta.dir, "..", "..", "vendor", "maplibre-gl-4.7.1");
-  const lib = { js: await Bun.file(join(dir, "maplibre-gl.js")).text(), css: await Bun.file(join(dir, "maplibre-gl.css")).text() };
-  const spec = mapOf({ markers: [{ lat: 1, lon: 2, label: "</script><script>alert(1)</script>" }] });
-  if (typeof spec === "string") throw new Error(spec);
-  const page = mapPage(spec, lib);
-  expect(page).toContain("https://tiles.openfreemap.org/styles/liberty");
-  expect(page).toMatch(/fadeDuration: 0/);
-  expect(page).not.toContain("<script>alert(1)");
-  // Exactly the three scripts the page writes: the spec, MapLibre GL, its own.
-  expect(page.match(/<script[ >]/g)?.length).toBe(3);
-  expect(page.match(/<\/script>/g)?.length).toBe(3);
-  expect(page).not.toMatch(/src=["']?https?:/);
+test("the element on the wire is what the app's genui/map.rs reads: markers always, here, center and zoom only when said, points as [lat, lon]", () => {
+  const wire = (props: Record<string, unknown>) => {
+    const spec = mapOf(props);
+    if (typeof spec === "string") throw new Error(spec);
+    return mapWire(spec);
+  };
+  expect(wire({ markers: [{ lat: 1, lon: 2, label: "A", detail: "near", href: "https://example.com" }], here: { latitude: 3, longitude: 4, accuracy_m: 30 } })).toEqual({
+    markers: [{ lat: 1, lon: 2, label: "A", detail: "near", href: "https://example.com" }], here: [3, 4],
+  });
+  expect(wire({ center: { lat: 5, lon: 6 }, zoom: "12" })).toEqual({ markers: [], center: [5, 6], zoom: 12 });
+  expect(Object.keys(wire({ here: [1, 2] })).sort()).toEqual(["here", "markers"]);
 });

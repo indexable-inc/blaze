@@ -36,7 +36,7 @@ export const ELEMENT_NAMES = [
   'Video', 'Shader',
   // A page of the harness browser (embedded Chromium), live: a view an agent opened (`view={page.view}`) or a URL the app opens.
   'Browser',
-  // Places on a real map that pans and zooms (map.ts): the kernel serves its page and it is drawn as the Browser of that view.
+  // Places on a real map that pans and zooms (map.ts): Apple's map, which the app lays over the element's card.
   'Map',
 ] as const;
 export type ElementName = typeof ELEMENT_NAMES[number];
@@ -144,7 +144,7 @@ export const OWN_PROPS: Record<ElementName, readonly string[]> = {
   Shader: ['source', 'src', 'width', 'height', 'aspect', 'uniforms', 'textures', 'animate', 'id', 'sourceLine', 'children'],
   // One of the two: a view of the harness browser (cdp.ts Page.view), or an http(s) URL the app opens a view at.
   Browser: ['view', 'src'],
-  // Places as pins on OpenStreetMap, fitted to them or looking at center with zoom; `here` is where the person is (map.ts).
+  // Places as pins on Apple's map, fitted to them or looking at center with zoom; `here` is where the person is (map.ts).
   Map: ['markers', 'center', 'zoom', 'here'],
 };
 /** Props the kernel sets itself, never listed as what an element takes. */

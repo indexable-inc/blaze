@@ -1029,6 +1029,9 @@ export const gen_shape_zeta = 1
 // web_pane_max, less in a narrow window so the main card keeps web_keep beside it.
 export const gen_browser_aspect = 1.6
 export const gen_browser_load = 2
+// A Map's card (hn.GenMap; src/app/maps.rs): gen_map_aspect wide over tall (5:3), rounded by radius_gen_media, the
+// host's live map (Apple's, src/window/maps.rs) laid over it.
+export const gen_map_aspect = 1.6667
 export const web_pane_w = 520
 export const web_pane_min = 320
 export const web_pane_max = 1200

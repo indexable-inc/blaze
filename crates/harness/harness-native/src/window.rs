@@ -69,6 +69,8 @@ struct State {
     rest: Option<NSPoint>,
     /// The windows the open menus, popovers and hover cards float in (overlay.rs).
     overlays: overlay::Overlays,
+    /// Apple's maps over the frame's Map cards (maps.rs).
+    maps: maps::Maps,
     /// The window is tucked away: its turn's item floating at the screen's corner (mini.rs).
     mini: Option<mini::Mini>,
 }
@@ -116,6 +118,7 @@ fn untuck() {
     }
 }
 
+mod maps;
 mod mini;
 mod overlay;
 
@@ -1030,6 +1033,9 @@ impl HarnessView {
             drop(passes);
             let tip = st.app.tooltip();
             st.overlays.shown(&st.window, &floats, &drawn, &tip);
+            // The Map cards the frame painted, each under its live map (maps.rs).
+            let cards = st.app.take_maps();
+            st.maps.sync(&st.window, &cards, st.app.zoom());
             framelog::note(
                 entered,
                 t,
@@ -1472,6 +1478,7 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
     )));
     let menu_gen = app.keys_gen();
     let overlays = overlay::Overlays::new(view.clone(), renderer.device().clone());
+    let maps = maps::Maps::new(view.clone());
     STATE.with(|s| {
         *s.borrow_mut() = Some(State {
             app,
@@ -1491,6 +1498,7 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
             inside: false,
             rest: None,
             overlays,
+            maps,
             mini: None,
         })
     });

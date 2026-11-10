@@ -32,7 +32,10 @@ mod chat;
 mod floats;
 mod fold;
 mod keys;
+mod maps;
 pub use floats::Float;
+#[cfg(target_os = "macos")]
+pub use maps::{MapCard, Places};
 mod panes;
 mod pointer;
 mod row_menu;
@@ -330,6 +333,8 @@ pub struct App {
     screen: Option<[f32; 4]>,
     /// The windowed overlays the last frame drew, until the host takes them (src/app/floats.rs).
     floats: Vec<floats::Float>,
+    /// The map cards the last frame painted, until the host takes them (src/app/maps.rs).
+    maps: Vec<maps::MapCard>,
     /// The embedded browser: its link to the host, the pane, the views' input (app/browser.rs).
     browser: browser::Browser,
     /// A sidebar row's menu while it is open (a right press or a control-click on the row; src/app/row_menu.rs).
@@ -392,6 +397,7 @@ fn scene_world() -> Result<World, String> {
     crate::look::register(&world);
     archive::register(&world);
     browser::register(&world);
+    maps::register(&world);
     stats::register(&world);
     crate::keys::register(&world);
     view::register(&world);
@@ -623,6 +629,7 @@ impl App {
             look,
             screen: None,
             floats: Vec::new(), // alloc: empty until an overlay's window shows
+            maps: Vec::new(), // alloc: empty until a cell draws a Map
             browser: browser::Browser::new(browser_wake, web_clip, web_pane),
             row_menu: None,
         };
@@ -2336,6 +2343,8 @@ impl App {
         let dark = self.dark;
         // The windowed overlays' draws (src/app/floats.rs), by their node, in the order they first paint.
         let mut floats: Vec<(u64, Draw)> = Vec::new(); // alloc: none, or an overlay window's draw or two a frame
+        // The Map cards painted in the main window, for the host to lay its maps over (src/app/maps.rs).
+        self.maps.clear();
         for (id, mut p) in painted {
             let w = self.world.world_ref();
             let e = w.entity_from_id(id);
@@ -2350,6 +2359,14 @@ impl App {
             // Nothing is drawn that cannot be seen, a terminal's thousands of cells least of all.
             if !seen(&p) {
                 continue;
+            }
+            // A Map's card: the host covers it with its map. One in a windowed overlay keeps its empty plate (a map is a
+            // view of the main window's).
+            if p.window == 0
+                && e.has(maps::MapPlaces::id())
+                && let Some(card) = maps::card(e, &p, [laid.x, laid.y, laid.w * p.scale, laid.h * p.scale], dark)
+            {
+                self.maps.push(card);
             }
             // A terminal's cells and a Kip's picture are drawn on the main window's pixel grid and passes only.
             if p.window != 0 && (is_term || e.has(harness_native_ui_text_api::Kip::id())) {
@@ -3157,7 +3174,7 @@ mod tests {
             "hn.GenCanvas", "hn.GenShape", "hn.GenShapeBack", "hn.GenChart", "hn.GenChartPlot", "hn.GenChartTick",
             "hn.GenChartBar", "hn.GenChartGroup", "hn.GenChartStack", "hn.GenChartHit", "hn.GenChartLabel",
             "hn.GenChartLegend", "hn.GenChartKey", "hn.GenChartPie", "hn.GenChartCenter", "hn.GenTone.faint",
-            "hn.GenTone.series1", "hn.GenTone.series8", "ui.Browser", "hn.GenBrowser", "hn.WebClip", "hn.WebPane",
+            "hn.GenTone.series1", "hn.GenTone.series8", "ui.Browser", "hn.GenBrowser", "hn.GenMap", "hn.WebClip", "hn.WebPane",
             "hn.WebMenu", "hn.WebPopup", "ui.MenuItem", "ui.MenuNote", "ui.MenuSep", "hn.ChatMention", "hn.ChatMentionItem", "hn.ChatMentionHead", "hn.ChatMentionCode", "hn.ChatMentionImage", "hn.PeekList", "hn.PeekEntry", "hn.PeekMeta",
         ]
         .into_iter()
