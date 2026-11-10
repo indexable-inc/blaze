@@ -33,8 +33,7 @@ before any command runs. It says
                                                 (it runs itself in any checkout of blaze's tree, or with --ignore-pin)
 
 The version is the second field (`.github/actions/blaze` reads it). The binary does not know its
-channel: a canary is made stable unchanged. Where a manifest's version must be the release's
-(publishing to crates.io), `canary.py stamp` writes it into that job's checkout only.
+channel: a canary is made stable unchanged.
 
 A version is one release on one tag, for good: **promotion flips that same release** from
 prerelease to stable and makes it GitHub's *Latest*. No second tag is made and no asset is

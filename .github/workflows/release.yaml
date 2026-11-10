@@ -174,38 +174,6 @@ jobs:
       - if: failure()
         uses: ./.github/actions/daemon-log
 
-  # blaze's crate and the forks it depends on (`blaze-hir`, `blaze-rustc_abi`, ...) on crates.io, as
-  # its own job so it can be rerun alone: versions already published are skipped. Each crate is
-  # built first; crates.io's limit on new crates is waited out (a first release takes hours).
-  crates:
-    name: crates.io
-    needs: [notes, build]
-    # Off: it would publish 60 permanent `blaze-*` names and `blaze`, both retired (#270);
-    # whether and under which names blaze goes to crates.io is decided after the rename.
-    if: false
-    runs-on: [ix, arm64, ix-mode-cold]
-    timeout-minutes: 340
-    steps:
-      - uses: actions/checkout@v7
-      # cargo here is crates.io's client alone (`cargo package --no-verify`, `cargo publish
-      # --no-verify`); what the crates build to is checked by the stage 0's `blaze build`
-      # (publish_crates.py, `verify`).
-      - uses: ./.github/actions/blaze
-        with:
-          job: crates
-          llvm: true
-      - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal && rustup default "$tc"
-      # crates.io needs the manifests to say the release's version: written into this job's
-      # checkout only, never committed (main's stays `0.0.0`).
-      - run: |
-          python3 -I .github/scripts/canary.py stamp "{\"tag\": \"$GITHUB_REF_NAME\"}"
-      - run: python3 -I .github/scripts/publish_crates.py --publish --max-hours 5
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      # Why the daemon ended, when it did (the client does not say).
-      - if: failure()
-        uses: ./.github/actions/daemon-log
-
   # ix.dev/explore reads this release's profile schema (.github/scripts/explore_page.py): the
   # page deploys from indexable-inc/ix and refuses a daemon whose schema it does not read, so a
   # release ahead of it would show users only that refusal (0.20261105.1, schema 5, page 1).
