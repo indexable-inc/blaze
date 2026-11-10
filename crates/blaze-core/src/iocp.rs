@@ -2534,6 +2534,7 @@ fn file(root: &Path, effect: Effect, kept: &mut Kept) -> io::Result<Done> {
         },
         Effect::Write { file, bytes, .. } => {
             files::write_atomically(joined(at, root, &file), &bytes).map(|()| Done::Written)
+            // durable: carries out `Effect::Write`, whose asker said why
         }
         // Neither flushed nor written through: derived data, checked by its reader.
         Effect::WriteUnsynced { file, bytes, .. } => {

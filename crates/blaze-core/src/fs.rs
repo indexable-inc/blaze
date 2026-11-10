@@ -158,6 +158,7 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
             let open = || OpenOptions::new().write(true).create_new(true).open(&*temporary);
             let mut file = making_parent(path, open)?;
             file.write_all(bytes)?;
+            // durable: `write_atomically` is `Effect::Write` carried out: the bytes are on disk before the rename
             file.sync_all()
         })();
         if let Err(error) = written {
@@ -492,6 +493,7 @@ pub(crate) fn list(dir: &Path, name: &FileName) -> io::Result<Vec<(FileName, Met
     // Each directory still to read, by its index in `found`; `None` for `dir` itself.
     let mut todo: Vec<Option<usize>> = Vec::with_capacity(16); // alloc: once per listing.
     todo.push(None);
+        // durable: the directory's sync of `Effect::Write` and `Effect::Rename`: the new name survives a crash
     while let Some(at) = todo.pop() {
         let read = blaze_mem::scratch::with_path(|path| {
             path.push(dir);
