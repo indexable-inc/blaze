@@ -1,0 +1,27 @@
+# blaze's Lean side (docs/v2/plan/design/formal-verification.md): the library the models are
+# written against, the checked-in models the golden tests hold to the translator's output, and
+# the proofs that live beside each crate's `src/`. No dependency: core Lean only.
+name = "blaze"
+defaultTargets = ["Blaze", "BlazeModel", "BlazeGraph"]
+
+# The library (`Blaze.Result`, `Blaze.Scalar`, `Blaze.Slice`, `Blaze.Std`) and its tests.
+[[lean_lib]]
+name = "Blaze"
+globs = ["Blaze.*"]
+
+# Models as `hir-ty-lean` emits them, one module per function, byte for byte (the golden tests
+# of crates/hir-ty-lean compare them).
+[[lean_lib]]
+name = "BlazeModel"
+globs = ["BlazeModel.+"]
+
+# blaze-graph's proofs, beside its `src/`.
+[[lean_lib]]
+name = "BlazeGraph"
+srcDir = "../crates/blaze-graph/lean"
+globs = ["BlazeGraph.+"]
+
+# The compiled model of `blaze_graph::ledger::fnv1a_from`, for harness/v2/lean_differential.py.
+[[lean_exe]]
+name = "fnv1a_model"
+root = "Blaze.Tests.Fnv1aMain"
