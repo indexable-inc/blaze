@@ -20,13 +20,15 @@ use crate::explore::{Bounds, Chooser, Failure, Memo};
 use crate::fs::{CrashFs, Disk, Persist, digest};
 use crate::properties;
 
-/// What a build waits on before it answers.
+/// What is waited on before what a build left is kept for reuse across a crash: by what
+/// settles after its answer ([`Op::Settle`]), or by a snapshot before it answers
+/// ([`Op::AwaitAndAnswer`]). A build's answer itself waits on neither.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Wait {
     /// The tickets of its own puts.
     Own,
-    /// Every put any writer made before it asked: a build asked while another is storing
-    /// waits for that store too (the warm-restart lane's hold).
+    /// Every put any writer made before it asked: a value it read came with no ticket, and
+    /// may be another writer's put not yet durable.
     Everything,
 }
 
@@ -56,8 +58,15 @@ pub struct Ledger {
     pub accepted: BTreeMap<Key, (Kind, Vec<u8>)>,
     /// Each accepted put's ticket.
     pub tickets: Vec<(Ticket, Key)>,
-    /// The keys of builds that answered.
+    /// The keys of builds that answered, durable or not: an answer is no promise of them.
     pub answered: BTreeSet<Key>,
+    /// The keys an answered build kept for reuse across a crash, as its settling ended
+    /// durable ([`Op::Settle`]): what a restart may rely on.
+    pub kept: BTreeSet<Key>,
+    /// The actors whose settling ended durable, and kept.
+    pub kept_actors: BTreeSet<String>,
+    /// The actors whose settling ended with the store stopped, and said the loss.
+    pub lost: BTreeSet<String>,
     /// Puts refused as a second value.
     pub refused: Vec<Mismatch>,
     /// Each kernel actor's world and outcome, by name.
@@ -160,7 +169,7 @@ impl Ledger {
 
 /// The store's config in every model: one directory, no layers.
 pub fn config() -> Config {
-    Config { dir: FileName::new("store").expect("a name"), layers: Vec::new(), tags: 1 << 40 }
+    Config { dir: FileName::new("store").expect("a name"), layers: Vec::new(), tags: 1 << 40, load_tags: (1 << 40) + (1 << 32), loader: blaze_cas::Loader::Pumped }
 }
 
 /// Runs `effects` and what they lead to, each completing in the order asked, until none is
@@ -280,14 +289,15 @@ pub fn no_extra(_: &Store, _: &Disk, _: &Ledger, _: &Bounds) -> Result<(), Failu
 }
 
 /// The keys that must survive a crash now: those whose put the store calls durable, and
-/// those a build answered with.
+/// those an answered build kept for reuse. Not those a build merely answered with: an answer
+/// is sent on results not yet durable, and a restart works out again what a crash lost.
 pub fn must_survive(store: &Store, ledger: &Ledger) -> BTreeSet<Key> {
     ledger
         .tickets
         .iter()
         .filter(|(ticket, _)| store.durable(*ticket))
         .map(|(_, key)| *key)
-        .chain(ledger.answered.iter().copied())
+        .chain(ledger.kept.iter().copied())
         .collect()
 }
 
@@ -331,13 +341,16 @@ pub fn restore(
             format!("the restore's verify found {} corrupt: {first}", corrupt.len()),
         ));
     }
-    // What a build answered with first: the most specific loss.
+    // What an answered build kept first: the most specific loss.
     if let Some(key) =
-        ledger.answered.iter().find(|it| survive.contains(*it) && !held.contains_key(*it))
+        ledger.kept.iter().find(|it| survive.contains(*it) && !held.contains_key(*it))
     {
         return Err(Failure::new(
-            properties::ANSWERED_SURVIVES,
-            format!("{} was lost: a build answered with it before the crash", short(key)),
+            properties::KEPT_SURVIVES,
+            format!(
+                "{} was lost: an answered build kept it for reuse before the crash, and it was not durable",
+                short(key)
+            ),
         ));
     }
     if held.is_empty() && !survive.is_empty() {
@@ -352,7 +365,7 @@ pub fn restore(
     for key in survive {
         if !held.contains_key(key) {
             return Err(Failure::new(
-                properties::ANSWERED_SURVIVES,
+                properties::KEPT_SURVIVES,
                 format!(
                     "{} was lost: the store called its put durable before the crash",
                     short(key)
@@ -604,6 +617,20 @@ impl<'a> Run<'a> {
                 other => unreachable!("an actor whose next step is {other:?} has a step to take"),
             }
         }
+        // Every answer's settling ended one way or the other: kept, or said lost.
+        let ledger = self.ledger.lock();
+        if let Some(name) = ledger
+            .answered_actors
+            .iter()
+            .find(|it| !ledger.kept_actors.contains(*it) && !ledger.lost.contains(*it))
+        {
+            return Err(Failure::new(
+                properties::LOSS_IS_SAID,
+                format!(
+                    "{name} answered, and what it left was neither kept once durable nor said lost: it was dropped silently"
+                ),
+            ));
+        }
         Ok(())
     }
 
@@ -644,14 +671,24 @@ pub enum Op {
         value: u8,
     },
     Flush,
-    /// Waits for what the model's [`Wait`] says, then answers.
+    /// Answers at once, durable or not: a build's answer waits for no store.
+    Answer,
+    /// What the build left settles after its answer: waits for what the model's [`Wait`]
+    /// says, then keeps it for reuse across a crash; or, the store stopped, says the loss.
+    Settle,
+    /// Waits for what the model's [`Wait`] says, then answers and keeps: a snapshot, which
+    /// is asked for durability.
     AwaitAndAnswer,
     /// Reads key `key`.
     Get {
         key: u8,
     },
-    /// Answers at once, durable or not: a bug the model must find (its own test).
-    AnswerUnwaited,
+    /// Keeps what it put for reuse across a crash at once, durable or not: a bug the model
+    /// must find (its own test).
+    KeepUnwaited,
+    /// [`Op::Settle`] that says nothing when the store stopped: a bug the model must find
+    /// (its own test).
+    SettleSilently,
 }
 
 /// A store actor: its name and script.
@@ -726,10 +763,28 @@ fn writes(
                 };
                 match turn.await_durable(tickets) {
                     Resume::Broken => return,
-                    Resume::Go | Resume::Durable => turn.answer(kept.clone()),
+                    Resume::Go | Resume::Durable => {
+                        keep(ledger, name, &kept);
+                        turn.answer(kept.clone());
+                    }
                 }
             }
-            Op::AnswerUnwaited => turn.answer(kept.clone()),
+            Op::Answer => turn.answer(kept.clone()),
+            Op::Settle | Op::SettleSilently => {
+                let tickets = match wait {
+                    Wait::Own => mine.clone(),
+                    Wait::Everything => ledger.lock().all_tickets(),
+                };
+                match turn.await_durable(tickets) {
+                    Resume::Broken if *op == Op::SettleSilently => return,
+                    Resume::Broken => {
+                        ledger.lock().lost.insert(name.to_owned());
+                        return;
+                    }
+                    Resume::Go | Resume::Durable => keep(ledger, name, &kept),
+                }
+            }
+            Op::KeepUnwaited => keep(ledger, name, &kept),
             Op::Get { key: k } => {
                 turn.pause(format!("get k{k}"));
                 let failure = match reader.get(&guard, &key(k)) {
@@ -746,6 +801,13 @@ fn writes(
             }
         }
     }
+}
+
+/// `who` keeps `keys` for reuse across a crash: what a restart may rely on from here.
+pub fn keep(ledger: &Lock<Ledger>, who: &str, keys: &[Key]) {
+    let mut ledger = ledger.lock();
+    ledger.kept.extend(keys.iter().copied());
+    ledger.kept_actors.insert(who.to_owned());
 }
 
 /// A disk changed after the process stopped, as no crash makes it: the store must stop and

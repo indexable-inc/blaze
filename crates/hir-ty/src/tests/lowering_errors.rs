@@ -1,5 +1,5 @@
 //! A type that does not lower is an error naming why, as rustc's, never an error type with no
-//! diagnostic (queue 01168): E0562, E0225, E0719, E0393, E0220 and E0223 of field types.
+//! diagnostic: E0562, E0225, E0719, E0393, E0220 and E0223 of field types.
 
 use hir_def::{AdtId, ModuleDefId, VariantId, nameres::crate_def_map, signatures::StructSignature};
 use hir_expand::fixture;

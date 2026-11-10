@@ -47,6 +47,16 @@ pub fn read(at: &str, probe: bool) -> Result<LocalRead, ApiError> {
     }
 }
 
+/// Whether nothing is at `at` now, as [`read_at`] finds a path absent: what vouches for a
+/// local mount read as absent ([`crate::serve::mounts::Mounts::stale_locals`]), which no
+/// watch can (a watch of a directory above it would hear every file below).
+pub fn absent(at: &str) -> bool {
+    matches!(
+        std::fs::metadata(at),
+        Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory)
+    )
+}
+
 /// The path `at` read exactly where it is: a directory whole, a file alone, or absent. What a
 /// local mount is read again as.
 pub fn read_at(at: &str) -> Result<LocalRead, ApiError> {
@@ -79,7 +89,10 @@ pub fn read_at(at: &str) -> Result<LocalRead, ApiError> {
                     files.len()
                 )));
             }
-            Ok(LocalRead { at: at.to_owned(), source: Source { files, under: String::new() }, watched: Some(watched), generation })
+            // The watch is of the resolved directory, and hears nothing of a link above `at`
+            // pointed elsewhere: a directory named through one is read again by every job.
+            let watched = (canonical == path).then_some(watched);
+            Ok(LocalRead { at: at.to_owned(), source: Source { files, under: String::new() }, watched, generation })
         }
         Some(meta) => {
             let generation = blaze_vfs::outside::generation();

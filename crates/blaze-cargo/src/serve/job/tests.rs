@@ -90,6 +90,15 @@ fn job(views: Vec<Opened>) -> Job<Real> {
         opened_ns: 0,
         opened_unix_ns: None,
         leases: Arc::new(blaze_core::lock::Lock::new("serve.job.leases", Leases::default())),
+        paused: blaze_graph::pressure::Paused::default(),
+        began: std::time::Duration::ZERO,
+        doing_said: None,
+        missed: 0,
+        held_wait: None,
+        look_wait: None,
+        placed_any: false,
+        walks: None,
+        lost: None,
     }
 }
 
@@ -123,6 +132,7 @@ fn work_is_placed_whole_when_any_link_was() {
     assert_eq!(link_kind(&[link(Linking::Spliced), link(Linking::First)]), LinkKind::Placed);
     assert_eq!(link_kind(&[link(Linking::Unchanged), link(Linking::Spliced)]), LinkKind::Patched);
     assert_eq!(link_kind(&[link(Linking::Full(Full::NotIncremental))]), LinkKind::Placed);
+    assert_eq!(link_kind(&[link(Linking::Full(Full::NoThunk))]), LinkKind::Placed);
 
     use blaze_api::LinkHow;
     assert_eq!(Linking::Spliced.how(), LinkHow::Spliced);
@@ -131,6 +141,10 @@ fn work_is_placed_whole_when_any_link_was() {
     assert_eq!(
         Linking::Full(Full::NotIncremental).how(),
         LinkHow::Full { why: vec!["not incremental".to_owned()] }
+    );
+    assert_eq!(
+        Linking::Full(Full::NoThunk).how(),
+        LinkHow::Full { why: vec!["no thunk in reach".to_owned()] }
     );
 }
 
@@ -231,14 +245,6 @@ fn a_build_ahead_compiles_tests_and_an_edit_only_checks() {
     assert_eq!((command_of(&edit), goal_of(&edit)), (Command::Check, Goal::Check));
     assert!(targets_of(&edit).is_none());
     assert!(reuses_plans(&edit) && reuses_plans(&ahead));
-}
-
-#[test]
-fn a_pack_checks_the_targets_it_names() {
-    let pack = Work::Pack { targets: targets(), program: "app".into() };
-    assert_eq!((command_of(&pack), goal_of(&pack)), (Command::Check, Goal::Check));
-    assert_eq!(targets_of(&pack), Some(&targets()));
-    assert!(reuses_plans(&pack));
 }
 
 #[test]
@@ -607,4 +613,19 @@ fn a_diagnostic_of_no_unit_is_said_once_a_job_and_a_units_each_time() {
         said_once(&mut said, &of(None, "error: the front end fails on `std::g` ...\n")),
         "another report is said"
     );
+}
+
+/// The directories asked of are each output's first directory under its build dir, never the
+/// build dir itself (every build writes its record there); an output no such directory holds
+/// leaves the answer unkept.
+#[test]
+fn a_builds_outputs_are_vouched_for_by_the_directories_under_its_build_dirs() {
+    let dirs = |outputs: &[&'static str]| output_dirs_of(["/b", "/t"], outputs.iter().copied());
+    assert_eq!(
+        dirs(&["/b/debug/deps/liba.rlib", "/b/debug/app", "/t/x86_64/debug/app", "/b/debug/b"]),
+        Some(vec!["/b/debug".into(), "/t/x86_64".into()])
+    );
+    assert_eq!(dirs(&[]), Some(Vec::new()));
+    assert_eq!(dirs(&["/b/app"]), None, "an output right in the build dir");
+    assert_eq!(dirs(&["/elsewhere/debug/app"]), None, "an output under no build dir");
 }

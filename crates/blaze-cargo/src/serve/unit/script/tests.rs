@@ -9,7 +9,7 @@ use blaze_usercode::run::OutFile;
 
 use super::{
     BYTES, CUT, LOOK, LOOK_EVERY, QUIET_MOST, Quiet, Stuck, TICK, TIMED, Writing, file_name,
-    out_files, rechecks_in, verifies_in,
+    out_files, rechecks_in, verifies_in, with_reads,
 };
 
 const RUN: Tag = Tag(5 << 32);
@@ -274,4 +274,111 @@ fn a_look_that_fails_or_ends_otherwise_is_an_error() {
             .unwrap_err()
             .contains("Truncated")
     );
+}
+
+/// A run's miss as its start makes it: its key's own parts, and what it read not explained.
+fn run_miss() -> blaze_kernel::Miss {
+    use blaze_ids::ContentId;
+    let code = ContentId::of("blaze v2 test 1", b"script");
+    let mut miss = blaze_kernel::Miss::of_parts(
+        super::RUN,
+        ContentId::of("blaze v2 test 1", b"subject"),
+        "z-sys v0.1.0 (build script run)".to_owned(),
+        ContentId::of("blaze v2 test 1", b"key"),
+        vec![blaze_kernel::Part::new("the build script's code", Some(code))],
+    );
+    miss.beyond = Some("what it read when it last ran (the files and variables it traced)");
+    miss
+}
+
+/// The parts of `now` whose hash is not what the part of that name in `was` has: what `blaze
+/// why`'s ledger names as changed.
+fn differ(was: &blaze_kernel::Miss, now: &blaze_kernel::Miss) -> Vec<String> {
+    let hash_in = |miss: &blaze_kernel::Miss, name: &str| {
+        miss.parts.iter().find(|it| it.name == name).and_then(|it| it.hash)
+    };
+    let mut names: Vec<&str> =
+        was.parts.iter().chain(&now.parts).map(|it| it.name.as_str()).collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+        .into_iter()
+        .filter(|name| hash_in(was, name) != hash_in(now, name))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// `blaze why` names the read that differs between two runs of one script: the miss of a run
+/// that ended carries each read as a part, so the one file edited between the runs is the one
+/// part that changed, and the key moves with it. Without the reads (the miss as the run's
+/// start made it) both runs have one key and nothing names the file: the cause removed, the
+/// effect goes.
+#[test]
+fn a_run_that_ended_names_the_read_that_differs() {
+    let traced = |main: [u8; 32]| blaze_core::Traced {
+        files: vec![
+            ("/w/build.rs".into(), Some([1; 32])),
+            ("/w/crates/core/main.rs".into(), Some(main)),
+            ("/w/missing".into(), None),
+        ],
+        dirs: vec![("/w/pkg".into(), [3; 32])],
+        env: vec![("CARGO_CFG_TARGET_OS".into(), Some("linux".into())), ("UNSET".into(), None)],
+        untraceable: vec![blaze_core::Untraceable::Clock],
+    };
+    let was = with_reads(run_miss(), &traced([2; 32]));
+    let now = with_reads(run_miss(), &traced([9; 32]));
+    assert_ne!(was.key, now.key);
+    assert_eq!(differ(&was, &now), vec!["the file /w/crates/core/main.rs".to_owned()]);
+    assert_eq!(was.missed, blaze_kernel::Missed::New);
+    assert_eq!(was.beyond, None);
+    // The same reads are the same key: the second run is one whose result was not kept.
+    let again = with_reads(run_miss(), &traced([2; 32]));
+    assert_eq!(was, again);
+    // The order the sandbox traced them in is no part of it.
+    let mut shuffled = traced([2; 32]);
+    shuffled.files.reverse();
+    shuffled.env.reverse();
+    assert_eq!(with_reads(run_miss(), &shuffled), was);
+    // A file found and one looked for and not there are told apart.
+    let mut found = traced([2; 32]);
+    found.files[2].1 = Some([4; 32]);
+    let found = with_reads(run_miss(), &found);
+    assert_eq!(differ(&was, &found), vec!["the file /w/missing".to_owned()]);
+    // The control: with no reads, two runs can't be told apart.
+    assert_eq!(run_miss().key, run_miss().key);
+    assert!(differ(&run_miss(), &run_miss()).is_empty());
+}
+
+/// cargo's watch of a whole package is named as that, never by the name no file has, and a
+/// run past the cap folds the reads it does not name into one part that still moves the key.
+#[test]
+fn a_package_watch_is_named_and_many_reads_are_folded() {
+    let package = std::path::Path::new("/w").join(blaze_usercode::trace::PACKAGE);
+    let watched = |hash: [u8; 32]| blaze_core::Traced {
+        dirs: vec![(package.clone(), hash)],
+        untraceable: vec![blaze_core::Untraceable::Descriptor],
+        ..blaze_core::Traced::default()
+    };
+    let was = with_reads(run_miss(), &watched([1; 32]));
+    let changed = differ(&was, &with_reads(run_miss(), &watched([2; 32])));
+    assert_eq!(changed.len(), 1, "{changed:?}");
+    assert!(changed[0].starts_with("every file of the package at /w "), "{changed:?}");
+
+    let many = |last: [u8; 32]| blaze_core::Traced {
+        files: (0..super::READS_NAMED + 8)
+            .map(|at| {
+                let hash = if at == super::READS_NAMED + 7 { last } else { [1; 32] };
+                (PathBuf::from(format!("/w/include/{at:06}.h")), Some(hash))
+            })
+            .collect(),
+        ..blaze_core::Traced::default()
+    };
+    let was = with_reads(run_miss(), &many([1; 32]));
+    let now = with_reads(run_miss(), &many([2; 32]));
+    // The script's code, the reads named and the one part of the rest.
+    assert_eq!(was.parts.len(), super::READS_NAMED + 2);
+    assert_ne!(was.key, now.key);
+    let changed = differ(&was, &now);
+    assert_eq!(changed.len(), 1, "{changed:?}");
+    assert!(changed[0].starts_with("its other "), "{changed:?}");
 }

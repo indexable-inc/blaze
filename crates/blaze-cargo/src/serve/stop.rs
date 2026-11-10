@@ -353,8 +353,9 @@ struct Memory {
 impl Memory {
     /// One look. Allocates nothing and takes no lock on a look that finds the footprint under
     /// the ceiling and no nearer or further than before (an atomic's load and one read of the
-    /// kernel's: `proc_pid_rusage` on macOS, `/proc/self/statm` into a buffer of the stack on
-    /// Linux); a line is said only at a crossing.
+    /// kernel's: `proc_pid_rusage` on macOS; on Linux the daemon's cgroup's `memory.current`
+    /// and `memory.stat`, or `/proc/self/statm` where it has none, into buffers of the stack);
+    /// a line is said only at a crossing.
     fn look(&mut self, pid: u32) {
         let ceiling = super::ceiling::ceiling();
         if ceiling == 0 {
@@ -369,12 +370,30 @@ impl Memory {
             return;
         };
         self.unread = false;
+        let mut look = self.watch.look(footprint, ceiling);
+        let mut footprint = footprint;
+        if look == CeilingLook::Purge {
+            // Past the ceiling: what the allocators keep freed goes back first, and only a
+            // footprint still past it after that ends the daemon. The purge reads it once every
+            // worker gave back its heaps' free pages (or its wait passed), on this thread, the
+            // guard's, never the loop's: a reading at once still held what they kept.
+            let purged = crate::raw::memory::purge();
+            footprint = purged.after.unwrap_or(footprint);
+            look = self.watch.look(footprint, ceiling);
+            tracing::warn!(
+                target: "blaze",
+                "blaze serve: pid {pid} passed its memory ceiling of {ceiling} bytes and purged what its allocators kept freed: {footprint} bytes after, {} returned, workers' give-back {:?}",
+                purged.returned(),
+                purged.settle,
+            );
+        }
         let (at, of) = (Gib(footprint), Gib(ceiling));
-        let line = match self.watch.look(footprint, ceiling) {
+        let line = match look {
             CeilingLook::Under => return,
             CeilingLook::Near => NEAR,
             CeilingLook::Eased => EASED,
-            CeilingLook::Passed => passed(pid, footprint, ceiling),
+            // A purge gave back too little: the second look ends it.
+            CeilingLook::Purge | CeilingLook::Passed => passed(pid, footprint, ceiling),
         };
         // A crossing's line, once a crossing: written straight to stderr, which buffers nothing.
         tracing::warn!(

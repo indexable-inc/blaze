@@ -32,11 +32,59 @@ pub const PROFILE: &str = "BLAZE_PROFILE";
 /// for none heard yet: one request a client process, so the last one heard is its.
 static BUILD: AtomicU64 = AtomicU64::new(0);
 
-/// The daemon said the request is build `build`.
-pub fn heard(build: Option<u64>) {
+/// How many steps that build computed again instead of reusing ([`blaze_api::Worked::misses`]):
+/// 0 until a build is heard, and for one that recomputed nothing, whose summary is empty.
+static MISSES: AtomicU64 = AtomicU64::new(0);
+
+/// The build the daemon said this client's request is, 0 for none heard.
+pub fn build() -> u64 {
+    BUILD.load(Ordering::Relaxed)
+}
+
+/// How many steps the build heard computed again, 0 for none heard.
+pub fn misses() -> u64 {
+    MISSES.load(Ordering::Relaxed)
+}
+
+/// The daemon said the request is build `build`, which computed `misses` steps again.
+pub fn heard(build: Option<u64>, misses: u64) {
     if let Some(build) = build {
         BUILD.store(build, Ordering::Relaxed);
+        MISSES.store(misses, Ordering::Relaxed);
     }
+}
+
+/// The variable a launcher sets as it becomes another blaze (the release a workspace pins, or
+/// the default; `blaze_engine`'s `program.rs`): `<pid>:<ns>`, its process and when it began on
+/// the history's clock ([`launched`]). A process becomes another by `exec`, which keeps its
+/// pid, so the blaze it became reads its own launcher's start and counts it in its own
+/// ([`began_ns`]); a child that inherits the variable is another process and reads nothing
+/// from it.
+pub const LAUNCHED: &str = "BLAZE_LAUNCHED";
+
+/// What a launcher sets [`LAUNCHED`] to: this process and when it began, the launcher's
+/// before it when this one was launched itself.
+pub fn launched() -> String {
+    format!("{}:{}", std::process::id(), began_ns())
+}
+
+/// When the launcher that became this process began, when [`LAUNCHED`] names this process.
+fn launched_ns() -> Option<i64> {
+    let said = std::env::var(LAUNCHED).ok()?;
+    let (pid, ns) = said.split_once(':')?;
+    if pid.parse::<u32>().ok()? != std::process::id() {
+        return None;
+    }
+    ns.parse().ok()
+}
+
+/// When this client began, on the history's clock: its first read of the clock
+/// ([`blaze_profile::began`], which `main` calls first), or its launcher's when one became it,
+/// so the build's `client_started_ns` counts the launcher's work (finding the pin) and the
+/// second start of the program too.
+fn began_ns() -> i64 {
+    let own = clock::Scale::now().mono(clock::origin().0);
+    launched_ns().map_or(own, |launcher| launcher.min(own))
 }
 
 /// Sends what this process recorded to the daemon as build `BUILD`'s client rows, and then,
@@ -60,7 +108,7 @@ pub fn send() -> Result<Option<PathBuf>, String> {
 /// them.
 fn rows(build: u64) -> Result<Request, String> {
     let ended_ns = clock::mono_ns();
-    let started_ns = clock::Scale::now().mono(clock::origin().0);
+    let started_ns = began_ns();
     let tagged = u32::try_from(build)
         .map_err(|_| format!("build {build} is past the recorder's 32-bit build ids"))?;
     let mut read = Read::default();

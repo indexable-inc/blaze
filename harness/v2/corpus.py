@@ -1,7 +1,7 @@
 """corpus.py: real crates built, run and tested by blaze, each judged by its own verdicts: the
 build succeeds, its programs run and exit 0, and its own tests pass (docs/v2/plan.md).
 
-    uv run --frozen python harness/v2/corpus.py '{"engine": {"kind": "v1", "blaze": "target/release/blaze"}, "out": "/tmp/corpus.json"}'
+    uv run --frozen python harness/v2/corpus.py '{"engine": {"kind": "v2", "blaze": "target/release/blaze"}, "out": "/tmp/corpus.json"}'
     uv run --frozen python harness/v2/corpus.py '{"engine": {...}, "out": "...", "projects": ["crates.io"], "crates": ["itoa"]}'
     uv run --frozen python harness/v2/corpus.py selftest
 
@@ -760,7 +760,6 @@ def test_dev_backend() -> None:
         v2 = engine.EngineSpec("v2", sys.executable, dev_backend=backend)
         said = refused(lambda: engine.Engine.of(v2))
         assert "codegen-backend" in said and "requests-backend-axis.md" in said, said
-        assert "v1" in refused(lambda: engine.Engine.of(dataclasses.replace(v2, kind="v1")))
         assert "LLVM" in refused(lambda: engine.Engine.of(dataclasses.replace(v2, backend="llvm")))
         both = Input(engine.EngineSpec("v2", sys.executable), "", backends=("stencil", "cranelift"))
         assert "codegen-backend" in refused(lambda: engines_of(both))

@@ -10,8 +10,7 @@
 //! - [`daemon`]: finding and starting `blaze serve`, and the [`daemon::Api`] it is spoken to by.
 //! - [`print`]: a build's responses as cargo's lines; [`say`] and [`json`] are their texts.
 //! - [`run`] and [`test`]: what runs after the build; [`doc`]: `doc`'s pages, written.
-//! - [`inspect`]: blaze's own looks at the last build (`codegen-inputs`, `trace`, `tables`),
-//!   and `pack`, the in-browser compiler's pack of a program.
+//! - [`inspect`]: blaze's own looks at the last build (`codegen-inputs`, `trace`, `tables`).
 //! - [`observe`]: blaze's looks at itself: `explore`, `debug profile|live|sql`, `explain`.
 //! - [`replace`]: `check --replace`, a path moved through the front end's name resolution.
 //! - [`reach`]: `reach`, what the checkout's edits since a root reach, building only what its
@@ -21,6 +20,9 @@
 //! - [`clean`]: `clean`, a workspace's build directory under blaze's root removed; `--list`
 //!   and `--all`, every workspace's.
 //! - [`cache`]: `cache gc`, one run of the collector of what blaze keeps on disk.
+//! - [`new`], [`tree`], [`metadata`]: cargo's `new`, `init`, `tree` and `metadata`, each answered
+//!   in this process from the workspace's files (blaze-new, blaze-tree, blaze-metadata), with
+//!   the command-line reader they share in [`own`].
 
 #![forbid(unsafe_code)]
 
@@ -31,12 +33,17 @@ pub mod clean;
 pub mod client_rows;
 pub mod daemon;
 pub mod doc;
+mod duckdb;
 pub mod fetch_url;
 pub mod fix;
 pub mod inspect;
 pub mod json;
 pub mod live;
+#[cfg(feature = "native")]
+pub mod metadata;
+pub mod new;
 pub mod observe;
+pub mod own;
 pub mod perf;
 pub mod place;
 #[cfg(feature = "native")]
@@ -48,6 +55,8 @@ pub mod run;
 pub mod say;
 pub mod terminal;
 pub mod test;
+#[cfg(feature = "native")]
+pub mod tree;
 
 use std::{
     ffi::OsString,
@@ -91,6 +100,10 @@ Commands:
                 prints the daemon's last runs)
     fmt         Format the workspace's packages with blaze's own rustfmt (`--check`, `-p NAME`,
                 `--all`, `-- RUSTFMT_ARGS`), or the `.rs` files named; `blaze fmt --help`
+    new, init   Create a package at <PATH>, or in the directory it is run in (`--bin`, `--lib`,
+                `--name`, `--edition`, `--vcs`), as cargo writes one
+    tree        The workspace's dependency graph, with cargo's flags (`-e`, `-i`, `-p`, `--depth`)
+    metadata    The workspace and its resolve as `cargo metadata --format-version 1` prints them
     serve       Run the daemon the other commands are clients of
     stop        Make the daemon's state durable and stop it
     status      What the daemon is doing (`--json`: one object, docs/cargo.md)
@@ -99,7 +112,6 @@ Commands:
     codegen-inputs --format=json   Each instance the last build made, with its code hash
     trace --out PATH               Every result of the last build, with its edges, as CBOR
     tables --format=json           The size of each of the daemon's long-lived tables
-    pack -p PACKAGE --out PATH     The program checked for wasm32, packed for the in-browser compiler
     explore [--dev] [--print]      The explorer: the daemon's builds and spans at https://ix.dev/explore
     debug profile [--seconds N]    The daemon's flight recorder as a Chrome trace
     debug live                     The daemon's threads as they run
@@ -118,6 +130,23 @@ Options:
 Every command takes cargo's flags; `blaze help <COMMAND>` lists them.
 ";
 
+/// After a build's `Finished`: why it recomputed what it did, as the daemon sums it up
+/// (`observe::recomputed`, docs/v2/plan/design/why.md), on the printer's streams. A build that
+/// recomputed nothing says nothing; a summary the daemon could not give is said as a
+/// warning, and the command's own outcome stands.
+fn said_recomputed<O: Write, E: Write>(
+    printer: &mut Printer<'_, O, E>,
+    shown: Shown,
+) -> io::Result<()> {
+    if shown.quiet {
+        return Ok(());
+    }
+    match observe::recomputed() {
+        Ok(summary) => printer.recomputed(summary),
+        Err(why) => printer.err().write_all(say::warning(&why, shown.color).as_bytes()),
+    }
+}
+
 /// What this client recorded of its build, sent to the daemon's history, and with
 /// `BLAZE_PROFILE` the build's trace written (its path said on `err`): a failure is said on
 /// `err` as a warning naming the step and the build, and the command's own outcome stands.
@@ -132,6 +161,18 @@ fn sent_client_rows(err: &mut impl Write, color: bool) {
         Err(why) => say::warning(&why, color),
     };
     _ = err.write_all(said.as_bytes());
+}
+
+/// This process's time counted from now ([`blaze_profile::began`]): what the program calls
+/// first, before the work that comes before [`main`] (finding the workspace's pin).
+pub fn began() {
+    blaze_profile::began();
+}
+
+/// The flight recorder installed ([`blaze_profile::install`]), for the spans of the work
+/// before [`main`], which installs it again to no effect. It starts no thread.
+pub fn record() {
+    blaze_profile::install();
 }
 
 /// The `blaze` program, and `cargo-blaze`, which cargo runs for `cargo blaze` as
@@ -237,7 +278,11 @@ fn auto_color() -> bool {
 
 /// One command line, run: its exit code.
 pub fn command(words: Vec<OsString>) -> i32 {
-    let asked = match args::parse(words) {
+    let parsing =
+        tracing::info_span!(target: "blaze", "client: parse the command line").entered();
+    let parsed = args::parse(words);
+    drop(parsing);
+    let asked = match parsed {
         Ok(asked) => asked,
         Err(usage) => {
             eprint!("{}", args::refusal(&usage, auto_color()));
@@ -267,8 +312,8 @@ pub fn command(words: Vec<OsString>) -> i32 {
         Asked::Unknown(name) => {
             let what = format!(
                 "no such command: `{name}`\n\nhelp: blaze's commands are build, check, run, test, bench, \
-                 doc, clean, cache, fmt, serve, stop, status, toolchain, daemon, codegen-inputs, trace, tables, pack, explore, debug, \
-                 explain, why, reach and slow"
+                 doc, clean, cache, fmt, new, init, tree, metadata, serve, stop, status, toolchain, daemon, \
+                 codegen-inputs, trace, tables, explore, debug, explain, why, reach and slow"
             );
             eprint!("{}", say::error(&what, auto_color()));
             Exit::Failed.code()
@@ -327,6 +372,15 @@ pub fn command(words: Vec<OsString>) -> i32 {
         Asked::Cache(words) => cache::main(&words, auto_color()),
         Asked::FetchUrl(words) => fetch_url::main(&words, auto_color()),
         Asked::Fmt(words) => fmt(words),
+        Asked::New { init, words } => new::main(init, words, auto_color()),
+        #[cfg(feature = "native")]
+        Asked::Tree(words) => tree::main(words, auto_color()),
+        #[cfg(feature = "native")]
+        Asked::Metadata(words) => metadata::main(words, auto_color()),
+        #[cfg(not(feature = "native"))]
+        Asked::Tree(_) | Asked::Metadata(_) => said(Err(anyhow::anyhow!(
+            "blaze tree and blaze metadata fetch the packages the lock file names: this blaze is built without blaze-cargo's `native` feature (the seed profile, docs/future/bootstrap.md), which has no network"
+        ))),
         Asked::Cargo(asked) => cargo(&asked),
     }
 }
@@ -470,12 +524,24 @@ fn cargo(asked: &Invocation) -> i32 {
     if let Some(what) = args::refused(asked) {
         return refused(&what, color);
     }
-    let (place, mut request) = match prepared(asked, color) {
+    // Each stretch of the client's own time is a span (slow-is-p0-traced): they reach the
+    // history with the client's rows (`client_rows`), under the build the daemon names.
+    let preparing = tracing::info_span!(
+        target: "blaze",
+        "client: find the checkout, its config files and the environment"
+    )
+    .entered();
+    let prepared = prepared(asked, color);
+    drop(preparing);
+    let (place, mut request) = match prepared {
         Ok(prepared) => prepared,
         Err(what) => return refused(&what, color),
     };
     crate::toolchain::say_toolchain_file(&place.cwd, asked.flags.verbose > 0);
-    if let Err(what) = crate::toolchain::ensure() {
+    let finding = tracing::info_span!(target: "blaze", "client: find the toolchain").entered();
+    let found = crate::toolchain::ensure();
+    drop(finding);
+    if let Err(what) = found {
         return refused(&what, color);
     }
     if asked.command() == Command::Check && !asked.flags.replace.is_empty() {
@@ -488,7 +554,11 @@ fn cargo(asked: &Invocation) -> i32 {
         },
         false => None,
     };
-    let mut client = match daemon::connect(Start::IfMissing) {
+    let connecting =
+        tracing::info_span!(target: "blaze", "client: connect to the daemon").entered();
+    let connected = daemon::connect(Start::IfMissing);
+    drop(connecting);
+    let mut client = match connected {
         Ok(Some(client)) => client,
         Ok(None) => return refused("no daemon answers, and none could be started", color),
         Err(error) => return refused(&format!("{error:#}"), color),
@@ -648,6 +718,13 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
     let mut counted = asked.flags.baselines.is_some().then(baselines::Counted::default);
     let mut found = (asked.command() == Command::Check && asked.flags.fix)
         .then(|| fix::Found::new(&asked.flags.lints));
+    // The client's one wait: on the daemon's socket, from the request sent to its `Done`.
+    let waiting = tracing::info_span!(
+        target: "blaze",
+        "client: wait for the daemon's answer to the request",
+        command = asked.command().name(),
+    )
+    .entered();
     let called = api.call(request, |response, more| {
         if let ResponseRef::Diagnostic(diagnostic) = &response {
             if let Some(counted) = &mut counted {
@@ -658,7 +735,7 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
             }
         }
         if let ResponseRef::Work(worked) = &response {
-            client_rows::heard(worked.build_id);
+            client_rows::heard(worked.build_id, worked.misses);
         }
         let printed = match response {
             ResponseRef::Documented(documented) => {
@@ -691,10 +768,26 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
             unwritten.get_or_insert(error);
         }
     });
+    drop(waiting);
     if let Some(error) = unwritten {
         return Err(error);
     }
     let ok = match called {
+        // A build that left units unchecked behind a failure failed: the exit status is of what
+        // was asked for, all of it built. A daemon that says `Done { ok: true }` after it named
+        // them is wrong, and is said so, never believed (0.20261028.7 ended a `build` 0 with
+        // both of its binaries unbuilt).
+        Ok(true) if printer.left_unchecked() > 0 => {
+            printer.flush()?;
+            // alloc: an error, once
+            let what = format!(
+                "the daemon said the build passed after it left {} unit(s) unchecked or unbuilt \
+                 behind a failure (named above): it failed, and the daemon's answer is a bug in blaze",
+                printer.left_unchecked()
+            );
+            printer.err().write_all(say::error(&what, shown.color).as_bytes())?;
+            false
+        }
         Ok(ok) => ok && !printer.refused(),
         Err(error) => {
             printer.flush()?;
@@ -731,6 +824,7 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
         _ => None,
     };
     printer.finish(ok, started.elapsed())?;
+    said_recomputed(&mut printer, shown)?;
     // A check that failed on its findings still has its suggestions made: a deny lint's
     // finding is an error, and its fix takes it away.
     if let Some(found) = found

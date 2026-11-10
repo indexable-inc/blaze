@@ -10,7 +10,7 @@ under a key of its code's identity and those inputs, and found there before it i
 
 The input is one JSON object (inline, a file's path, or `-`):
 
-    engine    the blaze measured (engine.EngineSpec); v1 has no pure scripts, and says so
+    engine    the blaze measured (engine.EngineSpec)
     out       the result's path (report.py's JSON)
     work      where each project's source, trees and daemon homes go; a new directory under
               /tmp when empty
@@ -572,9 +572,6 @@ def main(args: Input) -> None:
     except engine.Failed as e:
         fail(SCRIPT, str(e))
     rep = report.Report(SCRIPT, args.engine, args.out)
-    if eng.kind == "v1":
-        rep.add("pure scripts", "unmeasured", "v1 proves no build script pure: every script compiles and runs in the sandbox")
-        rep.finish()
     expectations = Expectations((*data.crates, *apps.scripts))
     work = engine.work_dir(args.work, "bz-pure-scripts-")
     work.mkdir(parents=True, exist_ok=True)

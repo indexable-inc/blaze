@@ -99,8 +99,9 @@ renamed static's digest is made again, so the linker places one copy and every r
 reaches it. The fixpoint ends within one round per candidate and one more; past that it is a
 `DedupeError` and the build stops. Each round rehashes only the functions it renamed. Never
 merged: a function whose address is `Address::Significant` (an exported symbol), any static
-(statics are `Target::Static`, by which item they are), a patchable or tiered function of a
-live build (each keeps its slot), and a covered, counting or instrumented function. Rust
+(statics are `Target::Static`, by which item they are), a function of a live build reached
+through its slot (edited, rebound or tiered: each keeps its slot), and a covered, counting or
+instrumented function. Rust
 functions' addresses are not unique (rustc marks them `unnamed_addr`), so merging the rest
 changes no program. Data objects are one per content ID. The span `codegen dedupe` records the
 folded count, rounds and bytes saved. See
@@ -122,12 +123,110 @@ Off by default for LLVM's levels. See [`fold`](../../../../crates/blaze-codegen/
   backend per origin; tests are built at the profile's level.
 - The standard library's own functions are compiled as rustc ships std (`-O3`, no overflow
   checks, no debug assertions, line tables); a generic of std as the crate instantiating it.
-- Only members of a live build are reached through slots; everything else is called directly.
+- In a live build a function is reached through its slot when an edit can replace its code
+  (a member's own function, or one an edit fills again under its own key: "Slots and a splice's
+  reach" below); everything else is called directly.
 - A live build starts LLVM-level functions at Cranelift and replaces them in their slots when
   LLVM is done; a build whose output is a file compiles each function once at its level, so
   its bytes never depend on timing.
 - `Spec::policy` is the policy's content ID: a caller's relocations name callees by keys made
   with the callees' settings, so a change to how anything is compiled is in every key.
+
+## Slots and a splice's reach
+
+A splice (an incremental link, `blaze-link`) never moves code the image holds: new code goes to
+the patch region (`__blaze_patch`, `Class::Patch`), and a caller of code that moved is written
+again where it is. On AArch64 a `bl` reaches 128 MiB, and a splice's thunks are in the patch
+region only, so a direct caller kept in place more than 128 MiB from the patch region can reach
+neither its moved callee nor a thunk of it. That is `Refusal::NoThunk` and a link from scratch
+(found 2026-11-09 on a 750 MiB dev image).
+
+What moved there was not edited code. The edit changed a closure in a member's function; the
+closure, a member's code, got a new key and is reached through its slot. But the instances of
+`core`'s generics over that closure (`Iterator::any::check::<.., {closure#0}>::{closure#0}`,
+`map_try_fold::<..>`) keep their keys: an instance key holds its body's code and what the code
+reads of its type arguments, and a closure or function item is a type argument by which one it
+is, never by its body. Their *fills* still changed, since a fill names each callee by key and
+the closure's key is new. A function filled again under its own key is removed and added, so
+its new code is in the patch region, and it was called directly: `Described::editable` (its
+body is written in a workspace crate) was the one test for a slot, on the reasoning "no edit
+changes its body, and an edit of its arguments' types gives another instance". The second half
+is false for a closure or function item argument, and for any callee whose key changes while
+the caller's does not.
+
+**The invariant.** In a build whose edited code is reached through slots (`Mode::Live`,
+`Mode::Tiered`), every function whose fill an edit can change while its key stays is reached
+through its slot by every caller. A splice then never writes a direct branch to code it
+replaced: the callers of replaced code hold a branch to a slot's stub, which no splice moves,
+and the splice changes the slot's entry.
+
+**The rule** (`blaze-codegen`'s driver, `rebind`; the front end gives the facts). A function is
+reached through its slot (`FnNode::slotted`) when it is
+
+1. *edited*: its body is written in a workspace crate (`Described::editable`), as before; or
+2. *rebound*: no edit changes its body, but an edit can change which keys its references
+   resolve to:
+   - one of its type arguments names a workspace crate's type, closure, coroutine or function
+     item (`Described::over_editable`, the walk `Owner` already uses, over crates an edit
+     reaches). This covers a callee keyed by a fact of the argument this instance's own code
+     does not read (`Vec<T>::extend` forwarding to `Vec<T>::reserve` after `T`'s layout
+     changed), not only a closure's body; or
+   - it refers to an edited function directly (a dependency's function devirtualized to a
+     member's impl, the C `main` of a member's `fn main`); or
+   - it builds in (`Described::built_in`, at any depth) a rebound function, whose references
+     its own fill then holds.
+
+Both are decided once per build from sorted nodes, so the same program gives the same slots.
+The call's instruction is the same either way (`Target::Function` and `Target::Direct` are one
+kind of place in a template), so no template or instance key changes: the fill's id covers
+which target a place names (`content::target_id`), and that is what the link diffs.
+
+**What keeps instances apart.** A function reached through its slot is never merged with
+another (`FnNode::external`, the ICF exclusion in [icf.md](icf.md)): two instances over two
+closures that compile to equal bytes stay two functions with two slots, so an edit to one
+closure changes neither the other's code nor which key the other's callers name. A release
+unit imports a rebound function only into a function that is itself reached through a slot
+(the importer's fill holds the import's references); an edited function is still never
+imported or built in.
+
+**Why not the alternatives.**
+
+| | Code size | Per call | Per edit | Complexity | x86-64 |
+|---|---|---|---|---|---|
+| 1. Slots for what an edit refills (chosen) | none: every function of a table image already has a slot and stub | the stub: 4 instructions and 2 loads on AArch64 (`adrp, ldr, ldr, br`), 2 instructions and 2 loads on x86-64, for calls to rebound instances only | the edited function and the instances that name it are placed in the patch region; slot entries change; no caller is written | a classification in the driver; nothing new in the linker, loader or runtime | same rule; a `call rel32` past 2 GiB never arises for replaced code |
+| 2. Patch islands every N MiB of `__text` | N-th of the code as free executable room, kept in the file's layout | none | a thunk allocated in the nearest island; an island that fills is a link from scratch | address-directed placement (the linker has none: an incremental link only appends to a region), island cursors in the persisted image state, their restore, and reuse rules for memory a running thread may be in | needs the same islands past 2 GiB |
+| 3. Slack next to each caller | 12 bytes per call site, or per function | none | as 2 | as 2, per function | as 2 |
+
+1 makes the common case right by construction with no new unsafe code and no new persisted
+state. 2 and 3 only make an out-of-reach branch reachable after the fact, and add placement
+the linker does not have. They would be the safety net for a direct branch 1 does not cover;
+what is left for that net is small (below), so it is not built: `Refusal::NoThunk` stays as
+the typed last resort, and the build says which branch took it, which names the function the
+rule missed.
+
+**What still reaches `NoThunk`.** An incremental image whose build has no slots in its calls
+(`Mode::Output`: a test binary or program that does not run in process) when its code is past
+128 MiB from its patch region; and a fill that changes under its key for a reason the rule
+does not name, which is then a bug in the rule, reported by name. Both link from scratch and
+say so (`Linking::Full(Full::NoThunk)`).
+
+**Release builds** have no slots in their calls (`Choice::patchable` is false in
+`Mode::Output`, and no function is edited there), so nothing is rebound and their bytes are
+unchanged.
+
+**A running program.** Nothing new is written into running code. A slot's stub loads the
+table's address from the table cell and jumps through the slot's entry; a link builds a new
+table and the runtime switches every entry at once by storing the new table's address in the
+cell (`blaze-live`, `table.rs`), so a thread sees the old function or the new one, and old code
+stays where it was for the frames still in it. Rebound functions use exactly that path; the
+case removed is the one where a caller's `bl` had to be rewritten in place.
+
+**Measured by** the span `codegen classify` (per unit: `edited`, `over_editable`, `refers`,
+`tiered`, `direct`, the count of functions reached each way), `link.thunks` and the link line's
+kind. **Checked by** `rebound_functions_are_reached_through_their_slots` (the invariant over
+generated programs and edits, with its control) in the driver, and in the linker the oracle of
+`thunks.rs` over generated edit sequences on an image larger than a branch's reach, with a
+control per planted bug.
 
 ## Release: summaries, then imports, then compiles (#899, #176)
 

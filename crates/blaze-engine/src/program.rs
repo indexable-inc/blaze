@@ -15,6 +15,16 @@ use crate::{as_rustc, pin, update, versions};
 
 /// The program `blaze`, whose `src/main.rs` and `src/bin/blaze.rs` are only this.
 pub fn main() -> ExitCode {
+    // The client's time is counted from here (`client_rows`), not from blaze's cargo's start.
+    blaze_cargo::cli::began();
+    // Which system calls this process's threads wait with, chosen before any thread exists or
+    // waits: direct ones where blaze's sandbox launched it (blaze as the `rustc` of a build
+    // script, whose filter refuses io_uring), each thread's wait ring otherwise. Read from the
+    // launcher's mark, never found by trying the ring (`blaze_core::wait::choose_from_env`).
+    if let Err(why) = blaze_core::wait::choose_from_env() {
+        eprintln!("error: {why}");
+        return ExitCode::FAILURE;
+    }
     // C's and C++'s allocations (LLVM's) are blaze's allocator's, counted to the running task's
     // tag as Rust's are (`malloc.rs`); a process where they are not stops here, saying why.
     #[cfg(feature = "native")]
@@ -70,10 +80,23 @@ pub fn main() -> ExitCode {
     let (args, ignore_pin) = pin::take_ignore_pin(std::env::args_os());
     let words = blaze_cargo::cli::words(args.iter().cloned());
     let asks_version = matches!(words.as_slice(), [it] if it == "--version" || it == "-V");
-    match pinned_elsewhere(&words, ignore_pin) {
+    // Recorded from here: what runs before blaze's cargo is the client's time too
+    // (slow-is-p0-traced). The sandbox launcher and blaze as rustc are past.
+    blaze_cargo::cli::record();
+    let pinning =
+        tracing::info_span!(target: "blaze", "launcher: find the blaze the workspace pins")
+            .entered();
+    let pinned = pinned_elsewhere(&words, ignore_pin);
+    drop(pinning);
+    match pinned {
         Ok(Ran::Ended(ended)) => return ended,
         Ok(Ran::Here { pin: pinned, manifest }) => {
             if says_updates(&words) {
+                let _span = tracing::info_span!(
+                    target: "blaze",
+                    "launcher: read what is known of blaze's updates"
+                )
+                .entered();
                 update::say(pin::OURS, pinned.as_policy(), manifest.as_deref());
             }
         }
@@ -103,6 +126,10 @@ pub fn main() -> ExitCode {
             if let Err(error) = crate::huge::huge_pages_for_mimalloc() {
                 return failed(&format!("{error:#}"));
             }
+            // Freed pages leave the footprint as they are freed, in the client and the
+            // daemon alike.
+            #[cfg(feature = "native")]
+            crate::heaps::purge_at_once();
             // `IX_PROF=<dir>`: this process (the client, or the daemon it starts) is sampled
             // until it ends and its profile written to `<dir>`; with `<dir>` a target
             // directory's `layout`, the next build of blaze there lays its code out by it
@@ -179,12 +206,13 @@ fn pinned_elsewhere(words: &[OsString], given: bool) -> Result<Ran, String> {
     }
     let cwd = std::env::current_dir()
         .map_err(|error| pin::PinError::NoWorkingDirectory(error).to_string())?;
-    let Some(manifest) =
-        pin::root_manifest(&pin::start(&text, &cwd)).map_err(|why| why.to_string())?
-    else {
+    // One lookup, kept by the directory with the manifests' stamps: a stat of each manifest on
+    // the way and one small read once kept, no manifest read or parsed (`pin::found`).
+    let found = pin::found(&pin::start(&text, &cwd)).map_err(|why| why.to_string())?;
+    let Some(manifest) = found.manifest else {
         return run_default(words, None);
     };
-    let Some(named) = pin::pinned(&manifest).map_err(|why| why.to_string())? else {
+    let Some(named) = found.pinned else {
         return run_default(words, Some(manifest));
     };
     let shown = manifest.display();
@@ -371,6 +399,9 @@ fn failed(why: &str) -> ExitCode {
 
 /// Becomes `command`, where a process can, else runs it and ends as it ended.
 fn ended(command: &mut std::process::Command, program: &Path) -> ExitCode {
+    // The blaze this one becomes counts this one's time in its own (`client_rows::LAUNCHED`).
+    command
+        .env(blaze_cargo::cli::client_rows::LAUNCHED, blaze_cargo::cli::client_rows::launched());
     #[cfg(unix)]
     let error = std::os::unix::process::CommandExt::exec(command);
     #[cfg(not(unix))]

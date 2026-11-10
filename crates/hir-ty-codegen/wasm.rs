@@ -11,9 +11,7 @@
 //! What comes out is not a module. A [`WasmFunction`] names the functions and data it uses
 //! through relocations, like machine code does, and a linker gives them places:
 //!
-//! - a call names the function ([`Calls::Direct`]) or goes through the function's slot in
-//!   the function table ([`Calls::Table`]), so that a function is replaced by writing its
-//!   slot;
+//! - a call names the function (`call`, as rustc's code does);
 //! - the address of a function is its slot, the address of data is where the linker put it
 //!   in linear memory;
 //! - stack slots live on the stack in linear memory, whose pointer is the global
@@ -53,7 +51,6 @@ use wasm_encoder::{
     BlockType, Encode, Instruction as I, InstructionSink, MemArg, MemArgTarget, ValType,
 };
 
-use super::target::Calls;
 
 /// How many bytes an operand a linker fills in takes: a LEB128 padded to full length.
 pub const INDEX_LEN: usize = 5;
@@ -297,10 +294,9 @@ impl WasmFunction {
 /// the start of the body.
 pub(super) fn lower(
     func: &Function,
-    calls: Calls,
     address: Address,
 ) -> Result<(WasmFunction, Vec<ModuleReloc>), String> {
-    Lower::new(func, calls, address)?.run()
+    Lower::new(func, address)?.run()
 }
 
 /// How a Cranelift type is held in wasm locals.
@@ -505,7 +501,6 @@ impl Op {
 
 struct Lower<'a> {
     func: &'a Function,
-    calls: Calls,
     /// The width of the addresses of the memory.
     address: Address,
     signature: WasmSignature,
@@ -545,7 +540,7 @@ fn mem(offset: u64) -> MemArg {
 }
 
 impl<'a> Lower<'a> {
-    fn new(func: &'a Function, calls: Calls, address: Address) -> Result<Self, String> {
+    fn new(func: &'a Function, address: Address) -> Result<Self, String> {
         let signature = WasmSignature::of(&func.signature, address)?;
         let returned = Returned::of(&func.signature)?;
         let mut order = SecondaryMap::new();
@@ -577,7 +572,6 @@ impl<'a> Lower<'a> {
         }
         let mut this = Lower {
             func,
-            calls,
             address,
             returned,
             returned_at,
@@ -954,10 +948,6 @@ impl<'a> Lower<'a> {
 
     /// Calls the function `name` with the arguments on the stack.
     fn call_named(&mut self, name: &ExternalName, signature: &Signature) -> Result<(), String> {
-        if self.calls == Calls::Table {
-            self.address(name, 0)?;
-            return self.call_slot(signature);
-        }
         let ExternalName::User(name) = name else {
             // alloc: the error's message
             return Err(format!("wasm: call of {name:?}"));

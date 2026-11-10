@@ -157,7 +157,8 @@ Steps, each its own PR:
      its ring.
    - The stampers' channel (`uring.rs:1503`) stays a futex through the pool's park above.
    - Out of scope: the sandbox launcher (`sandbox/linux.rs`), whose seccomp filter refuses
-     io_uring to the program it launches; its `waitpid` and `poll` stay on `wait::`.
+     io_uring to the program it launches; its `waitpid` and `poll` stay on `wait::`. What it
+     launches waits with direct system calls (step 6).
    Then `waitpid`/`waitid`/`wait4`/`thread::park*` and raw `syscall(SYS_futex)` are banned
    outside `blaze_core::wait`, the macOS park takes `os_sync_wait_on_address_with_deadline`,
    Windows `WaitOnAddress`, and the Windows sampler follows.
@@ -175,6 +176,37 @@ Steps, each its own PR:
    Still to do: the uring driver's pidfd `POLL_ADD` onto `OP_WAITID`, the pool's stopper and
    `block_until` client parks, `fiber.rs`'s idle, the SQE-embedded timeout, the bans above,
    the macOS and Windows parks and the Windows sampler.
+6. A second Linux driver for a process inside blaze's sandbox (landed 2026-11-10). From step 5
+   (commit efcabd8fc6) every park was a request on the thread's ring, and the sandbox's filter
+   answers `io_uring_setup` with `ENOSYS`: blaze as the `rustc` a build script runs (anyhow's
+   probe, and most of crates.io's) started its pool, each worker's first park failed, the
+   worker ended unheard (the probe's stderr is `/dev/null`) and the main thread waited forever
+   for jobs no worker would run.
+   - `wait/direct.rs`: the same cores (`parking::park`, `reaping::reap`, `until`'s retry) over
+     direct calls. A park is `futex(FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG)` to an absolute
+     `CLOCK_MONOTONIC` time and `FUTEX_WAKE`; a child's exit is `waitid(P_PID, WEXITED |
+     WNOHANG | WNOWAIT)` to look, `pidfd_open` and `ppoll` of the pidfd to wait, and the look
+     again; `pollable` is `ppoll` under the ring's signal mask; a sleep is
+     `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)`. Each call's time is made from what
+     `until` recomputed just before it, never carried across a retry. The sandbox's filter
+     refuses only `io_uring_setup`, two terminal ioctls and another architecture's calls, so
+     all of these are allowed in it and the filter is not widened.
+   - Chosen once, never probed (`wait/choice.rs`, rule `no-fallback`): the Linux launcher sets
+     `__BLAZE_SANDBOXED=1` in the environment of the program it runs (`mark_sandboxed`), which
+     every program below it inherits, and blaze's `main` reads it before any thread exists or
+     waits (`wait::choose_from_env`): the direct driver with the mark, the ring without, an
+     error for any other value. A second choice, or one after a thread has waited, panics
+     naming both. Without the mark a refused ring stays an error, which names the mark.
+   - A worker that cannot wait stops its pool (`blaze-graph/src/pool.rs`, `Broken`): the
+     park's error is kept and said once, the workers run what is queued and end without
+     parking again, and every scope on the pool fails with the error, a thread blocked on one
+     (`block`) woken to do so; a worker's loop that panics does the same. A wait on a scope
+     whose jobs are parked with no worker left cannot be failed through the scheduler, and
+     ends the process, saying so.
+   Not covered: a thread that waits on a broken pool through something other than a scope (a
+   channel a detached `Pool::submit` answers on) is not woken; and a program that clears its
+   environment before it runs blaze inside the sandbox loses the mark, and that blaze fails at
+   its first park, naming it.
 
 ## How it is proven
 
@@ -190,6 +222,21 @@ test-only switch) re-enters with the first relative timeout after an interrupt; 
 find a counterexample within its case budget. `Sim` gets the same fault
 (`Faults::interrupt_one_in`): its `poll` goes through `wait::until`, so every existing DST on
 `Sim` runs its waits under interruption too.
+
+The direct driver (step 6) runs the park's and the reap's plans of that DST through its own
+calls (`Through::Direct`): the simulated kernel answers `futex`, `waitid`, `pidfd_open` and
+`ppoll` with the errors the kernel returns, on a `CLOCK_MONOTONIC` of another origin than the
+wait's clock, and the same oracles and plants hold (`no_unpark_is_lost_through_the_direct_driver`,
+`every_reaped_child_is_reported_through_the_direct_driver`, and their `the_oracle_catches_...`
+controls). `wait/direct.rs`'s own tests run it on the real kernel: a park woken, one ended by
+its deadline, one interrupted by signals, a child waited for past a deadline and reaped, a
+poll, a sleep. In `blaze-graph/src/pool.rs` (`mod broken`),
+`a_sandboxed_process_parks_its_workers_with_no_io_uring` runs the test binary again under a
+seccomp filter that refuses `io_uring_setup`, marked as the launcher marks it: its workers park
+and wake and a `par` loop runs on the process's pool; the control, unmarked, fails naming the
+ring (`the_oracle_catches_a_sandboxed_process_on_the_ring`). A pool whose parks fail fails its
+scoped waiter within a bound, and the planted worker that ends silently leaves it parked
+(`the_oracle_catches_a_worker_that_ends_silently`).
 
 The sampler: the existing `a_busy_thread_is_sampled_and_named` test, plus one that a sample
 names the span and fiber it was taken in on Linux (the property perf lacked), run in an ix VM.

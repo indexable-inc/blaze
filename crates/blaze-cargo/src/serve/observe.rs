@@ -35,11 +35,83 @@ use blaze_profile::{
 };
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
-use super::why::{Answer, Answers, Ledger, file::File};
+use super::why::{Answer, Answers, Ask, Ledger, file::File};
 
 /// The variable naming the DuckDB `blaze debug sql` and the explorer run: an absolute path,
-/// which blaze's Nix wrapper sets to `nix run .#duckdb`'s. Never looked up on `PATH`.
+/// which blaze's Nix wrapper sets to `nix run .#duckdb`'s. Never looked up on `PATH`. Unset,
+/// the history's readers run the DuckDB blaze pins ([`Pin`]), fetched on first use
+/// (`cli/duckdb.rs`).
 pub const DUCKDB: &str = "BLAZE_DUCKDB";
+
+/// The DuckDB blaze pins: flake.nix's `duckdb` asserts the same version.
+pub const DUCKDB_VERSION: &str = "1.5.5";
+
+/// Where DuckDB's releases are.
+const DUCKDB_RELEASES: &str = "https://github.com/duckdb/duckdb/releases/download";
+
+/// The pinned DuckDB CLI of one host: an asset of DuckDB's release [`DUCKDB_VERSION`] (a gzip
+/// of the one program) and the SHA-256 of that asset, which the fetch is checked against.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Pin {
+    pub asset: &'static str,
+    pub sha256: &'static str,
+}
+
+/// Each host's pin, by `<arch>-<os>` (`std::env::consts`).
+pub const DUCKDB_PINS: &[(&str, Pin)] = &[
+    (
+        "aarch64-linux",
+        Pin {
+            asset: "duckdb_cli-linux-arm64.gz",
+            sha256: "50c719e603a4e599d435e5321542458edc1cfc5f7eed65979fe9bc5ae4e3ba23",
+        },
+    ),
+    (
+        "x86_64-linux",
+        Pin {
+            asset: "duckdb_cli-linux-amd64.gz",
+            sha256: "c61f21485e6e41d3a0c28ce9904ea18346309cf427b4cf9479bc3564348dc885",
+        },
+    ),
+    (
+        "aarch64-macos",
+        Pin {
+            asset: "duckdb_cli-osx-arm64.gz",
+            sha256: "37144723eb43639a96b47207b44036e6dedc084f81afbf0c18625e7f3deac810",
+        },
+    ),
+    (
+        "x86_64-macos",
+        Pin {
+            asset: "duckdb_cli-osx-universal.gz",
+            sha256: "cbd6e7d472c33083db32e1e78d71ab9eefb32da872c349423294de370b8f4ca9",
+        },
+    ),
+];
+
+impl Pin {
+    /// This host's pin; `None` for a host DuckDB's release has no CLI blaze pins for.
+    pub fn host() -> Option<&'static Pin> {
+        let host = (std::env::consts::ARCH, std::env::consts::OS);
+        DUCKDB_PINS.iter().find_map(|(name, pin)| {
+            (name.split_once('-') == Some(host)).then_some(pin)
+        })
+    }
+
+    /// Where the asset is fetched from.
+    pub fn url(&self) -> String {
+        format!("{DUCKDB_RELEASES}/v{DUCKDB_VERSION}/{}", self.asset) // alloc: once per first use, or an error
+    }
+
+    /// Where the program is once laid out under the state directory `state`: a directory named
+    /// by the version and the asset's SHA-256, so another pin is another place and a path that
+    /// exists holds this pin's program.
+    pub fn laid_out(&self, state: &Path) -> PathBuf {
+        let short = self.sha256.get(..16).unwrap_or(self.sha256);
+        // alloc: once per lookup
+        state.join("duckdb").join(format!("{DUCKDB_VERSION}-{short}")).join("duckdb")
+    }
+}
 
 /// The DuckDB [`DUCKDB`] names: `None` unset, and an error naming the variable and its value
 /// when set to anything but an absolute path to a file.
@@ -248,8 +320,6 @@ enum Told {
     /// The flush a reader asked for ([`ToHistory::Flush`]) committed, with its number, or
     /// failed, saying why.
     Flushed { to: RequestRef, seq: Result<u64, String> },
-    /// A client's rows written, or why they were not: what its request is answered.
-    ClientWritten { to: RequestRef, written: Result<(), String> },
 }
 
 /// A build that ended, as the history's rows: its own, each image it linked, and an edge of
@@ -275,6 +345,10 @@ enum ToHistory {
     /// daemon dies before it ends ([`history::writes`]).
     Started(BuildRow),
     Ended(Finished),
+    /// The run log of a build that ended with its front end kept, named after its answer by
+    /// the task that stored the front end ([`super::work::Steps::kept_run_log`]): its
+    /// `provenance` rows, written by the flush this asks for.
+    Ran(Vec<ProvenanceRow>),
     /// Flush now, and tell the loop the flush's number ([`Told::Flushed`]): every row recorded
     /// before the ask is drained by this flush, so a reader that reads the manifest it
     /// committed reads them.
@@ -283,11 +357,10 @@ enum ToHistory {
     /// to the explorer's thread that waits for it ([`explorer_flush`]).
     FlushFor(Sender<Result<u64, String>>),
     /// What the client of a build sent as it ended ([`blaze_api::Request::ClientRows`]),
-    /// written at once and `to` answered once it is ([`Told::ClientWritten`]).
-    Client {
-        to: RequestRef,
-        rows: history::ClientRows,
-    },
+    /// written at once. Its request was answered as this was sent ([`Observe::client_rows`]):
+    /// no client waits for a write, and one that fails is the history's failure, said in
+    /// `blaze status` as any flush's is.
+    Client(history::ClientRows),
 }
 
 /// How long a reader's flush ([`blaze_api::Request::Flush`]) may take, on the loop's clock,
@@ -304,8 +377,10 @@ struct Finished {
 }
 
 /// A front end's run log, as `build`'s `provenance` rows: each memo that ran again and its
-/// cause, each untracked read by name. Taken on the loop as the build ends, with its database
-/// ([`super::work::Writer::run_log`]); sorted by the engine, so the rows are the same each time.
+/// cause, each untracked read by name. Taken with its database: by the task that stores the
+/// build's kept front end, after its answer ([`super::work::Steps::kept_run_log`]), or on the
+/// loop as the build ends when its front end is not kept ([`super::work::Writer::run_log`]);
+/// sorted by the engine, so the rows are the same each time.
 pub(super) fn provenance_rows(build: u64, taken: blaze_query::db::Taken) -> Vec<ProvenanceRow> {
     let blaze_query::db::Taken { rows, dropped } = taken;
     if dropped > 0 {
@@ -690,13 +765,15 @@ fn keep(
                 history.build_started(row);
                 (history.flush(None), false)
             }
-            Ok(ToHistory::Client { to, rows }) => {
+            Ok(ToHistory::Ran(rows)) => {
+                doing.set(Step::Flushing, rows.first().map_or(0, |it| it.build_id));
+                history.ran(rows);
+                (history.flush(None), false)
+            }
+            Ok(ToHistory::Client(rows)) => {
                 let build = rows.build;
                 doing.set(Step::Flushing, build);
-                let flushed = history.client_rows(&rows).and_then(|()| history.flush(Some(build)));
-                let written = flushed.as_ref().map(|_| ()).map_err(ToString::to_string);
-                _ = told.send(Told::ClientWritten { to, written });
-                (flushed, false)
+                (history.client_rows(&rows).and_then(|()| history.flush(Some(build))), false)
             }
             Ok(ToHistory::Ended(Finished {
                 ended: Ended { mut row, links, crate_deps, misses, test_runs, provenance },
@@ -709,12 +786,8 @@ fn keep(
                 doing.set(Step::Explaining, build);
                 let (rebuilt, misses, record) = why.explain(build, ended_well, misses);
                 // clone: the answer's copy of whose build it is, once a build
-                let answer = Answer {
-                    build,
-                    workspace: row.workspace.clone(),
-                    command: row.command.clone(),
-                    rebuilt,
-                };
+                let answer =
+                    Answer::new(build, row.workspace.clone(), row.command.clone(), rebuilt);
                 // Sent before the record is durable: an answer may name a build whose record a
                 // crash then loses (docs/v2/plan/design/why.md, "Answered before durable").
                 _ = told.send(Told::Explained { answer, dropped: why.dropped() });
@@ -854,9 +927,7 @@ pub struct Observe {
 /// once `after` builds' have come back, failed at `until` on the loop's clock.
 struct Asked {
     to: RequestRef,
-    cwd: Option<String>,
-    item: Option<String>,
-    all: bool,
+    ask: Ask,
     after: u64,
     until: Duration,
 }
@@ -985,6 +1056,18 @@ impl Observe {
         }
     }
 
+    /// The run log of builds that ended with their front end kept, as the history's rows
+    /// (`Jobs::ran`): written by the history's thread; dropped by a daemon that keeps none.
+    pub fn ran(&mut self, rows: Vec<ProvenanceRow>) {
+        let Some(profiling) = &self.profiling else { return };
+        if profiling.ended.send(ToHistory::Ran(rows)).is_err() {
+            self.history_error = Some(
+                "the profile history's thread (`blaze-history`) is gone: no build is written"
+                    .to_owned(),
+            ); // alloc: error path
+        }
+    }
+
     /// A build that ended, for the history to write with what the query engine counted by
     /// now; dropped by a daemon that keeps none, which takes no counts.
     pub fn ended(&mut self, mut ended: Ended) {
@@ -998,12 +1081,12 @@ impl Observe {
                 ledger.explain(build, ended_well, std::mem::take(&mut ended.misses)).rebuilt;
             let dropped = ledger.dropped();
             // clone: whose build it is, once a build of a daemon with no history
-            let answer = Answer {
+            let answer = Answer::new(
                 build,
-                workspace: ended.row.workspace.clone(),
-                command: ended.row.command.clone(),
+                ended.row.workspace.clone(),
+                ended.row.command.clone(),
                 rebuilt,
-            };
+            );
             self.answers.add(answer, dropped);
             return;
         };
@@ -1023,16 +1106,21 @@ impl Observe {
     }
 
     /// What the client of a build sent as it ended: handed to the history's thread, which
-    /// writes it and then has `to` answered ([`Told::ClientWritten`]). A daemon that keeps no
-    /// history answers at once and keeps nothing, as it drops its builds' rows ([`Observe::started`]).
+    /// writes it, and `to` answered at once, before the write. The client's exit waits for no
+    /// flush (each is an fsync, behind the build's own end row's): a reader's flush
+    /// ([`Observe::flush`]) is given to the same thread after these rows, so the manifest it
+    /// then reads has them, and a write that fails is the history's failure
+    /// ([`Observe::history_error`]), not the client's. A daemon that keeps no history answers
+    /// the same and keeps nothing, as it drops its builds' rows ([`Observe::started`]).
     pub fn client_rows(&mut self, to: RequestRef, rows: history::ClientRows, out: &mut Vec<Reply>) {
         let Some(profiling) = &self.profiling else {
             return out.push(Reply { to, response: Response::Done { ok: true } });
         };
-        if profiling.ended.send(ToHistory::Client { to, rows }).is_err() {
+        if profiling.ended.send(ToHistory::Client(rows)).is_err() {
             let what = "the profile history's thread (`blaze-history`) is gone: the client's rows can't be written";
-            fail(out, to, ApiError::new(what, Some(CLIENT_ROWS.to_owned()))); // alloc: error path
+            return fail(out, to, ApiError::new(what, Some(CLIENT_ROWS.to_owned()))); // alloc: error path
         }
+        out.push(Reply { to, response: Response::Done { ok: true } });
     }
 
     /// `blaze why`: what the last build computed again and why, in groups (each listing
@@ -1049,24 +1137,21 @@ impl Observe {
         now: Duration,
         out: &mut Vec<Reply>,
     ) {
+        self.why_asked(to, Ask { all, cwd, item, build: None, unexplained: false }, now, out);
+    }
+
+    /// [`Observe::rebuilt`] of all an ask can say ([`Ask`]): one build's own summary, asked by
+    /// its client once it has its `Done`, and the steps blaze has no reason for.
+    pub fn why_asked(&mut self, to: RequestRef, ask: Ask, now: Duration, out: &mut Vec<Reply>) {
         if self.explained >= self.sent {
-            return answer(
-                out,
-                to,
-                Response::Rebuilt(self.answers.rebuilt(cwd.as_deref(), item.as_deref(), all)),
-            );
+            return answer(out, to, Response::Rebuilt(self.answers.asked(&ask)));
         }
         // Never answered from a build older than one that ended before it was asked (rule 3).
         match self.history_gone {
             true => fail(out, to, never_explained(self.unexplained.front().copied())),
-            false => self.asked.push(Asked {
-                to,
-                cwd,
-                item,
-                all,
-                after: self.sent,
-                until: now + WHY_WAIT,
-            }),
+            false => {
+                self.asked.push(Asked { to, ask, after: self.sent, until: now + WHY_WAIT });
+            }
         }
     }
 
@@ -1090,7 +1175,6 @@ impl Observe {
                     dir: profiling.dir.clone(), // clone: once an explorer
                     flush: explorer_flush(profiling),
                 },
-                world: None,
                 dev_origin: dev,
                 daemon: crate::release::get().version,
                 tasks: Arc::clone(&self.tasks),
@@ -1205,12 +1289,6 @@ impl Observe {
                             ), // alloc: error path
                         }
                     }
-                    Ok(Told::ClientWritten { to, written: Ok(()) }) => {
-                        out.push(Reply { to, response: Response::Done { ok: true } })
-                    }
-                    Ok(Told::ClientWritten { to, written: Err(why) }) => {
-                        fail(out, to, ApiError::new(why, Some(CLIENT_ROWS.to_owned()))); // alloc: error path
-                    }
                     Err(crossbeam_channel::TryRecvError::Empty) => break,
                     Err(crossbeam_channel::TryRecvError::Disconnected) => {
                         // Gone, so nothing more comes back: what is held is answered now, and
@@ -1233,15 +1311,7 @@ impl Observe {
                 (&self.unexplained, self.profiling.as_ref().map(|it| &*it.doing));
             self.asked.retain(|it| {
                 if explained >= it.after {
-                    answer(
-                        out,
-                        it.to,
-                        Response::Rebuilt(answers.rebuilt(
-                            it.cwd.as_deref(),
-                            it.item.as_deref(),
-                            it.all,
-                        )),
-                    );
+                    answer(out, it.to, Response::Rebuilt(answers.asked(&it.ask)));
                     return false;
                 }
                 if gone {
@@ -1616,12 +1686,7 @@ mod tests {
     }
 
     fn explained(build: u64) -> Told {
-        let answer = Answer {
-            build,
-            workspace: "/w".to_owned(),
-            command: "build".to_owned(),
-            rebuilt: Vec::new(),
-        };
+        let answer = Answer::new(build, "/w".to_owned(), "build".to_owned(), Vec::new());
         Told::Explained { answer, dropped: None }
     }
 

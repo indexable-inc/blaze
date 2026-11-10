@@ -198,7 +198,10 @@ pub fn facts(
 /// The [`STACKS`] commonest stacks, on and off the CPU, of the samples inside the build's
 /// spans of each name: a sample counts for every name among its span and that span's
 /// ancestors, once a name. Samples are the build's, or in its window from its process; their
-/// frames come back joined by newlines, which no frame's name holds.
+/// frames come back joined by newlines, which no frame's name holds. The stacks are counted
+/// in `counted` and the commonest chosen over its columns: a window beside the counting, ordered
+/// by a column that is not one of its groups as written, is refused by DuckDB ("Cannot mix
+/// aggregates with non-aggregated columns").
 fn span_stacks_sql(build: u64, window: Option<(i64, i64)>, of: &str, spans: &str) -> String {
     let which = match window {
         // alloc: a condition, once a report
@@ -221,12 +224,14 @@ fn span_stacks_sql(build: u64, window: Option<(i64, i64)>, of: &str, spans: &str
            UNION ALL \
            SELECT up.sample, s.process, s.span_id, s.parent, CAST(s.name AS VARCHAR) \
            FROM up JOIN {spans} AS s ON s.process = up.process AND s.span_id = up.parent\
-         ), named AS (SELECT DISTINCT sample, name FROM up) \
-         SELECT named.name AS name, sampled.on_cpu AS on_cpu, CAST(sampled.frames AS VARCHAR) AS frames, \
-           CAST(count(*) AS UBIGINT) AS samples \
-         FROM named JOIN sampled USING (sample) \
-         GROUP BY 1, 2, 3 \
-         QUALIFY row_number() OVER (PARTITION BY named.name, sampled.on_cpu ORDER BY count(*) DESC, sampled.frames) <= {STACKS} \
+         ), named AS (SELECT DISTINCT sample, name FROM up), counted AS (\
+           SELECT named.name AS name, sampled.on_cpu AS on_cpu, CAST(sampled.frames AS VARCHAR) AS frames, \
+             CAST(count(*) AS UBIGINT) AS samples \
+           FROM named JOIN sampled USING (sample) \
+           GROUP BY 1, 2, 3\
+         ) \
+         SELECT name, on_cpu, frames, samples FROM counted \
+         QUALIFY row_number() OVER (PARTITION BY name, on_cpu ORDER BY samples DESC, frames) <= {STACKS} \
          ORDER BY 1, 2 DESC, 4 DESC, 3"
     )
 }

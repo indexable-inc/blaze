@@ -18,10 +18,17 @@
 //!   ends first; none is cancelled), and the front end's values kept by bytes are swept under
 //!   the squeeze's caps too ([`blaze_query::db::Storage::sweep_values`]), not only at the next
 //!   view.
-//! - **As the front end is kept**, its build over: every MIR goes then, of every goal and
+//! - **Once the front end is kept**, its build over: every MIR goes then, of every goal and
 //!   under any limit or none ([`Release::end`]). MIR is the request's: a value of the build
 //!   that made it, read again by the next build only as its memo (verified against, made
-//!   again where read), so nothing of it outlives the build that made it.
+//!   again where read), so nothing of it outlives the build that made it. This release is
+//!   never on the loop and never before the build's answer: it is kept with the front end
+//!   and run by the task that stores the front end, which holds it alone as the writer did
+//!   (`Steps::release_kept`). It only lowers memory, so the checkout's next build never waits
+//!   for it: a request that waits for the front end has it handed back unreleased, and that
+//!   build's own releases, at the latest its end's, let the MIR go. When blaze is past its
+//!   limit's line the release runs all the same, before that build is given the front end:
+//!   memory short stays a reason that stops for nothing but the answer.
 //!
 //! A value let go keeps its memo, so a read of it later in the build, or by the next build of
 //! the head, makes it again and backdates it: nothing read can differ, a re-read costs time and
@@ -204,6 +211,7 @@ impl Release<Crate> {
             const_eval = tracing::field::Empty,
             solver_caches = tracing::field::Empty,
             intern_tables = tracing::field::Empty,
+            unread = tracing::field::Empty,
             left = tracing::field::Empty,
             query_storage = tracing::field::Empty,
         );
@@ -213,6 +221,13 @@ impl Release<Crate> {
         if pressed {
             db.storage_mut().sweep_values(&Squeeze::caps(before));
         }
+        // The build is over: what neither it nor the build before it read of the front end's
+        // evictable values goes, the results of revisions no edit since has asked for. Only
+        // here, with the build's reads all made; a build that wrote nothing lets nothing go.
+        let unread = match ended {
+            true => db.storage_mut().end_epoch(),
+            false => blaze_query::db::Unread::default(),
+        };
         // What was let go goes back to the system now, not when mimalloc's purge delay and the
         // next page taken get to it: this thread's heaps and every freed page at once, each
         // other thread's heaps as it next allocates or idles (memcap5).
@@ -227,6 +242,7 @@ impl Release<Crate> {
         span.record("const_eval", dropped.const_eval);
         span.record("solver_caches", dropped.solver_caches);
         span.record("intern_tables", dropped.intern_tables);
+        span.record("unread", unread.values);
         span.record("left", after.held);
         // What the query storage still holds after the drops. On a release memory made due, by
         // ingredient (memcap6): its rows in use are a walk of every function's rows made, a
@@ -246,7 +262,17 @@ impl Release<Crate> {
         // query storage's largest holders.
         eprintln!(
             "blaze serve: {}",
-            Said { crates: crates.len(), mir, pressed, ended, dropped, before, after, storage }
+            Said {
+                crates: crates.len(),
+                mir,
+                pressed,
+                ended,
+                dropped,
+                unread,
+                before,
+                after,
+                storage,
+            }
         );
     }
 }
@@ -259,6 +285,9 @@ pub(crate) struct Said {
     pub(crate) pressed: bool,
     pub(crate) ended: bool,
     pub(crate) dropped: hir::evict::Dropped,
+    /// What the build's end let go of that two builds left unread
+    /// ([`blaze_query::db::Storage::end_epoch`]).
+    pub(crate) unread: blaze_query::db::Unread,
     pub(crate) before: Pressure,
     pub(crate) after: Pressure,
     pub(crate) storage: Holders,
@@ -334,7 +363,8 @@ impl std::fmt::Display for Holders {
 impl std::fmt::Display for Said {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let gib = |bytes: u64| bytes as f64 / f64::from(1u32 << 30);
-        let Said { crates, mir, pressed, ended, dropped, before, after, storage: _ } = self;
+        let Said { crates, mir, pressed, ended, dropped, unread, before, after, storage: _ } =
+            self;
         f.write_str("front end release (")?;
         match (*pressed, before.over) {
             (true, _) if before.squeezed() => write!(
@@ -364,6 +394,9 @@ impl std::fmt::Display for Said {
         write!(f, " and {} trait solver caches", dropped.solver_caches)?;
         if *pressed {
             f.write_str(", and swept the front end's values to their fair shares")?;
+        }
+        if unread.values != 0 {
+            write!(f, ", and {} values the last two builds did not read", unread.values)?;
         }
         write!(f, "; blaze held {:.2} GiB, now {:.2} GiB", gib(before.held), gib(after.held))?;
         match before.held.checked_sub(after.held) {
@@ -419,10 +452,11 @@ impl<K: Copy + Eq + Hash> Release<K> {
         self.pressed = true;
     }
 
-    /// The build is over and its front end is about to be kept, no reader alive: the next
-    /// release lets go of every MIR, of a check as of any build, under any limit or none. What
-    /// a build made of MIR is the build's: kept, it is only what the next build would verify
-    /// its memos against, which needs the memo alone.
+    /// The build is over and its front end is kept, no reader alive: the next release lets go
+    /// of every MIR, of a check as of any build, under any limit or none. What a build made of
+    /// MIR is the build's: kept, it is only what the next build would verify its memos
+    /// against, which needs the memo alone. That release is run after the build's answer, by
+    /// the task that stores the kept front end (the module's list).
     pub(crate) fn end(&mut self) {
         self.ended = true;
     }

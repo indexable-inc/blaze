@@ -233,6 +233,14 @@ pub(super) fn lower(name: &str) -> Option<Lowered> {
             results: vec![x0],                    // alloc: the lowering's registers, the output
             clobbers: Vec::new(),                 // alloc: empty, allocates nothing
         }),
+        // The words of a key schedule's step, the round constant the immediate.
+        "aesni.aeskeygenassist" => Some(Lowered {
+            // alloc: the stub's text, the output
+            text: "aeskeygenassist xmm0, xmm0, {imm}".to_owned(),
+            args: vec![Some(x0), None], // alloc: the lowering's registers, the output
+            results: vec![x0],          // alloc: the lowering's registers, the output
+            clobbers: Vec::new(),       // alloc: empty, allocates nothing
+        }),
         // AVX's and AVX2's, of three operands.
         "avx.max.pd.256"
         | "avx.max.ps.256"
@@ -609,6 +617,7 @@ mod tests {
             "x86.avx.vtestc.ps.256",
             "x86.avx.vtestnzc.pd",
             "x86.sse41.round.sd",
+            "x86.aesni.aeskeygenassist",
             "x86.avx.vpermilvar.ps.256",
             "x86.avx2.pmul.hr.sw",
             "x86.aesni.aesenc.512",
@@ -641,6 +650,7 @@ x86.sse41.ptestnzc: ptest xmm0, xmm1; seta al; movzx eax, al [Some(\"xmm0\"), So
 x86.avx.vtestc.ps.256: vtestps ymm0, ymm1; setb al; movzx eax, al [Some(\"ymm0\"), Some(\"ymm1\")] -> [\"eax\"]
 x86.avx.vtestnzc.pd: vtestpd xmm0, xmm1; seta al; movzx eax, al [Some(\"xmm0\"), Some(\"xmm1\")] -> [\"eax\"]
 x86.sse41.round.sd: roundsd xmm0, xmm1, {imm} [Some(\"xmm0\"), Some(\"xmm1\"), None] -> [\"xmm0\"]
+x86.aesni.aeskeygenassist: aeskeygenassist xmm0, xmm0, {imm} [Some(\"xmm0\"), None] -> [\"xmm0\"]
 x86.avx.vpermilvar.ps.256: vpermilps ymm0, ymm0, ymm1 [Some(\"ymm0\"), Some(\"ymm1\")] -> [\"ymm0\"]
 x86.avx2.pmul.hr.sw: vpmulhrsw ymm0, ymm0, ymm1 [Some(\"ymm0\"), Some(\"ymm1\")] -> [\"ymm0\"]
 x86.aesni.aesenc.512: vaesenc zmm0, zmm0, zmm1 [Some(\"zmm0\"), Some(\"zmm1\")] -> [\"zmm0\"]

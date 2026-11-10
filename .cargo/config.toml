@@ -12,7 +12,8 @@ linker = "arm-linux-gnueabihf-gcc-8"
 [env]
 CARGO_WORKSPACE_DIR = { value = "", relative = true }
 
-# The compiler in a browser, `crates/blaze-wasm`: there are no threads to drop syntax trees on.
+# blaze's crates built for a browser: there are no threads to drop syntax trees on
+# (crates/syntax, `no_async_drops`).
 [target.wasm32-unknown-unknown]
 rustflags = ["--cfg", "no_async_drops"]
 

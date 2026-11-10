@@ -53,7 +53,7 @@ jobs:
       # The renderer builds with cargo, and no cache, until blaze builds the renderer: what ships
       # is its own Rust release's wasm32 with LTO at opt-level z, and blaze's wasm32 modules are
       # still many times rustc's size (docs/platforms.md, "wasm32").
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       # The release build for the runner's architecture (the ix runners are AArch64; an x86-64
       # wasm-opt there fails with "Exec format error"), checked by its sha256 (the release's own
       # .sha256 files).

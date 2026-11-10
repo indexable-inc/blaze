@@ -218,7 +218,7 @@ One change, whole port (rule 23):
   not, because TLS and quinn-proto draw randomness (keys, connection IDs).
 - **The explorer's tests** (`crates/blaze-explore/src/server.rs`) keep every case and move onto
   the new client over real UDP on loopback: path and origin refusals, `unauthenticated` before
-  `hello`, `hello`, `views` as IPC, `unknown_op`, `no_world`, a live frame's layout, `bad_token`
+  `hello`, `hello`, `views` as IPC, `unknown_op`, a live frame's layout, `bad_token`
   closing only its own session, and the dev origin.
 - **The browser**, by hand: the probe page in Chrome and Firefox (bidirectional echo,
   unidirectional echo, datagrams), then `blaze explore` with the real page on ix.dev. This is

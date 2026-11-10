@@ -310,6 +310,21 @@ impl Query<'_> {
             }
         };
 
+        let durable = quote! {
+            /// Whether the row of these arguments is current and durable
+            /// (`blaze_query::db::plumbing::durable`): fetched in this view, of inputs of
+            /// kind `HIGH` alone.
+            #[inline]
+            #[allow(clippy::needless_lifetimes, clippy::too_many_arguments, dead_code)]
+            #vis fn durable<#db_lt>(
+                db: &#db_lt #db_ty,
+                #(#idents: #db_tys,)*
+            ) -> bool {
+                let key = #make_key;
+                #plumbing::durable::<#config>(db, key)
+            }
+        };
+
         let evict = if evictable {
             let evict_of = if self.direct_key() {
                 let arg = &args[0];
@@ -466,6 +481,7 @@ impl Query<'_> {
 
                 impl #name {
                     #fetch
+                    #durable
                     #evict
                     #arguments
                 }

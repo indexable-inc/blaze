@@ -120,7 +120,7 @@ mod reference {
         }
     }
 
-    /// The wasm linker's 5-byte padded form, and `blaze-wasm`'s padded to any length.
+    /// The wasm linker's 5-byte padded form.
     pub fn padded(mut value: i64, signed: bool) -> [u8; 5] {
         let mut bytes = [0x80; 5];
         for byte in &mut bytes {

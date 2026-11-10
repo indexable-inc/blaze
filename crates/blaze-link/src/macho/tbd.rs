@@ -83,6 +83,8 @@ fn read_documents(text: &str, arch: Arch, platform: u32) -> Result<Shared, Strin
         more: Vec::new(),
         // alloc: `Shared::inputs`: the re-exports outside the file, once per file
         inputs: plan.inputs.iter().map(|it| (*it).to_owned()).collect(),
+        // alloc: empty `Vec`s, which don't allocate
+        undefined: Vec::new(),
     })
 }
 

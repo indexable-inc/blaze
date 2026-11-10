@@ -30,7 +30,6 @@ blaze-profile.workspace = true
 # The plane's records as tasks (`now::Records`), one conversion with the build's live model.
 blaze-protocol.workspace = true
 blaze-serde.workspace = true
-blaze-web.workspace = true
 # The explorer's server, which serves this crate's source.
 ix-prof = { workspace = true, features = ["explore"] }
 serde.workspace = true

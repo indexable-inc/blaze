@@ -20,6 +20,12 @@
 //! sleeps on its own futex word (a [`blaze_core::wait::Parker`]: `IORING_OP_FUTEX_WAIT` on its
 //! thread's io_uring on Linux), not a shared condvar; nothing signals it.
 //!
+//! A worker that cannot park (the kernel refused its wait) or whose loop panicked stops the
+//! pool for that error ([`Broken`], [`Pool::broken`]): it is said once on standard error, the
+//! pool's workers run what is queued and end without parking again, and every scope on the
+//! pool fails with the error, a thread blocked on one woken to do so. No worker ends telling no
+//! one, and no thread waits on a pool none of whose workers is left.
+//!
 //! On a machine of fast and slow groups, a job on its request's critical path
 //! ([`Pool::submit_critical`]) goes to its `near` group if that is fast, else to the least loaded
 //! fast group; stealing is unchanged, so a slow worker with nothing else still takes it. Where
@@ -105,6 +111,27 @@ const STALL_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
 /// waits at most past the pool's last progress ([`Pool::stop`]).
 #[cfg(not(blaze_check))]
 pub const STOP_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The pools whose workers run threads of their own, while they live: what a heap give-back
+/// wakes ([`wake_for_give_back`]). Pushed as such a pool starts, pruned of dropped ones then.
+#[cfg(not(blaze_check))]
+static LIVE: Lock<Vec<std::sync::Weak<Shared>>> = Lock::new("graph.pool.live", Vec::new());
+
+/// Wakes every idle worker of every live pool, so it gives back the free pages its heaps keep
+/// as it goes idle again ([`blaze_mem::tag::settle_heap`] in [`Local::park`]) rather than at its
+/// next job: what [`blaze_mem::tag::ask_heap_give_back`] calls, and a purge then waits for
+/// every worker's give-back (docs/memory-footprint.md, step 2). A worker woken with no job
+/// parks again; nothing is signalled.
+#[cfg(not(blaze_check))]
+fn wake_for_give_back() {
+    // Taken out of the lock before any wake: a wake is a system call (rule
+    // standard-structures: a lock is held for a field update alone).
+    // alloc: a few pools, once a purge
+    let live: Vec<Arc<Shared>> = LIVE.lock().iter().filter_map(std::sync::Weak::upgrade).collect();
+    for shared in live {
+        shared.unpark_workers();
+    }
+}
 
 /// What the queues hold: a pointer to a job's [`Header`], which says how to run it. One pointer
 /// (8 bytes on 64-bit targets), so a line of a deque's buffer holds eight jobs there.
@@ -660,16 +687,92 @@ impl Slot {
     /// Its worker parks for up to `wait` (no limit for `None`), until a wake: on its own
     /// [`blaze_core::wait::Parker`], whose deadline is absolute, so an interruption waits only
     /// for what is left. The caller's span names the wait (`Driving::Idle`).
+    ///
+    /// # Errors
+    ///
+    /// The wait's, when the kernel refused it: its worker stops the pool with it
+    /// ([`Shared::broke`]).
     #[cfg(not(blaze_check))]
-    fn park_for(&self, wait: Option<std::time::Duration>) {
+    fn park_for(
+        &self,
+        wait: Option<std::time::Duration>,
+    ) -> Result<(), blaze_core::wait::WaitError> {
         use blaze_core::wait::{Clock as _, Deadline, Monotonic};
         let clock = Monotonic::new();
         let deadline = wait.map(|it| Deadline::after(clock.now(), it));
-        let what = "a job for an idle worker, or its pool's next due wait";
-        if let Err(error) = self.parker.park(what, deadline, &clock) {
-            panic!("an idle worker of group {} could not park: {error}", self.group);
+        self.parker.park(IDLE_PARK, deadline, &clock).map(|_| ())
+    }
+}
+
+/// What an idle worker's park waits for, as its wait and its error name it.
+#[cfg(not(blaze_check))]
+const IDLE_PARK: &str = "a job for an idle worker, or its pool's next due wait";
+
+/// Why a pool stopped for an error ([`Pool::broken`]): one of its workers could not go on. Its
+/// message names the worker, its group and the wait or the panic, and is what every scope on
+/// the pool fails with from then on.
+#[cfg(not(blaze_check))]
+#[derive(Debug)]
+pub struct Broken {
+    /// The worker, by its index in the pool.
+    pub worker: usize,
+    /// The worker's group.
+    pub group: u32,
+    /// How many workers the pool has.
+    pub workers: usize,
+    pub why: Unable,
+}
+
+/// What a pool's worker could not do ([`Broken`]).
+#[cfg(not(blaze_check))]
+#[derive(Debug)]
+pub enum Unable {
+    /// Its idle park failed: the kernel refused the wait.
+    Park(blaze_core::wait::WaitError),
+    /// Its loop panicked, outside any job, with this message.
+    Loop(String),
+}
+
+#[cfg(not(blaze_check))]
+impl std::fmt::Display for Broken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "worker {} (group {}) of a pool of {} workers ",
+            self.worker, self.group, self.workers
+        )?;
+        match &self.why {
+            Unable::Park(error) => write!(f, "could not park: {error}")?,
+            Unable::Loop(panic) => write!(f, "panicked outside any job: {panic}")?,
+        }
+        f.write_str(
+            "; a pool one of whose workers cannot go on is stopped: its workers end, and every scope on it fails with \
+             this rather than wait for jobs no worker will run (rules bounded-progress, no-fallback)",
+        )
+    }
+}
+
+#[cfg(not(blaze_check))]
+impl std::error::Error for Broken {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.why {
+            Unable::Park(error) => Some(error),
+            Unable::Loop(_) => None,
         }
     }
+}
+
+/// What a test makes a pool's idle parks do ([`Shared::park_plant`]).
+#[cfg(all(test, not(blaze_check)))]
+mod park_plant {
+    /// Park, as outside a test.
+    pub(super) const PARKS: u32 = 0;
+    /// Every park fails, as where the kernel refuses the wait.
+    pub(super) const FAILS: u32 = 1;
+    /// Every park fails and its worker ends telling no one: the bug of 0.20261105.0 on, where
+    /// a worker whose park failed panicked out of its loop, unheard with standard error
+    /// closed, and whoever waited on the pool waited forever.
+    pub(super) const FAILS_AND_ENDS_SILENTLY: u32 = 2;
 }
 
 /// How many workers search and how many sleep, in one word so a submit reads both at once.
@@ -715,6 +818,17 @@ struct Shared {
     abandoned: AtomicBool,
     /// Its workers whose loop returned: what its stopper waits for.
     left: AtomicUsize,
+    /// Why it stopped for an error, set once, by the first worker that could not go on
+    /// ([`Shared::broke`]).
+    #[cfg(not(blaze_check))]
+    broken: OnceLock<Broken>,
+    /// The threads on no fiber blocked on a scope of this pool now ([`block`]): woken as the
+    /// pool breaks and as each worker of a broken pool ends.
+    #[cfg(not(blaze_check))]
+    waiters: Lock<Vec<Thread>>,
+    /// What a test makes its idle parks do ([`park_plant`]).
+    #[cfg(all(test, not(blaze_check)))]
+    park_plant: AtomicU32,
     #[cfg(test)]
     critical: AtomicUsize,
 }
@@ -964,6 +1078,12 @@ impl Pool {
             #[cfg(not(blaze_check))]
             abandoned: AtomicBool::new(false),
             left: AtomicUsize::new(0),
+            #[cfg(not(blaze_check))]
+            broken: OnceLock::new(),
+            #[cfg(not(blaze_check))]
+            waiters: Lock::new("graph.pool.scope_waiters", Vec::new()),
+            #[cfg(all(test, not(blaze_check)))]
+            park_plant: AtomicU32::new(park_plant::PARKS),
             #[cfg(test)]
             critical: AtomicUsize::new(0),
         });
@@ -982,6 +1102,14 @@ impl Pool {
             return Ok(Pool::drive(shared, deques, topology, stealing));
             #[cfg(blaze_check)]
             unreachable!("the model checker's targets have threads");
+        }
+        #[cfg(not(blaze_check))]
+        {
+            let mut live = LIVE.lock();
+            live.retain(|it| it.strong_count() > 0);
+            live.push(Arc::downgrade(&shared)); // alloc: a pool's entry, once a pool
+            drop(live);
+            blaze_mem::tag::heap_wakes_by(wake_for_give_back);
         }
         let (ready_tx, ready_rx) = crossbeam_channel::unbounded::<io::Result<()>>();
         let mut threads = Vec::with_capacity(deques.len());
@@ -1002,25 +1130,47 @@ impl Pool {
                     // clone: a reference count, once per worker thread
                     let after = Arc::clone(&shared);
                     if ok {
+                        // A worker counts for every heap give-back while its loop runs: a purge
+                        // waits for its give-back before it reads the footprint.
+                        let _settles = blaze_mem::tag::count_heap_settles();
                         let group = shared.slots[index].group as usize;
-                        work(
-                            &Local {
-                                shared,
-                                index,
-                                group,
-                                node: cpu.node,
-                                deque,
-                                lifo: Cell::new(0),
-                                seed: Cell::new(worker_seed(stealing.seed, index)),
-                                victims: stealing.victims,
-                            },
-                            None,
-                        );
+                        let local = Local {
+                            shared,
+                            index,
+                            group,
+                            node: cpu.node,
+                            deque,
+                            lifo: Cell::new(0),
+                            seed: Cell::new(worker_seed(stealing.seed, index)),
+                            victims: stealing.victims,
+                        };
+                        #[cfg(blaze_check)]
+                        work(&local, None);
+                        // A panic of the loop itself (a job's is the job's failure, caught where
+                        // it runs) ends this worker: the pool stops for it, so no one waits on
+                        // jobs it would have run (rule 20).
+                        #[cfg(not(blaze_check))]
+                        if let Err(panic) = catch_unwind(AssertUnwindSafe(|| work(&local, None))) {
+                            let said = panic
+                                .downcast_ref::<String>()
+                                .map(String::as_str)
+                                .or_else(|| panic.downcast_ref::<&str>().copied())
+                                .unwrap_or("a panic of no message");
+                            // alloc: the error of a pool that stops, once
+                            after.broke(index, Unable::Loop(said.to_owned()));
+                        }
                     }
                     // Its loop returned, or never began: the stopper waits for each ([`Pool::stop`]).
                     after.left.fetch_add(1, Ordering::SeqCst);
                     #[cfg(not(blaze_check))]
-                    after.unpark_stopper();
+                    {
+                        after.unpark_stopper();
+                        // A thread blocked on a scope of a broken pool fails once no worker is
+                        // left to run the scope's jobs: each that ends has it look.
+                        if after.broken.get().is_some() {
+                            after.wake_waiters();
+                        }
+                    }
                 });
             match spawned {
                 Ok(handle) => threads.push(handle),
@@ -1114,6 +1264,13 @@ impl Pool {
 
     pub fn topology(&self) -> &Topology {
         &self.topology
+    }
+
+    /// Why the pool stopped for an error, if it did: one of its workers could not park, or
+    /// its loop panicked. Its workers end, and every scope on it fails with this.
+    #[cfg(not(blaze_check))]
+    pub fn broken(&self) -> Option<&Broken> {
+        self.shared.broken.get()
     }
 
     pub fn workers(&self) -> usize {
@@ -1305,7 +1462,18 @@ pub(crate) fn threads_here() -> usize {
 /// a scope in the scheduler, joined with the pool's ([`crate::sched::open_scope_on`]), so a job
 /// of it that waits for what the caller makes gives way rather than wait for a caller that
 /// waits for it, and a stall check of the scope's wait sees whether the pool is idle.
+///
+/// # Panics
+///
+/// With the pool's [`Broken`] where the pool stopped for an error: before `f` runs when it had
+/// by then, else once the scope's jobs have run, or, where no worker is left to run them, once
+/// the last worker has ended (those jobs are never run, and what they borrow is never used).
 fn scope_in<'env, R>(shared: &Shared, f: impl FnOnce(&Scope<'env>) -> R) -> R {
+    // A pool stopped for an error runs nothing more: the scope fails before it gives it a job.
+    #[cfg(not(blaze_check))]
+    if let Some(broken) = shared.broken.get() {
+        panic!("{broken}");
+    }
     let pending = Pending {
         count: AtomicUsize::new(1),
         finished: AtomicBool::new(false),
@@ -1323,19 +1491,42 @@ fn scope_in<'env, R>(shared: &Shared, f: impl FnOnce(&Scope<'env>) -> R) -> R {
     drop(Left(&raw const pending));
     #[cfg(not(blaze_check))]
     {
+        // A thread on no fiber parks for the wait ([`block`]), which reads what it waits on
+        // here: the pool's break wakes it, and it ends a wait no worker is left to end. A job
+        // switches out instead, and may resume on another thread: it names nothing here.
+        let waiting = ScopeWait {
+            shared: ptr::from_ref(shared),
+            counter: pending.counter,
+            let_go: Cell::new(false),
+        };
+        let named = crate::sched::fiber::current_job().is_none().then(|| Named::new(&waiting));
         let waited = crate::wait::wait(crate::wait::WaitOn::Scope(pending.counter.0), None, || {
             crate::sched::wait(crate::sched::Wait::Counter(pending.counter))
         });
+        drop(named);
         if let Err(cycle) = waited {
             panic!(
                 "a scope's caller closed a cycle of waits, which its scope's jobs would have: {cycle:?}"
             );
         }
-        // The last job released the counter just before it says so, as the last thing it does.
-        crate::spin::SpinWait::until("a scope's last job to let go of it", || {
-            pending.finished.load(Ordering::Acquire)
-        });
+        // Whether the pool broke and its last worker ended with jobs of this scope never run:
+        // the wait ended as `block` let go of the scope's count, and `finished` is never set.
+        // Read in this order: a worker has ended only after every job it ran said so.
+        let lost = shared.ended_broken().is_some() && !pending.finished.load(Ordering::Acquire);
+        if !lost {
+            // The last job released the counter just before it says so, as the last thing it
+            // does.
+            crate::spin::SpinWait::until("a scope's last job to let go of it", || {
+                pending.finished.load(Ordering::Acquire)
+            });
+        }
         crate::sched::close_scope(pending.counter);
+        // A scope on a pool that stopped for an error fails with it, whatever its jobs made:
+        // the process does not go on as if its pool were whole.
+        if let Some(broken) = shared.broken.get() {
+            drop(result);
+            panic!("{broken}");
+        }
     }
     #[cfg(blaze_check)]
     while !pending.finished.load(Ordering::Acquire) {
@@ -1858,6 +2049,43 @@ impl Shared {
         }
     }
 
+    /// Stops the pool for an error: its worker `worker` could not go on, as `why` says. The
+    /// first such is kept ([`Pool::broken`]) and said on standard error, once; every worker is
+    /// woken, to run what is queued and end without parking again ([`work`]), and every thread
+    /// blocked on a scope of the pool, to fail with it once it can ([`block`]).
+    #[cfg(not(blaze_check))]
+    #[cold]
+    fn broke(&self, worker: usize, why: Unable) {
+        let broken =
+            Broken { worker, group: self.slots[worker].group, workers: self.slots.len(), why };
+        if self.broken.set(broken).is_ok()
+            && let Some(broken) = self.broken.get()
+        {
+            eprintln!("error: {broken}");
+        }
+        self.unpark_workers();
+        self.wake_waiters();
+    }
+
+    /// Wakes every thread blocked on a scope of the pool, to look at the pool again.
+    #[cfg(not(blaze_check))]
+    fn wake_waiters(&self) {
+        // Taken out of the lock before any wake: a wake is a system call.
+        // alloc: a few threads' handles, as a pool breaks and as its workers end
+        let waiters: Vec<Thread> = self.waiters.lock().clone();
+        for thread in waiters {
+            thread.unpark();
+        }
+    }
+
+    /// Why the pool stopped for an error, once every worker of it has ended: nothing queued
+    /// in it or parked on it runs again. Only a pool with threads of its own breaks.
+    #[cfg(not(blaze_check))]
+    fn ended_broken(&self) -> Option<&Broken> {
+        let broken = self.broken.get()?;
+        (self.left.load(Ordering::SeqCst) >= self.slots.len()).then_some(broken)
+    }
+
     /// What a stop counts as the pool's progress: the jobs ended, and those parked.
     #[cfg(not(blaze_check))]
     fn progress(&self) -> (u64, usize) {
@@ -2233,41 +2461,59 @@ impl Local {
 
     /// A worker of its own thread parks, marked asleep ([`Local::sleep`]), until a job queued
     /// wakes it or a timed wait is due; the last to sleep with jobs parked checks for a stall.
-    fn park(&self, ended: &impl Fn() -> bool) {
+    ///
+    /// # Errors
+    ///
+    /// The park's, when the kernel refused the wait: the worker did not park, and stops the
+    /// pool with it ([`work`]).
+    fn park(&self, ended: &impl Fn() -> bool) -> Result<(), blaze_core::wait::WaitError> {
         let shared = &*self.shared;
         let slot = &shared.slots[self.index];
+        #[cfg(not(blaze_check))]
         {
-            #[cfg(not(blaze_check))]
+            #[cfg(test)]
+            if shared.park_plant.load(Ordering::SeqCst) != park_plant::PARKS {
+                return Err(blaze_core::wait::WaitError::io(
+                    IDLE_PARK,
+                    io::Error::new(io::ErrorKind::Unsupported, "a test's kernel refuses the wait"),
+                ));
+            }
+            // A timed wait of a pool's job ends only as a worker of its scheduler looks at
+            // the clock.
+            let due = crate::sched::until_due(&shared.sched);
+            // Outside any job: the free pages this thread's heaps keep go back if a release
+            // asked since it last gave them (memcap5); nothing otherwise.
+            blaze_mem::tag::settle_heap();
+            crate::sched::idle(&shared.sched, true);
+            let parked = DriverSpan::open(Driving::Idle);
+            let waited = if shared.parked.load(Ordering::Acquire) != 0
+                && pool_idle(ptr::from_ref(shared).expose_provenance())
             {
-                // A timed wait of a pool's job ends only as a worker of its scheduler looks at
-                // the clock.
-                let due = crate::sched::until_due(&shared.sched);
-                // Outside any job: the free pages this thread's heaps keep go back if a release
-                // asked since it last gave them (memcap5); nothing otherwise.
-                blaze_mem::tag::settle_heap();
-                crate::sched::idle(&shared.sched, true);
-                let parked = DriverSpan::open(Driving::Idle);
-                if shared.parked.load(Ordering::Acquire) != 0
-                    && pool_idle(ptr::from_ref(shared).expose_provenance())
-                {
-                    // The last to sleep with jobs parked: none of them wakes unless a job ends a
-                    // wait, so after a while with none, the scheduler checks for a stall.
+                // The last to sleep with jobs parked: none of them wakes unless a job ends a
+                // wait, so after a while with none, the scheduler checks for a stall.
+                let waited =
                     slot.park_for(Some(due.map_or(STALL_AFTER, |due| due.min(STALL_AFTER))));
-                    if slot.sleeping.load(Ordering::SeqCst) && !ended() && !shared.any_work() {
-                        _ = crate::sched::check_stall(&shared.sched);
-                    }
-                } else {
-                    slot.park_for(due);
+                if waited.is_ok()
+                    && slot.sleeping.load(Ordering::SeqCst)
+                    && !ended()
+                    && !shared.any_work()
+                {
+                    _ = crate::sched::check_stall(&shared.sched);
                 }
-                drop(parked);
-                crate::sched::idle(&shared.sched, false);
-                crate::sched::fire_due(&shared.sched);
-            }
-            #[cfg(blaze_check)]
-            {
-                let _ = (slot, ended);
-                thread::park();
-            }
+                waited
+            } else {
+                slot.park_for(due)
+            };
+            drop(parked);
+            crate::sched::idle(&shared.sched, false);
+            crate::sched::fire_due(&shared.sched);
+            waited
+        }
+        #[cfg(blaze_check)]
+        {
+            let _ = (slot, ended);
+            thread::park();
+            Ok(())
         }
     }
 }
@@ -2366,6 +2612,8 @@ fn work(local: &Local, turns: Option<&crate::sched::Turns<'_>>) {
     };
     #[cfg(blaze_check)]
     let ran = || debug_assert!(turns.is_none(), "the model checker's pools have threads");
+    // The error of a park the kernel refused, until the loop stops the pool with it.
+    let refused: Cell<Option<blaze_core::wait::WaitError>> = Cell::new(None);
     let park = |ended: &dyn Fn() -> bool| match turns {
         #[cfg(not(blaze_check))]
         Some(turns) => {
@@ -2374,7 +2622,11 @@ fn work(local: &Local, turns: Option<&crate::sched::Turns<'_>>) {
             crate::sched::idle(&local.shared.sched, false);
             crate::sched::fire_due(&local.shared.sched);
         }
-        _ => local.park(&ended),
+        _ => {
+            if let Err(error) = local.park(&ended) {
+                refused.set(Some(error));
+            }
+        }
     };
     let shared = &*local.shared;
     #[cfg(not(blaze_check))]
@@ -2395,6 +2647,18 @@ fn work(local: &Local, turns: Option<&crate::sched::Turns<'_>>) {
     // start: closed before a job runs, as the job's fiber would take it along.
     let mut search: Option<DriverSpan> = None;
     loop {
+        // Its park was refused: it cannot wait, so the pool stops for it, and no thread is
+        // left waiting on jobs a worker that ended unheard would have run.
+        #[cfg(not(blaze_check))]
+        if let Some(error) = refused.take() {
+            #[cfg(test)]
+            if shared.park_plant.load(Ordering::SeqCst) == park_plant::FAILS_AND_ENDS_SILENTLY {
+                break;
+            }
+            shared.broke(local.index, Unable::Park(error));
+        }
+        #[cfg(blaze_check)]
+        let _ = refused.take();
         search.get_or_insert_with(|| DriverSpan::open(Driving::Search));
         #[cfg(not(blaze_check))]
         crate::sched::fire_due(&shared.sched);
@@ -2422,6 +2686,19 @@ fn work(local: &Local, turns: Option<&crate::sched::Turns<'_>>) {
             local.run(&mut runner, job);
             ran();
             continue;
+        }
+        // A pool stopped for an error: its workers park no more. Each runs what it finds
+        // queued, as above, and ends once nothing is; a job queued after the last has ended is
+        // never run, and its scope's caller fails rather than wait for it ([`block`]).
+        #[cfg(not(blaze_check))]
+        if shared.broken.get().is_some() {
+            if shared.any_work() {
+                if !drain.spin() {
+                    drain = crate::spin::SpinWait::new();
+                }
+                continue;
+            }
+            break;
         }
         if shared.stop.load(Ordering::SeqCst) {
             // Every job given before the stop is run, and every parked one resumed and run:
@@ -2488,8 +2765,20 @@ pub(crate) fn block_until(until: &dyn Fn() -> bool) {
 
 /// [`block_until`], and returns by `deadline` (on [`crate::sched::now`]'s clock) at the latest,
 /// whether `until` holds or not: a stopping pool's bounded wait ([`stop_bounded`]).
+///
+/// A thread whose wait is on a scope of a pool with threads of its own ([`scope_in`] names it)
+/// is listed with that pool while it blocks, and woken as the pool stops for an error
+/// ([`Broken`]) and as its workers end. Once the last has ended and the wait has not, nothing
+/// is left to end it: the thread lets go of the scope's own count, as the scope's last job
+/// would have, which ends the wait where every job still counted never began; where jobs of
+/// the scope are parked, which hold counts of their own and are never resumed, the wait can
+/// never end and the scheduler has no way to fail the wait of a thread on no fiber, so the
+/// process ends, saying so ([`cannot_go_on`]).
 #[cfg(not(blaze_check))]
 fn block(until: &dyn Fn() -> bool, deadline: Option<u64>) {
+    // Taken for this call alone: a `block` further down this thread's stack (a pool dropped
+    // by a job this thread drives) waits on something else.
+    let scope = Blocked::take();
     // How long until the deadline, if one: `Some(ZERO)` once it is past.
     let left = || {
         deadline.map(|at| std::time::Duration::from_nanos(at.saturating_sub(crate::sched::now())))
@@ -2505,6 +2794,19 @@ fn block(until: &dyn Fn() -> bool, deadline: Option<u64>) {
     loop {
         if until() || left().is_some_and(|it| it.is_zero()) {
             return;
+        }
+        if let Some(waiting) = scope.waiting()
+            && let Some(broken) = waiting.pool().ended_broken()
+        {
+            // Looked at again: the last worker's last job may have ended the wait as it ended.
+            if until() {
+                return;
+            }
+            if !waiting.let_go.replace(true) {
+                crate::sched::release(waiting.counter);
+                continue;
+            }
+            cannot_go_on(broken);
         }
         match drive_round() {
             // A client of pools with threads of their own: its waker unparks it.
@@ -2544,6 +2846,101 @@ fn block(until: &dyn Fn() -> bool, deadline: Option<u64>) {
             }
         }
     }
+}
+
+/// What a thread on no fiber waits on in [`scope_in`]: the scope's pool and its counter, on the
+/// stack of that call for as long as the wait.
+#[cfg(not(blaze_check))]
+struct ScopeWait {
+    shared: *const Shared,
+    counter: crate::sched::CounterId,
+    /// Whether [`block`] let go of the scope's own count, which it does once.
+    let_go: Cell<bool>,
+}
+
+#[cfg(not(blaze_check))]
+impl ScopeWait {
+    fn pool(&self) -> &Shared {
+        // SAFETY: `scope_in` made this of the `&Shared` it holds until its wait is over, and
+        // it is read only during that wait, on the same thread.
+        unsafe { &*self.shared }
+    }
+}
+
+#[cfg(not(blaze_check))]
+thread_local! {
+    /// The scope this thread, on no fiber, is about to wait on or waits on ([`scope_in`]), or
+    /// null. Never set by a job: a job that waits switches out and may resume elsewhere.
+    static SCOPE_WAIT: Cell<*const ScopeWait> = const { Cell::new(ptr::null()) };
+}
+
+/// [`SCOPE_WAIT`] naming a [`ScopeWait`] while this lives, and what it named before after.
+#[cfg(not(blaze_check))]
+struct Named(*const ScopeWait);
+
+#[cfg(not(blaze_check))]
+impl Named {
+    fn new(waiting: &ScopeWait) -> Named {
+        Named(SCOPE_WAIT.replace(ptr::from_ref(waiting)))
+    }
+}
+
+#[cfg(not(blaze_check))]
+impl Drop for Named {
+    fn drop(&mut self) {
+        SCOPE_WAIT.set(self.0);
+    }
+}
+
+/// The scope a [`block`] waits on, taken from [`SCOPE_WAIT`] and its thread listed with the
+/// scope's pool, for as long as this lives.
+#[cfg(not(blaze_check))]
+struct Blocked(*const ScopeWait);
+
+#[cfg(not(blaze_check))]
+impl Blocked {
+    fn take() -> Blocked {
+        let blocked = Blocked(SCOPE_WAIT.replace(ptr::null()));
+        if let Some(waiting) = blocked.waiting() {
+            // alloc: grows to the most threads blocked on the pool's scopes at once
+            waiting.pool().waiters.lock().push(thread::current());
+        }
+        blocked
+    }
+
+    fn waiting(&self) -> Option<&ScopeWait> {
+        // SAFETY: null, or the `ScopeWait` on the stack of the `scope_in` whose wait this
+        // `block` is, on this thread: it outlives the wait, which this is inside.
+        unsafe { self.0.as_ref() }
+    }
+}
+
+#[cfg(not(blaze_check))]
+impl Drop for Blocked {
+    fn drop(&mut self) {
+        if let Some(waiting) = self.waiting() {
+            let me = thread::current().id();
+            let mut waiters = waiting.pool().waiters.lock();
+            if let Some(at) = waiters.iter().position(|it| it.id() == me) {
+                waiters.swap_remove(at);
+            }
+        }
+        SCOPE_WAIT.set(self.0);
+    }
+}
+
+/// A thread waits on a scope of a pool that stopped for `broken`, whose workers have all ended
+/// with jobs of the scope parked: nothing is left to resume them, so the wait can never end,
+/// and it cannot be failed (the scheduler ends the wait of a thread on no fiber only as what
+/// it waits for ends). The process ends, saying so: the hang this was is the alternative.
+#[cfg(not(blaze_check))]
+#[cold]
+fn cannot_go_on(broken: &Broken) -> ! {
+    eprintln!(
+        "error: {broken}; a thread waits on a scope of that pool whose jobs are parked with no worker left to resume \
+         them, so its wait can never end and the process ends here (rule bounded-progress)"
+    );
+    std::process::abort()
 }
 
 /// `rx.recv()` on a thread on no fiber, for the channel `name`. Where the target has threads,
@@ -4581,6 +4978,363 @@ mod tests {
         }
         for _ in 0..pool.workers() {
             assert!(rx.recv_timeout(LONG).unwrap().is_some());
+        }
+    }
+}
+
+/// A pool one of whose workers cannot wait ([`Broken`]): it stops for the wait's error, and a
+/// thread that waits on a scope of it fails with that error rather than wait, where once the
+/// worker ended unheard and the thread waited forever (a build script's `rustc`, blaze itself,
+/// under the sandbox's filter: `blaze build` of anything that depends on anyhow hung). And the
+/// cause of that on Linux, with the cause removed: a process under a seccomp filter that
+/// refuses io_uring, as the sandbox's does, parks and wakes its workers on the direct driver
+/// (`blaze_core::wait::choose_from_env`) and never asks for a ring.
+#[cfg(all(test, not(blaze_check)))]
+#[allow(clippy::disallowed_types, reason = "a test's own bookkeeping, off every hot path")]
+mod broken {
+    use std::{
+        panic::{AssertUnwindSafe, catch_unwind},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    };
+
+    use crossbeam_channel::bounded;
+
+    use super::{Pool, Unable, park_plant};
+    use crate::topology::{Cpu, Topology};
+
+    const LONG: Duration = Duration::from_secs(60);
+    /// How long the control gives a waiter that will never end before it says so.
+    const NEVER: Duration = Duration::from_secs(3);
+
+    fn two_groups_of_two() -> Topology {
+        let cpu = |id| Cpu { id, group: id / 2, socket: 0, node: 0, fast: true };
+        Topology { cpus: (0..4).map(cpu).collect() }
+    }
+
+    fn until(what: &str, done: impl Fn() -> bool) {
+        crate::spin::SpinWait::within(what, LONG, done);
+    }
+
+    fn message(panic: &(dyn std::any::Any + Send)) -> String {
+        panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic.downcast_ref::<&str>().map(|it| (*it).to_owned()))
+            .unwrap_or_default()
+    }
+
+    /// Makes `pool`'s idle parks do as `plant` says from now on, each worker woken to meet it.
+    fn plant(pool: &Pool, plant: u32) {
+        pool.shared.park_plant.store(plant, Ordering::SeqCst);
+        pool.shared.unpark_workers();
+    }
+
+    fn ended(pool: &Pool) -> usize {
+        pool.shared.left.load(Ordering::SeqCst)
+    }
+
+    /// A thread of its own opens a scope on `pool` and gives it `job`: how the scope ended
+    /// within `bound` (its panic's message when it failed), or `None` while it still waits.
+    fn scoped_waiter(
+        pool: &Arc<Pool>,
+        job: impl FnOnce() + Send + 'static,
+        bound: Duration,
+    ) -> Option<Result<(), String>> {
+        let (tx, rx) = bounded(1);
+        let pool = Arc::clone(pool);
+        std::thread::Builder::new()
+            .name("scoped-waiter".to_owned())
+            .spawn(move || {
+                let scoped = catch_unwind(AssertUnwindSafe(|| {
+                    pool.scope(|scope| scope.submit(None, job, |_| ()));
+                }));
+                _ = tx.send(scoped.map_err(|panic| message(&*panic)));
+            })
+            .unwrap();
+        rx.recv_timeout(bound).ok()
+    }
+
+    /// A pool of four whose every worker met a park that fails as `planted` says and ended,
+    /// and what a thread that then waits on a scope of it got within `bound`.
+    fn waiter_on_a_pool_whose_parks_fail(
+        planted: u32,
+        bound: Duration,
+    ) -> (Arc<Pool>, Option<Result<(), String>>) {
+        let pool = Arc::new(Pool::new(&two_groups_of_two(), false).unwrap());
+        plant(&pool, planted);
+        until("every worker to end at its refused park", || ended(&pool) == pool.workers());
+        let waited = scoped_waiter(&pool, || (), bound);
+        (pool, waited)
+    }
+
+    /// The invariant (tested): a pool whose worker cannot park stops with the park's error,
+    /// and a thread that waits on a scope of it fails with that error, naming the worker and
+    /// the wait, within a bound: none waits for jobs no worker is left to run.
+    #[test]
+    fn a_worker_that_cannot_park_stops_the_pool_and_its_scoped_waiter_fails_with_the_wait() {
+        let (pool, waited) = waiter_on_a_pool_whose_parks_fail(park_plant::FAILS, LONG);
+        let broken = pool.broken().expect("the pool stopped for the park's error");
+        assert!(broken.worker < 4 && broken.group < 2 && broken.workers == 4, "{broken:?}");
+        let Unable::Park(error) = &broken.why else { panic!("{broken:?}") };
+        assert_eq!(error.what(), super::IDLE_PARK);
+        let said = match waited {
+            Some(Err(said)) => said,
+            Some(Ok(())) => panic!("the scope of a stopped pool returned as if its job had run"),
+            None => panic!("the waiter still waited after 60 s on a pool with no worker left"),
+        };
+        assert_eq!(said, broken.to_string());
+        for names in ["could not park", super::IDLE_PARK, "bounded-progress"] {
+            assert!(said.contains(names), "the failure does not say `{names}`: {said}");
+        }
+        // The pool's drop ends: its workers are counted as ended.
+        drop(pool);
+    }
+
+    /// The control: a worker whose park fails and that ends telling no one (the bug) leaves
+    /// the waiter parked, which the bound of the test above would have caught.
+    #[test]
+    fn the_oracle_catches_a_worker_that_ends_silently() {
+        let planted = park_plant::FAILS_AND_ENDS_SILENTLY;
+        let (pool, waited) = waiter_on_a_pool_whose_parks_fail(planted, NEVER);
+        assert!(pool.broken().is_none(), "the planted worker told the pool");
+        assert_eq!(
+            waited, None,
+            "a waiter on a pool whose workers ended unheard came back: the plant plants nothing"
+        );
+        // The waiter's thread keeps the pool, parked for good: the bug, kept until the test
+        // binary ends.
+    }
+
+    /// A scope whose job runs as the pool breaks is waited for to its end, so nothing it
+    /// borrows is used after, and then fails with the pool's error.
+    #[test]
+    fn a_scope_whose_job_runs_as_the_pool_breaks_ends_and_then_fails() {
+        let pool = Arc::new(Pool::new(&two_groups_of_two(), false).unwrap());
+        let (began_tx, began_rx) = bounded::<()>(1);
+        let (go_tx, go_rx) = bounded::<()>(1);
+        let ran = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = bounded(1);
+        {
+            let (pool, ran) = (Arc::clone(&pool), Arc::clone(&ran));
+            std::thread::Builder::new()
+                .name("scoped-waiter".to_owned())
+                .spawn(move || {
+                    let scoped = catch_unwind(AssertUnwindSafe(|| {
+                        pool.scope(|scope| {
+                            scope.submit(
+                                None,
+                                || {
+                                    began_tx.send(()).unwrap();
+                                    go_rx.recv_timeout(LONG).unwrap();
+                                    ran.store(true, Ordering::SeqCst);
+                                },
+                                |it| it.unwrap(),
+                            );
+                        });
+                    }));
+                    _ = tx.send(scoped.map_err(|panic| message(&*panic)));
+                })
+                .unwrap();
+        }
+        began_rx.recv_timeout(LONG).unwrap();
+        plant(&pool, park_plant::FAILS);
+        // The three idle workers end at their park; the fourth is inside the job.
+        until("the idle workers to end at their refused park", || ended(&pool) == 3);
+        assert!(pool.broken().is_some());
+        assert!(rx.try_recv().is_err(), "the scope ended while its job ran");
+        go_tx.send(()).unwrap();
+        let said = rx.recv_timeout(LONG).unwrap().expect_err("a scope of a stopped pool returned");
+        assert!(ran.load(Ordering::SeqCst), "the scope failed before its job had ended");
+        assert_eq!(said, pool.broken().unwrap().to_string());
+        until("the last worker to end", || ended(&pool) == 4);
+    }
+
+    /// The variable that makes this test binary, run again, a process under a filter that
+    /// refuses io_uring: `direct` for one the sandbox launcher marked, `ring` for one it did not.
+    #[cfg(target_os = "linux")]
+    const UNDER_FILTER: &str = "__BLAZE_GRAPH_TEST_UNDER_FILTER";
+
+    /// Installs, for this thread and those it starts, a seccomp filter that answers
+    /// `io_uring_setup` with `ENOSYS` and allows every other call: the part of the sandbox's
+    /// filter (`blaze-cargo/src/sandbox/linux.rs`, `filter_program`) a blaze inside it meets.
+    #[cfg(target_os = "linux")]
+    fn refuse_io_uring() {
+        let insn =
+            |code: u32, jt: u8, jf: u8, k: u32| libc::sock_filter { code: code as u16, jt, jf, k };
+        let (load, jump, ret) = (
+            libc::BPF_LD | libc::BPF_W | libc::BPF_ABS,
+            libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
+            libc::BPF_RET | libc::BPF_K,
+        );
+        let mut filter = [
+            // The call's number, which is `io_uring_setup`'s or not.
+            insn(load, 0, 0, 0),
+            insn(jump, 0, 1, libc::SYS_io_uring_setup as u32),
+            insn(ret, 0, 0, libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32),
+            insn(ret, 0, 0, libc::SECCOMP_RET_ALLOW),
+        ];
+        let program = libc::sock_fprog { len: filter.len() as u16, filter: filter.as_mut_ptr() };
+        let (on, no): (libc::c_ulong, libc::c_ulong) = (1, 0);
+        // SAFETY: `prctl` with integer arguments, each the `unsigned long` it reads; `seccomp`
+        // reads `program` and the filter it points at, both live for the call, and keeps a
+        // copy of its own.
+        unsafe {
+            assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, on, no, no, no), 0, "no_new_privs");
+            let installed = libc::syscall(
+                libc::SYS_seccomp,
+                libc::SECCOMP_SET_MODE_FILTER,
+                0,
+                std::ptr::from_ref(&program),
+            );
+            assert_eq!(installed, 0, "seccomp: {}", std::io::Error::last_os_error());
+        }
+    }
+
+    /// What `io_uring_setup` answers this thread: the error's number.
+    #[cfg(target_os = "linux")]
+    fn io_uring_setup_errno() -> Option<i32> {
+        // SAFETY: a null `io_uring_params`, which a kernel that takes the call refuses
+        // (`EFAULT`) before it makes anything.
+        let made = unsafe {
+            libc::syscall(libc::SYS_io_uring_setup, 8u32, std::ptr::null_mut::<libc::c_void>())
+        };
+        assert!(made < 0, "io_uring_setup with no parameters made a ring");
+        std::io::Error::last_os_error().raw_os_error()
+    }
+
+    /// The failing scenario, in a process of its own: under the filter, the driver chosen as
+    /// blaze's `main` chooses it, a pool's workers park idle and are woken by jobs eight
+    /// times over, and a loop of [`crate::par`] runs on the process's own pool from this
+    /// thread, as the probe of a build script's `rustc` does. Which driver it chose.
+    #[cfg(target_os = "linux")]
+    fn park_and_wake_under_the_filter() -> blaze_core::wait::Waits {
+        use std::sync::atomic::AtomicUsize;
+        refuse_io_uring();
+        assert_eq!(io_uring_setup_errno(), Some(libc::ENOSYS), "the filter is not in force");
+        let waits = blaze_core::wait::choose_from_env().unwrap();
+        let pool = Pool::new(&two_groups_of_two(), false).unwrap();
+        let sum = AtomicUsize::new(0);
+        for _ in 0..8 {
+            // A pool that broke never goes idle: its scope, next, says why.
+            until("every worker to park idle", || pool.idle() || pool.broken().is_some());
+            pool.scope(|scope| {
+                for n in 0..64usize {
+                    let sum = &sum;
+                    let add = move || sum.fetch_add(n, Ordering::SeqCst);
+                    scope.submit(None, add, |it| _ = it.unwrap());
+                }
+            });
+        }
+        assert_eq!(sum.load(Ordering::SeqCst), 8 * (0..64).sum::<usize>());
+        assert!(pool.broken().is_none(), "{:?}", pool.broken());
+        drop(pool);
+        let seen = AtomicUsize::new(0);
+        let again = crate::par::for_each_giving_way(
+            256,
+            |_| _ = seen.fetch_add(1, Ordering::SeqCst),
+            |_| false,
+        );
+        assert!(again.is_empty() && seen.load(Ordering::SeqCst) == 256);
+        assert!(crate::exec::shared().broken().is_none());
+        waits
+    }
+
+    /// This test binary run again with [`UNDER_FILTER`]: does [`park_and_wake_under_the_filter`]
+    /// before libtest's `main`, as the process's one thread, and ends: 0 having said the
+    /// driver, 3 having said the panic.
+    #[cfg(target_os = "linux")]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a test binary run again as another process: told so by a variable, and ended here, before \
+                  libtest's `main`"
+    )]
+    extern "C" fn take_over() {
+        if std::env::var_os(UNDER_FILTER).is_none() {
+            return;
+        }
+        let code = match catch_unwind(park_and_wake_under_the_filter) {
+            Ok(waits) => {
+                println!("parked and woke its workers on {waits:?}");
+                0
+            }
+            Err(panic) => {
+                eprintln!("failed: {}", message(&*panic));
+                3
+            }
+        };
+        std::process::exit(code)
+    }
+
+    // SAFETY: the loader calls each entry of this section as a function as the binary loads,
+    // before `main`, when the process is one thread. The entry is `take_over`, an
+    // `extern "C" fn()`: the loader passes it `argc`, `argv` and `envp`, which the C calling
+    // convention lets it ignore. Anything but a function pointer there would be called as code.
+    #[cfg(target_os = "linux")]
+    #[used]
+    #[unsafe(link_section = ".init_array")]
+    static TAKE_OVER: extern "C" fn() = take_over;
+
+    /// Runs this test binary again under the filter, marked as the sandbox marks what it
+    /// launches or not: its exit status and what it wrote, within a bound.
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::disallowed_methods, reason = "a test's child: this test binary, run again")]
+    fn under_the_filter(marked: bool) -> (std::process::ExitStatus, String) {
+        use blaze_core::wait::{Clock as _, Deadline, Monotonic, Waited};
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .env(UNDER_FILTER, if marked { "direct" } else { "ring" })
+            .env_remove(blaze_core::wait::SANDBOXED)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if marked {
+            command.env(blaze_core::wait::SANDBOXED, "1");
+        }
+        let mut child = command.spawn().unwrap();
+        let clock = Monotonic::new();
+        let deadline = Some(Deadline::after(clock.now(), LONG));
+        let pid = i32::try_from(child.id()).unwrap();
+        let what = "the test binary run again under a filter that refuses io_uring";
+        if blaze_core::wait::exited(what, pid, deadline, &clock).unwrap() == Waited::Deadline {
+            child.kill().unwrap();
+            panic!("{what} did not end within 60 s: its threads wait for workers that ended");
+        }
+        let out = child.wait_with_output().unwrap();
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status, said)
+    }
+
+    /// The invariant (tested): a process the sandbox launcher marked, under a filter that
+    /// refuses io_uring as the sandbox's does, parks and wakes its pool's workers and runs a
+    /// parallel loop to its end on the direct driver, and makes no ring.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_sandboxed_process_parks_its_workers_with_no_io_uring() {
+        let (status, said) = under_the_filter(true);
+        assert!(status.success(), "{status}: {said}");
+        assert!(said.contains("parked and woke its workers on Direct"), "{said}");
+        assert!(!said.contains("io_uring"), "it asked for a ring: {said}");
+    }
+
+    /// The control (the cause, put back): the same process not marked waits on its ring,
+    /// which the filter refuses, and fails naming `io_uring_setup` and the worker that could
+    /// not park. It ends, where before it hung; a ring that worked under the filter would
+    /// mean the test above proves nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_oracle_catches_a_sandboxed_process_on_the_ring() {
+        let (status, said) = under_the_filter(false);
+        assert_eq!(status.code(), Some(3), "{status}: {said}");
+        for names in ["could not park", "io_uring_setup", "__BLAZE_SANDBOXED"] {
+            assert!(said.contains(names), "the failure does not say `{names}`: {said}");
         }
     }
 }

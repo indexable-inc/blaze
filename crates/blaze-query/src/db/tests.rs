@@ -21,11 +21,12 @@ use blaze_core::lock::Lock;
 
 use super::{
     AsId, Cancelled, Cause, Counts, Cycle, Database, DatabaseKeyIndex, Durability, Event, FromIdIn,
-    Hook, Id, Outcome, Provenance, ReadKind, Reads, Setter, Storage, attach, capture_reads,
+    Hook, Id, Outcome, Provenance, ReadKind, Reads, Setter, Storage, Unread, attach,
+    capture_reads,
     input::field_node,
     owner_is,
     plumbing::{
-        CycleKind, Function, Ingredient, Input, Interned, Tag, Tracked, Vtable, evict_values,
+        CycleKind, Function, Ingredient, Input, Interned, Tag, Tracked, Vtable, durable, evict_values,
         evict_values_of, fetch, input_fields, input_new, input_new_singleton, input_read,
         input_set, input_singleton, intern, intern_by, interned_arguments, interned_fields,
         tracked_fields, tracked_new, value_hash,
@@ -405,6 +406,51 @@ fn a_write_of_a_lower_durability_skips_higher_rows() {
     file.set_a(&mut db, 3);
     assert_eq!(*get::<Double>(&db, library), 10, "now LOW, verified by its edges: unchanged");
     assert_eq!(db.runs("Double"), 2);
+}
+
+/// `plumbing::durable` says a current row read library inputs alone, and
+/// `Storage::durable_view` moves only with a write of kind `HIGH`: a holder that saw a row
+/// durable knows it holds its value while the durable view is the one it saw.
+#[test]
+fn a_durable_row_holds_its_value_while_the_durable_view_is_the_same() {
+    let mut db = TestDb::new();
+    let library = Cell::of(&db, 4, 0, Durability::HIGH);
+    let file = Cell::new(&db, 1, 0);
+    assert!(!durable::<Double>(&db, library), "never run");
+    assert_eq!(*get::<Double>(&db, library), 8);
+    assert_eq!(*get::<Double>(&db, file), 2);
+    assert!(durable::<Double>(&db, library));
+    assert!(!durable::<Double>(&db, file), "it read a LOW input");
+    let seen = db.storage().durable_view();
+
+    file.set_a(&mut db, 2);
+    assert_eq!(db.storage().durable_view(), seen, "a LOW write leaves the durable view");
+    assert!(!durable::<Double>(&db, library), "not current until it is fetched in this view");
+    assert_eq!(*get::<Double>(&db, library), 8);
+    assert_eq!(db.runs("Double"), 2, "the library's row never ran again");
+    assert!(durable::<Double>(&db, library));
+
+    library.set_a(&mut db, 5);
+    assert_ne!(db.storage().durable_view(), seen, "a HIGH write moves it");
+    assert_eq!(db.storage().durable_view(), db.storage().view());
+    assert_eq!(*get::<Double>(&db, library), 10);
+    assert!(durable::<Double>(&db, library));
+}
+
+/// A row whose value was let go is not current: `durable` says no until a fetch makes the
+/// value again, and the durable view is untouched by the eviction.
+#[test]
+fn a_durable_row_whose_value_was_evicted_is_not_current() {
+    let mut db = TestDb::new();
+    let library = Cell::of(&db, 4, 0, Durability::HIGH);
+    let value = *get::<Tens>(&db, library);
+    assert!(durable::<Tens>(&db, library));
+    let seen = db.storage().durable_view();
+    assert_eq!(evict_values::<Tens>(&mut db), 1);
+    assert_eq!(db.storage().durable_view(), seen);
+    assert!(!durable::<Tens>(&db, library));
+    assert_eq!(*get::<Tens>(&db, library), value);
+    assert!(durable::<Tens>(&db, library));
 }
 
 #[test]
@@ -1313,12 +1359,41 @@ fn a_key_the_database_never_gave_is_refused_naming_the_query_and_the_database_st
     for forged in [Id::from_u32(5), Id::from_u32(Id::MAX_U32)] {
         let payload = catch_unwind(AssertUnwindSafe(|| *get::<Double>(&db, Cell(forged))))
             .expect_err("a key of no owned page");
-        let message = message(&*payload);
+        // Typed, so a host names the job's failure by it, and it says what finds the key's
+        // source: the query, the key, its page, that nothing on the task's stack asked (the
+        // test asks from outside any query), and the call stack.
+        let never = payload.downcast_ref::<super::NeverGiven>().expect("a typed unwind");
+        assert_eq!(
+            (never.query, never.key, never.page),
+            ("Double", forged.as_u32(), forged.page())
+        );
+        assert_eq!((never.asker.as_deref(), never.frames), (None, 0));
+        assert!(never.pages > 1 && never.page != 1, "the cell's page was given: {never}");
+        let message = super::unwind_text(&*payload).expect("an engine unwind has a text");
+        assert_eq!(message, never.to_string());
         assert!(message.contains("`Double`") && message.contains("never gave"), "{message}");
+        assert!(message.contains("asked from outside any query"), "{message}");
+        assert!(message.contains("a key of another database, forged"), "{message}");
+        assert!(message.contains("the call stack of the ask"), "{message}");
     }
+    assert_eq!(*get::<Double>(&db, cell), 6);
+
+    // Asked by a query: the unwind names it and its key, the top of its task's stack.
+    let payload = catch_unwind(AssertUnwindSafe(|| *get::<AsksForged>(&db, cell)))
+        .expect_err("a query asking for a key of no owned page");
+    let never = payload.downcast_ref::<super::NeverGiven>().expect("a typed unwind");
+    assert_eq!((never.query, never.key, never.frames), ("Double", 5, 1), "{never}");
+    let asker = never.asker.as_deref().expect("a query asked");
+    assert!(asker.starts_with("`AsksForged` of "), "{asker}");
+    assert!(never.to_string().contains("asked by `AsksForged` of "), "{never}");
     assert_eq!(*get::<Double>(&db, cell), 6);
     drop(db);
 }
+
+query!(AsksForged, u64, |db, key| {
+    let _ = key;
+    *get::<Double>(db, Cell(Id::from_u32(5)))
+});
 
 /// No `Id` lies past the last ID page: `fetch`'s hit path indexes the page directory by an
 /// ID's page with no bounds load, so a key above [`Id::MAX_U32`] (here `u32::MAX`, page
@@ -1599,7 +1674,7 @@ query!(ConfigOrZero, u64, |db, _key| match input_singleton::<Config>(db.storage(
 });
 
 /// Reading a singleton's absence is a dependency: making it reruns exactly those readers,
-/// though it is made after they ran in the same view (queue 01228).
+/// though it is made after they ran in the same view.
 #[test]
 fn making_a_singleton_reruns_what_read_its_absence() {
     let mut db = TestDb::new();
@@ -1919,6 +1994,32 @@ fn a_view_tells_what_each_memo_did_and_why_it_ran() {
         Some((Outcome::ReranSameOutput, Some(Cause::Evicted))),
         "a value of an earlier view, evicted and made again equal"
     );
+}
+
+/// A value read in neither of the last two epochs that wrote goes as the second ends; one read
+/// in each stays; an epoch that wrote nothing lets nothing go and ages nothing (the control:
+/// were it an epoch, `cold` would go one writing epoch sooner).
+#[test]
+fn an_epoch_end_lets_go_of_the_values_two_epochs_left_unread() {
+    let mut db = TestDb::new();
+    let (cold, warm, other) = (Cell::new(&db, 11, 0), Cell::new(&db, 21, 0), Cell::new(&db, 1, 0));
+    assert_eq!((*get::<Tens>(&db, cold), *get::<Tens>(&db, warm)), (1, 2));
+    assert_eq!(db.storage_mut().end_epoch(), Unread::default(), "nothing written yet");
+    let wrote = |db: &mut TestDb, value: u64| {
+        other.set_a(db, value);
+        assert_eq!(*get::<Tens>(&*db, warm), 2);
+        db.storage_mut().end_epoch().values
+    };
+    assert_eq!(wrote(&mut db, 2), 0, "the first epoch that wrote: `cold` was read in it");
+    assert_eq!(db.storage_mut().end_epoch().values, 0, "nothing written since");
+    assert_eq!(db.storage_mut().end_epoch().values, 0, "nothing written since");
+    assert_eq!(wrote(&mut db, 3), 0, "`cold` was read in the epoch before this one");
+    assert_eq!(wrote(&mut db, 4), 1, "`cold`, unread in this epoch and the one before");
+    assert_eq!(wrote(&mut db, 5), 0, "`warm` is read in every epoch");
+    assert_eq!(db.runs("Tens"), 2, "nothing ran again yet");
+    assert_eq!(*get::<Tens>(&db, cold), 1, "let go, made again when asked");
+    assert_eq!(*get::<Tens>(&db, warm), 2);
+    assert_eq!((db.runs_of("Tens", cold.0), db.runs_of("Tens", warm.0)), (2, 1));
 }
 
 #[test]

@@ -87,7 +87,7 @@ const WHOLE_BUDGET: usize = 120_000;
 /// that deep before its loop reaches `Vec::push` and what that calls (`from_iter`, `extend`,
 /// `for_each`, `fold`, two closures, `push`, `reserve`, `needs_to_grow`, `capacity`). At
 /// [`DEPTH`] the build of the kernels was refused 4323 bodies for their depth, and `words`
-/// took 1.43 times release's time rather than 1.36 (dev-aws-6, 2026-10-21).
+/// took 1.43 times release's time rather than 1.36 (x86-64 Linux, 2026-10-21).
 const BUILD_DEPTH: u32 = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

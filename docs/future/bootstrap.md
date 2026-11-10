@@ -80,7 +80,6 @@ a second compiler in the bootstrap, so the seed profile has none of them. Count 
 |---|---|---|
 | llvm-sys | C++ wrappers around LLVM | out: the seed has no LLVM |
 | tree-sitter, tree-sitter-{python,rust,toml-ng} | C parsers | out |
-| flecs-c | the site's Flecs runtime | out |
 | libmimalloc-sys | allocator | out: std's allocator |
 | blake3, blake3-servil | SIMD C and asm | blake3's `wasm32_simd` (Rust simd128, no C); servil is not reached on wasm32. Native builds keep the asm. |
 | zstd-sys | the store's, cold columns', Arrow IPC's and Parquet's compression | vendor/zstd-sys: native builds compile C zstd 1.5.7 (fastest on aarch64); on wasm it compiles no C and links libzstd-rs-sys, a Rust translation of zstd's dev branch after 1.5.7 (it reports 1.5.8), whose bytes matched C's on a store's values, a measurement the blaze-cas and blaze-format fixtures pin (fastest pure-Rust on wasm32; ruzstd has no dictionary encoder). Every caller keeps the `zstd` crate. |

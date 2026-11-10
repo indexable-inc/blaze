@@ -211,6 +211,9 @@ impl Hit {
 /// named when it can't be read, is no indexed profile, or has nothing counted.
 pub fn load(settings: Settings) -> Result<Loaded, String> {
     let path = &settings.path;
+    // Read off the disk by every job that lints with it, and counted as a look: no watch
+    // vouches for it (`blaze_vfs::outside::looks`).
+    blaze_vfs::outside::looked(path);
     let bytes = std::fs::read(path).map_err(|error| {
         format!(
             "the lint profile `{}` (`profile` in {}) can't be read: {error}",

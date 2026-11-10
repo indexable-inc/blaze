@@ -168,7 +168,7 @@ impl Inputs for Fixed {
 
 fn opened(sim: &mut Sim) -> Store {
     let mut effects = Vec::new();
-    let config = Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48 };
+    let config = Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48, load_tags: (1 << 48) + (1 << 32), loader: blaze_cas::Loader::Pumped };
     let mut store = Store::open(config, &mut effects);
     run_until_idle(sim, &mut effects, |completion, effects| {
         store.complete(completion, effects);

@@ -1,5 +1,5 @@
-//! The drop check's overflow (E0320) as rustc reports it, on the two shapes of
-//! `/tmp/blaze-lanes/v2-quadratic`: `param140.rs`, a chain of `let`s each wrapping the last in
+//! The drop check's overflow (E0320) as rustc reports it, on two shapes:
+//! `param140.rs`, a chain of `let`s each wrapping the last in
 //! one more `Option` around a projection rustc cannot see through, and `ident_2000_50.rs`, the
 //! same with fifty `Option`s a step. Past the crate's recursion limit (128) the walk of rustc's
 //! `dropck_outlives` overflows and each local deeper than that is refused, naming the body and

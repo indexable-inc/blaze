@@ -45,7 +45,7 @@ fn object(format: BinaryFormat, defines: &[&str], directives: &str) -> Vec<u8> {
 
 /// A GNU-format archive of `members` (name, bytes, the symbols it defines), with its symbol
 /// index: what both ELF and COFF archives may be.
-fn archive(members: &[(&str, &[u8], &[&str])]) -> Vec<u8> {
+pub(super) fn archive(members: &[(&str, &[u8], &[&str])]) -> Vec<u8> {
     let header = |name: &str, size: usize| {
         format!("{name:<16}{:<12}{:<6}{:<6}{:<8}{size:<10}`\n", 0, 0, 0, 644)
     };

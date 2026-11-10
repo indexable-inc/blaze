@@ -45,6 +45,10 @@ pub struct SharedConfig {
     pub writer: ContentId,
     /// Tags it asks with are `tags..tags + 2^32`.
     pub tags: u64,
+    /// Tags its buffer pool's loads ask with: `load_tags..load_tags + 2^32`, apart from `tags`.
+    pub load_tags: u64,
+    /// How its reads' misses are loaded ([`crate::Loader`]).
+    pub loader: crate::Loader,
 }
 
 /// What a store of a shared directory knows of the other writers.
@@ -111,8 +115,9 @@ impl Store {
             done: 0,
         };
         // alloc: empty, no layers: allocates nothing
-        let mut store =
-            Store::new(Config { dir: own, layers: Vec::new(), tags: config.tags }, Some(peers));
+        let config =
+            Config { dir: own, layers: Vec::new(), tags: config.tags, load_tags: config.load_tags, loader: config.loader };
+        let mut store = Store::new(config, Some(peers));
         store.ask_private(effects);
         store
     }
@@ -232,8 +237,10 @@ impl Store {
             return self.fail(file, why);
         }
         peers.restart.push(at);
-        // The mappings of the opening given up are let go of as they come.
-        self.tags.ops.retain(|_, op| !matches!(op, Op::Map { tier, .. } if *tier == at));
+        // The mappings and the checks of the opening given up are let go of as they come.
+        self.tags.ops.retain(|_, op| {
+            !matches!(op, Op::Map { tier, .. } | Op::Checks { tier, .. } if *tier == at)
+        });
         let tier = &mut self.tiers[at];
         *tier = match tier.before.take() {
             Some(before) => *before,

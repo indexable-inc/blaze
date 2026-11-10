@@ -163,6 +163,39 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     placed
 }
 
+/// `from` moved over `to`, replacing it, with no write-through: the new name is in the file
+/// system's cache when it returns, not yet on the disk.
+fn moved_unsynced(from: &Path, to: &Path) -> io::Result<()> {
+    let (wide_from, wide_to) = (sys::path(from)?, sys::path(to)?);
+    // SAFETY: two NUL-terminated paths.
+    sys::check(unsafe {
+        MoveFileExW(wide_from.as_ptr(), wide_to.as_ptr(), MOVEFILE_REPLACE_EXISTING)
+    })
+}
+
+/// [`crate::Effect::WriteUnsynced`]: `bytes` as the whole of `path`, a temporary file next to
+/// it written and moved over it, with no flush of the file and no write-through of the move. A
+/// reader sees the old file or the new; a crash may leave either, or the new name over any
+/// part of the bytes.
+pub(crate) fn write_unsynced(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    crate::fs::make_parent(path)?;
+    let temporary = crate::fs::temporary_next_to(path);
+    let written = (|| {
+        std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary)?.write_all(bytes)
+    })();
+    let placed = written.and_then(|()| moved_unsynced(&temporary, path));
+    if placed.is_err() {
+        _ = std::fs::remove_file(&temporary);
+    }
+    placed
+}
+
+/// [`crate::Effect::RenameUnsynced`]: `from` renamed over `to`, with no write-through.
+pub(crate) fn rename_unsynced(from: &Path, to: &Path) -> io::Result<()> {
+    crate::fs::make_parent(to)?;
+    moved_unsynced(from, to)
+}
+
 /// `from` renamed over `to`, the new name on the disk when it returns.
 pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
     crate::fs::make_parent(to)?;

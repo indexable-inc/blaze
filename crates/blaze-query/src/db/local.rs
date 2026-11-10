@@ -636,6 +636,18 @@ impl Local {
         (depth, depth + above)
     }
 
+    /// The query running or verifying on top of the task's part of the stack (above the last
+    /// unlifted barrier): its ingredient and its key's bits. `None` when the task runs none.
+    pub(crate) fn top_query(&self) -> Option<(u32, u32)> {
+        let walled = |frame: &Frame| frame.kind == Kind::Barrier { lifted: false };
+        self.frames
+            .iter()
+            .rev()
+            .take_while(|it| !walled(*it))
+            .find(|it| matches!(it.kind, Kind::Run | Kind::Verify))
+            .map(|it| (it.ingredient, it.id))
+    }
+
     /// The frames running or verifying on the task's part of the stack.
     pub(crate) fn task_frames(&self) -> usize {
         match self.frames.len() {

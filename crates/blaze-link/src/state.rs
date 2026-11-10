@@ -478,6 +478,16 @@ impl Pairs {
     }
 }
 
+/// A name Rust code defines ([`State::names`]): the symbol it is, and whether it is defined
+/// weakly ([`crate::Change::weak_names`]). A weak one is the name's definition only while no
+/// native input (or the image linked beside) defines it strongly; resolution decides which
+/// ([`crate::native`]), and the symbol stays Rust's own either way.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct RustName {
+    pub target: Sym,
+    pub weak: bool,
+}
+
 /// Every field is `Copy`, an `Arc`, or a copy-on-write container whose clone is a reference
 /// count.
 #[derive(Clone)] // clone: once per stage, no allocation: `a_clone_allocates_nothing`
@@ -488,9 +498,10 @@ pub(crate) struct State {
     /// Written with `Arc::make_mut`, only where a region changes, so a stage that writes none
     /// shares the list it started from.
     pub spaces: Arc<Vec<Space>>,
-    /// The names Rust code defines (`#[no_mangle]`, `main`), each the symbol it is.
+    /// The names Rust code defines (`#[no_mangle]`, `main`), each the symbol it is and how
+    /// strongly ([`RustName`]).
     // BTreeMap: changed by every stage and walked in order by each native resolve.
-    pub names: Arc<BTreeMap<NameId, Sym>>,
+    pub names: Arc<BTreeMap<NameId, RustName>>,
     /// wasm: what codegen's live functions and statics say each name is imported as, the one
     /// import every live piece declaring it agrees on ([`State::declare_wasm`]); a name no
     /// live piece declares has none.

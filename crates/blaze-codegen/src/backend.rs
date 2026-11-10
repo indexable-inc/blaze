@@ -12,7 +12,7 @@ use blaze_ids::ContentId;
 use blaze_items::{CodeHash, ItemKey};
 
 use crate::{
-    CodegenError, CompiledFunction, InstanceKey, Owner, Static, Unit,
+    CodegenError, CompiledFunction, InstanceKey, Linkage, Owner, Static, Unit,
     plan::Origin,
     settings::Spec,
     summary::{Imports, Summary},
@@ -42,7 +42,7 @@ pub enum FrontRef<I, S> {
 }
 
 /// What the front end says of a function instance, without compiling it.
-#[derive(Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: copied out of the front end's memo, once per function described
 pub struct Described<I, S> {
     pub item: ItemKey,
     /// Its code, with the key of the store its body is written in: what its instance key
@@ -76,11 +76,21 @@ pub struct Described<I, S> {
     /// not editable: no edit changes its body (an edit of its arguments' types gives another
     /// instance), and a caller may build it in (`#[inline(always)]`, [`Self::built_in`]).
     pub editable: bool,
+    /// Whether one of its type arguments names a workspace crate's type, closure, coroutine or
+    /// function item, when its own body is not editable: no edit changes its body, but one can
+    /// change which keys its references resolve to while its own key stays (a closure is a
+    /// type argument by which one it is, never by its body), so its fill changes under its
+    /// key. A live build reaches it through its slot, as it does an edited function
+    /// (`driver`'s `rebind`; docs/v2/plan/design/codegen.md, "Slots and a splice's reach").
+    pub over_editable: bool,
     /// `Some` when its MIR says (std's built without, `#[rustc_inherit_overflow_checks]`).
     pub overflow_checks: Option<bool>,
     pub address: Address,
     /// The symbol it is defined as, for what outside code names it by.
     pub symbol: Option<String>,
+    /// How `symbol` is defined: [`Linkage::Weak`] makes every reference to it, its build's
+    /// own included, one by name ([`crate::Target::Extern`]); [`Linkage::Strong`] without one.
+    pub linkage: Linkage,
     /// Everything it refers to, each once, in the order of its MIR: its template's places.
     pub refs: Vec<FrontRef<I, S>>,
     /// The places among `refs` of the functions whose bodies its code builds in, as LLVM's
@@ -124,7 +134,7 @@ impl<I, S> Described<I, S> {
 }
 
 /// What the front end says of a static.
-#[derive(Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: copied out of the front end's memo, once per static described
 pub struct DescribedStatic<I, S> {
     pub item: ItemKey,
     /// Which instance of the item: a generic's thread-local or a promoted constant's owner;
@@ -149,6 +159,8 @@ pub struct DescribedStatic<I, S> {
     /// the workspace's too. Never read off `origin`, which is the settings' concept.
     pub owner: Owner,
     pub symbol: Option<String>,
+    /// How `symbol` is defined, as [`Described::linkage`].
+    pub linkage: Linkage,
     /// Its path, as errors name it (`krate::module::NAME`).
     pub name: String,
     pub refs: Vec<FrontRef<I, S>>,
@@ -239,6 +251,48 @@ pub trait Frontend: Sync {
         head: &Self::Instance,
         limit_of: &Self::Instance,
     ) -> CodegenError;
+
+    /// What describing `instance` for `requester` gives now, where it is other than `was`:
+    /// what this front end's database gave an earlier walk of it, which the driver kept
+    /// (`driver::Kept`). `Ok(None)` says a describe now would give `was`, decided without
+    /// the describe wherever the front end can (a memo its query engine verifies); the driver
+    /// then takes `was` and asks nothing more. The answer is exact: a front end that cannot
+    /// tell gives the new describe. The default describes again, which is the whole
+    /// computation, so a walk over it is the walk with nothing kept.
+    fn redescribe(
+        &self,
+        instance: &Self::Instance,
+        requester: &Origin,
+        was: &Described<Self::Instance, Self::Static>,
+    ) -> Result<Option<Described<Self::Instance, Self::Static>>, CodegenError> {
+        let _ = was;
+        self.describe(instance, requester).map(Some)
+    }
+
+    /// Whether what this front end says of `instance` for `requester` ([`Self::describe`],
+    /// [`Self::counted`]) was made of durable inputs alone: ones whose every write moves
+    /// [`Self::durable_view`]. Asked after a describe of it in this build. `true` promises
+    /// that for as long as the durable view is the same, a describe and a count give what
+    /// they gave, so the driver asks nothing of it. The default is `false`: asked each build.
+    fn durable(&self, instance: &Self::Instance, requester: &Origin) -> bool {
+        let _ = (instance, requester);
+        false
+    }
+
+    /// A number that is another after any write of an input a durable describe may read
+    /// (a library's source, a frozen table); `None` for a front end that tells none, whose
+    /// walk is then never patched.
+    fn durable_view(&self) -> Option<u64> {
+        None
+    }
+
+    /// Whether a walk of this front end may close facts of the whole program
+    /// ([`Self::closed`] may say `true`). The facts are made from everything the walk reached
+    /// ([`Self::reached`]), so a walk patched from a kept one, which tells only what changed,
+    /// is for a front end that says `false`. The default is `true`.
+    fn closes(&self) -> bool {
+        true
+    }
 
     /// Told that the walk has reached everything it was told of ([`Self::reached`]), with
     /// no error: `true` when what it reached closes facts of the whole program its bodies are

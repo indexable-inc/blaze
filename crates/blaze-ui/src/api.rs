@@ -139,7 +139,6 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
             }
         }
         Response::Announced { root } => put!(out, "{} {root}\n", status("Announced")),
-        Response::Packed { pack } => put!(out, "{} {} bytes\n", status("Packed"), pack.len()),
         Response::DocPage { path, page } => {
             put!(out, "{} {path}, {} bytes\n", status("Page"), page.len())
         }
@@ -859,6 +858,7 @@ mod tests {
     fn work_is_one_json_line_in_the_form_proof_reads() {
         let worked = Worked {
             reran: 12,
+            misses: 0,
             green: 300,
             served: Vec::new(),
             build_id: None,
@@ -910,6 +910,7 @@ mod tests {
         );
         let worked = Worked {
             reran: 0,
+            misses: 0,
             green: 0,
             served: Vec::new(),
             build_id: None,

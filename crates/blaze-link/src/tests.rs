@@ -2161,6 +2161,10 @@ mod dev_run;
 
 mod natives;
 
+mod interpose;
+
+mod weak_names;
+
 mod macho_unwind;
 
 mod premap;
@@ -2174,6 +2178,8 @@ mod icf;
 mod layout;
 
 mod thunks;
+
+mod patch;
 
 mod eh_frame_reach;
 

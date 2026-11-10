@@ -484,8 +484,10 @@ impl Kqueue {
             | Effect::Sync { .. }
             | Effect::Truncate { .. }
             | Effect::Write { .. }
+            | Effect::WriteUnsynced { .. }
             | Effect::WriteAt { .. }
             | Effect::Rename { .. }
+            | Effect::RenameUnsynced { .. }
             | Effect::Mode { .. }
             | Effect::Seal { .. }
             | Effect::Private { .. }

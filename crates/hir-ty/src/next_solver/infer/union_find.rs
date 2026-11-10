@@ -230,17 +230,24 @@ impl<K: UnifyKey, V: UnifyValue> UnionFind<K, V> {
         }
     }
 
-    /// The root of every set whose value satisfies `keep`, in index order: one pass over the
-    /// columns, as a root is its own parent.
-    pub(crate) fn roots_where(&self, keep: impl Fn(V) -> bool) -> Vec<K> {
-        self.parent
-            .iter()
-            .zip(&self.value)
-            .enumerate()
-            .filter(|&(at, (&parent, &value))| parent == at as u32 && keep(value))
-            .map(|(at, _)| K::from_index(at as u32))
-            // alloc: once per body, for fallback.
-            .collect()
+    /// The root of every set whose value satisfies `keep`, in index order, in `alloc`
+    /// (fallback's frame, which reads them once): one pass over the columns, as a root is its
+    /// own parent.
+    pub(crate) fn roots_where<A: std::alloc::Allocator>(
+        &self,
+        keep: impl Fn(V) -> bool,
+        alloc: A,
+    ) -> Vec<K, A> {
+        let mut roots = Vec::new_in(alloc);
+        roots.extend(
+            self.parent
+                .iter()
+                .zip(&self.value)
+                .enumerate()
+                .filter(|&(at, (&parent, &value))| parent == at as u32 && keep(value))
+                .map(|(at, _)| K::from_index(at as u32)),
+        );
+        roots
     }
 
     /// Merges the sets of `a` and `b`; when their values do not unify, changes nothing.
@@ -522,7 +529,7 @@ mod tests {
         }
         let roots: Vec<Key> =
             (0..model.parent.len() as u32).filter(|&at| model.find(at) == at).map(Key).collect();
-        assert_eq!(table.roots_where(|_| true), roots, "roots");
+        assert_eq!(table.roots_where(|_| true, std::alloc::Global), roots, "roots");
     }
 
     #[test]

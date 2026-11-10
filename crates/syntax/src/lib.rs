@@ -28,6 +28,7 @@ extern crate rustc_lexer;
 #[global_allocator]
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
+mod c_string;
 mod parsing;
 mod ptr;
 #[allow(unsafe_code)]

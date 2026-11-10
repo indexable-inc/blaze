@@ -911,6 +911,61 @@ fn the_lock_file_pins_a_registry_package_which_is_fetched_then_built() {
     );
 }
 
+/// Two packages the lock file pins to one commit of one git repository (a workspace whose
+/// member inherits its package table and a `path` dependency from `[workspace.dependencies]`,
+/// as `uzaaft/libghostty-rs` is) are in one checkout: the load asks for it once, never once per
+/// package, which the daemon refuses as a place asked twice.
+#[test]
+fn two_packages_of_one_git_repository_ask_for_its_checkout_once() {
+    let commit = "575ed6b8ceb79ffaf247ecf7e34333876b0d5be4";
+    let source = format!("git+https://github.com/o/r?rev={commit}#{commit}");
+    let ident = blaze_resolve::SourceId::from_url(&source).unwrap().git_ident();
+    let at = format!("{SOURCES}/git/checkouts/{ident}/{commit}");
+    let fetch = Fetch {
+        what: "git repository `https://github.com/o/r`".to_owned(),
+        url: "https://github.com/o/r".to_owned(),
+        kind: FetchKind::Git { commit: commit.to_owned() },
+        at: at.clone(),
+    };
+    let manifest =
+        format!("{A}\n[dependencies]\nr = {{ git = \"https://github.com/o/r\", rev = \"{commit}\" }}\n");
+    let lock = format!(
+        "{HEADER}\n[[package]]\nname = \"a\"\nversion = \"0.1.0\"\ndependencies = [\n \"r\",\n]\n\n\
+         [[package]]\nname = \"r\"\nversion = \"0.1.0\"\nsource = \"{source}\"\ndependencies = [\n \"r-sys\",\n]\n\n\
+         [[package]]\nname = \"r-sys\"\nversion = \"0.1.0\"\nsource = \"{source}\"\n"
+    );
+    let fixture = Fixture::new();
+    let files = [
+        ("ws/Cargo.toml", manifest.as_str()),
+        ("ws/Cargo.lock", lock.as_str()),
+        ("ws/src/lib.rs", ""),
+    ];
+    assert_eq!(fixture.plan(fixture.open(&ask(&files))), Planned::Needs(vec![fetch]));
+
+    let root = "[workspace]\nresolver = \"2\"\nmembers = [\"crates/*\"]\n\n\
+                [workspace.package]\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+                [workspace.dependencies]\nr = { path = \"crates/r\" }\nr-sys = { path = \"crates/r-sys\" }\n";
+    let r = "[package]\nname = \"r\"\nversion.workspace = true\nedition.workspace = true\n\n\
+             [dependencies]\nr-sys.workspace = true\n";
+    let r_sys = "[package]\nname = \"r-sys\"\nversion.workspace = true\nedition.workspace = true\n";
+    let fetched = [
+        ("ws/Cargo.toml", manifest.as_str()),
+        ("ws/Cargo.lock", lock.as_str()),
+        ("ws/src/lib.rs", ""),
+        ("co/Cargo.toml", root),
+        ("co/crates/r/Cargo.toml", r),
+        ("co/crates/r/src/lib.rs", ""),
+        ("co/crates/r-sys/Cargo.toml", r_sys),
+        ("co/crates/r-sys/src/lib.rs", ""),
+    ];
+    let mounted = Ask { mounts: vec![mount(&at, "co")], ..ask(&fetched) };
+    let units = ready(fixture.plan(fixture.open(&mounted)));
+    assert_eq!(units.lock, None, "the lock file is up to date");
+    let (r_sys_at, _, _) = lib_of(&units, "r-sys");
+    let (_, r_lib, _) = lib_of(&units, "r");
+    assert!(r_lib.dependencies.iter().any(|it| it.index == r_sys_at));
+}
+
 /// What one step over the view's workspace saw: whether its lock file's bytes were lent from
 /// the database rather than copied, and whether it resolved.
 #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq, Debug)]

@@ -492,7 +492,7 @@ fn no_sysroot_library_directory_adds_none() {
 }
 
 /// cargo on Linux gives its scripts the certificates libgit2 found for it (found by
-/// harness/scripts.py on dev-aws-8, where cargo's scripts had `SSL_CERT_FILE` and
+/// harness/scripts.py on a Linux host, where cargo's scripts had `SSL_CERT_FILE` and
 /// `SSL_CERT_DIR` and blaze's did not).
 #[test]
 fn certificates_libgit2_finds() {

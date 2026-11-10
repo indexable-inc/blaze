@@ -63,7 +63,7 @@ pub use backend::Backends;
 pub use frontend::{BodyChecks, Databases, HirFrontend};
 pub use global_asm::GlobalAsmObject;
 pub use hashes::ItemHashes;
-pub use linked::{Assumed, LinkInputs, span_tables_of};
+pub use linked::{Assumed, InputsWork, LinkInputs, Table, span_table_id, span_tables_of};
 pub use lowered::{Lowering, lowered};
 #[cfg(feature = "llvm")]
 pub use release::{give_profile, profile_id};

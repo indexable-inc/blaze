@@ -954,6 +954,16 @@ pub struct Spent {
     pub freed: u64,
 }
 
+/// What `account`'s work held at most so far, while it is open: what a task has realized as it
+/// runs, read from another thread (the daemon's loop, for the plane's
+/// `PlaneInput::Realized`). `None` once it closed, so a task that ended is never read as
+/// another's whose account took its slot. Lock-free: one load of the slot's generation and one
+/// of its peak.
+pub fn peak_now(account: Account) -> Option<u64> {
+    let slot = account.slot()?;
+    Some(u64::try_from(slot.peak.load(Ordering::Relaxed)).unwrap_or(0))
+}
+
 /// Runs `f` in a new account, inside the job's account if it has one, and says the most bytes
 /// its work held at once through [`Counting`]: what it allocated less what it freed, on this
 /// job and on every job a pool scope of `f` ran ([`charged_to`]), wherever each ran and
@@ -1059,6 +1069,15 @@ pub fn own() -> u64 {
 /// [`own`], the counted sum taken from `snapshot` where the system does not say.
 pub fn own_of(snapshot: &blaze_mem::tag::Snapshot) -> u64 {
     blaze_mem::tag::resident().unwrap_or_else(|| snapshot.footprint(held()))
+}
+
+/// What `footprint` holds past the live heap and what blaze-mem keeps committed and resident in
+/// `snapshot`: the free pages the allocators keep, the bytes a purge can give back
+/// (`blaze_cargo::raw::memory::purge`). An estimate, an upper bound: it holds the code, the
+/// stacks and the system zones too. mimalloc's own committed count is no measure of it, since a
+/// purge never lowers that count (`mi_os_decommit_ex`, os.c, on a release build).
+pub fn kept_of(snapshot: &blaze_mem::tag::Snapshot, footprint: u64) -> u64 {
+    footprint.saturating_sub(held().saturating_add(snapshot.resident_committed()))
 }
 
 /// The share of each of the machine's own memory limits (`hw.memsize`, `MemTotal`, a cgroup's

@@ -838,11 +838,11 @@ impl Reloc<'_> {
         let to = s.wrapping_add(fixup.addend as u64);
         // alloc: error path
         Err(format!(
-            "a branch to {}{} at {to:#x}, {:#x} bytes away: past its 128 MiB reach, and no thunk of it is in reach \
+            "a branch to {}{} at {to:#x}, {} away: past its 128 MiB reach, and no thunk of it is in reach \
              (the image has {} thunk islands)",
             named_in(self.symbols, &[self.state], self.writer, fixup.target),
             if plt { " through its PLT stub" } else { "" },
-            to.wrapping_sub(p) as i64,
+            thunk::away(p, to),
             self.state.islands,
         ))
     }
@@ -1959,7 +1959,7 @@ impl<'a> Stage<'a> {
         };
         let exports = self.exports();
         let mut out = Vec::with_capacity(exports.len());
-        for (name, symbol, data) in exports {
+        for crate::place::Asked { name, symbol, data, weak, own } in exports {
             let Some(sym) = self.symbols.find_sym_name(symbol) else {
                 // alloc: error path
                 return Err(error(None, format!("the export `{name}` is not defined")));
@@ -1990,9 +1990,12 @@ impl<'a> Stage<'a> {
                     }
                     None => (SymbolKind::Other, 0),
                 };
+            // What its definition states of itself is its own: an object's `malloc` among
+            // other functions of one section is not the section's size.
+            let (kind, size) = own.unwrap_or((kind, size));
             let kind = if data { SymbolKind::Data } else { kind };
             // alloc: the writer's export table owns its names (model.rs `Export`), one per export
-            out.push(Export { name: name.to_owned(), addr, size, kind });
+            out.push(Export { name: name.to_owned(), addr, size, kind, weak });
         }
         let image = |name: &str| -> Option<u64> {
             match resolver.value(self.symbols.find_sym_name(name)?) {

@@ -26,7 +26,9 @@ use std::alloc::Global;
 use crate::arena::{FrameVec, collect_in};
 use crate::cow::{CowBytes, IdSet};
 use crate::layout;
-use crate::model::{Apply, Class, Counts, Prot, Region, Reserve, Sym, Writer, reserved, zeroed};
+use crate::model::{
+    Apply, Class, Counts, Prot, Region, Reserve, Sym, SymbolKind, Writer, reserved, zeroed,
+};
 use crate::reloc::GotKind;
 use crate::shape::{self, RegionShape};
 use crate::stage::{Stage, error, function_of, named_in, refused};
@@ -363,6 +365,19 @@ fn by_key(entries: &mut [Entry]) {
     radix::sort_copy_by_key(entries, |it| radix::pack_64(it.key[0], it.key[1]));
 }
 
+/// A name the image exports ([`Stage::exports`]), before it is placed: the name, the symbol
+/// it is, whether it is data whatever it is defined in (`/EXPORT:name=symbol,DATA`), whether
+/// its definition is weak, and the type and size its definition states, when it states them
+/// ([`crate::model::Exported`]).
+#[derive(Clone, Copy)] // clone: `Copy`: two references and three words
+pub(crate) struct Asked<'s> {
+    pub name: &'s str,
+    pub symbol: &'s str,
+    pub data: bool,
+    pub weak: bool,
+    pub own: Option<(SymbolKind, u64)>,
+}
+
 impl<'a> Stage<'a> {
     /// The region an incremental link puts a new piece of `class` in.
     fn patch_class<'c>(&self, class: &'c Class) -> &'c Class {
@@ -457,7 +472,7 @@ impl<'a> Stage<'a> {
             got: totals.got,
             absolute: totals.absolute + u64::from(self.new.slots),
             exports: exports.len() as u64,
-            export_names: exports.iter().map(|it| it.0.len() as u64 + 1).sum(),
+            export_names: exports.iter().map(|it| it.name.len() as u64 + 1).sum(),
             functions: totals.functions,
             function_names: totals.function_names,
             image: totals.image,
@@ -466,26 +481,33 @@ impl<'a> Stage<'a> {
         }
     }
 
-    /// What the image exports: the name, the symbol it is, and whether it is data whatever
-    /// it is defined in (`/EXPORT:name=symbol,DATA`).
-    pub fn exports(&self) -> FrameVec<'a, (&str, &str, bool)> {
+    /// What the image exports: a shared library's own exports, what resolution has it
+    /// export ([`crate::native::Resolved::exports`]: `/EXPORT` directives, and what an ELF
+    /// executable defines that a shared library it links names), the live descriptor.
+    pub fn exports(&self) -> FrameVec<'a, Asked<'_>> {
         let mut seen: HashSet<&str, Global> = HashSet::new_in(Global);
-        let mut out: FrameVec<'a, (&str, &str, bool)> = Vec::new_in(self.arena);
+        let mut out: FrameVec<'a, Asked<'_>> = Vec::new_in(self.arena);
         if let crate::OutputKind::Shared { exports, .. } = &self.output.kind {
             out.reserve(exports.len());
             for it in exports {
                 seen.insert(it);
-                out.push((it, it, false));
+                out.push(Asked { name: it, symbol: it, data: false, weak: false, own: None });
             }
         }
-        for (name, symbol, data) in self.new.resolved.exports.iter() {
-            if seen.insert(name) {
-                out.push((name, symbol, *data));
+        for it in self.new.resolved.exports.iter() {
+            if seen.insert(&it.name) {
+                out.push(Asked {
+                    name: &it.name,
+                    symbol: &it.symbol,
+                    data: it.data,
+                    weak: it.weak,
+                    own: it.own,
+                });
             }
         }
         if self.output.live.is_some() {
             let name = blaze_live::patch::DESCRIPTOR;
-            out.push((name, name, true));
+            out.push(Asked { name, symbol: name, data: true, weak: false, own: None });
         }
         out
     }

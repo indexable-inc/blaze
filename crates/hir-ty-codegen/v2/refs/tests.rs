@@ -16,7 +16,8 @@ use blaze_ids::ContentId;
 use cranelift_codegen::ir;
 use hir_def::{FunctionId, StaticId, signatures::FunctionSignature};
 use hir_expand::fixture;
-use hir_ty::db::HirDatabase;
+use hir_ty::{db::HirDatabase, next_solver::TyKind};
+use rustc_type_ir::inherent::{GenericArgs as _, IntoKind as _};
 use std::alloc::Global;
 
 use super::{Walking, walk};
@@ -364,6 +365,77 @@ fn a_dyn_fn_call_lists_the_closure_vtable() {
     assert!(count(&reached, |def| *def == InstanceDef::DropGlue) >= 1, "{reached:?}");
 }
 
+const REIFIED_TRAIT_FN: &str = r#"
+//- minicore: sized, copy, unsize, coerce_unsized, dispatch_from_dyn, fn, eq
+pub trait Tr {
+    fn f(x: u32) -> bool;
+    fn g(x: u32) -> bool { x == 4 }
+}
+pub struct A;
+pub struct B;
+impl Tr for A {
+    fn f(x: u32) -> bool { x == 3 }
+    fn g(x: u32) -> bool { x == 5 }
+}
+impl Tr for B { fn f(x: u32) -> bool { x == 7 } }
+pub fn take(f: &dyn Fn(u32) -> bool) -> bool { f(3) }
+pub fn go<C: Tr>() -> bool {
+    let p: fn(u32) -> bool = C::f;
+    let q: fn(u32) -> bool = C::g;
+    take(&C::f) && take(&C::g) && p(3) && q(4)
+}
+pub fn roots() -> bool { go::<A>() && go::<B>() }
+"#;
+
+/// A trait's associated fn named through a type parameter (`&C::f` as a `&dyn Fn`, `C::f` as
+/// a `fn` pointer, harfrust's `&Ctx::is_actionable`) runs the impl's fn its monomorphized
+/// arguments select, or the trait's default where the impl has none, never the trait's
+/// declaration: the `Fn`-vtable shim is of the resolved fn, as rustc's shim calls what
+/// `Instance::resolve` gives. Of the declaration, the shim was keyed by a function with no
+/// body ("`Fn` `...::is_actionable` has no body to compile") or, for a default the impl
+/// overrides, by the default's code.
+#[test]
+fn a_trait_fn_reified_through_a_type_parameter_runs_the_impls_fn() {
+    let (db, reached) = reach_from(REIFIED_TRAIT_FN, "roots");
+    let krate = fixture::test_crate(db);
+    let impls = hir_def::test_items::impls(db, krate);
+    let owner = |func: FunctionId| match func.loc(db).container {
+        hir_def::ItemContainerId::ImplId(it) if it == impls[0] => "A",
+        hir_def::ItemContainerId::ImplId(it) if it == impls[1] => "B",
+        hir_def::ItemContainerId::TraitId(_) => "Tr",
+        _ => "",
+    };
+    let named = |func: FunctionId| {
+        format!("{}::{}", owner(func), FunctionSignature::of(db, func).name.as_str())
+    };
+    let mut shims = Vec::new();
+    let mut fns = Vec::new();
+    for (instance, _) in &reached {
+        let Kind::Code(code, _) = &instance.0 else { continue };
+        match code.def {
+            InstanceDef::ReifyShim { receiver } => {
+                let ty = code.args.as_ref().type_at(0);
+                let TyKind::FnDef(def, _) = ty.kind() else {
+                    panic!("a reify shim of {ty:?}, not of a fn item");
+                };
+                let hir_def::CallableDefId::FunctionId(func) = def.0 else {
+                    panic!("a reify shim of a constructor, {ty:?}");
+                };
+                assert!(receiver, "a `fn` pointer to a plain fn needs no shim: {}", named(func));
+                shims.push(named(func));
+            }
+            InstanceDef::Fn(func) => fns.push(named(func)),
+            _ => (),
+        }
+    }
+    shims.sort();
+    assert_eq!(shims, ["A::f", "A::g", "B::f", "Tr::g"], "the `Fn`-vtable shims' callees");
+    for wanted in ["A::f", "A::g", "B::f", "Tr::g"] {
+        assert!(fns.iter().any(|it| it == wanted), "`{wanted}` is not reached: {fns:?}");
+    }
+    assert!(!fns.iter().any(|it| it == "Tr::f"), "the trait's declaration is reached: {fns:?}");
+}
+
 const DERIVED: &str = r#"
 //- minicore: sized, copy, clone, derive, eq, ord, unsize, coerce_unsized, dispatch_from_dyn
 #[derive(Clone, PartialEq)]
@@ -517,6 +589,66 @@ fn checks_list_their_panics() {
             "panic_const_div_by_zero",
             "panic_const_rem_by_zero",
         ],
+    );
+}
+
+const ASYNC: &str = r#"
+//- minicore: sized, future, pin, panic_location
+#![feature(lang_items)]
+pub mod panicking {
+    #[lang = "panic_bounds_check"]
+    #[track_caller]
+    pub fn panic_bounds_check(index: usize, len: usize) -> ! { loop {} }
+    pub mod panic_const {
+        #[track_caller] pub const fn panic_const_async_fn_resumed() -> ! { loop {} }
+        #[track_caller] pub const fn panic_const_async_fn_resumed_panic() -> ! { loop {} }
+    }
+}
+use core::{future::Future, pin::Pin, task::{Context, Poll}};
+pub async fn answer() -> u32 { 41 }
+pub fn poll_once<F: Future>(future: &mut F, cx: &mut Context<'_>) -> Poll<F::Output> {
+    Pin::new(future).poll(cx)
+}
+pub fn roots(cx: &mut Context<'_>) -> Poll<u32> {
+    let mut block = async { answer().await + 1 };
+    poll_once(&mut block, cx)
+}
+"#;
+
+/// An `async` body polled after it returned or panicked panics (`resumed_after_end`): the walk
+/// of each `async` body, the `async fn`'s and the block awaiting it, lists both panics, and
+/// [`reach`] checks the walk against what each body's IR asks for with every setting.
+#[test]
+fn an_async_body_lists_the_panics_of_a_poll_after_it_ended() {
+    let (db, reached) = reach_from(ASYNC, "roots");
+    let is_body = |instance: &HirInstance| {
+        matches!(&instance.0, Kind::Code(code, _) if matches!(code.def, InstanceDef::Coroutine(_)))
+    };
+    let bodies: Vec<&[Ref]> = reached
+        .iter()
+        .filter(|(instance, _)| is_body(instance))
+        .map(|(_, walk)| walk.as_slice())
+        .collect();
+    assert!(bodies.len() >= 2, "the `async fn`'s body and the block's: {reached:?}");
+    let named = |it: &Ref, name: &str| match it {
+        FrontRef::Function(callee) => callee
+            .function()
+            .is_some_and(|func| FunctionSignature::of(db, func).name.as_str() == name),
+        _ => false,
+    };
+    for walk in bodies {
+        for path in crate::RESUMED_AFTER_END {
+            let name = *path.last().expect("a panic's name");
+            assert!(
+                walk.iter().any(|it| named(it, name)),
+                "an `async` body's walk does not list `{name}`: {walk:?}"
+            );
+        }
+    }
+    assert_reached(
+        &db,
+        &reached,
+        &["panic_const_async_fn_resumed", "panic_const_async_fn_resumed_panic"],
     );
 }
 
@@ -690,6 +822,55 @@ fn extern_and_variadic_calls_list_their_symbols() {
     });
 }
 
+const PROJECTED_C_SIGNATURE: &str = r#"
+//- minicore: sized, fn
+pub trait Convert<F> { type Inner; }
+impl<T, F> Convert<F> for T { type Inner = T; }
+#[repr(C)]
+pub struct Rect { pub x: f64, pub y: f64, pub w: f64, pub h: f64 }
+#[repr(C)]
+pub struct Wrap<T: Convert<()>> { pub inner: <T as Convert<()>>::Inner, pub tag: f64 }
+pub struct View;
+impl View {
+    pub extern "C" fn frame(&self) -> <Rect as Convert<()>>::Inner {
+        Rect { x: 1.0, y: 2.0, w: 3.0, h: 4.0 }
+    }
+}
+pub extern "C" fn wrapped<T: Convert<()>>(
+    inner: <T as Convert<()>>::Inner,
+) -> <Wrap<T> as Convert<()>>::Inner {
+    Wrap { inner, tag: 5.0 }
+}
+pub fn class() -> (extern "C" fn(&View) -> Rect, extern "C" fn(Rect) -> Wrap<Rect>) {
+    let register = || {
+        let method = || {
+            (
+                View::frame as extern "C" fn(&View) -> Rect,
+                wrapped::<Rect> as extern "C" fn(Rect) -> Wrap<Rect>,
+            )
+        };
+        method()
+    };
+    register()
+}
+pub fn roots() -> f64 {
+    let (frame, wrap) = class();
+    wrap(frame(&View)).inner.h
+}
+"#;
+
+/// An `extern "C"` fn whose signature names a projection (objc2's `define_class!` method,
+/// `-> <CGRect as ConvertReturn<()>>::Inner`), cast to a fn pointer in a closure in a
+/// closure as objc2's `class()` registers it, has its C ABI computed from the types the
+/// projections normalize to, a `repr(C)` struct's projected field too. Of the declared
+/// signature, the walk of the inner closure refused the alias "in the C ABI".
+#[test]
+fn an_extern_c_fn_whose_signature_names_a_projection_is_passed_as_what_it_normalizes_to() {
+    let (db, reached) = reach_from(PROJECTED_C_SIGNATURE, "roots");
+    assert_reached(&db, &reached, &["class", "frame", "wrapped"]);
+    assert!(count(&reached, |def| matches!(def, InstanceDef::Closure(_))) >= 2, "{reached:?}");
+}
+
 const INTRINSICS: &str = r#"
 //- minicore: sized
 #![feature(intrinsics)]
@@ -831,7 +1012,7 @@ pub fn root() -> u32 {
 /// type, with none left in it.
 #[test]
 fn vtables_whose_types_differ_in_lifetimes_only_are_one() {
-    use rustc_type_ir::{TypeVisitableExt as _, inherent::IntoKind as _};
+    use rustc_type_ir::TypeVisitableExt as _;
     let (db, frontend) = frontend(VTABLES_APART_IN_LIFETIMES);
     let root = frontend.root(function(&db, "root"));
     frontend.with(|db| {
