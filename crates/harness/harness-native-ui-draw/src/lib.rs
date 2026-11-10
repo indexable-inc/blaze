@@ -11,7 +11,7 @@ use harness_native_ui_look_api::{Edge, Fill, Ribbon, Scheme};
 use harness_native_ui_layout_api::{Background, Overlay, ScrollExtent, ScrollState, ScrollerPart};
 use harness_native_ui_motion_api::{Drawn, HoverPose, Pose, PoseAxis, Posed, Posing, Reveal, Shown};
 use harness_native_ui_node_api::{Clip, ClipFade, Hidden, Hosted, Laid, Layer, Level, Node, Offscreen, Windowed, Z};
-use harness_native_ui_text_api::{BlazeMark, Drawing, Icon, Kip, Mark, Picture, PixelBlock, Starfield, Surface, Text, Vector};
+use harness_native_ui_text_api::{BlazeMark, Drawing, Icon, Kip, Lantern, Mark, Picture, PixelBlock, Surface, Text, Vector};
 
 /// A clip rectangle in window points.
 #[derive(Clone, Copy)]
@@ -180,7 +180,7 @@ fn walk(
         Some(PaintKind::Drawing)
     } else if e.has(Icon::id()) {
         Some(PaintKind::Icon)
-    } else if e.has(Surface::id()) || e.has(Picture::id()) || e.has(BlazeMark::id()) || e.has(PixelBlock::id()) || e.has(Starfield::id()) || e.has(Kip::id()) {
+    } else if e.has(Surface::id()) || e.has(Picture::id()) || e.has(BlazeMark::id()) || e.has(PixelBlock::id()) || e.has(Lantern::id()) || e.has(Kip::id()) {
         Some(PaintKind::Picture)
     } else if e.has(Ribbon::id()) {
         Some(PaintKind::Ribbon)

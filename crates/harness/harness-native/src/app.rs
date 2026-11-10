@@ -2139,7 +2139,7 @@ impl App {
         crate::look::breathing(self.world.world_ref())
             || paint.shimmering
             || paint.blocks_live
-            || paint.sky_live
+            || paint.lantern_live
             || matches!(paint.kip_wake, harness_native_render::kips::Wake::Calm(_))
     }
 
