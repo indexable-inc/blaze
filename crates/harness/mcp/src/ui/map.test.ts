@@ -36,17 +36,16 @@ test("a Map needs something to look at, and says so as the element's error", () 
   expect(checkProp("Map", "pins", [], "line 1")?.message).toContain(`has no prop "pins"`);
 });
 
-test("the page is one document: the vendored Leaflet inline, the places as JSON no label can break out of, OpenStreetMap credited", async () => {
-  const dir = join(import.meta.dir, "..", "..", "vendor", "leaflet-1.9.4");
-  const lib = { js: await Bun.file(join(dir, "leaflet.js")).text(), css: await Bun.file(join(dir, "leaflet.css")).text() };
+test("the page is one document: the vendored MapLibre GL inline, the places as JSON no label can break out of, the keyless vector style", async () => {
+  const dir = join(import.meta.dir, "..", "..", "vendor", "maplibre-gl-4.7.1");
+  const lib = { js: await Bun.file(join(dir, "maplibre-gl.js")).text(), css: await Bun.file(join(dir, "maplibre-gl.css")).text() };
   const spec = mapOf({ markers: [{ lat: 1, lon: 2, label: "</script><script>alert(1)</script>" }] });
   if (typeof spec === "string") throw new Error(spec);
   const page = mapPage(spec, lib);
-  expect(page).toContain("https://tile.openstreetmap.org/{z}/{x}/{y}.png");
-  expect(page).toContain("OpenStreetMap</a> contributors");
-  expect(page).toMatch(/zoomAnimation: (false|!1)/);
+  expect(page).toContain("https://tiles.openfreemap.org/styles/dark");
+  expect(page).toMatch(/fadeDuration: 0/);
   expect(page).not.toContain("<script>alert(1)");
-  // Exactly the three scripts the page writes: the spec, Leaflet, its own.
+  // Exactly the three scripts the page writes: the spec, MapLibre GL, its own.
   expect(page.match(/<script[ >]/g)?.length).toBe(3);
   expect(page.match(/<\/script>/g)?.length).toBe(3);
   expect(page).not.toMatch(/src=["']?https?:/);

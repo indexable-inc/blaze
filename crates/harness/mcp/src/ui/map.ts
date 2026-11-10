@@ -1,6 +1,6 @@
 /*
  * The `Map` element's own rules and its page. `<Map markers={places} />` is no drawing of the app's: the kernel serves one
- * self-contained page (Leaflet, vendored in vendor/leaflet-1.9.4, over OpenStreetMap's raster tiles; no key) and shows it in a view
+ * self-contained page (MapLibre GL, vendored in vendor/maplibre-gl-4.7.1, over OpenFreeMap's vector tiles of OpenStreetMap; no key) and shows it in a view
  * of the harness browser, so the element goes to the app as the `Browser` element of that view (map-view.ts opens it, tree.ts
  * lowers it). This file is the pure half: what the props must be (`markersOf`, `pointOf`, `mapOf`) and the page's HTML (`mapPage`).
  */
@@ -142,84 +142,116 @@ const html = (text: string): string => text.replace(/[&<>"]/g, c => ({ '&': '&am
 /** JSON that can sit inside a <script> element: no `<` to end it early, no line separators JavaScript once refused. */
 const inScript = (value: unknown): string => JSON.stringify(value).replace(/[<\u2028\u2029]/g, c => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
 
-/** The app's look, as the page's: near-black ground, ink only, one blue for the pins. Nothing eases. */
+/** The map's style: OpenFreeMap's dark vector style (OpenMapTiles data from OpenStreetMap; no key, no account), drawn by
+ *  MapLibre GL at the screen's own resolution. Vector, not pictures of a map: sharp at every zoom and scale. */
+export const MAP_STYLE = 'https://tiles.openfreemap.org/styles/dark';
+
+/** The style's colours, retinted to the app's look before the map is made (layer id of MAP_STYLE: paint properties): its own
+ *  are near-black on black, roads and names barely there. Here the ground is the app's, streets are steps of grey above it by
+ *  their size, water a slate a shade off the ground, names in the app's inks. A layer the style no longer has is skipped. */
+export const MAP_TINT: Record<string, Record<string, string>> = {
+  background: { 'background-color': '#0E1013' },
+  water: { 'fill-color': '#18222E' },
+  waterway: { 'line-color': '#18222E' },
+  water_name: { 'text-color': '#62707F', 'text-halo-color': 'rgba(14,16,19,0)' },
+  landuse_residential: { 'fill-color': '#111317' },
+  landcover_wood: { 'fill-color': '#131A18' },
+  landuse_park: { 'fill-color': '#131A18' },
+  building: { 'fill-color': '#15181D', 'fill-outline-color': '#1B1F25' },
+  highway_path: { 'line-color': '#23272E' },
+  highway_minor: { 'line-color': '#2B3038' },
+  highway_major_casing: { 'line-color': '#3B414B' },
+  highway_major_inner: { 'line-color': '#333842' },
+  highway_major_subtle: { 'line-color': '#333842' },
+  highway_motorway_casing: { 'line-color': '#4C535E' },
+  highway_motorway_inner: { 'line-color': '#414852' },
+  highway_motorway_subtle: { 'line-color': '#414852' },
+  railway_transit: { 'line-color': '#2B3038' },
+  railway_minor: { 'line-color': '#2B3038' },
+  railway: { 'line-color': '#2B3038' },
+  highway_name_other: { 'text-color': '#8B919A', 'text-halo-color': '#0E1013' },
+  highway_name_motorway: { 'text-color': '#A3A9B1', 'text-halo-color': '#0E1013' },
+  boundary_state: { 'line-color': '#3B414B' },
+  'boundary_country_z0-4': { 'line-color': '#4C535E' },
+  'boundary_country_z5-': { 'line-color': '#4C535E' },
+  ...Object.fromEntries(['other', 'suburb', 'village', 'town', 'city', 'city_large', 'state', 'country_other', 'country_minor', 'country_major']
+    .map(k => [`place_${k}`, { 'text-color': '#C4C8CE', 'text-halo-color': 'rgba(14,16,19,0.9)' }])),
+};
+
+/** The app's look, as the page's: near-black ground, ink only, one blue for the pins. */
 const PAGE_CSS = `
 html, body, #map { height: 100%; margin: 0; }
 body { background: #0A0B0D; color: #E6E8EB; font: 12px/16px -apple-system, "SF Pro Text", system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
-.leaflet-container { background: #0A0B0D; font: inherit; color: inherit; outline: none; }
-.leaflet-container a { color: #4D8EFF; }
-/* OpenStreetMap's light tiles as quiet dark ink: grey, inverted, pulled down so the pins and their words stand over them. */
-.leaflet-tile-pane { filter: grayscale(1) invert(1) brightness(0.82) contrast(0.92); }
-.leaflet-control-attribution { background: rgba(10, 11, 13, 0.78) !important; color: #9AA0A8; font-size: 10px; line-height: 14px; padding: 1px 6px; }
-.leaflet-control-attribution a { color: #C4C8CE; text-decoration: none; }
-.leaflet-bar { border: 1px solid #2A2D33 !important; border-radius: 6px; box-shadow: none; overflow: hidden; }
-.leaflet-bar a, .leaflet-bar a:hover { background: #14161A; color: #E6E8EB; border-bottom: 1px solid #2A2D33; width: 26px; height: 26px; line-height: 26px; font-size: 16px; }
-.leaflet-bar a:last-child { border-bottom: none; }
-.leaflet-bar a:hover { background: #1C1F24; }
-.leaflet-bar a.leaflet-disabled { background: #14161A; color: #5A6068; }
-.pin { width: 0 !important; height: 0 !important; margin: 0 !important; }
-.pin i { position: absolute; left: -6px; top: -6px; width: 12px; height: 12px; box-sizing: border-box; border-radius: 50%; background: #4D8EFF; border: 2px solid #0A0B0D; }
-.pin b { position: absolute; left: 10px; top: -8px; white-space: nowrap; font-weight: 500; color: #E6E8EB;
-  text-shadow: 0 0 2px #0A0B0D, 0 0 2px #0A0B0D, 0 0 4px #0A0B0D, 0 0 4px #0A0B0D; }
-.pin { cursor: default; }
+.maplibregl-map { background: #0A0B0D; font: inherit; color: inherit; }
+.maplibregl-canvas { outline: none; }
+.maplibregl-ctrl-attrib { background: rgba(10, 11, 13, 0.72) !important; color: #9AA0A8; font-size: 10px; line-height: 14px; }
+.maplibregl-ctrl-attrib a { color: #C4C8CE; text-decoration: none; }
+.maplibregl-ctrl-attrib-button { filter: invert(1); opacity: 0.6; }
+.pin { width: 12px; height: 12px; box-sizing: border-box; border-radius: 50%; background: #4D8EFF; border: 2px solid #0A0B0D; cursor: default; }
 .pin.pressable { cursor: pointer; }
+.pin b { position: absolute; left: 14px; top: -4px; white-space: nowrap; font-weight: 500; color: #E6E8EB;
+  text-shadow: 0 0 2px #0A0B0D, 0 0 2px #0A0B0D, 0 0 4px #0A0B0D, 0 0 4px #0A0B0D; }
 .dense .pin b { display: none; }
 .dense .pin:hover b { display: block; }
-.pin:hover { z-index: 100000 !important; }
-.here i { position: absolute; left: -7px; top: -7px; width: 14px; height: 14px; box-sizing: border-box; border-radius: 50%; background: #E6E8EB; border: 3px solid #0A0B0D; box-shadow: 0 0 0 1px #E6E8EB; }
-.leaflet-popup-content-wrapper { background: #14161A; color: #E6E8EB; border: 1px solid #2A2D33; border-radius: 8px; box-shadow: none; }
-.leaflet-popup-content { margin: 8px 10px; font: inherit; line-height: 16px; max-width: 260px; }
-.leaflet-popup-content strong { display: block; font-weight: 600; }
-.leaflet-popup-content span { display: block; color: #9AA0A8; }
-.leaflet-popup-content a { display: block; margin-top: 4px; text-decoration: none; }
-.leaflet-popup-tip { background: #14161A; border: 1px solid #2A2D33; box-shadow: none; }
+.maplibregl-marker:hover { z-index: 3; }
+.here { width: 14px; height: 14px; box-sizing: border-box; border-radius: 50%; background: #4D8EFF; border: 3px solid #E6E8EB; box-shadow: 0 0 0 1px #0A0B0D; }
+.maplibregl-popup-content { background: #14161A; color: #E6E8EB; border: 1px solid #2A2D33; border-radius: 8px; box-shadow: none; padding: 8px 10px; font: inherit; line-height: 16px; max-width: 260px; }
+.maplibregl-popup-content strong { display: block; font-weight: 600; }
+.maplibregl-popup-content span { display: block; color: #9AA0A8; }
+.maplibregl-popup-content a { display: block; margin-top: 4px; color: #4D8EFF; text-decoration: none; }
+.maplibregl-popup-tip { display: none; }
 `;
 
 /**
- * What the page runs once Leaflet is loaded: the map with every animation off (a fit or a zoom is set, never flown to), the places
- * as pins with their words, `here` as a ring. `harnessMap.set(spec)` draws another spec in place (the kernel calls it when the
- * element's props change). Until the person moves the map, it is fitted again whenever its view changes size.
+ * What the page runs once MapLibre is loaded: the map (a fit or a zoom is set, never flown to; nothing fades in), the places as
+ * pins with their words, `here` as a ringed dot. `harnessMap.set(spec)` draws another spec in place (the kernel calls it when the
+ * element's props change). Until the person moves the map, it is fitted again whenever its view changes size. `zoom` is a web
+ * map's (256-pixel tiles, as OpenStreetMap's and Google's count it): MapLibre's own is one less.
  */
-function pageMain(DENSE: number): void {
+async function pageMain(DENSE: number, STYLE: string, TINT: Record<string, Record<string, string>>): Promise<void> {
   type Spec = { markers: Array<{ lat: number; lon: number; label?: string; detail?: string; href?: string }>; center?: [number, number]; zoom?: number; here?: [number, number]; title: string };
-  const L = (window as any).L;
+  const M = (window as any).maplibregl;
   const fresh = JSON.parse(document.getElementById('spec')!.textContent!) as Spec;
-  const map = L.map('map', { zoomAnimation: false, fadeAnimation: false, markerZoomAnimation: false, inertia: false, worldCopyJump: true });
-  map.attributionControl.setPrefix(false);
-  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    maxZoom: 19,
-    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors',
-  }).addTo(map);
-  const layer = L.layerGroup().addTo(map);
+  // The style is fetched here, retinted, and handed over whole, so the map never shows in the style's own colours first.
+  const got = await fetch(STYLE);
+  if (!got.ok) { document.body.textContent = `The map's style could not be loaded (${STYLE}: ${got.status}).`; return; }
+  const style = await got.json();
+  for (const layer of style.layers ?? []) if (TINT[layer.id]) layer.paint = { ...layer.paint, ...TINT[layer.id] };
+  const map = new M.Map({ container: 'map', style, center: [0, 0], zoom: 1, attributionControl: false, fadeDuration: 0, dragRotate: false, pitchWithRotate: false, touchPitch: false });
+  map.touchZoomRotate.disableRotation();
+  map.addControl(new M.AttributionControl({ compact: true }), 'bottom-right');
   let spec = fresh;
   let moved = false;
+  let drawn: any[] = [];
   const el = (tag: string, text?: string) => { const e = document.createElement(tag); if (text !== undefined) e.textContent = text; return e; };
+  const at = (p: [number, number] | { lat: number; lon: number }): [number, number] => (Array.isArray(p) ? [p[1], p[0]] : [p.lon, p.lat]);
+  const zoom = (z: number) => Math.max(0, z - 1);
   const fit = () => {
-    const still = { animate: false };
-    if (spec.center) return map.setView(spec.center, spec.zoom ?? 13, still);
-    if (spec.markers.length === 0) return map.setView(spec.here, spec.zoom ?? 14, still);
-    const bounds = L.latLngBounds(spec.markers.map(m => [m.lat, m.lon]));
-    if (spec.zoom !== undefined) return map.setView(bounds.getCenter(), spec.zoom, still);
+    if (spec.center) return map.jumpTo({ center: at(spec.center), zoom: zoom(spec.zoom ?? 13) });
+    if (spec.markers.length === 0) return map.jumpTo({ center: at(spec.here!), zoom: zoom(spec.zoom ?? 14) });
+    const bounds = new M.LngLatBounds();
+    for (const m of spec.markers) bounds.extend(at(m));
+    if (spec.zoom !== undefined) return map.jumpTo({ center: bounds.getCenter(), zoom: zoom(spec.zoom) });
     // Room for a pin's words to its right; one place alone is shown at street level, not at the deepest zoom.
-    map.fitBounds(bounds, { animate: false, maxZoom: 15, paddingTopLeft: [32, 32], paddingBottomRight: [96, 32] });
+    map.fitBounds(bounds, { animate: false, maxZoom: 14, padding: { top: 40, left: 32, bottom: 48, right: 96 } });
   };
   const draw = () => {
-    layer.clearLayers();
+    for (const d of drawn) d.remove();
+    drawn = [];
     document.title = spec.title;
     document.body.classList.toggle('dense', spec.markers.length > DENSE);
     if (spec.here) {
-      L.marker(spec.here, { icon: L.divIcon({ className: 'pin here', html: el('i'), iconSize: null }), interactive: false, keyboard: false, zIndexOffset: -1000 }).addTo(layer);
+      const dot = el('div');
+      dot.className = 'here';
+      drawn.push(new M.Marker({ element: dot }).setLngLat(at(spec.here)).addTo(map));
     }
     for (const m of spec.markers) {
-      const body = document.createDocumentFragment();
-      body.append(el('i'));
-      if (m.label) body.append(el('b', m.label));
-      const holder = el('div');
-      holder.append(body);
+      const pin = el('div');
       const pressable = !!(m.detail || m.href);
-      const marker = L.marker([m.lat, m.lon], {
-        icon: L.divIcon({ className: pressable ? 'pin pressable' : 'pin', html: holder, iconSize: null }), keyboard: false,
-      }).addTo(layer);
+      pin.className = pressable ? 'pin pressable' : 'pin';
+      if (m.label) pin.append(el('b', m.label));
+      const marker = new M.Marker({ element: pin }).setLngLat(at(m)).addTo(map);
+      drawn.push(marker);
       if (!pressable) continue;
       const card = el('div');
       if (m.label) card.append(el('strong', m.label));
@@ -229,7 +261,7 @@ function pageMain(DENSE: number): void {
         a.href = m.href; a.target = '_blank'; a.rel = 'noopener';
         card.append(a);
       }
-      marker.bindPopup(card, { closeButton: false, offset: [0, -4], autoPan: false });
+      marker.setPopup(new M.Popup({ closeButton: false, offset: 10, maxWidth: '280px' }).setDOMContent(card));
     }
   };
   // The person's own drag or scroll, never a fit of ours.
@@ -241,11 +273,11 @@ function pageMain(DENSE: number): void {
 }
 
 /**
- * The whole page of one Map: Leaflet's script and styles (`lib`, the vendored files' text) inline, the spec as JSON, and the script
- * above. One document, one request; the only thing it loads after is OpenStreetMap's tiles.
+ * The whole page of one Map: MapLibre GL's script and styles (`lib`, the vendored files' text) inline, the spec as JSON, and the script
+ * above. One document, one request; the only things it loads after are the style and its tiles, fonts and icons (tiles.openfreemap.org).
  */
 export function mapPage(spec: MapSpec, lib: { js: string; css: string }): string {
-  const main = `(${pageMain.toString()})(${DENSE_MARKERS});`;
+  const main = `(${pageMain.toString()})(${DENSE_MARKERS}, ${JSON.stringify(MAP_STYLE)}, ${inScript(MAP_TINT)});`;
   const safe = (code: string) => code.replace(/<\/(script)/gi, '<\\/$1');
   return `<!doctype html>
 <html lang="en">

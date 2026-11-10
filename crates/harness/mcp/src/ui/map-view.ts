@@ -10,7 +10,7 @@ import { mapPage, type MapSpec } from './map.ts';
  * a server and not `Page.setDocumentContent` on about:blank or a `Fetch.fulfillRequest` on a made-up origin: the page then has a
  * real http origin, so its tile requests carry a Referer, which OpenStreetMap's tile servers require of a browser; and it is an
  * ordinary page the pane can show and inspect. The server holds nothing but the specs of this kernel's maps and answers nothing
- * but their pages. A page needs it once, to load: it is one document with Leaflet inline, so a map already drawn keeps working
+ * but their pages. A page needs it once, to load: it is one document with MapLibre GL inline, so a map already drawn keeps working
  * (panning, zooming, new tiles) after this kernel is gone; only reloading it then fails.
  *
  * Lifetime: the view is opened `keep`, as `browser.open`'s is, so the card stays live after the cell finishes and after this
@@ -22,8 +22,9 @@ import { mapPage, type MapSpec } from './map.ts';
 export const MAX_MAP_VIEWS = 16;
 /** A map view's size in points until the app draws it (the card takes its shape from the view's). */
 const VIEW_SIZE: [number, number] = [800, 480];
-/** Where the vendored Leaflet is (vendor/leaflet-1.9.4, from npm's leaflet-1.9.4.tgz: dist/leaflet.js, dist/leaflet.css, LICENSE). */
-const LEAFLET = join(import.meta.dir, '..', '..', 'vendor', 'leaflet-1.9.4');
+/** Where the vendored MapLibre GL is (vendor/maplibre-gl-4.7.1, from npm's maplibre-gl-4.7.1.tgz, sha256 7e8a778c…65f923:
+ *  dist/maplibre-gl.js, dist/maplibre-gl.css, LICENSE.txt). */
+const MAPLIBRE = join(import.meta.dir, '..', '..', 'vendor', 'maplibre-gl-4.7.1');
 
 /** What a Map is drawn as now: nothing yet, the view of its page, or why there is none. */
 export type MapShown = { state: 'opening' } | { state: 'open'; view: string } | { state: 'failed'; why: string };
@@ -51,15 +52,15 @@ let seq = 0;
 let lib: Promise<{ js: string; css: string }> | undefined;
 let server: { port: number } | undefined;
 
-/** Leaflet's script and styles, read once; a missing file is an error naming it. */
-function leaflet(): Promise<{ js: string; css: string }> {
+/** MapLibre GL's script and styles, read once; a missing file is an error naming it. */
+function maplibre(): Promise<{ js: string; css: string }> {
   return lib ??= (async () => {
     const read = async (name: string) => {
-      const file = Bun.file(join(LEAFLET, name));
-      if (!await file.exists()) throw new Error(`the map library is missing: ${join(LEAFLET, name)} (vendored Leaflet 1.9.4, in the repository under crates/harness/mcp/vendor)`);
+      const file = Bun.file(join(MAPLIBRE, name));
+      if (!await file.exists()) throw new Error(`the map library is missing: ${join(MAPLIBRE, name)} (vendored MapLibre GL 4.7.1, in the repository under crates/harness/mcp/vendor)`);
       return file.text();
     };
-    const [js, css] = await Promise.all([read('leaflet.js'), read('leaflet.css')]);
+    const [js, css] = await Promise.all([read('maplibre-gl.js'), read('maplibre-gl.css')]);
     return { js, css };
   })().catch((error) => { lib = undefined; throw error; });
 }
@@ -76,7 +77,7 @@ function urlOf(id: string): string {
         const spec = request.method === 'GET' && found && found[1] === token ? specs.get(found[2]!) : undefined;
         if (spec === undefined) return new Response('no such map', { status: 404 });
         try {
-          return new Response(mapPage(JSON.parse(spec) as MapSpec, await leaflet()), {
+          return new Response(mapPage(JSON.parse(spec) as MapSpec, await maplibre()), {
             headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' },
           });
         } catch (error) {
@@ -110,7 +111,7 @@ function close(card: MapCard, why: string): void {
 async function open(card: MapCard): Promise<void> {
   const loaded = card.want;
   // Read before the view opens, so a missing library is this error and not a page that says 500.
-  await leaflet();
+  await maplibre();
   const url = urlOf(card.id);
   // Loaded when a Map is first drawn: the UI's own modules stay free of the browser's (a kernel that draws no Map loads none of it here).
   const { newPage } = await import('../cdp.ts');
