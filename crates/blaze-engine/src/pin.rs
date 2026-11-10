@@ -370,7 +370,9 @@ fn keep(file: &Path, start: &Path, seen: &[(PathBuf, Result<Option<Stamp>, ()>)]
     let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
         return;
     };
-    let line = |path: &Path| path.to_str().filter(|it| !it.contains(['\t', '\n']));
+    fn line(path: &Path) -> Option<&str> {
+        path.to_str().filter(|it| !it.contains(['\t', '\n']))
+    }
     let Some(start) = line(start) else { return };
     let mut text = format!("{KEPT}\nstart\t{start}\n"); // alloc: the file's text, once a lookup kept
     for (path, was) in seen {
