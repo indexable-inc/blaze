@@ -2060,7 +2060,9 @@ def selftest_ledger() -> None:
             chosen = select(it.projects, it.budgets)
         except (SystemExit, ValueError) as e:
             raise SystemExit(f"{SCRIPT} selftest: the ledger's {row_id} gives an input this script refuses: {e}") from None
-        expect(it.command == "run" and (bool(chosen) or "bounds" in it.budgets),
+        # The smoke's rows are its own (`SMOKE_ROWS`, `guards.names()`): it takes no `budgets`.
+        expect((it.command == "smoke" and not it.projects and not it.budgets)
+               or (it.command == "run" and (bool(chosen) or "bounds" in it.budgets)),
                f"the ledger's {row_id} selects no row: {given}")
 
 
