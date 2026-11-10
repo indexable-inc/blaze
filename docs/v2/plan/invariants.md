@@ -130,7 +130,7 @@ By level: 20 tested, 18 simulated, 0 model-checked, 0 proved.
 ### blaze-codegen
 
 - **`a_walk_over_kept_describes_builds_what_a_fresh_walk_builds`** *tested* (`crates/blaze-codegen/src/driver/tests/kept.rs`): for any program and any sequence of edits (a body, a reference added or removed, a function added or removed, a static's value, a dyn fact, the recursion limit), the build whose walk takes the describes kept by the builds before it is, after every edit, the build of a walk that keeps none: the same functions and statics, the same code and places, symbols, slots, owners, dedupe and reach, and the same errors where it is refused.
-  Controls: `a_changed_function_whose_callers_keep_its_old_key`, `a_removed_ref_whose_target_stays_reached`, `a_dyn_fact_change_that_invalidates_nothing`.
+  Controls: `a_changed_function_whose_callers_keep_its_old_key`, `a_removed_ref_whose_target_stays_reached`, `a_dyn_fact_change_that_invalidates_nothing`, `a_patch_that_keeps_a_changed_functions_old_references`, `a_caller_that_names_a_changed_callees_old_key`.
 
 ### blaze-link
 
