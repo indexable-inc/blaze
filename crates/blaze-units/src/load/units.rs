@@ -745,10 +745,12 @@ impl PackageTargets for Targets<'_> {
         }
     }
 
-    /// The host's, or the wasm macros': the unit graph builds a proc macro's dependencies for
-    /// wasm, and asks for the features of each one either platform activates.
-    fn host_dep_activated(&self, platform: &Platform) -> bool {
-        self.host.activates(platform) || self.macro_wasm.is_some_and(|it| it.activates(platform))
+    fn macros_are_wasm(&self) -> bool {
+        self.macro_wasm.is_some()
+    }
+
+    fn macro_wasm_activated(&self, platform: &Platform) -> bool {
+        self.macro_wasm.is_some_and(|it| it.activates(platform))
     }
 }
 

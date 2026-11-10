@@ -64,10 +64,14 @@ pub trait PackageTargets {
     fn has_proc_macro_lib(&self, package_id: PackageId) -> bool;
     /// Whether a `[target.'cfg(..)'.dependencies]` platform holds for `kind`.
     fn platform_activated(&self, platform: &Platform, kind: CompileKind) -> bool;
-    /// Whether a platform holds for a build dependency or a dependency under a proc macro:
-    /// the host's, as in cargo. blaze, which builds proc macros for wasm, adds that platform.
-    fn host_dep_activated(&self, platform: &Platform) -> bool {
-        self.platform_activated(platform, CompileKind::Host)
+    /// Whether proc macros are built for wasm, blaze's: their features are then
+    /// [`FeaturesFor::MacroWasm`]'s. cargo builds them for the host.
+    fn macros_are_wasm(&self) -> bool {
+        false
+    }
+    /// Whether a platform holds for a proc macro built for wasm, and what it depends on.
+    fn macro_wasm_activated(&self, _platform: &Platform) -> bool {
+        false
     }
 }
 
@@ -142,12 +146,16 @@ pub enum FeaturesFor {
     NormalOrDev,
     /// Build dependency or proc-macro.
     HostDep,
+    /// blaze's: a proc macro built for wasm ([`PackageTargets::macros_are_wasm`]), and its
+    /// dependencies other than build dependencies, whose platform is the wasm one.
+    MacroWasm,
 }
 
 impl std::fmt::Display for FeaturesFor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FeaturesFor::HostDep => f.write_str("host"),
+            FeaturesFor::MacroWasm => f.write_str("macro-wasm"),
             FeaturesFor::NormalOrDev => Ok(()),
         }
     }
@@ -459,6 +467,10 @@ impl<'a, T: PackageTargets> FeatureResolver<'a, T> {
                 // dependencies. This is part of the bigger problem where
                 // features depend on which packages are built.
                 self.activate_pkg(member.package_id(), FeaturesFor::default(), &fvs)?;
+                if self.targets.macros_are_wasm() {
+                    // Its library is built for wasm, its tests for the host.
+                    self.activate_pkg(member.package_id(), FeaturesFor::MacroWasm, &fvs)?;
+                }
                 FeaturesFor::HostDep
             } else {
                 FeaturesFor::default()
@@ -727,8 +739,9 @@ impl<'a, T: PackageTargets> FeatureResolver<'a, T> {
                     // We always care about build-dependencies, and they are always
                     // Host. If we are computing dependencies "for a build script",
                     // even normal dependencies are host-only.
-                    targets.host_dep_activated(platform)
+                    targets.platform_activated(platform, CompileKind::Host)
                 }
+                (_, FeaturesFor::MacroWasm) => targets.macro_wasm_activated(platform),
                 (_, FeaturesFor::NormalOrDev) => {
                     requested_targets.iter().any(|kind| targets.platform_activated(platform, *kind))
                 }
@@ -753,19 +766,24 @@ impl<'a, T: PackageTargets> FeatureResolver<'a, T> {
                         }
                         true
                     })
-                    .map(|dep| {
+                    .flat_map(|dep| {
                         // A dependency may be a library target which is built as initially
                         // configured by `fk`. If it appears as build dependency, it must be
                         // built for the host.
-                        let dep_fk = if fk != FeaturesFor::HostDep
-                            && self.track_for_host
-                            && (dep.is_build() || self.has_proc_macro_lib(dep_id))
-                        {
+                        // blaze builds a proc macro's library for wasm, from a build script
+                        // too, and its other targets (its tests) for the host as cargo does.
+                        let proc_macro = self.has_proc_macro_lib(dep_id);
+                        let dep_fk = if !self.track_for_host {
+                            fk
+                        } else if dep.is_build() || proc_macro {
                             FeaturesFor::HostDep
                         } else {
                             fk
                         };
-                        (dep, dep_fk)
+                        let wasm =
+                            self.track_for_host && proc_macro && self.targets.macros_are_wasm();
+                        std::iter::once((dep, dep_fk))
+                            .chain(wasm.then_some((dep, FeaturesFor::MacroWasm)))
                     })
                     .collect::<Vec<_>>();
                 (dep_id, deps)
