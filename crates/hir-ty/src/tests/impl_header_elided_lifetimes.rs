@@ -207,7 +207,7 @@ fn an_elided_impl_header_lifetime_holds_for_every_lifetime() {
 
 /// The proc-macro bridge's `Decode` impls (`rpc.rs`, `client.rs`), each leaving its header's
 /// lifetimes out, and `run_client`'s closure calling `<(ExpnGlobals<Span>, A)>::decode`: the
-/// 00:49 self-run's serde derives stopped there, the callee typeless (queue 01481).
+/// 00:49 self-run's serde derives stopped there, the callee typeless.
 const BRIDGE: &str = r#"
 //- minicore: sized, fn, copy, slice, index, range, deref, coerce_unsized
 pub trait Decode<'a, 's, S>: Sized {

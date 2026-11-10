@@ -336,7 +336,7 @@ fn two_closures_of_one_signature_keep_their_own_bodies() {
 /// of before it runs the C compiler: `fetch_update(AcqRel, Acquire, |t| t.checked_sub(1))` on
 /// an `AtomicU32` of `NUM_JOBS`, retried after a `YieldOnce` on a no-op waker, and given back
 /// when `retain_mut` drops a finished job's token. ring's and zstd-sys's build scripts, built by
-/// blaze, compiled `NUM_JOBS` objects and then slept in cc's `block_on` forever (queue 01523):
+/// blaze, compiled `NUM_JOBS` objects and then slept in cc's `block_on` forever:
 /// the MIR inliner inlined `drop_in_place`'s `drop_glue`, a placeholder, so `retain_mut`
 /// dropped nothing it removed. Each step is checked on its own, in the build script and in the
 /// program.

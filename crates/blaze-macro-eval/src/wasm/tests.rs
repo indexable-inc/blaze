@@ -604,6 +604,8 @@ fn an_expansion_is_found_again_when_only_a_variable_it_never_read_differs() {
     let mut spent = Spent::default();
     let first = env("1", "/tmp/blaze-lanes/profile-1855");
     let ran = library.expand(&db, &first, &[(0, given(&input))], &[], "/", &mut spent).unwrap();
+    let first = env("1", "/tmp/blaze-profile-1855");
+    let ran = library.expand(&db, &first, 0, &given(&input), &[], "/", &mut spent).unwrap();
     assert_eq!(
         ran.seen,
         [(Seen::Env, "A".to_owned())],
@@ -632,11 +634,11 @@ fn an_expansion_is_found_again_when_only_a_variable_it_never_read_differs() {
         matches!(index::find(&reader, &guard, &key, &mut Calling::new(env)), Ok(Found::Hit { .. }))
     };
     assert!(
-        found(&env("1", "/tmp/blaze-lanes/profile-1910")),
+        found(&env("1", "/tmp/blaze-profile-1910")),
         "a variable it never read made it miss"
     );
     assert!(
-        !found(&env("2", "/tmp/blaze-lanes/profile-1855")),
+        !found(&env("2", "/tmp/blaze-profile-1855")),
         "the variable it read changed and it was found"
     );
 }

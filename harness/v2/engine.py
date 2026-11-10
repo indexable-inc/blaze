@@ -1,23 +1,20 @@
-"""engine.py: the blaze a v2 proof script measures, v1 or v2, behind one interface.
+"""engine.py: the blaze a v2 proof script measures, behind one interface.
 
 Every script under harness/v2 takes, in its typed input, an `engine`:
 
     {"kind": "v2", "blaze": "target/release/blaze"}
 
-(`backend` is v1's, given it as BLAZE_BACKEND; v2 takes only the default, as it picks each
-unit's backend from its profile and refuses every unit while BLAZE_BACKEND is set. v2 also takes
-`"dev_backend": "stencil"` or `"cranelift"`, forcing the dev tier's backend for every function,
-`"default"` leaving it to blaze), and does everything through `Engine`. `Engine.of` refuses
-`"kind": "v1"`: v1 is gone, and its adapter (`V1`) read what its workers logged and the
-`loading`/`ready` states `blaze status` printed, which a v2 blaze has none of, so against one it
-would measure nothing without a word. Builds, runs and tests go through the `blaze` command
-line (`blaze build`, `run`, `test`, `check`, `status`, `stop`), which v1 and v2 both have, so a
-script is the same for both. What only an engine's insides can say (what an edit recompiled,
-the codegen inputs of a build, the critical path of a cold build) is a method here:
+(`kind` is `"v2"`, the one engine there is. `backend` takes only the default, as blaze picks each
+unit's backend from its profile and refuses every unit while BLAZE_BACKEND is set;
+`"dev_backend": "stencil"` or `"cranelift"` forces the dev tier's backend for every function,
+`"default"` leaving it to blaze), and does everything through `Engine`. Builds, runs and tests
+go through the `blaze` command line (`blaze build`, `run`, `test`, `check`, `status`, `stop`).
+What only an engine's insides can say (what an edit recompiled, the codegen inputs of a build,
+the critical path of a cold build) is a method here:
 
-- a method v1 has no answer to raises `Unmeasurable`, and the result says "unmeasured": a run
-  against v1 still sets the bar;
-- v2 answers each from the agent API (`crates/blaze-api`) through the command line's forms of
+- a method with no answer raises `Unmeasurable`, and the result says "unmeasured", which is a
+  failure of the run;
+- blaze answers each from the agent API (`crates/blaze-api`) through the command line's forms of
   it (`crates/blaze-ui/src/api.rs`): what a request did from the `blaze-work` line a build, test
   or run prints under `--message-format=json`; `blaze codegen-inputs --format=json`,
   `blaze trace --out PATH` and `blaze tables --format=json` for the rest. An answer it cannot
@@ -53,10 +50,10 @@ import sys
 import tempfile
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field, replace
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import Any, Literal, cast
 
 import blake3
 
@@ -65,9 +62,6 @@ HARNESS = HERE.parent
 if str(HARNESS) not in sys.path:
     sys.path.append(str(HARNESS))
 import storelib  # noqa: E402
-
-if TYPE_CHECKING:
-    from storelib import BuildFinished
 
 ROOT = HARNESS.parent
 TOOLCHAIN = (HARNESS / "toolchain").read_text().strip()
@@ -89,26 +83,19 @@ SCRUBBED = (
     "BLAZE_BACKEND",
     "BLAZE_OPT",
     "BLAZE_EMIT",
-    # v1's memory limit, read by nothing in v2 (the daemon's is BLAZE_DAEMON_MEMORY_GB, which a
+    # A memory limit nothing reads any more (the daemon's is BLAZE_DAEMON_MEMORY_GB, which a
     # caller keeps): dropped so a stale export says nothing.
     "BLAZE_MEMORY_BUDGET",
     # Where the socket goes without BLAZE_HOME (blaze_api::client::home); every command here has one.
     "XDG_RUNTIME_DIR",
 )
-# What the v1 daemon's workers log about each build (crates/blaze-engine), read by `work_since`.
-V1_COMPILED = re.compile(r"^stats: (\d+) of (\d+) functions compiled", re.M)
-V1_STORE = re.compile(r"^store: (\d+) functions found, (\d+) compiled and added$", re.M)
-V1_LINK = re.compile(r"^link: \S+ \((.*)\)$", re.M)
-V1_DONE_BYTES = re.compile(rb"^(edit-to-binary:|cold: compiled|stats: )", re.M)
-SETTLE_SECS = 3.0
-QUIET_SECS = 0.25
 # The commands whose request ends in `Response::Work` (crates/blaze-api/src/build.rs), which the
 # command line prints under `--message-format=json` as a `blaze-work` line
 # (crates/blaze-ui/src/api.rs, `work_json`).
 WORKING = ("build", "test", "run")
 WORK_COUNTS = ("reran", "green", "compiled", "found", "critical_path_us")
 
-type Kind = Literal["v1", "v2"]
+type Kind = Literal["v2"]
 type Backend = Literal["cranelift", "llvm"]
 type DevBackend = Literal["default", "stencil", "cranelift"]
 DEV_BACKENDS: tuple[DevBackend, ...] = ("default", "stencil", "cranelift")
@@ -127,7 +114,7 @@ class EngineSpec:
     """The `engine` field of every script's input."""
 
     kind: Kind
-    # The `blaze` command line client (v1: the `blaze` beside `blaze-engine`).
+    # The `blaze` command line client.
     blaze: str
     backend: Backend = "cranelift"
     # The backend of every function the dev tier compiles (opt-level 0 and 1, and the first
@@ -140,7 +127,7 @@ class EngineSpec:
 
 
 class Unmeasurable(Exception):
-    """What was asked has no answer in this engine (v1 has no codegen inputs to compare)."""
+    """What was asked has no answer in this engine."""
 
 
 class Failed(Exception):
@@ -157,10 +144,6 @@ class Ran:
     returncode: int
     stdout: str
     stderr: str
-    # Its `build-finished` line read (harness/storelib.py), where the engine asked for one and
-    # cut `stdout` to what came after it (`V1.build`); None otherwise.
-    finished: "BuildFinished | None" = None
-
     def said(self, tail: int = 3000) -> str:
         return (self.stdout + self.stderr)[-tail:]
 
@@ -518,15 +501,12 @@ class Engine(ABC):
         self.blaze = Path(spec.blaze).resolve()
         if not self.blaze.is_file():
             raise Failed(f"engine.blaze: no file {self.blaze}")
-        if spec.kind == "v2" and spec.backend != "cranelift":
+        if spec.backend != "cranelift":
             raise Failed(f"engine.backend {spec.backend!r}: v2 picks each unit's backend from its profile "
-                         "(opt-level), and BLAZE_BACKEND, BLAZE_OPT and BLAZE_EMIT are v1's: the v2 code "
+                         "(opt-level), and BLAZE_BACKEND, BLAZE_OPT and BLAZE_EMIT are gone: the code "
                          "generator refuses every unit while one is set (CHANGES_CODE in "
                          "crates/hir-ty-codegen/v2/backend.rs); build with `--release` for LLVM")
         if spec.dev_backend != "default":
-            if spec.kind == "v1":
-                raise Failed(f"engine.dev_backend {spec.dev_backend!r}: v1 has no stencil backend and no setting "
-                             "for the dev tier's; the backend axis is v2's")
             if spec.backend != "cranelift":
                 raise Failed(f"engine.dev_backend {spec.dev_backend!r} with engine.backend {spec.backend!r}: "
                              "BLAZE_BACKEND=llvm compiles every function with LLVM, so there is no dev tier to force")
@@ -534,10 +514,6 @@ class Engine(ABC):
 
     @staticmethod
     def of(spec: EngineSpec) -> "Engine":
-        if spec.kind == "v1":
-            raise Failed(f"engine.kind 'v1' ({spec.blaze}): v1 is gone, and its adapter reads its workers' logs "
-                         "(`<home>/*/*/log`) and `blaze status`'s `loading`/`ready` lines, which v2 has none of; "
-                         "give `\"kind\": \"v2\"`")
         eng = V2(spec)
         eng.preflight()
         return eng
@@ -555,12 +531,8 @@ class Engine(ABC):
         home.mkdir(parents=True, exist_ok=True, mode=0o700)
         env = scrubbed()
         env.update(BLAZE_HOME=str(home), BLAZE_STATS="1", PATH=f"{self.blaze.parent}{os.pathsep}{env.get('PATH', '')}")
-        # v1 is told its backend by the environment. v2 refuses every unit while BLAZE_BACKEND,
-        # BLAZE_OPT or BLAZE_EMIT is set (`scrubbed` drops the caller's), so it gets none.
-        if self.kind == "v1":
-            env.update(BLAZE_BACKEND=self.spec.backend)
-            if self.spec.backend == "llvm":
-                env.update(BLAZE_OPT="2", BLAZE_EMIT="fast")
+        # blaze refuses every unit while BLAZE_BACKEND, BLAZE_OPT or BLAZE_EMIT is set (`scrubbed`
+        # drops the caller's), so it gets none.
         if target is not None:
             env["CARGO_TARGET_DIR"] = str(target)
         env.update(extra or {})
@@ -625,124 +597,6 @@ class Engine(ABC):
     def trace(self, ws: Path, env: dict[str, str], to: Path) -> None:
         """Writes to `to` what the last build of `ws` left in the query database, as the
         deterministic CBOR of `blaze_v2_proof::Trace`, which `blaze-v2-proof` compares."""
-
-
-class V1(Engine):
-    """v1's blaze (`blaze` beside `blaze-engine`): a daemon of workers, each logging what it
-    built under `BLAZE_HOME`; a build it cannot do is cargo's, and says so. `Engine.of` no
-    longer gives it (v1 is gone); only proof.py's check of its log reader still builds one."""
-
-    def not_blazes(self, ran: Ran) -> str | None:
-        import blaze_cli
-
-        # Reads `ran.finished`, which `build` filled from the `build-finished` line.
-        how_built: Callable[[Ran], str] = getattr(blaze_cli, "how_built")
-        how = how_built(ran)
-        if how == "daemon":
-            return None
-        # `how_built` says "daemon", "served <how>, not by the daemon" or "failed: <error>",
-        # never "cargo", and blaze_cli's `by_rustc` (the check of a refused build that went to
-        # cargo) is gone (queue 01087).
-        return how
-
-    def command(self, step: str, command: str, args: list[str], ws: Path, env: dict[str, str],
-                timeout: float = 7200) -> Ran:
-        """`blaze COMMAND ARGS` in `ws`; a command that builds runs with the format its build is
-        read by (`blaze_cli.machine_format`), its `build-finished` line goes to `Ran.finished` and
-        its `stdout` is what came after the line: the program's or the tests' own output."""
-        import blaze_cli
-        import storelib
-
-        machine_format: Callable[[str, Sequence[str]], list[str]] = getattr(blaze_cli, "machine_format")
-        added = machine_format(command, args)
-        ran = run(step, [str(self.blaze), command, *added, *args], ws, env, timeout)
-        if not added:
-            return ran
-        finished, rest = storelib.split_build_output(ran.stdout)
-        return replace(ran, stdout=rest, finished=finished) if finished is not None else ran
-
-    def build(self, step: str, ws: Path, env: dict[str, str], args: Sequence[str] = (), command: str = "build",
-              timeout: float = 7200) -> Ran:
-        # The first build of a checkout can come before its worker has loaded it, and is then
-        # cargo's: the next ones are the daemon's once it is ready.
-        began = time.monotonic()
-        while True:
-            ran = self.command(step, command, list(args), ws, env, timeout)
-            if ran.returncode != 0 or self.not_blazes(ran) is None or time.monotonic() - began > timeout:
-                return ran
-            if "loading" not in self.command(f"{step}: status", "status", [], ws, env, 300).stdout:
-                return ran
-            time.sleep(0.5)
-
-    def wait_ready(self, ws: Path, env: dict[str, str], timeout: float = 3600) -> float:
-        root = os.path.realpath(ws)
-        began = time.monotonic()
-        while time.monotonic() - began < timeout:
-            status = self.command("the daemon's status", "status", [], ws, env, 300).stdout
-            states = re.findall(rf"^    {re.escape(root)}: (.*)$", status, re.M)
-            if states and not any(s.startswith("loading") for s in states):
-                if any(s != "ready" for s in states):
-                    raise Failed(f"the daemon did not load {root}: {states}")
-                return time.monotonic() - began
-            time.sleep(0.1)
-        raise Failed(f"the daemon did not have {root} ready in {timeout:.0f} s")
-
-    def logs(self, home: Path) -> list[Path]:
-        # A worker's log is `workers/<id>/log`; one that began as a spare keeps the spare's.
-        return sorted(set(home.glob("*/*/log")))
-
-    def mark(self, home: Path) -> Mark:
-        return Mark({str(p): p.stat().st_size for p in self.logs(home)})
-
-    def work_since(self, home: Path, mark: Mark) -> Work:
-        # Each log's bytes after the mark, read once: a poll reads only what was added since.
-        read: dict[str, bytearray] = {}
-
-        def grew() -> bool:
-            more = False
-            for path in self.logs(home):
-                got = read.setdefault(str(path), bytearray())
-                with open(path, "rb") as f:
-                    f.seek(mark.sizes.get(str(path), 0) + len(got))
-                    added = f.read()
-                if added:
-                    got += added
-                    more = True
-            return more
-
-        def done() -> bool:
-            return any(V1_DONE_BYTES.search(got) for got in read.values())
-
-        # A worker writes what it did after it answered the client: wait for it to be quiet.
-        began = time.monotonic()
-        grew()
-        quiet, finished = time.monotonic(), done()
-        while time.monotonic() - began < SETTLE_SECS:
-            time.sleep(0.05)
-            if grew():
-                quiet, finished = time.monotonic(), done()
-            elif finished and time.monotonic() - quiet >= QUIET_SECS:
-                break
-        said = "".join(read[path].decode(errors="replace") for path in sorted(read, key=Path))
-        compiled = sum(int(n) for n, _ in V1_COMPILED.findall(said))
-        stored = V1_STORE.findall(said)
-        links = V1_LINK.findall(said)
-        again = [link for link in links if not link.startswith("spliced")]
-        link = None if not links else "spliced" if not again else "full link: " + again[0][:160]
-        return Work(compiled=compiled, reran=None, found=sum(int(f) for f, _ in stored) if stored else None,
-                    link=link, said=said[-4000:])
-
-    def codegen_inputs(self, ws: Path, env: dict[str, str]) -> dict[str, str]:
-        raise Unmeasurable("v1 has no per-function codegen inputs to read; its programs are compared instead")
-
-    def critical_path_s(self, ws: Path, env: dict[str, str]) -> float:
-        raise Unmeasurable("v1 does not record the critical path of a build")
-
-    def tables(self, ws: Path, env: dict[str, str]) -> dict[str, Table]:
-        raise Unmeasurable("v1 keeps rowan trees and salsa memos, not columns it can count")
-
-    def trace(self, ws: Path, env: dict[str, str], to: Path) -> None:
-        raise Unmeasurable("v1 has no query database of fingerprints and edges to trace")
 
 
 class V2(Engine):

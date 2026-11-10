@@ -5,7 +5,7 @@
         "checks": [{"name": "oracle", "given": {"rounds": 8}}, {"name": "budgets"}]}'
     uv run --frozen python harness/v2/proof.py selftest
 
-The checks, each a script of this directory run with the same `engine` (v2; `engine.Engine.of` refuses v1, which is gone):
+The checks, each a script of this directory run with the same `engine`:
 
     oracle        oracle.py: the incremental build equals one from scratch after every edit
     corpus        corpus.py: real crates built, run and tested by blaze, judged by their own tests
@@ -197,7 +197,7 @@ def selftest(proof: Path | None) -> list[str]:
     if [verdict_of([{"verdict": v} for v in vs]) for vs in (["pass"], ["pass", "unmeasured"], ["error", "fail"], [])] != [
         "pass", "unmeasured", "fail", "pass"]:
         wrong.append("verdict_of does not give the worst verdict")
-    spec = engine.EngineSpec("v1", "/b/blaze")
+    spec = engine.EngineSpec("v2", "/b/blaze")
     argv = argv_of(Check("oracle", {"rounds": 2}), spec, Path("/o"), "/w")
     given = json.loads(argv[-1])
     if argv[1:3] != [str(HERE / "oracle.py"), "run"]:
@@ -215,7 +215,7 @@ def selftest(proof: Path | None) -> list[str]:
         {"name": "nushell body", "verdict": "fail", "detail": "took 80 ms", "numbers": {"ms": 80, "budget": 30}}]})])
     if "| nushell body | fail | ms=80  budget=30 | took 80 ms |" not in md:
         wrong.append(f"markdown has no row of the budget:\n{md}")
-    return wrong + v2_work_wrong() + files_wrong(proof) + v1_logs_wrong()
+    return wrong + v2_work_wrong() + files_wrong(proof)
 
 
 def old_outputs(target: Path, profile: str) -> dict[str, str]:
@@ -371,29 +371,6 @@ def files_wrong(proof: Path | None) -> list[str]:
                 before = after
         except engine.Failed as e:
             wrong.append(f"engine.tree_digest: {e}")
-    return wrong
-
-
-def v1_logs_wrong() -> list[str]:
-    """`V1.work_since` reads only what each worker's log gained after the mark, and all of it."""
-    import tempfile
-
-    wrong: list[str] = []
-    with tempfile.TemporaryDirectory() as tmp:
-        home = Path(tmp)
-        logs = [home / "workers" / str(i) / "log" for i in (1, 2)]
-        for log in logs:
-            log.parent.mkdir(parents=True)
-            log.write_text("stats: 100 of 100 functions compiled\n")
-        eng = engine.V1(engine.EngineSpec("v1", sys.executable))
-        mark = eng.mark(home)
-        with open(logs[0], "a") as f:
-            f.write("stats: 3 of 10 functions compiled\nlink: app (spliced into the running program)\n")
-        with open(logs[1], "a") as f:
-            f.write("store: 5 functions found, 2 compiled and added\nstats: 2 of 9 functions compiled\n")
-        work = eng.work_since(home, mark)
-        if (work.compiled, work.found, work.link) != (5, 5, "spliced"):
-            wrong.append(f"V1.work_since: {work}")
     return wrong
 
 

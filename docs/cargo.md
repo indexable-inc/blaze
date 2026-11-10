@@ -86,6 +86,10 @@ a build first needs it.
     blaze doc   [cargo's flags]                                       (d)
     blaze fmt   [--check] [-p NAME]... [--all] [--manifest-path PATH] [-v|-q] [-- RUSTFMT_ARGS]
     blaze fmt   [RUSTFMT_ARGS] FILE.rs...
+    blaze new   [--bin|--lib] [--name NAME] [--edition YEAR] [--vcs VCS] [--registry NAME] PATH
+    blaze init  [--bin|--lib] [--name NAME] [--edition YEAR] [--vcs VCS] [--registry NAME] [PATH]
+    blaze tree  [cargo tree's flags]
+    blaze metadata [--format-version 1] [--no-deps] [--filter-platform TRIPLE] [the feature flags] [--manifest-path PATH]
     blaze serve [--socket PATH] [--http ADDR] [--activated] [--ready-fd N] [--stall-bound SECS]
     blaze stop
     blaze status [--json]
@@ -94,7 +98,6 @@ a build first needs it.
     blaze codegen-inputs --format=json
     blaze trace --out PATH
     blaze tables --format=json
-    blaze pack -p PACKAGE --out PATH [cargo's flags]
     blaze pin
     blaze --version
 
@@ -107,12 +110,7 @@ the command work as in cargo. `test` alone takes four flags of blaze's own (exte
 not compile a build's error names, the first `N` (16 without it) or every one.
 `serve` is the daemon itself ([below](#the-daemon)); `codegen-inputs`, `trace` and `tables`
 print what the daemon's last build of the checkout did (each instance it made with its code
-hash, every result with its edges as CBOR, the size of each long-lived table); `pack` checks
-the package for `wasm32-unknown-unknown` with debug assertions off (as `--release`), its build
-scripts run and proc macros loaded in the sandbox as any check's, and writes the program's crate
-and every crate it is made of, with each macro expansion its names and bodies needed, to `PATH`
-as one JSON file for the in-browser compiler (`crates/blaze-wasm-pack`, the agent API's
-`Request::Pack`); `check --replace std::sync::Mutex=parking_lot::Mutex` retargets every
+hash, every result with its edges as CBOR, the size of each long-lived table); `check --replace std::sync::Mutex=parking_lot::Mutex` retargets every
 reference that resolves to the item `FROM` names to the item `TO` names, each a def path from a
 crate's name: the daemon's front end finds them by name resolution (imports, renames, globs,
 re-exports, the prelude, a macro's input), never by text, rewrites a `use` of it or a path that
@@ -693,7 +691,7 @@ itself (`CARGO_PKG_*`, `CARGO_MANIFEST_DIR`, `OUT_DIR`, `RUSTC*`, ...); what car
 build scripts (`CARGO_CFG_*`, `CARGO_FEATURE_*`, `CARGO_ENCODED_RUSTFLAGS`) it may forward, as
 rav1e's does. Anything
 else fails the build, naming the script and each line. Over the bench corpus's 587 runs the
-rules refuse none (`tools/bench/results/2026-10-27-bscache/directives.md`).
+rules refuse none (counted 2026-10-27).
 
 and, for a package of the workspace, in its own manifest:
 
@@ -1424,14 +1422,17 @@ plugin (`cargo-<name>` on the path).
 v2's client has only the commands of [Commands](#commands) (`crates/blaze-cargo/src/cli.rs`);
 any other fails with status 101 and does nothing:
 
-    error: no such command: `tree`
+    error: no such command: `vendor`
 
-    help: blaze's commands are build, check, run, test, bench, doc, clean, cache, fmt, serve, stop, status, toolchain, daemon, codegen-inputs, trace, tables, pack, explore, debug, explain, why, reach and slow
+    help: blaze's commands are build, check, run, test, bench, doc, clean, cache, fmt, new, init, tree, metadata, serve, stop, status, toolchain, daemon, codegen-inputs, trace, tables, explore, debug, explain, why, reach and slow
 
 The table below is a record of what v1 had (as of 2026-10-30): the crates it names
 (blaze-metadata, blaze-fmt, blaze-lints, ...) are still in the tree, and a command comes back
-once the client asks the daemon for it. None of it runs in v2, except `fmt`, which is back as
-[above](#commands).
+once the client is given it. None of it runs in v2, except `fmt`, `new`, `init`, `tree` and
+`metadata`, which are back as [above](#commands): each runs in the client's process
+(`crates/blaze-cargo/src/cli/new.rs`, `crates/blaze-cargo/src/cli/tree.rs`,
+`crates/blaze-cargo/src/cli/metadata.rs`) and asks the daemon nothing. `tree` and `metadata`
+decide the lock files as a build does ([Lock files](#lock-files)).
 
 | Command | blaze's | What it is, and what it waits for |
 |---|---|---|

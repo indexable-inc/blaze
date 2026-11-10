@@ -94,11 +94,6 @@ jobs:
     # (the train, on main too, pushes nothing). A called workflow sees a secret only when its
     # caller passes it, environment secrets too: blaze.yaml calls this with `secrets: inherit`.
     environment: ${{ github.ref == 'refs/heads/main' && inputs.tier == 'warm' && !startsWith(inputs.os, 'windows') && 'cache-writer' || '' }}
-    env:
-      # A pull request runs the tests its change reached and takes the rest as passed from
-      # main's store; main runs every test, which records each pass for the pull requests after
-      # it, and says of each that passed before whether it passed again.
-      BLAZE_TESTS: ${{ github.ref == 'refs/heads/main' && 'verify' || 'affected' }}
     steps:
       - name: no blaze for Windows
         if: env.BLAZE != 'true'
@@ -109,7 +104,7 @@ jobs:
       # With blaze, no rustup and no Nix: blaze brings its own Rust (.github/actions/blaze), and
       # the C compiler and linker are the runner's.
       # With the build job's project too, and LLVM: the tests are built with the features the
-      # build ships (harness/unittests.py, FEATURES).
+      # build ships (harness/unittests.py).
       - if: env.BLAZE == 'true'
         id: blaze
         uses: ./.github/actions/blaze
@@ -139,6 +134,8 @@ jobs:
       # A limit of its own, under the job's: a cold store's tests ran past the job's 90 minutes
       # on 2026-10-28, which cancelled the push after them, so no run after it found them
       # compiled. Run out here, the step fails and main's push still runs.
+      # Every test of every package of the workspace, held to harness/known-failures.toml, the
+      # one list of tests that may fail (harness/unittests.py).
       # unittests.py dumps the threads of a blaze that stops using the CPU (a stuck build).
       # The ix runner image ships no package lists, which a hosted image has.
       - if: env.BLAZE == 'true' && runner.os == 'Linux'
@@ -186,15 +183,14 @@ jobs:
       # The packs the store has before the build, so that what it adds can be handed on.
       - if: env.BLAZE == 'true'
         run: find "$BLAZE_CACHE" -maxdepth 1 -name '*.pack' -exec basename {} \; | sort > "$RUNNER_TEMP/packs-pulled.txt"
-      # Against the LLVM blaze pins. blaze's build is of every package the unit tests are of,
-      # with their features and profile (harness/unittests.py), so that its libraries are the
-      # ones the tests job's programs are built on. Every one of them is a dependency of
-      # blaze-engine, and each has the features it has in blaze-engine's build alone.
+      # Against the LLVM blaze pins. blaze's build is of every package of the workspace, as the
+      # unit tests are (`--workspace`, harness/unittests.py), with their features and profile, so
+      # that its libraries are the ones the tests job's programs are built on.
       # The profile history's files the build writes are told from those the runner had (an ix
       # runner's snapshot keeps earlier runs') by being newer than this file.
       - if: env.BLAZE == 'true' && inputs.harnesses == ''
         run: touch "$RUNNER_TEMP/profile-since"
-      - name: blaze build --release, of what the unit tests are built on
+      - name: blaze build --release --workspace, what the unit tests are built on
         if: env.BLAZE == 'true'
         run: |
           $PYTHON harness/unittests.py '{"build": true}'

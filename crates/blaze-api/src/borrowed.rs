@@ -85,10 +85,6 @@ pub enum ResponseRef<'a> {
         root: ContentId,
     },
     Memory(Memory),
-    Packed {
-        #[serde(deserialize_with = "blaze_protocol::bytes::borrow")]
-        pack: &'a [u8],
-    },
     DocPage {
         #[serde(deserialize_with = "blaze_protocol::bytes::borrow")]
         page: &'a [u8],
@@ -358,7 +354,6 @@ impl ResponseRef<'_> {
             ResponseRef::Edited(it) => Response::Edited(it),
             ResponseRef::Announced { root } => Response::Announced { root },
             ResponseRef::Memory(it) => Response::Memory(it),
-            ResponseRef::Packed { pack } => Response::Packed { pack: bytes(pack) },
             ResponseRef::DocPage { path, page } => {
                 Response::DocPage { path: owned(path), page: bytes(page) }
             }

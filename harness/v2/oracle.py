@@ -1,7 +1,7 @@
 """oracle.py: the invalidation oracle. After every edit, the incremental result must equal a
 build from scratch of the same sources (docs/v2/plan.md).
 
-    uv run --frozen python harness/v2/oracle.py run '{"engine": {"kind": "v1", "blaze": "target/release/blaze"}}'
+    uv run --frozen python harness/v2/oracle.py run '{"engine": {"kind": "v2", "blaze": "target/release/blaze"}}'
     uv run --frozen python harness/v2/oracle.py run '{"engine": {...}, "rounds": 2, "steps": 30, "kinds": ["closure"]}'
     uv run --frozen python harness/v2/oracle.py replay '{"engine": {...}, "found": "OUT/found/906-03.json"}'
     uv run --frozen python harness/v2/oracle.py selftest
@@ -23,8 +23,7 @@ the source is refused and with which errors, what the program prints and its exi
 outcome of every test, with `bytes` every output file byte for byte, and where the engine says
 them (v2) the codegen input of every function and the query database's trace of both builds,
 which `blaze-v2-proof` compares to name the query that went stale and the read it missed. That
-is under-invalidation, and the whole point. It is unmeasured where either build was not blaze's (v1 hands some to cargo).
-For a slot with a case in `blaze-v2-proof`'s `nameres` (the `nameres` regression edits each),
+is under-invalidation, and the whole point. For a slot with a case in `blaze-v2-proof`'s `nameres` (the `nameres` regression edits each),
 the traces are also held to what the facts say that edit changes: more is `over`, less is stale.
 Apart from that:
 
@@ -49,8 +48,7 @@ Input (JSON inline, a file's path, or `-`):
     seed, first, rounds, steps, kinds, regressions    as above
     profiles      "dev" and/or "release" (release adds the inlining edges of section 6.1)
     tests         run `blaze test` too (default true)
-    bytes         compare output files byte for byte (default: on for v2, off for v1, whose
-                  incremental programs are spliced)
+    bytes         compare output files byte for byte (default: on)
     seed_std      give each build from scratch a store with the standard library alone
     jobs          sequences run at once, each with daemons of its own
     proof         the `blaze-v2-proof` binary (crates/blaze-v2-proof), which compares two traces
@@ -601,7 +599,7 @@ def settings(spec: engine.EngineSpec, profiles: tuple[Profile, ...], tests: bool
     if not profiles:
         fail(SCRIPT, "profiles: name at least one")
     proof_bin = Path(proof) if proof else Path(spec.blaze).parent / f"blaze-v2-proof{engine.EXE}"
-    return Settings(spec, profiles, tests, spec.kind == "v2" if bytes_ is None else bytes_,
+    return Settings(spec, profiles, tests, True if bytes_ is None else bytes_,
                     str(proof_bin.resolve()), keep)
 
 

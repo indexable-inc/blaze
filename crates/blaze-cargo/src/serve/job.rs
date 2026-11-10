@@ -390,12 +390,8 @@ pub(super) enum Does<S: Steps> {
         front: Arc<S::Front>,
         filter: Vec<String>,
     },
-    /// Posted with the job's writer, once its check is built and nothing reads its front end.
-    Pack {
-        front: Arc<S::Front>,
-        program: String,
-    },
-    /// As [`Does::Pack`] is: the documentation sets `cfg(doc)` on the crates it documents.
+    /// Posted with the job's writer, once its check is built and nothing reads its front end:
+    /// the documentation sets `cfg(doc)` on the crates it documents.
     Doc {
         front: Arc<S::Front>,
         no_deps: bool,
@@ -471,7 +467,6 @@ impl<S: Steps> plane::Work for Step<S> {
             Does::Verify { .. } => tracing::info_span!("verify"),
             Does::Edit { .. } => tracing::info_span!("edit"),
             Does::Ahead { .. } => tracing::info_span!("ahead"),
-            Does::Pack { .. } => tracing::info_span!("pack"),
             Does::Doc { .. } => tracing::info_span!("doc"),
             Does::StoreKept { checkout, .. } => tracing::info_span!(target: "blaze", "store kept front end", checkout = %checkout),
         }
@@ -677,13 +672,6 @@ impl<S: Steps> plane::Work for Step<S> {
             }),
             Does::Ahead { front, filter } => {
                 self.settle(front.ahead(this(readers), filter), Value::Ahead)
-            }
-            Does::Pack { front, program } => {
-                let writer =
-                    readers.writer.expect("the pack's task is posted with its job's writer");
-                self.settle(front.pack(writer, program), |it| {
-                    Value::Answer(it.map(|pack| Response::Packed { pack }))
-                })
             }
             Does::Doc { front, no_deps, private } => {
                 let writer = readers
@@ -915,7 +903,6 @@ fn command_of(work: &Work) -> Command {
         | Work::Tables
         | Work::Snapshot
         | Work::Edit(_)
-        | Work::Pack { .. }
         | Work::Lock(_) => Command::Check,
         Work::Doc { .. } => Command::Doc,
     }
@@ -936,7 +923,6 @@ fn goal_of(work: &Work) -> Goal {
         | Work::Tables
         | Work::Snapshot
         | Work::Edit(_)
-        | Work::Pack { .. }
         | Work::Doc { .. }
         | Work::Lock(_) => Goal::Check,
     }
@@ -950,7 +936,7 @@ fn goal_of(work: &Work) -> Goal {
 /// ([`applied_units`]) in the job's own plane request, and only then is read ([`Jobs::next`]):
 /// the one place that order is made, never a read of what a pending macro left out
 /// (no-fallback). Every other job builds every unit in order before it reads (a check, a
-/// build, a test, a run, a pack, the documentation) or reads no def map of the view (a trace
+/// build, a test, a run, the documentation) or reads no def map of the view (a trace
 /// and a verify walk the plan, the tables count, the codegen inputs read the units' records).
 fn reads_front_unbuilt(work: &Work) -> bool {
     match work {
@@ -964,7 +950,6 @@ fn reads_front_unbuilt(work: &Work) -> bool {
         | Work::CodegenInputs(_)
         | Work::Trace(_)
         | Work::Tables
-        | Work::Pack { .. }
         | Work::Doc { .. }
         | Work::Lock(_) => false,
     }
@@ -983,7 +968,6 @@ fn work_word(work: &Work) -> &'static str {
         Work::CodegenInputs(_) => "codegen-inputs",
         Work::Trace(_) => "trace",
         Work::Tables => "tables",
-        Work::Pack { .. } => "pack",
         Work::Doc { .. } => "doc",
         Work::Edit(_) => "edit",
         Work::Ahead { .. } => "ahead",
@@ -1023,7 +1007,6 @@ fn targets_of(work: &Work) -> Option<&Targets> {
         | Work::Run { targets, .. }
         | Work::Reach { targets, .. }
         | Work::Ahead { targets, .. }
-        | Work::Pack { targets, .. }
         | Work::Doc { targets, .. }
         | Work::Lock(targets) => Some(targets),
         Work::Tables | Work::Snapshot | Work::Edit(_) => None,
@@ -3691,7 +3674,7 @@ impl<S: Steps> Jobs<S> {
             }
             Some(job) if matches!(job.stage, Stage::Answer(_) | Stage::Ahead(_)) => {
                 match job.work {
-                    Work::Tables | Work::Pack { .. } | Work::Doc { .. } => job
+                    Work::Tables | Work::Doc { .. } => job
                         .ready
                         .last_mut()
                         .and_then(|it| it.writer.take())
@@ -4905,7 +4888,6 @@ impl<S: Steps> Jobs<S> {
                 | Work::Build(_)
                 | Work::Test { .. }
                 | Work::Run { .. }
-                | Work::Pack { .. }
                 | Work::Doc { .. }
         ) {
             self.build(w, id, None);
@@ -5958,7 +5940,7 @@ impl<S: Steps> Jobs<S> {
         }
         let ok = ok && job.over.is_none();
         let runs = ok && matches!(job.work, Work::Test { ub: None, .. } | Work::Run { .. });
-        let pack = ok && matches!(job.work, Work::Pack { .. } | Work::Doc { .. });
+        let documents = ok && matches!(job.work, Work::Doc { .. });
         if let Stage::Units(build) = &job.stage
             && build.applying.is_some()
         {
@@ -5999,7 +5981,7 @@ impl<S: Steps> Jobs<S> {
                 return;
             }
         }
-        let (ok, runs, pack) = (ok && !denied, runs && !denied, pack && !denied);
+        let (ok, runs, documents) = (ok && !denied, runs && !denied, documents && !denied);
         let served = match writer.served() {
             Ok(it) => it,
             Err(error) => {
@@ -6012,9 +5994,8 @@ impl<S: Steps> Jobs<S> {
                 w.said.push(Said::Report(id, Response::Diagnostic(note)));
             }
         }
-        // A pack's front end is not kept: recording its expansions changes its proc macros; nor
-        // is the documentation's, which sets `cfg(doc)`.
-        let packing = match pack {
+        // The documentation's front end is not kept: it sets `cfg(doc)`.
+        let documenting = match documents {
             true => Some(writer),
             false => {
                 if let Some(root) = root {
@@ -6038,9 +6019,9 @@ impl<S: Steps> Jobs<S> {
         let profile = input.units.finished.clone(); // clone: the report owns it, once per build
         let members = input.units.packages.iter().filter(|it| it.is_member).count();
         let members = u32::try_from(members).unwrap_or(u32::MAX);
-        if let Some(writer) = packing {
+        if let Some(writer) = documenting {
             w.said.push(Said::Report(id, Response::Built { members, profile, artifacts }));
-            self.pack(w, id, input, front, writer);
+            self.document(w, id, input, front, writer);
             return;
         }
         if !runs {
@@ -6224,10 +6205,9 @@ impl<S: Steps> Jobs<S> {
         self.next(w, id);
     }
 
-    /// [`Work::Pack`]'s or [`Work::Doc`]'s check built: the pack or the documentation made by
-    /// one task of a plane request of its own, posted with the front end's writer, as no task
-    /// reads the front end any more.
-    fn pack(
+    /// [`Work::Doc`]'s check built: the documentation made by one task of a plane request of
+    /// its own, posted with the front end's writer, as no task reads the front end any more.
+    fn document(
         &mut self,
         w: &mut World<'_, S>,
         id: JobId,
@@ -6254,11 +6234,8 @@ impl<S: Steps> Jobs<S> {
         self.started.push(job.row(request, None, profile_history::Outcome::Running));
         job.finished = false;
         job.closed = false;
-        let what = match job.work {
-            Work::Doc { .. } => "the documentation",
-            _ => "the pack",
-        };
-        let fresh = lone(w.plane, NodeKind::Bodies, what, Pool::Work, None, kinds::WALK);
+        let fresh =
+            lone(w.plane, NodeKind::Bodies, "the documentation", Pool::Work, None, kinds::WALK);
         job.stage = Stage::Answer(fresh.first());
         self.add(w, id, fresh, Some(work), true);
         self.close(w, id);
@@ -6835,8 +6812,8 @@ impl<S: Steps> Jobs<S> {
 }
 
 /// The task that answers a job's work on its ready views: a reach, the codegen inputs, the
-/// tables, a trace, a verify, an edit, the units a build ahead picks, a checked pack's pack, or
-/// a checked documentation's pages.
+/// tables, a trace, a verify, an edit, the units a build ahead picks, or a checked
+/// documentation's pages.
 fn answer<S: Steps>(job: &Job<S>, paths: &Paths<S>, steps: &Arc<S>) -> Result<Step<S>, ApiError> {
     let Some(ready) = job.ready.last() else {
         return Err(ApiError::new("the job has no view", None));
@@ -6877,8 +6854,6 @@ fn answer<S: Steps>(job: &Job<S>, paths: &Paths<S>, steps: &Arc<S>) -> Result<St
         Work::Edit(edits) => Does::Edit { front: lowered()?, edits: edits.clone() },
         // clone: the task owns the filter, once per job
         Work::Ahead { filter, .. } => Does::Ahead { front: lowered()?, filter: filter.clone() },
-        // clone: the task owns the program's name, once per job
-        Work::Pack { program, .. } => Does::Pack { front: lowered()?, program: program.clone() },
         Work::Doc { no_deps, private, .. } => {
             Does::Doc { front: lowered()?, no_deps: *no_deps, private: *private }
         }

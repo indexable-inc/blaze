@@ -155,7 +155,7 @@ pub(crate) use spare::with_context;
 mod stable;
 pub use stable::{block_place, function_place, lower_declared, static_place};
 mod target;
-pub use target::{Arch, Calls, Features, ObjectFormat, Target, UnwindFormat, VariableArguments};
+pub use target::{Arch, Features, ObjectFormat, Target, UnwindFormat, VariableArguments};
 pub mod tier;
 
 mod type_id;
@@ -973,8 +973,8 @@ fn regalloc() -> &'static str {
 const LARGE: usize = 50_000;
 
 /// The most instructions a function has that Cranelift gives its usual register allocator,
-/// which spends 1 to 2 µs an instruction on one this large and more on larger ones. On
-/// dev-aws-6 nushell's `main`, of 35 780 instructions, took 75 ms of Cranelift with it and
+/// which spends 1 to 2 µs an instruction on one this large and more on larger ones. On an
+/// x86-64 Linux host nushell's `main`, of 35 780 instructions, took 75 ms of Cranelift with it and
 /// 47 ms with the single-pass one, on every edit to it; the largest functions of a cold build
 /// of nushell took 80 to 220 ms each. The single-pass allocator's code is larger and slower,
 /// and it gives every value live across blocks a stack slot of its own: hir-ty's
@@ -3225,7 +3225,7 @@ fn emit_with(
 ) -> Result<Code> {
     refuse_tail_calls(&ctx.func, target)?;
     if target.is_wasm() {
-        return emit_wasm(&ctx.func, target.calls(), wasm::Address::of(target));
+        return emit_wasm(&ctx.func, wasm::Address::of(target));
     }
     let large = ctx.func.dfg.num_insts() > SINGLE_PASS;
     let kind = if large { Isa::Large } else { Isa::Usual };
@@ -3368,11 +3368,9 @@ fn refuse_tail_calls(func: &ir::Function, target: &'static Target) -> Result<()>
 /// goes through the object like machine code and is made a module of by a linker.
 fn emit_wasm(
     func: &cranelift_codegen::ir::Function,
-    calls: Calls,
     address: wasm::Address,
 ) -> Result<Code> {
-    let (function, mut relocs) =
-        wasm::lower(func, calls, address).map_err(CodegenError::Unsupported)?;
+    let (function, mut relocs) = wasm::lower(func, address).map_err(CodegenError::Unsupported)?;
     let (bytes, body) = function.encode().map_err(CodegenError::Backend)?;
     for reloc in &mut relocs {
         reloc.offset += body;

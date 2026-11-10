@@ -1152,7 +1152,6 @@ impl Observe {
                     dir: profiling.dir.clone(), // clone: once an explorer
                     flush: explorer_flush(profiling),
                 },
-                world: None,
                 dev_origin: dev,
                 daemon: crate::release::get().version,
                 tasks: Arc::clone(&self.tasks),

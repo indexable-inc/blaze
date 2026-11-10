@@ -99,11 +99,6 @@ rsasm = ["dep:rsasm"]
 # llvm.py building that target (2026-11-01); once llvm.json pins ones that have it, this folds
 # into `llvm`.
 llvm-wasm = ["llvm", "inkwell/target-webassembly"]
-# The compiler as a WebAssembly module itself: see `crates/blaze-wasm`, a workspace of its own
-# and the only one that turns it on, so it never unifies into the native build. It decides only what is
-# about that program, where it runs (`Target::host`) and that it links what it compiles into the
-# page's table (`Target::calls`), never anything of a target's code (`target.rs` tests).
-wasm = []
 
 [lints]
 workspace = true

@@ -643,15 +643,4 @@ errors gone:
         _ = fs::remove_dir_all(&dir);
     }
 
-    /// The diff of the two self-build logs Andrew named (round 31, and the 214-crate
-    /// regression), printed: a look, not a check.
-    #[test]
-    #[ignore = "reads /tmp/blaze-lanes/self-0151.log and self-0209PST.log; run with --ignored --nocapture"]
-    fn the_self_build_logs_diff() {
-        let (a, b) = (
-            Side::parse("/tmp/blaze-lanes/self-0151.log"),
-            Side::parse("/tmp/blaze-lanes/self-0209PST.log"),
-        );
-        println!("{}", run(&a, &b, None, Path::new("/nowhere")).unwrap());
-    }
 }

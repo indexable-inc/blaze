@@ -1,9 +1,9 @@
 // Lesson 1: what a build does. Compile, then link. Cargo runs rustc once per crate, a fresh process each time; rustc's
 // incremental compilation (on in the dev profile) reloads its saved state from disk and recompiles only the codegen
 // units that changed, but cargo still reruns it for every crate downstream of an edit, and the program is linked again
-// every build (docs/architecture.md, "The idea"). blaze stays running, keeps the program in memory, redoes functions
+// every build (docs/v2/plan.md). blaze stays running, keeps the program in memory, redoes functions
 // and patches the built program. `blaze build/run/test` run no rustc; plain cargo after `blaze enable` still does
-// (docs/no-rustc.md, "Today").
+// (docs/no-rustc.md).
 site {
   learn {
     builds : Page {

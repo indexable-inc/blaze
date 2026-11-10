@@ -11294,7 +11294,7 @@
   },
   "blaze-web@0.0.0": {
    "authors": "blaze contributors",
-   "description": "blaze's build page: the daemon serves the build, down to every function, on 127.0.0.1 (docs/web.md)",
+   "description": "blaze's build page: the daemon serves the build, down to every function, on 127.0.0.1",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
    "license_file": "",

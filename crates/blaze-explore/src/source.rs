@@ -1,7 +1,7 @@
 //! The daemon as an explorer source (`ix_prof::explore::Source`): its `hello` (the daemon's
 //! version, blaze-profile's schema and clock, the `blaze` layer), a live feed per session over
 //! blaze-profile's flight recorder ([`live::Feed`]), and the `blaze` layer's ops over the
-//! history and the build world ([`ops`]). The server is ix-prof's; [`start`] starts it on this
+//! history ([`ops`]). The server is ix-prof's; [`start`] starts it on this
 //! source.
 
 use std::sync::Arc;
@@ -19,7 +19,7 @@ use crate::{
     wire,
 };
 
-/// The daemon's layer: builds, SQL over the history, the named views and the build world,
+/// The daemon's layer: builds, SQL over the history and the named views,
 /// versioned by blaze-profile's schema.
 pub const LAYERS: &[Layer] = &[Layer { name: "blaze", version: schema::VERSION }];
 
@@ -29,8 +29,6 @@ pub const NAME: &str = "blaze explore";
 /// What the daemon's explorer serves.
 pub struct Config {
     pub history: History,
-    /// Flecs's world of the builds, for `world`; `None` answers `no_world`.
-    pub world: Option<Arc<blaze_web::Graphs>>,
     /// Accept sessions from `ix_prof::explore::link::DEV_ORIGIN` too.
     pub dev_origin: bool,
     /// The daemon's version, as `hello` says it.
@@ -68,8 +66,8 @@ pub fn core_file(exe: &std::path::Path) -> Result<CoreWasm, String> {
 
 /// Starts the daemon's explorer; it serves until the [`Explorer`] is dropped.
 pub fn start(config: Config) -> Result<Explorer, StartError> {
-    let Config { history, world, dev_origin, daemon, tasks, core } = config;
-    let source = Daemon { cx: Context { history, world }, daemon, tasks };
+    let Config { history, dev_origin, daemon, tasks, core } = config;
+    let source = Daemon { cx: Context { history }, daemon, tasks };
     explore::serve(explore::Config {
         source: Arc::new(source),
         dev_origin,
@@ -88,7 +86,7 @@ pub(crate) struct Daemon {
 
 impl Source for Daemon {
     /// The daemon, whose builds the generic views read through `spans` and `sql`, and which
-    /// alone has the `blaze` extension (builds, SQL, views, the build world): a page that reads
+    /// alone has the `blaze` extension (builds, SQL, views): a page that reads
     /// `source` shows the extension's views only when it is listed
     /// (docs/v2/plan/design/explore.md, "One explorer, many sources").
     fn hello(&self) -> Hello {
@@ -171,7 +169,7 @@ mod tests {
     fn daemon() -> Daemon {
         let history =
             History { duckdb: None, dir: PathBuf::from("/nowhere"), flush: Flush::new(|| Ok(0)) };
-        Daemon { cx: Context { history, world: None }, daemon: "test", tasks: Arc::new(Tasks::new()) }
+        Daemon { cx: Context { history }, daemon: "test", tasks: Arc::new(Tasks::new()) }
     }
 
     fn op(source: &Daemon, request: &str) -> Option<Result<Answer, OpError>> {
@@ -201,8 +199,6 @@ mod tests {
         let views = op(&source, r#"{"op":"views"}"#).unwrap().unwrap();
         assert_eq!(views.header["op"], "views");
         assert_eq!(views.table.unwrap().rows(), blaze_profile::views::VIEWS.len());
-        let world = op(&source, r#"{"op":"world","path":"/entity/flecs"}"#).unwrap().unwrap_err();
-        assert_eq!(world.kind, "no_world");
         let bad = op(&source, r#"{"op":"builds","extra":1}"#).unwrap().unwrap_err();
         assert_eq!(bad.kind, "bad_args");
         assert!(op(&source, r#"{"op":"frobnicate"}"#).is_none(), "the session names it");

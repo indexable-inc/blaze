@@ -123,7 +123,6 @@ pub fn named(request: &Request) -> Vec<&str> {
         | Request::CodegenInputs { view, .. }
         | Request::Trace { view, .. }
         | Request::Tables { view }
-        | Request::Pack { view, .. }
         | Request::Doc { view, .. }
         | Request::Lock { view, .. }
         | Request::WillTest { view, .. } => view_heads(view, &mut heads),
@@ -152,7 +151,6 @@ pub fn runs_user_code(request: &Request) -> bool {
             | Request::Run { .. }
             | Request::BestOf { .. }
             | Request::Verify { .. }
-            | Request::Pack { .. }
             | Request::Doc { .. }
             | Request::Reach { .. }
             | Request::Edit { .. }

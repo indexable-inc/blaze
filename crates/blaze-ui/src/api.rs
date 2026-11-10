@@ -139,7 +139,6 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
             }
         }
         Response::Announced { root } => put!(out, "{} {root}\n", status("Announced")),
-        Response::Packed { pack } => put!(out, "{} {} bytes\n", status("Packed"), pack.len()),
         Response::DocPage { path, page } => {
             put!(out, "{} {path}, {} bytes\n", status("Page"), page.len())
         }

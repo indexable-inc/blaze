@@ -10,7 +10,7 @@
 //!   the network or the disk; they touch no state of the loop.
 //! - **On a worker of the plane**: [`Steps::lower`], [`Front::compile`], [`Front::reach`],
 //!   [`Front::ub_tests`], [`Front::evaluate`], [`Front::codegen_inputs`], [`Front::tables`],
-//!   [`Front::pack`].
+//!   [`Front::doc`].
 //!   They read the front end through the [`Steps::Reader`] the loop made as it posted the task, the
 //!   VFS's reader and the store through [`JobInput`], and give back what the loop writes
 //!   ([`Compiled::puts`]); a [`Failed::Again`] goes back to the loop, which posts it again
@@ -29,8 +29,8 @@
 //! is posted with a [`Steps::Reader`], a shared reference it holds for its run and drops as it ends,
 //! with no lock, no clone of the database and no cancellation. The tables are measured with
 //! the database exclusive, so no reader adds to them: their task, the front end's last use, is
-//! handed the job's [`Writer`] itself. So is a pack's, whose recording of expansions sets the
-//! database's proc macros, once its check's own plane request is over.
+//! handed the job's [`Writer`] itself. So is the documentation's, which sets `cfg(doc)` on the
+//! crates it documents, once its check's own plane request is over.
 //!
 //! A build script's output ([`Writer::ran`]) and a proc macro's load ([`Writer::macros`]) are
 //! writes, and so is letting go of what a unit that compiled leaves in the front end for no task
@@ -978,11 +978,7 @@ pub trait Front<S: Steps>: Send + Sync + 'static {
         images: &[(&'static str, u64, u64)],
     ) -> Result<Vec<Table>, Failed>;
     /// On a worker, once every unit of a [`Goal::Check`] build is checked and every build
-    /// script's run and proc macro's load applied: package `program`'s crate and every crate it
-    /// is made of packed for blaze's in-browser compiler, its macros' expansions recorded
-    /// through the job's `writer`, the front end's last use ([`Response::Packed`]'s bytes).
-    fn pack(&self, writer: S::Writer, program: &str) -> Result<Vec<u8>, Failed>;
-    /// On a worker, as [`Front::pack`] is but for `blaze doc`: the documentation of the crates
+    /// script's run and proc macro's load applied, for `blaze doc`: the documentation of the crates
     /// `cargo doc` documents for the check's root units (`blaze-doc`), and unless `no_deps` of
     /// every library they depend on, made through the job's `writer`, the front end's last use,
     /// which sets `cfg(doc)` on them. `private` is `--document-private-items`.

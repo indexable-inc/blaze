@@ -19,7 +19,7 @@ use blaze_units::{
 };
 use blaze_usercode::run::Value;
 
-use super::{artifact, codegen, compile, graph, pack, run, script, test, unit_target};
+use super::{artifact, codegen, compile, graph, run, script, test, unit_target};
 
 const HOST: &str = "x86_64-unknown-linux-gnu";
 
@@ -1018,56 +1018,6 @@ fn a_unit_waits_on_every_run_of_its_closure() {
     assert!((0..6).all(|at| waits.ready(at)));
 }
 
-#[test]
-fn a_pack_is_of_the_packages_binary_or_else_its_library() {
-    let (app, dep) = ("path+file:///w/app#0.1.0", "path+file:///w/dep#0.1.0");
-    let with = |units: Vec<Unit>| Units {
-        graph: UnitGraph { version: 1, units, roots: Vec::new() },
-        plans: Vec::new(),
-        packages: vec![package(app, "app", "/w/app"), package(dep, "dep", "/w/dep")],
-        lock: None,
-        warnings: Vec::new(),
-        target_dir: "/w/target".to_owned(),
-        build_dir: "/w/target".to_owned(),
-        finished: String::new(),
-        link_dirs: Vec::new(),
-        sandboxed_tests: false,
-        native: Vec::new(),
-    };
-    let units = with(vec![
-        unit(dep, target("dep", "lib", "/w/dep/src/lib.rs"), Mode::Check, &[]),
-        unit(
-            app,
-            target("build-script-build", "custom-build", "/w/app/build.rs"),
-            Mode::Build,
-            &[],
-        ),
-        unit(app, target("app", "lib", "/w/app/src/lib.rs"), Mode::Check, &[0]),
-        unit(app, target("app", "bin", "/w/app/src/main.rs"), Mode::Check, &[2]),
-    ]);
-    assert_eq!(pack::program_unit(&units, "app").unwrap(), 3);
-    assert_eq!(pack::program_unit(&units, "dep").unwrap(), 0);
-    let none = pack::program_unit(&units, "other").unwrap_err().what;
-    assert!(none.contains("-p other"), "{none}");
-
-    let mut tested = unit(app, target("app", "bin", "/w/app/src/main.rs"), Mode::Check, &[]);
-    tested.checked_as_test = true;
-    let units =
-        with(vec![tested, unit(app, target("app", "lib", "/w/app/src/lib.rs"), Mode::Check, &[])]);
-    assert_eq!(
-        pack::program_unit(&units, "app").unwrap(),
-        1,
-        "a binary checked as a test is no program"
-    );
-
-    let units = with(vec![
-        unit(app, target("one", "bin", "/w/app/src/bin/one.rs"), Mode::Check, &[]),
-        unit(app, target("two", "bin", "/w/app/src/bin/two.rs"), Mode::Check, &[]),
-    ]);
-    let refused = pack::program_unit(&units, "app").unwrap_err().what;
-    assert!(refused.contains("`one`, `two`"), "{refused}");
-}
-
 /// A unit of a package the build doesn't list, or naming a dependency past its units, stops
 /// the graph: no edge is dropped and no unit is given a package it isn't of.
 #[test]
@@ -1740,7 +1690,7 @@ fn primary_package_keys_only_a_record_whose_code_read_it() {
 fn build_script_compile_is_reused_across_runs() {
     let first = [
         ("FOO", "on"),
-        ("BLAZE_PROFILE", "/tmp/blaze-lanes/profile-0101"),
+        ("BLAZE_PROFILE", "/tmp/blaze-profile-0101"),
         ("OLDPWD", "/w"),
         ("SHLVL", "1"),
         ("BLAZE_CLIENT_PID", "4242"),
@@ -1748,7 +1698,7 @@ fn build_script_compile_is_reused_across_runs() {
     ];
     let second = [
         ("FOO", "on"),
-        ("BLAZE_PROFILE", "/tmp/blaze-lanes/profile-0242"),
+        ("BLAZE_PROFILE", "/tmp/blaze-profile-0242"),
         ("OLDPWD", "/tmp/elsewhere"),
         ("SHLVL", "3"),
         ("BLAZE_CLIENT_PID", "977"),
@@ -1779,13 +1729,13 @@ fn build_script_compile_is_reused_across_runs() {
 /// value of a variable its code read (another value, or unset), its source, a dependency.
 #[test]
 fn a_real_input_of_a_build_script_makes_its_record_miss() {
-    let run = [("FOO", "on"), ("BLAZE_PROFILE", "/tmp/blaze-lanes/profile-0101")];
+    let run = [("FOO", "on"), ("BLAZE_PROFILE", "/tmp/blaze-profile-0101")];
     let (base, read) = script_run(SCRIPT, true, &run);
     let mut store = super::reads::tests::Store::default();
     let filed = store.keep(base, &read, &super::reads::tests::env(&run));
     let other_value: &[(&str, &str)] =
-        &[("FOO", "off"), ("BLAZE_PROFILE", "/tmp/blaze-lanes/profile-0101")];
-    let unset: &[(&str, &str)] = &[("BLAZE_PROFILE", "/tmp/blaze-lanes/profile-0101")];
+        &[("FOO", "off"), ("BLAZE_PROFILE", "/tmp/blaze-profile-0101")];
+    let unset: &[(&str, &str)] = &[("BLAZE_PROFILE", "/tmp/blaze-profile-0101")];
     for env in [other_value, unset] {
         let (again, read_again) = script_run(SCRIPT, true, env);
         assert_eq!(again, base, "{env:?}: the base key holds no variable's value");
@@ -2682,7 +2632,7 @@ fn a_served_dependency_whose_out_dir_file_alone_moves_is_served_again_not_stale(
 /// and finds it again once the file is as it was.
 #[test]
 fn a_file_a_proc_macro_read_outside_the_tree_makes_the_record_miss_once_it_changes() {
-    let run = [("BLAZE_PROFILE", "/tmp/blaze-lanes/profile-0101")];
+    let run = [("BLAZE_PROFILE", "/tmp/blaze-profile-0101")];
     let (lowered, base) = script_lowered(SCRIPT, true, &run);
     let krate = lowered.krate(1).unwrap();
     let outside = tempfile::tempdir().unwrap();

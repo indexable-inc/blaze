@@ -22,8 +22,8 @@ use crate::{
     ViewRef, Worked,
 };
 
-const REQUESTS: usize = 36;
-const RESPONSES: usize = 45;
+const REQUESTS: usize = 35;
+const RESPONSES: usize = 44;
 
 const CHARS: [char; 9] = ['a', 'Z', '0', ' ', '-', '/', '\u{e9}', '\u{6c34}', '\u{1f525}'];
 
@@ -293,33 +293,30 @@ impl Gen {
                 wait_ms: self.wide(),
             },
             21 => Request::Memory,
-            22 => {
-                Request::Pack { view: self.view(0), targets: self.targets(), program: self.text() }
-            }
-            23 => Request::Doc {
+            22 => Request::Doc {
                 view: self.view(0),
                 no_deps: self.yes(),
                 private: self.yes(),
                 targets: self.targets(),
             },
-            24 => Request::Explore { dev: self.yes() },
-            25 => Request::Profile { seconds: self.u32() },
-            26 => Request::Live,
-            27 => Request::Flush,
-            28 => Request::Hot {
+            23 => Request::Explore { dev: self.yes() },
+            24 => Request::Profile { seconds: self.u32() },
+            25 => Request::Live,
+            26 => Request::Flush,
+            27 => Request::Hot {
                 top: self.u32(),
                 since: if self.yes() { crate::HotSince::LastBuild } else { crate::HotSince::Start },
             },
-            29 => Request::Gc { dry_run: self.yes() },
-            30 => Request::Rebuilt {
+            28 => Request::Gc { dry_run: self.yes() },
+            29 => Request::Rebuilt {
                 all: self.yes(),
                 cwd: self.maybe_text(),
                 item: self.maybe_text(),
                 build: if self.yes() { Some(self.wide()) } else { None },
                 unexplained: self.yes(),
             },
-            31 => Request::Launch { program: self.text(), pid: self.u32() },
-            32 => Request::FetchUrl {
+            30 => Request::Launch { program: self.text(), pid: self.u32() },
+            31 => Request::FetchUrl {
                 url: self.maybe_text(),
                 repo: self.maybe_text(),
                 rev: self.maybe_text(),
@@ -327,7 +324,7 @@ impl Gen {
                 most_bytes: if self.yes() { Some(self.wide()) } else { None },
                 out: self.maybe_text(),
             },
-            33 => Request::ClientRows {
+            32 => Request::ClientRows {
                 build: self.wide(),
                 events: self.bytes(),
                 folded: self.bytes(),
@@ -335,7 +332,7 @@ impl Gen {
                 ended_ns: self.wide() as i64,
                 started_ns: self.wide() as i64,
             },
-            34 => Request::Lock { view: self.view(0), targets: self.targets() },
+            33 => Request::Lock { view: self.view(0), targets: self.targets() },
             _ => Request::Stop,
         }
     }
@@ -706,9 +703,8 @@ impl Gen {
                 committed: self.wide(),
                 committed_high_water: self.wide(),
             }),
-            26 => Response::Packed { pack: self.bytes() },
-            27 => Response::DocPage { page: self.bytes(), path: self.text() },
-            28 => Response::Documented(Documented {
+            26 => Response::DocPage { page: self.bytes(), path: self.text() },
+            27 => Response::Documented(Documented {
                 dir: self.text(),
                 pages: self.wide(),
                 crates: self.many(depth, |g| DocumentedCrate {
@@ -718,9 +714,9 @@ impl Gen {
                 }),
                 source_pages: self.wide(),
             }),
-            29 => Response::Explored { link: self.text() },
-            30 => Response::Profiled { trace: self.bytes() },
-            31 => Response::Live(LiveFrame {
+            28 => Response::Explored { link: self.text() },
+            29 => Response::Profiled { trace: self.bytes() },
+            30 => Response::Live(LiveFrame {
                 lost: self.wide(),
                 open: self.bytes(),
                 at_ns: self.wide() as i64,
@@ -728,8 +724,8 @@ impl Gen {
                 skipped: self.wide(),
                 counters: self.bytes(),
             }),
-            32 => Response::Flushed { seq: self.wide() },
-            33 => Response::Hot(crate::Hot {
+            31 => Response::Flushed { seq: self.wide() },
+            32 => Response::Hot(crate::Hot {
                 keys: self.many(depth, |g| crate::HotKey {
                     span: g.text(),
                     function: match g.below(3) {
@@ -761,17 +757,17 @@ impl Gen {
                 error_ns: self.wide(),
                 total_ns: self.wide(),
             }),
-            34 => Response::Collected { report: self.text() },
-            35 => Response::UnitBegan(self.unit_of()),
-            36 => Response::TestReady(self.artifact()),
-            37 => Response::Rebuilt(self.rebuilt(depth)),
-            38 => Response::Launched {
+            33 => Response::Collected { report: self.text() },
+            34 => Response::UnitBegan(self.unit_of()),
+            35 => Response::TestReady(self.artifact()),
+            36 => Response::Rebuilt(self.rebuilt(depth)),
+            37 => Response::Launched {
                 live: self.yes(),
                 env: self.many(depth, |g| (g.text(), g.text())),
             },
-            39 => Response::Stopping { doing: self.text() },
-            41 => Response::Stored { path: self.maybe_text(), blake3: self.text() },
-            40 => Response::Unchecked(Unchecked {
+            38 => Response::Stopping { doing: self.text() },
+            40 => Response::Stored { path: self.maybe_text(), blake3: self.text() },
+            39 => Response::Unchecked(Unchecked {
                 open: self
                     .many(depth, |g| OpenFailure { unit: g.text(), checked: g.texts(depth + 1) }),
                 behind: self.many(depth, |g| Behind {
@@ -787,8 +783,8 @@ impl Gen {
                 }),
                 stopped: self.yes(),
             }),
-            42 => Response::Report { unit: self.maybe(Gen::unit_of), report: self.report(depth) },
-            43 => Response::Doing(crate::Doing {
+            41 => Response::Report { unit: self.maybe(Gen::unit_of), report: self.report(depth) },
+            42 => Response::Doing(crate::Doing {
                 on: self.maybe_text(),
                 now: blaze_protocol::now::Now::default(),
                 busy: self.u32(),
@@ -998,20 +994,19 @@ fn request_index(request: &Request) -> usize {
         Request::WillTest { .. } => 19,
         Request::WillSave { .. } => 20,
         Request::Memory => 21,
-        Request::Pack { .. } => 22,
-        Request::Doc { .. } => 23,
-        Request::Explore { .. } => 24,
-        Request::Profile { .. } => 25,
-        Request::Live => 26,
-        Request::Flush => 27,
-        Request::Hot { .. } => 28,
-        Request::Gc { .. } => 29,
-        Request::Rebuilt { .. } => 30,
-        Request::Launch { .. } => 31,
-        Request::FetchUrl { .. } => 32,
-        Request::ClientRows { .. } => 33,
-        Request::Lock { .. } => 34,
-        Request::Stop => 35,
+        Request::Doc { .. } => 22,
+        Request::Explore { .. } => 23,
+        Request::Profile { .. } => 24,
+        Request::Live => 25,
+        Request::Flush => 26,
+        Request::Hot { .. } => 27,
+        Request::Gc { .. } => 28,
+        Request::Rebuilt { .. } => 29,
+        Request::Launch { .. } => 30,
+        Request::FetchUrl { .. } => 31,
+        Request::ClientRows { .. } => 32,
+        Request::Lock { .. } => 33,
+        Request::Stop => 34,
     }
 }
 
@@ -1044,25 +1039,24 @@ fn response_index(response: &Response) -> usize {
         Response::Edited(_) => 23,
         Response::Announced { .. } => 24,
         Response::Memory(_) => 25,
-        Response::Packed { .. } => 26,
-        Response::DocPage { .. } => 27,
-        Response::Documented(_) => 28,
-        Response::Explored { .. } => 29,
-        Response::Profiled { .. } => 30,
-        Response::Live(_) => 31,
-        Response::Flushed { .. } => 32,
-        Response::Hot(_) => 33,
-        Response::Collected { .. } => 34,
-        Response::UnitBegan(_) => 35,
-        Response::TestReady(_) => 36,
-        Response::Rebuilt(_) => 37,
-        Response::Launched { .. } => 38,
-        Response::Stopping { .. } => 39,
-        Response::Unchecked(_) => 40,
-        Response::Stored { .. } => 41,
-        Response::Report { .. } => 42,
-        Response::Doing(_) => 43,
-        Response::Of { .. } => 44,
+        Response::DocPage { .. } => 26,
+        Response::Documented(_) => 27,
+        Response::Explored { .. } => 28,
+        Response::Profiled { .. } => 29,
+        Response::Live(_) => 30,
+        Response::Flushed { .. } => 31,
+        Response::Hot(_) => 32,
+        Response::Collected { .. } => 33,
+        Response::UnitBegan(_) => 34,
+        Response::TestReady(_) => 35,
+        Response::Rebuilt(_) => 36,
+        Response::Launched { .. } => 37,
+        Response::Stopping { .. } => 38,
+        Response::Unchecked(_) => 39,
+        Response::Stored { .. } => 40,
+        Response::Report { .. } => 41,
+        Response::Doing(_) => 42,
+        Response::Of { .. } => 43,
     }
 }
 

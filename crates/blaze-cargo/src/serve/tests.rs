@@ -1304,16 +1304,6 @@ impl Front<Fake> for FakeFront {
             .collect())
     }
 
-    /// The program and the build scripts' runs its front end had applied, read with the front
-    /// end exclusive, as the real pack sets its proc macros.
-    fn pack(&self, mut writer: FakeWriter, program: &str) -> Result<Vec<u8>, Failed> {
-        assert_eq!(self.goal, Goal::Check, "a pack only checks its units");
-        writer.apply()?;
-        match Arc::get_mut(&mut writer.inputs) {
-            Some(inputs) => Ok(format!("{program} {:?}", inputs.runs).into_bytes()),
-            None => Err(ApiError::new("a task still reads the front end", None).into()),
-        }
-    }
 
     /// One page naming the build scripts' runs its front end had applied, read with the front
     /// end exclusive, as the real documentation sets `cfg(doc)`.
@@ -3286,35 +3276,6 @@ fn a_run_starts_only_once_its_program_is_placed() {
 }
 
 #[test]
-fn a_pack_is_made_once_its_check_is_built_with_every_scripts_run_applied() {
-    let mut sim = Sim::new(41, Faults::default());
-    checkout(&mut sim, "[package]\n");
-    let steps = Arc::new(Fake::default());
-    let mut daemon = start(sim, &steps, 41);
-    let mut client = dial(&mut daemon);
-    let pack =
-        Request::Pack { view: ViewRef::Head("/w".into()), targets: agent(), program: "app".into() };
-    let id = client.send(&mut daemon, pack);
-    let got = client.wait(&mut daemon, id);
-    let built = got.iter().position(|it| matches!(it, Response::Built { .. }));
-    let packed = got.iter().position(|it| matches!(it, Response::Packed { .. }));
-    assert!(built.is_some() && built < packed, "`Built`, then `Packed`: {got:#?}");
-    assert!(
-        got.contains(&Response::Packed { pack: b"app [2]".to_vec() }),
-        "app's build script ran first: {got:#?}"
-    );
-    assert_eq!(got.last(), Some(&Response::Done { ok: true }));
-
-    let id = client
-        .send(&mut daemon, Request::Check { view: ViewRef::Head("/w".into()), targets: agent() });
-    assert_eq!(
-        client.wait(&mut daemon, id).last(),
-        Some(&Response::Done { ok: true }),
-        "the head builds after a pack"
-    );
-}
-
-#[test]
 fn the_documentation_is_made_once_its_check_is_built_with_every_scripts_run_applied() {
     let mut sim = Sim::new(42, Faults::default());
     checkout(&mut sim, "[package]\n");
@@ -3923,19 +3884,6 @@ fn each_kind_of_batch_runs_its_own_step_of_the_front_end() {
     let tables = answered(run(tables, Readers { writer: Some(writer), ..Readers::default() }));
     assert_eq!(tables, Response::Tables(vec![Table { name: "run".into(), elements: 3, bytes: 0 }]));
 
-    let writer = FakeWriter {
-        inputs: Arc::new(FakeInputs { runs: vec![1], ..FakeInputs::default() }),
-        asked: vec![2],
-        broke: Vec::new(),
-    };
-    let pack = Does::Pack { front: front.clone(), program: "app".into() };
-    let packed = answered(run(pack, Readers { writer: Some(writer), ..Readers::default() }));
-    assert_eq!(
-        packed,
-        Response::Packed { pack: b"app [1, 2]".to_vec() },
-        "a write asked for is applied first"
-    );
-
     let db = Arc::new(Database::new(blaze_query::Config::memory()));
     let queries = db.open_with(blaze_vfs::View { root: ContentId([0; 32]) }, b"");
     let traced = answered(run(
@@ -4169,7 +4117,7 @@ fn every_request_ends_once_over_many_seeds() {
                 },
                 _ => ViewRef::Head("agents/none".into()),
             };
-            let request = match rng.below(6) {
+            let request = match rng.below(5) {
                 0 => Request::Check { view, targets: agent() },
                 1 => Request::Build { view, targets: agent() },
                 2 => Request::Test {
@@ -4180,8 +4128,7 @@ fn every_request_ends_once_over_many_seeds() {
                     args: Vec::new(),
                     ub: None,
                 },
-                3 => Request::Pack { view, targets: agent(), program: "app".into() },
-                4 => Request::Doc { view, targets: agent(), no_deps: false, private: true },
+                3 => Request::Doc { view, targets: agent(), no_deps: false, private: true },
                 _ => Request::Run { view, targets: agent(), bin: None, args: Vec::new() },
             };
             let id = clients[client].send(&mut daemon, request);

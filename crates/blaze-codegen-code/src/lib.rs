@@ -360,13 +360,6 @@ pub const FRONT_END_REVIEWED: &[Hook] = &[
               its crate's files' content (`hir_def::deps::key`)",
     },
     Hook {
-        package: "blaze-wasm-pack",
-        hook: "ProcMacroExpander",
-        why: "`Recorder` gives what the expander it wraps gives, unchanged, keeping a copy; \
-              `Replay` is made only by `Pack::project`, for blaze-wasm, which stores no front-end \
-              value",
-    },
-    Hook {
         package: "hir-ty-codegen",
         hook: "Profiler",
         why: "`Untimed` is Cranelift's profiler of a thread that reads no clock: it times passes \
@@ -403,16 +396,6 @@ pub const RECORD_CUT: &[Cut] = &[
             why: "starts the explorer for `blaze explore` and encodes `blaze debug sql`'s Arrow IPC: \
                   answers to a client about finished builds, past every record",
         }],
-    },
-    Cut {
-        package: "blaze-web",
-        why: "the build page blaze-explore serves: built into blaze-explore alone",
-        named_in: &[],
-    },
-    Cut {
-        package: "flecs-c",
-        why: "the ECS blaze-web's page is made with: built into blaze-web alone",
-        named_in: &[],
     },
     Cut {
         package: "blaze-history",
@@ -623,17 +606,6 @@ pub const REVIEWED_HOOKS: &[Hook] = &[
         hook: "ProcMacroExpander",
         why: "`Evaluated` expands proc macros: the tokens it gives are source of the HIR, which \
               the instance key hashes, so another expansion is another key",
-    },
-    Hook {
-        package: "blaze-wasm-pack",
-        hook: "ProcMacroExpander",
-        why: "`Recorder` and `Replay` record and replay proc-macro expansions as tokens: source \
-              the instance key hashes",
-    },
-    Hook {
-        package: "blaze-wasm",
-        hook: "Lookup",
-        why: "`Stored` reads templates by key from its own store",
     },
     Hook {
         package: "blaze-macro-eval",

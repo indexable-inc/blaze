@@ -1194,9 +1194,9 @@ fn a_units_identity_leaves_out_the_process_environment() {
                 .unwrap();
         [CORE, BUILD_SCRIPT, LIB, MACRO, BIN, LIB_TEST].map(|unit| lowered.identity(unit))
     };
-    let first = identities(&[("BLAZE_PROFILE", "/tmp/blaze-lanes/profile-0101"), ("SHLVL", "1")]);
+    let first = identities(&[("BLAZE_PROFILE", "/tmp/blaze-profile-0101"), ("SHLVL", "1")]);
     let second = identities(&[
-        ("BLAZE_PROFILE", "/tmp/blaze-lanes/profile-0242"),
+        ("BLAZE_PROFILE", "/tmp/blaze-profile-0242"),
         ("OLDPWD", "/elsewhere"),
         ("SHLVL", "3"),
     ]);

@@ -80,16 +80,11 @@ jobs:
     outputs:
       tier: ${{ steps.files.outputs.tier }}
     steps:
-      # The script alone: the job decides in seconds, before a whole checkout. The two flecs
-      # manifests are for the pin check below.
+      # The script alone: the job decides in seconds, before a whole checkout.
       - uses: actions/checkout@v7
         with:
           sparse-checkout: |
             .github/scripts
-            vendor/flecs-c
-            crates/harness/vendor/hyperion-flecs-c
-      # blaze and harness build one flecs: the same indexable-inc/flecs rev in both manifests.
-      - run: python3 .github/scripts/flecs_pin.py
       - id: files
         env:
           GH_TOKEN: ${{ github.token }}
@@ -119,6 +114,9 @@ jobs:
       # Some scripts ask rustc for the host when imported: after the toolchain is installed. In
       # the workspace's Python, which has its helpers (tools/typed-input) for the scripts that use them.
       - run: uv run --frozen python harness/imports.py
+      # The list of tests that may fail holds together and is as its recorder writes it, and the
+      # comparison and the recording do what they say on made-up results.
+      - run: uv run --frozen python harness/failures.py selftest
       # No new place in blaze's code starts rustc, rustdoc or cargo (docs/no-rustc.md).
       - run: python3 harness/rustcsites.py
       # The agent rules: tools/agents/rules.ts type-checks, and AGENTS.md and the rules in .agents/skills/*/SKILL.md are what it generates.
