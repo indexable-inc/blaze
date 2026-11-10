@@ -42,7 +42,8 @@ line:
   last column `from` holding each row's source chip.
 - A report of parts (what changed, the risks, what to verify): one strong line of verdict with each part folded
   under it (an `Accordion` of `Disclosure`s, one idea each, closed).
-- A choice: `ask(...)`. Two options are two buttons, never two paragraphs.
+- A choice: `ask(...)`. Two options are two buttons, never two paragraphs. The question is one short line and it
+  waits for his answer; what it rests on is shown once, in that cell. Nothing in your reply says it again.
 - A comparison or a before/after: a `Table` or a `Chart`, never prose.
 
 Leave out: what he just asked or decided ("following your call"), what you are about to do unless it needs his

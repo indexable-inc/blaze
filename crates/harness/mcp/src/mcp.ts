@@ -56,6 +56,7 @@ server.registerTool(
     const secs = (t.elapsed_ms / 1000).toFixed(2) + "s";
     const logs = t.logs.length ? t.logs.join("\n") + "\n" : "";
     if (t.status === "running") {
+      t.returned = true;
       const text = `[${t.id} running ${secs}, backgrounded; await wait('${t.id}') or tasks()]\n${logs}`.trimEnd();
       return { content: [{ type: "text", text }] };
     }
