@@ -924,7 +924,7 @@ fn an_edit_in_a_body_of_a_macro_heavy_file_runs_no_resolution_of_again() {
 /// An attribute macro's input is its whole item: an edit inside an attributed inline module,
 /// which leaves the call where it was, expands the attribute again, and the module gains what
 /// the edit wrote. The incremental tests' `typing_inside_an_attribute_should_not_invalidate_def_map`
-/// shows no expansion after such an edit (queue 01309).
+/// shows no expansion after such an edit.
 #[test]
 fn an_edit_inside_an_attributed_module_expands_the_attribute_again() {
     let mut loaded = Loaded::new(
@@ -961,8 +961,8 @@ pub mod m {
 /// An attribute macro's input is its whole item, the fn body too, and its output may depend on
 /// that body: an edit that makes the body of a `#[identity_when_valid]` fn invalid turns its
 /// expansion into an error, which a fresh map shows. The item tree leaves bodies out, so this
-/// write changes none of the module's round-0 ops (queue 01309,
-/// `typing_inside_an_attribute_should_not_invalidate_def_map`).
+/// write changes none of the module's round-0 ops
+/// (`typing_inside_an_attribute_should_not_invalidate_def_map`).
 #[test]
 fn an_edit_in_the_body_of_an_attributed_fn_expands_the_attribute_again() {
     let mut loaded = Loaded::new(

@@ -1599,7 +1599,7 @@ query!(ConfigOrZero, u64, |db, _key| match input_singleton::<Config>(db.storage(
 });
 
 /// Reading a singleton's absence is a dependency: making it reruns exactly those readers,
-/// though it is made after they ran in the same view (queue 01228).
+/// though it is made after they ran in the same view.
 #[test]
 fn making_a_singleton_reruns_what_read_its_absence() {
     let mut db = TestDb::new();

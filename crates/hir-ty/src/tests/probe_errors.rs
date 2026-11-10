@@ -1,6 +1,6 @@
 //! The errors rustc reports from autoderef, the method probe, reference patterns and `Fn*`
-//! calls are errors here too, never a failed probe or an error type with no diagnostic
-//! (queue 01168): E0055, E0282 of an unknown receiver, E0308 of `&mut` matching an inherited
+//! calls are errors here too, never a failed probe or an error type with no diagnostic:
+//! E0055, E0282 of an unknown receiver, E0308 of `&mut` matching an inherited
 //! `&`, and E0059.
 
 use hir_def::{DefWithBodyId, ModuleDefId, nameres::crate_def_map, signatures::FunctionSignature};

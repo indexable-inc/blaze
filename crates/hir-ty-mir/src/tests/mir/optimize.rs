@@ -210,7 +210,7 @@ fn main() {
 /// core's `drop_in_place` is an `#[inline(always)]` call of the `drop_glue` lang item, whose body
 /// is a placeholder for the type's drop glue: inlined, it dropped nothing, and std's
 /// `Vec::retain_mut` dropped none of what it removed (cc's build scripts leaked every job token
-/// and hung, queue 01523).
+/// and hung).
 ///
 /// The crate declares `drop_glue` itself, which takes `#![feature(lang_items)]` (rustc's E0658;
 /// `crate_lang_items` collects none without it), so the root starts with it, before `out`.

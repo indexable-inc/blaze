@@ -931,8 +931,8 @@ fn regalloc() -> &'static str {
 const LARGE: usize = 50_000;
 
 /// The most instructions a function has that Cranelift gives its usual register allocator,
-/// which spends 1 to 2 µs an instruction on one this large and more on larger ones. On
-/// dev-aws-6 nushell's `main`, of 35 780 instructions, took 75 ms of Cranelift with it and
+/// which spends 1 to 2 µs an instruction on one this large and more on larger ones. On an
+/// x86-64 Linux host nushell's `main`, of 35 780 instructions, took 75 ms of Cranelift with it and
 /// 47 ms with the single-pass one, on every edit to it; the largest functions of a cold build
 /// of nushell took 80 to 220 ms each. The single-pass allocator's code is larger and slower,
 /// and it gives every value live across blocks a stack slot of its own: hir-ty's

@@ -1,7 +1,7 @@
 //! A struct literal's or pattern's path that resolves to something it can't be is an error
 //! naming what it found, as rustc's resolver (E0574, E0532), `check_struct_path` (E0071),
 //! `check_pat_tuple_struct` (E0164) and `check_pat_path` (E0533) give it, never an error type
-//! with no diagnostic (queue 01168).
+//! with no diagnostic.
 
 use hir_def::{
     AssocItemId, DefWithBodyId, ModuleDefId, nameres::crate_def_map, signatures::FunctionSignature,

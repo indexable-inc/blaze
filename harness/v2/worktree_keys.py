@@ -1,8 +1,7 @@
 """worktree_keys.py: `a_second_checkout_at_another_path_reuses_every_key`. One commit of a real
 project in two checkouts at two different paths, built one after the other by one daemon with
 one store: the second build has to find in the store everything the first compiled, because no
-key may hold where a checkout lives (/tmp/blaze-lanes/v2-kernel.brief.md, "Identity";
-docs/cargo.md, "Where a build writes"). The idea is kache's benchmark
+key may hold where a checkout lives (docs/cargo.md, "Where a build writes"). The idea is kache's benchmark
 (github.com/kunobi-ninja/kache), which builds one commit in two worktrees and fails unless
 every key matches.
 
