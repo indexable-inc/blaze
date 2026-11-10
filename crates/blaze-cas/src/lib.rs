@@ -753,6 +753,10 @@ pub struct Store {
     /// durable.
     #[cfg(test)]
     plant_head_before_syncs: bool,
+    /// A planted bug for the refinement against a map (`tests::model_check`): a commit drains
+    /// no writer's segment, so a flush makes nothing durable and a reopen has lost every put.
+    #[cfg(test)]
+    plant_no_drain: bool,
 }
 
 /// A way to read a store from any thread, with no lock: [`Store::reader`].
@@ -1479,6 +1483,8 @@ impl Store {
             plant_clear_then_clone: false,
             #[cfg(test)]
             plant_head_before_syncs: false,
+            #[cfg(test)]
+            plant_no_drain: false,
         }
     }
 
@@ -3808,9 +3814,15 @@ impl Store {
         if self.broken.is_some() {
             return;
         }
+        #[cfg(test)]
+        let drains = !self.plant_no_drain;
+        #[cfg(not(test))]
+        let drains = true;
         // In a task of the store's tag, so the packs' bytes the drain copies are named on the
         // daemon's memory line, whichever thread commits.
-        blaze_mem::frame::task(blaze_mem::Tag::Store, |_| self.drain());
+        if drains {
+            blaze_mem::frame::task(blaze_mem::Tag::Store, |_| self.drain());
+        }
         // A record the drain found against the claim's rule broke the store (`record_home`).
         if self.broken.is_some() {
             return;

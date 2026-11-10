@@ -88,7 +88,7 @@ fn checks_hold(sim: &Sim, store: &Store) -> Result<(), String> {
 
 /// The oracle's rule for the values: every value put reads back its bytes or is absent, and one
 /// whose put was reported durable is there.
-fn values_hold(
+pub(super) fn values_hold(
     store: &Store,
     expected: &BTreeMap<Key, Vec<u8>>,
     durable: &[Key],
@@ -243,12 +243,9 @@ fn head_then_crash(seed: u64, plant: bool) -> Result<(), String> {
     values_hold(&store, &expected, &durable)
 }
 
-/// The planted-bug control (bug 7): with the head written before the syncs of its packs and
-/// their checks complete, the directed case fails under some seed's crash, and fails as that
-/// bug does: the store does not open, because its head names bytes of a pack, or checks of
-/// them, that are not on disk. The same cases pass with nothing planted.
-#[test]
-fn the_oracle_catches_a_head_written_before_its_syncs() {
+/// The directed case over seeds: each passes with nothing planted, and the first that fails
+/// with the bug planted is given, with what the oracle found.
+pub(super) fn head_before_syncs_caught() -> (u64, String) {
     let mut caught = None;
     for seed in 0..32 {
         let unplanted = head_then_crash(seed, false);
@@ -259,7 +256,16 @@ fn the_oracle_catches_a_head_written_before_its_syncs() {
             caught = Some((seed, why));
         }
     }
-    let (seed, why) = caught.expect("the oracle missed the planted head written before its syncs");
+    caught.expect("the oracle missed the planted head written before its syncs")
+}
+
+/// The planted-bug control (bug 7): with the head written before the syncs of its packs and
+/// their checks complete, the directed case fails under some seed's crash, and fails as that
+/// bug does: the store does not open, because its head names bytes of a pack, or checks of
+/// them, that are not on disk. The same cases pass with nothing planted.
+#[test]
+fn the_oracle_catches_a_head_written_before_its_syncs() {
+    let (seed, why) = head_before_syncs_caught();
     assert!(
         why.contains("did not open") && why.contains("its head names"),
         "seed {seed}: caught, but not as a head naming what is not durable: {why}"

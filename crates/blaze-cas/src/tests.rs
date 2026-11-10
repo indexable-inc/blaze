@@ -1762,7 +1762,7 @@ fn a_pack_a_batch_waiting_on_its_maps_moves_records_into_is_not_retired() {
     assert_eq!(store.verify(None), Vec::new());
 }
 
-/// The crash test: at any point of any number of commits, under injected IO failures, a crash
+/// The invariant: at any point of any number of commits, under injected IO failures, a crash
 /// loses no put that was reported durable, and the store opens with only whole values.
 #[test]
 fn a_crash_at_any_point_loses_nothing_durable_and_serves_nothing_torn() {
@@ -1773,13 +1773,9 @@ fn a_crash_at_any_point_loses_nothing_durable_and_serves_nothing_torn() {
         let mut next = 0u64;
         for round in 0..4 {
             let mut store = open(&mut sim, "store");
-            for (key, bytes) in &expected {
-                if let Some(found) = bytes_of(&store, key) {
-                    assert_eq!(&found, bytes, "seed {seed} round {round}");
-                }
-            }
-            for key in &durable_keys {
-                assert!(store.has(key), "seed {seed} round {round}: a durable put was lost");
+            // The oracle's rule for the values, the one its control runs under the planted bug.
+            if let Err(why) = block_checks::values_hold(&store, &expected, &durable_keys) {
+                panic!("seed {seed} round {round}: {why}");
             }
             assert_eq!(store.verify(None), Vec::new(), "seed {seed} round {round}");
             let mut tickets = BTreeMap::new();
@@ -1834,6 +1830,21 @@ fn a_crash_at_any_point_loses_nothing_durable_and_serves_nothing_torn() {
             sim.crash();
         }
     }
+}
+
+/// The planted-bug control of the crash test: with the head written before the syncs of its
+/// packs and their checks complete (`Store::plant_head_before_syncs`), the directed case (a
+/// commit on a disk that stopped answering syncs, then a crash; `block_checks::head_then_crash`)
+/// fails under some seed, as that bug does: the store does not open, its head naming bytes that
+/// are not on disk. The crash test's own rules judge it: the store opens, and
+/// `block_checks::values_hold`.
+#[test]
+fn the_oracle_catches_a_put_reported_durable_that_no_sync_made_so() {
+    let (seed, why) = block_checks::head_before_syncs_caught();
+    assert!(
+        why.contains("did not open") && why.contains("its head names"),
+        "seed {seed}: caught, but not as a head naming what is not durable: {why}"
+    );
 }
 
 #[test]
