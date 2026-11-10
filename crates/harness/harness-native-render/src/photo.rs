@@ -41,7 +41,7 @@ fn format(path: &Path) -> Result<bool, String> {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn open(path: &Path) -> Result<objc2_core_foundation::CFRetained<objc2_core_graphics::CGImage>, String> {
     use objc2_core_graphics::{CGColorRenderingIntent, CGDataProvider, CGImage};
     use std::os::unix::ffi::OsStrExt;
@@ -66,7 +66,7 @@ fn open(path: &Path) -> Result<objc2_core_foundation::CFRetained<objc2_core_grap
 }
 
 /// The size of the photo at `path` in pixels, from its header (nothing is decoded).
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 pub fn size(path: &Path) -> Result<(u32, u32), String> {
     use objc2_core_graphics::CGImage;
     let img = open(path)?;
@@ -76,7 +76,7 @@ pub fn size(path: &Path) -> Result<(u32, u32), String> {
 
 /// ImageIO's entry points the HDR decode uses (objc2 has no ImageIO crate in this tree's lock): a source over a data
 /// provider and its first image, decoded with `kCGImageSourceDecodeRequest: kCGImageSourceDecodeToHDR` (macOS 15).
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 mod imageio {
     use objc2_core_foundation::{CFDictionary, CFString, CFType};
     use objc2_core_graphics::{CGDataProvider, CGImage};
@@ -91,7 +91,7 @@ mod imageio {
 
 /// The photo at `path` decoded by ImageIO to its HDR range, when it is HDR (its content headroom is above 1.0); None for
 /// an SDR photo.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn open_hdr(path: &Path) -> Result<Option<objc2_core_foundation::CFRetained<objc2_core_graphics::CGImage>>, String> {
     use objc2_core_foundation::{CFDictionary, CFRetained, CFString};
     use objc2_core_graphics::{CGDataProvider, CGImage};
@@ -120,7 +120,7 @@ fn open_hdr(path: &Path) -> Result<Option<objc2_core_foundation::CFRetained<objc
 /// The photo at `path`, cut to the shape `aspect` (width over height; None keeps its own) about its middle, then scaled
 /// down to at most [`MAX_EDGE`] along its longer edge. With `hdr`, an HDR photo keeps its range (module doc); without
 /// (a shader's input, which samples 8-bit sRGB), every photo is SDR.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 pub fn decode(path: &Path, aspect: Option<f32>, hdr: bool) -> Result<Photo, String> {
     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
     use objc2_core_graphics::{CGBitmapContextCreate, CGColorSpace, CGContext, CGImage, CGInterpolationQuality, kCGColorSpaceExtendedLinearSRGB};
@@ -186,14 +186,14 @@ pub fn decode(path: &Path, aspect: Option<f32>, hdr: bool) -> Result<Photo, Stri
     Ok(Photo { w: ow as u32, h: oh as u32, rgba: buf.into(), peak: None })
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(target_vendor = "apple"))]
 pub fn size(path: &Path) -> Result<(u32, u32), String> {
     format(path)?;
-    Err(format!("{}: photos are decoded only on macOS (CoreGraphics)", path.display()))
+    Err(format!("{}: photos are decoded only on Apple systems (CoreGraphics)", path.display()))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(target_vendor = "apple"))]
 pub fn decode(path: &Path, _aspect: Option<f32>, _hdr: bool) -> Result<Photo, String> {
     format(path)?;
-    Err(format!("{}: photos are decoded only on macOS (CoreGraphics)", path.display()))
+    Err(format!("{}: photos are decoded only on Apple systems (CoreGraphics)", path.display()))
 }

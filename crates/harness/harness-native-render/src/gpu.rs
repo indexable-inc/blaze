@@ -526,7 +526,8 @@ impl Renderer {
                 }
                 enc.endEncoding();
             }
-            if let Some(d) = drawable {
+            // A pass drawn over an earlier one's drawable (a phone's overlays over its view) is presented by that one.
+            if let Some(d) = drawable.filter(|_| !pass.over) {
                 on_screen = true;
                 if d.layer().presentsWithTransaction() {
                     with_transaction.push(d);

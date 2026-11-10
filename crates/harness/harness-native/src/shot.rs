@@ -339,6 +339,7 @@ pub fn run(path: &str) -> Result<(), String> {
     }
     // HARNESS_NATIVE_MENU_DUMP: the menu bar the window would have, read back from the NSMenu built from the keys.
     if std::env::var_os("HARNESS_NATIVE_MENU_DUMP").is_some() {
+        #[cfg(target_os = "macos")]
         eprint!("harness-native: menu bar\n{}", crate::window::dump_menu(&app.menu()));
     }
     Ok(())
