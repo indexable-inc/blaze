@@ -1818,7 +1818,10 @@ fn store(
     let package = job.package(u)?;
     // Read before the unit's is taken, so a give-way finds it as it was.
     let krate = crate_of(job, unit, u)?;
-    let sources = crate_files(reader, krate);
+    let sources = {
+        let _span = tracing::info_span!(target: "blaze", "unit source files").entered();
+        crate_files(reader, krate)
+    };
     // Everything its closure's code was made from is in the database's logs now: it compiled.
     // An expansion whose reads were not traced read what no key can cover: no record is kept.
     let read = {
@@ -1853,6 +1856,10 @@ fn store(
     } = *making;
     let mut outputs = Vec::new();
     let mut artifact = None;
+    // Each file it wrote hashed whole for its key (a program's image among them), its
+    // dep-info written and its artifact made.
+    let hashing =
+        tracing::info_span!(target: "blaze", "unit outputs hash", files = files.len()).entered();
     if !nothing {
         let mounted = &job.mounted;
         // Each file's bytes go into the store once, moved, under their key; a copy cargo makes
@@ -1941,6 +1948,7 @@ fn store(
             *context = with_natives(*context, &natives);
         }
     }
+    drop(hashing);
     let misses = std::mem::take(&mut phases.misses);
     let why = why.map(str::to_owned); // alloc: a unit that failed, once
     let mut compiled = Compiled {
@@ -2364,6 +2372,11 @@ fn assemble(
         );
         return Err(ApiError::new(what, None).into());
     };
+    // Its diagnostics' sources read and each diagnostic rendered: a unit made again does this
+    // whole, whatever of its check was reused.
+    let rendering =
+        tracing::info_span!(target: "blaze", "unit diagnostics render", diags = diags.len())
+            .entered();
     let mut sources = blaze_diagnostics::emit::Sources::default();
     for (name, text) in &phases.unmounted {
         // clone: a file no mount holds, once per unit whose diagnostics point into one
@@ -2394,6 +2407,7 @@ fn assemble(
         .collect::<Result<_, _>>()
         // clone: the unit's name, on the error path
         .map_err(|why| ApiError::new(why, Some(u.target.name.clone())))?;
+    drop(rendering);
     let failed = diagnostics.iter().any(|it| it.level == Level::Error);
     let mut made = Made::default();
     let nothing = |diagnostics: Vec<Diagnostic>, ok: bool, made: Made| Making {
@@ -2489,7 +2503,10 @@ fn assemble(
             if job.cancelled() {
                 return Err(Failed::Again);
             }
-            let generated = parts.over(reader, mounted);
+            let generated = {
+                let _span = tracing::info_span!(target: "blaze", "unit generated over").entered();
+                parts.over(reader, mounted)
+            };
             // Lint `blaze::vecreport`: what the optimized code still does in its loops, at
             // the source line, in the order of the positions.
             let reported = generated
@@ -2516,6 +2533,7 @@ fn assemble(
             // has: a reformat that moves a `panic!` changes its message. Every span table of the
             // binary is in each test's selection, so such an edit runs its tests again.
             // alloc: once per test unit, one hash per span table
+            let tables = tracing::info_span!(target: "blaze", "unit span tables").entered();
             let mut spans: Vec<CodeHash> = match generated.roots.tests.is_empty() {
                 true => Vec::new(),
                 false => generated
@@ -2533,6 +2551,7 @@ fn assemble(
             spans.sort_unstable();
             spans.dedup();
             made.spans = spans;
+            drop(tables);
             // Each test by name only: what it reaches is walked from the binary's table when a
             // reach request or a kept run asks, not here, where a binary of thousands of tests
             // walked the program once per test (2026-11-01: minutes per binary).
