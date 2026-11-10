@@ -43,7 +43,7 @@ class Row:
         self.dir = os.path.join(work, name)
         self.ws = os.path.realpath(at or os.path.join(self.dir, "ws"))
         self.home = os.path.join(self.dir, "home")
-        self.store = os.path.join(self.home, "v2", "store")
+        self.store = storelib.layout(self.home).store
         os.makedirs(self.dir, exist_ok=True)
         self.env = dict(base_env(self.home), **(env or {}))
         self.built, self.notes, self.mark = [], [], 1000

@@ -212,7 +212,7 @@ def placed_of(label: str, ran: engine.Ran) -> dict[str, int]:
 
 
 def build_dirs(home: Path) -> set[Path]:
-    root = home / "build"
+    root = Path(engine.layout(home).builds)
     return {it for it in root.iterdir() if it.is_dir()} if root.is_dir() else set()
 
 
@@ -225,7 +225,7 @@ async def check(eng: engine.Engine, rep: report.Report, args: Input, work: Path)
     fixture.write(source, state)
     want = fixture.environment(state)
     extra = {name: value for name in ("ORACLE_SCRIPT_VALUE", "ORACLE_SOURCE_ENV") if (value := want[name]) is not None}
-    env = eng.env(home, None, None, extra)
+    env = eng.env(home, None, extra)
     if want["PATH_EXTRA"]:
         front = work / "path-extra"
         front.mkdir(exist_ok=True)
@@ -242,7 +242,7 @@ async def check(eng: engine.Engine, rep: report.Report, args: Input, work: Path)
             raise engine.Failed(f"{step} exited {ran.returncode}:\n{ran.said()}")
         made = build_dirs(home) - before
         if len(made) != 1:
-            raise engine.Failed(f"{step}: {len(made)} new build directories under {home / 'build'}, not one: "
+            raise engine.Failed(f"{step}: {len(made)} new build directories under {engine.layout(home).builds}, not one: "
                                 f"{sorted(map(str, made))}")
         return ran, made.pop()
 
@@ -287,7 +287,7 @@ def main(args: Input) -> None:
     if eng.kind != "v2":
         fail(SCRIPT, "engine.kind: v2; v1 has no build directory under its home and no store it places from")
     rep = report.Report(SCRIPT, args.engine, args.out)
-    work = Path(args.work or tempfile.mkdtemp(prefix="bz-clone-out-", dir="/tmp")).resolve()
+    work = engine.work_dir(args.work, "bz-clone-out-")
     work.mkdir(parents=True, exist_ok=True)
     print(f"work: {work}", flush=True)
     rep.guarded(CHECK, lambda: asyncio.run(check(eng, rep, args, work)))

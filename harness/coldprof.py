@@ -21,6 +21,7 @@ the largest process (the daemon) holds then.
 import os, shutil, subprocess, sys, threading, time
 
 import memory
+import storelib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOLCHAIN = open(os.path.join(HERE, "toolchain")).read().strip()
@@ -69,7 +70,7 @@ def main():
     os.makedirs(home, mode=0o700)
     # The daemon's store is `<home>/v2/store`: DIR is copied in now and the store copied back
     # once the daemon stops, so DIR carries from run to run while the home starts empty.
-    own_store = os.path.join(home, "v2", "store")
+    own_store = storelib.layout(home).store
     if os.path.isdir(store):
         shutil.copytree(store, own_store, symlinks=True)
     env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, BLAZE_HOME=home, CARGO_TARGET_DIR=target,
@@ -85,7 +86,7 @@ def main():
 
     # The daemon's own log, of the daemon the first `blaze build` starts (crates/blaze-cargo,
     # `cli/daemon.rs`): v1's worker and spare logs are gone with its workers.
-    log = os.path.join(home, "v2", "serve.log")
+    log = storelib.layout(home).log
 
     def follow():
         offset = 0

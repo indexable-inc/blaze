@@ -47,7 +47,6 @@ import shutil
 import statistics
 import subprocess
 import sys
-import tempfile
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -240,7 +239,8 @@ class Build:
 
     @property
     def program(self) -> Path:
-        return self.ws / "target" / "release" / (PACKAGE + engine.EXE)
+        # In the build directory under the daemon's home: blaze writes no `target` into the checkout.
+        return self.eng.build_dir(self.ws, self.env) / "release" / (PACKAGE + engine.EXE)
 
 
 def manifest() -> str:
@@ -436,7 +436,7 @@ def main(args: Input) -> None:
         fail(SCRIPT, f"rounds and runs: at least 1, not {args.rounds} and {args.runs}")
     if not os.path.isabs(args.duckdb) or not os.path.isfile(args.duckdb):
         fail(SCRIPT, f"duckdb: an absolute path to the DuckDB binary, not {args.duckdb!r}")
-    work = Path(args.work or tempfile.mkdtemp(prefix="bz-constspec-", dir="/tmp")).resolve()
+    work = engine.work_dir(args.work, "bz-constspec-")
     work.mkdir(parents=True, exist_ok=True)
     rep = report.Report(SCRIPT, args.after, args.out)
     rep.extra.update(work=str(work), before=args.before.blaze, before_tree=args.before_tree,

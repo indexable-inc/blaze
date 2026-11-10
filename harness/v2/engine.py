@@ -26,6 +26,16 @@ the codegen inputs of a build, the critical path of a cold build) is a method he
 `Failed` is a step the harness could not do (a command that timed out, a daemon that did not
 come up): an error of the run, never a finding about the compiler.
 
+Where a daemon keeps what it keeps is `layout(home)` (harness/storelib.py's `Layout`, the one
+place it is decided): its socket, state, store, lock, log, profile history and build
+directories are all under its home, which `BLAZE_HOME` names, and no setting moves one out. So
+`Engine.env` takes a home and no store, `store_of(home)` is where a script reads the store, and
+`Engine.build_dir` is where a build's outputs are (the checkout has no `target`). `Engine.of`
+ends with `preflight`: what this harness assumes of the binary and cannot tell from the source
+it was written against (`blaze --version`, the commands it runs as `blaze --help` lists them,
+`blaze status --json`'s home, state and socket against `layout`) is checked against the binary
+before any build, and a miss is a `Failed` naming the assumption.
+
 `reference_env` is plain cargo with the pinned nightly (`harness/toolchain`), no incremental
 compilation and no wrapper: what a script fetches sources with (`cargo fetch`, `cargo vendor`,
 `cargo metadata`). Nothing blaze builds is compared with what cargo builds.
@@ -37,8 +47,10 @@ import json
 import mmap
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
@@ -48,11 +60,15 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 import blake3
 
+HERE = Path(__file__).resolve().parent
+HARNESS = HERE.parent
+if str(HARNESS) not in sys.path:
+    sys.path.append(str(HARNESS))
+import storelib  # noqa: E402
+
 if TYPE_CHECKING:
     from storelib import BuildFinished
 
-HERE = Path(__file__).resolve().parent
-HARNESS = HERE.parent
 ROOT = HARNESS.parent
 TOOLCHAIN = (HARNESS / "toolchain").read_text().strip()
 EXE = ".exe" if os.name == "nt" else ""
@@ -73,7 +89,11 @@ SCRUBBED = (
     "BLAZE_BACKEND",
     "BLAZE_OPT",
     "BLAZE_EMIT",
+    # v1's memory limit, read by nothing in v2 (the daemon's is BLAZE_DAEMON_MEMORY_GB, which a
+    # caller keeps): dropped so a stale export says nothing.
     "BLAZE_MEMORY_BUDGET",
+    # Where the socket goes without BLAZE_HOME (blaze_api::client::home); every command here has one.
+    "XDG_RUNTIME_DIR",
 )
 # What the v1 daemon's workers log about each build (crates/blaze-engine), read by `work_since`.
 V1_COMPILED = re.compile(r"^stats: (\d+) of (\d+) functions compiled", re.M)
@@ -205,9 +225,87 @@ def run(step: str, argv: list[str], cwd: Path, env: dict[str, str], timeout: flo
     return ran
 
 
+def layout(home: Path) -> storelib.Layout:
+    """Where the daemon of `home` keeps everything (storelib.Layout, which states the daemon's
+    rule and where its code is): the one place a v2 script gets these paths from."""
+    return storelib.layout(str(home))
+
+
 def store_of(home: Path) -> Path:
-    """Where the daemon of `home` keeps its store (crates/blaze-cargo/src/serve/daemon.rs)."""
-    return home / "v2" / "store"
+    """Where the daemon of `home` keeps its store, and reads no other (`layout`)."""
+    return Path(layout(home).store)
+
+
+def seed_store(source: Path | None, home: Path) -> None:
+    """The store of `home` made a copy of the store directory `source` (another home's
+    `store_of`, or a copy kept of one), or with None emptied, before the daemon of `home`
+    starts: how a store is shared or seeded across homes, as the daemon reads only its own. A
+    `source` that is no directory is a `Failed` naming it."""
+    store = store_of(home)
+    shutil.rmtree(store, ignore_errors=True)
+    if source is None:
+        return
+    if not source.is_dir():
+        raise Failed(f"seeding the store of the home {home}: no store directory {source}")
+    store.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    shutil.copytree(source, store, symlinks=True)
+
+
+def work_dir(given: str, prefix: str) -> Path:
+    """Where a v2 script keeps its checkouts and daemon homes (storelib.work_dir): `given`, or
+    a new directory on a file system blaze can place outputs on; probed either way, and a
+    `Failed` naming the directory and the requirement when blaze would refuse it."""
+    try:
+        return Path(storelib.work_dir(given, prefix))
+    except storelib.Failed as e:
+        raise Failed(str(e)) from None
+
+
+def empty_home(home: Path, keep_store: bool = False) -> None:
+    """Everything the daemon of `home` kept removed (its state, its build directories, the
+    packages it fetched), and with `keep_store` all but its store: what a build "from an empty
+    home into the same store" starts from, the store being in the home. The daemon is stopped
+    first by the caller."""
+    store = store_of(home)
+    if not keep_store or not store.is_dir():
+        shutil.rmtree(home, ignore_errors=True)
+        return
+    aside = home.with_name(f"{home.name}.store-kept")
+    shutil.rmtree(aside, ignore_errors=True)
+    os.rename(store, aside)
+    shutil.rmtree(home, ignore_errors=True)
+    store.parent.mkdir(parents=True, mode=0o700)
+    os.rename(aside, store)
+
+
+BUILD_DIR_ID = re.compile(r"[0-9a-f]{32}")
+
+
+def build_dir_name(ws: Path) -> str:
+    """The front of the name of the default build directory of the workspace at `ws`, before
+    its id: the last part of its path, each character but ASCII letters, digits, `-`, `_` and
+    `.` as `_`, then `-` (blaze_manifest::home::build_dir); empty for a path with no last part."""
+    name = "".join(c if c.isascii() and (c.isalnum() or c in "-_.") else "_" for c in ws.name)
+    return f"{name}-" if name else ""
+
+
+def default_build_dir(home: Path, ws: Path) -> Path:
+    """The build directory the daemon of `home` gave the workspace at `ws` when no target
+    directory was named: the one `<home>/build/<name>-<id>` (docs/cargo.md, "Where a build
+    writes"), `<id>` 32 hex digits of a hash of the path as the daemon names it, which is not
+    computed again here: the directory is found by its name's front, and none or more than one
+    (two checkouts with one last part built in one home) is a `Failed` naming them."""
+    builds, front = Path(layout(home).builds), build_dir_name(ws)
+    try:
+        found = sorted(p for p in builds.iterdir()
+                       if p.is_dir() and p.name.startswith(front) and BUILD_DIR_ID.fullmatch(p.name[len(front):]))
+    except FileNotFoundError:
+        found = []
+    if len(found) != 1:
+        raise Failed(f"the build directory of {ws}: {len(found)} directories named `{front}<32 hex digits>` in "
+                     f"{builds} ({', '.join(p.name for p in found) or 'none'}), not one; a build with no "
+                     "`CARGO_TARGET_DIR` makes one there (crates/blaze-manifest/src/home.rs, `build_dir`)")
+    return found[0]
 
 
 def scrubbed() -> dict[str, str]:
@@ -437,21 +535,20 @@ class Engine(ABC):
             raise Failed(f"engine.kind 'v1' ({spec.blaze}): v1 is gone, and its adapter reads its workers' logs "
                          "(`<home>/*/*/log`) and `blaze status`'s `loading`/`ready` lines, which v2 has none of; "
                          "give `\"kind\": \"v2\"`")
-        return V2(spec)
+        eng = V2(spec)
+        eng.preflight()
+        return eng
 
     @property
     def kind(self) -> Kind:
         return self.spec.kind
 
-    def env(self, home: Path, store: Path | None = None, target: Path | None = None,
-            extra: dict[str, str] | None = None) -> dict[str, str]:
-        """The environment of a `blaze` command with a home (daemon, socket, logs) and a store of
-        its own; the target directory is the workspace's `target` unless `target` is given.
-        The daemon's store is always `store_of(home)`: a `store` elsewhere is refused, and a store
-        shared or seeded across homes is copied there before the daemon starts."""
-        if store is not None and store != store_of(home):
-            raise Failed(f"a store at {store} for the home {home}: the daemon keeps its store at "
-                         f"{store_of(home)} and reads no other")
+    def env(self, home: Path, target: Path | None = None, extra: dict[str, str] | None = None) -> dict[str, str]:
+        """The environment of a `blaze` command whose daemon lives in `home` (`layout(home)`:
+        socket, state, store, logs, build directories). There is no store to name: the daemon
+        keeps it at `store_of(home)` and reads no other (`seed_store` copies one in). The build
+        directory is the daemon's default under the home unless `target` is given
+        (`CARGO_TARGET_DIR`); `build_dir` says where it is either way."""
         home.mkdir(parents=True, exist_ok=True, mode=0o700)
         env = scrubbed()
         env.update(BLAZE_HOME=str(home), BLAZE_STATS="1", PATH=f"{self.blaze.parent}{os.pathsep}{env.get('PATH', '')}")
@@ -473,6 +570,17 @@ class Engine(ABC):
 
     def stop(self, ws: Path, env: dict[str, str]) -> None:
         self.command("stopping the daemon", "stop", [], ws, env, 300)
+
+    def build_dir(self, ws: Path, env: dict[str, str]) -> Path:
+        """Where the builds of `ws` under `env` put their outputs (`debug/<program>`,
+        `release/...`): the `CARGO_TARGET_DIR` `env` names, else the daemon's default for `ws`
+        under its home (`default_build_dir`), which is there once a build has run."""
+        if named := env.get("CARGO_TARGET_DIR"):
+            return Path(named)
+        return default_build_dir(Path(env["BLAZE_HOME"]), ws)
+
+    def preflight(self) -> None:
+        """Nothing here: an engine with assumptions to hold to its binary checks them."""
 
     @abstractmethod
     def not_blazes(self, ran: Ran) -> str | None:
@@ -644,24 +752,77 @@ class V2(Engine):
 
     def wait_ready(self, ws: Path, env: dict[str, str], timeout: float = 3600) -> float:
         # `Request::Status` answers once the daemon serves requests; a view is opened by the
-        # request that names it, so there is no loading of a workspace to wait out.
+        # request that names it, so there is no loading of a workspace to wait out. `blaze
+        # status` exits 0 with no daemon too (it starts none and says "no daemon is running",
+        # crates/blaze-cargo/src/cli/daemon.rs `status`), so its exit says nothing: the answer
+        # read is `blaze status --json`'s `daemon`, which is null until one answers.
         began = time.monotonic()
+        said = "it was not asked"
         while time.monotonic() - began < timeout:
-            if self.command("the daemon's status", "status", [], ws, env, 300).returncode == 0:
-                return time.monotonic() - began
+            try:
+                if storelib.blaze_status(str(self.blaze), env, str(ws), 300).daemon is not None:
+                    return time.monotonic() - began
+                said = "`blaze status --json` says no daemon is running"
+            except (storelib.Failed, subprocess.SubprocessError, OSError) as e:
+                said = f"{type(e).__name__}: {e}"
             time.sleep(0.1)
-        raise Failed(f"the daemon did not answer `blaze status` for {ws} in {timeout:.0f} s")
+        raise Failed(f"the daemon did not answer `blaze status --json` for {ws} in {timeout:.0f} s: {said}")
+
+    def preflight(self) -> None:
+        """What this harness assumes of the binary, held to the binary before any build; each
+        miss is a `Failed` naming the assumption and what the binary said instead:
+
+        - `blaze --version` exits 0 and names a version (kept as `self.version`);
+        - every command the v2 scripts run is listed by `blaze --help`, in the form they run it
+          (`HELP_LISTS`);
+        - `blaze status --json`, asked with a home of its own and no daemon, exits 0, reads as
+          storelib's format, says no daemon runs, and names the home, the state directory and
+          the socket `layout` names (the daemon's rule, storelib.Layout)."""
+        with tempfile.TemporaryDirectory(prefix="bz-pre-", dir="/tmp" if os.path.isdir("/tmp") else None) as tmp:
+            home = Path(os.path.realpath(tmp)) / "h"
+            env = self.env(home)
+            what = f"preflight of {self.blaze}"
+            said = run(f"{what}: `blaze --version`", [str(self.blaze), "--version"], home, env, 60, check=True).stdout
+            words = said.split()
+            if len(words) < 2 or words[0] != "blaze":
+                raise Failed(f"{what}: `blaze --version` said {said.strip()!r}, not `blaze <version> ...`")
+            self.version = said.strip()
+            listed = run(f"{what}: `blaze --help`", [str(self.blaze), "--help"], home, env, 60, check=True).stdout
+            missing = [name for name in HELP_LISTS if not help_lists(listed, name)]
+            if missing:
+                raise Failed(f"{what} ({self.version}): `blaze --help` lists no "
+                             f"{', '.join(f'`{name}`' for name in missing)}, which the harness runs (engine.py and "
+                             "the scripts over it); the harness is written against another blaze's commands")
+            try:
+                status = storelib.blaze_status(str(self.blaze), env, str(home))
+            except (storelib.Failed, subprocess.SubprocessError, OSError) as e:
+                raise Failed(f"{what} ({self.version}): `blaze status --json` with BLAZE_HOME={home}: {e}") from None
+            if status.daemon is not None:
+                raise Failed(f"{what}: a daemon (pid {status.daemon.pid}) answers in the new home {home}")
+            want = layout(home)
+            for name, got, wanted in (("home", status.home, want.home), ("state", status.state, want.state),
+                                      ("socket", status.socket, want.socket)):
+                if os.path.realpath(got) != os.path.realpath(wanted):
+                    raise Failed(f"{what} ({self.version}): with BLAZE_HOME={home}, `blaze status --json` says its "
+                                 f"{name} is {got}, and the harness lays out {wanted} (storelib.layout): the "
+                                 "daemon's rule for where it keeps things moved, and the layout has to follow it")
 
     def __init__(self, spec: EngineSpec):
         super().__init__(spec)
+        # `blaze --version`'s line, once `preflight` has asked.
+        self.version = ""
         # Each build, test and run through `build`, by its daemon's home: its step and its
         # `blaze-work` line, or None where it printed none.
         self.worked: dict[str, list[tuple[str, dict[str, object] | None]]] = {}
+        # Every command through `build`, in order: its step and its seconds, for a script to
+        # say where its time went.
+        self.took: list[tuple[str, float]] = []
 
     def build(self, step: str, ws: Path, env: dict[str, str], args: Sequence[str] = (), command: str = "build",
               timeout: float = 7200) -> Ran:
         args = dev_backend_args(self.spec.dev_backend, command, args)
         ran = self.command(step, command, list(args), ws, env, timeout)
+        self.took.append((step, ran.seconds))
         if command in WORKING:
             label = f"{step} (`{' '.join(['blaze', command, *args])}`)"
             lines = worked_lines(ran.stdout) if "--message-format=json" in args else []
@@ -737,6 +898,22 @@ class V2(Engine):
         self.command("the trace", "trace", ["--out", str(to)], ws, env, 600).checked("the trace")
         if not to.is_file():
             raise Failed(f"`blaze trace --out {to}` exited 0 and wrote no file")
+
+
+# The commands the v2 scripts run, each as `blaze --help` lists it (crates/blaze-cargo/src/cli.rs,
+# `HELP`): `preflight` refuses a binary that lists one of them otherwise.
+HELP_LISTS = ("build", "check", "run", "test", "stop", "status", "toolchain", "daemon",
+              "codegen-inputs --format=json", "trace --out PATH", "tables --format=json", "debug sql")
+
+
+def help_lists(listed: str, name: str) -> bool:
+    """Whether `blaze --help`'s text `listed` has a line for the command `name`: the line
+    starts with it, whole (`build, b`, `debug sql QUERY`; `tables` is not `tables-of`)."""
+    for line in listed.splitlines():
+        text = line.strip()
+        if text.startswith(name) and (len(text) == len(name) or text[len(name)] in " ,"):
+            return True
+    return False
 
 
 def profile_of(command: str, args: Sequence[str]) -> str:

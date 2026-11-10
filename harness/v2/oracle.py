@@ -13,7 +13,7 @@ whitespace in literals, names `type_name` and `module_path!` read, positions `li
 `#[track_caller]` read, the environment of a build). A sequence starts from a state and edits
 one slot at a time. Each step:
 
-- the incremental build: one daemon kept for the whole sequence, with its home and store,
+- the incremental build: one daemon kept for the whole sequence, with its home (and so its store),
   builds the edited source (`blaze build`, then `blaze test`);
 - the build from scratch: a daemon with an empty home and a store holding only the standard
   library (`seed_std`), into an empty target directory, of the same source at the same path.
@@ -45,7 +45,7 @@ not touch put back to its default, as long as it still fails, at most `reduce` r
 Input (JSON inline, a file's path, or `-`):
     engine        the blaze under test (engine.EngineSpec)
     out           the result's path (report.py); found sequences go beside it, in `found/`
-    work          where daemons' homes, stores and targets go (a new directory under /tmp)
+    work          where daemons' homes (each with its store) and targets go (a new directory under /tmp)
     seed, first, rounds, steps, kinds, regressions    as above
     profiles      "dev" and/or "release" (release adds the inlining edges of section 6.1)
     tests         run `blaze test` too (default true)
@@ -83,7 +83,6 @@ import report  # noqa: E402
 from typed_input import fail, parse  # noqa: E402
 
 difference: Callable[[object, object], str | None] = getattr(blaze_cli, "difference")
-kept_passes: Callable[[str], list[str]] = getattr(blaze_cli, "kept_passes")
 test_results: Callable[[object], object] = getattr(blaze_cli, "test_results")
 
 SCRIPT = "oracle.py"
@@ -260,11 +259,11 @@ class Round:
     def __init__(self, eng: engine.Engine, it: Settings, work: Path, std_store: Path | None):
         self.eng, self.it, self.work, self.std_store = eng, it, work, std_store
         self.ws = work / "ws"
-        self.inc_home, self.inc_store, self.inc_target = work / "hi", work / "si", work / "ti"
+        self.inc_home, self.inc_target = work / "hi", work / "ti"
         self.extra_dir = work / "path-extra"
         for path in (self.ws, self.extra_dir):
             path.mkdir(parents=True, exist_ok=True)
-        self.fresh_store(self.inc_store)
+        self.fresh_store(self.inc_home)
         self.files: dict[str, str | None] | None = None
         self.last_env: dict[str, str] | None = None
         # Why the engine cannot say what a build did, its codegen inputs or its trace, once said.
@@ -275,10 +274,10 @@ class Round:
         self.traces = 0
         self.last_trace: Path | None = None
 
-    def fresh_store(self, store: Path) -> None:
-        shutil.rmtree(store, ignore_errors=True)
-        if self.std_store is not None:
-            shutil.copytree(self.std_store, store, symlinks=True)
+    def fresh_store(self, home: Path) -> None:
+        """The store of `home` (where its daemon keeps it: engine.layout) emptied, or a copy of
+        the standard library's where one was made, before its daemon starts."""
+        engine.seed_store(self.std_store, home)
 
     def env_of(self, base: dict[str, str], state: fixture.State) -> dict[str, str]:
         env = dict(base)
@@ -319,12 +318,11 @@ class Round:
     def tests(self, step: str, env: dict[str, str], target: Path, release: list[str], built: Built) -> object:
         # JSON for blaze-work (engine.V2.work_since).
         args = ["--message-format=json", "--no-fail-fast", *release]
-        kept_file = target / "blaze" / "tests.ndjson"
-        kept_file.unlink(missing_ok=True)
         ran = self.eng.build(f"{step}: test", self.ws, env, args, command="test", timeout=BUILD_SECS)
         built.not_blazes = built.not_blazes or self.eng.not_blazes(ran)
-        kept = kept_passes(str(kept_file))
-        return test_results(SimpleNamespace(returncode=ran.returncode, stdout=ran.stdout, kept=kept))
+        # Plain `blaze test` runs every test: v2 keeps no pass without `--reached` and writes no
+        # `tests.ndjson` (docs/cargo.md, "Which tests run").
+        return test_results(SimpleNamespace(returncode=ran.returncode, stdout=ran.stdout, kept=[]))
 
     def codegen(self, env: dict[str, str]) -> dict[str, str] | None:
         if self.codegen_gap is not None:
@@ -375,7 +373,7 @@ class Round:
         return stale[:12], None if work is None else work["needless"]
 
     def incremental(self, state: fixture.State) -> tuple[Built, engine.Work | None]:
-        env = self.env_of(self.eng.env(self.inc_home, self.inc_store, self.inc_target), state)
+        env = self.env_of(self.eng.env(self.inc_home, self.inc_target), state)
         self.last_env = env
         mark = None
         if self.work_gap is None:
@@ -397,9 +395,9 @@ class Round:
         return built, work
 
     def scratch(self, state: fixture.State) -> Built:
-        home, store = self.work / "hs", self.work / "ss"
+        home = self.work / "hs"
         shutil.rmtree(home, ignore_errors=True)
-        self.fresh_store(store)
+        self.fresh_store(home)
         # Byte for byte needs the same target path as the incremental build: that one waits aside.
         aside = self.work / "ti-aside"
         target = self.inc_target if self.it.bytes else self.work / "ts"
@@ -408,7 +406,7 @@ class Round:
             os.rename(self.inc_target, aside)
         else:
             shutil.rmtree(target, ignore_errors=True)
-        env = self.env_of(self.eng.env(home, store, target), state)
+        env = self.env_of(self.eng.env(home, target), state)
         try:
             built = self.side("from scratch", env, target)
             if built.ok:
@@ -420,7 +418,6 @@ class Round:
                 self.eng.stop(self.ws, env)
             finally:
                 shutil.rmtree(home, ignore_errors=True)
-                shutil.rmtree(store, ignore_errors=True)
                 shutil.rmtree(target, ignore_errors=True)
                 if self.it.bytes:
                     os.rename(aside, self.inc_target)
@@ -576,15 +573,18 @@ def std_seed(eng: engine.Engine, work: Path) -> Path:
     for name, text in SEED.items():
         (ws / name).parent.mkdir(parents=True, exist_ok=True)
         (ws / name).write_text(text)
-    store = work / "std-store"
-    env = eng.env(work / "seed-home", store, work / "seed-target")
+    store, home = work / "std-store", work / "seed-home"
+    env = eng.env(home, work / "seed-target")
     try:
         ran = eng.build("the standard library's store", ws, env)
         if ran.returncode != 0:
             raise engine.Failed(f"the standard library's store: `blaze build` failed:\n{ran.said()}")
     finally:
         eng.stop(ws, env)
-    shutil.rmtree(work / "seed-home", ignore_errors=True)
+    # The daemon wrote it in its home (engine.store_of); it is kept beside, for `engine.seed_store`.
+    shutil.rmtree(store, ignore_errors=True)
+    shutil.move(engine.store_of(home), store)
+    shutil.rmtree(home, ignore_errors=True)
     shutil.rmtree(work / "seed-target", ignore_errors=True)
     return store
 
@@ -600,9 +600,7 @@ def settings(spec: engine.EngineSpec, profiles: tuple[Profile, ...], tests: bool
 
 def work_root(given: str) -> Path:
     # A daemon's socket is under its home, and a socket's path has to be short.
-    root = Path(given) if given else Path(tempfile.mkdtemp(prefix="bz-oracle-", dir="/tmp"))
-    root.mkdir(parents=True, exist_ok=True)
-    return root.resolve()
+    return engine.work_dir(given, "bz-oracle-")
 
 
 def record(out: report.Report, ran: Ran, gaps: dict[str, tuple[report.Verdict, str]],

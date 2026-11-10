@@ -212,7 +212,8 @@ class Said:
 class Batch:
     """What came of the workspace `ws`: what blaze said of each case (by name), the cases that
     could not be laid out as a package (and why), each case's package directory, a daemon that
-    would not stop, and what the run that checked each case printed on stdout."""
+    would not stop, what the run that checked each case printed on stdout, and the target
+    directory its programs were built into."""
 
     ws: str
     said: dict[str, Said] = field(default_factory=dict[str, Said])
@@ -220,6 +221,7 @@ class Batch:
     packages: dict[str, str] = field(default_factory=dict[str, str])
     stopped: str | None = None
     stdout: dict[str, str] = field(default_factory=dict[str, str])
+    target: str = ""
 
 
 @dataclass(frozen=True)
@@ -645,18 +647,20 @@ def batches_of(cases: Sequence[Case], size: int) -> list[list[Case]]:
     return [group[i:i + size] for group in groups.values() for i in range(0, len(group), size)]
 
 
-def run_batch(eng: engine.Engine, index: int, cases: Sequence[Case], work: Path, store: Path, whole: bool) -> Batch:
+def run_batch(eng: engine.Engine, index: int, cases: Sequence[Case], work: Path, whole: bool) -> Batch:
     """`blaze check` (or `build`, of programs, to be run) of a workspace of `cases`, under its
-    own daemon; the daemon is stopped at the end."""
-    ws, home = work / "ws" / str(index), work / "h" / str(index)
+    own daemon, whose home holds its store (engine.layout), into an empty target directory of
+    its own; the daemon is stopped at the end."""
+    ws, home, target = work / "ws" / str(index), work / "h" / str(index), work / "t" / str(index)
     shutil.rmtree(ws, ignore_errors=True)
+    shutil.rmtree(target, ignore_errors=True)
     members, out = write_workspace(ws, index, cases)
     packages = {case.name: str(ws / "crates" / member) for member, case in members.items()}
     if not members:
         return Batch(str(ws), out=out, packages=packages)
     kind = cases[0].kind
     command = "build" if kind == "bin" else "check"
-    env = eng.env(home, store, extra={"RUSTFLAGS": " ".join(COMMON)})
+    env = eng.env(home, target, {"RUSTFLAGS": " ".join(COMMON)})
     said: dict[str, Said] = {}
     printed: dict[str, str] = {}
     stopped: str | None = None
@@ -683,7 +687,7 @@ def run_batch(eng: engine.Engine, index: int, cases: Sequence[Case], work: Path,
             eng.stop(ws, env)
         except engine.Failed as e:
             stopped = str(e)
-    return Batch(str(ws), said, out, packages, stopped, printed)
+    return Batch(str(ws), said, out, packages, stopped, printed, str(eng.build_dir(ws, env)))
 
 
 def panics_of(stderr: str) -> tuple[str, ...]:
@@ -810,13 +814,13 @@ class Runner:
 
     def side(self, index: int, cases: list[Case]) -> list[Judged]:
         """blaze on a workspace of `cases`, each judged; `twice` cases built a second time with a
-        fresh daemon, workspace and target and the same store, judged again, and held to serve
-        each case's dependencies (`serving`)."""
-        batch = run_batch(self.eng, index, cases, self.work, self.work / "store", self.whole)
+        fresh daemon, workspace and target and the same store (the home emptied of all but it),
+        judged again, and held to serve each case's dependencies (`serving`)."""
+        batch = run_batch(self.eng, index, cases, self.work, self.whole)
         found = self.judged_batch(batch, cases)
         if cases[0].twice:
-            shutil.rmtree(self.work / "h" / str(index), ignore_errors=True)
-            second = run_batch(self.eng, index, cases, self.work, self.work / "store", self.whole)
+            engine.empty_home(self.work / "h" / str(index), keep_store=True)
+            second = run_batch(self.eng, index, cases, self.work, self.whole)
             again = {j.case.name: j for j in self.judged_batch(second, cases)}
             found = [self.second(first, again[first.case.name], second) for first in found]
             batch = second
@@ -841,7 +845,6 @@ class Runner:
     def judged_batch(self, batch: Batch, cases: Sequence[Case]) -> list[Judged]:
         if batch.stopped is not None:
             self.stopped.append((batch.ws, batch.stopped))
-        ws = Path(batch.ws)
         found: list[Judged] = []
         for case in cases:
             if case.name in batch.out:
@@ -852,7 +855,7 @@ class Runner:
             ran = None
             if case.kind == "bin" and case.expect.accept and not said.keys and said.error is None and said.who is None:
                 member = Path(package).name
-                ran = run_program(ws / "target" / "debug" / (member + engine.EXE), self.work / "cwd", self.env)
+                ran = run_program(Path(batch.target) / "debug" / (member + engine.EXE), self.work / "cwd", self.env)
             verdict, category, detail = judged(case, said, ran)
             if case.issue:
                 detail += f"; {case.issue}"
@@ -874,7 +877,7 @@ def main(args: Input) -> None:
     cases, wrong = discover(root, args.areas, args.filter)
     if not cases and not wrong:
         fail(SCRIPT, f"no case under {root} for areas {list(args.areas)} and filter {args.filter!r}")
-    work = Path(args.work or tempfile.mkdtemp(prefix="bz-cases-", dir="/tmp")).resolve()
+    work = engine.work_dir(args.work, "bz-cases-")
     work.mkdir(parents=True, exist_ok=True)
     print(f"work: {work}", flush=True)
     rep = report.Report(SCRIPT, args.engine, args.out)
@@ -895,7 +898,7 @@ def main(args: Input) -> None:
     rep.extra.update(work=str(work), dir=str(root), cases=len(cases), wrong=len(wrong),
                      areas={area: dict(counts) for area, counts in sorted(by_area.items())})
     if not args.keep:
-        shutil.rmtree(work / "store", ignore_errors=True)
+        shutil.rmtree(work / "t", ignore_errors=True)
         shutil.rmtree(work / "h", ignore_errors=True)
     rep.finish()
 

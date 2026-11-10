@@ -1,11 +1,11 @@
 """proof.py: everything that proves blaze v2 (docs/v2/plan.md), run as one, into one report.
 
-    uv run --frozen python harness/v2/proof.py '{"engine": {"kind": "v1", "blaze": "target/release/blaze"}, "out": "/tmp/proof"}'
+    uv run --frozen python harness/v2/proof.py '{"engine": {"kind": "v2", "blaze": "target/release/blaze"}, "out": "/tmp/proof"}'
     uv run --frozen python harness/v2/proof.py '{"engine": {...}, "out": "/tmp/proof",
         "checks": [{"name": "oracle", "given": {"rounds": 8}}, {"name": "budgets"}]}'
     uv run --frozen python harness/v2/proof.py selftest
 
-The checks, each a script of this directory run with the same `engine` (v1 now, v2 later):
+The checks, each a script of this directory run with the same `engine` (v2; `engine.Engine.of` refuses v1, which is gone):
 
     oracle        oracle.py: the incremental build equals one from scratch after every edit
     corpus        corpus.py: real crates built, run and tested by blaze, judged by their own tests

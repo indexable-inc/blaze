@@ -10,7 +10,7 @@ The input is one JSON object (inline, a file's path, or `-`):
 
     engine     the blaze measured (engine.EngineSpec)
     out        the result's path (report.py's JSON)
-    work       where checkouts, homes, stores and target directories go; a new directory under
+    work       where checkouts and their daemons' homes go; a new directory under
                /tmp when empty
     projects   the projects of bench.PROJECTS built, at their pinned revisions (ripgrep)
     factors    the limits, each a factor of cargo's peak (1.0, 0.5); numbers with a point
@@ -22,11 +22,11 @@ The input is one JSON object (inline, a file's path, or `-`):
 
 For each project: cargo's cold build, whose peak (memory.run: the most its processes held at
 once) sets the limits; then a cold blaze build with no limit, and what its program prints; then
-one under each factor. A blaze build is cold: an empty home, store and target directory. Each
+one under each factor. A blaze build is cold: an empty home (so an empty store and build directory). Each
 runs in a child of this script (`child`, a JSON input of its own) that drives it through
 `engine.Engine`, so the daemon it starts is the child's descendant and inside its limit. Under a
 factor the child is in a cgroup with `memory.max` of factor × cargo's peak and `memory.swap.max`
-0 (swap is not budget), and `BLAZE_MEMORY_BUDGET` says the same size. The child's own Python is
+0 (swap is not budget), and `BLAZE_DAEMON_MEMORY_GB` says the same size. The child's own Python is
 inside the limit too; the result says how much it held (`harness_mb`).
 
 A limited build passes when it finishes and its program prints what the unlimited build's does
@@ -48,7 +48,6 @@ import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
@@ -103,12 +102,11 @@ class Child:
     """The input of `child`: one cold blaze build of `ws`, its program run once it is built, the
     result written to `done`. `enter` is a `cgroup.procs` the child moves itself into first;
     `limit_bytes` the `memory.max` its cgroup has to have, with `memory.swap.max` 0 (0: no limit);
-    `env` is NAME=VALUE; `budget` is BLAZE_MEMORY_BUDGET's value, or empty for none."""
+    `env` is NAME=VALUE; `budget` is BLAZE_DAEMON_MEMORY_GB's value (GiB), or empty for none."""
 
     engine: engine.EngineSpec
     ws: str
     home: str
-    store: str
     build: tuple[str, ...]
     run: tuple[str, ...] | None
     env: tuple[str, ...]
@@ -278,9 +276,9 @@ def child(args: Child) -> None:
         name, value = item.split("=", 1)
         extra[name] = value
     if args.budget:
-        extra["BLAZE_MEMORY_BUDGET"] = args.budget
+        extra["BLAZE_DAEMON_MEMORY_GB"] = args.budget
     ws = Path(args.ws)
-    env = eng.env(Path(args.home), Path(args.store), None, extra)
+    env = eng.env(Path(args.home), None, extra)
     status: int | None = None
     said, who, error, hung = "", None, None, False
     program: engine.Ran | None = None
@@ -353,8 +351,8 @@ class Project:
 
     def attempt(self, label: str, factor: float | None) -> Attempt:
         """A cold blaze build in a child, under `factor` times cargo's peak or with no limit."""
-        for path in (self.ws / "target", self.top / "home", self.top / "store"):
-            shutil.rmtree(path, ignore_errors=True)
+        # The home holds the store and the build directory (engine.layout): without it, nothing is built.
+        shutil.rmtree(self.top / "home", ignore_errors=True)
         done_path = self.top / f"done-{label}.json"
         done_path.unlink(missing_ok=True)
         group: Path | None = None
@@ -363,7 +361,8 @@ class Project:
         limit_bytes = 0
         if factor is not None:
             mib, limit_bytes = limit_of(factor, self.cargo_peak_mb)
-            budget = f"{mib}M"
+            # What the daemon is told its limit with: a number of GiB (crates/blaze-cargo/src/serve.rs, `told_memory`).
+            budget = f"{mib / 1024:.4f}"
             if self.args.cgroup:
                 group = Path(self.args.cgroup) / unit
                 try:
@@ -374,7 +373,7 @@ class Project:
                     raise engine.Failed(f"{self.name}: making the cgroup {group} with memory.max {limit_bytes} and "
                                         f"memory.swap.max 0: {e}") from None
                 enter = str(group / "cgroup.procs")
-        spec = Child(engine=self.eng.spec, ws=str(self.ws), home=str(self.top / "home"), store=str(self.top / "store"),
+        spec = Child(engine=self.eng.spec, ws=str(self.ws), home=str(self.top / "home"),
                      build=self.build, run=self.run, env=tuple(f"{k}={v}" for k, v in self.extra.items()),
                      budget=budget, enter=enter, limit_bytes=limit_bytes, timeout_s=self.args.timeout_s,
                      done=str(done_path))
@@ -396,7 +395,7 @@ class Project:
         if factor is not None:
             self.clean(unit, group)
         elif status is None:
-            self.eng.stop(self.ws, self.eng.env(self.top / "home", self.top / "store", None, self.extra))
+            self.eng.stop(self.ws, self.eng.env(self.top / "home", None, self.extra))
         oom = max(kills or 0, (done.oom_kills or 0) if done else 0)
         same: bool | None = None
         if self.expected is not None and done is not None and done.program_status is not None:
@@ -498,7 +497,7 @@ def main(args: Input) -> None:
     except engine.Failed as e:
         fail(SCRIPT, str(e))
     rep = report.Report(SCRIPT, args.engine, args.out)
-    work = Path(args.work or tempfile.mkdtemp(prefix="bz-tight-", dir="/tmp")).resolve()
+    work = engine.work_dir(args.work, "bz-tight-")
     work.mkdir(parents=True, exist_ok=True)
     print(f"work: {work}", flush=True)
     for name in dict.fromkeys(args.projects):

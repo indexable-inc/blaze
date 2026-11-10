@@ -279,7 +279,6 @@ def build(rep: report.Report, eng: engine.Engine, name: str, ws: Path, env: dict
 def fixture_tests(rep: report.Report, eng: engine.Engine, ws: Path, env: dict[str, str]) -> None:
     """`blaze test -p corpus-calls` in `ws`: one outcome per test of the fixture crate."""
     label = f"{LABEL}/fixture"
-    kept_at = ws / "target" / "blaze" / "tests.ndjson"
     try:
         ran = eng.build(label, ws, env, ("-p", PACKAGE), command="test", timeout=TEST_SECS)
     except engine.Failed as e:
@@ -292,10 +291,9 @@ def fixture_tests(rep: report.Report, eng: engine.Engine, ws: Path, env: dict[st
         rep.add(label, "fail", f"`blaze test -p {PACKAGE}` in {ws} exited {ran.returncode}:\n{ran.said()}")
     else:
         rep.add(label, "pass", seconds=round(ran.seconds, 2))
-    import blaze_cli
-
-    kept_passes: Callable[[str], list[str]] = getattr(blaze_cli, "kept_passes")
-    kept = kept_passes(str(kept_at)) if kept_at.is_file() else []
+    # Plain `blaze test` runs every test: v2 keeps no pass without `--reached` and writes no
+    # `tests.ndjson` (docs/cargo.md, "Which tests run").
+    kept: list[str] = []
     expected = [*expected_tests({"tests": FIXTURE_TESTS.read_text()}, "tests::"), *FIXTURE_OWN]
     for judged in judge_tests(expected, ran.stdout + "\n" + ran.stderr, kept):
         rep.add(f"{LABEL}/fixture/{judged.name}", judged.verdict, judged.detail)
@@ -306,8 +304,6 @@ def run_tests(rep: report.Report, eng: engine.Engine, work: Path, target: Path, 
     env = eng.env(home, target=target, extra={"BLAZE_MACRO_CORPUS": str(config)})
     for name in UNSET:
         env.pop(name, None)
-    kept_at = target / "blaze" / "tests.ndjson"
-    kept_at.unlink(missing_ok=True)
     label = f"{LABEL}/blaze test"
     try:
         ran = eng.build(label, engine.ROOT, env, TEST_ARGS, command="test", timeout=TEST_SECS)
@@ -327,10 +323,7 @@ def run_tests(rep: report.Report, eng: engine.Engine, work: Path, target: Path, 
         rep.add(label, "fail", f"`blaze test {' '.join(TEST_ARGS)}` exited {ran.returncode}:\n{ran.said()}")
     else:
         rep.add(label, "pass", seconds=round(ran.seconds, 2))
-    import blaze_cli
-
-    kept_passes: Callable[[str], list[str]] = getattr(blaze_cli, "kept_passes")
-    kept = kept_passes(str(kept_at))
+    kept: list[str] = []
     sources = {t: (TESTS / f"{t}.rs").read_text() for t in TEST_FILES}
     for judged in judge_tests(expected_tests(sources), ran.stdout + "\n" + ran.stderr, kept):
         rep.add(f"{LABEL}/{judged.name}", judged.verdict, judged.detail)
@@ -350,21 +343,21 @@ def main(args: Input) -> None:
         eng = engine.Engine.of(args.engine)
     except engine.Failed as e:
         fail(SCRIPT, str(e))
-    work = Path(args.work or tempfile.mkdtemp(prefix="bz-macroeval-", dir="/tmp")).resolve()
+    work = engine.work_dir(args.work, "bz-macroeval-")
     work.mkdir(parents=True, exist_ok=True)
     target = Path(args.target).resolve() if args.target else work / "target"
-    cargo_home, home, store = work / "cargo-home", work / "h", work / "store"
+    cargo_home, home = work / "cargo-home", work / "h"
     rep = report.Report(SCRIPT, args.engine, args.out)
     rep.extra.update(work=str(work), target=str(target), toolchain=engine.TOOLCHAIN)
     print(f"work: {work}", flush=True)
-    build_env = eng.env(home, store, extra={"CARGO_HOME": str(cargo_home)})
+    build_env = eng.env(home, extra={"CARGO_HOME": str(cargo_home)})
     try:
         rep.extra["toolchain_identity"] = step(rep, "toolchain", lambda: engine.toolchain_identity(eng.blaze, engine.scrubbed()))
         copies = step(rep, "copy", lambda: copy(work))
         step(rep, "fetch", lambda: fetch(copies["workspace"], cargo_home, work))
         try:
             for name in COPIES:
-                build(rep, eng, name, copies[name], build_env, home / "build")
+                build(rep, eng, name, copies[name], build_env, Path(engine.layout(home).builds))
             fixture_tests(rep, eng, copies["fixture"], build_env)
         finally:
             try:
@@ -372,7 +365,7 @@ def main(args: Input) -> None:
                     eng.stop(copies["workspace"], build_env)
             except engine.Failed as e:
                 rep.add(f"{LABEL}: stopping the daemon", "error", str(e))
-        config = corpus_config(copies["workspace"], copies["scratch"], cargo_home, home / "build",
+        config = corpus_config(copies["workspace"], copies["scratch"], cargo_home, Path(engine.layout(home).builds),
                                std_dir(eng.blaze, build_env))
         rep.extra.update(config=config)
         config_at = work / "corpus.json"
