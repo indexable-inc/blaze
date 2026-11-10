@@ -1402,6 +1402,8 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
     // Tooltips come quickly (AppKit waits about a second and a half): what a step's item or a control says under the
     // pointer is part of reading the window, not a hint for the lost.
     objc2_foundation::NSUserDefaults::standardUserDefaults().setInteger_forKey(250, objc2_foundation::ns_string!("NSInitialToolTipDelay"));
+    // The world served to agents, and the edits saved from it replayed (src/world_api.rs): the window's only.
+    app.serve_world();
     // The app's sound (src/audio.rs): the window's only. A scene or a device that refuses it leaves the app silent.
     if let Err(e) = app.start_sound() {
         eprintln!("harness-native: sound: {e}");

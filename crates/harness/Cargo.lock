@@ -956,6 +956,7 @@ dependencies = [
  "png",
  "pulldown-cmark",
  "read-fonts",
+ "serde",
  "serde_json",
  "unicode-bidi",
 ]

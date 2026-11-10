@@ -41,6 +41,7 @@ mod sidebar;
 mod stats;
 pub use stats::TICK as STATS_TICK;
 mod ghostty;
+mod world;
 mod script;
 pub use keys::{MenuLine, Outcome};
 pub use sidebar::Wheel;
@@ -277,6 +278,10 @@ pub struct App {
     /// When cmd+N last asked for a new chat (the frame clock): an empty chat's lantern is struck again at it, so the
     /// key always shows, even on the chat that already is the new one.
     relit: f32,
+    /// The world api's calls waiting for the main thread (src/world_api.rs; None: not served), and how many scripts
+    /// its calls have run.
+    world_rx: Option<std::sync::mpsc::Receiver<crate::world_api::Pending>>,
+    world_scripts: u32,
     /// Remember the selected object in native.json (not for the offscreen shot).
     pub persist: bool,
     /// An offscreen shot's `HARNESS_NATIVE_SHOT_WORKING` (src/shot.rs): every session row and every run row shows at
@@ -589,6 +594,8 @@ impl App {
             pending_archive: false,
             pruned: false,
             relit: 0.0,
+            world_rx: None,
+            world_scripts: 0,
             persist: true,
             shot_working: false,
             shot_plan: Vec::new(), // alloc: empty but in a shot
@@ -1926,6 +1933,7 @@ impl App {
         self.stats_begin();
         self.reload_keys_if_changed();
         self.reload_ghostty_if_changed();
+        self.step_world();
         let z = self.zoom();
         let view = (points.0 / z, points.1 / z);
         let scale = backing * z;
