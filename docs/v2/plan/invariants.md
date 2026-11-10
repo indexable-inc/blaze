@@ -11,10 +11,19 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-10 invariants, 0 refinements, 1 reference models.
-By level: 3 tested, 7 simulated, 0 model-checked, 0 proved.
+15 invariants, 0 refinements, 1 reference models.
+By level: 8 tested, 7 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
+
+### blaze-cargo
+
+- **`every_recomputed_step_ends_in_a_terminal_reason`** *tested* (`crates/blaze-cargo/src/serve/why.rs`): every recomputed step of a build has a reason whose chain ends in a terminal reason other than `Unexplained`.
+  Controls: `a_result_part_not_followed`, `an_unchanged_part_blamed`, `ends_in_the_order_reached`.
+- **`a_chain_blames_only_inputs_that_changed`** *tested* (`crates/blaze-cargo/src/serve/why.rs`): a chain's input is one the build's inputs really changed between the two builds, and it is called trivia exactly when no code changed in it.
+  Controls: `a_result_part_not_followed`, `an_unchanged_part_blamed`, `ends_in_the_order_reached`.
+- **`the_summary_is_the_same_whatever_order_the_misses_arrive_in`** *tested* (`crates/blaze-cargo/src/serve/why.rs`): the summary is deterministic for a given pair of trees: the same reports, and the same reasons, whatever order the build's misses arrive in.
+  Controls: `a_result_part_not_followed`, `an_unchanged_part_blamed`, `ends_in_the_order_reached`.
 
 ### blaze-codegen
 
@@ -43,6 +52,13 @@ By level: 3 tested, 7 simulated, 0 model-checked, 0 proved.
 
 - **`every_call_reaches_the_code_an_edit_left`** *tested* (`crates/blaze-link/src/tests/thunks.rs`): after any splice that succeeds, every branch in the image reaches its target directly or through a thunk, and every call to code an edit replaced reaches the replacement. Drawn: whether the callers call the leaves through their slots or directly, and up to three edits, each a leaf filled again under its own key. A splice refused must be the typed one for a thunk out of reach, and the link from scratch that takes its place is held to the same oracle. Each case links 200 MiB, so there are few.
   Controls: `a_stale_direct_branch_to_replaced_code`, `a_slot_left_on_replaced_code`, `an_edit_the_image_does_not_hold`.
+
+### blaze-lower
+
+- **`the_interface_text_moves_exactly_with_what_a_dependent_observes`** *tested* (`crates/blaze-lower/src/code/tests.rs`): any edit of a file that changes what a crate checking against it can observe (a signature, an item added or removed, a constant's value, a macro's tokens, a generic, `const`, `#[inline]`, `impl Trait` or default-method body, a body that defines an item or calls an unknown macro, a `cfg`, a line moved) changes its interface text, and an edit of a comment or of a plain function's body that moves no line leaves it as it was. Drawn: up to five items of any kind, and one edit of one of them.
+  Controls: `a_generic_body_left_out`, `a_const_body_left_out`, `an_inline_body_left_out`, `a_body_a_signature_hides_a_type_of_left_out`, `a_default_methods_body_left_out`, `a_body_that_defines_an_item_left_out`, `a_body_that_calls_an_unknown_macro_left_out`, `a_shape_with_no_line_count`.
+- **`a_dependents_key_moves_only_with_what_it_observes_of_a_dependency`** *tested* (`crates/blaze-lower/src/tests.rs`): an edit that leaves a crate's interface as it was (a comment; a plain function's body that keeps its lines) leaves the key identity of every unit that only checks against it as it was, and an edit of comments alone leaves every narrowed identity as it was, in the crate and above it; any other edit (a body, for a unit that builds code; a line moved; a signature) moves the identity of every unit that can observe it.
+  Controls: `a_check_keyed_by_its_dependencies_code`, `a_program_keyed_by_its_dependencies_interfaces`.
 
 ### blaze-profile
 

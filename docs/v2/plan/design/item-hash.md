@@ -419,3 +419,48 @@ never change. A later opt-in extension may print IDs in a program's own panic te
   rename and an edit of the item, `locate` gives the current place, the program's output is
   byte-identical to a build with IDs off, and the `--events` records name the same ID after the
   move and the rename.
+
+## 15. The crate interface identity
+
+What a unit's record key holds of the crates its crate depends on: not their bytes, but what the
+unit can observe of them. Built 2026-11-10 (lane fast-driver) as far as section 12 allows; the
+rest is stated here as what remains.
+
+**What a dependent observes of a dependency, and what covers it.**
+
+| observed | by | covered by |
+|---|---|---|
+| signatures, generics and bounds, types' fields and layout attributes, visibility, re-exports, impls, attributes a check reads (`must_use`, `deprecated`) | every dependent | kept as text in the interface text |
+| exported macros' tokens | expansion in the dependent | kept as text |
+| bodies it instantiates, evaluates, inlines or types through: a type or const parameter (of the fn, its `impl`, its trait), `const`, `#[inline]`, `impl Trait`, `async`, a body that defines an item | check and codegen | kept as text (`blaze_lower::code::plain_body` refuses each) |
+| every other body | codegen only: its walk compiles or finds every instance it reaches, across crates | a unit that builds code is keyed by its dependencies' code text, deeply (`Narrowed::code`); only a unit that only checks is keyed by their interfaces (`Narrowed::checked`) |
+| cfg, features, edition, env, target, a build script's cfgs and `OUT_DIR` files | every dependent | the crate's settings (`Crate::content`) and files, in every identity |
+| what blaze's extensions prove over callee bodies (effects, contracts, `fn_info`'s code identity) | a check | a crate that names them, or depends on a workspace crate that does, takes and gives no interface |
+| a proc macro's, build script's or const macro crate's code | run by the dependent | its interface is its code |
+| comments | clippy's and blaze's lints, rustdoc, doctests; a rendered diagnostic's quoted lines | such units keep the whole key; a record with diagnostics is keyed by the files they quote (`quoted_key`) |
+| positions | see below | never left out |
+
+**Positions.** A dependent reads a dependency's positions through three things: (a) a diagnostic
+that points into it, which the dependent's record holds rendered; (b) `line!()`, `column!()`,
+`file!()` and `Location`s in code of the dependency instantiated in the dependent, which today
+are in the hashed code (section 12, "Today"); (c) span tables and debug info. None of the three
+is a side table apart from the result yet, so no position may be left out of a key. The
+interface is therefore a *text*, not a fold of item hashes: each file with what is left out (a
+comment no macro sees, a plain body) replaced by its shape, the count of its line ends and the
+bytes, characters and UTF-16 units of its last line, so every line and column after it is as
+it was. An edit that moves a line moves every identity above it. A plain `//` comment ends its
+line and moves nothing: it leaves no shape at all.
+
+**What it cuts off today.** A comment edit that moves no line: no unit's key, in the crate or
+above it. A plain body's edit that keeps its lines: no checking dependent's key. Any body edit:
+every unit that builds code above it, which then finds every function but the edited one in
+the store.
+
+**What remains**, in order: (1) sections 12 and 13 (locations and debug info as side tables),
+after which shapes can drop their line counts and a moved line is a data write; (2) the
+interface as a fold of `blaze_items::crate_hashes` (interface and layout hashes, macros by
+tokens, instantiable bodies by code hash) once (1) makes positions unobservable, which also
+cuts off formatting and line-moving body edits; (3) the per-unit steps keyed per item, so a
+unit whose key moved reruns one function's steps (docs/v2/plan.md section 7), not its walk.
+The tests: `the_interface_text_moves_exactly_with_what_a_dependent_observes`,
+`a_dependents_key_moves_only_with_what_it_observes_of_a_dependency` (docs/v2/plan/invariants.md).

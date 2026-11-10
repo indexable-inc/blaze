@@ -51,6 +51,11 @@ class Slot:
     budget_zero: bool = False
     # What the edit is to section 6.3's table, for the report.
     about: str = ""
+    # The variants an edit between which moves no token and no position (a comment at a line's
+    # end, a variable nothing reads): such an edit recomputes no step of any unit, where one
+    # that moves a line still makes again what holds positions (docs/v2/plan/design/item-hash.md
+    # section 15).
+    still: tuple[int, ...] = ()
 
 
 def v(label: str, rejects: bool = False, **values: str) -> Variant:
@@ -189,12 +194,12 @@ SLOTS: tuple[Slot, ...] = (
                                v("beta", ORACLE_SOURCE_ENV="beta")),
          about="an environment variable option_env! reads"),
     Slot("path", "env", (v("plain", PATH_EXTRA=""), v("extra directory", PATH_EXTRA="1")),
-         budget_zero=True, about="PATH with another directory in front, read by nothing (#805)"),
+         budget_zero=True, about="PATH with another directory in front, read by nothing (#805)", still=(0, 1)),
     *(Slot(f"format:{name}", "format", (v("4, one blank"), v("2, two blanks"), v("4, none, braces below")),
            budget_zero=True, about="the file laid out otherwise: indentation, blank lines, braces")
       for name in SOURCES),
     *(Slot(f"comments:{name}", "comments", (v("none"), v("a line before each item"), v("one after each line")),
-           budget_zero=True, about="comments added or taken away; the first kind moves every line")
+           budget_zero=True, about="comments added or taken away; the first kind moves every line", still=(0, 2))
       for name in SOURCES),
 )
 BY_NAME = {slot.name: slot for slot in SLOTS}
@@ -851,6 +856,10 @@ class Edit:
     def label(self) -> str:
         slot = BY_NAME[self.slot]
         return f"{self.kind} {self.slot}: {slot.variants[self.old].label} -> {slot.variants[self.new].label}"
+
+    def still(self) -> bool:
+        """Whether the edit moves no token and no position (`Slot.still`)."""
+        return {self.old, self.new} <= set(BY_NAME[self.slot].still)
 
 
 # How often each kind of edit is drawn. A kind of rejecting edits is drawn rarely; its next
