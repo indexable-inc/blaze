@@ -42,8 +42,13 @@
 //! glob of another crate, `#[macro_use] extern crate`): they are inert only where no file of the
 //! crate could shadow them ([`CodeText::shadows`]).
 //!
-//! Files of a library source root (the standard library, registry crates) keep their whole
-//! text: they rarely change, and their outlines would have to be parsed in full.
+//! Files of a library source root are parsed as outlines, and a code text needs each parsed
+//! in full. The standard library's keep their whole text: it is the toolchain's. A registry,
+//! git or other library crate has its narrowed identity worked out from a full parse of each
+//! of its files, made here and dropped ([`library_narrow`]), once per content of the crate:
+//! the driver keeps it in the store under [`library_key`] and reads it back, so only a crate
+//! whose files changed is parsed, and one whose comments alone changed gives the identity it
+//! had, to itself and to everything above it ([`crate::Lowered::library_narrows`]).
 //!
 //! # The interface text
 //!
@@ -444,17 +449,144 @@ pub(crate) fn own_narrow(db: &Db, krate: Crate) -> OwnNarrow {
     let data = krate.data(db);
     let root_file = data.root_file_id;
     let root = db.source_root(db.file_source_root(root_file).source_root_id(db));
-    let set = root.source_root_ref(db);
-    let whole = OwnNarrow { code: None, interface: None, extends: false, reaches: false };
-    if set.is_library {
-        return whole;
+    if root.source_root_ref(db).is_library {
+        return OwnNarrow::WHOLE;
     }
-    let text_of =
-        |file: base_db::FileId| code_text(db, EditionedFileId::new(db, file, data.edition));
+    narrow_from(
+        db,
+        krate,
+        |file| code_text(db, EditionedFileId::new(db, file, data.edition)),
+        || reads_root_alone(db, EditionedFileId::new(db, root_file, data.edition)),
+    )
+}
+
+/// Whether `krate` is a library source root's crate that is narrowed through the store
+/// ([`library_narrow`], [`library_key`]): any but the standard library's.
+pub(crate) fn library_narrowed(db: &Db, krate: Crate) -> bool {
+    let data = krate.data(db);
+    let root = db.source_root(db.file_source_root(data.root_file_id).source_root_id(db));
+    root.source_root_ref(db).is_library && !data.origin.is_lang()
+}
+
+/// [`OwnNarrow`] of `krate`, a library source root's crate ([`library_narrowed`]): as
+/// [`own_narrow`], of every file of its source root (its identity holds them all), each Rust
+/// file parsed in full for this alone ([`whole_code_text`]). What the driver keeps under
+/// [`library_key`]: asked only where the store has none.
+#[blaze_query::tracked(returns(copy))]
+pub(crate) fn library_narrow(db: &Db, krate: Crate) -> OwnNarrow {
+    let edition = krate.data(db).edition;
+    narrow_from(
+        db,
+        krate,
+        |file| whole_code_text(db, EditionedFileId::new(db, file, edition)),
+        || false,
+    )
+}
+
+const LIBRARY_KEY: &str = "blaze v2 library crate narrow 1";
+
+/// What [`library_narrow`] of `krate` is kept under: everything it is a function of. The code
+/// that makes it (`front_end`, the front end's code identity, which this crate and the
+/// parser are of) and the domains of the texts it holds; the crate's settings (its edition
+/// among them), its root's text and its source root's content (every file's path and bytes),
+/// as its whole identity has them ([`crate::Lowered::identity`]). Not the crates it depends
+/// on: its own narrowed identity reads none of them.
+pub(crate) fn library_key(db: &Db, krate: Crate, front_end: &ContentId) -> ContentId {
+    let data = krate.data(db);
+    let root = db.file_source_root(data.root_file_id).source_root_id(db);
+    let mut hasher = Hasher::new(LIBRARY_KEY);
+    hasher.id(front_end);
+    for domain in [CODE_TEXT, INTERFACE_TEXT, OWN_NARROW] {
+        hasher.part(domain.as_bytes());
+    }
+    hasher
+        .id(&krate.content(db))
+        .id(&db.file_text(data.root_file_id).content(db))
+        .id(&db.source_root(root).content(db));
+    hasher.finish()
+}
+
+impl OwnNarrow {
+    /// A crate that keeps its whole text.
+    const WHOLE: OwnNarrow =
+        OwnNarrow { code: None, interface: None, extends: false, reaches: false };
+
+    /// How many bytes [`OwnNarrow::kept`] is.
+    pub(crate) const KEPT: usize = 4 + 1 + 32 + 32;
+    const MAGIC: &[u8; 4] = b"BZN1";
+
+    /// It as the store keeps it: [`Self::MAGIC`], a byte of flags (1: it has a code text, 2:
+    /// an interface, 4: `extends`, 8: `reaches`), then the code text's hash and the
+    /// interface's, zeros for one it lacks.
+    pub(crate) fn kept(&self) -> [u8; Self::KEPT] {
+        let mut out = [0; Self::KEPT];
+        out[..4].copy_from_slice(Self::MAGIC);
+        out[4] = u8::from(self.code.is_some())
+            | u8::from(self.interface.is_some()) << 1
+            | u8::from(self.extends) << 2
+            | u8::from(self.reaches) << 3;
+        if let Some(code) = &self.code {
+            out[5..37].copy_from_slice(&code.0);
+        }
+        if let Some(interface) = &self.interface {
+            out[37..69].copy_from_slice(&interface.0);
+        }
+        out
+    }
+
+    /// What [`OwnNarrow::kept`] wrote as `bytes`: an error saying what is wrong with bytes it
+    /// did not write, each of which is one value's alone (a flag unknown, a hash where the
+    /// flags say none).
+    pub(crate) fn restored(bytes: &[u8]) -> Result<OwnNarrow, String> {
+        let Ok(bytes) = <&[u8; Self::KEPT]>::try_from(bytes) else {
+            // alloc: error path
+            return Err(format!("{} bytes, where one is {}", bytes.len(), Self::KEPT));
+        };
+        if &bytes[..4] != Self::MAGIC {
+            return Err("it does not start as one does".to_owned()); // alloc: error path
+        }
+        let flags = bytes[4];
+        if flags >> 4 != 0 {
+            return Err(format!("flags {flags:#x}, of which it knows the low four")); // alloc: error path
+        }
+        let hash = |at: usize, has: bool| -> Result<Option<ContentId>, String> {
+            let mut id = [0; 32];
+            id.copy_from_slice(&bytes[at..at + 32]);
+            match (has, id == [0; 32]) {
+                (true, _) => Ok(Some(ContentId(id))),
+                (false, true) => Ok(None),
+                // alloc: error path
+                (false, false) => Err("a hash where its flags say it has none".to_owned()),
+            }
+        };
+        Ok(OwnNarrow {
+            code: hash(5, flags & 1 != 0)?,
+            interface: hash(37, flags & 2 != 0)?,
+            extends: flags & 4 != 0,
+            reaches: flags & 8 != 0,
+        })
+    }
+}
+
+/// [`OwnNarrow`] of `krate` from `text_of`, each of its files' code text: the files
+/// [`crate::Lowered::identity`] holds of it (its root alone when `alone` says it reads no
+/// other, else every file of its source root by path), each Rust file as its code text or its
+/// interface text, any other by its bytes.
+fn narrow_from(
+    db: &Db,
+    krate: Crate,
+    text_of: impl Fn(base_db::FileId) -> Option<CodeText>,
+    alone: impl FnOnce() -> bool,
+) -> OwnNarrow {
+    let data = krate.data(db);
+    let root_file = data.root_file_id;
+    let root = db.source_root(db.file_source_root(root_file).source_root_id(db));
+    let set = root.source_root_ref(db);
+    let whole = OwnNarrow::WHOLE;
     // Its root by itself: an alias's (a test's, with its harness appended) is not among its
     // source root's files.
     let Some(root_text) = text_of(root_file) else { return whole };
-    let alone = reads_root_alone(db, EditionedFileId::new(db, root_file, data.edition));
+    let alone = alone();
     // alloc: once per workspace crate keyed in a revision, a file of its source root each
     let mut files: Vec<(&str, base_db::FileId, Option<CodeText>)> = Vec::new();
     if !alone {
@@ -524,6 +656,22 @@ pub(crate) fn observed(db: &Db, krate: Crate, file: base_db::FileId) -> Option<C
     code_text(db, EditionedFileId::new(db, file, edition))
         .filter(|code| !code.whole)
         .map(|code| code.strict)
+}
+
+/// [`code_text`] of a library source root's `file`, whose parse the database keeps as an
+/// outline: from a full parse made here and dropped, so the database holds no tree for it.
+#[blaze_query::tracked(returns(copy))]
+fn whole_code_text(db: &Db, file: EditionedFileId) -> Option<CodeText> {
+    let (id, edition) = file.unpack(db);
+    if !db.has_file_text(id) {
+        // Its bytes, read so that it getting text again reruns this.
+        _ = db.file_content(id);
+        return None;
+    }
+    let text = db.file_text(id);
+    let text: &str = &**text.text(db);
+    let parse = syntax::SourceFile::parse(text, edition);
+    Some(code_text_of(parse.tree().syntax(), text))
 }
 
 /// [`code_text_of`] of `file`'s parse; none for a file with no text (bytes that are not

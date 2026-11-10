@@ -397,7 +397,7 @@ impl Steps for Real {
                         return Err(Failed::Again);
                     }
                     if waits.ready(unit) {
-                        identify(&mut lowered, &job, unit);
+                        identify(&mut lowered, &job, unit)?;
                     }
                 }
                 // Kept or fresh alike: the session's keys say which crates' keys moved, and a kept
@@ -953,7 +953,7 @@ impl Writer<Real> for UnitWriter {
             }
         }
         for &unit in &self.ready {
-            identify(lowered, job, unit);
+            identify(lowered, job, unit)?;
         }
         // The units these runs made ready and those a loaded proc macro reaches are served, in a
         // kept front end as in a fresh one: a run applied again with other cfgs, env or
@@ -1150,15 +1150,38 @@ impl<T> Drop for Held<T> {
 
 /// Unit `unit`'s identity set from the front end, once every run of its closure is applied:
 /// from then on nothing changes what its crate is made from.
-fn identify(lowered: &mut Lowered, job: &Job, unit: u32) {
+///
+/// The library crates of its closure (a registry's, a git's) are given their own narrowed
+/// identities first ([`Lowered::library_narrows`]), each read from the store under its key, or
+/// worked out by parsing that crate where the store has none and left in
+/// [`Job::library_narrows`] to be kept. A read of the store that fails, or bytes there that are
+/// no narrowed identity, is the error (rule 3).
+fn identify(lowered: &mut Lowered, job: &Job, unit: u32) -> Result<(), ApiError> {
     // The narrowed identities first: a reader that finds the identity set finds them set.
     if let Some(slot) = job.narrowed.get(unit as usize) {
         let _span = tracing::info_span!(target: "blaze", "unit narrowed identity", unit).entered();
+        let front_end = deps::front_end()?;
+        let guard = blaze_cas::enter();
+        let kept = |key: &ContentId| match job.input.store.get(&guard, &blaze_cas::Key(*key)) {
+            // alloc: a narrowed identity's few bytes, once per library crate per front end
+            Ok(found) => Ok(found.map(|entry| entry.bytes.to_vec())),
+            Err(corrupt) => Err(corrupt.to_string()), // alloc: error path
+        };
+        lowered.library_narrows(unit as usize, &front_end, kept).map_err(lower_error)?;
+        let made = lowered.take_library_narrows();
+        if !made.is_empty() {
+            job.library_narrows.lock().extend(made.into_iter().map(|(key, bytes)| Put {
+                key: blaze_cas::Key(key),
+                kind: blaze_cas::Kind::Query,
+                bytes,
+            }));
+        }
         let _ = slot.set(lowered.narrowed(unit as usize));
     }
     if let Some(slot) = job.identities.get(unit as usize) {
         let _ = slot.set(lowered.identity(unit as usize));
     }
+    Ok(())
 }
 
 /// Every file under the library's `dir`, by its path from there. A link is its target's bytes:
@@ -1279,6 +1302,10 @@ pub(crate) struct Job {
     /// ([`blaze_lower::Lowered::narrowed`]), set by the writer with its identity: none for a
     /// crate that keeps its whole text.
     pub(crate) narrowed: Box<[OnceLock<Option<blaze_lower::Narrowed>>]>,
+    /// The narrowed identities of library crates the writer worked out, the store having none
+    /// ([`identify`]), as puts: taken by the next unit that gives the loop its puts
+    /// ([`compile::library_puts`]), so a later front end reads them and parses no such crate.
+    pub(crate) library_narrows: Lock<Vec<Put>>,
     /// What each build script's run told cargo, by its run unit. Each slot is written once,
     /// when the run ends, and read with no lock by every unit after it.
     pub(crate) scripts: Box<[OnceLock<script::Applied>]>,
@@ -1371,6 +1398,7 @@ impl Job {
             graph,
             identities: (0..slots).map(|_| Default::default()).collect(),
             narrowed: (0..slots).map(|_| Default::default()).collect(),
+            library_narrows: Lock::new("serve.unit.library_narrows", Vec::new()), // alloc: none
             scripts: (0..slots).map(|_| Default::default()).collect(),
             made: (0..slots).map(|_| Default::default()).collect(),
             phases: (0..slots)

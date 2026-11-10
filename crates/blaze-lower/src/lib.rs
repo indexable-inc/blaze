@@ -200,6 +200,12 @@ pub struct Lowered {
     /// Each crate's narrowed identities worked out since the last write
     /// ([`Lowered::narrowed`]).
     narrowed: blaze_hash::HashMap<Crate, Narrow, Global>,
+    /// Each library crate's own narrowed identity ([`Lowered::library_narrows`]) with the key
+    /// it is kept under: one whose key is as it was is neither read nor worked out again.
+    library: blaze_hash::HashMap<Crate, (ContentId, code::OwnNarrow), Global>,
+    /// The narrowed identities [`Lowered::library_narrows`] worked out, the store having none,
+    /// each with its key, for the driver to keep ([`Lowered::take_library_narrows`]).
+    library_made: Vec<(ContentId, Vec<u8>)>,
     /// How cargo passes each crate's root, which the build's naming of files reads and each
     /// crate's identity covers.
     spellings: std::sync::Arc<Spellings>,
@@ -325,6 +331,8 @@ pub fn lower_into<T: blaze_query::Tree>(
         paths: std::sync::Arc::new(paths),
         identities: blaze_hash::HashMap::new_in(Global),
         narrowed: blaze_hash::HashMap::new_in(Global),
+        library: blaze_hash::HashMap::new_in(Global),
+        library_made: Vec::new(), // alloc: none
         spellings,
         appended: blaze_hash::HashMap::new_in(Global),
         loads,
@@ -1045,10 +1053,79 @@ impl Lowered {
             krate,
             &self.spellings,
             &self.identities,
+            &self.library,
             &self.const_macros,
             &mut self.narrowed,
         );
         narrow.own.then_some(Narrowed { code: narrow.code, checked: narrow.checked })
+    }
+
+    /// Gives each library crate of unit `unit`'s closure (a registry's, a git's, any library
+    /// source root's but the standard library's) its own narrowed identity, before
+    /// [`Lowered::narrowed`] is asked of the unit: without it such a crate is its bytes to
+    /// every key. `kept` reads the store: the bytes under a key ([`code::library_key`], of
+    /// the crate's files, its settings and `front_end`, the front end's code identity), or
+    /// none. A crate the store has none of is parsed in full, once
+    /// ([`code::library_narrow`]), and what that gave is left for the driver to keep
+    /// ([`Lowered::take_library_narrows`]); a crate whose key is the one it was last given
+    /// under is neither read nor parsed. So an edit of a comment in such a crate moves its
+    /// key, misses once, parses that crate, and gives the identity it had: no key above it
+    /// moves.
+    ///
+    /// Bytes under a key that do not read as a narrowed identity are an error naming the
+    /// crate and the key, never worked out again in their place (rule 3).
+    pub fn library_narrows(
+        &mut self,
+        unit: usize,
+        front_end: &ContentId,
+        mut kept: impl FnMut(&ContentId) -> Result<Option<Vec<u8>>, String>,
+    ) -> Result<(), LowerError> {
+        let Some(krate) = self.crates.krate(unit) else { return Ok(()) };
+        let db = &self.db;
+        // alloc: once per unit identified, a crate of its closure each
+        let mut seen: blaze_hash::HashMap<Crate, (), Global> = blaze_hash::HashMap::new_in(Global);
+        let mut stack = vec![krate]; // alloc: as above
+        while let Some(at) = stack.pop() {
+            // A crate narrowed since the last write had its closure given already.
+            if self.narrowed.contains_key(&at) || seen.insert(at, ()).is_some() {
+                continue;
+            }
+            stack.extend(at.data(db).dependencies.iter().map(|it| it.crate_id));
+            if !code::library_narrowed(db, at) {
+                continue;
+            }
+            let key = code::library_key(db, at, front_end);
+            if self.library.get(&at).is_some_and(|(under, _)| *under == key) {
+                continue;
+            }
+            let failed = |why: String| {
+                // alloc: error path
+                LowerError::at(
+                    format!(
+                        "the narrowed identity of the crate {}, kept under {key:x} in the store: {why}",
+                        at.named(db)
+                    ),
+                    format!("{}", at.named(db)),
+                )
+            };
+            let own = match kept(&key).map_err(|why| failed(format!("reading it: {why}")))? {
+                Some(bytes) => code::OwnNarrow::restored(&bytes).map_err(failed)?,
+                None => {
+                    let own = code::library_narrow(db, at);
+                    // alloc: once per library crate the store has no narrowed identity of
+                    self.library_made.push((key, own.kept().to_vec()));
+                    own
+                }
+            };
+            self.library.insert(at, (key, own));
+        }
+        Ok(())
+    }
+
+    /// The narrowed identities [`Lowered::library_narrows`] worked out since the last take,
+    /// each with the key to keep it under.
+    pub fn take_library_narrows(&mut self) -> Vec<(ContentId, Vec<u8>)> {
+        std::mem::take(&mut self.library_made)
     }
 
     /// What unit `unit`'s identity ([`Lowered::identity`]) is made of, one part each, for
@@ -1659,12 +1736,14 @@ const NARROW_CHECKED: &str = "blaze v2 cargo unit narrow checked 1";
 
 /// [`Lowered::narrowed`] of `krate`, each crate of its closure worked out once into `known`,
 /// dependencies first, with a stack of its own; `whole` holds the whole identity
-/// ([`identity_of`]) of every crate of the closure.
+/// ([`identity_of`]) of every crate of the closure, and `given` the own narrowed identity
+/// of each library crate given one.
 fn narrow_of(
     db: &Db,
     krate: Crate,
     spellings: &Spellings,
     whole: &blaze_hash::HashMap<Crate, ContentId, Global>,
+    given: &blaze_hash::HashMap<Crate, (ContentId, code::OwnNarrow), Global>,
     const_macros: &[const_macros::Loaded],
     known: &mut blaze_hash::HashMap<Crate, Narrow, Global>,
 ) -> Narrow {
@@ -1687,7 +1766,13 @@ fn narrow_of(
             );
             continue;
         }
-        let own = code::own_narrow(db, at);
+        // A library crate's own, as the store or a full parse gave it
+        // ([`Lowered::library_narrows`]); one not given is its whole text, as the standard
+        // library's always is.
+        let own = match given.get(&at) {
+            Some((_, own)) => *own,
+            None => code::own_narrow(db, at),
+        };
         let extends = own.extends || data.dependencies.iter().any(|it| known[&it.crate_id].extends);
         let Some(own_code) = own.code else {
             // A crate that keeps its whole text is its whole identity to everything.

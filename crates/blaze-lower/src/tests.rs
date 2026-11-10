@@ -2486,3 +2486,147 @@ fn a_rust_file_read_as_bytes_keeps_its_crates_whole_text() {
     assert_ne!(bin.code, bin_now.code);
     assert_ne!(bin.checked, bin_now.checked);
 }
+
+/// The front end's code identity a test keeps library crates' narrowed identities under.
+const FRONT_END: ContentId = ContentId([7; 32]);
+
+/// [`units`] with the lib's package a registry's: its source root is a library's.
+fn units_with_a_registry_lib() -> Units {
+    let mut units = units();
+    for package in &mut units.packages {
+        if package.name == "a" {
+            package.is_member = false;
+            package.source = Some("registry+https://index.example/".to_owned());
+        }
+    }
+    units
+}
+
+/// What a store holds of library crates' narrowed identities, by key.
+type KeptNarrows = Vec<(ContentId, Vec<u8>)>;
+
+/// The lib, a registry crate with its root as `lib`, and the bin above it, lowered from
+/// nothing and given their library crates' narrowed identities from `store`, which is given
+/// what the store lacked: the lib's whole identity, its narrowed identity and the bin's, and
+/// how many crates were parsed for want of a kept identity.
+fn library_over(
+    lib: &'static [u8],
+    store: &mut KeptNarrows,
+) -> (ContentId, Option<super::Narrowed>, super::Narrowed, usize) {
+    let tree = MemTree::default();
+    let root = changed(&tree, &[("a/src/lib.rs", Some(lib))]);
+    let config = config(root, library(&tree));
+    let units = units_with_a_registry_lib();
+    let mut front =
+        lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None })
+            .unwrap();
+    for unit in [LIB, BIN] {
+        let kept = |key: &ContentId| {
+            Ok(store.iter().find(|it| it.0 == *key).map(|it| it.1.clone()))
+        };
+        front.library_narrows(unit, &FRONT_END, kept).unwrap();
+    }
+    let made = front.take_library_narrows();
+    let parsed = made.len();
+    store.extend(made);
+    let whole = front.identity(LIB).expect("the lib's identity");
+    let bin = front.narrowed(BIN).expect("the bin, a workspace crate, has a narrowed identity");
+    (whole, front.narrowed(LIB), bin, parsed)
+}
+
+/// A registry crate is its bytes to every key until it is given a narrowed identity; given
+/// one, a comment in it moves its whole identity and its key in the store, so it is parsed
+/// once, and the narrowed identity that parse gives is the one it had: its own record's key
+/// and the key of everything above it stay. An edit of its code moves them.
+#[test]
+fn a_comment_in_a_registry_crate_moves_no_key_once_it_is_parsed() {
+    // Not given one: no narrowed identity of its own, as before.
+    let mut front = {
+        let tree = MemTree::default();
+        let root = changed(&tree, &[("a/src/lib.rs", Some(LIB_PLAIN))]);
+        let config = config(root, library(&tree));
+        let units = units_with_a_registry_lib();
+        lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None }).unwrap()
+    };
+    assert!(root_of(front.db(), front.krate(LIB).unwrap()).is_library);
+    assert_eq!(front.narrowed(LIB), None);
+
+    let mut store = KeptNarrows::new();
+    let (whole, lib, bin, parsed) = library_over(LIB_PLAIN, &mut store);
+    assert_eq!(parsed, 1, "the store had none: the lib is parsed, the standard library never");
+    assert!(lib.is_some(), "a registry crate given a narrowed identity has one");
+    let (whole_now, lib_now, bin_now, parsed) = library_over(LIB_COMMENTED, &mut store);
+    assert_ne!(whole, whole_now, "its bytes moved");
+    assert_eq!(parsed, 1, "so its key in the store did, and it is parsed once");
+    assert_eq!((lib, bin), (lib_now, bin_now), "and nothing a key holds of it moved");
+    let (_, lib_body, bin_body, parsed) = library_over(LIB_BODY, &mut store);
+    assert_eq!(parsed, 1);
+    assert_ne!(lib.map(|it| it.code), lib_body.map(|it| it.code));
+    assert_ne!(bin.code, bin_body.code, "the program builds the lib's code");
+    assert_eq!(bin.checked, bin_body.checked, "a check of the bin reads the lib's interface");
+}
+
+/// What the store keeps of a library crate's narrowed identity restores to what a fresh
+/// parse works out, byte for byte: a front end given the kept bytes parses nothing and
+/// gives the very identities the one that parsed gave. Bytes that are no narrowed identity
+/// are refused, naming the crate, never parsed over.
+#[test]
+fn a_kept_narrowed_identity_restores_to_the_one_a_parse_gives() {
+    let mut store = KeptNarrows::new();
+    let fresh = library_over(LIB_COMMENTED, &mut store);
+    assert_eq!(fresh.3, 1);
+    let kept = store.clone();
+    let restored = library_over(LIB_COMMENTED, &mut store);
+    assert_eq!(restored.3, 0, "the store has it: nothing is parsed");
+    assert_eq!(store, kept, "and nothing more is kept");
+    assert_eq!((fresh.0, fresh.1, fresh.2), (restored.0, restored.1, restored.2));
+    // Worked out again from nothing, the bytes kept are the same bytes.
+    let mut again = KeptNarrows::new();
+    library_over(LIB_COMMENTED, &mut again);
+    assert_eq!(again, kept);
+    for (_, bytes) in &kept {
+        let own = crate::code::OwnNarrow::restored(bytes).expect("what was kept restores");
+        assert_eq!(own.kept().as_slice(), bytes.as_slice());
+    }
+
+    // A value cut short, and one with a flag no narrowed identity has.
+    for spoil in [|bytes: &mut Vec<u8>| bytes.truncate(8), |bytes: &mut Vec<u8>| bytes[4] |= 0x80] {
+        let mut spoiled = kept.clone();
+        spoil(&mut spoiled[0].1);
+        let tree = MemTree::default();
+        let root = changed(&tree, &[("a/src/lib.rs", Some(LIB_COMMENTED))]);
+        let config = config(root, library(&tree));
+        let units = units_with_a_registry_lib();
+        let mut front =
+            lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None })
+                .unwrap();
+        let read = |key: &ContentId| {
+            Ok(spoiled.iter().find(|it| it.0 == *key).map(|it| it.1.clone()))
+        };
+        let refused = front.library_narrows(LIB, &FRONT_END, read).expect_err("spoiled bytes");
+        assert!(refused.what.contains("the narrowed identity of the crate"), "{}", refused.what);
+        assert!(front.take_library_narrows().is_empty(), "nothing is worked out in their place");
+    }
+}
+
+/// A narrowed identity is kept under everything it is made from: the front end's code
+/// identity among it, so one made by other code is never read.
+#[test]
+fn a_kept_narrowed_identity_is_under_the_front_ends_code() {
+    let mut store = KeptNarrows::new();
+    library_over(LIB_PLAIN, &mut store);
+    let tree = MemTree::default();
+    let root = changed(&tree, &[("a/src/lib.rs", Some(LIB_PLAIN))]);
+    let config = config(root, library(&tree));
+    let units = units_with_a_registry_lib();
+    let mut front =
+        lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None })
+            .unwrap();
+    let other = ContentId([8; 32]);
+    let kept = |key: &ContentId| Ok(store.iter().find(|it| it.0 == *key).map(|it| it.1.clone()));
+    front.library_narrows(LIB, &other, kept).unwrap();
+    let made = front.take_library_narrows();
+    assert_eq!(made.len(), 1, "another front end's code: another key, so it parses");
+    assert_ne!(made[0].0, store[0].0);
+    assert_eq!(made[0].1, store[0].1, "the same code text, as this test's two are one code");
+}

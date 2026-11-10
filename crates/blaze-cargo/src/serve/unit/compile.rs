@@ -1043,6 +1043,13 @@ pub(crate) fn fresh(job: &Job, unit: usize) -> bool {
     })
 }
 
+/// The narrowed identities of library crates the writer worked out and no unit gave the loop
+/// yet ([`Job::library_narrows`]): each put once, by the first unit replayed or stored after
+/// it was made.
+fn library_puts(job: &Job) -> Vec<Put> {
+    std::mem::take(&mut *job.library_narrows.lock())
+}
+
 /// The store a record is read from, named for an error: the daemon's, or with `std` the shared
 /// std store.
 fn store_named(job: &Job, std: bool) -> String {
@@ -1528,7 +1535,8 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Re
         let miss = missed(job, reader, unit);
         lock(slot).misses.push(miss);
     }
-    if let Some(Kept { record, puts, profiles }) = kept {
+    if let Some(Kept { record, mut puts, profiles }) = kept {
+        puts.extend(library_puts(job));
         // What its build did with its profiles, as the record says: counted for this job's
         // check that a profile applied to something ([`codegen::unapplied`]).
         if let Some(slot) = job.counted.get(unit) {
@@ -2059,6 +2067,7 @@ fn store(
         records,
         quoted,
     } = *making;
+    puts.extend(library_puts(job));
     // Under the narrow key when it holds no diagnostics; with diagnostics, all of them the
     // check's, under the narrow key and what they quote ([`quoted_key`]), their files' names
     // put in the slot a lookup reads; else under the whole one.
