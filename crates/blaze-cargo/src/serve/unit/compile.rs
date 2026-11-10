@@ -1871,17 +1871,17 @@ impl Written {
     /// the end of no long chain of patches), the patch ([`Written::Derived`]), and `whole` is
     /// not called; else the whole file `whole` gives ([`Written::Linked`]): an image's first
     /// link or one from scratch (a full patch), a base the store never had or let go of.
-    /// Having no base is not an error, and why is logged.
+    /// Having no base is not an error, and why is logged; `whole`'s error is the answer's.
     ///
     /// Give no patch for a file the daemon reads back by its bytes (a proc macro's wasm
     /// module, [`Module::bytes`]): what the store keeps of a patch is the recipe, and only a
     /// place gives the file.
-    pub(crate) fn linked(
+    pub(crate) fn linked<E>(
         store: &blaze_cas::Reader,
         root: [u8; 32],
         patch: Option<blaze_link::Patch>,
-        whole: impl FnOnce() -> Vec<u8>,
-    ) -> Written {
+        whole: impl FnOnce() -> Result<Vec<u8>, E>,
+    ) -> Result<Written, E> {
         let derived = patch.filter(|it| !it.full && it.digest == root).and_then(|patch| {
             let base = patch.base?;
             let key = linked_key(&base);
@@ -1901,8 +1901,8 @@ impl Written {
             }
         });
         match derived {
-            Some(derived) => derived,
-            None => Written::Linked(whole(), root),
+            Some(derived) => Ok(derived),
+            None => Ok(Written::Linked(whole()?, root)),
         }
     }
 }
@@ -3398,14 +3398,10 @@ fn assemble(
                         }
                         // alloc: once per image linked, a unit links one or two
                         links.push((path.to_owned(), linked.how));
-                        // The link hands over the whole file and no patch yet
-                        // (`codegen::LinkMade`): with the patch it took the link as, and the
-                        // bytes made only when asked, an edit's image is derived in the store.
-                        files.push((
-                            path.to_owned(),
-                            Written::linked(&job.input.store, linked.root, None, || linked.bytes),
-                            true,
-                        ));
+                        // What the link settled the store is given: the patch the image took
+                        // the link as, where the store derives the file from the one before
+                        // it, else the whole file (`codegen::LinkMade::written`).
+                        files.push((path.to_owned(), linked.written, true));
                     }
                     Err(failed) => {
                         // alloc: error path

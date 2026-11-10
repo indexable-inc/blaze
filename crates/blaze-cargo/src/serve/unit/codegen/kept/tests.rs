@@ -13,7 +13,7 @@ use blaze_items::{CodeHash, ItemKey};
 use hegel::generators as gs;
 use hir_ty_codegen::v2::{InputsWork, LinkInputs, Table, span_table_id};
 
-use super::{Rows, Spans, Work};
+use super::{Listed, Rows, Spans, Work};
 use crate::serve::unit::codegen::{filled_id, static_row};
 
 /// A program: functions by slot, each with how many times its body was edited (its key says
@@ -507,4 +507,33 @@ fn a_body_edit_among_many_hashes_the_edit() {
         costs.push((work.rows, work.row_bytes));
     }
     assert_eq!(costs[0], costs[1], "the same rows and code hashed among 100 as among 10,000");
+}
+
+/// A search of one of a build's lists never takes a list out of key order for one that lacks
+/// the key ([`Listed`]'s precondition, checked). The list here holds the key searched for where no
+/// binary search looks (first, above every entry after it), as a build without debug
+/// assertions would be given it: the search is an error naming the list and the key. The
+/// control is the same list in order, where the same search finds the entry, and a key in
+/// neither, which is `None`.
+#[test]
+fn a_search_of_a_list_out_of_key_order_is_an_error_naming_the_list_and_the_key() {
+    let wanted = key(9, 0);
+    let unsorted = [wanted, key(1, 0), key(2, 0), key(3, 0), key(4, 0)];
+    assert!(!unsorted.is_sorted());
+    let listed = Listed::unasserted(&unsorted[..], "cold", |it: &InstanceKey| *it);
+    let refused = listed.find(&wanted).unwrap_err();
+    assert!(refused.contains("`cold` is not in key order"), "{refused}");
+    assert!(refused.contains(&format!("{wanted:?}")), "{refused}");
+    // Refused each time, and so is the entry a caller knows is there.
+    assert_eq!(listed.need(&wanted).unwrap_err(), refused);
+
+    let mut sorted = unsorted;
+    sorted.sort_unstable();
+    let listed = Listed::new(&sorted[..], "cold", |it: &InstanceKey| *it);
+    assert_eq!(listed.find(&wanted), Ok(Some(&sorted[4])));
+    let absent = key(7, 0);
+    assert_eq!(listed.find(&absent), Ok(None));
+    let refused = listed.need(&absent).unwrap_err();
+    assert!(refused.contains("`cold` has no entry of"), "{refused}");
+    assert!(refused.contains(&format!("{absent:?}")), "{refused}");
 }
