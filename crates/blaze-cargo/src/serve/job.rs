@@ -3382,7 +3382,7 @@ impl<S: Steps> Jobs<S> {
             }
             self.roots.answers[at as usize] = None;
             if asked {
-                self.record(id, at, key);
+                self.record_answer(id, at, key);
             }
         }
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
@@ -3477,7 +3477,7 @@ impl<S: Steps> Jobs<S> {
     /// directory its outputs are in is named canonically, as the watches are asked. The
     /// watches' generation and the count of looks at the disk are read here, before the job
     /// looks at anything.
-    fn record(&mut self, id: JobId, root: u32, key: ContentId) {
+    fn record_answer(&mut self, id: JobId, root: u32, key: ContentId) {
         let Some(Some(last)) = self.roots.plans.get(root as usize) else { return };
         if last.key != key || last.lock.is_some() {
             return;
