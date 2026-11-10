@@ -152,6 +152,18 @@ fn sent_client_rows(err: &mut impl Write, color: bool) {
     _ = err.write_all(said.as_bytes());
 }
 
+/// This process's time counted from now ([`blaze_profile::began`]): what the program calls
+/// first, before the work that comes before [`main`] (finding the workspace's pin).
+pub fn began() {
+    blaze_profile::began();
+}
+
+/// The flight recorder installed ([`blaze_profile::install`]), for the spans of the work
+/// before [`main`], which installs it again to no effect. It starts no thread.
+pub fn record() {
+    blaze_profile::install();
+}
+
 /// The `blaze` program, and `cargo-blaze`, which cargo runs for `cargo blaze` as
 /// `cargo-blaze blaze <command> ...`.
 pub fn main(args: impl Iterator<Item = OsString>) -> ExitCode {
@@ -255,7 +267,11 @@ fn auto_color() -> bool {
 
 /// One command line, run: its exit code.
 pub fn command(words: Vec<OsString>) -> i32 {
-    let asked = match args::parse(words) {
+    let parsing =
+        tracing::info_span!(target: "blaze", "client: parse the command line").entered();
+    let parsed = args::parse(words);
+    drop(parsing);
+    let asked = match parsed {
         Ok(asked) => asked,
         Err(usage) => {
             eprint!("{}", args::refusal(&usage, auto_color()));
@@ -488,12 +504,24 @@ fn cargo(asked: &Invocation) -> i32 {
     if let Some(what) = args::refused(asked) {
         return refused(&what, color);
     }
-    let (place, mut request) = match prepared(asked, color) {
+    // Each stretch of the client's own time is a span (slow-is-p0-traced): they reach the
+    // history with the client's rows (`client_rows`), under the build the daemon names.
+    let preparing = tracing::info_span!(
+        target: "blaze",
+        "client: find the checkout, its config files and the environment"
+    )
+    .entered();
+    let prepared = prepared(asked, color);
+    drop(preparing);
+    let (place, mut request) = match prepared {
         Ok(prepared) => prepared,
         Err(what) => return refused(&what, color),
     };
     crate::toolchain::say_toolchain_file(&place.cwd, asked.flags.verbose > 0);
-    if let Err(what) = crate::toolchain::ensure() {
+    let finding = tracing::info_span!(target: "blaze", "client: find the toolchain").entered();
+    let found = crate::toolchain::ensure();
+    drop(finding);
+    if let Err(what) = found {
         return refused(&what, color);
     }
     if asked.command() == Command::Check && !asked.flags.replace.is_empty() {
@@ -506,7 +534,11 @@ fn cargo(asked: &Invocation) -> i32 {
         },
         false => None,
     };
-    let mut client = match daemon::connect(Start::IfMissing) {
+    let connecting =
+        tracing::info_span!(target: "blaze", "client: connect to the daemon").entered();
+    let connected = daemon::connect(Start::IfMissing);
+    drop(connecting);
+    let mut client = match connected {
         Ok(Some(client)) => client,
         Ok(None) => return refused("no daemon answers, and none could be started", color),
         Err(error) => return refused(&format!("{error:#}"), color),
@@ -666,6 +698,13 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
     let mut counted = asked.flags.baselines.is_some().then(baselines::Counted::default);
     let mut found = (asked.command() == Command::Check && asked.flags.fix)
         .then(|| fix::Found::new(&asked.flags.lints));
+    // The client's one wait: on the daemon's socket, from the request sent to its `Done`.
+    let waiting = tracing::info_span!(
+        target: "blaze",
+        "client: wait for the daemon's answer to the request",
+        command = asked.command().name(),
+    )
+    .entered();
     let called = api.call(request, |response, more| {
         if let ResponseRef::Diagnostic(diagnostic) = &response {
             if let Some(counted) = &mut counted {
@@ -709,6 +748,7 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
             unwritten.get_or_insert(error);
         }
     });
+    drop(waiting);
     if let Some(error) = unwritten {
         return Err(error);
     }

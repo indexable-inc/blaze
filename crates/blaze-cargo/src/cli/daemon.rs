@@ -232,8 +232,15 @@ pub fn connect(start: Start) -> anyhow::Result<Option<Client>> {
     use anyhow::Context as _;
     let (log, ready, mut child) = started()?;
     let pid = child.id();
+    let listening = tracing::info_span!(
+        target: "blaze",
+        "client: wait for the daemon it started to listen",
+        pid,
+    )
+    .entered();
     let heard =
         heard(&ready, STARTING).context("waiting for the daemon it started to say it listens")?;
+    drop(listening);
     match heard {
         Heard::Listening => match Client::unix(&socket) {
             Ok(client) => {
@@ -367,6 +374,13 @@ fn named(build: &blaze_api::Build) -> String {
 #[cfg(all(any(unix, windows), feature = "native"))]
 fn this_build(mut client: Client, socket: &Path) -> anyhow::Result<Option<Client>> {
     use anyhow::Context as _;
+    // One Status round trip and a second connect a command: what a mismatch of builds or of
+    // settings is found by, before any request of this blaze runs on another's daemon.
+    let _span = tracing::info_span!(
+        target: "blaze",
+        "client: ask the daemon which blaze it is and what it keeps"
+    )
+    .entered();
     let exe = std::env::current_exe().context("finding blaze's own executable")?;
     let file = std::fs::File::open(&exe)
         .with_context(|| format!("reading blaze itself, {}", exe.display()))?;
