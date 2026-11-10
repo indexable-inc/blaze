@@ -379,7 +379,7 @@ export class Page {
 
   #where() { return this.view === null ? `target ${this.target}` : `view ${this.view}`; }
 
-  /** Load `url` and wait for its load event. A cell that calls it shows the page as a live card. */
+  /** Load `url` and wait for its load event. On a page opened for the person (browser.open) the browser pane shows it. */
   goto(url: string, timeoutMs = 20_000): Promise<void> {
     let host = url;
     try { host = new URL(url).host || url; } catch {}

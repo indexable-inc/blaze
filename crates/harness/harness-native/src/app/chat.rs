@@ -987,7 +987,8 @@ fn empty_value(v: &Value) -> bool {
             "text" => blank("v"),
             "error" => blank("stack") && blank("message"),
             "scalar" => false,
-            "browser" => genui::browser_view_id(&v["view"]).is_none(),
+            // A page of the harness browser is shown in the browser pane (App::chat_pane_page), never in the transcript.
+            "browser" => true,
             _ => true,
         },
     }
@@ -1169,35 +1170,6 @@ fn rows_nested(t: &Transcript, shows: Shows<'_>) -> (Vec<(String, Row)>, HashSet
                 if open && item(piece).is_none_or(|n| !shown(n)) {
                     nested.extend(out[from..].iter().map(|(k, _)| k.clone()));
                 }
-            }
-        }
-        // A page a step opened or drove in the harness browser (its shown value, steps::value_outs) is what the turn did
-        // for the person, not how: its live card shows under the turn while the steps are folded away (opened, each
-        // step shows its own). One card a view, where the turn left it.
-        if !open {
-            let blocks = rest.iter().flat_map(|p| match p {
-                Piece::Item(n) => vec![*n],
-                Piece::Run(r) => r.items.clone(),
-            });
-            let mut pages: Vec<(u64, &Value)> = Vec::new(); // alloc: a turn's pages, a handful
-            for n in blocks {
-                let Item::Tool { block, .. } = &t.items[n] else { continue };
-                let Some(d) = t.details.get(block) else { continue };
-                // A cell that drew shows its own view; it places its pages itself.
-                if !empty_value(&d.ui) {
-                    continue;
-                }
-                for e in &d.effects {
-                    if e.value["t"] == "browser"
-                        && let Some(view) = genui::browser_view_id(&e.value["view"])
-                    {
-                        pages.retain(|(v, _)| *v != view);
-                        pages.push((view, &e.value));
-                    }
-                }
-            }
-            for (view, v) in pages {
-                out.push((format!("{key}.page{view}"), Row::Ui { v: Arc::new(genui::shown_card(v)), cell: String::new(), block: String::new(), code: false }));
             }
         }
         if last {
@@ -4111,13 +4083,10 @@ mod tests {
         assert_eq!((blank.text.as_str(), blank.caret), ("", 0));
     }
 
-    /// A page's card is drawn whether the kernel names its view in digits (as it does) or as a number.
+    /// A page a step opened is the browser pane's to show: its shown value draws nothing in the transcript.
     #[test]
-    fn a_browser_card_takes_the_kernels_view_id() {
-        assert!(!empty_value(&serde_json::json!({"t": "browser", "view": "4", "url": "https://x", "title": ""})));
-        assert!(!empty_value(&serde_json::json!({"t": "browser", "view": 4})));
-        assert!(empty_value(&serde_json::json!({"t": "browser", "view": "0"})));
-        assert!(empty_value(&serde_json::json!({"t": "browser", "view": "x"})));
+    fn a_page_draws_nothing_in_the_transcript() {
+        assert!(empty_value(&serde_json::json!({"t": "browser", "view": "4", "url": "https://x", "title": "", "pane": true})));
     }
 
     #[test]
