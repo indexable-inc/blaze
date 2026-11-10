@@ -4,7 +4,8 @@
 //! Three kinds:
 //!
 //! - **Device types** ([`device_ty`]): the gpu crate's vectors become naga vectors, and its
-//!   `Texture2d` and `Sampler` become naga's image and sampler types. A vector's fields are its
+//!   `Texture2d`, `Sampler` and `Tlas` become naga's image, sampler and acceleration structure
+//!   types. A vector's fields are its
 //!   components in order, which is what its `#[repr(C)]` layout already says; the layout itself
 //!   still comes from the front end (`mirrors-derive-or-check`).
 //! - **Device functions** ([`device_fn`]): the gpu crate's functions that only a GPU can run
@@ -39,18 +40,26 @@ pub enum DeviceTy {
     Texture2d,
     /// `gpu::Sampler`.
     Sampler,
+    /// `gpu::Tlas`: a top-level acceleration structure.
+    Tlas,
+    /// `gpu::RawOut<T>`: the runtime-sized array of `T` a kernel's read-write storage holds.
+    RawOut,
 }
 
 /// The device types, by their paths in the gpu crate.
-const DEVICE_TYS: [(&str, DeviceTy); 8] = [
+const DEVICE_TYS: [(&str, DeviceTy); 12] = [
     ("gpu::vec::Vec2", DeviceTy::Vector { scalar: Scalar::F32, size: VectorSize::Bi }),
     ("gpu::vec::Vec3", DeviceTy::Vector { scalar: Scalar::F32, size: VectorSize::Tri }),
     ("gpu::vec::Vec4", DeviceTy::Vector { scalar: Scalar::F32, size: VectorSize::Quad }),
+    ("gpu::vec::UVec2", DeviceTy::Vector { scalar: Scalar::U32, size: VectorSize::Bi }),
+    ("gpu::vec::UVec3", DeviceTy::Vector { scalar: Scalar::U32, size: VectorSize::Tri }),
     ("gpu::vec::UVec4", DeviceTy::Vector { scalar: Scalar::U32, size: VectorSize::Quad }),
     ("gpu::vec::IVec2", DeviceTy::Vector { scalar: Scalar::I32, size: VectorSize::Bi }),
     ("gpu::vec::IVec4", DeviceTy::Vector { scalar: Scalar::I32, size: VectorSize::Quad }),
     ("gpu::entry::Texture2d", DeviceTy::Texture2d),
     ("gpu::entry::Sampler", DeviceTy::Sampler),
+    ("gpu::ray::Tlas", DeviceTy::Tlas),
+    ("gpu::entry::RawOut", DeviceTy::RawOut),
 ];
 
 /// A function only the device runs.
@@ -66,6 +75,19 @@ pub enum DeviceFn {
     SampleLevel,
     /// `Texture2d::load(&self, IVec2, u32) -> Vec4`.
     Load,
+    /// `RawOut::count(&self) -> usize`: its runtime-sized array's `arrayLength`.
+    RawOutLen,
+    /// `RawOut::load(&self, usize) -> T`.
+    RawOutLoad,
+    /// `RawOut::store(&self, usize, T)`.
+    RawOutStore,
+    /// `Tlas::query(&self, Ray, flags: u32, mask: u32) -> Committed`: one naga ray query,
+    /// initialized, proceeded to its end, its committed intersection read.
+    TlasQuery,
+    /// `f32tof16(f32) -> u32`: naga's `pack2x16float` of `(x, 0)`.
+    F32ToF16,
+    /// `f16tof32(u32) -> f32`: the first of naga's `unpack2x16float`.
+    F16ToF32,
 }
 
 impl DeviceFn {
@@ -76,7 +98,7 @@ impl DeviceFn {
 }
 
 /// The device functions, by their paths (an inherent method under its type's path).
-const DEVICE_FNS: [(&str, DeviceFn); 7] = [
+const DEVICE_FNS: [(&str, DeviceFn); 13] = [
     ("gpu::intrinsic::dpdx", DeviceFn::Derivative(DerivativeAxis::X)),
     ("gpu::intrinsic::dpdy", DeviceFn::Derivative(DerivativeAxis::Y)),
     ("gpu::intrinsic::fwidth", DeviceFn::Derivative(DerivativeAxis::Width)),
@@ -84,6 +106,13 @@ const DEVICE_FNS: [(&str, DeviceFn); 7] = [
     ("gpu::entry::Texture2d::sample", DeviceFn::Sample),
     ("gpu::entry::Texture2d::sample_level", DeviceFn::SampleLevel),
     ("gpu::entry::Texture2d::load", DeviceFn::Load),
+    ("gpu::entry::RawOut::count", DeviceFn::RawOutLen),
+    ("gpu::entry::RawOut::load", DeviceFn::RawOutLoad),
+    ("gpu::entry::RawOut::store", DeviceFn::RawOutStore),
+    ("gpu::ray::Tlas::query", DeviceFn::TlasQuery),
+    // These two have host bodies that run as written; the device has an instruction for each.
+    ("gpu::math::f32tof16", DeviceFn::F32ToF16),
+    ("gpu::math::f16tof32", DeviceFn::F16ToF32),
 ];
 
 /// The device type `adt` is, if it is one.

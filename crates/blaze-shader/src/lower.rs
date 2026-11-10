@@ -114,6 +114,10 @@ pub(crate) enum Shape {
     Enum(Vec<EnumVariant>),
     Texture,
     Sampler,
+    /// A `gpu::Tlas`: naga's acceleration structure, a handle like a texture.
+    Tlas,
+    /// A `gpu::RawOut<T>`: the runtime-sized array of `T` its storage global holds.
+    RawOut,
 }
 
 /// One variant of a lowered enum.
@@ -258,6 +262,8 @@ enum Input {
     Arg { arg: u32, io: Handle<Type> },
     /// A resource.
     Global(Handle<naga::GlobalVariable>),
+    /// A kernel's `Thread`: the naga arguments of its global, local and workgroup ids.
+    Thread { global: u32, local: u32, group: u32 },
 }
 
 impl<'db> Device<'db> {
@@ -357,6 +363,18 @@ impl<'db> Device<'db> {
                     Some(DeviceTy::Sampler) => {
                         let inner = TypeInner::Sampler { comparison: false };
                         Lowered { naga: Some(self.insert_ty(None, inner)), shape: Shape::Sampler }
+                    }
+                    Some(DeviceTy::Tlas) => {
+                        let inner = TypeInner::AccelerationStructure { vertex_return: false };
+                        Lowered { naga: Some(self.insert_ty(None, inner)), shape: Shape::Tlas }
+                    }
+                    Some(DeviceTy::RawOut) => {
+                        let elem = self.normalize(args.type_at(0));
+                        let stride = self.with_layout(elem, |l| l.size.bytes())? as u32;
+                        // alloc: an error
+                        let base = self.lower_ty(elem)?.naga.ok_or_else(|| (format!("the RawOut `{ty}` of elements of no size", ty = self.shown(ty)), why::TYPES))?;
+                        let inner = TypeInner::Array { base, size: ArraySize::Dynamic, stride };
+                        Lowered { naga: Some(self.insert_ty(None, inner)), shape: Shape::RawOut }
                     }
                     None => match adt {
                         AdtId::StructId(id) => {
@@ -576,7 +594,7 @@ impl<'db> Device<'db> {
                     .collect();
                 Expression::Compose { ty: naga_ty, components }
             }
-            Shape::Zst | Shape::Texture | Shape::Sampler => {
+            Shape::Zst | Shape::Texture | Shape::Sampler | Shape::Tlas | Shape::RawOut => {
                 return Err((format!("a constant of type `{ty}`", ty = self.shown(ty)), why::OPERATIONS)); // alloc: an error
             }
         };
@@ -660,9 +678,10 @@ impl<'db> Device<'db> {
         if !cx.refusals.is_empty() {
             return Err(cx.refusals);
         }
-        let stage = match entry.stage {
-            Stage::Vertex => naga::ShaderStage::Vertex,
-            Stage::Fragment => naga::ShaderStage::Fragment,
+        let (stage, workgroup_size) = match entry.stage {
+            Stage::Vertex => (naga::ShaderStage::Vertex, [0, 0, 0]),
+            Stage::Fragment => (naga::ShaderStage::Fragment, [0, 0, 0]),
+            Stage::Compute { x, y, z } => (naga::ShaderStage::Compute, [x, y, z]),
         };
         let function = std::mem::take(&mut cx.func);
         let mut bindings = Vec::new(); // alloc: an entry's binding table
@@ -677,7 +696,7 @@ impl<'db> Device<'db> {
             name: entry.name.clone(), // clone: the entry's name
             stage,
             early_depth_test: None,
-            workgroup_size: [0, 0, 0],
+            workgroup_size,
             workgroup_size_overrides: None,
             function,
             mesh_info: None,
@@ -899,6 +918,11 @@ impl<'d, 'db> EntryCx<'d, 'db> {
             },
             Call::Method(Ok(Dispatched::Fn(g, g_args))) => {
                 if let Some(device) = device_fn(db, g) {
+                    // Decided here, not at the edge: a discard's block is doomed, so its edges are
+                    // never walked.
+                    if device == DeviceFn::Discard && matches!(self.entry.stage, Stage::Compute { .. }) {
+                        return Target::Refused("`Discard` in a kernel".to_owned(), why::STAGE); // alloc: an error
+                    }
                     return Target::Device(device);
                 }
                 if model_of(db, g) == Some(Model::Leaf(Leaf::Panic)) {
@@ -1172,7 +1196,7 @@ impl<'d, 'db> EntryCx<'d, 'db> {
         let slot = match lowered.naga {
             None => Slot::Zst,
             Some(naga_ty) => {
-                if matches!(lowered.shape, Shape::Texture | Shape::Sampler) {
+                if matches!(lowered.shape, Shape::Texture | Shape::Sampler | Shape::Tlas | Shape::RawOut) {
                     return Err((format!("a `{ty}` held by value", ty = self.dev.shown(ty)), why::TYPES)); // alloc: an error
                 }
                 let name = format!("{}_{i}", short_name(&self.frames[frame].item)); // alloc: a name
@@ -1237,7 +1261,8 @@ impl<'d, 'db> EntryCx<'d, 'db> {
                     Target::Panic | Target::Device(DeviceFn::Discard) => vec![END], // alloc: an edge
                     Target::Device(device) => {
                         if device.fragment_only() && self.entry.stage != Stage::Fragment {
-                            return Err((format!("`{device:?}` in a vertex stage"), why::STAGE)); // alloc: an error
+                            let stage = if self.entry.stage == Stage::Vertex { "a vertex stage" } else { "a kernel" };
+                            return Err((format!("`{device:?}` in {stage}"), why::STAGE)); // alloc: an error
                         }
                         after.into_iter().collect()
                     }
@@ -1345,16 +1370,45 @@ impl<'d, 'db> EntryCx<'d, 'db> {
                     self.bind(root, *local, Sym { root: Root::Global(g), steps: Vec::new(), len: None })?;
                     Input::Global(g)
                 }
-                Kind::Texture2d | Kind::Sampler => {
+                Kind::Texture2d | Kind::Sampler | Kind::Tlas => {
                     let TyKind::Ref(_, inner, _) = ty.kind() else { return Err((format!("`{}` is not a reference", param.name), why::INTERFACE)) }; // alloc: an error
-                    let naga_ty = self.dev.lower_ty(inner)?.naga.expect("textures and samplers have a type");
+                    let naga_ty = self.dev.lower_ty(inner)?.naga.expect("textures, samplers and acceleration structures have a type");
                     let g = self.dev.resource(format!("{}_{}", entry.name, param.name), AddressSpace::Handle, naga_ty); // alloc: a name
                     self.bind(root, *local, Sym { root: Root::Global(g), steps: Vec::new(), len: None })?;
                     Input::Global(g)
                 }
+                Kind::RawOut { stride } => {
+                    let elem = match ty.kind() {
+                        TyKind::Ref(_, inner, _) => match inner.kind() {
+                            TyKind::Adt(def, args) if device_ty(self.dev.db, def.def_id()) == Some(DeviceTy::RawOut) => self.dev.normalize(args.type_at(0)),
+                            _ => return Err((format!("RawOut `{}` is not a `&RawOut<T>`", param.name), why::INTERFACE)), // alloc: an error
+                        },
+                        _ => return Err((format!("RawOut `{}` is not a `&RawOut<T>`", param.name), why::INTERFACE)), // alloc: an error
+                    };
+                    self.host_shared(elem, &param.name)?;
+                    let actual = self.dev.with_layout(elem, |l| l.size.bytes())?;
+                    if actual != u64::from(*stride) {
+                        return Err((format!("RawOut `{}`: its descriptor says a stride of {stride}, its type has {actual}", param.name), why::INTERFACE)); // alloc: an error
+                    }
+                    let TyKind::Ref(_, inner, _) = ty.kind() else { unreachable!("matched above") };
+                    let array = self.dev.lower_ty(inner)?.naga.expect("a RawOut has its array type");
+                    let access = StorageAccess::LOAD | StorageAccess::STORE;
+                    let g = self.dev.resource(format!("{}_{}", entry.name, param.name), AddressSpace::Storage { access }, array); // alloc: a name
+                    self.bind(root, *local, Sym { root: Root::Global(g), steps: Vec::new(), len: None })?;
+                    Input::Global(g)
+                }
+                Kind::Thread => {
+                    let io = self.dev.insert_ty(None, TypeInner::Vector { size: VectorSize::Tri, scalar: Scalar::U32 });
+                    for (suffix, built_in) in [("global", BuiltIn::GlobalInvocationId), ("local", BuiltIn::LocalInvocationId), ("group", BuiltIn::WorkGroupId)] {
+                        // alloc: a name
+                        self.func.arguments.push(naga::FunctionArgument { name: Some(format!("{}_{suffix}", param.name)), ty: io, binding: Some(Binding::BuiltIn(built_in)) });
+                    }
+                    args += 3;
+                    Input::Thread { global: args - 3, local: args - 2, group: args - 1 }
+                }
             };
             let want_table = match param.kind {
-                Kind::Uniform { .. } | Kind::Storage { .. } => Table::Buffer,
+                Kind::Uniform { .. } | Kind::Storage { .. } | Kind::RawOut { .. } | Kind::Tlas => Table::Buffer,
                 Kind::Texture2d => Table::Texture,
                 Kind::Sampler => Table::Sampler,
                 _ => Table::None,
@@ -1366,6 +1420,12 @@ impl<'d, 'db> EntryCx<'d, 'db> {
         }
         let ret_ty = self.local_ty(root, m::return_slot());
         let result = match &entry.out {
+            Out::Nothing => {
+                if self.dev.lower_ty(ret_ty)?.naga.is_some() {
+                    return Err((format!("a kernel returning `{ret_ty}`, not `()`", ret_ty = self.dev.shown(ret_ty)), why::INTERFACE)); // alloc: an error
+                }
+                return Ok(());
+            }
             Out::Color => {
                 let vec4 = self.value_ty(ValueTy::Vec4);
                 if self.dev.lower_ty(ret_ty)?.naga != Some(vec4) {
@@ -1550,8 +1610,13 @@ impl<'d, 'db> EntryCx<'d, 'db> {
 
     /// The end of the invocation: a fragment discarded, a vertex outside the clip volume.
     fn end_invocation(&mut self) {
+        if let Stage::Compute { .. } = self.entry.stage {
+            self.stmt(Statement::Return { value: None });
+            return;
+        }
         let Some(result) = self.result else { return };
         match self.entry.stage {
+            Stage::Compute { .. } => unreachable!("returned above"),
             Stage::Fragment => {
                 self.stmt(Statement::Kill);
                 let value = self.expr(Expression::ZeroValue(result));
@@ -1627,6 +1692,14 @@ impl<'d, 'db> EntryCx<'d, 'db> {
         let params = self.frames[0].body.param_locals.clone(); // clone: a few locals
         let inputs = self.inputs.clone(); // clone: a few inputs
         for (local, input) in params.iter().zip(inputs) {
+            if let Input::Thread { global, local: in_group, group } = input {
+                let ty = self.local_ty(0, *local);
+                let Some(var) = self.var(0, *local)? else { continue };
+                let value = self.thread_in(ty, [("global", global), ("local", in_group), ("group", group)])?;
+                let pointer = self.expr(Expression::LocalVariable(var));
+                self.stmt(Statement::Store { pointer, value });
+                continue;
+            }
             let Input::Arg { arg, io } = input else { continue };
             let ty = self.local_ty(0, *local);
             let Some(var) = self.var(0, *local)? else { continue };
@@ -1642,6 +1715,26 @@ impl<'d, 'db> EntryCx<'d, 'db> {
             self.stmt(Statement::Store { pointer, value });
         }
         Ok(())
+    }
+
+    /// The `gpu::Thread` value from the kernel's id arguments, each Rust field from the argument
+    /// of its name.
+    fn thread_in(&mut self, ty: Ty<'db>, ids: [(&str, u32); 3]) -> Result<Handle<Expression>, Refused> {
+        let lowered = self.dev.lower_ty(ty)?;
+        let (Some(naga_ty), Shape::Struct(map)) = (lowered.naga, lowered.shape) else {
+            return Err((format!("the Thread `{ty}` is not a struct", ty = self.dev.shown(ty)), why::INTERFACE)); // alloc: an error
+        };
+        let names = self.field_names(ty);
+        let mut members: Vec<(u32, Handle<Expression>)> = Vec::with_capacity(3); // alloc: members
+        for (i, name) in names.iter().enumerate() {
+            let Some(k) = map[i] else { continue };
+            let Some((_, arg)) = ids.into_iter().find(|(n, _)| *n == name.as_str()) else {
+                return Err((format!("Thread field `{name}`, which is no kernel id"), why::INTERFACE)); // alloc: an error
+            };
+            members.push((k, self.expr(Expression::FunctionArgument(arg))));
+        }
+        members.sort_by_key(|(k, _)| *k);
+        Ok(self.expr(Expression::Compose { ty: naga_ty, components: members.into_iter().map(|(_, e)| e).collect() }))
     }
 
     /// The Rust varyings value from the I/O struct `arg`, each Rust field from the member of its
@@ -1729,6 +1822,10 @@ impl<'d, 'db> EntryCx<'d, 'db> {
     }
 
     fn entry_return(&mut self) -> Result<(), Refused> {
+        if self.entry.out == Out::Nothing {
+            self.stmt(Statement::Return { value: None });
+            return Ok(());
+        }
         let result = self.result.expect("the interface is set");
         let ret = m::return_slot();
         let ty = self.local_ty(0, ret);
@@ -1736,6 +1833,7 @@ impl<'d, 'db> EntryCx<'d, 'db> {
         let pointer = self.expr(Expression::LocalVariable(var));
         let value = self.expr(Expression::Load { pointer });
         let out = match &self.entry.out {
+            Out::Nothing => unreachable!("returned above"),
             Out::Color => value,
             Out::Varyings(fields) => {
                 let lowered = self.dev.lower_ty(ty)?;
@@ -1855,7 +1953,7 @@ impl<'d, 'db> EntryCx<'d, 'db> {
         let lowered = self.dev.lower_ty(pty.ty)?;
         Ok(match lowered.shape {
             Shape::Zst => Ptr::Zst,
-            Shape::Texture | Shape::Sampler => Ptr::Handle(ptr),
+            Shape::Texture | Shape::Sampler | Shape::Tlas => Ptr::Handle(ptr),
             _ => Ptr::Pointer(ptr, pty.ty),
         })
     }
@@ -2399,7 +2497,8 @@ impl<'d, 'db> EntryCx<'d, 'db> {
                     }
                     Target::Nothing | Target::Panic | Target::Refused(..) | Target::Device(DeviceFn::Discard) => Ok(()),
                     Target::Device(device) => {
-                        let value = self.device_call(frame, device, args)?;
+                        let dest_ty = self.place_ty(frame, destination);
+                        let Some(value) = self.device_call(frame, device, args, dest_ty)? else { return Ok(()) };
                         self.store_to(frame, destination, value)
                     }
                 }
@@ -2505,13 +2604,59 @@ impl<'d, 'db> EntryCx<'d, 'db> {
         self.sym_ptr(&sym).ok_or_else(|| ("a texture or sampler of no size".to_owned(), why::TYPES)) // alloc: an error
     }
 
-    fn device_call(&mut self, frame: usize, device: DeviceFn, args: &[m::Operand]) -> Result<Handle<Expression>, Refused> {
-        let mut value = |cx: &mut Self, i: usize| -> Result<Handle<Expression>, Refused> {
+    /// A device function's value; `None` for one that returns nothing (a store).
+    fn device_call(&mut self, frame: usize, device: DeviceFn, args: &[m::Operand], dest_ty: Ty<'db>) -> Result<Option<Handle<Expression>>, Refused> {
+        let value = |cx: &mut Self, i: usize| -> Result<Handle<Expression>, Refused> {
             let arg = args.get(i).ok_or_else(|| (format!("`{device:?}` with too few arguments"), why::OPERATIONS))?; // alloc: an error
             let v = cx.operand(frame, arg)?;
             cx.need(v)
         };
-        Ok(match device {
+        let raw = |cx: &mut Self| -> Result<Handle<Expression>, Refused> {
+            let arg = args.first().ok_or_else(|| (format!("`{device:?}` without its RawOut"), why::OPERATIONS))?; // alloc: an error
+            let (m::OperandKind::Copy(of) | m::OperandKind::Move(of)) = &arg.kind else {
+                return Err(("a RawOut that is a constant".to_owned(), why::POINTERS)); // alloc: an error
+            };
+            let sym = cx.sym_of_ref_value(frame, of)?;
+            if !sym.steps.is_empty() {
+                return Err(("a RawOut inside a value".to_owned(), why::TYPES)); // alloc: an error
+            }
+            cx.sym_ptr(&sym).ok_or_else(|| ("a RawOut of no size".to_owned(), why::TYPES)) // alloc: an error
+        };
+        Ok(Some(match device {
+            DeviceFn::RawOutLen => {
+                let pointer = raw(self)?;
+                self.expr(Expression::ArrayLength(pointer))
+            }
+            DeviceFn::RawOutLoad => {
+                let base = raw(self)?;
+                let index = value(self, 1)?;
+                let pointer = self.expr(Expression::Access { base, index });
+                self.expr(Expression::Load { pointer })
+            }
+            DeviceFn::RawOutStore => {
+                let base = raw(self)?;
+                let index = value(self, 1)?;
+                let pointer = self.expr(Expression::Access { base, index });
+                // A value of no size stores nothing.
+                if let Some(v) = self.operand(frame, args.get(2).ok_or_else(|| ("a RawOut write without a value".to_owned(), why::OPERATIONS))?)? {
+                    // alloc: an error
+                    self.stmt(Statement::Store { pointer, value: v });
+                }
+                return Ok(None);
+            }
+            DeviceFn::F32ToF16 => {
+                let x = value(self, 0)?;
+                let vec2 = self.value_ty(ValueTy::Vec2);
+                let zero = self.expr(Expression::Literal(Literal::F32(0.0)));
+                let pair = self.expr(Expression::Compose { ty: vec2, components: vec![x, zero] }); // alloc: two components
+                self.expr(Expression::Math { fun: MathFunction::Pack2x16float, arg: pair, arg1: None, arg2: None, arg3: None })
+            }
+            DeviceFn::F16ToF32 => {
+                let x = value(self, 0)?;
+                let pair = self.expr(Expression::Math { fun: MathFunction::Unpack2x16float, arg: x, arg1: None, arg2: None, arg3: None });
+                self.expr(Expression::AccessIndex { base: pair, index: 0 })
+            }
+            DeviceFn::TlasQuery => return self.tlas_query(frame, args, dest_ty).map(Some),
             DeviceFn::Derivative(axis) => {
                 let expr = value(self, 0)?;
                 self.expr(Expression::Derivative { axis, ctrl: naga::DerivativeControl::None, expr })
@@ -2533,7 +2678,84 @@ impl<'d, 'db> EntryCx<'d, 'db> {
                 self.expr(Expression::ImageLoad { image, coordinate, array_index: None, sample: None, level: Some(level) })
             }
             DeviceFn::Discard => unreachable!("discard ends the invocation"),
-        })
+        }))
+    }
+
+    /// `Tlas::query(&self, ray, flags, mask)`: one naga ray query in a variable of its own,
+    /// initialized from the ray, proceeded until it has no candidate left (every one is opaque,
+    /// so none needs the kernel's say), and its committed intersection read into the gpu crate's
+    /// `Committed`, each field from the `RayIntersection` member of its name.
+    fn tlas_query(&mut self, frame: usize, args: &[m::Operand], dest_ty: Ty<'db>) -> Result<Handle<Expression>, Refused> {
+        let [tlas, ray, flags, mask] = args else {
+            return Err(("`Tlas::query` without its four arguments".to_owned(), why::OPERATIONS)); // alloc: an error
+        };
+        let acceleration_structure = self.handle_arg(frame, tlas)?;
+        let ray_ty = self.operand_ty(frame, ray).ok_or_else(|| ("a static ray".to_owned(), why::STATICS))?; // alloc: an error
+        let ray = self.operand(frame, ray)?;
+        let ray = self.need(ray)?;
+        let flags = self.operand(frame, flags)?;
+        let flags = self.need(flags)?;
+        let mask = self.operand(frame, mask)?;
+        let mask = self.need(mask)?;
+
+        // The ray's fields by name, into naga's RayDesc.
+        let ray_shape = self.dev.lower_ty(ray_ty)?.shape;
+        let Shape::Struct(ray_map) = ray_shape else {
+            return Err((format!("the ray `{ty}` is not a struct", ty = self.dev.shown(ray_ty)), why::INTERFACE)); // alloc: an error
+        };
+        let ray_names = self.field_names(ray_ty);
+        let ray_field = |cx: &mut Self, name: &str| -> Result<Handle<Expression>, Refused> {
+            let i = ray_names.iter().position(|n| n == name).ok_or_else(|| (format!("a ray without its `{name}`"), why::INTERFACE))?; // alloc: an error
+            let k = ray_map[i].ok_or_else(|| (format!("the ray's `{name}` of no size"), why::INTERFACE))?; // alloc: an error
+            Ok(cx.expr(Expression::AccessIndex { base: ray, index: k }))
+        };
+        let (tmin, tmax, origin, dir) = (ray_field(self, "tmin")?, ray_field(self, "tmax")?, ray_field(self, "origin")?, ray_field(self, "dir")?);
+        let desc_ty = self.dev.module.generate_ray_desc_type();
+        // RayDesc's members: flags, cull_mask, tmin, tmax, origin, dir.
+        let descriptor = self.expr(Expression::Compose { ty: desc_ty, components: vec![flags, mask, tmin, tmax, origin, dir] }); // alloc: six members
+        let query_ty = self.dev.insert_ty(None, TypeInner::RayQuery { vertex_return: false });
+        let var = self.func.local_variables.append(LocalVariable { name: Some("query".to_owned()), ty: query_ty, init: None }, Span::UNDEFINED); // alloc: a name
+        let query = self.expr(Expression::LocalVariable(var));
+        self.stmt(Statement::RayQuery { query, fun: naga::RayQueryFunction::Initialize { acceleration_structure, descriptor } });
+
+        // loop { proceed; if !more { break } }
+        self.blocks.push(naga::Block::new());
+        let query = self.expr(Expression::LocalVariable(var));
+        // The statement's result, which no Emit may cover.
+        let more = self.func.expressions.append(Expression::RayQueryProceedResult, Span::UNDEFINED);
+        self.stmt(Statement::RayQuery { query, fun: naga::RayQueryFunction::Proceed { result: more } });
+        let done = self.expr(Expression::Unary { op: UnaryOperator::LogicalNot, expr: more });
+        let mut stop = naga::Block::new();
+        stop.push(Statement::Break, Span::UNDEFINED);
+        self.stmt(Statement::If { condition: done, accept: stop, reject: naga::Block::new() });
+        let body = self.blocks.pop().expect("the query's loop");
+        self.stmt(Statement::Loop { body, continuing: naga::Block::new(), break_if: None });
+
+        let intersection_ty = self.dev.module.generate_ray_intersection_type();
+        let query = self.expr(Expression::LocalVariable(var));
+        let hit = self.expr(Expression::RayQueryGetIntersection { query, committed: true });
+        let TypeInner::Struct { members: hit_members, .. } = &self.dev.module.types[intersection_ty].inner else {
+            unreachable!("naga's RayIntersection is a struct")
+        };
+        let hit_names: Vec<String> = hit_members.iter().map(|m| m.name.clone().unwrap_or_default()).collect(); // clone: names
+
+        let lowered = self.dev.lower_ty(dest_ty)?;
+        let (Some(naga_ty), Shape::Struct(map)) = (lowered.naga, lowered.shape) else {
+            return Err((format!("a query read into `{ty}`, which is not a struct", ty = self.dev.shown(dest_ty)), why::INTERFACE)); // alloc: an error
+        };
+        let names = self.field_names(dest_ty);
+        let mut members: Vec<(u32, Handle<Expression>)> = Vec::with_capacity(names.len()); // alloc: members
+        for (i, name) in names.iter().enumerate() {
+            let Some(k) = map[i] else { continue };
+            // naga's name for the instance's own value.
+            let naga_name = if name == "instance_custom_index" { "instance_custom_data" } else { name.as_str() };
+            let Some(at) = hit_names.iter().position(|n| n == naga_name) else {
+                return Err((format!("`{name}`, which naga's RayIntersection has no member for"), why::INTERFACE)); // alloc: an error
+            };
+            members.push((k, self.expr(Expression::AccessIndex { base: hit, index: at as u32 })));
+        }
+        members.sort_by_key(|(k, _)| *k);
+        Ok(self.expr(Expression::Compose { ty: naga_ty, components: members.into_iter().map(|(_, e)| e).collect() }))
     }
 
     /// A node's terminator as the choice of its arms: an `if` chain (naga's `switch` would take

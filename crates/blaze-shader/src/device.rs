@@ -65,7 +65,7 @@ fn build(db: &Db, krate: Crate) -> Result<DeviceBuild, Error> {
         return Err(Error::Refused(refusals));
     }
     let module = device.module;
-    let info = Validator::new(ValidationFlags::all(), Capabilities::empty()).validate(&module).map_err(|e| {
+    let info = Validator::new(ValidationFlags::all(), capabilities(&module)).validate(&module).map_err(|e| {
         let inner = e.as_inner();
         let entry = match inner {
             naga::valid::ValidationError::EntryPoint { name, .. } => name.clone(), // clone: an error path
@@ -121,6 +121,27 @@ fn build(db: &Db, krate: Crate) -> Result<DeviceBuild, Error> {
         }
     }
     Ok(DeviceBuild { msl, entries, module })
+}
+
+/// What the module uses past naga's baseline, and so what the validator allows: a ray query when an
+/// entry traces one, and half packing (`f32tof16`, `f16tof32`) when an entry packs; Metal has both.
+/// Never more than the module uses, so a construct a lowering did not mean to make still fails
+/// validation.
+fn capabilities(module: &naga::Module) -> Capabilities {
+    let mut caps = Capabilities::empty();
+    for (_, t) in module.types.iter() {
+        if let naga::TypeInner::AccelerationStructure { .. } | naga::TypeInner::RayQuery { .. } = t.inner {
+            caps |= Capabilities::RAY_QUERY;
+        }
+    }
+    for e in &module.entry_points {
+        for (_, x) in e.function.expressions.iter() {
+            if let naga::Expression::Math { fun: naga::MathFunction::Pack2x16float | naga::MathFunction::Unpack2x16float, .. } = x {
+                caps |= Capabilities::SHADER_FLOAT16_IN_FLOAT32;
+            }
+        }
+    }
+    caps
 }
 
 /// An error and its sources, as one line.

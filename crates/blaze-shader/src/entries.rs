@@ -33,6 +33,8 @@ pub const ENTRIES: &str = "GPU_ENTRIES";
 pub enum Stage {
     Vertex,
     Fragment,
+    /// A kernel, its workgroup `x * y * z` threads.
+    Compute { x: u32, y: u32, z: u32 },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -76,12 +78,16 @@ pub enum Kind {
     Storage { stride: u32 },
     Texture2d,
     Sampler,
+    Thread,
+    RawOut { stride: u32 },
+    Tlas,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Out {
     Varyings(Vec<Field>),
     Color,
+    Nothing,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -208,9 +214,16 @@ impl<'db> Reader<'db> {
 
     fn entry(&self, desc: Value<'_, 'db>, code: Value<'_, 'db>) -> Result<Entry, String> {
         let name = self.str(self.field(desc, "name")?)?;
-        let stage = match self.variant(self.field(desc, "stage")?)?.0.as_str() {
+        let (stage, axes) = self.variant(self.field(desc, "stage")?)?;
+        let stage = match stage.as_str() {
             "Vertex" => Stage::Vertex,
             "Fragment" => Stage::Fragment,
+            "Compute" => {
+                let [x, y, z] = axes[..] else {
+                    return Err("`Stage::Compute` has other than three fields".to_owned()); // alloc: an error
+                };
+                Stage::Compute { x: self.u32(x)?, y: self.u32(y)?, z: self.u32(z)? }
+            }
             other => return Err(unknown("Stage", other)),
         };
         let mut params = Vec::new(); // alloc: an entry's parameters
@@ -222,6 +235,7 @@ impl<'db> Reader<'db> {
             match variant.as_str() {
                 "Varyings" => Out::Varyings(self.fields(one(&fields, "Out::Varyings")?)?),
                 "Color" => Out::Color,
+                "Nothing" => Out::Nothing,
                 other => return Err(unknown("Out", other)),
             }
         };
@@ -248,6 +262,9 @@ impl<'db> Reader<'db> {
             "Storage" => Kind::Storage { stride: self.u32(one(&fields, "Kind::Storage")?)? },
             "Texture2d" => Kind::Texture2d,
             "Sampler" => Kind::Sampler,
+            "Thread" => Kind::Thread,
+            "RawOut" => Kind::RawOut { stride: self.u32(one(&fields, "Kind::RawOut")?)? },
+            "Tlas" => Kind::Tlas,
             other => return Err(unknown("Kind", other)),
         };
         let slot = self.slot(self.field(param, "slot")?)?;
