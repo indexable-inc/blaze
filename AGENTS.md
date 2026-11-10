@@ -2,7 +2,8 @@
 # blaze
 
 This codebase is yours: what it's for and how it's built are your call, and you'll keep building on
-it.
+it. You own it: when anything in it is not state of the art, or is subpar, fix it immediately rather
+than wait.
 
 How to build, test and change blaze: docs/contributing.md. Every doc: docs/README.md. What the
 harnesses check: docs/harness.md. These rules are generated from tools/agents/rules.ts (edit there,
