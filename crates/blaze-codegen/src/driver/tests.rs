@@ -43,6 +43,13 @@ struct Function {
     /// name and no place in it ([`Described::template_code`]): its body and callees alone.
     /// Its compiled code then names a position in two of them.
     anchors: Option<[ContentId; crate::template::OWN_TABLES]>,
+    /// Its body is written in a crate no edit reaches, whatever its origin: a generic of
+    /// another crate that a member instantiates is the member's by origin and not editable
+    /// ([`Described::editable`]).
+    foreign: bool,
+    /// One of its type arguments names a workspace type, closure or item
+    /// ([`Described::over_editable`]); read only when it is not editable.
+    over_editable: bool,
 }
 
 struct Program {
@@ -127,6 +134,8 @@ impl Program {
             owner: Owner::Workspace,
             identity_of: None,
             anchors: None,
+            foreign: false,
+            over_editable: false,
         };
         self.functions.insert(id, function);
         self.functions.get_mut(&id).unwrap()
@@ -180,7 +189,9 @@ impl Frontend for Program {
             built_in_code: code,
             args: ContentId::default(),
             origin: function.origin,
-            editable: matches!(function.origin, Origin::Member(_)),
+            editable: matches!(function.origin, Origin::Member(_)) && !function.foreign,
+            over_editable: function.over_editable
+                && !(matches!(function.origin, Origin::Member(_)) && !function.foreign),
             overflow_checks: None,
             address: match function.symbol {
                 Some(_) => Address::Significant,
@@ -1991,4 +2002,198 @@ fn one_key_of_two_origins_has_one_id_whichever_was_described_first() {
     assert_eq!(member_first.1, dependency_first.1, "one ID either way");
     assert!(member_first.2.is_some());
     assert_eq!(member_first.2, dependency_first.2, "one live identity either way");
+}
+
+/// A live build of `program` from its `main`, function 1; `planted` is the build before the
+/// rule: no function is rebound ([`Build::without_rebinding`]).
+fn live(program: &Program, planted: bool) -> Built {
+    let policy = policy(OptLevel::O0, Mode::Live);
+    let (machine, memo) = (Machine::default(), Memo::new());
+    let build = Build::new(&machine, program, &policy, &memo);
+    let mut build = if planted { build.without_rebinding() } else { build };
+    build.run(&[(1, member())], &Store::default()).unwrap_or_else(|errors| panic!("{errors:?}"))
+}
+
+/// The key of function `id` in `built`.
+fn key_named(built: &Built, id: u32) -> InstanceKey {
+    let name = format!("f{id}");
+    built.debug_names.iter().find(|it| it.1 == name).map(|it| it.0).expect("a function reached")
+}
+
+/// The oracle of [`rebound_functions_are_reached_through_their_slots`]: a function `after`
+/// fills another way than `before` did under one key (its code or what its places name
+/// changed: a link removes it and adds it, so its code moves) that some function of either
+/// build calls directly. `None` when every such function is reached through its slot.
+fn refilled_and_called_directly(before: &Built, after: &Built) -> Option<String> {
+    let fill = |it: &CompiledFunction| (it.code.clone(), it.relocs.targets().to_vec());
+    for new in &after.functions {
+        let Some(old) = before.functions.iter().find(|it| it.key == new.key) else { continue };
+        if fill(old) == fill(new) {
+            continue;
+        }
+        let direct = Target::Direct(new.key);
+        let caller = (before.functions.iter().chain(&after.functions))
+            .find(|it| it.relocs.targets().contains(&direct));
+        if let Some(caller) = caller {
+            let name = |key: InstanceKey| {
+                (after.debug_names.iter().chain(&before.debug_names))
+                    .find(|it| it.0 == key)
+                    .map_or("(no name)", |it| it.1.as_str())
+            };
+            return Some(format!(
+                "`{}` is filled again under its own key and `{}` calls it directly",
+                name(new.key),
+                name(caller.key)
+            ));
+        }
+    }
+    None
+}
+
+/// A program of 3 to 8 functions, `main` (1) a member's, each calling the next and some of
+/// those after it; each other one a member's, another crate's generic a member instantiates
+/// (over a workspace type or not) or a dependency's; and up to 3 edits, each of one
+/// function's body (applied to a member's own function only: no edit reaches another's).
+fn drawn(tc: &hegel::TestCase) -> (Program, Vec<u32>) {
+    use hegel::generators as gs;
+    let count: u32 = tc.draw(gs::integers::<u32>().min_value(3).max_value(8));
+    let mut program = Program::default();
+    for id in 1..=count {
+        let mut calls: Vec<u32> = Vec::new();
+        for callee in id + 1..=count {
+            if callee == id + 1 || tc.draw(gs::integers::<u8>().max_value(2)) == 0 {
+                calls.push(callee);
+            }
+        }
+        let function = program.function(id, 0x10 + id as u8, &calls);
+        if id == 1 {
+            function.symbol = Some("main".to_owned());
+            continue;
+        }
+        match tc.draw(gs::integers::<u8>().max_value(3)) {
+            0 => {}
+            1 => (function.foreign, function.over_editable) = (true, true),
+            2 => function.foreign = true,
+            _ => function.origin = Origin::Dependency(Package::new("dep")),
+        }
+    }
+    let edits: Vec<u32> =
+        tc.draw(gs::vecs(gs::integers::<u32>().min_value(1).max_value(count)).max_size(3));
+    (program, edits)
+}
+
+/// Builds `program`, then after each of `edits` that names a member's own function, with
+/// its body changed, builds again: the first finding of the oracle between two builds.
+fn first_finding(mut program: Program, edits: &[u32], planted: bool) -> Option<String> {
+    let mut before = live(&program, planted);
+    for (round, id) in edits.iter().enumerate() {
+        let function = program.functions.get_mut(id).expect("drawn among the functions");
+        if function.foreign || !matches!(function.origin, Origin::Member(_)) {
+            continue;
+        }
+        function.body = function.body.wrapping_add(0x20 * (round as u8 + 1));
+        let after = live(&program, planted);
+        if let Some(found) = refilled_and_called_directly(&before, &after) {
+            return Some(found);
+        }
+        before = after;
+    }
+    None
+}
+
+/// The invariant: in a build that reaches edited code through slots, every function an edit
+/// fills again under its own key is reached through its slot by every caller, so no caller a
+/// splice keeps in place holds a direct branch to code the splice replaced.
+#[hegel::test(test_cases = 64)]
+fn rebound_functions_are_reached_through_their_slots(tc: hegel::TestCase) {
+    let (program, edits) = drawn(&tc);
+    if let Some(found) = first_finding(program, &edits, false) {
+        panic!("{found}");
+    }
+}
+
+/// `main` (1) calls a dependency's function (2), which calls another crate's generic (3)
+/// over a member's closure (4), which it calls: the dogfood report's shape
+/// (`Iterator::any::check` over `capabilities::{closure#0}`).
+fn closure_through_a_generic(over_editable: bool) -> Program {
+    let mut program = Program::default();
+    program.function(1, 0x11, &[2]).symbol = Some("main".to_owned());
+    program.function(2, 0x22, &[3]).origin = Origin::Dependency(Package::new("dep"));
+    let generic = program.function(3, 0x33, &[4]);
+    (generic.foreign, generic.over_editable) = (true, over_editable);
+    program.function(4, 0x44, &[]);
+    program
+}
+
+/// The control of [`rebound_functions_are_reached_through_their_slots`]: an edit of the
+/// closure fills the generic over it again under its own key. With the rule its caller
+/// names its slot and the oracle finds nothing; without it (the build before the rule) the
+/// caller holds a direct call, and the oracle names the generic and its caller.
+#[test]
+fn the_oracle_catches_a_refilled_function_called_directly() {
+    for over_editable in [true, false] {
+        let program = || closure_through_a_generic(over_editable);
+        assert_eq!(first_finding(program(), &[4], false), None, "over {over_editable}");
+        let found = first_finding(program(), &[4], true)
+            .unwrap_or_else(|| panic!("over {over_editable}: the planted bug was not found"));
+        assert_eq!(found, "`f3` is filled again under its own key and `f2` calls it directly");
+    }
+}
+
+/// The generic over a member's closure is reached through its slot whether the front end
+/// says it is over a workspace item or only the walk does (it refers to an edited
+/// function); the dependency's function that calls it keeps its direct call from `main`'s
+/// side: nothing an edit does changes its fill. An edit of the closure then compiles the
+/// closure alone and leaves the dependency's function as it was filled.
+#[test]
+fn a_generic_over_an_edited_closure_is_reached_through_its_slot() {
+    for over_editable in [true, false] {
+        let mut program = closure_through_a_generic(over_editable);
+        let before = live(&program, false);
+        let (dependency, generic) = (key_named(&before, 2), key_named(&before, 3));
+        let of = |built: &Built, key: InstanceKey| {
+            let function = built.functions.iter().find(|it| it.key == key).expect("compiled");
+            (function.code.clone(), function.relocs.targets().to_vec())
+        };
+        assert!(of(&before, dependency).1.contains(&Target::Function(generic)));
+        assert!(of(&before, key_named(&before, 1)).1.contains(&Target::Direct(dependency)));
+        assert!(before.patchable.contains(&generic), "among the functions with a slot");
+        assert!(!before.patchable.contains(&dependency));
+
+        program.functions.get_mut(&4).unwrap().body = 0x45;
+        let after = live(&program, false);
+        assert_eq!(key_named(&after, 3), generic, "the generic keeps its key");
+        assert_ne!(key_named(&after, 4), key_named(&before, 4), "the closure has a new one");
+        assert_ne!(of(&after, generic), of(&before, generic), "and the generic names it");
+        assert_eq!(of(&after, dependency), of(&before, dependency), "its caller is untouched");
+    }
+}
+
+/// A function that builds in a rebound one holds its references, so an edit fills it again
+/// too: it is reached through its slot. `main` (1) calls a dependency's function (2) that
+/// builds in another crate's generic (3), which calls a member's function (4).
+#[test]
+fn a_function_that_builds_in_a_rebound_one_is_rebound_too() {
+    let mut program = closure_through_a_generic(false);
+    program.functions.get_mut(&2).unwrap().built_in = vec![0];
+    let built = live(&program, false);
+    let (main, dependency) = (key_named(&built, 1), key_named(&built, 2));
+    let main = built.functions.iter().find(|it| it.key == main).expect("compiled");
+    assert!(main.relocs.targets().contains(&Target::Function(dependency)));
+    assert!(built.patchable.contains(&dependency));
+}
+
+/// A build of a file has no slots in its calls: nothing is rebound, and its code is what
+/// it was before the rule.
+#[test]
+fn a_build_of_a_file_reaches_nothing_through_a_slot() {
+    let program = closure_through_a_generic(true);
+    let policy = policy(OptLevel::O0, Mode::Output);
+    let built = build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default())
+        .unwrap_or_else(|errors| panic!("{errors:?}"));
+    assert!(built.patchable.is_empty());
+    let through_slot = |it: &CompiledFunction| {
+        it.relocs.targets().iter().any(|target| matches!(target, Target::Function(_)))
+    };
+    assert!(!built.functions.iter().any(through_slot));
 }

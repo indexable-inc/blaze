@@ -555,6 +555,9 @@ impl<'db> HirFrontend<'db> {
         // (`always_inlinable_callee`), so nothing patchable is ever built in.
         let editable =
             crate_of(db, &instance.0).is_some_and(|krate| krate.data(db).origin.is_local());
+        // Written elsewhere, over a type, closure or item written in a workspace crate: an
+        // edit there can change what its references resolve to under its own key.
+        let over_editable = !editable && over_local(db, &instance.0);
         Ok(Described {
             item,
             code,
@@ -564,6 +567,7 @@ impl<'db> HirFrontend<'db> {
             args,
             origin,
             editable,
+            over_editable,
             overflow_checks,
             address: if symbol.is_some() { Address::Significant } else { Address::Free },
             symbol,
@@ -1512,6 +1516,19 @@ fn reaches_local(db: &Db, krate: Crate) -> bool {
             .filter(|dep| !dep.crate_id.data(db).target_kind.is_proc_macro())
             .any(|dep| reaches_local(db, dep.crate_id)),
     }
+}
+
+/// Whether one of an instance's type arguments, at any depth, names a type, closure,
+/// coroutine or function item of a crate whose source an edit reaches
+/// ([`Described::over_editable`]): [`HirFrontend::owner`]'s walk, over the crates
+/// [`Described::editable`] is decided by. Only a function with a body of its own has any.
+fn over_local(db: &Db, kind: &Kind) -> bool {
+    let Kind::Code(instance, _) = kind else { return false };
+    let local = |krate: Crate| krate.data(db).origin.is_local();
+    (instance.args.as_ref().iter())
+        .flat_map(|arg| arg.walk())
+        .filter_map(|arg| arg.ty())
+        .any(|ty| names_workspace(db, ty, &local))
 }
 
 /// Whether a type, not looking into its arguments (the walk does), is a workspace crate's.

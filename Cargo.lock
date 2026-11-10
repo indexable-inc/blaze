@@ -710,6 +710,7 @@ dependencies = [
  "blaze-store-check",
  "crossbeam-channel",
  "hashbrown 0.17.1",
+ "hegeltest",
  "serde",
  "serde_json",
  "tracing",
