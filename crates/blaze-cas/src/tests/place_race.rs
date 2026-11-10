@@ -146,7 +146,7 @@ fn race_draw(tc: &TestCase) -> Race {
     }
 }
 
-/// The DST: any schedule of two stores placing the same value at one shared path ends with
+/// The invariant: any schedule of two stores placing the same value at one shared path ends with
 /// both Ok and the path holding the value. `HEGEL_TEST_CASES=<n>` runs it longer.
 #[test]
 fn two_stores_placing_one_value_at_one_path_both_succeed_in_any_order() {
@@ -161,7 +161,7 @@ fn two_stores_placing_one_value_at_one_path_both_succeed_in_any_order() {
 /// The planted-bug control: with the old remove-then-clone-onto-`to` order switched back on,
 /// the same oracle fails under some schedule of the same draws, with the error seen live.
 #[test]
-fn the_place_race_oracle_catches_a_remove_then_clone_onto_the_path() {
+fn the_oracle_catches_a_remove_then_clone_onto_the_path() {
     let mut caught = None;
     'search: for seed in 0..64 {
         for shape in [Shape::Output, Shape::External] {

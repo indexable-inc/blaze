@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-15 invariants, 0 refinements, 1 reference models.
-By level: 6 tested, 9 simulated, 0 model-checked, 0 proved.
+16 invariants, 0 refinements, 1 reference models.
+By level: 6 tested, 10 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
@@ -31,6 +31,8 @@ By level: 6 tested, 9 simulated, 0 model-checked, 0 proved.
   Controls: `an_eviction_that_keeps_the_version`, `an_eviction_of_a_pinned_page`, `pages_unloaded_before_they_are_given_back`, `a_page_loaded_as_its_read_is_asked`, `a_load_with_no_block_checks`, `a_failed_load_kept`, `a_commit_that_does_not_pin_its_file_s_last_page`, `a_prefetch_issued_while_a_demand_load_is_in_flight`, `block_checks_that_stop_at_the_first_bad_block`.
 - **`a_crash_leaves_every_pack_and_its_checks_as_the_head_names_them`** *simulated* (`crates/blaze-cas/src/tests/block_checks.rs`): after a crash at any point of any number of commits, under injected IO failures, the store opens; each pack's checks file holds the checks of the blocks its head names, and the store holds the same; every put reported durable reads back the bytes it was given; and no value reads back other bytes than were put. `HEGEL_TEST_CASES=<n>` runs it longer.
   Controls: `a_head_written_before_its_syncs`.
+- **`two_stores_placing_one_value_at_one_path_both_succeed_in_any_order`** *simulated* (`crates/blaze-cas/src/tests/place_race.rs`): any schedule of two stores placing the same value at one shared path ends with both Ok and the path holding the value. `HEGEL_TEST_CASES=<n>` runs it longer.
+  Controls: `a_remove_then_clone_onto_the_path`.
 
 ### blaze-codegen
 
