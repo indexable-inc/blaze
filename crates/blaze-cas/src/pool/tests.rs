@@ -1638,3 +1638,40 @@ fn the_loader_pins_a_file_s_records_and_loads_them_again_after_eviction() {
     drop(loader);
     _ = std::fs::remove_dir_all(&root);
 }
+
+/// The census is the words' own count: loaded pages, those pinned, and what an eviction could
+/// give back now (unpinned, and not a hot tail), which is what the sweep then frees.
+#[test]
+fn the_census_counts_what_is_loaded_pinned_and_can_be_given_back() {
+    use super::{
+        Tail,
+        evict::{Census, census},
+    };
+    let pool = Pool::new(8, Kernel).unwrap();
+    let mut windows = Windows::new(8);
+    let window = windows.open(&pool, FileId::Pack(0), 4 * PAGE, Rank::Plain).unwrap();
+    let first = window.first_page();
+    assert_eq!(census(&pool, &windows), Census::default());
+    // Three pages in memory, each with the pin it was taken with; the last page's is let go.
+    for page in first + 1..first + 4 {
+        pool.fresh(page).unwrap();
+    }
+    pool.unpin(first + 3);
+    let all = Census { loaded: 3 * PAGE, pinned: 2 * PAGE, evictable: PAGE, unread: 0 };
+    assert_eq!(census(&pool, &windows), all);
+    // The file's last page is passed over while its pack was written in the last two commits.
+    windows.set_tail(FileId::Pack(0), Tail::Hot);
+    assert_eq!(census(&pool, &windows), Census { evictable: 0, ..all });
+    windows.set_tail(FileId::Pack(0), Tail::Cold);
+    pool.unpin(first + 1);
+    pool.unpin(first + 2);
+    let free = Census { loaded: 3 * PAGE, pinned: 0, evictable: 3 * PAGE, unread: 0 };
+    assert_eq!(census(&pool, &windows), free);
+    // What it calls evictable is what the sweep gives back: two laps, since a page taken with
+    // a pin has its second chance.
+    let mut sweep = Sweep::new();
+    let swept = sweep.evict(&pool, &windows, u64::MAX);
+    assert_eq!(swept.refused, None);
+    assert_eq!((swept.freed, sweep.evicted()), (free.evictable, free.evictable), "{swept:?}");
+    assert_eq!(census(&pool, &windows), Census::default());
+}

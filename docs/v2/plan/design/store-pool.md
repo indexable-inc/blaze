@@ -933,8 +933,11 @@ is next. Lane 5 waits on 4b and on admission by footprint reaching main.
        `Kind::Machine`'s.
      - The macOS file threads keep each pool file's descriptor open (lane 2 opens per effect).
      - docs/v2-store.md is brought up to what it then does.
-5. **Eviction with admission.** Not built: it waits on lane 4b (nothing reads through the pool
-   to measure) and on `crates/blaze-graph/src/footprint.rs` and memory-pool.md's one evictor, which
+5. **Eviction with admission.** The pool's side is built on fast-storepool-1110: `evict::census`
+   (the pool's charge, its pinned bytes, what an eviction could give back now, and the unread
+   guesses, from one walk of the state words) beside `Sweep::evict`, and `Sweep::evicted`. The
+   rest is not built: it waits on lane 4b (nothing reads through the pool to measure) and on
+   `crates/blaze-graph/src/footprint.rs` and memory-pool.md's one evictor, which
    are on branches admit-footprint-1106 and kept-memory-1109 and not on main.
    - The pool as the first cache on the one evictor. `PlaneInput::Footprint::evictable` and
      `footprint::Step::Evict`. The ceiling guard evicts before it exits. Pinned bytes go into the

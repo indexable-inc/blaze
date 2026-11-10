@@ -932,6 +932,11 @@ impl Windows {
         self.ids.get(&id).and_then(|first| self.by_first.get(first))
     }
 
+    /// Each open file, in address order: what a census walks.
+    pub(crate) fn files(&self) -> impl Iterator<Item = &Window> {
+        self.by_first.values()
+    }
+
     /// Pages of every open file's committed bytes: what the sweep's bound is twice of.
     pub(crate) fn open_pages(&self) -> u64 {
         self.open_pages

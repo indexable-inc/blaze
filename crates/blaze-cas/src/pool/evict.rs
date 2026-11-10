@@ -18,8 +18,16 @@
 //! the version is raised as the page is taken, so an optimistic copy begun before fails its
 //! check, and no pin succeeds until the page is `Unloaded` and loaded again.
 //!
-//! This is the pool's half of the one evictor's interface (memory-pool.md): `evict(bytes) ->
-//! freed`. Ranking it against the other caches, its `charge` and `cost`, is lane 5's.
+//! This is the pool's half of the one evictor's interface (memory-pool.md):
+//! `evict(bytes) -> freed` ([`Sweep::evict`]), and its charge and what of it can be
+//! given back ([`census`]): what admission's gate reads as `evictable` and asks back with
+//! `Step::Evict` before it waits or fails (the design's section 4). The plane's side of that
+//! (`blaze-graph`'s footprint core) is not on main; nothing calls these from there yet. Ranking
+//! the pool against the other caches by its cost to rebuild (its loads' latency a byte) is the
+//! plane's too.
+//!
+//! The counters come from the same walk, once a sample, never from a count kept on a pin: a pin
+//! writes its page's word and nothing else.
 
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
@@ -27,6 +35,52 @@
 use std::sync::atomic::Ordering;
 
 use super::{Give, PAGE, Plant, Pool, Prefetch, Rank, Referenced, State, Tail, Windows, Word, ranges_of};
+
+/// The pool's pages as the plane and the counters ask of them: one walk of the open files'
+/// state words ([`census`]). Bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) struct Census {
+    /// Pages in memory or on their way (`Loaded`, `Loading`, `Evicting`): the pool's charge,
+    /// what `Tag::Pool` holds of the open files.
+    pub(crate) loaded: u64,
+    /// `Loaded` pages with a pin: not the sweep's to take, and charged to whoever holds them.
+    pub(crate) pinned: u64,
+    /// What an eviction could give back now: `Loaded`, unpinned, and not a pack's last page
+    /// the next commit is likely to write into. A page read since the sweep last came by is
+    /// counted: the sweep takes it on its second lap.
+    pub(crate) evictable: u64,
+    /// Prefetched and not yet read: guesses, the first the sweep takes.
+    pub(crate) unread: u64,
+}
+
+/// The census of `pool`'s open files. It reads each committed page's word once and writes
+/// nothing; the words move under it, so it is a sample, exact only while nothing else runs.
+pub(crate) fn census<G: Give>(pool: &Pool<G>, windows: &Windows) -> Census {
+    let mut census = Census::default();
+    for file in windows.files() {
+        let (first, pages) = (file.first_page(), file.pages());
+        for page in first..first + pages {
+            let word = pool.word_now(page);
+            match word.state() {
+                State::Loading | State::Evicting => census.loaded += PAGE,
+                State::Loaded => {
+                    census.loaded += PAGE;
+                    let hot_tail = file.tail == Tail::Hot && page + 1 == first + pages;
+                    match word.pins() {
+                        0 if !hot_tail => census.evictable += PAGE,
+                        0 => {}
+                        _ => census.pinned += PAGE,
+                    }
+                    if word.prefetched() {
+                        census.unread += PAGE;
+                    }
+                }
+                State::Unloaded | State::Corrupt | State::Abandoned => {}
+            }
+        }
+    }
+    census
+}
 
 /// Pages one batch gives back at most: one `process_madvise` on Linux, one TLB flush.
 pub(crate) const BATCH: usize = 256;
@@ -65,6 +119,8 @@ pub(crate) struct Sweep {
     /// Laps of the open files so far.
     lap: u64,
     batch: Vec<u64>,
+    /// Bytes it has given back to the kernel, ever: the `pool evicted bytes` counter.
+    evicted: u64,
 }
 
 impl Default for Sweep {
@@ -75,7 +131,12 @@ impl Default for Sweep {
 
 impl Sweep {
     pub(crate) fn new() -> Sweep {
-        Sweep { hand: 0, lap: 0, batch: Vec::with_capacity(BATCH) } // alloc: the sweep's batch, once
+        Sweep { hand: 0, lap: 0, batch: Vec::with_capacity(BATCH), evicted: 0 } // alloc: the sweep's batch, once
+    }
+
+    /// Bytes it has given back to the kernel, ever.
+    pub(crate) fn evicted(&self) -> u64 {
+        self.evicted
     }
 
     /// Pages taken and not yet given back.
@@ -158,6 +219,7 @@ impl Sweep {
             Err(err) => (0, Some(err.to_string())),
         };
         let gone = given / PAGE;
+        self.evicted += given;
         // The kernel took the pages of a prefix of the ranges, so of the sorted batch.
         for (i, &page) in self.batch.iter().enumerate() {
             let word = pool.word_now(page);
