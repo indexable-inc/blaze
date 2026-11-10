@@ -929,9 +929,19 @@ impl App {
         let s = self.web();
         let info = self.browser.views.get(&s.view).cloned();
         if let Some(bar) = pane.part("bar") {
-            // The toolbar is out of the way: the page fills the pane, and the bar (back, forward, reload, the address)
-            // comes only while the address is edited (cmd+L) or the extensions menu is open.
-            let want = if self.browser.url.is_some() || self.browser.menu {
+            // The toolbar is out of the way: the page fills the pane, and the bar (back, forward, reload, the address,
+            // close) comes while the address is edited (cmd+L), the extensions menu is open, or the pointer is at the
+            // pane's top (over the bar, or the strip of the page it would take), so the pane can be closed with the
+            // pointer.
+            let reach = view::prefab(self.world.world_ref(), "hn.WebPane")
+                .and_then(|p| View::of(p).part("bar"))
+                .and_then(|b| b.entity().try_cloned::<&Size>())
+                .map_or(0.0, |s| s.h.value);
+            let near = pane.entity().try_cloned::<&Laid>().is_some_and(|l| {
+                let (px, py) = (self.pointer.x, self.pointer.y);
+                l.w > 0.0 && px >= l.x && px < l.x + l.w && py >= l.y && py < l.y + reach
+            });
+            let want = if self.browser.url.is_some() || self.browser.menu || near {
                 view::prefab(self.world.world_ref(), "hn.WebPane").and_then(|p| View::of(p).part("bar")).and_then(|b| b.entity().try_cloned::<&Size>())
             } else {
                 bar.entity().try_cloned::<&Size>().map(|s| Size { h: Sizing::fixed(0.0), ..s })
