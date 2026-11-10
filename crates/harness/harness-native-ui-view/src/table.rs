@@ -9,6 +9,9 @@
 //! that needs less than an even split keeps only its need, the widest gets the slack), down to a floor of a few words so
 //! the main column is never cut to a sliver; only past the floors does the table scroll sideways (its `scroll`). A long
 //! cell is cut at its column's end with an ellipsis and shows its whole value on hover.
+//! A small table too wide for its room is not cut at all: it is stacked ([`stacks`]), each row a record of its own, its
+//! first cell the title and every other field under it by name, whole and wrapped, a hairline between rows; so a
+//! comparison of a few things reads in a narrow pane as well as a wide one.
 //! A press on a row (when the host gives an action) opens it below as a record, every field whole and wrapped at the
 //! width that shows (Nushell's `get`): it stays in view while the rows scroll sideways under it. Only the rows in view
 //! exist, in two lazy columns around the open record.
@@ -241,6 +244,18 @@ pub fn find(text: &str, query: &str) -> Option<(u32, u32)> {
 const SHORT_EM: f32 = 11.0;
 /// The narrowest a long column gets before the table scrolls sideways.
 const FLOOR_EM: f32 = 8.0;
+/// The most rows a table stacks ([`stacks`]): past it, it is data to scan down columns, and stays a grid that scrolls.
+const STACK_ROWS: usize = 12;
+/// How far past its room a table's whole width runs before it stacks: under it, a cell loses a word and the grid stays.
+const STACK_OVER: f32 = 1.12;
+
+/// Whether a table of `cols` columns and `rows` rows that needs `whole` points to show every cell whole stacks in a room
+/// `room` wide (0: not laid out yet, so not known): it is small, and too wide by more than a word.
+#[must_use]
+pub fn stacks(cols: usize, rows: usize, whole: f32, room: f32) -> bool {
+    room > 0.0 && cols >= 2 && rows <= STACK_ROWS && whole > room * STACK_OVER
+}
+
 /// The widest a column grows.
 const MAX_EM: f32 = 34.0;
 /// Rows measured for widths (a long table's later rows are like its first).
@@ -373,6 +388,53 @@ pub fn table<'a>(t: View<'a>, data: &Table, opts: Opts<'_>, measure: &mut dyn Fn
             Width::of(measured[c].0, measured[c].1, em, share)
         })
         .collect();
+    // Stacked: every row a record, nothing cut (the module's doc). The grid's parts are then empty and no height.
+    let stack = t.part("stack");
+    let whole = needs.iter().sum::<f32>() + gap * n.saturating_sub(1) as f32 + pad;
+    let stacked = stack.is_some() && stacks(n, shown, whole, view_w);
+    set_size(scroll, Size { w: Sizing::GROW, h: if stacked { Sizing::fixed(0.0) } else { Sizing::FIT } });
+    let key_style = style_of(w, &format!("{look}Field"), "key");
+    let key_w = (0..n).map(|c| measure(&data.cols[c].name, &key_style, false)).fold(0.0, f32::max).min(14.0 * em);
+    let (field, field_md) = (format!("{look}Field"), format!("{look}FieldMd"));
+    if let Some(stack) = stack {
+        let rows = (0..if stacked { shown } else { 0 }).flat_map(|r| {
+            let md = n > 0 && data.cell(r, 0).kind == Kind::Markdown;
+            let rule = (r > 0).then(|| (format!("d{r}"), "ui.TableStackRule", (r, false)));
+            rule.into_iter().chain(std::iter::once((format!("s{r}"), if md { "ui.TableStackRowMd" } else { "ui.TableStackRow" }, (r, true))))
+        });
+        for_each_of(stack, rows, |v, (r, row), _| {
+            if !row {
+                return;
+            }
+            let act = match opts.presses {
+                Some(p) => p.get(r).cloned().unwrap_or_default(),
+                None => String::new(),
+            };
+            if v.entity().try_cloned::<&Action>().is_none_or(|x| x.name.as_str() != act) {
+                v.set(Action { name: act.as_str().into() });
+            }
+            if let Some(x) = v.part("title") {
+                let cell = data.cell(r, 0);
+                x.text(if cell.text.is_empty() { "\u{2014}" } else { &cell.text });
+            }
+            let Some(fields) = v.part("fields") else { return };
+            let each = (1..n).map(|c| {
+                let pf = if data.cell(r, c).kind == Kind::Markdown { field_md.as_str() } else { field.as_str() };
+                (format!("f{c}"), pf, c)
+            });
+            for_each_of(fields, each, |f, c, _| {
+                if let Some(k) = f.part("key") {
+                    k.text(&data.cols[c].name);
+                    set_size(k, Size { w: Sizing::fixed(key_w), h: Sizing::FIT });
+                }
+                if let Some(x) = f.part("value") {
+                    let cell = data.cell(r, c);
+                    x.text(if cell.text.is_empty() { "\u{2014}" } else { &cell.text });
+                }
+            });
+        });
+    }
+    let shown = if stacked { 0 } else { shown };
     let aligns: Vec<Justify> = (0..n)
         .map(|c| match data.align(c) {
             Align::End => Justify::End,
@@ -393,14 +455,14 @@ pub fn table<'a>(t: View<'a>, data: &Table, opts: Opts<'_>, measure: &mut dyn Fn
         }
     };
     let row_h = body.entity().try_cloned::<&harness_native_ui_layout_api::Lazy>().map_or(22.0, |l| l.row);
-    if data.head {
+    if data.head && !stacked {
         set_size(head_row, Size { w: Sizing::GROW, h: Sizing::fixed(row_h) });
         set_size(rule, Size { w: Sizing::GROW, h: Sizing::fixed(1.0) });
     } else {
         set_size(head_row, Size { w: Sizing::GROW, h: Sizing::fixed(0.0) });
         set_size(rule, Size { w: Sizing::GROW, h: Sizing::fixed(0.0) });
     }
-    let heads = (0..if data.head { n } else { 0 }).map(|c| (format!("c{c}"), head_pf.as_str(), c));
+    let heads = (0..if data.head && !stacked { n } else { 0 }).map(|c| (format!("c{c}"), head_pf.as_str(), c));
     for_each_of(head_row, heads, |v, c, _| {
         if let Some(x) = v.part("text") {
             x.text(&data.cols[c].name);
@@ -477,9 +539,6 @@ pub fn table<'a>(t: View<'a>, data: &Table, opts: Opts<'_>, measure: &mut dyn Fn
         fill_row(row, first + i as usize, fresh);
     });
     // The open row as a record below it: each field's name, then its value whole, wrapped.
-    let key_style = style_of(w, &format!("{look}Field"), "key");
-    let key_w = (0..n).map(|c| measure(&data.cols[c].name, &key_style, false)).fold(0.0, f32::max).min(14.0 * em);
-    let (field, field_md) = (format!("{look}Field"), format!("{look}FieldMd"));
     let fields: Vec<(String, &str, (usize, usize))> = open
         .into_iter()
         .flat_map(|o| (0..n).map(move |c| (o, c)))
@@ -641,6 +700,16 @@ mod tests {
         assert_eq!(find("\u{1F600}ab", "B"), Some((3, 4)));
         assert_eq!(find("abc", " "), None);
         assert_eq!(find("ab", "abc"), None);
+    }
+
+    #[test]
+    fn a_small_table_too_wide_stacks() {
+        // Five columns of words in a narrow pane: stacked. The same in a wide one, a long one, or one a word over: a grid.
+        assert!(stacks(5, 4, 1400.0, 700.0));
+        assert!(!stacks(5, 4, 1400.0, 1500.0));
+        assert!(!stacks(5, 400, 1400.0, 700.0));
+        assert!(!stacks(5, 4, 740.0, 700.0));
+        assert!(!stacks(5, 4, 1400.0, 0.0));
     }
 
     #[test]
