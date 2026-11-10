@@ -340,8 +340,10 @@ fn kept(path: &str, output: &blaze_link::Output) -> KeptImage {
     let kept = Linked {
         image: blaze_link::Image::new(to, output.clone()).unwrap(),
         output: output.clone(),
-        functions: vec![(InstanceKey(ContentId([9; 32])), ContentId([9; 32]))],
-        statics: Vec::new(),
+        rows: super::kept::Rows {
+            functions: [(InstanceKey(ContentId([9; 32])), ContentId([9; 32]))].into(),
+            ..Default::default()
+        },
         natives: Vec::new(),
         names: Vec::new(),
         layout: None,
@@ -420,7 +422,7 @@ fn a_kept_image_is_taken_only_for_its_own_output_and_layout() {
     let mut images = vec![kept(path, &output)];
     let (linked, changed, relaid) = kept_image(&mut images, path, &output, None).unwrap();
     assert_eq!(
-        (linked.functions.len(), changed, relaid),
+        (linked.rows.functions.len(), changed, relaid),
         (1, Some(OutputFields::default()), false)
     );
     assert!(images.is_empty(), "taken out for the link");
@@ -429,7 +431,7 @@ fn a_kept_image_is_taken_only_for_its_own_output_and_layout() {
     let heat = Some(ContentId([3; 32]));
     let (fresh, changed, relaid) = kept_image(&mut images, path, &output, heat).unwrap();
     assert!(
-        fresh.functions.is_empty() && fresh.layout == heat && relaid,
+        fresh.rows.functions.is_empty() && fresh.layout == heat && relaid,
         "another profile: laid out again"
     );
     assert_eq!(changed, Some(OutputFields::default()));
@@ -438,13 +440,13 @@ fn a_kept_image_is_taken_only_for_its_own_output_and_layout() {
     images.push(KeptImage { path: path.to_owned(), kept: fresh });
     let other = shared(&["f", "g"]);
     let (fresh, changed, _) = kept_image(&mut images, path, &other, heat).unwrap();
-    assert!(fresh.functions.is_empty() && fresh.output == other);
+    assert!(fresh.rows.functions.is_empty() && fresh.output == other);
     assert_eq!(changed.map(|it| it.to_string()).as_deref(), Some("exports"));
     assert!(images.is_empty(), "the image of the old output is let go");
 
     let (fresh, changed, relaid) = kept_image(&mut images, path, &output, None).unwrap();
     assert!(
-        fresh.functions.is_empty() && changed.is_none() && !relaid,
+        fresh.rows.functions.is_empty() && changed.is_none() && !relaid,
         "nothing kept: a first link"
     );
 

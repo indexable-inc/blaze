@@ -3230,9 +3230,8 @@ fn assemble(
             let mut spans: Vec<CodeHash> = match generated.roots.tests.is_empty() {
                 true => Vec::new(),
                 false => generated
-                    .side()
+                    .spans()
                     .map_err(|what| ApiError::new(what, Some(u.target.name.clone())))?
-                    .spans
                     .iter()
                     .map(|(anchor, table)| {
                         let mut hasher = Hasher::new(SPANS);

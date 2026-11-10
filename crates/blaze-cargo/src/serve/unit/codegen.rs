@@ -33,6 +33,7 @@ use crate::serve::work::{Full, Linking, OutputFields};
 
 type KeptImage = crate::serve::work::Image<Real>;
 
+mod kept;
 #[cfg(test)]
 mod tests;
 
@@ -848,6 +849,7 @@ impl Parts {
             policy: &self.policy,
             image: self.image,
             side: Default::default(),
+            spans: Default::default(),
         }
     }
 }
@@ -860,13 +862,22 @@ pub(crate) struct Generated<'a> {
     pub(crate) policy: &'a Policy,
     /// Whether the link maps the dependency image ([`Parts::image`]).
     pub(crate) image: bool,
-    /// The span tables and debug names the build's code names: read once, by the first
-    /// link or test selection that needs them, and none for a library.
+    /// The span tables the build's code names, as a change of those its last link was given
+    /// ([`HirFrontend::link_inputs`]): read once, by the first link that needs them, and none
+    /// for a library.
     #[expect(
         clippy::disallowed_types,
-        reason = "read once, by the first link or test selection that needs it: per unit's codegen, not global"
+        reason = "read once, by the first link that needs it: per unit's codegen, not global"
     )]
     side: std::cell::OnceCell<LinkInputs>,
+    /// Every span table the build's code names, made whole ([`HirFrontend::span_tables`]):
+    /// read once, by a test's selection, a test binary's table, or a link that holds no
+    /// earlier tables to change.
+    #[expect(
+        clippy::disallowed_types,
+        reason = "read once, by the first test selection or link that needs it: per unit's codegen, not global"
+    )]
+    spans: std::cell::OnceCell<Vec<(ContentId, Vec<u8>)>>,
 }
 
 impl Generated<'_> {
@@ -916,13 +927,25 @@ impl Generated<'_> {
         self.frontend.vecreport(self.built, &reports).map_err(|it| it.what)
     }
 
-    /// What the link takes beside the code ([`HirFrontend::link_inputs`]).
+    /// What the link takes beside the code ([`HirFrontend::link_inputs`]): the span tables
+    /// an edit changed, for a link that holds the rest.
     pub(crate) fn side(&self) -> Result<&LinkInputs, String> {
         if let Some(side) = self.side.get() {
             return Ok(side);
         }
         let side = self.frontend.link_inputs(self.built).map_err(|it| it.what)?;
         Ok(self.side.get_or_init(|| side))
+    }
+
+    /// Every span table the build's code names, by anchor, sorted
+    /// ([`HirFrontend::span_tables`]): each made again, whatever a link before was given.
+    pub(crate) fn spans(&self) -> Result<&[(ContentId, Vec<u8>)], String> {
+        if let Some(spans) = self.spans.get() {
+            return Ok(spans);
+        }
+        let _span = tracing::info_span!(target: "blaze", "link span tables whole").entered();
+        let spans = self.frontend.span_tables(self.built).map_err(|it| it.what)?;
+        Ok(self.spans.get_or_init(|| spans))
     }
 }
 
@@ -1266,14 +1289,13 @@ fn texts(
 }
 
 /// An image kept linked at one path, and what is in it, so the next link of it is a change.
-/// Each column is sorted, so a link's diff against it is one merge pass. Functions and statics
-/// are rows of their key and the hash of all of them as built ([`function_rows`],
-/// [`static_rows`]), which each link hashes again; natives are their contents' hashes.
+/// Functions, statics and span tables are rows of their key and the hash of each as built
+/// ([`kept::Rows`]), which a link brings forward by its build's delta: only what the build
+/// changed is hashed. Natives are their contents' hashes, sorted.
 pub struct Linked {
     image: Image,
     output: Output,
-    functions: Vec<FunctionRow>,
-    statics: Vec<StaticRow>,
+    rows: kept::Rows,
     natives: Vec<ContentId>,
     names: Vec<String>,
     /// The profile its first link laid it out by ([`super::layout::Weights::id`]): a kept
@@ -1287,8 +1309,8 @@ pub struct Linked {
     /// What a dev executable's running code assumes of its workspace crates' items, as of its
     /// last link ([`HirFrontend::live_assumed`]).
     assumed: Vec<(ItemKey, Assumed)>,
-    /// What its last link was given besides its rows ([`given_id`]); `None` before one. A
-    /// link that keeps every row and is given the same changes nothing, so it is not staged.
+    /// What its last link was given, as one id ([`kept::Rows::given`]); `None` before one. A
+    /// link that is given the same changes nothing, so it is not staged.
     given: Option<ContentId>,
 }
 
@@ -1308,8 +1330,7 @@ impl Linked {
         }
         let names = self.names.iter().map(|it| it.capacity() as u64).sum::<u64>();
         self.image.held()
-            + rows(&self.functions)
-            + rows(&self.statics)
+            + self.rows.held()
             + rows(&self.natives)
             + rows(&self.names)
             + names
@@ -1796,9 +1817,35 @@ fn link_at(
             .map_err(linker(LinkStep::Locate))?;
         (assembled, located)
     };
+    // The span tables the code names, as a change of those the last link was given: what
+    // an edit moved is made again, the rest is neither read nor encoded (`items` resolved,
+    // `read` tables kept untouched, `made` tables encoded; `whole` says why nothing kept
+    // was used).
     let side = {
-        let _span = tracing::info_span!(target: "blaze", "link inputs", unit = %path).entered();
-        generated.side()?
+        let span = tracing::info_span!(
+            target: "blaze",
+            "link inputs",
+            unit = %path,
+            items = tracing::field::Empty,
+            functions = tracing::field::Empty,
+            verified = tracing::field::Empty,
+            read = tracing::field::Empty,
+            made = tracing::field::Empty,
+            bytes = tracing::field::Empty,
+            whole = tracing::field::Empty,
+        )
+        .entered();
+        let side = generated.side()?;
+        span.record("items", side.work.items);
+        span.record("functions", side.work.functions);
+        span.record("verified", side.work.verified);
+        span.record("read", side.work.kept);
+        span.record("made", side.work.made);
+        span.record("bytes", side.work.bytes);
+        if let Some(why) = side.work.whole {
+            span.record("whole", why);
+        }
+        side
     };
     // The profiles the target directory keeps for layout, what they say of this image, and
     // that as this build's instances.
@@ -1957,8 +2004,7 @@ pub(crate) fn fresh_image(
         image: Image::new(to, output.clone())
             .map_err(|error| LinkCause::Linker { step: LinkStep::Image, error })?,
         output: output.clone(),
-        functions: Vec::new(),
-        statics: Vec::new(),
+        rows: kept::Rows::default(),
         natives: Vec::new(),
         names: Vec::new(),
         layout,
@@ -2008,18 +2054,23 @@ pub(crate) fn static_rows(
     old: &[StaticRow],
     statics: &[blaze_codegen::Static],
 ) -> Result<(Vec<StaticRow>, Vec<StaticRow>, Vec<StaticRow>), String> {
-    let mut scratch = Vec::new();
     let mut rows = Vec::with_capacity(statics.len());
     for it in statics {
-        scratch.clear();
-        blaze_protocol::cbor::append(&mut scratch, it)
-            .map_err(|error| format!("the static {:?}: {error}", it.item))?;
-        rows.push((it.item, it.instance, ContentId::of(STATIC_DOMAIN, &scratch)));
+        rows.push(static_row(it)?);
     }
     rows.sort_unstable();
     let (mut gone, mut new) = (Vec::new(), Vec::new());
     diff(old, &rows, &mut gone, &mut new);
     Ok((rows, gone, new))
+}
+
+/// The row of one static: its item, its instance and the hash of its whole definition.
+pub(crate) fn static_row(it: &blaze_codegen::Static) -> Result<StaticRow, String> {
+    // alloc: per static hashed, its encoding, freed with the row made
+    let mut scratch = Vec::new();
+    blaze_protocol::cbor::append(&mut scratch, it)
+        .map_err(|error| format!("the static {:?}: {error}", it.item))?;
+    Ok((it.item, it.instance, ContentId::of(STATIC_DOMAIN, &scratch)))
 }
 
 /// A function by its instance key and the hash of all of it as this build filled it
@@ -2145,14 +2196,19 @@ fn relink(
         }
         None => None,
     };
-    // What of the image this build changes: its natives, function rows, static rows and
-    // names against the columns the image keeps.
+    // What of the image this build changes: its natives and names against the columns the
+    // image keeps, and its function rows, static rows and span tables by the build's delta
+    // (`rows` hashed, `hashed` bytes of code and digest; `whole` says why every row was made
+    // again, when the image's last link was not of the build's base).
     let delta = tracing::info_span!(
         target: "blaze",
         "link delta",
         unit = %path,
         gone = tracing::field::Empty,
         new = tracing::field::Empty,
+        rows = tracing::field::Empty,
+        hashed = tracing::field::Empty,
+        whole = tracing::field::Empty,
     )
     .entered();
     // Each native input by the hash of its contents, through the process's table of files by
@@ -2206,11 +2262,7 @@ fn relink(
         }
     }
 
-    let (functions, removed, added_keys) =
-        function_rows(&linked.functions, &built.functions, &built.debug_names)?;
-    let (statics, gone_statics, new_statics) = static_rows(&linked.statics, &built.statics)?;
-    delta.record("gone", removed.len() + gone_statics.len());
-    delta.record("new", added_keys.len() + new_statics.len());
+    // alloc: per link, the functions reached through slots: a workspace's, by key
     let mut patchable: Vec<InstanceKey> = built.patchable.iter().copied().collect();
     patchable.sort_unstable();
     let mut names: Vec<(String, Target)> =
@@ -2241,10 +2293,44 @@ fn relink(
             .map_err(|what| LinkCause::Given(format!("{path}: {what}")))?,
         None => (Vec::new(), Vec::new()),
     };
+    // The rows: brought to this build by its delta where the image's last link was of the
+    // delta's base, so only what the build changed is hashed; else made again from the
+    // build's whole lists, and the span says why. Nothing of `linked` but its rows is written
+    // from here to the stage, and a stage the image refuses takes the rows back (`undo`).
+    let spans = match linked.rows.spans_of(side) {
+        Some(spans) => spans,
+        // The image holds neither the tables the front end kept nor their base (its first
+        // link beside another image's, or one after a link that failed): it takes them all.
+        None => kept::Spans::All {
+            serial: side.serial,
+            // alloc: per link given every table, a row a table
+            tables: generated.spans()?.iter().map(|(anchor, it)| (*anchor, None, &it[..])).collect(),
+        },
+    };
+    // alloc: per link, the span tables the linker is given: those that changed
+    let given_spans: Vec<(ContentId, &[u8])> = match &spans {
+        kept::Spans::Same => Vec::new(),
+        kept::Spans::Changed(inputs) => {
+            // The front end's tables outlive `spans`, which the rows take.
+            let inputs: &LinkInputs = *inputs;
+            inputs.tables.iter().map(|it| (it.anchor, &it.bytes[..])).collect()
+        }
+        kept::Spans::All { tables, .. } => tables.iter().map(|it| (it.0, it.2)).collect(),
+    };
+    let takes = linked.rows.takes(built);
+    let mut work = kept::Work::default();
+    let kept::Applied { removed, added: added_keys, gone_statics, new_statics, spans: _, undo } =
+        linked.rows.apply(built, spans, &mut work)?;
+    delta.record("gone", removed.len() + gone_statics.len());
+    delta.record("new", added_keys.len() + new_statics.len());
+    delta.record("rows", work.rows);
+    delta.record("hashed", work.row_bytes + work.digest_bytes);
+    if let Some(why) = work.whole {
+        delta.record("whole", why);
+    }
     let mut now_named: Vec<&str> = names.iter().map(|it| it.0.as_str()).collect();
     let (kept_names, unnamed) = renamed(std::mem::take(&mut linked.names), &mut now_named);
-    let given =
-        given_id(&names, &weak_names, &side.debug_names, &side.spans, &built.cold, &native_ids);
+    let given = linked.rows.given(built.id, &native_ids);
     // Nothing to link: every row kept, the same names, natives and span tables, and a file
     // patched in place (no code memory, no slots). Staging it would make a new generation
     // whose file differs only in its build id, so an image whose inputs did not change (a
@@ -2268,36 +2354,62 @@ fn relink(
             .image
             .file()
             .map_err(|error| LinkCause::Linker { step: LinkStep::Bytes, error })?;
-        let table = tests_table(test, path, generated, side, linked)?;
+        let table = tests_table(test, path, generated, linked)?;
         return Ok((bytes, read, table, Laid::Nothing, super::run::inproc::Told::Nothing));
     }
     // clone: the names gone, a few a link, which an image that refuses the change still has
     let gone_names = unnamed.clone();
-    let change = Change {
-        added: built
-            .functions
+    // The names for debuggers of what the delta lists: the image holds the rest. A build's
+    // lists are in key order (`driver.rs` makes each from its nodes), so each is a search.
+    let listed = || {
+        let functions = &built.delta.functions;
+        functions.added.iter().chain(&functions.changed)
+    };
+    let debug_names: Vec<(InstanceKey, String)> = match takes {
+        // alloc: none, empty: the image was given this build's names
+        Ok(true) => Vec::new(),
+        Ok(false) => listed()
+            .filter_map(|key| built.debug_names.binary_search_by(|it| it.0.cmp(key)).ok())
+            // clone: per link, the names of the functions the build changed
+            .map(|at| built.debug_names[at].clone())
+            .collect(),
+        // clone: once per image linked from the build's whole lists
+        Err(_) => built.debug_names.clone(),
+    };
+    // What a layout reads of the cold functions: all of them where the image is laid out
+    // whole (its first link, or an output that keeps no room), else those of the functions
+    // this link adds, which are all it places.
+    let cold: Vec<InstanceKey> = match takes.is_err() || !linked.output.incremental {
+        // clone: once per image laid out whole, the functions codegen inferred cold
+        true => built.cold.clone(),
+        false => added_keys
             .iter()
-            .filter(|it| added_keys.binary_search(&it.key).is_ok())
+            .copied()
+            .filter(|key| built.cold.binary_search(key).is_ok())
+            .collect(),
+    };
+    let change = Change {
+        added: added_keys
+            .iter()
+            .filter_map(|key| built.functions.binary_search_by(|it| it.key.cmp(key)).ok())
+            .map(|at| &built.functions[at])
             .collect(),
         removed,
         // A whole build tiers nothing up: the slots that run another function than their own
         // are an edited function's earlier keys', in a live image.
         slots,
-        statics: built
-            .statics
+        statics: new_statics
             .iter()
-            .filter(|it| {
-                new_statics
-                    .binary_search_by(|row| (row.0, row.1).cmp(&(it.item, it.instance)))
-                    .is_ok()
+            .filter_map(|id| {
+                built.statics.binary_search_by(|it| (it.item, it.instance).cmp(id)).ok()
             })
+            .map(|at| &built.statics[at])
             .collect(),
-        removed_statics: gone_statics.iter().map(|row| (row.0, row.1)).collect(),
+        removed_statics: gone_statics,
         names,
         weak_names,
         unnamed,
-        // clone: once per image linked, a unit links one or two
-        debug_names: side.debug_names.clone(),
+        debug_names,
         natives: bytes_of
             .iter()
             .map(|(at, bytes)| match assembled.get(*at) {
@@ -2322,10 +2434,9 @@ fn relink(
             })
             .collect(),
         removed_natives,
-        spans: side.spans.iter().map(|(anchor, bytes)| (*anchor, bytes.as_slice())).collect(),
+        spans: given_spans,
         heat,
-        // clone: once per image linked, the functions codegen inferred cold
-        cold: built.cold.clone(),
+        cold,
         // How each function was made, sorted by key: what the image's code is summed by.
         made: &built.made,
     };
@@ -2407,11 +2518,11 @@ fn relink(
             linked.names = kept_names;
             linked.names.extend(gone_names);
             linked.names.sort_unstable();
+            // The image is as it was, so its rows are: the next link's delta is against them.
+            linked.rows.undo(undo);
             return Err(cause);
         }
     };
-    linked.functions = functions;
-    linked.statics = statics;
     linked.natives = new_natives;
     linked.names = kept_names;
     linked.slotted = slotted;
@@ -2419,7 +2530,7 @@ fn relink(
     linked.given = Some(given);
     let table = {
         let _span = tracing::info_span!(target: "blaze", "link tables", unit = %path).entered();
-        tests_table(test, path, generated, side, linked)?
+        tests_table(test, path, generated, linked)?
     };
     Ok((bytes, read, table, laid, told))
 }
@@ -2445,7 +2556,6 @@ fn tests_table(
     test: bool,
     path: &str,
     generated: &Generated<'_>,
-    side: &LinkInputs,
     linked: &Linked,
 ) -> Result<Option<blaze_codegen::ExecTable>, String> {
     if !test {
@@ -2454,65 +2564,14 @@ fn tests_table(
     let table = super::test::image::table(
         path,
         generated.built,
-        &side.spans,
+        // Every span table, made whole: a test binary's table reads them all.
+        generated.spans()?,
         linked.image.slots(),
         |key| linked.image.slot(key).map(|it| it.0),
         ContentId::default(),
         &generated.roots.tests,
     )?;
     Ok(Some(table))
-}
-
-/// What a link is given besides its function and static rows, as one id: each name and what
-/// it names, which names are weak, the debug names, the span tables, the cold functions and the
-/// natives in their order. Two links of one image with the same rows and this id stage the same
-/// image.
-fn given_id(
-    names: &[(String, Target)],
-    weak_names: &[String],
-    debug_names: &[(InstanceKey, String)],
-    spans: &[(ContentId, Vec<u8>)],
-    cold: &[InstanceKey],
-    natives: &[ContentId],
-) -> ContentId {
-    let mut hasher = blaze_ids::Hasher::new("blaze v2 link given 1");
-    hasher.update(&(names.len() as u64).to_le_bytes());
-    for (name, target) in names {
-        hasher.part(name.as_bytes());
-        match target {
-            Target::Function(key) => hasher.update(&[0]).id(&key.0),
-            Target::Direct(key) => hasher.update(&[1]).id(&key.0),
-            Target::Static { item, instance } => hasher.update(&[2]).id(&item.0).id(instance),
-            // A link names only functions and statics (`relink`); any other is hashed by what
-            // it is, so it can never match a link that named something else.
-            other => hasher.update(&[3]).part(format!("{other:?}").as_bytes()), // alloc: never reached by `relink`'s names
-        };
-    }
-    // A name turning weak changes who wins it, so it is an input of the link.
-    hasher.update(&(weak_names.len() as u64).to_le_bytes());
-    for name in weak_names {
-        hasher.part(name.as_bytes());
-    }
-    hasher.update(&(debug_names.len() as u64).to_le_bytes());
-    for (key, name) in debug_names {
-        hasher.id(&key.0).part(name.as_bytes());
-    }
-    hasher.update(&(spans.len() as u64).to_le_bytes());
-    for (anchor, bytes) in spans {
-        hasher.id(anchor).part(bytes);
-    }
-    let mut cold = cold.to_vec(); // alloc: once per link, the cold functions' keys
-    cold.sort_unstable();
-    cold.dedup();
-    hasher.update(&(cold.len() as u64).to_le_bytes());
-    for key in &cold {
-        hasher.id(&key.0);
-    }
-    hasher.update(&(natives.len() as u64).to_le_bytes());
-    for id in natives {
-        hasher.id(id);
-    }
-    hasher.finish()
 }
 
 /// What the code `unit` links of its workspace crates assumes of their items, by key, sorted
@@ -2611,11 +2670,19 @@ pub(crate) fn edited_slots(
     debug_names: &[(InstanceKey, String)],
 ) -> Result<(Vec<(InstanceKey, InstanceKey)>, Vec<(ContentId, InstanceKey)>), String> {
     // alloc: once per live link, a pair per patchable function, kept by the image
-    let mut now: Vec<(ContentId, InstanceKey)> = identities
-        .iter()
-        .filter(|it| patchable.binary_search(&it.0).is_ok())
-        .map(|(key, id)| (*id, *key))
-        .collect();
+    let mut now: Vec<(ContentId, InstanceKey)> = Vec::with_capacity(patchable.len());
+    for key in patchable {
+        // The walk's instances are first, in key order (`driver.rs`), then each folded
+        // group's body: a patchable function is found by search among the first, and looked
+        // for through the list only if the search misses it.
+        let found = match identities.binary_search_by(|it| it.0.cmp(key)) {
+            Ok(at) => Some(identities[at].1),
+            Err(_) => identities.iter().find(|it| it.0 == *key).map(|it| it.1),
+        };
+        if let Some(id) = found {
+            now.push((id, *key));
+        }
+    }
     now.sort_unstable();
     now.dedup();
     // Two functions one across edits: which of them an earlier key's slot runs is not
