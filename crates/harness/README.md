@@ -20,10 +20,10 @@ harness is its own cargo workspace with its own `Cargo.lock`, excluded from blaz
 | `harness-proto/` | the one schema the daemon, every client and the chat logs speak: deterministic CBOR, frames, messages, chat events, the log format and its migration |
 | `harness-vt/` | terminal state through libghostty-vt (built by zig) |
 | `harness-ghostty-config/` | reads the user's Ghostty config |
-| `harness-native/` | the macOS app: `scene/*.flecs` (tokens, views, keys), fonts, icons, Metal shaders |
+| `harness-native/` | the macOS app, a library with a thin binary: `scene/*.flecs` (tokens, views, keys), fonts, icons, Metal shaders; `harness_native::scene::world()` is the scene every host loads (the app, its tests, harness-video) |
 | `harness-native-render/` | the renderer the app and harness-video share: Metal (Slang shaders), text, vector marks, the paint pass |
 | `harness-native-blaze/` | blaze's fire wordmark, live (drop in, catch, burn to embers), and its synthesised soundtrack (from indexable-inc/anim) |
-| `harness-video/` | videos from flecs scenes on the same stack, a timeline of `Cue`s as data (blaze's launch video: `scene/launch.flecs`) |
+| `harness-video/` | videos from flecs scenes loaded into the app's own scene (its tokens, prims and `hn.*` widgets), a timeline of `Cue`s as data (blaze's launch video: `scene/launch.flecs`) |
 | `harness-native-*` | the app's layers: model, flecs glue, ECS, UI layout/motion/draw/input/text and their `-api` crates, prims (`harness-native-ui-prims/scene/`), scroll physics |
 | `vendor/` | the hyperion-* crates over flecs (flecs itself is the indexable-inc/flecs fork, pinned by rev in `vendor/hyperion-flecs-c/Cargo.toml`; `vendor/SOURCE.md`) |
 | `scripts/zig` | fetches the pinned zig through Nix |

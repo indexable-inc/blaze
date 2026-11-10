@@ -29,6 +29,11 @@ state (`harness-vt`).
    applied in `harness-native/src/app/ghostty.rs`) retints the theme-driven ones at runtime.
 5. **Keys** (`harness-native/scene/20-keys.flecs`): bindings are data, see below.
 
+harness-native is a library (`src/lib.rs`; the binary is a thin `main`). `harness_native::scene::world()` is layers 1 to 4
+loaded headless, and every host stands on it: the app's window, its tests, and `harness-video`, which loads a video's
+scene into it, so a video uses the same tokens, prims and `hn.*` widgets as the app (see `harness-video/README.md`).
+A part both should show goes in a widget file or the prims, never in a video's scene.
+
 Rust owns only: the terminal grid (thousands of cells a frame, never entities), key dispatch, the layout solver,
 springs, drawing (shared with harness-video in `harness-native-render`: Metal, text, the paint pass), the daemon link. Everything a designer would tweak lives in script.
 
@@ -55,7 +60,7 @@ springs, drawing (shared with harness-video in `harness-native-render`: Metal, t
 | Pointer shape | `Cursor: {shape: Text}` on a node (nearest ancestor's wins; makes it a hit target): Text on what takes typing or selection, Arrow on controls, Hand only on links (macOS's conventions); the host's zones (terminal grid, sidebar edge) and drags in `harness-native/src/app/pointer.rs` |
 | Scrolling | `ui.Scroll` (clips, shifts by `ScrollState`) carries `ui.Scroller`, macOS's overlay scroller: knob and track parts (`ScrollerPart`) layout places from `ScrollExtent`, motion fades and widens (`ScrollerState`), input drags and pages (`ScrollerGrip`); tokens `scroller_*`, `NoScroller` turns it off, `ScrollFed` lets a host feed the extent (the terminal), `scroll_quietly` moves without showing it. A host running its own physics (the tree's, harness-native-scroll-physics, in `harness-native/src/app/sidebar.rs`; a chat's) adopts a `ScrollState` the scroller wrote |
 | Motion | `MatchedGeometry {id}` (selection pill), `Transition: {kind: Opacity/Slide/Scale/Move}`, `Animate`, `HoverAmt`/`HoverLift` springs; spring params are tokens |
-| Pose / timeline | `Pose: {dx, dy, shrink, fade, cut}` (0 at rest; draw folds it into the subtree, layout ignores it); a `Cue` child animates any member by path over the clock (`harness-native-ui-timeline`, used by `harness-video`) |
+| Pose / timeline | `Pose: {dx, dy, shrink, fade, cut}` (0 at rest; draw folds it into the subtree, layout ignores it); a `Cue` child animates any member by path over the clock (`harness-native-ui-timeline`; `cue.FadeIn`/`FadeOut`/`PushIn` in prims' cue.flecs name the moves). Only `harness-video` applies cues; the app's frame does not |
 | Text motion, code colour | `GlyphsIn: {at, per, dur, by, ease}` (glyph-by-glyph arrival), `Caret: {at, until, blink, ink}`, `Sheen: {period, rest, band, strength, still, ease, bands, phase, scatter, dark, light}` (a band of light sweeping through the words, the sign of work: `ui.Shimmer`, a working row's title; strength 0 is off and free), `Highlight: {file}` (tree-sitter, inks from `code_ink.<capture>` tokens). Words always break at the width their box has this frame, so they re-wrap live through a fold, instantly (only broken again over glyphs shaped once, `Layout::wrap`). Never lay words out at a rest width: `LaysAtRest` is for a terminal's grid only |
 | A running step's block | `ui.Block` + `PixelBlock: {face, turn}`: a pixel-art block (a game's item icon) whose face names what a step does (`exec`, `read`, `edit`, `net`, `think`, ...; drawn in harness-native-render block.rs, no file); set another face and it turns a quarter to it. The one coloured, moving thing in the app (a running step's line) |
 | Pixel art | `Picture: {handle}` + `Pixelated`, `Frames: {count, fps}` for a sheet; `BlazeMark: {start, exit}` for the live fire wordmark (`harness-native-blaze`). Drawn as one texture, texels fetched not filtered: never a panel per cell (those seam when scaled) |
@@ -141,7 +146,8 @@ template hn.ObjRow {
   `warning`, `error` and their `_wash`. Below them sit the palettes (kinds, brand marks, file types, chart series,
   GitHub states, `code_ink.*`), colours that name a thing. A widget names a role (`Fill: $tone_card`), never a colour,
   and never a new one-off token: add a role if none fits. `no_raw_colours` (harness-native's app.rs tests) fails on a
-  colour literal elsewhere; harness-video/scene/tokens.flecs mirrors the roles in its own look.
+  colour literal elsewhere. A video (harness-video) is loaded on these same tokens; only what is its own is in a token
+  file beside its scene.
 - Sizes, radii and springs are `export const` tokens in 00-tokens.flecs too, never literals in a view.
 - Colour, size and spring roles come from `hn.Theme` children (`hn.Theme.card` reads `$tone_card`: a token named like
   the entity that reads it does not resolve, flecs#2389); Rust reads them by name (`harness-native/src/look.rs` `role`,

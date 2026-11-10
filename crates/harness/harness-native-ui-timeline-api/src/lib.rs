@@ -117,10 +117,10 @@ pub enum Voice {
 }
 
 /// A sound of the scene's soundtrack, as data, one component per concern so a prefab carries a voice's defaults and an
-/// instance sets only what differs (`ding : sound.Bell { Onset: {2.0} Pitch: {1760} }`): which voice ([`Sound`]), when it
+/// instance sets only what differs (`ding : voice.Bell { Onset: {2.0} Pitch: {1760} }`): which voice ([`Sound`]), when it
 /// starts ([`Onset`], required), how long it rings ([`Lasts`]), its pitch ([`Pitch`]), level ([`Gain`]) and where it is
-/// heard from ([`Pan`]). harness-video ships the `sound.*` prefabs, one a voice, and mixes every entity with a `Sound`
-/// and an `Onset` into the soundtrack, in the same room as the mark's score.
+/// heard from ([`Pan`]). harness-native-ui-prims ships the `voice.*` prefabs, one a voice (scene/voice.flecs); harness-video
+/// mixes every entity under its frame with a `Sound` and an `Onset` into the soundtrack, in the same room as the mark's score.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct Sound {
     pub voice: Voice,
