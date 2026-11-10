@@ -48,7 +48,7 @@ ratex-font = "=0.1.14"
 ratex-parser = "=0.1.14"
 ratex-layout = "=0.1.14"
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(target_vendor = "apple")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = "0.3"
 objc2-metal = "0.3"
