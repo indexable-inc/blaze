@@ -45,6 +45,22 @@ character (he has moods).
 </Grid>
 ```
 
+Numbers are drawn. A part of a whole (disk, memory, a quota) is a donut with the figure that matters beside it,
+never a sentence:
+
+```svelte
+<Row>
+  <Chart kind="donut" data={[{label: 'Used', value: 7231}, {label: 'Free', value: 469}]} unit="GB" height={140} />
+  <Column>
+    <Stat label="Free" value="469 GB" note="of 7.7 TB" />
+    <Text tone="warning">94% full</Text>
+  </Column>
+</Row>
+```
+
+Several amounts to compare are a bar chart (largest first), something over time a line chart, one figure alone a
+Stat.
+
 Content: Column, Row, Text (tone: ink muted strong error accent success warning), Markdown, Code, Table (rows of
 records; query, onselect; a cell that is an inline reference, `from: '<Path loc="/abs/file.md" line={12}>rule 48</Path>'`,
 draws as its chip: give a row its source that way), Badge, Stat (label, value, note), Card (title), Divider and Spacer.
