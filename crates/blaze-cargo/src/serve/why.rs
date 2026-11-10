@@ -146,6 +146,7 @@ struct Record {
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Ledger {
     /// A bug a test plants to show its oracle catches it ([`Plant`]).
+    #[cfg(test)]
     plant: Plant,
     items: BTreeMap<(String, ContentId), Last>,
     /// Records from builds before this one may lack a later compute of their subject: a build's
@@ -155,16 +156,17 @@ pub struct Ledger {
 }
 
 /// A bug the tests plant to show their oracles catch it: never in a build of blaze.
+#[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub(crate) enum Plant {
     #[default]
-    None,
+    None = 0,
     /// Every part of a key is said to have changed, whether its hash did.
-    BlameEveryPart,
+    BlameEveryPart = 1,
     /// A part that is another step's result is not followed.
-    FollowNothing,
+    FollowNothing = 2,
     /// A step's ends are left in the order they were reached in, each as often as reached.
-    EndsAsReached,
+    EndsAsReached = 3,
 }
 
 /// A build's misses explained: what it computed again, sorted by item, then step, so an item's
@@ -317,7 +319,7 @@ impl Ledger {
             // A part that is another step's result: that step's reasons, in this build or as
             // the ledger recorded them in a build since `since`.
             let mut follow = |name: Option<&str>, part: &str, since: u64, mine: &mut Vec<Reason>| {
-                if self.plant == Plant::FollowNothing {
+                if self.planted(2) {
                     return;
                 }
                 let Some(name) = name.or(miss.via.as_deref()) else {
@@ -466,7 +468,7 @@ impl Ledger {
                         all.extend(theirs.iter().cloned()); // clone: once an edge
                     }
                 }
-                if self.plant != Plant::EndsAsReached {
+                if !self.planted(3) {
                     all.sort();
                     all.dedup();
                 }
@@ -660,6 +662,18 @@ impl Ledger {
         changed
     }
 
+    /// Whether a test planted bug `plant` ([`Plant`], by its number): never in a build of
+    /// blaze.
+    #[cfg(test)]
+    fn planted(&self, plant: u8) -> bool {
+        self.plant as u8 == plant
+    }
+
+    #[cfg(not(test))]
+    fn planted(&self, _plant: u8) -> bool {
+        false
+    }
+
     fn cause(&self, miss: &Miss) -> RebuildCause {
         match &miss.missed {
             Missed::New => self.against(miss),
@@ -715,7 +729,7 @@ impl Ledger {
                 None => RebuildCause::Lost { since },
             };
         }
-        let changed = changed(&last.parts, &miss.parts, self.plant == Plant::BlameEveryPart);
+        let changed = changed(&last.parts, &miss.parts, self.planted(1));
         match changed.is_empty() {
             true => RebuildCause::Unnamed { since },
             false => RebuildCause::Parts {

@@ -49,15 +49,16 @@ note: recomputed 3 steps because crates/core/main.rs changed  [why: input]
    | `Evicted { by: Memory, Age or Cap, when }` | it was computed before and the result or its record was dropped; the dropper recorded that it did |
    | `PreviousFailed { since }` | its key is the one of its last compute, which was in a build that failed or was stopped and kept nothing |
    | `Forced { how }` | computed because it was asked for: a build script named in `unsandboxed-build-scripts` runs every build |
-   | `KeyUnstable { part }` | a `Result` part differs though the step it names has not been computed since: the same inputs gave another value, a determinism bug in blaze |
-   | `Unexplained { what }` | anything else. A blaze bug: printed as one, counted, and the fixtures assert there are none |
+   | `KeyUnstable { part }` | a `Result` part differs though the step it names was not computed in between: the same inputs gave another value, a determinism bug in blaze. Defined and printed, not yet produced: until hits are recorded it cannot be told from a reuse under an older key, so that case is `Unexplained` |
+   | `Unexplained { what }` | anything else. A blaze bug: printed as one, counted (a `blaze` warning event a build, with the count, where the profile's events see it), and the fixtures assert there are none |
 
    A differing `Result` part is followed (`serve/why.rs`, `Ends`):
    - the step it names was recomputed in this build: its ends are this step's too;
    - it was not, and the ledger's records of that item are from a build after this step's last
      compute: their recorded ends (`Last::ends`) are this step's (it changed in a build this
      step took no part in);
-   - it was not, and every record of it is older: `KeyUnstable`;
+   - it was not, and every record of it is older: `Unexplained`, saying so (`KeyUnstable`
+     once hits are recorded);
    - it names no step (a dev template's `its code`): the unit that computed it
      (`Miss::via`) is followed, since a unit's key covers, deeply, every source its functions'
      code is made from;
@@ -120,7 +121,7 @@ note: recomputed 3 steps because crates/core/main.rs changed  [why: input]
 ## What is printed
 
 **After every build that recomputed something** (`blaze build`, `check`, `test`, `run`'s
-build), once `Finished` is out: the CLI asks the daemon for the build's summary
+build; not yet the live test view, `cli/live.rs`), once `Finished` is out: the CLI asks the daemon for the build's summary
 (`Request::Rebuilt { build: Some(id), .. }`, `Rebuilt::summary`) and draws each report with
 the one renderer (docs/v2/plan/design/structured-output.md). Under `--message-format=json`
 each is a `{"reason":"blaze-report","report":{...}}` line. Nothing is said by a build that
@@ -132,16 +133,16 @@ kind, most first, naming at most 3 items and counting the rest:
 
 | root cause | severity, rule | headline |
 |---|---|---|
-| input | note, `why:input` | `recomputed N steps because PATH changed` (or `` `env CC` changed``; two inputs joined by `and`; past 3, a count) |
+| input | note, `why:input` | `recomputed N steps because PATH changed` (or `` `env CC` changed``; inputs joined by `and`; past 3, a count) |
 | trivia only | warning, `why:wasted` | `recomputed N steps because PATH changed, though no item in it did (comments only): wasted work, a bug in blaze's keys` |
 | first time | note, `why:first` | `computed N steps for the first time`, no facts: a cold build is one line |
-| evicted | note, `why:evicted` | `recomputed N steps whose records were dropped by blaze why's ledger cap` |
-| previous failed | note, `why:failed` | `recomputed N steps whose last compute failed or was stopped` |
-| forced | note, `why:forced` | `recomputed N steps as asked: HOW` |
-| key unstable | warning, `why:unstable` | ``recomputed N steps because `PART` came out different from the same inputs: a determinism bug in blaze`` |
+| evicted | note, `why:evicted` | `recomputed N steps because blaze why's ledger dropped its records of them to stay under its cap` |
+| previous failed | note, `why:failed` | `recomputed N steps because the last compute of each failed or was stopped` |
+| forced | note, `why:forced` | `recomputed N steps because that was asked for: HOW` |
+| key unstable | warning, `why:unstable` | ``recomputed N steps because `PART` came out different from the same inputs (a determinism bug in blaze)`` |
 | unexplained | warning, `why:unexplained` | ``N steps recomputed for no recorded reason: a blaze bug (`blaze why --unexplained`)`` |
 
-A cause with several kinds of end joins their phrases. The summary is a function of the
+A cause with several kinds of end joins their clauses with `and`. The summary is a function of the
 build's explained misses alone: sorted, no clock, no map order (`deterministic-output`).
 
 **`blaze why`**: the groups by step and diff, as before, each item's chain with `blaze why
@@ -167,13 +168,22 @@ ITEM`, `--all`, `--json`. **`blaze why --unexplained`** lists only the steps wit
 
 ## Tests
 
-Invariants (`serve/why.rs` tests, each with its planted-bug control):
-- every recomputed step of a build has ends, none `Unexplained`, on the fixtures;
-- an `InputChanged` end names an input the two builds really differ in;
-- the summary is the same for the same pair of builds, whatever order the misses arrive in.
-Fixtures: one for each terminal reason; the three edits of ripgrep that started this lane
-(a body edit, a comment in the same file, a comment in a leaf crate), asserting the text
-names the file and, for the comments, says no item changed.
+Invariants (`serve/why.rs` tests, over a model of ripgrep's three crates and every way their
+files can be left, commented or edited; each with its planted-bug control, `Plant`):
+- every recomputed step of a build has ends, none `Unexplained`
+  (`the_oracle_catches_a_result_part_not_followed`);
+- an `InputChanged` end names a file the two builds really differ in, as trivia exactly when
+  its code text is the same (`the_oracle_catches_an_unchanged_part_blamed`). It holds for a
+  build against the one before it; with a reuse in between (A, B, A reused, C) the diff is
+  against B, which is the "hits are not tracked" gap below;
+- the summary is the same whatever order the misses arrive in
+  (`the_oracle_catches_ends_in_the_order_reached`).
+
+Fixtures: each terminal reason that is produced (all but `KeyUnstable` and an eviction by
+memory or age); the three edits of ripgrep that started this lane (a body edit, a comment in
+the same file, a comment in a leaf crate), asserting the text names the file and, for the
+comments, says no item changed. These run on the model, with the producers' misses built by
+hand: the producers themselves (`identity_parts`, the driver's parts) have no test yet.
 
 ## Not yet
 
@@ -191,5 +201,11 @@ names the file and, for the comments, says no item changed.
 - Hits are not tracked: after A, B, A (reused), C, C is compared with B.
 - Frames have no checksum: a bit-rotted length in a middle record reads as a torn tail.
 - `--all` after a cold build is not paged.
+- A count of unexplained steps as a column of the history (`builds` or `misses`), so `blaze
+  slow` and SQL can gate on it; today it is an event.
+- The summary in the live test view (`cli/live.rs`).
+- A dev template computed under two keys for one function and settings in one build (two
+  units whose builds of a shared generic differ in what is built in) is `Twice`, so
+  `Unexplained`: whether that happens on real projects is not known.
 - The end-to-end path on a real project (ripgrep, the three edits) has not been run on this
-  lane's tree.
+  lane's tree, and nothing here has been compiled.
