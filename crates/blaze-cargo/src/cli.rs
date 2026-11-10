@@ -31,6 +31,7 @@ pub mod clean;
 pub mod client_rows;
 pub mod daemon;
 pub mod doc;
+mod duckdb;
 pub mod fetch_url;
 pub mod fix;
 pub mod inspect;
@@ -695,6 +696,21 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
         return Err(error);
     }
     let ok = match called {
+        // A build that left units unchecked behind a failure failed: the exit status is of what
+        // was asked for, all of it built. A daemon that says `Done { ok: true }` after it named
+        // them is wrong, and is said so, never believed (0.20261028.7 ended a `build` 0 with
+        // both of its binaries unbuilt).
+        Ok(true) if printer.left_unchecked() > 0 => {
+            printer.flush()?;
+            // alloc: an error, once
+            let what = format!(
+                "the daemon said the build passed after it left {} unit(s) unchecked or unbuilt \
+                 behind a failure (named above): it failed, and the daemon's answer is a bug in blaze",
+                printer.left_unchecked()
+            );
+            printer.err().write_all(say::error(&what, shown.color).as_bytes())?;
+            false
+        }
         Ok(ok) => ok && !printer.refused(),
         Err(error) => {
             printer.flush()?;
