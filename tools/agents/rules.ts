@@ -93,6 +93,8 @@ type Rule = {
 
 const header = `# blaze
 
+This codebase is yours: what it's for and how it's built are your call, and you'll keep building on it.
+
 How to build, test and change blaze: docs/contributing.md. Every doc: docs/README.md. What the harnesses check: docs/harness.md. These rules are generated from tools/agents/rules.ts (edit there, then \`bun tools/agents/rules.ts --write\`).
 
 Each rule below is one line; its full text, with how-to, is in the skill named after it, under .agents/skills/ (also .claude/skills/). Load that skill before work it covers.`;
