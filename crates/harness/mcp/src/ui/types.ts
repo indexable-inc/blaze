@@ -313,9 +313,9 @@ export type MapPoint = readonly [number, number] | { lat: number; lon: number } 
 /** One place on a Map: its pin, the words beside it, and a line more and a link shown when it is pressed. */
 export interface MapMarker { lat: number; lon: number; label?: string; detail?: string; href?: string }
 /**
- * Places on a real map (OpenStreetMap) that pans and zooms: a pin and its label per marker (at most 200), fitted to them, or looking
- * at `center` with `zoom` (0 the world to 19 a building); `here` is a dot for where the person is. The kernel serves the map's page
- * and it is drawn as the Browser of that view (map.ts, map-view.ts), which stays live after the cell finishes.
+ * Places on a real map (Apple's, a live MapKit view over the element's card) that pans and zooms: a pin and its label per marker
+ * (at most 200), fitted to them, or looking at `center` with `zoom` (a web map's: 0 the world to 19 a building); `here` is a dot for
+ * where the person is. A pin's `detail` shows when it is pressed, and its `href` opens from there (map.ts).
  */
 export interface MapProps extends CommonProps { markers?: readonly MapMarker[]; center?: MapPoint; zoom?: number; here?: MapPoint }
 

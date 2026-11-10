@@ -129,9 +129,7 @@ page gets a real composition), `Focus`, `Nav`. The host answers with `Cursor` (a
 - **The card.** When a cell uses the browser, its step's shown value is `{ t: "browser", view, url, title }`
   (`mcp/src/shown.ts`); chat.rs's `value_rows` draws it as the genui `Browser` element in its compact form: a live picture
   of the page, its title and host under it. Agents can also draw one themselves: `<Browser view={page.view} />` or
-  `<Browser src="https://…" />`. Pressing a card opens its view in the pane. The genui `Map` element is one of these too: the
-  kernel serves a page of its own (MapLibre GL over OpenFreeMap's vector tiles of OpenStreetMap, `mcp/src/ui/map.ts`) on 127.0.0.1 and opens a kept
-  view at it (`mcp/src/ui/map-view.ts`).
+  `<Browser src="https://…" />`. Pressing a card opens its view in the pane.
 - **The pane.** `hn.WebPane`, beside the main card on the right: a toolbar (back, forward, reload, the URL field, the
   extensions button, close) over the view, sized by its own spring like the left sidebar's fold. Its state is data on one
   entity, `hn.web`: `WebPane { view, open, width }` and the tabs it lists; `act.web.*` actions and keys in 20-keys.flecs

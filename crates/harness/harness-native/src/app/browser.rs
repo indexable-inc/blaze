@@ -921,9 +921,7 @@ impl App {
                 t.text(&title);
             }
             if let Some(u) = m.part("url") {
-                // A page the kernel serves from this Mac (a Map's, mcp/src/ui/map-view.ts) has no address worth
-                // reading: a port and a token.
-                u.text(if url.starts_with("http://127.0.0.1:") { "" } else { short(&url) });
+                u.text(short(&url));
             }
         }
         if let Some(l) = card.part("load") {

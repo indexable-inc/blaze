@@ -93,11 +93,11 @@ in.u.<uniform>; texture(name, uv)); uniforms and textures take values or '@id' o
 live value, a Video's frames): <Shader aspect="16:9" textures={{ clip: '@clip' }} uniforms={{ gain: '@gain' }}>float4
 main(ShaderInput in) { return texture(clip, in.uv) * in.u.gain; }</Shader>.
 
-Places: Map shows them on a real map (OpenStreetMap) the person can pan and zoom, a pin and its label each; never draw a
-map by hand or list coordinates. markers is at most 200 of {lat, lon, label, detail, href} (lat -90 to 90, lon -180 to
-180; detail and href show when a pin is pressed). It is fitted to the markers, or looks at center={[lat, lon]} with zoom
-(0 the world, 13 a town, 19 a building); here={[lat, lon]} is a dot for where the person is, and takes what `location()`
-returns as it is. It stays live after the cell finishes; pressing it opens it in the browser pane.
+Places: Map shows them on Apple's map, live in the transcript: the person pans and zooms it in place, a pin and its
+label each; never draw a map by hand or list coordinates. markers is at most 200 of {lat, lon, label, detail, href} (lat
+-90 to 90, lon -180 to 180; detail shows when a pin is pressed, and href opens from there). It is fitted to the markers,
+or looks at center={[lat, lon]} with zoom (a web map's: 0 the world, 13 a town, 19 a building); here={[lat, lon]} is a
+blue dot for where the person is, and takes what `location()` returns as it is.
 
 ```svelte
 <script>const me = await location();</script>

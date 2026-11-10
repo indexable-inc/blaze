@@ -1,7 +1,6 @@
 import { DRAWING, PROPS, article, TEXT_PROP, WIRED, WORDS_ONLY, ViewNode, commonWire, elementWire, holdsError, placeError, taskOf, wholeChartError, wireValue, written } from './element.ts';
 import type { ElementName } from './element.ts';
-import { mapOf } from './map.ts';
-import { mapGone, mapShown } from './map-view.ts';
+import { mapOf, mapWire } from './map.ts';
 import { resolveFile, resolveMedia } from './media.ts';
 import { resolveRefs } from './shader.ts';
 import type { Attachment, Handler } from './element.ts';
@@ -102,11 +101,6 @@ export class UiTree implements Attachment {
   private shown: UiNode | UiNode[] | undefined;
   private disposed = false;
   private mounting = false;
-  /** The Map elements drawn in the last pass, and in this one: one that leaves the UI has its view closed (map-view.ts). */
-  private maps = new Set<ViewNode>();
-  private mapsNow = new Set<ViewNode>();
-  /** The Maps whose failure the cell's logs already say. */
-  private mapFailed = new WeakSet<ViewNode>();
 
   constructor(private readonly options: TreeOptions) {}
 
@@ -147,11 +141,11 @@ export class UiTree implements Attachment {
       if (thrown) throw thrown.error;
     } catch (error) {
       this.mounting = false;
-      this.unmount(true);
+      this.unmount();
       throw error;
     }
     this.mounting = false;
-    try { this.pass(); } catch (error) { this.unmount(true); throw error; }
+    try { this.pass(); } catch (error) { this.unmount(); throw error; }
   }
 
   /** Sends what changed, at most once per RENDER_MS however many changes arrive. */
@@ -204,16 +198,8 @@ export class UiTree implements Attachment {
     } finally { running = before; }
   }
 
-  /**
-   * Unmounts everything (`onDestroy` and effect cleanups run) and stops sending. `gone`: what it showed is no longer shown (the cell
-   * drew again, or took it down), so its Maps' views are closed; without it they stay open under the card the transcript keeps.
-   */
-  unmount(gone = false): void {
-    if (gone) {
-      for (const node of [...this.maps, ...this.mapsNow]) mapGone(node);
-      this.maps.clear();
-      this.mapsNow.clear();
-    }
+  /** Unmounts everything (`onDestroy` and effect cleanups run) and stops sending. */
+  unmount(): void {
     if (this.disposed) return;
     this.disposed = true;
     clearTimeout(this.timer);
@@ -238,13 +224,7 @@ export class UiTree implements Attachment {
     this.lastPass = Date.now();
     this.dirty = false;
     this.places = new WeakMap();
-    // (A pass that threw may have opened a Map's view before it did: those are still this tree's.)
-    for (const node of this.mapsNow) this.maps.add(node);
-    this.mapsNow = new Set();
     const nodes = this.children(this.container);
-    // A Map that is no longer in the UI (an {#if} took it out) has its view closed; one still there keeps it.
-    for (const node of this.maps) if (!this.mapsNow.has(node)) mapGone(node);
-    this.maps = this.mapsNow;
     // A Shader's '@id's are checked over the whole tree, so an id may come after the Shader that names it.
     const bad = resolveRefs(nodes, node => this.places.get(node as UiNode));
     if (bad) throw placed(bad.error, this.places.get(bad.node as UiNode));
@@ -351,22 +331,15 @@ export class UiTree implements Attachment {
       props.task = task;
       props.call = found;
     }
-    // A Map is drawn as the Browser of the view its page is in (map-view.ts opens it): a Loading until the view is open, the reason
-    // in place when it cannot be. Its common props go to whichever stands for it.
+    // A Map goes as its checked places and where it looks (map.ts `mapWire`): the app covers its card with Apple's map.
     if (type === 'Map') {
       const where = node.at ? ` (${node.at})` : '';
       const inner = kids.find(child => child.isElement);
       if (inner) throw placed(new TypeError(`<Map> holds ${inner.type}${where}: a Map holds nothing; its places are markers={[{lat, lon, label}]}`), node.at);
       const spec = mapOf(props);
       if (typeof spec === 'string') throw placed(new TypeError(`<Map> ${spec}${where}`), node.at);
-      this.mapsNow.add(node);
-      const shown = mapShown(node, spec, () => this.schedule());
-      try {
-        if (shown.state === 'open') return { type: 'Browser', props: commonWire('Browser', props, elementWire('Browser', { view: shown.view }, node.at), node.at), children: [] };
-        if (shown.state === 'opening') return { type: 'Loading', props: commonWire('Loading', props, elementWire('Loading', { label: 'Opening the map' }, node.at), node.at), children: [] };
-        if (!this.mapFailed.has(node)) { this.mapFailed.add(node); this.options.fail('Map', new Error(`<Map>${where}: ${shown.why}`)); }
-        return { type: 'Text', props: commonWire('Text', props, { text: shown.why, tone: 'error' }, node.at), children: [] };
-      } catch (error) { throw error instanceof Error ? placed(error, node.at) : error; }
+      try { return { type: 'Map', props: commonWire('Map', props, mapWire(spec), node.at), children: [] }; }
+      catch (error) { throw error instanceof Error ? placed(error, node.at) : error; }
     }
     // A control, and every element of tier 3, goes as exactly what the app reads of it (element.ts `elementWire`). One that holds only
     // its words (a Button's label) or nothing has no children on the wire; the rest hold what `holdsError` lets them, where `placeError` does.

@@ -23,6 +23,7 @@ mod common;
 mod control;
 mod float;
 mod layout;
+mod map;
 mod media;
 mod props;
 mod surface;
@@ -39,7 +40,7 @@ const MAX_ROWS: usize = 200;
 const MAX_COLS: usize = 12;
 
 /// Each element the app draws and its prefab: the kernel's `ELEMENT_NAMES` (mcp/src/ui/element.ts).
-const ELEMENTS: [(&str, &str); 53] = [
+const ELEMENTS: [(&str, &str); 54] = [
     ("Column", "hn.GenColumn"),
     ("Row", "hn.GenRow"),
     ("Text", "hn.GenText"),
@@ -93,6 +94,7 @@ const ELEMENTS: [(&str, &str); 53] = [
     ("ColorPicker", "hn.GenColorPicker"),
     ("DropZone", "hn.GenDropZone"),
     ("Browser", "hn.GenBrowser"),
+    ("Map", "hn.GenMap"),
 ];
 /// The elements that take input (genui/control.rs).
 const CONTROLS: [&str; 10] = ["Button", "Toggle", "Checkbox", "Slider", "NumberField", "Input", "TextArea", "Select", "Choice", "Radio"];
@@ -263,6 +265,7 @@ fn own_refusal(world: WorldRef<'_>, node: &Value, within: &Within, live: Option<
         "Chart" => chart::check(world, node),
         "Canvas" => canvas::check(world, node),
         "Browser" => browser::check(node),
+        "Map" => map::check(node),
         k if CONTROLS.contains(&k) => control::check(node),
         "Table" => match prop(node, "rows") {
             Value::Null | Value::Array(_) => None,
@@ -345,6 +348,7 @@ fn element(v: View<'_>, node: &Value, depth: usize, b: &mut Budget<'_, '_>) {
         "ColorPicker" => color::element(v, node, b),
         "DropZone" => dropzone::element(v, node, &kids, depth, b),
         "Browser" => browser::element(v, node),
+        "Map" => map::element(v, node),
         "Column" | "Row" => {
             spacing(v, prefab_of(kind), node);
             children(v, &kids, depth + 1, b);
