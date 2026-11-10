@@ -408,6 +408,19 @@ fn a_promoted_temporary_with_its_place_in_it_runs() {
     assert_eq!(case.ok(&["run"]), "main.rs:16\nmain.rs:11\n");
 }
 
+/// An `async` body with an `.await` in a branch a constant condition rules out (`if F::ON { ..
+/// .await }` of an associated constant, or of a `const`) builds and runs: the branch's blocks are
+/// not compiled, so its yield has no arm in the switch that resumes or drops the future. Each
+/// `.await` that runs suspends once, and the last future is dropped suspended.
+#[test]
+fn an_await_a_constant_condition_rules_out_builds() {
+    let case = Case::new("an_await_a_constant_condition_rules_out_builds");
+    assert_eq!(
+        case.ok(&["run"]),
+        "dropped early\ndropped early\n(7, 2) (8, 2)\n(2, 1) (7, 2)\n(8, 2)\ndropped early\n"
+    );
+}
+
 /// sqlx's `#[sqlx::test(migrations = "..")]` passes `&Migrator { migrations: Cow::Borrowed(const
 /// { &[..] }), .., ..Migrator::DEFAULT }` where a `&'static Migrator` is wanted: a record literal
 /// with a constant base, and a `const { .. }` block, are promoted, as rustc promotes them. blaze
