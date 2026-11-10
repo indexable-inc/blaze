@@ -466,9 +466,6 @@ pub struct ChatState {
     sizes: HashMap<String, Option<(u32, u32)>>,
     /// The aside asked from this composer, shown over it until closed ([`Aside`]).
     aside: Option<Aside>,
-    /// The step (its call's block, its place among the call's steps) whose page the browser pane was last opened on
-    /// for this chat ([`App::chat_pane_page`]): each step opens it once.
-    paned: Option<(String, usize)>,
 }
 
 /// What an aside's answer is as the link delivers it: the fork's words (markdown), or why there are none.
@@ -607,7 +604,6 @@ impl Default for ChatState {
             draft_saved: (String::new(), Vec::new()),
             sizes: HashMap::new(),
             aside: None,
-            paned: None,
         }
     }
 }
@@ -987,7 +983,8 @@ fn empty_value(v: &Value) -> bool {
             "text" => blank("v"),
             "error" => blank("stack") && blank("message"),
             "scalar" => false,
-            // A page of the harness browser is shown in the browser pane (App::chat_pane_page), never in the transcript.
+            // A page of the harness browser is never drawn in the transcript: a page opened for the person is a line
+            // that shows it in the browser pane when pressed (steps::Out::Page with a view).
             "browser" => true,
             _ => true,
         },
@@ -1170,6 +1167,29 @@ fn rows_nested(t: &Transcript, shows: Shows<'_>) -> (Vec<(String, Row)>, HashSet
                 if open && item(piece).is_none_or(|n| !shown(n)) {
                     nested.extend(out[from..].iter().map(|(k, _)| k.clone()));
                 }
+            }
+        }
+        // A page a step opened for the person (browser.open) is what the turn did for them, not how: while the steps
+        // are folded away it stays as one line under the turn, the page's host as a link that shows it in the browser
+        // pane (opened, each step says its own). One line a view, at the address the turn left it.
+        if !open {
+            let mut pages: Vec<(u64, String, String)> = Vec::new(); // alloc: a turn's pages, a handful
+            for n in rest.iter().flat_map(|p| match p {
+                Piece::Item(n) => vec![*n],
+                Piece::Run(r) => r.items.clone(),
+            }) {
+                let Item::Tool { block, .. } = &t.items[n] else { continue };
+                let Some(d) = t.details.get(block) else { continue };
+                for e in &d.effects {
+                    if let Some(view) = steps::pane_view(&e.value) {
+                        pages.retain(|(v, _, _)| *v != view);
+                        let said = |k: &str| e.value[k].as_str().unwrap_or("").to_owned();
+                        pages.push((view, said("url"), said("title")));
+                    }
+                }
+            }
+            for (view, url, title) in pages {
+                out.push((format!("{key}.page{view}"), Row::Out(steps::Out::Page { verb: "Opened".into(), url, tip: title, view: Some(view) })));
             }
         }
         if last {
@@ -2548,33 +2568,6 @@ impl App {
             self.poke();
         }
         left
-    }
-
-    /// The page the focused chat's turn in flight just opened for the person (browser.open; its shown value says
-    /// `pane`, cdp.ts `Page.kept`), for the browser pane to show: the newest such step's view, once a step. Only a turn
-    /// in flight, so a chat read again later opens nothing; only the focused chat, so another chat's agent does not
-    /// take the pane.
-    pub(in crate::app) fn chat_pane_page(&mut self) -> Option<u64> {
-        let (_, _, sid) = self.focused_chat()?;
-        let (key, view) = {
-            let chats = self.chats.borrow();
-            let t = chats.get(&sid).filter(|t| t.busy)?;
-            t.items[turn_start(t)..].iter().rev().find_map(|i| {
-                let Item::Tool { block, .. } = i else { return None };
-                let d = t.details.get(block)?;
-                d.effects.iter().enumerate().rev().find_map(|(k, e)| {
-                    let view = genui::browser_view_id(&e.value["view"]).filter(|_| e.value["t"] == "browser" && e.value["pane"] == true)?;
-                    Some(((block.clone(), k), view))
-                })
-            })?
-        };
-        let mut chat = self.chat.borrow_mut();
-        let st = chat.get_mut(&sid)?;
-        if st.paned.as_ref() == Some(&key) {
-            return None;
-        }
-        st.paned = Some(key);
-        Some(view)
     }
 
     /// An aside card's close button (`chat:aside_close:<sid>`): chat `sid`'s aside closed.
