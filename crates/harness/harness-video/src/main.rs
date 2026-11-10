@@ -11,10 +11,11 @@
 //!
 //! The soundtrack is synthesised offline (harness-native-blaze's `sound`), deterministic, placed binaurally, and written
 //! lossless (ALAC) by AVAssetWriter: the `BlazeMark`'s score from the mark's own timeline, plus every `Sound` the scene
-//! declares as data. A scene with neither is silent.
+//! declares under its frame as data. A scene with neither is silent.
 //!
-//! The scene's directory holds `tokens.flecs` (the names the prims read: tones, radii, sizes, springs and the Ink, Muted,
-//! Plate... prefabs), loaded before the prims and the scene, and the media its `Picture`s name.
+//! The scene is loaded into the app's own world (`harness_native::scene::world`: the app's tokens, the `ui.*` prims with
+//! the `cue.*` moves and `voice.*` voices, and the `hn.*` widgets), so a video names the same tokens and is made of the
+//! same parts as the app, and declares only what is its own. Its directory holds the media its `Picture`s name.
 mod encode;
 mod hdr;
 
@@ -28,7 +29,6 @@ use harness_native_render::pack::Frame;
 use harness_native_render::paint::Painter;
 use harness_native_render::text::TypeLook;
 use harness_native_ui_draw_api::Paint;
-use harness_native_ui_input_api::PointerState;
 use harness_native_ui_layout_api::Viewport;
 use harness_native_ui_node_api::Laid;
 
@@ -48,61 +48,18 @@ struct Stage {
     world: World,
     painter: Painter,
     video: Video,
-}
-
-fn script_error(e: EntityView<'_>) -> Option<String> {
-    e.try_get::<&flecs::Script>(|s| {
-        // SAFETY: `error` is null or a NUL-terminated string owned by the EcsScript component, alive for this call.
-        (!s.error.is_null())
-            .then(|| unsafe { std::ffi::CStr::from_ptr(s.error) }.to_string_lossy().into_owned())
-    })
-    .flatten()
+    /// The entity that carries the Video: the frame, and what the soundtrack's sounds are under.
+    root: u64,
 }
 
 impl Stage {
     fn load(scene: &Path) -> Result<Self, String> {
-        harness_native_ecs::init_os_api();
-        harness_native_flecs::set_message_source(harness_native_ecs::last_error);
-        // SAFETY: the OS API is set, and this binary links flecs (hyperion-flecs-c).
-        let world = unsafe { World::init_host() };
-        harness_native_ui_prims::register(&world);
-        harness_native_api::register(&world);
-        harness_native_ui_timeline_api::register(&world);
+        // The app's own world (its tokens, the prims and the `hn.*` widgets), so a video is made of what the app is.
+        let world = harness_native::scene::world()?;
         world.component::<Video>().writable();
-        world.set(Clock::default());
-        world.set(PointerState::default());
-        world.set(Paint::default());
         let dir = scene.parent().ok_or_else(|| format!("{}: no directory", scene.display()))?;
-        let tokens_path = dir.join("tokens.flecs");
-        let tokens = std::fs::read_to_string(&tokens_path).map_err(|e| {
-            format!("{}: {e} (a scene's directory holds its tokens.flecs)", tokens_path.display())
-        })?;
-        let mut scripts: Vec<(String, String)> = vec![("00-tokens".into(), tokens)];
-        scripts.extend(
-            harness_native_ui_prims::SCENES.iter().map(|(n, s)| ((*n).to_owned(), (*s).to_owned())),
-        );
-        // The soundtrack's voices as prefabs (`sound.Bell`...), for every scene.
-        scripts.push(("sound".into(), include_str!("sound.flecs").to_owned()));
-        for (name, src) in &scripts {
-            let e = world.script_named(&format!("scene::{name}")).build_from_code(src);
-            if let Some(err) = script_error(*e) {
-                return Err(format!("scene script {name}: {err}"));
-            }
-        }
         let path = scene.to_str().ok_or_else(|| format!("{}: not UTF-8", scene.display()))?;
-        let e = world.script_named("scene::video").build_from_file(path);
-        if let Some(err) = script_error(*e) {
-            return Err(format!("{path}: {err}"));
-        }
-        let mut bad = None;
-        world.new_query::<&flecs::Script>().each_entity(|e, _| {
-            if bad.is_none() {
-                bad = script_error(e).map(|err| format!("scene script {}: {err}", e.name()));
-            }
-        });
-        if let Some(err) = bad {
-            return Err(err);
-        }
+        harness_native::scene::load_file(&world, "video", path)?;
         let w = world.world_ref();
         harness_native_ui_layout::install(w);
         harness_native_ui_input::install(w);
@@ -111,8 +68,8 @@ impl Stage {
         // The inline components' labels, for the typesetter (which reads no world).
         harness_native_render::inline::install(w);
         let mut videos = Vec::new();
-        world.new_query::<&Video>().each_entity(|e, v| videos.push((e.path(), *v)));
-        let video = match videos.as_slice() {
+        world.new_query::<&Video>().each_entity(|e, v| videos.push((e.path(), (*e.id(), *v))));
+        let (root, video) = match videos.as_slice() {
             [(_, v)] => *v,
             [] => {
                 return Err(format!(
@@ -146,7 +103,7 @@ impl Stage {
         let mut painter =
             Painter::new(TypeLook { code_scale: 1.0, plain: true, ..TypeLook::default() });
         painter.media = Some(dir.to_path_buf());
-        Ok(Self { world, painter, video })
+        Ok(Self { world, painter, video, root })
     }
 
     /// The soundtrack at `sr` Hz: the one `BlazeMark`'s score (if any) and every `Sound` the scene declares, or None for
@@ -164,11 +121,15 @@ impl Stage {
             glints.extend((0..n).map(|i| g.at + g.per * i as f32));
         });
         glints.sort_by(f32::total_cmp);
-        // The scene's own sounds (a `Sound` and its `Onset`; the rest default as the voice's prefab would leave them),
+        // The scene's own sounds (a `Sound` and its `Onset` under the frame; the rest default as the voice's prefab would leave them),
         // sorted by time then path so the mix is the same every run.
         let mut notes = Vec::new();
         let mut bad = None;
         self.world.new_query::<(&Sound, &Onset)>().each_entity(|e, (s, o)| {
+            // Only the video's own: the app's scene has sounds too (its cues, `hn.sound`).
+            if !std::iter::successors(e.parent(), |p| p.parent()).any(|p| *p.id() == self.root) {
+                return;
+            }
             let dur = e.try_get::<&Lasts>(|l| l.dur).unwrap_or(0.0);
             let freq = e.try_get::<&Pitch>(|p| p.hz).unwrap_or(0.0);
             let amp = e.try_get::<&Gain>(|g| g.amp).unwrap_or(0.0);
@@ -434,5 +395,52 @@ fn main() {
     if let Err(e) = run() {
         eprintln!("harness-video: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shipped video loads into the app's scene: a token or prim it names that the app renamed fails here, not at
+    /// render. `cargo test -p harness-video`.
+    #[test]
+    fn launch_loads() {
+        let scene = Path::new(env!("CARGO_MANIFEST_DIR")).join("scene/launch.flecs");
+        let stage = Stage::load(&scene).unwrap_or_else(|e| panic!("{e}"));
+        assert!(stage.sound(8_000).unwrap_or_else(|e| panic!("{e}")).is_some(), "the mark has a soundtrack");
+    }
+
+    /// A video is made of what the app is: an app widget (`hn.*`) on the app's tokens, moved by a shared `cue.*`, with a
+    /// shared `voice.*` sounding. The soundtrack is the video's own sound alone, none of the app's (`hn.sound`'s cues).
+    #[test]
+    fn app_parts_in_a_video() {
+        let dir = std::env::temp_dir().join(format!("harness-video-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+        let scene = dir.join("parts.flecs");
+        let video = |inside: &str| {
+            format!(
+                "@tree ChildOf\nclip : ui.ZStack {{\n  Video: {{width: 64, height: 36, fps: 10, seconds: 1, scale: 2}}\n  \
+                 Fill: $tone_ground\n  badge : hn.Badge {{\n    cue.FadeIn show(at: 0.2, dur: 0.5)\n  }}\n{inside}}}\n"
+            )
+        };
+        let load = |src: String| {
+            std::fs::write(&scene, src).unwrap_or_else(|e| panic!("{}: {e}", scene.display()));
+            Stage::load(&scene).unwrap_or_else(|e| panic!("{e}"))
+        };
+        let silent = load(video(""));
+        assert!(silent.sound(8_000).unwrap_or_else(|e| panic!("{e}")).is_none(), "the app's own sounds are not the video's");
+        let mut rings = load(video("  ding : voice.Bell {\n    Onset: {at: 0.1}\n  }\n"));
+        let sound = rings.sound(8_000).unwrap_or_else(|e| panic!("{e}")).unwrap_or_else(|| panic!("the bell is silent"));
+        assert!(sound.iter().any(|s| s[0] != 0.0 || s[1] != 0.0), "the bell is silent");
+        // The cue moves the app's widget: faded out before it starts, there after it ends.
+        let fade = |stage: &mut Stage, i: u32| {
+            stage.frame(i, 0.1, &mut |_, _, _, _, _| {}).unwrap_or_else(|e| panic!("{e}"));
+            let badge = stage.world.world_ref().lookup("clip::badge");
+            badge.try_get::<&harness_native_ui_motion_api::Pose>(|p| p.fade).unwrap_or_else(|| panic!("clip.badge has no Pose"))
+        };
+        assert_eq!(fade(&mut rings, 0), 1.0);
+        assert_eq!(fade(&mut rings, 9), 0.0);
+        std::fs::remove_dir_all(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
     }
 }

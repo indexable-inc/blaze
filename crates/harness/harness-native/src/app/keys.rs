@@ -205,10 +205,7 @@ impl App {
         for root in keys::ROOTS {
             w.entity_named(root).add(flecs::OrderedChildren::ID);
         }
-        let e = self.world.script_named("scene::20-keys").build_from_code(KEYS);
-        if let Some(err) = script_error(*e) {
-            return Err(format!("scene script 20-keys: {err}"));
-        }
+        super::load(&self.world, "20-keys", KEYS)?;
         // An empty source still clears what the user's file made last time.
         let e = self.world.script_named("scene::user-keys").build_from_code(user.unwrap_or(""));
         if let Some(err) = script_error(*e) {

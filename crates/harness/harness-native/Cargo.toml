@@ -6,6 +6,10 @@ edition = "2024"
 license = "Apache-2.0"
 publish = false
 
+[lib]
+name = "harness_native"
+path = "src/lib.rs"
+
 [[bin]]
 name = "harness-native"
 path = "src/main.rs"
