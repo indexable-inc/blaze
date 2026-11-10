@@ -370,27 +370,17 @@ fn fetch_cold<'db, F: Function>(db: &'db F::Db, key: F::Key) -> &'db F::Value {
 ///
 /// When no ingredient owns `id`'s page: an ID this storage never gave (page 0, a page not yet
 /// made, past [`Id::MAX_U32`]), forged or decoded unchecked. Its row would sit in a page no
-/// sweep or drop can name.
+/// sweep or drop can name. The unwind is typed ([`super::NeverGiven`]) and fails the asking
+/// job alone.
 fn row_or_make<F: Function>(storage: &Storage, id: Id) -> (&RowOf<F>, u32) {
     let (table, index) = storage.table_or_make::<FnTable<F>>(F::ingredient());
     if storage.owner(id).is_none() {
-        never_given(index, id);
+        super::never_given(storage, index, id);
     }
     let (size, align) = row::layout::<RowOf<F>>();
     let page = table.pages.page_or_make(id.page(), &storage.heap, size, align);
     // SAFETY: the page was made for `RowOf<F>` rows; `id.slot() < PAGE_LEN`.
     (unsafe { row_at::<RowOf<F>>(page, id.slot()) }, index)
-}
-
-#[cold]
-#[inline(never)]
-fn never_given(index: u32, id: Id) -> ! {
-    panic!(
-        "`{}` was asked for the key {id:?}, an ID this database never gave (its page {} has no \
-         owner): a key forged, or decoded without checking its page's owner",
-        ingredient::name(index),
-        id.page(),
-    )
 }
 
 /// Brings `row` up to this view: with its value when `value`. Returns how the caller may read

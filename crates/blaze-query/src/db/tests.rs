@@ -1313,12 +1313,41 @@ fn a_key_the_database_never_gave_is_refused_naming_the_query_and_the_database_st
     for forged in [Id::from_u32(5), Id::from_u32(Id::MAX_U32)] {
         let payload = catch_unwind(AssertUnwindSafe(|| *get::<Double>(&db, Cell(forged))))
             .expect_err("a key of no owned page");
-        let message = message(&*payload);
+        // Typed, so a host names the job's failure by it, and it says what finds the key's
+        // source: the query, the key, its page, that nothing on the task's stack asked (the
+        // test asks from outside any query), and the call stack.
+        let never = payload.downcast_ref::<super::NeverGiven>().expect("a typed unwind");
+        assert_eq!(
+            (never.query, never.key, never.page),
+            ("Double", forged.as_u32(), forged.page())
+        );
+        assert_eq!((never.asker.as_deref(), never.frames), (None, 0));
+        assert!(never.pages > 1 && never.page != 1, "the cell's page was given: {never}");
+        let message = super::unwind_text(&*payload).expect("an engine unwind has a text");
+        assert_eq!(message, never.to_string());
         assert!(message.contains("`Double`") && message.contains("never gave"), "{message}");
+        assert!(message.contains("asked from outside any query"), "{message}");
+        assert!(message.contains("a key of another database, forged"), "{message}");
+        assert!(message.contains("the call stack of the ask"), "{message}");
     }
+    assert_eq!(*get::<Double>(&db, cell), 6);
+
+    // Asked by a query: the unwind names it and its key, the top of its task's stack.
+    let payload = catch_unwind(AssertUnwindSafe(|| *get::<AsksForged>(&db, cell)))
+        .expect_err("a query asking for a key of no owned page");
+    let never = payload.downcast_ref::<super::NeverGiven>().expect("a typed unwind");
+    assert_eq!((never.query, never.key, never.frames), ("Double", 5, 1), "{never}");
+    let asker = never.asker.as_deref().expect("a query asked");
+    assert!(asker.starts_with("`AsksForged` of "), "{asker}");
+    assert!(never.to_string().contains("asked by `AsksForged` of "), "{never}");
     assert_eq!(*get::<Double>(&db, cell), 6);
     drop(db);
 }
+
+query!(AsksForged, u64, |db, key| {
+    let _ = key;
+    *get::<Double>(db, Cell(Id::from_u32(5)))
+});
 
 /// No `Id` lies past the last ID page: `fetch`'s hit path indexes the page directory by an
 /// ID's page with no bounds load, so a key above [`Id::MAX_U32`] (here `u32::MAX`, page
