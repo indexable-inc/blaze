@@ -1034,12 +1034,12 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
             Ok(Done::Truncated)
         }),
         Effect::Write { file, bytes, .. } => at(root, &file, |path| {
+            // durable: carries out `Effect::Write`, whose asker said why
             fs::write_atomically(path, &bytes)?;
             Ok(Done::Written)
         }),
         // No sync of the file or its directory: derived data, checked by its reader.
         Effect::WriteUnsynced { file, bytes, .. } => at(root, &file, |path| {
-            // durable: carries out `Effect::Write`, whose asker said why
             fs::write_unsynced(path, &bytes)?;
             Ok(Done::Written)
         }),
@@ -1392,12 +1392,12 @@ impl Shared {
                 }
                 return None;
             }
+            // wakes: an errand queued and the pool's close each notify `errand`; an idle errand thread serves until `closed`
             self.errand.wait(&mut errands);
         }
     }
 
     /// Tells what an errand ended with, then the next errand: the thread is idle before the
-            // wakes: an errand queued and the pool's close each notify `errand`; an idle errand thread serves until `closed`
     /// driver hears, so an errand it asks for next starts no thread more.
     fn next_errand_after(&self, told: Option<Told>) -> Option<Errand> {
         lock(&self.errands).idle += 1;
@@ -1689,12 +1689,12 @@ mod linux {
                 if let Some(started) = state.started.take() {
                     return started;
                 }
+                // wakes: the watcher thread, which sets `started` and notifies whether the watch began or failed
                 self.started.wait(&mut state);
             }
         }
     }
 
-                // wakes: the watcher thread, which sets `started` and notifies whether the watch began or failed
     /// A watch's errand: watches `dir`, then reads its events until it is stopped, answering
     /// each flush once it has read every event queued when the flush was taken. What ends the
     /// watch, `None` when it did not start (told through `control`) or the driver is gone.

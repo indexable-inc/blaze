@@ -454,6 +454,7 @@ pub(crate) use crate::iocp::files::{
 #[cfg(any(unix, target_os = "wasi"))]
 fn sync_dir_of(path: &Path) -> io::Result<()> {
     match path.parent() {
+        // durable: the directory's sync of `Effect::Write` and `Effect::Rename`: the new name survives a crash
         Some(parent) if !parent.as_os_str().is_empty() => File::open(parent)?.sync_all(),
         _ => Ok(()),
     }
@@ -493,7 +494,6 @@ pub(crate) fn list(dir: &Path, name: &FileName) -> io::Result<Vec<(FileName, Met
     // Each directory still to read, by its index in `found`; `None` for `dir` itself.
     let mut todo: Vec<Option<usize>> = Vec::with_capacity(16); // alloc: once per listing.
     todo.push(None);
-        // durable: the directory's sync of `Effect::Write` and `Effect::Rename`: the new name survives a crash
     while let Some(at) = todo.pop() {
         let read = blaze_mem::scratch::with_path(|path| {
             path.push(dir);
