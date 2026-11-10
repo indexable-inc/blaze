@@ -477,8 +477,22 @@ pub struct Config {
     pub layers: Vec<FileName>,
     /// Tags it asks with are `tags..tags + 2^32`.
     pub tags: u64,
+    /// Tags the loads of its buffer pool ask with: `load_tags..load_tags + 2^32`, a range
+    /// apart from `tags`'s (a load's tag names its slot and its read, so the loads core takes
+    /// a whole range of its own; `pool::Loads`). A store whose two ranges overlap is refused
+    /// as it is made.
+    pub load_tags: u64,
     /// How its reads' misses are loaded.
     pub loader: Loader,
+}
+
+impl Config {
+    /// Whether its two tag ranges, each 2^32 wide, are apart and inside a `u64`.
+    fn tags_apart(&self) -> bool {
+        const WIDE: u64 = 1 << 32;
+        let inside = |from: u64| from.checked_add(WIDE).is_some();
+        inside(self.tags) && inside(self.load_tags) && self.tags.abs_diff(self.load_tags) >= WIDE
+    }
 }
 
 /// How a store loads the pages a read needs that are not in memory
@@ -1419,6 +1433,14 @@ impl Store {
     }
 
     fn new(config: Config, peers: Option<peers::Peers>) -> Store {
+        assert!(
+            config.tags_apart(),
+            "the store in {} is given tags from {} and its pool's loads tags from {}: the two \
+             ranges, 2^32 wide each, overlap (Config::tags, Config::load_tags)",
+            config.dir,
+            config.tags,
+            config.load_tags
+        );
         // alloc: setup, once per store
         let mut tiers = vec![Tier::new(config.dir.clone())];
         tiers.extend(config.layers.iter().cloned().map(Tier::new));

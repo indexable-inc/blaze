@@ -69,6 +69,10 @@ const OUTSIDE_END: u64 = OUTSIDE + blaze_vfs::outside::TAGS;
 /// The shared standard library's store ([`Options::std`]).
 const STD_STORE: u64 = 8 << 32;
 const STD_STORE_END: u64 = 9 << 32;
+/// The reads the store's buffer pool loads its pages with (`blaze_cas::Config::load_tags`), and
+/// the shared standard library's store's.
+const LOADS: u64 = 9 << 32;
+const STD_LOADS: u64 = 10 << 32;
 const WATCHERS: u64 = 1 << 40;
 const RUNS: u64 = 1 << 50;
 const RUNS_END: u64 = 1 << 62;
@@ -1189,6 +1193,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 dir: under(&state, "store"),
                 layers: Vec::new(),
                 tags: STORE,
+                load_tags: LOADS,
                 loader: blaze_cas::Loader::Thread,
             };
         let mut store = Store::open(store_config, &mut effects);
@@ -1198,6 +1203,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             root: under(&options.std, "store"),
             writer: options.writer,
             tags: STD_STORE,
+            load_tags: STD_LOADS,
             loader: blaze_cas::Loader::Thread,
         };
         let mut std = Store::open_shared(shared, &mut effects);

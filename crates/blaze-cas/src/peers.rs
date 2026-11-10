@@ -45,6 +45,8 @@ pub struct SharedConfig {
     pub writer: ContentId,
     /// Tags it asks with are `tags..tags + 2^32`.
     pub tags: u64,
+    /// Tags its buffer pool's loads ask with: `load_tags..load_tags + 2^32`, apart from `tags`.
+    pub load_tags: u64,
     /// How its reads' misses are loaded ([`crate::Loader`]).
     pub loader: crate::Loader,
 }
@@ -114,7 +116,7 @@ impl Store {
         };
         // alloc: empty, no layers: allocates nothing
         let config =
-            Config { dir: own, layers: Vec::new(), tags: config.tags, loader: config.loader };
+            Config { dir: own, layers: Vec::new(), tags: config.tags, load_tags: config.load_tags, loader: config.loader };
         let mut store = Store::new(config, Some(peers));
         store.ask_private(effects);
         store

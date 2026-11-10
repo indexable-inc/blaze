@@ -12,6 +12,7 @@ pub(crate) fn opened(sim: &mut Sim) -> blaze_cas::Store {
         dir: FileName::new("store").unwrap(),
         layers: Vec::new(),
         tags: 1 << 40,
+        load_tags: (1 << 40) + (1 << 32),
         loader: blaze_cas::Loader::Pumped,
     };
     let mut effects = Vec::new();

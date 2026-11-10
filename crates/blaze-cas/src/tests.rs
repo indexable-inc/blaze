@@ -17,7 +17,7 @@ fn name(it: &str) -> FileName {
 }
 
 fn config(dir: &str) -> Config {
-    Config { dir: name(dir), layers: Vec::new(), tags: 1 << 40, loader: crate::Loader::Pumped }
+    Config { dir: name(dir), layers: Vec::new(), tags: 1 << 40, load_tags: (1 << 40) + (1 << 32), loader: crate::Loader::Pumped }
 }
 
 fn key(n: u64) -> Key {
@@ -141,6 +141,26 @@ fn recheck(sim: &mut Sim, pack: &FileName) {
     let file = name(&pack.as_str().replace("pack-", "checks-"));
     let checked = checks::encode(&checks::of(&sim.contents(pack)));
     sim.change(&file, &checked);
+}
+
+/// A store's own tags and its pool's loads' tags are two ranges of 2^32: one that overlaps
+/// the other is refused as the store is made, naming both.
+#[test]
+fn a_store_whose_two_tag_ranges_overlap_is_refused() {
+    let apart = |tags: u64, load_tags: u64| Config { tags, load_tags, ..config("store") }.tags_apart();
+    assert!(apart(1 << 40, (1 << 40) + (1 << 32)));
+    assert!(apart(5 << 32, 4 << 32));
+    assert!(!apart(1 << 40, 1 << 40));
+    assert!(!apart(1 << 40, (1 << 40) + (1 << 32) - 1));
+    assert!(!apart((1 << 40) + 1, 1 << 40));
+    assert!(!apart(1 << 40, u64::MAX - 5), "a range that runs past the last tag");
+    let made = std::panic::catch_unwind(|| {
+        let mut effects = Vec::new();
+        Store::open(Config { load_tags: (1 << 40) + 7, ..config("store") }, &mut effects);
+    });
+    let why = made.expect_err("a store with overlapping ranges was made");
+    let why = why.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(why.contains("overlap") && why.contains("Config::load_tags"), "{why}");
 }
 
 #[test]
@@ -2516,7 +2536,7 @@ fn a_layer_is_read_after_the_store_and_never_written() {
     let before = sim.contents(&name("base/head"));
     let mut store = open_with(
         &mut sim,
-        Config { dir: name("mine"), layers: vec![name("base")], tags: 1 << 40, loader: crate::Loader::Pumped },
+        Config { dir: name("mine"), layers: vec![name("base")], tags: 1 << 40, load_tags: (1 << 40) + (1 << 32), loader: crate::Loader::Pumped },
     );
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), b"from the base");
     assert_eq!(bytes_of(&store, &key(2)).unwrap(), noise(400 << 10, 2));
@@ -2535,7 +2555,7 @@ fn a_missing_layer_stops_the_store() {
     let mut sim = Sim::new(12, quiet());
     let mut effects = Vec::new();
     let mut store = Store::open(
-        Config { dir: name("mine"), layers: vec![name("nowhere")], tags: 0, loader: crate::Loader::Pumped },
+        Config { dir: name("mine"), layers: vec![name("nowhere")], tags: 0, load_tags: 1 << 32, loader: crate::Loader::Pumped },
         &mut effects,
     );
     drive(&mut sim, &mut store, &mut effects);
@@ -2552,6 +2572,7 @@ fn shared(n: u64) -> SharedConfig {
         root: name("shared"),
         writer: writer(n),
         tags: (1 << 40) + (n << 33),
+        load_tags: ((1 << 40) + (n << 33)) + (1 << 32),
         loader: Loader::Pumped,
     }
 }
@@ -3037,7 +3058,7 @@ fn machine_code_is_never_kept_from_a_fetch_and_a_value_says_its_directory() {
     drop(base);
     let mut store = open_with(
         &mut sim,
-        Config { dir: name("mine"), layers: vec![name("base")], tags: 1 << 40, loader: crate::Loader::Pumped },
+        Config { dir: name("mine"), layers: vec![name("base")], tags: 1 << 40, load_tags: (1 << 40) + (1 << 32), loader: crate::Loader::Pumped },
     );
     store.put(key(8), Kind::Machine, b"my code").unwrap();
     let mut remote = Recorded(Vec::new(), Vec::new());
