@@ -1,8 +1,8 @@
 //! The `Browser` element: a harness browser view in a cell, `<Browser view={page.view} />` (the host's id) or
 //! `<Browser src="https://…" />` (a page the app asks the host to open once), drawn as hn.GenBrowser. Only its
 //! `BrowserView` is set here; src/app/browser.rs fills its picture, title, address and loading hairline every frame and
-//! makes a press open the view in the pane. A step's shown value `{t: "browser", view, url, title}` is drawn as the same
-//! element ([`shown_card`], steps.rs value_outs).
+//! makes a press open the view in the pane. A step's shown value `{t: "browser", view, ...}` draws nothing in the
+//! transcript: a page opened for the person shows in the browser pane (chat.rs `chat_pane_page`).
 use super::*;
 use harness_native_ui_browser_api::BrowserView;
 
@@ -48,9 +48,4 @@ pub(super) fn element(v: View<'_>, node: &Value) {
     {
         page.set(want);
     }
-}
-
-/// The `Browser` element a step's shown value `{t: "browser", view, url, title}` (mcp/src/shown.ts) draws as.
-pub(in crate::app) fn shown_card(v: &Value) -> Value {
-    serde_json::json!({"type": "Browser", "props": {"view": v["view"]}, "children": []})
 }

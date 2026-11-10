@@ -9,7 +9,7 @@ import { effect } from "../effects.ts";
 const hostOf = (url: string) => { try { return new URL(url).host || url; } catch { return url; } };
 
 /** Open `url` in a view of its own that stays open (in the browser pane's tabs, after this kernel too), loaded or after
- *  20 s still loading; the cell's step shows it as a live card. The Page drives it (goto, evaluate, send...). */
+ *  20 s still loading; the app shows it in the browser pane beside the chat. The Page drives it (goto, evaluate, send...). */
 function open(url: string): Promise<Page> {
   const h = hostOf(url);
   return effect("net", `Opening ${h}`, `Opened ${h}`, url, () => newPage({ url, keep: true }), (p) => ({ show: p }));

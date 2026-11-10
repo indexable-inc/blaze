@@ -374,8 +374,6 @@ fn value_outs(key: &str, v: &Arc<Value>, fold: &HashMap<String, bool>, out: &mut
                 out.push(Row::Grid { v: v.clone(), cap: usize::MAX });
             }
         }
-        // A page the cell drove in the harness browser: its live card (genui's Browser, src/app/browser.rs).
-        "browser" => out.push(Row::Ui { v: Arc::new(genui::shown_card(v)), cell: String::new(), block: String::new(), code: false }),
         _ => {}
     }
 }
