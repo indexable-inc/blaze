@@ -19,6 +19,8 @@
 //! of the code after it (`line!()`, a panic's location, debug info): its shape stays, the count
 //! of its lines and, for a block comment, the bytes and characters of its last line, so every
 //! token after it keeps its line and column.
+//! A plain `//` comment ends its line, so it moves nothing: it and the spaces before it are
+//! left out whole, and adding or removing one at the end of a line changes no code text.
 //!
 //! An attribute is inert, giving its item to no macro, when it is one of the compiler's own
 //! that never runs user code on the item (`inline`, `doc`, `cfg`, `allow`, `repr`, a tool's
@@ -29,6 +31,19 @@
 //!
 //! Files of a library source root (the standard library, registry crates) keep their whole
 //! text: they rarely change, and their outlines would have to be parsed in full.
+//!
+//! # The interface text
+//!
+//! What a crate that only checks against this one can observe of a file
+//! ([`CodeText::interface`]): the code text with each function body no other crate's check
+//! can read ([`plain_body`]) as its shape. It is the crate interface identity of
+//! docs/v2/plan/design/item-hash.md (section 15) as it can be built today: everything such a
+//! dependent observes stays as text (signatures, types, visibility, attributes, re-exports,
+//! macro definitions, generic, `const`, `#[inline]` and `impl Trait` bodies, constants), and
+//! so do positions, through the shapes: a diagnostic that points into this crate, a location
+//! in code instantiated from it and its span tables all read lines and columns, which no
+//! side table holds apart from the code yet. [`crate::Lowered::narrowed`] says which unit
+//! reads which text.
 
 use std::alloc::Global;
 
@@ -41,7 +56,11 @@ mod tests;
 
 const CODE_IDENTITY: &str = "blaze v2 crate code identity 1";
 const OWN_CODE: &str = "blaze v2 crate own code 1";
-const CODE_TEXT: &str = "blaze v2 file code text 1";
+/// 2: a comment whose text the compiler reads (a bidirectional control, a carriage return)
+/// keeps its text.
+const CODE_TEXT: &str = "blaze v2 file code text 2";
+const INTERFACE_TEXT: &str = "blaze v2 file interface text 1";
+const OWN_NARROW: &str = "blaze v2 crate own narrow 1";
 
 /// What of a file its crate's code can observe ([`code_text`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -59,6 +78,25 @@ pub struct CodeText {
     /// Whether its crate keeps its whole text: it reads a file's bytes with `include_str!` or
     /// `include_bytes!` that may be Rust, or gives an out-of-line module to an attribute.
     pub whole: bool,
+    /// What a crate that only checks against this file's crate can observe of it (the module's
+    /// docs, "The interface text"): as `inert`, with each function body no other crate's check
+    /// can read as its shape.
+    pub interface: ContentId,
+    /// As `interface`, the standard derives, `test` and `bench` taken as macros that see their
+    /// item.
+    pub interface_strict: ContentId,
+    /// Whether no body of its crate may be left out of its interface: a standard macro a body
+    /// calls could mean something else in it (a macro of that name defined or imported, another
+    /// crate's macros taken with `#[macro_use]`), or it calls, outside every body, a macro
+    /// that could define one.
+    pub unplain: bool,
+    /// Whether it names blaze's extensions (`blaze`, `fn_info`, `type_info`): what is proved
+    /// of its code (an effect, a contract, a function's code identity) may read the bodies of
+    /// the crates its crate depends on.
+    pub extends: bool,
+    /// Whether it may read a file by path (`#[path]`, `include!` and its kin): its crate may be
+    /// made from another crate's file.
+    pub reaches: bool,
 }
 
 /// The code identity of `krate`: [`own_code`] of it and of every crate it depends on,
@@ -364,6 +402,104 @@ fn own_code(db: &Db, krate: Crate) -> ContentId {
     hasher.finish()
 }
 
+/// What of `krate` alone can be observed, narrower than its bytes, for the keys that leave
+/// trivia out ([`crate::Lowered::narrowed`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct OwnNarrow {
+    /// What its own code can observe of it ([`CodeText::inert`] of each of its files, its
+    /// settings, the module appended to its root): none for a crate that keeps its whole text
+    /// (a library source root's, one a file of which reads Rust bytes, [`CodeText::whole`]),
+    /// which is then known by its whole identity alone.
+    pub(crate) code: Option<ContentId>,
+    /// What a crate that only checks against it can observe of it ([`CodeText::interface`] of
+    /// each file): none where no body may be left out ([`CodeText::unplain`]), and `code`
+    /// stands in.
+    pub(crate) interface: Option<ContentId>,
+    /// [`CodeText::extends`] of any of its files.
+    pub(crate) extends: bool,
+    /// [`CodeText::reaches`] of any of its files.
+    pub(crate) reaches: bool,
+}
+
+/// [`OwnNarrow`] of `krate`: the files [`crate::Lowered::identity`] holds of it (its root
+/// alone for a [`root_alone`] crate, else every file of its source root by path), each Rust
+/// file as its code text or its interface text, any other by its bytes.
+#[blaze_query::tracked(returns(copy))]
+pub(crate) fn own_narrow(db: &Db, krate: Crate) -> OwnNarrow {
+    let data = krate.data(db);
+    let root_file = data.root_file_id;
+    let root = db.source_root(db.file_source_root(root_file).source_root_id(db));
+    let set = root.source_root_ref(db);
+    let whole = OwnNarrow { code: None, interface: None, extends: false, reaches: false };
+    if set.is_library {
+        return whole;
+    }
+    let text_of =
+        |file: base_db::FileId| code_text(db, EditionedFileId::new(db, file, data.edition));
+    // Its root by itself: an alias's (a test's, with its harness appended) is not among its
+    // source root's files.
+    let Some(root_text) = text_of(root_file) else { return whole };
+    let alone = reads_root_alone(db, EditionedFileId::new(db, root_file, data.edition));
+    // alloc: once per workspace crate keyed in a revision, a file of its source root each
+    let mut files: Vec<(&str, base_db::FileId, Option<CodeText>)> = Vec::new();
+    if !alone {
+        for file in set.iter() {
+            let Some(path) =
+                set.path_for_file(&file).and_then(|it| it.as_path()).map(|it| it.as_str())
+            else {
+                return whole;
+            };
+            let code = match path.ends_with(".rs") {
+                true => text_of(file),
+                false => None,
+            };
+            files.push((path, file, code));
+        }
+        files.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    }
+    let texts = || std::iter::once(root_text).chain(files.iter().filter_map(|it| it.2));
+    let extends = texts().any(|it| it.extends);
+    let reaches = texts().any(|it| it.reaches);
+    if texts().any(|it| it.whole) {
+        return OwnNarrow { extends, reaches, ..whole };
+    }
+    let strict = texts().any(|it| it.shadows);
+    let unplain = texts().any(|it| it.unplain);
+    let hashed = |interface: bool| {
+        let pick = |code: &CodeText| match (interface, strict) {
+            (false, false) => code.inert,
+            (false, true) => code.strict,
+            (true, false) => code.interface,
+            (true, true) => code.interface_strict,
+        };
+        let mut hasher = Hasher::new(OWN_NARROW);
+        hasher
+            .id(&krate.content(db))
+            .update(&[u8::from(interface), u8::from(strict), u8::from(alone)])
+            .id(&pick(&root_text))
+            .opt_part(db.file_text(root_file).appended_root_module(db));
+        hasher.update(&(files.len() as u64).to_le_bytes());
+        for (path, file, code) in &files {
+            let appended = match db.has_file_text(*file) {
+                true => db.file_text(*file).appended_root_module(db),
+                false => None,
+            };
+            hasher.part(path.as_bytes()).opt_part(appended);
+            match code {
+                Some(code) => hasher.update(&[1]).id(&pick(code)),
+                None => hasher.update(&[0]).id(&db.file_content(*file)),
+            };
+        }
+        hasher.finish()
+    };
+    OwnNarrow {
+        code: Some(hashed(false)),
+        interface: (!unplain).then(|| hashed(true)),
+        extends,
+        reaches,
+    }
+}
+
 /// What `krate`'s code can observe of its workspace file `file` ([`CodeText::strict`], so a
 /// crate that shadows a standard derive is covered too), for `blaze why` to tell an edit of
 /// comments from one of code ([`crate::Lowered::identity_parts`]). None for a file with no
@@ -403,6 +539,12 @@ pub fn code_text_of(root: &SyntaxNode, text: &str) -> CodeText {
         strict: Masked::new(),
         shadows: false,
         whole: false,
+        interface: Masked::of(INTERFACE_TEXT),
+        interface_strict: Masked::of(INTERFACE_TEXT),
+        skip: (0, 0),
+        unplain: false,
+        extends: false,
+        reaches: false,
         // alloc: once per file keyed, a node of its depth each
         seen: Vec::new(),
     };
@@ -419,6 +561,11 @@ pub fn code_text_of(root: &SyntaxNode, text: &str) -> CodeText {
         strict: walk.strict.finish(text),
         shadows: walk.shadows,
         whole: walk.whole,
+        interface: walk.interface.finish(text),
+        interface_strict: walk.interface_strict.finish(text),
+        unplain: walk.unplain,
+        extends: walk.extends,
+        reaches: walk.reaches,
     }
 }
 
@@ -432,24 +579,47 @@ struct Masked {
 
 impl Masked {
     fn new() -> Masked {
-        Masked { hasher: Hasher::new(CODE_TEXT), from: 0 }
+        Masked::of(CODE_TEXT)
+    }
+
+    fn of(domain: &'static str) -> Masked {
+        Masked { hasher: Hasher::new(domain), from: 0 }
     }
 
     /// `token`, a comment at `range` of `text`, as its shape: a byte no UTF-8 text has, its
     /// kind, the count of its lines' ends and, for a block comment, the bytes and characters
     /// after its last line's end (all of it on one line): what the line and column of every
-    /// token after it are made of.
+    /// token after it are made of. A plain `//` comment has no shape: it is left out, with
+    /// the spaces before it.
     fn mask(&mut self, text: &str, token: &SyntaxToken) {
         let range = token.text_range();
         let (start, end) = (usize::from(range.start()), usize::from(range.end()));
         let comment = &text[start..end];
-        self.hasher.update(&text.as_bytes()[self.from..start]);
+        // A comment the compiler reads the text of stays text: a bidirectional control in it
+        // is denied (`text_direction_codepoint_in_comment`), and a carriage return in a doc
+        // comment is an error.
+        if comment.contains(READ_IN_COMMENTS) {
+            return;
+        }
         let kind: u8 = match token.kind() {
             SyntaxKind::OUTER_DOC_COMMENT => 1,
             SyntaxKind::INNER_DOC_COMMENT => 2,
             _ => 3,
         };
         let block = comment.starts_with("/*");
+        if kind == 3 && !block {
+            // A plain `//` comment runs to its line's end, so nothing is after it on its line:
+            // it, and the spaces and tabs before it, move no token and are no token. Whether
+            // it is there at all is nothing code can observe, so it leaves nothing, where a doc
+            // comment (an attribute of its item) and a block comment (the columns after it)
+            // leave their shape. The line's end after it is text, as every line's.
+            let before = &text.as_bytes()[self.from..start];
+            let kept = before.iter().rposition(|it| !matches!(it, b' ' | b'\t')).map_or(0, |at| at + 1);
+            self.hasher.update(&before[..kept]);
+            self.from = end;
+            return;
+        }
+        self.hasher.update(&text.as_bytes()[self.from..start]);
         self.hasher.update(&[0xFF, kind, u8::from(block)]);
         self.hasher.update(&(comment.matches('\n').count() as u64).to_le_bytes());
         if block {
@@ -461,9 +631,33 @@ impl Masked {
         self.from = end;
     }
 
+    /// The function body at `start..end` of `text` as its shape: a byte no UTF-8 text has
+    /// (and no comment's shape starts with), the count of its lines' ends, and the bytes,
+    /// characters and UTF-16 units after its last line's end (all of it on one line): what the
+    /// line and column of every token after it are made of, however a column is counted.
+    fn shape(&mut self, text: &str, start: usize, end: usize) {
+        let body = &text[start..end];
+        self.hasher.update(&text.as_bytes()[self.from..start]);
+        let last = body.rsplit('\n').next().unwrap_or(body);
+        let lines = match planted(Plant::Positions) {
+            true => 0,
+            false => body.matches('\n').count(),
+        };
+        self.hasher
+            .update(&[0xFE])
+            .update(&(lines as u64).to_le_bytes())
+            .update(&(last.len() as u64).to_le_bytes())
+            .update(&(last.chars().count() as u64).to_le_bytes())
+            .update(&(last.encode_utf16().count() as u64).to_le_bytes());
+        self.from = end;
+    }
+
+    /// The hash of the text with what was left out: the rest of the text, and nothing of its
+    /// length, which a comment's own length is part of (until CODE_TEXT 2 it was hashed, so a
+    /// comment edit that made the file longer changed every code text). Each shape starts
+    /// with a byte no text has and has a fixed length, so no two streams read the same.
     fn finish(mut self, text: &str) -> ContentId {
         self.hasher.update(&text.as_bytes()[self.from..]);
-        self.hasher.update(&(text.len() as u64).to_le_bytes());
         self.hasher.finish()
     }
 }
@@ -476,6 +670,15 @@ struct Walk<'a> {
     strict: Masked,
     shadows: bool,
     whole: bool,
+    /// [`CodeText::interface`] and [`CodeText::interface_strict`].
+    interface: Masked,
+    interface_strict: Masked,
+    /// Where the last body each of the two left out ends: a comment before it is in the body,
+    /// part of its shape.
+    skip: (usize, usize),
+    unplain: bool,
+    extends: bool,
+    reaches: bool,
     /// Of each node entered and not left: whether a macro sees it, with the prelude's derives,
     /// `test` and `bench` inert, and not.
     seen: Vec<(bool, bool)>,
@@ -504,14 +707,46 @@ impl Walk<'_> {
             }
         }
         match kind {
-            SyntaxKind::USE => self.shadows |= use_shadows(node),
-            SyntaxKind::EXTERN_CRATE => self.shadows |= macro_use_extern(node),
+            SyntaxKind::USE => {
+                self.shadows |= use_shadows(node);
+                self.unplain |= use_takes(node, |it| PLAIN_MACROS.contains(&it));
+            }
+            SyntaxKind::EXTERN_CRATE => {
+                let taken = macro_use_extern(node);
+                self.shadows |= taken;
+                self.unplain |= taken;
+            }
             SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF => {
                 let name = node
                     .children()
                     .find(|it| it.kind() == SyntaxKind::NAME)
                     .map(|it| it.text().to_string()); // alloc: a macro's name, once per macro definition
-                self.shadows |= name.is_some_and(|it| SHADOWABLE.contains(&it.as_str()));
+                self.shadows |= name.as_ref().is_some_and(|it| SHADOWABLE.contains(&it.as_str()));
+                // A macro of a standard macro's name, or one that could define a macro.
+                self.unplain |= name.is_none_or(|it| PLAIN_MACROS.contains(&it.as_str()))
+                    || node
+                        .children()
+                        .filter(|it| it.kind() == SyntaxKind::TOKEN_TREE)
+                        .flat_map(|it| it.descendants_with_tokens())
+                        .filter_map(NodeOrToken::into_token)
+                        .any(|it| it.kind() == SyntaxKind::MACRO_KW || it.text() == "macro_rules");
+            }
+            // A macro called where items are (never in a body, whose calls [`plain_body`]
+            // judges) that is not one of the standard library's plain ones: what it makes is
+            // not known, and it could define a macro of a standard macro's name.
+            SyntaxKind::MACRO_CALL if at_items(node) => self.unplain |= !plain_call(node),
+            // A body no other crate's check can read, left out of the interface.
+            SyntaxKind::BLOCK_EXPR if plain_body(node) => {
+                let range = node.text_range();
+                let (start, end) = (usize::from(range.start()), usize::from(range.end()));
+                if !inert {
+                    self.interface.shape(self.text, start, end);
+                    self.skip.0 = end;
+                }
+                if !strict {
+                    self.interface_strict.shape(self.text, start, end);
+                    self.skip.1 = end;
+                }
             }
             // `mod x;` given to an attribute that is not inert: the attribute may be given
             // the file's items.
@@ -525,26 +760,277 @@ impl Walk<'_> {
 
     fn token(&mut self, token: &SyntaxToken) {
         let (inert, strict) = self.seen.last().copied().unwrap_or((false, false));
+        // A token of a body an interface left out is part of that body's shape.
+        let at = usize::from(token.text_range().start());
+        let (in_interface, in_interface_strict) = (at >= self.skip.0, at >= self.skip.1);
         match token.kind() {
             // No token stream holds a `//` comment.
             SyntaxKind::COMMENT => {
                 self.inert.mask(self.text, token);
                 self.strict.mask(self.text, token);
+                if in_interface {
+                    self.interface.mask(self.text, token);
+                }
+                if in_interface_strict {
+                    self.interface_strict.mask(self.text, token);
+                }
             }
             SyntaxKind::OUTER_DOC_COMMENT | SyntaxKind::INNER_DOC_COMMENT => {
                 if !inert {
                     self.inert.mask(self.text, token);
+                    if in_interface {
+                        self.interface.mask(self.text, token);
+                    }
                 }
                 if !strict {
                     self.strict.mask(self.text, token);
+                    if in_interface_strict {
+                        self.interface_strict.mask(self.text, token);
+                    }
                 }
             }
-            SyntaxKind::IDENT if matches!(token.text(), "include_str" | "include_bytes") => {
-                self.whole |= !reads_other_than_rust(token);
-            }
+            SyntaxKind::IDENT => match token.text() {
+                "include_str" | "include_bytes" => {
+                    self.whole |= !reads_other_than_rust(token);
+                    self.reaches = true;
+                }
+                "include" => self.reaches = true,
+                "path" => self.reaches |= names_path_attr(token),
+                "blaze" | "fn_info" | "type_info" => self.extends = true,
+                _ => {}
+            },
             _ => {}
         }
     }
+}
+
+/// What the compiler reads in a comment's text: the bidirectional controls
+/// (`text_direction_codepoint_in_comment`) and a carriage return (an error in a doc comment).
+const READ_IN_COMMENTS: &[char] = &[
+    '\r', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}',
+    '\u{2068}', '\u{2069}',
+];
+
+/// Whether `token`, the name `path`, may be the `path` attribute: in an attribute, or, among
+/// the tokens a macro is given, after a `[` or before a `=`.
+fn names_path_attr(token: &SyntaxToken) -> bool {
+    let Some(parent) = token.parent() else { return true };
+    let mut given = false;
+    for at in parent.ancestors() {
+        match at.kind() {
+            SyntaxKind::ATTR => return true,
+            SyntaxKind::TOKEN_TREE => given = true,
+            _ => {}
+        }
+    }
+    let before = std::iter::successors(token.prev_token(), SyntaxToken::prev_token)
+        .find(|it| !it.kind().is_trivia());
+    let after = std::iter::successors(token.next_token(), SyntaxToken::next_token)
+        .find(|it| !it.kind().is_trivia());
+    given
+        && (before.is_some_and(|it| it.kind() == SyntaxKind::L_BRACK)
+            || after.is_some_and(|it| it.kind() == SyntaxKind::EQ))
+}
+
+/// Whether `node`, a macro call, is where items are: under nothing but modules, `impl`s and
+/// traits.
+fn at_items(node: &SyntaxNode) -> bool {
+    node.ancestors().skip(1).all(|it| {
+        matches!(
+            it.kind(),
+            SyntaxKind::SOURCE_FILE
+                | SyntaxKind::ITEM_LIST
+                | SyntaxKind::ASSOC_ITEM_LIST
+                | SyntaxKind::MODULE
+                | SyntaxKind::IMPL
+                | SyntaxKind::TRAIT
+        )
+    })
+}
+
+/// Whether the macro call `node` calls one of [`PLAIN_MACROS`] by its name alone (`std::vec!`
+/// is not taken: `std` could be a module of the crate), given no tokens that could make an
+/// item or call another macro.
+fn plain_call(node: &SyntaxNode) -> bool {
+    let named = node
+        .children()
+        .find(|it| it.kind() == SyntaxKind::PATH)
+        .is_some_and(|path| PLAIN_MACROS.contains(&path_text(&path).as_str()));
+    named
+        && node.descendants_with_tokens().filter_map(NodeOrToken::into_token).all(|token| {
+            match token.kind() {
+                SyntaxKind::FN_KW
+                | SyntaxKind::STRUCT_KW
+                | SyntaxKind::ENUM_KW
+                | SyntaxKind::UNION_KW
+                | SyntaxKind::TRAIT_KW
+                | SyntaxKind::IMPL_KW
+                | SyntaxKind::CONST_KW
+                | SyntaxKind::STATIC_KW
+                | SyntaxKind::TYPE_KW
+                | SyntaxKind::MOD_KW
+                | SyntaxKind::USE_KW
+                | SyntaxKind::EXTERN_KW
+                | SyntaxKind::MACRO_KW
+                | SyntaxKind::POUND => false,
+                SyntaxKind::IDENT => !matches!(
+                    token.text(),
+                    "union" | "macro_rules" | "include" | "include_str" | "include_bytes"
+                ),
+                // The call's own `!` is after its own name, a plain macro's.
+                SyntaxKind::BANG => !calls_other_macro(&token),
+                _ => true,
+            }
+        })
+}
+
+/// A safeguard of the interface text a test takes away, to see its oracle find the edit the
+/// safeguard is there for (`code/tests.rs`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Plant {
+    /// A body with a type parameter is left out.
+    Generic,
+    /// A `const fn`'s body is left out.
+    Const,
+    /// An `#[inline]` body is left out.
+    Inline,
+    /// A body whose signature hides a type (`impl Trait`) is left out.
+    Hidden,
+    /// A trait's default method's body is left out.
+    Trait,
+    /// A body that defines an item is left out.
+    Items,
+    /// A body that calls a macro of unknown expansion is left out.
+    Macros,
+    /// A left-out body's shape holds no line count.
+    Positions,
+    /// A unit that only checks is keyed by the code of the crates it depends on, not their
+    /// interfaces: no cutoff ([`crate::Narrowed::checked`]).
+    Deep,
+    /// A unit that builds code is keyed by the interfaces of the crates it depends on, not
+    /// their code: a stale program ([`crate::Narrowed::code`]).
+    Shallow,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The safeguard this thread's test took away.
+    static PLANTED: std::cell::Cell<Option<Plant>> = const { std::cell::Cell::new(None) };
+}
+
+/// `run` with `plant` taken away, on this thread.
+#[cfg(test)]
+pub(crate) fn planting<T>(plant: Plant, run: impl FnOnce() -> T) -> T {
+    PLANTED.with(|it| it.set(Some(plant)));
+    let out = run();
+    PLANTED.with(|it| it.set(None));
+    out
+}
+
+/// Whether a test planted `plant`: never, outside this crate's tests.
+#[cfg(test)]
+pub(crate) fn planted(plant: Plant) -> bool {
+    PLANTED.with(|it| it.get() == Some(plant))
+}
+
+#[cfg(not(test))]
+pub(crate) fn planted(_plant: Plant) -> bool {
+    false
+}
+
+/// Whether `body`, a block, is a function's body that no other crate's check can read, so the
+/// crate's interface holds its shape in place of its text. A check of another crate reads a
+/// body of this one only to: infer a type the signature hides (`impl Trait`, `async`, a
+/// generator), evaluate it (`const`), instantiate it (a type or const parameter of the
+/// function, its `impl` or its trait), inline it (`#[inline]`), or find an item it defines
+/// (an `impl`, which is the crate's wherever it is written). So a body is left out only when:
+///
+/// - its function is written with nothing but attributes, a visibility, `unsafe`, an ABI,
+///   lifetime parameters, parameters and a return type: no `const`, `async` or `default`, no
+///   type or const parameter, no `where`, and no `impl Trait` or macro in its signature;
+/// - no attribute of it names `inline` (one that gives it to a macro already keeps it: the
+///   walk leaves no shape where a macro sees);
+/// - it is under nothing but modules and `impl`s with no type or const parameter, no `where`,
+///   no `const` and no `impl Trait` anywhere in them (an associated type that hides its type
+///   takes it from the `impl`'s bodies): never in a trait (a default method is instantiated
+///   for each `Self`), a function or a macro's tokens;
+/// - it holds no item, no attribute that gives anything to a macro, and no macro call but a
+///   [`plain_call`], which makes no item ([`CodeText::unplain`] says when one of those names
+///   could mean another macro, and the crate then keeps every body).
+///
+/// What is proved of a body by blaze's extensions (effects, contracts) is read across crates
+/// too: a crate that names them, or depends on one that does, takes no interface
+/// ([`CodeText::extends`]). A code generator reads every body it reaches: a unit that builds
+/// code takes no interface either.
+pub(crate) fn plain_body(body: &SyntaxNode) -> bool {
+    let Some(function) = body.parent().filter(|it| it.kind() == SyntaxKind::FN) else {
+        return false;
+    };
+    let lifetimes_only =
+        |list: &SyntaxNode| list.children().all(|it| it.kind() == SyntaxKind::LIFETIME_PARAM);
+    let signature = function.children_with_tokens().all(|element| match element {
+        NodeOrToken::Token(token) => matches!(
+            token.kind(),
+            SyntaxKind::WHITESPACE
+                | SyntaxKind::COMMENT
+                | SyntaxKind::OUTER_DOC_COMMENT
+                | SyntaxKind::INNER_DOC_COMMENT
+                | SyntaxKind::FN_KW
+                | SyntaxKind::UNSAFE_KW
+                | SyntaxKind::SAFE_KW
+        ) || (token.kind() == SyntaxKind::CONST_KW && planted(Plant::Const)),
+        NodeOrToken::Node(node) => match node.kind() {
+            SyntaxKind::ATTR => {
+                planted(Plant::Inline)
+                    || !node
+                        .descendants_with_tokens()
+                        .filter_map(NodeOrToken::into_token)
+                        .any(|it| it.kind() == SyntaxKind::IDENT && it.text() == "inline")
+            }
+            SyntaxKind::VISIBILITY | SyntaxKind::ABI | SyntaxKind::NAME => true,
+            SyntaxKind::GENERIC_PARAM_LIST => lifetimes_only(&node) || planted(Plant::Generic),
+            SyntaxKind::PARAM_LIST | SyntaxKind::RET_TYPE => {
+                planted(Plant::Hidden)
+                    || !node.descendants().any(|it| {
+                        matches!(it.kind(), SyntaxKind::IMPL_TRAIT_TYPE | SyntaxKind::MACRO_CALL)
+                    })
+            }
+            SyntaxKind::BLOCK_EXPR => true,
+            _ => false,
+        },
+    });
+    if !signature {
+        return false;
+    }
+    let placed = function.ancestors().skip(1).all(|at| match at.kind() {
+        SyntaxKind::SOURCE_FILE
+        | SyntaxKind::ITEM_LIST
+        | SyntaxKind::ASSOC_ITEM_LIST
+        | SyntaxKind::MODULE => true,
+        SyntaxKind::IMPL => {
+            at.children_with_tokens().all(|element| match element {
+                NodeOrToken::Token(token) => token.kind() != SyntaxKind::CONST_KW,
+                NodeOrToken::Node(node) => match node.kind() {
+                    SyntaxKind::WHERE_CLAUSE => false,
+                    SyntaxKind::GENERIC_PARAM_LIST => lifetimes_only(&node),
+                    _ => true,
+                },
+            // An associated type that hides its type (`type Item = impl Trait;`) is given it
+            // by the bodies of its `impl`'s functions, whatever their signatures say.
+            }) && !at.descendants().any(|it| it.kind() == SyntaxKind::IMPL_TRAIT_TYPE)
+        }
+        SyntaxKind::TRAIT => planted(Plant::Trait),
+        _ => false,
+    });
+    placed
+        && body.descendants().all(|node| match node.kind() {
+            SyntaxKind::MACRO_CALL => plain_call(&node) || planted(Plant::Macros),
+            SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF => false,
+            _ => match ast::Attr::cast(node.clone()) {
+                Some(attr) => attr_seen(&attr) == Seen::No,
+                None => ast::Item::cast(node).is_none() || planted(Plant::Items),
+            },
+        })
 }
 
 /// The standard derives, and the prelude's attribute macros, that a crate can shadow.
@@ -760,6 +1246,12 @@ fn own_or_std(first: &str) -> bool {
 /// Whether the `use` item `node` could shadow a prelude macro: a name of one imported, or a
 /// glob, from a path that starts outside the standard library and the crate.
 fn use_shadows(node: &SyntaxNode) -> bool {
+    use_takes(node, |it| SHADOWABLE.contains(&it))
+}
+
+/// Whether the `use` item `node` brings in a name `named` takes, or a glob, from a path that
+/// starts outside the standard library and the crate.
+fn use_takes(node: &SyntaxNode, named: impl Fn(&str) -> bool) -> bool {
     node.descendants().filter(|it| it.kind() == SyntaxKind::USE_TREE).any(|tree| {
         let glob = tree.children_with_tokens().any(|it| it.kind() == SyntaxKind::STAR);
         let list = tree.children().any(|it| it.kind() == SyntaxKind::USE_TREE_LIST);
@@ -791,7 +1283,7 @@ fn use_shadows(node: &SyntaxNode) -> bool {
             Some(rename) => rename.strip_prefix("as").map(str::to_owned),
             None => last,
         };
-        from_outside && (glob || name.is_some_and(|it| SHADOWABLE.contains(&it.as_str())))
+        from_outside && (glob || name.is_some_and(|it| named(it.as_str())))
     })
 }
 

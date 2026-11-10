@@ -14,6 +14,16 @@
 //! proc-macro expansions read outside the tree, with their values ([`reads`]). A unit
 //! whose record and outputs are all in the store is fresh: its diagnostics are replayed as
 //! cargo replays a fresh unit's, and nothing runs.
+//!
+//! A record that holds no diagnostics is kept under a second, narrow key ([`narrow_key`])
+//! in place of that one: the same inputs, with the unit's crate known by what its code can
+//! observe ([`blaze_lower::Narrowed`]) in place of its bytes. An edit of a comment no macro
+//! sees then finds the record, in the unit's own crate and in every crate it depends on; and
+//! for a unit that only checks, so does an edit of a body no other crate's check can read.
+//! Diagnostics quote their files (a line with its comments), which no narrow identity holds:
+//! a record with any is under the narrow key and the content of each file they point into
+//! ([`quoted_key`]), so only an edit of one of those files renders them again. Where a file
+//! they point into is not one of the view's, the record stays under the whole key.
 
 #![forbid(unsafe_code)]
 
@@ -112,8 +122,10 @@ struct RecordRef<'a> {
 /// how its key is made ([`RecordInputs::key`]), so that no record of another format is read as
 /// this one's. blaze-cargo's own code is of [`crate::serve::RecordCode`] too, so such a change
 /// moves every key even unbumped; the bump says so by name. 9: keyed by
-/// [`crate::serve::RecordMakers`] in place of the executable's bytes.
-const RECORD: &str = "blaze v2 cargo unit record 9";
+/// [`crate::serve::RecordMakers`] in place of the executable's bytes. 10: a library's file
+/// names its crate by its narrowed identity where it has one ([`named_identity`]), and a
+/// record with no diagnostics is under the narrow key ([`narrow_key`]).
+const RECORD: &str = "blaze v2 cargo unit record 10";
 const OUTPUT: &str = "blaze v2 cargo output 1";
 
 /// The store's key of an output file's `bytes`: what a record names it by, and what a dev
@@ -279,6 +291,139 @@ fn record_key(job: &Job, unit: usize) -> Result<Option<Key>, ApiError> {
 /// `unit`'s identity in the front end, once the writer set it.
 fn identity(job: &Job, unit: usize) -> Option<ContentId> {
     job.identities.get(unit).and_then(|it| it.get()).copied().flatten()
+}
+
+/// What `unit`'s narrow record key ([`narrow_key`]) holds in place of its crate's whole
+/// identity: what a unit that only checks can observe ([`blaze_lower::Narrowed::checked`]),
+/// or what one that builds code can ([`blaze_lower::Narrowed::code`]: the code generator
+/// reads every body its walk reaches, in every crate). None, so the unit has its whole key
+/// alone, where the unit reads what a narrowed identity leaves out: comments, read by
+/// clippy's and blaze's lints (`// SAFETY:`, `// alloc:`) and by rustdoc and its doctests;
+/// and for a crate with no narrowed identity ([`blaze_lower::Lowered::narrowed`]).
+fn narrow_identity(job: &Job, unit: usize) -> Result<Option<ContentId>, ApiError> {
+    let Some(narrowed) = job.narrowed.get(unit).and_then(|it| it.get()).copied().flatten() else {
+        return Ok(None);
+    };
+    let u = job.unit(unit)?;
+    let reads_comments = job.plan(unit)?.clippy.is_some()
+        || !matches!(u.mode, Mode::Build | Mode::Check | Mode::Test);
+    if reads_comments {
+        return Ok(None);
+    }
+    Ok(Some(match checks_only(job.input.goal, u) {
+        true => narrowed.checked,
+        false => narrowed.code,
+    }))
+}
+
+/// The identity a library's file names its crate by ([`crate_record`]): the narrowed one
+/// where the unit has it, else the whole. The file is the same whichever key its record is
+/// under, so a record found under the narrow key holds the bytes a build from nothing writes.
+fn named_identity(job: &Job, unit: usize) -> Result<Option<ContentId>, ApiError> {
+    Ok(narrow_identity(job, unit)?.or(identity(job, unit)))
+}
+
+/// The narrow base key of `unit`'s record: [`RecordInputs::key`] with [`narrow_identity`] in
+/// place of the crate's whole identity, which a record with no diagnostics is filed under
+/// ([`store`]) and looked up by before the whole key ([`record_keys`]). None for a unit with
+/// no narrow identity, and before the writer set the unit's identities. Worked out once per
+/// job and unit.
+///
+/// Sound because everything a record holds but its diagnostics is made from what the narrow
+/// identity covers: the outputs are compiled from the code text (a comment no macro sees is
+/// in no token the compiler keeps, and positions are in the text's shape), and a unit that
+/// only checks reads of another crate what that crate's interface text holds. Its diagnostics
+/// are not (they quote source lines), so only a record with none is under this key; and
+/// whether a unit has any is itself made from the code text, for a unit no lint of which
+/// reads comments ([`narrow_identity`]).
+fn narrow_key(job: &Job, unit: usize) -> Result<Option<Key>, ApiError> {
+    if let Some(key) = job.narrow_keys.get(unit).and_then(|it| it.get()) {
+        return Ok(*key);
+    }
+    if job.identities.get(unit).and_then(|it| it.get()).is_none() {
+        return Ok(None);
+    }
+    let key = match narrow_identity(job, unit)? {
+        Some(identity) => Some(work_out_key(job, unit, identity)?),
+        None => None,
+    };
+    if let Some(slot) = job.narrow_keys.get(unit) {
+        let _ = slot.set(key);
+    }
+    Ok(key)
+}
+
+/// The base keys `unit`'s record may be under, in the order they are asked: the narrow one
+/// (a record with no diagnostics), the narrow one with what its diagnostics quote
+/// ([`quoted_key`], of the files the slot under the narrow key lists), then the whole one.
+fn record_keys(job: &Job, unit: usize) -> Result<[Option<Key>; 3], ApiError> {
+    let narrow = narrow_key(job, unit)?;
+    let quoted = match narrow {
+        Some(narrow) => match quotes(job, narrow)? {
+            Some(names) => quoted_key(job, narrow, &names),
+            None => None,
+        },
+        None => None,
+    };
+    Ok([narrow, quoted, record_key(job, unit)?])
+}
+
+/// The domain of the slot under a narrow key that lists the files its record's diagnostics
+/// point into ([`quotes_slot`]).
+const QUOTES: &str = "blaze v2 cargo unit record quotes 1";
+/// The domain of [`quoted_key`].
+const QUOTED: &str = "blaze v2 cargo unit record quoted 1";
+
+/// Where the names of the files the diagnostics of the record under `narrow` point into are
+/// kept: what a lookup reads to work out [`quoted_key`] before it has the record.
+fn quotes_slot(narrow: Key) -> Key {
+    Key(Hasher::new(QUOTES).id(&narrow.0).finish())
+}
+
+/// The names in the slot under `narrow` ([`quotes_slot`]): none when the store has none. A
+/// read that fails or bytes that do not decode are an error naming the slot (rule 3).
+fn quotes(job: &Job, narrow: Key) -> Result<Option<Vec<String>>, ApiError> {
+    let guard = blaze_cas::enter();
+    let slot = quotes_slot(narrow);
+    let failed = |why: String| {
+        // alloc: error path
+        ApiError::new(
+            format!(
+                "the files the diagnostics of the record under {:x} quote, kept under {:x} in the daemon's store: {why}",
+                narrow.0, slot.0
+            ),
+            None,
+        )
+    };
+    match job.input.store.get(&guard, &slot) {
+        Ok(None) => Ok(None),
+        // alloc: the few names of a record's quoted files, once per lookup of a unit that has any
+        Ok(Some(entry)) => blaze_protocol::cbor::from_slice(entry.bytes)
+            .map(Some)
+            .map_err(|error| failed(format!("they do not decode: {error}"))), // alloc: error path
+        Err(error) => Err(failed(error.to_string())), // alloc: error path
+    }
+}
+
+/// The base key of a record whose diagnostics point into the files `names`: its narrow key
+/// with each of those files' content as the job's view has it, by the name the diagnostics
+/// give it. The diagnostics are rendered from the check's result, which the narrow key
+/// covers, and the text of exactly these files ([`blaze_diagnostics::emit::Sources::unread`]:
+/// every file a span is in, through each macro call and definition), so an edit of a comment
+/// in any other file finds the record, and one in these renders them again. None, so the
+/// record is under its whole key, when one of the files is not the view's file at its path:
+/// a text of the database's own (a root with a module appended), or a file no mount holds.
+fn quoted_key(job: &Job, narrow: Key, names: &[String]) -> Option<Key> {
+    let mut hasher = Hasher::new(QUOTED);
+    hasher.id(&narrow.0).update(&(names.len() as u64).to_le_bytes());
+    for name in names {
+        if blaze_diagnostics::emit::names_text(name) {
+            return None;
+        }
+        let (content, _, _) = job.mounted.read(&job.mounted.absolute(name)).ok()??;
+        hasher.part(name.as_bytes()).id(&content);
+    }
+    Some(Key(hasher.finish()))
 }
 
 fn work_out_key(job: &Job, unit: usize, identity: ContentId) -> Result<Key, ApiError> {
@@ -887,12 +1032,15 @@ fn machine_file(
 /// allocation for a record whose code read no process variable. A store it can't read says
 /// not fresh, and the unit's compile, looking again, fails naming why ([`kept`]).
 pub(crate) fn fresh(job: &Job, unit: usize) -> bool {
-    let Ok(Some(base)) = record_key(job, unit) else { return false };
+    let Ok(keys) = record_keys(job, unit) else { return false };
     let guard = blaze_cas::enter();
-    let found_in = |store: &blaze_cas::Reader, std: bool| {
+    let found_in = |store: &blaze_cas::Reader, std: bool, base: Key| {
         matches!(filed_in(job, store, std, &guard, base), Ok(Some(_)))
     };
-    found_in(&job.input.store, false) || (shared(job, unit) && found_in(&job.input.std, true))
+    keys.into_iter().flatten().any(|base| {
+        found_in(&job.input.store, false, base)
+            || (shared(job, unit) && found_in(&job.input.std, true, base))
+    })
 }
 
 /// The store a record is read from, named for an error: the daemon's, or with `std` the shared
@@ -1024,7 +1172,8 @@ pub(crate) fn codegen_inputs(job: &Job) -> Result<Vec<(ContentId, ContentId)>, F
 /// units are looked for in the shared std store too.
 pub(crate) fn recorded_profiles(job: &Job, unit: usize) -> Result<Recorded, ApiError> {
     let name = || job.unit(unit).map_or("", |it| it.target.name.as_str());
-    let Some(base) = record_key(job, unit)? else {
+    let keys = record_keys(job, unit)?;
+    let Some(base) = keys[2] else {
         // alloc: an error
         return Ok(Recorded::Missing(format!(
             "unit {unit} (`{}`): its record key is not known",
@@ -1032,15 +1181,24 @@ pub(crate) fn recorded_profiles(job: &Job, unit: usize) -> Result<Recorded, ApiE
         )));
     };
     let guard = blaze_cas::enter();
-    let read = |store: &blaze_cas::Reader, std: bool| -> Result<Option<Vec<_>>, ApiError> {
+    let read = |store: &blaze_cas::Reader,
+                std: bool,
+                base: Key|
+     -> Result<Option<Vec<_>>, ApiError> {
         let Some((_, entry, _)) = filed_in(job, store, std, &guard, base)? else { return Ok(None) };
         recorded_in(job, unit, base, entry.bytes).map(Some)
     };
-    let found = match read(&job.input.store, false)? {
-        Some(profiles) => Some(profiles),
-        None if shared(job, unit) => read(&job.input.std, true)?,
-        None => None,
-    };
+    let mut found = None;
+    for base in keys.into_iter().flatten() {
+        found = match read(&job.input.store, false, base)? {
+            Some(profiles) => Some(profiles),
+            None if shared(job, unit) => read(&job.input.std, true, base)?,
+            None => None,
+        };
+        if found.is_some() {
+            break;
+        }
+    }
     Ok(match found {
         Some(profiles) => Recorded::Read(profiles),
         // alloc: an error
@@ -1087,7 +1245,16 @@ struct Kept {
 /// with the puts that copy it, the slot of what it read and every output it names into the
 /// store. A record key that can't be worked out, or a slot that does not decode, is an error.
 fn kept(job: &Job, unit: usize) -> Result<Option<Kept>, ApiError> {
-    let Some(base) = record_key(job, unit)? else { return Ok(None) };
+    for base in record_keys(job, unit)?.into_iter().flatten() {
+        if let Some(kept) = kept_under(job, unit, base)? {
+            return Ok(Some(kept));
+        }
+    }
+    Ok(None)
+}
+
+/// [`kept`] under the base key `base`, one of the unit's ([`record_keys`]).
+fn kept_under(job: &Job, unit: usize, base: Key) -> Result<Option<Kept>, ApiError> {
     let guard = blaze_cas::enter();
     // A record that is there and does not decode is an error naming the unit, the key and the
     // store, never read as one not kept (rule 3): a record format change is the key's to cover.
@@ -1256,6 +1423,9 @@ struct Making {
     /// The records of images keyed by all they are made from before they are built (a
     /// doctest's examples), each filed once its output is keyed ([`doctest`]).
     records: Vec<ImageRecord>,
+    /// How many of `diagnostics` its check's are, in front, and every file they point into, by
+    /// the name they give it ([`quoted_key`]); none where that is not known (a doctest's).
+    quoted: Option<(usize, Vec<String>)>,
 }
 
 /// What a unit writes at one of its paths ([`Making::files`]).
@@ -1866,7 +2036,6 @@ fn store(
     if let Err(why) = &read {
         tracing::info!(unit, crate_name = %u.target.name, "unit record not kept: {why}");
     }
-    let key = record_key(job, unit)?.filter(|_| read.is_ok());
     let Some(Linked::Made(making)) = phases.linked.take() else {
         // alloc: error path
         return Err(ApiError::new(
@@ -1888,7 +2057,41 @@ fn store(
         links,
         macros,
         records,
+        quoted,
     } = *making;
+    // Under the narrow key when it holds no diagnostics; with diagnostics, all of them the
+    // check's, under the narrow key and what they quote ([`quoted_key`]), their files' names
+    // put in the slot a lookup reads; else under the whole one.
+    let narrow = narrow_key(job, unit)?;
+    let mut quotes_put = None;
+    let key = match (narrow, quoted) {
+        (Some(narrow), _) if diagnostics.is_empty() => Some(narrow),
+        (Some(narrow), Some((count, names))) if count == diagnostics.len() => {
+            let slot = quotes_slot(narrow);
+            // The slot as the store has it: one already there with other names (the check's
+            // result moved with a variable its code read, which the key does not hold) is
+            // left as it is, and this record is under its whole key.
+            let kept = quotes(job, narrow)?;
+            match (quoted_key(job, narrow, &names), kept) {
+                (Some(key), None) => {
+                    // alloc: the slot's bytes, once per record first kept with diagnostics
+                    let bytes = blaze_protocol::cbor::to_vec(&names).map_err(|why| {
+                        // alloc: error path
+                        ApiError::new(
+                            format!("encoding the files the diagnostics of unit {unit} quote: {why}"),
+                            None,
+                        )
+                    })?;
+                    quotes_put = Some(Put { key: slot, kind: Kind::Query, bytes });
+                    Some(key)
+                }
+                (Some(key), Some(kept)) if kept == names => Some(key),
+                _ => record_key(job, unit)?,
+            }
+        }
+        _ => record_key(job, unit)?,
+    }
+    .filter(|_| read.is_ok());
     let mut outputs = Vec::new();
     let mut artifact = None;
     // Each file it wrote hashed whole for its key (a program's image among them), its
@@ -2055,6 +2258,7 @@ fn store(
         }
         compiled.puts.push(record);
         compiled.puts.extend(slot);
+        compiled.puts.extend(quotes_put);
     }
     if let Some(slot) = job.made.get(unit) {
         let _ = slot.set(made);
@@ -2446,6 +2650,16 @@ fn assemble(
         // clone: the unit's name, on the error path
         .map_err(|why| ApiError::new(why, Some(u.target.name.clone())))?;
     drop(rendering);
+    // What those were rendered from beside the check's own result: every file it points into.
+    let quoted: (usize, Vec<String>) = (
+        diagnostics.len(),
+        // alloc: the names of the files a unit's diagnostics point into, once per unit made
+        blaze_diagnostics::emit::Sources::default()
+            .unread(diags)
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+    );
     let failed = diagnostics.iter().any(|it| it.level == Level::Error);
     let mut made = Made::default();
     let nothing = |diagnostics: Vec<Diagnostic>, ok: bool, made: Made| Making {
@@ -2461,6 +2675,8 @@ fn assemble(
         links: Vec::new(),
         macros: None,
         records: Vec::new(),
+        // clone: the files its diagnostics point into, once per unit that fails or builds nothing
+        quoted: Some(quoted.clone()),
     };
     if failed {
         // Failed in its bodies or lints only: its items are sound, and what is checked against
@@ -2484,7 +2700,7 @@ fn assemble(
     let mut links = Vec::new(); // alloc: none until a link
     // What each file rustc would write holds: (path, bytes, executable).
     let mut files: Vec<(String, Written, bool)> = Vec::new();
-    let identity = identity(job, unit);
+    let identity = named_identity(job, unit)?;
     if inert {
         // A build script that does nothing is not run, so not built: what it prints is known.
         return Ok(nothing(diagnostics, true, made));
@@ -2685,6 +2901,7 @@ fn assemble(
         links,
         macros: None,
         records: Vec::new(),
+        quoted: Some(quoted),
     })
 }
 

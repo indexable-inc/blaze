@@ -182,6 +182,9 @@ class Work:
     link: str | None = None
     said: str = ""
     green: int | None = None
+    # The reports of steps recomputed (`blaze-report` lines, one a root cause): none from a
+    # build that recomputed nothing (docs/v2/plan/design/why.md, "What is printed").
+    reports: int | None = None
 
 
 @dataclass(frozen=True)
@@ -814,6 +817,8 @@ class V2(Engine):
         # Each build, test and run through `build`, by its daemon's home: its step and its
         # `blaze-work` line, or None where it printed none.
         self.worked: dict[str, list[tuple[str, dict[str, object] | None]]] = {}
+        # Beside each of those, the `blaze-report` lines the command printed.
+        self.reported: dict[str, list[list[str]]] = {}
         # Every command through `build`, in order: its step and its seconds, for a script to
         # say where its time went.
         self.took: list[tuple[str, float]] = []
@@ -829,6 +834,7 @@ class V2(Engine):
             if len(lines) > 1:
                 raise Failed(f"{label}: {len(lines)} `blaze-work` lines; a request reports what it did once")
             self.worked.setdefault(env["BLAZE_HOME"], []).append((label, lines[0] if lines else None))
+            self.reported.setdefault(env["BLAZE_HOME"], []).append(report_lines(ran.stdout))
         return ran
 
     def mark(self, home: Path) -> Mark:
@@ -858,8 +864,10 @@ class V2(Engine):
             link = f"first link: {label}: {it['path']}"
         else:
             link = "patched in place"
+        reports = [text for texts in self.reported.get(str(home), [])[mark.sizes["requests"]:] for text in texts]
         return Work(compiled=total("compiled"), reran=total("reran"), found=total("found"), link=link,
-                    said="\n".join(json.dumps(line, sort_keys=True) for _, line in lines), green=total("green"))
+                    said="\n".join([*(json.dumps(line, sort_keys=True) for _, line in lines), *reports]),
+                    green=total("green"), reports=len(reports))
 
     def codegen_inputs(self, ws: Path, env: dict[str, str]) -> dict[str, str]:
         # `blaze codegen-inputs --format=json` (`blaze_ui::api::codegen_inputs_json`): one object
@@ -963,6 +971,24 @@ def worked_lines(stdout: str) -> list[dict[str, object]]:
             continue
         if isinstance(line, dict) and cast(dict[str, object], line).get("reason") == "blaze-work":
             found.append(cast(dict[str, object], line))
+    return found
+
+
+def report_lines(stdout: str) -> list[str]:
+    """The `blaze-report` lines of a command's `--message-format=json` output that say why its
+    build recomputed steps (a report whose rule is one of `why:...`, docs/v2/plan/design/why.md):
+    one for each root cause, none when it recomputed nothing. Reports of other rules are not
+    of work done."""
+    found: list[str] = []
+    for text in stdout.splitlines():
+        if not text.startswith("{") or '"blaze-report"' not in text or '"why:' not in text:
+            continue
+        try:
+            line = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(line, dict) and cast(dict[str, object], line).get("reason") == "blaze-report":
+            found.append(text)
     return found
 
 

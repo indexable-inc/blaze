@@ -166,6 +166,11 @@ class Step:
     slot: str = ""
     edit: str = ""
     budget_zero: bool = False
+    # The edit moves no token and no position (`fixture.Edit.still`): it recomputes no step.
+    still: bool = False
+    # The reports of recomputed steps the incremental build gave (`engine.Work.reports`).
+    reports: int | None = None
+    said: str = ""
     rejects: bool = False
     compiled: int | None = None
     reran: int | None = None
@@ -427,6 +432,7 @@ class Round:
         slot = fixture.BY_NAME[edit.slot] if edit else None
         out = Step(name=name, verdict="pass", kind=edit.kind if edit else "start", slot=edit.slot if edit else "",
                    edit=edit.label() if edit else "", budget_zero=bool(slot and slot.budget_zero),
+                   still=bool(edit and edit.still()),
                    rejects=fixture.rejects(state), state=dict(state))
         try:
             inc, work = self.incremental(state)
@@ -442,6 +448,7 @@ class Round:
         self.last_trace = inc.trace
         if work is not None:
             out.compiled, out.reran, out.link = work.compiled, work.reran, work.link
+            out.reports, out.said = work.reports, work.said
         if inc.not_blazes or scratch.not_blazes:
             out.verdict = "unmeasured"
             out.detail = f"not blaze's: {inc.not_blazes or scratch.not_blazes}"
@@ -607,7 +614,7 @@ def record(out: report.Report, ran: Ran, gaps: dict[str, tuple[report.Verdict, s
            by_kind: dict[str, list[int]], refused: list[Step]) -> None:
     for step in ran.steps:
         numbers: dict[str, report.Number] = dict(kind=step.kind, compiled=step.compiled, reran=step.reran,
-                                                 needless=step.needless, link=step.link)
+                                                 needless=step.needless, link=step.link, reports=step.reports)
         detail = step.edit + (f"\n{step.detail}" if step.detail else "") + (f"\nfiled: {step.found}" if step.found else "")
         out.add(f"oracle/{step.name}", step.verdict, detail.strip(), **numbers)
         if step.rejects and step.verdict != "error":
@@ -616,10 +623,18 @@ def record(out: report.Report, ran: Ran, gaps: dict[str, tuple[report.Verdict, s
                     f"{step.edit}\n{step.refusal or 'both builds refused it'}".strip(), kind=step.kind)
         if step.kind != "start" and step.compiled is not None and step.verdict != "error" and not step.rejects:
             by_kind.setdefault(step.kind, []).append(step.compiled)
+            # A budget-zero edit compiles no function; one that also moves no position makes no
+            # step of any unit again (no unit, no build script run, no link), which a build says
+            # by giving no report of what it recomputed.
+            over: list[str] = []
             if step.budget_zero and step.compiled > 0:
-                out.add(f"over/{step.name}", "fail",
-                        f"{step.edit}: docs/v2/plan/objectives.md says this compiles nothing; it compiled {step.compiled} functions",
-                        kind=step.kind, compiled=step.compiled, budget=0)
+                over.append(f"docs/v2/plan/objectives.md says this compiles nothing; it compiled {step.compiled} functions")
+            if step.budget_zero and step.still and step.reports:
+                over.append(f"it moves no token and no position, so no step is made again; the build reported "
+                            f"{step.reports} causes of steps it recomputed:\n{step.said}")
+            if over:
+                out.add(f"over/{step.name}", "fail", f"{step.edit}: " + "; ".join(over),
+                        kind=step.kind, compiled=step.compiled, reports=step.reports, budget=0)
     for verdict, why in ran.gaps:
         gaps.setdefault(why.split(":")[0], (verdict, why))
 

@@ -1416,6 +1416,7 @@ dependencies = [
  "blaze-units",
  "blaze-vfs",
  "cfg",
+ "hegeltest",
  "hir-def",
  "hir-expand",
  "hir-ty-mir",

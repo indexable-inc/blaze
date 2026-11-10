@@ -197,6 +197,9 @@ pub struct Lowered {
     paths: std::sync::Arc<HashMap<FileId, String>>,
     /// Each crate's identity worked out since the last write ([`Lowered::identity`]).
     identities: blaze_hash::HashMap<Crate, ContentId, Global>,
+    /// Each crate's narrowed identities worked out since the last write
+    /// ([`Lowered::narrowed`]).
+    narrowed: blaze_hash::HashMap<Crate, Narrow, Global>,
     /// How cargo passes each crate's root, which the build's naming of files reads and each
     /// crate's identity covers.
     spellings: std::sync::Arc<Spellings>,
@@ -321,6 +324,7 @@ pub fn lower_into<T: blaze_query::Tree>(
         crates: std::sync::Arc::new(Crates { units: lowerings, sets }),
         paths: std::sync::Arc::new(paths),
         identities: blaze_hash::HashMap::new_in(Global),
+        narrowed: blaze_hash::HashMap::new_in(Global),
         spellings,
         appended: blaze_hash::HashMap::new_in(Global),
         loads,
@@ -1022,6 +1026,31 @@ impl Lowered {
         Some(identity_of(&self.db, krate, &self.spellings, &mut self.identities))
     }
 
+    /// Unit `unit`'s crate as the keys that leave trivia out know it ([`Narrowed`]): none for
+    /// a unit with no crate, and for a crate that keeps its whole text (a library source
+    /// root's, which does not change; one a file of which reads Rust source as bytes), whose
+    /// keys hold [`Lowered::identity`] alone. Worked out once per crate between writes, each
+    /// file parsed once a revision ([`code::own_narrow`]).
+    ///
+    /// Why each narrower identity covers what its reader can observe is with the texts it is
+    /// made of: a comment no macro sees (`code`'s module docs), and a body no other crate's
+    /// check can read ([`code::plain_body`]). Positions are never left out: each text keeps the
+    /// shape of what it leaves out, so every line and column after it is as it was, and a
+    /// change that moves code changes every identity here.
+    pub fn narrowed(&mut self, unit: usize) -> Option<Narrowed> {
+        let krate = self.crates.krate(unit)?;
+        identity_of(&self.db, krate, &self.spellings, &mut self.identities);
+        let narrow = narrow_of(
+            &self.db,
+            krate,
+            &self.spellings,
+            &self.identities,
+            &self.const_macros,
+            &mut self.narrowed,
+        );
+        narrow.own.then_some(Narrowed { code: narrow.code, checked: narrow.checked })
+    }
+
     /// What unit `unit`'s identity ([`Lowered::identity`]) is made of, one part each, for
     /// `blaze why` to name the one that changed (docs/v2/plan/design/why.md): its crate's own
     /// settings, each file it is made from (its root file alone for a crate that reads no
@@ -1245,6 +1274,7 @@ impl Lowered {
         }
 
         self.identities.clear();
+        self.narrowed.clear();
         let db = &mut self.db;
         let change = set_files(db, out_dir, &[], lowering.set, crates.sets, &loaded)?;
         note(&mut self.paths, db, lowering.set, &change);
@@ -1333,6 +1363,7 @@ impl Lowered {
             return Ok(false);
         }
         self.identities.clear();
+        self.narrowed.clear();
         // One change: the view's files, the seeds and the const macros they list, one batch.
         self.batch(Trigger::named("the view moved"), |this| {
             this.refresh_writes(&tree, root, seed)
@@ -1446,6 +1477,7 @@ impl Lowered {
             macros
         });
         self.identities.clear();
+        self.narrowed.clear();
         let trigger = Trigger::of("a proc macro's expanders loaded", &self.crates.units[unit].what);
         Db::batch_in(&mut self.db, |db| db, trigger, |db| ProcMacros::give(db, [(krate, macros)]));
         Ok(())
@@ -1587,6 +1619,124 @@ pub enum IdentityPart {
     Spelling(ContentId),
     /// A crate it depends on, by the name its code uses, with that crate's identity.
     Dependency { krate: Crate, name: String, identity: ContentId },
+}
+
+/// A crate as the keys that leave trivia out know it ([`Lowered::narrowed`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Narrowed {
+    /// What code made from the crate can observe: its own code text (each comment no macro
+    /// sees as its shape) and that of every crate it depends on, deeply. For a unit that
+    /// builds code, which reads every body it reaches.
+    pub code: ContentId,
+    /// What a check of the crate can observe: its own code text, and of each crate it depends
+    /// on only its interface (each body no other crate's check can read as its shape too).
+    /// For a unit that only checks. Equal to `code` wherever a check may read more: a crate
+    /// that names blaze's extensions or reads files by path.
+    pub checked: ContentId,
+}
+
+/// A crate's narrowed identities, as [`narrow_of`] keeps them.
+#[derive(Clone, Copy)]
+struct Narrow {
+    /// Whether the crate has a code text of its own: [`Lowered::narrowed`] is none without.
+    own: bool,
+    /// [`Narrowed::code`]; the whole identity for a crate with no code text of its own.
+    code: ContentId,
+    /// What a crate that only checks against it observes of it and, through it, of what it
+    /// depends on: its interface text and its dependencies' interfaces. `code` where no body
+    /// may be left out: a proc macro, a build script or a program (what depends on those runs
+    /// them), a const macro crate, a crate that names blaze's extensions.
+    interface: ContentId,
+    /// [`Narrowed::checked`].
+    checked: ContentId,
+    /// Whether it or a workspace crate it depends on names blaze's extensions.
+    extends: bool,
+}
+
+const NARROW_CODE: &str = "blaze v2 cargo unit narrow code 1";
+const NARROW_INTERFACE: &str = "blaze v2 cargo unit narrow interface 1";
+const NARROW_CHECKED: &str = "blaze v2 cargo unit narrow checked 1";
+
+/// [`Lowered::narrowed`] of `krate`, each crate of its closure worked out once into `known`,
+/// dependencies first, with a stack of its own; `whole` holds the whole identity
+/// ([`identity_of`]) of every crate of the closure.
+fn narrow_of(
+    db: &Db,
+    krate: Crate,
+    spellings: &Spellings,
+    whole: &blaze_hash::HashMap<Crate, ContentId, Global>,
+    const_macros: &[const_macros::Loaded],
+    known: &mut blaze_hash::HashMap<Crate, Narrow, Global>,
+) -> Narrow {
+    if let Some(narrow) = known.get(&krate) {
+        return *narrow;
+    }
+    let mut stack = vec![(krate, false)]; // alloc: once per crate keyed between writes
+    while let Some((at, deps_known)) = stack.pop() {
+        if known.contains_key(&at) {
+            continue;
+        }
+        let data = at.data(db);
+        if !deps_known {
+            stack.push((at, true));
+            stack.extend(
+                data.dependencies
+                    .iter()
+                    .filter(|it| !known.contains_key(&it.crate_id))
+                    .map(|it| (it.crate_id, false)),
+            );
+            continue;
+        }
+        let own = code::own_narrow(db, at);
+        let extends = own.extends || data.dependencies.iter().any(|it| known[&it.crate_id].extends);
+        let Some(own_code) = own.code else {
+            // A crate that keeps its whole text is its whole identity to everything.
+            let id = whole[&at];
+            known.insert(at, Narrow { own: false, code: id, interface: id, checked: id, extends });
+            continue;
+        };
+        // Of `own_text` and each dependency by `of`, with how cargo passes the root, which
+        // the crate's code says of its files, as the whole identity has it.
+        let folded = |domain: &'static str, own_text: ContentId, of: fn(&Narrow) -> ContentId| {
+            let mut hasher = Hasher::new(domain);
+            hasher.id(&own_text);
+            match spellings.of(at) {
+                None => {
+                    hasher.update(&[0]);
+                }
+                Some(spelling) => {
+                    hasher.update(&[1]);
+                    for text in [&spelling.dir, &spelling.passed] {
+                        hasher.part(text.as_bytes());
+                    }
+                }
+            }
+            hasher.update(&(data.dependencies.len() as u64).to_le_bytes());
+            for dep in &data.dependencies {
+                hasher.id(&of(&known[&dep.crate_id]));
+            }
+            hasher.finish()
+        };
+        let code = match code::planted(code::Plant::Shallow) {
+            true => folded(NARROW_CODE, own_code, |it| it.interface),
+            false => folded(NARROW_CODE, own_code, |it| it.code),
+        };
+        // Only a library that runs nowhere at compile time is read through its interface.
+        let library = matches!(data.target_kind, base_db::TargetKind::Lib { is_proc_macro: false })
+            && const_macros.iter().all(|it| it.krate != at);
+        let interface = match own.interface {
+            Some(own_interface) if library && !extends => {
+                folded(NARROW_INTERFACE, own_interface, |it| it.interface)
+            }
+            _ => code,
+        };
+        let checked = match extends || own.reaches || code::planted(code::Plant::Deep) {
+            true => code,
+            false => folded(NARROW_CHECKED, own_code, |it| it.interface),
+        };
+        known.insert(at, Narrow { own: true, code, interface, checked, extends });
+    }
+    known[&krate]
 }
 
 /// What an identity holds in place of its source root's content for a crate that reads its
