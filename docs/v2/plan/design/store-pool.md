@@ -925,7 +925,8 @@ is next. Lane 5 waits on 4b and on admission by footprint reaching main.
        - The read port's six steps, in order, each a commit that leaves the tree whole: (1) the
          pool, the windows and the loads core inside the store, each pack opened with its
          checks (`crates/blaze-cas/src/hot.rs`: built); (2) `Pump`, for the simulation and a
-         native inline driver; (3) `Reader::read` and `Reader::pin` beside the old readers;
+         native inline driver (`crates/blaze-cas/src/pump.rs`, `Inline` over any driver, and
+         `Hot::pin_pack`, a pinned read whose miss the pump loads: built); (3) `Reader::read` and `Reader::pin` beside the old readers;
          (4) the index probes, the recovery scan and the commit (`Append`, `WriteFrom`) on the
          pool; (5) the callers, crate by crate, and the tests' reads through one helper;
          (6) the old readers and every mapping but `Kind::Machine`'s deleted. Until (4), a

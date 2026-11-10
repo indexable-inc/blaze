@@ -301,6 +301,69 @@ fn every_pack_is_open_in_the_pool_as_far_as_it_is_committed() {
     assert_eq!(store.hot.pack_open(0, 0), None);
 }
 
+/// A pump that must not be asked: a read of pages in memory loads nothing.
+struct NoPump;
+
+impl Pump for NoPump {
+    fn pump(
+        &mut self,
+        effects: &mut Vec<Effect>,
+        _done: &mut dyn FnMut(Completion) -> Option<Completion>,
+    ) -> Result<(), PumpError> {
+        panic!("a read of pages in memory asked for {effects:?}");
+    }
+}
+
+/// A pumped miss: a pack's bytes pinned through the pool are the file's, loaded by reads the
+/// caller's pump carries out on the simulation and checked by block; a second read is a hit and
+/// asks nothing; given back, they load again; and a block rotted on disk meanwhile is refused,
+/// naming the pack and the block, never served.
+#[test]
+fn a_pumped_miss_loads_a_packs_bytes_checked_and_again_once_given_back() {
+    let mut sim = Sim::new(9, quiet());
+    let mut store = open(&mut sim, "store");
+    for n in 0..5 {
+        store.put(key(n), Kind::Code, &noise(40_000, n)).unwrap();
+    }
+    flush(&mut sim, &mut store);
+    let (file, committed) = {
+        let pack = &store.tiers[0].packs[0];
+        (pack.file.clone(), pack.committed)
+    };
+    let on_disk = sim.contents(&file);
+    assert!(committed > 2 * crate::pool::PAGE, "the pack is more than two pages");
+    for round in 0..2 {
+        {
+            let mut pump = Inline::new(&mut sim);
+            let pins = store
+                .hot
+                .pin_pack(&mut pump, 0, 0, 0, committed)
+                .unwrap_or_else(|err| panic!("round {round}: {err}"));
+            assert_eq!(pins.bytes(), &on_disk[..committed as usize], "round {round}");
+            drop(pins);
+            assert_eq!(pump.strays().len(), 0, "round {round}: only the loads' reads were in flight");
+        }
+        {
+            let hit = store.hot.pin_pack(&mut NoPump, 0, 0, 70_000, 300).unwrap();
+            assert_eq!(hit.bytes(), &on_disk[70_000..70_300], "round {round}");
+        }
+        let swept = store.hot.evict(u64::MAX).expect("the store has a pool");
+        assert_eq!((swept.refused, swept.freed >= committed), (None, true), "round {round}");
+    }
+    sim.rot(&file, 70_000, &[0xff; 8]);
+    let mut pump = Inline::new(&mut sim);
+    let refused = store.hot.pin_pack(&mut pump, 0, 0, 0, committed).map(|_| ()).unwrap_err();
+    let block = 70_000 / disk::BLOCK;
+    let said = refused.to_string();
+    assert!(
+        said.contains("pack-000000") && said.contains(&format!("block {block} ")),
+        "{refused:?}"
+    );
+    drop(pump);
+    let past = store.hot.pin_pack(&mut NoPump, 0, 0, committed - 1, 2).map(|_| ()).unwrap_err();
+    assert!(matches!(past, crate::hot::PinError::NotCommitted { .. }), "{past:?}");
+}
+
 /// A block of a pack changed on disk under what was committed (rot) stops the store as it
 /// opens, naming the pack and the block: the recovery scan checks every block it reads.
 #[test]

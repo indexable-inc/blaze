@@ -3,8 +3,10 @@
 //! open in them.
 //!
 //! A pack is opened in the pool with its blocks' checks as its tier opens, grows as a commit
-//! makes more of it durable, and is retired with its file. Nothing reads through the pool yet:
-//! the store still maps what it reads, and this is the state the reads move onto.
+//! makes more of it durable, and is retired with its file. The store's readers do not read
+//! through the pool yet (it still maps what they read); this is the state they move onto, and
+//! what they will call: [`Hot::pin_pack`], a pinned read of a pack's bytes whose miss is loaded
+//! by the caller's [`Pump`], and [`Hot::evict`], the sweep.
 //!
 //! Until the commit appends through the pool ([`crate::pool::Append`]), a commit's bytes reach
 //! their pack by a write of the store's, not through the pack's window. So a page the
@@ -21,7 +23,78 @@ use blaze_core::FileName;
 use blaze_core::Cache;
 
 #[cfg(not(blaze_check))]
-use crate::pool::{FileId, Kernel, Loads, Opened, PAGE, Pool, Rank, WINDOW, WINDOWS, Windows};
+use crate::{
+    pool::{
+        Ended, FileId, Kernel, Load, LoadFailure, Loads, Opened, PAGE, Pins, Pool, PoolError, Rank,
+        ReadStep, Reading, WINDOW, WINDOWS, Windows,
+        evict::{Sweep, Swept},
+    },
+    pump::{Pump, PumpError},
+};
+
+/// The load slot a pumped read loads in: a pumped store's reads are one at a time (the store
+/// is its caller's alone while it pumps), so one slot serves them all.
+#[cfg(not(blaze_check))]
+const PUMPED_SLOT: u16 = 0;
+
+/// Why a pinned read of a pack's bytes failed.
+#[cfg(not(blaze_check))]
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum PinError {
+    /// The store has no pool: its reservation was refused.
+    NoPool(String),
+    /// The pack is not open in the pool, or the bytes asked for run past what it commits.
+    NotCommitted { tier: usize, pack: usize, offset: u64, len: u64, committed: Option<u64> },
+    Pool(PoolError),
+    Pump(PumpError),
+}
+
+#[cfg(not(blaze_check))]
+impl std::fmt::Display for PinError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PinError::NoPool(why) => write!(f, "{why}"),
+            PinError::NotCommitted { tier, pack, offset, len, committed: Some(committed) } => write!(
+                f,
+                "bytes {offset}..{} of pack {pack} of tier {tier}, which commits {committed}, are                  not the store pool's to read",
+                offset + len
+            ),
+            PinError::NotCommitted { tier, pack, offset, len, committed: None } => write!(
+                f,
+                "bytes {offset}..{} of pack {pack} of tier {tier}, which is not open in the                  store's pool",
+                offset + len
+            ),
+            PinError::Pool(err) => write!(f, "{err}"),
+            PinError::Pump(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+/// `load` asked of the loads core and carried out by `pump`: how it ended.
+#[cfg(not(blaze_check))]
+fn pumped(
+    pool: &Pool<Kernel>,
+    loads: &mut Loads,
+    pump: &mut dyn Pump,
+    load: Load,
+) -> Result<Result<(), LoadFailure>, PumpError> {
+    // alloc: a pumped miss, a test's or a tool's, never the daemon's
+    let (mut effects, mut ended) = (Vec::new(), Vec::new());
+    loads.ask(pool, load, &mut effects, &mut ended);
+    // A load of no file the core knows ended as it was asked, with no read.
+    if ended.is_empty() {
+        pump.pump(&mut effects, &mut |completion| {
+            if !loads.owns(completion.tag) {
+                return Some(completion);
+            }
+            loads.complete(pool, completion, &mut ended);
+            None
+        })?;
+    }
+    let Ended { outcome, .. } =
+        ended.pop().expect("a pump that returns Ok has completed every read of the load");
+    Ok(outcome)
+}
 
 /// A pack as the pool names it: its tier and its place in its tier's head.
 #[cfg(not(blaze_check))]
@@ -36,6 +109,7 @@ struct Open {
     pool: Pool<Kernel>,
     windows: Windows,
     loads: Loads,
+    sweep: Sweep,
 }
 
 /// The store's hot tier.
@@ -56,6 +130,7 @@ impl Hot {
                 windows: Windows::new(WINDOWS),
                 // Around the page cache: the pool is the one copy of what it reads.
                 loads: Loads::new(load_tags, Cache::Bypassed),
+                sweep: Sweep::new(),
             })
             // alloc: the error that stops the store
             .map_err(|err| err.to_string());
@@ -94,7 +169,7 @@ impl Hot {
         checks: &[u32],
     ) -> Result<(), String> {
         // clone: the error that stops the store
-        let Open { pool, windows, loads } = self.open.as_mut().map_err(|why| why.clone())?;
+        let Open { pool, windows, loads, .. } = self.open.as_mut().map_err(|why| why.clone())?;
         let id = pack_id(tier, pack);
         let Some(before) = windows.get(id).copied() else {
             let window = windows
@@ -154,7 +229,7 @@ impl Hot {
     /// A page of it is pinned or loading: why. Its windows stay taken.
     #[cfg(not(blaze_check))]
     pub(crate) fn pack_removed(&mut self, tier: usize, pack: usize) -> Result<(), String> {
-        let Ok(Open { pool, windows, loads }) = self.open.as_mut() else { return Ok(()) };
+        let Ok(Open { pool, windows, loads, .. }) = self.open.as_mut() else { return Ok(()) };
         let id = pack_id(tier, pack);
         let Some(window) = windows.get(id).copied() else { return Ok(()) };
         // alloc: a problem reported
@@ -196,8 +271,75 @@ impl Hot {
         Ok(())
     }
 
-    /// The committed length the pool holds of pack `pack` of tier `tier`, and how many checks
-    /// the loads core would check its reads by: a test's look.
+    /// The `len` (at least one) bytes at `offset` of pack `pack` of tier `tier` pinned: in
+    /// memory already, or loaded now by `pump`, each block checked as it is. The bytes stay as
+    /// they are while the guard lives.
+    ///
+    /// A pump that stalls leaves its load in flight: the pages it claimed stay `Loading`, and a
+    /// later read of them ends starved, naming the page. The store's driver has stopped; so has
+    /// the store.
+    #[cfg(not(blaze_check))]
+    pub(crate) fn pin_pack(
+        &mut self,
+        pump: &mut dyn Pump,
+        tier: usize,
+        pack: usize,
+        offset: u64,
+        len: u64,
+    ) -> Result<Pins<Kernel, &Pool<Kernel>>, PinError> {
+        // clone: the error of a read
+        let open = self.open.as_mut().map_err(|why| PinError::NoPool(why.clone()))?;
+        let (pool, loads): (&Pool<Kernel>, &mut Loads) = (&open.pool, &mut open.loads);
+        let committed = open.windows.get(pack_id(tier, pack)).map(|it| it.len);
+        let window = open
+            .windows
+            .get(pack_id(tier, pack))
+            .filter(|it| len >= 1 && offset.checked_add(len).is_some_and(|end| end <= it.len))
+            .ok_or(PinError::NotCommitted { tier, pack, offset, len, committed })?;
+        let mut reading = Reading::new(window.at(offset), len);
+        let mut spin = blaze_spin::SpinWait::new();
+        // Bounded by the reading: it pins a page or asks a load each turn, and counts its
+        // waits to `pool::WAITS_MOST`.
+        loop {
+            match reading.step(&pool) {
+                ReadStep::Pinned(pins) => {
+                    reading.take_slot();
+                    return Ok(pins);
+                }
+                ReadStep::Failed(error) => {
+                    reading.take_slot();
+                    return Err(PinError::Pool(error));
+                }
+                ReadStep::NeedSlot => reading.give_slot(PUMPED_SLOT),
+                ReadStep::Ask(load) => match pumped(pool, loads, pump, load) {
+                    Ok(outcome) => reading.loaded(pool, outcome),
+                    Err(stalled) => {
+                        // Its load is in flight for good: its claim and its slot go with it.
+                        std::mem::forget(reading);
+                        return Err(PinError::Pump(stalled));
+                    }
+                },
+                ReadStep::Pending => unreachable!("a pumped load has ended by the time it is looked at"),
+                // A page being given back, or loading in a pump that stalled: the reading
+                // bounds how often.
+                ReadStep::Wait { .. } | ReadStep::Spin { .. } => {
+                    if !spin.spin() {
+                        spin = blaze_spin::SpinWait::new();
+                    }
+                }
+            }
+        }
+    }
+
+    /// At least `bytes` of the pool's pages given back, if the sweep finds them: the pool's
+    /// `evict(bytes) -> freed`.
+    #[cfg(not(blaze_check))]
+    pub(crate) fn evict(&mut self, bytes: u64) -> Option<Swept> {
+        let open = self.open.as_mut().ok()?;
+        Some(open.sweep.evict(&open.pool, &open.windows, bytes))
+    }
+
+    /// The committed length the pool holds of pack `pack` of tier `tier`: a test's look.
     #[cfg(all(test, not(blaze_check)))]
     pub(crate) fn pack_open(&self, tier: usize, pack: usize) -> Option<u64> {
         let open = self.open.as_ref().ok()?;

@@ -46,6 +46,10 @@ mod disk;
 mod driven;
 mod flags;
 mod handle;
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "lane 4b of docs/v2/plan/design/store-pool.md: the pinned read and the sweep are the readers' to call once they are on the pool (the read port's step 3)")
+)]
 mod hot;
 mod index;
 #[cfg(all(test, blaze_check))]
@@ -59,6 +63,7 @@ mod peers;
     allow(dead_code, reason = "lane 4b of docs/v2/plan/design/store-pool.md: the store opens its packs in the pool (`hot`); its reads move onto it next")
 )]
 mod pool;
+mod pump;
 mod read;
 pub mod remote;
 mod segment;
@@ -93,6 +98,7 @@ pub use crate::driven::Driven;
 use crate::flags::{FLAGS, Flag, Row};
 pub use crate::handle::Handle;
 pub use crate::peers::SharedConfig;
+pub use crate::pump::{Inline, Pump, PumpError};
 pub use crate::read::Pinned;
 use crate::read::{
     ExternalView, Index, Look, PackView, Place, Seg, Shared, Spot, TierView, View, carry_flags,
