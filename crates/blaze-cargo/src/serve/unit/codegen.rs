@@ -1602,6 +1602,9 @@ pub(crate) type Read = (String, ContentId);
 /// ([`Full::NoThunk`]), what the build says of it.
 pub(crate) struct LinkMade {
     pub(crate) bytes: Vec<u8>,
+    /// The root of the linker's digest of `bytes` ([`Image::digest`]): what the store keys
+    /// the file by (`compile::linked_key`), kept by the blocks each link wrote.
+    pub(crate) root: [u8; 32],
     pub(crate) read: Vec<Read>,
     pub(crate) table: Option<blaze_codegen::ExecTable>,
     pub(crate) how: Linking,
@@ -1890,10 +1893,19 @@ fn link_at(
         Err(_) => Ok(()),
     };
     drop(tables);
+    // The file's identity as the last commit left it: the blocks this link wrote, hashed.
+    let root = match &made {
+        Ok(_) => linked
+            .image
+            .digest()
+            .map_err(|error| LinkCause::Linker { step: LinkStep::Bytes, error }),
+        Err(_) => Ok([0; 32]),
+    };
     images.push(KeptImage { path: path.to_owned(), kept: linked });
     let (bytes, read, table, laid, told) = made?;
     mapped?;
     perf_mapped?;
+    let root = root?;
     let how = match (&whole, relaid && changed.is_some_and(OutputFields::is_empty)) {
         (Some((reason, _)), _) => Linking::Full(*reason),
         (None, true) => Linking::Full(Full::Layout),
@@ -1903,7 +1915,7 @@ fn link_at(
         super::run::inproc::Told::Restart { why } => Some(why),
         super::run::inproc::Told::Nothing | super::run::inproc::Told::Patched { .. } => None,
     };
-    Ok(LinkMade { bytes, read, table, how, restart, whole: whole.map(|it| it.1) })
+    Ok(LinkMade { bytes, root, read, table, how, restart, whole: whole.map(|it| it.1) })
 }
 
 /// The image to link `output` laid out by profile `layout` into at `path`, taken out of

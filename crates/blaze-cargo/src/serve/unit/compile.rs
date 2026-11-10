@@ -133,6 +133,18 @@ const OUTPUT: &str = "blaze v2 cargo output 1";
 pub(crate) fn output_key(bytes: &[u8]) -> Key {
     Key(ContentId::of(OUTPUT, bytes))
 }
+
+const LINKED_OUTPUT: &str = "blaze v2 cargo linked output 1";
+
+/// The store's key of a linked image's file by `root`, the root of the linker's digest of it
+/// ([`blaze_link::Image::digest`]): what [`output_key`] is for a file blaze's linker made,
+/// with no pass over the file. A sound content identity: the root is a collision-resistant
+/// hash that binds the file's length and every one of its blocks
+/// (`blaze_link::digest`), so two files with one root are one file, and one file has one
+/// root. Its domain is its own, so no key of a file hashed whole is one of these.
+pub(crate) fn linked_key(root: &[u8; 32]) -> Key {
+    Key(ContentId::of(LINKED_OUTPUT, root))
+}
 /// A span table's anchor and content, as a test's selection holds it.
 const SPANS: &str = "blaze v2 cargo test spans 1";
 /// A test binary's context with the native inputs its link read, in link order.
@@ -1439,6 +1451,9 @@ struct Making {
 pub(crate) enum Written {
     /// These bytes, which the store is given.
     Bytes(Vec<u8>),
+    /// A linked image's bytes, which the store is given under the key of the linker's digest
+    /// of them ([`linked_key`]): the file is not hashed again.
+    Linked(Vec<u8>, [u8; 32]),
     /// The bytes the store keeps under this key, as the path's last build of the same inputs
     /// left them: an image nothing it is made from changed since ([`Linking::Unchanged`]).
     Kept(Key),
@@ -2113,8 +2128,11 @@ fn store(
         // of one (`target/debug/foo` of `deps/foo-0123`) is the same key.
         let mut keyed: Vec<(String, Key, bool)> = Vec::with_capacity(files.len());
         let mut output_keys: Vec<Key> = Vec::with_capacity(plan.outputs.len());
-        let mut put_output = |puts: &mut Vec<Put>, bytes: Vec<u8>| {
-            let key = output_key(&bytes);
+        let mut put_output = |puts: &mut Vec<Put>, bytes: Vec<u8>, root: Option<[u8; 32]>| {
+            let key = match root {
+                Some(root) => linked_key(&root),
+                None => output_key(&bytes),
+            };
             if !output_keys.contains(&key) {
                 output_keys.push(key);
                 puts.push(Put { key, kind: Kind::Output, bytes });
@@ -2124,7 +2142,8 @@ fn store(
         let main_file = files.first().map(|it| it.0.clone());
         for (path, written, executable) in files {
             let key = match written {
-                Written::Bytes(bytes) => put_output(&mut puts, bytes),
+                Written::Bytes(bytes) => put_output(&mut puts, bytes, None),
+                Written::Linked(bytes, root) => put_output(&mut puts, bytes, Some(root)),
                 // In the store already, under the record that names it.
                 Written::Kept(key) => key,
             };
@@ -2155,7 +2174,7 @@ fn store(
                 Some((_, key, executable)) => (*key, *executable),
                 None if path.ends_with(".d") => {
                     let text = dep_info(path, plan, main_file.as_deref(), &sources, mounted);
-                    (put_output(&mut puts, text.into_bytes()), false)
+                    (put_output(&mut puts, text.into_bytes(), None), false)
                 }
                 // Debug info beside an image (`.dSYM`, `.pdb`, `.dwp`): blaze's images carry
                 // their line tables, and write none beside them.
@@ -2293,7 +2312,9 @@ impl Module<'_> {
         let (path, bytes) = match self {
             Module::Linked(files) => match files.iter().find(|(path, _, _)| wasm(path)) {
                 // alloc: once per proc macro linked for wasm, the module's bytes for its load
-                Some((path, Written::Bytes(bytes), _)) => (path.as_str(), bytes.clone()),
+                Some((path, Written::Bytes(bytes) | Written::Linked(bytes, _), _)) => {
+                    (path.as_str(), bytes.clone())
+                }
                 // Only a doctest's images are kept as they were; a proc macro's is linked.
                 Some((_, Written::Kept(_), _)) | None => return Err(ModuleError::NotLinked),
             },
@@ -2885,7 +2906,11 @@ fn assemble(
                         }
                         // alloc: once per image linked, a unit links one or two
                         links.push((path.to_owned(), linked.how));
-                        files.push((path.to_owned(), Written::Bytes(linked.bytes), true));
+                        files.push((
+                            path.to_owned(),
+                            Written::Linked(linked.bytes, linked.root),
+                            true,
+                        ));
                     }
                     Err(failed) => {
                         // alloc: error path

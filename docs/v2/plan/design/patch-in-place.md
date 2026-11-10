@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: What a link after a one-function edit costs that grows with the program, where, and the design that makes it cost the edit. Built - a link taken as a patch (the ranges written and a Merkle digest of the file kept by the blocks written), an unsynced edit-path commit with a digest check after a crash, a named link from scratch when a kept image has no room, and the spans. Not built - span tables kept per owner, a store that takes a patch, the dev run's whole-file copy.
+summary: What a link after a one-function edit costs that grows with the program, where, and the design that makes it cost the edit. Built - a link taken as a patch (the ranges written and a Merkle digest of the file kept by the blocks written), an unsynced edit-path commit with a digest check after a crash, a named link from scratch when a kept image has no room, and the spans. A linked image's store key is the digest's root, so no step hashes the file. Not built - span tables kept per owner, a store that takes a patch, the dev run's whole-file copy, one link for two paths.
 date: 2026-11-10
 ---
 # Patch in place
@@ -84,6 +84,17 @@ than among 20.
 The daemon still makes the whole file from that (`link copy` span) because the store takes
 whole files. So the linker's part is O(edit) and the handoff is not.
 
+## The store's key of a linked image
+
+A linked image is filed under `compile::linked_key(root)`, the root of the linker's digest,
+in a domain of its own: `unit outputs hash` no longer passes over it (131 ms measured), nor
+does a dev run's commit (`run/inproc.rs` `file_key`; two hashes of the file per link before).
+It is a sound content identity for the reason in 6: the root binds the length and every
+block. For a dev run the invariant is that only `Image::commit_into` and
+`Image::roll_back_into` write the image part of its code memory, so the memory's bytes are
+the file the digest names. The first link hashes the file's data once (not its room); an
+edit hashes the blocks it wrote.
+
 ## Not built, and why
 
 - **Span tables kept per owner** (the 668 ms). The table of an anchor is a function of the
@@ -100,8 +111,12 @@ whole files. So the linker's part is O(edit) and the handoff is not.
   `placed/<base>`, writes the ranges, and seals by the Merkle root (verified by
   `Digest::of` when it must be). `compile.rs` then carries `Written::Patched`. It is durable,
   crash-recovering store code and needs its own DST; `blaze-cas` and `job.rs` are other lanes.
-- **The dev run's copy**: `Loaded::patch` copies the memory and hashes it for
-  `host::Image::key`. It follows the store's key.
+- **The dev run's copy**: `Loaded::patch` still copies the memory out for the store's put
+  (the hash is gone). It goes with the store's patch op.
+- **Two links per program**: `out/hello` and `debug/hello` are each a kept image and a
+  link (`compile.rs`, one `codegen::link` per path of `artifact::made`), so `dev run commit`
+  runs twice. One image placed at two paths needs the unit's file list and `job.rs`.
+- **Rows, `given_id` and the maps from `built.delta`**: the interface is not in the tree yet.
 - **Function rows, `given_id`, the two maps**: linear with small constants; named by spans
   (`link function rows`, `link delta`, `link tables`).
 
