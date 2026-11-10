@@ -2486,6 +2486,20 @@ impl App {
         )
     }
 
+    /// Draw the sidebar's ground opaque: for a host with nothing blurred behind it (an offscreen shot, iOS). The theme's
+    /// `tone_sidebar` is a tint over the window's vibrancy (src/window.rs: the effect view under the Metal view); with
+    /// no vibrancy under it the tint would show whatever the host lays there instead, so the fold's clip (hn.SideClip,
+    /// whose Fill is the sidebar's ground) takes the same colour at alpha 1. The macOS window never calls this.
+    pub fn opaque_sidebar(&mut self) {
+        let w = self.world.world_ref();
+        let mut fill = crate::look::tone(w, "sidebar");
+        fill.dark.a = 1.0;
+        fill.light.a = 1.0;
+        if let Some(clip) = w.entity_from_id(self.ids.device).parent().and_then(|side| side.parent()) {
+            clip.set(fill);
+        }
+    }
+
     /// Start with the sidebar folded away (`HARNESS_NATIVE_SIDEBAR=0`, for captures).
     pub fn fold_sidebar_now(&mut self) {
         self.side_open = false;

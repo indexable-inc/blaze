@@ -10,7 +10,9 @@
 //    small status glyph's breath in a chat while something runs (it also keeps that time ticking).
 // The one exception to 1 and 2, asked for by name: the block on a running step's line (ui.Block): pixel art in its
 //    own colours, a game's item icon, that turns to a new face when the step changes and is still between turns.
-// 3. A plate only where something floats or is typed into: one hairline, no shadow, no glass, corners of 8.
+// 3. A plate only where something floats or is typed into: one hairline, no shadow, no glass, corners of 8. The one
+//    translucent surface, asked for by name: the sidebar (tone_sidebar), a tint over the system's blur of what is behind
+//    the window. Everything else is opaque.
 // 4. Type is the hierarchy: size, weight and ink before any box, rule or icon.
 //
 // ---- The theme: the one place a colour is chosen ----
@@ -23,8 +25,11 @@
 //
 // Grounds, darkest to most lifted:
 // - ground: the window and the main card under every pane (#0A0B0D / #f2f1ee).
-// - sidebar: the sidebar. The same ground as the main card, divided from it by one `line` hairline (hn.Seam), as Linear
-//   and Notion do: one dark field, never a lighter slab beside it.
+// - sidebar: the sidebar. The main card's ground as a tint (its alpha is the one place the sidebar's translucency is
+//   chosen) over the window's vibrancy, the system's blur of what is behind the window (src/window.rs: the
+//   NSVisualEffectView under the Metal view), as Finder's and Maps' sidebars are; one `line` hairline (hn.Seam) divides
+//   it from the main card. Keep its colour the ground's: with nothing behind the window (an offscreen shot, iOS) the
+//   host draws it at alpha 1 (src/app.rs opaque_sidebar), which is then the ground itself.
 // - card: a plate that sits on the ground: the composer, the palette's and the picker's cards, a generated Card (#111216).
 // - raised: what floats over everything, solid (never glass): menus, popovers, hover cards, a user's bubble (dark #16181C; light --bg-3, so a
 //   popover lifts toward the light on the paper ground).
@@ -32,7 +37,7 @@
 // - term_ground: the terminal's own ground, under a terminal pane's grid only; the one role the user's Ghostty theme sets
 //   (src/app/ghostty.rs), since a terminal's colours are chosen against it. The built-in theme's is the dark ground in both.
 export mut tone_ground: Fill = {dark: {0.039, 0.043, 0.051, 1}, light: {0.949, 0.945, 0.933, 1}}
-export mut tone_sidebar: Fill = $tone_ground
+export mut tone_sidebar: Fill = {dark: {0.039, 0.043, 0.051, 0.72}, light: {0.949, 0.945, 0.933, 0.66}}
 export mut tone_card: Fill = {dark: {0.067, 0.071, 0.086, 1}, light: {0.965, 0.961, 0.949, 1}}
 export mut tone_raised: Fill = {dark: {0.086, 0.094, 0.11, 1}, light: {0.965, 0.961, 0.949, 1}}
 export mut tone_well: Fill = {dark: {0.027, 0.031, 0.035, 1}, light: {0.922, 0.918, 0.898, 1}}

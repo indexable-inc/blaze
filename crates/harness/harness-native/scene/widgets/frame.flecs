@@ -48,14 +48,15 @@ hn {
   }
 
   // The hairline between the sidebar and the main card: the only seam (no shadow; tone_sidebar is the main card's own
-  // ground, so this line is all that divides them). It is the sidebar's right edge, inside hn.SideClip, so it folds away
+  // ground as a tint over the window's blur). It is the sidebar's right edge, inside hn.SideClip, so it folds away
   // with the sidebar (and the browser pane's, inside hn.WebClip).
   prefab Seam : ui.Node {
     Fill: $tone_line
     Size: {w: {kind: Fixed, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
   }
 
-  // The sidebar's fold (cmd+S), in the theme's sidebar ground: a clip as wide as the fold's spring leaves the sidebar
+  // The sidebar's fold (cmd+S), in the theme's sidebar ground (tone_sidebar: translucent, the one surface the window's
+  // vibrancy shows through; its Fill is the whole sidebar's, from the traffic lights to its foot): a clip as wide as the fold's spring leaves the sidebar
   // and its seam, over the two laid out at their full width and slid left by the part folded away (src/app.rs
   // lay_chrome), so its rows never lay out at an in-between width. The host makes its children in order: the sidebar,
   // then its hn.Seam. Folded, the clip is 0 wide and cuts both away, so nothing of the sidebar paints and the main card,

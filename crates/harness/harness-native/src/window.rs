@@ -1502,7 +1502,9 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
             mini: None,
         })
     });
-    // The sidebar's material behind the whole window (Finder's, Zed's): the main card covers it with an opaque plate.
+    // The sidebar's material behind the whole window (Finder's, Zed's): the main card covers it with an opaque plate,
+    // and the sidebar's ground (`tone_sidebar`, scene/00-tokens.flecs) is a tint over it, so what is behind the window
+    // shows blurred through the sidebar only. It follows the window's appearance, as the scene's fills do (`is_dark`).
     let effect = NSVisualEffectView::initWithFrame(NSVisualEffectView::alloc(mtm), rect);
     // HARNESS_NATIVE_MATERIAL=sidebar|under|hud: the vibrancy material under the sidebar's tint plate.
     effect.setMaterial(match std::env::var("HARNESS_NATIVE_MATERIAL").as_deref() {
