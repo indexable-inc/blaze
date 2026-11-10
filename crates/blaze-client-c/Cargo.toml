@@ -1,0 +1,25 @@
+[package]
+name = "blaze-client-c"
+description = "blaze-client's C ABI: connect to blaze's daemon, send requests of the agent API in JSON or CBOR, take each response in a callback (docs/client.md, include/blaze_client.h)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+name = "blaze_client_c"
+crate-type = ["cdylib", "staticlib"]
+doctest = false
+test = false
+
+[dependencies]
+blaze-api.workspace = true
+blaze-client.workspace = true
+blaze-protocol.workspace = true
+
+[lints]
+workspace = true

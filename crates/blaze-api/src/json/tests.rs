@@ -72,3 +72,28 @@ fn escapes_are_the_bytes_serde_json_wrote() {
         assert_eq!(response(&envelope), serde_json::to_string(&envelope).unwrap());
     }
 }
+
+/// What [`request`] writes of a request's body, [`request_of`] reads back; text that is not a
+/// request is refused, naming why.
+#[test]
+fn a_request_is_read_back_from_its_json() {
+    let asked = [
+        Request::Status,
+        Request::Cancel { id: 3 },
+        Request::Rebuilt {
+            all: true,
+            cwd: Some("/w".to_owned()),
+            item: None,
+            build: None,
+            unexplained: false,
+        },
+    ];
+    for body in asked {
+        let line = request(&Envelope::new(1, body.clone()));
+        let value: Value = serde_json::from_str(&line).unwrap();
+        let text = serde_json::to_vec(&value["body"]).unwrap();
+        assert_eq!(request_of(&text), Ok(body), "{line}");
+    }
+    let refused = request_of(br#"{"Nothing":{}}"#).unwrap_err();
+    assert!(refused.what.starts_with("a request that is not the API's JSON"), "{refused:?}");
+}

@@ -340,6 +340,11 @@ blaze-ui = { path = "crates/blaze-ui" }
 blaze-alloc-count = { path = "crates/blaze-alloc-count" }
 blaze-bytes = { path = "crates/blaze-bytes" }
 blaze-api = { path = "crates/blaze-api" }
+# The daemon's clients with no process launch (docs/client.md): the library, its C ABI and its
+# Node-API addon.
+blaze-client = { path = "crates/blaze-client" }
+blaze-client-c = { path = "crates/blaze-client-c" }
+blaze-napi = { path = "crates/blaze-napi" }
 blaze-cas = { path = "crates/blaze-cas" }
 blaze-kernel = { path = "crates/blaze-kernel" }
 blaze-gc = { path = "crates/blaze-gc" }
