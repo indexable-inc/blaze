@@ -180,6 +180,9 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::string_key",
             "blaze::nll_workaround",
             "blaze::lenient_deserialize",
+            "blaze::durable_write",
+            "blaze::unbounded_wait",
+            "blaze::combined_identity",
         ],
     ),
     // The cross-configuration reachability lints (docs/v2/plan/design/multiconfig-check.md), also in

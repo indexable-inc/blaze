@@ -25,12 +25,14 @@ mod checkfree;
 mod clone;
 mod cold_error;
 mod collect_then_consume;
+mod combined_identity;
 #[cfg(test)]
 mod correctness_general_tests;
 mod deep_drop_at_exit;
 mod dispatch;
 mod dos_hasher_on_input;
 mod dropped_error;
+mod durable_write;
 mod dyn_fn_param;
 mod dyn_in_hot_field;
 mod effects;
@@ -106,6 +108,7 @@ mod thread_local_in_waiting_fn;
 #[cfg(test)]
 mod thread_local_tests;
 mod unbounded_from_input;
+mod unbounded_wait;
 mod unbuffered_io;
 mod unnamed_wait;
 mod unrecorded_span;
@@ -230,6 +233,9 @@ pub enum Lint {
     ThreadLocalInWaitingFn,
     LenientDeserialize,
     LockHeldAcrossSlow,
+    DurableWrite,
+    UnboundedWait,
+    CombinedIdentity,
 }
 
 /// Which workspaces a lint is for.
@@ -392,6 +398,9 @@ impl Lint {
         Lint::ThreadLocalInWaitingFn,
         Lint::LenientDeserialize,
         Lint::LockHeldAcrossSlow,
+        Lint::DurableWrite,
+        Lint::UnboundedWait,
+        Lint::CombinedIdentity,
     ];
 
     /// Which workspaces the lint is for ([`Kind`]); written out per lint, so a new one chooses.
@@ -495,7 +504,12 @@ impl Lint {
             | Lint::NllWorkaround
             // AGENTS.md rule 3 (no fallback) for input: what a workspace reads must say what it
             // holds. Another crate may read a format that grows on purpose, so it opts in.
-            | Lint::LenientDeserialize => Kind::Internal,
+            | Lint::LenientDeserialize
+            // Rule guard-the-cause's lints: a sync says what must survive, a wait with no
+            // deadline names its waker, and hashes become an identity only in `blaze_ids::keyed`.
+            | Lint::DurableWrite
+            | Lint::UnboundedWait
+            | Lint::CombinedIdentity => Kind::Internal,
         }
     }
 
@@ -591,6 +605,9 @@ impl Lint {
             Lint::ThreadLocalInWaitingFn => "thread_local_in_waiting_fn",
             Lint::LenientDeserialize => "lenient_deserialize",
             Lint::LockHeldAcrossSlow => "lock_held_across_slow",
+            Lint::DurableWrite => "durable_write",
+            Lint::UnboundedWait => "unbounded_wait",
+            Lint::CombinedIdentity => "combined_identity",
         }
     }
 
@@ -683,6 +700,9 @@ impl Lint {
             Lint::ThreadLocalInWaitingFn => concat!(docs!(), "#thread_local_in_waiting_fn"),
             Lint::LenientDeserialize => concat!(docs!(), "#lenient_deserialize"),
             Lint::LockHeldAcrossSlow => concat!(docs!(), "#lock_held_across_slow"),
+            Lint::DurableWrite => concat!(docs!(), "#durable_write"),
+            Lint::UnboundedWait => concat!(docs!(), "#unbounded_wait"),
+            Lint::CombinedIdentity => concat!(docs!(), "#combined_identity"),
             Lint::FiberBoundary => {
                 "https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan.md"
             }
@@ -735,6 +755,15 @@ impl Lint {
             }
             Lint::LockHeldAcrossSlow => {
                 "copy out what the call needs and drop the guard before it, then take the lock again to write the result; or move the state to an atomic, `papaya::HashMap` or one owner thread"
+            }
+            Lint::DurableWrite => {
+                "take `Effect::WriteUnsynced` or `Effect::RenameUnsynced` where a build can make the data again and its reader checks it, or say what must survive a crash with `// durable: <why>` on its line or the line above"
+            }
+            Lint::UnboundedWait => {
+                "wait to a `Deadline` through `blaze_core::wait` and end in a typed error when it passes, or name what always wakes this wait, and why it cannot end first, with `// wakes: <who>` on its line or the line above"
+            }
+            Lint::CombinedIdentity => {
+                "keep the set in a `blaze_ids::keyed::Keyed` and take its root, or hash every entry with `blaze_ids::Hasher`; an XOR or a sum that makes no identity says so with `// identity: <why>` on its line or the line above"
             }
             Lint::BlockingOnPool => {
                 "wait through the scheduler (`blaze_graph::sched::wait`, an `Event`, a `Wait::Key`), or move the blocking call to a driver thread"
@@ -1046,6 +1075,9 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         key_ignores_field::check(cx);
         wildcard_arm::check(cx);
         seqcst_unexplained::check(cx);
+        durable_write::check(cx);
+        unbounded_wait::check(cx);
+        combined_identity::check(cx);
         large_move::check(cx);
         collect_then_consume::check(cx);
         hash_twice::check(cx);
