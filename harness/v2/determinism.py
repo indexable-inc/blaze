@@ -227,7 +227,7 @@ def main(args: Input) -> None:
     except engine.Failed as e:
         fail(SCRIPT, str(e))
     rep = report.Report(SCRIPT, args.engine, args.out)
-    work = Path(args.work or tempfile.mkdtemp(prefix="bz-determinism-", dir="/tmp")).resolve()
+    work = engine.work_dir(args.work, "bz-determinism-")
     work.mkdir(parents=True, exist_ok=True)
     print(f"work: {work}; cores {len(cores_a)} and {len(cores_b)}", flush=True)
     subjects: list[tuple[str, Callable[[Path], Subject]]] = [

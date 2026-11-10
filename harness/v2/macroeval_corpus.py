@@ -343,7 +343,7 @@ def main(args: Input) -> None:
         eng = engine.Engine.of(args.engine)
     except engine.Failed as e:
         fail(SCRIPT, str(e))
-    work = Path(args.work or tempfile.mkdtemp(prefix="bz-macroeval-", dir="/tmp")).resolve()
+    work = engine.work_dir(args.work, "bz-macroeval-")
     work.mkdir(parents=True, exist_ok=True)
     target = Path(args.target).resolve() if args.target else work / "target"
     cargo_home, home = work / "cargo-home", work / "h"

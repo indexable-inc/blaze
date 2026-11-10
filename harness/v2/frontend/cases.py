@@ -877,7 +877,7 @@ def main(args: Input) -> None:
     cases, wrong = discover(root, args.areas, args.filter)
     if not cases and not wrong:
         fail(SCRIPT, f"no case under {root} for areas {list(args.areas)} and filter {args.filter!r}")
-    work = Path(args.work or tempfile.mkdtemp(prefix="bz-cases-", dir="/tmp")).resolve()
+    work = engine.work_dir(args.work, "bz-cases-")
     work.mkdir(parents=True, exist_ok=True)
     print(f"work: {work}", flush=True)
     rep = report.Report(SCRIPT, args.engine, args.out)

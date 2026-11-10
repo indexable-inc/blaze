@@ -576,7 +576,7 @@ def main(args: Input) -> None:
         engines = engines_of(args)
     except engine.Failed as e:
         fail(SCRIPT, str(e))
-    work = Path(args.work or tempfile.mkdtemp(prefix="bz-corpus-", dir="/tmp")).resolve()
+    work = engine.work_dir(args.work, "bz-corpus-")
     work.mkdir(parents=True, exist_ok=True)
     try:
         programs = programs_of(args, corpus, work / "crates.io")

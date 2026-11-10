@@ -464,6 +464,15 @@ its daemon starts (`engine.seed_store`), and a home emptied of all but its store
 says where a build's outputs are (the `CARGO_TARGET_DIR` the script named, else the one
 directory the daemon made for the workspace under `<home>/build`).
 
+A script's work directory (`work`, or one it picks) is `engine.work_dir`'s (`storelib.work_dir`;
+`storelib.scratch` for the older harnesses): blaze places an output of 16 KiB or more as a clone
+of the store's file (`FICLONE`, `clonefile`) and fails a build where the file system cannot
+([cargo.md](cargo.md#where-a-build-writes)), so the directory is probed with one clone before
+anything is built. With none named it is a new directory under `/tmp`, or where `/tmp` cannot
+clone (tmpfs) under `blaze-harness` in the user's cache directory, removed at exit when left
+empty; a named one that cannot clone, or no base that can, stops the script naming the
+directory and the requirement.
+
 `Engine.of` ends with a preflight against the binary (`engine.V2.preflight`): `blaze --version`
 names a version, `blaze --help` lists every command the scripts run in the form they run it,
 and `blaze status --json`, asked with a new home, names the home, state directory and socket

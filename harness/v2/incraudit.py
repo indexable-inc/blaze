@@ -74,7 +74,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from array import array
 from collections import Counter
@@ -1066,7 +1065,7 @@ def main() -> None:
     except engine.Failed as e:
         rep.add(f"{PROPERTY}/setup", "error", str(e))
         rep.finish()
-    work = Path(args.work) if args.work else Path(tempfile.mkdtemp(prefix="incraudit-"))
+    work = engine.work_dir(args.work, "incraudit-")
     work.mkdir(parents=True, exist_ok=True)
     try:
         asyncio.run(audit(args, rep, eng, work))

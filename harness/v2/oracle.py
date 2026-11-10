@@ -600,9 +600,7 @@ def settings(spec: engine.EngineSpec, profiles: tuple[Profile, ...], tests: bool
 
 def work_root(given: str) -> Path:
     # A daemon's socket is under its home, and a socket's path has to be short.
-    root = Path(given) if given else Path(tempfile.mkdtemp(prefix="bz-oracle-", dir="/tmp"))
-    root.mkdir(parents=True, exist_ok=True)
-    return root.resolve()
+    return engine.work_dir(given, "bz-oracle-")
 
 
 def record(out: report.Report, ran: Ran, gaps: dict[str, tuple[report.Verdict, str]],

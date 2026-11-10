@@ -36,7 +36,6 @@ import asyncio
 import re
 import shutil
 import sys
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -235,7 +234,7 @@ def main(args: Input) -> None:
     tests = [t for t in tests if args.filter in t.path]
     if not tests:
         fail(SCRIPT, f"no test of {table_path} has {args.filter!r} in its path")
-    work = Path(args.work or tempfile.mkdtemp(prefix="bz-borrowck-flow-", dir="/tmp")).resolve()
+    work = engine.work_dir(args.work, "bz-borrowck-flow-")
     work.mkdir(parents=True, exist_ok=True)
     print(f"work: {work}", flush=True)
     rep = report.Report(SCRIPT, args.engine, args.out)

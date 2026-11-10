@@ -48,7 +48,6 @@ import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
@@ -498,7 +497,7 @@ def main(args: Input) -> None:
     except engine.Failed as e:
         fail(SCRIPT, str(e))
     rep = report.Report(SCRIPT, args.engine, args.out)
-    work = Path(args.work or tempfile.mkdtemp(prefix="bz-tight-", dir="/tmp")).resolve()
+    work = engine.work_dir(args.work, "bz-tight-")
     work.mkdir(parents=True, exist_ok=True)
     print(f"work: {work}", flush=True)
     for name in dict.fromkeys(args.projects):

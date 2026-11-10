@@ -287,7 +287,7 @@ def main(args: Input) -> None:
     if eng.kind != "v2":
         fail(SCRIPT, "engine.kind: v2; v1 has no build directory under its home and no store it places from")
     rep = report.Report(SCRIPT, args.engine, args.out)
-    work = Path(args.work or tempfile.mkdtemp(prefix="bz-clone-out-", dir="/tmp")).resolve()
+    work = engine.work_dir(args.work, "bz-clone-out-")
     work.mkdir(parents=True, exist_ok=True)
     print(f"work: {work}", flush=True)
     rep.guarded(CHECK, lambda: asyncio.run(check(eng, rep, args, work)))

@@ -12,10 +12,13 @@ The input is one JSON object (inline, a file's path, or `-`):
     command         `run` (the budgets, the default) or `smoke` (below)
     engine          the blaze measured (engine.EngineSpec)
     out             the result's path (report.py's JSON); `run` needs one
-    work            where checkouts and each one's daemon home go; a new directory under /tmp
-                    when empty (a daemon's socket is in its home, and its path has to be
-                    short). Everything a daemon keeps is under its home (engine.layout): there
-                    is no store directory to name
+    work            where checkouts and each one's daemon home go. Empty: a new directory under
+                    /tmp, or where /tmp cannot clone files (tmpfs) under `blaze-harness` in the
+                    user's cache directory, removed at the end when nothing is kept. Either way
+                    it is probed before any build, and one on a file system blaze cannot place
+                    outputs on (no FICLONE or clonefile: tmpfs, ext4) stops the run naming it
+                    (engine.work_dir). Everything a daemon keeps is under its home
+                    (engine.layout): there is no store directory to name
     projects        whose rows run, of nushell, ripgrep, ruff and blaze (this checkout); empty
                     for every project the budgets asked for have a row for
     budgets         which budgets run (the names below); empty for every budget the projects
@@ -125,7 +128,10 @@ builds it cold in a new home, and measures one no-op build and one body edit thr
 the budgets run (`Lane.noop`, `Lane.timed_edit`, with the edited program checked against a build
 from nothing in a home of its own), once each and against no budget. It exits 0 only when both
 gave a number and the daemon's lock and store are where engine.layout says; it needs no cargo
-and no network but blaze's own toolchain, and takes about a minute.
+and no network but blaze's own toolchain. It took 64 s with the release of 2026-11-05 on 32
+cores, and says where (`steps_s` in the result, a line per `blaze` command): it builds the
+fixture cold twice, once in the lane's home and once from nothing for the check of the edited
+program.
 
 `selftest` checks the parts that need neither blaze nor cargo nor the network: edit generation,
 budget evaluation, /proc/stat, which rows an input selects, the daemon home's layout against the
@@ -1563,7 +1569,12 @@ def smoke(eng: engine.Engine, args: Input, rep: report.Report, work: Path) -> No
         got = [o.numbers.get("measured") for o in rep.outcomes if o.name == row.name and o.verdict == "pass"]
         if not (len(got) == 1 and isinstance(got[0], (int, float)) and math.isfinite(got[0])):
             rep.add(f"{row.name}: a measured number", "error", f"the smoke measured no number for it: {got}")
-    rep.extra.update(seconds=round(time.monotonic() - began, 1))
+    # Where the time went: each `blaze` command the smoke ran, with its seconds (the rest is
+    # daemon stops, the readiness wait and the copies).
+    steps: list[tuple[str, float]] = getattr(eng, "took", [])
+    rep.extra.update(seconds=round(time.monotonic() - began, 1), steps_s={step: round(s, 2) for step, s in steps})
+    for step, s in steps:
+        print(f"smoke: {s:7.2f} s  {step}", flush=True)
     print(f"smoke: {time.monotonic() - began:.1f} s", flush=True)
 
 
@@ -1588,8 +1599,10 @@ def main(args: Input) -> None:
         fail(SCRIPT, str(e))
     rep = report.Report(SCRIPT, args.engine, args.out)
     prefix = "bz-smoke-" if args.command == "smoke" else "bz-budgets-"
-    work = Path(args.work or tempfile.mkdtemp(prefix=prefix, dir="/tmp")).resolve()
-    work.mkdir(parents=True, exist_ok=True)
+    try:
+        work = engine.work_dir(args.work, prefix)
+    except engine.Failed as e:
+        fail(SCRIPT, str(e))
     print(f"work: {work}", flush=True)
     if args.command == "smoke":
         smoke(eng, args, rep, work)
@@ -1785,6 +1798,30 @@ def selftest_smoke() -> None:
     expect(verdict(got.value, math.inf, True) == "pass" and got.interval is None, "one sample is a number, and passes no budget")
 
 
+def selftest_work() -> None:
+    """The work directory: probed for what blaze needs of its file system, chosen where the
+    probe passes, refused by name where it does not."""
+    bases = storelib.work_bases()
+    expect(bases[0] == "/tmp" and bases[1].endswith("blaze-harness"), f"/tmp, then the cache directory: {bases}")
+    with tempfile.TemporaryDirectory() as tmp:
+        why = storelib.cannot_clone(tmp)
+        expect(os.listdir(tmp) == [], "the probe leaves nothing behind")
+        named = Path(tmp) / "given"
+        if why is None:
+            expect(engine.work_dir(str(named), "x-") == named.resolve() and named.is_dir(), "a directory that clones is taken")
+        else:
+            said = refused("a work directory that cannot clone", lambda: engine.work_dir(str(named), "x-"), engine.Failed)
+            expect(str(named.resolve()) in said and "FICLONE" in said and why in said, said)
+    clones = [base for base in bases if os.path.isdir(base) and storelib.cannot_clone(base) is None]
+    if clones:
+        made = engine.work_dir("", "bz-selftest-")
+        expect(made.is_dir() and str(made.parent) == os.path.realpath(clones[0]), f"a new one in {clones[0]}: {made}")
+        made.rmdir()
+    else:
+        said = refused("no base that clones", lambda: engine.work_dir("", "bz-selftest-"), engine.Failed)
+        expect(all(base in said for base in bases) and "give `work`" in said, said)
+
+
 def selftest_ledger() -> None:
     """Every check of the objectives ledger (docs/v2/plan/objectives.json) that runs this script
     gives it an input it takes and rows it has: a row naming a budget that is gone, or a pair
@@ -1869,6 +1906,7 @@ def selftest() -> None:
     selftest_layout()
     selftest_smoke()
     selftest_ledger()
+    selftest_work()
     expect(verdict(30, 30, True) == "pass" and verdict(30.01, 30, True) == "fail", "at most")
     expect(verdict(0.8, 0.8, False) == "pass" and verdict(0.79, 0.8, False) == "fail", "at least")
     expect(describe(12.5, 30, True, "ms") == "12.5 ms against a budget of at most 30 ms", describe(12.5, 30, True, "ms"))

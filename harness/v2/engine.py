@@ -251,6 +251,16 @@ def seed_store(source: Path | None, home: Path) -> None:
     shutil.copytree(source, store, symlinks=True)
 
 
+def work_dir(given: str, prefix: str) -> Path:
+    """Where a v2 script keeps its checkouts and daemon homes (storelib.work_dir): `given`, or
+    a new directory on a file system blaze can place outputs on; probed either way, and a
+    `Failed` naming the directory and the requirement when blaze would refuse it."""
+    try:
+        return Path(storelib.work_dir(given, prefix))
+    except storelib.Failed as e:
+        raise Failed(str(e)) from None
+
+
 def empty_home(home: Path, keep_store: bool = False) -> None:
     """Everything the daemon of `home` kept removed (its state, its build directories, the
     packages it fetched), and with `keep_store` all but its store: what a build "from an empty
@@ -804,11 +814,15 @@ class V2(Engine):
         # Each build, test and run through `build`, by its daemon's home: its step and its
         # `blaze-work` line, or None where it printed none.
         self.worked: dict[str, list[tuple[str, dict[str, object] | None]]] = {}
+        # Every command through `build`, in order: its step and its seconds, for a script to
+        # say where its time went.
+        self.took: list[tuple[str, float]] = []
 
     def build(self, step: str, ws: Path, env: dict[str, str], args: Sequence[str] = (), command: str = "build",
               timeout: float = 7200) -> Ran:
         args = dev_backend_args(self.spec.dev_backend, command, args)
         ran = self.command(step, command, list(args), ws, env, timeout)
+        self.took.append((step, ran.seconds))
         if command in WORKING:
             label = f"{step} (`{' '.join(['blaze', command, *args])}`)"
             lines = worked_lines(ran.stdout) if "--message-format=json" in args else []

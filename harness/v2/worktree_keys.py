@@ -844,7 +844,7 @@ def main(args: Input) -> None:
         eng = engine.Engine.of(args.engine)
     except engine.Failed as e:
         fail(SCRIPT, str(e))
-    work = Path(args.work or tempfile.mkdtemp(prefix="bz-worktree-keys-", dir="/tmp")).resolve()
+    work = engine.work_dir(args.work, "bz-worktree-keys-")
     work.mkdir(parents=True, exist_ok=True)
     if any(work.iterdir()):
         fail(SCRIPT, f"work: {work} is not empty; the run fills it and removes it after")

@@ -612,7 +612,7 @@ def main(args: Input) -> None:
     except engine.Failed as e:
         fail(SCRIPT, str(e))
     rep = report.Report(SCRIPT, args.engine, args.out)
-    work = Path(args.work or tempfile.mkdtemp(prefix="bz-reachable-", dir="/tmp")).resolve()
+    work = engine.work_dir(args.work, "bz-reachable-")
     work.mkdir(parents=True, exist_ok=True)
     print(f"work: {work}", flush=True)
     cold: list[dict[str, report.Number]] = []

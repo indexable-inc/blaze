@@ -63,7 +63,6 @@ import hashlib
 import json
 import shutil
 import sys
-import tempfile
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -577,7 +576,7 @@ def main(args: Input) -> None:
         rep.add("pure scripts", "unmeasured", "v1 proves no build script pure: every script compiles and runs in the sandbox")
         rep.finish()
     expectations = Expectations((*data.crates, *apps.scripts))
-    work = Path(args.work or tempfile.mkdtemp(prefix="bz-pure-scripts-", dir="/tmp")).resolve()
+    work = engine.work_dir(args.work, "bz-pure-scripts-")
     work.mkdir(parents=True, exist_ok=True)
     print(f"work: {work}", flush=True)
     cache = work / "crates.io"

@@ -289,7 +289,8 @@ jobs:
     needs: build
     if: inputs.harnesses == '' && !startsWith(inputs.os, 'windows')
     runs-on: ${{ inputs.platform == 'linux-arm64' && fromJSON('["ix", "arm64", "ix-cpu-16", "blaze-profile-gate"]') || inputs.os }}
-    timeout-minutes: 30
+    # The gate itself is a few minutes; the budgets smoke after it has 20 of its own.
+    timeout-minutes: 45
     permissions:
       contents: read
     env:
@@ -331,8 +332,10 @@ jobs:
       # build and one body edit measured through the code the budgets run. It holds no number to
       # a budget; it fails when the harness and blaze no longer fit, at the change that parted them.
       # The fixture has a build script, which runs in a sandbox of user namespaces.
+      # 64 s with a release on 32 cores; this runner has 16 and the tree's blaze, whose own code
+      # runs slower (#899). The step prints each command's seconds: tighten the bound from them.
       - name: budgets.py smoke, with the blaze this tree built
-        timeout-minutes: 15
+        timeout-minutes: 20
         run: |
           if [ "$RUNNER_OS" = Linux ] && [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
             sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0

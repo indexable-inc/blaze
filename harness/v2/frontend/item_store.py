@@ -742,7 +742,7 @@ def main(args: Input) -> None:
         eng = engine.Engine.of(args.engine)
     except engine.Failed as e:
         fail(SCRIPT, str(e))
-    work = Path(args.work or tempfile.mkdtemp(prefix="bz-item-store-", dir="/tmp")).resolve()
+    work = engine.work_dir(args.work, "bz-item-store-")
     work.mkdir(parents=True, exist_ok=True)
     rep = report.Report(SCRIPT, args.engine, args.out)
     rep.extra.update(work=str(work), apps=names, seed=args.seed, steps=args.steps, toolchain=engine.TOOLCHAIN)

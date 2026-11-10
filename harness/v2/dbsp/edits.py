@@ -1416,7 +1416,7 @@ def main(args: Input) -> None:
         eng = engine.Engine.of(args.engine)
     except engine.Failed as e:
         fail(SCRIPT, str(e))
-    work = Path(args.work or tempfile.mkdtemp(prefix="bz-dbsp-edits-", dir="/tmp")).resolve()
+    work = engine.work_dir(args.work, "bz-dbsp-edits-")
     work.mkdir(parents=True, exist_ok=True)
     into = Path(args.into).resolve() if args.into else SCRIPTS
     print(f"work: {work}", flush=True)

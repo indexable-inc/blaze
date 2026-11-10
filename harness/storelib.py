@@ -27,6 +27,7 @@ and the `blaze-test-result` lines of a `blaze test --reached --message-format=js
 
 from __future__ import annotations
 
+import atexit
 import concurrent.futures
 import hashlib
 import json
@@ -76,10 +77,109 @@ class Failed(Exception):
     """A step the harness could not do, said whole: an error of the run, not a finding."""
 
 
+# What blaze needs of the file system a daemon's home and build directories are on: an output of
+# 16 KiB or more is placed in the build directory as a clone of the store's file of its bytes
+# (blaze_cas's `CLONE_FROM`; `FICLONE` on Linux, `clonefile` on macOS), and where the file system
+# cannot share blocks the build fails ("the file system of ... cannot share blocks with ...;
+# blaze does not copy instead", crates/blaze-core/src/fs.rs `clone`). tmpfs and ext4 cannot; xfs
+# and btrfs made with reflink, and APFS, can.
+CLONES = "blaze places a build's outputs by cloning the store's files (FICLONE, clonefile), which this file system refuses"
+FICLONE = 0x4004_9409
+
+
+def cannot_clone(directory: str) -> str | None:
+    """None when a file in `directory` (which is there) can be cloned beside itself, as blaze
+    clones a store's file into a build directory; else why not, as the system says it."""
+    handle, source = tempfile.mkstemp(prefix=".clone-probe-", dir=directory)
+    target = f"{source}.clone"
+    try:
+        with os.fdopen(handle, "wb") as made:
+            made.write(b"\0" * (64 << 10))
+        if sys.platform == "darwin":
+            import ctypes
+
+            libc = ctypes.CDLL(None, use_errno=True)
+            if libc.clonefile(os.fsencode(source), os.fsencode(target), 0) != 0:
+                return f"clonefile: {os.strerror(ctypes.get_errno())}"
+            return None
+        if sys.platform != "linux":
+            return f"no probe of cloning on {sys.platform}"
+        import fcntl
+
+        with open(source, "rb") as src, open(target, "wb") as dst:
+            try:
+                fcntl.ioctl(dst.fileno(), FICLONE, src.fileno())
+            except OSError as error:
+                return f"FICLONE: {error.strerror}"
+        return None
+    finally:
+        for path in (source, target):
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+
+
+def work_bases() -> list[str]:
+    """Where a work directory nobody named may go, best first: `/tmp` (short, as the path of a
+    daemon's socket under it has to be: 104 bytes on macOS, 108 on Linux; cargo names a checkout
+    by its real path, and macOS's own temporary directory is a long link), then `blaze-harness`
+    in the user's cache directory, beside blaze's own root, which is on a disk where `/tmp` is
+    memory."""
+    caches = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    return ["/tmp", os.path.join(caches, "blaze-harness")]
+
+
+def _remove_if_empty(path: str) -> None:
+    try:
+        os.rmdir(path)
+    except OSError:
+        pass
+
+
+def work_dir(given: str, prefix: str) -> str:
+    """The directory a script keeps its checkouts and daemon homes in, its real path: `given`,
+    made if it is not there, or with none given a new `<prefix>...` in the first of `work_bases`
+    whose file system can do what blaze needs (`CLONES`). Either way the directory is probed
+    before anything is built: one blaze would refuse to place outputs in is a `Failed` naming it
+    and the requirement here, not each project's cold build failing later. A directory chosen
+    here is removed at exit when the script left it empty (each removes what it made unless
+    told to keep it)."""
+    if given:
+        path = os.path.realpath(given)
+        os.makedirs(path, exist_ok=True)
+        if (why := cannot_clone(path)) is not None:
+            raise Failed(f"work: {path} is on a file system blaze cannot build on ({why}): {CLONES}; "
+                         "name a directory on xfs or btrfs with reflink, or on APFS")
+        return path
+    refused: list[str] = []
+    for base in work_bases():
+        try:
+            os.makedirs(base, exist_ok=True)
+            why = cannot_clone(base)
+        except OSError as error:
+            why = f"{type(error).__name__}: {error}"
+        if why is None:
+            path = os.path.realpath(tempfile.mkdtemp(prefix=prefix, dir=base))
+            atexit.register(_remove_if_empty, path)
+            return path
+        refused.append(f"{base} ({why})")
+    raise Failed(f"no work directory: {CLONES} in each of {', '.join(refused)}; give `work`, a directory on xfs "
+                 "or btrfs with reflink, or on APFS")
+
+
 def scratch(prefix: str) -> str:
-    # cargo names a checkout by its real path, and the temporary directory of macOS is a link.
-    # That directory is also too long for the path of a daemon's socket in it (104 bytes).
-    return os.path.realpath(tempfile.mkdtemp(prefix=prefix, dir="/tmp" if sys.platform == "darwin" else None))
+    """A new directory for a harness's checkouts and homes, the caller's to remove: in the first
+    of `work_bases` blaze can place outputs in (`work_dir`'s rule). Where none is, the same
+    `Failed`: a build there would be refused by blaze."""
+    for base in work_bases():
+        try:
+            os.makedirs(base, exist_ok=True)
+            if cannot_clone(base) is None:
+                return os.path.realpath(tempfile.mkdtemp(prefix=prefix, dir=base))
+        except OSError:
+            continue
+    raise Failed(f"no scratch directory: {CLONES} in each of {', '.join(work_bases())}")
 
 
 def run(path: str) -> str:
