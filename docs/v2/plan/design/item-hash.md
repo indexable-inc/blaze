@@ -476,13 +476,24 @@ the edited one in the store.
   a key that left positions out would keep a stale constant. It needs the unit's steps keyed
   per item (item 3 below) with positions as presentation slots (section 3.7), and a link step
   that writes only the span tables into an image whose code is as it was.
-- *A crate of a library source root* (a registry or git package, the standard library) is its
-  bytes: its files are parsed as outlines, and a code text needs each parsed in full. To
-  narrow one without that on every start, keep its own narrowed identity in the store under
-  its whole one and the front end's code identity, and parse only on a miss.
 - *A record with diagnostics* is under the content of the files they quote, whole
-  (`quoted_key`): an edit of one of those files that moves nothing makes the unit again,
-  where rendering them again from the kept check would do (section 3.7, diagnostics as ids).
+  (`quoted_key`): an edit of one of those files that moves nothing makes the unit again. The
+  design, not built: the record under the narrow key holds the check's `Diag`s
+  (`blaze_diagnostics::model`, already serializable) with each span's ends as (file, line,
+  column), which the narrow key keeps for every token; a replay maps them to bytes in the
+  file as it is and renders them (`compile::link`'s rendering, with the unit's options). Only
+  a span whose ends are both at a token's edge is kept so (one that ends in whitespace or a
+  comment, such as a file's whole span, stays under `quoted_key`).
+
+**Library crates** (built). A registry or git crate's files are parsed as outlines, and a
+code text needs a full parse. Each such crate but the standard library's has its own narrowed
+identity (`blaze_lower::code::library_narrow`, a full parse of each file, made and dropped)
+kept in the store under `library_key`: the front end's code identity, the text domains, the
+crate's settings, its root's text and its source root's content. `identify` reads it before a
+unit is keyed (`Lowered::library_narrows`) and parses only a crate the store has none of. A
+comment in such a crate moves its bytes, misses once, parses that crate, and gives the
+identity it had: nothing above it recomputes, and its own record is found under its narrow
+key. The standard library keeps its whole text: it is the toolchain's.
 
 **What remains**, in order: (1) sections 12 and 13 (locations and debug info as side tables),
 after which shapes can drop their line counts and a moved line is a data write; (2) the

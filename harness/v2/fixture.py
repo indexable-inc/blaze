@@ -927,6 +927,24 @@ REGRESSIONS: dict[str, tuple[tuple[str, str], ...]] = {
     "positions": (("comments:app/src/main.rs", "a line before each item"), ("format:base/src/lib.rs", "2, two blanks"),
                   ("comments:base/src/lib.rs", "one after each line"), ("format:app/src/main.rs", "4, none, braces below"),
                   ("comments:app/src/main.rs", "none"), ("format:base/src/lib.rs", "4, one blank")),
+    # What moves no token: nothing (a comment after the last line, spaces at lines' ends, a
+    # comment at each line's end), in the program's own crate and in a library below it, then
+    # lines alone (a comment on a line of its own, blank lines), each there and back.
+    "still": (("comments:app/src/main.rs", "one after the last line"), ("comments:app/src/main.rs", "spaces at lines' ends"),
+              ("comments:base/src/lib.rs", "one after each line"), ("comments:base/src/lib.rs", "one after the last line"),
+              ("comments:app/src/main.rs", "none"), ("comments:base/src/lib.rs", "none")),
+    "moves": (("comments:app/src/main.rs", "a line before each item"), ("comments:app/src/main.rs", "none"),
+              ("format:app/src/main.rs", "2, two blanks"), ("format:app/src/main.rs", "4, one blank"),
+              ("comments:base/src/lib.rs", "a line before each item"), ("format:base/src/lib.rs", "2, two blanks"),
+              ("comments:base/src/lib.rs", "none"), ("format:base/src/lib.rs", "4, one blank")),
+    # Whether a dev template missed for the comment or for the build before it (its code's
+    # "its code changed" on a one-line program): two edits that move lines and no token, one
+    # after the other, in one file. The first follows the first build, which made std's
+    # dependency images; if only the first compiles functions (`over/`) and the second none,
+    # what moved is what a body's code hash reads of a crate served from its image, not the
+    # comment. If both compile, a position is in the code.
+    "template-miss": (("comments:app/src/main.rs", "a line before each item"), ("format:app/src/main.rs", "2, two blanks"),
+                      ("comments:app/src/main.rs", "none"), ("format:app/src/main.rs", "4, one blank")),
     "resolution": (("specific", "present"), ("inference", "and i32"), ("shadow", "local"), ("vtable", "three methods"),
                    ("specific", "absent"), ("vtable", "two methods"), ("combine", "u32,u32,u8->u64"),
                    ("combine", "u32,u32->u128"), ("leak", "rc"), ("leak", "arc")),

@@ -41,7 +41,7 @@ Apart from that:
   writing of a location table (`LOCATIONS`; docs/v2/plan/design/item-hash.md section 12): no
   unit, no codegen template and no link of code.
 
-Sequences: `regressions` (fixture.REGRESSIONS: #906, #1325, #1326, #805, names, positions,
+Sequences: `regressions` (fixture.REGRESSIONS: #906, #1325, #1326, #805, names, positions, still, moves, template-miss,
 resolution, features), then `rounds` random sequences of `steps` edits from `seed` (round
 `first` on), of the `kinds` given (all when none). A failing step is filed under `OUT/found/`
 with every state of its sequence; `replay` builds them again with fresh daemons. With `reduce`
