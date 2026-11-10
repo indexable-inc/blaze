@@ -415,9 +415,10 @@ impl Tables {
         numbered(placed.regions)?;
         for &at in order.items() {
             let export = &exports[at as usize];
+            let bind = if export.weak { elf::STB_WEAK } else { elf::STB_GLOBAL };
             Sym {
                 name: strings.add(&export.name),
-                info: info(elf::STB_GLOBAL, export.kind),
+                info: info(bind, export.kind),
                 shndx: shndx(placed.regions, export.addr),
                 value: value(placed, &export.name, export.addr, export.kind)?,
                 size: export.size,

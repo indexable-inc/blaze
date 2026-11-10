@@ -37,6 +37,14 @@ pub(super) fn read(name: &str, data: &[u8]) -> Result<Shared, String> {
     };
     let mut names = Names::with_capacity(dynstr.size());
     let mut symbols = Vec::with_capacity(dynsym.len());
+    // The names it leaves undefined, counted first so their list is sized once; none
+    // allocates nothing.
+    let refers = |symbol: &<Header as object::read::elf::FileHeader>::Sym| {
+        symbol.st_shndx(ENDIAN) == elf::SHN_UNDEF
+            && matches!(symbol.st_bind(), elf::STB_GLOBAL | elf::STB_WEAK)
+    };
+    let mut undefined: Vec<Name> =
+        Vec::with_capacity(dynsym.iter().skip(1).filter(|it| refers(it)).count());
     // alloc: once per version the library defines, `Shared::versions`; empty allocates nothing
     let mut versions: Vec<Name> = Vec::new();
     // By ELF version index (at most 0x7fff): its slot in `versions` once seen, `None` inside
@@ -45,7 +53,14 @@ pub(super) fn read(name: &str, data: &[u8]) -> Result<Shared, String> {
     let mut slots: Vec<Option<Option<u16>>> =
         Vec::with_capacity(if table.is_some() { usize::from(elf::VERSYM_VERSION) + 1 } else { 0 });
     for (index, symbol) in dynsym.enumerate() {
-        if index.0 == 0 || symbol.st_shndx(ENDIAN) == elf::SHN_UNDEF {
+        if index.0 == 0 {
+            continue;
+        }
+        if symbol.st_shndx(ENDIAN) == elf::SHN_UNDEF {
+            if refers(symbol) {
+                let at = symbol.st_name(ENDIAN);
+                undefined.push(dynstr.name(&mut names, name, "the symbol name", at)?);
+            }
             continue;
         }
         // Read for an error only: the name is pushed once the symbol is known to be kept.
@@ -131,5 +146,6 @@ pub(super) fn read(name: &str, data: &[u8]) -> Result<Shared, String> {
         versions,
         more: Vec::new(),   // alloc: empty, allocates nothing
         inputs: Vec::new(), // alloc: empty, allocates nothing
+        undefined,
     })
 }

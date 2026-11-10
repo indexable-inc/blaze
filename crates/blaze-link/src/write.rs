@@ -1959,7 +1959,7 @@ impl<'a> Stage<'a> {
         };
         let exports = self.exports();
         let mut out = Vec::with_capacity(exports.len());
-        for (name, symbol, data) in exports {
+        for crate::place::Asked { name, symbol, data, weak, own } in exports {
             let Some(sym) = self.symbols.find_sym_name(symbol) else {
                 // alloc: error path
                 return Err(error(None, format!("the export `{name}` is not defined")));
@@ -1990,9 +1990,12 @@ impl<'a> Stage<'a> {
                     }
                     None => (SymbolKind::Other, 0),
                 };
+            // What its definition states of itself is its own: an object's `malloc` among
+            // other functions of one section is not the section's size.
+            let (kind, size) = own.unwrap_or((kind, size));
             let kind = if data { SymbolKind::Data } else { kind };
             // alloc: the writer's export table owns its names (model.rs `Export`), one per export
-            out.push(Export { name: name.to_owned(), addr, size, kind });
+            out.push(Export { name: name.to_owned(), addr, size, kind, weak });
         }
         let image = |name: &str| -> Option<u64> {
             match resolver.value(self.symbols.find_sym_name(name)?) {

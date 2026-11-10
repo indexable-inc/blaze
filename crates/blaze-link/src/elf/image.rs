@@ -300,9 +300,10 @@ fn globals_and_headers(
     let mut strings = Names { bytes: strs, at: 0, offset: (1 + layout.function_names) as u32 };
     let mut out = syms.chunks_exact_mut(SYM);
     for export in placed.exports {
+        let bind = if export.weak { elf::STB_WEAK } else { elf::STB_GLOBAL };
         let symbol = Sym {
             name: strings.add(&export.name),
-            info: info(elf::STB_GLOBAL, export.kind),
+            info: info(bind, export.kind),
             shndx: shndx(regions, export.addr),
             value: value(placed, &export.name, export.addr, export.kind)?,
             size: export.size,

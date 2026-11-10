@@ -305,8 +305,13 @@ fn executable() -> Fixture {
         GotEntry { addr: got + 24, holds: Holds::Import(2) },
     ];
     f.rebase = vec![data, data + 8];
-    f.exports =
-        vec![Export { name: "__blaze_live".into(), addr: data, size: 16, kind: SymbolKind::Data }];
+    f.exports = vec![Export {
+        name: "__blaze_live".into(),
+        addr: data,
+        size: 16,
+        kind: SymbolKind::Data,
+        weak: false,
+    }];
     f.functions = vec![function(text, 0x10, rodata), function(text + 0x10, 0x20, rodata + 8)];
     f.entry = Some(text);
     f.tls = Some(Tls { addr: tdata, init: 8, size: 8, align: 8 });
@@ -516,6 +521,7 @@ fn dll_exports_sorted_by_name() {
             addr: text + 0x10 * at as u64,
             size: 0x10,
             kind: SymbolKind::Function,
+            weak: false,
         })
         .collect();
     let image = f.image().unwrap();
@@ -708,8 +714,13 @@ fn what_pe_cannot_say_is_an_error() {
 
     let mut f = executable();
     let first = &f.exports[0];
-    let twice =
-        Export { name: first.name.clone(), addr: first.addr, size: first.size, kind: first.kind };
+    let twice = Export {
+        name: first.name.clone(),
+        addr: first.addr,
+        size: first.size,
+        kind: first.kind,
+        weak: false,
+    };
     f.exports.push(twice);
     f.fails("exported twice");
 }

@@ -2161,6 +2161,8 @@ mod dev_run;
 
 mod natives;
 
+mod interpose;
+
 mod weak_names;
 
 mod macho_unwind;

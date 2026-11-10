@@ -47,8 +47,8 @@ use smallvec::SmallVec;
 
 use crate::cow::{CowList, CowVec, ListRef};
 use crate::model::{
-    Apply, Archive, Binding, Class, Data, Directive, Fixup, Formats, Import, Library, Name, Names,
-    NativeFile, Object, SectionKind, Shared, Special, Sym, Symbol, SymbolDef, SymbolKind, Tie,
+    Apply, Archive, Binding, Class, Data, Directive, Exported, Fixup, Formats, Import, Library,
+    Name, Names, NativeFile, Object, SectionKind, Shared, Special, Sym, Symbol, SymbolDef, SymbolKind, Tie,
     Writer,
 };
 use crate::premap::{Outside, Strength, outside_def};
@@ -458,6 +458,10 @@ fn check_shared(shared: &Shared) -> Result<(), String> {
                 shared.versions.len()
             ));
         }
+    }
+    if shared.undefined.iter().any(|it| shared.names.get(*it).is_none()) {
+        // alloc: error path
+        return Err(format!("{}: an undefined symbol with a name outside its names", shared.name));
     }
     shared.more.iter().try_for_each(check_shared)
 }
@@ -1044,7 +1048,8 @@ fn section_in(object: &Object, at: u32) -> String {
 }
 
 /// What the shared libraries of a link export: every library they stand for, flattened, and
-/// of each name the first library's symbol. Built when the libraries change, not per stage.
+/// of each name the first library's symbol; and the names they leave undefined. Built when
+/// the libraries change, not per stage.
 #[derive(Default)]
 pub(crate) struct Exports {
     /// File, `as_needed`, place on the link line ([`crate::Native::order`]).
@@ -1058,6 +1063,9 @@ pub(crate) struct Exports {
     versions: Vec<String>,
     symbols: Vec<Export>,
     table: Table,
+    /// The names the libraries refer to and leave undefined, each once, by name in `wanted`.
+    undefined: Vec<Name>,
+    wanted: Table,
 }
 
 #[derive(Clone, Copy)]
@@ -1103,7 +1111,10 @@ impl Exports {
                 .map(|(it, as_needed)| Library { name: it.name.clone(), as_needed: *as_needed }),
         );
         let count: usize = flat.iter().map(|it| it.0.symbols.len()).sum();
+        let refers: usize = flat.iter().map(|it| it.0.undefined.len()).sum();
         let mut names = Names::with_capacity(flat.iter().map(|it| it.0.names.bytes()).sum());
+        let mut undefined: Vec<Name> = Vec::with_capacity(refers);
+        let mut wanted = if refers == 0 { Table::default() } else { Table::with_capacity(refers) };
         let mut table = Table::with_capacity(count);
         let mut symbols: Vec<Export> = Vec::with_capacity(count);
         let distinct: usize = flat.iter().map(|it| it.0.versions.len()).sum();
@@ -1139,8 +1150,36 @@ impl Exports {
                     weak: symbol.weak,
                 });
             }
+            for name in &shared.undefined {
+                let name = shared.names.at(*name);
+                let index = undefined.len() as u32;
+                if wanted
+                    .insert(hash(name), index, |it| names.at(undefined[it as usize]) == name)
+                    .is_ok()
+                {
+                    undefined.push(names.push(name)?);
+                }
+            }
         }
-        Ok(Exports { roots, libraries, orders, canonical, names, versions, symbols, table })
+        Ok(Exports {
+            roots,
+            libraries,
+            orders,
+            canonical,
+            names,
+            versions,
+            symbols,
+            table,
+            undefined,
+            wanted,
+        })
+    }
+
+    /// Whether a library refers to `name` and leaves it undefined.
+    fn refers(&self, name: &str) -> bool {
+        self.wanted
+            .find(hash(name), |it| self.names.at(self.undefined[it as usize]) == name)
+            .is_some()
     }
 
     fn find(&self, name: &str) -> Option<&Export> {
@@ -1174,7 +1213,8 @@ const RUST: u16 = 1;
 const PULL: u16 = 2;
 /// The link must define it: `/INCLUDE`, `/EXPORT`, what a taken fallback falls back to.
 const REQUIRED: u16 = 4;
-/// Collection starts from it, and it is resolved: the entry, exports, directives.
+/// Collection starts from it, and it is resolved: the entry, exports (a shared library's,
+/// and what an ELF executable exports for the shared libraries it links), directives.
 const ROOT: u16 = 8;
 /// Referred to strongly whatever Rust does: the entry, exports.
 const STRONG: u16 = 16;
@@ -1252,8 +1292,10 @@ pub(crate) struct Graph {
     /// The archives searched for names, in link-line order: input and index.
     archives: Vec<(u32, Arc<Table>)>,
     exports: Arc<Exports>,
-    /// What the objects' `/EXPORT` directives export.
-    asked: Arc<Vec<(String, String, bool)>>,
+    /// What resolution has the image export: the objects' `/EXPORT` directives', then, by
+    /// name, what an ELF executable defines that a shared library it links defines or
+    /// refers to ([`Stage::export_for_libraries`]).
+    asked: Arc<Vec<Exported>>,
     /// wasm: what objects say a name is imported as, and the input saying it.
     wasm: HashMap<Sym, (u32, blaze_codegen::wasm::Import), std::alloc::Global>,
     entry: Option<Sym>,
@@ -1873,9 +1915,8 @@ pub(crate) struct Resolved {
     pub libraries: Arc<Vec<Library>>,
     /// Of each of `libraries`, its place on the link line ([`crate::Native::order`]).
     pub library_orders: Arc<Vec<u32>>,
-    /// What the objects' `/EXPORT` directives export: the name, the symbol, and whether it
-    /// is data.
-    pub exports: Arc<Vec<(String, String, bool)>>,
+    /// What the graph has the image export ([`Graph::asked`]).
+    pub exports: Arc<Vec<Exported>>,
     /// Whether an import is kept in place for an incremental link that no longer needs it.
     stale: bool,
     refs: Refs,
@@ -2539,11 +2580,13 @@ impl<'a> Stage<'a> {
                     // alloc: the set's own name, once per `/EXPORT` directive per graph built
                     if b.asked.insert(name.clone()) {
                         // alloc: the writers' own names, once per name exported per graph built
-                        Arc::make_mut(&mut b.graph.asked).push((
-                            name.clone(),
-                            symbol.clone(),
-                            *data,
-                        ));
+                        Arc::make_mut(&mut b.graph.asked).push(Exported {
+                            name: name.clone(),
+                            symbol: symbol.clone(),
+                            data: *data,
+                            weak: false,
+                            own: None,
+                        });
                     }
                 }
                 Directive::Mismatch { key, value } => match b.mismatches.get(key) {
@@ -3404,6 +3447,100 @@ impl<'a> Stage<'a> {
         Ok(())
     }
 
+    /// An ELF executable exports each name it defines, by Rust or by a loaded object, that a
+    /// shared library on its link line also defines or leaves undefined, as GNU ld and lld
+    /// do: the dynamic linker then binds the library's own uses of the name to the
+    /// executable's definition, which is how a program's `malloc` and `free` replace libc's.
+    /// A name hidden where it is defined, or by any loaded object that mentions it (ELF
+    /// merges visibility to the most constraining), is not exported. Each exported name is
+    /// a root of collection, since the loader may call what nothing in the image does, and
+    /// keeps its binding and, where its object states them, its type and size.
+    ///
+    /// The exports are in name order, after the directives', and are part of the graph: it
+    /// is built again whenever the natives (the libraries among them) or Rust's names
+    /// change, so no link reuses a list made from other inputs.
+    fn export_for_libraries(&self, b: &mut Build) -> Result<(), LinkError> {
+        let symbols: &Symbols = &*self.symbols;
+        let graph = &b.graph;
+        let exports = &graph.exports;
+        if exports.symbols.is_empty() && exports.undefined.is_empty() {
+            return Ok(());
+        }
+        // alloc: none unless a library names what the executable defines, once per graph built
+        let mut found: Vec<(&str, u32)> = Vec::new();
+        for (slot, it) in graph.slots.iter().enumerate() {
+            let slot = slot as u32;
+            if it.flags & (OUTSIDE | ALIAS) != 0 {
+                continue;
+            }
+            if it.flags & RUST == 0 {
+                let Some((load, symbol)) = graph.best(slot) else { continue };
+                let symbol = &graph.object(load).symbols[symbol as usize];
+                if symbol.hidden
+                    || matches!(symbol.def, SymbolDef::Undefined | SymbolDef::Fallback { .. })
+                {
+                    continue;
+                }
+            }
+            let Some(name) = symbols.name_of(it.sym) else { continue };
+            if exports.find(name).is_some() || exports.refers(name) {
+                found.push((name, slot));
+            }
+        }
+        if found.is_empty() {
+            return Ok(());
+        }
+        // alloc: once per graph built whose executable defines a name its libraries name
+        let mut hidden = vec![false; graph.slots.len()];
+        for load in &graph.loads {
+            for (symbol, slot) in load.parsed.object().symbols.iter().zip(&load.slots) {
+                if symbol.hidden && *slot != NONE {
+                    hidden[*slot as usize] = true;
+                }
+            }
+        }
+        found.retain(|(_, slot)| !hidden[*slot as usize]);
+        // Slots are numbered in the order names are met; the exports are in name order.
+        found.sort_unstable();
+        let mut made: Vec<Exported> = Vec::with_capacity(found.len());
+        for &(name, slot) in &found {
+            let it = &graph.slots[slot as usize];
+            let (weak, own) = if it.flags & RUST != 0 {
+                (it.flags & RUST_WEAK != 0, None)
+            } else {
+                let (load, symbol) = unpack(it.best);
+                let symbol = &graph.object(load).symbols[symbol as usize];
+                let own = match symbol.def {
+                    SymbolDef::Section { size, .. } => Some((symbol.kind, size)),
+                    SymbolDef::Common { .. } => None,
+                    _ => {
+                        return Err(error(
+                            None,
+                            // alloc: error path
+                            format!(
+                                "`{name}` is defined outside every section (an absolute symbol) by {}, and a shared                                  library {} links defines or refers to it, so the executable exports it: blaze's ELF                                  writer exports only what is in the image",
+                                self.input_name(graph.loads[load as usize].input),
+                                self.name
+                            ),
+                        ));
+                    }
+                };
+                (symbol.binding == Binding::Weak, own)
+            };
+            // alloc: the writers' own names, once per name exported per graph built
+            let (name, symbol) = (name.to_owned(), name.to_owned());
+            made.push(Exported { name, symbol, data: false, weak, own });
+        }
+        for (export, &(_, slot)) in made.into_iter().zip(&found) {
+            // alloc: the set's own name, once per name exported per graph built
+            if b.asked.insert(export.name.clone()) {
+                Arc::make_mut(&mut b.graph.asked).push(export);
+            }
+            b.graph.slots[slot as usize].flags |= ROOT;
+        }
+        Ok(())
+    }
+
     /// Builds the graph again from the kept objects and makes the image's natives and names
     /// what it gives, touching only what differs.
     fn rebuild<O: Outside>(
@@ -3574,6 +3711,9 @@ impl<'a> Stage<'a> {
             // alloc: once per change of the link's shared libraries
             _ => Arc::new(Exports::build(shared).map_err(|what| error(None, what))?),
         };
+        if output.format == Format::Elf && matches!(output.kind, OutputKind::Executable { .. }) {
+            self.export_for_libraries(&mut b)?;
+        }
         b.graph.archives = archives;
         b.graph.index();
         // alloc: once per graph built, shared by the stages after
