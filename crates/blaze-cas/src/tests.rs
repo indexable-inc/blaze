@@ -8,6 +8,7 @@ use blaze_core::{
 use super::*;
 use crate::read::Found;
 
+mod block_checks;
 mod model_check;
 mod place_race;
 
@@ -131,6 +132,15 @@ fn quiet() -> Faults {
 
 fn bytes_of(store: &Store, key: &Key) -> Option<Vec<u8>> {
     store.get(key).unwrap().map(|it| it.bytes.to_vec())
+}
+
+/// The checks of `pack` written again from the pack's bytes as they are now: what a change of
+/// the pack that fixed its checks up too leaves (rot does not, and no block check passes it), so
+/// a test reaches the check behind them, the value's content hash.
+fn recheck(sim: &mut Sim, pack: &FileName) {
+    let file = name(&pack.as_str().replace("pack-", "checks-"));
+    let checked = checks::encode(&checks::of(&sim.contents(pack)));
+    sim.change(&file, &checked);
 }
 
 #[test]
@@ -1839,6 +1849,9 @@ fn a_flipped_byte_of_a_value_is_never_served() {
     let mut bytes = sim.contents(&pack);
     bytes[(loc.offset + RECORD_HEADER) as usize + 500] ^= 1;
     sim.change(&pack, &bytes);
+    // With its block's check fixed up too, so the open's block checks pass and the value's
+    // content hash is what refuses it (`block_checks` has the open that stops on the block).
+    recheck(&mut sim, &pack);
     let store = open(&mut sim, "store");
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), vec![b'a'; 1000]);
     let corrupt = store.get(&key(2)).unwrap_err();
@@ -1884,6 +1897,30 @@ fn a_head_of_another_format_is_refused_by_name() {
     let broken = store.broken().unwrap();
     assert_eq!(broken.file, head);
     assert!(broken.what.contains("format 99"), "{broken}");
+}
+
+/// Format 4 added the packs' block checks. A store of format 3 has none: it is refused, naming
+/// both formats, and never migrated or read as this one.
+#[test]
+fn a_store_of_the_format_before_block_checks_is_refused_naming_both() {
+    let mut sim = Sim::new(6, quiet());
+    let mut store = open(&mut sim, "store");
+    store.put(key(1), Kind::Code, &[1]).unwrap();
+    flush(&mut sim, &mut store);
+    drop(store);
+    assert_eq!(FORMAT, 4);
+    let head = name("store/head");
+    let mut bytes = sim.contents(&head);
+    assert_eq!(bytes[8..12], FORMAT.to_le_bytes());
+    bytes[8..12].copy_from_slice(&3u32.to_le_bytes());
+    sim.change(&head, &bytes);
+    let mut effects = Vec::new();
+    let mut store = Store::open(config("store"), &mut effects);
+    drive(&mut sim, &mut store, &mut effects);
+    assert!(!store.ready());
+    let broken = store.broken().unwrap();
+    assert_eq!(broken.file, head);
+    assert!(broken.what.contains("store format 3, not 4"), "{broken}");
 }
 
 #[test]
@@ -2619,6 +2656,8 @@ fn a_damaged_value_in_another_writers_store_is_never_served() {
     let mut bytes = sim.contents(&pack);
     bytes[(loc.offset + RECORD_HEADER) as usize + 500] ^= 1;
     sim.change(&pack, &bytes);
+    // Its block's check fixed up too: the value's content hash is what refuses it.
+    recheck(&mut sim, &pack);
     let b = open_shared(&mut sim, 2);
     assert_eq!(bytes_of(&b, &key(1)).unwrap(), vec![b'a'; 1000]);
     let corrupt = b.get(&key(2)).unwrap_err();

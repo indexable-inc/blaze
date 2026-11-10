@@ -232,8 +232,10 @@ impl Store {
             return self.fail(file, why);
         }
         peers.restart.push(at);
-        // The mappings of the opening given up are let go of as they come.
-        self.tags.ops.retain(|_, op| !matches!(op, Op::Map { tier, .. } if *tier == at));
+        // The mappings and the checks of the opening given up are let go of as they come.
+        self.tags.ops.retain(|_, op| {
+            !matches!(op, Op::Map { tier, .. } | Op::Checks { tier, .. } if *tier == at)
+        });
         let tier = &mut self.tiers[at];
         *tier = match tier.before.take() {
             Some(before) => *before,

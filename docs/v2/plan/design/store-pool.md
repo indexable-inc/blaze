@@ -351,8 +351,8 @@ The store does the same per **block**:
   (`Effect::Private`). That is enough (decided below): a reload does not hash again.
 
 The sidecar changes the store's format. `FORMAT` goes from 3 to 4, and a store of format 3 refuses
-to open, naming both, as every change of format does (docs/v2-store.md, "Opening"). There is no
-migration. The store is rebuilt from what made it.
+to open, naming both, as every change of format does. There is no
+migration. The store is rebuilt from what made it. (Built: `crates/blaze-cas/src/checks.rs`.)
 
 ### Errors
 
@@ -777,8 +777,8 @@ budget:
 4. `Loading -> Loaded` published before the read completes.
 5. The block checks are skipped on load, so a torn or rotted block is served.
 6. A failed read leaves the page `Loaded`.
-7. The head is written before the packs' and checks' syncs complete (as the store's crash tests plant
-   today).
+7. The head is written before the packs' and checks' syncs complete (planted in the store's
+   crash tests, `Store::plant_head_before_syncs`, `crates/blaze-cas/src/tests/block_checks.rs`).
 8. The commit writes into a pack's last page without pinning it, so the sweep evicts it in the
    middle of the write.
 9. A prefetch is issued while a demand load is in flight.
@@ -824,9 +824,10 @@ Each lane is one pull request or a few, landed through `.github/scripts/land.py`
 it touches concurrent or durable code. Lanes 1 and 2 can run side by side. The rest are in order,
 except the lanes that are the pool's alone (4a and 6a), which need only lane 3.
 
-Where they stand (2026-11-09): lanes 1 and 2 are on main. Lanes 3, 4a and 6a are built on branch
-pool-finish-1109 and not yet on main. Lane 4b is next. Lane 5 waits on 4b and on admission by
-footprint reaching main.
+Where they stand (2026-11-10): lanes 1 and 2 are on main. Lanes 3, 4a and 6a are built on branch
+pool-finish-1109 and not yet on main. Of lane 4b, the checks sidecar and format 4 are built on
+branch fast-storepool-1110; the store's reads and its commit are not on the pool yet, and that
+is next. Lane 5 waits on 4b and on admission by footprint reaching main.
 
 1. **blaze-mem: giving back a sparse range.**
    - `Region::evict(&self, ranges)` for a sparse region, over `os::evict`: Linux
@@ -880,18 +881,33 @@ footprint reaching main.
      makes them the file's loaded pages (`Windows::grow`, `Loads::grow`, `Loader::grow`). An
      append given up gives its fresh pages back. The DST has the commit as an actor (append,
      `WriteFrom`, sync, then the flip, with crashes through it) and planted bug 8.
-   - **4b. The store's port.** Not built.
-     - Packs, index slots and files of their own read through the pool, with `checks-<n>` and
-       `FORMAT` 4. The open's recovery scan as reads. The commit draining into `Append`s and
+   - **4b. The store's port.** Built in part on fast-storepool-1110; the reads are not.
+     - Built: `checks-<n>` and `FORMAT` 4 (`crates/blaze-cas/src/checks.rs`). A commit cuts each
+       written pack's checks to those committed, writes the new blocks' checks and syncs them
+       before the head; the open reads each pack's checks whole, refuses a file that holds fewer
+       than the head names, and checks every block its recovery scan reads; a removed pack's
+       checks go with it. Each pack's checks stay in memory (`Pack::checks`) for the loads core
+       (`Opened::checks`). Its crash test, the oracle's rule for the checks and planted bug 7
+       (the head written before the packs' and checks' syncs complete) with its directed case
+       are `crates/blaze-cas/src/tests/block_checks.rs`. The store still maps what it reads.
+     - Not built: packs, index slots and files of their own read through the pool. The open's
+       recovery scan as reads. The commit draining into `Append`s and
        writing with `WriteFrom`. `Pinned` as pins, `Reader::read` with a `PinSet` and the
        optimistic copy of short records (section 1), and `Tail::Hot` set for a pack written in the
        last two commits.
+     - Decided before the reads move, since the design above leaves them open: how a store
+       driven by `Sim` (no loader thread) loads a miss, since its tests read synchronously right
+       after driving effects (238 reads in `tests.rs`); what carries a task's pins behind
+       `Entry<'g>` (the store's guard, or a `PinSet` every caller passes); how `Config` names
+       the loader's driver; and `ReadInto`/`WriteFrom` in blaze-storemodel's crash file system
+       (`crates/blaze-storemodel/src/fs.rs`), which has no rule for them.
      - A reader's miss blocks on the loader, so the store's reads stop being a pure function of a
        published view: every caller of `Reader::get`, `get_in_place`, `get_from` and `pinned`
        across the workspace moves in the same batch (rule `whole-ports`), and the store's `Sim`
        tests drive the loads core's effects beside the store's own.
-     - The DST grows planted bug 7. The store's existing crash and model-check tests
-       (`crates/blaze-cas/src/tests.rs`, `tests/model_check.rs`) run on the pool.
+     - Planted bug 7 is built, in the store's crash tests (above). The store's existing crash
+       and model-check tests (`crates/blaze-cas/src/tests.rs`, `tests/model_check.rs`) run on
+       the pool once the reads do.
      - A trace is kept as a store record keyed by its view, with its round-trip test (lane 6a
        builds it in memory).
      - Deletes: `Pack::mapping`, `Pack::memory`, `PackView::mapping`, `Index::mapping`,

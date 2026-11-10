@@ -1119,12 +1119,12 @@ pub(crate) fn ranges_of(pages: &[u64]) -> Vec<Range<usize>> {
 /// The check of one block of a file's committed bytes (its last may be short): what a load
 /// compares each block it read against, and the store's `checks-<n>` holds per block.
 pub(crate) fn block_check(bytes: &[u8]) -> u32 {
-    crate::crc::crc32c(bytes)
+    crate::checks::of_block(bytes)
 }
 
 /// The checks of every block of `bytes`, a file's committed bytes.
 pub(crate) fn checks_of(bytes: &[u8]) -> Vec<u32> {
-    bytes.chunks(BLOCK as usize).map(block_check).collect() // alloc: a file's checks, once as it opens
+    crate::checks::of(bytes)
 }
 
 // --- Pinned reads ----------------------------------------------------------------------------------
