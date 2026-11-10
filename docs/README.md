@@ -20,6 +20,7 @@ How blaze is now. Kept true: CI checks their links, paths and settings against t
 - [ix-prof.md](ix-prof.md): Profiling any Rust program, not only blaze, like Go's pprof. Covers the ix-prof crate (CPU samples of every thread, tracing spans with their own CPU time and allocations, named waits, allocations by stack), `IX_PROF=<dir>`, the loopback `/debug/pprof` endpoint and live stream, and `blaze pprof` with top, peek, tree, list, flame, diff, export and --http.
 - [lints.md](lints.md): The general `blaze::` lints `blaze check` runs in every workspace (`blaze::general`): what each catches, why it costs, how to fix or allow it, and the `clippy.toml` keys that tune them.
 - [mir-passes.md](mir-passes.md): The MIR passes from built MIR to runtime MIR, ported from rustc, that codegen and the interpreter run on.
+- [no-rustc.md](no-rustc.md): The no-rustc rule, what counts as running rustc, the end state, and the live list of the places that still name rustc or cargo.
 - [release.md](release.md): Releases: the canary and stable channels, how a release is cut and what gates promotion to stable.
 - [resolve.md](resolve.md): Reading Cargo.toml and .cargo/config.toml as cargo does (blaze-manifest), and how it measured against cargo.
 - [toolchain.md](toolchain.md): blaze's own pinned nightly: what it is, how it is fetched and checked, and the daily bump.
@@ -113,7 +114,6 @@ Designs not (fully) built, newest first.
 - [v2/plan/design/codegen.md](v2/plan/design/codegen.md) (2026-10-29): blaze v2 codegen lane's design: per-function units, instance keys, templates (the back-end memo up to callee renaming), code dedupe, folding by constants, settings and tiering, release summaries and imports.
 - [future/const-macros.md](future/const-macros.md) (2026-10-28): Const macros: proc macros written inline as const fn, run by the const evaluator. Stage 0 is experimental.
 - [remote-cache.md](remote-cache.md) (2026-10-27): One shared remote cache for CI and everyone: the gateway, the CAS API, and the slices built and to come.
-- [no-rustc.md](no-rustc.md) (2026-10-22): The no-rustc rule and the plan to remove every rustc use, step by step, with what is done.
 
 ## Records
 
