@@ -4,6 +4,8 @@
 //! past the patch room too), and in an incremental link's new code; and a `bl` from a native
 //! object's `.init`, which ELF lays out after the code and its islands. A branch to a weak name
 //! nothing defines, 200 MiB into the code, takes no thunk: it lands on the next instruction.
+//! An edit that moves a direct callee to the patch region, 200 MiB from a caller the link
+//! keeps in place, is refused, typed, and the link from scratch takes it.
 
 use blaze_codegen::{Arch, CompiledFunction, RelocKind, Relocation, Target};
 
@@ -293,4 +295,72 @@ fn a_branch_to_an_undefined_weak_past_128_mib_lands_on_the_next_instruction() {
         assert!(past, "incremental {incremental}: the `bl` at {call:#x} is in reach of 0");
         assert_eq!(bl(&linked, call), at, "incremental {incremental}: `bl hook` steps past itself");
     }
+}
+
+/// `nop; ret`: the edited callee, to tell it from the first.
+const NOP: u32 = 0xd503_201f;
+
+/// The dogfood report's shape (2026-11-09, `blaze test -p blaze-shader`): `one` calls `two`
+/// directly, next to it, so the full link makes no thunk of `two`; 200 MiB of code are
+/// between them and the patch region. An edit refills `two` under its own key: its new code
+/// goes to the patch region, `one` is written again where it is, and its `bl` reaches
+/// neither `two` nor the patch region, where the stage's thunks go. The stage is refused,
+/// typed, naming both functions and the distance signed in MiB, with nothing staged; a link
+/// of the same functions from scratch lays them next to each other again.
+#[test]
+fn an_edit_moving_a_direct_callee_out_of_its_callers_reach_is_refused_for_a_link_from_scratch() {
+    let plain = |n: u8, code: &[u8]| CompiledFunction {
+        arch: Arch::Aarch64,
+        ..function(n, code, Vec::new())
+    };
+    let (one, two, big) = (caller(1, Target::Direct(key(2))), plain(2, &RET), filler(3));
+    let two2 = plain(2, &[NOP.to_le_bytes(), RET].concat());
+    let whole = |two: &CompiledFunction| -> (Image, Disk) {
+        let mut image = Image::new(name(TO), a64(true)).unwrap();
+        let mut disk = Disk::default();
+        let change = Change {
+            added: vec![&one, two, &big],
+            names: vec![("_start".into(), Target::Direct(key(1)))],
+            debug_names: vec![
+                (key(1), "one".into()),
+                (key(2), "two".into()),
+                (key(3), "big".into()),
+            ],
+            ..Change::default()
+        };
+        disk.link(&mut image, change).unwrap_or_else(|it| panic!("from scratch: {it}"));
+        (image, disk)
+    };
+    let (mut image, disk) = whole(&two);
+    let linked = Linked::of(disk.file(TO));
+    let (a, b) = (linked.symbol("one"), linked.symbol("two"));
+    assert_eq!(bl(&linked, a), b, "next to each other: a direct `bl`, no thunk");
+    assert!(linked.symbol("big") > b, "the 200 MiB are after them, before the patch region");
+
+    let generation = image.generation();
+    let edit = Change { added: vec![&two2], removed: vec![key(2)], ..Change::default() };
+    let error = match image.stage(edit) {
+        Ok(_) => panic!("staged: `one` is 200 MiB from the patch region's thunks"),
+        Err(error) => error,
+    };
+    let branch = error.no_thunk().unwrap_or_else(|| panic!("not typed: {error}"));
+    assert!(
+        branch.contains("the function `one`") && branch.contains("the function `two`"),
+        "names the caller and the callee: {branch}"
+    );
+    assert!(
+        branch.contains(", +2") && branch.ends_with(" MiB away"),
+        "the distance is signed, in MiB: {branch}"
+    );
+    assert!(!error.what.contains("0xffffffff"), "no distance as an unsigned number: {error}");
+    assert_eq!(error.function, Some(key(1)), "the error names the caller");
+    assert_eq!(error.no_room(), None, "no want of room");
+    assert_eq!(image.generation(), generation, "nothing staged");
+
+    // What the build does with the refusal: the same functions linked from scratch.
+    let (_, disk) = whole(&two2);
+    let linked = Linked::of(disk.file(TO));
+    let (a, b) = (linked.symbol("one"), linked.symbol("two"));
+    assert_eq!(bl(&linked, a), b, "from scratch: next to each other again");
+    assert_eq!(linked.u32_at(b), NOP, "the edited `two`");
 }

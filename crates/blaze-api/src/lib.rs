@@ -1305,8 +1305,9 @@ pub enum LinkHow {
     /// image's, byte for byte.
     Unchanged,
     /// Laid out whole although an image was kept: the names of the output's fields that differ
-    /// from the kept image's (`exports`, `debug`), or `not incremental` for an output that keeps
-    /// no room.
+    /// from the kept image's (`exports`, `debug`), `not incremental` for an output that keeps
+    /// no room, `layout` for a changed layout profile, or `no thunk in reach` for a splice
+    /// refused because a branch in code kept in place could reach no thunk.
     Full { why: Vec<String> },
 }
 

@@ -77,7 +77,7 @@ impl fmt::Display for Bad {
             Bad::A64Literal => f.write_str("an AArch64 thread-local offset is a 64-bit literal"),
             Bad::Branch { offset, bits } => write!(
                 f,
-                "an AArch64 branch of {offset:#x} bytes, past its {bits}-bit field's reach of {:#x}",
+                "an AArch64 branch of {offset} bytes, past its {bits}-bit field's reach of {:#x}",
                 1i64 << (bits + 1)
             ),
             Bad::Adrp(pages) => write!(f, "an ADRP of {pages:#x} pages, past its 4 GiB reach"),

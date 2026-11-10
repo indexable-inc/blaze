@@ -2586,6 +2586,17 @@ fn assemble(
                                 color,
                             ));
                         }
+                        // The splice was refused and the image linked from scratch: the
+                        // build says so, naming the branch, as the link line says how.
+                        if let Some(why) = &linked.whole {
+                            diagnostics.push(say::cargo(
+                                Level::Note,
+                                // alloc: a note's text, once per link from scratch
+                                format!("`{path}`: {why}"),
+                                Some(unit_of.clone()),
+                                color,
+                            ));
+                        }
                         natives.extend(linked.read);
                         if linked.table.is_some() {
                             made.table = linked.table;

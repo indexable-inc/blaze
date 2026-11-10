@@ -1546,14 +1546,25 @@ const FIRST_LIBRARY: u32 = 1 << 20;
 pub(crate) type Read = (String, ContentId);
 
 /// What [`link`] made: the file's bytes, every native input the link read off the machine, a
-/// test binary's execution table, how it reached the image, and, for a dev executable whose
-/// runs could not take the link as a patch, why they were told to start again.
+/// test binary's execution table, how it reached the image, for a dev executable whose
+/// runs could not take the link as a patch, why they were told to start again, and, for an
+/// image linked from scratch because the kept one refused the change as a splice
+/// ([`Full::NoThunk`]), what the build says of it.
 pub(crate) struct LinkMade {
     pub(crate) bytes: Vec<u8>,
     pub(crate) read: Vec<Read>,
     pub(crate) table: Option<blaze_codegen::ExecTable>,
     pub(crate) how: Linking,
     pub(crate) restart: Option<String>,
+    pub(crate) whole: Option<String>,
+}
+
+/// What the build says when a splice was refused for a thunk it could not place and the
+/// image is linked from scratch in its place: `branch` is the linker's words for the branch
+/// ([`blaze_link::LinkError::no_thunk`]).
+pub(crate) fn full_link_note(branch: &str) -> String {
+    // alloc: once per link from scratch
+    format!("full link: the splice could not place a thunk for {branch}")
 }
 
 /// Why [`link`] made no image at `image`.
@@ -1743,7 +1754,7 @@ fn link_at(
         kept_image(images, path, &output, weights.map(super::layout::Weights::id))?;
     // The image goes back whether the link is made or not: one that fails leaves it as it
     // was, and the next link is a change of it.
-    let made = relink(
+    let mut made = relink(
         job,
         unit,
         path,
@@ -1755,6 +1766,42 @@ fn link_at(
         heat.as_ref(),
         &mut linked,
     );
+    // A splice refused for a thunk it could not place ([`blaze_link::Refusal::NoThunk`]: a
+    // branch in code the kept image holds in place, out of reach of the patch region) is a
+    // change a link from scratch takes, its islands cut through the code. That link is a
+    // named step, never a silent one: the link line says it ([`Full::NoThunk`]) and the
+    // build says which branch ([`LinkMade::whole`]). The kept image is let go first, so the
+    // two are never held at once; a link from scratch that fails too is the build's error,
+    // and the next link starts from an image never laid out.
+    let mut whole = None;
+    if let Err(LinkCause::Linker { step: LinkStep::Stage, error }) = &made
+        && let Some(branch) = error.no_thunk()
+    {
+        let why = full_link_note(branch);
+        tracing::info!(target: "blaze", unit = %path, why = %why, "link from scratch");
+        match fresh_image(path, &output, weights.map(super::layout::Weights::id)) {
+            Ok(fresh) => {
+                linked = fresh;
+                made = relink(
+                    job,
+                    unit,
+                    path,
+                    generated,
+                    test,
+                    &assembled,
+                    &located,
+                    side,
+                    heat.as_ref(),
+                    &mut linked,
+                );
+                whole = Some(why);
+            }
+            Err(cause) => {
+                images.push(KeptImage { path: path.to_owned(), kept: linked });
+                return Err(cause);
+            }
+        }
+    }
     // What address holds which function, for a profile of this build to be read through.
     let mapped = match (&made, profiles) {
         (Ok(_), Some(profiles)) => profiles.write_map(
@@ -1779,15 +1826,16 @@ fn link_at(
     let (bytes, read, table, laid, told) = made?;
     mapped?;
     perf_mapped?;
-    let how = match relaid && changed.is_some_and(OutputFields::is_empty) {
-        true => Linking::Full(Full::Layout),
-        false => linking(changed, laid, output.incremental),
+    let how = match (&whole, relaid && changed.is_some_and(OutputFields::is_empty)) {
+        (Some(_), _) => Linking::Full(Full::NoThunk),
+        (None, true) => Linking::Full(Full::Layout),
+        (None, false) => linking(changed, laid, output.incremental),
     };
     let restart = match told {
         super::run::inproc::Told::Restart { why } => Some(why),
         super::run::inproc::Told::Nothing | super::run::inproc::Told::Patched { .. } => None,
     };
-    Ok(LinkMade { bytes, read, table, how, restart })
+    Ok(LinkMade { bytes, read, table, how, restart, whole })
 }
 
 /// The image to link `output` laid out by profile `layout` into at `path`, taken out of
@@ -1810,8 +1858,22 @@ pub(crate) fn kept_image(
     {
         return Ok((images.swap_remove(at).kept, Some(changed), false));
     }
+    let fresh = fresh_image(path, output, layout)?;
+    if let Some(at) = at {
+        images.swap_remove(at);
+    }
+    Ok((fresh, changed, relaid))
+}
+
+/// An image of `output` at `path`, laid out by profile `layout`, with nothing linked into it:
+/// what a first link, or a link from scratch, stages against.
+pub(crate) fn fresh_image(
+    path: &str,
+    output: &Output,
+    layout: Option<ContentId>,
+) -> Result<Linked, LinkCause> {
     let to = blaze_core::FileName::new(path.trim_start_matches('/')).ok_or(LinkCause::Unnamed)?;
-    let fresh = Linked {
+    Ok(Linked {
         image: Image::new(to, output.clone())
             .map_err(|error| LinkCause::Linker { step: LinkStep::Image, error })?,
         output: output.clone(),
@@ -1824,11 +1886,7 @@ pub(crate) fn kept_image(
         slotted: Vec::new(),
         assumed: Vec::new(),
         given: None,
-    };
-    if let Some(at) = at {
-        images.swap_remove(at);
-    }
-    Ok((fresh, changed, relaid))
+    })
 }
 
 /// What [`relink`] did to an image: staged nothing (it was given what its last link was, so

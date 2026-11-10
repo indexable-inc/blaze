@@ -838,11 +838,11 @@ impl Reloc<'_> {
         let to = s.wrapping_add(fixup.addend as u64);
         // alloc: error path
         Err(format!(
-            "a branch to {}{} at {to:#x}, {:#x} bytes away: past its 128 MiB reach, and no thunk of it is in reach \
+            "a branch to {}{} at {to:#x}, {} away: past its 128 MiB reach, and no thunk of it is in reach \
              (the image has {} thunk islands)",
             named_in(self.symbols, &[self.state], self.writer, fixup.target),
             if plt { " through its PLT stub" } else { "" },
-            to.wrapping_sub(p) as i64,
+            thunk::away(p, to),
             self.state.islands,
         ))
     }
