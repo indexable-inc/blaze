@@ -590,11 +590,11 @@ fn param(ty: Ty, word: u32) -> Param {
 }
 
 fn build<S: Sink>(plan: &Plan) -> Builder<Global, S> {
-    let mut gen = Gen::<S>::new(plan);
+    let mut made = Gen::<S>::new(plan);
     for i in 0..plan.blocks.len() {
-        gen.block(plan, i);
+        made.block(plan, i);
     }
-    gen.b
+    made.b
 }
 
 fn generated(plan: &Plan) -> Func<Global> {
