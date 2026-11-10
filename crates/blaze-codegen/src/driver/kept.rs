@@ -25,8 +25,13 @@ use std::{
 
 use blaze_hash::SharedMap;
 
-use super::delta::{Fresh, Last};
-use crate::{InstanceKey, backend::Described, plan::Origin};
+use blaze_core::lock::Lock;
+
+use super::{
+    delta::{Fresh, Last},
+    patch::Walked,
+};
+use crate::{backend::Described, plan::Origin};
 
 /// The rounds of a walk whose describes are kept apart: the first, and the one over the facts
 /// of the whole program the first closed ([`crate::backend::Frontend::closed`]). A body built
@@ -41,10 +46,10 @@ const ROUNDS: usize = 2;
 pub struct Kept<I, S> {
     /// Each round's describes, by the instance and whose code asked for it.
     rounds: [SharedMap<(I, Origin), Arc<Described<I, S>>>; ROUNDS],
-    /// Each program's last walk, by [`program`]: the first word of each function's key,
-    /// sorted. Read only to count what a walk dropped ([`Walk::dropped`]); nothing is built
-    /// or left out by it, so two keys of one first word only miscount by one.
-    programs: SharedMap<u64, Arc<[u64]>>,
+    /// Each program's last walk whole ([`Walked`]), by [`program`] of its inputs, which the
+    /// walk itself holds and a build compares: taken by the build that patches it, so a
+    /// locked map.
+    walks: Lock<std::collections::HashMap<u64, Walked<I, S>>>,
     /// What each program's last build gave, by [`program`] of every input of the build: its
     /// ID and its entries, which the next build's [`super::Delta`] is made against.
     built: SharedMap<u64, Arc<Last>>,
@@ -54,7 +59,8 @@ impl<I: Eq + Hash, S> Default for Kept<I, S> {
     fn default() -> Self {
         Kept {
             rounds: std::array::from_fn(|_| SharedMap::default()),
-            programs: SharedMap::default(),
+            // alloc: none until a walk is kept
+            walks: Lock::new("codegen.driver.kept_walks", std::collections::HashMap::new()),
             built: SharedMap::default(),
         }
     }
@@ -103,40 +109,16 @@ impl<I: Clone + Eq + Hash + Send + Sync, S: Send + Sync> Kept<I, S> {
         self.built.pin().insert(program, built);
     }
 
-    /// Records `keys`, the functions of `program`'s walk in key order, as its last walk, and
-    /// gives how many functions of the one before are not among them; `None` for a program
-    /// never walked over this.
-    pub(super) fn walked(&self, program: u64, keys: &[InstanceKey]) -> Option<usize> {
-        // alloc: per build, eight bytes a function, kept until the program's next walk
-        let now: Arc<[u64]> = keys.iter().map(first_word).collect();
-        debug_assert!(now.is_sorted(), "a walk's keys are sorted, so their first words are");
-        let programs = self.programs.pin();
-        // clone: a reference count, once per build
-        let before = programs.get(&program).cloned();
-        programs.insert(program, now.clone()); // clone: a reference count, once per build
-        before.map(|before| missing(&before, &now))
+    /// Takes the walk kept of `program`, if one is: a build that patches it owns it, and
+    /// keeps the patched one in its place when it ends well.
+    pub(super) fn take_walk(&self, program: u64) -> Option<Walked<I, S>> {
+        self.walks.lock().remove(&program)
     }
-}
 
-/// The first eight bytes of a key, most significant first: keys in order give words in order.
-fn first_word(key: &InstanceKey) -> u64 {
-    let mut word = [0; 8];
-    word.copy_from_slice(&key.0.0[..8]);
-    u64::from_be_bytes(word)
-}
-
-/// How many of `before` are not in `now`, both sorted: one pass over the two.
-fn missing(before: &[u64], now: &[u64]) -> usize {
-    let (mut at, mut missing) = (0, 0);
-    for word in before {
-        while now.get(at).is_some_and(|it| it < word) {
-            at += 1;
-        }
-        if now.get(at) != Some(word) {
-            missing += 1;
-        }
+    /// Keeps `walked` as the walk of `program`.
+    pub(super) fn keep_walk(&self, program: u64, walked: Walked<I, S>) {
+        self.walks.lock().insert(program, walked);
     }
-    missing
 }
 
 /// Which program a walk is of, among those walked over one [`Kept`]: a hash of its roots as
@@ -156,8 +138,15 @@ pub struct Walk {
     pub verified: usize,
     /// The functions of the walk's result.
     pub reached: usize,
-    /// The functions of this program's last walk that are not in this one's result.
+    /// The functions of this program's last build that are not in this one's
+    /// ([`super::Delta`]'s `removed`).
     pub dropped: usize,
+    /// Why the walk ran whole, every function reached from the roots again, in place of
+    /// patching the walk kept of the program; `None` for a patched walk.
+    pub whole: Option<&'static str>,
+    /// The functions and statics a patched walk touched: the changed ones and those that
+    /// refer to them. 0 for a whole walk, which touches every one.
+    pub visited: usize,
     /// Why every describe was asked for anew, when no kept one was looked at.
     pub fresh: Option<Fresh>,
 }

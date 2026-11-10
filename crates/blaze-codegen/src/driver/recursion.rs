@@ -446,6 +446,15 @@ impl<I: Clone + Eq + Hash + std::fmt::Debug, S: Clone + Eq + Hash> Graph<I, S> {
         self.items[item as usize].state = State::Described(edges);
     }
 
+    /// Every function the walk counted, by whose code asked for it, with its count: what a
+    /// kept walk holds its functions to ([`super::patch`]).
+    pub(super) fn counts(&self) -> Vec<((I, Origin), Counted)> {
+        // clone: per build that keeps its walk, the walk's handle of each function
+        let counted = |it: &Item<I>| Some((it.function.clone()?, it.counted?));
+        // alloc: per build that keeps its walk, one per function
+        self.items.iter().filter_map(counted).collect()
+    }
+
     /// Item `item`'s description failed.
     pub(super) fn failed(&mut self, item: u32) {
         self.items[item as usize].state = State::Failed;

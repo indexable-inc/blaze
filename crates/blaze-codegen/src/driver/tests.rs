@@ -103,6 +103,11 @@ struct Engine {
     /// The planted bug of a control: a dyn fact's change is not seen, so a body built against
     /// the old fact is said to hold.
     misses_facts: bool,
+    /// The functions whose describe and count read durable inputs alone
+    /// ([`Frontend::durable`]): an edit of one moves `high`.
+    durable: std::collections::HashSet<u32>,
+    /// The durable view ([`Frontend::durable_view`]).
+    high: u64,
 }
 
 impl Default for Engine {
@@ -116,6 +121,8 @@ impl Default for Engine {
             describes: AtomicUsize::new(0),
             verifies: AtomicUsize::new(0),
             misses_facts: false,
+            durable: std::collections::HashSet::new(),
+            high: 0,
         }
     }
 }
@@ -183,6 +190,9 @@ impl Program {
     fn touch(&mut self, id: u32) {
         self.engine.revision += 1;
         self.engine.changed.insert(id, self.engine.revision);
+        if self.engine.durable.contains(&id) {
+            self.engine.high += 1;
+        }
     }
 
     /// An edit of the dyn fact the body of `id` reads: a new revision, which the fact changed
@@ -397,6 +407,18 @@ impl Frontend for Program {
             return Ok(None);
         }
         self.describe(id, requester).map(Some)
+    }
+
+    fn durable(&self, id: &u32, _: &Origin) -> bool {
+        self.engine.durable.contains(id)
+    }
+
+    fn durable_view(&self) -> Option<u64> {
+        Some(self.engine.high)
+    }
+
+    fn closes(&self) -> bool {
+        !self.dyn_sites.is_empty()
     }
 
     /// A program with a call through a `dyn` closes its dyn facts when its first walk ends,

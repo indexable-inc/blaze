@@ -269,6 +269,31 @@ pub trait Frontend: Sync {
         self.describe(instance, requester).map(Some)
     }
 
+    /// Whether what this front end says of `instance` for `requester` ([`Self::describe`],
+    /// [`Self::counted`]) was made of durable inputs alone: ones whose every write moves
+    /// [`Self::durable_view`]. Asked after a describe of it in this build. `true` promises
+    /// that for as long as the durable view is the same, a describe and a count give what
+    /// they gave, so the driver asks nothing of it. The default is `false`: asked each build.
+    fn durable(&self, instance: &Self::Instance, requester: &Origin) -> bool {
+        let _ = (instance, requester);
+        false
+    }
+
+    /// A number that is another after any write of an input a durable describe may read
+    /// (a library's source, a frozen table); `None` for a front end that tells none, whose
+    /// walk is then never patched.
+    fn durable_view(&self) -> Option<u64> {
+        None
+    }
+
+    /// Whether a walk of this front end may close facts of the whole program
+    /// ([`Self::closed`] may say `true`). The facts are made from everything the walk reached
+    /// ([`Self::reached`]), so a walk patched from a kept one, which tells only what changed,
+    /// is for a front end that says `false`. The default is `true`.
+    fn closes(&self) -> bool {
+        true
+    }
+
     /// Told that the walk has reached everything it was told of ([`Self::reached`]), with
     /// no error: `true` when what it reached closes facts of the whole program its bodies are
     /// to be described and built against from now on (a final binary's trait objects, which

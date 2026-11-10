@@ -698,12 +698,17 @@ impl<'db> HirFrontend<'db> {
         instance: &HirInstance,
         requester: &Origin,
     ) -> &'db Memoed {
-        let world = self.devirt.world().and_then(|world| match self.walking(db, instance) {
-            Ok(walking) => walking.world,
-            Err(_) => Some(world),
-        });
+        let world = self.key_world(db, instance);
         // clone: the query's key by value, a few `Copy` ids in a `Clone`-only type
         described_memo(db, instance.clone(), *requester, self.facing(world))
+    }
+
+    /// The world a describe of `instance` is keyed by ([`Self::memoed`]).
+    fn key_world(&self, db: &Db, instance: &HirInstance) -> Option<DevirtWorld> {
+        self.devirt.world().and_then(|world| match self.walking(db, instance) {
+            Ok(walking) => walking.world,
+            Err(_) => Some(world),
+        })
     }
 
     /// The describes the walks over this front end's database and configuration kept
@@ -1124,8 +1129,44 @@ impl Frontend for HirFrontend<'_> {
     }
 
     fn counted(&self, functions: &[(HirInstance, Origin)]) -> Vec<Counted> {
-        // alloc: once a level of the walk, sized by it
-        self.with(|db| functions.iter().map(|(instance, _)| counted(db, &instance.0)).collect())
+        self.with(|db| {
+            // clone: the query's key by value, a few `Copy` ids in a `Clone`-only type
+            let counted = |(instance, _): &(HirInstance, Origin)| {
+                counted_memo(db, instance.clone(), ())
+            };
+            // alloc: once a level of the walk, sized by it
+            functions.iter().map(counted).collect()
+        })
+    }
+
+    /// Durable when both of its memos are current and of library inputs alone (the query
+    /// engine's `durable`), and its describe is the database's: one of a body that names a
+    /// file is the build's each time. Asked after the walk described and counted it.
+    fn durable(&self, instance: &HirInstance, requester: &Origin) -> bool {
+        self.with(|db| {
+            let facing = self.facing(self.key_world(db, instance));
+            // clone: the queries' keys by value, a few `Copy` ids in a `Clone`-only type
+            matches!(self.memoed(db, instance, requester), Memoed::Described(_))
+                && described_memo::durable(db, instance.clone(), *requester, facing)
+                && counted_memo::durable(db, instance.clone(), ())
+        })
+    }
+
+    /// The view the last write of a library input opened in the database
+    /// (`Storage::durable_view`).
+    fn durable_view(&self) -> Option<u64> {
+        let storage = blaze_query::db::Database::storage(self.databases.db);
+        Some(storage.durable_view().as_u64())
+    }
+
+    /// A walk closes dyn facts only where some body takes the program's world
+    /// ([`super::devirt::takes_world`]), which needs a unit that MIR-inlines: with none of
+    /// any origin (a dev build), or an origin whose plan fails, it closes none.
+    fn closes(&self) -> bool {
+        match &self.units {
+            Some(units) => units.inlines.values().any(|it| *it != Ok(false)),
+            None => true,
+        }
     }
 
     fn spell(&self, instance: &HirInstance) -> String {
@@ -1149,6 +1190,14 @@ impl Frontend for HirFrontend<'_> {
 
 /// The domain of the body a shim is an instance of, for the walk's recursion limit.
 const SHIM_BODY_DOMAIN: &str = "blaze v2 recursion shim body 2";
+
+/// [`counted`] of `instance`, kept by the database: with its describe's memo, what tells a
+/// function whose every input is a library's ([`Frontend::durable`]). The unit argument makes
+/// the key an interned one, as an instance is no ID.
+#[blaze_query::tracked(returns(copy))]
+fn counted_memo(db: &Db, instance: HirInstance, _alone: ()) -> Counted {
+    counted(db, &instance.0)
+}
 
 /// What the build's walk reads of `kind` for rustc's recursion limit ([`Counted`]).
 fn counted(db: &Db, kind: &Kind) -> Counted {

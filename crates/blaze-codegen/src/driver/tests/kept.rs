@@ -66,6 +66,12 @@ enum Plant {
     RemovedRef,
     /// The engine sees no change of a dyn fact ([`Engine::misses_facts`]).
     DynFact,
+    /// The driver patches a changed function whatever its shape
+    /// ([`Build::patching_any_shape`]).
+    AnyShape,
+    /// The driver leaves the places that named a changed function's old key
+    /// ([`Build::without_renaming`]).
+    Unrenamed,
 }
 
 /// The program's functions, in order: a draw picks among them the same way every run.
@@ -178,6 +184,8 @@ fn apply(
         }
         Edit::DynFact => set_fact(program, pick(a), pick(b)),
         Edit::Limit => {
+            // The limit is every function's crate's: a durable input.
+            program.engine.high += 1;
             program.recursion_limit = match b % 4 {
                 0 => None,
                 limit => Some(limit),
@@ -204,7 +212,12 @@ fn built(
         Some(kept) => build.keeping(kept),
         None => build,
     };
-    let mut build = if plant == Some(Plant::Unasked) { build.trusting_kept() } else { build };
+    let mut build = match plant {
+        Some(Plant::Unasked) => build.trusting_kept(),
+        Some(Plant::AnyShape) => build.patching_any_shape(),
+        Some(Plant::Unrenamed) => build.without_renaming(),
+        _ => build,
+    };
     build.run_with_statics(&[(1, member())], static_roots, &check, &store)
 }
 
@@ -269,8 +282,11 @@ fn difference(
     same!(stats.instances);
     same!(stats.statics);
     same!(walk.reached);
-    // Every function a round reached was described or taken from the kept walk, once.
-    if kept.walk.described + kept.walk.verified != fresh.walk.described {
+    // Every function a round of a whole walk reached was described or taken from the kept
+    // walk, once; a patched walk asks only of what is not durable.
+    if kept.walk.whole.is_some()
+        && kept.walk.described + kept.walk.verified != fresh.walk.described
+    {
         return Some(format!(
             "the walk over kept describes asked for {} describes and took {} kept, where the \
              fresh walk described {}",
@@ -391,7 +407,11 @@ fn drawn(tc: &hegel::TestCase) -> (Program, Run) {
         match kind {
             0 => (function.foreign, function.over_editable) = (true, true),
             1 => function.foreign = true,
-            2 => function.origin = Origin::Dependency(Package::new("dep")),
+            2 => {
+                function.origin = Origin::Dependency(Package::new("dep"));
+                // A dependency's function reads library inputs alone.
+                program.engine.durable.insert(id);
+            }
             _ => {}
         }
     }
@@ -497,6 +517,11 @@ fn tree(count: u32) -> Program {
     program
 }
 
+/// A walk's describes, kept describes taken, functions and functions dropped.
+fn counts(walk: &Walk) -> (usize, usize, usize, usize) {
+    (walk.described, walk.verified, walk.reached, walk.dropped)
+}
+
 fn describes(program: &Program) -> (usize, usize) {
     let engine = &program.engine;
     (engine.describes.load(Ordering::Relaxed), engine.verifies.load(Ordering::Relaxed))
@@ -519,21 +544,21 @@ fn an_edit_of_one_leaf_describes_it_alone() {
         (walk, (after.0 - before.0, after.1 - before.1))
     };
     let (first, asked) = walk(&program);
-    let fresh = Some(Fresh::Restart);
-    let all = Walk { described: COUNT, verified: 0, reached: COUNT, dropped: 0, fresh };
-    assert_eq!((first, asked), (all, (COUNT, 0)));
+    assert_eq!(counts(&first), (COUNT, 0, COUNT, 0));
+    assert_eq!((first.fresh, asked), (Some(Fresh::Restart), (COUNT, 0)));
+    assert!(first.whole.is_some(), "nothing was kept to patch");
     assert_eq!(kept.len(), COUNT);
 
     program.functions.get_mut(&(COUNT as u32)).expect("the last leaf").body = 0x12;
     program.touch(COUNT as u32);
     let (edited, asked) = walk(&program);
     // The leaf has a new key: the one of the walk before is the one function dropped.
-    let one = Walk { described: 1, verified: COUNT - 1, reached: COUNT, dropped: 1, fresh: None };
-    assert_eq!((edited, asked), (one, (1, COUNT - 1)));
+    assert_eq!(counts(&edited), (1, COUNT - 1, COUNT, 1));
+    assert_eq!((edited.fresh, edited.whole, asked), (None, None, (1, COUNT - 1)));
 
     let (again, asked) = walk(&program);
-    let none = Walk { described: 0, verified: COUNT, reached: COUNT, dropped: 0, fresh: None };
-    assert_eq!((again, asked), (none, (0, COUNT)));
+    assert_eq!(counts(&again), (0, COUNT, COUNT, 0));
+    assert_eq!((again.fresh, again.whole, asked), (None, None, (0, COUNT)));
 
     // A new function the leaf calls: the leaf, whose references changed, and the new one.
     program.function(COUNT as u32 + 1, 0x11, &[]);
@@ -541,18 +566,19 @@ fn an_edit_of_one_leaf_describes_it_alone() {
     program.functions.get_mut(&(COUNT as u32)).expect("the last leaf").calls.push(COUNT as u32 + 1);
     program.touch(COUNT as u32);
     let (grown, asked) = walk(&program);
-    assert_eq!((grown.described, grown.verified, grown.reached), (2, COUNT - 1, COUNT + 1));
-    assert_eq!(asked, (2, COUNT - 1));
+    // The patch asked of every function, found the leaf's shape another and gave way to the
+    // whole walk, which took the leaf's new describe as kept and described the new function.
+    assert!(grown.whole.is_some());
+    assert_eq!((grown.described, grown.verified, grown.reached), (1, COUNT, COUNT + 1));
+    assert_eq!(asked, (2, 2 * COUNT - 1));
 }
 
 /// A build given nothing to keep describes in describes everything and says so.
 #[test]
 fn a_build_that_keeps_no_walk_says_so() {
     let walk = built(&program(), WHOLE, None, None).unwrap_or_else(|e| panic!("{e:?}")).walk;
-    assert_eq!(
-        walk,
-        Walk { described: 5, verified: 0, reached: 5, dropped: 0, fresh: Some(Fresh::Unkept) }
-    );
+    assert_eq!(counts(&walk), (5, 0, 5, 0));
+    assert_eq!((walk.fresh, walk.whole), (Some(Fresh::Unkept), Some("the build keeps no walk")));
 }
 
 /// The two rounds of a walk over a program with dyn facts keep their describes apart: the
@@ -602,4 +628,77 @@ fn a_delta_names_a_function_whose_owner_alone_changed() {
     let again = built(&program, WHOLE, Some(&kept), None).unwrap_or_else(|e| panic!("{e:?}"));
     assert_eq!((again.id, again.delta.base), (after.id, Some(after.id)));
     assert!(again.delta.functions.is_empty() && again.delta.statics.is_empty());
+}
+
+/// The control of the patched walk's shape rule: `main` stops calling 3. A driver that
+/// patches a changed function whatever its shape gives `main` its new describe over its old
+/// places, so the walk still holds 3 and what it reaches; the oracle says so. The driver that
+/// holds the rule walks whole.
+#[test]
+fn the_oracle_catches_a_patch_that_keeps_a_changed_functions_old_references() {
+    let edits = [(Edit::RemoveRef, (0, 1))];
+    assert_eq!(first_difference(program(), WHOLE, &edits, None), None);
+    let found = first_difference(program(), WHOLE, &edits, Some(Plant::AnyShape))
+        .expect("the planted bug was not found");
+    assert!(found.starts_with("build 1: "), "{found}");
+}
+
+/// The control of the patched walk's renaming: an edit of 4's body gives it a new key, which
+/// 2's place must name. A driver that leaves the places that named the old key builds 2
+/// calling a function the build no longer holds; the oracle says so.
+#[test]
+fn the_oracle_catches_a_caller_that_names_a_changed_callees_old_key() {
+    let edits = [(Edit::Body, (3, 0))];
+    assert_eq!(first_difference(program(), WHOLE, &edits, None), None);
+    let found = first_difference(program(), WHOLE, &edits, Some(Plant::Unrenamed))
+        .expect("the planted bug was not found");
+    assert!(found.starts_with("build 1: "), "{found}");
+}
+
+/// The patched walk's work is the edit's: of 10,000 functions of which all but the last
+/// three are durable, an edit of the last leaf's body asks the front end of those three,
+/// describes one, and touches it and the one function that calls it. An edit that adds a
+/// call changes a function's shape: the walk runs whole and says why.
+#[test]
+fn a_leaf_edit_among_ten_thousand_functions_touches_the_leaf_and_its_caller() {
+    const COUNT: u32 = 10_000;
+    let mut program = tree(COUNT);
+    // Each under a name of its own, so none is merged with another of the same code and a
+    // change of one is a change of it alone.
+    for id in 2..=COUNT {
+        program.functions.get_mut(&id).expect("of the tree").symbol = Some(format!("f{id}"));
+    }
+    program.engine.durable.extend(1..=COUNT - 3);
+    let kept = Kept::new();
+    let walk = |program: &Program| {
+        program.begin_build();
+        let before = describes(program);
+        let built = built(program, WHOLE, Some(&kept), None);
+        let built = built.unwrap_or_else(|e| panic!("{e:?}"));
+        let after = describes(program);
+        (built, (after.0 - before.0, after.1 - before.1))
+    };
+    let (first, _) = walk(&program);
+    assert!(first.walk.whole.is_some());
+
+    program.functions.get_mut(&COUNT).expect("the last leaf").body = 0x12;
+    program.touch(COUNT);
+    let (edited, asked) = walk(&program);
+    assert_eq!(edited.walk.whole, None, "patched");
+    assert_eq!(counts(&edited.walk), (1, 2, COUNT as usize, 1));
+    assert_eq!(asked, (1, 2), "the front end described one function and verified two");
+    assert_eq!(edited.walk.visited, 2, "the leaf and the function that calls it");
+    let leaf = key_named(&edited, COUNT);
+    let changes = &edited.delta.functions;
+    assert_eq!((&changes.added, changes.removed.len()), (&vec![leaf], 1));
+    // Its caller's places name another key: its entry is another, its key the same.
+    assert_eq!(changes.changed, vec![key_named(&edited, COUNT / 2)]);
+
+    program.functions.get_mut(&COUNT).expect("the last leaf").calls.push(COUNT - 1);
+    program.touch(COUNT);
+    let (grown, _) = walk(&program);
+    assert_eq!(
+        grown.walk.whole,
+        Some("a changed function refers to other things or is another's")
+    );
 }
