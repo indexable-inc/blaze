@@ -91,7 +91,18 @@ const AFTER: Arg =
     Arg { name: "after", ty: ArgType::U64, default: Some("(SELECT max(build_id) FROM key_parts)") };
 
 // Each entry is a constant of its own (`const { .. }`): one evaluation scanning EXAMPLES for every
-// view at once ran past the const evaluator's step bound.
+// view at once is past `long_running_const_eval`'s 2,000,000 steps, and each block is at most
+// 125,000.
+// TODO(stage 0 after 332bdbe577): remove this `#[allow]` once .github/blaze-version names a
+// release cut after 332bdbe577 (a `const { .. }` block of a constant's value has its own count
+// of the lint's steps, as under rustc). The pinned 0.20261105.4 counts every block's steps as
+// `VIEWS`'s own and refuses it at the 32nd ("constant evaluation is taking a long time"); the
+// lint's level is read at `VIEWS`, so allowed here that release goes on.
+#[allow(
+    long_running_const_eval,
+    reason = "stage 0 (0.20261105.4) counts each block's steps as VIEWS's own; not `expect`: \
+              a blaze with 332bdbe577 never reaches the lint here"
+)]
 pub const VIEWS: &[View] = &[
     const { view("slowest_queries", &[BUILD, LIMIT]) },
     const { view("slower_between_commits", &[EARLIER, LATER, LIMIT]) },
