@@ -228,6 +228,31 @@ pub fn fetch<'db, F: Function>(db: &'db F::Db, key: F::Key) -> &'db F::Value {
     fetch_cold::<F>(db, key)
 }
 
+/// Whether the row of `key` is current in this view (verified, with its value) and durable:
+/// it read nothing below kind `HIGH` and made no untracked read. Such a row's value changes
+/// only in a view a `HIGH` write opens, so a caller that fetched it, saw `true` here and
+/// kept [`Storage::durable_view`] knows, for as long as that view is the same, that the row
+/// holds that value: no fetch, no verification. `false` for a row never run, not current
+/// (fetch it first), or of a lower kind. Records no read: for a caller outside any query.
+pub fn durable<F: Function>(db: &F::Db, key: F::Key) -> bool {
+    let storage = db.storage();
+    let id = key.as_id();
+    let dir = storage.dir(F::ingredient().index());
+    if dir.is_null() {
+        return false;
+    }
+    // SAFETY: a published directory is readable whole for `MAX_PAGES` entries
+    // (`Pages::dir`), and `id.page() < MAX_PAGES` (masked, `Id::page`); it lives as long
+    // as the storage. As [`fetch`].
+    let page = unsafe { &*dir.add(id.page()) }.load(Ordering::Acquire);
+    let Some(page) = NonNull::new(page) else { return false };
+    // SAFETY: the page was made for this function's rows, `id.slot() < PAGE_LEN`.
+    let row = unsafe { row_at::<RowOf<F>>(page, id.slot()) };
+    u64::from(row.header.verified.load(Ordering::Acquire)) == storage.clock()
+        && row.header.meta.load(Ordering::Relaxed) & UNTRACKED == 0
+        && row.header.durability() >= Durability::HIGH.0
+}
+
 /// Records a read of a row's current value into the running query, if any.
 #[inline(always)]
 fn read(storage: &Storage, header: &Header) {

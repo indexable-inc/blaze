@@ -26,7 +26,7 @@ use super::{
     input::field_node,
     owner_is,
     plumbing::{
-        CycleKind, Function, Ingredient, Input, Interned, Tag, Tracked, Vtable, evict_values,
+        CycleKind, Function, Ingredient, Input, Interned, Tag, Tracked, Vtable, durable, evict_values,
         evict_values_of, fetch, input_fields, input_new, input_new_singleton, input_read,
         input_set, input_singleton, intern, intern_by, interned_arguments, interned_fields,
         tracked_fields, tracked_new, value_hash,
@@ -406,6 +406,51 @@ fn a_write_of_a_lower_durability_skips_higher_rows() {
     file.set_a(&mut db, 3);
     assert_eq!(*get::<Double>(&db, library), 10, "now LOW, verified by its edges: unchanged");
     assert_eq!(db.runs("Double"), 2);
+}
+
+/// `plumbing::durable` says a current row read library inputs alone, and
+/// `Storage::durable_view` moves only with a write of kind `HIGH`: a holder that saw a row
+/// durable knows it holds its value while the durable view is the one it saw.
+#[test]
+fn a_durable_row_holds_its_value_while_the_durable_view_is_the_same() {
+    let mut db = TestDb::new();
+    let library = Cell::of(&db, 4, 0, Durability::HIGH);
+    let file = Cell::new(&db, 1, 0);
+    assert!(!durable::<Double>(&db, library), "never run");
+    assert_eq!(*get::<Double>(&db, library), 8);
+    assert_eq!(*get::<Double>(&db, file), 2);
+    assert!(durable::<Double>(&db, library));
+    assert!(!durable::<Double>(&db, file), "it read a LOW input");
+    let seen = db.storage().durable_view();
+
+    file.set_a(&mut db, 2);
+    assert_eq!(db.storage().durable_view(), seen, "a LOW write leaves the durable view");
+    assert!(!durable::<Double>(&db, library), "not current until it is fetched in this view");
+    assert_eq!(*get::<Double>(&db, library), 8);
+    assert_eq!(db.runs("Double"), 2, "the library's row never ran again");
+    assert!(durable::<Double>(&db, library));
+
+    library.set_a(&mut db, 5);
+    assert_ne!(db.storage().durable_view(), seen, "a HIGH write moves it");
+    assert_eq!(db.storage().durable_view(), db.storage().view());
+    assert_eq!(*get::<Double>(&db, library), 10);
+    assert!(durable::<Double>(&db, library));
+}
+
+/// A row whose value was let go is not current: `durable` says no until a fetch makes the
+/// value again, and the durable view is untouched by the eviction.
+#[test]
+fn a_durable_row_whose_value_was_evicted_is_not_current() {
+    let mut db = TestDb::new();
+    let library = Cell::of(&db, 4, 0, Durability::HIGH);
+    let value = *get::<Tens>(&db, library);
+    assert!(durable::<Tens>(&db, library));
+    let seen = db.storage().durable_view();
+    assert_eq!(evict_values::<Tens>(&mut db), 1);
+    assert_eq!(db.storage().durable_view(), seen);
+    assert!(!durable::<Tens>(&db, library));
+    assert_eq!(*get::<Tens>(&db, library), value);
+    assert!(durable::<Tens>(&db, library));
 }
 
 #[test]

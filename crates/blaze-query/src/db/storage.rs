@@ -232,6 +232,9 @@ pub struct Storage {
     opened: u64,
     /// The last view an input of each kind or above changed in.
     last_changed: [u32; Durability::KINDS],
+    /// `opened` as the last write of kind `HIGH` left it: never renumbered, so a holder that
+    /// kept it across views compares it ([`Storage::durable_view`]).
+    high_opened: u64,
     /// `written[i]`: the OR of the [`input_bits`] of every field written in the last `i + 1`
     /// views.
     written: [Summary; HISTORY],
@@ -322,6 +325,7 @@ impl Storage {
             view,
             opened: u64::from(view),
             last_changed: [view; Durability::KINDS],
+            high_opened: u64::from(view),
             written: [[0; 2]; HISTORY],
             dirs,
             tables,
@@ -358,6 +362,16 @@ impl Storage {
     #[inline]
     pub fn view(&self) -> View {
         View(self.opened)
+    }
+
+    /// The view the last write of kind `HIGH` opened ([`Storage::view`]'s numbering, never
+    /// renumbered): while it is what a holder saw, no library input or frozen table was
+    /// written, so every row that was durable then ([`plumbing::durable`](super::plumbing))
+    /// still holds its value, with no look at the row. A storage made anew (a restart, an
+    /// image loaded) is another storage: a holder keeps the view with which storage it is of.
+    #[inline]
+    pub fn durable_view(&self) -> View {
+        View(self.high_opened)
     }
 
     /// What a current row's `verified` equals, or a word no row has once readers are stopped.
@@ -586,6 +600,9 @@ impl Storage {
         self.next_view(written);
         for kind in &mut self.last_changed[..=durability.0 as usize] {
             *kind = self.view;
+        }
+        if durability.0 >= Durability::HIGH.0 {
+            self.high_opened = self.opened;
         }
         self.settle();
         self.sweep();

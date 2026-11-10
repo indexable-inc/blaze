@@ -60,7 +60,9 @@ pub mod plumbing {
     pub use blaze_mem::Tag;
 
     pub use super::{
-        function::{CycleKind, Function, MAX_ROUNDS, evict_values, evict_values_of, fetch},
+        function::{
+            CycleKind, Function, MAX_ROUNDS, durable, evict_values, evict_values_of, fetch,
+        },
         ingredient::{Ingredient, Kind, Vtable},
         input::{
             Input, InputSetter, input_fields, input_new, input_new_singleton, input_read,
