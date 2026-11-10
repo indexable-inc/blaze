@@ -312,6 +312,20 @@ impl Draft {
         self.insert("");
     }
 
+    /// Leave an aside: the spaces the draft starts with go (they are what makes it one, [`is_aside`]), what follows
+    /// stays as an ordinary message, the caret and selection keeping their place in it. Whether it was one.
+    fn leave_aside(&mut self) -> bool {
+        let n = self.text.len() - self.text.trim_start_matches(' ').len();
+        if n == 0 {
+            return false;
+        }
+        let (caret, anchor) = (self.caret.saturating_sub(n), self.anchor.saturating_sub(n));
+        (self.caret, self.anchor) = (0, n);
+        self.insert("");
+        (self.caret, self.anchor) = (caret, anchor);
+        true
+    }
+
     /// What a press at byte `i` selects by `unit`: nothing (the caret there), its word, or its line.
     fn span(&self, i: usize, unit: Unit) -> (usize, usize) {
         match unit {
@@ -969,7 +983,7 @@ fn empty_value(v: &Value) -> bool {
             "text" => blank("v"),
             "error" => blank("stack") && blank("message"),
             "scalar" => false,
-            "browser" => v["view"].as_u64().is_none_or(|n| n == 0),
+            "browser" => genui::browser_view_id(&v["view"]).is_none(),
             _ => true,
         },
     }
@@ -1328,25 +1342,70 @@ fn word_around(s: &str, i: usize) -> (usize, usize) {
     }
 }
 
-/// The words of a row a selection can cover, in reading order: each one's path below the row, what it is given (as
-/// [`fill_row`] gives it) and whether it is inline markdown.
-fn texts(r: &Row) -> Vec<(&'static [&'static str], String, bool)> {
+/// Words of a row a selection can cover ([`texts`]): the node that draws them, what it is given (as [`fill_row`] gives
+/// it), and how a copy takes them.
+#[derive(Clone, Debug, PartialEq)]
+struct Words {
+    /// The node that draws them: its part names below the row, a `/` apart. None ("") when no node of their own draws
+    /// them (a drawn control's label): a selection is not placed in them, a copy that covers them takes them.
+    path: std::borrow::Cow<'static, str>,
+    /// The node that draws them while `path`'s is not made (a table's cell while the table is stacked); "" when none.
+    alt: std::borrow::Cow<'static, str>,
+    /// What the node is given, and whether that is inline markdown.
+    src: String,
+    md: bool,
+    /// What a copy that covers them whole takes when it is not what they show (a table cell's url, shown as its host).
+    full: Option<String>,
+    /// What a copy puts between them and the words before them in their row.
+    sep: &'static str,
+    /// A table's cell: a copy keeps its place when it is empty, so the columns after it stay theirs.
+    cell: bool,
+}
+
+impl Words {
+    /// Words the node at `path` draws, a space after the ones before them.
+    fn at(path: impl Into<std::borrow::Cow<'static, str>>, src: impl Into<String>, md: bool) -> Self {
+        Self { path: path.into(), alt: "".into(), src: src.into(), md, full: None, sep: " ", cell: false }
+    }
+
+    /// The node under `row` that draws them, if it is made.
+    fn node<'a>(&self, row: View<'a>) -> Option<View<'a>> {
+        let at = |path: &str| if path.is_empty() { None } else { path.split('/').try_fold(row, |v, n| v.part(n)) };
+        at(&self.path).or_else(|| at(&self.alt))
+    }
+}
+
+/// The words of a row a selection can cover, in reading order.
+fn texts(r: &Row) -> Vec<Words> {
     match r {
-        Row::User(s, ..) => vec![(&["bubble", "text"], s.clone(), false)],
-        Row::Prose(s) | Row::Heading(_, s) | Row::Quote(s) => vec![(&["text"], s.clone(), true)],
-        Row::ListItem { mark, text, .. } => vec![(&["mark"], mark.clone(), false), (&["text"], text.clone(), true)],
-        Row::Code { text, .. } => vec![(&["card", "text"], text.clone(), false)],
-        Row::Tool { shown: Shown::Full, input, result, .. } => vec![
-            (&["body", "input"], input.clone(), false),
-            (&["body", "result"], tool_result(result).to_owned(), false),
-        ],
-        Row::Thinking { open: true, text, .. } => vec![(&["body", "text"], text.trim().to_owned(), false)],
-        Row::Note(s) | Row::Error(s) => vec![(&["text"], s.clone(), false)],
+        Row::User(s, ..) => vec![Words::at("bubble/text", s.clone(), false)],
+        Row::Prose(s) | Row::Heading(_, s) | Row::Quote(s) => vec![Words::at("text", s.clone(), true)],
+        Row::ListItem { mark, text, .. } => vec![Words::at("mark", mark.clone(), false), Words::at("text", text.clone(), true)],
+        Row::Code { text, .. } => vec![Words::at("card/text", text.clone(), false)],
+        Row::Tool { shown: Shown::Full, input, result, .. } => {
+            vec![Words::at("body/input", input.clone(), false), Words::at("body/result", tool_result(result), false)]
+        }
+        Row::Thinking { open: true, text, .. } => vec![Words::at("body/text", text.trim(), false)],
+        Row::Note(s) | Row::Error(s) => vec![Words::at("text", s.clone(), false)],
         Row::Out(o) => o.texts(),
-        Row::Steps(_) | Row::Tool { .. } | Row::Thinking { .. } | Row::Grid { .. } | Row::Table(_) | Row::Ui { .. } | Row::Pictures(..) | Row::RefCard(_) | Row::Math(_) => {
+        // What a cell drew: each element's own words (genui.rs `texts`).
+        Row::Ui { v, .. } => genui::texts(v),
+        Row::Steps(_) | Row::Tool { .. } | Row::Thinking { .. } | Row::Grid { .. } | Row::Table(_) | Row::Pictures(..) | Row::RefCard(_) | Row::Math(_) => {
             Vec::new()
         }
     }
+}
+
+/// Words cut for a copy (each with its [`Words::sep`]) as one text: each after its separator, the first after none.
+fn joined<'a>(bits: impl IntoIterator<Item = (&'a str, &'a str)>) -> String {
+    let mut out = String::new();
+    for (k, (sep, s)) in bits.into_iter().enumerate() {
+        if k > 0 {
+            out.push_str(sep);
+        }
+        out.push_str(s);
+    }
+    out
 }
 
 /// A tool's result as its open row shows it (an ellipsis while it has none).
@@ -1389,11 +1448,11 @@ fn covered(lo: Spot, hi: Spot, row: usize, part: usize, len: usize) -> Option<(u
     Some((a, b))
 }
 
-/// A row selected only whole (a table, search results, a drawn card): no words of its own to place a selection in,
+/// A row selected only whole (a table, search results, a drawn chart): no words of its own to place a selection in,
 /// copied as [`Row::markdown`]. A selection takes it when it reaches past its middle: its one place is `at` 0 (above
 /// the middle) or 1 (below), in part 0.
 fn atomic(r: &Row) -> bool {
-    texts(r).is_empty() && r.markdown().is_some_and(|m| !m.trim().is_empty())
+    texts(r).iter().all(|t| t.path.is_empty()) && r.markdown().is_some_and(|m| !m.trim().is_empty())
 }
 
 /// Whether the selection `lo..hi` takes atomic row `row` whole.
@@ -1438,30 +1497,37 @@ fn transcript_text(rows: &[(String, Row)], lo: Spot, hi: Spot) -> String {
     let mut out = String::new();
     let mut last: Option<&Row> = None;
     for (i, (_, r)) in rows.iter().enumerate().take(hi.row + 1).skip(lo.row) {
-        let mut whole = true;
-        let mut bits = Vec::new();
-        for (k, (_, src, md)) in texts(r).iter().enumerate() {
-            let s = shown(src, *md);
-            let n = units(&s);
-            let Some((a, b)) = covered(lo, hi, i, k, n) else {
-                whole = false;
-                continue;
-            };
-            whole &= a == 0 && b == n;
-            if a < b {
-                bits.push(shown_cut(src, *md, a, b));
-            }
-        }
         // A row with no words to select (a table) is taken whole when the selection reaches past its middle.
-        let piece = if bits.is_empty() {
-            match r.markdown().filter(|_| atomic(r) && takes_whole(lo, hi, i)) {
+        let piece = if atomic(r) {
+            match r.markdown().filter(|_| takes_whole(lo, hi, i)) {
                 Some(md) => md,
                 None => continue,
             }
-        } else if whole {
-            r.markdown().unwrap_or_else(|| bits.join("\n"))
         } else {
-            bits.join(" ")
+            let mut whole = true;
+            let mut bits: Vec<(&str, String)> = Vec::new(); // alloc: the words one copy takes of a row
+            for (k, t) in texts(r).iter().enumerate() {
+                let n = units(&shown(&t.src, t.md));
+                let Some((a, b)) = covered(lo, hi, i, k, n) else {
+                    whole = false;
+                    continue;
+                };
+                whole &= a == 0 && b == n;
+                if a < b {
+                    let all = t.full.clone().filter(|_| a == 0 && b == n);
+                    bits.push((t.sep, all.unwrap_or_else(|| shown_cut(&t.src, t.md, a, b))));
+                } else if t.cell && n == 0 {
+                    bits.push((t.sep, String::new()));
+                }
+            }
+            if bits.iter().all(|(_, s)| s.is_empty()) {
+                continue;
+            }
+            match r.markdown().filter(|_| whole) {
+                Some(md) => md,
+                None if whole => bits.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join("\n"),
+                None => joined(bits.iter().map(|(sep, s)| (*sep, s.as_str()))),
+            }
         };
         if let Some(prev) = last {
             let list = matches!(prev, Row::ListItem { .. }) && matches!(r, Row::ListItem { .. });
@@ -1471,6 +1537,11 @@ fn transcript_text(rows: &[(String, Row)], lo: Spot, hi: Spot) -> String {
         last = Some(r);
     }
     out
+}
+
+/// How far across `x` is from `l` (0 over it).
+fn across(l: &Laid, x: f32) -> f32 {
+    if x < l.x { l.x - x } else { (x - (l.x + l.w)).max(0.0) }
 }
 
 /// Words node `e` laid out as the painter draws it (its lines broken at its laid width), and where it is (window points).
@@ -1725,20 +1796,22 @@ impl App {
                         g.set(f);
                     }
                 }
-                if atomic(&rows[i].1) {
+                let words = texts(&rows[i].1);
+                if words.iter().all(|t| t.path.is_empty()) && atomic(&rows[i].1) {
                     let whole = sel.is_some_and(|(lo, hi)| takes_whole(lo, hi, i));
                     select_all_words(row.entity(), whole);
                 }
-                let arrive = arrives.get(rows[i].0.as_str()).copied();
-                for (k, (path, src, md)) in texts(&rows[i].1).iter().enumerate() {
-                    let Some(node) = path.iter().try_fold(row, |v, n| v.part(n)) else { continue };
+                // What a cell drew is there at once: only a reply's words stream in.
+                let arrive = arrives.get(rows[i].0.as_str()).copied().filter(|_| !matches!(rows[i].1, Row::Ui { .. }));
+                for (k, t) in words.iter().enumerate() {
+                    let Some(node) = t.node(row) else { continue };
                     let e = node.entity();
                     match arrive {
                         Some(a) if e.try_cloned::<&GlyphsArrive>() != Some(a) => _ = e.set(a),
                         None if e.has(GlyphsArrive::id()) => _ = e.remove(GlyphsArrive::id()),
                         _ => {}
                     }
-                    let range = sel.and_then(|(lo, hi)| covered(lo, hi, i, k, units(&shown(src, *md))));
+                    let range = sel.and_then(|(lo, hi)| covered(lo, hi, i, k, units(&shown(&t.src, t.md))));
                     match range.filter(|(a, b)| a < b) {
                         Some((a, b)) => {
                             let te = TextEdit { caret: b as u32, anchor: a as u32, ..TextEdit::default() };
@@ -2458,6 +2531,20 @@ impl App {
         closed
     }
 
+    /// The focused chat's draft, an aside, made an ordinary message ([`Draft::leave_aside`]); with `at_start`, only
+    /// while its caret is before the space with nothing selected. Whether it was.
+    fn chat_leave_aside(&mut self, at_start: bool) -> bool {
+        let Some((_, _, sid)) = self.focused_chat() else { return false };
+        let left = self.chat.borrow_mut().get_mut(&sid).is_some_and(|st| {
+            let d = &mut st.draft;
+            d.marked.is_none() && (!at_start || (d.caret == 0 && d.anchor == 0)) && d.leave_aside()
+        });
+        if left {
+            self.poke();
+        }
+        left
+    }
+
     /// An aside card's close button (`chat:aside_close:<sid>`): chat `sid`'s aside closed.
     pub(in crate::app) fn chat_aside_dismiss(&mut self, rest: &str) {
         let Ok(sid) = rest.parse::<u64>() else {
@@ -2495,6 +2582,12 @@ impl App {
         // Escape closes the picker's menu, what a cell floats over the transcript (a popover, a menu, a dialog), and an
         // aside's card, before it interrupts.
         if op == "interrupt" && (self.chat_pick_close() || self.genui_escape() || self.chat_aside_close() || self.chat_ctx_close()) {
+            return;
+        }
+        // Then Escape leaves an aside being written, and so does Backspace with the caret before its space, where there
+        // is nothing to erase and the space, unseen while the hint shows, could not be found: the draft is an ordinary
+        // message again.
+        if matches!(op, "interrupt" | "backspace") && !self.renaming() && !self.genui_editing() && self.chat_leave_aside(op == "backspace") {
             return;
         }
         let Some((_, _, sid)) = self.focused_chat() else { return };
@@ -2737,7 +2830,7 @@ impl App {
                 if let Some(list) = list {
                     let root = list.id();
                     w.new_query::<&TextEdit>().each_entity(|e, te| {
-                        if te.anchor != te.caret && std::iter::successors(e.parent(), |n| n.parent()).take(16).any(|n| *n.id() == root) {
+                        if te.anchor != te.caret && std::iter::successors(e.parent(), |n| n.parent()).take(32).any(|n| *n.id() == root) {
                             hit.push(*e.id());
                         }
                     });
@@ -2896,17 +2989,28 @@ impl App {
                 last = Some(Spot { row: i, part: 0, at: 1 });
                 continue;
             }
-            for (k, (path, src, md)) in texts(&rows[i].1).iter().enumerate() {
-                let Some(node) = path.iter().try_fold(row, |v, n| v.part(n)) else { continue };
-                let Some(l) = node.entity().try_cloned::<&Laid>() else { continue };
+            // The row's words that are drawn: which they are, their node, where it is and how long they are.
+            let parts: Vec<(usize, View<'_>, Laid, usize)> = texts(&rows[i].1)
+                .iter()
+                .enumerate()
+                .filter_map(|(k, t)| {
+                    let node = t.node(row)?;
+                    let l = node.entity().try_cloned::<&Laid>()?;
+                    Some((k, node, l, units(&shown(&t.src, t.md))))
+                })
+                .collect(); // alloc: one row's words, for this press or move
+            // Words side by side (a table's cells, a list item's mark and text): of those on the pointer's line, the ones
+            // under it, else the nearest across.
+            let on_line = parts.iter().filter(|p| p.2.y <= y && y < p.2.y + p.2.h).min_by(|a, b| across(&a.2, x).total_cmp(&across(&b.2, x)));
+            if let Some(&(k, node, ..)) = on_line {
+                let (lay, l) = words_layout(&mut self.paint.borrow_mut(), node.entity())?;
+                return Some(Spot { row: i, part: k, at: lay.index_at(x - l.x, y - l.y) });
+            }
+            for &(k, _, l, n) in &parts {
                 if y < l.y {
                     return Some(Spot { row: i, part: k, at: 0 });
                 }
-                if y < l.y + l.h {
-                    let (lay, l) = words_layout(&mut self.paint.borrow_mut(), node.entity())?;
-                    return Some(Spot { row: i, part: k, at: lay.index_at(x - l.x, y - l.y) });
-                }
-                last = Some(Spot { row: i, part: k, at: units(&shown(src, *md)) });
+                last = Some(Spot { row: i, part: k, at: n });
             }
         }
         last
@@ -2918,7 +3022,7 @@ impl App {
             let whole = (Spot { at: 0, ..s }, Spot { at: 1, ..s });
             return if unit == Unit::Cell { (s, s) } else { whole };
         }
-        let text = rows.get(s.row).and_then(|(_, r)| texts(r).into_iter().nth(s.part)).map(|(_, src, md)| shown(&src, md));
+        let text = rows.get(s.row).and_then(|(_, r)| texts(r).into_iter().nth(s.part)).map(|t| shown(&t.src, t.md));
         let Some(t) = text else { return (s, s) };
         match unit {
             Unit::Cell => (s, s),
@@ -3049,8 +3153,8 @@ impl App {
     /// Option-press opens it outside ([`App::open_target`]). A component that cannot open says why in the log, naming it.
     fn chat_open_at(&mut self, sid: u64, s: Spot) {
         let rows = self.chat_rows(sid);
-        let Some((_, src, true)) = rows.get(s.row).and_then(|(_, r)| texts(r).into_iter().nth(s.part)) else { return };
-        let m = harness_native_render::markdown::inline(&src);
+        let Some(t) = rows.get(s.row).and_then(|(_, r)| texts(r).into_iter().nth(s.part)).filter(|t| t.md) else { return };
+        let m = harness_native_render::markdown::inline(&t.src);
         let w = self.world.world_ref();
         let target = if let Some(t) = m.tags.iter().find(|t| (t.start..t.end).contains(&s.at)) {
             let home = std::env::var("HOME").unwrap_or_default();
@@ -3934,6 +4038,28 @@ mod tests {
 
     /// What of a block still streaming may show: whole words, never a bold run or code span still open, never a line that
     /// so far only opens a list item, a heading or a fence; all of it once done.
+    /// An aside is left by taking the spaces it starts with: what follows stays, the caret keeps its place in it, and a
+    /// draft that is no aside is left alone.
+    #[test]
+    fn leaving_an_aside_keeps_the_words() {
+        let mut d = Draft { text: "  why".into(), caret: 4, anchor: 4, ..Draft::default() };
+        assert!(d.leave_aside());
+        assert_eq!((d.text.as_str(), d.caret, d.anchor), ("why", 2, 2));
+        assert!(!d.leave_aside());
+        let mut blank = Draft { text: " ".into(), ..Draft::default() };
+        assert!(blank.leave_aside());
+        assert_eq!((blank.text.as_str(), blank.caret), ("", 0));
+    }
+
+    /// A page's card is drawn whether the kernel names its view in digits (as it does) or as a number.
+    #[test]
+    fn a_browser_card_takes_the_kernels_view_id() {
+        assert!(!empty_value(&serde_json::json!({"t": "browser", "view": "4", "url": "https://x", "title": ""})));
+        assert!(!empty_value(&serde_json::json!({"t": "browser", "view": 4})));
+        assert!(empty_value(&serde_json::json!({"t": "browser", "view": "0"})));
+        assert!(empty_value(&serde_json::json!({"t": "browser", "view": "x"})));
+    }
+
     #[test]
     fn streaming_words_show_only_what_more_cannot_change() {
         fn at(t: &str) -> &str {
@@ -4233,5 +4359,38 @@ mod tests {
         assert_eq!(transcript_text(&rows, at(0, 0, 4), at(2, 1, 3)), "h\u{e9}llo there\n\n- one\n- two");
         assert_eq!(transcript_text(&rows, at(1, 0, 0), at(3, 0, 2)), "- one\n- two\n\nfn");
         assert_eq!(transcript_text(&rows, at(3, 0, 0), at(3, 0, 12)), "```rs\nfn main() {}\n```");
+    }
+
+    /// A copy across a drawn table's cells takes them a tab apart and its rows a line apart, an empty cell keeping its
+    /// place; a url cell covered whole is its url, cut it is what shows; a card with no words of its own is taken whole.
+    #[test]
+    fn a_drawn_table_copies_as_tabbed_cells() {
+        let ui = serde_json::json!({"type": "Column", "props": {}, "children": [
+            {"type": "Text", "props": {"text": "Cafes"}, "children": []},
+            {"type": "Table", "props": {"columns": ["place", "away", "site"], "rows": [
+                {"place": "Onda", "away": "", "site": "https://www.onda.example/menu"},
+                {"place": "Tide", "away": "4 min", "site": null}]}, "children": []},
+            {"type": "Button", "props": {"label": "More"}, "children": []}]});
+        let words = genui::texts(&ui);
+        let paths: Vec<&str> = words.iter().map(|t| &*t.path).collect();
+        assert_eq!(paths[..3], ["body/g0/g0", "body/g0/g1/card/grid/scroll/inner/head/c0/text", "body/g0/g1/card/grid/scroll/inner/head/c1/text"]);
+        assert_eq!(&*words[4].path, "body/g0/g1/card/grid/scroll/inner/body/r0/c0/text");
+        assert_eq!((&*words[4].alt, &*words[5].alt), ("body/g0/g1/card/grid/stack/s0/title", "body/g0/g1/card/grid/stack/s0/fields/f1/value"));
+        assert_eq!(words.last().map(|t| (&*t.path, t.src.as_str())), Some(("", "More")), "a control's label is copied, not placed");
+        let rows = vec![("i0".to_owned(), Row::Ui { v: Arc::new(ui), cell: String::new(), block: String::new(), code: false })];
+        let at = |part, at| Spot { row: 0, part, at };
+        // From the header's second cell to the middle of the last row's first.
+        assert_eq!(transcript_text(&rows, at(2, 0), at(7, 2)), "away\tsite\nOnda\t\thttps://www.onda.example/menu\nTi");
+        // Inside the url cell: its host, as it shows.
+        assert_eq!(transcript_text(&rows, at(6, 0), at(6, 4)), "onda");
+        // Everything: the same words, whole.
+        assert_eq!(
+            transcript_text(&rows, at(0, 0), at(10, 4)),
+            "Cafes\nplace\taway\tsite\nOnda\t\thttps://www.onda.example/menu\nTide\t4 min\tnull\nMore"
+        );
+        let button = serde_json::json!({"type": "Button", "props": {"label": "Go"}, "children": []});
+        let only = Row::Ui { v: Arc::new(button), cell: String::new(), block: String::new(), code: false };
+        assert!(atomic(&only), "no words of its own to place a selection in");
+        assert_eq!(only.markdown().as_deref(), Some("Go"));
     }
 }

@@ -53,6 +53,8 @@ SERVER = "https://cef-builds.spotifycdn.com/"
 FRAMEWORK = "Chromium Embedded Framework.framework"
 APP = "Harness Browser"
 BUNDLE_ID = "inc.indexable.harness.browser"
+# What macOS shows when it asks the person to let the browser read where the Mac is.
+LOCATION_WHY = "Pages you open in harness, and agents you ask, can use where this Mac is."
 # CEF's helper kinds on macOS: the suffix Chromium appends to the helper's name, and our bundle id's. No "(Alerts)"
 # helper: it exists only to post macOS notifications, which the host turns off (harness-browser/src/handlers.rs), and its
 # first launch makes macOS ask the person for notification permission. Anything that still asks for it fails to launch.
@@ -180,6 +182,10 @@ def info_plist(name: str, ident: str) -> bytes:
             "LSMinimumSystemVersion": "13.0",
             # No Dock icon and no menu bar: the host draws nothing of its own but the manage window.
             "LSUIElement": True,
+            # Chromium reads the Mac's position through Core Location, which answers only an app whose plist says
+            # why: without these a page's navigator.geolocation (and ts location()) times out and macOS never asks.
+            "NSLocationUsageDescription": LOCATION_WHY,
+            "NSLocationWhenInUseUsageDescription": LOCATION_WHY,
             "NSPrincipalClass": "NSApplication",
             "NSSupportsAutomaticGraphicsSwitching": True,
         }

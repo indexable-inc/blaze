@@ -120,6 +120,10 @@ pub enum KernelUp {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         url: Option<String>,
     },
+    /// Where the Mac is now, from macOS's Core Location (the host is the app macOS asks the person about; the first
+    /// request makes it ask). Answered by [`KernelDown::Location`], or [`KernelDown::Error`] saying why not (Location
+    /// Services off, the host refused, no fix in time): nothing else is tried.
+    Location { req: u64 },
 }
 
 /// The host's message to a socket client.
@@ -136,6 +140,17 @@ pub enum KernelDown {
     Closed { view: u64, why: String },
     Views { req: u64, views: Vec<ViewInfo> },
     Extensions { req: u64, extensions: Vec<Extension> },
+    /// Where the Mac is ([`KernelUp::Location`]): degrees, the radius Core Location is sure of in metres, the altitude
+    /// in metres when it has one, and when the fix was taken (Unix ms).
+    Location {
+        req: u64,
+        latitude: f64,
+        longitude: f64,
+        accuracy_m: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        altitude_m: Option<f64>,
+        at_ms: u64,
+    },
     /// A request with nothing else to say is done.
     Done { req: u64 },
     /// A request refused, naming the thing and why; `req` None for the hello or a message that names no request.

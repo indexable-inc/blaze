@@ -33,6 +33,9 @@ export type ViewInfo = {
   owner?: string; size: [number, number]; scale: number;
 };
 /** An extension installed in the profile (browser.rs `Extension`). */
+/** Where the Mac is, as macOS's Core Location said it (browser.rs `KernelDown::Location`): degrees, metres (the radius
+ *  it is sure of; altitude when it has one), and when it was measured (Unix ms). */
+export type Fix = { latitude: number; longitude: number; accuracy_m: number; altitude_m?: number; at_ms: number };
 export type Extension = { id: string; name: string; version: string; enabled: boolean; popup?: string; source: string; path: string };
 
 /** A socket client's message (browser.rs `KernelUp`). */
@@ -44,6 +47,7 @@ type KernelUp =
   | { t: "close"; view: number }
   | { t: "views"; req: number }
   | { t: "extensions"; req: number }
+  | { t: "location"; req: number }
   | { t: "manage"; req: number; url?: string };
 /** The host's message (browser.rs `KernelDown`). */
 type KernelDown =
@@ -53,12 +57,16 @@ type KernelDown =
   | { t: "closed"; view: number; why: string }
   | { t: "views"; req: number; views: ViewInfo[] }
   | { t: "extensions"; req: number; extensions: Extension[] }
+  | ({ t: "location"; req: number } & Fix)
   | { t: "done"; req: number }
   | { t: "error"; req?: number | null; error: string };
 
 /** The bounds on each wait (rule bounded-progress): the hello, a host request, one CDP call. */
 const HELLO_MS = 5_000;
 const HOST_MS = 30_000;
+/** A location may wait on the person: the first one makes macOS ask them to let Harness Browser use Location Services.
+ *  The host gives up after 60 s (location.rs `WAIT`) and says why; this bound is past it. */
+const LOCATION_MS = 70_000;
 const CDP_MS = 120_000;
 
 /** A CDP message (an answer when it has an id, else an event). */
@@ -244,11 +252,11 @@ export class Host {
   }
 
   /** One host request, answered by the message with its `req`. */
-  #ask(what: string, m: (req: number) => KernelUp): Promise<KernelDown> {
+  #ask(what: string, m: (req: number) => KernelUp, ms = HOST_MS): Promise<KernelDown> {
     const id = ++this.#req;
     const p = new Promise<KernelDown>((resolve, reject) => this.#requests.set(id, { resolve, reject, what }));
     this.#write(m(id));
-    return bounded(p, HOST_MS, `${WHAT}: ${what}`).finally(() => this.#requests.delete(id));
+    return bounded(p, ms, `${WHAT}: ${what}`).finally(() => this.#requests.delete(id));
   }
 
   /** A new view at `url`: closed with this connection unless `keep`. */
@@ -286,6 +294,13 @@ export class Host {
     const m = await this.#ask("listing the extensions", (req) => ({ t: "extensions", req }));
     if (m.t !== "extensions") throw new Error(`${WHAT}: listing the extensions was answered with a \`${m.t}\` message`);
     return m.extensions;
+  }
+
+  /** Where the Mac is now, from macOS's Core Location (the host asks it; the first time macOS asks the person). */
+  async location(): Promise<Fix> {
+    const m = await this.#ask("asking macOS where this Mac is", (req) => ({ t: "location", req }), LOCATION_MS);
+    if (m.t !== "location") throw new Error(`${WHAT}: asking where this Mac is was answered with a \`${m.t}\` message`);
+    return { latitude: m.latitude, longitude: m.longitude, accuracy_m: m.accuracy_m, altitude_m: m.altitude_m, at_ms: m.at_ms };
   }
 
   /** Open the manage window (a Chrome-style window of the host's own) at `url`, chrome://extensions when none. */
@@ -374,9 +389,10 @@ export class Page {
     if (at) { this.#url = at.url; this.#title = at.title; }
   }
 
-  /** Run a function in the page. It is serialized with toString, so it cannot close over local variables; pass `arg`. */
-  async evaluate<T, A = undefined>(fn: (arg: A) => T | Promise<T>, arg?: A): Promise<T> {
-    const expression = `(${fn.toString()})(${JSON.stringify(arg ?? null)})`;
+  /** Run a function in the page, or a string as an expression there (`'document.title'`). A function is serialized with
+   *  toString, so it cannot close over local variables; pass `arg`. */
+  async evaluate<T, A = undefined>(fn: ((arg: A) => T | Promise<T>) | string, arg?: A): Promise<T> {
+    const expression = typeof fn === "string" ? fn : `(${fn.toString()})(${JSON.stringify(arg ?? null)})`;
     const r = await this.send("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true });
     if (r.exceptionDetails) throw new Error(`evaluate on ${this.#where()}: ${r.exceptionDetails.exception?.description ?? r.exceptionDetails.text}`);
     return r.result.value as T;
@@ -389,6 +405,21 @@ export class Page {
       await Bun.sleep(100);
     }
     return false;
+  }
+
+  /** The page's words as a person reads them (the body's innerText), once it has settled: loaded, and the same length
+   *  on two looks 250 ms apart (a page that fills itself in after its load event, as most do), or as it is after
+   *  `timeoutMs`. No sleep is needed before it. */
+  async text(timeoutMs = 8_000): Promise<string> {
+    const deadline = Date.now() + timeoutMs;
+    let last = -1;
+    while (Date.now() < deadline) {
+      const now = await this.evaluate(() => (document.body && document.readyState === "complete" ? document.body.innerText.length : -1)).catch(() => -1);
+      if (now > 0 && now === last) break;
+      last = now;
+      await Bun.sleep(250);
+    }
+    return this.evaluate(() => document.body?.innerText ?? "");
   }
 
   url() { return this.evaluate(() => location.href); }
@@ -422,19 +453,53 @@ export async function host(): Promise<Host> {
 /** Who opened a view: the running cell (`<repl>/<task>`), else this kernel. */
 const owner = () => `${REPL_ID}/${currentTask()?.id ?? "kernel"}`;
 
-/** A page of the harness browser, its Page and Runtime domains on; at `url`, loaded, when given. `keep`: it outlives
- *  this kernel's connection (a page opened for the person). */
-export async function newPage(opts: { url?: string; keep?: boolean } = {}): Promise<Page> {
-  const v = await (await host()).open(opts.url ?? "about:blank", { owner: owner(), keep: opts.keep });
+/** A page of the harness browser, its Page domain on (never Runtime: evaluate needs no Runtime.enable, nothing here
+ *  hears its events, and a page can tell it is on, which is how sites pick out an automated browser); at `url`,
+ *  loaded, when given. `keep`: it outlives this kernel's connection (a page opened for the person). `size`: its view's
+ *  size in points until the app draws it (the app sizes a view to the box it is drawn in). */
+export async function newPage(opts: { url?: string; keep?: boolean; size?: [number, number] } = {}): Promise<Page> {
+  // Always opened blank: the page is told what browser it is (asChrome) before its first request leaves.
+  const v = await (await host()).open("about:blank", { owner: owner(), keep: opts.keep, size: opts.size });
   const page = new Page(v, String(v.info.view), v.info.target, v.info.url, v.info.title);
   try {
-    await Promise.all([page.send("Page.enable"), page.send("Runtime.enable")]);
-    if (opts.url) await waitLoaded(page, opts.url, 20_000);
+    await Promise.all([page.send("Page.enable"), asChrome(page)]);
+    if (opts.url) {
+      const r = await page.send<{ errorText?: string }>("Page.navigate", { url: opts.url });
+      if (r.errorText) throw new Error(`navigate ${opts.url} (view ${page.view}): ${r.errorText}`);
+      await waitLoaded(page, opts.url, 20_000);
+    }
   } catch (e) {
     if (!opts.keep) await page.close();
     throw e;
   }
   return page;
+}
+
+/** What the harness browser is, said the way Chrome says it: the embedded Chromium is Chrome's engine at Chrome's
+ *  version, but an embedder's build names only "Chromium" in its client hints (`Sec-CH-UA`, `navigator.userAgentData`)
+ *  while its User-Agent header says Chrome, a mismatch sites read as an automated browser. This adds the "Google
+ *  Chrome" brand at the same version, beside the brands the build already sends. Read once a kernel. */
+let chrome: Promise<object> | undefined;
+function asChrome(page: Page): Promise<unknown> {
+  chrome ??= (async () => {
+    const v = await page.send<{ product: string; userAgent: string }>("Browser.getVersion");
+    const full = /\/([\d.]+)/.exec(v.product)?.[1];
+    if (!full) throw new Error(`${WHAT}: Browser.getVersion's product is \`${v.product}\`, not Chrome/<version>`);
+    const major = full.split(".")[0]!;
+    const os = Bun.spawnSync(["/usr/bin/sw_vers", "-productVersion"]).stdout.toString().trim();
+    if (!/^\d+(\.\d+)*$/.test(os)) throw new Error(`${WHAT}: sw_vers -productVersion printed \`${os}\`, not a macOS version`);
+    const brands = (ver: string, grease: string) => [{ brand: "Chromium", version: ver }, { brand: "Google Chrome", version: ver }, { brand: "Not:A-Brand", version: grease }];
+    return {
+      userAgent: v.userAgent,
+      userAgentMetadata: {
+        brands: brands(major, "8"), fullVersionList: brands(full, "8.0.0.0"), fullVersion: full,
+        platform: "macOS", platformVersion: os.split(".").concat("0", "0").slice(0, 3).join("."),
+        architecture: process.arch === "arm64" ? "arm" : "x86", bitness: "64", model: "", mobile: false, wow64: false,
+      },
+    };
+  })();
+  chrome.catch(() => { chrome = undefined; });
+  return chrome.then((o) => page.send("Emulation.setUserAgentOverride", o));
 }
 
 /** Wait (at most `ms`) for a page opened at a url to finish loading; a page still loading then is returned as it is.
@@ -521,7 +586,7 @@ export class External {
       },
     };
     const page = new Page(session, null, targetId);
-    await Promise.all([page.send("Page.enable"), page.send("Runtime.enable")]);
+    await page.send("Page.enable");
     return page;
   }
 

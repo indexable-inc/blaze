@@ -30,6 +30,7 @@ mod surface;
 pub use common::{GenFeel, GenOn, Prims};
 pub use control::Live;
 pub(super) use browser::shown_card;
+pub(super) use browser::view_id as browser_view_id;
 
 /// The most elements one cell draws, how deep they nest, and the most rows and columns a table shows.
 const MAX_ELEMENTS: usize = 600;
@@ -482,6 +483,34 @@ fn toned(v: View<'_>, s: &str, tone: &str) {
 /// or `{title, key}`: the record field it shows). Drawn as the transcript's grids are (super::fill_grid), without an index:
 /// a `ui.Table` with a header, cells typed by their values, a foot saying how many rows when not all show.
 fn table(v: View<'_>, node: &Value, b: &mut Budget<'_, '_>) {
+    let rows = prop(node, "rows").as_array().map_or(0, Vec::len);
+    let query = words(node, "query");
+    let query = query.trim();
+    let (data, kept, total) = table_data(node, b.cell);
+    let shown = data.rows.len();
+    // onSelect is sent the row's index in `rows`.
+    let on_select = control::handler(node, "onSelect");
+    let presses: Option<Vec<String>> = on_select.as_deref().map(|h| kept.iter().map(|&r| control::send(b.cell, h, Value::from(r))).collect());
+    if let Some(grid) = v.part("card").and_then(|c| c.part("grid")) {
+        let opts = view::table::Opts { look: "hn.ChatTable", shown, presses: presses.as_deref(), find: query, ..view::table::Opts::default() };
+        view::table(grid, &data, opts, &mut *b.measure);
+    }
+    if let Some(f) = v.part("foot") {
+        let foot = if total == 0 && !query.is_empty() {
+            "No rows match".to_owned()
+        } else if shown < rows {
+            format!("{shown} of {rows} rows")
+        } else {
+            String::new()
+        };
+        super::foot(f, &foot);
+    }
+}
+
+/// A `Table`'s data as it is drawn (its cells' presses going to cell `to`): the columns, the rows that show, each one's
+/// index in `rows`, and how many rows its `query` keeps. What [`table`] fills and [`texts`] reads, so a selection's
+/// words are the drawn ones.
+fn table_data(node: &Value, to: &str) -> (view::table::Table, Vec<usize>, usize) {
     let rows: &[Value] = prop(node, "rows").as_array().map_or(&[], Vec::as_slice);
     // (title, record key) of each column.
     let mut cols: Vec<(String, String)> = prop(node, "columns")
@@ -532,7 +561,7 @@ fn table(v: View<'_>, node: &Value, b: &mut Budget<'_, '_>) {
         Value::Object(o) if o.contains_key("text") => {
             let c = super::value_cell(&o["text"], "");
             match (&on_open, o.get("open")) {
-                (Some(h), Some(open)) => c.with_press(control::send(b.cell, h, open.clone())),
+                (Some(h), Some(open)) => c.with_press(control::send(to, h, open.clone())),
                 _ => c,
             }
         }
@@ -545,30 +574,15 @@ fn table(v: View<'_>, node: &Value, b: &mut Budget<'_, '_>) {
     let kept: Vec<usize> =
         (0..rows.len()).filter(|&r| query.is_empty() || built[r].iter().any(|c| view::table::find(&c.shown(), query).is_some())).collect();
     let total = kept.len();
-    let shown = total.min(MAX_ROWS);
-    // onSelect is sent the row's index in `rows`.
-    let on_select = control::handler(node, "onSelect");
-    let presses: Option<Vec<String>> = on_select.as_deref().map(|h| kept.iter().take(shown).map(|&r| control::send(b.cell, h, Value::from(r))).collect());
+    let mut kept = kept;
+    kept.truncate(MAX_ROWS);
     let mut built = built;
     let data = view::table::Table {
         cols: cols.iter().map(|(title, _)| view::table::Column { name: title.clone(), align: view::table::Align::Auto }).collect(),
-        rows: kept.iter().take(shown).map(|&r| std::mem::take(&mut built[r])).collect(),
+        rows: kept.iter().map(|&r| std::mem::take(&mut built[r])).collect(),
         head: true,
     };
-    if let Some(grid) = v.part("card").and_then(|c| c.part("grid")) {
-        let opts = view::table::Opts { look: "hn.ChatTable", shown, presses: presses.as_deref(), find: query, ..view::table::Opts::default() };
-        view::table(grid, &data, opts, &mut *b.measure);
-    }
-    if let Some(f) = v.part("foot") {
-        let foot = if total == 0 && !query.is_empty() {
-            "No rows match".to_owned()
-        } else if shown < rows.len() {
-            format!("{shown} of {} rows", rows.len())
-        } else {
-            String::new()
-        };
-        super::foot(f, &foot);
-    }
+    (data, kept, total)
 }
 
 #[cfg(test)]
@@ -1402,37 +1416,110 @@ mod tests {
     }
 }
 
-/// A drawn tree's words as plain text, for a copy that takes the card whole: each element's own words (its text, title,
-/// label, value, note; a table's rows a line each, cells a tab apart) in reading order, one element a line.
+/// A drawn tree's words as plain text, for a copy that takes the card whole: [`texts`], each after its separator (one
+/// element a line, a table's rows a line each and its cells a tab apart), a table's cell whole where it shows less.
 pub(super) fn plain(ui: &Value) -> String {
-    fn walk(node: &Value, out: &mut Vec<String>) {
-        match node {
-            Value::Array(a) => a.iter().for_each(|n| walk(n, out)),
-            Value::String(s) if !s.trim().is_empty() => out.push(s.clone()),
-            Value::Object(_) => {
+    let words = texts(ui);
+    let kept = words.iter().filter(|t| t.cell || !t.src.trim().is_empty());
+    super::joined(kept.map(|t| (t.sep, t.full.as_deref().unwrap_or(&t.src))))
+}
+
+/// The words of a drawn tree a selection in the transcript can cover (chat.rs `texts`), in reading order: each element's
+/// own words with the node [`element`] draws them on, below the tree's `hn.ChatUi` row. Text, Markdown, Code, a Badge, a
+/// Stat and a Table's header and cells are placed (a cell on its grid node, else its stacked one), through the
+/// containers that only hold their children (Column, Row, Card, Stack, Wrap, Scroll). Any other element's words (a
+/// control's label, a chart's title) have no node named here: they are only copied.
+pub(super) fn texts(ui: &Value) -> Vec<Words> {
+    /// `node`'s words into `out`; `at` is its node's path (None: under an element whose nodes are not named here).
+    fn walk(node: &Value, at: Option<&str>, depth: usize, out: &mut Vec<Words>) {
+        if !node.is_object() || depth >= MAX_DEPTH {
+            return;
+        }
+        // Words on their own line, on the node at `path` under this element's ("" : the element's own).
+        let line = |path: &str, src: String, md: bool| {
+            let path = at.map_or_else(String::new, |a| if path.is_empty() { a.to_owned() } else { format!("{a}/{path}") });
+            Words { sep: "\n", ..Words::at(path, src, md) }
+        };
+        let kids = |from: usize, out: &mut Vec<Words>| {
+            for (i, kid) in node["children"].as_array().into_iter().flatten().enumerate() {
+                let path = at.map(|a| format!("{a}/g{}", from + i));
+                walk(kid, path.as_deref(), depth + 1, out);
+            }
+        };
+        match node["type"].as_str().unwrap_or("") {
+            "Column" | "Row" | "Stack" | "Wrap" | "Scroll" => kids(0, out),
+            "Card" => {
+                // A title is its first child ([`element`]).
+                let title = words(node, "title");
+                let from = usize::from(!title.is_empty());
+                if from == 1 {
+                    out.push(line("g0", title, false));
+                }
+                kids(from, out);
+            }
+            "Text" => out.push(line("", words(node, "text"), false)),
+            "Badge" => out.push(line("text", words(node, "text"), false)),
+            "Stat" => out.extend(["label", "value", "note"].map(|part| line(part, words(node, part), false))),
+            "Code" => out.push(line("card/text", words(node, "text"), false)),
+            "Markdown" => {
+                let mut rows = Vec::new();
+                super::blocks(&words(node, "text"), false, &mut rows);
+                for (i, r) in rows.iter().enumerate() {
+                    let own = super::texts(r);
+                    if own.is_empty() {
+                        // A row taken only whole (a table in the markdown): copied as written.
+                        out.extend(r.markdown().map(|md| line("", md, false)).map(|t| Words { path: "".into(), ..t }));
+                    }
+                    for (k, t) in own.into_iter().enumerate() {
+                        let placed = line(&format!("m{i}/{}", t.path), String::new(), false).path;
+                        out.push(Words { path: placed, sep: if k == 0 { "\n" } else { t.sep }, ..t });
+                    }
+                }
+            }
+            "Table" => {
+                let (data, ..) = table_data(node, "");
+                let grid = |part: String| line(&format!("card/grid/{part}"), String::new(), false).path;
+                for (c, col) in data.cols.iter().enumerate() {
+                    out.push(Words { path: grid(format!("scroll/inner/head/c{c}/text")), sep: if c == 0 { "\n" } else { "\t" }, cell: true, ..Words::at("", col.name.clone(), false) });
+                }
+                for r in 0..data.rows.len() {
+                    for c in 0..data.cols.len() {
+                        let cell = data.cell(r, c);
+                        let shown = cell.shown().into_owned();
+                        out.push(Words {
+                            path: grid(format!("scroll/inner/body/r{r}/c{c}/text")),
+                            // Stacked (view::table): its first cell the row's title, the others its fields.
+                            alt: grid(if c == 0 { format!("stack/s{r}/title") } else { format!("stack/s{r}/fields/f{c}/value") }),
+                            full: (shown != cell.text).then(|| cell.text.clone()),
+                            sep: if c == 0 { "\n" } else { "\t" },
+                            cell: true,
+                            ..Words::at("", shown, cell.kind == view::table::Kind::Markdown)
+                        });
+                    }
+                }
+            }
+            _ => {
+                // An element whose nodes are not named here: its own words, and all under it, only copied.
                 for name in ["title", "label", "text", "value", "note"] {
                     match prop(node, name) {
-                        Value::String(s) if !s.trim().is_empty() => out.push(s.clone()),
-                        Value::Number(n) => out.push(n.to_string()),
+                        Value::String(s) if !s.trim().is_empty() => out.push(Words { sep: "\n", ..Words::at("", s.clone(), false) }),
+                        Value::Number(n) => out.push(Words { sep: "\n", ..Words::at("", n.to_string(), false) }),
                         _ => {}
                     }
                 }
-                if node["type"].as_str() == Some("Table") {
-                    for r in prop(node, "rows").as_array().into_iter().flatten() {
-                        let cells: Vec<String> = match r {
-                            Value::Object(o) => o.values().map(super::cell_text).collect(),
-                            Value::Array(a) => a.iter().map(super::cell_text).collect(),
-                            x => vec![super::cell_text(x)],
-                        };
-                        out.push(cells.join("\t"));
-                    }
+                for kid in node["children"].as_array().into_iter().flatten() {
+                    walk(kid, None, depth + 1, out);
                 }
-                walk(&node["children"], out);
             }
-            _ => {}
         }
     }
-    let mut out = Vec::new();
-    walk(ui, &mut out);
-    out.join("\n")
+    let mut out = Vec::new(); // alloc: one drawn tree's words, for this frame's selection or a copy
+    let nodes: Vec<&Value> = match ui {
+        Value::Array(a) => a.iter().collect(),
+        v => vec![v],
+    };
+    for (i, node) in nodes.into_iter().enumerate() {
+        walk(node, Some(&format!("body/g{i}")), 0, &mut out);
+    }
+    out
 }

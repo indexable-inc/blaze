@@ -6,6 +6,7 @@
  * types), and every check says the cell line it is about when it is known. Nothing here depends on Svelte. Copied from den's repl/src/ui/element.ts and cut to
  * the elements the harness app draws.
  */
+import { MAP_RULES } from './map.ts';
 import { fileProblem, mediaProblem } from './media.ts';
 import { ID_RULE, aspectOf, shaderWire, texturesProblem, uniformsOf } from './shader.ts';
 
@@ -35,6 +36,8 @@ export const ELEMENT_NAMES = [
   'Video', 'Shader',
   // A page of the harness browser (embedded Chromium), live: a view an agent opened (`view={page.view}`) or a URL the app opens.
   'Browser',
+  // Places on a real map that pans and zooms (map.ts): the kernel serves its page and it is drawn as the Browser of that view.
+  'Map',
 ] as const;
 export type ElementName = typeof ELEMENT_NAMES[number];
 
@@ -141,6 +144,8 @@ export const OWN_PROPS: Record<ElementName, readonly string[]> = {
   Shader: ['source', 'src', 'width', 'height', 'aspect', 'uniforms', 'textures', 'animate', 'id', 'sourceLine', 'children'],
   // One of the two: a view of the harness browser (cdp.ts Page.view), or an http(s) URL the app opens a view at.
   Browser: ['view', 'src'],
+  // Places as pins on OpenStreetMap, fitted to them or looking at center with zoom; `here` is where the person is (map.ts).
+  Map: ['markers', 'center', 'zoom', 'here'],
 };
 /** Props the kernel sets itself, never listed as what an element takes. */
 const INTERNAL: ReadonlySet<string> = new Set(['sourceLine']);
@@ -674,6 +679,7 @@ const ELEMENT_RULES: Partial<Record<ElementName, Record<string, Rule>>> = {
     width: positive, height: positive, aspect, uniforms, textures, animate: flag, id, sourceLine: whole(1, Number.MAX_SAFE_INTEGER, 'a line'),
   },
   Browser: { view, src: webUrl },
+  Map: MAP_RULES,
 };
 
 /** The elements that go to the app as exactly the props `elementWire` gives them: the controls, and every element of tier 3. */

@@ -22,6 +22,7 @@ mod handlers;
 mod host;
 mod kernel;
 mod keys;
+mod location;
 mod manage;
 mod parent;
 mod ring;
