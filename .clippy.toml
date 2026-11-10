@@ -6,6 +6,8 @@ disallowed-types = [
     # docs/v2/plan/design/profile-names.md: the flight recorder names per thread, sharing nothing.
     { path = "blaze_profile::flight::Names", replacement = "blaze_profile::flight::names::Local", reason = "one process-wide name table shared cache lines across every recording thread: a thread names into its own table, defined in its own ring (docs/v2/plan/design/profile-names.md)", allow-invalid = true },
     { path = "blaze_profile::flight::Shared", replacement = "blaze_profile::flight::names::Local", reason = "as for `flight::Names`: names are per thread", allow-invalid = true },
+    # The keyed Merkle set moved to blaze-ids, the one audited place hashes are combined into an identity (rule guard-the-cause, 2026-11-10).
+    { path = "blaze_link::keyed::Keyed", replacement = "blaze_ids::keyed::Keyed", reason = "one home for the identity of a set of hashes: a link's given id and a build's id are both made of it, never of a sum or an XOR of hashes", allow-invalid = true },
     # Locks (rule standard-structures): raw std and parking_lot locks are banned outside crates/blaze-core/src/lock.rs.
     { path = "std::sync::Mutex", replacement = "blaze_core::lock::Lock", reason = "named and recorded (docs/v2/plan/design/named-locks.md): blaze's one lock home is `blaze_core::lock`, whose locks take a name and record who waited behind whom on the slow path only" },
     { path = "std::sync::RwLock", replacement = "blaze_core::lock::ReadLock", reason = "named and recorded (docs/v2/plan/design/named-locks.md): blaze's one lock home is `blaze_core::lock`, whose locks take a name and record who waited behind whom on the slow path only" },
