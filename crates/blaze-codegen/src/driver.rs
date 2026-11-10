@@ -1661,7 +1661,7 @@ pub struct Build<'a, B: Prepare> {
 /// How many of a walk's functions are reached each way: what [`rebind`] counted, and the span
 /// `codegen classify` records.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-struct Reached {
+struct SlotCounts {
     /// Through their slots: an edit changes their bodies.
     edited: usize,
     /// Through their slots: another crate's code over a workspace type, closure or item.
@@ -1692,7 +1692,7 @@ fn rebind<I: Clone + Eq + Hash, S>(
     nodes: &mut Sorted<InstanceKey, FnNode<I, S>>,
     asked: &HashMap<(I, Origin), InstanceKey>,
     rebinds: bool,
-) -> Reached {
+) -> SlotCounts {
     // The place among the nodes of the function `node` refers to at `place`.
     let index = |node: &FnNode<I, S>, place: usize| -> Option<usize> {
         let FrontRef::Function(callee) = node.described.refs.get(place)? else { return None };
@@ -1728,7 +1728,7 @@ fn rebind<I: Clone + Eq + Hash, S>(
             }
         }
     }
-    let mut reached = Reached::default();
+    let mut reached = SlotCounts::default();
     for (node, refers) in nodes.values_mut().zip(&refers) {
         if node.patchable {
             reached.edited += 1;
