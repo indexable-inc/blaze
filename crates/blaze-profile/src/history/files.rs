@@ -914,10 +914,12 @@ impl Commit {
                     return Step::Ready(Err(error));
                 }
                 if cx.syncs() {
+                    // durable: the manifest's bytes are on disk before the rename that commits it (the DST's planted bug is this sync left out)
                     cx.ask(Wait::Sync, |tag| Effect::Sync { file: hidden, tag });
                     self.stage = Committing::Sync;
                 } else {
                     let to = cx.file(manifest::FILE);
+                    // durable: the manifest's rename is the commit of a flush, a merge or a retire
                     cx.ask(Wait::Sync, |tag| Effect::Rename { from: hidden, to, tag });
                     self.stage = Committing::Rename;
                 }
@@ -927,6 +929,7 @@ impl Commit {
                     return Step::Ready(Err(error));
                 }
                 let to = cx.file(manifest::FILE);
+                // durable: the manifest's rename is the commit of a flush, a merge or a retire
                 cx.ask(Wait::Sync, |tag| Effect::Rename { from: hidden, to, tag });
                 self.stage = Committing::Rename;
             }
@@ -1123,10 +1126,12 @@ impl Place {
                         cx.ask(Wait::Files, |tag| Effect::Append { file: hidden, bytes, tag });
                     }
                     Placing::Sync => {
+                        // durable: a flushed table's bytes are on disk before the manifest lists the file
                         cx.ask(Wait::Sync, |tag| Effect::Sync { file: hidden, tag });
                     }
                     Placing::Rename => {
                         let to = cx.file(&self.slots[at].name);
+                        // durable: a flushed table takes its name on disk before the manifest lists it
                         cx.ask(Wait::Sync, |tag| Effect::Rename { from: hidden, to, tag });
                     }
                 }
@@ -1688,10 +1693,12 @@ impl Compact {
                 // Synced before it is renamed: the commit that lists it retires its inputs,
                 // which a reap deletes, so its bytes must be on disk first.
                 if cx.syncs() {
+                    // durable: a merge's output is on disk before the commit that retires its inputs
                     cx.ask(Wait::Sync, |tag| Effect::Sync { file: hidden, tag });
                     self.stage = Merging::Sync;
                 } else {
                     let to = cx.file(&self.current().output.file_name());
+                    // durable: a merge's output takes its name on disk before the commit that retires its inputs
                     cx.ask(Wait::Sync, |tag| Effect::Rename { from: hidden, to, tag });
                     self.stage = Merging::Rename;
                 }
@@ -1784,6 +1791,7 @@ impl Compact {
                     }
                     let hidden = cx.hidden(&self.current().output.file_name());
                     let to = cx.file(&self.current().output.file_name());
+                    // durable: a merge's output takes its name on disk before the commit that retires its inputs
                     cx.ask(Wait::Sync, |tag| Effect::Rename { from: hidden, to, tag });
                     self.stage = Merging::Rename;
                     return Step::Pending;
@@ -2461,6 +2469,7 @@ impl Open {
                 CrashFile::SetAside => {
                     // alloc: a file's name, once a record refused
                     let to = cx.file(&format!("{name}.refused"));
+                    // durable: a refused crash record is set aside once: a restart must not find it under its old name and report it again
                     cx.ask(Wait::Files, |tag| Effect::Rename { from: file, to, tag });
                 }
             }
@@ -3025,6 +3034,7 @@ impl WriteListed {
                         for at in 0..self.entries.len() {
                             let from = cx.hidden(&self.entries[at].0);
                             let to = cx.file(&self.entries[at].0);
+                            // durable: recovered files take their names on disk before the manifest that lists them is committed
                             cx.ask(Wait::Sync, |tag| Effect::Rename { from, to, tag });
                         }
                         self.held = Some(held);
@@ -3436,6 +3446,7 @@ impl PinJob {
                     }
                     let from = cx.pin_file(&self.making());
                     let to = cx.pin_file(&PinFile::Lock { id: &self.id }.file_name());
+                    // durable: review: a reader's pin is a lock file of a live process; it waits for the directory's sync and may not need to survive a crash
                     cx.ask(Wait::Files, |tag| Effect::Rename { from, to, tag });
                     self.stage = Pinning::Rename;
                     return Step::Pending;

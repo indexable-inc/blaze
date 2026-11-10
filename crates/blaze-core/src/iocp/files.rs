@@ -154,6 +154,7 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary)?;
         file.write_all(bytes)?;
         // `FlushFileBuffers`.
+        // durable: `write_atomically` is `Effect::Write` carried out: the bytes are flushed before the move
         file.sync_all()
     })();
     let placed = written.and_then(|()| moved(&temporary, path));

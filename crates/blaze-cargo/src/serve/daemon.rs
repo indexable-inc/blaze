@@ -2175,6 +2175,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         );
         tracing::error!("{said}");
         let file = under(&self.state, &format!("stalls/{now}.json"));
+        // durable: a stall's trace is read after the daemon is killed for the stall, and nothing can make it again
         self.effects.push(Effect::Write { file, bytes: stall.trace, tag: STALL });
         // clone: the error, once a stall
         let error = ApiError::new(said.clone(), Some("stall".to_owned()));

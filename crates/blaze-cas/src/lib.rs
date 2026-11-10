@@ -4688,7 +4688,7 @@ impl Store {
             let bytes = external.memory.clone().expect("a file not yet written is held");
             let tag = self.tags.ask(Op::WriteExternal { content: *content });
             // clone: the effect owns its file name; once per file a commit
-            effects.push(Effect::Write { file: external.file.clone(), bytes, tag });
+            effects.push(Effect::Write { file: external.file.clone(), bytes, tag }); // durable: the store's commit: a file the head will name is on disk before the head is
             steps += 1;
         }
         let mut batch = std::mem::take(&mut self.draining);
@@ -4696,6 +4696,7 @@ impl Store {
         self.next_batch += 1;
         let index = index.map(|(slot, bytes)| {
             let tag = self.tags.ask(Op::WriteIndex);
+            // durable: the store's commit: the index the head will name is on disk before the head is
             effects.push(Effect::Write { file: own.file(&disk::index_file(slot)), bytes, tag });
             steps += 1;
             (slot, batch.id)
@@ -4841,7 +4842,7 @@ impl Store {
                 if commit.failed.is_none() && last {
                     let tag = self.tags.ask(sync_op(Op::Sync { pack: *pack }, waited));
                     // clone: the effect owns its file name; once per pack a commit
-                    effects.push(Effect::Sync { file: own.packs[*pack].file.clone(), tag });
+                    effects.push(Effect::Sync { file: own.packs[*pack].file.clone(), tag }); // durable: the store's commit: a pack's appended bytes are on disk before the head names them
                     commit.steps += usize::from(waited);
                     if !waited {
                         // The planted commit waits for no sync: its checks follow the write.
@@ -4890,6 +4891,7 @@ impl Store {
                 if commit.failed.is_none() {
                     let tag = self.tags.ask(sync_op(Op::SyncChecks { pack: *pack }, waited));
                     let file = own.file(&disk::checks_file(*pack));
+                    // durable: the store's commit: a pack's checks are on disk before the head names its new length
                     effects.push(Effect::Sync { file, tag });
                     commit.steps += usize::from(waited);
                 }
@@ -4939,6 +4941,7 @@ impl Store {
             commit.head_sent = true;
             commit.steps += 1;
             let tag = self.tags.ask(Op::WriteHead);
+            // durable: the store's head is its commit point: what it names is what a reopen after a crash holds
             effects.push(Effect::Write {
                 file: self.tiers[0].file(HEAD_FILE),
                 bytes: commit.head.encode(),

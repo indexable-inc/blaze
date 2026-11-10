@@ -2812,6 +2812,7 @@ fn block(until: &dyn Fn() -> bool, deadline: Option<u64>) {
             // A client of pools with threads of their own: its waker unparks it.
             Round::None if THREADS => match left() {
                 Some(left) => thread::park_timeout(left),
+                // wakes: the client's waker as its wait ends, and the pool this thread is listed with (`Blocked`) as it stops for an error and as each worker ends, which the loop then reads as `ended_broken`
                 None => thread::park(),
             },
             Round::Ran => {}

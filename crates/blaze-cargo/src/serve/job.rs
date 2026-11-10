@@ -4703,6 +4703,7 @@ impl<S: Steps> Jobs<S> {
                     }
                 };
                 self.begin_placing(id, path);
+                // durable: the user's lock file: their own source, written whole or not at all
                 w.effects.push(Effect::Write { file, bytes: written.text.into_bytes(), tag });
             }
             for line in &lock.said {

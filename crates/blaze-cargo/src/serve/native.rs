@@ -247,6 +247,7 @@ fn lay_out(
         .open(&mark_path)
         .map_err(|e| format!("creating {}: {e}", mark_path.display()))?;
     out.write_all(&mark).map_err(|e| format!("writing {}: {e}", mark_path.display()))?;
+    // durable: the mark says the unpacked tree beside it is whole: it is on disk before the rename that publishes the tree
     out.sync_all().map_err(|e| format!("syncing {}: {e}", mark_path.display()))?;
     drop(out);
     seal(&mark_path).map_err(|e| format!("making {} read-only: {e}", mark_path.display()))?;

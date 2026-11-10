@@ -526,6 +526,7 @@ impl Condvar {
         let mutex = guard.mutex;
         let inner = guard.guard.take().expect("a live guard holds the lock");
         drop(guard);
+        // wakes: the caller's notifier: this is std's `Condvar::wait` handed through when no model runs
         mutex.wrap(self.condvar.wait(inner), false)
     }
 

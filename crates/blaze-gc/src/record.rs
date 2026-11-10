@@ -91,6 +91,8 @@ pub fn write_whole(path: &Path, bytes: &[u8]) -> Result<(), String> {
             let mut file =
                 std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary)?;
             file.write_all(bytes)?;
+            // `touch` writes a record as a job takes a lease, so this sync is on a build's path.
+            // durable: review: the collector decides what to delete from these files; a torn one must not be read
             file.sync_all()?;
             std::fs::rename(&temporary, path)
         })();
