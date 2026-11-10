@@ -98,7 +98,12 @@ impl Machine {
         crate::socket::private_dir(&dir).with_context(|| {
             format!("making {}, where the machine's memory ledger is, the user's alone", dir.display())
         })?;
-        let path = dir.join("machine");
+        // Named by its layout: a daemon of a blaze that reads another layout keeps a ledger of
+        // its own beside this one, and neither refuses to start for the other's file (a blaze
+        // upgraded while an older daemon ran, or two pinned versions on one machine, stopped
+        // every build with "is of layout 1, and this blaze reads layout 2"). Daemons of two
+        // layouts then share no budget; each is still held by its own ceiling.
+        let path = dir.join(format!("machine.{}", blaze_graph::ledger::FORMAT)); // alloc: the path, once a daemon start
         let file = crate::socket::private_file(
             OpenOptions::new().read(true).write(true).create(true).truncate(false),
             &path,
