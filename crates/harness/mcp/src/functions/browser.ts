@@ -3,6 +3,10 @@
 // what the browser holds.
 import { host, newPage, withHiddenPage, type Extension, type Fix, type Page, type Place, type ViewInfo } from "../cdp.ts";
 import { pmap } from "../pmap.ts";
+import { currentTask, type Task } from "../tasks.ts";
+import { show } from "../ui/index.ts";
+import { hostComponent } from "../ui/svelte.ts";
+import { MAX_MARKERS } from "../ui/map.ts";
 import { table, type Table } from "../table.ts";
 import { effect } from "../effects.ts";
 
@@ -74,18 +78,39 @@ function metres(a: { latitude: number; longitude: number }, b: { latitude: numbe
   return 2 * 6_371_000 * Math.asin(Math.sqrt(h));
 }
 
+/** What each cell's place searches found so far, and where the person is when a search was centred on them: the one
+ *  map the cell draws shows all of it (two searches in one cell are one map, not the second replacing the first). */
+const drawn = new WeakMap<Task, { here?: [number, number]; found: Near[] }>();
+
+/** Draw (or redraw) the calling cell's map of the places its searches found: a pin each, nearest first, each naming
+ *  its place so its pin shows Apple's own card of it; the person's place as the blue dot. The cell's own render(), or
+ *  markup, replaces it. */
+function mapOf(found: Near[], here: [number, number] | undefined) {
+  const t = currentTask();
+  if (!t || found.length === 0) return;
+  const all = drawn.get(t) ?? { found: [] };
+  drawn.set(t, all);
+  all.here ??= here;
+  for (const p of found) if (!all.found.some((q) => (p.id ? q.id === p.id : q.name === p.name && q.distance_m === p.distance_m))) all.found.push(p);
+  all.found.sort((a, b) => a.distance_m - b.distance_m);
+  const markers = all.found.slice(0, MAX_MARKERS).map((p) => ({ lat: p.latitude, lon: p.longitude, label: p.name.slice(0, 120), detail: p.address.slice(0, 400), ...(p.id ? { place: p.id } : {}) }));
+  show(t, hostComponent("Map"), all.here ? { markers, here: all.here } : { markers });
+}
+
 /** The places Apple Maps finds for `query` (what a person would type into Maps) near a point: where the Mac is
- *  (location()) unless `near` says, within `radius_m`, nearest first. One call, under a second: names, addresses,
- *  phones, their own pages, coordinates (a Map's markers as they are). */
-export function places(query: string, opts: { near?: { latitude: number; longitude: number } | [number, number]; radius_m?: number; limit?: number } = {}): Promise<Table<Near>> {
+ *  (location()) unless `near` says, within `radius_m`, nearest first: names, addresses, phones, their own pages,
+ *  coordinates. It draws them on a Map under the calling cell (`map: false` for the rows alone): asking is showing. */
+export function places(query: string, opts: { near?: { latitude: number; longitude: number } | [number, number]; radius_m?: number; limit?: number; map?: boolean } = {}): Promise<Table<Near>> {
   return effect("net", `Finding ${query} nearby`, `Found ${query} nearby`, "Apple Maps", async () => {
     const h = await host();
     const n = opts.near;
     const at = Array.isArray(n) ? { latitude: n[0], longitude: n[1] } : n ?? await h.location();
     const found = await h.places(query, at, opts.radius_m ?? 5_000, opts.limit ?? 20);
-    return table(found
+    const rows = found
       .map((p): Near => ({ ...p, distance_m: Math.round(metres(at, p)), maps: `https://maps.apple.com/?q=${encodeURIComponent(p.name)}&ll=${p.latitude},${p.longitude}` }))
-      .sort((a, b) => a.distance_m - b.distance_m));
+      .sort((a, b) => a.distance_m - b.distance_m);
+    if (opts.map !== false) mapOf(rows, n ? undefined : [at.latitude, at.longitude]);
+    return table(rows);
   }, (t) => ({ detail: `${t.length} place${t.length === 1 ? "" : "s"}` }));
 }
 
