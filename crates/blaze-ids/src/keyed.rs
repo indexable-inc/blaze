@@ -1,6 +1,11 @@
 //! The identity of a set of keyed entries, kept as entries are set and removed
-//! (docs/v2/plan/design/patch-in-place.md): what a link is given, as one id, without hashing
-//! every entry each link.
+//! (docs/v2/plan/design/patch-in-place.md): what a link is given, or what a build made, as one
+//! id, without hashing every entry each time.
+//!
+//! The rule: an identity of many hashes is made here, by a hash of the whole set, and nowhere
+//! by adding or XORing them. This module is the one audited place where hashes are combined
+//! into an identity that is kept through edits (`blaze::combined_identity` refuses the sum and
+//! the XOR elsewhere).
 //!
 //! A Merkle tree over the keys' bits. The subtree of the keys that share a prefix hashes to
 //! zeros when it holds no entry, to its entry's leaf when it holds one, and to the hash of its
@@ -22,7 +27,8 @@
 use std::{alloc::Global, collections::BTreeMap};
 
 use blaze_hash::HashMap;
-use blaze_ids::Hasher;
+
+use crate::Hasher;
 
 /// A key, a value, a leaf, a node or a root.
 pub type Hash = [u8; 32];
@@ -81,6 +87,7 @@ enum Under {
 /// A set of entries by key and its Merkle tree. The invariant: a node is kept for exactly
 /// each prefix that two entries or more share, under the prefix's depth and least key, and it
 /// is the hash of its two halves.
+#[derive(Clone)] // clone: a set kept for one build moved to the next's, no hash made again
 pub struct Keyed {
     /// Each entry's value and leaf, by key.
     // BTreeMap: the entries under a prefix are a range of it.
@@ -394,7 +401,7 @@ mod tests {
     /// bytes hashed among 10,000 entries are within a small multiple of those among 100.
     #[test]
     fn one_entry_set_hashes_its_path() {
-        let entry = |at: u32| (blaze_ids::ContentId::of("keyed test", &at.to_le_bytes()).0, [1; 32]);
+        let entry = |at: u32| (crate::ContentId::of("keyed test", &at.to_le_bytes()).0, [1; 32]);
         let mut cost = [0u64; 2];
         for (slot, count) in [100u32, 10_000].into_iter().enumerate() {
             let mut kept = Keyed::of((0..count).map(entry));

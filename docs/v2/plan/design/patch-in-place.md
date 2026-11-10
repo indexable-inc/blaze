@@ -18,7 +18,7 @@ numbers after it are the main lane's to measure.
 | Span tables the code names | `link inputs` | the functions the delta lists are read for their anchors; the workspace's named bodies are each one memo verification (`verified`); the tables whose positions moved are encoded (`made`). A library's bodies are not asked. One call a file the tables name, to check its name. |
 | Native inputs | `link delta` | one `stat` a library, as before |
 | Function, static and span rows | `link delta` (`rows`, `hashed`) | the delta's functions hashed (`filled_id`); a search of the build's sorted lists for each |
-| The link's id | `link delta` | a leaf and about `log2(n)` nodes for each changed row (`blaze_link::keyed`) |
+| The link's id | `link delta` | a leaf and about `log2(n)` nodes for each changed row (`blaze_ids::keyed`) |
 | Names | `link delta` | every name the image exports (`Built::symbols`): a handful for a program, not its functions |
 | Slots of a live image | `link delta` | the patchable (workspace) functions, each a search |
 | What running code assumes | `live assumed` | the workspace's items (`crate_hashes` columns), as before |
@@ -67,7 +67,7 @@ since the last link".
    are of no walked instance and so in no delta.
 4. **The link's id** (`Rows::given`) is the build's id, the root of a keyed Merkle set over
    every function row, static row and span table id, and the natives. The set
-   (`crates/blaze-link/src/keyed.rs`) is a tree over the keys' bits: empty subtree zeros,
+   (`crates/blaze-ids/src/keyed.rs`) is a tree over the keys' bits: empty subtree zeros,
    one entry its leaf, more the hash of the two halves, the root bound to the count. Its
    shape is of the set alone, so the root kept through edits is the root made whole, and
    two sets with one root are the same set by the hash's collision resistance. A sum of
@@ -116,7 +116,7 @@ since the last link".
 
 ## Tests
 
-- `crates/blaze-link/src/keyed.rs`: the refinement
+- `crates/blaze-ids/src/keyed.rs`: the refinement
   `a_keyed_set_kept_by_edits_is_the_set_made_whole`, control
   `the_oracle_catches_a_removed_entry_left_in_the_root`, counter
   `one_entry_set_hashes_its_path`.

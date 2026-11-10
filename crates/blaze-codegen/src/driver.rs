@@ -3065,9 +3065,9 @@ impl<'a, B: Prepare> Build<'a, B> {
             removed = tracing::field::Empty,
         );
         let _entered = span.enter();
-        let now = delta::Last::of(&built);
         let program = kept::program(&(roots, static_roots, check, policy_id.0, later));
         let before = self.kept.and_then(|kept| kept.last(program));
+        let now = delta::Last::of(&built, before.as_deref());
         let fresh = match self.kept {
             None => Some(Fresh::Unkept),
             Some(_) => Some(walk.fresh.unwrap_or(Fresh::First)),

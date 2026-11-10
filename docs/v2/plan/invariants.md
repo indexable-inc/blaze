@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-36 invariants, 7 refinements, 2 reference models.
-By level: 24 tested, 19 simulated, 0 model-checked, 0 proved.
+39 invariants, 10 refinements, 3 reference models.
+By level: 30 tested, 19 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
@@ -51,6 +51,8 @@ By level: 24 tested, 19 simulated, 0 model-checked, 0 proved.
 
 ### blaze-codegen
 
+- **`an_id_kept_through_edits_is_a_fresh_builds`** *tested* (`crates/blaze-codegen/src/driver/delta.rs`): the ID maintained incrementally equals a fresh build's. The set of one build's entries moved to the next build's has the root of the next build's entries made whole, whatever was added, changed and removed between them.
+  Controls: `a_removed_entry_kept_in_the_id`.
 - **`rebound_functions_are_reached_through_their_slots`** *tested* (`crates/blaze-codegen/src/driver/tests.rs`): in a build that reaches edited code through slots, every function an edit fills again under its own key is reached through its slot by every caller, so no caller a splice keeps in place holds a direct branch to code the splice replaced.
   Controls: `a_refilled_function_called_directly`.
 
@@ -70,6 +72,13 @@ By level: 24 tested, 19 simulated, 0 model-checked, 0 proved.
   Controls: `a_retry_with_the_first_timeout`, `a_lost_wakeup`, `a_reaped_child_never_reported`, `a_lost_wakeup_through_the_direct_driver`, `a_reaped_child_never_reported_through_the_direct_driver`.
 - **`every_reaped_child_is_reported_through_the_direct_driver`** *simulated* (`crates/blaze-core/src/wait/tests.rs`): on the direct driver (a look with `waitid`, a poll of the child's pidfd, the look again, then the reap), whatever interrupts the wait and whenever the child exits, every child is reaped once and its exit reported, by the reap's deadline or after it.
   Controls: `a_retry_with_the_first_timeout`, `a_lost_wakeup`, `a_reaped_child_never_reported`, `a_lost_wakeup_through_the_direct_driver`, `a_reaped_child_never_reported_through_the_direct_driver`.
+
+### blaze-diff
+
+- **`the_symbolic_derivative_agrees_with_finite_differences`** *tested* (`crates/blaze-diff/src/tests/derivative.rs`): the symbolic derivative of an expression is its derivative: for a drawn expression over every operation and a drawn point inside each operation's domain and away from its kinks, the value of `d(e)/dx` agrees with the central finite difference of `e`, within a tolerance relative to the derivative's size; and so does its exact simplification.
+  Controls: `a_wrong_quotient_rule_sign`, `a_missing_chain_rule_factor_for_tanh`, `a_derivative_that_drops_a_shared_nodes_second_use`.
+- **`a_rebuilt_egraph_is_closed_under_congruence`** *tested* (`crates/blaze-diff/src/tests/simplify.rs`): after a rebuild the e-graph is closed under congruence: every e-node's arguments are class roots, and two e-nodes of the same operation, payload and argument classes are in one class, whatever unions came before.
+  Controls: `x_minus_x_rewritten_to_zero`, `a_union_without_a_rebuild`.
 
 ### blaze-engine
 
@@ -144,12 +153,27 @@ By level: 24 tested, 19 simulated, 0 model-checked, 0 proved.
 - **`a_walk_over_kept_describes_builds_what_a_fresh_walk_builds`** *tested* (`crates/blaze-codegen/src/driver/tests/kept.rs`): for any program and any sequence of edits (a body, a reference added or removed, a function added or removed, a static's value, a dyn fact, the recursion limit), the build whose walk takes the describes kept by the builds before it is, after every edit, the build of a walk that keeps none: the same functions and statics, the same code and places, symbols, slots, owners, dedupe and reach, and the same errors where it is refused.
   Controls: `a_changed_function_whose_callers_keep_its_old_key`, `a_removed_ref_whose_target_stays_reached`, `a_dyn_fact_change_that_invalidates_nothing`, `a_patch_that_keeps_a_changed_functions_old_references`, `a_caller_that_names_a_changed_callees_old_key`.
 
+### blaze-diff
+
+- **`exact_simplification_preserves_every_value`** *tested* (`crates/blaze-diff/src/tests/simplify.rs`): simplifying by the exact rewrites preserves the value: for a drawn term over every operation and drawn inputs, signed zeros, infinities, NaN and subnormals included, the simplified term evaluates to the same bits as the term (any NaN is any NaN), whether or not the fuel stopped the run.
+  Controls: `x_minus_x_rewritten_to_zero`, `a_union_without_a_rebuild`.
+
+### blaze-diff-mir
+
+- **`lifting_and_lowering_keep_what_the_body_computes_on_special_values`** *tested* (`crates/blaze-diff-mir/src/tests.rs`): for a body that lifts, the lifted expression graph evaluates to the body's own result, bit for bit, at every input, and the body lowered from the graph does too: here at every pair of special values (zeros of both signs, infinities, NaN, a subnormal), for straight-line code, calls of intrinsics, branches, an unrolled loop and a tuple result.
+  Controls: `a_select_with_its_arms_swapped`.
+- **`lifting_and_lowering_keep_what_the_body_computes_on_any_bits`** *tested* (`crates/blaze-diff-mir/src/tests.rs`): the same at drawn inputs of any bits.
+  Controls: `a_select_with_its_arms_swapped`.
+
+### blaze-ids
+
+- **`a_keyed_set_kept_by_edits_is_the_set_made_whole`** *tested* (`crates/blaze-ids/src/keyed.rs`): after any sequence of sets and removals, the root kept by hashing only the edited entries' paths is the root of the same entries hashed whole, and so are the nodes kept.
+  Controls: `a_removed_entry_left_in_the_root`.
+
 ### blaze-link
 
 - **`a_digest_kept_by_updates_is_the_files`** *tested* (`crates/blaze-link/src/digest.rs`): after any sequence of writes and changes of length, the digest kept by updating only the blocks written is the digest of the file hashed whole, root and nodes.
   Controls: `a_block_not_rehashed`.
-- **`a_keyed_set_kept_by_edits_is_the_set_made_whole`** *tested* (`crates/blaze-link/src/keyed.rs`): after any sequence of sets and removals, the root kept by hashing only the edited entries' paths is the root of the same entries hashed whole, and so are the nodes kept.
-  Controls: `a_removed_entry_left_in_the_root`.
 - **`a_patched_file_behaves_as_a_fresh_link`** *tested* (`crates/blaze-link/src/tests/patch.rs`): after any sequence of edits (a body changed at the same size, smaller or larger than the room it had, a function added or removed, a callee set changed, a frame entry gained or lost, a static read, dropped or given another value), the file the patches make behaves as a fresh full link of the same program: the same entry, each function's code, each call resolved through its slot to the same function, each static read holding the same bytes, an unwind lookup of each function finding an entry that covers it, and the same function names in the symbol table. Each patch is of the file the last one left, never lays the image out whole, and the digest it gives is the patched file's hashed whole.
   Controls: `a_stale_unwind_entry`, `a_slot_left_on_the_old_body`, `a_removed_function_still_exported`, `a_write_the_digest_missed`, `a_check_of_the_length_alone`.
 
@@ -163,6 +187,10 @@ By level: 24 tested, 19 simulated, 0 model-checked, 0 proved.
 ### blaze-core
 
 - **`Model`** (`crates/blaze-core/src/wheel.rs`): every timer with its deadline and insertion number, fired by sorting.
+
+### blaze-diff
+
+- **`saturation_is_no_dearer_than_naive_rewriting`** (`crates/blaze-diff/src/tests/simplify.rs`): equality saturation that ran to the end finds a term at most as dear as naive rewriting to a fixpoint does, since every term naive rewriting reaches is in the root's class, and extraction takes the cheapest of the class.
 
 ### blaze-link
 

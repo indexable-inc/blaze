@@ -11,8 +11,7 @@ use std::{cell::Cell, collections::BTreeMap, fmt};
 use blaze_codegen::{
     BuiltId, CompiledFunction, InstanceKey, Static, StaticId, driver::Built,
 };
-use blaze_ids::{ContentId, Hasher};
-use blaze_link::keyed::Keyed;
+use blaze_ids::{ContentId, Hasher, keyed::Keyed};
 use hir_ty_codegen::v2::{LinkInputs, span_table_id};
 
 use super::{FunctionRow, StaticRow, filled_id, function_rows, static_row, static_rows};
@@ -539,7 +538,7 @@ impl Rows {
     /// (the digest's root) and the natives in their order. Two links of one image with one
     /// id stage the same image. It is a sound identity of the link's inputs: the root is a
     /// Merkle hash of every function's, static's and span table's content
-    /// ([`blaze_link::keyed`]), the build's id says the rest (names, debug names, symbols,
+    /// ([`blaze_ids::keyed`]), the build's id says the rest (names, debug names, symbols,
     /// which functions are patchable or cold: `BuiltId`), and the natives are hashed here
     /// whole, a few a link.
     pub(crate) fn given(&self, built: BuiltId, natives: &[ContentId]) -> ContentId {

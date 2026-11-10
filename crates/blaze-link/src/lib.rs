@@ -28,7 +28,6 @@ mod dwarf;
 mod elf;
 mod file;
 mod intern;
-pub mod keyed;
 mod layout;
 mod lazy;
 mod live;

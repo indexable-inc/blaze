@@ -5,13 +5,17 @@
 //!
 //! Each function and static of a `Built` has an *entry*: one content ID of everything the
 //! `Built` says of it ([`function_entries`], [`static_entries`]). A function or static is
-//! *changed* when its entry is another. A `Built`'s [`BuiltId`] is made of the sum of its
-//! entries, so a build that knows the entries it added, changed and removed makes the new ID
-//! from the old sum without reading the rest, and gets the ID a build with nothing kept gets.
+//! *changed* when its entry is another. A `Built`'s [`BuiltId`] is made of the roots of two
+//! keyed Merkle sets of its entries ([`blaze_ids::keyed`]), so a build that knows the entries
+//! it added, changed and removed makes the new ID from the last build's sets by hashing those
+//! entries' paths alone, and gets the ID a build with nothing kept gets.
 
 use std::sync::Arc;
 
-use blaze_ids::{ContentId, Hasher};
+use blaze_ids::{
+    ContentId, Hasher,
+    keyed::{Hash, Keyed},
+};
 use blaze_items::CodeHash;
 
 use super::{Built, StaticId};
@@ -19,17 +23,22 @@ use crate::{InstanceKey, Linkage, Owner, content, plan::Origin};
 
 pub const FUNCTION_ENTRY_DOMAIN: &str = "blaze v2 built function entry 1";
 pub const STATIC_ENTRY_DOMAIN: &str = "blaze v2 built static entry 1";
-pub const BUILT_ID_DOMAIN: &str = "blaze v2 built id 1";
+pub const STATIC_KEY_DOMAIN: &str = "blaze v2 built static key 1";
+pub const BUILT_ID_DOMAIN: &str = "blaze v2 built id 2";
 
 /// Which whole [`Built`] one is, by content: a digest of every function's and static's entry
 /// and of the lists that are of no one function (the roots, a lazy build's entry, a folded
 /// group's identity). Two builds of one ID give a link the same functions, statics, names,
 /// owners, symbols and slots.
 ///
-/// It is the hash of two sums, of the function entries and of the static entries, each entry
-/// read as four 64-bit words added word by word, wrapping: adding is in any order and has an
-/// inverse, so the sum after an edit is the sum before, less the entries removed and changed,
-/// plus the entries added and changed. A fresh build adds every entry and gets the same sum.
+/// It is the hash of two roots, of the keyed set of the function entries and of the keyed set
+/// of the static entries ([`Keyed`]: a Merkle tree over the keys' bits, whose shape is of the
+/// set alone). A root is a hash of its whole set, so two builds of one ID have the same
+/// entries; and it is kept through edits, so the root after an edit is made from the set
+/// before by hashing the paths of the entries removed, added and changed. A fresh build makes
+/// the set whole and gets the same root. Until 2026-11-10 it was a hash of two wrapping sums
+/// of the entries, which is no identity: other entries with the same sum are found by a
+/// generalized birthday search (`sets_a_wrapping_sum_takes_for_one_have_other_ids`).
 /// Not in it: a lazy build's walk order ([`Built::walked`]) and what a build counts of its
 /// compiles and the store (`stats`, `puts`, `memo_used`, `kernel`, `misses`, `walk`).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
@@ -125,21 +134,80 @@ pub struct Delta {
 }
 
 /// What a build keeps of its `Built` for the next build of the same program: each entry, by
-/// key, and the ID. 64 bytes a function; the lists themselves are the consumer's.
+/// key, the two keyed sets of them, and the ID. The lists themselves are the consumer's.
 pub(super) struct Last {
     pub(super) id: BuiltId,
     functions: Vec<(InstanceKey, ContentId)>,
     statics: Vec<(StaticId, ContentId)>,
+    /// The entries of `functions` and of `statics` as keyed sets: their roots make `id`.
+    sets: Sets,
+}
+
+/// The keyed sets of a `Built`'s function entries and static entries.
+#[derive(Clone)] // clone: the last build's sets, moved to this build's with no hash made again
+struct Sets {
+    functions: Keyed,
+    statics: Keyed,
+}
+
+/// A function's key in its set: its instance key, a content ID already.
+fn function_key(key: &InstanceKey) -> Hash {
+    key.0.0
+}
+
+/// A static's key in its set: one hash of its item and its instance.
+fn static_key(id: &StaticId) -> Hash {
+    let mut hasher = Hasher::new(STATIC_KEY_DOMAIN);
+    hasher.id(&id.0.0).id(&id.1);
+    hasher.finish().0
+}
+
+/// The set of `entries`, made whole.
+fn whole<K>(entries: &[(K, ContentId)], key: impl Fn(&K) -> Hash) -> Keyed {
+    Keyed::of(entries.iter().map(|(of, entry)| (key(of), entry.0)))
+}
+
+/// Moves `set`, the set of `before`, to the set of `now` (both sorted by key): the entries
+/// `now` lacks removed, the others set. An entry that did not change hashes nothing.
+fn moved<K: Copy + Ord>(
+    set: &mut Keyed,
+    before: &[(K, ContentId)],
+    now: &[(K, ContentId)],
+    key: impl Fn(&K) -> Hash,
+) {
+    for (of, _) in before {
+        if now.binary_search_by_key(of, |it| it.0).is_err() {
+            set.remove(&key(of));
+        }
+    }
+    for (of, entry) in now {
+        set.set(key(of), entry.0);
+    }
 }
 
 impl Last {
-    /// Of `built`: every entry made and summed. Linear in the build; a build that patches its
-    /// walk makes only the changed entries and moves the sums by them.
-    pub(super) fn of(built: &Built) -> Last {
+    /// Of `built`, the build after `before` of the same program (none: the first): every
+    /// entry made, and the sets moved from `before`'s by the entries that differ, or made
+    /// whole with none before. Either way the ID is the one a build with nothing kept gets
+    /// (`an_id_kept_through_edits_is_a_fresh_builds`).
+    pub(super) fn of(built: &Built, before: Option<&Last>) -> Last {
         let functions = function_entries(built);
         let statics = static_entries(built);
-        let id = id_of(built, &functions, &statics);
-        Last { id, functions, statics }
+        let sets = match before {
+            Some(before) => {
+                // clone: the last build's sets, which stay its own (a consumer may hold it)
+                let mut sets = before.sets.clone();
+                moved(&mut sets.functions, &before.functions, &functions, function_key);
+                moved(&mut sets.statics, &before.statics, &statics, static_key);
+                sets
+            }
+            None => Sets {
+                functions: whole(&functions, function_key),
+                statics: whole(&statics, static_key),
+            },
+        };
+        let id = id_of(built, &sets);
+        Last { id, functions, statics, sets }
     }
 }
 
@@ -347,32 +415,11 @@ pub(crate) fn static_entries(built: &Built) -> Vec<(StaticId, ContentId)> {
     entries
 }
 
-/// `entry` added to `sum`, word by word.
-fn add(sum: &mut [u64; 4], entry: &ContentId) {
-    for (word, bytes) in sum.iter_mut().zip(entry.0.chunks_exact(8)) {
-        let mut eight = [0; 8];
-        eight.copy_from_slice(bytes);
-        *word = word.wrapping_add(u64::from_le_bytes(eight));
-    }
-}
-
-/// The [`BuiltId`] of `built`, whose entries are `functions` and `statics`.
-fn id_of(
-    built: &Built,
-    functions: &[(InstanceKey, ContentId)],
-    statics: &[(StaticId, ContentId)],
-) -> BuiltId {
-    let (mut of_functions, mut of_statics) = ([0u64; 4], [0u64; 4]);
-    functions.iter().for_each(|(_, entry)| add(&mut of_functions, entry));
-    statics.iter().for_each(|(_, entry)| add(&mut of_statics, entry));
+/// The [`BuiltId`] of `built`, whose entries are in `sets`.
+fn id_of(built: &Built, sets: &Sets) -> BuiltId {
     let mut hasher = Hasher::new(BUILT_ID_DOMAIN);
-    for sum in [of_functions, of_statics] {
-        for word in sum {
-            hasher.update(&word.to_le_bytes());
-        }
-    }
-    hasher.update(&(functions.len() as u64).to_le_bytes());
-    hasher.update(&(statics.len() as u64).to_le_bytes());
+    // Each root says its set's entries and how many there are.
+    hasher.update(&sets.functions.root()).update(&sets.statics.root());
     for list in [&built.roots, &built.entry] {
         hasher.update(&(list.len() as u64).to_le_bytes());
         for key in list {
@@ -388,4 +435,108 @@ fn id_of(
         hasher.id(&function.key.0).id(&content::code_id(function));
     }
     BuiltId(hasher.finish())
+}
+
+#[cfg(test)]
+mod tests {
+    use hegel::generators as gs;
+
+    use super::*;
+
+    /// A key of a small space, so two drawn lists share keys.
+    fn key(at: &u8) -> Hash {
+        ContentId::of("built id test key", &[*at]).0
+    }
+
+    /// A list of entries sorted by key, each key once.
+    #[hegel::composite]
+    fn entries(tc: &hegel::TestCase) -> Vec<(u8, ContentId)> {
+        let keys: Vec<u8> = tc.draw(gs::vecs(gs::integers::<u8>().max_value(15)).max_size(16));
+        let mut made: Vec<(u8, ContentId)> = Vec::new();
+        for at in keys {
+            if made.iter().all(|it| it.0 != at) {
+                let value = tc.draw(gs::integers::<u8>().max_value(3));
+                made.push((at, ContentId::of("built id test entry", &[value])));
+            }
+        }
+        made.sort_unstable_by_key(|it| it.0);
+        made
+    }
+
+    /// The root of the set of `before` moved to `now`, with `plant` leaving out the removals.
+    fn moved_root(before: &[(u8, ContentId)], now: &[(u8, ContentId)], plant: bool) -> Hash {
+        let mut set = whole(before, key);
+        match plant {
+            false => moved(&mut set, before, now, key),
+            true => now.iter().for_each(|(of, entry)| {
+                set.set(key(of), entry.0);
+            }),
+        }
+        set.root()
+    }
+
+    /// The invariant: the ID maintained incrementally equals a fresh build's. The set of one
+    /// build's entries moved to the next build's has the root of the next build's entries made
+    /// whole, whatever was added, changed and removed between them.
+    #[hegel::test]
+    fn an_id_kept_through_edits_is_a_fresh_builds(tc: hegel::TestCase) {
+        let (before, now) = (tc.draw(entries()), tc.draw(entries()));
+        assert_eq!(
+            moved_root(&before, &now, false),
+            whole(&now, key).root(),
+            "moved from {before:?} to {now:?}"
+        );
+    }
+
+    /// A control of [`an_id_kept_through_edits_is_a_fresh_builds`]: a move that removes
+    /// nothing keeps a removed entry in the root.
+    #[test]
+    fn the_oracle_catches_a_removed_entry_kept_in_the_id() {
+        let entry = |value: u8| ContentId::of("built id test entry", &[value]);
+        let before = [(1, entry(0)), (2, entry(1))];
+        let now = [(1, entry(0))];
+        assert_eq!(moved_root(&before, &now, false), whole(&now, key).root());
+        assert_ne!(moved_root(&before, &now, true), whole(&now, key).root());
+    }
+
+    /// What [`BuiltId`] was made of until 2026-11-10: the entries read as four 64-bit words
+    /// and added word by word, wrapping.
+    fn wrapping_sum(entries: &[(u8, ContentId)]) -> [u64; 4] {
+        let mut sum = [0u64; 4];
+        for (_, entry) in entries {
+            for (word, bytes) in sum.iter_mut().zip(entry.0.chunks_exact(8)) {
+                let mut eight = [0; 8];
+                eight.copy_from_slice(bytes);
+                *word = word.wrapping_add(u64::from_le_bytes(eight));
+            }
+        }
+        sum
+    }
+
+    /// The bug the sum had, in miniature: two sets of two entries under the same keys, the
+    /// second's entries the first's with one word moved from one to the other, have one sum
+    /// and one count, so had one ID; and so do the entries `{x, -x}` and `{0, 0}`. Their
+    /// keyed sets have other roots.
+    #[test]
+    fn sets_a_wrapping_sum_takes_for_one_have_other_ids() {
+        let (a, b) = (ContentId::of("built id test entry", &[1]), ContentId::of("built id test entry", &[2]));
+        let shifted = |entry: ContentId, by: u64| {
+            let mut eight = [0; 8];
+            eight.copy_from_slice(&entry.0[..8]);
+            let mut made = entry;
+            made.0[..8].copy_from_slice(&u64::from_le_bytes(eight).wrapping_add(by).to_le_bytes());
+            made
+        };
+        let one = [(1, a), (2, b)];
+        let other = [(1, shifted(a, 1)), (2, shifted(b, u64::MAX))];
+        assert_eq!(wrapping_sum(&one), wrapping_sum(&other), "the sum takes them for one");
+        assert_ne!(whole(&one, key).root(), whole(&other, key).root());
+
+        let x = shifted(ContentId([0; 32]), 7);
+        let minus = shifted(ContentId([0; 32]), 7u64.wrapping_neg());
+        let cancelling = [(1, x), (2, minus)];
+        let zeros = [(1, ContentId([0; 32])), (2, ContentId([0; 32]))];
+        assert_eq!(wrapping_sum(&cancelling), wrapping_sum(&zeros), "the sum takes them for one");
+        assert_ne!(whole(&cancelling, key).root(), whole(&zeros, key).root());
+    }
 }
