@@ -196,11 +196,11 @@ pub struct Frames {
     pub fps: f32,
 }
 
-/// A night sky over the node (harness-native-render sky.rs draws it, no file): a faint nebula along the galaxy's band,
-/// far stars, near ones that twinkle, a shooting star now and then, fading to the ground at its edges. For a pane with
+/// A lit paper lantern hanging in the middle of the node (harness-native-render lantern.rs draws it, no file), its
+/// light flickering a little and falling on the ground under it: pixel art, as a step's item is. For a pane with
 /// nothing in it yet. `on`: whether it shows.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
-pub struct Starfield {
+pub struct Lantern {
     pub on: bool,
 }
 
@@ -380,7 +380,7 @@ hyperion_api_layouts::api_layouts! {
     "Frames" => alias Frames,
     "BlazeMark" => alias BlazeMark,
     "PixelBlock" => alias PixelBlock,
-    "Starfield" => alias Starfield,
+    "Lantern" => alias Lantern,
     "Kip" => alias Kip,
     "KipStand" => alias KipStand,
     "Caret" => alias Caret,
@@ -415,7 +415,7 @@ pub fn register(world: &World) {
     world.component::<Frames>().writable();
     world.component::<BlazeMark>().writable();
     world.component::<PixelBlock>().writable();
-    world.component::<Starfield>().writable();
+    world.component::<Lantern>().writable();
     world.component::<Kip>().writable();
     world.component::<KipStand>().writable();
     world.component::<Caret>().writable();

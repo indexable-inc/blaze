@@ -1667,10 +1667,10 @@ impl App {
                 // Grown past its most, it scrolls on its FieldScroll (step_chat_inputs), the caret kept in view.
             }
         }
-        // The night sky, while nothing was sent in it yet.
-        if let Some(sky) = pv.part("sky") {
-            let on = harness_native_ui_text_api::Starfield { on: !t.items.iter().any(|i| matches!(i, Item::User { .. })) };
-            if sky.entity().try_cloned::<&harness_native_ui_text_api::Starfield>() != Some(on) {
+        // The lantern, while nothing was sent in it yet.
+        if let Some(sky) = pv.part("lantern") {
+            let on = harness_native_ui_text_api::Lantern { on: !t.items.iter().any(|i| matches!(i, Item::User { .. })) };
+            if sky.entity().try_cloned::<&harness_native_ui_text_api::Lantern>() != Some(on) {
                 sky.set(on);
             }
         }

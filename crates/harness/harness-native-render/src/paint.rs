@@ -16,7 +16,7 @@ use harness_native_ui_look_api::{Edge, Fill, HoverInk, HoverLook, Lift, MathLook
 use harness_native_ui_motion_api::{CopyFlash, Pose};
 use harness_native_ui_node_api::Laid;
 use harness_native_ui_text_api::{
-    BlazeMark, Caret, Drawing, Frames, Highlight, Kip, Mark, MarkdownText, OneLine, Picture, PixelBlock, Pixelated, Starfield, Surface, Text, TextRange,
+    BlazeMark, Caret, Lantern, Drawing, Frames, Highlight, Kip, Mark, MarkdownText, OneLine, Picture, PixelBlock, Pixelated, Surface, Text, TextRange,
     TextEdit, Truncate, TruncateMode, Vector, VectorFit, VectorText,
 };
 use harness_native_ui_timeline_api::{GlyphsArrive, GlyphsIn};
@@ -63,10 +63,10 @@ pub struct Painter {
     sheets: HashMap<String, Rc<Sheet>>,
     /// Each `BlazeMark` node's fire, by entity and appearance: its automaton runs on from frame to frame.
     marks: HashMap<(u64, bool), harness_native_blaze::mark::Blaze>,
-    /// The `Starfield` nodes' sky (sky.rs), and whether one was painted in the last frame ([`Painter::end_frame`]): it
-    /// moves, so the host keeps drawing, at its calm rate.
-    sky: crate::sky::Sky,
-    pub sky_live: bool,
+    /// The `Lantern` nodes' lantern (lantern.rs), and whether one was painted in the last frame
+    /// ([`Painter::end_frame`]): its flame moves, so the host keeps drawing, at its calm rate.
+    lanterns: crate::lantern::Lanterns,
+    pub lantern_live: bool,
     /// Each `PixelBlock` node's item (block.rs).
     blocks: crate::block::Blocks,
     /// A block was painted in the last frame ([`Painter::end_frame`]): its item moves, so the host keeps drawing, at
@@ -319,8 +319,8 @@ impl Painter {
             marks: HashMap::new(),
             blocks: crate::block::Blocks::default(),
             blocks_live: false,
-            sky: crate::sky::Sky::default(),
-            sky_live: false,
+            lanterns: crate::lantern::Lanterns::default(),
+            lantern_live: false,
             kips: crate::kips::Kips::default(),
             kip_wake: crate::kips::Wake::None,
             paths: HashMap::new(),
@@ -520,7 +520,7 @@ impl Painter {
     pub fn end_frame(&mut self) -> bool {
         self.kip_wake = self.kips.end_frame();
         self.blocks_live = self.blocks.end_frame();
-        self.sky_live = self.sky.end_frame();
+        self.lantern_live = self.lanterns.end_frame();
         self.arriving = self.arrivals.end_frame();
         self.gliding = self.carets.end_frame();
         self.shimmering = std::mem::take(&mut self.sheening);
@@ -1330,9 +1330,9 @@ impl Painter {
             let laid = e.try_cloned::<&Laid>().map_or(rect, |l| [l.x, l.y, l.w, l.h]);
             return self.kips.paint(d, e, &k, rect, laid, alpha, dark, sc, time);
         }
-        if let Some(s) = e.try_cloned::<&Starfield>() {
+        if let Some(s) = e.try_cloned::<&Lantern>() {
             if s.on {
-                self.sky.paint(d, rect, alpha, dark, sc, time);
+                self.lanterns.paint(d, rect, alpha, dark, sc, time);
             }
             return Ok(());
         }

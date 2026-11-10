@@ -628,11 +628,12 @@ ui {
   prefab caret {
     CaretLook: {w: $caret_w, h: $caret_h, radius: $caret_radius, glide: $caret_glide, hold: $caret_hold, blink: $caret_blink, fade: $caret_fade}
   }
-  // A night sky under a node's content (Starfield, harness-native-render sky.rs): a Background, so it lies on its
-  // parent's frame out of the flow. Its owner turns it `on` while there is nothing else to show.
-  prefab Sky : ui.Node {
+  // A lit paper lantern in the middle of a node (Lantern, harness-native-render lantern.rs; named Lamp because flecs
+  // refuses a prefab named like a component it sets): a Background, so it lies on
+  // its parent's frame out of the flow. Its owner turns it `on` while there is nothing else to show.
+  prefab Lamp : ui.Node {
     Background
-    Starfield: {on: false}
+    Lantern: {on: false}
   }
   // A small pixel-art item, a game's dropped item (PixelBlock, harness-native-render block.rs): its face names what it
   // is and does (`exec` a terminal, `read` a book, `net` the world turning, `think` a crystal, ...); it floats and moves
