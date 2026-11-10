@@ -37,7 +37,7 @@ export type ViewInfo = {
  *  it is sure of; altitude when it has one), and when it was measured (Unix ms). */
 export type Fix = { latitude: number; longitude: number; accuracy_m: number; altitude_m?: number; at_ms: number };
 /** One place Apple Maps found (browser.rs `Place`): empty strings where Maps has nothing. */
-export type Place = { name: string; latitude: number; longitude: number; address: string; phone: string; url: string; category: string };
+export type Place = { id: string; name: string; latitude: number; longitude: number; address: string; phone: string; url: string; category: string };
 export type Extension = { id: string; name: string; version: string; enabled: boolean; popup?: string; source: string; path: string };
 
 /** A socket client's message (browser.rs `KernelUp`). */

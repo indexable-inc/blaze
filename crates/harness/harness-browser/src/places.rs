@@ -134,7 +134,10 @@ pub fn request(conn: u64, req: u64, query: &str, latitude: f64, longitude: f64, 
                 let Some(mark) = mark else { continue };
                 let at: Coordinate = msg_send![&*mark, coordinate];
                 let url: Option<Retained<AnyObject>> = msg_send![&*item, url];
+                // MKMapItem.identifier (macOS 15): an MKMapItemIdentifier, or nil; its rawValue is the id's text.
+                let ident: Option<Retained<AnyObject>> = msg_send![&*item, identifier];
                 out.push(Place {
+                    id: ident.map(|i| text(&i, objc2::sel!(rawValue))).unwrap_or_default(),
                     name: text(&item, objc2::sel!(name)),
                     latitude: at.latitude,
                     longitude: at.longitude,

@@ -16,7 +16,7 @@ export const MAX_MAP_DETAIL = 400;
 export const MAX_MAP_ZOOM = 19;
 
 /** One place: where it is, the words beside its pin, a line more and a link shown when it is pressed. */
-export interface MapMarker { lat: number; lon: number; label?: string; detail?: string; href?: string }
+export interface MapMarker { lat: number; lon: number; label?: string; detail?: string; href?: string; place?: string }
 /** A Map as the app reads it: every place checked, points as [lat, lon]. */
 export interface MapSpec { markers: MapMarker[]; center?: [number, number]; zoom?: number; here?: [number, number] }
 
@@ -25,8 +25,8 @@ const said = (v: unknown): string => {
   return text.length > 60 ? `${text.slice(0, 59)}…` : text;
 };
 const finite = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
-const MARKER_SAID = '{lat, lon, label?, detail?, href?}';
-const MARKER_KEYS = ['lat', 'lon', 'label', 'detail', 'href'];
+const MARKER_SAID = '{lat, lon, label?, detail?, href?, place?}';
+const MARKER_KEYS = ['lat', 'lon', 'label', 'detail', 'href', 'place'];
 /** What a place's key was most likely meant to be. */
 const MARKER_MEANT: Readonly<Record<string, string>> = {
   lng: 'lon', long: 'lon', longitude: 'lon', latitude: 'lat', name: 'label', title: 'label', text: 'label', description: 'detail', note: 'detail',
@@ -88,6 +88,11 @@ export function markersOf(value: unknown): MapMarker[] | string {
       if (typeof o.href !== 'string' || !/^https?:\/\/\S+$/i.test(o.href.trim())) return `${what} has href ${said(o.href)}: an http(s) URL, href: 'https://example.com'`;
       marker.href = o.href.trim();
     }
+    // The place as Apple Maps knows it (places()'s `id`): its pin shows Apple's own card of it, with its pictures and hours.
+    if (o.place !== undefined && o.place !== null && o.place !== '') {
+      if (typeof o.place !== 'string' || !/^[A-Za-z0-9]{1,64}$/.test(o.place)) return `${what} has place ${said(o.place)}: a place's id as places() gives it, place: p.id`;
+      marker.place = o.place;
+    }
     out.push(marker);
   }
   return out;
@@ -135,7 +140,7 @@ export function mapOf(props: Record<string, unknown>): MapSpec | string {
 
 /**
  * The Map's own props on the wire, `{type: 'Map', props}` (the app's genui/map.rs checks and reads exactly these): `markers` always,
- * a list of `{lat, lon, label?, detail?, href?}`; `here` and `center` as `[lat, lon]` and `zoom` as a number, each only when said.
+ * a list of `{lat, lon, label?, detail?, href?, place?}`; `here` and `center` as `[lat, lon]` and `zoom` as a number, each only when said.
  */
 export function mapWire(spec: MapSpec): Record<string, unknown> {
   const out: Record<string, unknown> = { markers: spec.markers };
