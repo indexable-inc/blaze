@@ -1,0 +1,70 @@
+# The budget smoke's bounds known to fail (harness/v2/guards.py; docs/harness.md, "The smoke's
+# guards"). Each entry is one bound on one step of one fixture, the number measured when it was
+# recorded, and the cause in a line. A listed bound may fail by no more than `measured` (a time by
+# half as much again, for noise); one listed that passes fails the run until it is taken out; one
+# not listed that fails fails the run. The list only shrinks. Written by:
+#   uv run --frozen python harness/v2/budgets.py '{"command": "smoke", "record": true, "engine": {...}}'
+#
+# Not yet recorded on the gate's machine: the numbers below are the ones traced by hand on
+# 2026-11-10 on another program (about 10,000 untracked runs of `identity_of` a build; about 200 ms
+# in `lower workspace` and 190 ms in `maintainer reads` on a comment edit), so the first run
+# against a built blaze has to record them again before this list holds anything.
+
+[[known]]
+fixture = "onefile"
+step = "comment"
+check = "lower_ms"
+measured = 200
+cause = "`lower workspace` runs whole on an edit that changes no token (2026-11-10)"
+
+[[known]]
+fixture = "onefile"
+step = "comment"
+check = "maintain_ms"
+measured = 190
+cause = "the maintainers read every unit again though nothing they read changed (2026-11-10)"
+
+[[known]]
+fixture = "onefile"
+step = "comment"
+check = "ran_untracked"
+measured = 10000
+cause = "`identity_of` is untracked, so it runs in every view (2026-11-10)"
+
+[[known]]
+fixture = "onefile"
+step = "noop"
+check = "ran_untracked"
+measured = 10000
+cause = "`identity_of` is untracked, so it runs in every view (2026-11-10)"
+
+[[known]]
+fixture = "workspace"
+step = "comment"
+check = "lower_ms"
+measured = 200
+cause = "`lower workspace` runs whole on an edit that changes no token (2026-11-10)"
+
+[[known]]
+fixture = "workspace"
+step = "comment"
+check = "maintain_ms"
+measured = 190
+cause = "the maintainers read every unit again though nothing they read changed (2026-11-10)"
+
+[[known]]
+fixture = "workspace"
+step = "comment"
+check = "ran_untracked"
+measured = 10000
+cause = "`identity_of` is untracked, so it runs in every view (2026-11-10)"
+
+[[known]]
+fixture = "workspace"
+step = "noop"
+check = "ran_untracked"
+measured = 10000
+cause = "`identity_of` is untracked, so it runs in every view (2026-11-10)"
+
+[recorded]
+tree = "not recorded: written by hand from the main agent's traces of 2026-11-10"
