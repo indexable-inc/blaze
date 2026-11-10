@@ -2,7 +2,7 @@
 import { googleSearch } from "./google.ts";
 import { gmail } from "./gmail.ts";
 import { github } from "./github.ts";
-import { browser } from "./browser.ts";
+import { browser, location } from "./browser.ts";
 import { withHiddenPage } from "../cdp.ts";
 import { table, Table, LazyTable, col, lit, tableDocs } from "../table.ts";
 import { gitLog } from "../git-log.ts";
@@ -35,7 +35,7 @@ const wait = (id: string | number, timeoutMs?: number) =>
     show: v.status === "running" ? undefined : taskValue(id),
   }));
 
-export const functions = { progress, skill, skills, rg, ls, glob, du, cargo, follow, $, pmap, image, vfs, spawn, obj, objects, tree, sql, googleSearch, gmail, github, browser, withHiddenPage, table, Table, LazyTable, col, lit, gitLog, nuon, tasks, task, taskValue, wait, sh, procs, out, err, lines, kill, ptree, runs, stage, runInfo, agents, world, phone, call };
+export const functions = { progress, skill, skills, rg, ls, glob, du, cargo, follow, $, pmap, image, vfs, spawn, obj, objects, tree, sql, googleSearch, gmail, github, browser, location, withHiddenPage, table, Table, LazyTable, col, lit, gitLog, nuon, tasks, task, taskValue, wait, sh, procs, out, err, lines, kill, ptree, runs, stage, runInfo, agents, world, phone, call };
 
 /** Shown in the MCP tool description so the model knows what it can call. A call only some tasks need keeps its long
  *  reference in a skill (mcp/skills/) and a one-line pointer here. */
@@ -63,11 +63,13 @@ export const docs: Record<keyof typeof functions, string> = {
     "googleSearch(query: string, opts?: { limit?: number = 10; hl?: string = 'en' }): Promise<Table<{ title; url; resolved: boolean; site; snippet }>> — Google search in a page of the harness browser (embedded Chromium the daemon runs; its card shows in the chat). url is the real link when resolved, else Google's /goto link (Google throttles resolving after ~2 per page); site is the displayed breadcrumb.",
   gmail: "gmail.* — Andrew's Gmail through the harness browser's profile (he signs in once in the browser pane, cmd+shift+B): search, messages, read, labels, attachment, send, reply, forward, draft, archive, trash, label, markRead, via; await skill('gmail') for every call's arguments and rows before using it.",
   browser:
-    "browser.* — the harness browser (embedded Chromium the daemon runs; the person sees it in the browser pane, cmd+shift+B). open(url): Promise<Page> opens url in a view that stays open (a tab in the pane), loaded or after 20 s still loading, and shows it as a live card in the chat; draw one yourself with <Browser view={page.view} /> or <Browser src=\"https://…\" />. views(): Table<{ view; target; url; title; loading; can_back; can_forward; owner; size; scale }>. extensions(): Table<{ id; name; version; enabled; popup; source: store|unpacked; path }>. manage(url? = 'chrome://extensions'): opens the manage window (a full Chrome-style window: install from the Chrome Web Store there). When the browser cannot start, every call throws CdpUnavailable naming why (no other browser is tried).",
+    "browser.* — the harness browser (embedded Chromium the daemon runs; the person sees it in the browser pane, cmd+shift+B). read(url | urls[], { maxChars? }): Table<{ url; title; text; error }> = the words of every page (innerText once settled), each in a hidden view, six at a time: to read several pages (search results, reviews, docs) make ONE read call, never a loop of goto and sleeps over one page. open(url): Promise<Page> opens url in a view that stays open (a tab in the pane), loaded or after 20 s still loading, and shows it as a live card in the chat; draw one yourself with <Browser view={page.view} /> or <Browser src=\"https://…\" />. views(): Table<{ view; target; url; title; loading; can_back; can_forward; owner; size; scale }>. extensions(): Table<{ id; name; version; enabled; popup; source: store|unpacked; path }>. manage(url? = 'chrome://extensions'): opens the manage window (a full Chrome-style window: install from the Chrome Web Store there). When the browser cannot start, every call throws CdpUnavailable naming why (no other browser is tried).",
+  location:
+    "location(): Promise<{ latitude; longitude; accuracy_m; altitude_m?; at_ms; at; maps }> — where this Mac (so the person) is now, from macOS Location Services through the harness browser's host; the first call makes macOS ask the person. Use it for anything 'near me'; it throws, saying why, when Location Services is off or refused (do not guess from IP or timezone instead: say so).",
   github:
     "github.* — GitHub with gh's token, never `gh api` in a shell: graphql<T>(query, vars?): Promise<T> (data, typed by you); prs({ repo: 'owner/name', state?: open|closed|merged|all = open, author?, limit? = 30 }): Table<{ number; title; state; draft; author; ci: success|failure|pending|error|null; mergeable; review: approved|changes_requested|review_required|null; head; base; created; updated; url }>; pr({ repo, n }): that row plus body, sha, files, checks, comments, reviews (Tables); issues({ repo, state?, author?, assignee?, labels?, limit? }): Table<{ number; title; state; author; labels; assignees; comments; created; updated; url }>; checks({ repo, ref }): Table<{ name; workflow; status; conclusion; url; started; completed }>; rest(path, { method?, body? }) for what GraphQL lacks (Actions logs). await skill('github') first.",
   withHiddenPage:
-    "withHiddenPage<T>(fn: (page) => Promise<T>): Promise<T> — a page of the harness browser for fn, closed afterwards; page has view, goto(url) (a cell's goto shows the page as a live card), evaluate(fn, arg), waitForSelector(sel), url(), title(), send(cdpMethod, params), on(cdpEvent, fn), waitFor(cdpEvent, ms).",
+    "withHiddenPage<T>(fn: (page) => Promise<T>): Promise<T> — a page of the harness browser for fn, closed afterwards; page (a Page, as browser.open gives too) has view, goto(url) (waits for the load event; a cell's goto shows the page as a live card), text() (its words, innerText, once the page has settled: no sleep before it), evaluate(fn | 'expression', arg) (fn runs in the page: it cannot close over cell variables, pass arg), waitForSelector(sel), url(), title(), close(), and all of DevTools: send(cdpMethod, params) (every page-session domain, and Browser.*, Target.*, Storage.* too), on(cdpEvent, fn), waitFor(cdpEvent, ms).",
   table: tableDocs.table,
   col: tableDocs.col,
   lit: "lit(value) — see col.",

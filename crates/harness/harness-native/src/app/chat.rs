@@ -312,6 +312,20 @@ impl Draft {
         self.insert("");
     }
 
+    /// Leave an aside: the spaces the draft starts with go (they are what makes it one, [`is_aside`]), what follows
+    /// stays as an ordinary message, the caret and selection keeping their place in it. Whether it was one.
+    fn leave_aside(&mut self) -> bool {
+        let n = self.text.len() - self.text.trim_start_matches(' ').len();
+        if n == 0 {
+            return false;
+        }
+        let (caret, anchor) = (self.caret.saturating_sub(n), self.anchor.saturating_sub(n));
+        (self.caret, self.anchor) = (0, n);
+        self.insert("");
+        (self.caret, self.anchor) = (caret, anchor);
+        true
+    }
+
     /// What a press at byte `i` selects by `unit`: nothing (the caret there), its word, or its line.
     fn span(&self, i: usize, unit: Unit) -> (usize, usize) {
         match unit {
@@ -969,7 +983,7 @@ fn empty_value(v: &Value) -> bool {
             "text" => blank("v"),
             "error" => blank("stack") && blank("message"),
             "scalar" => false,
-            "browser" => v["view"].as_u64().is_none_or(|n| n == 0),
+            "browser" => genui::browser_view_id(&v["view"]).is_none(),
             _ => true,
         },
     }
@@ -2458,6 +2472,20 @@ impl App {
         closed
     }
 
+    /// The focused chat's draft, an aside, made an ordinary message ([`Draft::leave_aside`]); with `at_start`, only
+    /// while its caret is before the space with nothing selected. Whether it was.
+    fn chat_leave_aside(&mut self, at_start: bool) -> bool {
+        let Some((_, _, sid)) = self.focused_chat() else { return false };
+        let left = self.chat.borrow_mut().get_mut(&sid).is_some_and(|st| {
+            let d = &mut st.draft;
+            d.marked.is_none() && (!at_start || (d.caret == 0 && d.anchor == 0)) && d.leave_aside()
+        });
+        if left {
+            self.poke();
+        }
+        left
+    }
+
     /// An aside card's close button (`chat:aside_close:<sid>`): chat `sid`'s aside closed.
     pub(in crate::app) fn chat_aside_dismiss(&mut self, rest: &str) {
         let Ok(sid) = rest.parse::<u64>() else {
@@ -2495,6 +2523,12 @@ impl App {
         // Escape closes the picker's menu, what a cell floats over the transcript (a popover, a menu, a dialog), and an
         // aside's card, before it interrupts.
         if op == "interrupt" && (self.chat_pick_close() || self.genui_escape() || self.chat_aside_close() || self.chat_ctx_close()) {
+            return;
+        }
+        // Then Escape leaves an aside being written, and so does Backspace with the caret before its space, where there
+        // is nothing to erase and the space, unseen while the hint shows, could not be found: the draft is an ordinary
+        // message again.
+        if matches!(op, "interrupt" | "backspace") && !self.renaming() && !self.genui_editing() && self.chat_leave_aside(op == "backspace") {
             return;
         }
         let Some((_, _, sid)) = self.focused_chat() else { return };
@@ -3934,6 +3968,28 @@ mod tests {
 
     /// What of a block still streaming may show: whole words, never a bold run or code span still open, never a line that
     /// so far only opens a list item, a heading or a fence; all of it once done.
+    /// An aside is left by taking the spaces it starts with: what follows stays, the caret keeps its place in it, and a
+    /// draft that is no aside is left alone.
+    #[test]
+    fn leaving_an_aside_keeps_the_words() {
+        let mut d = Draft { text: "  why".into(), caret: 4, anchor: 4, ..Draft::default() };
+        assert!(d.leave_aside());
+        assert_eq!((d.text.as_str(), d.caret, d.anchor), ("why", 2, 2));
+        assert!(!d.leave_aside());
+        let mut blank = Draft { text: " ".into(), ..Draft::default() };
+        assert!(blank.leave_aside());
+        assert_eq!((blank.text.as_str(), blank.caret), ("", 0));
+    }
+
+    /// A page's card is drawn whether the kernel names its view in digits (as it does) or as a number.
+    #[test]
+    fn a_browser_card_takes_the_kernels_view_id() {
+        assert!(!empty_value(&serde_json::json!({"t": "browser", "view": "4", "url": "https://x", "title": ""})));
+        assert!(!empty_value(&serde_json::json!({"t": "browser", "view": 4})));
+        assert!(empty_value(&serde_json::json!({"t": "browser", "view": "0"})));
+        assert!(empty_value(&serde_json::json!({"t": "browser", "view": "x"})));
+    }
+
     #[test]
     fn streaming_words_show_only_what_more_cannot_change() {
         fn at(t: &str) -> &str {

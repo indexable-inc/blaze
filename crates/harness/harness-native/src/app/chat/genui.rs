@@ -30,6 +30,7 @@ mod surface;
 pub use common::{GenFeel, GenOn, Prims};
 pub use control::Live;
 pub(super) use browser::shown_card;
+pub(super) use browser::view_id as browser_view_id;
 
 /// The most elements one cell draws, how deep they nest, and the most rows and columns a table shows.
 const MAX_ELEMENTS: usize = 600;
