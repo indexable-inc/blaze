@@ -401,6 +401,35 @@ planted bug; a differential test that runs the same programs under `Fibers` and 
 compares outputs and the order of cancellations, drops and panics; and a UI test for each error
 above.
 
+### Files: whether bytes reached the disk is in the type
+
+Decided 2026-11-10, after a build's answer was held four seconds on a 162 MB executable: the
+store wrote the file without a sync and then cloned it, and a clone of a file whose data is
+still in the page cache makes the kernel write it out first (1.3 s there, against 29 ms for the
+write and 1 ms for a clone of a flushed file). The API let "write, then clone" be written and
+hid the two things that decide its cost.
+
+- **Durability is an argument with no default.** Every write, rename and publish takes
+  `Durable::No` (derived data: lost at a power failure and made again), `Durable::Started`
+  (writeback begun, nothing waits) or `Durable::Yes` (synced: the one that waits for the
+  device). Only `Durable::Yes` and `flush` may block (`may(block)`), so a caller checked as
+  non-blocking cannot reach a sync.
+- **A file whose data may not be on disk is another type.** `dir.write(..)` gives `Written`;
+  `written.flush(cx)` gives `Flushed`, and is the wait. `clone_to` exists on `Flushed` alone;
+  `copy_to` (a plain write of the bytes) is on both. A clone that forces writeback cannot be
+  written.
+- **Say what a path should hold, not how.** `dir.publish(path, content, durable)` makes `path`
+  hold `content`, replaced atomically, where `content` is bytes, another file, or a file and
+  the ranges that differ from it (`Content::patch_of(&base, ranges)`). bstd picks a clone, a
+  derive (clone and write the ranges), a write or a link from what it knows: whether the base
+  is flushed, whether both paths are on one file system, how much differs. Its span says which
+  it took. The store's placement of outputs is one caller.
+- **The simulation charges for it.** `Sim` counts the bytes a clone of an unflushed file forces
+  out, so a test of an edit path asserts none were, with no real disk.
+
+Until records land ([edition](edition.md), change 4) the options are a `Durable` argument and
+plain parameters; with them, `publish(path, content, { durable: Durable::No, .. })`.
+
 ## Values that must be finished
 
 bstd is written with linear types ([linear](linear.md)): a `#[blaze::linear]` value cannot be
