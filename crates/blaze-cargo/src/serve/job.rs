@@ -36,6 +36,7 @@
 
 pub(super) mod doing;
 mod kept;
+mod noop;
 mod slab;
 #[cfg(test)]
 mod tests;
@@ -102,6 +103,7 @@ use std::alloc::Global;
 
 use blaze_mem::{Handle, MemError, Tag as MemTag};
 
+use self::noop::{Asked as NoopAsked, Inputs, Last, Recording, Unkept, Vouches, Walk};
 use self::slab::{Table, Tagged};
 use super::{
     heads::Heads,
@@ -1159,28 +1161,6 @@ struct Placement {
     meta: Option<Meta>,
 }
 
-/// The request variable that asks for a no-op to be answered from the checkout's last answer
-/// ([`LastAnswer`]): `replay` asks it, `walk` or nothing has every build walk its units.
-/// Opt-in until the walk's every look at the disk is known to be counted
-/// ([`blaze_vfs::outside::looks`]); docs/cargo.md names it.
-pub(crate) const NOOP: &str = "BLAZE_NOOP";
-
-/// Whether the request's environment asks for [`NOOP`]'s replay; another value of it is an
-/// error naming it.
-fn noop_asked(env: &[(String, String)]) -> Result<bool, ApiError> {
-    match env.iter().find(|(name, _)| name == NOOP).map(|(_, value)| value.as_str()) {
-        None | Some("" | "walk") => Ok(false),
-        Some("replay") => Ok(true),
-        // alloc: an error, once
-        Some(other) => Err(ApiError::new(
-            format!(
-                "{NOOP} is `replay` (a build with nothing changed answers as the last one did) or `walk`, not `{other}`"
-            ),
-            Some(NOOP.to_owned()),
-        )),
-    }
-}
-
 /// The directories `units`' outputs are in: under each of its build dirs, the first directory
 /// of each output's path (a profile's, or a target's), sorted, each once. These, not the build
 /// dirs themselves, which every build writes its record into (docs/gc.md). `None` when an
@@ -1213,17 +1193,7 @@ pub(super) fn output_dirs_of<'a>(
     Some(dirs)
 }
 
-/// What the watches of directories outside every view say ([`blaze_vfs::outside`]), as
-/// [`LastAnswer::replayable`] asks it: the process's table in the daemon, a table of the
-/// test's in a test.
-pub(super) trait Vouches {
-    /// [`blaze_vfs::outside::quiet_since`].
-    fn quiet_since(&self, generation: u64) -> bool;
-    /// [`blaze_vfs::outside::unchanged_since`].
-    fn unchanged_since(&self, dir: &std::path::Path, generation: u64) -> bool;
-}
-
-/// The process's watches.
+/// The process's watches of directories outside every view ([`blaze_vfs::outside`]).
 struct Watched;
 
 impl Vouches for Watched {
@@ -1234,156 +1204,104 @@ impl Vouches for Watched {
     fn unchanged_since(&self, dir: &std::path::Path, generation: u64) -> bool {
         blaze_vfs::outside::unchanged_since(dir, generation)
     }
-}
 
-/// Why a checkout's last answer is not replayed, and the build walks its units.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub(super) enum NotReplayed {
-    /// No build of the checkout that walked every unit and made nothing has ended since the
-    /// last one that made something.
-    NoAnswer,
-    /// The view or the config (the command line, the environment, the mounts, the toolchain)
-    /// is another than the answer's.
-    OtherKey,
-    /// Another job is under way, which may be writing the outputs now.
-    NotAlone,
-    /// A change was heard under a watched directory outside every view since the answer's
-    /// walk began, or a watch stopped vouching, or a round of flushes is out.
-    Disturbed,
-    /// Something under this directory of outputs changed or was removed since the answer's
-    /// walk began, or it has not been watched since before then.
-    OutputsMoved(std::path::PathBuf),
-}
-
-impl std::fmt::Display for NotReplayed {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            NotReplayed::NoAnswer => f.write_str("no build of it that made nothing is kept"),
-            NotReplayed::OtherKey => f.write_str("its view or its config is another"),
-            NotReplayed::NotAlone => f.write_str("another job is under way"),
-            NotReplayed::Disturbed => f.write_str(
-                "a change was heard outside the view since the kept build began, or a watch stopped vouching",
-            ),
-            NotReplayed::OutputsMoved(dir) => write!(
-                f,
-                "{} changed since the kept build began, or was not watched then",
-                dir.display()
-            ),
-        }
+    fn absent(&self, path: &std::path::Path) -> bool {
+        matches!(std::fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
     }
 }
 
-/// A bug a test plants in [`LastAnswer::replayable`], which its oracle has to catch.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum Plant {
-    /// Replays whatever happened to the outputs (a deleted binary, `blaze clean`).
-    IgnoresOutputs,
-    /// Replays whatever was heard outside the view (a file a build script traced).
-    IgnoresOutside,
-    /// Replays an answer of another view or config (a source edit, a variable, a flag).
-    IgnoresKey,
-    /// Replays while another job may be writing the outputs.
-    IgnoresOthers,
-}
-
-#[cfg(test)]
-thread_local! {
-    /// The bug the test on this thread planted.
-    pub(super) static PLANTED: std::cell::Cell<Option<Plant>> = const { std::cell::Cell::new(None) };
-}
-
-/// Whether the test on this thread planted `plant`; never outside a test.
-fn planted(plant: Plant) -> bool {
-    #[cfg(test)]
-    let planted = PLANTED.get() == Some(plant);
-    #[cfg(not(test))]
-    let planted = {
-        _ = plant;
-        false
+/// The hash of a request's work and its whole `Targets` ([`Inputs::request`]): what the
+/// view's config does not hold of it. `None` for work the lane does not answer.
+fn request_id(work: &Work) -> Option<ContentId> {
+    let (word, targets) = match work {
+        Work::Build(targets) => ("build", targets),
+        Work::Check(targets) => ("check", targets),
+        _ => return None,
     };
-    planted
+    // alloc: the request's encoding, once a build or check
+    let encoded = blaze_protocol::cbor::to_vec(targets)
+        .expect("a request's targets are plain data, which CBOR encodes");
+    Some(Hasher::new("blaze v2 serve no-op request").part(word.as_bytes()).part(&encoded).finish())
 }
 
-/// The answer of a checkout's last build that walked every unit and made nothing: what the
-/// next build of the same view and config says again without walking, while nothing it rests
-/// on moved ([`LastAnswer::replayable`]). Only such a build's answer is kept, never one that
-/// compiled, placed or missed anything, so what is replayed is what a walk said of this very
-/// state: its warnings, its units and its artifacts as a build with nothing to do says them.
-///
-/// Kept in memory, per checkout, and dropped by the next job of the checkout that walks; a
-/// restarted daemon keeps none, and walks.
-pub(super) struct LastAnswer {
-    /// [`LastPlan::key`] of the build: its view's root and its whole config.
-    pub(super) key: ContentId,
-    /// [`blaze_vfs::outside::generation`] as read before the build looked at anything.
-    pub(super) generation: u64,
-    /// The directories its outputs are in ([`output_dirs`]), each canonical.
-    pub(super) dirs: Arc<[std::path::PathBuf]>,
-    /// What it said, in order, but its `Work` and its progress.
-    pub(super) responses: Arc<[Response]>,
-    /// Its `Work`, for a build; a check says none.
-    pub(super) worked: Option<Worked>,
+/// The hash of a view's config, by its encoding ([`Inputs::config_id`]).
+fn config_id(encoded: &[u8]) -> ContentId {
+    Hasher::new("blaze v2 serve no-op config").part(encoded).finish()
 }
 
-impl LastAnswer {
-    /// Whether a build of `key`, `alone` among the jobs, is answered by this: every input of
-    /// the answer's walk is as it was.
-    ///
-    /// - The view and the config are the answer's (`key`): every file of the checkout, the
-    ///   command line, the request's whole environment, the config files, the mounts (each
-    ///   path dependency outside the view by its root) and the toolchain.
-    /// - Nothing was heard under any watched directory outside every view since the walk
-    ///   began, and no watch stopped vouching ([`Vouches::quiet_since`]): the walk looked at
-    ///   no such path on the disk (or its answer was not kept, [`Jobs::keep_answer`]), so each
-    ///   path outside the view it rested on was vouched for by a watch, and still is.
-    /// - Each directory of outputs has been watched since before the walk began and heard
-    ///   nothing since ([`Vouches::unchanged_since`]): the walk found every output in place
-    ///   (it placed none), and none was written, replaced or removed after. `blaze clean` and
-    ///   a deleted binary are changes there, so the next build walks and places them again.
-    /// - No other job is under way: one could be writing the outputs now, which the watches
-    ///   hear only after.
-    pub(super) fn replayable(
-        &self,
-        key: ContentId,
-        alone: bool,
-        watches: &impl Vouches,
-    ) -> Result<(), NotReplayed> {
-        if self.key != key && !planted(Plant::IgnoresKey) {
-            return Err(NotReplayed::OtherKey);
-        }
-        if !alone && !planted(Plant::IgnoresOthers) {
-            return Err(NotReplayed::NotAlone);
-        }
-        if !watches.quiet_since(self.generation) && !planted(Plant::IgnoresOutside) {
-            return Err(NotReplayed::Disturbed);
-        }
-        let moved = self.dirs.iter().find(|dir| !watches.unchanged_since(dir, self.generation));
-        if let Some(dir) = moved
-            && !planted(Plant::IgnoresOutputs)
-        {
-            return Err(NotReplayed::OutputsMoved(dir.clone())); // clone: a reason, once
-        }
-        Ok(())
+/// Whether the watch of `dir`, a path dependency's directory outside the view, vouches that
+/// nothing under it changed since `generation` was read ([`Mounts::stale_locals`]).
+fn vouched_local(dir: &str, generation: u64) -> bool {
+    blaze_vfs::outside::unchanged_since(std::path::Path::new(dir), generation)
+}
+
+/// The directory of a build's layout profiles under its target directory
+/// (`unit::layout::DIR`, which every unit that links reads off the disk).
+const LAYOUT: &str = "layout";
+
+/// What a walk of `units` rests on that only a watch or a look can vouch for, found before
+/// the walk looks at anything: the directories to ask the watches of (each one its outputs
+/// are in, canonical, and its layout profiles' when there is one, watched from the next
+/// round), and the paths that are not there and must stay so (its layout profiles' when
+/// there is none: no watch is confirmed of a directory that is not there). Else why no
+/// answer of such a walk is kept.
+fn recorded_dirs(
+    units: &Units,
+) -> Result<(Vec<std::path::PathBuf>, Vec<std::path::PathBuf>), Unkept> {
+    use std::path::Path;
+    // A profile to use is read off the disk by each build (`unit::codegen::read_profile`),
+    // wherever its flag names it: no watch is asked of it.
+    let profiled = |flag: &String| flag.contains("profile-use") || flag.contains("profile_use");
+    if units.plans.iter().any(|plan| plan.rustflags.iter().any(profiled)) {
+        return Err(Unkept::Uncounted("a `-C profile-use` profile"));
     }
+    let Some(mut dirs) = output_dirs(units) else { return Err(Unkept::Outputs) };
+    // A watch hears nothing of a symlink above its directory being pointed elsewhere
+    // ([`blaze_vfs::outside::unchanged_since`]): a directory named through one is not
+    // vouched for. A resolve of each, once a build that walks.
+    let _span = tracing::info_span!(
+        target: "blaze",
+        "no-op answer: resolve the output directories",
+        dirs = dirs.len(),
+    )
+    .entered();
+    let canonical = |dir: &Path| std::fs::canonicalize(dir).is_ok_and(|it| it == dir);
+    if !dirs.iter().all(|dir| canonical(dir.as_path())) {
+        return Err(Unkept::Outputs);
+    }
+    let layout = Path::new(&units.target_dir).join(LAYOUT);
+    let mut absent = Vec::new(); // alloc: once a build that walks, a path
+    match std::fs::symlink_metadata(&layout) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => absent.push(layout),
+        Ok(meta) if meta.is_dir() && canonical(layout.as_path()) => {
+            blaze_vfs::outside::want(&layout);
+            dirs.push(layout);
+        }
+        _ => return Err(Unkept::Looked(Some(layout))),
+    }
+    Ok((dirs, absent))
 }
 
-/// A build that may become its checkout's [`LastAnswer`]: one that asked for [`NOOP`]'s
-/// replay and walks the checkout's last plan. What it says is noted as the daemon tells it
-/// ([`Jobs::heard`]), and it is kept once it ends, if it made nothing ([`Jobs::keep_answer`]).
-struct Recording {
+/// A build under way that may become its checkout's kept answer ([`Jobs::record_answer`]).
+struct Recorded {
     job: JobId,
     root: u32,
-    key: ContentId,
-    /// [`blaze_vfs::outside::generation`] and [`blaze_vfs::outside::looks`] as its view was
-    /// opened, before it looked at anything.
-    generation: u64,
-    looks: u64,
-    dirs: Vec<std::path::PathBuf>,
-    responses: Vec<Response>,
-    /// Why it is not kept, once something says so.
-    refused: Option<&'static str>,
+    recording: Recording,
     /// Set as the job winds up: whether it made nothing, and its `Work`.
     walked: Option<(bool, Option<Worked>)>,
+}
+
+/// A view as a job is to build it ([`Jobs::viewed`]).
+struct Viewed {
+    /// Where the view's root is, absolute.
+    root_dir: String,
+    /// The checkout `root_dir` is in [`Jobs::roots`]; none for an agent's view.
+    root: Option<u32>,
+    config: BuildConfig,
+    /// `config`, encoded.
+    encoded: Vec<u8>,
+    /// The view's root and its config as one: what [`LastPlan::key`] is matched by.
+    key: ContentId,
 }
 
 /// The last plan of a head's view: a job of the same view and config reads its database
@@ -1637,8 +1555,9 @@ struct Roots<S: Steps> {
     storing: Vec<u32>,
     /// The outputs of its last units, as ids.
     outputs: Vec<Option<Arc<Outputs>>>,
-    /// The answer of its last build that made nothing ([`LastAnswer`]), until a job of it walks.
-    answers: Vec<Option<LastAnswer>>,
+    /// The answer of its last build that made nothing ([`noop::LastAnswer`]), until a job of
+    /// it walks; or why it has none.
+    answers: Vec<Last>,
 }
 
 impl<S: Steps> Roots<S> {
@@ -1663,7 +1582,7 @@ impl<S: Steps> Roots<S> {
         self.fronts.push(None);
         self.storing.push(0);
         self.outputs.push(None);
-        self.answers.push(None);
+        self.answers.push(Err(Unkept::None));
         id
     }
 }
@@ -2169,9 +2088,10 @@ struct Job<S: Steps> {
     /// It placed an output ([`Jobs::place`]), whatever its bytes: its answer is not one of a
     /// build that made nothing.
     placed_any: bool,
-    /// It was answered from its checkout's [`LastAnswer`] ([`Jobs::replay`]): it read nothing
-    /// of the store and put nothing, so its end waits for no commit.
-    replayed: bool,
+    /// Why its checkout's kept answer was not said again and it walks, as the input `blaze
+    /// why` names ([`noop::NotReplayed::input`]): its one miss when it ends having computed nothing
+    /// again ([`Job::ended`]). None where its own work says why it walked.
+    walks: Option<(String, ContentId)>,
 }
 
 /// A job's kept front end being stored ([`Jobs::store_kept`]), by one task of a plane request
@@ -2652,6 +2572,40 @@ impl<S: Steps> Job<S> {
         misses.sort_unstable();
         misses.dedup();
         self.missed = misses.len() as u64;
+        // A build that computed nothing again, and walked though its checkout's kept answer
+        // could have been said again: what `blaze why` says of it is the input that moved or
+        // that nothing covers ([`noop::NotReplayed::input`]). Not counted in `missed`: it computed
+        // nothing, so its client asks for no summary and its own answer may be kept.
+        if misses.is_empty()
+            && self.compiled == 0
+            && let Some((input, key)) = self.walks.take()
+        {
+            let command = command_line(&self.work);
+            let root = targets_of(&self.work)
+                .and_then(|it| it.cargo.as_ref())
+                .map_or("", |cargo| cargo.root.as_str());
+            misses.push(blaze_kernel::Miss {
+                step: noop::STEP,
+                subject: Hasher::new("blaze v2 serve no-op subject")
+                    .part(root.as_bytes())
+                    .part(command.as_bytes())
+                    .finish(),
+                item: format!("`{command}` in {root}"), // alloc: once a build that walked
+                missed: blaze_kernel::Missed::Read {
+                    read: input,
+                    names: None,
+                    was: blaze_kernel::Seen::Gone,
+                    now: blaze_kernel::Seen::Is(key),
+                    changed: 1,
+                    reads: 1,
+                },
+                key,
+                kept: None,
+                parts: Vec::new(), // alloc: none
+                beyond: None,
+                via: None,
+            });
+        }
         let mut test_runs = std::mem::take(&mut self.test_runs);
         for it in &mut test_runs {
             it.build_id = build_id;
@@ -2894,8 +2848,9 @@ pub struct Jobs<S: Steps> {
     held_leases: Vec<(JobId, Arc<AtomicBool>, Arc<Lock<Leases>>)>,
     /// Lowerings waiting for their root's front end to be stored ([`Jobs::lower`]).
     lowering: Vec<Lowering>,
-    /// The builds under way that may become their checkout's [`LastAnswer`].
-    recordings: Vec<Recording>,
+    /// The builds under way that may become their checkout's kept answer
+    /// ([`noop::LastAnswer`]), each with its job and its checkout.
+    recordings: Vec<Recorded>,
     /// The plane requests of kept front ends' stores ([`Jobs::store_kept`]), until each
     /// finishes: a store is part of its job's build, never a build of its own.
     store_requests: HashSet<RequestId, Global>,
@@ -3009,7 +2964,7 @@ impl<S: Steps> Jobs<S> {
             started: Vec::new(),     // alloc: none until a build opens, then reused
             held_leases: Vec::new(), // alloc: none until a stall
             lowering: Vec::new(), // alloc: none until a job lowers while its root's front end is stored
-            recordings: Vec::new(), // alloc: none until a build asks for a replay
+            recordings: Vec::new(), // alloc: none until a build walks its checkout's last plan
             store_requests: HashSet::new_in(Global),
             store_heard: Duration::ZERO,
             commit_steps: 0,
@@ -3174,6 +3129,12 @@ impl<S: Steps> Jobs<S> {
         work: Work,
         idle: bool,
     ) {
+        // A build or a check of a checkout with nothing changed is answered here, as its last
+        // one was, before it is a job ([`Jobs::answer_again`]).
+        let walks = match self.answer_again(w, id, view.as_ref(), &work) {
+            Ok(()) => return,
+            Err(walks) => walks,
+        };
         let views = match (&work, view) {
             (Work::Reach { from, .. }, Some(to)) => vec![*from, to], // alloc: once per job
             (_, Some(view)) => vec![view],                           // alloc: once per job
@@ -3233,7 +3194,7 @@ impl<S: Steps> Jobs<S> {
             durable_wait: None,
             look_wait: None,
             placed_any: false,
-            replayed: false,
+            walks,
         };
         if self.jobs.put(key_of(id), job).is_err() {
             // alloc: an error the session's free list can't give
@@ -3302,7 +3263,7 @@ impl<S: Steps> Jobs<S> {
         // Paths outside the view read where they are on the disk ([`Mounts::mount_local`]):
         // each the watch can't vouch for is read again before the view's configuration takes
         // its mount, so the build reads what is on the disk now, never a stale copy.
-        let ats = w.mounts.stale_locals(|dir, generation| blaze_vfs::outside::unchanged_since(std::path::Path::new(dir), generation));
+        let ats = w.mounts.stale_locals(vouched_local, super::fetch::local::absent);
         if !ats.is_empty() {
             let work = Step::of(&job.cancelled, Does::Locals { steps: w.steps.clone(), ats }); // clone: a refcount, once
             let fresh = lone(w.plane, NodeKind::Fetch, "paths outside the view, read again", Pool::Io, None, kinds::FETCH);
@@ -3311,6 +3272,48 @@ impl<S: Steps> Jobs<S> {
             return;
         }
         self.open(w, id, opened, HashSet::new_in(Global));
+    }
+
+    /// What job work `work` on the view `opened` is built with, as the mounts are now: where
+    /// its root is, the checkout that is when it is one later builds are of again, its
+    /// config, the config's encoding, and the key its plan is kept by.
+    fn viewed(
+        setup: &Setup,
+        roots: &mut Roots<S>,
+        w: &World<'_, S>,
+        work: &Work,
+        opened: &Opened,
+        library: String,
+    ) -> Viewed {
+        let targets = targets_of(work);
+        let root_dir = match targets.and_then(|it| it.cargo.as_ref()) {
+            Some(cargo) => cargo.root.clone(), // clone: the view's root directory, once per view
+            None => w
+                .heads
+                .path_of(&*w.vfs, opened.view.root)
+                // alloc: an agent's view's directory, once per view
+                .unwrap_or_else(|| format!("{}/{:x}", setup.views, opened.view.root)),
+        };
+        let root = lasting(&setup.views, &root_dir).then(|| roots.intern(&root_dir));
+        // clone: the config owns its mounts, once per view
+        let mut mounts =
+            vec![Mount { at: root_dir.clone(), origin: Origin::View, under: String::new() }];
+        mounts.extend(w.mounts.all().cloned());
+        mounts.sort_by(|a, b| a.at.cmp(&b.at));
+        let config = BuildConfig {
+            invocation: invocation(work, targets, &root_dir, &setup.env),
+            mounts,
+            host: setup.host.clone(), // clone: the config owns it, once per view
+            library,
+            std: setup.std.clone(), // clone: the config owns it, once per view
+            builds: setup.builds.clone(), // clone: the config owns it, once per view
+            sources: setup.sources.clone(), // clone: the config owns it, once per view
+            blaze: crate::release::get().version.to_owned(), // alloc: the config owns it, once per view
+        };
+        let encoded = config.encode();
+        let key =
+            Hasher::new("blaze v2 serve last plan").id(&opened.view.root).part(&encoded).finish();
+        Viewed { root_dir, root, config, encoded, key }
     }
 
     /// The view opened in the database with its build configuration as the mounts are now, or
@@ -3330,59 +3333,23 @@ impl<S: Steps> Jobs<S> {
             self.end(w, id, false, Some(error));
             return;
         };
-        let targets = targets_of(&job.work);
-        let root_dir = match targets.and_then(|it| it.cargo.as_ref()) {
-            Some(cargo) => cargo.root.clone(), // clone: the view's root directory, once per view
-            None => w
-                .heads
-                .path_of(w.vfs, opened.view.root)
-                // alloc: an agent's view's directory, once per view
-                .unwrap_or_else(|| format!("{}/{:x}", self.setup.views, opened.view.root)),
-        };
-        let root = lasting(&self.setup.views, &root_dir).then(|| self.roots.intern(&root_dir));
-        // clone: the config owns its mounts, once per view
-        let mut mounts =
-            vec![Mount { at: root_dir.clone(), origin: Origin::View, under: String::new() }];
-        mounts.extend(w.mounts.all().cloned());
-        mounts.sort_by(|a, b| a.at.cmp(&b.at));
-        let config = BuildConfig {
-            invocation: invocation(&job.work, targets, &root_dir, &self.setup.env),
-            mounts,
-            host: self.setup.host.clone(), // clone: the config owns it, once per view
-            library,
-            std: self.setup.std.clone(), // clone: the config owns it, once per view
-            builds: self.setup.builds.clone(), // clone: the config owns it, once per view
-            sources: self.setup.sources.clone(), // clone: the config owns it, once per view
-            blaze: crate::release::get().version.to_owned(), // alloc: the config owns it, once per view
-        };
-        let encoded = config.encode();
-        let key =
-            Hasher::new("blaze v2 serve last plan").id(&opened.view.root).part(&encoded).finish();
+        let Viewed { root_dir, root, config, encoded, key } =
+            Self::viewed(&self.setup, &mut self.roots, w, &job.work, &opened, library);
+        let request = request_id(&job.work);
         let config = Arc::new(config); // alloc: once per view, shared with its tasks
-        // A build or a check of a checkout, asked with `BLAZE_NOOP=replay`: answered as the
-        // checkout's last build of this view and config was, when that one walked every unit
-        // and made nothing and nothing it rests on moved since ([`LastAnswer`]); no plan, no
-        // lowering, no node, no store. Any job that goes on to walk drops the kept answer
-        // (it may place other outputs), and one that asked may become the next.
-        let answers = matches!(job.work, Work::Build(_) | Work::Check(_));
+        // Any job of a checkout that walks drops the checkout's kept answer (it may place
+        // other outputs); a build or a check that walks may become the next
+        // ([`Jobs::record_answer`]).
         if let Some(at) = root {
-            let asked = match answers {
-                true => noop_asked(&config.invocation.env),
-                false => Ok(false),
-            };
-            let asked = match asked {
-                Ok(asked) => asked,
-                Err(error) => {
-                    self.end(w, id, false, Some(error));
-                    return;
-                }
-            };
-            if asked && self.replay(w, id, at, key) {
-                return;
-            }
-            self.roots.answers[at as usize] = None;
-            if asked {
-                self.record_answer(id, at, key);
+            self.roots.answers[at as usize] = Err(Unkept::None);
+            if let Some(request) = request {
+                let inputs = Inputs {
+                    view: opened.view.root,
+                    config_id: config_id(&encoded),
+                    config: Arc::clone(&config), // clone: a refcount, once per view
+                    request,
+                };
+                self.record_answer(id, at, key, inputs);
             }
         }
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
@@ -3412,101 +3379,124 @@ impl<S: Steps> Jobs<S> {
         self.plan(w, id, Prep { opened, root_dir, root, config, key, queries, asked, last: None });
     }
 
-    /// Job `id`, a build or check of checkout `root` with `key`, answered as the checkout's
-    /// last build that made nothing was ([`LastAnswer::replayable`]): what that one said is
-    /// said again, its `Work` under this job's build id, and the job ends ok with no node of
-    /// the plane and nothing put. False, the reason in a span, when it is not: the job walks.
-    fn replay(&mut self, w: &mut World<'_, S>, id: JobId, root: u32, key: ContentId) -> bool {
+    /// Job `id`, asked on `view` for `work`, answered as its checkout's last build that made
+    /// nothing was, when it is a build or a check of a checkout whose kept answer still
+    /// stands ([`noop::ask`]): what that one said is said again, its `Work` with no build id
+    /// (no row of the history stands for it, so its client sends none), and it finishes ok.
+    /// It never becomes a job: no request of the plane, no plan, no lowering, no task, no
+    /// store, no commit to wait for (the answer said again was given only once what it
+    /// rested on was durable). All of it is the span `no-op answer`, its checks the span's
+    /// children.
+    ///
+    /// Else it walks: why, as the input `blaze why` names ([`noop::NotReplayed::input`]) with the
+    /// id of the request's inputs; none for other work, and where the walk's own work says
+    /// why.
+    fn answer_again(
+        &mut self,
+        w: &mut World<'_, S>,
+        id: JobId,
+        view: Option<&Opened>,
+        work: &Work,
+    ) -> Result<(), Option<(String, ContentId)>> {
+        let (Some(opened), Some(request)) = (view, request_id(work)) else { return Err(None) };
+        // The standard library is mounted by a daemon's first build, which keeps no answer.
+        // clone: the config owns the library's place, once a request
+        let Some(library) = self.library.clone() else { return Err(None) };
+        let _answering = tracing::info_span!(target: "blaze", "no-op answer").entered();
+        let keying =
+            tracing::info_span!(target: "blaze", "no-op answer: the request's inputs").entered();
+        let Viewed { root, config, encoded, .. } =
+            Self::viewed(&self.setup, &mut self.roots, w, work, opened, library);
+        let Some(root) = root else { return Err(None) };
+        let inputs = Inputs {
+            view: opened.view.root,
+            config_id: config_id(&encoded),
+            config: Arc::new(config), // alloc: once a request, kept with a walk's recording
+            request,
+        };
+        drop(keying);
         let comparing = tracing::info_span!(
             target: "blaze",
-            "no-op: compare with the checkout's last answer",
+            "no-op answer: compare with the kept answer",
             root,
         )
         .entered();
+        let traced = blaze_units::query::env_var(
+            &inputs.config.invocation.env,
+            crate::cli::client_rows::PROFILE,
+        )
+        .is_some_and(|it| !it.is_empty());
         // The store of the root's kept front end is a job's too, and may still put.
-        let alone = self.order.len() == 1 && self.roots.storing[root as usize] == 0;
-        let found = match &self.roots.answers[root as usize] {
-            None => Err(NotReplayed::NoAnswer),
-            Some(answer) => answer.replayable(key, alone, &Watched).map(|()| {
-                // clone: a refcount and the `Work`, once a replay
-                (Arc::clone(&answer.responses), answer.worked.clone())
-            }),
-        };
+        let alone = self.order.is_empty() && self.roots.storing[root as usize] == 0;
+        let locals_vouched = w.mounts.stale_locals(vouched_local, super::fetch::local::absent).is_empty();
+        let asked = NoopAsked { inputs: &inputs, traced, alone, locals_vouched };
+        let found = noop::ask(&self.roots.answers[root as usize], &asked, &Watched);
         drop(comparing);
         let (responses, worked) = match found {
             Ok(found) => found,
             Err(why) => {
                 tracing::info_span!(
                     target: "blaze",
-                    "no-op: the last answer is not replayed, the build walks",
+                    "no-op answer: not given, the build walks",
                     root,
                     why = %why,
                 )
                 .in_scope(|| {});
-                return false;
+                return Err(why.input().map(|input| (input, inputs.id())));
             }
         };
-        let _replaying = tracing::info_span!(
+        let _saying = tracing::info_span!(
             target: "blaze",
-            "no-op: replay the checkout's last answer",
+            "no-op answer: say the kept answer again",
             root,
             responses = responses.len(),
         )
         .entered();
-        let Some(job) = self.jobs.get_mut(key_of(id)) else { return true };
         for response in responses.iter() {
-            // clone: what the session sends, once a response replayed
+            // clone: what the session sends, once a response said again
             w.said.push(Said::Report(id, response.clone()));
         }
-        // Its own build's: the id the history has it under, and no time of nodes it never ran.
-        let build_id = job.request.map(|it| u64::from(it.0));
-        job.worked = worked.map(|worked| Worked {
-            build_id,
-            steps_us: Vec::new(), // alloc: none
-            critical_path_us: 0,
-            placed: blaze_api::PlacedBytes::default(),
-            ..worked
-        });
-        job.replayed = true;
-        self.end(w, id, true, None);
-        true
+        if let Some(worked) = worked {
+            // No build of its own: no id in the history, no time of nodes it never ran.
+            let worked = Worked {
+                build_id: None,
+                steps_us: Vec::new(), // alloc: none
+                critical_path_us: 0,
+                placed: blaze_api::PlacedBytes::default(),
+                ..worked
+            };
+            w.said.push(Said::Report(id, Response::Work(worked)));
+        }
+        w.said.push(Said::Finish(id, true, None, None));
+        Ok(())
     }
 
-    /// Job `id` noted as one that may become checkout `root`'s [`LastAnswer`]: when it is
-    /// about to walk the checkout's last plan (of `key`, writing no lock file) and each
-    /// directory its outputs are in is named canonically, as the watches are asked. The
-    /// watches' generation and the count of looks at the disk are read here, before the job
-    /// looks at anything.
-    fn record_answer(&mut self, id: JobId, root: u32, key: ContentId) {
-        let Some(Some(last)) = self.roots.plans.get(root as usize) else { return };
-        if last.key != key || last.lock.is_some() {
-            return;
-        }
-        let Some(dirs) = output_dirs(&last.units) else { return };
-        // A watch hears nothing of a symlink above its directory being pointed elsewhere
-        // ([`blaze_vfs::outside::unchanged_since`]): a directory named through one is not
-        // vouched for. A resolve of each, once a build that walks.
-        let _span = tracing::info_span!(
-            target: "blaze",
-            "no-op: resolve the output directories",
-            dirs = dirs.len(),
-        )
-        .entered();
-        if !dirs.iter().all(|dir| std::fs::canonicalize(dir).is_ok_and(|it| it == *dir)) {
-            return;
-        }
+    /// Job `id` noted as one that may become checkout `root`'s kept answer: when it is about
+    /// to walk the checkout's last plan (of `key`, writing no lock file) and each directory
+    /// its outputs are in is named canonically, as the watches are asked. The watches'
+    /// generation and the count of looks at the disk are read here, before the job looks at
+    /// anything. Else the checkout's answer says why none is kept ([`Unkept`]).
+    fn record_answer(&mut self, id: JobId, root: u32, key: ContentId, inputs: Inputs) {
         self.recordings.retain(|it| it.job != id);
-        self.recordings.push(Recording {
-            job: id,
-            root,
-            key,
-            generation: blaze_vfs::outside::generation(),
-            looks: blaze_vfs::outside::looks(),
-            dirs,
-            responses: Vec::new(), // alloc: once a build that asks for a replay
-            refused: None,
-            walked: None,
-        });
+        let (generation, looks) = (blaze_vfs::outside::generation(), blaze_vfs::outside::looks());
+        let found = match self.roots.plans.get(root as usize) {
+            Some(Some(last)) if last.key == key && last.lock.is_none() => {
+                recorded_dirs(&last.units)
+            }
+            _ => Err(Unkept::Planned),
+        };
+        match found {
+            Ok((dirs, absent)) => self.recordings.push(Recorded {
+                job: id,
+                root,
+                recording: Recording::new(inputs, generation, looks, dirs, absent),
+                walked: None,
+            }),
+            Err(why) => self.roots.answers[root as usize] = Err(why),
+        }
+        // The path of each look is kept while a build that may be answered again walks, so
+        // a walk that is not kept for a look names the path.
+        blaze_vfs::outside::name_looks(!self.recordings.is_empty());
     }
 
     /// What the daemon tells the session of a job ([`Said`]), noted for the job's
@@ -3519,73 +3509,54 @@ impl<S: Steps> Jobs<S> {
         }
         match said {
             Said::Report(id, response) => {
-                let Some(recording) = self.recordings.iter_mut().find(|it| it.job == *id) else {
-                    return;
-                };
-                match response {
-                    // Its own build's, made anew by a replay; and its progress.
-                    Response::Work(_) | Response::Doing(_) => {}
-                    Response::Diagnostic(_)
-                    | Response::Unit(_)
-                    | Response::UnitBegan(_)
-                    | Response::UnitEnded(_)
-                    | Response::BuildScript(_)
-                    | Response::Built { .. } => recording.responses.push(response.clone()), // clone: kept for the replays
-                    _ => {
-                        recording.refused =
-                            Some("it said what a build with nothing to do does not say");
-                    }
+                if let Some(it) = self.recordings.iter_mut().find(|it| it.job == *id) {
+                    it.recording.hear(response);
                 }
             }
             Said::Finish(id, ok, error, _) => {
                 let Some(at) = self.recordings.iter().position(|it| it.job == *id) else {
                     return;
                 };
-                let recording = self.recordings.swap_remove(at);
-                self.keep_answer(recording, *ok && error.is_none());
+                let recorded = self.recordings.swap_remove(at);
+                self.keep_answer(recorded, *ok && error.is_none());
+                blaze_vfs::outside::name_looks(!self.recordings.is_empty());
             }
         }
     }
 
-    /// `recording`'s job ended, `ok` or not: kept as its checkout's [`LastAnswer`] when it
-    /// passed, made nothing (no unit compiled, no miss, no output placed, nothing shared),
-    /// said only what such a build says, and no path outside every view was looked at on the
-    /// disk while it ran ([`blaze_vfs::outside::looks`] did not move: each such path it rested
-    /// on was vouched for by a watch, which [`LastAnswer::replayable`] asks again). Else
-    /// dropped, the reason in a span.
-    fn keep_answer(&mut self, recording: Recording, ok: bool) {
-        let Recording { root, key, generation, looks, dirs, responses, refused, walked, .. } =
-            recording;
+    /// `recorded`'s job ended, `ok` or not: its answer kept as its checkout's when it passed,
+    /// made nothing (no unit compiled, no miss, no output placed, nothing shared), said only
+    /// what such a build says, and looked at no path outside every view on the disk while it
+    /// ran ([`Recording::end`]). Else the checkout's answer says why none is kept; either
+    /// way in a span.
+    fn keep_answer(&mut self, recorded: Recorded, ok: bool) {
+        let Recorded { root, recording, walked, .. } = recorded;
         let (made_nothing, worked) = walked.unwrap_or((false, None));
-        let why = match refused {
-            _ if !ok => Some("it did not pass"),
-            Some(why) => Some(why),
-            None if !made_nothing => Some("it compiled, placed, missed or shared something"),
-            None if blaze_vfs::outside::looks() != looks => {
-                Some("a path outside every view was looked at on the disk while it ran")
-            }
-            None => None,
-        };
-        if let Some(why) = why {
-            tracing::info_span!(target: "blaze", "no-op: the build's answer is not kept", root, why)
-                .in_scope(|| {});
-            return;
-        }
-        tracing::info_span!(
-            target: "blaze",
-            "no-op: the build's answer is kept",
-            root,
-            responses = responses.len(),
-            dirs = dirs.len(),
-        )
-        .in_scope(|| {});
-        self.roots.answers[root as usize] = Some(LastAnswer {
-            key,
-            generation,
-            dirs: dirs.into(),
-            responses: responses.into(),
+        let last = recording.end(Walk {
+            passed: ok,
+            made_nothing,
+            looks: blaze_vfs::outside::looks(),
+            looked_at: blaze_vfs::outside::last_look(),
             worked,
         });
+        match &last {
+            Ok(answer) => tracing::info_span!(
+                target: "blaze",
+                "no-op answer: the build's answer is kept",
+                root,
+                responses = answer.responses.len(),
+                dirs = answer.dirs.len(),
+            )
+            .in_scope(|| {}),
+            Err(why) => tracing::info_span!(
+                target: "blaze",
+                "no-op answer: the build's answer is not kept",
+                root,
+                why = %why,
+            )
+            .in_scope(|| {}),
+        }
+        self.roots.answers[root as usize] = last;
     }
 
     /// The view's plan asked, or taken from the head's last one.
@@ -4435,10 +4406,11 @@ impl<S: Steps> Jobs<S> {
         if self.jobs.get(key_of(id)).is_none() {
             return;
         }
-        // A build that asks for a replay has the directories its outputs are in watched from
-        // the watches' next round, so a later walk's answer can rest on them
-        // ([`LastAnswer::replayable`]). Once a directory a process.
-        if matches!(noop_asked(&prep.config.invocation.env), Ok(true))
+        // A build or a check of a checkout has the directories its outputs are in watched
+        // from the watches' next round, so a later walk's answer can rest on them
+        // ([`noop::LastAnswer::replayable`]). Once a directory a process.
+        if prep.root.is_some()
+            && self.jobs.get(key_of(id)).is_some_and(|job| request_id(&job.work).is_some())
             && let Some(dirs) = output_dirs(&units)
         {
             for dir in &dirs {
@@ -6617,9 +6589,7 @@ impl<S: Steps> Jobs<S> {
             // ([`Store::last_puts`]), which covers every put made by then, on the loop or through
             // a writer of another thread, whether or not its caller handed the ticket over (an
             // error path that put before it failed, a fetch).
-            // A replayed job read nothing of the store and put nothing: the answer it says again
-            // was given only once what it rested on was durable.
-            let first = job.durable_since.is_none() && !job.replayed;
+            let first = job.durable_since.is_none();
             if first {
                 job.stored.extend(&self.put);
                 job.stored.extend(&w.store.last_puts());
@@ -6688,7 +6658,7 @@ impl<S: Steps> Jobs<S> {
         self.recheck = (recheck && w.store.broken().is_none()).then(|| w.now + RECHECK);
         for (id, ok, error) in over.drain(..) {
             let Some(mut job) = self.jobs.remove(key_of(id)) else { continue };
-            if let Some(recording) = self.recordings.iter_mut().find(|it| it.job == id) {
+            if let Some(recorded) = self.recordings.iter_mut().find(|it| it.job == id) {
                 let made_nothing = ok
                     && error.is_none()
                     && job.compiled == 0
@@ -6698,7 +6668,7 @@ impl<S: Steps> Jobs<S> {
                     && !job.shared
                     && !job.cancelled.load(Ordering::Acquire);
                 // clone: its `Work`, kept for the replays, once a build that asked for one
-                recording.walked = Some((made_nothing, job.worked.clone()));
+                recorded.walked = Some((made_nothing, job.worked.clone()));
             }
             // Its live model ends with it.
             if let Some(request) = job.request {

@@ -145,6 +145,8 @@ blaze-cas = { workspace = true, features = ["test-hooks"] }
 tokio = { workspace = true, features = ["net"] }
 lzma-rust2 = { workspace = true, features = ["std", "xz", "encoder"] }
 tempfile.workspace = true
+# The property test of the no-op lane (`serve/job/noop/tests.rs`).
+hegeltest.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 uds_windows.workspace = true

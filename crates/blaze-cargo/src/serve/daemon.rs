@@ -1872,6 +1872,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.done = done;
         self.expire_jobs();
         self.step_plane();
+        // What the turn has to send so far (an answer, a flush asked) is handed to the driver
+        // before the work between requests below (the collections, the image's step): an
+        // answer never waits behind them.
+        if !self.effects.is_empty() {
+            self.submit();
+        }
         self.store_broke();
         self.observed();
         self.watch();

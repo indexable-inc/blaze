@@ -247,7 +247,7 @@ impl Files {
         // No watch vouched for the answer kept, or none was kept: the disk is looked at, and
         // counted, so a stretch of checks that looked at nothing can be told
         // (`blaze_vfs::outside::looks`).
-        blaze_vfs::outside::looked();
+        blaze_vfs::outside::looked(path);
         let (answer, settled) = self.look(path)?;
         if settled {
             match (known, found) {
@@ -334,7 +334,7 @@ impl Files {
             return Err(refused("its name is not UTF-8, which no view holds"));
         }
         // Looked at on the disk every time: no watch vouches for an entry.
-        blaze_vfs::outside::looked();
+        blaze_vfs::outside::looked(path);
         let meta = match std::fs::symlink_metadata(path) {
             Ok(meta) => meta,
             Err(error) if missing(&error) => return Ok(Entry::Missing),
@@ -495,7 +495,7 @@ impl Inputs for Now<'_> {
         let unreadable =
             |error: io::Error| Unreadable { path: path.to_owned(), error: error.to_string() };
         // Listed on the disk every time: no watch vouches for a listing.
-        blaze_vfs::outside::looked();
+        blaze_vfs::outside::looked(path);
         let entries = match std::fs::read_dir(path) {
             Ok(entries) => entries,
             Err(error) if missing(&error) => return Ok(false),

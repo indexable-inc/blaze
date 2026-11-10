@@ -234,10 +234,17 @@ impl RootMap {
     }
 }
 
-/// The path `root`'s links resolve to, when it is there and UTF-8.
+/// The path `root`'s links resolve to, when it is there and UTF-8. A root that is not there,
+/// or that a link leads away from, is counted as a look at the disk
+/// ([`blaze_vfs::outside::looked`]): no watch hears a link above a root pointed elsewhere, so
+/// nothing vouches that it still resolves so.
 fn resolve(root: &str) -> Option<String> {
-    let resolved = std::fs::canonicalize(root).ok()?;
-    resolved.to_str().map(|it| trim(it).to_owned()) // alloc: setup, once per root of a run
+    let resolved = std::fs::canonicalize(root).ok();
+    let resolved = resolved.as_deref().and_then(Path::to_str).map(|it| trim(it).to_owned()); // alloc: setup, once per root of a run
+    if resolved.as_deref() != Some(root) {
+        blaze_vfs::outside::looked(Path::new(root));
+    }
+    resolved
 }
 
 /// The directories a path in which means the same file in every checkout on a machine: the

@@ -523,12 +523,41 @@ pub fn quiet_since(generation: u64) -> bool {
 /// in place of an answer a watch vouched for ([`looked`]).
 static LOOKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Counts a look at the disk for what a path outside every view is now (a `stat`, a read, a
+/// Whether [`looked`] keeps the path it is told ([`name_looks`]).
+static NAMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The last path [`looked`] was told while looks were named.
+static LAST_LOOK: Lock<PathBuf> = Lock::new("vfs.outside.last_look", PathBuf::new());
+
+/// Counts a look at the disk for what `path`, outside every view, is now (a `stat`, a read, a
 /// listing), made because no watch vouched for the answer kept. Called by each place that
 /// checks such a path: blaze-usercode's `inputs` (a traced file, entry or listing) and
-/// base-db's `IncludedFile::read_now` (a file an `include!` read).
-pub fn looked() {
+/// `roots` (a root resolved through a link), base-db's `IncludedFile::read_now` (a file an
+/// `include!` read), blaze-lints' `profile::load` (a lint profile) and the daemon's pinned
+/// native layouts. While looks are named ([`name_looks`]) the path is kept for
+/// [`last_look`].
+pub fn looked(path: &Path) {
     LOOKS.fetch_add(1, Ordering::Relaxed);
+    if NAMING.load(Ordering::Relaxed) {
+        let mut last = LAST_LOOK.lock();
+        last.clear();
+        last.push(path); // alloc: grows to the longest path looked at, then is used again
+    }
+}
+
+/// Has [`looked`] keep the path of each look from now on, or stop: on while someone will
+/// ask [`last_look`] (the daemon, while a build that may be answered again later walks), so
+/// a build no one asks about pays one load a look.
+pub fn name_looks(on: bool) {
+    NAMING.store(on, Ordering::Relaxed);
+}
+
+/// The last path looked at while looks were named, for a person: which path no watch
+/// vouched for.
+pub fn last_look() -> Option<PathBuf> {
+    let last = LAST_LOOK.lock();
+    // clone: a reason, once a build asked about
+    (!last.as_os_str().is_empty()).then(|| last.clone())
 }
 
 /// How many looks ([`looked`]) this process has made. A stretch of work across which it did

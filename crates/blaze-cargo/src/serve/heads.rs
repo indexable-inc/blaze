@@ -61,6 +61,10 @@ struct Held {
     waits: Vec<(u32, u64)>,
     /// It runs user code: it waits for the round of the watches outside views.
     outside: bool,
+    /// The span of its wait (every-wait-says-what), closed as it is handed on, fails or is
+    /// cancelled: how long the watches took to hear every change made before the request.
+    /// The wait ends with each flush's completion, which every driver tells, done or failed.
+    _waiting: tracing::Span,
 }
 
 struct Checkout {
@@ -276,7 +280,13 @@ impl Heads {
         if outside {
             self.outside.flush(effects);
         }
-        self.held.push(Held { from, request, waits, outside });
+        let _waiting = tracing::info_span!(
+            target: "blaze",
+            "the request waits for the watches to hear every change made before it",
+            checkouts = waits.len(),
+            outside,
+        );
+        self.held.push(Held { from, request, waits, outside, _waiting });
         self.release(out);
     }
 

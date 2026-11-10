@@ -302,6 +302,9 @@ fn remove_stale(native: &Path, sha256: &str) -> io::Result<()> {
 /// the mark of its digest, or (walked once a daemon) holding other than its mark lists, is
 /// refused, naming what is wrong and how to remove it.
 fn laid_out(input: &NativeInput, dir: &Path, verified: &Verified) -> Result<bool, ApiError> {
+    // Looked at on the disk by every job, and counted: no watch vouches for a layout
+    // (`blaze_vfs::outside::looks`).
+    blaze_vfs::outside::looked(dir);
     match fs::symlink_metadata(dir) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(refused(input, &format!("reading {}: {error}", dir.display()))),

@@ -1068,6 +1068,38 @@ the stall bound fails with an error naming what each thread is inside, and the d
 --stall-bound SECS` sets another, for a daemon started by hand (`blaze stop` first) on a host
 so loaded that one piece of work can go that long with nothing else moving.
 
+### A build with nothing changed
+
+A `build` or `check` of a checkout (and the build of `run`, `test` and `bench`) with nothing
+changed is answered as the checkout's last one was: its warnings byte for byte, its units and
+its artifacts, with no plan, lowering, task or store commit (`serve/job/noop.rs`). The daemon's
+span `no-op answer` is the whole of it, and the answer's `Work` has no `build_id`
+(`"build_id":null` with `--message-format json`): no build ran, so the client sends no rows.
+
+The answer said again is that of a build that walked every unit and made nothing, so the
+first build after a change builds, the next walks and is kept, and each one after is
+answered. It is said again only while every input of that walk is as it was:
+
+| Input | Covered by |
+|---|---|
+| The checkout's files (sources, manifests, lock file, config in it) | the view's root, which the checkout's watcher commits before the request is seen |
+| Command, arguments, directory, the request's whole environment, config files outside the checkout, fetched sources and path dependencies, toolchain, blaze's version | the view's config, by its bytes |
+| Colors, width, `--refused`, `-v` | the request's own hash |
+| Paths outside the checkout a build script, proc macro or `include!` read | the watches outside views heard nothing since the kept walk began, and that walk looked at no such path on the disk |
+| Path dependencies outside the checkout | each one's watch vouches for it; one named through a link, or a single file, is read again by every build |
+| A manifest above the checkout that is not there | looked at as the request is asked |
+| The outputs | each directory they are in has been watched since before the kept walk and heard nothing |
+| Layout profiles (`<target>/layout`) | watched when there, looked at when not |
+| Other jobs | none is under way |
+
+A request is held until its checkout's watcher and the watches outside it have heard every
+change made before it (the span `the request waits for the watches to hear every change made
+before it`), so an edit saved just before the request is seen. What is not covered walks, which
+is the whole build: a build whose walk listed a directory or read an unwatched path outside
+the checkout, one with `-C profile-use`, one whose outputs are named through a symlink, and one
+with `BLAZE_PROFILE` set (there is then a build to trace). `blaze why` after a build that
+walked and computed nothing names the input that moved or that nothing covers.
+
 ### Cores and priority
 
 By default blaze leaves two cores to the rest of the machine and runs at background priority,
@@ -1291,7 +1323,6 @@ it, for that request alone:
 | `BLAZE_SANDBOX` | `off` (or `0`) runs build scripts and proc macros, and tests under `--reached`, outside the sandbox ([above](#build-scripts-and-proc-macros-run-in-a-sandbox)) | sandboxed |
 | `BLAZE_ELIDE` | `verify` also compiles and runs a build script blaze elided as inert, and checks it said what elision did; any other value is an error | unset: an inert script is not run |
 | `BLAZE_PROC_MACRO_CACHE` | `check` expands again each expansion the store kept and compares; any other value is an error | unset: a kept expansion is used |
-| `BLAZE_NOOP` | `replay` answers a `build` or `check` with nothing changed as the checkout's last one was, with no plan, lowering, unit or store commit: only from a build of the same view and whole config (command line, environment, config files, mounts, toolchain) that walked every unit and made nothing, while the watches heard nothing outside the view since that walk began and each directory its outputs are in has been watched since before it (a deleted binary or `blaze clean` has the next build walk and place them again), and no other job runs. The daemon's spans `no-op: ...` say whether it replayed and, when not, why. Opt-in: a walk that looks at a path on the disk through a check the daemon does not count (`blaze_vfs::outside::looks`) could be answered stale; `walk` is the default | `walk` |
 | `BLAZE_SCRIPT_CACHE` | `check` runs again each build script run the store kept and compares, failing the build where they differ; a result another checkout verified that differs is recorded as depending on where its roots are, so no checkout is given it again; any other value is an error | unset: a kept run is used |
 
 These are read by the process itself, the client or the daemon (from the environment of
