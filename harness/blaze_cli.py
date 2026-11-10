@@ -1405,7 +1405,7 @@ def stranger(home, check):
         made = sudo("useradd", "--system", "--no-create-home", "--shell", "/usr/sbin/nologin", name)
     # The daemon's socket (blaze_api::client::socket). v1's request named the daemon's version,
     # read from `blaze status`; v2's carries its schema alone.
-    sock = os.path.join(home, "v2.sock")
+    sock = storelib.layout(home).socket
     request = framed("Status")
     def knock(user):
         run = subprocess.run([*(["sudo", "-n", "-u", user] if user else []), sys.executable, "-c", CONNECT, sock, request], capture_output=True, text=True, cwd="/")
@@ -1436,7 +1436,7 @@ def stranger(home, check):
         check("and still answers its own user", "Status" in mine, mine[:60])
         # The other way round: the second user listens where BLAZE_HOME points the user's
         # client, which sends its request and its variables to whoever serves it.
-        trap = os.path.join(tempfile.mkdtemp(prefix="blaze-trap-", dir="/tmp"), "v2.sock")
+        trap = storelib.layout(tempfile.mkdtemp(prefix="blaze-trap-", dir="/tmp")).socket
         os.chmod(os.path.dirname(trap), 0o777)
         listener = subprocess.Popen(["sudo", "-n", "-u", name, sys.executable, "-c", LISTEN, trap], stdout=subprocess.PIPE, text=True, cwd="/")
         try:

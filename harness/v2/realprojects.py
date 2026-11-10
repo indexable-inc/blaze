@@ -85,6 +85,7 @@ ROOT = HERE.parent.parent
 sys.path[:0] = [str(HERE), str(HERE.parent)]
 import blake3
 import pins
+import storelib
 from pins import Workspace
 from typed_input import fail, parse
 
@@ -1332,7 +1333,10 @@ async def run_all(args: Run) -> int:
     workspaces = chosen(pins.load_corpus(script=SCRIPT), args.projects)
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
-    work = Path(args.work or tempfile.mkdtemp(prefix="bz-realprojects-", dir="/tmp")).resolve()
+    try:
+        work = Path(storelib.work_dir(args.work, "bz-realprojects-"))
+    except storelib.Failed as e:
+        fail(SCRIPT, str(e))
     work.mkdir(parents=True, exist_ok=True)
     sources = Path(args.sources).expanduser().resolve() if args.sources else SOURCES
     sources.mkdir(parents=True, exist_ok=True)

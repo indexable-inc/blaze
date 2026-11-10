@@ -36,7 +36,6 @@ import asyncio
 import re
 import shutil
 import sys
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -166,9 +165,8 @@ class ModeV2(engine.V2):
         super().__init__(spec)
         self.mode = mode
 
-    def env(self, home: Path, store: Path | None = None, target: Path | None = None,
-            extra: dict[str, str] | None = None) -> dict[str, str]:
-        return super().env(home, store, target, {**(extra or {}), "BLAZE_BORROWCK": self.mode})
+    def env(self, home: Path, target: Path | None = None, extra: dict[str, str] | None = None) -> dict[str, str]:
+        return super().env(home, target, {**(extra or {}), "BLAZE_BORROWCK": self.mode})
 
 
 def said_of(judged: cases.Judged) -> Said:
@@ -208,6 +206,8 @@ def judge_mode(eng: engine.Engine, work: Path, made: list[cases.Case], args: Inp
 
 async def judge_both(spec: engine.EngineSpec, work: Path, made: list[cases.Case], args: Input) -> dict[str, list[cases.Judged]]:
     engines = {mode: ModeV2(spec, mode) for mode in MODES}
+    # What the harness assumes of the binary, held to it once (`Engine.of` does it for the others).
+    next(iter(engines.values())).preflight()
     async with asyncio.TaskGroup() as group:
         tasks = {mode: group.create_task(asyncio.to_thread(judge_mode, engines[mode], work / mode, made, args))
                  for mode in MODES}
@@ -234,7 +234,7 @@ def main(args: Input) -> None:
     tests = [t for t in tests if args.filter in t.path]
     if not tests:
         fail(SCRIPT, f"no test of {table_path} has {args.filter!r} in its path")
-    work = Path(args.work or tempfile.mkdtemp(prefix="bz-borrowck-flow-", dir="/tmp")).resolve()
+    work = engine.work_dir(args.work, "bz-borrowck-flow-")
     work.mkdir(parents=True, exist_ok=True)
     print(f"work: {work}", flush=True)
     rep = report.Report(SCRIPT, args.engine, args.out)
@@ -275,7 +275,7 @@ def main(args: Input) -> None:
                      newly_accepted=newly, targets=sorted(TARGETS))
     if not args.keep:
         for mode in MODES:
-            shutil.rmtree(work / mode / "store", ignore_errors=True)
+            shutil.rmtree(work / mode / "t", ignore_errors=True)
             shutil.rmtree(work / mode / "h", ignore_errors=True)
     rep.finish()
 

@@ -15,7 +15,7 @@ The input is one JSON object (inline, a file's path, or `-`):
 
     engine    the blaze measured (engine.EngineSpec)
     out       the result's path (report.py's JSON)
-    work      where each project's source, its builds' trees, homes and stores go; a new
+    work      where each project's source, its builds' trees and daemon homes go; a new
               directory under /tmp when empty
     projects  entries of harness/apps/apps.json (ripgrep and every local app under harness/apps
               with a Cargo.toml). The source is bench.PROJECTS' pinned clone where the name is
@@ -28,7 +28,7 @@ The input is one JSON object (inline, a file's path, or `-`):
     keep      keep the work directory (false)
 
 For each project and profile: two cold builds of the same source at the same path, each with an
-empty home, store and target directory and its own daemon, the first with `BLAZE_DEPS=full` and
+empty home (so an empty store and build directory) and its own daemon, the first with `BLAZE_DEPS=full` and
 the second with it unset (and taken out of an inherited environment), each timed from nothing to
 the end of `blaze build`. Then, with each build's tree and daemon in place:
 
@@ -102,7 +102,6 @@ TOTALS = ("executables not ok", "passed", "failed", "ignored", "measured")
 
 test_results: Callable[[object], tuple[int, dict[tuple[str, str], int], tuple[int, ...]]] = getattr(
     blaze_cli, "test_results")
-kept_passes: Callable[[str], list[str]] = getattr(blaze_cli, "kept_passes")
 
 
 @dataclass(frozen=True)
@@ -390,14 +389,13 @@ def outcomes(tests: dict[tuple[str, str], int]) -> dict[str, str]:
 
 
 def tested(eng: engine.Engine, step: str, s: Subject, ws: Path, env: dict[str, str], release: list[str]) -> Tests:
-    kept_file = ws / "target" / "blaze" / "tests.ndjson"
-    kept_file.unlink(missing_ok=True)
     ran = eng.build(f"{step}: test", ws, env, ["--message-format=json", "--no-fail-fast", *s.test, *release],
                     command="test", timeout=BUILD_SECS)
     if (who := eng.not_blazes(ran)) is not None:
         raise Problem(f"`blaze test` was served by {who}, not blaze")
-    status, tests, totals = test_results(SimpleNamespace(returncode=ran.returncode, stdout=ran.stdout,
-                                                         kept=kept_passes(str(kept_file))))
+    # Plain `blaze test` runs every test: v2 keeps no pass without `--reached`, and writes no
+    # `tests.ndjson` (docs/cargo.md, "Which tests run").
+    status, tests, totals = test_results(SimpleNamespace(returncode=ran.returncode, stdout=ran.stdout, kept=[]))
     return Tests(status, outcomes(tests), tuple(totals), ran.said())
 
 
@@ -516,12 +514,12 @@ def attempt(side: Side, check: Check, checks: tuple[Check, ...], fn: Callable[[]
 
 
 def side(eng: engine.Engine, s: Subject, top: Path, profile: Profile, mode: Mode, checks: tuple[Check, ...]) -> Side:
-    """A cold build of `s` in `mode` at `top/build/<tree>`, with an empty home, store and target
-    directory and a daemon of its own, timed; then each check made of it with its tree and daemon
-    in place, and the daemon stopped."""
+    """A cold build of `s` in `mode` at `top/build/<tree>`, with an empty home (so an empty store
+    and build directory: engine.layout) and a daemon of its own, timed; then each check made of
+    it with its tree and daemon in place, and the daemon stopped."""
     builds = top / "build"
-    tree, home, store = builds / s.tree, top / "home", top / "store"
-    for path in (tree, home, store):
+    tree, home = builds / s.tree, top / "home"
+    for path in (tree, home):
         shutil.rmtree(path, ignore_errors=True)
     builds.mkdir(parents=True, exist_ok=True)
     for entry in s.beside:
@@ -529,7 +527,7 @@ def side(eng: engine.Engine, s: Subject, top: Path, profile: Profile, mode: Mode
             (builds / entry).symlink_to(s.source / entry)
     shutil.copytree(s.source / s.tree, tree, symlinks=True, ignore=budgets.left_out)
     ws = tree / s.sub if s.sub else tree
-    env = deps_env(eng.env(home, store, None, s.env), mode)
+    env = deps_env(eng.env(home, None, s.env), mode)
     release = ["--release"] if profile == "release" else []
     step = f"{s.label} {profile} ({MODE_NAMES[mode]})"
     got = Side()
@@ -543,7 +541,7 @@ def side(eng: engine.Engine, s: Subject, top: Path, profile: Profile, mode: Mode
         if (who := eng.not_blazes(ran)) is not None:
             got.failed = f"built by {who}, not blaze"
             return got
-        target = ws / "target" / profile_dir(profile)
+        target = eng.build_dir(ws, env) / profile_dir(profile)
 
         def symbols() -> None:
             got.symbols = exported(target)
@@ -614,7 +612,7 @@ def main(args: Input) -> None:
     except engine.Failed as e:
         fail(SCRIPT, str(e))
     rep = report.Report(SCRIPT, args.engine, args.out)
-    work = Path(args.work or tempfile.mkdtemp(prefix="bz-reachable-", dir="/tmp")).resolve()
+    work = engine.work_dir(args.work, "bz-reachable-")
     work.mkdir(parents=True, exist_ok=True)
     print(f"work: {work}", flush=True)
     cold: list[dict[str, report.Number]] = []

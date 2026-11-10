@@ -113,7 +113,7 @@ def base_env(home, target):
 
 def store_of(home):
     """Where the daemon of `home` keeps its store."""
-    return os.path.join(home, "v2", "store")
+    return storelib.layout(home).store
 
 
 async def run(argv, cwd, env, step, timeout=STEP_SECS, check=True):

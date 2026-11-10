@@ -21,7 +21,7 @@ Writes the steps as JSON on stdout's last line. The projects are bench.py's, fet
 """
 import json, os, re, shutil, sys
 
-import bench, blaze_cli, memory
+import bench, blaze_cli, memory, storelib
 from blaze_cli import Scratch, Side, fetch, program_output, wait_warm
 
 
@@ -52,7 +52,7 @@ def main():
         shutil.copytree(source, ws, symlinks=True, ignore=lambda at, names: [n for n in names if n in ("target", ".git")])
         home = os.path.join(work, f"home-{label}")
         if seed is not None:
-            shutil.copytree(os.path.join(seed.env["BLAZE_HOME"], "v2", "store"), os.path.join(home, "v2", "store"), symlinks=True)
+            shutil.copytree(storelib.store_of(seed.env["BLAZE_HOME"]), storelib.store_of(home), symlinks=True)
         env = dict(blaze_cli.base_env(home), **spec.get("env", {}), **extra_env)
         env.update(BLAZE_STATS="1")
         env.pop("RUSTC_WRAPPER", None)
