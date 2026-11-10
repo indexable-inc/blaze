@@ -197,10 +197,10 @@ A part runs all of its harnesses even when one fails, then names the ones that f
 long each took. Alongside the harnesses, CI runs `python3 harness/imports.py`, which imports
 every script of the harness, and
 `python3 harness/unittests.py`, which runs the Rust unit tests and holds them to
-`harness/known-failures.toml` (below). It is one `cargo test` from the root over blaze's crates and the front end's
-(`hir-ty`, `hir-ty-mir`, `hir-def`, `ide-diagnostics` and the rest), all
-members of the one workspace; the root `.cargo/config.toml` sets `CARGO_WORKSPACE_DIR`, where
-expect-test finds the parser's `.rast` files.
+`harness/known-failures.toml` (below). It is one `blaze test --release --workspace` from the root:
+every test of every member of the workspace, never a hand-kept subset; the root
+`.cargo/config.toml` sets `CARGO_WORKSPACE_DIR`, where expect-test finds the parser's `.rast`
+files.
 
 ### Under Cranelift
 
@@ -561,7 +561,7 @@ for each platform, each on a machine of its own kind.
 
 | Workflow | Event | What runs | Wall time |
 |---|---|---|---|
-| `blaze.yaml` (`gate`) | pull request | on Linux AArch64, on a 64-vCPU ix runner ([ix runners](#ix-runners)): blaze builds blaze (`blaze build`) and tests it (`harness/unittests.py`, `blaze test`, only the tests the change reached), from the newest release and the store main pushed to blaze's remote; on Linux AArch64 (ix), `blaze check --workspace --message-format short` with the release `.github/blaze-version` names and the pinned LLVM, then astlog's rules over the crates and tools (`tools/astlog/scan.py`, [its README](../tools/astlog/README.md#rules-in-blaze)) (`workspace-check`, from main's last green run's snapshot); on Linux AArch64, the lint baselines, `blaze check --workspace --target aarch64-unknown-linux-gnu --baselines crates/blaze-lints/baselines` with the blaze the tree builds there (as the build job does, from main's warm store), not the release, so the counts are of the lints the tree defines (`lint-baselines`, [cargo.md](cargo.md#lints)); `harness/imports.py`, `harness/rustcsites.py`, actionlint over `.github/workflows` | 49 min on a store the release has not compiled into |
+| `blaze.yaml` (`gate`) | pull request | on Linux AArch64, on a 64-vCPU ix runner ([ix runners](#ix-runners)): blaze builds blaze (`blaze build`) and tests it (`harness/unittests.py`: `blaze test --workspace`, every test of every crate, held to `harness/known-failures.toml`), from the newest release and the store main pushed to blaze's remote; on Linux AArch64 (ix), `blaze check --workspace --message-format short` with the release `.github/blaze-version` names and the pinned LLVM, then astlog's rules over the crates and tools (`tools/astlog/scan.py`, [its README](../tools/astlog/README.md#rules-in-blaze)) (`workspace-check`, from main's last green run's snapshot); on Linux AArch64, the lint baselines, `blaze check --workspace --target aarch64-unknown-linux-gnu --baselines crates/blaze-lints/baselines` with the blaze the tree builds there (as the build job does, from main's warm store), not the release, so the counts are of the lints the tree defines (`lint-baselines`, [cargo.md](cargo.md#lints)); `harness/imports.py`, `harness/rustcsites.py`, actionlint over `.github/workflows` | 49 min on a store the release has not compiled into |
 | `blaze.yaml` (`warm`) | push to main | the same on Linux AArch64 (ix) and macOS, every test, then a push of the store for the runs after it, and `linux x64 (cross-compiled, not run)`, blaze cross-compiled for x86-64 and not run ([ix runners](#ix-runners); TODO(x86-64): no x86-64 tests). Its `linux arm64 / build` passing is what cuts a canary (`canary.yaml`); the whole run green, unit tests on every platform, is what stable needs besides the promotion gate ([release.md](release.md)). And on Linux AArch64 the std cases of the smoke corpus (`harness/smoke.py`, [release.md](release.md#the-smoke-corpus): `blaze run` and `blaze test`, dev and `--release`) with the blaze blaze built, 17 to 30 min until [#899](https://github.com/indexable-inc/blaze/issues/899) (74 s with rustc's) | |
 | `blaze-platform.yaml` (`profile-gate`) | with each platform's build, but Windows | the profile's gate (`blaze debug gate`, [profiling.md](profiling.md#the-gate-what-a-profile-must-hold)) over the history the build's self-build wrote, with the blaze it made, held to `harness/profile-gate-known.toml`, and each fixture of `crates/blaze-profile/fixtures/gate/` failing its own check (`harness/profile_gate.py`); then `harness/v2/budgets.py`'s smoke with the same blaze ([The v2 proof](#the-v2-proof)); uploads the build's per-build summary as `profile-summary-<platform>-<runner>-<commit>-<tree>-<blaze>`. No secret | a few min |
 | `profile-nightly.yaml` | nightly, by hand | `slower_between_commits` over main's last 10 summaries of one runner class, the newest against the rest (`harness/profile_trend.py`); fails naming each span 1.25 times and 50 ms slower or more | 5 min |
@@ -839,20 +839,29 @@ What is known to be wrong is written down, says why, and does not fail the run. 
 out right, it fails the run until it is taken off the list:
 
 - `harness/known-failures.toml`: Rust unit tests that fail, by crate and full name, each with
-  an owner (a lane or an issue) and a one-line cause, held by `harness/failures.py`;
+  a one-line cause, held by `harness/failures.py`: the only exemption the gate's tests have;
 - `OPEN` in `dwarf.py`: `realdebug.py`'s checks whose frames or variables are wrong;
 
-`failures.py` reads a run's log (`cargo test` or `blaze test`, libtest's text or JSON format)
-and fails on a failing test that is not listed, a listed test that passes, is ignored or no
-longer exists, and a test binary that did not finish (a crash leaves the rest of its tests
-unchecked); each failure names the crate, the test and the tail of its output. Entries owned by
-`unowned` are listed without failing the run, and listed tests the run could not check (their
-crate did not run, filtered out, unreached by `blaze test`, or `only` for another runner,
-profile or OS) are counted, so a partial run never reads as clean. CI's `unittests.py` calls it
-on its log; a lane runs it on the crates it touched before saying a failure was there before:
+`failures.py` reads a run's log (`blaze test`, libtest's text or JSON format) and fails on a
+failing test that is not listed, a listed test that passes, is ignored or no longer exists, a
+test binary that did not finish (a crash leaves the rest of its tests unchecked) unless it is
+listed as `<binary>::*`, and a package asked for none of whose test binaries ran (its test
+build failed) unless it is listed as `*`; each failure names the crate, the test and the tail
+of its output. Listed tests the run could not check (their crate did not run, filtered out,
+unreached by `blaze test --reached`, or `only` for another profile or OS) are counted, so a
+partial run never reads as clean. CI's `unittests.py` calls it on its log, with every package of
+the workspace asked for; a lane runs it on the crates it touched before saying a failure was
+there before:
 
-    uv run --frozen harness/failures.py '{"run": {"runner": "blaze", "packages": ["hir-def", "hir-ty-mir"]}}'
-    uv run --frozen harness/failures.py '{"results": ["test.log"], "runner": "cargo", "profile": "dev", "os": "macos"}'
+    uv run --frozen harness/failures.py '{"run": {"packages": ["hir-def", "hir-ty-mir"]}}'
+    uv run --frozen harness/failures.py '{"results": ["test.log"], "profile": "dev", "os": "macos"}'
+
+The list is written from a run, never by hand: `python3 harness/unittests.py '{"record": true}'`
+runs every test and writes the list again, sorted, each new entry with the first line of its
+failure as its cause and `only` the OS it ran on; the entries of other OSes are kept, and an
+entry that was there keeps its cause. Run it once on each OS the gate tests on (Linux and
+macOS), on the tree to land. `harness/failures.py selftest` (CI's `scripts` job) holds the
+checked-in list to the form the recorder writes.
 
 A failure joins the list only with an owner and a cause, in the change that explains it.
 

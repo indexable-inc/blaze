@@ -708,7 +708,7 @@ type_complexity = "allow"
 wrong_self_convention = "allow"
 
 ## deny: allocation, dyn and clones are controlled mechanically
-## (docs/v2/plan.md). The lints marked `warn, with no baseline yet` were lowered from deny to be
+## (docs/v2/plan.md). The lints marked `no baseline yet` were lowered from deny to be
 ## ratcheted by counts in crates/blaze-lints/baselines/, which holds no file yet: blaze cannot
 ## finish its own check of the workspace, so nothing holds their counts today
 ## (docs/cargo.md#lints; `blaze check --baselines DIR --new-baseline LINT` starts one).

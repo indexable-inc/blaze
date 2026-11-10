@@ -19,8 +19,8 @@ blaze fmt --all --check
 cargo test --release -p blaze-engine -p hir-ty -p hir-def -p parser -p syntax
 ```
 
-`python3 harness/unittests.py` is the one `cargo test` CI runs, over blaze's crates and the
-front end's (`hir-ty`, `hir-def`, `parser`, `syntax` and the rest), all in `crates/`.
+`python3 harness/unittests.py` is what CI runs: `blaze test --workspace`, every test of every
+crate, held to `harness/known-failures.toml`, the one list of tests that may fail.
 
 The real gate is real crates' own test suites passing under blaze, and tests that state their
 expected result: see [docs/harness.md](../docs/harness.md). Run what fits your change and say in the pull request
