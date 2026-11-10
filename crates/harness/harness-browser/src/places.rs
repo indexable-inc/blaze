@@ -81,6 +81,13 @@ fn refuse(conn: u64, req: u64, why: &str) {
 /// # Safety
 /// `obj` is a live object whose `sel` getter returns an NSString or nil.
 unsafe fn text(obj: &AnyObject, sel: objc2::runtime::Sel) -> String {
+    // A getter this object does not have is no text, never an exception: an unrecognised selector would end the host.
+    // SAFETY: -respondsToSelector: on a live object.
+    let has: bool = unsafe { msg_send![obj, respondsToSelector: sel] };
+    if !has {
+        eprintln!("harness-browser: places: {:?} has no -{}", obj.class().name(), sel.name().to_string_lossy());
+        return String::new();
+    }
     // SAFETY: the caller's contract.
     let s: Option<Retained<NSString>> = unsafe { msg_send![obj, performSelector: sel] };
     s.map(|s| s.to_string()).unwrap_or_default()
@@ -134,10 +141,11 @@ pub fn request(conn: u64, req: u64, query: &str, latitude: f64, longitude: f64, 
                 let Some(mark) = mark else { continue };
                 let at: Coordinate = msg_send![&*mark, coordinate];
                 let url: Option<Retained<AnyObject>> = msg_send![&*item, url];
-                // MKMapItem.identifier (macOS 15): an MKMapItemIdentifier, or nil; its rawValue is the id's text.
+                // MKMapItem.identifier (macOS 15): an MKMapItemIdentifier, or nil; its identifierString is the id's text
+                // (Swift's rawValue; Objective-C has no selector of that name).
                 let ident: Option<Retained<AnyObject>> = msg_send![&*item, identifier];
                 out.push(Place {
-                    id: ident.map(|i| text(&i, objc2::sel!(rawValue))).unwrap_or_default(),
+                    id: ident.map(|i| text(&i, objc2::sel!(identifierString))).unwrap_or_default(),
                     name: text(&item, objc2::sel!(name)),
                     latitude: at.latitude,
                     longitude: at.longitude,
