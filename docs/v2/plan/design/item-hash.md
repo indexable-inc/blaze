@@ -476,14 +476,38 @@ the edited one in the store.
   a key that left positions out would keep a stale constant. It needs the unit's steps keyed
   per item (item 3 below) with positions as presentation slots (section 3.7), and a link step
   that writes only the span tables into an image whose code is as it was.
-- *A record with diagnostics* is under the content of the files they quote, whole
-  (`quoted_key`): an edit of one of those files that moves nothing makes the unit again. The
-  design, not built: the record under the narrow key holds the check's `Diag`s
-  (`blaze_diagnostics::model`, already serializable) with each span's ends as (file, line,
-  column), which the narrow key keeps for every token; a replay maps them to bytes in the
-  file as it is and renders them (`compile::link`'s rendering, with the unit's options). Only
-  a span whose ends are both at a token's edge is kept so (one that ends in whitespace or a
-  comment, such as a file's whole span, stays under `quoted_key`).
+**Diagnostics** (built). A record whose diagnostics are all its check's, each span one the
+code text keeps exactly (`blaze_lower::places`: both ends at a token's edge, nothing between
+them the code text leaves out or keeps as a shape), is under the narrow key and holds the
+check's `Diag`s with the line and byte column of each span end (`compile::Placed`), which
+every text of that key has its tokens at. A replay finds each place's offset in the file as
+it is and renders the diagnostics from those files, so a comment in a quoted file recomputes
+nothing. Any other span (into or over a comment, to a file's end, in a file the view lacks)
+keeps its record under `quoted_key` or the whole key.
+
+**The check's outcome** (built) is an entry of its own (`compile::Checked`, under
+`check_key`: the record's inputs with the crate as a check observes it, `Narrowed::checked`).
+A unit whose record misses for what no check of it reads (a body below it) finds it and runs
+no check. An item's own results were entries already: a body's inference, MIR and borrow
+check in the item store (sections 3 to 8), a function's code under its template key.
+
+**For an edit that moves positions alone**, what is left, each piece on the one before:
+1. Texts with no position in them beside the ones there are (`code`: a token's text and
+   whether whitespace parts it from the one before, a doc comment as its kind, a left-out
+   body as a mark), and places as (file, token index, which edge) in place of line and
+   column, so a kept diagnostic is found again after its line moved.
+2. The positions read by value, as a slot under the position-free key that names the files
+   they are in (as `quotes_slot` names quoted files), the entry then filed under those
+   files' positioned code texts. The readers: `line!()` and `column!()` where they expand
+   (`hir_expand::builtin::fn_macro::place_expand`, which reads the position through the
+   file's text, a tracked read already, so the engine reruns exactly the expansions whose
+   value moved); the evaluator's caller location (`hir_ty_mir::mir::eval::shim`); a proc
+   macro's span answers. Each needs a log in the database beside the `env!` log
+   (`base_db::process_env_reads`), which `reads::Reads` already files records by.
+3. The check entry under that key: a moved line then finds it, and runs no check.
+4. The link: `compile::SpansMoved` (the record whose code this unit's is, and the span tables
+   that differ) is what the unit gives it; the link that writes only those tables is the
+   link lane's. Until it is there a moved line links whole, and `moved/` fails.
 
 **Library crates** (built). A registry or git crate's files are parsed as outlines, and a
 code text needs a full parse. Each such crate but the standard library's has its own narrowed

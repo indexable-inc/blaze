@@ -674,6 +674,29 @@ fn rendered(
         .map_err(|why| ApiError::new(why, Some(u.target.name.clone())))
 }
 
+/// What a unit gives its link when an edit moved positions in its crate and no token: its
+/// code is the code of a record the store keeps, and only span tables differ. The link/store
+/// lane's input (docs/v2/plan/design/item-hash.md, sections 12 and 15): with it a link writes
+/// the tables named here into the images of `code`'s record and writes no code.
+///
+/// Not made yet: making it needs the unit's key without its positions (a code text with no
+/// line or column in it, with each position a constant, a type or a macro read by value kept
+/// beside it), under which the record of the same tokens is found after lines moved. Until
+/// then such an edit misses the unit's record and links whole.
+#[allow(dead_code, reason = "the link lane's input, defined before either lane makes or takes it")]
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct SpansMoved {
+    /// The key of the record whose code this unit's is: every template it names and every
+    /// image it wrote are the ones to use, its span tables apart.
+    pub(crate) code: Key,
+    /// Each span table whose positions are not those `code`'s record was linked with: its
+    /// anchor (`blaze_format::SpanRef::anchor`, of the store key of the body or declaration
+    /// it is of, which no edit of positions moves) and the hash of its content now
+    /// ([`Made::spans`]' hash of a table), sorted by anchor, each once. A table that is gone
+    /// or new is a change of code, never listed here.
+    pub(crate) tables: Vec<(ContentId, CodeHash)>,
+}
+
 /// The domain of a unit's check entry's key ([`check_key`]).
 const CHECK: &str = "blaze v2 cargo unit check 1";
 
