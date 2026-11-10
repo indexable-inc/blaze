@@ -22,6 +22,8 @@ import { vfs } from "../vfs.ts";
 import { sh, procs, out, err, lines, kill, ptree, runs, stage, runInfo } from "../proc.ts";
 import { skill, skills, skillDocs } from "../skills.ts";
 import { world, worldDocs } from "../world.ts";
+import { phone, phoneDocs } from "../phone.ts";
+import { call, callDocs } from "../call.ts";
 
 /** `wait` as a step of the cell that waits (effects.ts kind `wait`): the step shows the awaited cell's own value (or its
  *  error), so the app draws that cell's output, never the task's record (id, status, timestamps); the cell still returns
@@ -33,7 +35,7 @@ const wait = (id: string | number, timeoutMs?: number) =>
     show: v.status === "running" ? undefined : taskValue(id),
   }));
 
-export const functions = { progress, skill, skills, rg, ls, glob, du, cargo, follow, $, pmap, image, vfs, spawn, obj, objects, tree, sql, googleSearch, gmail, github, browser, withHiddenPage, table, Table, LazyTable, col, lit, gitLog, nuon, tasks, task, taskValue, wait, sh, procs, out, err, lines, kill, ptree, runs, stage, runInfo, agents, world };
+export const functions = { progress, skill, skills, rg, ls, glob, du, cargo, follow, $, pmap, image, vfs, spawn, obj, objects, tree, sql, googleSearch, gmail, github, browser, withHiddenPage, table, Table, LazyTable, col, lit, gitLog, nuon, tasks, task, taskValue, wait, sh, procs, out, err, lines, kill, ptree, runs, stage, runInfo, agents, world, phone, call };
 
 /** Shown in the MCP tool description so the model knows what it can call. A call only some tasks need keeps its long
  *  reference in a skill (mcp/skills/) and a one-line pointer here. */
@@ -41,6 +43,8 @@ export const docs: Record<keyof typeof functions, string> = {
   ...skillDocs,
   ...progressDocs,
   ...worldDocs,
+  ...phoneDocs,
+  ...callDocs,
   ...searchDocs,
   ...followDocs,
   $: "$`cmd ${arg}`: thenable of { stdout, stderr, exitCode, ok, text(), lines(), json() } — runs a program through sh(); each ${value} is one quoted word (arrays several), $.raw(s) unquoted. Chain before awaiting: .nothrow(), .cwd(dir), .env(vars), .timeout(ms), .stdin(data), .why(reason). A non-zero exit throws with the stderr tail. `await $`git log --oneline -5`.lines()`.",
