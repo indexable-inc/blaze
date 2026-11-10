@@ -22,6 +22,19 @@
 //! A plain `//` comment ends its line, so it moves nothing: it and the spaces before it are
 //! left out whole, and adding or removing one at the end of a line changes no code text.
 //!
+//! What else moves no token and no position is left out the same way ([`Masked::blank`],
+//! [`code_end`]): the spaces and tabs before a line's end, which nothing is after, and
+//! everything after the file's last token that is whitespace or a plain `//` comment, which
+//! nothing is after at all (a comment line appended to a file, blank lines at its end, its last
+//! line's end). A crate's unit is keyed by these texts ([`crate::Lowered::narrowed`]), so such
+//! an edit leaves its key, and every key above it, as it was. An edit that moves a line (a
+//! comment on a line of its own before code, a blank line between items) changes the text:
+//! positions are in what a unit makes (item-hash.md, sections 12 and 15).
+//!
+//! A comment the compiler reads the text of keeps it ([`mask`](Masked::mask)): one with a
+//! bidirectional control or a carriage return, and a block comment that does not end, which is
+//! an error, so no text with one is the text of a file that builds.
+//!
 //! An attribute is inert, giving its item to no macro, when it is one of the compiler's own
 //! that never runs user code on the item (`inline`, `doc`, `cfg`, `allow`, `repr`, a tool's
 //! `rustfmt::skip`), or a `cfg_attr` whose attributes are all inert. `derive` of the standard
@@ -57,9 +70,11 @@ mod tests;
 const CODE_IDENTITY: &str = "blaze v2 crate code identity 1";
 const OWN_CODE: &str = "blaze v2 crate own code 1";
 /// 2: a comment whose text the compiler reads (a bidirectional control, a carriage return)
-/// keeps its text.
-const CODE_TEXT: &str = "blaze v2 file code text 2";
-const INTERFACE_TEXT: &str = "blaze v2 file interface text 1";
+/// keeps its text. 3: the spaces before a line's end and what is after the last token are left
+/// out, and a block comment that does not end keeps its text.
+const CODE_TEXT: &str = "blaze v2 file code text 3";
+/// 2: as [`CODE_TEXT`] 3.
+const INTERFACE_TEXT: &str = "blaze v2 file interface text 2";
 const OWN_NARROW: &str = "blaze v2 crate own narrow 1";
 
 /// What of a file its crate's code can observe ([`code_text`]).
@@ -533,14 +548,18 @@ fn code_text(db: &Db, file: EditionedFileId) -> Option<CodeText> {
 /// What of a file of text `text`, parsed as `root`, its crate's code can observe (the module's
 /// docs).
 pub fn code_text_of(root: &SyntaxNode, text: &str) -> CodeText {
+    let end = match planted(Plant::Bytes) {
+        true => text.len(),
+        false => code_end(root),
+    };
     let mut walk = Walk {
         text,
-        inert: Masked::new(),
-        strict: Masked::new(),
+        inert: Masked::of(CODE_TEXT, end),
+        strict: Masked::of(CODE_TEXT, end),
         shadows: false,
         whole: false,
-        interface: Masked::of(INTERFACE_TEXT),
-        interface_strict: Masked::of(INTERFACE_TEXT),
+        interface: Masked::of(INTERFACE_TEXT, end),
+        interface_strict: Masked::of(INTERFACE_TEXT, end),
         skip: (0, 0),
         unplain: false,
         extends: false,
@@ -569,21 +588,113 @@ pub fn code_text_of(root: &SyntaxNode, text: &str) -> CodeText {
     }
 }
 
+/// Where the code of a file parsed as `root` ends: the end of its last token that is not
+/// whitespace or a plain `//` comment, 0 for a file with none. Nothing is after what follows it,
+/// so no token and no position moves with it, and no text holds it ([`Masked::end`]): a
+/// comment line appended to a file, blank lines at its end and its last line's end are in no
+/// key. A doc comment there stays (it is an attribute with no item, an error), and so does a
+/// block comment (one that does not end is an error) and a comment the compiler reads
+/// ([`READ_IN_COMMENTS`]).
+fn code_end(root: &SyntaxNode) -> usize {
+    let mut last = root.last_token();
+    while let Some(token) = last {
+        let left_out = match token.kind() {
+            SyntaxKind::WHITESPACE => true,
+            SyntaxKind::COMMENT => {
+                token.text().starts_with("//") && !token.text().contains(READ_IN_COMMENTS)
+            }
+            _ => false,
+        };
+        if !left_out {
+            return usize::from(token.text_range().end());
+        }
+        last = token.prev_token();
+    }
+    0
+}
+
+/// Whether the block comment `comment` (`/* .. */`, nested ones inside it) ends: each `/*`
+/// of it is closed, the last by its last two bytes. One that does not is an error
+/// (`unterminated block comment`), which a shape would hide.
+fn block_ends(comment: &str) -> bool {
+    let bytes = comment.as_bytes();
+    let (mut depth, mut at) = (0usize, 0usize);
+    while at + 1 < bytes.len() {
+        match (bytes[at], bytes[at + 1]) {
+            (b'/', b'*') => {
+                depth += 1;
+                at += 2;
+            }
+            (b'*', b'/') => {
+                let Some(less) = depth.checked_sub(1) else { return false };
+                depth = less;
+                at += 2;
+                if depth == 0 {
+                    return at == bytes.len();
+                }
+            }
+            _ => at += 1,
+        }
+    }
+    false
+}
+
 /// A file's text hashed with some comments as their shape: the text since the last one, then
 /// each one's shape.
 struct Masked {
     hasher: Hasher,
     /// Where the text not hashed yet starts.
     from: usize,
+    /// Where the file's code ends ([`code_end`]): nothing from here on is hashed.
+    end: usize,
 }
 
 impl Masked {
-    fn new() -> Masked {
-        Masked::of(CODE_TEXT)
+    fn of(domain: &'static str, end: usize) -> Masked {
+        Masked { hasher: Hasher::new(domain), from: 0, end }
     }
 
-    fn of(domain: &'static str) -> Masked {
-        Masked { hasher: Hasher::new(domain), from: 0 }
+    /// The whitespace `token` of `text` with the spaces and tabs before each of its lines'
+    /// ends left out: nothing is after them on their line, so they move no token, as the
+    /// spaces before a `//` comment move none. Its lines' ends stay, each a line of every
+    /// token after it, and so does what is after its last line's end, the column of the next
+    /// token, which stays to be hashed (a `//` comment after it leaves it out). Whitespace
+    /// with no line's end is left as it is: it is before a token, or before a comment or the
+    /// file's end, which leave it out.
+    fn blank(&mut self, text: &str, token: &SyntaxToken) {
+        let range = token.text_range();
+        let (start, end) = (usize::from(range.start()), usize::from(range.end()));
+        if start >= self.end {
+            return;
+        }
+        let space = &text.as_bytes()[start..end];
+        let Some(last) = space.iter().rposition(|it| *it == b'\n') else { return };
+        self.hasher.update(&text.as_bytes()[self.from..start]);
+        // Where the bytes of `space` not hashed yet start, and the byte looked at.
+        let (mut kept, mut at) = (0, 0);
+        while at <= last {
+            // A run of spaces and tabs, which ends at the latest at the last line's end.
+            let run = at;
+            while matches!(space[at], b' ' | b'\t') {
+                at += 1;
+            }
+            let ends_line =
+                space[at] == b'\n' || (space[at] == b'\r' && space.get(at + 1) == Some(&b'\n'));
+            if at > run && ends_line {
+                self.hasher.update(&space[kept..run]);
+                kept = at;
+            }
+            at += 1;
+        }
+        self.hasher.update(&space[kept..=last]);
+        self.from = start + last + 1;
+    }
+
+    /// `start..end` of `text` left out, with nothing in its place: what a planted bug takes
+    /// out of a text ([`Plant::Stale`]).
+    fn skip(&mut self, text: &str, start: usize, end: usize) {
+        self.hasher.update(&text.as_bytes()[self.from..start]);
+        self.from = end;
     }
 
     /// `token`, a comment at `range` of `text`, as its shape: a byte no UTF-8 text has, its
@@ -594,11 +705,17 @@ impl Masked {
     fn mask(&mut self, text: &str, token: &SyntaxToken) {
         let range = token.text_range();
         let (start, end) = (usize::from(range.start()), usize::from(range.end()));
+        // After the file's last token nothing is hashed ([`code_end`]).
+        if start >= self.end {
+            return;
+        }
         let comment = &text[start..end];
         // A comment the compiler reads the text of stays text: a bidirectional control in it
-        // is denied (`text_direction_codepoint_in_comment`), and a carriage return in a doc
-        // comment is an error.
-        if comment.contains(READ_IN_COMMENTS) {
+        // is denied (`text_direction_codepoint_in_comment`), a carriage return in a doc
+        // comment is an error, and so is a block comment that does not end.
+        if comment.contains(READ_IN_COMMENTS)
+            || (comment.starts_with("/*") && !block_ends(comment))
+        {
             return;
         }
         let kind: u8 = match token.kind() {
@@ -656,8 +773,11 @@ impl Masked {
     /// length, which a comment's own length is part of (until CODE_TEXT 2 it was hashed, so a
     /// comment edit that made the file longer changed every code text). Each shape starts
     /// with a byte no text has and has a fixed length, so no two streams read the same.
+    ///
+    /// The rest ends where the file's code does ([`code_end`]): what is after its last token
+    /// is in no text.
     fn finish(mut self, text: &str) -> ContentId {
-        self.hasher.update(&text.as_bytes()[self.from..]);
+        self.hasher.update(&text.as_bytes()[self.from..self.end.max(self.from)]);
         self.hasher.finish()
     }
 }
@@ -764,6 +884,8 @@ impl Walk<'_> {
         let at = usize::from(token.text_range().start());
         let (in_interface, in_interface_strict) = (at >= self.skip.0, at >= self.skip.1);
         match token.kind() {
+            // With the planted bug every text holds its file's bytes, comments and all.
+            SyntaxKind::COMMENT | SyntaxKind::WHITESPACE if planted(Plant::Bytes) => {}
             // No token stream holds a `//` comment.
             SyntaxKind::COMMENT => {
                 self.inert.mask(self.text, token);
@@ -774,6 +896,26 @@ impl Walk<'_> {
                 if in_interface_strict {
                     self.interface_strict.mask(self.text, token);
                 }
+            }
+            // Nor the spaces before a line's end: a macro is given tokens, and whether two of
+            // them have whitespace between them, which a line's end between them says either
+            // way.
+            SyntaxKind::WHITESPACE => {
+                self.inert.blank(self.text, token);
+                self.strict.blank(self.text, token);
+                if in_interface {
+                    self.interface.blank(self.text, token);
+                }
+                if in_interface_strict {
+                    self.interface_strict.blank(self.text, token);
+                }
+            }
+            // The planted bug: a number's digits are in no code text.
+            SyntaxKind::INT_NUMBER if planted(Plant::Stale) => {
+                let range = token.text_range();
+                let (start, end) = (usize::from(range.start()), usize::from(range.end()));
+                self.inert.skip(self.text, start, end);
+                self.strict.skip(self.text, start, end);
             }
             SyntaxKind::OUTER_DOC_COMMENT | SyntaxKind::INNER_DOC_COMMENT => {
                 if !inert {
@@ -910,6 +1052,12 @@ pub(crate) enum Plant {
     /// A unit that builds code is keyed by the interfaces of the crates it depends on, not
     /// their code: a stale program ([`crate::Narrowed::code`]).
     Shallow,
+    /// A file's texts hold its bytes, comments and whitespace as they are: a unit keyed by
+    /// them is made again by an edit that moves no token and no position, no cutoff.
+    Bytes,
+    /// A number's digits are in no code text: a unit keyed by it is not made again when one
+    /// changes, a stale unit.
+    Stale,
 }
 
 #[cfg(test)]

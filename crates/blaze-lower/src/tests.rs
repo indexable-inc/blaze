@@ -2299,13 +2299,7 @@ fn a_root_passed_two_ways_is_two_crates_with_two_names() {
 /// the bin that depends on it, in the units of [`units`] lowered from nothing over the view
 /// with the lib's root as `lib`.
 fn narrowed_over(lib: &'static [u8]) -> [(ContentId, super::Narrowed); 2] {
-    let tree = MemTree::default();
-    let root = changed(&tree, &[("a/src/lib.rs", Some(lib))]);
-    let config = config(root, library(&tree));
-    let units = units();
-    let mut front =
-        lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None })
-            .unwrap();
+    let mut front = front_over(&[("a/src/lib.rs", Some(lib))]);
     [LIB, BIN].map(|unit| {
         let whole = front.identity(unit).unwrap_or_else(|| panic!("unit {unit} has no identity"));
         let narrowed = front
@@ -2315,9 +2309,26 @@ fn narrowed_over(lib: &'static [u8]) -> [(ContentId, super::Narrowed); 2] {
     })
 }
 
+/// The units of [`units`] lowered from nothing over the view with each of `changes` made.
+fn front_over(changes: &[(&'static str, Option<&'static [u8]>)]) -> Lowered {
+    let tree = MemTree::default();
+    let root = changed(&tree, changes);
+    let config = config(root, library(&tree));
+    let units = units();
+    lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None }).unwrap()
+}
+
 /// The lib's root as a plain function, and the same after an edit of each kind.
 const LIB_PLAIN: &[u8] = b"pub fn gen() -> u8 {\n    1\n}\n";
 const LIB_COMMENTED: &[u8] = b"pub fn gen() -> u8 { // made up\n    1 // the value\n}\n";
+/// What else moves no token and no position: spaces before a line's end, and a comment and
+/// blank lines after the last line.
+const LIB_SPACED: &[u8] = b"pub fn gen() -> u8 {  \n    1\t\n}\n";
+const LIB_ENDED: &[u8] = b"pub fn gen() -> u8 {\n    1\n}\n// the end\n\n";
+/// A comment on a line of its own, which moves every line after it, and a doc comment, an
+/// attribute of its item.
+const LIB_HEADED: &[u8] = b"// made up\npub fn gen() -> u8 {\n    1\n}\n";
+const LIB_DOCUMENTED: &[u8] = b"/** Made up. */pub fn gen() -> u8 {\n    1\n}\n";
 const LIB_BODY: &[u8] = b"pub fn gen() -> u8 {\n    2\n}\n";
 const LIB_LINE: &[u8] = b"pub fn gen() -> u8 {\n\n    1\n}\n";
 const LIB_SIGNATURE: &[u8] = b"pub fn gen() -> u16 {\n    1\n}\n";
@@ -2361,6 +2372,10 @@ fn check_edit(lib: &'static [u8], comment: bool, body: bool) -> Result<(), Strin
 #[test]
 fn a_dependents_key_moves_only_with_what_it_observes_of_a_dependency() {
     assert_eq!(check_edit(LIB_COMMENTED, true, false), Ok(()));
+    assert_eq!(check_edit(LIB_SPACED, true, false), Ok(()));
+    assert_eq!(check_edit(LIB_ENDED, true, false), Ok(()));
+    assert_eq!(check_edit(LIB_HEADED, false, false), Ok(()));
+    assert_eq!(check_edit(LIB_DOCUMENTED, false, false), Ok(()));
     assert_eq!(check_edit(LIB_BODY, false, true), Ok(()));
     assert_eq!(check_edit(LIB_LINE, false, false), Ok(()));
     assert_eq!(check_edit(LIB_SIGNATURE, false, false), Ok(()));
@@ -2408,4 +2423,66 @@ fn a_crate_whose_bodies_a_check_may_read_gives_no_interface() {
     let [_, (_, inline)] = narrowed_over(b"#[inline]\npub fn gen() -> u8 {\n    1\n}\n");
     let [_, (_, inline_body)] = narrowed_over(b"#[inline]\npub fn gen() -> u8 {\n    2\n}\n");
     assert_ne!(inline.checked, inline_body.checked, "an `#[inline]` body");
+}
+
+/// The edited crate's own unit, directed: an edit of its root that moves no token and no
+/// position (a comment at a line's end, spaces before one, a comment after the last line)
+/// leaves the identity its record is keyed by as it was, for the unit that builds its code and
+/// for the one that checks it, though its bytes, and so its whole identity, moved; a comment
+/// on a line of its own and a doc comment move it.
+#[test]
+fn a_units_own_key_is_of_its_code_text_and_not_its_bytes() {
+    let [(whole, was), _] = narrowed_over(LIB_PLAIN);
+    for still in [LIB_COMMENTED, LIB_SPACED, LIB_ENDED] {
+        let [(whole_now, now), _] = narrowed_over(still);
+        assert_ne!(whole, whole_now, "{}", String::from_utf8_lossy(still));
+        assert_eq!(was, now, "{}", String::from_utf8_lossy(still));
+    }
+    for moved in [LIB_HEADED, LIB_DOCUMENTED, LIB_LINE, LIB_BODY] {
+        let [(_, now), _] = narrowed_over(moved);
+        assert_ne!(was.code, now.code, "{}", String::from_utf8_lossy(moved));
+        assert_ne!(was.checked, now.checked, "{}", String::from_utf8_lossy(moved));
+    }
+}
+
+/// A file `include_str!` reads is an input by its bytes: one that is not Rust is in every
+/// key of its crate, and of the crates above it, as it is, so what looks like a comment in it
+/// moves them all, while a comment in the crate's own code still moves none.
+#[test]
+fn a_file_read_as_bytes_is_in_every_key_by_its_bytes() {
+    const READS: &[u8] = b"pub fn gen() -> usize {\n    include_str!(\"notes.txt\").len()\n}\n";
+    const READS_NOTED: &[u8] =
+        b"pub fn gen() -> usize { // counts\n    include_str!(\"notes.txt\").len()\n}\n";
+    let over = |lib: &'static [u8], notes: &'static [u8]| {
+        let mut front =
+            front_over(&[("a/src/lib.rs", Some(lib)), ("a/src/notes.txt", Some(notes))]);
+        [LIB, BIN].map(|unit| front.narrowed(unit).expect("a workspace crate's narrowed identity"))
+    };
+    let [lib, bin] = over(READS, b"one\n");
+    assert_eq!([lib, bin], over(READS_NOTED, b"one\n"), "a comment in the code");
+    let [lib_now, bin_now] = over(READS, b"one // two\n");
+    assert_ne!(lib.code, lib_now.code);
+    assert_ne!(lib.checked, lib_now.checked);
+    assert_ne!(bin.code, bin_now.code, "the program is built with the file's bytes in it");
+    assert_ne!(bin.checked, bin_now.checked, "a check of the bin may read the constant");
+}
+
+/// A Rust file `include_str!` reads is read comments and all: its crate keeps its whole text
+/// (no narrowed identity, so its record is under its whole key), and a comment in that file
+/// moves the key of every unit above it.
+#[test]
+fn a_rust_file_read_as_bytes_keeps_its_crates_whole_text() {
+    const READS: &[u8] = b"pub fn gen() -> usize {\n    include_str!(\"more.rs\").len()\n}\n";
+    let over = |more: &'static [u8]| {
+        let mut front =
+            front_over(&[("a/src/lib.rs", Some(READS)), ("a/src/more.rs", Some(more))]);
+        let whole = front.identity(LIB).expect("the lib's identity");
+        (whole, front.narrowed(LIB), front.narrowed(BIN).expect("the bin's narrowed identity"))
+    };
+    let (whole, lib, bin) = over(b"pub fn more() {}\n");
+    let (whole_now, lib_now, bin_now) = over(b"pub fn more() {} // said\n");
+    assert_eq!((lib, lib_now), (None, None), "a crate that reads Rust as bytes is its bytes");
+    assert_ne!(whole, whole_now);
+    assert_ne!(bin.code, bin_now.code);
+    assert_ne!(bin.checked, bin_now.checked);
 }

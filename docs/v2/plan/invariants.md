@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-26 invariants, 1 refinements, 1 reference models.
-By level: 12 tested, 15 simulated, 0 model-checked, 0 proved.
+27 invariants, 1 refinements, 1 reference models.
+By level: 13 tested, 15 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
@@ -83,7 +83,9 @@ By level: 12 tested, 15 simulated, 0 model-checked, 0 proved.
 ### blaze-lower
 
 - **`the_interface_text_moves_exactly_with_what_a_dependent_observes`** *tested* (`crates/blaze-lower/src/code/tests.rs`): any edit of a file that changes what a crate checking against it can observe (a signature, an item added or removed, a constant's value, a macro's tokens, a generic, `const`, `#[inline]`, `impl Trait` or default-method body, a body that defines an item or calls an unknown macro, a `cfg`, a line moved) changes its interface text, and an edit of a comment or of a plain function's body that moves no line leaves it as it was. Drawn: up to five items of any kind, and one edit of one of them.
-  Controls: `a_generic_body_left_out`, `a_const_body_left_out`, `an_inline_body_left_out`, `a_body_a_signature_hides_a_type_of_left_out`, `a_default_methods_body_left_out`, `a_body_that_defines_an_item_left_out`, `a_body_that_calls_an_unknown_macro_left_out`, `a_shape_with_no_line_count`.
+  Controls: `a_key_that_holds_its_files_bytes`, `a_key_that_drops_a_token`, `a_generic_body_left_out`, `a_const_body_left_out`, `an_inline_body_left_out`, `a_body_a_signature_hides_a_type_of_left_out`, `a_default_methods_body_left_out`, `a_body_that_defines_an_item_left_out`, `a_body_that_calls_an_unknown_macro_left_out`, `a_shape_with_no_line_count`.
+- **`a_units_own_key_moves_exactly_with_what_its_results_depend_on`** *tested* (`crates/blaze-lower/src/code/tests.rs`): a unit's key moves exactly when something its results depend on moves. Of its own crate's file it holds the code text, so any edit that changes a token (a body, a signature, an item or a `cfg` that comes or goes, a doc comment that comes) or the line or column of one (a line more in a body, a comment on a line of its own) changes it, and an edit that moves neither (a `//` comment at a line's end, spaces before a line's end, a comment or blank lines after the last line) leaves it as it was. Drawn: up to five items of any kind, some with a comment at a line's end already, and one edit of one of them.
+  Controls: `a_key_that_holds_its_files_bytes`, `a_key_that_drops_a_token`, `a_generic_body_left_out`, `a_const_body_left_out`, `an_inline_body_left_out`, `a_body_a_signature_hides_a_type_of_left_out`, `a_default_methods_body_left_out`, `a_body_that_defines_an_item_left_out`, `a_body_that_calls_an_unknown_macro_left_out`, `a_shape_with_no_line_count`.
 - **`a_dependents_key_moves_only_with_what_it_observes_of_a_dependency`** *tested* (`crates/blaze-lower/src/tests.rs`): an edit that leaves a crate's interface as it was (a comment; a plain function's body that keeps its lines) leaves the key identity of every unit that only checks against it as it was, and an edit of comments alone leaves every narrowed identity as it was, in the crate and above it; any other edit (a body, for a unit that builds code; a line moved; a signature) moves the identity of every unit that can observe it.
   Controls: `a_check_keyed_by_its_dependencies_code`, `a_program_keyed_by_its_dependencies_interfaces`.
 

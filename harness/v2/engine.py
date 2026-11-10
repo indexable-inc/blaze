@@ -168,6 +168,8 @@ class Work:
     # The reports of steps recomputed (`blaze-report` lines, one a root cause): none from a
     # build that recomputed nothing (docs/v2/plan/design/why.md, "What is printed").
     reports: int | None = None
+    # Each of those reports' text.
+    causes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -721,7 +723,7 @@ class V2(Engine):
         reports = [text for texts in self.reported.get(str(home), [])[mark.sizes["requests"]:] for text in texts]
         return Work(compiled=total("compiled"), reran=total("reran"), found=total("found"), link=link,
                     said="\n".join([*(json.dumps(line, sort_keys=True) for _, line in lines), *reports]),
-                    green=total("green"), reports=len(reports))
+                    green=total("green"), reports=len(reports), causes=tuple(reports))
 
     def codegen_inputs(self, ws: Path, env: dict[str, str]) -> dict[str, str]:
         # `blaze codegen-inputs --format=json` (`blaze_ui::api::codegen_inputs_json`): one object

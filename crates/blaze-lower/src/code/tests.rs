@@ -232,6 +232,146 @@ fn a_line_comment_at_a_lines_end_is_nothing() {
     );
 }
 
+/// What moves no token and no position is in no text, there or not: the spaces and tabs
+/// before a line's end, and what is after the file's last token (a comment line appended,
+/// blank lines, the last line's end). Spaces before a token are its column, and stay.
+#[test]
+fn what_moves_no_token_and_no_position_is_nothing() {
+    let bare = code("fn f() {\n    g();\n}\n");
+    for same in [
+        "fn f() {  \n    g();\t\n}\n",
+        "fn f() {\n    g();\n}\n// c\n",
+        "fn f() {\n    g();\n}\n\n\n// one\n    // two\n\n",
+        "fn f() {\n    g();\n}",
+        "fn f() {\n    g();\n} // c",
+        "fn f() {\n    g();\n}   ",
+    ] {
+        assert_eq!(bare, code(same), "{same:?}");
+    }
+    // In a file whose lines end `\r\n`, the spaces before a line's end are as little.
+    assert_eq!(
+        code("fn f() {\r\n    g();\r\n}\r\n").inert,
+        code("fn f() {  \r\n    g(); \t\r\n}\r\n").inert
+    );
+    // Each with whether a crate that only checks against the file can observe it: what is
+    // inside a plain body but its lines is in no interface.
+    for (text, what, outside) in [
+        ("fn f() {\n     g();\n}\n", "a column more, in a plain body", false),
+        ("fn f()  {\n    g();\n}\n", "a column more, before a token on its line", true),
+        ("fn f() {\n\n    g();\n}\n", "a line more", true),
+        ("fn f() {\n    g();\n}\n/// doc\n", "a doc comment after the last item", true),
+        ("fn f() {\n    g();\n}\n/* c */\n", "a block comment after the last item", true),
+        ("fn f() {\n    g();\n}\n// \u{202E}\n", "a comment the compiler reads", true),
+        ("fn f() {\n    h();\n}\n", "a token of a plain body", false),
+    ] {
+        let other = code(text);
+        assert_ne!(bare.inert, other.inert, "{what}: {text:?}");
+        assert_ne!(bare.strict, other.strict, "{what}: {text:?}");
+        assert_eq!(bare.interface != other.interface, outside, "{what}: {text:?}");
+    }
+    // Whitespace inside a string is the string.
+    assert_ne!(
+        code("const A: &str = \"a \n b\";\n").inert,
+        code("const A: &str = \"a\n b\";\n").inert
+    );
+    // A file of comments and whitespace alone has no code, whatever they say.
+    assert_eq!(code("// one\n\n"), code(""));
+}
+
+/// A block comment that does not end is an error, so its text stays: no text of a file with
+/// one is the text of a file that builds.
+#[test]
+fn a_block_comment_that_does_not_end_keeps_its_text() {
+    let ended = code("fn f() {}\n/* a */ fn g() {}\n");
+    assert_eq!(ended, code("fn f() {}\n/* b */ fn g() {}\n"));
+    assert_ne!(ended.inert, code("fn f() {}\n/* a fn g() {}\n").inert);
+    assert_ne!(
+        code("fn f() {}\n/* abc").inert,
+        code("fn f() {}\n/* a*/").inert,
+        "as many bytes on as many lines"
+    );
+    assert_ne!(code("/* /* a */ b").inert, code("/* /* a */ */").inert, "a nested one");
+    assert_ne!(code("/** a").inert, code("/** b").inert, "a doc comment's");
+}
+
+/// A comment on a line of its own before code moves every line after it, which `line!()`, a
+/// panic's location and a diagnostic read: the text changes. What it says does not.
+#[test]
+fn a_comment_on_its_own_line_moves_the_lines_after_it() {
+    let bare = code("fn f() -> u32 {\n    line!()\n}\n");
+    let noted = code("fn f() -> u32 {\n    // which line\n    line!()\n}\n");
+    assert_ne!(bare.inert, noted.inert);
+    assert_ne!(bare.interface, noted.interface, "a dependent's diagnostic points here too");
+    assert_eq!(noted, code("fn f() -> u32 {\n        // another thing said\n    line!()\n}\n"));
+    assert_eq!(noted, code("fn f() -> u32 {\n\n    line!()\n}\n"), "its line is an empty line");
+    // Before the first item, and between two.
+    assert_ne!(code("fn f() {}\nfn g() {}\n").inert, code("fn f() {}\n// g\nfn g() {}\n").inert);
+}
+
+/// A doc comment is an attribute of its item: one that comes or goes changes the text (a
+/// lint reads whether an item is documented), in a body too. What it says is read by rustdoc
+/// and by a macro given its item, whose units and items keep it
+/// ([`an_unseen_doc_edit_is_masked`], [`a_doc_a_macro_sees_is_kept`]).
+#[test]
+fn a_doc_comment_that_comes_or_goes_changes_the_text() {
+    let bare = code("pub fn f() {}\n");
+    let documented = code("/// What f does.\npub fn f() {}\n");
+    assert_ne!(bare.inert, documented.inert);
+    assert_ne!(bare.strict, documented.strict);
+    assert_ne!(bare.interface, documented.interface);
+    // On one line with its item, where it moves nothing: still an attribute more.
+    assert_ne!(code("pub fn f() {}").inert, code("/** f */pub fn f() {}").inert);
+    assert_ne!(
+        code("//! one\npub fn f() {}\n").inert,
+        code("// one\npub fn f() {}\n").inert,
+        "an inner doc comment and a plain one"
+    );
+}
+
+/// A macro is given tokens: a `//` comment among them, and the spaces before a line's end,
+/// are none, so they are in no text. What the macro's tokens can say of where they are
+/// (`line!()`, `column!()`, a span `stringify!`'s caller reads) moves with a line or a
+/// column, which stay.
+#[test]
+fn a_comment_among_a_macros_tokens_is_nothing_and_a_moved_token_is_not() {
+    let bare = code("fn f() {\n    m!(a,\n        b);\n}\n");
+    assert_eq!(bare, code("fn f() {\n    m!(a, // the first\n        b);  \n}\n"));
+    assert_eq!(
+        code("macro_rules! m {\n    () => {\n        1\n    };\n}\n"),
+        code("macro_rules! m { // none\n    () => { // gives\n        1\n    };\n}\n")
+    );
+    for (before, after, what) in [
+        (
+            "fn f() -> u32 {\n    m!(line!())\n}\n",
+            "fn f() -> u32 {\n    // moved\n    m!(line!())\n}\n",
+            "a line",
+        ),
+        (
+            "fn f() -> u32 {\n    m!(\n        line!()\n    )\n}\n",
+            "fn f() -> u32 {\n    m!(\n        // moved\n        line!()\n    )\n}\n",
+            "a line, inside the macro's tokens",
+        ),
+        (
+            "fn f() -> u32 {\n    m!(column!())\n}\n",
+            "fn f() -> u32 {\n    /* c */ m!(column!())\n}\n",
+            "a column",
+        ),
+        (
+            "fn f() -> &'static str {\n    stringify!(a+b)\n}\n",
+            "fn f() -> &'static str {\n    stringify!(a + b)\n}\n",
+            "whether two tokens have whitespace between them",
+        ),
+        (
+            "fn f() -> &'static str {\n    stringify!(a /* c */ b)\n}\n",
+            "fn f() -> &'static str {\n    stringify!(a /* cd */ b)\n}\n",
+            "the column of a token after a block comment",
+        ),
+    ] {
+        assert_ne!(code(before).inert, code(after).inert, "{what}");
+        assert_ne!(code(before).strict, code(after).strict, "{what}");
+    }
+}
+
 /// What a file says of its crate beside its texts: whether a standard macro could mean
 /// another in it, whether it names blaze's extensions, whether it may read a file by path.
 #[test]
@@ -317,6 +457,98 @@ struct Item {
     long: bool,
     gated: bool,
     noted: bool,
+}
+
+/// One edit of a generated file that only its own crate's unit is asked of: what moves no
+/// token and no position, and what does.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Own {
+    /// An edit every text is asked of ([`Edit`]).
+    Of(Edit),
+    /// Spaces at the end of the item's first line come.
+    Spaces,
+    /// A comment line and a blank line come after the file's last line.
+    Ending,
+    /// A comment on a line of its own comes before the item: every line from it on moves.
+    Heading,
+    /// A doc comment comes on the item, on the item's own first line: an attribute more, and
+    /// a column moved.
+    Doc,
+}
+
+const OWN: [Own; 11] = [
+    Own::Of(Edit::Body),
+    Own::Of(Edit::Lines),
+    Own::Of(Edit::Signature),
+    Own::Of(Edit::Removed),
+    Own::Of(Edit::Added),
+    Own::Of(Edit::Cfg),
+    Own::Of(Edit::Comment),
+    Own::Spaces,
+    Own::Ending,
+    Own::Heading,
+    Own::Doc,
+];
+
+/// What the unit of a crate of the one file `text` is keyed by of it
+/// ([`super::own_narrow`]'s choice for it: its code text, with the prelude's macros taken as
+/// macros where the file could shadow one).
+fn own(text: &str) -> ContentId {
+    let code = code(text);
+    match code.shadows {
+        true => code.strict,
+        false => code.inert,
+    }
+}
+
+/// `edit` of item `at` of `items`: the file before and after, and whether anything the
+/// crate's own unit makes depends on what moved: its code and its check on every token, and
+/// its locations, debug info and diagnostics on every line and column.
+fn own_edited(items: &[Item], at: usize, edit: Own) -> (String, String, bool) {
+    let before = file(items);
+    match edit {
+        Own::Of(edit) => {
+            let (after, _) = edited(items, at, edit);
+            (before, file(&after), edit != Edit::Comment)
+        }
+        Own::Spaces => {
+            let after = with_item(items, at, |text| text.replacen('\n', "  \t\n", 1));
+            (before, after, false)
+        }
+        Own::Ending => {
+            let after = format!("{before}// the end\n\n");
+            (before, after, false)
+        }
+        Own::Heading => (before, with_item(items, at, |text| format!("// item\n{text}")), true),
+        Own::Doc => (before, with_item(items, at, |text| format!("/** item */{text}")), true),
+    }
+}
+
+/// The file of `items` with the text of item `at` as `change` makes it.
+fn with_item(items: &[Item], at: usize, change: impl Fn(String) -> String) -> String {
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, it)| if index == at { change(it.text(index)) } else { it.text(index) })
+        .collect()
+}
+
+/// The oracle of a unit's own key: the code text of `items` and of `items` after `edit` of
+/// item `at` differ exactly when something the unit makes depends on what the edit moved.
+fn check_own(items: &[Item], at: usize, edit: Own) -> Result<(), String> {
+    let (before, after, observed) = own_edited(items, at, edit);
+    let moved = own(&before) != own(&after);
+    match (observed, moved) {
+        (true, false) => Err(format!(
+            "{:?} {edit:?}: what the unit makes depends on it, and its key is as it was",
+            items[at].kind
+        )),
+        (false, true) => Err(format!(
+            "{:?} {edit:?}: it moves no token and no position, and the unit's key moved",
+            items[at].kind
+        )),
+        _ => Ok(()),
+    }
 }
 
 impl Item {
@@ -515,6 +747,91 @@ fn the_interface_text_moves_exactly_with_what_a_dependent_observes(tc: TestCase)
     if let Err(found) = check(&items, at, EDITS[edit]) {
         panic!("{found}\n{}", file(&items));
     }
+}
+
+/// The invariant: a unit's key moves exactly when something its results depend on moves. Of
+/// its own crate's file it holds the code text, so any edit that changes a token (a body, a
+/// signature, an item or a `cfg` that comes or goes, a doc comment that comes) or the line or
+/// column of one (a line more in a body, a comment on a line of its own) changes it, and an
+/// edit that moves neither (a `//` comment at a line's end, spaces before a line's end, a
+/// comment or blank lines after the last line) leaves it as it was.
+/// Drawn: up to five items of any kind, some with a comment at a line's end already, and one
+/// edit of one of them.
+#[hegel::test]
+fn a_units_own_key_moves_exactly_with_what_its_results_depend_on(tc: TestCase) {
+    // The last of each: whether its body has a line more (1) and a comment ends its first
+    // line (2).
+    let drawn: Vec<(u8, u8, u8, u8)> = tc.draw(
+        gs::vecs(gs::tuples!(
+            gs::integers().max_value(10),
+            gs::integers().max_value(2),
+            gs::integers().max_value(9),
+            gs::integers().max_value(3)
+        ))
+        .min_size(1)
+        .max_size(5),
+    );
+    let items: Vec<Item> = drawn
+        .iter()
+        .map(|&(kind, sig, value, laid)| Item {
+            kind: KINDS[usize::from(kind)],
+            sig,
+            value,
+            long: laid & 1 != 0,
+            gated: false,
+            noted: laid & 2 != 0,
+        })
+        .collect();
+    let at: usize = tc.draw(gs::integers().max_value(items.len() - 1));
+    let edit: usize = tc.draw(gs::integers().max_value(OWN.len() - 1));
+    if let Err(found) = check_own(&items, at, OWN[edit]) {
+        panic!("{found}\n{}", file(&items));
+    }
+}
+
+/// One item of `kind`, edited by `edit`, asked of its own unit's key: the directed case of a
+/// control.
+fn directed_own(kind: Kind, edit: Own) -> Result<(), String> {
+    let item = Item { kind, sig: 0, value: 1, long: false, gated: false, noted: false };
+    check_own(&[item], 0, edit)
+}
+
+/// Every edit of every kind of item, one item a file: the oracle's cases one by one.
+#[test]
+fn a_units_own_key_holds_every_edit_of_every_kind_of_item() {
+    for kind in KINDS {
+        for edit in OWN {
+            assert_eq!(directed_own(kind, edit), Ok(()), "{kind:?} {edit:?}");
+        }
+    }
+}
+
+/// With a key that holds its file's bytes, an edit that moves no token and no position makes
+/// the unit again, the cutoff gone: the oracle says so for each such edit.
+#[test]
+fn the_oracle_catches_a_key_that_holds_its_files_bytes() {
+    for edit in [Own::Of(Edit::Comment), Own::Spaces, Own::Ending] {
+        assert_eq!(directed_own(Kind::Plain, edit), Ok(()));
+        assert_eq!(
+            planting(Plant::Bytes, || directed_own(Kind::Plain, edit)),
+            Err(format!(
+                "Plain {edit:?}: it moves no token and no position, and the unit's key moved"
+            ))
+        );
+    }
+}
+
+/// With a key that leaves a token out (a number's digits), an edit of it leaves the unit as
+/// it was, stale: the oracle says so.
+#[test]
+fn the_oracle_catches_a_key_that_drops_a_token() {
+    let edit = Own::Of(Edit::Body);
+    assert_eq!(directed_own(Kind::Plain, edit), Ok(()));
+    assert_eq!(
+        planting(Plant::Stale, || directed_own(Kind::Plain, edit)),
+        Err("Plain Of(Body): what the unit makes depends on it, and its key is as it was"
+            .to_owned())
+    );
 }
 
 /// One item of `kind`, edited by `edit`: the directed case of a control.

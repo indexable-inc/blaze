@@ -31,8 +31,15 @@ Apart from that:
   (`fixture.rejects`: a deleted `include_str!` file, a non-`Send` type sent) was built: both
   builds have to refuse it;
 - `over/...` fails where an edit docs/v2/plan/objectives.md says compiles nothing (`fixture.Slot.budget_zero`:
-  formatting, comments, a rename or move nothing reads, PATH) compiled something. What every
-  other kind of edit compiled is measured and summed by kind in the result (`work_by_kind`).
+  formatting, comments, a rename or move nothing reads, PATH) compiled something, and where one
+  that moves no token and no position (`fixture.Edit.still`: a comment at a line's end or after
+  the last line, spaces before a line's end, in any crate of the workspace, the program's own
+  among them) made any step again. What every other kind of edit compiled is measured and
+  summed by kind in the result (`work_by_kind`);
+- `moved/...` fails where an edit that moves positions and no token (`fixture.Edit.moves`: a
+  comment on a line of its own, a file laid out otherwise) made a step again that is not the
+  writing of a location table (`LOCATIONS`; docs/v2/plan/design/item-hash.md section 12): no
+  unit, no codegen template and no link of code.
 
 Sequences: `regressions` (fixture.REGRESSIONS: #906, #1325, #1326, #805, names, positions,
 resolution, features), then `rounds` random sequences of `steps` edits from `seed` (round
@@ -166,8 +173,13 @@ class Step:
     budget_zero: bool = False
     # The edit moves no token and no position (`fixture.Edit.still`): it recomputes no step.
     still: bool = False
+    # The edit moves positions and no token (`fixture.Edit.moves`): it recomputes no step but
+    # the writing of location tables.
+    moves: bool = False
     # The reports of recomputed steps the incremental build gave (`engine.Work.reports`).
     reports: int | None = None
+    # Each report's text (`engine.Work.causes`).
+    causes: tuple[str, ...] = ()
     said: str = ""
     rejects: bool = False
     compiled: int | None = None
@@ -430,7 +442,7 @@ class Round:
         slot = fixture.BY_NAME[edit.slot] if edit else None
         out = Step(name=name, verdict="pass", kind=edit.kind if edit else "start", slot=edit.slot if edit else "",
                    edit=edit.label() if edit else "", budget_zero=bool(slot and slot.budget_zero),
-                   still=bool(edit and edit.still()),
+                   still=bool(edit and edit.still()), moves=bool(edit and edit.moves()),
                    rejects=fixture.rejects(state), state=dict(state))
         try:
             inc, work = self.incremental(state)
@@ -446,7 +458,7 @@ class Round:
         self.last_trace = inc.trace
         if work is not None:
             out.compiled, out.reran, out.link = work.compiled, work.reran, work.link
-            out.reports, out.said = work.reports, work.said
+            out.reports, out.said, out.causes = work.reports, work.said, work.causes
         if inc.not_blazes or scratch.not_blazes:
             out.verdict = "unmeasured"
             out.detail = f"not blaze's: {inc.not_blazes or scratch.not_blazes}"
@@ -608,6 +620,19 @@ def work_root(given: str) -> Path:
     return engine.work_dir(given, "bz-oracle-")
 
 
+# The step that writes a crate's location table (docs/v2/plan/design/item-hash.md section 12),
+# as a report of recomputed steps names it.
+LOCATIONS = "location table"
+
+
+def only_locations(cause: str) -> bool:
+    """Whether `cause`, a report of recomputed steps (`recomputed N steps because WHAT [why:
+    RULE]: STEP: items; STEP: items`), names no step but the writing of location tables. A
+    report that does not read so names other steps."""
+    _, found, steps = cause.partition("]: ")
+    return bool(found) and all(step.partition(":")[0].strip() == LOCATIONS for step in steps.split("; "))
+
+
 def record(out: report.Report, ran: Ran, gaps: dict[str, tuple[report.Verdict, str]],
            by_kind: dict[str, list[int]], refused: list[Step]) -> None:
     for step in ran.steps:
@@ -633,6 +658,14 @@ def record(out: report.Report, ran: Ran, gaps: dict[str, tuple[report.Verdict, s
             if over:
                 out.add(f"over/{step.name}", "fail", f"{step.edit}: " + "; ".join(over),
                         kind=step.kind, compiled=step.compiled, reports=step.reports, budget=0)
+            # An edit that moves positions and no token writes location tables again, data,
+            # and nothing else: each cause the build reports is of those steps alone.
+            code = [cause for cause in step.causes if not only_locations(cause)]
+            if step.moves and code:
+                out.add(f"moved/{step.name}", "fail",
+                        f"{step.edit}: it moves positions and no token, so only location tables are written "
+                        f"again; the build reported {len(code)} causes of other steps it recomputed:\n"
+                        + "\n".join(code), kind=step.kind, compiled=step.compiled, reports=len(code), budget=0)
     for verdict, why in ran.gaps:
         gaps.setdefault(why.split(":")[0], (verdict, why))
 
@@ -721,6 +754,13 @@ def replay(it: Replay) -> None:
 
 def selftest() -> list[str]:
     wrong = fixture.selftest()
+    code = 'recomputed 3 steps because src/main.rs changed [why: input]: codegen dev template: hello::main, main; unit: hello v0.1.0 (bin "hello")'
+    tables = f"recomputed 2 steps because src/main.rs changed [why: input]: {LOCATIONS}: hello v0.1.0, base v0.1.0"
+    if only_locations(code) or not only_locations(tables) or only_locations(f"{tables}; unit: hello v0.1.0") or only_locations("said otherwise"):
+        wrong.append("only_locations does not tell a report of location tables from one of other steps")
+    edits = [fixture.Edit("comments:app/src/main.rs", "comments", old, new) for old, new in ((0, 3), (2, 4), (0, 1), (3, 1))]
+    if [(e.still(), e.moves()) for e in edits] != [(True, False), (True, False), (False, True), (False, True)]:
+        wrong.append("a comment edit that moves no line is not still, or one that moves lines is")
     a = Built(programs={"dev": (0, "x\ny\n", "")})
     b = Built(programs={"dev": (0, "x\nz\n", "")})
     if not compare(a, b, ("a", "b")) or compare(a, a, ("a", "b")):

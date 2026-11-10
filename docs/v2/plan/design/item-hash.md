@@ -449,12 +449,40 @@ interface is therefore a *text*, not a fold of item hashes: each file with what 
 comment no macro sees, a plain body) replaced by its shape, the count of its line ends and the
 bytes, characters and UTF-16 units of its last line, so every line and column after it is as
 it was. An edit that moves a line moves every identity above it. A plain `//` comment ends its
-line and moves nothing: it leaves no shape at all.
+line and moves nothing: it leaves no shape at all. Nor does anything else nothing is after: the
+spaces and tabs before a line's end, and the whitespace and `//` comments after a file's last
+token (`blaze_lower::code`: `Masked::blank`, `code_end`). A block comment that does not end
+keeps its text: it is an error, which a shape would hide.
 
-**What it cuts off today.** A comment edit that moves no line: no unit's key, in the crate or
-above it. A plain body's edit that keeps its lines: no checking dependent's key. Any body edit:
-every unit that builds code above it, which then finds every function but the edited one in
-the store.
+**What it cuts off today.** An edit that moves no token and no position (a `//` comment added,
+changed or removed at a line's end or after the last line; spaces before a line's end; blank
+lines at a file's end): no unit's key, in the edited crate itself or above it, so no unit, no
+codegen and no link runs. A plain body's edit that keeps its lines: no checking dependent's
+key. Any body edit: every unit that builds code above it, which then finds every function but
+the edited one in the store.
+
+**What it does not, and why.**
+
+- *An edit that moves a line or a column and no token* (a comment on a line of its own, a
+  blank line, reformatting) moves the unit's key and every key above it. The code generator is
+  ready for it (a `Location` is `Target::Position(SpanRef)` into the owner's span table, filled
+  at link; `line!()` in code reads its `Location`'s line, `hir_ty_mir::mir::location::
+  line_literals`; a template is kept under its template code with its own anchors by table),
+  but a unit's record is one value keyed by one text, and what reads a position *by value* is
+  in it: a diagnostic's rendered lines; `column!()`, and `line!()` where it becomes a constant
+  or part of a type (section 3.3); a constant made by a `#[track_caller]` `const fn` (its
+  call's position, with no `line!` written anywhere in the crate that calls it); a proc macro
+  that asks its input's spans for their lines. No text can tell which of these a crate has, so
+  a key that left positions out would keep a stale constant. It needs the unit's steps keyed
+  per item (item 3 below) with positions as presentation slots (section 3.7), and a link step
+  that writes only the span tables into an image whose code is as it was.
+- *A crate of a library source root* (a registry or git package, the standard library) is its
+  bytes: its files are parsed as outlines, and a code text needs each parsed in full. To
+  narrow one without that on every start, keep its own narrowed identity in the store under
+  its whole one and the front end's code identity, and parse only on a miss.
+- *A record with diagnostics* is under the content of the files they quote, whole
+  (`quoted_key`): an edit of one of those files that moves nothing makes the unit again,
+  where rendering them again from the kept check would do (section 3.7, diagnostics as ids).
 
 **What remains**, in order: (1) sections 12 and 13 (locations and debug info as side tables),
 after which shapes can drop their line counts and a moved line is a data write; (2) the
@@ -463,4 +491,8 @@ tokens, instantiable bodies by code hash) once (1) makes positions unobservable,
 cuts off formatting and line-moving body edits; (3) the per-unit steps keyed per item, so a
 unit whose key moved reruns one function's steps (docs/v2/plan.md section 7), not its walk.
 The tests: `the_interface_text_moves_exactly_with_what_a_dependent_observes`,
-`a_dependents_key_moves_only_with_what_it_observes_of_a_dependency` (docs/v2/plan/invariants.md).
+`a_units_own_key_moves_exactly_with_what_its_results_depend_on`,
+`a_dependents_key_moves_only_with_what_it_observes_of_a_dependency` (docs/v2/plan/invariants.md);
+the edit harness holds a build to them (`harness/v2/oracle.py`: `over/` for an edit that moves
+nothing, `moved/` for one that moves positions alone, which fails until the first item above is
+built).
