@@ -454,11 +454,12 @@ export async function host(): Promise<Host> {
 const owner = () => `${REPL_ID}/${currentTask()?.id ?? "kernel"}`;
 
 /** A page of the harness browser, its Page domain on (never Runtime: evaluate needs no Runtime.enable, nothing here
- *  hears its events, and a page can tell it is on, which is how sites pick out an automated browser); at `url`, loaded, when given. `keep`: it outlives
- *  this kernel's connection (a page opened for the person). */
-export async function newPage(opts: { url?: string; keep?: boolean } = {}): Promise<Page> {
+ *  hears its events, and a page can tell it is on, which is how sites pick out an automated browser); at `url`,
+ *  loaded, when given. `keep`: it outlives this kernel's connection (a page opened for the person). `size`: its view's
+ *  size in points until the app draws it (the app sizes a view to the box it is drawn in). */
+export async function newPage(opts: { url?: string; keep?: boolean; size?: [number, number] } = {}): Promise<Page> {
   // Always opened blank: the page is told what browser it is (asChrome) before its first request leaves.
-  const v = await (await host()).open("about:blank", { owner: owner(), keep: opts.keep });
+  const v = await (await host()).open("about:blank", { owner: owner(), keep: opts.keep, size: opts.size });
   const page = new Page(v, String(v.info.view), v.info.target, v.info.url, v.info.title);
   try {
     await Promise.all([page.send("Page.enable"), asChrome(page)]);
