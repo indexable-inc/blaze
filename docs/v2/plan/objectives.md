@@ -13,7 +13,7 @@ remembered. How rows are picked, worked and landed is
 `harness/v2/ledger.py`. A check in *italics* is not written yet, and writing it is the first
 part of the work. `?` is not measured; "last known" is a lead, not a status.
 
-79 objectives: 0 met, 0 open, 0 blocked, 79 not measured.
+80 objectives: 0 met, 0 open, 0 blocked, 80 not measured.
 
 ## Targets
 
@@ -35,6 +35,7 @@ What a user feels, on one warm machine.
 | T12 | Release code runs at least as fast as cargo's release build | `budgets.py {"budgets": ["release-speed"]}` |  | ? |
 | T13 | A second build of an unchanged tree in a fresh checkout misses nothing | `budgets.py {"budgets": ["cache-misses"]}`; `worktree_keys.py` |  | ? |
 | T14 | Every bound in bounds.md is within 10% | `budgets.py {"budgets": ["bounds"]}` |  | ? |
+| T15 | A warm no-op build, a comment edit and a body edit of the smoke's two fixtures hold every bound of harness/v2/guards.py (none worse than its known failure), and a build script that runs $RUSTC ends inside the sandbox | `budgets.py {"command": "smoke"}` | not run: guards-known.toml's numbers are hand-traced, to be recorded on a built blaze (11-10) | ? |
 
 ## Correctness
 
