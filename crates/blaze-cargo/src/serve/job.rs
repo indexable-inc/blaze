@@ -2082,6 +2082,10 @@ struct Job<S: Steps> {
     /// ([`Jobs::wind_up`]), the span naming the ticket it waits on (every-wait-says-what).
     /// Closed as the job ends.
     durable_wait: Option<tracing::Span>,
+    /// While it is over and its answer is held for something of its own still under way
+    /// ([`Jobs::wind_up`]): the span naming what, and which it names. A build whose tasks
+    /// ended at 1.6 s answered at 6.9 s with no span over the 5 s between (2026-11-10).
+    held_wait: Option<(tracing::Span, &'static str)>,
     /// While its units wait for the shared std store's look ([`Job::awaiting`]), the span
     /// naming that wait. Closed as the look lets it build ([`Jobs::looked`]).
     look_wait: Option<tracing::Span>,
@@ -3192,6 +3196,7 @@ impl<S: Steps> Jobs<S> {
             doing_said: None,
             missed: 0,
             durable_wait: None,
+            held_wait: None,
             look_wait: None,
             placed_any: false,
             walks,
@@ -6569,14 +6574,35 @@ impl<S: Steps> Jobs<S> {
                 }
             }
             let Some((ok, error)) = &mut job.over else { continue };
-            if !(job.finished
-                && job.placing == 0
-                && job.runs == 0
-                && job.storing.is_none()
-                && !matches!(job.stage, Stage::Runs(..)))
-            {
+            // What of its own is still under way, the first of them: named by a span while
+            // the answer is held for it (every-wait-says-what).
+            let held = if !job.finished {
+                Some("its plane request, not finished")
+            } else if job.placing != 0 {
+                Some("its outputs, being placed")
+            } else if job.runs != 0 {
+                Some("its runs")
+            } else if job.storing.is_some() {
+                Some("its kept front end, being stored")
+            } else if matches!(job.stage, Stage::Runs(..)) {
+                Some("its stage of runs")
+            } else {
+                None
+            };
+            if let Some(what) = held {
+                if job.held_wait.as_ref().is_none_or(|(_, was)| *was != what) {
+                    let span = tracing::info_span!(
+                        target: "blaze",
+                        "the job's answer waits for what it still does",
+                        what,
+                        placing = job.placing,
+                        runs = job.runs,
+                    );
+                    job.held_wait = Some((span, what));
+                }
                 continue;
             }
+            job.held_wait = None;
             // What its kept front end left for the store ([`Job::stored`]) and the retractions it
             // put ([`Job::durable`]) are durable first; the store was flushed as they were put.
             // A store that broke never makes them durable, nor does one that stopped committing:
