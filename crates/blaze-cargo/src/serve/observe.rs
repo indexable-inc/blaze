@@ -345,6 +345,10 @@ enum ToHistory {
     /// daemon dies before it ends ([`history::writes`]).
     Started(BuildRow),
     Ended(Finished),
+    /// The run log of a build that ended with its front end kept, named after its answer by
+    /// the task that stored the front end ([`super::work::Steps::kept_run_log`]): its
+    /// `provenance` rows, written by the flush this asks for.
+    Ran(Vec<ProvenanceRow>),
     /// Flush now, and tell the loop the flush's number ([`Told::Flushed`]): every row recorded
     /// before the ask is drained by this flush, so a reader that reads the manifest it
     /// committed reads them.
@@ -373,8 +377,10 @@ struct Finished {
 }
 
 /// A front end's run log, as `build`'s `provenance` rows: each memo that ran again and its
-/// cause, each untracked read by name. Taken on the loop as the build ends, with its database
-/// ([`super::work::Writer::run_log`]); sorted by the engine, so the rows are the same each time.
+/// cause, each untracked read by name. Taken with its database: by the task that stores the
+/// build's kept front end, after its answer ([`super::work::Steps::kept_run_log`]), or on the
+/// loop as the build ends when its front end is not kept ([`super::work::Writer::run_log`]);
+/// sorted by the engine, so the rows are the same each time.
 pub(super) fn provenance_rows(build: u64, taken: blaze_query::db::Taken) -> Vec<ProvenanceRow> {
     let blaze_query::db::Taken { rows, dropped } = taken;
     if dropped > 0 {
@@ -759,6 +765,11 @@ fn keep(
                 history.build_started(row);
                 (history.flush(None), false)
             }
+            Ok(ToHistory::Ran(rows)) => {
+                doing.set(Step::Flushing, rows.first().map_or(0, |it| it.build_id));
+                history.ran(rows);
+                (history.flush(None), false)
+            }
             Ok(ToHistory::Client(rows)) => {
                 let build = rows.build;
                 doing.set(Step::Flushing, build);
@@ -1038,6 +1049,18 @@ impl Observe {
     pub fn started(&mut self, row: BuildRow) {
         let Some(profiling) = &self.profiling else { return };
         if profiling.ended.send(ToHistory::Started(row)).is_err() {
+            self.history_error = Some(
+                "the profile history's thread (`blaze-history`) is gone: no build is written"
+                    .to_owned(),
+            ); // alloc: error path
+        }
+    }
+
+    /// The run log of builds that ended with their front end kept, as the history's rows
+    /// (`Jobs::ran`): written by the history's thread; dropped by a daemon that keeps none.
+    pub fn ran(&mut self, rows: Vec<ProvenanceRow>) {
+        let Some(profiling) = &self.profiling else { return };
+        if profiling.ended.send(ToHistory::Ran(rows)).is_err() {
             self.history_error = Some(
                 "the profile history's thread (`blaze-history`) is gone: no build is written"
                     .to_owned(),

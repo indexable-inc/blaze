@@ -282,6 +282,27 @@ impl Steps for Real {
         Ok(puts)
     }
 
+    fn kept_run_log(&self, kept: &KeptLowered) -> blaze_query::db::Taken {
+        blaze_query::db::take_log_in(kept.lowered.db())
+    }
+
+    fn release_kept(&self, kept: &mut KeptLowered, wanted: &std::sync::atomic::AtomicBool) {
+        let Some(mut release) = kept.release.take() else { return };
+        // A request of the checkout waits for this front end: it goes back now, and that
+        // build's own releases let go of what this one would have, unless memory is short,
+        // when the release is due before more work is admitted.
+        if wanted.load(Ordering::Acquire) && !blaze_graph::admission::Pressure::now().squeezed() {
+            tracing::info_span!(
+                target: "blaze",
+                "front end release left to the checkout's next build, which waits for the front end",
+                checkout = %kept.root,
+            )
+            .in_scope(|| {});
+            return;
+        }
+        release.release(&mut kept.lowered);
+    }
+
     fn lower(&self, input: &JobInput, kept: Option<KeptLowered>) -> Result<FrontEnd<Real>, Failed> {
         if input.cancelled.load(Ordering::Relaxed) {
             return Err(Failed::Again);
@@ -692,6 +713,10 @@ pub struct KeptLowered {
     /// What its job's builds used of the code generator's memo, kept there while it is kept;
     /// taken by the next job of the head.
     memo: Option<memo::Held>,
+    /// What its build's end lets go of it ([`release::Release::end`]), until the task that
+    /// stores it runs the release or leaves it for a request that waits
+    /// ([`Steps::release_kept`]).
+    release: Option<release::Release>,
 }
 
 /// What a task reads the front end through ([`Steps::Reader`]): a shared reference to the job's
@@ -1033,7 +1058,13 @@ impl Writer<Real> for UnitWriter {
     }
 
     fn keep(mut self) -> Result<KeptLowered, ApiError> {
-        if !self.apply()? {
+        // The writes still asked for are applied. With none, only that no reader is alive is
+        // asked: a release that is due stays for the task that stores the front end.
+        let applied = match self.runs.is_empty() && self.macros.is_empty() {
+            true => Arc::get_mut(&mut self.front).is_some(),
+            false => self.apply()?,
+        };
+        if !applied {
             let what = "the front end is kept for the head's next build with no task reading it, and one still does";
             return Err(self.refused(what));
         }
@@ -1041,14 +1072,13 @@ impl Writer<Real> for UnitWriter {
             let what = "the front end is not kept for the head's next build: a write to it panicked, and it may be half written";
             return Err(self.refused(what));
         }
-        // The build is over: what its finished crates keep goes before the front end is kept,
-        // and every MIR it made, of a check as of any build, so the kept front end holds none
-        // of it into the next build (a check's MIR, kept, grew the heap by every check).
+        // The build is over: what its finished crates keep goes, and every MIR it made, of a
+        // check as of any build, so the kept front end holds none of it into the build after
+        // the next (a check's MIR, kept, grew the heap by every check). Not here, on the loop
+        // before the build's answer: the release is kept with the front end and run by the
+        // task that stores it, after the answer ([`Steps::release_kept`]).
         self.release.end();
-        if let Some(lowered) = Arc::get_mut(&mut self.front) {
-            self.release.release(lowered);
-        }
-        let UnitWriter { session, front, job, deps, retractions, .. } = self;
+        let UnitWriter { session, front, job, deps, retractions, release, .. } = self;
         let Some(lowered) = Arc::into_inner(front.into_inner()) else {
             let what = "the front end is kept for the head's next build, and another holder of it is still alive";
             return Err(ApiError::new(what, None));
@@ -1072,6 +1102,7 @@ impl Writer<Real> for UnitWriter {
             flushed: None,
             seeds,
             memo,
+            release: Some(release),
         })
     }
 }

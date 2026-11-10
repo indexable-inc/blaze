@@ -25,7 +25,7 @@ use crate::actors::{Resume, Turn};
 use crate::explore::{Bounds, Chooser, Failure, Memo};
 use crate::fs::{CrashFs, Disk};
 use crate::properties;
-use crate::store::{Ledger, Model, Outcome, Run, Wait, open, short};
+use crate::store::{Ledger, Model, Outcome, Run, Wait, keep, open, short};
 
 const DIAL: ReadKind = ReadKind(1);
 const FACT: ReadKind = ReadKind(2);
@@ -361,19 +361,24 @@ fn asks(
     if let Ok(outcome) = got {
         ledger.lock().outcomes.insert(asker.name.to_owned(), (asker.world, outcome));
     }
+    // The answer first, durable or not; what the get left settles after it: kept for reuse
+    // once what it waits for is durable, or said lost when the store stopped.
+    turn.answer(kept.clone());
     turn.flush();
     let tickets = match wait {
         Wait::Own => tickets,
         Wait::Everything => ledger.lock().all_tickets(),
     };
     match turn.await_durable(tickets) {
-        Resume::Broken => {}
-        Resume::Go | Resume::Durable => turn.answer(kept),
+        Resume::Broken => {
+            ledger.lock().lost.insert(asker.name.to_owned());
+        }
+        Resume::Go | Resume::Durable => keep(ledger, asker.name, &kept),
     }
 }
 
 /// The kernel's checks of a restore: each lookup finds nothing or a value some actor's world
-/// makes, an actor that answered still finds its value, and the kernel run again on the
+/// makes, an actor that kept what it answered with still finds its value, and the kernel run again on the
 /// restore gives what it gives on an empty store.
 fn check(
     scenario: &KernelScenario,
@@ -404,13 +409,13 @@ fn check(
                 ));
             }
             Some(_) => {}
-            None if ledger.answered_actors.contains(asker.name) => {
+            None if ledger.kept_actors.contains(asker.name) => {
                 let outcome = ledger.outcomes.get(asker.name).map(|it| &it.1);
                 if matches!(outcome, Some(Outcome::Hit(_) | Outcome::Computed(_))) {
                     return Err(Failure::new(
-                        properties::ANSWERED_SURVIVES,
+                        properties::KEPT_SURVIVES,
                         format!(
-                            "{} answered ({outcome:?}), and after the crash a lookup of its input in its world misses",
+                            "{} kept what it answered with ({outcome:?}), and after the crash a lookup of its input in its world misses",
                             asker.name
                         ),
                     ));

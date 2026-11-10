@@ -18,10 +18,17 @@
 //!   ends first; none is cancelled), and the front end's values kept by bytes are swept under
 //!   the squeeze's caps too ([`blaze_query::db::Storage::sweep_values`]), not only at the next
 //!   view.
-//! - **As the front end is kept**, its build over: every MIR goes then, of every goal and
+//! - **Once the front end is kept**, its build over: every MIR goes then, of every goal and
 //!   under any limit or none ([`Release::end`]). MIR is the request's: a value of the build
 //!   that made it, read again by the next build only as its memo (verified against, made
-//!   again where read), so nothing of it outlives the build that made it.
+//!   again where read), so nothing of it outlives the build that made it. This release is
+//!   never on the loop and never before the build's answer: it is kept with the front end
+//!   and run by the task that stores the front end, which holds it alone as the writer did
+//!   (`Steps::release_kept`). It only lowers memory, so the checkout's next build never waits
+//!   for it: a request that waits for the front end has it handed back unreleased, and that
+//!   build's own releases, at the latest its end's, let the MIR go. When blaze is past its
+//!   limit's line the release runs all the same, before that build is given the front end:
+//!   memory short stays a reason that stops for nothing but the answer.
 //!
 //! A value let go keeps its memo, so a read of it later in the build, or by the next build of
 //! the head, makes it again and backdates it: nothing read can differ, a re-read costs time and
@@ -445,10 +452,11 @@ impl<K: Copy + Eq + Hash> Release<K> {
         self.pressed = true;
     }
 
-    /// The build is over and its front end is about to be kept, no reader alive: the next
-    /// release lets go of every MIR, of a check as of any build, under any limit or none. What
-    /// a build made of MIR is the build's: kept, it is only what the next build would verify
-    /// its memos against, which needs the memo alone.
+    /// The build is over and its front end is kept, no reader alive: the next release lets go
+    /// of every MIR, of a check as of any build, under any limit or none. What a build made of
+    /// MIR is the build's: kept, it is only what the next build would verify its memos
+    /// against, which needs the memo alone. That release is run after the build's answer, by
+    /// the task that stores the kept front end (the module's list).
     pub(crate) fn end(&mut self) {
         self.ended = true;
     }

@@ -643,6 +643,25 @@ pub trait Steps: Sized + Send + Sync + 'static {
     /// after it loses none of it (persisted-state-round-trips). Called once per kept front
     /// end, while no task reads it; one already stored hands back no puts.
     fn store_kept(&self, kept: &mut Self::KeptFront) -> Result<Vec<KeptPut>, ApiError>;
+    /// On a worker, by the task that stores a kept front end and before it stores: what the
+    /// front end's query engine logged of why its queries ran since the last take, each memo
+    /// and input named with the database in hand ([`Writer::run_log`], taken here so naming a
+    /// build's runs is never on the loop before the build's answer); none for a front end
+    /// with no database, and while the run log is off.
+    fn kept_run_log(&self, kept: &Self::KeptFront) -> blaze_query::db::Taken {
+        let _ = kept;
+        blaze_query::db::Taken::default()
+    }
+    /// On a worker, by the task that stores a kept front end, after [`Steps::store_kept`] and
+    /// after the build's answer: what the build's end lets go of its front end (every MIR it
+    /// made, and the values no build read since the one before). The front end is the task's
+    /// alone, as it was the job's writer's. A release only lowers memory, so it is never a
+    /// precondition of the checkout's next build: once `wanted` is set (a request of the
+    /// checkout waits for the front end) it is skipped, unless blaze is past its limit's line,
+    /// and that build goes on with what was not let go.
+    fn release_kept(&self, kept: &mut Self::KeptFront, wanted: &AtomicBool) {
+        let _ = (kept, wanted);
+    }
     /// On the loop: `blaze run`'s start of the built program at `program` as process `pid`
     /// ([`blaze_api::Request::Launch`]): the variables it runs on the daemon's code memory
     /// with, or `None` for a program that is no dev executable and runs its file.
@@ -819,7 +838,8 @@ pub trait Writer<S: Steps>: Send + 'static {
     /// On the loop, once every task of the job's build has ended: the front end with every
     /// write applied, for the head's next build to lower into. An error while a reader of it
     /// is alive or a write fails to apply: the build ends with it, never a silent full lower
-    /// next time.
+    /// next time. It lets nothing go: what the build's end releases is released by the task
+    /// that stores the kept front end, after the answer ([`Steps::release_kept`]).
     fn keep(self) -> Result<S::KeptFront, ApiError>;
 }
 
