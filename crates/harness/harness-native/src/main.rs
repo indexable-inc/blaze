@@ -16,6 +16,7 @@ mod shot;
 mod single;
 mod term;
 mod window;
+mod world_api;
 
 fn main() {
     if let Some(path) = std::env::var_os("HARNESS_NATIVE_SHOT") {

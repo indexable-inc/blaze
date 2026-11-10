@@ -20,6 +20,8 @@ pub fn run(path: &str) -> Result<(), String> {
     let mut renderer =
         Renderer::new(objc2_metal::MTLCreateSystemDefaultDevice().ok_or("no Metal device")?);
     let mut app = App::new(Arc::new(|| {}))?;
+    // The edits saved through the world api (src/world_api.rs), as a launch applies them.
+    app.replay_world();
     app.persist = false;
     // The canvas is the screen: a windowed overlay is kept on it, as the window keeps one on its screen.
     app.set_screen([0.0, 0.0, w, h]);
