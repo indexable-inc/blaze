@@ -67,8 +67,8 @@ use serde::{Deserialize, Serialize};
 /// [`TestResult::outside`]; [`Worked::served`]; dense ids
 /// ([`UnitOf::id`], [`UnitStarted::package`], [`TestResult::executable`]); the fixed name sets
 /// as enums ([`TargetKind`], [`CrateType`], [`ArtifactKind`], [`Applicability`]), written by
-/// name as before. [`ResponseRef`] reads the same bytes. 15: [`Request::Pack`] and
-/// [`Response::Packed`]. 16: [`Worked::links`]. 17: [`Worked::steps_us`]. 18: [`Request::Doc`],
+/// name as before. [`ResponseRef`] reads the same bytes. 15: `Request::Pack` and
+/// `Response::Packed`. 16: [`Worked::links`]. 17: [`Worked::steps_us`]. 18: [`Request::Doc`],
 /// [`Response::DocPage`] and [`Response::Documented`]. 19: [`Cargo::refused`]. 20:
 /// [`Request::Explore`], [`Request::Profile`], [`Request::Live`], `Request::Sql`, their
 /// answers, and [`Status::history`]. 21: [`Edit::Replace`]. 22: [`Status::build`]. 23:
@@ -92,8 +92,9 @@ use serde::{Deserialize, Serialize};
 /// its running tasks, longest first (`running`), the tasks settled in the last 30 s
 /// (`recent`), the failed tasks (`failures`) and the proc-macro expansion lane (`expanding`).
 /// 44: `Now::stall`, the daemon's top stall in its wait-for graph (a deadlock or a convoy of
-/// named locks), in one line, which `blaze status` and the build view say.
-pub const SCHEMA: u32 = 44;
+/// named locks), in one line, which `blaze status` and the build view say. 45: `Request::Pack`
+/// and `Response::Packed` are gone with the in-browser compiler they fed.
+pub const SCHEMA: u32 = 45;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -359,15 +360,6 @@ pub enum Request {
     /// What each subsystem's memory is doing, from blaze-mem's counters; answered with
     /// [`Response::Memory`].
     Memory,
-    /// The front end of package `program`'s crate and every crate it is made of, checked as
-    /// `targets` asks (its build scripts run and its proc macros loaded in the sandbox, every
-    /// expansion of the program recorded) as one file for blaze's in-browser compiler
-    /// (`blaze_wasm_pack::Pack`); answered with [`Response::Packed`].
-    Pack {
-        view: ViewRef,
-        program: String,
-        targets: Targets,
-    },
     /// `cargo doc`: the targets it documents checked as `targets` asks (`Targets::cargo`'s
     /// command `doc`), then the HTML documentation of those crates and, unless `no_deps`, of
     /// every library they depend on, written by blaze from the front end (`blaze-doc`), no
@@ -782,11 +774,6 @@ pub enum Response {
         root: ContentId,
     },
     Memory(Memory),
-    /// A [`Request::Pack`]'s pack: `blaze_wasm_pack::Pack` as JSON.
-    Packed {
-        #[serde(with = "blaze_protocol::bytes")]
-        pack: Vec<u8>,
-    },
     /// A file of a [`Request::Doc`]'s documentation: its path under [`Documented::dir`],
     /// `/`-separated, and its bytes.
     DocPage {

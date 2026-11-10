@@ -19,7 +19,7 @@ use blaze_units::{
 };
 use blaze_usercode::run::Value;
 
-use super::{artifact, codegen, compile, graph, pack, run, script, test, unit_target};
+use super::{artifact, codegen, compile, graph, run, script, test, unit_target};
 
 const HOST: &str = "x86_64-unknown-linux-gnu";
 
@@ -1016,56 +1016,6 @@ fn a_unit_waits_on_every_run_of_its_closure() {
     waits.applied(3, &mut ready);
     assert_eq!(ready, [5]);
     assert!((0..6).all(|at| waits.ready(at)));
-}
-
-#[test]
-fn a_pack_is_of_the_packages_binary_or_else_its_library() {
-    let (app, dep) = ("path+file:///w/app#0.1.0", "path+file:///w/dep#0.1.0");
-    let with = |units: Vec<Unit>| Units {
-        graph: UnitGraph { version: 1, units, roots: Vec::new() },
-        plans: Vec::new(),
-        packages: vec![package(app, "app", "/w/app"), package(dep, "dep", "/w/dep")],
-        lock: None,
-        warnings: Vec::new(),
-        target_dir: "/w/target".to_owned(),
-        build_dir: "/w/target".to_owned(),
-        finished: String::new(),
-        link_dirs: Vec::new(),
-        sandboxed_tests: false,
-        native: Vec::new(),
-    };
-    let units = with(vec![
-        unit(dep, target("dep", "lib", "/w/dep/src/lib.rs"), Mode::Check, &[]),
-        unit(
-            app,
-            target("build-script-build", "custom-build", "/w/app/build.rs"),
-            Mode::Build,
-            &[],
-        ),
-        unit(app, target("app", "lib", "/w/app/src/lib.rs"), Mode::Check, &[0]),
-        unit(app, target("app", "bin", "/w/app/src/main.rs"), Mode::Check, &[2]),
-    ]);
-    assert_eq!(pack::program_unit(&units, "app").unwrap(), 3);
-    assert_eq!(pack::program_unit(&units, "dep").unwrap(), 0);
-    let none = pack::program_unit(&units, "other").unwrap_err().what;
-    assert!(none.contains("-p other"), "{none}");
-
-    let mut tested = unit(app, target("app", "bin", "/w/app/src/main.rs"), Mode::Check, &[]);
-    tested.checked_as_test = true;
-    let units =
-        with(vec![tested, unit(app, target("app", "lib", "/w/app/src/lib.rs"), Mode::Check, &[])]);
-    assert_eq!(
-        pack::program_unit(&units, "app").unwrap(),
-        1,
-        "a binary checked as a test is no program"
-    );
-
-    let units = with(vec![
-        unit(app, target("one", "bin", "/w/app/src/bin/one.rs"), Mode::Check, &[]),
-        unit(app, target("two", "bin", "/w/app/src/bin/two.rs"), Mode::Check, &[]),
-    ]);
-    let refused = pack::program_unit(&units, "app").unwrap_err().what;
-    assert!(refused.contains("`one`, `two`"), "{refused}");
 }
 
 /// A unit of a package the build doesn't list, or naming a dependency past its units, stops

@@ -4225,7 +4225,7 @@ fn a_wasm32_pair_is_returned_as_llvm_returns_it_whatever_blaze_was_built_with() 
             "{name}: the IR returns the pair through a pointer of its own: {signature}"
         );
         let (lowered, _) =
-            crate::wasm::lower(pending.func(), crate::Calls::Direct, Address::of(target))
+            crate::wasm::lower(pending.func(), Address::of(target))
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
         let llvms = WasmSignature { params: vec![WasmType::I32, WasmType::I32], results: vec![] };
         assert_eq!(lowered.signature, llvms, "{name}: the wasm signature LLVM gives");

@@ -155,7 +155,7 @@ pub(crate) use spare::with_context;
 mod stable;
 pub use stable::{block_place, function_place, lower_declared, static_place};
 mod target;
-pub use target::{Arch, Calls, Features, ObjectFormat, Target, UnwindFormat, VariableArguments};
+pub use target::{Arch, Features, ObjectFormat, Target, UnwindFormat, VariableArguments};
 pub mod tier;
 
 mod type_id;
@@ -3155,7 +3155,7 @@ fn emit_with(
 ) -> Result<Code> {
     refuse_tail_calls(&ctx.func, target)?;
     if target.is_wasm() {
-        return emit_wasm(&ctx.func, target.calls(), wasm::Address::of(target));
+        return emit_wasm(&ctx.func, wasm::Address::of(target));
     }
     let large = ctx.func.dfg.num_insts() > SINGLE_PASS;
     let kind = if large { Isa::Large } else { Isa::Usual };
@@ -3298,11 +3298,9 @@ fn refuse_tail_calls(func: &ir::Function, target: &'static Target) -> Result<()>
 /// goes through the object like machine code and is made a module of by a linker.
 fn emit_wasm(
     func: &cranelift_codegen::ir::Function,
-    calls: Calls,
     address: wasm::Address,
 ) -> Result<Code> {
-    let (function, mut relocs) =
-        wasm::lower(func, calls, address).map_err(CodegenError::Unsupported)?;
+    let (function, mut relocs) = wasm::lower(func, address).map_err(CodegenError::Unsupported)?;
     let (bytes, body) = function.encode().map_err(CodegenError::Backend)?;
     for reloc in &mut relocs {
         reloc.offset += body;

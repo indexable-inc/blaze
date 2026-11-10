@@ -234,14 +234,6 @@ fn a_build_ahead_compiles_tests_and_an_edit_only_checks() {
 }
 
 #[test]
-fn a_pack_checks_the_targets_it_names() {
-    let pack = Work::Pack { targets: targets(), program: "app".into() };
-    assert_eq!((command_of(&pack), goal_of(&pack)), (Command::Check, Goal::Check));
-    assert_eq!(targets_of(&pack), Some(&targets()));
-    assert!(reuses_plans(&pack));
-}
-
-#[test]
 fn a_fetchs_key_is_its_source() {
     let fetch = |at: &str, sha: &str| Fetch {
         what: "serde v1.0.0".into(),

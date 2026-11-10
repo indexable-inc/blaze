@@ -591,7 +591,6 @@ dependencies = [
  "blaze-units",
  "blaze-usercode",
  "blaze-vfs",
- "blaze-wasm-pack",
  "cfg",
  "crossbeam-channel",
  "crossbeam-queue",
@@ -2011,26 +2010,6 @@ name = "blaze-wasi"
 version = "0.0.0"
 dependencies = [
  "wasmtime",
-]
-
-[[package]]
-name = "blaze-wasm-pack"
-version = "0.0.0"
-dependencies = [
- "base-db",
- "blaze-core",
- "blaze-hash",
- "blaze-query",
- "blaze-serde",
- "cfg",
- "hir",
- "hir-expand",
- "intern",
- "serde",
- "span",
- "syntax-bridge",
- "triomphe",
- "tt",
 ]
 
 [[package]]

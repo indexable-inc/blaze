@@ -94,7 +94,6 @@ a build first needs it.
     blaze codegen-inputs --format=json
     blaze trace --out PATH
     blaze tables --format=json
-    blaze pack -p PACKAGE --out PATH [cargo's flags]
     blaze pin
     blaze --version
 
@@ -107,12 +106,7 @@ the command work as in cargo. `test` alone takes four flags of blaze's own (exte
 not compile a build's error names, the first `N` (16 without it) or every one.
 `serve` is the daemon itself ([below](#the-daemon)); `codegen-inputs`, `trace` and `tables`
 print what the daemon's last build of the checkout did (each instance it made with its code
-hash, every result with its edges as CBOR, the size of each long-lived table); `pack` checks
-the package for `wasm32-unknown-unknown` with debug assertions off (as `--release`), its build
-scripts run and proc macros loaded in the sandbox as any check's, and writes the program's crate
-and every crate it is made of, with each macro expansion its names and bodies needed, to `PATH`
-as one JSON file for the in-browser compiler (`crates/blaze-wasm-pack`, the agent API's
-`Request::Pack`); `check --replace std::sync::Mutex=parking_lot::Mutex` retargets every
+hash, every result with its edges as CBOR, the size of each long-lived table); `check --replace std::sync::Mutex=parking_lot::Mutex` retargets every
 reference that resolves to the item `FROM` names to the item `TO` names, each a def path from a
 crate's name: the daemon's front end finds them by name resolution (imports, renames, globs,
 re-exports, the prelude, a macro's input), never by text, rewrites a `use` of it or a path that
@@ -1411,7 +1405,7 @@ any other fails with status 101 and does nothing:
 
     error: no such command: `tree`
 
-    help: blaze's commands are build, check, run, test, bench, doc, clean, cache, fmt, serve, stop, status, toolchain, daemon, codegen-inputs, trace, tables, pack, explore, debug, explain, why, reach and slow
+    help: blaze's commands are build, check, run, test, bench, doc, clean, cache, fmt, serve, stop, status, toolchain, daemon, codegen-inputs, trace, tables, explore, debug, explain, why, reach and slow
 
 The table below is a record of what v1 had (as of 2026-10-30): the crates it names
 (blaze-metadata, blaze-fmt, blaze-lints, ...) are still in the tree, and a command comes back

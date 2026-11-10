@@ -9,10 +9,7 @@ members = [
     "tools/astlog/error-chain",
     "tools/astlog/langs",
 ]
-# `blaze-wasm` turns on a feature of `hir-ty-codegen` that swaps the code generator's output, which
-# must not be unified into a build of the native crates.
 exclude = [
-    "crates/blaze-wasm",
     # harness, its own workspace with its own lock: a macOS app and daemon blaze does not build
     # (crates/harness/README.md).
     "crates/harness",
@@ -322,7 +319,6 @@ blaze-resolve = { path = "crates/blaze-resolve" }
 blaze-source = { path = "crates/blaze-source" }
 blaze-units = { path = "crates/blaze-units" }
 blaze-lower = { path = "crates/blaze-lower" }
-blaze-wasm-pack = { path = "crates/blaze-wasm-pack" }
 blaze-doc = { path = "crates/blaze-doc" }
 blaze-fmt = { path = "crates/blaze-fmt" }
 blaze-fuzz = { path = "crates/blaze-fuzz" }

@@ -597,9 +597,6 @@ impl Session {
             Request::Trace { view, targets } => self.build(cx, req, &view, Work::Trace(targets))?,
             Request::Lock { view, targets } => self.build(cx, req, &view, Work::Lock(targets))?,
             Request::Tables { view } => self.build(cx, req, &view, Work::Tables)?,
-            Request::Pack { view, targets, program } => {
-                self.build(cx, req, &view, Work::Pack { targets, program })?
-            }
             Request::Doc { view, targets, no_deps, private } => {
                 self.build(cx, req, &view, Work::Doc { targets, no_deps, private })?
             }
@@ -1053,7 +1050,6 @@ fn incremental(work: &Work) -> bool {
         | Work::Run { .. }
         | Work::CodegenInputs(_)
         | Work::Trace(_)
-        | Work::Pack { .. }
         | Work::Doc { .. } => true,
         Work::Reach { .. }
         | Work::Verify(_)

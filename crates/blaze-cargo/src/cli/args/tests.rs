@@ -193,10 +193,6 @@ fn commands_and_their_aliases() {
         Ok(Asked::Inspect(Inspected::Trace, os(&["--out", "t"])))
     );
     assert_eq!(parse(os(&["tables"])), Ok(Asked::Inspect(Inspected::Tables, Vec::new())));
-    assert_eq!(
-        parse(os(&["pack", "-p", "app", "--out", "a.pack"])),
-        Ok(Asked::Inspect(Inspected::Pack, os(&["-p", "app", "--out", "a.pack"])))
-    );
     assert_eq!(parse(os(&["frobnicate"])), Ok(Asked::Unknown("frobnicate".to_owned())));
 }
 
