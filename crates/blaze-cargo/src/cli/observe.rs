@@ -52,7 +52,7 @@ const MEMORY_PARTS: [(&str, &str, &str); 4] = [
     ("at_peak", "memory_at_peak", "the memory by area at the footprint's peak"),
     ("sites", "memory_sites", "what churns the global heap, by call site"),
 ];
-const WHY_USAGE: &str = "blaze why [ITEM] [--all] [--json]";
+const WHY_USAGE: &str = "blaze why [ITEM] [--all] [--unexplained] [--json]";
 const SLOW_USAGE: &str = "blaze slow [--build N] [--top N] [--json]";
 
 /// `blaze explore`: the daemon's explorer started if it is not, its link printed (it carries
@@ -248,20 +248,22 @@ pub fn explain(words: Vec<OsString>, color: bool) -> i32 {
     said(explained(words), color)
 }
 
-/// `blaze why [ITEM] [--all] [--json]`: what the daemon's last build computed again instead
-/// of reusing, grouped by why on the daemon (each group's first items, every one with
-/// `--all`); with an item (a function, a unit, a build script, by path), its
-/// chain of reasons (`Request::Rebuilt`).
+/// `blaze why [ITEM] [--all] [--unexplained] [--json]`: what the daemon's last build computed
+/// again instead of reusing, grouped by why on the daemon (each group's first items, every one
+/// with `--all`); with an item (a function, a unit, a build script, by path), its chain of
+/// reasons; with `--unexplained`, each step blaze has no recorded reason for, which is a bug
+/// in blaze (`Request::Rebuilt`).
 pub fn why(words: Vec<OsString>, color: bool) -> i32 {
     said(rebuilt(words), color)
 }
 
 fn rebuilt(words: Vec<OsString>) -> Result<(), Refusal> {
-    let (mut item, mut json, mut all) = (None, false, false);
+    let (mut item, mut json, mut all, mut unexplained) = (None, false, false, false);
     for word in texts(words)? {
         match word.as_str() {
             "--json" => json = true,
             "--all" => all = true,
+            "--unexplained" => unexplained = true,
             _ if word.starts_with('-') => {
                 return Err(Refusal::Usage(format!("{WHY_USAGE}, not `{word}`")));
             }
@@ -280,7 +282,7 @@ fn rebuilt(words: Vec<OsString>) -> Result<(), Refusal> {
         )));
     };
     let cwd = Some(cwd);
-    ask(Request::Rebuilt { all, cwd, item }, Start::Never, |response| {
+    ask(Request::Rebuilt { all, cwd, item, build: None, unexplained }, Start::Never, |response| {
         if let ResponseRef::Rebuilt(it) = response {
             answer = Some(it);
         }
@@ -298,9 +300,38 @@ fn rebuilt(words: Vec<OsString>) -> Result<(), Refusal> {
         return Ok(());
     }
     let mut text = String::new();
-    blaze_ui::why::lines(&mut text, &rebuilt);
+    match unexplained {
+        true => blaze_ui::why::unexplained(&mut text, &rebuilt),
+        false => blaze_ui::why::lines(&mut text, &rebuilt),
+    }
     print!("{text}");
     Ok(())
+}
+
+/// Why the build this process asked for recomputed what it did, as the daemon sums it up once
+/// the build has ended (`Rebuilt::summary`, docs/v2/plan/design/why.md): a report a root
+/// cause. None when this process heard of no build, in the seed (whose engine is this
+/// process: a second connection would start a second), when no daemon is running, and when
+/// the reasons the daemon keeps are by now another build's (`blaze why` and the history's
+/// `misses` table still have them). The daemon's error otherwise.
+pub(super) fn recomputed() -> Result<Vec<blaze_api::Report>, String> {
+    let build = super::client_rows::build();
+    if build == 0 || !cfg!(feature = "native") {
+        return Ok(Vec::new());
+    }
+    let mut summary = Vec::new();
+    let request =
+        Request::Rebuilt { all: false, cwd: None, item: None, build: Some(build), unexplained: false };
+    ask_if_running(request, Start::Never, |response| {
+        if let ResponseRef::Rebuilt(it) = response
+            && it.build == Some(build)
+        {
+            summary = it.summary;
+        }
+        Ok(())
+    })
+    .map_err(|why| format!("why build {build} recomputed what it did is not known: {why}"))?;
+    Ok(summary)
 }
 
 /// `blaze slow [--build N] [--top N] [--json]`: what made a build slow, ranked by the wall time
@@ -481,13 +512,24 @@ fn texts(words: Vec<OsString>) -> Result<Vec<String>, Refusal> {
 pub(super) fn ask(
     request: Request,
     start: Start,
-    mut on: impl FnMut(ResponseRef<'_>) -> Result<(), String>,
+    on: impl FnMut(ResponseRef<'_>) -> Result<(), String>,
 ) -> Result<(), String> {
+    match ask_if_running(request, start, on)? {
+        true => Ok(()),
+        false => Err("no daemon is running: a build, or `blaze serve`, starts one".to_owned()),
+    }
+}
+
+/// [`ask`], where no daemon running (under [`Start::Never`]) is not an error: whether one
+/// was asked.
+fn ask_if_running(
+    request: Request,
+    start: Start,
+    mut on: impl FnMut(ResponseRef<'_>) -> Result<(), String>,
+) -> Result<bool, String> {
     let mut client = match daemon::connect(start) {
         Ok(Some(client)) => client,
-        Ok(None) => {
-            return Err("no daemon is running: a build, or `blaze serve`, starts one".to_owned());
-        }
+        Ok(None) => return Ok(false),
         Err(error) => return Err(format!("{error:#}")),
     };
     let mut errors = Vec::new();
@@ -508,7 +550,7 @@ pub(super) fn ask(
         return Err(why);
     }
     match (ok, errors.is_empty()) {
-        (true, true) => Ok(()),
+        (true, true) => Ok(true),
         (_, false) => Err(errors.join("\n")),
         (false, true) => Err("the daemon answered not ok and said no error".to_owned()),
     }

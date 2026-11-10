@@ -375,21 +375,14 @@ pub(super) fn unit_subject(job: &Job, u: &Unit) -> Result<ContentId, String> {
     Ok(Hasher::new(SUBJECT).part(&bytes).finish())
 }
 
-/// The subject of a function or a run, `subject` within its build, as one of the unit whose
-/// subject is `unit`: two units' builds of one function are two subjects.
-pub(super) fn within(unit: ContentId, subject: ContentId) -> ContentId {
-    Hasher::new(WITHIN).id(&unit).id(&subject).finish()
-}
-
-/// The domains of [`unit_subject`] and [`within`].
+/// The domain of [`unit_subject`].
 const SUBJECT: &str = "blaze v2 why unit subject 3";
-const WITHIN: &str = "blaze v2 why subject within a unit 1";
 
 /// Why `unit`'s record was not in the store, for `blaze why`: its key's parts by name, which
 /// the daemon tells apart against the unit's last compute. Made on a miss only. The parts are
 /// made from inputs gathered again, and refused unless they make the very key the record was
 /// looked up under, so they never describe other inputs than the key's.
-fn missed(job: &Job, unit: usize) -> blaze_kernel::Miss {
+fn missed(job: &Job, reader: &UnitReader, unit: usize) -> blaze_kernel::Miss {
     use blaze_kernel::{Miss, Missed};
     let (item, subject) = match job.unit(unit) {
         Ok(u) => (span_unit(u), unit_subject(job, u)),
@@ -405,6 +398,7 @@ fn missed(job: &Job, unit: usize) -> blaze_kernel::Miss {
         // alloc: none
         parts: Vec::new(),
         beyond: None,
+        via: None,
     };
     let subject = match subject {
         Ok(it) => it,
@@ -433,10 +427,13 @@ fn missed(job: &Job, unit: usize) -> blaze_kernel::Miss {
             // alloc: once a miss
             return Err("its record has no key, though its crate's identity is set".to_owned());
         };
-        let (key, parts) = with_record_inputs(job, unit, identity, |inputs| {
+        let (key, mut parts) = with_record_inputs(job, unit, identity, |inputs| {
             Ok((inputs.key(unit)?, inputs.parts(unit)?))
         })
         .map_err(|error| error.what)?;
+        // In place of its crate's identity as one part: what that identity is made of, so the
+        // file, setting or dependency that changed is the one named.
+        parts.extend(identity_named(job, unit, reader.identity_parts(unit)?)?);
         if key != looked {
             // alloc: once a miss
             return Err("its inputs changed between its record's lookup and now (a profile it reads was rewritten during the build), so its parts would not describe the key it missed under".to_owned());
@@ -446,6 +443,54 @@ fn missed(job: &Job, unit: usize) -> blaze_kernel::Miss {
         Ok(miss)
     })();
     made.unwrap_or_else(|why| refused(subject, Missed::Failed(why)))
+}
+
+/// What unit `unit`'s identity in the front end is `made_of`
+/// ([`blaze_lower::Lowered::identity_parts`]) as parts of its record's key: each file by its
+/// path, and each crate it depends on as the result of that crate's unit, which a chain of
+/// reasons follows.
+fn identity_named(
+    job: &Job,
+    unit: usize,
+    made_of: Vec<blaze_lower::IdentityPart>,
+) -> Result<Vec<blaze_kernel::Part>, String> {
+    use blaze_kernel::Part;
+    use blaze_lower::IdentityPart;
+    let u = job.unit(unit).map_err(|error| error.what)?;
+    // The unit whose crate `krate` is: one this unit depends on, else (a crate of the
+    // standard library, which no unit names as a dependency) the first of the job's.
+    let unit_of = |krate| {
+        u.dependencies
+            .iter()
+            .map(|dep| dep.index)
+            .chain(0..job.graph.len())
+            .find(|&at| job.crates.krate(at) == Some(krate))
+            .and_then(|at| job.unit(at).ok())
+            .map(span_unit)
+    };
+    // alloc: once a miss, a part each thing its identity is made of
+    let mut parts = Vec::with_capacity(made_of.len());
+    for part in made_of {
+        parts.push(match part {
+            IdentityPart::Settings(id) => Part::new(
+                "its crate's settings in the front end (its root's path, cfgs, env, edition and target)",
+                Some(id),
+            ),
+            IdentityPart::File { path, content, code } => Part::file(path, Some(content), code),
+            IdentityPart::Files { what, content } => Part::new(what, Some(content)),
+            IdentityPart::Appended(id) => {
+                Part::new("the module the build appends to its root file (a test harness)", Some(id))
+            }
+            IdentityPart::Spelling(id) => Part::new("how cargo passes its root file", Some(id)),
+            // alloc: once a miss, a part's name
+            IdentityPart::Dependency { krate, name, identity } => Part::result(
+                format!("the crate `{name}` it depends on, as the front end has it"),
+                Some(identity),
+                unit_of(krate),
+            ),
+        });
+    }
+    Ok(parts)
 }
 
 /// What a unit's record key is made of. The process's environment is not among it: a record
@@ -556,7 +601,8 @@ impl RecordInputs<'_> {
 
     /// The parts of [`Self::key`] by name, each hashed alone, for `blaze why`: the unit's own
     /// fields and each dependency by the name it is used as, so a changed feature or profile
-    /// is named. Made on a miss only.
+    /// is named. Made on a miss only. All but [`Self::identity`], which its caller names by
+    /// what it is made of ([`identity_named`]).
     pub(crate) fn parts(&self, unit: usize) -> Result<Vec<blaze_kernel::Part>, ApiError> {
         use blaze_kernel::Part;
         let bytes = |name: &str, bytes: &[u8]| {
@@ -577,10 +623,6 @@ impl RecordInputs<'_> {
         let u = &self.unit;
         // alloc: once a miss, a part each part of the key
         let mut parts = vec![
-            id(
-                "the crate's identity in the front end (its sources and its dependencies')",
-                Some(&self.identity),
-            ),
             cbor("package", &u.pkg_id)?,
             cbor("target", u.target)?,
             cbor("profile", u.profile)?,
@@ -1311,7 +1353,7 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Re
         kept(job, unit)?
     };
     if kept.is_none() {
-        let miss = missed(job, unit);
+        let miss = missed(job, reader, unit);
         lock(slot).misses.push(miss);
     }
     if let Some(Kept { record, puts, profiles }) = kept {
@@ -1687,20 +1729,11 @@ fn link(
     if let Some(Ok((_, Ok(Ok(parts))))) = &mut phases.generated
         && !parts.built.misses.is_empty()
     {
-        // Its functions are subjects within the unit: another unit's build of one is another.
-        let subject = unit_subject(job, job.unit(unit)?);
+        // A function's template is the same step whichever unit built it (its subject is
+        // the driver's): the unit is only what a chain of reasons follows from its code.
+        let via = span_unit(job.unit(unit)?);
         for mut miss in std::mem::take(&mut parts.built.misses) {
-            match &subject {
-                Ok(subject) => miss.subject = within(*subject, miss.subject),
-                Err(why) => {
-                    // No subject to compare it by: said, not dropped.
-                    miss.subject = ContentId::default();
-                    // alloc: error path, once a miss
-                    miss.missed =
-                        blaze_kernel::Missed::Failed(format!("its unit has no subject: {why}"));
-                    miss.parts.clear();
-                }
-            }
+            miss.via = Some(via.clone()); // clone: once a miss
             phases.misses.push(miss);
         }
     }
@@ -1818,7 +1851,10 @@ fn store(
     let package = job.package(u)?;
     // Read before the unit's is taken, so a give-way finds it as it was.
     let krate = crate_of(job, unit, u)?;
-    let sources = crate_files(reader, krate);
+    let sources = {
+        let _span = tracing::info_span!(target: "blaze", "unit source files").entered();
+        crate_files(reader, krate)
+    };
     // Everything its closure's code was made from is in the database's logs now: it compiled.
     // An expansion whose reads were not traced read what no key can cover: no record is kept.
     let read = {
@@ -1853,6 +1889,10 @@ fn store(
     } = *making;
     let mut outputs = Vec::new();
     let mut artifact = None;
+    // Each file it wrote hashed whole for its key (a program's image among them), its
+    // dep-info written and its artifact made.
+    let hashing =
+        tracing::info_span!(target: "blaze", "unit outputs hash", files = files.len()).entered();
     if !nothing {
         let mounted = &job.mounted;
         // Each file's bytes go into the store once, moved, under their key; a copy cargo makes
@@ -1941,6 +1981,7 @@ fn store(
             *context = with_natives(*context, &natives);
         }
     }
+    drop(hashing);
     let misses = std::mem::take(&mut phases.misses);
     let why = why.map(str::to_owned); // alloc: a unit that failed, once
     let mut compiled = Compiled {
@@ -2364,6 +2405,11 @@ fn assemble(
         );
         return Err(ApiError::new(what, None).into());
     };
+    // Its diagnostics' sources read and each diagnostic rendered: a unit made again does this
+    // whole, whatever of its check was reused.
+    let rendering =
+        tracing::info_span!(target: "blaze", "unit diagnostics render", diags = diags.len())
+            .entered();
     let mut sources = blaze_diagnostics::emit::Sources::default();
     for (name, text) in &phases.unmounted {
         // clone: a file no mount holds, once per unit whose diagnostics point into one
@@ -2394,6 +2440,7 @@ fn assemble(
         .collect::<Result<_, _>>()
         // clone: the unit's name, on the error path
         .map_err(|why| ApiError::new(why, Some(u.target.name.clone())))?;
+    drop(rendering);
     let failed = diagnostics.iter().any(|it| it.level == Level::Error);
     let mut made = Made::default();
     let nothing = |diagnostics: Vec<Diagnostic>, ok: bool, made: Made| Making {
@@ -2489,7 +2536,10 @@ fn assemble(
             if job.cancelled() {
                 return Err(Failed::Again);
             }
-            let generated = parts.over(reader, mounted);
+            let generated = {
+                let _span = tracing::info_span!(target: "blaze", "unit generated over").entered();
+                parts.over(reader, mounted)
+            };
             // Lint `blaze::vecreport`: what the optimized code still does in its loops, at
             // the source line, in the order of the positions.
             let reported = generated
@@ -2516,6 +2566,7 @@ fn assemble(
             // has: a reformat that moves a `panic!` changes its message. Every span table of the
             // binary is in each test's selection, so such an edit runs its tests again.
             // alloc: once per test unit, one hash per span table
+            let tables = tracing::info_span!(target: "blaze", "unit span tables").entered();
             let mut spans: Vec<CodeHash> = match generated.roots.tests.is_empty() {
                 true => Vec::new(),
                 false => generated
@@ -2533,6 +2584,7 @@ fn assemble(
             spans.sort_unstable();
             spans.dedup();
             made.spans = spans;
+            drop(tables);
             // Each test by name only: what it reaches is walked from the binary's table when a
             // reach request or a kept run asks, not here, where a binary of thousands of tests
             // walked the program once per test (2026-11-01: minutes per binary).

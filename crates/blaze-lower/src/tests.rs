@@ -1122,6 +1122,10 @@ fn a_units_identity_covers_what_it_is_made_from_deeply() {
     };
     assert!(changed(LIB) && changed(LIB_TEST) && changed(BIN));
     assert!(!changed(CORE) && !changed(MACRO));
+    // The build script is `fn main() {}`: it can read no file of its package's source root
+    // but its own root, so the file its run left there (as an edit of the lib's source would)
+    // is nothing it is made from. Remove `code::root_alone` from the identity and this fails.
+    assert!(!changed(BUILD_SCRIPT), "a build script that reads its root file alone");
     first.lowered.ran(RUN, &ran("pub fn gen() { loop {} }\n")).unwrap();
     assert_ne!(first.lowered.identity(LIB), after[2]);
     first.lowered.ran(RUN, &ran("pub fn gen() {}\n")).unwrap();

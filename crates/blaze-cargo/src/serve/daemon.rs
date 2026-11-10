@@ -2477,10 +2477,11 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 }
                 Out::Pass(Arrived::Request {
                     from,
-                    request: Request::Rebuilt { all, cwd, item },
+                    request: Request::Rebuilt { all, cwd, item, build, unexplained },
                 }) => {
                     let mut replies = std::mem::take(&mut self.replies);
-                    self.observe.rebuilt(from, cwd, item, all, self.driver.now(), &mut replies);
+                    let ask = crate::serve::why::Ask { all, cwd, item, build, unexplained };
+                    self.observe.why_asked(from, ask, self.driver.now(), &mut replies);
                     self.send(replies);
                 }
                 Out::Pass(arrived) => {

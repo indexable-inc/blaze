@@ -3,7 +3,7 @@
 use span::Edition;
 use syntax::{AstNode, SourceFile};
 
-use super::{CodeText, code_text_of};
+use super::{CodeText, code_text_of, root_alone_of};
 
 fn code(text: &str) -> CodeText {
     let parse = SourceFile::parse(text, Edition::CURRENT);
@@ -140,5 +140,71 @@ fn a_file_its_code_may_read_whole_keeps_its_text() {
         "#[cfg(test)]\nmod tests;\n",
     ] {
         assert!(!code(text).whole, "{text}");
+    }
+}
+
+fn alone(text: &str) -> bool {
+    root_alone_of(SourceFile::parse(text, Edition::CURRENT).tree().syntax())
+}
+
+/// A root file that only prints, reads variables and starts programs (ripgrep's `build.rs`)
+/// can read no other file of its source root.
+#[test]
+fn a_script_that_prints_and_runs_programs_reads_its_root_alone() {
+    assert!(alone("fn main() {}\n"));
+    assert!(alone(
+        "use std::process::Command;\n\
+         #[derive(Debug, Clone)]\nstruct Rev(String);\n\
+         mod inline { pub fn f() -> u8 { 1 } }\n\
+         fn main() {\n\
+             let Ok(os) = std::env::var(\"CARGO_CFG_TARGET_OS\") else { return };\n\
+             let out = Command::new(\"git\").args(&[\"rev-parse\", \"HEAD\"]).output();\n\
+             if !os.is_empty() { println!(\"cargo:rustc-env=REV={}\", format!(\"{:?}\", out.is_ok())); }\n\
+             std::println!(\"{}\", env!(\"CARGO_PKG_NAME\"));\n\
+             assert!(!matches!(inline::f(), 2), \"{}\", line!());\n\
+         }\n"
+    ));
+    // A dependency used for its functions, none of its names a macro's or a derive's.
+    assert!(alone("use cc::Build;\nfn main() { Build::new().file(\"a.c\").compile(\"a\"); }\n"));
+}
+
+/// Anything that reads another file, or could expand to something that does, is refused: the
+/// crate keeps its whole source root in its identity.
+#[test]
+fn what_could_read_another_file_is_not_alone() {
+    let refused = [
+        ("mod other;\nfn main() {}\n", "a module in another file"),
+        ("#[path = \"../x.rs\"]\nmod other;\nfn main() {}\n", "a module at a path"),
+        ("fn main() { let _ = include_str!(\"x.txt\"); }\n", "include_str!"),
+        ("include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));\n", "include!"),
+        (
+            "fn main() { println!(\"{}\", include_bytes!(\"x\").len()); }\n",
+            "an include a macro is given",
+        ),
+        ("#[doc = include_str!(\"../README.md\")]\nfn main() {}\n", "an include in an attribute"),
+        ("macro_rules! m { () => {}; }\nfn main() { m!(); }\n", "a macro defined here"),
+        ("fn main() { other::mac!(); }\n", "another crate's macro"),
+        ("fn main() { mac!(); }\n", "a macro of an unknown name"),
+        ("#[macro_use]\nextern crate other;\nfn main() {}\n", "extern crate"),
+        ("#[other::attr]\nfn main() {}\n", "an attribute macro"),
+        ("#[derive(Other)]\nstruct S;\nfn main() {}\n", "a derive of another crate"),
+        ("use other::*;\nfn main() { println!(); }\n", "a glob of another crate"),
+        ("use crate::inner::*;\nmod inner {}\nfn main() {}\n", "a glob of its own"),
+        ("use other::println;\nfn main() { println!(); }\n", "a plain macro's name imported"),
+        ("use other::mac as vec;\nfn main() { let _: Vec<u8> = vec![]; }\n", "renamed to one"),
+        ("use other::Debug;\n#[derive(Debug)]\nstruct S;\nfn main() {}\n", "a derive shadowed"),
+        (
+            "fn main() { println!(\"{}\", { #[path = \"x.rs\"] mod m; 1 }); }\n",
+            "a module a macro is given",
+        ),
+        ("fn main() { println!(\"{}\", { use other::*; 1 }); }\n", "an import a macro is given"),
+        ("fn main() { println!(\"{}\", other!()); }\n", "a macro a macro is given"),
+        (
+            "fn main() { println!(\"{}\", std::format!(\"\")); }\n",
+            "a path's macro a macro is given",
+        ),
+    ];
+    for (text, what) in refused {
+        assert!(!alone(text), "{what}: {text}");
     }
 }

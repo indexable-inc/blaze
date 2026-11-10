@@ -497,6 +497,8 @@ pub fn subject(identity: ContentId, origin: Origin) -> ContentId {
     origin.hash_into(&mut hasher);
     hasher.finish()
 }
+/// The domain of a dev template's identity as a step `blaze why` records (`FnNode::missed`).
+const TEMPLATE_STEP_DOMAIN: &str = "blaze v2 why dev template step 1";
 pub const RELATIVE_FLIGHT_DOMAIN: &str = "blaze v2 relative flight 1";
 pub const GROUP_FLIGHT_DOMAIN: &str = "blaze v2 group flight 2";
 
@@ -577,10 +579,12 @@ impl<I, S> FnNode<I, S> {
         // alloc: once a miss, a part each part of its key
         let mut parts = vec![
             Part::new("the toolchain", Some(self.spec.toolchain.id)),
-            Part::new("its code", Some(instance.code.0)),
-            Part::new("its type arguments' facts", Some(instance.args)),
+            // The front end's results, of no step blaze why records: a chain follows the
+            // unit that built it (`blaze_kernel::Miss::via`), whose key covers their sources.
+            Part::result("its code", Some(instance.code.0), None),
+            Part::result("its type arguments' facts", Some(instance.args), None),
             Part::new("its codegen settings", Some(instance.settings.0)),
-            Part::new(
+            Part::result(
                 "the kinds of its references",
                 Some(
                     placed(
@@ -590,6 +594,7 @@ impl<I, S> FnNode<I, S> {
                     )
                     .0,
                 ),
+                None,
             ),
         ];
         // alloc: once a miss
@@ -636,11 +641,19 @@ impl<I, S> FnNode<I, S> {
                 }
             };
             let names = node.map(|it| it.described.name.clone()); // clone: once a miss
-            parts.push(Part { name, hash: Some(key.0), names });
+            parts.push(Part::result(name, Some(key.0), names));
         }
+        // The step's identity: the function and its settings, and nothing of the unit that
+        // asked for it. The template store is shared by every unit, so which unit's build
+        // missed is no part of what the template is; one function built at two settings in
+        // one build is two steps.
+        let step = Hasher::new(TEMPLATE_STEP_DOMAIN)
+            .id(&self.subject())
+            .id(&instance.settings.0)
+            .finish();
         blaze_kernel::Miss::of_parts(
             <kernel::DevTemplate as blaze_kernel::Step>::NAME,
-            self.subject(),
+            step,
             self.described.name.clone(), // clone: once a miss
             at.0,
             parts,
