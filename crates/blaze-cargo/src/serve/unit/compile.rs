@@ -510,18 +510,20 @@ fn quoted_text(job: &Job, name: &str) -> Option<String> {
 /// unit's crate's), in which case the record is under what its diagnostics quote
 /// ([`quoted_key`]) or its whole key, as before.
 fn placed(job: &Job, edition: ::span::Edition, diags: &[Diag]) -> Option<Placed> {
-    placed_from(|name| quoted_text(job, name), edition, diags)
+    // alloc: once per unit stored with diagnostics, those cargo shows
+    let shown: Vec<Diag> = diags.iter().filter(|it| !cargo_hides(&it.message)).cloned().collect();
+    placed_from(|name| quoted_text(job, name), edition, &shown)
 }
 
-/// [`placed`], each file's text as `read` gives it by the name the diagnostics give the file.
+/// [`placed`] of every one of `diags`, each file's text as `read` gives it by the name the
+/// diagnostics give the file.
 pub(super) fn placed_from(
     read: impl Fn(&str) -> Option<String>,
     edition: ::span::Edition,
     diags: &[Diag],
 ) -> Option<Placed> {
     // alloc: once per unit stored with diagnostics, what its record holds of them
-    let mut diags: Vec<Diag> =
-        diags.iter().filter(|it| !cargo_hides(&it.message)).cloned().collect();
+    let mut diags: Vec<Diag> = diags.to_vec();
     // alloc: as above, a span each
     let mut spans: Vec<(String, u32, u32)> = Vec::new();
     for diag in &mut diags {
@@ -670,6 +672,145 @@ fn rendered(
         .collect::<Result<_, _>>()
         // clone: the unit's name, on the error path
         .map_err(|why| ApiError::new(why, Some(u.target.name.clone())))
+}
+
+/// The domain of a unit's check entry's key ([`check_key`]).
+const CHECK: &str = "blaze v2 cargo unit check 1";
+
+/// The outcome of a unit's check, an entry of the store apart from its record
+/// ([`check_key`]): what [`Phase::Bodies`] gives the phases after it. A unit whose record
+/// misses and whose check entry is found runs no check: its code is generated and linked
+/// against the diagnostics the entry keeps.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub(crate) struct Checked {
+    /// [`blaze_diagnostics::CrateCheck::items_broken`].
+    pub(super) items_broken: bool,
+    /// The check's diagnostics, every one, as places ([`Placed`]); none for a check that
+    /// gave none.
+    pub(super) placed: Option<Placed>,
+}
+
+impl Checked {
+    /// The entry as the store keeps it: a record's header with no output, native input or
+    /// profile ([`header`]), which a lookup checks in place as it does a record's, then the
+    /// CBOR of the outcome.
+    pub(super) fn encoded(&self) -> Result<Vec<u8>, String> {
+        let mut bytes = Vec::new(); // alloc: once per check entry kept
+        header::write(&mut bytes, &[], &[], &[]);
+        blaze_protocol::cbor::append(&mut bytes, self).map_err(|why| why.to_string())?;
+        Ok(bytes)
+    }
+
+    /// What [`Checked::encoded`] wrote as `bytes`, whose body starts at `body`
+    /// ([`header::check`]).
+    pub(super) fn decoded(bytes: &[u8], body: usize) -> Result<Checked, String> {
+        let body = bytes.get(body..).ok_or("it ends before its body starts")?;
+        blaze_protocol::cbor::from_slice(body).map_err(|why| why.to_string())
+    }
+}
+
+/// The base key of `unit`'s check entry: what its check's outcome is made from, which is
+/// what a unit that only checks is keyed by, whatever the unit goes on to build: its record's
+/// inputs ([`RecordInputs`]) with its crate known by what a check can observe of it
+/// ([`blaze_lower::Narrowed::checked`]: its own code text, and of the crates it depends on
+/// their interfaces). So an edit of a body no check of this crate can read, in a crate below
+/// it, moves the unit's record key and leaves this one. Filed, as a record is, by what the
+/// crate's code read ([`reads`]). None for a unit with no narrow identity
+/// ([`narrow_identity`]: its lints read comments, or its crate keeps its whole text), and for
+/// one that only checks, whose record is under this very identity.
+fn check_key(job: &Job, unit: usize) -> Result<Option<Key>, ApiError> {
+    let u = job.unit(unit)?;
+    if checks_only(job.input.goal, u) || narrow_identity(job, unit)?.is_none() {
+        return Ok(None);
+    }
+    let Some(narrowed) = job.narrowed.get(unit).and_then(|it| it.get()).copied().flatten() else {
+        return Ok(None);
+    };
+    let base = work_out_key(job, unit, narrowed.checked)?;
+    Ok(Some(Key(Hasher::new(CHECK).id(&base.0).finish())))
+}
+
+/// The check outcome the store keeps for `unit` ([`Checked`]): its diagnostics with their
+/// offsets in the files as they are ([`replaced`]) and whether they break its items. None
+/// when the unit has no check entry or the store keeps none. An entry that is there and does
+/// not decode is an error naming the unit and its key (rule 3).
+fn kept_check(job: &Job, unit: usize) -> Result<Option<(Vec<Diag>, bool)>, ApiError> {
+    let Some(base) = check_key(job, unit)? else { return Ok(None) };
+    let guard = blaze_cas::enter();
+    let Some((_, entry, body)) = filed_in(job, &job.input.store, false, &guard, base)? else {
+        return Ok(None);
+    };
+    let checked = Checked::decoded(entry.bytes, body).map_err(|why| {
+        // alloc: error path
+        ApiError::new(
+            format!(
+                "unit {unit}: its check's outcome under {:x} in the daemon's store does not decode: {why}",
+                base.0
+            ),
+            None,
+        )
+    })?;
+    let diags = match &checked.placed {
+        Some(placed) => replaced(job, unit, placed)?,
+        None => Vec::new(), // alloc: empty, allocates nothing
+    };
+    Ok(Some((diags, checked.items_broken)))
+}
+
+/// The puts of `unit`'s check entry ([`Checked`]), its check having run in this build and
+/// given `diags`: the entry under where its reads `read` file it, and the slot of their
+/// names where no slot holds them yet. None, so the check runs again when the record
+/// misses, where the unit has no check entry ([`check_key`]), a diagnostic of it is not
+/// kept as places ([`placed_from`]) or points into a text that is no file of the view
+/// (`unmounted`), or every slot of the key holds other names.
+fn check_puts(
+    job: &Job,
+    reader: &UnitReader,
+    unit: usize,
+    read: &reads::Reads,
+    diags: &[Diag],
+    items_broken: bool,
+    unmounted: bool,
+) -> Result<Vec<Put>, ApiError> {
+    let none = Vec::new(); // alloc: empty, allocates nothing
+    if unmounted {
+        return Ok(none);
+    }
+    let Some(base) = check_key(job, unit)? else { return Ok(none) };
+    let u = job.unit(unit)?;
+    let placed = match diags.is_empty() {
+        true => None,
+        false => {
+            let edition = crate_of(job, unit, u)?.data(reader.db()).edition;
+            match placed_from(|name| quoted_text(job, name), edition, diags) {
+                Some(placed) => Some(placed),
+                None => return Ok(none),
+            }
+        }
+    };
+    let failed = |why: String| {
+        // alloc: error path
+        ApiError::new(
+            format!("keeping the check's outcome of unit {unit} (`{}`): {why}", u.target.name),
+            None,
+        )
+    };
+    let filing = {
+        let guard = blaze_cas::enter();
+        reads::file(
+            base,
+            read,
+            &job.input.config.invocation.env,
+            &|manifest| job.units().is_primary_manifest(manifest),
+            |slot| job.input.store.get(&guard, slot).ok().flatten().map(|it| it.bytes),
+        )
+        .map_err(failed)?
+    };
+    let Some(reads::Filing { key, slot }) = filing else { return Ok(none) };
+    let bytes = Checked { items_broken, placed }.encoded().map_err(failed)?;
+    let mut puts = vec![Put { key, kind: Kind::Query, bytes }]; // alloc: once per check entry kept
+    puts.extend(slot.map(|(key, bytes)| Put { key, kind: Kind::Query, bytes }));
+    Ok(puts)
 }
 
 fn work_out_key(job: &Job, unit: usize, identity: ContentId) -> Result<Key, ApiError> {
@@ -1871,8 +2012,13 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Re
                 true,
             )
         }
-        // alloc: once per unit checked, shared by its check and its codegen
-        None => (Some(Arc::new(Checking::new(db, hir::Crate::from(krate)))), None, false),
+        // Its own check's outcome from the store ([`kept_check`]): its record missed for
+        // what no check of it reads (a body below it), so no check runs.
+        None => match kept_check(job, unit)? {
+            Some((diags, items_broken)) => (None, Some(diags), items_broken),
+            // alloc: once per unit checked, shared by its check and its codegen
+            None => (Some(Arc::new(Checking::new(db, hir::Crate::from(krate)))), None, false),
+        },
     };
     let unmounted =
         diags.as_deref().map_or_else(Vec::new, |diags| unmounted(reader, &job.mounted, diags));
@@ -2542,6 +2688,13 @@ fn store(
         compiled.puts.push(record);
         compiled.puts.extend(slot);
         compiled.puts.extend(quotes_put);
+    }
+    // Its check's outcome, when its check ran here, as an entry of its own: found by a later
+    // build whose record misses for what the check does not read.
+    if let (true, Ok(read), Some(diags)) = (phases.checking.is_some(), &read, &phases.diags) {
+        let unmounted = !phases.unmounted.is_empty();
+        let puts = check_puts(job, reader, unit, read, diags, phases.items_broken, unmounted)?;
+        compiled.puts.extend(puts);
     }
     if let Some(slot) = job.made.get(unit) {
         let _ = slot.set(made);

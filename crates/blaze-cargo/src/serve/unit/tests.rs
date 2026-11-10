@@ -2914,3 +2914,33 @@ fn a_span_that_is_no_place_keeps_its_record_under_what_it_quotes() {
     let unread = compile::replaced_from(|_| None, 3, &placed).unwrap_err();
     assert!(unread.what.contains("no text of"), "{}", unread.what);
 }
+
+/// A check entry, the store's own record of a unit's check, restores to the outcome it was
+/// made of, byte for byte: through its encoding and a record's header check, the same value
+/// and the same bytes again, and its diagnostics replayed over the text they were made of are
+/// the check's. Bytes cut short are refused.
+#[test]
+fn a_check_entry_restores_to_the_outcome_it_was_made_of() {
+    let diags = vec![warning_over(PLACED_BARE, "x", "let x = 1;")];
+    let placed =
+        compile::placed_from(one_file(PLACED_BARE), span::Edition::CURRENT, &diags).unwrap();
+    for checked in [
+        compile::Checked { items_broken: true, placed: Some(placed) },
+        compile::Checked { items_broken: false, placed: None },
+    ] {
+        let bytes = checked.encoded().unwrap();
+        let body = compile::header::check(&bytes, |_| true, &mut |_: &std::path::Path| {
+            None::<[u8; 32]>
+        })
+        .expect("a check entry starts as a record with no output does");
+        let restored = compile::Checked::decoded(&bytes, body).unwrap();
+        assert_eq!(restored, checked);
+        assert_eq!(restored.encoded().unwrap(), bytes);
+        if let Some(placed) = &restored.placed {
+            let replayed = compile::replaced_from(one_file(PLACED_BARE), 0, placed).unwrap();
+            assert_eq!(replayed, diags);
+        }
+        assert!(compile::Checked::decoded(&bytes[..bytes.len() - 1], body).is_err());
+        assert!(compile::Checked::decoded(&bytes, bytes.len() + 1).is_err());
+    }
+}
