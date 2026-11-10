@@ -956,6 +956,53 @@ pub(crate) struct ScriptRun {
     /// version. Held ([`blaze_profile::flight::HELD_FIELD`]): entered only while the loop does a step
     /// of it, so its `self_cpu_ns` is the daemon's work for this run alone.
     span: tracing::Span,
+    /// The run's files are in place as this process left them ([`run_in_place`]): of which
+    /// bytes, and when that run began. Taken as the run ends reused (nothing is written when
+    /// the bytes are those) or starts anew ([`ScriptRun::started`]).
+    left: Option<(blaze_ids::ContentId, SystemTime)>,
+}
+
+/// What a run left in its directory: cargo's files of it, of which bytes ([`run_id`]), when it
+/// began (the time of `invoked.timestamp`), and each file's length and time as it was left.
+struct LeftRun {
+    id: blaze_ids::ContentId,
+    began: SystemTime,
+    files: [(u64, SystemTime); 3],
+}
+
+/// Each run's directory this process left cargo's files in, by its path: a few dozen a
+/// build, scanned. In memory only: a restarted daemon writes each once.
+static LEFT_RUNS: blaze_core::lock::Lock<Vec<(PathBuf, LeftRun)>> =
+    blaze_core::lock::Lock::new("serve.unit.script.left_runs", Vec::new());
+
+/// The identity of cargo's files of a run that printed `stdout` and `stderr`; its
+/// `root-output` is its unit's `OUT_DIR`, which its directory names.
+fn run_id(stdout: &[u8], stderr: &[u8]) -> blaze_ids::ContentId {
+    blaze_ids::Hasher::new("blaze serve script run files").part(stdout).part(stderr).finish()
+}
+
+/// A file's length and time now.
+fn file_now(path: &Path) -> Option<(u64, SystemTime)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
+}
+
+/// Whether `unit`'s run directory holds cargo's files as this process left them, and its
+/// `OUT_DIR` is there: the bytes they are of and when that run began. Four stats and no
+/// read; a write of any of them, by anyone, moved its time or its length. What is found so
+/// is not written again by a run reused ([`ScriptRun::finish`]): a walk that computes
+/// nothing writes nothing, so no watch of the build directory hears of it.
+fn run_in_place(unit: &bs::Unit) -> Option<(blaze_ids::ContentId, SystemTime)> {
+    let dir = blaze_build_script::run::run_dir(unit);
+    let (id, began, files) = {
+        let left = LEFT_RUNS.lock();
+        let (_, it) = left.iter().find(|it| it.0 == dir)?;
+        (it.id, it.began, it.files)
+    };
+    let at = blaze_build_script::run::files(unit, &[], &[]).ok()?;
+    let now = [file_now(&at.printed.0)?, file_now(&at.stderr.0)?, file_now(&at.root_output.0)?];
+    let invoked = file_now(&blaze_build_script::run::invoked(unit).0)?.1;
+    (now == files && invoked == began && unit.out_dir.is_dir()).then_some((id, began))
 }
 
 enum State {
@@ -978,6 +1025,12 @@ enum State {
 /// then given its bytes, then the first dated when the run began. None is synced: cargo syncs
 /// none of them. The run ends ok once every effect of them completed.
 struct Writing {
+    /// The run's directory, the files' paths in it, the bytes they are of ([`run_id`]) and
+    /// when the run began: what is noted of them once they are written ([`Writing::note`]).
+    run_dir: PathBuf,
+    paths: [PathBuf; 3],
+    id: blaze_ids::ContentId,
+    began: SystemTime,
     files: [FileName; 3],
     /// Each file's bytes until it is cut and they are written; none are for an empty file.
     bytes: [Vec<u8>; 3],
@@ -1328,6 +1381,7 @@ pub(crate) fn start(job: &Arc<Job>, unit: usize, tags: u64) -> Result<ScriptRun,
         puts: RunPuts::default(),
         missed: None,
         span: tracing::Span::none(),
+        left: None,
     })
 }
 
@@ -1494,6 +1548,19 @@ impl ScriptRun {
                 out,
             );
         }
+        // cargo's files of these bytes are in place as this process left them: a run reused
+        // that computes nothing writes nothing. Of other bytes, the run starts anew.
+        let began = match self.left.take() {
+            Some((left, _)) if left == run_id(&stdout, &stderr) => {
+                self.state = State::Done;
+                return Some(true);
+            }
+            Some(_) => match blaze_build_script::run::begin(&start.unit) {
+                Ok(it) => it,
+                Err(error) => return self.error(error.0, out),
+            },
+            None => began,
+        };
         match Writing::begin(&start.unit, stdout, stderr, began, self.tag, effects) {
             Ok(writing) => {
                 self.state = State::Writing(Box::new(writing)); // alloc: once per script run
@@ -1513,6 +1580,7 @@ impl ScriptRun {
     ) -> Option<bool> {
         match writing.step(self.tag, completion, effects) {
             Ok(true) => {
+                writing.note();
                 self.state = State::Done;
                 Some(true)
             }
@@ -1536,9 +1604,15 @@ impl Writing {
         tag: Tag,
         effects: &mut Vec<Effect>,
     ) -> Result<Writing, String> {
+        let id = run_id(&stdout, &stderr);
+        let run_dir = blaze_build_script::run::run_dir(unit);
+        // What was noted of the directory is of files about to be cut.
+        LEFT_RUNS.lock().retain(|it| it.0 != run_dir);
         let at = blaze_build_script::run::files(unit, &[], &[]).map_err(|error| {
             format!("cargo's files of the build script run of `{}`: {error}", unit.package.descr())
         })?;
+        // clone: three paths, once per run written
+        let paths = [at.printed.0.clone(), at.stderr.0.clone(), at.root_output.0.clone()];
         let files =
             [file_name(&at.printed.0)?, file_name(&at.stderr.0)?, file_name(&at.root_output.0)?];
         // alloc: the effect owns what it writes; `OUT_DIR`'s path, once per run.
@@ -1559,7 +1633,19 @@ impl Writing {
                 tag: Tag(tag.0 + CUT + n),
             });
         }
-        Ok(Writing { files, bytes: [stdout, stderr, root_output], modified_ns, left: 3 })
+        let bytes = [stdout, stderr, root_output];
+        Ok(Writing { run_dir, paths, id, began, files, bytes, modified_ns, left: 3 })
+    }
+
+    /// Every file is written: what the directory holds is noted, each file's length and time
+    /// read back, so the next run reused with these bytes finds them in place
+    /// ([`run_in_place`]). A file that can't be looked at leaves nothing noted.
+    fn note(self) {
+        let now = [file_now(&self.paths[0]), file_now(&self.paths[1]), file_now(&self.paths[2])];
+        if let [Some(a), Some(b), Some(c)] = now {
+            let left = LeftRun { id: self.id, began: self.began, files: [a, b, c] };
+            LEFT_RUNS.lock().push((self.run_dir, left)); // alloc: once per run written
+        }
     }
 
     /// `completion` of one of its effects, the run's tag being `tag`: the next effect of its
@@ -1656,6 +1742,16 @@ impl Runs<Real> for ScriptRun {
 }
 
 impl ScriptRun {
+    /// The script is to run, whatever its directory holds: cargo's start of a run made now
+    /// when it was put off for files found in place ([`ScriptRun::begin`]), before the
+    /// spawn asked for is submitted. When the run began.
+    fn started(&mut self, unit: &bs::Unit, began: SystemTime) -> Result<SystemTime, String> {
+        match self.left.take() {
+            Some(_) => blaze_build_script::run::begin(unit).map_err(|error| error.0),
+            None => Ok(began),
+        }
+    }
+
     /// [`Runs::start`]'s step.
     fn begin(
         &mut self,
@@ -1668,10 +1764,16 @@ impl ScriptRun {
             return None;
         };
         // cargo's start of a run: `OUT_DIR` made, `invoked.timestamp` written, and the time it
-        // began, which its `output` is given.
-        let began = match blaze_build_script::run::begin(&start.unit) {
-            Ok(it) => it,
-            Err(error) => return self.error(error.0, out),
+        // began, which its `output` is given. Not when the last run's files are in place as
+        // this process left them: a run reused then writes nothing, and one that runs starts
+        // then ([`ScriptRun::started`]).
+        self.left = run_in_place(&start.unit);
+        let began = match self.left {
+            Some((_, began)) => began,
+            None => match blaze_build_script::run::begin(&start.unit) {
+                Ok(it) => it,
+                Err(error) => return self.error(error.0, out),
+            },
         };
         match &start.how {
             How::Inert => {
@@ -1713,6 +1815,10 @@ impl ScriptRun {
                 self.puts.misses.push(miss);
                 effects.push(Effect::Spawn { command: Box::new(command.clone()), tag: self.tag });
                 label_run(self.tag, &start.unit.package.descr());
+                let began = match self.started(&start.unit, began) {
+                    Ok(it) => it,
+                    Err(what) => return self.error(what, out),
+                };
                 self.state = State::Running {
                     start,
                     run: None,
@@ -1737,6 +1843,10 @@ impl ScriptRun {
                         label_run(self.tag, &start.unit.package.descr());
                         self.missed = Some(run_missed(&self.job, self.unit, prepared));
                         let quiet = Some(Quiet::begin(&live, self.tag, effects));
+                        let began = match self.started(&start.unit, began) {
+                            Ok(it) => it,
+                            Err(what) => return self.error(what, out),
+                        };
                         self.state = State::Running {
                             start,
                             run: Some(run),

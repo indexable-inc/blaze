@@ -51,6 +51,9 @@ struct World {
     /// What each profile's output file holds, when it is in place: the answer it was made
     /// from.
     outputs: [Option<String>; 2],
+    /// What each profile's build script's `OUT_DIR` holds, under the profile's directory of
+    /// outputs: what the script made of the header, or what a foreign process wrote there.
+    out_dirs: [Option<String>; 2],
     /// Another job is under way, which may write the outputs at any time.
     other_job: bool,
     /// A watch wanted in one request is in place only at the end of the next, after that
@@ -75,6 +78,7 @@ impl World {
             dep_watched,
             layout: false,
             outputs: [None, None],
+            out_dirs: [None, None],
             other_job: false,
             lag,
         }
@@ -88,6 +92,11 @@ impl World {
     /// The output of the profile asked for.
     fn output(&mut self) -> &mut Option<String> {
         &mut self.outputs[usize::from(self.release)]
+    }
+
+    /// What the build script makes in its `OUT_DIR`: a function of the header it reads.
+    fn generated(&self) -> String {
+        format!("generated from header {}", self.header)
     }
 
     /// What a walk of every unit says of this state, with nothing to make: a function of
@@ -204,6 +213,8 @@ enum Op {
     /// The header is written with the bytes it has: the watch hears a change of nothing.
     Touch,
     DeleteOutput,
+    /// A foreign process writes into the build script's `OUT_DIR`.
+    EditOutDir,
     /// The store lets go of what the outputs were made from: the next walk makes them
     /// again, and finds the files in place as it would place them.
     Evict,
@@ -220,6 +231,11 @@ enum Op {
 enum Bug {
     Lane(Plant),
     NoRound,
+    /// A build script reused writes its `OUT_DIR` again on every walk, in place or not.
+    ReplayWrites,
+    /// Every change heard under a directory of outputs after a walk that wrote there is
+    /// taken for that walk's own echo, a foreign write made in the same window too.
+    EchoHidesForeign,
 }
 
 fn id(text: &str) -> ContentId {
@@ -262,6 +278,12 @@ struct Daemon {
     /// The path dependency as it was last read, and the watches' generation read before.
     dep_read: u8,
     dep_generation: u64,
+    /// The header each profile's kept script run is of, and what this daemon left in each
+    /// `OUT_DIR` (the files' identity and their stamps as one: a foreign write moves them).
+    script_of: [Option<u8>; 2],
+    left: [Option<String>; 2],
+    /// The last walk wrote under a directory of outputs: its echo is yet to be heard.
+    echo: bool,
     /// How many requests the lane answered.
     answered: u32,
 }
@@ -277,6 +299,9 @@ impl Daemon {
             header_read: None,
             dep_read: 0,
             dep_generation: 0,
+            script_of: [None, None],
+            left: [None, None],
+            echo: false,
             answered: 0,
         }
     }
@@ -332,6 +357,10 @@ impl Daemon {
     /// A request: held for the watches' round, asked of the lane, and walked when the lane
     /// refuses. The oracle is asked of an answer said again.
     fn request(&mut self, world: &mut World, tamper: bool, bug: Option<Bug>) -> Result<(), String> {
+        if bug == Some(Bug::EchoHidesForeign) && self.echo {
+            self.watches.pending.retain(|dir| !OUT.contains(dir));
+        }
+        self.echo = false;
         if bug != Some(Bug::NoRound) {
             self.watches.round();
         }
@@ -360,8 +389,11 @@ impl Daemon {
                 if world.other_job {
                     return Err("said again while another job may write the outputs".to_owned());
                 }
+                if world.out_dirs[usize::from(world.release)] != Some(world.generated()) {
+                    return Err("said again with a foreign OUT_DIR".to_owned());
+                }
             }
-            Err(_) => self.walk(world, tamper),
+            Err(_) => self.walk(world, tamper, bug),
         }
         if world.lag {
             self.watches.confirm(&wanted);
@@ -372,7 +404,7 @@ impl Daemon {
     /// The whole build: the path dependency read again unless vouched for, the kept answer
     /// dropped, the walk recorded when it is of the checkout's last plan, every unit walked
     /// and what is not in place made.
-    fn walk(&mut self, world: &mut World, tamper: bool) {
+    fn walk(&mut self, world: &mut World, tamper: bool, bug: Option<Bug>) {
         if !self.dep_vouched(world) {
             self.dep_generation = self.watches.generation;
             self.dep_read = world.dep;
@@ -414,8 +446,21 @@ impl Daemon {
         }
         let answer = world.answer();
         let profile = usize::from(world.release);
+        // The build script: run again when its traced input moved, which makes something;
+        // else reused, its `OUT_DIR` written again only when it is not in place as this
+        // daemon left it, which no count of what a build made sees.
+        let generated = Some(world.generated());
+        let reran = self.script_of[profile] != Some(world.header);
+        let in_place = world.out_dirs[profile] == generated && self.left[profile] == generated;
+        if reran || !in_place || bug == Some(Bug::ReplayWrites) {
+            world.out_dirs[profile] = generated.clone();
+            self.left[profile] = generated;
+            self.script_of[profile] = Some(world.header);
+            self.watches.change(world.out());
+            self.echo = true;
+        }
         let placed = world.output().as_ref() == Some(&answer);
-        let made_nothing = placed && self.known[profile].as_ref() == Some(&answer);
+        let made_nothing = !reran && placed && self.known[profile].as_ref() == Some(&answer);
         self.known[profile] = Some(answer.clone());
         if !placed {
             *world.output() = Some(answer.clone());
@@ -478,6 +523,10 @@ fn runs(mut world: World, ops: &[Op], bug: Option<Bug>) -> Result<u32, String> {
                 *world.output() = None;
                 daemon.watches.change(world.out());
             }
+            Op::EditOutDir => {
+                world.out_dirs[usize::from(world.release)] = Some("foreign".to_owned());
+                daemon.watches.change(world.out());
+            }
             Op::Evict => daemon.known = [None, None],
             Op::OtherJob => world.other_job = !world.other_job,
             Op::Build { tamper } => {
@@ -494,7 +543,7 @@ fn runs(mut world: World, ops: &[Op], bug: Option<Bug>) -> Result<u32, String> {
 
 #[hegel::composite]
 fn op(tc: &TestCase) -> Op {
-    match tc.draw(gs::integers::<u8>().max_value(20)) {
+    match tc.draw(gs::integers::<u8>().max_value(21)) {
         0 => Op::Edit(Input::Source),
         1 => Op::Edit(Input::Lock),
         2 => Op::Edit(Input::Header),
@@ -511,6 +560,7 @@ fn op(tc: &TestCase) -> Op {
         13 => Op::OtherJob,
         14 => Op::Build { tamper: true },
         15 => Op::Evict,
+        16 => Op::EditOutDir,
         _ => Op::Build { tamper: false },
     }
 }
@@ -677,6 +727,32 @@ fn the_oracle_catches_a_lane_that_trusts_an_unwatched_path_dependency() {
 fn the_oracle_catches_a_lane_that_does_not_see_layout_profiles_appear() {
     let ops = kept_then(&[Op::Edit(Input::Layout), BUILD]);
     assert!(caught(plain(), &ops, Bug::Lane(Plant::IgnoresAppeared)).contains("said again"));
+}
+
+/// A build script reused whose `OUT_DIR` is in place writes nothing, so the walk after the
+/// build that ran it is kept and the lane answers; one that wrote it again on every walk
+/// would disturb each kept answer with its own echo, and the lane would never answer.
+#[test]
+fn the_oracle_catches_a_replayed_script_that_writes_on_every_walk() {
+    let ops = kept_then(&[BUILD, BUILD]);
+    assert_eq!(runs(plain(), &ops, None), Ok(2));
+    assert_eq!(runs(plain(), &ops, Some(Bug::ReplayWrites)), Ok(0));
+    // The script runs again when the header it reads changed, and is reused after.
+    // The build that runs it makes something, the walk after is kept, and the two after that
+    // are answered.
+    let ops = kept_then(&[Op::Edit(Input::Header), BUILD, BUILD, BUILD, BUILD]);
+    assert_eq!(runs(plain(), &ops, None), Ok(2));
+}
+
+/// A foreign write into `OUT_DIR` is heard, and the walk after it writes the script's files
+/// back; a second foreign write made before that walk's own echo is heard is a change like
+/// any other. A lane that took everything heard there for the echo would say the kept
+/// answer over a foreign `OUT_DIR`.
+#[test]
+fn the_oracle_catches_a_foreign_write_taken_for_the_walks_echo() {
+    let ops = kept_then(&[Op::EditOutDir, BUILD, Op::EditOutDir, BUILD]);
+    let why = caught(plain(), &ops, Bug::EchoHidesForeign);
+    assert!(why.contains("a foreign OUT_DIR"), "{why}");
 }
 
 /// The daemon's hold is the barrier: a request asked of the lane before the watches' round
