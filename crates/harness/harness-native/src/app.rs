@@ -1773,8 +1773,8 @@ impl App {
     }
 
     /// The work bar (hn.WorkBar): while the chat in front works, a band along the window's top edge, placed by the
-    /// track's padding. With an estimate ([`Self::turn_estimate`]) it fills from the left as the turn nears it and
-    /// `eta` says about how long is left; with none, or past it, it sweeps. At rest it has no width. Drawn every frame
+    /// track's padding. With an estimate ([`Self::turn_estimate`]) it fills from the left as the turn nears it (the bar
+    /// alone: no words say a time); with none, or past it, it sweeps. At rest it has no width. Drawn every frame
     /// the display gives while it moves; under Reduce Motion a sweep is the whole hairline, still.
     fn step_work_bar(&mut self) {
         use harness_native_ui_layout_api::Padding;
@@ -1799,12 +1799,9 @@ impl App {
             }
             None => run.zip(self.turn_estimate()).filter(|(run, est)| run < est),
         };
-        let mut left = String::new();
         let pad = if !busy {
             Padding { l: whole, r: 0.0, t: 0.0, b: 0.0 }
         } else if let Some((run, est)) = toward {
-            let mins = (est - run).div_ceil(60_000);
-            left = if est - run < 45_000 { "under a minute".to_owned() } else { format!("about {mins} min") };
             Padding { l: 0.0, r: (whole * (1.0 - run as f32 / est as f32)).max(0.0), t: 0.0, b: 0.0 }
         } else if still {
             Padding::default()
@@ -1821,9 +1818,6 @@ impl App {
         };
         if track.entity().try_cloned::<&Padding>() != Some(pad) {
             track.set(pad);
-        }
-        if let Some(eta) = bar.part("foot").and_then(|f| f.part("eta")) {
-            eta.text(&left);
         }
         // It moves: every frame the display gives (a sweep at a calm rate steps visibly).
         if busy && !(still && toward.is_none()) {
