@@ -165,8 +165,8 @@ mod tests {
         )
         .unwrap();
         std::fs::write(root.join("src/lib.rs"), "").unwrap();
-        let read = read(&["--format-version", "1", "--no-deps"]);
-        let json = printed(&read, &root, env(&cwd)).unwrap();
+        let one = read(&["--format-version", "1", "--no-deps"]);
+        let json = printed(&one, &root, env(&cwd)).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["version"], 1);
         assert_eq!(value["packages"][0]["name"], "app");
