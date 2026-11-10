@@ -313,12 +313,18 @@ fn rebuilt(words: Vec<OsString>) -> Result<(), Refusal> {
 /// cause. None when this process heard of no build, in the seed (whose engine is this
 /// process: a second connection would start a second), when no daemon is running, and when
 /// the reasons the daemon keeps are by now another build's (`blaze why` and the history's
-/// `misses` table still have them). The daemon's error otherwise.
+/// `misses` table still have them). None, and nothing asked, when the build said it computed
+/// nothing again (`Worked::misses` of 0): its summary is of those misses, so it is empty, and
+/// a no-op build makes no second round trip and waits for no history thread. The daemon's
+/// error otherwise.
 pub(super) fn recomputed() -> Result<Vec<blaze_api::Report>, String> {
     let build = super::client_rows::build();
-    if build == 0 || !cfg!(feature = "native") {
+    if build == 0 || super::client_rows::misses() == 0 || !cfg!(feature = "native") {
         return Ok(Vec::new());
     }
+    let _span =
+        tracing::info_span!(target: "blaze", "client: ask why the build recomputed", build)
+            .entered();
     let mut summary = Vec::new();
     let request =
         Request::Rebuilt { all: false, cwd: None, item: None, build: Some(build), unexplained: false };

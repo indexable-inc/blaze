@@ -32,15 +32,25 @@ pub const PROFILE: &str = "BLAZE_PROFILE";
 /// for none heard yet: one request a client process, so the last one heard is its.
 static BUILD: AtomicU64 = AtomicU64::new(0);
 
+/// How many steps that build computed again instead of reusing ([`blaze_api::Worked::misses`]):
+/// 0 until a build is heard, and for one that recomputed nothing, whose summary is empty.
+static MISSES: AtomicU64 = AtomicU64::new(0);
+
 /// The build the daemon said this client's request is, 0 for none heard.
 pub fn build() -> u64 {
     BUILD.load(Ordering::Relaxed)
 }
 
-/// The daemon said the request is build `build`.
-pub fn heard(build: Option<u64>) {
+/// How many steps the build heard computed again, 0 for none heard.
+pub fn misses() -> u64 {
+    MISSES.load(Ordering::Relaxed)
+}
+
+/// The daemon said the request is build `build`, which computed `misses` steps again.
+pub fn heard(build: Option<u64>, misses: u64) {
     if let Some(build) = build {
         BUILD.store(build, Ordering::Relaxed);
+        MISSES.store(misses, Ordering::Relaxed);
     }
 }
 

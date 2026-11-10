@@ -356,8 +356,10 @@ The daemon writes them into `spans`, `events` and `folded` as the client's proce
 (`process_name` = `blaze client`, `pid` the client's) and refuses rows of another build. The
 times go on a third row of the build in `builds` with `client_started_ns` and
 `client_ended_ns`; the view keeps the row with `dur_ns` and those times. A client's rows that
-arrive before the build's end row are held and go on it. The client waits for the write (at
-most the loop's 50 ms idle tick), so an export right after reads them. `blaze debug time`
+arrive before the build's end row are held and go on it. The daemon answers the client as it
+hands the rows to the history's thread, before they are written, so the client's exit waits
+for no flush; an export right after asks for a flush, which that thread makes after the rows,
+so it reads them. A write that fails is the history's failure, said in `blaze status`. `blaze debug time`
 reads one process's rows a build, the daemon's, so it leaves the client's out.
 
 ### `processes`: one row a child process blaze spawned, reaped

@@ -391,6 +391,7 @@ fn seeds() -> Vec<Vec<u8>> {
             green: 2,
             links: vec![Linked { how: LinkHow::Spliced, path: "target/debug/a".to_owned() }],
             reran: 3,
+            misses: 5,
             served: vec![ServedCrate {
                 why: Some("a body changed".to_owned()),
                 bodies: ServedPart::Served,

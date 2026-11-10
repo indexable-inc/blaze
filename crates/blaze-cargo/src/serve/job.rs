@@ -1935,6 +1935,16 @@ struct Job<S: Steps> {
     began: Duration,
     /// When its last [`Response::Doing`] was said, on the same clock ([`Jobs::doing`]).
     doing_said: Option<Duration>,
+    /// How many misses its history row took ([`Job::ended`]), sorted and each once: what its
+    /// [`Worked::misses`] says, so a build with none is asked for no summary.
+    missed: u64,
+    /// While its answer waits for the store's commit of what it put or read
+    /// ([`Jobs::wind_up`]), the span naming the ticket it waits on (every-wait-says-what).
+    /// Closed as the job ends.
+    durable_wait: Option<tracing::Span>,
+    /// While its units wait for the shared std store's look ([`Job::awaiting`]), the span
+    /// naming that wait. Closed as the look lets it build ([`Jobs::looked`]).
+    look_wait: Option<tracing::Span>,
 }
 
 /// A job's kept front end being stored ([`Jobs::store_kept`]), by one task of a plane request
@@ -2414,6 +2424,7 @@ impl<S: Steps> Job<S> {
         let mut misses = std::mem::take(&mut self.misses);
         misses.sort_unstable();
         misses.dedup();
+        self.missed = misses.len() as u64;
         let mut test_runs = std::mem::take(&mut self.test_runs);
         for it in &mut test_runs {
             it.build_id = build_id;
@@ -2988,6 +2999,9 @@ impl<S: Steps> Jobs<S> {
             paused: blaze_graph::pressure::Paused::default(),
             began: w.now,
             doing_said: None,
+            missed: 0,
+            durable_wait: None,
+            look_wait: None,
         };
         if self.jobs.put(key_of(id), job).is_err() {
             // alloc: an error the session's free list can't give
@@ -4459,8 +4473,14 @@ impl<S: Steps> Jobs<S> {
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
         if w.std.looked() < job.look {
             job.awaiting = Some(picked.map(<[u32]>::to_vec)); // alloc: a build ahead's picks, once
+            job.look_wait = Some(tracing::info_span!(
+                target: "blaze",
+                "the job's units wait for the shared std store's look",
+                look = job.look,
+            ));
             return;
         }
+        job.look_wait = None;
         let ready = job.ready.pop();
         let Some(Ready { input, root, front: Some(front), writer: Some(writer) }) = ready else {
             self.end(w, id, false, Some(ApiError::new("a build's view is not lowered", None)));
@@ -5789,6 +5809,9 @@ impl<S: Steps> Jobs<S> {
         let links = std::mem::take(&mut job.links);
         let worked = Worked {
             reran: stats.ran,
+            // What its history row took ([`Job::ended`], before this): the misses the
+            // history's thread explains, so 0 here is an empty summary there.
+            misses: job.missed,
             green: stats.cached + stats.joined,
             served: std::mem::take(&mut job.served),
             // The history's `build_id` of the same build ([`Job::row`]).
@@ -6173,6 +6196,14 @@ impl<S: Steps> Jobs<S> {
                 .map(|it| (it, true))
                 .or_else(|| job.durable.iter().next().map(|it| (it, false)));
             if let Some((ticket, stored)) = waiting {
+                if job.durable_wait.is_none() {
+                    job.durable_wait = Some(tracing::info_span!(
+                        target: "blaze",
+                        "the job's answer waits for the store's commit",
+                        ticket = %ticket,
+                        its_kept_front_end = stored,
+                    ));
+                }
                 let since = *job.durable_since.get_or_insert(w.now);
                 let Some(why) = gave_up(w.store, w.now, since, heard, judge) else { continue };
                 let what = match (stored, &job.stored_of) {
