@@ -118,7 +118,19 @@ fn grid(v: View<'_>, node: &Value, kids: &[&Value], depth: usize, b: &mut Budget
             row.set(want);
         }
         let cells = (0..n).map(|j| (format!("c{j}"), "hn.GenGridCell", r.get(j).copied()));
-        view::for_each_of(row, cells, |c, kid, _| children(c, kid.as_slice(), depth + 1, b));
+        view::for_each_of(row, cells, |c, kid, _| {
+            children(c, kid.as_slice(), depth + 1, b);
+            // A card in a cell fills the cell: the row is as tall as its tallest cell, and every card in it ends on the
+            // same line (a card that kept its own height left a ragged row).
+            if kid.is_some_and(|k| k["type"] == "Card")
+                && let Some(card) = c.part("g0")
+                && let Some(mut size) = card.entity().try_cloned::<&Size>()
+                && size.h != Sizing::GROW
+            {
+                size.h = Sizing::GROW;
+                card.set(size);
+            }
+        });
     });
 }
 

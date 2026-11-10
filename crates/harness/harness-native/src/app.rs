@@ -1773,8 +1773,8 @@ impl App {
     }
 
     /// The work bar (hn.WorkBar): while the chat in front works, a band along the window's top edge, placed by the
-    /// track's padding. With an estimate ([`Self::turn_estimate`]) it fills from the left as the turn nears it and
-    /// `eta` says about how long is left; with none, or past it, it sweeps. At rest it has no width. Drawn every frame
+    /// track's padding. With an estimate ([`Self::turn_estimate`]) it fills from the left as the turn nears it (the bar
+    /// alone: no words say a time); with none, or past it, it sweeps. At rest it has no width. Drawn every frame
     /// the display gives while it moves; under Reduce Motion a sweep is the whole hairline, still.
     fn step_work_bar(&mut self) {
         use harness_native_ui_layout_api::Padding;
@@ -1785,15 +1785,23 @@ impl App {
         let since = self.focused_chat().and_then(|(_, _, sid)| self.chats.borrow().get(&sid).filter(|t| t.busy).map(|t| t.turn_since));
         let busy = since.is_some() && whole >= 1.0;
         let still = harness_native_api::reduced(w);
-        // How far through the estimate the turn is, while it has not outrun it; and how long is left.
+        // How far along it is. A step that says so itself ("Checking blaze-core \u{b7} 132/388": a build, a test, a
+        // cell's `progress`) is the truth: that share, and how long is left at the rate it has gone. Else the estimate:
+        // how far through the middle length of finished turns this one is, while it has not outrun it.
+        let told = self.focused_chat().and_then(|(_, _, sid)| self.chats.borrow().get(&sid).and_then(step_share));
         let run = since.flatten().map(|from| model::now_ms().saturating_sub(from));
-        let toward = run.zip(self.turn_estimate()).filter(|(run, est)| run < est);
-        let mut left = String::new();
+        let toward = match told {
+            Some((done, total, started)) => {
+                let gone = started.map_or(0, |s| model::now_ms().saturating_sub(s));
+                // As if the whole took `whole` ms and `at` of it had gone.
+                let whole = if done > 0 { gone * total / done } else { 0 };
+                Some((gone.max(1), whole.max(gone + 1))).filter(|_| done > 0 && done < total)
+            }
+            None => run.zip(self.turn_estimate()).filter(|(run, est)| run < est),
+        };
         let pad = if !busy {
             Padding { l: whole, r: 0.0, t: 0.0, b: 0.0 }
         } else if let Some((run, est)) = toward {
-            let mins = (est - run).div_ceil(60_000);
-            left = if est - run < 45_000 { "under a minute".to_owned() } else { format!("about {mins} min") };
             Padding { l: 0.0, r: (whole * (1.0 - run as f32 / est as f32)).max(0.0), t: 0.0, b: 0.0 }
         } else if still {
             Padding::default()
@@ -1810,9 +1818,6 @@ impl App {
         };
         if track.entity().try_cloned::<&Padding>() != Some(pad) {
             track.set(pad);
-        }
-        if let Some(eta) = bar.part("foot").and_then(|f| f.part("eta")) {
-            eta.text(&left);
         }
         // It moves: every frame the display gives (a sweep at a calm rate steps visibly).
         if busy && !(still && toward.is_none()) {
@@ -2139,7 +2144,7 @@ impl App {
         crate::look::breathing(self.world.world_ref())
             || paint.shimmering
             || paint.blocks_live
-            || paint.sky_live
+            || paint.lantern_live
             || matches!(paint.kip_wake, harness_native_render::kips::Wake::Calm(_))
     }
 
@@ -2577,6 +2582,30 @@ fn done_mark(status: &str, code: Option<i32>, depth: usize) -> &'static str {
     }
 }
 
+/// The share of its work the running step of transcript `t` says it has done ("\u{2026} \u{b7} 132/388" in its words: a
+/// build's, a test's, a cell's `progress`): done, total and when the step began. None when no running step says.
+fn step_share(t: &model::chat::Transcript) -> Option<(u64, u64, Option<u64>)> {
+    use model::chat::Item;
+    let block = t.items.iter().rev().find_map(|i| match i {
+        Item::Tool { block, result: None, .. } => Some(block),
+        _ => None,
+    })?;
+    let e = t.details.get(block)?.effects.iter().rev().find(|e| e.status == "running")?;
+    let (done, total) = share_in(&e.doing)?;
+    Some((done, total, e.started_ms))
+}
+
+/// The last `done/total` in `words` ("Checking blaze-core \u{b7} 132/388"): digits either side of a slash, the total
+/// over 0 and at least the done.
+fn share_in(words: &str) -> Option<(u64, u64)> {
+    words.match_indices('/').rev().find_map(|(i, _)| {
+        let done: String = words[..i].chars().rev().take_while(char::is_ascii_digit).collect::<Vec<_>>().into_iter().rev().collect();
+        let total: String = words[i + 1..].chars().take_while(char::is_ascii_digit).collect();
+        let (done, total) = (done.parse::<u64>().ok()?, total.parse::<u64>().ok()?);
+        (total > 0 && done <= total).then_some((done, total))
+    })
+}
+
 /// What a working agent is doing now, from its transcript's last item: the words its tooltip leads with, and the
 /// detail its row trails (the command, the file, the pattern, the page): only what names a thing. A state alone
 /// (thinking, writing) trails nothing, since the row's dot already says it is at work.
@@ -2964,6 +2993,15 @@ mod tests {
         frame(z);
         frame(z);
         assert!((drawn(pill).y - laid(rows[2]).y).abs() > 1.0, "a selection still slides");
+    }
+
+    /// A step's own share is read from its words; a path or a date is not one.
+    #[test]
+    fn a_steps_share_is_read_from_its_words() {
+        assert_eq!(share_in("Checking blaze-core \u{b7} 132/388"), Some((132, 388)));
+        assert_eq!(share_in("Converting \u{b7} 0/12"), Some((0, 12)));
+        assert_eq!(share_in("Reading src/app.rs"), None);
+        assert_eq!(share_in("9/3 of them"), None);
     }
 
     /// The scene's sound reads whole: every step item has a cue, `ready` and `done` ring, and every mood of the ladder is there.
