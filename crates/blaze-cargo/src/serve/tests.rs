@@ -2458,9 +2458,10 @@ fn what_a_build_that_puts_nothing_left_settles_with_what_the_loop_put_before_it_
     PUTS_NOTHING.with_borrow_mut(String::clear);
 }
 
-/// The invariant: an answer may be sent on results not yet durable; nothing derived from that
-/// answer is reused across a crash unless its tickets were durable, and what is lost is said,
-/// never dropped silently and never a second answer.
+/// The daemon's side of the store model's invariant on answers sent before their results are
+/// durable (stated, with its controls, in `crates/blaze-storemodel/src/tests.rs`,
+/// `what_is_kept_after_an_answer_survives_any_crash_and_no_lost_value_is_served`): what is
+/// lost is said, never dropped silently and never a second answer.
 ///
 /// A store whose commit hangs (a sync that never returns) holds no build's answer: the build
 /// is answered at once, and what it left settles after. Once the store has answered nothing
@@ -3111,9 +3112,10 @@ fn outcome(
     (got.last().cloned(), app, kept)
 }
 
-/// The invariant: an answer may be sent on results not yet durable; nothing derived from that
-/// answer is reused across a crash unless its tickets were durable. After a crash at any turn,
-/// the restore serves no torn or half-kept value, and a build on it equals a fresh build.
+/// The daemon's side of the store model's invariant on answers sent before their results are
+/// durable (stated, with its controls, in `crates/blaze-storemodel/src/tests.rs`): after a
+/// crash at any turn, the restore serves no torn or half-kept value, and a build on it equals
+/// a fresh build.
 ///
 /// Rule 26, at every point: two checkouts build at once, so one's answer may rest on what the
 /// other put and has not made durable (a value read from the store carries no ticket); the
