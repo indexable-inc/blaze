@@ -37,6 +37,7 @@ mod crates;
 mod doctests;
 mod files;
 mod harness;
+pub mod places;
 #[cfg(test)]
 mod tests;
 

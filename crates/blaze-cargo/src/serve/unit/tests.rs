@@ -2789,3 +2789,128 @@ fn a_dependencys_staticlib_or_dylib_is_built_as_its_rlib_and_refused_where_asked
         assert!(none.contains("no `lib` or `rlib`"), "{none}");
     }
 }
+
+/// A file's text by name, for [`compile::placed_from`] and [`compile::replaced_from`].
+fn one_file(text: &'static str) -> impl Fn(&str) -> Option<String> {
+    move |name| (name == "src/lib.rs").then(|| text.to_owned())
+}
+
+/// A warning over `what` of `text` (its first), with a label over `label` and a suggestion
+/// that replaces `what`.
+fn warning_over(text: &str, what: &str, label: &str) -> blaze_diagnostics::Diag {
+    let span = |of: &str| {
+        let lo = text.find(of).unwrap_or_else(|| panic!("no `{of}` in the text")) as u32;
+        blaze_diagnostics::Span {
+            file: "src/lib.rs".to_owned(),
+            lo,
+            hi: lo + of.len() as u32,
+            expansion: None,
+        }
+    };
+    let mut diag = blaze_diagnostics::Diag::error(None, format!("unused: `{what}`"), span(what));
+    diag.span.labels.push((span(label), "here".to_owned()));
+    diag.suggestions.push(blaze_diagnostics::model::Suggestion {
+        message: "prefix it".to_owned(),
+        substitutions: vec![vec![(span(what), format!("_{what}"))]],
+        applicability: blaze_api::Applicability::MachineApplicable,
+        style: blaze_diagnostics::model::SuggestionStyle::ShowCode,
+    });
+    diag
+}
+
+const PLACED_BARE: &str = "fn f() {\n    let x = 1;\n    g();\n}\n";
+/// [`PLACED_BARE`] with what its narrow key does not see: a comment at each line's end, spaces
+/// before one, a comment after the last line.
+const PLACED_NOTED: &str =
+    "fn f() { // opens\n    let x = 1; // never read\n    g();  \n}\n// the end\n";
+
+/// What each span of `diags` covers of `text`, in the order they are met: the oracle of a
+/// replay, which shows the tokens the check pointed at.
+fn covered(diags: &[blaze_diagnostics::Diag], text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for diag in diags {
+        let spans = diag.span.primary.iter().chain(diag.span.labels.iter().map(|it| &it.0)).chain(
+            diag.suggestions.iter().flat_map(|it| it.substitutions.iter().flatten().map(|it| &it.0)),
+        );
+        for span in spans {
+            out.push(text.get(span.lo as usize..span.hi as usize).unwrap_or("<outside>").to_owned());
+        }
+    }
+    out
+}
+
+/// The invariant: a record's diagnostics kept as places, replayed over any text of the same
+/// code text (a comment at a line's end, spaces before one, a comment after the last line
+/// added or taken away), point at the very tokens the check pointed at, and over the text they
+/// were made of are the diagnostics the check gave, byte for byte, through the record's
+/// encoding.
+#[test]
+fn a_records_diagnostics_kept_as_places_point_at_the_same_tokens_in_every_text_of_its_key() {
+    let diags = vec![
+        warning_over(PLACED_BARE, "x", "let x = 1;"),
+        warning_over(PLACED_BARE, "g()", "g"),
+    ];
+    let pointed = covered(&diags, PLACED_BARE);
+    assert_eq!(pointed, ["x", "let x = 1;", "x", "g()", "g", "g()"]);
+    let placed = compile::placed_from(one_file(PLACED_BARE), span::Edition::CURRENT, &diags)
+        .expect("every span is of tokens of a file that is read");
+    // Through the record's encoding and back: the same value.
+    let bytes = blaze_protocol::cbor::to_vec(&placed).unwrap();
+    let restored: compile::Placed = blaze_protocol::cbor::from_slice(&bytes).unwrap();
+    assert_eq!(restored, placed);
+    assert_eq!(blaze_protocol::cbor::to_vec(&restored).unwrap(), bytes);
+    // Over the text they were made of: what the check gave.
+    assert_eq!(compile::replaced_from(one_file(PLACED_BARE), 0, &restored).unwrap(), diags);
+    // Over another text of the same code text: the same tokens, at other offsets.
+    let moved = compile::replaced_from(one_file(PLACED_NOTED), 0, &restored).unwrap();
+    assert_ne!(moved, diags);
+    assert_eq!(covered(&moved, PLACED_NOTED), pointed);
+    // And made of that text, replayed over the first: the same again.
+    let noted = vec![
+        warning_over(PLACED_NOTED, "x", "let x = 1;"),
+        warning_over(PLACED_NOTED, "g()", "g"),
+    ];
+    assert_eq!(moved, noted, "a replay is what a check of the text as it is gives");
+    let placed_noted =
+        compile::placed_from(one_file(PLACED_NOTED), span::Edition::CURRENT, &noted).unwrap();
+    assert_eq!(compile::replaced_from(one_file(PLACED_BARE), 0, &placed_noted).unwrap(), diags);
+}
+
+/// Shown at the offsets the record was made with, in a text whose comments moved them, a
+/// diagnostic points at other text: the oracle finds it.
+#[test]
+fn the_oracle_catches_a_diagnostic_rendered_at_stale_offsets() {
+    let diags = vec![warning_over(PLACED_BARE, "x", "let x = 1;")];
+    let placed =
+        compile::placed_from(one_file(PLACED_BARE), span::Edition::CURRENT, &diags).unwrap();
+    let pointed = covered(&diags, PLACED_BARE);
+    let replayed = compile::replaced_from(one_file(PLACED_NOTED), 0, &placed).unwrap();
+    assert_eq!(covered(&replayed, PLACED_NOTED), pointed);
+    // The planted bug: the kept diagnostics as they are, their offsets not found again.
+    assert_ne!(covered(&placed.diags, PLACED_NOTED), pointed);
+}
+
+/// What is not kept as places, so that its record is under the files it quotes or its whole
+/// key: a span into a comment, one over a comment (a suggestion may copy what it covers), and
+/// one in a file that is not read. A replay over a file that lacks a place is refused, naming
+/// the file.
+#[test]
+fn a_span_that_is_no_place_keeps_its_record_under_what_it_quotes() {
+    let edition = span::Edition::CURRENT;
+    let into = vec![warning_over(PLACED_NOTED, "opens", "fn")];
+    assert_eq!(compile::placed_from(one_file(PLACED_NOTED), edition, &into), None);
+    let over = vec![warning_over(PLACED_NOTED, "{ // opens\n    let x = 1;", "fn")];
+    assert_eq!(compile::placed_from(one_file(PLACED_NOTED), edition, &over), None);
+    let diags = vec![warning_over(PLACED_BARE, "x", "let x = 1;")];
+    assert_eq!(compile::placed_from(|_| None, edition, &diags), None);
+
+    let placed = compile::placed_from(one_file(PLACED_BARE), edition, &diags).unwrap();
+    let refused = compile::replaced_from(one_file("fn f() {}\n"), 3, &placed).unwrap_err();
+    assert!(
+        refused.what.contains("`src/lib.rs`") && refused.what.contains("unit 3"),
+        "{}",
+        refused.what
+    );
+    let unread = compile::replaced_from(|_| None, 3, &placed).unwrap_err();
+    assert!(unread.what.contains("no text of"), "{}", unread.what);
+}

@@ -20,10 +20,16 @@
 //! observe ([`blaze_lower::Narrowed`]) in place of its bytes. An edit of a comment no macro
 //! sees then finds the record, in the unit's own crate and in every crate it depends on; and
 //! for a unit that only checks, so does an edit of a body no other crate's check can read.
-//! Diagnostics quote their files (a line with its comments), which no narrow identity holds:
-//! a record with any is under the narrow key and the content of each file they point into
-//! ([`quoted_key`]), so only an edit of one of those files renders them again. Where a file
-//! they point into is not one of the view's, the record stays under the whole key.
+//! Diagnostics quote their files (a line with its comments), which no narrow identity holds.
+//! A record whose diagnostics are its check's, each span of them one the code text keeps
+//! exactly ([`blaze_lower::places`]), is under the narrow key too, and holds them as the
+//! check gave them with the place of each span's ends ([`Placed`]): a replay gives the spans
+//! their offsets in the files as they are and renders them from those files
+//! ([`replayed`]), so an edit of a comment in a file they quote renders them again and makes
+//! nothing again. A record with a span that is no such place (into a comment, to a file's
+//! end) is under the narrow key and the content of each file its diagnostics point into
+//! ([`quoted_key`]). Where a file they point into is not one of the view's, the record stays
+//! under the whole key.
 
 #![forbid(unsafe_code)]
 
@@ -103,6 +109,23 @@ struct Record {
     outputs: Vec<(String, Key, bool)>,
     artifact: Option<Artifact>,
     made: Made,
+    /// Its diagnostics, where `diagnostics` holds none of them: to be rendered from the files
+    /// as they are ([`replayed`]).
+    placed: Option<Placed>,
+}
+
+/// A record's diagnostics as its check gave them, kept in place of their rendering under
+/// the narrow key ([`placed`]): each span's ends are at a place every text of that key has
+/// them at ([`blaze_lower::places`]), so a replay finds their offsets in the files as they are
+/// and renders the diagnostics from those files.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub(crate) struct Placed {
+    /// The check's diagnostics cargo shows, in its order, their spans' offsets those of the
+    /// files as they were when the record was made.
+    pub(super) diags: Vec<Diag>,
+    /// Each file they point into, by the name they give it, sorted, with every offset a span
+    /// of theirs has in it and that offset's line and byte column, sorted by offset.
+    files: Vec<(String, Vec<(u32, u32, u32)>)>,
 }
 
 /// [`Record`] as it is written, borrowing what the compile made rather than copying it.
@@ -115,6 +138,7 @@ struct RecordRef<'a> {
     outputs: Vec<(&'a str, Key, bool)>,
     artifact: Option<&'a Artifact>,
     made: &'a Made,
+    placed: Option<&'a Placed>,
 }
 
 /// The domain of a record's key, and the record's format version: bumped by hand on any change
@@ -124,8 +148,9 @@ struct RecordRef<'a> {
 /// moves every key even unbumped; the bump says so by name. 9: keyed by
 /// [`crate::serve::RecordMakers`] in place of the executable's bytes. 10: a library's file
 /// names its crate by its narrowed identity where it has one ([`named_identity`]), and a
-/// record with no diagnostics is under the narrow key ([`narrow_key`]).
-const RECORD: &str = "blaze v2 cargo unit record 10";
+/// record with no diagnostics is under the narrow key ([`narrow_key`]). 11: a record holds
+/// its diagnostics rendered or as places ([`Placed`]).
+const RECORD: &str = "blaze v2 cargo unit record 11";
 const OUTPUT: &str = "blaze v2 cargo output 1";
 
 /// The store's key of an output file's `bytes`: what a record names it by, and what a dev
@@ -436,6 +461,215 @@ fn quoted_key(job: &Job, narrow: Key, names: &[String]) -> Option<Key> {
         hasher.part(name.as_bytes()).id(&content);
     }
     Some(Key(hasher.finish()))
+}
+
+/// Each span `diag` writes, to change: its own, its children's and its suggestions', and each
+/// macro call and definition they are in (as `blaze_diagnostics::emit` reads them).
+fn each_span_mut(diag: &mut Diag, f: &mut impl FnMut(&mut blaze_diagnostics::Span)) {
+    fn meet(span: &mut blaze_diagnostics::Span, f: &mut impl FnMut(&mut blaze_diagnostics::Span)) {
+        f(span);
+        if let Some(expansion) = span.expansion.as_deref_mut() {
+            if let Some(def) = &mut expansion.def_site {
+                meet(def, f);
+            }
+            meet(&mut expansion.call_site, f);
+        }
+    }
+    let Diag { span, children, suggestions, .. } = diag;
+    let multi = std::iter::once(span).chain(children.iter_mut().map(|it| &mut it.span));
+    for multi in multi {
+        for span in &mut multi.primary {
+            meet(span, f);
+        }
+        for (span, _) in &mut multi.labels {
+            meet(span, f);
+        }
+    }
+    for suggestion in suggestions {
+        for (span, _) in suggestion.substitutions.iter_mut().flatten() {
+            meet(span, f);
+        }
+    }
+}
+
+/// The text of the view's file the diagnostics name `name`; none for a name of a text that is
+/// not the file at its path, a file no mount holds, bytes that fail their check or are not
+/// UTF-8.
+fn quoted_text(job: &Job, name: &str) -> Option<String> {
+    if blaze_diagnostics::emit::names_text(name) {
+        return None;
+    }
+    let (_, _, bytes) = job.mounted.read(&job.mounted.absolute(name)).ok()??;
+    // alloc: a file's text, once per file a kept record's diagnostics point into
+    String::from_utf8(bytes.to_vec()).ok()
+}
+
+/// `diags`, a unit's check's (those cargo shows), as a record under the narrow key keeps
+/// them ([`Placed`]): none unless every span of theirs is in a file of the view and is one
+/// the code text keeps exactly ([`blaze_lower::places::places`], read with `edition`, the
+/// unit's crate's), in which case the record is under what its diagnostics quote
+/// ([`quoted_key`]) or its whole key, as before.
+fn placed(job: &Job, edition: ::span::Edition, diags: &[Diag]) -> Option<Placed> {
+    placed_from(|name| quoted_text(job, name), edition, diags)
+}
+
+/// [`placed`], each file's text as `read` gives it by the name the diagnostics give the file.
+pub(super) fn placed_from(
+    read: impl Fn(&str) -> Option<String>,
+    edition: ::span::Edition,
+    diags: &[Diag],
+) -> Option<Placed> {
+    // alloc: once per unit stored with diagnostics, what its record holds of them
+    let mut diags: Vec<Diag> =
+        diags.iter().filter(|it| !cargo_hides(&it.message)).cloned().collect();
+    // alloc: as above, a span each
+    let mut spans: Vec<(String, u32, u32)> = Vec::new();
+    for diag in &mut diags {
+        // clone: a file's name per span, once per unit stored with diagnostics
+        each_span_mut(diag, &mut |span| spans.push((span.file.clone(), span.lo, span.hi)));
+    }
+    spans.sort_unstable();
+    spans.dedup();
+    let mut files: Vec<(String, Vec<(u32, u32, u32)>)> = Vec::new(); // alloc: as above
+    for of_file in spans.chunk_by(|a, b| a.0 == b.0) {
+        let name = &of_file[0].0;
+        let text = read(name)?;
+        let ends: Vec<(u32, u32)> = of_file.iter().map(|it| (it.1, it.2)).collect(); // alloc: as above
+        let places = blaze_lower::places::places(&text, edition, &ends)?;
+        let mut offsets: Vec<(u32, u32, u32)> = ends
+            .iter()
+            .zip(&places)
+            .flat_map(|(&(lo, hi), (at_lo, at_hi))| {
+                [(lo, at_lo.line, at_lo.column), (hi, at_hi.line, at_hi.column)]
+            })
+            .collect(); // alloc: as above
+        offsets.sort_unstable();
+        offsets.dedup();
+        files.push((name.clone(), offsets)); // clone: as above
+    }
+    Some(Placed { diags, files })
+}
+
+/// The diagnostics `placed` holds with each span's offsets those of its file as the job's
+/// view has it: the offset of the place the record keeps for it
+/// ([`blaze_lower::places::offset_of`]). The record was found under its narrow key, which
+/// every text with those tokens at those places has, so a file that lacks one, or that can't
+/// be read, is an error naming the file and the place: the key failed to cover it (rule 21),
+/// and nothing is rendered from other offsets (rule 3).
+fn replaced(job: &Job, unit: usize, placed: &Placed) -> Result<Vec<Diag>, ApiError> {
+    replaced_from(|name| quoted_text(job, name), unit, placed)
+}
+
+/// [`replaced`], each file's text as `read` gives it now.
+pub(super) fn replaced_from(
+    read: impl Fn(&str) -> Option<String>,
+    unit: usize,
+    placed: &Placed,
+) -> Result<Vec<Diag>, ApiError> {
+    let failed = |name: &str, why: String| {
+        // alloc: error path
+        ApiError::new(
+            format!(
+                "unit {unit}: the diagnostics its record keeps point into `{name}`, {why}; its record's key                  says the file's code is as it was when they were made"
+            ),
+            Some(name.to_owned()),
+        )
+    };
+    // alloc: once per record replayed with diagnostics, an offset each
+    let mut moved: Vec<(&str, Vec<(u32, u32)>)> = Vec::with_capacity(placed.files.len());
+    for (name, offsets) in &placed.files {
+        let Some(text) = read(name) else {
+            return Err(failed(name, "which the view has no text of".to_owned())); // alloc: error path
+        };
+        let mut now = Vec::with_capacity(offsets.len()); // alloc: as above
+        for &(was, line, column) in offsets {
+            let place = blaze_lower::places::Place { line, column };
+            let Some(at) = blaze_lower::places::offset_of(&text, place) else {
+                // alloc: error path
+                return Err(failed(
+                    name,
+                    format!("which has nothing at line {}, byte column {column}", line + 1),
+                ));
+            };
+            now.push((was, at));
+        }
+        moved.push((name.as_str(), now));
+    }
+    let mut diags = placed.diags.clone(); // clone: the diagnostics to render, once per replay
+    let mut lost = None;
+    for diag in &mut diags {
+        each_span_mut(diag, &mut |span| {
+            let of_file = moved.iter().find(|it| it.0 == span.file).map(|it| &it.1);
+            let at = |was: u32| {
+                let offsets = of_file?;
+                offsets.binary_search_by_key(&was, |it| it.0).ok().map(|found| offsets[found].1)
+            };
+            match (at(span.lo), at(span.hi)) {
+                (Some(lo), Some(hi)) => (span.lo, span.hi) = (lo, hi),
+                // clone: error path
+                _ => lost = lost.take().or(Some(span.file.clone())),
+            }
+        });
+    }
+    match lost {
+        // alloc: error path
+        Some(name) => Err(failed(&name, "a span of which the record keeps no place of".to_owned())),
+        None => Ok(diags),
+    }
+}
+
+/// What a replay of a record that keeps its diagnostics as places shows: they with their
+/// offsets in the files as they are ([`replaced`]), rendered from those files as a unit made
+/// renders its own ([`rendered`]).
+fn replayed(job: &Job, unit: usize, placed: &Placed) -> Result<Vec<Diagnostic>, ApiError> {
+    let diags = replaced(job, unit, placed)?;
+    let mut sources = blaze_diagnostics::emit::Sources::default();
+    job.mounted.add_sources(&mut sources, &diags);
+    rendered(job, unit, &diags, &sources)
+}
+
+/// How the job's diagnostics are written: in its colour, at its width, short or not.
+fn style(job: &Job) -> blaze_diagnostics::emit::Style {
+    let mut style = blaze_diagnostics::emit::Style {
+        ansi: job.input.color,
+        short: job.input.short,
+        ..Default::default()
+    };
+    if let Some(width) = job.input.width {
+        style.width = usize::try_from(width).unwrap_or(usize::MAX);
+    }
+    style
+}
+
+/// `diags` as cargo shows them, rendered from `sources`, the text of each file they point
+/// into, in the job's style (its colour, its width, short or not): a unit made's and a
+/// replayed record's alike. A span that can't be placed in its file is the error, naming the
+/// diagnostic.
+fn rendered(
+    job: &Job,
+    unit: usize,
+    diags: &[Diag],
+    sources: &blaze_diagnostics::emit::Sources,
+) -> Result<Vec<Diagnostic>, ApiError> {
+    let u = job.unit(unit)?;
+    let unit_of = job.unit_of(unit)?;
+    let style = style(job);
+    diags
+        .iter()
+        .filter(|it| !cargo_hides(&it.message))
+        .map(|it| {
+            blaze_diagnostics::api::diagnostic(it, sources, style, Some(unit_of.clone()))
+                // alloc: error path, naming the diagnostic whose span can't be placed
+                .map_err(|why| {
+                    format!(
+                        "{why}, in the diagnostic `{}`",
+                        it.message.lines().next().unwrap_or_default()
+                    )
+                })
+        })
+        .collect::<Result<_, _>>()
+        // clone: the unit's name, on the error path
+        .map_err(|why| ApiError::new(why, Some(u.target.name.clone())))
 }
 
 fn work_out_key(job: &Job, unit: usize, identity: ContentId) -> Result<Key, ApiError> {
@@ -1550,8 +1784,13 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Re
         let miss = missed(job, reader, unit);
         lock(slot).misses.push(miss);
     }
-    if let Some(Kept { record, mut puts, profiles }) = kept {
+    if let Some(Kept { mut record, mut puts, profiles }) = kept {
         puts.extend(library_puts(job));
+        // Its diagnostics kept as places are rendered from the files as they are.
+        if let Some(placed) = record.placed.take() {
+            let _span = tracing::info_span!(target: "blaze", "unit diagnostics replay").entered();
+            record.diagnostics = replayed(job, unit, &placed)?;
+        }
         // What its build did with its profiles, as the record says: counted for this job's
         // check that a profile applied to something ([`codegen::unapplied`]).
         if let Some(slot) = job.counted.get(unit) {
@@ -2087,9 +2326,21 @@ fn store(
     // check's, under the narrow key and what they quote ([`quoted_key`]), their files' names
     // put in the slot a lookup reads; else under the whole one.
     let narrow = narrow_key(job, unit)?;
+    // Its diagnostics as places, where all of them are its check's and each span is one the
+    // code text keeps exactly: the record is then under the narrow key, as one with none is.
+    let kept_placed = match (narrow, &quoted, &phases.diags) {
+        (Some(_), Some((count, _)), Some(diags))
+            if *count == diagnostics.len() && !diagnostics.is_empty() =>
+        {
+            let _span = tracing::info_span!(target: "blaze", "unit diagnostics places").entered();
+            placed(job, krate.data(reader.db()).edition, diags)
+                .filter(|it| it.diags.len() == diagnostics.len())
+        }
+        _ => None,
+    };
     let mut quotes_put = None;
     let key = match (narrow, quoted) {
-        (Some(narrow), _) if diagnostics.is_empty() => Some(narrow),
+        (Some(narrow), _) if diagnostics.is_empty() || kept_placed.is_some() => Some(narrow),
         (Some(narrow), Some((count, names))) if count == diagnostics.len() => {
             let slot = quotes_slot(narrow);
             // The slot as the store has it: one already there with other names (the check's
@@ -2256,7 +2507,11 @@ fn store(
             ok: compiled.ok,
             open: compiled.open,
             why: compiled.why.as_deref(),
-            diagnostics: &compiled.diagnostics,
+            diagnostics: match kept_placed {
+                Some(_) => &[],
+                None => compiled.diagnostics.as_slice(),
+            },
+            placed: kept_placed.as_ref(),
             outputs: compiled
                 .outputs
                 .iter()
@@ -2655,30 +2910,8 @@ fn assemble(
         sources.add(name, Some(text.clone()));
     }
     mounted.add_sources(&mut sources, diags);
-    let mut style = blaze_diagnostics::emit::Style {
-        ansi: color,
-        short: job.input.short,
-        ..Default::default()
-    };
-    if let Some(width) = job.input.width {
-        style.width = usize::try_from(width).unwrap_or(usize::MAX);
-    }
-    let mut diagnostics: Vec<Diagnostic> = diags
-        .iter()
-        .filter(|it| !cargo_hides(&it.message))
-        .map(|it| {
-            blaze_diagnostics::api::diagnostic(it, &sources, style, Some(unit_of.clone()))
-                // alloc: error path, naming the diagnostic whose span can't be placed
-                .map_err(|why| {
-                    format!(
-                        "{why}, in the diagnostic `{}`",
-                        it.message.lines().next().unwrap_or_default()
-                    )
-                })
-        })
-        .collect::<Result<_, _>>()
-        // clone: the unit's name, on the error path
-        .map_err(|why| ApiError::new(why, Some(u.target.name.clone())))?;
+    let style = style(job);
+    let mut diagnostics: Vec<Diagnostic> = rendered(job, unit, diags, &sources)?;
     drop(rendering);
     // What those were rendered from beside the check's own result: every file it points into.
     let quoted: (usize, Vec<String>) = (
