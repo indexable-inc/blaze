@@ -1167,6 +1167,35 @@ fn rows_nested(t: &Transcript, shows: Shows<'_>) -> (Vec<(String, Row)>, HashSet
                 }
             }
         }
+        // A page a step opened or drove in the harness browser (its shown value, steps::value_outs) is what the turn did
+        // for the person, not how: its live card shows under the turn while the steps are folded away (opened, each
+        // step shows its own). One card a view, where the turn left it.
+        if !open {
+            let blocks = rest.iter().flat_map(|p| match p {
+                Piece::Item(n) => vec![*n],
+                Piece::Run(r) => r.items.clone(),
+            });
+            let mut pages: Vec<(u64, &Value)> = Vec::new(); // alloc: a turn's pages, a handful
+            for n in blocks {
+                let Item::Tool { block, .. } = &t.items[n] else { continue };
+                let Some(d) = t.details.get(block) else { continue };
+                // A cell that drew shows its own view; it places its pages itself.
+                if !empty_value(&d.ui) {
+                    continue;
+                }
+                for e in &d.effects {
+                    if e.value["t"] == "browser"
+                        && let Some(view) = genui::browser_view_id(&e.value["view"])
+                    {
+                        pages.retain(|(v, _)| *v != view);
+                        pages.push((view, &e.value));
+                    }
+                }
+            }
+            for (view, v) in pages {
+                out.push((format!("{key}.page{view}"), Row::Ui { v: Arc::new(genui::shown_card(v)), cell: String::new(), block: String::new(), code: false }));
+            }
+        }
         if last {
             out.extend(line);
         }
