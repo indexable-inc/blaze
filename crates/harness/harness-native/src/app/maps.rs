@@ -42,7 +42,9 @@ pub struct MapCard {
     pub spec: String,
 }
 
-/// One place: where it is, its pin's title and the line under it, and the page a press on its callout opens.
+/// One place: where it is, its pin's title and the line under it, the page a press on its callout opens, and which
+/// place of Apple Maps it is (`place`, an `MKMapItem`'s identifier such as "I8EE01663EF4733A0"; empty when unknown): a
+/// pin that says so shows Apple's own place card when pressed.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Pin {
     pub lat: f64,
@@ -50,6 +52,7 @@ pub struct Pin {
     pub label: String,
     pub detail: String,
     pub href: String,
+    pub place: String,
 }
 
 /// What a map shows: its pins, the person's place, and where it looks (`center` and `zoom` as said, else fitted).
@@ -96,11 +99,11 @@ impl Places {
                     let Some([lat, lon]) = coords(&m["lat"], &m["lon"]) else {
                         let said: String = m.to_string().chars().take(48).collect();
                         return Err(format!(
-                            "<Map> markers[{i}] is {said}, not a place {{lat, lon, label?, detail?, href?}} (a latitude from -90 to 90, a longitude from -180 to 180)"
+                            "<Map> markers[{i}] is {said}, not a place {{lat, lon, label?, detail?, href?, place?}} (a latitude from -90 to 90, a longitude from -180 to 180)"
                         ));
                     };
                     let words = |name: &str| m[name].as_str().unwrap_or("").to_owned();
-                    out.pins.push(Pin { lat, lon, label: words("label"), detail: words("detail"), href: words("href") });
+                    out.pins.push(Pin { lat, lon, label: words("label"), detail: words("detail"), href: words("href"), place: words("place") });
                 }
             }
             v => {
@@ -194,7 +197,8 @@ mod tests {
     /// One place alone is shown a few streets wide, never at the deepest zoom; places apart are all inside the span.
     #[test]
     fn a_fit_holds_every_place() {
-        let one = Places::parse(&serde_json::json!({"markers": [{"lat": 34.1, "lon": -118.1, "label": "A"}]})).unwrap();
+        let one = Places::parse(&serde_json::json!({"markers": [{"lat": 34.1, "lon": -118.1, "label": "A", "place": "I8EE01663EF4733A0"}]})).unwrap();
+        assert_eq!((one.pins[0].place.as_str(), one.pins[0].href.as_str()), ("I8EE01663EF4733A0", ""));
         assert_eq!(one.region(800.0, 480.0), ([34.1, -118.1], span_of(NEAR_ZOOM, 800.0, 480.0, 34.1)));
         let two = Places::parse(&serde_json::json!({"markers": [{"lat": 34.0, "lon": -118.0}, {"lat": 36.0, "lon": -122.0}], "here": [35.0, -120.0]})).unwrap();
         let (c, span) = two.region(800.0, 480.0);
