@@ -1332,7 +1332,7 @@ impl Painter {
         }
         if let Some(s) = e.try_cloned::<&Starfield>() {
             if s.on {
-                self.sky.paint(d, rect, alpha, dark, time);
+                self.sky.paint(d, rect, alpha, dark, sc, time);
             }
             return Ok(());
         }
