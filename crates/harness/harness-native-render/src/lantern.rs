@@ -4,7 +4,8 @@
 //! here, never read from a file.
 //!
 //! The candle's level changes a few times a second in three steps (steady mostly, a dip now and then); with it the
-//! paper's brightness, the halo's reach and the pool of light under it. The host draws it at its calm rate while it is
+//! paper's brightness, the halo's reach and the pool of light under it. It lights when it first shows and, put out (the
+//! first message), its flame sinks and it fades: never there or gone in a frame. The host draws it at its calm rate while it is
 //! in view. In the light appearance it draws nothing: a lit lantern on paper is no light at all.
 use crate::draw::Draw;
 use crate::pack::ImageInst;
@@ -33,8 +34,8 @@ fn hash(n: u32) -> f32 {
 /// The flame's level at `step`: full mostly, a little low sometimes, a dip now and then.
 fn flame(step: u32) -> f32 {
     match hash(step) {
-        r if r > 0.93 => 0.72,
-        r if r > 0.7 => 0.88,
+        r if r > 0.93 => 0.75,
+        r if r > 0.7 => 0.9167,
         _ => 1.0,
     }
 }
@@ -85,42 +86,79 @@ fn render(f: f32) -> Vec<u8> {
     px
 }
 
-/// The lantern's picture at each flame level drawn so far.
+/// Seconds the lantern takes to light when it first shows, and to go out when it is put out: its flame sinks, its
+/// light draws in, and over the last [`GONE`] of them the lantern itself fades.
+const LIGHT: f32 = 0.7;
+const OUT: f32 = 1.6;
+const GONE: f32 = 0.5;
+
+/// The lanterns in view: each one's state (lit or put out, and since when), and the picture at each flame level drawn
+/// so far.
 #[derive(Default)]
 pub struct Lanterns {
     made: Vec<(u32, Rc<[u8]>)>,
+    /// By node: whether it is lit, and the frame time that began.
+    seen: Vec<(u64, bool, f32)>,
     /// A lantern was painted this frame: its flame moves.
     live: bool,
 }
 
 impl Lanterns {
-    /// Paint the lantern in the middle of `rect`, a little above its centre, at frame time `time`: [`TEXEL`] points a
-    /// texel on whole device pixels (`sc` a point). Nothing in the light appearance, or in a pane too small for it.
-    pub fn paint(&mut self, d: &mut Draw, rect: [f32; 4], alpha: f32, dark: bool, sc: f32, time: f32) {
+    /// Paint node `id`'s lantern (lit while `on`) in the middle of `rect`, a little above its centre, at frame time
+    /// `time`: [`TEXEL`] points a texel on whole device pixels (`sc` a point). It lights over [`LIGHT`] seconds and,
+    /// put out, goes over [`OUT`]: never there or gone in a frame. Nothing in the light appearance, or in a pane too
+    /// small for it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn paint(&mut self, d: &mut Draw, id: u64, on: bool, rect: [f32; 4], alpha: f32, dark: bool, sc: f32, time: f32) {
         let cell = (TEXEL * sc).round().max(1.0) / sc;
         let (w, h) = (W as f32 * cell, H as f32 * cell);
         if !dark || rect[2] < w || rect[3] < h * 1.2 {
             return;
         }
-        let f = flame((time.max(0.0) * FPS) as u32);
-        let key = (f * 100.0) as u32;
+        let since = match self.seen.iter_mut().find(|s| s.0 == id) {
+            Some(s) => {
+                if s.1 != on {
+                    (s.1, s.2) = (on, time);
+                }
+                time - s.2
+            }
+            // First seen put out: there is nothing to put out. First seen lit: it lights.
+            None if !on => return,
+            None => {
+                self.seen.push((id, true, time)); // alloc: one entry a lantern in view
+                0.0
+            }
+        };
+        // How high the flame stands (1: lit) and how much of the lantern shows.
+        let (stand, show) = if on { ((since / LIGHT).min(1.0), (since / (LIGHT * 0.5)).min(1.0)) } else { ((1.0 - since / (OUT - GONE)).max(0.0), ((OUT - since) / GONE).clamp(0.0, 1.0)) };
+        if show <= 0.0 {
+            return;
+        }
+        let f = flame((time.max(0.0) * FPS) as u32) * stand;
+        // In twelfths, so a lighting or a going out is a dozen pictures, not one a frame.
+        let key = (f * 12.0).round() as u32;
         let texels = match self.made.iter().find(|(k, _)| *k == key) {
             Some((_, p)) => p.clone(),
             None => {
-                let p: Rc<[u8]> = render(f).into();
-                self.made.push((key, p.clone())); // alloc: three pictures, one a flame level
+                let p: Rc<[u8]> = render(key as f32 / 12.0).into();
+                self.made.push((key, p.clone())); // alloc: at most thirteen pictures, one a flame level
                 p
             }
         };
         self.live = true;
         let snap = |v: f32| (v * sc).round() / sc;
         let at = [snap(rect[0] + (rect[2] - w) * 0.5), snap(rect[1] + (rect[3] - h) * 0.42), w, h];
-        d.image(ImageInst { rect: at, size: [W as f32, H as f32, alpha, 0.0], clip: [0.0; 4], clipx: [0.0; 4], light: [0.0; 4], hdr: [0.0; 4] }, texels);
+        d.image(ImageInst { rect: at, size: [W as f32, H as f32, alpha * show, 0.0], clip: [0.0; 4], clipx: [0.0; 4], light: [0.0; 4], hdr: [0.0; 4] }, texels);
     }
 
-    /// After a frame: whether a lantern was painted in it (the host keeps drawing, at its calm rate).
+    /// After a frame: whether a lantern was painted in it (the host keeps drawing, at its calm rate). With none
+    /// painted, what was known of them is let go.
     pub fn end_frame(&mut self) -> bool {
-        std::mem::take(&mut self.live)
+        let live = std::mem::take(&mut self.live);
+        if !live {
+            self.seen.clear();
+        }
+        live
     }
 }
 
@@ -132,7 +170,7 @@ mod tests {
     /// past the paper, and a dip of the flame dims it.
     #[test]
     fn the_lantern_is_lit_and_flickers() {
-        let (full, low) = (render(1.0), render(0.72));
+        let (full, low) = (render(1.0), render(0.75));
         let at = |p: &[u8], x: usize, y: usize| [p[(y * W + x) * 4], p[(y * W + x) * 4 + 1], p[(y * W + x) * 4 + 2], p[(y * W + x) * 4 + 3]];
         assert_eq!(at(&full, 0, 0)[3], 0, "the corner is not clear");
         let mid = at(&full, CX as usize, CY as usize);
@@ -141,5 +179,9 @@ mod tests {
         assert!(halo > 400, "{halo} texels of light round it");
         assert!(full != low, "a dip changes nothing");
         assert!([0, 1, 2, 50].map(flame).iter().all(|f| (0.7..=1.0).contains(f)));
+        // Put out, the flame is gone: no light round it, the paper dark.
+        let out = render(0.0);
+        assert!(out.chunks_exact(4).filter(|p| p[3] > 0 && p[3] < 255).count() < 40, "light round a lantern that is out");
+        assert!(at(&out, CX as usize, CY as usize)[0] < 200);
     }
 }
