@@ -103,7 +103,7 @@ impl Machine {
         // upgraded while an older daemon ran, or two pinned versions on one machine, stopped
         // every build with "is of layout 1, and this blaze reads layout 2"). Daemons of two
         // layouts then share no budget; each is still held by its own ceiling.
-        let path = dir.join(format!("machine.{}", blaze_graph::ledger::FORMAT)); // alloc: the path, once a daemon start
+        let path = ledger_path(&dir);
         let file = crate::socket::private_file(
             OpenOptions::new().read(true).write(true).create(true).truncate(false),
             &path,
@@ -455,6 +455,13 @@ fn says_of(says: &mut String, me: Process, ledger: &Ledger<'_>, allowance: &Allo
     }
 }
 
+/// The ledger's file in `dir`, named by its layout (`machine.2`): what [`Machine::join`] opens.
+/// The name before layouts were in it was `machine`; no layout's name is another's, so a
+/// blaze never opens, refuses or writes over a file another layout's daemons share.
+fn ledger_path(dir: &Path) -> PathBuf {
+    dir.join(format!("machine.{}", blaze_graph::ledger::FORMAT)) // alloc: the path, once a daemon start
+}
+
 fn user() -> u32 {
     // SAFETY: `geteuid` takes nothing, touches no memory of the caller's and can't fail.
     unsafe { libc::geteuid() }
@@ -462,4 +469,71 @@ fn user() -> u32 {
 
 fn gib(bytes: u64) -> f64 {
     bytes as f64 / f64::from(1u32 << 30)
+}
+
+#[cfg(test)]
+mod tests {
+    use blaze_graph::ledger::FORMAT;
+
+    use super::*;
+
+    /// A ledger of the layout before this one, as its blaze wrote it.
+    fn previous_layout() -> [u8; LEN] {
+        let mut bytes = [0; LEN];
+        Ledger::empty(Path::new("/previous")).encode(&mut bytes);
+        bytes[8..12].copy_from_slice(&(FORMAT - 1).to_le_bytes());
+        bytes
+    }
+
+    fn open(path: &Path) -> File {
+        OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path).unwrap()
+    }
+
+    /// The bug this guards (2026-11-10): layout 2 kept layout 1's file name, so a new blaze
+    /// beside an older daemon's `/tmp/blaze-<uid>/machine` refused to start. A file of the
+    /// previous layout, under either name a previous blaze gave it, is not the file this blaze
+    /// opens, and this blaze's writes leave its bytes as they were.
+    #[test]
+    fn a_file_of_the_previous_layout_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let ours = ledger_path(dir.path());
+        let theirs = [dir.path().join("machine"), dir.path().join(format!("machine.{}", FORMAT - 1))];
+        assert_eq!(ours, dir.path().join(format!("machine.{FORMAT}")), "the name carries the layout");
+        let old = previous_layout();
+        for path in &theirs {
+            assert_ne!(&ours, path);
+            std::fs::write(path, old).unwrap();
+        }
+        let file = open(&ours);
+        let mut bytes = [0; LEN];
+        let ledger = read(&file, &ours, &mut bytes).expect("a new file is an empty ledger");
+        assert_eq!(ledger.records().count(), 0);
+        let mut out = [0; LEN];
+        write(&file, &ours, &ledger, &mut out).unwrap();
+        for path in &theirs {
+            assert_eq!(std::fs::read(path).unwrap(), old, "{} was written over", path.display());
+        }
+    }
+
+    /// Bytes of the previous layout under this layout's name (a copy, a restore of `/tmp`) are
+    /// refused naming the file, both layouts and what to do, never read as this layout's.
+    #[test]
+    fn a_file_of_the_previous_layout_is_refused_by_name_under_this_layouts_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let ours = ledger_path(dir.path());
+        std::fs::write(&ours, previous_layout()).unwrap();
+        let mut bytes = [0; LEN];
+        let said = match read(&open(&ours), &ours, &mut bytes) {
+            Ok(_) => panic!("layout {} read as layout {FORMAT}", FORMAT - 1),
+            Err(error) => format!("{error:#}"),
+        };
+        let path = ours.display().to_string();
+        assert!(
+            said.contains(&path)
+                && said.contains(&format!("layout {}", FORMAT - 1))
+                && said.contains(&format!("layout {FORMAT}"))
+                && said.contains(&format!("remove {path}")),
+            "{said}"
+        );
+    }
 }
