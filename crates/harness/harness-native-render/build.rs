@@ -18,15 +18,21 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=shaders");
     println!("cargo:rerun-if-env-changed=SLANGC");
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
-        panic!("harness-native-render is macOS only (AppKit + Metal)");
-    }
+    // The SDK whose Metal compiler builds the library: the Mac's, an iPhone's, or the iOS simulator's.
+    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let abi = std::env::var("CARGO_CFG_TARGET_ABI").unwrap_or_default();
+    let sdk = match (os.as_str(), abi.as_str()) {
+        ("macos", _) => "macosx",
+        ("ios", "sim") => "iphonesimulator",
+        ("ios", _) => "iphoneos",
+        _ => panic!("harness-native-render draws with Metal: it builds for macOS and iOS, not {os}"),
+    };
     for name in SHADERS {
-        slang(&out, name);
+        slang(&out, name, sdk);
     }
 }
 
-fn slang(out: &Path, name: &str) {
+fn slang(out: &Path, name: &str, sdk: &str) {
     let src = PathBuf::from(format!("shaders/{name}.slang"));
     let text =
         std::fs::read_to_string(&src).unwrap_or_else(|e| panic!("read {}: {e}", src.display()));
@@ -45,7 +51,7 @@ fn slang(out: &Path, name: &str) {
     let air = out.join(format!("{name}.air"));
     run(
         Command::new("xcrun")
-            .args(["-sdk", "macosx", "metal", "-c", "-std=metal3.1", "-ffast-math"])
+            .args(["-sdk", sdk, "metal", "-c", "-std=metal3.1", "-ffast-math"])
             .arg(&msl)
             .arg("-o")
             .arg(&air),
@@ -53,7 +59,7 @@ fn slang(out: &Path, name: &str) {
     );
     run(
         Command::new("xcrun")
-            .args(["-sdk", "macosx", "metallib"])
+            .args(["-sdk", sdk, "metallib"])
             .arg(&air)
             .arg("-o")
             .arg(out.join(format!("{name}.metallib"))),
