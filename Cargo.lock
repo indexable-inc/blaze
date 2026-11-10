@@ -693,6 +693,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-client"
+version = "0.0.0"
+dependencies = [
+ "blaze-api",
+ "blaze-core",
+ "blaze-protocol",
+ "blaze-report",
+ "blaze-rng",
+ "hegeltest",
+ "libc",
+ "serde",
+ "sonic-rs",
+ "tracing",
+]
+
+[[package]]
+name = "blaze-client-c"
+version = "0.0.0"
+dependencies = [
+ "blaze-api",
+ "blaze-client",
+ "blaze-protocol",
+]
+
+[[package]]
 name = "blaze-codegen"
 version = "0.0.0"
 dependencies = [
@@ -1569,6 +1594,15 @@ dependencies = [
  "blaze-units",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "blaze-napi"
+version = "0.0.0"
+dependencies = [
+ "blaze-api",
+ "blaze-client",
+ "crossbeam-channel",
 ]
 
 [[package]]
