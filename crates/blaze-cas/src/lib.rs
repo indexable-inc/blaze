@@ -3919,15 +3919,6 @@ impl Store {
             // clone: the effect owns its file name; once per pack a commit
             effects.push(Effect::Truncate { file: pack.file.clone(), len: pack.committed, tag });
             steps += 1;
-            // Its checks cut to those of what is committed: a torn append of an earlier commit
-            // that failed, or that a crash cut short, goes before this one's are written.
-            let tag = self.tags.ask(Op::TruncateChecks { pack: at });
-            effects.push(Effect::Truncate {
-                file: own.file(&disk::checks_file(at)),
-                len: checks::len_of(pack.committed),
-                tag,
-            });
-            steps += 1;
         }
         for content in &externals {
             let external = &own.externals[content];
@@ -4064,6 +4055,32 @@ impl Store {
                     // clone: the effect owns its file name; once per pack a commit
                     effects.push(Effect::Sync { file: own.packs[*pack].file.clone(), tag });
                     commit.steps += usize::from(waited);
+                    if !waited {
+                        // The planted commit waits for no sync: its checks follow the write.
+                        let tag = self.tags.ask(Op::TruncateChecks { pack: *pack });
+                        effects.push(Effect::Truncate {
+                            file: own.file(&disk::checks_file(*pack)),
+                            len: checks::len_of(own.packs[*pack].committed),
+                            tag,
+                        });
+                        commit.steps += 1;
+                    }
+                }
+            }
+            // A pack's checks follow its own sync, one effect at a time: cut to those of what
+            // is committed (a torn append of an earlier commit that failed, or that a crash cut
+            // short, goes first), written, synced. In a chain behind the pack rather than beside
+            // it, so the store model's search over a commit's orders stays within its bound
+            // (docs/v2/plan/design/store-pool.md, lane 4b).
+            (Op::Sync { pack }, Done::Synced) => {
+                if commit.failed.is_none() {
+                    let tag = self.tags.ask(Op::TruncateChecks { pack: *pack });
+                    effects.push(Effect::Truncate {
+                        file: own.file(&disk::checks_file(*pack)),
+                        len: checks::len_of(own.packs[*pack].committed),
+                        tag,
+                    });
+                    commit.steps += 1;
                 }
             }
             (Op::TruncateChecks { pack }, Done::Truncated) => {
@@ -4089,7 +4106,7 @@ impl Store {
                     commit.steps += usize::from(waited);
                 }
             }
-            (Op::Sync { .. } | Op::SyncChecks { .. }, Done::Synced)
+            (Op::SyncChecks { .. }, Done::Synced)
             | (Op::WriteExternal { .. } | Op::WriteIndex, Done::Written) => {}
             (Op::WriteHead, Done::Written) => return self.finish_commit(effects),
             (op, done) => {

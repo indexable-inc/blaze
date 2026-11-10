@@ -883,8 +883,8 @@ is next. Lane 5 waits on 4b and on admission by footprint reaching main.
      `WriteFrom`, sync, then the flip, with crashes through it) and planted bug 8.
    - **4b. The store's port.** Built in part on fast-storepool-1110; the reads are not.
      - Built: `checks-<n>` and `FORMAT` 4 (`crates/blaze-cas/src/checks.rs`). A commit cuts each
-       written pack's checks to those committed, writes the new blocks' checks and syncs them
-       before the head; the open reads each pack's checks whole, refuses a file that holds fewer
+       written pack's checks to those committed, writes the new blocks' checks and syncs them,
+       after the pack's own sync and before the head; the open reads each pack's checks whole, refuses a file that holds fewer
        than the head names, and checks every block its recovery scan reads; a removed pack's
        checks go with it. Each pack's checks stay in memory (`Pack::checks`) for the loads core
        (`Opened::checks`). Its crash test, the oracle's rule for the checks and planted bug 7
@@ -895,12 +895,29 @@ is next. Lane 5 waits on 4b and on admission by footprint reaching main.
        writing with `WriteFrom`. `Pinned` as pins, `Reader::read` with a `PinSet` and the
        optimistic copy of short records (section 1), and `Tail::Hot` set for a pack written in the
        last two commits.
-     - Decided before the reads move, since the design above leaves them open: how a store
-       driven by `Sim` (no loader thread) loads a miss, since its tests read synchronously right
-       after driving effects (238 reads in `tests.rs`); what carries a task's pins behind
-       `Entry<'g>` (the store's guard, or a `PinSet` every caller passes); how `Config` names
-       the loader's driver; and `ReadInto`/`WriteFrom` in blaze-storemodel's crash file system
-       (`crates/blaze-storemodel/src/fs.rs`), which has no rule for them.
+     - Decided (2026-11-10), for the reads' move:
+       - *Misses.* The store stays sans-IO. A read that needs pages not in memory asks for them
+         (the loads core emits `ReadInto`), and whoever drives the store's effects completes
+         them. On a task in the daemon, `read` and `pin` wait for the load through the one
+         deadline wait, in a span naming the pages, while the loader thread drives the pool's
+         effects (`pool/drive.rs`). A caller that drives the store's effects itself (every test
+         on `Sim`, a tool) passes a `Pump` (`fn pump(&mut self, loads: &Loads) -> Result<(),
+         LoadError>`), which loads a miss by pumping effects to completion there,
+         deterministically. The store has no hidden thread under `Sim`; the tests' reads go
+         through one helper that owns the `Sim` pump.
+       - *Pins.* As section 2: `Reader::read(&self, task: &PinSet, key)` for a task's reads and
+         `Reader::pin(&self, key)` for a holder that outlives a task. No guard of the store's
+         own behind `Entry`. A caller with no task in hand uses `pin` for now.
+       - *`Config`* gains one field saying how misses are driven: `Loader::Thread` (the
+         target's native driver, the default) or `Loader::Pumped`. The existing constructors
+         default it.
+       - *blaze-storemodel* gets `ReadInto` and `WriteFrom` rules with the semantics of `Read`
+         and `WriteAt` over a registered span, and a crash rule for a span being written as the
+         crash comes.
+       - *The checks' effects are chained* behind their pack's own sync (cut, write, sync, one
+         at a time), so the store model's search over a commit's orders still ends. That costs
+         commit latency: a second sync in series a pack. Running them beside the pack's again
+         needs the model's bound measured again first.
      - A reader's miss blocks on the loader, so the store's reads stop being a pure function of a
        published view: every caller of `Reader::get`, `get_in_place`, `get_from` and `pinned`
        across the workspace moves in the same batch (rule `whole-ports`), and the store's `Sim`
