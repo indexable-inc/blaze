@@ -94,6 +94,215 @@ pub fn code_identity(db: &Db, krate: Crate) -> ContentId {
     known[&krate]
 }
 
+/// Whether `krate` can read no file of its source root but its root file: a workspace crate
+/// whose root file is [`root_alone_of`]. Its identity
+/// ([`Lowered::identity`](super::Lowered::identity)) then leaves the other files of its source root out: a build script's (`build.rs`, with
+/// every other target's sources and its own run's `OUT_DIR` in its package's source root) is
+/// not made from them, so an edit of `src/main.rs` neither compiles the script again nor
+/// links it. A library source root's crate is never asked: its files don't change, and its
+/// root would be parsed for nothing.
+pub(crate) fn root_alone(db: &Db, krate: Crate) -> bool {
+    let data = krate.data(db);
+    let root = db.source_root(db.file_source_root(data.root_file_id).source_root_id(db));
+    !root.source_root_ref(db).is_library
+        && reads_root_alone(db, EditionedFileId::new(db, data.root_file_id, data.edition))
+}
+
+/// [`root_alone_of`] of `file`'s parse; false for a file with no text. The text is read
+/// before the parse, as [`code_text`] reads it.
+#[blaze_query::tracked(returns(copy))]
+fn reads_root_alone(db: &Db, file: EditionedFileId) -> bool {
+    let id = file.file_id(db);
+    if !db.has_file_text(id) {
+        _ = db.file_content(id);
+        return false;
+    }
+    _ = db.file_text(id).text(db);
+    root_alone_of(&file.parse(db).syntax_node())
+}
+
+/// The macros of the standard library a [`root_alone_of`] file may call: none reads a file,
+/// and none makes an item.
+const PLAIN_MACROS: &[&str] = &[
+    "println",
+    "print",
+    "eprintln",
+    "eprint",
+    "format",
+    "format_args",
+    "write",
+    "writeln",
+    "panic",
+    "assert",
+    "assert_eq",
+    "assert_ne",
+    "debug_assert",
+    "debug_assert_eq",
+    "debug_assert_ne",
+    "unreachable",
+    "todo",
+    "unimplemented",
+    "vec",
+    "matches",
+    "dbg",
+    "concat",
+    "stringify",
+    "env",
+    "option_env",
+    "cfg",
+    "line",
+    "column",
+    "file",
+    "module_path",
+    "compile_error",
+];
+
+/// Whether a crate whose root file parses as `root` can be proved, from that file alone, to
+/// read no other file of its source root: no `mod x;`, no `include!`, `include_str!` or
+/// `include_bytes!`, and no macro that could make either. What could make one is refused
+/// whole, never looked into:
+///
+/// - a module with no body, or the `mod` keyword anywhere a macro is given tokens;
+/// - the name `include`, `include_str` or `include_bytes` anywhere, a call or not;
+/// - a macro defined here (`macro_rules!`, `macro`), any `extern crate`, and any macro call
+///   but one of [`PLAIN_MACROS`] by its name alone or from `std`, `core` or `alloc`;
+/// - an attribute that gives its item to a macro ([`Seen::Yes`]);
+/// - an import that could give one of those names another meaning: any glob but one of the
+///   standard library's, and any import, from anywhere else, of a name in [`PLAIN_MACROS`]
+///   or [`SHADOWABLE`];
+/// - in the tokens a macro is given, which are not parsed: an attribute (`#`), `use`,
+///   `extern`, and a call of any macro but a [`PLAIN_MACROS`] one by its name alone.
+///
+/// A build script that only prints, reads variables and starts programs passes; anything
+/// refused keeps its source root whole in its crate's identity, as before.
+pub(crate) fn root_alone_of(root: &SyntaxNode) -> bool {
+    // How many token trees deep the walk is: tokens a macro is given, parsed as nothing.
+    let mut given = 0usize;
+    for event in root.preorder_with_tokens() {
+        match event {
+            WalkEvent::Enter(NodeOrToken::Node(node)) => {
+                let alone = match node.kind() {
+                    SyntaxKind::TOKEN_TREE => {
+                        given += 1;
+                        true
+                    }
+                    SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF | SyntaxKind::EXTERN_CRATE => {
+                        false
+                    }
+                    SyntaxKind::MODULE => {
+                        node.children().any(|it| it.kind() == SyntaxKind::ITEM_LIST)
+                    }
+                    SyntaxKind::MACRO_CALL => node
+                        .children()
+                        .find(|it| it.kind() == SyntaxKind::PATH)
+                        .is_some_and(|path| plain_macro(&path_text(&path))),
+                    SyntaxKind::USE => !use_could_rename(&node),
+                    _ => ast::Attr::cast(node).is_none_or(|attr| attr_seen(&attr) != Seen::Yes),
+                };
+                if !alone {
+                    return false;
+                }
+            }
+            WalkEvent::Leave(NodeOrToken::Node(node)) => {
+                if node.kind() == SyntaxKind::TOKEN_TREE {
+                    given -= 1;
+                }
+            }
+            WalkEvent::Enter(NodeOrToken::Token(token)) => {
+                let alone = match token.kind() {
+                    SyntaxKind::IDENT => {
+                        !matches!(token.text(), "include" | "include_str" | "include_bytes")
+                    }
+                    _ if given == 0 => true,
+                    SyntaxKind::MOD_KW
+                    | SyntaxKind::USE_KW
+                    | SyntaxKind::EXTERN_KW
+                    | SyntaxKind::POUND => false,
+                    SyntaxKind::BANG => !calls_other_macro(&token),
+                    _ => true,
+                };
+                if !alone {
+                    return false;
+                }
+            }
+            WalkEvent::Leave(NodeOrToken::Token(_)) => {}
+        }
+    }
+    true
+}
+
+/// Whether the macro path `path` (its text, `std::println`) names one of [`PLAIN_MACROS`]: by
+/// its name alone, or from `std`, `core` or `alloc`.
+fn plain_macro(path: &str) -> bool {
+    let path = path.trim_start_matches("::");
+    match path.split_once("::") {
+        None => PLAIN_MACROS.contains(&path),
+        Some((first, rest)) => {
+            let last = rest.rsplit("::").next().unwrap_or(rest);
+            matches!(first, "std" | "core" | "alloc") && PLAIN_MACROS.contains(&last)
+        }
+    }
+}
+
+/// Whether `bang`, a `!` among the tokens a macro is given, calls a macro that is not one of
+/// [`PLAIN_MACROS`] by its name alone: the token before it is a name (a `!` after anything
+/// else negates), and that name is no plain macro's or is the end of a path.
+fn calls_other_macro(bang: &SyntaxToken) -> bool {
+    let mut before = std::iter::successors(bang.prev_token(), SyntaxToken::prev_token)
+        .filter(|it| !it.kind().is_trivia());
+    let Some(name) = before.next().filter(|it| it.kind() == SyntaxKind::IDENT) else {
+        return false;
+    };
+    !PLAIN_MACROS.contains(&name.text())
+        || before.next().is_some_and(|it| it.kind() == SyntaxKind::COLON2)
+}
+
+/// Whether the `use` item `node` could give a name of [`PLAIN_MACROS`] or [`SHADOWABLE`]
+/// another meaning: a glob, or an import of one of those names (as it is brought in, renamed
+/// or not), from a path that does not start in the standard library. The crate's own paths
+/// count: one may lead to another crate's names through an import of its own.
+fn use_could_rename(node: &SyntaxNode) -> bool {
+    let std = |first: &str| matches!(first, "std" | "core" | "alloc");
+    node.descendants().filter(|it| it.kind() == SyntaxKind::USE_TREE).any(|tree| {
+        let glob = tree.children_with_tokens().any(|it| it.kind() == SyntaxKind::STAR);
+        let list = tree.children().any(|it| it.kind() == SyntaxKind::USE_TREE_LIST);
+        if list && !glob {
+            return false;
+        }
+        // The path from this tree out: the outermost tree's first segment is where the names
+        // come from, this tree's last what is brought in.
+        let mut first = None;
+        let mut last = None;
+        for at in std::iter::once(tree.clone())
+            .chain(tree.ancestors().skip(1))
+            .take_while(|it| it.kind() != SyntaxKind::USE)
+        {
+            if at.kind() != SyntaxKind::USE_TREE {
+                continue;
+            }
+            if let Some(path) = at.children().find(|it| it.kind() == SyntaxKind::PATH) {
+                let text = path_text(&path);
+                if last.is_none() {
+                    last = text.rsplit("::").next().map(str::to_owned); // alloc: as `path_text`
+                }
+                first = text.trim_start_matches("::").split("::").next().map(str::to_owned); // alloc: as above
+            }
+        }
+        if first.as_deref().is_some_and(std) {
+            return false;
+        }
+        let renamed =
+            tree.children().find(|it| it.kind() == SyntaxKind::RENAME).map(|it| path_text(&it));
+        let name = match &renamed {
+            Some(rename) => rename.strip_prefix("as").map(str::to_owned), // alloc: as `path_text`
+            None => last,
+        };
+        glob || name.is_none_or(|it| {
+            PLAIN_MACROS.contains(&it.as_str()) || SHADOWABLE.contains(&it.as_str())
+        })
+    })
+}
+
 /// What of `krate` alone its code can observe: its content ([`Crate::content`]: its root's
 /// path, edition, cfg, env, dependencies and the rest), then its source root's files as
 /// [`code_text`] has them, each by its path, sorted, with the module the compiler appended to

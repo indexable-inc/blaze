@@ -1004,6 +1004,13 @@ impl Lowered {
     /// identity of a crate covers everything it is made from before it is resolved. None for a
     /// unit with no crate. Worked out once per crate between writes.
     ///
+    /// A workspace crate whose root file proves it can read no other file of its source root
+    /// ([`code::root_alone_of`]: no `mod x;`, no `include!`, no macro that could make one) is
+    /// not made from them, and they are left out: a package's source root holds every
+    /// target's sources, so with them in, an edit of `src/main.rs` gave the package's build
+    /// script a new identity, compiled and linked it again, and so on for each single-file
+    /// target beside the one edited.
+    ///
     /// The process's environment is not in it: a crate reads a variable of it only through
     /// `env!` and `option_env!`, which only resolving finds, and each read is noted in the
     /// database's `env!` log (`Files::env_read`). Whoever files a value made from the crate
@@ -1415,6 +1422,11 @@ const INCLUDED_MOVED: Trigger<'static> =
 
 const IDENTITY: &str = "blaze v2 cargo unit identity 5";
 
+/// What an identity holds in place of its source root's content for a crate that reads its
+/// root file alone ([`code::root_alone`]). No content ID is these bytes' length, so no
+/// identity of the other form is one of this.
+const ROOT_ALONE: &[u8] = b"its root file alone";
+
 /// [`Lowered::identity`] of `krate`, each crate of its closure worked out once into `known`,
 /// dependencies first, with a stack of its own rather than the thread's.
 fn identity_of(
@@ -1444,10 +1456,14 @@ fn identity_of(
         }
         let root = db.file_source_root(data.root_file_id).source_root_id(db);
         let mut hasher = Hasher::new(IDENTITY);
-        hasher
-            .id(&at.content(db))
-            .id(&db.file_text(data.root_file_id).content(db))
-            .id(&db.source_root(root).content(db));
+        hasher.id(&at.content(db)).id(&db.file_text(data.root_file_id).content(db));
+        // The files of its source root, unless its root file proves it can read none of them
+        // but itself ([`code::root_alone`]): then the root's text above is all of them it is
+        // made from, and an edit of another target's source in the package leaves it as it was.
+        match code::root_alone(db, at) {
+            true => hasher.update(ROOT_ALONE),
+            false => hasher.id(&db.source_root(root).content(db)),
+        };
         // How rustc names the crate's files, which its code says (`file!()`, panic locations).
         match spellings.of(at) {
             None => {
