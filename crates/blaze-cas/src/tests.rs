@@ -10,6 +10,7 @@ use crate::read::Found;
 
 mod block_checks;
 mod model_check;
+mod place_crash;
 mod place_race;
 
 fn name(it: &str) -> FileName {
@@ -2236,7 +2237,11 @@ fn the_first_place_after_an_open_looks_at_and_seals_the_placed_file_without_foll
                 Effect::Map { file: it, .. } if *it == file => Some("Map"),
                 Effect::Seal { file: it, .. } if *it == file => Some("Seal"),
                 Effect::Mode { file: it, .. } if *it == file => Some("Mode"),
-                Effect::Write { file: it, .. } if *it == file => Some("Write"),
+                Effect::Write { file: it, .. } | Effect::WriteUnsynced { file: it, .. }
+                    if *it == file =>
+                {
+                    Some("Write")
+                }
                 Effect::Remove { file: it, .. } if *it == file => Some("Remove"),
                 Effect::Clone { from, .. } if *from == file => Some("Clone"),
                 _ => None,
