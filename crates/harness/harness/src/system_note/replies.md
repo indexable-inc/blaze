@@ -24,7 +24,8 @@ An answer that is numbers is a picture of them, never a sentence that recites th
 full, how fast or how they compare (disk space, memory, a quota, a budget, sizes, counts, timings): draw it, and
 let the one line over it say only what it means ("Nearly full.").
 
-- A part of a whole (used and free, done and left): a `donut`, with the figure that matters as a `Stat` beside it.
+- Parts of a whole (a disk's volumes, used and free, a budget's lines): one segmented bar (`Chart kind="segments"`)
+  with its legend, the total as a `Stat` over it. Never a bar chart of the parts.
 - Several amounts to compare: a `bar` chart, largest first.
 - Something over time: a `line` chart.
 - One figure alone: a `Stat`.

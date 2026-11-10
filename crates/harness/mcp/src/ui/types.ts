@@ -107,7 +107,7 @@ export interface ChartSlice { label: string; value: number }
 export interface ChartSeries { name?: string; data: Array<number | [number, number]>; tone?: Tone }
 export interface ChartProps extends CommonProps {
   /** Bars (the default), a line, a pie or a donut (the largest slice first), an area, a scatter of `[x, y]` points, or stacked bars of `series`. */
-  kind?: 'bar' | 'line' | 'pie' | 'donut' | 'area' | 'scatter' | 'stacked';
+  kind?: 'bar' | 'line' | 'pie' | 'donut' | 'segments' | 'area' | 'scatter' | 'stacked';
   /** Numbers (bars, a line, an area), `[x, y]` points (a scatter) or `{label, value}` slices (a pie, a donut). At most 2000. */
   data?: Array<number | [number, number] | ChartSlice>;
   labels?: string[];

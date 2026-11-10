@@ -45,28 +45,29 @@ character (he has moods).
 </Grid>
 ```
 
-Numbers are drawn. A part of a whole (disk, memory, a quota) is a donut with the figure that matters beside it,
-never a sentence:
+Numbers are drawn. Parts of a whole (a disk's volumes, memory by process, a budget's lines) are one segmented bar
+with its legend, the total as a Stat over it and the few facts that matter in a small Table under it, never a
+sentence and never a bar chart of the parts:
 
 ```svelte
-<Row>
-  <Chart kind="donut" data={[{label: 'Used', value: 7231}, {label: 'Free', value: 469}]} unit="GB" height={140} />
-  <Column>
-    <Stat label="Free" value="469 GB" note="of 7.7 TB" />
-    <Text tone="warning">94% full</Text>
-  </Column>
-</Row>
+<Column>
+  <Stat label="Container disk3" value="7.72 TB" note="469 GB free" />
+  <Chart kind="segments" unit="GB" data={[{label: 'Data', value: 2920}, {label: 'Projects', value: 2740},
+    {label: 'Nix Store', value: 1480}, {label: 'VM', value: 87}, {label: 'Free', value: 469}]} />
+  <Table rows={[{what: 'Capacity', value: '7.72 TB'}, {what: 'Used', value: '7.25 TB'}, {what: 'Free', value: '469 GB'}]} />
+</Column>
 ```
 
-Several amounts to compare are a bar chart (largest first), something over time a line chart, one figure alone a
-Stat.
+A part called Free, Other, Unused or Left is drawn quiet. One part against the rest (used and free alone) can be a
+donut. Amounts that are not parts of one whole are a bar chart (largest first), something over time a line chart,
+one figure alone a Stat.
 
 Content: Column, Row, Text (tone: ink muted strong error accent success warning), Markdown, Code, Table (rows of
 records; query, onselect; a cell that is an inline reference, `from: '<Path loc="/abs/file.md" line={12}>rule 48</Path>'`,
 draws as its chip: give a row its source that way), Badge, Stat (label, value, note), Card (title), Divider and Spacer.
 
-Charts: <Chart kind="bar|stacked|line|area|scatter|pie|donut" data={[...]} or series={[{name, data}]} labels={[...]}
-unit height /> (pie and donut take data as [{label, value}]); never draw a chart by hand.
+Charts: <Chart kind="bar|stacked|line|area|scatter|pie|donut|segments" data={[...]} or series={[{name, data}]} labels={[...]}
+unit height /> (pie, donut and segments take data as [{label, value}]); never draw a chart by hand.
 
 Drawings: SVG (svg, g, path, rect, circle, ellipse, line, polyline, polygon, text) or Canvas (view, Group, Path, Rect,
 Circle, Line, Polyline, Text); inks are tone names (ink, muted, accent, success, warning, error, faint,
