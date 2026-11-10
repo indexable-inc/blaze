@@ -22,6 +22,8 @@ pub fn run(path: &str) -> Result<(), String> {
     let mut app = App::new(Arc::new(|| {}))?;
     // The edits saved through the world api (src/world_api.rs), as a launch applies them.
     app.replay_world();
+    // No window, so no vibrancy behind the sidebar: its ground is drawn opaque.
+    app.opaque_sidebar();
     app.persist = false;
     // The canvas is the screen: a windowed overlay is kept on it, as the window keeps one on its screen.
     app.set_screen([0.0, 0.0, w, h]);
