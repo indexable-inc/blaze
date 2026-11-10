@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-34 invariants, 4 refinements, 2 reference models.
-By level: 20 tested, 18 simulated, 0 model-checked, 0 proved.
+37 invariants, 5 refinements, 2 reference models.
+By level: 22 tested, 20 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
@@ -22,6 +22,8 @@ By level: 20 tested, 18 simulated, 0 model-checked, 0 proved.
   Controls: `shared_memory_dropped_and_file_cache_kept`.
 - **`a_kept_answer_is_said_again_only_while_a_walk_would_say_the_same`** *tested* (`crates/blaze-cargo/src/serve/job/noop/tests.rs`): the lane says a kept answer again only when a walk of every unit would say the same of the state the request is asked in, with every output in place and no other job under way: no input a build reads changed since the answer was kept. Over any run of edits of the checkout's files and its lock file, of a traced header, a listed directory, a path dependency and the layout profiles outside it, of the request's environment, features, profile and colors, of touches, deleted outputs, other jobs and requests, with the watches confirmed in time or late. `HEGEL_TEST_CASES=<n>` runs it longer.
   Controls: `a_lane_that_ignores_an_edited_file`, `a_lane_that_ignores_the_lock_file`, `a_lane_that_does_not_compare_the_environment`, `a_lane_that_ignores_the_features_and_the_profile`, `a_lane_that_ignores_how_the_request_is_rendered`, `a_lane_that_ignores_a_traced_file_outside_the_view`, `a_lane_that_does_not_see_a_deleted_output`, `a_kept_walk_that_listed_a_directory`, `a_kept_build_that_made_something`, `a_lane_that_answers_beside_another_job`, `a_lane_that_trusts_an_unwatched_path_dependency`, `a_lane_that_does_not_see_layout_profiles_appear`, `a_replayed_script_that_writes_on_every_walk`, `a_foreign_write_taken_for_the_walks_echo`, `a_request_not_held_for_the_watches_round`.
+- **`a_build_answers_before_its_puts_are_durable_and_a_commit_that_hangs_is_a_loss_said_once`** *simulated* (`crates/blaze-cargo/src/serve/tests.rs`): an answer may be sent on results not yet durable; nothing derived from that answer is reused across a crash unless its tickets were durable, and what is lost is said, never dropped silently and never a second answer. A store whose commit hangs (a sync that never returns) holds no build's answer: the build is answered at once, and what it left settles after. Once the store has answered nothing for [`DURABLE_WITHIN`] on the injected clock, not before, that is given up as a loss: one line naming the checkout, the command and the store's ticket, one bug for `blaze status`, and a miss of the checkout's next build that `blaze why` says. The daemon keeps serving.
+- **`a_crash_after_any_turn_keeps_what_had_settled_and_restores_to_a_fresh_build`** *simulated* (`crates/blaze-cargo/src/serve/tests.rs`): an answer may be sent on results not yet durable; nothing derived from that answer is reused across a crash unless its tickets were durable. After a crash at any turn, the restore serves no torn or half-kept value, and a build on it equals a fresh build. Rule 26, at every point: two checkouts build at once, so one's answer may rest on what the other put and has not made durable (a value read from the store carries no ticket); the daemon crashes after turn `k`, for every `k` up to both answered and settled, so at every point between an answer and its results being durable. After each crash, once nothing was still settling every checkout whose `Done` the client saw has all it left in the store; and at every point, settled or not, a build of `/w` on the restored disk gives byte for byte what a fresh daemon's gives: no torn or half-kept value is refused as a mismatch, and what was lost is made again. `Sim::crash` keeps a seeded prefix of each file's unsynced writes; it does not model directory entries (lane storemodel's `CrashFs` does).
 - **`a_records_diagnostics_kept_as_places_point_at_the_same_tokens_in_every_text_of_its_key`** *simulated* (`crates/blaze-cargo/src/serve/unit/tests.rs`): a record's diagnostics kept as places, replayed over any text of the same code text (a comment at a line's end, spaces before one, a comment after the last line added or taken away), point at the very tokens the check pointed at, and over the text they were made of are the diagnostics the check gave, byte for byte, through the record's encoding.
   Controls: `a_diagnostic_rendered_at_stale_offsets`.
 - **`every_recomputed_step_ends_in_a_terminal_reason`** *tested* (`crates/blaze-cargo/src/serve/why.rs`): every recomputed step of a build has a reason whose chain ends in a terminal reason other than `Unexplained`.
@@ -120,6 +122,11 @@ By level: 20 tested, 18 simulated, 0 model-checked, 0 proved.
 - **`every_row_is_in_the_history_once_after_any_crash`** *simulated* (`crates/blaze-profile/src/history/files/tests.rs`): whatever the faults, wherever the power goes out, every row handed to the history is listed, handed back or left to read, exactly once, and the history opens.
   Controls: `a_rename_with_no_sync_before`, `what_a_flush_consumed_marked_after_its_commit`.
 
+### blaze-storemodel
+
+- **`what_is_kept_after_an_answer_survives_any_crash_and_no_lost_value_is_served`** *tested* (`crates/blaze-storemodel/src/tests.rs`): an answer may be sent on results not yet durable; nothing derived from that answer is reused across a crash unless its tickets were durable. After any crash the restore serves no value whose bytes were lost, holds everything the store called durable and everything an answered build kept, and every answer's settling ended kept or said lost. Two builds on shared and separate keys with a reader, and a snapshot beside a build, each build answering before it flushes: every schedule, a crash after every IO step, so at every point between an answer sent and its results durable; with an IO failure anywhere, so a settling that ends with the store stopped. Then two kernel gets of one identity in two worlds racing for one shape slot, each answering at once and keeping what it left once it and every store before it is durable, with an IO failure anywhere and effects completing in any order.
+  Controls: `a_kept_answer_relied_on_before_its_tickets_were_durable`, `a_settling_failure_dropped_silently`.
+
 ## Refinements
 
 ### blaze-cas
@@ -138,6 +145,11 @@ By level: 20 tested, 18 simulated, 0 model-checked, 0 proved.
   Controls: `a_block_not_rehashed`.
 - **`a_patched_file_behaves_as_a_fresh_link`** *tested* (`crates/blaze-link/src/tests/patch.rs`): after any sequence of edits (a body changed at the same size, smaller or larger than the room it had, a function added or removed, a callee set changed, a frame entry gained or lost, a static read, dropped or given another value), the file the patches make behaves as a fresh full link of the same program: the same entry, each function's code, each call resolved through its slot to the same function, each static read holding the same bytes, an unwind lookup of each function finding an entry that covers it, and the same function names in the symbol table. Each patch is of the file the last one left, never lays the image out whole, and the digest it gives is the patched file's hashed whole.
   Controls: `a_stale_unwind_entry`, `a_slot_left_on_the_old_body`, `a_removed_function_still_exported`, `a_write_the_digest_missed`, `a_check_of_the_length_alone`.
+
+### linked
+
+- **`the_link_inputs_kept_are_the_tables_made_whole`** *tested* (`crates/hir-ty-codegen/v2/linked/tests.rs`): for any program and sequence of edits (a reformat, a body edited, a function gone or back, a function that names another table), the span tables a link holds by applying each build's link inputs to those of the link before are the tables made whole from the build, with nothing kept.
+  Controls: `a_moved_body_not_encoded_again`.
 
 ## Reference models
 
