@@ -78,15 +78,41 @@ fn type_with_bounds_cond_here(p: &mut Parser<'_>, allow_bounds: bool) {
 
 /// blaze, under `#![blaze::records]`: `fn open(opts: { create: bool = false, mode: u32 }) {}`
 ///
-/// A record type: a struct's field list where a type is expected, which is nowhere a type of
-/// Rust's (the arm after this one is its error). The list is the struct's own node and
-/// grammar, so a field may carry a default (`= expr`, as `default_field_values` writes it);
-/// hir-def refuses what a record has none of (a visibility, an attribute, `unsafe`) and a
-/// default outside a function parameter.
+/// A record type: a field list where a type is expected, which is nowhere a type of Rust's
+/// (the arm after this one is its error). The list and its fields are a struct's nodes, but a
+/// record's field is a name, a `:`, a type and then a default (`= expr`, as
+/// `default_field_values` writes it) and nothing else: a visibility, an attribute or `unsafe`
+/// is an error here. hir-ty refuses a default outside a function parameter.
 fn record_type(p: &mut Parser<'_>) {
     assert!(p.at(T!['{']));
     let m = p.start();
-    items::record_field_list(p);
+    let list = p.start();
+    p.bump(T!['{']);
+    while !p.at(T!['}']) && !p.at(EOF) {
+        if p.at(T!['{']) {
+            error_block(p, "expected a record field: a name, `:` and a type");
+            continue;
+        }
+        if !p.at(IDENT) {
+            p.err_and_bump("expected a record field: a name, `:` and a type");
+            continue;
+        }
+        let field = p.start();
+        name(p);
+        p.expect(T![:]);
+        type_(p);
+        if p.eat(T![=]) {
+            let default = p.start();
+            expressions::expr(p);
+            default.complete(p, CONST_ARG);
+        }
+        field.complete(p, RECORD_FIELD);
+        if !p.at(T!['}']) {
+            p.expect(T![,]);
+        }
+    }
+    p.expect(T!['}']);
+    list.complete(p, RECORD_FIELD_LIST);
     m.complete(p, RECORD_TYPE);
 }
 

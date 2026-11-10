@@ -1975,6 +1975,12 @@ impl ExpressionStore {
                 visitor.on_pat(pat)
             }
             TypeRef::UnsafeBinder { lifetimes: _, ty } => visitor.on_type(ty),
+            TypeRef::Record { names: _, types, defaults } => {
+                visitor.on_types(types);
+                for default in defaults.iter().flatten() {
+                    visitor.on_anon_const_expr(default.expr);
+                }
+            }
             TypeRef::Tuple(types) => visitor.on_types(types),
             TypeRef::Path(path) => visitor.on_path(path),
             TypeRef::RawPtr(inner, _) | TypeRef::Slice(inner) => visitor.on_type(inner),

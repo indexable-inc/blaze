@@ -2588,6 +2588,21 @@ impl<'db> HirDisplayWithExpressionStore<'db> for TypeRefId {
                 write!(f, " is ")?;
                 pat.hir_fmt(f, owner, store)?;
             }
+            TypeRef::Record { names, types, defaults } => {
+                // blaze's record type (`#![blaze::records]`) as written; a default is `= ..`.
+                let edition = f.edition();
+                write!(f, "{{")?;
+                for (at, name) in store.names(names).iter().enumerate() {
+                    write!(f, "{}{}: ", if at == 0 { " " } else { ", " }, name.display(f.db, edition))?;
+                    if let Some(ty) = types.get(at) {
+                        ty.hir_fmt(f, owner, store)?;
+                    }
+                    if defaults.get(at).is_some() {
+                        write!(f, " = ..")?;
+                    }
+                }
+                write!(f, "{}", if types.is_empty() { "}" } else { " }" })?;
+            }
             TypeRef::UnsafeBinder { lifetimes, ty } => {
                 let lifetimes = store.names(lifetimes);
                 if lifetimes.is_empty() {
