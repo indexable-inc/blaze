@@ -93,6 +93,10 @@ pub struct Vtable {
     /// A function whose values are let go only when asked (`lru = 0`): what a caller letting go
     /// of a tag's values asks of it ([`Storage::evict_tag`]).
     pub(crate) explicit: Option<Explicit>,
+    /// A function whose values may be let go (`lru` or `lru = 0`): lets go of each value last
+    /// verified in a view before `before`, keeping its row's stamp, edges and hash; returns
+    /// how many went and what they weighed ([`Storage::end_epoch`]).
+    pub(crate) unread: Option<fn(storage: &Storage, ingredient: u32, before: u32) -> (usize, u64)>,
     /// Moves each of its rows' edge spans into the compacted array.
     pub(crate) relocate: Option<fn(storage: &mut Storage, ingredient: u32, moved: &mut Relocate)>,
     /// Passes each view stamp its rows hold through `restamp`, storing what it gives: the

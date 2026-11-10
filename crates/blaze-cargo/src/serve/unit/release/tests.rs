@@ -150,6 +150,7 @@ fn a_release_says_why_what_went_and_the_memory_against_the_limit() {
     };
     let before = Pressure { held: 44 * GIB, limit: 48 * GIB, over: Some(Tag::Mir) };
     let after = Pressure { held: 38 * GIB, limit: 48 * GIB, over: None };
+    let unread = blaze_query::db::Unread::default();
     // A release memory made due says the storage's holders.
     let infer = MemoryUsage {
         name: "infer",
@@ -159,9 +160,18 @@ fn a_release_says_why_what_went_and_the_memory_against_the_limit() {
         value_bytes: 1 << 28,
     };
     let storage = Holders::of(vec![infer]);
-    let said =
-        Said { crates: 2, mir: true, pressed: true, ended: false, dropped, before, after, storage }
-            .to_string();
+    let said = Said {
+        crates: 2,
+        mir: true,
+        pressed: true,
+        ended: false,
+        dropped,
+        unread,
+        before,
+        after,
+        storage,
+    }
+    .to_string();
     assert_eq!(
         said,
         "front end release (memory: blaze is past the limit's line of 42.00 GiB): let go of 30 inference results of 40 \
@@ -177,6 +187,7 @@ fn a_release_says_why_what_went_and_the_memory_against_the_limit() {
         pressed: true,
         ended: false,
         dropped,
+        unread,
         before: early,
         after: early,
         storage,
@@ -197,6 +208,7 @@ fn a_release_says_why_what_went_and_the_memory_against_the_limit() {
         pressed: false,
         ended: false,
         dropped,
+        unread,
         before: idle,
         after: idle,
         storage,
@@ -204,6 +216,25 @@ fn a_release_says_why_what_went_and_the_memory_against_the_limit() {
     .to_string();
     assert!(said.starts_with("front end release (no unit is open)"), "{said}");
     assert!(said.ends_with(", under no limit; the query storage holds 1.50 GiB"), "{said}");
+    assert!(!said.contains("did not read"), "{said}");
+    // A build's end says what two builds left unread, when anything went.
+    let said = Said {
+        crates: 0,
+        mir: true,
+        pressed: false,
+        ended: true,
+        dropped,
+        unread: blaze_query::db::Unread { values: 12, bytes: 0 },
+        before: idle,
+        after: idle,
+        storage: Holders::total(3 << 29),
+    }
+    .to_string();
+    assert!(said.starts_with("front end release (the build is over)"), "{said}");
+    assert!(
+        said.contains("trait solver caches, and 12 values the last two builds did not read; "),
+        "{said}"
+    );
 }
 
 /// A release's line ends with what the query storage holds and its eight largest holders,

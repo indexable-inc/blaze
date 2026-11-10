@@ -21,7 +21,8 @@ use blaze_core::lock::Lock;
 
 use super::{
     AsId, Cancelled, Cause, Counts, Cycle, Database, DatabaseKeyIndex, Durability, Event, FromIdIn,
-    Hook, Id, Outcome, Provenance, ReadKind, Reads, Setter, Storage, attach, capture_reads,
+    Hook, Id, Outcome, Provenance, ReadKind, Reads, Setter, Storage, Unread, attach,
+    capture_reads,
     input::field_node,
     owner_is,
     plumbing::{
@@ -1948,6 +1949,32 @@ fn a_view_tells_what_each_memo_did_and_why_it_ran() {
         Some((Outcome::ReranSameOutput, Some(Cause::Evicted))),
         "a value of an earlier view, evicted and made again equal"
     );
+}
+
+/// A value read in neither of the last two epochs that wrote goes as the second ends; one read
+/// in each stays; an epoch that wrote nothing lets nothing go and ages nothing (the control:
+/// were it an epoch, `cold` would go one writing epoch sooner).
+#[test]
+fn an_epoch_end_lets_go_of_the_values_two_epochs_left_unread() {
+    let mut db = TestDb::new();
+    let (cold, warm, other) = (Cell::new(&db, 11, 0), Cell::new(&db, 21, 0), Cell::new(&db, 1, 0));
+    assert_eq!((*get::<Tens>(&db, cold), *get::<Tens>(&db, warm)), (1, 2));
+    assert_eq!(db.storage_mut().end_epoch(), Unread::default(), "nothing written yet");
+    let wrote = |db: &mut TestDb, value: u64| {
+        other.set_a(db, value);
+        assert_eq!(*get::<Tens>(&*db, warm), 2);
+        db.storage_mut().end_epoch().values
+    };
+    assert_eq!(wrote(&mut db, 2), 0, "the first epoch that wrote: `cold` was read in it");
+    assert_eq!(db.storage_mut().end_epoch().values, 0, "nothing written since");
+    assert_eq!(db.storage_mut().end_epoch().values, 0, "nothing written since");
+    assert_eq!(wrote(&mut db, 3), 0, "`cold` was read in the epoch before this one");
+    assert_eq!(wrote(&mut db, 4), 1, "`cold`, unread in this epoch and the one before");
+    assert_eq!(wrote(&mut db, 5), 0, "`warm` is read in every epoch");
+    assert_eq!(db.runs("Tens"), 2, "nothing ran again yet");
+    assert_eq!(*get::<Tens>(&db, cold), 1, "let go, made again when asked");
+    assert_eq!(*get::<Tens>(&db, warm), 2);
+    assert_eq!((db.runs_of("Tens", cold.0), db.runs_of("Tens", warm.0)), (2, 1));
 }
 
 #[test]

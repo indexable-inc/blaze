@@ -51,7 +51,7 @@ pub use provenance::{
     take_log_in,
 };
 pub use slot::{Filled, Slot, SlotClaim, SlotError, SlotName, SlotRefused};
-pub use storage::{Database, Durability, Hook, Storage, View};
+pub use storage::{Database, Durability, Hook, Storage, Unread, View};
 pub use value::Value;
 
 /// What generated code calls: the ingredient traits, their statics' vtables, and the typed

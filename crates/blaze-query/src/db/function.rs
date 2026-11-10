@@ -189,6 +189,11 @@ impl Vtable {
             } else {
                 None
             },
+            unread: if F::EVICTABLE {
+                Some(evict_unread::<F> as fn(&Storage, u32, u32) -> (usize, u64))
+            } else {
+                None
+            },
             relocate: Some(relocate::<F> as fn(&mut Storage, u32, &mut Relocate)),
             restamp: Some(restamp::<F> as fn(&Storage, u32, &mut Restamp<'_>)),
             write_key: Some(write_key::<F> as fn(&Storage, Id, &mut String)),
@@ -1679,6 +1684,30 @@ fn evict_table<F: Function>(storage: &mut Storage, index: u32) -> usize {
     table.values.fetch_sub(evicted, Ordering::Relaxed);
     counts::add(index, counts::DROPPED, evicted as u64);
     evicted
+}
+
+/// [`Vtable::unread`] of `F`: lets go of each value whose row was last verified in a view
+/// before `before`. A row is stamped with the view of each read of it (a hit needs
+/// `verified == clock`, and the cold path stamps what it verifies or runs), so such a value was
+/// read in no view since. A walk of every row made, for a caller with `&mut` of the storage.
+fn evict_unread<F: Function>(storage: &Storage, index: u32, before: u32) -> (usize, u64) {
+    let Some(table) = storage.table::<FnTable<F>>(index) else { return (0, 0) };
+    let (mut evicted, mut freed) = (0usize, 0u64);
+    for (_, row) in rows::<F>(storage, table) {
+        let word = row.header.verified.load(Ordering::Relaxed);
+        if word & VALUE == 0 || word & VIEW_MASK >= before {
+            continue;
+        }
+        if let Some(bytes) = evict::<F>(table, row) {
+            evicted += 1;
+            freed += bytes;
+        }
+    }
+    table.values.fetch_sub(evicted, Ordering::Relaxed);
+    if evicted != 0 {
+        counts::add(index, counts::EVICTED, evicted as u64);
+    }
+    (evicted, freed)
 }
 
 /// [`Explicit::values`] of `F`: how many of its rows hold a value, from its counter.
