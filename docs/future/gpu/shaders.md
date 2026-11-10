@@ -424,8 +424,8 @@ pub fn light_cs(t: Thread, view: &LightView, scene: &Tlas, insts: &[Inst], acc: 
 | `RWStructuredBuffer<T> acc` | `acc: &RawOut<T>`, `unsafe { acc.read(i) }`, `unsafe { acc.write(i, v) }`, `acc.len()` | `Kind::RawOut { stride }` |
 | `RaytracingAccelerationStructure scene` | `scene: &Tlas` | `Kind::Tlas` |
 | `RayDesc` | `Ray { origin, dir, tmin, tmax }` | library |
-| `RayQuery<FORCE_OPAQUE>`, `TraceRayInline`, `while (q.Proceed()) {}`, `CommittedStatus() == COMMITTED_TRIANGLE_HIT`, `CommittedRayT()`, `CommittedInstanceIndex()`, `CommittedPrimitiveIndex()` | `scene.trace(ray, mask) -> Option<Hit>`; `hit.t`, `hit.instance_index`, `hit.primitive_index`, `hit.instance_custom_index`, `hit.geometry_index`, `hit.barycentrics`, `hit.front_face` | intrinsic |
-| the same with `ACCEPT_FIRST_HIT_AND_END_SEARCH`, `CommittedStatus() == COMMITTED_NOTHING` | `scene.occluded(ray, mask) -> bool` | intrinsic |
+| `RayQuery<FORCE_OPAQUE>`, `TraceRayInline`, `while (q.Proceed()) {}`, `CommittedStatus() == COMMITTED_TRIANGLE_HIT`, `CommittedRayT()`, `CommittedInstanceIndex()`, `CommittedPrimitiveIndex()` | `scene.trace(ray, mask) -> Option<Hit>`; `hit.t`, `hit.instance_index`, `hit.primitive_index`, `hit.instance_custom_index`, `hit.geometry_index`, `hit.barycentrics`, `hit.front_face` | library over one intrinsic |
+| the same with `ACCEPT_FIRST_HIT_AND_END_SEARCH`, `CommittedStatus() == COMMITTED_NOTHING` | `scene.occluded(ray, mask) -> bool` | library over one intrinsic |
 | `f32tof16(x)`, `f16tof32(u)` | `f32tof16(x)`, `f16tof32(u)` (Slang's names; round to nearest even, the low 16 bits) | intrinsic with a host body |
 | `uint2`, `uint3` | `UVec2`, `UVec3` | library |
 
@@ -448,7 +448,10 @@ pub fn light_cs(t: Thread, view: &LightView, scene: &Tlas, insts: &[Inst], acc: 
   read the committed hit) with `FORCE_OPAQUE`, so every triangle the ray meets is a candidate the
   hardware commits itself and no candidate loop is needed; `occluded` adds
   `ACCEPT_FIRST_HIT_AND_END_SEARCH` and says whether anything was committed. The query object never
-  appears in Rust, so it can't be moved, copied or read before it is initialized. raytracing.md's
+  appears in Rust, so it can't be moved, copied or read before it is initialized. Both are Rust
+  over one private intrinsic, `Tlas::query(ray, flags, mask)`, which returns the committed
+  intersection as a plain struct read member by member by name; `Option<Hit>` is built in Rust,
+  so the backend never composes an enum. raytracing.md's
   `RayQuery` with `Candidate` arms, `commit` and `commit_at` (alpha-tested and procedural
   geometry) is the next step and adds to this; it replaces nothing.
 - **Slots.** Metal binds an acceleration structure in the buffer table, so `&T`, `&[T]`,
@@ -459,7 +462,8 @@ pub fn light_cs(t: Thread, view: &LightView, scene: &Tlas, insts: &[Inst], acc: 
   that lays its bind group entries in parameter order, with the sizes buffer as a uniform after
   them, binds what the MSL reads.
 - **The module's capabilities** are what it uses: the validator gets `RAY_QUERY` when an entry
-  traces, and nothing else beyond the base set.
+  traces and `SHADER_FLOAT16_IN_FLOAT32` when it packs halves (Metal has both), nothing else
+  beyond the base set.
 
 What is left after it: `Out<T>` and its partitions, `Shared<T>`, barriers and atomics (plan.md);
 `RayQuery` with candidates (raytracing.md); a kernel on the CPU.

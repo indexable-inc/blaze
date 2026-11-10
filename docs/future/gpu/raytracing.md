@@ -76,9 +76,11 @@ pub fn trace(&self, ray: Ray, mask: u32) -> Option<Hit>; // FORCE_OPAQUE, the cl
 pub fn occluded(&self, ray: Ray, mask: u32) -> bool;     // FORCE_OPAQUE | ACCEPT_FIRST_HIT_AND_END_SEARCH
 ```
 
-Each lowers to one naga query in a local variable: `Initialize` with the ray, a `loop` of
+Both are Rust over one intrinsic, `Tlas::query(ray, flags, mask)`, which lowers to one naga
+query in a local variable: `Initialize` with the ray, a `loop` of
 `Proceed` that breaks when it returns false, and `RayQueryGetIntersection { committed: true }`,
-whose `kind` (none or triangle, the only kinds an opaque query commits) picks `None` or `Some`.
+read into a plain struct by member name; its `kind` (none or triangle, the only kinds an opaque
+query commits) picks `None` or `Some` in Rust.
 `Hit` is a plain Rust struct of the committed intersection's fields (`t`, `instance_index`,
 `instance_custom_index`, `geometry_index`, `primitive_index`, `barycentrics`, `front_face`); the
 object-to-world matrices are left out until a user needs them. `RayQuery::new` and `proceed` with
