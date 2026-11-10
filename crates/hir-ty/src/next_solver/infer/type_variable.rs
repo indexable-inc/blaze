@@ -321,16 +321,18 @@ impl<'db> TypeVariableTable<'_, 'db> {
         )
     }
 
-    /// Returns indices of all root variables that are not yet instantiated.
-    pub(crate) fn unresolved_root_variables(&mut self) -> Vec<TyVid> {
-        (0..self.num_vars())
-            .map(TyVid::from_usize)
-            .filter(|&vid| {
-                let (root, value) = self.probe_with_root_vid(vid);
-                root == vid && value.is_unknown()
-            })
-            // alloc: once per body, for fallback.
-            .collect()
+    /// Returns indices of all root variables that are not yet instantiated, in `alloc`:
+    /// fallback's frame, which reads them once.
+    pub(crate) fn unresolved_root_variables<A: std::alloc::Allocator>(
+        &mut self,
+        alloc: A,
+    ) -> Vec<TyVid, A> {
+        let mut unresolved = Vec::new_in(alloc);
+        unresolved.extend((0..self.num_vars()).map(TyVid::from_usize).filter(|&vid| {
+            let (root, value) = self.probe_with_root_vid(vid);
+            root == vid && value.is_unknown()
+        }));
+        unresolved
     }
 }
 
