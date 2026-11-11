@@ -213,6 +213,30 @@ fn every_float_operation_has_one_rule() {
     }
 }
 
+#[test]
+fn the_operations_rules_json_lists_are_the_enum() {
+    // The Lean `Op` (lean/analysis/BlazeDiff/Ops.lean) is generated from the same list.
+    let listed: Vec<Op> = crate::OPS.iter().map(|&(op, _, _)| op).collect();
+    assert_eq!(listed, Op::ALL);
+    for &(op, arity, sort) in crate::OPS {
+        assert_eq!((arity, sort), (op.arity(), op.sort()), "`{op}`");
+    }
+}
+
+#[test]
+fn powi_of_the_smallest_exponent_has_its_derivative() {
+    // d/dx x^n = n * x^(n - 1), and `i32::MIN - 1` is no `i32`: the rule takes `x^n / x`.
+    // Wrapping the exponent gave `n * x^i32::MAX`, infinite at 2 where the derivative is 0.
+    let mut graph = Graph::new(Width::F64);
+    let x = graph.var(0);
+    let f = graph.powi(x, i32::MIN);
+    let df = diff::derivative(&mut graph, f, 0, Policy::default()).expect("no kink");
+    let at = |x: f64| eval_one::<f64>(&graph, df, &[x]).unwrap();
+    assert_eq!(at(1.0), f64::from(i32::MIN));
+    assert_eq!(at(2.0).abs(), 0.0);
+    assert_eq!(at(-1.0), -f64::from(i32::MIN));
+}
+
 /// The plan's closed form of `d/dx (x * y).sin() / (1.0 + x * x)`.
 fn plan_closed_form(x: f64, y: f64) -> f64 {
     let d = 1.0 + x * x;
