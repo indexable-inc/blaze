@@ -214,6 +214,7 @@ fn units() -> Units {
         ],
         lock: None,
         warnings: Vec::new(),
+        notes: Vec::new(),
         target_dir: "/w/target".to_owned(),
         build_dir: "/w/target".to_owned(),
         finished: String::new(),
