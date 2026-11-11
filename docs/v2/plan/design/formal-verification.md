@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: The verifier: blaze translates its own borrow-checked MIR to Lean 4 and the pinned Lean checks proofs of specs written once in blaze's extensions. v0 (safe Rust by functional translation) is written in crates/hir-ty-lean with the first proof in the tree; the Verus tier was retired on 2026-11-10. Planned: v1 unsafe and interior mutability in an Iris-style logic, v2 atomics (SC, then RC11), v3 crashes on files and mmap (Perennial-style, sharing the DST's kernel model), v4 compiler correctness. DST stays on everything.
+summary: The verifier: blaze translates its own borrow-checked MIR to Lean 4 and the pinned Lean checks proofs of specs written once in blaze's extensions. v0 (safe Rust by functional translation) is written in crates/hir-ty-lean with the first proof in the tree; lean/Blaze/Mir is the executable Lean semantics of MIR for a first subset that models, passes and the evaluator are held to, with its trusted base listed; the Verus tier was retired on 2026-11-10. Planned: v1 unsafe and interior mutability in an Iris-style logic, v2 atomics (SC, then RC11), v3 crashes on files and mmap (Perennial-style, sharing the DST's kernel model), v4 compiler correctness. DST stays on everything.
 date: 2026-11-10
 ---
 # Formal verification: blaze's MIR to Lean
@@ -335,9 +335,10 @@ Second targets:
 ## v0 as built (2026-11-10)
 
 `crates/hir-ty-lean` (the translator and the driver), `lean/` (the library and the checked-in
-models) and `crates/blaze-graph/lean/` (the first proof). It was written without being built
-or run: until the tests and `lake build` have passed on a named commit, read this section as
-what the code is meant to do. Where the plan above left a choice, this is the choice.
+models) and `crates/blaze-graph/lean/` (the first proof). On 2026-11-10 `lake build` of
+`lean/` passed with Lean 4.20.0 and the crate's library compiled under `blaze check`; its
+tests have not run, so the checked-in models are predictions of what the translator emits.
+Where the plan above left a choice, this is the choice.
 
 **Structured MIR** (`structured.rs`, `body.rs`; `hir_ty_lean::structured(db, func)`).
 - Over built MIR (`mir_body`), after type checking and borrow checking accept the function.
@@ -438,9 +439,196 @@ test `fnv1a_from_is_the_fold_of_its_bytes` states the invariant as proved.
 `harness/v2/lean_differential.py` runs the compiled model against the function blaze built.
 
 **How to run it.** The Rust tests: `blaze test -p hir-ty-lean` (one needs
-`BLAZE_LEAN_PROVER`). The Lean: `lake build` in `lean/` with the pinned toolchain builds the
+`BLAZE_LEAN_PROVER`, and `mir_semantics_corpus` is run by `harness/v2/mir_semantics.py`). The Lean: `lake build` in `lean/` with the pinned toolchain builds the
 library, every golden model and the proofs. After a deliberate change to the translator,
 `UPDATE_EXPECT=1` rewrites the goldens, and `lake build` must pass again.
+
+## The semantics of MIR (2026-11-10)
+
+Rule `verified-compiler` needs one thing every proof and every pass is held to: what a MIR
+body means. It is `lean/Blaze/Mir`, a deep embedding of blaze's MIR with an executable
+semantics, for a first subset. It was written without Lean or blaze having run on it: until
+`lake build` of `lean/` and `blaze test -p hir-ty-lean` pass on a named commit, read this
+section as what the code is meant to do. Objectives V6, V7 and V8 decide it.
+
+**Prior art, and the one lesson taken from each.**
+- [MiniRust](https://github.com/minirust/minirust): a specification of Rust's operational
+  semantics is best written as an interpreter, so it can be run against the implementation.
+  `step` and `run` are total Lean functions, and V6 runs them against the evaluator.
+- [a-mir-formality](https://github.com/rust-lang/a-mir-formality): a formal model stays true
+  only while it is tested against the compiler it models. The embedded bodies are goldens of
+  the encoder, and the differential harness is in the ledger.
+- [CompCert](https://compcert.org/): a pass is proved by a forward simulation, and
+  correctness is stated as "every behaviour of the target is a behaviour of the source".
+  `Outcome.Refines` is that statement; `run_mapBlocks` is the simulation for block-local
+  passes.
+- Translation validation (Pnueli, Siegel, Singerman 1998; Necula 2000) and
+  [Alive2](https://github.com/AliveToolkit/alive2): a pass too large to prove is checked on
+  each run, by a checker that is itself small. V8's second half does this.
+- [Aeneas](https://github.com/AeneasVerif/aeneas): the functional translation is trusted
+  there (its ICFP 2024 proof is of the symbolic semantics against a borrow checker, not of the
+  emitted model). V7 proves each emitted model against the semantics instead.
+- [CakeML](https://cakeml.org/) and [seL4](https://sel4.systems/): a verified stack is a
+  chain of refinements, each between two stated semantics, and what is not in the chain is
+  listed. "The trusted base" below is that list.
+
+**Syntax** (`Syntax.lean`). Types (`unit`, `bool`, integers by `ScalarTy`, references, slices,
+arrays, and `adt`: structs, enums and tuples by their declared layout, a list of variants
+with a discriminant and field types), places (a local and projections: `deref`, `field`,
+`downcast`, `index`, `constIndex`), operands (`copy`, `move`, `const`), rvalues (`use`,
+`binary`, `checked`, `withOverflow`, `unary`, `cast`, `aggregate`, `replicate`,
+`discriminant`, `ref`, `len`), statements (`assign`, `storageLive`, `storageDead`, `nop`),
+terminators (`goto`, `switchInt`, `call`, `ret`, `assert`, `drop`, `unreachable`), bodies and
+programs (functions by index). blaze's MIR has no `SetDiscriminant`, so neither does this.
+Core's panic entry points, `wrapping_*`, `saturating_*`, slice `len` and constructor
+functions are intrinsics, as the functional models have them.
+
+**Values and memory: structured places, not bytes** (`Value.lean`, `State.lean`). A local is a
+slot: `uninit`, `moved` or a structured value (`unit`, `bool`, `int`, `adt`, `array`, `ref`).
+A reference is a pointer: a frame, a local of it and a path of fields and indices. Frame 0
+holds what the entry function's reference arguments point to.
+- **Why.** It is what safe code that borrows locals and their parts needs, it is the model the
+  functional translation reads a `&mut` in, and every definition reduces in Lean's kernel, so
+  tests and translation validation are `rfl`.
+- **What it cannot express:** raw pointers, pointer-integer casts, transmutes, unions,
+  anything that depends on layout (padding, niches, alignment), the heap (`Box`, `Vec`),
+  `static`s, interior mutability, and aliasing rules (Tree or Stacked Borrows): two `&mut` to
+  one place are not detected. A reference into a frame that returned is `dangling` only until
+  another call reuses the depth. A move out of a part of a local leaves the part readable.
+  Storage markers do nothing, so a use of a dead local is not detected. The encoder refuses
+  what the model has no form for; the rest is the borrow checker's to rule out.
+- **How it grows.** Heap cells addressed by an allocation id, for `Box` and `Vec`. Then bytes
+  with provenance, as MiniRust has, with a stated relation between the two models: a
+  structured value is related to the bytes its type's layout encodes it as. That relation is
+  also what ties this semantics to LIR's ("Two semantics, one lowering").
+
+**Semantics** (`Step.lean`, `Run.lean`). `step : Program → State → Outcome Next` runs the
+running frame's block: its statements, then its terminator. `run prog fuel state` steps until
+the entry function returns. Both are total (`def`, structural recursion), with no `partial`
+and no axiom.
+- **Outcomes:** `ok value`, `panic kind` (`Blaze.Error`'s kinds: `panic`, `arithmetic`,
+  `bounds`), `undefined why` (`uninit`, `moved`, `dangling`, `illTyped`, `illFormed`,
+  `unreachable`), `diverge` (out of fuel).
+- **Against `Blaze.Result`.** `Result` is `Outcome` without `undefined`:
+  `Outcome.ofResult` maps `ok`, `fail`, `div` to `ok`, `panic`, `diverge`, and
+  `Outcome.toResult?` is its inverse, `none` exactly on `undefined`. The functional models
+  assume a borrow-checked safe program has no undefined behaviour; a V7 theorem discharges
+  the assumption for its function, because it shows the run is an `ofResult`. Two differences
+  to know: the models read MIR's `Unreachable` as `fail unreachable`, the semantics as
+  undefined; a model counts loop turns as fuel, the semantics counts blocks.
+- **Integers** are `Blaze.Scalar`'s, the models' own: checked operations panic where
+  `Scalar.add` fails, `BinaryOp` wraps, casts are `Scalar.cast`. One home.
+- **Choices where MIR is open.** A `move` of a whole local leaves it `moved` (the evaluator
+  and Miri leave it readable; this semantics has more undefined behaviour there, never less).
+  An index out of bounds panics, as built MIR's index does; runtime MIR asserts first, so the
+  two agree. The rvalue is evaluated before the place it is assigned to.
+- **Proved** (`Run.lean`): `step_deterministic` (a state has one next outcome: `step` is a
+  function), `run_mono` (a run that ends, ends the same with any more fuel) and `run_agree`
+  (two runs of one state that both end agree). No frame lemma yet.
+
+**V6: the differential harness.** `harness/v2/mir_semantics.py differential` draws programs
+(arithmetic with overflow, a struct through a `&mut` parameter, an enum built and matched, a
+loop, an array index, an explicit panic with an early return and a division, shifts) and gets
+three answers per call: the Lean semantics on the body `hir_ty_lean::embed_mir` writes
+(`crates/hir-ty-lean/src/body/embed.rs`), blaze's MIR evaluator (`interpret_mir`), and the
+executable blaze builds. They must agree on the value or the kind of panic. The program is
+Lean source, the encoder's one output: the runner (`Blaze/Mir/Runner.lean`) has the programs
+compiled in and reads calls, so no second form of a body is parsed. The Rust half is the
+test `mir_semantics_corpus`, the smallest hook that reaches the encoder and the evaluator
+from a script; there is no `blaze debug` command for either.
+
+**V7: a model is tied to the semantics.** The chain for `fnv1a_from`:
+
+```text
+MIR of crates/blaze-graph/src/ledger.rs
+  = (golden test fnv1a_from_is_embedded_as_the_body_its_proof_walks)
+lean/BlazeMir/blaze_graph/ledger/fnv1a_from.lean       the embedded body
+  = (theorem BlazeGraph.LedgerMir.fnv1a_from_model_agrees)
+lean/BlazeModel/blaze_graph/ledger/fnv1a_from.lean     the functional model
+  = (theorem BlazeGraph.Ledger.fnv1a_from_returns)
+FNV-1a's fold of the seed over the bytes
+```
+
+The middle link says: for every seed, slice and `extra`, `run` with `4 * len + 4 + extra`
+steps is `Outcome.ofResult` of the model run with `len + 1` turns; with less fuel the run is
+`diverge` or the same value (`fnv1a_from_any_fuel`). The embedded body is a prediction of the
+encoder's output until the golden test runs; when it differs, the file is rewritten and the
+block theorems of `LedgerMir.lean` (one per block, each failing alone) are redone.
+
+How it scales: **the translator emits the proof with the model**, a script that follows the
+translation's structure and applies one lemma per construct (`Blaze/Mir/Lemmas.lean`, the
+first step, used by the `fnv1a_from` proof): an assignment is `execStmt_assign`; a copy or
+move `evalOperand_copy`/`_move`; a binary rvalue `evalTwo_ok` with the operator's `Scalar`
+fact (`binaryOp_checked_add`, `binaryOp_same`); an index `inBounds_some`; a block
+`step_block`; a branch a case split on the tested value; a loop an induction on the model's
+fuel, with the live locals as the invariant's state; a call the callee's theorem. The other
+route, a checker `agree : Body → Model → Bool` proved sound once and evaluated per function,
+was not taken: a model is a Lean function, not data, so the checker would need a second deep
+embedding of the model language and its own semantics, and the evaluation of a loop's
+agreement does not terminate by `rfl`. `native_decide` is not allowed either way.
+
+**V8: the first proved transformations** (`Blaze/Mir/Opt`). A pass is a Lean function on
+programs; it is the specification of the Rust pass of the same name.
+- **Refinement.** `Outcome.Refines target source`: the source is undefined, or the two are
+  equal. Behaviours of the target are behaviours of the source.
+- **`run_mapBlocks`.** A rewrite that leaves each block's meaning as it was from every state
+  preserves every run, with the same fuel. Proved for `removeStorageMarkers`
+  (`RemoveStorageMarkers`: true in this semantics because a marker does nothing in it) and
+  `simplifyConstCondition` (`SimplifyConstCondition`'s direct form: a `switchInt` or an
+  `assert` on a constant).
+- **The Rust passes are held to them by translation validation.** The test
+  `the_passes_are_their_lean_specifications` and `mir_semantics.py validate` run each pass
+  alone on runtime MIR, embed the body before and after, and Lean checks
+  `example : after = spec before := rfl` (`lean/BlazeValidated`): a syntactic check the
+  kernel decides. `RemoveStorageMarkers` does exactly its specification. The Rust
+  `SimplifyConstCondition` also takes a condition that reads a place the statement before
+  assigned a constant; there `after ≠ spec before` and the build says so.
+- **What the general validator needs** (V8's large-pass half, for `DeadStoreElimination`,
+  `CopyProp`, `Inline`): a simulation relation weaker than equality (states equal on live
+  locals; a `moved` slot related to any slot, CompCert's `lessdef`), `step` proved monotone
+  in it, and a checker `validate : Body → Body → Bool` proved to imply the simulation, run
+  by `rfl` per function.
+
+**The trusted base** (what a `(proved: ..)` of rule 57 rests on, beyond what is proved):
+- Lean's kernel, and the axioms `propext`, `Classical.choice`, `Quot.sound`.
+- That `lean/Blaze/Mir` is what Rust means, on the subset. Reduced by V6's three-way run.
+- The encoder (`body/embed.rs`): the blocks it keeps, false edges as `goto`, the intrinsics.
+  Reduced by V6 and by the golden tests.
+- The memory model's coverage: what it cannot express, above.
+- `Blaze.Scalar` and the intrinsics as the meaning of core's integer operations.
+- The functional translation, for every model without a V7 theorem (all but `fnv1a_from`).
+- blaze's front end up to MIR: parsing, name resolution, type and borrow checking, MIR
+  building. A proof is about the MIR blaze built.
+- Runtime lowering (`crates/hir-ty-mir/src/mir/transform`: `AddAsserts`, `ElaborateDrops`,
+  cleanup, upvars, packed drops) and every MIR pass without a proof or a validation
+  (`crates/hir-ty-mir/src/mir/optimize`): `CleanupPostBorrowck`, `SimplifyCfg`, `HeapToStack`,
+  `BoxInPlace`, `CheckAlignment`, `CheckNull`, `CheckEnums`, `LowerSliceLenCalls`,
+  `InstSimplify`, `Devirtualize`, `Inline`, `RemoveUnneededDrops`, `UnreachablePropagation`,
+  `SimplifyLocals`, `DeadStoreElimination`, `SingleUseConsts`, `RemoveNoopLandingPads`,
+  `CopyProp`, `CriticalCallEdges`, `Specialize`, monomorphization, and
+  `SimplifyConstCondition` where it does more than its specification.
+- MIR to Cranelift IR lowering in `crates/hir-ty-codegen` (today's path), with layout, ABI
+  and unwinding.
+- Below it: the stencils, LLVM, the linker, the loader and live patching, the OS, hardware.
+
+## Two semantics, one lowering
+
+MIR's semantics, above, is the specification of Rust programs: typed, with places, panics
+and undefined behaviour. LIR ([lir.md](lir.md), `crates/blaze-lir`, ledger L1) will get its
+own, lower semantics: SSA with block parameters, machine types, bytes and pointers with
+provenance, no Rust types. It is not written now: LIR has no producer yet (code generation
+still builds Cranelift IR from MIR), and a specification nothing runs against rots.
+
+The chain, once L1 is built:
+1. **MIR to LIR is the one large lowering** (layout, ABI, drop elaboration, unwinding). It is
+   held by translation validation per function, against both semantics (ledger V9).
+2. **LIR passes** are proved or validated against LIR's semantics, as MIR passes are here.
+3. **LIR to machine code** (the stencils, LLVM) stays in the trusted base.
+
+The two memory models meet in one relation, which this semantics must keep statable: a
+structured value is related to the bytes its type's layout encodes it as (and a `Pointer` to
+an address with provenance for its allocation). Every choice in `Value.lean` is made so that
+relation can be written: values carry no layout, and nothing in the semantics reads one.
 
 ## v1: interior mutability and unsafe, by deep embedding
 
@@ -448,8 +636,8 @@ library, every golden model and the proofs. After a deliberate change to the tra
 on them.
 
 **How.**
-- A deep embedding: an operational semantics of structured MIR in Lean, over a heap with
-  permissions, plus a separation logic over it.
+- The deep embedding of "The semantics of MIR", grown to a heap with permissions (then
+  bytes), plus a separation logic over it.
 - The logic follows [RustBelt](https://plv.mpi-sws.org/rustbelt/popl18/) and
   [Iris](https://iris-project.org/), built on
   [iris-lean](https://github.com/leanprover-community/iris-lean): its MoSeL proof mode, the
@@ -467,9 +655,8 @@ module is blaze's own code.
 **Refused:** atomics (v2), FFI except through a modelled boundary, inline assembly, and
 anything that depends on layout beyond what the layout query proves (until v4).
 
-**Trust base:** v0's, plus the MIR semantics in Lean and its memory model. It must agree with
-the MIR evaluator, which blaze's `--ub` checker uses ([unsafe.md](unsafe.md)), on a corpus,
-and differential runs keep the two aligned.
+**Trust base:** v0's, plus the MIR semantics in Lean and its memory model, held to the MIR
+evaluator and to built code by V6's differential runs.
 
 **First target:** the bump arena behind `Vec::new_in(frame)` (`bump-allocate`). Every block it
 hands out is in bounds, aligned, and disjoint from every other live block, and a reset frees
@@ -484,7 +671,7 @@ lifetime-logic port is a separate effort of similar size.
   Stacked Borrows is an open question in Rust itself). Proofs must target the rule set the
   pinned nightly's Miri uses, and change when that changes.
 
-**CI:** as in v0. The semantics also gets a differential run against the MIR evaluator.
+**CI:** as in v0.
 
 ## v2: atomics, sequentially consistent first, then weak memory
 
@@ -575,16 +762,15 @@ order:
 1. **Layout and ABI.** A Lean spec of the pinned nightly's layout rules for `repr(Rust)`, `C`,
    `transparent` and niche filling, and a proof that blaze's layout query implements it.
    Every rule in the spec is cited to the rustc source at the pinned commit.
-2. **Const eval.** blaze's MIR evaluator refines v1's MIR semantics.
-3. **The translator itself.** The structured-MIR-to-Lean translation is sound against v1's
-   semantics: v0's functional model is a refinement of the deep embedding, as Aeneas proved
-   its symbolic semantics against a borrow checker (ICFP 2024). This removes the emitter from
-   the trust base.
+2. **Const eval.** blaze's MIR evaluator refines the MIR semantics (V6 tests it today).
+3. **The translator itself.** Each emitted model is proved against the MIR semantics
+   (objective V7, "The semantics of MIR"); a proof of the translator once and for all would
+   replace the per-model proofs.
 4. **Trait resolution.** Coherence, and determinism of selection. Full equivalence with
    rustc's solver is out of scope, because the solver itself is still changing upstream.
 
-**Refused:** codegen and linking (the stencils and LLVM) stay in the trust base. Proving them
-would mean a CompCert-scale effort and is not planned.
+**Refused:** machine code generation and linking (the stencils and LLVM) stay in the trust
+base. The lowering above them is validated, not proved ("Two semantics, one lowering").
 
 **Trust base:** shrinks from v0's by the parts proved above.
 

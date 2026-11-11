@@ -47,6 +47,8 @@ use crate::{
     structured::{self, Cfg, CfgBlock, End, Exit, Node},
 };
 
+pub mod embed;
+
 pub type Local = u32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
