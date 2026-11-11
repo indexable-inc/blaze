@@ -670,4 +670,10 @@ example :
       true := by
   decide
 
+/-- The pass as a rewrite of the witness validator: the certificate is the script's data. -/
+example :
+    Opt.validateWith storeAcross (Opt.removeDead liveAcross Opt.refsOf storeAcross)
+        [Opt.Rewrite.removeDead liveAcross] = true := by
+  decide
+
 end Blaze.Mir.Tests

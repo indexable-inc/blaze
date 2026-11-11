@@ -18,10 +18,9 @@ the terminator goes to (a call's destination, written whole, may be). A `ret` re
 `removeDead cert borrowed prog`: a store `l = rv` to a whole local that is not live after
 it, never borrowed, of an rvalue that cannot panic or move, becomes a `nop`.
 
-Here: the definitions, the check, what a passed check says of one statement
-(`stmtLive_dead`), and examples. Not here, and so no theorem about `removeDead` yet: the
-terminators, calls and returns on related states (piece d) and `removeDead_refines`
-(piece e); `Opt/Puts.lean` is what they rest on.
+Here: the definitions, the check, and what a passed check says of one statement
+(`stmtLive_dead`). The theorem, `removeDead_refines`, is in `Opt/RemoveDead.lean`, on
+`Opt/Puts.lean` and `Opt/PutsTerm.lean`.
 -/
 
 namespace Blaze.Mir.Opt
