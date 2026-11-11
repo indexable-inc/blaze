@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-64 theorems: 51 in `lean`, 13 in `lean/analysis`.
+65 theorems: 52 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -496,13 +496,22 @@ theorem execStmt_okAt {B : FnId → Local → Prop} {ids : List (Nat × FnId)} (
       Outcome.all_bind (Outcome.all_true _) (fun ptr _ =>
         (fun st' h =>
           And.intro
-            ((State.write_ids r.2 ptr r.1 st' h).trans (And.left (And.right hr)))
+            (Covers.of_ids (State.write_ids r.2 ptr r.1 st' h) (And.left (And.right hr)))
             (State.write_ok (And.right (And.right hr)) ptr r.1 (And.left hr) st' h))))
   | Statement.storageLive _, _ => Outcome.all_ok hs
   | Statement.storageDead _, _ => Outcome.all_ok hs
   | Statement.nop, _ => Outcome.all_ok hs
 
 end Blaze.Mir
+```
+
+**`Blaze.Mir.step_borrows`** (`Blaze.Mir.Opt.BorrowStep`, `lean`): Every step keeps the borrow invariant: memory holds only pointers to frame 0 or to a local the function of its frame may borrow, and no pointer names a frame not yet made.
+
+```lean
+theorem step_borrows {B : FnId → Local → Prop} {prog : Program} (hf : ProgFine B prog)
+    {g : List (Nat × FnId)} :
+    ∀ (st : State), Borrows B g st → Outcome.All (NextBorrows B) (step prog st)
+  | { base
 ```
 
 **`Blaze.Mir.Opt.simplifyCfg_call`** (`Blaze.Mir.Opt.SimplifyCfg`, `lean`): SimplifyCfg composed from the proved passes keeps every call that ends, and not in undefined behaviour: the same outcome with the same fuel.

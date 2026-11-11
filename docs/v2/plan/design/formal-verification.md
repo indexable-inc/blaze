@@ -683,7 +683,14 @@ programs; it is the specification of the Rust pass of the same name.
     `ref` the pointer its place evaluates to; so a statement keeps the invariant
     (`execStmt_okAt`) when every `ref` in it is of a place whose base may be borrowed or
     that goes through a dereference (`StmtFine`: the Rust pass's "ever borrowed" as a
-    condition on the body). The rest is below.
+    condition on the body).
+  - **Dead-store elimination: fourth piece** (`Opt/NextId.lean`, `Opt/BorrowStep.lean`; not
+    yet elaborated). `Borrows B g st`: `g` lists every frame the run has made, those that
+    returned too, with ids below the next one, and memory holds only pointers to frame 0 or
+    to a local that the function of its frame may borrow. A call adds its frame to `g`, a
+    return leaves it. `step_borrows`: every step keeps it, for a program whose every `ref`
+    is of a place that may be borrowed or goes through a dereference (`ProgFine`). The rest
+    is below.
   - **Dead-store elimination: what is not written.** It needs a relation, not a map: two states
     equal but on dead locals. The Rust pass (`optimize/dse.rs`) removes the whole assignment
     of an rvalue it holds to be free of effects (all but a pointer-to-address cast), to a
