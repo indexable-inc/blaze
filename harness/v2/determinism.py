@@ -242,9 +242,9 @@ def across(eng: engine.Engine, rep: report.Report, top: Path) -> None:
     if found:
         lines = [f"`{name}` (key {key[:16]})" for name, key in found[:SHOWN]]
         more = f"\n... and {len(found) - SHOWN} more" if len(found) > SHOWN else ""
-        rep.add(ACROSS_NAME, "fail", f"{len(found)} functions `first`'s build kept in the store are not what `second`'s "
-                "build computes under the same key, so the key misses an input:\n" + "\n".join(lines) + more,
-                differing=len(found))
+        rep.add(ACROSS_NAME, "fail", f"the store check refused `second`, naming {len(found)} functions `first`'s build "
+                "kept in the store that are not what `second`'s build computes under the same key, so the key misses "
+                "an input:\n" + "\n".join(lines) + more, differing=len(found))
         return
     if second.returncode != 0:
         rep.add(ACROSS_NAME, "fail", f"{label}: `blaze build` exited {second.returncode}:\n{second.said()}")

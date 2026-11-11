@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-102 invariants, 19 refinements, 7 reference models.
-By level: 90 tested, 30 simulated, 1 model-checked, 0 proved.
+104 invariants, 19 refinements, 7 reference models.
+By level: 91 tested, 31 simulated, 1 model-checked, 0 proved.
 
 ## Invariants
 
@@ -252,6 +252,7 @@ By level: 90 tested, 30 simulated, 1 model-checked, 0 proved.
 
 - **`a_process_is_given_its_own_stream_whoever_else_asks`** *tested* (`crates/blaze-usercode/src/provider.rs`): what a process is given by `getrandom` is its own stream's bytes in order, a function of the seed and the process alone, however the asks of the run's processes interleave and however each cut its own.
   Controls: `a_count_shared_by_all_processes`.
+- **`a_probe_is_a_search_directory_or_a_library_name_directly_in_one`** *simulated* (`crates/blaze-usercode/src/pure/tests.rs`): a read is the loader's walk of the run's library search path exactly when it is a search directory (there or not) or a library's name directly in one; a name found there is a load, which no pure key covers.
 
 ### hir
 
@@ -303,6 +304,11 @@ By level: 90 tested, 30 simulated, 1 model-checked, 0 proved.
   Controls: `a_clone_the_cpu_lacks`, `the_baseline_chosen_over_a_supported_clone`, `two_clones_of_one_set`.
 - **`clones_never_share_a_feature_set`** *tested* (`crates/target-features/src/multiversion.rs`): no two clones of a plan have one feature set, and none has the unit's, so the baseline and the clones are compiled with pairwise different sets and (their feature names being part of an instance's shape) never share a code identity.
   Controls: `a_clone_the_cpu_lacks`, `the_baseline_chosen_over_a_supported_clone`, `two_clones_of_one_set`.
+
+### v2
+
+- **`a_function_of_the_build_is_one_request_however_a_body_names_it`** *tested* (`crates/hir-ty-codegen/v2/release.rs`): a release compile asks for each function of the build once, whatever the bodies it is made of call it: a request of an import's body whose target among the compile's references is one the compile already asks for, with the same signature, is that request. The import's body is linked under the first request of its function ([`emit`]), so a call through a second would be of a declaration LLVM has no body of, and whether there is a second follows from which crate each body was compiled in (the first asker's of the walk), which no key of the compile holds: the store then held one key's code two ways (`BLAZE_VERIFY_STORE`, 2026-11-11: `alloc::vec::from_elem::<u8>` built `RawVecInner::try_allocate_in` in at both of its calls in one program's unit and at one of them in another's).
+  Controls: `a_request_kept_apart_by_its_name`.
 
 ## Refinements
 
