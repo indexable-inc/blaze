@@ -2035,6 +2035,14 @@ impl ScriptRun {
                         said::run(unit, traced);
                         checked =
                             pure::check(&job, run_unit, unit, prepared.script_env(), traced);
+                        // A run its proof refuses is kept under no key: kept under its
+                        // sandboxed one, the next build would find it there, never run or
+                        // check it, and succeed where this one failed (no-fallback: a
+                        // refusal that a retry makes go away).
+                        if let Some(Err(what)) = &checked {
+                            // clone: error path, once per refused run
+                            return Err(blaze_build_script::Error(what.clone()));
+                        }
                         script::keyed(prepared, traced)
                     },
                 );
