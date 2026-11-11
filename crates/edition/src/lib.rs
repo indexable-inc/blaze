@@ -92,3 +92,55 @@ impl fmt::Display for Edition {
         })
     }
 }
+
+/// blaze's syntax extensions a crate turns on with a crate attribute, which change what the
+/// parser accepts: with none on, the parser is Rust's, error for error. A file is parsed with
+/// its crate's set (the `span` crate's `EditionedFileId` carries it beside the edition), so the
+/// set is part of every key a parse is stored under. Each bit is one extension; the set is
+/// closed, and an unknown bit is refused when read back ([`Extensions::from_bits`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Extensions {
+    bits: u8,
+}
+
+impl Extensions {
+    /// No extension: Rust's syntax.
+    pub const NONE: Extensions = Extensions { bits: 0 };
+    /// `#![blaze::records]`: the record type `{ a: T, b: U }`, the record value
+    /// `{ a: x, b: y }`, the record pattern `{ a, b: p, .. }` and a record parameter's field
+    /// defaults (docs/v2/plan/design/records.md; docs/v2/plan/design/edition.md, change 4).
+    /// Bit 2: bits 0 and 1 are `uniq` and `error_unions` on the edition's integration branch,
+    /// so the fold there adds this constant, its accessor and one `EXTENSION_ATTRS` row.
+    pub const RECORDS: Extensions = Extensions { bits: 1 << 2 };
+    /// Every bit some extension has.
+    const KNOWN: u8 = Self::RECORDS.bits;
+
+    /// The set as one byte, as [`Extensions::from_bits`] reads it back.
+    pub const fn bits(self) -> u8 {
+        self.bits
+    }
+
+    /// The set of `bits`, or `None` when a bit is no extension's.
+    pub const fn from_bits(bits: u8) -> Option<Extensions> {
+        match bits & !Self::KNOWN {
+            0 => Some(Extensions { bits }),
+            _ => None,
+        }
+    }
+
+    /// Both sets' extensions.
+    #[must_use]
+    pub const fn with(self, other: Extensions) -> Extensions {
+        Extensions { bits: self.bits | other.bits }
+    }
+
+    /// Whether no extension is on.
+    pub const fn is_none(self) -> bool {
+        self.bits == 0
+    }
+
+    /// Whether `#![blaze::records]` is on.
+    pub const fn records(self) -> bool {
+        self.bits & Self::RECORDS.bits != 0
+    }
+}

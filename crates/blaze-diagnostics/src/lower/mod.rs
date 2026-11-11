@@ -48,6 +48,8 @@ pub(crate) mod object_without_trait;
 pub(crate) mod parenthesized_generic_args_without_fn_trait;
 pub(crate) mod pattern_arg_in_extern_fn;
 pub(crate) mod pattern_type_not_lowered;
+pub(crate) mod record_refused;
+pub(crate) mod record_use_refused;
 pub(crate) mod query_cycle;
 pub(crate) mod self_ctor_not_tuple_or_unit;
 pub(crate) mod trait_impl_incorrect_safety;
@@ -225,6 +227,8 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> 
         AnyDiagnostic::MissingSelfDefaultParams(d) => missing_self_default_params::lower(cx, &d),
         AnyDiagnostic::ObjectWithoutTrait(d) => object_without_trait::lower(cx, &d),
         AnyDiagnostic::PatternTypeNotLowered(d) => pattern_type_not_lowered::lower(cx, &d),
+        AnyDiagnostic::RecordRefused(d) => record_refused::lower(cx, &d),
+        AnyDiagnostic::RecordUseRefused(d) => record_use_refused::lower(cx, &d),
         AnyDiagnostic::QueryCycle(d) => query_cycle::lower(cx, &d),
         AnyDiagnostic::NotAStructPath(d) => not_a_struct_path::lower(cx, &d),
         AnyDiagnostic::AutoderefRecursionLimit(d) => autoderef_recursion_limit::lower(cx, &d),

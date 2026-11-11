@@ -44,7 +44,8 @@ use crate::{
         Adjust, Adjustment, AllowTwoPhase, AutoBorrow, AutoBorrowMutability, CallArguments,
         CaptureInfo, CaptureSourceStack, CapturedPlace, ClosureData, ComptimeLoop,
         ExplicitDropMethodUseKind, InferenceDiagnostic, InferenceResult, MinCaptures,
-        OverloadedDeref, PatAdjust, PatAdjustment, PointerCast, ReturnKind, StructPathDef,
+        OverloadedDeref, PatAdjust, PatAdjustment, PointerCast, RecordProblem, ReturnKind,
+        StructPathDef,
         StructPathFound, Unreachable, UnreachableAt, UpvarCapture,
         cast::{CastError, CastPointerKind, CastPointers},
         closure::analysis::{
@@ -2319,6 +2320,33 @@ impl Sink {
                 self.words.extend([80, local(*expr), form]);
             }
             D::NonExhaustiveRecordExpr { expr } => self.words.extend([13, local(*expr)]),
+            D::RecordRefused { node, problem } => {
+                self.word(81);
+                self.node(*node);
+                match problem {
+                    RecordProblem::NotEnabled => self.word(0),
+                    RecordProblem::TypeUnknown => self.word(1),
+                    RecordProblem::NotARecord => self.word(2),
+                    RecordProblem::NoSuchField(name) => {
+                        self.word(3);
+                        self.name(name);
+                    }
+                    RecordProblem::DuplicateField(name) => {
+                        self.word(4);
+                        self.name(name);
+                    }
+                    RecordProblem::MissingField(name) => {
+                        self.word(5);
+                        self.name(name);
+                    }
+                    RecordProblem::MissingDefault { field, function } => {
+                        self.word(6);
+                        self.name(field);
+                        self.id(*function);
+                    }
+                    RecordProblem::NoCallee => self.word(7),
+                }
+            }
             D::NonExhaustiveRecordPat { pat, variant } => {
                 self.words.extend([14, local(*pat)]);
                 self.variant(*variant);
@@ -3386,6 +3414,20 @@ impl Source<'_> {
                 },
             },
             13 => D::NonExhaustiveRecordExpr { expr: self.local()? },
+            81 => D::RecordRefused {
+                node: self.node()?,
+                problem: match self.word()? {
+                    0 => RecordProblem::NotEnabled,
+                    1 => RecordProblem::TypeUnknown,
+                    2 => RecordProblem::NotARecord,
+                    3 => RecordProblem::NoSuchField(self.name()?),
+                    4 => RecordProblem::DuplicateField(self.name()?),
+                    5 => RecordProblem::MissingField(self.name()?),
+                    6 => RecordProblem::MissingDefault { field: self.name()?, function: self.id()? },
+                    7 => RecordProblem::NoCallee,
+                    _ => return Err(self.invalid("a record refused for no reason")),
+                },
+            },
             14 => D::NonExhaustiveRecordPat { pat: self.local()?, variant: self.variant()? },
             15 => D::UnionPatMustHaveExactlyOneField { pat: self.local()? },
             16 => D::UnionPatHasRest { pat: self.local()? },
@@ -4110,6 +4152,29 @@ mod tests {
             D::AsyncCoroutinesNotSupported { expr: expr(10) },
             D::ComptimeNotYetSupported { expr: expr(9), form: ComptimeForm::ReflectedField },
             D::NonExhaustiveRecordExpr { expr: expr(9) },
+            D::RecordRefused { node: expr(9).into(), problem: RecordProblem::NotEnabled },
+            D::RecordRefused { node: pat(3).into(), problem: RecordProblem::TypeUnknown },
+            D::RecordRefused { node: pat(3).into(), problem: RecordProblem::NotARecord },
+            D::RecordRefused {
+                node: expr(9).into(),
+                problem: RecordProblem::NoSuchField(Name::new_root("mod")),
+            },
+            D::RecordRefused {
+                node: expr(9).into(),
+                problem: RecordProblem::DuplicateField(Name::new_root("mode")),
+            },
+            D::RecordRefused {
+                node: pat(3).into(),
+                problem: RecordProblem::MissingField(Name::new_root("mode")),
+            },
+            D::RecordRefused {
+                node: expr(9).into(),
+                problem: RecordProblem::MissingDefault {
+                    field: Name::new_root("path"),
+                    function: FunctionId::from_id(id(7)),
+                },
+            },
+            D::RecordRefused { node: expr(9).into(), problem: RecordProblem::NoCallee },
             D::NonExhaustiveRecordPat { pat: pat(7), variant },
             D::UnionPatMustHaveExactlyOneField { pat: pat(8) },
             D::UnionPatHasRest { pat: pat(9) },

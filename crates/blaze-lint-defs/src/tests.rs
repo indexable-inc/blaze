@@ -54,6 +54,7 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
     assert_eq!(lint.default_level, Level::Warn);
     assert_eq!(blaze_lints().len(), 89);
     assert_eq!(blaze_lints().len(), 91);
+    assert_eq!(blaze_lints().len(), 87);
     assert!(!lint.is_externally_loaded);
     // The compiler's own and the release build's; blaze-lints loads every other.
     let built: Vec<&str> =

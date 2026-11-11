@@ -1474,6 +1474,20 @@ impl<'db> Ty<'db> {
                     ret.hir_fmt(f)?;
                 }
             }
+            // blaze: a record (`#![blaze::records]`) prints as it is written, `{ a: A, b: B }`,
+            // its fields in canonical order.
+            TyKind::Adt(..) if crate::record::record_fields(f.lang_items(), *self).is_some() => {
+                if let Some(record) = crate::record::record_fields(f.lang_items(), *self) {
+                    write!(f, "{{")?;
+                    for (at, name) in record.names().enumerate() {
+                        write!(f, "{}{name}: ", if at == 0 { " " } else { ", " })?;
+                        if let Some(ty) = record.ty(at) {
+                            ty.hir_fmt(f)?;
+                        }
+                    }
+                    write!(f, "{}", if record.is_empty() { "}" } else { " }" })?;
+                }
+            }
             TyKind::Adt(def, parameters) => {
                 let def_id = def.def_id();
                 match f.display_kind {
@@ -2587,6 +2601,21 @@ impl<'db> HirDisplayWithExpressionStore<'db> for TypeRefId {
                 ty.hir_fmt(f, owner, store)?;
                 write!(f, " is ")?;
                 pat.hir_fmt(f, owner, store)?;
+            }
+            TypeRef::Record { names, types, defaults } => {
+                // blaze's record type (`#![blaze::records]`) as written; a default is `= ..`.
+                let edition = f.edition();
+                write!(f, "{{")?;
+                for (at, name) in store.names(names).iter().enumerate() {
+                    write!(f, "{}{}: ", if at == 0 { " " } else { ", " }, name.display(f.db, edition))?;
+                    if let Some(ty) = types.get(at) {
+                        ty.hir_fmt(f, owner, store)?;
+                    }
+                    if defaults.get(at).is_some() {
+                        write!(f, " = ..")?;
+                    }
+                }
+                write!(f, "{}", if types.is_empty() { "}" } else { " }" })?;
             }
             TypeRef::UnsafeBinder { lifetimes, ty } => {
                 let lifetimes = store.names(lifetimes);

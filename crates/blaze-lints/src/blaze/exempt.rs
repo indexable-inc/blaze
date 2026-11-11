@@ -45,6 +45,7 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         // the item, not of one line.
         | Lint::StructUpdate
         | Lint::BoolParam
+        | Lint::ManyBools
         // Kept with `#[expect(..)]`: a core and a key are choices of the item, not of one line
         // (`key_ignores_field`'s `// not in key: <why>` names one field, through [`commented`]).
         | Lint::SansIoCore

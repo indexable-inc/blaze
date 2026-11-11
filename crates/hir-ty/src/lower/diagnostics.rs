@@ -84,6 +84,35 @@ pub enum TyLoweringDiagnostic {
         def: GenericDefId,
         query: CycleQuery,
     },
+    /// The record type `{ a: T, .. }` at `source` (blaze, `#![blaze::records]`) refused for
+    /// `reason`.
+    RecordRefused {
+        source: TypeRefId,
+        reason: RecordRefusal,
+    },
+}
+
+/// Why a record type is refused ([`TyLoweringDiagnostic::RecordRefused`]). A field is named by
+/// its place among the fields as written.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+pub enum RecordRefusal {
+    /// The crate does not say `#![blaze::records]` plainly among the inner attributes that
+    /// open its root (under `cfg_attr` it is not read): its file is parsed with the syntax
+    /// only because another crate of its source root says it.
+    NotEnabled,
+    /// `core` declares no `#[lang = "record"]` type to lower the record to.
+    NoLangItem,
+    /// The field at this place has the name of an earlier field.
+    DuplicateField(u32),
+    /// The field at this place has a default (`= expr`), and the record is not the type of a
+    /// function's parameter, the one place a default is read.
+    DefaultOutsideParameter(u32),
+    /// The field at this place has a default, and the function is a method of a trait impl:
+    /// a trait method's defaults are its declaration's, which every caller reads.
+    DefaultInTraitImpl(u32),
+    /// The record is the type of a parameter of a function whose ABI is not Rust's
+    /// (`extern "C" fn`): no other ABI says how a record is passed.
+    ExternAbi,
 }
 
 /// The query of `def` whose computation needed itself, in a [`TyLoweringDiagnostic::QueryCycle`].

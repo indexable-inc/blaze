@@ -163,6 +163,7 @@
 #![feature(try_blocks)]
 #![feature(uint_carryless_mul)]
 #![feature(unboxed_closures)]
+#![feature(unsized_const_params)]
 #![feature(unsized_fn_params)]
 #![feature(with_negative_coherence)]
 // tidy-alphabetical-end
@@ -288,6 +289,10 @@ pub mod field;
 // blaze's compile-time reflection (`library/UPSTREAM` lists it among blaze's changes).
 #[unstable(feature = "blaze_comptime", issue = "none")]
 pub mod reflect;
+// blaze's records, the type of `{ a: A, b: B }` under `#![blaze::records]` (`library/UPSTREAM`
+// lists it among blaze's changes).
+#[unstable(feature = "blaze_records", issue = "none")]
+pub mod record;
 // blaze's own attribute macros, `blaze::contract_test` (`library/UPSTREAM` lists it among blaze's
 // changes).
 #[unstable(feature = "blaze_verify", issue = "none")]

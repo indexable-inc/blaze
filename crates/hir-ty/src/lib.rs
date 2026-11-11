@@ -53,6 +53,7 @@ pub mod method_resolution;
 pub mod mir;
 pub mod primitive;
 pub mod providers;
+pub mod record;
 pub mod solver_errors;
 pub mod traits;
 pub mod used_imports;
@@ -110,7 +111,8 @@ use crate::{
 pub use autoderef::autoderef;
 pub use infer::{
     Adjust, Adjustment, AutoBorrow, BindingMode, ByRef, CallArguments, ExplicitDropMethodUseKind,
-    InferenceDiagnostic, InferenceResult, OverloadedDeref, PointerCast, ReturnKind, StructPathDef,
+    InferenceDiagnostic, InferenceResult, OverloadedDeref, PointerCast, RecordProblem, ReturnKind,
+    StructPathDef,
     StructPathFound, Unreachable, UnreachableAt,
     cast::{CastError, CastPointerKind, CastPointers},
     could_coerce, could_unify, could_unify_deeply, infer_query_with_inspect,
@@ -127,7 +129,11 @@ pub use lower::{
     diagnostics::*,
     elided_groups, elided_lifetimes, hir_mutability, hybrid_param_env, lower_mutability,
     persist::{BatchKind, ColdBatch, ColdBatchRef, PredicatesRec},
-    predicate_sources, solver_fn_sig, supertraits_cycle, with_elided_regions,
+    predicate_sources,
+    record::{
+        RecordParamDefault, record_defaults_owner, record_param_default, record_param_defaults,
+    },
+    solver_fn_sig, supertraits_cycle, with_elided_regions,
 };
 pub use opaques::{rpit_hidden_types, tait_hidden_types};
 pub use specialization::{

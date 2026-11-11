@@ -38,7 +38,7 @@ it.
 | 1 | **Handles copy themselves.** `Handle` marks types whose clone is a second reference to the same thing (`Arc`, `Rc`, channel senders, interned ids). Where a handle would be moved and is used again, it is copied; the last use moves. | `.clone()` on handles, clone-then-move blocks | here | small |
 | 2 | **Error unions.** `A \| B` in type position is an anonymous enum, order-free; `?` widens a smaller set into a larger one; `match` on it is exhaustive. | error enums, `From` impls, `anyhow`, `thiserror` | here | medium |
 | 3 | **View types.** `fn old_keys(&self.{lru})` says which fields a method borrows. | structs split to please the borrow checker | here | medium |
-| 4 | **Records and named arguments.** `{ a: T, b: U }` is a type, equal to any record with the same fields; fields may have defaults. | builders, options structs, one-off structs | here | medium |
+| 4 | **Records and named arguments.** `{ a: T, b: U }` is a type, equal to any record with the same fields; fields may have defaults. | builders, options structs, one-off structs | [records](records.md) | medium |
 | 5 | **Capabilities as parameters.** With [bstd](std.md), a function touches only what it is handed, so one with no `Fs` or `Dir` parameter cannot reach the disk. (A `with` clause to pass them by name is deferred.) | ambient files, clock, network, allocator | [std](std.md) | large |
 | 6 | **Effects are what a function may do.** `#[blaze::may(panic, alloc, block, diverge)]` lists a function's effects, and an unlisted one is checked absent; a module's `#![blaze::may(..)]` is the default of the functions in it; pure is derived; ambient, unsafe and may-suspend follow the same form; a function that takes a closure does what the closure does. | `async`/`await`, and the async, const and `try_` twins of every API | [effects](effects.md), [pure-fns](pure-fns.md), [may-suspend](may-suspend.md) | medium |
 | 7 | **Values that must be used up.** A `#[blaze::linear]` value cannot be dropped; every path hands it to a function that takes it by value. | forgotten commits, drop bombs | [linear](linear.md) | medium |
@@ -86,7 +86,7 @@ it.
 - A view is part of the method's type for the borrow checker only; layout and ABI are unchanged
   (the method still receives the whole pointer).
 
-**4. Records.**
+**4. Records.** (Spec: [records](records.md).)
 - `{ path: PathBuf, size: u64 }` is structural: field names and types, in any order. It has
   `Clone`, `Debug`, `Eq`, `Hash` and `Default` when its fields do, as a tuple has. To give it
   methods or other traits, name it.
@@ -174,6 +174,9 @@ is an error. Where a mechanical fix exists, `blaze check --fix` applies it.
 | `blaze::undeclared_effect` | a function that may panic, allocate from the global heap, block or not return where its `#[blaze::may(..)]`, its trait method's, a module's default or the gate (`#![blaze::effects]`, which the edition turns on) does not allow it ([effects](effects.md)); `deny` wherever something is declared | writes the list with the missing words: under the gate, `#[blaze::may(..)]` with exactly the inferred effects on every function that needs one |
 | `blaze::unneeded_effect` | a word of a private function's list for an effect it is proved not to have | takes the word off |
 | `blaze::negative_effect` | `#[blaze::nopanic]`, `#[blaze::noalloc]`, `#[blaze::nonblocking]` where effects are declared positively | rewrites to the `#[blaze::may(..)]` they stand for |
+| `blaze::many_bools` | a call passing two or more bare `bool` literals by position ([records](records.md), change 4) | none: suggests a record parameter |
+| `blaze::options_struct` | a function whose last parameter is a struct used only as its options (once change 4 is in a release; not built) | none at first |
+| `blaze::unmarked_pure`, `unmarked_nopanic`, `unmarked_noalloc`, `unmarked_nonblocking` | a function the effects walk proves has that property and that lacks its attribute; `pub` functions by default, every function with `unmarked-effects-private = true` | adds the attribute; never one the check would then refuse |
 | `blaze::derivable_by_reflection` | a derive that reflection covers (once change 9 exists) | none at first |
 | `blaze::proc_macro_derive`, `proc_macro_attribute`, `proc_macro_fn_like` (the group `blaze::proc_macro`) | a procedural macro a workspace crate defines, one finding per macro, naming it and its kind: code blaze cannot see through | none: names the replacement of its kind (a generic impl over fields, reflection over the item, a `const fn`; a macro that parses a foreign syntax may stay) |
 | `blaze::build_script_ambient` | a workspace build script's use of the standard library's ambient file system, environment, processes, network or clock, one finding per item with its count: code blaze must run and trace to key | none: names the capability to take |

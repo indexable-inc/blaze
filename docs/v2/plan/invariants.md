@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-49 invariants, 16 refinements, 5 reference models.
-By level: 46 tested, 19 simulated, 0 model-checked, 0 proved.
+50 invariants, 16 refinements, 5 reference models.
+By level: 47 tested, 19 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
@@ -155,6 +155,8 @@ By level: 46 tested, 19 simulated, 0 model-checked, 0 proved.
 
 - **`a_write_of_a_file_has_a_job_for_its_crate_and_those_above_it_alone`** *tested* (`crates/hir-def/src/nameres/delta/tests.rs`): a crate with no job in a write (`delta::unreached`) is one whose job would change nothing, so after any write every crate's maintained map is the one a fresh resolution makes (`check_db`). And the cost: a write of a file has a job for its crate and the crates above it alone, not one for every crate of the graph.
   Controls: `a_crate_above_a_written_one_left_without_a_job`.
+- **`records_are_equal_exactly_when_their_field_sets_are`** *tested* (`crates/hir-def/src/record.rs`): two record types are equal exactly when their (name, type) sets are.
+  Controls: `field_order_in_the_key`, `a_default_in_the_type_identity`.
 
 ### hir-ty-lean
 

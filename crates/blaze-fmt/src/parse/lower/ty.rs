@@ -97,6 +97,10 @@ impl Lower<'_> {
                 self.unsupported(span, "a pattern type");
                 ast::TyKind::Err(ast::ErrorGuaranteed::unchecked_error_guaranteed())
             }
+            ra::Type::RecordType(_) => {
+                self.unsupported(span, "a record type (`#![blaze::records]`)");
+                ast::TyKind::Err(ast::ErrorGuaranteed::unchecked_error_guaranteed())
+            }
         };
         Box::new(ast::Ty {
             id: DUMMY_NODE_ID,

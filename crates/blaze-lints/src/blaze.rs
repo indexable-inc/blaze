@@ -74,6 +74,7 @@ mod lenient_deserialize_tests;
 mod lock_across_query;
 mod lock_held_across_slow;
 mod loops;
+mod many_bools;
 mod missing_size_hint;
 mod native_contracts;
 #[cfg(test)]
@@ -186,6 +187,7 @@ pub enum Lint {
     FixedKeyLookup,
     StructUpdate,
     BoolParam,
+    ManyBools,
     SansIoCore,
     KeyIgnoresField,
     WildcardArm,
@@ -393,6 +395,7 @@ impl Lint {
         Lint::FixedKeyLookup,
         Lint::StructUpdate,
         Lint::BoolParam,
+        Lint::ManyBools,
         Lint::SansIoCore,
         Lint::KeyIgnoresField,
         Lint::WildcardArm,
@@ -572,6 +575,7 @@ impl Lint {
             | Lint::WildcardArm
             | Lint::StructUpdate
             | Lint::BoolParam
+            | Lint::ManyBools
             // Its fix passes only blaze's (and nightly Rust's) borrow checker: on in workspaces
             // that turn on `internal`, allowed in the rest, so a published crate keeps building
             // with stable Rust.
@@ -634,6 +638,7 @@ impl Lint {
             Lint::FixedKeyLookup => "fixed_key_lookup",
             Lint::StructUpdate => "struct_update",
             Lint::BoolParam => "bool_param",
+            Lint::ManyBools => "many_bools",
             Lint::SansIoCore => "sans_io_core",
             Lint::KeyIgnoresField => "key_ignores_field",
             Lint::WildcardArm => "wildcard_arm",
@@ -737,6 +742,7 @@ impl Lint {
             Lint::FixedKeyLookup => concat!(docs!(), "#fixed_key_lookup"),
             Lint::StructUpdate => concat!(docs!(), "#struct_update"),
             Lint::BoolParam => concat!(docs!(), "#bool_param"),
+            Lint::ManyBools => concat!(docs!(), "#many_bools"),
             Lint::SansIoCore => concat!(docs!(), "#sans_io_core"),
             Lint::KeyIgnoresField => concat!(docs!(), "#key_ignores_field"),
             Lint::WildcardArm => concat!(docs!(), "#wildcard_arm"),
@@ -902,6 +908,9 @@ impl Lint {
             }
             Lint::BoolParam => {
                 "take a two-variant enum named for the choice instead of the `bool`, or say why it stays with `#[expect(blaze::bool_param, reason = \"..\")]`"
+            }
+            Lint::ManyBools => {
+                "name the choices at the call: a record parameter with defaults (`#![blaze::records]`) or two-variant enums; or say why the call stays with `#[expect(blaze::many_bools, reason = \"..\")]`"
             }
             Lint::SansIoCore => {
                 "take what the call reads as a parameter (`advance_clock(now)`) and hand back decisions (`take_decisions`, `next_deadline`); a driver injects IO through a trait object or a type parameter the core takes. Or say why with `#[expect(blaze::sans_io_core, reason = \"..\")]`"
@@ -1191,6 +1200,12 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     }
     if let Some(record) = ast::RecordExpr::cast(node) {
         struct_update::check(cx, record);
+    }
+    if let Some(call) = ast::CallExpr::cast(node) {
+        many_bools::check(cx, node, ast::HasArgList::arg_list(&call));
+    }
+    if let Some(call) = ast::MethodCallExpr::cast(node) {
+        many_bools::check(cx, node, ast::HasArgList::arg_list(&call));
     }
     if matches!(
         node.kind(),
