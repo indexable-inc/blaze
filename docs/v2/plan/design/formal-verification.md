@@ -684,8 +684,8 @@ programs; it is the specification of the Rust pass of the same name.
     (`execStmt_okAt`) when every `ref` in it is of a place whose base may be borrowed or
     that goes through a dereference (`StmtFine`: the Rust pass's "ever borrowed" as a
     condition on the body).
-  - **Dead-store elimination: fourth piece** (`Opt/NextId.lean`, `Opt/BorrowStep.lean`; not
-    yet elaborated). `Borrows B g st`: `g` lists every frame the run has made, those that
+  - **Dead-store elimination: fourth piece** (`Opt/NextId.lean`, `Opt/BorrowStep.lean`;
+    checked at dde643da71). `Borrows B g st`: `g` lists every frame the run has made, those that
     returned too, with ids below the next one, and memory holds only pointers to frame 0 or
     to a local that the function of its frame may borrow. A call adds its frame to `g`, a
     return leaves it. `step_borrows`: every step keeps it, for a program whose every `ref`
