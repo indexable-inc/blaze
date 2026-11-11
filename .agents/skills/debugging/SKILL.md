@@ -349,6 +349,11 @@ out of `BLAZE_DEV_TOOLCHAIN_AS`.
   across daemons: compare by name, or through `key_parts` and `misses`.
 - The counts are process-wide (two overlapping builds share them); the run log is the front
   end's own.
+- The history holds 4 GiB. Past it the oldest builds go whole, never one that is running nor
+  the newest; each time a WARN event says the files, rows, bytes and builds
+  (`blaze explain problems`), and another says rows the rings wrote over before a flush read
+  them. A build with fewer rows than it should have and neither event is a bug in the history:
+  read `manifest.json`'s `builds` of each file before any other guess.
 - `admission` says memory only when the task was passed over for it; a wait behind another
   task's starvation hold reads as a thread.
 - The `queries` view joins `provenance` on a span's `function`. That is a display name, so the

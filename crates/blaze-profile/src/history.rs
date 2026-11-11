@@ -37,7 +37,11 @@
 //! leaves the manifest listing bytes the disk lost (every file and the manifest, with the
 //! directory synced around the manifest's rename). Past [`CAP_BYTES`] (or the cap the history
 //! is opened with), the oldest builds are retired first, each whole: every table and flush of a
-//! build at once, so a reader of a build reads all of it or none.
+//! build at once, with every file that holds a row of it and so every build those files hold
+//! rows of too, so a reader of a build reads all of it or none; never a build still running
+//! ([`History::build_started`] to [`History::build_ended`]) nor the newest flush's. What goes is
+//! said as a WARN event ([`said_capped`]), as are rows the rings wrote over before a flush
+//! read them: the history never loses rows with nothing said.
 //!
 //! A flush every [`EVERY`] would leave thousands of files a long build (a 52-minute self-build
 //! left 3,250), and every reader reads each one's footer. So after each flush the
@@ -361,6 +365,26 @@ pub const CLIENT_PROCESS: &str = "blaze client";
 /// its rows later than this many builds ended after its own has its times dropped, named.
 const RECENT_BUILDS: usize = 64;
 
+/// Says what the cap retired, as one WARN event with the counts as its fields, so `blaze
+/// explain problems` names it and the builds whose rows are gone. Until 2026-11-11 the cap
+/// said nothing: a long build's history held its last five minutes and no row said why.
+fn said_capped(capped: &files::Capped) {
+    if capped.files == 0 {
+        return;
+    }
+    let [first_build, last_build] = capped.builds.unwrap_or([0, 0]);
+    tracing::warn!(
+        target: "blaze",
+        files = capped.files,
+        rows = capped.rows,
+        bytes = capped.bytes,
+        first_build,
+        last_build,
+        "the profile history passed its cap and retired its oldest builds' rows, each build \
+         whole: `blaze debug sql` and `blaze slow` no longer read them"
+    );
+}
+
 /// What a flush wrote.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Flushed {
@@ -404,8 +428,12 @@ pub struct Flushed {
     pub bytes: u64,
     /// Rows the rings wrote over before this flush read them, CPU samples included.
     pub skipped: u64,
-    /// Old files retired to stay under the cap (deleted once no reader pins them).
+    /// Old files retired to stay under the cap (deleted once no reader pins them), the rows
+    /// they held and their bytes. Never silent: the flush says them as a WARN event
+    /// ([`said_capped`]).
     pub deleted: u32,
+    pub deleted_rows: u64,
+    pub deleted_bytes: u64,
     /// Files merged into others, and retired, after the flush (deleted once no reader pins
     /// them).
     pub merged: u32,
@@ -874,6 +902,7 @@ impl History {
         for refused in &opened.crashes.refused {
             tracing::warn!(target: "blaze", "{refused}");
         }
+        said_capped(&opened.capped);
         let blaze = identity::binary().map_err(|error| HistoryError::Identity {
             what: "hashing blaze's own executable",
             path: std::env::current_exe().unwrap_or_default(),
@@ -992,7 +1021,7 @@ impl History {
         // The mapping is reserved whole as it is made: the cap counts it from now on, and the
         // crash record armed beside it.
         match self.core.job(files::Files::recount)? {
-            files::Outcome::Recounted(retired) => retired.map(|_| ()),
+            files::Outcome::Recounted(retired) => retired.map(|capped| said_capped(&capped)),
             other => Err(mismatch(self.core.dir(), "counting the files beside", &other)),
         }
     }
@@ -1012,6 +1041,8 @@ impl History {
             // clone: a hash, once a build
             row.blaze = Some(self.blaze.clone());
         }
+        // While it runs, the cap retires no file that holds a row of it.
+        self.core.files_mut().running(row.build_id, true);
         flight::postmortem::build_started(&flight::postmortem::RunningBuild {
             build_id: row.build_id,
             started_ns: row.started_ns,
@@ -1029,6 +1060,7 @@ impl History {
     /// the build's. A tree that can't be digested leaves `tree` null, and the next flush answers
     /// why.
     pub fn build_ended(&mut self, mut row: BuildRow) {
+        self.core.files_mut().running(row.build_id, false);
         flight::postmortem::build_ended(row.build_id);
         if row.blaze.is_none() {
             // clone: a hash, once a build
@@ -1187,6 +1219,18 @@ impl History {
         // they grew, so an idle daemon's timer writes no file for them.
         // Counted since the process began; the row of a build's flush carries the build.
         let (t_ns, now) = (self.read.at_ns, (self.read.lost, late + behind, behind));
+        // And said, each flush they grew in: a profile never loses rows with nothing said.
+        let (lost, skipped) =
+            (now.0.saturating_sub(self.told.0), now.1.saturating_sub(self.told.1));
+        if lost != 0 || skipped != 0 {
+            tracing::warn!(
+                target: "blaze",
+                spans_lost = lost,
+                rows_skipped = skipped,
+                "the flight recorder lost rows before the profile history read them: a total \
+                 over this stretch is short by what they held"
+            );
+        }
         if build.is_some() || now != self.told {
             self.told = now;
             let build = build.and_then(|it| u32::try_from(it).ok()).unwrap_or(0);
@@ -1482,6 +1526,8 @@ impl History {
             files: 0,
             bytes: 0,
             deleted: 0,
+            deleted_rows: 0,
+            deleted_bytes: 0,
             merged: 0,
             compacted: 0,
         };
@@ -1589,7 +1635,7 @@ impl History {
             bytes,
             merged,
             compacted,
-            deleted,
+            capped,
             deferred,
             undeleted,
         } = out;
@@ -1658,7 +1704,10 @@ impl History {
         flushed.bytes = bytes;
         flushed.merged = merged;
         flushed.compacted = compacted;
-        flushed.deleted = deleted;
+        flushed.deleted = capped.files;
+        flushed.deleted_rows = capped.rows;
+        flushed.deleted_bytes = capped.bytes;
+        said_capped(&capped);
         // Committed: what fails from here on is said apart, and the flush's number stands.
         self.deferred.extend(failed);
         self.deferred.extend(deferred);

@@ -62,8 +62,17 @@ several readers.
 
     **The cap.** Past `history::CAP_BYTES` the history deletes its oldest builds whole, every
     table of a build at once, never one table of a build; files of no build (an idle daemon's
-    flushes) go one at a time. A build is as old as its newest flush; the newest flush's build is
-    kept.
+    flushes) go one at a time. A flush is named for the highest build of its rows, so while
+    builds run at once a file named for one holds another's rows: the unit that goes is every
+    build whose files chain together through the builds their rows are of (the manifest's
+    `builds` of each file), all at once. A unit is as old as its newest flush. Two are never
+    retired: the newest flush's, and any that holds a row of a build still running, so a long
+    build keeps every row however far past the cap it takes the history. What the cap retires
+    is never silent: each time, a WARN event says the files, rows, bytes and builds
+    (`blaze explain problems` lists it), and so does one for each flush in which the rings
+    wrote over rows before the history read them. Until 2026-11-11 the unit was the build a
+    file was named for and nothing was said: an 80-minute build that shorter builds ran beside
+    kept its last five minutes of `task` spans.
   - The live feed: Arrow batches every 250 ms over the daemon's socket. `blaze debug live`
     renders them as a TUI, and the explorer at ix.dev/explore draws them.
   - The stall watchdog: it writes the buffer out when a request stops moving.
