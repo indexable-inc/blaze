@@ -365,7 +365,9 @@ impl fmt::Display for Made {
             write!(f, " ({inside} in the sandbox)")?;
         }
         // What `/proc` did not give is said as `?`, never left out.
-        let shown = |it: &str| if it.is_empty() { "?" } else { it };
+        fn shown(it: &str) -> &str {
+            if it.is_empty() { "?" } else { it }
+        }
         let (program, argv0) = (shown(&self.program), shown(&self.argv0));
         let (syscall, number) = (&self.syscall, self.number);
         match self.what == EXEC {
