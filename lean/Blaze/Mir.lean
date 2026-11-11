@@ -23,6 +23,7 @@ import Blaze.Mir.Opt.Ptr
 import Blaze.Mir.Opt.SimplifyCfg
 import Blaze.Mir.Opt.Ids
 import Blaze.Mir.Opt.Borrow
+import Blaze.Mir.Opt.BorrowExec
 import Blaze.Mir.Opt.RemoveNops
 import Blaze.Mir.Opt.ConstFold
 import Blaze.Mir.Opt.Validate

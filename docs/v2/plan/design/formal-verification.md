@@ -658,8 +658,8 @@ programs; it is the specification of the Rust pass of the same name.
   - **Not written: merging a target that ends in a call.** The caller's frame keeps a stale
     `block` under the callee; the map is `block` renamed on the frames under the running
     one, another `MemMap`.
-  - **`SimplifyCfg` composed** (`Opt/SimplifyCfg.lean`, `simplifyCfg k`; not yet
-    elaborated): `nop`s removed, `k` rounds of threading every target, the `switchInt` rule,
+  - **`SimplifyCfg` composed** (`Opt/SimplifyCfg.lean`, `simplifyCfg k`; checked at
+    167c97fb61): `nop`s removed, `k` rounds of threading every target, the `switchInt` rule,
     dead blocks, merging, then dead blocks, in the order of the Rust loop. Proved of it
     (`simplifyCfg_call`): a call that ends, and not in undefined behaviour, gives the same
     outcome with the same fuel, which is what an equality, a refinement and two stuttering
@@ -677,7 +677,13 @@ programs; it is the specification of the Rust pass of the same name.
     such. Writes and moves keep it, and a place whose base may be borrowed, or that goes
     through a dereference, evaluates to such a pointer (`evalPlace_ptr`). A frame's id and
     function are left by statements (`execStmt_ids`, `Opt/Ctl.lean`'s proofs for that
-    pair). The rest is below.
+    pair).
+  - **Dead-store elimination: third piece** (`Opt/BorrowExec.lean`; not yet elaborated). An
+    operator gives a value with no pointer in it, an operand a value read from memory, a
+    `ref` the pointer its place evaluates to; so a statement keeps the invariant
+    (`execStmt_okAt`) when every `ref` in it is of a place whose base may be borrowed or
+    that goes through a dereference (`StmtFine`: the Rust pass's "ever borrowed" as a
+    condition on the body). The rest is below.
   - **Dead-store elimination: what is not written.** It needs a relation, not a map: two states
     equal but on dead locals. The Rust pass (`optimize/dse.rs`) removes the whole assignment
     of an rvalue it holds to be free of effects (all but a pointer-to-address cast), to a

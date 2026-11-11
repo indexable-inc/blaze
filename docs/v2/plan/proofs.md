@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-63 theorems: 50 in `lean`, 13 in `lean/analysis`.
+64 theorems: 51 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -483,6 +483,26 @@ theorem State.write_ok {P : Pointer → Prop} {st : State} (hm : MemOk P st) (p 
 theorem evalPlace_ptr {B : FnId → Local → Prop} {st : State} (hs : StateOk B st) (place : Place)
     (q : Pointer) (hb : B st.topFn place.base ∨ hasDeref place.proj = true)
     (h : evalPlace st place = Outcome.ok q) : PtrOk B st.ids q
+```
+
+**`Blaze.Mir.execStmt_okAt`** (`Blaze.Mir.Opt.BorrowExec`, `lean`): A statement whose refs are of places that may be borrowed, or through a dereference, keeps every pointer in memory naming frame 0 or a borrowed local.
+
+```lean
+theorem execStmt_okAt {B : FnId → Local → Prop} {ids : List (Nat × FnId)} (adts : List AdtDecl)
+    (st : State) (hs : OkAt B ids st) (fn : FnId) (hfn : st.topFn = fn) :
+    ∀ (s : Statement), StmtFine B fn s → Outcome.All (OkAt B ids) (execStmt adts st s)
+  | Statement.assign _ rv, hfine =>
+    Outcome.all_bind (evalRvalue_okAt adts st hs fn hfn rv hfine) (fun r hr =>
+      Outcome.all_bind (Outcome.all_true _) (fun ptr _ =>
+        (fun st' h =>
+          And.intro
+            ((State.write_ids r.2 ptr r.1 st' h).trans (And.left (And.right hr)))
+            (State.write_ok (And.right (And.right hr)) ptr r.1 (And.left hr) st' h))))
+  | Statement.storageLive _, _ => Outcome.all_ok hs
+  | Statement.storageDead _, _ => Outcome.all_ok hs
+  | Statement.nop, _ => Outcome.all_ok hs
+
+end Blaze.Mir
 ```
 
 **`Blaze.Mir.Opt.simplifyCfg_call`** (`Blaze.Mir.Opt.SimplifyCfg`, `lean`): SimplifyCfg composed from the proved passes keeps every call that ends, and not in undefined behaviour: the same outcome with the same fuel.
