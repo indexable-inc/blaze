@@ -7,6 +7,7 @@
 //! - [`pyjson`]: JSON written as Python's `json.dumps` writes it, so a generated file comes out
 //!   byte for byte as the Python script wrote it.
 //! - [`run`], [`git`], [`run_shown`]: a program run, its output captured or shown.
+//! - [`pystr`]: Python's `splitlines` and whitespace, where Rust's `lines` and `trim` differ.
 //! - [`fail`], [`expect`]: how a script ends in an error, and how its `selftest` checks.
 //!
 //! When a release carries bstd and reflection, a script's `Input::parse` is derived
@@ -14,6 +15,7 @@
 
 pub mod input;
 pub mod pyjson;
+pub mod pystr;
 
 use std::{
     path::Path,
