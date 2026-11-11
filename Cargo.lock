@@ -6469,6 +6469,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-ids",
  "blaze-phf",
+ "hegeltest",
 ]
 
 [[package]]

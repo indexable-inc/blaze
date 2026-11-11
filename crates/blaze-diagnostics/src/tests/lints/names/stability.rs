@@ -646,5 +646,6 @@ fn core_simd_without_blaze_simd_is_gated_as_before() {
     assert!(gated.iter().any(|it| it.contains("`portable_simd`")), "{gated:?}");
     assert!(gated.iter().any(|it| it.contains("`blaze_simd`")), "{gated:?}");
     let by_hand = portable_simd_gate("#![feature(portable_simd)]");
-    assert!(!by_hand.is_empty() && by_hand.iter().all(|it| it.contains("`blaze_simd`")), "{by_hand:?}");
+    assert!(!by_hand.is_empty(), "blaze_simd is its own feature");
+    assert!(by_hand.iter().all(|it| it.contains("`blaze_simd`")), "{by_hand:?}");
 }

@@ -253,6 +253,9 @@ fn old_match_attr_flags(
                     "blaze" if &*second_segment == "nonblocking" => {
                         attr_flags.insert(AttrFlags::NONBLOCKING)
                     }
+                    "blaze" if &*second_segment == "multiversion" => {
+                        attr_flags.insert(AttrFlags::BLAZE_MULTIVERSION)
+                    }
                     _ => {}
                 },
             }
@@ -377,6 +380,7 @@ fn old_match_attr_flags(
                         "consumes" => attr_flags.insert(AttrFlags::CONSUMES),
                         "reflect" => attr_flags.insert(AttrFlags::BLAZE_REFLECT),
                         "sealed" => attr_flags.insert(AttrFlags::BLAZE_SEALED),
+                        "multiversion" => attr_flags.insert(AttrFlags::BLAZE_MULTIVERSION),
                         _ => {}
                     },
                     _ => {}
@@ -754,6 +758,38 @@ fn gated_queries_read_what_the_source_says() {
             "{name}"
         );
     }
+}
+
+/// `#[blaze::multiversion]`'s levels as written, in order; no level for the bare word, and
+/// nothing without the attribute or under another tool's name (docs/v2/plan/design/simd.md).
+#[test]
+fn multiversion_levels_are_the_attributes_strings_in_order() {
+    let db = fixture::db(
+        r#"
+#[blaze::multiversion] pub fn a() {}
+#[blaze::multiversion("x86-64-v3", "avx512f,avx512vl")] pub fn b() {}
+#[cfg_attr(all(), blaze::multiversion("avx2",))] pub fn c() {}
+#[cfg_attr(any(), blaze::multiversion("avx2"))] pub fn d() {}
+#[rustfmt::multiversion("avx2")] pub fn e() {}
+#[blaze::multiversion(avx2)] pub fn f() {}
+pub fn plain() {}
+"#,
+    )
+    .into_db();
+    let functions = functions(&db);
+    let levels = |name: &str| {
+        let func = functions.iter().find(|(it, _)| it == name).unwrap_or_else(|| panic!("{name}"));
+        let levels = AttrFlags::multiversion_levels(&db, func.1)?;
+        Some(levels.iter().map(|it| it.as_str().to_owned()).collect::<Vec<_>>())
+    };
+    assert_eq!(levels("a"), Some(vec![]));
+    assert_eq!(levels("b"), Some(vec!["x86-64-v3".to_owned(), "avx512f,avx512vl".to_owned()]));
+    assert_eq!(levels("c"), Some(vec!["avx2".to_owned()]));
+    assert_eq!(levels("d"), None);
+    assert_eq!(levels("e"), None);
+    // No string literal: kept as its text, for the plan to refuse by name.
+    assert_eq!(levels("f"), Some(vec!["avx2".to_owned()]));
+    assert_eq!(levels("plain"), None);
 }
 
 #[test]
