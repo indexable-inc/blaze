@@ -1,34 +1,41 @@
-src/interner.rs --- Rust
-301 301 
-302 302     fn expand_abstract_consts<T: TypeFoldable<Self>>(self, t: T) -> T;
-... 303 
-... 304     /// blaze: whether the constants `a` and `b`, which are not one constant, are the same
-... 305     /// expression of the same constants (`#![feature(blaze_const_exprs)]`: `{ N + M }` and
-... 306     /// `{ M + N }`), by a normal form the interner computes. `false` wherever no generic const
-... 307     /// expression is involved.
-... 308     fn same_const_expression(self, a: Const<Self>, b: Const<Self>) -> bool;
-303 309 
-304 310     type GenericsOf: GenericsOf<Self>;
-305 311     fn generics_of(self, def_id: Self::DefId) -> Self::GenericsOf;
-
-src/relate.rs --- Rust
-612 612         // While this is slightly incorrect, it shouldn't matter for `min_const_generics`
-613 613         // and is the better alternative to waiting until `generic_const_exprs` can
-614 614         // be stabilized.
-... 615         // blaze: two generic const expressions that are different anonymous constants are
-... 616         // one constant when they have one normal form (`Interner::same_const_expression`); so
-... 617         // is one against the parameter or value it reduces to (`{ N + 0 }` and `N`).
-... 618         _ if matches!(a.kind(), ty::ConstKind::Alias(..)) != matches!(b.kind(), ty::ConstKind::Alias(..))
-... 619             && cx.same_const_expression(a, b) =>
-... 620         {
-... 621             true
-... 622         }
-... 623         (ty::ConstKind::Alias(_, au), ty::ConstKind::Alias(_, bu))
-... 624             if au != bu && cx.same_const_expression(a, b) =>
-... 625         {
-... 626             true
-... 627         }
-615 628         (ty::ConstKind::Alias(is_rigid_a, au), ty::ConstKind::Alias(is_rigid_b, bu)) => {
-616 629             // Users shouldn't know about this so the mismatch should be caught
-617 630             // during development rather than presented as type error.
-
+diff --git a/src/interner.rs b/src/interner.rs
+index 84b816c2b3..130ed5b6e2 100644
+--- a/src/interner.rs
++++ b/src/interner.rs
+@@ -301,6 +301,12 @@ pub trait Interner:
+ 
+     fn expand_abstract_consts<T: TypeFoldable<Self>>(self, t: T) -> T;
+ 
++    /// blaze: whether the constants `a` and `b`, which are not one constant, are the same
++    /// expression of the same constants (`#![feature(blaze_const_exprs)]`: `{ N + M }` and
++    /// `{ M + N }`), by a normal form the interner computes. `false` wherever no generic const
++    /// expression is involved.
++    fn same_const_expression(self, a: Const<Self>, b: Const<Self>) -> bool;
++
+     type GenericsOf: GenericsOf<Self>;
+     fn generics_of(self, def_id: Self::DefId) -> Self::GenericsOf;
+ 
+diff --git a/src/relate.rs b/src/relate.rs
+index e87b584ebc..5f1bd0bf33 100644
+--- a/src/relate.rs
++++ b/src/relate.rs
+@@ -612,6 +612,19 @@ pub fn structurally_relate_consts<I: Interner, R: TypeRelation<I>>(
+         // While this is slightly incorrect, it shouldn't matter for `min_const_generics`
+         // and is the better alternative to waiting until `generic_const_exprs` can
+         // be stabilized.
++        // blaze: two generic const expressions that are different anonymous constants are
++        // one constant when they have one normal form (`Interner::same_const_expression`); so
++        // is one against the parameter or value it reduces to (`{ N + 0 }` and `N`).
++        _ if matches!(a.kind(), ty::ConstKind::Alias(..)) != matches!(b.kind(), ty::ConstKind::Alias(..))
++            && cx.same_const_expression(a, b) =>
++        {
++            true
++        }
++        (ty::ConstKind::Alias(_, au), ty::ConstKind::Alias(_, bu))
++            if au != bu && cx.same_const_expression(a, b) =>
++        {
++            true
++        }
+         (ty::ConstKind::Alias(is_rigid_a, au), ty::ConstKind::Alias(is_rigid_b, bu)) => {
+             // Users shouldn't know about this so the mismatch should be caught
+             // during development rather than presented as type error.

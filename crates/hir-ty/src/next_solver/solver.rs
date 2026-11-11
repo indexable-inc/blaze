@@ -437,7 +437,7 @@ impl<'db> SolverDelegate for SolverContext<'db> {
     /// blaze: whether a `where const { COND }` condition holds ([`crate::where_const`]): `None`
     /// while it has an inference variable.
     fn const_condition(&self, param_env: ParamEnv<'db>, ct: Const<'db>) -> Option<bool> {
-        let ct = self.resolve_vars_if_possible(ct);
+        let ct = self.deeply_resolve_ignoring_regions(ct);
         match crate::where_const::condition(self.interner, param_env, ct) {
             crate::where_const::Condition::Holds => Some(true),
             crate::where_const::Condition::Fails(_) => Some(false),

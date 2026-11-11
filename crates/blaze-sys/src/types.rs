@@ -45,8 +45,19 @@ impl<'a> Path<'a> {
     #[blaze::noalloc]
     #[blaze::nopanic]
     pub const fn new(path: &'a CStr) -> Path<'a> {
-        // A `CStr`'s bytes end in its only NUL: the invariant.
-        Path(path.to_bytes_with_nul())
+        // Not `CStr::to_bytes_with_nul`: it asserts its length unchecked, whose precondition
+        // check is an abort path no nopanic function may reach. A `CStr` is its bytes with
+        // their NUL (core's `#[repr(transparent)]` over `[c_char]`, which blaze's pinned core
+        // has), so a cast of the pointer keeps the length and calls nothing.
+        // SAFETY: `CStr` is `repr(transparent)` over `[c_char]`, and `c_char` is a byte: the
+        // cast names the same bytes, as long, for as long as `path` is lent.
+        let bytes: &'a [u8] = unsafe { &*(path as *const CStr as *const [u8]) };
+        match bytes {
+            // A `CStr`'s bytes end in its only NUL: the invariant.
+            [.., 0] => Path(bytes),
+            // Never: a `CStr` always ends in its NUL. The empty path keeps the invariant.
+            _ => Path::EMPTY,
+        }
     }
 
     /// `bytes` and a NUL written into `buffer`: [`Errno::NameTooLong`] where they do not fit,

@@ -193,7 +193,7 @@ fn impl_refusal<'db>(
     let args = infcx.fresh_args_for_item(Span::Dummy, impl_.into());
     let header = db.impl_trait(impl_)?.instantiate(interner, args).skip_norm_wip();
     infcx.at(&ObligationCause::dummy(), ParamEnv::empty()).eq(header, trait_ref).ok()?;
-    let args = infcx.resolve_vars_if_possible(args);
+    let args = infcx.deeply_resolve_ignoring_regions(args);
     crate::lower::GenericPredicates::query_all(db, impl_.into())
         .iter_instantiated(interner, args.as_slice())
         .map(crate::next_solver::Unnormalized::skip_norm_wip)

@@ -254,7 +254,7 @@ where
         // that failed was an error of its own. Here the goal is the condition, so a `false`
         // or a failed evaluation is `NoSolution`, the impl or function it guards does not
         // apply, and the delegate has the reason for the error.
-        match self.delegate.const_condition(param_env, ct) {
+        match self.const_condition(param_env, ct) {
             Some(true) => self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes),
             Some(false) => Err(NoSolution.into()),
             None => self.evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS),

@@ -3011,8 +3011,12 @@ fn gpu_msl(job: &Job, unit: usize, ok: bool, module: Module<'_>) -> Result<Optio
     let bytes = match module {
         Module::Linked(files) => match files.iter().find(|(at, _, _)| at == path) {
             // alloc: once per device unit linked, the MSL for its dependents
-            Some((_, Written::Bytes(bytes), _)) => bytes.clone(),
-            Some((_, Written::Kept(_), _)) | None => return Err(error("its link wrote no MSL there".to_owned())),
+            Some((_, Written::Bytes(bytes) | Written::Linked(bytes, _), _)) => bytes.clone(),
+            // A device unit's MSL is written whole as its link makes it (`Written::Bytes`); a
+            // kept image or a patch of one holds no bytes here to hand its dependents.
+            Some((_, Written::Kept(_) | Written::Derived { .. }, _)) | None => {
+                return Err(error("its link wrote no MSL there".to_owned()));
+            }
         },
         Module::Kept(kept) => {
             let Some(output) = kept.outputs.iter().find(|it| it.path == path) else {

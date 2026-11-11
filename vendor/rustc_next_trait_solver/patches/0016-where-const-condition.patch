@@ -1,124 +1,97 @@
-src/delegate.rs --- Rust
-71 71         ) -> Result<<Self::Interner as Interner>::Ty, E>,
-72 72     ) -> Result<Option<Const<Self::Interner>>, E>;
-.. 73 
-.. 74     /// blaze: whether the constant of a `ConstEvaluatable` goal, which blaze makes only for a
-.. 75     /// `where const { COND }` condition, is `true` with the arguments it has: `Some(true)`
-.. 76     /// when it holds, `Some(false)` when it does not (it is `false`, its evaluation failed, or
-.. 77     /// it names a generic parameter and the environment does not have it), `None` while it has
-.. 78     /// an inference variable.
-.. 79     fn const_condition(
-.. 80         &self,
-.. 81         param_env: <Self::Interner as Interner>::ParamEnv,
-.. 82         ct: Const<Self::Interner>,
-.. 83     ) -> Option<bool>;
-73 84 
-74 85     // FIXME: This only is here because `wf::obligations` is in `rustc_trait_selection`!
-75 86     fn well_formed_goals(
-
-src/solve/mod.rs --- Rust
-247         &mut self,                   247         &mut self,
-248         Goal { param_env, predicate  248         Goal { param_env, predicate
-... : ct }: Goal<I, Const<I>>,           ... : ct }: Goal<I, Const<I>>,
-249     ) -> QueryResultOrRerunNonErase  249     ) -> QueryResultOrRerunNonErase
-... d<I> {                               ... d<I> {
-...                                      250         // blaze: the one predicate
-...                                      ...  that lowers to this goal is `where
-...                                      ...  const { COND }`
-...                                      251         // (`#![feature(blaze_compt
-...                                      ... ime)]`), a `bool` constant over the
-...                                      ...  generic parameters that
-...                                      252         // holds when it is `true` 
-...                                      ... for the arguments it is asked with.
-...                                      ...  rustc's goal ("the
-...                                      253         // constant can be evaluate
-...                                      ... d", for `generic_const_exprs`) neve
-...                                      ... r said no: an evaluation
-...                                      254         // that failed was an error
-...                                      ...  of its own. Here the goal is the c
-...                                      ... ondition, so a `false`
-...                                      255         // or a failed evaluation i
-...                                      ... s `NoSolution`, the impl or functio
-...                                      ... n it guards does not
-...                                      256         // apply, and the delegate 
-...                                      ... has the reason for the error.
-250         match ct.kind() {            257         match self.delegate.const_c
-...                                      ... ondition(param_env, ct) {
-251             ty::ConstKind::Alias(ty  ... 
-... ::IsRigid::Yes, _)                   ... 
-252             | ty::ConstKind::Placeh  ... 
-... older(_)                             ... 
-253             | ty::ConstKind::Value(  ... 
-... _)                                   ... 
-254             | ty::ConstKind::Error(  258             Some(true) => self.eval
-... _) => {                              ... uate_added_goals_and_make_canonical
-...                                      ... _response(Certainty::Yes),
-255                 self.evaluate_added  ... 
-... _goals_and_make_canonical_response(  ... 
-... Certainty::Yes)                      ... 
-256             }                        ... 
-257                                      ... 
-258             ty::ConstKind::Infer(_)  259             Some(false) => Err(NoSo
-...  => {                                ... lution.into()),
-259                 self.evaluate_added  ... 
-... _goals_and_make_canonical_response(  ... 
-... Certainty::AMBIGUOUS)                ... 
-260             }                        ... 
-261                                      ... 
-262             ty::ConstKind::Alias(ty  260             None => self.evaluate_a
-... ::IsRigid::No, alias_const) => {     ... dded_goals_and_make_canonical_respo
-...                                      ... nse(Certainty::AMBIGUOUS),
-263                 // We never return   ... 
-... `NoSolution` here as `evaluate_cons  ... 
-... t` emits an                          ... 
-264                 // error itself whe  ... 
-... n failing to evaluate, so emitting   ... 
-... an additional fulfillment            ... 
-265                 // error in that ca  ... 
-... se is unnecessary noise. This may c  ... 
-... hange in the future once             ... 
-266                 // evaluation failu  ... 
-... res are allowed to impact selection  ... 
-... , e.g. generic const                 ... 
-267                 // expressions in i  ... 
-... mpl headers or `where`-clauses.      ... 
-268                                      ... 
-269                 // FIXME(generic_co  ... 
-... nst_exprs): Implement handling for   ... 
-... generic                              ... 
-270                 // const expression  ... 
-... s here.                              ... 
-271                 if let Some(_normal  ... 
-... ized) = self.evaluate_const(param_e  ... 
-... nv, alias_const)? {                  ... 
-272                     self.evaluate_a  ... 
-... dded_goals_and_make_canonical_respo  ... 
-... nse(Certainty::Yes)                  ... 
-273                 } else {             ... 
-274                     self.evaluate_a  ... 
-... dded_goals_and_make_canonical_respo  ... 
-... nse(Certainty::AMBIGUOUS)            ... 
-275                 }                    ... 
-276             }                        ... 
-277                                      ... 
-278             // We can freely ICE he  ... 
-... re as:                               ... 
-279             // - `Param` gets repla  ... 
-... ced with a placeholder during canon  ... 
-... icalization                          ... 
-280             // - `Bound` cannot exi  ... 
-... st as we don't have a binder around  ... 
-...  the self Type                       ... 
-281             // - `Expr` is part of   ... 
-... `feature(generic_const_exprs)` and   ... 
-... is not implemented yet               ... 
-282             ty::ConstKind::Param(_)  ... 
-...  | ty::ConstKind::Bound(_, _) | ty:  ... 
-... :ConstKind::Expr(_) => {             ... 
-283                 panic!("unexpected   ... 
-... const kind: {:?}", ct)               ... 
-284             }                        ... 
-285         }                            261         }
-286     }                                262     }
-287                                      263 
-
+diff --git a/src/delegate.rs b/src/delegate.rs
+index f23f4774ea..d7b44b1eb3 100644
+--- a/src/delegate.rs
++++ b/src/delegate.rs
+@@ -71,6 +71,17 @@ pub trait SolverDelegate: Deref<Target = Self::Infcx> + Sized {
+         ) -> Result<<Self::Interner as Interner>::Ty, E>,
+     ) -> Result<Option<Const<Self::Interner>>, E>;
+ 
++    /// blaze: whether the constant of a `ConstEvaluatable` goal, which blaze makes only for a
++    /// `where const { COND }` condition, is `true` with the arguments it has: `Some(true)`
++    /// when it holds, `Some(false)` when it does not (it is `false`, its evaluation failed, or
++    /// it names a generic parameter and the environment does not have it), `None` while it has
++    /// an inference variable.
++    fn const_condition(
++        &self,
++        param_env: <Self::Interner as Interner>::ParamEnv,
++        ct: Const<Self::Interner>,
++    ) -> Option<bool>;
++
+     // FIXME: This only is here because `wf::obligations` is in `rustc_trait_selection`!
+     fn well_formed_goals(
+         &self,
+diff --git a/src/solve/eval_ctxt/mod.rs b/src/solve/eval_ctxt/mod.rs
+index 9d09af38e7..6153ce8bd7 100644
+--- a/src/solve/eval_ctxt/mod.rs
++++ b/src/solve/eval_ctxt/mod.rs
+@@ -1151,6 +1151,13 @@ where
+         self.delegate.cx()
+     }
+ 
++    /// blaze: whether the `where const { COND }` constant `ct` holds in `param_env`
++    /// ([`SolverDelegate::const_condition`]), re-declared here as the delegate's other methods
++    /// are.
++    pub(super) fn const_condition(&self, param_env: I::ParamEnv, ct: Const<I>) -> Option<bool> {
++        self.delegate.const_condition(param_env, ct)
++    }
++
+     #[instrument(level = "debug", skip(self))]
+     pub(super) fn add_goal(
+         &mut self,
+diff --git a/src/solve/mod.rs b/src/solve/mod.rs
+index c057eefd15..f9506d523c 100644
+--- a/src/solve/mod.rs
++++ b/src/solve/mod.rs
+@@ -247,41 +247,17 @@ where
+         &mut self,
+         Goal { param_env, predicate: ct }: Goal<I, Const<I>>,
+     ) -> QueryResultOrRerunNonErased<I> {
+-        match ct.kind() {
+-            ty::ConstKind::Alias(ty::IsRigid::Yes, _)
+-            | ty::ConstKind::Placeholder(_)
+-            | ty::ConstKind::Value(_)
+-            | ty::ConstKind::Error(_) => {
+-                self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
+-            }
+-
+-            ty::ConstKind::Infer(_) => {
+-                self.evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS)
+-            }
+-
+-            ty::ConstKind::Alias(ty::IsRigid::No, alias_const) => {
+-                // We never return `NoSolution` here as `evaluate_const` emits an
+-                // error itself when failing to evaluate, so emitting an additional fulfillment
+-                // error in that case is unnecessary noise. This may change in the future once
+-                // evaluation failures are allowed to impact selection, e.g. generic const
+-                // expressions in impl headers or `where`-clauses.
+-
+-                // FIXME(generic_const_exprs): Implement handling for generic
+-                // const expressions here.
+-                if let Some(_normalized) = self.evaluate_const(param_env, alias_const)? {
+-                    self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
+-                } else {
+-                    self.evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS)
+-                }
+-            }
+-
+-            // We can freely ICE here as:
+-            // - `Param` gets replaced with a placeholder during canonicalization
+-            // - `Bound` cannot exist as we don't have a binder around the self Type
+-            // - `Expr` is part of `feature(generic_const_exprs)` and is not implemented yet
+-            ty::ConstKind::Param(_) | ty::ConstKind::Bound(_, _) | ty::ConstKind::Expr(_) => {
+-                panic!("unexpected const kind: {:?}", ct)
+-            }
++        // blaze: the one predicate that lowers to this goal is `where const { COND }`
++        // (`#![feature(blaze_comptime)]`), a `bool` constant over the generic parameters that
++        // holds when it is `true` for the arguments it is asked with. rustc's goal ("the
++        // constant can be evaluated", for `generic_const_exprs`) never said no: an evaluation
++        // that failed was an error of its own. Here the goal is the condition, so a `false`
++        // or a failed evaluation is `NoSolution`, the impl or function it guards does not
++        // apply, and the delegate has the reason for the error.
++        match self.const_condition(param_env, ct) {
++            Some(true) => self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes),
++            Some(false) => Err(NoSolution.into()),
++            None => self.evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS),
+         }
+     }
+ 

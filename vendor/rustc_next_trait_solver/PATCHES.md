@@ -234,8 +234,10 @@ edition-e3-unions-1109 (2026-11-09).
 
 ### 0016-where-const-condition
 
-What: `SolverDelegate::const_condition` (`src/delegate.rs`) and `compute_const_evaluatable_goal`
-(`src/solve/mod.rs`), which now asks it: a `ConstEvaluatable` goal holds when the delegate says
+What: `SolverDelegate::const_condition` (`src/delegate.rs`), re-declared on `EvalCtxt`
+(`src/solve/eval_ctxt/mod.rs`, whose `delegate` is private to it, as upstream re-declares the
+delegate's other methods), and `compute_const_evaluatable_goal` (`src/solve/mod.rs`), which now
+asks it: a `ConstEvaluatable` goal holds when the delegate says
 its constant is `true`, is `NoSolution` when it says `false`, and is ambiguous while it cannot
 say.
 
