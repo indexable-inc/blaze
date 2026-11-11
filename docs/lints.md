@@ -932,8 +932,10 @@ method of an impl of a trait so marked, that may, through any call:
   `thread::sleep`, `JoinHandle::join`, and the syscalls that wait (`read`, `write`, `futex`,
   `poll`, `accept`, `connect`).
 
-Each also refuses what it can't see: a call through a `dyn` or a function pointer it can't
-follow, and (`noalloc`, `nonblocking`) a foreign function or `asm!` it knows nothing of. The
+Each also refuses what it can't see: a function pointer the function takes, a call through a
+`dyn` it takes whose method has no `#[blaze::may(..)]` leaving the word out (taking the `dyn`,
+storing it or handing it on is fine; the finding names the method called), and (`noalloc`,
+`nonblocking`) a foreign function or `asm!` it knows nothing of. The
 finding says the shortest call chain to what does it, each step with its file and line. They
 are `deny` by default: the function asked for it. The tables and rules are in
 [v2/plan/lanes/effects.md](v2/plan/design/effects.md).
@@ -1014,7 +1016,8 @@ stdio; spawning, sleeping or asking about threads; reading or writing a `static 
 with interior mutability or a thread-local; observing an address (a pointer cast to a number, a
 pointer hashed, ordered or formatted with `{:p}`); `RandomState` or the system's randomness; a
 foreign function or `asm!` not known to be deterministic. A root parameter the check can't see
-through is refused too: a `dyn` or a function pointer (take a type parameter), a raw pointer, or
+through is refused too: a function pointer (take a type parameter), a `dyn` the function calls
+an unlisted method through, a raw pointer, or
 state with interior mutability behind a shared reference (`&AtomicU64`, `&Mutex<T>`), which
 another thread can change during the call. Allocation, panics, atomics and cells on memory the
 function owns are allowed. The finding says the shortest call chain to what does it, each step

@@ -581,11 +581,12 @@ pub(crate) fn summary_in(db: &Db, env: StoredParamEnvAndCrate, instance: Instanc
 /// The kinds an effect keeps in a summary's set: those it refuses, and [`Rule::Open`], which a
 /// generic check reports as left to each instance.
 /// The kinds a summary keeps for `effect`: those it refuses, a call only an instance decides,
-/// and, for an effect that refuses a panic, an `unsafe` precondition check not answered for
+/// a call through a `dyn` nothing answers for ([`Rule::Dyn`], refused by a check whose root
+/// takes such a `dyn`), and, for an effect that refuses a panic, an `unsafe` precondition check not answered for
 /// yet ([`Rule::Precondition`]), which is a panic where code outside the toolchain calls the
 /// `unsafe fn`.
 pub(crate) fn kept(effect: &EffectDef) -> EffectSet {
-    let kept = effect.refuses.union(EffectSet::one(Rule::Open));
+    let kept = effect.refuses.union(EffectSet::of(&[Rule::Open, Rule::Dyn]));
     match effect.refuses.has(Rule::Panic) {
         true => kept.union(EffectSet::one(Rule::Precondition)),
         false => kept,
@@ -769,6 +770,8 @@ struct Walk<'a, 'db> {
     code: HashMap<(Ty<'db>, Reach), bool, Global>,
     /// Per type dropped, whether a value of it may hold a `dyn` ([`Walk::holds_dyn`]).
     dyns: HashMap<Ty<'db>, bool, Global>,
+    /// Per type dropped, whether a value of it owns a `dyn` ([`Walk::owns_dyn`]).
+    owned_dyns: HashMap<Ty<'db>, bool, Global>,
 }
 
 fn summarize<'db>(cx: &Cx<'db>, body: &MirBody<'db>, def: Def) -> Summary {
@@ -878,7 +881,9 @@ struct Fold {
 
 impl Fold {
     fn new(own: Own, home: Crate) -> Fold {
-        let (kinds, trust) = (own.kinds, own.base);
+        // `Rule::Dyn` is a check's alone (its root's parameters decide it): no kind of the
+        // instance, which the facts and a destructor's kinds read.
+        let (kinds, trust) = (own.kinds.without(EffectSet::one(Rule::Dyn)), own.base);
         let (sets, witnesses) = own.into_sets();
         Fold { kinds, sets, witnesses: witnesses.into_vec(), home, trust }
     }
@@ -991,6 +996,13 @@ impl Fold {
         });
         for (index, effect) in EFFECTS.iter().enumerate() {
             if trusted & 1 << index != 0 || !Fold::counts(db, func, effect) {
+                // A callee trusted for the effect answers for its own code, not for the object
+                // it is given: a call it makes through a `dyn` is still the root's to answer.
+                if callee.set(index).has(Rule::Dyn) {
+                    let depth =
+                        callee.witness(index, Rule::Dyn).map_or(0, |it| it.depth).saturating_add(1);
+                    self.add(index, Rule::Dyn, depth, || How::Site { site: at, said: None });
+                }
                 continue;
             }
             if let (Some(func), Some(does)) = (func, said) {
@@ -1354,6 +1366,7 @@ impl<'a, 'db> Walk<'a, 'db> {
             statics: HashSet::new_in(Global),
             code: HashMap::new_in(Global),
             dyns: HashMap::new_in(Global),
+            owned_dyns: HashMap::new_in(Global),
         }
     }
 
@@ -1506,6 +1519,7 @@ impl<'a, 'db> Walk<'a, 'db> {
                     self.origin = Origin::Drop(id);
                     let ty = self.place_ty(place);
                     self.drop_glue(ty);
+                    self.dyn_drop(ty);
                     // A `dyn` it owns is dropped through its vtable: a call like any through one.
                     if !self.kinds.full.has(Rule::Indirect) && self.holds_dyn(ty) {
                         self.indirect(
@@ -1528,6 +1542,31 @@ impl<'a, 'db> Walk<'a, 'db> {
             self.observe(EffectSet::one(Rule::Loop), "has a loop that is not known to end");
         }
         (self.span, self.origin) = (None, Origin::Made);
+    }
+
+    /// The drop of a value of `ty` that owns a `dyn` runs the drop of whatever object it is
+    /// ([`Rule::Dyn`]): drop glue does nothing for a `dyn` itself, whose own was walked where
+    /// its vtable was made.
+    fn dyn_drop(&mut self, ty: Ty<'db>) {
+        if !self.kinds.full.has(Rule::Dyn) && self.owns_dyn(ty) {
+            let ty = self.cx.shown(ty);
+            let what = blaze_query::db::attach(self.cx.db, || {
+                format!("drops a `{ty}`, which owns a `dyn` whose drop is the object's")
+            }); // alloc: a witness's text, once per body
+            self.observe(EffectSet::one(Rule::Dyn), &what);
+        }
+    }
+
+    /// Whether a value of `ty` owns a `dyn`: in its own bytes or behind a raw pointer (a
+    /// `Box`'s, a `Vec`'s), never behind a reference, which owns nothing.
+    fn owns_dyn(&mut self, ty: Ty<'db>) -> bool {
+        if let Some(&known) = self.owned_dyns.get(&ty) {
+            return known;
+        }
+        let mut dyns: SmallVec<[Ty<'db>; 2]> = SmallVec::new();
+        self.scan(ty, Reach::Owned, &mut HashSet::new_in(Global), &mut dyns);
+        self.owned_dyns.insert(ty, !dyns.is_empty());
+        !dyns.is_empty()
     }
 
     /// Whether a value of `ty` may hold a `dyn`, in its own bytes or behind a pointer.
@@ -1626,6 +1665,7 @@ impl<'a, 'db> Walk<'a, 'db> {
             Call::DropGlue(ty) => {
                 let before = self.sites.len();
                 self.drop_glue(ty);
+                self.dyn_drop(ty);
                 if self.sites.len() == before {
                     self.call_kind(at, CallKind::Nothing);
                 }
@@ -1673,6 +1713,10 @@ impl<'a, 'db> Walk<'a, 'db> {
             }
             Call::Indirect => {
                 self.call_kind(at, CallKind::Indirect);
+                self.observe(
+                    EffectSet::one(Rule::Dyn),
+                    "calls through a function pointer or a `dyn Fn`, whose target is the object's",
+                );
                 self.indirect(
                     "calls through a function pointer or a `dyn Fn`, whose target may call this function again",
                     0,
@@ -1723,6 +1767,15 @@ impl<'a, 'db> Walk<'a, 'db> {
                 // and one whose `#[blaze::may(..)]` leaves `diverge` out ends in every impl.
                 if matches!(callee, Callee::Virtual) {
                     let except = self.trusted_call(f) | effects::bound_mask(db, f);
+                    // The method's own `#[blaze::may(..)]`, or its trait's trust, says what a
+                    // call of it through any object cannot do; for the rest nothing does.
+                    if !self.kinds.full.has(Rule::Dyn) {
+                        let what = format!(
+                            "calls {} through a `dyn`: nothing says the object's method cannot do this (a `#[blaze::may(..)]` on the trait's method that leaves it out would)",
+                            fn_name(db, f)
+                        ); // alloc: a witness's text, once per body
+                        self.observe_except(EffectSet::one(Rule::Dyn), &what, except);
+                    }
                     if !self.kinds.full.has(Rule::Indirect) {
                         let what = format!(
                             "calls {} through a `dyn`, whose target may call this function again",
@@ -2278,6 +2331,8 @@ impl<'a, 'db> Walk<'a, 'db> {
             TyKind::RawPtr(pointee, _) => {
                 self.scan(pointee, reach, seen, dyns) | (reach == Reach::Raw)
             }
+            // A reference owns nothing.
+            TyKind::Ref(..) if reach == Reach::Owned => false,
             TyKind::Ref(_, pointee, _) | TyKind::Pat(pointee, _) => {
                 self.scan(pointee, reach, seen, dyns)
             }
@@ -2353,6 +2408,9 @@ enum Reach {
     Pointees,
     /// Those, and any raw pointer itself, which may be a function pointer cast.
     Raw,
+    /// Its own bytes and what its raw pointers point to (a `Box`'s, a `Vec`'s), not what its
+    /// references do: what dropping the value drops.
+    Owned,
 }
 
 /// Whether an intrinsic other than `const_eval_select`, a transmute, `read_via_copy` and

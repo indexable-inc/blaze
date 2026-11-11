@@ -33,8 +33,8 @@ capabilities, which are already positive (a function touches the disk because it
 too little is an error and listing too much is advice.
 
 There is no word for code the check can't see (a foreign function no table knows, inline
-assembly, a function pointer or an unmarked `dyn` taken as a parameter, a body that does not
-lower): it may do anything, so it is refused for every word the list leaves out. Only
+assembly, a function pointer taken as a parameter, a call of an unlisted method through a
+`dyn` taken as a parameter, a body that does not lower): it may do anything, so it is refused for every word the list leaves out. Only
 `#[blaze::may(panic, alloc, block, diverge)]`, "may anything", admits it, or a callee taken at
 its word (`trusted`, below). `pure` needs no word either: see "Purity" below.
 
@@ -97,10 +97,19 @@ takes no `trusted`.
 
 **Calls the check can't resolve.**
 - *Through `dyn Trait`, or a method of a type parameter*: the call has the trait method's list
-  (its own, else its trait's). A `dyn` of a trait whose methods all leave a word out can be
-  taken as a parameter by a function that leaves it out too, and a generic function's call of
-  such a method is not left open to each instance. This rests on every impl being held within
-  the list, which `undeclared_effect` does wherever the impl is written.
+  (its own, else its trait's), and a generic function's call of such a method is not left open
+  to each instance. This rests on every impl being held within the list, which
+  `undeclared_effect` does wherever the impl is written.
+- *A `dyn` taken as a parameter* (itself, in a field, behind a pointer) is an object the
+  caller made, which the walk of the function never saw. Taking it is not refused: a call
+  through it is, when nothing says what the object's method may do. The walk records each call
+  through a `dyn` of a method whose list (or whose trait's trust) does not leave the word out,
+  each call through a `dyn Fn`, and each drop of a value that owns a `dyn` (`Rule::Dyn`, kept
+  for every word); a function that takes a `dyn` and reaches one, in its own body or in
+  anything it calls, is refused as code the check can't see, naming the method and the `dyn`.
+  A callee `trusted` for the word does not hide it: it answers for its own code, not for the
+  object it is handed. So a function that stores the `dyn`, compares it or hands it on to code
+  that calls nothing through it is clean, and one that calls a listed method has that list.
 - *Through a function pointer*: a function pointer's type has no marks, so one taken as a
   parameter is "may anything" and refused for every word the function leaves out. One made in
   the body is different: what it points to was walked where it was made (the walk is
@@ -217,7 +226,7 @@ kinds are above):
 | `Block` | the blocking table (below) | | | yes |
 | `ForeignUnwind` | a foreign function blaze knows nothing of whose ABI may unwind and that is not `#[rustc_nounwind]`; `asm!(.., options(may_unwind))` | yes | | |
 | `ForeignUnknown` | a foreign function not in the foreign table; inline assembly | | yes | yes |
-| `Unchecked` | what the walk can't follow (a `dyn` or function pointer from a parameter, a body that does not lower) | yes | yes | yes |
+| `Unchecked` | what the walk can't follow (a function pointer from a parameter, a call through a `dyn` from a parameter that no list answers for, a body that does not lower) | yes | yes | yes |
 
 A list without `diverge` refuses `Loop`, `Recursion`, `Indirect`, `ForeignUnknown` and
 `Unchecked`.

@@ -79,10 +79,18 @@ pub enum Rule {
     /// the sets of an effect that refuses a panic, never a kind of [`crate::walk::Summary`]'s
     /// `kinds`, and never refused itself.
     Precondition,
+    /// A call through a `dyn` of a method no `#[blaze::may(..)]` or trust says the effects of
+    /// (or through a `dyn Fn`), or the drop of a value that owns a `dyn`: its target is
+    /// whatever object the function is handed. It matters only to a check whose root takes
+    /// such a `dyn` (`crate::function`): every other object is made in the root's own graph,
+    /// where its vtable's methods were walked. Kept in every effect's set, never refused by an
+    /// effect itself, and it crosses a callee trusted for the effect, which answers for its
+    /// own code and not for the object it is given.
+    Dyn,
 }
 
 impl Rule {
-    pub const ALL: [Rule; 22] = [
+    pub const ALL: [Rule; 23] = [
         Rule::Io,
         Rule::Env,
         Rule::Clock,
@@ -105,6 +113,7 @@ impl Rule {
         Rule::Recursion,
         Rule::Indirect,
         Rule::Precondition,
+        Rule::Dyn,
     ];
 
     /// What an instance with this kind does: "reads the environment".
@@ -132,6 +141,7 @@ impl Rule {
             Rule::Recursion => "may call itself again",
             Rule::Indirect => "makes a call that may reach it again",
             Rule::Precondition => "has an `unsafe` precondition its caller upholds",
+            Rule::Dyn => "calls through a `dyn` it is given",
         }
     }
 
@@ -160,6 +170,7 @@ impl Rule {
             Rule::Recursion => "recursion",
             Rule::Indirect => "indirect",
             Rule::Precondition => "precondition",
+            Rule::Dyn => "dyn",
         }
     }
 }

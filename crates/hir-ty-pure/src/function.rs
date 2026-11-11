@@ -296,6 +296,23 @@ fn checked(
     }
     let summary = summary(db, env.clone(), root.clone()); // clone: the query's key, reference counts
     let mut refused = summary.set(index).intersect(refuses);
+    // The root takes a `dyn` nothing answers for, and reaches a call through one (or the drop
+    // of one it owns): the object is the caller's, so its code is code the check can't see.
+    // Said before any other kind, as what the parameters hide is.
+    if let Some(taken) = &found.unlisted_dyn
+        && summary.set(index).has(Rule::Dyn)
+    {
+        let mut refusal = refusal(&cx, def, index, Rule::Dyn, &root, summary);
+        refusal.rule = Rule::Unchecked;
+        refusal.says = (def.says)(Rule::Unchecked);
+        // alloc: the refusal's text, once
+        refusal.what = format!(
+            "{}; the function takes `{taken}`, whose calls the check can't see: give the trait's method a `#[blaze::may(..)]`, take a type parameter, or mark the trait trusted",
+            refusal.what
+        )
+        .into();
+        return FnPurity::Impure(refusal);
+    }
     if generic {
         found.open |= summary.set(index).has(Rule::Open);
     } else if summary.set(index).has(Rule::Open) {
@@ -318,6 +335,11 @@ struct Found {
     // alloc: the proof's trusted functions, few, once per check
     trusted: Vec<Trusted>,
     open: bool,
+    /// The first `dyn` the root takes whose trait neither bounds every method nor is trusted
+    /// for the effect, as written: a call through it is refused where the walk reaches one
+    /// ([`Rule::Dyn`]); one only stored, compared or handed on to code that makes no such call
+    /// is not.
+    unlisted_dyn: Option<Box<str>>,
 }
 
 impl Found {
@@ -630,9 +652,17 @@ impl<'db> Params<'_, 'db> {
                             }
                         }
                     }
-                    None => self.refuse(Rule::Unchecked, || {
-                        format!("takes `{}`, whose calls the check can't see: take a type parameter, or mark the trait trusted", cx.shown(ty))
-                    }),
+                    // Its methods' effects are each method's to say (`effects::bound_mask`):
+                    // whether the function makes a call nothing answers for is the walk's to
+                    // find ([`Rule::Dyn`], refused in `checked`).
+                    None if self.refuses.has(Rule::Unchecked) => {
+                        if self.found.unlisted_dyn.is_none() {
+                            let shown = cx.shown(ty);
+                            let text = blaze_query::db::attach(cx.db, || format!("{shown}")); // alloc: a refusal's text, once per check
+                            self.found.unlisted_dyn = Some(text.into());
+                        }
+                    }
+                    None => {}
                 }
             }
             TyKind::Adt(adt, adt_args) => {

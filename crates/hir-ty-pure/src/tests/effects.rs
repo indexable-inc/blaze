@@ -202,3 +202,114 @@ pub fn only_the_name(n: usize) {
         }
     });
 }
+
+/// What the tests of a `dyn` the root takes share: a trait with a method whose
+/// `#[blaze::may(..)]` says what any object's may do and one with none, and a holder of one.
+const PROBED: &str = r#"
+//- minicore: sized, copy, phantom_data, drop, unsize, coerce_unsized, dispatch_from_dyn
+//- /lib.rs crate:kernel
+pub trait Probe {
+    /// Allocates, in any impl, and nothing else.
+    #[blaze::may(alloc)]
+    fn listed(&self, at: u32);
+    fn unlisted(&self, at: u32);
+}
+
+pub struct World<'a> {
+    pub probe: &'a dyn Probe,
+    pub clock: u32,
+}
+
+pub fn only_stores<'a>(probe: &'a dyn Probe, clock: u32) -> World<'a> {
+    World { probe, clock }
+}
+
+pub fn reads_beside_it(world: &World<'_>) -> u32 {
+    world.clock
+}
+
+fn inner(world: &World<'_>) -> u32 {
+    world.clock
+}
+
+pub fn hands_it_on(world: &World<'_>) -> u32 {
+    inner(world)
+}
+
+pub fn calls_listed(probe: &dyn Probe) {
+    probe.listed(1)
+}
+
+pub fn calls_unlisted(probe: &dyn Probe) {
+    probe.unlisted(1)
+}
+
+fn calls_inside(world: &World<'_>) {
+    world.probe.unlisted(2)
+}
+
+pub fn hands_it_to_a_caller(world: &World<'_>) {
+    calls_inside(world)
+}
+
+#[blaze::nopanic(trusted = "the fixture's: it answers for its own code")]
+#[blaze::nonblocking(trusted = "the fixture's: it answers for its own code")]
+fn trusted_inside(world: &World<'_>) {
+    world.probe.unlisted(3)
+}
+
+pub fn hands_it_to_a_trusted_function(world: &World<'_>) {
+    trusted_inside(world)
+}
+"#;
+
+/// A function that takes a `dyn` is refused for what it does through it, not for taking it:
+/// one that stores it, reads beside it or hands it to a function that calls nothing through
+/// it is clean. A call through it has the effects the trait's method declares
+/// (`#[blaze::may(alloc)]`: no panic and no wait in any impl, an allocation in some). A call
+/// of a method with no list is refused naming the method and the `dyn` taken, wherever in
+/// the root's graph it is made, under a callee trusted for the effect too: that one answers
+/// for its own code, not for the object it is handed.
+#[test]
+fn a_dyn_parameter_is_refused_only_for_a_call_through_it() {
+    let db = hir_expand::fixture::db(PROBED).into_db();
+    let krate = crate_named(&db, "kernel");
+    blaze_query::db::attach(&db, || {
+        for clean in ["only_stores", "reads_beside_it", "hands_it_on"] {
+            for effect in [&NOPANIC, &NOALLOC, &NONBLOCKING] {
+                if let Err(refusal) = check_generic(&db, fn_named(&db, krate, clean), effect) {
+                    panic!("`{clean}` should be {}, but {}", effect.name, refusal.said());
+                }
+            }
+        }
+        // Exactly the declared effects: `alloc` and no other.
+        let listed = fn_named(&db, krate, "calls_listed");
+        for effect in [&NOPANIC, &NONBLOCKING] {
+            if let Err(refusal) = check_generic(&db, listed, effect) {
+                panic!("`calls_listed` should be {}, but {}", effect.name, refusal.said());
+            }
+        }
+        let Err(refusal) = check_generic(&db, listed, &NOALLOC) else {
+            panic!("`Probe::listed` may allocate, so `calls_listed` is not noalloc");
+        };
+        assert!(refusal.said().contains("listed"), "{}", refusal.said());
+        for refused in
+            ["calls_unlisted", "hands_it_to_a_caller", "hands_it_to_a_trusted_function"]
+        {
+            for effect in [&NOPANIC, &NONBLOCKING] {
+                let Err(refusal) = check_generic(&db, fn_named(&db, krate, refused), effect)
+                else {
+                    panic!("`{refused}` calls `Probe::unlisted` through a `dyn` it is given");
+                };
+                let said = refusal.said();
+                assert_eq!(refusal.rule, Rule::Unchecked, "{said}");
+                assert!(
+                    said.contains("unlisted")
+                        && said.contains("through a `dyn`")
+                        && said.contains("dyn Probe"),
+                    "{said}"
+                );
+            }
+        }
+    });
+}

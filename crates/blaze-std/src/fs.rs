@@ -1605,8 +1605,8 @@ impl File<ReadWrite> {
 
 impl Buffered<'_, '_> {
     /// How many bytes are held and not yet in the file.
-    #[blaze::noalloc(trusted = "reads the buffer's length; the `dyn Probe` the file's world holds in its lock is never called")]
-    #[blaze::nonblocking(trusted = "reads the buffer's length; the `dyn Probe` the file's world holds in its lock is never called")]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn held(&self) -> usize {
         self.held.len()
     }

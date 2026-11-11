@@ -295,7 +295,7 @@ fn says(rule: Rule) -> &'static str {
         Rule::ForeignUnknown => {
             "calls a foreign function (or runs inline assembly) blaze knows nothing of"
         }
-        Rule::Unchecked => "runs code the check can't see",
+        Rule::Unchecked | Rule::Dyn => "runs code the check can't see",
         Rule::Loop => "may run for ever: it has a loop that is not known to end",
         Rule::Recursion => "may run for ever: it may call itself again",
         Rule::Indirect => {
