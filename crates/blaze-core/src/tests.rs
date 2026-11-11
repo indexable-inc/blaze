@@ -101,6 +101,15 @@ fn script(driver: &mut impl Driver) -> BTreeMap<u64, String> {
             21 => Effect::WriteAt { file: name("missing"), at: 0, bytes: vec![1], tag: Tag(22) },
             22 => Effect::Rename { from: name("missing"), to: name("out/m"), tag: Tag(23) },
             23 => Effect::List { dir: name("missing"), tag: Tag(24) },
+            // The effects whose calls are blaze-sys's on Linux (`fs/linux.rs`): a cut, a read
+            // of a range that runs past the end, a sync, and an append after them. (A ranged
+            // read of a file that is not there is not in the script: the simulation reads it
+            // as empty and the native drivers fail it, a difference this lane found and left.)
+            24 => Effect::Truncate { file: name("store/a/moved"), len: 3, tag: Tag(25) },
+            25 => Effect::Read { file: name("store/a/moved"), at: 1, len: 10, tag: Tag(26) },
+            26 => Effect::Sync { file: name("store/a/moved"), tag: Tag(27) },
+            27 => Effect::Append { file: name("store/a/moved"), bytes: b"!".to_vec(), tag: Tag(28) },
+            28 => Effect::ReadAll { file: name("store/a/moved"), tag: Tag(29) },
             _ => return,
         };
         effects.push(next);
@@ -139,6 +148,10 @@ fn every_driver_ends_the_script_the_same() {
         (&simulated[&22][..], &simulated[&23][..], &simulated[&24][..]),
         ("failed", "failed", "failed")
     );
+    assert_eq!(simulated[&25], format!("{:?}", Done::Truncated));
+    assert_eq!(simulated[&26], format!("{:?}", Done::Read(b"ga".to_vec())));
+    assert_eq!(simulated[&27], format!("{:?}", Done::Synced));
+    assert_eq!(simulated[&29], format!("{:?}", Done::Read(b"aga!".to_vec())));
     #[cfg(target_os = "linux")]
     {
         let root = dir("uring");

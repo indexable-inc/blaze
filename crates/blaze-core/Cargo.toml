@@ -25,6 +25,11 @@ parking_lot.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
+# The one home of system calls (docs/v2/plan/design/sys.md): the drivers move onto it call by
+# call, and `libc` above goes when the last has.
+[target.'cfg(target_os = "linux")'.dependencies]
+blaze-sys.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Security_Authorization"] }
 

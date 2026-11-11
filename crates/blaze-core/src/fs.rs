@@ -12,6 +12,10 @@ mod private;
 
 pub(crate) use private::private;
 
+/// The file effects' calls on Linux, on blaze-sys: no `libc`, no `std::fs`.
+#[cfg(target_os = "linux")]
+pub(crate) mod linux;
+
 /// The calls WASI makes its own way or has none of (the wasm32-wasip1 seed).
 #[cfg(target_os = "wasi")]
 mod wasi;
@@ -136,9 +140,14 @@ pub(crate) fn making_parent<T>(
 /// earlier request: the name may be another file by now (a build directory removed and made
 /// again by `blaze clean` and the next build).
 pub(crate) fn truncate(path: &Path, len: u64) -> io::Result<()> {
-    let open = || OpenOptions::new().write(true).create(true).truncate(false).open(path);
-    making_parent(path, open)
-        .and_then(|file| file.set_len(len))
+    #[cfg(target_os = "linux")]
+    let cut = linux::truncate(path, len);
+    #[cfg(not(target_os = "linux"))]
+    let cut = {
+        let open = || OpenOptions::new().write(true).create(true).truncate(false).open(path);
+        making_parent(path, open).and_then(|file| file.set_len(len))
+    };
+    cut
         // alloc: an error path.
         .map_err(|error| {
             io::Error::new(
@@ -190,7 +199,79 @@ pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
+/// [`crate::Effect::Read`]: up to `len` bytes of the file at `path` from `at`, fewer only at
+/// its end.
+#[cfg(target_os = "linux")]
+pub(crate) fn read(path: &Path, at: u64, len: usize) -> io::Result<Vec<u8>> {
+    linux::read(path, at, len)
+}
+
+/// [`crate::Effect::Read`]: up to `len` bytes of the file at `path` from `at`, fewer only at
+/// its end.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn read(path: &Path, at: u64, len: usize) -> io::Result<Vec<u8>> {
+    let file = std::fs::File::open(path)?;
+    // alloc: the read's payload.
+    let mut bytes = vec![0; len];
+    let mut read = 0;
+    while read < len {
+        let n = read_at(&file, &mut bytes[read..], at + read as u64)?;
+        if n == 0 {
+            break;
+        }
+        read += n;
+    }
+    bytes.truncate(read);
+    Ok(bytes)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn read_at(file: &std::fs::File, buffer: &mut [u8], at: u64) -> io::Result<usize> {
+    std::os::unix::fs::FileExt::read_at(file, buffer, at)
+}
+
+#[cfg(windows)]
+fn read_at(file: &std::fs::File, buffer: &mut [u8], at: u64) -> io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_read(file, buffer, at)
+}
+
+#[cfg(target_os = "wasi")]
+fn read_at(file: &std::fs::File, buffer: &mut [u8], at: u64) -> io::Result<usize> {
+    std::os::wasi::fs::FileExt::read_at(file, buffer, at)
+}
+
+/// [`crate::Effect::Append`]: `bytes` at the end of the file at `path`, made with its
+/// directories where it is missing.
+pub(crate) fn append(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    return linux::append(path, bytes);
+    #[cfg(not(target_os = "linux"))]
+    {
+        use std::io::Write as _;
+        let open = || OpenOptions::new().create(true).append(true).open(path);
+        making_parent(path, open)?.write_all(bytes)
+    }
+}
+
+/// [`crate::Effect::Sync`]: the file at `path`, made where it is missing, synced to the
+/// device. Off Linux, `sync_all` is `F_FULLFSYNC` on Apple's systems, where `fsync` leaves
+/// the bytes in the drive's cache.
+pub(crate) fn sync(path: &Path) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    return linux::sync(path);
+    #[cfg(not(target_os = "linux"))]
+    // durable: the effect is the sync its caller asked for.
+    return OpenOptions::new().append(true).create(true).open(path)?.sync_all();
+}
+
 /// `bytes` written at `at` of the file at `path`, which exists.
+#[cfg(target_os = "linux")]
+pub(crate) fn write_at(path: &Path, at: u64, bytes: &[u8]) -> io::Result<()> {
+    linux::write_at(path, at, bytes)
+}
+
+/// `bytes` written at `at` of the file at `path`, which exists.
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn write_at(path: &Path, at: u64, bytes: &[u8]) -> io::Result<()> {
     let file = OpenOptions::new().write(true).open(path)?;
     // As `uring.rs`'s `O_DIRECT`: a large aligned write stays out of the unified buffer cache;
