@@ -1,6 +1,8 @@
 //! The structured-MIR refinement and its controls, the folds, the printer, golden tests of
 //! the emitted Lean (each a module under `lean/BlazeModel`, which `lake build` type-checks),
-//! the refusals, and the first proof's statement.
+//! the refusals, the first proof's statement, and the embedded MIR (`body::embed`): its golden
+//! bodies under `lean/BlazeMir`, the passes held to their Lean specifications
+//! (`lean/BlazeValidated`), and the corpus harness/v2/mir_semantics.py runs three ways.
 //!
 //! A golden's file is what the translator emits, byte for byte. When the translator changes
 //! on purpose, `UPDATE_EXPECT=1` rewrites the files; then `lake build` in `lean/` must still
@@ -16,8 +18,13 @@ use hir_expand::fixture;
 // Links the crate that provides the MIR queries.
 use hir_ty_mir as _;
 
+use hir_def::{DefWithBodyId, HasModule as _};
+use rustc_type_ir::inherent::GenericArgs as _;
+use hir_ty::db::HirDatabase as _;
+use hir_ty_mir::mir::budget::{self, Pass};
+
 use crate::{
-    Emitted, body::*, driver, emit, lean,
+    Emitted, body::*, driver, emit, embed_mir, embed_mir_body, lean,
     structured::{
         self, Cfg, CfgBlock, End, Ended, Exit, Machine, Node, Plant, ill_formed, lower,
         reconstruct, reconstruct_planted, run_cfg, run_structured,
@@ -797,9 +804,12 @@ fn fnv1a(db: &Db) -> FunctionId {
 /// proof is of the model this test holds to the tree's source: the function's text is read
 /// from crates/blaze-graph/src/ledger.rs, its emitted Lean must be the checked-in module the
 /// proof imports, and its structured MIR runs to the same fold on the inputs here.
-/// A Lean proof of it is written (crates/blaze-graph/lean/BlazeGraph/Ledger.lean) and Lean has
-/// not checked it: this statement says `(proved: ..)` once `lake build` of `lean/` passes in
-/// the gate (ledger V5), never before.
+/// Lean 4.20.0 accepts the proof of the model (crates/blaze-graph/lean/BlazeGraph/Ledger.lean)
+/// and a proof is written that the model is what the function's MIR runs to
+/// (BlazeGraph/LedgerMir.lean, objective V7). This statement says `(proved: ..)` once three
+/// things hold on one commit, never before: this test and
+/// `fnv1a_from_is_embedded_as_the_body_its_proof_walks` pass (the model and the embedded body
+/// are what blaze emits), and `lake build` of `lean/` passes in the gate with both proofs.
 #[test]
 fn fnv1a_from_is_the_fold_of_its_bytes() {
     let db = db(&fnv1a_fixture());
@@ -895,4 +905,331 @@ fn lean_checks_the_first_proof_and_its_axioms() {
     let proved = proved.unwrap_or_else(|err| panic!("{err}"));
     assert_eq!(proved.theorem, "blaze_graph.ledger.fnv1a_from.spec");
     assert!(proved.axioms.iter().all(|it| crate::ALLOWED_AXIOMS.contains(&it.as_str())));
+}
+
+// ---- MIR, embedded (`body::embed`): what `lean/Blaze/Mir` runs. ----
+
+#[track_caller]
+fn embedded(flags: &str, krate: &str, name: &str, source: &str) -> crate::EmbeddedMir {
+    let db = db(&fixture_of(flags, krate, source));
+    let func = function(&db, krate, name);
+    let first = match embed_mir(&db, func) {
+        Ok(it) => it,
+        Err(err) => panic!("{err}"),
+    };
+    // Written again, it is the same bytes (`deterministic-output`), from the same database
+    // and from a new one.
+    assert_eq!(embed_mir(&db, func).as_ref().map(|it| &it.text), Ok(&first.text));
+    let other = self::db(&fixture_of(flags, krate, source));
+    let again = embed_mir(&other, function(&other, krate, name)).expect("embedded once already");
+    assert_eq!(again.text, first.text);
+    assert_eq!(first.module, format!("BlazeMir.{krate}.{name}"));
+    first
+}
+
+const SLICES: &str = "sized, copy, add, ord, eq, fn, builtin_impls, index, slice";
+
+/// The fixtures of the embedded goldens: the crate, the function, minicore's flags, the source.
+/// Each is a construct of the subset; `lean/Blaze/Mir/Tests/Golden.lean` imports every one,
+/// so `lake build` type-checks them, and `Tests/Run.lean` runs them.
+const EMBEDDED: &[(&str, &str, &str, &str)] = &[
+    ("arith", "add_one", FLAGS, "pub fn add_one(x: u32) -> u32 { x + 1 }\n"),
+    (
+        "structs",
+        "bump",
+        FLAGS,
+        "pub struct Counter { pub hits: u32, pub limit: u32 }
+pub fn bump(counter: &mut Counter) { counter.hits = counter.limit; }
+",
+    ),
+    (
+        "enums",
+        "side",
+        FLAGS,
+        "pub enum Shape { Dot, Square(u32) }
+pub fn side(shape: Shape) -> u32 { match shape { Shape::Dot => 0, Shape::Square(side) => side } }
+",
+    ),
+    (
+        "loops",
+        "count",
+        FLAGS,
+        "pub fn count(n: u32) -> u32 { let mut i = 0; while i < n { i += 1; } i }\n",
+    ),
+    (
+        "early",
+        "clamp",
+        FLAGS,
+        "pub fn clamp(x: u32, limit: u32) -> u32 { if x > limit { return limit; } x }\n",
+    ),
+    ("slices", "first", SLICES, "pub fn first(xs: &[u32]) -> u32 { xs[0] }\n"),
+    (
+        "calls",
+        "quadruple",
+        FLAGS,
+        "pub fn double(x: u32) -> u32 { x + x }
+pub fn quadruple(x: u32) -> u32 { double(double(x)) }
+",
+    ),
+];
+
+#[test]
+fn mir_is_embedded_as_the_golden_bodies() {
+    for (krate, name, flags, source) in EMBEDDED {
+        let out = embedded(flags, krate, name, source);
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../lean/BlazeMir")
+            .join(krate)
+            .join(format!("{name}.lean"));
+        expect_file![path].assert_eq(&out.text);
+    }
+}
+
+/// The body the proof `crates/blaze-graph/lean/BlazeGraph/LedgerMir.lean` walks is the body
+/// blaze has for the tree's `fnv1a_from`: the first link of the chain from the MIR to FNV-1a's
+/// fold.
+#[test]
+fn fnv1a_from_is_embedded_as_the_body_its_proof_walks() {
+    let db = db(&fnv1a_fixture());
+    let out = embed_mir(&db, fnv1a(&db)).unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(out.name, "blaze_graph.ledger.fnv1a_from.mir");
+    expect_file!["../../../lean/BlazeMir/blaze_graph/ledger/fnv1a_from.lean"].assert_eq(&out.text);
+    assert_eq!(embed_mir(&db, fnv1a(&db)).map(|it| it.text), Ok(out.text));
+}
+
+#[test]
+fn what_the_semantics_does_not_have_is_refused_by_name() {
+    let cases = [
+        ("pub fn f(p: *const u32) -> u32 { 0 }\n", "raw pointer"),
+        ("pub unsafe fn f() -> u32 { 0 }\n", "`unsafe fn`"),
+        ("pub fn f() -> u32 { let g = |x: u32| x; g(1) }\n", "closure"),
+        ("pub fn f(x: f32) -> f32 { x }\n", "floating-point"),
+        ("pub fn f(s: &str) -> u32 { 0 }\n", "string"),
+        ("pub fn f<T>(x: T) -> T { x }\n", "generic function"),
+        ("pub union U { a: u32, b: u32 }\npub fn f(u: U) -> u32 { 0 }\n", "union"),
+        ("pub fn g<T>(x: T) -> T { x }\npub fn f() -> u32 { g(1) }\n", "generic function `g`"),
+        ("pub fn f(x: u32) -> u64 { x as f32 as u64 }\n", "floating-point"),
+    ];
+    for (source, what) in cases {
+        let db = db(&fixture_of(FLAGS, "main", source));
+        match embed_mir(&db, function(&db, "main", "f")) {
+            Err(err) => {
+                assert!(err.what.contains(what), "`{source}` is refused for {what}: {err}");
+                assert_eq!(err.function, "main::f");
+                assert!(!err.at.is_empty());
+            }
+            Ok(it) => panic!("expected a refusal of `{source}`, got:\n{}", it.text),
+        }
+    }
+}
+
+// ---- The passes, held to their Lean specifications. ----
+
+/// The passes with a specification in `lean/Blaze/Mir/Opt`, by rustc's name, and the Lean
+/// function each must equal.
+const SPECIFIED: &[(Pass, &str, &str)] = &[
+    (Pass::RemoveStorageMarkers, "RemoveStorageMarkers", "Opt.removeStorageMarkers"),
+    (Pass::SimplifyConstCondition, "SimplifyConstCondition", "Opt.simplifyConstCondition"),
+];
+
+/// `pass` run alone on `func`'s runtime MIR, as Lean: the body before, the body after, and
+/// `example : after = <spec> before := rfl`, which the kernel decides by evaluating the
+/// specification. Lean failing on it says the Rust pass did not do what its specification
+/// does (it did more, or something else): a finding, reported by the build.
+fn validation(db: &Db, krate: &str, name: &str, pass: Pass) -> String {
+    let func = function(db, krate, name);
+    let (_, pass_name, spec) =
+        SPECIFIED.iter().find(|it| it.0 == pass).expect("a pass with a specification");
+    let (before, after) = blaze_query::db::attach(db, || {
+        let def = DefWithBodyId::FunctionId(func);
+        let before = match db.runtime_mir_body(def.into()) {
+            Ok(body) => body.clone(),
+            Err(err) => panic!("the runtime MIR of `{krate}::{name}`: {err:?}"),
+        };
+        let mut after = before.clone();
+        budget::with_passes(db, def.into(), |passes| passes.run(&mut after, pass))
+            .unwrap_or_else(|err| panic!("{pass_name} on `{krate}::{name}`: {err:?}"));
+        (before, after)
+    });
+    let before = embed_mir_body(db, func, &before).unwrap_or_else(|err| panic!("{err}"));
+    let after = embed_mir_body(db, func, &after).unwrap_or_else(|err| panic!("{err}"));
+    let namespace = lean::ident(&format!("BlazeValidated.{pass_name}.{krate}.{name}"));
+    format!(
+        "namespace {namespace}\n\ndef before : Program :=\n{before}\n\ndef after : Program :=\n{after}\n\n\
+         /-- `{pass_name}` did to `{krate}::{name}` what its specification does. -/\n\
+         example : after = {spec} before := rfl\n\nend {namespace}\n"
+    )
+}
+
+/// The head of a module of validations.
+fn validation_head() -> String {
+    format!(
+        "-- Generated by blaze ({}): MIR passes run alone on runtime MIR, each held to its Lean specification.\n\
+         -- Do not edit: the golden tests of crates/hir-ty-lean hold this file to what the passes and the encoder write.\n\
+         import Blaze.Mir.Opt.RemoveStorageMarkers\nimport Blaze.Mir.Opt.SimplifyConstCondition\n\n\
+         open Blaze Blaze.Mir\n",
+        crate::TRANSLATOR
+    )
+}
+
+/// A MIR pass with a Lean specification does, on each body here, exactly
+/// what the specification does (`after = spec before`, decided by Lean's kernel when
+/// `lake build` checks lean/BlazeValidated/passes.lean); the specification is proved to
+/// preserve every run (`Blaze.Mir.Opt.removeStorageMarkers_correct`,
+/// `simplifyConstCondition_correct`). This test holds the checked-in pairs to what the Rust
+/// passes and the encoder produce today.
+#[test]
+fn the_passes_are_their_lean_specifications() {
+    let loops = db(&fixture_of(
+        FLAGS,
+        "loops",
+        "pub fn count(n: u32) -> u32 { let mut i = 0; while i < n { i += 1; } i }\n",
+    ));
+    let consts = db(&fixture_of(
+        FLAGS,
+        "consts",
+        "pub fn pick(x: u32) -> u32 { if true { x } else { 0 } }\n",
+    ));
+    let text = [
+        validation_head(),
+        validation(&loops, "loops", "count", Pass::RemoveStorageMarkers),
+        validation(&consts, "consts", "pick", Pass::SimplifyConstCondition),
+    ]
+    .join("\n");
+    expect_file!["../../../lean/BlazeValidated/passes.lean"].assert_eq(&text);
+}
+
+// ---- The corpus of harness/v2/mir_semantics.py. ----
+
+/// What blaze's MIR evaluator says of the nullary function `func`, in the fixed form of
+/// `lean/Blaze/Mir/Runner.lean`: `ok <value>`, `panic <kind>`, `undefined`, or `error ..`.
+fn evaluated(db: &Db, func: FunctionId, returns: &str) -> String {
+    blaze_query::db::attach(db, || {
+        // The body the evaluator runs: runtime MIR, as `tests/layout/field_order.rs` asks for it.
+        let env = hir_ty::traits::ParamEnvAndCrate {
+            param_env: db.trait_environment(func.into()),
+            krate: func.krate(db),
+        }
+        .store();
+        let body = match db.monomorphized_runtime_mir_body(
+            func.into(),
+            hir_ty::next_solver::GenericArgs::empty().store(),
+            env,
+        ) {
+            Ok(body) => body,
+            Err(err) => return format!("error: no MIR ({err:?})"),
+        };
+        let value = match hir_ty_mir::mir::interpret_mir(db, body, None) {
+            Ok((Ok(value), _)) => value,
+            Ok((Err(err), _)) | Err(err) => {
+                let said = format!("{err:?}");
+                let lower = said.to_lowercase();
+                return if lower.contains("undefinedbehavior") {
+                    "undefined".to_owned()
+                } else if !lower.contains("panic") {
+                    format!("error: {}", said.replace('\n', " "))
+                } else if lower.contains("out of bounds") {
+                    "panic bounds".to_owned()
+                } else if lower.contains("overflow")
+                    || lower.contains("by zero")
+                    || lower.contains("zero divisor")
+                {
+                    "panic arithmetic".to_owned()
+                } else {
+                    "panic panic".to_owned()
+                };
+            }
+        };
+        let memory: &[u8] = &value.memory;
+        let mut bytes = [0u8; 16];
+        bytes[..memory.len().min(16)].copy_from_slice(&memory[..memory.len().min(16)]);
+        let bits = u128::from_le_bytes(bytes);
+        let int = match returns {
+            "bool" => return format!("ok {}", bits != 0),
+            "u8" => IntTy::U8,
+            "u16" => IntTy::U16,
+            "u32" => IntTy::U32,
+            "u64" => IntTy::U64,
+            "u128" => IntTy::U128,
+            "usize" => IntTy::Usize,
+            "i8" => IntTy::I8,
+            "i16" => IntTy::I16,
+            "i32" => IntTy::I32,
+            "i64" => IntTy::I64,
+            "i128" => IntTy::I128,
+            "isize" => IntTy::Isize,
+            other => return format!("error: a case returns `{other}`"),
+        };
+        format!("ok {}", int.decimal(bits))
+    })
+}
+
+/// The cases of a corpus program: each `pub fn case_N() -> T {` of its source, its name and `T`.
+fn cases_of(source: &str) -> Vec<(String, String)> {
+    source
+        .lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix("pub fn ")?;
+            let (name, rest) = rest.split_once("() -> ")?;
+            let (returns, _) = rest.split_once(" {")?;
+            name.starts_with("case_").then(|| (name.to_owned(), returns.to_owned()))
+        })
+        .collect()
+}
+
+/// The Rust half of harness/v2/mir_semantics.py, which names a directory in
+/// `BLAZE_MIR_SEMANTICS` (without it this test fails, never skips). For each program
+/// `programs/<name>.rs` there (a crate `<name>` with `pub fn entry(..)` and nullary
+/// `pub fn case_N() -> T { entry(..) }`), it writes:
+///
+/// - `Corpus.lean`: `entry`'s embedded program under the name `<name>`, and a `main` that runs
+///   `Blaze.Mir.Runner` over them;
+/// - `evaluator.txt`: a line `<name> <case> <answer>` per case, from blaze's MIR evaluator;
+/// - `Validate.lean`: each specified pass on `entry`'s runtime MIR against its specification.
+#[test]
+fn mir_semantics_corpus() {
+    let dir = std::env::var_os("BLAZE_MIR_SEMANTICS").map(std::path::PathBuf::from).expect(
+        "BLAZE_MIR_SEMANTICS names the corpus directory harness/v2/mir_semantics.py wrote: run \
+         that script, which runs this test",
+    );
+    let mut names: Vec<String> = std::fs::read_dir(dir.join("programs"))
+        .unwrap_or_else(|err| panic!("{}/programs: {err}", dir.display()))
+        .map(|entry| entry.expect("a directory entry").file_name().to_string_lossy().into_owned())
+        .filter_map(|file| file.strip_suffix(".rs").map(str::to_owned))
+        .collect();
+    // A directory lists in any order; the output does not depend on it.
+    names.sort();
+    let flags = "sized, copy, add, ord, eq, fn, builtin_impls, index, slice, int_wrapping, panic";
+    let mut corpus = String::from("import Blaze.Mir.Runner\n\nopen Blaze Blaze.Mir\n");
+    let mut table = Vec::new();
+    let mut answers = String::new();
+    let mut validate = validation_head();
+    for name in &names {
+        let source = std::fs::read_to_string(dir.join("programs").join(format!("{name}.rs")))
+            .unwrap_or_else(|err| panic!("{name}.rs: {err}"));
+        let db = db(&fixture_of(flags, name, &source));
+        let entry = function(&db, name, "entry");
+        let embedded = embed_mir(&db, entry).unwrap_or_else(|err| panic!("{err}"));
+        let constant = lean::ident(&embedded.name);
+        corpus.push_str(&format!("\ndef {constant} : Program :=\n{}\n", embedded.term));
+        table.push(format!("(\"{name}\", {constant})"));
+        for (case, returns) in cases_of(&source) {
+            let answer = evaluated(&db, function(&db, name, &case), &returns);
+            answers.push_str(&format!("{name} {case} {answer}\n"));
+        }
+        for (pass, _, _) in SPECIFIED {
+            validate.push('\n');
+            validate.push_str(&validation(&db, name, "entry", *pass));
+        }
+    }
+    corpus.push_str(&format!(
+        "\ndef main : IO Unit := Blaze.Mir.runMain [\n  {}]\n",
+        table.join(",\n  ")
+    ));
+    let write = |file: &str, text: &str| {
+        std::fs::write(dir.join(file), text).unwrap_or_else(|err| panic!("{file}: {err}"));
+    };
+    write("Corpus.lean", &corpus);
+    write("evaluator.txt", &answers);
+    write("Validate.lean", &validate);
 }

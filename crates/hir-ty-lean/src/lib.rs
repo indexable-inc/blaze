@@ -21,6 +21,10 @@
 //!    an elaboration error naming the theorem. Proved means: Lean accepts it, and its axioms
 //!    are among [`ALLOWED_AXIOMS`] (so no `sorry`, no native evaluation).
 //!
+//! Beside the functional translation, [`embed_mir`] writes a function's MIR itself as a term
+//! of the deep embedding in `lean/Blaze/Mir` ([`body::embed`]): the executable semantics the
+//! models, the passes and the evaluator are held to.
+//!
 //! What v0 does not translate is a [`NotTranslated`] naming the construct and where it is:
 //! never a `sorry`, an axiom or an approximation.
 //!
@@ -46,6 +50,7 @@ pub use driver::{
     ALLOWED_AXIOMS, Clause, Config, LEAN_VERSION, LeanError, NotProved, ProofFile, ProofKey,
     Proofs, Proved, Prover, check, check_emitted, proof_key, proved,
 };
+pub use body::embed::Embedded as EmbeddedMir;
 pub use spec::Spec;
 
 use lean::{Binder, Decl, Infix, Module, Pat, Term, app, atom, infix, name};
@@ -126,6 +131,13 @@ pub fn structured(db: &Db, func: FunctionId) -> Result<body::Body, NotTranslated
 }
 
 fn lowered(db: &Db, func: FunctionId) -> Result<body::Lowered, NotTranslated> {
+    accepted(db, func)?;
+    body::from_mir(db, func)
+}
+
+/// Refused unless `func` type-checks and borrow-checks: every reading of its MIR rests on
+/// both.
+fn accepted(db: &Db, func: FunctionId) -> Result<(), NotTranslated> {
     let def = DefWithBodyId::FunctionId(func);
     let display = body::function_path(db, func).join("::");
     let refuse = |what: &str| NotTranslated {
@@ -142,7 +154,31 @@ fn lowered(db: &Db, func: FunctionId) -> Result<body::Lowered, NotTranslated> {
     {
         return Err(refuse("a function the borrow checker did not accept"));
     }
-    body::from_mir(db, func)
+    Ok(())
+}
+
+/// `func`'s built MIR, embedded: a Lean module holding the `Blaze.Mir.Program` of the function
+/// (index 0) and the functions it calls, which `lean/Blaze/Mir` gives a meaning. The semantics'
+/// side of every check that a model, a pass or the evaluator agrees with what blaze compiles.
+pub fn embed_mir(db: &Db, func: FunctionId) -> Result<EmbeddedMir, NotTranslated> {
+    blaze_query::db::attach(db, || {
+        accepted(db, func)?;
+        let term = body::embed::program(db, func, None)?;
+        Ok(body::embed::module(db, func, term))
+    })
+}
+
+/// As [`embed_mir`], with `mir` as `func`'s own body: the body before or after a pass, for
+/// the check that the pass did what its Lean specification does. The term alone.
+pub fn embed_mir_body<'db>(
+    db: &'db Db,
+    func: FunctionId,
+    mir: &hir_ty::mir::MirBody<'db>,
+) -> Result<String, NotTranslated> {
+    blaze_query::db::attach(db, || {
+        accepted(db, func)?;
+        body::embed::program(db, func, Some(mir))
+    })
 }
 
 /// `func`'s Lean module, and those of the functions it calls: pipeline steps 1 to 3.
