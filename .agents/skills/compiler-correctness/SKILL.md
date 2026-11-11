@@ -143,8 +143,14 @@ the solver refuses), say so, and build the missing piece: finish the nightly fea
 front end where one exists (generic const expressions, specialization as blaze already has it), or
 add the smallest general primitive where none does (`library-over-language`), as an opt-in extension
 that changes no program that does not use it (`superset-of-rust`). Then use it in blaze's own code
-(`blaze-uses-its-extensions`). A workaround written because "stable const generics can't do that" is
-a subpar design to fix (`guard-the-cause`): the spec names the feature it needs and its ledger row.
+(`blaze-uses-its-extensions`). The same holds when nothing is blocked but the code pays for the gap:
+an abstraction that costs at run time (a `dyn` call, a clone, a heap box, a runtime check, a lock)
+only because the language cannot state it statically, boilerplate repeated because the language
+cannot abstract it, or an invariant kept by convention because no type can hold it. blaze's own
+crates are where the language is tried (dogfooding): whoever writes blaze code and finds such a
+place proposes the feature that would make it zero-cost or direct, unasked, as a short spec with its
+ledger row, and builds it. A workaround written because "stable const generics can't do that" is a
+subpar design to fix (`guard-the-cause`): the spec names the feature it needs and its ledger row.
 
 See [docs/v2/plan/design/edition.md](../../../docs/v2/plan/design/edition.md).
 

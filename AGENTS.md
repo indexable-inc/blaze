@@ -144,10 +144,10 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 54. **guard-the-cause**: When you find bad code or a bad decision, find why it was made and remove that
     cause with a guard (a lint, a check in the gate, a rule or a skill's instruction), so it cannot
     be written again; do this unasked. Skill: `changing-code`.
-55. **own-the-language**: blaze owns its compiler: never design around what stable Rust lacks; when the
-    right design needs a feature Rust has not stabilized or does not have (const generic
-    expressions, for one), build it properly in blaze as an opt-in extension. Skill:
-    `compiler-correctness`.
+55. **own-the-language**: blaze owns its compiler and is its own first user: never design around what
+    Rust lacks; when code would be clearer, safer or zero-cost with a language feature Rust has not
+    stabilized or does not have (const generic expressions, for one), build it properly in blaze as
+    an opt-in extension and use it. Skill: `compiler-correctness`.
 56. **reflection-first**: Derive a property of a type or a function with blaze's compile-time
     reflection, not an auto trait, a proc macro or a special case in the compiler, wherever
     reflection is the more powerful; where reflection cannot yet say something that is possible,
