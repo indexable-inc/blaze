@@ -76,6 +76,8 @@ pub const STARTED_WITH: &[&str] = &[
     "BLAZE_LEAN_PROVER",
     // blaze-alloc-count's tracing (`OnceLock`).
     "BLAZE_ALLOC_TRACE",
+    // The parts of a good image the start leaves unused (`serve::engine`, read once).
+    super::daemon::RESTORE_WITHOUT,
 ];
 
 /// The value of `name` in an environment, as text: `None` unset, a value that is not UTF-8

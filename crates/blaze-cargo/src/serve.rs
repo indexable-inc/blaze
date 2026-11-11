@@ -1206,6 +1206,11 @@ pub(crate) fn engine(
         #[cfg(unix)]
         activated: serving.activated,
         profiling: Some(profiling),
+        without: match std::env::var(daemon::RESTORE_WITHOUT) {
+            Ok(text) => daemon::Without::parse(&text).map_err(anyhow::Error::msg)?,
+            Err(std::env::VarError::NotPresent) => daemon::Without::default(),
+            Err(error) => anyhow::bail!("the daemon's ${}: {error}", daemon::RESTORE_WITHOUT),
+        },
     };
     // A sampler that can't be made is no other path: every dump and history says it is off.
     if let Err(why) = blaze_profile::sampler::start(blaze_profile::sampler::HZ) {

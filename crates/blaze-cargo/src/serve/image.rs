@@ -52,6 +52,9 @@ pub enum Unlearned {
     Refused(Refused),
     /// The section holds another version of [`History::encode`]'s bytes.
     Version,
+    /// The start was asked to leave the history unused
+    /// ([`super::daemon::RESTORE_WITHOUT`]).
+    Asked,
 }
 
 impl fmt::Display for Unlearned {
@@ -61,6 +64,12 @@ impl fmt::Display for Unlearned {
             Unlearned::Version => {
                 write!(f, "the image's {} is of another blaze", SectionId::PLANE_HISTORY)
             }
+            Unlearned::Asked => write!(
+                f,
+                "the start was asked to leave the image's {} unused ({} names `history`)",
+                SectionId::PLANE_HISTORY,
+                super::daemon::RESTORE_WITHOUT
+            ),
         }
     }
 }

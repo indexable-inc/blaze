@@ -508,6 +508,49 @@ pub struct Options {
     /// A daemon with none (the simulation's) numbers its builds from 1 and refuses the
     /// explorer and live SQL, saying so.
     pub profiling: Option<Profiling>,
+    /// The parts of a good image this start leaves unused because it was asked to
+    /// ([`RESTORE_WITHOUT`]): each is said in the start's log as every other part not used.
+    pub without: Without,
+}
+
+/// The variable that names parts of the daemon's image a start leaves unused though they
+/// are whole: `database`, `history`, `trees`, separated by commas. For finding which part of
+/// a restored state a fault follows (docs/v2/plan/design/restore.md, "Which part a fault
+/// follows"): the image stays on disk as it is, and each part left is said in the start's log.
+pub const RESTORE_WITHOUT: &str = "BLAZE_RESTORE_WITHOUT";
+
+/// The parts of a good image a start was asked to leave unused ([`RESTORE_WITHOUT`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Without {
+    /// The query database's sections: it starts empty ([`Cold::Asked`]).
+    pub database: bool,
+    /// The plane's history: it starts empty ([`Unlearned::Asked`]).
+    pub history: bool,
+    /// The library syntax trees: every library file is parsed.
+    pub trees: bool,
+}
+
+impl Without {
+    /// The parts `text` names, separated by commas; a word that names none is the error,
+    /// saying the word and the ones there are.
+    pub fn parse(text: &str) -> Result<Without, String> {
+        let mut without = Without::default();
+        for word in text.split(',').map(str::trim).filter(|it| !it.is_empty()) {
+            match word {
+                "database" => without.database = true,
+                "history" => without.history = true,
+                "trees" => without.trees = true,
+                // alloc: an error's text, once a start
+                _ => {
+                    return Err(format!(
+                        "{RESTORE_WITHOUT} names `{word}`, which is no part of the daemon image \
+                         a start can leave unused: the parts are `database`, `history` and `trees`"
+                    ));
+                }
+            }
+        }
+        Ok(without)
+    }
 }
 
 fn under(dir: &FileName, name: &str) -> FileName {
@@ -1043,6 +1086,8 @@ pub enum Cold {
     /// restored: a second daemon in one process, as the simulation's restarts are. `blaze
     /// serve` starts one daemon a process and stops on it.
     Interned,
+    /// The start was asked to leave the database's sections unused ([`RESTORE_WITHOUT`]).
+    Asked,
 }
 
 impl fmt::Display for Cold {
@@ -1056,6 +1101,11 @@ impl fmt::Display for Cold {
             Cold::Interned => write!(
                 f,
                 "values were interned in this process before its symbols could be restored"
+            ),
+            Cold::Asked => write!(
+                f,
+                "the start was asked to leave the image's database unused \
+                 ({RESTORE_WITHOUT} names `database`)"
             ),
         }
     }
@@ -1486,6 +1536,10 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                     Some(unrestored(error).map_err(|fault| StartError::image(&image, fault))?);
                 Database::new(config)
             }
+            Some((_, Ok(()))) if options.without.database => {
+                started.cold = Some(Cold::Asked);
+                Database::new(config)
+            }
             Some((opened, Ok(()))) => {
                 let restored = Restored {
                     hash: opened.hash(),
@@ -1521,6 +1575,10 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 .entered();
         let history = match opened.as_deref() {
             None => History::new(HistoryConfig::default()),
+            Some(_) if options.without.history => {
+                started.unlearned = Some(Unlearned::Asked);
+                History::new(HistoryConfig::default())
+            }
             Some(opened) => {
                 let (history, unlearned) = super::image::history(opened, HistoryConfig::default())
                     .map_err(|error| StartError::image(&image, ImageFault::History(error)))?;
@@ -1530,7 +1588,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         };
         drop(learning);
         // Before any front end's database is made: each reads the trees installed when made.
-        if let Some(opened) = &opened {
+        if opened.is_some() && options.without.trees {
+            // alloc: a start's report, once
+            started.trees = Some(format!(
+                "the start was asked to leave them unused: {RESTORE_WITHOUT} names `trees`"
+            ));
+        } else if let Some(opened) = &opened {
             let _span =
                 tracing::info_span!(target: "blaze", "daemon start: install the library's trees")
                     .entered();
