@@ -658,6 +658,15 @@ programs; it is the specification of the Rust pass of the same name.
   - **Not written: merging a target that ends in a call.** The caller's frame keeps a stale
     `block` under the callee; the map is `block` renamed on the frames under the running
     one, another `MemMap`.
+  - **`SimplifyCfg` composed** (`Opt/SimplifyCfg.lean`, `simplifyCfg k`; not yet
+    elaborated): `nop`s removed, `k` rounds of threading every target, the `switchInt` rule,
+    dead blocks, merging, then dead blocks, in the order of the Rust loop. Proved of it
+    (`simplifyCfg_call`): a call that ends, and not in undefined behaviour, gives the same
+    outcome with the same fuel, which is what an equality, a refinement and two stuttering
+    simulations have in common. It is not yet the Rust pass block for block (that changes
+    blocks in place with predecessor counts kept as it goes, merges a target that ends in a
+    call, rewrites a `switchInt` on a `move`, merges empty `unreachable` blocks), so
+    `after = spec before` is to be tried per body, and no pair is in `BlazeValidated` yet.
   - **Dead-store elimination: first piece** (`Opt/Ptr.lean`; not yet elaborated).
     `MemOk P st` says every pointer in every slot of the state satisfies `P`; a read gives a
     value whose pointers do (`State.read_ok`) and a write of such a value keeps it

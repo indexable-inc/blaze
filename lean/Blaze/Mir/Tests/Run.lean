@@ -509,4 +509,16 @@ example : isDiverge (callThenHop.call 3 0 [] []) = true := by decide
 /-- The threaded program is done in three steps where the program takes four. -/
 example : isInt ScalarTy.U32 7 ((Opt.threadAll callThenHop).call 3 0 [] []) = true := by decide
 
+/-! `SimplifyCfg` composed: one round leaves `constantSimplified` one block, the three
+statements and the return, and its call is done in one step. -/
+
+example :
+    (Opt.simplifyCfg 1 constantSimplified).fns.map
+        (fun body => body.blocks.map (fun blk => (blk.stmts.length, blk.terminator))) =
+      [[(3, Terminator.ret)]] := by
+  decide
+
+example : isInt ScalarTy.U32 4 ((Opt.simplifyCfg 1 constantSimplified).call 1 0 [] []) = true := by
+  decide
+
 end Blaze.Mir.Tests

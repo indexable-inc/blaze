@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-61 theorems: 48 in `lean`, 13 in `lean/analysis`.
+62 theorems: 49 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -475,6 +475,15 @@ theorem State.read_ok {P : Pointer → Prop} {st : State} (hm : MemOk P st) (p :
 theorem State.write_ok {P : Pointer → Prop} {st : State} (hm : MemOk P st) (p : Pointer)
     (v : Value) (hv : Value.Ok P v) (st' : State) (h : st.write p v = Outcome.ok st') :
     MemOk P st'
+```
+
+**`Blaze.Mir.Opt.simplifyCfg_call`** (`Blaze.Mir.Opt.SimplifyCfg`, `lean`): SimplifyCfg composed from the proved passes keeps every call that ends, and not in undefined behaviour: the same outcome with the same fuel.
+
+```lean
+theorem simplifyCfg_call (k : Nat) (prog : Program) (n : Nat) (id : FnId) (base : List Slot)
+    (args : List Value) (r : Outcome Value) (h : prog.call n id base args = r)
+    (hd : r ≠ Outcome.diverge) (hu : ∀ (why : Undefined), r ≠ Outcome.undefined why) :
+    (simplifyCfg k prog).call n id base args = r
 ```
 
 ## V10
