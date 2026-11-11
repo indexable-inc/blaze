@@ -198,6 +198,8 @@ pub const RUNTIME: &[&str] = &[
     "/nix/store",
     "/etc/ld.so.cache",
     "/etc/ld.so.preload",
+    // NixOS's glibc reads its preload list under this name.
+    "/etc/ld-nix.so.preload",
     "/etc/ld.so.conf",
     "/etc/ld.so.conf.d",
     "/proc/self",
