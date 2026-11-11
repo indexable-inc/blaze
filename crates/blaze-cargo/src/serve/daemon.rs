@@ -2226,6 +2226,11 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         for row in self.jobs.rows.drain(..) {
             self.observe.ended(row);
         }
+        // The errors builds said, before their answers are told below: a build's own flush,
+        // as it is answered, writes them.
+        if !self.jobs.errors.is_empty() {
+            self.observe.errored(std::mem::take(&mut self.jobs.errors));
+        }
         // After the rows of the same turn (a stalled build's row and its answer are one turn's),
         // and after this turn's answers went to the driver (`turn_after_wait` submits before
         // it calls this): a build's profile is flushed behind its answer, never beside it.

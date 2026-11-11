@@ -71,6 +71,12 @@ thread_local! {
     /// The planted bug: an output is placed at once whatever is in flight at its path
     /// ([`Jobs::place_output`]), as before outputs outlived their job's answer.
     pub(super) static PLANT_NO_QUEUE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Each `errors` row a job's words gave ([`Jobs::note_errors`]): its build, its kind and
+    /// its message. What a test reads of a table only the history's thread writes.
+    pub(super) static ERROR_ROWS: std::cell::RefCell<Vec<(u64, String, String)>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: none, a test's record
+    /// The planted bug: no job's errors are noted for the history ([`Jobs::note_errors`]),
+    /// as before 2026-11-11.
+    pub(super) static PLANT_NO_ERROR_ROWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The planted bug: a job's answer waits for no placement, named or not
     /// ([`Jobs::wind_up`]).
     pub(super) static PLANT_ANSWER_WAITS_FOR_NO_OUTPUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -3091,6 +3097,15 @@ struct Queued {
     _waits: tracing::Span,
 }
 
+/// A job's build in the history and the `errors` rows it has so far ([`Jobs::erring`]).
+struct Erring {
+    build: u64,
+    command: String,
+    rows: u32,
+    /// The job's cancel flag: a cancelled build that says no error did not fail.
+    cancelled: Arc<AtomicBool>,
+}
+
 /// A placement the store was asked for.
 struct Placing {
     job: JobId,
@@ -3220,6 +3235,14 @@ pub struct Jobs<S: Steps> {
     /// The run logs of builds whose front end was kept, as the history's rows, named by the
     /// task that stored it ([`Steps::kept_run_log`]): for the daemon to hand to its history.
     pub ran: Vec<ProvenanceRow>,
+    /// Each error a build said, as the history's `errors` rows ([`Jobs::note_errors`]): for
+    /// the daemon to hand to its history, before the build's answer is told to it, so the
+    /// answer's flush writes them.
+    pub errors: Vec<blaze_profile::errors::ErrorRow>,
+    /// Each job with a plane request, from its opening until its `Finish` is heard: the
+    /// build it is in the history and how many `errors` rows it has, so a build that ends
+    /// not ok with none is given one ([`Jobs::note_errors`]).
+    erring: HashMap<JobId, Erring, Global>,
     roots: Roots<S>,
     /// Views of plans replaced in `roots`, closed once no job reads them.
     retired: Vec<ViewId>,
@@ -3358,6 +3381,8 @@ impl<S: Steps> Jobs<S> {
             settling: Vec::new(), // alloc: none until a job leaves something to settle
             lost: Vec::new(),     // alloc: none until settling loses something
             ran: Vec::new(),      // alloc: none until a kept front end's run log is named
+            errors: Vec::new(),   // alloc: none until a build says an error
+            erring: HashMap::new_in(Global),
             roots: Roots::new(),
             retired: Vec::new(), // alloc: none until a plan is replaced
             out: Vec::new(),     // alloc: none until user code says something, then reused
@@ -3696,6 +3721,15 @@ impl<S: Steps> Jobs<S> {
             job.request = Some(request);
             job.opening();
             self.started.push(job.row(request, None, profile_history::Outcome::Running));
+            self.erring.insert(
+                id,
+                Erring {
+                    build: u64::from(request.0),
+                    command: command_line(&job.work),
+                    rows: 0,
+                    cancelled: Arc::clone(&job.cancelled), // clone: a refcount, once a job
+                },
+            );
         }
         self.prepare(w, id);
     }
@@ -4082,6 +4116,24 @@ impl<S: Steps> Jobs<S> {
     /// order, and at its `Finish` the recording kept or dropped ([`Jobs::keep_answer`]). The
     /// daemon calls it for every `Said` as it is told, so nothing a job said is missed.
     pub fn heard(&mut self, said: &Said) {
+        #[cfg(test)]
+        let before = self.errors.len();
+        #[cfg(test)]
+        let planted = PLANT_NO_ERROR_ROWS.get();
+        #[cfg(not(test))]
+        let planted = false;
+        if !planted {
+            self.note_errors(said);
+        }
+        #[cfg(test)]
+        ERROR_ROWS.with_borrow_mut(|it| {
+            // clone: a test's record of each row
+            it.extend(
+                self.errors[before..]
+                    .iter()
+                    .map(|row| (row.build_id, row.kind.clone(), row.message.clone())),
+            )
+        });
         if self.recordings.is_empty() {
             return;
         }
@@ -4099,6 +4151,90 @@ impl<S: Steps> Jobs<S> {
                 self.keep_answer(recorded, *ok && error.is_none());
                 blaze_vfs::outside::name_looks(!self.recordings.is_empty());
             }
+        }
+    }
+
+    /// The history's `errors` rows of what a job says ([`Jobs::errors`]): one for each error
+    /// diagnostic (or a row a function, for an error naming the functions blaze could not
+    /// compile), and one for the error its `Finish` carries. Every word of a job passes
+    /// [`Jobs::heard`] once, so no error a build said is missed, whichever step said it.
+    ///
+    /// A build that ends not ok having said no error is given a row saying so, naming the
+    /// build and its command: `builds.outcome = 'failed'` with nothing in `errors` (the cold
+    /// build of ripgrep, 2026-11-11, when nothing in the daemon wrote the table at all) is
+    /// a failure with no cause to read, and that is itself the thing to fix (rule 19). Not
+    /// for a cancelled build: it did not fail.
+    fn note_errors(&mut self, said: &Said) {
+        use blaze_profile::errors;
+        let now = Some(blaze_profile::clock::mono_ns());
+        match said {
+            Said::Report(id, Response::Diagnostic(diagnostic))
+                if diagnostic.level == Level::Error =>
+            {
+                let Some(erring) = self.erring.get_mut(id) else { return };
+                let before = self.errors.len();
+                let place = diagnostic.spans.iter().find(|it| it.primary).or(diagnostic.spans.first());
+                let detail = diagnostic
+                    .children
+                    .iter()
+                    .find(|it| matches!(it.level, Level::Help | Level::Note))
+                    .map(|it| it.message.as_str());
+                // alloc: an error's unit as cargo names it, once an error said
+                let unit = diagnostic.unit.as_ref().map(|unit| {
+                    let kinds: Vec<&str> = unit.target.kinds().collect(); // alloc: as above
+                    let test = if unit.test { " test" } else { "" };
+                    format!("{} ({}{test})", unit.target.name, kinds.join(","))
+                });
+                errors::rows(
+                    errors::Said {
+                        code: diagnostic.code.as_deref(),
+                        message: &diagnostic.message,
+                        detail,
+                        file: place.map(|it| it.file.as_str()),
+                        line: place.map(|it| it.line),
+                    },
+                    errors::Of {
+                        build_id: erring.build,
+                        t_ns: now,
+                        krate: diagnostic.unit.as_ref().map(|it| it.target.name.as_str()),
+                        unit: unit.as_deref(),
+                    },
+                    &mut self.errors,
+                );
+                erring.rows += u32::try_from(self.errors.len() - before).unwrap_or(u32::MAX);
+            }
+            Said::Finish(id, ok, error, _) => {
+                let Some(erring) = self.erring.remove(id) else { return };
+                let of =
+                    errors::Of { build_id: erring.build, t_ns: now, krate: None, unit: None };
+                if let Some(error) = error {
+                    errors::rows(
+                        errors::Said {
+                            code: None,
+                            message: &error.what,
+                            detail: None,
+                            file: error.at.as_deref(),
+                            line: None,
+                        },
+                        of,
+                        &mut self.errors,
+                    );
+                } else if !*ok && erring.rows == 0 && !erring.cancelled.load(Ordering::Acquire) {
+                    // alloc: a failure with no error said, once
+                    let what = format!(
+                        "build {} (`{}`) failed and said no error: what failed is in none of its \
+                         diagnostics and not in its answer (a bug in blaze: every failure names what failed)",
+                        erring.build, erring.command
+                    );
+                    tracing::error!(target: "blaze", build = erring.build, "{what}");
+                    errors::rows(
+                        errors::Said { code: None, message: &what, detail: None, file: None, line: None },
+                        of,
+                        &mut self.errors,
+                    );
+                }
+            }
+            Said::Report(..) => {}
         }
     }
 

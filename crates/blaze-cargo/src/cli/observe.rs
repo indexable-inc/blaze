@@ -858,7 +858,72 @@ fn explained(words: Vec<OsString>) -> Result<(), Refusal> {
         args.insert(key.to_owned(), argument(view, key, value)?);
     }
     let sql = views::render(view, &args).map_err(|error| error.to_string())?;
-    print(&run(&sql)?, shape)
+    let batches = run(&sql)?;
+    // `problems` with no row says which builds it read and that nothing was said wrong in
+    // them, or that the build asked for is not there: an empty table reads the same for a
+    // clean build, a build of another history and a history with no build (no-fallback).
+    if name == "problems" && batches.iter().all(|it| it.num_rows() == 0) {
+        return no_problems(&args, shape);
+    }
+    print(&batches, shape)
+}
+
+/// The last build of the history.
+const LAST_BUILD: &str = "SELECT max(build_id) AS build FROM builds";
+
+/// The last build that has rows `blaze explain memory` reads: a counter tagged with it, a
+/// task's peak, or an allocation sample.
+const LAST_MEMORY_BUILD: &str = "SELECT max(build_id) AS build FROM (\
+    SELECT build_id FROM counters WHERE build_id IS NOT NULL \
+    UNION ALL SELECT build_id FROM spans WHERE name = 'task' AND peak_bytes IS NOT NULL \
+    UNION ALL SELECT build_id FROM alloc_samples WHERE build_id IS NOT NULL)";
+
+/// The one number `sql` gives: its first row's first column; none for no row, or a null.
+fn number(sql: &str) -> Result<Option<u64>, Refusal> {
+    let rows = json(&run(sql)?)?;
+    let Some(line) = rows.lines().next() else { return Ok(None) };
+    let row: Value = serde_json::from_str(line)
+        .map_err(|error| format!("a row of `{sql}` as JSON: {error}"))?;
+    Ok(row.as_object().and_then(|it| it.values().next()).and_then(Value::as_u64))
+}
+
+/// What `blaze explain problems` says when its view has no row: which builds it read, or
+/// that the one asked for is not in this history. With `--json` a clean build prints no row
+/// (the data is that there is none); a build that is not there is still an error.
+fn no_problems(args: &Map<String, Value>, shape: Shape) -> Result<(), Refusal> {
+    let Some(last) = number(LAST_BUILD)? else {
+        return Err(Refusal::Failed(
+            "`blaze explain problems`: this history has no build, so there is nothing to read: run a \
+             build under this daemon first (`blaze status` names its state directory)"
+                .to_owned(),
+        ));
+    };
+    let said = match args.get("build").and_then(Value::as_u64) {
+        Some(build) => {
+            let there = number(&format!("SELECT count(*) AS n FROM builds WHERE build_id = {build}"))?;
+            if there.unwrap_or(0) == 0 {
+                return Err(Refusal::Failed(format!(
+                    "`blaze explain problems`: there is no build {build} in this history (its last build is {last})"
+                )));
+            }
+            format!(
+                "build {build}: blaze said nothing was wrong in it (no WARN or ERROR event, panic, fatal signal \
+                 or blaze bug, and it did not fail, stall or crash)\n"
+            )
+        }
+        None => {
+            let builds = args.get("builds").and_then(Value::as_u64).unwrap_or(5).max(1);
+            let first = last.saturating_sub(builds - 1).max(1);
+            format!(
+                "builds {first} to {last}: blaze said nothing was wrong in them (no WARN or ERROR event, panic, \
+                 fatal signal or blaze bug, and none failed, stalled or crashed); `build=N` reads one build\n"
+            )
+        }
+    };
+    match shape {
+        Shape::Table => stdout(&said),
+        Shape::Json => Ok(()),
+    }
 }
 
 /// `blaze explain memory [BUILD] [limit=N] [--json]`: who owned a build's memory, from its
@@ -888,13 +953,41 @@ fn memory(words: impl Iterator<Item = String>) -> Result<(), Refusal> {
             _ => return Err(Refusal::Usage(format!("{MEMORY_USAGE}, not `{word}`"))),
         }
     }
+    // With no build named: the last build that has memory rows, said when it is not the
+    // last build (a no-op, or a build of a daemon that had just started, records none, and
+    // four empty tables read as "no memory was used"). A history with none is an error.
     let mut out = String::new();
+    let build = match build {
+        Some(build) => build,
+        None => match (number(LAST_MEMORY_BUILD)?, number(LAST_BUILD)?) {
+            (Some(with), Some(last)) if with != last => {
+                let note = format!(
+                    "build {with}: the last build with memory rows (the last build, {last}, has none: it \
+                     recorded no counter, task peak or allocation sample; `blaze explain memory {last}` \
+                     says so)"
+                );
+                match json {
+                    true => eprintln!("note: {note}"),
+                    false => _ = writeln!(out, "{note}\n"),
+                }
+                with
+            }
+            (Some(with), _) => with,
+            (None, last) => {
+                let last =
+                    last.map_or_else(|| "it has no build".to_owned(), |it| format!("its last build is {it}"));
+                return Err(Refusal::Failed(format!(
+                    "`blaze explain memory`: no build of this history has memory rows (a counter, a task's \
+                     peak or an allocation sample); {last}"
+                )));
+            }
+        },
+    };
+    let mut rows = 0;
     for (part, name, heading) in MEMORY_PARTS {
         let view = views::find(name).map_err(|error| error.to_string())?;
         let mut args = Map::new();
-        if let Some(build) = build {
-            args.insert("build".to_owned(), Value::from(build));
-        }
+        args.insert("build".to_owned(), Value::from(build));
         if let Some(limit) = limit
             && view.args.iter().any(|it| it.name == "limit")
         {
@@ -902,6 +995,7 @@ fn memory(words: impl Iterator<Item = String>) -> Result<(), Refusal> {
         }
         let sql = views::render(view, &args).map_err(|error| error.to_string())?;
         let batches = run(&sql)?;
+        rows += batches.iter().map(RecordBatch::num_rows).sum::<usize>();
         if json {
             let rows = self::json(&batches)?;
             for line in rows.lines() {
@@ -915,6 +1009,13 @@ fn memory(words: impl Iterator<Item = String>) -> Result<(), Refusal> {
             out.push_str(&table(&batches)?);
             out.push('\n');
         }
+    }
+    // A build named that has none: said, never four empty tables.
+    if rows == 0 {
+        return Err(Refusal::Failed(format!(
+            "`blaze explain memory`: build {build} has no memory rows (no counter, task peak or allocation \
+             sample was recorded for it); with no build named it reads the last build that has some"
+        )));
     }
     stdout(&out)
 }

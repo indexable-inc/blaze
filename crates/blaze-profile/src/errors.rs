@@ -1,6 +1,7 @@
 //! Errors as rows: each error a build said, one row of the `errors` table (schema.rs), so
 //! "derive panics per build" is a query. The daemon gives each error diagnostic it says to
-//! [`rows`]; a build's log, as the client printed it, is read the same way by [`from_log`],
+//! [`rows`] (blaze-cargo's `Jobs::note_errors`, which also gives the error a build's answer
+//! carries, and a row of its own to a build that failed and said none); a build's log, as the client printed it, is read the same way by [`from_log`],
 //! for builds the history has no rows of.
 //!
 //! An error's `kind` is a stable code: rustc's own (`E0277`) or a deny lint's name when the

@@ -2365,6 +2365,55 @@ fn what_a_build_left_for_the_store_is_durable_once_it_settles_and_survives_a_cra
     }
 }
 
+/// The `errors` rows a build of `/w` whose build script's compile errs gave, and how it ended.
+fn failed_build_rows(seed: u64) -> (Option<Response>, Vec<(u64, String, String)>) {
+    use super::job::ERROR_ROWS;
+    ERROR_ROWS.with_borrow_mut(Vec::clear);
+    ERRS_COMPILE.set(Some(1));
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    let id = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let got = client.wait(&mut daemon, id);
+    ERRS_COMPILE.set(None);
+    settle(&mut daemon, &mut client);
+    (got.last().cloned(), ERROR_ROWS.with_borrow_mut(std::mem::take))
+}
+
+/// The invariant: a build that ends not ok and was not cancelled has a row in the history's
+/// `errors` table saying what failed: here the error of the unit whose compile erred, as
+/// the build said it. `builds.outcome = 'failed'` beside an empty `errors` is a failure
+/// with no cause to read (the cold build of ripgrep, 2026-11-11).
+#[test]
+fn a_build_that_fails_has_its_error_among_the_historys_error_rows() {
+    for seed in 190..194 {
+        let (done, rows) = failed_build_rows(seed);
+        assert_eq!(done, Some(Response::Done { ok: false }), "seed {seed}");
+        assert!(!rows.is_empty(), "seed {seed}: the build failed and gave the history no error");
+        assert!(
+            rows.iter().all(|(_, kind, message)| !kind.is_empty() && !message.is_empty()),
+            "seed {seed}: a row with no kind or no message: {rows:#?}"
+        );
+        let build = rows[0].0;
+        assert!(rows.iter().all(|it| it.0 == build), "seed {seed}: rows of two builds: {rows:#?}");
+    }
+}
+
+/// The planted-bug control: a daemon that notes no job's errors, as it was, gives a failed
+/// build no row.
+#[test]
+fn the_oracle_catches_a_failed_build_with_no_error_row() {
+    use super::job::PLANT_NO_ERROR_ROWS;
+    PLANT_NO_ERROR_ROWS.set(true);
+    let (done, rows) = failed_build_rows(190);
+    PLANT_NO_ERROR_ROWS.set(false);
+    assert_eq!(done, Some(Response::Done { ok: false }));
+    assert!(rows.is_empty(), "the plant notes nothing, and the oracle's check would fail: {rows:#?}");
+}
+
 fn second_checkout(sim: &mut Sim) {
     sim.change(&name("v/Cargo.toml"), b"[package]\nname = \"app\"\n");
     sim.change(&name("v/src/main.rs"), b"fn main() {}\n");
