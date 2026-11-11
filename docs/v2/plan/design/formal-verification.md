@@ -701,14 +701,16 @@ programs; it is the specification of the Rust pass of the same name.
     borrow, a statement that mentions the local neither as a place's base nor as an index
     does the same whatever the slot holds (`execStmt_put`), through every function of
     `Step.lean` up to `execStmt`.
-  - **`removeOverwritten`** (`Opt/RemoveOverwritten.lean`; not yet elaborated): the end
+  - **`removeOverwritten`** (`Opt/RemoveOverwritten.lean`; checked at cc0f8f3ee7, `removeOverwritten_call` after it): the end
     theorem of the pieces above. In a block, `l = rv1; ..; l = rv2` becomes
     `nop; ..; l = rv2` when `l` is a whole local its function never borrows, `rv1` is a copy
     of a place with no index or a constant, and nothing between mentions `l`. A step runs a
     whole block, so the two programs' states are equal at every step:
     `removeOverwritten_refines` is `run_refines_inv` (a refinement of runs under an invariant
     the source's steps keep) with the block lemma, from every state the borrow invariant
-    holds of, for a program `checkBorrows` accepts (evaluated by the kernel, proved sound).
+    holds of, for a program `checkBorrows` accepts (evaluated by the kernel, proved sound);
+    `removeOverwritten_call` is the same for every call whose base slots and arguments have
+    pointers into frame 0 only, where the start state holds the invariant.
   - **What the Rust `DeadStoreElimination` does beyond it, none specified** (ledger V11):
     liveness over the whole control-flow graph, unwinding included; every rvalue but a
     pointer-to-address cast removable, where here only one that cannot panic or move is;

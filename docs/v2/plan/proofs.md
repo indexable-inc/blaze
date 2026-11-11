@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-72 theorems: 59 in `lean`, 13 in `lean/analysis`.
+73 theorems: 60 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -575,6 +575,18 @@ theorem removeOverwritten_refines (borrowed : Body → Local → Bool) (prog : P
     (hfine : ProgFine (BorrowedIn borrowed prog) prog) (fuel : Nat) (st : State)
     (hinv : ∃ g, Borrows (BorrowedIn borrowed prog) g st) :
     (run (removeOverwritten borrowed prog) fuel st).Refines (run prog fuel st)
+```
+
+**`Blaze.Mir.Opt.removeOverwritten_call`** (`Blaze.Mir.Opt.RemoveOverwritten`, `lean`): Removing a store its own block overwrites refines every call whose base slots and arguments have pointers into frame 0 only.
+
+```lean
+theorem removeOverwritten_call (borrowed : Body → Local → Bool) (prog : Program)
+    (hfine : ProgFine (BorrowedIn borrowed prog) prog) (fuel : Nat) (id : FnId)
+    (base : List Slot) (args : List Value)
+    (hbase : SlotsOk (PtrOk (BorrowedIn borrowed prog) []) base)
+    (hargs : ∀ (v : Value), v ∈ args → Value.Ok (PtrOk (BorrowedIn borrowed prog) []) v) :
+    ((removeOverwritten borrowed prog).call fuel id base args).Refines
+      (prog.call fuel id base args)
 ```
 
 **`Blaze.Mir.Opt.simplifyCfg_call`** (`Blaze.Mir.Opt.SimplifyCfg`, `lean`): SimplifyCfg composed from the proved passes keeps every call that ends, and not in undefined behaviour: the same outcome with the same fuel.

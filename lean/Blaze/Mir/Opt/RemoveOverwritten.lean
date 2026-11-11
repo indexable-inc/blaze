@@ -443,6 +443,56 @@ theorem removeOverwritten_refines (borrowed : Body → Local → Bool) (prog : P
       exact step_borrows hfine s hb (Next.state s') hstep)
     fuel st hinv
 
+/-! Calls. A call's start state holds the borrow invariant when what the caller hands over
+has pointers into frame 0 only. -/
+
+theorem start_removeOverwritten (borrowed : Body → Local → Bool) (prog : Program) (id : FnId)
+    (base : List Slot) (args : List Value) :
+    (removeOverwritten borrowed prog).start id base args = prog.start id base args := by
+  unfold Program.start
+  rw [sig_removeOverwritten]
+
+theorem start_borrows (B : FnId → Local → Prop) (prog : Program) (id : FnId) (base : List Slot)
+    (args : List Value) (hbase : SlotsOk (PtrOk B []) base)
+    (hargs : ∀ (v : Value), v ∈ args → Value.Ok (PtrOk B []) v) :
+    Outcome.All (fun (st : State) => ∃ g, Borrows B g st) (prog.start id base args) := by
+  have h0 : Borrows B [] { base := base, stack := [], next := 1 } :=
+    And.intro
+      (And.intro (fun _ he => mem_nil_elim he)
+        (And.intro hbase (fun _ m => mem_nil_elim m)))
+      (And.intro (Nat.succ_pos 0) (fun _ he => mem_nil_elim he))
+  unfold Program.start
+  cases hs : prog.sig id with
+  | none => exact Outcome.all_undefined _ _
+  | some s =>
+    exact Outcome.all_bind
+      (State.enter_borrows h0 id s args { frame := 0, slot := 0, path := [] } none hargs)
+      (fun next hn => by
+        cases next with
+        | state st => exact Outcome.all_ok hn
+        | done v => exact Outcome.all_undefined _ _)
+
+/-- Removing a store overwritten in its own block refines every call whose base slots and
+arguments have pointers into frame 0 only: the same outcome, unless the program's is
+undefined. -/
+theorem removeOverwritten_call (borrowed : Body → Local → Bool) (prog : Program)
+    (hfine : ProgFine (BorrowedIn borrowed prog) prog) (fuel : Nat) (id : FnId)
+    (base : List Slot) (args : List Value)
+    (hbase : SlotsOk (PtrOk (BorrowedIn borrowed prog) []) base)
+    (hargs : ∀ (v : Value), v ∈ args → Value.Ok (PtrOk (BorrowedIn borrowed prog) []) v) :
+    ((removeOverwritten borrowed prog).call fuel id base args).Refines
+      (prog.call fuel id base args) := by
+  have es : (removeOverwritten borrowed prog).start id base args = prog.start id base args :=
+    start_removeOverwritten borrowed prog id base args
+  show Outcome.Refines
+    (((removeOverwritten borrowed prog).start id base args).bind
+      (run (removeOverwritten borrowed prog) fuel))
+    ((prog.start id base args).bind (run prog fuel))
+  rw [es]
+  exact Outcome.Refines.bind (fun st hst =>
+    removeOverwritten_refines borrowed prog hfine fuel st
+      (start_borrows (BorrowedIn borrowed prog) prog id base args hbase hargs st hst))
+
 /-! The condition on the program, as a check the kernel evaluates. -/
 
 theorem or_true_cases {a b : Bool} (h : (a || b) = true) : a = true ∨ b = true := by
