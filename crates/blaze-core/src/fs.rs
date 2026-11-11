@@ -12,6 +12,13 @@ mod private;
 
 pub(crate) use private::private;
 
+/// macOS's listing of a directory with its stamps, in one call per buffer of entries.
+#[cfg(target_os = "macos")]
+mod bulk;
+
+#[cfg(target_os = "macos")]
+pub(crate) use bulk::entries;
+
 /// The calls WASI makes its own way or has none of (the wasm32-wasip1 seed).
 #[cfg(target_os = "wasi")]
 mod wasi;
@@ -912,8 +919,9 @@ pub(crate) fn stamps(root: &Path, names: &Names) -> io::Result<Vec<Stamp>> {
 }
 
 /// What is directly in `dir` (named `name` under the root), each with its stamp, sorted by
-/// name; symbolic links are stamped themselves.
-#[cfg(unix)]
+/// name; symbolic links are stamped themselves. macOS lists with `getattrlistbulk`
+/// ([`bulk::entries`]).
+#[cfg(all(unix, not(target_os = "macos")))]
 pub(crate) fn entries(dir: &Path, name: &FileName) -> io::Result<Vec<(FileName, Stamp)>> {
     use std::os::fd::AsFd as _;
     let fd = open_dir(dir)?;
