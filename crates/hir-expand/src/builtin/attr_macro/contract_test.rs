@@ -295,7 +295,7 @@ fn generate(
         for expr in clause.exprs() {
             let (ph, text) = w.user(expr.syntax());
             let mut shown = String::new();
-            write_assert_condition(&mut shown, &text, edition);
+            write_assert_condition(&mut shown, &text, edition, span.anchor.file_id.extensions());
             list.push((ph, shown));
         }
     }

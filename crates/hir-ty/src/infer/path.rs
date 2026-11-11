@@ -85,6 +85,11 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 it.into()
             }
             ValueNs::LocalBinding(pat) => {
+                // blaze: a local narrowed by a match arm, `if let` or `let else`
+                // (`#![blaze::pattern_types]`, `infer::narrow`).
+                if let Some(ty) = self.narrowed_type(pat) {
+                    return Some(ValuePathResolution::NonGeneric(ty));
+                }
                 return match self.result.type_of_binding.get(pat) {
                     Some(ty) => Some(ValuePathResolution::NonGeneric(ty.as_ref())),
                     None => unreachable!("no type for local variable {pat:?}"),

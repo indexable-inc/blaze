@@ -101,7 +101,8 @@ pub(crate) enum Rule {
     /// environment; refused for any other.
     ConstEval,
     /// A step of the body itself (its inference; its MIR, or that of a closure or an async
-    /// coroutine written in it): that step's fact, for a later step of the same body. Refused
+    /// coroutine written in it): that step's fact, the body named as `values::OWN`, for a
+    /// later step of the same body. Refused
     /// for another body's, for an inline const's, for a coroutine kind whose MIR the step's
     /// value leaves out, and for the same or a later step.
     OwnStep(Step),
@@ -470,10 +471,10 @@ fn apply(
             if earlier >= step || !is_own_step(db, def, key) {
                 return Classified::Refused;
             }
-            values::step_fact(db, def, earlier)
+            values::step_fact(earlier)
         }
         Rule::OwnMatchCheck => match arg::<DefWithBodyId>(db, key) {
-            Some(body) if body == def => Some(values::match_check(db, def)),
+            Some(body) if body == def => Some(values::match_check()),
             _ => None,
         },
         Rule::ConstEval => match hir_ty::consteval::const_eval_query::arguments(db, key) {
@@ -494,7 +495,9 @@ fn apply(
         Some(fact) if fact.kind == values::kinds::ATTRS && is_own_attrs(db, def, fact.subject) => {
             Classified::Covered
         }
-        Some(fact) => Classified::Fact(fact),
+        // The body's own item as "self", as its identity writes it: two bodies of one
+        // identity that read the same of themselves list the same shape (`values::OWN`).
+        Some(fact) => Classified::Fact(values::relative(db, def, fact)),
     }
 }
 

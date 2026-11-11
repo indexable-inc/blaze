@@ -425,7 +425,7 @@ impl Heads {
                 }
                 Watched::Lost { .. } | Watched::Scanned => {}
                 Watched::Conflict { path } => {
-                    eprintln!(
+                    crate::serve::said::logged!(WARN,
                         "blaze serve: {head}/{path} changed on disk and by a commit since; the head keeps the commit's"
                     );
                 }

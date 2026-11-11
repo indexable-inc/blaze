@@ -421,6 +421,30 @@ mod unix {
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
+    /// A pipe, its read end first, both ends close-on-exec: on Linux at once (`pipe2`), on the
+    /// other Unixes, which have no `pipe2` everywhere, by `FD_CLOEXEC` straight after (a spawn
+    /// of another thread's in between could inherit them; blaze's spawns close what they are
+    /// not given).
+    pub(crate) fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+        let mut ends = [0; 2];
+        #[cfg(target_os = "linux")]
+        // SAFETY: room for the two descriptors the call writes.
+        checked(unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) })?;
+        #[cfg(not(target_os = "linux"))]
+        // SAFETY: room for the two descriptors the call writes.
+        checked(unsafe { libc::pipe(ends.as_mut_ptr()) })?;
+        // SAFETY: the call succeeded, so both are new descriptors nothing else owns; each is
+        // owned once, here.
+        let (read, write) =
+            unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+        #[cfg(not(target_os = "linux"))]
+        for fd in [&read, &write] {
+            // SAFETY: `fd` is open, owned above; `F_SETFD` takes an integer.
+            checked(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) })?;
+        }
+        Ok((read, write))
+    }
+
     /// The running kernel's `uname`.
     #[cfg(target_os = "linux")]
     pub(crate) fn uname() -> io::Result<libc::utsname> {

@@ -3030,7 +3030,7 @@ fn an_edits_image_is_handed_to_the_loop_as_its_ranges_and_whole_only_over_a_base
         &store.reader(),
         now,
         Some(patch(was, now)),
-        || -> Result<Vec<u8>, String> {
+        || -> Result<compile::Written, String> {
             panic!("the whole image is made although the store can derive it")
         },
     )
@@ -3071,13 +3071,90 @@ fn an_edits_image_is_handed_to_the_loop_as_its_ranges_and_whole_only_over_a_base
         &store.reader(),
         edited,
         Some(patch(cold, edited)),
-        || -> Result<Vec<u8>, String> {
+        || -> Result<compile::Written, String> {
             asked += 1;
-            Ok(vec![0; 8]) // alloc: a test's stand-in for the image.
+            Ok(compile::Written::Linked(vec![0; 8], edited)) // alloc: a test's stand-in for the image.
         },
     )
     .unwrap();
     assert!(matches!(written, compile::Written::Linked(_, root) if root == edited));
     assert_eq!(asked, 1);
     assert_eq!(sim.bytes_forced(), 0);
+}
+
+/// Two statics and two functions alike but for their names (each pair has one identity, as
+/// ripgrep's `static MESSAGES: AtomicBool = AtomicBool::new(true)` and `IGNORE_MESSAGES` have),
+/// and one function of its own.
+const ALIKE: &str = "pub static FIRST: u32 = 1;\npub static SECOND: u32 = 1;\n\
+     pub fn one() {}\npub fn two() {}\npub fn three() -> u32 { 3 }\n";
+
+/// The front end of a build of one path package `alike` whose library is `lib`, told which
+/// front end computes its bodies' identities as a build's is (`Steps::lower`).
+fn alike_front(lib: &str) -> blaze_lower::Lowered {
+    let mut lowered = front_of(&[MemPkg { name: "alike", path: true, lib, deps: &[] }]).lowered;
+    blaze_item_hash::impls::install(lowered.served_db());
+    blaze_item_hash::identity::set_build(lowered.served_db(), super::deps::front_end().unwrap());
+    lowered
+}
+
+/// Asks the inference and the MIR of every body of unit 0's crate, as a build that compiles
+/// them does; how many bodies it has.
+fn ask_bodies_steps(lowered: &blaze_lower::Lowered) -> usize {
+    use hir_ty::db::HirDatabase as _;
+    let db = lowered.db();
+    let krate = lowered.krate(0).unwrap();
+    blaze_query::db::attach(db, || {
+        let bodies = hir_def::nameres::demand::crate_body_owners(db, krate);
+        for &def in &bodies {
+            let _ = hir_ty::InferenceResult::of(db, def);
+        }
+        for &def in &bodies {
+            let _ = db.mir_body(hir_ty::InferBodyId::DefWithBodyId(def));
+        }
+        bodies.len()
+    })
+}
+
+/// What a build left for the store is kept though its crate has bodies alike but for their
+/// names, and the front end of the next build, of an edited tree, reads each unedited body's
+/// inference and MIR from it (persisted-state-round-trips: nothing restores empty).
+///
+/// Until 2026-11-10 `FIRST` and `SECOND` filed two shapes of their MIR under one base key in
+/// one flush, the daemon's store refused the second ("keeping the shape of the MIR of
+/// StaticId(..): two images were made under .."), and `deps::store` stopped with it: nothing
+/// the build left was kept and its front end was dropped, after every build of ripgrep.
+#[test]
+fn what_a_build_with_bodies_alike_but_for_their_names_left_is_kept_and_read_by_the_next() {
+    let mut sim = blaze_core::sim::Sim::new(1, blaze_core::sim::Faults::default());
+    let mut store = super::deps::tests::opened(&mut sim);
+    let reader = store.reader();
+    let macros = super::deps::tests::no_macros();
+    let (infer, mir) = (0, 1);
+
+    // The first build runs every step and offers it.
+    let first = alike_front(ALIKE);
+    let mut session = super::deps::session(&first, &reader, &macros, &[]).unwrap();
+    assert_eq!(ask_bodies_steps(&first), 5);
+    let ran = session.item_steps().expect("an item store is installed unless it is turned off");
+    assert_eq!((ran[infer].hits, ran[infer].ran, ran[infer].refused), (0, 5, 0), "{ran:?}");
+    assert_eq!((ran[mir].hits, ran[mir].ran, ran[mir].refused), (0, 5, 0), "{ran:?}");
+    let (puts, mut flushes) = super::deps::store(&first, None, &mut session, &[], "/w")
+        .unwrap_or_else(|error| panic!("what the build left was not kept: {}", error.what));
+    assert_eq!(flushes.take_refusal(), None, "every record the build offered is kept");
+    let items = flushes.items.as_ref().expect("the item store was flushed");
+    assert_eq!((items.failed, items.slots_full), (0, 0), "{items:?}");
+    assert!(items.written >= 6, "three identities' inference and MIR at least: {items:?}");
+    assert!(!puts.is_empty());
+    for it in puts {
+        store.put(it.put.key, it.put.kind, &it.put.bytes).unwrap();
+    }
+    drop((session, first));
+
+    // The next build's front end, of a tree with `three` edited, runs `three`'s steps alone.
+    let next = alike_front(&ALIKE.replace("{ 3 }", "{ 4 }"));
+    let session = super::deps::session(&next, &reader, &macros, &[]).unwrap();
+    assert_eq!(ask_bodies_steps(&next), 5);
+    let read = session.item_steps().unwrap();
+    assert_eq!((read[infer].hits, read[infer].ran), (4, 1), "inference: {read:?}");
+    assert_eq!((read[mir].hits, read[mir].ran), (4, 1), "MIR: {read:?}");
 }

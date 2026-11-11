@@ -12,7 +12,7 @@ use std::{
 };
 
 use super::{
-    ops::{ABANDONED, DIRECT, FINISHED, LINKS, NO_BUFFER, STDERR, STOPPING, ZERO_COPY},
+    ops::{ABANDONED, DIRECT, FINISHED, LINKS, STDERR, STOPPING, ZERO_COPY},
     *,
 };
 
@@ -113,10 +113,9 @@ impl Uring {
     }
 
     /// Writes the request `id` as it now stands to the ring, or keeps it for when there is
-    /// room (or for its kept file's open, the slots its opens fill, or, bypassing the page
-    /// cache, a registered buffer).
+    /// room (or for its kept file's open, or the slots its opens fill).
     pub(super) fn queue(&mut self, id: Id) {
-        if !self.admitted(id) || !self.prepared(id) || !self.slotted(id) || !self.buffered(id) {
+        if !self.admitted(id) || !self.prepared(id) || !self.slotted(id) {
             return;
         }
         let mut sqes = [Sqe::default(); LINKS];
@@ -132,32 +131,6 @@ impl Uring {
     fn asked(&mut self, id: Id, sqes: &[Sqe]) {
         let links = sqes.iter().fold(0u8, |links, it| links | 1 << (it.user_data & LINK_MASK));
         self.ops.get_mut(id).expect("a request in flight").links |= links;
-    }
-
-    /// Whether the request `id` has the registered buffer it needs, given one if it needs one
-    /// and one is free; one that finds none waits in [`ops::Lent`] for the next given back.
-    fn buffered(&mut self, id: Id) -> bool {
-        let Uring { ops, lent, .. } = self;
-        let hot = ops.get_mut(id).expect("a request in flight");
-        if hot.kind != Kind::WriteAt || hot.flags & DIRECT == 0 || hot.buffer != NO_BUFFER {
-            return true;
-        }
-        match lent.take(id) {
-            Some(buffer) => {
-                hot.buffer = buffer;
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// The registered buffer of a write that ended free again, for the write that has waited
-    /// longest.
-    pub(super) fn unbuffer(&mut self, buffer: u16) {
-        let Uring { ops, lent, .. } = self;
-        let Some((id, buffer)) = lent.give(buffer, |it| ops.contains(it)) else { return };
-        ops.get_mut(id).expect("in flight, as `give` checked").buffer = buffer;
-        self.queue(id);
     }
 
     /// The request `id` taken out of its slot, and what it held let go: the file it used, its
@@ -407,7 +380,7 @@ impl Uring {
             }
             Kind::Wake => Sqe {
                 opcode: OP_READ,
-                fd: self.offload.wake.as_raw_fd(),
+                fd: self.offload.wake.fd.as_raw_fd(),
                 off: u64::MAX,
                 addr: self.offload.count.get() as u64,
                 len: 8,
@@ -550,7 +523,6 @@ impl Uring {
         self.on_open.clear();
         self.slot_waiting.clear();
         self.load_waiting.clear();
-        drop(self.lent.clear_waiting());
         self.ring.unsubmitted = 0;
     }
 
@@ -1270,7 +1242,6 @@ impl Drop for Uring {
         self.on_open.clear();
         self.slot_waiting.clear();
         self.load_waiting.clear();
-        drop(self.lent.clear_waiting());
         // alloc: drop, once.
         let mut owed: HashMap<Id, usize, std::alloc::Global> =
             self.ops.iter().map(|(id, hot)| (id, owed(hot))).collect();

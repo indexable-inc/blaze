@@ -248,18 +248,89 @@ pub(crate) fn logging() -> bool {
     LOGGING.load(Ordering::Relaxed)
 }
 
-/// Names an input's or tracked struct's row for the run log: its ingredient's name, its ID and
-/// where to write; true when it wrote a name (a file's path, a crate's name), false to leave it
-/// to its ID. Called with the database the log is taken with attached
-/// ([`super::with_attached_db`]).
-pub type RowNamer = fn(ingredient: &'static str, id: Id, out: &mut String) -> bool;
+/// Names a row for the run log: the name of its ingredient (an input, a tracked struct, or the
+/// type an ID in a memo's key is printed as: `Crate`, `FunctionId`), its ID and where to write;
+/// true when it wrote a name (a file's path, a crate's name and version, an item's path), false
+/// to leave it to its ID, which every namer answers for a row that is not its own. Called with
+/// the database the log is taken with attached ([`super::with_attached_db`]).
+pub type RowNamer = fn(ingredient: &str, id: Id, out: &mut String) -> bool;
 
-static NAMER: OnceLock<RowNamer> = OnceLock::new();
+/// The namers a process may hold: one a crate that defines rows worth naming (base-db's files,
+/// hir-def's crates, modules and items).
+const NAMERS_MOST: usize = 8;
 
-/// Sets the process's [`RowNamer`]: the front end's, once; a second is ignored, as the first
-/// names the same rows.
+static NAMERS: [OnceLock<RowNamer>; NAMERS_MOST] = [const { OnceLock::new() }; NAMERS_MOST];
+
+/// Adds `namer` to the process's [`RowNamer`]s; one given again is one namer. Each crate that
+/// defines rows gives its own, so the run log says `serde v1.0.219 (lib)` where it said
+/// `Crate(Id(21548))`: on 2026-11-10 the crate behind an id was found by guessing from symbol
+/// names. A namer past [`NAMERS_MOST`] is a bug in the caller, and panics saying so.
 pub fn name_rows(namer: RowNamer) {
-    _ = NAMER.set(namer);
+    for slot in &NAMERS {
+        if std::ptr::fn_addr_eq(*slot.get_or_init(|| namer), namer) {
+            return;
+        }
+    }
+    panic!(
+        "blaze-query holds {NAMERS_MOST} run-log namers and was given another: raise \
+         `provenance::NAMERS_MOST`"
+    );
+}
+
+/// Writes the name the first namer that knows row `id` of `ingredient` gives it; false, with
+/// `out` as it was, when none does (or the one asked panicked: a name is never worth a build).
+fn named(ingredient: &str, id: Id, out: &mut String) -> bool {
+    let start = out.len();
+    NAMERS.iter().map_while(OnceLock::get).any(|namer| {
+        let named = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            namer(ingredient, id, &mut *out)
+        }))
+        .unwrap_or(false);
+        if !named {
+            out.truncate(start);
+        }
+        named
+    })
+}
+
+/// `text`, a key as its type's `Debug` shows it, with the name of each ID in it written after
+/// the ID: `Crate(Id(21548))` reads `Crate(Id(21548) = serde v1.0.219 (lib))`. The ID stays, so
+/// the same row reads the same wherever it is named and a chain of causes is still a join on
+/// the text. An ID no namer knows (the type before it is not a row's, or the row is another
+/// database's) is left as it is: nothing is guessed.
+pub(crate) fn name_ids(text: String) -> String {
+    const OPEN: &str = "(Id(";
+    if NAMERS[0].get().is_none() || !text.contains(OPEN) {
+        return text;
+    }
+    let bytes = text.as_bytes();
+    // alloc: a log row's name, once a node a take
+    let mut out = String::with_capacity(text.len() + 32);
+    let (mut copied, mut from) = (0, 0);
+    while let Some(found) = text[from..].find(OPEN) {
+        let open = from + found;
+        let digits = open + OPEN.len();
+        let end = digits + bytes[digits..].iter().take_while(|it| it.is_ascii_digit()).count();
+        from = end;
+        let word = bytes[..open]
+            .iter()
+            .rev()
+            .take_while(|it| it.is_ascii_alphanumeric() || **it == b'_')
+            .count();
+        if end == digits || word == 0 || bytes.get(end) != Some(&b')') {
+            continue;
+        }
+        let Some(id) = text[digits..end].parse::<u32>().ok().and_then(Id::new) else { continue };
+        out.push_str(&text[copied..end]);
+        copied = end;
+        let at = out.len();
+        out.push_str(" = ");
+        if !named(&text[open - word..open], id, &mut out) {
+            out.truncate(at);
+        }
+    }
+    out.push_str(&text[copied..]);
+    out
 }
 
 /// Everything `db`'s storage logged since the last take, each node named with `db` attached
@@ -275,9 +346,17 @@ pub fn take_log_in<D: super::Database>(db: &D) -> Taken {
         let mut names: crate::table::FxMap<u64, String> = crate::table::FxMap::default();
         let mut name =
             |key: u64| names.entry(key).or_insert_with(|| node_name(storage, key)).clone(); // clone: a row's own text
-        // alloc: once a take, a row an entry
-        let mut rows = Vec::new();
+        // The entries first, then their names: naming reads the database (a key's `Debug`, a
+        // namer's path of a module), and a query it runs anew logs itself here. Those runs are
+        // the take's, not the build's, so they are let go below, never left for the next take.
+        // alloc: once a take, an entry a run logged
+        let mut entries = Vec::new();
         while let Some(entry) = log.entries.pop() {
+            entries.push(entry);
+        }
+        // alloc: once a take, a row an entry
+        let mut rows = Vec::with_capacity(entries.len());
+        for entry in entries {
             let (index, _, _) = key_parts(entry.key);
             let read = (entry.read != 0).then(|| name(entry.read));
             let read_kind = (entry.read != 0).then(|| {
@@ -298,6 +377,9 @@ pub fn take_log_in<D: super::Database>(db: &D) -> Taken {
                 read_kind,
             });
         }
+        // The database's holder takes the log outside any query, so what is in it now is what
+        // naming ran.
+        while log.entries.pop().is_some() {}
         log.logged.store(0, Ordering::Relaxed);
         let dropped = log.dropped.swap(0, Ordering::Relaxed);
         rows.sort_unstable_by(|a, b| {
@@ -339,18 +421,44 @@ fn node_name(storage: &Storage, key: u64) -> String {
         Some((Kind::Input | Kind::Tracked, fields)) => {
             let field = fields.get(field as usize).copied().unwrap_or("?");
             _ = write!(out, "`{name}.{field}`(");
-            let start = out.len();
-            let named = NAMER.get().is_some_and(|namer| {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| namer(name, id, &mut out)))
-                    .unwrap_or(false)
-            });
-            if !named {
-                out.truncate(start);
+            if !named(name, id, &mut out) {
                 _ = write!(out, "{id:?}");
             }
             out.push(')');
         }
-        _ => _ = write!(out, "`{name}`({})", super::key_text(storage, index, id)),
+        _ => _ = write!(out, "`{name}`({})", name_ids(super::key_text(storage, index, id))),
     }
     out
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+
+    /// Names the rows of one made-up ingredient, as a crate's namer names its own and no other.
+    fn namer(ingredient: &str, id: Id, out: &mut String) -> bool {
+        if ingredient != "NamedForTheLogTest" {
+            return false;
+        }
+        _ = write!(out, "serde v1.0.{}", id.as_u32());
+        true
+    }
+
+    #[test]
+    fn an_id_in_a_key_reads_with_its_name_and_keeps_its_id() {
+        name_rows(namer);
+        // Given again, it is one namer: the slots are not used up by a database made twice.
+        for _ in 0..2 * NAMERS_MOST {
+            name_rows(namer);
+        }
+        let named = |text: &str| name_ids(text.to_owned());
+        assert_eq!(
+            named("Pair(NamedForTheLogTest(Id(7)), Other(Id(9)))"),
+            "Pair(NamedForTheLogTest(Id(7) = serde v1.0.7), Other(Id(9)))",
+            "a row a namer knows has its name after its id; one none knows keeps its id alone"
+        );
+        for unchanged in ["NamedForTheLogTest(Id(x))", "(Id(3))", "NamedForTheLogTest(Id(3)", "f(1)"] {
+            assert_eq!(named(unchanged), unchanged);
+        }
+    }
 }

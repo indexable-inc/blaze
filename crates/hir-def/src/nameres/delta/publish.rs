@@ -54,6 +54,23 @@ impl ScopeInput {
     }
 }
 
+/// The module a row of this file's inputs is of, for the run log's names
+/// (`crate::span_names::name_log_rows`): a [`ScopeInput`]'s module, a [`CrateResolution`]'s
+/// root. None for any other ingredient, and for an id that is not such a row of `db`.
+pub(in crate::nameres) fn log_row_module(
+    db: &Db,
+    ingredient: &str,
+    id: blaze_query::db::Id,
+) -> Option<ModuleId> {
+    use blaze_query::db::FromIdIn;
+    let storage = blaze_query::db::Database::storage(db);
+    match ingredient {
+        "ScopeInput" => Some(ScopeInput::from_id_in(storage, id)?.module(db)),
+        "CrateResolution" => Some(CrateResolution::from_id_in(storage, id)?.root(db)),
+        _ => None,
+    }
+}
+
 /// A crate's resolution besides its modules' scopes. Set only when the module tree, the crate
 /// env, the crate data, the name records or the diagnostics change: an item added to a module
 /// leaves it as it is.

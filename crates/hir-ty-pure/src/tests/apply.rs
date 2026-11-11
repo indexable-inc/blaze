@@ -28,7 +28,7 @@ fn refused(applied: Applied, says: &str) {
     }
 }
 
-const LEAVES: [Leaf; 12] = [
+const LEAVES: [Leaf; 14] = [
     Leaf::EnvVar,
     Leaf::Print,
     Leaf::ReadFile,
@@ -41,6 +41,8 @@ const LEAVES: [Leaf; 12] = [
     Leaf::Panic,
     Leaf::Alloc,
     Leaf::ErrorText,
+    Leaf::Seeded,
+    Leaf::Wall,
 ];
 
 #[test]
@@ -125,6 +127,8 @@ fn the_rest_take_any_arguments() {
     let any = [Abs::Unknown, Abs::Unset, c("/etc/passwd"), Abs::Param(3)];
     assert_eq!(apply_leaf(Leaf::Print, &any), done(Effects::PRINT));
     assert_eq!(apply_leaf(Leaf::Exit, &any), done(Effects::EXIT));
+    assert_eq!(apply_leaf(Leaf::Seeded, &any), done(Effects::SEEDED));
+    assert_eq!(apply_leaf(Leaf::Wall, &any), done(Effects::WALL));
     for leaf in [Leaf::Handle, Leaf::Panic, Leaf::Alloc, Leaf::ErrorText] {
         assert_eq!(apply_leaf(leaf, &any), done(Effects::NONE));
         assert_eq!(apply_leaf(leaf, &[]), done(Effects::NONE));

@@ -429,6 +429,15 @@ impl<'a, B: Prepare> Build<'a, B> {
         // Each one's describe and count, on all cores. A describe that fails is the whole
         // walk's to report.
         type Answer<I, S> = Option<(Option<Arc<Described<I, S>>>, Counted)>;
+        // The asking is the part of a patched walk that is still the program's size, not the
+        // edit's (docs/v2/plan/design/incremental-walk.md, "The changed set from the engine"):
+        // its own span, so the profile says how much of `codegen walk` it is.
+        let asking = tracing::info_span!(
+            target: "blaze",
+            "codegen walk: ask functions",
+            asked = asks.len(),
+        )
+        .entered();
         let answers: Vec<Result<Answer<_, _>, &'static str>> = par::map(&asks, |item| {
             let Some(it) = keep.function(*item) else {
                 return Err("a kept walk asks of a function it does not hold");
@@ -452,6 +461,13 @@ impl<'a, B: Prepare> Build<'a, B> {
             };
             Ok((now.is_some() || counted != it.counted).then_some((now, counted)))
         });
+        drop(asking);
+        let asking = tracing::info_span!(
+            target: "blaze",
+            "codegen walk: ask statics",
+            asked = keep.statics.len(),
+        )
+        .entered();
         // alloc: per build, the statics whose describe is another
         let mut changed_statics = Vec::new();
         for &item in &keep.statics {
@@ -464,6 +480,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                 Err(_) => return Err("a static's describe failed"),
             }
         }
+        drop(asking);
 
         // The changed set. Each changed item takes its new describe and its edges are set
         // again; what it newly refers to goes to `fresh`.

@@ -961,7 +961,15 @@ mod tests {
         let (edition, _) = named_in("#[warn(blaze::edition)]");
         let (macros, _) = named_in("#[allow(blaze::proc_macro)]");
         assert!(
-            edition.intersects(blaze::Lint::BuildScriptAmbient.bit())
+            edition.intersects(blaze::Lint::LossyAs.bit())
+                && edition.intersects(blaze::Lint::GlobalState.bit())
+                && edition.intersects(blaze::Lint::AsyncFn.bit())
+                && edition.intersects(blaze::Lint::UnmarkedPure.bit())
+                && edition.intersects(blaze::Lint::UnmarkedNopanic.bit())
+                && edition.intersects(blaze::Lint::UnmarkedNoalloc.bit())
+                && edition.intersects(blaze::Lint::UnmarkedNonblocking.bit())
+                && edition.intersects(blaze::Lint::MutRef.bit())
+                && edition.intersects(blaze::Lint::BuildScriptAmbient.bit())
                 && !edition.intersects(blaze::Lint::HashTwice.bit())
         );
         assert_eq!(

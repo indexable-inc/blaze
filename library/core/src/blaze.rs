@@ -23,3 +23,13 @@
 pub macro contract_test($item:item) {
     /* compiler built-in */
 }
+
+/// What carries the name of blaze's generic const expressions,
+/// `#![feature(blaze_const_exprs)]`, in the library's table of features: a const generic
+/// argument or an array length that is an expression over generic parameters
+/// (`Shares<T, K, { N + M }, D>`), evaluated per instance and unified by a normal form by
+/// blaze's own front end (docs/v2/plan/design/ownership.md). The feature is the language's;
+/// no program names this type. rustc has neither, so a crate that enables the feature is
+/// refused there.
+#[unstable(feature = "blaze_const_exprs", issue = "none")]
+pub struct ConstExprs;

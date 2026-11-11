@@ -1,8 +1,9 @@
 //! The pool's deterministic simulation test (docs/v2/plan/design/store-pool.md, section 7): the
 //! real word, reading, pins, pin set, optimistic reads, loads core, sweep and windows, over files
-//! the test writes, driven by `blaze_core::sim::Sim`. The store does not read through the pool yet
-//! (lane 4), so the files stand in for its packs: records of drawn sizes laid out at 16 bytes,
-//! padded to a block, each file written whole and durable, with its blocks' checks.
+//! the test writes, driven by `blaze_core::sim::Sim`. The files stand in for the store's packs
+//! (which the store reads through the pool: `crate::hot`, `crate::read`): records of drawn sizes
+//! laid out at 16 bytes, padded to a block, each file written whole and durable, with its
+//! blocks' checks.
 //!
 //! What it draws, as one plan (Hegel's, shrunk; or a seed's, for the controls and replay):
 //!
@@ -852,7 +853,7 @@ impl World {
         for completion in out.drain(..) {
             match self.loads.owns(completion.tag) {
                 true => self.loads.complete(&self.pool, completion, &mut self.ended),
-                false => self.written(completion)?,
+                false => self.written(&completion)?,
             }
         }
         self.out = out;
@@ -958,7 +959,7 @@ impl World {
     /// completed, the sync is asked; once the sync has, the append is the file's, in the pool
     /// and in the model (the head's flip). A write or a sync that failed gives the append up:
     /// nothing of it was committed.
-    fn written(&mut self, completion: Completion) -> Result<(), Broke> {
+    fn written(&mut self, completion: &Completion) -> Result<(), Broke> {
         let actor = std::mem::replace(&mut self.actors[COMMITTER], Actor::Idle);
         let Actor::Appending { file, append, bytes, records, checks, mut writes, mut failed, syncing } = actor else {
             return Err(Broke::Harness(format!("a completion neither a load nor the commit asked for: {completion:?}")));
@@ -1319,6 +1320,15 @@ fn directed(plant: Plant) -> Plan {
             let acts = vec![Act::Rot { file: 0, block: 0 }, Act::Rot { file: 0, block: 28 }];
             Plan { rot: true, ..by_hand(&[110_004, 4096, 4096], acts) }
         }
+        // Reader 0's load of the record's page is in flight as reader 1 comes to it: a slot,
+        // then its look at the page. With nothing planted it waits for that load, and both
+        // are served by the one read.
+        Plant::DoubleClaim => {
+            by_hand(&[300], vec![read(0), read(0), read(1), read(1), read(1), step, read(0), read(1)])
+        }
+        // A plan of a file of eight pages or more, with a budget of six (`BUDGET`): the
+        // prefetch reads six and waits for them to be read.
+        Plant::PrefetchUncharged => by_hand(&[300, 500_000], vec![Act::Prefetch { file: 0 }]),
     }
 }
 
@@ -1331,12 +1341,13 @@ fn rule_of(plant: Plant) -> Rule {
         Plant::SameVersion | Plant::LoadedAtAsk | Plant::NoCheck | Plant::FailedLoadKept | Plant::FirstBadBlock => {
             Rule::Bytes
         }
-        // The kernel's stand-in was given a page that was pinned, or not `Evicting`.
-        Plant::EvictPinned | Plant::NoEvicting => Rule::GivenBack,
+        // The kernel's stand-in was given a page that was pinned, or not `Evicting`; or was
+        // asked to make a page the process's that a load in flight had made so already.
+        Plant::EvictPinned | Plant::NoEvicting | Plant::DoubleClaim => Rule::GivenBack,
         // The append reached the disk as whatever the kernel left: its block fails its check
         // when it is read back, and nothing rotted.
         Plant::UnpinnedTail => Rule::Unexplained,
-        Plant::PrefetchFirst => Rule::Prefetch,
+        Plant::PrefetchFirst | Plant::PrefetchUncharged => Rule::Prefetch,
     }
 }
 
@@ -1414,6 +1425,18 @@ fn the_oracle_catches_a_commit_that_does_not_pin_its_file_s_last_page() {
 #[test]
 fn the_oracle_catches_a_prefetch_issued_while_a_demand_load_is_in_flight() {
     control(Plant::PrefetchFirst);
+}
+
+/// Two loads of one page racing: the read that lands last is what is served, whatever the
+/// first read, and the page is made the process's twice.
+#[test]
+fn the_oracle_catches_two_loads_of_one_page() {
+    control(Plant::DoubleClaim);
+}
+
+#[test]
+fn the_oracle_catches_a_prefetch_the_budget_is_not_charged_for() {
+    control(Plant::PrefetchUncharged);
 }
 
 #[test]
@@ -1674,4 +1697,227 @@ fn the_census_counts_what_is_loaded_pinned_and_can_be_given_back() {
     assert_eq!(swept.refused, None);
     assert_eq!((swept.freed, sweep.evicted()), (free.evictable, free.evictable), "{swept:?}");
     assert_eq!(census(&pool, &windows), Census::default());
+}
+
+// --- What a read costs, counted -----------------------------------------------------------------
+
+/// What one pinned read asked of the loads core.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+struct Asked {
+    /// Loads asked.
+    loads: u64,
+    /// Reads submitted to the driver.
+    reads: u64,
+    /// Pages they read.
+    pages: u64,
+}
+
+/// The `len` bytes at the pool's byte `at` pinned, with no faults, in load slot 0, and what it
+/// asked: a reading stepped to its end on the simulation.
+fn pin_counting(sim: &mut Sim, pool: &Handle, loads: &mut Loads, at: u64, len: u64) -> (Pins<Poison, Handle>, Asked) {
+    let mut reading = Reading::new(at, len);
+    let (mut effects, mut ended, mut out) = (Vec::new(), Vec::new(), Vec::new());
+    let mut asked = Asked::default();
+    for _ in 0..DRAIN {
+        match reading.step(pool) {
+            ReadStep::Pinned(pins) => {
+                reading.take_slot();
+                return (pins, asked);
+            }
+            ReadStep::Failed(error) => panic!("a read with no faults failed: {error}"),
+            ReadStep::NeedSlot => reading.give_slot(0),
+            ReadStep::Ask(load) => {
+                loads.ask(pool, load, &mut effects, &mut ended);
+                asked.loads += 1;
+                asked.pages += u64::from(load.pages);
+                asked.reads += effects.iter().filter(|it| matches!(it, Effect::ReadInto { .. })).count() as u64;
+                sim.submit(&mut effects);
+            }
+            ReadStep::Pending | ReadStep::Wait { .. } | ReadStep::Spin { .. } => {
+                sim.advance(Duration::from_micros(400));
+                sim.poll(&mut out, Deadline::PASSED);
+                for completion in out.drain(..) {
+                    loads.complete(pool, completion, &mut ended);
+                }
+            }
+        }
+        for Ended { outcome, .. } in ended.drain(..) {
+            reading.loaded(pool, outcome);
+        }
+    }
+    panic!("a read with no faults did not end in {DRAIN} steps");
+}
+
+/// One file of `spec` in a pool of its own with windows enough for it, on a simulation with no
+/// faults: the pool, its windows and loads, the file's window, bytes and records.
+fn one_file(spec: &Spec) -> (Sim, Handle, Windows, Loads, Window, Vec<u8>, Vec<(u64, u64)>) {
+    let (bytes, records) = file_bytes(spec);
+    let count = (bytes.len() as u64).div_ceil(WINDOW) as u32 + 1;
+    let pool: Handle = Rc::new(Pool::planted_with(count, Poison::default(), Plant::None).unwrap());
+    let (mut windows, mut loads) = (Windows::new(count), loads());
+    let mut sim = Sim::new(11, Faults::default());
+    let name = FileName::new("pool/pack-0").expect("a name");
+    sim.change(&name, &bytes);
+    let window = open(&mut windows, &mut loads, &pool, FileId::Pack(0), &name, &bytes, Rank::Plain)
+        .unwrap_or_else(|broke| panic!("{broke}"));
+    (sim, pool, windows, loads, window, bytes, records)
+}
+
+/// A read of one small record loads the record's pages and no others, however long its pack:
+/// one load, one read, and of a pack a thousand pages long one page is the process's after.
+/// (The pack is 64 MiB, not the GiB a pack may grow to: the simulation holds a file's bytes in
+/// memory, twice while it is written, and what is counted does not depend on the length.)
+#[test]
+fn a_read_of_one_small_record_of_a_long_pack_loads_only_the_record_s_pages() {
+    const LONG: u64 = 64 << 20;
+    let spec = Spec { sizes: vec![LONG / 2, 300, LONG / 2 - (64 << 10)], fill: 9, rank: Rank::Plain };
+    let (mut sim, pool, _windows, mut loads, window, bytes, records) = one_file(&spec);
+    assert!(window.pages() >= 1000, "the pack is {} pages", window.pages());
+    let (at, len) = records[1];
+    let run = Run::of(window.at(at), len);
+    let (pins, asked) = pin_counting(&mut sim, &pool, &mut loads, window.at(at), len);
+    assert_eq!(pins.bytes(), &bytes[at as usize..(at + len) as usize]);
+    assert_eq!(asked, Asked { loads: 1, reads: 1, pages: u64::from(run.pages) }, "of {} pages", window.pages());
+    assert_eq!(pool.give().held.borrow().len() as u64, u64::from(run.pages), "the pages the process holds");
+    // A second read of it is a hit: nothing is asked.
+    let (again, asked) = pin_counting(&mut sim, &pool, &mut loads, window.at(at), len);
+    assert_eq!((again.bytes(), asked), (pins.bytes(), Asked::default()));
+}
+
+/// A prefetch of records that are neighbours in their pack is one batched read: the run of
+/// their pages is asked once, and the reads of the records after it ask nothing and count
+/// each page as a prefetch hit.
+#[test]
+fn a_prefetch_of_neighbouring_records_is_one_read_and_their_reads_ask_nothing() {
+    let spec = Spec { sizes: vec![40_000; 5], fill: 4, rank: Rank::Plain };
+    let (mut sim, pool, _windows, mut loads, window, bytes, records) = one_file(&spec);
+    let (first, last) = (records[0], records[4]);
+    let run = Run::of(window.at(first.0), last.0 + last.1 - first.0);
+    assert!(run.pages >= 3 && u64::from(run.pages) <= BUDGET, "the records lie over {} pages", run.pages);
+    loads.prefetch(&pool, [run]);
+    let (mut effects, mut ended, mut out) = (Vec::new(), Vec::new(), Vec::new());
+    assert_eq!(loads.pump(&pool, &mut effects, &mut ended), 1, "one load of the whole run");
+    let reads = effects.iter().filter(|it| matches!(it, Effect::ReadInto { .. })).count();
+    assert_eq!(reads, 1, "{} records, {} pages: {effects:?}", records.len(), run.pages);
+    sim.submit(&mut effects);
+    for _ in 0..DRAIN {
+        if loads.in_flight() == 0 {
+            break;
+        }
+        sim.advance(Duration::from_micros(400));
+        sim.poll(&mut out, Deadline::PASSED);
+        for completion in out.drain(..) {
+            loads.complete(&pool, completion, &mut ended);
+        }
+    }
+    assert_eq!(loads.in_flight(), 0, "the prefetch's load ended");
+    assert_eq!(pool.prefetch_counts().loaded, u64::from(run.pages));
+    for &(at, len) in &records {
+        let (pins, asked) = pin_counting(&mut sim, &pool, &mut loads, window.at(at), len);
+        assert_eq!(pins.bytes(), &bytes[at as usize..(at + len) as usize], "the record at {at}");
+        assert_eq!(asked, Asked::default(), "the record at {at} was prefetched");
+    }
+    let counts = pool.prefetch_counts();
+    assert_eq!((counts.hit, counts.late, counts.wasted), (u64::from(run.pages), 0, 0), "{counts:?}");
+}
+
+/// Two readers of one page not in memory are served by one load: the second waits on the
+/// first's, and one read is asked.
+#[test]
+fn two_readers_of_one_page_are_served_by_one_load() {
+    let plan = quiet_plan();
+    let mut world = World::new(&plan, Plant::None).unwrap_or_else(|broke| panic!("{broke}"));
+    let ok = |done: Result<(), Broke>| done.unwrap_or_else(|broke| panic!("{broke}"));
+    // Reader 0: a slot, then its load asked. Reader 1 comes to the page while it is loading.
+    ok(world.read(&plan, 0, 0, 0, Keep::Hold));
+    ok(world.advance(&plan, 0));
+    assert_eq!(world.loads.in_flight(), 1, "reader 0's load is in flight");
+    for _ in 0..3 {
+        ok(world.read(&plan, 1, 0, 0, Keep::Hold));
+    }
+    assert_eq!(world.loads.in_flight(), 1, "reader 1 asked no load of its own");
+    ok(world.step(400));
+    ok(world.advance(&plan, 0));
+    ok(world.advance(&plan, 1));
+    assert!(matches!(world.actors[0], Actor::Holding { .. }) && matches!(world.actors[1], Actor::Holding { .. }));
+    assert_eq!(world.recorder.runs().len(), 1, "one miss: {:?}", world.recorder.runs());
+    ok(world.check());
+}
+
+// --- The budget ---------------------------------------------------------------------------------
+
+/// Readers pinning records of one file and letting them go, under a budget of `ROOM` resident
+/// pages, each read making room first ([`Sweep::make_room`]) when `room` says so: `Err` at the
+/// first read after which the pool holds more than the budget and more than what is pinned.
+fn reads_under_a_budget(seed: u64, room: bool) -> Result<(), String> {
+    const ROOM: u64 = 3;
+    const RECORDS: u64 = 12;
+    let spec = Spec { sizes: vec![40_000; RECORDS as usize], fill: 5, rank: Rank::Plain };
+    let plan = Plan { seed, files: vec![spec], ..quiet_plan() };
+    let said = |broke: Broke| broke.to_string();
+    let mut world = World::new(&plan, Plant::None).map_err(said)?;
+    let mut rng = Rng::new(seed);
+    let resident = |world: &World| world.pool.give().held.borrow().len() as u64 * PAGE;
+    for n in 0..200 {
+        let reader = rng.below(READERS as u64) as usize;
+        // The reader's last read is let go as its next begins.
+        if matches!(world.actors[reader], Actor::Holding { .. }) {
+            world.actors[reader] = Actor::Idle;
+        }
+        let rec = rng.below(RECORDS) as usize;
+        let (at, len) = world.place(0, rec);
+        let load = u64::from(Run::of(at, len).pages) * PAGE;
+        if room {
+            let held = resident(&world);
+            world.sweep.make_room(&world.pool, &world.windows, held, ROOM * PAGE, load, 0);
+        }
+        world.read(&plan, reader as u8, 0, rec as u8, Keep::Hold).map_err(said)?;
+        for _ in 0..DRAIN {
+            if matches!(world.actors[reader], Actor::Holding { .. }) {
+                break;
+            }
+            world.step(100).map_err(said)?;
+            world.advance(&plan, reader).map_err(said)?;
+        }
+        world.check().map_err(said)?;
+        let pinned: u64 = world
+            .actors
+            .iter()
+            .map(|it| match it {
+                Actor::Holding { pins, .. } => u64::from(pins.run().pages) * PAGE,
+                _ => 0,
+            })
+            .sum();
+        let held = resident(&world);
+        if held > (ROOM * PAGE).max(pinned) {
+            return Err(format!(
+                "after read {n} (record {rec}, reader {reader}) the pool holds {held} bytes: more than its budget \
+                 of {} and more than the {pinned} its readers pin",
+                ROOM * PAGE
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The invariant: the pool's resident bytes never exceed its budget plus what its readers pin,
+/// when every load makes room first: after each read the pool holds at most the budget, or,
+/// where readers pin more than that, at most what they pin.
+#[test]
+fn a_load_that_makes_room_first_keeps_the_pool_within_its_budget_and_what_is_pinned() {
+    for seed in 0..64 {
+        if let Err(why) = reads_under_a_budget(seed, true) {
+            panic!("seed {seed}: {why}");
+        }
+    }
+}
+
+/// The cause removed: with no room made before a load, nothing gives a page back, and the pool
+/// passes its budget and what is pinned on every seed.
+#[test]
+fn the_oracle_catches_a_load_that_makes_no_room() {
+    for seed in 0..64 {
+        let why = reads_under_a_budget(seed, false).expect_err("a pool that gives nothing back stays within no budget");
+        assert!(why.contains("more than its budget"), "seed {seed}: {why}");
+    }
 }

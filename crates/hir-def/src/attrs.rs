@@ -599,6 +599,7 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                     // [`AttrFlags::multiversion_levels`]'s to read.
                     (Some(Word::blaze), Some(Word::multiversion)) => {
                         attr_flags.insert(AttrFlags::BLAZE_MULTIVERSION)
+                    }
                     // `#[blaze::drop(early)]`, `#[blaze::drop(early, trusted = "why")]` and
                     // `#[blaze::drop(scoped)]` on a type; anything else sets no flag, and
                     // both words set both, which `hir_ty_mir::mir::early_drop` refuses.
@@ -742,6 +743,7 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                 }
                 (Some(Word::blaze), Some(Word::may_suspend)) => AttrFlags::MAY_SUSPEND,
                 (Some(Word::blaze), Some(Word::sans_io)) => AttrFlags::SANS_IO,
+                (Some(Word::blaze), Some(Word::capabilities)) => AttrFlags::CAPABILITIES,
                 (Some(Word::blaze), Some(Word::checkfree)) => AttrFlags::CHECKFREE,
                 (Some(Word::blaze), Some(Word::pure)) => AttrFlags::PURE,
                 (Some(Word::blaze), Some(Word::differentiable)) => AttrFlags::DIFFERENTIABLE,
@@ -753,14 +755,16 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                 (Some(Word::blaze), Some(Word::nopanic)) => AttrFlags::NOPANIC,
                 (Some(Word::blaze), Some(Word::noalloc)) => AttrFlags::NOALLOC,
                 (Some(Word::blaze), Some(Word::nonblocking)) => AttrFlags::NONBLOCKING,
+                (Some(Word::blaze), Some(Word::norefcount)) => AttrFlags::NOREFCOUNT,
                 (Some(Word::blaze), Some(Word::may)) => AttrFlags::MAY,
                 (Some(Word::blaze), Some(Word::effects)) => AttrFlags::BLAZE_EFFECTS,
                 (Some(Word::blaze), Some(Word::linear)) => AttrFlags::LINEAR,
                 (Some(Word::blaze), Some(Word::consumes)) => AttrFlags::CONSUMES,
+                (Some(Word::blaze), Some(Word::holds)) => AttrFlags::HOLDS,
+                (Some(Word::blaze), Some(Word::memo)) => AttrFlags::BLAZE_MEMO,
                 (Some(Word::blaze), Some(Word::reflect)) => AttrFlags::BLAZE_REFLECT,
                 (Some(Word::blaze), Some(Word::sealed)) => AttrFlags::BLAZE_SEALED,
                 (Some(Word::blaze), Some(Word::multiversion)) => AttrFlags::BLAZE_MULTIVERSION,
-                (Some(Word::blaze), Some(Word::acyclic)) => AttrFlags::BLAZE_ACYCLIC,
                 (Some(Word::blaze), Some(Word::program_lifetime)) => {
                     AttrFlags::BLAZE_PROGRAM_LIFETIME
                 }
@@ -926,11 +930,11 @@ fn word(name: &str) -> Option<Word> {
 name_set! {
     /// An attribute name the flags or the value queries read.
     enum Word {
-    acyclic,
     automatically_derived,
     bench,
     bits,
     blaze,
+    capabilities,
     checkfree,
     clippy,
     cold,
@@ -948,6 +952,7 @@ name_set! {
     export_name,
     fundamental,
     has_significant_drop,
+    holds,
     ignore,
     inline,
     instruction_set,
@@ -963,6 +968,7 @@ name_set! {
     may,
     may_dangle,
     may_suspend,
+    memo,
     multiversion,
     must_not_suspend,
     must_use,
@@ -973,6 +979,7 @@ name_set! {
     non_exhaustive,
     nonblocking,
     nopanic,
+    norefcount,
     optimize,
     panic_handler,
     path,
@@ -1227,6 +1234,14 @@ bitflags::bitflags! {
         /// `#[blaze::nonblocking]` or `#[blaze::nonblocking(..)]`: as [`AttrFlags::NOPANIC`],
         /// for no call that blocks the thread (`blaze::nonblocking`).
         const NONBLOCKING = 1 << 99;
+        /// `#[blaze::memo]`, a word, on a function: a blaze extension (inert under rustc with
+        /// `#![register_tool(blaze)]`), the function is a memo point of `bstd::eval`
+        /// (docs/v2/plan/design/std.md, "Eval"). It is held pure as if written
+        /// `#[blaze::pure]` ([`AttrFlags::pure_attr`] answers `Checked` for it), and its item
+        /// type alone is `core::reflect::MemoPoint` (`hir_ty::comptime::reflect_is_memo_point`).
+        /// It changes diagnostics and which trait goals hold, never code: no codegen key reads
+        /// it.
+        const BLAZE_MEMO = 1 << 112;
         /// `#[blaze::may]` or `#[blaze::may(..)]` on a function, a trait or (as an inner
         /// attribute) a module or the crate: the effects it may have, the positive spelling of
         /// the three above and the only one of `diverge` (docs/v2/plan/design/effects.md). Inert
@@ -1242,6 +1257,19 @@ bitflags::bitflags! {
         /// bounded by it counts as local in its crate's orphan check
         /// (`TraitFlags::SEALED`, `hir_ty::sealed_local_bound`, `hir-ty-coherence`).
         const BLAZE_SEALED = 1 << 100;
+        /// `#![blaze::capabilities]`, a word, inner, on a crate root: a blaze extension (inert
+        /// under rustc with `#![register_tool(blaze)]`), read by blaze-lints'
+        /// `blaze::capabilities`: no function of the crate may reach ambient IO, `unsafe` code
+        /// or the global heap outside the workspace's trusted crates (hir-ty-pure's `ambient`,
+        /// `unsafe` and `global_alloc`, docs/v2/plan/design/std.md). It changes diagnostics,
+        /// never code: no codegen key reads it.
+        const CAPABILITIES = 1 << 113;
+        /// `#[blaze::norefcount]`, a word, on a function or method: a blaze extension (inert
+        /// under rustc with `#![register_tool(blaze)]`). Under `#![blaze::handles]`, each copy
+        /// of a handle the body would otherwise make where it moves one is an error naming the
+        /// line and the handle (`hir_ty_mir::mir::handles::norefcount_errors`, reported with
+        /// the borrow check's). It changes diagnostics, never code.
+        const NOREFCOUNT = 1 << 114;
         /// `#[blaze::differentiable]` or `#[blaze::differentiable(..)]`, on a function: a blaze
         /// extension (inert under rustc with `#![register_tool(blaze)]`), read by
         /// `blaze-diff-mir` ([`AttrFlags::differentiable_attr`], docs/future/autodiff.md): the
@@ -1253,7 +1281,6 @@ bitflags::bitflags! {
         /// `#![blaze::early_drop]` a value of the type is dropped after its last use
         /// (docs/v2/plan/design/early-drop.md): the impl must only free memory
         /// (`hir_ty_pure::drop_effects`), unless [`AttrFlags::DROP_TRUSTED`] says otherwise.
-        /// Bit 101 is `NOREFCOUNT`'s on `edition-e2-handles-1109`.
         const DROP_EARLY = 1 << 105;
         /// `#[blaze::drop(scoped)]` on a type: a value of it, and of any type that holds one,
         /// is dropped where its scope ends, as in Rust, whatever its destructor does.
@@ -1272,6 +1299,13 @@ bitflags::bitflags! {
         /// linear types its by-value parameters have end, so in its body those types are not
         /// linear (`hir-ty-linear`). It changes diagnostics, never code.
         const CONSUMES = 1 << 111;
+        /// `#[blaze::holds]`, a word, on a struct or enum: a value of it holds a value of each
+        /// of its type arguments although no field does (behind a raw or counted pointer), so
+        /// it holds a linear value when an argument does, and the bodies of its own crate's
+        /// impls of it, which move those values in and out by trusted code, are not checked
+        /// for them (`hir-ty-linear`, docs/v2/plan/design/linear.md, rule 7). It changes
+        /// diagnostics, never code.
+        const HOLDS = 1 << 109;
         /// `#[rustc_specialization_trait]`, one segment, on a trait: rustc's
         /// `TraitSpecializationKind::AlwaysApplicable` (`TraitFlags::SPECIALIZATION_ALWAYS_APPLICABLE`).
         const RUSTC_SPECIALIZATION_TRAIT = 1 << 120;
@@ -1300,14 +1334,6 @@ bitflags::bitflags! {
         /// [`AttrFlags::multiversion_levels`]'s; it changes code generation only, never what
         /// the function means.
         const BLAZE_MULTIVERSION = 1 << 125;
-        /// `#[blaze::acyclic]`, a word, on a struct or enum: a blaze extension (inert under
-        /// rustc with `#![register_tool(blaze)]`). The spelling that asserts the `Acyclic`
-        /// trait of the type: the trait is derived from the type's shape by compile-time
-        /// reflection with a blanket impl (rule `reflection-first`; built on `lang-int-1110`,
-        /// docs/v2/plan/design/facts.md "Acyclic"), so nothing in the compiler analyses it
-        /// and nothing reads the bit until that lane's assertion does. It changes
-        /// diagnostics, never code: no codegen key reads the bit.
-        const BLAZE_ACYCLIC = 1 << 108;
         /// `#[blaze::program_lifetime]`, a word, on a struct or enum: a blaze extension (inert
         /// under rustc with `#![register_tool(blaze)]`), a declared type fact
         /// (docs/v2/plan/design/facts.md): instances live until the program exits. `hir-ty-pure`'s
@@ -2363,10 +2389,13 @@ impl AttrFlags {
     }
 
     /// What `#[blaze::pure]` on `owner` says ([`PureAttr`]); `None` without it, one bit test.
+    /// `#[blaze::memo]` without it says `Checked`: a memo point is held pure, so every reader
+    /// of this (the lint `blaze::pure`, the purity check) holds it with no rule of its own.
     #[inline]
     pub fn pure_attr(db: &Db, owner: AttrDefId) -> Option<PureAttr> {
-        if !AttrFlags::query(db, owner).contains(AttrFlags::PURE) {
-            return None;
+        let flags = AttrFlags::query(db, owner);
+        if !flags.contains(AttrFlags::PURE) {
+            return flags.contains(AttrFlags::BLAZE_MEMO).then_some(PureAttr::Checked);
         }
         return pure_attr(db, owner);
 
@@ -2408,6 +2437,15 @@ impl AttrFlags {
                         match attr.token_tree() {
                             Some(tt) => may_args(tt),
                             None => MayAttr { words: 0, trusted: None, malformed: None },
+                        }
+                    }
+                    _ => return ControlFlow::Continue(()),
+                };
+                ControlFlow::Break(read)
+            })
+        }
+    }
+
     /// What `#[blaze::differentiable]` on `owner` says ([`DifferentiableAttr`]); `None` without
     /// it, one bit test.
     #[inline]

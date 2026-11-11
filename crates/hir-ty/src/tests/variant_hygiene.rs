@@ -195,7 +195,7 @@ globbed!();
 /// impls), and for each
 /// path expression, record literal and pattern of its body that names a variant, the variant
 /// ([`variant_of`]).
-fn check_variants(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
+fn check_variants(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: &Expect) {
     let db = fixture::db(ra_fixture).into_db();
     blaze_query::db::attach(&db, || {
         let main = fixture::test_crate(&db);
@@ -323,7 +323,7 @@ fn variant_of(db: &base_db::Db, variant: EnumVariantId) -> String {
 fn variants_a_macro_names_in_another_crate_are_found_by_its_expansion_alone() {
     check_variants(
         CROSS_CRATE,
-        expect![[r#"
+        &expect![[r#"
             fn check_variants:
                 MyEnum::Variant -> variant 0
                 MyEnum::Variant -> variant 1
@@ -351,7 +351,7 @@ fn variants_a_macro_names_in_another_crate_are_found_by_its_expansion_alone() {
 fn variants_a_macro_names_are_found_by_its_expansion_alone() {
     check_variants(
         SAME_CRATE,
-        expect![[r#"
+        &expect![[r#"
             fn in_x:
                 E::V -> variant 0
                 <_>::V -> variant 1

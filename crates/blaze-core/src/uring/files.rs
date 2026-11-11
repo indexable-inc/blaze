@@ -44,8 +44,6 @@ const OPENING: u8 = 0;
 const OPENED: u8 = 1;
 /// Making the directories its path is in, one at a time.
 const MAKING: u8 = 2;
-/// A write at an offset's `statx`, which says whether it may bypass the page cache.
-const STATTING: u8 = 3;
 /// Unlinking what it made before it failed: a whole file's temporary, a clone's target.
 const UNLINKING: u8 = 4;
 /// A kept file's descriptor being put in its slot of the table.
@@ -58,6 +56,9 @@ pub(super) const SIZED: u8 = 1;
 const READING: u8 = 7;
 /// A read of a file no request keeps, waiting for room among [`LOADS`].
 const QUEUED: u8 = 8;
+/// A write at an offset done, its slot being emptied: its completion is told only once the
+/// file is closed ([`Uring::wrote_at`]).
+const CLOSING: u8 = 9;
 
 /// The most reads of files no request keeps that hold a descriptor at once (fewer where the
 /// table, sized to `RLIMIT_NOFILE`, is smaller): a batch of 50 000 opens whose reads wait
@@ -289,8 +290,8 @@ impl Uring {
 
     /// The name `n` of the request `id`. Each caller asks for a name its kind's push put there
     /// (0 and 1 the paths, 2 and 3 a rename's directories) or, for 4, the directory
-    /// `next_parent` put there before the `made` that asks; never `write_at`'s `statx` room,
-    /// which only `statx_of` reads.
+    /// `next_parent` put there before the `made` that asks; never a `statx`'s room, which
+    /// only `statx_of` reads.
     fn name_of(&self, id: Id, n: usize) -> &CStr {
         let hot = self.ops.get(id).expect("a request in flight");
         // SAFETY: as above, `names[n]` starts a NUL-terminated name in the request's arena,
@@ -307,8 +308,18 @@ impl Uring {
         Step::Ends(Some(Done::Failed(IoError(format!("{what} {name}: {}", error(res))))))
     }
 
-    /// Starts [`Effect::WriteAt`] `tag` of `bytes` at `at` of `file`: a `statx` first where
-    /// the write may bypass the page cache, then the open into a slot linked to the write.
+    /// Starts [`Effect::WriteAt`] `tag` of `bytes` at `at` of `file`: the open into a slot
+    /// linked to the write.
+    ///
+    /// Through the page cache, whatever its size and alignment: the write completes once the
+    /// kernel holds the bytes and waits for no device, as its effect says (durable only once
+    /// a later sync of the file completes). Until 2026-11-11 a write of a MiB or more at a
+    /// sector's offset was opened `O_DIRECT` here, on the driver's own judgement: a linked
+    /// image's runs are cut at multiples of 8 MiB, so every run of an edit's output placed
+    /// from its maker's bytes (`blaze_cas::Store::place_made`) waited for the device, a MiB
+    /// a piece through four buffers, behind whatever else the disk was doing (the profile's
+    /// fsync: 1513 ms of an edit's 2760). A write around the cache is asked for by name
+    /// ([`Effect::WriteFrom`] with [`crate::Cache::Bypassed`]), never chosen here.
     pub(super) fn write_at(
         &mut self,
         tag: Tag,
@@ -316,11 +327,7 @@ impl Uring {
         at: u64,
         bytes: Vec<u8>,
     ) -> io::Result<()> {
-        const SECTOR: u64 = 512;
-        let len = bytes.len();
-        let candidate = len >= DIRECT_LEAST && at % SECTOR == 0 && len as u64 % SECTOR == 0;
-        let mut hot = Hot::new(tag, Kind::WriteAt, 0);
-        hot.phase = if candidate { STATTING } else { OPENING };
+        let hot = Hot::new(tag, Kind::WriteAt, 0);
         let cold = Cold { at, ..Cold::EMPTY };
         self.named(
             hot,
@@ -328,9 +335,6 @@ impl Uring {
             cold,
             |path, names, at| {
                 at[0] = push_c(names, path.as_os_str().as_bytes())?;
-                if candidate {
-                    at[4] = push_zeros(names, STATX_SIZE)?;
-                }
                 Ok(())
             },
             file,
@@ -766,45 +770,26 @@ impl Uring {
                 };
                 1
             }
-            (Kind::WriteAt, STATTING) => {
-                sqes[0] = statx(name(0), STATX_DIOALIGN, name(4), ud(0));
+            (Kind::WriteAt, CLOSING) => {
+                sqes[0] = Sqe {
+                    opcode: OP_CLOSE,
+                    fd: 0,
+                    splice_fd_in: cold.slots[0] as i32 + 1,
+                    user_data: ud(0),
+                    ..Sqe::default()
+                };
                 1
             }
             (Kind::WriteAt, _) => {
                 let slot = cold.slots[0];
-                let write = if hot.flags & DIRECT != 0 {
-                    debug_assert_ne!(
-                        hot.buffer,
-                        ops::NO_BUFFER,
-                        "a registered buffer, given before it is queued"
-                    );
-                    let piece = (buf.len() - done).min(DIRECT_PIECE);
-                    let to = self.registered.at(hot.buffer);
-                    // SAFETY: the buffer is this request's alone (lent by `Lent` until it ends),
-                    // `DIRECT_PIECE` long, and the kernel reads it only for this request, which
-                    // it is not given before this; `piece` is at most what is left of `buf`.
-                    unsafe { ptr::copy_nonoverlapping(buf[done..].as_ptr(), to, piece) };
-                    Sqe {
-                        opcode: OP_WRITE_FIXED,
-                        flags: SQE_FIXED_FILE,
-                        fd: slot as i32,
-                        off: cold.at + hot.done,
-                        addr: to as u64,
-                        len: piece as u32,
-                        buf_index: hot.buffer,
-                        user_data: ud(1),
-                        ..Sqe::default()
-                    }
-                } else {
-                    let off = cold.at + hot.done;
-                    Sqe { off, addr: rest, len: left, ..on_slot(OP_WRITE, slot, 0, ud(1)) }
-                };
+                let off = cold.at + hot.done;
+                let write = Sqe { off, addr: rest, len: left, ..on_slot(OP_WRITE, slot, 0, ud(1)) };
                 if hot.phase == OPENED {
                     sqes[0] = write;
                     return 1;
                 }
-                let flags =
-                    libc::O_WRONLY | if hot.flags & DIRECT != 0 { libc::O_DIRECT } else { 0 };
+                // Through the page cache, always ([`Uring::write_at`]): never `O_DIRECT`.
+                let flags = libc::O_WRONLY;
                 // An empty write only opens the file, which must be there.
                 let more = !buf.is_empty();
                 sqes[0] = open(name(0), flags, 0, slot, if more { SQE_IO_LINK } else { 0 }, ud(0));
@@ -997,37 +982,21 @@ impl Uring {
     }
 
     fn wrote_at(&mut self, id: Id, hot: Hot, results: [i32; LINKS]) -> Step {
-        if hot.phase == STATTING {
-            let res = results[0];
-            if res < 0 {
-                return self.failed_on(id, "opening", 0, res);
+        if hot.phase == CLOSING {
+            // Closed (or the close failed, and the request's end empties the slot as any
+            // other's does): only now is the write told. Until here the slot held the file
+            // open for writing, and an exec of it met `ETXTBSY`.
+            if results[0] >= 0 {
+                self.ops.cold_mut(id).opened[0] = false;
             }
-            let (at, len) = (self.ops.cold(id).at, self.ops.buf(id).len() as u64);
-            let statx = self.statx_of(id, &hot);
-            // `stx_dio_offset_align`, where the mask says it is filled in.
-            let align = u64::from(if word(&statx, 0) & STATX_DIOALIGN != 0 {
-                word(&statx, 156)
-            } else {
-                0
-            });
-            let hot = self.ops.get_mut(id).expect("in flight");
-            if align != 0 && DIRECT_PIECE as u64 % align == 0 && at % align == 0 && len % align == 0
-            {
-                hot.flags |= DIRECT;
-            }
-            hot.phase = OPENING;
-            return Step::Again;
+            return Step::Ends(Some(Done::Written));
         }
         if hot.phase == OPENING && !self.opened_slot(id, 0, results[0]) {
-            let what = match hot.flags & DIRECT {
-                0 => "opening",
-                _ => "opening, to bypass the page cache its file system says it takes,",
-            };
-            return self.failed_on(id, what, 0, results[0]);
+            return self.failed_on(id, "opening", 0, results[0]);
         }
         let len = self.ops.buf(id).len();
         if len == 0 {
-            return Step::Ends(Some(Done::Written));
+            return self.close_written(id);
         }
         let res = results[1];
         if res < 0 {
@@ -1036,10 +1005,24 @@ impl Uring {
         let put = self.progress(id, res);
         self.ops.get_mut(id).expect("in flight").phase = OPENED;
         match (put < len, res) {
-            (false, _) => Step::Ends(Some(Done::Written)),
+            (false, _) => self.close_written(id),
             (true, 0) => Step::Ends(failed(-libc::EIO)),
             (true, _) => Step::Again,
         }
+    }
+
+    /// The write at an offset `id` has written all of its bytes: its slot is emptied through
+    /// the ring before its completion is told ([`CLOSING`]). A file's writer hears `Written`
+    /// only once the driver holds the file open for writing no more, so what it does next
+    /// with the file (a rename onto an executable's path, then a run of it) never meets a
+    /// descriptor of the driver's own: an exec of a file open for writing is `ETXTBSY`. Told
+    /// as the write ended, with the close left to follow, a build script placed from its
+    /// maker's runs (a write a run) was run with slots still open, 3.4 to 4.1 s of retries a
+    /// run (2026-11-10).
+    fn close_written(&mut self, id: Id) -> Step {
+        let hot = self.ops.get_mut(id).expect("in flight");
+        hot.phase = CLOSING;
+        Step::Again
     }
 
     fn wrote(&mut self, id: Id, hot: Hot, results: [i32; LINKS]) -> Step {
@@ -1295,18 +1278,36 @@ impl Uring {
             }
             Err(error) => error.raw_os_error().unwrap_or(libc::EIO),
             Ok((true, _)) => {
-                /// `_IOW(0x94, 9, int)` of `linux/fs.h`.
-                const FICLONE: libc::c_ulong = 0x4004_9409;
                 // No io_uring op shares blocks: one `FICLONE` of the two files the ring opened,
-                // here.
-                // SAFETY: two open descriptors; the call reads the first's blocks into the
-                // second.
-                let cloned =
-                    unsafe { libc::ioctl(target.as_raw_fd(), FICLONE as _, source.as_raw_fd()) };
-                if cloned == 0 {
-                    return Step::Ends(Some(Done::Cloned));
-                }
-                io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)
+                // on a thread of its own, never here. The call waits for the device where the
+                // source has data not written back (a file system that shares blocks writes
+                // it out first): made on this thread, the daemon's loop, it held every
+                // request for 0.9 s and 1.4 s of one edit, in no span (strace, 2026-11-10).
+                // The request ends here with no completion of its own; the thread's is the
+                // effect's, taken in at a poll once it wakes the ring.
+                // alloc: clone: the two names, for the thread's span and its errors; once a clone
+                let from = self.name_of(id, 0).to_string_lossy().into_owned();
+                // alloc: clone: as above
+                let to = self.name_of(id, 1).to_string_lossy().into_owned();
+                // alloc: clone: the name of what the opens made, removed here if no thread starts
+                let unmade = to.clone();
+                let started = self.off_ring_with(hot.tag, move |_| {
+                    Ok(crate::lock::io_wait("clone", &from, || {
+                        share_blocks(&source, target, &from, &to)
+                    }))
+                });
+                return match started {
+                    Ok(()) => Step::Ends(None),
+                    Err(error) => {
+                        // The closure went with the thread that did not start, and the two
+                        // files with it: the empty file the open made is removed by name.
+                        _ = std::fs::remove_file(&unmade);
+                        // alloc: an error path.
+                        Step::Ends(Some(Done::Failed(IoError(format!(
+                            "{unmade}: starting the thread that clones it: {error}"
+                        )))))
+                    }
+                };
             }
         };
         drop((source, target));
@@ -1421,7 +1422,7 @@ impl Uring {
 
     /// What the request on a path `hot` held let go as it ends: its names, each slot its
     /// opens filled emptied through the ring (one not filled free again at once), its kept
-    /// file's use, the name a whole file's write makes another file, its registered buffer.
+    /// file's use, the name a whole file's write makes another file.
     pub(super) fn path_end(&mut self, hot: &Hot, mut cold: Cold) {
         self.paths.release(arena_of(hot));
         let mut freed = false;
@@ -1448,12 +1449,6 @@ impl Uring {
                     self.forget(&file);
                 }
             }
-            Kind::WriteAt => {
-                self.direct_writes += u64::from(hot.flags & DIRECT != 0 && hot.phase == OPENED);
-                if hot.buffer != ops::NO_BUFFER {
-                    self.unbuffer(hot.buffer);
-                }
-            }
             Kind::Load if hot.phase != QUEUED => {
                 // Its descriptor closed before the next read takes its room.
                 drop(cold.fds[0].take());
@@ -1462,4 +1457,33 @@ impl Uring {
             _ => {}
         }
     }
+}
+
+/// The `FICLONE` of [`Effect::Clone`], whose two files the ring opened, made on a thread off
+/// the ring ([`Uring::cloned`]): `target`, the new empty file at `to`, made to share
+/// `source`'s blocks. One that fails is removed, and the completion says why as the ring's
+/// own did: a file system that cannot share blocks is named with both volumes, and nothing
+/// copies instead.
+fn share_blocks(source: &File, target: OwnedFd, from: &str, to: &str) -> Done {
+    use std::os::fd::AsFd as _;
+    let Err(failed) = crate::raw::ficlone(target.as_fd(), source.as_fd()) else {
+        return Done::Cloned;
+    };
+    drop(target);
+    _ = std::fs::remove_file(to);
+    let code = failed.raw_os_error().unwrap_or(libc::EIO);
+    let why = match matches!(code, libc::EOPNOTSUPP | libc::EXDEV | libc::EINVAL) {
+        // alloc: an error path.
+        true => format!(
+            "the file system of {to} ({}) cannot share blocks with {from} ({}): {}; blaze does not copy \
+             instead",
+            crate::fs::volume_of(
+                std::path::Path::new(to).parent().unwrap_or(std::path::Path::new(to))
+            ),
+            crate::fs::volume_of(std::path::Path::new(from)),
+            error(-code)
+        ),
+        false => error(-code),
+    };
+    Done::Failed(IoError(why))
 }

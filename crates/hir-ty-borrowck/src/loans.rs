@@ -515,7 +515,9 @@ impl<'a> Loans<'a> {
             promoted: promoted_borrows(ctx, body, decoded),
         };
         let mut facts = Facts::with_capacity(frame, borrows.len() * 2);
-        let mut two_phase: FMap<'_, LocalId, usize> = mem::map(frame);
+        // The loans of each two-phase borrow, by the local it is assigned to: one, or one per
+        // field of a `#![blaze::views]` receiver, numbered one after another.
+        let mut two_phase: FMap<'_, LocalId, (usize, usize)> = mem::map(frame);
         let mut chain: FVec<'_, PlaceId> = Vec::new_in(frame);
         for borrow in borrows {
             let location = borrow.location;
@@ -538,25 +540,45 @@ impl<'a> Loans<'a> {
             }
             let two = matches!(kind, BorrowKind::Mut { kind: MutBorrowKind::TwoPhasedBorrow })
                 && borrow.assigned_whole;
-            let id = loans.loans.len();
-            if two {
-                two_phase.insert(borrow.assigned, id);
+            // `#![blaze::views]`: the receiver of a call of a method with a view is a loan of
+            // each field of the view, not of the whole place (`views::call_views`). One region
+            // holds them all, the reference's; a view of no fields makes no loan.
+            let view = if borrow.assigned_whole {
+                ctx.call_views.get(&location).copied()
+            } else {
+                None
+            };
+            let first = loans.loans.len();
+            for at in 0..view.map_or(1, <[_]>::len) {
+                let id = loans.loans.len();
+                let start = loans.projections.len() as u32;
+                loans.projections.extend_from_slice(projection);
+                loans.prefixes.extend_from_slice(prefixes);
+                if let Some(fields) = view {
+                    // The field's prefix is the place borrowed, the last of its chain.
+                    loans.projections.push(ProjectionElem::Field(fields[at]));
+                    loans.prefixes.push(chain[projection.len()]);
+                }
+                loans.loans.push(Loan {
+                    local: borrow.local,
+                    projection: (start, loans.projections.len() as u32),
+                    kind,
+                    region,
+                    location,
+                    span: borrow.span,
+                    assigned: borrow.assigned,
+                    activation: if two {
+                        Activation::NotActivated
+                    } else {
+                        Activation::NotTwoPhase
+                    },
+                });
+                facts.push(MADE_AT, cfg.point(location), id);
+                facts.push(OF_LOCAL, raw(borrow.local), id);
             }
-            let start = loans.projections.len() as u32;
-            loans.projections.extend_from_slice(projection);
-            loans.prefixes.extend_from_slice(prefixes);
-            loans.loans.push(Loan {
-                local: borrow.local,
-                projection: (start, loans.projections.len() as u32),
-                kind,
-                region,
-                location,
-                span: borrow.span,
-                assigned: borrow.assigned,
-                activation: if two { Activation::NotActivated } else { Activation::NotTwoPhase },
-            });
-            facts.push(MADE_AT, cfg.point(location), id);
-            facts.push(OF_LOCAL, raw(borrow.local), id);
+            if two && loans.loans.len() > first {
+                two_phase.insert(borrow.assigned, (first, loans.loans.len()));
+            }
         }
         if !two_phase.is_empty() {
             // A two-phase borrow is activated by the first use of the reference.
@@ -565,12 +587,14 @@ impl<'a> Loans<'a> {
                 for point in start..=cfg.block_end(body, block) {
                     let location = Location { block, statement: point - start };
                     for &used in decoded.two_phase.of(point) {
-                        if let Some(&id) = two_phase.get(&local(used))
-                            && loans.loans[id].activation == Activation::NotActivated
-                            && loans.loans[id].location != location
-                        {
-                            loans.loans[id].activation = Activation::At(location);
-                            facts.push(ACTIVATED_AT, point, id);
+                        let Some(&(first, end)) = two_phase.get(&local(used)) else { continue };
+                        for id in first..end {
+                            if loans.loans[id].activation == Activation::NotActivated
+                                && loans.loans[id].location != location
+                            {
+                                loans.loans[id].activation = Activation::At(location);
+                                facts.push(ACTIVATED_AT, point, id);
+                            }
                         }
                     }
                 }
@@ -635,9 +659,10 @@ impl<'a> Loans<'a> {
         &self.projections[start as usize..end as usize]
     }
 
-    /// The loan made at `point`, if one is.
-    fn made_at(&self, point: usize) -> Option<usize> {
-        self.index.get(MADE_AT, point).first().map(|&it| it as usize)
+    /// The loans made at `point`: one for a borrow, one per field for the receiver of a
+    /// method with a `#![blaze::views]` view, none elsewhere.
+    fn made_at(&self, point: usize) -> &'a [u32] {
+        self.index.get(MADE_AT, point)
     }
 
     /// The loans of a place of `local`, in the order they were made.
@@ -751,8 +776,8 @@ impl<'a> Loans<'a> {
         for &id in self.kills.get(KILLED_AT, point) {
             state.kill(id as usize);
         }
-        if let Some(id) = self.made_at(point) {
-            state.gen_(id);
+        for &id in self.made_at(point) {
+            state.gen_(id as usize);
         }
     }
 

@@ -17,9 +17,11 @@
 //!   stored one is the build's error, naming the body and the step.
 //!
 //! With no store installed for a database, every entry point is one load and a branch. A
-//! record that does not open under its key, a store that cannot be read, or two answers under
-//! one key of fact values is an error naming the body, reported by the next flush; the step
-//! is run then, which gives the same result. A miss is a miss.
+//! record that does not open under its key or a store that cannot be read is an error naming
+//! the body, reported by the next flush; the step is run then, which gives the same result. A
+//! step the flush cannot keep (two answers under one key of fact values, a record the store
+//! refuses) is named in what the flush did ([`Flushed::failure`]) and keeps no other step out.
+//! A miss is a miss.
 
 mod facts;
 mod infer;
@@ -56,7 +58,11 @@ pub(crate) use mir::built as built_mir;
 pub use mir::location_literals;
 pub use value::step_value;
 
-use crate::next_solver::goal_store::{FactRef, solver_version};
+use crate::next_solver::goal_store::{
+    FactRef,
+    slots::{self, Claimed},
+    solver_version,
+};
 use pending::{Counts, Offered, Pending, Tallies};
 use record::{AnswerKey, SLOTS, ShapeRef};
 
@@ -76,14 +82,19 @@ fn passed_schema(checker: &'static str) -> SchemaHash {
 }
 
 /// `schema` for an answer about a body of `def`'s crate, with the crate attributes that change
-/// what the body's MIR is: `#![blaze::early_drop]` drops a local whose destructor only frees
-/// memory after its last use (`hir_ty_mir::mir::early_drop`), so the built MIR and the borrow
-/// check's verdict differ. A crate without it keeps `schema` itself, so its keys are what they
-/// were. `edition-e2-handles-1109` adds the same function for `#![blaze::handles]`: one
-/// function, a part per attribute.
+/// what the body's MIR is, a part per attribute: `#![blaze::handles]` makes a move of a handle
+/// that is used again a copy (`hir_ty_mir::mir::handles`), and `#![blaze::early_drop]` drops a
+/// local whose destructor only frees memory after its last use (`hir_ty_mir::mir::early_drop`),
+/// so the built MIR and the borrow check's verdict differ. A crate with neither keeps `schema`
+/// itself, so its keys are what they were.
 fn with_crate_attrs(db: &Db, def: DefWithBodyId, schema: SchemaHash) -> SchemaHash {
     use hir_def::HasModule;
-    match hir_def::nameres::crate_def_map(db, def.krate(db)).early_drop() {
+    let def_map = hir_def::nameres::crate_def_map(db, def.krate(db));
+    let schema = match def_map.handles() {
+        true => schema_of(&[Part::Schema(schema), Part::Str("blaze::handles")]),
+        false => schema,
+    };
+    match def_map.early_drop() {
         true => schema_of(&[Part::Schema(schema), Part::Str("blaze::early_drop 1")]),
         false => schema,
     }
@@ -346,48 +357,31 @@ impl Store {
         }
     }
 
-    /// Writes one buffered step: its shape in the first slot that holds it or is free, then its
-    /// answer under the shape's key and the values its facts had.
-    fn write(&self, entry: &pending::Entry<'_>) -> Result<Wrote, String> {
+    /// Writes one buffered step: its shape in the first slot that holds it or is free
+    /// (`claimed`: what this flush placed in the slots of the step's base key before,
+    /// `goal_store::slots`), then its answer under the shape's key and the values its facts
+    /// had.
+    fn write<'a>(
+        &self,
+        entry: &pending::Entry<'a>,
+        claimed: &mut Claimed<'a, { SLOTS as usize }>,
+    ) -> Result<Wrote, String> {
         let (step, def) = (entry.step, entry.def);
         // alloc: error text
         let error = |doing: &str, why: String| {
             format!("the item store: {doing} the {} of {def:?}: {why}", what(step))
         };
-        let mut wrote = Wrote::Kept;
-        let mut slot = None;
-        for n in 0..SLOTS {
-            let shape_key = record::shape_key(&entry.base, n);
-            let at = record::shape_at(step, &shape_key);
-            match self.images.get(&at).map_err(|why| error("reading the shape of", why))? {
-                Some(kept) if kept.bytes() == entry.shape => {
-                    slot = Some(shape_key);
-                    break;
-                }
-                Some(_) => continue,
-                // alloc: the shape's bytes, once per step written
-                None => match self.images.put(at, entry.shape.to_vec()) {
-                    Ok(()) => {
-                        wrote = Wrote::Written;
-                        slot = Some(shape_key);
-                        break;
-                    }
-                    Err(why) => match self
-                        .images
-                        .get(&at)
-                        .map_err(|why| error("reading the shape of", why))?
-                    {
-                        Some(kept) if kept.bytes() == entry.shape => {
-                            slot = Some(shape_key);
-                            break;
-                        }
-                        Some(_) => continue,
-                        None => return Err(error("keeping the shape of", why)),
-                    },
-                },
-            }
-        }
-        let Some(shape_key) = slot else { return Ok(Wrote::SlotsFull) };
+        let placed = claimed
+            .claim(&*self.images, entry.shape, |n| {
+                record::shape_at(step, &record::shape_key(&entry.base, n))
+            })
+            .map_err(|slots::Refused { doing, why }| error(doing, why))?;
+        let Some(slots::Slot { n, written }) = placed else { return Ok(Wrote::SlotsFull) };
+        let wrote = match written {
+            true => Wrote::Written,
+            false => Wrote::Kept,
+        };
+        let shape_key = record::shape_key(&entry.base, n);
         let mut key = AnswerKey::new(&shape_key);
         for value in entry.values() {
             key.value(&value);
@@ -444,6 +438,12 @@ pub struct Flushed {
     pub unencodable: u64,
     /// Steps dropped as the buffer of their thread was full.
     pub dropped: u64,
+    /// Steps the store would not keep (a store that could not be read or refused a record, a
+    /// second answer under one key of fact values): each is a bug in a key or in the store,
+    /// and every other step of the flush was written all the same.
+    pub failed: usize,
+    /// Why the first of them, in the order the flush writes, was not kept, naming the body.
+    pub failure: Option<String>,
     /// What each step's lookups found and its offers met since the last flush, by [`Step`] as an
     /// index.
     pub steps: [StepCounts; 3],
@@ -704,10 +704,15 @@ impl Installed {
     }
 
     /// Writes every step offered since the last flush, on the store's threads
-    /// (`ImageStore::for_each`). The driver calls it where it flushes the goal store: after a
+    /// (`ImageStore::for_each`): the steps of one base key one after another, in an order that
+    /// is of their bytes alone, so two shapes of one base key (two bodies of one identity
+    /// whose steps read different facts) take two slots whichever thread offered them
+    /// (`goal_store::slots`). The driver calls it where it flushes the goal store: after a
     /// build's front-end work, with no query running. An error a lookup met since the last
-    /// flush, a store that will not keep a record, or a second answer under one key of fact
-    /// values (a read the identity and facts do not cover) is an error naming the body.
+    /// flush is an error naming the body. A step the store will not keep (a record it
+    /// refuses, a second answer under one key of fact values: a read the identity and facts
+    /// do not cover) is counted and named in [`Flushed::failed`] and [`Flushed::failure`],
+    /// and keeps no other step out: one record's refusal is not the loss of a build's.
     pub fn flush(&self) -> Result<Flushed, String> {
         let store = self.store();
         let (taken, tallies) = store.pending.take();
@@ -723,8 +728,17 @@ impl Installed {
         )]
         let results: Vec<std::sync::OnceLock<Result<Wrote, String>>> =
             entries.iter().map(|_| std::sync::OnceLock::new()).collect();
-        store.images.for_each(entries.len(), &|at| {
-            _ = results[at].set(store.write(&entries[at]));
+        let (order, runs) = slots::groups(
+            entries.len(),
+            |a, b| entries[a].cmp_bytes(&entries[b]),
+            |a, b| entries[a].base == entries[b].base,
+        );
+        store.images.for_each(runs.len(), &|run| {
+            let mut claimed = Claimed::new();
+            // clone: a range of two words
+            for &at in &order[runs[run].clone()] {
+                _ = results[at].set(store.write(&entries[at], &mut claimed));
+            }
         });
         let Tallies { refused, counts } = tallies;
         let Counts { unhashable, no_identity, unshareable, unencodable, dropped, steps } = counts;
@@ -738,14 +752,20 @@ impl Installed {
             steps,
             ..Flushed::default()
         };
-        for result in results {
-            let wrote = result.into_inner().unwrap_or_else(|| {
+        let mut results = results;
+        // In the order written, so the failure named is the same one whichever thread wrote it.
+        for at in order {
+            let wrote = results[at].take().unwrap_or_else(|| {
                 panic!("`ImageStore::for_each` did not run every task of an item store flush")
-            })?;
+            });
             match wrote {
-                Wrote::Written => flushed.written += 1,
-                Wrote::Kept => flushed.kept += 1,
-                Wrote::SlotsFull => flushed.slots_full += 1,
+                Ok(Wrote::Written) => flushed.written += 1,
+                Ok(Wrote::Kept) => flushed.kept += 1,
+                Ok(Wrote::SlotsFull) => flushed.slots_full += 1,
+                Err(why) => {
+                    flushed.failed += 1;
+                    flushed.failure.get_or_insert(why);
+                }
             }
         }
         Ok(flushed)

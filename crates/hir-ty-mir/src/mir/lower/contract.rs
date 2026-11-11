@@ -20,6 +20,10 @@
 //! - an `ensures` of a function with a `mut` parameter is refused: the clause would read the
 //!   parameter as the body left it, not as it was passed;
 //! - an `ensures` whose named return is not a plain binding (`-> ((a, b): T)`) is refused;
+//! - an `ensures` that moves out of the returned value, a parameter or a local of the body is
+//!   refused, naming what it moves: the clause runs before the caller gets the value, so it
+//!   reads it, by reference (`match &r { Ok(k) => .. }`); what the clause itself makes (the
+//!   value of a call, what a pattern binds out of it) is its own to move and drop;
 //! - a `become` in a function whose `ensures` is checked is refused: it leaves without a return;
 //! - a clause runs as the program's own code: `n + 1` is machine arithmetic that can overflow
 //!   (and panic in dev), where a proof reads it as an unbounded `int`.
@@ -128,6 +132,16 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                         );
                     };
                     self.set_binding_local(id, return_slot());
+                    // The group owns what its clauses bind (`Ok(k) =>`), so the body did not
+                    // pick them: each is declared where the clause binds it, as the bindings
+                    // of a `const { .. }` lowered in place are.
+                    for (binding, _) in store.bindings() {
+                        if store.binding_owner(binding) == Some(group)
+                            && self.local_of_binding(binding).is_none()
+                        {
+                            self.undeclared.insert(binding);
+                        }
+                    }
                     let Expr::Tuple { exprs } = store.expr(body) else {
                         implementation_error!("an `ensures` group of `{path}` is not a tuple");
                     };
@@ -194,14 +208,93 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         current: BasicBlockId,
     ) -> Result<'db, Option<BasicBlockId>> {
         let span = MirSpan::from(clause);
+        let before = (
+            self.building.blocks.len(),
+            self.block(current).statements.len(),
+            self.building.locals.len(),
+        );
         let scope = self.push_drop_scope();
-        let Some((holds, fails)) = self.lower_let_chain(clause, current, false)? else {
+        let lowered = self.lower_let_chain(clause, current, false)?;
+        if kind == SpecClauseKind::Ensures {
+            self.ensures_locals.push((before.2, self.building.locals.len()));
+            self.refuse_moves_out(func, clause, current, before.0, before.1)?;
+        }
+        let Some((holds, fails)) = lowered else {
             scope.pop_assume_dropped(self);
             return Ok(None);
         };
         let message = self.broken_message(func, kind, clause);
         self.abort_with(fails, &message, span)?;
         Ok(Some(scope.pop_and_drop(self, holds, span)))
+    }
+
+    /// An `ensures` reads what the function returns and what it was given: it runs before the
+    /// caller gets the value, so a clause that moved out of the return slot (`match r { Ok(k)
+    /// => .. }` of a `k` that is not `Copy`, `consume(r)`) would drop a part of it and hand
+    /// the caller the rest. Refused, naming what is moved; a clause moves only what it made
+    /// itself (`ensures_locals`). The statements looked at are the clause's: those of
+    /// `current` from `statements` on, and every block from `blocks` on. Lowering writes
+    /// `Copy` for every read and `mark_moves` says `Move` by the type alone, so a read of a
+    /// place whose type is not `Copy` is a move.
+    fn refuse_moves_out(
+        &mut self,
+        func: FunctionId,
+        clause: ExprId,
+        current: BasicBlockId,
+        blocks: usize,
+        statements: usize,
+    ) -> Result<'db, ()> {
+        let mut read = Vec::new_in(self.frame);
+        let mut note = |operand: &Operand| {
+            if let OperandKind::Copy(place) | OperandKind::Move(place) = &operand.kind {
+                // clone: a `StoredPlace` is a local and an interned projection handle
+                read.push(place.clone());
+            }
+        };
+        let own = framed::block_index(current);
+        for (index, block) in self.building.blocks.iter().enumerate() {
+            let from = match index {
+                index if index == own => statements,
+                index if index >= blocks => 0,
+                _ => continue,
+            };
+            for statement in &block.statements[from..] {
+                statement.kind.for_each_operand(&mut note);
+            }
+            if let Some(terminator) = &block.terminator {
+                terminator.kind.for_each_operand(&mut note);
+            }
+        }
+        for place in read {
+            let local = framed::local_index(place.local);
+            if self.ensures_locals.iter().any(|&(from, to)| (from..to).contains(&local)) {
+                continue;
+            }
+            let ty = self.place_ty(&place.as_ref());
+            if self.is_copy(ty) {
+                continue;
+            }
+            let path = self.fn_path(func);
+            let text = hir_def::expr_store::pretty::print_expr_hir(
+                self.db,
+                self.store,
+                self.store_owner,
+                clause,
+                self.edition(),
+            );
+            let named = self.store.bindings().find_map(|(binding, data)| {
+                (self.local_of_binding(binding) == Some(place.local)).then(|| data.name.as_str())
+            });
+            let what = match named {
+                Some(name) => format!("`{name}`"), // alloc: error path
+                None if place.local == return_slot() => "the value returned".to_owned(), // alloc: error path
+                None => "a value of the body".to_owned(), // alloc: error path
+            };
+            not_supported!(
+                "checking the `ensures` of `{path}` at run time: the clause `{text}` moves out                  of {what}, which is still used after the clause: read it by reference (`match                  &r {{ .. }}`, a `ref` binding, a method that takes `&self`)"
+            );
+        }
+        Ok(())
     }
 
     /// `block` ends in `panic_nounwind(message)`, which never returns and never unwinds.

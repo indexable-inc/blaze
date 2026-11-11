@@ -997,6 +997,31 @@ where
             .enter(|ecx| ecx.reflect_candidate_response(goal.param_env, answer, base))
     }
 
+    /// blaze: `U: UnionFrom<S>` holds when `U` is an error union and `S` one of its members or
+    /// a union of some of them ([`EvalCtxt::error_union_from`]). Any other self type fails
+    /// before any probe, whatever `S` is.
+    fn consider_builtin_error_union_from_candidate(
+        ecx: &mut EvalCtxt<'_, D>,
+        goal: Goal<I, Self>,
+    ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
+        use crate::solve::error_union::{UnionFrom, error_union_members};
+
+        if goal.predicate.polarity != ty::ClausePolarity::Positive {
+            return Err(NoSolution.into());
+        }
+        let Some(members) = error_union_members(ecx.cx(), goal.predicate.self_ty()) else {
+            return Err(NoSolution.into());
+        };
+        let source = goal.predicate.trait_ref.args.type_at(1);
+        ecx.probe_builtin_trait_candidate(BuiltinImplSource::Misc).enter(|ecx| {
+            let certainty = match ecx.error_union_from(goal.param_env, members, source)? {
+                UnionFrom::Holds(_) => Certainty::Yes,
+                UnionFrom::Ambiguous => Certainty::AMBIGUOUS,
+            };
+            ecx.evaluate_added_goals_and_make_canonical_response(certainty)
+        })
+    }
+
     fn consider_builtin_field_candidate(
         ecx: &mut EvalCtxt<'_, D>,
         goal: Goal<I, Self>,

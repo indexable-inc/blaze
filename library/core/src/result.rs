@@ -575,7 +575,10 @@ impl<T, E> Result<T, E> {
     /////////////////////////////////////////////////////////////////////////
     // Querying the contained values
     /////////////////////////////////////////////////////////////////////////
+}
 
+// blaze: an impl whose methods admit a `#[blaze::linear]` payload (library/UPSTREAM).
+impl<#[blaze::linear] T, #[blaze::linear] E> Result<T, E> {
     /// Returns `true` if the result is [`Ok`].
     ///
     /// # Examples
@@ -594,7 +597,9 @@ impl<T, E> Result<T, E> {
     pub const fn is_ok(&self) -> bool {
         matches!(*self, Ok(_))
     }
+}
 
+impl<T, E> Result<T, E> {
     /// Returns `true` if the result is [`Ok`] and the value inside of it matches a predicate.
     ///
     /// # Examples
@@ -628,7 +633,10 @@ impl<T, E> Result<T, E> {
             Ok(x) => f(x),
         }
     }
+}
 
+// blaze: an impl whose methods admit a `#[blaze::linear]` payload (library/UPSTREAM).
+impl<#[blaze::linear] T, #[blaze::linear] E> Result<T, E> {
     /// Returns `true` if the result is [`Err`].
     ///
     /// # Examples
@@ -647,7 +655,9 @@ impl<T, E> Result<T, E> {
     pub const fn is_err(&self) -> bool {
         !self.is_ok()
     }
+}
 
+impl<T, E> Result<T, E> {
     /// Returns `true` if the result is [`Err`] and the value inside of it matches a predicate.
     ///
     /// # Examples
@@ -687,7 +697,10 @@ impl<T, E> Result<T, E> {
     /////////////////////////////////////////////////////////////////////////
     // Adapter for each variant
     /////////////////////////////////////////////////////////////////////////
+}
 
+// blaze: an impl whose methods admit a `#[blaze::linear]` payload (library/UPSTREAM).
+impl<#[blaze::linear] T, E> Result<T, E> {
     /// Converts from `Result<T, E>` to [`Option<T>`].
     ///
     /// Converts `self` into an [`Option<T>`], consuming `self`,
@@ -716,7 +729,9 @@ impl<T, E> Result<T, E> {
             Err(_) => None,
         }
     }
+}
 
+impl<T, E> Result<T, E> {
     /// Converts from `Result<T, E>` to [`Option<E>`].
     ///
     /// Converts `self` into an [`Option<E>`], consuming `self`,
@@ -748,7 +763,10 @@ impl<T, E> Result<T, E> {
     /////////////////////////////////////////////////////////////////////////
     // Adapter for working with references
     /////////////////////////////////////////////////////////////////////////
+}
 
+// blaze: an impl whose methods admit a `#[blaze::linear]` payload (library/UPSTREAM).
+impl<#[blaze::linear] T, #[blaze::linear] E> Result<T, E> {
     /// Converts from `&Result<T, E>` to `Result<&T, &E>`.
     ///
     /// Produces a new `Result`, containing a reference
@@ -802,11 +820,16 @@ impl<T, E> Result<T, E> {
             Err(ref mut x) => Err(x),
         }
     }
+}
 
+impl<T, E> Result<T, E> {
     /////////////////////////////////////////////////////////////////////////
     // Transforming contained values
     /////////////////////////////////////////////////////////////////////////
+}
 
+// blaze: an impl whose methods admit a `#[blaze::linear]` payload (library/UPSTREAM).
+impl<#[blaze::linear] T, #[blaze::linear] E> Result<T, E> {
     /// Maps a `Result<T, E>` to `Result<U, E>` by applying a function to a
     /// contained [`Ok`] value, leaving an [`Err`] value untouched.
     ///
@@ -838,7 +861,9 @@ impl<T, E> Result<T, E> {
             Err(e) => Err(e),
         }
     }
+}
 
+impl<T, E> Result<T, E> {
     /// Returns the provided default (if [`Err`]), or
     /// applies a function to the contained value (if [`Ok`]).
     ///
@@ -936,7 +961,10 @@ impl<T, E> Result<T, E> {
             Err(_) => U::default(),
         }
     }
+}
 
+// blaze: an impl whose methods admit a `#[blaze::linear]` payload (library/UPSTREAM).
+impl<#[blaze::linear] T, #[blaze::linear] E> Result<T, E> {
     /// Maps a `Result<T, E>` to `Result<T, F>` by applying a function to a
     /// contained [`Err`] value, leaving an [`Ok`] value untouched.
     ///
@@ -967,7 +995,9 @@ impl<T, E> Result<T, E> {
             Err(e) => Err(op(e)),
         }
     }
+}
 
+impl<T, E> Result<T, E> {
     /// Calls a function with a reference to the contained value if [`Ok`].
     ///
     /// Returns the original result.
@@ -1128,7 +1158,10 @@ impl<T, E> Result<T, E> {
     /////////////////////////////////////////////////////////////////////////
     // Extract a value
     /////////////////////////////////////////////////////////////////////////
+}
 
+// blaze: an impl whose methods admit a `#[blaze::linear]` payload (library/UPSTREAM).
+impl<#[blaze::linear] T, E> Result<T, E> {
     /// Returns the contained [`Ok`] value, consuming the `self` value.
     ///
     /// Because this function may panic, its use is generally discouraged.
@@ -1232,7 +1265,9 @@ impl<T, E> Result<T, E> {
             Err(e) => unwrap_failed("called `Result::unwrap()` on an `Err` value", e),
         }
     }
+}
 
+impl<T, E> Result<T, E> {
     /// Returns the contained [`Ok`] value or a default
     ///
     /// Consumes the `self` argument then, if [`Ok`], returns the contained
@@ -1443,7 +1478,10 @@ impl<T, E> Result<T, E> {
             Err(e) => Err(e),
         }
     }
+}
 
+// blaze: an impl whose methods admit a `#[blaze::linear]` payload (library/UPSTREAM).
+impl<#[blaze::linear] T, #[blaze::linear] E> Result<T, E> {
     /// Calls `op` if the result is [`Ok`], otherwise returns the [`Err`] value of `self`.
     ///
     ///
@@ -1487,7 +1525,9 @@ impl<T, E> Result<T, E> {
             Err(e) => Err(e),
         }
     }
+}
 
+impl<T, E> Result<T, E> {
     /// Returns `res` if the result is [`Err`], otherwise returns the [`Ok`] value of `self`.
     ///
     /// Arguments passed to `or` are eagerly evaluated; if you are passing the
@@ -1529,7 +1569,10 @@ impl<T, E> Result<T, E> {
             Err(_) => res,
         }
     }
+}
 
+// blaze: an impl whose methods admit a `#[blaze::linear]` payload (library/UPSTREAM).
+impl<#[blaze::linear] T, #[blaze::linear] E> Result<T, E> {
     /// Calls `op` if the result is [`Err`], otherwise returns the [`Ok`] value of `self`.
     ///
     /// This function can be used for control flow based on result values.
@@ -1558,7 +1601,9 @@ impl<T, E> Result<T, E> {
             Err(e) => op(e),
         }
     }
+}
 
+impl<T, E> Result<T, E> {
     /// Returns the contained [`Ok`] value or a provided default.
     ///
     /// Arguments passed to `unwrap_or` are eagerly evaluated; if you are passing
@@ -1590,7 +1635,10 @@ impl<T, E> Result<T, E> {
             Err(_) => default,
         }
     }
+}
 
+// blaze: an impl whose methods admit a `#[blaze::linear]` payload (library/UPSTREAM).
+impl<#[blaze::linear] T, #[blaze::linear] E> Result<T, E> {
     /// Returns the contained [`Ok`] value or computes it from a closure.
     ///
     ///
@@ -1615,7 +1663,9 @@ impl<T, E> Result<T, E> {
             Err(e) => op(e),
         }
     }
+}
 
+impl<T, E> Result<T, E> {
     /// Returns the contained [`Ok`] value, consuming the `self` value,
     /// without checking that the value is not an [`Err`].
     ///
@@ -2168,7 +2218,8 @@ impl<T, E, V: FromIterator<T>> FromIterator<Result<T, E>> for Result<V, E> {
 
 #[unstable(feature = "try_trait_v2", issue = "84277", old_name = "try_trait")]
 #[rustc_const_unstable(feature = "const_try", issue = "74935")]
-const impl<T, E> ops::Try for Result<T, E> {
+// blaze: `?` admits a `#[blaze::linear]` payload (library/UPSTREAM).
+const impl<#[blaze::linear] T, E> ops::Try for Result<T, E> {
     type Output = T;
     type Residual = Result<!, E>;
 
@@ -2188,7 +2239,10 @@ const impl<T, E> ops::Try for Result<T, E> {
 
 #[unstable(feature = "try_trait_v2", issue = "84277", old_name = "try_trait")]
 #[rustc_const_unstable(feature = "const_try", issue = "74935")]
-const impl<T, E, F: [const] From<E>> ops::FromResidual<Result<!, E>> for Result<T, F> {
+// blaze: `?` admits a `#[blaze::linear]` payload (library/UPSTREAM).
+const impl<#[blaze::linear] T, E, F: [const] From<E>> ops::FromResidual<Result<!, E>>
+    for Result<T, F>
+{
     #[inline]
     #[track_caller]
     fn from_residual(residual: Result<!, E>) -> Self {
@@ -2200,7 +2254,10 @@ const impl<T, E, F: [const] From<E>> ops::FromResidual<Result<!, E>> for Result<
 #[diagnostic::do_not_recommend]
 #[unstable(feature = "try_trait_v2_yeet", issue = "96374")]
 #[rustc_const_unstable(feature = "const_try", issue = "74935")]
-const impl<T, E, F: [const] From<E>> ops::FromResidual<ops::Yeet<E>> for Result<T, F> {
+// blaze: `?` admits a `#[blaze::linear]` payload (library/UPSTREAM).
+const impl<#[blaze::linear] T, E, F: [const] From<E>> ops::FromResidual<ops::Yeet<E>>
+    for Result<T, F>
+{
     #[inline]
     fn from_residual(ops::Yeet(e): ops::Yeet<E>) -> Self {
         Err(From::from(e))

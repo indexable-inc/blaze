@@ -2,6 +2,7 @@
 //! pinned std's paths and signatures, on minicore, and build scripts using them.
 
 mod apply;
+mod capabilities;
 mod drop_effects;
 mod effects;
 mod facts;

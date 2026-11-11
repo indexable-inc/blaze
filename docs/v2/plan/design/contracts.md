@@ -239,8 +239,14 @@ How they are made:
     "`path` was called with its contract broken: requires `TEXT` (file:line:col)" and
     "`path` broke its contract: ensures `TEXT` on return (file:line:col)".
   - Refused, not skipped: an `ensures` check in a function with a `mut` parameter (the clause
-    would read the changed value), a named return that is a pattern, and `become` in a function
-    whose `ensures` is checked.
+    would read the changed value), a named return that is a pattern, `become` in a function
+    whose `ensures` is checked, and an `ensures` that moves out of the returned value, a
+    parameter or a local of the body (`match r { Ok(k) => .. }` of a `k` that is not `Copy`,
+    `consume(r)`): the clause runs before the caller gets the value, so it reads it by
+    reference (`match &r { Ok(k) => .. }`).
+  - What a clause's patterns bind (`Ok(k) =>`, `Some(left) =>`) are locals of the clause, live
+    for that clause at each way out; what the clause makes itself (the value of a call) is its
+    own to move and to drop.
   - Not built yet: the caller-side check (and so the caller's file and line), the `Debug` of
     the returned value, and spec arithmetic: a clause runs as machine arithmetic (`n + 1` can
     overflow), where a proof reads it as an unbounded `int`.

@@ -21,6 +21,7 @@ use blaze_core::lock::Lock;
 use crate::{
     Cancelled, Changed, Config, Cx, Database, DbError, Edge, Input, Mark, MemTree, Names as Lent,
     Query, QueryKey, QueryKind, Stored, Tree, kinds,
+    image::ImageMap,
     memo::MemoId,
     subtree::{Digest, Subtree, SubtreeKey},
     table::{Aligned, EdgeRecord},
@@ -576,11 +577,106 @@ fn a_cold_pack_mapped_across_a_settle_is_removed() {
     settle_with_a_cold_pack_in_flight(true);
 }
 
-/// One byte flipped in a group of a database section: each request reading a key whose memos
-/// it held fails naming the section and group, every time, and nothing is computed again; every
-/// other key is used from the image, the group is reported once, and no image is written
-/// without it. A group holding an input's path is read at start, so the database does not
-/// start, naming it.
+/// `bytes`, an image, written again with `section`'s bytes changed by `change`: every group's
+/// CRC is of the changed bytes, so it reads as an image a blaze with a bug wrote.
+fn rewritten(bytes: &[u8], section: SectionId, change: impl Fn(&mut Vec<u8>)) -> Vec<u8> {
+    let image = opened(bytes);
+    let mut builder = Builder::new();
+    for it in image.sections() {
+        let mut held = image.whole(it).expect("a group that passes its CRC").to_vec();
+        if it.id == section {
+            change(&mut held);
+        }
+        builder.add(it.id, it.schema, &held);
+    }
+    builder.finish().expect("a small image")
+}
+
+/// A database of a few keys, as an image.
+fn small_image() -> (Vec<u8>, Arc<MemTree>) {
+    let (db, tree) = setup();
+    let one = view(&db, &tree, &[("a", "abc"), ("b", "abcd")]);
+    double(&db, one, "a");
+    double(&db, one, "b");
+    (image_of(&db, Builder::new()).0, tree)
+}
+
+/// The invariant: a database restored from an image holds no record that names a memo, an
+/// edge or bytes of the blob the image lacks: each is refused as the image is opened, naming
+/// the section and the record, never met by the first request that reads it. An image the
+/// database wrote passes, and written again unchanged it still does.
+#[test]
+fn a_restored_image_names_only_what_it_holds() {
+    let (bytes, tree) = small_image();
+    let checked = Database::check_image(opened(&bytes)).expect("an image this blaze wrote");
+    assert!(checked.memos >= 2 && checked.keys >= 2 && checked.inputs >= 2, "{checked:?}");
+    let same = rewritten(&bytes, SectionId::DB_TABLE, |_| {});
+    assert_eq!(Database::check_image(opened(&same)), Ok(checked));
+    Database::open_image(config(&tree), opened(&same)).expect("it opens too");
+
+    // Each reference a record makes, pointed past what the image holds.
+    let plant = |section, at: usize, word: u64| {
+        rewritten(&bytes, section, |held| {
+            held[at..at + 8].copy_from_slice(&word.to_le_bytes());
+        })
+    };
+    let table = opened(&bytes)
+        .sections()
+        .iter()
+        .find(|it| it.id == SectionId::DB_TABLE)
+        .map(|it| opened(&bytes).whole(it).expect("the table").to_vec())
+        .expect("a table");
+    let slot = table.chunks(8).position(|it| it != [0; 8]).expect("a slot that names a memo");
+    let planted = [
+        (SectionId::DB_TABLE, slot * 8, checked.memos + 7, "the memo"),
+        // A memo's value, key bytes and edges; an input's path.
+        (SectionId::DB_MEMOS, 160, 1 << 40, "a value"),
+        (SectionId::DB_MEMOS, 176, 1 << 40, "key bytes"),
+        (SectionId::DB_MEMOS, 152, u64::MAX, "edges"),
+        (SectionId::DB_INPUTS, 48, 1 << 40, "a path"),
+    ];
+    for (section, at, word, what) in planted {
+        let bad = plant(section, at, word);
+        let refused = Database::check_image(opened(&bad)).expect_err(what);
+        assert!(
+            matches!(&refused, DbError::Dangling { section: found, .. } if *found == section),
+            "{what}: {refused}"
+        );
+        assert!(refused.to_string().contains(what), "{what}: {refused}");
+        // At the restore, before any request: the database does not open.
+        let restored = Database::open_image(config(&tree), opened(&bad));
+        assert_eq!(restored.err(), Some(refused), "{what}");
+    }
+}
+
+/// The control of `a_restored_image_names_only_what_it_holds`: with the check at open left
+/// out (the image map opened alone, as before 2026-11-11), a table slot naming a memo the
+/// image lacks is met only by the read that reaches it, as a panic.
+#[test]
+fn the_oracle_catches_a_table_slot_naming_a_memo_the_image_lacks() {
+    let (bytes, _) = small_image();
+    let memos = Database::check_image(opened(&bytes)).expect("a good image").memos;
+    let bad = rewritten(&bytes, SectionId::DB_TABLE, |held| {
+        for slot in held.chunks_mut(8).filter(|it| *it != [0; 8]) {
+            slot.copy_from_slice(&(memos + 7).to_le_bytes());
+        }
+    });
+    let unchecked = ImageMap::open(opened(&bad)).expect("its sections are whole records");
+    let met = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        unchecked.for_each_key(|_| {});
+    }));
+    assert!(met.is_err(), "unchecked, the slot is met at its first read");
+    assert!(
+        matches!(unchecked.check_references(), Err(DbError::Dangling { .. })),
+        "the check finds it"
+    );
+}
+
+/// One byte flipped in a group of the edges or the values: each request reading a key whose
+/// memos it held fails naming the section and group, every time, and nothing is computed again;
+/// every other key is used from the image, the group is reported once, and no image is written
+/// without it. A group of the table or the memo records, or one holding an input's path, is
+/// read at start, so the database does not start, naming it.
 #[test]
 fn a_corrupt_group_fails_the_keys_in_it() {
     const KEYS: usize = 300;
@@ -605,10 +701,14 @@ fn a_corrupt_group_fails_the_keys_in_it() {
             let mut started = match Database::open_image(config(&tree), image) {
                 Ok(started) => started,
                 Err(DbError::Corrupt(corrupt)) => {
-                    assert_eq!(
-                        (corrupt.section, corrupt.group),
-                        (SectionId::DB_BLOB, group),
-                        "only paths are read at start"
+                    // The table and the memo records are read whole as the image opens (its
+                    // references are checked then), and so are the inputs' paths in the blob.
+                    assert_eq!((corrupt.section, corrupt.group), (section.id, group));
+                    assert!(
+                        [SectionId::DB_TABLE, SectionId::DB_MEMOS, SectionId::DB_BLOB]
+                            .contains(&section.id),
+                        "{} is not read at start",
+                        section.id
                     );
                     continue;
                 }
@@ -680,7 +780,7 @@ fn a_corrupt_group_fails_the_keys_in_it() {
             tried += 1;
         }
     }
-    assert!(tried > 4 * 2, "every database section spans groups: {tried} tried");
+    assert!(tried > 2 * 2, "the edges and the values span groups: {tried} tried");
 }
 
 #[test]

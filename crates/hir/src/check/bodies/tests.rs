@@ -5,6 +5,138 @@ use hir_def::{DefWithBodyId, ModuleDefId, nameres::crate_def_map, signatures::Fu
 use hir_expand::fixture;
 
 use super::{Plan, Queue, Ran};
+
+/// Each run of [`super::body_check_clean`], by the database it ran in: what the tests count
+/// to say which bodies a build checked, a memo's verification counting for none.
+pub(super) static CHECKED: blaze_core::lock::Lock<Vec<(base_db::Nonce, DefWithBodyId)>> =
+    blaze_core::lock::Lock::new("test.hir.check.checked", Vec::new());
+
+/// The bodies whose check ran in `db` since the last take, in no order.
+fn take_checked(db: &Db) -> Vec<DefWithBodyId> {
+    let nonce = db.nonce_and_revision().0;
+    let mut checked = CHECKED.lock();
+    let mut own = Vec::new();
+    checked.retain(|&(of, def)| {
+        if of == nonce {
+            own.push(def);
+        }
+        of != nonce
+    });
+    own
+}
+
+/// A crate of `functions` clean functions, each calling the one before it, in two files:
+/// `edited` in `main.rs` among the first half, the rest in `rest.rs`.
+fn many(functions: usize) -> String {
+    let mut text = String::from("//- minicore: sized, copy\n//- /main.rs crate:main\nmod rest;\n");
+    text.push_str("pub fn edited() -> u32 { 1 }\n");
+    for at in 0..functions / 2 {
+        text.push_str(&format!("pub fn near{at}(x: u32) -> u32 {{ let _ = edited(); x }}\n"));
+    }
+    text.push_str("//- /rest.rs\n");
+    for at in 0..functions - functions / 2 {
+        text.push_str(&format!("pub fn far{at}(x: u32) -> u32 {{ let _ = super::edited(); x }}\n"));
+    }
+    text
+}
+
+/// `main.rs` of [`many`] with another body for `edited`, a line longer, so every function
+/// after it in the file moves.
+fn edited_main(functions: usize) -> String {
+    let mut text = String::from("mod rest;\npub fn edited() -> u32 {\n    let two = 2;\n    two\n}\n");
+    for at in 0..functions / 2 {
+        text.push_str(&format!("pub fn near{at}(x: u32) -> u32 {{ let _ = edited(); x }}\n"));
+    }
+    text
+}
+
+/// How many bodies' checks ran in a build of [`many`]`(functions)` after `edited`'s body
+/// changed, the build before it having checked every body. `kept` is whether the plans keep
+/// what they found clean ([`Plan::of_every_body`]); a plan that does not is the planted bug: a
+/// walk that asks every body.
+fn checked_after_an_edit(functions: usize, kept: bool) -> usize {
+    let fixture = fixture::db(&many(functions));
+    let main = fixture.file_at("/main.rs").file_id(fixture.db());
+    let mut db = fixture.into_db();
+    let run = |db: &Db| {
+        blaze_query::db::attach(db, || {
+            let krate = workspace_crates(db)[0];
+            let found = match kept {
+                true => Plan::of_every_body(db, &[krate]).run(db, false),
+                false => {
+                    // The planted bug: no memo is asked, so each task runs its body's check.
+                    let plan = Plan::new(db, &[krate], &every_body);
+                    let listed = plan.listed();
+                    let found = plan.run(db, false);
+                    let mut checked = CHECKED.lock();
+                    let nonce = db.nonce_and_revision().0;
+                    checked.extend(listed.into_iter().map(|def| (nonce, def)));
+                    found
+                }
+            };
+            assert!(found.iter().all(|it| it.is_empty()), "the fixture is clean: {found:?}");
+        });
+    };
+    run(&db);
+    let first = take_checked(&db).len();
+    assert!(first > functions, "the first build checks every body: {first} of {functions}");
+    db.set_file_text(main, &edited_main(functions));
+    run(&db);
+    take_checked(&db).len()
+}
+
+/// The invariant: after a body-only edit of one function of a crate, the bodies whose check
+/// runs again are bounded by a constant, whatever the crate's size: the edited body and the
+/// bodies that read what changed of it (none here: its signature is the same), never every
+/// body, nor every body of the edited file, which the edit moves.
+#[test]
+fn an_edit_of_one_body_checks_a_number_of_bodies_that_does_not_grow_with_the_crate() {
+    let small = checked_after_an_edit(20, true);
+    let large = checked_after_an_edit(200, true);
+    assert!(small >= 1, "the edited body is checked again");
+    assert!(small <= 2, "{small} bodies checked again for one edited body among 20");
+    assert_eq!(large, small, "the work of an edit is the same among 20 bodies and 200");
+}
+
+/// The control of
+/// [`an_edit_of_one_body_checks_a_number_of_bodies_that_does_not_grow_with_the_crate`]: a
+/// plan that asks every body (no memo: every task runs its check) is told from one that asks
+/// the edited one.
+#[test]
+fn the_oracle_catches_a_walk_that_asks_every_body() {
+    let small = checked_after_an_edit(20, false);
+    let large = checked_after_an_edit(200, false);
+    assert!(small > 20 && large > 200, "the planted walk checks every body: {small}, {large}");
+    assert_ne!(large, small, "the oracle tells a walk that grows with the crate");
+}
+
+/// What a plan that keeps its clean checks gives is what one that keeps none gives: the
+/// memos change which checks run, never a diagnostic, on a first build and on the one after
+/// an edit that fixes one body and breaks another.
+#[test]
+fn a_plan_that_keeps_clean_checks_gives_the_diagnostics_of_one_that_keeps_none() {
+    let fixture = fixture::db(BODIES);
+    let b = fixture.file_at("/b.rs").file_id(fixture.db());
+    let mut db = fixture.into_db();
+    let both = |db: &Db| {
+        blaze_query::db::attach(db, || {
+            let krate = workspace_crates(db)[0];
+            let kept = Plan::of_every_body(db, &[krate]).run(db, false).pop().unwrap_or_default();
+            let whole = Plan::new(db, &[krate], &every_body).run(db, false).pop().unwrap_or_default();
+            assert_eq!(format!("{kept:?}"), format!("{whole:?}"));
+            kinds(&kept)
+        })
+    };
+    let first = both(&db);
+    assert!(first.iter().filter(|it| *it == "TypeMismatch").count() >= 8, "{first:?}");
+    db.set_file_text(b, "pub fn h() {}\npub fn new() { let _: u8 = (); }\n");
+    let second = both(&db);
+    assert_eq!(
+        second.iter().filter(|it| *it == "TypeMismatch").count() + 1,
+        first.iter().filter(|it| *it == "TypeMismatch").count(),
+        "`h`'s two mismatches are gone and `new`'s one is there: {second:?}"
+    );
+}
 use crate::check::{check_module, every_body, file_modules, workspace_crates};
 
 /// Bodies at every level a check meets them: functions, a trait's required and provided

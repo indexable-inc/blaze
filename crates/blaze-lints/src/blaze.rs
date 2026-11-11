@@ -11,6 +11,7 @@
 
 mod alloc;
 mod arc_clone_only_borrowed;
+mod async_fn;
 mod blocking_in_async;
 mod blocking_on_pool;
 mod bool_param;
@@ -32,12 +33,15 @@ mod combined_identity;
 #[cfg(test)]
 mod correctness_general_tests;
 mod deep_drop_at_exit;
+mod default_policy;
 mod dispatch;
 mod dos_hasher_on_input;
 mod dropped_error;
 mod durable_write;
 mod dyn_fn_param;
 mod dyn_in_hot_field;
+#[cfg(test)]
+mod edition_tests;
 mod effects;
 #[cfg(test)]
 mod effects_tests;
@@ -57,6 +61,7 @@ mod fmt_allocates;
 mod front_vec_ops;
 mod frozen_collection;
 mod general_facts;
+mod global_state;
 mod goose_fields;
 mod goose_locals;
 #[cfg(test)]
@@ -76,8 +81,10 @@ mod lenient_deserialize_tests;
 mod lock_across_query;
 mod lock_held_across_slow;
 mod loops;
+mod lossy_as;
 mod many_bools;
 mod missing_size_hint;
+mod mut_ref;
 mod native_contracts;
 #[cfg(test)]
 mod opaque_tests;
@@ -110,6 +117,7 @@ mod seqcst_unexplained;
 mod shared_collection_lock;
 mod small_map;
 mod soa_candidate;
+mod span_field_unrecorded;
 mod stable_sort_needless;
 mod std_use;
 #[cfg(test)]
@@ -126,6 +134,7 @@ mod thread_local_tests;
 mod unbounded_from_input;
 mod unbounded_wait;
 mod unbuffered_io;
+mod unmarked_effects;
 mod unnamed_wait;
 mod unrecorded_span;
 mod untyped_error;
@@ -193,6 +202,7 @@ pub enum Lint {
     StructUpdate,
     BoolParam,
     ManyBools,
+    DefaultPolicy,
     SansIoCore,
     KeyIgnoresField,
     WildcardArm,
@@ -243,6 +253,7 @@ pub enum Lint {
     Noalloc,
     Nonblocking,
     Pure,
+    Capabilities,
     Packable,
     SoaCandidate,
     BorrowWorkaround,
@@ -251,6 +262,14 @@ pub enum Lint {
     ThreadLocalInWaitingFn,
     LenientDeserialize,
     LockHeldAcrossSlow,
+    LossyAs,
+    GlobalState,
+    AsyncFn,
+    UnmarkedPure,
+    UnmarkedNopanic,
+    UnmarkedNoalloc,
+    UnmarkedNonblocking,
+    MutRef,
     UndeclaredEffect,
     UnneededEffect,
     NegativeEffect,
@@ -265,6 +284,7 @@ pub enum Lint {
     ProgramLifetime,
     CouldBeProgramLifetime,
     CouldBeRef32,
+    SpanFieldUnrecorded,
 }
 
 /// Which workspaces a lint is for.
@@ -281,27 +301,28 @@ pub(crate) enum Kind {
     /// depends on) or it can't see whether the code is hot: allowed until a workspace or crate
     /// turns it, or the group `blaze::pedantic_perf`, on.
     PedanticPerf,
-    /// It flags what the blaze edition removes (docs/v2/plan/design/edition.md), here the code
-    /// blaze cannot analyse and what blaze's standard library replaces (`std_use`): the group
-    /// `blaze::edition`, allowed until a workspace or crate turns it on, but for a lint whose
-    /// advice this blaze already has ([`Lint::warns_by_default`]), which warns everywhere.
-    /// It asks for code written the way blaze's edition wants it (docs/v2/plan/design/edition.md):
-    /// allowed until a crate turns it, or the group `blaze::edition`, on; a check of what the
-    /// code declared (`program_lifetime`) is `deny` where it fires ([`DENY_BY_DEFAULT`]).
+    /// It flags what the blaze edition removes or respells, an effect it writes at a crate's
+    /// border that the code lacks, code blaze cannot analyse and what blaze's standard library
+    /// replaces (`std_use`), or asks for code written the way the edition wants it
+    /// (docs/v2/plan/design/edition.md): the group `blaze::edition`, allowed until a workspace
+    /// or crate turns it on to get ready for the edition, but for a lint whose advice this
+    /// blaze already has ([`Lint::warns_by_default`]), which warns everywhere; a check of what
+    /// the code declared (`program_lifetime`) is `deny` where it fires ([`DENY_BY_DEFAULT`]).
     Edition,
 }
 
 /// The lints that are `deny` by default rather than their kind's level: they fire only where
 /// the code asked for them (`#[blaze::checkfree]`, `#[blaze::nopanic]`, `#[blaze::noalloc]`,
-/// `#[blaze::nonblocking]`, `#[blaze::pure]`, and for `undeclared_effect` a `#[blaze::may(..)]`
-/// on the function, its trait or a module around it, or `#![blaze::effects]`), so a finding is
-/// a broken promise.
+/// `#[blaze::nonblocking]`, `#[blaze::pure]`, `#![blaze::capabilities]`, and for
+/// `undeclared_effect` a `#[blaze::may(..)]` on the function, its trait or a module around it,
+/// or `#![blaze::effects]`), so a finding is a broken promise.
 pub(crate) const DENY_BY_DEFAULT: &[Lint] = &[
     Lint::Checkfree,
     Lint::Nopanic,
     Lint::Noalloc,
     Lint::Nonblocking,
     Lint::Pure,
+    Lint::Capabilities,
     Lint::UndeclaredEffect,
     // Fires only on a type declared `#[blaze::program_lifetime]`.
     Lint::ProgramLifetime,
@@ -317,10 +338,20 @@ pub(crate) const EDITION_READY: &[(Lint, bool)] = &[
     (Lint::ProcMacroAttribute, ready::REFLECTION_REPLACES_MACROS),
     (Lint::ProcMacroFnLike, true),
     (Lint::BuildScriptAmbient, ready::CAPABILITIES_FOR_BUILD_SCRIPTS),
-    // Never by default, in any workspace: a crate asks for it (`#![blaze::capabilities]`), and
-    // blaze's own workspace does once bstd is in the tree (its manifest's `lints-when-ready`
-    // table and `ready::BSTD_IN_TREE`).
+    // Never by default, in any workspace: a crate asks for it (`#![blaze::capabilities]`), a
+    // workspace by its `lints-when-ready` table once `ready::BSTD_IN_TREE`, and blaze's own
+    // denies it in its `lints-ratchet` ahead of the switch.
     (Lint::StdUse, false),
+    // What the edition removes or respells, and the marks it writes: a workspace getting ready
+    // for the edition turns the group on.
+    (Lint::LossyAs, false),
+    (Lint::GlobalState, false),
+    (Lint::AsyncFn, false),
+    (Lint::UnmarkedPure, false),
+    (Lint::UnmarkedNopanic, false),
+    (Lint::UnmarkedNoalloc, false),
+    (Lint::UnmarkedNonblocking, false),
+    (Lint::MutRef, false),
 ];
 
 /// The group `blaze::proc_macro`: one lint per kind of procedural macro a workspace crate
@@ -409,6 +440,7 @@ impl Lint {
         Lint::StructUpdate,
         Lint::BoolParam,
         Lint::ManyBools,
+        Lint::DefaultPolicy,
         Lint::SansIoCore,
         Lint::KeyIgnoresField,
         Lint::WildcardArm,
@@ -459,6 +491,7 @@ impl Lint {
         Lint::Noalloc,
         Lint::Nonblocking,
         Lint::Pure,
+        Lint::Capabilities,
         Lint::Packable,
         Lint::SoaCandidate,
         Lint::BorrowWorkaround,
@@ -467,6 +500,14 @@ impl Lint {
         Lint::ThreadLocalInWaitingFn,
         Lint::LenientDeserialize,
         Lint::LockHeldAcrossSlow,
+        Lint::LossyAs,
+        Lint::GlobalState,
+        Lint::AsyncFn,
+        Lint::UnmarkedPure,
+        Lint::UnmarkedNopanic,
+        Lint::UnmarkedNoalloc,
+        Lint::UnmarkedNonblocking,
+        Lint::MutRef,
         Lint::UndeclaredEffect,
         Lint::UnneededEffect,
         Lint::NegativeEffect,
@@ -481,6 +522,7 @@ impl Lint {
         Lint::ProgramLifetime,
         Lint::CouldBeProgramLifetime,
         Lint::CouldBeRef32,
+        Lint::SpanFieldUnrecorded,
     ];
 
     /// Which workspaces the lint is for ([`Kind`]); written out per lint, so a new one chooses.
@@ -530,6 +572,8 @@ impl Lint {
             | Lint::Noalloc
             | Lint::Nonblocking
             | Lint::Pure
+            // Fires only in a crate with `#![blaze::capabilities]`, `deny` there.
+            | Lint::Capabilities
             // Its fix passes stable Rust's borrow checker too, so it is right for any crate.
             | Lint::BorrowWorkaround
             // Fires only in a crate with `#![feature(blaze_verify)]`.
@@ -544,6 +588,14 @@ impl Lint {
             Lint::DeepDropAtExit | Lint::PodSerializedByField | Lint::Packable | Lint::SoaCandidate => {
                 Kind::PedanticPerf
             }
+            // What the blaze edition removes or respells; right for any crate getting ready
+            // for it.
+            Lint::LossyAs | Lint::GlobalState | Lint::AsyncFn | Lint::MutRef => Kind::Edition,
+            // What the blaze edition writes at a crate's border: an effect the code already has.
+            Lint::UnmarkedPure
+            | Lint::UnmarkedNopanic
+            | Lint::UnmarkedNoalloc
+            | Lint::UnmarkedNonblocking => Kind::Edition,
             // Code blaze cannot analyse, which the blaze edition removes; right for any
             // workspace once the replacement exists ([`Lint::warns_by_default`]).
             Lint::ProcMacroDerive
@@ -592,6 +644,7 @@ impl Lint {
             | Lint::StructUpdate
             | Lint::BoolParam
             | Lint::ManyBools
+            | Lint::DefaultPolicy
             // Its fix passes only blaze's (and nightly Rust's) borrow checker: on in workspaces
             // that turn on `internal`, allowed in the rest, so a published crate keeps building
             // with stable Rust.
@@ -603,8 +656,10 @@ impl Lint {
             // deadline names its waker, and hashes become an identity only in `blaze_ids::keyed`.
             | Lint::DurableWrite
             | Lint::UnboundedWait
-            | Lint::CombinedIdentity => Kind::Internal,
-            | Lint::LenientDeserialize => Kind::Internal,
+            | Lint::CombinedIdentity
+            // Rule guard-the-cause for the profile: a span's field that reaches no column of
+            // `spans` (`blaze_profile::span::ad_hoc_fields`) is refused where it is written.
+            | Lint::SpanFieldUnrecorded => Kind::Internal,
             // docs/v2/plan/design/facts.md: the check of `#[blaze::program_lifetime]` and the
             // two lints that say where the attribute and `Ref32` would pay.
             Lint::ProgramLifetime | Lint::CouldBeProgramLifetime | Lint::CouldBeRef32 => {
@@ -661,6 +716,7 @@ impl Lint {
             Lint::StructUpdate => "struct_update",
             Lint::BoolParam => "bool_param",
             Lint::ManyBools => "many_bools",
+            Lint::DefaultPolicy => "default_policy",
             Lint::SansIoCore => "sans_io_core",
             Lint::KeyIgnoresField => "key_ignores_field",
             Lint::WildcardArm => "wildcard_arm",
@@ -711,6 +767,7 @@ impl Lint {
             Lint::Noalloc => "noalloc",
             Lint::Nonblocking => "nonblocking",
             Lint::Pure => "pure",
+            Lint::Capabilities => "capabilities",
             Lint::Packable => "packable",
             Lint::SoaCandidate => "soa_candidate",
             Lint::BorrowWorkaround => "borrow_workaround",
@@ -719,6 +776,14 @@ impl Lint {
             Lint::ThreadLocalInWaitingFn => "thread_local_in_waiting_fn",
             Lint::LenientDeserialize => "lenient_deserialize",
             Lint::LockHeldAcrossSlow => "lock_held_across_slow",
+            Lint::LossyAs => "lossy_as",
+            Lint::GlobalState => "global_state",
+            Lint::AsyncFn => "async_fn",
+            Lint::UnmarkedPure => "unmarked_pure",
+            Lint::UnmarkedNopanic => "unmarked_nopanic",
+            Lint::UnmarkedNoalloc => "unmarked_noalloc",
+            Lint::UnmarkedNonblocking => "unmarked_nonblocking",
+            Lint::MutRef => "mut_ref",
             Lint::UndeclaredEffect => "undeclared_effect",
             Lint::UnneededEffect => "unneeded_effect",
             Lint::NegativeEffect => "negative_effect",
@@ -733,6 +798,7 @@ impl Lint {
             Lint::ProgramLifetime => "program_lifetime",
             Lint::CouldBeProgramLifetime => "could_be_program_lifetime",
             Lint::CouldBeRef32 => "could_be_ref32",
+            Lint::SpanFieldUnrecorded => "span_field_unrecorded",
         }
     }
 
@@ -768,6 +834,7 @@ impl Lint {
             Lint::StructUpdate => concat!(docs!(), "#struct_update"),
             Lint::BoolParam => concat!(docs!(), "#bool_param"),
             Lint::ManyBools => concat!(docs!(), "#many_bools"),
+            Lint::DefaultPolicy => concat!(docs!(), "#default_policy"),
             Lint::SansIoCore => concat!(docs!(), "#sans_io_core"),
             Lint::KeyIgnoresField => concat!(docs!(), "#key_ignores_field"),
             Lint::WildcardArm => concat!(docs!(), "#wildcard_arm"),
@@ -818,6 +885,7 @@ impl Lint {
             Lint::Noalloc => concat!(general_docs!(), "#nopanic-noalloc-nonblocking"),
             Lint::Nonblocking => concat!(general_docs!(), "#nopanic-noalloc-nonblocking"),
             Lint::Pure => concat!(general_docs!(), "#pure"),
+            Lint::Capabilities => concat!(general_docs!(), "#capabilities"),
             Lint::Packable => concat!(general_docs!(), "#packable"),
             Lint::SoaCandidate => concat!(general_docs!(), "#soa_candidate"),
             Lint::BorrowWorkaround => concat!(general_docs!(), "#borrow_workaround"),
@@ -826,6 +894,14 @@ impl Lint {
             Lint::ThreadLocalInWaitingFn => concat!(docs!(), "#thread_local_in_waiting_fn"),
             Lint::LenientDeserialize => concat!(docs!(), "#lenient_deserialize"),
             Lint::LockHeldAcrossSlow => concat!(docs!(), "#lock_held_across_slow"),
+            Lint::LossyAs => concat!(general_docs!(), "#lossy_as"),
+            Lint::GlobalState => concat!(general_docs!(), "#global_state"),
+            Lint::AsyncFn => concat!(general_docs!(), "#async_fn"),
+            Lint::UnmarkedPure
+            | Lint::UnmarkedNopanic
+            | Lint::UnmarkedNoalloc
+            | Lint::UnmarkedNonblocking => concat!(general_docs!(), "#unmarked_pure-unmarked_nopanic-unmarked_noalloc-unmarked_nonblocking"),
+            Lint::MutRef => concat!(general_docs!(), "#mut_ref"),
             Lint::UndeclaredEffect | Lint::UnneededEffect | Lint::NegativeEffect => {
                 concat!(general_docs!(), "#undeclared_effect-unneeded_effect-negative_effect")
             }
@@ -840,6 +916,7 @@ impl Lint {
             Lint::ProgramLifetime | Lint::CouldBeProgramLifetime | Lint::CouldBeRef32 => {
                 concat!(general_docs!(), "#program_lifetime-could_be_program_lifetime-could_be_ref32")
             }
+            Lint::SpanFieldUnrecorded => concat!(docs!(), "#span_field_unrecorded"),
             Lint::FiberBoundary => {
                 "https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan.md"
             }
@@ -901,6 +978,7 @@ impl Lint {
             }
             Lint::NegativeEffect => {
                 "write what the function may do, `#[blaze::may(..)]`, in place of what it may not (`blaze check --fix` rewrites it)"
+            }
             Lint::DurableWrite => {
                 "take `Effect::WriteUnsynced` or `Effect::RenameUnsynced` where a build can make the data again and its reader checks it, or say what must survive a crash with `// durable: <why>` on its line or the line above"
             }
@@ -909,6 +987,9 @@ impl Lint {
             }
             Lint::CombinedIdentity => {
                 "keep the set in a `blaze_ids::keyed::Keyed` and take its root, or hash every entry with `blaze_ids::Hasher`; an XOR or a sum that makes no identity says so with `// identity: <why>` on its line or the line above"
+            }
+            Lint::SpanFieldUnrecorded => {
+                "name the field for the column it fills (`function` for what the span is of, `awaits` for what it waits for), say it in the span's name, write it as an event inside the span (every field of an event is a row of `event_fields`), or make the span a kind with typed fields in `blaze_profile::span`"
             }
             Lint::BlockingOnPool => {
                 "wait through the scheduler (`blaze_graph::sched::wait`, an `Event`, a `Wait::Key`), or move the blocking call to a driver thread"
@@ -939,6 +1020,9 @@ impl Lint {
             }
             Lint::ManyBools => {
                 "name the choices at the call: a record parameter with defaults (`#![blaze::records]`) or two-variant enums; or say why the call stays with `#[expect(blaze::many_bools, reason = \"..\")]`"
+            }
+            Lint::DefaultPolicy => {
+                "take the marked field as an argument of every constructor (a named `const` of the type is a value written at the call, not a default), or say why the type decides with `#[expect(blaze::default_policy, reason = \"..\")]`"
             }
             Lint::SansIoCore => {
                 "take what the call reads as a parameter (`advance_clock(now)`) and hand back decisions (`take_decisions`, `next_deadline`); a driver injects IO through a trait object or a type parameter the core takes. Or say why with `#[expect(blaze::sans_io_core, reason = \"..\")]`"
@@ -1084,6 +1168,9 @@ impl Lint {
             Lint::Pure => {
                 "read the outside world only through the arguments (pass the value in, take a type parameter for a `dyn` or a function pointer), mark a callee proven by hand `#[blaze::pure(trusted = \"why\")]`, or take `#[blaze::pure]` off"
             }
+            Lint::Capabilities => {
+                "take the IO, the allocator or the unsafe interface as an argument, list the crate that does it under `[workspace.metadata.blaze.trusted]` with an `owner` and a `reason`, or take `#![blaze::capabilities]` off"
+            }
             Lint::Packable => {
                 "mark it `#[blaze::bits]` to store its `bool`, enum and small-integer fields at their bit widths, after checking that nothing borrows a field (`&s.f`, `&mut s.f`): a packed field has no address; or say why with `#[expect(blaze::packable, reason = \"..\")]`"
             }
@@ -1107,6 +1194,30 @@ impl Lint {
             }
             Lint::DynInHotField => {
                 "take the implementation as a type parameter (`struct S<F: Fn(..)>`) so the call is direct and inlinable, which costs one copy of the code per type used; or say why with `#[expect(blaze::dyn_in_hot_field, reason = \"..\")]`"
+            }
+            Lint::LossyAs => {
+                "convert with `From` where it can't lose (`u64::from(x)`), `T::try_from(x)` where it can, or the method that names the loss (`cast_signed`, `cast_unsigned`, `wrapping_*`, `ptr.addr()`); or say why with `#[expect(blaze::lossy_as, reason = \"..\")]`"
+            }
+            Lint::GlobalState => {
+                "give the state one owner and pass it, or a handle to it, as a context to the code the finding lists as using it; or say why it stays global with `#[expect(blaze::global_state, reason = \"..\")]`"
+            }
+            Lint::AsyncFn => {
+                "write it as a plain function run on a fiber: a wait parks the fiber and the may-suspend effect is inferred, so neither `async` nor `.await` is written; or say why with `#[expect(blaze::async_fn, reason = \"..\")]`"
+            }
+            Lint::UnmarkedPure => {
+                "write `#[blaze::pure]` above the function (`blaze check --fix` does); or say why it stays unmarked with `#[expect(blaze::unmarked_pure, reason = \"..\")]`"
+            }
+            Lint::UnmarkedNopanic => {
+                "write `#[blaze::nopanic]` above the function (`blaze check --fix` does); or say why it stays unmarked with `#[expect(blaze::unmarked_nopanic, reason = \"..\")]`"
+            }
+            Lint::UnmarkedNoalloc => {
+                "write `#[blaze::noalloc]` above the function (`blaze check --fix` does); or say why it stays unmarked with `#[expect(blaze::unmarked_noalloc, reason = \"..\")]`"
+            }
+            Lint::UnmarkedNonblocking => {
+                "write `#[blaze::nonblocking]` above the function (`blaze check --fix` does); or say why it stays unmarked with `#[expect(blaze::unmarked_nonblocking, reason = \"..\")]`"
+            }
+            Lint::MutRef => {
+                "spell the unique reference `&uniq` (`ref uniq` in a binding), as `blaze check --fix` does; or say why with `#[expect(blaze::mut_ref, reason = \"..\")]`"
             }
             Lint::ProcMacroDerive => {
                 if ready::REFLECTION_REPLACES_MACROS {
@@ -1138,6 +1249,7 @@ impl Lint {
                 } else {
                     "nothing to change yet: what the finding names is of blaze's standard library (bstd, docs/v2/plan/design/std.md), which is not in this blaze; this lint is `allow` by default, a crate asks for it with `#![blaze::capabilities]`, and blaze's own workspace has it at `warn` once bstd is in the tree"
                 }
+            }
             Lint::ProgramLifetime => {
                 "a `#[blaze::program_lifetime]` type has no parameter and no `Drop`, holds only plain data, `&'static` references and other program-lifetime types, and is not `pub` unless its crate has `#![blaze::program_lifetime_api]`: change the field or take the attribute off"
             }
@@ -1205,6 +1317,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         lenient_deserialize::check(cx, adt);
         program_lifetime::check(cx, adt);
         could_be_program_lifetime::check(cx, adt);
+        default_policy::check_adt(cx, adt);
         intern_candidate::check(cx, adt);
         boxed_recursive_node::check(cx, adt);
     }
@@ -1216,6 +1329,26 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         profiled::check_fn(cx, f);
         native_contracts::check(cx, f);
         proc_macro::check(cx, f);
+        async_fn::check_fn(cx, f);
+    }
+    if matches!(node.kind(), syntax::SyntaxKind::BLOCK_EXPR | syntax::SyntaxKind::CLOSURE_EXPR) {
+        async_fn::check_expr(cx, node);
+    }
+    if matches!(
+        node.kind(),
+        syntax::SyntaxKind::REF_TYPE
+            | syntax::SyntaxKind::REF_EXPR
+            | syntax::SyntaxKind::SELF_PARAM
+            | syntax::SyntaxKind::IDENT_PAT
+            | syntax::SyntaxKind::REF_PAT
+    ) {
+        mut_ref::check(cx, node);
+    }
+    if let Some(item) = ast::Static::cast(node) {
+        global_state::check(cx, item);
+    }
+    if let Some(call) = ast::MacroCall::cast(node) {
+        global_state::check_thread_local(cx, call);
     }
     if let Some(item) = ast::Enum::cast(node) {
         large_move::check_enum(cx, item);
@@ -1236,6 +1369,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     }
     if let Some(item) = ast::Impl::cast(node) {
         missing_size_hint::check(cx, item);
+        default_policy::check_impl(cx, item);
     }
     if let Some(record) = ast::RecordExpr::cast(node) {
         struct_update::check(cx, record);
@@ -1256,6 +1390,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     }
     unrecorded_span::check(cx, node);
     std_use::check_declaration(cx, node);
+    span_field_unrecorded::check(cx, node);
     if node == cx.root() && cx.in_file() {
         error_debug::check(cx);
         dropped_error::check(cx);
@@ -1301,12 +1436,14 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         box_large_new::check(cx);
         checkfree::check(cx);
         effects::check(cx);
+        unmarked_effects::check(cx);
         may::check(cx);
         unbuffered_io::check(cx);
         stdout_lock_in_loop::check(cx);
         front_vec_ops::check(cx);
         fmt_allocates::check(cx);
         stable_sort_needless::check(cx);
+        lossy_as::check(cx);
         build_script_ambient::check(cx);
         std_use::check(cx);
         check_body(cx);

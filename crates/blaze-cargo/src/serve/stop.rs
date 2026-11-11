@@ -144,6 +144,7 @@ fn guard(pipe: std::fs::File, bound: Duration, pulse: &Pulse, over: &Receiver<()
             };
             let said = stalled(std::process::id(), &why);
             tracing::error!(target: "blaze", "{said}");
+            // logged: the event above
             eprintln!("{said}");
             signals::exit_now(Exit::StopStalled);
         }
@@ -187,6 +188,7 @@ fn watch_turns(
         if let Look::Stuck { for_ns, turns, .. } = look {
             let said = stuck(pid, for_ns, turns);
             tracing::error!(target: "blaze", "{said}");
+            // logged: the event above
             eprintln!("{said}");
         }
         let progress = Progress {
@@ -205,6 +207,7 @@ fn watch_turns(
             );
             let said = stuck_line(pid, &why);
             tracing::error!(target: "blaze", "{said}");
+            // logged: the event above
             eprintln!("{said}");
             signals::exit_now(Exit::LoopStalled);
         }
@@ -266,6 +269,7 @@ impl Stalls {
             if !self.unprobed {
                 self.unprobed = true;
                 tracing::error!(target: "blaze", "blaze serve: pid {pid}: {UNPROBED}");
+                // logged: the event above
                 eprintln!("blaze serve: pid {pid}: {UNPROBED}");
             }
             return;
@@ -331,6 +335,7 @@ fn said(pid: u32, stall: &Stall, now_ns: u64) {
         oldest_ns,
         "stall"
     );
+    // logged: the event above
     eprintln!("blaze serve: pid {pid} stall: {line}");
 }
 
@@ -365,6 +370,7 @@ impl Memory {
             if !self.unread {
                 self.unread = true;
                 tracing::error!(target: "blaze", "blaze serve: pid {pid}: {UNREAD}");
+                // logged: the event above
                 eprintln!("blaze serve: pid {pid}: {UNREAD}");
             }
             return;
@@ -400,6 +406,7 @@ impl Memory {
             target: "blaze",
             "blaze serve: pid {pid}{line}{footprint} bytes of {ceiling} bytes ({at} of {of} GiB)"
         );
+        // logged: the event above
         eprintln!("blaze serve: pid {pid}{line}{footprint} bytes of {ceiling} bytes ({at} of {of} GiB)");
     }
 }
@@ -420,6 +427,7 @@ fn passed(pid: u32, footprint: u64, ceiling: u64) -> ! {
         inside_within(WAITS_READ_AT_CEILING),
     );
     tracing::error!(target: "blaze", "{said}");
+    // logged: the event above
     eprintln!("{said}");
     signals::exit_now(Exit::MemoryCeiling);
 }
@@ -427,6 +435,7 @@ fn passed(pid: u32, footprint: u64, ceiling: u64) -> ! {
 /// Without its pipe the guard hears no stop: said, and the stop runs unbounded.
 fn unread(error: &std::io::Error) -> bool {
     tracing::error!(target: "blaze", "the stop's guard can't read its pipe, so no stop of this daemon is bounded: {error}");
+    // logged: the event above
     eprintln!(
         "blaze serve: the stop's guard can't read its pipe, so no stop of this daemon is bounded: {error}"
     );

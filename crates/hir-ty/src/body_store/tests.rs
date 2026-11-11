@@ -815,3 +815,184 @@ fn an_item_kept_by_one_solver_misses_after_a_solver_source_edit() {
         assert_eq!(s.installed.steps()[Step::Infer as usize].hits, hits as u64, "{what}");
     }
 }
+
+/// A store that shows a put only once its driver made it, as the daemon's does (blaze-cargo
+/// `serve/unit/deps.rs`, `Images`: every put of a flush is buffered until the flush has ended):
+/// a get reads what was committed, and a second put of a key with other bytes is refused
+/// whether the first was committed or not.
+struct Buffered {
+    kept: Memory,
+    puts: Lock<Vec<(ContentId, Vec<u8>)>>,
+}
+
+impl Default for Buffered {
+    fn default() -> Buffered {
+        Buffered {
+            kept: Memory::default(),
+            puts: Lock::new("test.ty.body_store.buffered", Vec::new()),
+        }
+    }
+}
+
+impl Buffered {
+    /// Makes every buffered put, as the driver does once the flush has ended.
+    fn commit(&self) {
+        for (key, bytes) in std::mem::take(&mut *self.puts.lock()) {
+            self.kept.put(key, bytes).expect("a buffered put is of a key the store lacks");
+        }
+    }
+}
+
+impl ImageStore for Buffered {
+    fn get(&self, key: &ContentId) -> Result<Option<ImageBuf>, String> {
+        self.kept.get(key)
+    }
+
+    fn put(&self, key: ContentId, value: Vec<u8>) -> Result<(), String> {
+        match self.kept.get(&key)? {
+            Some(kept) if kept.bytes() == value.as_slice() => return Ok(()),
+            Some(_) => return Err(format!("the store holds other bytes under {key:?}")),
+            None => {}
+        }
+        let mut puts = self.puts.lock();
+        match puts.iter().find(|it| it.0 == key) {
+            Some(put) if put.1 == value => {}
+            Some(_) => return Err(format!("two images were made under {key:?}")),
+            None => puts.push((key, value)),
+        }
+        Ok(())
+    }
+
+    fn reads_now(&self, _: &base_db::Env, _: &[u8]) -> Result<ContentId, String> {
+        Err(String::from("an item store reads no expansion"))
+    }
+}
+
+/// One flush of two steps of one base key whose shapes differ (two bodies alike enough to share
+/// an identity, each reading a fact the other does not), into a store that shows no put before
+/// its driver made it; then what the store holds, checked: `Err` says what the flush lost.
+///
+/// The steps are offered as a worker's offer buffers them, under a base key of the test's own.
+fn two_shapes_of_one_base_key_flushed_at_once() -> Result<(), String> {
+    let store = Arc::new(Buffered::default());
+    let db = db_of(FIXTURE);
+    let facts = Arc::new(TestFacts::new(&db, &Defs::default(), None));
+    let installed = install(&db, store.clone(), facts, BUILD, Mode::Serve).unwrap();
+    let def = function(&db, "plain");
+    let base = ContentId([3; 32]);
+    let fact = |subject: u8| FactRef {
+        kind: QueryKind(0x1803),
+        subject: ContentId([subject; 32]),
+        object: FactObject::None,
+    };
+    let offers: [(FactRef, ContentId, &[u8]); 2] =
+        [(fact(5), ContentId([6; 32]), b"one"), (fact(7), ContentId([8; 32]), b"two")];
+    let mut shapes = Vec::new();
+    for (fact, value, answer) in offers {
+        let mut shape = Vec::new();
+        record::write_shape(&mut shape, &base, &[fact]);
+        installed.store().pending.push(super::pending::Offered {
+            step: Step::Mir,
+            def,
+            base: &base,
+            shape: &shape,
+            values: &[value],
+            answer,
+        });
+        shapes.push((shape, value, answer));
+    }
+    let flushed = installed.flush().map_err(|why| format!("the flush stopped: {why}"))?;
+    if let Some(why) = &flushed.failure {
+        return Err(format!("{} of 2 steps were not kept: {why}", flushed.failed));
+    }
+    store.commit();
+    let mut taken = Vec::new();
+    for (shape, value, answer) in &shapes {
+        let slot = (0..record::SLOTS).find(|&n| {
+            let at = record::shape_at(Step::Mir, &record::shape_key(&base, n));
+            store.get(&at).unwrap().is_some_and(|kept| kept.bytes() == shape.as_slice())
+        });
+        let Some(n) = slot else {
+            return Err(format!("the shape of answer {answer:?} is in no slot"));
+        };
+        if taken.contains(&n) {
+            return Err(format!("two shapes in slot {n}"));
+        }
+        taken.push(n);
+        let mut key = AnswerKey::new(&record::shape_key(&base, n));
+        key.value(value);
+        let answer_key = key.finish();
+        let Some(kept) = store.get(&record::answer_at(Step::Mir, &answer_key)).unwrap() else {
+            return Err(format!("no answer {answer:?} under its shape's slot {n}"));
+        };
+        if record::open_answer(kept.bytes(), &answer_key)? != *answer {
+            return Err(format!("another answer than {answer:?} under its key"));
+        }
+    }
+    Ok(())
+}
+
+/// The invariant: every step a flush is given is kept, whatever else the same flush holds; two
+/// shapes of one base key take two slots, in a store that shows no put before its driver made
+/// it. Until 2026-11-10 the second shape was placed against the store alone, found slot 0
+/// free, and was refused by the put the first had buffered ("keeping the shape of the MIR of
+/// StaticId(..): two images were made under .."), which lost everything the build left for
+/// the store and its front end with it: every build of ripgrep, whose crates have statics and
+/// functions alike but for their names.
+#[test]
+fn a_flush_keeps_two_shapes_of_one_base_key() {
+    two_shapes_of_one_base_key_flushed_at_once().unwrap();
+}
+
+/// The control: a flush that forgets what it placed (`slots::FORGETFUL`) loses the second shape,
+/// and the oracle says so in the daemon's words.
+#[test]
+fn the_oracle_catches_a_flush_that_forgets_what_it_placed() {
+    use crate::next_solver::goal_store::slots::FORGETFUL;
+    FORGETFUL.set(true);
+    let lost = two_shapes_of_one_base_key_flushed_at_once();
+    FORGETFUL.set(false);
+    let why = lost.expect_err("the second shape of a base key is placed against the store alone");
+    assert!(
+        why.contains("1 of 2 steps were not kept")
+            && why.contains("keeping the shape of the MIR")
+            && why.contains("two images were made under"),
+        "{why}"
+    );
+}
+
+/// One step's refusal is not the flush's: a step whose answer the store refuses is named in
+/// what the flush did, and the step offered beside it is kept.
+#[test]
+fn a_step_the_store_refuses_keeps_no_other_step_out() {
+    let store = Arc::new(Buffered::default());
+    let db = db_of(FIXTURE);
+    let facts = Arc::new(TestFacts::new(&db, &Defs::default(), None));
+    let installed = install(&db, store.clone(), facts, BUILD, Mode::Serve).unwrap();
+    let def = function(&db, "plain");
+    let (clashing, other) = (ContentId([3; 32]), ContentId([4; 32]));
+    let value = ContentId([6; 32]);
+    // Two answers under one key of fact values, and one step of another base key.
+    let offers: [(ContentId, &[u8]); 3] = [(clashing, b"one"), (clashing, b"two"), (other, b"three")];
+    for (base, answer) in offers {
+        let mut shape = Vec::new();
+        record::write_shape(&mut shape, &base, &[IMPLS]);
+        installed.store().pending.push(super::pending::Offered {
+            step: Step::Infer,
+            def,
+            base: &base,
+            shape: &shape,
+            values: &[value],
+            answer,
+        });
+    }
+    let flushed = installed.flush().expect("a step's refusal stops no flush");
+    assert_eq!((flushed.written, flushed.failed), (2, 1), "{flushed:?}");
+    let why = flushed.failure.expect("the refusal is named");
+    assert!(why.contains("the answer of the inference of") && why.contains("FunctionId"), "{why}");
+    store.commit();
+    let mut key = AnswerKey::new(&record::shape_key(&other, 0));
+    key.value(&value);
+    let at = record::answer_at(Step::Infer, &key.finish());
+    assert!(store.get(&at).unwrap().is_some(), "the other step's answer is kept");
+}

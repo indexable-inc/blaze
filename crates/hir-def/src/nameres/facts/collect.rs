@@ -151,6 +151,33 @@ pub(crate) fn crate_data(db: &Db, krate: Crate) -> Arc<DefMapCrateData> {
             crate_data.arbitrary_ints = true;
             continue;
         }
+        // `#![blaze::handles]`: a handle that would be moved and is used again is copied
+        // (`DefMap::handles`, docs/v2/plan/design/edition.md, change 1).
+        if let [tool, name] = attr.path.segments()
+            && tool.symbol().as_str() == "blaze"
+            && name.symbol().as_str() == "handles"
+        {
+            crate_data.handles = true;
+            continue;
+        }
+        // `#![blaze::views]`: a receiver may name the fields it borrows, `&self.{a, b}`
+        // (`DefMap::views`, docs/v2/plan/design/edition.md, change 3).
+        if let [tool, name] = attr.path.segments()
+            && tool.symbol().as_str() == "blaze"
+            && name.symbol().as_str() == "views"
+        {
+            crate_data.views = true;
+            continue;
+        }
+        // `#![blaze::pattern_types]`: `T is PAT` types and variant refinements in this crate
+        // (`DefMap::pattern_types`, docs/v2/plan/design/edition.md, section 8).
+        if let [tool, name] = attr.path.segments()
+            && tool.symbol().as_str() == "blaze"
+            && name.symbol().as_str() == "pattern_types"
+        {
+            crate_data.pattern_types = true;
+            continue;
+        }
         // `#![blaze::simd]`: the pinned nightly's `core::simd` and blaze's additions to it
         // (`core::simd::native_lanes!`) need no `#![feature]` in this crate. The two library
         // features are entered as if written, so every stability check reads them as it reads
@@ -162,6 +189,8 @@ pub(crate) fn crate_data(db: &Db, krate: Crate) -> Arc<DefMapCrateData> {
             for feature in ["portable_simd", "blaze_simd"] {
                 crate_data.unstable_features.enable(Symbol::intern(feature));
             }
+            continue;
+        }
         // `#![blaze::early_drop]`: a local whose destructor only frees memory is dropped after
         // its last use (`DefMap::early_drop`, docs/v2/plan/design/early-drop.md).
         if let [tool, name] = attr.path.segments()
@@ -778,6 +807,14 @@ impl<'a, 'db, 'f> Sink<'db> for DeclSink<'a, 'db, 'f> {
         let db = self.cx.db;
         let own = HirFileId::from(call).original_file(db).file_id(db);
         let other_files = &mut self.other_files;
+        // The file an `include!` of the round-0 log parses is a file the log reads beside
+        // its own, as a macro's definition file is.
+        if let Some(included) = call.loc(db).include_file_id(db, call) {
+            let file = included.file_id(db);
+            if file != own && !other_files.contains(&file) {
+                other_files.push(file);
+            }
+        }
         definition_files(db, call, |file| {
             if file != own && !other_files.contains(&file) {
                 other_files.push(file);

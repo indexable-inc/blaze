@@ -75,17 +75,11 @@ pub(crate) const BLAZE_INTERNAL: On = blaze_kind(blaze::Kind::Internal);
 /// see whether the code is hot, allowed until a workspace or crate turns it on.
 pub(crate) const BLAZE_PEDANTIC_PERF: On = blaze_kind(blaze::Kind::PedanticPerf);
 
-/// The group `blaze::edition`: what the blaze edition removes, here the code blaze cannot
-/// analyse (`proc_macro_*`, `build_script_ambient`) and what blaze's standard library replaces
-/// (`std_use`), allowed until a workspace or crate turns
-/// it on, but for the lints whose advice this blaze already has
-/// ([`blaze::Lint::warns_by_default`]) (docs/v2/plan/design/edition.md).
-pub(crate) const BLAZE_EDITION: On = blaze_kind(blaze::Kind::Edition);
-
 /// The attribute a crate (or a module) opts in to capabilities with, after `blaze::`:
-/// `#![blaze::capabilities]` (docs/v2/plan/design/std.md, "The checks"). The effects it will
-/// turn into errors are not built; what it does today is ask for `blaze::std_use` at `warn`
-/// beneath it, as `#![warn(blaze::std_use)]` there would ([`capabilities_asks_for`]).
+/// `#![blaze::capabilities]` (docs/v2/plan/design/std.md, "The checks"). At a crate's root it
+/// makes the effects `ambient`, `unsafe` and `global_alloc` errors (`blaze::capabilities`,
+/// read from `AttrFlags::CAPABILITIES`); here it asks for `blaze::std_use` at `warn` beneath
+/// it, as `#![warn(blaze::std_use)]` there would ([`capabilities_asks_for`]).
 pub(crate) const CAPABILITIES: &str = "capabilities";
 
 /// What `#![blaze::capabilities]` sets to `warn` beneath it.
@@ -104,8 +98,13 @@ const BLAZE_PROC_MACRO: On = {
     }
     bits
 };
-/// The group `blaze::edition`: code written the way blaze's edition wants it
-/// (docs/v2/plan/design/edition.md), allowed until a crate turns it on.
+/// The group `blaze::edition`: what the blaze edition removes or respells (`lossy_as`,
+/// `global_state`, `async_fn`, `mut_ref`), what it writes at a crate's border (`unmarked_*`),
+/// the code blaze cannot analyse (`proc_macro_*`, `build_script_ambient`), what blaze's
+/// standard library replaces (`std_use`) and code written the way the edition wants it
+/// (`could_be_*`), allowed until a workspace or crate turns it on to get ready for the edition,
+/// but for the lints whose advice this blaze already has
+/// ([`blaze::Lint::warns_by_default`]) (docs/v2/plan/design/edition.md).
 pub(crate) const BLAZE_EDITION: On = blaze_kind(blaze::Kind::Edition);
 
 /// The lints `deny` by default ([`blaze::DENY_BY_DEFAULT`]), as a [`Target::Blaze`] has them.

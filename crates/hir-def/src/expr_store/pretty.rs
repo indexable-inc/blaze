@@ -337,10 +337,20 @@ pub fn print_function(
 }
 
 fn print_where_clauses(db: &Db, generic_params: &GenericParams, p: &mut Printer<'_>) {
-    if !generic_params.where_predicates.is_empty() {
+    if !generic_params.has_no_predicates() {
         w!(p, "\nwhere\n");
         p.indented(|p| {
+            // `where const { COND }` conditions first: they bound no type.
+            for (i, condition) in generic_params.where_consts.iter().enumerate() {
+                if i != 0 {
+                    w!(p, ",\n");
+                }
+                w!(p, "const ");
+                p.print_expr(condition.expr);
+            }
+            let after_conditions = !generic_params.where_consts.is_empty();
             for (i, pred) in generic_params.where_predicates.iter().enumerate() {
+                let i = i + usize::from(after_conditions);
                 if i != 0 {
                     w!(p, ",\n");
                 }
@@ -1430,6 +1440,14 @@ impl Printer<'_> {
                 self.print_type_ref(ty);
                 w!(self, " is ");
                 self.print_pat(pat);
+            }
+            TypeRef::Union(members) => {
+                for (i, member) in members.iter().enumerate() {
+                    if i != 0 {
+                        w!(self, " | ");
+                    }
+                    self.print_type_ref(*member);
+                }
             }
             TypeRef::Record { names, types, defaults } => {
                 // As written: `{ a: T, b: U = default }`, and `{}` for no field.

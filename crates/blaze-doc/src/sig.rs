@@ -155,6 +155,14 @@ impl<'a> Sig<'a> {
                     out.text(")");
                 }
             }
+            TypeRef::Union(members) => {
+                for (at, member) in members.iter().enumerate() {
+                    if at > 0 {
+                        out.text(" | ");
+                    }
+                    self.ty(out, *member);
+                }
+            }
             TypeRef::Record { names, types, defaults } => {
                 // blaze's record type (`#![blaze::records]`) as written; a default is `= ..`.
                 out.text("{");

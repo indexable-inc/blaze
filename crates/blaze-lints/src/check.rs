@@ -1015,6 +1015,15 @@ impl<'q: 't, 't> Cx<'q, 't> {
         self.range(node)
     }
 
+    /// Where `token`, of the tree walked or of an expansion, is written in the tree of
+    /// [`Cx::text`]; `None` for one a macro made up.
+    pub(crate) fn token_range(&self, token: ast::Token<'_>) -> Option<TextRange> {
+        match token.parent().and_then(|node| self.call_of(node)) {
+            None => Some(token.text_range()),
+            Some(call) => self.upmap(call, token.text_range()),
+        }
+    }
+
     /// The source of `node` as written in the file, or its text in the expansion it is in.
     pub(crate) fn source_of(&self, node: ast::Node<'t>) -> Cow<'t, str> {
         match self.range(node).and_then(|it| self.base.text.get(std::ops::Range::<usize>::from(it)))

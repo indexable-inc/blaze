@@ -1,8 +1,14 @@
 //! The parser's input from token trees, which are the tokens of a macro's input and output.
 //!
 //! One pass over the trees' columns ([`tt::TokenTreesView::for_each_token`]): no span is
-//! unpacked and no leaf decoded. An identifier's kind comes from a table by its symbol
-//! ([`Keywords`]), not from its text, and each context's edition is asked once a conversion.
+//! unpacked and no leaf decoded. Each token's word is marked with the syntax extensions of the
+//! crate whose source wrote it (its span's anchor file's, `span::EditionedFileId::extensions`),
+//! so every parse of a token tree (an expansion, a matcher's fragment, a builtin macro's
+//! argument) reads a token under its own crate's syntax, as it reads it in its own edition:
+//! a macro of a crate with `#![blaze::uniq]` keeps its `&uniq` wherever it is expanded, and
+//! what a crate without it passes to that macro stays Rust. An identifier's kind comes from a
+//! table by its symbol ([`Keywords`]), not from its text, and each context's edition is asked
+//! once a conversion.
 //! A token costs a few loads and one 4-byte word of [`parser::Input`]; a caller parsing many
 //! times (a macro's matcher, once a fragment) reuses one input with the `_into` functions.
 //! [`tree_words`] converts a whole tree once, into the words it keeps, so that any view of it is
@@ -12,7 +18,7 @@ use std::sync::LazyLock;
 
 use blaze_hash::HashMap;
 use intern::{Symbol, sym};
-use span::{Edition, SyntaxContext};
+use span::{Edition, Extensions, SyntaxContext};
 use std::alloc::Global;
 use syntax::{SyntaxKind, SyntaxKind::*, T};
 use tt::FlatToken;
@@ -65,7 +71,7 @@ fn convert<const FRAGMENTS: bool, F: FnMut(SyntaxContext) -> Edition + ?Sized>(
     res.clear();
     res.reserve(buffer.len());
     let mut conversion = Conversion::<FRAGMENTS, F>::new(span_to_edition, res, None);
-    buffer.for_each_token(|token, ctx| conversion.token(token, ctx));
+    buffer.for_each_token(|token, ctx, extensions| conversion.token(token, ctx, extensions));
     conversion.finish();
 }
 
@@ -83,9 +89,9 @@ pub fn tree_words<F: FnMut(SyntaxContext) -> Edition + ?Sized>(
     let mut fragment_starts = Vec::new();
     let slots = Slots { at: &mut at, fragment_starts: &mut fragment_starts, slot: 0, origin: 0 };
     let mut conversion = Conversion::<true, F>::new(span_to_edition, &mut res, Some(slots));
-    tree.for_each_slotted_token(|slot, token, ctx| {
+    tree.for_each_slotted_token(|slot, token, ctx, extensions| {
         conversion.at_slot(slot);
-        conversion.token(token, ctx);
+        conversion.token(token, ctx, extensions);
     });
     // alloc: the editions the words were made with, kept with them; a tree has a few contexts.
     let editions = conversion.finish().answers().collect();
@@ -102,6 +108,9 @@ pub fn tree_words<F: FnMut(SyntaxContext) -> Edition + ?Sized>(
 /// time): read in place when only the words' end padding follows the view's, as for a whole
 /// tree, otherwise copied into `copy`. They are [`to_matcher_input`]'s tokens of the view, or with
 /// `fragments` false [`to_parser_input`]'s, and nothing is converted.
+///
+/// The kept words hold their tokens' syntax extensions too, which are the tree's own (its
+/// spans' anchors'), so they stay a function of the tree and those editions.
 ///
 /// The kept words hold the editions their contexts were given when they were made. When
 /// `span_to_edition` gives any of those contexts another, the view alone is converted into
@@ -216,7 +225,15 @@ impl<'c, 'f, const FRAGMENTS: bool, F: FnMut(SyntaxContext) -> Edition + ?Sized>
         }
     }
 
-    fn token(&mut self, token: FlatToken, ctx: SyntaxContext) {
+    /// Converts `token`, of context `ctx`, written by a crate whose syntax extensions are
+    /// `extensions`: the words it makes are marked with them.
+    fn token(&mut self, token: FlatToken, ctx: SyntaxContext, extensions: Extensions) {
+        let from = self.res.len();
+        self.unmarked(token, ctx);
+        self.res.mark_extensions(from, extensions);
+    }
+
+    fn unmarked(&mut self, token: FlatToken, ctx: SyntaxContext) {
         self.start_fragment();
         let res = &mut *self.res;
         let editions = &mut self.editions;

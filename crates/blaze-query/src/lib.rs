@@ -92,6 +92,7 @@ use crate::{
     table::{Column, EdgeRecord, Edit, FxMap, FxSet, Map, Rows, ShortLock},
 };
 pub use crate::{
+    image::Checked,
     subtree::TreeHash,
     tree::{MemTree, Names, Tree},
 };
@@ -1071,6 +1072,17 @@ pub enum DbError {
         section: SectionId,
         what: &'static str,
     },
+    /// A record of a database section names another record, or bytes of the blob, that the
+    /// image does not hold (`image::ImageMap::check_references`): `record` of `section` names
+    /// `what` `names`, and the image holds `bound`. Its bytes passed their CRC, so they are
+    /// what was written: a writer's bug, or a write by another program.
+    Dangling {
+        section: SectionId,
+        record: u64,
+        what: &'static str,
+        names: u64,
+        bound: u64,
+    },
     /// The symbol table was not restored from this image (`intern::restore_symbols`), so a
     /// value naming a symbol by ID can't be read.
     Symbols,
@@ -1082,7 +1094,11 @@ impl DbError {
     pub fn is_image(&self) -> bool {
         matches!(
             self,
-            DbError::Refused(_) | DbError::Corrupt(_) | DbError::Invalid { .. } | DbError::Symbols
+            DbError::Refused(_)
+                | DbError::Corrupt(_)
+                | DbError::Invalid { .. }
+                | DbError::Dangling { .. }
+                | DbError::Symbols
         )
     }
 }
@@ -1096,6 +1112,12 @@ impl fmt::Display for DbError {
             DbError::Refused(refused) => write!(f, "the daemon image: {refused}"),
             DbError::Corrupt(corrupt) => write!(f, "the daemon image: {corrupt}"),
             DbError::Invalid { section, what } => write!(f, "the daemon image's {section}: {what}"),
+            DbError::Dangling { section, record, what, names, bound } => write!(
+                f,
+                "the daemon image's {section}: its record {record} names {what} {names}, and the \
+                 image holds {bound}: bytes that pass their checksum and are not what this blaze \
+                 writes (a bug in the blaze that wrote the image, or another program's write)"
+            ),
             DbError::Symbols => {
                 write!(f, "the symbol table was not restored from the daemon image")
             }
@@ -1684,10 +1706,25 @@ impl Database {
         Database::open_image(config, image)
     }
 
+    /// Checks the database's sections of `image` as a restore does and reads no memo's value:
+    /// the sections are this blaze's, whole records, and every record names only records and
+    /// bytes the image holds (`image::ImageMap::check_references`). For `blaze doctor`, which
+    /// checks every group's CRC itself (`Image::verify`); it needs no symbol table.
+    pub fn check_image(image: Arc<Image<Mapping>>) -> Result<Checked, DbError> {
+        ImageMap::open(image)?.check_references()
+    }
+
     /// [`Database::from_image_with`] with this process's symbol table as it is: for an image
     /// this process wrote (a settle), whose symbols are the ones it holds.
     fn open_image(config: Config, image: Arc<Image<Mapping>>) -> Result<Database, DbError> {
         let image = ImageMap::open(image)?;
+        {
+            // Named: it reads the table and the memo records whole, which a restore pays
+            // before its first answer (harness/v2/budgets.py `restart-first-answer-*`).
+            let _span =
+                tracing::info_span!(target: "blaze", "check the image's references").entered();
+            image.check_references()?;
+        }
         let inputs = image.inputs().map_err(DbError::Corrupt)?;
         let db = Database::blank(config);
         {

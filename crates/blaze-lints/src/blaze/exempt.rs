@@ -38,6 +38,8 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::SharedCollectionLock
         | Lint::OpenWaitLoop
         | Lint::UnrecordedSpan
+        // No comment makes the profile keep a field: the fix is the field's name.
+        | Lint::SpanFieldUnrecorded
         // Kept with `#[expect(blaze::fixed_key_lookup, reason = ..)]`: a table is a choice of
         // the item, not of one line.
         | Lint::FixedKeyLookup
@@ -46,6 +48,7 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::StructUpdate
         | Lint::BoolParam
         | Lint::ManyBools
+        | Lint::DefaultPolicy
         // Kept with `#[expect(..)]`: a core and a key are choices of the item, not of one line
         // (`key_ignores_field`'s `// not in key: <why>` names one field, through [`commented`]).
         | Lint::SansIoCore
@@ -111,6 +114,7 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::Noalloc
         | Lint::Nonblocking
         | Lint::Pure
+        | Lint::Capabilities
         // Kept by the list itself, or with `#[expect(..)]` on the function.
         | Lint::UndeclaredEffect
         | Lint::UnneededEffect
@@ -132,7 +136,21 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::StdUse
         // A hasher is chosen in the type, or kept with `#[expect(blaze::default_hasher, reason = ..)]`:
         // an allocation's comment says nothing about it.
-        | Lint::DefaultHasher => None,
+        | Lint::DefaultHasher
+        // The edition's lints name a construct the edition removes, not a cost on a line.
+        | Lint::LossyAs
+        | Lint::GlobalState
+        | Lint::AsyncFn
+        | Lint::MutRef
+        // Kept with `#[expect(..)]` on the function: a mark is the item's choice, not a line's.
+        | Lint::UnmarkedPure
+        | Lint::UnmarkedNopanic
+        | Lint::UnmarkedNoalloc
+        | Lint::UnmarkedNonblocking
+        // A type's declaration and where it is held: kept with `#[expect(..)]` on the item.
+        | Lint::ProgramLifetime
+        | Lint::CouldBeProgramLifetime
+        | Lint::CouldBeRef32 => None,
     }
 }
 

@@ -1,7 +1,7 @@
 ---
 status: plan
 summary: The store's hot tier as a vmcache-style buffer pool - one reserved range with a fixed slot per page of every store file, a state word per page (optimistic and pinned reads), misses as explicit reads around the page cache through blaze-core that the task yields on, immutable records written once through the pool, eviction by the one evictor (a second-chance sweep that takes a page read once first) with MADV_DONTNEED / MADV_FREE_REUSABLE, prefetch we plan ourselves (each view's recorded trace replayed in order and paced by its hits, then the change set's cone in the query graph), codegen outputs then memos then the image on it, a DST, and the lanes.
-date: 2026-11-09
+date: 2026-11-10
 ---
 # The store's buffer pool
 
@@ -25,9 +25,92 @@ Rashmi, "FIFO Queues are All You Need for Cache Eviction" (S3-FIFO, SOSP 2023), 
 prefetch and warm restarts, InnoDB's buffer pool dump and load and PostgreSQL's `pg_prewarm`
 autoprewarm.
 
+## As built (2026-11-10)
+
+Every read of a pack goes through the pool, and no pack is mapped. What is built, in the order a
+read meets it (branch all-1110; `crates/blaze-cas/src/hot.rs`, `read.rs`, `pool/`):
+
+- **A read pins.** `Look::pack_bytes` finds the record's place in the pool from the view
+  (`PackView::base`, the pool's byte the pack's first byte lives at, and `usable`, what is
+  committed) and pins the run of pages under it (`Side::pin`). The pins are kept by run in the
+  readers' table (`read::Owned::pins`, beside the values made whole), so the bytes an `Entry`
+  hands out stay as they are for as long as the task that read them runs, exactly as a value made
+  whole does, and no caller changed. A second read of a run the table holds touches no shared
+  word. A value held past its task (`Pinned`) holds pins of its own (`PinnedBytes::Pool`).
+- **The pinned bound.** Readers pin at most half of the pool's budget
+  (`pool::counts::pinned_bound`; 64 MiB at least, 1 GiB while no budget is set). The store lets
+  the table go once it pins a quarter of the bound (`Store::tidy`), and its pins go back when
+  every task that could have read from it has ended (the limbo's grace). A read that would pass
+  the bound waits, in a span (`store pool: pinned bound`) and through the one named wait, 50 ms
+  at a time for at most five seconds, for the store to free a table; then it fails with
+  `AtBound`, naming the bound. It never waits without end and never pins past the bound.
+- **A miss** is `Loader::Thread { root }` (the daemon): the pool's loader thread
+  (`pool/drive.rs`) reads on a native driver of its own over the same root, and the task waits
+  in the span `store pool load` (first page, pages, bytes; its time is the span's). Before it,
+  the reader makes room: when the load would take `Tag::Pool` past its budget it runs the sweep
+  (`Side::make_room`, `Sweep::make_room`, span `store pool evict`). So the pool's resident bytes
+  stay within the budget plus what is pinned (plus each pack's hot last page and the loads in
+  flight).
+- **`Loader::Pumped`** (every test on the simulation, `Driven`): the store has no thread and a
+  read can carry out no effect, so the store loads what each pack commits as the pack opens, a
+  stretch of 16 MiB at a time, as `ReadInto` effects its own driver completes
+  (`Hot::load_whole`), the way it asked for a mapping before; a stretch with a block that fails
+  its check is read again a page at a time, so only that page is refused. Nothing is given back
+  (`Store::evict_pool` is 0), and a read that finds a page not in memory is refused, naming why.
+- **Verification.** A load checks every block it read against the pack's `checks-<n>` before a
+  page is `Loaded`: on the first load of a record's pages and again on every load after an
+  eviction, never on a hit. BLAKE3 stays once per record per process (`Flag::Verified`, or the
+  spot's own flag), on the record's first read. A value kept in chunks (`chunk.rs`) is
+  hashed chunk by chunk, each chunk a record with its own content hash, so a large value's
+  first read after an eviction of some of its pages rehashes nothing: the reload's CRCs cover
+  it.
+- **The budget** is `Tag::Pool`'s, 16 parts in 64 of what the daemon runs under, set with every
+  other subsystem's by `blaze_graph::admission::set_budgets`. The pool reads it
+  (`pool::counts::budget`); it has no setting of its own.
+- **Counters** (`blaze_cas::pool_counts`, plotted by the daemon's breakdown beside
+  `blocks live bytes`): `pool resident bytes` (`Tag::Pool`'s live bytes, what the footprint
+  counts), `pool pinned bytes`, `pool loaded bytes`, `pool prefetched bytes`,
+  `pool evicted bytes`, `pool pinned bound waits`. `Store::pool_census` is one store's walk of
+  its state words.
+- **Prefetch.** `Reader::prefetch(guard, keys)` (and `Store::prefetch`) plans the runs of pages
+  the keys' records are in, neighbours merged, and hands them to the loads core as its plan:
+  one read a run of up to a megabyte, only while no demand load is in flight, charged to the
+  prefetch budget (an eighth of the pool's, and never more than the room left in it). Its call
+  site is codegen's: before a unit reads its functions' templates, with their keys.
+- **Retiring a pack.** A removed pack's pages go back, and its windows are free, once a view
+  without it is published and the tasks that began before have ended (`Hot::published`), and no
+  pin holds a page of it. Another writer's tier opened afresh opens beside the packs readers
+  still read of it (an opening number in the pack's id).
+- **The commit** was on the pool already; it no longer asks for a mapping after its head, so a
+  batch of packs alone makes its moves as the head is written.
+
+What still maps a store file, and why:
+
+- **The index slots** (`Index::mapping`): a probe reads 16 control bytes and a 64-byte row with
+  no pin, which wants the optimistic read (`Pool::read_optimistic`) and a checks file of the
+  slot's own; neither is wired.
+- **Files of their own** (`ExternalView::mapping`, 4 MiB and up): the format has no block
+  checks for them (`checks-<n>` is a pack's), so a reload could not be verified short of
+  hashing the whole file. They need a sidecar of checks, or to be written as chunks.
+- **A placement's check of a kept whole file** (`Op::Check`, one mapping, hashed and dropped).
+- The daemon image and the linker's inputs are not the store's hot tier, and are out of this
+  lane.
+
+What moving the mechanism into bstd (`file.pin`) needs: the pool's cores are already generic
+over what gives pages to and takes them from the kernel (`pool::Give`) and over the handle a
+guard reaches the pool through, and they emit `Effect::ReadInto` into registered spans; what is
+the store's own is the table from a file to its windows and the checks a load is verified by.
+So `file.pin(range) -> Pinned` needs (1) the window table keyed by a file's identity rather
+than a pack's number, with a file's length able to grow; (2) a per-file source of block checks
+(a sidecar, or none for a file the caller verifies itself, said in the type); (3) the loader's
+thread and its budget owned by the runtime, one per process, rather than one per store; and
+(4) the readers' table of pins (`read::Owned`) lifted out of the store, since its lifetime rule
+(pins live until the tasks that could have read them end) is the runtime's guard, not the
+store's.
+
 ## What it replaces, and why
 
-Today the store maps every file it reads in place. It maps each pack (`PackView::mapping`, `Pack::mapping`
+Before this, the store mapped every file it read in place. It maps each pack (`PackView::mapping`, `Pack::mapping`
 in `crates/blaze-cas/src/read.rs` and `lib.rs`), each index slot (`Index::mapping`), and each file of
 its own (`ExternalView::mapping`), all through `Effect::Map` and `crates/blaze-core/src/fs/mapped.rs`.
 Committed bytes wait in `Pack::memory` until a fresh mapping covers them, and the store maps a
@@ -824,10 +907,12 @@ Each lane is one pull request or a few, landed through `.github/scripts/land.py`
 it touches concurrent or durable code. Lanes 1 and 2 can run side by side. The rest are in order,
 except the lanes that are the pool's alone (4a and 6a), which need only lane 3.
 
-Where they stand (2026-11-10): lanes 1 and 2 are on main. Lanes 3, 4a and 6a are built on branch
-pool-finish-1109 and not yet on main. Of lane 4b, the checks sidecar and format 4 are built on
-branch fast-storepool-1110; the store's reads and its commit are not on the pool yet, and that
-is next. Lane 5 waits on 4b and on admission by footprint reaching main.
+Where they stand (2026-11-10): lanes 1 and 2 are on main. Lanes 3, 4a and 6a are built. Of lane
+4b, the packs are read through the pool and none is mapped (branch all-1110; "As built", above);
+the index slots and the files of their own still are. Of lane 5 the pool's own side is built
+(its budget, the sweep a load runs first, the counters); the plane's side waits on admission by
+footprint reaching main. Of lane 6b the hint (`Reader::prefetch`) is built; the trace is not
+kept as a record yet.
 
 1. **blaze-mem: giving back a sparse range.**
    - `Region::evict(&self, ranges)` for a sparse region, over `os::evict`: Linux
@@ -881,7 +966,22 @@ is next. Lane 5 waits on 4b and on admission by footprint reaching main.
      makes them the file's loaded pages (`Windows::grow`, `Loads::grow`, `Loader::grow`). An
      append given up gives its fresh pages back. The DST has the commit as an actor (append,
      `WriteFrom`, sync, then the flip, with crashes through it) and planted bug 8.
-   - **4b. The store's port.** Built in part on fast-storepool-1110; the reads are not.
+   - **4b. The store's port.** The packs' reads are built (2026-11-10, "As built" above), with
+     these differences from what was decided below, each for the reason given:
+     - *No `PinSet` argument and no `Pump` on a read.* `Reader::get` keeps its signature: its
+       pins live in the readers' table, freed by the same grace that frees a value made whole,
+       so no caller across the workspace changed and none can forget a pin.
+     - *A pumped store loads its packs as they open*, rather than pumping a miss where it is
+       read: a read through `&Store` or a `Reader` on another thread has no driver in hand.
+     - *The loader's thread holds the one loads core* of a store that has one; such a store's
+       commit pins the page its committed bytes end in through it, waiting in the load's span.
+     - *The short record's optimistic copy* (`COPY_MOST`) is not built: every record pins.
+     - Left: the index slots and files of their own on the pool (above); `Pack::memory`, the
+       drained bytes a commit writes, drained straight into the `Append`; `ReadError` as the
+       reads' error type (a failed load is reported as `Corrupt` naming the load's failure,
+       so a caller cannot yet tell a read that failed from bytes that are wrong); the
+       ceiling guard asking `Store::evict_pool`; the trace as a record.
+     What follows is the lane as it was planned and decided before that.
      - Built: `checks-<n>` and `FORMAT` 4 (`crates/blaze-cas/src/checks.rs`). A commit cuts each
        written pack's checks to those committed, writes the new blocks' checks and syncs them,
        after the pack's own sync and before the head; the open reads each pack's checks whole, refuses a file that holds fewer

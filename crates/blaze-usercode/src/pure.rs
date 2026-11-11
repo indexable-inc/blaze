@@ -198,6 +198,8 @@ pub const RUNTIME: &[&str] = &[
     "/nix/store",
     "/etc/ld.so.cache",
     "/etc/ld.so.preload",
+    // NixOS's glibc reads its preload list under this name.
+    "/etc/ld-nix.so.preload",
     "/etc/ld.so.conf",
     "/etc/ld.so.conf.d",
     "/proc/self",
@@ -220,6 +222,11 @@ pub type Read = Vec<(PathBuf, Option<[u8; 32]>)>;
 /// or an error naming the script and the first effect its proof said it never has. Called
 /// before anything is taken out of the trace (the run's own key's `keyed`), so it sees every
 /// read.
+///
+/// What the sandbox answered from the run's provider (`getrandom`, an open of
+/// `/dev/urandom`: docs/v2/plan/design/determinism.md, section C) is not in `traced` at all
+/// ([`crate::trace::answered`]): it was made of the run's key, so it is no effect the proof
+/// has to deny. What the sandbox could not answer still is one, and is refused here.
 pub fn check(
     script: &str,
     proof: &Proof,
@@ -233,10 +240,18 @@ pub fn check(
         ))
     };
     if let Some(it) = traced.untraceable.first() {
+        // Who read it, as the run's sandbox described the caller (`crate::calls`): the
+        // process, its program, the system call and where in the process it came from.
+        let who = crate::calls::said(
+            &crate::calls::of(places.program),
+            crate::trace::untraceable_name(*it),
+        );
         // alloc: error path
-        return Err(bug(format!(
-            "read what can't be traced ({it:?}), which its proof says it never does"
-        )));
+        let Error(what) = bug(format!(
+            "got what the sandbox could neither trace nor answer from its provider ({it:?}), which its proof says it never does"
+        ));
+        // alloc: error path
+        return Err(Error(format!("{what}{who}")));
     }
     if let Some((dir, _)) = traced.dirs.iter().find(|(dir, _)| !runtime(dir, places)) {
         // alloc: error path

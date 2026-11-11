@@ -367,6 +367,12 @@ impl Crate {
         self.id.data(db).edition
     }
 
+    /// The syntax extensions the crate turns on (`#![blaze::uniq]`): its files parse and print
+    /// under them ([`base_db::Crate::extensions`]).
+    pub fn extensions(self, db: &Db) -> span::Extensions {
+        self.id.extensions(db)
+    }
+
     pub fn version(self, db: &Db) -> Option<String> {
         // clone: editor edge, an owned string for display
         self.id.extra_data(db).version.clone()
@@ -6167,6 +6173,19 @@ impl<'db> Type<'db> {
         Type { owner: self.owner, ty: EarlyBinder::bind_no_rigid_aliases(ty) }
     }
 
+    /// Every numeric primitive type, the integers and the floats, each a type of the same
+    /// owner as `self`, so its methods are looked up from the crate `self` is of: the types a
+    /// number whose type is not decided yet (`{integer}`, `{float}`) can still become.
+    pub fn numeric_primitives(&self, db: &'db Db) -> Vec<Type<'db>> {
+        use hir_def::builtin_type::BuiltinType as Builtin;
+        let interner = DbInterner::new_no_crate(db);
+        Builtin::all_builtin_types()
+            .into_iter()
+            .filter(|(_, it)| matches!(it, Builtin::Int(_) | Builtin::Uint(_) | Builtin::Float(_)))
+            .map(|(_, it)| self.derived(Ty::from_builtin_type(interner, it)))
+            .collect() // alloc: an error's candidates, on the error path
+    }
+
     /// The type as the front end has it, for rustc's printing and checks outside `hir`.
     pub fn to_next_solver(&self) -> Ty<'db> {
         self.ty.skip_binder()
@@ -6633,6 +6652,8 @@ pub enum Adjust {
     /// Take the address and produce either a `&` or `*` pointer.
     Borrow(AutoBorrow),
     Pointer(PointerCast),
+    /// blaze: a member, or a union of some members, put in the error union that is the target.
+    ErrorUnion,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -6661,6 +6682,7 @@ impl From<hir_ty::Adjust> for Adjust {
                 Adjust::Borrow(AutoBorrow::Ref(hir_ty::hir_mutability(m.into())))
             }
             hir_ty::Adjust::Pointer(pc) => Adjust::Pointer(pc),
+            hir_ty::Adjust::ErrorUnion => Adjust::ErrorUnion,
         }
     }
 }

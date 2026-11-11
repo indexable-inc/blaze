@@ -1283,6 +1283,17 @@ impl<'db> ExprCollector<'db> {
                 let ty = self.lower_type_ref_opt(inner.ty(), impl_trait_lower_fn);
                 self.alloc_type_ref(TypeRef::UnsafeBinder { lifetimes, ty }, ptr)
             }
+            ast::Type::UnionType(inner) => {
+                let mark = self.store.list_mark();
+                for member in inner.types() {
+                    let ty = self.lower_type_ref(member, impl_trait_lower_fn);
+                    self.store.push_list_type(ty);
+                }
+                let id = self.with_lists(mark, |this, lists| {
+                    this.store.alloc_type_ref(TypeRef::Union(lists.types_since(mark)))
+                });
+                self.map_type_ref(id, ptr, false)
+            }
             // blaze's record type (`#![blaze::records]`): the fields as written, a field the
             // parser gave no name left out with its error. A visibility, an attribute or
             // `unsafe` on a field is the parser's error too.
@@ -1758,6 +1769,12 @@ impl<'db> ExprCollector<'db> {
                 this.collect_expr_opt(arg.and_then(|arg| arg.expr()))
             }),
         }
+    }
+
+    /// The block of a `where const { COND }` condition, as the root a const argument is: a
+    /// plain block of the signature's store (its `const` only marks the predicate).
+    pub(in crate::expr_store) fn lower_where_const(&mut self, block: ast::BlockExpr<'_>) -> ExprId {
+        self.with_fresh_binding_expr_root(|this| this.collect_block(block))
     }
 
     pub fn lower_const_arg(&mut self, arg: ast::ConstArg<'_>) -> ConstRef {
@@ -4085,6 +4102,22 @@ impl<'db> ExprCollector<'db> {
             }
             ast::Pat::MacroPat(pat) => {
                 self.collect_macro_pat_with(pat, |this, pat| this.collect_ty_pat(pat))
+            }
+            // blaze: a variant of an enum, `Conn is Conn::Open { .. }`
+            // (`#![blaze::pattern_types]`, docs/v2/plan/design/edition.md, section 8), lowered
+            // as the pattern it is in a body. The type lowering checks it names a variant of the
+            // base type and holds nothing but `_` and `..`, and refuses it without the gate.
+            ast::Pat::PathPat(_) | ast::Pat::TupleStructPat(_) | ast::Pat::RecordPat(_) => {
+                self.collect_pat(pat, &mut BindingList::default())
+            }
+            // A lone name, `E is A` after `use E::*`: always a path here, as a type's pattern
+            // binds nothing.
+            ast::Pat::IdentPat(bp)
+                if bp.mut_token().is_none() && bp.ref_token().is_none() && bp.pat().is_none() =>
+            {
+                let name = bp.name().map(|nr| nr.as_name()).unwrap_or_else(Name::missing);
+                let id = self.store.alloc_name_path_pat(name);
+                self.map_pat(id, ptr)
             }
             // rustc's "pattern not supported in pattern types": the type lowering reports
             // anything but a range, an or-pattern and `!null`; `Missing` is a parse error's.

@@ -936,7 +936,7 @@ impl<'f, 'db> MirLowerCtx<'_, 'f, 'db> {
     }
 
     /// The type of a place, normalized: the local of a `?` has the type `<R as Try>::Residual`.
-    fn place_ty(&self, place: &Place<'db>) -> Ty<'db> {
+    pub(super) fn place_ty(&self, place: &Place<'db>) -> Ty<'db> {
         let local = self.local(place.local).ty.as_ref();
         let ty = PlaceTy::from_ty(local)
             .multi_projection_ty(&self.infcx, self.env, place.projection.as_slice())

@@ -643,12 +643,12 @@ mod tests {
             });
             freed.wait();
             let before =
-                blaze_cargo::raw::memory::own_footprint().expect("the footprint is readable");
+                blaze_cargo::raw::memory::own_footprint_now().expect("the footprint is readable");
             blaze_mem::tag::give_back_heap();
             asked.wait();
             settled.wait();
             let after =
-                blaze_cargo::raw::memory::own_footprint().expect("the footprint is readable");
+                blaze_cargo::raw::memory::own_footprint_now().expect("the footprint is readable");
             let given = before.saturating_sub(after);
             assert!(
                 given >= (BLOCK * BLOCKS / 2) as u64,

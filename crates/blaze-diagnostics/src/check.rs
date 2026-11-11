@@ -69,7 +69,7 @@ fn breaks_items(found: &Found) -> bool {
 /// closing ones ("aborting due to ...", "For more information about this error, ...").
 pub fn check_crate(db: &Db, krate: hir::Crate, files: Files<'_>, options: &Options) -> Vec<Diag> {
     blaze_query::db::attach(db, || {
-        let plan = Plan::new(db, &[krate], &hir::check::every_body);
+        let plan = Plan::of_every_body(db, &[krate]);
         frame::task(Tag::Diagnostics, |frame| run(db, krate, files, options, &plan, frame).diags)
     })
 }

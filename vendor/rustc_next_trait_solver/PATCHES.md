@@ -215,6 +215,39 @@ Why: `for<F: Field<T>>` bounds are proven over the members of `T`, which only th
 enumerate. Made in `src/` by lane comptime-solver (2026-11-02) without a patch; recorded as one
 on 2026-11-03 (lane solverkey) so the series replays to `src/`.
 
+### 0015-error-union-builtins
+
+What: blaze's error unions (`#![blaze::error_unions]`, `A | B`) in the solver, in
+`src/solve/error_union.rs`: a builtin candidate for the lang item `ErrorUnionFrom` (core's
+`error_union::UnionFrom<S>`), trait and normalizes-to goals (`consider_builtin_error_union_from_candidate`
+on `GoalKind`; host-effect goals never hold). `U: UnionFrom<S>` holds when `U` is core's
+`ErrorUnion<(members..)>` and `S` is one of its members, or a union of a strict subset of them;
+the member is found by `DeepRejectCtxt` and then related, more than one possible member is
+ambiguous. Its `Path` is the member's index as nested one-tuples around `()`, or for a union
+source the tuple of its members' paths. Uses `rustc_type_ir`'s patch `0018-error-union-lang-items`.
+
+Why: which member of a union a type is cannot be written as impls (the members are a tuple in
+canonical order, and impls by position would overlap when two members unify), so only the solver
+can answer it; core's `Inject` impls over the paths then do the conversion as library code, and
+core's `From` over both is what `?` and coercion to a union use. Made by lane
+edition-e3-unions-1109 (2026-11-09).
+
+### 0016-where-const-condition
+
+What: `SolverDelegate::const_condition` (`src/delegate.rs`), re-declared on `EvalCtxt`
+(`src/solve/eval_ctxt/mod.rs`, whose `delegate` is private to it, as upstream re-declares the
+delegate's other methods), and `compute_const_evaluatable_goal` (`src/solve/mod.rs`), which now
+asks it: a `ConstEvaluatable` goal holds when the delegate says
+its constant is `true`, is `NoSolution` when it says `false`, and is ambiguous while it cannot
+say.
+
+Why: blaze lowers one predicate to that clause, `where const { COND }`
+(`#![feature(blaze_comptime)]`, docs/v2/plan/design/ownership.md), a `bool` constant over the
+generic parameters; rustc's goal only asked that the constant evaluate and never answered no.
+The condition is evaluated by hir-ty (`where_const::condition`), which also has the reason for
+the error. No `generic_const_exprs` program reaches the goal: blaze never built that feature's
+`ConstEvaluatable` bounds. Made by lane lang-int-1110 (2026-11-10).
+
 ## Dropped since the previous base (ra-ap-rustc_next_trait_solver 0.166.0, rustc `ce89c898`)
 
 - The backport of rust-lang/rust#161380 (a constant sends a goal back to the caller's typing

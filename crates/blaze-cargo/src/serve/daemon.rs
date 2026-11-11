@@ -88,6 +88,67 @@ const STILL_TIMER: Tag = Tag(OWN + 4);
 const DIAL: Tag = Tag(OWN + 6);
 const UNLINK: Tag = Tag(OWN + 7);
 const HANG_UP: Tag = Tag(OWN + 8);
+/// The longest one step of a loop turn may run in line before it is said ([`Stalled`]).
+const STEP_BOUND_NS: i64 = 20_000_000;
+
+/// The loop's own watchdog: each step of a turn after its wait is timed on the profile's
+/// clock, and one that ran longer than [`STEP_BOUND_NS`] is said as a span named `loop
+/// stalled` whose `function` is the step and how long it took. The loop thread serves every
+/// request, so 20 ms of one step is 20 ms every client waits; the budgets harness fails an
+/// edit whose build has such a row (harness/v2/budgets.py). The span is opened once the step
+/// has ended, so its own length is nothing: the time is in its `function`. The turn's wait
+/// (the driver's poll) is not a step: what a driver does in line there is held by
+/// harness/v2/loop_syscalls.py, which times the thread's system calls.
+struct Stalled {
+    step: &'static str,
+    began: i64,
+}
+
+impl Stalled {
+    fn begin(step: &'static str) -> Stalled {
+        Stalled { step, began: blaze_profile::clock::mono_ns() }
+    }
+
+    /// The step under way ended and `step` began.
+    fn next(&mut self, step: &'static str) {
+        let now = blaze_profile::clock::mono_ns();
+        self.say(now);
+        *self = Stalled { step, began: now };
+    }
+
+    fn end(self) {
+        self.say(blaze_profile::clock::mono_ns());
+    }
+
+    fn say(&self, now: i64) {
+        let Some(ms) = stalled_ms(self.began, now) else { return };
+        // alloc: once a step past its bound, the span's `function`
+        let function = format!("{}: {ms} ms", self.step);
+        // `held`: a held span is never folded. This one is opened once the step has ended, so
+        // it is shorter than any span the recorder writes a row for (`flight::FOLD_BELOW`), and
+        // folded it would be a count in `folded` with no `function`: the step's name gone, and
+        // no row of `spans` for the budgets harness to find.
+        tracing::info_span!(target: "blaze", "loop stalled", function = %function, held = true)
+            .in_scope(|| {});
+        // And a problem (`blaze explain problems`, `blaze slow`, `blaze why`): a step of the
+        // loop that ran this long held every client's answer that long.
+        tracing::warn!(
+            target: "blaze",
+            step = self.step,
+            ms,
+            "loop stalled: a step of the daemon's loop ran in line past {} ms",
+            STEP_BOUND_NS / 1_000_000
+        );
+    }
+}
+
+/// How many milliseconds a step from `began` to `now` ran, where that is past
+/// [`STEP_BOUND_NS`].
+fn stalled_ms(began: i64, now: i64) -> Option<i64> {
+    let ran = now.saturating_sub(began);
+    (ran > STEP_BOUND_NS).then_some(ran / 1_000_000)
+}
+
 /// A stall's trace, written once: the daemon stops after it.
 const STALL: Tag = Tag(OWN + 9);
 /// The image's placing (its clone, writes, sync and rename, one in flight at a time) and its
@@ -110,14 +171,37 @@ pub(super) const STOP_SETTLES_WITHIN: Duration = Duration::from_secs(30);
 /// How many quiet turns after the last request was read the work between requests waits for
 /// (the collections, the settle's image, whose making is a pass over the whole database on
 /// the loop's thread: 65 to 137 ms on a small program, 2026-11-10). A quiet turn took no
-/// completion with no plane task running: the loop's idle poll, 50 ms each, so about half a
-/// second. Counted in turns, not on the clock, so it is the same under the simulation, whose
+/// completion with no plane task running and no job under way ([`quiet_turns_after`]): the
+/// loop's idle poll, 50 ms each, so about half a second after the last answer. Counted in turns, not on the clock, so it is the same under the simulation, whose
 /// clock stands still while nothing is in flight. Requests come in runs (an edit, a build, a
 /// build again): a request read while that work ran waited behind it, 130 ms for an answer
 /// that takes 0.1 ms. The work is for the next start and for memory, never for a request, so
 /// it runs once the daemon has been quiet this long, and not at all while a request is read
 /// and held for its checkout's watcher.
 pub(super) const QUIET_BEFORE_BETWEEN: u32 = 10;
+
+/// [`Daemon::quiet_turns`] after a turn, from the count `before` it: none while a job is under
+/// way (`under_way`), one more for a turn that took no completion (`took`) with no plane task
+/// running (`running`), else as it was.
+///
+/// A job under way is not quiet, whatever its turns take: a build whose outputs were being
+/// placed turned with no completion and no plane task for its whole wait, so the count was
+/// past [`QUIET_BEFORE_BETWEEN`] the turn it was answered, and the image was made in the
+/// turns right after the answer (`image make` 91 ms on the loop), which is when the client
+/// that got the answer asks its next thing: its `why` waited 92 ms behind it (2026-11-11).
+/// Counted from the last answer, the image is made half a second after it.
+pub(super) const fn quiet_turns_after(
+    before: u32,
+    under_way: bool,
+    took: bool,
+    running: bool,
+) -> u32 {
+    match (under_way, took || running) {
+        (true, _) => 0,
+        (false, false) => before.saturating_add(1),
+        (false, true) => before,
+    }
+}
 /// How often the plane's and the memory's plots are written to the flight recorder, at most.
 const PLOT_EVERY: Duration = Duration::from_millis(10);
 /// How often the memory by tag goes to the log while the daemon works, at most.
@@ -373,6 +457,12 @@ pub struct Options {
     pub sources: FileName,
     /// The daemon as a writer of that store: one per state directory.
     pub writer: ContentId,
+    /// How its stores load the pages of their packs a read finds not in memory
+    /// ([`blaze_cas::Loader`]): by a thread of each store's own on the target's native
+    /// driver, over the root of the driver the daemon runs on (`blaze serve`); or, where the
+    /// daemon's driver is the simulation and its files are in no file system, as effects of
+    /// the store's that the daemon's driver completes.
+    pub store_loader: blaze_cas::Loader,
     /// The socket it listens on; `None` takes requests from this process alone
     /// ([`Daemon::connect_local`]): the seed's one-shot build ([`super::once`]).
     pub socket: Option<FileName>,
@@ -527,9 +617,9 @@ pub struct Daemon<D: Driver, S: Steps> {
     /// Each request read and not yet told it is done, with its `request: read to reply` span
     /// ([`Daemon::arrive`], [`Daemon::reply`]); a connection's go as it ends.
     answering: Vec<(RequestRef, tracing::Span)>,
-    /// How many turns in a row, since a request was last read, took no completion with no
-    /// plane task running: the work between requests waits for [`QUIET_BEFORE_BETWEEN`] of
-    /// them ([`Daemon::between`]).
+    /// How many turns in a row, since a request was last read and since a job was last under
+    /// way, took no completion with no plane task running ([`quiet_turns_after`]): the work
+    /// between requests waits for [`QUIET_BEFORE_BETWEEN`] of them ([`Daemon::between`]).
     quiet_turns: u32,
     failed: Option<Failed>,
     /// Its place in the machine's memory ledger ([`Options::machine`]); held so it leaves as the
@@ -935,8 +1025,9 @@ pub(super) fn log_memory(memory: &blaze_mem::tag::Snapshot) {
     let chunks = blaze_mem::chunks::cached();
     let stacks = blaze_query::db::stack_high_water();
     let said = MemoryLine { memory, blocks: &blocks, resident, heap, chunks, stacks }.to_string(); // alloc: one line each MEMORY_LOG_EVERY and at stop
+    // logged: the info event below
     eprintln!("blaze serve: {said}");
-    tracing::info!("{said}");
+    tracing::info!(target: "blaze", "{said}");
 }
 
 /// Why a start's database is empty.
@@ -995,7 +1086,11 @@ impl From<String> for StartError {
 impl fmt::Display for StartError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            StartError::Image { file, fault } => write!(f, "the daemon image /{file}: {fault}"),
+            StartError::Image { file, fault } => write!(
+                f,
+                "the daemon image /{file}: {fault}; nothing of it is used and the daemon does \
+                 not start: `blaze doctor` checks it and prints the command that sets it aside"
+            ),
             StartError::Other(what) => f.write_str(what),
         }
     }
@@ -1232,7 +1327,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 layers: Vec::new(),
                 tags: STORE,
                 load_tags: LOADS,
-                loader: blaze_cas::Loader::Thread,
+                // clone: once per daemon started, a path
+                loader: options.store_loader.clone(),
             };
         let mut store = Store::open(store_config, &mut effects);
         store.encode_columns(blaze_format::Spans::columns());
@@ -1242,7 +1338,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             writer: options.writer,
             tags: STD_STORE,
             load_tags: STD_LOADS,
-            loader: blaze_cas::Loader::Thread,
+            // clone: once per daemon started, a path
+            loader: options.store_loader.clone(),
         };
         let mut std = Store::open_shared(shared, &mut effects);
         let mut read =
@@ -1398,6 +1495,13 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 };
                 match Database::from_image_with(config.clone(), opened) {
                     Ok(db) => {
+                        // What a key no database gave names as its first suspect
+                        // (`blaze_query::db::NeverGiven`), with `blaze doctor` to check it.
+                        blaze_query::db::note_restored(blaze_query::db::RestoredFrom {
+                            file: format!("/{image}"), // alloc: once a start
+                            format: blaze_image::LAYOUT.0.to_string(), // alloc: once a start
+                            hash: restored.hash.to_string(), // alloc: once a start
+                        });
                         started.restored = Some(restored);
                         db
                     }
@@ -1941,8 +2045,15 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     /// everything it calls to that (docs/v2/plan/design/effects.md): `blaze check` refuses a
     /// blocking call under it, naming the chain. A call proven not to wait is marked
     /// `#[blaze::nonblocking(trusted = "why")]` where it is defined, never allowed here.
-    #[blaze::nonblocking]
+    ///
+    /// Off for one release (2026-11-10): the released blaze (stage 0, 0.20261105.4) takes
+    /// `blaze_ids::Idx<T>`'s `PhantomData<fn() -> T>` for a function pointer it cannot see
+    /// through and refuses this function; the checker is fixed in 02b092913b. Put the attribute
+    /// back when `.github/blaze-version` names a blaze with that fix. Until then the loop is
+    /// held at run time by the `loop stalled` span (`Stalled`) and harness/v2/loop_syscalls.py.
+    // #[blaze::nonblocking]
     fn turn_after_wait(&mut self, mut done: Vec<Completion>) -> bool {
+        let mut step = Stalled::begin("completions");
         for completion in &done {
             self.ended(completion);
         }
@@ -1952,9 +2063,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         // Each part of a turn that has a span is a child of it, so a long turn names what it
         // was inside (slow-is-p0-traced); an idle turn opens none.
         let spanned = _span.is_some();
-        if done.is_empty() && self.plane.running() == 0 {
-            self.quiet_turns = self.quiet_turns.saturating_add(1);
-        }
+        self.quiet_turns = quiet_turns_after(
+            self.quiet_turns,
+            !self.jobs.idle(),
+            !done.is_empty(),
+            self.plane.running() != 0,
+        );
         let part = spanned.then(|| {
             tracing::info_span!(target: "blaze", "loop turn: completions", count = done.len())
                 .entered()
@@ -1972,10 +2086,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         }
         self.expire_jobs();
         drop(part);
+        step.next("the plane's step");
         let part = spanned
             .then(|| tracing::info_span!(target: "blaze", "loop turn: the plane's step").entered());
         self.step_plane();
         drop(part);
+        step.next("observe, watch and say");
         // What the turn has to send so far (an answer, a flush asked) is handed to the driver
         // before the work between requests below (the collections, the image's step): an
         // answer never waits behind them.
@@ -1991,6 +2107,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.doing();
         self.plot();
         drop(part);
+        step.next("after the answers");
         let _between = spanned.then(|| {
             tracing::info_span!(target: "blaze", "loop turn: after the answers").entered()
         });
@@ -2045,6 +2162,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         }
         self.stepping_stop();
         self.submit();
+        step.end();
         self.pulse.turned(self.completions + self.settled + self.job_effects);
         !matches!(self.stopping, Some(Stopping::Over))
     }
@@ -2104,6 +2222,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         }
         for row in self.jobs.rows.drain(..) {
             self.observe.ended(row);
+        }
+        // After the rows of the same turn (a stalled build's row and its answer are one turn's),
+        // and after this turn's answers went to the driver (`turn_after_wait` submits before
+        // it calls this): a build's profile is flushed behind its answer, never beside it.
+        for build in self.jobs.answered.drain(..) {
+            self.observe.answered(build);
         }
         // The run logs of builds whose front end was kept, named after their answers.
         if !self.jobs.ran.is_empty() {
@@ -2299,7 +2423,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             Done::Unwatched => self.pressure_watched = false,
             Done::Failed(IoError(why)) => {
                 self.pressure_watched = false;
-                eprintln!(
+                crate::serve::said::logged!(WARN,
                     "blaze serve: no memory pressure source is watched, so the daemon admits by \
                      its budget alone: {why}"
                 );
@@ -2913,7 +3037,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         }
         if self.jobs.ended {
             self.jobs.ended = false;
-            let _span = tracing::info_span!(target: "blaze", "between requests: collect").entered();
+            let _span = tracing::info_span!(
+                target: "blaze",
+                "between requests: collect",
+                quiet_turns = self.quiet_turns
+            )
+            .entered();
             self.db.collect(&[self.steps.plan_key()], &mut self.effects);
             if let Some(db) = Arc::get_mut(&mut self.db) {
                 db.reclaim();
@@ -2936,8 +3065,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             self.jobs.cold = false;
             self.settling = true;
             self.changed_since_settle = false;
-            let _span =
-                tracing::info_span!(target: "blaze", "between requests: ask the image").entered();
+            let _span = tracing::info_span!(
+                target: "blaze",
+                "between requests: ask the image",
+                quiet_turns = self.quiet_turns
+            )
+            .entered();
             self.ask_image(false);
         }
         if self.settling
@@ -3052,7 +3185,63 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
 mod tests {
     use blaze_image::{Cause, SectionId};
 
+    /// The turn (counted from 0) at which the work between requests may first run under
+    /// `rule`, for a build that turns `placing` times with no completion and no plane task
+    /// (its outputs being placed), is answered, and leaves the loop idle after: the oracle of
+    /// `the_work_between_requests_waits_for_quiet_turns_after_the_answer`.
+    fn between_first_runs_at(rule: fn(u32, bool, bool, bool) -> u32, placing: u32) -> u32 {
+        let mut quiet = 0;
+        for turn in 0..placing + 4 * QUIET_BEFORE_BETWEEN {
+            quiet = rule(quiet, turn < placing, false, false);
+            if quiet >= QUIET_BEFORE_BETWEEN {
+                return turn;
+            }
+        }
+        u32::MAX
+    }
+
+    /// The invariant: the work between requests (the collections, the image's making, in
+    /// line on the loop) first runs [`QUIET_BEFORE_BETWEEN`] quiet turns after a build's
+    /// answer, however long the build turned with nothing completing: the client that got the
+    /// answer asks its next thing (its rows, why it recomputed) into an idle loop. Its
+    /// control is `the_oracle_catches_quiet_turns_counted_under_a_build`.
+    #[test]
+    fn the_work_between_requests_waits_for_quiet_turns_after_the_answer() {
+        for placing in [0, 1, QUIET_BEFORE_BETWEEN, 40] {
+            assert_eq!(
+                between_first_runs_at(quiet_turns_after, placing),
+                placing + QUIET_BEFORE_BETWEEN - 1,
+                "a build that placed for {placing} turns"
+            );
+        }
+        // A completion or a running task is not quiet, and loses no count.
+        assert_eq!(quiet_turns_after(3, false, true, false), 3);
+        assert_eq!(quiet_turns_after(3, false, false, true), 3);
+        assert_eq!(quiet_turns_after(3, true, false, false), 0);
+    }
+
+    /// The planted bug: the count as it was until 2026-11-11, blind to a job under way. A
+    /// build that places for 40 turns is past the bound before it is answered.
+    #[test]
+    fn the_oracle_catches_quiet_turns_counted_under_a_build() {
+        fn planted(before: u32, _under_way: bool, took: bool, running: bool) -> u32 {
+            if took || running { before } else { before.saturating_add(1) }
+        }
+        let at = between_first_runs_at(planted, 40);
+        assert!(at < 40, "the oracle missed it: the work first ran at turn {at}");
+        assert_eq!(at, QUIET_BEFORE_BETWEEN - 1);
+    }
+
     use super::*;
+
+    /// A step of a loop turn is said as stalled only past its bound, with its milliseconds.
+    #[test]
+    fn a_step_is_stalled_only_past_its_bound() {
+        assert_eq!(stalled_ms(0, STEP_BOUND_NS), None);
+        assert_eq!(stalled_ms(5, 5 + STEP_BOUND_NS + 1), Some(20));
+        assert_eq!(stalled_ms(0, 735_000_000), Some(735));
+        assert_eq!(stalled_ms(10, 3), None, "a clock read out of order is no stall");
+    }
 
     fn corrupt(section: SectionId) -> Corrupt {
         Corrupt { section, group: 3, cause: Cause::Crc { found: 1, wanted: 2 } }
@@ -3167,6 +3356,7 @@ mod tests {
         let said = error.to_string();
         assert!(said.starts_with("the daemon image /state/db/image: "), "{said}");
         assert!(said.contains("starts from no image"), "{said}");
+        assert!(said.contains("the daemon does not start: `blaze doctor` checks it"), "{said}");
     }
 
     #[test]

@@ -430,7 +430,8 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
         fields: Vec<IndexedPat<Cx<'a, 'db>>>,
         arity: usize,
     ) -> Result<Pat<'a, 'db>, LowerError> {
-        let ctor = match (ty.kind(), variant) {
+        // blaze: a variant of a refinement `T is PAT` is its base's.
+        let ctor = match (hir_ty::pattern_types::base(ty).kind(), variant) {
             (TyKind::Adt(..), VariantId::EnumVariantId(v)) => {
                 Constructor::Variant(VariantIdx::of(self.cx.db, v))
             }

@@ -216,6 +216,14 @@ a **constructive trace**, the goal store's record one level up:
 - the **answer** (the result's bytes) is filed under `H(shape key, each fact's value now)`;
 - a lookup reads the shapes of the identity, computes each fact's value now (each a memoized
   salsa query), and reads the answer under them. A shape whose facts now differ misses.
+- a fact about the body's own item (its inference as its MIR reads it, its MIR and match check
+  as its borrow check does) names it as "self" (`blaze_item_hash::values::OWN`), as the identity
+  does, never by its key: two items alike but for their names have one identity, so they list one
+  shape and share one answer, and a rename keeps a body's records;
+- a flush writes the steps of one identity one after another, in an order of their bytes alone,
+  each against what the flush placed before (`goal_store::slots`), so two shapes of one identity
+  take two slots whichever thread offered them; a step the store refuses is named in what the
+  flush did and keeps no other step out.
 
 The facts are lane items' kinds (`blaze_items::Fact`), each with a value
 (`blaze_items::facts::value`):

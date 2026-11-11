@@ -123,8 +123,10 @@ harness/v2/invariants.py
 harness/v2/lean_differential.py
 harness/v2/lean_gate.py
 harness/v2/ledger.py
+harness/v2/loop_syscalls.py
 harness/v2/macroeval_corpus.py
 harness/v2/mir_semantics.py
+harness/v2/nostd.py
 harness/v2/oracle.py
 harness/v2/pins.py
 harness/v2/proof.py

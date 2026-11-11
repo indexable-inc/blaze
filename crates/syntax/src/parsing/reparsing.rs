@@ -510,11 +510,11 @@ impl Edit<'_> {
         {
             return None;
         }
-        let mut input = lexed.to_input(self.edition);
-        input.set_extensions(self.extensions);
+        let input = lexed.to_input(self.edition);
+        let tokens = input.tokens().with_extensions(self.extensions);
         let output = match in_full {
-            true => reparser.parse(&input),
-            false => reparser.parse_outline(&input),
+            true => reparser.parse(tokens),
+            false => reparser.parse_outline(tokens),
         };
         // clone: a count of the new text, which the node's tree shares
         let source = self.new_source.clone();
@@ -559,11 +559,11 @@ impl Edit<'_> {
         self.reads(TextRange::new(range.end(), TextSize::try_from(ahead).unwrap()));
         // `lexes_alone` showed the lexer ends a token where the item ends.
         let ahead = LexedStr::new(self.edition, &tree.source()[usize::from(range.end())..ahead]);
-        let mut input = lexed.to_input_followed_by(&ahead, self.edition);
-        input.set_extensions(self.extensions);
+        let input = lexed.to_input_followed_by(&ahead, self.edition);
+        let tokens = input.tokens().with_extensions(self.extensions);
         let output = match in_full {
-            true => Reparser::top_level_item().parse(&input),
-            false => Reparser::top_level_item().parse_outline(&input),
+            true => Reparser::top_level_item().parse(tokens),
+            false => Reparser::top_level_item().parse_outline(tokens),
         };
         let (output, first, n_tokens) = output.into_first_node()?;
         let tokens = (0..lexed.len()).filter(|&it| !lexed.kind(it).is_trivia()).count();

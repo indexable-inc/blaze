@@ -29,11 +29,13 @@ pub const CAPABILITIES_FOR_BUILD_SCRIPTS: bool = false;
 
 /// Whether blaze's capability standard library (bstd, `crates/blaze-std`,
 /// docs/v2/plan/design/std.md) is in the tree, compiles on a stage-1 blaze and has an API the
-/// workspace can port to: steps S1 and S2 of that plan. Today it is on a branch and has never
-/// been compiled. Turning this to `true` makes `blaze::std_use` warn in every crate of a
-/// workspace whose `lints-when-ready` table has `std_use = "warn"` (blaze's own does), and its findings
-/// name what to write as something to do now. The lint's own default stays `allow`: another
-/// workspace's crates ask for it with `#![blaze::capabilities]`.
+/// workspace can port to: steps S1 and S2 of that plan. Today `crates/blaze-std` is in the tree,
+/// but it is not yet built on a stage-1 blaze nor an API the workspace ports to. Turning this to `true` makes `blaze::std_use` warn in every crate of a
+/// workspace whose `lints-when-ready` table has `std_use = "warn"`, and its findings name what to
+/// write as something to do now. The lint's own default stays `allow`: another workspace's
+/// crates ask for it with `#![blaze::capabilities]`. blaze's own workspace does not wait: its
+/// `lints-ratchet` denies the lint ahead of this switch (Andrew's decision of 2026-11-11), each
+/// crate not yet ported held at `warn` by its line in the lint's baseline.
 pub const BSTD_IN_TREE: bool = false;
 
 /// Each lint that has a switch here, by its name after `blaze::`, with the switch: what the

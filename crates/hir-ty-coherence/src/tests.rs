@@ -511,3 +511,39 @@ impl<T: Open> up::G for T {}
     assert!(open.contains("LPair<A, Q>") && open.contains("`#[fundamental]`"), "{open}");
     assert_eq!(report.orphans, vec!["G for T".to_owned()], "{report:#?}");
 }
+
+/// The coherence rule of a `where const` impl: its trait is `#[marker]` and its own crate's.
+/// A marker trait's impls may overlap (they have no items to disagree on), so the derived impl
+/// and an explicit `unsafe impl` stand together; a trait with items, or another crate's, is
+/// refused, naming the impl and the rule.
+#[test]
+fn a_where_const_impl_is_of_a_marker_trait_of_its_own_crate() {
+    let report = check(
+        "#![feature(marker_trait_attr)]\n#[marker] pub trait UpMark {}\npub trait UpPlain {}",
+        r#"
+#![feature(blaze_comptime, marker_trait_attr)]
+const fn yes<T: ?Sized>() -> bool { true }
+#[marker]
+unsafe trait Derived {}
+unsafe impl<T: ?Sized> Derived for T where const { yes::<T>() } {}
+struct Asserted;
+unsafe impl Derived for Asserted {}
+
+trait WithItem { fn item(&self) {} }
+impl<T> WithItem for T where const { yes::<T>() } {}
+
+struct Local;
+impl up::UpMark for Local where const { yes::<Local>() } {}
+"#,
+    );
+    let mut rules = report.rules();
+    rules.sort_by_key(|rule| rule.name());
+    assert_eq!(rules, vec![Rule::ConditionElsewhere, Rule::ConditionNotMarker], "{report:#?}");
+    let of = |rule: Rule| {
+        report.refused.iter().find(|(it, _)| *it == rule).map(|(_, message)| message.as_str()).unwrap()
+    };
+    let not_marker = of(Rule::ConditionNotMarker);
+    assert!(not_marker.contains("WithItem") && not_marker.contains("`#[marker]`"), "{not_marker}");
+    let elsewhere = of(Rule::ConditionElsewhere);
+    assert!(elsewhere.contains("UpMark") && elsewhere.contains("crate `up`"), "{elsewhere}");
+}

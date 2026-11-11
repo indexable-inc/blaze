@@ -521,6 +521,10 @@ language_item_table! { LangItems =>
     UseCloned,               sym::use_cloned,          TraitId;
     Clone,                   sym::clone,               TraitId;
     TrivialClone,            sym::trivial_clone,       TraitId;
+    /// Nightly's `core::clone::Share`: a type whose clone is another reference to the same
+    /// thing. Under `#![blaze::handles]` a value of one that would be moved and is used again
+    /// is copied (`hir_ty_mir::mir::handles`).
+    Handle,                  sym::blaze_handle,        TraitId;
     TryAsDyn,                sym::try_as_dyn,          TraitId;
     /// The arbitrary-width integers `u1`..`u128`, `i1`..`i128` other than the standard ones
     /// (`#[blaze::arbitrary_ints]`): a marker the solver answers, never implemented by an impl.
@@ -541,6 +545,15 @@ language_item_table! { LangItems =>
     PointeeTrait,            sym::pointee_trait,       TraitId;
     Metadata,                sym::metadata_type,       TypeAliasId;
     DynMetadata,             sym::dyn_metadata,        StructId;
+    /// The type of blaze's error unions `A | B` (`#![blaze::error_unions]`): core's
+    /// `error_union::ErrorUnion<(A, B)>`, which hir-ty lowers a union to.
+    ErrorUnion,              sym::error_union,         StructId;
+    /// `U: UnionFrom<S>`: `U` is an error union and `S` one of its members or a union of some
+    /// of them; the solver answers it and its `Path`, never an impl.
+    ErrorUnionFrom,          sym::error_union_from,    TraitId;
+    /// `core::error_union::widen::<S, U>`, the conversion a coercion of a member or a smaller
+    /// union to an error union calls.
+    ErrorUnionWiden,         sym::error_union_widen,   FunctionId;
     /// The type of blaze's records `{ a: T, b: U }` (`#![blaze::records]`): core's
     /// `record::Record<"a,b", (T, U)>`, which hir-ty lowers a record type to and a record value
     /// and pattern are of (docs/v2/plan/design/records.md).
@@ -831,6 +844,8 @@ language_item_table! { LangItems =>
     ReflectVariants,         sym::blaze_variants,      StructId;
     /// `core::reflect::FnItem`: fn item and closure types, never fn pointers.
     ReflectFnItem,           sym::blaze_fn_item,       TraitId;
+    /// `core::reflect::MemoPoint`: the item type of a function written `#[blaze::memo]`.
+    ReflectMemoPoint,        sym::blaze_memo_point,    TraitId;
 
     RangeMin,                sym::RangeMin,            ConstId;
     /// `SizedTypeProperties::SIZE` and `::ALIGN`.

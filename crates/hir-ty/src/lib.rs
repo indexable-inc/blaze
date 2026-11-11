@@ -34,6 +34,7 @@ pub mod arbitrary_ints;
 pub mod autoderef;
 pub mod body_store;
 pub mod check_cache;
+pub mod const_exprs;
 pub mod const_param_ty;
 pub mod const_valtree;
 pub mod consteval;
@@ -52,12 +53,14 @@ pub mod lang_items;
 pub mod layout;
 pub mod method_resolution;
 pub mod mir;
+pub mod pattern_types;
 pub mod primitive;
 pub mod providers;
 pub mod record;
 pub mod solver_errors;
 pub mod traits;
 pub mod used_imports;
+pub mod where_const;
 
 #[cfg(test)]
 mod tests;
@@ -112,9 +115,8 @@ use crate::{
 pub use autoderef::autoderef;
 pub use infer::{
     Adjust, Adjustment, AutoBorrow, BindingMode, ByRef, CallArguments, ExplicitDropMethodUseKind,
-    InferenceDiagnostic, InferenceResult, OverloadedDeref, PointerCast, RecordProblem, ReturnKind,
-    StructPathDef,
-    StructPathFound, Unreachable, UnreachableAt,
+    InferenceDiagnostic, InferenceResult, NumericVar, OverloadedDeref, PointerCast, RecordProblem,
+    ReturnKind, StructPathDef, StructPathFound, Unreachable, UnreachableAt,
     cast::{CastError, CastPointerKind, CastPointers},
     could_coerce, could_unify, could_unify_deeply, infer_query_with_inspect,
     prelude_lints::{EditionLint, ReceiverAdjustment},

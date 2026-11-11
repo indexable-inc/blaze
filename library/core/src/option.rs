@@ -614,7 +614,10 @@ impl<T> Option<T> {
     /////////////////////////////////////////////////////////////////////////
     // Querying the contained values
     /////////////////////////////////////////////////////////////////////////
+}
 
+// blaze: an impl whose methods admit a `#[blaze::linear]` payload (library/UPSTREAM).
+impl<#[blaze::linear] T> Option<T> {
     /// Returns `true` if the option is a [`Some`] value.
     ///
     /// # Examples
@@ -633,7 +636,9 @@ impl<T> Option<T> {
     pub const fn is_some(&self) -> bool {
         matches!(*self, Some(_))
     }
+}
 
+impl<T> Option<T> {
     /// Returns `true` if the option is a [`Some`] and the value inside of it matches a predicate.
     ///
     /// # Examples
@@ -662,7 +667,10 @@ impl<T> Option<T> {
             Some(x) => f(x),
         }
     }
+}
 
+// blaze: an impl whose methods admit a `#[blaze::linear]` payload (library/UPSTREAM).
+impl<#[blaze::linear] T> Option<T> {
     /// Returns `true` if the option is a [`None`] value.
     ///
     /// # Examples
@@ -682,7 +690,9 @@ impl<T> Option<T> {
     pub const fn is_none(&self) -> bool {
         !self.is_some()
     }
+}
 
+impl<T> Option<T> {
     /// Returns `true` if the option is a [`None`] or the value inside of it matches a predicate.
     ///
     /// # Examples
@@ -715,7 +725,10 @@ impl<T> Option<T> {
     /////////////////////////////////////////////////////////////////////////
     // Adapter for working with references
     /////////////////////////////////////////////////////////////////////////
+}
 
+// blaze: an impl whose methods admit a `#[blaze::linear]` payload (library/UPSTREAM).
+impl<#[blaze::linear] T> Option<T> {
     /// Converts from `&Option<T>` to `Option<&T>`.
     ///
     /// # Examples
@@ -769,7 +782,9 @@ impl<T> Option<T> {
             None => None,
         }
     }
+}
 
+impl<T> Option<T> {
     /// Converts from <code>[Pin]<[&]Option\<T>></code> to <code>Option<[Pin]<[&]T>></code>.
     ///
     /// [&]: reference "shared reference"
@@ -920,7 +935,10 @@ impl<T> Option<T> {
     /////////////////////////////////////////////////////////////////////////
     // Getting to contained values
     /////////////////////////////////////////////////////////////////////////
+}
 
+// blaze: an impl whose methods admit a `#[blaze::linear]` payload (library/UPSTREAM).
+impl<#[blaze::linear] T> Option<T> {
     /// Returns the contained [`Some`] value, consuming the `self` value.
     ///
     /// # Panics
@@ -1016,7 +1034,9 @@ impl<T> Option<T> {
             None => unwrap_failed(),
         }
     }
+}
 
+impl<T> Option<T> {
     /// Returns the contained [`Some`] value or a provided default.
     ///
     /// Arguments passed to `unwrap_or` are eagerly evaluated; if you are passing
@@ -1136,7 +1156,10 @@ impl<T> Option<T> {
     /////////////////////////////////////////////////////////////////////////
     // Transforming contained values
     /////////////////////////////////////////////////////////////////////////
+}
 
+// blaze: an impl whose methods admit a `#[blaze::linear]` payload (library/UPSTREAM).
+impl<#[blaze::linear] T> Option<T> {
     /// Maps an `Option<T>` to `Option<U>` by applying a function to a contained value (if `Some`) or returns `None` (if `None`).
     ///
     /// # Examples
@@ -1166,7 +1189,9 @@ impl<T> Option<T> {
             None => None,
         }
     }
+}
 
+impl<T> Option<T> {
     /// Calls a function with a reference to the contained value if [`Some`].
     ///
     /// Returns the original option.
@@ -1307,7 +1332,10 @@ impl<T> Option<T> {
             None => U::default(),
         }
     }
+}
 
+// blaze: an impl whose methods admit a `#[blaze::linear]` payload (library/UPSTREAM).
+impl<#[blaze::linear] T> Option<T> {
     /// Transforms the `Option<T>` into a [`Result<T, E>`], mapping [`Some(v)`] to
     /// [`Ok(v)`] and [`None`] to [`Err(err)`].
     ///
@@ -1367,7 +1395,9 @@ impl<T> Option<T> {
             None => Err(err()),
         }
     }
+}
 
+impl<T> Option<T> {
     /// Converts from `Option<T>` (or `&Option<T>`) to `Option<&T::Target>`.
     ///
     /// Leaves the original Option in-place, creating a new one with a reference
@@ -1502,7 +1532,10 @@ impl<T> Option<T> {
             None => None,
         }
     }
+}
 
+// blaze: an impl whose methods admit a `#[blaze::linear]` payload (library/UPSTREAM).
+impl<#[blaze::linear] T> Option<T> {
     /// Returns [`None`] if the option is [`None`], otherwise calls `f` with the
     /// wrapped value and returns the result.
     ///
@@ -1545,7 +1578,9 @@ impl<T> Option<T> {
             None => None,
         }
     }
+}
 
+impl<T> Option<T> {
     /// Returns [`None`] if the option is [`None`], otherwise calls `predicate`
     /// with the wrapped value and returns:
     ///
@@ -2862,7 +2897,8 @@ impl<T, V: FromIterator<T>> FromIterator<Option<T>> for Option<V> {
 
 #[unstable(feature = "try_trait_v2", issue = "84277", old_name = "try_trait")]
 #[rustc_const_unstable(feature = "const_try", issue = "74935")]
-const impl<T> ops::Try for Option<T> {
+// blaze: `?` admits a `#[blaze::linear]` payload (library/UPSTREAM).
+const impl<#[blaze::linear] T> ops::Try for Option<T> {
     type Output = T;
     type Residual = Option<!>;
 
@@ -2884,7 +2920,8 @@ const impl<T> ops::Try for Option<T> {
 #[rustc_const_unstable(feature = "const_try", issue = "74935")]
 // Note: manually specifying the residual type instead of using the default to work around
 // https://github.com/rust-lang/rust/issues/99940
-const impl<T> ops::FromResidual<Option<!>> for Option<T> {
+// blaze: `?` admits a `#[blaze::linear]` payload (library/UPSTREAM).
+const impl<#[blaze::linear] T> ops::FromResidual<Option<!>> for Option<T> {
     #[inline]
     fn from_residual(residual: Option<!>) -> Self {
         match residual {
@@ -2896,7 +2933,8 @@ const impl<T> ops::FromResidual<Option<!>> for Option<T> {
 #[diagnostic::do_not_recommend]
 #[unstable(feature = "try_trait_v2_yeet", issue = "96374")]
 #[rustc_const_unstable(feature = "const_try", issue = "74935")]
-const impl<T> ops::FromResidual<ops::Yeet<()>> for Option<T> {
+// blaze: `?` admits a `#[blaze::linear]` payload (library/UPSTREAM).
+const impl<#[blaze::linear] T> ops::FromResidual<ops::Yeet<()>> for Option<T> {
     #[inline]
     fn from_residual(ops::Yeet(()): ops::Yeet<()>) -> Self {
         None

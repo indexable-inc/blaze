@@ -697,3 +697,29 @@ fn mismatched() {
         }
     });
 }
+
+/// blaze: a `match` on a refinement by enum variants (`#![blaze::pattern_types]`,
+/// docs/v2/plan/design/edition.md, section 8) is exhaustive over its set alone; the enum
+/// itself still needs every variant.
+#[test]
+fn a_match_on_a_refinement_needs_only_its_variants() {
+    check(
+        r#"
+#![blaze::pattern_types]
+enum Conn { Open { socket: u32 }, Closed, Pending(u8) }
+
+fn one(c: Conn is Conn::Open { .. }) -> u32 {
+    match c { Conn::Open { socket } => socket }
+}
+
+fn two(c: Conn is Conn::Open { .. } | Conn::Closed) -> u32 {
+    match c { Conn::Open { socket } => socket }
+}
+
+fn base(c: Conn) -> u32 {
+    match c { Conn::Open { socket } => socket }
+}
+"#,
+        &[("c", "E0004: Conn::Closed"), ("c", "E0004: Conn::Closed | Conn::Pending(_)")],
+    );
+}

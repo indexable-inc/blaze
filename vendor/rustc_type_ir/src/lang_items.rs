@@ -22,6 +22,8 @@ pub enum SolverProjectionLangItem {
 pub enum SolverAdtLangItem {
     // tidy-alphabetical-start
     DynMetadata,
+    /// blaze: `core::error_union::ErrorUnion<(members..)>`, the type of `A | B`.
+    ErrorUnion,
     Option,
     OwnedBox,
     Poll,
@@ -47,6 +49,9 @@ pub enum SolverTraitLangItem {
     Destruct,
     DiscriminantKind,
     Drop,
+    /// blaze: `U: core::error_union::UnionFrom<S>` (`#![blaze::error_unions]`): `U` is an error
+    /// union and `S` one of its members or a union of some of them, never all.
+    ErrorUnionFrom,
     Field,
     Fn,
     FnMut,
@@ -72,6 +77,8 @@ pub enum SolverTraitLangItem {
     ReflectField,
     /// blaze: `core::reflect::FnItem`: fn item and closure types.
     ReflectFnItem,
+    /// blaze: `core::reflect::MemoPoint`: the item type of a function written `#[blaze::memo]`.
+    ReflectMemoPoint,
     /// blaze: `core::reflect::Struct`: a struct whose fields reflection may read, a tuple, or
     /// a variant view.
     ReflectStruct,

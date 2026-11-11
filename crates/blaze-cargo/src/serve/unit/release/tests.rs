@@ -2,7 +2,7 @@ use blaze_graph::admission::Pressure;
 use blaze_mem::Tag;
 use blaze_query::db::MemoryUsage;
 
-use super::{Finished, Holders, Plan, Release, Rows, Said};
+use super::{EDIT_CRATES, Finished, Holders, Plan, Release, Rows, Said};
 
 /// A crate is finished once every unit of it compiled, never before, and once; a unit is open
 /// from its first task to its compile's end, and a build script's run (no crate) or a unit
@@ -288,14 +288,18 @@ fn a_count_of_rows_is_said_in_the_unit_it_rounds_to() {
 /// A release is made due by what this build made. A crate whose units were all
 /// found kept as they began (a warm build's dependencies, every one of them before its first
 /// task) is finished and makes none due; it goes with the next release, a made crate's or the
-/// build's end's. The control: with one of its units not found kept, the same crate makes a
-/// release due at once, as every finished crate did before.
+/// build's end's. The build here makes more crates than an edit does ([`EDIT_CRATES`]), so it
+/// releases as a cold build does once it is past that many. The control: a build that found
+/// no unit kept makes a release due as its first crate finishes.
 #[test]
 fn a_crate_whose_units_were_all_found_kept_makes_no_release_due_and_goes_with_the_next() {
     const GIB: u64 = 1 << 30;
     let fine = || Pressure { held: GIB, limit: 48 * GIB, over: None };
-    // Units 0 and 1 of crate 7, a dependency found kept; unit 2 of crate 9, the one edited.
-    let mut release = Release::of(Finished::new(vec![Some(7u32), Some(7), Some(9)]), true);
+    // Units 0 and 1 of crate 7, a dependency found kept; units 2.. of crates 10.., made.
+    let made_crates = EDIT_CRATES as u32 + 1;
+    let mut of = vec![Some(7u32), Some(7)];
+    of.extend((0..made_crates).map(|at| Some(10 + at)));
+    let mut release = Release::of(Finished::new(of), true);
     for unit in [0, 1] {
         release.began(unit);
         release.kept(unit);
@@ -304,24 +308,38 @@ fn a_crate_whose_units_were_all_found_kept_makes_no_release_due_and_goes_with_th
     assert!(!release.due(), "no unit is open, and the one crate finished was found kept");
     release.began(2);
     assert!(!release.due(), "a unit is open");
-    release.compiled_under(2, fine);
-    assert!(release.due(), "the crate this build made is finished");
+    for unit in 2..2 + EDIT_CRATES {
+        release.began(unit);
+        release.compiled_under(unit, fine);
+        assert!(!release.due(), "so far an edit's build: what it made stays");
+        assert!(release.plan().is_none());
+    }
+    let last = 2 + EDIT_CRATES;
+    release.began(last);
+    release.compiled_under(last, fine);
+    assert!(release.due(), "one crate more than an edit makes: a rebuild, and no unit is open");
+    let mut crates = vec![7];
+    crates.extend((0..made_crates).map(|at| 10 + at));
     assert_eq!(
         release.plan(),
-        Some(Plan { crates: vec![7, 9], mir: true, pressed: false, ended: false }),
-        "the kept crate goes with it"
+        Some(Plan { crates, mir: true, pressed: false, ended: false }),
+        "every crate finished goes, the kept one and those made while the build was an edit's"
     );
     assert!(!release.due() && release.plan().is_none(), "taken");
 
-    let mut made = Release::of(Finished::new(vec![Some(7u32), Some(7), Some(9)]), true);
-    made.began(0);
-    made.kept(0);
-    made.compiled_under(0, fine);
-    made.began(1);
-    made.compiled_under(1, fine);
-    assert!(made.due(), "a unit of crate 7 was made: its crate, finished, is due");
+    let mut cold = Release::of(Finished::new(vec![Some(7u32), Some(7), Some(9)]), true);
+    cold.began(0);
+    cold.compiled_under(0, fine);
+    cold.began(1);
+    cold.compiled_under(1, fine);
+    assert!(cold.due(), "no unit was found kept: crate 7, made and finished, is due");
+    assert_eq!(
+        cold.plan(),
+        Some(Plan { crates: vec![7], mir: true, pressed: false, ended: false })
+    );
 
-    // A build that found every unit kept has nothing due until its end, which takes them all.
+    // A build that found every unit kept has nothing due until its end, which lets go of
+    // what the last two builds did not read and of nothing by name: it made nothing.
     let mut kept = Release::of(Finished::new(vec![Some(7u32), Some(9)]), true);
     for unit in [0, 1] {
         kept.began(unit);
@@ -333,6 +351,74 @@ fn a_crate_whose_units_were_all_found_kept_makes_no_release_due_and_goes_with_th
     assert!(kept.due(), "the build's end");
     assert_eq!(
         kept.plan(),
-        Some(Plan { crates: vec![7, 9], mir: true, pressed: false, ended: true })
+        Some(Plan { crates: vec![], mir: false, pressed: false, ended: true })
+    );
+}
+
+/// The invariant: a build that found units kept and made at most [`EDIT_CRATES`] crates (an
+/// edit's) lets go of no crate's inference by name and of no MIR, while it runs or as it
+/// ends, so the next edit's check reads the values of the crate it makes again and infers and
+/// lowers only what changed; memory short takes everything, as of any build.
+#[test]
+fn an_edit_s_build_keeps_what_it_made_until_memory_is_short() {
+    const GIB: u64 = 1 << 30;
+    let fine = || Pressure { held: GIB, limit: 48 * GIB, over: None };
+    let short = || Pressure { held: 47 * GIB, limit: 48 * GIB, over: Some(Tag::Mir) };
+    let edit = |now: fn() -> Pressure| {
+        // Units 0 and 1 of crate 7, found kept; unit 2 of crate 9, the crate edited.
+        let mut release = Release::of(Finished::new(vec![Some(7u32), Some(7), Some(9)]), true);
+        for unit in [0, 1] {
+            release.began(unit);
+            release.kept(unit);
+            release.compiled_under(unit, fine);
+        }
+        release.began(2);
+        release.compiled_under(2, now);
+        release
+    };
+    let mut release = edit(fine);
+    assert!(!release.due(), "the crate the edit made is finished, and nothing of it goes");
+    assert!(release.plan().is_none());
+    release.end();
+    assert!(release.due(), "the build's end");
+    assert_eq!(
+        release.plan(),
+        Some(Plan { crates: vec![], mir: false, pressed: false, ended: true }),
+        "no crate's inference and no MIR: the end lets go of the unread and the solver's caches"
+    );
+    assert!(!release.due() && release.plan().is_none(), "taken");
+
+    let mut pressed = edit(short);
+    assert!(pressed.due(), "memory is short");
+    assert_eq!(
+        pressed.plan(),
+        Some(Plan { crates: vec![7, 9], mir: true, pressed: true, ended: false }),
+        "memory takes an edit's build's values as any build's"
+    );
+}
+
+/// The control of [`an_edit_s_build_keeps_what_it_made_until_memory_is_short`]: the same
+/// build with no unit found kept (the planted bug's shape: a release that does not tell an
+/// edit from a first build) lets go of the crate it made as it finishes and of every MIR, so
+/// the oracle's plans are not those of every build.
+#[test]
+fn the_oracle_catches_a_release_that_lets_go_of_what_an_edit_made() {
+    const GIB: u64 = 1 << 30;
+    let fine = || Pressure { held: GIB, limit: 48 * GIB, over: None };
+    let mut release = Release::of(Finished::new(vec![Some(7u32), Some(7), Some(9)]), true);
+    for unit in [0, 1, 2] {
+        release.began(unit);
+        release.compiled_under(unit, fine);
+    }
+    assert!(release.due(), "a build that is no edit's is due as its crates finish");
+    assert_eq!(
+        release.plan(),
+        Some(Plan { crates: vec![7, 9], mir: true, pressed: false, ended: false })
+    );
+    release.end();
+    assert_eq!(
+        release.plan(),
+        Some(Plan { crates: vec![], mir: true, pressed: false, ended: true }),
+        "and its end lets go of every MIR"
     );
 }

@@ -183,6 +183,9 @@ pub enum TypeRef<'a> {
         lifetimes: Names,
         ty: TypeRefId,
     },
+    /// `A | B | ..`, an error union (blaze, under `#![blaze::error_unions]`): its members in
+    /// source order, which hir-ty canonicalizes.
+    Union(&'a [TypeRefId]),
     /// `{ a: T, b: U }`, a record type (blaze, under `#![blaze::records]`,
     /// docs/v2/plan/design/records.md): its fields in the order written, which hir-ty sorts by
     /// name. `names` (read with [`ExpressionStore::names`]), `types` and `defaults` run in
@@ -336,12 +339,13 @@ pub(crate) enum TypeRefKind {
     PatternType,
     Error,
     UnsafeBinder,
+    Union,
     Record,
 }
 
 impl TypeRefKind {
     /// Every kind, at the index of its value.
-    pub(crate) const ALL: [TypeRefKind; 16] = {
+    pub(crate) const ALL: [TypeRefKind; 17] = {
         use TypeRefKind::*;
         [
             Never,
@@ -359,6 +363,7 @@ impl TypeRefKind {
             PatternType,
             Error,
             UnsafeBinder,
+            Union,
             Record,
         ]
     };
@@ -380,6 +385,7 @@ impl TypeRefKind {
             TypeRef::PatternType(..) => TypeRefKind::PatternType,
             TypeRef::Error => TypeRefKind::Error,
             TypeRef::UnsafeBinder { .. } => TypeRefKind::UnsafeBinder,
+            TypeRef::Union(_) => TypeRefKind::Union,
             TypeRef::Record { .. } => TypeRefKind::Record,
         }
     }
@@ -392,7 +398,8 @@ pub(crate) struct TypeColumns<V: ColumnVec = Frozen> {
     pub(crate) kind: V::Of<u8>,
     pub(crate) data: V::Of<u32>,
     pub(crate) extra: V::Of<u32>,
-    /// The elements of every `Tuple` and the field types of every `Record`.
+    /// The elements of every `Tuple`, the members of every `Union` and the field types of
+    /// every `Record`.
     pub(crate) lists: V::Of<TypeRefId>,
     /// The bounds of every `ImplTrait` and `DynTrait`.
     pub(crate) bounds: V::Of<TypeBound>,
@@ -546,6 +553,10 @@ impl<V: ColumnVec> TypeColumns<V> {
                 let [ty, start, len] = self.triple(d)?;
                 TypeRef::UnsafeBinder { lifetimes: Names { start, len }, ty: idx(ty) }
             }
+            TypeRefKind::Union => {
+                let [start, count] = self.pair(d)?;
+                TypeRef::Union(list(&self.lists, start, count, LIST)?)
+            }
             TypeRefKind::Record => {
                 // The types' start, the names' start, the field count, then a default's slot
                 // per field.
@@ -595,7 +606,7 @@ impl TypeColumns<Growing> {
         let kind = TypeRefKind::of(&type_ref);
         let data = match type_ref {
             TypeRef::Never | TypeRef::Placeholder | TypeRef::Error => 0,
-            TypeRef::Tuple(types) => {
+            TypeRef::Tuple(types) | TypeRef::Union(types) => {
                 let words = append(&mut self.lists, types);
                 self.words(words)
             }
@@ -769,7 +780,9 @@ impl TypeColumns<Frozen> {
                 | TypeRef::Error
                 | TypeRef::Path(_)
                 | TypeRef::TypeParam(_) => {}
-                TypeRef::Tuple(types) => types.iter().try_for_each(|&it| ty(it))?,
+                TypeRef::Tuple(types) | TypeRef::Union(types) => {
+                    types.iter().try_for_each(|&it| ty(it))?
+                }
                 TypeRef::RawPtr(inner, _) | TypeRef::Slice(inner) => ty(inner)?,
                 TypeRef::Reference(RefType { ty: inner, lifetime: region, mutability: _ }) => {
                     ty(*inner)?;

@@ -138,11 +138,29 @@ impl DefMap {
                         // `hir-ty-linear`, from `AttrFlags::LINEAR` and `AttrFlags::CONSUMES`.
                         | "linear"
                         | "consumes"
+                        | "holds"
                         // `#![blaze::arbitrary_ints]`, from `DefMap::arbitrary_ints`
                         // (docs/v2/plan/design/arbitrary-ints.md).
                         | "arbitrary_ints"
-                        // `#![blaze::records]`, read off the crate root's tokens by
-                        // `base_db::crate_extensions` (docs/v2/plan/design/records.md).
+                        // `#![blaze::handles]`, from `DefMap::handles`, and the effect
+                        // `#[blaze::norefcount]`, from `AttrFlags::NOREFCOUNT`
+                        // (docs/v2/plan/design/edition.md, change 1).
+                        | "handles"
+                        | "norefcount"
+                        // `#![blaze::views]`, from `DefMap::views`
+                        // (`hir_ty_borrowck::views`, docs/v2/plan/design/edition.md).
+                        | "views"
+                        // `#![blaze::uniq]`, read off the root's tokens before any parse
+                        // (`base_db::Crate::extensions`, docs/v2/plan/design/edition.md).
+                        | "uniq"
+                        // `#![blaze::pattern_types]`, from `DefMap::pattern_types`
+                        // (docs/v2/plan/design/edition.md, section 8).
+                        | "pattern_types"
+                        // `#![blaze::error_unions]`, read off the root's tokens the same way
+                        // (`base_db::Crate::extensions`: the parser's `A | B` types).
+                        | "error_unions"
+                        // `#![blaze::records]`, read off the root's tokens the same way
+                        // (`base_db::Crate::extensions`, docs/v2/plan/design/records.md).
                         | "records"
                         // `#![blaze::early_drop]`, from `DefMap::early_drop`, and
                         // `#[blaze::drop(early)]` and `#[blaze::drop(scoped)]` on a type, from
@@ -155,23 +173,25 @@ impl DefMap {
                         | "reflect"
                         // `#[blaze::sealed]`, from `AttrFlags::BLAZE_SEALED` (`hir-ty-coherence`).
                         | "sealed"
+                        // `#![blaze::capabilities]`, from `AttrFlags::CAPABILITIES`
+                        // (blaze-lints' `blaze::capabilities`, and `blaze::std_use` beneath
+                        // it; docs/v2/plan/design/std.md, "The checks").
+                        | "capabilities"
+                        // `#[blaze::memo]`, from `AttrFlags::BLAZE_MEMO`: a memo point of
+                        // `bstd::eval` (`AttrFlags::pure_attr`, `core::reflect::MemoPoint`).
+                        | "memo"
                         // `#[blaze::differentiable]`, from `AttrFlags::DIFFERENTIABLE`
                         // (`blaze-diff-mir`, docs/future/autodiff.md).
                         | "differentiable"
-                        // `#![blaze::capabilities]` (docs/v2/plan/design/std.md, "The checks"):
-                        // read from the syntax by blaze-lints, where it asks for
-                        // `blaze::std_use` beneath it; the effects it will make errors are
-                        // not built.
-                        | "capabilities"
                         // `#![blaze::simd]`, read from the crate root's attributes where
                         // `#![feature]` is, and `#[blaze::multiversion]`, from
                         // `AttrFlags::BLAZE_MULTIVERSION` (docs/v2/plan/design/simd.md).
                         | "simd"
                         | "multiversion"
-                        // `#[blaze::acyclic]` and `#[blaze::program_lifetime]`, from
-                        // `AttrFlags::BLAZE_ACYCLIC` and `AttrFlags::BLAZE_PROGRAM_LIFETIME`
-                        // (`hir-ty-pure`'s facts, docs/v2/plan/design/facts.md).
-                        | "acyclic"
+                        // `#[blaze::program_lifetime]`, from
+                        // `AttrFlags::BLAZE_PROGRAM_LIFETIME` (`hir-ty-pure`'s facts,
+                        // docs/v2/plan/design/facts.md). `Acyclic` has no attribute: it is
+                        // derived by reflection (docs/v2/plan/design/ownership.md).
                         | "program_lifetime"
                 )
             {

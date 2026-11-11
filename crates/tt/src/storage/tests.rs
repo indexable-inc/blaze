@@ -265,29 +265,32 @@ fn walk_cursor(tree: &TopSubtree) -> Vec<TokenTree> {
 
 /// The tokens of flat token trees as a parser reads them, each with its context, from the
 /// token trees alone.
-fn reference_tokens(tokens: &[TokenTree]) -> Vec<(FlatToken, SyntaxContext)> {
-    fn seq(mut tokens: &[TokenTree], out: &mut Vec<(FlatToken, SyntaxContext)>) {
+fn reference_tokens(tokens: &[TokenTree]) -> Vec<(FlatToken, SyntaxContext, Extensions)> {
+    fn of(token: FlatToken, span: Span) -> (FlatToken, SyntaxContext, Extensions) {
+        (token, span.ctx, span.anchor.file_id.extensions())
+    }
+    fn seq(mut tokens: &[TokenTree], out: &mut Vec<(FlatToken, SyntaxContext, Extensions)>) {
         while let Some((first, rest)) = tokens.split_first() {
             tokens = rest;
             let token = match first {
                 TokenTree::Leaf(Leaf::Punct(it)) => {
-                    (FlatToken::Punct { char: it.char, spacing: it.spacing }, it.span.ctx)
+                    of(FlatToken::Punct { char: it.char, spacing: it.spacing }, it.span)
                 }
                 TokenTree::Leaf(Leaf::Ident(it)) => {
-                    (FlatToken::Ident { sym: it.sym, is_raw: it.is_raw }, it.span.ctx)
+                    of(FlatToken::Ident { sym: it.sym, is_raw: it.is_raw }, it.span)
                 }
                 TokenTree::Leaf(Leaf::Literal(it)) => {
                     let sym = it.text_and_suffix;
                     let (kind, suffix_len) = (it.kind, it.suffix_len);
-                    (FlatToken::Literal { sym, kind, suffix_len }, it.span.ctx)
+                    of(FlatToken::Literal { sym, kind, suffix_len }, it.span)
                 }
                 TokenTree::Subtree(subtree) => {
                     let (children, after) = rest.split_at(subtree.usize_len());
                     let delimiter = subtree.delimiter;
-                    out.push((FlatToken::Open(delimiter.kind), delimiter.open.ctx));
+                    out.push(of(FlatToken::Open(delimiter.kind), delimiter.open));
                     seq(children, out);
                     tokens = after;
-                    (FlatToken::Close(delimiter.kind), delimiter.close.ctx)
+                    of(FlatToken::Close(delimiter.kind), delimiter.close)
                 }
             };
             out.push(token);
@@ -299,9 +302,9 @@ fn reference_tokens(tokens: &[TokenTree]) -> Vec<(FlatToken, SyntaxContext)> {
 }
 
 /// The tokens of `view`, through [`TokenTreesView::for_each_token`].
-fn walk_tokens(view: TokenTreesView<'_>) -> Vec<(FlatToken, SyntaxContext)> {
+fn walk_tokens(view: TokenTreesView<'_>) -> Vec<(FlatToken, SyntaxContext, Extensions)> {
     let mut out = Vec::new();
-    view.for_each_token(|token, ctx| out.push((token, ctx)));
+    view.for_each_token(|token, ctx, extensions| out.push((token, ctx, extensions)));
     out
 }
 
@@ -1127,10 +1130,10 @@ fn walking_and_the_wire_allocate_the_same_for_any_size_of_tree() {
     assert!(!big.wide().is_empty());
     for tree in [&small, &big] {
         let view = tree.token_trees();
-        view.for_each_token(|_, _| ());
+        view.for_each_token(|_, _, _| ());
         let walked = blaze_alloc_count::assert_at_most(0, "walking a tree's tokens", || {
             let mut tokens = 0;
-            view.for_each_token(|_, _| tokens += 1);
+            view.for_each_token(|_, _, _| tokens += 1);
             tokens
         });
         assert!(walked >= view.len());
