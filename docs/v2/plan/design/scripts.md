@@ -56,6 +56,157 @@ and three fixtures under `crates/blaze-resolve/tests`, which go with the Python 
 Recommendation: what ships to a browser, a Worker or a user's shell stays in its language; what
 is a repository script (`rules.ts`, the harness's `.sh`) follows the Python.
 
+## The design
+
+Rust replaces Python for every script, in two tiers, because of one rule.
+
+### Stage 0 for scripts (the bootstrap rule)
+
+A script that checks, tests, lands or releases blaze is built and run by the pinned released
+blaze (`.github/blaze-version`, the stage 0 that builds blaze), never by the tree under test: a
+tree that does not compile must still be checked, landed on and released from. So:
+
+- A script uses only the language and libraries that release has. One that needs a newer
+  feature waits one release: the feature lands, a release is cut and pinned, then the script
+  uses it. CI runs every script with the stage-0 binary, as it builds blaze with it.
+- A script builds from its own file and its helper crate alone, never from blaze's crates: the
+  helper (`crates/blaze-script`) depends on nothing in `crates/` and only on registry crates
+  the lock already holds, so a broken compiler crate cannot stop `land` or the gate's checkers
+  from building. A script that measures the tree's blaze takes it as data (the `engine` field
+  of its input, as harness/v2 does now) and starts it as a program.
+- The helper crate is held to the same rule as the scripts: it must build under stage 0. Its
+  own change is checked by stage 0 building every script (the gate's `scripts` job).
+- `land.py`'s successor is the `land` script: stage 0 builds it from `scripts/` and
+  `crates/blaze-script`, both of which build whatever state main's compiler is in.
+
+### Tier 0: now, on the released blaze
+
+Plain Rust on `std` plus `crates/blaze-script`, as ordinary binaries of one workspace package,
+`scripts/` (`scripts/src/bin/<name>.rs`, one self-contained file a script), run as
+
+    blaze run -p scripts --bin ledger -- '{"command": "check"}'
+
+Stage 0 builds that today. `blaze-script` is small and has what the audit found the Python
+uses (imports counted over the 192 files left): the typed input (`typed_input`, 80 files),
+JSON (92), processes with captured output and exit status (`subprocess`, `asyncio`; 96),
+files, directories and temporary directories (`os`, `pathlib`, `shutil`, `tempfile`), regular
+expressions (59), TOML reading (14), SHA-256 and BLAKE3 (31), tar (7), HTTP GET and PUT (12,
+the release uploads, done by starting `curl` as the Python's `gh` and `aws` calls are started),
+time, N jobs at once (`concurrent`, 13), and the table and report printer (`report`). JSON,
+TOML, regex, tar and the hashes are the crates already in `Cargo.lock` (`serde_json`, `toml`,
+`regex`, `tar`, `sha2`, `blake3`): no new registry dependency.
+
+### Tier 1: the long-term form
+
+    #!/usr/bin/env blaze
+    ---
+    [dependencies]
+    blaze-script = { path = "../crates/blaze-script" }
+    [package.metadata.blaze]
+    experimental = ["capabilities"]
+    ---
+    /// Checks the ledger's rows and writes its table.
+    struct Input { /** check, write, pick or run */ command: Command, /** the checkout */ root: Path }
+
+    fn main(cx: &Cx, io: Io, input: Input) -> Result<(), Error> { .. }
+
+- **Single file.** `blaze run path/to/script.rs`, `blaze path/to/script.rs` and the shebang
+  line. The file is a crate root. Its manifest is cargo's `-Zscript` front matter, unchanged, so
+  editors and cargo read it (rule useful-not-parity: no syntax of blaze's own); blaze's gates
+  are the `[package.metadata.blaze]` keys a `Cargo.toml` already takes. What the tree has: the
+  lexer and parser accept the shebang and the front matter (`crates/parser/src/frontmatter.rs`,
+  cargo's parser copied; the `frontmatter` feature gate is diagnosed), and the command line
+  finds an embedded manifest (`crates/blaze-cargo/src/cli/place.rs`) but only under `-Zscript`,
+  after which `crates/blaze-manifest/src/manifest.rs` refuses it ("requires `-Zscript`"):
+  there is no manifest synthesis and no `blaze run file.rs`. To build: the manifest from the
+  front matter with cargo's defaults (name from the file, one `bin` at the file, no build
+  script, no auto targets, a workspace of its own), on by default with no flag; the script's
+  build directory and lock under blaze's home, keyed by the file's path; the unit keyed as any
+  unit is, by the file's content and its dependency set, so a second run is a no-op build and
+  an exec.
+- **Where scripts live.** `scripts/`, one file each, for what a workflow, the ledger or a
+  person runs; a generator stays beside the file it generates. Shared code is the helper crate,
+  a path dependency: no `sys.path`.
+- **Fast start.** The budget: a warm script starts within 5 ms of the program's own start, and
+  cold is one compile of the file against dependencies already built. Today a no-op `blaze
+  build` is 38 to 136 ms, of which the daemon's answer is 0.1 to 0.4 ms (ledger T5): the rest is
+  the `blaze` process. What takes it away is specified in docs/cargo.md by the edit-speed lane
+  (the command asks the daemon before it sets anything up; build on save; ledger T5, D34, D35)
+  and docs/client.md (`blaze-fast`), and is not repeated here: `blaze run script.rs` is the
+  same no-op lane followed by an exec of the kept executable, with no second process between.
+  With no daemon running the command starts one, as every build does, and the first script pays
+  for it; there is no in-process route (rule no-fallback).
+- **bstd is the library.** `main` gets the task's `Cx` and the root `Io` and narrows it
+  (`io.fs().open_dir(..)`, `io.env().only(..)`), so a script's signature and first lines say
+  what it can touch. Against bstd on `lang-int-1110` (docs/v2/plan/design/std.md there, and
+  `crates/blaze-std/src`):
+
+  | need | bstd has | missing, for the bstd lane |
+  |---|---|---|
+  | files, directories | `fs` (`Dir`, `File`, `list`, `stat`, `read_all`, `publish`, `remove`, `rename_replacing`), `path` | a recursive walk; a glob; removing a tree; a temporary directory that removes itself |
+  | environment, arguments, exit | `env`, `args`, `host` | |
+  | processes | `procs` lists and signals, in the simulation only | running a program with captured output and its exit status: std.md's `Sandboxes` and `OsSandbox` are designed, no module is written |
+  | JSON read and write | none (`data` is designed on reflection) | `bstd::data` with JSON; until reflection phase 2, a JSON value tree |
+  | TOML read | none | a TOML reader (blaze-manifest's, moved) |
+  | regular expressions | none | `bstd::text::regex`, or the `regex` crate re-exported |
+  | hashing | `digest` (BLAKE3, SHA-256) | |
+  | tar, zip, xz | `image/zlib` inflates, for PNG | tar read and write, gzip and xz streams (zip is not used) |
+  | HTTP GET and PUT | `requests` (`Http`), `http` (h1 core), `net`, `roots`, `url` | a native provider of `Io::http` (the simulation's alone exists); TLS |
+  | time | `clock` | wall-clock dates formatted (ISO 8601) |
+  | N jobs at once | `task` (scopes, deadlines) | |
+  | a table and report printer | `report`, `term` | a plain column table |
+
+- **The typed input.** `bstd::input`: the script's entry parses its one argument (a JSON value
+  inline, the path of a file, or `-`) into `main`'s third parameter and refuses what
+  `typed_input` refuses, in its words, naming the field: `ledger: no field rot (the fields are
+  command, count, ids, root)`, `ledger: field command is required`, `ledger: command is one of
+  "check", "write", not "chek"`, exit status 1. `selftest` as the one argument runs the
+  script's `fn selftest(cx, io)`, as now. `--help` prints the struct's and each field's doc
+  comment with its type and default. The decoder and the help are derived from the struct by
+  reflection, no derive macro: reflection phase 2 (the field loop of `blaze_comptime`,
+  docs/v2/plan/design/comptime.md on `lang-int-1110`) and `bstd::data` (reflect.md item 11),
+  plus doc comments in a field's reflected data, which phase 2 does not list. The interim form
+  is tier 0's: a hand-written `Input::parse` over `blaze_script::input`'s field reader, which
+  gives the same errors.
+
+Tier 1 waits on, each in a release: single-file scripts; bstd with a native `Io` (ledger S1,
+S4) and the missing pieces above; reflection phase 2 with `bstd::data`; the edition's
+`fn main(cx, io)` entry (S5). A tier 0 script moves by the lints that move blaze's own crates
+(`blaze::std_use`'s renames, `blaze check --fix`), not by hand.
+
+### The order, and the guard
+
+Nothing is ported one for one that can be deleted instead. Sizes are from the audit.
+
+1. **Checkers** (13 files, 4,752 lines): `tools/docs.py`, harness/v2's `ledger`, `invariants`,
+   `guards`, `changed`, `diff_rules`, `lean_gate`, then `tools/v2/domains.py`,
+   `harness/rustcsites.py`, `harness/failures.py`, `harness/imports.py`,
+   `.github/scripts/gate_changes.py`, with `typed_input` itself. Pure functions over files; they
+   need `blaze-script`'s input, JSON, TOML, regex and `git` runs. `tools/agents/rules.ts` goes
+   with them.
+2. **harness/v2's harnesses** (28 files, 20,546 lines): they need the engine handle
+   (`engine.py`), the report (`report.py`) and process running with deadlines.
+3. **The older harness** (106 files, 32,567 lines): each script is deleted, or becomes a row
+   of a harness/v2 harness, before any is translated; `storelib` and `blaze_cli` (68 importers)
+   are the helpers to settle first.
+4. **tools/ and the generators** (29 files, 6,957 lines): each generator when its output is
+   next regenerated.
+5. **.github/scripts** (14 files, 3,914 lines) last: `land`, the release and the uploads, once
+   a release has proved the tiers on everything before them.
+
+A port keeps the Python's interface exactly (the one argument, `selftest`, the text printed,
+the exit status), so a workflow or a ledger check changes only its command. Ports land in
+pairs: the Rust script beside the Python, then, once both were run on the same inputs and
+agreed byte for byte, the switch that deletes the Python and its line of the list below.
+
+**No new Python** (rule guard-the-cause): `tools/python-allowed.txt` lists every tracked `.py`
+file. `python3 tools/docs.py check`, which every gate runs, fails for a `.py` file that is not
+on it (write it in Rust) and for a line whose file is gone (`python3 tools/docs.py write` takes
+it out, and never adds one), so the list only shrinks. Ledger row D43 is met when
+`tools/docs.py python '{"left": 0}'` passes: the list is empty and no `.py` file is tracked.
+The check moves into the Rust `docs` script with `tools/docs.py`, and then holds that there is
+no `.py` file at all.
+
 ## Appendix: every Python file
 
 | file | lines | verdict | evidence |
