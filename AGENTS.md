@@ -147,6 +147,10 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
     right design needs a feature Rust has not stabilized or does not have (const generic
     expressions, for one), build it properly in blaze as an opt-in extension. Skill:
     `compiler-correctness`.
+56. **reflection-first**: Derive a property of a type or a function with blaze's compile-time
+    reflection, not an auto trait, a proc macro or a special case in the compiler, wherever
+    reflection is the more powerful; where reflection cannot yet say something that is possible,
+    improve the language until it can. Skill: `compiler-correctness`.
 
 ## Code Review Rules
 
