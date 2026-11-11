@@ -18,12 +18,18 @@
 //!
 //! A fact whose subject no longer resolves has the value [`absent`]; one that names what is not
 //! its kind's (a record is data, which this build may not have written) has none.
+//!
+//! A fact about the body's own item names it as [`OWN`], never by its item key ([`relative`]):
+//! a body's identity writes its own item as "self" (section 3.2), so two items alike but for
+//! their names share one identity and one base key, and a shape that named each by its key
+//! would be another shape for each of them (and for the same body after a rename). Its value
+//! is asked for a body ([`value_in`]), which puts the body's own key back.
 
 use base_db::{Crate, Db};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{ItemId, ItemKey, Resolved, goals::Goals, key};
 use hir_def::{
-    AdtId, AssocItemId, AttrDefId, DefWithBodyId, VariantId,
+    AdtId, AssocItemId, AttrDefId, DefWithBodyId, HasModule as _, VariantId,
     attrs::AttrFlags,
     lang_item::{LangItemEnum, lang_items},
     nameres::crate_recursion_limit,
@@ -62,9 +68,38 @@ const CRATE_ROOT_DOMAIN: &str = "blaze v2 item-hash crate root 1";
 const MATCH_CHECK_DOMAIN: &str = "blaze v2 item-hash match check 1";
 const ABSENT_DOMAIN: &str = "blaze v2 item-hash absent 1";
 
+/// The subject of a fact about the body's own item (a function, const or static, or a
+/// discriminant's variant), in place of its key: a tag, which no hash is. What it stands for
+/// is known only with the body ([`value_in`]).
+pub const OWN: ContentId = ContentId(*b"blaze v2 item-hash: a body's own");
+
+/// `fact` as a shape of `def`'s steps lists it: a fact whose subject is `def`'s own key names
+/// it as [`OWN`]. Its object is left as it is.
+pub fn relative(db: &Db, def: DefWithBodyId, fact: FactRef) -> FactRef {
+    match fact.subject == body_key(db, def) {
+        true => FactRef { subject: OWN, ..fact },
+        false => fact,
+    }
+}
+
+/// The value `fact`, of a shape of `def`'s steps, has now: [`value`] as `def`'s crate sees it,
+/// of `def`'s own item where the fact names [`OWN`].
+pub fn value_in(db: &Db, def: DefWithBodyId, fact: FactRef) -> Option<ContentId> {
+    let fact = match fact.subject == OWN {
+        true => FactRef { subject: body_key(db, def), ..fact },
+        false => fact,
+    };
+    value(db, def.krate(db), fact)
+}
+
 /// The value `fact` has now as a body of `krate` sees it (lane items' facts about impls cover
-/// the crates it loads), `None` when it cannot be hashed or names what is no fact.
+/// the crates it loads), `None` when it cannot be hashed or names what is no fact. A fact
+/// that names [`OWN`] has no value here, where no body says whose it is ([`value_in`]): it
+/// must never read as [`absent`], which every body's would then share.
 pub fn value(db: &Db, krate: Crate, fact: FactRef) -> Option<ContentId> {
+    if fact.subject == OWN {
+        return None;
+    }
     if !kinds::RANGE.contains(&fact.kind.0) {
         return Goals.value(db, Some(krate), fact);
     }
@@ -118,23 +153,25 @@ fn body_of(db: &Db, subject: ContentId) -> Option<Option<DefWithBodyId>> {
     }))
 }
 
-/// The fact of `step` of `def`, as a later step of it reads it; `None` for the borrow check,
-/// which no step reads.
-pub fn step_fact(db: &Db, def: DefWithBodyId, step: Step) -> Option<FactRef> {
+/// The fact of `step` of a body, as a later step of the same body reads it, the body named as
+/// [`OWN`]; `None` for the borrow check, which no step reads.
+pub fn step_fact(step: Step) -> Option<FactRef> {
     let kind = match step {
         Step::Infer => kinds::STEP_INFER,
         Step::Mir => kinds::STEP_MIR,
         Step::Borrowck => return None,
     };
-    Some(FactRef { kind, subject: body_key(db, def), object: FactObject::None })
+    Some(FactRef { kind, subject: OWN, object: FactObject::None })
 }
 
-/// The `MatchCheck` fact of `def`, as its borrow check reads it.
-pub fn match_check(db: &Db, def: DefWithBodyId) -> FactRef {
-    FactRef { kind: kinds::MATCH_CHECK, subject: body_key(db, def), object: FactObject::None }
+/// The `MatchCheck` fact of a body, as its own borrow check reads it, the body named as
+/// [`OWN`].
+pub fn match_check() -> FactRef {
+    FactRef { kind: kinds::MATCH_CHECK, subject: OWN, object: FactObject::None }
 }
 
-fn body_key(db: &Db, def: DefWithBodyId) -> ContentId {
+/// The key of `def`'s own item: what [`OWN`] stands for in a shape of `def`'s steps.
+pub fn body_key(db: &Db, def: DefWithBodyId) -> ContentId {
     match def {
         DefWithBodyId::FunctionId(it) => key::item_key(db, ItemId::Function(it)),
         DefWithBodyId::ConstId(it) => key::item_key(db, ItemId::Const(it)),
