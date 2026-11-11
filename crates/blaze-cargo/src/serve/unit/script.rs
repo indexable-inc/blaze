@@ -2033,7 +2033,8 @@ impl ScriptRun {
                         // What the run read and who read it, as events of the build's
                         // profile, before its key takes anything out of the trace.
                         said::run(unit, traced);
-                        checked = pure::check(&job, run_unit, unit, traced);
+                        checked =
+                            pure::check(&job, run_unit, unit, prepared.script_env(), traced);
                         script::keyed(prepared, traced)
                     },
                 );

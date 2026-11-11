@@ -39,6 +39,7 @@ fn places(toolchain: &[PathBuf]) -> Places<'_> {
         target_dir: Path::new("/ws/p/target"),
         program: Path::new("/ws/p/target/debug/build/p-4567/build-script-build"),
         toolchain,
+        search: &[],
     }
 }
 
@@ -150,6 +151,214 @@ fn an_untraceable_read_names_the_process_that_made_it() {
     // With no caller described, the error says so: never a caller of another kind or run.
     let error = check("p v0.1.0", &proof(), &places, &random).unwrap_err().0;
     assert!(error.contains("which process read it is not known"), "{error}");
+}
+
+/// A trace of `(path, hash)` files, as a run's sandbox assembles it.
+fn traced_as(files: &[(&str, Option<[u8; 32]>)]) -> Traced {
+    Traced {
+        files: files.iter().map(|(path, hash)| (PathBuf::from(path), *hash)).collect(),
+        dirs: Vec::new(),
+        env: Vec::new(),
+        untraceable: Vec::new(),
+    }
+}
+
+/// A shared library's name on this machine, as its loader looks for one.
+fn library(stem: &str) -> String {
+    match Loader::HOST {
+        Loader::Elf => format!("lib{stem}.so.1"),
+        Loader::Dyld => format!("lib{stem}.dylib"),
+        Loader::Windows => format!("{stem}.dll"),
+    }
+}
+
+#[test]
+fn a_library_name_is_the_loaders_and_nothing_else() {
+    let named = |name: &str, loader| library_name(OsStr::new(name), loader);
+    for name in ["libc.so.6", "libdl.so.2", "libgcc_s.so.1", "libz.so.1.3.1", "libfoo.so"] {
+        assert!(named(name, Loader::Elf), "{name}");
+    }
+    for name in [
+        "libfoo.rlib",
+        "libfoo.rmeta",
+        "libfoo.a",
+        "libfoo.so.d",
+        "libfoo.so.",
+        "libfoo.so.1.",
+        "libfoo.so..1",
+        "libfoo.so.1a",
+        "libfoo.so.so",
+        "libfoo.sox",
+        "lib.so",
+        "foo.so",
+        "foo.d",
+        "libfoo",
+        "libfoo.dylib",
+        "foo.dll",
+        "",
+    ] {
+        assert!(!named(name, Loader::Elf), "{name}");
+    }
+    assert!(named("libSystem.B.dylib", Loader::Dyld) && named("foo.dylib", Loader::Dyld));
+    for name in [".dylib", "libfoo.so", "libfoo.dylib.d", "libfoo.rlib", "foo.dll"] {
+        assert!(!named(name, Loader::Dyld), "{name}");
+    }
+    assert!(named("foo.dll", Loader::Windows) && named("KERNEL32.DLL", Loader::Windows));
+    for name in [".dll", "foo.dll.d", "foo.lib", "foo.exe", "libfoo.so"] {
+        assert!(!named(name, Loader::Windows), "{name}");
+    }
+}
+
+/// The invariant: a read is the loader's walk of the run's library search path exactly when
+/// it is a search directory (there or not) or a library's name directly in one; a name found
+/// there is a load, which no pure key covers.
+#[test]
+fn a_probe_is_a_search_directory_or_a_library_name_directly_in_one() {
+    let search = [PathBuf::from("/t/debug"), PathBuf::from("/t/debug/deps")];
+    let at = |path: &str, hash: Option<[u8; 32]>| probe(Path::new(path), hash.as_ref(), &search);
+    let lib = library("gcc_s");
+    assert_eq!(at("/t/debug", Some(DIRECTORY)), Some(Probe::Directory));
+    assert_eq!(at("/t/debug/deps", None), Some(Probe::Directory));
+    assert_eq!(at(&format!("/t/debug/{lib}"), None), Some(Probe::Missed));
+    assert_eq!(at(&format!("/t/debug/deps/{lib}"), None), Some(Probe::Missed));
+    assert_eq!(at(&format!("/t/debug/deps/{lib}"), Some([7; 32])), Some(Probe::Found));
+    // No search directory: the target directory, a directory beside or below one, a file
+    // where one is named.
+    assert_eq!(at("/t", Some(DIRECTORY)), None);
+    assert_eq!(at("/t/debug/build", Some(DIRECTORY)), None);
+    assert_eq!(at("/t/release", None), None);
+    assert_eq!(at("/t/debug", Some([7; 32])), None);
+    // A library's name where the loader does not look, and another file where it does.
+    assert_eq!(at(&format!("/t/debug/build/{lib}"), None), None);
+    assert_eq!(at(&format!("/t/release/{lib}"), None), None);
+    assert_eq!(at(&format!("/t/debug/deps/sub/{lib}"), None), None);
+    assert_eq!(at("/t/debug/deps/libserde-0123.rlib", None), None);
+    assert_eq!(at("/t/debug/deps/serde-0123.d", Some([7; 32])), None);
+    assert_eq!(at("/t/debug/.fingerprint", None), None);
+    // With no search path nothing is a probe.
+    assert_eq!(probe(Path::new("/t/debug"), None, &[]), None);
+    assert_eq!(probe(Path::new(&format!("/t/debug/{lib}")), None, &[]), None);
+}
+
+/// glibc's `glibc-hwcaps/<level>` under a search directory (x86-64, POWER, s390x): the level's
+/// directory and a library's name in it, and nothing deeper or under another name.
+#[cfg(target_os = "linux")]
+#[test]
+fn glibc_looks_under_a_search_directorys_hwcaps_levels() {
+    let search = [PathBuf::from("/t/debug")];
+    let at = |path: &str, hash: Option<[u8; 32]>| probe(Path::new(path), hash.as_ref(), &search);
+    assert_eq!(at("/t/debug/glibc-hwcaps/x86-64-v3", None), Some(Probe::Directory));
+    assert_eq!(at("/t/debug/glibc-hwcaps/x86-64-v3/libc.so.6", None), Some(Probe::Missed));
+    assert_eq!(at("/t/debug/glibc-hwcaps/x86-64-v2/libc.so.6", Some([7; 32])), Some(Probe::Found));
+    assert_eq!(at("/t/debug/glibc-hwcaps", None), None);
+    assert_eq!(at("/t/debug/glibc-hwcaps/x86-64-v3/x.rlib", None), None);
+    assert_eq!(at("/t/debug/glibc-hwcaps/a/b/libc.so.6", None), None);
+    assert_eq!(at("/t/debug/other/x86-64-v3/libc.so.6", None), None);
+    assert_eq!(at("/t/debug/build/glibc-hwcaps/x86-64-v3/libc.so.6", None), None);
+}
+
+/// The whole read set of a pure script's run on NixOS aarch64 with glibc 2.44 (2026-11-11:
+/// zstd-safe, rustls, parking_lot_core, getrandom, crossbeam-utils, serde_json, anyhow, libc),
+/// as `blaze explain script` gave it: each was refused one build at a time. All of it is the
+/// loader's, and the check passes it with no package file read.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_loaders_reads_before_main_are_passed_whole() {
+    const T: &str = "/root/m1/.cache/blaze/build/b-main-0123/";
+    const GLIBC: &str = "/nix/store/abc-glibc-2.44/";
+    let t = |rest: &str| format!("{T}{rest}");
+    let glibc = |rest: &str| format!("{GLIBC}{rest}");
+    let out_dir = t("debug/build/p-0123/out");
+    let program = t("debug/build/p-4567/build-script-build");
+    let search = [PathBuf::from(t("debug")), PathBuf::from(t("debug/deps"))];
+    let tools: Vec<PathBuf> = TOOLS.iter().map(PathBuf::from).collect();
+    let places = Places {
+        package: Path::new("/root/m1/registry/p-0.1.0"),
+        out_dir: Path::new(&out_dir),
+        target_dir: Path::new(T),
+        program: Path::new(&program),
+        toolchain: &tools,
+        search: &search,
+    };
+    let (found, dir, missed) = (Some([7; 32]), Some(DIRECTORY), None);
+    let reads = [
+        (String::from("/etc/ld-nix.so.preload"), missed),
+        (glibc("etc/ld.so.cache"), found),
+        (glibc("lib"), dir),
+        (glibc("lib/libc.so.6"), found),
+        (glibc("lib/libdl.so.2"), found),
+        (glibc("lib/libgcc_s.so.1"), found),
+        (t("debug"), dir),
+        (t("debug/deps"), dir),
+        (t("debug/deps/libgcc_s.so.1"), missed),
+        (t("debug/libc.so.6"), missed),
+        (t("debug/libdl.so.2"), missed),
+        (t("debug/libgcc_s.so.1"), missed),
+        (program.clone(), found),
+    ];
+    let with = |more: &[(&str, Option<[u8; 32]>)]| {
+        let mut all: Vec<(&str, Option<[u8; 32]>)> =
+            reads.iter().map(|(path, hash)| (path.as_str(), *hash)).collect();
+        all.extend_from_slice(more);
+        check("p v0.1.0", &proof(), &places, &traced_as(&all)).map_err(|it| it.0)
+    };
+    assert_eq!(with(&[]), Ok(Vec::new()));
+    // The same walk on x86-64, where glibc has hardware levels.
+    let level = t("debug/glibc-hwcaps/x86-64-v3");
+    let leveled = t("debug/glibc-hwcaps/x86-64-v3/libc.so.6");
+    assert_eq!(with(&[(&level, missed), (&leveled, missed)]), Ok(Vec::new()));
+
+    // Planted: each a read of the script's own, still refused, by its path.
+    let refused = |path: &str, hash, why: &str| {
+        let error = with(&[(path, hash)]).unwrap_err();
+        assert!(error.contains(path) && error.contains(why), "{path}: {error}");
+    };
+    // Another unit's output and a file that is no library, in a search directory.
+    refused(&t("debug/deps/libserde-0123.rlib"), found, "in the target directory");
+    refused(&t("debug/deps/libserde-0123.rlib"), missed, "in the target directory");
+    refused(&t("debug/.fingerprint"), missed, "in the target directory");
+    refused(&t("debug/notes.txt"), found, "in the target directory");
+    // A library's name in directories not on the search path.
+    refused(&t("debug/build/libgcc_s.so.1"), missed, "in the target directory");
+    refused(&t("release/libc.so.6"), missed, "in the target directory");
+    refused("/opt/lib/libc.so.6", missed, "outside its package and OUT_DIR");
+    // The target directory itself, and a directory that is none of the path's.
+    refused(T.trim_end_matches('/'), dir, "in the target directory");
+    refused(&t("debug/build"), dir, "in the target directory");
+    // A file under another package.
+    refused("/root/m1/registry/q-0.2.0/Cargo.toml", found, "outside its package and OUT_DIR");
+    // A library found on the search path was loaded: an input no pure key covers.
+    refused(&t("debug/deps/libgcc_s.so.1"), found, "its pure key does not cover");
+    refused(&t("debug/libplugin.so"), found, "its pure key does not cover");
+    // A search directory listed: the loader lists none.
+    let mut listed = traced_as(&[]);
+    listed.dirs.push((PathBuf::from(t("debug/deps")), [1; 32]));
+    let error = check("p v0.1.0", &proof(), &places, &listed).unwrap_err().0;
+    assert!(error.contains("listed") && error.contains("debug/deps"), "{error}");
+}
+
+/// A search directory outside the target directory (one the build was started with in its
+/// library path variable) is walked the same; one inside the package of a script that may
+/// read is kept as the package's file it is, in the key.
+#[test]
+fn a_search_directory_outside_the_target_directory_is_walked_the_same() {
+    let tools: Vec<PathBuf> = TOOLS.iter().map(PathBuf::from).collect();
+    let search = [PathBuf::from("/opt/lib"), PathBuf::from("/ws/p/vendor")];
+    let places = Places { search: &search, ..places(&tools) };
+    let lib = library("z");
+    let (outside, inside) = (format!("/opt/lib/{lib}"), format!("/ws/p/vendor/{lib}"));
+    let trace = traced_as(&[("/opt/lib", Some(DIRECTORY)), (&outside, None), (&inside, None)]);
+    let read = check("p v0.1.0", &proof(), &places, &trace).unwrap();
+    assert_eq!(read, vec![(PathBuf::from(&inside), None)]);
+    let mut reads_nothing = proof();
+    reads_nothing.reads = false;
+    assert_eq!(check("p v0.1.0", &reads_nothing, &places, &trace).unwrap(), Vec::new());
+    let loaded = traced_as(&[(&outside, Some([7; 32]))]);
+    let error = check("p v0.1.0", &proof(), &places, &loaded).unwrap_err().0;
+    assert!(error.contains(&outside) && error.contains("its pure key does not cover"), "{error}");
+    let other = traced_as(&[("/opt/lib/pkgconfig/z.pc", None)]);
+    let error = check("p v0.1.0", &proof(), &places, &other).unwrap_err().0;
+    assert!(error.contains("outside its package and OUT_DIR"), "{error}");
 }
 
 #[test]

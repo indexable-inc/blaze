@@ -182,6 +182,11 @@ pub struct Places<'a> {
     /// The toolchain's directories the sandbox lets every script read (blaze's stand-ins for
     /// cargo's tools, the launcher), which the runtime may read before `main`.
     pub toolchain: &'a [PathBuf],
+    /// The run's library search path: the directories blaze put in the script's library path
+    /// variable for this run (`blaze_build_script::env::dylib_search_path` of its environment),
+    /// `target/debug` and `target/debug/deps` among them. The loader walks them before `main`
+    /// looking for each library the program needs ([`probe`]).
+    pub search: &'a [PathBuf],
 }
 
 /// The directories and files the dynamic loader and the runtime read before `main` on this
@@ -204,6 +209,16 @@ pub const RUNTIME: &[&str] = &[
     "/etc/ld.so.conf.d",
     "/proc/self",
     "/sys/devices/system/cpu",
+    // glibc's malloc reads the huge page settings when a tunable asks (`__malloc_hugepages`,
+    // `__malloc_default_thp_pagesize`), and its `sysconf` the page sizes.
+    "/sys/kernel/mm/transparent_hugepage",
+    "/sys/kernel/mm/hugepages",
+    // glibc's `__libc_alloca_cutoff`/`malloc` (`check_may_shrink_heap`) and `qsort`'s
+    // allocation bound.
+    "/proc/sys/vm/overcommit_memory",
+    // musl's loader: its search path file, by the machine's name.
+    "/etc/ld-musl-aarch64.path",
+    "/etc/ld-musl-x86_64.path",
 ];
 #[cfg(target_os = "macos")]
 pub const RUNTIME: &[&str] =
@@ -253,6 +268,8 @@ pub fn check(
         // alloc: error path
         return Err(Error(format!("{what}{who}")));
     }
+    // A listing is never the loader's: it opens a search directory's files by name and looks at
+    // the directory, and lists neither. So a listed search directory is refused as any other.
     if let Some((dir, _)) = traced.dirs.iter().find(|(dir, _)| !runtime(dir, places)) {
         // alloc: error path
         return Err(bug(format!("listed {}, which its proof says it never does", dir.display())));
@@ -261,6 +278,27 @@ pub fn check(
     for (path, hash) in &traced.files {
         if path.starts_with(places.out_dir) || path == places.program {
             continue;
+        }
+        // The loader's walk of the run's library search path, wherever the path's directories
+        // are; inside the package a script that may read keeps them as its reads instead, the
+        // stricter of the two.
+        let keeps = proof.reads
+            && path.starts_with(places.package)
+            && !path.starts_with(places.target_dir);
+        if !keeps {
+            match probe(path, hash.as_ref(), places.search) {
+                Some(Probe::Directory | Probe::Missed) => continue,
+                // No key of a pure script has a library found on its search path: the proof
+                // is of its code's instance graph, and says nothing of a library it loads.
+                Some(Probe::Found) => {
+                    // alloc: error path
+                    return Err(Error(format!(
+                        "the build script of `{script}` was proved pure, but its loader found {} on the library search path blaze gave its run: a library loaded from there is an input its pure key does not cover (keys-cover-every-input), so the script is not pure",
+                        path.display()
+                    )));
+                }
+                None => {}
+            }
         }
         if path.starts_with(places.target_dir) {
             // alloc: error path
@@ -296,6 +334,110 @@ pub fn check(
 fn runtime(path: &Path, places: &Places<'_>) -> bool {
     RUNTIME.iter().any(|root| path.starts_with(root))
         || places.toolchain.iter().any(|root| path.starts_with(root))
+}
+
+/// What a read is of the loader's walk of a library search path ([`probe`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Probe {
+    /// A search directory itself, looked at (the loader's `stat` of a directory none of its
+    /// opens found anything in), there or not.
+    Directory,
+    /// A library's name looked for in a search directory and not there.
+    Missed,
+    /// A library's name looked for in a search directory and found: the loader loaded it.
+    Found,
+}
+
+/// What `path`, traced with `hash` (`None` for nothing there, [`crate::trace::DIRECTORY`] for
+/// a directory), is of the loader's walk of `search`, the run's library search path, before
+/// `main`; `None` when it is no part of that walk, and so a read of the script's own.
+///
+/// The loader takes each library the program needs and, for each search directory in order,
+/// opens `<directory>/<name>`; glibc then looks at a directory nothing was found in. So the
+/// walk is exactly: a search directory, and a direct child of one named as a library is
+/// ([`library_name`]). glibc also looks under `<directory>/glibc-hwcaps/<level>` for each
+/// level the machine has (elf/dl-hwcaps.c: `x86-64-v2`.. on x86-64, `power9`.., `z13`..; none
+/// on aarch64): that directory, and a library's name in it. Nothing else under a search
+/// directory is the loader's: another unit's `.rlib`, `.d` or `.rmeta` there is refused.
+pub fn probe(path: &Path, hash: Option<&[u8; 32]>, search: &[PathBuf]) -> Option<Probe> {
+    let directory = || match hash {
+        None => Some(Probe::Directory),
+        Some(it) if *it == crate::trace::DIRECTORY => Some(Probe::Directory),
+        // A file where a search directory is named: nothing the loader walks.
+        Some(_) => None,
+    };
+    let on_path = |dir: &Path| search.iter().any(|it| it.as_path() == dir);
+    // glibc's `<directory>/glibc-hwcaps/<level>`, on Linux alone.
+    let hwcaps = |dir: &Path| {
+        cfg!(target_os = "linux")
+            && dir.parent().is_some_and(|caps| {
+                caps.file_name() == Some(OsStr::new("glibc-hwcaps"))
+                    && caps.parent().is_some_and(|it| on_path(it))
+            })
+    };
+    if on_path(path) || hwcaps(path) {
+        return directory();
+    }
+    let (dir, name) = (path.parent()?, path.file_name()?);
+    if !(on_path(dir) || hwcaps(dir)) || !library_name(name, Loader::HOST) {
+        return None;
+    }
+    match hash {
+        None => Some(Probe::Missed),
+        // A directory named as a library is: the loader's open of it reads nothing.
+        Some(it) if *it == crate::trace::DIRECTORY => Some(Probe::Missed),
+        Some(_) => Some(Probe::Found),
+    }
+}
+
+/// Whose names a shared library has ([`library_name`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Loader {
+    /// ELF's (`ld.so`, musl's): `lib*.so`, `lib*.so.<version>`.
+    Elf,
+    /// dyld's: `*.dylib`.
+    Dyld,
+    /// Windows': `*.dll`.
+    Windows,
+}
+
+impl Loader {
+    /// This machine's, which runs the script.
+    #[cfg(target_vendor = "apple")]
+    pub const HOST: Loader = Loader::Dyld;
+    #[cfg(windows)]
+    pub const HOST: Loader = Loader::Windows;
+    #[cfg(not(any(target_vendor = "apple", windows)))]
+    pub const HOST: Loader = Loader::Elf;
+}
+
+/// Whether `name`, a file's name, is a shared library's as `loader` names them: ELF's
+/// `lib<something>.so` and `lib<something>.so.<digits and dots>` (`libc.so.6`,
+/// `libgcc_s.so.1`, `libz.so.1.3.1`), dyld's `<something>.dylib`, Windows' `<something>.dll`
+/// (in any case). Nothing else: not `libfoo.rlib`, `libfoo.so.d`, `foo.so` or `libfoo.so.`.
+pub fn library_name(name: &OsStr, loader: Loader) -> bool {
+    let Some(name) = name.to_str() else { return false };
+    let stem_then = |suffix: &str| {
+        name.len() > suffix.len()
+            && name.is_char_boundary(name.len() - suffix.len())
+            && name[name.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+    };
+    match loader {
+        Loader::Elf => {
+            let Some(rest) = name.strip_prefix("lib") else { return false };
+            let Some((stem, version)) = rest.split_once(".so") else { return false };
+            // `.so` is the first one: a version has none, so `liba.so.so` is refused below.
+            let versioned = version.strip_prefix('.').is_some_and(|it| {
+                !it.is_empty()
+                    && it.split('.').all(|part| {
+                        !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())
+                    })
+            });
+            !stem.is_empty() && (version.is_empty() || versioned)
+        }
+        Loader::Dyld => name.ends_with(".dylib") && name.len() > ".dylib".len(),
+        Loader::Windows => stem_then(".dll"),
+    }
 }
 
 /// What a succeeded run of the pure script `script` printed and wrote, against `proof`.

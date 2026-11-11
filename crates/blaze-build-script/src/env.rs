@@ -467,6 +467,22 @@ fn joined<'b>(buf: &'b mut PathBuf, dir: &Path, name: &str) -> &'b Path {
     buf
 }
 
+/// The directories the dynamic loader of `host` searches for the libraries of a program started
+/// in `env` (a script's whole environment, as [`env`] makes it): the value of the host's
+/// library path variable there, split as the host splits it, in order. Empty when the
+/// variable is not set. What a check of a run's reads knows the loader's probes by
+/// (`blaze_usercode::pure::Places::search`): the very list the run was given, never one made
+/// again from the unit.
+pub fn dylib_search_path(host: &str, env: &[(OsString, OsString)]) -> Vec<PathBuf> {
+    let host = HostOs::of(host);
+    // The last of a name is the one a process started in `env` sees.
+    env.iter()
+        .rev()
+        .find(|(name, _)| name == OsStr::new(host.dylib_var))
+        .map(|(_, value)| host.split_paths(value))
+        .unwrap_or_default()
+}
+
 /// About how many words cargo has on the fixed set of names, the dynamic library path's two
 /// among them.
 const FIXED: usize = 40;
