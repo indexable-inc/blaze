@@ -167,7 +167,7 @@ def blockEq (a b : BasicBlock) : Bool := decide (a = b) || sameSome (symBlock a)
 theorem blockEq_sound (adts : List AdtDecl) (sig : FnId → Option FnSig) (st : State)
     (a b : BasicBlock) (h : blockEq a b = true) :
     execBlock adts sig st b = execBlock adts sig st a := by
-  cases or_true_cases h with
+  cases Opt.or_true_cases h with
   | inl same =>
     have e : a = b := of_decide_eq_true same
     rw [e]
@@ -248,7 +248,7 @@ theorem block_of_rel (adts : List AdtDecl) (sig : FnId → Option FnSig) (st : S
     | none =>
       cases hy : nth? y.blocks b with
       | none => rfl
-      | some by' =>
+      | some blkY =>
         rw [hx, hy] at rel
         exact False.elim rel
     | some bx =>
@@ -256,9 +256,9 @@ theorem block_of_rel (adts : List AdtDecl) (sig : FnId → Option FnSig) (st : S
       | none =>
         rw [hx, hy] at rel
         exact False.elim rel
-      | some by' =>
+      | some blkY =>
         rw [hx, hy] at rel
-        exact blockEq_sound adts sig st bx by' rel
+        exact blockEq_sound adts sig st bx blkY rel
 
 /-- Symbolically equal programs step alike. -/
 theorem step_symEq (a b : Program) (h : symEq a b = true) :
