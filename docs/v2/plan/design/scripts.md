@@ -202,12 +202,12 @@ pairs: the Rust script beside the Python, then, once both were run on the same i
 agreed byte for byte, the switch that deletes the Python and its line of the list below.
 
 **No new Python** (rule guard-the-cause): `tools/python-allowed.txt` lists every tracked `.py`
-file. `python3 tools/docs.py check`, which every gate runs, fails for a `.py` file that is not
-on it (write it in Rust) and for a line whose file is gone (`python3 tools/docs.py write` takes
-it out, and never adds one), so the list only shrinks. Ledger row D43 is met when
-`tools/docs.py python '{"left": 0}'` passes: the list is empty and no `.py` file is tracked.
-The check moves into the Rust `docs` script with `tools/docs.py`, and then holds that there is
-no `.py` file at all.
+file. The `docs` script's `check` (`blaze run -q -p scripts --bin docs -- check`, on the pinned
+release), which every gate runs, fails for a `.py` file that is not on it (write it in Rust)
+and for a line whose file is gone (its `write` takes it out, and never adds one), so the list
+only shrinks. Ledger row D43 is met when `... --bin docs -- python '{"left": 0}'` passes: the
+list is empty and no `.py` file is tracked; then the check holds that there is no `.py` file at
+all.
 
 ## Ports and their parity
 
@@ -225,10 +225,10 @@ the row says otherwise. `state`: `written` (the Rust is in the tree, not yet com
 
 | script | state | Python | Rust | must be equal |
 |---|---|---|---|---|
-| docs | agreed | `python3 tools/docs.py selftest` | `R docs -- selftest` | output (`docs.py selftest: ok`), status 0 |
-| docs | agreed | `python3 tools/docs.py check` | `R docs -- check` | on a clean tree: nothing printed, status 0. Then on a tree with each of these planted, one at a time: a new `x.py`; a line `gone.py` added to `tools/python-allowed.txt`; a link to `nope.md` and a link to the anchor `#nope` of `harness.md` in a current doc; `` `crates/nope` `` and `BLAZE_NOPE` in a current doc; a doc with no front matter; `status: draft`: the same lines on standard error, status 1 |
-| docs | agreed | `python3 tools/docs.py write` | `R docs -- write` | after each, `git status --short` is empty on a clean tree; with a doc's `summary` changed, `docs/README.md` is the same bytes from both (`git diff` after one, then the other) |
-| docs | agreed | `python3 tools/docs.py python '{"left": 0}'`, `'{"left": 166}'`, `'{"lft": 1}'`, `'{}'`, `'{"left": true}'`, `'[1]'` | `R docs -- python <the same>` | all but the JSON syntax error's words after `the input is not JSON:` (none of these inputs has one) |
+| docs | switched | `python3 tools/docs.py selftest` | `R docs -- selftest` | output (`docs.py selftest: ok`), status 0 |
+| docs | switched | `python3 tools/docs.py check` | `R docs -- check` | on a clean tree: nothing printed, status 0. Then on a tree with each of these planted, one at a time: a new `x.py`; a line `gone.py` added to `tools/python-allowed.txt`; a link to `nope.md` and a link to the anchor `#nope` of `harness.md` in a current doc; `` `crates/nope` `` and `BLAZE_NOPE` in a current doc; a doc with no front matter; `status: draft`: the same lines on standard error, status 1 |
+| docs | switched | `python3 tools/docs.py write` | `R docs -- write` | after each, `git status --short` is empty on a clean tree; with a doc's `summary` changed, `docs/README.md` is the same bytes from both (`git diff` after one, then the other) |
+| docs | switched | `python3 tools/docs.py python '{"left": 0}'`, `'{"left": 166}'`, `'{"lft": 1}'`, `'{}'`, `'{"left": true}'`, `'[1]'` | `R docs -- python <the same>` | all but the JSON syntax error's words after `the input is not JSON:` (none of these inputs has one) |
 | ledger | switched | `uv run --frozen python harness/v2/ledger.py selftest` | `R ledger -- selftest` | output (`ledger.py selftest: ok`), status 0 |
 | ledger | switched | `... ledger.py '{"command": "check"}'` | `R ledger -- '{"command": "check"}'` | clean tree: silent, status 0; with a row's `known` edited in objectives.json: the stale-table line, status 1; with a row's `paths` naming a missing path, an id used twice, `{"command": "chek"}`, `{"comand": "check"}`, no argument (the usage and the docstring): the same lines, status 1 |
 | ledger | switched | `... ledger.py '{"command": "write"}'` | `R ledger -- '{"command": "write"}'` | `git status --short` empty after each on a clean tree; after a row's `known` is edited, objectives.json and objectives.md are the same bytes from both |
@@ -425,7 +425,7 @@ the clean-tree `check` proves it). The ledger's default `work` directory is
 | tools/bench/remote-cache/gateway_v0.py | 170 | LIVE | named in tools/remote-cache/README.md |
 | tools/cpus.py | 241 | LIVE | run by .github/workflows/toolchain-bump.yaml |
 | tools/devirt/bench.py | 220 | LIVE | named in tools/devirt/dyn_loop/src/main.rs |
-| tools/docs.py | 259 | LIVE | run by .github/workflows/blaze.yaml |
+| tools/docs.py | 259 | SWITCHED | deleted: scripts/src/bin/docs.rs agreed with it on blaze 0.20261105.4 (2026-11-11) |
 | tools/layout/bench.py | 325 | DEAD | second pass: only a plan names it, nothing that runs |
 | tools/nix/life_launch.py | 132 | LIVE | named in crates/blaze-live/Cargo.toml (+1) |
 | tools/nix/unit_build.py | 175 | LIVE | used by live tools/nix/unit_graph.py |

@@ -299,14 +299,14 @@ not by a code review (rule `dst-not-review`).
 
 ## Documents
 
-Every doc under `docs/` opens with front matter saying what it is (`tools/docs.py` has the
-fields): `current` (how blaze is now, kept true), `plan` (a design not fully built, dated),
+Every doc under `docs/` opens with front matter saying what it is (`scripts/src/bin/docs.rs` has
+the fields): `current` (how blaze is now, kept true), `plan` (a design not fully built, dated),
 `record` (research, a report or a measurement, true on its date and never brought up to date) or
 `superseded` (with `superseded_by`, what replaced it). [docs/README.md](README.md) is the index,
-generated from it; superseded docs are left out. CI's `python3 tools/docs.py check` holds every
+generated from it; superseded docs are left out. CI's `blaze run -q -p scripts --bin docs -- check` holds every
 doc's links, and a current doc's anchors, repository paths in backticks and `BLAZE_*` settings,
 against the tree, and every doc that code names. A change that makes a current doc
-untrue fixes it in the same change, or marks it superseded; `python3 tools/docs.py write`
+untrue fixes it in the same change, or marks it superseded; `blaze run -q -p scripts --bin docs -- write`
 regenerates the index.
 
 ## Working in parallel

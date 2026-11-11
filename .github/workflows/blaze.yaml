@@ -127,12 +127,6 @@ jobs:
       # Under bun: tsc's script asks for node, which ix's runner image does not have.
       - run: bun site/node_modules/.bin/tsc -p tools/agents
       - run: bun tools/agents/rules.ts --check
-      # Each doc says what it is, the current ones hold against the tree, and docs/README.md is
-      # their index (tools/docs.py). And no Python file is added: tools/python-allowed.txt lists
-      # the ones left and only shrinks (docs/v2/plan/design/scripts.md).
-      - run: |
-          python3 tools/docs.py selftest
-          python3 tools/docs.py check
       # The repository's Rust scripts (scripts/, docs/v2/plan/design/scripts.md) run on the
       # release .github/blaze-version names, never on the blaze this tree builds: a tree whose
       # compiler does not build must still be checked (the stage-0 rule). No LLVM: the scripts
@@ -140,6 +134,12 @@ jobs:
       - uses: ./.github/actions/blaze
         with:
           job: scripts
+      # Each doc says what it is, the current ones hold against the tree, and docs/README.md is
+      # their index (scripts/src/bin/docs.rs). And no Python file is added: tools/python-allowed.txt
+      # lists the ones left and only shrinks (docs/v2/plan/design/scripts.md).
+      - run: |
+          blaze run -q -p scripts --bin docs -- selftest
+          blaze run -q -p scripts --bin docs -- check
       # The objectives ledger's rows are well formed and its table is current (scripts/src/bin/ledger.rs).
       - run: |
           blaze run -q -p scripts --bin ledger -- selftest

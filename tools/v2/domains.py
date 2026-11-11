@@ -2,7 +2,7 @@
 domain string are one hash to whoever compares their outputs (AGENTS.md one-concept-one-home).
 
 Input: `{"root": "<repository>"}` (inline, a path, or `-`). Prints one line per problem and exits
-1 when there is any; CI runs it beside `tools/docs.py check`.
+1 when there is any; CI runs it beside the `docs` script's `check`.
 
 A domain is a `str` literal under `crates/` that starts with `blaze` and ends in its version
 number (`"blaze v2 body code 1"`, `"blaze plane history 1"`), the form every domain in the tree

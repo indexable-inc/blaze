@@ -1,6 +1,6 @@
-# The Python files left (docs/v2/plan/design/scripts.md). `python3 tools/docs.py check` fails for a
-# .py file that is not here; `python3 tools/docs.py write` takes out the lines whose file is gone
-# and never adds one. A new script is written in Rust.
+# The Python files left (docs/v2/plan/design/scripts.md). `blaze run -q -p scripts --bin docs --
+# check` fails for a .py file that is not here; `... --bin docs -- write` takes out the lines whose
+# file is gone and never adds one. A new script is written in Rust.
 .github/scripts/bench_commit.py
 .github/scripts/build_release.py
 .github/scripts/canary.py
@@ -150,7 +150,6 @@ tools/bench/remote-cache/cas_v1.py
 tools/bench/remote-cache/gateway_v0.py
 tools/cpus.py
 tools/devirt/bench.py
-tools/docs.py
 tools/nix/life_launch.py
 tools/nix/unit_build.py
 tools/nix/unit_graph.py

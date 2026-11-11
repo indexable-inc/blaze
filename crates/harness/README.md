@@ -6,7 +6,7 @@ on den's flecs stack, libghostty for terminal state). Imported with its history 
 
 harness is its own cargo workspace with its own `Cargo.lock`, excluded from blaze's workspace
 (blaze's root `Cargo.toml`): blaze's gate does not build or check it, and blaze's astlog rules,
-`harness/rustcsites.py` and `tools/docs.py` skip this directory. Build it with blaze, on the Mac:
+`harness/rustcsites.py` and the `docs` script (`scripts/src/bin/docs.rs`) skip this directory. Build it with blaze, on the Mac:
 
     cd crates/harness && blaze build --release    # harness, harness-native, harness-video
 

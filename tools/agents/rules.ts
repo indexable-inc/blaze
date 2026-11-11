@@ -60,7 +60,7 @@ const skills = {
 	"docs-and-scripts": {
 		title: "Docs, scripts and agent interfaces",
 		description:
-			"Conventions for blaze's documents, scripts and agent-facing interfaces: docs/ front matter (current, plan, record, superseded) and `tools/docs.py`, scripts that take one typed JSON value, and no MCP. Load before writing or editing a doc under docs/, writing or changing a script, or designing an interface agents call.",
+			"Conventions for blaze's documents, scripts and agent-facing interfaces: docs/ front matter (current, plan, record, superseded) and the `docs` script (`scripts/src/bin/docs.rs`), scripts that take one typed JSON value, and no MCP. Load before writing or editing a doc under docs/, writing or changing a script, or designing an interface agents call.",
 	},
 	debugging: {
 		title: "Debugging blaze from its profile",
@@ -396,7 +396,7 @@ export const rules = [
 		id: "docs-say-what-they-are",
 		skill: "docs-and-scripts",
 		line: "Every doc under `docs/` says in front matter whether it is current, plan, record or superseded; keep current docs true.",
-		info: "Every doc under `docs/` has front matter: `current` (kept true), `plan`, `record` (dated history) or `superseded` (naming its replacement). Trust current docs; read plans and records as of their date. A change that makes a current doc untrue fixes it or marks it superseded in the same change; `python3 tools/docs.py check` holds them to the tree.",
+		info: "Every doc under `docs/` has front matter: `current` (kept true), `plan`, `record` (dated history) or `superseded` (naming its replacement). Trust current docs; read plans and records as of their date. A change that makes a current doc untrue fixes it or marks it superseded in the same change; `blaze run -q -p scripts --bin docs -- check` holds them to the tree.",
 		reason: "Andrew, 2026-10-28: docs should \"be structured or something so can say things are outdated filter those out\". Agents followed AGENTS.md's stale `vendor/rust-analyzer` after the front end moved to crates/.",
 		link: "docs/contributing.md#documents",
 	},

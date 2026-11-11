@@ -1,13 +1,15 @@
 //! docs: every document under docs/ says what it is, and the current ones are held to the tree.
-//! The port of `tools/docs.py`, line for line: the same commands, the same text printed, the same
-//! exit status, the same bytes written (docs/v2/plan/design/scripts.md, "The order").
+//! The port of `tools/docs.py`, deleted once both were run on the same tree and agreed byte for
+//! byte (docs/v2/plan/design/scripts.md, "Ports and their parity"): the same commands, text
+//! printed, exit status and bytes written.
 //!
-//!     blaze run -p scripts --bin docs -- check      fail naming each problem (CI)
-//!     blaze run -p scripts --bin docs -- write      regenerate docs/README.md, the index, from the
-//!                                                   front matter, and take the files that are gone
-//!                                                   out of tools/python-allowed.txt
-//!     blaze run -p scripts --bin docs -- python '{"left": 0}'   at most `left` Python files remain
-//!     blaze run -p scripts --bin docs -- selftest
+//!     blaze run -q -p scripts --bin docs -- check      fail naming each problem (CI)
+//!     blaze run -q -p scripts --bin docs -- write      regenerate docs/README.md, the index, from
+//!                                                      the front matter, and take the files that
+//!                                                      are gone out of tools/python-allowed.txt
+//!     blaze run -q -p scripts --bin docs -- python '{"left": 0}'   at most `left` Python files
+//!                                                      remain (ledger D43)
+//!     blaze run -q -p scripts --bin docs -- selftest
 //!
 //! Each docs/**/*.md but docs/README.md (generated) and docs/upstream/ (others' text, as fetched)
 //! opens with front matter, one `key: value` per line between `---` lines:
@@ -46,7 +48,8 @@ use blaze_script::{
     run,
 };
 
-/// What the Python called itself in every line it printed; kept so the output is the same bytes.
+/// What the Python called itself in every line it printed; kept so the output stayed the same
+/// bytes through the switch.
 const SAYS: &str = "tools/docs.py";
 const STATUSES: [&str; 4] = ["current", "plan", "record", "superseded"];
 const FRONT_FIELDS: [&str; 4] = ["status", "summary", "date", "superseded_by"];
@@ -58,9 +61,9 @@ const TREE: [&str; 10] =
 /// harness (its own workspace) and the flecs skills, about other projects.
 const NOT_OURS: [&str; 6] =
     ["docs/", "library/", "vendor/", "crates/harness/", ".agents/skills/flecs/", ".agents/skills/flecs-ui/"];
-const ALLOWED_HEAD: &str = "# The Python files left (docs/v2/plan/design/scripts.md). `python3 tools/docs.py check` fails for a
-# .py file that is not here; `python3 tools/docs.py write` takes out the lines whose file is gone
-# and never adds one. A new script is written in Rust.
+const ALLOWED_HEAD: &str = "# The Python files left (docs/v2/plan/design/scripts.md). `blaze run -q -p scripts --bin docs --
+# check` fails for a .py file that is not here; `... --bin docs -- write` takes out the lines whose
+# file is gone and never adds one. A new script is written in Rust.
 ";
 
 /// The patterns of tools/docs.py, compiled once. The ones Python wrote with a lookaround or a
@@ -271,7 +274,7 @@ fn py_repr(s: &str) -> String {
 fn parse_front(p: &Patterns, path: &str, text: &str, errors: &mut Vec<String>) -> (Option<Front>, String) {
     if !text.starts_with("---\n") {
         errors.push(format!(
-            "{path}: no front matter (`---`, then status, summary and the rest; tools/docs.py)"
+            "{path}: no front matter (`---`, then status, summary and the rest; scripts/src/bin/docs.rs)"
         ));
         return (None, text.to_owned());
     }
@@ -513,12 +516,12 @@ fn python_problems(files: &[String], listed: &[String]) -> Vec<String> {
         })
         .collect();
     errors.extend(listed.iter().filter(|path| !files.contains(path)).map(|path| {
-        format!("tools/python-allowed.txt: {path} is gone: run `python3 tools/docs.py write` and commit it")
+        format!("tools/python-allowed.txt: {path} is gone: run `blaze run -q -p scripts --bin docs -- write` and commit it")
     }));
     let sorted: Vec<&String> = listed.iter().collect::<BTreeSet<_>>().into_iter().collect();
     if errors.is_empty() && listed.iter().collect::<Vec<_>>() != sorted {
         errors.push(
-            "tools/python-allowed.txt: not sorted, or a path twice: run `python3 tools/docs.py write`".to_owned(),
+            "tools/python-allowed.txt: not sorted, or a path twice: run `blaze run -q -p scripts --bin docs -- write`".to_owned(),
         );
     }
     errors
@@ -613,7 +616,7 @@ fn check(root: &Path, p: &Patterns) -> Vec<String> {
     }
     if errors.is_empty() && read_text(&root.join("docs").join("README.md")).as_deref() != Some(index(&docs).as_str())
     {
-        errors.push("docs/README.md is stale: run `python3 tools/docs.py write` and commit it".to_owned());
+        errors.push("docs/README.md is stale: run `blaze run -q -p scripts --bin docs -- write` and commit it".to_owned());
     }
     errors
 }
@@ -642,10 +645,10 @@ fn index(docs: &[Doc]) -> String {
         out
     }
     let mut out: Vec<String> = [
-        "<!-- Generated by `python3 tools/docs.py write` from each doc's front matter; edit those, not this. -->",
+        "<!-- Generated by `blaze run -q -p scripts --bin docs -- write` from each doc's front matter; edit those, not this. -->",
         "# Documents",
         "",
-        "Each document under docs/ says in its front matter what it is (tools/docs.py). Superseded ones",
+        "Each document under docs/ says in its front matter what it is (scripts/src/bin/docs.rs). Superseded ones",
         "are left out here; each names what replaced it. docs/upstream/ holds others' text, as fetched.",
         "",
     ]
