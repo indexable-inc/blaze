@@ -610,7 +610,21 @@ fn failure(
                 .fact("ended", Text::plain(format!("it ended with {status}"))); // alloc: as above
             let report = tail(report, "stderr", &String::from_utf8_lossy(stderr));
             // Its directives are cargo's, not words for a person.
-            tail(report, "stdout", &printed)
+            let report = tail(report, "stdout", &printed);
+            match checkout_without_git(&unit.package.manifest_dir, stderr) {
+                // alloc: as above
+                Some(root) => report.fact(
+                    "cause",
+                    Text::plain(format!(
+                        "git found no repository: the package is in blaze's checkout of a git \
+                         dependency ({}), which has no `.git`, where cargo's checkout has one \
+                         that answers `git rev-parse HEAD` with the locked commit. This is \
+                         blaze's fault, not the script's: nothing in the package is to change",
+                        root.display()
+                    )),
+                ),
+                None => report,
+            }
         }
         (true, [one]) => Report::error(Text::marked(one)).rule("build-script:error"),
         (true, []) => {
@@ -653,6 +667,28 @@ fn failure(
         report = report.fact("unread", Text::plain(line));
     }
     report
+}
+
+/// The root of blaze's checkout of a git dependency that the package directory `dir` is in
+/// (`<sources>/git/checkouts/<ident>/<commit>`, the whole commit:
+/// [`crate::serve::fetch::keep_on_disk`]), when it has no `.git` and the failed run's `stderr`
+/// has git saying it is in no repository. cargo's checkout of the same commit is a clone of
+/// its database, where a script's `git rev-parse` and `git describe` answer; blaze's is the
+/// commit's files alone (`serve/fetch/git.rs`), so such a script fails under blaze only, and
+/// its failure says so.
+fn checkout_without_git(dir: &Path, stderr: &[u8]) -> Option<PathBuf> {
+    const SAID: &[u8] = b"not a git repository";
+    if !stderr.windows(SAID.len()).any(|it| it == SAID) {
+        return None;
+    }
+    let root = dir.ancestors().find(|root| {
+        let commit = root.file_name().and_then(|it| it.to_str()).is_some_and(|it| {
+            matches!(it.len(), 40 | 64) && it.bytes().all(|it| it.is_ascii_hexdigit())
+        });
+        commit
+            && root.parent().and_then(Path::parent).is_some_and(|it| it.ends_with("git/checkouts"))
+    })?;
+    (!root.join(".git").exists()).then(|| root.to_owned())
 }
 
 /// `report` with the last [`TAIL`] lines of `text` that are not cargo directives, each a fact

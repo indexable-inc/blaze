@@ -1,5 +1,5 @@
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
 
@@ -8,8 +8,8 @@ use blaze_core::{Completion, Done, Effect, FileName, IoError, Stamp, Tag};
 use blaze_usercode::run::OutFile;
 
 use super::{
-    BYTES, CUT, LOOK, LOOK_EVERY, QUIET_MOST, Quiet, Stuck, TICK, TIMED, Writing, file_name,
-    out_files, rechecks_in, verifies_in, with_reads,
+    BYTES, CUT, LOOK, LOOK_EVERY, QUIET_MOST, Quiet, Stuck, TICK, TIMED, Writing,
+    checkout_without_git, failure, file_name, out_files, rechecks_in, verifies_in, with_reads,
 };
 
 const RUN: Tag = Tag(5 << 32);
@@ -382,4 +382,28 @@ fn a_package_watch_is_named_and_many_reads_are_folded() {
     let changed = differ(&was, &now);
     assert_eq!(changed.len(), 1, "{changed:?}");
     assert!(changed[0].starts_with("its other "), "{changed:?}");
+}
+
+/// A script of a git dependency whose `git` found no repository is said to have failed for
+/// blaze's checkout having no `.git`, naming the checkout; any other failure there, and the
+/// same words of a package that is in no checkout, say nothing of it.
+#[test]
+fn a_git_dependencys_script_that_found_no_repository_names_blazes_checkout() {
+    let root = "/h/.cache/blaze/sources/git/checkouts/reth-e231042ee7db3fb7/467449357b6d0aca6c1fb7cc2d87a304bb8fbff5";
+    let dir = PathBuf::from(format!("{root}/crates/node/core"));
+    let said = b"fatal: not a git repository (or any of the parent directories): .git\n";
+    assert_eq!(checkout_without_git(&dir, said), Some(PathBuf::from(root)));
+    assert_eq!(checkout_without_git(&dir, b"DEP_LLVM_23_CONFIG_PATH is not set"), None);
+    assert_eq!(checkout_without_git(Path::new("/w/reth/crates/node/core"), said), None);
+    let mut unit = unit();
+    unit.package.manifest_dir = dir;
+    let status = blaze_build_script::run::Ended { code: Some(1), signal: None };
+    let failed = blaze_build_script::run::Failed {
+        error: blaze_build_script::Error("the script exited with 1".to_owned()),
+        log_messages: Vec::new(),
+    };
+    let report = failure(&unit, status, &failed, b"", said);
+    let cause = report.facts.iter().find(|it| it.key == "cause").expect("the cause is a fact");
+    let cause = format!("{:?}", cause.text);
+    assert!(cause.contains(root) && cause.contains("has no `.git`"), "{cause}");
 }
