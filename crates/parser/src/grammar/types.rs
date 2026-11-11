@@ -556,13 +556,20 @@ pub(super) fn opt_type_bounds_as_dyn_trait_type(
 
 // test pattern_type
 // type T = builtin#pattern_type (u8 is 0..10);
+
+// test pattern_type_base
+// type P = builtin#pattern_type (*const u8 is !null);
 fn pattern_type(p: &mut Parser<'_>) {
     let m = p.start();
     p.bump_remap(T![builtin]);
     p.bump(T![#]);
     if p.eat_contextual_kw(T![pattern_type]) {
         p.expect(T!['(']);
-        type_(p);
+        // The `is` after the base is this builtin's: a path at the end of the base (`u8`, the
+        // `T` of `*const T`) must not take it as a bare pattern type
+        // (`#![blaze::pattern_types]`), or every pattern type of core (`NonNull`'s pointer,
+        // `NonZero`'s inner integers) parses with no pattern and lowers to the error type.
+        p.with_pattern_base(type_);
         if !p.eat_contextual_kw(T![is]) {
             p.error("expected `is`")
         }

@@ -560,6 +560,10 @@ mod ok {
     #[test]
     fn pattern_type() { run_and_expect_no_errors("test_data/parser/inline/ok/pattern_type.rs"); }
     #[test]
+    fn pattern_type_base() {
+        run_and_expect_no_errors("test_data/parser/inline/ok/pattern_type_base.rs");
+    }
+    #[test]
     fn placeholder_pat() {
         run_and_expect_no_errors("test_data/parser/inline/ok/placeholder_pat.rs");
     }

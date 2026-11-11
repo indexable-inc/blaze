@@ -54,6 +54,11 @@ pub(crate) struct Parser<'t> {
     /// `|` follow one (a closure's parameters, after `as`) and inside one union's members
     /// ([`Parser::with_unions`]). The `|` itself must have it ([`Parser::union_bar_gate`]).
     unions: bool,
+    /// Whether the type being read is the base of a `builtin#pattern_type(T is PAT)`
+    /// (`core::pattern_type!`), outside any delimiter within it: there the `is` after a path is
+    /// the builtin's own, never a bare pattern type's, so `u8 is 1..` and `*const T is !null`
+    /// are read as rustc reads them ([`Parser::with_pattern_base`]).
+    pattern_base: bool,
 }
 
 const PARSER_STEP_LIMIT: usize = if cfg!(debug_assertions) { 150_000 } else { 15_000_000 };
@@ -71,6 +76,7 @@ impl<'t> Parser<'t> {
             closed_curlies: None,
             bare_pattern_types: true,
             unions: inp.any_extensions().error_unions(),
+            pattern_base: false,
         }
     }
 
@@ -82,7 +88,16 @@ impl<'t> Parser<'t> {
 
     /// Whether a bare `T is PAT` is a type here (`#![blaze::pattern_types]`).
     pub(crate) fn bare_pattern_types(&self) -> bool {
-        self.bare_pattern_types
+        self.bare_pattern_types && !self.pattern_base
+    }
+
+    /// Runs `parse` on the base type of a `builtin#pattern_type(T is PAT)`: until a delimiter
+    /// opens ([`Parser::with_unions`] with `true`), the `is` after a path type is left for the
+    /// builtin.
+    pub(crate) fn with_pattern_base(&mut self, parse: impl FnOnce(&mut Parser<'t>)) {
+        let before = std::mem::replace(&mut self.pattern_base, true);
+        parse(self);
+        self.pattern_base = before;
     }
 
     /// Whether a type parsed here may be an error union `A | B`.
@@ -107,12 +122,17 @@ impl<'t> Parser<'t> {
 
     /// Runs `parse` with error unions allowed (`true`, inside a delimiter: only when some
     /// token of the input has the extension) or not (`false`), then puts back what was allowed
-    /// before.
+    /// before. Inside a delimiter a type is also no longer the base of a
+    /// `builtin#pattern_type` ([`Parser::with_pattern_base`]): `Foo<E is E::A>` there is a bare
+    /// pattern type again.
     pub(crate) fn with_unions(&mut self, allowed: bool, parse: impl FnOnce(&mut Parser<'t>)) {
+        let pattern_base = self.pattern_base && !allowed;
+        let pattern_base_before = std::mem::replace(&mut self.pattern_base, pattern_base);
         let allowed = allowed && self.inp.any_extensions().error_unions();
         let before = std::mem::replace(&mut self.unions, allowed);
         parse(self);
         self.unions = before;
+        self.pattern_base = pattern_base_before;
     }
 
     pub(super) fn new_outline(inp: impl Into<Tokens<'t>>) -> Parser<'t> {
