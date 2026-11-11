@@ -518,6 +518,14 @@ export const rules = [
 		reason: "Andrew, 2026-11-10, choosing how `Acyclic` is derived: \"prefer our const time reflection over auto trait if more powerful and if something doesn't work but is possible improve the language\".",
 		link: "docs/v2/plan/design/comptime.md",
 	},
+	{
+		id: "verified-compiler",
+		skill: "testing",
+		line: "The goal is a formally verified blaze: one executable Lean semantics of MIR is the specification, every MIR pass is proved or translation-validated against it, proofs are checked in the gate, and what is still trusted is listed.",
+		info: "blaze is to be a compiler whose correctness is proved, not only tested. The order that works in practice: (1) one specification of what MIR does, written in Lean as an executable semantics (an interpreter over a deep embedding of MIR), held to the tree by running it against blaze's MIR evaluator and blaze-built code on generated programs; it is the one meaning every proof refers to (`one-concept-one-home`); (2) user code is proved against it: the functional models `hir-ty-lean` emits are derived from, and proved or checked equal to, the semantics of the body they model, so a proof is about what blaze compiles and not a hand-written copy; (3) each MIR transformation is correct against it: a small pass by a Lean theorem that its output refines its input, a large one by translation validation (a checker, itself proved sound, that accepts each run's before and after), run in the gate on real crates; (4) then lowering to LIR and to machine code against machine models, the front end's rules, and the daemon's state machines by refinement from their reference models (`invariants-are-stated`). Nothing counts as proved until Lean has checked it in the gate with only its allowed axioms and no `sorry`; `docs/v2/plan/invariants.md` gives each claim its level, and docs/v2/plan/design/formal-verification.md lists the trusted base (the Lean kernel, the semantics' agreement with hardware, each unverified pass) and shrinks it. A change to MIR's meaning changes the Lean semantics in the same pull request.",
+		reason: "Andrew, 2026-11-10, the day the first Lean proof in the tree was checked: \"what is the best way to do this in practice for real formal verified ... the goal ... to have our own compiler be formally verified\".",
+		link: "docs/v2/plan/design/formal-verification.md",
+	},
 ] as const satisfies readonly Rule[];
 
 /**

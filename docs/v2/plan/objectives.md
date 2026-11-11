@@ -13,7 +13,7 @@ remembered. How rows are picked, worked and landed is
 `harness/v2/ledger.py`. A check in *italics* is not written yet, and writing it is the first
 part of the work. `?` is not measured; "last known" is a lead, not a status.
 
-95 objectives: 0 met, 0 open, 0 blocked, 95 not measured.
+98 objectives: 0 met, 0 open, 0 blocked, 98 not measured.
 
 ## Targets
 
@@ -57,6 +57,9 @@ What must hold for any of the speed to count.
 | V3 | bstd's public functions carry contracts (requires and ensures), each run as a generated property test | *write: contracts on bstd's API and the generator of reflect.md item 7* |  | ? |
 | V4 | The simulated driver refines each native driver on the effects both run | *write: one test per native driver that replays seeded effect sequences on both and compares completions* |  | ? |
 | V5 | A reference model translated to Lean has a property proved about it, and the compiled Lean model agrees with blaze-built code on drawn inputs | *write: the first proof in the tree, named by a `(proved: ..)` statement, checked in the train* | fnv1a_from has a model and a hand-written proof on mir-lean-1110; Lean has not checked it (2026-11-10) | ? |
+| V6 | An executable Lean semantics of MIR (a first subset: integers, structs, enums, references, calls, loops, panics) agrees with blaze's MIR evaluator and blaze-built code on generated programs | *write: the differential harness in the gate (Lean interpreter, MIR evaluator, compiled code on drawn programs)* | not started; rule verified-compiler (2026-11-10) | ? |
+| V7 | The functional model hir-ty-lean emits for a function is proved or checked equal to the Lean semantics of its MIR body, so a proof is of what blaze compiles | *write: an equivalence proved per emitted model (generated proof or a proved-sound checker), checked by lake build in the gate* | the first proof (fnv1a_from) is of a hand-checked model: lake build passes with Lean 4.20.0, the Rust golden test has not run (2026-11-10) | ? |
+| V8 | One MIR optimization is proved to refine its input against the Lean semantics, and one large pass is translation-validated by a checker proved sound, run on real crates in the gate | *write: the theorem checked by lake build; the validator's run over the corpus* | not started (2026-11-10) | ? |
 
 ## The design, part by part
 

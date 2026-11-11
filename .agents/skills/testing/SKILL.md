@@ -54,6 +54,27 @@ crate states: they are what the new code is judged against.
 
 See [docs/v2/plan.md#11-proof-by-check-not-by-review](../../../docs/v2/plan.md#11-proof-by-check-not-by-review).
 
+## verified-compiler (rule 57)
+
+blaze is to be a compiler whose correctness is proved, not only tested. The order that works in
+practice: (1) one specification of what MIR does, written in Lean as an executable semantics (an
+interpreter over a deep embedding of MIR), held to the tree by running it against blaze's MIR
+evaluator and blaze-built code on generated programs; it is the one meaning every proof refers to
+(`one-concept-one-home`); (2) user code is proved against it: the functional models `hir-ty-lean`
+emits are derived from, and proved or checked equal to, the semantics of the body they model, so a
+proof is about what blaze compiles and not a hand-written copy; (3) each MIR transformation is
+correct against it: a small pass by a Lean theorem that its output refines its input, a large one by
+translation validation (a checker, itself proved sound, that accepts each run's before and after),
+run in the gate on real crates; (4) then lowering to LIR and to machine code against machine models,
+the front end's rules, and the daemon's state machines by refinement from their reference models
+(`invariants-are-stated`). Nothing counts as proved until Lean has checked it in the gate with only
+its allowed axioms and no `sorry`; `docs/v2/plan/invariants.md` gives each claim its level, and
+docs/v2/plan/design/formal-verification.md lists the trusted base (the Lean kernel, the semantics'
+agreement with hardware, each unverified pass) and shrinks it. A change to MIR's meaning changes the
+Lean semantics in the same pull request.
+
+See [docs/v2/plan/design/formal-verification.md](../../../docs/v2/plan/design/formal-verification.md).
+
 <!-- End of the generated rules. Hand-written notes follow. -->
 
 This skill is the one home for how blaze tests its own code. Other skills and docs point here:
