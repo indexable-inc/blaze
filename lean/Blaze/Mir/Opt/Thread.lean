@@ -312,12 +312,12 @@ theorem thread_stutter (prog : Program) :
     intro st _
     cases thread_step prog st with
     | inl same =>
-      exact ⟨0, by omega,
+      exact ⟨0, Nat.zero_lt_succ 1,
         (same.trans (steps_one prog st).symm).trans (mapNext_id (steps prog (0 + 1) st)).symm,
         fun _ _ => True.intro⟩
     | inr two =>
       have ⟨s1, h1, h2⟩ := two
-      exact ⟨1, by omega,
+      exact ⟨1, Nat.lt_succ_self 1,
         (h2.trans (steps_two prog st s1 h1).symm).trans (mapNext_id (steps prog (1 + 1) st)).symm,
         fun _ _ => True.intro⟩
 

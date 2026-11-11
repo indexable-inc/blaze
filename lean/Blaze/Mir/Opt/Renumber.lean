@@ -167,7 +167,10 @@ theorem covers_has (order : List BlockId) (b : BlockId) :
     by_cases e : b = n
     · rw [e]
       exact and_true_left hc
-    · exact ih (and_true_right hc) (by omega)
+    · have hb' : b < n + 1 := hb
+      have e' : ¬ b = n := e
+      have hlt : b < n := Nat.lt_of_le_of_ne (Nat.le_of_lt_succ hb') e'
+      exact ih (and_true_right hc) hlt
 
 /-- The order starts with the entry block, so the entry block stays block 0. -/
 def startsZero : List BlockId → Bool
