@@ -69,10 +69,10 @@ theorem Outcome.toResult?_ofResult {α : Type} (r : Result α) :
 theorem Outcome.toResult?_eq_none {α : Type} (x : Outcome α) :
     x.toResult? = none ↔ ∃ why, x = Outcome.undefined why := by
   cases x with
-  | ok v => exact ⟨fun h => nomatch h, fun ⟨_, h⟩ => nomatch h⟩
-  | panic e => exact ⟨fun h => nomatch h, fun ⟨_, h⟩ => nomatch h⟩
+  | ok v => exact ⟨(fun h => nomatch h), (fun ⟨_, h⟩ => nomatch h)⟩
+  | panic e => exact ⟨(fun h => nomatch h), (fun ⟨_, h⟩ => nomatch h)⟩
   | undefined why => exact ⟨fun _ => ⟨why, rfl⟩, fun _ => rfl⟩
-  | diverge => exact ⟨fun h => nomatch h, fun ⟨_, h⟩ => nomatch h⟩
+  | diverge => exact ⟨(fun h => nomatch h), (fun ⟨_, h⟩ => nomatch h)⟩
 
 /-- The refinement of compiler correctness, CompCert's direction: every behaviour of the
 target `a` is a behaviour of the source `b`, where a source with undefined behaviour allows
