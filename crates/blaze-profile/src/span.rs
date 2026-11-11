@@ -722,7 +722,7 @@ pub struct KindTable {
 }
 
 /// The columns every kind's view has, before its fields.
-const VIEW_COLUMNS: &str =
+pub(crate) const VIEW_COLUMNS: &str =
     "build_id, process, thread, thread_name, span_id, parent, depth, start_ns, dur_ns, self_cpu_ns";
 
 /// Writes into `out` one view a kind, `span_<name>` (`span_macro_expand`): its rows of `spans`

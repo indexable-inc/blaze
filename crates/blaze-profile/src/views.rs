@@ -80,6 +80,14 @@ const LIMIT: Arg = Arg { name: "limit", ty: ArgType::U64, default: Some("20") };
 /// One build, or none: a view over the last builds (`problems`) reads them all unless one is
 /// named.
 const ANY_BUILD: Arg = Arg { name: "build", ty: ArgType::U64, default: Some("NULL") };
+/// The limit of a view whose rows are read whole (a build's timeline, its counts): past it the
+/// view is cut, and `limit=N` asks for more.
+const MANY: Arg = Arg { name: "limit", ty: ArgType::U64, default: Some("200") };
+/// The least duration of a span a timeline lists, in milliseconds.
+const MIN_MS: Arg = Arg { name: "min_ms", ty: ArgType::F64, default: Some("1.0") };
+/// The least duration of a span that counts as long, in milliseconds: the loop's budget for a
+/// step (`loop stalled`).
+const LONG_MS: Arg = Arg { name: "min_ms", ty: ArgType::F64, default: Some("20.0") };
 /// How many of the last builds a view of several builds reads when no build is named.
 const BUILDS: Arg = Arg { name: "builds", ty: ArgType::U64, default: Some("5") };
 const EARLIER: Arg = Arg { name: "earlier", ty: ArgType::Text, default: None };
@@ -144,6 +152,14 @@ pub const VIEWS: &[View] = &[
     const { view("link_regions", &[BUILD]) },
     const { view("link_code", &[BUILD]) },
     const { view("problems", &[ANY_BUILD, BUILDS, LIMIT]) },
+    const { view("timeline", &[ENDED_BUILD, MIN_MS, MANY]) },
+    const { view("long_spans", &[BUILD, LONG_MS, LIMIT]) },
+    const { view("waits_by_reason", &[BUILD, LIMIT]) },
+    const { view("counts_by_cause", &[BUILD, MANY]) },
+    const { view("writes", &[BUILD, MANY]) },
+    const { view("scripts", &[BUILD, MANY]) },
+    const { view("pool", &[ENDED_BUILD]) },
+    const { view("kept", &[ENDED_BUILD, MANY]) },
 ];
 
 /// The view named `name`.
@@ -806,6 +822,7 @@ mod tests {
     const FUNCTIONS: &[&str] = &[
         "any_value",
         "arg_max",
+        "arg_min",
         "array_to_string",
         "count",
         "lag",

@@ -39,6 +39,7 @@ mod script;
 const EXPLORE_USAGE: &str = "blaze explore [--dev] [--print]: the explorer's link, opened in the browser (`--print`: printed only; \
                              `--dev`: the page's development server, http://localhost:5173, may connect too)";
 const DEBUG_USAGE: &str = "blaze debug profile [--seconds N] | blaze debug live | blaze debug sql [--json] QUERY \
+                           | blaze debug schema [TABLE] [--json] \
                            | blaze debug hot [--top N] [--last-build] | blaze debug time [--build N] [--by unit|item|wait] [--top N] \
                            [--match TEXT] [--cores [LINES]] [--html FILE] [--trace FILE] \
                            | blaze debug gate [--build N] [--history DIR] [--json] [--summary FILE] \
@@ -129,6 +130,7 @@ pub fn debug(words: Vec<OsString>, color: bool) -> i32 {
             ))),
         },
         Some("sql") => query(words.collect()),
+        Some("schema") => schema_of(words.collect()),
         Some("hot") => hot(words.collect()),
         Some("time") => time(words.collect()),
         Some("gate") => gate(words.collect()),
@@ -692,7 +694,54 @@ fn query(words: Vec<OsString>) -> Result<(), Refusal> {
         }
     }
     let sql = sql.ok_or_else(|| Refusal::Usage(DEBUG_USAGE.to_owned()))?;
+    // `DESCRIBE spans` and `SHOW TABLES` are answered from the schema, with no DuckDB and no
+    // daemon: the tables DuckDB would list are the views of one connection, with no meaning.
+    if let Some(answer) = blaze_profile::describe::statement(&sql) {
+        let (rows, of) = answer.map_err(|error| Refusal::Usage(error.to_string()))?;
+        return described(&rows, of.as_deref(), shape);
+    }
     print(&run(&sql)?, shape)
+}
+
+/// `blaze debug schema [TABLE] [--json]`: the tables and views of the profile, each with what
+/// it holds; with a table (or a span view), its columns with their types and meaning. From the
+/// schema this blaze reads and writes (`blaze_profile::schema`), so no column is a guess; no
+/// DuckDB and no daemon is asked.
+fn schema_of(words: Vec<OsString>) -> Result<(), Refusal> {
+    const USAGE: &str = "blaze debug schema [TABLE] [--json]";
+    let (mut shape, mut table) = (Shape::Table, None);
+    for word in texts(words)? {
+        match word.as_str() {
+            "--json" => shape = Shape::Json,
+            flag if flag.starts_with('-') => {
+                return Err(Refusal::Usage(format!("{USAGE}, not `{flag}`")));
+            }
+            _ if table.is_some() => {
+                return Err(Refusal::Usage(format!("{USAGE}: one table, not `{word}` too")));
+            }
+            _ => table = Some(word),
+        }
+    }
+    let rows = match &table {
+        Some(name) => blaze_profile::describe::columns(name)
+            .map_err(|error| Refusal::Usage(error.to_string()))?,
+        None => blaze_profile::describe::listing(),
+    };
+    described(&rows, table.as_deref(), shape)
+}
+
+/// A listing of the schema on stdout: text for a person, JSON lines with `--json`.
+fn described(
+    rows: &[blaze_profile::describe::Row],
+    of: Option<&str>,
+    shape: Shape,
+) -> Result<(), Refusal> {
+    let text = match shape {
+        Shape::Table => blaze_profile::describe::text(rows, of),
+        Shape::Json => blaze_profile::describe::json(rows)
+            .map_err(|error| format!("the schema as JSON: {error}"))?,
+    };
+    stdout(&text)
 }
 
 fn explained(words: Vec<OsString>) -> Result<(), Refusal> {

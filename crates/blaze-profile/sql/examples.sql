@@ -885,3 +885,145 @@ ORDER BY tied.of_build DESC,
     CASE tied.severity WHEN 'FATAL' THEN 0 WHEN 'PANIC' THEN 1 WHEN 'BUG' THEN 2 WHEN 'BUILD' THEN 3 WHEN 'ERROR' THEN 4 ELSE 5 END,
     count(*) DESC, tied.source
 LIMIT $limit
+
+-- name: timeline
+-- says: a build as rows in the order things began: each span of `min_ms` (1) or longer with when it began from the build's start (`at_ms`), how long it was open (`ms`), its own CPU (`cpu_ms`, less the spans under it), its thread, its depth on that thread, and what it was of (its function, what a wait awaited, its unit, its crate, or its other fields); spans of no build in the build's window are its too. A gap between one row's end and the next row's `at_ms` on the same thread and depth is time under no span of that size. The path across waits to the jobs that ended them is `critical_path`
+WITH bounds AS (
+    SELECT started_ns AS t0, started_ns + dur_ns AS t1
+    FROM builds
+    WHERE build_id = $build
+)
+SELECT
+    round((s.start_ns - bounds.t0) / 1e6, 3) AS at_ms,
+    round(s.dur_ns / 1e6, 3) AS ms,
+    round(s.self_cpu_ns / 1e6, 3) AS cpu_ms,
+    CAST(s.thread_name AS VARCHAR) AS thread,
+    s.depth,
+    CAST(s.name AS VARCHAR) AS name,
+    coalesce(s.function, s.awaits, s.unit, CAST(s.crate AS VARCHAR)) AS what
+FROM spans AS s, bounds
+WHERE (s.build_id = $build OR (s.build_id IS NULL AND s.start_ns >= bounds.t0 AND s.start_ns < bounds.t1))
+    AND s.dur_ns >= $min_ms * 1e6
+ORDER BY s.start_ns, s.depth
+LIMIT $limit
+
+-- name: long_spans
+-- says: a build's spans of `min_ms` (20) or longer, longest first: how long (`ms`), its own CPU (`cpu_ms`), its thread, its name, what it was of, and when it began from the build's start (`at_ms`); a long span with little CPU that is no `wait` blocked in something no span names
+SELECT
+    round(s.dur_ns / 1e6, 3) AS ms,
+    round(s.self_cpu_ns / 1e6, 3) AS cpu_ms,
+    CAST(s.thread_name AS VARCHAR) AS thread,
+    CAST(s.name AS VARCHAR) AS name,
+    coalesce(s.function, s.awaits, s.unit, CAST(s.crate AS VARCHAR)) AS what,
+    round((s.start_ns - (SELECT min(started_ns) FROM builds WHERE build_id = $build)) / 1e6, 3) AS at_ms
+FROM spans AS s
+WHERE s.build_id = $build AND s.dur_ns >= $min_ms * 1e6
+ORDER BY s.dur_ns DESC, s.start_ns
+LIMIT $limit
+
+-- name: waits_by_reason
+-- says: a build's waits by what they waited for (`wait` spans by `awaits`, `admission` spans by what held the task back): how many, their time summed over the threads waiting (not wall time), the longest, and a thread that waited; waits too short for a row (`folded`) are not counted
+SELECT
+    CAST(s.name AS VARCHAR) AS waited_in,
+    coalesce(s.awaits, '(unnamed)') AS reason,
+    count(*) AS waits,
+    round(sum(s.dur_ns) / 1e6, 3) AS ms,
+    round(max(s.dur_ns) / 1e6, 3) AS longest_ms,
+    CAST(any_value(s.thread_name) AS VARCHAR) AS a_thread
+FROM spans AS s
+WHERE s.build_id = $build AND s.name IN ('wait', 'admission')
+GROUP BY s.name, s.awaits
+ORDER BY sum(s.dur_ns) DESC, reason
+LIMIT $limit
+
+-- name: counts_by_cause
+-- says: what the query engine counted in a build, per query that ran or input that was written: its runs and, of them, first runs, runs for a changed read, for an untracked read and for a cycle, runs for a value evicted and asked again, runs in a view it had already run in, rows verified without running, and an input's writes; the most run first. An edit's build should run a handful
+SELECT query, executed, ran_new, ran_changed, ran_untracked, ran_cycle, evicted_asked, reran, verified, written
+FROM query_counts
+WHERE build_id = $build AND (executed > 0 OR written > 0)
+ORDER BY executed DESC, written DESC NULLS LAST, query
+LIMIT $limit
+
+-- name: writes
+-- says: the inputs a build wrote, by kind with names: each input a setter wrote (`query_counts.written`, an equal value too), and beside it each of its fields a rerun names as its cause (`provenance.cause_key`: which file, which crate, which module's scope) with how many memos ran again for it; an input written that made nothing run has one row with no field
+WITH wrote AS (
+    SELECT CAST(query AS VARCHAR) AS input, written
+    FROM query_counts
+    WHERE build_id = $build AND written > 0
+), caused AS (
+    SELECT cause_key, count(DISTINCT query_key) AS memos
+    FROM provenance
+    WHERE build_id = $build AND outcome = 'ran' AND cause_kind IN ('input', 'tracked')
+    GROUP BY cause_key
+)
+SELECT wrote.input, wrote.written, caused.cause_key AS field, caused.memos
+FROM wrote
+LEFT JOIN caused ON starts_with(caused.cause_key, '`' || wrote.input || '.')
+ORDER BY caused.memos DESC NULLS LAST, wrote.written DESC, wrote.input, caused.cause_key
+LIMIT $limit
+
+-- name: scripts
+-- says: the build scripts a build ran, slowest first: the unit, how long its process lived, how long making its sandbox took, its CPU, its exit code, and why it ran instead of being reused (`misses` of step `build script run`: the cause and what changed). A script whose kept run was reused has no row: it ran no process
+SELECT
+    p.unit,
+    round((p.exited_ns - p.spawned_ns) / 1e6, 1) AS ms,
+    round(p.sandbox_ns / 1e6, 1) AS sandbox_ms,
+    round((p.user_ns + p.system_ns) / 1e6, 1) AS cpu_ms,
+    p.code,
+    CAST(m.cause AS VARCHAR) AS cause,
+    m.what
+FROM processes AS p
+LEFT JOIN misses AS m
+    ON m.build_id = p.build_id AND m.step = 'build script run'
+    AND (starts_with(p.unit, m.item) OR starts_with(m.item, p.unit))
+WHERE p.build_id = $build AND p.kind = 'build_script'
+ORDER BY p.exited_ns - p.spawned_ns DESC, p.unit
+LIMIT $limit
+
+-- name: pool
+-- says: the pools' counters over a build: the store's buffer pool (`pool resident bytes`, `pool pinned bytes`, `pool loaded bytes`, `pool prefetched bytes`, `pool evicted bytes`, `pool pinned bound waits`) and the worker pool (`pool queued`, `pool running`), each with its value as the build began and ended, its most, and how many readings; a counter that counts up (loaded, evicted, waits) grew by end less start
+WITH bounds AS (
+    SELECT started_ns AS t0, started_ns + dur_ns AS t1
+    FROM builds
+    WHERE build_id = $build
+)
+SELECT
+    CAST(c.name AS VARCHAR) AS counter,
+    CAST(arg_min(c.value, c.t_ns) AS BIGINT) AS at_start,
+    CAST(arg_max(c.value, c.t_ns) AS BIGINT) AS at_end,
+    CAST(max(c.value) AS BIGINT) AS most,
+    count(*) AS readings
+FROM counters AS c, bounds
+WHERE starts_with(CAST(c.name AS VARCHAR), 'pool ')
+    AND (c.build_id = $build OR (c.build_id IS NULL AND c.t_ns >= bounds.t0 AND c.t_ns <= bounds.t1))
+GROUP BY c.name
+ORDER BY counter
+
+-- name: kept
+-- says: what a build kept or lost as it ended and after its answer was sent, to the next build's start: each span about keeping (the front end kept or let go, expansions published, what the store was given, link images evicted), in order, then whether what it left was lost (`misses` of step `results kept after the answer`: `the build before` lost what this build then computed again, `this build` lost what the next one did)
+WITH bounds AS (
+    SELECT started_ns AS t0,
+        coalesce((SELECT min(started_ns) FROM builds WHERE build_id > $build), started_ns + dur_ns + 60000000000) AS t1
+    FROM builds
+    WHERE build_id = $build
+)
+SELECT
+    round((s.start_ns - bounds.t0) / 1e6, 3) AS at_ms,
+    round(s.dur_ns / 1e6, 3) AS ms,
+    CAST(s.thread_name AS VARCHAR) AS thread,
+    CAST(s.name AS VARCHAR) AS name,
+    coalesce(s.function, s.unit, CAST(s.crate AS VARCHAR)) AS what
+FROM spans AS s, bounds
+WHERE s.start_ns >= bounds.t0 AND s.start_ns < bounds.t1
+    AND (s.name LIKE '%kept%' OR s.name LIKE '%let go%' OR s.name LIKE 'store %' OR s.name LIKE '%settl%')
+UNION ALL
+SELECT
+    NULL,
+    NULL,
+    CASE WHEN m.build_id = $build THEN 'the build before' ELSE 'this build' END,
+    'LOST: ' || CAST(m.step AS VARCHAR),
+    m.what
+FROM misses AS m
+WHERE m.step = 'results kept after the answer' AND m.build_id IN ($build, $build + 1)
+ORDER BY at_ms NULLS LAST, name
+LIMIT $limit

@@ -112,6 +112,18 @@ null, not counted; it has no `provenance` rows) and one of version 2 as 5 too (i
 refuses any other, naming the file: version 1 named a job by its slot alone, and the
 generation version 2 needs was never written.
 
+**Asking the schema.** `blaze debug schema [TABLE] [--json]` prints the tables, the span
+views (`span_macro_expand`) and the named views with what each holds, or one table's columns
+with their types and meaning, from `schema.rs` itself: it is the schema of the blaze that prints
+it, and needs no DuckDB and no daemon. `blaze debug sql "DESCRIBE spans"` and `"SHOW TABLES"`
+are answered the same way before DuckDB is started, and when DuckDB refuses a query for a
+column it does not know, the error ends with the columns of each table the query names, the
+nearest names first (`crates/blaze-profile/src/describe.rs`). The tables below are written by
+hand: a test holds every column they list to the schema, and where they lack a table or a
+column (`job_intervals`, `span_time`, `path_links` and `core_busy`, which `blaze debug time`
+derives, are described under [Utilization](#utilization-where-a-builds-wall-time-goes)),
+`blaze debug schema` has it.
+
 **Time.** Every `*_ns` instant is in nanoseconds on the machine's monotonic clock: Linux
 `CLOCK_MONOTONIC`, macOS `CLOCK_UPTIME_RAW` (`mach_absolute_time`). It is the same clock in
 every process on the machine, so the client's, the daemon's and the build scripts' spans line
@@ -256,7 +268,6 @@ are the `query_counts` table.
 | reran | u64 | of its runs, those in a view the row had already run in |
 | evicted_asked | u64 | of its runs, those for a value evicted earlier and asked for again: what eviction cost |
 | evicted | u64 | its values a sweep let go past its cap |
-| refused | u64 | of those, the ones recency alone would have kept |
 | dropped | u64 | its values an explicit `evict_values` or `evict_values_of` let go |
 | reads_recorded | u64 | the reads its runs recorded, a row read again later in the same run included: over `reads_kept`, how often its runs re-read the same rows |
 | reads_kept | u64 | the reads its runs' rows kept: each run's distinct reads, summed |
