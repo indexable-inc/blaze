@@ -1630,6 +1630,10 @@ struct Roots<S: Steps> {
     /// Why what its last build left to settle after its answer was not kept ([`Jobs::lose`]),
     /// until its next build or check takes it as a miss `blaze why` says ([`Job::ended`]).
     lost: Vec<Option<String>>,
+    /// Its last build or check, when that did not end well ([`Unfinished`]): set as the job
+    /// is answered, none again once one ends well. Its next build says it first and takes it
+    /// as a row `blaze why` says ([`Job::ended`]).
+    unfinished: Vec<Option<Unfinished>>,
     /// The files of the view its answer's walk read, held open in the VFS from that walk's
     /// start until its next job walks: what a request on another root is read against
     /// ([`Jobs::edited`]), so the root and its files stay whatever the head moved to.
@@ -1649,6 +1653,7 @@ impl<S: Steps> Roots<S> {
             outputs: Vec::new(), // alloc: none until the first checkout
             answers: Vec::new(), // alloc: none until the first checkout
             lost: Vec::new(),    // alloc: none until the first checkout
+            unfinished: Vec::new(), // alloc: none until the first checkout
             walked: Vec::new(),  // alloc: none until the first checkout
             stills: Vec::new(),  // alloc: none until the first checkout
         }
@@ -1666,6 +1671,7 @@ impl<S: Steps> Roots<S> {
         self.outputs.push(None);
         self.answers.push(Err(Unkept::None));
         self.lost.push(None);
+        self.unfinished.push(None);
         self.walked.push(None);
         self.stills.push(Vec::new()); // alloc: none
         id
@@ -1920,6 +1926,20 @@ impl<S: Steps> Build<S> {
             (true, None) if last => Verdict::Done,
             (true, None) => return,
         };
+    }
+
+    /// How its units stand, counted from their verdicts ([`Left`]).
+    fn left(&self) -> Left {
+        let mut left = Left { units: self.verdicts.len() as u32, ..Left::default() };
+        for verdict in &self.verdicts {
+            match verdict {
+                Verdict::Done => {}
+                Verdict::Failed { .. } => left.failed += 1,
+                Verdict::Skipped { .. } => left.skipped += 1,
+                Verdict::Unsettled => left.unsettled += 1,
+            }
+        }
+        left
     }
 
     /// What the build left unchecked behind its failures and what it checked against a unit
@@ -2185,6 +2205,16 @@ struct Job<S: Steps> {
     /// as its view opened: a miss of its own when it ends ([`Job::ended`]), so `blaze why`
     /// says the previous build's results were not kept and why.
     lost: Option<String>,
+    /// Its checkout's last build, which did not end well ([`Roots::unfinished`]), taken as its
+    /// view opened and said then: a row of its own when it ends having run anything
+    /// ([`Job::ended`]).
+    after: Option<Unfinished>,
+    /// The checkout it is of, in [`Jobs::roots`], with its root directory, from its view's
+    /// opening; none before, and for an agent's view.
+    checkout: Option<(u32, String)>,
+    /// How its units stood as its plane request ended not ok, for its checkout's next build
+    /// ([`Unfinished::left`]).
+    left: Option<Left>,
 }
 
 /// A job's kept front end being stored ([`Jobs::store_kept`]), by one task of a plane request
@@ -2274,6 +2304,64 @@ pub struct Lost {
 
 /// How many losses the jobs keep to show ([`Jobs::lost`]): the last ones.
 const LOST_SHOWN: usize = 16;
+
+/// A checkout's last build or check, which did not end well ([`Roots::unfinished`]): what its
+/// next one says first and `blaze why` says of it, so the time it spends on what that one left
+/// is never read as a slow build of nothing (2026-11-10: after a failed cold build the next
+/// three builds of an unchanged tree took 56 s, 10 s and 22 s, exited 0 and said nothing).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Unfinished {
+    /// Its number in the history (its plane request); none when it ended before it had one.
+    build: Option<u32>,
+    command: String,
+    /// It was cancelled, not failed.
+    cancelled: bool,
+    /// What became of its units, when it reached them.
+    left: Option<Left>,
+}
+
+/// How a build's units stood as its plane request ended not ok ([`Build::left`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Left {
+    units: u32,
+    failed: u32,
+    /// Skipped behind a failure.
+    skipped: u32,
+    /// Neither built, failed nor skipped: not reached, or not part of the build.
+    unsettled: u32,
+}
+
+impl Unfinished {
+    /// What the next build of `root` says of it: one line, facts only.
+    fn said(&self, root: &str) -> String {
+        let Unfinished { build, command, cancelled, left } = self;
+        let which = match build {
+            Some(build) => format!("build {build}, `{command}`"), // alloc: once a build after one that did not end well
+            None => format!("`{command}`"), // alloc: as above
+        };
+        let how = if *cancelled { "was cancelled" } else { "failed" };
+        let left = match left {
+            Some(Left { units, failed, skipped, unsettled }) if failed + skipped + unsettled > 0 => {
+                // alloc: as above
+                format!(
+                    " with {} of its {units} units not built ({failed} failed, {skipped} skipped \
+                     behind a failure, {unsettled} not reached)",
+                    failed + skipped + unsettled
+                )
+            }
+            _ => String::new(),
+        };
+        // alloc: as above
+        format!(
+            "the last build of {root} ({which}) {how}{left}: this build first does the work that \
+             one left, so its time is not a no-op's"
+        )
+    }
+}
+
+/// The step what a build did after its checkout's last build did not end well is under in
+/// `blaze why` ([`Unfinished`]).
+const UNFINISHED_STEP: &str = super::why::UNFINISHED;
 
 /// The step a loss is under in `blaze why` ([`blaze_kernel::Miss::step`]), and what `blaze
 /// slow` ranks first by.
@@ -2771,6 +2859,34 @@ impl<S: Steps> Job<S> {
         misses.sort_unstable();
         misses.dedup();
         self.missed = misses.len() as u64;
+        // What it ran after its checkout's last build did not end well: a row `blaze why`
+        // says first, so that build's remainder is not read as this one's slowness. Only when
+        // it ran a task (a build the memo settled whole did none of that work). Not counted
+        // in `missed`: it is why the work was there, not a thing computed again, and a build
+        // that computed nothing again may still be kept as its checkout's answer.
+        if let Some(after) = self.after.take()
+            && let Some(ran) = stats.map(|it| it.ran).filter(|ran| *ran > 0)
+        {
+            let root = self.checkout.as_ref().map_or("", |(_, dir)| dir.as_str());
+            misses.push(blaze_kernel::Miss {
+                step: UNFINISHED_STEP,
+                subject: Hasher::new("blaze v2 serve unfinished subject")
+                    .part(root.as_bytes())
+                    .finish(),
+                item: format!("the last build of {root}"), // alloc: once a build after one that did not end well
+                // alloc: as above
+                missed: blaze_kernel::Missed::Always(format!(
+                    "{}; it ran {ran} tasks",
+                    after.said(root)
+                )),
+                key: ContentId::default(),
+                kept: None,
+                parts: Vec::new(), // alloc: none
+                beyond: None,
+                via: None,
+            });
+            misses.sort_unstable();
+        }
         // A build that computed nothing again, and walked though its checkout's kept answer
         // could have been said again: what `blaze why` says of it is the input that moved or
         // that nothing covers ([`noop::NotReplayed::input`]). Not counted in `missed`: it computed
@@ -3463,6 +3579,9 @@ impl<S: Steps> Jobs<S> {
             placed_any: false,
             walks,
             lost: None,
+            after: None,
+            checkout: None,
+            left: None,
         };
         if self.jobs.put(key_of(id), job).is_err() {
             // alloc: an error the session's free list can't give
@@ -3630,7 +3749,17 @@ impl<S: Steps> Jobs<S> {
             && let Some(at) = root
         {
             job.lost = self.roots.lost[at as usize].take();
+            // And what its last build left by not ending well: said now, the first thing
+            // this build says, before any of that work is done.
+            // clone: once a build after one that did not end well
+            if let Some(after) = self.roots.unfinished[at as usize].clone() {
+                let note = Diagnostic::note(after.said(&root_dir));
+                w.said.push(Said::Report(id, Response::Diagnostic(note)));
+                job.after = Some(after);
+            }
         }
+        // clone: a path, once a view
+        job.checkout = root.map(|at| (at, root_dir.clone()));
         if reuses_plans(&job.work)
             && let Some(at) = root
             && let Some(Some(last)) = self.roots.plans.get(at as usize)
@@ -6416,6 +6545,12 @@ impl<S: Steps> Jobs<S> {
             (false, true) => profile_history::Outcome::Ok,
             (false, false) => profile_history::Outcome::Failed,
         };
+        // How its units stand, for its checkout's next build to say ([`Unfinished`]).
+        if outcome != profile_history::Outcome::Ok
+            && let Stage::Units(build) = &job.stage
+        {
+            job.left = Some(build.left());
+        }
         // A build whose front end is kept has its run log named by the task that stores the
         // front end, after the answer ([`Steps::kept_run_log`]); any other's is named here,
         // before its front end goes. A documentation's front end is not kept.
@@ -6433,7 +6568,7 @@ impl<S: Steps> Jobs<S> {
         #[cfg(test)]
         ENDED_LOST.with_borrow_mut(|it| {
             // alloc: a test's record
-            it.extend(ended.misses.iter().filter(|miss| miss.step == SETTLING_STEP).filter_map(
+            it.extend(ended.misses.iter().filter(|miss| miss.step == SETTLING_STEP || miss.step == UNFINISHED_STEP).filter_map(
                 |miss| match &miss.missed {
                     blaze_kernel::Missed::Always(why) => Some(why.clone()),
                     _ => None,
@@ -7352,6 +7487,21 @@ impl<S: Steps> Jobs<S> {
             self.batches.remove(id);
             self.order.retain(|it| *it != id);
             self.ended = true;
+            // Its checkout's next build says a build or check that did not end well, and
+            // forgets it once one does.
+            if matches!(job.work, Work::Build(_) | Work::Check(_))
+                && let Some((root, _)) = &job.checkout
+            {
+                self.roots.unfinished[*root as usize] = match ok {
+                    true => None,
+                    false => Some(Unfinished {
+                        build: job.request.map(|it| it.0),
+                        command: command_line(&job.work),
+                        cancelled: job.cancelled.load(Ordering::Acquire),
+                        left: job.left,
+                    }),
+                };
+            }
             w.said.push(Said::Finish(id, ok, error, job.built));
         }
         // What answered jobs left to settle: each waits for the store's commit of its tickets,

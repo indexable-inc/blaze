@@ -1148,6 +1148,22 @@ fn group_of(cause: &RebuildCause) -> String {
 /// build's front end anew for it, and most of what else was computed again follows from that.
 const NOT_KEPT: &str = blaze_profile::slow::NOT_KEPT_STEP;
 
+/// The step of what a build ran because its checkout's last build did not end well
+/// (blaze-cargo's `job::Unfinished`): said with [`NOT_KEPT`] before every other group and root
+/// cause, as the work under them is that build's remainder, not something this one's inputs
+/// changed.
+pub(super) const UNFINISHED: &str = "work the last build left unfinished";
+
+/// Whether `step` is said before every other: what the last build lost, then what it left
+/// unfinished. 0 and 1 for those, 2 for any other, to sort by.
+fn said_first(step: &str) -> u8 {
+    match step {
+        NOT_KEPT => 0,
+        UNFINISHED => 1,
+        _ => 2,
+    }
+}
+
 /// `rebuilt` in groups by step and reason: what the last build lost first ([`NOT_KEPT`]), then
 /// the most items first, then by step and reason; each lists its first [`LISTED`] items, or
 /// every one with `all`. With how many there are.
@@ -1173,8 +1189,8 @@ fn groups<'a>(rebuilt: impl Iterator<Item = &'a Rebuild>, all: bool) -> (u32, Ve
     // alloc: once a request
     let mut groups: Vec<((&str, String), RebuildGroup)> = by.into_iter().collect();
     groups.sort_by(|a, b| {
-        (a.1.step != NOT_KEPT)
-            .cmp(&(b.1.step != NOT_KEPT))
+        said_first(&a.1.step)
+            .cmp(&said_first(&b.1.step))
             .then(b.1.count.cmp(&a.1.count))
             .then_with(|| a.0.cmp(&b.0))
     });
@@ -1195,10 +1211,10 @@ pub fn summary(rebuilt: &[Rebuild]) -> Vec<Report> {
     let mut groups: Vec<(&[Reason], Vec<&Rebuild>)> = by.into_iter().collect(); // alloc: as above
     // What the last build lost is said first, however many steps share its cause: with more
     // than `CAUSES` root causes it would be counted among "the rest" and never read.
-    let not_kept = |steps: &[&Rebuild]| steps.iter().any(|it| it.step == NOT_KEPT);
+    let first = |steps: &[&Rebuild]| steps.iter().map(|it| said_first(&it.step)).min();
     groups.sort_by(|a, b| {
-        not_kept(&b.1)
-            .cmp(&not_kept(&a.1))
+        first(&a.1)
+            .cmp(&first(&b.1))
             .then(b.1.len().cmp(&a.1.len()))
             .then_with(|| a.0.cmp(b.0))
     });
@@ -1471,6 +1487,35 @@ mod tests {
         // The control: with no such row the most items are first, as before.
         let (_, without) = groups_of(&rebuilt[..5]);
         assert_eq!(without[0].step, "unit");
+    }
+
+    /// What a build ran because the last one failed is said before the units it built and
+    /// after what the last build lost, in the groups and in the build's own summary: a build
+    /// finishing a failed one's work never reads as a slow build of nothing (2026-11-10).
+    #[test]
+    fn what_the_last_build_left_unfinished_is_said_before_the_work() {
+        let left = RebuildCause::Always {
+            why: "the last build of /w (build 41, `build`) failed with 212 of its 340 units not built".to_owned(),
+        };
+        let lost = RebuildCause::Always { why: "the item store: two images were made".to_owned() };
+        let step = |step: &str, item: &str, cause: &RebuildCause| Rebuild {
+            ends: Vec::new(),
+            item: item.to_owned(),
+            step: step.to_owned(),
+            cause: cause.clone(),
+        };
+        let mut rebuilt: Vec<Rebuild> =
+            (0..5).map(|n| step("unit", &format!("crate-{n}"), &RebuildCause::First)).collect();
+        rebuilt.push(step(UNFINISHED, "the last build of /w", &left));
+        let (_, groups) = groups(rebuilt.iter(), false);
+        assert_eq!((groups[0].step.as_str(), groups[0].count), (UNFINISHED, 1), "{groups:#?}");
+        assert_eq!(groups[0].cause, left, "its reason is the build's own words");
+        rebuilt.push(step(NOT_KEPT, "the last build of /w", &lost));
+        let (_, groups) = groups_of(&rebuilt);
+        let order: Vec<&str> = groups.iter().map(|it| it.step.as_str()).collect();
+        assert_eq!(order, [NOT_KEPT, UNFINISHED, "unit"]);
+        assert_eq!(said_first(NOT_KEPT), 0);
+        assert_eq!(said_first("unit"), 2);
     }
 
     fn groups_of(rebuilt: &[Rebuild]) -> (u32, Vec<RebuildGroup>) {

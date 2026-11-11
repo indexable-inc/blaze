@@ -211,3 +211,25 @@ hand: the producers themselves (`identity_parts`, the driver's parts) have no te
   `Unexplained`: whether that happens on real projects is not known.
 - The end-to-end path on a real project (ripgrep, the three edits) has not been run on this
   lane's tree, and nothing here has been compiled.
+
+## A build after one that did not end well (2026-11-11)
+
+On 2026-11-10 the three builds after a failed cold build took 56 s, 10 s and 22 s on an
+unchanged tree, exited 0 and said nothing: they were doing the failed build's remainder and
+read as slow no-ops. Now:
+
+- The daemon keeps, per checkout, its last build or check when that did not end well
+  (`job::Unfinished`: its number, command, whether it failed or was cancelled, and how its
+  units stood: failed, skipped behind a failure, not reached). It is set as the job is
+  answered and cleared when a build or check of the checkout ends well.
+- The next build of the checkout says it before anything else, as a note:
+  `note: the last build of /w (build 41, `build`) failed with 212 of its 340 units not built
+  (3 failed, 180 skipped behind a failure, 29 not reached): this build first does the work that
+  one left, so its time is not a no-op's`.
+- When that build ran any task, its `misses` hold one row of step `work the last build left
+  unfinished` with the same words and the tasks it ran. `blaze why` prints it before every
+  other group, after what the last build lost. It is not counted among the build's misses: it
+  is why the work was there, not a thing computed again.
+- Test: `a_build_after_one_that_failed_says_so_first_and_only_until_one_ends_well`
+  (`crates/blaze-cargo/src/serve/tests.rs`), and `what_the_last_build_left_unfinished_is_said_before_the_work`
+  (`serve/why.rs`).
