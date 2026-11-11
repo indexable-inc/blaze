@@ -65,6 +65,47 @@ theorem run_refines_inv (src tgt : Program) (Inv : State → Prop)
       | undefined why => exact Outcome.Refines.of_eq rfl
       | diverge => exact Outcome.Refines.of_eq rfl
 
+/-- Two outcomes of a step are related: next states `R` relates, or the same answer, panic,
+undefined behaviour or lack of fuel. -/
+inductive StepRel (R : State → State → Prop) : Outcome Next → Outcome Next → Prop where
+  | state (s t : State) (h : R s t) :
+    StepRel R (Outcome.ok (Next.state s)) (Outcome.ok (Next.state t))
+  | done (v : Value) : StepRel R (Outcome.ok (Next.done v)) (Outcome.ok (Next.done v))
+  | panic (e : Error) : StepRel R (Outcome.panic e) (Outcome.panic e)
+  | undefined (why : Undefined) : StepRel R (Outcome.undefined why) (Outcome.undefined why)
+  | diverge : StepRel R Outcome.diverge Outcome.diverge
+
+/-- The relational form of `run_refines_inv`: the two programs run from states `R` relates,
+not from one state. When from related states the source's step is undefined or the two steps
+are related, every run of the target from a state refines the source's from a related one. -/
+theorem run_refines_rel (src tgt : Program) (R : State → State → Prop)
+    (hstep : ∀ (s t : State), R s t →
+      (∃ why, step src s = Outcome.undefined why) ∨ StepRel R (step src s) (step tgt t)) :
+    ∀ (fuel : Nat) (s t : State), R s t → (run tgt fuel t).Refines (run src fuel s) := by
+  intro fuel
+  induction fuel with
+  | zero =>
+    intro s t _
+    exact Outcome.Refines.of_eq rfl
+  | succ n ih =>
+    intro s t hr
+    have after : ∀ (a b : Outcome Next), StepRel R a b →
+        (afterStep (run tgt n) b).Refines (afterStep (run src n) a) := by
+      intro a b h
+      cases h with
+      | state s' t' h' => exact ih s' t' h'
+      | done v => exact Outcome.Refines.of_eq rfl
+      | panic e => exact Outcome.Refines.of_eq rfl
+      | undefined why => exact Outcome.Refines.of_eq rfl
+      | diverge => exact Outcome.Refines.of_eq rfl
+    rw [run_succ, run_succ]
+    cases hstep s t hr with
+    | inl hu =>
+      have ⟨why, e⟩ := hu
+      rw [e]
+      exact Or.inl ⟨why, rfl⟩
+    | inr rel => exact after (step src s) (step tgt t) rel
+
 /-! An rvalue that cannot panic and moves nothing. -/
 
 def operandCalm : Operand → Bool
