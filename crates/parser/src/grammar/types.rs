@@ -35,11 +35,41 @@ pub(super) const TYPE_RECOVERY_SET: TokenSet = TokenSet::new(&[
 ]);
 
 pub(crate) fn type_(p: &mut Parser<'_>) {
-    type_with_bounds_cond(p, true);
+    type_or_union(p, true);
 }
 
 pub(super) fn type_no_bounds(p: &mut Parser<'_>) {
-    type_with_bounds_cond(p, false);
+    type_or_union(p, false);
+}
+
+/// A type, or under `#![blaze::error_unions]` an error union `A | B | C` of types: the union
+/// binds loosest, so `&A | B` is a union of `&A` and `B`, and a member is never a union itself
+/// (write one in parentheses). Without the extension, or where Rust lets a `|` follow a type
+/// (a closure's parameters, after `as`: [`Parser::with_unions`]), this is the type alone and
+/// the parse is Rust's.
+fn type_or_union(p: &mut Parser<'_>, allow_bounds: bool) {
+    if !p.unions() {
+        type_with_bounds_cond(p, allow_bounds);
+        return;
+    }
+    let m = p.start();
+    p.with_unions(false, |p| type_with_bounds_cond(p, allow_bounds));
+    if !at_union_bar(p) {
+        m.abandon(p);
+        return;
+    }
+    // blaze, under `#![blaze::error_unions]`: `type E = io::Error | ParseIntError;`
+    while at_union_bar(p) {
+        p.bump(T![|]);
+        p.with_unions(false, |p| type_with_bounds_cond(p, allow_bounds));
+    }
+    m.complete(p, UNION_TYPE);
+}
+
+/// Whether the parser is at the `|` between two members of an error union: a lone `|`, not
+/// the first of `||` or `|=`, that a crate with the extension wrote.
+fn at_union_bar(p: &Parser<'_>) -> bool {
+    p.at(T![|]) && !p.at(T![||]) && !p.at(T![|=]) && p.union_bar_gate()
 }
 
 fn type_with_bounds_cond(p: &mut Parser<'_>, allow_bounds: bool) {
@@ -66,6 +96,7 @@ fn type_with_bounds_cond_here(p: &mut Parser<'_>, allow_bounds: bool) {
         }
         _ if paths::is_path_start(p) => path_or_macro_type(p, allow_bounds),
         LIFETIME_IDENT if p.nth_at(1, T![+]) => bare_dyn_trait_type(p),
+        T!['{'] if p.records_gate() => record_type(p),
         T!['{'] => {
             p.err_recover("expected type, found `{`", TYPE_RECOVERY_SET);
         }
@@ -73,6 +104,65 @@ fn type_with_bounds_cond_here(p: &mut Parser<'_>, allow_bounds: bool) {
             p.err_recover("expected type", TYPE_RECOVERY_SET);
         }
     }
+}
+
+/// blaze, under `#![blaze::records]`: `fn open(opts: { create: bool = false, mode: u32 }) {}`
+///
+/// A record type: a field list where a type is expected, which is nowhere a type of Rust's
+/// (the arm after this one is its error). The list and its fields are a struct's nodes, but a
+/// record's field is a name, a `:`, a type and then a default (`= expr`, as
+/// `default_field_values` writes it) and nothing else: a visibility, an attribute or `unsafe`
+/// is an error here. hir-ty refuses a default outside a function parameter.
+fn record_type(p: &mut Parser<'_>) {
+    assert!(p.at(T!['{']));
+    let m = p.start();
+    let list = p.start();
+    p.bump(T!['{']);
+    while !p.at(T!['}']) && !p.at(EOF) {
+        if p.at(T!['{']) {
+            error_block(p, "expected a record field: a name, `:` and a type");
+            continue;
+        }
+        if !p.at(IDENT) {
+            p.err_and_bump("expected a record field: a name, `:` and a type");
+            continue;
+        }
+        let field = p.start();
+        name(p);
+        p.expect(T![:]);
+        type_(p);
+        if p.eat(T![=]) {
+            let default = p.start();
+            expressions::expr(p);
+            default.complete(p, CONST_ARG);
+        }
+        field.complete(p, RECORD_FIELD);
+        if !p.at(T!['}']) {
+            p.expect(T![,]);
+        }
+    }
+    p.expect(T!['}']);
+    list.complete(p, RECORD_FIELD_LIST);
+    m.complete(p, RECORD_TYPE);
+}
+
+/// Whether the parser is at a record type (`#![blaze::records]`) where only a type can be,
+/// which [`TYPE_FIRST`] cannot say: a `{` starts a type only under the extension.
+pub(super) fn at_record_type(p: &Parser<'_>) -> bool {
+    p.at(T!['{']) && p.records_gate()
+}
+
+/// Whether the parser is at a record type that is a generic argument (`Vec<{ a: u8 }>`,
+/// `#![blaze::records]`): a `{`, an identifier, a `:` and a token that is not a second `:`.
+/// Any other `{` in a generic argument list is Rust's const block (`Foo<{ N + 1 }>`, `Foo<{}>`),
+/// which never starts so; the empty record there is written `({})`. Four tokens, jointness
+/// unread, the bound of [`super::expressions::at_record_value`].
+pub(super) fn at_record_type_arg(p: &Parser<'_>) -> bool {
+    p.at(T!['{'])
+        && p.records_gate()
+        && p.nth(1) == IDENT
+        && p.nth(2) == T![:]
+        && p.nth(3) != T![:]
 }
 
 pub(crate) fn is_dyn_weak(p: &Parser<'_>) -> bool {
@@ -112,16 +202,18 @@ fn paren_or_tuple_type(p: &mut Parser<'_>) {
     p.bump(T!['(']);
     let mut n_types: u32 = 0;
     let mut trailing_comma: bool = false;
-    while !p.at(EOF) && !p.at(T![')']) {
-        n_types += 1;
-        type_(p);
-        if p.eat(T![,]) {
-            trailing_comma = true;
-        } else {
-            trailing_comma = false;
-            break;
+    p.with_unions(true, |p| {
+        while !p.at(EOF) && !p.at(T![')']) {
+            n_types += 1;
+            type_(p);
+            if p.eat(T![,]) {
+                trailing_comma = true;
+            } else {
+                trailing_comma = false;
+                break;
+            }
         }
-    }
+    });
     p.expect(T![')']);
 
     let kind = if n_types == 1 && !trailing_comma {
@@ -177,7 +269,7 @@ fn array_or_slice_type(p: &mut Parser<'_>) {
     let m = p.start();
     p.bump(T!['[']);
 
-    type_(p);
+    p.with_unions(true, type_);
     let kind = match p.current() {
         // test slice_type
         // type T = [()];
@@ -217,7 +309,10 @@ fn ref_type(p: &mut Parser<'_>) {
     if p.at(LIFETIME_IDENT) {
         lifetime(p);
     }
-    p.eat(T![mut]);
+    if !p.eat(T![mut]) && uniq::at_type(p) {
+        // `&uniq T`, `&'a uniq T` (`#![blaze::uniq]`): the `mut` of `&mut T`, spelled `uniq`.
+        p.bump_remap(T![mut]);
+    }
     type_no_bounds(p);
     m.complete(p, REF_TYPE);
 }
@@ -386,6 +481,18 @@ fn path_or_macro_type(p: &mut Parser<'_>, allow_bounds: bool) {
 
     let path = r.complete(p, kind);
 
+    // test bare_pattern_type
+    // type A = E is E::A(..) | E::B;
+    if kind == PATH_TYPE && p.bare_pattern_types() && p.at_contextual_kw(T![is]) {
+        // `#![blaze::pattern_types]`'s `T is PAT`: the feature gate refuses it in a crate
+        // without the gate, and before the gate `T is` was never a valid type.
+        let m = path.precede(p);
+        p.bump_remap(T![is]);
+        pat_top(p);
+        m.complete(p, PATTERN_TYPE);
+        return;
+    }
+
     if allow_bounds {
         opt_type_bounds_as_dyn_trait_type(p, path);
     }
@@ -449,13 +556,20 @@ pub(super) fn opt_type_bounds_as_dyn_trait_type(
 
 // test pattern_type
 // type T = builtin#pattern_type (u8 is 0..10);
+
+// test pattern_type_base
+// type P = builtin#pattern_type (*const u8 is !null);
 fn pattern_type(p: &mut Parser<'_>) {
     let m = p.start();
     p.bump_remap(T![builtin]);
     p.bump(T![#]);
     if p.eat_contextual_kw(T![pattern_type]) {
         p.expect(T!['(']);
-        type_(p);
+        // The `is` after the base is this builtin's: a path at the end of the base (`u8`, the
+        // `T` of `*const T`) must not take it as a bare pattern type
+        // (`#![blaze::pattern_types]`), or every pattern type of core (`NonNull`'s pointer,
+        // `NonZero`'s inner integers) parses with no pattern and lowers to the error type.
+        p.with_pattern_base(type_);
         if !p.eat_contextual_kw(T![is]) {
             p.error("expected `is`")
         }

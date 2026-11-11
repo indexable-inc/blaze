@@ -723,6 +723,7 @@ impl<'db> Encode<'_, 'db> {
             devirtualized,
             specialized,
             moved_to_frame,
+            relied,
         } = inlined;
         let why = if !callees.is_empty() {
             "a body with inlined callees, which only optimized MIR has"
@@ -740,6 +741,8 @@ impl<'db> Encode<'_, 'db> {
             "a body with specialized calls, which only optimized MIR has"
         } else if *moved_to_frame != 0 {
             "a body with allocations moved into its frame, which only optimized MIR has"
+        } else if !relied.is_empty() {
+            "a body that relied on facts, which only optimized MIR has"
         } else {
             return;
         };

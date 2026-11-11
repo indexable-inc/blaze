@@ -275,7 +275,7 @@ impl<'h, 't> Printer<'h, 't> {
                     self.write_str(" ");
                 }
                 if m == Mutability::Mut {
-                    self.write_str("mut ");
+                    self.write_str(self.unique_ref());
                 }
                 self.print_type(ty);
             }

@@ -239,6 +239,8 @@ impl Kips {
         if one.kip.tuning != setup.tuning {
             one.kip.tuning = setup.tuning;
         }
+        // Under Reduce Motion (the window keeps it in step with AppKit's) he rests still, blinking only.
+        one.kip.reduce_motion = harness_native_api::reduced(w);
         // His clock runs only while he is painted frame after frame: off screen it stopped.
         let dt = if one.seen + 1 == frame { (time - one.time).clamp(0.0, 0.25) } else { 0.0 };
         one.seen = frame;

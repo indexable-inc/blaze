@@ -222,7 +222,7 @@ impl Chord {
             "delete" => "\u{2326}",
             "return" => "\u{21A9}",
             "enter" => "\u{2324}",
-            "escape" => "\u{238B}",
+            "escape" => "esc",
             "tab" => "\u{21E5}",
             "space" => "Space",
             "-" => "\u{2212}",
@@ -419,7 +419,7 @@ impl Keymap {
     }
 
     /// Every binding of the action named `name` that nothing shadows, in any context, as hints in the order the keys file
-    /// binds them (`⎋`, `⌘.`); a control chord is left out (a terminal's habit, kept working but not said).
+    /// binds them (`esc`, `⌘.`); a control chord is left out (a terminal's habit, kept working but not said).
     #[must_use]
     pub fn hints_of(&self, name: &str) -> Vec<String> {
         let Some(a) = self.act_named(name) else { return Vec::new() };

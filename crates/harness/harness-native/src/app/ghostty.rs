@@ -52,7 +52,11 @@ fn derived(t: &term::Theme) -> [term::Rgba; 1] {
 
 /// Token `token`'s value (`export mut`), None when the scene has no such token or it is not a Fill.
 fn token(w: WorldRef<'_>, token: &str) -> Option<Fill> {
-    let v: serde_json::Value = serde_json::from_str(&w.var_json(token)?).ok()?;
+    fill_of(&serde_json::from_str(&w.var_json(token)?).ok()?)
+}
+
+/// `v` as a Fill, when it is one as flecs writes it (`{dark: {r, g, b, a}, light: {...}}`).
+pub(super) fn fill_of(v: &serde_json::Value) -> Option<Fill> {
     let c = |k: &str| {
         let c = &v[k];
         let n = |m: &str| c[m].as_f64().map(|x| x as f32);
@@ -74,14 +78,14 @@ fn fills(w: WorldRef<'_>) -> Vec<(u64, Fill)> {
 /// Token `token` set to `f`. Flecs re-runs the scripts that read it, which sets the Fill of the prefabs that name it; the
 /// Fills copied from those when something was made from them (a prefab derived from one, a prefab's children inside another,
 /// the instances made so far) do not follow on their own, so each copy that still holds its source's old Fill takes the new
-/// one, down every chain of copies. A copy given its own Fill keeps it.
-fn retint(w: WorldRef<'_>, token: &str, f: Fill) {
+/// one, down every chain of copies. A copy given its own Fill keeps it. False (and nothing changed) when the scene has no
+/// such `export mut` token.
+pub(super) fn retint(w: WorldRef<'_>, token: &str, f: Fill) -> bool {
     let json =
         |c: Rgba| format!("{{\"r\": {}, \"g\": {}, \"b\": {}, \"a\": {}}}", c.r, c.g, c.b, c.a);
     let before = fills(w);
     if !w.set_mut_var(token, &format!("{{\"dark\": {}, \"light\": {}}}", json(f.dark), json(f.light))) {
-        eprintln!("harness-native: no scene token {token} to tint");
-        return;
+        return false;
     }
     let mut work: Vec<(u64, Fill, Fill)> = before
         .iter()
@@ -116,6 +120,7 @@ fn retint(w: WorldRef<'_>, token: &str, f: Fill) {
             }
         }
     }
+    true
 }
 
 impl App {
@@ -182,8 +187,8 @@ impl App {
                 light: if themed[0] { rgba(dl[i]) } else { s.light },
                 dark: if themed[1] { rgba(dd[i]) } else { s.dark },
             };
-            if token(w, name) != Some(f) {
-                retint(w, name, f);
+            if token(w, name) != Some(f) && !retint(w, name, f) {
+                eprintln!("harness-native: no scene token {name} to tint");
             }
         }
     }

@@ -104,6 +104,10 @@ define_unstable_features! {
     forced_keywords,
     // blaze's compile-time reflection (`docs/v2/plan/design/comptime.md`).
     blaze_comptime,
+    // blaze's generic const expressions (`docs/v2/plan/design/ownership.md`): its own gate, not
+    // `generic_const_exprs`, whose unfinished rustc rules (`thir_abstract_const`) blaze does
+    // not have and the solver's own code paths for it must not take.
+    blaze_const_exprs,
     // blaze's native verification clauses (`docs/v2/plan/design/verus.md`).
     blaze_verify,
 }

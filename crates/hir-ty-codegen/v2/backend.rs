@@ -555,12 +555,71 @@ fn features(
         Kind::Code(..) | Kind::Start(_) | Kind::Allocator(_) | Kind::Asm(..) => None,
     };
     let Some(func) = func else { return Ok((unit, false)) };
+    multiversioned(db, spec, target, func)?;
     let enabled = hir_ty::TargetFeatures::from_fn(db, func).known();
     if enabled.is_empty() {
         return Ok((unit, false));
     }
     let set = with_enabled(target, &spec.toolchain.cpu, &spec.toolchain.features, enabled.names())?;
     Ok((set, set != unit))
+}
+
+/// `#[blaze::multiversion]` on `func` (docs/v2/plan/design/simd.md): its levels are checked
+/// against the unit's features, and a plan with no clone (the unit already has every level,
+/// or the target has none) is the function as it is. The clones themselves, their dispatch
+/// cell and the code that fills it are not built yet, so a plan that has one stops here,
+/// naming the function and the levels: compiling only the baseline would hand back slower
+/// code than was asked for and say nothing (`no-fallback`).
+///
+/// SAFETY of what replaces this refusal, stated where the attribute becomes target features:
+/// a clone is this function compiled as if `#[target_feature(enable = ..)]` named its level's
+/// added features, which rustc makes unsafe to call because the caller must know the CPU has
+/// them. The attribute is safe because a clone has no name and no address a program can take,
+/// and is entered only (1) through the function's dispatch cell, which holds the baseline
+/// until it is filled with a clone `Plan::select` picked from the features std's detection
+/// reported, so every feature the clone adds is present, or (2) directly from a clone whose
+/// set contains this one's, which by induction already runs on such a CPU. The unit's own
+/// features are the program's precondition, as for every function of the unit.
+fn multiversioned(
+    db: &Db,
+    spec: &Spec,
+    target: &crate::Target,
+    func: hir_def::FunctionId,
+) -> Result<(), String> {
+    if !AttrFlags::query(db, func.into()).contains(AttrFlags::BLAZE_MULTIVERSION) {
+        return Ok(());
+    }
+    let name = FunctionSignature::of(db, func).name.symbol().as_str();
+    let unit = unit_features(target, &spec.toolchain.features);
+    let plan = match hir_ty::multiversion_plan(db, func, &unit) {
+        None => return Ok(()),
+        // alloc: an error
+        Some(Err(refusal)) => return Err(format!("function `{name}`: {refusal}")),
+        Some(Ok(plan)) => plan,
+    };
+    if plan.clones().is_empty() {
+        return Ok(());
+    }
+    // alloc: an error
+    let levels: Vec<&str> = plan.clones().iter().map(|it| &*it.name).collect();
+    Err(format!(
+        "function `{name}` is `#[blaze::multiversion]` and this unit would compile a clone of it \
+         for each of the levels {levels:?}: blaze does not compile a function's clones yet \
+         (docs/v2/plan/design/simd.md, \"Built in slice 1\"); remove the attribute, or build \
+         the unit with those target features"
+    ))
+}
+
+/// A unit's target features as rustc's tables name them: the baseline's of its target with
+/// what `toolchain` (its sorted `+name` and `-name`) turns on and off. A name no table of
+/// rustc's has is left out, and one of another arch's table (`fp-armv8` of AArch64's baseline,
+/// which rustc folds into `neon`) implies nothing there: a level never names either, since
+/// `#[blaze::multiversion]`'s levels are checked against the target's own table.
+fn unit_features(target: &crate::Target, toolchain: &[String]) -> hir_ty::TargetFeatureSet {
+    let off = |name: &str| toolchain.iter().any(|it| it.strip_prefix('-') == Some(name));
+    let baseline = super::toolchain::baseline(target).iter().copied().filter(|it| !off(it));
+    let on = toolchain.iter().filter_map(|it| it.strip_prefix('+'));
+    baseline.chain(on).filter_map(hir_ty::TargetFeature::from_name).collect()
 }
 
 /// The set of `toolchain` (a unit's sorted features, for its CPU `cpu`) with `enabled`
@@ -1468,7 +1527,7 @@ impl Compile for Backends<'_> {
 
 #[cfg(test)]
 mod features_tests {
-    use super::with_enabled;
+    use super::{unit_features, with_enabled};
 
     fn names(features: &[&str]) -> Vec<String> {
         features.iter().map(|it| (*it).to_owned()).collect()
@@ -1492,5 +1551,22 @@ mod features_tests {
         let same =
             with_enabled(&x86, x86.cpu(), &names(&["+avx"]), ["avx"].into_iter()).expect("a set");
         assert_eq!(same, unit);
+    }
+
+    /// What `#[blaze::multiversion]`'s plan is made against: the target's baseline with the
+    /// toolchain's features on and off.
+    #[test]
+    fn a_units_features_are_its_baselines_with_its_toolchains() {
+        let has = |set: &hir_ty::TargetFeatureSet, name: &str| {
+            set.contains(hir_ty::TargetFeature::from_name(name).expect(name))
+        };
+        let x86 = crate::Target::of("x86_64-unknown-linux-gnu").expect("a target");
+        let unit = unit_features(&x86, &[]);
+        assert!(has(&unit, "sse2") && has(&unit, "fxsr") && !has(&unit, "avx2"));
+        let unit = unit_features(&x86, &names(&["+avx", "+avx2", "-x87"]));
+        assert!(has(&unit, "sse2") && has(&unit, "avx2") && !has(&unit, "x87"));
+        let arm = crate::Target::of("aarch64-unknown-linux-gnu").expect("a target");
+        let unit = unit_features(&arm, &names(&["+sve"]));
+        assert!(has(&unit, "neon") && has(&unit, "sve") && !has(&unit, "sve2"));
     }
 }

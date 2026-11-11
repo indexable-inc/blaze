@@ -1,7 +1,9 @@
 //! The effects of the one walk (docs/v2/plan/design/pure-fns.md, "Effects"): every kind of thing
 //! an instance may do ([`Rule`]), as the bitset ([`EffectSet`]) each instance's summary carries
 //! with a witness per kind; the attribute effects that refuse some kinds ([`EffectDef`]:
-//! `#[blaze::pure]` here, `nopanic`, `noalloc` and `nonblocking` beside it); and the toolchain's
+//! `#[blaze::pure]` here; beside it `nopanic`, `noalloc`, `nonblocking` and `terminates`, which
+//! `#[blaze::may(..)]` asks for by the words it leaves out, [`crate::may`]; and the crate-wide
+//! `ambient`, `unsafe` and `global_alloc` of `#![blaze::capabilities]`); and the toolchain's
 //! entry points a call of which counts as kinds at the call ([`MODELS`]).
 //!
 //! One walk answers every effect: checking one reads the root's summary, never walks again. A
@@ -12,7 +14,7 @@
 use base_db::{CrateOrigin, Db};
 use hir_def::{
     AttrDefId, FunctionId, ItemContainerId, Lookup, TraitId,
-    attrs::{AttrFlags, PureAttr},
+    attrs::{AttrFlags, MayWord, PureAttr},
 };
 use hir_ty::db::HirDatabase;
 use intern::Symbol;
@@ -57,10 +59,38 @@ pub enum Rule {
     ForeignUnwind,
     /// A call only an instance decides (a generic check only).
     Open,
+    /// `unsafe` code: an `unsafe` block written in the body, or the body of an `unsafe fn`.
+    Unsafe,
+    /// A loop not known to end: blocks of the body that reach themselves again, with no
+    /// bounding block (`crate::loops`).
+    Loop,
+    /// The instance can call itself again, through any calls (a cycle of instances).
+    Recursion,
+    /// A call through a function pointer or a `dyn`, or the drop of a value that may hold a
+    /// `dyn`: what it reaches was walked where the pointer or vtable was made, but it may
+    /// reach the caller again, a recursion no cycle of instances shows.
+    Indirect,
+    /// The abort of an `unsafe` precondition check of the toolchain (the `precondition_check`
+    /// of `core::ub_checks::assert_unsafe_precondition!`), not answered for yet. It goes up
+    /// through the toolchain's `unsafe fn`s to the first safe function of the toolchain, whose
+    /// contract is that it upholds the precondition (dropped there: the toolchain is trusted
+    /// for `unsafe`), or to code outside the toolchain that calls the `unsafe fn`, which has to
+    /// uphold it itself: there it is a [`Rule::Panic`] (`walk::Fold::callee`). Kept only in
+    /// the sets of an effect that refuses a panic, never a kind of [`crate::walk::Summary`]'s
+    /// `kinds`, and never refused itself.
+    Precondition,
+    /// A call through a `dyn` of a method no `#[blaze::may(..)]` or trust says the effects of
+    /// (or through a `dyn Fn`), or the drop of a value that owns a `dyn`: its target is
+    /// whatever object the function is handed. It matters only to a check whose root takes
+    /// such a `dyn` (`crate::function`): every other object is made in the root's own graph,
+    /// where its vtable's methods were walked. Kept in every effect's set, never refused by an
+    /// effect itself, and it crosses a callee trusted for the effect, which answers for its
+    /// own code and not for the object it is given.
+    Dyn,
 }
 
 impl Rule {
-    pub const ALL: [Rule; 17] = [
+    pub const ALL: [Rule; 23] = [
         Rule::Io,
         Rule::Env,
         Rule::Clock,
@@ -78,6 +108,12 @@ impl Rule {
         Rule::ForeignUnknown,
         Rule::ForeignUnwind,
         Rule::Open,
+        Rule::Unsafe,
+        Rule::Loop,
+        Rule::Recursion,
+        Rule::Indirect,
+        Rule::Precondition,
+        Rule::Dyn,
     ];
 
     /// What an instance with this kind does: "reads the environment".
@@ -100,6 +136,12 @@ impl Rule {
             Rule::ForeignUnknown => "calls a foreign function no table knows",
             Rule::ForeignUnwind => "calls a foreign function that may unwind",
             Rule::Open => "makes a call only an instance decides",
+            Rule::Unsafe => "runs `unsafe` code",
+            Rule::Loop => "has a loop not known to end",
+            Rule::Recursion => "may call itself again",
+            Rule::Indirect => "makes a call that may reach it again",
+            Rule::Precondition => "has an `unsafe` precondition its caller upholds",
+            Rule::Dyn => "calls through a `dyn` it is given",
         }
     }
 
@@ -123,6 +165,12 @@ impl Rule {
             Rule::ForeignUnknown => "foreign_unknown",
             Rule::ForeignUnwind => "foreign_unwind",
             Rule::Open => "open",
+            Rule::Unsafe => "unsafe",
+            Rule::Loop => "loop",
+            Rule::Recursion => "recursion",
+            Rule::Indirect => "indirect",
+            Rule::Precondition => "precondition",
+            Rule::Dyn => "dyn",
         }
     }
 }
@@ -179,8 +227,12 @@ impl EffectSet {
 /// impl or trait it is a method of, takes those kinds off every call of it (its body is still
 /// walked for the other effects and for build scripts).
 pub struct EffectDef {
-    /// The attribute's word: "pure".
+    /// The attribute's word: "pure". (`terminates` has no attribute of its own: it is what a
+    /// `#[blaze::may(..)]` without `diverge` asks.)
     pub name: &'static str,
+    /// The word of `#[blaze::may(..)]` that allows what this refuses: a list without it asks
+    /// for this effect. None for `pure`, which no list names.
+    pub word: Option<MayWord>,
     pub refuses: EffectSet,
     /// What the attribute on an item says: checked, trusted with a reason, or malformed.
     pub attr: fn(&Db, AttrDefId) -> Option<PureAttr>,
@@ -191,6 +243,12 @@ pub struct EffectDef {
     /// Whether what a callee that never returns (its type's output is `!`) does counts. Not for
     /// purity: such a call gives no result to keep, so what it does can't make one differ.
     pub through_never: bool,
+    /// An effect of `#![blaze::capabilities]` (`effect_attrs::AMBIENT`, `UNSAFE`,
+    /// `GLOBAL_ALLOC`): asked of every function of a crate with the attribute, not of a marked
+    /// one; no attribute trusts a function for it, a crate's trust does
+    /// (`effect_attrs::crate_trust`); and a check does not refuse the root's parameters, as a
+    /// `dyn` or a function pointer it takes is walked where it is made.
+    pub crate_wide: bool,
 }
 
 /// What `#[blaze::pure]` refuses: everything that makes a result depend on more than the
@@ -210,20 +268,28 @@ pub const PURE_REFUSES: EffectSet = EffectSet::of(&[
 /// `#[blaze::pure]`.
 pub const PURE: EffectDef = EffectDef {
     name: "pure",
+    word: None,
     refuses: PURE_REFUSES,
     attr: AttrFlags::pure_attr,
     says: Rule::said,
     fix: "a pure function reads the outside world only through its arguments",
     through_never: false,
+    crate_wide: false,
 };
 
 /// Every attribute effect, in the order each summary keeps their sets. The effects lane appends
-/// `&NOPANIC, &NOALLOC, &NONBLOCKING` (defined in `effect_attrs`).
+/// `&NOPANIC, &NOALLOC, &NONBLOCKING, &TERMINATES` (defined in `effect_attrs`), then the
+/// crate-wide effects of `#![blaze::capabilities]`. A summary's inline room (`walk::Sets`) is
+/// this many.
 pub const EFFECTS: &[&EffectDef] = &[
     &PURE,
     &crate::effect_attrs::NOPANIC,
     &crate::effect_attrs::NOALLOC,
     &crate::effect_attrs::NONBLOCKING,
+    &crate::effect_attrs::TERMINATES,
+    &crate::effect_attrs::AMBIENT,
+    &crate::effect_attrs::UNSAFE,
+    &crate::effect_attrs::GLOBAL_ALLOC,
 ];
 
 /// The index of `effect` in [`EFFECTS`], by name: a copy with fewer `refuses` (a profile's
@@ -243,15 +309,76 @@ pub(crate) fn trusted(
     if let Some(PureAttr::Trusted(why)) = (effect.attr)(db, AttrDefId::FunctionId(func)) {
         return Some((why, None));
     }
+    if let Some(why) = may_trusted(db, AttrDefId::FunctionId(func), effect) {
+        return Some((why, None));
+    }
     let trait_ = match func.lookup(db).container {
         ItemContainerId::TraitId(it) => it,
         ItemContainerId::ImplId(imp) => db.impl_trait(imp)?.skip_binder().def_id.0,
         _ => return None,
     };
+    trusted_trait(db, trait_, effect).map(|why| (why, Some(trait_)))
+}
+
+/// Why `trait_` is trusted for `effect`, if it is: its `#[blaze::<effect>(trusted = "..")]`,
+/// or its `#[blaze::may(.., trusted = "..")]` that leaves the effect's word out.
+pub(crate) fn trusted_trait(db: &Db, trait_: TraitId, effect: &EffectDef) -> Option<Symbol> {
     match (effect.attr)(db, AttrDefId::TraitId(trait_)) {
-        Some(PureAttr::Trusted(why)) => Some((why, Some(trait_))),
-        _ => None,
+        Some(PureAttr::Trusted(why)) => Some(why),
+        _ => may_trusted(db, AttrDefId::TraitId(trait_), effect),
     }
+}
+
+/// The reason of `owner`'s `#[blaze::may(.., trusted = "why")]` when its list leaves out
+/// `effect`'s word: the list is taken at its word, so the item does not have the effect.
+fn may_trusted(db: &Db, owner: AttrDefId, effect: &EffectDef) -> Option<Symbol> {
+    let word = effect.word?;
+    let may = AttrFlags::may_attr(db, owner)?;
+    if may.malformed.is_some() || may.has(word) {
+        return None;
+    }
+    may.trusted
+}
+
+/// Bit `i` set for each effect `EFFECTS[i]` that a call of the trait's method `method` through
+/// a `dyn` or a type parameter cannot have: the method's `#[blaze::may(..)]`, or without one
+/// its trait's, leaves the effect's word out, and every impl's method is held within that list
+/// where it is written (`blaze::undeclared_effect`). Nothing for a method with no list.
+pub(crate) fn bound_mask(db: &Db, method: FunctionId) -> u32 {
+    let ItemContainerId::TraitId(trait_) = method.lookup(db).container else { return 0 };
+    let may = AttrFlags::may_attr(db, AttrDefId::FunctionId(method))
+        .or_else(|| AttrFlags::may_attr(db, AttrDefId::TraitId(trait_)));
+    let Some(may) = may else { return 0 };
+    if may.malformed.is_some() {
+        return 0;
+    }
+    EFFECTS
+        .iter()
+        .enumerate()
+        .filter(|(_, effect)| effect.word.is_some_and(|word| !may.has(word)))
+        .fold(0, |mask, (index, _)| mask | 1 << index)
+}
+
+/// Whether `func` is the check of an `unsafe` precondition in the pinned library: the
+/// `precondition_check` that `core::ub_checks::assert_unsafe_precondition!` declares inside the
+/// function whose precondition it is, `#[rustc_no_mir_inline]` and `#[rustc_nounwind]`, which
+/// aborts through `panic_nounwind_fmt` when the caller of that function broke its contract.
+/// Only a function of the toolchain written inside a body with both attributes is one: a
+/// function of that name anywhere else is not.
+pub(crate) fn precondition_check(db: &Db, func: FunctionId) -> bool {
+    use hir_def::HasModule as _;
+    if !matches!(func.krate(db).data(db).origin, CrateOrigin::Lang(_)) {
+        return false;
+    }
+    let ItemContainerId::ModuleId(module) = func.lookup(db).container else { return false };
+    if !module.is_block_module(db) {
+        return false;
+    }
+    let flags = AttrFlags::query(db, AttrDefId::FunctionId(func));
+    flags.contains(AttrFlags::RUSTC_NO_MIR_INLINE)
+        && flags.contains(AttrFlags::RUSTC_NOUNWIND)
+        && hir_def::signatures::FunctionSignature::of(db, func).name.as_str()
+            == "precondition_check"
 }
 
 /// Whether a body of `krate` is the code a person writes: a crate of the workspace. The address

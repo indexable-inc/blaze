@@ -288,6 +288,9 @@ pub struct Compiled {
     /// A proc macro's expanders, loaded from what it compiled to (or why there are none):
     /// the loop asks the job's [`Writer::macros`] with them. None for any other unit.
     pub macros: Option<blaze_lower::ProcMacroLoadResult>,
+    /// A device unit's MSL (`blaze_units::UnitPlan::gpu_msl`), as it made or kept it: the loop
+    /// asks the job's [`Writer::gpu_msl`] with it. None for any other unit.
+    pub gpu_msl: Option<Vec<u8>>,
     /// Each image the compile linked, by its path, and how the link reached it: what the job's
     /// [`blaze_api::Worked`] says, and the bench fails an edit by.
     pub links: Vec<(String, Linking)>,
@@ -784,6 +787,10 @@ pub trait Writer<S: Steps>: Send + 'static {
         unit: usize,
         macros: blaze_lower::ProcMacroLoadResult,
     ) -> Result<(), ApiError>;
+    /// Asks for device unit `unit`'s MSL set as the bytes of its file
+    /// (`blaze_lower::Lowered::gpu_msl`), which its dependents' front ends read: checked now,
+    /// applied by [`Writer::apply`], counted as a run's (`unit::graph::flag::GPU_MSL`).
+    fn gpu_msl(&mut self, unit: usize, msl: Vec<u8>) -> Result<(), ApiError>;
     /// Whether a write was asked for and is not applied yet, or the front end asks to let go
     /// of what nothing still to compile reads (the daemon's `unit::release`): either way the
     /// loop posts no reading task of the job until [`Writer::apply`] applied it.

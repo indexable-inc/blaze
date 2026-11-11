@@ -368,9 +368,10 @@ jobs:
   # The counts are of aarch64-unknown-linux-gnu's cfg (the directory's TARGET), so this runs on
   # Linux AArch64 and builds blaze there as the build job does, from the store main's pushes
   # keep warm for it. Each package's default targets: blaze's check of test targets fails for
-  # now ("can't find crate for `test`"), so tests are counted once it passes. No baseline is
-  # made yet, as blaze cannot yet finish this check of its own workspace, so the job fails until
-  # a run does and makes them (docs/lints.md).
+  # now ("can't find crate for `test`"), so tests are counted once it passes. The `blaze.*.txt`
+  # baselines are also the ratchet's: each crate a lint's lists is held at `warn` on it, every
+  # other crate at `deny` (docs/lints.md, "Workspace levels and the ratchet"). They start with
+  # every crate `unmeasured`, so the job fails until a run with `--bless-baselines` records them.
   lint-baselines:
     name: lint baselines
     needs: changes
@@ -380,6 +381,19 @@ jobs:
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v7
+      # The ratchet only tightens (harness/v2/guards.py, `ratchet`; docs/lints.md, "Workspace
+      # levels and the ratchet"): no `blaze.<lint>.txt` holds a crate at `warn` that the base did
+      # not, a count over the base's, or a count back at `unmeasured`. Against the base itself:
+      # the checkout is shallow.
+      - name: the lint ratchet only tightens
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+        run: |
+          if [ -z "$BASE" ]; then
+            echo "no base to compare with (a run by hand): the ratchet is held on pull requests and pushes"; exit 0
+          fi
+          git fetch -q --depth=1 origin "$BASE"
+          PYTHONPATH=tools/typed-input/src python3 harness/v2/guards.py "{\"command\": \"ratchet\", \"base\": \"$BASE\"}"
       - id: blaze
         uses: ./.github/actions/blaze
         with:

@@ -1,0 +1,16 @@
+# A blaze extension (docs/v2/plan/design/extensions.md): a crate outside blaze's workspace, as
+# a user's is. Its one dependency is the API, whose version requirement says which surface the
+# source was written for; blaze compiles it against its own copy.
+[package]
+name = "panic-in-drop"
+description = "blaze's `panic_in_drop` lint, ported to the extension API: the worked example"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-ext = { path = "../../crates/blaze-ext", version = "0.1" }

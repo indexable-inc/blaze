@@ -342,7 +342,7 @@ fn every_variant<'db>(cx: &Cx<'_, 'db>, ty: Ty<'db>, out: &mut Vec<u32>) {
     let ty = ty.strip_references();
     let Ok(ConstructorSet::Variants { variants, .. }) = cx.ctors_for_ty(&ty) else { return };
     for (idx, visibility) in variants.iter().enumerate() {
-        if !matches!(visibility, VariantVisibility::Empty) {
+        if !matches!(visibility, VariantVisibility::Empty | VariantVisibility::Excluded) {
             out.push(idx as u32);
         }
     }

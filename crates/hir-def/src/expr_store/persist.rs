@@ -242,7 +242,7 @@ kinds! {
     /// Which [`type_ref::TypeRef`] variant a type of a buffer is, read in place.
     TypeRefKind {
         Never, Placeholder, Tuple, Path, RawPtr, Reference, Array, Slice, Fn, ImplTrait, DynTrait,
-        TypeParam, PatternType, Error, UnsafeBinder,
+        TypeParam, PatternType, Error, UnsafeBinder, Union, Record,
     }
 
     /// Which [`LifetimeRef`] variant a node of a buffer is, read in place.
@@ -260,7 +260,7 @@ kinds! {
 same_numbers! {
     TypeRefKind = type_ref::TypeRefKind {
         Never, Placeholder, Tuple, Path, RawPtr, Reference, Array, Slice, Fn, ImplTrait, DynTrait,
-        TypeParam, PatternType, Error, UnsafeBinder,
+        TypeParam, PatternType, Error, UnsafeBinder, Union, Record,
     }
     StatementKind = columns::StatementKind {
         Let, Expr, MacroDef, Item,
@@ -1657,7 +1657,9 @@ impl Persist for ExpressionStore {
         // `offset_of!`'s field contexts (`OffsetOf::hygiene`), and a tuple index's context in
         // `ident_hygiene`, which def-site privacy reads.
         // 14: a closure's `for<..>` binder (`Expr::Closure::binder`), two more words of it.
-        Part::U64(14),
+        // 15: a type's kind may be `Union` (an error union) or `Record` (a record type, three
+        // words of `extra` and one per field).
+        Part::U64(15),
         Part::Schema(<StoreRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = ExpressionStoreRef<'a>;
@@ -1739,7 +1741,9 @@ impl Persist for Body {
         // `offset_of!`'s field contexts (`OffsetOf::hygiene`), and a tuple index's context in
         // `ident_hygiene`, which def-site privacy reads.
         // 14: a closure's `for<..>` binder (`Expr::Closure::binder`), two more words of it.
-        Part::U64(14),
+        // 15: a type's kind may be `Union` (an error union) or `Record` (a record type, three
+        // words of `extra` and one per field).
+        Part::U64(15),
         Part::Schema(<BodyRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = BodyRef<'a>;
@@ -1948,6 +1952,7 @@ unit_codes! {
         1 => ComptimeForm::ReflectedField,
         2 => ComptimeForm::BinderBound,
         3 => ComptimeForm::Block,
+        4 => ComptimeForm::WhereConst,
     }
     VerifyRefusal {
         0 => VerifyRefusal::WithoutFeature,
@@ -2742,6 +2747,8 @@ mod tests {
             TypeRef::PatternType(..) => TypeRefKind::PatternType,
             TypeRef::Error => TypeRefKind::Error,
             TypeRef::UnsafeBinder { .. } => TypeRefKind::UnsafeBinder,
+            TypeRef::Union(_) => TypeRefKind::Union,
+            TypeRef::Record { .. } => TypeRefKind::Record,
         }
     }
 

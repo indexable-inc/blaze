@@ -35,9 +35,9 @@ use crate::{
             SideTable,
         },
         diagnostics::{
-            AssocTypeFailure, AssocTypeQself, CycleQuery, ElidedLifetimeSite,
+            AssocTypeFailure, AssocTypeQself, CycleQuery, ElidedLifetimeSite, ErrorUnionRefusal,
             GenericArgsProhibitedReason, IncorrectGenericsLenKind, MissingLifetimeKind,
-            PathGenericsSource, PathLoweringDiagnostic, PatternTypeUnsupported,
+            PathGenericsSource, PathLoweringDiagnostic, PatternTypeUnsupported, RecordRefusal,
         },
     },
     next_solver::{
@@ -912,7 +912,37 @@ pub(crate) fn put_diagnostic(w: &mut Vec<u32>, diagnostic: &TyLoweringDiagnostic
             put_local(w, *source);
             w.push(match reason {
                 PatternTypeUnsupported::Pattern => 0,
+                PatternTypeUnsupported::VariantsNeedGate => 1,
+                PatternTypeUnsupported::VariantsOfNonEnum => 2,
+                PatternTypeUnsupported::NotAVariant => 3,
+                PatternTypeUnsupported::VariantFieldNotWildcard => 4,
+                PatternTypeUnsupported::VariantShape => 5,
             });
+        }
+        TyLoweringDiagnostic::ErrorUnionRefused { source, reason } => {
+            w.push(41);
+            put_local(w, *source);
+            w.push(match reason {
+                ErrorUnionRefusal::NotEnabled => 0,
+                ErrorUnionRefusal::NoLangItem => 1,
+                ErrorUnionRefusal::TypeParam => 2,
+                ErrorUnionRefusal::NotNamed => 3,
+                ErrorUnionRefusal::Ambiguous => 4,
+                ErrorUnionRefusal::TooMany => 5,
+            });
+        }
+        TyLoweringDiagnostic::RecordRefused { source, reason } => {
+            w.push(42);
+            put_local(w, *source);
+            let (tag, field) = match reason {
+                RecordRefusal::NotEnabled => (0, 0),
+                RecordRefusal::NoLangItem => (1, 0),
+                RecordRefusal::DuplicateField(at) => (2, *at),
+                RecordRefusal::DefaultOutsideParameter(at) => (3, *at),
+                RecordRefusal::DefaultInTraitImpl(at) => (4, *at),
+                RecordRefusal::ExternAbi => (5, 0),
+            };
+            w.extend([tag, field]);
         }
         TyLoweringDiagnostic::QueryCycle { def, query } => {
             w.push(10);
@@ -1230,7 +1260,36 @@ impl Words<'_> {
                 source: self.local()?,
                 reason: match self.u32()? {
                     0 => PatternTypeUnsupported::Pattern,
+                    1 => PatternTypeUnsupported::VariantsNeedGate,
+                    2 => PatternTypeUnsupported::VariantsOfNonEnum,
+                    3 => PatternTypeUnsupported::NotAVariant,
+                    4 => PatternTypeUnsupported::VariantFieldNotWildcard,
+                    5 => PatternTypeUnsupported::VariantShape,
                     _ => return Err(self.invalid("a pattern type not lowered for no reason")),
+                },
+            },
+            41 => TyLoweringDiagnostic::ErrorUnionRefused {
+                source: self.local()?,
+                reason: match self.u32()? {
+                    0 => ErrorUnionRefusal::NotEnabled,
+                    1 => ErrorUnionRefusal::NoLangItem,
+                    2 => ErrorUnionRefusal::TypeParam,
+                    3 => ErrorUnionRefusal::NotNamed,
+                    4 => ErrorUnionRefusal::Ambiguous,
+                    5 => ErrorUnionRefusal::TooMany,
+                    _ => return Err(self.invalid("an error union refused for no reason")),
+                },
+            },
+            42 => TyLoweringDiagnostic::RecordRefused {
+                source: self.local()?,
+                reason: match (self.u32()?, self.u32()?) {
+                    (0, 0) => RecordRefusal::NotEnabled,
+                    (1, 0) => RecordRefusal::NoLangItem,
+                    (2, at) => RecordRefusal::DuplicateField(at),
+                    (3, at) => RecordRefusal::DefaultOutsideParameter(at),
+                    (4, at) => RecordRefusal::DefaultInTraitImpl(at),
+                    (5, 0) => RecordRefusal::ExternAbi,
+                    _ => return Err(self.invalid("a record refused for no reason")),
                 },
             },
             10 => TyLoweringDiagnostic::QueryCycle {
@@ -1496,6 +1555,34 @@ mod tests {
                 source,
                 reason: PatternTypeUnsupported::Pattern,
             },
+            TyLoweringDiagnostic::PatternTypeNotLowered {
+                source,
+                reason: PatternTypeUnsupported::VariantsNeedGate,
+            },
+            TyLoweringDiagnostic::PatternTypeNotLowered {
+                source,
+                reason: PatternTypeUnsupported::VariantShape,
+            },
+            TyLoweringDiagnostic::ErrorUnionRefused {
+                source,
+                reason: ErrorUnionRefusal::NotEnabled,
+            },
+            TyLoweringDiagnostic::ErrorUnionRefused { source, reason: ErrorUnionRefusal::TooMany },
+            TyLoweringDiagnostic::RecordRefused { source, reason: RecordRefusal::NotEnabled },
+            TyLoweringDiagnostic::RecordRefused { source, reason: RecordRefusal::NoLangItem },
+            TyLoweringDiagnostic::RecordRefused {
+                source,
+                reason: RecordRefusal::DuplicateField(3),
+            },
+            TyLoweringDiagnostic::RecordRefused {
+                source,
+                reason: RecordRefusal::DefaultOutsideParameter(1),
+            },
+            TyLoweringDiagnostic::RecordRefused {
+                source,
+                reason: RecordRefusal::DefaultInTraitImpl(2),
+            },
+            TyLoweringDiagnostic::RecordRefused { source, reason: RecordRefusal::ExternAbi },
             TyLoweringDiagnostic::QueryCycle { def, query: CycleQuery::Predicates },
             TyLoweringDiagnostic::QueryCycle { def: trait_def, query: CycleQuery::SuperClauses },
             TyLoweringDiagnostic::QueryCycle { def: trait_def, query: CycleQuery::ImpliedClauses },

@@ -1139,9 +1139,9 @@ impl<'a, 'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'a, 'db, 'f, D> {
         for adjustment in &adjustments {
             debug!("walk_adjustment expr={:?} adj={:?}", expr, adjustment);
             match adjustment.kind {
-                Adjust::NeverToAny | Adjust::Pointer(_) => {
-                    // Creating a closure/fn-pointer or unsizing consumes
-                    // the input and stores it into the resulting rvalue.
+                Adjust::NeverToAny | Adjust::Pointer(_) | Adjust::ErrorUnion => {
+                    // Creating a closure/fn-pointer, unsizing or widening to an error union
+                    // consumes the input and stores it into the resulting rvalue.
                     // clone: frame copy, the place goes on to the next adjustment
                     self.consume_or_copy(place_with_id.clone());
                 }
@@ -1650,7 +1650,7 @@ impl<'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'_, 'db, 'f, D> {
                 self.cat_deref(expr.into(), base)
             }
 
-            Adjust::NeverToAny | Adjust::Pointer(_) | Adjust::Borrow(_) => {
+            Adjust::NeverToAny | Adjust::Pointer(_) | Adjust::Borrow(_) | Adjust::ErrorUnion => {
                 // Result is an rvalue.
                 Ok(self.cat_rvalue(expr.into(), target))
             }
@@ -1669,9 +1669,31 @@ impl<'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'_, 'db, 'f, D> {
                 }
             }
 
-            Expr::Field { expr: base, .. } => {
+            Expr::Field { expr: base, name } => {
                 let base = self.cat_expr(base)?;
                 debug!(?base);
+
+                // blaze: `r.a` on a record (`#![blaze::records]`) is the one field of core's
+                // `Record`, then the field's place in the tuple it holds, as MIR building
+                // projects it.
+                if let Some(of) =
+                    crate::record::record_fields(self.cx.lang_items, base.place.ty())
+                {
+                    let at = of.index_of(name.as_str()).ok_or(ErrorGuaranteed)? as u32;
+                    let tuple = of.tuple(self.cx.interner());
+                    let inner = self.cat_projection(
+                        expr.into(),
+                        base,
+                        tuple,
+                        ProjectionKind::Field { field_idx: 0, variant_idx: 0 },
+                    );
+                    return Ok(self.cat_projection(
+                        expr.into(),
+                        inner,
+                        expr_ty,
+                        ProjectionKind::Field { field_idx: at, variant_idx: 0 },
+                    ));
+                }
 
                 let field_idx = self
                     .cx
@@ -2009,6 +2031,33 @@ impl<'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'_, 'db, 'f, D> {
                         projection_kind,
                     );
                     self.cat_pattern(sub_place, subpat, op)?;
+                }
+            }
+
+            // blaze: a record pattern `{ a, b: x }` (`#![blaze::records]`): each field named
+            // is at its place in the tuple core's `Record` holds.
+            Pat::Record { args: field_pats, .. }
+                if let Some(of) =
+                    crate::record::record_fields(self.cx.lang_items, place_with_id.place.ty()) =>
+            {
+                let tuple = of.tuple(self.cx.interner());
+                let inner = self.cat_projection(
+                    pat.into(),
+                    place_with_id,
+                    tuple,
+                    ProjectionKind::Field { field_idx: 0, variant_idx: 0 },
+                );
+                for fp in field_pats {
+                    let field_ty = self.pat_ty_adjusted(fp.pat)?;
+                    let at = of.index_of(fp.name.as_str()).ok_or(ErrorGuaranteed)? as u32;
+                    let field_place = self.cat_projection(
+                        pat.into(),
+                        // clone: frame copy, each subpattern extends its own
+                        inner.clone(),
+                        field_ty,
+                        ProjectionKind::Field { field_idx: at, variant_idx: 0 },
+                    );
+                    self.cat_pattern(field_place, fp.pat, op)?;
                 }
             }
 

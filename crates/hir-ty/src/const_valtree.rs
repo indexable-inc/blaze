@@ -35,7 +35,9 @@ pub fn anon_const_valtree_error<'db>(db: &'db Db, def: AnonConstId<'db>) -> Opti
     let krate = def.module(db).krate(db);
     let interner = DbInterner::new_with(db, krate);
     let args = GenericArgs::identity_for_item(interner, owner.into());
-    if !loc.allow_using_generic_params
+    // A constant that depends on its owner's parameters has a value only at a use with
+    // concrete arguments, as one that may not name them at all.
+    if (!loc.allow_using_generic_params || crate::consteval::anon_const_is_dependent(db, def))
         && (args.has_non_region_param() || args.has_non_region_placeholders())
     {
         return None;

@@ -341,6 +341,10 @@ struct MirLowerCtx<'a, 'f, 'db> {
     /// (`cfg::CONTRACT_CHECKS`, docs/v2/plan/design/contracts.md part 1); `None` everywhere
     /// else, which lowers as before.
     contracts: Option<contract::Contracts>,
+    /// The locals made while an `ensures` clause was lowered, as ranges of local indexes: the
+    /// clause's own, which it may move out of. A clause is lowered at each way out and binds
+    /// the same locals each time.
+    ensures_locals: Vec<(usize, usize), &'f Frame>,
     /// Set only while `unreachable_after_calls`'s probe lowers the body again
     /// (`lower/uninhabited.rs`): lowering goes on past calls of an uninhabited type.
     probe: Option<uninhabited::Probe<'f>>,
@@ -526,6 +530,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             exit_ended_buf: Vec::new_in(frame),
             uninhabited_call: false,
             contracts: None,
+            ensures_locals: Vec::new_in(frame),
             probe: None,
             early_drops: &[],
             early_drops_placed: 0,
@@ -555,6 +560,12 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
 
     fn alloc_local(&mut self, local: Local) -> LocalId {
         let id = LocalId::from_raw(RawIdx::from_u32(self.building.locals.len() as u32));
+        // blaze: a refinement by enum variants (`#![blaze::pattern_types]`) has its base's
+        // layout and code, so a local holds the base: places project through it as through
+        // the enum, and a signature naming the refinement relates to it as its base.
+        let ty = hir_ty::pattern_types::erase(self.interner(), local.ty.as_ref()).store();
+        let mut local = local;
+        local.ty = ty;
         self.building.locals.push(local);
         id
     }
@@ -772,9 +783,49 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                     );
                     Ok(Some(current))
                 }
+                Adjust::ErrorUnion => {
+                    let Some((p, current)) =
+                        self.lower_expr_as_place_with_adjust(current, expr_id, true, rest)?
+                    else {
+                        return Ok(None);
+                    };
+                    let source = match rest.last() {
+                        Some(it) => it.target.as_ref(),
+                        None => self.expr_ty_without_adjust(expr_id),
+                    };
+                    self.lower_error_union_widen(
+                        current,
+                        Operand { kind: OperandKind::Copy(p.store()), span: None },
+                        source,
+                        last.target.as_ref(),
+                        place,
+                        expr_id.into(),
+                    )
+                }
             },
             None => self.lower_expr_to_place_without_adjust(expr_id, place, current),
         }
+    }
+
+    /// `place = core::error_union::widen::<source, target>(value)`: a member of the error
+    /// union `target`, or a union of some of its members, put in it (`Adjust::ErrorUnion`).
+    fn lower_error_union_widen(
+        &mut self,
+        current: BasicBlockId,
+        value: Operand,
+        source: Ty<'db>,
+        target: Ty<'db>,
+        place: Place<'db>,
+        span: MirSpan,
+    ) -> Result<'db, Option<BasicBlockId>> {
+        let widen = self.lang_items().ErrorUnionWiden.ok_or(MirLowerError::LangItemNotFound)?;
+        let widen = Operand::const_zst(Ty::new_fn_def(
+            self.interner(),
+            CallableDefId::FunctionId(widen).into(),
+            GenericArgs::new_from_slice(&[source.into(), target.into()]),
+        ));
+        // alloc: the call's arguments, kept in the body
+        self.lower_call(widen, Box::new([value]), place, current, false, span)
     }
 
     fn lower_expr_to_place_with_borrow_adjust(
@@ -1672,6 +1723,16 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                 self.lower_become(expr, expr_id, current)
             }
             Expr::Yield { .. } => not_supported!("yield"),
+            // blaze: a record value `{ a: 1, b }` (`#![blaze::records]`), whose path is core's
+            // `Record` and whose fields are the record's, not the struct's.
+            Expr::RecordLit { fields, spread, .. }
+                if let Some(of) = crate::record::record_fields(
+                    self.lang_items(),
+                    self.expr_ty_without_adjust(expr_id),
+                ) =>
+            {
+                self.lower_record_value(expr_id, &of, fields, spread, place, current)
+            }
             Expr::RecordLit { fields, path, spread, .. } => {
                 let variant_id =
                     self.infer.variant_resolution_for_expr(expr_id).ok_or_else(|| {
@@ -2529,12 +2590,117 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         Ok(place)
     }
 
+    /// Lowers the record value `expr_id` (`{ a: 1, b }`, blaze's `#![blaze::records]`) of the
+    /// record `of` into `place`: the tuple of its fields in canonical order, then core's
+    /// `Record` around it. The fields written are evaluated in the order written; the rest
+    /// are copied from the base (`..base`, evaluated after them) or are the callee's defaults
+    /// (`..`), which are constants, placed in the callee's declaration order.
+    fn lower_record_value(
+        &mut self,
+        expr_id: ExprId,
+        of: &crate::record::RecordFields<'db>,
+        fields: &[RecordLitField],
+        spread: RecordSpread,
+        place: Place<'db>,
+        mut current: BasicBlockId,
+    ) -> Result<'db, Option<BasicBlockId>> {
+        let TyKind::Adt(_, args) = self.expr_ty_without_adjust(expr_id).kind() else {
+            return Err(MirLowerError::TypeError("a record value whose type is no record"));
+        };
+        let record = self.lang_items().Record.ok_or(MirLowerError::LangItemNotFound)?;
+        let count = of.len();
+        let mut operands = Vec::with_capacity_in(count, self.frame);
+        operands.resize_with(count, || None);
+        let declared = self.declared_locals();
+        for RecordLitField { name, expr } in fields.iter() {
+            let at = of.index_of(name.as_str()).ok_or(MirLowerError::UnresolvedField)?;
+            let Some((op, c)) = self.lower_expr_to_some_operand(*expr, current)? else {
+                return Ok(None);
+            };
+            current = c;
+            // What unwinds from the next field drops this one first.
+            self.declare_operands_last(expr_id, declared, std::iter::once(&op));
+            operands[at] = Some(op);
+        }
+        self.declare_operands_last(expr_id, declared, operands.iter().flatten());
+        match spread {
+            RecordSpread::None => {}
+            RecordSpread::Expr(base) => {
+                let Some((base, c)) = self.lower_expr_as_place(current, base, true)? else {
+                    return Ok(None);
+                };
+                current = c;
+                let inner = base.project(ProjectionElem::Field(FieldIndex(0)));
+                for (at, operand) in operands.iter_mut().enumerate() {
+                    if operand.is_none() {
+                        let field = inner.project(ProjectionElem::Field(FieldIndex(at as u32)));
+                        *operand =
+                            Some(Operand { kind: OperandKind::Copy(field.store()), span: None });
+                    }
+                }
+            }
+            RecordSpread::FieldDefaults => {
+                let (function, param) =
+                    crate::record::record_argument_callee(self.store, self.infer, expr_id).ok_or(
+                        MirLowerError::TypeError(
+                            "a record value's `..` outside a call to a function by name",
+                        ),
+                    )?;
+                for (at, name) in of.names().enumerate() {
+                    if operands[at].is_some() {
+                        continue;
+                    }
+                    let field = Name::new_root(name);
+                    let default = crate::record_param_default(self.db, function, param, field)
+                        .ok_or(MirLowerError::TypeError(
+                            "a record field left out that its callee declares no default for",
+                        ))?;
+                    // A default names no parameter of its function, so it is the same
+                    // constant at every call.
+                    let konst = default.get_with(|it| it.as_ref()).skip_binder();
+                    let ty = of.ty(at).ok_or(MirLowerError::UnresolvedField)?;
+                    operands[at] = Some(Operand {
+                        kind: OperandKind::Constant { konst: konst.store(), ty: ty.store() },
+                        span: Some(expr_id.into()),
+                    });
+                }
+            }
+        }
+        // alloc: the fields, kept in the body
+        let mut values = Vec::with_capacity(count);
+        for it in operands {
+            values.push(it.ok_or(MirLowerError::TypeError("missing field in record value"))?);
+        }
+        let tuple_ty = of.tuple(self.interner());
+        let tuple: Place<'db> = self.temp(tuple_ty, current, expr_id.into())?.into();
+        let fields = Rvalue::Aggregate(AggregateKind::Tuple(tuple_ty.store()), values.into());
+        self.push_assignment(current, tuple, fields, expr_id.into());
+        let whole = Operand { kind: OperandKind::Move(tuple.store()), span: None };
+        let rvalue = Rvalue::Aggregate(
+            AggregateKind::Adt(VariantId::StructId(record), args.store()),
+            [whole].into(),
+        );
+        self.push_assignment(current, place, rvalue, expr_id.into());
+        Ok(Some(current))
+    }
+
     fn push_field_projection(
         &mut self,
         place: &mut Place<'db>,
         expr_id: ExprId,
     ) -> Result<'db, ()> {
         if let Expr::Field { expr, name } = self.store.expr(expr_id) {
+            // blaze: `r.a` on a record (`#![blaze::records]`) is the one field of core's
+            // `Record`, then the field's place in the tuple it holds.
+            if let Some(of) =
+                crate::record::record_fields(self.lang_items(), self.expr_ty_after_adjustments(expr))
+            {
+                let at = of.index_of(name.as_str()).ok_or(MirLowerError::UnresolvedField)?;
+                *place = place
+                    .project(ProjectionElem::Field(FieldIndex(0)))
+                    .project(ProjectionElem::Field(FieldIndex(at as u32)));
+                return Ok(());
+            }
             if let TyKind::Tuple(tys) = self.expr_ty_after_adjustments(expr).kind() {
                 let index =
                     name.as_tuple_index().ok_or(MirLowerError::TypeError("named field on tuple"))?
@@ -2544,11 +2710,17 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                 }
                 *place = place.project(ProjectionElem::Field(FieldIndex(index)));
             } else {
-                let field = self
-                    .infer
-                    .field_resolution(expr_id)
-                    .ok_or(MirLowerError::UnresolvedField)?
-                    .either(|f| f.local_id.into(), |t| FieldIndex(t.index));
+                let field =
+                    self.infer.field_resolution(expr_id).ok_or(MirLowerError::UnresolvedField)?;
+                // blaze: a field of an enum's variant, read on a refinement by that one variant
+                // (`conn.socket` on a `Conn is Conn::Open { .. }`, `#![blaze::pattern_types]`):
+                // the place is the enum, so it is downcast to the variant first.
+                if let Either::Left(it) = field
+                    && let hir_def::VariantId::EnumVariantId(variant) = it.parent
+                {
+                    *place = place.project(ProjectionElem::Downcast(variant.into()));
+                }
+                let field = field.either(|f| f.local_id.into(), |t| FieldIndex(t.index));
                 *place = place.project(ProjectionElem::Field(field));
             }
         } else {
@@ -2650,15 +2822,23 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             hir_def::hir::Literal::Bool(b) => scalar(&[*b as u8]),
             hir_def::hir::Literal::Int(it, _) => scalar(&it.to_le_bytes()[0..size()?]),
             hir_def::hir::Literal::Uint(it, _) => scalar(&it.to_le_bytes()[0..size()?]),
-            hir_def::hir::Literal::Float(f, _) => match size()? {
-                16 => scalar(&f.to_f128().to_bits().to_le_bytes()),
-                8 => scalar(&f.to_f64().to_bits().to_le_bytes()),
-                4 => scalar(&f.to_f32().to_bits().to_le_bytes()),
-                2 => scalar(&u16::try_from(f.to_f16().to_bits()).unwrap().to_le_bytes()),
-                _ => {
-                    Err(MirLowerError::TypeError("float with size other than 2, 4, 8 or 16 bytes"))
-                }
-            },
+            hir_def::hir::Literal::Float(f, _) => {
+                // apfloat's `to_bits` is a `u128` at every width: the constant is its low `size`
+                // bytes, as many as the type's layout, as for an integer.
+                let size = size()?;
+                let bits = match size {
+                    16 => f.to_f128().to_bits(),
+                    8 => f.to_f64().to_bits(),
+                    4 => f.to_f32().to_bits(),
+                    2 => f.to_f16().to_bits(),
+                    _ => {
+                        return Err(MirLowerError::TypeError(
+                            "float with size other than 2, 4, 8 or 16 bytes",
+                        ));
+                    }
+                };
+                scalar(&bits.to_le_bytes()[..size])
+            }
         }
     }
 
@@ -4914,8 +5094,19 @@ pub fn inline_const_at<'db>(
 
 /// `owner`'s body built from its HIR. An `async` block's is the `Future::poll` of the block's
 /// type; by move, the future owns what its `async` closure captured, where the block itself
-/// borrows from the closure.
+/// borrows from the closure. Under `#![blaze::handles]`, a move of a handle that is used again
+/// is then a copy ([`super::handles`]); under `#![blaze::early_drop]` each local whose
+/// destructor only frees memory is then dropped after its last use ([`super::early_drop`], after
+/// the copies, which are uses); both before anything, the borrow checker first, reads the body.
 pub(crate) fn build_mir_body<'db>(db: &'db Db, owner: MirOwner<'db>) -> Result<'db, MirBody<'db>> {
+    let mut body = lower_mir_body(db, owner)?;
+    super::handles::copy_handles(db, &mut body)?;
+    super::early_drop::drop_early(db, &mut body)?;
+    Ok(body)
+}
+
+/// `owner`'s body as lowering builds it, before [`super::handles`] and [`super::early_drop`].
+fn lower_mir_body<'db>(db: &'db Db, owner: MirOwner<'db>) -> Result<'db, MirBody<'db>> {
     match owner {
         MirOwner::Body(def) => compute_mir_body(db, def),
         MirOwner::Closure(closure) => {

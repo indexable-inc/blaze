@@ -11,6 +11,8 @@ name = "harness-video"
 path = "src/main.rs"
 
 [dependencies]
+# The app, as a library: its scene world (tokens, prims, hn.* widgets) is what a video's scene loads into.
+harness-native = { path = "../harness-native" }
 harness-native-flecs = { path = "../harness-native-flecs", features = ["json"] }
 harness-native-ecs = { path = "../harness-native-ecs" }
 harness-native-api = { path = "../harness-native-api" }
@@ -25,12 +27,14 @@ harness-native-ui-input = { path = "../harness-native-ui-input" }
 harness-native-ui-motion = { path = "../harness-native-ui-motion" }
 harness-native-ui-draw-api = { path = "../harness-native-ui-draw-api" }
 harness-native-ui-draw = { path = "../harness-native-ui-draw" }
-harness-native-ui-prims = { path = "../harness-native-ui-prims" }
 harness-native-ui-timeline-api = { path = "../harness-native-ui-timeline-api" }
 harness-native-ui-timeline = { path = "../harness-native-ui-timeline" }
 hyperion-ecs = { path = "../vendor/hyperion-ecs", features = ["pipeline", "meta"] }
 hyperion-flecs-c = { path = "../vendor/hyperion-flecs-c", features = ["prefab", "constraint_traits", "pipeline", "script", "script_input"] }
 png = "0.17"
+
+[dev-dependencies]
+harness-native-ui-motion-api = { path = "../harness-native-ui-motion-api" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

@@ -17,6 +17,12 @@ pub(super) const PATTERN_FIRST: TokenSet =
 
 const PAT_TOP_FIRST: TokenSet = PATTERN_FIRST.union(TokenSet::new(&[T![|]]));
 
+/// Whether the parser is at a record pattern `{ a, b: x, .. }` (`#![blaze::records]`), which
+/// [`PATTERN_FIRST`] cannot say: a `{` starts a pattern only under the extension.
+pub(super) fn at_record_pat(p: &Parser<'_>) -> bool {
+    p.at(T!['{']) && p.records_gate()
+}
+
 /// Set of possible tokens at the start of a range pattern's end bound.
 const RANGE_PAT_END_FIRST: TokenSet =
     expressions::LITERAL_FIRST.union(paths::PATH_FIRST).union(TokenSet::new(&[T![-], T![const]]));
@@ -322,6 +328,15 @@ fn atom_pat(p: &mut Parser<'_>, recovery_set: TokenSet) -> Option<CompletedMarke
 
         T![_] => wildcard_pat(p),
         T![&] => ref_pat(p),
+        // blaze, under `#![blaze::records]`: `fn f() { let { a, b: x, .. } = r; }`
+        //
+        // A record pattern: a struct pattern's field list with no path before it. No pattern of
+        // Rust's starts with a `{`.
+        T!['{'] if p.records_gate() => {
+            let m = p.start();
+            record_pat_field_list(p);
+            m.complete(p, RECORD_PAT)
+        }
         T!['('] => tuple_pat(p),
         T!['['] => slice_pat(p),
         T![!] => not_null_pat(p),
@@ -513,7 +528,7 @@ fn wildcard_pat(p: &mut Parser<'_>) -> CompletedMarker {
 //     let &(0..=1) = ();
 // }
 /// `&pat`, `&mut pat`, `&pin const pat` and `&pin mut pat` (rustc's `parse_pat_deref`, with
-/// `parse_pin_and_mut`).
+/// `parse_pin_and_mut`), and under `#![blaze::uniq]` `&uniq pat`.
 fn ref_pat(p: &mut Parser<'_>) -> CompletedMarker {
     assert!(p.at(T![&]));
     let m = p.start();
@@ -523,8 +538,9 @@ fn ref_pat(p: &mut Parser<'_>) -> CompletedMarker {
         if !p.eat(T![mut]) {
             p.bump(T![const]);
         }
-    } else {
-        p.eat(T![mut]);
+    } else if !p.eat(T![mut]) && uniq::at_ref_pat(p) {
+        // `&uniq pat` (`#![blaze::uniq]`): the `mut` of `&mut pat`, spelled `uniq`.
+        p.bump_remap(T![mut]);
     }
     let (_, range_op) = pattern_single_r(p, PAT_RECOVERY_SET);
     ban_pat_range_if_ambiguous(p, range_op);
@@ -570,7 +586,7 @@ fn tuple_pat(p: &mut Parser<'_>) -> CompletedMarker {
 
     while !p.at(EOF) && !p.at(T![')']) {
         has_pat = true;
-        if !p.at_ts(PAT_TOP_FIRST) {
+        if !p.at_ts(PAT_TOP_FIRST) && !at_record_pat(p) {
             p.error("expected a pattern");
             break;
         }
@@ -604,7 +620,7 @@ fn pat_list(p: &mut Parser<'_>, ket: SyntaxKind) {
     while !p.at(EOF) && !p.at(ket) {
         pattern_top_guard(p);
         if !p.eat(T![,]) {
-            if p.at_ts(PAT_TOP_FIRST) {
+            if p.at_ts(PAT_TOP_FIRST) || at_record_pat(p) {
                 // alloc: error path only, the message names the token found
                 p.error(format!("expected {:?}, got {:?}", T![,], p.current()));
             } else {
@@ -626,8 +642,12 @@ fn pat_list(p: &mut Parser<'_>, ket: SyntaxKind) {
 fn ident_pat(p: &mut Parser<'_>, with_at: bool) -> CompletedMarker {
     assert!(matches!(p.current(), T![ref] | T![mut] | IDENT));
     let m = p.start();
-    p.eat(T![ref]);
-    p.eat(T![mut]);
+    if p.eat(T![ref]) && !p.eat(T![mut]) && uniq::at_ref_binding(p) {
+        // `ref uniq x` (`#![blaze::uniq]`): the `mut` of `ref mut x`, spelled `uniq`.
+        p.bump_remap(T![mut]);
+    } else {
+        p.eat(T![mut]);
+    }
     name_r(p, PAT_RECOVERY_SET);
     if with_at && p.eat(T![@]) {
         pattern_single(p);

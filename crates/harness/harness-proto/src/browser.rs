@@ -120,6 +120,30 @@ pub enum KernelUp {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         url: Option<String>,
     },
+    /// Where the Mac is now, from macOS's Core Location (the host is the app macOS asks the person about; the first
+    /// request makes it ask). Answered by [`KernelDown::Location`], or [`KernelDown::Error`] saying why not (Location
+    /// Services off, the host refused, no fix in time): nothing else is tried.
+    Location { req: u64 },
+    /// The places Apple Maps finds for `query` (what a person types into Maps: "coffee", "pharmacy open now", a name)
+    /// within `radius_m` metres of a point, at most `limit`, as Maps ranks them. Answered by [`KernelDown::Places`]
+    /// (empty when nothing matches), or [`KernelDown::Error`] when the search itself failed.
+    Places { req: u64, query: String, latitude: f64, longitude: f64, radius_m: f64, limit: u32 },
+}
+
+/// One place Apple Maps found: its identity in Apple Maps (`id`, `MKMapItem.identifier`: what a Map's marker names as
+/// `place` to show Apple's own card of it; empty when Maps gives none), its name, where it is (degrees), its address in one line, and what Maps knows of its
+/// phone, its own page and its kind (`Cafe`, `Restaurant`, ...), each empty when Maps has none.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct Place {
+    #[serde(default)]
+    pub id: String,
+    pub name: String,
+    pub latitude: f64,
+    pub longitude: f64,
+    pub address: String,
+    pub phone: String,
+    pub url: String,
+    pub category: String,
 }
 
 /// The host's message to a socket client.
@@ -136,6 +160,19 @@ pub enum KernelDown {
     Closed { view: u64, why: String },
     Views { req: u64, views: Vec<ViewInfo> },
     Extensions { req: u64, extensions: Vec<Extension> },
+    /// Where the Mac is ([`KernelUp::Location`]): degrees, the radius Core Location is sure of in metres, the altitude
+    /// in metres when it has one, and when the fix was taken (Unix ms).
+    Location {
+        req: u64,
+        latitude: f64,
+        longitude: f64,
+        accuracy_m: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        altitude_m: Option<f64>,
+        at_ms: u64,
+    },
+    /// What Apple Maps found ([`KernelUp::Places`]).
+    Places { req: u64, places: Vec<Place> },
     /// A request with nothing else to say is done.
     Done { req: u64 },
     /// A request refused, naming the thing and why; `req` None for the hello or a message that names no request.

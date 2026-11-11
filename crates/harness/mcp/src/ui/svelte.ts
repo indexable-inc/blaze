@@ -233,9 +233,21 @@ function fileComponent(): unknown {
   return new Proxy(target, { apply: (_target, _this, args: unknown[]) => draw(args) });
 }
 
+/**
+ * `Map` is also the class cells use: calling it (as compiled markup does) draws the element, and `new Map()`, `instanceof Map` and
+ * `Map.groupBy` still reach the class, as with `File` above.
+ */
+function mapComponent(): unknown {
+  const draw = (args: unknown[]) => (hostComponent('Map') as unknown as (...a: unknown[]) => unknown)(...args);
+  return new Proxy(globalThis.Map, { apply: (_target, _this, args: unknown[]) => draw(args) });
+}
+
+/** The names of elements that are also a class of the web's, and the component that is both. */
+const ALSO_A_CLASS: Readonly<Record<string, () => unknown>> = { File: fileComponent, Map: mapComponent };
+
 /** The element components (`Column`, `Row`, ...), as a cell is handed them. */
 export function elementGlobals(): Record<string, unknown> {
-  return Object.fromEntries(ELEMENT_NAMES.map(name => [name, name === 'File' ? fileComponent() : hostComponent(name)]));
+  return Object.fromEntries(ELEMENT_NAMES.map(name => [name, ALSO_A_CLASS[name]?.() ?? hostComponent(name)]));
 }
 
 /** How the cell reaches a name a template uses without declaring it (compile.ts writes one of these per name). */

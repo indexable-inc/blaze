@@ -12,33 +12,13 @@
 //                 to the dark ground the video started on
 //
 // Motion is data: a `Cue` child moves one member of its node (`Pose.fade`, `Pose.shrink`...) between two values over a
-// stretch of the clock. The `cue.*` templates below are the few moves this video makes, by name. The mark's own motion
+// stretch of the clock. The `cue.*` templates (harness-native-ui-prims/scene/cue.flecs) are the moves, by name. The mark's own motion
 // and its sound come from its `BlazeMark` times.
 
-// ---- the moves ----
-@tree ChildOf
-cue {
-  // Fade in over `dur` from `at`, slowly at both ends.
-  template FadeIn {
-    prop at: f32 = 0
-    prop dur: f32 = 1
-    Cue: {member: "Pose.fade", from: 1, to: 0, at: $at, dur: $dur, ease: InOut}
-  }
-  // Fade out over `dur` from `at`, slowly at both ends.
-  template FadeOut {
-    prop at: f32 = 0
-    prop dur: f32 = 1
-    Cue: {member: "Pose.fade", from: 0, to: 1, at: $at, dur: $dur, ease: InOut}
-  }
-  // Grow by `by` of its size over `dur` from `at`, slowly at both ends (a camera pushing in).
-  template PushIn {
-    prop at: f32 = 0
-    prop dur: f32 = 4
-    prop by: f32 = 0.05
-    Cue: {member: "Pose.shrink", from: 0, to: 0 - $by, at: $at, dur: $dur, ease: InOut}
-  }
-}
-
+// ---- the look ----
+// The video stands on the app's tokens and prims (harness-video loads it into the app's scene); tokens.flecs beside it
+// holds the few that are its own.
+include tokens
 
 // ---- the parts ----
 @tree ChildOf
@@ -48,7 +28,8 @@ launch_part {
     Flex: {axis: Column, gap: 0, align: Center, justify: Center, wrap: false}
     Size: {w: {kind: Percent, value: 1, min: 0, max: 0}, h: {kind: Percent, value: 1, min: 0, max: 0}}
   }
-  prefab Lead : ui.Words, Ink {
+  prefab Lead : ui.Words {
+    Fill: $tone_launch_ink
     TextStyle: {size: $size_lead, line: $line_lead, code_line: 0, role: 9, bold: 0, weight: 0}
   }
 }
@@ -65,7 +46,7 @@ const home = $burn + 1.8
 @tree ChildOf
 launch : ui.ZStack {
   Video: {width: 960, height: 540, fps: 60, seconds: 10, scale: 8}
-  Fill: $tone_ground
+  Fill: $tone_launch_ground
   Flex: {axis: Z, gap: 0, align: Center, justify: Center, wrap: false}
   Size: {w: {kind: Fixed, value: 960, min: 0, max: 0}, h: {kind: Fixed, value: 540, min: 0, max: 0}}
 
@@ -84,7 +65,7 @@ launch : ui.ZStack {
       Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
       scheme : launch_part.Lead {
         Text: {s: "https://"}
-        Fill: $tone_ink_muted
+        Fill: $tone_launch_ink_muted
         cue.FadeIn arrive(at: $home - 0.3, dur: 0.6)
       }
       name : launch_part.Lead {

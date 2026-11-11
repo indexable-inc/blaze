@@ -46,7 +46,7 @@ use rustc_type_ir::{
     inherent::{GenericArgs as _, IntoKind, Term as _, Ty as _, Tys as _},
 };
 use smallvec::SmallVec;
-use span::Edition;
+use span::{Edition, Extensions};
 use std::alloc::Global;
 use stdx::never;
 
@@ -508,17 +508,28 @@ impl<'db> HirFormatter<'_, 'db> {
 pub struct DisplayTarget {
     krate: Crate,
     pub edition: Edition,
+    /// The crate's syntax extensions ([`Crate::extensions`], a query, so what is displayed for
+    /// the crate depends on them): under `#![blaze::uniq]` a unique reference is `&uniq T`.
+    extensions: Extensions,
 }
 
 impl DisplayTarget {
     pub fn from_crate(db: &Db, krate: Crate) -> Self {
         let edition = krate.data(db).edition;
-        Self { krate, edition }
+        Self { krate, edition, extensions: krate.extensions(db) }
     }
 
     pub fn from_crate_and_edition(db: &Db, krate: Crate, edition: Edition) -> Self {
-        let _ = db;
-        Self { krate, edition }
+        Self { krate, edition, extensions: krate.extensions(db) }
+    }
+
+    /// What a unique reference's `&` is followed by: `uniq ` in a crate that says
+    /// `#![blaze::uniq]`, which writes it so, else `mut `.
+    pub fn unique_ref(&self) -> &'static str {
+        match self.extensions.uniq() {
+            true => "uniq ",
+            false => "mut ",
+        }
     }
 }
 
@@ -1337,7 +1348,7 @@ impl<'db> Ty<'db> {
                 }
                 match m {
                     rustc_ast_ir::Mutability::Not => (),
-                    rustc_ast_ir::Mutability::Mut => f.write_str("mut ")?,
+                    rustc_ast_ir::Mutability::Mut => f.write_str(f.display_target.unique_ref())?,
                 }
 
                 f.trait_bounds_need_parens = true;
@@ -1472,6 +1483,36 @@ impl<'db> Ty<'db> {
                 if !ret.is_unit() {
                     write!(f, " -> ")?;
                     ret.hir_fmt(f)?;
+                }
+            }
+            // blaze: an error union (`#![blaze::error_unions]`) prints as it is written, its
+            // members in their canonical order.
+            TyKind::Adt(def, parameters)
+                if f.lang_items()
+                    .ErrorUnion
+                    .is_some_and(|it| def.def_id() == hir_def::AdtId::StructId(it))
+                    && matches!(
+                        parameters.types().next().map(|it| it.kind()),
+                        Some(TyKind::Tuple(_))
+                    ) =>
+            {
+                if let Some(TyKind::Tuple(members)) = parameters.types().next().map(|it| it.kind())
+                {
+                    f.write_joined(members.as_slice(), " | ")?;
+                }
+            }
+            // blaze: a record (`#![blaze::records]`) prints as it is written, `{ a: A, b: B }`,
+            // its fields in canonical order.
+            TyKind::Adt(..) if crate::record::record_fields(f.lang_items(), *self).is_some() => {
+                if let Some(record) = crate::record::record_fields(f.lang_items(), *self) {
+                    write!(f, "{{")?;
+                    for (at, name) in record.names().enumerate() {
+                        write!(f, "{}{name}: ", if at == 0 { " " } else { ", " })?;
+                        if let Some(ty) = record.ty(at) {
+                            ty.hir_fmt(f)?;
+                        }
+                    }
+                    write!(f, "{}", if record.is_empty() { "}" } else { " }" })?;
                 }
             }
             TyKind::Adt(def, parameters) => {
@@ -1843,6 +1884,33 @@ impl<'db> Ty<'db> {
                 }
             }
             TyKind::CoroutineWitness(..) => write!(f, "{{coroutine witness}}")?,
+            // blaze: a refinement by variants (`#![blaze::pattern_types]`) prints as written,
+            // `Conn is Conn::Open { .. } | Conn::Closed`.
+            TyKind::Pat(base, _) if let Some(enum_) = crate::pattern_types::enum_of(*self) => {
+                base.hir_fmt(f)?;
+                let enum_name = EnumSignature::of(db, enum_).name.clone();
+                let variants = &enum_.enum_variants(db).variants;
+                let pattern = crate::pattern_types::refinement(*self).map(|(_, it)| it);
+                let indices = pattern.map(crate::pattern_types::variants).unwrap_or_default();
+                for (n, &index) in indices.iter().enumerate() {
+                    write!(f, "{}", if n == 0 { " is " } else { " | " })?;
+                    let Some((name, &(_, shape))) = variants.get_index(index as usize) else {
+                        write!(f, "{{variant {index}}}")?;
+                        continue;
+                    };
+                    write!(
+                        f,
+                        "{}::{}",
+                        enum_name.display(db, f.edition()),
+                        name.display(db, f.edition())
+                    )?;
+                    match shape {
+                        FieldsShape::Record => write!(f, " {{ .. }}")?,
+                        FieldsShape::Tuple => write!(f, "(..)")?,
+                        FieldsShape::Unit => {}
+                    }
+                }
+            }
             TyKind::Pat(_, _) => write!(f, "{{pat}}")?,
             TyKind::UnsafeBinder(_) => write!(f, "{{unsafe binder}}")?,
             TyKind::Alias(..) => write!(f, "{{alias}}")?,
@@ -2503,7 +2571,7 @@ impl<'db> HirDisplayWithExpressionStore<'db> for TypeRefId {
             TypeRef::Reference(ref_) => {
                 let mutability = match ref_.mutability {
                     hir_def::type_ref::Mutability::Shared => "",
-                    hir_def::type_ref::Mutability::Mut => "mut ",
+                    hir_def::type_ref::Mutability::Mut => f.display_target.unique_ref(),
                 };
                 write!(f, "&")?;
                 if let Some(lifetime) = &ref_.lifetime {
@@ -2587,6 +2655,25 @@ impl<'db> HirDisplayWithExpressionStore<'db> for TypeRefId {
                 ty.hir_fmt(f, owner, store)?;
                 write!(f, " is ")?;
                 pat.hir_fmt(f, owner, store)?;
+            }
+            TypeRef::Union(members) => {
+                let members = members.iter().map(ExpressionStoreAdapter::wrap(owner, store));
+                f.write_joined(members, " | ")?;
+            }
+            TypeRef::Record { names, types, defaults } => {
+                // blaze's record type (`#![blaze::records]`) as written; a default is `= ..`.
+                let edition = f.edition();
+                write!(f, "{{")?;
+                for (at, name) in store.names(names).iter().enumerate() {
+                    write!(f, "{}{}: ", if at == 0 { " " } else { ", " }, name.display(f.db, edition))?;
+                    if let Some(ty) = types.get(at) {
+                        ty.hir_fmt(f, owner, store)?;
+                    }
+                    if defaults.get(at).is_some() {
+                        write!(f, " = ..")?;
+                    }
+                }
+                write!(f, "{}", if types.is_empty() { "}" } else { " }" })?;
             }
             TypeRef::UnsafeBinder { lifetimes, ty } => {
                 let lifetimes = store.names(lifetimes);

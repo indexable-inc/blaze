@@ -1626,3 +1626,88 @@ For more information about this error, try `rustc --explain E0616`.
 "#
     );
 }
+
+/// E0689 where rustc reports it (`tests/ui/methods/method-on-ambiguous-numeric-type.rs` is its
+/// test of the code; this is the shape blaze got wrong): a method called on an integer whose
+/// type only later uses decide, and on a float. blaze said E0599 "for type `usize`", the type
+/// the integer became afterwards, with a help for `saturating_add_signed`. The error is at
+/// the method's name, names the number as `{integer}` or `{float}`, and its fix gives the
+/// binding the type the rest of the function decided for it.
+#[test]
+fn a_method_on_a_number_whose_type_a_later_use_decides() {
+    let source = r#"const BLOCK: usize = 4;
+
+fn main() {
+    let mut pos = 0;
+    loop {
+        let start = pos;
+        let end = start.saturating_add(BLOCK); //~ ERROR E0689
+        pos = end;
+        let _: usize = pos;
+        break;
+    }
+    let ratio = 2.0;
+    let _ = ratio.powf(2.0); //~ ERROR E0689
+    let _: f32 = ratio;
+}
+"#;
+    let stderr = ui_core("method-on-undecided-number.rs", "sized, num_methods", source);
+    assert_reports(
+        &stderr,
+        &[
+            error(
+                7,
+                &["E0689", "`saturating_add`", "`{integer}`", "`start`", "let start: usize = pos;"],
+            ),
+            error(13, &["E0689", "`powf`", "`{float}`", "`ratio`", "let ratio: f32 = 2.0;"]),
+        ],
+    );
+    assert!(stderr.contains("--> $DIR/method-on-undecided-number.rs:7:25"), "{stderr}");
+    for wrong in ["E0599", "type `usize`", "type `f32`", "saturating_add_signed"] {
+        assert!(!stderr.contains(wrong), "{wrong:?} in:\n{stderr}");
+    }
+}
+
+/// E0689 of a method only a trait that is not in scope has, on a binding, a literal and a
+/// `for` loop's variable: the fix is a type on the `let`, a suffix on the literal, and a label
+/// on a binding no `let` declares. A method no numeric type and no trait has is E0599 of the
+/// same `{integer}`, never of the `i32` the integer falls back to.
+#[test]
+fn a_method_on_a_number_of_undecided_type_by_where_it_is_written() {
+    let source = r#"mod ops {
+    pub trait Twice {
+        fn twice(self) -> Self;
+    }
+    impl Twice for u8 {
+        fn twice(self) -> u8 { self }
+    }
+    impl Twice for f32 {
+        fn twice(self) -> f32 { self }
+    }
+}
+
+fn main() {
+    let count = 2;
+    let _ = count.twice(); //~ ERROR E0689
+    let _: u8 = count;
+    let _ = 3.twice(); //~ ERROR E0689
+    let _ = 2.5.twice(); //~ ERROR E0689
+    let (left, _) = (1, 2);
+    let _ = left.twice(); //~ ERROR E0689
+    let other = 7;
+    other.nothing(); //~ ERROR E0599
+}
+"#;
+    let stderr = ui_core("method-on-undecided-number-places.rs", "sized", source);
+    assert_reports(
+        &stderr,
+        &[
+            error(15, &["E0689", "`twice`", "`{integer}`", "let count: u8 = 2;"]),
+            error(17, &["E0689", "`twice`", "`{integer}`", "3_i32"]),
+            error(18, &["E0689", "`twice`", "`{float}`", "2.5_f64"]),
+            error(20, &["E0689", "`twice`", "`{integer}`", "give `left` a type, such as `i32`"]),
+            error(22, &["E0599", "`nothing`", "`{integer}`"]),
+        ],
+    );
+    assert!(!stderr.contains("type `i32`") && !stderr.contains("type `u8`"), "{stderr}");
+}

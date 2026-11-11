@@ -1449,7 +1449,7 @@ fn a_statics_refused_put_names_it_by_its_path() {
     let mut out = Out::default();
     out.put(By::static_(a, &unit), key, Kind::Code, vec![1]);
     out.put(By::static_(b, &unit), key, Kind::Code, vec![2]);
-    let finished = out.finish(names_of(&nodes, Some(&statics)));
+    let finished = out.finish(names_of::<_, _, Machine>(&nodes, Some(&statics)));
     assert_eq!(finished.errors.len(), 1, "{:?}", finished.errors);
     let what = &finished.errors[0].what;
     assert!(

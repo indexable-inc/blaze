@@ -40,6 +40,8 @@ cfg_select! {
         target_os = "zkvm",
         target_os = "trusty",
         target_os = "vexos",
+        // blaze: the GPU device target (naga-unknown-unknown), one invocation per thread.
+        target_arch = "naga",
     ) => {
         mod no_threads;
         pub use no_threads::{EagerStorage, LazyStorage, thread_local_inner};
@@ -115,6 +117,8 @@ pub(crate) mod guard {
             target_os = "zkvm",
             target_os = "trusty",
             target_os = "vexos",
+            // blaze: the GPU device target (naga-unknown-unknown).
+            target_arch = "naga",
         ) => {
             pub(crate) fn enable() {
                 // FIXME: Right now there is no concept of "thread exit" on

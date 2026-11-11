@@ -6,11 +6,19 @@
 //! moved out on every way to the drop (it was destructured, in part or in full); otherwise it
 //! is dropped if it may hold a value. A part no path below the dropped place reaches is dropped
 //! whole with it, so one that holds a linear value is an error too.
+//!
+//! An error exit abandons ([`error_exits`]): where a body that returns a `Result` or an
+//! `Option` writes the failure (`Err(..)`, `None`, or what `?` propagates) as its return
+//! value, a live value whose every linear part has an abandonment path
+//! ([`Types::abandons`]) is given up, as a panic gives it up, and the drops the exit runs of
+//! it are no error. The analysis takes it as moved out there, so a drop another way also
+//! reaches still sees the value that way brings.
 
 use hir_def::hir::{Expr, ExprId};
 use hir_ty::next_solver::{Ty, TyKind};
 use hir_ty_mir::mir::{
-    DropState, HeldPath, MirBody, MirSpan, PlaceElem, ProjectionElem, StatementKind, drop_states,
+    AggregateKind, BasicBlockId, DropState, HeldPath, MirBody, MirSpan, PlaceElem,
+    ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind, drop_states, return_slot,
 };
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind};
 
@@ -26,7 +34,8 @@ pub(crate) fn check_drops<'db>(
     if !body.locals.iter().any(|(_, local)| holds(local.ty.as_ref())) {
         return;
     }
-    for state in drop_states(types.db, body, holds) {
+    let exits = error_exits(types, body);
+    for state in drop_states(types.db, body, holds, &exits, |ty| types.abandons(ty)) {
         // A drop on the way out of a panic: unwinding runs the value's own drop.
         if state.cleanup {
             continue;
@@ -41,6 +50,62 @@ pub(crate) fn check_drops<'db>(
             Some(held) => check_held(types, body, &state, held, out),
         }
     }
+}
+
+/// Where `body` leaves by an error exit, each as a block and the statement of it (the number
+/// of them for its terminator) after which the exit is taken: where the return place of a
+/// body that returns a `Result` or an `Option` is written the failure. That is `Err(..)` or
+/// `None` built into it (a `return Err(e)`, or one as the value the body ends with), and the
+/// value of `FromResidual::from_residual` called into it, which is what `?` returns. Once the
+/// return place is written, the body only drops what is in scope and returns, so every way on
+/// from there is the exit. None in a body that returns another type, and none for a `?` in
+/// a `try` block, which leaves the block and not the body.
+fn error_exits<'f, 'db>(
+    types: &Types<'f, 'db>,
+    body: &MirBody<'db>,
+) -> Vec<(BasicBlockId, usize), &'f blaze_mem::Frame> {
+    use hir_def::{AdtId, CallableDefId, VariantId};
+    let mut exits = Vec::new_in(types.frame);
+    let lang = types.interner.lang_items();
+    let TyKind::Adt(returned, _) = body.locals[return_slot()].ty.as_ref().kind() else {
+        return exits;
+    };
+    let AdtId::EnumId(returned) = returned.def_id() else { return exits };
+    let of_returned = |variant: Option<hir_def::EnumVariantId>| {
+        variant.filter(|it| it.loc(types.db).parent == returned)
+    };
+    let Some(failure) = of_returned(lang.ResultErr).or_else(|| of_returned(lang.OptionNone))
+    else {
+        return exits;
+    };
+    let failure = VariantId::EnumVariantId(failure);
+    let returns = |place: &StoredPlace| {
+        place.local == return_slot() && place.projection.as_slice().is_empty()
+    };
+    for (id, block) in body.basic_blocks.iter() {
+        if block.is_cleanup {
+            continue;
+        }
+        for (at, statement) in block.statements.iter().enumerate() {
+            if let StatementKind::Assign(place, Rvalue::Aggregate(kind, _)) = &statement.kind
+                && let AggregateKind::Adt(variant, _) = kind
+                && returns(place)
+                && *variant == failure
+            {
+                exits.push((id, at));
+            }
+        }
+        if let Some(terminator) = &block.terminator
+            && let TerminatorKind::Call { func, destination, target: Some(_), .. } =
+                &terminator.kind
+            && returns(destination)
+            && let Some((CallableDefId::FunctionId(callee), _)) = func.fn_def()
+            && Some(callee) == lang.TryTraitFromResidual
+        {
+            exits.push((id, block.statements.len()));
+        }
+    }
+    exits
 }
 
 /// How a linear value is dropped at a drop.
@@ -198,7 +263,10 @@ fn report<'db>(
     let db = types.db;
     let value = names::place(db, body, state.place.local, elems);
     let shown = names::ty(db, body, ty);
-    let exit = exit_of(db, body, state);
+    // A value an error exit abandons is not dropped live by a `?`: the way that drops it is
+    // another one to the same drop.
+    let abandoned = types.abandons(body.locals[state.place.local].ty.as_ref());
+    let exit = exit_of(db, body, state, abandoned);
     let how = match exit {
         Exit::ScopeEnd => "at the end of its scope".to_owned(), // alloc: error path
         Exit::Overwrite => "when a new value is assigned over it".to_owned(), // alloc: error path
@@ -227,6 +295,14 @@ fn report<'db>(
         Exit::Early(expr, _) => MirSpan::ExprId(expr),
         _ => state.span,
     };
+    let by_try = matches!(exit, Exit::Early(_, TRY));
+    let message = match by_try {
+        true => format!(
+            "{message}: nothing abandons it there, so give its linear type an abandonment \
+             `Drop` or finish it before the `?`"
+        ),
+        false => message,
+    };
     let mut labels = Vec::new(); // alloc: error path
     if let Some(binding) = names::binding_of(body, state.place.local) {
         labels.push((
@@ -237,13 +313,22 @@ fn report<'db>(
     if let Exit::Early(_, _) = exit {
         labels.push((state.span, "and dropped here, at the end of its scope".to_owned())); // alloc: error path
     }
-    out.push(LinearDiagnostic {
-        span,
-        message,
-        labels,
-        notes: vec![CONSUME.to_owned()], // alloc: error path
-    });
+    let mut notes = vec![CONSUME.to_owned()]; // alloc: error path
+    if by_try {
+        notes.push(ABANDON.to_owned()); // alloc: error path
+    }
+    out.push(LinearDiagnostic { span, message, labels, notes });
 }
+
+/// What an early exit by `?` is said to do.
+const TRY: &str = "`?` returns early";
+
+/// When an error exit abandons a linear value, the second note of a drop by `?`.
+const ABANDON: &str = "an error exit (a `?` that propagates, a returned `Err(..)` or `None`) \
+    abandons a live linear value through the abandonment `Drop` of its `#[blaze::linear]` type, \
+    as a panic does: a `Drop` impl of the type itself, or of a field of the struct whose type \
+    the same crate defines; a linear type with neither has no abandonment path, and a value of \
+    it must be consumed before the exit";
 
 /// How to consume a linear value, the note of every drop error.
 pub(crate) const CONSUME: &str = "a `#[blaze::linear]` value must be consumed on every path: \
@@ -254,7 +339,15 @@ pub(crate) const CONSUME: &str = "a `#[blaze::linear]` value must be consumed on
 /// How the way to `state`'s drop leaves the value's code: an overwrite when the drop is of a
 /// place assigned next, an early exit when a block that goes to the drop chain ends in a
 /// `return`, `break`, `continue` or `?`, else the end of a scope where lowering says so.
-fn exit_of<'db>(db: &'db base_db::Db, body: &MirBody<'db>, state: &DropState<'db>) -> Exit {
+///
+/// With `abandoned`, the dropped local is one an error exit abandons: a `?` is then not the
+/// way that drops it live, and the search goes on past it.
+fn exit_of<'db>(
+    db: &'db base_db::Db,
+    body: &MirBody<'db>,
+    state: &DropState<'db>,
+    abandoned: bool,
+) -> Exit {
     if state.replace {
         return Exit::Overwrite;
     }
@@ -284,6 +377,7 @@ fn exit_of<'db>(db: &'db base_db::Db, body: &MirBody<'db>, state: &DropState<'db
             seen[index(pred)] = true;
             if let MirSpan::ExprId(expr) = terminator.span
                 && let Some(what) = early_exit(db, body, store, expr)
+                && !(abandoned && what == TRY)
             {
                 return Exit::Early(expr, what);
             }
@@ -310,7 +404,7 @@ fn early_exit<'db>(
     expr: ExprId,
 ) -> Option<&'static str> {
     Some(match store.expr(expr) {
-        Expr::Return { .. } if names::is_try(db, body, expr) => "`?` returns early",
+        Expr::Return { .. } if names::is_try(db, body, expr) => TRY,
         Expr::Return { .. } => "`return` leaves early",
         Expr::Break { .. } => "`break` leaves its loop or block",
         Expr::Continue { .. } => "`continue` goes to the next iteration",

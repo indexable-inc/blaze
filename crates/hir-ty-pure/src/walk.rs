@@ -18,14 +18,16 @@
 
 use std::cmp::Ordering;
 
-use base_db::{Crate, Db};
+use base_db::{Crate, CrateOrigin, Db};
 use blaze_hash::{HashMap, HashSet};
 use blaze_query::db::{AsId, FromId};
 use hir_def::{
     AdtId, CallableDefId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup as _,
     ModuleDefId, ModuleIdLt, StaticId,
     attrs::AttrFlags,
+    expr_store::Body as HirBody,
     find_path::{FindPathConfig, PrefixKind, find_path},
+    hir::{Expr, Unsafe},
     item_scope::ItemInNs,
     lang_item::{LangItems, lang_items},
     nameres::crate_def_map,
@@ -34,7 +36,7 @@ use hir_def::{
         TraitSignature, UnionSignature,
     },
 };
-use hir_expand::{mod_path::PathKind, name::Name};
+use hir_expand::{HirFileId, mod_path::PathKind, name::Name};
 use hir_ty::{
     InferBodyId, MemoryMap, ParamEnvAndCrate, PointerCast,
     db::{HirDatabase, InternedClosureId, InternedCoroutineId},
@@ -64,11 +66,12 @@ use rustc_type_ir::{
 };
 use smallvec::SmallVec;
 use std::alloc::Global;
+use syntax::{SyntaxKind, TextRange};
 
 use crate::{
     Abs, Effects, Impure, Proof, Purity, allowed_env, effect_attrs,
     effects::{self, EFFECTS, EffectDef, EffectSet, Rule},
-    identity,
+    identity, loops,
     memory::{self, CallKind, MemoryEffects, Origin, SiteFacts},
     models::{Applied, Leaf, Model, Transfer, apply_leaf, effect_row, model_of, tag},
     values::{Flow, Spread, Values, evaluate},
@@ -116,7 +119,7 @@ pub(crate) struct Summary {
     pub(crate) kinds: EffectSet,
     /// Per effect of [`EFFECTS`], by index: the kinds the effect refuses that it may have through
     /// no function trusted for the effect. Missing past the end: none.
-    pub(crate) sets: SmallVec<[EffectSet; 4]>,
+    pub(crate) sets: Sets,
     /// How it has each kind of `sets`, by effect and then kind, each once.
     pub(crate) witnesses: Box<[Witness]>,
     /// The sites the effects go through, in order: its callees, and the closures and functions
@@ -129,7 +132,44 @@ pub(crate) struct Summary {
     pub(crate) trusted_calls: Box<[FunctionId]>,
 }
 
+/// A set of kinds per effect of [`EFFECTS`], inline: as many as there are effects.
+pub(crate) type Sets = SmallVec<[EffectSet; 8]>;
+const _: () = assert!(EFFECTS.len() <= 8, "`Sets` keeps one set per effect inline");
+
+/// The depth of every witness of [`Rule::Recursion`]: the calls around a cycle have no fewest,
+/// so a depth that grew by one per call (as every other kind's does) would grow each round of
+/// the cycle's fixpoint and never settle. A constant does: the first site that has it stays.
+const RECURSION_DEPTH: u16 = 1;
+
 impl Summary {
+    /// The summary a cycle of instances starts from: no effect but that it is one
+    /// ([`Rule::Recursion`], for each effect that keeps it), and the memory of a call that may
+    /// not return. Every instance of the cycle reads it, of itself or through the others, so at
+    /// the fixpoint each of them, and each of their callers, has the kind through a site.
+    fn recursive() -> Summary {
+        let recursion = EffectSet::one(Rule::Recursion);
+        let mut sets = Sets::new();
+        let mut witnesses = Vec::new(); // alloc: one witness per effect that keeps it, per cycle
+        for (index, effect) in EFFECTS.iter().enumerate() {
+            let keeps = kept(effect).has(Rule::Recursion);
+            sets.push(if keeps { recursion } else { EffectSet::EMPTY });
+            if keeps {
+                witnesses.push(Witness {
+                    effect: index as u8,
+                    rule: Rule::Recursion,
+                    depth: RECURSION_DEPTH,
+                    how: How::Own { what: "is called again by what it calls".into(), span: None },
+                });
+            }
+        }
+        Summary {
+            kinds: recursion,
+            sets,
+            witnesses: witnesses.into_boxed_slice(),
+            ..Summary::default()
+        }
+    }
+
     /// The kinds effect `index` refuses that the instance has.
     pub(crate) fn set(&self, index: usize) -> EffectSet {
         self.sets.get(index).copied().unwrap_or(EffectSet::EMPTY)
@@ -142,8 +182,8 @@ impl Summary {
 }
 
 impl Default for Summary {
-    /// The empty summary a cycle of instances starts from: no effect, and the memory of a call
-    /// that may not return (recursion is not known to end).
+    /// The empty summary: no effect, and the memory of a call that may not return (what a
+    /// cycle of instances starts from, with its recursion: [`Summary::recursive`]).
     fn default() -> Summary {
         Summary {
             effects: Effects::NONE,
@@ -505,9 +545,10 @@ fn step_key(body: Body, args: &StoredGenericArgs) -> u128 {
     (kind << 64) | (u128::from(id.as_u32()) << 32) | u128::from(args.as_ref().index())
 }
 
-/// What the instance does, in `env`. A cycle of instances starts from the empty summary and
-/// iterates to its fixpoint: each local's value only rises, in a lattice three high.
-#[blaze_query::tracked(returns(ref), cycle_initial = |_, _, _, _| Summary::default())]
+/// What the instance does, in `env`. A cycle of instances starts from the summary of a
+/// recursion ([`Summary::recursive`]) and iterates to its fixpoint: each local's value only
+/// rises, in a lattice three high, and the recursion's witness keeps one depth.
+#[blaze_query::tracked(returns(ref), cycle_initial = |_, _, _, _| Summary::recursive())]
 #[expect(
     clippy::needless_pass_by_value,
     reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value"
@@ -517,12 +558,13 @@ pub(crate) fn summary_in(db: &Db, env: StoredParamEnvAndCrate, instance: Instanc
     match body {
         Ok(body) => {
             let cx = Cx::new(db, env);
-            summarize(&cx, body)
+            summarize(&cx, body, instance.def)
         }
         Err(error) => {
             let what = format!("has a body that does not lower to MIR: {error:?}"); // alloc: an impure script's reason, once
-            let mut own = Own::default();
-            own.add(EffectSet::one(Rule::Unchecked), &what, None, 0);
+            let trust = effect_attrs::crate_trust(db, def_crate(db, instance.def));
+            let mut own = Own::trusted(trust);
+            own.add(EffectSet::one(Rule::Unchecked), &what, None, trust);
             let (sets, witnesses) = own.into_sets();
             Summary {
                 impure: Some(Box::new(Impure { what, through: Vec::new() })), // alloc: an impure summary's reason, kept out of line
@@ -538,8 +580,17 @@ pub(crate) fn summary_in(db: &Db, env: StoredParamEnvAndCrate, instance: Instanc
 
 /// The kinds an effect keeps in a summary's set: those it refuses, and [`Rule::Open`], which a
 /// generic check reports as left to each instance.
+/// The kinds a summary keeps for `effect`: those it refuses, a call only an instance decides,
+/// a call through a `dyn` nothing answers for ([`Rule::Dyn`], refused by a check whose root
+/// takes such a `dyn`), and, for an effect that refuses a panic, an `unsafe` precondition check not answered for
+/// yet ([`Rule::Precondition`]), which is a panic where code outside the toolchain calls the
+/// `unsafe fn`.
 pub(crate) fn kept(effect: &EffectDef) -> EffectSet {
-    effect.refuses.union(EffectSet::one(Rule::Open))
+    let kept = effect.refuses.union(EffectSet::of(&[Rule::Open, Rule::Dyn]));
+    match effect.refuses.has(Rule::Panic) {
+        true => kept.union(EffectSet::one(Rule::Precondition)),
+        false => kept,
+    }
 }
 
 /// Bit `i` set for each effect `EFFECTS[i]` that `func` is trusted for.
@@ -556,23 +607,32 @@ pub(crate) fn trust_mask(db: &Db, func: FunctionId) -> u32 {
 /// for some effects: `except` has a bit per effect of [`EFFECTS`] it does not count for).
 #[derive(Default)]
 struct Own {
+    /// The effects the body's crate is trusted for (`effect_attrs::crate_trust`): every place's
+    /// `except` has them, so a place counted for every other effect is full.
+    base: u32,
     /// Every kind, trust not applied.
     kinds: EffectSet,
-    /// The kinds with a place counted for every effect.
+    /// The kinds with a place counted for every effect but `base`'s.
     full: EffectSet,
     // alloc: the body's own kinds, few, once per instance
     first: Vec<(Rule, Box<str>, Option<MirSpan>, u32)>,
 }
 
 impl Own {
+    /// No kind yet, of a body of a crate trusted for the effects of `base`.
+    fn trusted(base: u32) -> Own {
+        Own { base, ..Own::default() }
+    }
+
     fn add(&mut self, kinds: EffectSet, what: &str, span: Option<MirSpan>, except: u32) {
+        let except = except | self.base;
         for rule in kinds.without(self.full).iter() {
             // A place counted for at least the effects this one is already stands for it.
             let known = self.first.iter().any(|it| it.0 == rule && it.3 & !except == 0);
             if !known {
                 self.first.push((rule, what.into(), span, except));
             }
-            if except == 0 {
+            if except == self.base {
                 self.full = self.full.union(EffectSet::one(rule));
             }
         }
@@ -580,7 +640,7 @@ impl Own {
     }
 
     /// The sets and witnesses of these kinds alone.
-    fn into_sets(self) -> (SmallVec<[EffectSet; 4]>, Box<[Witness]>) {
+    fn into_sets(self) -> (Sets, Box<[Witness]>) {
         let mut sets = SmallVec::new();
         let mut witnesses = Vec::new(); // alloc: an instance's witnesses, once per instance
         for (index, effect) in EFFECTS.iter().enumerate() {
@@ -708,12 +768,21 @@ struct Walk<'a, 'db> {
     dropped: HashSet<Ty<'db>, Global>,
     statics: HashSet<StaticId, Global>,
     code: HashMap<(Ty<'db>, Reach), bool, Global>,
+    /// Per type dropped, whether a value of it may hold a `dyn` ([`Walk::holds_dyn`]).
+    dyns: HashMap<Ty<'db>, bool, Global>,
+    /// Per type dropped, whether a value of it owns a `dyn` ([`Walk::owns_dyn`]).
+    owned_dyns: HashMap<Ty<'db>, bool, Global>,
 }
 
-fn summarize<'db>(cx: &Cx<'db>, body: &MirBody<'db>) -> Summary {
+fn summarize<'db>(cx: &Cx<'db>, body: &MirBody<'db>, def: Def) -> Summary {
     let db = cx.db;
     let mut walk = Walk::new(cx, Some(body));
     walk.gather(body);
+    // A closure's or `async` block's `unsafe` is its function's: one scan of the function's
+    // source, which holds them.
+    if let Def::Body(Body::Fn(func)) = def {
+        walk.unsafe_code(func);
+    }
     let mut values = Values::solve(db, cx.env, &cx.infcx, body, &walk.flows);
     let mut out = Out::default();
     if let Some(what) = walk.own.take() {
@@ -725,7 +794,7 @@ fn summarize<'db>(cx: &Cx<'db>, body: &MirBody<'db>) -> Summary {
         Rule::Open,
         Rule::MutableState,
     ]));
-    let mut fold = Fold::new(std::mem::take(&mut walk.kinds));
+    let mut fold = Fold::new(std::mem::take(&mut walk.kinds), body.owner.krate(db));
     let mut callees = Vec::with_capacity(walk.sites.len()); // alloc: the summary's callees, once per instance
     let mut sites = Vec::with_capacity(walk.sites.len()); // alloc: the summary's effect sites, once per instance
     let mut facts = Vec::with_capacity(walk.sites.len()); // alloc: one site's memory facts each, once per instance
@@ -801,16 +870,33 @@ fn summarize<'db>(cx: &Cx<'db>, body: &MirBody<'db>) -> Summary {
 /// witness of the fewest calls (the first site of those).
 struct Fold {
     kinds: EffectSet,
-    sets: SmallVec<[EffectSet; 4]>,
+    sets: Sets,
     // alloc: the body's witnesses, few, once per instance
     witnesses: Vec<Witness>,
+    /// The crate of the body, and the crate-wide effects it is trusted for
+    /// (`effect_attrs::crate_trust`).
+    home: Crate,
+    trust: u32,
 }
 
 impl Fold {
-    fn new(own: Own) -> Fold {
-        let kinds = own.kinds;
+    fn new(own: Own, home: Crate) -> Fold {
+        // `Rule::Dyn` is a check's alone (its root's parameters decide it): no kind of the
+        // instance, which the facts and a destructor's kinds read.
+        let (kinds, trust) = (own.kinds.without(EffectSet::one(Rule::Dyn)), own.base);
         let (sets, witnesses) = own.into_sets();
-        Fold { kinds, sets, witnesses: witnesses.into_vec() }
+        Fold { kinds, sets, witnesses: witnesses.into_vec(), home, trust }
+    }
+
+    /// The effects a call of code of `krate` does not count for: those the body's crate is
+    /// trusted for, when `krate` is that crate or one it depends on (code it rests on); none for
+    /// code of another crate (a closure or impl a caller gives it), which counts as anywhere.
+    fn trusted_for(&self, db: &Db, krate: Crate) -> u32 {
+        if self.trust != 0 && self.home.transitive_deps(db).contains(&krate) {
+            self.trust
+        } else {
+            0
+        }
     }
 
     fn add(&mut self, effect: usize, rule: Rule, depth: u16, how: impl FnOnce() -> How) {
@@ -848,9 +934,13 @@ impl Fold {
         said: impl Fn() -> String,
     ) {
         self.kinds = self.kinds.union(kinds);
+        let trusted = self.trusted_for(db, func.krate(db));
         for (index, effect) in EFFECTS.iter().enumerate() {
             let counted = kinds.intersect(kept(effect));
-            if counted.is_empty() || !Fold::counts(db, Some(func), effect) {
+            if counted.is_empty()
+                || trusted & 1 << index != 0
+                || !Fold::counts(db, Some(func), effect)
+            {
                 continue;
             }
             for rule in counted.iter() {
@@ -893,8 +983,26 @@ impl Fold {
                 },
             };
         self.kinds = self.kinds.union(row).union(callee.kinds);
+        let trusted = self.trusted_for(db, def_crate(db, Def::Body(def)));
+        // The toolchain's `unsafe` precondition checks (`Rule::Precondition`): what the check
+        // itself aborts with is the precondition of the function it is written in; a safe
+        // function of the toolchain upholds what it calls; a body outside the toolchain that
+        // calls one still pending (an `unsafe fn` of the toolchain) has to uphold it itself.
+        let toolchain = |krate: Crate| matches!(krate.data(db).origin, CrateOrigin::Lang(_));
+        let here = toolchain(self.home);
+        let check = func.is_some_and(|it| effects::precondition_check(db, it));
+        let upholds = func.is_some_and(|it| {
+            !check && toolchain(it.krate(db)) && !FunctionSignature::of(db, it).is_unsafe()
+        });
         for (index, effect) in EFFECTS.iter().enumerate() {
-            if !Fold::counts(db, func, effect) {
+            if trusted & 1 << index != 0 || !Fold::counts(db, func, effect) {
+                // A callee trusted for the effect answers for its own code, not for the object
+                // it is given: a call it makes through a `dyn` is still the root's to answer.
+                if callee.set(index).has(Rule::Dyn) {
+                    let depth =
+                        callee.witness(index, Rule::Dyn).map_or(0, |it| it.depth).saturating_add(1);
+                    self.add(index, Rule::Dyn, depth, || How::Site { site: at, said: None });
+                }
                 continue;
             }
             if let (Some(func), Some(does)) = (func, said) {
@@ -906,13 +1014,38 @@ impl Fold {
                 }
             }
             for rule in callee.set(index).without(covers).iter() {
-                let depth = callee.witness(index, rule).map_or(0, |it| it.depth).saturating_add(1);
+                let depth = match rule {
+                    Rule::Recursion => RECURSION_DEPTH,
+                    _ => callee.witness(index, rule).map_or(0, |it| it.depth).saturating_add(1),
+                };
+                let rule = match rule {
+                    Rule::Panic if check && here => Rule::Precondition,
+                    Rule::Precondition if upholds => continue,
+                    Rule::Precondition if !here => {
+                        self.add(index, Rule::Panic, 1, || How::Site {
+                            site: at,
+                            said: Some(
+                                match func {
+                                    // alloc: a witness's text
+                                    Some(func) => format!(
+                                        "calls {}, an `unsafe fn` of the toolchain whose precondition check aborts when its caller breaks the precondition",
+                                        fn_name(db, func)
+                                    ),
+                                    None => "calls code of the toolchain with an `unsafe` precondition, whose check aborts when its caller breaks it".to_owned(), // alloc: a witness's text
+                                }
+                                .into(),
+                            ),
+                        });
+                        continue;
+                    }
+                    rule => rule,
+                };
                 self.add(index, rule, depth, || How::Site { site: at, said: None });
             }
         }
     }
 
-    fn finish(mut self) -> (EffectSet, SmallVec<[EffectSet; 4]>, Box<[Witness]>) {
+    fn finish(mut self) -> (EffectSet, Sets, Box<[Witness]>) {
         self.witnesses.sort_by_key(|it| (it.effect, it.rule));
         (self.kinds, self.sets, self.witnesses.into_boxed_slice())
     }
@@ -1194,6 +1327,15 @@ fn open_or_unchecked(args: GenericArgs<'_>) -> Rule {
     if args.has_param() { Rule::Open } else { Rule::Unchecked }
 }
 
+/// rustc's `span.allows_unsafe()` for `range` of `file`: it is of the expansion of a macro
+/// defined `#[allow_internal_unsafe]`. A file's own text is of no expansion: no span map is read.
+fn allows_unsafe(db: &Db, file: HirFileId, range: TextRange) -> bool {
+    file.macro_file().is_some()
+        && file.span_map(db).span_for_range(range).ctx.outer_expn(db).is_some_and(|call| {
+            hir_expand::MacroCallId::from(call).loc(db).def.allow_internal_unsafe
+        })
+}
+
 fn compose(outer: Spread, inner: Spread) -> Spread {
     match (outer, inner) {
         (Spread::Direct, it) | (it, Spread::Direct) => it,
@@ -1210,7 +1352,9 @@ impl<'a, 'db> Walk<'a, 'db> {
             // alloc: one flow per block, once per body
             flows: vec![Flow::Unknown; body.map_or(0, |it| it.basic_blocks.len())],
             own: None,
-            kinds: Own::default(),
+            kinds: Own::trusted(
+                body.map_or(0, |it| effect_attrs::crate_trust(cx.db, it.owner.krate(cx.db))),
+            ),
             span: None,
             origin: Origin::Made,
             giving: false,
@@ -1221,6 +1365,8 @@ impl<'a, 'db> Walk<'a, 'db> {
             dropped: HashSet::new_in(Global),
             statics: HashSet::new_in(Global),
             code: HashMap::new_in(Global),
+            dyns: HashMap::new_in(Global),
+            owned_dyns: HashMap::new_in(Global),
         }
     }
 
@@ -1235,14 +1381,37 @@ impl<'a, 'db> Walk<'a, 'db> {
 
     /// A reason names types, whose `Debug` reads the attached database.
     fn refuse_with(&mut self, rule: Rule, what: impl FnOnce() -> String) {
+        self.refuse_except(rule, 0, what);
+    }
+
+    /// [`Walk::refuse_with`], not counted for the effects of `except` (a bit per effect of
+    /// [`EFFECTS`]: a trait's method whose `#[blaze::may(..)]` bounds what every impl does).
+    fn refuse_except(&mut self, rule: Rule, except: u32, what: impl FnOnce() -> String) {
         let script = self.own.is_none() && !self.giving;
         if !script && self.kinds.full.has(rule) {
             return;
         }
         let what = blaze_query::db::attach(self.cx.db, what);
-        self.observe(EffectSet::one(rule), &what);
+        self.observe_except(EffectSet::one(rule), &what, except);
         if script {
             self.own = Some(what);
+        }
+    }
+
+    /// A call through a function pointer or a `dyn` ([`Rule::Indirect`]): what it reaches was
+    /// walked where the pointer or vtable was made, but it may reach this body again, which no
+    /// cycle of instances shows. Not counted for the effects of `except`.
+    fn indirect(&mut self, what: &str, except: u32) {
+        self.observe_except(EffectSet::one(Rule::Indirect), what, except);
+    }
+
+    /// The effects (a bit per effect of [`EFFECTS`]) a call of the trait's method `f` that only
+    /// an instance decides cannot have, when `rule` is [`Rule::Open`]: the method's
+    /// `#[blaze::may(..)]` bounds every impl.
+    fn open_bound(&self, rule: Rule, f: FunctionId) -> u32 {
+        match rule {
+            Rule::Open => effects::bound_mask(self.cx.db, f),
+            _ => 0,
         }
     }
 
@@ -1265,6 +1434,49 @@ impl<'a, 'db> Walk<'a, 'db> {
             self.trusted_calls.push(func);
         }
         mask
+    }
+
+    /// The `unsafe` code of `func`'s own source, the closures and `async` blocks in it included:
+    /// its body when it is an `unsafe fn`, and the first `unsafe` block written in it. A block
+    /// lowering makes (`format_args!`'s: no `unsafe {` is written there) is none, nor one a macro
+    /// defined `#[allow_internal_unsafe]` expands to (`thread_local!`'s), as rustc's
+    /// `unsafe_code` lint says. Not scanned in a crate trusted for `unsafe` (the toolchain's), so
+    /// its source map is never read there.
+    fn unsafe_code(&mut self, func: FunctionId) {
+        let db = self.cx.db;
+        let unsafe_bit = effects::effect_index(&effect_attrs::UNSAFE).map_or(0, |it| 1 << it);
+        if self.kinds.base & unsafe_bit != 0 || self.kinds.full.has(Rule::Unsafe) {
+            return;
+        }
+        let was = self.span.take();
+        if FunctionSignature::of(db, func).is_unsafe() {
+            let what = format!("is {}, an `unsafe fn`, whose body is `unsafe` code", fn_name(db, func)); // alloc: a witness's text, once
+            self.observe(EffectSet::one(Rule::Unsafe), &what);
+        }
+        let owner = DefWithBodyId::FunctionId(func);
+        let source = HirBody::of(db, owner);
+        let mut blocks = source
+            .exprs()
+            .filter(|(_, expr)| matches!(expr, Expr::Block { unsafe_: Unsafe::Yes, .. }))
+            .map(|(id, _)| id)
+            .peekable();
+        // Most bodies have no `unsafe` block: their source map is not read.
+        if blocks.peek().is_some() {
+            let map = HirBody::source_map(db, owner);
+            for block in blocks {
+                // An expression with no syntax is one lowering made.
+                let Ok(syntax) = map.expr_syntax(block) else { continue };
+                if syntax.value.kind() != SyntaxKind::BLOCK_EXPR
+                    || allows_unsafe(db, syntax.file_id, syntax.value.text_range())
+                {
+                    continue;
+                }
+                self.span = Some(MirSpan::ExprId(block));
+                self.observe(EffectSet::one(Rule::Unsafe), "runs an `unsafe` block");
+                break;
+            }
+        }
+        self.span = was;
     }
 
     /// Of a call at `at`, what it is past its sites.
@@ -1307,6 +1519,14 @@ impl<'a, 'db> Walk<'a, 'db> {
                     self.origin = Origin::Drop(id);
                     let ty = self.place_ty(place);
                     self.drop_glue(ty);
+                    self.dyn_drop(ty);
+                    // A `dyn` it owns is dropped through its vtable: a call like any through one.
+                    if !self.kinds.full.has(Rule::Indirect) && self.holds_dyn(ty) {
+                        self.indirect(
+                            "drops a value that may hold a `dyn`, whose drop may call this function again",
+                            0,
+                        );
+                    }
                 }
                 TerminatorKind::Assert { msg, .. } => {
                     if let Some(rule) = effect_attrs::assert_rule(body, id) {
@@ -1316,7 +1536,48 @@ impl<'a, 'db> Walk<'a, 'db> {
                 _ => {}
             }
         }
+        // A loop not known to end, at the loop's line.
+        if let Some(span) = loops::unbounded_loop(body) {
+            self.span = Some(span);
+            self.observe(EffectSet::one(Rule::Loop), "has a loop that is not known to end");
+        }
         (self.span, self.origin) = (None, Origin::Made);
+    }
+
+    /// The drop of a value of `ty` that owns a `dyn` runs the drop of whatever object it is
+    /// ([`Rule::Dyn`]): drop glue does nothing for a `dyn` itself, whose own was walked where
+    /// its vtable was made.
+    fn dyn_drop(&mut self, ty: Ty<'db>) {
+        if !self.kinds.full.has(Rule::Dyn) && self.owns_dyn(ty) {
+            let ty = self.cx.shown(ty);
+            let what = blaze_query::db::attach(self.cx.db, || {
+                format!("drops a `{ty}`, which owns a `dyn` whose drop is the object's")
+            }); // alloc: a witness's text, once per body
+            self.observe(EffectSet::one(Rule::Dyn), &what);
+        }
+    }
+
+    /// Whether a value of `ty` owns a `dyn`: in its own bytes or behind a raw pointer (a
+    /// `Box`'s, a `Vec`'s), never behind a reference, which owns nothing.
+    fn owns_dyn(&mut self, ty: Ty<'db>) -> bool {
+        if let Some(&known) = self.owned_dyns.get(&ty) {
+            return known;
+        }
+        let mut dyns: SmallVec<[Ty<'db>; 2]> = SmallVec::new();
+        self.scan(ty, Reach::Owned, &mut HashSet::new_in(Global), &mut dyns);
+        self.owned_dyns.insert(ty, !dyns.is_empty());
+        !dyns.is_empty()
+    }
+
+    /// Whether a value of `ty` may hold a `dyn`, in its own bytes or behind a pointer.
+    fn holds_dyn(&mut self, ty: Ty<'db>) -> bool {
+        if let Some(&known) = self.dyns.get(&ty) {
+            return known;
+        }
+        let mut dyns: SmallVec<[Ty<'db>; 2]> = SmallVec::new();
+        self.scan(ty, Reach::Pointees, &mut HashSet::new_in(Global), &mut dyns);
+        self.dyns.insert(ty, !dyns.is_empty());
+        !dyns.is_empty()
     }
 
     fn place_ty(&self, place: &StoredPlace) -> Ty<'db> {
@@ -1351,6 +1612,10 @@ impl<'a, 'db> Walk<'a, 'db> {
             }
             None => {
                 self.call_kind(Some(at), CallKind::Indirect);
+                self.indirect(
+                    "calls through a function pointer, whose target may call this function again",
+                    0,
+                );
                 Flow::Unknown
             }
         }
@@ -1400,6 +1665,7 @@ impl<'a, 'db> Walk<'a, 'db> {
             Call::DropGlue(ty) => {
                 let before = self.sites.len();
                 self.drop_glue(ty);
+                self.dyn_drop(ty);
                 if self.sites.len() == before {
                     self.call_kind(at, CallKind::Nothing);
                 }
@@ -1441,8 +1707,20 @@ impl<'a, 'db> Walk<'a, 'db> {
             Call::FnItem(CallableDefId::FunctionId(g), g_args) => {
                 self.call(g, g_args, compose(spread, Spread::Tuple { from: 1 }), at)
             }
-            Call::FnItem(..) | Call::Indirect => {
+            Call::FnItem(..) => {
                 self.call_kind(at, CallKind::Indirect);
+                Flow::Unknown
+            }
+            Call::Indirect => {
+                self.call_kind(at, CallKind::Indirect);
+                self.observe(
+                    EffectSet::one(Rule::Dyn),
+                    "calls through a function pointer or a `dyn Fn`, whose target is the object's",
+                );
+                self.indirect(
+                    "calls through a function pointer or a `dyn Fn`, whose target may call this function again",
+                    0,
+                );
                 Flow::Unknown
             }
             Call::AsyncClosure => {
@@ -1454,7 +1732,8 @@ impl<'a, 'db> Walk<'a, 'db> {
             }
             Call::Method(Err(why)) => {
                 let receiver = self.cx.shown(args.type_at(0));
-                self.refuse_with(open_or_unchecked(args), || {
+                let rule = open_or_unchecked(args);
+                self.refuse_except(rule, self.open_bound(rule, f), || {
                     format!(
                         "calls {} for `{receiver}`, which no impl's method is found for: {}",
                         fn_name(db, f),
@@ -1484,9 +1763,26 @@ impl<'a, 'db> Walk<'a, 'db> {
             }
             Callee::Virtual | Callee::FnPtr(_) => {
                 // What a `dyn` call reaches was walked where its vtable was made; a method of a
-                // trait trusted for an effect (a door) is trusted wherever the vtable is from.
+                // trait trusted for an effect (a door) is trusted wherever the vtable is from,
+                // and one whose `#[blaze::may(..)]` leaves `diverge` out ends in every impl.
                 if matches!(callee, Callee::Virtual) {
-                    self.trusted_call(f);
+                    let except = self.trusted_call(f) | effects::bound_mask(db, f);
+                    // The method's own `#[blaze::may(..)]`, or its trait's trust, says what a
+                    // call of it through any object cannot do; for the rest nothing does.
+                    if !self.kinds.full.has(Rule::Dyn) {
+                        let what = format!(
+                            "calls {} through a `dyn`: nothing says the object's method cannot do this (a `#[blaze::may(..)]` on the trait's method that leaves it out would)",
+                            fn_name(db, f)
+                        ); // alloc: a witness's text, once per body
+                        self.observe_except(EffectSet::one(Rule::Dyn), &what, except);
+                    }
+                    if !self.kinds.full.has(Rule::Indirect) {
+                        let what = format!(
+                            "calls {} through a `dyn`, whose target may call this function again",
+                            fn_name(db, f)
+                        ); // alloc: a witness's text, once per body
+                        self.indirect(&what, except);
+                    }
                 }
                 self.call_kind(at, CallKind::Indirect);
                 Flow::Unknown
@@ -1507,7 +1803,8 @@ impl<'a, 'db> Walk<'a, 'db> {
                     && !FunctionSignature::of(db, f).has_body() =>
             {
                 let receiver = self.cx.shown(args.type_at(0));
-                self.refuse_with(open_or_unchecked(args), || {
+                let rule = open_or_unchecked(args);
+                self.refuse_except(rule, self.open_bound(rule, f), || {
                     format!("calls {} for `{receiver}`, which no impl gives a body", fn_name(db, f)) // alloc: an impure script's reason
                 });
                 Flow::Unknown
@@ -2034,6 +2331,8 @@ impl<'a, 'db> Walk<'a, 'db> {
             TyKind::RawPtr(pointee, _) => {
                 self.scan(pointee, reach, seen, dyns) | (reach == Reach::Raw)
             }
+            // A reference owns nothing.
+            TyKind::Ref(..) if reach == Reach::Owned => false,
             TyKind::Ref(_, pointee, _) | TyKind::Pat(pointee, _) => {
                 self.scan(pointee, reach, seen, dyns)
             }
@@ -2109,6 +2408,9 @@ enum Reach {
     Pointees,
     /// Those, and any raw pointer itself, which may be a function pointer cast.
     Raw,
+    /// Its own bytes and what its raw pointers point to (a `Box`'s, a `Vec`'s), not what its
+    /// references do: what dropping the value drops.
+    Owned,
 }
 
 /// Whether an intrinsic other than `const_eval_select`, a transmute, `read_via_copy` and
@@ -2296,6 +2598,8 @@ fn pure_intrinsic(intrinsic: Intrinsic) -> bool {
         | I::BlazeFieldAttrs
         | I::BlazeFieldIndex
         | I::BlazeVariantDiscriminant
-        | I::BlazeVariantIndex => true,
+        | I::BlazeVariantIndex
+        | I::BlazeCodeId
+        | I::BlazeTypeNameOf => true,
     }
 }

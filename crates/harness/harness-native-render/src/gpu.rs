@@ -77,7 +77,7 @@ pub struct Renderer {
     image: Pso,
     surface: Pso,
     sampler: Retained<ProtocolObject<dyn MTLSamplerState>>,
-    /// Kip's pictures and pipelines (kip.rs, shaders/mascot.slang).
+    /// Kip's pictures and pipelines (kip.rs, harness-native-shaders' `mascot`).
     kips: crate::kip::Mascots,
     pub atlas: Tex,
     /// The brand marks' Slug curves and bands (icons.rs), uploaded once.
@@ -526,7 +526,8 @@ impl Renderer {
                 }
                 enc.endEncoding();
             }
-            if let Some(d) = drawable {
+            // A pass drawn over an earlier one's drawable (a phone's overlays over its view) is presented by that one.
+            if let Some(d) = drawable.filter(|_| !pass.over) {
                 on_screen = true;
                 if d.layer().presentsWithTransaction() {
                     with_transaction.push(d);

@@ -69,8 +69,57 @@ struct State {
     rest: Option<NSPoint>,
     /// The windows the open menus, popovers and hover cards float in (overlay.rs).
     overlays: overlay::Overlays,
+    /// Apple's maps over the frame's Map cards (maps.rs).
+    maps: maps::Maps,
+    /// The window is tucked away: its turn's item floating at the screen's corner (mini.rs).
+    mini: Option<mini::Mini>,
 }
 
+/// Tuck the window away for chat `sid`: it is ordered out and the chat's item floats until a press on it (or the Dock
+/// icon) brings the window back ([`untuck`]).
+fn tuck(st: &mut State, sid: u64) {
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    if let Some(old) = st.mini.take() {
+        old.close();
+    }
+    let block = block2::RcBlock::new(move |_: std::ptr::NonNull<objc2_foundation::NSTimer>| {
+        let now = objc2_quartz_core::CACurrentMediaTime();
+        with(|st| {
+            let Some(m) = st.mini.as_mut() else { return };
+            let (face, running) = st.app.tucked(m.sid);
+            m.step(now, face, running);
+        });
+    });
+    // SAFETY: the block runs on the main thread (a main-run-loop timer) and touches only main-thread state.
+    let timer = unsafe { objc2_foundation::NSTimer::timerWithTimeInterval_repeats_block(1.0 / 12.0, true, &block) };
+    // SAFETY: the main run loop, common modes.
+    unsafe { NSRunLoop::mainRunLoop().addTimer_forMode(&timer, NSRunLoopCommonModes) };
+    st.mini = Some(mini::Mini::show(mtm, &st.window, sid, timer, objc2_quartz_core::CACurrentMediaTime()));
+    st.window.orderOut(None);
+}
+
+/// Bring a tucked-away window back, on the chat it was tucked for. Nothing when it is not tucked.
+fn untuck() {
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let back = with(|st| {
+        let Some(m) = st.mini.take() else { return false };
+        let sid = m.sid;
+        m.close();
+        st.app.select_session(sid);
+        st.app.poke();
+        st.link.setPaused(false);
+        st.window.makeKeyAndOrderFront(None);
+        true
+    });
+    if back == Some(true) {
+        // The person pressed the item (or the Dock icon): the app comes to the front with its window.
+        #[allow(deprecated)]
+        NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
+    }
+}
+
+mod maps;
+mod mini;
 mod overlay;
 
 thread_local! {
@@ -964,6 +1013,10 @@ impl HarnessView {
                 dt,
                 &mut |x, y, w, h, b| renderer.upload_atlas(x, y, w, h, b),
             );
+            // The live line's tuck button: the window goes away until its turn is done (mini.rs).
+            if let Some(sid) = st.app.take_tuck() {
+                tuck(st, sid);
+            }
             let built = objc2_quartz_core::CACurrentMediaTime();
             // The open overlays into their own windows, drawn in the same command buffer as the window.
             let floats = st.app.take_floats();
@@ -980,6 +1033,9 @@ impl HarnessView {
             drop(passes);
             let tip = st.app.tooltip();
             st.overlays.shown(&st.window, &floats, &drawn, &tip);
+            // The Map cards the frame painted, each under its live map (maps.rs).
+            let cards = st.app.take_maps();
+            st.maps.sync(&st.window, &cards, st.app.zoom());
             framelog::note(
                 entered,
                 t,
@@ -1402,6 +1458,8 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
     // Tooltips come quickly (AppKit waits about a second and a half): what a step's item or a control says under the
     // pointer is part of reading the window, not a hint for the lost.
     objc2_foundation::NSUserDefaults::standardUserDefaults().setInteger_forKey(250, objc2_foundation::ns_string!("NSInitialToolTipDelay"));
+    // The world served to agents, and the edits saved from it replayed (src/world_api.rs): the window's only.
+    app.serve_world();
     // The app's sound (src/audio.rs): the window's only. A scene or a device that refuses it leaves the app silent.
     if let Err(e) = app.start_sound() {
         eprintln!("harness-native: sound: {e}");
@@ -1420,6 +1478,7 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
     )));
     let menu_gen = app.keys_gen();
     let overlays = overlay::Overlays::new(view.clone(), renderer.device().clone());
+    let maps = maps::Maps::new(view.clone());
     STATE.with(|s| {
         *s.borrow_mut() = Some(State {
             app,
@@ -1439,9 +1498,13 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
             inside: false,
             rest: None,
             overlays,
+            maps,
+            mini: None,
         })
     });
-    // The sidebar's material behind the whole window (Finder's, Zed's): the main card covers it with an opaque plate.
+    // The sidebar's material behind the whole window (Finder's, Zed's): the main card covers it with an opaque plate,
+    // and the sidebar's ground (`tone_sidebar`, scene/00-tokens.flecs) is a tint over it, so what is behind the window
+    // shows blurred through the sidebar only. It follows the window's appearance, as the scene's fills do (`is_dark`).
     let effect = NSVisualEffectView::initWithFrame(NSVisualEffectView::alloc(mtm), rect);
     // HARNESS_NATIVE_MATERIAL=sidebar|under|hud: the vibrancy material under the sidebar's tint plate.
     effect.setMaterial(match std::env::var("HARNESS_NATIVE_MATERIAL").as_deref() {
@@ -1586,6 +1649,13 @@ define_class!(
             // What was typed since the last pause is kept too.
             with(|st| st.app.flush_drafts());
             single::release();
+        }
+
+        /// The Dock icon pressed: a tucked-away window comes back.
+        #[unsafe(method(applicationShouldHandleReopen:hasVisibleWindows:))]
+        fn handle_reopen(&self, _app: &NSApplication, _visible: bool) -> bool {
+            untuck();
+            true
         }
 
         #[unsafe(method(applicationShouldTerminateAfterLastWindowClosed:))]

@@ -84,7 +84,71 @@ pub enum TyLoweringDiagnostic {
         def: GenericDefId,
         query: CycleQuery,
     },
+    /// An error union `A | B` (blaze, `#![blaze::error_unions]`) refused for `reason`, at
+    /// `source`: the member refused, or the union when the refusal is the whole union's.
+    ErrorUnionRefused {
+        source: TypeRefId,
+        reason: ErrorUnionRefusal,
+    },
+    /// The record type `{ a: T, .. }` at `source` (blaze, `#![blaze::records]`) refused for
+    /// `reason`.
+    RecordRefused {
+        source: TypeRefId,
+        reason: RecordRefusal,
+    },
 }
+
+/// Why a record type is refused ([`TyLoweringDiagnostic::RecordRefused`]). A field is named by
+/// its place among the fields as written.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+pub enum RecordRefusal {
+    /// The crate does not say `#![blaze::records]` plainly among the inner attributes that
+    /// open its root (under `cfg_attr` it is not read): its file is parsed with the syntax
+    /// only because another crate of its source root says it.
+    NotEnabled,
+    /// `core` declares no `#[lang = "record"]` type to lower the record to.
+    NoLangItem,
+    /// The field at this place has the name of an earlier field.
+    DuplicateField(u32),
+    /// The field at this place has a default (`= expr`), and the record is not the type of a
+    /// function's parameter, the one place a default is read.
+    DefaultOutsideParameter(u32),
+    /// The field at this place has a default, and the function is a method of a trait impl:
+    /// a trait method's defaults are its declaration's, which every caller reads.
+    DefaultInTraitImpl(u32),
+    /// The record is the type of a parameter of a function whose ABI is not Rust's
+    /// (`extern "C" fn`): no other ABI says how a record is passed.
+    ExternAbi,
+}
+
+/// Why an error union is refused ([`TyLoweringDiagnostic::ErrorUnionRefused`]).
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+pub enum ErrorUnionRefusal {
+    /// The crate does not say `#![blaze::error_unions]` plainly among the inner attributes that
+    /// open its root (under `cfg_attr` it is not read). Its own files parse no union
+    /// (`base_db::Crate::extensions`), so this is a union that reached it some other way, and
+    /// is refused rather than lowered.
+    NotEnabled,
+    /// `core` declares no `#[lang = "error_union"]` type to lower the union to.
+    NoLangItem,
+    /// A member is or names a type parameter: a union's members are known types, so that its
+    /// members and their order are known where it is written.
+    TypeParam,
+    /// A member that is not a named type (a struct, enum or union, or a scalar) with named
+    /// arguments: `impl Trait`, `dyn Trait`, `_`, a reference, a tuple, a fn pointer, or an
+    /// argument that is a const.
+    NotNamed,
+    /// Two members of one identity (the item's crate, module path and name, and its
+    /// arguments) that are different types: items of one name in two blocks of one module, or
+    /// arguments that differ only in lifetimes.
+    Ambiguous,
+    /// More members than core's `ErrorUnion` takes ([`ERROR_UNION_MAX_MEMBERS`]).
+    TooMany,
+}
+
+/// The most members an error union has: the largest tuple core implements its
+/// `error_union::Members` for.
+pub const ERROR_UNION_MAX_MEMBERS: usize = 12;
 
 /// The query of `def` whose computation needed itself, in a [`TyLoweringDiagnostic::QueryCycle`].
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
@@ -113,6 +177,20 @@ pub enum PatternTypeUnsupported {
     /// A range's ends are always lowered: hir-def makes `a..b` and `a..` inclusive as rustc's
     /// `lower_excluded_range_end` and `lower_ty_pat_range_end` do.
     Pattern,
+    /// blaze: a pattern of enum variants in a crate without `#![blaze::pattern_types]`
+    /// (docs/v2/plan/design/edition.md, section 8).
+    VariantsNeedGate,
+    /// blaze: a pattern of enum variants whose base type is not an enum.
+    VariantsOfNonEnum,
+    /// blaze: an alternative of a set of variants that is not a variant of the base enum, or not
+    /// a variant pattern at all (a set mixed with a range).
+    NotAVariant,
+    /// blaze: a variant pattern with something inside other than `_` and `..`: a type's pattern
+    /// says which variant, never what its fields hold.
+    VariantFieldNotWildcard,
+    /// blaze: a variant pattern of another shape than its variant: a path for a tuple or
+    /// struct variant, a tuple pattern of the wrong length, or a field the variant lacks.
+    VariantShape,
 }
 
 /// Where a lifetime is left out.

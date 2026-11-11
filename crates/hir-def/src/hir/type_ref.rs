@@ -183,6 +183,82 @@ pub enum TypeRef<'a> {
         lifetimes: Names,
         ty: TypeRefId,
     },
+    /// `A | B | ..`, an error union (blaze, under `#![blaze::error_unions]`): its members in
+    /// source order, which hir-ty canonicalizes.
+    Union(&'a [TypeRefId]),
+    /// `{ a: T, b: U }`, a record type (blaze, under `#![blaze::records]`,
+    /// docs/v2/plan/design/records.md): its fields in the order written, which hir-ty sorts by
+    /// name. `names` (read with [`ExpressionStore::names`]), `types` and `defaults` run in
+    /// step; a field's default is the `= expr` after its type, which only a function
+    /// parameter's record may write.
+    Record {
+        names: Names,
+        types: &'a [TypeRefId],
+        defaults: RecordDefaults<'a>,
+    },
+}
+
+/// The defaults of a [`TypeRef::Record`]'s fields, one slot per field: a word of the store's
+/// columns each, the expression's id and one, or zero where the field has none.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct RecordDefaults<'a>(&'a [u32]);
+
+impl<'a> RecordDefaults<'a> {
+    /// The defaults whose slots are `words`, each made by [`RecordDefaults::word`].
+    #[inline]
+    pub fn from_words(words: &'a [u32]) -> RecordDefaults<'a> {
+        RecordDefaults(words)
+    }
+
+    /// The slot of a field with the default `default`, or with none.
+    #[inline]
+    pub fn word(default: Option<ConstRef>) -> u32 {
+        match default {
+            Some(ConstRef { expr }) => {
+                let id = raw(expr);
+                assert!(id < u32::MAX, "an expression id too large to be a record default");
+                id + 1
+            }
+            None => 0,
+        }
+    }
+
+    /// How many fields the record has.
+    #[inline]
+    pub fn len(self) -> usize {
+        self.0.len()
+    }
+
+    #[inline]
+    pub fn is_empty(self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The default of field `at`, in the order written.
+    #[inline]
+    pub fn get(self, at: usize) -> Option<ConstRef> {
+        match self.0.get(at).copied() {
+            None | Some(0) => None,
+            Some(word) => Some(ConstRef { expr: idx(word - 1) }),
+        }
+    }
+
+    /// Each field's default, in the order written.
+    #[inline]
+    pub fn iter(self) -> impl ExactSizeIterator<Item = Option<ConstRef>> + 'a {
+        (0..self.0.len()).map(move |at| self.get(at))
+    }
+
+    /// Whether some field has a default.
+    #[inline]
+    pub fn any(self) -> bool {
+        self.0.iter().any(|&word| word != 0)
+    }
+
+    #[inline]
+    fn words(self) -> &'a [u32] {
+        self.0
+    }
 }
 
 pub type TypeRefId = Idx<TypeRef<'static>>;
@@ -263,11 +339,13 @@ pub(crate) enum TypeRefKind {
     PatternType,
     Error,
     UnsafeBinder,
+    Union,
+    Record,
 }
 
 impl TypeRefKind {
     /// Every kind, at the index of its value.
-    pub(crate) const ALL: [TypeRefKind; 15] = {
+    pub(crate) const ALL: [TypeRefKind; 17] = {
         use TypeRefKind::*;
         [
             Never,
@@ -285,6 +363,8 @@ impl TypeRefKind {
             PatternType,
             Error,
             UnsafeBinder,
+            Union,
+            Record,
         ]
     };
 
@@ -305,6 +385,8 @@ impl TypeRefKind {
             TypeRef::PatternType(..) => TypeRefKind::PatternType,
             TypeRef::Error => TypeRefKind::Error,
             TypeRef::UnsafeBinder { .. } => TypeRefKind::UnsafeBinder,
+            TypeRef::Union(_) => TypeRefKind::Union,
+            TypeRef::Record { .. } => TypeRefKind::Record,
         }
     }
 }
@@ -316,7 +398,8 @@ pub(crate) struct TypeColumns<V: ColumnVec = Frozen> {
     pub(crate) kind: V::Of<u8>,
     pub(crate) data: V::Of<u32>,
     pub(crate) extra: V::Of<u32>,
-    /// The elements of every `Tuple`.
+    /// The elements of every `Tuple`, the members of every `Union` and the field types of
+    /// every `Record`.
     pub(crate) lists: V::Of<TypeRefId>,
     /// The bounds of every `ImplTrait` and `DynTrait`.
     pub(crate) bounds: V::Of<TypeBound>,
@@ -331,7 +414,7 @@ pub(crate) struct TypeColumns<V: ColumnVec = Frozen> {
 /// The bytes of the columns of one type ref (`kind` and `data`): 5, one cache line holding 12
 /// type refs' kinds and data words; `extra`, the lists and the side tables are counted apart
 /// (two words of `extra` for `Tuple`, `ImplTrait`, `DynTrait` and `PatternType`, three for
-/// `UnsafeBinder`).
+/// `UnsafeBinder`, three and one per field for `Record`).
 pub(crate) const TYPE_REF_BYTES: usize = size_of::<u8>() + size_of::<u32>();
 
 const _: () = {
@@ -470,6 +553,23 @@ impl<V: ColumnVec> TypeColumns<V> {
                 let [ty, start, len] = self.triple(d)?;
                 TypeRef::UnsafeBinder { lifetimes: Names { start, len }, ty: idx(ty) }
             }
+            TypeRefKind::Union => {
+                let [start, count] = self.pair(d)?;
+                TypeRef::Union(list(&self.lists, start, count, LIST)?)
+            }
+            TypeRefKind::Record => {
+                // The types' start, the names' start, the field count, then a default's slot
+                // per field.
+                let [types, names, count] = self.triple(d)?;
+                let slots = (d as usize).wrapping_add(3);
+                let defaults =
+                    self.extra.get(slots..slots.wrapping_add(count as usize)).ok_or(EXTRA)?;
+                TypeRef::Record {
+                    names: Names { start: names, len: count },
+                    types: list(&self.lists, types, count, LIST)?,
+                    defaults: RecordDefaults(defaults),
+                }
+            }
         })
     }
 }
@@ -506,7 +606,7 @@ impl TypeColumns<Growing> {
         let kind = TypeRefKind::of(&type_ref);
         let data = match type_ref {
             TypeRef::Never | TypeRef::Placeholder | TypeRef::Error => 0,
-            TypeRef::Tuple(types) => {
+            TypeRef::Tuple(types) | TypeRef::Union(types) => {
                 let words = append(&mut self.lists, types);
                 self.words(words)
             }
@@ -531,6 +631,16 @@ impl TypeColumns<Growing> {
             TypeRef::PatternType(ty, pat) => self.words([raw(ty), raw(pat)]),
             TypeRef::UnsafeBinder { lifetimes, ty } => {
                 self.words([raw(ty), lifetimes.start, lifetimes.len])
+            }
+            TypeRef::Record { names, types, defaults } => {
+                assert!(
+                    names.len as usize == types.len() && defaults.len() == types.len(),
+                    "a record's names, types and defaults run in step"
+                );
+                let [start, count] = append(&mut self.lists, types);
+                let at = self.words([start, names.start, count]);
+                self.extra.extend_from_slice(defaults.words());
+                at
             }
         };
         self.node(kind, data)
@@ -670,7 +780,9 @@ impl TypeColumns<Frozen> {
                 | TypeRef::Error
                 | TypeRef::Path(_)
                 | TypeRef::TypeParam(_) => {}
-                TypeRef::Tuple(types) => types.iter().try_for_each(|&it| ty(it))?,
+                TypeRef::Tuple(types) | TypeRef::Union(types) => {
+                    types.iter().try_for_each(|&it| ty(it))?
+                }
                 TypeRef::RawPtr(inner, _) | TypeRef::Slice(inner) => ty(inner)?,
                 TypeRef::Reference(RefType { ty: inner, lifetime: region, mutability: _ }) => {
                     ty(*inner)?;
@@ -713,6 +825,13 @@ impl TypeColumns<Frozen> {
                 TypeRef::UnsafeBinder { lifetimes, ty: inner } => {
                     ty(inner)?;
                     self.paths.check_names(lifetimes)?;
+                }
+                TypeRef::Record { names, types, defaults } => {
+                    types.iter().try_for_each(|&it| ty(it))?;
+                    self.paths.check_names(names)?;
+                    for default in defaults.iter().flatten() {
+                        below(raw(default.expr), exprs, "an expression id past its arena")?;
+                    }
                 }
             }
         }
@@ -820,6 +939,13 @@ mod tests {
             TypeRef::Error,
             TypeRef::UnsafeBinder { lifetimes: Names { start: 0, len: 1 }, ty: t(8) },
             TypeRef::UnsafeBinder { lifetimes: Names::EMPTY, ty: t(0) },
+            // `{ 'b: T0 = <expr 0> }` and `{}`: one field with a default, and no field.
+            TypeRef::Record {
+                names: Names { start: 0, len: 1 },
+                types: &[T0],
+                defaults: RecordDefaults(&[1]),
+            },
+            TypeRef::Record { names: Names::EMPTY, types: &[], defaults: RecordDefaults(&[]) },
         ]
     }
 

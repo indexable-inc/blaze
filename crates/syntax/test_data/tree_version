@@ -1,4 +1,4 @@
-2
+3
 generated/runner.rs c853fcd571c75413cf80ddb25cdc8f8f
 lexer/err/byte_char_literals.rs c3ef3de877abe1fdf49a5cda3579186e
 lexer/err/byte_strings.rs 9c68adca42c9076b385aab193ff38d25

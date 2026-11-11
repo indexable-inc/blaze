@@ -18,9 +18,9 @@ export type Shown =
   | { t: "scalar"; type: ColType; v: Cell }
   | { t: "text"; v: string; total: number }
   | { t: "error"; message: string; stack: string }
-  /** A page of the harness browser (cdp.ts `Page`): the app draws it as a live card of view `view` (the genui Browser
-   *  element, compact), its title and host under it; pressing it opens the view in the browser pane. */
-  | { t: "browser"; view: string; url: string; title: string };
+  /** A page of the harness browser (cdp.ts `Page`). The transcript draws nothing for it; with `pane` (a page opened for
+   *  the person, browser.open) its step is a line whose link shows view `view` in the browser pane when pressed. */
+  | { t: "browser"; view: string; url: string; title: string; pane?: true };
 
 /** A value that says how it is shown: `[SHOWN]()` gives its Shown (a browser Page gives its card). */
 export const SHOWN: unique symbol = Symbol.for("harness.shown");

@@ -6,6 +6,10 @@ edition = "2024"
 license = "Apache-2.0"
 publish = false
 
+[lib]
+name = "harness_native"
+path = "src/lib.rs"
+
 [[bin]]
 name = "harness-native"
 path = "src/main.rs"
@@ -45,6 +49,7 @@ harness-vt = { path = "../harness-vt" }
 harness-proto = { path = "../harness-proto" }
 harness-ghostty-config = { path = "../harness-ghostty-config" }
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
 bytemuck = { version = "1", features = ["derive"] }
 png = "0.17"
 libc = "0.2"
@@ -55,10 +60,18 @@ icu_segmenter = "=2.3.0"
 icu_properties = "=2.3.0"
 unicode-bidi = "=0.3.18"
 
+# The Mac's shell (src/window.rs): AppKit's window, events, menus and pasteboard.
 [target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = "0.3"
+
+# The phone's shell (src/ios.rs): UIKit's view, touches and keyboard.
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2-ui-kit = "0.3"
+
+# What both shells and the app's core use: Metal, layers, text, the run loop.
+[target.'cfg(target_vendor = "apple")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = "0.3"
-objc2-app-kit = "0.3"
 objc2-metal = "0.3"
 objc2-quartz-core = "0.3"
 objc2-core-text = "0.3"

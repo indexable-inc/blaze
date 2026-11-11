@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-47 invariants, 14 refinements, 4 reference models.
-By level: 40 tested, 21 simulated, 0 model-checked, 0 proved.
+104 invariants, 18 refinements, 7 reference models.
+By level: 91 tested, 30 simulated, 1 model-checked, 0 proved.
 
 ## Invariants
 
@@ -20,8 +20,28 @@ By level: 40 tested, 21 simulated, 0 model-checked, 0 proved.
 
 - **`a_cgroups_footprint_is_its_charge_less_the_file_cache_the_kernel_can_drop`** *tested* (`crates/blaze-cargo/src/raw/memory.rs`): the cgroup's footprint is its charge less the file cache the kernel can drop, and nothing else is taken off. The directed case: a cgroup of 10 GiB of which 6 are file cache, 1 of that shared memory, is 5 GiB (the control: counting all of `file` as droppable says 4, counting none says 10). A line that only begins with a field's name (`file_mapped`, `shmem_thp`) is not the field.
   Controls: `shared_memory_dropped_and_file_cache_kept`.
+- **`a_provided_run_is_answered_the_same_randomness_every_time`** *tested* (`crates/blaze-cargo/src/sandbox/linux.rs`): in a run given a provider, what a process gets from `getrandom` and from `/dev/urandom` is the provider's: the same bytes on every run of the same seed, other bytes for each process and each open, other bytes under another seed, and nothing in the trace that can't be traced.
+  Controls: `randomness_read_without_a_provider`, `an_allocation_that_seeds_in_the_window`.
+- **`the_launchers_window_makes_no_call_the_supervisor_sees`** *tested* (`crates/blaze-cargo/src/sandbox/linux.rs`): between its filter's install and its exec the launcher's child makes no call the supervisor notes or answers (no allocation that seeds a heap, no clock): the supervisor takes every call of that process for the program's, and an answered one would move the program's stream.
+  Controls: `randomness_read_without_a_provider`, `an_allocation_that_seeds_in_the_window`.
+- **`a_provided_run_is_answered_the_same_randomness_every_time`** *tested* (`crates/blaze-cargo/src/sandbox/linux.rs`): in a run given a provider, what a process gets from `getrandom` and from `/dev/urandom` is the provider's: the same bytes on every run of the same seed, other bytes for each process and each open, other bytes under another seed, and nothing in the trace that can't be traced.
+  Controls: `randomness_read_without_a_provider`, `an_allocation_that_seeds_in_the_window`.
+- **`the_launchers_window_makes_no_call_the_supervisor_sees`** *tested* (`crates/blaze-cargo/src/sandbox/linux.rs`): between its filter's install and its exec the launcher's child makes no call the supervisor notes or answers (no allocation that seeds a heap, no clock): the supervisor takes every call of that process for the program's, and an answered one would move the program's stream.
+  Controls: `randomness_read_without_a_provider`, `an_allocation_that_seeds_in_the_window`.
+- **`a_provided_run_is_answered_the_same_randomness_every_time`** *tested* (`crates/blaze-cargo/src/sandbox/linux.rs`): in a run given a provider, what a process gets from `getrandom` and from `/dev/urandom` is the provider's: the same bytes on every run of the same seed, other bytes for each process and each open, other bytes under another seed, and nothing in the trace that can't be traced.
+  Controls: `randomness_read_without_a_provider`, `an_allocation_that_seeds_in_the_window`.
+- **`the_launchers_window_makes_no_call_the_supervisor_sees`** *tested* (`crates/blaze-cargo/src/sandbox/linux.rs`): between its filter's install and its exec the launcher's child makes no call the supervisor notes or answers (no allocation that seeds a heap, no clock): the supervisor takes every call of that process for the program's, and an answered one would move the program's stream.
+  Controls: `randomness_read_without_a_provider`, `an_allocation_that_seeds_in_the_window`.
+- **`the_work_between_requests_waits_for_quiet_turns_after_the_answer`** *simulated* (`crates/blaze-cargo/src/serve/daemon.rs`): the work between requests (the collections, the image's making, in line on the loop) first runs [`QUIET_BEFORE_BETWEEN`] quiet turns after a build's answer, however long the build turned with nothing completing: the client that got the answer asks its next thing (its rows, why it recomputed) into an idle loop. Its control is `the_oracle_catches_quiet_turns_counted_under_a_build`.
+  Controls: `quiet_turns_counted_under_a_build`.
 - **`a_kept_answer_is_said_again_only_while_a_walk_would_say_the_same`** *tested* (`crates/blaze-cargo/src/serve/job/noop/tests.rs`): the lane says a kept answer again only when a walk of every unit would say the same of the state the request is asked in, with every output in place and no other job under way: no input a build reads changed since the answer was kept. Over any run of edits of the checkout's files and its lock file, of a traced header, a listed directory, a path dependency and the layout profiles outside it, of the request's environment, features, profile and colors, of touches, deleted outputs, other jobs and requests, with the watches confirmed in time or late; and of a `//` comment at a line's end, in the source (its unit keyed by code text or, a lint reading comments, by bytes; its build warning of the commented line or not) and in a file the build script reads by its bytes. `HEGEL_TEST_CASES=<n>` runs it longer.
   Controls: `a_lane_that_ignores_an_edited_file`, `a_lane_that_ignores_the_lock_file`, `a_lane_that_does_not_compare_the_environment`, `a_lane_that_ignores_the_features_and_the_profile`, `a_lane_that_ignores_how_the_request_is_rendered`, `a_lane_that_ignores_a_traced_file_outside_the_view`, `a_lane_that_does_not_see_a_deleted_output`, `a_kept_walk_that_listed_a_directory`, `a_kept_build_that_made_something`, `a_lane_that_answers_beside_another_job`, `a_lane_that_trusts_an_unwatched_path_dependency`, `a_lane_that_does_not_see_layout_profiles_appear`, `a_replayed_script_that_writes_on_every_walk`, `a_foreign_write_taken_for_the_walks_echo`, `a_request_not_held_for_the_watches_round`, `a_lane_keyed_by_code_text_that_misses_a_token_change`, `a_lane_that_takes_bytes_something_reads_for_still`, `a_replayed_diagnostic_with_stale_quoted_text`.
+- **`a_builds_rows_are_flushed_only_after_its_answer`** *tested* (`crates/blaze-cargo/src/serve/observe.rs`): a build's rows reach no file of the history until its answer was said ([`ToHistory::Answered`]), whatever else is flushed meanwhile; its misses are explained and told as it ends, before that. So the answer of a build never shares the disk with the flush of its own profile. The history's thread is given the build's end and then a reader's flush: once that is told, nothing of the build is on disk. Then its answer and a second reader's flush behind it: its row is there. Its control is `the_oracle_catches_a_build_flushed_as_it_ends`.
+  Controls: `a_build_flushed_as_it_ends`.
+- **`the_daemon_writes_no_line_to_its_log_that_is_not_an_event`** *tested* (`crates/blaze-cargo/src/serve/said.rs`): every line the daemon writes to its log is an event of the profile too. Held by reading the daemon's sources: tests, this file and `once.rs` (the seed's engine in the client's process, whose standard error is the terminal) aside.
+  Controls: `a_line_written_to_the_log_alone`.
+- **`an_edit_s_build_keeps_what_it_made_until_memory_is_short`** *tested* (`crates/blaze-cargo/src/serve/unit/release/tests.rs`): a build that found units kept and made at most [`EDIT_CRATES`] crates (an edit's) lets go of no crate's inference by name and of no MIR, while it runs or as it ends, so the next edit's check reads the values of the crate it makes again and infers and lowers only what changed; memory short takes everything, as of any build.
+  Controls: `a_release_that_lets_go_of_what_an_edit_made`.
 - **`a_records_diagnostics_kept_as_places_point_at_the_same_tokens_in_every_text_of_its_key`** *simulated* (`crates/blaze-cargo/src/serve/unit/tests.rs`): a record's diagnostics kept as places, replayed over any text of the same code text (a comment at a line's end, spaces before one, a comment after the last line added or taken away), point at the very tokens the check pointed at, and over the text they were made of are the diagnostics the check gave, byte for byte, through the record's encoding.
   Controls: `a_diagnostic_rendered_at_stale_offsets`.
 - **`every_recomputed_step_ends_in_a_terminal_reason`** *tested* (`crates/blaze-cargo/src/serve/why.rs`): every recomputed step of a build has a reason whose chain ends in a terminal reason other than `Unexplained`.
@@ -42,7 +62,9 @@ By level: 40 tested, 21 simulated, 0 model-checked, 0 proved.
 - **`a_crash_leaves_every_pack_and_its_checks_as_the_head_names_them`** *simulated* (`crates/blaze-cas/src/tests/block_checks.rs`): after a crash at any point of any number of commits, under injected IO failures, the store opens; each pack's checks file holds the checks of the blocks its head names, and the store holds the same; every put reported durable reads back the bytes it was given; and no value reads back other bytes than were put. `HEGEL_TEST_CASES=<n>` runs it longer.
   Controls: `a_head_written_before_its_syncs`.
 - **`a_place_gives_its_values_bytes_whole_through_any_crash`** *simulated* (`crates/blaze-cas/src/tests/place_crash.rs`): whatever is put, placed, replaced and derived, with `placed/` full or not, and wherever the power goes, (1) a place that ends well leaves its path holding exactly its value's bytes, so a whole file of `placed/` is cloned from only when its bytes are its value's: one written or derived by this run, or one an earlier run left that hashes to its name (a derived value's is never kept: it is made again from its base and its ranges); (2) until a place ends well its path holds what it held or the new value whole, never a part; (3) after a crash a path holds nothing, or the whole of a value once placed there, or what the power left of a place of one (nothing of a place is synced: any of the sectors of a value written where it goes, or a derived value's base with any of its ranges written), never bytes of anything else; (4) no clone the store asks for is of a file with data not written back, so no place waits for a write-back a clone forced; and the store opens. `HEGEL_TEST_CASES=<n>` runs it longer.
-  Controls: `a_placed_file_used_after_a_crash_unchecked`, `a_rename_before_the_clones_bytes_are_complete`, `a_derive_that_skipped_a_range`, `a_derived_file_accepted_as_a_crash_left_it`, `a_clone_of_a_dirty_file_on_the_edit_path`.
+  Controls: `a_placed_file_used_after_a_crash_unchecked`, `a_rename_before_the_clones_bytes_are_complete`, `a_derive_that_skipped_a_range`, `a_derived_file_accepted_as_a_crash_left_it`, `a_clone_of_a_dirty_file_on_the_edit_path`, `an_image_put_whole_with_its_room`.
+- **`an_image_put_as_its_runs_over_holes_is_placed_writing_its_runs_and_none_of_its_room`** *simulated* (`crates/blaze-cas/src/tests/place_crash.rs`): an image put as its runs over the base of holes ([`derived::holes`]) is placed as the file those runs give, and from its put to its place nothing writes its room: the record is the runs, and the place writes the base once and the runs once (into the store's own file of it, which the output is a clone of). The image is then a base as any other, so the edit after it derives from it.
+  Controls: `a_placed_file_used_after_a_crash_unchecked`, `a_rename_before_the_clones_bytes_are_complete`, `a_derive_that_skipped_a_range`, `a_derived_file_accepted_as_a_crash_left_it`, `a_clone_of_a_dirty_file_on_the_edit_path`, `an_image_put_whole_with_its_room`.
 - **`a_made_output_is_placed_with_no_clone_and_no_wait_for_a_write_back`** *simulated* (`crates/blaze-cas/src/tests/place_made.rs`): an output placed from its maker's bytes ([`Store::place_made`]), whatever the store's own whole files are doing beside it (written, sealed, their write-backs in flight or held for ever) and wherever the power goes, (1) asks the driver for no clone, no write-back and nothing that waits for a sync, so no clone of a file with data not written back is made for it and none of its bytes are forced out by one; (2) is answered once its own effects have completed, with write-backs the disk never completes still held: its answer waits for no write-back; (3) ends with its path holding exactly its file, the runs over zeros at its length, and reports the runs' bytes as written there; (4) until it ends its path holds what it held or the new file whole, never a part; (5) after a crash its path holds nothing, a value once placed there whole, or what the power left of one (each byte the value's or a zero), never bytes of anything else; and the store opens. `HEGEL_TEST_CASES=<n>` runs it longer.
   Controls: `a_made_output_cloned_from_a_file_just_written`, `a_made_output_whose_answer_waits_for_a_write_back`.
 - **`two_stores_placing_one_value_at_one_path_both_succeed_in_any_order`** *simulated* (`crates/blaze-cas/src/tests/place_race.rs`): any schedule of two stores placing the same value at one shared path ends with both Ok and the path holding the value. `HEGEL_TEST_CASES=<n>` runs it longer.
@@ -64,10 +86,16 @@ By level: 40 tested, 21 simulated, 0 model-checked, 0 proved.
 
 ### blaze-core
 
+- **`wrote_all`** *tested* (`crates/blaze-core/src/fs/linux.rs`): after a write effect that reported done, the file holds every byte asked for, where it was asked for. The oracle is `std::fs::read`.
+  Controls: `a_short_write_not_continued`, `an_errno_mapped_to_the_wrong_error`.
+- **`missing_is_not_found`** *tested* (`crates/blaze-core/src/fs/linux.rs`): a file that is not there is `NotFound`, which is what makes a parent directory (`making_parent`) and what an empty `ReadAll` reads. The oracle is `std::fs`'s error for the same path.
+  Controls: `a_short_write_not_continued`, `an_errno_mapped_to_the_wrong_error`.
 - **`the_turn_loop_never_waits_behind_a_stalled_holder`** *simulated* (`crates/blaze-core/src/lock/tests.rs`): with the state published through an atomic, a stalled holder never holds up a turn, every turn reads the latest state, and every wait among the workers is recorded once, behind the holder it waited for.
   Controls: `a_hot_lock_on_the_turn_loop`.
 - **`pages_read_back_what_was_put_after_any_crash`** *simulated* (`crates/blaze-core/src/sim/pages.rs`): whatever the faults, wherever the power goes out, a read hands back the bytes put or a refusal the disk's rot explains, the open finds what completed, and every load ends.
   Controls: `a_page_loaded_as_its_read_is_asked`, `a_failed_load_kept`, `a_load_with_no_check`, `an_eviction_of_a_page_the_commit_pinned`, `a_head_written_before_the_data_s_sync`.
+- **`a_write_at_an_offset_goes_through_the_page_cache`** *simulated* (`crates/blaze-core/src/uring.rs`): a write at an offset goes through the page cache whatever its size and alignment, so it completes without waiting for a device. Writes of 8 MiB at multiples of 8 MiB (a linked image's runs, as an edit's output is placed) and one unaligned: the open of each asks for no `O_DIRECT`, each is one buffered write on its slot, and each reads back as written. Its control is `the_oracle_catches_a_write_at_an_offset_opened_around_the_cache`.
+  Controls: `a_write_at_an_offset_opened_around_the_cache`.
 - **`every_public_wait_ends_in_a_sandboxed_process`** *tested* (`crates/blaze-core/src/wait/filtered.rs`): in a process the sandbox launcher marked, under a filter that refuses io_uring as the sandbox's does, every wait `blaze_core::wait` gives ends, on the direct driver, and no ring is asked for.
   Controls: `a_sandboxed_process_waiting_on_the_ring`.
 - **`every_wait_ends_by_its_deadline_under_interruption`** *simulated* (`crates/blaze-core/src/wait/tests.rs`): whatever interrupts it, every wait ends by its deadline, never says it passed before it did, and is ready whenever its event came first.
@@ -92,6 +120,15 @@ By level: 40 tested, 21 simulated, 0 model-checked, 0 proved.
 
 - **`a_kept_lookup_answers_as_the_manifests_do`** *tested* (`crates/blaze-engine/src/pin.rs`): a kept lookup answers what reading the manifests answers, whatever changed on the way since it was kept (the pin edited to one of the same length, a manifest added nearer, the root removed), and an unsettled manifest keeps nothing. The control at its end shows the kept answer is the one served while every stamp stands: a manifest rewritten in place with its stamp put back answers as kept, which is the very case [`SETTLED_NS`] keeps out of the file.
   Controls: `a_manifest_rewritten_under_its_stamp`.
+
+### blaze-ext-host
+
+- **`facts_equal_the_reference_fixpoint_after_any_edits`** *tested* (`crates/blaze-ext-host/src/facts/tests.rs`): after any edits, rewirings and switches of extension, against whatever an earlier solve kept, every fact of every item equals the least fixpoint of its function over the call graph as it stands; a solve with nothing kept gives the same bytes; and a solve after no change computes nothing.
+  Controls: `a_fact_not_recomputed_when_a_callee_s_fact_changed`, `a_cache_hit_across_two_extensions_code_identities`.
+- **`the_key_covers_blaze_the_source_and_the_grants`** *tested* (`crates/blaze-ext-host/src/key.rs`): a build's key changes with each of its inputs, and with nothing else.
+  Controls: `a_key_that_leaves_blaze_out`.
+- **`two_builds_give_the_same_diagnostics`** *tested* (`crates/blaze-ext-host/src/tests.rs`): two checks of the same source, on two databases, give the same diagnostics, byte for byte, in the same order; and so does a check that runs every job twice with its arena elsewhere.
+  Controls: `an_extension_that_misses_a_finding`, `a_result_that_depends_on_an_address`.
 
 ### blaze-graph
 
@@ -121,6 +158,10 @@ By level: 40 tested, 21 simulated, 0 model-checked, 0 proved.
 - **`every_call_reaches_the_code_an_edit_left`** *tested* (`crates/blaze-link/src/tests/thunks.rs`): after any splice that succeeds, every branch in the image reaches its target directly or through a thunk, and every call to code an edit replaced reaches the replacement. Drawn: whether the callers call the leaves through their slots or directly, and up to three edits, each a leaf filled again under its own key. A splice refused must be the typed one for a thunk out of reach, and the link from scratch that takes its place is held to the same oracle. Each case links 200 MiB, so there are few.
   Controls: `a_stale_direct_branch_to_replaced_code`, `a_slot_left_on_replaced_code`, `an_edit_the_image_does_not_hold`.
 
+### blaze-lints
+
+- **`an_unmeasured_crate_takes_any_count_until_a_bless_records_it`** *tested* (`crates/blaze-lints/src/baseline.rs`): an unmeasured crate passes any count and is never over, is stale until a bless, and a bless gives it the run's count or drops it at zero, so the ratchet's first measured run only turns `unmeasured` into numbers or into `deny`.
+
 ### blaze-lower
 
 - **`the_interface_text_moves_exactly_with_what_a_dependent_observes`** *tested* (`crates/blaze-lower/src/code/tests.rs`): any edit of a file that changes what a crate checking against it can observe (a signature, an item added or removed, a constant's value, a macro's tokens, a generic, `const`, `#[inline]`, `impl Trait` or default-method body, a body that defines an item or calls an unknown macro, a `cfg`, a line moved) changes its interface text, and an edit of a comment or of a plain function's body that moves no line leaves it as it was. Drawn: up to five items of any kind, and one edit of one of them.
@@ -141,25 +182,128 @@ By level: 40 tested, 21 simulated, 0 model-checked, 0 proved.
 
 ### blaze-profile
 
+- **`profiling_md_lists_only_columns_the_schema_has`** *tested* (`crates/blaze-profile/src/describe.rs`): docs/profiling.md lists no column the schema lacks. Its tables are written by hand; each row of a table under a `### \`<table>\`` heading names columns of that table (several on a row are `a, b`), and every table of the schema is named there.
+  Controls: `a_column_the_schema_lacks`.
 - **`every_name_reads_back_as_recorded_or_is_counted_forgotten`** *simulated* (`crates/blaze-profile/src/flight/names/tests.rs`): every name a row holds reads back as the text recorded or is counted as forgotten, never as another text; and nothing is forgotten in a run that lost no row.
   Controls: `a_foreign_name_written_with_no_link`, `a_generation_begun_with_no_gen_row`, `a_reader_that_ignores_the_window`, `a_table_kept_across_a_park`.
 - **`every_row_is_in_the_history_once_after_any_crash`** *simulated* (`crates/blaze-profile/src/history/files/tests.rs`): whatever the faults, wherever the power goes out, every row handed to the history is listed, handed back or left to read, exactly once, and the history opens.
   Controls: `a_rename_with_no_sync_before`, `what_a_flush_consumed_marked_after_its_commit`.
+
+### blaze-query
+
+- **`a_restored_image_names_only_what_it_holds`** *model-checked* (`crates/blaze-query/src/tests.rs`): a database restored from an image holds no record that names a memo, an edge or bytes of the blob the image lacks: each is refused as the image is opened, naming the section and the record, never met by the first request that reads it. An image the database wrote passes, and written again unchanged it still does.
+  Controls: `a_table_slot_naming_a_memo_the_image_lacks`.
+
+### blaze-std
+
+- **`an_arena_never_hands_out_more_than_its_limit`** *tested* (`crates/blaze-std/src/tests/arena.rs`): an arena never hands out more than its limit. Whatever appends are made to bytes in a named arena, its use stays within its limit, an append past it is `Stopped::OutOfMemory` naming the arena and changes nothing, and the bytes are exactly the appends that were taken.
+  Controls: `an_arena_with_no_limit`.
+- **`a_net_never_passes_its_byte_limit`** *tested* (`crates/blaze-std/src/tests/budget.rs`): a `Net` with a byte limit never passes it and spends it exactly. What the peer was sent and what was received from it, counted outside bstd, fit the limit; a send that does not fit is a typed `Over` and moves nothing.
+  Controls: `a_limit_checked_after_the_send`, `a_quota_checked_after_the_write`.
+- **`a_directory_never_passes_its_quota`** *tested* (`crates/blaze-std/src/tests/budget.rs`): a `Dir` with a quota never passes it and spends it exactly. The lengths of the files on the simulated disk fit the quota; a write that does not fit is a typed `Over` and writes nothing.
+  Controls: `a_limit_checked_after_the_send`, `a_quota_checked_after_the_write`.
+- **`cancelling_a_scope_ends_its_waits_with_cancelled`** *tested* (`crates/blaze-std/src/tests/cancel.rs`): cancelling a scope ends its waits with `Stopped::Cancelled`. Once a task of a scope fails or panics, or the scope is cancelled, every wait of its later tasks ends with `Cancelled`, the ones before it ended as they would have, and the scope returns its first failure, naming the task.
+  Controls: `a_wait_that_ignores_cancellation`.
+- **`closing_a_file_syncs_it_or_says_why_not`** *simulated* (`crates/blaze-std/src/tests/close.rs`): a `File::close_synced` that returned `Ok` has made the file and every append durable (a crash right after keeps them all), and one whose flush the disk fails returns that failure, op `Close`, never `Ok`.
+  Controls: `a_close_that_skips_its_sync`.
+- **`a_child_context_never_has_a_later_deadline`** *tested* (`crates/blaze-std/src/tests/contexts.rs`): a child `Cx` never has a later deadline than its parent. Whatever tree of `until`, `span`, scopes and tasks grows from the root, each context's deadline is at or before the one it was made from.
+  Controls: `until_that_widens`.
+- **`write_then_read_round_trips_through_crashes`** *simulated* (`crates/blaze-std/src/tests/crash.rs`): write then read round-trips through crashes. Before a crash a read is everything written; after one it is everything a returned flush or synced publish made durable, followed by a prefix of what came after it, never less and never anything else.
+  Controls: `a_sync_that_skips_the_disk`.
+- **`a_deadline_always_ends_a_wait`** *simulated* (`crates/blaze-std/src/tests/deadlines.rs`): a deadline always ends a wait. Under `cx.until(d)` no call returns with the driver's clock past `d` (unless it was past already), a call that stopped with `Stopped::Deadline` did so once `d` had passed, and a call that cannot finish ends with `Stopped::Deadline`, not later and not otherwise.
+  Controls: `a_wait_that_ignores_its_deadline`.
+- **`files_keep_what_their_calls_said_through_crashes`** *simulated* (`crates/blaze-std/src/tests/durable.rs`): a file call's durability is what its caller said and nothing else. A read after a publish or a remove returned gives what it said; a crash keeps exactly what was synced, and of what was not, the last synced state or an unsynced change cut short; a clone of a `Flushed` forces no writeback; nothing told `No` or `Started` waits for the device; and `Started` keeps through a crash no more than `No` does.
+  Controls: `a_publish_that_reports_done_before_its_rename`, `a_durable_yes_that_skipped_the_directory_sync`, `a_flushed_handed_out_before_the_flush_completed`.
+- **`env_only_never_widens`** *tested* (`crates/blaze-std/src/tests/env.rs`): `Env::only` never widens. After any chain of narrowings a variable reads only if every narrowing in the chain named it, and then reads as the world set it.
+  Controls: `only_that_replaces`.
+- **`a_call_gives_the_points_own_value`** *tested* (`crates/blaze-std/src/tests/eval.rs`): `Eval` gives a memo point's own value. Under `direct` and `memo`, every call gives what the plain function gives and what the same call gave before, for two points called with the same arguments.
+  Controls: `a_key_that_ignores_an_argument`, `two_points_sharing_entries`, `a_memo_that_never_evicts`, `calls_put_under_the_grandparent`.
+- **`a_memo_stays_within_its_limit`** *tested* (`crates/blaze-std/src/tests/eval.rs`): a memo never holds more entries or bytes than its limit, and until it has dropped or refused an entry each distinct call's body runs at most once.
+  Controls: `a_key_that_ignores_an_argument`, `two_points_sharing_entries`, `a_memo_that_never_evicts`, `calls_put_under_the_grandparent`.
+- **`provenance_records_the_calls_made`** *tested* (`crates/blaze-std/src/tests/eval.rs`): the graph `Provenance` writes holds exactly the calls made, each under the call whose body made it, in order.
+  Controls: `a_key_that_ignores_an_argument`, `two_points_sharing_entries`, `a_memo_that_never_evicts`, `calls_put_under_the_grandparent`.
+- **`stale_clone_forces_nothing`** *tested* (`crates/blaze-std/src/tests/explicit.rs`): no clone made through a `Flushed` forces writeback, whatever was written behind it. The oracle is the simulated disk's ledger. `plant` is the bug planted.
+  Controls: `a_stale_flushed_cloned`.
+- **`a_finished_op_never_lands_later`** *simulated* (`crates/blaze-std/src/tests/inflight.rs`): an op in flight is finished. Once `Pending::wait` or `Pending::cancel` has returned, the driver holds nothing of it and nothing it does happens later: the file holds what the model says then and once the world has moved on.
+  Controls: `a_cancel_that_skips_its_wait`.
+- **`kv_agrees_with_a_model_through_crashes`** *simulated* (`crates/blaze-std/src/tests/kv.rs`): `Kv` agrees with a model map through crashes. A get gives exactly what the model holds and a list exactly its keys; a `put_synced` or a `delete_synced` that returned is kept by a crash, whole: never a part of a value, never an older one.
+  Controls: `a_put_without_a_sync`.
+- **`a_local_pair_delivers_in_order_exactly_once`** *tested* (`crates/blaze-std/src/tests/local.rs`): a local pair delivers bytes in order, exactly once. Each read gives the next bytes written and not yet read, a write that stops half way says how many bytes it wrote, and once an end is finished its peer reads what was left, then 0.
+  Controls: `a_dropped_chunk`.
+- **`a_withheld_capability_is_missing_and_named`** *tested* (`crates/blaze-std/src/tests/missing.rs`): a capability the host withholds is missing at the root. Each root accessor of `Io` is `Some` exactly when the host offers it, and its `need_` form is `Ok` then and otherwise a `Missing` naming it, for every flag of `Offers`.
+  Controls: `accessors_that_ignore_the_offers`.
+- **`a_narrowed_directory_reaches_only_beneath_it`** *tested* (`crates/blaze-std/src/tests/narrowing.rs`): narrowing never widens. Every file a call through `top/sub` names is beneath `top/sub`, and a call through its read-only narrowing changes nothing.
+  Controls: `a_subdir_that_keeps_its_parent`, `a_read_only_open_that_creates`.
+- **`a_path_never_escapes_its_directory`** *tested* (`crates/blaze-std/src/tests/paths.rs`): a `Path` never escapes its `Dir`. Whatever text a path is made of, what `Path::new` takes is plain and relative, and a write through `jail/in` of it names a file beneath `jail/in`.
+  Controls: `a_parent_resolved_by_text`.
+- **`a_scopes_tasks_have_all_ended_when_it_joins`** *tested* (`crates/blaze-std/src/tests/scopes.rs`): when `Scope::join` returns its tasks have all ended. Nothing a task started is still in flight in the driver, each `Task::join` gives exactly what its closure did, and the scope's own join gives the first failure, naming the task.
+  Controls: `a_join_that_drops_a_failure`.
 
 ### blaze-storemodel
 
 - **`what_is_kept_after_an_answer_survives_any_crash_and_no_lost_value_is_served`** *tested* (`crates/blaze-storemodel/src/tests.rs`): an answer may be sent on results not yet durable; nothing derived from that answer is reused across a crash unless its tickets were durable. After any crash the restore serves no value whose bytes were lost, holds everything the store called durable and everything an answered build kept, and every answer's settling ended kept or said lost. Two builds on shared and separate keys with a reader, and a snapshot beside a build, each build answering before it flushes: every schedule, a crash after every IO step, so at every point between an answer sent and its results durable; with an IO failure anywhere, so a settling that ends with the store stopped. Then two kernel gets of one identity in two worlds racing for one shape slot, each answering at once and keeping what it left once it and every store before it is durable, with an IO failure anywhere and effects completing in any order.
   Controls: `a_kept_answer_relied_on_before_its_tickets_were_durable`, `a_settling_failure_dropped_silently`.
 
+### blaze-units
+
+- **`the_ratchet_is_read_in_place_of_the_levels_table`** *tested* (`crates/blaze-units/src/load/plan/tests.rs`): where a workspace has `[workspace.metadata.blaze.lints-ratchet]`, this blaze reads its levels in place of `[workspace.metadata.blaze.lints]` (which a released blaze reads) and after `lints-when-ready`, so the ratchet's level of a lint is the one that holds.
+- **`a_crate_its_baseline_lists_is_held_at_warn_and_no_other`** *tested* (`crates/blaze-units/src/load/plan/tests.rs`): a member is held at `warn` on exactly the blaze lints whose baseline lists it, `unmeasured` or counted; a crate no baseline lists gets no flag, so the ratchet's `deny` holds for it. A baseline that does not read is an error naming it, never a crate dropped.
+
+### blaze-usercode
+
+- **`a_process_is_given_its_own_stream_whoever_else_asks`** *tested* (`crates/blaze-usercode/src/provider.rs`): what a process is given by `getrandom` is its own stream's bytes in order, a function of the seed and the process alone, however the asks of the run's processes interleave and however each cut its own.
+  Controls: `a_count_shared_by_all_processes`.
+
+### hir
+
+- **`an_edit_of_one_body_checks_a_number_of_bodies_that_does_not_grow_with_the_crate`** *tested* (`crates/hir/src/check/bodies/tests.rs`): after a body-only edit of one function of a crate, the bodies whose check runs again are bounded by a constant, whatever the crate's size: the edited body and the bodies that read what changed of it (none here: its signature is the same), never every body, nor every body of the edited file, which the edit moves.
+  Controls: `a_walk_that_asks_every_body`.
+
 ### hir-def
 
+- **`a_kept_walk_keys_each_crate_once_and_as_one_walk_does`** *tested* (`crates/hir-def/src/deps/tests.rs`): at one view of one database by one `build`, the keys a [`KeyWalk`] gives over any sequence of asks are those one walk of all the crates gives, each crate keyed once: so keeping the walk between a build's serves changes no key (rule 21), and a serve costs the crates it is the first to ask for. Every order of asking the fixture's crates one at a time, each asked again after. Its control is `the_oracle_catches_a_walk_kept_across_a_write`.
+  Controls: `a_walk_kept_across_a_write`.
 - **`a_write_of_a_file_has_a_job_for_its_crate_and_those_above_it_alone`** *tested* (`crates/hir-def/src/nameres/delta/tests.rs`): a crate with no job in a write (`delta::unreached`) is one whose job would change nothing, so after any write every crate's maintained map is the one a fresh resolution makes (`check_db`). And the cost: a write of a file has a job for its crate and the crates above it alone, not one for every crate of the graph.
-  Controls: `a_crate_above_a_written_one_left_without_a_job`.
+  Controls: `a_crate_above_a_written_one_left_without_a_job`, `an_edit_of_a_crate_root_that_changes_a_scope`, `an_include_whose_file_is_not_kept`.
+- **`a_body_edit_in_a_crate_root_whose_children_export_macros_sets_no_scope`** *tested* (`crates/hir-def/src/nameres/delta/tests.rs`): an edit inside one function's body sets no module's scope and no field of its crate's resolution, in the crate root's file as in any other and whatever the root's children export to its textual scope: a body binds no name of a module. On ripgrep 2026-11-10 a one-line edit of `rg::main` wrote 25 `ScopeInput`s, and 841 `ScopeInput::name` and 833 `ScopeInput::legacy_macro` ran again for them, which every body of the crate then verified through.
+  Controls: `a_crate_above_a_written_one_left_without_a_job`, `an_edit_of_a_crate_root_that_changes_a_scope`, `an_include_whose_file_is_not_kept`.
+- **`a_crate_that_includes_a_file_has_a_job_for_that_file_and_not_for_another_crates`** *tested* (`crates/hir-def/src/nameres/delta/tests.rs`): a crate that expanded an `include!` has a job in a write only when the write holds a file one of its logs or expansions read: the file its `include!` parsed, not any file it does not define. So an edit of a crate above it gives it no job and sets nothing of it, and a write of the included file still reaches it: after either, every crate's maintained map is the one a fresh resolution makes (`check_db`).
+  Controls: `a_crate_above_a_written_one_left_without_a_job`, `an_edit_of_a_crate_root_that_changes_a_scope`, `an_include_whose_file_is_not_kept`.
+- **`records_are_equal_exactly_when_their_field_sets_are`** *tested* (`crates/hir-def/src/record.rs`): two record types are equal exactly when their (name, type) sets are.
+  Controls: `field_order_in_the_key`, `a_default_in_the_type_identity`.
 
 ### hir-ty
 
 - **`a_flush_keeps_two_shapes_of_one_base_key`** *tested* (`crates/hir-ty/src/body_store/tests.rs`): every step a flush is given is kept, whatever else the same flush holds; two shapes of one base key take two slots, in a store that shows no put before its driver made it. Until 2026-11-10 the second shape was placed against the store alone, found slot 0 free, and was refused by the put the first had buffered ("keeping the shape of the MIR of StaticId(..): two images were made under .."), which lost everything the build left for the store and its front end with it: every build of ripgrep, whose crates have statics and functions alike but for their names.
   Controls: `a_flush_that_forgets_what_it_placed`.
+
+### hir-ty-lean
+
+- **`fnv1a_from_is_the_fold_of_its_bytes`** *tested* (`crates/hir-ty-lean/src/tests.rs`): the ledger's checksum loop `fnv1a_from` never panics (no index out of bounds, no counter overflow) and returns FNV-1a's fold of the seed over the bytes, for every seed and every slice. The proof is of the model this test holds to the tree's source: the function's text is read from crates/blaze-graph/src/ledger.rs, its emitted Lean must be the checked-in module the proof imports, and its structured MIR runs to the same fold on the inputs here. Lean 4.20.0 accepts the proof of the model (crates/blaze-graph/lean/BlazeGraph/Ledger.lean) and a proof is written that the model is what the function's MIR runs to (BlazeGraph/LedgerMir.lean, objective V7). This statement says `(proved: ..)` once three things hold on one commit, never before: this test and `fnv1a_from_is_embedded_as_the_body_its_proof_walks` pass (the model and the embedded body are what blaze emits), and `lake build` of `lean/` passes in the gate with both proofs.
+  Controls: `a_continue_made_a_break`, `an_else_branch_dropped_at_a_join`, `an_xor_made_an_add`.
+
+### hir-ty-mir
+
+- **`early_drops_keep_every_program_as_rust_runs_it`** *tested* (`crates/hir-ty-mir/src/mir/early_drop/frontier.rs`): under early drop no local is dropped while a loan of it is live, no local is used after its drop, every initialized local is dropped exactly once on every path, the locals of one edge drop in scope order, and a scoped local drops where Rust drops it.
+  Controls: `a_drop_before_the_last_use_of_a_reborrow`, `a_conditional_move_with_no_drop_flag`, `a_scoped_guard_dropped_early`, `two_locals_dropped_in_hash_order`.
+- **`the_walk_agrees_with_the_reference_model`** *tested* (`crates/hir-ty-mir/src/tests/consteval/reach.rs`): for a random program of structs whose fields are plain, boxed, in a `Vec`, behind a counted or weak pointer, in a cell or in a generic struct, in any nesting and recursion, the walk clears a struct for the cycle question exactly when the reference model ([`model_is_acyclic`]) finds no way for a value of it to own itself.
+  Controls: `a_shared_pointer_inside_an_option_in_a_cell_missed`, `a_box_recursion_taken_for_a_cycle`, `a_visited_set_keyed_by_name`.
+
+### hir-ty-pure
+
+- **`one_key_is_one_optimized_code`** *tested* (`crates/hir-ty-pure/src/facts/model.rs`): a body's key covers every fact its passes relied on. For random pairs of programs that differ in one function, a function with the same code as written and the same recorded digests in both has the same optimized code in both.
+  Controls: `an_unwind_edge_removed_for_a_callee_that_panics_through_a_dyn_call`, `a_pure_call_hoisted_above_the_branch_guarding_its_panic`, `a_fact_relied_on_but_missing_from_the_key`.
+- **`an_accepted_graph_has_no_infinite_path`** *tested* (`crates/hir-ty-pure/src/loops.rs`): a control flow graph the analysis accepts has no infinite path. For random small graphs with random bounding facts, every accepted graph, each fact's block forced through its exit once its bound is used up, has only finite paths (checked by brute force over every state).
+  Controls: `a_self_loop_not_seen_as_a_cycle`, `a_bounding_block_whose_exit_stays_inside`.
+- **`the_checker_accepts_exactly_what_is_within_its_allowance`** *tested* (`crates/hir-ty-pure/src/may.rs`): the checker accepts a crate exactly when every function's inferred effects are within its allowed set, where allowed sets flow as specified: its own mark, else its trait method's, else the nearest module's default, else nothing under the gate and anything outside it; and an impl's own mark is within its trait method's. For random small call graphs with random effect sources and random declarations.
+  Controls: `an_impl_allowed_more_than_its_trait`, `a_module_default_merged_with_a_functions_own_mark`.
+
+### target-features
+
+- **`the_selected_clone_is_supported_and_the_best`** *tested* (`crates/target-features/src/multiversion.rs`): the clone selected is supported by the CPU (every feature it adds to the unit is present), and no supported clone is declared after it; the baseline is selected only when no clone is supported.
+  Controls: `a_clone_the_cpu_lacks`, `the_baseline_chosen_over_a_supported_clone`, `two_clones_of_one_set`.
+- **`clones_never_share_a_feature_set`** *tested* (`crates/target-features/src/multiversion.rs`): no two clones of a plan have one feature set, and none has the unit's, so the baseline and the clones are compiled with pairwise different sets and (their feature names being part of an instance's shape) never share a code identity.
+  Controls: `a_clone_the_cpu_lacks`, `the_baseline_chosen_over_a_supported_clone`, `two_clones_of_one_set`.
 
 ## Refinements
 
@@ -194,6 +338,11 @@ By level: 40 tested, 21 simulated, 0 model-checked, 0 proved.
 - **`lifting_and_lowering_keep_what_the_body_computes_on_any_bits`** *tested* (`crates/blaze-diff-mir/src/tests.rs`): the same at drawn inputs of any bits.
   Controls: `a_select_with_its_arms_swapped`.
 
+### blaze-ext-host
+
+- **`the_worked_example_finds_what_the_in_tree_lint_finds`** *tested* (`crates/blaze-ext-host/src/tests.rs`): over the same source, the extension `panic-in-drop` reports exactly what blaze's own `blaze::panic_in_drop` does: the same messages at the same places.
+  Controls: `an_extension_that_misses_a_finding`, `a_result_that_depends_on_an_address`.
+
 ### blaze-ids
 
 - **`a_keyed_set_kept_by_edits_is_the_set_made_whole`** *tested* (`crates/blaze-ids/src/keyed.rs`): after any sequence of sets and removals, the root kept by hashing only the edited entries' paths is the root of the same entries hashed whole, and so are the nodes kept.
@@ -208,6 +357,21 @@ By level: 40 tested, 21 simulated, 0 model-checked, 0 proved.
 - **`an_image_and_its_side_file_resolve_as_debug_info_inside`** *tested* (`crates/blaze-link/src/tests/beside.rs`): an executable and its side file resolve every function's rows to the same (function, file, line) as the same program linked with its debug info inside, at its first link, after a body edit taken as a patch of both, and after a rollback.
 - **`a_patched_file_behaves_as_a_fresh_link`** *tested* (`crates/blaze-link/src/tests/patch.rs`): after any sequence of edits (a body changed at the same size, smaller or larger than the room it had, a function added or removed, a callee set changed, a frame entry gained or lost, a static read, dropped or given another value), the file the patches make behaves as a fresh full link of the same program: the same entry, each function's code, each call resolved through its slot to the same function, each static read holding the same bytes, an unwind lookup of each function finding an entry that covers it, and the same function names in the symbol table. Each patch is of the file the last one left, never lays the image out whole, and the digest it gives is the patched file's hashed whole.
   Controls: `a_stale_unwind_entry`, `a_slot_left_on_the_old_body`, `a_removed_function_still_exported`, `a_write_the_digest_missed`, `a_check_of_the_length_alone`.
+
+### blaze-std
+
+- **`a_handler_and_a_net_answer_alike`** *tested* (`crates/blaze-std/src/tests/requests.rs`): `Http::handler` over a function and `Http::over` a `Net` whose peer runs the same function behind HTTP/1.1 give the same answer to the same request (status and body), and narrowed to one origin both refuse a request to the other, the same way.
+  Controls: `an_only_that_is_ignored`.
+
+### hir-ty-lean
+
+- **`structured_code_runs_as_its_graph`** *tested* (`crates/hir-ty-lean/src/tests.rs`): structured control flow reconstructed from a control-flow graph runs as the graph does, from every state, to the same end, variables and trace; and what `reconstruct` returns is well formed and a fixed point of lowering and reconstructing.
+  Controls: `a_continue_made_a_break`, `an_else_branch_dropped_at_a_join`, `an_xor_made_an_add`.
+
+### hir-ty-pure
+
+- **`a_program_optimized_on_facts_behaves_as_written`** *tested* (`crates/hir-ty-pure/src/facts/model.rs`): a program optimized on the facts proved of its functions is seen to do what the program as written does: the same output, the same panic, the same hang. For random small programs (calls by name and through objects, cleanups, guards, panics and hangs that depend on the argument) and every argument, with every [`Spend`] made wherever [`Facts::license`] allows it.
+  Controls: `an_unwind_edge_removed_for_a_callee_that_panics_through_a_dyn_call`, `a_pure_call_hoisted_above_the_branch_guarding_its_panic`, `a_fact_relied_on_but_missing_from_the_key`.
 
 ### linked
 
@@ -224,7 +388,19 @@ By level: 40 tested, 21 simulated, 0 model-checked, 0 proved.
 
 - **`saturation_is_no_dearer_than_naive_rewriting`** (`crates/blaze-diff/src/tests/simplify.rs`): equality saturation that ran to the end finds a term at most as dear as naive rewriting to a fixpoint does, since every term naive rewriting reaches is in the root's class, and extraction takes the cheapest of the class.
 
+### blaze-ext-host
+
+- **`reference`** (`crates/blaze-ext-host/src/facts/tests.rs`): every item from its bottom, whole sweeps until one changes nothing. No components, no order, no cache: the least fixpoint by its definition.
+
 ### blaze-link
 
 - **`Program`** (`crates/blaze-link/src/beside/tests.rs`): a program is its functions by number; what a debugger sees of it is what [`inside`] reads of its debug info made whole.
 - **`Program`** (`crates/blaze-link/src/tests/patch.rs`): a program is its functions by name and its statics' values; what it does is what [`normal`] reads of a fresh link of it.
+
+### blaze-usercode
+
+- **`model`** (`crates/blaze-usercode/src/provider.rs`): the byte at `offset` of what `process` is given by `getrandom`, whatever anyone asked before.
+
+### hir-ty-mir
+
+- **`model_is_acyclic`** (`crates/hir-ty-mir/src/tests/consteval/reach.rs`): `S{root}` can own itself when some cell it owns (at any depth) owns (at any depth) a counted pointer whose pointee owns (at any depth) an `S{root}`. An explicit search with no pruning and no position flag, over the same description.

@@ -1,9 +1,10 @@
 //! The flags cargo gives rustc: a platform's rustflags (`target_info.rs`'s `TargetInfo::new`
 //! and `extra_args`), the `--cfg`s (`features_args`), the `--check-cfg`s (`check_cfg_args`) and
 //! `[lints]` (`parser/mod.rs`'s `lints_to_rustflags`), and blaze's own lints of
-//! `[workspace.metadata.blaze.lints]`.
+//! `[workspace.metadata.blaze.lints]` (or its ratchet) and the crates its baselines hold at `warn`.
 
 use std::cmp::Reverse;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use blaze_lint_defs::Named;
@@ -89,9 +90,20 @@ pub(super) fn kind_info<F: Files>(
 /// flags are for its own platforms (a host's `-C target-cpu=native` is no wasm cpu), and no
 /// `[target.<triple>]` of the user's names blaze's macro platform.
 pub(super) fn macro_wasm_info(triple: &str) -> Result<KindInfo, LoadError> {
-    let cfg_lines =
-        platform::target_cfg(triple, &CfgArgs { proc_macro: true, ..CfgArgs::default() })
-            .map_err(error)?;
+    own_platform_info(triple, true)
+}
+
+/// The kind of the device's units (`artifact = "gpu"`, [`crate::GPU_DEVICE`]), with no
+/// rustflags as the wasm macros': the build's flags are for its own platforms, and no
+/// `[target.<triple>]` of the user's names blaze's device.
+pub(super) fn device_info(triple: &str) -> Result<KindInfo, LoadError> {
+    own_platform_info(triple, false)
+}
+
+/// A platform of blaze's own (the wasm macros', the device's): its cfg, no rustflags.
+fn own_platform_info(triple: &str, proc_macro: bool) -> Result<KindInfo, LoadError> {
+    let cfg_lines = platform::target_cfg(triple, &CfgArgs { proc_macro, ..CfgArgs::default() })
+        .map_err(error)?;
     let cfgs = cfg_lines
         .iter()
         .map(|line| {
@@ -245,27 +257,102 @@ pub(super) fn check_cfg_of<'a>(features: impl ExactSizeIterator<Item = &'a str>)
 /// (E0602), so a `blaze` table there breaks every cargo build; cargo hands rustc no metadata.
 pub(crate) const WORKSPACE_LINTS: &str = "[workspace.metadata.blaze.lints]";
 
+/// The table beside [`WORKSPACE_LINTS`] of the lints a workspace has once what they tell code
+/// to move to is in this blaze: `std_use = "warn"` there is `--warn=blaze::std_use` when the
+/// lint's switch is on (`blaze_lint_defs::ready`) and no flag until then, so a workspace
+/// writes the line before the switch flips. A table of its own, not a level of
+/// [`WORKSPACE_LINTS`]: a released blaze that does not know the lint yet (the stage 0 that
+/// builds this tree) refuses a name it does not know there, and reads no table it does not
+/// know here.
+pub(crate) const WORKSPACE_LINTS_WHEN_READY: &str = "[workspace.metadata.blaze.lints-when-ready]";
+
+/// `[workspace.metadata.blaze.lints-ratchet]`: the levels this blaze reads in place of
+/// [`WORKSPACE_LINTS`] when a workspace has the table, which a released blaze does not read (it
+/// refuses a name it does not know in [`WORKSPACE_LINTS`], and the levels there must hold for
+/// the release that checks the workspace too). Its lints are `deny`, and each crate a lint's
+/// baseline lists is held at `warn` by [`ratchet_downgrades`]: the list only shrinks
+/// (docs/lints.md, "Workspace levels and the ratchet").
+pub(crate) const WORKSPACE_LINTS_RATCHET: &str = "[workspace.metadata.blaze.lints-ratchet]";
+
+/// The key of [`WORKSPACE_LINTS_RATCHET`] naming the directory of the lints' baselines
+/// (blaze-lints' `baseline`), from the workspace's root, beside the levels.
+pub(crate) const RATCHET_BASELINES: &str = "baselines";
+
+/// Which of the workspace's lint tables a table is: what else it holds beside levels.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Table {
+    /// [`WORKSPACE_LINTS`]: levels and [`PROFILE_KEYS`].
+    Levels,
+    /// [`WORKSPACE_LINTS_WHEN_READY`]: levels of lints with a switch, set once it is on.
+    WhenReady,
+    /// [`WORKSPACE_LINTS_RATCHET`]: levels and [`RATCHET_BASELINES`].
+    Ratchet,
+}
+
 /// The level flags of [`WORKSPACE_LINTS`] in `metadata`, the root manifest's
 /// `[workspace.metadata]` (at `manifest`): `hot_alloc = "warn"` is `--warn=blaze::hot_alloc`,
-/// by name. A level that is not `allow`, `warn`, `deny` or `forbid`, a name with a path, or one
-/// that is no lint or group of blaze's, is an error.
+/// by name; then those of [`WORKSPACE_LINTS_WHEN_READY`] whose lint's switch is on. Where the
+/// workspace has [`WORKSPACE_LINTS_RATCHET`], its levels in place of [`WORKSPACE_LINTS`]', after
+/// the second table's, so a line of both is the ratchet's. A level that is not `allow`, `warn`,
+/// `deny` or `forbid`, a name with a path, one that is no lint or group of blaze's, or a lint of
+/// the second table that has no switch, is an error.
 pub(super) fn workspace_lints(
     metadata: Option<&toml::Value>,
     manifest: &Path,
 ) -> Result<Vec<String>, LoadError> {
-    let Some(table) = metadata.and_then(|it| it.get("blaze")).and_then(|it| it.get("lints")) else {
-        return Ok(Vec::new());
+    let blaze = metadata.and_then(|it| it.get("blaze"));
+    let when_ready = ("lints-when-ready", WORKSPACE_LINTS_WHEN_READY, Table::WhenReady);
+    let tables = match blaze.and_then(|it| it.get("lints-ratchet")) {
+        Some(_) => [when_ready, ("lints-ratchet", WORKSPACE_LINTS_RATCHET, Table::Ratchet)],
+        None => [("lints", WORKSPACE_LINTS, Table::Levels), when_ready],
     };
+    // alloc: the workspace's lint flags, once per load
+    let mut flags = Vec::new();
+    for (key, name, kind) in tables {
+        let Some(table) = blaze.and_then(|it| it.get(key)) else { continue };
+        table_flags(table, name, kind, manifest, &mut flags)?;
+    }
+    // The wide groups first, then the narrow ones (`hot`, part of `internal`; `reach`, part of
+    // `general`; `proc_macro`, part of `edition`), then single lints, each by name: the later
+    // flag wins, so `internal = "warn"` with `hot_alloc = "deny"` denies `hot_alloc`, and
+    // `reach = "deny"` outranks `general`.
+    let rank = |flag: &String| {
+        let name = flag.split_once('=').map_or("", |it| it.1);
+        let order = match name {
+            "blaze::general" | "blaze::internal" | "blaze::pedantic_perf" | "blaze::edition" => 0,
+            "blaze::hot" | "blaze::reach" | "blaze::proc_macro" => 1,
+            _ => 2,
+        };
+        (order, name.to_owned()) // alloc: a sort key of a few flags, once per load
+    };
+    flags.sort_by_cached_key(rank);
+    Ok(flags)
+}
+
+/// Adds to `flags` the level flag of each line of `table`, the table `name` of `manifest`, of
+/// the `kind`: every level, or of [`Table::WhenReady`] those whose lint's switch is on.
+fn table_flags(
+    table: &toml::Value,
+    name: &str,
+    kind: Table,
+    manifest: &Path,
+    flags: &mut Vec<String>,
+) -> Result<(), LoadError> {
     let wrong = |what: String| LoadError {
-        what: format!("{WORKSPACE_LINTS} in {}: {what}", manifest.display()),
+        what: format!("{name} in {}: {what}", manifest.display()),
         at: Some(manifest.display().to_string()),
     };
     let table =
         table.as_table().ok_or_else(|| wrong("is a table of lint names to levels".to_owned()))?;
-    let mut flags = Vec::with_capacity(table.len());
     for (lint, level) in table {
-        // The profile the profile lints read is configuration, not a level ([`workspace_profile`]).
-        if PROFILE_KEYS.contains(&lint.as_str()) {
+        // The profile the profile lints read is configuration, not a level ([`workspace_profile`]),
+        // and so is the ratchet's directory of baselines ([`ratchet_downgrades`]).
+        let configuration = match kind {
+            Table::Levels => PROFILE_KEYS.contains(&lint.as_str()),
+            Table::WhenReady => false,
+            Table::Ratchet => lint == RATCHET_BASELINES,
+        };
+        if configuration {
             continue;
         }
         if lint.contains(':') {
@@ -289,22 +376,88 @@ pub(super) fn workspace_lints(
                 )));
             }
         };
+        if kind == Table::WhenReady {
+            match blaze_lint_defs::ready::switch_of(lint) {
+                Some(true) => {}
+                Some(false) => continue,
+                None => {
+                    return Err(wrong(format!(
+                        "`{lint}` has no switch in blaze-lint-defs' `ready` to wait for: set its level in {WORKSPACE_LINTS}"
+                    )));
+                }
+            }
+        }
         flags.push(format!("{flag}=blaze::{lint}"));
     }
-    // The wide groups first, then the narrow ones (`hot`, part of `internal`; `reach`, part of
-    // `general`), then single lints, each by name: the later flag wins, so `internal = "warn"`
-    // with `hot_alloc = "deny"` denies `hot_alloc`, and `reach = "deny"` outranks `general`.
-    let rank = |flag: &String| {
-        let name = flag.split_once('=').map_or("", |it| it.1);
-        let order = match name {
-            "blaze::general" | "blaze::internal" | "blaze::pedantic_perf" => 0,
-            "blaze::hot" | "blaze::reach" => 1,
-            _ => 2,
-        };
-        (order, name.to_owned()) // alloc: a sort key of a few flags, once per load
+    Ok(())
+}
+
+/// The flags that hold a member at `warn` under [`WORKSPACE_LINTS_RATCHET`] in `metadata` (the
+/// root manifest's `[workspace.metadata]`, at `manifest`), by package name: `--warn=blaze::LINT`
+/// for each `blaze.LINT.txt` of the directory its [`RATCHET_BASELINES`] names, from the
+/// workspace's root `ws_root`, that lists the package (blaze-lints' `baseline`: a line
+/// `crate<TAB>count` or `crate<TAB>unmeasured` per crate). They go after the workspace's flags,
+/// so they win over its `deny`, and before the package's own `[lints]`. None without a ratchet.
+/// A ratchet with no directory, a directory that cannot be listed, a `blaze.*.txt` of no lint of
+/// blaze's or a line that does not read is an error naming it: never a crate quietly left at
+/// `deny` or at `warn`. The other files (`TARGET`, clippy's baselines) set no level here. Read
+/// through `files`, as the manifests are, so a changed baseline is a changed load.
+pub(super) fn ratchet_downgrades<F: Files>(
+    files: &F,
+    metadata: Option<&toml::Value>,
+    manifest: &Path,
+    ws_root: &Path,
+) -> Result<BTreeMap<String, Vec<String>>, LoadError> {
+    let mut downgrades = BTreeMap::new();
+    let ratchet = metadata.and_then(|it| it.get("blaze")).and_then(|it| it.get("lints-ratchet"));
+    let Some(ratchet) = ratchet else { return Ok(downgrades) };
+    let wrong = |what: String| LoadError {
+        what: format!("{WORKSPACE_LINTS_RATCHET} in {}: {what}", manifest.display()),
+        at: Some(manifest.display().to_string()),
     };
-    flags.sort_by_cached_key(rank);
-    Ok(flags)
+    let Some(dir) = ratchet.get(RATCHET_BASELINES).and_then(toml::Value::as_str) else {
+        return Err(wrong(format!(
+            "`{RATCHET_BASELINES}` names the directory of the lints' baselines, which list each crate a lint is held at `warn` in"
+        )));
+    };
+    let dir = ws_root.join(dir);
+    let names = files
+        .list(&dir)
+        .map_err(|why| wrong(format!("its baselines' directory {}: {why}", dir.display())))?;
+    for (name, is_dir) in names {
+        let Some(lint) = name.strip_prefix("blaze.").and_then(|it| it.strip_suffix(".txt")) else {
+            continue;
+        };
+        let path = dir.join(&name);
+        let shown = path.display();
+        // alloc: a lint's full name, once per baseline
+        let named = blaze_lint_defs::named(&format!("blaze::{lint}"));
+        if is_dir || !matches!(named, Named::Lint(_)) {
+            return Err(wrong(format!("{shown} is the baseline of no lint of blaze's (`blaze::{lint}`)")));
+        }
+        let bytes = files.read(&path).map_err(|why| wrong(format!("{shown}: {why}")))?;
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| wrong(format!("{shown}: stream did not contain valid UTF-8")))?;
+        for (at, line) in text.lines().enumerate() {
+            let held = |count: &str| {
+                count == "unmeasured" || count.parse::<u32>().is_ok_and(|it| it > 0)
+            };
+            let Some((krate, _)) =
+                line.split_once('\t').filter(|(krate, count)| !krate.is_empty() && held(count))
+            else {
+                return Err(wrong(format!(
+                    "{shown}:{}: `{line}` is not `crate<TAB>count` with a count above 0, nor `crate<TAB>unmeasured`",
+                    at + 1
+                )));
+            };
+            downgrades
+                .entry(krate.to_owned())
+                .or_insert_with(Vec::new)
+                // alloc: a crate's flag, once per baseline line per load
+                .push(format!("--warn=blaze::{lint}"));
+        }
+    }
+    Ok(downgrades)
 }
 
 /// The keys of [`WORKSPACE_LINTS`] that name the profile blaze's profile lints read

@@ -278,6 +278,26 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
                 let fields = self.lower_tuple_fields(args, arity, ellipsis)?;
                 self.variant_pat(pat, ty, variant, fields, arity)?
             }
+            // blaze: a record pattern `{ a, b: x }` (`#![blaze::records]`): core's `Record`
+            // struct around the tuple of the record's fields, each field named at its place
+            // in the tuple and the rest wildcards.
+            HirPat::Record { args, .. }
+                if let Some(of) = hir_ty::record::record_fields(
+                    self.cx.infcx.interner.lang_items(),
+                    ty,
+                ) =>
+            {
+                let record = self.cx.infcx.interner.lang_items().Record.ok_or(LowerError::Failed)?;
+                let mut fields = Vec::with_capacity(args.len());
+                for field in args {
+                    let at = of.index_of(field.name.as_str()).ok_or(LowerError::Failed)?;
+                    fields.push(self.lower(field.pat)?.at_index(at));
+                }
+                let tuple = of.tuple(self.cx.infcx.interner);
+                let inner = Self::new_pat(Constructor::Struct, fields, of.len(), tuple, pat);
+                // alloc: the one field `DeconstructedPat::new` takes.
+                self.variant_pat(pat, ty, VariantId::StructId(record), vec![inner.at_index(0)], 1)?
+            }
             HirPat::Record { args, .. } => {
                 let variant =
                     self.infer.variant_resolution_for_pat(pat).ok_or(LowerError::Failed)?;
@@ -410,7 +430,8 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
         fields: Vec<IndexedPat<Cx<'a, 'db>>>,
         arity: usize,
     ) -> Result<Pat<'a, 'db>, LowerError> {
-        let ctor = match (ty.kind(), variant) {
+        // blaze: a variant of a refinement `T is PAT` is its base's.
+        let ctor = match (hir_ty::pattern_types::base(ty).kind(), variant) {
             (TyKind::Adt(..), VariantId::EnumVariantId(v)) => {
                 Constructor::Variant(VariantIdx::of(self.cx.db, v))
             }

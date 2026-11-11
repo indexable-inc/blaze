@@ -592,6 +592,28 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                     (Some(Word::blaze), Some(Word::nonblocking)) => {
                         attr_flags.insert(AttrFlags::NONBLOCKING)
                     }
+                    // `#[blaze::may(panic, alloc)]`: the list is [`AttrFlags::may_attr`]'s to
+                    // read and refuse.
+                    (Some(Word::blaze), Some(Word::may)) => attr_flags.insert(AttrFlags::MAY),
+                    // `#[blaze::multiversion("x86-64-v3", "avx512f")]`; the levels are
+                    // [`AttrFlags::multiversion_levels`]'s to read.
+                    (Some(Word::blaze), Some(Word::multiversion)) => {
+                        attr_flags.insert(AttrFlags::BLAZE_MULTIVERSION)
+                    }
+                    // `#[blaze::drop(early)]`, `#[blaze::drop(early, trusted = "why")]` and
+                    // `#[blaze::drop(scoped)]` on a type; anything else sets no flag, and
+                    // both words set both, which `hir_ty_mir::mir::early_drop` refuses.
+                    (Some(Word::blaze), Some(Word::drop)) => {
+                        if tt_has_token(tt, "early") {
+                            attr_flags.insert(AttrFlags::DROP_EARLY);
+                            if tt_has_token(tt, "trusted") {
+                                attr_flags.insert(AttrFlags::DROP_TRUSTED);
+                            }
+                        }
+                        if tt_has_token(tt, "scoped") {
+                            attr_flags.insert(AttrFlags::DROP_SCOPED);
+                        }
+                    }
                     _ => {}
                 },
             }
@@ -721,6 +743,7 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                 }
                 (Some(Word::blaze), Some(Word::may_suspend)) => AttrFlags::MAY_SUSPEND,
                 (Some(Word::blaze), Some(Word::sans_io)) => AttrFlags::SANS_IO,
+                (Some(Word::blaze), Some(Word::capabilities)) => AttrFlags::CAPABILITIES,
                 (Some(Word::blaze), Some(Word::checkfree)) => AttrFlags::CHECKFREE,
                 (Some(Word::blaze), Some(Word::pure)) => AttrFlags::PURE,
                 (Some(Word::blaze), Some(Word::differentiable)) => AttrFlags::DIFFERENTIABLE,
@@ -732,10 +755,19 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                 (Some(Word::blaze), Some(Word::nopanic)) => AttrFlags::NOPANIC,
                 (Some(Word::blaze), Some(Word::noalloc)) => AttrFlags::NOALLOC,
                 (Some(Word::blaze), Some(Word::nonblocking)) => AttrFlags::NONBLOCKING,
+                (Some(Word::blaze), Some(Word::norefcount)) => AttrFlags::NOREFCOUNT,
+                (Some(Word::blaze), Some(Word::may)) => AttrFlags::MAY,
+                (Some(Word::blaze), Some(Word::effects)) => AttrFlags::BLAZE_EFFECTS,
                 (Some(Word::blaze), Some(Word::linear)) => AttrFlags::LINEAR,
                 (Some(Word::blaze), Some(Word::consumes)) => AttrFlags::CONSUMES,
+                (Some(Word::blaze), Some(Word::holds)) => AttrFlags::HOLDS,
+                (Some(Word::blaze), Some(Word::memo)) => AttrFlags::BLAZE_MEMO,
                 (Some(Word::blaze), Some(Word::reflect)) => AttrFlags::BLAZE_REFLECT,
                 (Some(Word::blaze), Some(Word::sealed)) => AttrFlags::BLAZE_SEALED,
+                (Some(Word::blaze), Some(Word::multiversion)) => AttrFlags::BLAZE_MULTIVERSION,
+                (Some(Word::blaze), Some(Word::program_lifetime)) => {
+                    AttrFlags::BLAZE_PROGRAM_LIFETIME
+                }
                 (Some(Word::clippy), Some(Word::has_significant_drop)) => {
                     AttrFlags::HAS_SIGNIFICANT_DROP
                 }
@@ -902,6 +934,7 @@ name_set! {
     bench,
     bits,
     blaze,
+    capabilities,
     checkfree,
     clippy,
     cold,
@@ -911,12 +944,15 @@ name_set! {
     define_opaque,
     deprecated,
     diagnostic,
+    effects,
     differentiable,
     do_not_recommend,
     doc,
+    drop,
     export_name,
     fundamental,
     has_significant_drop,
+    holds,
     ignore,
     inline,
     instruction_set,
@@ -929,8 +965,11 @@ name_set! {
     macro_export,
     macro_style,
     marker,
+    may,
     may_dangle,
     may_suspend,
+    memo,
+    multiversion,
     must_not_suspend,
     must_use,
     naked,
@@ -940,12 +979,14 @@ name_set! {
     non_exhaustive,
     nonblocking,
     nopanic,
+    norefcount,
     optimize,
     panic_handler,
     path,
     pointee,
     prefer_underscore_import,
     proc_macro_derive,
+    program_lifetime,
     pure,
     reflect,
     repr,
@@ -1193,18 +1234,60 @@ bitflags::bitflags! {
         /// `#[blaze::nonblocking]` or `#[blaze::nonblocking(..)]`: as [`AttrFlags::NOPANIC`],
         /// for no call that blocks the thread (`blaze::nonblocking`).
         const NONBLOCKING = 1 << 99;
+        /// `#[blaze::memo]`, a word, on a function: a blaze extension (inert under rustc with
+        /// `#![register_tool(blaze)]`), the function is a memo point of `bstd::eval`
+        /// (docs/v2/plan/design/std.md, "Eval"). It is held pure as if written
+        /// `#[blaze::pure]` ([`AttrFlags::pure_attr`] answers `Checked` for it), and its item
+        /// type alone is `core::reflect::MemoPoint` (`hir_ty::comptime::reflect_is_memo_point`).
+        /// It changes diagnostics and which trait goals hold, never code: no codegen key reads
+        /// it.
+        const BLAZE_MEMO = 1 << 112;
+        /// `#[blaze::may]` or `#[blaze::may(..)]` on a function, a trait or (as an inner
+        /// attribute) a module or the crate: the effects it may have, the positive spelling of
+        /// the three above and the only one of `diverge` (docs/v2/plan/design/effects.md). Inert
+        /// under rustc with `#![register_tool(blaze)]`; [`AttrFlags::may_attr`] reads the list.
+        const MAY = 1 << 101;
+        /// `#![blaze::effects]` at a crate's root: every function of the crate with no
+        /// `#[blaze::may(..)]` of its own, and no module's above it, may have no effect, checked
+        /// (the gate the blaze edition will turn on; `blaze::undeclared_effect`).
+        const BLAZE_EFFECTS = 1 << 102;
         /// `#[blaze::sealed]`, a word, on a trait: a blaze extension (inert under rustc with
         /// `#![register_tool(blaze)]`). No crate but the trait's may implement it or name it as
         /// a supertrait, and when every impl of it is for a local type, a type parameter
         /// bounded by it counts as local in its crate's orphan check
         /// (`TraitFlags::SEALED`, `hir_ty::sealed_local_bound`, `hir-ty-coherence`).
         const BLAZE_SEALED = 1 << 100;
+        /// `#![blaze::capabilities]`, a word, inner, on a crate root: a blaze extension (inert
+        /// under rustc with `#![register_tool(blaze)]`), read by blaze-lints'
+        /// `blaze::capabilities`: no function of the crate may reach ambient IO, `unsafe` code
+        /// or the global heap outside the workspace's trusted crates (hir-ty-pure's `ambient`,
+        /// `unsafe` and `global_alloc`, docs/v2/plan/design/std.md). It changes diagnostics,
+        /// never code: no codegen key reads it.
+        const CAPABILITIES = 1 << 113;
+        /// `#[blaze::norefcount]`, a word, on a function or method: a blaze extension (inert
+        /// under rustc with `#![register_tool(blaze)]`). Under `#![blaze::handles]`, each copy
+        /// of a handle the body would otherwise make where it moves one is an error naming the
+        /// line and the handle (`hir_ty_mir::mir::handles::norefcount_errors`, reported with
+        /// the borrow check's). It changes diagnostics, never code.
+        const NOREFCOUNT = 1 << 114;
         /// `#[blaze::differentiable]` or `#[blaze::differentiable(..)]`, on a function: a blaze
         /// extension (inert under rustc with `#![register_tool(blaze)]`), read by
         /// `blaze-diff-mir` ([`AttrFlags::differentiable_attr`], docs/future/autodiff.md): the
         /// function has a derivative blaze can be asked for. It changes no code of a function
         /// that is not asked for its derivative: no codegen key reads it.
-        const DIFFERENTIABLE = 1 << 101;
+        const DIFFERENTIABLE = 1 << 103;
+        /// `#[blaze::drop(early)]` on a struct, enum or union with a `Drop` impl: a blaze
+        /// extension (inert under rustc with `#![register_tool(blaze)]`). Under
+        /// `#![blaze::early_drop]` a value of the type is dropped after its last use
+        /// (docs/v2/plan/design/early-drop.md): the impl must only free memory
+        /// (`hir_ty_pure::drop_effects`), unless [`AttrFlags::DROP_TRUSTED`] says otherwise.
+        const DROP_EARLY = 1 << 105;
+        /// `#[blaze::drop(scoped)]` on a type: a value of it, and of any type that holds one,
+        /// is dropped where its scope ends, as in Rust, whatever its destructor does.
+        const DROP_SCOPED = 1 << 106;
+        /// `#[blaze::drop(early, trusted = "why")]`: [`AttrFlags::DROP_EARLY`] asserted, the
+        /// destructor not checked (a pooled buffer whose drop gives it back to its pool).
+        const DROP_TRUSTED = 1 << 107;
         /// `#[blaze::linear]`, a word: a blaze extension (inert under rustc with
         /// `#![register_tool(blaze)]`), read by `hir-ty-linear`
         /// (docs/v2/plan/design/linear.md). On a struct or enum: a value of it may not be
@@ -1216,6 +1299,13 @@ bitflags::bitflags! {
         /// linear types its by-value parameters have end, so in its body those types are not
         /// linear (`hir-ty-linear`). It changes diagnostics, never code.
         const CONSUMES = 1 << 111;
+        /// `#[blaze::holds]`, a word, on a struct or enum: a value of it holds a value of each
+        /// of its type arguments although no field does (behind a raw or counted pointer), so
+        /// it holds a linear value when an argument does, and the bodies of its own crate's
+        /// impls of it, which move those values in and out by trusted code, are not checked
+        /// for them (`hir-ty-linear`, docs/v2/plan/design/linear.md, rule 7). It changes
+        /// diagnostics, never code.
+        const HOLDS = 1 << 109;
         /// `#[rustc_specialization_trait]`, one segment, on a trait: rustc's
         /// `TraitSpecializationKind::AlwaysApplicable` (`TraitFlags::SPECIALIZATION_ALWAYS_APPLICABLE`).
         const RUSTC_SPECIALIZATION_TRAIT = 1 << 120;
@@ -1237,6 +1327,21 @@ bitflags::bitflags! {
         /// reflection reads and writes every field, private ones too (`hir_ty_comptime`'s
         /// `struct_domain`, docs/v2/plan/design/comptime.md "Which fields").
         const BLAZE_REFLECT = 1 << 124;
+        /// `#[blaze::multiversion]`, a word or with a list of levels, on a function: a blaze
+        /// extension (inert under rustc with `#![register_tool(blaze)]`), the function is
+        /// compiled once per level of target features and the best one the CPU has is picked
+        /// when the program starts (docs/v2/plan/design/simd.md). The levels are
+        /// [`AttrFlags::multiversion_levels`]'s; it changes code generation only, never what
+        /// the function means.
+        const BLAZE_MULTIVERSION = 1 << 125;
+        /// `#[blaze::program_lifetime]`, a word, on a struct or enum: a blaze extension (inert
+        /// under rustc with `#![register_tool(blaze)]`), a declared type fact
+        /// (docs/v2/plan/design/facts.md): instances live until the program exits. `hir-ty-pure`'s
+        /// `program_lifetime` checks what the type itself must be for that (no `Drop`, nothing
+        /// in it to drop, no type parameter, not public unless its crate opts in) or refuses it
+        /// naming the field path (`blaze::program_lifetime`). It changes diagnostics, never code: no codegen
+        /// key reads the bit.
+        const BLAZE_PROGRAM_LIFETIME = 1 << 126;
         /// `#[clippy::has_significant_drop]`, a word, on a struct or enum: dropping a value of
         /// it does something another part of the program can see (releases a lock, ends a
         /// borrow), read by blaze-lints' `significant_drop_tightening`. It changes diagnostics,
@@ -1781,6 +1886,10 @@ pub enum EffectWord {
 }
 
 impl EffectWord {
+    /// Every effect word, in the order of its index.
+    pub const ALL: [EffectWord; 3] =
+        [EffectWord::Nopanic, EffectWord::Noalloc, EffectWord::Nonblocking];
+
     /// The word, as written after `blaze::`.
     pub const fn text(self) -> &'static str {
         match self {
@@ -1798,6 +1907,118 @@ impl EffectWord {
             EffectWord::Nonblocking => AttrFlags::NONBLOCKING,
         }
     }
+
+    /// The word of `#[blaze::may(..)]` this spelling promises the absence of.
+    pub const fn may(self) -> MayWord {
+        match self {
+            EffectWord::Nopanic => MayWord::Panic,
+            EffectWord::Noalloc => MayWord::Alloc,
+            EffectWord::Nonblocking => MayWord::Block,
+        }
+    }
+}
+
+/// A word of `#[blaze::may(..)]`: an effect a function is allowed to have. The positive
+/// spelling: what is not listed, the function does not have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum MayWord {
+    /// `panic`: it may panic or abort (the absence `#[blaze::nopanic]` promises).
+    Panic,
+    /// `alloc`: it may call the global allocator (`#[blaze::noalloc]`).
+    Alloc,
+    /// `block`: it may block the thread (`#[blaze::nonblocking]`).
+    Block,
+    /// `diverge`: it may not return: a loop not proven bounded, or recursion. No negative
+    /// spelling.
+    Diverge,
+}
+
+impl MayWord {
+    /// Every word, in the order of its index and the order a list is written in.
+    pub const ALL: [MayWord; 4] =
+        [MayWord::Panic, MayWord::Alloc, MayWord::Block, MayWord::Diverge];
+
+    /// The word, as written in the list.
+    pub const fn text(self) -> &'static str {
+        match self {
+            MayWord::Panic => "panic",
+            MayWord::Alloc => "alloc",
+            MayWord::Block => "block",
+            MayWord::Diverge => "diverge",
+        }
+    }
+
+    /// The word written `text`.
+    pub fn of(text: &str) -> Option<MayWord> {
+        MayWord::ALL.into_iter().find(|it| it.text() == text)
+    }
+
+    /// Its bit in a [`MayAttr::words`].
+    pub const fn bit(self) -> u8 {
+        1 << self as u8
+    }
+}
+
+/// What `#[blaze::may(..)]` on an item says.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MayAttr {
+    /// The words listed, a [`MayWord::bit`] each.
+    pub words: u8,
+    /// `trusted = "why"` after the words: the list is taken at its word, not checked.
+    pub trusted: Option<Symbol>,
+    /// The list's text when it is not words separated by commas with at most one
+    /// `trusted = "why"` at its end.
+    pub malformed: Option<Symbol>,
+}
+
+impl MayAttr {
+    /// Whether `word` is listed.
+    pub const fn has(&self, word: MayWord) -> bool {
+        self.words & word.bit() != 0
+    }
+}
+
+/// What the arguments of `#[blaze::may(..)]` say: words of [`MayWord`] separated by commas
+/// (each once, a trailing comma allowed), then at most one `trusted = "why"`.
+fn may_args(tt: ast::TokenTree<'_>) -> MayAttr {
+    let malformed = |words| MayAttr {
+        words,
+        trusted: None,
+        malformed: Some(Symbol::intern(&tt.syntax().text().to_string())),
+    };
+    let mut words = 0u8;
+    let mut trusted = None;
+    let mut tokens = TokenTreeChildren::new(tt).peekable();
+    while let Some(token) = tokens.next() {
+        let NodeOrToken::Token(key) = token else { return malformed(words) };
+        if key.kind() != SyntaxKind::IDENT || trusted.is_some() {
+            return malformed(words);
+        }
+        if key.text() == "trusted" {
+            let (Some(NodeOrToken::Token(eq)), Some(NodeOrToken::Token(value))) =
+                (tokens.next(), tokens.next())
+            else {
+                return malformed(words);
+            };
+            let reason = ast::String::cast(value).and_then(|it| it.value().ok());
+            match reason {
+                Some(reason) if eq.kind() == T![=] => trusted = Some(Symbol::intern(&reason)),
+                _ => return malformed(words),
+            }
+        } else {
+            match MayWord::of(key.text()) {
+                Some(word) if words & word.bit() == 0 => words |= word.bit(),
+                _ => return malformed(words),
+            }
+        }
+        match tokens.next() {
+            None => break,
+            Some(NodeOrToken::Token(comma)) if comma.kind() == T![,] => {}
+            Some(_) => return malformed(words),
+        }
+    }
+    MayAttr { words, trusted, malformed: None }
 }
 
 /// Whether `path` is the two segments `blaze::<word>`.
@@ -1818,6 +2039,13 @@ pub enum BitsBacking {
     Explicit(rustc_abi::Integer),
     /// `#[blaze::bits(..)]` with arguments that are none of these: their text, for the error.
     Malformed(Symbol),
+}
+
+/// Whether `path` is the two segments `blaze::multiversion`.
+fn is_blaze_multiversion(path: Option<ast::Path<'_>>) -> bool {
+    path.and_then(up_to_two_segments).is_some_and(|(first, second)| {
+        name_text(first) == "blaze" && second.is_some_and(|it| name_text(it) == "multiversion")
+    })
 }
 
 /// Whether `path` is the two segments `blaze::bits`.
@@ -2161,10 +2389,13 @@ impl AttrFlags {
     }
 
     /// What `#[blaze::pure]` on `owner` says ([`PureAttr`]); `None` without it, one bit test.
+    /// `#[blaze::memo]` without it says `Checked`: a memo point is held pure, so every reader
+    /// of this (the lint `blaze::pure`, the purity check) holds it with no rule of its own.
     #[inline]
     pub fn pure_attr(db: &Db, owner: AttrDefId) -> Option<PureAttr> {
-        if !AttrFlags::query(db, owner).contains(AttrFlags::PURE) {
-            return None;
+        let flags = AttrFlags::query(db, owner);
+        if !flags.contains(AttrFlags::PURE) {
+            return flags.contains(AttrFlags::BLAZE_MEMO).then_some(PureAttr::Checked);
         }
         return pure_attr(db, owner);
 
@@ -2177,6 +2408,35 @@ impl AttrFlags {
                         match attr.token_tree() {
                             Some(tt) => pure_args(tt),
                             None => PureAttr::Checked,
+                        }
+                    }
+                    _ => return ControlFlow::Continue(()),
+                };
+                ControlFlow::Break(read)
+            })
+        }
+    }
+
+    /// What `#[blaze::may(..)]` on `owner` (a function, a trait, or a module or the crate's root
+    /// for the inner attribute) says ([`MayAttr`]); `None` without it, one bit test.
+    #[inline]
+    pub fn may_attr(db: &Db, owner: AttrDefId) -> Option<MayAttr> {
+        if !AttrFlags::query(db, owner).contains(AttrFlags::MAY) {
+            return None;
+        }
+        return may_attr(db, owner);
+
+        #[blaze_query::tracked(returns(clone), mem_tag = Nameres)]
+        fn may_attr(db: &Db, owner: AttrDefId) -> Option<MayAttr> {
+            collect_attrs(db, owner, |attr| {
+                let read = match attr {
+                    ast::Meta::PathMeta(attr) if is_blaze_word(attr.path(), "may") => {
+                        MayAttr { words: 0, trusted: None, malformed: None }
+                    }
+                    ast::Meta::TokenTreeMeta(attr) if is_blaze_word(attr.path(), "may") => {
+                        match attr.token_tree() {
+                            Some(tt) => may_args(tt),
+                            None => MayAttr { words: 0, trusted: None, malformed: None },
                         }
                     }
                     _ => return ControlFlow::Continue(()),
@@ -2228,12 +2488,12 @@ impl AttrFlags {
         // clone: a handle of an interned reason
         return effect_attrs(db, owner)[effect as usize].clone();
 
-        /// The three effect attributes of `owner` at once, by [`EffectWord`]'s index: an
+        /// The effect attributes of `owner` at once, by [`EffectWord`]'s index: an
         /// item with one of them has the others read in the same pass over its attributes.
         #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
         fn effect_attrs(db: &Db, owner: AttrDefId) -> [Option<PureAttr>; 3] {
             let mut read: [Option<PureAttr>; 3] = [None, None, None];
-            for effect in [EffectWord::Nopanic, EffectWord::Noalloc, EffectWord::Nonblocking] {
+            for effect in EffectWord::ALL {
                 let word = effect.text();
                 read[effect as usize] = collect_attrs(db, owner, |attr| {
                     let it = match attr {
@@ -2533,6 +2793,40 @@ impl AttrFlags {
             ControlFlow::Continue(())
         });
         result
+    }
+
+    /// The levels `#[blaze::multiversion(..)]` on `owner` names, in the order written (least
+    /// preferred first): each string literal of its list. `None` without the attribute, one
+    /// bit test; `Some` of no level for the bare word, which asks for the target's defaults
+    /// (`target_features::multiversion::default_levels`). A token of the list that is no
+    /// string literal is kept as its text, so the plan refuses it by name. Read once per
+    /// multiversioned function a unit compiles, so it is no query.
+    pub fn multiversion_levels(db: &Db, owner: FunctionId) -> Option<Vec<Symbol>> {
+        if !AttrFlags::query(db, owner.into()).contains(AttrFlags::BLAZE_MULTIVERSION) {
+            return None;
+        }
+        // alloc: only a function with `#[blaze::multiversion]`; the caller owns the list
+        let mut levels = Vec::new();
+        collect_attrs::<Infallible>(db, owner.into(), |attr| {
+            if let ast::Meta::TokenTreeMeta(attr) = attr
+                && is_blaze_multiversion(attr.path())
+                && let Some(tt) = attr.token_tree()
+            {
+                for token in TokenTreeChildren::new(tt) {
+                    let NodeOrToken::Token(token) = token else { continue };
+                    if token.kind() == T![,] {
+                        continue;
+                    }
+                    let level = match ast::String::cast(token).and_then(|it| it.value().ok()) {
+                        Some(level) => Symbol::intern(&level),
+                        None => Symbol::intern(token.text()),
+                    };
+                    levels.push(level);
+                }
+            }
+            ControlFlow::Continue(())
+        });
+        Some(levels)
     }
 
     /// What `#[doc(test(attr(..)))]` on `owner` (cfg_attr expanded, a crate root's inner and

@@ -1744,9 +1744,27 @@ pub struct Uring {
     /// Made for the first [`Effect::Stamp`].
     stampers: Option<Stampers>,
     offload: Offload,
+    /// The datagrams, the standard streams, the clock and randomness ([`crate::host`]), told
+    /// as work off the ring is ([`HostSink`]).
+    host: crate::host::Host,
     /// The file locks of [`Effect::Lock`], each taken as it is asked for.
     locks: crate::locks::Locks,
     in_flight: usize,
+}
+
+/// Where the host's effects are told: the channel of the work off the ring, and its wake.
+struct HostSink {
+    done: crossbeam_channel::Sender<Completion>,
+    wake: Arc<Wake>,
+}
+
+impl crate::host::Sink for HostSink {
+    fn tell(&self, completion: Completion) {
+        // A driver dropped meanwhile takes nothing; the descriptor is kept open by `wake`.
+        if self.done.send(completion).is_ok() {
+            wake_ring(&self.wake);
+        }
+    }
 }
 
 /// A temporary's number, counted from the top half so that it never meets one of
@@ -1757,6 +1775,7 @@ impl Uring {
     /// A driver whose files are under `root`, or why this kernel has no ring for it.
     pub fn new(root: impl Into<PathBuf>) -> io::Result<Uring> {
         let ring = Ring::new(ENTRIES, COMPLETIONS)?;
+        let offload = Offload::new()?;
         let table = Table::new(&ring.fd)?;
         let provided = ManuallyDrop::new(Provided::new(ring.fd.as_raw_fd())?);
         fn slab<T>(max: u32) -> io::Result<Slab<T>> {
@@ -1801,7 +1820,12 @@ impl Uring {
             buffers: Vec::with_capacity(SPARES), // alloc: setup, once per driver.
             trees: Vec::with_capacity(SPARES),   // alloc: setup, once per driver.
             stampers: None,
-            offload: Offload::new()?,
+            host: crate::host::Host::new(Arc::new(HostSink {
+                // clone: setup, a channel's handle and a count of the wake, for the host.
+                done: offload.sender.clone(),
+                wake: Arc::clone(&offload.wake),
+            })), // alloc: setup, once per driver.
+            offload,
             locks: crate::locks::Locks::new(),
             in_flight: 0,
         })
@@ -2365,6 +2389,14 @@ impl Driver for Uring {
                     self.kill(tag);
                     continue;
                 }
+                // The host's, told as work off the ring is: the ring reads its wake until the
+                // completion is in.
+                effect if crate::host::Host::takes(&effect) => {
+                    self.in_flight += 1;
+                    self.offloaded(tag);
+                    self.host.submit(effect);
+                    continue;
+                }
                 _ => {}
             }
             self.in_flight += 1;
@@ -2388,6 +2420,8 @@ impl Driver for Uring {
                 // On a thread of its own (`sync_file_range`, waited for there): the ring's
                 // submitter never waits for a device, and the asker waits for nothing.
                 back @ Effect::WriteBack { .. } => self.off_ring(back).map(|()| None),
+                // A directory's `fsync`, waited for on a thread of its own as a list is.
+                names @ Effect::SyncDir { .. } => self.off_ring(names).map(|()| None),
                 list @ Effect::List { .. } => self.off_ring(list).map(|()| None),
                 private @ Effect::Private { .. } => self.off_ring(private).map(|()| None),
                 Effect::WriteAt { file, at, bytes, .. } => {
@@ -2418,6 +2452,11 @@ impl Driver for Uring {
                     crate::threads::read_link(&self.root, &file).map(Some)
                 }
                 Effect::Remove { file, .. } => self.remove(tag, &file).map(|()| None),
+                // One `mkdir` or `rmdir` here on the driver's thread, as a mode is set: the
+                // ring's `IORING_OP_MKDIRAT` and `IORING_OP_UNLINKAT` are not used for them yet.
+                effect @ (Effect::MakeDir { .. } | Effect::RemoveDir { .. }) => {
+                    crate::threads::run(&self.root, effect).map(Some)
+                }
                 // No io_uring op takes a lock, and `flock` without waiting is one call: here on
                 // the driver's thread, as a mode is set.
                 Effect::Lock { file, mode, .. } => {
@@ -2442,9 +2481,17 @@ impl Driver for Uring {
                 Effect::Stamp { files, .. } => self.sweep(tag, files).map(|()| None),
                 Effect::Entries { dir, .. } => self.list(tag, dir).map(|()| None),
                 Effect::Flush { watch, .. } => self.flush(watch, tag).map(|()| None),
-                Effect::Unwatch { .. } | Effect::Unlisten { .. } | Effect::Kill { .. } => {
-                    unreachable!("taken above")
-                }
+                Effect::Unwatch { .. }
+                | Effect::Unlisten { .. }
+                | Effect::Kill { .. }
+                | Effect::Bind { .. }
+                | Effect::SendTo { .. }
+                | Effect::RecvFrom { .. }
+                | Effect::Unbind { .. }
+                | Effect::ReadStdin { .. }
+                | Effect::WriteOut { .. }
+                | Effect::Now { .. }
+                | Effect::Random { .. } => unreachable!("taken above"),
                 // Of a file kept for appending, through its descriptor, after what was asked
                 // of it before; of any other, the file at its name now, opened for the read
                 // alone. Its buffer is the file's size, once it is open (a missing file's,
