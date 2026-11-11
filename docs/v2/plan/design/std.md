@@ -1,7 +1,7 @@
 ---
 status: plan
 summary: blaze's own standard library, written from scratch on core and alloc. No ambient authority (main receives an Io and every function touches only what it is handed), sans-IO underneath (one Io over io_uring, kqueue, IOCP and the simulation), and every blaze crate moves onto it.
-date: 2026-11-09
+date: 2026-11-10
 ---
 # bstd: blaze's standard library
 
@@ -19,12 +19,14 @@ not use Rust's `std`. Three properties define it:
    io_uring, kqueue, IOCP and the deterministic simulation, and code above it cannot tell which.
 3. **Explicit context and memory.** Every task has a `Cx` that says how long it may run, whether
    it was cancelled, what span it is and where its scratch memory comes from. Nothing allocates
-   from a hidden global heap: memory comes from an allocator the code was handed.
+   from a hidden global heap: memory comes from an allocator the code was handed. The same
+   goes for every other cost and guarantee: none has a default ("The second rule").
 4. **One of each.** One lock, one map, one channel, one clock, one wait, one error shape: the
    ones blaze's rules already name.
 
-Every blaze crate moves onto it, and later it is the `std` of the blaze edition. Nothing here is
-built except the driver layer it starts from (`crates/blaze-core`).
+Every blaze crate moves onto it, and later it is the `std` of the blaze edition. Built so far: the
+driver layer it starts from (`crates/blaze-core`) and S1's interface over it
+(`crates/blaze-std`).
 
 ```rust
 fn main(cx: &Cx, io: Io) -> Result<(), Error> {
@@ -51,6 +53,44 @@ arguments, compute, and return. It cannot read or write a file, a socket, the cl
 environment, a device or another process; it cannot wait; it cannot allocate from a heap it was
 not given; it cannot keep state between calls. Everything else in this document is a way of
 handing something over, and every such thing is a value in a parameter list.
+
+## The second rule
+
+**A cost or a guarantee the caller should decide is an argument or a type, never a default.**
+The first rule says what code may touch; this one says what touching it costs and promises.
+Whatever waits on a device, allocates, copies in proportion to its data, can lose data or picks
+a policy says so where the call is written: in a parameter that has no default, or in the type
+of what goes in or comes out. Decided 2026-11-10 (the Files section below is where it was
+learned). How it is applied:
+
+- **A type that makes the wrong call unwritable** comes first (`clone_to` exists on `Flushed`
+  alone; a `Buffered` writer cannot be dropped with bytes it holds); then **a required
+  argument** (`Durable`, a frame's size, a `Wire`); a doc comment is never enough.
+- **A policy that changes an effect is a different function, not an argument.** An effect
+  cannot depend on a run-time value, so where a choice decides whether a call can block,
+  allocate or panic, each side is its own function with its effect static: `publish_unsynced`
+  never waits for the device and `publish_synced` does. The form that takes the policy as a
+  value (`publish(.., durable)`) is only a match over the two, for a caller that holds the
+  policy as data, and has the larger effect.
+- **Two costs are two functions, or one whose result says which was paid**: `clone_to` and
+  `copy_to`; `Published::how`; `Pushed::{Held, Wrote}`.
+- **A copy is named one** (`copy_to`, `copy_of`, `to_owned_in(alloc)`), and what does not copy
+  is `as_*` or a view. What allocates takes the allocator or returns a type that names it
+  (`Vec<T, &Frame>`, `Bytes<'a>`, `Pinned`).
+- **All or an error is named `_all`** (`send_all`, `write_all`); what may do less returns how
+  much. Nothing truncates, saturates or answers a question that was not asked: a call that
+  cannot answer returns why (`Result`), or `None` only where "nothing there" is the whole
+  story.
+- **A bound bstd must pick** (how long a dropped value waits for its op, how many polls a
+  stalled driver gets) is a named `pub const`, quoted in the typed outcome that it ends in.
+  A bound the caller could pick is an argument.
+- **Until records land** ([edition](edition.md), change 4) options are plain required
+  parameters and small structs with no `Default`. With records, the fields that are a cost or
+  a guarantee stay required (a record field with no default); only true conveniences get one.
+  "What each API makes explicit" lists which signatures change shape then.
+
+What bstd found it was deciding for its callers, and what each became, is the table of "What
+each API makes explicit".
 
 ## Layers
 
@@ -232,7 +272,7 @@ not ambient and is never fetched from a thread-local; `main` receives the root o
 |---|---|---|---|
 | `Fs` | `io.fs()` | `open_dir(path)` | directories |
 | `Dir<P>` | `Fs`, a `Dir` | `subdir`, `read_only` | files beneath it, by relative path only |
-| `File<P>` | `Dir` | `read_only` | positional reads and writes, sync, mapping |
+| `File<P>` | `Dir` | `read_only` | positional reads and writes, each saying its durability; `flush`; pinning |
 | `Net` | `io.net()` | `connect_only(host)`, `listen_only(addr)` | `Conn`, `Listener`, `Datagrams` (UDP), name lookup |
 | `Env` | `io.env()` | `only(names)` | environment variables |
 | `Args` | `io.args()` | | the command line |
@@ -407,28 +447,71 @@ Decided 2026-11-10, after a build's answer was held four seconds on a 162 MB exe
 store wrote the file without a sync and then cloned it, and a clone of a file whose data is
 still in the page cache makes the kernel write it out first (1.3 s there, against 29 ms for the
 write and 1 ms for a clone of a flushed file). The API let "write, then clone" be written and
-hid the two things that decide its cost.
+hid the two things that decide its cost. Built in `bstd::fs` (S1).
 
-- **Durability is an argument with no default.** Every write, rename and publish takes
-  `Durable::No` (derived data: lost at a power failure and made again), `Durable::Started`
-  (writeback begun, nothing waits) or `Durable::Yes` (synced: the one that waits for the
-  device). Only `Durable::Yes` and `flush` may block (`may(block)`), so a caller checked as
-  non-blocking cannot reach a sync.
-- **A file whose data may not be on disk is another type.** `dir.write(..)` gives `Written`;
-  `written.flush(cx)` gives `Flushed`, and is the wait. `clone_to` exists on `Flushed` alone;
-  `copy_to` (a plain write of the bytes) is on both. A clone that forces writeback cannot be
-  written.
+- **Durability is an argument with no default.** Every change to a file or a name (publish,
+  append, write at an offset, cut, rename, remove, close; `Kv` and `Blobs` put and delete)
+  takes `Durable::No` (derived data: lost or torn by a power failure and made again),
+  `Durable::Started` (writeback begun, nothing waits) or `Durable::Yes` (synced: the one that
+  waits for the device). Nothing syncs unasked, and nothing claims a durability it was not
+  asked for: there is no `write` that is quietly atomic and durable, and no `close` that
+  quietly syncs.
+- **Each has three forms**, by the second rule's "a policy that changes an effect is a
+  different function":
+
+  | form | takes | waits for the device |
+  |---|---|---|
+  | `x_unsynced(.., Unsynced)` | `Unsynced::{No, Started}` | never |
+  | `x_synced(..)` | nothing more | yes: the file's bytes, then its directory's names |
+  | `x(.., Durable)` | the policy as a value | when it is `Yes` |
+
+  So a caller checked as non-blocking calls `_unsynced` and cannot reach a sync. The only
+  other wait for the device is `flush`.
+- **A file whose data may not be on disk is another type.** An `_unsynced` call gives
+  `Written`; `written.flush(cx)` gives `Flushed`, and is the wait; a `_synced` call gives
+  `Flushed`. `clone_to` exists on `Flushed` alone; `copy_to` (a plain read and write of the
+  bytes, a chunk at a time) is on both. A clone that forces writeback cannot be written.
+  Neither replaces a file that is there: that is `publish`.
 - **Say what a path should hold, not how.** `dir.publish(path, content, durable)` makes `path`
-  hold `content`, replaced atomically, where `content` is bytes, another file, or a file and
-  the ranges that differ from it (`Content::patch_of(&base, ranges)`). bstd picks a clone, a
-  derive (clone and write the ranges), a write or a link from what it knows: whether the base
-  is flushed, whether both paths are on one file system, how much differs. Its span says which
-  it took. The store's placement of outputs is one caller.
-- **The simulation charges for it.** `Sim` counts the bytes a clone of an unflushed file forces
-  out, so a test of an edit path asserts none were, with no real disk.
+  hold `content`, replaced all at once (a temporary file beside it, renamed over it), where
+  `content` is bytes (`Content::bytes`), a flushed file (`Content::file`, a clone), any file
+  (`Content::copy_of(&file, chunk)`, a copy), or a flushed file and the ranges that differ
+  from it (`Content::patch_of(&base, ranges)`, a clone and writes). What it did is in its
+  result (`Published::how`: `Written`, `Cloned`, `Copied`, `Derived`) and recorded in the
+  caller's span. The constructor's argument type decides the cost today: a `Flushed` is
+  cloned, anything else copied. Choosing between them itself (a link where nothing writes in
+  place, a copy across file systems, a derive only when little differs) needs the volume and
+  the size of the difference, which blaze-core's effects do not report yet; until then a file
+  system that cannot share blocks fails a clone, naming both volumes, and nothing copies in
+  its place. The store's placement of outputs is one caller.
+- **What a crash keeps is stated per call** and tested: a `_synced` publish or remove that
+  returned is kept exactly; an `_unsynced` one leaves what was last synced, or itself cut
+  short; an append is kept once a later `flush` returned. A reader, crash or no crash, sees
+  the old contents of a published path or the new, never a part.
+- **A writer that buffers is its own type.** `file.buffered(frame, capacity)` gives
+  `Buffered`: pushes are kept until the buffer is full, and each says which it did
+  (`Pushed::Held` or `Pushed::Wrote(n)`). It is linear, so bytes it holds cannot be dropped:
+  it ends with `finish(cx)`. `append` keeps nothing back.
+- **The simulation charges for it.** `io.disk()` is the simulated disk's ledger: bytes written
+  and read, flushes, waits for the device, clones, and the bytes a clone of an unflushed file
+  forces out (`forced_writeback`). A test of an edit path asserts none were, and that no
+  `_unsynced` call waited for the device, with no real disk. The ledger also holds the name
+  changes no directory sync covered, and a simulated crash undoes a suffix of them, so "synced
+  the bytes, forgot the directory" loses the file in a test as it would on a disk.
 
-Until records land ([edition](edition.md), change 4) the options are a `Durable` argument and
-plain parameters; with them, `publish(path, content, { durable: Durable::No, .. })`.
+What blaze-core's effects make of it today, each a refusal or a stated gap and never a quiet
+substitute:
+
+| wanted | today | needs |
+|---|---|---|
+| `Durable::Started` | refused before anything changes (`FsKind::NoWritebackStart`): a whole flush left in flight makes its file again if it was renamed or removed meanwhile | an effect that begins writeback (`sync_file_range`, `F_BARRIERFSYNC` without the wait) |
+| a name made durable after a remove, a create or `sync_names` on a real disk | refused after the change (`FsKind::NoNameSync`); the simulation syncs names in its ledger | an effect that syncs a directory |
+| an unsynced rename or publish that costs no sync on a real disk | the native rename syncs its directories itself, so `Durable::No` is true of the promise and not yet of the price | a rename effect that does not sync |
+| a read that does not copy | `Done::Read` hands back a buffer the driver made, copied into the caller's `Bytes` | the page pool (`file.pin`, S1f) |
+| a write that does not copy | each write's bytes are copied once into the effect, which owns them | registered buffers (`WriteFrom`), with S4 |
+
+With records, `publish(path, content, { durable: Durable::No, .. })`; `durable` stays a field
+with no default.
 
 ## Values that must be finished
 
@@ -447,10 +530,10 @@ does not need the workarounds.
   since a forgotten future would free memory the kernel still writes. A linear
   `Pending<'buf>` cannot be forgotten: it must be `wait`ed or `cancel`led (which also waits), so
   `file.read_into(cx, &mut buf)` on a borrowed buffer is sound and zero-copy.
-- **Closing is a call that can fail and can wait**: `file.close(cx)?`, `conn.finish(cx)?`,
-  `vm.stop(cx)?`. A handle with unsynced writes, a connection with unsent data, a sandbox and a
-  transaction are linear, so their last error cannot be lost in a destructor and nothing has to
-  wait inside `Drop`.
+- **Closing is a call that can fail and can wait**: `file.close_synced(cx)?`,
+  `conn.finish(cx)?`, `vm.stop(cx)?`. A handle with unsynced writes, a buffer with unwritten
+  bytes, a connection with unsent data, a sandbox and a transaction are linear, so their last
+  error cannot be lost in a destructor and nothing has to wait inside `Drop`.
 - **A task's result must be taken**: `Task<T>` is linear and `join` returns its outcome, so a
   failure cannot be ignored by dropping the handle.
 - **On a panic** the value's abandonment path runs instead (roll back, cancel and wait, close
@@ -810,6 +893,70 @@ few stores into a hot buffer) with a budget on ns and bytes per event and zero a
 simulation test of ring and drainer whose oracle is "every event is delivered once, in order per
 worker, or counted as dropped", with a planted bug; and an encode-decode round trip.
 
+## What each API makes explicit
+
+The audit of `crates/blaze-std` against the second rule (2026-11-10). One row a place bstd was
+deciding for its caller, or already was not. "Record" marks a signature that becomes a record
+parameter when records land; its cost and guarantee fields stay required.
+
+| module | API | what it makes explicit | was |
+|---|---|---|---|
+| `fs` | `Dir::publish{,_unsynced,_synced}`, `Content`, `Published::how` | durability; which of write, clone, copy, derive was paid; atomic replace (record: `durable`, a copy's `chunk`) | `Dir::write(path, bytes)`: always synced and atomic, unsaid |
+| `fs` | `File::{append,write_at,set_len}{,_unsynced,_synced}`, `File::flush` | whether the call waits for the device | "durable once a later sync has returned", a doc comment; `File::sync` |
+| `fs` | `File::close{,_unsynced,_synced}` giving `Written` or `Flushed` | that closing syncs only when told, and what the file then is | `close` always synced |
+| `fs` | `Dir::{remove,rename_replacing}{,_unsynced,_synced}`, `Dir::sync_names` | that a name is durable only once its directory is synced; that a rename replaces | `remove`, `rename`: durability unsaid |
+| `fs` | `Written`, `Flushed`, `clone_to`, `copy_to(.., chunk)` | whether bytes reached the disk; clone against copy; neither replaces (`FsKind::Exists`) | no clone or copy in bstd; the store's own |
+| `fs` | `Dir::create` | in place, not atomic, nothing durable until its close says | "made empty, replacing what was there" through a synced whole-file write |
+| `fs` | `Buffered`, `Pushed` | the one buffer, sized by its maker; held against written; linear | no buffered writer |
+| `fs` | `File::read_into(buf)`, `read_at`, `read_all(into)`, `Dir::list(cx, frame)` | the caller's buffer or allocator | already explicit |
+| `disk` | `Io::disk() -> DiskCounts` | what a path paid, in a test | nothing |
+| `kv`, `blobs` | `put{,_unsynced,_synced}`, `delete{,_unsynced,_synced}` | durability of a put and a delete | "durably and all at once", fixed |
+| `io` | `Io::cx(budget, scratch)` | the root frame's size (record: `scratch`) | 64 MiB picked inside |
+| `io` | `Io::fs()` .. `Option`, `need_x() -> Result<_, Missing>` | absence at the root, named | already explicit |
+| `task` | `Scope::spawn(name, scratch, f)`, `spawn_concurrent` | the task's frame size (record: `scratch`); in any order against must overlap | 64 MiB picked inside |
+| `task` | `Scope`, `Task` linear, `join(cx)` | that tasks are joined and failures seen | already explicit |
+| `cx` | `Cx::{deadline, name, cancelled, check}` | `noalloc`, `nonblocking`, checked | unmarked |
+| `cx` | every waiting call takes `&Cx`; a wait ends in `Stopped` | deadline, cancellation, span | already explicit |
+| `pending` | `Pending::cancel(cx, give_up)` | how long a cancel waits past its context | the later of the deadline and 1 s, picked inside |
+| `pending` | `Pending` linear; `read_into`/`write_from` against `read_at`/`write_at` | an op in flight is finished; start against start-and-wait | already explicit |
+| `net` | `Conn::send_all`; `recv(cx, most, into)`; `Net::limit` | all or an error; the caller's bound and buffer; the byte budget | `send` |
+| `net` | `Listener::close` hangs up at most `CLOSE_MOST` and says `Unending` | a bound bstd picks, named | already explicit |
+| `local` | `pair(name, NonZero)`, `End::write_all` (`LocalError::moved`) | the buffer's size; all or how far | capacity 0 raised to 1; `write` |
+| `streams` | `Stream::send_all` | all or an error | `send` |
+| `requests` | `Http::over(net, clock, roots, Wire)` (record: `Wire`'s fields) | user agent, most body bytes, most receives; one connection a request, no retry, redirect or pool | three constants picked inside |
+| `requests` | `Exchange` linear, `request(.., into)` | the answer's buffer; finishing | already explicit |
+| `env` | `Env::get -> Result<Option<&str>, NotAllowed>` | not allowed against not set | both `None` |
+| `clock` | `Instant::since -> Option<Duration>` | that the earlier instant was later | zero |
+| `clock` | `sleep(cx, ..)`, `sleep_until(cx, at)`, `Deadline` absolute | the wait and its bound | already explicit |
+| `rng` | `Rng::below(NonZero<u64>)`; no `Clone`, `fork()` | an empty range cannot be asked; a seed is never shared by accident | `below(0)` gave 0 |
+| `mem` | `Mem::arena(name, limit)`, `Bytes::try_*`, `Arena::alloc()` | name, limit, fallible growth | already explicit |
+| `eval` | `Eval::memo(mem, MemoLimit)` (record), `Graph::new_in(arena)` | entries and bytes kept; where provenance is kept | already explicit |
+| `budget` | `Budget::{take, give_back, left}` | `noalloc`, `nonblocking`, checked | unmarked |
+| `device` | `Usb`/`Serial`/`Bluetooth::write_all`; `scan(cx, frame)`; `read(.., into)` | all or an error; the caller's allocator | `write` |
+| `audio` | `play(cx, device, pcm, periods, fill)` | how long it plays; the device's pull | already explicit |
+| `keys`, `procs`, `code`, `window`, `term`, `power`, `opener`, `automation` | every call takes `&Cx`; narrowing by typed name; `RawMode`, `Awake` linear | wait, authority, finishing | already explicit |
+| `path`, `url`, `name`, `env::VarName`, `net::HostPort` | checked constructors with a typed `Why`; `path!`/`var!`/`host!` at compile time | no lossy parse | already explicit |
+| `sort` | `sort::on(workers)`, `Serial` | which threads sort; no ambient pool | already explicit |
+| `map`, `hash` | fixed seed, `SipKey` handed in | no per-process hasher seed | already explicit |
+
+Left implicit, with what each waits for (none is hidden by a default a caller could have
+chosen otherwise today, and each is a row to close):
+
+| where | what is still implicit | waits for |
+|---|---|---|
+| every write and send | the bytes are copied once into the effect, in the global heap | registered buffers, S4 |
+| `Pending` | one boxed closure an op | the `Frames` layout (the op's state is in its frame) |
+| `requests::Http::over` | the h1 core's head and body buffers are `Vec`s in the global heap | an h1 core that takes an allocator |
+| `streams` (handler provider) | replies are held in an unbounded queue in the global heap | a bound and an allocator on `Streams::handler` |
+| `Path::join`, `Dir::subdir`, narrowing (`only`) | a name or an allow-list is allocated in the global heap, once | S4's `String<A>`, or names interned in the task's frame |
+| `keys::Secret` | its bytes are in the global heap | a locked, zeroed arena from `Mem` |
+| `sync::{Lock, RwLock}` | `lock()` takes no `Cx`: no deadline, and nothing in its type says it may wait | S1b: bstd's own lock over the one wait |
+| `Io`'s own state | one process lock around the driver (uncontended under `Inline`) | the scheduler (S3b) |
+| `io::ABANDON_WAIT`, `io::POLL_FUEL`, `net::CLOSE_MOST`, `trace::TRACE_MOST`, `kv::KEY_MOST` | bounds bstd picks, each a `pub const` named in the outcome it ends in | record parameters, where a caller could pick |
+| `SimWorld::new(seed)` | the simulation's latency and faults default (`Faults::default`) | nothing: a test's world, and the seed is said |
+| `audio` callbacks | `Fill`/`Take` should be `noalloc` and `nonblocking`; a closure type cannot carry the mark | effect bounds on closure parameters |
+| the facade (`record`, `report`, `bytes`, `http`, `quic`) | re-exports are not audited here: `record::to_bytes` and `report::render` allocate in the global heap | S1d, as each piece is merged |
+
 ## Errors
 
 One error type per area (`FsError`, `NetError`, ...), each naming the operation, the thing (the
@@ -882,6 +1029,49 @@ nonblocking; [effects](effects.md)):
 - **`global_state`**: reads or writes a `static` with interior mutability, a `static mut` or a
   thread-local.
 
+Effect attributes on bstd itself. This branch has `#[blaze::pure]`, `nopanic`, `noalloc` and
+`nonblocking` ([effects](effects.md)); bstd marks with those where the mark holds and is
+checked, and the positive form being built (`#[blaze::may(block, alloc, ..)]`) replaces each
+with a list of what a function may do, so "only `_synced` and `flush` may block" becomes
+`may(block)` on those and its absence everywhere else. Marked today: `Cx::{deadline, name,
+cancelled, check}`, `Budget`'s counting, `Instant::{since_start, since}`, `Durable::unsynced`,
+`How::says`, `Buffered::held`. Not marked, and why: every call that reaches the driver takes
+`Io`'s process lock and polls inline in S1, which the walk rightly reads as blocking, so
+`_unsynced` cannot be marked `nonblocking` until a wait parks on the scheduler; its promise is
+the narrower one the ledger tests ("no wait for the device").
+
+Lints the second rule implies:
+
+| lint | refuses | exists |
+|---|---|---|
+| `blaze::nopanic`, `noalloc`, `nonblocking` | a marked function that reaches the effect | yes |
+| `blaze::linear` (the borrow check's `LINEAR`) | a `File<ReadWrite>`, `Buffered`, `Pending`, `Scope`, `Conn` left unfinished | yes |
+| `blaze::implicit_policy` | a public bstd function that reaches a cost its signature does not carry (below) | no: specified here, for the lints lane |
+| `blaze::default_policy` | `impl Default`, or a `new()` with no arguments, for a bstd type with a field marked as a cost or a guarantee | no |
+| `.clippy.toml` bans of the removed names (`Dir::write`, `File::sync`, `File::replace`, `Conn::send`, `End::write`) | a use of one, by resolution | no: the names are gone from bstd, so the ban is for crates that move onto it (S3) |
+| a compile-fail fixture for bstd | `written.clone_to(..)`; a call of a removed name | no: bstd has no compile-fail harness; hir-ty-linear's fixtures mirror only its linear types |
+
+**`blaze::implicit_policy`**, for crates on the trusted list that are libraries (bstd first).
+For each `pub` function and method, read the effect summary the walk already makes
+(`instance_effects`: one `EffectSet` per instance, with the shortest witness of each kind) and
+compare it with the signature:
+
+| the summary has | the signature must have one of | else |
+|---|---|---|
+| `Block` through the one wait, a lock or a foreign wait | a parameter of type `&Cx`, `Deadline`, or a type holding one (`Scope`, `Pending`) | "waits (witness path) and takes no deadline" |
+| `Alloc` (the global heap) | nothing satisfies it | "allocates from the global heap (witness)": a `// alloc:` line with a reason, until S4, is the one opt-out |
+| `AllocIn` | a parameter or `self` field whose type is an `Allocator`, `&Frame`, `Bytes`, `Arena`, `Mem`, or a return type parameterised by one | "allocates in an allocator its caller did not hand it" |
+| a new kind `Sync` (reaches `Effect::Sync`, `fsync`, `F_FULLFSYNC`, a directory sync) | a name ending `_synced`, or `flush`, or a parameter of type `Durable` | "waits for the device and does not say so" |
+| a new kind `Write` (reaches a file-changing effect) with no `Sync` | a name ending `_unsynced`, or a parameter of type `Durable` or `Unsynced`, or `self: Buffered` | "changes a file and does not say how durably" |
+| a copy of a slice parameter into owned memory (`to_vec`, `extend_from_slice` of an argument) | a name starting `copy_` or ending `_all`/`_owned_in`, or an `into:` buffer parameter | "copies its input and is not named a copy" |
+
+What it needs that does not exist: two effect kinds (`Sync`, `Write`) as rows of
+`effect_attrs::ROWS` and `FOREIGN` (the driver's sync and write entry points, `fsync` and its
+family); the table of signature types above as data beside the rows; and, for the copy row, the
+walk recording when an argument's bytes reach an allocation (the taint summary
+`constant_time` would add; without it the copy row is left out and the rest still stands).
+It reads summaries and signatures only, so it adds no walk.
+
 The trusted list is in the workspace manifest (`[blaze.trusted]`, each entry with an owner and a
 reason); `bstd` is on it. `blaze explain trusted <binary>` prints what a binary rests on, and
 `blaze explain caps <item>` follows a capability or a secret through the call graph. A crate
@@ -894,7 +1084,7 @@ Interface first, bottom last, so nothing waits on the runtime and every step lan
 
 | step | what | done when |
 |---|---|---|
-| S1 | The crate `crates/blaze-std` (`bstd`): `Cx`, `Io`, every capability above, the allocators, the scopes and deadlines, the errors, over `blaze-core`'s drivers and its simulation | its simulation tests pass; one planted bug per invariant is caught |
+| S1 | The crate `crates/blaze-std` (`bstd`): `Cx`, `Io`, every capability above, the allocators, the scopes and deadlines, the errors, over `blaze-core`'s drivers and its simulation; the second rule applied to all of it ("What each API makes explicit"), with the Files design | its simulation tests pass; one planted bug per invariant is caught (for files: a publish that reports done before its rename, a `Durable::Yes` that skipped the directory sync, a `Flushed` handed out before its flush) |
 | S2 | The `ambient` and `unsafe` effects, `#![blaze::capabilities]`, `blaze explain trusted` | a crate with the attribute that calls `std::fs` is refused, naming the call path |
 | S3 | blaze's crates move, leaves first: a sans-IO core takes nothing, a driver takes the piece it needs, `blaze`'s `main` takes `Io`. Each move is a `.clippy.toml` ban and `blaze check --fix` (rule `fix-through-blaze-lints`) | every crate in `crates/` has `#![blaze::capabilities]` |
 | S1b | `bstd::{sync, cell}`: the table of "Shared mutation", token cells, `Freeze` as a bound, typed names (`HostPort`, `VarName`) in place of strings, and bans on the removed names | misuse tests: two live `get_mut` on one token do not compile; a static that is not `Freeze` is refused |
@@ -931,6 +1121,8 @@ with its path, or put on the trusted list with a reason.
 - **Structured tasks with deadlines**, as Trio's scopes.
 - **Standard error is not a capability; standard output is.**
 - **No revocation** until something needs it.
+- **No default for a cost or a guarantee** (the second rule); a policy that changes an effect
+  is a function of its own.
 
 ## Prior art
 

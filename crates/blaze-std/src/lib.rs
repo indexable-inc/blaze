@@ -14,8 +14,9 @@
 //!   [`task::Scope::spawn`] a [`task::Task`] ([`task`]), in the `Inline` layout.
 //! - What must be finished is linear (`#[blaze::linear]`, crates/hir-ty-linear): a
 //!   [`task::Scope`] and its [`task::Task`]s are joined, an op in flight
-//!   ([`pending::Pending`]) is waited for or cancelled, a writable [`fs::File`] is closed and a
-//!   [`net::Conn`] or [`net::Listener`] is finished. Leaving one is a compile error; a panic
+//!   ([`pending::Pending`]) is waited for or cancelled, a writable [`fs::File`] is closed, a
+//!   buffered writer ([`fs::Buffered`]) is finished and a [`net::Conn`] or [`net::Listener`]
+//!   is finished. Leaving one is a compile error; a panic
 //!   that unwinds past one runs its abandonment path, which each type's doc names.
 //! - A capability the host does not offer is `None` at the root ([`io::Io::fs`], ...;
 //!   [`io::Offers`]), with a `need_` form whose [`io::Missing`] names it.
@@ -26,6 +27,10 @@
 //!   a [`Path`], an [`env::VarName`], a [`net::HostPort`], each checked as it is made, and a
 //!   literal checked as the crate compiles ([`path!`], [`var!`], [`host!`]).
 //! - Every wait ends in a typed outcome: what it waited for, or a [`Stopped`].
+//! - A cost or a guarantee the caller should decide is an argument or a type, never a default
+//!   (std.md, "The second rule"): how durable a file change is ([`fs::Durable`], and
+//!   [`fs::Written`] against [`fs::Flushed`]), how big a task's frame is, how a request
+//!   talks on the wire. The simulated disk counts what was paid ([`io::Io::disk`]).
 //! - The rest of the capability set (std.md, "The rest of the set", "Sound, and the device
 //!   capabilities") exists as types with their narrowing: [`term::Term`], [`keys::Keys`],
 //!   [`roots::Roots`], [`locale::Locale`], [`user::User`], [`procs::Procs`], [`code::Code`],
