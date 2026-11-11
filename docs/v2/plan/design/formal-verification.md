@@ -719,6 +719,38 @@ programs; it is the specification of the Rust pass of the same name.
     form needs the two states related across steps (equal but, per frame, on the locals
     dead at its resume point), on `Opt/Ptr`, `Opt/Borrow`, `Opt/BorrowStep`,
     `Opt/SlotAlgebra`, `Opt/SlotExec`. So no `BlazeValidated` pair for DSE.
+- **Global dead-store elimination: the design (ledger V11; not built).** One relation serves
+  the Rust `DeadStoreElimination`, the deleting half of `CopyProp` (a use rewritten is
+  `symEq`; the copy left unused is a dead store) and of `SimplifyLocals` (which also
+  renumbers locals: a rename of locals, a commutation family like `Opt/Rename.lean`'s, not
+  part of this).
+  - **No change to the semantics.** `step` runs a whole block, and that grain is right: the
+    relation is stated at block boundaries, and inside a block the proof is an induction
+    over the statements, as `Opt/RemoveOverwritten.lean`'s is. A per-statement small step is
+    not needed.
+  - **The certificate** is liveness as data: per function and block, the locals live on
+    entry. `checkLiveness` (a `Bool` the kernel evaluates) recomputes each block backwards
+    from the union of its successors' sets (a `ret` reads local 0; a call's destination is
+    written whole or in part; every borrowed local is always live) and accepts when what it
+    computes is within the set given. The pass removes `l = rv` where `l` is a whole local
+    not live after the statement and never borrowed, and `rv` cannot panic or move
+    (`rvalueCalm`, to be widened to total operators).
+  - **The relation** is a map, as in `Opt/SlotAlgebra.lean`: the source state is the target
+    state with a list of slots replaced, `(frame id, local, slot)`, each a local dead at its
+    frame's resume point (the running frame: the block it is at; a frame under it: after
+    its call returns and writes the destination) and never borrowed, so by `step_borrows` no
+    pointer is into it. A step keeps it: a statement that does not read a replaced slot
+    commutes with the replacements (`execStmt_put`, generalized to a frame that is not the
+    running one, where no place of the statement can be in it); a store to a replaced local
+    drops it from the list (`State.write_setSlot_same`); a removed store adds one; a call
+    leaves the caller's list as it is and starts the callee with none; a return drops the
+    callee's.
+  - **What to build, in order:** `execStmt_put` for any frame (the running frame's fine
+    conditions only when the slot is in it); the list of replacements with its commutation
+    through a statement; `checkLiveness` and its two facts (a local dead on entry and not
+    written is dead on exit; the removed store's local is dead after it); terminators,
+    calls and returns on related states; `removeDead_refines` through `run_refines_inv`
+    with the invariant "related, and the source holds `Borrows`".
 - **A validator proved sound** (`Opt/Validate.lean`). `validate a b` accepts when the two
   programs have one normal form under the proved rewrites; `validate_sound`: an accepted
   pair runs alike for every fuel and state. It takes no witness and accepts only what the
