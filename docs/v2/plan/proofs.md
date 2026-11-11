@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-51 theorems: 38 in `lean`, 13 in `lean/analysis`.
+56 theorems: 43 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -361,6 +361,79 @@ theorem run_refines (src tgt : Program)
 ```lean
 theorem switchToGoto_refines (prog : Program) (fuel : Nat) (st : State) :
     (run (switchToGoto prog) fuel st).Refines (run prog fuel st)
+```
+
+**`Blaze.Mir.execStmt_mapStack`** (`Blaze.Mir.Opt.MemMap`, `lean`): A statement commutes with any map on the stack that leaves memory alone.
+
+```lean
+theorem execStmt_mapStack (adts : List AdtDecl) {M : List Frame → List Frame} (hM : MemMap M) (st : State) :
+    ∀ (s : Statement),
+      execStmt adts (st.mapStack M) s = Outcome.map (State.mapStack M) (execStmt adts st s)
+  | Statement.assign p rv =>
+    Outcome.bind_commutes_map (evalRvalue_mapStack adts hM st rv) (fun r _ =>
+      Outcome.bind_commutes (evalPlace_mapStack hM r.2 p) (fun ptr _ =>
+        State.write_mapStack hM r.2 ptr r.1))
+  | Statement.storageLive _ => rfl
+  | Statement.storageDead _ => rfl
+  | Statement.nop => rfl
+
+end Blaze.Mir
+```
+
+**`Blaze.Mir.execBlockFrom_top`** (`Blaze.Mir.Opt.Merge`, `lean`): A block that does not end in a call does the same whatever block the running frame is at.
+
+```lean
+theorem execBlockFrom_top (adts : List AdtDecl) (sig : FnId → Option FnSig) (c : BlockId)
+    (term : Terminator) (h : isCall term = false) :
+    ∀ (stmts : List Statement) (st : State),
+      execBlockFrom adts sig (st.mapStack (withTopBlock c)) stmts term =
+        execBlockFrom adts sig st stmts term
+  | [], st => execTerm_top sig c st term h
+  | s :: rest, st =>
+    Outcome.bind_map_congr (execStmt_mapStack adts (withTopBlock_memMap c) st s) (fun st1 _ =>
+      execBlockFrom_top adts sig c term h rest st1)
+
+/-- Statements, then more statements and a terminator: what the first statements and a
+`goto` do when they fail, or else the rest from the state the `goto` jumps from. -/
+theorem execBlockFrom_append (adts : List AdtDecl) (sig : FnId → Option FnSig) (t : BlockId)
+    (s2 : List Statement) (term2 : Terminator) :
+    ∀ (s1 : List Statement) (st : State),
+      execBlockFrom adts sig st (s1 ++ s2) term2 =
+          execBlockFrom adts sig st s1 (Terminator.goto t) ∨
+        ∃ st1, st1.ctl = st.ctl ∧
+          execBlockFrom adts sig st s1 (Terminator.goto t) = st1.jump t ∧
+          execBlockFrom adts sig st (s1 ++ s2) term2 = execBlockFrom adts sig st1 s2 term2
+  | [], st => Or.inr ⟨st, rfl, rfl, rfl⟩
+  | s :: rest, st => by
+    cases hs : execStmt adts st s with
+    | ok st' =>
+      have a : execBlockFrom adts sig st ((s :: rest) ++ s2) term2 =
+          execBlockFrom adts sig st' (rest ++ s2) term2
+```
+
+**`Blaze.Mir.Opt.mergeGotos_target`** (`Blaze.Mir.Opt.Merge`, `lean`): A run of the block-merged program that ends in n steps is the program's run of 2 * n steps, for every choice of targets merged.
+
+```lean
+theorem mergeGotos_target (pick : Body → BlockId → Bool) (prog : Program) (n : Nat) (st : State)
+    (hne : run (mergeGotos pick prog) n st ≠ Outcome.diverge) :
+    run prog (2 * n) st = run (mergeGotos pick prog) n st
+```
+
+**`Blaze.Mir.Opt.mergeGotos_source`** (`Blaze.Mir.Opt.Merge`, `lean`): A run of the program that ends in n steps is the block-merged program's run of n steps.
+
+```lean
+theorem mergeGotos_source (pick : Body → BlockId → Bool) (prog : Program) (n : Nat) (st : State)
+    (hne : run prog n st ≠ Outcome.diverge) :
+    run (mergeGotos pick prog) n st = run prog n st
+```
+
+**`Blaze.Mir.Opt.mergeGotos_call_source`** (`Blaze.Mir.Opt.Merge`, `lean`): A call that ends in n steps gives the same outcome in the block-merged program.
+
+```lean
+theorem mergeGotos_call_source (pick : Body → BlockId → Bool) (prog : Program) (n : Nat)
+    (id : FnId) (base : List Slot) (args : List Value)
+    (hne : prog.call n id base args ≠ Outcome.diverge) :
+    (mergeGotos pick prog).call n id base args = prog.call n id base args
 ```
 
 ## V10

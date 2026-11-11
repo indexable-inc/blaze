@@ -16,6 +16,8 @@ import Blaze.Mir.Opt.Reach
 import Blaze.Mir.Opt.Renumber
 import Blaze.Mir.Opt.Thread
 import Blaze.Mir.Opt.SwitchSame
+import Blaze.Mir.Opt.MemMap
+import Blaze.Mir.Opt.Merge
 import Blaze.Mir.Opt.RemoveNops
 import Blaze.Mir.Opt.ConstFold
 import Blaze.Mir.Opt.Validate

@@ -624,7 +624,7 @@ programs; it is the specification of the Rust pass of the same name.
     composed, `2 ^ k * n` one way and `n` the other (`threadGotosN_target`,
     `threadGotosN_source`; checked at e15b208b49).
   - **A `switchInt` whose arms all agree is a `goto`** (`Opt/SwitchSame.lean`,
-    `switchToGoto`; not yet elaborated). A refinement, not an equality: the `goto` drops the
+    `switchToGoto`; checked at 6a85685c71). A refinement, not an equality: the `goto` drops the
     evaluation of the discriminant, which here can be undefined, so `switchToGoto_refines`
     says the rewritten run is the program's unless the program's is undefined. The
     discriminant must be a `copy` of a place with no index (a `move` changes the state, an
@@ -633,29 +633,32 @@ programs; it is the specification of the Rust pass of the same name.
     `Outcome.Calm` (a value or undefined, never a panic), proved of reads and plain places.
   - **Where these cover less than the Rust `SimplifyCfg`** (`optimize/cfg.rs`): it threads a
     call's return target too (the specification leaves call targets, so that no state is
-    renamed); it merges a block into
-    its only predecessor and turns a `switchInt` whose arms all agree into a `goto`; and
+    renamed); it merges a block that ends in a call too, and rewrites a `switchInt` whose
+    discriminant is a `move` or has an index; and
     `remove_dead_blocks` merges every empty `unreachable` block into one. None of those is
     specified, so `BlazeValidated` has no `after = spec before` pair for a CFG pass, and
     `validate`'s normal form does not include them: `validate_sound` is equality of runs
     with the same fuel from the same state, which a renumbering (the state is renamed) and
     threading (the fuel differs) do not have. The witness validator is where they join.
-  - **Not written: merging a block into its only predecessor, and threading a call's
-    return target.** Both are `Stutter` proofs, and both need one generalization of
-    `Opt/Rename.lean` first: two maps in `Frame.rename`, one for `block` and one for
-    `target` (today one `ρ` renames both; the memory lemmas up to `execStmt_rename` do not
-    care, only `State.jump_rename`, `State.jump?_rename` and `State.ret_rename` do).
-    - Call targets: the block map is the identity and the target map is `threadTarget`. A
-      return then lands, in the source, on the empty block the target skipped, and takes
-      one more step: `Thread.lean`'s `jump_then` is that step, to be applied after
-      `State.ret` and after an intrinsic call as it is after a jump.
-    - Merging: inlining the block a `goto` targets (`b.stmts ++ t.stmts`, `t`'s terminator)
-      is right whatever `t`'s predecessors are; the only difference in states is the stale
-      `block` of a frame that is not running, when the inlined terminator is a call (the
-      source's caller frame says `t`, the target's says `b`). No step reads that field, so
-      the map is a rename of `block` on the frames under the running one, which the
-      two-map `Frame.rename` gives when the running frame is treated apart. A chain of
-      merges is the pass again, as for threading.
+  - **Merging a block into its predecessor** (`Opt/Merge.lean`, `mergeGotos pick`; not yet
+    elaborated). A block that ends in `goto t` gets `t`'s statements and terminator. It is
+    right whatever jumps to `t`, so it is proved for every choice of targets; `mergeSuccessors`
+    chooses as the Rust `merge_successor` does (one predecessor). A stuttering simulation
+    through the identity with bound 2 (`mergeGotos_target`, `mergeGotos_source`). It rests on
+    `execBlockFrom_top`: a block that does not end in a call does the same whatever block
+    the running frame is at; `Opt/MemMap.lean` has the commutation lemmas of `Opt/Rename.lean`
+    for any map on the stack that leaves memory alone, which that needs. A target that ends
+    in a call is not merged (the caller's frame would keep a stale `block` under the
+    callee, so the two states would differ): there the specification covers less.
+  - **Not written: threading a call's return target.** A `Stutter` proof that needs two maps
+    in `Frame.rename`, one for `block` and one for `target` (today one `ρ` renames both; the
+    memory lemmas do not care, only `State.jump_rename`, `State.jump?_rename` and
+    `State.ret_rename` do): the block map is the identity and the target map is
+    `threadTarget`. A return then lands, in the source, on the empty block the target
+    skipped, and takes one more step: `Thread.lean`'s `jump_then` is that step, to be applied
+    after `State.ret` and after an intrinsic call as it is after a jump. Merging a target
+    that ends in a call needs the same two maps, with the frames under the running one
+    renamed.
   - **Dead-store elimination is not written.** It needs a relation, not a map: two states
     equal but on dead locals. The Rust pass (`optimize/dse.rs`) removes the whole assignment
     of an rvalue it holds to be free of effects (all but a pointer-to-address cast), to a

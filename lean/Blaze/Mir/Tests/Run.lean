@@ -461,4 +461,18 @@ example :
       true := by
   decide
 
+/-! Merging: block 1 has one predecessor and goes into block 0; block 3 has one and goes
+into block 1. The merged program is done in two steps. -/
+
+example :
+    (Opt.mergeSuccessors constantSimplified).fns.map
+        (fun body => body.blocks.map (fun blk => (blk.stmts.length, blk.terminator))) =
+      [[(1, Terminator.goto 3), (2, Terminator.ret), (0, Terminator.unreachable),
+        (2, Terminator.ret)]] := by
+  decide
+
+example :
+    isInt ScalarTy.U32 4 ((Opt.mergeSuccessors constantSimplified).call 2 0 [] []) = true := by
+  decide
+
 end Blaze.Mir.Tests
