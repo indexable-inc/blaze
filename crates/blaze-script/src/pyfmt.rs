@@ -1,6 +1,7 @@
 //! Values written as Python writes them in an f-string: `{x:g}` ([`g`]), `{x!r}` ([`repr`],
-//! [`repr_str`]) and `{x}` ([`py_str`]) of a JSON value, so a ported script's message is the
-//! bytes the Python printed.
+//! [`repr_str`], [`float_repr`]) and `{x}` ([`py_str`]) of a JSON value, and a float as
+//! `fractions.Fraction` holds it ([`fraction`]), so a ported script's message is the bytes the
+//! Python printed.
 
 use serde_json::Value;
 
@@ -74,7 +75,7 @@ pub fn repr_str(s: &str) -> String {
 }
 
 /// A float as Python's `repr` writes it: `1.0`, `1e-05`, `inf`, `nan`.
-fn float_repr(f: f64) -> String {
+pub fn float_repr(f: f64) -> String {
     if f.is_nan() {
         "nan".to_owned()
     } else if f.is_infinite() {
@@ -82,6 +83,56 @@ fn float_repr(f: f64) -> String {
     } else {
         pyjson::float(f)
     }
+}
+
+/// `Fraction(x)` of a finite float: its exact value as a numerator (signed) and a denominator
+/// (a power of two), in lowest terms, both in decimal: `(1, 2)` for 0.5, `(0, 1)` for -0.0.
+pub fn fraction(x: f64) -> (String, String) {
+    if x == 0.0 || !x.is_finite() {
+        return ("0".to_owned(), "1".to_owned());
+    }
+    let bits = x.to_bits();
+    let biased = i64::try_from((bits >> 52) & 0x7ff).unwrap_or(0);
+    let fraction_bits = bits & ((1 << 52) - 1);
+    // x = mantissa * 2^exponent, a subnormal without the hidden bit.
+    let (mut mantissa, mut exponent) =
+        if biased == 0 { (fraction_bits, -1074) } else { (fraction_bits | (1 << 52), biased - 1075) };
+    let zeros = mantissa.trailing_zeros();
+    mantissa >>= zeros;
+    exponent += i64::from(zeros);
+    let sign = if x < 0.0 { "-" } else { "" };
+    let shift = u32::try_from(exponent.unsigned_abs()).unwrap_or(0);
+    if exponent >= 0 {
+        (format!("{sign}{}", times_pow2(mantissa, shift)), "1".to_owned())
+    } else {
+        (format!("{sign}{mantissa}"), times_pow2(1, shift))
+    }
+}
+
+/// `m * 2^e` in decimal, of any size.
+fn times_pow2(m: u64, e: u32) -> String {
+    const BASE: u64 = 1_000_000_000;
+    // Little-endian limbs of nine decimal digits.
+    let mut limbs = vec![m % BASE, (m / BASE) % BASE, m / BASE / BASE];
+    for _ in 0..e {
+        let mut carry = 0;
+        for limb in &mut limbs {
+            let doubled = *limb * 2 + carry;
+            *limb = doubled % BASE;
+            carry = doubled / BASE;
+        }
+        if carry > 0 {
+            limbs.push(carry);
+        }
+    }
+    while limbs.len() > 1 && limbs.last() == Some(&0) {
+        limbs.pop();
+    }
+    let mut out = limbs.last().map(u64::to_string).unwrap_or_default();
+    for limb in limbs.iter().rev().skip(1) {
+        out.push_str(&format!("{limb:09}"));
+    }
+    out
 }
 
 /// `repr(value)` of the Python value `json.loads` gave: `None`, `True`, `'a'`, `[1, 'b']`,
@@ -147,6 +198,25 @@ mod tests {
         for (x, said) in cases {
             assert_eq!(g(x), said, "{x}");
         }
+    }
+
+    #[test]
+    fn a_fraction_is_pythons() {
+        let cases = [
+            (0.5, "1", "2"),
+            (-1.0, "-1", "1"),
+            (-0.0, "0", "1"),
+            (2.0, "2", "1"),
+            (0.1, "3602879701896397", "36028797018963968"),
+            (1e20, "100000000000000000000", "1"),
+            (-2.5, "-5", "2"),
+            (5e-324, "1", "202402253307310618352495346718917307049556649764142118356901358027430339567995346891960383701437124495187077864316811911389808737385793476867013399940738509921517424276566361364466907742093216341239767678472745068562007483424692698618103355649159556340810056512358769552333414615230502532186327508646006263307707741093494784"),
+        ];
+        for (x, numerator, denominator) in cases {
+            assert_eq!(fraction(x), (numerator.to_owned(), denominator.to_owned()), "{x}");
+        }
+        assert_eq!(float_repr(f64::INFINITY), "inf");
+        assert_eq!(float_repr(-0.0), "-0.0");
     }
 
     #[test]

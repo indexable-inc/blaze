@@ -242,6 +242,9 @@ the row says otherwise. `state`: `written` (the Rust is in the tree, not yet com
 | guards | written | `... guards.py '{"command": "held", "result": "<a smoke's budgets-smoke.json>"}'` | `R guards -- <the same>` | the lines and the status on a gate run's result; then on copies of it with one outcome's verdict set to `fail`, one outcome taken out, a number raised over its bound, and a bound of `harness/v2/guards-known.toml` that now passes; with `"result": "/nope.json"`, with no `result`, `{"command": "hold"}`, a `guards-known.toml` that is not TOML: the same lines, status 1 (the TOML error's words excepted) |
 | changed | written | `uv run --frozen python harness/v2/changed.py selftest` | `R changed -- selftest` | output (`changed.py selftest: ok`), status 0 |
 | changed | written | `... changed.py '{"base": "origin/main"}'`; with `"print": "packages"`; `"print": "args"`; `"dependents": false`; `{"base": "HEAD~3", "direct": true}` | `R changed -- <the same>` | output, status 0, on a branch a few commits past main; again with an untracked file in `crates/blaze-script/src/`, with `Cargo.lock` touched (`all`, `why_all`), and with only `docs/` changed (`print: args` prints nothing) |
+| diff_rules | written | `uv run --frozen python harness/v2/diff_rules.py selftest` | `R diff_rules -- selftest` | output (`diff_rules.py selftest: ok`), status 0 |
+| diff_rules | written | `... diff_rules.py '{"command": "write"}'` | `R diff_rules -- '{"command": "write"}'` | `git status --short` empty after each on a clean tree: `crates/blaze-diff/src/rules_gen.rs` and `lean/analysis/BlazeDiff/{Ops,Rules,Rewrites}.lean` byte-identical. Then with rules.json edited (a rule's tangent changed, a fast_math rewrite with two `requires` added, a constant `0.1` and `-2.5` in a tangent, a `powi(a, -3)` in a rewrite): the four files the same bytes from both (`git diff` after one, then the other) |
+| diff_rules | written | `... diff_rules.py '{"command": "check"}'` | `R diff_rules -- '{"command": "check"}'` | clean tree: silent, status 0. With one generated file given one more byte, then with rules.json given in turn: `(a + b)` for a tangent, `a $ b`, an unknown domain, a rewrite named twice, a rewrite field `colour`, `class` set to `fuzzy`, rules out of the operations' order, a rule removed, a fast_math rewrite with no `holds`, `-0.0` in a fast_math rewrite: the same lines, status 1 (a JSON syntax error's words excepted); `{"command": "chek"}`, no argument: the same lines and status |
 | changed | written | `... changed.py '{"base": "nope"}'`, `{"base": "main", "root": "/tmp"}`, `{"base": "main", "since": "x"}`, `{"base": "main", "print": "list"}`, `{}`, no argument | `R changed -- <the same>` | the same lines, status 1 |
 
 Known differences, on purpose: the words of a JSON syntax error are serde_json's; a heading's
@@ -250,8 +253,11 @@ where Python asked `str.isalnum` and Unicode category M (no heading of docs/ tel
 the clean-tree `check` proves it). The ledger's default `work` directory is
 `/tmp/ledger-<pid>-<nanoseconds>` where Python's `mkdtemp` chose a random name, and its date is
 `date +%Y-%m-%d`'s. A TOML syntax error (guards' known list, changed's manifests) is in the toml
-crate's words. `invariants` ends with git's words when `git ls-files` fails, and `changed` with
-`git did not start` when there is no git, where the Python raised (a traceback, status 1).
+crate's words. `invariants` ends with git's words when `git ls-files` fails, where the Python raised (a
+traceback, status 1); `changed` without a git says `git did not start` where the Python said
+`[Errno 2] ...`. `diff_rules` refuses a number token of non-ASCII digits (`\d` is Unicode in
+both) that Python's `float` read, and treats `\x1c`..`\x1f` as no space where Python's `\s` did;
+a rules.json it cannot read ends with a line, not a traceback.
 
 ## Appendix: every Python file
 
