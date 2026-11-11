@@ -12,6 +12,10 @@
 //! history's flush reads the ring ([`since`]) and names the addresses then, as it does the CPU
 //! samples'. A sample written over before a flush read it, or being written as it read, is lost
 //! and counted in the flush's `skipped`.
+//!
+//! Each sample is also kept by the allocator under its block's address until the block is
+//! freed ([`blaze_graph::arena::sampled`]), so the samples still there are what the heap holds,
+//! by call site: the `held_samples` table, a reading of them once a minute ([`held`]).
 
 use std::{
     sync::{
@@ -34,6 +38,9 @@ const KEPT: usize = 8192;
 /// stands for.
 const HEAD: usize = 6;
 const WORDS: usize = HEAD + DEPTH;
+
+// A sample still held is kept whole by the allocator's table of sampled blocks.
+const _: () = assert!(WORDS <= blaze_graph::arena::sampled::WORDS);
 
 /// The tag word of a sample made outside any task.
 const NO_TAG: u64 = 0xff;
@@ -88,6 +95,7 @@ pub fn start() -> Result<(), Unsampled> {
     }
     _ = EPOCH.get_or_init(Instant::now);
     STARTED.store(true, Ordering::Release);
+    blaze_graph::arena::sampled::keep();
     blaze_graph::arena::sample_heap_with(taken);
     Ok(())
 }
@@ -123,6 +131,26 @@ fn taken(sampled: HeapSampled) {
     let packed = u64::from(build) | tag << 32 | (depth as u64) << 40;
     let head = [t_ns, crate::sampler::os_tid(), packed, span, sampled.bytes, sampled.weight];
     put(head, &pcs[..depth]);
+    // And kept under the block's address until the block is freed: what `held_samples` reads.
+    blaze_graph::arena::sampled::put(
+        sampled.block,
+        head.iter().chain(&pcs[..depth]).copied(),
+    );
+}
+
+/// The samples whose blocks are still held, into `into`: every sampled allocation nobody has
+/// freed, with the stack that made it ([`blaze_graph::arena::sampled`]). Nothing where the
+/// sampler was not started in this process.
+pub(crate) fn held(into: &mut Vec<HeapSample>) {
+    if !STARTED.load(Ordering::Acquire) {
+        return;
+    }
+    let Some(epoch) = EPOCH.get() else { return };
+    blaze_graph::arena::sampled::each(|words| {
+        let mut own = [0u64; WORDS];
+        own.copy_from_slice(&words[..WORDS]);
+        into.push(decode(epoch, &own)); // alloc: a reading's rows, into the history's buffer
+    });
 }
 
 /// Writes one sample into its place in [`RING`], unless another writer holds it (a lap behind,

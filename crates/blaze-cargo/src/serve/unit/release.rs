@@ -446,7 +446,7 @@ pub(crate) struct Holders {
 
 impl Holders {
     /// The holders said at most.
-    const SHOWN: usize = 8;
+    const SHOWN: usize = 32;
 
     pub(crate) fn of(mut usage: Vec<MemoryUsage>) -> Holders {
         usage.sort_by(|a, b| b.held().cmp(&a.held()).then(a.name.cmp(b.name)));

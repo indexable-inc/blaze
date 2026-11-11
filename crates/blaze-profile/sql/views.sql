@@ -51,6 +51,9 @@ SELECT * FROM read_parquet(@inputs, union_by_name = true);
 CREATE OR REPLACE VIEW alloc_samples AS
 SELECT * FROM read_parquet(@alloc_samples, union_by_name = true);
 
+CREATE OR REPLACE VIEW held_samples AS
+SELECT * FROM read_parquet(@held_samples, union_by_name = true);
+
 CREATE OR REPLACE VIEW heap_by_owner AS
 SELECT * FROM read_parquet(@heap_by_owner, union_by_name = true);
 

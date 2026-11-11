@@ -353,12 +353,37 @@ pub(crate) fn alloc_samples(
     at: (Instant, i64),
     process: Process<'_>,
 ) -> Result<RecordBatch, ArrowError> {
+    heap_samples(&schema::ALLOC_SAMPLES, None, samples, frames, at, process)
+}
+
+/// The `held_samples` rows of one reading, at `read_ns`, of the samples still held
+/// ([`crate::heap::held`]): [`alloc_samples`]' columns of each, then the reading's time.
+pub(crate) fn held_samples(
+    samples: &[crate::heap::HeapSample],
+    frames: &HashMap<u64, Vec<String>, Global>,
+    at: (Instant, i64),
+    read_ns: i64,
+    process: Process<'_>,
+) -> Result<RecordBatch, ArrowError> {
+    heap_samples(&schema::HELD_SAMPLES, Some(read_ns), samples, frames, at, process)
+}
+
+/// The rows of `table`, `alloc_samples` or `held_samples`, which has `read_ns` as its last
+/// column: one column list for both, so the two tables' shared columns cannot differ.
+fn heap_samples(
+    table: &'static schema::Table,
+    read_ns: Option<i64>,
+    samples: &[crate::heap::HeapSample],
+    frames: &HashMap<u64, Vec<String>, Global>,
+    at: (Instant, i64),
+    process: Process<'_>,
+) -> Result<RecordBatch, ArrowError> {
     let rows = samples.len();
-    let schema = schema_of(&schema::ALLOC_SAMPLES);
+    let schema = schema_of(table);
     let list_field = |name: &str| {
-        let at = schema::ALLOC_SAMPLES
+        let at = table
             .column(name)
-            .unwrap_or_else(|| unreachable!("alloc_samples has {name}"));
+            .unwrap_or_else(|| unreachable!("{} has {name}", table.name));
         let DataType::List(item) = schema.field(at).data_type() else {
             unreachable!("{name} is a list (arrow.rs)")
         };
@@ -390,7 +415,7 @@ pub(crate) fn alloc_samples(
     let tags: DictionaryArray<UInt32Type> =
         samples.iter().map(|it| it.tag.map(blaze_mem::Tag::name)).collect();
     // alloc: a batch's list of columns, once a read
-    let columns: Vec<ArrayRef> = vec![
+    let mut columns: Vec<ArrayRef> = vec![
         column(UInt64Array::from_iter(samples.iter().map(|it| build_id(it.build)))),
         column(UInt32Array::from_value(process.pid, rows)),
         column(UInt32Array::from_iter_values(samples.iter().map(|it| it.tid as u32))),
@@ -407,6 +432,9 @@ pub(crate) fn alloc_samples(
                 .map(|it| crate::heap::site_of(&it.pcs[..usize::from(it.depth)], frames)),
         )),
     ];
+    if let Some(read_ns) = read_ns {
+        columns.push(column(Int64Array::from_value(read_ns, rows))); // alloc: one column more
+    }
     RecordBatch::try_new(schema, columns)
 }
 

@@ -2983,7 +2983,8 @@ attributes #0 = { alwaysinline }
         assert_eq!(attribute("aarch64-apple-darwin", false).as_deref(), Some("non-leaf"));
         assert_eq!(attribute("x86_64-apple-darwin", false).as_deref(), Some("non-leaf"));
         assert_eq!(attribute("aarch64-apple-darwin", true).as_deref(), Some("all"));
-        assert_eq!(attribute("aarch64-unknown-linux-gnu", false), None);
+        assert_eq!(attribute("aarch64-unknown-linux-gnu", false).as_deref(), Some("non-leaf"));
+        assert_eq!(attribute("x86_64-unknown-linux-gnu", false), None);
         assert_eq!(attribute("x86_64-unknown-linux-gnu", true).as_deref(), Some("all"));
     }
 

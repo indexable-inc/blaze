@@ -610,8 +610,15 @@ impl Target {
     /// a function that calls and keeps no frame record leaves its return address where only
     /// its DWARF rows say. `-C force-frame-pointers=no` cannot take it away, as in rustc
     /// (`FramePointer::ratchet`).
+    ///
+    /// And `aarch64-unknown-linux-gnu`'s, whose rustc target spec has `frame_pointer: NonLeaf`
+    /// too (AAPCS64 expects a frame record in every function that calls): without it x29 is
+    /// any register, and a walk by the frame chain of a blaze-built program finds nothing.
+    /// blaze's own daemon is such a program: its heap and CPU samples' stacks were one frame,
+    /// an address in no function (2026-11-11, lane mem-1111: every `alloc_samples` site of a
+    /// self-built daemon read `[blaze1]`).
     pub(crate) fn requires_frame_pointers(&self) -> bool {
-        self.triple().contains("-apple-")
+        self.triple().contains("-apple-") || self.triple() == "aarch64-unknown-linux-gnu"
     }
 
     /// LLVM's `"frame-pointer"` attribute of a function of this target: `all` when its unit
@@ -932,17 +939,17 @@ mod tests {
         assert!(Features::BASELINE.names().is_empty());
     }
 
-    /// rustc's frame pointers: `all` when forced, Apple's `non-leaf` whatever the flags, else
+    /// rustc's frame pointers: `all` when forced, Apple's and aarch64 Linux's `non-leaf` whatever the flags, else
     /// LLVM's default.
     #[test]
     fn frame_pointers_are_forced_or_the_abis() {
-        for apple in ["aarch64-apple-darwin", "x86_64-apple-darwin"] {
+        for apple in ["aarch64-apple-darwin", "x86_64-apple-darwin", "aarch64-unknown-linux-gnu"] {
             let apple = Target::of(apple).expect("a target");
             assert!(apple.requires_frame_pointers());
             assert_eq!(apple.llvm_frame_pointer(false), Some("non-leaf"), "{}", apple.triple());
             assert_eq!(apple.llvm_frame_pointer(true), Some("all"));
         }
-        for other in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-pc-windows-msvc"] {
+        for other in ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"] {
             let other = Target::of(other).expect("a target");
             assert!(!other.requires_frame_pointers(), "{}", other.triple());
             assert_eq!(other.llvm_frame_pointer(false), None);
