@@ -162,6 +162,10 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 59. **unease-is-work**: When anything seems iffy, suboptimal or makes you uneasy, stop and find the core
     reason it is that way, then fix that reason at its root, whatever it takes: a redesign, a
     language change, addition or removal. Skill: `changing-code`.
+60. **incremental-first**: Incremental builds come first: optimise and judge blaze by the edit loop
+    (no-op, comment, body edit, first edit, edit after restart, memory while warm); design so cold
+    builds can be fast too, but do not spend on them ahead of incremental for now. Skill:
+    `perf-and-tracing`.
 
 ## Code Review Rules
 
