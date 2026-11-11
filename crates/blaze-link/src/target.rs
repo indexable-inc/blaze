@@ -1547,6 +1547,16 @@ impl Line<'_> {
         kind: NativeLibKind,
         verbatim: bool,
     ) -> Result<(), LinkError> {
+        // rustc hands link.exe a `+verbatim` name as it is written, and the standard library
+        // writes the C runtime that way (`#[link(name = "/defaultlib:libcmt", modifiers =
+        // "+verbatim")]`, `msvcrt` when it is dynamic): an argument, a `/DEFAULTLIB`, not a file.
+        if verbatim
+            && self.output.format == Format::Pe
+            && let Some(library) = default_library_argument(name)
+        {
+            let path = self.default_library(&library)?;
+            return self.push(path, NativeKind::Archive { whole: false });
+        }
         let (path, kind) = self.find(name, kind, verbatim)?;
         self.push(path, kind)
     }
@@ -1858,6 +1868,26 @@ impl Line<'_> {
         }
         Ok(())
     }
+}
+
+/// The library a `+verbatim` native library name asks for when the name is link.exe's
+/// `/DEFAULTLIB:NAME` argument (`-` for `/` also, as link.exe takes it), named as link.exe names
+/// a default library: `.lib` added when it has no extension, quotes taken off. `None` for a name
+/// that is a file's.
+fn default_library_argument(name: &str) -> Option<String> {
+    const OPTION: &str = "defaultlib:";
+    let option = name.strip_prefix(['/', '-'])?;
+    let (head, library) = option.split_at_checked(OPTION.len())?;
+    if !head.eq_ignore_ascii_case(OPTION) {
+        return None;
+    }
+    let library = library.trim_matches('"');
+    if library.is_empty() {
+        return None;
+    }
+    let file = library.rsplit(['/', '\\']).next().unwrap_or(library);
+    // alloc: once per library searched, its file name
+    Some(if file.contains('.') { library.to_owned() } else { format!("{library}.lib") })
 }
 
 /// The file names a library may have, in the order the linker tries them in a directory, and
