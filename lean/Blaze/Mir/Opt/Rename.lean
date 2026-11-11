@@ -155,11 +155,9 @@ theorem State.setSlots_rename (ρ : FnId → BlockId → BlockId) (st : State) (
     have right : st.setSlots f slots =
         { base := st.base, stack := setFrame st.stack f slots, next := st.next } :=
       (State.setSlots_def st f slots).trans (if_neg hf)
-    have mid : ({ base := st.base, stack := setFrame (renameStack ρ st.stack) f slots,
-          next := st.next } : State) =
-        State.rename ρ { base := st.base, stack := setFrame st.stack f slots, next := st.next } :=
-      congrTo (fun s => ({ base := st.base, stack := s, next := st.next } : State))
-        (setFrame_renameStack ρ f slots st.stack)
+    have mid : State.mk st.base (setFrame (renameStack ρ st.stack) f slots) st.next =
+        State.rename ρ (State.mk st.base (setFrame st.stack f slots) st.next) :=
+      congrTo (fun s => State.mk st.base s st.next) (setFrame_renameStack ρ f slots st.stack)
     exact left.trans (mid.trans (congrTo (State.rename ρ) right).symm)
 
 theorem State.setSlotIn_rename (ρ : FnId → BlockId → BlockId) (st : State) (p : Pointer)
@@ -427,15 +425,13 @@ theorem enterState_rename (ρ : FnId → BlockId → BlockId) (st : State) (fn :
   subst hfn
   exact congrTo
     (fun b =>
-      ({ base := st.base,
-         stack :=
-           ({ id := st.next, fn := id, block := b,
-              locals :=
-                Slot.uninit ::
-                  (args.map Slot.init ++ List.replicate (sig.locals - 1 - sig.args) Slot.uninit),
-              dest := dest, target := mapTarget (ρ st.topFn) target } : Frame) ::
-             renameStack ρ st.stack,
-         next := st.next + 1 } : State))
+      State.mk st.base
+        (Frame.mk st.next id b
+            (Slot.uninit ::
+              (args.map Slot.init ++ List.replicate (sig.locals - 1 - sig.args) Slot.uninit))
+            dest (mapTarget (ρ st.topFn) target) ::
+          renameStack ρ st.stack)
+        (st.next + 1))
     h0.symm
 
 theorem State.enter_rename (ρ : FnId → BlockId → BlockId) (st : State) (fn : FnId)
@@ -451,13 +447,14 @@ theorem State.enter_rename (ρ : FnId → BlockId → BlockId) (st : State) (fn 
     have right : st.enter id sig args dest target =
         Outcome.ok (Next.state (enterState st id sig args dest target)) :=
       (State.enter_eq st id sig args dest target).trans (if_pos hl)
-    have mid : (Outcome.ok (Next.state
-          (enterState (st.rename ρ) id sig args dest (mapTarget (ρ fn) target))) : Outcome Next) =
-        Outcome.map (Next.map (State.rename ρ))
-          (Outcome.ok (Next.state (enterState st id sig args dest target))) :=
-      congrTo (fun s => (Outcome.ok (Next.state s) : Outcome Next))
-        (enterState_rename ρ st fn hfn id sig args dest target h0)
-    exact left.trans (mid.trans (congrTo (Outcome.map (Next.map (State.rename ρ))) right).symm)
+    have mid : Outcome.map (Next.map (State.rename ρ))
+          (Outcome.ok (Next.state (enterState st id sig args dest target))) =
+        Outcome.ok (Next.state
+          (enterState (st.rename ρ) id sig args dest (mapTarget (ρ fn) target))) :=
+      (congrTo (fun s => Outcome.ok (Next.state s))
+        (enterState_rename ρ st fn hfn id sig args dest target h0)).symm
+    exact left.trans
+      (mid.symm.trans (congrTo (Outcome.map (Next.map (State.rename ρ))) right).symm)
   · have left : (st.rename ρ).enter id sig args dest (mapTarget (ρ fn) target) =
         Outcome.undefined Undefined.illFormed :=
       (State.enter_eq (st.rename ρ) id sig args dest (mapTarget (ρ fn) target)).trans (if_neg hl)
