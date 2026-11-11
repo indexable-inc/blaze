@@ -16,8 +16,6 @@ package = false
 
 [tool.uv.workspace]
 members = ["tools/typed-input"]
-# Its own project with its own lock, so torch stays out of this one.
-exclude = ["tools/similar"]
 
 [tool.uv.sources]
 typed-input = { workspace = true }
@@ -57,7 +55,6 @@ include = [
   "tools/devirt/*.py",
   "tools/layout",
   "tools/cpus.py",
-  "tools/similar",
   "tools/typed-input",
   "tools/v2",
   "tools/vendor",
