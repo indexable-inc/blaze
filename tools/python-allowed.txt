@@ -79,7 +79,6 @@ harness/reachmacros.py
 harness/realdebug.py
 harness/rebuild.py
 harness/rival.py
-harness/rustcsites.py
 harness/rustsrc.py
 harness/scriptenv.py
 harness/selects.py

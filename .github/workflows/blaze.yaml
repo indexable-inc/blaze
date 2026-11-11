@@ -10,7 +10,7 @@
 #       test targets type-check) with the release on Linux AArch64,
 #       the lint baselines (crates/blaze-lints/baselines) with the blaze the tree builds, on
 #       Linux AArch64,
-#       `harness/imports.py` and `harness/rustcsites.py`, actionlint over the workflows. No `blaze fmt --check`: fmt.yaml
+#       `harness/imports.py` and `rustcsites` (scripts/), actionlint over the workflows. No `blaze fmt --check`: fmt.yaml
 #       formats main after each push instead.
 #   push to main: the build and the unit tests on Linux AArch64 and macOS, which
 #       write the caches every other run reads, and the same `blaze check --workspace`. One runs at a time: the next push waits, and a
@@ -121,8 +121,6 @@ jobs:
       # The list of tests that may fail holds together and is as its recorder writes it, and the
       # comparison and the recording do what they say on made-up results.
       - run: uv run --frozen python harness/failures.py selftest
-      # No new place in blaze's code starts rustc, rustdoc or cargo (docs/no-rustc.md).
-      - run: python3 harness/rustcsites.py
       # The agent rules: tools/agents/rules.ts type-checks, and AGENTS.md and the rules in .agents/skills/*/SKILL.md are what it generates.
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile --cwd site
@@ -142,6 +140,9 @@ jobs:
       - run: |
           blaze run -q -p scripts --bin docs -- selftest
           blaze run -q -p scripts --bin docs -- check
+      # No new place in blaze's code starts rustc, rustdoc or cargo (docs/no-rustc.md,
+      # scripts/src/bin/rustcsites.rs).
+      - run: blaze run -q -p scripts --bin rustcsites
       # The objectives ledger's rows are well formed and its table is current (scripts/src/bin/ledger.rs).
       - run: |
           blaze run -q -p scripts --bin ledger -- selftest

@@ -1,16 +1,13 @@
 //! rustcsites: the places in crates/ that start rustc, rustdoc, cargo or rustup, held to
-//! `harness/norustc/sites.json`. The port of `harness/rustcsites.py`, line for line: the same
-//! flag, lines printed, file written and exit status (docs/v2/plan/design/scripts.md, "Ports and
-//! their parity"). What follows is the Python's docstring.
+//! `harness/norustc/sites.json`. The port of `harness/rustcsites.py`, deleted once both were run
+//! on the same tree and agreed (docs/v2/plan/design/scripts.md, "Ports and their parity").
 //!
 //!     blaze run -q -p scripts --bin rustcsites [-- --record]
 //!
-//! rustcsites.py: the places in crates/ that start rustc, rustdoc, cargo or rustup, or read
-//! which one to start, counted per file against norustc/sites.json. One more in a file fails:
-//! blaze is to run no rustc (docs/no-rustc.md), so no new place may start one, and a place that
-//! goes lowers the count.
-//!
-//!     rustcsites.py [--record]
+//! It counts the places in crates/ that start rustc, rustdoc, cargo or rustup, or read which one
+//! to start, per file against norustc/sites.json. One more in a file fails: blaze is to run no
+//! rustc (docs/no-rustc.md), so no new place may start one, and a place that goes lowers the
+//! count.
 //!
 //! --record writes the counts as they are, after a change that removed a place.
 //!
@@ -214,12 +211,12 @@ fn main() {
         if now > was {
             more.push(format!("{path}: {now} places, {was} recorded (lines {})", joined(lines)));
         } else if now < was {
-            println!("{path}: {now} places, {was} recorded; rustcsites.py --record lowers it");
+            println!("{path}: {now} places, {was} recorded; `blaze run -q -p scripts --bin rustcsites -- --record` lowers it");
         }
     }
     for (path, was) in &recorded {
         if !found.iter().any(|(it, _)| it == path) {
-            println!("{path}: no place, {was} recorded; rustcsites.py --record lowers it");
+            println!("{path}: no place, {was} recorded; `blaze run -q -p scripts --bin rustcsites -- --record` lowers it");
         }
     }
     for line in &more {
