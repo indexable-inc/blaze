@@ -50,10 +50,13 @@ theorem rule_sound_mul (hf : HasDerivAt f f' x) (hg : HasDerivAt g g' x) :
 theorem rule_sound_div (hf : HasDerivAt f f' x) (hg : HasDerivAt g g' x) (hd : g x ≠ 0) :
     HasDerivAt (fun t => f t / g t) ((f' - f x / g x * g') / g x) x := by
   have h := hf.div hg hd
+  -- `div_mul_eq_mul_div : a / b * c = a * c / b`, `mul_div_assoc : a * b / c = a * (b / c)`
+  have hb : f x / g x * g x = f x := by
+    rw [div_mul_eq_mul_div, mul_div_assoc, div_self hd, mul_one]
+  -- `div_eq_div_iff : b ≠ 0 → d ≠ 0 → (a / b = c / d ↔ a * d = c * b)`
   have e : (f' * g x - f x * g') / g x ^ 2 = (f' - f x / g x * g') / g x := by
-    first
-      | (field_simp; ring)
-      | field_simp
+    rw [div_eq_div_iff (pow_ne_zero 2 hd) hd]
+    linear_combination (g' * g x) * hb
   exact h.congr_deriv e
 
 -- `HasDerivAt.neg : HasDerivAt f f' x → HasDerivAt (fun x => -f x) (-f') x`
@@ -141,10 +144,8 @@ theorem one_add_tan_mul_tan {v : ℝ} (hv : Real.cos v ≠ 0) :
     1 + Real.tan v * Real.tan v = 1 / Real.cos v ^ 2 := by
   have hs := Real.sin_sq_add_cos_sq v
   rw [Real.tan_eq_sin_div_cos]
-  first
-    | (field_simp; nlinarith [hs])
-    | (field_simp; ring_nf; nlinarith [hs])
-    | field_simp
+  field_simp
+  nlinarith [hs]
 
 -- `Real.hasDerivAt_tan : Real.cos x ≠ 0 → HasDerivAt Real.tan (1 / Real.cos x ^ 2) x`
 theorem rule_sound_tan (hf : HasDerivAt f f' x) (hd : Real.cos (f x) ≠ 0) :
@@ -156,22 +157,19 @@ theorem rule_sound_tan (hf : HasDerivAt f f' x) (hd : Real.cos (f x) ≠ 0) :
 -- `Real.hasDerivAt_cosh (x) : HasDerivAt Real.cosh (Real.sinh x) x`
 -- `Real.cosh_pos (x) : 0 < Real.cosh x`
 -- `Real.tanh_eq_sinh_div_cosh (x) : Real.tanh x = Real.sinh x / Real.cosh x`
--- `Real.cosh_sq (x) : Real.cosh x ^ 2 = Real.sinh x ^ 2 + 1`
 /-- `tanh`'s derivative, from `sinh / cosh`: no Mathlib name for it is relied on. -/
 theorem hasDerivAt_tanh (v : ℝ) :
     HasDerivAt Real.tanh (1 - Real.tanh v * Real.tanh v) v := by
   have hc : Real.cosh v ≠ 0 := (Real.cosh_pos v).ne'
-  have hq := Real.cosh_sq v
+  have hc2 : Real.cosh v ^ 2 ≠ 0 := pow_ne_zero 2 hc
   have h := (Real.hasDerivAt_sinh v).div (Real.hasDerivAt_cosh v) hc
   have hfun : Real.tanh = fun y => Real.sinh y / Real.cosh y :=
     funext Real.tanh_eq_sinh_div_cosh
   have e : (Real.cosh v * Real.cosh v - Real.sinh v * Real.sinh v) / Real.cosh v ^ 2 =
       1 - Real.tanh v * Real.tanh v := by
-    rw [Real.tanh_eq_sinh_div_cosh]
-    first
-      | (field_simp; ring)
-      | (field_simp; nlinarith [hq])
-      | field_simp
+    -- `div_mul_div_comm : a / b * (c / d) = a * c / (b * d)`, `sq : a ^ 2 = a * a`,
+    -- `sub_div : (a - b) / c = a / c - b / c`
+    rw [Real.tanh_eq_sinh_div_cosh, div_mul_div_comm, ← sq (Real.cosh v), sub_div, div_self hc2]
   have h2 : HasDerivAt Real.tanh
       ((Real.cosh v * Real.cosh v - Real.sinh v * Real.sinh v) / Real.cosh v ^ 2) v := by
     rw [hfun]
