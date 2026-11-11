@@ -166,33 +166,33 @@ def sqrt_squared : Prop :=
 
 /-- Every fast_math rewrite preserves the term's meaning over the reals. -/
 structure AllSound : Prop where
-  add_zero : add_zero
-  mul_zero : mul_zero
-  zero_div : zero_div
-  sub_self : sub_self
-  div_self : div_self
-  mul_div_cancel : mul_div_cancel
-  div_mul_cancel : div_mul_cancel
-  assoc_add : assoc_add
-  assoc_add_back : assoc_add_back
-  assoc_mul : assoc_mul
-  assoc_mul_back : assoc_mul_back
-  factor : factor
-  factor_sub : factor_sub
-  common_divisor : common_divisor
-  common_divisor_sub : common_divisor_sub
-  mul_of_quotient : mul_of_quotient
-  quotient_of_quotient : quotient_of_quotient
-  sub_of_quotient : sub_of_quotient
-  mul_reciprocal : mul_reciprocal
-  pythagoras : pythagoras
-  ln_exp : ln_exp
-  exp_sum : exp_sum
-  powi_two : powi_two
-  powi_one : powi_one
-  powi_zero : powi_zero
-  fma : fma
-  neg_of_difference : neg_of_difference
-  sqrt_squared : sqrt_squared
+  add_zero : BlazeDiff.Rewrite.add_zero
+  mul_zero : BlazeDiff.Rewrite.mul_zero
+  zero_div : BlazeDiff.Rewrite.zero_div
+  sub_self : BlazeDiff.Rewrite.sub_self
+  div_self : BlazeDiff.Rewrite.div_self
+  mul_div_cancel : BlazeDiff.Rewrite.mul_div_cancel
+  div_mul_cancel : BlazeDiff.Rewrite.div_mul_cancel
+  assoc_add : BlazeDiff.Rewrite.assoc_add
+  assoc_add_back : BlazeDiff.Rewrite.assoc_add_back
+  assoc_mul : BlazeDiff.Rewrite.assoc_mul
+  assoc_mul_back : BlazeDiff.Rewrite.assoc_mul_back
+  factor : BlazeDiff.Rewrite.factor
+  factor_sub : BlazeDiff.Rewrite.factor_sub
+  common_divisor : BlazeDiff.Rewrite.common_divisor
+  common_divisor_sub : BlazeDiff.Rewrite.common_divisor_sub
+  mul_of_quotient : BlazeDiff.Rewrite.mul_of_quotient
+  quotient_of_quotient : BlazeDiff.Rewrite.quotient_of_quotient
+  sub_of_quotient : BlazeDiff.Rewrite.sub_of_quotient
+  mul_reciprocal : BlazeDiff.Rewrite.mul_reciprocal
+  pythagoras : BlazeDiff.Rewrite.pythagoras
+  ln_exp : BlazeDiff.Rewrite.ln_exp
+  exp_sum : BlazeDiff.Rewrite.exp_sum
+  powi_two : BlazeDiff.Rewrite.powi_two
+  powi_one : BlazeDiff.Rewrite.powi_one
+  powi_zero : BlazeDiff.Rewrite.powi_zero
+  fma : BlazeDiff.Rewrite.fma
+  neg_of_difference : BlazeDiff.Rewrite.neg_of_difference
+  sqrt_squared : BlazeDiff.Rewrite.sqrt_squared
 
 end BlazeDiff.Rewrite

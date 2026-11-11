@@ -4,6 +4,8 @@ with command `write`. Each operation's derivative rule: `blaze_diff::diff::RULES
 -/
 import BlazeDiff.Template
 
+noncomputable section
+
 namespace BlazeDiff.Rules
 
 /-- Whether the operation has a rule: a float operation but `const` and `var`. -/
@@ -211,3 +213,5 @@ def kink : Op → Option KinkAt
   | .select => some .condition
 
 end BlazeDiff.Rules
+
+end

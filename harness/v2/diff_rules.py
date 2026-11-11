@@ -521,7 +521,7 @@ def lean_rules(rules: Rules, ops: dict[str, Op]) -> str:
     by_op = {r.op: r for r in rules.rules}
     names = [(op, camel(op.name, False)) for op in rules.ops]
     out = lean_header("Each operation's derivative rule: `blaze_diff::diff::RULES`.")
-    out += ["import BlazeDiff.Template", "", "namespace BlazeDiff.Rules", ""]
+    out += ["import BlazeDiff.Template", "", "noncomputable section", "", "namespace BlazeDiff.Rules", ""]
 
     def table(doc: str, head: str, value) -> None:
         out.extend([f"/-- {doc} -/", head])
@@ -545,7 +545,7 @@ def lean_rules(rules: Rules, ops: dict[str, Op]) -> str:
         return "none" if rule is None or rule.kink is None else f"some .{rule.kink.at}"
 
     table("Where the operation has no derivative, when it has such a point.", "def kink : Op → Option KinkAt", kink)
-    out.append("end BlazeDiff.Rules")
+    out += ["end BlazeDiff.Rules", "", "end"]
     return "\n".join(out) + "\n"
 
 
@@ -578,7 +578,7 @@ def lean_rewrites(rules: Rules, ops: dict[str, Op]) -> str:
             "",
         ]
     out += ["/-- Every fast_math rewrite preserves the term's meaning over the reals. -/", "structure AllSound : Prop where"]
-    out += [f"  {lean_name(row.name)} : {lean_name(row.name)}" for row in fast]
+    out += [f"  {lean_name(row.name)} : BlazeDiff.Rewrite.{lean_name(row.name)}" for row in fast]
     out += ["", "end BlazeDiff.Rewrite"]
     return "\n".join(out) + "\n"
 
@@ -668,7 +668,7 @@ def selftest() -> None:
     expect("  | .div => .divisorNonZero" in files[f"{LEAN}/Rules.lean"] and "  | .mulAdd => some .value" in files[f"{LEAN}/Rules.lean"], files[f"{LEAN}/Rules.lean"])
     rewrites = files[f"{LEAN}/Rewrites.lean"]
     expect("def div_self : Prop :=\n  ∀ (env : ℕ → ℝ) (a : Expr),\n    a.eval env ≠ (0 : ℝ) →\n    (Expr.bin .div a a).eval env = (Expr.const (1 : ℝ)).eval env" in rewrites, rewrites)
-    expect("  div_self : div_self" in rewrites and "mul_one" not in rewrites and "They are: mul-one." in rewrites, "only fast_math rewrites are stated")
+    expect("  div_self : BlazeDiff.Rewrite.div_self" in rewrites and "mul_one" not in rewrites and "They are: mul-one." in rewrites, "only fast_math rewrites are stated")
 
     def changed(edit) -> str:
         copy = json.loads(json.dumps(small))
