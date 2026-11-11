@@ -1006,7 +1006,7 @@ impl<'a> Ctx<'a> {
     }
 
     /// Waits by what they wait for, charged by the critical path; and the blind spots of waits
-    /// that name nothing or no owner.
+    /// that name nothing or whose owner the path could not cross to.
     fn waits(&self, out: &mut Vec<Finding>) -> Vec<BlindSpot> {
         let model = self.model;
         #[derive(Default)]
@@ -1023,6 +1023,9 @@ impl<'a> Ctx<'a> {
             /// Its waits' spans were under the floor the model read from ([`crate::time::SpanCut`]).
             under_floor: bool,
             moved: bool,
+            /// Who its waits say ends them (`spans.owned_by`), the first that says: what an
+            /// ownerless class is told to do about it.
+            by: Option<blaze_graph::wait::OwnedBy>,
         }
         // alloc: once a report
         let mut of_wait = vec![0i64; model.waits.len()];
@@ -1100,6 +1103,7 @@ impl<'a> Ctx<'a> {
             class.named |= named;
             class.under_floor |= under_floor;
             class.moved |= wait.on == Some(crate::flight::WaitedOn::Moved);
+            class.by = class.by.or(wait.span.and_then(|it| model.spans[it].owned_by));
             if let Some(lane) = wait.waker.lane() {
                 class.known += 1;
                 let at = wait.ready_ns.or(wait.resumed_ns).unwrap_or(wait.parked_ns);
@@ -1173,7 +1177,8 @@ impl<'a> Ctx<'a> {
                     subject: name.clone(),
                     // clone: its evidence, also the finding's
                     evidence: evidence.clone(),
-                    fix: "set the wait's `owner` (the job running the key, the lock's holder) so the critical path can cross it".to_owned(),
+                    // alloc: a blind spot's fix, once a class a report
+                    fix: ownerless_fix(class.by).to_owned(),
                 });
             }
             let (saves, estimate) = match (on_path > 0, self.path_trusted) {
@@ -2122,4 +2127,37 @@ fn file_in(text: &str) -> Option<String> {
     let end = rest.find(|c: char| c.is_whitespace() || c == ')' || c == ',').unwrap_or(rest.len());
     let it = &rest[..end];
     it.contains(".rs").then(|| it.to_owned())
+}
+
+/// What to do about waits the critical path could not cross, by who they say ends them
+/// (`spans.owned_by`): each kind of owner is crossed by another row, and a class that still
+/// reads as ownerless lacks that row.
+fn ownerless_fix(by: Option<blaze_graph::wait::OwnedBy>) -> &'static str {
+    use blaze_graph::wait::OwnedBy;
+    match by {
+        Some(OwnedBy::Job) => {
+            "its `owner` names a job with no lane in the record (a job on no fiber, or one whose switches are of no build read): give that job's work a `job` span, or run it on the pool"
+        }
+        Some(OwnedBy::Sender) => {
+            "say who woke it as the wait ends: `blaze_graph::wait::wait_woken` with the job that posted (as `blaze_graph::sched::observed` numbers it), so the critical path crosses into that job"
+        }
+        Some(OwnedBy::Daemon) => {
+            "the record holds no `loop: a job's answer` span of its daemon while it waited: the daemon's rows of this build are missing, or its answer's span was too short for a row"
+        }
+        Some(OwnedBy::ScopeJobs) => {
+            "the scope's jobs wrote no `ready` row for the waiter: the recorder lost switches, or the scope's caller is on no fiber"
+        }
+        Some(OwnedBy::Holder) => {
+            "the lock's holder is a thread: `blaze debug locks` (`lock_waits`) names it and what to use in the lock's place"
+        }
+        Some(OwnedBy::Kernel | OwnedBy::Child) => {
+            "the wait is on the kernel or a child process, which no job ends: shorten the io, or move it off the path"
+        }
+        Some(OwnedBy::Unsaid) => {
+            "a key's wait whose caller named no runner: pass the runner's job to `blaze_graph::wait::wait` at that call"
+        }
+        None => {
+            "a wait of a blaze before `spans.owned_by`: set the wait's `owner` (the job running the key) so the critical path can cross it"
+        }
+    }
 }

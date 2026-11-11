@@ -182,6 +182,8 @@ Each query below is a named view (`blaze explain <name>`) unless it says otherwi
 - `blaze explain long_spans [min_ms=20]`: the longest spans, with their own CPU: long with
   little CPU and not a `wait` is blocked in something no span names.
 - `blaze explain waits_by_reason`: `wait` and `admission` spans by what they waited for.
+- `blaze explain wait_owner [min_ms=20]`: the long waits, each with who ends it (`owned_by`,
+  `owner`) and what that owner's job did meanwhile (`owner_did`: `query verify`, a query's run).
 - `blaze explain counts_by_cause`: `query_counts` with the cause columns, the most run first.
   An edit's build runs a handful.
 - `blaze explain writes`: the inputs the build wrote, and for each the fields reruns name as

@@ -828,7 +828,11 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
         command = asked.command().name(),
     )
     .entered();
-    let called = api.call(request, |response, more| {
+    // A `wait` row owned by the daemon (`owned_by = 'the daemon'`), so `blaze slow` follows
+    // the critical path across it into the daemon's answer; the ad hoc span above stays for
+    // the timeline.
+    let called = blaze_graph::wait::wait_for_daemon("the daemon's answer to the request", || {
+        api.call(request, |response, more| {
         if let ResponseRef::Diagnostic(diagnostic) = &response {
             if let Some(counted) = &mut counted {
                 counted.add(diagnostic);
@@ -870,6 +874,7 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
         if let Err(error) = written {
             unwritten.get_or_insert(error);
         }
+        })
     });
     drop(waiting);
     if let Some(error) = unwritten {

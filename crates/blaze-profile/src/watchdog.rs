@@ -534,7 +534,14 @@ mod tests {
                     let awaits = crate::span::Name::of("trait_solve `T: Sized`");
                     let on = blaze_graph::wait::WaitKind::Key;
                     let _wait =
-                        crate::span::Wait { awaits, function: awaits, owner: Some(7), on }.open();
+                        crate::span::Wait {
+                            awaits,
+                            function: awaits,
+                            owner: Some(7),
+                            on,
+                            by: blaze_graph::wait::OwnedBy::Job,
+                        }
+                        .open();
                     ready.wait();
                     let (released, cv) = &gate;
                     let mut released = released.lock();

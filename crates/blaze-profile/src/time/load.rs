@@ -15,6 +15,7 @@ use arrow_array::{
     cast::AsArray,
     types::{Float64Type, Int64Type, UInt64Type},
 };
+use blaze_graph::wait::OwnedBy;
 
 use super::{
     CutGroup, Event, EventIn, Input, JOB_SPAN, LaneId, Model, PathRead, SpanCut, SpanIn, State,
@@ -351,7 +352,8 @@ const FLOORS_NS: [i64; 24] = [
 const SPAN_COLUMNS: &str = "CAST(process AS BIGINT) AS process, CAST(thread AS BIGINT) AS thread, CAST(span_id AS UBIGINT) AS span_id, \
      CAST(parent AS UBIGINT) AS parent, CAST(depth AS BIGINT) AS depth, CAST(name AS VARCHAR) AS name, \
      CAST(crate AS VARCHAR) AS krate, CAST(function AS VARCHAR) AS function, CAST(unit AS VARCHAR) AS unit, \
-     CAST(awaits AS VARCHAR) AS awaits, CAST(owner AS UBIGINT) AS owner, CAST(job AS UBIGINT) AS job, \
+     CAST(awaits AS VARCHAR) AS awaits, CAST(owner AS UBIGINT) AS owner, CAST(owned_by AS VARCHAR) AS owned_by, \
+     CAST(job AS UBIGINT) AS job, \
      CAST(creator AS UBIGINT) AS creator, CAST(start_ns AS BIGINT) AS start_ns, CAST(dur_ns AS BIGINT) AS dur_ns, \
      CAST(self_cpu_ns AS BIGINT) AS self_cpu_ns, CAST(coalesce(folded_ns, 0) AS BIGINT) AS folded_ns";
 
@@ -970,8 +972,8 @@ fn build_process(source: &Source<'_>, build: u64) -> Result<Option<u32>, TimeErr
 const SWITCHES_SINCE_2: &str = "NULL::UBIGINT AS by_job, NULL::BIGINT AS since_ns, NULL::UBIGINT AS began_as, NULL::BIGINT AS queued_ns, NULL::BIGINT AS cpu_ns";
 /// And `spans.folded_ns`, which version 3 added: a file of an older version folded nothing
 /// ([`crate::schema::VERSION`]), so its null reads as 0.
-const SPANS_SINCE_2: &str =
-    "NULL::UBIGINT AS job, NULL::UBIGINT AS creator, NULL::BIGINT AS folded_ns";
+/// And `spans.owned_by` (2026-11-11), who ends a wait: null in a file from before it.
+const SPANS_SINCE_2: &str = "NULL::UBIGINT AS job, NULL::UBIGINT AS creator, NULL::BIGINT AS folded_ns, NULL::VARCHAR AS owned_by";
 
 /// `table`'s rows of `build`, and its rows of no build that `window` holds (a condition on the
 /// row's time), with the `added` columns null where its files have none.
@@ -1129,6 +1131,7 @@ fn spans_of(batches: &[RecordBatch]) -> Result<Vec<SpanIn>, TimeError> {
             uints(batch, T, "job")?,
         );
         let creator = uints(batch, T, "creator")?;
+        let owned_by = texts(batch, T, "owned_by")?;
         let (start_ns, dur_ns, self_cpu) = (
             ints(batch, T, "start_ns")?,
             ints(batch, T, "dur_ns")?,
@@ -1151,6 +1154,13 @@ fn spans_of(batches: &[RecordBatch]) -> Result<Vec<SpanIn>, TimeError> {
                 unit: text(unit, row),
                 awaits: text(awaits, row),
                 owner: get(owner, row, |it, row| it.value(row)),
+                // A name no `OwnedBy` has (a newer blaze's file) reads as not said, as a file
+                // from before the column does: the wait is then crossed by its `owner` alone.
+                owned_by: get(owned_by, row, |it, row| {
+                    let name = it.value(row);
+                    OwnedBy::ALL.into_iter().find(|by| by.name() == name)
+                })
+                .flatten(),
                 job: get(of_job, row, |it, row| it.value(row)),
                 creator: get(creator, row, |it, row| it.value(row)),
                 start_ns: get(start_ns, row, |it, row| it.value(row)).ok_or(null("start_ns"))?,

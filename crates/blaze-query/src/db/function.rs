@@ -628,10 +628,24 @@ fn claimed<F: Function>(
         }
         return None;
     }
-    let at =
-        local::with(|local| local.push(Frame::new(storage, FrameKind::Verify, node, index, id)));
+    let (at, outermost) = local::with(|local| {
+        // The verify no other verify of this task asked for: a fetch's, or a run's read.
+        let outermost = local.frames.last().is_none_or(|it| it.kind != FrameKind::Verify);
+        (local.push(Frame::new(storage, FrameKind::Verify, node, index, id)), outermost)
+    });
+    // The holder of a row's flight brings the row's reads up to date here, running each that
+    // changed, before it knows whether the row itself runs: time no run's span covers, while
+    // every other asker of the row waits behind the flight (a 299 ms `wait` on an edited body's
+    // inference with nothing under its owner, 2026-11-11). Named by the query, once a task's
+    // outermost verify (the verifies it asks for are inside it), so a waiter's owner shows
+    // `query verify` or the query's own run (slow-is-p0-traced). A short one folds into its
+    // parent's sum; nothing is formatted.
+    let verifying = outermost.then(|| {
+        tracing::info_span!(target: "blaze", "query verify", function = F::NAME).entered()
+    });
     let mut guard = Running { storage, header, word, at, index, id, armed: true };
     let changed = verify_claimed(db, storage, header, node, word & VIEW_MASK);
+    drop(verifying);
     let (reentered, head) = local::with(|local| {
         let frame = &local.frames[at as usize];
         (frame.reentered, frame.head)

@@ -215,7 +215,9 @@ impl<V: Clone + Send + Sync + 'static> Flights<V> {
             };
             let left = Left { runs: &self.runs, key, waiter: &waiter };
             let waiting =
-                Waiting::begin(crate::wait::WaitKind::Key, &mut named, || Some(observed(runner)));
+                Waiting::begin(crate::wait::WaitKind::Key, &mut named, || {
+                    crate::wait::Owner::Job(observed(runner))
+                });
             let got = wait(&waiter, key, flight(number), &mut named);
             drop(waiting);
             drop(left);
@@ -412,13 +414,16 @@ fn job(task: u64) -> JobId {
 #[derive(Clone, Copy)]
 pub struct WaitSpans {
     /// Opens the wait's span on this thread, `kind` the [`crate::wait::WaitOn`] variant it is,
-    /// `awaited` naming what it waits for and `owner` the job running it, when known (for a
-    /// key, its generation << 32 | its slot, as [`sched::observed`] and the switches name it):
-    /// a number for `end`.
-    pub begin: fn(kind: crate::wait::WaitKind, awaited: &str, owner: Option<u64>) -> u64,
+    /// `awaited` naming what it waits for and `owner` who ends it ([`crate::wait::Owner`]: for
+    /// a key, the job running it, its generation << 32 | its slot, as [`sched::observed`] and
+    /// the switches name it; never nothing): a number for `end`.
+    pub begin: fn(kind: crate::wait::WaitKind, awaited: &str, owner: crate::wait::Owner) -> u64,
     /// Closes the span `begin` gave, on whatever thread the wait ended on (a job on a fiber
     /// may resume on another).
     pub end: fn(u64),
+    /// Says, before `end`, that job `by` (numbered as an owner is) woke the wait of the span
+    /// `begin` gave: its owner from then on ([`crate::wait::wait_woken`]).
+    pub woken: fn(span: u64, by: u64),
     /// Opens the span of a hold on this thread ([`Flights::hold_named`]), `what` naming what is
     /// held and `holder` the job holding it, numbered as `begin`'s `owner`: what a waiter's
     /// `owner` names. Closed by `end`.
@@ -445,12 +450,11 @@ pub fn span_waits(spans: WaitSpans) -> Result<(), WaitSpans> {
 pub(crate) struct Waiting(Option<(fn(u64), u64)>);
 
 impl Waiting {
-    /// `owner` is read only while a profiler spans waits: naming a task's job takes the
-    /// scheduler's lock ([`observed`]).
+    /// `owner` is read only while a profiler spans waits.
     pub(crate) fn begin(
         kind: crate::wait::WaitKind,
         named: &mut impl FnMut(&mut String),
-        owner: impl FnOnce() -> Option<u64>,
+        owner: impl FnOnce() -> crate::wait::Owner,
     ) -> Waiting {
         Waiting(WAIT_SPANS.get().map(|spans| {
             // alloc: only while a profiler spans waits, once a wait, which suspends
@@ -458,6 +462,14 @@ impl Waiting {
             named(&mut awaited);
             (spans.end, (spans.begin)(kind, &awaited, owner()))
         }))
+    }
+
+    /// Job `by` woke this wait: its span's owner from now on. Nothing while no profiler spans
+    /// waits.
+    pub(crate) fn woken(&self, by: u64) {
+        if let (Some((_, span)), Some(spans)) = (self.0, WAIT_SPANS.get()) {
+            (spans.woken)(span, by);
+        }
     }
 
     /// The span of a hold by `holder` (a task id) of what `named` writes, open while this lives.
