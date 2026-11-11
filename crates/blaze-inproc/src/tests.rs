@@ -695,10 +695,10 @@ fn memory(image: u64, arena: u64) -> Option<CodeMemory> {
 /// since the object was made: a range never written (an image's patch room) costs nothing.
 #[test]
 fn zeroing_fills_only_the_pages_that_were_written() {
-    let Some(mut memory) = memory(1, 1) else { return };
-    let page = memory.page();
-    drop(memory);
-    let Some(mut memory) = self::memory(64 * page, page) else { return };
+    let Some(probe) = memory(1, 1) else { return };
+    let page = probe.page();
+    drop(probe);
+    let Some(mut memory) = memory(64 * page, page) else { return };
     assert_eq!(memory.zero(0, 64 * page).unwrap(), 0, "nothing was written: nothing is filled");
     memory.write(3 * page + 5, &[7]).unwrap();
     memory.fill(10 * page, 2 * page + 1, 0xcc).unwrap();
