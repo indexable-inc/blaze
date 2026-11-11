@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-76 theorems: 63 in `lean`, 13 in `lean/analysis`.
+78 theorems: 65 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -618,6 +618,25 @@ theorem evalRvalue_sym {st0 : State} {σ : List (Local × Expr)} {st : State}
   | Rvalue.use o, e, hs => evalOperand_sym h o e hs
   | Rvalue.binary op a b, e, hs => by
     have ⟨ea, eb, ha, hb, he⟩
+```
+
+**`Blaze.Mir.execStmts_sym`** (`Blaze.Mir.Opt.SymBlock`, `lean`): Executing a block's statements is the meaning of their symbolic trace: each expression evaluated in the block's initial state and written to its local.
+
+```lean
+theorem execStmts_sym (adts : List AdtDecl) (st0 : State) :
+    ∀ (stmts : List Statement) (σ : List (Local × Expr)) (st : State)
+      (tr : List (Local × Expr)), Reads st0 σ st → symStmts σ stmts = some tr →
+        execStmts adts st stmts = den st0 st tr
+  | [], _, _, tr, _, h => by
+    have e : ([] : List (Local × Expr)) = tr
+```
+
+**`Blaze.Mir.execStmts_same`** (`Blaze.Mir.Opt.SymBlock`, `lean`): Statement lists with one symbolic trace do the same from every state.
+
+```lean
+theorem execStmts_same (adts : List AdtDecl) (s1 s2 : List Statement)
+    (tr : List (Local × Expr)) (h1 : symStmts [] s1 = some tr) (h2 : symStmts [] s2 = some tr)
+    (st : State) : execStmts adts st s1 = execStmts adts st s2
 ```
 
 **`Blaze.Mir.Opt.simplifyCfg_call`** (`Blaze.Mir.Opt.SimplifyCfg`, `lean`): SimplifyCfg composed from the proved passes keeps every call that ends, and not in undefined behaviour: the same outcome with the same fuel.

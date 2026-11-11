@@ -741,6 +741,10 @@ programs; it is the specification of the Rust pass of the same name.
   `evalRvalue_sym`: an rvalue of the subset (`use`, `binary`, `checked`, `withOverflow`,
   `unary`, `cast` on constants and copies of whole locals: no move, no projection, no
   `ref`) evaluates to the value of its expression and leaves the state.
+  **Second piece** (`Opt/SymBlock.lean`; not yet elaborated): a block's statements as a
+  trace, the locals assigned in order with their expressions (`symStmts`), and what a trace
+  means (`den`); `execStmts_sym`: executing the statements is the meaning of their trace,
+  so statement lists with one trace do the same from every state (`execStmts_same`).
   **Not written: the rest of it**, which needs no script and accepts
   rewrites nobody proved one by one (copy propagation, local renumbering, reordering of
   independent statements). It needs an expression language whose evaluation is proved to
