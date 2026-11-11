@@ -50,8 +50,10 @@ The input is one JSON object (inline, a file's path, or `-`):
     keep            keep each project's directory under `work` (false)
     record          `smoke`: write harness/v2/guards-known.toml again from this run's guards
                     instead of holding the run to it (guards.py; false)
-    duckdb          `smoke`: the DuckDB `blaze debug sql` runs (`BLAZE_DUCKDB`), as an absolute
-                    path; empty for blaze's pin, which its first query fetches
+    duckdb          the DuckDB `blaze debug sql` runs (`BLAZE_DUCKDB`), as an absolute path;
+                    empty for blaze's pin, which its first query fetches
+    hold_ms         the most an edit's build may hold its answer back for what the job still
+                    does, summed over the build (200.0; "The loop thread", below)
 
 Numbers are JSON numbers; a float field takes one with a point (4.0, not 4).
 
@@ -124,6 +126,17 @@ wrong build passes nothing. cargo is the baseline of the speed and memory rows a
 parameter with another value, blank lines and indentation by more, comments with another text,
 another name), so no run is a store's hit for the one before it.
 
+The loop thread. After every edit's timed build (`Lane.edits`: the body, signature, formatting,
+comment, rename and move rows, and the smoke's body edit) the build's profile is read (`blaze
+debug sql`, `LOOP_SQL`: the spans that began inside the last build's window, as guards.py takes
+them) and the row fails, whatever its time, when the daemon's loop thread stalled: a span named
+`loop stalled` (the daemon's watchdog records one for each inline step of a loop turn that ran
+over 20 ms, the step in its `function`), each listed with its step and ms; or the spans named
+`the job's answer waits for what it still does` add up to more than `hold_ms`, listed with what
+each waited for (`function`, `awaits`). The finding of 2026-11-10 (Linux, XFS): a one-line body
+edit of a hello world answered 3.2 s late, held by that span, while the loop thread sat in
+`ioctl(FICLONE)` for 0.9 and 1.4 s. loop_syscalls.py holds the same from outside, with strace.
+
 `smoke` is what keeps this script able to run against the blaze of the tree: the merge gate
 runs it with the blaze the change built (blaze-platform.yaml, `profile-gate`). After the
 engine's preflight (engine.V2.preflight) it writes fixture.py's workspace (three small crates),
@@ -147,7 +160,8 @@ program.
 
 `selftest` checks the parts that need neither blaze nor cargo nor the network: edit generation,
 budget evaluation, /proc/stat, which rows an input selects, the daemon home's layout against the
-daemon's rule, and that the smoke's edit applies to the fixture. The guards' own selftest is
+daemon's rule, that the smoke's edit applies to the fixture, and which of a build's spans fail an
+edit (`loop_failures`). The guards' own selftest is
 guards.py's.
 """
 
@@ -257,6 +271,7 @@ class Input:
     keep: bool = False
     record: bool = False
     duckdb: str = ""
+    hold_ms: float = 200.0
 
 
 @dataclass(frozen=True)
@@ -899,6 +914,60 @@ def count_numbers(counted: Sequence[counters.Counts]) -> dict[str, report.Number
     return out
 
 
+# The loop thread over an edit's build, from the build's profile (the docstring's "The loop
+# thread"). The names are the daemon's: its loop's watchdog and its job's hold.
+STALLED = "loop stalled"
+HELD = "the job's answer waits for what it still does"
+# A span of the build: its name, what it is of, and its ms.
+type SpanRow = tuple[str, str, float]
+# The stalls and the holds that began inside the last build's window, in order. The window is
+# guards.FACTS_SQL's: a span is taken by when it began, not by its `build_id` (the loop thread's
+# spans are of no build), and the window runs to the reply's end when that is after the build's
+# row's (an answer held back).
+LOOP_SQL = """
+WITH b AS (
+    SELECT build_id, started_ns AS t0, started_ns + coalesce(dur_ns, 0) AS t1
+    FROM builds ORDER BY build_id DESC LIMIT 1
+), reply AS (
+    SELECT max(s.start_ns + s.dur_ns) AS at
+    FROM spans s, b
+    WHERE s.name = 'request: read to reply' AND s.start_ns <= b.t1 AND s.start_ns + s.dur_ns >= b.t0
+), w AS (
+    SELECT b.t0, greatest(b.t1, coalesce(reply.at, b.t1)) AS t1 FROM b, reply
+)
+SELECT s.name AS name, s.function AS function, s.awaits AS awaits, coalesce(s.dur_ns, 0) / 1e6 AS ms
+FROM spans s, w
+WHERE s.name IN (@NAMES@) AND s.start_ns >= w.t0 AND s.start_ns <= w.t1
+ORDER BY s.start_ns
+""".replace("@NAMES@", ", ".join("'" + name.replace("'", "''") + "'" for name in (STALLED, HELD)))
+
+
+def span_rows(stdout: str, what: str) -> list[SpanRow]:
+    """`LOOP_SQL`'s rows as `blaze debug sql --json` printed them. What a hold waited for is its
+    `function` and its `awaits`. A row that is not the query's is a ValueError naming `what`."""
+    out: list[SpanRow] = []
+    for row in guards.rows(stdout, what):
+        name, ms = row.get("name"), guards.number(row, "ms", what)
+        if not isinstance(name, str) or ms is None:
+            raise ValueError(f"{what}: a row with no name or no ms: {row}")
+        of = [str(row[column]) for column in ("function", "awaits") if row.get(column) not in (None, "")]
+        out.append((name, ", awaiting ".join(of) or "nothing the span names", ms))
+    return out
+
+
+def loop_failures(rows: Sequence[SpanRow], hold_ms: float) -> list[str]:
+    """Why a build with the spans `rows` fails its edit; empty when it does not. Every `loop
+    stalled` span fails it, named by its step; and the holds of its answer when they add up to
+    more than `hold_ms`, named by what each waited for."""
+    out = [f"the loop thread stalled {ms:.4g} ms in one step, `{step}`" for name, step, ms in rows if name == STALLED]
+    holds = [(what, ms) for name, what, ms in rows if name == HELD]
+    held = sum(ms for _, ms in holds)
+    if held > hold_ms:
+        out.append(f"the answer was held {held:.4g} ms, over the bound of {hold_ms:.4g} ms, for what the job still "
+                   "did: " + ", ".join(f"`{what}` {ms:.4g} ms" for what, ms in holds))
+    return out
+
+
 @dataclass(frozen=True)
 class Edits:
     seconds: tuple[float, ...]
@@ -1044,6 +1113,7 @@ class Lane:
         seconds: list[float] = []
         compiled: list[int] = []
         counted: list[counters.Counts] = []
+        stalled: list[str] = []
         places = 0
         n = 0
         while (len(seconds) < self.args.runs if limit_ms is None
@@ -1053,6 +1123,8 @@ class Lane:
                 took, work, used = self.counted_build(f"{step} {n + 1}", count)
                 seconds.append(took)
                 counted.append(used)
+                # Before any other build: the profile's last build is the one just timed.
+                stalled += [f"{step} {n + 1} ({took * 1000:.4g} ms): {why}" for why in self.loop_failures(f"{step} {n + 1}")]
                 if work is not None:
                     if work.compiled is None:
                         raise engine.Unmeasurable(f"{self.eng.kind} did not say how many functions the {step} compiled")
@@ -1063,7 +1135,17 @@ class Lane:
                 revert(n)
             self.build(f"{step} {n + 1} taken back", False)
             n += 1
+        if stalled:
+            raise Wrong(f"{self.name}: {step}: the daemon's loop thread did not keep up in {len(stalled)} of "
+                        f"{len(seconds)} builds' profiles (their times: {samples(s * 1000 for s in seconds)} ms):\n"
+                        + "\n".join(stalled))
         return Edits(tuple(seconds), tuple(compiled), places, tuple(counted))
+
+    def loop_failures(self, step: str) -> list[str]:
+        """Why the build just run fails its edit by what its profile says of the loop thread
+        (`LOOP_SQL`, `loop_failures`); empty when it does not."""
+        what = f"{step}: the loop thread's stalls and the answer's holds"
+        return loop_failures(span_rows(sql(self.eng, self, what, LOOP_SQL), f"{self.name}: {what}"), self.args.hold_ms)
 
     def text_edit(self, file: str, make: Callable[[str, int], str]) -> tuple[Apply, Revert]:
         path = self.ws / file
@@ -1786,6 +1868,8 @@ def main(args: Input) -> None:
         fail(SCRIPT, "record: it writes the smoke's known list, and the command is not `smoke`")
     if args.duckdb and not os.path.isabs(args.duckdb):
         fail(SCRIPT, f"duckdb: an absolute path, not {args.duckdb!r}")
+    if not args.hold_ms >= 0:
+        fail(SCRIPT, f"hold_ms: at least 0, not {args.hold_ms}")
     if args.command == "run" and not args.out:
         fail(SCRIPT, "out: command `run` writes its result there, and was given none")
     try:
@@ -2066,6 +2150,40 @@ def selftest_ledger() -> None:
                f"the ledger's {row_id} selects no row: {given}")
 
 
+def selftest_loop() -> None:
+    """Which of a build's spans fail its edit: the finding of 2026-11-10 in miniature, and the
+    fixed state."""
+    stall: SpanRow = (STALLED, "place outputs", 889.0)
+    hold: SpanRow = (HELD, "the store's placement, awaiting an io thread", 3200.0)
+    said = loop_failures([stall, (STALLED, "sync the store", 1400.0), hold], 200.0)
+    expect(len(said) == 3 and "`place outputs`" in said[0] and "889 ms" in said[0] and "`sync the store`" in said[1]
+           and "1400 ms" in said[1], f"every stall fails the edit, naming its step and its ms: {said}")
+    expect("held 3200 ms" in said[2] and "bound of 200 ms" in said[2]
+           and "`the store's placement, awaiting an io thread` 3200 ms" in said[2],
+           f"a hold over the bound fails the edit, naming what it waited for: {said}")
+    expect(loop_failures([stall], 1e9) == said[:1], "a stall fails whatever the hold's bound")
+    expect(loop_failures([(HELD, "a", 120.0), (HELD, "b", 80.0)], 200.0) == [], "holds that add up to the bound pass")
+    over = loop_failures([(HELD, "a", 120.0), (HELD, "b", 80.5)], 200.0)
+    expect(len(over) == 1 and "held 200.5 ms" in over[0] and "`a` 120 ms, `b` 80.5 ms" in over[0],
+           f"holds are summed over the build: {over}")
+    expect(loop_failures([], 200.0) == [] and loop_failures([("loop turn", "x", 5000.0), ("task", "y", 9000.0)], 0.0) == [],
+           "no stall and no hold passes, whatever other spans took")
+    printed = ('{"name":"loop stalled","function":"place outputs","awaits":null,"ms":889.012}\n'
+               '{"name":"the job\'s answer waits for what it still does","function":"placement","awaits":"the store","ms":3200}\n'
+               '{"name":"loop stalled","function":null,"awaits":null,"ms":21}\n')
+    expect(span_rows(printed, "rows") == [(STALLED, "place outputs", 889.012), (HELD, "placement, awaiting the store", 3200.0),
+                                          (STALLED, "nothing the span names", 21.0)], f"the rows read: {span_rows(printed, 'rows')}")
+    refused("a row with no ms", lambda: span_rows('{"name":"loop stalled","function":"x","awaits":null,"ms":null}', "rows"),
+            ValueError)
+    refused("a row without the query's columns", lambda: span_rows('{"name":"loop stalled"}', "rows"), ValueError)
+    expect(LOOP_SQL.count("'loop stalled'") == 1 and "'the job''s answer waits for what it still does'" in LOOP_SQL
+           and "@" not in LOOP_SQL, f"the query names both spans, quoted for SQL: {LOOP_SQL}")
+    spec = '{"engine": {"kind": "v2", "blaze": "blaze"}, "out": "o.json"'
+    expect(parse(Input, spec + "}", SCRIPT).hold_ms == 200.0 and parse(Input, spec + ', "hold_ms": 50.0}', SCRIPT).hold_ms == 50.0,
+           "the hold's bound is 200 ms unless given")
+    refused("a negative bound", lambda: main(parse(Input, spec + ', "hold_ms": -1.0}', SCRIPT)), SystemExit)
+
+
 def selftest() -> None:
     f = locate(SAMPLE, OPENING)
     expect(SAMPLE[f.close:].startswith("}\n\nimpl"), f"the end of main is found: {SAMPLE[f.close:f.close + 12]!r}")
@@ -2130,6 +2248,7 @@ def selftest() -> None:
     selftest_smoke()
     selftest_ledger()
     selftest_work()
+    selftest_loop()
     expect(verdict(30, 30, True) == "pass" and verdict(30.01, 30, True) == "fail", "at most")
     expect(verdict(0.8, 0.8, False) == "pass" and verdict(0.79, 0.8, False) == "fail", "at least")
     expect(describe(12.5, 30, True, "ms") == "12.5 ms against a budget of at most 30 ms", describe(12.5, 30, True, "ms"))

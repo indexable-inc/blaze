@@ -13,7 +13,7 @@ remembered. How rows are picked, worked and landed is
 `harness/v2/ledger.py`. A check in *italics* is not written yet, and writing it is the first
 part of the work. `?` is not measured; "last known" is a lead, not a status.
 
-80 objectives: 0 met, 0 open, 0 blocked, 80 not measured.
+81 objectives: 0 met, 0 open, 0 blocked, 81 not measured.
 
 ## Targets
 
@@ -36,6 +36,7 @@ What a user feels, on one warm machine.
 | T13 | A second build of an unchanged tree in a fresh checkout misses nothing | `budgets.py {"budgets": ["cache-misses"]}`; `worktree_keys.py` |  | ? |
 | T14 | Every bound in bounds.md is within 10% | `budgets.py {"budgets": ["bounds"]}` |  | ? |
 | T15 | A warm no-op build, a comment edit and a body edit of the smoke's two fixtures hold every bound of harness/v2/guards.py (none worse than its known failure), and a build script that runs $RUSTC ends inside the sandbox | `budgets.py {"command": "smoke"}` | not run: guards-known.toml's numbers are hand-traced, to be recorded on a built blaze (11-10) | ? |
+| T16 | A body edit's answer is not held by the store's placement: over the edit's build the daemon's loop thread never stalls (no `loop stalled` span, no system call of it over 20 ms but its own waits) and the answer is held under 200 ms for what the job still does | `budgets.py {"command": "smoke"}`; `loop_syscalls.py` | answer held 3.2 s; the loop thread 0.9 and 1.4 s in ioctl(FICLONE) (Linux ARM VM, XFS, hello world, 11-10) | ? |
 
 ## Correctness
 
