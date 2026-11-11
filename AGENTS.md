@@ -155,6 +155,9 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 57. **verified-compiler**: The goal is a formally verified blaze: one executable Lean semantics of MIR
     is the specification, every MIR pass is proved or translation-validated against it, proofs are
     checked in the gate, and what is still trusted is listed. Skill: `testing`.
+58. **build-the-missing-piece**: When the right design needs something the tree does not have (a
+    compiler feature, a library module, a tool), build it and add it to the tree; never ship the
+    weaker form because the piece was missing. Skill: `changing-code`.
 
 ## Code Review Rules
 
