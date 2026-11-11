@@ -6,8 +6,9 @@
 //! and the call site, the innermost frame outside the allocator and the collections' plumbing.
 //!
 //! A sample is taken inside the allocator, on the allocating thread: [`taken`] walks the
-//! thread's frame pointers through [`crate::stack::here`] (each record vouched for by the
-//! kernel, so a wild pointer ends the walk, never faults; two system calls a frame) and writes
+//! thread's stack, on Linux by the unwind tables ([`crate::stack::unwound`]) and elsewhere up
+//! its frame pointers through [`crate::stack::here`] (each record vouched for by the
+//! kernel, so a wild pointer ends the walk, never faults; two system calls a frame), and writes
 //! the sample into a fixed ring of atomics, [`RING`], with no lock and no allocation. The
 //! history's flush reads the ring ([`since`]) and names the addresses then, as it does the CPU
 //! samples'. A sample written over before a flush read it, or being written as it read, is lost
@@ -124,6 +125,11 @@ pub(crate) struct HeapSample {
 fn taken(sampled: HeapSampled) {
     let Some(epoch) = EPOCH.get() else { return };
     let mut pcs = [0u64; DEPTH];
+    // By the unwind tables on Linux, where a function need keep no frame record; by the
+    // frame records where the ABI gives every function that calls one (Apple's).
+    #[cfg(target_os = "linux")]
+    let depth = crate::stack::unwound(&mut pcs);
+    #[cfg(not(target_os = "linux"))]
     let depth = crate::stack::here(&mut pcs);
     let (build, span) = crate::flight::here_now();
     let t_ns = u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -246,7 +252,11 @@ const PLUMBING: &[&str] = &[
     "blaze_profile::heap",
     "blaze_profile::stack",
     "blaze_graph::arena",
+    "<blaze_graph::arena",
     "blaze_engine::heaps",
+    "<blaze_engine::heaps",
+    "blaze_engine::malloc",
+    "_Unwind_",
     "__rust_",
     "__rdl_",
     "__rg_",

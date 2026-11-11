@@ -184,6 +184,59 @@ pub(crate) fn here(pcs: &mut [u64; DEPTH]) -> usize {
     depth
 }
 
+/// The calling thread's stack from its caller up, innermost first, into `pcs`, by the unwind
+/// tables: how many. For a walk a thread makes of itself outside any signal handler (the heap
+/// sampler's, [`crate::heap`]), on Linux, where no ABI gives every function a frame record:
+/// x86-64's never has, and a daemon built before aarch64's did
+/// (`hir_ty_codegen::target::Target::requires_frame_pointers`) walked one frame, an address in
+/// no function, so every heap sample of a self-built daemon was of the site `[blaze1]`
+/// (2026-11-11, lane mem-1111). The tables are what a panic unwinds by, so every function has
+/// them. `_Unwind_Backtrace` finds each frame's table through glibc's `_dl_find_object`, which
+/// takes no lock, and allocates nothing once the unwinder has run once; an allocation it did
+/// make would not be sampled again (`blaze_graph::arena`'s `sampling`).
+#[cfg(target_os = "linux")]
+pub(crate) fn unwound(pcs: &mut [u64; DEPTH]) -> usize {
+    use std::ffi::{c_int, c_void};
+
+    #[repr(C)]
+    struct Context {
+        opaque: [u8; 0],
+    }
+    // libgcc's, as std links it for panics.
+    unsafe extern "C" {
+        fn _Unwind_Backtrace(
+            trace: unsafe extern "C" fn(*mut Context, *mut c_void) -> c_int,
+            arg: *mut c_void,
+        ) -> c_int;
+        fn _Unwind_GetIP(context: *mut Context) -> usize;
+    }
+    /// `_URC_NO_REASON`: go on to the next frame; `_URC_END_OF_STACK`: stop.
+    const GO_ON: c_int = 0;
+    const STOP: c_int = 5;
+    struct Walk<'a> {
+        pcs: &'a mut [u64; DEPTH],
+        depth: usize,
+    }
+    /// One frame: its address into the walk, until the walk is full.
+    unsafe extern "C" fn frame(context: *mut Context, arg: *mut c_void) -> c_int {
+        // SAFETY: `arg` is the `Walk` `unwound` passed, alive and this thread's for the call.
+        let walk = unsafe { &mut *arg.cast::<Walk<'_>>() };
+        // SAFETY: `context` is the unwinder's, valid for this callback.
+        let pc = unsafe { _Unwind_GetIP(context) } as u64;
+        if pc == 0 || walk.depth == DEPTH {
+            return STOP;
+        }
+        walk.pcs[walk.depth] = pc;
+        walk.depth += 1;
+        GO_ON
+    }
+    let mut walk = Walk { pcs, depth: 0 };
+    // SAFETY: `frame` is called on this thread, within the call, with `walk`, which outlives
+    // it; the unwinder reads this thread's own stack through its tables and unwinds nothing.
+    unsafe { _Unwind_Backtrace(frame, std::ptr::from_mut(&mut walk).cast()) };
+    walk.depth
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,6 +262,36 @@ mod tests {
         let frames = crate::symbols::frames(std::iter::once(&pcs[..depth]));
         let found = pcs[..depth].iter().enumerate().any(|(i, pc)| {
             frames[&crate::symbols::lookup(i, *pc)].iter().any(|it| it.contains("a_caller_to_find"))
+        });
+        assert!(found, "{frames:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[inline(never)]
+    fn unwound_from_here() -> (usize, [u64; DEPTH]) {
+        let mut pcs = [0; DEPTH];
+        let depth = unwound(&mut pcs);
+        std::hint::black_box((depth, pcs))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[inline(never)]
+    fn a_caller_the_tables_find() -> (usize, [u64; DEPTH]) {
+        std::hint::black_box(unwound_from_here())
+    }
+
+    /// The walk by the unwind tables names its callers, whether or not they keep frame
+    /// records.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_walk_by_the_tables_finds_its_callers() {
+        let (depth, pcs) = a_caller_the_tables_find();
+        assert!(depth >= 3, "{depth} frames");
+        let frames = crate::symbols::frames(std::iter::once(&pcs[..depth]));
+        let found = pcs[..depth].iter().enumerate().any(|(i, pc)| {
+            frames[&crate::symbols::lookup(i, *pc)]
+                .iter()
+                .any(|it| it.contains("a_caller_the_tables_find"))
         });
         assert!(found, "{frames:?}");
     }
