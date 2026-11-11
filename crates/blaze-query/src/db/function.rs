@@ -22,7 +22,10 @@
 //!   the converged head stores them all, over every round, as its edges, and each member's one
 //!   edge is its head ([`finalize`]). So a later view verifies a final cycle as any row: when
 //!   nothing it read changed the whole cycle is reused, else it runs again from its head. A
-//!   provisional row (a round not yet converged) is never verified.
+//!   provisional row (a round not yet converged) is never verified, and only the task whose
+//!   stack holds its head reads, runs or writes it ([`headed_here`]): any other task waits for
+//!   the head's flight, also one that finds the flight of a stale inner head free between two
+//!   rounds.
 
 use std::{
     cell::Cell,
@@ -471,6 +474,9 @@ fn refresh<F: Function>(
                     return State::Provisional(at);
                 }
                 Some(_) => {}
+                // The cycle's task emptied or finished the row between this task's loads of
+                // its word and of its head: no head to wait for; the next round reads both anew.
+                None if head == 0 => continue,
                 None => {
                     wait_for(storage, head);
                     continue;
@@ -554,6 +560,10 @@ pub fn completed() -> u64 {
 
 /// Runs `run` holding the flight of row `id` of `index`, or waits for whoever holds it.
 fn in_flight(storage: &Storage, index: u32, id: Id, run: impl FnOnce()) {
+    #[cfg(test)]
+    if let Some(stop) = probe::BEFORE_FLIGHT.with(Cell::get) {
+        stop(index, id);
+    }
     let barrier = local::barrier();
     let awaited = |it: &mut String| {
         use std::fmt::Write as _;
@@ -591,7 +601,14 @@ fn claimed<F: Function>(
     let view = storage.view_bits();
     let word = header.verified.load(Ordering::Acquire);
     let meta = header.meta.load(Ordering::Relaxed);
-    if word & PROVISIONAL != 0 && meta & STALE == 0 {
+    // A provisional row is its cycle's task's. One not stale holds this round's value, which
+    // that task reads with no flight. A stale one (an inner head between two rounds of the
+    // outermost) runs again, but only on the task whose stack holds its head: its flight is
+    // free between its runs, so any task can come to hold it here (it read the row's word
+    // before the row was provisional, then waited to ask: `sched::before_claim`, or a
+    // claim-free walk), and one that ran it would write a row the cycle's task reads and
+    // empties with no flight. That task goes back to `refresh`, which waits for the head.
+    if word & PROVISIONAL != 0 && (meta & STALE == 0 || !headed_here(storage, header)) {
         return None;
     }
     debug_assert_eq!(word & RUNNING, 0, "a row runs only in its flight");
@@ -679,6 +696,35 @@ fn claimed<F: Function>(
     local::with(|local| local.verify_to_run(at));
     run::<F>(db, storage, index, row, key, Some(at), false);
     None
+}
+
+/// Whether the cycle the provisional row of `header` is in is this task's: the run of its head
+/// is on this task's stack. Another task's (or one this thread set aside below a wait) is not
+/// this task's to run or write, whoever holds the row's flight.
+fn headed_here(storage: &Storage, header: &Header) -> bool {
+    #[cfg(test)]
+    if probe::FOREIGN_STALE_RUNS.with(Cell::get) {
+        return true;
+    }
+    let head = header.extra.load(Ordering::Relaxed) as u32;
+    local::with(|local| local.find(storage, head)).is_some()
+}
+
+/// What a test sets on its own thread to stop it at a point no query's body reaches, and to
+/// plant a bug its oracle must catch (`tests/stale_head.rs`).
+#[cfg(test)]
+pub(crate) mod probe {
+    use std::cell::Cell;
+
+    use super::Id;
+
+    std::thread_local! {
+        /// Called by this thread with the ingredient and key of each flight it is about to ask
+        /// for ([`super::in_flight`]): after it read the row's word, before it holds or waits.
+        pub(crate) static BEFORE_FLIGHT: Cell<Option<fn(u32, Id)>> = const { Cell::new(None) };
+        /// The planted bug: this thread runs a stale head of a cycle that is another task's.
+        pub(crate) static FOREIGN_STALE_RUNS: Cell<bool> = const { Cell::new(false) };
+    }
 }
 
 /// Marks the rows from `from` on the pending list verified: the verify they assumed was proved.
