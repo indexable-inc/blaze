@@ -1495,6 +1495,8 @@ pub enum SolverGoal<'db> {
         a: Type<'db>,
         b: Type<'db>,
     },
+    /// blaze: a `where const { .. }` condition, as the phrase an error says: "the `where
+    /// const` condition `..` holds", with why it does not when its evaluation says.
     ConstEvaluatable(String),
     ConstArgHasType {
         ct: String,
@@ -5231,14 +5233,20 @@ impl<'db> AnyDiagnostic<'db> {
             StoredGoal::WellFormed { term: wf } => SolverGoal::WellFormed(term(wf)),
             StoredGoal::Subtype { a, b } => SolverGoal::Subtype { a: ty(a), b: ty(b) },
             StoredGoal::Coerce { a, b } => SolverGoal::Coerce { a: ty(a), b: ty(b) },
-            // blaze's one use of the goal is a `where const { .. }` condition: the constant,
-            // with why it does not hold when its evaluation says.
+            // blaze's one use of the goal is a `where const { .. }` condition: the goal as
+            // a phrase, with why it does not hold when its evaluation says.
             StoredGoal::ConstEvaluatable { ct } => SolverGoal::ConstEvaluatable(
                 match ct.as_ref().konst().and_then(|it| {
                     hir_ty::where_const::refusal(interner, it)
                 }) {
-                    Some(failure) => format!("{}`: {} (`", text(ct), failure.text()),
-                    None => text(ct),
+                    // alloc: error path, the goal's text
+                    Some(failure) => format!(
+                        "the `where const` condition `{}` holds; it does not: {}",
+                        text(ct),
+                        failure.text()
+                    ),
+                    // alloc: error path, the goal's text
+                    None => format!("the `where const` condition `{}` holds", text(ct)),
                 },
             ),
             StoredGoal::ConstArgHasType { ct, ty: of } => {
