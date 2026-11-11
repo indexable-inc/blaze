@@ -265,7 +265,10 @@ fn disagreement(cfg: &Cfg, choices: &[u8], plant: Plant) -> Option<String> {
     None
 }
 
-/// The oracle over Hegel's graphs and choices.
+/// The invariant: for any reducible graph and any sequence of branch choices, the graph, its
+/// labelled structure, the simplified structure and naga's shape run the same blocks in the same
+/// order and leave from the same block, compared up to `FUEL` blocks. The oracle over Hegel's
+/// graphs and choices.
 #[hegel::test(test_cases = 500)]
 fn structured_control_flow_runs_as_the_graph_does(tc: hegel::TestCase) {
     use hegel::generators as gs;
