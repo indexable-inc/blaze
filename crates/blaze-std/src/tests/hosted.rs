@@ -412,7 +412,7 @@ fn streams_from_a_handler_reply_and_from_the_host_record() {
     });
     let mut heard = cx.bytes();
     // A stream is linear: finished whatever it carried, and checked after.
-    let carried = match shout.open(&cx, origin) {
+    let carried = match shout.open(&cx, origin, 1 << 16) {
         Ok(mut stream) => {
             let sent = stream.send_all(&cx, b"quiet");
             let first = stream.recv(&cx, 3, &mut heard);
@@ -429,7 +429,7 @@ fn streams_from_a_handler_reply_and_from_the_host_record() {
     io.script(|host| host.streams.replies.push_back(b"welcome".to_vec()));
     let hosted = io.need_streams().expect("the simulation carries streams");
     let mut greeted = cx.bytes();
-    let carried = match hosted.open(&cx, origin) {
+    let carried = match hosted.open(&cx, origin, 1 << 16) {
         Ok(mut stream) => {
             let sent = stream.send_all(&cx, b"hi");
             let received = stream.recv(&cx, 64, &mut greeted);

@@ -20,7 +20,8 @@
 
 #![blaze::sans_io]
 
-use std::{alloc::Allocator, fmt};
+use alloc::vec::Vec;
+use core::{alloc::Allocator, fmt};
 
 use super::{Colour, Packet};
 
@@ -205,7 +206,7 @@ impl<A: Allocator + Clone> Muxer<A> {
     /// The bytes ready so far, to be written after those taken before. Progressive: none until
     /// [`Muxer::finish`].
     pub fn bytes(&mut self) -> Vec<u8, A> {
-        let ready = std::mem::replace(&mut self.out, Vec::new_in(self.alloc.clone()));
+        let ready = core::mem::replace(&mut self.out, Vec::new_in(self.alloc.clone()));
         self.taken += ready.len() as u64;
         ready
     }
@@ -697,4 +698,4 @@ impl fmt::Display for MuxError {
     }
 }
 
-impl std::error::Error for MuxError {}
+impl core::error::Error for MuxError {}

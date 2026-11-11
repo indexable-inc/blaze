@@ -28,7 +28,8 @@ pub mod mp4;
 )]
 mod videotoolbox;
 
-use std::{alloc::Allocator, fmt};
+use alloc::vec::Vec;
+use core::{alloc::Allocator, fmt};
 
 pub use mp4::{Layout, MuxError, Muxer, Track};
 
@@ -295,9 +296,21 @@ fn hardware(gpu: &Gpu, config: &EncoderConfig) -> Result<Provider, VideoError> {
     Ok(Provider::VideoToolbox(videotoolbox::Session::new(gpu, config)?))
 }
 
+/// The system this is compiled for, as a refusal names it.
+#[cfg(not(target_os = "macos"))]
+const TARGET_OS: &str = if cfg!(target_os = "linux") {
+    "linux"
+} else if cfg!(target_os = "windows") {
+    "windows"
+} else if cfg!(target_os = "ios") {
+    "ios"
+} else {
+    "this system"
+};
+
 #[cfg(not(target_os = "macos"))]
 fn hardware(_gpu: &Gpu, _config: &EncoderConfig) -> Result<Provider, VideoError> {
-    Err(VideoError::NoProvider { what: "a hardware HEVC encoder", target: std::env::consts::OS })
+    Err(VideoError::NoProvider { what: "a hardware HEVC encoder", target: TARGET_OS })
 }
 
 impl Encoder {
@@ -387,4 +400,4 @@ impl fmt::Display for VideoError {
     }
 }
 
-impl std::error::Error for VideoError {}
+impl core::error::Error for VideoError {}

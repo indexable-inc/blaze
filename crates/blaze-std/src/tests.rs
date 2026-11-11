@@ -92,7 +92,7 @@ use crate::{
     Plant,
     cx::Cx,
     fs::{Content, Dir, FsError, ReadWrite},
-    io::{Io, SimWorld},
+    io::{Io, Limits, SimWorld},
     mem::TASK_FRAME,
     path::Path,
 };
@@ -167,7 +167,7 @@ fn control<P: fmt::Debug>(
 
 /// A simulated world of `seed` with `plant`.
 fn world(seed: u64, plant: Plant) -> Io {
-    Io::planted(SimWorld::new(seed), plant)
+    Io::planted(SimWorld::new(seed, Limits::USUAL), plant)
 }
 
 /// The root context of `io`.

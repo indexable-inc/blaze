@@ -28,6 +28,7 @@ pub use blaze_mem::{
 };
 pub use blaze_mem::Arena as RequestArena;
 
+use alloc::{string::String, vec::Vec};
 use crate::{Plant, Stopped, io::Io};
 
 /// The most a frame not given a limit hands out: a task's ([`crate::task`]) and the root's.
@@ -96,8 +97,8 @@ impl<'a> Bytes<'a> {
     }
 }
 
-impl std::fmt::Debug for Bytes<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for Bytes<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "Bytes({} of {})", self.bytes.len(), self.arena)
     }
 }
@@ -166,8 +167,8 @@ impl Arena {
     }
 }
 
-impl std::fmt::Debug for Arena {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for Arena {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "Arena({}: {} of {})", self.name, self.used(), self.limit)
     }
 }

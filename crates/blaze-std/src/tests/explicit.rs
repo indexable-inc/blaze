@@ -3,13 +3,11 @@
 //! to decide for its caller, showing that the explicit form does what it says and that what
 //! was implicit is gone. The invariant across crashes is [`super::durable`]'s.
 //!
-//! What only a compiler can show is not here. That a `File<ReadWrite>` or a `Buffered` cannot
-//! be dropped unfinished is in crates/hir-ty-linear's fixtures, which mirror bstd's linear
-//! types (`bstd_a_writable_file_left_unclosed_is_an_error`,
-//! `bstd_a_buffered_writer_left_unfinished_is_an_error`). That `Written` has no `clone_to`,
-//! and that `Dir::write`, `File::sync`, `File::replace`, `Conn::send` and a two-argument
-//! `Scope::spawn` no longer exist, has no harness: the crate has no compile-fail tests, and
-//! the spec lists the fixture that is owed.
+//! What only a compiler can show is not here: it is the compile-fail harness
+//! `bstd_the_wrong_call_does_not_compile` (crates/blaze-engine/tests/repro.rs), whose fixtures
+//! are each one call bstd's types refuse (a clone from a `Written`, a `Buffered` dropped, a
+//! write through a narrowed handle, a removed name) beside a control that checks.
+//! crates/hir-ty-linear's fixtures mirror bstd's linear types for the check's own tests.
 
 use std::{num::NonZero, time::Duration};
 
@@ -19,7 +17,7 @@ use crate::{
     blobs::{Blobs, BlobsKind},
     env::VarName,
     fs::{Content, Dir, Durable, File, FsKind, FsOp, How, Placed, Pushed, ReadWrite, Unsynced},
-    io::{Io, SimWorld},
+    io::{Io, Limits, SimWorld},
     kv::{Key, Kv},
     local::{Pair, pair},
     mem::TASK_FRAME,
@@ -136,19 +134,54 @@ fn no_unsynced_call_waits_for_the_device_and_each_synced_one_does() {
 }
 
 #[test]
-fn started_is_refused_before_anything_changes() {
+fn started_begins_the_writeback_and_waits_for_nothing() {
     let io = world(8, Plant::None);
     let (cx, dir) = data(&io);
     write_synced(&cx, &dir, &path("f"), b"old").expect("a file");
     let before = io.disk().expect("a simulated disk");
-    let refused = dir.publish(&cx, &path("f"), Content::bytes(b"new"), Durable::Started).expect_err("no driver starts writeback");
-    assert_eq!((refused.op, &refused.kind), (FsOp::Publish, &FsKind::NoWritebackStart));
-    assert!(refused.to_string().contains("Durable::Started"), "{refused}");
-    let refused = dir.remove(&cx, &path("f"), Durable::Started).expect_err("no driver starts writeback");
-    assert_eq!(refused.kind, FsKind::NoWritebackStart);
-    assert_eq!(held(&cx, &dir, "f").as_deref(), Some(&b"old"[..]));
+    // `Started` makes the change, begins the write-back and waits for nothing: no flush is
+    // asked, and no wait for the device is paid.
+    let published = dir.publish(&cx, &path("f"), Content::bytes(b"new"), Durable::Started).expect("a publish");
+    assert!(matches!(published.file, Placed::Written(_)), "Started gives no Flushed: {:?}", published.file);
+    assert_eq!(held(&cx, &dir, "f").as_deref(), Some(&b"new"[..]));
     let after = io.disk().expect("a simulated disk");
-    assert_eq!((before.written, before.flushes, before.device_waits), (after.written, after.flushes, after.device_waits));
+    assert_eq!((after.writebacks - before.writebacks, after.flushes, after.device_waits), (1, before.flushes, before.device_waits));
+    // A file whose write-back has ended is clean: flushed then, its clone forces nothing.
+    let file = match dir.open(&cx, &path("f")) {
+        Ok(file) => file,
+        Err(error) => panic!("the file: {error}"),
+    };
+    let appended = file.append(&cx, &[1; 50], Durable::Started);
+    let closed = file.close_unsynced(Unsynced::Started);
+    appended.expect("an append");
+    let flushed = closed.expect("a close").flush(&cx).expect("a flush");
+    flushed.clone_to(&cx, &dir, &path("clone")).expect("a clone");
+    assert_eq!(io.disk().expect("a simulated disk").forced_writeback, 0);
+    // A remove told `Started` removes, and begins its directory's sync without waiting.
+    let waits = io.disk().expect("a simulated disk").device_waits;
+    dir.remove(&cx, &path("f"), Durable::Started).expect("a remove");
+    assert_eq!(held(&cx, &dir, "f"), None);
+    assert_eq!(io.disk().expect("a simulated disk").device_waits, waits);
+}
+
+/// A name sync is a real effect: `sync_names`, a synced remove and a synced close of a file
+/// its handle made each wait for their directory's sync, and none is refused.
+#[test]
+fn a_directorys_names_are_synced_by_an_effect() {
+    let io = world(25, Plant::None);
+    let (cx, dir) = data(&io);
+    let before = io.disk().expect("a simulated disk");
+    let file = create(&cx, &dir, "made");
+    let appended = file.append(&cx, b"bytes", Durable::No);
+    let closed = file.close_synced(&cx);
+    appended.expect("an append");
+    closed.expect("a synced close of a file its handle made");
+    dir.remove_synced(&cx, &path("made")).expect("a synced remove");
+    dir.sync_names(&cx).expect("a directory's names synced");
+    let after = io.disk().expect("a simulated disk");
+    assert_eq!(after.name_syncs - before.name_syncs, 3);
+    assert!(io.crash());
+    assert_eq!(held(&cx, &dir, "made"), None, "a synced remove is kept through a crash");
 }
 
 #[test]
@@ -160,20 +193,73 @@ fn a_clone_of_a_flushed_file_forces_nothing_and_one_of_unflushed_bytes_is_charge
     let counts = io.disk().expect("a simulated disk");
     assert_eq!((counts.clones, counts.forced_writeback), (1, 0));
     assert_eq!(held(&cx, &dir, "clone").as_deref(), Some(&[7u8; 100][..]));
-    // What no type sees: the path is written again behind the `Flushed`, unsynced. The
-    // simulation charges the clone for every byte it makes the kernel write out.
+    // The path is written again behind the `Flushed`, unsynced: the `Flushed` is stale, and
+    // its clone is refused before anything is made, naming the file.
     dir.publish_unsynced(&cx, &path("base"), Content::bytes(&[8; 60]), Unsynced::No).expect("a publish");
-    flushed.clone_to(&cx, &dir, &path("stale")).expect("a clone");
+    assert!(flushed.is_stale());
+    let refused = flushed.clone_to(&cx, &dir, &path("stale")).expect_err("a clone of a file changed behind its Flushed");
+    assert!(matches!(refused.kind, FsKind::Stale { .. }), "{refused}");
+    assert_eq!(refused.op, FsOp::CloneTo);
+    assert!(refused.to_string().contains("data/base") && refused.to_string().contains("flush it again"), "{refused}");
+    assert_eq!(held(&cx, &dir, "stale"), None, "a refused clone made nothing");
     let counts = io.disk().expect("a simulated disk");
-    assert_eq!((counts.clones, counts.forced_writeback), (2, 60));
+    assert_eq!((counts.clones, counts.forced_writeback), (1, 0));
+    // Flushed again, it clones, and forces nothing.
+    let again = crate::fs::Written::from(flushed).flush(&cx).expect("a flush");
+    assert!(!again.is_stale());
+    again.clone_to(&cx, &dir, &path("fresh")).expect("a clone of the file flushed again");
+    let counts = io.disk().expect("a simulated disk");
+    assert_eq!((counts.clones, counts.forced_writeback), (2, 0));
+    assert_eq!(held(&cx, &dir, "fresh").as_deref(), Some(&[8u8; 60][..]));
     // A copy of the same unflushed file forces nothing: it reads and writes.
     dir.publish_unsynced(&cx, &path("base"), Content::bytes(&[9; 40]), Unsynced::No).expect("a publish");
     let chunk = NonZero::new(16).expect("a chunk");
     let unflushed = dir.open_read(&cx, &path("base")).expect("the file");
     let copied = dir.publish_unsynced(&cx, &path("copy"), Content::copy_of(&unflushed, chunk), Unsynced::No).expect("a copy");
     assert_eq!(copied.how, How::Copied);
-    assert_eq!(io.disk().expect("a simulated disk").forced_writeback, 60);
+    assert_eq!(io.disk().expect("a simulated disk").forced_writeback, 0);
     assert_eq!(held(&cx, &dir, "copy").as_deref(), Some(&[9u8; 40][..]));
+}
+
+/// The invariant: no clone made through a `Flushed` forces writeback, whatever was written
+/// behind it. The oracle is the simulated disk's ledger. `plant` is the bug planted.
+fn stale_clone_forces_nothing(plant: Plant) -> Result<(), String> {
+    let io = world(24, plant);
+    let (cx, dir) = data(&io);
+    let flushed = dir.publish_synced(&cx, &path("base"), Content::bytes(&[7; 100])).map_err(|error| error.to_string())?.file;
+    // Written behind the `Flushed`, three ways: a publish over the path, an append through
+    // another handle, a rename onto it.
+    let file = match dir.open(&cx, &path("base")) {
+        Ok(file) => file,
+        Err(error) => return Err(error.to_string()),
+    };
+    let appended = file.append_unsynced(&cx, &[8; 60], Unsynced::No);
+    let closed = file.close_unsynced(Unsynced::No);
+    appended.map_err(|error| error.to_string())?;
+    closed.map_err(|error| error.to_string())?;
+    // A clone either is refused or forced nothing out.
+    let cloned = flushed.clone_to(&cx, &dir, &path("clone"));
+    let published = dir.publish_unsynced(&cx, &path("published"), Content::file(&flushed), Unsynced::No);
+    let forced = io.disk().ok_or("no simulated disk")?.forced_writeback;
+    match forced {
+        0 => Ok(()),
+        forced => Err(format!(
+            "clones of a file written behind its Flushed forced {forced} bytes out (clone_to: {}, publish: {})",
+            cloned.is_ok(),
+            published.is_ok()
+        )),
+    }
+}
+
+#[test]
+fn a_flushed_file_written_behind_is_not_cloned() {
+    stale_clone_forces_nothing(Plant::None).unwrap();
+}
+
+#[test]
+fn the_oracle_catches_a_stale_flushed_cloned() {
+    let why = stale_clone_forces_nothing(Plant::StaleFlushedCloned).expect_err("a stale Flushed was cloned and nothing noticed");
+    assert!(why.contains("forced 60 bytes") || why.contains("forced 120 bytes"), "{why}");
 }
 
 #[test]
@@ -237,10 +323,10 @@ fn closing_a_file_gives_the_type_its_durability_made() {
     // The synced close made the file's name durable too; the unsynced one's may be undone.
     assert!(io.crash());
     assert_eq!(held(&cx, &dir, "yes").as_deref(), Some(&b"bytes"[..]));
-    // A close told `Started` is refused and still gives the handle up.
+    // A close told `Started` begins the write-back and gives a `Written`.
     let file = create(&cx, &dir, "started");
-    let refused = file.close(&cx, Durable::Started).expect_err("no driver starts writeback");
-    assert_eq!((refused.op, refused.kind), (FsOp::Close, FsKind::NoWritebackStart));
+    let closed = file.close(&cx, Durable::Started).expect("a close");
+    assert!(matches!(closed, Placed::Written(_)), "{closed:?}");
 }
 
 #[test]
@@ -268,7 +354,7 @@ fn a_blob_torn_by_a_crash_is_refused_not_handed_back() {
 
 #[test]
 fn an_env_says_not_allowed_apart_from_not_set() {
-    let mut sim = SimWorld::new(13);
+    let mut sim = SimWorld::new(13, Limits::USUAL);
     sim.env = vec![("HOME".to_owned(), "/home/sim".to_owned()), ("SECRET".to_owned(), "s3".to_owned())];
     let io = Io::simulated(sim);
     let name = |raw: &str| VarName::new(raw).expect("a test's variable");
@@ -348,4 +434,103 @@ fn a_buffered_writer_holds_bytes_until_it_is_full_or_finished_and_says_which() {
     assert!(closed.is_ok());
     // An append with no buffer is in the file when its call returns.
     assert_eq!(io.disk().expect("a simulated disk").device_waits, 0);
+}
+
+/// The bounds a world's waits, closes and trace end by are the ones its maker said: there is
+/// no constant bstd picked. A trace told to keep two records keeps two and counts the rest.
+#[test]
+fn a_worlds_limits_are_the_ones_its_maker_said() {
+    let limits = Limits {
+        abandon_wait: Duration::from_millis(250),
+        poll_fuel: 1 << 10,
+        close_most: 4,
+        trace_most: 2,
+    };
+    let io = Io::simulated(SimWorld::new(21, limits));
+    assert_eq!(io.limits(), limits);
+    let cx = root(&io);
+    for what in ["one", "two", "three", "four"] {
+        cx.event(what);
+    }
+    let (kept, dropped) = io.trace(|trace| (trace.records().len(), trace.dropped()));
+    assert_eq!((kept, dropped), (2, 2), "two kept, two counted");
+    // The usual world's are the named value, said at its call.
+    assert_eq!(world(21, Plant::None).limits(), Limits::USUAL);
+}
+
+/// A stream holds at most the bytes its opener said: a reply that would pass the bound is
+/// refused whole, and received bytes make room again.
+#[test]
+fn a_streams_inbox_is_bounded_by_what_its_opener_said() {
+    use crate::{hosted::Refused, streams::Streams, url::Url};
+    let io = world(22, Plant::None);
+    let cx = root(&io);
+    let origin = Url::parse("https://relay.example/session").expect("a URL");
+    let origin = origin.origin().expect("an origin");
+    let echo = Streams::handler(|_: &crate::Cx, _: &crate::url::Origin, sent: &[u8], reply: &mut crate::mem::Bytes<'_>| {
+        reply.try_extend(sent)
+    });
+    let mut heard = cx.bytes();
+    // A stream is linear: finished whatever it carried, and checked after.
+    let outcome = match echo.open(&cx, origin, 8) {
+        Ok(mut stream) => {
+            let fits = stream.send_all(&cx, b"12345");
+            let over = stream.send_all(&cx, b"6789").map_err(|error| error.kind);
+            let took = stream.recv(&cx, 64, &mut heard);
+            let again = stream.send_all(&cx, b"6789");
+            let finished = stream.finish(&cx);
+            (fits.is_ok(), over, took, again.is_ok(), finished.is_ok())
+        }
+        Err(error) => panic!("a stream to a handler: {error}"),
+    };
+    assert_eq!(outcome, (true, Err(Refused::InboxFull { held: 5, most: 8 }), Ok(5), true, true));
+    assert_eq!(heard.as_slice(), b"12345", "the refused reply left nothing behind");
+}
+
+/// A lock wait is a wait: it takes the task's context, and a lock still held at the
+/// context's deadline ends the wait with the deadline, in a span named for the lock.
+#[test]
+fn a_lock_wait_takes_a_context_and_ends_at_its_deadline() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::sync::Lock;
+    let io = world(23, Plant::None);
+    let cx = root(&io);
+    let clock = io.need_clock().expect("a clock");
+    let lock = Lock::new("a test's lock", 7u32);
+    match lock.lock(&cx) {
+        Ok(guard) => assert_eq!(*guard, 7),
+        Err(stopped) => panic!("a free lock: {stopped}"),
+    }
+    let (held, release) = (AtomicBool::new(false), AtomicBool::new(false));
+    std::thread::scope(|threads| {
+        threads.spawn(|| {
+            let guard = lock.try_lock().expect("the lock is free");
+            held.store(true, Ordering::SeqCst);
+            // Bounded: the test's thread releases it after its one wait; 60 s at most.
+            let start = std::time::Instant::now();
+            while !release.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(60) {
+                std::thread::yield_now();
+            }
+            drop(guard);
+        });
+        let start = std::time::Instant::now();
+        while !held.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(60) {
+            std::thread::yield_now();
+        }
+        assert!(lock.try_lock().is_none(), "held by the other thread");
+        let short = cx.until(clock.after(Duration::from_millis(20)));
+        let waited = lock.lock(&short).map(|_| ());
+        release.store(true, Ordering::SeqCst);
+        match waited {
+            Err(Stopped::Deadline { span, .. }) => assert_eq!(span, "a test's lock"),
+            other => panic!("a lock held past the deadline gave {other:?}"),
+        }
+    });
+    // Free again: the same context takes it.
+    assert!(lock.lock(&cx).is_ok());
+    let said = io.trace(|trace| {
+        trace.records().iter().any(|record| record.span == "a test's lock" && matches!(record.kind, RecordKind::Opened { .. }))
+    });
+    assert!(said, "the lock's wait opened a span named for it");
 }

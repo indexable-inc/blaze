@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-75 invariants, 18 refinements, 6 reference models.
-By level: 68 tested, 25 simulated, 0 model-checked, 0 proved.
+78 invariants, 18 refinements, 6 reference models.
+By level: 71 tested, 25 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
@@ -60,6 +60,10 @@ By level: 68 tested, 25 simulated, 0 model-checked, 0 proved.
 
 ### blaze-core
 
+- **`wrote_all`** *tested* (`crates/blaze-core/src/fs/linux.rs`): after a write effect that reported done, the file holds every byte asked for, where it was asked for. The oracle is `std::fs::read`.
+  Controls: `a_short_write_not_continued`, `an_errno_mapped_to_the_wrong_error`.
+- **`missing_is_not_found`** *tested* (`crates/blaze-core/src/fs/linux.rs`): a file that is not there is `NotFound`, which is what makes a parent directory (`making_parent`) and what an empty `ReadAll` reads. The oracle is `std::fs`'s error for the same path.
+  Controls: `a_short_write_not_continued`, `an_errno_mapped_to_the_wrong_error`.
 - **`the_turn_loop_never_waits_behind_a_stalled_holder`** *simulated* (`crates/blaze-core/src/lock/tests.rs`): with the state published through an atomic, a stalled holder never holds up a turn, every turn reads the latest state, and every wait among the workers is recorded once, behind the holder it waited for.
   Controls: `a_hot_lock_on_the_turn_loop`.
 - **`pages_read_back_what_was_put_after_any_crash`** *simulated* (`crates/blaze-core/src/sim/pages.rs`): whatever the faults, wherever the power goes out, a read hands back the bytes put or a refusal the disk's rot explains, the open finds what completed, and every load ends.
@@ -164,7 +168,7 @@ By level: 68 tested, 25 simulated, 0 model-checked, 0 proved.
   Controls: `a_sync_that_skips_the_disk`.
 - **`a_deadline_always_ends_a_wait`** *simulated* (`crates/blaze-std/src/tests/deadlines.rs`): a deadline always ends a wait. Under `cx.until(d)` no call returns with the driver's clock past `d` (unless it was past already), a call that stopped with `Stopped::Deadline` did so once `d` had passed, and a call that cannot finish ends with `Stopped::Deadline`, not later and not otherwise.
   Controls: `a_wait_that_ignores_its_deadline`.
-- **`files_keep_what_their_calls_said_through_crashes`** *simulated* (`crates/blaze-std/src/tests/durable.rs`): a file call's durability is what its caller said and nothing else. A read after a publish or a remove returned gives what it said; a crash keeps exactly what was synced, and of what was not, the last synced state or an unsynced change cut short; a clone of a `Flushed` forces no writeback; nothing told `No` waits for the device; and `Started`, which no driver can do yet, is refused with nothing changed.
+- **`files_keep_what_their_calls_said_through_crashes`** *simulated* (`crates/blaze-std/src/tests/durable.rs`): a file call's durability is what its caller said and nothing else. A read after a publish or a remove returned gives what it said; a crash keeps exactly what was synced, and of what was not, the last synced state or an unsynced change cut short; a clone of a `Flushed` forces no writeback; nothing told `No` or `Started` waits for the device; and `Started` keeps through a crash no more than `No` does.
   Controls: `a_publish_that_reports_done_before_its_rename`, `a_durable_yes_that_skipped_the_directory_sync`, `a_flushed_handed_out_before_the_flush_completed`.
 - **`env_only_never_widens`** *tested* (`crates/blaze-std/src/tests/env.rs`): `Env::only` never widens. After any chain of narrowings a variable reads only if every narrowing in the chain named it, and then reads as the world set it.
   Controls: `only_that_replaces`.
@@ -174,6 +178,8 @@ By level: 68 tested, 25 simulated, 0 model-checked, 0 proved.
   Controls: `a_key_that_ignores_an_argument`, `two_points_sharing_entries`, `a_memo_that_never_evicts`, `calls_put_under_the_grandparent`.
 - **`provenance_records_the_calls_made`** *tested* (`crates/blaze-std/src/tests/eval.rs`): the graph `Provenance` writes holds exactly the calls made, each under the call whose body made it, in order.
   Controls: `a_key_that_ignores_an_argument`, `two_points_sharing_entries`, `a_memo_that_never_evicts`, `calls_put_under_the_grandparent`.
+- **`stale_clone_forces_nothing`** *tested* (`crates/blaze-std/src/tests/explicit.rs`): no clone made through a `Flushed` forces writeback, whatever was written behind it. The oracle is the simulated disk's ledger. `plant` is the bug planted.
+  Controls: `a_stale_flushed_cloned`.
 - **`a_finished_op_never_lands_later`** *simulated* (`crates/blaze-std/src/tests/inflight.rs`): an op in flight is finished. Once `Pending::wait` or `Pending::cancel` has returned, the driver holds nothing of it and nothing it does happens later: the file holds what the model says then and once the world has moved on.
   Controls: `a_cancel_that_skips_its_wait`.
 - **`kv_agrees_with_a_model_through_crashes`** *simulated* (`crates/blaze-std/src/tests/kv.rs`): `Kv` agrees with a model map through crashes. A get gives exactly what the model holds and a list exactly its keys; a `put_synced` or a `delete_synced` that returned is kept by a crash, whole: never a part of a value, never an older one.

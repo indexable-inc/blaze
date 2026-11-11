@@ -12,7 +12,8 @@
 
 #![blaze::sans_io]
 
-use std::alloc::Allocator;
+use alloc::vec::Vec;
+use core::alloc::Allocator;
 
 use miniz_oxide::inflate::{
     TINFLStatus,

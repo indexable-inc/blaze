@@ -23,17 +23,15 @@
 //!   [`Scope::join`] ([`crate::task`]); [`Cx::scope_with`] runs a closure as one. There is no
 //!   `io.tasks()`.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use blaze_core::{Done, Tag, wait::Deadline};
 use blaze_mem::Frame;
 
 use crate::{
     Plant, Stopped,
-    io::{Ends, Io, POLL_FUEL},
+    io::{Ends, Io},
     mem::Bytes,
     task::{Scope, TaskError},
     trace::RecordKind,
@@ -210,7 +208,7 @@ impl Cx {
                 Some(Stopped::Cancelled { span: self.span })
             } else if deadline.passed(io.now()) {
                 Some(Stopped::Deadline { span: self.span, at: deadline.get() })
-            } else if idle == POLL_FUEL {
+            } else if idle == io.limits().poll_fuel {
                 Some(Stopped::Stalled { span: self.span, polls: idle })
             } else {
                 None
@@ -257,7 +255,7 @@ impl Cx {
             if deadline.passed(io.now()) {
                 return Err(Stopped::Deadline { span: self.span, at: deadline.get() });
             }
-            if idle == POLL_FUEL {
+            if idle == io.limits().poll_fuel {
                 return Err(Stopped::Stalled { span: self.span, polls: idle });
             }
             match io.poll(deadline) {
@@ -268,7 +266,7 @@ impl Cx {
     }
 
     /// Whether this context stopped already at `now`: then a call asks nothing of the driver.
-    pub(crate) fn stopped_by(&self, now: std::time::Duration) -> Result<(), Stopped> {
+    pub(crate) fn stopped_by(&self, now: core::time::Duration) -> Result<(), Stopped> {
         if self.plant != Plant::WaitIgnoresCancel {
             self.check()?;
         }
@@ -308,8 +306,8 @@ impl Cx {
     }
 }
 
-impl std::fmt::Debug for Cx {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for Cx {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Cx")
             .field("span", &self.span)
             .field("deadline", &self.deadline)

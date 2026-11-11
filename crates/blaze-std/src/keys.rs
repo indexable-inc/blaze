@@ -8,7 +8,8 @@
 //! the message, and its "decryption" an XOR with the material: enough for a program's logic
 //! to be tested against, and not cryptography.
 
-use std::fmt;
+use alloc::vec::Vec;
+use core::fmt;
 
 use crate::{
     Stopped,
@@ -48,7 +49,7 @@ impl Drop for Secret {
             *byte = 0;
         }
         // The zeroing is of memory about to be freed: kept from being optimized away.
-        std::hint::black_box(&self.bytes);
+        core::hint::black_box(&self.bytes);
     }
 }
 
@@ -75,7 +76,7 @@ impl fmt::Display for KeysError {
     }
 }
 
-impl std::error::Error for KeysError {}
+impl core::error::Error for KeysError {}
 
 /// The length of a signature.
 pub const SIGNATURE_LEN: usize = 32;

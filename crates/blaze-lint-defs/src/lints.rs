@@ -965,6 +965,8 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::many_bools", Allow, "detects a call passing two or more bare `bool` literals by position, where a record parameter would name them")
         .externally_loaded(),
+    l("blaze::default_policy", Allow, "detects `impl Default`, `#[derive(Default)]` or a `new()` that takes nothing on a type with a field marked `#[blaze::policy]`, a cost or a guarantee its maker decides")
+        .externally_loaded(),
     l("blaze::sans_io_core", Allow, "detects a function of a `#![blaze::sans_io]` core that reaches the wall clock or IO")
         .externally_loaded(),
     l("blaze::key_ignores_field", Allow, "detects a hand-written key (`Hash`, `PartialEq`, `Ord` or a key builder) that leaves a field out unnamed")

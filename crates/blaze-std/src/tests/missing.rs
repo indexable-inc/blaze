@@ -14,7 +14,7 @@ use hegel::TestCase;
 use super::{Draw, Drawn, Seeds, check, control};
 use crate::{
     Plant,
-    io::{Io, Missing, Offers, SimWorld},
+    io::{Io, Limits, Missing, Offers, SimWorld},
 };
 
 #[derive(Debug)]
@@ -90,7 +90,7 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
     if offers.bits() != plan.offered {
         return Err(format!("Offers::from_bits({:#x}) reads back as {:#x}", plan.offered, offers.bits()));
     }
-    let mut world = SimWorld::new(plan.seed);
+    let mut world = SimWorld::new(plan.seed, Limits::USUAL);
     world.offers = offers;
     let io = Io::planted(world, plant);
     if io.offers() != offers {

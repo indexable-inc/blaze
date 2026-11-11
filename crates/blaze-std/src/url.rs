@@ -5,7 +5,8 @@
 //! with an authority also has its [`Url::origin`] and its [`Url::target`], which is what an
 //! HTTP request needs.
 
-use std::{fmt, sync::Arc};
+use alloc::{borrow::ToOwned, format, string::String, sync::Arc};
+use core::fmt;
 
 use crate::net::HostPort;
 
@@ -59,7 +60,7 @@ impl fmt::Display for UrlError {
     }
 }
 
-impl std::error::Error for UrlError {}
+impl core::error::Error for UrlError {}
 
 /// Whether `raw` is a scheme as written, in either case.
 fn is_scheme(raw: &str) -> bool {

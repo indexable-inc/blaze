@@ -3,7 +3,8 @@
 //! ([`refused`]): 1 to [`NAME_MOST`] bytes, no control byte, no space at either end. A field's
 //! type then says which capability the name is for.
 
-use std::{fmt, sync::Arc};
+use alloc::{borrow::ToOwned, string::String, sync::Arc};
+use core::fmt;
 
 /// The most bytes in a name.
 pub const NAME_MOST: usize = 255;
@@ -46,7 +47,7 @@ impl fmt::Display for NameError {
     }
 }
 
-impl std::error::Error for NameError {}
+impl core::error::Error for NameError {}
 
 /// Why `raw` is no name, if it is not: the one rule of every typed name here.
 pub const fn refused(raw: &str) -> Option<NameWhy> {

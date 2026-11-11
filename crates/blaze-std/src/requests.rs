@@ -26,7 +26,8 @@
 //! connection nor an answer's error can be dropped unseen. [`Http::request`] is the two
 //! together.
 
-use std::{fmt, sync::Arc};
+use alloc::{borrow::ToOwned, string::{String, ToString}, sync::Arc, vec::Vec};
+use core::fmt;
 
 use blaze_http::h1;
 
@@ -52,9 +53,11 @@ pub struct Wire {
     /// The most bytes of an answer's body that are read: past it the request fails
     /// ([`HttpKind::TooBig`]). The bytes go to the caller's [`Bytes`], whose arena has its
     /// own limit; this one is the peer's.
+    #[blaze::policy]
     pub body_most: usize,
     /// The most receives made for one answer before it stops waiting for its end
     /// ([`HttpKind::Unending`]; rule bounded-progress).
+    #[blaze::policy]
     pub reads_most: usize,
 }
 
@@ -106,7 +109,7 @@ impl fmt::Display for HeaderError {
     }
 }
 
-impl std::error::Error for HeaderError {}
+impl core::error::Error for HeaderError {}
 
 impl Header {
     pub fn new(name: &str, value: &str) -> Result<Header, HeaderError> {
@@ -218,7 +221,7 @@ impl fmt::Display for HttpError {
     }
 }
 
-impl std::error::Error for HttpError {}
+impl core::error::Error for HttpError {}
 
 impl From<Stopped> for HttpKind {
     fn from(stopped: Stopped) -> HttpKind {

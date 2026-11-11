@@ -10,10 +10,8 @@
 //! `#[blaze::nonblocking]`, checked, so a budget never adds a wait or an allocation to the
 //! call it meters.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// A budget that had no room for what was asked of it: its limit, what was used of it then,
 /// and what was asked.
@@ -24,8 +22,8 @@ pub struct Over {
     pub asked: u64,
 }
 
-impl std::fmt::Display for Over {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Over {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let Over { limit, used, asked } = self;
         write!(f, "{asked} more bytes would pass its limit of {limit} ({used} used)")
     }
@@ -62,9 +60,17 @@ impl Budget {
 
     /// `bytes` taken from this budget and from each it is inside, or from none of them: the
     /// first with no room says so.
+    ///
+    /// The contract: a refusal names what was asked, and what it says was used never passes
+    /// the limit it names.
     #[blaze::noalloc]
     #[blaze::nonblocking]
-    pub(crate) fn take(&self, bytes: u64) -> Result<(), Over> {
+    pub(crate) fn take(&self, bytes: u64) -> (r: Result<(), Over>)
+        ensures match &r {
+            Ok(()) => true,
+            Err(over) => over.asked == bytes && over.used <= over.limit,
+        }
+    {
         self.take_here(bytes)?;
         let Some(outer) = &self.outer else { return Ok(()) };
         if let Err(over) = outer.take(bytes) {
@@ -105,8 +111,8 @@ impl Budget {
     }
 }
 
-impl std::fmt::Debug for Budget {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for Budget {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "Budget({} of {} used)", self.used.load(Ordering::Acquire), self.limit)
     }
 }

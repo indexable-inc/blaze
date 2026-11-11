@@ -101,7 +101,7 @@ Each layer uses only the ones below it.
 | 4 | `bstd::{fs, net, env, clock, rng, task, process, out}` | the capability types people use |
 | 3 | `bstd::io` | `Io`: one handle to the process's driver; turns a call into an effect and parks the caller until its completion |
 | 2 | `bstd::driver` | `Effect`, `Completion`, `Driver`, and the drivers: `Uring`, `Kqueue`, `Iocp`, `Sim` (today's `blaze-core`) |
-| 1 | `bstd::sys` | raw system calls per target, the only home of `unsafe`; Linux by syscall number with no libc, macOS through libSystem, Windows through ntdll and kernel32 |
+| 1 | `bstd::sys` | raw system calls per target, the only home of `unsafe`; Linux by syscall number with no libc, macOS through libSystem, Windows through ntdll and kernel32 ([sys](sys.md); today the crate `crates/blaze-sys`) |
 | 0 | `core`, `alloc` | the language's own libraries, unchanged |
 
 ## What is in it
@@ -470,7 +470,11 @@ hid the two things that decide its cost. Built in `bstd::fs` (S1).
 - **A file whose data may not be on disk is another type.** An `_unsynced` call gives
   `Written`; `written.flush(cx)` gives `Flushed`, and is the wait; a `_synced` call gives
   `Flushed`. `clone_to` exists on `Flushed` alone; `copy_to` (a plain read and write of the
-  bytes, a chunk at a time) is on both. A clone that forces writeback cannot be written.
+  bytes, a chunk at a time) is on both. A clone that forces writeback cannot be written. A
+  `Flushed` does not go stale silently: it carries the file's generation (the number of the
+  last effect of its world that changed the file, kept by the `Io`), and a clone of a file
+  changed since is refused, naming it (`FsKind::Stale`); flushing again gives one that clones.
+  A change by another process is not seen until an effect reports the inode and change time.
   Neither replaces a file that is there: that is `publish`.
 - **Say what a path should hold, not how.** `dir.publish(path, content, durable)` makes `path`
   hold `content`, replaced all at once (a temporary file beside it, renamed over it), where
@@ -504,8 +508,8 @@ substitute:
 
 | wanted | today | needs |
 |---|---|---|
-| `Durable::Started` | refused before anything changes (`FsKind::NoWritebackStart`): a whole flush left in flight makes its file again if it was renamed or removed meanwhile | an effect that begins writeback (`sync_file_range`, `F_BARRIERFSYNC` without the wait) |
-| a name made durable after a remove, a create or `sync_names` on a real disk | refused after the change (`FsKind::NoNameSync`); the simulation syncs names in its ledger | an effect that syncs a directory |
+| `Durable::Started` | built: the change is made, then `Effect::WriteBack` (all-1110's effect: `sync_file_range` on Linux, `fsync` without `F_FULLFSYNC` on Apple's) is handed over and not waited for; a name change also begins its directory's `Effect::SyncDir` | nothing; `F_BARRIERFSYNC` on macOS comes with blaze-sys's macOS layer |
+| a name made durable after a remove, a create or `sync_names` on a real disk | built: `Effect::SyncDir` (`fsync` of the directory), waited for; refused on Windows, naming it, and for names directly beneath the driver's root (`FsKind::NoNameSync`: no `FileName` names the root) | a handle for the root (the opens beneath a handle, `core-effects-1109`); the Windows call |
 | an unsynced rename or publish that costs no sync on a real disk | the native rename syncs its directories itself, so `Durable::No` is true of the promise and not yet of the price | a rename effect that does not sync |
 | a read that does not copy | `Done::Read` hands back a buffer the driver made, copied into the caller's `Bytes` | the page pool (`file.pin`, S1f) |
 | a write that does not copy | each write's bytes are copied once into the effect, which owns them | registered buffers (`WriteFrom`), with S4 |
@@ -913,6 +917,7 @@ parameter when records land; its cost and guarantee fields stay required.
 | `fs` | `File::close{,_unsynced,_synced}` giving `Written` or `Flushed` | that closing syncs only when told, and what the file then is | `close` always synced |
 | `fs` | `Dir::{remove,rename_replacing}{,_unsynced,_synced}`, `Dir::sync_names` | that a name is durable only once its directory is synced; that a rename replaces | `remove`, `rename`: durability unsaid |
 | `fs` | `Written`, `Flushed`, `clone_to`, `copy_to(.., chunk)` | whether bytes reached the disk; clone against copy; neither replaces (`FsKind::Exists`) | no clone or copy in bstd; the store's own |
+| `fs` | `Flushed` carries its file's generation; `clone_to` and a cloning publish refuse `FsKind::Stale`; `Flushed::is_stale` | that the file was not changed, through this world, since its flush | a write behind a `Flushed` was unseen, and its clone forced writeback |
 | `fs` | `Dir::create` | in place, not atomic, nothing durable until its close says | "made empty, replacing what was there" through a synced whole-file write |
 | `fs` | `Buffered`, `Pushed` | the one buffer, sized by its maker; held against written; linear | no buffered writer |
 | `fs` | `File::read_into(buf)`, `read_at`, `read_all(into)`, `Dir::list(cx, frame)` | the caller's buffer or allocator | already explicit |
@@ -927,9 +932,11 @@ parameter when records land; its cost and guarantee fields stay required.
 | `pending` | `Pending::cancel(cx, give_up)` | how long a cancel waits past its context | the later of the deadline and 1 s, picked inside |
 | `pending` | `Pending` linear; `read_into`/`write_from` against `read_at`/`write_at` | an op in flight is finished; start against start-and-wait | already explicit |
 | `net` | `Conn::send_all`; `recv(cx, most, into)`; `Net::limit` | all or an error; the caller's bound and buffer; the byte budget | `send` |
-| `net` | `Listener::close` hangs up at most `CLOSE_MOST` and says `Unending` | a bound bstd picks, named | already explicit |
+| `net` | `Listener::close` hangs up at most the world's `Limits::close_most` and says `Unending { accepted, most }` | the bound, said where the `Io` is made | `CLOSE_MOST`, a constant |
+| `io` | `Limits { abandon_wait, poll_fuel, close_most, trace_most }` on `SimWorld` and `NativeWorld`, no `Default`; `Io::limits()` | the bounds of an abandoned value's wait, a stalled driver's polls, a close and the trace | four `pub const`s picked inside |
+| `sync` | `Lock::lock(cx)`, `Lock::try_lock()` | a lock wait is a wait: a deadline, a span named for the lock, `Stopped` | `lock()` with no `Cx` |
 | `local` | `pair(name, NonZero)`, `End::write_all` (`LocalError::moved`) | the buffer's size; all or how far | capacity 0 raised to 1; `write` |
-| `streams` | `Stream::send_all` | all or an error | `send` |
+| `streams` | `Stream::send_all`; `Streams::open(cx, origin, inbox_most)` and `Refused::InboxFull` | all or an error; the most bytes a stream holds unreceived | `send`; an unbounded inbox |
 | `requests` | `Http::over(net, clock, roots, Wire)` (record: `Wire`'s fields) | user agent, most body bytes, most receives; one connection a request, no retry, redirect or pool | three constants picked inside |
 | `requests` | `Exchange` linear, `request(.., into)` | the answer's buffer; finishing | already explicit |
 | `env` | `Env::get -> Result<Option<&str>, NotAllowed>` | not allowed against not set | both `None` |
@@ -954,12 +961,14 @@ chosen otherwise today, and each is a row to close):
 | every write and send | the bytes are copied once into the effect, in the global heap | registered buffers, S4 |
 | `Pending` | one boxed closure an op | the `Frames` layout (the op's state is in its frame) |
 | `requests::Http::over` | the h1 core's head and body buffers are `Vec`s in the global heap | an h1 core that takes an allocator |
-| `streams` (handler provider) | replies are held in an unbounded queue in the global heap | a bound and an allocator on `Streams::handler` |
+| `streams` (handler provider) | replies are held in the global heap (bounded by `inbox_most`) | an allocator on `Streams::open` |
 | `Path::join`, `Dir::subdir`, narrowing (`only`) | a name or an allow-list is allocated in the global heap, once | S4's `String<A>`, or names interned in the task's frame |
 | `keys::Secret` | its bytes are in the global heap | a locked, zeroed arena from `Mem` |
-| `sync::{Lock, RwLock}` | `lock()` takes no `Cx`: no deadline, and nothing in its type says it may wait | S1b: bstd's own lock over the one wait |
+| `fs::Flushed` | a change to its file by another process is not seen (the generation counts this world's effects) | a stat effect that reports the inode and change time (`statx` in blaze-sys has both) |
+| `sync::RwLock`, `Signal` | `read()`, `write()` and `wait()` take no `Cx` (blaze-core's, re-exported); `Lock::lock(cx)` waits on the wall clock, not the driver's | S1b: bstd's own locks over the one wait |
 | `Io`'s own state | one process lock around the driver (uncontended under `Inline`) | the scheduler (S3b) |
-| `io::ABANDON_WAIT`, `io::POLL_FUEL`, `net::CLOSE_MOST`, `trace::TRACE_MOST`, `kv::KEY_MOST` | bounds bstd picks, each a `pub const` named in the outcome it ends in | record parameters, where a caller could pick |
+| `kv::KEY_MOST` | a bound of the format (a key's longest file name), a `pub const` named in the outcome it ends in | nothing: not a policy |
+| `Io::sim(seed)` | `Limits::USUAL`, a named value its doc says | nothing: a test's world; `Io::simulated(SimWorld::new(seed, limits))` says its own |
 | `SimWorld::new(seed)` | the simulation's latency and faults default (`Faults::default`) | nothing: a test's world, and the seed is said |
 | `audio` callbacks | `Fill`/`Take` should be `noalloc` and `nonblocking`; a closure type cannot carry the mark | effect bounds on closure parameters |
 | the facade (`record`, `report`, `bytes`, `http`, `quic`) | re-exports are not audited here: `record::to_bytes` and `report::render` allocate in the global heap | S1d, as each piece is merged |
@@ -992,8 +1001,32 @@ task with `Stopped::OutOfMemory { arena, asked }` through the same path as a pan
 `panics-fail-one-job`); the process and the other tasks go on. Code that wants to handle it itself
 uses the `try_` forms (`try_push`, `try_reserve`), which return the error.
 
-Until S4, `alloc`'s global allocator still exists underneath; the `ambient` check treats a use of
+Until S4's runtime ([sys](sys.md), "Runtime"), `alloc`'s global allocator still exists underneath; the `ambient` check treats a use of
 it in a capabilities crate as an effect (`global_alloc`), which replaces the `// alloc:` comment.
+
+### Contracts
+
+bstd's public functions carry `requires` and `ensures` (ledger V3), in the native clause syntax
+([contracts](contracts.md); `#![feature(blaze_verify)]`), checked in the dev and test profiles.
+
+| function | contract | generated test |
+|---|---|---|
+| `budget::Budget::take` | a refusal names what was asked, and its `used` never passes its `limit` | no: a method |
+| `clock::Instant::since` | it answers exactly when `earlier` is not the later | no: a method |
+| `kv::Key::new` | a key is 1 to `KEY_MOST` bytes | no: an associated function |
+| `fs::Dir::quota` | the directory given has at most `bytes` left | no: a method |
+
+Written and not yet stated, because each needs `self` or a borrowed argument in its `ensures`,
+which no test of the lowering shows it takes: `Kv::get` after `put_synced` reads the value put;
+`Blobs::put` returns the BLAKE3 of its bytes and `get` hands back only bytes whose BLAKE3 is the
+id; `Budget::left` is at most the limit; `Clock::after(wait)` is `now + wait`; a `_synced` call
+leaves `device_waits` higher and an `_unsynced` one does not.
+
+What the generator (`#[blaze::contract_test]`) needs before these are run as property tests: it
+refuses methods and associated functions (bstd has almost nothing else), so it needs a receiver
+(drawn, or built by a constructor the type names); a `&Cx` and capabilities, made from
+`Io::sim(seed)` with the seed drawn; `&mut` arguments (`Bytes`); and a `Debug` bound it can do
+without for capabilities. The crate-wide `#![blaze::contract_tests]` is also not built.
 
 ### The page pool: one home for bytes that come from outside
 
@@ -1053,10 +1086,10 @@ Lints the second rule implies:
 |---|---|---|
 | `blaze::nopanic`, `noalloc`, `nonblocking` | a marked function that reaches the effect | yes |
 | `blaze::linear` (the borrow check's `LINEAR`) | a `File<ReadWrite>`, `Buffered`, `Pending`, `Scope`, `Conn` left unfinished | yes |
-| `blaze::implicit_policy` | a public bstd function that reaches a cost its signature does not carry (below) | no: specified here, for the lints lane |
-| `blaze::default_policy` | `impl Default`, or a `new()` with no arguments, for a bstd type with a field marked as a cost or a guarantee | no |
+| `blaze::implicit_policy` | a public bstd function that reaches a cost its signature does not carry (below) | no: specified here. Not built with `default_policy` because the lints read no effect summary yet (`instance_effects` is the MIR walk's, with no query the lint pass can ask per function), and the `Sync` and `Write` kinds are not rows of `effect_attrs::ROWS` |
+| `blaze::default_policy` | `impl Default`, `#[derive(Default)]`, or a `new()` with no arguments, for a type with a field marked `#[blaze::policy]` (a cost or a guarantee) | yes: `crates/blaze-lints/src/blaze/default_policy.rs`, on in bstd; `Limits`, `SimWorld::limits`, `Wire` and `MemoLimit` are marked |
 | `.clippy.toml` bans of the removed names (`Dir::write`, `File::sync`, `File::replace`, `Conn::send`, `End::write`) | a use of one, by resolution | no: the names are gone from bstd, so the ban is for crates that move onto it (S3) |
-| a compile-fail fixture for bstd | `written.clone_to(..)`; a call of a removed name | no: bstd has no compile-fail harness; hir-ty-linear's fixtures mirror only its linear types |
+| compile-fail fixtures for bstd | `written.clone_to(..)`; a `Buffered` dropped; a write through a handle narrowed to read-only; a call of a removed name (`Dir::write`) | yes: `bstd_the_wrong_call_does_not_compile` in `crates/blaze-engine/tests/repro.rs` runs `blaze check` on each file of `crates/blaze-engine/tests/repro/bstd_the_wrong_call_does_not_compile/wrong`, beside a control that checks |
 
 **`blaze::implicit_policy`**, for crates on the trusted list that are libraries (bstd first).
 For each `pub` function and method, read the effect summary the walk already makes
@@ -1101,7 +1134,7 @@ Interface first, bottom last, so nothing waits on the runtime and every step lan
 | S1f | The page pool moves from `blaze-cas` to `bstd::mem::pool`; `file.pin`, pooled receive buffers, records read in place; no `mmap` anywhere in bstd | the pool's simulation test still passes from its new home; the store builds on it |
 | S1g | `bstd::audio`: `AudioOut`, `AudioIn`, PCM buffers, the mixer and resampler as cores, the simulation's provider and one native one; the audio track in the muxer; the types of the device capabilities | a simulated run's samples equal a model's; the callback's effects are refused when it waits or allocates |
 | S3b | The `Frames` layout: the calling convention, the slab, unwinding, and the profiler and backtraces walking the frame chain | the differential test against `Fibers` passes |
-| S4 | The bottom: `bstd::sys` and `bstd::rt`, `blaze-core`'s drivers move in as `bstd::driver`, and bstd is `#![no_std]` | no blaze crate links Rust's `std`; C1 still passes |
+| S4 | The bottom ([sys](sys.md)): `bstd::sys` and `bstd::rt`, `blaze-core`'s drivers move in as `bstd::driver`, and bstd is `#![no_std]`. Slice 1 is written: `crates/blaze-sys` for Linux, the first file effects on it, bstd `#![no_std]` with one std module (`rt.rs`) | the ban list (`harness/v2/nostd.json`) is empty and no blaze crate links Rust's `std` (`harness/v2/nostd.py`); C1 still passes |
 | S5 | The edition: `edition = "blaze-2026.11"` makes `std` name bstd, `fn main(io: Io)` is the entry, and the OS sandbox of a program is derived from what `main` hands out | a program of the edition that never opens the network cannot, checked by the sandbox |
 | S6 | C dependencies as wasm, the registry, the migration (`blaze fix --edition`) | each has its own row when S5 is met |
 

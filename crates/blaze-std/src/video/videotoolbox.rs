@@ -13,7 +13,8 @@
 //! waits. The callback's refcon is the outbox, which the session holds until after it is
 //! invalidated (field order: [`Live`] drops first), after which VideoToolbox calls no more.
 
-use std::{alloc::Allocator, collections::VecDeque, ffi::c_void, ptr::NonNull, sync::Arc};
+use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
+use core::{alloc::Allocator, ffi::c_void, ptr::NonNull};
 
 use blaze_core::lock::Lock;
 use objc2_core_foundation::{CFArray, CFBoolean, CFData, CFDictionary, CFNumber, CFRetained, CFString, CFType};
@@ -233,7 +234,7 @@ impl Session {
             "bstd.video.videotoolbox.outbox",
             Outbox { ready: VecDeque::new(), done: 0 },
         ));
-        let mut out: *mut VTCompressionSession = std::ptr::null_mut();
+        let mut out: *mut VTCompressionSession = core::ptr::null_mut();
         // SAFETY: the dictionaries hold the value types VideoToolbox documents for their keys
         // (CFBoolean, CFNumber, CFDictionary); the callback matches VTCompressionOutputCallback;
         // the refcon is the outbox, alive until after the session is invalidated (`Live`); `out`
@@ -313,8 +314,8 @@ impl Session {
                 pts,
                 duration,
                 None,
-                std::ptr::without_provenance_mut(at as usize),
-                std::ptr::null_mut(),
+                core::ptr::without_provenance_mut(at as usize),
+                core::ptr::null_mut(),
             )
         };
         checked("VTCompressionSessionEncodeFrame", status)?;
@@ -338,7 +339,7 @@ impl Session {
 
     /// A buffer from the session's pool, for the frame at `at`.
     fn pixel_buffer(&self, at: i64) -> Result<CFRetained<CVPixelBuffer>, VideoError> {
-        let mut out: *mut CVPixelBuffer = std::ptr::null_mut();
+        let mut out: *mut CVPixelBuffer = core::ptr::null_mut();
         // SAFETY: a live pool and a valid place for the buffer, returned +1 (the Create rule).
         let status = unsafe { CVPixelBufferPool::create_pixel_buffer(None, &self.pool, NonNull::from(&mut out)) };
         match NonNull::new(out).filter(|_| status == kCVReturnSuccess) {
@@ -376,7 +377,7 @@ impl Session {
                 let target = unsafe { base.add(r * stride) };
                 // SAFETY: row `r`'s first `row` bytes (row <= stride) are in the locked plane and
                 // writable; the source is the caller's, which cannot overlap CoreVideo's buffer.
-                unsafe { std::ptr::copy_nonoverlapping(source.as_ptr(), target, row) };
+                unsafe { core::ptr::copy_nonoverlapping(source.as_ptr(), target, row) };
             }
         }
         // SAFETY: the lock taken above, with the same flags.

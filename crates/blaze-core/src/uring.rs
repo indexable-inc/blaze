@@ -2488,6 +2488,8 @@ impl Driver for Uring {
                 // On a thread of its own (`sync_file_range`, waited for there): the ring's
                 // submitter never waits for a device, and the asker waits for nothing.
                 back @ Effect::WriteBack { .. } => self.off_ring(back).map(|()| None),
+                // A directory's `fsync`, waited for on a thread of its own as a list is.
+                names @ Effect::SyncDir { .. } => self.off_ring(names).map(|()| None),
                 list @ Effect::List { .. } => self.off_ring(list).map(|()| None),
                 private @ Effect::Private { .. } => self.off_ring(private).map(|()| None),
                 Effect::WriteAt { file, at, bytes, .. } => {

@@ -1688,6 +1688,10 @@ impl Sim {
                 // alloc: an error's message.
                 None => Done::Failed(IoError(format!("{file}: no such file"))),
             },
+            // This simulation keeps every name change through a crash (its names are
+            // durable as they are made); what a crash may undo of names not synced is
+            // modelled above it (bstd's ledger), which this completion tells.
+            Effect::SyncDir { .. } => Done::Synced,
             Effect::Truncate { file, len, .. } => {
                 file_mut(&mut self.files, &file).ops.push(Op::Cut(len));
                 self.changed(&file);

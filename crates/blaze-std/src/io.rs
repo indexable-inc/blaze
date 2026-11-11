@@ -33,7 +33,14 @@
 //! them ([`Offers::NATIVE`]) and a simulated one answers them from its
 //! [`SimHost`] ([`Io::script`]). Nothing stands in for a missing provider.
 
-use std::{fmt, sync::Arc, time::Duration};
+use alloc::{
+    boxed::Box,
+    collections::BTreeMap,
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
+use core::{fmt, time::Duration};
 
 use blaze_core::{
     Completion, Done, Driver, Effect, FileName, Tag,
@@ -75,14 +82,42 @@ use crate::{
     window::Window,
 };
 
-/// The most polls in a row that bring nothing while the deadline has not passed: a driver
-/// whose poll returns early this often does not keep its deadline (rule bounded-progress).
-pub(crate) const POLL_FUEL: u32 = 1 << 16;
+/// The bounds bstd would otherwise pick for its caller, said once where the [`Io`] is made
+/// (docs/v2/plan/design/std.md, "The second rule": a bound is an argument, never a default).
+/// A world is made with one ([`SimWorld::limits`], [`NativeWorld::limits`]); there is no
+/// `Default`. [`Limits::USUAL`] is a named value, written at the call like any other.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Limits {
+    /// How long an abandoned value waits, on the driver's clock, for what it had in flight to
+    /// end (a [`crate::pending::Pending`]'s op, a [`crate::task::Scope`]'s tasks) when a panic
+    /// drops it: its abandonment path's bound.
+    #[blaze::policy]
+    pub abandon_wait: Duration,
+    /// The most polls in a row that bring nothing while the deadline has not passed, before
+    /// the wait ends as [`Stopped::Stalled`]: a driver whose poll returns early this often
+    /// does not keep its deadline.
+    #[blaze::policy]
+    pub poll_fuel: u32,
+    /// The most connections [`crate::net::Listener::close`] hangs up while it waits for the
+    /// listen's end, before it stops waiting.
+    #[blaze::policy]
+    pub close_most: usize,
+    /// The most records the world's trace keeps; past it each further one is counted in
+    /// [`Trace::dropped`].
+    #[blaze::policy]
+    pub trace_most: usize,
+}
 
-/// How long an abandoned value waits, on the driver's clock, for what it had in flight to end
-/// (a [`crate::pending::Pending`]'s op, a [`crate::task::Scope`]'s tasks) when a panic drops it:
-/// its abandonment path's bound (rule bounded-progress).
-pub const ABANDON_WAIT: Duration = Duration::from_secs(1);
+impl Limits {
+    /// One second for an abandoned value, 65,536 idle polls, 1,024 connections hung up by a
+    /// close, 65,536 trace records: what blaze's own programs and the tests say.
+    pub const USUAL: Limits = Limits {
+        abandon_wait: Duration::from_secs(1),
+        poll_fuel: 1 << 16,
+        close_most: 1024,
+        trace_most: 1 << 16,
+    };
+}
 
 /// What the simulation's generator of [`Io::rng`] starts from, besides the seed: so it draws
 /// other numbers than the simulation's own scheduler.
@@ -182,6 +217,12 @@ struct World {
     /// test's view of where its capabilities reached.
     touched: Vec<(FileName, bool)>,
     record: bool,
+    /// For each file whose bytes or name an effect of this world changed, the number of the
+    /// last effect that did (its tag, plus one): the file's generation, which a
+    /// [`crate::fs::Flushed`] carries and its clone compares. A file removed or renamed away
+    /// has no entry, so the table holds one entry a file that is there and was changed here.
+    // alloc: one entry a live file changed through this world.
+    changed: BTreeMap<FileName, u64>,
     /// What the world's tasks recorded through their contexts.
     trace: Trace,
     host: HostFacts,
@@ -205,6 +246,7 @@ pub struct Io {
     env: Arc<[(String, String)]>,
     args: Arc<[String]>,
     offers: Offers,
+    limits: Limits,
 }
 
 /// The table of what a host offers, one flag a root capability, and what is made from it.
@@ -332,7 +374,7 @@ impl fmt::Display for Missing {
     }
 }
 
-impl std::error::Error for Missing {}
+impl core::error::Error for Missing {}
 
 /// A simulated world: the seed every choice of it comes from, how unkind it is, its
 /// environment variables, its command line and its host.
@@ -345,13 +387,17 @@ pub struct SimWorld {
     pub host: HostFacts,
     /// What its program is offered: [`Offers::ALL`] unless a test withholds some.
     pub offers: Offers,
+    /// The bounds its waits, closes and trace end by.
+    #[blaze::policy]
+    pub limits: Limits,
 }
 
 impl SimWorld {
     /// The world of [`Io::sim`]: no faults beyond latency, no environment, no arguments, the
-    /// simulated host, every capability offered.
-    pub fn new(seed: u64) -> SimWorld {
+    /// simulated host, every capability offered, with the bounds `limits`.
+    pub fn new(seed: u64, limits: Limits) -> SimWorld {
         SimWorld {
+            limits,
             seed,
             faults: Faults::default(),
             // alloc: none, an empty environment.
@@ -370,12 +416,14 @@ impl SimWorld {
 /// no effect that asks the system for randomness or the host's name yet).
 #[derive(Debug)]
 pub struct NativeWorld<'a> {
-    pub root: &'a std::path::Path,
+    pub root: &'a crate::rt::RootPath,
     pub threads: usize,
     pub env: Vec<(String, String)>,
     pub args: Vec<String>,
     pub host_name: Arc<str>,
     pub seed: u64,
+    /// The bounds its waits, closes and trace end by.
+    pub limits: Limits,
 }
 
 /// What a world starts from, whichever its driver.
@@ -386,6 +434,7 @@ struct Start {
     args: Vec<String>,
     host: HostFacts,
     offers: Offers,
+    limits: Limits,
     hosted: Option<Box<SimHost>>,
     disk: Option<Box<Disk>>,
     plant: Plant,
@@ -404,18 +453,20 @@ impl fmt::Display for OpenError {
     }
 }
 
-impl std::error::Error for OpenError {}
+impl core::error::Error for OpenError {}
 
 impl Io {
     /// A whole simulated world from `seed`: an in-memory file tree, a virtual clock, a seeded
-    /// generator, no faults beyond the simulation's latency and no environment.
+    /// generator, no faults beyond the simulation's latency and no environment, with
+    /// [`Limits::USUAL`]: a test's world, whose seed is said. A world with other bounds is
+    /// [`Io::simulated`] of a [`SimWorld`].
     pub fn sim(seed: u64) -> Io {
-        Io::simulated(SimWorld::new(seed))
+        Io::simulated(SimWorld::new(seed, Limits::USUAL))
     }
 
     /// [`Io::sim`] offering only what `offers` says: a test of a host that withholds some.
     pub fn sim_with(seed: u64, offers: Offers) -> Io {
-        let mut world = SimWorld::new(seed);
+        let mut world = SimWorld::new(seed, Limits::USUAL);
         world.offers = offers;
         Io::simulated(world)
     }
@@ -434,6 +485,7 @@ impl Io {
             args: world.args,
             host: world.host,
             offers: world.offers,
+            limits: world.limits,
             // alloc: once per simulated world, its host.
             hosted: Some(Box::new(SimHost::new())),
             // alloc: once per simulated world, its disk's ledger.
@@ -460,8 +512,9 @@ impl Io {
             seed: world.seed,
             env: world.env,
             args: world.args,
-            host: HostFacts { pid: std::process::id(), cores, name: world.host_name },
+            host: HostFacts { pid: crate::rt::process_id(), cores, name: world.host_name },
             offers: crate::host::OFFERS,
+            limits: world.limits,
             hosted: None,
             disk: None,
             plant: Plant::None,
@@ -469,7 +522,7 @@ impl Io {
     }
 
     fn over(start: Start) -> Io {
-        let Start { driver, seed, env, args, host, offers, hosted, disk, plant } = start;
+        let Start { driver, seed, env, args, host, offers, limits, hosted, disk, plant } = start;
         let world = World {
             driver,
             next: 0,
@@ -485,7 +538,9 @@ impl Io {
             // alloc: none until a test records.
             touched: Vec::new(),
             record: false,
-            trace: Trace::new(),
+            // alloc: none until a file is changed.
+            changed: BTreeMap::new(),
+            trace: Trace::new(limits.trace_most),
             host,
             exited: None,
             hosted,
@@ -500,7 +555,16 @@ impl Io {
             // alloc: once per world, its command line.
             args: args.into(),
             offers,
+            limits,
         }
+    }
+
+    /// The bounds this world was made with.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn limits(&self) -> Limits {
+        self.limits
     }
 
     /// The root context: named `main`, never cancelled, ending `budget` from now on the
@@ -878,10 +942,10 @@ impl Io {
             simulated
         };
         if !simulated {
-            std::process::exit(status);
+            crate::rt::exit(status);
         }
         // alloc: once, the unwind's payload.
-        std::panic::resume_unwind(Box::new(Exit { status }))
+        crate::rt::resume_unwind(Box::new(Exit { status }))
     }
 
     /// The driver's clock.
@@ -923,6 +987,7 @@ impl Io {
         if world.record {
             touch(&mut world.touched, &effect);
         }
+        change(&mut world.changed, &effect, tag.0 + 1);
         let World { driver, effects, disk, .. } = &mut *world;
         if let (Some(disk), Some(sim)) = (disk.as_deref_mut(), driver.sim()) {
             disk.submitted(sim, &effect);
@@ -930,6 +995,14 @@ impl Io {
         effects.push(effect);
         driver.submit(effects);
         tag
+    }
+
+    /// The generation of `name`: the number of the last effect of this world that changed
+    /// its bytes or made it, 0 for a file no effect of this world changed (or one since
+    /// removed). Changes by another process are not seen: blaze-core's `Meta` carries no
+    /// inode or change time to compare (std.md, "still implicit").
+    pub(crate) fn generation(&self, name: &FileName) -> u64 {
+        self.world.lock().changed.get(name).copied().unwrap_or(0)
     }
 
     /// A number no other call of this world was given: a tag's, taken for a name made beside
@@ -955,20 +1028,26 @@ impl Io {
         }
     }
 
-    /// The names of the directory `dir` made durable, waited for: `true` once the simulated
-    /// disk has synced them. `false` on a real driver: blaze-core has no effect that syncs a
-    /// directory (its rename syncs its own), so nothing was done and the caller decides
-    /// whether that is a refusal. A `cx` that stopped already asks nothing.
-    pub(crate) fn sync_names(&self, cx: &Cx, dir: &str) -> Result<bool, Stopped> {
-        cx.stopped_by(self.now())?;
+    /// A sync of the directory `dir`'s names completed and was waited for
+    /// ([`Effect::SyncDir`]): the simulated disk's ledger makes them durable and counts the
+    /// wait. `true` in a simulated world, which has a ledger; `false` in a real one, where
+    /// the disk itself did it.
+    pub(crate) fn names_synced(&self, dir: &str) -> bool {
         match self.world.lock().disk.as_deref_mut() {
             Some(disk) => {
                 disk.sync_names(dir);
                 disk.waited();
-                Ok(true)
+                true
             }
-            None => Ok(false),
+            None => false,
         }
+    }
+
+    /// Whether this world's rename has synced its directories by the time it completes: a
+    /// real driver's does (blaze-core's `Effect::Rename`); the simulation's ledger is told by
+    /// a directory sync.
+    pub(crate) fn rename_syncs_names(&self) -> bool {
+        self.world.lock().disk.is_none()
     }
 
     /// How many effects the driver holds that have not completed: a test's view of whether
@@ -979,8 +1058,8 @@ impl Io {
 
     /// The next completion of the one-shot `tag`, waited for until `until` heeding no
     /// cancellation: the wait of a cancel and of an abandonment, which must see their op end
-    /// so that nothing it does lands after they return. Past `until`, or after [`POLL_FUEL`]
-    /// polls in a row that bring nothing, the op is given up ([`Io::forget`]) and the stop
+    /// so that nothing it does lands after they return. Past `until`, or after
+    /// [`Limits::poll_fuel`] polls in a row that bring nothing, the op is given up ([`Io::forget`]) and the stop
     /// says why (rule bounded-progress).
     pub(crate) fn settle(&self, tag: Tag, until: Deadline, span: &'static str) -> Result<Done, Stopped> {
         let mut idle = 0;
@@ -990,7 +1069,7 @@ impl Io {
             }
             let stopped = if until.passed(self.now()) {
                 Some(Stopped::Deadline { span, at: until.get() })
-            } else if idle == POLL_FUEL {
+            } else if idle == self.limits.poll_fuel {
                 Some(Stopped::Stalled { span, polls: idle })
             } else {
                 None
@@ -1087,7 +1166,10 @@ fn touch(touched: &mut Vec<(FileName, bool)>, effect: &Effect) {
             named(to, true);
         }
         Effect::List { dir, .. } | Effect::Entries { dir, .. } | Effect::Watch { dir, .. } => named(dir, false),
-        Effect::Private { dir, .. } | Effect::MakeDir { dir, .. } | Effect::RemoveDir { dir, .. } => named(dir, true),
+        Effect::Private { dir, .. }
+        | Effect::MakeDir { dir, .. }
+        | Effect::RemoveDir { dir, .. }
+        | Effect::SyncDir { dir, .. } => named(dir, true),
         Effect::Journal { dir, .. } => named(dir, false),
         Effect::Unlock { .. }
         | Effect::Unwatch { .. }
@@ -1113,6 +1195,36 @@ fn touch(touched: &mut Vec<(FileName, bool)>, effect: &Effect) {
         | Effect::WriteOut { .. }
         | Effect::Now { .. }
         | Effect::Random { .. } => {}
+    }
+}
+
+/// Records in `changed` what `effect`, numbered `stamp`, does to the files it names: a file
+/// whose bytes it changes or that it makes is stamped; one it removes or renames away loses
+/// its entry.
+fn change(changed: &mut BTreeMap<FileName, u64>, effect: &Effect, stamp: u64) {
+    match effect {
+        Effect::Append { file, .. }
+        | Effect::Truncate { file, .. }
+        | Effect::Write { file, .. }
+        | Effect::WriteAt { file, .. }
+        | Effect::WriteFrom { file, .. } => {
+            // clone: the table's key, a refcount.
+            changed.insert(file.clone(), stamp);
+        }
+        Effect::Remove { file, .. } => {
+            changed.remove(file);
+        }
+        Effect::Rename { from, to, .. } => {
+            changed.remove(from);
+            // clone: the table's key, a refcount.
+            changed.insert(to.clone(), stamp);
+        }
+        Effect::Clone { to, .. } | Effect::Link { to, .. } => {
+            // clone: the table's key, a refcount.
+            changed.insert(to.clone(), stamp);
+        }
+        // Everything else leaves every file's bytes and names as they were.
+        _ => {}
     }
 }
 

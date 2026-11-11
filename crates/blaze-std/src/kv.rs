@@ -26,7 +26,8 @@
 //! crash is never listed), and a delete is a remove. A host that offers a store directly (a
 //! wasm worker's) would be a second provider; none exists yet.
 
-use std::fmt;
+use alloc::{borrow::ToOwned, string::String, vec::Vec};
+use core::fmt;
 
 use blaze_mem::Frame;
 
@@ -81,7 +82,7 @@ impl fmt::Display for KeyError {
     }
 }
 
-impl std::error::Error for KeyError {}
+impl core::error::Error for KeyError {}
 
 /// Why `raw` is no key, if it is not.
 pub const fn refused(raw: &str) -> Option<KeyWhy> {
@@ -106,7 +107,15 @@ pub const fn refused(raw: &str) -> Option<KeyWhy> {
 }
 
 impl Key {
-    pub fn new(raw: &str) -> Result<Key, KeyError> {
+    /// `raw` as a key, or why it is none.
+    ///
+    /// The contract: a key is 1 to [`KEY_MOST`] bytes.
+    pub fn new(raw: &str) -> (r: Result<Key, KeyError>)
+        ensures match &r {
+            Ok(key) => !key.as_str().is_empty() && key.as_str().len() <= KEY_MOST,
+            Err(_) => true,
+        }
+    {
         if let Some(why) = refused(raw) {
             // alloc: an error's message.
             return Err(KeyError { key: raw.to_owned(), why });
@@ -172,7 +181,7 @@ impl fmt::Display for KvError {
     }
 }
 
-impl std::error::Error for KvError {}
+impl core::error::Error for KvError {}
 
 impl KvError {
     /// The stop, if the wait under it stopped.

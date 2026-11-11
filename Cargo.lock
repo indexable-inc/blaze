@@ -759,6 +759,7 @@ dependencies = [
  "blaze-radix",
  "blaze-rng",
  "blaze-spin",
+ "blaze-sys",
  "crossbeam-channel",
  "crossbeam-queue",
  "hegeltest",
@@ -2012,6 +2013,13 @@ dependencies = [
  "blaze-rng",
  "blaze-store-check",
  "crossbeam-channel",
+]
+
+[[package]]
+name = "blaze-sys"
+version = "0.0.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

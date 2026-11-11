@@ -17,7 +17,8 @@
 //! script runs out. blaze-core has no effect for a sound device (CoreAudio, PipeWire, WASAPI).
 //! Sample times are data: a simulated run gives exact samples a test compares.
 
-use std::{collections::VecDeque, fmt};
+use alloc::{collections::VecDeque, vec::Vec};
+use core::fmt;
 
 use crate::{
     cx::Cx,
@@ -104,7 +105,7 @@ impl fmt::Display for AudioError {
     }
 }
 
-impl std::error::Error for AudioError {}
+impl core::error::Error for AudioError {}
 
 /// The host's sound: from [`Io::audio`].
 #[derive(Clone)]

@@ -8,7 +8,7 @@
 //! **Provider.** The simulation only ([`crate::hosted::SimHost::apps`]): blaze-core has no
 //! effect for an accessibility or automation interface.
 
-use std::fmt;
+use core::fmt;
 
 use crate::{
     cx::Cx,
@@ -32,7 +32,7 @@ impl fmt::Display for AutomationError {
     }
 }
 
-impl std::error::Error for AutomationError {}
+impl core::error::Error for AutomationError {}
 
 /// Other applications: from [`Io::automation`].
 #[derive(Clone)]

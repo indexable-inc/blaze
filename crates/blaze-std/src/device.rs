@@ -18,7 +18,8 @@
 //! has just the operations one test needs, a scripted value in and a recorded value out.
 //! blaze-core has no effect for any of them.
 
-use std::fmt;
+use alloc::{borrow::ToOwned, vec::Vec};
+use core::fmt;
 
 use blaze_mem::Frame;
 
@@ -85,7 +86,7 @@ impl fmt::Display for DeviceError {
     }
 }
 
-impl std::error::Error for DeviceError {}
+impl core::error::Error for DeviceError {}
 
 /// The simulated device `name` of `kind`.
 fn device<'a>(host: &'a mut SimHost, kind: DeviceKind, name: &DeviceName) -> Result<&'a mut SimDevice, Refused> {

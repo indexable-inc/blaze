@@ -10,7 +10,8 @@
 //!
 //! **Provider.** Real, over [`Dir`], as [`Kv`]'s.
 
-use std::fmt;
+use alloc::{string::ToString, vec::Vec};
+use core::fmt;
 
 use blaze_mem::Frame;
 
@@ -120,7 +121,7 @@ impl fmt::Display for BlobsError {
     }
 }
 
-impl std::error::Error for BlobsError {}
+impl core::error::Error for BlobsError {}
 
 /// An object store beneath a directory: from [`Blobs::beneath`].
 pub struct Blobs<#[blaze::linear] P: Rights> {

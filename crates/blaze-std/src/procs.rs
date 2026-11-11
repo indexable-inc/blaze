@@ -10,7 +10,8 @@
 //! [`Host`]: crate::host::Host
 //! [`Host::procs`]: crate::host::Host::procs
 
-use std::fmt;
+use alloc::vec::Vec;
+use core::fmt;
 
 use blaze_mem::Frame;
 
@@ -82,7 +83,7 @@ impl fmt::Display for ProcsError {
     }
 }
 
-impl std::error::Error for ProcsError {}
+impl core::error::Error for ProcsError {}
 
 /// Other processes: from [`crate::host::Host::procs`].
 #[derive(Clone)]

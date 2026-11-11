@@ -10,7 +10,7 @@
 //!
 //! | form | takes | waits for the device |
 //! |---|---|---|
-//! | `x_unsynced` | [`Unsynced`] (`No`; `Started` is refused until a driver can begin writeback) | never |
+//! | `x_unsynced` | [`Unsynced`] (`No`, or `Started`: write-back begun, nothing waited for) | never |
 //! | `x_synced` | nothing more | yes: the file's bytes, then its directory's names |
 //! | `x` | [`Durable`], the policy as a value | when it is `Durable::Yes` |
 //!
@@ -66,21 +66,20 @@
 //! - A real driver's rename syncs its directories itself, so a rename, and a publish, costs
 //!   that sync whatever [`Durable`] says: `Durable::No` is honest about what is promised, not
 //!   yet about what is paid. It needs a rename effect that does not sync.
-//! - No effect syncs a directory. On a real driver a `_synced` call whose name change was not
-//!   a rename (a remove, the close of a file this handle made, [`Dir::sync_names`]) is
-//!   refused with [`FsKind::NoNameSync`] rather than said durable. The simulation's ledger
-//!   syncs names itself.
-//! - No effect starts writeback alone, and a whole flush handed over and not waited for is
-//!   not a stand-in: blaze-core's flush makes its file where it is missing, so one still in
-//!   flight brings back, empty, a file removed or renamed away meanwhile. So
-//!   [`Unsynced::Started`] is refused before anything is changed
-//!   ([`FsKind::NoWritebackStart`]), on a real driver and in the simulation alike.
+//! - A directory's names are synced by an effect (`Effect::SyncDir`), which every `_synced`
+//!   name change and [`Dir::sync_names`] wait for. The driver's root itself has no name an
+//!   effect can carry: a name directly beneath it is [`FsKind::NoNameSync`] on a real driver.
+//! - [`Unsynced::Started`] begins the file's write-back (`Effect::WriteBack`) once the
+//!   change is made, and for a name change its directory's sync (`Effect::SyncDir`), and
+//!   waits for neither: their ends are dropped as they arrive. A write-back makes no file, so
+//!   one still in flight brings nothing back of a file removed or renamed away meanwhile.
 //! - A directory is there once a file under it is (no effect makes an empty one).
 //! - A read's bytes come back in a buffer the driver made (`Done::Read`), so
 //!   [`File::read_all`] and `copy_to` pass through one global allocation each read; the page
 //!   pool (std.md, S1f) replaces it with a view.
 
-use std::{fmt, marker::PhantomData, num::NonZero, sync::Arc};
+use alloc::{format, string::String, sync::Arc, vec::Vec};
+use core::{fmt, marker::PhantomData, num::NonZero};
 
 use blaze_core::{Done, Effect, FileName};
 use blaze_mem::Frame;
@@ -141,10 +140,9 @@ pub enum Durable {
     /// Nothing is asked of the device: derived data, lost or torn by a power failure and
     /// made again.
     No,
-    /// Writeback of the bytes is begun and not waited for. It promises nothing a crash
-    /// keeps; a later flush has less to wait for. No driver can do it yet (see the module's
-    /// doc): a call told this is refused with [`FsKind::NoWritebackStart`] before it changes
-    /// anything, never run as `No` or as `Yes` in its place.
+    /// Writeback of the bytes is begun and not waited for (`Effect::WriteBack`; for a name
+    /// change, its directory's `Effect::SyncDir`). It promises nothing a crash keeps; a
+    /// later flush has less to wait for, and a file whose write-back has ended is clean.
     Started,
     /// Synced: the bytes, then the name. The one that waits for the device.
     Yes,
@@ -358,13 +356,15 @@ pub enum FsKind {
     Stopped(Stopped),
     /// The directory it came from has a quota ([`Dir::quota`]) with no room for it.
     OverQuota(Over),
-    /// The call was told [`Durable::Started`] and no driver has an effect that begins
-    /// writeback without waiting for it. Nothing was changed.
-    NoWritebackStart,
-    /// A directory's names were to be made durable and the driver has no effect that syncs
-    /// a directory (blaze-core's rename syncs its own; nothing else of its does): refused,
-    /// never said durable. The change itself was made.
+    /// The names directly beneath the driver's root were to be made durable, and no effect
+    /// can name the root to sync it (a `FileName` names something beneath it): refused,
+    /// never said durable. The change itself was made. A name in any directory beneath the
+    /// root is synced ([`blaze_core::Effect::SyncDir`]).
     NoNameSync,
+    /// A [`Flushed`] was to be cloned and its file was changed after the flush it stands
+    /// for (by effect `changed_at` of this world; the flush saw `flushed_at`): the clone
+    /// would make the kernel write the new bytes out first. Nothing was cloned.
+    Stale { flushed_at: u64, changed_at: u64 },
     /// The driver failed it, saying this.
     Driver(String),
     /// The driver answered with a completion of another kind: a driver's bug.
@@ -393,15 +393,18 @@ impl fmt::Display for FsError {
             ),
             FsKind::Stopped(stopped) => write!(f, "bstd::fs {op} of {path}: {stopped}"),
             FsKind::OverQuota(over) => write!(f, "bstd::fs {op} of {path}: its directory's quota: {over}"),
-            FsKind::NoWritebackStart => write!(
-                f,
-                "bstd::fs {op} of {path}: told Durable::Started, and no driver has an effect that begins \
-                 writeback without waiting for it: nothing was changed (pass Durable::No, or Durable::Yes and wait)"
-            ),
             FsKind::NoNameSync => write!(
                 f,
-                "bstd::fs {op} of {path}: its directory's names were to be synced, and this driver has no \
-                 effect that syncs a directory: the change was made and is not said durable (rule no-fallback)"
+                "bstd::fs {op} of {path}: its directory is the driver's root, whose names no effect can \
+                 sync (a name beneath a directory of the root is synced): the change was made and is not \
+                 said durable (rule no-fallback)"
+            ),
+            FsKind::Stale { flushed_at, changed_at } => write!(
+                f,
+                "bstd::fs {op} of {path}: the file was changed after it was flushed (the flush saw \
+                 change {flushed_at}, and change {changed_at} came after), so a clone would wait for \
+                 its writeback: nothing was cloned (flush it again, `Written::from(flushed).flush(cx)`, \
+                 or copy it)"
             ),
             FsKind::Driver(said) => write!(f, "bstd::fs {op} of {path}: {said}"),
             FsKind::Answered(done) => {
@@ -411,7 +414,7 @@ impl fmt::Display for FsError {
     }
 }
 
-impl std::error::Error for FsError {}
+impl core::error::Error for FsError {}
 
 impl FsError {
     fn new(op: FsOp, path: &FileName, kind: FsKind) -> FsError {
@@ -474,29 +477,67 @@ fn flush_start(io: &Io, name: &FileName) {
     io.forget(tag, Ends::Once);
 }
 
-/// What an `_unsynced` call checks before it changes anything: [`Unsynced::No`] asks nothing
-/// of the device, and [`Unsynced::Started`] asks what no driver can do yet, so it is refused
-/// here rather than run as another policy (rule no-fallback).
-fn unsynced_as_told(op: FsOp, name: &FileName, unsynced: Unsynced) -> Result<(), FsError> {
+/// What an `_unsynced` call does once its change to `name`'s bytes is made:
+/// [`Unsynced::No`] asks nothing of the device; [`Unsynced::Started`] begins the file's
+/// write-back ([`Effect::WriteBack`]) and waits for nothing. The write-back's end, and its
+/// failure (the file removed meanwhile; a write-back makes no file), are dropped as they
+/// arrive: `Started` promises only that the bytes are on their way.
+fn started(io: &Io, name: &FileName, unsynced: Unsynced) {
     match unsynced {
-        Unsynced::No => Ok(()),
-        Unsynced::Started => Err(FsError::new(op, name, FsKind::NoWritebackStart)),
+        Unsynced::No => {}
+        Unsynced::Started => {
+            // clone: the effect's name, a refcount.
+            let file = name.clone();
+            let tag = io.submit(|tag| Effect::WriteBack { file, tag });
+            io.forget(tag, Ends::Once);
+        }
     }
 }
 
-/// The names of `name`'s directory made durable, for a `_synced` call. `renamed` says the
-/// name change was a rename: a real driver's rename has synced its directories itself, and
-/// nothing else of blaze-core's syncs one, so any other change is refused there
-/// ([`FsKind::NoNameSync`]).
+/// What an `_unsynced` call does once its change to a name (a rename, a remove) is made:
+/// for [`Unsynced::Started`] the sync of `name`'s directory is begun ([`Effect::SyncDir`])
+/// and not waited for. The names of the driver's root, which no effect can name, are left.
+fn names_started(io: &Io, name: &FileName, unsynced: Unsynced) {
+    match (unsynced, FileName::new(dir_of(name))) {
+        (Unsynced::Started, Some(dir)) => {
+            let tag = io.submit(|tag| Effect::SyncDir { dir, tag });
+            io.forget(tag, Ends::Once);
+        }
+        (Unsynced::Started, None) | (Unsynced::No, _) => {}
+    }
+}
+
+/// The names of `name`'s directory made durable and waited for, for a `_synced` call: the
+/// directory's sync ([`Effect::SyncDir`]). `renamed` says the name change was a rename: a
+/// real driver's rename has synced its directories itself by the time it completes, so no
+/// second sync is paid there. A name directly beneath the driver's root has no directory an
+/// effect can name: [`FsKind::NoNameSync`] on a real driver (the simulation's ledger is told
+/// directly).
 fn sync_names(io: &Io, cx: &Cx, op: FsOp, name: &FileName, renamed: bool) -> Result<(), FsError> {
     if io.plant() == Plant::DurableSkipsNameSync {
         return Ok(());
     }
-    match io.sync_names(cx, dir_of(name)) {
-        Ok(true) => Ok(()),
-        Ok(false) if renamed => Ok(()),
-        Ok(false) => Err(FsError::new(op, name, FsKind::NoNameSync)),
-        Err(stopped) => Err(FsError::new(op, name, FsKind::Stopped(stopped))),
+    if renamed && io.rename_syncs_names() {
+        return Ok(());
+    }
+    sync_dir(io, cx, op, name, dir_of(name))
+}
+
+/// The directory `dir`'s names synced and waited for, on behalf of the call `op` on `path`.
+fn sync_dir(io: &Io, cx: &Cx, op: FsOp, path: &FileName, dir: &str) -> Result<(), FsError> {
+    let Some(named) = FileName::new(dir) else {
+        cx.stopped_by(io.now()).map_err(|stopped| FsError::new(op, path, FsKind::Stopped(stopped)))?;
+        return match io.names_synced(dir) {
+            true => Ok(()),
+            false => Err(FsError::new(op, path, FsKind::NoNameSync)),
+        };
+    };
+    match call(io, cx, op, path, |tag| Effect::SyncDir { dir: named, tag })? {
+        Done::Synced => {
+            io.names_synced(dir);
+            Ok(())
+        }
+        done => Err(unexpected(op, path, done)),
     }
 }
 
@@ -696,7 +737,14 @@ impl Dir<ReadWrite> {
     /// its bytes, not the hole before them. So the files written through it by appends and
     /// publishes of bytes never hold more than the quota; bytes held on the disk are the
     /// driver's to bound, with an effect blaze-core does not have yet.
-    pub fn quota(&self, bytes: u64) -> Dir<ReadWrite> {
+    ///
+    /// The contract: the directory it gives has at most `bytes` left, whatever it is inside.
+    pub fn quota(&self, bytes: u64) -> (r: Dir<ReadWrite>)
+        ensures match r.quota_left() {
+            Some(left) => left <= bytes,
+            None => false,
+        }
+    {
         // clone: authority held, narrowed: a refcount each, the budget this one is inside too.
         let quota = Some(Budget::new(bytes, self.quota.clone()));
         Dir { io: self.io.clone(), base: self.base.clone(), quota, rights: PhantomData }
@@ -890,6 +938,7 @@ impl Dir<ReadWrite> {
                 How::Written
             }
             Kind::CloneOf(base) => {
+                base.not_stale(FsOp::Publish)?;
                 // A name left by an earlier process: a clone never replaces.
                 remove(&self.io, cx, FsOp::Publish, &temp)?;
                 clone_file(&self.io, cx, FsOp::Publish, base.name(), &temp)?;
@@ -900,6 +949,7 @@ impl Dir<ReadWrite> {
                 How::Copied
             }
             Kind::PatchOf { base, patches } => {
+                base.not_stale(FsOp::Publish)?;
                 remove(&self.io, cx, FsOp::Publish, &temp)?;
                 clone_file(&self.io, cx, FsOp::Publish, base.name(), &temp)?;
                 for patch in patches {
@@ -970,9 +1020,10 @@ impl Dir<ReadWrite> {
         unsynced: Unsynced,
     ) -> Result<Published<Written>, FsError> {
         let name = self.beneath(path);
-        unsynced_as_told(FsOp::Publish, &name, unsynced)?;
         let (temp, how) = self.place(cx, &name, content)?;
         self.swap_in(cx, &temp, &name)?;
+        started(&self.io, &name, unsynced);
+        names_started(&self.io, &name, unsynced);
         cx.event(how.says());
         Ok(Published { file: Written::of(&self.io, name), how })
     }
@@ -988,7 +1039,10 @@ impl Dir<ReadWrite> {
         self.swap_in(cx, flushed.name(), &name)?;
         sync_names(&self.io, cx, FsOp::Publish, &name, true)?;
         cx.event(how.says());
-        Ok(Published { file: Flushed::of(&self.io, name), how })
+        // The name's generation is its rename's: the bytes were flushed as the temporary file,
+        // and nothing changed them since.
+        let seen = self.io.generation(&name);
+        Ok(Published { file: Flushed::of(&self.io, name, seen), how })
     }
 
     /// The file at `path` gone, as durably as `durable` says; gone already is done.
@@ -1004,12 +1058,12 @@ impl Dir<ReadWrite> {
     /// is done.
     pub fn remove_unsynced(&self, cx: &Cx, path: &Path, unsynced: Unsynced) -> Result<(), FsError> {
         let name = self.beneath(path);
-        unsynced_as_told(FsOp::Remove, &name, unsynced)?;
-        remove(&self.io, cx, FsOp::Remove, &name)
+        remove(&self.io, cx, FsOp::Remove, &name)?;
+        names_started(&self.io, &name, unsynced);
+        Ok(())
     }
 
     /// The file at `path` gone, and its directory's names synced: a crash keeps it gone.
-    /// On a real driver the sync is refused ([`FsKind::NoNameSync`]) after the remove.
     pub fn remove_synced(&self, cx: &Cx, path: &Path) -> Result<(), FsError> {
         let name = self.beneath(path);
         remove(&self.io, cx, FsOp::Remove, &name)?;
@@ -1038,8 +1092,10 @@ impl Dir<ReadWrite> {
         unsynced: Unsynced,
     ) -> Result<(), FsError> {
         let (from, to) = (self.beneath(from), self.beneath(to));
-        unsynced_as_told(FsOp::Rename, &to, unsynced)?;
-        rename(&self.io, cx, FsOp::Rename, &from, &to)
+        rename(&self.io, cx, FsOp::Rename, &from, &to)?;
+        started(&self.io, &to, unsynced);
+        names_started(&self.io, &to, unsynced);
+        Ok(())
     }
 
     /// `from` renamed over `to`, replacing it all at once for a reader, then the file's
@@ -1056,17 +1112,14 @@ impl Dir<ReadWrite> {
 
     /// The names directly in this directory made durable: every file made in it, renamed
     /// into it or removed from it by a call that has returned stays so through a crash. It
-    /// waits for the device. A file's bytes are its own flush. On a real driver it is
-    /// refused ([`FsKind::NoNameSync`]): blaze-core has no effect that syncs a directory.
+    /// waits for the device ([`blaze_core::Effect::SyncDir`]). A file's bytes are its own
+    /// flush. The driver's root itself, which no effect can name, is
+    /// [`FsKind::NoNameSync`] on a real driver.
     pub fn sync_names(&self, cx: &Cx) -> Result<(), FsError> {
         if self.io.plant() == Plant::DurableSkipsNameSync {
             return Ok(());
         }
-        match self.io.sync_names(cx, self.base.as_str()) {
-            Ok(true) => Ok(()),
-            Ok(false) => Err(FsError::new(FsOp::SyncNames, &self.base, FsKind::NoNameSync)),
-            Err(stopped) => Err(FsError::new(FsOp::SyncNames, &self.base, FsKind::Stopped(stopped))),
-        }
+        sync_dir(&self.io, cx, FsOp::SyncNames, &self.base, self.base.as_str())
     }
 }
 
@@ -1081,12 +1134,17 @@ pub struct Written {
 }
 
 /// A file whose bytes had all reached the disk when this was made: what a `_synced` call and
-/// [`Written::flush`] give. The one type with [`Flushed::clone_to`]. A write to the file
-/// through another handle after this was made is not seen by the type: the simulation
-/// counts what a clone then forces out ([`crate::disk::DiskCounts::forced_writeback`]).
+/// [`Written::flush`] give. The one type with [`Flushed::clone_to`]. It carries the file's
+/// generation as its flush saw it (the number of the last effect of this world that changed
+/// the file), and a clone of a file changed since is refused ([`FsKind::Stale`]): a
+/// `Flushed` does not go stale silently. A change by another process is not seen (blaze-core
+/// reports no inode or change time yet); the simulation still counts what any clone forces
+/// out ([`crate::disk::DiskCounts::forced_writeback`]).
 #[derive(Clone, Debug)] // clone: authority held, copied: refcounts
 pub struct Flushed {
     file: File<ReadOnly>,
+    /// The file's generation ([`Io::generation`]) read before the flush this stands for.
+    seen: u64,
 }
 
 impl From<File<ReadOnly>> for Written {
@@ -1098,6 +1156,8 @@ impl From<File<ReadOnly>> for Written {
 }
 
 impl From<Flushed> for Written {
+    /// A flushed file taken as one that may not be: it claims less. The way back from a
+    /// stale `Flushed` is this and [`Written::flush`].
     fn from(flushed: Flushed) -> Written {
         Written { file: flushed.file }
     }
@@ -1123,12 +1183,15 @@ impl Written {
     /// `_synced` call that named it).
     pub fn flush(self, cx: &Cx) -> Result<Flushed, FsError> {
         let Written { file } = self;
+        // Read before the flush is asked for: a change that lands while it runs is one the
+        // flush may not cover, and makes the `Flushed` stale.
+        let seen = file.io.generation(&file.name);
         if file.io.plant() == Plant::FlushedBeforeFlush {
             flush_start(&file.io, &file.name);
-            return Ok(Flushed { file });
+            return Ok(Flushed { file, seen });
         }
         flush_wait(&file.io, cx, FsOp::Flush, &file.name)?;
-        Ok(Flushed { file })
+        Ok(Flushed { file, seen })
     }
 
     /// A new file at `path` beneath `dir` holding what this holds, read and written `chunk`
@@ -1149,8 +1212,26 @@ impl Written {
 }
 
 impl Flushed {
-    fn of(io: &Io, name: FileName) -> Flushed {
-        Flushed { file: File { io: io.clone(), name, quota: None, made: false, rights: ReadOnly } }
+    fn of(io: &Io, name: FileName, seen: u64) -> Flushed {
+        Flushed { file: File { io: io.clone(), name, quota: None, made: false, rights: ReadOnly }, seen }
+    }
+
+    /// Whether the file was changed, through this world, after the flush this stands for:
+    /// then [`Flushed::clone_to`] and a publish that clones it refuse it.
+    pub fn is_stale(&self) -> bool {
+        self.file.io.generation(&self.file.name) != self.seen
+    }
+
+    /// What every clone of this file checks first, for the call `op`: [`FsKind::Stale`],
+    /// naming the file, when it was changed after its flush. Under
+    /// [`Plant::StaleFlushedCloned`] nothing is checked: the planted bug of the stale-clone
+    /// test.
+    fn not_stale(&self, op: FsOp) -> Result<(), FsError> {
+        let changed_at = self.file.io.generation(&self.file.name);
+        if changed_at == self.seen || self.file.io.plant() == Plant::StaleFlushedCloned {
+            return Ok(());
+        }
+        Err(FsError::new(op, &self.file.name, FsKind::Stale { flushed_at: self.seen, changed_at }))
     }
 
     /// The file, to read.
@@ -1166,8 +1247,11 @@ impl Flushed {
     /// are forced out, this file being flushed. It never replaces: something at `path` is
     /// [`FsKind::Exists`]. A file system that cannot share blocks fails it, naming both
     /// volumes; nothing copies in its place ([`Flushed::copy_to`] is the copy). The new
-    /// file's name is not synced.
+    /// file's name is not synced. A file changed since its flush is refused before anything
+    /// is made ([`FsKind::Stale`], naming the file): flushing it again gives a `Flushed` that
+    /// clones.
     pub fn clone_to(&self, cx: &Cx, dir: &Dir<ReadWrite>, path: &Path) -> Result<Written, FsError> {
+        self.not_stale(FsOp::CloneTo)?;
         let to = dir.beneath(path);
         dir.absent(cx, FsOp::CloneTo, &to)?;
         clone_file(&dir.io, cx, FsOp::CloneTo, &self.file.name, &to)?;
@@ -1326,8 +1410,9 @@ impl File<ReadWrite> {
     /// `bytes` added at the end, not flushed: it never waits for the device, and a crash
     /// keeps a prefix of them until a later [`File::flush`] has returned.
     pub fn append_unsynced(&self, cx: &Cx, bytes: &[u8], unsynced: Unsynced) -> Result<(), FsError> {
-        unsynced_as_told(FsOp::Append, &self.name, unsynced)?;
-        self.append_bytes(cx, bytes)
+        self.append_bytes(cx, bytes)?;
+        started(&self.io, &self.name, unsynced);
+        Ok(())
     }
 
     /// `bytes` added at the end, then the file flushed: once this returns a crash keeps
@@ -1382,10 +1467,11 @@ impl File<ReadWrite> {
     /// `bytes` written at `at`, not flushed: its [`File::write_from`], waited for. It never
     /// waits for the device.
     pub fn write_at_unsynced(&self, cx: &Cx, at: u64, bytes: &[u8], unsynced: Unsynced) -> Result<(), FsError> {
-        unsynced_as_told(FsOp::WriteAt, &self.name, unsynced)?;
         cx.stopped_by(self.io.now())
             .map_err(|stopped| FsError::new(FsOp::WriteAt, &self.name, FsKind::Stopped(stopped)))?;
-        self.write_from(bytes, at).wait(cx)
+        self.write_from(bytes, at).wait(cx)?;
+        started(&self.io, &self.name, unsynced);
+        Ok(())
     }
 
     /// `bytes` written at `at`, then the file flushed: once this returns a crash keeps them.
@@ -1405,10 +1491,11 @@ impl File<ReadWrite> {
 
     /// The file cut or grown to `len`, not flushed: it never waits for the device.
     pub fn set_len_unsynced(&self, cx: &Cx, len: u64, unsynced: Unsynced) -> Result<(), FsError> {
-        unsynced_as_told(FsOp::SetLen, &self.name, unsynced)?;
         within(&self.io, self.quota.as_deref(), FsOp::SetLen, &self.name, len, || {
             truncate(&self.io, cx, FsOp::SetLen, &self.name, len)
-        })
+        })?;
+        started(&self.io, &self.name, unsynced);
+        Ok(())
     }
 
     /// The file cut or grown to `len`, then flushed: once this returns a crash keeps it so.
@@ -1440,34 +1527,33 @@ impl File<ReadWrite> {
     }
 
     /// The file finished with nothing synced: a [`Written`], whose bytes a crash may lose or
-    /// tear. It takes no `Cx`: it cannot wait. Told [`Unsynced::Started`] it is refused
-    /// ([`FsKind::NoWritebackStart`]); the handle is given up either way, with nothing synced,
-    /// since a linear value has no way back.
+    /// tear. It takes no `Cx`: it cannot wait. Told [`Unsynced::Started`] it begins the
+    /// file's write-back and waits for nothing. It cannot fail today; the `Result` is the
+    /// shape every close has.
     #[blaze::consumes]
     pub fn close_unsynced(self, unsynced: Unsynced) -> Result<Written, FsError> {
         let File { io, name, quota: _, made: _, rights } = self;
         crate::consume(rights);
-        unsynced_as_told(FsOp::Close, &name, unsynced)?;
+        started(&io, &name, unsynced);
         Ok(Written::of(&io, name))
     }
 
     /// The file finished and synced: its bytes flushed and, if this handle made it
     /// ([`Dir::create`]), its directory's names synced, so a crash keeps the file and every
-    /// byte written to it. A [`Flushed`], or the sync's error, op [`FsOp::Close`]. On a real
-    /// driver the names' sync of a file this handle made is refused
-    /// ([`FsKind::NoNameSync`]), after the flush.
+    /// byte written to it. A [`Flushed`], or the sync's error, op [`FsOp::Close`].
     #[blaze::consumes]
     pub fn close_synced(self, cx: &Cx) -> Result<Flushed, FsError> {
         let File { io, name, quota: _, made, rights } = self;
         crate::consume(rights);
+        let seen = io.generation(&name);
         if io.plant() == Plant::CloseSkipsSync {
-            return Ok(Flushed::of(&io, name));
+            return Ok(Flushed::of(&io, name, seen));
         }
         flush_wait(&io, cx, FsOp::Close, &name)?;
         if made {
             sync_names(&io, cx, FsOp::Close, &name, false)?;
         }
-        Ok(Flushed::of(&io, name))
+        Ok(Flushed::of(&io, name, seen))
     }
 }
 

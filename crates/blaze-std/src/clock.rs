@@ -2,7 +2,8 @@
 //! simulation's is virtual), deadlines on it, and sleeps that end by the task's deadline. Wall
 //! time needs an effect blaze-core does not have, so there is none yet.
 
-use std::time::Duration;
+use alloc::{format, string::String};
+use core::time::Duration;
 
 use blaze_core::{Done, Effect, wait::Deadline};
 
@@ -23,9 +24,13 @@ impl Instant {
 
     /// Time from `earlier` to this; `None` when `earlier` is the later of the two (it was
     /// once zero then, unsaid).
+    ///
+    /// The contract: it answers exactly when `earlier` is not the later one.
     #[blaze::noalloc]
     #[blaze::nonblocking]
-    pub fn since(self, earlier: Instant) -> Option<Duration> {
+    pub fn since(self, earlier: Instant) -> (r: Option<Duration>)
+        ensures r.is_some() == (earlier.0 <= self.0)
+    {
         self.0.checked_sub(earlier.0)
     }
 
@@ -49,8 +54,8 @@ pub enum SleepError {
     Driver { span: &'static str, said: String },
 }
 
-impl std::fmt::Display for SleepError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for SleepError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             SleepError::Stopped(stopped) => write!(f, "bstd::clock sleep: {stopped}"),
             SleepError::Driver { span, said } => {
@@ -60,7 +65,7 @@ impl std::fmt::Display for SleepError {
     }
 }
 
-impl std::error::Error for SleepError {}
+impl core::error::Error for SleepError {}
 
 impl From<Stopped> for SleepError {
     fn from(stopped: Stopped) -> SleepError {

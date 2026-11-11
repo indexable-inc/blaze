@@ -30,13 +30,19 @@ pub mod reach;
 mod shared;
 pub mod shares;
 
-use std::{
+use alloc::{
+    boxed::Box,
+    collections::{BTreeMap, BTreeSet, BinaryHeap, LinkedList, VecDeque},
+    rc::{self, Rc},
+    string::String,
+    sync::{self, Arc},
+    vec::Vec,
+};
+use core::{
     alloc::Allocator,
     cell::{Cell, LazyCell, OnceCell, RefCell, UnsafeCell},
-    collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, LinkedList, VecDeque},
     mem::{ManuallyDrop, MaybeUninit},
-    rc::{self, Rc},
-    sync::{self, Arc, LazyLock, Mutex, OnceLock, RwLock, atomic::Atomic},
+    sync::atomic::{Atomic, AtomicPrimitive},
 };
 
 pub use reach::{
@@ -124,8 +130,10 @@ impl Capability for crate::host::Host {}
 impl Capability for crate::mem::Mem {}
 impl Capability for crate::keys::Keys {}
 
-// How std's containers hold their type arguments. Each is a trusted assertion about a type
-// whose fields the walk would otherwise refuse (a raw pointer inside) or misread.
+// How core's and alloc's containers hold their type arguments. Each is a trusted assertion
+// about a type whose fields the walk would otherwise refuse (a raw pointer inside) or misread.
+// The ones only Rust's `std` has (`HashMap`, `HashSet`, `Mutex`, `RwLock`, `OnceLock`,
+// `LazyLock`) are stated in `crate::rt`, the one module that names `std` (bstd is `#![no_std]`).
 //
 // SAFETY (all of the impls below): the type keeps a value of each type argument alive the way
 // the impl says and keeps alive nothing else that owns: `Option`, `Result`, `ManuallyDrop` and
@@ -146,8 +154,6 @@ unsafe impl<T, A: Allocator> Owns<Solely> for LinkedList<T, A> {}
 unsafe impl<T, A: Allocator> Owns<Solely> for BinaryHeap<T, A> {}
 unsafe impl<K, V, A: Allocator + Clone> Owns<Solely> for BTreeMap<K, V, A> {}
 unsafe impl<T, A: Allocator + Clone> Owns<Solely> for BTreeSet<T, A> {}
-unsafe impl<K, V, S> Owns<Solely> for HashMap<K, V, S> {}
-unsafe impl<T, S> Owns<Solely> for HashSet<T, S> {}
 unsafe impl Owns<Solely> for String {}
 
 unsafe impl<T: ?Sized, A: Allocator> Owns<Jointly> for Rc<T, A> {}
@@ -158,11 +164,7 @@ unsafe impl<T: ?Sized> Owns<Mutably> for Cell<T> {}
 unsafe impl<T: ?Sized> Owns<Mutably> for RefCell<T> {}
 unsafe impl<T> Owns<Mutably> for OnceCell<T> {}
 unsafe impl<T, F> Owns<Mutably> for LazyCell<T, F> {}
-unsafe impl<T: ?Sized> Owns<Mutably> for Mutex<T> {}
-unsafe impl<T: ?Sized> Owns<Mutably> for RwLock<T> {}
-unsafe impl<T> Owns<Mutably> for OnceLock<T> {}
-unsafe impl<T, F> Owns<Mutably> for LazyLock<T, F> {}
-unsafe impl<T: sync::atomic::AtomicPrimitive> Owns<Mutably> for Atomic<T> {}
+unsafe impl<T: AtomicPrimitive> Owns<Mutably> for Atomic<T> {}
 unsafe impl<T: ?Sized> Owns<Mutably> for blaze_core::lock::Lock<T> {}
 unsafe impl<T: ?Sized> Owns<Mutably> for blaze_core::lock::ReadLock<T> {}
 unsafe impl<T: ?Sized, K> Owns<Mutably> for crate::cell::TokenCell<T, K> {}

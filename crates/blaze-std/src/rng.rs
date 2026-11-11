@@ -6,7 +6,7 @@
 //! The generator itself is re-exported as it is ([`SplitMix64`], its [`mix`] and [`GAMMA`]),
 //! for a sans-IO core that is handed a seed rather than the capability.
 
-use std::num::NonZero;
+use core::num::NonZero;
 
 pub use blaze_rng::{GAMMA, SplitMix64, mix};
 
@@ -41,8 +41,8 @@ impl Rng {
     }
 }
 
-impl std::fmt::Debug for Rng {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for Rng {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("Rng")
     }
 }

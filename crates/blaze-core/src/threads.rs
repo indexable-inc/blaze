@@ -23,7 +23,6 @@
 
 use std::{
     collections::VecDeque,
-    fs::{File, OpenOptions},
     io::{self, Write as _},
     path::{Path, PathBuf},
     sync::Arc,
@@ -999,19 +998,7 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
         },
         Effect::ReadLink { file, .. } => read_link(root, &file),
         Effect::Read { file, at: from, len, .. } => {
-            let file = at(root, &file, |path| File::open(path))?;
-            // alloc: the read's payload.
-            let mut bytes = vec![0; len];
-            let mut read = 0;
-            while read < len {
-                let n = read_at(&file, &mut bytes[read..], from + read as u64)?;
-                if n == 0 {
-                    break;
-                }
-                read += n;
-            }
-            bytes.truncate(read);
-            Ok(Done::Read(bytes))
+            Ok(Done::Read(at(root, &file, |path| fs::read(path, from, len))?))
         }
         Effect::ReadInto { file, at: from, into, cache, priority, .. } => {
             let span = crate::spans::resolve(&into, &file, from, cache, "a read into memory of")
@@ -1038,15 +1025,15 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
             Ok(Done::Written)
         }
         Effect::Append { file, bytes, .. } => at(root, &file, |path| {
-            let open = || OpenOptions::new().create(true).append(true).open(path);
-            fs::making_parent(path, open)?.write_all(&bytes)?;
+            fs::append(path, &bytes)?;
             Ok(Done::Appended)
         }),
-        // `sync_all` is `F_FULLFSYNC` on Apple's systems, where `fsync` leaves the bytes in the
-        // drive's cache.
         Effect::Sync { file, .. } => at(root, &file, |path| {
-            // durable: carries out `Effect::Sync`, whose asker said why
-            OpenOptions::new().append(true).create(true).open(path)?.sync_all()?;
+            fs::sync(path)?;
+            Ok(Done::Synced)
+        }),
+        Effect::SyncDir { dir, .. } => at(root, &dir, |path| {
+            fs::sync_dir(path)?;
             Ok(Done::Synced)
         }),
         // Waited for on this thread; the asker waits for nothing, and nothing is durable.
@@ -1218,21 +1205,6 @@ fn link_bytes(file: &crate::FileName, target: std::path::PathBuf) -> io::Result<
             format!("{file}: a link's target that is not UTF-8"),
         )),
     }
-}
-
-#[cfg(unix)]
-fn read_at(file: &File, buffer: &mut [u8], at: u64) -> io::Result<usize> {
-    std::os::unix::fs::FileExt::read_at(file, buffer, at)
-}
-
-#[cfg(windows)]
-fn read_at(file: &File, buffer: &mut [u8], at: u64) -> io::Result<usize> {
-    std::os::windows::fs::FileExt::seek_read(file, buffer, at)
-}
-
-#[cfg(target_os = "wasi")]
-fn read_at(file: &File, buffer: &mut [u8], at: u64) -> io::Result<usize> {
-    std::os::wasi::fs::FileExt::read_at(file, buffer, at)
 }
 
 /// The bytes of the symbolic link `file`'s `target`, as [`Effect::ReadLink`] gives them.

@@ -6,7 +6,8 @@
 //! stored"): checked as it is made, by [`VarName::new`] or, for a literal, by
 //! [`crate::var!`] as the crate compiles.
 
-use std::{fmt, sync::Arc};
+use alloc::{borrow::ToOwned, string::String, sync::Arc};
+use core::fmt;
 
 use crate::Plant;
 
@@ -46,7 +47,7 @@ impl fmt::Display for VarNameError {
     }
 }
 
-impl std::error::Error for VarNameError {}
+impl core::error::Error for VarNameError {}
 
 /// Why `raw` is no variable name, if it is not. A `const fn`, so [`crate::var!`] checks a
 /// literal as the crate compiles with the same rule [`VarName::new`] checks at run time.
@@ -132,7 +133,7 @@ impl fmt::Display for NotAllowed {
     }
 }
 
-impl std::error::Error for NotAllowed {}
+impl core::error::Error for NotAllowed {}
 
 /// The variables a holder may read.
 #[derive(Clone)]

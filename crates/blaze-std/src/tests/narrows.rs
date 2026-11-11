@@ -678,7 +678,7 @@ impl Narrows for StreamsCase {
 
     fn reaches(cap: &Streams, _: &Io, cx: &Cx, thing: usize) -> Result<bool, String> {
         // A stream is linear: one that opened is finished here.
-        match cap.open(cx, &origin(thing)) {
+        match cap.open(cx, &origin(thing), 1 << 16) {
             Ok(stream) => match stream.finish(cx) {
                 Ok(()) => Ok(true),
                 Err(error) => Err(format!("harness: {error}")),

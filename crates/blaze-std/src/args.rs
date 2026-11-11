@@ -2,7 +2,7 @@
 //! when it was made (handed in by the entry until `bstd::rt` reads the start block). There is
 //! no arguments function: a holder of `Args` reads them, no one else.
 
-use std::sync::Arc;
+use alloc::{string::String, sync::Arc};
 
 /// The command line, the program's own name first.
 #[derive(Clone)] // clone: a refcount
@@ -34,8 +34,8 @@ impl Args {
     }
 }
 
-impl std::fmt::Debug for Args {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for Args {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_list().entries(self.each()).finish()
     }
 }

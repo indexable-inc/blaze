@@ -358,6 +358,7 @@ blaze-kernel = { path = "crates/blaze-kernel" }
 blaze-gc = { path = "crates/blaze-gc" }
 blaze-check = { path = "crates/blaze-check" }
 blaze-spin = { path = "crates/blaze-spin" }
+blaze-sys = { path = "crates/blaze-sys" }
 blaze-codegen = { path = "crates/blaze-codegen" }
 blaze-codegen-code = { path = "crates/blaze-codegen-code" }
 blaze-dbsp = { path = "crates/blaze-dbsp" }

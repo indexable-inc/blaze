@@ -7,7 +7,8 @@
 //! **Provider.** The simulation only ([`crate::hosted::SimHost::windows`]): blaze-core has no
 //! effect for a window system.
 
-use std::{collections::VecDeque, fmt};
+use alloc::{collections::VecDeque, vec::Vec};
+use core::fmt;
 
 use crate::{
     cx::Cx,
@@ -70,7 +71,7 @@ impl fmt::Display for WindowError {
     }
 }
 
-impl std::error::Error for WindowError {}
+impl core::error::Error for WindowError {}
 
 /// The program's windows: from [`Io::windows`].
 #[derive(Clone)]

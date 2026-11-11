@@ -3,7 +3,8 @@
 
 #![blaze::sans_io]
 
-use std::alloc::Allocator;
+use alloc::vec::Vec;
+use core::alloc::Allocator;
 
 use super::{
     ChunkName, Color, Depth, Image, ImageError, Limits, decode_bytes, row_bytes,

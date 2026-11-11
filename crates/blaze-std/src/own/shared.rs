@@ -11,10 +11,11 @@
 //! type is acyclic the count reaches zero exactly when every handle has been released, so the
 //! value is always handed to someone who must finish it.
 //!
-//! The count is std's: `release` is `Arc::into_inner`, which gives the value to exactly one of
+//! The count is alloc's: `release` is `Arc::into_inner`, which gives the value to exactly one of
 //! the handles released together, where `try_unwrap` could give it to none.
 
-use std::{
+use alloc::{rc::Rc, sync::Arc};
+use core::{
     alloc::{AllocError, Allocator, Layout},
     borrow::Borrow,
     fmt,
@@ -22,8 +23,6 @@ use std::{
     marker::Unsize,
     ops::{CoerceUnsized, Deref},
     ptr::NonNull,
-    rc::Rc,
-    sync::Arc,
 };
 
 use super::reach::{Acyclic, Jointly, Owns};

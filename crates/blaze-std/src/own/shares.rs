@@ -25,7 +25,8 @@
 //!   with the path. And a part put anywhere is still a linear value its holder must hand
 //!   back: the whole cannot be taken while it is missing.
 
-use std::{marker::PhantomData, ops::Deref, ptr::NonNull};
+use alloc::boxed::Box;
+use core::{marker::PhantomData, ops::Deref, ptr::NonNull};
 
 use super::reach::{Acyclic, Jointly, Owns};
 use crate::cell::Token;

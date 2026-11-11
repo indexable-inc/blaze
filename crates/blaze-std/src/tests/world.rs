@@ -10,7 +10,7 @@ use std::{
 use super::root;
 use crate::{
     host::{Exit, HostFacts},
-    io::{Io, SimWorld},
+    io::{Io, Limits, SimWorld},
     mem::TASK_FRAME,
     task::{Layout, TaskError, TaskWhy},
     trace::RecordKind,
@@ -18,7 +18,7 @@ use crate::{
 
 #[test]
 fn args_and_host_are_the_worlds() {
-    let mut world = SimWorld::new(7);
+    let mut world = SimWorld::new(7, Limits::USUAL);
     world.args = vec!["prog".to_owned(), "--flag".to_owned()];
     world.host = HostFacts { pid: 42, cores: NonZero::<usize>::MIN.saturating_add(7), name: Arc::from("box") };
     let io = Io::simulated(world);

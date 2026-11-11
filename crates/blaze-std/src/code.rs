@@ -7,7 +7,7 @@
 //! was loaded and made executable and runs nothing: blaze-core has no effect that changes a
 //! mapping's protection or loads a library.
 
-use std::fmt;
+use core::fmt;
 
 use crate::{
     cx::Cx,
@@ -41,7 +41,7 @@ impl fmt::Display for CodeError {
     }
 }
 
-impl std::error::Error for CodeError {}
+impl core::error::Error for CodeError {}
 
 /// A module that was loaded.
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: a refcount

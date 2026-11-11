@@ -19,7 +19,8 @@
 pub(crate) mod png;
 pub(crate) mod zlib;
 
-use std::{alloc::Allocator, fmt};
+use alloc::vec::Vec;
+use core::{alloc::Allocator, fmt};
 
 /// The most a PNG's width or height may be (2^31 - 1, the PNG spec's).
 pub const MAX_SIDE: u32 = (1 << 31) - 1;
@@ -278,4 +279,4 @@ impl fmt::Display for ImageError {
     }
 }
 
-impl std::error::Error for ImageError {}
+impl core::error::Error for ImageError {}

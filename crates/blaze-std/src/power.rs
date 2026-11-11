@@ -8,7 +8,7 @@
 //! **Provider.** The simulation only ([`crate::hosted::SimHost::battery`], `awake`):
 //! blaze-core has no effect for a power assertion or the battery.
 
-use std::fmt;
+use core::fmt;
 
 use crate::{
     cx::Cx,
@@ -45,7 +45,7 @@ impl fmt::Display for PowerError {
     }
 }
 
-impl std::error::Error for PowerError {}
+impl core::error::Error for PowerError {}
 
 /// The machine's power: from [`Io::power`].
 #[derive(Clone)]
