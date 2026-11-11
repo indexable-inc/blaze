@@ -295,3 +295,47 @@ fn child() { need::<Child>(); }
         );
     });
 }
+
+/// `Shares`' arithmetic as its signatures state it (`crates/blaze-std/src/own/shares.rs`), on
+/// a type with the same parameters: parts split and join with the fractions in the types, a
+/// join of parts of different wholes is a type error, and the value is taken only from the
+/// handle whose parts are all of them.
+#[test]
+fn shares_arithmetic_is_checked_in_the_types() {
+    let text = r#"
+//- minicore: sized
+#![feature(blaze_comptime, blaze_const_exprs)]
+struct Part<const N: usize, const D: usize>;
+fn split<const A: usize, const B: usize, const N: usize, const D: usize>(
+    _: Part<N, D>,
+) -> (Part<A, D>, Part<B, D>)
+where
+    const { A >= 1 && B >= 1 && A + B == N },
+{
+    (Part, Part)
+}
+fn join<const N: usize, const M: usize, const D: usize>(_: Part<N, D>, _: Part<M, D>) -> Part<{ N + M }, D> {
+    Part
+}
+fn whole<const N: usize, const D: usize>(_: Part<N, D>) where const { N == D } {}
+
+fn round_trip() {
+    let (one, three) = split::<1, 3, 4, 4>(Part);
+    let (two, last) = split::<2, 1, 3, 4>(three);
+    let most: Part<3, 4> = join(one, two);
+    whole(join(most, last));
+}
+fn uneven_split() { let _ = split::<1, 2, 4, 4>(Part); }
+fn empty_part() { let _ = split::<0, 4, 4, 4>(Part); }
+fn other_whole() { let _ = join(Part::<1, 2>, Part::<1, 3>); }
+fn not_whole() { whole(Part::<1, 2>); }
+"#;
+    with_db(text, |db| {
+        accepted(db, "round_trip");
+        assert_eq!(condition_refused(db, "uneven_split"), Failure::False);
+        assert_eq!(condition_refused(db, "empty_part"), Failure::False);
+        assert_eq!(condition_refused(db, "not_whole"), Failure::False);
+        let found = diagnostics(db, "other_whole");
+        assert!(!found.is_empty(), "halves joined with thirds: `Part<1, 2>` and `Part<1, 3>`");
+    });
+}
