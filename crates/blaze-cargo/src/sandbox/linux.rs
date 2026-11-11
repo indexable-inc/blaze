@@ -929,7 +929,7 @@ fn confined(spec: &Spec, scratch: &Path, made: &Made<'_>, probe: bool) -> Result
     if program == 0 {
         raw::die_with_parent();
         let error = exec(made);
-        eprintln!("blaze: could not run {}: {error}", made.argv[0].to_string_lossy());
+        error.say(made.argv);
         raw::exit(Exit::ExecFailed.code());
     }
     // SAFETY: `made.socket` is the child's end of the supervisor's pair, owned by no
@@ -1910,7 +1910,7 @@ fn first_process(cwd: &CString, made: &Made<'_>, probe: bool) -> Result<i32, Str
     }
     if program == 0 {
         let error = exec(made);
-        eprintln!("blaze: could not run {}: {error}", made.argv[0].to_string_lossy());
+        error.say(made.argv);
         raw::exit(Exit::ExecFailed.code());
     }
     // SAFETY: `made.socket` is the child's end of the supervisor's pair, owned by no
@@ -1928,20 +1928,77 @@ fn first_process(cwd: &CString, made: &Made<'_>, probe: bool) -> Result<i32, Str
     }
 }
 
+/// Why the program's process did not run its program ([`exec`]).
+enum NoExec {
+    /// Before the program's exec was tried: the filter not installed or not handed over.
+    Setup(String),
+    /// Its `execve` failed with this `errno`.
+    Errno(i32),
+    /// Its `execve` met `ETXTBSY` for all of blaze-core's waits.
+    Busy,
+}
+
+impl NoExec {
+    /// Says it on the standard error, naming the program, as the process ends. After the
+    /// filter is installed ([`NoExec::Errno`], [`NoExec::Busy`]) with no allocation and no
+    /// lock: bytes put together on the stack and written with `write` alone, since whatever
+    /// this process does there the supervisor records as the program's.
+    fn say(&self, argv: &[CString]) {
+        use std::io::Write as _;
+        use std::os::fd::AsFd as _;
+        let mut room = [0u8; 1024];
+        let mut text = [0u8; 128];
+        let mut out = &mut room[..];
+        let program = argv.first().map_or(&b""[..], |it| it.to_bytes());
+        // A name too long for the room is cut; each write below that does not fit is dropped.
+        _ = out.write_all(b"blaze: could not run ");
+        _ = out.write_all(&program[..program.len().min(700)]);
+        _ = out.write_all(b": ");
+        match self {
+            NoExec::Setup(why) => _ = out.write_all(&why.as_bytes()[..why.len().min(250)]),
+            NoExec::Errno(errno) => {
+                _ = out.write_all(raw::error_text(*errno, &mut text));
+                _ = write!(out, " (os error {errno})");
+            }
+            NoExec::Busy => {
+                _ = write!(
+                    out,
+                    "still open for writing after {} ms of tries: ",
+                    blaze_core::busy::MOST_NS / 1_000_000
+                );
+                _ = out.write_all(raw::error_text(libc::ETXTBSY, &mut text));
+                _ = write!(out, " (os error {})", libc::ETXTBSY);
+            }
+        }
+        _ = out.write_all(b"\n");
+        let left = out.len();
+        let len = room.len() - left;
+        raw::write(std::io::stderr().as_fd(), &room[..len]);
+    }
+}
+
 /// Installs the filter, when there is one, hands its descriptor to the supervisor and runs
 /// the program; what kept it from running.
+///
+/// The rule of the window from the filter's install to the exec: this process makes no
+/// allocation there and no call the filter reports (`getrandom`, a clock, an open), since the
+/// supervisor takes every call of the process for the program's. What the exec needs is made
+/// before ([`raw::Exec::new`]); a busy file's retry is a sleep and the same exec; and a
+/// failure is said from the stack ([`NoExec::say`]).
 #[allow(unsafe_code, reason = "close of the supervisor's socket by number")]
-fn exec(made: &Made<'_>) -> String {
+fn exec(made: &Made<'_>) -> NoExec {
     if made.viewed {
         close_machine_files();
     }
+    // Before the filter: the exec's vectors are the one allocation it needs.
+    let image = raw::Exec::new(made.argv, made.env);
     if let Some(program) = made.filter {
         let listener = match install(program) {
             Ok(it) => it,
-            Err(error) => return error,
+            Err(error) => return NoExec::Setup(error),
         };
         if let Err(error) = send(made.socket, listener.as_raw_fd()) {
-            return error;
+            return NoExec::Setup(error);
         }
         // The supervisor has its own copy now, and the program is not to have it.
         drop(listener);
@@ -1953,18 +2010,15 @@ fn exec(made: &Made<'_>) -> String {
     // descriptor not yet closed (`ETXTBSY`) is made again on blaze-core's schedule.
     let (mut tried, mut waited) = (0, 0);
     loop {
-        raw::execve(made.argv, made.env);
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ETXTBSY) {
-            // alloc: the error, once, and the program's process ends.
-            return error.to_string();
+        image.run();
+        // `errno`, read with no allocation.
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
+        if errno != libc::ETXTBSY {
+            return NoExec::Errno(errno);
         }
+        // Bounded: the waits come to `MOST_NS` and then it is said, never tried on.
         let Some(wait) = blaze_core::busy::next(tried, waited) else {
-            // alloc: as above.
-            return format!(
-                "still open for writing after {} ms of tries: {error}",
-                blaze_core::busy::MOST_NS / 1_000_000
-            );
+            return NoExec::Busy;
         };
         blaze_core::busy::wait(wait);
         tried += 1;
