@@ -1783,14 +1783,20 @@ mod tests {
     fn a_builds_rows_are_flushed_only_after_its_answer() {
         let dir = tempfile::tempdir().unwrap();
         static UNSAMPLED: blaze_profile::sampler::Ring = blaze_profile::sampler::Ring::new();
-        let history = History::open(dir.path(), history::CAP_BYTES, &UNSAMPLED).unwrap();
         let (sent, rows) = crossbeam_channel::unbounded();
         let (failed_to, failed) = crossbeam_channel::unbounded();
         let (told_to, told) = crossbeam_channel::unbounded();
-        let (mut why, _) = File::restore(dir.path());
+        // The history and the ledger are opened on the thread that keeps them, as the
+        // daemon's are ([`keep_history`]): a `History` holds pointers into its rings and is
+        // of one thread, so it is never made here and moved there.
+        let at = dir.path().to_path_buf();
         let keeper = std::thread::Builder::new()
             .name("blaze-history-test".to_owned())
-            .spawn(move || keep(history, &mut why, &rows, &failed_to, &told_to, &Doing::default()))
+            .spawn(move || {
+                let history = History::open(&at, history::CAP_BYTES, &UNSAMPLED).unwrap();
+                let (mut why, _) = File::restore(&at);
+                keep(history, &mut why, &rows, &failed_to, &told_to, &Doing::default())
+            })
             .unwrap();
         let bound = Duration::from_secs(60);
         let ended = Finished { ended: ended_row(71), query_counts: Vec::new() };
