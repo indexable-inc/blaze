@@ -140,9 +140,8 @@ theorem State.setSlots_setSlots (st : State) (f : Nat) (x y : List Slot) :
     have e2 := State.setSlots_frame st f hf y
     have e3 := State.setSlots_frame
       { base := st.base, stack := setFrame st.stack f x, next := st.next } f hf y
-    have mid : ({ base := st.base, stack := setFrame (setFrame st.stack f x) f y,
-        next := st.next } : State) =
-        { base := st.base, stack := setFrame st.stack f y, next := st.next } :=
+    have mid : State.mk st.base (setFrame (setFrame st.stack f x) f y) st.next =
+        State.mk st.base (setFrame st.stack f y) st.next :=
       congrTo (fun s => State.mk st.base s st.next) (setFrame_setFrame f x y st.stack)
     exact (congrTo (fun s => State.setSlots s f y) e1).trans (e3.trans (mid.trans e2.symm))
 
