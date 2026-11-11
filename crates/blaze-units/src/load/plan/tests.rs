@@ -781,6 +781,7 @@ fn unit(
                 noprelude: None,
                 nounused: None,
                 dev: false,
+                gpu: false,
             })
             .collect(),
     }
@@ -938,6 +939,7 @@ fn plan_app_as(target: Option<&str>, lints: bool) -> (PathBuf, Vec<UnitPlan>, St
         host: HOST,
         target,
         macro_wasm: None,
+        gpu: None,
         requested_profile: "dev",
         profile_dir: "debug",
         base_profile: &base_profile,

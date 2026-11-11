@@ -1182,9 +1182,36 @@ impl Files {
         else {
             return false;
         };
+        let read = self.read_included(path);
+        self.set_included_read(db, at, read)
+    }
+
+    /// The file outside the VFS at `path` set to `bytes`, as though read from disk now: for a
+    /// file blaze writes and holds the bytes of before they reach the disk (a device build's MSL,
+    /// which its dependents' `include_str!(env!("BLAZE_GPU_MSL_<CRATE>"))` reads), so a crate
+    /// that reads it reads these. One no crate has read yet is made with them, so the first read
+    /// is of these bytes, not of the disk. Kept among [`Files::included_paths`]: a later read of
+    /// the disk that finds other bytes sets those, and a record that read it is filed by its
+    /// content as any included file's ([`IncludedFile::content_now`]). Whether it changed.
+    pub fn set_included_file(&self, db: &mut Db, path: &AbsPath, bytes: std::sync::Arc<[u8]>) -> bool {
+        let hash = self.included.hash(path);
+        if let Some(at) = self.included.find(hash, |it| it.path.as_path() == path) {
+            return self.set_included_read(db, at, Ok(bytes));
+        }
+        let read = Ok(bytes);
+        let content = InputId(IncludedFile::content_of(read.as_deref()));
+        // Written by the build: it moves with each, as a workspace's own file does.
+        let file = IncludedFile::new(&*db, Durability::LOW, read, content);
+        let make = || Included { path: path.to_path_buf(), file, source: OnceLock::new() };
+        self.included.insert(hash, |it| it.path.as_path() == path, make);
+        true
+    }
+
+    /// The included file at `at` set to `read`, and the text `include!` parses of it with it.
+    /// Whether it changed.
+    fn set_included_read(&self, db: &mut Db, at: u32, read: Result<std::sync::Arc<[u8]>, ReadError>) -> bool {
         let included = self.included.get(at);
         let file = included.file;
-        let read = self.read_included(path);
         let changed = *file.read(&*db) != read;
         if !changed {
             return false;

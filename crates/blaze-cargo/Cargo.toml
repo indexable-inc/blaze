@@ -124,6 +124,9 @@ blaze-testsel.workspace = true
 blaze-lazy = { workspace = true, features = ["daemon"] }
 blaze-link.workspace = true
 blaze-lower.workspace = true
+# The device build of an `artifact = "gpu"` dependency: its `GPU_ENTRIES` written as MSL at its
+# link (`serve/unit/compile.rs`, `assemble`), which the record key covers as this crate's code.
+blaze-shader.workspace = true
 base-db.workspace = true
 crossbeam-channel.workspace = true
 crossbeam-queue.workspace = true
@@ -147,6 +150,8 @@ lzma-rust2 = { workspace = true, features = ["std", "xz", "encoder"] }
 tempfile.workspace = true
 # The property test of the no-op lane (`serve/job/noop/tests.rs`).
 hegeltest.workspace = true
+# minicore, the `core` of the gpu dependency's end-to-end test (`serve/unit/tests/gpu.rs`).
+test-utils.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 uds_windows.workspace = true

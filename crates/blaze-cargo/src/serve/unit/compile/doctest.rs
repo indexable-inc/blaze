@@ -561,6 +561,7 @@ pub(super) fn link(
         natives: Vec::new(),
         links: Vec::new(),
         macros: None,
+        gpu_msl: None,
         records: Vec::new(),
         quoted: None,
     };

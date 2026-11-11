@@ -2765,15 +2765,23 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             hir_def::hir::Literal::Bool(b) => scalar(&[*b as u8]),
             hir_def::hir::Literal::Int(it, _) => scalar(&it.to_le_bytes()[0..size()?]),
             hir_def::hir::Literal::Uint(it, _) => scalar(&it.to_le_bytes()[0..size()?]),
-            hir_def::hir::Literal::Float(f, _) => match size()? {
-                16 => scalar(&f.to_f128().to_bits().to_le_bytes()),
-                8 => scalar(&f.to_f64().to_bits().to_le_bytes()),
-                4 => scalar(&f.to_f32().to_bits().to_le_bytes()),
-                2 => scalar(&u16::try_from(f.to_f16().to_bits()).unwrap().to_le_bytes()),
-                _ => {
-                    Err(MirLowerError::TypeError("float with size other than 2, 4, 8 or 16 bytes"))
-                }
-            },
+            hir_def::hir::Literal::Float(f, _) => {
+                // apfloat's `to_bits` is a `u128` at every width: the constant is its low `size`
+                // bytes, as many as the type's layout, as for an integer.
+                let size = size()?;
+                let bits = match size {
+                    16 => f.to_f128().to_bits(),
+                    8 => f.to_f64().to_bits(),
+                    4 => f.to_f32().to_bits(),
+                    2 => f.to_f16().to_bits(),
+                    _ => {
+                        return Err(MirLowerError::TypeError(
+                            "float with size other than 2, 4, 8 or 16 bytes",
+                        ));
+                    }
+                };
+                scalar(&bits.to_le_bytes()[..size])
+            }
         }
     }
 
