@@ -5977,6 +5977,13 @@ impl<S: Steps> Jobs<S> {
                 }
                 continue;
             }
+            // A file this compile linked is placed from the bytes it made, whatever the path
+            // holds: no file of the store is read, cloned or waited for, so the answer is
+            // held by no clone and no write-back (docs/v2/plan/design/clone-out.md).
+            if let Some(made) = output.made {
+                self.place_made(w, id, path, output.key, output.executable, &made);
+                continue;
+            }
             let placed = self.paths.placed[path as usize].as_ref().is_some_and(|it| {
                 it.key == output.key && it.executable == output.executable && it.meta.is_some()
             });
@@ -6046,6 +6053,45 @@ impl<S: Steps> Jobs<S> {
                 job.over.get_or_insert((false, Some(error)));
             }
         }
+    }
+
+    /// `made`, the file of `key` that job `id`'s compile just linked, placed at path `path`
+    /// from those bytes (`blaze_cas::Store::place_made`): its runs written into a file of
+    /// holes beside the path and renamed onto it. The whole file the store kept to clone the
+    /// path's last value from goes, and none is made of this one.
+    fn place_made(
+        &mut self,
+        w: &mut World<'_, S>,
+        id: JobId,
+        path: u32,
+        key: blaze_cas::Key,
+        executable: bool,
+        made: &blaze_cas::Sparse,
+    ) {
+        if let Some(before) = self.paths.placed[path as usize].take()
+            && before.key != key
+        {
+            w.store.unplace_made(&before.key, w.effects);
+        }
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        job.placed_any = true;
+        // clone: the store's effect owns the file's name, once per placement
+        let Some(file) = self.paths.files[path as usize].clone() else {
+            let name = self.paths.names[path as usize].to_string(); // alloc: an error, once
+            // alloc: an error, once
+            job.over.get_or_insert((
+                false,
+                Some(ApiError::new(
+                    format!("{name} is no path an output can be placed at"),
+                    Some(name),
+                )),
+            ));
+            return;
+        };
+        // clone: the runs, which the path's writes own (an effect owns its bytes); once per path
+        let tag = w.store.place_made(file, made.clone(), w.effects);
+        self.placing.insert(tag, Placing { job: id, path, key, executable });
+        self.begin_placing(id, path);
     }
 
     /// An effect of job `id` at path `path` asked: the file is not all there until it ends.
@@ -7175,18 +7221,14 @@ impl<S: Steps> Jobs<S> {
             };
             if let Some(what) = held {
                 if job.held_wait.as_ref().is_none_or(|(_, was)| *was != what) {
-                    // `function` is the field of an ad hoc span the profile keeps as what a
-                    // wait awaits (`blaze_profile::span`'s generic columns: `crate`,
-                    // `function`, `unit`); a field named `awaits` reaches no column, which is
-                    // why this span's reason came out empty.
+                    // `function` and `awaits` are fields of an ad hoc span the profile keeps
+                    // (`blaze_profile::span::ad_hoc_fields`); `what`, `placing` and `runs`
+                    // had no column and are not given (`blaze::span_field_unrecorded`).
                     let span = tracing::info_span!(
                         target: "blaze",
                         "the job's answer waits for what it still does",
                         function = what,
                         awaits = what,
-                        what,
-                        placing = job.placing,
-                        runs = job.runs,
                     );
                     job.held_wait = Some((span, what));
                 }

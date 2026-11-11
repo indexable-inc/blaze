@@ -252,6 +252,10 @@ pub struct Output {
     pub path: String,
     pub key: blaze_cas::Key,
     pub executable: bool,
+    /// The file itself, where this compile linked it: the loop places it from these bytes
+    /// (`blaze_cas::Store::place_made`), never from a file of the store. None for a file the
+    /// store places from its value (a library, a record replayed).
+    pub made: Option<Arc<blaze_cas::Sparse>>,
 }
 
 /// What came of one unit's compile.

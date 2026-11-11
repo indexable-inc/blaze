@@ -949,6 +949,26 @@ impl Image {
         Ok(out)
     }
 
+    /// The file as the last commit left it, as the runs of it that hold bytes and its length:
+    /// what [`Image::file`] gives without the zeros between regions past a page, so a patch
+    /// region's unused room (64 MiB each of code and data) is in no run, and a writer of the
+    /// runs into a file of holes writes none of it. The same error as [`Image::file`] before
+    /// the first commit or while one is in flight.
+    pub fn file_runs(&self) -> Result<(u64, Vec<(u64, Vec<u8>)>), LinkError> {
+        if !self.state.laid_out || self.pending.is_some() {
+            return Err(LinkError {
+                function: None,
+                refusal: None,
+                // alloc: error path
+                what: format!(
+                    "{}: no committed file to give: the image is not laid out, or a commit is in flight",
+                    self.to
+                ),
+            });
+        }
+        Ok((self.state.file_len, file::whole(&self.state)))
+    }
+
     /// Each table the image keeps as `(name, elements, bytes)`, for `blaze inspect tables`
     /// (`blaze_api::Response::Tables`): `relocation` and the rest.
     pub fn tables(&self) -> Vec<(&'static str, u64, u64)> {

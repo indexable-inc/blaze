@@ -562,6 +562,7 @@ pub(super) fn link(
         links: Vec::new(),
         macros: None,
         records: Vec::new(),
+        made_files: Vec::new(),
         quoted: None,
     };
     let runner = match runner {

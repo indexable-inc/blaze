@@ -1627,6 +1627,10 @@ pub(crate) struct LinkMade {
     /// image took the link as a patch of a file the store can derive from, the patch
     /// ([`Filed::written`]).
     pub(crate) written: Written,
+    /// The file itself as the runs of it that hold bytes, for the loop to place it from
+    /// (`blaze_cas::Store::place_made`): the build made it, so its place reads, clones and
+    /// waits for no file of the store. None for a wasm module, which is not placed to run.
+    pub(crate) made: Option<blaze_cas::Sparse>,
     pub(crate) read: Vec<Read>,
     pub(crate) table: Option<blaze_codegen::ExecTable>,
     pub(crate) how: Linking,
@@ -2163,10 +2167,31 @@ fn link_at(
         let written = filed
             .written(&job.input.store, &linked.image, root?, path, wasm)
             .map_err(|error| LinkCause::Linker { step: LinkStep::Bytes, error })?;
-        Ok((written, read, table, laid, told))
+        // The file for its place, read from the image while it is at hand: the runs that
+        // hold bytes, none of the patch regions' room (`link runs` says how many bytes).
+        let runs = match wasm {
+            true => None,
+            false => {
+                let span = tracing::info_span!(
+                    target: "blaze",
+                    "link runs",
+                    unit = %path,
+                    bytes = tracing::field::Empty,
+                )
+                .entered();
+                let (len, runs) = linked
+                    .image
+                    .file_runs()
+                    .map_err(|error| LinkCause::Linker { step: LinkStep::Bytes, error })?;
+                let file = blaze_cas::Sparse { len, runs };
+                span.record("bytes", file.bytes());
+                Some(file)
+            }
+        };
+        Ok((written, runs, read, table, laid, told))
     });
     images.push(KeptImage { path: path.to_owned(), kept: linked });
-    let (written, read, table, laid, told) = made?;
+    let (written, runs, read, table, laid, told) = made?;
     mapped?;
     perf_mapped?;
     debug?;
@@ -2179,7 +2204,7 @@ fn link_at(
         super::run::inproc::Told::Restart { why } => Some(why),
         super::run::inproc::Told::Nothing | super::run::inproc::Told::Patched { .. } => None,
     };
-    Ok(LinkMade { written, read, table, how, restart, whole: whole.map(|it| it.1) })
+    Ok(LinkMade { written, made: runs, read, table, how, restart, whole: whole.map(|it| it.1) })
 }
 
 /// The image to link `output` laid out by profile `layout` into at `path`, taken out of
