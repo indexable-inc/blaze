@@ -1,4 +1,5 @@
 import Blaze.Mir.Opt.SlotExecFar
+import Blaze.Mir.Opt.RemoveOverwritten
 
 /-!
 A list of replaced slots, and a statement through it: global dead-store elimination (ledger
@@ -11,8 +12,10 @@ gives what it gives from `st` with the same slots replaced, when each entry is a
 pointer is into, holds a value the borrow invariant allows, and is either of another frame
 or of a local the statement does not mention (`RepOk`).
 
-Still to do in piece (b): a store to a replaced local drops its entry, and a removed store
-adds one.
+Second part: a store to the whole of a replaced local of the running frame forgets what the
+slot held, so its entries leave the list (`execStmt_absorb`, `keepReps`); and a replacement
+after the list is the list with one more entry (`puts_append`), which is what a removed
+store adds.
 -/
 
 namespace Blaze.Mir
@@ -105,5 +108,105 @@ theorem execStmt_puts {B : FnId → Local → Prop} {g : List (Nat × FnId)} (ad
         (Outcome.map_map (fun x => State.put x r.1 r.2.1 r.2.2) (fun x => puts x rest)
           (execStmt adts st s))
     exact inner.trans both
+
+/-! Second part: entries leave the list at a store to their local, and one joins it at a
+removed store. -/
+
+/-- The statement, run by the frame `top`, stores to the whole local of the entry. -/
+def absorbs (top : Nat) (s : Statement) (r : Rep) : Bool :=
+  decide (top = r.1) && isOverwrite r.2.1 s
+
+/-- The list without the entries the statement absorbs. -/
+def keepReps (top : Nat) (s : Statement) : List Rep → List Rep
+  | [] => []
+  | r :: rest => if absorbs top s r = true then keepReps top s rest else r :: keepReps top s rest
+
+theorem keepReps_cons (top : Nat) (s : Statement) (r : Rep) (rest : List Rep) :
+    keepReps top s (r :: rest) =
+      if absorbs top s r = true then keepReps top s rest else r :: keepReps top s rest := rfl
+
+/-- The entry can be carried through or absorbed by the statement. -/
+def RepFits (B : FnId → Local → Prop) (g : List (Nat × FnId)) (top : Nat) (s : Statement)
+    (r : Rep) : Prop :=
+  SlotOk (PtrOk B g) r.2.2 ∧ (∀ (q : Pointer), PtrOk B g q → Off r.1 r.2.1 q) ∧
+    (absorbs top s r = true ∨ (top = r.1 ∧ stmtFine r.2.1 s = true) ∨ ¬ r.1 = top)
+
+/-- A statement through a list of replaced slots, the ones it stores to forgotten: from the
+state with the slots replaced it gives its state with the slots it did not store to
+replaced. -/
+theorem execStmt_absorb {B : FnId → Local → Prop} {g : List (Nat × FnId)} (adts : List AdtDecl)
+    (fn : FnId) (s : Statement) (hB : StmtFine B fn s) (top : Nat) :
+    ∀ (reps : List Rep) (st : State), OkAt B g st → st.topFn = fn → st.top = top →
+      (∀ (r : Rep), r ∈ reps → RepFits B g top s r) →
+        execStmt adts (puts st reps) s =
+          Outcome.map (fun x => puts x (keepReps top s reps)) (execStmt adts st s)
+  | [], st, _, _, _, _ => (Outcome.map_same (execStmt adts st s)).symm
+  | r :: rest, st, hs, hfn, htop, hreps => by
+    have hr : RepFits B g top s r := hreps r (List.mem_cons.mpr (Or.inl rfl))
+    have off : ∀ (q : Pointer), PtrOk B g q → Off r.1 r.2.1 q := And.left (And.right hr)
+    have hs1 : OkAt B g (st.put r.1 r.2.1 r.2.2) :=
+      State.put_okAt hs r.1 r.2.1 r.2.2 (And.left hr)
+    have hfn1 : (st.put r.1 r.2.1 r.2.2).topFn = fn :=
+      (State.put_topFn st r.1 r.2.1 r.2.2).trans hfn
+    have htop1 : (st.put r.1 r.2.1 r.2.2).top = top :=
+      (State.put_top st r.1 r.2.1 r.2.2).trans htop
+    have inner : execStmt adts (puts (st.put r.1 r.2.1 r.2.2) rest) s =
+        Outcome.map (fun x => puts x (keepReps top s rest))
+          (execStmt adts (st.put r.1 r.2.1 r.2.2) s) :=
+      execStmt_absorb adts fn s hB top rest (st.put r.1 r.2.1 r.2.2) hs1 hfn1 htop1
+        (fun r' m => hreps r' (List.mem_cons.mpr (Or.inr m)))
+    by_cases ha : absorbs top s r = true
+    · have here : st.top = r.1 := htop.trans (of_decide_eq_true (and_true_left ha))
+      have hides : Hides B g r.1 r.2.1 st := { okAt := hs, top := here, off := off }
+      have same : execStmt adts (st.put r.1 r.2.1 r.2.2) s = execStmt adts st s :=
+        isOverwrite_exec adts hides r.2.2 fn hfn s hB (and_true_right ha)
+      have kept : keepReps top s (r :: rest) = keepReps top s rest :=
+        (keepReps_cons top s r rest).trans (if_pos ha)
+      rw [kept]
+      exact inner.trans (congrTo (Outcome.map (fun x => puts x (keepReps top s rest))) same)
+    · have kept : keepReps top s (r :: rest) = r :: keepReps top s rest :=
+        (keepReps_cons top s r rest).trans (if_neg ha)
+      have fits : (st.top = r.1 ∧ stmtFine r.2.1 s = true) ∨ ¬ r.1 = st.top := by
+        rw [htop]
+        cases And.right (And.right hr) with
+        | inl a => exact absurd a ha
+        | inr rest' => exact rest'
+      have single : execStmt adts (st.put r.1 r.2.1 r.2.2) s =
+          Outcome.map (fun x => State.put x r.1 r.2.1 r.2.2) (execStmt adts st s) :=
+        execStmt_rep adts hs fn hfn s hB r (And.intro (And.left hr) (And.intro off fits))
+      have both : Outcome.map (fun x => puts x (keepReps top s rest))
+            (execStmt adts (st.put r.1 r.2.1 r.2.2) s) =
+          Outcome.map (fun x => puts (State.put x r.1 r.2.1 r.2.2) (keepReps top s rest))
+            (execStmt adts st s) :=
+        (congrTo (Outcome.map (fun x => puts x (keepReps top s rest))) single).trans
+          (Outcome.map_map (fun x => State.put x r.1 r.2.1 r.2.2)
+            (fun x => puts x (keepReps top s rest)) (execStmt adts st s))
+      rw [kept]
+      exact inner.trans both
+
+/-- A replacement after the list is the list with one more entry. -/
+theorem puts_append : ∀ (reps : List Rep) (st : State) (r : Rep),
+    puts st (reps ++ [r]) = (puts st reps).put r.1 r.2.1 r.2.2
+  | [], _, _ => rfl
+  | x :: rest, st, r => puts_append rest (st.put x.1 x.2.1 x.2.2) r
+
+/-- The list of replacements keeps the invariant when what each puts is allowed. -/
+theorem puts_okAt {B : FnId → Local → Prop} {g : List (Nat × FnId)} :
+    ∀ (reps : List Rep) (st : State), OkAt B g st →
+      (∀ (r : Rep), r ∈ reps → SlotOk (PtrOk B g) r.2.2) → OkAt B g (puts st reps)
+  | [], _, hs, _ => hs
+  | r :: rest, st, hs, hok =>
+    puts_okAt rest (st.put r.1 r.2.1 r.2.2)
+      (State.put_okAt hs r.1 r.2.1 r.2.2 (hok r (List.mem_cons.mpr (Or.inl rfl))))
+      (fun r' m => hok r' (List.mem_cons.mpr (Or.inr m)))
+
+theorem puts_top : ∀ (reps : List Rep) (st : State), (puts st reps).top = st.top
+  | [], _ => rfl
+  | r :: rest, st => (puts_top rest (st.put r.1 r.2.1 r.2.2)).trans (State.put_top st r.1 r.2.1 r.2.2)
+
+theorem puts_topFn : ∀ (reps : List Rep) (st : State), (puts st reps).topFn = st.topFn
+  | [], _ => rfl
+  | r :: rest, st =>
+    (puts_topFn rest (st.put r.1 r.2.1 r.2.2)).trans (State.put_topFn st r.1 r.2.1 r.2.2)
 
 end Blaze.Mir

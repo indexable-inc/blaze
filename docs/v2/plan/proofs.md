@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-82 theorems: 69 in `lean`, 13 in `lean/analysis`.
+83 theorems: 70 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -792,12 +792,21 @@ theorem execStmt_puts {B : FnId → Local → Prop} {g : List (Nat × FnId)} (ad
       (∀ (r : Rep), r ∈ reps → RepOk B g st.top s r) →
         execStmt adts (puts st reps) s =
           Outcome.map (fun x => puts x reps) (execStmt adts st s)
-  | [], st, _, _, _ => by
-    cases execStmt adts st s with
-    | ok st' => rfl
-    | panic e => rfl
-    | undefined why => rfl
-    | diverge => rfl
+  | [], st, _, _, _ => (Outcome.map_same (execStmt adts st s)).symm
   | r :: rest, st, hs, hfn, hreps => by
     have hr : RepOk B g st.top s r
+```
+
+**`Blaze.Mir.execStmt_absorb`** (`Blaze.Mir.Opt.Puts`, `lean`): A statement through a list of replaced slots gives its state with the slots it did not store to replaced: a store to a whole replaced local forgets it.
+
+```lean
+theorem execStmt_absorb {B : FnId → Local → Prop} {g : List (Nat × FnId)} (adts : List AdtDecl)
+    (fn : FnId) (s : Statement) (hB : StmtFine B fn s) (top : Nat) :
+    ∀ (reps : List Rep) (st : State), OkAt B g st → st.topFn = fn → st.top = top →
+      (∀ (r : Rep), r ∈ reps → RepFits B g top s r) →
+        execStmt adts (puts st reps) s =
+          Outcome.map (fun x => puts x (keepReps top s reps)) (execStmt adts st s)
+  | [], st, _, _, _, _ => (Outcome.map_same (execStmt adts st s)).symm
+  | r :: rest, st, hs, hfn, htop, hreps => by
+    have hr : RepFits B g top s r
 ```

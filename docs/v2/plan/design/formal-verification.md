@@ -745,14 +745,13 @@ programs; it is the specification of the Rust pass of the same name.
     drops it from the list (`State.write_setSlot_same`); a removed store adds one; a call
     leaves the caller's list as it is and starts the callee with none; a return drops the
     callee's.
-  - **Built so far:** (a) `Opt/SlotExecFar.lean`, `execStmt_putFar`: a statement does the
-    same whatever a hidden slot of a frame that is not running holds (not yet elaborated).
-    (b), first part, `Opt/Puts.lean`: `puts st reps`, the state with a list of slots
-    replaced, and `execStmt_puts`, a statement through the list when each entry is hidden,
-    holds an allowed value and is of another frame or of a local the statement does not
-    mention (not yet elaborated). Left of (b): a store to a replaced local drops its entry
-    (reorder the list with `State.setSlot_comm`, then `State.write_setSlot_same`), and a
-    removed store adds one (`State.write_whole`).
+  - **Built so far.** (a) `Opt/SlotExecFar.lean`, `execStmt_putFar`: a statement does the
+    same whatever a hidden slot of a frame that is not running holds (checked at
+    e51837e3a0). (b) `Opt/Puts.lean`: `puts st reps`, the state with a list of slots
+    replaced; `execStmt_puts`, a statement through the list (checked at e51837e3a0);
+    `execStmt_absorb`, the same with the entries the statement stores to leaving the list
+    (`keepReps`), and `puts_append`, a replacement after the list as one more entry, which
+    is what a removed store adds (not yet elaborated).
   - **What to build, in order:** ~~`execStmt_put` for any frame~~ (a, above); the list of replacements with its commutation
     through a statement; `checkLiveness` and its two facts (a local dead on entry and not
     written is dead on exit; the removed store's local is dead after it); terminators,
