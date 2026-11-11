@@ -287,7 +287,7 @@ impl Steps for Real {
     }
 
     fn kept_run_log(&self, kept: &KeptLowered) -> blaze_query::db::Taken {
-        blaze_query::db::take_log_in(kept.lowered.db())
+        hir_def::span_names::take_run_log(kept.lowered.db())
     }
 
     fn release_kept(&self, kept: &mut KeptLowered, wanted: &std::sync::atomic::AtomicBool) {
@@ -1076,7 +1076,7 @@ impl Writer<Real> for UnitWriter {
     }
 
     fn run_log(&self) -> blaze_query::db::Taken {
-        blaze_query::db::take_log_in(self.front.db())
+        hir_def::span_names::take_run_log(self.front.db())
     }
 
     fn goals_noted(&self) -> Option<blaze_api::Diagnostic> {

@@ -767,7 +767,7 @@ impl fmt::Debug for Db {
 /// path its source root has it at (its `FileId` where it has none), so the run log says which
 /// file's edit made a query run again. Called with the database the log is taken with
 /// attached; any other row is left to its ID.
-fn name_row(ingredient: &'static str, id: blaze_query::db::Id, out: &mut String) -> bool {
+fn name_row(ingredient: &str, id: blaze_query::db::Id, out: &mut String) -> bool {
     use std::fmt::Write as _;
     blaze_query::db::with_attached_db::<Db, _>(|db| {
         let Some(db) = db else { return false };

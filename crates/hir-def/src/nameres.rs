@@ -67,6 +67,17 @@ mod facts;
 pub use self::facts::kinds;
 pub mod frozen;
 pub use hir_expand::proc_macro::may_have_session_macros;
+
+/// The module a published row of name resolution is of (a module's scope, a crate's
+/// resolution), for the run log's names (`crate::span_names::name_log_rows`); None for a row
+/// that is not one.
+pub(crate) fn log_row_module(
+    db: &Db,
+    ingredient: &str,
+    id: blaze_query::db::Id,
+) -> Option<crate::ModuleId> {
+    delta::log_row_module(db, ingredient, id)
+}
 mod mod_resolution;
 pub mod named;
 mod path_resolution;

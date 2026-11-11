@@ -176,6 +176,37 @@ fn a_span_name_says_which_impl_const_block_and_build_script() {
     );
 }
 
+/// The run log's rows carry names, not ids: a crate reads as spans name it, a function by its
+/// path, and an id that is no row of the kind asked (a crate's id asked as a function) is left
+/// to its id, never named as another row. On 2026-11-10 `Crate(Id(21548))` was found to be serde
+/// by guessing from symbol names.
+#[test]
+fn the_run_logs_rows_are_named_by_crate_and_path_and_no_id_is_guessed() {
+    use blaze_query::db::AsId as _;
+    let fixture = fixture::db(EXACT);
+    let db = fixture.db();
+    let krate = *all_crates(db)
+        .iter()
+        .find(|krate| krate.data(db).origin.is_local() && !names(db, **krate, EXACT).is_empty())
+        .unwrap();
+    let mut label = String::new();
+    super::write_crate_label(db, krate, &mut label);
+    let named = |ingredient: &str, id| {
+        let mut out = String::new();
+        blaze_query::db::attach(db, || super::name_row(ingredient, id, &mut out)).then_some(out)
+    };
+    assert_eq!(named("Crate", krate.as_id()), Some(label));
+    let (path, def) = names(db, krate, EXACT).into_iter().find(|(_, def)| matches!(def, DefWithBodyId::FunctionId(_))).unwrap();
+    let DefWithBodyId::FunctionId(function) = def else { unreachable!() };
+    assert_eq!(named("FunctionId", function.as_id()), Some(path));
+    // The controls: a row asked as another kind, a kind no namer knows, and no database.
+    assert_eq!(named("FunctionId", krate.as_id()), None);
+    assert_eq!(named("Crate", function.as_id()), None);
+    assert_eq!(named("NoSuchRow", krate.as_id()), None);
+    let mut out = String::new();
+    assert!(!super::name_row("Crate", krate.as_id(), &mut out) && out.is_empty());
+}
+
 /// A macro that calls itself writes each inner call at ordinal 0 of its own output, so its
 /// bodies are named by the whole chain of calls: the two `get`s are two names.
 #[test]

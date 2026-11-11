@@ -537,7 +537,7 @@ pub const PROVENANCE: Table = Table {
         col(
             "query_key",
             Type::Utf8,
-            "the memo: its query and its key as the key's type shows it, `` `infer_query`(DefWithBodyId(FunctionId(..))) `` (its id where the key has no `Debug`), as `cause_key` names it where it is another run's cause",
+            "the memo: its query and its key as the key's type shows it, `` `infer_query`(DefWithBodyId(FunctionId(..))) `` (its id where the key has no `Debug`), each id in it followed by its row's name where the front end names it, `Crate(Id(21548) = serde v1.0.219 (lib))`, as `cause_key` names it where it is another run's cause",
         ),
         col("kind", Type::Dict, "the query, as `query_counts.query` names it"),
         col(
@@ -558,7 +558,7 @@ pub const PROVENANCE: Table = Table {
         opt(
             "cause_key",
             Type::Utf8,
-            "for changed: the read that changed: an input's or tracked struct's field as `` `Input.field`(<row>) ``, its row by name where the front end names it (a file's text by its path, `` `FileText.text`(/src/lib.rs) ``) else its id, or a memo as `query_key` names it, whose own row says why it changed",
+            "for changed: the read that changed: an input's or tracked struct's field as `` `Input.field`(<row>) ``, its row by name where the front end names it (a file's text by its path, `` `FileText.text`(/src/lib.rs) ``; a crate as spans name it; a module's scope by crate and module path, `` `ScopeInput.scope`(serde::de) ``) else its id, or a memo as `query_key` names it, whose own row says why it changed",
         ),
         opt("cause_kind", Type::Dict, "what `cause_key` is: input, tracked or function"),
         opt(

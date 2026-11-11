@@ -46,7 +46,7 @@ use std::alloc::Global;
 #[cfg(test)]
 pub(in crate::nameres) use self::publish::Slices;
 pub(in crate::nameres) use self::publish::{
-    input_children, input_legacy_macro, input_name, input_scope, input_traits, published,
+    log_row_module, input_children, input_legacy_macro, input_name, input_scope, input_traits, published,
     published_module, published_modules, published_records,
 };
 pub(in crate::nameres) use self::state::State;
