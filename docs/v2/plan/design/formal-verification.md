@@ -447,8 +447,9 @@ library, every golden model and the proofs. After a deliberate change to the tra
 
 Rule `verified-compiler` needs one thing every proof and every pass is held to: what a MIR
 body means. It is `lean/Blaze/Mir`, a deep embedding of blaze's MIR with an executable
-semantics, for a first subset. `lake build` of `lean/` passes with Lean 4.20.0 up to commit 19916d9159 (2026-11-10); what was
-written after it is marked "not yet checked". The Rust tests of `crates/hir-ty-lean` have
+semantics, for a first subset. `lake build` of `lean/` passes with Lean 4.20.0 up to commit cc0f8f3ee7 (2026-11-11), and
+the gate (below) holds every theorem of `lean/theorems.json`; what was written after a
+checked commit says so where it is described. The Rust tests of `crates/hir-ty-lean` have
 not run, so every embedded body is a prediction of the encoder's output. Objectives V6, V7 and V8 decide it.
 
 **Prior art, and the one lesson taken from each.**
@@ -563,7 +564,7 @@ steps is `Outcome.ofResult` of the model run with `len + 1` turns; with less fue
 encoder's output until the golden test runs; when it differs, the file is rewritten and the
 block theorems of `LedgerMir.lean` (one per block, each failing alone) are redone.
 
-Three more functions are tied the same way (not yet checked by Lean), each a file beside its
+Three more functions are tied the same way (checked by Lean and held by the gate), each a file beside its
 model: `arith::add_one` (`BlazeModel/arith/add_one_agrees.lean`: the value, and the overflow
 panic), `early::clamp` (both branches) and `loops::count` (through `run_loop`, the one
 lemma for loops: an invariant and a variant give the loop's result). The other four goldens
