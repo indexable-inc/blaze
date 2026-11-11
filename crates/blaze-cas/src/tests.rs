@@ -11,6 +11,7 @@ use crate::read::Found;
 mod block_checks;
 mod model_check;
 mod place_crash;
+mod place_made;
 mod place_race;
 
 fn name(it: &str) -> FileName {
