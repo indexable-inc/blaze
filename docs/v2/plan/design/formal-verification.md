@@ -649,7 +649,7 @@ programs; it is the specification of the Rust pass of the same name.
     in a call is not merged (the caller's frame would keep a stale `block` under the
     callee, so the two states would differ): there the specification covers less.
   - **Threading through every target, a call's return target too** (`Opt/ThreadCalls.lean`,
-    `threadAll`; not yet elaborated). A frame's `target` is then another block in the
+    `threadAll`; checked at 9f791ac218). A frame's `target` is then another block in the
     threaded program, so states are mapped: `retargetStack` sends each frame's `target`
     through its caller's map and leaves every `block`; it is a `MemMap`. A terminator from
     the mapped state gives the mapped next state, or the mapped jump one hop further, and
@@ -658,7 +658,11 @@ programs; it is the specification of the Rust pass of the same name.
   - **Not written: merging a target that ends in a call.** The caller's frame keeps a stale
     `block` under the callee; the map is `block` renamed on the frames under the running
     one, another `MemMap`.
-  - **Dead-store elimination is not written.** It needs a relation, not a map: two states
+  - **Dead-store elimination: first piece** (`Opt/Ptr.lean`; not yet elaborated).
+    `MemOk P st` says every pointer in every slot of the state satisfies `P`; a read gives a
+    value whose pointers do (`State.read_ok`) and a write of such a value keeps it
+    (`State.write_ok`). The rest is below.
+  - **Dead-store elimination: what is not written.** It needs a relation, not a map: two states
     equal but on dead locals. The Rust pass (`optimize/dse.rs`) removes the whole assignment
     of an rvalue it holds to be free of effects (all but a pointer-to-address cast), to a
     local that is not live after and is never borrowed. In this semantics an rvalue can

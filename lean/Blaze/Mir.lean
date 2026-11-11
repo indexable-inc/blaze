@@ -19,6 +19,7 @@ import Blaze.Mir.Opt.SwitchSame
 import Blaze.Mir.Opt.MemMap
 import Blaze.Mir.Opt.Merge
 import Blaze.Mir.Opt.ThreadCalls
+import Blaze.Mir.Opt.Ptr
 import Blaze.Mir.Opt.RemoveNops
 import Blaze.Mir.Opt.ConstFold
 import Blaze.Mir.Opt.Validate

@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-59 theorems: 46 in `lean`, 13 in `lean/analysis`.
+61 theorems: 48 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -460,6 +460,21 @@ theorem threadAll_source (prog : Program) (n : Nat) (st : State)
 theorem threadAll_call_source (prog : Program) (n : Nat) (id : FnId) (base : List Slot)
     (args : List Value) (hne : prog.call n id base args ≠ Outcome.diverge) :
     (threadAll prog).call n id base args = prog.call n id base args
+```
+
+**`Blaze.Mir.State.read_ok`** (`Blaze.Mir.Opt.Ptr`, `lean`): When every pointer in memory satisfies P, a read gives a value whose pointers satisfy P.
+
+```lean
+theorem State.read_ok {P : Pointer → Prop} {st : State} (hm : MemOk P st) (p : Pointer)
+    (v : Value) (h : st.read p = Outcome.ok v) : Value.Ok P v
+```
+
+**`Blaze.Mir.State.write_ok`** (`Blaze.Mir.Opt.Ptr`, `lean`): A write of a value whose pointers satisfy P keeps every pointer in memory satisfying P.
+
+```lean
+theorem State.write_ok {P : Pointer → Prop} {st : State} (hm : MemOk P st) (p : Pointer)
+    (v : Value) (hv : Value.Ok P v) (st' : State) (h : st.write p v = Outcome.ok st') :
+    MemOk P st'
 ```
 
 ## V10
