@@ -294,6 +294,10 @@ the row says otherwise. `state`: `written` (the Rust is in the tree, not yet com
 | domains | switched | `uv run --frozen python tools/v2/domains.py '{"root": "."}'` | `R domains -- '{"root": "."}'` | clean tree: `domains.py: <n> hash domains, each written once outside tests`, status 0. Planted one at a time in a non-test file of `crates/`: a second copy of a domain literal in use (`"blaze v2 body code 1"`-form); the same copy under `#[cfg(test)]` on the next item, and inside a `#[cfg(test)] mod tests {`, and on a `//` line (each passes); `"blaze v2 field order 1"` removed from `crates/blaze-items/src/field_order.rs`: the same lines, status 1 or 0 as the Python's; `'{"root": "/tmp"}'`, `'{}'`, `'{"rot": "."}'`, no argument: the same lines, status 1 |
 | rustcsites | switched | `python3 harness/rustcsites.py` | `R rustcsites` | clean tree: the `ask blaze` lines and `<n> places start rustc, rustdoc, cargo or rustup, none new`, status 0. Planted one at a time: `Command::new("cargo")` in a file of `crates/` (`NEW:` line, status 1); the same inside an `r#"` string spanning lines (passes), on one line (counts); the same under `// asks blaze: planted` (an `ask blaze` line); `Command::new(env!("CARGO_BIN_EXE_blaze"))` (passes); a counted place removed (the `--record lowers it` line); a file of sites.json renamed (`no place` and `NEW:`): the same lines and status |
 | rustcsites | switched | `python3 harness/rustcsites.py --record` | `R rustcsites -- --record` | the same lines; `harness/norustc/sites.json` the same bytes from both, on a clean tree and after a place is planted |
+| share | written | `uv run --frozen python harness/v2/share.py selftest` | `R share -- selftest` | output (`ok    test_cases` ... `share.py selftest: 4 of 4 pass`), status 0 |
+| share | written | `... share.py '{"engine": {"kind": "v2", "blaze": "<blaze>"}, "out": "/tmp/sh-py.json", "work": "/tmp/sh-py"}'`, and with `"programs": ["type_id", "statics"], "jobs": 1` | `R share -- <the same>` with `/tmp/sh-rs.json` and `/tmp/sh-rs` | the outcome lines in the programs' order, the summary and the status, with the work path and each `blaze_s` normalized; the out files equal after the same normalizing and with `host`, `started`, `ended` taken out. Then with `"programs": ["nope"]`, `"jobs": 0`, `"dir": "/nope"`, `"engine": {"kind": "v2", "blaze": "/nope"}`, a `.rs` with no `.stdout` in a copy of the programs (`"dir"` naming it), no argument: the same lines, status 1 (the lone `.rs`: an `error` outcome, status 1) |
+| debug_side | written | `uv run --frozen python harness/v2/debug_side.py selftest` | `R debug_side -- selftest` | output (`debug_side.py selftest: ok`), status 0 |
+| debug_side | written | `... debug_side.py '{"engine": {"kind": "v2", "blaze": "<blaze>"}, "out": "/tmp/ds-py.json", "work": "/tmp/ds-py"}'` | `R debug_side -- <the same>` with `/tmp/ds-rs.json` and `/tmp/ds-rs` | the outcome lines (sizes, build id, backtrace, gdb, lldb), the summary and the status, with the work path normalized; the out files equal with `host`, `started`, `ended` taken out and the work path normalized. `"engine": {"kind": "v2", "blaze": "/nope"}`, `{}`, no argument: the same lines, status 1 |
 
 Known differences, on purpose: the words of a JSON syntax error are serde_json's; a heading's
 anchor keeps a character by Rust's `char::is_alphanumeric` and a table of combining-mark blocks
@@ -310,7 +314,14 @@ the Python raised: gh that does not start, an input path that cannot be read, an
 that is not a JSON list. `domains` and `rustcsites` end with a line where the Python raised on a
 file of `crates/` they could not read (and `rustcsites` on one that is not UTF-8, or a
 `sites.json` that is missing or not a JSON object); `domains`'s `\w` is Rust's alphanumeric, as
-`diff_rules`'s is.
+`diff_rules`'s is. The harnesses on `engine` and `report` (`share`, `debug_side`): a work or
+temporary directory's name is the process id and a count where Python's `mkdtemp` chose a random
+one; what the Python let through as a traceback (an `OSError` outside a step, `work_dir`'s
+refusal in `main`, a section reader's `ValueError` or `struct.error` on a short file) ends with a
+`<script>: <Type>: <message>` line, status 1, still with no report written; a program that does
+not start in a missing directory is named by its program, not the directory;
+`PYTHON_CPU_COUNT` is not read. `share`'s selftest says the `repr` of a failed check's values in
+Rust's `Debug` (`["a"]` for `['a']`); only a failing selftest shows it.
 
 ## Appendix: every Python file
 
