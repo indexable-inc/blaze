@@ -31,7 +31,12 @@ impl Id {
     /// [`Id::MAX_U32`], past every page a storage has. What a reader of bits it did not make
     /// (a persisted record, a restored image, a question from outside) goes through, so a
     /// corrupt word becomes its own typed error rather than a panic.
+    ///
+    /// It cannot panic or allocate (`#[blaze::nopanic]`, `#[blaze::noalloc]`): a word from a
+    /// file is refused here, as a value, or this does not compile.
     #[inline]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
     pub const fn new(bits: u32) -> Option<Id> {
         match NonZeroU32::new(bits) {
             Some(id) if bits <= Id::MAX_U32 => Some(Id(id)),
@@ -43,8 +48,19 @@ impl Id {
     /// and `what` names the field: [`FormatError::Zero`] for 0, and for any word past
     /// [`Id::MAX_U32`] (a corrupt or foreign word) [`FormatError::Bound`] naming the word and
     /// the bound.
+    ///
+    /// The contract: an ID it gives is the word it was given, and a word it refuses is 0 or
+    /// past [`Id::MAX_U32`]; so no word decodes to another ID, and none to an ID no storage
+    /// could give. It cannot panic or allocate, as [`Id::new`].
     #[inline]
-    pub fn decode(word: u64, at: u64, what: &'static str) -> Result<Id, FormatError> {
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    pub fn decode(word: u64, at: u64, what: &'static str) -> (r: Result<Id, FormatError>)
+        ensures match &r {
+            Ok(id) => id.as_u32() as u64 == word,
+            Err(_) => word == 0 || word > Id::MAX_U32 as u64,
+        }
+    {
         match u32::try_from(word).ok().and_then(Id::new) {
             Some(id) => Ok(id),
             None if word == 0 => Err(FormatError::Zero { at, what }),
