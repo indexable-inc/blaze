@@ -322,8 +322,8 @@ mod tests {
         }
     }
 
-    fn refused(value: Value) -> String {
-        of::<Run>(&value, "").unwrap_err().0
+    fn refused(value: &Value) -> String {
+        of::<Run>(value, "").unwrap_err().0
     }
 
     // Each expected line is what tools/typed-input printed for the same value (2026-11-11).
@@ -340,25 +340,25 @@ mod tests {
                 only: None
             }
         );
-        assert_eq!(refused(json!([1])), "the input is a JSON object, not [1]");
+        assert_eq!(refused(&json!([1])), "the input is a JSON object, not [1]");
         assert_eq!(
-            refused(json!({"suite": "uv", "zeta": 1, "alpha": 2})),
+            refused(&json!({"suite": "uv", "zeta": 1, "alpha": 2})),
             "no field alpha, zeta (the fields are engine, ids, only, suite, timeout_minutes)"
         );
-        assert_eq!(refused(json!({})), "field suite is required");
-        assert_eq!(refused(json!({"suite": "pip"})), r#"suite is one of "ruff-and-ty", "uv", not "pip""#);
-        assert_eq!(refused(json!({"suite": "uv", "timeout_minutes": true})), "timeout_minutes is a int, not true");
-        assert_eq!(refused(json!({"suite": "uv", "timeout_minutes": 1.5})), "timeout_minutes is a int, not 1.5");
-        assert_eq!(refused(json!({"suite": "uv", "ids": "a"})), r#"ids is a list, not "a""#);
-        assert_eq!(refused(json!({"suite": "uv", "ids": ["a", 2]})), "ids[1] is a str, not 2");
+        assert_eq!(refused(&json!({})), "field suite is required");
+        assert_eq!(refused(&json!({"suite": "pip"})), r#"suite is one of "ruff-and-ty", "uv", not "pip""#);
+        assert_eq!(refused(&json!({"suite": "uv", "timeout_minutes": true})), "timeout_minutes is a int, not true");
+        assert_eq!(refused(&json!({"suite": "uv", "timeout_minutes": 1.5})), "timeout_minutes is a int, not 1.5");
+        assert_eq!(refused(&json!({"suite": "uv", "ids": "a"})), r#"ids is a list, not "a""#);
+        assert_eq!(refused(&json!({"suite": "uv", "ids": ["a", 2]})), "ids[1] is a str, not 2");
         assert_eq!(
-            refused(json!({"suite": "uv", "engine": {"blaze": 1}})),
+            refused(&json!({"suite": "uv", "engine": {"blaze": 1}})),
             r#"engine.blaze is a str, not 1 or engine is null, not {"blaze": 1}"#
         );
         assert_eq!(
-            refused(json!({"suite": "uv", "engine": {"x": 1}})),
+            refused(&json!({"suite": "uv", "engine": {"x": 1}})),
             r#"no field engine.x (the fields are blaze) or engine is null, not {"x": 1}"#
         );
-        assert_eq!(refused(json!({"suite": "uv", "only": 3})), "only is a str, not 3 or only is null, not 3");
+        assert_eq!(refused(&json!({"suite": "uv", "only": 3})), "only is a str, not 3 or only is null, not 3");
     }
 }
