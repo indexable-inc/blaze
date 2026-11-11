@@ -113,7 +113,7 @@ Two crates, written 2026-11-10. Nothing in the build calls them yet: no program 
   its user's, so id order is a topological order and no order comes from a hash map. A tuple or
   array is several roots.
 - `crates/blaze-diff/rules.json`: the one source of the two tables below.
-  `harness/v2/diff_rules.py` writes the Rust tables from it (`src/rules_gen.rs`) and the Lean
+  `scripts/src/bin/diff_rules.rs` writes the Rust tables from it (`src/rules_gen.rs`) and the Lean
   ones the proofs are about; see
   [formal-verification.md, "Derivatives"](../v2/plan/design/formal-verification.md#derivatives-2026-11-10):
   the rules are proved to give the derivative over the reals wherever their domain holds, and

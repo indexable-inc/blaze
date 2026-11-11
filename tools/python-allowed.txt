@@ -111,7 +111,6 @@ harness/v2/corpus.py
 harness/v2/dbsp/edits.py
 harness/v2/debug_side.py
 harness/v2/determinism.py
-harness/v2/diff_rules.py
 harness/v2/engine.py
 harness/v2/fixture.py
 harness/v2/frontend/borrowck_flow.py

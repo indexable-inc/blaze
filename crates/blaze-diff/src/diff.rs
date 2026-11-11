@@ -133,7 +133,7 @@ pub struct Rule {
 /// The derivative rules: one per float operation, in [`Op`]'s order. The one owner: the
 /// differentiator, the tests' generator and `blaze explain` read this table and nothing else
 /// says what a derivative is. Its source is `crates/blaze-diff/rules.json`, which
-/// `harness/v2/diff_rules.py` writes this table and the Lean one from
+/// `scripts/src/bin/diff_rules.rs` writes this table and the Lean one from
 /// (`lean/analysis/BlazeDiff/Rules.lean`): the table blaze runs is the table
 /// `BlazeDiff.diff_correct` is proved about.
 pub const RULES: &[Rule] = crate::rules_gen::RULES;

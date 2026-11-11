@@ -18,6 +18,6 @@ path = ".."
 
 # blaze-diff's symbolic differentiator and simplifier, over the reals. `Ops.lean`, `Rules.lean`
 # and `Rewrites.lean` are generated from crates/blaze-diff/rules.json by
-# harness/v2/diff_rules.py, as the crate's Rust tables are.
+# scripts/src/bin/diff_rules.rs, as the crate's Rust tables are.
 [[lean_lib]]
 name = "BlazeDiff"

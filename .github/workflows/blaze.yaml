@@ -160,10 +160,10 @@ jobs:
           blaze run -q -p scripts --bin invariants -- selftest
           blaze run -q -p scripts --bin invariants -- '{"command": "check"}'
       # blaze-diff's Rust tables and the Lean ones the proofs are about are what
-      # crates/blaze-diff/rules.json generates (harness/v2/diff_rules.py).
+      # crates/blaze-diff/rules.json generates (scripts/src/bin/diff_rules.rs).
       - run: |
-          uv run --frozen python harness/v2/diff_rules.py selftest
-          uv run --frozen python harness/v2/diff_rules.py '{"command": "check"}'
+          blaze run -q -p scripts --bin diff_rules -- selftest
+          blaze run -q -p scripts --bin diff_rules -- '{"command": "check"}'
       # The Lean proofs, as far as no Lean is needed (harness/v2/lean_gate.py): the list of
       # theorems (lean/theorems.json) names statements that are there, no source says `sorry`,
       # `native_decide`, `axiom` or `partial def`, lean/analysis's manifest is checked in at the
