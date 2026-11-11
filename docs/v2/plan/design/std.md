@@ -101,7 +101,7 @@ Each layer uses only the ones below it.
 | 4 | `bstd::{fs, net, env, clock, rng, task, process, out}` | the capability types people use |
 | 3 | `bstd::io` | `Io`: one handle to the process's driver; turns a call into an effect and parks the caller until its completion |
 | 2 | `bstd::driver` | `Effect`, `Completion`, `Driver`, and the drivers: `Uring`, `Kqueue`, `Iocp`, `Sim` (today's `blaze-core`) |
-| 1 | `bstd::sys` | raw system calls per target, the only home of `unsafe`; Linux by syscall number with no libc, macOS through libSystem, Windows through ntdll and kernel32 |
+| 1 | `bstd::sys` | raw system calls per target, the only home of `unsafe`; Linux by syscall number with no libc, macOS through libSystem, Windows through ntdll and kernel32 ([sys](sys.md); today the crate `crates/blaze-sys`) |
 | 0 | `core`, `alloc` | the language's own libraries, unchanged |
 
 ## What is in it
@@ -985,7 +985,7 @@ task with `Stopped::OutOfMemory { arena, asked }` through the same path as a pan
 `panics-fail-one-job`); the process and the other tasks go on. Code that wants to handle it itself
 uses the `try_` forms (`try_push`, `try_reserve`), which return the error.
 
-Until S4, `alloc`'s global allocator still exists underneath; the `ambient` check treats a use of
+Until S4's runtime ([sys](sys.md), "Runtime"), `alloc`'s global allocator still exists underneath; the `ambient` check treats a use of
 it in a capabilities crate as an effect (`global_alloc`), which replaces the `// alloc:` comment.
 
 ### The page pool: one home for bytes that come from outside
@@ -1094,7 +1094,7 @@ Interface first, bottom last, so nothing waits on the runtime and every step lan
 | S1f | The page pool moves from `blaze-cas` to `bstd::mem::pool`; `file.pin`, pooled receive buffers, records read in place; no `mmap` anywhere in bstd | the pool's simulation test still passes from its new home; the store builds on it |
 | S1g | `bstd::audio`: `AudioOut`, `AudioIn`, PCM buffers, the mixer and resampler as cores, the simulation's provider and one native one; the audio track in the muxer; the types of the device capabilities | a simulated run's samples equal a model's; the callback's effects are refused when it waits or allocates |
 | S3b | The `Frames` layout: the calling convention, the slab, unwinding, and the profiler and backtraces walking the frame chain | the differential test against `Fibers` passes |
-| S4 | The bottom: `bstd::sys` and `bstd::rt`, `blaze-core`'s drivers move in as `bstd::driver`, and bstd is `#![no_std]` | no blaze crate links Rust's `std`; C1 still passes |
+| S4 | The bottom ([sys](sys.md)): `bstd::sys` and `bstd::rt`, `blaze-core`'s drivers move in as `bstd::driver`, and bstd is `#![no_std]`. Slice 1 is written: `crates/blaze-sys` for Linux, the first file effects on it, bstd `#![no_std]` with one std module (`rt.rs`) | the ban list (`harness/v2/nostd.json`) is empty and no blaze crate links Rust's `std` (`harness/v2/nostd.py`); C1 still passes |
 | S5 | The edition: `edition = "blaze-2026.11"` makes `std` name bstd, `fn main(io: Io)` is the entry, and the OS sandbox of a program is derived from what `main` hands out | a program of the edition that never opens the network cannot, checked by the sandbox |
 | S6 | C dependencies as wasm, the registry, the migration (`blaze fix --edition`) | each has its own row when S5 is met |
 
