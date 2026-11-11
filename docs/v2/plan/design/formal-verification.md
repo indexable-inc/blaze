@@ -702,7 +702,7 @@ programs; it is the specification of the Rust pass of the same name.
     borrow, a statement that mentions the local neither as a place's base nor as an index
     does the same whatever the slot holds (`execStmt_put`), through every function of
     `Step.lean` up to `execStmt`.
-  - **`removeOverwritten`** (`Opt/RemoveOverwritten.lean`; checked at cc0f8f3ee7, `removeOverwritten_call` after it): the end
+  - **`removeOverwritten`** (`Opt/RemoveOverwritten.lean`; checked at 9aabce8584): the end
     theorem of the pieces above. In a block, `l = rv1; ..; l = rv2` becomes
     `nop; ..; l = rv2` when `l` is a whole local its function never borrows, `rv1` is a copy
     of a place with no index or a constant, and nothing between mentions `l`. A step runs a
@@ -719,11 +719,144 @@ programs; it is the specification of the Rust pass of the same name.
     form needs the two states related across steps (equal but, per frame, on the locals
     dead at its resume point), on `Opt/Ptr`, `Opt/Borrow`, `Opt/BorrowStep`,
     `Opt/SlotAlgebra`, `Opt/SlotExec`. So no `BlazeValidated` pair for DSE.
+- **Global dead-store elimination: the design (ledger V11; not built).** One relation serves
+  the Rust `DeadStoreElimination`, the deleting half of `CopyProp` (a use rewritten is
+  `symEq`; the copy left unused is a dead store) and of `SimplifyLocals` (which also
+  renumbers locals: a rename of locals, a commutation family like `Opt/Rename.lean`'s, not
+  part of this).
+  - **No change to the semantics.** `step` runs a whole block, and that grain is right: the
+    relation is stated at block boundaries, and inside a block the proof is an induction
+    over the statements, as `Opt/RemoveOverwritten.lean`'s is. A per-statement small step is
+    not needed.
+  - **The certificate** is liveness as data: per function and block, the locals live on
+    entry. `checkLiveness` (a `Bool` the kernel evaluates) recomputes each block backwards
+    from the union of its successors' sets (a `ret` reads local 0; a call's destination is
+    written whole or in part; every borrowed local is always live) and accepts when what it
+    computes is within the set given. The pass removes `l = rv` where `l` is a whole local
+    not live after the statement and never borrowed, and `rv` cannot panic or move
+    (`rvalueCalm`, to be widened to total operators).
+  - **The relation** is a map, as in `Opt/SlotAlgebra.lean`: the source state is the target
+    state with a list of slots replaced, `(frame id, local, slot)`, each a local dead at its
+    frame's resume point (the running frame: the block it is at; a frame under it: after
+    its call returns and writes the destination) and never borrowed, so by `step_borrows` no
+    pointer is into it. A step keeps it: a statement that does not read a replaced slot
+    commutes with the replacements (`execStmt_put`, generalized to a frame that is not the
+    running one, where no place of the statement can be in it); a store to a replaced local
+    drops it from the list (`State.write_setSlot_same`); a removed store adds one; a call
+    leaves the caller's list as it is and starts the callee with none; a return drops the
+    callee's.
+  - **Built, all checked by Lean** (`lake build` of `lean/` at 7aef0a78fb, 2026-11-11).
+    (a) `Opt/SlotExecFar.lean`, `execStmt_putFar`: a statement does the same whatever a
+    hidden slot of a frame that is not running holds. (b) `Opt/Puts.lean`: `puts st reps`,
+    the state with a list of slots replaced (`Rep := Nat × Nat × Slot`: frame id, local,
+    content); `execStmt_puts`, a statement through the list; `execStmt_absorb`, the same
+    with the entries the statement stores to whole leaving the list (`keepReps`);
+    `puts_append`, `puts_okAt`, `puts_top`, `puts_topFn`. (c) `Opt/Liveness.lean`: the
+    certificate, `checkLiveness`, `stmtLive_dead`, and the pass `removeDead`, with examples.
+    **`removeDead` has no theorem**: that is (d) and (e), below.
+  - **Left to build: (d) and (e), for a reader starting fresh.** Names in backticks exist
+    and are checked unless said to be new. `B` is `BorrowedIn borrowed prog`, `g` the list
+    of frames of `Borrows B g st` (`Opt/BorrowStep.lean`).
+    - **The relation.** The source state is `puts t reps` for the target state `t`. Each
+      entry `(f, l, sl)` is `Good`: `SlotOk (PtrOk B g) sl`; `∀ q, PtrOk B g q → Off f l q`
+      (from `ptrOk_off`: `fnOfIds g f = some fn`, `¬ B fn l`, `¬ f = 0` by
+      `KeysBelow.pos`); `f` is the id of a frame of `t` whose function has `l` among its
+      locals; and `l` is dead at that frame's resume point: for the running frame, not in
+      `liveIn points fr.block`; for a frame under it, the same at the block its callee's
+      `target` names, except a local the call writes whole (`termWrites`).
+    - **(d1) new file `Opt/PutsTerm.lean`: operands and places through the list.** As
+      `execStmt_puts` is built from `execStmt_put` and `execStmt_putFar` (see
+      `execStmt_rep`), build from `evalOperand_put`/`evalOperand_putFar`,
+      `evalOperands_put`/`_putFar` and `evalPlace_put`/`_putFar`:
+      `evalOperand (puts st reps) o = Outcome.map (keepState (fun s => puts s reps)) (evalOperand st o)`,
+      the same for `evalOperands`, and
+      `evalPlace (puts st reps) p = evalPlace st p` with the pointer it gives `Off` every
+      entry. The condition per entry is `RepOk` with `operandFine`/`operandsFine`/`placeFine`
+      in place of `stmtFine`; `termFine l term` (`Opt/Liveness.lean`) gives them for the
+      locals dead before the terminator.
+    - **(d2) same file: control.** A jump: `State.jump st x` is
+      `Outcome.ok (Next.state (st.mapStack (withTopBlock x)))` on a stack that is not empty,
+      and `State.setSlot_mapStack (withTopBlock_memMap x)` (`Opt/MemMap.lean`,
+      `Opt/Merge.lean`) commutes a replacement with it, so
+      `(puts st reps).jump x = Outcome.map (Next.map (fun s => puts s reps)) (st.jump x)`
+      by induction on the list; `switchOn` and `assertOn` follow as in `Opt/Reach.lean`.
+      A call: `enterState (puts st reps) .. = puts (enterState st ..) reps`, because the new
+      frame's id is `st.next` and every entry's frame id is below it (`KeysBelow`), so
+      `setFrame` passes the new frame (`setFrame_cons` with `if_neg`) and `State.slots?`
+      of an entry's frame is unchanged. A return: an entry of the returning frame becomes
+      the identity once the frame is gone (`State.setSlot_none`); the write of the
+      destination in the caller absorbs an entry of the destination's whole local
+      (`State.write_setSlot_same`) and commutes with every other
+      (`State.write_setSlot_other`), for which the relation must also say, of each frame
+      under the running one, that its callee's `dest` is `Off` each of its entries or is
+      that entry's whole slot.
+    - **(d3) new file `Opt/RemoveDead.lean`: the block.** By induction on the statements
+      with their points (`stmtsLive`, `killDead` recurse the same way): a kept statement is
+      `execStmt_absorb` with `RepFits` from `stmtLive_dead` (the local is absorbed, or
+      `stmtFine` and still dead; an entry of another frame is the third case); a removed
+      store `l = rv` is, on the source, `evalRvalue_calm` then `State.write_whole`, so the
+      source state becomes `puts t ((top, l, Slot.init v) :: keepReps top s reps)` while the
+      target state stays `t` (`killable_refines` in `Opt/RemoveOverwritten.lean` is the same
+      argument for one block); the value is allowed by `evalRvalue_okAt` on the source
+      state, which holds `OkAt` by `puts_okAt`.
+    - **(e) same file: the runs.** `run_refines_inv` is not enough as it is: it wants the
+      two programs in the same state, and here they are related. Write its relational form
+      first (new, in `Opt/RemoveOverwritten.lean` beside it), about ten lines more than
+      `run_refines_inv`:
+      `theorem run_refines_rel (src tgt : Program) (R : State → State → Prop)
+      (hstep : ∀ s t, R s t → (∃ why, step src s = Outcome.undefined why) ∨ StepRel R (step src s) (step tgt t)) :
+      ∀ fuel s t, R s t → (run tgt fuel t).Refines (run src fuel s)`, where
+      `StepRel R` relates two `Outcome Next`: both `ok (Next.state ..)` with `R`, both
+      `ok (Next.done v)` with one `v`, or the same panic, undefined or `diverge`. Then
+      `removeDead_refines` with `R s t := ∃ reps g, s = puts t reps ∧ Borrows B g t ∧ every entry Good`,
+      under `checkLiveness prog cert = true` and `checkBorrows borrowed prog = true`; and
+      the call form as `removeOverwritten_call` (`start_borrows`; the start state is related
+      by the empty list).
+  - **Idioms that elaborate here, and ones that do not** (Lean 4.20.0; learned on this
+    branch, each from a build):
+    - Prove through `Opt/Bind.lean`, as terms: `Outcome.bind_commutes hx (fun a ha => ..)`,
+      `bind_commutes_map`, `bind_congr`, `bind_map_congr`, and `Outcome.all_bind` for a
+      predicate on the value. The unifier unfolds a definition to its `bind`; no `rw`.
+    - `congrTo f h` (in `Opt/Bind.lean`), never `congrArg f h`, where an expected type is
+      known: `congrArg` lets the goal choose the right-hand side and picks wrongly when it
+      only unfolds to the same.
+    - A structure literal `{ a := .., b := .. }` broken across lines inside parentheses
+      in a `have`'s type does not parse: write `State.mk .. .. ..` / `Frame.mk ..`.
+    - `Preserves.comp (f := ..) (g := ..)` and the like: give the functions; higher-order
+      unification of `fun prog => g (f prog)` picks the identity.
+    - `nomatch h, fun ..` parses as a list: parenthesize `(fun ⟨_, h⟩ => nomatch h)`.
+    - A hypothesis whose type is a `def` (`Reaches`, `RepOk`, `Redirects`): use
+      `And.left`/`And.right`/`And.intro`/`Or.inl`, not `h.1` or `⟨..⟩`; before `cases` on
+      it, restate it with its `∨` written out (`have h' : A ∨ B := h`), or take
+      `And.right (And.right h)` whose type is then the `∨` itself.
+    - A `match` on a value that is not a constructor does not reduce: give every function
+      a helper that matches on its argument (`slotIn`, `switchOr`, `symNext`), and state
+      `f_cons := rfl`; for an inline one, `simp only [f]` then `cases h : scrutinee`
+      (`callOn`), or `unfold f; cases h : scrutinee` when the `match` is the body's head
+      (`Program.start`); `unfold f; split <;> first | ..` for a many-pattern one
+      (`Intrinsic.eval`).
+    - `by omega` as an argument runs before its goal is known: put it in a
+      `have h : <type> := by omega`.
+    - `rw [e] at h` matches up to instances: `k + 1 + 0` also matches `k + 1`. Build
+      arithmetic steps as terms (`congrArg (fun j => run prog j st) e`).
+    - After `subst`, do not name the variable that may be gone; state the lemma for one
+      variable and derive the other form with `congrTo`.
+    - `cases e with | c => ..` needs `e` to appear in the goal as written: `show` the
+      unfolded goal first, or `cases h : e` and `rw [h] at ..`.
+    - `first | exact A | exact B | ..` after `cases x <;> cases y` chooses by unification;
+      order the alternatives so that an earlier one cannot fit a later one's goal.
+    - Generating a file by substitution from one that builds works and is cheap to get
+      right: `Opt/MemMap.lean` from `Opt/Rename.lean`, `Opt/Ids.lean` and `Opt/NextId.lean`
+      from `Opt/Ctl.lean`, `Opt/SlotExecFar.lean` from `Opt/SlotExec.lean`, the operator
+      lemmas of `Opt/SymBlock.lean` from `Opt/BorrowExec.lean`. Assert that no old name is
+      left, and read the result once.
+    - In `decide` examples, state what the pass does by hand first; twice here the
+      expectation was wrong and the pass right.
 - **A validator proved sound** (`Opt/Validate.lean`). `validate a b` accepts when the two
   programs have one normal form under the proved rewrites; `validate_sound`: an accepted
   pair runs alike for every fuel and state. It takes no witness and accepts only what the
   normal form identifies.
-- **A validator that takes a witness** (`Opt/Witness.lean`; not yet elaborated). The witness
+- **A validator that takes a witness** (`Opt/Witness.lean`; checked at 9aabce8584). The witness
   is a script: the proved rewrites, in order, that take the program before a pass to the
   program after it (`Rewrite`: the block-local passes, `switchToGoto`, both threadings,
   merging, dead-block removal, a block permutation with its orders as data).
@@ -732,14 +865,33 @@ programs; it is the specification of the Rust pass of the same name.
   in undefined behaviour, the same outcome with the same fuel. The Rust pass is then not
   trusted and need not be a fixed specification block for block: a script that reproduces
   its output is the evidence, and the pass can say which rewrites it applied.
-  **Not written: the validator by symbolic execution**, which needs no script and accepts
-  rewrites nobody proved one by one (copy propagation, local renumbering, reordering of
-  independent statements). It needs an expression language whose evaluation is proved to
-  agree with `evalRvalue`, each block run on symbolic locals to a normal form (stores of
-  expressions, panics in order, a terminator with a symbolic condition), and `Renumbers`
-  with "the target block is symbolically equal" in place of "is the renamed block"; sound
-  through `Sim`, or `Stutter` when blocks were merged. The inliner needs a relation between
-  one frame and two beyond that; loop transforms need a witness that is not per block.
+  `removeOverwritten` is a rewrite too, proved for the calls whose caller hands over
+  pointers into frame 0 only (`FrameZero`): `validateWith_sound` is for scripts without it
+  (`allPlain`), `validateWith_sound_frameZero` for any script and those calls.
+  **The validator by symbolic execution, first piece** (`Opt/Sym.lean`; checked at
+  9aabce8584): `Expr`, what a local holds as a function of the locals when its block began,
+  with `Expr.eval`; a symbolic store, and `Reads` (the state agrees with it);
+  `evalRvalue_sym`: an rvalue of the subset (`use`, `binary`, `checked`, `withOverflow`,
+  `unary`, `cast` on constants and copies of whole locals: no move, no projection, no
+  `ref`) evaluates to the value of its expression and leaves the state.
+  **Second piece** (`Opt/SymBlock.lean`; checked at 9aabce8584): a block's statements as a
+  trace, the locals assigned in order with their expressions (`symStmts`), and what a trace
+  means (`den`); `execStmts_sym`: executing the statements is the meaning of their trace,
+  so statement lists with one trace do the same from every state (`execStmts_same`).
+  **Third piece** (`Opt/SymEq.lean`; checked at 9aabce8584): a terminator with a symbolic
+  condition (`symTerm`), a block as its trace and symbolic terminator (`symBlock`,
+  `execBlock_sym`), `symEq a b` (the same types and, block by block, blocks that are equal
+  or have one symbolic form) with `symEq_sound` (they run alike, for every fuel and state),
+  and `validateSym a b w`: a script of proved rewrites replayed on `a`, the result compared
+  with `b` by `symEq` (`validateSym_sound`). The script is the block map; symbolic equality
+  is the rest.
+  **What symbolic equality accepts, and what it does not.** It accepts a pass that rewrites
+  operands inside a block and keeps every store: copy and constant propagation of uses,
+  on the scalar, move-free subset (blocks outside it must be equal). It does not accept a
+  store or a local removed (the deleting half of the Rust `CopyProp`, `SimplifyLocals`):
+  there the two programs' states differ on a dead local across steps, which is ledger V11's
+  relation. The inliner needs a relation between one frame and two; loop transforms need a
+  witness that is not per block.
 - **The Rust passes are held to them by translation validation.** The test
   `the_passes_are_their_lean_specifications` and `mir_semantics.py validate` run each pass
   alone on runtime MIR, embed the body before and after, and Lean checks

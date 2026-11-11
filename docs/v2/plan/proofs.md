@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-74 theorems: 61 in `lean`, 13 in `lean/analysis`.
+84 theorems: 71 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -589,12 +589,69 @@ theorem removeOverwritten_call (borrowed : Body → Local → Bool) (prog : Prog
       (prog.call fuel id base args)
 ```
 
-**`Blaze.Mir.Opt.validateWith_sound`** (`Blaze.Mir.Opt.Witness`, `lean`): The witness validator is sound: when a script of proved rewrites takes one program to another, every call that ends, and not in undefined behaviour, gives the same outcome with the same fuel.
+**`Blaze.Mir.Opt.validateWith_sound`** (`Blaze.Mir.Opt.Witness`, `lean`): The witness validator is sound: when a script of rewrites proved for every call takes one program to another, every call that ends, and not in undefined behaviour, gives the same outcome with the same fuel.
 
 ```lean
 theorem validateWith_sound (a b : Program) (w : List Rewrite) (h : validateWith a b w = true)
-    (n : Nat) (id : FnId) (base : List Slot) (args : List Value) (r : Outcome Value)
+    (hp : allPlain w = true) (n : Nat) (id : FnId) (base : List Slot) (args : List Value)
+    (r : Outcome Value) (hr : a.call n id base args = r) (hd : r ≠ Outcome.diverge)
+    (hu : ∀ (why : Undefined), r ≠ Outcome.undefined why) : b.call n id base args = r
+```
+
+**`Blaze.Mir.Opt.validateWith_sound_frameZero`** (`Blaze.Mir.Opt.Witness`, `lean`): The same for any script, removeOverwritten among its rewrites, for the calls whose base slots and arguments have pointers into frame 0 only.
+
+```lean
+theorem validateWith_sound_frameZero (a b : Program) (w : List Rewrite)
+    (h : validateWith a b w = true) (n : Nat) (id : FnId) (base : List Slot)
+    (args : List Value) (hz : FrameZero base args) (r : Outcome Value)
     (hr : a.call n id base args = r) (hd : r ≠ Outcome.diverge)
+    (hu : ∀ (why : Undefined), r ≠ Outcome.undefined why) : b.call n id base args = r
+```
+
+**`Blaze.Mir.evalRvalue_sym`** (`Blaze.Mir.Opt.Sym`, `lean`): An rvalue of the scalar, move-free subset evaluates to the value of its symbolic expression over the block's initial locals, and leaves the state as it was.
+
+```lean
+theorem evalRvalue_sym {st0 : State} {σ : List (Local × Expr)} {st : State}
+    (adts : List AdtDecl) (h : Reads st0 σ st) :
+    ∀ (rv : Rvalue) (e : Expr), symRvalue σ rv = some e →
+      evalRvalue adts st rv = Outcome.map (fun v => (v, st)) (e.eval st0)
+  | Rvalue.use o, e, hs => evalOperand_sym h o e hs
+  | Rvalue.binary op a b, e, hs => by
+    have ⟨ea, eb, ha, hb, he⟩
+```
+
+**`Blaze.Mir.execStmts_sym`** (`Blaze.Mir.Opt.SymBlock`, `lean`): Executing a block's statements is the meaning of their symbolic trace: each expression evaluated in the block's initial state and written to its local.
+
+```lean
+theorem execStmts_sym (adts : List AdtDecl) (st0 : State) :
+    ∀ (stmts : List Statement) (σ : List (Local × Expr)) (st : State)
+      (tr : List (Local × Expr)), Reads st0 σ st → symStmts σ stmts = some tr →
+        execStmts adts st stmts = den st0 st tr
+  | [], _, _, tr, _, h => by
+    have e : ([] : List (Local × Expr)) = tr
+```
+
+**`Blaze.Mir.execStmts_same`** (`Blaze.Mir.Opt.SymBlock`, `lean`): Statement lists with one symbolic trace do the same from every state.
+
+```lean
+theorem execStmts_same (adts : List AdtDecl) (s1 s2 : List Statement)
+    (tr : List (Local × Expr)) (h1 : symStmts [] s1 = some tr) (h2 : symStmts [] s2 = some tr)
+    (st : State) : execStmts adts st s1 = execStmts adts st s2
+```
+
+**`Blaze.Mir.symEq_sound`** (`Blaze.Mir.Opt.SymEq`, `lean`): Programs whose blocks are equal or have one symbolic form run alike, for every fuel and every state.
+
+```lean
+theorem symEq_sound (a b : Program) (h : symEq a b = true) (fuel : Nat) (st : State) :
+    run b fuel st = run a fuel st
+```
+
+**`Blaze.Mir.Opt.validateSym_sound`** (`Blaze.Mir.Opt.SymEq`, `lean`): When a script of proved rewrites takes one program to a program symbolically equal to another, every call whose caller hands over pointers into frame 0 only, that ends and not in undefined behaviour, gives the same outcome.
+
+```lean
+theorem validateSym_sound (a b : Program) (w : List Rewrite) (h : validateSym a b w = true)
+    (n : Nat) (id : FnId) (base : List Slot) (args : List Value) (hz : FrameZero base args)
+    (r : Outcome Value) (hr : a.call n id base args = r) (hd : r ≠ Outcome.diverge)
     (hu : ∀ (why : Undefined), r ≠ Outcome.undefined why) : b.call n id base args = r
 ```
 
@@ -708,4 +765,56 @@ theorem select_tangent (c a0 a1 a2 t0 t1 t2 o : ℝ) (n : Blaze.I32) (p : Prop) 
 
 ```lean
 theorem rewrites_sound : Rewrite.AllSound
+```
+
+## V11
+
+**`Blaze.Mir.execStmt_putFar`** (`Blaze.Mir.Opt.SlotExecFar`, `lean`): A statement does the same whatever a slot of a frame that is not running holds, when no pointer in memory is into it.
+
+```lean
+theorem execStmt_putFar {B : FnId → Local → Prop} {g : List (Nat × FnId)} {f l : Nat}
+    (adts : List AdtDecl) {st : State} (h : HidesFar B g f l st) (sl : Slot) (fn : FnId)
+    (hfn : st.topFn = fn) :
+    ∀ (s : Statement), StmtFine B fn s →
+      execStmt adts (st.put f l sl) s =
+        Outcome.map (fun x => State.put x f l sl) (execStmt adts st s)
+  | Statement.assign p rv, hB =>
+    Outcome.bind_commutes_map (evalRvalue_putFar adts h sl rv) (fun r hr =>
+      have hr2 : HidesFar B g f l r.2
+```
+
+**`Blaze.Mir.execStmt_puts`** (`Blaze.Mir.Opt.Puts`, `lean`): A statement does the same through a list of replaced slots, each hidden and of another frame or of a local the statement does not mention.
+
+```lean
+theorem execStmt_puts {B : FnId → Local → Prop} {g : List (Nat × FnId)} (adts : List AdtDecl)
+    (fn : FnId) (s : Statement) (hB : StmtFine B fn s) :
+    ∀ (reps : List Rep) (st : State), OkAt B g st → st.topFn = fn →
+      (∀ (r : Rep), r ∈ reps → RepOk B g st.top s r) →
+        execStmt adts (puts st reps) s =
+          Outcome.map (fun x => puts x reps) (execStmt adts st s)
+  | [], st, _, _, _ => (Outcome.map_same (execStmt adts st s)).symm
+  | r :: rest, st, hs, hfn, hreps => by
+    have hr : RepOk B g st.top s r
+```
+
+**`Blaze.Mir.execStmt_absorb`** (`Blaze.Mir.Opt.Puts`, `lean`): A statement through a list of replaced slots gives its state with the slots it did not store to replaced: a store to a whole replaced local forgets it.
+
+```lean
+theorem execStmt_absorb {B : FnId → Local → Prop} {g : List (Nat × FnId)} (adts : List AdtDecl)
+    (fn : FnId) (s : Statement) (hB : StmtFine B fn s) (top : Nat) :
+    ∀ (reps : List Rep) (st : State), OkAt B g st → st.topFn = fn → st.top = top →
+      (∀ (r : Rep), r ∈ reps → RepFits B g top s r) →
+        execStmt adts (puts st reps) s =
+          Outcome.map (fun x => puts x (keepReps top s reps)) (execStmt adts st s)
+  | [], st, _, _, _, _ => (Outcome.map_same (execStmt adts st s)).symm
+  | r :: rest, st, hs, hfn, htop, hreps => by
+    have hr : RepFits B g top s r
+```
+
+**`Blaze.Mir.Opt.stmtLive_dead`** (`Blaze.Mir.Opt.Liveness`, `lean`): Under a liveness certificate the check accepts, a local dead before a statement is stored to whole by it, or is not mentioned and is dead after it.
+
+```lean
+theorem stmtLive_dead (n : Nat) (before after : List Local) (s : Statement) (l : Local)
+    (h : stmtLive n before after s = true) (hl : l < n) (hd : has l before = false) :
+    isOverwrite l s = true ∨ (stmtFine l s = true ∧ has l after = false)
 ```
