@@ -183,6 +183,7 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::durable_write",
             "blaze::unbounded_wait",
             "blaze::combined_identity",
+            "blaze::span_field_unrecorded",
         ],
     ),
     // The cross-configuration reachability lints (docs/v2/plan/design/multiconfig-check.md), also in

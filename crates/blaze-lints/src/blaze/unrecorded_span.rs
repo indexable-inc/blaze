@@ -37,16 +37,21 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
 
 /// What a macro of `tracing` writes: a span or an event.
 #[derive(Clone, Copy)]
-enum Made {
+pub(super) enum Made {
     Span,
     Event,
 }
 
-fn check_call<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>, call: ast::MacroCall<'t>) {
-    let Some(called) = call.path().and_then(|it| it.segment()).and_then(|it| it.name_ref()) else {
-        return;
-    };
-    let (made, level) = match called.text() {
+/// What `call` writes when it calls a span or event macro of the crate `tracing`, and the
+/// level its macro names (none for `span!` and `event!`, which take it as their first
+/// argument); none for any other macro. The one reading of which calls are `tracing`'s, for
+/// this lint and `span_field_unrecorded`.
+pub(super) fn tracing_macro<'t>(
+    cx: &Cx<'_, 't>,
+    call: ast::MacroCall<'t>,
+) -> Option<(Made, Option<&'static str>)> {
+    let called = call.path().and_then(|it| it.segment()).and_then(|it| it.name_ref())?;
+    let written = match called.text() {
         "error_span" => (Made::Span, Some("error")),
         "warn_span" => (Made::Span, Some("warn")),
         "info_span" => (Made::Span, Some("info")),
@@ -59,7 +64,7 @@ fn check_call<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>, call: ast::MacroCall
         "debug" => (Made::Event, Some("debug")),
         "trace" => (Made::Event, Some("trace")),
         "event" => (Made::Event, None),
-        _ => return,
+        _ => return None,
     };
     let db = cx.db();
     if cx
@@ -67,9 +72,14 @@ fn check_call<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>, call: ast::MacroCall
         .and_then(|it| it.display_name(db))
         .is_none_or(|it| it.crate_name().as_str() != "tracing")
     {
-        return;
+        return None;
     }
-    let Some(display) = cx.krate().display_name(db) else { return };
+    Some(written)
+}
+
+fn check_call<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>, call: ast::MacroCall<'t>) {
+    let Some((made, level)) = tracing_macro(cx, call) else { return };
+    let Some(display) = cx.krate().display_name(cx.db()) else { return };
     let Some(tt) = call.token_tree() else { return };
     let mut args = [Arg::NONE; 4];
     let mut count = 0;
@@ -274,10 +284,10 @@ fn report<'t>(
 /// first three tokens, its last, and how many it has, a group in brackets counted as one with
 /// no token.
 #[derive(Clone, Copy)]
-struct Arg<'t> {
-    first: [Option<ast::Token<'t>>; 3],
-    last: Option<ast::Token<'t>>,
-    len: usize,
+pub(super) struct Arg<'t> {
+    pub(super) first: [Option<ast::Token<'t>>; 3],
+    pub(super) last: Option<ast::Token<'t>>,
+    pub(super) len: usize,
 }
 
 impl<'t> Arg<'t> {
@@ -293,7 +303,7 @@ impl<'t> Arg<'t> {
 
     /// The key of `key <separator> ..`: `target: ".."` in a macro, `level = ".."` in an
     /// attribute. A path (`Level::INFO`) has none.
-    fn key(&self, separator: SyntaxKind) -> Option<&'t str> {
+    pub(super) fn key(&self, separator: SyntaxKind) -> Option<&'t str> {
         match self.first {
             [Some(key), Some(sep), third]
                 if key.kind() == SyntaxKind::IDENT
@@ -307,20 +317,20 @@ impl<'t> Arg<'t> {
     }
 
     /// The string literal of `key <separator> ".."`.
-    fn value(&self) -> Option<ast::Token<'t>> {
+    pub(super) fn value(&self) -> Option<ast::Token<'t>> {
         let [_, _, Some(value)] = self.first else { return None };
         (self.len == 3 && value.kind() == SyntaxKind::STRING).then_some(value)
     }
 
     /// The argument when it is a string literal alone: a span's name.
-    fn string(&self) -> Option<ast::Token<'t>> {
+    pub(super) fn string(&self) -> Option<ast::Token<'t>> {
         let [Some(it), None, None] = self.first else { return None };
         (self.len == 1 && it.kind() == SyntaxKind::STRING).then_some(it)
     }
 }
 
 /// Calls `each` with each argument of the list `tt`, in order.
-fn each_arg<'t>(tt: ast::TokenTree<'t>, mut each: impl FnMut(&Arg<'t>)) {
+pub(super) fn each_arg<'t>(tt: ast::TokenTree<'t>, mut each: impl FnMut(&Arg<'t>)) {
     let mut arg = Arg::NONE;
     for child in tt.syntax().children_with_tokens() {
         let token = match child.into_token() {
@@ -351,7 +361,7 @@ fn each_arg<'t>(tt: ast::TokenTree<'t>, mut each: impl FnMut(&Arg<'t>)) {
 }
 
 /// A string literal's text without its quotes; anything else as it is.
-fn unquoted(text: &str) -> &str {
+pub(super) fn unquoted(text: &str) -> &str {
     text.strip_prefix('"').and_then(|it| it.strip_suffix('"')).unwrap_or(text)
 }
 
