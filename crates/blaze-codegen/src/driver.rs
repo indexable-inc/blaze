@@ -2855,7 +2855,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         self.static_callees =
             statics.values().flat_map(|it| it.refs.iter().filter_map(callee)).collect();
         if !out.errors.is_empty() {
-            let errors = out.finish(names_of(&nodes, Some(&statics))).errors;
+            let errors = out.finish(names_of::<_, _, B>(&nodes, Some(&statics))).errors;
             // A refused build is still the last run, as one whose compiles failed is: a lazy or
             // live compile after it never reads an earlier build's walk.
             // alloc: once per build, the walk its `Later` holds
@@ -2947,7 +2947,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             Err(why) => {
                 let item = nodes.get(&why.unit()).map_or(why.item(), |it| it.unit.item);
                 out.errors.push(error(why.unit(), item, why.to_string()));
-                return Err(out.finish(names_of(&nodes, Some(&statics))).errors);
+                return Err(out.finish(names_of::<_, _, B>(&nodes, Some(&statics))).errors);
             }
         };
         out.statics.sort_by_key(|it| (it.item, it.instance));
@@ -3039,7 +3039,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             used,
             kernel,
             misses,
-        } = out.finish(names_of(&nodes, Some(&statics)));
+        } = out.finish(names_of::<_, _, B>(&nodes, Some(&statics)));
         // alloc: once per build, the walk its `Later` and the kept walk share
         let nodes = Arc::new(nodes);
         // clone: a reference count, once per build
