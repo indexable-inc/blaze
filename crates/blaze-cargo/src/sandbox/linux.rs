@@ -3809,6 +3809,8 @@ for it in "$OUT"/*; do :; done
         let text = calls::said(&said, "random");
         assert!(text.contains("by process") && text.contains("argv[0] `head`"), "{text}");
         _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The variable that has the launcher's child ask the kernel for randomness between its
     /// filter's install and its exec, as an allocator seeding a heap there would.
     pub(super) const PLANT_WINDOW: &[u8] = b"__BLAZE_TEST_WINDOW_SEED=";
