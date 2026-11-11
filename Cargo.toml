@@ -257,9 +257,9 @@ blake3.opt-level = 3
 blaze-codegen-code.opt-level = 3
 
 # The tier 0 scripts as the script action caches them (.github/actions/script/build.sh): dev's
-# opt-levels (the scripts and their parsers at 3, above) without debug info, which made each
-# binary ~150 MB and a cache entry of ten ~1.5 GB. No `strip`: blaze's linker strips nothing
-# (`strip` only lowers to debug info in blaze-units), so `debug = false` is the whole of it.
+# opt-levels (the scripts and their parsers at 3, above) without debug info of their own. No
+# `strip`: blaze-link does not honour it yet (ledger D44), so build.sh strips the shipped
+# standard library's DWARF, ~138 MB of each binary, in the meantime.
 # Every setting here is in the action's key: key.sh hashes the root Cargo.toml's profiles.
 [profile.script]
 inherits = "dev"

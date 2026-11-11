@@ -22,6 +22,9 @@
 # - the environment: build.sh unsets every variable cargo or blaze reads from the caller
 #   (engine.py's SCRUBBED), so none is an input;
 # - this action's own files, which make the binaries.
+# Not an input: the `strip` build.sh runs in the meantime (ledger D44) and its version. It only
+# removes debug sections, which no script reads, so what a script does is the same whichever
+# strip ran; a different strip makes different bytes, never a different behaviour.
 set -euo pipefail
 
 sha() { if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 256; fi; }

@@ -29,6 +29,18 @@ unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS RUSTDOCFLAGS RUSTC RUSTC_WRAPPER RUSTC_W
   CARGO_BUILD_TARGET CARGO_BUILD_JOBS CARGO_INCREMENTAL BLAZE_BACKEND BLAZE_OPT BLAZE_EMIT
 for name in $(env | sed -nE 's/^(CARGO_PROFILE_[A-Z0-9_]*|CARGO_TARGET_[A-Z0-9_]*)=.*/\1/p'); do unset "$name"; done
 
+# Interim (ledger D44, the piece being built): each binary's debug sections are stripped after
+# the copy, by the runner's own binutils (`strip --strip-debug` on Linux, `strip -S` on macOS).
+# A dev link carries the shipped standard library's DWARF, ~138 MB of each ~145 MB binary, which
+# no profile setting drops and blaze-link cannot leave out yet.
+# when blaze-link honours strip (ledger D44): remove this and set strip in [profile.script]
+case "$(uname -s)" in
+  Linux) strip_debug=(strip --strip-debug) ;;
+  Darwin) strip_debug=(strip -S) ;;
+  *) die "no way to strip debug sections on $(uname -s): only Linux (binutils) and macOS are known" ;;
+esac
+command -v "${strip_debug[0]}" >/dev/null || die "no \`${strip_debug[0]}\` on PATH, which strips the scripts' debug sections (\`${strip_debug[*]}\`); install binutils"
+
 unset CARGO_TARGET_DIR
 said="$dir.build.json"
 mkdir -p "$(dirname "$dir")"
@@ -45,6 +57,7 @@ for src in scripts/src/bin/*.rs; do
   [ "$(echo "$found" | wc -l)" = 1 ] || die "blaze build -p scripts --bins named more than one executable \`$name\`: $(echo "$found" | tr '\n' ' ')"
   [ -x "$found" ] || die "the build named $found for \`$name\`, which is no executable file"
   cp "$found" "$fresh/$name"
+  "${strip_debug[@]}" "$fresh/$name" || die "\`${strip_debug[*]} $fresh/$name\` failed"
 done
 echo "$key" > "$fresh/KEY"
 rm -rf "$dir"
