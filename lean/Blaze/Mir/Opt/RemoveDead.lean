@@ -231,8 +231,8 @@ theorem Ordered.dest_lt (fr : Frame) (rest : List Frame) (h : Ordered (fr :: res
   have own : c.dest.frame < c.id := Ordered.own (fr :: rest) h c m
   cases List.mem_cons.mp m with
   | inl e =>
-    rw [e] at own
-    exact own
+    rw [e]
+    exact And.left h'
   | inr m' =>
     have lt : c.id < fr.id := And.left (And.right h') c m'
     omega
@@ -678,6 +678,8 @@ theorem callOn_fn_all (sig : FnId → Option FnSig) (st : State) (id : FnId) (ar
   cases hs : sig id with
   | none => exact Outcome.all_undefined _ _
   | some s =>
+    show Outcome.All (fun (n : Next) => ∃ s, n = Next.state (enterState st id s args dest target))
+      (st.enter id s args dest target)
     by_cases hl : args.length = s.args
     · rw [State.enter_eq, if_pos hl]
       exact Outcome.all_ok (Exists.intro s rfl)
