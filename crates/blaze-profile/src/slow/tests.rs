@@ -152,6 +152,33 @@ fn what_the_last_build_lost_is_the_first_finding() {
     assert!(without.findings.iter().all(|it| it.kind != Kind::NotKept), "{:#?}", without.findings);
 }
 
+/// What blaze said was wrong in a build is listed before its findings, each once with its
+/// count, and a build that said nothing lists nothing.
+#[test]
+fn the_problems_blaze_said_come_before_the_findings() {
+    let switches = vec![switch(1, 0, Event::Started, 1), switch(1, 100, Event::Ended, 1)];
+    let spans = vec![span(1, 1, None, "impls publish", 0, 100, 1)];
+    let mut facts = workers(1..=1);
+    facts.problems = vec![Problem {
+        level: "WARN".to_owned(),
+        source: "blaze event crates/blaze-cargo/src/serve/job.rs:3288".to_owned(),
+        what: "a build's results were not kept after its answer was sent: two images".to_owned(),
+        count: 12,
+        first_ns: 400_000_000,
+        last_ns: 900_000_000,
+    }];
+    let it = report(switches.clone(), spans.clone(), 100, &facts);
+    assert_eq!(it.problems, facts.problems);
+    let said = text(&it, 10);
+    let problems = said.find("problems blaze said in it: 1 (`blaze explain problems build=").unwrap();
+    assert!(said.contains("    WARN x12 from 0.4 s: a build's results were not kept"), "{said}");
+    assert!(problems < said.find("critical path").unwrap(), "before the path and findings: {said}");
+
+    facts.problems.clear();
+    let quiet = text(&report(switches, spans, 100, &facts), 10);
+    assert!(!quiet.contains("problems blaze said"), "{quiet}");
+}
+
 fn finding(report: &Report, kind: Kind) -> &Finding {
     report
         .findings
@@ -617,7 +644,13 @@ fn every_query_of_slow_is_answered_and_the_stacks_are_the_commonest_of_each_span
             (NULL::UBIGINT, 8::UINTEGER, 'live bytes', 900::BIGINT, 5::DOUBLE), \
             (1, 8, 'live bytes', 1010, 7), (1, 8, 'live bytes', 1050, 9), \
             (NULL, 8, 'profile spans made', 900, 1), (1, 8, 'profile spans made', 1090, 3)) \
-            AS t(build_id, process, name, t_ns, value)) TO '{d}/1-00000001.counters.parquet';\n";
+            AS t(build_id, process, name, t_ns, value)) TO '{d}/1-00000001.counters.parquet';\n\
+         COPY (SELECT * FROM (VALUES \
+            (1::UBIGINT, 8::UINTEGER, 10::UINTEGER, 1020::BIGINT, 'WARN', 'blaze', 'event job.rs:9', 'results were not kept: a', 1::UBIGINT), \
+            (NULL, 8, 10, 1105, 'WARN', 'blaze', 'event job.rs:9', 'results were not kept: b', 2), \
+            (1, 8, 10, 1030, 'INFO', 'blaze', 'event job.rs:1', 'fine', 3), \
+            (1, 8, 10, 1040, 'ERROR', 'blaze', 'event stop.rs:5', 'stall', 4)) \
+            AS t(build_id, process, thread, t_ns, level, target, name, message, event_id)) TO '{d}/1-00000001.events.parquet';\n";
     let dir = history_of(&duckdb, "facts", fixture);
     let source = crate::time::load::Source { duckdb: &duckdb, history: &dir };
     let stack = |name: &str, on_cpu, frames: &[&str], samples| SpanStack {
@@ -648,6 +681,21 @@ fn every_query_of_slow_is_answered_and_the_stacks_are_the_commonest_of_each_span
             facts.thread_cpu.iter().map(|it| (it.process, it.thread, it.uncounted)).collect();
         assert_eq!(cpu, [(8, 10, 2)], "window {window:?}");
         assert!(facts.misses.is_empty() && facts.query_counts.is_empty(), "window {window:?}");
+        // What the daemon said was wrong, worst first, each callsite once: the line said after
+        // the build's answer (of no build) is the build's, and an INFO event is no problem.
+        let problems: Vec<(&str, &str, &str, u64)> = facts
+            .problems
+            .iter()
+            .map(|it| (it.level.as_str(), it.source.as_str(), it.what.as_str(), it.count))
+            .collect();
+        assert_eq!(
+            problems,
+            [
+                ("ERROR", "blaze event stop.rs:5", "stall", 1),
+                ("WARN", "blaze event job.rs:9", "results were not kept: b", 2),
+            ],
+            "window {window:?}"
+        );
         if window.is_some() {
             let memory = (facts.memory.live_before, facts.memory.live_first, facts.memory.live_peak);
             assert_eq!(memory, (Some(5), Some(7), Some(9)), "the window's memory");

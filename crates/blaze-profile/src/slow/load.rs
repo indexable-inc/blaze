@@ -5,8 +5,8 @@
 use arrow_array::RecordBatch;
 
 use super::{
-    BuildFacts, Died, DiedSpan, DiedThread, Facts, Memory, MissGroup, PanicFacts, QueryCount,
-    Recorder, Report, STACKS, SpanKind, SpanStack, ThreadCpu, ThreadName, analyse,
+    BuildFacts, Died, DiedSpan, DiedThread, Facts, Memory, MissGroup, PanicFacts, Problem,
+    QueryCount, Recorder, Report, STACKS, SpanKind, SpanStack, ThreadCpu, ThreadName, analyse,
 };
 use crate::time::{
     TimeError,
@@ -164,6 +164,7 @@ pub fn facts(
         query_counts_sql(build),
         span_stacks_sql(build, window, &of, &spans),
         thread_cpu_sql(&spans),
+        problems_sql(Some(build), PROBLEMS)?,
     ];
     if let Some((memory, recorder)) = &windowed {
         // clone: a query, once a report
@@ -178,7 +179,7 @@ pub fn facts(
         source,
         crate::sql::Scope::All,
         &asked,
-        "reading the build's row, threads, spans by name, misses, query counts, sampled stacks by span, threads' CPU, memory and recorder",
+        "reading the build's row, threads, spans by name, misses, query counts, sampled stacks by span, threads' CPU, problems, memory and recorder",
     )?;
     let answer = |i: usize| answers.get(i).map(Vec::as_slice).unwrap_or_default();
     Ok(Facts {
@@ -189,10 +190,80 @@ pub fn facts(
         query_counts: query_counts(answer(4))?,
         span_stacks: span_stacks(answer(5))?,
         thread_cpu: thread_cpu(answer(6))?,
-        memory: if windowed.is_some() { memory(answer(7))? } else { Memory::default() },
-        recorder: if windowed.is_some() { recorder(answer(8))? } else { Recorder::default() },
+        problems: problems(answer(7))?,
+        memory: if windowed.is_some() { memory(answer(8))? } else { Memory::default() },
+        recorder: if windowed.is_some() { recorder(answer(9))? } else { Recorder::default() },
         spans: crate::time::SpanCut::default(),
     })
+}
+
+/// The most problems a report reads of a build: each is one callsite, so a build past it is one
+/// whose every part says something is wrong, and the view's own count says how many.
+const PROBLEMS: u64 = 64;
+
+/// The `problems` view (`sql/examples.sql`, the one definition of what a problem is) of `build`,
+/// or of the last build, at most `limit` rows, with its columns as the loaders read them.
+pub fn problems_sql(build: Option<u64>, limit: u64) -> Result<String, TimeError> {
+    let failed = |error| TimeError::Sql {
+        doing: "binding the `problems` view",
+        error: crate::sql::SqlError::Views(error),
+    };
+    let view = crate::views::find("problems").map_err(failed)?;
+    let mut args = serde_json::Map::new();
+    match build {
+        // alloc: an argument's name, once a report
+        Some(build) => args.insert("build".to_owned(), serde_json::Value::from(build)),
+        // The last build alone: the view's `builds` counts builds back from the last.
+        // alloc: an argument's name, once a report
+        None => args.insert("builds".to_owned(), serde_json::Value::from(1u64)),
+    };
+    // alloc: an argument's name, once a report
+    args.insert("limit".to_owned(), serde_json::Value::from(limit));
+    let sql = crate::views::render(view, &args).map_err(failed)?;
+    // alloc: a query, once a report
+    Ok(format!(
+        "SELECT CAST(build_id AS UBIGINT) AS build_id, CAST(level AS VARCHAR) AS level, CAST(source AS VARCHAR) AS source, \
+         CAST(what AS VARCHAR) AS what, CAST(count AS UBIGINT) AS count, \
+         CAST(first_ms * 1e6 AS BIGINT) AS first_ns, CAST(last_ms * 1e6 AS BIGINT) AS last_ns FROM ({sql})"
+    ))
+}
+
+/// What [`problems_sql`]'s answer says, in the view's order: each with its build.
+pub fn problems_by_build(batches: &[RecordBatch]) -> Result<Vec<(u64, Problem)>, TimeError> {
+    // alloc: once a report
+    let mut out = Vec::new();
+    for (batch, row) in rows(batches) {
+        const T: &str = "problems";
+        out.push((
+            uint(batch, T, "build_id", row)?.unwrap_or(0),
+            Problem {
+                level: text(batch, T, "level", row)?.unwrap_or_default(),
+                source: text(batch, T, "source", row)?.unwrap_or_default(),
+                what: text(batch, T, "what", row)?.unwrap_or_default(),
+                count: uint(batch, T, "count", row)?.unwrap_or(0),
+                first_ns: int(batch, T, "first_ns", row)?.unwrap_or(0),
+                last_ns: int(batch, T, "last_ns", row)?.unwrap_or(0),
+            },
+        ));
+    }
+    Ok(out)
+}
+
+fn problems(batches: &[RecordBatch]) -> Result<Vec<Problem>, TimeError> {
+    Ok(problems_by_build(batches)?.into_iter().map(|(_, it)| it).collect())
+}
+
+/// The problems of `build` (the last build to start when `None`) alone, for a command that
+/// reads nothing else of the profile (`blaze why`): the build they are of, and each.
+pub fn problems_of(
+    source: &Source<'_>,
+    build: Option<u64>,
+) -> Result<(Option<u64>, Vec<Problem>), TimeError> {
+    let sql = problems_sql(build, PROBLEMS)?;
+    let batches = query(source, &sql, "reading what blaze said was wrong in the build")?;
+    let rows = problems_by_build(&batches)?;
+    let of = build.or_else(|| rows.first().map(|(build, _)| *build));
+    Ok((of, rows.into_iter().map(|(_, it)| it).collect()))
 }
 
 /// The [`STACKS`] commonest stacks, on and off the CPU, of the samples inside the build's

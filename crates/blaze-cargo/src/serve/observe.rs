@@ -544,6 +544,7 @@ pub fn keep_history(
                     history.record_panics();
                     if let Err(why) = blaze_profile::crash::arm(&at) {
                         tracing::warn!("{why}");
+                        // logged: the warn event above
                         eprintln!("blaze serve: {why}");
                     }
                     // The recorder's rows outlive a crash from here on: the next daemon writes

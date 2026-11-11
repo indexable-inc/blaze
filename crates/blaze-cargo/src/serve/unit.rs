@@ -375,7 +375,7 @@ impl Steps for Real {
                                     let variable = "";
                                     let _span =
                                 tracing::info_span!(target: "blaze", "kept front end let go", checkout, why, variable).entered();
-                                    eprintln!(
+                                    crate::serve::said::logged!(WARN,
                                         "blaze serve: the kept front end of {checkout} is let go, and its build lowers anew: {why}"
                                     );
                                     drop((session, lowered, seeds));
@@ -640,7 +640,7 @@ fn let_go(kept: KeptLowered, why: &str, variable: Option<&str>) {
     let _span =
         tracing::info_span!(target: "blaze", "kept front end let go", checkout, why, variable)
             .entered();
-    eprintln!(
+    crate::serve::said::logged!(WARN,
         "blaze serve: the kept front end of {checkout} is let go, and its build lowers anew: {why}"
     );
     drop(kept);
@@ -1235,7 +1235,7 @@ impl<T> Drop for Held<T> {
         if let Some(it) = self.it.take()
             && let Err(panic) = dropped(it)
         {
-            eprintln!(
+            crate::serve::said::logged!(ERROR,
                 "blaze serve: letting go of {} {panic}; the daemon goes on, the memory it held may be lost",
                 self.what
             );

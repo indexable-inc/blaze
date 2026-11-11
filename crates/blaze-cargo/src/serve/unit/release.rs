@@ -344,7 +344,7 @@ impl Release<Crate> {
         // One line each release in the daemon's log, on its standard error as the memory line
         // is: why, what went, blaze's memory before and after against the limit (B5), and the
         // query storage's largest holders.
-        eprintln!(
+        crate::serve::said::logged!(INFO,
             "blaze serve: {}",
             Said {
                 crates: crates.len(),

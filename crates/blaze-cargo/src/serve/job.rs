@@ -3281,6 +3281,7 @@ impl<S: Steps> Jobs<S> {
     /// kept for the checkout's next build or check, whose `blaze why` says it ([`Roots::lost`]).
     fn lose(&mut self, job: JobId, command: &str, checkout: Option<&str>, what: String) {
         let of = checkout.unwrap_or("no checkout");
+        // logged: the warn event below, with the job, command and checkout as fields
         eprintln!(
             "blaze serve: the results of `{command}` in {of} (job {job}) were not kept after its answer was sent: {what}"
         );
@@ -4056,12 +4057,12 @@ impl<S: Steps> Jobs<S> {
             for (root, &id) in self.roots.ids.iter() {
                 if let Some(front) = self.roots.fronts[id as usize].take() {
                     match why {
-                        LetGo::Short(short) => eprintln!(
+                        LetGo::Short(short) => crate::serve::said::logged!(WARN,
                             "blaze serve: the kept front end of {root} is let go, and its next build lowers anew: \
                              a task waits for {:.2} GiB the process holds besides its tasks",
                             short as f64 / f64::from(1u32 << 30)
                         ),
-                        LetGo::Pressure => eprintln!(
+                        LetGo::Pressure => crate::serve::said::logged!(WARN,
                             "blaze serve: the kept front end of {root} is let go, and its next build lowers anew: \
                              the system says memory is short"
                         ),

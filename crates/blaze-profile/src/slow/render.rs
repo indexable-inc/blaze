@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 
-use super::{Died, DiedThread, Estimate, PanicFacts, Report, StackSeen, s};
+use super::{Died, DiedThread, Estimate, PanicFacts, Problem, Report, StackSeen, s};
 
 /// `report` as text, the first `top` findings and blind spots of each.
 pub fn text(report: &Report, top: usize) -> String {
@@ -32,6 +32,7 @@ pub fn text(report: &Report, top: usize) -> String {
         died_text(died, top, &mut out);
     }
     panics_text(&b.panics, top, &mut out);
+    problems_text(&report.problems, b.id, top, &mut out);
     // alloc: a line
     let links: Vec<String> =
         sum.path_by_link.iter().map(|it| format!("{} {}", it.name, s(it.ns))).collect();
@@ -107,6 +108,32 @@ pub fn text(report: &Report, top: usize) -> String {
         b.id
     );
     out
+}
+
+/// What blaze itself said was wrong in the build, the first `top`, before anything the profile
+/// was read for: `problems blaze said in it: 2 (blaze explain problems build=7)`, then a line
+/// each, `WARN x12 from 0.4 s: <what> (<source>)`. Nothing for a build that said none. Shared
+/// with `blaze why`, which lists the same lines first.
+pub fn problems_text(problems: &[Problem], build: u64, top: usize, out: &mut String) {
+    if problems.is_empty() {
+        return;
+    }
+    _ = writeln!(
+        out,
+        "  problems blaze said in it: {} (`blaze explain problems build={build}`)",
+        problems.len()
+    );
+    for it in problems.iter().take(top) {
+        _ = write!(out, "    {}", it.level);
+        if it.count > 1 {
+            _ = write!(out, " x{}", it.count);
+        }
+        _ = writeln!(out, " from {}: {} ({})", s(it.first_ns), it.what, it.source);
+    }
+    let hidden = problems.len().saturating_sub(top);
+    if hidden > 0 {
+        _ = writeln!(out, "    ({hidden} more problems past --top)");
+    }
 }
 
 /// The frames a stack line shows, innermost first.

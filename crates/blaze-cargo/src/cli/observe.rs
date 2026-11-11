@@ -294,21 +294,58 @@ fn rebuilt(words: Vec<OsString>) -> Result<(), Refusal> {
     let Some(rebuilt) = answer else {
         return Err(Refusal::Failed("the daemon answered `blaze why` with no answer".to_owned()));
     };
+    // What blaze itself said was wrong in that build comes first (the `problems` view): a
+    // build whose daemon said its results were not kept, or that a job panicked, computed
+    // again for that, whatever each item's own reason reads as.
+    let problems = problems_of(rebuilt.build);
     if json {
-        println!(
-            "{}",
-            serde_json::to_string(&rebuilt)
-                .map_err(|error| format!("`blaze why`'s answer as JSON: {error}"))?
-        );
+        let mut answer = serde_json::to_value(&rebuilt)
+            .map_err(|error| format!("`blaze why`'s answer as JSON: {error}"))?;
+        if let Value::Object(answer) = &mut answer {
+            let (key, value) = match &problems {
+                Ok(problems) => ("problems", serde_json::to_value(problems)),
+                Err(why) => ("problems_unread", serde_json::to_value(why)),
+            };
+            let value =
+                value.map_err(|error| format!("`blaze why`'s problems as JSON: {error}"))?;
+            answer.insert(key.to_owned(), value);
+        }
+        println!("{answer}");
         return Ok(());
     }
     let mut text = String::new();
+    match (&problems, rebuilt.build) {
+        (Ok(problems), Some(build)) if !problems.is_empty() => {
+            // Writing to a String cannot fail.
+            _ = writeln!(text, "build {build}:");
+            slow::problems_text(problems, build, 10, &mut text);
+        }
+        (Ok(_), _) => {}
+        (Err(why), _) => {
+            _ = writeln!(
+                text,
+                "note: what blaze said was wrong in that build was not read ({why}): `blaze explain problems` reads it"
+            );
+        }
+    }
     match unexplained {
         true => blaze_ui::why::unexplained(&mut text, &rebuilt),
         false => blaze_ui::why::lines(&mut text, &rebuilt),
     }
     print!("{text}");
     Ok(())
+}
+
+/// What blaze said was wrong in `build` (`blaze explain problems build=N`), for `blaze why` to
+/// say first; none for no build. An error says why they were not read: `blaze why` answers
+/// from the daemon's ledger either way, and says the problems were not read.
+fn problems_of(build: Option<u64>) -> Result<Vec<slow::Problem>, String> {
+    let Some(build) = build else { return Ok(Vec::new()) };
+    let (duckdb, dir) = history_paths()?;
+    let source = load::Source { duckdb: &duckdb, history: &dir };
+    slow::load::problems_of(&source, Some(build))
+        .map(|(_, problems)| problems)
+        .map_err(|error| error.to_string())
 }
 
 /// Why the build this process asked for recomputed what it did, as the daemon sums it up once

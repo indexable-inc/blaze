@@ -988,8 +988,9 @@ pub(super) fn log_memory(memory: &blaze_mem::tag::Snapshot) {
     let chunks = blaze_mem::chunks::cached();
     let stacks = blaze_query::db::stack_high_water();
     let said = MemoryLine { memory, blocks: &blocks, resident, heap, chunks, stacks }.to_string(); // alloc: one line each MEMORY_LOG_EVERY and at stop
+    // logged: the info event below
     eprintln!("blaze serve: {said}");
-    tracing::info!("{said}");
+    tracing::info!(target: "blaze", "{said}");
 }
 
 /// Why a start's database is empty.
@@ -2370,7 +2371,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             Done::Unwatched => self.pressure_watched = false,
             Done::Failed(IoError(why)) => {
                 self.pressure_watched = false;
-                eprintln!(
+                crate::serve::said::logged!(WARN,
                     "blaze serve: no memory pressure source is watched, so the daemon admits by \
                      its budget alone: {why}"
                 );

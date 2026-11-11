@@ -35,6 +35,7 @@ pub mod observe;
 pub(crate) mod once;
 mod plane;
 mod pulse;
+pub(crate) mod said;
 pub mod settings;
 pub(crate) mod signals;
 mod still;

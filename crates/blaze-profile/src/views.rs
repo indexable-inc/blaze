@@ -77,6 +77,11 @@ const ENDED_BUILD: Arg = Arg {
     default: Some("(SELECT max(build_id) FROM builds WHERE dur_ns IS NOT NULL)"),
 };
 const LIMIT: Arg = Arg { name: "limit", ty: ArgType::U64, default: Some("20") };
+/// One build, or none: a view over the last builds (`problems`) reads them all unless one is
+/// named.
+const ANY_BUILD: Arg = Arg { name: "build", ty: ArgType::U64, default: Some("NULL") };
+/// How many of the last builds a view of several builds reads when no build is named.
+const BUILDS: Arg = Arg { name: "builds", ty: ArgType::U64, default: Some("5") };
 const EARLIER: Arg = Arg { name: "earlier", ty: ArgType::Text, default: None };
 const LATER: Arg = Arg { name: "later", ty: ArgType::Text, default: None };
 /// The build a key is diffed against: by default, the last at or before the one before the
@@ -138,6 +143,7 @@ pub const VIEWS: &[View] = &[
     const { view("errors_by_kind", &[ENDED_BUILD]) },
     const { view("link_regions", &[BUILD]) },
     const { view("link_code", &[BUILD]) },
+    const { view("problems", &[ANY_BUILD, BUILDS, LIMIT]) },
 ];
 
 /// The view named `name`.

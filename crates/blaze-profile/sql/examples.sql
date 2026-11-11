@@ -839,3 +839,49 @@ WITH code AS (
 SELECT image, generation, whole, summed_by, what, pieces, code_bytes
 FROM code
 ORDER BY image, generation, summed_by, code_bytes DESC, what
+
+-- name: problems
+-- says: what blaze itself said was wrong, newest build first, each thing once with how often (`count`) and when in its build (`first_ms`, `last_ms` from the build's start, past its end for what was said after its answer): every event at WARN or ERROR (each line the daemon writes to its log is one), by callsite with its last message and fields; each panic and fatal signal; each `blaze-bug` and `daemon-panic` error; and a build that failed, stalled or crashed. An event of no build is the last build's to start before it. `build`: one build; unset, the last `builds` (5) builds
+WITH picked AS (
+    SELECT build_id AS picked_build, started_ns AS t0
+    FROM builds
+    WHERE CASE WHEN $build IS NULL THEN build_id > (SELECT max(build_id) FROM builds) - $builds ELSE build_id = $build END
+), said AS (
+    SELECT build_id AS tagged, t_ns AS said_ns, CAST(level AS VARCHAR) AS severity,
+        CAST(target AS VARCHAR) || ' ' || CAST(name AS VARCHAR) AS source,
+        coalesce(message, '') || coalesce(' [' || fields || ']', '') AS said_what
+    FROM events_wide
+    WHERE level IN ('ERROR', 'WARN')
+    UNION ALL
+    SELECT build_id, t_ns, CASE WHEN kind = 'signal' THEN 'FATAL' ELSE 'PANIC' END,
+        CASE WHEN kind = 'signal' THEN 'signal ' || coalesce(CAST(signal AS VARCHAR), '?') ELSE 'panic at ' || coalesce(location, '?') END,
+        coalesce(message, '')
+    FROM panics
+    UNION ALL
+    SELECT build_id, t_ns, 'BUG', CAST(kind AS VARCHAR) || coalesce(' ' || function, ''), message || coalesce(': ' || detail, '')
+    FROM errors
+    WHERE kind IN ('blaze-bug', 'daemon-panic')
+    UNION ALL
+    SELECT build_id, started_ns + coalesce(dur_ns, 0), 'BUILD', 'outcome', 'the build ' || CAST(outcome AS VARCHAR) || ': `' || command || '`'
+    FROM builds
+    WHERE outcome IN ('failed', 'stalled', 'crashed')
+), tied AS (
+    SELECT coalesce(said.tagged, earlier.earlier_build) AS of_build, said.said_ns, said.severity, said.source, said.said_what
+    FROM said ASOF LEFT JOIN (SELECT build_id AS earlier_build, started_ns AS earlier_ns FROM builds) AS earlier
+        ON said.said_ns >= earlier.earlier_ns
+)
+SELECT
+    tied.of_build AS build_id,
+    tied.severity AS level,
+    tied.source,
+    arg_max(tied.said_what, coalesce(tied.said_ns, 0)) AS what,
+    count(*) AS count,
+    round((min(tied.said_ns) - picked.t0) / 1e6, 1) AS first_ms,
+    round((max(tied.said_ns) - picked.t0) / 1e6, 1) AS last_ms
+FROM tied
+JOIN picked ON picked.picked_build = tied.of_build
+GROUP BY tied.of_build, tied.severity, tied.source, picked.t0
+ORDER BY tied.of_build DESC,
+    CASE tied.severity WHEN 'FATAL' THEN 0 WHEN 'PANIC' THEN 1 WHEN 'BUG' THEN 2 WHEN 'BUILD' THEN 3 WHEN 'ERROR' THEN 4 ELSE 5 END,
+    count(*) DESC, tied.source
+LIMIT $limit

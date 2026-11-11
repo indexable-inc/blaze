@@ -38,7 +38,7 @@ use crate::time::{
     report,
 };
 
-pub use render::{text, thread_line};
+pub use render::{problems_text, text, thread_line};
 
 /// The version of the report's JSON: bumped when a field changes meaning or goes away. 2: an
 /// unnamed wait's `hidden_ns` is the wall its waits cover, not their parked time summed, and
@@ -52,8 +52,9 @@ pub use render::{text, thread_line};
 /// unnamed wait; the workers' CPU counts every span, read or not.
 /// 6: `build.panics`, the build's panics and its daemon's fatal signal, each with its stack's
 /// top frames. 7: a build whose checkout's last build lost what it left for the store has the
-/// finding `not_kept` (fix `keep_results`), ranked first.
-pub const VERSION: u32 = 7;
+/// finding `not_kept` (fix `keep_results`), ranked first. 8: `problems`, what blaze itself said
+/// was wrong during the build (the `problems` view's rows), listed before the findings.
+pub const VERSION: u32 = 8;
 
 /// The `step` of the misses row a build takes when its checkout's last build answered and
 /// then lost what it left for the store (blaze-cargo's `Jobs::lose`): the daemon lowers this
@@ -136,10 +137,34 @@ pub struct DiedSpan {
     pub for_ns: i64,
 }
 
+/// One thing blaze itself said was wrong in the build, once however often it said it: a row of
+/// the `problems` view (`sql/examples.sql`): a WARN or ERROR event by callsite (every line the
+/// daemon writes to its log is one), a panic, a fatal signal, a `blaze-bug`, or the build's own
+/// failure. `blaze slow`, `blaze why` and `blaze explain problems` list them first: on
+/// 2026-11-10 the daemon wrote that a build's results were not kept after every build for hours,
+/// to a log no command read.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct Problem {
+    /// FATAL, PANIC, BUG, BUILD, ERROR or WARN.
+    pub level: String,
+    /// Where it was said: an event's target and callsite, a panic's location, an error's kind.
+    pub source: String,
+    /// The last thing said there, with its fields.
+    pub what: String,
+    /// How often it was said in the build.
+    pub count: u64,
+    /// When it was first and last said, from the build's start; past the build's end for what
+    /// was said after its answer was sent.
+    pub first_ns: i64,
+    pub last_ns: i64,
+}
+
 /// What the report reads beside the time model.
 #[derive(Clone, Debug, Default)]
 pub struct Facts {
     pub build: BuildFacts,
+    /// What blaze said was wrong in the build, worst first ([`Problem`]).
+    pub problems: Vec<Problem>,
     /// The threads' names.
     pub threads: Vec<ThreadName>,
     /// The spans in the build's window by name and query kind.
@@ -286,6 +311,9 @@ pub struct Memory {
 pub struct Report {
     pub version: u32,
     pub build: BuildFacts,
+    /// What blaze itself said was wrong in the build, worst first, each once with its count: read
+    /// these before the findings, which are often their cost.
+    pub problems: Vec<Problem>,
     pub summary: Summary,
     /// Ranked: most wall time saved first; those whose saving can't be estimated last.
     /// A `not_kept` finding is before them all.
@@ -573,6 +601,8 @@ pub fn analyse(model: &Model, path: &Path, facts: &Facts) -> Report {
     Report {
         version: VERSION,
         build: facts.build.clone(),
+        // clone: the build's problems, once a report
+        problems: facts.problems.clone(),
         summary: ctx.summary(smaller, cut_ns),
         findings,
         blind_spots: blind,
