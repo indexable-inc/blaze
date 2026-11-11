@@ -811,8 +811,13 @@ mod macos {
         // SAFETY: the section is `count` descriptors, which dyld wrote as it loaded the image
         // and nothing writes after.
         let descriptors = unsafe { std::slice::from_raw_parts(vars.cast::<Descriptor>(), count) };
-        let key = descriptors[0].key;
-        match descriptors.iter().all(|it| it.key == key) {
+        // The key is the word's low half. An image blaze links has the whole word the key
+        // (dyld's `TLVDescriptor`: thunk, key, offset); one Apple's linker makes with the
+        // packed descriptor (macOS 27, 2026-11-11: 393 descriptors, every low half 0x102, the
+        // high halves all different) keeps the key in the low 32 bits and the variable's own
+        // number above it. A `pthread` key is below 768 either way.
+        let key = descriptors[0].key & 0xffff_ffff;
+        match descriptors.iter().all(|it| it.key & 0xffff_ffff == key) {
             true => Ok(key),
             false => Err(Outcome::KeysDiffer),
         }

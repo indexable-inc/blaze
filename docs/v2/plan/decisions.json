@@ -152,6 +152,22 @@
    "why": "The agent said LLVM was most of an 80-minute build without a query; the profile said about 13%.",
    "recommended": "Yes.",
    "state": "done: rule 61 on main (#2052)"
+  },
+  {
+   "id": "D20",
+   "date": "2026-11-11",
+   "decision": "Interim: cargo with the pinned nightly builds, checks and unit-tests blaze in the dev loop, and a cargo-built blaze is a legal stage 0; blaze still builds blaze daily and for releases, and every claim about blaze's behaviour is measured with a blaze.",
+   "why": "Andrew, 2026-11-11: \"ideally we can build with cargo until blaze is fast\". cargo check passes after three small fixes; a release build takes 292 s on the Mac against about 80 minutes and 175 GB for blaze building blaze.",
+   "recommended": "Yes, with the conditions in rule blaze-builds-blaze; back to blaze-only when a warm self-rebuild is under a minute.",
+   "state": "done: rule changed; the cargo-built blaze of all-1111 runs hello-world on macOS"
+  },
+  {
+   "id": "D21",
+   "date": "2026-11-11",
+   "decision": "The bar is makepad's Relax, measured head to head on one machine and kept in the gate, and blaze has to be categorically better: a body edit patched in under 20 ms, a save rerunning only the tests it reaches, a cold start that is a download from a store shared across machines, optimized code faster than rustc --release, hundreds of cores, the whole language.",
+   "why": "Andrew, 2026-11-11: \"we strictly need better compile times and faster code than our competitor\", \"we need to be categorically better\". Relax publishes 50 to 200 ms save-to-patch and optimized code 1.14 to 2.29 times slower than rustc --release.",
+   "recommended": "Yes; these are targets, none is measured yet.",
+   "state": "harness to build"
   }
  ]
 }
