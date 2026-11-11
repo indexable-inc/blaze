@@ -1,6 +1,7 @@
-"""determinism.py: every corpus build twice, on different core counts, byte for byte the same
-(docs/v2/plan.md, "Deterministic", and docs/v2/plan.md). Linux only: a build is
-pinned to its cores with the scheduler's affinity, as `taskset -c` pins one.
+"""determinism.py: every corpus build twice, on different core counts, byte for byte the same,
+and one program's functions taken from the store another program's build filled, each computed
+again to the same bytes (docs/v2/plan.md, "Deterministic", and docs/v2/plan.md). Linux only: a
+build is pinned to its cores with the scheduler's affinity, as `taskset -c` pins one.
 
     uv run --frozen python harness/v2/determinism.py '{"engine": {"kind": "v2", "blaze": "target/release/blaze"}, "out": "/tmp/determinism.json"}'
     uv run --frozen python harness/v2/determinism.py '{"engine": {...}, "out": "...", "projects": ["ripgrep", "just", "fd"], "cores_a": 4}'
@@ -20,6 +21,7 @@ The input is one JSON object (inline, a file's path, or `-`):
     profiles      dev, release or both (both)
     cores_a       the cores of the first build (2)
     cores_b       the cores of the second (0: every core this script may run on); not cores_a
+    across        also the check across units, below (true)
     keep          keep the work directory (false)
 
 For each project and profile: two cold builds of the same source at the same path, each with an
@@ -29,11 +31,30 @@ empty home (so an empty store and build directory) and its own daemon, the first
 outcome per (project, profile): pass when both builds delivered the same files with the same
 bytes; fail naming each file that differs and where (`engine.first_difference_by`, the
 `blaze-v2-proof` beside the blaze measured), or that is in
-one build only, or when a build failed or was not blaze's. `selftest` checks the comparison, the
-choice of cores and the fixture's workspace and environment without blaze, cargo or the network.
+one build only, or when a build failed or was not blaze's.
+
+Across units (`across units release`): two cold builds on two cores give the same bytes even when a
+key misses an input, as long as both ask for the same things in the same order. What a build
+finds in the store was put there by another build, of another program, which reached each
+function by another way; a key that misses an input then holds one program's code where the
+other's differs (rule keys-cover-every-input). So `harness/v2/across`, two programs over the
+same functions of the standard library, is built in release: `first` into an empty home, then,
+by a new daemon on that home's store, `second` with `BLAZE_VERIFY_STORE=1`, which computes
+every function the store gives it again and refuses one whose bytes are not the stored ones
+(docs/v2/plan/design/verify.md). It passes when `second` builds; it fails naming each function
+refused. `second` is also built into an empty home of its own: the functions that build compiled
+and the one on `first`'s store did not are the ones checked, and none checked is an error, not a
+pass. On 2026-11-11 this found 36 functions of the standard library compiled two ways under one
+key (`alloc::vec::from_elem::<u8>` among them): a release compile kept two requests of one
+function apart by the crate each calling body was compiled in, which follows the order a unit
+reaches its functions in (crates/hir-ty-codegen/v2/release.rs, `Requested`).
+
+`selftest` checks the comparison, the choice of cores, the fixture's workspace and environment
+and how a refusal is read, without blaze, cargo or the network.
 """
 
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -54,6 +75,13 @@ import fixture
 SCRIPT = "determinism.py"
 Profile = Literal["dev", "release"]
 SHOWN = 10
+# The workspace of the check across units, and its outcome's name.
+ACROSS = HERE / "across"
+ACROSS_NAME = "across units release"
+# A function the store check refused (`blaze_store_check::Mismatch`'s words): its name and the
+# key it is stored under.
+REFUSED = re.compile(r"BLAZE_VERIFY_STORE: the store's value of `(.+?)` \(identity ([0-9a-f]{64})\) is not what "
+                     r"computing it again gives")
 
 
 @dataclass(frozen=True)
@@ -67,6 +95,7 @@ class Input:
     profiles: tuple[Profile, ...] = get_args(Profile)
     cores_a: int = 2
     cores_b: int = 0
+    across: bool = True
     keep: bool = False
 
 
@@ -177,6 +206,63 @@ def compare(eng: engine.Engine, rep: report.Report, subject: Subject, top: Path,
             differing=len(found), **numbers)
 
 
+def refused(said: str) -> list[tuple[str, str]]:
+    """Each function a build's output says the store check refused, once, in the order said: its
+    name and the key it is stored under."""
+    return list(dict.fromkeys((name, key) for name, key in REFUSED.findall(said)))
+
+
+def across(eng: engine.Engine, rep: report.Report, top: Path) -> None:
+    """The check across units (the module's text): `first` into an empty home, `second` on that
+    home's store with every hit computed again, `second` into an empty home of its own."""
+    tree, shared, alone = top / "src", top / "home", top / "home-alone"
+    for path in (tree, shared, alone):
+        shutil.rmtree(path, ignore_errors=True)
+    shutil.copytree(ACROSS, tree)
+
+    def build(step: str, home: Path, member: str, check: bool) -> tuple[engine.Ran, str]:
+        """A release build of `member` by a daemon of its own in `home`, and what it is called."""
+        label = f"{ACROSS_NAME}: {step}"
+        env = eng.env(home, None, {"BLAZE_VERIFY_STORE": "1"} if check else None)
+        try:
+            return eng.build(label, tree, env, ["--release", "-p", member, "--message-format=json"]), label
+        finally:
+            eng.stop(tree, env)
+
+    def compiled(ran: engine.Ran, label: str) -> int:
+        lines = engine.worked_lines(ran.stdout)
+        return engine.work_count(label, engine.required(label, lines[0] if lines else None), "compiled")
+
+    first, label = build("`first` into an empty store", shared, "first", False)
+    if first.returncode != 0:
+        rep.add(ACROSS_NAME, "fail", f"{label}: `blaze build` exited {first.returncode}:\n{first.said()}")
+        return
+    second, label = build("`second` on the store `first` filled, every hit computed again", shared, "second", True)
+    found = refused(second.stdout + second.stderr)
+    if found:
+        lines = [f"`{name}` (key {key[:16]})" for name, key in found[:SHOWN]]
+        more = f"\n... and {len(found) - SHOWN} more" if len(found) > SHOWN else ""
+        rep.add(ACROSS_NAME, "fail", f"{len(found)} functions `first`'s build kept in the store are not what `second`'s "
+                "build computes under the same key, so the key misses an input:\n" + "\n".join(lines) + more,
+                differing=len(found))
+        return
+    if second.returncode != 0:
+        rep.add(ACROSS_NAME, "fail", f"{label}: `blaze build` exited {second.returncode}:\n{second.said()}")
+        return
+    on_store = compiled(second, label)
+    cold, label = build("`second` into an empty store", alone, "second", False)
+    if cold.returncode != 0:
+        rep.add(ACROSS_NAME, "fail", f"{label}: `blaze build` exited {cold.returncode}:\n{cold.said()}")
+        return
+    from_nothing = compiled(cold, label)
+    checked = from_nothing - on_store
+    if checked <= 0:
+        raise engine.Failed(f"{ACROSS_NAME}: nothing was checked: `second` compiled {on_store} functions on the store "
+                            f"`first` filled and {from_nothing} from nothing, so it took none from that store")
+    rep.add(ACROSS_NAME, "pass", f"{checked} functions `second` took from the store `first` filled, each computed "
+            "again to the stored bytes", checked=checked, compiled_on_store=on_store, compiled_from_nothing=from_nothing)
+
+
 def fixture_subject(top: Path, seed: str) -> Subject:
     """The oracle's fixture in the state of `seed`, written once into `top/source`, with the
     environment variables that state is built with and, where it asks for one, an empty
@@ -252,6 +338,13 @@ def main(args: Input) -> None:
             each(subject, top)
         if not args.keep:
             shutil.rmtree(top, ignore_errors=True)
+    if args.across:
+        top = work / "across"
+        shutil.rmtree(top, ignore_errors=True)
+        top.mkdir(parents=True)
+        rep.guarded(ACROSS_NAME, lambda: budgets.failing(ACROSS_NAME, lambda: across(eng, rep, top)))
+        if not args.keep:
+            shutil.rmtree(top, ignore_errors=True)
     rep.extra.update(work=str(work), cores_a=len(cores_a), cores_b=len(cores_b), profiles=list(args.profiles))
     rep.finish()
 
@@ -275,6 +368,16 @@ def selftest() -> None:
            == [("b", "differs"), ("c", "only in the second build"), ("d", "only in the first build")],
            "every difference is named, in order")
     expect(profile_dir("dev") == "debug" and profile_dir("release") == "release", "profile directories")
+    one = ("BLAZE_VERIFY_STORE: the store's value of `<A as B>::c::<u8>` (identity " + "ab" * 32 + ") is not what "
+           "computing it again gives: they differ first at byte 9 (stored 0x04, recomputed 0x0c; 5171 bytes stored, "
+           "5259 recomputed); its entry recorded no reads (it is keyed by its whole content)")
+    other = one.replace("ab" * 32, "cd" * 32).replace("::c::<u8>", "::d")
+    expect(refused(f"error: ...\\n  {one}\\n  {other}\n{one}\n") == [("<A as B>::c::<u8>", "ab" * 32),
+                                                                   ("<A as B>::d", "cd" * 32)],
+           "each function refused is read once, in order, from JSON's text and plain text alike")
+    expect(refused("Finished `release` profile [optimized] target(s) in 2.31s") == [], "a build that refused nothing")
+    for path in ("Cargo.toml", "first/Cargo.toml", "first/src/main.rs", "second/Cargo.toml", "second/src/main.rs"):
+        expect((ACROSS / path).is_file(), f"the workspace across units has {path}")
     with tempfile.TemporaryDirectory() as tmp:
         for seed in ("base", "1"):
             top = Path(tmp) / seed

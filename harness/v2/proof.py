@@ -12,7 +12,8 @@ The checks, each a script of this directory run with the same `engine`:
     cases         frontend/cases.py: the front end's cases, each accepted or refused as its header says
     dbsp          dbsp/edits.py: edit sequences of dbsp built incrementally by blaze
     share         share.py: the instance-sharing programs print what Rust guarantees under blaze
-    determinism   determinism.py: two builds on different core counts, byte for byte the same
+    determinism   determinism.py: two builds on different core counts, byte for byte the same, and one
+                  program's store hits computed again in another's build
     tightmemory   tightmemory.py: a build under a tight memory budget finishes, never OOMs
     macroeval     macroeval_corpus.py: blaze-macro-eval's corpus of proc macros
     budgets       budgets.py: the targets of docs/v2/plan/objectives.md
