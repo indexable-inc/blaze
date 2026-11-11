@@ -42,11 +42,12 @@ def bytesValue (bytes : Slice U8) : List Value :=
 def at_ (block : BlockId) (hash : U64) (bytes : Slice U8) (s0 s3 s4 s5 s6 s7 : Slot) : State :=
   { base := [Slot.init (Value.array (bytesValue bytes))],
     stack :=
-      [({ fn := 0, block := block,
+      [({ id := 1, fn := 0, block := block,
           locals :=
             [s0, Slot.init (Value.int ScalarTy.U64 hash),
              Slot.init (Value.ref { frame := 0, slot := 0, path := [] }), s3, s4, s5, s6, s7],
-          dest := { frame := 0, slot := 0, path := [] }, target := none } : Frame)] }
+          dest := { frame := 0, slot := 0, path := [] }, target := none } : Frame)],
+    next := 2 }
 
 /-- The counter `at` (local 3) holding `i`. -/
 def idx (i : Usize) : Slot := Slot.init (Value.int ScalarTy.Usize i)
@@ -226,8 +227,8 @@ theorem read_byte (hash : U64) (bytes : Slice U8) (i : Usize) (s4 s5 s6 s7 : Slo
   have hv : (loopAt 4 hash bytes i s4 s5 s6 s7).read
         { frame := 0, slot := 0, path := [PathElem.index i.val.toNat] } =
       Outcome.ok (Value.int ScalarTy.U8 (bytes.val.get ⟨i.val.toNat, h⟩)) := by
-    show (found Undefined.dangling (nth? (bytesValue bytes) i.val.toNat)).bind
-      (fun inner => Value.project inner []) = _
+    show ((found Undefined.dangling (nth? (bytesValue bytes) i.val.toNat)).bind
+      (fun inner => Value.project inner [])).bind Value.checkLive = _
     rw [hn]
     rfl
   exact execStmt_assign P.adts (loopAt 4 hash bytes i s4 s5 s6 s7) (Place.mk 6 [])

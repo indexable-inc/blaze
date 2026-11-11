@@ -16,8 +16,6 @@ package = false
 
 [tool.uv.workspace]
 members = ["tools/typed-input"]
-# Its own project with its own lock, so torch stays out of this one.
-exclude = ["tools/similar"]
 
 [tool.uv.sources]
 typed-input = { workspace = true }
@@ -44,7 +42,6 @@ include = [
   "harness/incremental.py",
   "harness/keys.py",
   "harness/live_types.py",
-  "harness/norustc/setup.py",
   "harness/own_inputs.py",
   "harness/profile_fixtures.py",
   "harness/profile_gate.py",
@@ -55,9 +52,7 @@ include = [
   "harness/v2",
   "tools/astlog/scan.py",
   "tools/devirt/*.py",
-  "tools/layout",
   "tools/cpus.py",
-  "tools/similar",
   "tools/typed-input",
   "tools/v2",
   "tools/vendor",
@@ -70,7 +65,6 @@ include = [
 "harness/hermetic.py" = ["E402"]
 "harness/includes.py" = ["E402"]
 "harness/keys.py" = ["E402"]
-"harness/norustc/setup.py" = ["E402"]
 "harness/v2/*.py" = ["E402"]
 
 [tool.pyright]
@@ -92,7 +86,6 @@ include = [
   "harness/incremental.py",
   "harness/keys.py",
   "harness/live_types.py",
-  "harness/norustc/setup.py",
   "harness/own_inputs.py",
   "harness/profile_fixtures.py",
   "harness/profile_gate.py",
@@ -103,7 +96,6 @@ include = [
   "harness/v2",
   "tools/astlog/scan.py",
   "tools/devirt",
-  "tools/layout",
   "tools/cpus.py",
   "tools/typed-input",
   "tools/v2",

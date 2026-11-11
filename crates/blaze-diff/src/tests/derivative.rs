@@ -21,7 +21,7 @@ const LARGEST: f64 = 1e4;
 /// condition's value, and for `abs`, `min` and `max` the sign that picks their branch. `None`
 /// when the point is not one to check at: a value is not finite or is huge, or the point is
 /// within [`MARGIN`] of where some operation's rule stops holding or a comparison ties.
-fn sides(graph: &Graph, roots: &[Id], point: &[f64]) -> Option<Vec<bool>> {
+pub(super) fn sides(graph: &Graph, roots: &[Id], point: &[f64]) -> Option<Vec<bool>> {
     let values = eval_all::<f64>(graph, roots, point).ok()?;
     let float = |id: Id| values[id.index()].expect("an argument of a reached node").float();
     let mut sides = Vec::new();
@@ -67,7 +67,13 @@ fn sides(graph: &Graph, roots: &[Id], point: &[f64]) -> Option<Vec<bool>> {
 /// can judge (a kink, a pole or a huge value nearby, or the two step sizes disagree, which is
 /// what rounding noise and a function that turns within the step look like); `Err` says what
 /// disagreed. The tolerance is relative to the derivative's size, at least 1.
-fn agrees(graph: &Graph, f: Id, df: Id, var: usize, point: &[f64]) -> Result<bool, String> {
+pub(super) fn agrees(
+    graph: &Graph,
+    f: Id,
+    df: Id,
+    var: usize,
+    point: &[f64],
+) -> Result<bool, String> {
     let h = 1e-5 * point[var].abs().max(1.0);
     let at = |offset: f64| {
         let mut moved = point.to_vec();
@@ -142,7 +148,7 @@ fn judged(
 }
 
 /// [`RULES`] with `op`'s tangent replaced.
-fn rules_with(op: Op, tangent: P) -> Vec<Rule> {
+pub(super) fn rules_with(op: Op, tangent: P) -> Vec<Rule> {
     RULES.iter().map(|rule| if rule.op == op { Rule { tangent, ..*rule } } else { *rule }).collect()
 }
 
@@ -211,6 +217,30 @@ fn every_float_operation_has_one_rule() {
         let differentiable = op.sort() == Sort::Float && !matches!(op, Op::Const | Op::Var);
         assert_eq!(rules, usize::from(differentiable), "`{op}`");
     }
+}
+
+#[test]
+fn the_operations_rules_json_lists_are_the_enum() {
+    // The Lean `Op` (lean/analysis/BlazeDiff/Ops.lean) is generated from the same list.
+    let listed: Vec<Op> = crate::OPS.iter().map(|&(op, _, _)| op).collect();
+    assert_eq!(listed, Op::ALL);
+    for &(op, arity, sort) in crate::OPS {
+        assert_eq!((arity, sort), (op.arity(), op.sort()), "`{op}`");
+    }
+}
+
+#[test]
+fn powi_of_the_smallest_exponent_has_its_derivative() {
+    // d/dx x^n = n * x^(n - 1), and `i32::MIN - 1` is no `i32`: the rule takes `x^n / x`.
+    // Wrapping the exponent gave `n * x^i32::MAX`, infinite at 2 where the derivative is 0.
+    let mut graph = Graph::new(Width::F64);
+    let x = graph.var(0);
+    let f = graph.powi(x, i32::MIN);
+    let df = diff::derivative(&mut graph, f, 0, Policy::default()).expect("no kink");
+    let at = |x: f64| eval_one::<f64>(&graph, df, &[x]).unwrap();
+    assert_eq!(at(1.0), f64::from(i32::MIN));
+    assert_eq!(at(2.0).abs(), 0.0);
+    assert_eq!(at(-1.0), -f64::from(i32::MIN));
 }
 
 /// The plan's closed form of `d/dx (x * y).sin() / (1.0 + x * x)`.

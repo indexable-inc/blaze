@@ -79,6 +79,7 @@ def renderValue : Nat → Value → String
   | _, Value.bool b => if b then "true" else "false"
   | _, Value.int _ v => toString v.val
   | _, Value.ref _ => "&"
+  | _, Value.dead => "moved"
   | 0, _ => "..."
   | depth + 1, Value.adt variant fields =>
     "{" ++ toString variant ++ ": " ++ ", ".intercalate (fields.map (renderValue depth)) ++ "}"

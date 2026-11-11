@@ -95,7 +95,7 @@ def Program.start (prog : Program) (id : FnId) (base : List Slot) (args : List V
   match prog.sig id with
   | none => Outcome.undefined Undefined.illFormed
   | some sig =>
-    (State.enter { base := base, stack := [] } id sig args
+    (State.enter { base := base, stack := [], next := 1 } id sig args
         { frame := 0, slot := 0, path := [] } none).bind (fun next =>
       match next with
       | Next.state st => Outcome.ok st

@@ -76,4 +76,33 @@ it enforces.
 
 See [docs/contributing.md#what-a-change-needs](../../../docs/contributing.md#what-a-change-needs).
 
+## build-the-missing-piece (rule 58)
+
+A design that says "this would use X, but X is not in the tree" is not finished. The missing piece
+(a language or reflection feature, an intrinsic, a bstd module, a SIMD primitive, a harness check, a
+debugging command) is part of the work: specify it, build it in its right home, and use it, in the
+same lane or one started at once, with a ledger row so it is tracked. An interim form is allowed
+only while the piece is being built: it is marked at the spot (`// when <piece> lands: <what
+changes>`), listed in the lane's report and its ledger row, and removed when the piece lands. What
+is never acceptable is the weaker design left standing with a note that the tree lacked something: a
+scalar loop where the design is vectorized, a hand-written impl where reflection should derive it, a
+guessed number where a measurement tool should exist. If the piece is large, say so and start it; do
+not quietly scope it out. This is `own-the-language` for the whole tree, and `guard-the-cause` for
+capabilities: the cause of a weak design is a missing piece, so add the piece.
+
+## unease-is-work (rule 59)
+
+Unease is a finding, not a mood: a workaround that had to be written, a result explained by
+inspection where a check should explain it, a tool that could be misused the same way again, a step
+that only works when done carefully, a number that surprised you, code tied to other code by
+convention. Do not note it and move on, and do not patch the instance. Ask why it is that way until
+the answer is a cause that can be removed (a missing type, a missing check, an API that allows the
+mistake, a representation that hides the fact, a language that cannot state the invariant), and
+remove it there: redesign the piece, add the guard (`guard-the-cause`), build what is missing
+(`build-the-missing-piece`), or change the language: add a feature, change one, or delete one that
+invites the mistake (`own-the-language`). The size of the right fix is not a reason to prefer the
+wrong one (`best-long-term-design`); if it is large, say so, start it, and give it a ledger row. Say
+in the change what the unease was and what cause was removed, so the next reader does not rediscover
+it.
+
 <!-- End of the generated rules. Hand-written notes follow. -->

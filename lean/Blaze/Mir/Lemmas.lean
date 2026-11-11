@@ -137,13 +137,102 @@ theorem inBounds_some (p : Pointer) (n : Nat) (v : Value) :
     inBounds p n (some v) = Outcome.ok (p.push (PathElem.index n)) := rfl
 
 /-- A step is the running frame's block. -/
-theorem step_block (prog : Program) (base : List Slot) (fr : Frame) (rest : List Frame)
+theorem step_block (prog : Program) (base : List Slot) (fr : Frame) (rest : List Frame) (next : Nat)
     (blk : BasicBlock) (hb : prog.block fr.fn fr.block = some blk) :
-    step prog { base := base, stack := fr :: rest } =
-      execBlock prog.adts prog.sig { base := base, stack := fr :: rest } blk := by
-  show execBlock? prog.adts prog.sig { base := base, stack := fr :: rest }
+    step prog { base := base, stack := fr :: rest, next := next } =
+      execBlock prog.adts prog.sig { base := base, stack := fr :: rest, next := next } blk := by
+  show execBlock? prog.adts prog.sig { base := base, stack := fr :: rest, next := next }
     (prog.block fr.fn fr.block) = _
   rw [hb]
   rfl
+
+/-! Panics: where a part panics, the whole does. -/
+
+/-- A checked addition out of range panics. -/
+theorem binaryOp_checked_add_fail {ty : ScalarTy} (a b : Scalar ty)
+    (h : ¬ (ty.min ≤ a.val + b.val ∧ a.val + b.val ≤ ty.max)) :
+    binaryOp true BinOp.add (Value.int ty a) (Value.int ty b) =
+      Outcome.panic Error.arithmetic := by
+  show withSame a b (sameChecked BinOp.add) = Outcome.panic Error.arithmetic
+  rw [withSame_self]
+  show intResult (Scalar.add a b) = Outcome.panic Error.arithmetic
+  have hf : Scalar.add a b = Result.fail Error.arithmetic :=
+    Scalar.checked_fail ty (a.val + b.val) h
+  rw [hf]
+  rfl
+
+/-- A binary rvalue whose operator panics panics. -/
+theorem evalTwo_panic (st : State) (l r : Operand) (f : Value → Value → Outcome Value)
+    (a : Value) (st1 : State) (b : Value) (st2 : State) (e : Error)
+    (hl : evalOperand st l = Outcome.ok (a, st1))
+    (hr : evalOperand st1 r = Outcome.ok (b, st2))
+    (hv : f a b = Outcome.panic e) :
+    evalTwo st l r f = Outcome.panic e := by
+  unfold evalTwo
+  rw [hl]
+  show (evalOperand st1 r).bind (fun b =>
+    (f a b.1).bind (fun v => Outcome.ok (v, b.2))) = Outcome.panic e
+  rw [hr]
+  show (f a b).bind (fun v => Outcome.ok (v, st2)) = Outcome.panic e
+  rw [hv]
+  rfl
+
+/-- An assignment whose rvalue panics panics. -/
+theorem execStmt_assign_panic (adts : List AdtDecl) (st : State) (p : Place) (rv : Rvalue)
+    (e : Error) (hr : evalRvalue adts st rv = Outcome.panic e) :
+    execStmt adts st (Statement.assign p rv) = Outcome.panic e := by
+  show (evalRvalue adts st rv).bind (fun r =>
+    (evalPlace r.2 p).bind (fun ptr => r.2.write ptr r.1)) = Outcome.panic e
+  rw [hr]
+  rfl
+
+/-- A block whose first statement panics panics. -/
+theorem execBlockFrom_panic (adts : List AdtDecl) (sig : FnId → Option FnSig) (st : State)
+    (s : Statement) (rest : List Statement) (t : Terminator) (e : Error)
+    (h : execStmt adts st s = Outcome.panic e) :
+    execBlockFrom adts sig st (s :: rest) t = Outcome.panic e := by
+  rw [execBlockFrom_cons, h]
+  rfl
+
+/-- A step that panics ends the run with the panic. -/
+theorem run_panic (prog : Program) (fuel : Nat) (st : State) (e : Error)
+    (h : step prog st = Outcome.panic e) :
+    run prog (fuel + 1) st = Outcome.panic e := by
+  rw [run_succ, h]
+  rfl
+
+/-! Loops. -/
+
+/-- The steps a loop of `k` turns takes: `cIter` a turn, then `cExit` to leave. -/
+def loopFuel (cIter cExit : Nat) : Nat → Nat
+  | 0 => cExit
+  | k + 1 => cIter + loopFuel cIter cExit k
+
+/-- A loop, by a variant: `S x` is the state at the loop's head with the data `x`, and
+`good k x` says `k` turns are left. When a head with no turn left runs to `result` in
+`cExit` steps, and a head with `k + 1` turns left runs in `cIter` steps to a head with `k`
+left, a head with `k` turns left runs to `result`. The invariant is `good`; the variant is
+`k`. -/
+theorem run_loop (prog : Program) {α : Type} (good : Nat → α → Prop) (S : α → State)
+    (result : Value) (cIter cExit : Nat)
+    (exit : ∀ (x : α) (extra : Nat), good 0 x →
+      run prog (cExit + extra) (S x) = Outcome.ok result)
+    (iter : ∀ (k : Nat) (x : α), good (k + 1) x →
+      ∃ x', good k x' ∧ ∀ (fuel : Nat), run prog (cIter + fuel) (S x) = run prog fuel (S x')) :
+    ∀ (k : Nat) (x : α) (extra : Nat), good k x →
+      run prog (loopFuel cIter cExit k + extra) (S x) = Outcome.ok result := by
+  intro k
+  induction k with
+  | zero =>
+    intro x extra hg
+    exact exit x extra hg
+  | succ k ih =>
+    intro x extra hg
+    have ⟨x', hg', hrun⟩ := iter k x hg
+    have e : loopFuel cIter cExit (k + 1) + extra =
+        cIter + (loopFuel cIter cExit k + extra) :=
+      Nat.add_assoc cIter (loopFuel cIter cExit k) extra
+    rw [e, hrun (loopFuel cIter cExit k + extra)]
+    exact ih x' extra hg'
 
 end Blaze.Mir

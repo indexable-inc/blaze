@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: The verifier: blaze translates its own borrow-checked MIR to Lean 4 and the pinned Lean checks proofs of specs written once in blaze's extensions. v0 (safe Rust by functional translation) is written in crates/hir-ty-lean with the first proof in the tree; lean/Blaze/Mir is the executable Lean semantics of MIR for a first subset that models, passes and the evaluator are held to, with its trusted base listed; the Verus tier was retired on 2026-11-10. Planned: v1 unsafe and interior mutability in an Iris-style logic, v2 atomics (SC, then RC11), v3 crashes on files and mmap (Perennial-style, sharing the DST's kernel model), v4 compiler correctness. DST stays on everything.
+summary: The verifier: blaze translates its own borrow-checked MIR to Lean 4 and the pinned Lean checks proofs of specs written once in blaze's extensions. v0 (safe Rust by functional translation) is written in crates/hir-ty-lean with the first proof in the tree; lean/Blaze/Mir is the executable Lean semantics of MIR for a first subset that models, passes and the evaluator are held to, with its trusted base listed; the Verus tier was retired on 2026-11-10. Planned: v1 unsafe and interior mutability in an Iris-style logic, v2 atomics (SC, then RC11), v3 crashes on files and mmap (Perennial-style, sharing the DST's kernel model), v4 compiler correctness. DST stays on everything. A second package, lean/analysis, proves blaze-diff's derivative rules and fast_math rewrites over the reals with Mathlib, from the rule table the Rust differentiator runs.
 date: 2026-11-10
 ---
 # Formal verification: blaze's MIR to Lean
@@ -447,9 +447,10 @@ library, every golden model and the proofs. After a deliberate change to the tra
 
 Rule `verified-compiler` needs one thing every proof and every pass is held to: what a MIR
 body means. It is `lean/Blaze/Mir`, a deep embedding of blaze's MIR with an executable
-semantics, for a first subset. It was written without Lean or blaze having run on it: until
-`lake build` of `lean/` and `blaze test -p hir-ty-lean` pass on a named commit, read this
-section as what the code is meant to do. Objectives V6, V7 and V8 decide it.
+semantics, for a first subset. `lake build` of `lean/` passes with Lean 4.20.0 up to commit cc0f8f3ee7 (2026-11-11), and
+the gate (below) holds every theorem of `lean/theorems.json`; what was written after a
+checked commit says so where it is described. The Rust tests of `crates/hir-ty-lean` have
+not run, so every embedded body is a prediction of the encoder's output. Objectives V6, V7 and V8 decide it.
 
 **Prior art, and the one lesson taken from each.**
 - [MiniRust](https://github.com/minirust/minirust): a specification of Rust's operational
@@ -490,13 +491,19 @@ holds what the entry function's reference arguments point to.
 - **Why.** It is what safe code that borrows locals and their parts needs, it is the model the
   functional translation reads a `&mut` in, and every definition reduces in Lean's kernel, so
   tests and translation validation are `rfl`.
+- **Frames are named by an id from a counter**, never by depth, so a reference into a frame
+  that returned is `dangling` for the rest of the run. A move out of a part of a local leaves
+  a hole (`Value.dead`) there, and a read of the hole is undefined; a value with a hole
+  inside is still read whole, and the hole is undefined when it is used.
 - **What it cannot express:** raw pointers, pointer-integer casts, transmutes, unions,
   anything that depends on layout (padding, niches, alignment), the heap (`Box`, `Vec`),
-  `static`s, interior mutability, and aliasing rules (Tree or Stacked Borrows): two `&mut` to
-  one place are not detected. A reference into a frame that returned is `dangling` only until
-  another call reuses the depth. A move out of a part of a local leaves the part readable.
-  Storage markers do nothing, so a use of a dead local is not detected. The encoder refuses
-  what the model has no form for; the rest is the borrow checker's to rule out.
+  `static`s and interior mutability. Storage markers do nothing, so a use of a dead local is
+  not detected.
+- **Aliasing is not modelled.** Two live `&mut` to one place are two pointers to it: a write
+  through one is read through the other, where Rust says undefined behaviour (Stacked or
+  Tree Borrows). No program the borrow checker accepts does this, and the encoder embeds
+  only accepted programs, so every theorem about a Rust program has "borrow-checked" as its
+  hypothesis; a pass that needs `noalias` to be correct cannot be proved here yet.
 - **How it grows.** Heap cells addressed by an allocation id, for `Box` and `Vec`. Then bytes
   with provenance, as MiniRust has, with a stated relation between the two models: a
   structured value is related to the bytes its type's layout encodes it as. That relation is
@@ -524,7 +531,9 @@ and no axiom.
   two agree. The rvalue is evaluated before the place it is assigned to.
 - **Proved** (`Run.lean`): `step_deterministic` (a state has one next outcome: `step` is a
   function), `run_mono` (a run that ends, ends the same with any more fuel) and `run_agree`
-  (two runs of one state that both end agree). No frame lemma yet.
+  (two runs of one state that both end agree). `State.lean`: the frame lemma
+  `State.read_write_other` (a write at a place leaves the read of every place in another
+  slot as it was); two places in one slot are not covered.
 
 **V6: the differential harness.** `harness/v2/mir_semantics.py differential` draws programs
 (arithmetic with overflow, a struct through a `&mut` parameter, an enum built and matched, a
@@ -555,6 +564,13 @@ steps is `Outcome.ofResult` of the model run with `len + 1` turns; with less fue
 encoder's output until the golden test runs; when it differs, the file is rewritten and the
 block theorems of `LedgerMir.lean` (one per block, each failing alone) are redone.
 
+Three more functions are tied the same way (checked by Lean and held by the gate), each a file beside its
+model: `arith::add_one` (`BlazeModel/arith/add_one_agrees.lean`: the value, and the overflow
+panic), `early::clamp` (both branches) and `loops::count` (through `run_loop`, the one
+lemma for loops: an invariant and a variant give the loop's result). The other four goldens
+(`structs::bump`, `enums::side`, `slices::first`, `calls::quadruple`) have none, and the
+Rust emitter that prints these scripts is not written.
+
 How it scales: **the translator emits the proof with the model**, a script that follows the
 translation's structure and applies one lemma per construct (`Blaze/Mir/Lemmas.lean`, the
 first step, used by the `fnv1a_from` proof): an assignment is `execStmt_assign`; a copy or
@@ -571,11 +587,311 @@ agreement does not terminate by `rfl`. `native_decide` is not allowed either way
 programs; it is the specification of the Rust pass of the same name.
 - **Refinement.** `Outcome.Refines target source`: the source is undefined, or the two are
   equal. Behaviours of the target are behaviours of the source.
-- **`run_mapBlocks`.** A rewrite that leaves each block's meaning as it was from every state
-  preserves every run, with the same fuel. Proved for `removeStorageMarkers`
-  (`RemoveStorageMarkers`: true in this semantics because a marker does nothing in it) and
-  `simplifyConstCondition` (`SimplifyConstCondition`'s direct form: a `switchInt` or an
-  `assert` on a constant).
+- **`run_mapBlocks`** (`Opt/Local.lean`). A rewrite that leaves each block's meaning as it was
+  from every state preserves every run, with the same fuel. Proved with it:
+  `removeStorageMarkers` (true in this semantics because a marker does nothing in it),
+  `simplifyConstCondition` (the direct form: a `switchInt` or an `assert` on a constant),
+  `removeNops`, and `constFold` (a binary, checked, unary operation or a cast on constants is
+  its value; one that panics is left, so it still panics). blaze has no Rust pass that only
+  folds constants or only removes `nop`s, so those two have no pair to check.
+- **`Sim`** (`Opt/Sim.lean`). A lockstep simulation through a map on states, under an
+  invariant, gives equal runs (`Sim.run`). Its clients are the two renumbering passes below.
+- **The CFG passes: checked by Lean** (`lake build` of `lean/` at 4357e681bf, 2026-11-11;
+  what was written after that commit is marked).
+  - **Control is not memory** (`Opt/Ctl.lean`). Every function of `Step.lean` up to
+    `execStmt` leaves each frame's function, block and return target as they were
+    (`execStmt_ctl`). Each proof below that depends on where control is rests on it.
+  - **The commutation lemmas** (`Opt/Rename.lean`). `State.rename ρ` renames each frame's
+    block by its function's map and its return target by its caller's. Every function of
+    `Step.lean`, in the file's order, commutes with it, up to `execTerm_rename` and
+    `step_rename`. `Opt/Bind.lean` has the four facts about `Outcome.bind` they are applied
+    through, as terms: no proof there rewrites.
+  - **A permutation of blocks** (`Opt/Renumber.lean`, `renumber orders`). The orders are
+    checked by `checkPermutation` (every block listed, the entry block first), which the
+    kernel evaluates; `permuteBlocks_correct` then needs no invariant, and
+    `permuteBlocks_call` says every call gives the same outcome.
+  - **Dead-block removal** (`removeDeadBlocks`). The invariant is stated (`Opt/Reach.lean`,
+    `Reaches`): the running frame is at a kept block and every frame returns to one; it is
+    kept by every step when the kept blocks are closed under jumps (`step_reaches`). The pass
+    computes the blocks block 0 reaches and `checkDead` checks they are closed;
+    `removeDeadBlocks_correct` is under the invariant, `removeDeadBlocks_call` for every
+    call, where it holds of the start state.
+  - **Goto threading** (`Opt/Thread.lean`, `threadGotos`), by the stuttering form of `Sim`
+    (`Stutter`): one step of the target is `k + 1` steps of the source, `k` below a bound
+    `K`. The fuel is stated: a target run of `n` steps that ends is the source's run of
+    `K * n` (`Stutter.run_target`), and a source run of `n` steps that ends is the target's
+    run of `n` (`Stutter.run_source`). For threading `K` is 2. Whole chains are the pass
+    again: `threadGotosN k` threads chains of up to `k` empty blocks, with the bounds
+    composed, `2 ^ k * n` one way and `n` the other (`threadGotosN_target`,
+    `threadGotosN_source`; checked at e15b208b49).
+  - **A `switchInt` whose arms all agree is a `goto`** (`Opt/SwitchSame.lean`,
+    `switchToGoto`; checked at 6a85685c71). A refinement, not an equality: the `goto` drops the
+    evaluation of the discriminant, which here can be undefined, so `switchToGoto_refines`
+    says the rewritten run is the program's unless the program's is undefined. The
+    discriminant must be a `copy` of a place with no index (a `move` changes the state, an
+    index can panic); the Rust `simplify_branch` rewrites those too. The file has what
+    every such pass uses: `run_refines` (steps that refine give runs that refine) and
+    `Outcome.Calm` (a value or undefined, never a panic), proved of reads and plain places.
+  - **Where these cover less than the Rust `SimplifyCfg`** (`optimize/cfg.rs`): it merges a block that ends in a call too, and rewrites a `switchInt` whose
+    discriminant is a `move` or has an index; and
+    `remove_dead_blocks` merges every empty `unreachable` block into one. None of those is
+    specified, so `BlazeValidated` has no `after = spec before` pair for a CFG pass, and
+    `validate`'s normal form does not include them: `validate_sound` is equality of runs
+    with the same fuel from the same state, which a renumbering (the state is renamed) and
+    threading (the fuel differs) do not have. The witness validator is where they join.
+  - **Merging a block into its predecessor** (`Opt/Merge.lean`, `mergeGotos pick`; checked
+    at 2ebcfbbab5). A block that ends in `goto t` gets `t`'s statements and terminator. It is
+    right whatever jumps to `t`, so it is proved for every choice of targets; `mergeSuccessors`
+    chooses as the Rust `merge_successor` does (one predecessor). A stuttering simulation
+    through the identity with bound 2 (`mergeGotos_target`, `mergeGotos_source`). It rests on
+    `execBlockFrom_top`: a block that does not end in a call does the same whatever block
+    the running frame is at; `Opt/MemMap.lean` has the commutation lemmas of `Opt/Rename.lean`
+    for any map on the stack that leaves memory alone, which that needs. A target that ends
+    in a call is not merged (the caller's frame would keep a stale `block` under the
+    callee, so the two states would differ): there the specification covers less.
+  - **Threading through every target, a call's return target too** (`Opt/ThreadCalls.lean`,
+    `threadAll`; checked at 9f791ac218). A frame's `target` is then another block in the
+    threaded program, so states are mapped: `retargetStack` sends each frame's `target`
+    through its caller's map and leaves every `block`; it is a `MemMap`. A terminator from
+    the mapped state gives the mapped next state, or the mapped jump one hop further, and
+    that hop is the program's second step: a stuttering simulation through the map with
+    bound 2 (`threadAll_target`, `threadAll_source`, `threadAll_call_source`).
+  - **Not written: merging a target that ends in a call.** The caller's frame keeps a stale
+    `block` under the callee; the map is `block` renamed on the frames under the running
+    one, another `MemMap`.
+  - **`SimplifyCfg` composed** (`Opt/SimplifyCfg.lean`, `simplifyCfg k`; checked at
+    167c97fb61): `nop`s removed, `k` rounds of threading every target, the `switchInt` rule,
+    dead blocks, merging, then dead blocks, in the order of the Rust loop. Proved of it
+    (`simplifyCfg_call`): a call that ends, and not in undefined behaviour, gives the same
+    outcome with the same fuel, which is what an equality, a refinement and two stuttering
+    simulations have in common. It is not yet the Rust pass block for block (that changes
+    blocks in place with predecessor counts kept as it goes, merges a target that ends in a
+    call, rewrites a `switchInt` on a `move`, merges empty `unreachable` blocks), so
+    `after = spec before` is to be tried per body, and no pair is in `BlazeValidated` yet.
+  - **Dead-store elimination: first piece** (`Opt/Ptr.lean`; checked at eadd58c04c).
+    `MemOk P st` says every pointer in every slot of the state satisfies `P`; a read gives a
+    value whose pointers do (`State.read_ok`) and a write of such a value keeps it
+    (`State.write_ok`).
+  - **Dead-store elimination: second piece** (`Opt/Ids.lean`, `Opt/Borrow.lean`; checked at
+    b248b3e485). `PtrOk B ids p`: the pointer names frame 0, a frame that is gone, or a
+    local its frame's function may borrow (`B`); `StateOk B st`: every pointer in memory is
+    such. Writes and moves keep it, and a place whose base may be borrowed, or that goes
+    through a dereference, evaluates to such a pointer (`evalPlace_ptr`). A frame's id and
+    function are left by statements (`execStmt_ids`, `Opt/Ctl.lean`'s proofs for that
+    pair).
+  - **Dead-store elimination: third piece** (`Opt/BorrowExec.lean`; checked at fc96514550). An
+    operator gives a value with no pointer in it, an operand a value read from memory, a
+    `ref` the pointer its place evaluates to; so a statement keeps the invariant
+    (`execStmt_okAt`) when every `ref` in it is of a place whose base may be borrowed or
+    that goes through a dereference (`StmtFine`: the Rust pass's "ever borrowed" as a
+    condition on the body).
+  - **Dead-store elimination: fourth piece** (`Opt/NextId.lean`, `Opt/BorrowStep.lean`;
+    checked at dde643da71). `Borrows B g st`: `g` lists every frame the run has made, those that
+    returned too, with ids below the next one, and memory holds only pointers to frame 0 or
+    to a local that the function of its frame may borrow. A call adds its frame to `g`, a
+    return leaves it. `step_borrows`: every step keeps it, for a program whose every `ref`
+    is of a place that may be borrowed or goes through a dereference (`ProgFine`).
+  - **Dead-store elimination: fifth piece, first part** (`Opt/SlotAlgebra.lean`; checked
+    at 9d978075d2). The two programs' states are the same but in one slot, which is stated
+    with a map (the one is the other with that slot replaced), so the proof computes with
+    replacements: two of different slots commute (`State.setSlot_comm`), a write elsewhere
+    commutes with one (`State.write_setSlot_other`), and a write of the whole slot forgets
+    it (`State.write_setSlot_same`).
+  - **Dead-store elimination: fifth piece, second part** (`Opt/SlotExec.lean`; checked at
+    9d978075d2). When a slot is the running frame's, of a local its function does not
+    borrow, a statement that mentions the local neither as a place's base nor as an index
+    does the same whatever the slot holds (`execStmt_put`), through every function of
+    `Step.lean` up to `execStmt`.
+  - **`removeOverwritten`** (`Opt/RemoveOverwritten.lean`; checked at 9aabce8584): the end
+    theorem of the pieces above. In a block, `l = rv1; ..; l = rv2` becomes
+    `nop; ..; l = rv2` when `l` is a whole local its function never borrows, `rv1` is a copy
+    of a place with no index or a constant, and nothing between mentions `l`. A step runs a
+    whole block, so the two programs' states are equal at every step:
+    `removeOverwritten_refines` is `run_refines_inv` (a refinement of runs under an invariant
+    the source's steps keep) with the block lemma, from every state the borrow invariant
+    holds of, for a program `checkBorrows` accepts (evaluated by the kernel, proved sound);
+    `removeOverwritten_call` is the same for every call whose base slots and arguments have
+    pointers into frame 0 only, where the start state holds the invariant.
+  - **Liveness across blocks is the next entry**, `removeDead`: this pass needs none. No
+    `BlazeValidated` pair for DSE yet.
+- **Global dead-store elimination (ledger V11): proved for `removeDead`.** One relation serves
+  the Rust `DeadStoreElimination`, the deleting half of `CopyProp` (a use rewritten is
+  `symEq`; the copy left unused is a dead store) and of `SimplifyLocals` (which also
+  renumbers locals: a rename of locals, a commutation family like `Opt/Rename.lean`'s, not
+  part of this).
+  - **No change to the semantics.** `step` runs a whole block, and that grain is right: the
+    relation is stated at block boundaries, and inside a block the proof is an induction
+    over the statements, as `Opt/RemoveOverwritten.lean`'s is. A per-statement small step is
+    not needed.
+  - **The certificate** is liveness as data: per function and block, the locals live on
+    entry. `checkLiveness` (a `Bool` the kernel evaluates) recomputes each block backwards
+    from the union of its successors' sets (a `ret` reads local 0; a call's destination is
+    written whole or in part; every borrowed local is always live) and accepts when what it
+    computes is within the set given. The pass removes `l = rv` where `l` is a whole local
+    not live after the statement and never borrowed, and `rv` cannot panic or move
+    (`rvalueCalm`, to be widened to total operators).
+  - **The relation** is a map, as in `Opt/SlotAlgebra.lean`: the source state is the target
+    state with a list of slots replaced, `(frame id, local, slot)`, each a local dead at its
+    frame's resume point (the running frame: the block it is at; a frame under it: after
+    its call returns and writes the destination) and never borrowed, so by `step_borrows` no
+    pointer is into it. A step keeps it: a statement that does not read a replaced slot
+    commutes with the replacements (`execStmt_put`, generalized to a frame that is not the
+    running one, where no place of the statement can be in it); a store to a replaced local
+    drops it from the list (`State.write_setSlot_same`); a removed store adds one; a call
+    leaves the caller's list as it is and starts the callee with none; a return drops the
+    callee's.
+  - **Built, and checked by Lean** (`lake build` of `lean/` at c70276a7d8, 2026-11-11; the
+    `Rewrite` in `Opt/Witness.lean` was written after that build).
+    (a) `Opt/SlotExecFar.lean`, `execStmt_putFar`. (b) `Opt/Puts.lean`: `puts st reps`
+    (`Rep := Nat × Nat × Slot`), `execStmt_puts`, `execStmt_absorb` (`keepReps`),
+    `puts_append`. (c) `Opt/Liveness.lean`: the certificate, `checkLiveness`,
+    `stmtLive_dead`, the pass `removeDead`. (d) `Opt/Skel.lean`: the frames but for what
+    their locals hold (`State.skel`; from `Opt/Ctl.lean` by substitution), which statements
+    keep; the relation speaks of each frame's `dest`, which `ids` and `ctl` lack.
+    `Opt/PutsTerm.lean`: operands, places and a call's destination through the list
+    (`evalOperand_puts`, `evalPlace_puts`, `evalDest_puts`), then `jump_puts`, `write_puts`
+    (an entry whose whole slot is written leaves: `dropAt`), `enter_puts`,
+    `Intrinsic.eval_same`, `callOn_puts`, `ret_puts`. `Opt/RemoveDead.lean`: the relation
+    and `block_rel`, the induction over a block's statements with the certificate's points.
+    (e) `run_refines_rel` (`Opt/RemoveOverwritten.lean`), `removeDead_step`, and:
+
+    ```lean
+    theorem removeDead_refines (cert : List (List (List (List Local))))
+        (borrowed : Body → Local → Bool) (prog : Program)
+        (hlive : checkLiveness prog cert = true) (hb : checkBorrows borrowed prog = true)
+        (fuel : Nat) (st : State) (hinv : ∃ g, Borrows (BorrowedIn borrowed prog) g st)
+        (hord : Ordered st.skel) :
+        (run (removeDead cert borrowed prog) fuel st).Refines (run prog fuel st)
+    ```
+
+    `removeDead_call` is the same for every call whose base slots and arguments have
+    pointers into frame 0 only (a start state is `Ordered`: `start_ordered`).
+    `Rewrite.removeDead cert` makes it a rewrite of the witness validator
+    (`removeDeadStoresChecked_preserves`, `PreservesWhen FrameZero`).
+  - **The relation as built** (`Rel` in `Opt/RemoveDead.lean`), where it differs from the
+    design above. The source state is `puts t reps`; of the target state `t`, `Borrows B g t`
+    and `Ordered t.skel`: the frames' ids strictly decrease down the stack and each frame's
+    `dest.frame` is below its id. Both are needed and were not foreseen: an entry of a frame
+    that returned stays in the list (`Placed .. [] = True`) and replaces nothing only
+    because no frame under it has its id; and a removed store's new entry is off every
+    frame's destination only because those are in older frames. Each entry is `Good`: its
+    slot holds an allowed value; its frame's function never borrows its local; every
+    frame's `dest` is its whole slot or off it; and it is dead where its frame resumes
+    (`Placed`, `Below`): on entry to the running frame's block, or on entry to the callee's
+    return target unless the callee's `dest` is its whole slot. Inside a block the running
+    frame's entries are dead at the current point (`Here`). A removed store appends its
+    entry (`puts_append`); the older entries of that local stay, still dead.
+  - **What the Rust `DeadStoreElimination` does beyond `removeDead`, none proved.** A store
+    of an rvalue that can panic or move (here only a copy of a place without an index, or a
+    constant: `rvalueCalm`; a total operator on such operands is the next widening, and needs
+    only `evalRvalue_calm` for it); a store through a projection of a dead local; `Deinit`;
+    a copy into a call made a move; unused storage markers; liveness along unwind edges (the
+    semantics has no unwinding). And the pass is not yet held to the specification: it must
+    export its liveness as the certificate, and the pair in `BlazeValidated` be accepted by
+    `validateWith` with `Rewrite.removeDead cert`.
+  - **What `CopyProp` and `SimplifyLocals` need on top.** `CopyProp`: the uses rewritten are
+    `symEq`'s, and the copy left unused is a dead store, so a script
+    `[symEq step, Rewrite.removeDead cert]`; what is missing is `symEq` as a `Rewrite`
+    (`validateSym` compares at the end only) and `removeDead` for a `move` operand, which
+    `CopyProp` leaves when the source is dead after (the source then holds `moved` in one
+    program and its value in the other: one more entry in the list, which `Rel` already
+    allows, with `evalOperand` of a move shown to add it). `SimplifyLocals`: after
+    `removeDead`, a renaming of locals, a commutation family like `Opt/Rename.lean`'s over
+    `State` with each frame's `locals` permuted and pointers' `slot` mapped; and the
+    removal of the locals no statement mentions, which changes `FnSig.locals` and so needs
+    the relation between a frame and one with fewer slots.
+  - **Idioms that elaborate here, and ones that do not** (Lean 4.20.0; learned on this
+    branch, each from a build):
+    - Prove through `Opt/Bind.lean`, as terms: `Outcome.bind_commutes hx (fun a ha => ..)`,
+      `bind_commutes_map`, `bind_congr`, `bind_map_congr`, and `Outcome.all_bind` for a
+      predicate on the value. The unifier unfolds a definition to its `bind`; no `rw`.
+    - `congrTo f h` (in `Opt/Bind.lean`), never `congrArg f h`, where an expected type is
+      known: `congrArg` lets the goal choose the right-hand side and picks wrongly when it
+      only unfolds to the same.
+    - A structure literal `{ a := .., b := .. }` broken across lines inside parentheses
+      in a `have`'s type does not parse: write `State.mk .. .. ..` / `Frame.mk ..`.
+    - `Preserves.comp (f := ..) (g := ..)` and the like: give the functions; higher-order
+      unification of `fun prog => g (f prog)` picks the identity.
+    - `nomatch h, fun ..` parses as a list: parenthesize `(fun ⟨_, h⟩ => nomatch h)`.
+    - A hypothesis whose type is a `def` (`Reaches`, `RepOk`, `Redirects`): use
+      `And.left`/`And.right`/`And.intro`/`Or.inl`, not `h.1` or `⟨..⟩`; before `cases` on
+      it, restate it with its `∨` written out (`have h' : A ∨ B := h`), or take
+      `And.right (And.right h)` whose type is then the `∨` itself.
+    - A `match` on a value that is not a constructor does not reduce: give every function
+      a helper that matches on its argument (`slotIn`, `switchOr`, `symNext`), and state
+      `f_cons := rfl`; for an inline one, `simp only [f]` then `cases h : scrutinee`
+      (`callOn`), or `unfold f; cases h : scrutinee` when the `match` is the body's head
+      (`Program.start`); `unfold f; split <;> first | ..` for a many-pattern one
+      (`Intrinsic.eval`).
+    - `by omega` as an argument runs before its goal is known: put it in a
+      `have h : <type> := by omega`.
+    - `rw [e] at h` matches up to instances: `k + 1 + 0` also matches `k + 1`. Build
+      arithmetic steps as terms (`congrArg (fun j => run prog j st) e`).
+    - After `subst`, do not name the variable that may be gone; state the lemma for one
+      variable and derive the other form with `congrTo`.
+    - `cases e with | c => ..` needs `e` to appear in the goal as written: `show` the
+      unfolded goal first, or `cases h : e` and `rw [h] at ..`.
+    - `first | exact A | exact B | ..` after `cases x <;> cases y` chooses by unification;
+      order the alternatives so that an earlier one cannot fit a later one's goal.
+    - Generating a file by substitution from one that builds works and is cheap to get
+      right: `Opt/MemMap.lean` from `Opt/Rename.lean`, `Opt/Ids.lean` and `Opt/NextId.lean`
+      from `Opt/Ctl.lean`, `Opt/SlotExecFar.lean` from `Opt/SlotExec.lean`, the operator
+      lemmas of `Opt/SymBlock.lean` from `Opt/BorrowExec.lean`. Assert that no old name is
+      left, and read the result once.
+    - In `decide` examples, state what the pass does by hand first; twice here the
+      expectation was wrong and the pass right.
+    - After `cases hs : e` on a goal with `match e with ..`, the branch's goal is
+      `match some s with ..`, not reduced: `show` the reduced goal before a `rw` into it.
+    - `rw [e] at h` rewrites `h` only: when the goal speaks of the same variable, rewrite
+      the goal.
+    - An intermediate equation gets a `have` with its type, not `(congrTo f a).trans
+      (congrTo g b)`: the middle term is then known before either `by rfl` runs.
+    - A function with a many-pattern match (`Intrinsic.eval`) is proved about by a theorem
+      whose patterns split its arguments until every case is `rfl` (`Intrinsic.eval_same`).
+    - To use a fact about `x.jump? target = Outcome.ok ..` with `target` a variable, a
+      lemma by pattern matching (`jump?_ok`) that returns `target = some tb`, not `cases`.
+- **A validator proved sound** (`Opt/Validate.lean`). `validate a b` accepts when the two
+  programs have one normal form under the proved rewrites; `validate_sound`: an accepted
+  pair runs alike for every fuel and state. It takes no witness and accepts only what the
+  normal form identifies.
+- **A validator that takes a witness** (`Opt/Witness.lean`; checked at 9aabce8584). The witness
+  is a script: the proved rewrites, in order, that take the program before a pass to the
+  program after it (`Rewrite`: the block-local passes, `switchToGoto`, both threadings,
+  merging, dead-block removal, a block permutation with its orders as data).
+  `validateWith a b w` replays the script on `a` and accepts when it gives `b`, which the
+  kernel decides; `validateWith_sound`: an accepted pair gives every call that ends, and not
+  in undefined behaviour, the same outcome with the same fuel. The Rust pass is then not
+  trusted and need not be a fixed specification block for block: a script that reproduces
+  its output is the evidence, and the pass can say which rewrites it applied.
+  `removeOverwritten` and `removeDead cert` (global dead-store elimination, with its
+  liveness certificate as the rewrite's data) are rewrites too, proved for the calls whose
+  caller hands over pointers into frame 0 only (`FrameZero`): `validateWith_sound` is for
+  scripts without them (`allPlain`), `validateWith_sound_frameZero` for any script and those
+  calls.
+  **The validator by symbolic execution, first piece** (`Opt/Sym.lean`; checked at
+  9aabce8584): `Expr`, what a local holds as a function of the locals when its block began,
+  with `Expr.eval`; a symbolic store, and `Reads` (the state agrees with it);
+  `evalRvalue_sym`: an rvalue of the subset (`use`, `binary`, `checked`, `withOverflow`,
+  `unary`, `cast` on constants and copies of whole locals: no move, no projection, no
+  `ref`) evaluates to the value of its expression and leaves the state.
+  **Second piece** (`Opt/SymBlock.lean`; checked at 9aabce8584): a block's statements as a
+  trace, the locals assigned in order with their expressions (`symStmts`), and what a trace
+  means (`den`); `execStmts_sym`: executing the statements is the meaning of their trace,
+  so statement lists with one trace do the same from every state (`execStmts_same`).
+  **Third piece** (`Opt/SymEq.lean`; checked at 9aabce8584): a terminator with a symbolic
+  condition (`symTerm`), a block as its trace and symbolic terminator (`symBlock`,
+  `execBlock_sym`), `symEq a b` (the same types and, block by block, blocks that are equal
+  or have one symbolic form) with `symEq_sound` (they run alike, for every fuel and state),
+  and `validateSym a b w`: a script of proved rewrites replayed on `a`, the result compared
+  with `b` by `symEq` (`validateSym_sound`). The script is the block map; symbolic equality
+  is the rest.
+  **What symbolic equality accepts, and what it does not.** It accepts a pass that rewrites
+  operands inside a block and keeps every store: copy and constant propagation of uses,
+  on the scalar, move-free subset (blocks outside it must be equal). It does not accept a
+  store or a local removed (the deleting half of the Rust `CopyProp`, `SimplifyLocals`):
+  there the two programs' states differ on a dead local across steps, which is the relation
+  `removeDead_refines` is proved with (ledger V11, above). The inliner needs a relation between one frame and two; loop transforms need a
+  witness that is not per block.
 - **The Rust passes are held to them by translation validation.** The test
   `the_passes_are_their_lean_specifications` and `mir_semantics.py validate` run each pass
   alone on runtime MIR, embed the body before and after, and Lean checks
@@ -583,11 +899,25 @@ programs; it is the specification of the Rust pass of the same name.
   kernel decides. `RemoveStorageMarkers` does exactly its specification. The Rust
   `SimplifyConstCondition` also takes a condition that reads a place the statement before
   assigned a constant; there `after ≠ spec before` and the build says so.
-- **What the general validator needs** (V8's large-pass half, for `DeadStoreElimination`,
-  `CopyProp`, `Inline`): a simulation relation weaker than equality (states equal on live
-  locals; a `moved` slot related to any slot, CompCert's `lessdef`), `step` proved monotone
-  in it, and a checker `validate : Body → Body → Bool` proved to imply the simulation, run
-  by `rfl` per function.
+**The gate holds the proofs** (`harness/v2/lean_gate.py`; written 2026-11-10, its first run
+in CI pending). What is claimed proved is one list, `lean/theorems.json` (each theorem's name,
+module, what it says and its ledger row), and [proofs.md](../proofs.md) is generated from it
+with each statement as its module states it. The `lean` job of `blaze.yaml` runs the gate's
+`check` on every change, with the Lean `lean/lean-toolchain` pins:
+- `lake build` of `lean/` and of `lean/analysis` (after `lake exe cache get`), and neither log
+  may say `declaration uses 'sorry'`;
+- one generated Lean file per package runs `#print axioms` on each listed theorem: it must
+  exist and rest on nothing but `propext`, `Classical.choice` and `Quot.sound` (so a `sorry`,
+  `native_decide` or a new `axiom` under a listed theorem fails by name);
+- without Lean (`sources`, in the `scripts` job): no Lean source says `sorry`, `admit`,
+  `native_decide`, `decide +native`, `axiom`, `partial def` or `debug.skipKernelTC` outside a
+  comment, except where the list's `allow` names the file and the word (one entry: the
+  `partial def` that reads standard input in `lean/Blaze/Tests/Fnv1aMain.lean`); every listed
+  theorem is stated in its module; `lean/analysis/lake-manifest.json` is checked in and pins
+  Mathlib at `lakefile.toml`'s commit; proofs.md is current.
+
+The gate does not check that a theorem's statement says what its one line in words says: the
+statement is printed in proofs.md so a reader can.
 
 **The trusted base** (what a `(proved: ..)` of rule 57 rests on, beyond what is proved):
 - Lean's kernel, and the axioms `propext`, `Classical.choice`, `Quot.sound`.
@@ -596,7 +926,8 @@ programs; it is the specification of the Rust pass of the same name.
   Reduced by V6 and by the golden tests.
 - The memory model's coverage: what it cannot express, above.
 - `Blaze.Scalar` and the intrinsics as the meaning of core's integer operations.
-- The functional translation, for every model without a V7 theorem (all but `fnv1a_from`).
+- The functional translation, for every model without a V7 theorem (all but `fnv1a_from`;
+  `add_one`, `clamp` and `count` leave the list when Lean has checked their proofs).
 - blaze's front end up to MIR: parsing, name resolution, type and borrow checking, MIR
   building. A proof is about the MIR blaze built.
 - Runtime lowering (`crates/hir-ty-mir/src/mir/transform`: `AddAsserts`, `ElaborateDrops`,
@@ -610,6 +941,8 @@ programs; it is the specification of the Rust pass of the same name.
 - MIR to Cranelift IR lowering in `crates/hir-ty-codegen` (today's path), with layout, ABI
   and unwinding.
 - Below it: the stencils, LLVM, the linker, the loader and live patching, the OS, hardware.
+- For the derivative theorems, what ["Derivatives"](#derivatives-2026-11-10) lists: Mathlib,
+  the rule generator, the link from the Lean differentiator to the Rust one, and floats.
 
 ## Two semantics, one lowering
 
@@ -629,6 +962,147 @@ The two memory models meet in one relation, which this semantics must keep stata
 structured value is related to the bytes its type's layout encodes it as (and a `Pointer` to
 an address with provenance for its allocation). Every choice in `Value.lean` is made so that
 relation can be written: values carry no layout, and nothing in the semantics reads one.
+
+## Derivatives (2026-11-10)
+
+`crates/blaze-diff` takes symbolic derivatives by a table of rules and simplifies them by a
+table of rewrites ([autodiff.md](../../../future/autodiff.md)). Both tables are proved, over
+the reals, in a second Lake package, `lean/analysis`. Objective V10 is the row.
+
+**What Lean has checked and what nothing has compiled.** `lake build` of `lean/analysis`
+passes with Lean 4.20.0 at commit a36c7907ae: every theorem below is checked by Lean (their
+axioms are printed and held by the gate, above). The Rust side of the same work has never been compiled: the
+generated table's wiring into `diff::RULES` and `simplify::REWRITES`, the fix of `powi` at
+`i32::MIN`, `eval::dual` and every new test are written and not built.
+
+**Two packages.**
+- `lean/` is unchanged: core Lean only, no dependency, as fast to build as before
+  (`lake build` in `lean/`).
+- `lean/analysis` (package `blazeAnalysis`, library `BlazeDiff`) is for proofs that need real
+  analysis. Its `lean-toolchain` equals `lean/`'s. It requires Mathlib at commit
+  `c211948581bde9846a99e32d97a03f0d5307c31e`, which is what Mathlib's tag `v4.20.0` names (the
+  Mathlib built for Lean 4.20.0), and it requires `lean/` by path, so it reuses `Blaze.*` and
+  does not copy it: a `powi` exponent is `Blaze.I32`, Rust's `i32` as `Blaze.Scalar` models it.
+  Build: in `lean/analysis`, `lake exe cache get` (Mathlib's prebuilt files; Mathlib is never
+  compiled here), then `lake build`. `lake-manifest.json` is checked in, so what Mathlib itself
+  needs is pinned too; `lake update` rewrites it, and is run only to move the pin.
+
+**One source for the rules.** `crates/blaze-diff/rules.json` lists the operations, each
+derivative rule (its tangent as a template, its kink, its domain, its IEEE condition) and each
+rewrite (both sides, its class, and for a `fast_math` one the condition its theorem assumes).
+`harness/v2/diff_rules.py` writes from it:
+- `crates/blaze-diff/src/rules_gen.rs`, which `lib.rs` includes: `diff::RULES` and
+  `simplify::REWRITES` are these tables, and the Rust types (`Rule`, `P`, `Rewrite`, `Pat`)
+  are unchanged;
+- `lean/analysis/BlazeDiff/Ops.lean` (`Op`), `Rules.lean` (`Rules.tangent`, `Rules.domain`,
+  `Rules.kink`) and `Rewrites.lean` (one statement per `fast_math` rewrite).
+
+Its `check` fails when any of the four is not what `rules.json` generates, and runs in the
+gate. So the table blaze runs and the table the theorems are about cannot differ. Nothing is
+hand-written on both sides; what stays hand-written once is the Rust `Op` enum (a test holds
+it to the generated list), the meaning of each operation and of each `Domain` in Lean
+(`Expr.lean`, `Template.lean`), and the Rust `Domain::distance`.
+
+**The Lean side** (`lean/analysis/BlazeDiff`).
+- `Expr` is a `Graph` node as a tree, over the generated `Op`. `Expr.eval env e : ℝ` and
+  `Expr.holds env e : Prop` are its meaning at a point `env : ℕ → ℝ`, with Mathlib's total
+  functions (`Real.log`, `Real.sqrt`, `/`, `Real.rpow`, `zpow`).
+- `diff c x e` is `d(e)/d(variable x)` with `c` the value chosen at a kink. At each node it
+  instantiates `Rules.tangent op`: no derivative is written in `Diff.lean`.
+- `DiffAt env x e` is where the rules claim `e` differentiable: every node is inside its
+  rule's `Rules.domain`, and a `select` (whose kink is at its condition) has a condition that
+  does not change near the point and a differentiable taken arm.
+- `Sound.lean` has one lemma per operation (`rule_sound_add`, ..., `rule_sound_select`), each
+  one Mathlib lemma away. `Correct.lean` checks by unfolding that the generated template is
+  the tangent each lemma is about, then proves by induction:
+
+```lean
+theorem diff_correct (c : ℝ) (env : ℕ → ℝ) (x : ℕ) (e : Expr) (h : DiffAt env x e) :
+    HasDerivAt (fun t => e.eval (Function.update env x t)) ((diff c x e).eval env) (env x)
+
+theorem gradient_correct (c : ℝ) (env : ℕ → ℝ) (vars : List ℕ) (e : Expr)
+    (h : ∀ x ∈ vars, DiffAt env x e) :
+    ∀ x ∈ vars,
+      HasDerivAt (fun t => e.eval (Function.update env x t)) ((diff c x e).eval env) (env x)
+
+theorem jacobian_correct (c : ℝ) (env : ℕ → ℝ) (vars : List ℕ) (roots : List Expr)
+    (h : ∀ e ∈ roots, ∀ x ∈ vars, DiffAt env x e) :
+    ∀ e ∈ roots, ∀ x ∈ vars,
+      HasDerivAt (fun t => e.eval (Function.update env x t)) ((diff c x e).eval env) (env x)
+
+theorem hessian_entry_correct (c : ℝ) (env : ℕ → ℝ) (x y : ℕ) (e : Expr)
+    (h : DiffAt env y (diff c x e)) :
+    HasDerivAt (fun t => (diff c x e).eval (Function.update env y t))
+      ((diff c y (diff c x e)).eval env) (env y)
+```
+
+- **At a kink** (`Kink.lean`), where `diff_correct` says nothing, what
+  `Choice::Subgradient(c)` gives is proved of the generated template: `abs` at 0 has tangent
+  `t0 * c`, and a `c` in `[-1, 1]` is a subgradient; `min` and `max` at a tie have
+  `c * t0 + (1 - c) * t1`, for `c` in `[0, 1]` a supergradient of `min` and a subgradient of
+  `max`; `sqrt` at 0 has `c * t0`, a convention (there is no subgradient); `select` has its
+  taken arm's.
+
+```lean
+theorem abs_choice_is_subgradient (c : ℝ) (h1 : -1 ≤ c) (h2 : c ≤ 1) (y : ℝ) :
+    |(0 : ℝ)| + c * (y - 0) ≤ |y|
+
+theorem max_choice_is_subgradient (c : ℝ) (h0 : 0 ≤ c) (h1 : c ≤ 1) (a u v : ℝ) :
+    max a a + (c * (u - a) + (1 - c) * (v - a)) ≤ max u v
+
+theorem min_choice_is_supergradient (c : ℝ) (h0 : 0 ≤ c) (h1 : c ≤ 1) (a u v : ℝ) :
+    min u v ≤ min a a + (c * (u - a) + (1 - c) * (v - a))
+```
+
+- **Rewrites** (`RewriteProofs.lean`). Each of the 28 `fast_math` rewrites is a generated
+  statement, for example
+
+```lean
+def mul_div_cancel : Prop :=
+  ∀ (env : ℕ → ℝ) (a b : Expr),
+    b.eval env ≠ (0 : ℝ) →
+    (Expr.bin .div (Expr.bin .mul a b) b).eval env = a.eval env
+```
+
+  and `theorem rewrites_sound : Rewrite.AllSound` proves them all; `Rewrite.AllSound` is a
+  generated structure with one field per rewrite, so a rewrite added without a proof does not
+  build. For the 21 exact rewrites nothing is generated: they claim equal IEEE 754 bits, which
+  is not a statement about the reals. The crate's tests hold them, on `f64` and `f32` bits
+  (`each_exact_rewrite_keeps_every_bit_f32_sampled`, and the same over all 2^32 patterns
+  under `--ignored`).
+
+**What the proof found.** `powi`'s rule took the exponent less one by wrapping, so at
+`i32::MIN` the derivative was `n * x^i32::MAX`. Stating the rule with the exponent a
+`Blaze.I32`, not an unbounded integer, showed it; `PowiDown` is now the node over its argument
+there, in Rust and in Lean.
+
+**The Rust side is held to a second method.** `eval::dual` is forward-mode differentiation by
+dual numbers over the same graph. It does not read `RULES`: each operation's derivative is
+written out from its definition, on purpose, because an oracle must not share the thing it
+checks. The refinement test `the_symbolic_derivative_is_the_dual_tangent` draws expressions
+and points inside the domains and requires the symbolic derivative to equal the dual tangent
+within `1e-10` of the sum of the tangent's terms, with central finite differences as a third
+check and four planted bugs, one of them too small for finite differences to see.
+
+**Trusted, beyond what is proved** (added to the list above):
+- **Mathlib** at the pinned commit, with Lean's three axioms, which its real analysis uses.
+- **The generator** (`diff_rules.py`): that the Rust table and the Lean table it writes say
+  the same thing. Its selftest and the dual-number test are the evidence; it is not proved.
+- **The link from the Lean `diff` to the Rust `Differentiator`.** The Lean one recurses over a
+  term and builds every zero; the Rust one walks a hash-consed DAG once, never builds a
+  structural zero or one, and asks a rule's domain only at nodes the variable reaches. That
+  sharing and elision change no value is assumed, and tested by the dual-number refinement.
+  One consequence is not covered: `powf` by a constant exponent with a base that is not
+  positive, which Rust differentiates and `DiffAt` excludes.
+- **Floats.** Every theorem is over `ℝ`. `Blaze` has no model of IEEE 754 and none is built
+  here: Rust evaluates in `f32` or `f64`, where a derivative agrees with the real one up to
+  rounding only while every value is finite, and a `fast_math` rewrite can change a result.
+  NaN, infinities, signed zeros and rounding are covered by tests alone.
+- **The simplifier's engine.** Each rewrite is proved; that the e-graph (union-find, rebuild,
+  constant folding, extraction) applies only rewrites and keeps congruence is tested, not
+  proved.
+- **Lifting and lowering** (`crates/blaze-diff-mir`): that a `Graph` means what the MIR it
+  was lifted from means.
 
 ## v1: interior mutability and unsafe, by deep embedding
 

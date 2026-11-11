@@ -126,8 +126,11 @@ jobs:
       - run: bun site/node_modules/.bin/tsc -p tools/agents
       - run: bun tools/agents/rules.ts --check
       # Each doc says what it is, the current ones hold against the tree, and docs/README.md is
-      # their index (tools/docs.py).
-      - run: python3 tools/docs.py check
+      # their index (tools/docs.py). And no Python file is added: tools/python-allowed.txt lists
+      # the ones left and only shrinks (docs/v2/plan/design/scripts.md).
+      - run: |
+          python3 tools/docs.py selftest
+          python3 tools/docs.py check
       # The objectives ledger's rows are well formed and its table is current (harness/v2/ledger.py).
       - run: |
           uv run --frozen python harness/v2/ledger.py selftest
@@ -147,6 +150,18 @@ jobs:
       - run: |
           uv run --frozen python harness/v2/invariants.py selftest
           uv run --frozen python harness/v2/invariants.py '{"command": "check"}'
+      # blaze-diff's Rust tables and the Lean ones the proofs are about are what
+      # crates/blaze-diff/rules.json generates (harness/v2/diff_rules.py).
+      - run: |
+          uv run --frozen python harness/v2/diff_rules.py selftest
+          uv run --frozen python harness/v2/diff_rules.py '{"command": "check"}'
+      # The Lean proofs, as far as no Lean is needed (harness/v2/lean_gate.py): the list of
+      # theorems (lean/theorems.json) names statements that are there, no source says `sorry`,
+      # `native_decide`, `axiom` or `partial def`, lean/analysis's manifest is checked in at the
+      # pinned Mathlib, and docs/v2/plan/proofs.md is current. The `lean` job builds them.
+      - run: |
+          uv run --frozen python harness/v2/lean_gate.py selftest
+          uv run --frozen python harness/v2/lean_gate.py '{"command": "sources"}'
       # Each hash domain in crates/ is written once outside tests (tools/v2/domains.py).
       - run: |
           uv run --frozen python tools/v2/domains.py '{"root": "."}'
@@ -159,6 +174,60 @@ jobs:
           if [ "$(git show FETCH_HEAD:crates/blaze-profile/src/schema.rs | version)" != "$(version crates/blaze-profile/src/schema.rs)" ]; then
             uv run --frozen python .github/scripts/explore_page.py '{}'
           fi
+
+  # The Lean proofs hold (rule verified-compiler; harness/v2/lean_gate.py, docs/v2/plan/proofs.md):
+  # with the Lean lean/lean-toolchain pins, `lake build` of lean/ (core Lean: the semantics of
+  # MIR, the proved passes, the models and their proofs) and of lean/analysis (the derivative
+  # proofs, on Mathlib's prebuilt files from `lake exe cache get`: Mathlib is never compiled);
+  # no declaration uses `sorry`; and each theorem of lean/theorems.json exists and rests on no
+  # axiom but `propext`, `Classical.choice` and `Quot.sound` (`#print axioms`). On every change:
+  # a proof is about the Rust beside it (the embedded bodies, the rule table), so no list of
+  # paths says when it need not run. elan is the release binary, checked by its sha256; it and
+  # Mathlib's files are cached by the toolchain and lean/analysis's pins, and lean/'s own build
+  # by its sources. About 4 minutes from the caches and about 15 without (not yet measured).
+  lean:
+    name: lean proofs
+    runs-on: [ix, arm64]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: '0.13.5'
+          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (ix runners are arm64)
+          enable-cache: false
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.elan
+            lean/analysis/.lake
+          key: lean-${{ runner.arch }}-${{ hashFiles('lean/lean-toolchain', 'lean/analysis/lakefile.toml', 'lean/analysis/lake-manifest.json') }}
+      - uses: actions/cache@v6
+        with:
+          path: lean/.lake
+          key: lean-core-${{ runner.arch }}-${{ hashFiles('lean/lean-toolchain') }}-${{ hashFiles('lean/**/*.lean', 'crates/*/lean/**/*.lean', 'lean/lakefile.toml') }}
+          restore-keys: lean-core-${{ runner.arch }}-${{ hashFiles('lean/lean-toolchain') }}-
+      # The release binary of elan, checked by its sha256, then the toolchain lean/lean-toolchain
+      # pins. The gate names that toolchain's `lake` by its path, never PATH.
+      - name: elan 4.2.4 and the pinned Lean
+        run: |
+          pin=$(cat lean/lean-toolchain)
+          lake="$HOME/.elan/toolchains/$(echo "$pin" | sed 's|/|--|g; s|:|---|g')/bin/lake"
+          if [ ! -x "$lake" ]; then
+            case "$RUNNER_ARCH" in
+              ARM64) arch=aarch64 sum=05febd124d84ebf994b2e7479922a5650b1e950c17ae3bd1ddd776b65bb72bf9 ;;
+              *) echo "::error::no pinned elan for $RUNNER_ARCH"; exit 1 ;;
+            esac
+            tgz="$RUNNER_TEMP/elan.tar.gz"
+            curl -fsSL --retry 3 -o "$tgz" "https://github.com/leanprover/elan/releases/download/v4.2.4/elan-$arch-unknown-linux-gnu.tar.gz"
+            echo "$sum  $tgz" | sha256sum -c -
+            tar -xzf "$tgz" -C "$RUNNER_TEMP" elan-init
+            "$RUNNER_TEMP/elan-init" -y --no-modify-path --default-toolchain none
+            "$HOME/.elan/bin/elan" toolchain install "$pin"
+          fi
+          "$lake" --version
+      - run: |
+          uv run --frozen python harness/v2/lean_gate.py '{"command": "check"}'
 
   # Every workflow parses and holds together (actionlint): a workflow whose YAML does not parse
   # fails on push with no jobs and says so nowhere (release.yaml, promote.yaml and yank.yaml after
@@ -415,7 +484,7 @@ jobs:
 
   ci:
     name: ci
-    needs: [changes, scripts, workflows, linux-arm64, linux-6-8, macos, workspace-check]  # lint-baselines joins once the first baselines exist (blaze check --workspace crashes today)
+    needs: [changes, scripts, workflows, lean, linux-arm64, linux-6-8, macos, workspace-check]  # lint-baselines joins once the first baselines exist (blaze check --workspace crashes today)
     if: always()
     runs-on: [ix, arm64]
     timeout-minutes: 5

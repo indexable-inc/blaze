@@ -136,6 +136,10 @@ theorem lit_val (ty : ScalarTy) (x : Int) (h : ty.min ≤ x ∧ x ≤ ty.max) :
   unfold lit
   rw [dif_pos h]
 
+/-- An integer written back from its own value is itself. -/
+theorem lit_self {ty : ScalarTy} (x : Scalar ty) : lit ty x.val = x :=
+  ext (lit_val ty x.val ⟨x.hmin, x.hmax⟩)
+
 instance {ty : ScalarTy} {n : Nat} : OfNat (Scalar ty) n := ⟨lit ty (n : Int)⟩
 
 /-- A numeral in range is its value: `(1 : Usize).val = 1`. -/
@@ -152,6 +156,11 @@ theorem checked_ok (ty : ScalarTy) (x : Int) (h : ty.min ≤ x ∧ x ≤ ty.max)
     checked ty x = Result.ok ⟨x, h.1, h.2⟩ := by
   unfold checked
   rw [dif_pos h]
+
+theorem checked_fail (ty : ScalarTy) (x : Int) (h : ¬ (ty.min ≤ x ∧ x ≤ ty.max)) :
+    checked ty x = Result.fail Error.arithmetic := by
+  unfold checked
+  rw [dif_neg h]
 
 /-- `x` brought to the nearest end of `ty`'s range. -/
 def clamp (ty : ScalarTy) (x : Int) : Scalar ty :=

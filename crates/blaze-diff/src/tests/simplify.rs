@@ -6,7 +6,7 @@ use hegel::generators as gs;
 
 use super::{float_term, pick};
 use crate::{
-    eval::{Value, eval_all, same},
+    eval::{Value, apply, eval_all, same},
     expr::{Graph, Id, Node, Op, Sort, Width, payload_of},
     simplify::{
         CostModel, EGraph, Fuel, Ieee, MAX_VARS, Options, Pat, REWRITES, Rewrite, Stop, rewrites,
@@ -119,10 +119,15 @@ fn the_oracle_catches_x_minus_x_rewritten_to_zero() {
 /// A rewrite's two sides as terms over variables: a float variable `i` is `x_i`, a condition
 /// variable `i` is `x_i < x_(MAX_VARS + i)`.
 fn sides(rule: &Rewrite) -> (Graph, [Id; 2], usize) {
+    sides_in(rule, Width::F64).0
+}
+
+/// [`sides`] over `width`, and the sort of each variable the rewrite binds.
+fn sides_in(rule: &Rewrite, width: Width) -> ((Graph, [Id; 2], usize), [Option<Sort>; MAX_VARS]) {
     let mut sorts = [None; MAX_VARS];
     rule.lhs
         .sorts(rule.lhs.sort().expect("a rewrite's left side is not a lone variable"), &mut sorts);
-    let mut graph = Graph::new(Width::F64);
+    let mut graph = Graph::new(width);
     let mut vars = [Id::NONE; MAX_VARS];
     let mut used = 0;
     for (at, sort) in sorts.iter().enumerate() {
@@ -141,7 +146,7 @@ fn sides(rule: &Rewrite) -> (Graph, [Id; 2], usize) {
     }
     let lhs = rule.lhs.build(&mut graph, &vars);
     let rhs = rule.rhs.build(&mut graph, &vars);
-    (graph, [lhs, rhs], used)
+    ((graph, [lhs, rhs], used), sorts)
 }
 
 /// The coordinates of a point: both sides' variables. Named because the released blaze
@@ -197,6 +202,155 @@ fn each_exact_rewrite_holds_bit_for_bit_on_any_bits(tc: hegel::TestCase) {
     if let Err(message) = refines((&graph, &[lhs]), (&graph, &[rhs]), &point) {
         panic!("`{}` is not exact: {message}", rule.name);
     }
+}
+
+/// A rewrite's two sides over `f32`, evaluated without allocating: what an exhaustive run
+/// needs.
+struct InF32 {
+    graph: Graph,
+    lhs: Id,
+    rhs: Id,
+    values: Vec<Value<f32>>,
+    /// Whether the rewrite binds one variable, a float: every input is then one `f32`.
+    one_float: bool,
+}
+
+impl InF32 {
+    fn new(rule: &Rewrite) -> InF32 {
+        let ((graph, [lhs, rhs], _), sorts) = sides_in(rule, Width::F32);
+        let one_float = sorts == [Some(Sort::Float), None, None, None];
+        let values = vec![Value::Bool(false); graph.len()];
+        InF32 { graph, lhs, rhs, values, one_float }
+    }
+
+    /// Whether the two sides have the same value at `point`: the same bits, any NaN being any
+    /// NaN, or the same condition.
+    fn holds_at(&mut self, point: &[f32; 2 * MAX_VARS]) -> bool {
+        // Every node is of one of the two sides: all are computed, in id order.
+        for (at, node) in self.graph.nodes().iter().enumerate() {
+            let mut args = [Value::Bool(false); 3];
+            for (slot, arg) in node.args().iter().enumerate() {
+                args[slot] = self.values[arg.index()];
+            }
+            self.values[at] = match node.op {
+                Op::Var => Value::Float(point[node.payload as usize]),
+                _ => apply::<f32>(node, &args[..node.op.arity()]).expect("not a variable"),
+            };
+        }
+        match (self.values[self.lhs.index()], self.values[self.rhs.index()]) {
+            (Value::Float(old), Value::Float(new)) => same(old, new),
+            (Value::Bool(old), Value::Bool(new)) => old == new,
+            _ => false,
+        }
+    }
+
+    /// The first of `inputs`, as the bits of the one variable, at which the sides differ.
+    fn first_difference(&mut self, inputs: impl Iterator<Item = u32>) -> Option<u32> {
+        let mut point = [1.0f32; 2 * MAX_VARS];
+        inputs.into_iter().find(|&bits| {
+            point[0] = f32::from_bits(bits);
+            !self.holds_at(&point)
+        })
+    }
+}
+
+/// The `f32` bit patterns a sampled run takes: both zeros, both infinities, NaNs of both signs
+/// and kinds, the ends of the subnormals and of the normals, then every 65,521st pattern (a
+/// prime, so the samples fall on no fixed low bits).
+fn sampled_f32() -> impl Iterator<Item = u32> {
+    const EDGES: [u32; 14] = [
+        0x0000_0000,
+        0x8000_0000,
+        0x7f80_0000,
+        0xff80_0000,
+        0x7fc0_0000,
+        0xffc0_0000,
+        0x7f80_0001,
+        0x0000_0001,
+        0x8000_0001,
+        0x007f_ffff,
+        0x0080_0000,
+        0x7f7f_ffff,
+        0xff7f_ffff,
+        0x3f80_0000,
+    ];
+    EDGES.into_iter().chain((0..=u32::MAX).step_by(65_521))
+}
+
+/// The invariant: an exact rewrite of one float variable keeps every bit, on `f32` inputs: at
+/// the edge patterns and one pattern in every 65,521, the two sides are the same bits (any NaN
+/// being any NaN). `each_exact_rewrite_keeps_every_bit_f32_exhaustive` is the same over all
+/// 2^32 patterns.
+#[test]
+fn each_exact_rewrite_keeps_every_bit_f32_sampled() {
+    let mut checked = 0;
+    for rule in REWRITES.iter().filter(|it| it.ieee == Ieee::Exact) {
+        let mut sides = InF32::new(rule);
+        if !sides.one_float {
+            continue;
+        }
+        checked += 1;
+        if let Some(bits) = sides.first_difference(sampled_f32()) {
+            panic!("`{}` is not exact at the f32 bits {bits:#010x}", rule.name);
+        }
+    }
+    // mul-one, div-one, add-minus-zero, sub-zero, neg-neg, mul-minus-one, div-minus-one,
+    // double, abs-neg, abs-abs.
+    assert_eq!(checked, 10, "the exact rewrites of one float variable");
+}
+
+/// Every `f32` there is, for each exact rewrite of one float variable: 2^32 inputs each, ten
+/// rewrites, a few nodes per side, so some 10^11 node evaluations on one core. Its time has not
+/// been measured (an estimate: minutes per rewrite optimized, hours unoptimized), so it is not
+/// in the default run: run it with `--ignored`, optimized, and write the time here.
+#[test]
+#[ignore = "exhaustive over 2^32 inputs for each of ten rewrites: run with --ignored, optimized"]
+fn each_exact_rewrite_keeps_every_bit_f32_exhaustive() {
+    for rule in REWRITES.iter().filter(|it| it.ieee == Ieee::Exact) {
+        let mut sides = InF32::new(rule);
+        if !sides.one_float {
+            continue;
+        }
+        if let Some(bits) = sides.first_difference(0..=u32::MAX) {
+            panic!("`{}` is not exact at the f32 bits {bits:#010x}", rule.name);
+        }
+    }
+}
+
+/// The exact rewrites of several variables, and of conditions, on any `f32` bits.
+#[hegel::test]
+fn each_exact_rewrite_holds_bit_for_bit_on_any_f32_bits(tc: hegel::TestCase) {
+    let exact = rewrites(false);
+    let rule = &exact[pick(&tc, exact.len() as u32 - 1) as usize];
+    let mut sides = InF32::new(rule);
+    let mut point = [0.0f32; 2 * MAX_VARS];
+    for coordinate in &mut point {
+        *coordinate = if pick(&tc, 3) == 0 {
+            f32::from_bits(tc.draw(gs::integers::<u32>()))
+        } else {
+            SPECIAL[pick(&tc, SPECIAL.len() as u32 - 1) as usize] as f32
+        };
+    }
+    assert!(sides.holds_at(&point), "`{}` is not exact in f32 at {point:?}", rule.name);
+}
+
+#[test]
+fn the_oracle_catches_x_plus_zero_called_exact_at_minus_zero_alone() {
+    // `x + 0.0 → x` holds for every f32 but one: `-0.0 + 0.0` is `0.0`. A sampled run that did
+    // not take the edge patterns would pass it.
+    const PLANTED: Rewrite = Rewrite {
+        name: "planted-add-zero",
+        lhs: Pat::N(Op::Add, &[Pat::V(0), Pat::K(0.0)]),
+        rhs: Pat::V(0),
+        ieee: Ieee::Exact,
+    };
+    let mut planted = InF32::new(&PLANTED);
+    assert!(planted.one_float);
+    assert_eq!(planted.first_difference(sampled_f32()), Some(0x8000_0000));
+    assert_eq!(planted.first_difference((0..=u32::MAX).step_by(65_521)), None);
+    // And the right rewrite, with `-0.0`, passes the same run.
+    let right = REWRITES.iter().find(|it| it.name == "add-minus-zero").expect("in the table");
+    assert_eq!(InF32::new(right).first_difference(sampled_f32()), None);
 }
 
 #[test]
