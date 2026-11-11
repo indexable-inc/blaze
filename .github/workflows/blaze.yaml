@@ -155,10 +155,10 @@ jobs:
           uv run --frozen python harness/v2/guards.py selftest
           uv run --frozen python harness/v2/changed.py selftest
       # Every stated invariant has a control beside it, and docs/v2/plan/invariants.md lists them
-      # (harness/v2/invariants.py).
+      # (scripts/src/bin/invariants.rs).
       - run: |
-          uv run --frozen python harness/v2/invariants.py selftest
-          uv run --frozen python harness/v2/invariants.py '{"command": "check"}'
+          blaze run -q -p scripts --bin invariants -- selftest
+          blaze run -q -p scripts --bin invariants -- '{"command": "check"}'
       # blaze-diff's Rust tables and the Lean ones the proofs are about are what
       # crates/blaze-diff/rules.json generates (harness/v2/diff_rules.py).
       - run: |

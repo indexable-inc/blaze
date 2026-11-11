@@ -119,7 +119,6 @@ harness/v2/frontend/borrowck_flow.py
 harness/v2/frontend/cases.py
 harness/v2/guards.py
 harness/v2/incraudit.py
-harness/v2/invariants.py
 harness/v2/lean_differential.py
 harness/v2/lean_gate.py
 harness/v2/macroeval_corpus.py

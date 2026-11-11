@@ -52,7 +52,7 @@ What must hold for any of the speed to count.
 | C5 | blaze runs rustc nowhere (docs/no-rustc.md lists what is left) | *write: one check per remaining step of docs/no-rustc.md* |  | ? |
 | C6 | blaze rejects what rustc rejects, with the same code and primary span, and accepts what it accepts | `corpus.py {"projects": ["rejections"]}`; *write: confirm corpus.py's rejections cover rustc's UI tests, or add them* |  | ? |
 | C7 | No `todo!`, `unimplemented!` or fallback path in crates/ | *write: a lint in `blaze check`* |  | ? |
-| V1 | Every invariant blaze states has a planted-bug control, and all are listed in invariants.md | `invariants.py {"command": "check"}` |  | ? |
+| V1 | Every invariant blaze states has a planted-bug control, and all are listed in invariants.md | `invariants.rs {"command": "check"}` |  | ? |
 | V2 | Each subsystem with a simulation test has a reference model as an ordinary type in its crate, one generic harness (bstd::test's Refines) checks the real code refines it, and the model is what is translated to Lean | *write: a refinement stated for the store, the pool, the vfs and bstd's Fs, each with a planted difference* |  | ? |
 | V3 | bstd's public functions carry contracts (requires and ensures), each run as a generated property test | *write: contracts on bstd's API and the generator of reflect.md item 7* |  | ? |
 | V4 | The simulated driver refines each native driver on the effects both run | *write: one test per native driver that replays seeded effect sequences on both and compares completions* |  | ? |

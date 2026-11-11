@@ -212,9 +212,9 @@ crash-recovering code is at least simulated; what must never be wrong (a key's h
 round trip) is proved. When two levels disagree, one of them has a bug, and that is a finding.
 
 In the code, a statement is a doc comment opening `/// The invariant:`, `/// The refinement:` or
-`/// The reference model:`. `harness/v2/invariants.py` collects them, with the level each has
-reached, into [invariants.md](plan/invariants.md), and fails the gate when one has no planted-bug
-control beside it or names a proof that is not there. So what blaze guarantees, and how strongly,
+`/// The reference model:`. `scripts/src/bin/invariants.rs` collects them, with the level each
+has reached, into [invariants.md](plan/invariants.md), and fails the gate when one has no
+planted-bug control beside it or names a proof that is not there. So what blaze guarantees, and how strongly,
 is read in one place; dropping or weakening a guarantee is a visible line in a pull request; and
 generated code is judged against that list, not against itself.
 
