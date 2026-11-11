@@ -560,9 +560,9 @@ impl Io {
     }
 
     /// The bounds this world was made with.
-    #[blaze::nopanic]
-    #[blaze::noalloc]
-    #[blaze::nonblocking]
+    #[blaze::nopanic(trusted = "one field read; the `dyn Probe` the world's lock holds is never called")]
+    #[blaze::noalloc(trusted = "one field read; the `dyn Probe` the world's lock holds is never called")]
+    #[blaze::nonblocking(trusted = "one field read; the `dyn Probe` the world's lock holds is never called")]
     pub fn limits(&self) -> Limits {
         self.limits
     }

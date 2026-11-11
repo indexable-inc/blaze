@@ -61,6 +61,11 @@ impl Cancel {
         Arc::new(Cancel { set: AtomicBool::new(false), outer })
     }
 
+    /// Checked for [`Cx::cancelled`] and [`Cx::check`], which the check cannot see whole:
+    /// a context holds its world, whose lock holds a `dyn Probe`, and a function that takes
+    /// a `dyn` is refused whether or not it calls through it.
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     fn is_set(&self) -> bool {
         let mut at = Some(self);
         while let Some(cancel) = at {
@@ -113,31 +118,31 @@ impl Cx {
     }
 
     /// The deadline every wait under it ends by.
-    #[blaze::nopanic]
-    #[blaze::noalloc]
-    #[blaze::nonblocking]
+    #[blaze::nopanic(trusted = "one field read; the `dyn Probe` its world's lock holds is never called")]
+    #[blaze::noalloc(trusted = "one field read; the `dyn Probe` its world's lock holds is never called")]
+    #[blaze::nonblocking(trusted = "one field read; the `dyn Probe` its world's lock holds is never called")]
     pub fn deadline(&self) -> Deadline {
         self.deadline
     }
 
     /// The span's name.
-    #[blaze::nopanic]
-    #[blaze::noalloc]
-    #[blaze::nonblocking]
+    #[blaze::nopanic(trusted = "one field read; the `dyn Probe` its world's lock holds is never called")]
+    #[blaze::noalloc(trusted = "one field read; the `dyn Probe` its world's lock holds is never called")]
+    #[blaze::nonblocking(trusted = "one field read; the `dyn Probe` its world's lock holds is never called")]
     pub fn name(&self) -> &'static str {
         self.span
     }
 
     /// Whether its scope, or a scope it is inside, was cancelled.
-    #[blaze::noalloc]
-    #[blaze::nonblocking]
+    #[blaze::noalloc(trusted = "only `Cancel::is_set`, which is checked; the `dyn Probe` its world's lock holds is never called")]
+    #[blaze::nonblocking(trusted = "only `Cancel::is_set`, which is checked; the `dyn Probe` its world's lock holds is never called")]
     pub fn cancelled(&self) -> bool {
         self.cancel.is_set()
     }
 
     /// [`Stopped::Cancelled`] once its scope was cancelled: the line a long computation calls.
-    #[blaze::noalloc]
-    #[blaze::nonblocking]
+    #[blaze::noalloc(trusted = "only `Cancel::is_set`, which is checked, and one enum value; the `dyn Probe` its world's lock holds is never called")]
+    #[blaze::nonblocking(trusted = "only `Cancel::is_set`, which is checked, and one enum value; the `dyn Probe` its world's lock holds is never called")]
     pub fn check(&self) -> Result<(), Stopped> {
         match self.cancelled() {
             true => Err(Stopped::Cancelled { span: self.span }),
