@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-56 invariants, 8 refinements, 2 reference models.
-By level: 39 tested, 25 simulated, 0 model-checked, 0 proved.
+57 invariants, 8 refinements, 3 reference models.
+By level: 40 tested, 25 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
@@ -170,6 +170,11 @@ By level: 39 tested, 25 simulated, 0 model-checked, 0 proved.
 - **`what_is_kept_after_an_answer_survives_any_crash_and_no_lost_value_is_served`** *tested* (`crates/blaze-storemodel/src/tests.rs`): an answer may be sent on results not yet durable; nothing derived from that answer is reused across a crash unless its tickets were durable. After any crash the restore serves no value whose bytes were lost, holds everything the store called durable and everything an answered build kept, and every answer's settling ended kept or said lost. Two builds on shared and separate keys with a reader, and a snapshot beside a build, each build answering before it flushes: every schedule, a crash after every IO step, so at every point between an answer sent and its results durable; with an IO failure anywhere, so a settling that ends with the store stopped. Then two kernel gets of one identity in two worlds racing for one shape slot, each answering at once and keeping what it left once it and every store before it is durable, with an IO failure anywhere and effects completing in any order.
   Controls: `a_kept_answer_relied_on_before_its_tickets_were_durable`, `a_settling_failure_dropped_silently`.
 
+### hir-ty-mir
+
+- **`the_walk_agrees_with_the_reference_model`** *tested* (`crates/hir-ty-mir/src/tests/consteval/reach.rs`): for a random program of structs whose fields are plain, boxed, in a `Vec`, behind a counted or weak pointer, in a cell or in a generic struct, in any nesting and recursion, the walk clears a struct for the cycle question exactly when the reference model ([`model_is_acyclic`]) finds no way for a value of it to own itself.
+  Controls: `a_shared_pointer_inside_an_option_in_a_cell_missed`, `a_box_recursion_taken_for_a_cycle`, `a_visited_set_keyed_by_name`.
+
 ## Refinements
 
 ### blaze-cargo
@@ -215,3 +220,7 @@ By level: 39 tested, 25 simulated, 0 model-checked, 0 proved.
 ### blaze-link
 
 - **`Program`** (`crates/blaze-link/src/tests/patch.rs`): a program is its functions by name and its statics' values; what it does is what [`normal`] reads of a fresh link of it.
+
+### hir-ty-mir
+
+- **`model_is_acyclic`** (`crates/hir-ty-mir/src/tests/consteval/reach.rs`): `S{root}` can own itself when some cell it owns (at any depth) owns (at any depth) a counted pointer whose pointee owns (at any depth) an `S{root}`. An explicit search with no pruning and no position flag, over the same description.

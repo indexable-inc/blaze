@@ -13,7 +13,7 @@ remembered. How rows are picked, worked and landed is
 `harness/v2/ledger.py`. A check in *italics* is not written yet, and writing it is the first
 part of the work. `?` is not measured; "last known" is a lead, not a status.
 
-94 objectives: 0 met, 0 open, 0 blocked, 94 not measured.
+96 objectives: 0 met, 0 open, 0 blocked, 96 not measured.
 
 ## Targets
 
@@ -124,6 +124,8 @@ The parts of [the design](../plan.md#the-design) no check has shown yet.
 | E11 | Effects are declared by what a function may do: #[blaze::may(panic, alloc, block, diverge)], with undeclared_effect, unneeded_effect and negative_effect | *write: the lints' tests on a stage 1; no rule accepts a `for` loop as bounded* | written on terminates-effect, unbuilt (2026-11-10) | ? |
 | E12 | A workspace's proc macros and its build scripts' ambient std uses are linted, warn once their replacements are in the tree | *write: the lints' tests on a stage 1; three of four are allow until reflection phase 2 and bstd land* | written on lints-macros-scripts-1110, unbuilt (2026-11-10) | ? |
 | S6 | No bstd API hides a cost or a guarantee: durability, waits, allocation, buffering and policy are arguments or types | *write: the explicitness tables of design/std.md and the file-durability simulation test* |  | ? |
+| E16 | Const generic arguments may be expressions over generic parameters (generic const expressions), checked and unified by blaze's own front end under an opt-in attribute | *write: on a stage 1: hir-ty `const_exprs::tests` and hir-ty-mir `tests::where_const` (concrete_expressions_unify_by_evaluation, generic_expressions_unify_by_normal_form, an_expression_is_never_solved_for_its_parameters, an_overflow_at_an_instantiation_is_its_error). Still to write: the reported error for an argument in a type whose evaluation overflows, expressions in a body's turbofish, and a crate without `#![feature(blaze_const_exprs)]` building to the same bytes* | spec (design/ownership.md, section 4) and first slice written on lang-int-1110, unbuilt (2026-11-10) | ? |
+| E17 | `Acyclic` is derived by reflection with a path in its refusal; `Shared` over an acyclic type and `Shares` hold linear values | *write: on a stage 1: hir-ty-mir `tests::consteval::reach` (the walk's accepted and refused types with each path, the_walk_agrees_with_the_reference_model and its three the_oracle_catches_* controls) and `tests::where_const` (acyclic_is_derived_and_its_refusal_names_the_path, the_unmet_bound_shows_the_conditions_reason); hir-def a_where_const_condition_is_a_condition_of_the_generics; hir-ty-coherence a_where_const_impl_is_of_a_marker_trait_of_its_own_crate; hir-ty-linear's five holder tests; bstd `tests::own`. Still to write: the rendered E0277 with its note as a blaze-diagnostics fixture, and `Shared::new` admitting a linear value itself (a const fact for "is linear")* | spec and code written on lang-int-1110, unbuilt (2026-11-10) | ? |
 
 ## The agent app
 

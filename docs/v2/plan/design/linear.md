@@ -79,8 +79,8 @@ Rule 26 (semantics in the front end) puts the check in the front end, in its own
   analysis has (`Effects::add`): drop elaboration's own run is untouched.
 - `library/core/src/{option,result}.rs` and `crates/test-utils/src/minicore.rs` (the tests'
   core): the marks of rule 4.
-- `crates/hir-def`: `AttrFlags::LINEAR` and `AttrFlags::CONSUMES`, and the inert `blaze::linear` /
-  `blaze::consumes` names in `attr_resolution.rs`.
+- `crates/hir-def`: `AttrFlags::LINEAR`, `AttrFlags::CONSUMES` and `AttrFlags::HOLDS`, and the
+  inert `blaze::linear` / `blaze::consumes` / `blaze::holds` names in `attr_resolution.rs`.
 - `crates/hir-ty-borrowck`: `check_owner` calls `check_body` for each body it checks: the owner's,
   closures, coroutines and inline consts. It reports the results as `BorrowckDiagnostic`s with code
   `LINEAR`. This gives three things:
@@ -212,6 +212,25 @@ Rule 26 (semantics in the front end) puts the check in the front end, in its own
 
    This is Niko's "`?` is the hard part" answered the way unwinding already is: the type
    author says once what abandonment does, and both a panic and an error return run it.
+
+7. **A holder.** `#[blaze::holds]` on a struct or enum says a value of it holds a value of
+   each of its type arguments although no field does: a counted handle, a container over a raw
+   pointer (bstd's `Shared`, `LocalShared`, `Shares`). Two things follow:
+   - its type arguments are parts of it (rule 1), so `Shared<Txn>` holds a linear value and a
+     handle left in a scope is the error of rule 2;
+   - in the bodies of the impls of it written in the crate that defines it (closures in them
+     included), its type arguments are linear nowhere. Those bodies move the held values in and
+     out by code the check cannot follow (`Arc::into_inner`, a pointer read), as a
+     `#[blaze::consumes]` body ends a value; what they return is linear again in the caller.
+     This is a trusted boundary, like `unsafe`: the author owes that every value put in comes
+     back out by value (`release`, `whole`).
+
+   **Admission conditional on a property** needs nothing more: admission is per impl (rule 4),
+   so the impl that marks its parameter also bounds it,
+   `impl<#[blaze::linear] T: Acyclic> Shared<T> { fn holding(value: T) -> Shared<T> .. }`, and
+   a linear type without the property is refused by the bound, with the bound's own reason
+   (for `Acyclic`, the field path: [ownership](ownership.md)). The impls with no mark
+   (`new`, `Clone`) keep refusing a linear type, naming the parameter.
 
 ## Design choice and prior art
 

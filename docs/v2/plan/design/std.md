@@ -540,8 +540,9 @@ does not need the workarounds.
   without syncing), as [linear](linear.md) says; that is the one place a destructor of these types
   runs.
 - **bstd's containers say whether they admit linear elements.** `Vec`, `Option`, `Result` and
-  the maps do (and are then linear themselves); `Shared` and `LocalShared` do not, since a cycle
-  would leak one; there is no `forget`.
+  the maps do (and are then linear themselves). `Shared` and `LocalShared` do when the value's
+  type is `Acyclic`, which is derived from its shape, so no cycle can leak one
+  ([ownership](ownership.md)); `Shares` always does. There is no `forget`.
 
 ## Eval: who decides how a pure function is computed
 
@@ -808,13 +809,19 @@ they mean.
 
 | bstd | Rust's std | |
 |---|---|---|
-| `Shared<T>` / `LocalShared<T>` | `Arc` / `Rc` | both are `Handle`s ([edition](edition.md), change 1) |
+| `Shared<T>` / `LocalShared<T>` | `Arc` / `Rc` | both are `Handle`s ([edition](edition.md), change 1); over an `Acyclic` type they hold a linear value and are released by hand ([ownership](ownership.md)) |
+| `Shares<T, K, N, D>` | none | `N` of `D` parts of one `T`, the fraction in the type, no count at run time |
 | `Lock<T>`, `RwLock<T>` / `LocalLock<T>` | `Mutex`, `RwLock` / `RefCell` | the first waits, the second panics; the same operation |
 | `Once<T>`, `Lazy<T>` / `LocalOnce<T>`, `LocalLazy<T>` | `OnceLock`, `LazyLock` / `OnceCell`, `LazyCell` | |
 | `Atomic<T>` | `AtomicU32`, `AtomicBool`, ... | one generic type |
 | `Cell<T>` | `Cell` | unchanged |
 | `RawCell<T>` | `UnsafeCell` | trusted code only |
 
+- **Which sharing.** Borrow from a scope when the owners' lifetimes nest: the default, and it
+  costs nothing. `Shares` when the number of owners is fixed and known as the crate compiles:
+  each holds a fraction, any part reads, the whole writes or takes the value out. `Shared` over
+  an acyclic type when the number is decided at run time: a count, and the last `release` hands
+  the value back.
 - **These are the named locks of rule `standard-structures`**, in their one home: a `Lock` is
   made with its name, records who waited behind whom, and its `lock(cx)` is the one wait, so it
   has a deadline and can be cancelled. The removed names are banned by lint.

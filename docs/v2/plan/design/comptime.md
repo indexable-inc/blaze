@@ -77,7 +77,8 @@ Left, each a known gap rather than a quiet difference:
   type_info tests do not use it.
 - `field_offset` called at run time (not in const) reaches codegen, which has no arm for it
   and stops with its unsupported-intrinsic error. rustc answers it in codegen by const eval.
-- `Type::of::<(A, B)>()` is refused, as rustc ICEs on it at the pinned nightly.
+- `Type::of::<(A, B)>()` was refused, as rustc ICEs on it at the pinned nightly; it now answers
+  `TypeKind::Tuple` (2026-11-10, for `bstd::own`'s walk).
 
 ## Phase 2: `#![feature(blaze_comptime)]`
 
@@ -653,6 +654,22 @@ generic code can come later on top.
   owns (a `Box`, `Vec` or `String` by value, one behind `&mut` or behind an `UnsafeCell`) is
   `HeapInValue`, as today: each use of the constant would copy its owner, and a drop would free
   the constant's memory. Heap the value does not reach is dropped, as in any constant.
+
+### `where const { COND }` and names by id (2026-11-10)
+
+Two more pieces of the feature, for properties derived by a const walk over `type_info`
+([ownership](ownership.md) has the design, the coherence rule and the tests):
+
+- **`where const { COND }`**: a where predicate that is a `bool` constant over the generic
+  parameters, evaluated per instance. A blanket impl gated on it is how a reflection-derived
+  trait is stated (`unsafe impl<T: ?Sized> Acyclic for T where const { none::<T, Cycle>() } {}`).
+  A condition that panics does not hold, and its message is the reason the unmet bound's error
+  shows. `hir-def` `GenericParams::where_consts`, `ComptimeForm::WhereConst`;
+  `hir_ty::where_const`; the solver's `ConstEvaluatable` goal asks the delegate.
+- **`core::reflect::name_of(id)`** (intrinsic `blaze_type_name_of`): the type a `TypeId` is of,
+  as a diagnostic names it. A walk over ids names the types on its path with it.
+- Phase 1 answers a tuple's `TypeKind` (`Tuple`), which it refused as rustc ICEs: a walk by
+  kind has to tell a tuple from what it cannot see into.
 
 ### Without the feature
 

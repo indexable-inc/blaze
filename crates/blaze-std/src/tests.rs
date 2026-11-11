@@ -35,6 +35,8 @@
 //! - [`narrows`]: narrowing never widens, for every capability of "The rest of the set" that
 //!   has a narrowing: one harness over a trait of cases, one control a case.
 //! - [`kv`]: `Kv`, put and deleted synced, agrees with a model map through crashes.
+//! - [`own`]: the derived ownership properties hold of plain types, the last release of a
+//!   handle gives its value back, and shares split and join to the whole.
 //! - [`local`]: a local pair delivers bytes in order, exactly once.
 //! - [`budget`]: a `Net`'s byte limit and a `Dir`'s quota are never exceeded, and spent
 //!   exactly.
@@ -75,6 +77,7 @@ mod mp4;
 mod names;
 mod narrowing;
 mod narrows;
+mod own;
 mod paths;
 mod requests;
 mod scopes;
