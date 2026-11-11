@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-65 theorems: 52 in `lean`, 13 in `lean/analysis`.
+68 theorems: 55 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -512,6 +512,30 @@ theorem step_borrows {B : FnId → Local → Prop} {prog : Program} (hf : ProgFi
     {g : List (Nat × FnId)} :
     ∀ (st : State), Borrows B g st → Outcome.All (NextBorrows B) (step prog st)
   | { base
+```
+
+**`Blaze.Mir.State.setSlot_comm`** (`Blaze.Mir.Opt.SlotAlgebra`, `lean`): Replacements of two different slots commute.
+
+```lean
+theorem State.setSlot_comm (st : State) (p q : Pointer) (a b : Slot)
+    (hne : ¬ p.frame = q.frame ∨ ¬ p.slot = q.slot) :
+    (st.setSlot p a).setSlot q b = (st.setSlot q b).setSlot p a
+```
+
+**`Blaze.Mir.State.write_setSlot_other`** (`Blaze.Mir.Opt.SlotAlgebra`, `lean`): A write to another slot commutes with the replacement of a slot.
+
+```lean
+theorem State.write_setSlot_other (st : State) (p q : Pointer) (slot : Slot) (v : Value)
+    (hne : ¬ p.frame = q.frame ∨ ¬ p.slot = q.slot) :
+    (st.setSlot p slot).write q v =
+      Outcome.map (fun s => State.setSlot s p slot) (st.write q v)
+```
+
+**`Blaze.Mir.State.write_setSlot_same`** (`Blaze.Mir.Opt.SlotAlgebra`, `lean`): A write of a whole slot gives the same state whatever the slot was replaced by before.
+
+```lean
+theorem State.write_setSlot_same (st : State) (f l : Nat) (slot : Slot) (v : Value) :
+    (st.setSlot { frame
 ```
 
 **`Blaze.Mir.Opt.simplifyCfg_call`** (`Blaze.Mir.Opt.SimplifyCfg`, `lean`): SimplifyCfg composed from the proved passes keeps every call that ends, and not in undefined behaviour: the same outcome with the same fuel.

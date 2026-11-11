@@ -689,8 +689,13 @@ programs; it is the specification of the Rust pass of the same name.
     returned too, with ids below the next one, and memory holds only pointers to frame 0 or
     to a local that the function of its frame may borrow. A call adds its frame to `g`, a
     return leaves it. `step_borrows`: every step keeps it, for a program whose every `ref`
-    is of a place that may be borrowed or goes through a dereference (`ProgFine`). The rest
-    is below.
+    is of a place that may be borrowed or goes through a dereference (`ProgFine`).
+  - **Dead-store elimination: fifth piece, first part** (`Opt/SlotAlgebra.lean`; not yet
+    elaborated). The two programs' states are the same but in one slot, which is stated
+    with a map (the one is the other with that slot replaced), so the proof computes with
+    replacements: two of different slots commute (`State.setSlot_comm`), a write elsewhere
+    commutes with one (`State.write_setSlot_other`), and a write of the whole slot forgets
+    it (`State.write_setSlot_same`). The rest is below.
   - **Dead-store elimination: what is not written.** It needs a relation, not a map: two states
     equal but on dead locals. The Rust pass (`optimize/dse.rs`) removes the whole assignment
     of an rvalue it holds to be free of effects (all but a pointer-to-address cast), to a
