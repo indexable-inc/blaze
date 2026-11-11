@@ -1744,6 +1744,16 @@ fn write_side(
 /// what it costs is the span's. It reads nothing of the link's but the committed image, so
 /// the job can call it from its settling path instead, after the answer
 /// (docs/v2/plan/design/debug-side-file.md, "Not built").
+///
+/// Who reads the side file, and when: std's backtrace in the built program (as it panics),
+/// gdb and lldb (as someone debugs it), `blaze perf` (as it names a run's lines). Each is
+/// after the build's answer, and none is the build. What the update costs is not the patch
+/// (the changed functions' records) but two copies of the whole file: the one last written
+/// copied to be patched ([`write_side`]; a file renamed into place is never written again,
+/// since a program still running may hold it mapped), and the patched one copied beside the
+/// executable's uplifted copy, which on a file system that shares blocks is a clone of a
+/// file just written and so waits for its write-back. Each is a span of its own under
+/// `link debug file` (72 ms of a 171 ms `unit link` on ripgrep, 2026-11-11).
 fn debug_side(job: &Job, unit: usize, path: &str, linked: &mut Linked) -> Result<(), LinkCause> {
     if linked.output.debug != blaze_link::Debug::Beside {
         return Ok(());
@@ -1767,7 +1777,12 @@ fn debug_side(job: &Job, unit: usize, path: &str, linked: &mut Linked) -> Result
         return Ok(());
     };
     let first = side_path(format, path, &write.name);
-    if !write_side(&first, format, &write).map_err(LinkCause::Given)? {
+    let patching =
+        tracing::info_span!(target: "blaze", "link debug file: copy and patch", unit = %path)
+            .entered();
+    let patched = write_side(&first, format, &write).map_err(LinkCause::Given)?;
+    drop(patching);
+    if !patched {
         // The file there is not the one the patch is of: someone removed it, or another
         // build's is there. Made whole from the image, and said.
         let Some(whole) = linked.image.debug_file_whole().map_err(linker)? else {
@@ -1810,6 +1825,9 @@ fn debug_side(job: &Job, unit: usize, path: &str, linked: &mut Linked) -> Result
         }
         let mut next = to.as_os_str().to_owned();
         next.push(".blaze-next");
+        let _copying =
+            tracing::info_span!(target: "blaze", "link debug file: copy beside", unit = %copy)
+                .entered();
         std::fs::copy(&first, &next).map_err(|it| failed("copying the side file to it", it))?;
         std::fs::rename(&next, &to).map_err(|it| failed("renaming it into place", it))?;
         write_plist(&to, &write)?;
