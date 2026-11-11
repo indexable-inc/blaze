@@ -123,8 +123,13 @@ pub fn os_error(e: &std::io::Error, path: &str) -> String {
 /// become `\n`), or `None` when there is no such file, it is a directory or it is not UTF-8.
 pub fn read_text(path: &Path) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
-    let text = String::from_utf8(bytes).ok()?;
-    Some(if text.contains('\r') { text.replace("\r\n", "\n").replace('\r', "\n") } else { text })
+    Some(universal_newlines(String::from_utf8(bytes).ok()?))
+}
+
+/// Text with `\r\n` and `\r` made `\n`, as Python's text mode reads a file or a program's
+/// output (`open(...)`, `subprocess.run(..., text=True)`).
+pub fn universal_newlines(text: String) -> String {
+    if text.contains('\r') { text.replace("\r\n", "\n").replace('\r', "\n") } else { text }
 }
 
 /// A new empty directory under the system's temporary directory, removed with all it holds

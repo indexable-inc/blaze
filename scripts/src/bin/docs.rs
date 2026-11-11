@@ -43,6 +43,7 @@ use std::{
 use blaze_script::{
     Value, fail,
     pyjson::dumps,
+    pystr::is_word,
     read_text,
     regex::{Captures, Regex},
     run,
@@ -117,7 +118,7 @@ impl Patterns {
         let mut from = 0;
         while let Some(at) = text[from..].find("BLAZE_").map(|at| from + at) {
             // `\b` before `B`: what comes before is no word character.
-            let starts = !text[..at].chars().next_back().is_some_and(word);
+            let starts = !text[..at].chars().next_back().is_some_and(is_word);
             let name = |b: &u8| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_';
             let end = at + text[at..].bytes().take_while(name).count();
             from = if starts { end } else { at + 1 };
@@ -126,7 +127,7 @@ impl Patterns {
             }
             let ends = text[..end].chars().next_back().is_some_and(|c| c != '_');
             let next = text[end..].chars().next();
-            if ends && !next.is_some_and(|c| word(c) || c == '*') {
+            if ends && !next.is_some_and(|c| is_word(c) || c == '*') {
                 out.push(&text[at..end]);
             }
         }
@@ -139,16 +140,11 @@ impl Patterns {
             .find_iter(line)
             .filter(|m| {
                 let before = line[..m.start()].chars().next_back();
-                !before.is_some_and(|c| word(c) || matches!(c, '.' | '/' | ':' | '-'))
+                !before.is_some_and(|c| is_word(c) || matches!(c, '.' | '/' | ':' | '-'))
             })
             .map(|m| m.as_str())
             .collect()
     }
-}
-
-/// Python's `\w` for a str pattern.
-fn word(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
 }
 
 /// Python's `SPAN.finditer`, ``(`+)(.+?)\1``: what stands between a run of backticks and the

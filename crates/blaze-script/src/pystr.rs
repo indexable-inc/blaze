@@ -8,6 +8,12 @@ pub fn is_space(c: char) -> bool {
     c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
 }
 
+/// Python's `\w` in a str pattern: a letter or digit of any script, or `_` (close to Python's
+/// `str.isalnum`, which also counts the numeric characters that are not digits).
+pub fn is_word(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
 /// `s.strip()`.
 pub fn strip(s: &str) -> &str {
     s.trim_matches(is_space)
@@ -64,6 +70,12 @@ mod tests {
     use super::*;
 
     // Each expectation is what Python 3.13 gives for the same string.
+    #[test]
+    fn word_characters_are_pythons() {
+        assert!(is_word('a') && is_word('_') && is_word('9') && is_word('é') && is_word('名'));
+        assert!(!is_word('.') && !is_word('\'') && !is_word(' ') && !is_word('-'));
+    }
+
     #[test]
     fn lines_and_spaces_are_pythons() {
         assert_eq!(splitlines("a\nb\r\nc\rd\u{b}e\u{85}f\u{2028}g\n"), ["a", "b", "c", "d", "e", "f", "g"]);
