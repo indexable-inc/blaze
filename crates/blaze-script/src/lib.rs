@@ -272,6 +272,13 @@ pub fn read_text(path: &Path) -> Option<String> {
     Some(universal_newlines(String::from_utf8(bytes).ok()?))
 }
 
+/// A file's text as Python's `Path.read_text(errors="replace")` gives it: bytes that are not
+/// UTF-8 each read as U+FFFD, and `\r\n` and `\r` made `\n`; the error is the open's or the read's.
+pub fn read_text_lossy(path: &Path) -> std::io::Result<String> {
+    let bytes = std::fs::read(path)?;
+    Ok(universal_newlines(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
 /// Text with `\r\n` and `\r` made `\n`, as Python's text mode reads a file or a program's
 /// output (`open(...)`, `subprocess.run(..., text=True)`).
 pub fn universal_newlines(text: String) -> String {
@@ -346,6 +353,15 @@ mod tests {
         let started = Instant::now();
         assert!(run_within(&["sleep", "5"], here, Duration::from_millis(200)).unwrap().is_none());
         assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    #[test]
+    fn a_lossy_read_is_pythons_errors_replace() {
+        let dir = TempDir::new("blaze-script-lossy-").unwrap();
+        let path = dir.path().join("t");
+        std::fs::write(&path, b"a\xffb\r\nc\rd").unwrap();
+        assert_eq!(read_text_lossy(&path).unwrap(), "a\u{FFFD}b\nc\nd");
+        assert!(read_text_lossy(&dir.path().join("none")).is_err());
     }
 
     #[test]
