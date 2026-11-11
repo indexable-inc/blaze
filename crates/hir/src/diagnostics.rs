@@ -78,7 +78,8 @@ pub use hir_def::{
 pub use hir_expand::BuiltinChild;
 pub use hir_ty::solver_errors::{TypeAnnotationNeeded, UnreportedSolverError};
 pub use hir_ty::{
-    AssocTypeFailure, CycleQuery, GenericArgsProhibitedReason, IncorrectGenericsLenKind,
+    AssocTypeFailure, CycleQuery, ERROR_UNION_MAX_MEMBERS, ErrorUnionRefusal,
+    GenericArgsProhibitedReason, IncorrectGenericsLenKind,
     MissingLifetimeKind, PatternTypeUnsupported, ReturnKind, StructPathDef, StructPathFound,
     const_param_ty::ConstParamTyReason,
     consteval::CreateConstError,
@@ -190,6 +191,7 @@ diagnostics![AnyDiagnostic<'db> ->
     MissingSelfDefaultParams,
     ObjectWithoutTrait,
     PatternTypeNotLowered,
+    ErrorUnionRefused,
     QueryCycle,
     InactiveCode,
     IncoherentImpl,
@@ -280,6 +282,7 @@ diagnostics![AnyDiagnostic<'db> ->
     InheritedRefMutabilityMismatch,
     FnTraitArgsNotTuple,
     SelfCtorNotTupleOrUnit<'db>,
+    WholeValueWriteThroughRefinement<'db>,
     ConstParamTyNotAllowed<'db>,
     ValTreeError<'db>,
     UnplacedDiagnostic,
@@ -1685,6 +1688,14 @@ pub struct PatternTypeNotLowered {
     pub reason: PatternTypeUnsupported,
 }
 
+/// An error union (`A | B`, `#![blaze::error_unions]`) refused for `reason`, at `ty`: the
+/// member refused, or the whole union.
+#[derive(Debug)]
+pub struct ErrorUnionRefused {
+    pub ty: InFile<AstPtr<ast::Type>>,
+    pub reason: ErrorUnionRefusal,
+}
+
 #[derive(Debug)]
 pub struct UnionExprMustHaveExactlyOneField {
     pub expr: InFile<ExprOrPatPtr>,
@@ -2135,6 +2146,14 @@ pub struct FnTraitArgsNotTuple {
 pub struct SelfCtorNotTupleOrUnit<'db> {
     pub expr: InFile<ExprOrPatPtr>,
     pub self_ty: Type<'db>,
+}
+
+/// blaze: a whole-value write to `place`, of the refinement `ty` (`#![blaze::pattern_types]`),
+/// through a unique reference (rule pattern-types-unique-ref).
+#[derive(Debug)]
+pub struct WholeValueWriteThroughRefinement<'db> {
+    pub place: InFile<ExprOrPatPtr>,
+    pub ty: Type<'db>,
 }
 
 /// rustc's two errors of `check_expr_unsafe_binder_cast`: for `Wrap`, "`wrap_binder!()` can
@@ -4885,6 +4904,13 @@ impl<'db> AnyDiagnostic<'db> {
                 }
                 .into()
             }
+            InferenceDiagnostic::WholeValueWriteThroughRefinement { place, ty } => {
+                WholeValueWriteThroughRefinement {
+                    place: expr_syntax(*place)?,
+                    ty: new_ty(ty.as_ref()),
+                }
+                .into()
+            }
             InferenceDiagnostic::UnsafeBinderCastOfNonBinder { expr, kind, found } => {
                 UnsafeBinderCastOfNonBinder {
                     expr: expr_syntax(*expr)?,
@@ -5467,6 +5493,11 @@ impl<'db> AnyDiagnostic<'db> {
                 }
                 .into()
             }
+            TyLoweringDiagnostic::ErrorUnionRefused { source, reason } => ErrorUnionRefused {
+                ty: Self::type_syntax(*source, source_map)?,
+                reason: *reason,
+            }
+            .into(),
             TyLoweringDiagnostic::QueryCycle { def, query } => {
                 QueryCycle::new(db, *def, *query).into()
             }
@@ -5930,6 +5961,11 @@ fn unplaced_inference_text<'db>(
         InferenceDiagnostic::SelfCtorNotTupleOrUnit { self_ty, .. } => format!(
             "the `Self` constructor can only be used with tuple or unit structs, and `Self` is `{}`",
             ty(self_ty)
+        ),
+        InferenceDiagnostic::WholeValueWriteThroughRefinement { ty: refined, .. } => format!(
+            "a whole value of `{}` is written through a unique reference; only its fields may be \
+             (rule pattern-types-unique-ref)",
+            ty(refined)
         ),
     };
     let place = match d {

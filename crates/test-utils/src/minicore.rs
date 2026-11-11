@@ -39,6 +39,7 @@
 //!     env: option
 //!     eq: sized, unary_ops, builtin_impls
 //!     error: fmt
+//!     error_union: error, from, clone, hash
 //!     float_consts: unary_ops, builtin_impls
 //!     fmt: option, result, transmute, coerce_unsized, copy, clone, derive
 //!     fn: sized, tuple
@@ -47,6 +48,7 @@
 //!     coroutine: pin
 //!     global_allocator: allocator_api, derive
 //!     dispatch_from_dyn: unsize, pin
+//!     handle: clone
 //!     hash: sized
 //!     include:
 //!     include_bytes:
@@ -413,6 +415,12 @@ pub mod clone {
     #[rustc_builtin_macro]
     pub macro Clone($item:item) {}
     // endregion:derive
+
+    // region:handle
+    /// Nightly's `Share`, which `#![blaze::handles]` copies values of.
+    #[lang = "blaze_handle"]
+    pub trait Share: Clone {}
+    // endregion:handle
 }
 // endregion:clone
 
@@ -1158,7 +1166,9 @@ pub mod ops {
             type TryType = ControlFlow<B, C>;
         }
         // region:option
-        impl<T> Try for Option<T> {
+        // `#[blaze::linear] T` here and below: as library/core marks the impls of `Option`
+        // and `Result` that admit a linear payload (docs/v2/plan/design/linear.md, rule 4).
+        impl<#[blaze::linear] T> Try for Option<T> {
             type Output = T;
             type Residual = Option<Infallible>;
             fn from_output(output: Self::Output) -> Self {
@@ -1172,7 +1182,7 @@ pub mod ops {
             }
         }
 
-        impl<T> FromResidual for Option<T> {
+        impl<#[blaze::linear] T> FromResidual for Option<T> {
             fn from_residual(x: Option<Infallible>) -> Self {
                 match x {
                     None => None,
@@ -1189,7 +1199,7 @@ pub mod ops {
         // region:from
         use crate::convert::From;
 
-        impl<T, E> Try for Result<T, E> {
+        impl<#[blaze::linear] T, E> Try for Result<T, E> {
             type Output = T;
             type Residual = Result<Infallible, E>;
 
@@ -1205,7 +1215,9 @@ pub mod ops {
             }
         }
 
-        impl<T, E, F: From<E>> FromResidual<Result<Infallible, E>> for Result<T, F> {
+        impl<#[blaze::linear] T, E, F: From<E>> FromResidual<Result<Infallible, E>>
+            for Result<T, F>
+        {
             fn from_residual(residual: Result<Infallible, E>) -> Self {
                 match residual {
                     Err(e) => Err(F::from(e)),
@@ -1746,7 +1758,8 @@ pub mod option {
     impl<T: Copy> Copy for Option<T> {}
     // endregion:copy
 
-    impl<T> Option<T> {
+    // The methods that hand a payload on or panic, which admit a linear one.
+    impl<#[blaze::linear] T> Option<T> {
         pub const fn is_some(&self) -> bool {
             match self {
                 Some(_) => true,
@@ -1771,7 +1784,17 @@ pub mod option {
                 None => None,
             }
         }
+        // region:result
+        pub const fn ok_or<E>(self, err: E) -> Result<T, E> {
+            match self {
+                Some(v) => Ok(v),
+                None => Err(err),
+            }
+        }
+        // endregion:result
+    }
 
+    impl<T> Option<T> {
         pub fn and<U>(self, _optb: Option<U>) -> Option<U> {
             loop {}
         }
@@ -1781,14 +1804,6 @@ pub mod option {
                 None => default,
             }
         }
-        // region:result
-        pub const fn ok_or<E>(self, err: E) -> Result<T, E> {
-            match self {
-                Some(v) => Ok(v),
-                None => Err(err),
-            }
-        }
-        // endregion:result
         // region:fn
         pub fn and_then<U, F>(self, _f: F) -> Option<U>
         where
@@ -1843,19 +1858,21 @@ pub mod result {
             }
         }
 
-        // region:fmt
-        #[track_caller]
-        pub fn unwrap(self) -> T
+        // region:default
+        pub fn unwrap_or_default(self) -> T
         where
-            E: crate::fmt::Debug,
+            T: crate::default::Default,
         {
             match self {
                 Ok(t) => t,
-                Err(_) => panic!("called `Result::unwrap()` on an `Err` value"),
+                Err(_) => T::default(),
             }
         }
-        // endregion:fmt
+        // endregion:default
+    }
 
+    // The methods that hand both payloads on, which admit a linear one of either.
+    impl<#[blaze::linear] T, #[blaze::linear] E> Result<T, E> {
         // region:fn
         pub const fn or_else<F, O>(self, op: O) -> Result<T, F>
         where
@@ -1884,6 +1901,23 @@ pub mod result {
             }
         }
         // endregion:fn
+    }
+
+    // The methods that hand the `Ok` payload on and drop or print the `Err` one, which admit a
+    // linear `Ok` payload only.
+    impl<#[blaze::linear] T, E> Result<T, E> {
+        // region:fmt
+        #[track_caller]
+        pub fn unwrap(self) -> T
+        where
+            E: crate::fmt::Debug,
+        {
+            match self {
+                Ok(t) => t,
+                Err(_) => panic!("called `Result::unwrap()` on an `Err` value"),
+            }
+        }
+        // endregion:fmt
 
         // region:option
         pub fn ok(self) -> crate::option::Option<T> {
@@ -1893,18 +1927,6 @@ pub mod result {
             }
         }
         // endregion:option
-
-        // region:default
-        pub fn unwrap_or_default(self) -> T
-        where
-            T: crate::default::Default,
-        {
-            match self {
-                Ok(t) => t,
-                Err(_) => T::default(),
-            }
-        }
-        // endregion:default
     }
 }
 // endregion:result
@@ -2824,6 +2846,139 @@ pub mod error {
     }
 }
 // endregion:error
+
+// region:error_union
+pub mod error_union {
+    use crate::{clone::Clone, convert::From, error::Error, fmt, hash::{Hash, Hasher}};
+
+    pub trait Members {
+        type Repr;
+    }
+
+    #[lang = "error_union"]
+    pub struct ErrorUnion<M: Members>(pub M::Repr);
+
+    #[lang = "error_union_from"]
+    pub trait UnionFrom<S> {
+        type Path;
+    }
+
+    pub trait Inject<S, P> {
+        fn inject(value: S) -> Self;
+    }
+
+    #[lang = "error_union_widen"]
+    pub fn widen<S, U>(value: S) -> U
+    where
+        U: UnionFrom<S> + Inject<S, <U as UnionFrom<S>>::Path>,
+    {
+        <U as Inject<S, <U as UnionFrom<S>>::Path>>::inject(value)
+    }
+
+    impl<S, U> From<S> for U
+    where
+        U: UnionFrom<S> + Inject<S, <U as UnionFrom<S>>::Path>,
+    {
+        fn from(value: S) -> U {
+            widen(value)
+        }
+    }
+
+    pub enum Of2<T0, T1> {
+        M0(T0),
+        M1(T1),
+    }
+    pub enum Of3<T0, T1, T2> {
+        M0(T0),
+        M1(T1),
+        M2(T2),
+    }
+    impl<T0, T1> Members for (T0, T1) {
+        type Repr = Of2<T0, T1>;
+    }
+    impl<T0, T1, T2> Members for (T0, T1, T2) {
+        type Repr = Of3<T0, T1, T2>;
+    }
+
+    impl<T0, T1> Inject<T0, ()> for ErrorUnion<(T0, T1)> {
+        fn inject(value: T0) -> Self {
+            ErrorUnion(Of2::M0(value))
+        }
+    }
+    impl<T0, T1> Inject<T1, ((),)> for ErrorUnion<(T0, T1)> {
+        fn inject(value: T1) -> Self {
+            ErrorUnion(Of2::M1(value))
+        }
+    }
+    impl<T0, T1, T2> Inject<T0, ()> for ErrorUnion<(T0, T1, T2)> {
+        fn inject(value: T0) -> Self {
+            ErrorUnion(Of3::M0(value))
+        }
+    }
+    impl<T0, T1, T2> Inject<T1, ((),)> for ErrorUnion<(T0, T1, T2)> {
+        fn inject(value: T1) -> Self {
+            ErrorUnion(Of3::M1(value))
+        }
+    }
+    impl<T0, T1, T2> Inject<T2, (((),),)> for ErrorUnion<(T0, T1, T2)> {
+        fn inject(value: T2) -> Self {
+            ErrorUnion(Of3::M2(value))
+        }
+    }
+    impl<U, T0, T1, P0, P1> Inject<ErrorUnion<(T0, T1)>, (P0, P1)> for U
+    where
+        U: Inject<T0, P0> + Inject<T1, P1>,
+    {
+        fn inject(value: ErrorUnion<(T0, T1)>) -> U {
+            match value.0 {
+                Of2::M0(it) => <U as Inject<T0, P0>>::inject(it),
+                Of2::M1(it) => <U as Inject<T1, P1>>::inject(it),
+            }
+        }
+    }
+
+    impl<T0: fmt::Display, T1: fmt::Display> fmt::Display for ErrorUnion<(T0, T1)> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match &self.0 {
+                Of2::M0(it) => fmt::Display::fmt(it, f),
+                Of2::M1(it) => fmt::Display::fmt(it, f),
+            }
+        }
+    }
+    impl<T0: fmt::Debug, T1: fmt::Debug> fmt::Debug for ErrorUnion<(T0, T1)> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match &self.0 {
+                Of2::M0(it) => fmt::Debug::fmt(it, f),
+                Of2::M1(it) => fmt::Debug::fmt(it, f),
+            }
+        }
+    }
+    impl<T0: Error, T1: Error> Error for ErrorUnion<(T0, T1)> {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            match &self.0 {
+                Of2::M0(it) => it.source(),
+                Of2::M1(it) => it.source(),
+            }
+        }
+    }
+    impl<T0: Clone, T1: Clone> Clone for ErrorUnion<(T0, T1)> {
+        fn clone(&self) -> Self {
+            match &self.0 {
+                Of2::M0(it) => ErrorUnion(Of2::M0(it.clone())),
+                Of2::M1(it) => ErrorUnion(Of2::M1(it.clone())),
+            }
+        }
+    }
+    impl<T0: Hash, T1: Hash> Hash for ErrorUnion<(T0, T1)> {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            match &self.0 {
+                Of2::M0(it) => it.hash(state),
+                Of2::M1(it) => it.hash(state),
+            }
+        }
+    }
+}
+// endregion:error_union
 
 // region:float_consts
 impl f32 {

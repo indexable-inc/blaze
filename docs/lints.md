@@ -19,6 +19,17 @@ the release build reports, only by its flags). `checkfree`,
 `nopanic`, `noalloc` and `nonblocking` are in `blaze::general` but `deny` by default, and fire
 only on functions marked with their attribute (`#[blaze::checkfree]`, `#[blaze::nopanic]`, ...).
 
+The group `blaze::edition` (`async_fn`, `global_state`, `lossy_as`, `unmarked_pure`,
+`unmarked_nopanic`, `unmarked_noalloc`, `unmarked_nonblocking`) flags what the blaze edition
+removes and what it writes at a crate's border (docs/v2/plan/design/edition.md); it is allowed
+unless a workspace or crate turns it on to get ready for the edition (`edition = "warn"` in
+`[workspace.metadata.blaze.lints]`, or `#![warn(blaze::edition)]`). Only the four `unmarked_*`
+lints have a fix.
+The group `blaze::edition` (`async_fn`, `global_state`, `lossy_as`, `mut_ref`) flags what the
+blaze edition removes or respells (docs/v2/plan/design/edition.md); it is allowed unless a
+workspace or crate turns it on to get ready for the edition (`edition = "warn"` in
+`[workspace.metadata.blaze.lints]`, or `#![warn(blaze::edition)]`). Only `mut_ref` has a fix.
+
 Several lints come from ideas of the Goose language (no global heap, data stacks, bump
 growth, inline nested data, narrow relative links, variable-size enums, in-place construction
 and `checkfree` functions): `bounded_heap_field`, `box_large_new`, `boxed_recursive_node`,
@@ -64,6 +75,7 @@ The lints with a threshold read it from `clippy.toml` (or `.clippy.toml`), as cl
 | `bounded-heap-field-string-bytes` | `bounded_heap_field` | 16 (bytes) |
 | `bounded-heap-field-vec-len` | `bounded_heap_field` | 8 (elements) |
 | `large-box-threshold` | `box_large_new` | 4096 (bytes) |
+| `unmarked-effects-private` | `unmarked_pure`, `unmarked_nopanic`, `unmarked_noalloc`, `unmarked_nonblocking` | `false` (a flag; `true` also finds functions with no visibility written) |
 
 ```toml
 # clippy.toml
@@ -136,6 +148,25 @@ read it under epoch or hazard-pointer reclamation (arc-swap's guards, `crossbeam
 clone lives.
 
 **Allowing it.** `#[expect(blaze::arc_clone_only_borrowed, reason = "..")]` on the function.
+
+## `async_fn`
+
+In `blaze::edition`, allowed by default.
+
+**What it catches.** An `async fn`, an `async` block and an `async` closure: one finding per
+outermost one, so an `.await`, or an `async` block inside an `async fn`, goes with the finding
+of the construct it is in. An `async fn` declared inside another function is found on its own.
+
+**Why it matters.** The blaze edition has no `async` or `.await`: code runs on a fiber, a call
+that waits parks the fiber, and the may-suspend effect is inferred from the body. `async`
+splits every API into two colours and every caller has to choose one.
+
+**How to fix it.** Write it as a plain function run on a fiber, and call what it awaited
+directly.
+
+**Not found.** What a macro wrote with no input of the file (a macro's own `async` block).
+
+**Allowing it.** `#[expect(blaze::async_fn, reason = "..")]` on the function or item.
 
 ## `blocking_in_async`
 
@@ -518,6 +549,32 @@ each constant time. Or reverse the `Vec` once and work at its end with `pop` and
 **Allowing it.** `#[expect(blaze::front_vec_ops, reason = "..")]`, for a `Vec` known to stay
 a few elements long.
 
+## `global_state`
+
+In `blaze::edition`, allowed by default.
+
+**What it catches.** State of the whole program any code can reach by name: a `static mut`; a
+`static` whose type has interior mutability, decided by the type system (its type is not
+`Freeze`: an atomic, a `Mutex`, `RwLock`, `OnceLock` or `LazyLock`, a `Cell`, `RefCell` or
+`UnsafeCell`, a `blaze_core::lock` lock, or anything holding one); and each item of std's
+`thread_local!`. The message lists where in the crate it is used, each body once, in a fixed
+order: for a `static mut` the functions that write it and those that only read it, for the
+rest those that use it (a use through `&` may write).
+
+**Why it matters.** Every access to a `static mut` is `unsafe`, and nothing orders one
+thread's write before another's read. Interior-mutable statics and thread-locals are state
+shared by every caller, invisible in any signature; a thread-local's value can change under
+code on a fiber that moves between threads. The blaze edition removes all three.
+
+**How to fix it.** Choose the owner from the uses the message lists, and hand the state (or a
+handle to it) to the code that uses it as a context. For a `static mut` of an integer, `bool`
+or pointer that must stay shared, the message names the atomic that fits.
+
+**Not found.** A `static` of plain data that is not `mut` (`static NAMES: [&str; 2]`), a
+`const`, and what a macro wrote with no input of the file.
+
+**Allowing it.** `#[expect(blaze::global_state, reason = "..")]` on the item.
+
 ## `hash_twice`
 
 **What it catches.** A lookup of a key in a hash map or set (`get`, `contains_key`, `contains`,
@@ -588,6 +645,31 @@ found.
 
 **Allowing it.** `#[expect(blaze::jagged_vec, reason = "..")]` on the struct.
 
+## `lossy_as`
+
+In `blaze::edition`, allowed by default.
+
+**What it catches.** An `as` cast that can lose value or sign, or that goes between a pointer
+and an integer, by the types the front end inferred: an integer to a narrower one
+(`u64 as u32`), between signed and unsigned (`i32 as u32`, `u32 as i32`), a float to an
+integer (drops the fraction, saturates), an integer to a float whose mantissa can't hold it
+(`u64 as f64`), a float to a narrower float, a `char` to an integer narrower than 21 bits, a
+pointer to an integer (drops provenance) and an integer to a pointer. `usize` and `isize` count
+as 32 to 64 bits, so `usize as u32` and `u64 as usize` are both found. The message names the
+two types and what can be lost; the note names the conversion that says it (`T::try_from`,
+`cast_signed`, `cast_unsigned`, `wrapping_*`, `ptr.addr()`, `ptr::with_exposed_provenance`).
+
+**Why it matters.** `as` silently truncates, wraps, rounds or saturates, and the cast looks
+the same whether it can lose or not. The blaze edition removes the lossy forms.
+
+**How to fix it.** `From` where nothing can be lost (`u64::from(x)`), `T::try_from(x)` where
+it can, or the method that names the loss.
+
+**Not found.** A cast that can't lose (`u8 as u32`, `bool as u8`, `f32 as f64`), a cast to its
+own type, and a cast of a literal or a `const` whose value fits the target.
+
+**Allowing it.** `#[expect(blaze::lossy_as, reason = "..")]`.
+
 ## `missing_size_hint`
 
 **What it catches.** An `impl Iterator` for a struct of the crate that either:
@@ -605,6 +687,39 @@ their buffer by doubling (reallocating and copying) instead of allocating once, 
 ExactSizeIterator for ..` when the count is exact.
 
 **Allowing it.** `#[expect(blaze::missing_size_hint, reason = "..")]` on the impl.
+
+## `mut_ref`
+
+In `blaze::edition`, allowed by default; says nothing in a crate without `#![blaze::uniq]`.
+
+**What it catches.** In a crate that says `#![blaze::uniq]`, a unique reference spelled with
+`mut`: `&mut T` and `&'a mut T` in a type, `&mut expr` in an expression, `&mut self` and
+`&'a mut self` as a receiver, and `ref mut x` in a pattern.
+
+**Why it matters.** Under `#![blaze::uniq]`, `&uniq T` is `&mut T`, spelled for what it
+guarantees: no other reference to the place is live while it is. Mutation through it follows
+from that. The two spellings are the same type and are accepted for each other, so the lint
+only brings a crate to the one spelling the edition uses.
+
+**How to fix it.** `blaze check --fix`: the fix is machine-applicable and only respells `mut`
+as `uniq`. An operand that starts with `<`, `::`, `!` (or, in an expression, `.`, `{` or
+`#`) would keep `uniq` a name there, so the fix puts it in parentheses:
+`&mut <T>::new()` becomes `&uniq (<T>::new())`.
+
+**The gate.** `#![blaze::uniq]`, written as itself among the crate root's leading inner
+attributes (not through `cfg_attr` or a macro), makes `uniq` a keyword in exactly those four
+places, told by the token after it: `&uniq;`, `&uniq.x`, `&uniq::X`, `&uniq<T>` and
+`&uniq!()` stay a variable, path or macro named `uniq`. Under the gate `&uniq (x)`, `&uniq [0]`,
+`&uniq - 1` and `&uniq * x` are unique borrows of the operand, where rustc would read a call,
+an index or arithmetic on `uniq`. Types print as `&uniq T` in the crate's diagnostics. Without
+the gate, `&uniq T` is the syntax error it is in rustc.
+
+**Not found.** `let mut x` and any `mut` binding without `ref`, `mut self`, `*mut T`,
+`&raw mut place`, a `&mut pat` reference pattern (which has no `uniq` spelling), a reference
+already spelled `uniq`, and what a macro writes or is handed: macro input and expansions parse
+without the gate, so `&uniq` there is not yet accepted.
+
+**Allowing it.** `#[expect(blaze::mut_ref, reason = "..")]` on the function or item.
 
 ## `native_contracts`
 
@@ -732,6 +847,46 @@ function, or a trait: every impl's method and every call through `dyn` of it); t
 the trusted function's crate are kept in the proof. Or take the attribute off.
 
 **Allowing it.** `#[expect(blaze::pure, reason = "..")]` on the function.
+
+## `capabilities`
+
+**What it catches.** A function of a crate whose root says `#![blaze::capabilities]` (a blaze
+extension, opt-in; it changes diagnostics, never code) that, through any call, reaches one of
+three effects past the crates its workspace trusts:
+
+- `ambient`: std's file, environment, network, clock, randomness, process and thread entry
+  points, or a system call or other foreign call beneath them;
+- `unsafe`: an `unsafe` block written in the reached code, or an `unsafe fn`'s body (the block
+  `format_args!` makes, and a macro defined `#[allow_internal_unsafe]`, are not);
+- `global_alloc`: a call of the global allocator. An allocator the code is handed
+  (`Vec::new_in(arena)`) is not one.
+
+The finding names the function, the effect, the call or block that does it and the call path,
+each step with its file and line. It is `deny` by default: the crate asked for it. A crate
+without the attribute is not checked. What counts and why is in
+[v2/plan/design/std.md](v2/plan/design/std.md).
+
+**The trusted crates.** A workspace lists the crates whose code it has checked by hand:
+
+```toml
+[workspace.metadata.blaze.trusted]
+libc = { owner = "io", reason = "the C library's calls, behind bstd's Io" }
+```
+
+Each entry needs an `owner` and a `reason`; a toolchain crate can't be listed. What a trusted
+crate does itself, and what it reaches in the crates it depends on, does not count for any of
+the three effects; a closure or impl of another crate it calls still does. core and alloc are
+trusted for `ambient` and `unsafe` by default, but `alloc`'s allocation of the global heap
+(`Vec::new`) still counts for `global_alloc`; the rest of the toolchain is trusted for `unsafe`.
+
+**Why it matters.** A capability-based crate reaches the outside world only through what it is
+handed, so what a caller gives it is all it can do; the promise holds only when nothing it
+reaches, in any crate, takes the world another way.
+
+**How to fix it.** Take the IO, the allocator or the safe interface as an argument, move the
+code into a trusted crate (with an owner and a reason), or take the attribute off.
+
+**Allowing it.** `#[expect(blaze::capabilities, reason = "..")]` on the function.
 
 ## `outline_generic_body`
 
@@ -1100,6 +1255,58 @@ and make the calls on the wrapper. A `BufWriter` writes what is left when droppe
 
 **Allowing it.** `#[expect(blaze::unbuffered_io, reason = "..")]`, where each call must reach
 the system on its own (a log that must survive a crash).
+
+## `unmarked_pure`, `unmarked_nopanic`, `unmarked_noalloc`, `unmarked_nonblocking`
+
+In `blaze::edition`, allowed by default. Each can be turned on alone.
+
+**What it catches.** A function, method or associated function with a body that the effects
+walk proves pure, nopanic, noalloc or nonblocking and that lacks `#[blaze::pure]`,
+`#[blaze::nopanic]`, `#[blaze::noalloc]` or `#[blaze::nonblocking]`. The proof is the answer
+the attribute's own lint (`pure`, `nopanic`, `noalloc`, `nonblocking`) computes for a marked
+function, so the attribute is suggested only where it then passes: nothing is trusted but what
+that check trusts, and where the walk can't decide (a body that does not lower, a call it can't
+resolve) nothing is found. By default only a function at the crate's border is found: one with
+a visibility written (`pub`, `pub(crate)`, `pub(in ..)`), or a method of a trait, or of an impl
+of one, whose trait has one. `unmarked-effects-private = true` in `clippy.toml` finds every
+function.
+
+One finding per lint that is on and proved, each at the function's name with its own fix, so a
+level set on the function (`#[expect(blaze::unmarked_noalloc, reason = "..")]`, `#[allow(..)]`)
+works per lint, and `--fix` writes only the attributes of the lints left on there.
+
+- A generic function is proved as a marked one is checked: in its own where-clauses, with what
+  only an instance decides (a type parameter's method, its drop) left to each instance.
+- `unmarked_nopanic` finds only in a crate checked with overflow checks (a dev profile, or
+  `overflow-checks = true`), where a proof covers the checks release drops, so the mark holds
+  in dev and in release. Checked without them it finds nothing.
+- No attribute implies another: each refuses a kind of effect the others allow.
+- In a crate with `#![blaze::capabilities]` the global heap is out of reach, so
+  `unmarked_noalloc` finds only a function whose signature could allocate: a parameter (`self`
+  included, behind references too) that is or holds a type implementing
+  `core::alloc::Allocator`, a type with an allocator parameter (`Vec<T, A>`), or bstd's `Cx`.
+  A signature with none already says noalloc.
+- A method of an impl is found whether or not its trait is marked: the check reads the
+  function's own attribute first. A method covered by its trait's attribute is not found.
+
+**Why it matters.** The blaze edition infers effects inside a crate and writes them at its
+border. A mark the code already earns lets callers rely on it (a `pure` caller needs no
+`trusted`, the kernel caches a pure step), and from then on its lint refuses a change that
+breaks it, naming the call chain.
+
+**How to fix it.** `blaze check --fix` writes each attribute on its own line at the item's
+indentation, keeping the function's effect attributes in the order pure, nopanic, noalloc,
+nonblocking and moving none it has: before the first one written that comes later in that
+order, else after the last one written, else directly above the signature, under the doc
+comments and the other attributes. Attributes that land at one place are written one per pass
+of `--fix`, so a function gaining all four takes its four passes.
+
+**Not found.** A function already marked in any form (the bare word, `trusted = ".."`, a
+malformed attribute, or the attribute on its trait); a trait method with no body; a test, a
+bench, the crate's `main` and test code; a function a macro wrote.
+
+**Allowing it.** `#[expect(blaze::unmarked_pure, reason = "..")]` (or the lint the finding
+names) on the function, where the effect is an accident of today's body and not a promise.
 
 ## `unwind_across_ffi`
 

@@ -681,12 +681,14 @@ fn lower_writes<T: blaze_query::Tree>(
             None => {
                 // The workspace's `const-eval` budget is for its own crates: the standard
                 // library's are evaluated under blaze's, the same in every workspace.
-                let const_eval = if unit.is_std {
-                    ConstEvalBudget::default()
+                // So is its trusted list: the toolchain's trust is blaze's.
+                let (const_eval, trusted) = if unit.is_std {
+                    (ConstEvalBudget::default(), Box::default())
                 } else {
-                    workspace_root.const_eval
+                    // clone: once per triple, the workspace's trusted crates
+                    (workspace_root.const_eval, workspace_root.trusted.clone())
                 };
-                let made = crates::workspace_data(triple, &toolchain, const_eval)?;
+                let made = crates::workspace_data(triple, &toolchain, const_eval, trusted)?;
                 workspaces.insert((triple, unit.is_std), made.clone());
                 made
             }

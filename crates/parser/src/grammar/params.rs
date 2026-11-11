@@ -36,6 +36,12 @@ enum Flavor {
 }
 
 fn list_(p: &mut Parser<'_>, flavor: Flavor) {
+    // blaze: a closure's parameters end at a `|`, so no type in them is an error union
+    // (`#![blaze::error_unions]`) unless parenthesized; the others are delimited.
+    p.with_unions(flavor != Flavor::Closure, |p| list_in(p, flavor));
+}
+
+fn list_in(p: &mut Parser<'_>, flavor: Flavor) {
     use Flavor::*;
 
     let (bra, ket) = match flavor {
@@ -253,7 +259,9 @@ fn opt_self_param(p: &mut Parser<'_>, m: Marker) -> Result<(), Marker> {
         if p.nth_at(self_pos, LIFETIME_IDENT) {
             self_pos += 1;
         }
-        if p.nth_at(self_pos, T![mut]) {
+        // `&uniq self`, `&'a uniq self` (`#![blaze::uniq]`): `uniq` where `mut` would be.
+        let uniq = uniq::nth_at_receiver(p, self_pos);
+        if p.nth_at(self_pos, T![mut]) || uniq {
             self_pos += 1;
         }
         if !is_isolated_self(p, self_pos) {
@@ -264,14 +272,44 @@ fn opt_self_param(p: &mut Parser<'_>, m: Marker) -> Result<(), Marker> {
         if p.at(LIFETIME_IDENT) {
             lifetime(p);
         }
-        p.eat(T![mut]);
+        if !p.eat(T![mut]) && uniq {
+            p.bump_remap(T![mut]);
+        }
         self_as_name(p);
+        if p.at(T![.]) && p.nth_at(1, T!['{']) {
+            self_view(p);
+        }
     }
     m.complete(p, SELF_PARAM);
     if !p.at(T![')']) {
         p.expect(T![,]);
     }
     Ok(())
+}
+
+/// `#![blaze::views]`'s view of a receiver, `&self.{a, b}` or `&mut self.{a}`: the fields of
+/// `Self` the method borrows (docs/v2/plan/design/edition.md, change 3). The `.`, the braces
+/// and a `NAME_REF` per field are children of the `SELF_PARAM`. Parsed in every crate, as
+/// blaze_verify's clauses are: no Rust program has a `.` after a `self` parameter, so every
+/// program rustc parses parses as before, and the borrow check refuses a view in a crate
+/// without the attribute (`hir_ty_borrowck::views`).
+fn self_view(p: &mut Parser<'_>) {
+    p.bump(T![.]);
+    p.bump(T!['{']);
+    while !p.at(EOF) && !p.at(T!['}']) {
+        if p.at(IDENT) {
+            let m = p.start();
+            p.bump(IDENT);
+            m.complete(p, NAME_REF);
+        } else {
+            p.err_and_bump("expected a field name in the view of `self`");
+            continue;
+        }
+        if !p.at(T!['}']) && !p.expect(T![,]) {
+            break;
+        }
+    }
+    p.expect(T!['}']);
 }
 
 fn self_as_name(p: &mut Parser<'_>) {

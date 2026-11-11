@@ -183,6 +183,9 @@ pub enum TypeRef<'a> {
         lifetimes: Names,
         ty: TypeRefId,
     },
+    /// `A | B | ..`, an error union (blaze, under `#![blaze::error_unions]`): its members in
+    /// source order, which hir-ty canonicalizes.
+    Union(&'a [TypeRefId]),
 }
 
 pub type TypeRefId = Idx<TypeRef<'static>>;
@@ -263,11 +266,12 @@ pub(crate) enum TypeRefKind {
     PatternType,
     Error,
     UnsafeBinder,
+    Union,
 }
 
 impl TypeRefKind {
     /// Every kind, at the index of its value.
-    pub(crate) const ALL: [TypeRefKind; 15] = {
+    pub(crate) const ALL: [TypeRefKind; 16] = {
         use TypeRefKind::*;
         [
             Never,
@@ -285,6 +289,7 @@ impl TypeRefKind {
             PatternType,
             Error,
             UnsafeBinder,
+            Union,
         ]
     };
 
@@ -305,6 +310,7 @@ impl TypeRefKind {
             TypeRef::PatternType(..) => TypeRefKind::PatternType,
             TypeRef::Error => TypeRefKind::Error,
             TypeRef::UnsafeBinder { .. } => TypeRefKind::UnsafeBinder,
+            TypeRef::Union(_) => TypeRefKind::Union,
         }
     }
 }
@@ -316,7 +322,7 @@ pub(crate) struct TypeColumns<V: ColumnVec = Frozen> {
     pub(crate) kind: V::Of<u8>,
     pub(crate) data: V::Of<u32>,
     pub(crate) extra: V::Of<u32>,
-    /// The elements of every `Tuple`.
+    /// The elements of every `Tuple` and the members of every `Union`.
     pub(crate) lists: V::Of<TypeRefId>,
     /// The bounds of every `ImplTrait` and `DynTrait`.
     pub(crate) bounds: V::Of<TypeBound>,
@@ -470,6 +476,10 @@ impl<V: ColumnVec> TypeColumns<V> {
                 let [ty, start, len] = self.triple(d)?;
                 TypeRef::UnsafeBinder { lifetimes: Names { start, len }, ty: idx(ty) }
             }
+            TypeRefKind::Union => {
+                let [start, count] = self.pair(d)?;
+                TypeRef::Union(list(&self.lists, start, count, LIST)?)
+            }
         })
     }
 }
@@ -506,7 +516,7 @@ impl TypeColumns<Growing> {
         let kind = TypeRefKind::of(&type_ref);
         let data = match type_ref {
             TypeRef::Never | TypeRef::Placeholder | TypeRef::Error => 0,
-            TypeRef::Tuple(types) => {
+            TypeRef::Tuple(types) | TypeRef::Union(types) => {
                 let words = append(&mut self.lists, types);
                 self.words(words)
             }
@@ -670,7 +680,9 @@ impl TypeColumns<Frozen> {
                 | TypeRef::Error
                 | TypeRef::Path(_)
                 | TypeRef::TypeParam(_) => {}
-                TypeRef::Tuple(types) => types.iter().try_for_each(|&it| ty(it))?,
+                TypeRef::Tuple(types) | TypeRef::Union(types) => {
+                    types.iter().try_for_each(|&it| ty(it))?
+                }
                 TypeRef::RawPtr(inner, _) | TypeRef::Slice(inner) => ty(inner)?,
                 TypeRef::Reference(RefType { ty: inner, lifetime: region, mutability: _ }) => {
                     ty(*inner)?;

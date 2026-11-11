@@ -106,6 +106,7 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::Noalloc
         | Lint::Nonblocking
         | Lint::Pure
+        | Lint::Capabilities
         | Lint::Packable
         | Lint::SoaCandidate
         | Lint::BorrowWorkaround
@@ -115,7 +116,16 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::LenientDeserialize
         // A hasher is chosen in the type, or kept with `#[expect(blaze::default_hasher, reason = ..)]`:
         // an allocation's comment says nothing about it.
-        | Lint::DefaultHasher => None,
+        | Lint::DefaultHasher
+        // The edition's lints name a construct the edition removes, not a cost on a line.
+        | Lint::LossyAs
+        | Lint::GlobalState
+        | Lint::AsyncFn
+        // Kept with `#[expect(..)]` on the function: a mark is the item's choice, not a line's.
+        | Lint::UnmarkedPure
+        | Lint::UnmarkedNopanic
+        | Lint::UnmarkedNoalloc
+        | Lint::UnmarkedNonblocking => None,
     }
 }
 

@@ -361,6 +361,7 @@ fn old_match_attr_flags(
                     "blaze" => match &*second_segment {
                         "may_suspend" => attr_flags.insert(AttrFlags::MAY_SUSPEND),
                         "sans_io" => attr_flags.insert(AttrFlags::SANS_IO),
+                        "capabilities" => attr_flags.insert(AttrFlags::CAPABILITIES),
                         "checkfree" => attr_flags.insert(AttrFlags::CHECKFREE),
                         "pure" => attr_flags.insert(AttrFlags::PURE),
                         "bits" => attr_flags.insert(AttrFlags::BLAZE_BITS),
@@ -377,6 +378,7 @@ fn old_match_attr_flags(
                         "consumes" => attr_flags.insert(AttrFlags::CONSUMES),
                         "reflect" => attr_flags.insert(AttrFlags::BLAZE_REFLECT),
                         "sealed" => attr_flags.insert(AttrFlags::BLAZE_SEALED),
+                        "norefcount" => attr_flags.insert(AttrFlags::NOREFCOUNT),
                         _ => {}
                     },
                     _ => {}

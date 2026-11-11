@@ -127,3 +127,46 @@ fn a_field_binder_over_a_generic_container_is_met_by_the_callers_own() {
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     });
 }
+
+/// The target of phase 2's codec (docs/v2/plan/design/comptime.md, "Building a struct"):
+/// `encode` over a struct one of whose three fields has no `Encode` is refused at the call,
+/// naming that field, never after monomorphization.
+#[test]
+fn encode_of_a_struct_with_a_field_lacking_the_bound_names_the_field() {
+    let fixture = format!(
+        "//- minicore: sized, copy, clone, phantom_data\n#![feature(blaze_comptime, lang_items)]\n{REFLECT}{}",
+        r#"
+pub trait Encode {}
+impl Encode for u8 {}
+impl Encode for bool {}
+pub struct NoEncode;
+pub struct Bad { pub a: u8, pub n: NoEncode, pub c: bool }
+pub struct Good { pub a: u8, pub c: bool }
+fn encode<T: Struct>(_value: &T) where for<F: Field<T>> F::Type: Encode {}
+fn encodes_bad() { encode(&Bad { a: 1, n: NoEncode, c: true }); }
+fn encodes_good() { encode(&Good { a: 1, c: true }); }
+"#
+    );
+    let db = fixture::db(&fixture).into_db();
+    blaze_query::db::attach(&db, || {
+        let good = diagnostics(&db, "encodes_good");
+        assert!(good.is_empty(), "{good:?}");
+        let bad = diagnostics(&db, "encodes_bad");
+        let unmet: Vec<_> = bad
+            .iter()
+            .filter_map(|it| match it {
+                InferenceDiagnostic::SolverDiagnostic(SolverDiagnostic {
+                    kind: SolverDiagnosticKind::ReflectedMemberUnmet { member, .. },
+                    ..
+                }) => Some(*member),
+                _ => None,
+            })
+            .collect();
+        let [ReflectedMember::Field(field)] = unmet[..] else {
+            panic!("one error naming a field, not {bad:?}");
+        };
+        let name =
+            VariantFields::of(&db, field.parent).fields()[field.local_id].name.as_str().to_owned();
+        assert_eq!(name, "n", "`n: NoEncode` is the field without `Encode`");
+    });
+}

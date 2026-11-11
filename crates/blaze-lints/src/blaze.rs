@@ -11,6 +11,7 @@
 
 mod alloc;
 mod arc_clone_only_borrowed;
+mod async_fn;
 mod blocking_in_async;
 mod blocking_on_pool;
 mod bool_param;
@@ -33,6 +34,8 @@ mod dos_hasher_on_input;
 mod dropped_error;
 mod dyn_fn_param;
 mod dyn_in_hot_field;
+#[cfg(test)]
+mod edition_tests;
 mod effects;
 #[cfg(test)]
 mod effects_tests;
@@ -48,6 +51,7 @@ mod fixed_key_lookup;
 mod fmt_allocates;
 mod front_vec_ops;
 mod frozen_collection;
+mod global_state;
 mod general_facts;
 mod goose_fields;
 mod goose_locals;
@@ -68,7 +72,9 @@ mod lenient_deserialize_tests;
 mod lock_across_query;
 mod lock_held_across_slow;
 mod loops;
+mod lossy_as;
 mod missing_size_hint;
+mod mut_ref;
 mod native_contracts;
 mod open_wait_loop;
 mod outline_generic_body;
@@ -107,6 +113,7 @@ mod thread_local_in_waiting_fn;
 mod thread_local_tests;
 mod unbounded_from_input;
 mod unbuffered_io;
+mod unmarked_effects;
 mod unnamed_wait;
 mod unrecorded_span;
 mod untyped_error;
@@ -222,6 +229,7 @@ pub enum Lint {
     Noalloc,
     Nonblocking,
     Pure,
+    Capabilities,
     Packable,
     SoaCandidate,
     BorrowWorkaround,
@@ -230,6 +238,14 @@ pub enum Lint {
     ThreadLocalInWaitingFn,
     LenientDeserialize,
     LockHeldAcrossSlow,
+    LossyAs,
+    GlobalState,
+    AsyncFn,
+    UnmarkedPure,
+    UnmarkedNopanic,
+    UnmarkedNoalloc,
+    UnmarkedNonblocking,
+    MutRef,
 }
 
 /// Which workspaces a lint is for.
@@ -246,13 +262,25 @@ pub(crate) enum Kind {
     /// depends on) or it can't see whether the code is hot: allowed until a workspace or crate
     /// turns it, or the group `blaze::pedantic_perf`, on.
     PedanticPerf,
+    /// It flags what the blaze edition removes, or an effect it writes at a crate's border
+    /// that the code lacks (docs/v2/plan/design/edition.md): allowed until
+    /// a workspace or crate turns it, or the group `blaze::edition`, on to get ready for the
+    /// edition; under the edition each is an error.
+    Edition,
 }
 
 /// The lints that are `deny` by default rather than their kind's level: they fire only where
 /// the code asked for them (`#[blaze::checkfree]`, `#[blaze::nopanic]`, `#[blaze::noalloc]`,
-/// `#[blaze::nonblocking]`, `#[blaze::pure]`), so a finding is a broken promise.
-pub(crate) const DENY_BY_DEFAULT: &[Lint] =
-    &[Lint::Checkfree, Lint::Nopanic, Lint::Noalloc, Lint::Nonblocking, Lint::Pure];
+/// `#[blaze::nonblocking]`, `#[blaze::pure]`, `#![blaze::capabilities]`), so a finding is a
+/// broken promise.
+pub(crate) const DENY_BY_DEFAULT: &[Lint] = &[
+    Lint::Checkfree,
+    Lint::Nopanic,
+    Lint::Noalloc,
+    Lint::Nonblocking,
+    Lint::Pure,
+    Lint::Capabilities,
+];
 
 /// The group `blaze::hot`: every lint of hot code, a hasher nobody chose included
 /// (`default_hasher`, which grew from `hot_lint.py`'s SipHash maps), and a value that leaves
@@ -384,6 +412,7 @@ impl Lint {
         Lint::Noalloc,
         Lint::Nonblocking,
         Lint::Pure,
+        Lint::Capabilities,
         Lint::Packable,
         Lint::SoaCandidate,
         Lint::BorrowWorkaround,
@@ -392,6 +421,14 @@ impl Lint {
         Lint::ThreadLocalInWaitingFn,
         Lint::LenientDeserialize,
         Lint::LockHeldAcrossSlow,
+        Lint::LossyAs,
+        Lint::GlobalState,
+        Lint::AsyncFn,
+        Lint::UnmarkedPure,
+        Lint::UnmarkedNopanic,
+        Lint::UnmarkedNoalloc,
+        Lint::UnmarkedNonblocking,
+        Lint::MutRef,
     ];
 
     /// Which workspaces the lint is for ([`Kind`]); written out per lint, so a new one chooses.
@@ -441,6 +478,8 @@ impl Lint {
             | Lint::Noalloc
             | Lint::Nonblocking
             | Lint::Pure
+            // Fires only in a crate with `#![blaze::capabilities]`, `deny` there.
+            | Lint::Capabilities
             // Its fix passes stable Rust's borrow checker too, so it is right for any crate.
             | Lint::BorrowWorkaround
             // Fires only in a crate with `#![feature(blaze_verify)]`.
@@ -450,6 +489,14 @@ impl Lint {
             Lint::DeepDropAtExit | Lint::PodSerializedByField | Lint::Packable | Lint::SoaCandidate => {
                 Kind::PedanticPerf
             }
+            // What the blaze edition removes; right for any crate getting ready for it.
+            Lint::LossyAs | Lint::GlobalState | Lint::AsyncFn => Kind::Edition,
+            // What the blaze edition writes at a crate's border: an effect the code already has.
+            Lint::UnmarkedPure
+            | Lint::UnmarkedNopanic
+            | Lint::UnmarkedNoalloc
+            | Lint::UnmarkedNonblocking => Kind::Edition,
+            Lint::LossyAs | Lint::GlobalState | Lint::AsyncFn | Lint::MutRef => Kind::Edition,
             // `blaze::hot` and its comments (`// clone:`, `// alloc:`, `// dyn:`).
             Lint::HotClone
             | Lint::HotAlloc
@@ -583,6 +630,7 @@ impl Lint {
             Lint::Noalloc => "noalloc",
             Lint::Nonblocking => "nonblocking",
             Lint::Pure => "pure",
+            Lint::Capabilities => "capabilities",
             Lint::Packable => "packable",
             Lint::SoaCandidate => "soa_candidate",
             Lint::BorrowWorkaround => "borrow_workaround",
@@ -591,6 +639,14 @@ impl Lint {
             Lint::ThreadLocalInWaitingFn => "thread_local_in_waiting_fn",
             Lint::LenientDeserialize => "lenient_deserialize",
             Lint::LockHeldAcrossSlow => "lock_held_across_slow",
+            Lint::LossyAs => "lossy_as",
+            Lint::GlobalState => "global_state",
+            Lint::AsyncFn => "async_fn",
+            Lint::UnmarkedPure => "unmarked_pure",
+            Lint::UnmarkedNopanic => "unmarked_nopanic",
+            Lint::UnmarkedNoalloc => "unmarked_noalloc",
+            Lint::UnmarkedNonblocking => "unmarked_nonblocking",
+            Lint::MutRef => "mut_ref",
         }
     }
 
@@ -675,6 +731,7 @@ impl Lint {
             Lint::Noalloc => concat!(general_docs!(), "#nopanic-noalloc-nonblocking"),
             Lint::Nonblocking => concat!(general_docs!(), "#nopanic-noalloc-nonblocking"),
             Lint::Pure => concat!(general_docs!(), "#pure"),
+            Lint::Capabilities => concat!(general_docs!(), "#capabilities"),
             Lint::Packable => concat!(general_docs!(), "#packable"),
             Lint::SoaCandidate => concat!(general_docs!(), "#soa_candidate"),
             Lint::BorrowWorkaround => concat!(general_docs!(), "#borrow_workaround"),
@@ -683,6 +740,14 @@ impl Lint {
             Lint::ThreadLocalInWaitingFn => concat!(docs!(), "#thread_local_in_waiting_fn"),
             Lint::LenientDeserialize => concat!(docs!(), "#lenient_deserialize"),
             Lint::LockHeldAcrossSlow => concat!(docs!(), "#lock_held_across_slow"),
+            Lint::LossyAs => concat!(general_docs!(), "#lossy_as"),
+            Lint::GlobalState => concat!(general_docs!(), "#global_state"),
+            Lint::AsyncFn => concat!(general_docs!(), "#async_fn"),
+            Lint::UnmarkedPure
+            | Lint::UnmarkedNopanic
+            | Lint::UnmarkedNoalloc
+            | Lint::UnmarkedNonblocking => concat!(general_docs!(), "#unmarked_pure-unmarked_nopanic-unmarked_noalloc-unmarked_nonblocking"),
+            Lint::MutRef => concat!(general_docs!(), "#mut_ref"),
             Lint::FiberBoundary => {
                 "https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan.md"
             }
@@ -907,6 +972,9 @@ impl Lint {
             Lint::Pure => {
                 "read the outside world only through the arguments (pass the value in, take a type parameter for a `dyn` or a function pointer), mark a callee proven by hand `#[blaze::pure(trusted = \"why\")]`, or take `#[blaze::pure]` off"
             }
+            Lint::Capabilities => {
+                "take the IO, the allocator or the unsafe interface as an argument, list the crate that does it under `[workspace.metadata.blaze.trusted]` with an `owner` and a `reason`, or take `#![blaze::capabilities]` off"
+            }
             Lint::Packable => {
                 "mark it `#[blaze::bits]` to store its `bool`, enum and small-integer fields at their bit widths, after checking that nothing borrows a field (`&s.f`, `&mut s.f`): a packed field has no address; or say why with `#[expect(blaze::packable, reason = \"..\")]`"
             }
@@ -930,6 +998,29 @@ impl Lint {
             }
             Lint::DynInHotField => {
                 "take the implementation as a type parameter (`struct S<F: Fn(..)>`) so the call is direct and inlinable, which costs one copy of the code per type used; or say why with `#[expect(blaze::dyn_in_hot_field, reason = \"..\")]`"
+            }
+            Lint::LossyAs => {
+                "convert with `From` where it can't lose (`u64::from(x)`), `T::try_from(x)` where it can, or the method that names the loss (`cast_signed`, `cast_unsigned`, `wrapping_*`, `ptr.addr()`); or say why with `#[expect(blaze::lossy_as, reason = \"..\")]`"
+            }
+            Lint::GlobalState => {
+                "give the state one owner and pass it, or a handle to it, as a context to the code the finding lists as using it; or say why it stays global with `#[expect(blaze::global_state, reason = \"..\")]`"
+            }
+            Lint::AsyncFn => {
+                "write it as a plain function run on a fiber: a wait parks the fiber and the may-suspend effect is inferred, so neither `async` nor `.await` is written; or say why with `#[expect(blaze::async_fn, reason = \"..\")]`"
+            }
+            Lint::UnmarkedPure => {
+                "write `#[blaze::pure]` above the function (`blaze check --fix` does); or say why it stays unmarked with `#[expect(blaze::unmarked_pure, reason = \"..\")]`"
+            }
+            Lint::UnmarkedNopanic => {
+                "write `#[blaze::nopanic]` above the function (`blaze check --fix` does); or say why it stays unmarked with `#[expect(blaze::unmarked_nopanic, reason = \"..\")]`"
+            }
+            Lint::UnmarkedNoalloc => {
+                "write `#[blaze::noalloc]` above the function (`blaze check --fix` does); or say why it stays unmarked with `#[expect(blaze::unmarked_noalloc, reason = \"..\")]`"
+            }
+            Lint::UnmarkedNonblocking => {
+                "write `#[blaze::nonblocking]` above the function (`blaze check --fix` does); or say why it stays unmarked with `#[expect(blaze::unmarked_nonblocking, reason = \"..\")]`"
+            Lint::MutRef => {
+                "spell the unique reference `&uniq` (`ref uniq` in a pattern), as `blaze check --fix` does; or say why with `#[expect(blaze::mut_ref, reason = \"..\")]`"
             }
             Lint::FrozenCollection => {
                 "make the field a `Box<[T]>` (`Box<str>` for a string), built once with `into_boxed_slice()` / `into_boxed_str()`; or say why it stays growable with `#[expect(blaze::frozen_collection, reason = \"..\")]`"
@@ -997,6 +1088,25 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         cold_error::check_fn(cx, f);
         profiled::check_fn(cx, f);
         native_contracts::check(cx, f);
+        async_fn::check_fn(cx, f);
+    }
+    if matches!(node.kind(), syntax::SyntaxKind::BLOCK_EXPR | syntax::SyntaxKind::CLOSURE_EXPR) {
+        async_fn::check_expr(cx, node);
+    }
+    if matches!(
+        node.kind(),
+        syntax::SyntaxKind::REF_TYPE
+            | syntax::SyntaxKind::REF_EXPR
+            | syntax::SyntaxKind::SELF_PARAM
+            | syntax::SyntaxKind::IDENT_PAT
+    ) {
+        mut_ref::check(cx, node);
+    }
+    if let Some(item) = ast::Static::cast(node) {
+        global_state::check(cx, item);
+    }
+    if let Some(call) = ast::MacroCall::cast(node) {
+        global_state::check_thread_local(cx, call);
     }
     if let Some(item) = ast::Enum::cast(node) {
         large_move::check_enum(cx, item);
@@ -1071,11 +1181,13 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         box_large_new::check(cx);
         checkfree::check(cx);
         effects::check(cx);
+        unmarked_effects::check(cx);
         unbuffered_io::check(cx);
         stdout_lock_in_loop::check(cx);
         front_vec_ops::check(cx);
         fmt_allocates::check(cx);
         stable_sort_needless::check(cx);
+        lossy_as::check(cx);
         check_body(cx);
     }
 }

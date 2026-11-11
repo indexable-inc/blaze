@@ -631,7 +631,7 @@ fn let_go(kept: KeptLowered, why: &str, variable: Option<&str>) {
 /// file, never a whole parse in its place.
 fn seed(db: &base_db::Db, seeds: &[blaze_intent::Seed]) -> Result<(), blaze_lower::LowerError> {
     for it in seeds {
-        if !base_db::EditionedFileId::new(db, it.file, it.edition)
+        if !base_db::EditionedFileId::new_gated(db, it.file, it.edition, it.parse.gates())
             .seed_parse(db, it.content, &it.parse)
         {
             // alloc: an error path.

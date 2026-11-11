@@ -137,11 +137,31 @@ impl DefMap {
                         // `#![blaze::arbitrary_ints]`, from `DefMap::arbitrary_ints`
                         // (docs/v2/plan/design/arbitrary-ints.md).
                         | "arbitrary_ints"
+                        // `#![blaze::handles]`, from `DefMap::handles`, and the effect
+                        // `#[blaze::norefcount]`, from `AttrFlags::NOREFCOUNT`
+                        // (docs/v2/plan/design/edition.md, change 1).
+                        | "handles"
+                        | "norefcount"
+                        // `#![blaze::views]`, from `DefMap::views`
+                        // (`hir_ty_borrowck::views`, docs/v2/plan/design/edition.md).
+                        | "views"
+                        // `#![blaze::uniq]`, read off the root's tokens before any parse
+                        // (`base_db::Crate::syntax_gates`, docs/v2/plan/design/edition.md).
+                        | "uniq"
+                        // `#![blaze::pattern_types]`, from `DefMap::pattern_types`
+                        // (docs/v2/plan/design/edition.md, section 8).
+                        | "pattern_types"
+                        // `#![blaze::error_unions]`, read off the crate root's tokens by
+                        // `base_db::crate_extensions` (the parser's `A | B` types).
+                        | "error_unions"
                         // `#[blaze::reflect]`, from `AttrFlags::BLAZE_REFLECT`
                         // (`hir_ty_comptime::struct_domain`, docs/v2/plan/design/comptime.md).
                         | "reflect"
                         // `#[blaze::sealed]`, from `AttrFlags::BLAZE_SEALED` (`hir-ty-coherence`).
                         | "sealed"
+                        // `#![blaze::capabilities]`, from `AttrFlags::CAPABILITIES`
+                        // (blaze-lints' `blaze::capabilities`, docs/v2/plan/design/std.md).
+                        | "capabilities"
                 )
             {
                 return true;

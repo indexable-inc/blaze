@@ -555,7 +555,11 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
 
     fn alloc_local(&mut self, local: Local) -> LocalId {
         let id = LocalId::from_raw(RawIdx::from_u32(self.building.locals.len() as u32));
-        self.building.locals.push(local);
+        // blaze: a refinement by enum variants (`#![blaze::pattern_types]`) has its base's
+        // layout and code, so a local holds the base: places project through it as through
+        // the enum, and a signature naming the refinement relates to it as its base.
+        let ty = hir_ty::pattern_types::erase(self.interner(), local.ty.as_ref());
+        self.building.locals.push(Local { ty: ty.store() });
         id
     }
 
@@ -772,9 +776,49 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                     );
                     Ok(Some(current))
                 }
+                Adjust::ErrorUnion => {
+                    let Some((p, current)) =
+                        self.lower_expr_as_place_with_adjust(current, expr_id, true, rest)?
+                    else {
+                        return Ok(None);
+                    };
+                    let source = match rest.last() {
+                        Some(it) => it.target.as_ref(),
+                        None => self.expr_ty_without_adjust(expr_id),
+                    };
+                    self.lower_error_union_widen(
+                        current,
+                        Operand { kind: OperandKind::Copy(p.store()), span: None },
+                        source,
+                        last.target.as_ref(),
+                        place,
+                        expr_id.into(),
+                    )
+                }
             },
             None => self.lower_expr_to_place_without_adjust(expr_id, place, current),
         }
+    }
+
+    /// `place = core::error_union::widen::<source, target>(value)`: a member of the error
+    /// union `target`, or a union of some of its members, put in it (`Adjust::ErrorUnion`).
+    fn lower_error_union_widen(
+        &mut self,
+        current: BasicBlockId,
+        value: Operand,
+        source: Ty<'db>,
+        target: Ty<'db>,
+        place: Place<'db>,
+        span: MirSpan,
+    ) -> Result<'db, Option<BasicBlockId>> {
+        let widen = self.lang_items().ErrorUnionWiden.ok_or(MirLowerError::LangItemNotFound)?;
+        let widen = Operand::const_zst(Ty::new_fn_def(
+            self.interner(),
+            CallableDefId::FunctionId(widen).into(),
+            GenericArgs::new_from_slice(&[source.into(), target.into()]),
+        ));
+        // alloc: the call's arguments, kept in the body
+        self.lower_call(widen, Box::new([value]), place, current, false, span)
     }
 
     fn lower_expr_to_place_with_borrow_adjust(
@@ -2544,11 +2588,17 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                 }
                 *place = place.project(ProjectionElem::Field(FieldIndex(index)));
             } else {
-                let field = self
-                    .infer
-                    .field_resolution(expr_id)
-                    .ok_or(MirLowerError::UnresolvedField)?
-                    .either(|f| f.local_id.into(), |t| FieldIndex(t.index));
+                let field =
+                    self.infer.field_resolution(expr_id).ok_or(MirLowerError::UnresolvedField)?;
+                // blaze: a field of an enum's variant, read on a refinement by that one variant
+                // (`conn.socket` on a `Conn is Conn::Open { .. }`, `#![blaze::pattern_types]`):
+                // the place is the enum, so it is downcast to the variant first.
+                if let Either::Left(it) = field
+                    && let hir_def::VariantId::EnumVariantId(variant) = it.parent
+                {
+                    *place = place.project(ProjectionElem::Downcast(variant.into()));
+                }
+                let field = field.either(|f| f.local_id.into(), |t| FieldIndex(t.index));
                 *place = place.project(ProjectionElem::Field(field));
             }
         } else {
@@ -4914,8 +4964,16 @@ pub fn inline_const_at<'db>(
 
 /// `owner`'s body built from its HIR. An `async` block's is the `Future::poll` of the block's
 /// type; by move, the future owns what its `async` closure captured, where the block itself
-/// borrows from the closure.
+/// borrows from the closure. Under `#![blaze::handles]`, a move of a handle that is used again
+/// is then a copy ([`super::handles`]), before anything, the borrow checker first, reads it.
 pub(crate) fn build_mir_body<'db>(db: &'db Db, owner: MirOwner<'db>) -> Result<'db, MirBody<'db>> {
+    let mut body = lower_mir_body(db, owner)?;
+    super::handles::copy_handles(db, &mut body)?;
+    Ok(body)
+}
+
+/// `owner`'s body as lowering builds it, before [`super::handles`].
+fn lower_mir_body<'db>(db: &'db Db, owner: MirOwner<'db>) -> Result<'db, MirBody<'db>> {
     match owner {
         MirOwner::Body(def) => compute_mir_body(db, def),
         MirOwner::Closure(closure) => {

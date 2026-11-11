@@ -125,6 +125,7 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::noalloc",
             "blaze::nonblocking",
             "blaze::pure",
+            "blaze::capabilities",
             "blaze::borrow_workaround",
             "blaze::native_contracts",
             "blaze::dead",
@@ -141,6 +142,19 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::soa_candidate",
             "blaze::vecreport",
         ],
+    ),
+    (
+        "blaze::edition",
+        &[
+            "blaze::lossy_as",
+            "blaze::global_state",
+            "blaze::async_fn",
+            "blaze::unmarked_pure",
+            "blaze::unmarked_nopanic",
+            "blaze::unmarked_noalloc",
+            "blaze::unmarked_nonblocking",
+        ],
+        &["blaze::lossy_as", "blaze::global_state", "blaze::async_fn", "blaze::mut_ref"],
     ),
     (
         "blaze::internal",

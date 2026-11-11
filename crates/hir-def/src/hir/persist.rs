@@ -1144,10 +1144,11 @@ impl Code for span::EditionedFileId {
             true => r.relocated(Kind::SpanFile)? as u32,
             false => r.u32()?,
         };
-        let edition = (raw & Self::EDITION_MASK) >> Self::FILE_ID_BITS;
-        match raw & Self::RESERVED_MASK == 0 && edition <= Edition::LATEST as u32 {
+        match Self::is_valid_raw(raw) {
             true => Ok(Self::from_raw(raw)),
-            false => Err(r.invalid("a file id with reserved bits or an edition out of range")),
+            false => Err(r.invalid(
+                "a file id with reserved bits, an edition out of range or unknown syntax gates",
+            )),
         }
     }
 }

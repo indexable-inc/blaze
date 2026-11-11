@@ -626,8 +626,12 @@ fn pat_list(p: &mut Parser<'_>, ket: SyntaxKind) {
 fn ident_pat(p: &mut Parser<'_>, with_at: bool) -> CompletedMarker {
     assert!(matches!(p.current(), T![ref] | T![mut] | IDENT));
     let m = p.start();
-    p.eat(T![ref]);
-    p.eat(T![mut]);
+    if p.eat(T![ref]) && !p.eat(T![mut]) && uniq::at_ref_binding(p) {
+        // `ref uniq x` (`#![blaze::uniq]`): the `mut` of `ref mut x`, spelled `uniq`.
+        p.bump_remap(T![mut]);
+    } else {
+        p.eat(T![mut]);
+    }
     name_r(p, PAT_RECOVERY_SET);
     if with_at && p.eat(T![@]) {
         pattern_single(p);

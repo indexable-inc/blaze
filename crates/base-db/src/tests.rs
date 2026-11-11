@@ -89,6 +89,7 @@ fn add_with_attrs(
             target: Err("no target in tests".into()),
             toolchain: None,
             const_eval: Default::default(),
+            trusted: Box::default(),
         }),
     )
 }
@@ -1294,7 +1295,12 @@ fn targets_differing_in_the_tuple_or_thumb_interworking_have_different_ids() {
     assert_eq!(interworking.content(), arm_target("armv7-unknown-linux-gnueabihf", true).content());
 
     let workspace = |target: TargetData| {
-        CrateWorkspaceData { target: Ok(target), toolchain: None, const_eval: Default::default() }
+        CrateWorkspaceData {
+            target: Ok(target),
+            toolchain: None,
+            const_eval: Default::default(),
+            trusted: Box::default(),
+        }
             .content()
     };
     assert_ne!(workspace(interworking.clone()), workspace(without.clone()));
@@ -1309,6 +1315,7 @@ fn targets_differing_in_the_tuple_or_thumb_interworking_have_different_ids() {
             target: Ok(target),
             toolchain: None,
             const_eval: Default::default(),
+            trusted: Box::default(),
         };
         a.set_workspace_data(&mut db, Arc::new(workspace));
         a.content(&db)

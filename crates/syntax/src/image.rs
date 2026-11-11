@@ -33,8 +33,14 @@ const ERROR: usize = 4;
 
 /// Appends `parse` (its tree, the bodies parsed so far, and its lexer's and parser's errors)
 /// to `out` as a record [`read`] maps back: from the next multiple of 8 of `out`'s length,
-/// which is where in `out` it is.
+/// which is where in `out` it is. Only a parse under no syntax extensions is stored: the
+/// record keeps no extensions, and [`read`] makes a parse under none.
 pub fn write(parse: &Parse<SourceFile>, out: &mut Vec<u8>) -> Range<usize> {
+    assert!(
+        parse.extensions.is_none(),
+        "a parse under syntax extensions {:?} written as a tree image, which keeps none",
+        parse.extensions,
+    );
     pad(out);
     let start = out.len();
     out.resize(start + HEAD * 4, 0);
@@ -62,7 +68,9 @@ pub fn write(parse: &Parse<SourceFile>, out: &mut Vec<u8>) -> Range<usize> {
     head[0] = MAGIC;
     head[1] = offset(out, start);
     head[2] = TREE_VERSION;
-    head[3] = parse.outline.map_or(0, |edition| edition as u32 + 1);
+    // The syntax gates above the edition: a gated parse never reads back as an ungated one.
+    head[3] = parse.outline.map_or(0, |edition| edition as u32 + 1)
+        | u32::from(parse.gates.bits()) << 8;
     head[4] = to_u32(errors.len());
     head[8] = to_u32(tree.start - start);
     head[9] = to_u32(tree.len());
@@ -75,7 +83,8 @@ pub fn write(parse: &Parse<SourceFile>, out: &mut Vec<u8>) -> Range<usize> {
 /// The parse of `text` in `edition` (an outline when `outline`) stored at byte `at` of `bytes`
 /// by [`write`], its tree read in place from `bytes`. An error says what about the bytes is
 /// not that parse: another parser's tree ([`TREE_VERSION`]), another edition's or kind of
-/// parse, or a tree of another text's length.
+/// parse, one made under syntax gates (`#![blaze::uniq]`, which no stored parse is read
+/// under), or a tree of another text's length.
 pub fn read(
     bytes: &Bytes,
     at: usize,
@@ -95,7 +104,7 @@ pub fn read(
         return Err(wrong("a tree of another parser version"));
     }
     if head[3] != if outline { edition as u32 + 1 } else { 0 } {
-        return Err(wrong("a tree of another edition or kind of parse"));
+        return Err(wrong("a tree of another edition, syntax gates or kind of parse"));
     }
     let len = head[1] as usize;
     if at.checked_add(len).is_none_or(|end| end > bytes.len()) {
@@ -140,7 +149,8 @@ pub fn read(
         return Err(wrong("a tree that is not a file of this text's length"));
     }
     // alloc: the parse's shared tree, once per file read
-    Ok(Parse::with_outline(Tree::new(Arc::new(tree)), errors, outline.then_some(edition)))
+    let tree = Tree::new(Arc::new(tree));
+    Ok(Parse::with_outline(tree, errors, outline.then_some(edition), crate::Extensions::NONE))
 }
 
 fn pad(out: &mut Vec<u8>) {

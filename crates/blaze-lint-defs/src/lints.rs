@@ -1062,6 +1062,8 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::pure", Deny, "detects a `#[blaze::pure]` function that may read or change the world outside its arguments (the environment, the clock, files, threads, state that changes, an address, randomness, foreign code), through any call")
         .externally_loaded(),
+    l("blaze::capabilities", Deny, "detects a function of a `#![blaze::capabilities]` crate that may reach ambient IO, run `unsafe` code or call the global allocator past the crates its workspace trusts, through any call")
+        .externally_loaded(),
     l("blaze::packable", Allow, "detects a struct held in a collection whose `bool` and fieldless enum fields need far fewer bits than they take, which `#[blaze::bits]` would pack")
         .externally_loaded(),
     l("blaze::soa_candidate", Allow, "detects a struct held in a `Vec`, slice or array whose loops read or write only a small part of each element, which a struct of arrays would store as columns")
@@ -1075,6 +1077,21 @@ pub(super) const BLAZE: &[Lint] = &[
     l("blaze::thread_local_in_waiting_fn", Allow, "detects a thread-local read in, or inlinable into, a function that may park the fiber, which can keep the first thread's address after resuming on another")
         .externally_loaded(),
     l("blaze::lenient_deserialize", Allow, "detects a struct or enum deriving serde's `Deserialize` without `#[serde(deny_unknown_fields)]`, which silently drops a field of its input it doesn't know")
+        .externally_loaded(),
+    l("blaze::lossy_as", Allow, "detects an `as` cast that can lose value or sign, or that goes between a pointer and an integer, which `From`, `TryFrom` or a method naming the loss says")
+        .externally_loaded(),
+    l("blaze::global_state", Allow, "detects a `static mut`, a `static` whose type has interior mutability and a `thread_local!` item, global state the blaze edition removes")
+        .externally_loaded(),
+    l("blaze::async_fn", Allow, "detects an `async fn`, `async` block or `async` closure, which the blaze edition removes: a wait parks the fiber and the may-suspend effect is inferred")
+        .externally_loaded(),
+    l("blaze::unmarked_pure", Allow, "detects a function the effects walk proves pure that lacks `#[blaze::pure]`, which callers and the cache could rely on")
+        .externally_loaded(),
+    l("blaze::unmarked_nopanic", Allow, "detects a function the effects walk proves cannot panic that lacks `#[blaze::nopanic]`, which callers could rely on")
+        .externally_loaded(),
+    l("blaze::unmarked_noalloc", Allow, "detects a function the effects walk proves never calls the global allocator that lacks `#[blaze::noalloc]`, which callers could rely on")
+        .externally_loaded(),
+    l("blaze::unmarked_nonblocking", Allow, "detects a function the effects walk proves never blocks the thread that lacks `#[blaze::nonblocking]`, which callers could rely on")
+    l("blaze::mut_ref", Allow, "detects a unique reference spelled `&mut` or `ref mut` in a crate that says `#![blaze::uniq]`, which spells it `&uniq` and `ref uniq`")
         .externally_loaded(),
     // Emitted by the release build, which reads it from the code LLVM made, never by `blaze check`.
     l("blaze::vecreport", Allow, "reports a bounds check, overflow check or panic path the optimizer kept inside a loop, and a loop it left unvectorized with its reason, read from the optimized code; only hot loops when the build has a profile"),

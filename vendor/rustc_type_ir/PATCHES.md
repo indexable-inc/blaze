@@ -245,6 +245,15 @@ blaze-mem's 160 KiB class, 16 GiB, so the solver panicked in three units. Tests:
 `a_lookup_in_a_table_never_written_holds_no_memory`,
 `a_table_of_one_writer_holds_one_shard_whatever_the_cores`.
 
+### 0018-error-union-lang-items
+
+What, in `src/lang_items.rs`: `SolverTraitLangItem::ErrorUnionFrom` (core's
+`error_union::UnionFrom`) and `SolverAdtLangItem::ErrorUnion` (core's `error_union::ErrorUnion`).
+
+Why: `rustc_next_trait_solver`'s patch `0015-error-union-builtins` answers `U: UnionFrom<S>` for
+blaze's error unions (`#![blaze::error_unions]`) and needs to know both items. Made by lane
+edition-e3-unions-1109 (2026-11-09).
+
 ## Dropped since the previous base (ra-ap-rustc_type_ir 0.166.0, rustc `ce89c898`)
 
 - The backport of rust-lang/rust#159228 (the retry with twice the recursion limit:

@@ -10,6 +10,8 @@ use parser::Edition;
 use stdx::format_to_acc;
 use test_utils::{bench, bench_fixture, project_root};
 
+mod uniq;
+
 use crate::{AstNode, SourceFile, SyntaxError, Text, TextRange, TextSize, ast, fuzz};
 
 #[test]
@@ -398,4 +400,68 @@ fn exact_errors_allocate_only_their_box() {
     let want = outline.errors_with_bodies();
     assert_eq!(outline.errors_with_bodies_exact().as_deref(), Some(&want[..]));
     assert_eq!(outline.errors_exact().as_deref().unwrap_or_default(), &outline.errors()[..]);
+}
+
+/// How many error union types (`A | B`, `#![blaze::error_unions]`) a parse has.
+fn union_types(parse: &crate::Parse<SourceFile>) -> usize {
+    let root = parse.tree();
+    root.syntax().descendants().filter(|it| it.kind() == crate::SyntaxKind::UNION_TYPE).count()
+}
+
+#[test]
+fn union_types_parse_only_under_the_extension() {
+    let text = "fn f(e: A | B) -> Result<(), A | io::Error | Vec<u8>> {\n\
+        let x: (A | B, [C | D; 2]) = y;\n\
+    }\n";
+    let unions = crate::Extensions::ERROR_UNIONS;
+    let on = SourceFile::parse_shared_with(text, Edition::CURRENT, unions);
+    assert_eq!(on.errors(), Vec::<SyntaxError>::new());
+    assert_eq!(union_types(&on), 4);
+    let off = SourceFile::parse_shared_with(text, Edition::CURRENT, crate::Extensions::NONE);
+    let today = SourceFile::parse_shared(text, Edition::CURRENT);
+    assert_eq!(off, today, "no extension is today's parse");
+    assert!(!off.errors().is_empty(), "without the extension `A | B` is no type");
+    assert_eq!(union_types(&off), 0);
+}
+
+#[test]
+fn a_program_without_unions_parses_the_same_under_the_extension() {
+    // `|` after a type in every place the language has one: closures' parameters and return
+    // types, casts, or-patterns, bit-or after a turbofish, `|=` and `||`.
+    let text = "fn f(x: u8) -> u8 {\n\
+        let g = |a: u8, b: Vec<u8>| -> u8 { a | b[0] };\n\
+        let h = |a: u8| a as u8 | 1;\n\
+        let y = x as u32 | 2 as u32;\n\
+        let z = f::<u8>(x) | f::<u8>(x);\n\
+        let mut w = x; w |= 1;\n\
+        if let Some(_) | None = Some(x) {}\n\
+        let k = || true || false;\n\
+        x as u8 | g(1, vec![]) | h(2) | y as u8 | z | w\n\
+    }\n";
+    let off = SourceFile::parse_shared(text, Edition::CURRENT);
+    assert_eq!(off.errors(), Vec::<SyntaxError>::new());
+    let unions = crate::Extensions::ERROR_UNIONS;
+    for outline in [false, true] {
+        let on = match outline {
+            false => SourceFile::parse_shared_with(text, Edition::CURRENT, unions),
+            true => SourceFile::parse_outline_with(text, Edition::CURRENT, unions),
+        };
+        assert_eq!(format!("{:#?}", on.syntax_node()), format!("{:#?}", off.syntax_node()));
+        assert_eq!(on.errors_with_bodies(), off.errors_with_bodies());
+    }
+}
+
+#[test]
+fn an_outline_parses_its_lazy_bodies_under_its_extensions() {
+    let text = "fn f() { let x: A | B = y; }\n";
+    let unions = crate::Extensions::ERROR_UNIONS;
+    let on = SourceFile::parse_outline_with(text, Edition::CURRENT, unions);
+    assert_eq!(on.errors_with_bodies(), Vec::<SyntaxError>::new());
+    assert_eq!(union_types(&on), 1);
+    // ` | C` inserted after `B`.
+    let after = "fn f() { let x: A | B | C = y; }\n";
+    let reparsed = on.reparse_onto(TextRange::empty(TextSize::from(21)), after, Edition::CURRENT);
+    assert_eq!(reparsed.extensions(), crate::Extensions::ERROR_UNIONS);
+    assert_eq!(union_types(&reparsed), 1);
+    assert_eq!(reparsed.errors_with_bodies(), Vec::<SyntaxError>::new());
 }

@@ -155,6 +155,14 @@ impl<'a> Sig<'a> {
                     out.text(")");
                 }
             }
+            TypeRef::Union(members) => {
+                for (at, member) in members.iter().enumerate() {
+                    if at > 0 {
+                        out.text(" | ");
+                    }
+                    self.ty(out, *member);
+                }
+            }
             TypeRef::UnsafeBinder { lifetimes, ty } => {
                 // rustdoc's `print_higher_ranked_params_with_space`: nothing when no lifetime is bound.
                 let names = self.store.names(lifetimes);

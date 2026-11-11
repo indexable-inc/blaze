@@ -13,6 +13,7 @@
 
 mod assembly;
 mod effect_goals;
+mod error_union;
 mod eval_ctxt;
 pub mod inspect;
 mod normalizes_to;

@@ -953,11 +953,33 @@ mod tests {
             pedantic.intersects(blaze::Lint::DeepDropAtExit.bit())
                 && !pedantic.intersects(blaze::Lint::HashTwice.bit())
         );
+        let (edition, _) = named_in("#[warn(blaze::edition)]");
+        assert!(
+            edition.intersects(blaze::Lint::LossyAs.bit())
+                && edition.intersects(blaze::Lint::GlobalState.bit())
+                && edition.intersects(blaze::Lint::AsyncFn.bit())
+                && edition.intersects(blaze::Lint::UnmarkedPure.bit())
+                && edition.intersects(blaze::Lint::UnmarkedNopanic.bit())
+                && edition.intersects(blaze::Lint::UnmarkedNoalloc.bit())
+                && edition.intersects(blaze::Lint::UnmarkedNonblocking.bit())
+                && edition.intersects(blaze::Lint::MutRef.bit())
+                && !edition.intersects(blaze::Lint::HashTwice.bit())
+        );
         assert!(
             !(general.intersects(pedantic) || internal.intersects(pedantic)),
             "the kinds are disjoint"
         );
-        assert_eq!(general | internal | pedantic, On::BLAZE, "every blaze lint is of one kind");
+        assert!(
+            !(general.intersects(edition)
+                || internal.intersects(edition)
+                || pedantic.intersects(edition)),
+            "the kinds are disjoint"
+        );
+        assert_eq!(
+            general | internal | pedantic | edition,
+            On::BLAZE,
+            "every blaze lint is of one kind"
+        );
         for text in
             ["notclippy::needless_bool", "clippy::not_a_lint", "clippy needless_bool", "blaze::"]
         {

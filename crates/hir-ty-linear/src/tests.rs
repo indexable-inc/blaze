@@ -201,11 +201,299 @@ fn an_early_return_is_an_error() {
 }
 
 #[test]
-fn a_question_mark_is_an_error() {
+fn a_question_mark_with_no_abandonment_path_is_an_error() {
+    // `Txn` has no `Drop` impl: nothing says what leaving one on an error does.
     let found = check(&format!(
         "{TXN}\nfn f(r: Result<u32, ()>) -> Result<u32, ()> {{\n    let t = Txn {{ id: 0 }};\n    let v = r?;\n    t.commit();\n    Ok(v)\n}}\n"
     ));
-    expect(&found, &[(&["`t`", "`?` returns early"], "r?")]);
+    expect(
+        &found,
+        &[(&["`t`", "`Txn`", "`?` returns early", "abandonment `Drop`", "before the `?`"], "r?")],
+    );
+}
+
+/// A linear file with an abandonment path, as bstd's are to be: its own `Drop` is what an
+/// error exit and a panic run.
+const FILE: &str = "
+#[blaze::linear]
+struct File { fd: u32 }
+
+impl Drop for File {
+    fn drop(&mut self) {}
+}
+
+impl File {
+    fn write(&self) -> Result<(), u8> { Ok(()) }
+    #[blaze::consumes]
+    fn close(self) -> Result<(), u8> { Ok(()) }
+}
+
+fn open() -> Result<File, u8> { Ok(File { fd: 0 }) }
+fn step() -> Result<u32, u8> { Ok(0) }
+";
+
+#[test]
+fn a_function_returning_a_linear_result_uses_question_marks() {
+    // `?` on calls that have nothing to do with the value returned, and on the one that
+    // makes it: `from_residual` builds an `Err`, which holds no `File`.
+    let found = check(&format!(
+        "{FILE}
+fn f() -> Result<File, u8> {{
+    let n = step()?;
+    let file = open()?;
+    let _ = n + step()?;
+    Ok(file)
+}}
+fn g() -> Option<File> {{
+    let file = f().ok()?;
+    Some(file)
+}}
+"
+    ));
+    expect(&found, &[]);
+}
+
+#[test]
+fn an_error_exit_abandons_a_value_with_an_abandonment_path() {
+    // The `?` after `write` leaves with `file` live: its `Drop` runs, as in a panic. So do
+    // a returned `Err(..)` and `None`.
+    let found = check(&format!(
+        "{FILE}
+fn by_try() -> Result<(), u8> {{
+    let file = open()?;
+    file.write()?;
+    file.close()?;
+    Ok(())
+}}
+fn by_return(bad: bool) -> Result<(), u8> {{
+    let file = open()?;
+    if bad {{
+        return Err(1);
+    }}
+    file.close()
+}}
+fn by_none(bad: bool) -> Option<u32> {{
+    let file = open().ok()?;
+    if bad {{
+        return None;
+    }}
+    let _ = file.close();
+    Some(0)
+}}
+"
+    ));
+    expect(&found, &[]);
+}
+
+#[test]
+fn a_failure_the_body_ends_with_abandons_too() {
+    // `Err(1)` as the value the body ends with is the same exit as `return Err(1)`.
+    let found = check(&format!(
+        "{FILE}
+fn f(bad: bool) -> Result<u32, u8> {{
+    let file = open()?;
+    if bad {{
+        Err(1)
+    }} else {{
+        file.close()?;
+        Ok(0)
+    }}
+}}
+"
+    ));
+    expect(&found, &[]);
+}
+
+#[test]
+fn a_guard_field_is_an_abandonment_path() {
+    // The type keeps its `Drop` in a field of a type of its own crate, so that `finish` can
+    // still take the other fields out.
+    let found = check(&format!(
+        "{FILE}
+struct Armed {{ armed: bool }}
+impl Drop for Armed {{
+    fn drop(&mut self) {{}}
+}}
+#[blaze::linear]
+struct Op {{ guard: Armed, id: u32 }}
+impl Op {{
+    #[blaze::consumes]
+    fn finish(self) -> u32 {{ self.id }}
+}}
+fn f() -> Result<u32, u8> {{
+    let op = Op {{ guard: Armed {{ armed: true }}, id: 0 }};
+    step()?;
+    Ok(op.finish())
+}}
+"
+    ));
+    expect(&found, &[]);
+}
+
+// An abandonment path covers error exits only: falling off the end, `return Ok(..)`, `break`
+// and a `return` of a body that returns no `Result` or `Option` must have consumed the value.
+
+#[test]
+fn falling_off_the_end_with_a_live_value_is_still_an_error() {
+    let found = check(&format!(
+        "{FILE}
+fn f() -> Result<(), u8> {{
+    let file = open()?;
+    file.write()?;
+    Ok(())
+}}
+"
+    ));
+    expect(&found, &[(&["`file`", "`File`", "at the end of its scope"], "}")]);
+}
+
+#[test]
+fn returning_success_with_a_live_value_is_still_an_error() {
+    // The `?` after `close` shares the drop of `file` with the `return`: only the `return`
+    // gets there with the file live, and it is the one named.
+    let found = check(&format!(
+        "{FILE}
+fn f(early: bool) -> Result<u32, u8> {{
+    let file = open()?;
+    if early {{
+        return Ok(1);
+    }}
+    file.close()?;
+    Ok(0)
+}}
+"
+    ));
+    expect(&found, &[(&["`file`", "`File`", "`return` leaves early"], "return Ok(1)")]);
+}
+
+#[test]
+fn a_break_with_a_live_value_is_still_an_error() {
+    let found = check(&format!(
+        "{FILE}
+fn f() -> Result<(), u8> {{
+    loop {{
+        let file = open()?;
+        if step()? == 0 {{
+            break;
+        }}
+        file.close()?;
+    }}
+    Ok(())
+}}
+"
+    ));
+    expect(&found, &[(&["`file`", "`File`", "`break`"], "break")]);
+}
+
+#[test]
+fn a_return_of_a_body_that_returns_no_result_abandons_nothing() {
+    let found = check(&format!(
+        "{FILE}
+fn f(early: bool) {{
+    let file = File {{ fd: 0 }};
+    if early {{
+        return;
+    }}
+    let _ = file.close();
+}}
+"
+    ));
+    expect(&found, &[(&["`file`", "`File`", "`return` leaves early"], "return")]);
+}
+
+#[test]
+fn a_linear_payload_is_matched_out_of_an_option_and_a_result() {
+    let found = check(&format!(
+        "{TXN}
+fn from_option(o: Option<Txn>) {{
+    match o {{
+        Some(t) => t.commit(),
+        None => {{}}
+    }}
+}}
+fn from_result(r: Result<Txn, u8>) -> u8 {{
+    match r {{
+        Ok(t) => {{
+            t.commit();
+            0
+        }}
+        Err(e) => e,
+    }}
+}}
+fn if_let(o: Option<Txn>) {{
+    if let Some(t) = o {{
+        t.commit();
+    }}
+}}
+fn built() -> Option<Txn> {{ Some(Txn {{ id: 0 }}) }}
+"
+    ));
+    expect(&found, &[]);
+}
+
+#[test]
+fn an_option_holding_a_linear_value_is_linear() {
+    let found = check(&format!("{TXN}\nfn f(o: Option<Txn>) {{\n}}\n"));
+    assert_eq!(found.len(), 1, "{found:#?}");
+    let (message, at) = &found[0];
+    for word in ["o", "Option<Txn>", "at the end of its scope"] {
+        assert!(message.contains(word), "`{word}` is not in: {message}");
+    }
+    assert_eq!(at, "}", "{message}");
+}
+
+#[test]
+fn the_methods_that_hand_a_payload_on_admit_a_linear_one() {
+    let found = check(&format!(
+        "{TXN}
+fn unwrapped(o: Option<Txn>) {{ o.unwrap().commit() }}
+fn asked(o: Option<Txn>) -> bool {{
+    let some = o.is_some();
+    consume(o);
+    some
+}}
+fn to_result(o: Option<Txn>) -> Result<Txn, u8> {{ o.ok_or(1) }}
+fn to_option(r: Result<Txn, u8>) -> Option<Txn> {{ r.ok() }}
+fn mapped(r: Result<Txn, u8>) -> Result<Txn, u32> {{ r.map_err(|e| e as u32) }}
+fn taken(r: Result<u8, Txn>) -> u8 {{
+    r.unwrap_or_else(|t| {{
+        t.commit();
+        0
+    }})
+}}
+"
+    ));
+    expect(&found, &[]);
+}
+
+#[test]
+fn a_method_that_may_drop_the_payload_refuses_a_linear_one() {
+    // `unwrap_or` drops its default when the option is `Some`: its impl has no mark.
+    let found = check(&format!(
+        "{TXN}\nfn f(o: Option<Txn>, d: Txn) {{\n    o.unwrap_or(d).commit();\n}}\n"
+    ));
+    assert_eq!(found.len(), 1, "{found:#?}");
+    let (message, _) = &found[0];
+    for word in ["`Txn`", "unwrap_or", "type parameter `T`", "does not admit linear types"] {
+        assert!(message.contains(word), "`{word}` is not in: {message}");
+    }
+}
+
+#[test]
+fn a_callable_that_gives_a_linear_value_is_refused_and_one_that_takes_it_is_not() {
+    let found = check(&format!(
+        "{TXN}
+fn apply<F: FnOnce(Txn) -> u32>(t: Txn, f: F) -> u32 {{ f(t) }}
+fn make<F: FnOnce() -> Txn>(f: F) {{ f().commit() }}
+fn takes() -> u32 {{ apply(Txn {{ id: 0 }}, |t| {{ t.commit(); 0 }}) }}
+fn gives() {{ make(|| Txn {{ id: 0 }}) }}
+"
+    ));
+    assert_eq!(found.len(), 1, "{found:#?}");
+    let (message, _) = &found[0];
+    for word in ["make", "type parameter `F`", "does not admit linear types"] {
+        assert!(message.contains(word), "`{word}` is not in: {message}");
+    }
 }
 
 #[test]
@@ -267,4 +555,159 @@ fn an_async_body_holding_a_linear_value_is_an_error() {
     assert!(!found.is_empty(), "no error");
     assert!(found.iter().all(|(message, _)| message.contains("`async` body")), "{found:#?}");
     assert!(found.iter().any(|(message, at)| message.contains("`t`") && at == "t"), "{found:#?}");
+}
+
+/// bstd's linear types (crates/blaze-std), mirrored: this harness builds crates over minicore
+/// and cannot reach blaze-std, so each is its shape and its finishing call, nothing more. A
+/// `Scope` keeps its abandonment path in a field (`Live`), as blaze-std's does; a `Task` has
+/// none.
+const BSTD: &str = "
+struct Cx;
+
+/// A scope's abandonment path: what a panic and an error exit run.
+struct Live;
+
+impl Drop for Live {
+    fn drop(&mut self) {}
+}
+
+#[blaze::linear]
+struct Scope<'p> { cx: &'p Cx, live: Live }
+
+#[blaze::linear]
+struct Task<'s> { outcome: u32, scope: &'s () }
+
+impl Cx {
+    fn scope(&self) -> Scope<'_> { Scope { cx: self, live: Live } }
+}
+
+impl<'p> Scope<'p> {
+    fn spawn(&self, task: impl FnOnce(&Cx) -> u32) -> Task<'_> {
+        Task { outcome: task(self.cx), scope: &() }
+    }
+    #[blaze::consumes]
+    fn join(self, _cx: &Cx) -> Result<(), u32> { Ok(()) }
+}
+
+impl Task<'_> {
+    #[blaze::consumes]
+    fn join(self, _cx: &Cx) -> Result<u32, u32> { Ok(self.outcome) }
+}
+
+#[blaze::linear]
+struct Pending<'buf> { into: &'buf mut [u8; 4] }
+
+impl Pending<'_> {
+    #[blaze::consumes]
+    fn wait(self, _cx: &Cx) -> usize { 4 }
+    #[blaze::consumes]
+    fn cancel(self, _cx: &Cx) -> usize { 0 }
+}
+
+fn read_into(into: &mut [u8; 4]) -> Pending<'_> { Pending { into } }
+
+struct ReadOnly;
+
+#[blaze::linear]
+struct ReadWrite(());
+
+struct File<#[blaze::linear] P> { name: u32, rights: P }
+
+#[blaze::consumes]
+fn consume<#[blaze::linear] T>(_: T) {}
+
+impl File<ReadWrite> {
+    fn close(self, _cx: &Cx) -> Result<(), u32> {
+        let File { name: _, rights } = self;
+        consume(rights);
+        Ok(())
+    }
+}
+
+fn open_rw() -> File<ReadWrite> { File { name: 0, rights: ReadWrite(()) } }
+fn open_ro() -> File<ReadOnly> { File { name: 0, rights: ReadOnly } }
+";
+
+#[test]
+fn bstd_a_scope_left_unjoined_is_an_error() {
+    let found = check(&format!("{BSTD}\nfn f(cx: &Cx) {{\n    let scope = cx.scope();\n}}\n"));
+    expect(&found, &[(&["`scope`", "Scope", "at the end of its scope"], "}")]);
+}
+
+#[test]
+fn bstd_a_task_left_unjoined_is_an_error() {
+    let found = check(&format!(
+        "{BSTD}\nfn f(cx: &Cx) {{\n    let scope = cx.scope();\n    let task = scope.spawn(|_| 1);\n    let _ = scope.join(cx);\n}}\n"
+    ));
+    expect(&found, &[(&["`task`", "Task", "at the end of its scope"], "}")]);
+}
+
+#[test]
+fn bstd_a_pending_left_unfinished_is_an_error() {
+    let found = check(&format!(
+        "{BSTD}\nfn f(buf: &mut [u8; 4]) {{\n    let pending = read_into(buf);\n}}\n"
+    ));
+    expect(&found, &[(&["`pending`", "Pending", "at the end of its scope"], "}")]);
+}
+
+#[test]
+fn bstd_a_writable_file_left_unclosed_is_an_error() {
+    let found = check(&format!("{BSTD}\nfn f() {{\n    let file = open_rw();\n}}\n"));
+    // The file is linear by its `rights` field: the error names the file or that field.
+    assert!(!found.is_empty(), "no error");
+    assert!(
+        found.iter().all(|(message, at)| message.contains("file") && message.contains("ReadWrite") && at == "}"),
+        "{found:#?}"
+    );
+}
+
+#[test]
+fn bstd_a_question_mark_while_a_scope_is_live_abandons_it() {
+    // A `Scope` has an abandonment path (its `Live`), so the `?` drops it as a panic would.
+    let found = check(&format!(
+        "{BSTD}\nfn f(cx: &Cx, r: Result<u32, ()>) -> Result<u32, ()> {{\n    let scope = cx.scope();\n    let v = r?;\n    let _ = scope.join(cx);\n    Ok(v)\n}}\n"
+    ));
+    expect(&found, &[]);
+}
+
+#[test]
+fn bstd_a_scope_live_past_a_question_mark_and_left_unjoined_is_an_error() {
+    // The abandonment path covers the `?` only: falling off the end still needs `join`.
+    let found = check(&format!(
+        "{BSTD}\nfn f(cx: &Cx, r: Result<u32, ()>) -> Result<u32, ()> {{\n    let scope = cx.scope();\n    let v = r?;\n    Ok(v)\n}}\n"
+    ));
+    expect(&found, &[(&["`scope`", "Scope", "at the end of its scope"], "}")]);
+}
+
+#[test]
+fn bstd_a_question_mark_while_a_task_is_live_is_an_error() {
+    // A `Task` has no abandonment path: it is joined before the `?`.
+    let found = check(&format!(
+        "{BSTD}\nfn f(cx: &Cx, r: Result<u32, ()>) -> Result<u32, ()> {{\n    let scope = cx.scope();\n    let task = scope.spawn(|_| 1);\n    let v = r?;\n    let _ = task.join(cx);\n    let _ = scope.join(cx);\n    Ok(v)\n}}\n"
+    ));
+    expect(&found, &[(&["`task`", "`?` returns early", "abandonment `Drop`"], "r?")]);
+}
+
+#[test]
+fn bstd_finished_values_and_a_read_only_file_get_no_error() {
+    let found = check(&format!(
+        "{BSTD}
+fn f(cx: &Cx, buf: &mut [u8; 4]) -> Result<u32, u32> {{
+    let scope = cx.scope();
+    let task = scope.spawn(|_| 1);
+    let got = task.join(cx);
+    let _waited = read_into(buf).wait(cx);
+    let _cancelled = read_into(buf).cancel(cx);
+    let file = open_rw();
+    let closed = file.close(cx);
+    let _read_only = open_ro();
+    let joined = scope.join(cx);
+    match (got, closed, joined) {{
+        (Ok(v), Ok(()), Ok(())) => Ok(v),
+        _ => Err(0),
+    }}
+}}
+"
+    ));
+    expect(&found, &[]);
 }

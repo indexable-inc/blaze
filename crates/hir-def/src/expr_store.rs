@@ -1975,7 +1975,7 @@ impl ExpressionStore {
                 visitor.on_pat(pat)
             }
             TypeRef::UnsafeBinder { lifetimes: _, ty } => visitor.on_type(ty),
-            TypeRef::Tuple(types) => visitor.on_types(types),
+            TypeRef::Tuple(types) | TypeRef::Union(types) => visitor.on_types(types),
             TypeRef::Path(path) => visitor.on_path(path),
             TypeRef::RawPtr(inner, _) | TypeRef::Slice(inner) => visitor.on_type(inner),
             TypeRef::Reference(RefType { ty, lifetime, mutability: _ }) => {

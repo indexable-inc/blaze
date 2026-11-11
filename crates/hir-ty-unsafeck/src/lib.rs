@@ -795,7 +795,8 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
             Adjust::NeverToAny
             | Adjust::Deref(None)
             | Adjust::Borrow(AutoBorrow::RawPtr(_))
-            | Adjust::Pointer(_) => return,
+            | Adjust::Pointer(_)
+            | Adjust::ErrorUnion => return,
         };
         if self.is_layout_constrained_place(current) {
             let ty = self.infer.expr_ty(current);

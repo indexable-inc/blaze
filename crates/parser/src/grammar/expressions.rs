@@ -12,7 +12,7 @@ pub(super) enum Semicolon {
     Forbidden,
 }
 
-const EXPR_FIRST: TokenSet = LHS_FIRST;
+pub(super) const EXPR_FIRST: TokenSet = LHS_FIRST;
 
 pub(super) fn expr(p: &mut Parser<'_>) -> Option<CompletedMarker> {
     let r = Restrictions { forbid_structs: false, prefer_stmt: false, macro_ends_stmt: true };
@@ -404,8 +404,9 @@ fn lhs(p: &mut Parser<'_>, r: Restrictions) -> Option<(CompletedMarker, BlockLik
                     // &raw foo;
                     p.bump_remap(T![raw]);
                 }
-            } else {
-                p.eat(T![mut]);
+            } else if !p.eat(T![mut]) && uniq::at_expr(p) {
+                // `&uniq expr` (`#![blaze::uniq]`): the `mut` of `&mut expr`, spelled `uniq`.
+                p.bump_remap(T![mut]);
             }
             REF_EXPR
         }
@@ -705,8 +706,8 @@ fn cast_expr(p: &mut Parser<'_>, lhs: CompletedMarker) -> CompletedMarker {
     let m = lhs.precede(p);
     p.bump(T![as]);
     // Use type_no_bounds(), because cast expressions are not
-    // allowed to have bounds.
-    types::type_no_bounds(p);
+    // allowed to have bounds. blaze: nor an error union, as `x as u8 | y` is an or.
+    p.with_unions(false, types::type_no_bounds);
     m.complete(p, CAST_EXPR)
 }
 

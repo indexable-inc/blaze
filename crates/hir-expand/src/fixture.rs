@@ -403,6 +403,7 @@ fn build(fixture: &str, mut extra: Vec<(String, ProcMacro)>) -> Fixture {
         target,
         toolchain,
         const_eval: ConstEvalBudget { steps: 10_000_000, ..ConstEvalBudget::default() },
+        trusted: Box::default(),
     });
     let base = AbsPathBuf::try_from(BASE).expect("`/` is an absolute path");
     let proc_macro_cwd = Arc::new(base.clone());

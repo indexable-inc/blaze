@@ -35,11 +35,41 @@ pub(super) const TYPE_RECOVERY_SET: TokenSet = TokenSet::new(&[
 ]);
 
 pub(crate) fn type_(p: &mut Parser<'_>) {
-    type_with_bounds_cond(p, true);
+    type_or_union(p, true);
 }
 
 pub(super) fn type_no_bounds(p: &mut Parser<'_>) {
-    type_with_bounds_cond(p, false);
+    type_or_union(p, false);
+}
+
+/// A type, or under `#![blaze::error_unions]` an error union `A | B | C` of types: the union
+/// binds loosest, so `&A | B` is a union of `&A` and `B`, and a member is never a union itself
+/// (write one in parentheses). Without the extension, or where Rust lets a `|` follow a type
+/// (a closure's parameters, after `as`: [`Parser::with_unions`]), this is the type alone and
+/// the parse is Rust's.
+fn type_or_union(p: &mut Parser<'_>, allow_bounds: bool) {
+    if !p.unions() {
+        type_with_bounds_cond(p, allow_bounds);
+        return;
+    }
+    let m = p.start();
+    p.with_unions(false, |p| type_with_bounds_cond(p, allow_bounds));
+    if !at_union_bar(p) {
+        m.abandon(p);
+        return;
+    }
+    // blaze, under `#![blaze::error_unions]`: `type E = io::Error | ParseIntError;`
+    while at_union_bar(p) {
+        p.bump(T![|]);
+        p.with_unions(false, |p| type_with_bounds_cond(p, allow_bounds));
+    }
+    m.complete(p, UNION_TYPE);
+}
+
+/// Whether the parser is at the `|` between two members of an error union: a lone `|`, not
+/// the first of `||` or `|=`.
+fn at_union_bar(p: &Parser<'_>) -> bool {
+    p.at(T![|]) && !p.at(T![||]) && !p.at(T![|=])
 }
 
 fn type_with_bounds_cond(p: &mut Parser<'_>, allow_bounds: bool) {
@@ -112,16 +142,18 @@ fn paren_or_tuple_type(p: &mut Parser<'_>) {
     p.bump(T!['(']);
     let mut n_types: u32 = 0;
     let mut trailing_comma: bool = false;
-    while !p.at(EOF) && !p.at(T![')']) {
-        n_types += 1;
-        type_(p);
-        if p.eat(T![,]) {
-            trailing_comma = true;
-        } else {
-            trailing_comma = false;
-            break;
+    p.with_unions(true, |p| {
+        while !p.at(EOF) && !p.at(T![')']) {
+            n_types += 1;
+            type_(p);
+            if p.eat(T![,]) {
+                trailing_comma = true;
+            } else {
+                trailing_comma = false;
+                break;
+            }
         }
-    }
+    });
     p.expect(T![')']);
 
     let kind = if n_types == 1 && !trailing_comma {
@@ -177,7 +209,7 @@ fn array_or_slice_type(p: &mut Parser<'_>) {
     let m = p.start();
     p.bump(T!['[']);
 
-    type_(p);
+    p.with_unions(true, type_);
     let kind = match p.current() {
         // test slice_type
         // type T = [()];
@@ -217,7 +249,10 @@ fn ref_type(p: &mut Parser<'_>) {
     if p.at(LIFETIME_IDENT) {
         lifetime(p);
     }
-    p.eat(T![mut]);
+    if !p.eat(T![mut]) && uniq::at_type(p) {
+        // `&uniq T`, `&'a uniq T` (`#![blaze::uniq]`): the `mut` of `&mut T`, spelled `uniq`.
+        p.bump_remap(T![mut]);
+    }
     type_no_bounds(p);
     m.complete(p, REF_TYPE);
 }
@@ -385,6 +420,18 @@ fn path_or_macro_type(p: &mut Parser<'_>, allow_bounds: bool) {
     };
 
     let path = r.complete(p, kind);
+
+    // test bare_pattern_type
+    // type A = E is E::A(..) | E::B;
+    if kind == PATH_TYPE && p.bare_pattern_types() && p.at_contextual_kw(T![is]) {
+        // `#![blaze::pattern_types]`'s `T is PAT`: the feature gate refuses it in a crate
+        // without the gate, and before the gate `T is` was never a valid type.
+        let m = path.precede(p);
+        p.bump_remap(T![is]);
+        pat_top(p);
+        m.complete(p, PATTERN_TYPE);
+        return;
+    }
 
     if allow_bounds {
         opt_type_bounds_as_dyn_trait_type(p, path);

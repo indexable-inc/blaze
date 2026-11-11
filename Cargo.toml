@@ -365,6 +365,8 @@ blaze-lint-defs = { path = "crates/blaze-lint-defs", version = "0.0.0" }
 blaze-radix = { path = "crates/blaze-radix" }
 blaze-rng = { path = "crates/blaze-rng" }
 blaze-sha256 = { path = "crates/blaze-sha256" }
+# bstd, blaze's own standard library (docs/v2/plan/design/std.md).
+blaze-std = { path = "crates/blaze-std" }
 blaze-items = { path = "crates/blaze-items" }
 blaze-item-hash = { path = "crates/blaze-item-hash" }
 blaze-link = { path = "crates/blaze-link", default-features = false }
@@ -593,6 +595,16 @@ drop_bomb = "0.1.5"
 dunce = "1.0.5"
 filetime = "0.2.29"
 flate2 = { version = "1.1.10", default-features = false }
+# bstd::image's inflate (crates/blaze-std): the no-alloc core only (`inflate::core` into a buffer
+# the caller sized), the one flate2's rust backend already brings into the lock.
+miniz_oxide = { version = "0.9.1", default-features = false }
+# bstd::video's VideoToolbox provider (crates/blaze-std, macOS only): the hardware HEVC session,
+# CoreVideo's pool buffers and CoreMedia's sample buffers. Default features off: their defaults
+# pull in frameworks the encoder never uses (the harness's harness-video takes the same sets).
+objc2-core-foundation = "0.3.2"
+objc2-core-media = { version = "0.3.2", default-features = false, features = ["std", "objc2", "CMBase", "CMTime", "CMBlockBuffer", "CMFormatDescription", "CMSampleBuffer", "objc2-core-audio-types"] }
+objc2-core-video = { version = "0.3.2", default-features = false, features = ["std", "objc2", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVPixelBufferPool", "CVReturn"] }
+objc2-video-toolbox = { version = "0.3.2", default-features = false, features = ["std", "objc2", "VTBase", "VTErrors", "VTSession", "VTCompressionSession", "VTCompressionProperties", "objc2-core-media", "objc2-core-video"] }
 # blaze-hash's hasher (`crates/blaze-hash`), not a crate's own pick.
 foldhash = "0.2.0"
 fst = { version = "0.4.7", default-features = false }

@@ -1,0 +1,50 @@
+[package]
+name = "blaze-std"
+description = "bstd, blaze's own capability-based standard library (docs/v2/plan/design/std.md): one Io over blaze-core's drivers and its simulation, capabilities made only from it or by narrowing, a task context (Cx) with a deadline, cancellation, a span and a frame, and memory from named allocators; and the facade over blaze's piece crates (mem, bytes, map, id, sync, cell, sort, digest, record, report, quic, http, test)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+name = "bstd"
+doctest = false
+
+[dependencies]
+blaze-core.workspace = true
+blaze-mem.workspace = true
+blaze-rng.workspace = true
+# The facade (lib.rs, "Batteries"): each re-exported under bstd's names, none depending on bstd.
+blaze-alloc-count.workspace = true
+blaze-bytes.workspace = true
+blaze-check.workspace = true
+blaze-format.workspace = true
+blaze-hash.workspace = true
+# The sans-IO cores only: its `tokio` feature (the drivers) stays off.
+blaze-http.workspace = true
+blaze-ids.workspace = true
+blaze-phf.workspace = true
+blaze-radix.workspace = true
+blaze-reclaim.workspace = true
+blaze-report.workspace = true
+blaze-sha256.workspace = true
+blaze-spin.workspace = true
+# bstd::image's inflate: miniz_oxide's no-alloc core, into the buffer decode sized and limited.
+miniz_oxide.workspace = true
+
+# bstd::video's VideoToolbox provider (src/video/videotoolbox.rs).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation.workspace = true
+objc2-core-media.workspace = true
+objc2-core-video.workspace = true
+objc2-video-toolbox.workspace = true
+
+[dev-dependencies]
+hegeltest.workspace = true
+
+[lints]
+workspace = true

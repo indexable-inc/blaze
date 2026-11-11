@@ -30,6 +30,7 @@ pub(crate) mod diagnostics;
 mod expr;
 mod fallback;
 mod mutability;
+mod narrow;
 mod op;
 mod opaques;
 mod pat;
@@ -851,6 +852,15 @@ pub enum InferenceDiagnostic {
         expr: ExprId,
         self_ty: StoredTy,
     },
+    /// blaze: a whole-value write, `place = ..`, to a place of a refinement `ty`
+    /// (`#![blaze::pattern_types]`) reached through a unique reference: through
+    /// `&mut (T is PAT)` fields may be written, the whole value may not (rule
+    /// pattern-types-unique-ref, docs/v2/plan/design/edition.md, section 8).
+    WholeValueWriteThroughRefinement {
+        #[type_visitable(ignore)]
+        place: ExprId,
+        ty: StoredTy,
+    },
 }
 
 /// What a struct literal's or pattern's path names instead (`InferenceDiagnostic::NotAStructPath`).
@@ -1141,6 +1151,10 @@ pub enum Adjust {
     /// Take the address and produce either a `&` or `*` pointer.
     Borrow(AutoBorrow),
     Pointer(PointerCast),
+    /// blaze (`#![blaze::error_unions]`): a value of a member of the error union that is the
+    /// target, or of a union of some of its members, put in the union by a call of
+    /// `core::error_union::widen` (lang item `error_union_widen`). A value, never a place.
+    ErrorUnion,
 }
 
 /// An overloaded autoderef step, representing a `Deref(Mut)::deref(_mut)`
@@ -2534,6 +2548,13 @@ pub(crate) struct InferenceContext<'db, 'f> {
     defined_anon_consts: RefCell<Vec<AnonConstId<'db>, &'f Frame>>,
     /// The unsizing coercions that failed in this body; see `coerce::fast`.
     unsize_memo: coerce::UnsizeMemo<'db>,
+    /// blaze: whether the crate says `#![blaze::pattern_types]` (`DefMap::pattern_types`), so
+    /// a match, `if let` or `let else` narrows a plain local (`infer::narrow`).
+    pattern_types: bool,
+    /// blaze: the locals narrowed where inference is now, innermost last: in a match arm, the
+    /// success branch of an `if let`, after a `let else` (`#![blaze::pattern_types]`). A use of
+    /// the local has the narrowed type (`infer::narrow`).
+    narrowed: Vec<(BindingId, Ty<'db>), &'f Frame>,
 }
 
 #[derive(Clone, Debug)]
@@ -2633,6 +2654,8 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             target_features: (target_features, target_feature_is_safe),
             lang_items: table.interner().lang_items(),
             features: resolver.top_level_def_map().features(),
+            pattern_types: resolver.top_level_def_map().pattern_types(),
+            narrowed: Vec::new_in(frame),
             edition: resolver.krate().data(db).edition,
             table,
             tuple_field_accesses_rev: TupleFieldTypes::new_in(frame),

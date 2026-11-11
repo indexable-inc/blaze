@@ -446,6 +446,13 @@ where
         goal: Goal<I, Self>,
         item: SolverTraitLangItem,
     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased>;
+
+    /// blaze: `U: UnionFrom<S>` of `#![blaze::error_unions]` and its `Path`, answered from
+    /// the types alone ([`EvalCtxt::error_union_from`]).
+    fn consider_builtin_error_union_from_candidate(
+        ecx: &mut EvalCtxt<'_, D>,
+        goal: Goal<I, Self>,
+    ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased>;
 }
 
 /// Allows callers of `assemble_and_evaluate_candidates` to choose whether to limit
@@ -753,6 +760,9 @@ where
                     | SolverTraitLangItem::ReflectVariant
                     | SolverTraitLangItem::ReflectFnItem),
                 ) => G::consider_builtin_reflect_candidate(self, goal, item),
+                Some(SolverTraitLangItem::ErrorUnionFrom) => {
+                    G::consider_builtin_error_union_from_candidate(self, goal)
+                }
                 _ => Err(NoSolution.into()),
             }
         };

@@ -1139,9 +1139,9 @@ impl<'a, 'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'a, 'db, 'f, D> {
         for adjustment in &adjustments {
             debug!("walk_adjustment expr={:?} adj={:?}", expr, adjustment);
             match adjustment.kind {
-                Adjust::NeverToAny | Adjust::Pointer(_) => {
-                    // Creating a closure/fn-pointer or unsizing consumes
-                    // the input and stores it into the resulting rvalue.
+                Adjust::NeverToAny | Adjust::Pointer(_) | Adjust::ErrorUnion => {
+                    // Creating a closure/fn-pointer, unsizing or widening to an error union
+                    // consumes the input and stores it into the resulting rvalue.
                     // clone: frame copy, the place goes on to the next adjustment
                     self.consume_or_copy(place_with_id.clone());
                 }
@@ -1650,7 +1650,7 @@ impl<'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'_, 'db, 'f, D> {
                 self.cat_deref(expr.into(), base)
             }
 
-            Adjust::NeverToAny | Adjust::Pointer(_) | Adjust::Borrow(_) => {
+            Adjust::NeverToAny | Adjust::Pointer(_) | Adjust::Borrow(_) | Adjust::ErrorUnion => {
                 // Result is an rvalue.
                 Ok(self.cat_rvalue(expr.into(), target))
             }

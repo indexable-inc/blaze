@@ -355,6 +355,13 @@ pub enum SyntaxKind {
     RECOMMENDS_KW,
     REQUIRES_KW,
     SPEC_CLAUSE,
+    // `#![blaze::uniq]`'s `uniq` (docs/v2/plan/design/edition.md, change 10), after the others
+    // too. Only ever a contextual kind: where the grammar takes it as the keyword it goes in
+    // the tree as a `MUT_KW` token, so no tree holds this kind.
+    UNIQ_KW,
+    // blaze's error unions (`#![blaze::error_unions]`, docs/v2/plan/design/edition.md), after
+    // the others too.
+    UNION_TYPE,
     #[doc(hidden)]
     __LAST,
 }
@@ -474,6 +481,7 @@ impl SyntaxKind {
             | UNSAFE_BINDER_CAST_EXPR
             | UNSAFE_BINDER_TYPE
             | SPEC_CLAUSE
+            | UNION_TYPE
             | OR_PAT
             | PARAM
             | PARAM_LIST
@@ -703,6 +711,7 @@ impl SyntaxKind {
             INVARIANT_KW => "invariant",
             RECOMMENDS_KW => "recommends",
             REQUIRES_KW => "requires",
+            UNIQ_KW => "uniq",
             YEET_KW => "yeet",
             ASYNC_KW => "async",
             AWAIT_KW => "await",
@@ -821,6 +830,7 @@ impl SyntaxKind {
             INVARIANT_KW => true,
             RECOMMENDS_KW => true,
             REQUIRES_KW => true,
+            UNIQ_KW => true,
             YEET_KW => true,
             _ => false,
         }
@@ -927,6 +937,7 @@ impl SyntaxKind {
             INVARIANT_KW => true,
             RECOMMENDS_KW => true,
             REQUIRES_KW => true,
+            UNIQ_KW => true,
             YEET_KW => true,
             _ => false,
         }
@@ -1194,6 +1205,7 @@ macro_rules ! T_ {
     [invariant] => { $ crate :: SyntaxKind :: INVARIANT_KW };
     [recommends] => { $ crate :: SyntaxKind :: RECOMMENDS_KW };
     [requires] => { $ crate :: SyntaxKind :: REQUIRES_KW };
+    [uniq] => { $ crate :: SyntaxKind :: UNIQ_KW };
     [yeet] => { $ crate :: SyntaxKind :: YEET_KW };
     [async] => { $ crate :: SyntaxKind :: ASYNC_KW };
     [await] => { $ crate :: SyntaxKind :: AWAIT_KW };

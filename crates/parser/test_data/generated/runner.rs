@@ -69,6 +69,10 @@ mod ok {
         );
     }
     #[test]
+    fn bare_pattern_type() {
+        run_and_expect_no_errors("test_data/parser/inline/ok/bare_pattern_type.rs");
+    }
+    #[test]
     fn become_expr() { run_and_expect_no_errors("test_data/parser/inline/ok/become_expr.rs"); }
     #[test]
     fn bind_pat() { run_and_expect_no_errors("test_data/parser/inline/ok/bind_pat.rs"); }

@@ -367,6 +367,12 @@ impl Crate {
         self.id.data(db).edition
     }
 
+    /// The syntax gates the crate turns on (`#![blaze::uniq]`): its files parse and print
+    /// under them ([`base_db::Crate::syntax_gates`]).
+    pub fn syntax_gates(self, db: &Db) -> span::SyntaxGates {
+        self.id.syntax_gates(db)
+    }
+
     pub fn version(self, db: &Db) -> Option<String> {
         // clone: editor edge, an owned string for display
         self.id.extra_data(db).version.clone()
@@ -6633,6 +6639,8 @@ pub enum Adjust {
     /// Take the address and produce either a `&` or `*` pointer.
     Borrow(AutoBorrow),
     Pointer(PointerCast),
+    /// blaze: a member, or a union of some members, put in the error union that is the target.
+    ErrorUnion,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -6661,6 +6669,7 @@ impl From<hir_ty::Adjust> for Adjust {
                 Adjust::Borrow(AutoBorrow::Ref(hir_ty::hir_mutability(m.into())))
             }
             hir_ty::Adjust::Pointer(pc) => Adjust::Pointer(pc),
+            hir_ty::Adjust::ErrorUnion => Adjust::ErrorUnion,
         }
     }
 }

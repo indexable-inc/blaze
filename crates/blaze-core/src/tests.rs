@@ -1459,3 +1459,184 @@ fn a_file_name_cloned_into_effects_allocates_nothing() {
     assert_eq!(copy, file);
     assert_eq!(copy.as_str().as_ptr(), file.as_str().as_ptr(), "one name, shared");
 }
+
+/// The host's effects on `driver`, what became of each by its tag: two UDP sockets on
+/// loopback, one sending the other a datagram, both unbound; the wall clock (the system's
+/// where `real`, else a simulation's start after 2020); random bytes, and a draw too long;
+/// a directory made twice and removed twice, and one whose parent is not there; an empty write
+/// of the standard error and a read of none of the standard input, which end at once.
+fn host(driver: &mut impl Driver, real: bool) -> BTreeMap<u64, String> {
+    let loopback: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let made = || name("made");
+    let mut effects = vec![
+        Effect::Bind { at: loopback, tag: Tag(1) },
+        Effect::Bind { at: loopback, tag: Tag(2) },
+        Effect::Now { tag: Tag(7) },
+        Effect::Random { len: 32, tag: Tag(8) },
+        Effect::Random { len: crate::RANDOM_MOST + 1, tag: Tag(9) },
+        Effect::MakeDir { dir: made(), tag: Tag(10) },
+        Effect::WriteOut { stream: crate::Stream::Stderr, bytes: Vec::new(), tag: Tag(15) },
+        Effect::ReadStdin { most: 0, into: Vec::new(), tag: Tag(16) },
+    ];
+    let mut bound: [Option<(crate::Dgram, std::net::SocketAddr)>; 2] = [None, None];
+    let mut seen = BTreeMap::new();
+    let mut out = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        driver.submit(&mut effects);
+        if driver.in_flight() == 0 || Instant::now() >= deadline {
+            break;
+        }
+        driver.poll(&mut out, Deadline::after(driver.now(), Duration::from_millis(100)));
+        for Completion { tag, done } in out.drain(..) {
+            let shown = match done {
+                Done::Bound { sock, local } => {
+                    bound[tag.0 as usize - 1] = Some((sock, local));
+                    "bound".to_owned()
+                }
+                Done::Datagram { from, bytes } => format!(
+                    "{} from the first: {}",
+                    String::from_utf8_lossy(&bytes),
+                    bound[0].is_some_and(|(_, at)| at == from)
+                ),
+                Done::Wall(wall) => {
+                    let near = match real {
+                        true => {
+                            let system = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap();
+                            wall.abs_diff(system) < Duration::from_secs(60)
+                        }
+                        false => wall > Duration::from_secs(1_600_000_000),
+                    };
+                    format!("now: {near}")
+                }
+                Done::Random(bytes) => format!("random {}", bytes.len()),
+                Done::Sent(bytes) => format!("sent, {} left", bytes.len()),
+                Done::Read(bytes) => format!("read {}", bytes.len()),
+                Done::Unbound => "unbound".to_owned(),
+                Done::MadeDir => "made".to_owned(),
+                Done::RemovedDir => "removed".to_owned(),
+                Done::Failed(_) => "failed".to_owned(),
+                Done::Broken { .. } => "broken".to_owned(),
+                other => format!("{other:?}"),
+            };
+            seen.insert(tag.0, shown);
+            match tag.0 {
+                1 | 2 => {
+                    if let [Some((from, _)), Some((to, at))] = bound {
+                        effects.push(Effect::RecvFrom { sock: to, into: Vec::new(), tag: Tag(4) });
+                        effects.push(Effect::SendTo {
+                            sock: from,
+                            to: at,
+                            bytes: b"ping".to_vec(),
+                            tag: Tag(3),
+                        });
+                    }
+                }
+                4 => {
+                    for (at, tag) in [(0, Tag(5)), (1, Tag(6))] {
+                        if let Some((sock, _)) = bound[at] {
+                            effects.push(Effect::Unbind { sock, tag });
+                        }
+                    }
+                }
+                10 => effects.push(Effect::MakeDir { dir: made(), tag: Tag(11) }),
+                11 => effects.push(Effect::RemoveDir { dir: made(), tag: Tag(12) }),
+                12 => effects.push(Effect::RemoveDir { dir: made(), tag: Tag(13) }),
+                13 => effects.push(Effect::MakeDir { dir: name("missing/made"), tag: Tag(14) }),
+                _ => {}
+            }
+        }
+    }
+    seen
+}
+
+/// What [`host`] ends with: with the sockets and the streams, or with each refused (the IOCP
+/// driver's and WASI's).
+fn host_wanted(sockets_and_streams: bool) -> BTreeMap<u64, String> {
+    let mut want: BTreeMap<u64, String> = [
+        (7, "now: true"),
+        (8, "random 32"),
+        (9, "failed"),
+        (10, "made"),
+        (11, "failed"),
+        (12, "removed"),
+        (13, "failed"),
+        (14, "failed"),
+    ]
+    .into_iter()
+    .map(|(tag, it)| (tag, it.to_owned()))
+    .collect();
+    let rest: &[(u64, &str)] = match sockets_and_streams {
+        true => &[
+            (1, "bound"),
+            (2, "bound"),
+            (3, "sent, 0 left"),
+            (4, "ping from the first: true"),
+            (5, "unbound"),
+            (6, "unbound"),
+            (15, "sent, 0 left"),
+            (16, "read 0"),
+        ],
+        false => &[(1, "failed"), (2, "failed"), (15, "broken"), (16, "broken")],
+    };
+    for &(tag, it) in rest {
+        want.insert(tag, it.to_owned());
+    }
+    want
+}
+
+#[test]
+fn every_driver_runs_the_host_s_effects_or_refuses_them_naming_why() {
+    assert_eq!(host(&mut Sim::new(5, Faults::default()), false), host_wanted(true), "sim");
+    assert_eq!(
+        host(&mut Threads::new(&dir("host-threads"), 2), true),
+        host_wanted(cfg!(unix)),
+        "threads"
+    );
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        host(&mut crate::kqueue::Kqueue::new(dir("host-kqueue"), 2).unwrap(), true),
+        host_wanted(true),
+        "kqueue"
+    );
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        host(&mut crate::uring::Uring::new(dir("host-uring")).unwrap(), true),
+        host_wanted(true),
+        "io_uring"
+    );
+    #[cfg(windows)]
+    assert_eq!(
+        host(&mut crate::iocp::Iocp::new(&dir("host-iocp"), 2).unwrap(), true),
+        host_wanted(false),
+        "iocp"
+    );
+}
+
+/// A bind at an address another socket has fails naming the address; where the native driver
+/// has no sockets (IOCP), the bind is refused naming the effect.
+#[cfg(any(unix, windows))]
+#[test]
+fn a_host_effect_that_fails_names_what_it_is_about() {
+    let mut driver = crate::native(&dir("host-errors"), 1).unwrap();
+    let loopback: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let mut answers = Vec::new();
+    let mut effects = vec![Effect::Bind { at: loopback, tag: Tag(1) }];
+    run_until_idle(&mut driver, &mut effects, |it, _| answers.push(it.done)).unwrap();
+    let local = match answers.pop() {
+        Some(Done::Bound { local, .. }) => local,
+        Some(Done::Failed(error)) if cfg!(windows) => {
+            assert!(error.0.contains("Effect::Bind is refused"), "{error:?}");
+            return;
+        }
+        other => panic!("a bind at {loopback} ended {other:?}"),
+    };
+    let mut effects = vec![Effect::Bind { at: local, tag: Tag(2) }];
+    run_until_idle(&mut driver, &mut effects, |it, _| answers.push(it.done)).unwrap();
+    match answers.pop() {
+        Some(Done::Failed(error)) => assert!(error.0.contains(&local.to_string()), "{error:?}"),
+        other => panic!("a second bind at {local} ended {other:?}"),
+    }
+}

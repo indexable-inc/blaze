@@ -44,6 +44,16 @@ pub(crate) struct Parser<'t> {
     outline: bool,
     /// Which tokens are a `{` some `}` closes ([`Parser::curly_closes`]), made when first asked.
     closed_curlies: Option<Vec<bool>>,
+    /// Whether a path type followed by the contextual `is` is a bare pattern type `T is PAT`
+    /// (`#![blaze::pattern_types]`, docs/v2/plan/design/edition.md, section 8). True for a
+    /// whole file or expansion, where `T is` was never valid; false for a macro fragment
+    /// (`$t:ty`), so a `macro_rules!` matcher takes exactly the tokens it took before.
+    bare_pattern_types: bool,
+    /// Whether a type here may be an error union `A | B` (`#![blaze::error_unions]`): the
+    /// input's extension, off while a type is read where Rust lets a `|` follow one (a
+    /// closure's parameters, after `as`) and inside one union's members
+    /// ([`Parser::with_unions`]).
+    unions: bool,
 }
 
 const PARSER_STEP_LIMIT: usize = if cfg!(debug_assertions) { 150_000 } else { 15_000_000 };
@@ -59,7 +69,32 @@ impl<'t> Parser<'t> {
             steps: 0,
             outline: false,
             closed_curlies: None,
+            bare_pattern_types: true,
+            unions: inp.extensions().error_unions(),
         }
+    }
+
+    /// A parser for a macro fragment: a bare `T is PAT` is not taken as a type
+    /// ([`Parser::bare_pattern_types`]).
+    pub(super) fn new_fragment(inp: impl Into<Tokens<'t>>) -> Parser<'t> {
+        Parser { bare_pattern_types: false, ..Parser::new(inp) }
+    }
+
+    /// Whether a bare `T is PAT` is a type here (`#![blaze::pattern_types]`).
+    pub(crate) fn bare_pattern_types(&self) -> bool {
+        self.bare_pattern_types
+    /// Whether a type parsed here may be an error union `A | B`.
+    pub(crate) fn unions(&self) -> bool {
+        self.unions
+    }
+
+    /// Runs `parse` with error unions allowed (`true`, inside a delimiter: only when the
+    /// input's extensions have them) or not (`false`), then puts back what was allowed before.
+    pub(crate) fn with_unions(&mut self, allowed: bool, parse: impl FnOnce(&mut Parser<'t>)) {
+        let allowed = allowed && self.inp.extensions().error_unions();
+        let before = std::mem::replace(&mut self.unions, allowed);
+        parse(self);
+        self.unions = before;
     }
 
     pub(super) fn new_outline(inp: impl Into<Tokens<'t>>) -> Parser<'t> {
@@ -426,6 +461,12 @@ impl<'t> Parser<'t> {
 
     pub(crate) fn current_edition(&self) -> Edition {
         self.inp.edition(self.pos)
+    }
+
+    /// Whether the parse is of a crate that says `#![blaze::uniq]`
+    /// ([`crate::SyntaxGates::uniq`]): only then does `grammar/uniq.rs` take `uniq` as a keyword.
+    pub(crate) fn uniq_gate(&self) -> bool {
+        self.inp.gates().uniq()
     }
 }
 

@@ -30,6 +30,17 @@ rust-src https://static.rust-lang.org/dist/2026-10-27/rust-src-nightly.tar.xz a9
 #   `IntTryFrom<S>`, which only blaze's trait solver answers and nothing can implement. Every
 #   impl's self type or argument must be such an integer, so no other type gains an impl
 #   (docs/v2/plan/design/arbitrary-ints.md).
+# - core/src/error_union.rs (new) with its `pub mod error_union;` in core/src/lib.rs: the type
+#   of blaze's error unions `A | B` (`#![blaze::error_unions]`), `ErrorUnion<M>` over a tuple
+#   of members (`#[lang = "error_union"]`, which hir-ty lowers a union to), the trait `Members`
+#   and the enums `Of2`..`Of12` that hold one member's value; `Debug`, `Display`, `Error`,
+#   `Clone` and `Hash` by delegation to the member held; and the widening of a member or a
+#   subset union into a union: the marker `UnionFrom<S>` (`#[lang = "error_union_from"]`,
+#   `#[rustc_deny_explicit_impl]`, answered only by blaze's trait solver, its `Path` saying
+#   where each value goes), `Inject<S, P>` over those paths, `widen` (`#[lang =
+#   "error_union_widen"]`, which a coercion to a union calls) and a blanket `From<S>` for a
+#   union over them, which no type but an error union can satisfy. Unstable under
+#   `blaze_error_unions`; nothing else in library/ refers to it.
 # - core/src/blaze.rs (new) with its `pub mod blaze;` in core/src/lib.rs: blaze's own attribute
 #   macros, `contract_test` (`#[rustc_builtin_macro]`, expanded by blaze's `hir-expand`), which
 #   the attribute path `blaze::contract_test` names in every crate. Unstable under
@@ -48,3 +59,19 @@ rust-src https://static.rust-lang.org/dist/2026-10-27/rust-src-nightly.tar.xz a9
 #   (std/Cargo.toml) and names it with `extern crate wasi_rt;` under the same cfg
 #   (std/src/lib.rs); Cargo.lock has its package and std's dependency on it. Every other
 #   target's std is unchanged.
+# - core/src/clone.rs: `#[lang = "blaze_handle"]` on nightly's `Share`, by which blaze's
+#   `#![blaze::handles]` finds the handles it copies where a crate would move one that it uses
+#   again (docs/v2/plan/design/edition.md, change 1). A lang item changes nothing a crate
+#   without the attribute builds.
+# - core/src/option.rs and core/src/result.rs: `#[blaze::linear]` on the type parameters of
+#   the impls of `Option` and `Result` that admit a linear payload (blaze's linear types,
+#   docs/v2/plan/design/linear.md, rule 4). The inherent `impl<T> Option<T>` and
+#   `impl<T, E> Result<T, E>` are each written as several impls, no method moved or changed,
+#   so that the methods that hand the payload on or panic sit in marked ones (each under a
+#   `// blaze:` line): `Option`'s `is_some`, `is_none`, `as_ref`, `as_mut`, `expect`, `unwrap`,
+#   `map`, `ok_or`, `ok_or_else`, `and_then` (`T`); `Result`'s `is_ok`, `is_err`, `as_ref`,
+#   `as_mut`, `map`, `map_err`, `and_then`, `or_else`, `unwrap_or_else` (`T` and `E`) and `ok`,
+#   `expect`, `unwrap` (`T`). The impls of `Try` and `FromResidual` for both mark `T`, which
+#   is what `?` goes through. Every other method stays in an impl with no mark, and a method
+#   moves into a marked one only if its body, checked with the parameter linear, drops no
+#   value of it. The attribute is inert: nothing that names no linear type changes.

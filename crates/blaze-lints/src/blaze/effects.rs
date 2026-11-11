@@ -12,6 +12,12 @@
 //! to the profile the crate is built with: an optional overflow check counts when the crate has
 //! `overflow-checks` (`crate_checks_overflow`), never by a guessed default.
 //!
+//! `capabilities` (docs/v2/plan/design/std.md): every function of a crate whose root says
+//! `#![blaze::capabilities]` that may, through any call, reach ambient IO (`ambient`), run
+//! `unsafe` code (`unsafe`) or call the global allocator (`global_alloc`) past the crates its
+//! workspace trusts (`[workspace.metadata.blaze.trusted]`): the same walk, the first refused
+//! effect in that order, with its chain.
+//!
 //! The attributes change diagnostics only: no codegen key reads their bits, so a function with
 //! or without one builds byte for byte the same.
 
@@ -21,7 +27,9 @@ use hir_def::{
 use hir_ty::db::HirDatabase as _;
 use hir_ty_mir::mir::overflow::crate_checks_overflow;
 use hir_ty_pure::{
-    effect_attrs::{NOALLOC, NONBLOCKING, nopanic_for},
+    effect_attrs::{
+        AMBIENT, GLOBAL_ALLOC, NOALLOC, NONBLOCKING, UNSAFE, capabilities_asked, nopanic_for,
+    },
     effects::EffectDef,
 };
 
@@ -29,7 +37,8 @@ use super::{Finding, Lint, facts};
 use crate::{check::Cx, diag};
 
 pub(super) fn check(cx: &mut Cx<'_, '_>) {
-    for lint in [Lint::Nopanic, Lint::Noalloc, Lint::Nonblocking, Lint::Pure] {
+    let lints = [Lint::Nopanic, Lint::Noalloc, Lint::Nonblocking, Lint::Pure, Lint::Capabilities];
+    for lint in lints {
         if !cx.on_blaze(lint) {
             continue;
         }
@@ -72,7 +81,11 @@ fn step_notes(
 }
 
 /// What `#[blaze::<effect>]` on `func`, or on the trait whose method it is or implements, says.
-fn marked(db: &base_db::Db, func: FunctionId, effect: &EffectDef) -> Option<PureAttr> {
+pub(super) fn marked(
+    db: &base_db::Db,
+    func: FunctionId,
+    effect: &EffectDef,
+) -> Option<PureAttr> {
     if let Some(it) = (effect.attr)(db, AttrDefId::FunctionId(func)) {
         return Some(it);
     }
@@ -102,6 +115,16 @@ fn find(cx: &Cx<'_, '_>, lint: Lint) -> Option<(Finding, Vec<StepNote>)> {
     let finding = |message: String| Finding { lint, range: whole, message, note: None };
     let name = func_name(db, func);
     let krate = HasModule::krate(&func, db);
+    if lint == Lint::Capabilities {
+        // Asked by the crate, of each of its functions: the first effect refused, in this order.
+        if !capabilities_asked(db, krate) {
+            return None;
+        }
+        return [&AMBIENT, &UNSAFE, &GLOBAL_ALLOC].into_iter().find_map(|effect| {
+            let refusal = hir_ty_pure::check_generic(db, func, effect).err()?;
+            Some((finding(refusal.said()), step_notes(db, krate, &refusal)))
+        });
+    }
     let (effect, profile): (&EffectDef, &str) = match lint {
         Lint::Nopanic => {
             // Asked only of a function marked `nopanic`, so a crate's profile is read only there.
