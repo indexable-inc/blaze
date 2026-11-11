@@ -631,17 +631,15 @@ programs; it is the specification of the Rust pass of the same name.
     index can panic); the Rust `simplify_branch` rewrites those too. The file has what
     every such pass uses: `run_refines` (steps that refine give runs that refine) and
     `Outcome.Calm` (a value or undefined, never a panic), proved of reads and plain places.
-  - **Where these cover less than the Rust `SimplifyCfg`** (`optimize/cfg.rs`): it threads a
-    call's return target too (the specification leaves call targets, so that no state is
-    renamed); it merges a block that ends in a call too, and rewrites a `switchInt` whose
+  - **Where these cover less than the Rust `SimplifyCfg`** (`optimize/cfg.rs`): it merges a block that ends in a call too, and rewrites a `switchInt` whose
     discriminant is a `move` or has an index; and
     `remove_dead_blocks` merges every empty `unreachable` block into one. None of those is
     specified, so `BlazeValidated` has no `after = spec before` pair for a CFG pass, and
     `validate`'s normal form does not include them: `validate_sound` is equality of runs
     with the same fuel from the same state, which a renumbering (the state is renamed) and
     threading (the fuel differs) do not have. The witness validator is where they join.
-  - **Merging a block into its predecessor** (`Opt/Merge.lean`, `mergeGotos pick`; not yet
-    elaborated). A block that ends in `goto t` gets `t`'s statements and terminator. It is
+  - **Merging a block into its predecessor** (`Opt/Merge.lean`, `mergeGotos pick`; checked
+    at 2ebcfbbab5). A block that ends in `goto t` gets `t`'s statements and terminator. It is
     right whatever jumps to `t`, so it is proved for every choice of targets; `mergeSuccessors`
     chooses as the Rust `merge_successor` does (one predecessor). A stuttering simulation
     through the identity with bound 2 (`mergeGotos_target`, `mergeGotos_source`). It rests on
@@ -650,15 +648,16 @@ programs; it is the specification of the Rust pass of the same name.
     for any map on the stack that leaves memory alone, which that needs. A target that ends
     in a call is not merged (the caller's frame would keep a stale `block` under the
     callee, so the two states would differ): there the specification covers less.
-  - **Not written: threading a call's return target.** A `Stutter` proof that needs two maps
-    in `Frame.rename`, one for `block` and one for `target` (today one `ρ` renames both; the
-    memory lemmas do not care, only `State.jump_rename`, `State.jump?_rename` and
-    `State.ret_rename` do): the block map is the identity and the target map is
-    `threadTarget`. A return then lands, in the source, on the empty block the target
-    skipped, and takes one more step: `Thread.lean`'s `jump_then` is that step, to be applied
-    after `State.ret` and after an intrinsic call as it is after a jump. Merging a target
-    that ends in a call needs the same two maps, with the frames under the running one
-    renamed.
+  - **Threading through every target, a call's return target too** (`Opt/ThreadCalls.lean`,
+    `threadAll`; not yet elaborated). A frame's `target` is then another block in the
+    threaded program, so states are mapped: `retargetStack` sends each frame's `target`
+    through its caller's map and leaves every `block`; it is a `MemMap`. A terminator from
+    the mapped state gives the mapped next state, or the mapped jump one hop further, and
+    that hop is the program's second step: a stuttering simulation through the map with
+    bound 2 (`threadAll_target`, `threadAll_source`, `threadAll_call_source`).
+  - **Not written: merging a target that ends in a call.** The caller's frame keeps a stale
+    `block` under the callee; the map is `block` renamed on the frames under the running
+    one, another `MemMap`.
   - **Dead-store elimination is not written.** It needs a relation, not a map: two states
     equal but on dead locals. The Rust pass (`optimize/dse.rs`) removes the whole assignment
     of an rvalue it holds to be free of effects (all but a pointer-to-address cast), to a

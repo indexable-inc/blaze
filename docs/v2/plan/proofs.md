@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-56 theorems: 43 in `lean`, 13 in `lean/analysis`.
+59 theorems: 46 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -434,6 +434,32 @@ theorem mergeGotos_call_source (pick : Body → BlockId → Bool) (prog : Progra
     (id : FnId) (base : List Slot) (args : List Value)
     (hne : prog.call n id base args ≠ Outcome.diverge) :
     (mergeGotos pick prog).call n id base args = prog.call n id base args
+```
+
+**`Blaze.Mir.Opt.threadAll_target`** (`Blaze.Mir.Opt.ThreadCalls`, `lean`): With every target threaded, a call's return target too, a run that ends in n steps from the mapped state is the program's run of 2 * n steps.
+
+```lean
+theorem threadAll_target (prog : Program) (n : Nat) (st : State)
+    (hne : run (threadAll prog) n (st.mapStack (retargetStack (threadMap prog))) ≠
+      Outcome.diverge) :
+    run prog (2 * n) st =
+      run (threadAll prog) n (st.mapStack (retargetStack (threadMap prog)))
+```
+
+**`Blaze.Mir.Opt.threadAll_source`** (`Blaze.Mir.Opt.ThreadCalls`, `lean`): A run of the program that ends in n steps is the run of n steps of the program with every target threaded, from the mapped state.
+
+```lean
+theorem threadAll_source (prog : Program) (n : Nat) (st : State)
+    (hne : run prog n st ≠ Outcome.diverge) :
+    run (threadAll prog) n (st.mapStack (retargetStack (threadMap prog))) = run prog n st
+```
+
+**`Blaze.Mir.Opt.threadAll_call_source`** (`Blaze.Mir.Opt.ThreadCalls`, `lean`): A call that ends in n steps gives the same outcome with every target threaded.
+
+```lean
+theorem threadAll_call_source (prog : Program) (n : Nat) (id : FnId) (base : List Slot)
+    (args : List Value) (hne : prog.call n id base args ≠ Outcome.diverge) :
+    (threadAll prog).call n id base args = prog.call n id base args
 ```
 
 ## V10

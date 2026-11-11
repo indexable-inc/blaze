@@ -475,4 +475,38 @@ example :
     isInt ScalarTy.U32 4 ((Opt.mergeSuccessors constantSimplified).call 2 0 [] []) = true := by
   decide
 
+/-! Threading through a call's return target: the caller of `bump` returns to an empty block
+that only jumps on, and goes past it. -/
+
+def callThenHop : Program :=
+  { adts := [],
+    fns :=
+      [{ name := "caller", args := 0, locals := [Ty.int ScalarTy.U32, Ty.int ScalarTy.U32],
+         blocks :=
+           [{ stmts := [],
+              terminator := Terminator.call (Callee.fn 1) [] (Place.mk 1 []) (some 1) },
+            { stmts := [], terminator := Terminator.goto 2 },
+            { stmts :=
+                [Statement.assign (Place.mk 0 []) (Rvalue.use (Operand.copy (Place.mk 1 [])))],
+              terminator := Terminator.ret }] },
+       { name := "seven", args := 0, locals := [Ty.int ScalarTy.U32],
+         blocks :=
+           [{ stmts :=
+                [Statement.assign (Place.mk 0 [])
+                   (Rvalue.use (Operand.const (Const.int ScalarTy.U32 7)))],
+              terminator := Terminator.ret }] }] }
+
+example :
+    (Opt.threadAll callThenHop).block 0 0 =
+      some { stmts := [],
+             terminator := Terminator.call (Callee.fn 1) [] (Place.mk 1 []) (some 2) } := by
+  decide
+
+example : isInt ScalarTy.U32 7 (callThenHop.call 4 0 [] []) = true := by decide
+
+example : isDiverge (callThenHop.call 3 0 [] []) = true := by decide
+
+/-- The threaded program is done in three steps where the program takes four. -/
+example : isInt ScalarTy.U32 7 ((Opt.threadAll callThenHop).call 3 0 [] []) = true := by decide
+
 end Blaze.Mir.Tests
