@@ -13,7 +13,7 @@ remembered. How rows are picked, worked and landed is
 `harness/v2/ledger.py`. A check in *italics* is not written yet, and writing it is the first
 part of the work. `?` is not measured; "last known" is a lead, not a status.
 
-106 objectives: 0 met, 0 open, 0 blocked, 106 not measured.
+107 objectives: 0 met, 0 open, 0 blocked, 107 not measured.
 
 ## Targets
 
