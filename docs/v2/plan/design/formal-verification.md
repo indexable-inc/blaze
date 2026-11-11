@@ -640,6 +640,22 @@ programs; it is the specification of the Rust pass of the same name.
     `validate`'s normal form does not include them: `validate_sound` is equality of runs
     with the same fuel from the same state, which a renumbering (the state is renamed) and
     threading (the fuel differs) do not have. The witness validator is where they join.
+  - **Not written: merging a block into its only predecessor, and threading a call's
+    return target.** Both are `Stutter` proofs, and both need one generalization of
+    `Opt/Rename.lean` first: two maps in `Frame.rename`, one for `block` and one for
+    `target` (today one `ρ` renames both; the memory lemmas up to `execStmt_rename` do not
+    care, only `State.jump_rename`, `State.jump?_rename` and `State.ret_rename` do).
+    - Call targets: the block map is the identity and the target map is `threadTarget`. A
+      return then lands, in the source, on the empty block the target skipped, and takes
+      one more step: `Thread.lean`'s `jump_then` is that step, to be applied after
+      `State.ret` and after an intrinsic call as it is after a jump.
+    - Merging: inlining the block a `goto` targets (`b.stmts ++ t.stmts`, `t`'s terminator)
+      is right whatever `t`'s predecessors are; the only difference in states is the stale
+      `block` of a frame that is not running, when the inlined terminator is a call (the
+      source's caller frame says `t`, the target's says `b`). No step reads that field, so
+      the map is a rename of `block` on the frames under the running one, which the
+      two-map `Frame.rename` gives when the running frame is treated apart. A chain of
+      merges is the pass again, as for threading.
   - **Dead-store elimination is not written.** It needs a relation, not a map: two states
     equal but on dead locals. The Rust pass (`optimize/dse.rs`) removes the whole assignment
     of an rvalue it holds to be free of effects (all but a pointer-to-address cast), to a
