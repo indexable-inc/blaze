@@ -907,11 +907,11 @@ fn the_work_of_an_edit_is_the_same_among_a_hundred_functions_and_ten_thousand() 
     assert_eq!((large[2].lookups, large[2].replaced), (2, 4));
 }
 
-/// The control of the counts: a build that dedupes whole after an edit hashes every
-/// function, and the count says so. Two leaves of one code are one class; an edit of one's
+/// The control of [`the_work_of_an_edit_is_the_same_among_a_hundred_functions_and_ten_thousand`]:
+/// a build that dedupes whole after an edit hashes every function, and the count says so. Two leaves of one code are one class; an edit of one's
 /// body changes the class, so dedupe runs over all 100 functions as made.
 #[test]
-fn the_counts_catch_a_pass_that_runs_whole() {
+fn the_oracle_catches_a_pass_that_runs_whole() {
     let mut program = tree(100);
     // Every function but the two last leaves under a name of its own: those two are equal.
     for id in 2..=98 {
