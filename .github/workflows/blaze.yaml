@@ -173,9 +173,9 @@ jobs:
       - run: |
           uv run --frozen python harness/v2/lean_gate.py selftest
           uv run --frozen python harness/v2/lean_gate.py '{"command": "sources"}'
-      # Each hash domain in crates/ is written once outside tests (tools/v2/domains.py).
+      # Each hash domain in crates/ is written once outside tests (scripts/src/bin/domains.rs).
       - run: |
-          uv run --frozen python tools/v2/domains.py '{"root": "."}'
+          blaze run -q -p scripts --bin domains -- '{"root": "."}'
       # A change of blaze-profile's schema version lands only once ix.dev/explore reads it
       # (.github/scripts/explore_page.py; release.yaml checks every release too).
       - name: ix.dev/explore reads a new profile schema

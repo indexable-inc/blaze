@@ -1,7 +1,7 @@
 //! domains: every hash domain written in blaze's Rust is written once. The port of
-//! `tools/v2/domains.py`, line for line: the same one JSON argument, lines printed and exit
-//! status (docs/v2/plan/design/scripts.md, "Ports and their parity"). What follows is the
-//! Python's docstring, which says what a domain is and the rule.
+//! `tools/v2/domains.py`, deleted once both were run on the same tree and agreed
+//! (docs/v2/plan/design/scripts.md, "Ports and their parity"). What follows says what a domain
+//! is and the rule.
 //!
 //!     blaze run -q -p scripts --bin domains -- '{"root": "."}'
 //!

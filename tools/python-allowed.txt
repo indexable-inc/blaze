@@ -155,7 +155,6 @@ tools/remote-cache/smoke.py
 tools/typed-input/src/typed_input/__init__.py
 tools/unicode/casefold.py
 tools/v2/ast_views.py
-tools/v2/domains.py
 tools/v2/hot_lint.py
 tools/v2/repro/repro.py
 tools/v2/solver_sync.py
