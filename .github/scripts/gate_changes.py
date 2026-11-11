@@ -75,6 +75,9 @@ CODE = (
     ".github/workflows/blaze-platform.yaml",
     ".github/actions/toolchain/",
     ".github/actions/blaze/",
+    # The package of the repository's scripts (scripts/src/bin/<name>.rs), a workspace member the
+    # build checks; their library is crates/blaze-script, under crates/ above.
+    "scripts/",
 )
 # What the warm tier (a push to main) reads besides: the std cases of the smoke corpus, run
 # against the blaze that build built.

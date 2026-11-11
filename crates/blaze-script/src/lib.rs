@@ -6,7 +6,8 @@
 //!   refusals `tools/typed-input` gave, word for word.
 //! - [`pyjson`]: JSON written as Python's `json.dumps` writes it, so a generated file comes out
 //!   byte for byte as the Python script wrote it.
-//! - [`run`], [`git`], [`run_shown`]: a program run, its output captured or shown.
+//! - [`run`], [`git`], [`run_shown`], [`run_within`]: a program run, its output captured or
+//!   shown, or captured with a deadline.
 //! - [`pyfmt`]: `{x:g}`, `{x!r}` and `{x}` of a value, as an f-string writes them.
 //! - [`pystr`]: Python's `splitlines` and whitespace, where Rust's `lines` and `trim` differ.
 //! - [`pypath`]: `os.path`'s `normpath`, `relpath` and the rest, `glob.glob` and `fnmatch`.
@@ -23,9 +24,11 @@ pub mod pypath;
 pub mod pystr;
 
 use std::{
+    io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::atomic::{AtomicU32, Ordering},
+    time::{Duration, Instant},
 };
 
 pub use regex;
@@ -98,6 +101,51 @@ pub fn run_shown(argv: &[&str], cwd: &Path) -> Result<i32, String> {
     Ok(status.code().unwrap_or(-1))
 }
 
+/// Runs `argv` in `cwd` as [`run`] does, killing it when it has not ended within `limit`, as
+/// `subprocess.run(..., timeout=...)` and `asyncio.timeout` do: `Ok(None)` when it was killed.
+pub fn run_within(argv: &[&str], cwd: &Path, limit: Duration) -> Result<Option<Ran>, String> {
+    let (program, args) = argv.split_first().ok_or_else(|| "no program to run".to_owned())?;
+    #[allow(clippy::disallowed_methods, reason = "as `run`: a script starts a program here; `cwd` is always given")]
+    let mut command = Command::new(program);
+    let mut child = command
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{program} did not start in {}: {e}", cwd.display()))?;
+    // Both pipes are drained while it runs, so a program that writes much never blocks on one.
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = drain(child.stdout.take().map(|it| Box::new(it) as Box<dyn Read + Send>));
+    let stderr = drain(child.stderr.take().map(|it| Box::new(it) as Box<dyn Read + Send>));
+    let deadline = Instant::now() + limit;
+    // Bounded: it ends at the deadline at the latest, polling every 20 ms.
+    let status = loop {
+        match child.try_wait().map_err(|e| format!("waiting for {program}: {e}"))? {
+            Some(status) => break Some(status),
+            None if Instant::now() >= deadline => break None,
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    let Some(status) = status else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Ok(None);
+    };
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
+    Ok(Some(Ran { status: status.code().unwrap_or(-1), stdout, stderr }))
+}
+
 /// `git <args>` in `root`: its standard output, or `Err` with what it said when it failed.
 pub fn git(root: &Path, args: &[&str]) -> Result<String, String> {
     let mut argv = vec!["git"];
@@ -165,6 +213,17 @@ impl Drop for TempDir {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_run_past_its_deadline_is_killed() {
+        let here = Path::new(".");
+        let done = run_within(&["sh", "-c", "echo out; echo err >&2; exit 3"], here, Duration::from_secs(10)).unwrap();
+        let done = done.unwrap();
+        assert_eq!((done.status, done.out(), done.err()), (3, "out\n".to_owned(), "err\n".to_owned()));
+        let started = Instant::now();
+        assert!(run_within(&["sleep", "5"], here, Duration::from_millis(200)).unwrap().is_none());
+        assert!(started.elapsed() < Duration::from_secs(4));
+    }
 
     #[test]
     fn a_temp_dir_is_new_and_goes_when_dropped() {
