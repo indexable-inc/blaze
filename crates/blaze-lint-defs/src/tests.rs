@@ -52,7 +52,7 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
     let store = Store::default();
     let lint = lint("blaze::const_impure").expect("blaze's lint");
     assert_eq!(lint.default_level, Level::Warn);
-    assert_eq!(blaze_lints().len(), 86);
+    assert_eq!(blaze_lints().len(), 89);
     assert!(!lint.is_externally_loaded);
     // The compiler's own and the release build's; blaze-lints loads every other.
     let built: Vec<&str> =
@@ -64,6 +64,7 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
     let general = group("blaze::general").expect("blaze's general group");
     let internal = group("blaze::internal").expect("blaze's internal group");
     let pedantic = group("blaze::pedantic_perf").expect("blaze's pedantic_perf group");
+    let edition = group("blaze::edition").expect("blaze's edition group");
     // `deny` by default: they fire only where the code asked for them (`#[blaze::checkfree]`,
     // `#[blaze::nopanic]`, `#[blaze::noalloc]`, `#[blaze::nonblocking]`, `#[blaze::pure]`, a
     // `#[blaze::may(..)]` or `#![blaze::effects]`).
@@ -74,14 +75,18 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
         "blaze::nonblocking",
         "blaze::pure",
         "blaze::undeclared_effect",
+        "blaze::program_lifetime",
     ];
     for it in &blaze_lints()[1..] {
         let in_ = |g: &Group| g.lints.iter().any(|m| m.name == it.name);
         let (in_general, in_internal, in_pedantic) = (in_(general), in_(internal), in_(pedantic));
         assert_eq!(
-            usize::from(in_general) + usize::from(in_internal) + usize::from(in_pedantic),
+            usize::from(in_general)
+                + usize::from(in_internal)
+                + usize::from(in_pedantic)
+                + usize::from(in_(edition)),
             1,
-            "`{}` is general, internal or pedantic_perf, once",
+            "`{}` is general, internal, pedantic_perf or edition, once",
             it.name
         );
         let level = if deny.contains(&it.name) {
@@ -170,6 +175,7 @@ fn counts_are_rustcs() {
             "blaze::general",
             "blaze::pedantic_perf",
             "blaze::internal",
+            "blaze::edition",
             "blaze::reach",
         ]
     );
