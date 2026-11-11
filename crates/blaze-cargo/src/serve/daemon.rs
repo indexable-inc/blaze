@@ -2063,9 +2063,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         // Each part of a turn that has a span is a child of it, so a long turn names what it
         // was inside (slow-is-p0-traced); an idle turn opens none.
         let spanned = _span.is_some();
+        // An output an answered build left being placed is under way as a job is: the work
+        // between requests (the image's pass over the database, the collections) is counted
+        // from the last answer and the last such placement, never run beside one.
         self.quiet_turns = quiet_turns_after(
             self.quiet_turns,
-            !self.jobs.idle(),
+            !self.jobs.idle() || self.jobs.placing_after() != 0,
             !done.is_empty(),
             self.plane.running() != 0,
         );
@@ -3029,7 +3032,11 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     /// the image), so a request that arrived meanwhile is taken between them, and the image's
     /// write is let go when one comes ([`Daemon::let_go_of_image`]).
     fn between(&mut self) {
-        if self.stopping.is_some() || !self.jobs.idle() || self.jobs.storing() > 0 {
+        if self.stopping.is_some()
+            || !self.jobs.idle()
+            || self.jobs.storing() > 0
+            || self.jobs.placing_after() != 0
+        {
             return;
         }
         if !self.quiet_between_requests() {

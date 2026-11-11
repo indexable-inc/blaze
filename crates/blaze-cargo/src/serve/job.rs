@@ -61,6 +61,19 @@ thread_local! {
     /// Each miss a build's history row took that says its checkout's last build lost what it
     /// left to settle ([`SETTLING_STEP`]), as `blaze why` is given it: its reason.
     pub(super) static ENDED_LOST: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: none, a test's record
+    /// Each output queued behind its path's effects in flight ([`Jobs::place_output`]), by
+    /// its path: what a test sees of a later job's wait for an output an answered job left
+    /// being placed.
+    pub(super) static QUEUED_OUTPUTS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: none, a test's record
+    /// The most effects ever in flight at one path at once ([`Jobs::begin_placing`]): one,
+    /// while every placement of a path waits for the one before it.
+    pub(super) static MOST_AT_A_PATH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// The planted bug: an output is placed at once whatever is in flight at its path
+    /// ([`Jobs::place_output`]), as before outputs outlived their job's answer.
+    pub(super) static PLANT_NO_QUEUE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The planted bug: a job's answer waits for no placement, named or not
+    /// ([`Jobs::wind_up`]).
+    pub(super) static PLANT_ANSWER_WAITS_FOR_NO_OUTPUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 use std::{
@@ -2108,9 +2121,19 @@ struct Job<S: Steps> {
     /// Its `Work` report, said as it finishes: once its placements have all ended, so it
     /// counts every byte they placed.
     worked: Option<Worked>,
-    /// Of `placing`, how many are in flight at each path ([`Paths`] id): a file with one is
-    /// not yet all there.
-    busy: HashMap<u32, u32, Global>,
+    /// Of `placing`, how many are in flight at each path ([`Paths`] id), or wait behind
+    /// another job's ([`Jobs::queued`]): a file with one is not yet all there. With whether
+    /// the path is one its answer names, as its first effect there began ([`Busy`]).
+    busy: HashMap<u32, Busy, Global>,
+    /// Of `placing`, how many are at a path its answer names ([`Job::names`]): what its
+    /// answer waits for ([`Jobs::wind_up`]). The rest go on after it ([`Settling::placing`]).
+    needed: usize,
+    /// The paths its answer names, as [`Paths`] ids: each file of each unit's artifact
+    /// ([`Artifact::path`], [`Artifact::filenames`], [`Artifact::executable`]: what `Built`
+    /// says was made, and what a person or a tool runs or reads next) and each lock file it
+    /// writes. Every other output (a program's hashed copy under `deps`, dep-info, a file
+    /// cargo lists none of) is derived data the answer does not say: placed after it.
+    names: HashSet<u32, Global>,
     /// Build scripts' runs the plane started whose programs are not yet all placed: each
     /// starts once its compile's outputs have nothing in flight ([`Jobs::run_script`]).
     held: Vec<NodeId>,
@@ -2264,6 +2287,18 @@ struct Settling<S: Steps> {
     stored: blaze_cas::Tickets,
     /// As [`Job::durable`].
     durable: blaze_cas::Tickets,
+    /// How many of its job's placements were still under way as it was answered, less those
+    /// that have ended since ([`Job::placing`] less [`Job::needed`], which was none): the
+    /// outputs its answer does not name. Each goes on exactly as under the job (its mode
+    /// set, the file looked at for its record); one that fails is a loss ([`Jobs::lose`]),
+    /// and its path is placed again by the next build that makes it.
+    placing: usize,
+    /// `a build's other outputs are placed after its answer`, open while `placing` is not
+    /// none: what the daemon still does for the build, by name (slow-is-p0-traced).
+    placing_span: Option<tracing::Span>,
+    /// Its job's leases of the build dirs it placed into ([`Job::leases`]), held while
+    /// `placing` is not none: the collector renames no dir an output is still written into.
+    leases: Option<Arc<Lock<Leases>>>,
     /// When, on the injected clock, it first waited for a ticket: given up as lost once
     /// [`DURABLE_WITHIN`] has gone by from the later of then and the last step of the store's
     /// commit (bounded-progress, [`gave_up`]).
@@ -3028,6 +3063,34 @@ enum Own {
     Record { job: JobId, path: u32, key: blaze_cas::Key },
 }
 
+/// A job's effects in flight at one path ([`Job::busy`]).
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct Busy {
+    /// How many: placements, modes, looks, and outputs waiting behind another job's.
+    effects: u32,
+    /// Its answer names the path ([`Job::names`]): each of `effects` counts in
+    /// [`Job::needed`]. Decided once, as the entry is made or the path is named
+    /// ([`Jobs::name`]), so every end takes off exactly what its begin added.
+    named: bool,
+}
+
+/// An output a compile gave whose path has an effect of another placement in flight (one an
+/// answered job left, [`Settling::placing`], or another job's): placed once that has ended
+/// ([`Jobs::release_queued`]), in the order asked, so two placements of one path never race
+/// and the later value is the one left there. It counts as its job's placing meanwhile
+/// ([`Jobs::hold`]): what reads the path through the daemon (a run, a build script's
+/// program, a streamed test) waits for it as for any effect.
+struct Queued {
+    job: JobId,
+    path: u32,
+    key: blaze_cas::Key,
+    executable: bool,
+    made: Option<Arc<blaze_cas::Sparse>>,
+    /// `an output waits for the path's placement in flight`, open while it waits
+    /// (every-wait-says-what).
+    _waits: tracing::Span,
+}
+
 /// A placement the store was asked for.
 struct Placing {
     job: JobId,
@@ -3129,6 +3192,12 @@ pub struct Jobs<S: Steps> {
     /// The store's placements by the store's tag: its tags are its own, made among its other
     /// effects, so there is no slot of ours in them to index by.
     placing: HashMap<Tag, Placing, Global>,
+    /// How many effects are in flight at each path ([`Paths`] id), whoever asked: a live
+    /// job's or one an answered job left ([`Settling::placing`]). A path with none is all
+    /// there as far as the daemon knows.
+    flying: HashMap<u32, u32, Global>,
+    /// The outputs waiting for their path's effects in flight to end, in the order asked.
+    queued: Vec<Queued>,
     paths: Paths<S>,
     /// The lock writes, modes and looks at files in flight, by the slot their tag carries.
     own: Tagged<Own>,
@@ -3280,6 +3349,8 @@ impl<S: Steps> Jobs<S> {
             native_laid: BTreeMap::new(),
             native_waiting: BTreeMap::new(),
             placing: HashMap::new_in(Global),
+            flying: HashMap::new_in(Global),
+            queued: Vec::new(), // alloc: none until an output waits for its path
             paths: Paths::new(machine),
             own,
             runs,
@@ -3396,6 +3467,12 @@ impl<S: Steps> Jobs<S> {
     /// How many answered jobs still have something settling ([`Settling`]).
     pub fn settling(&self) -> usize {
         self.settling.len()
+    }
+
+    /// How many outputs answered jobs left being placed ([`Settling::placing`]): the loop is
+    /// not between requests while any is, as while a job is under way.
+    pub fn placing_after(&self) -> usize {
+        self.settling.iter().map(|it| it.placing).sum()
     }
 
     /// The last of what settling lost, oldest first ([`Jobs::lose`]).
@@ -3557,6 +3634,8 @@ impl<S: Steps> Jobs<S> {
             placed: blaze_cas::PlacedBytes::default(),
             worked: None,
             busy: HashMap::new_in(Global),
+            needed: 0,
+            names: HashSet::new_in(Global),
             held: Vec::new(), // alloc: none until a run waits for its program
             look: 0,
             awaiting: None,
@@ -4972,6 +5051,8 @@ impl<S: Steps> Jobs<S> {
                         return;
                     }
                 };
+                // A lock file is what the job is asked for: its answer waits for it.
+                self.name(id, path);
                 self.begin_placing(id, path);
                 // durable: the user's lock file: their own source, written whole or not at all
                 w.effects.push(Effect::Write { file, bytes: written.text.into_bytes(), tag });
@@ -6121,6 +6202,23 @@ impl<S: Steps> Jobs<S> {
                 job.over.get_or_insert((false, Some(error)));
             }
         }
+        // The files the unit's artifact names are what the build's answer says was made:
+        // the answer waits for those to be at their paths, and for nothing else placed.
+        if let Some(artifact) = &compiled.artifact {
+            let files = std::iter::once(artifact.path.as_str())
+                .chain(artifact.filenames.iter().map(String::as_str))
+                .chain(artifact.executable.as_deref());
+            for file in files {
+                let path = self.paths.intern(file);
+                if job.names.insert(path)
+                    && let Some(busy) = job.busy.get_mut(&path)
+                    && !busy.named
+                {
+                    busy.named = true;
+                    job.needed += busy.effects as usize;
+                }
+            }
+        }
         let outputs = match (compiled.artifact, &mut job.stage) {
             (artifact, Stage::Units(build)) => {
                 if streams
@@ -6150,33 +6248,128 @@ impl<S: Steps> Jobs<S> {
                 }
                 continue;
             }
-            // A file this compile linked is placed from the bytes it made, whatever the path
-            // holds: no file of the store is read, cloned or waited for, so the answer is
-            // held by no clone and no write-back (docs/v2/plan/design/clone-out.md).
-            if let Some(made) = output.made {
-                self.place_made(w, id, path, output.key, output.executable, &made);
+            self.place_output(w, id, path, output.key, output.executable, output.made);
+        }
+    }
+
+    /// An output of job `id` placed at path `path`, or queued behind the effects in flight
+    /// there ([`Queued`]): those of a placement an answered job left
+    /// ([`Settling::placing`]), or of another job's. The later output is placed once they
+    /// have ended ([`Jobs::release_queued`]), so a reader never finds the earlier value
+    /// landing over the later one, and a look at the path's record is never of a file
+    /// about to be replaced.
+    fn place_output(
+        &mut self,
+        w: &mut World<'_, S>,
+        id: JobId,
+        path: u32,
+        key: blaze_cas::Key,
+        executable: bool,
+        made: Option<Arc<blaze_cas::Sparse>>,
+    ) {
+        #[cfg(test)]
+        let planted = PLANT_NO_QUEUE.get();
+        #[cfg(not(test))]
+        let planted = false;
+        if !planted && self.flying.contains_key(&path) {
+            #[cfg(test)]
+            QUEUED_OUTPUTS.with_borrow_mut(|it| it.push(self.paths.names[path as usize].to_string()));
+            let waits = tracing::info_span!(
+                target: "blaze",
+                "an output waits for the path's placement in flight",
+                function = &*self.paths.names[path as usize],
+                awaits = "the placement of the path's last value, in flight",
+            );
+            self.hold(id, path);
+            self.queued.push(Queued { job: id, path, key, executable, made, _waits: waits });
+            return;
+        }
+        self.place_now(w, id, path, key, executable, made);
+    }
+
+    /// An output of job `id` placed at path `path`, where no effect is in flight.
+    fn place_now(
+        &mut self,
+        w: &mut World<'_, S>,
+        id: JobId,
+        path: u32,
+        key: blaze_cas::Key,
+        executable: bool,
+        made: Option<Arc<blaze_cas::Sparse>>,
+    ) {
+        // A file this compile linked is placed from the bytes it made, whatever the path
+        // holds: no file of the store is read, cloned or waited for, so the answer is
+        // held by no clone and no write-back (docs/v2/plan/design/clone-out.md).
+        if let Some(made) = made {
+            self.place_made(w, id, path, key, executable, &made);
+            return;
+        }
+        let placed = self.paths.placed[path as usize]
+            .as_ref()
+            .is_some_and(|it| it.key == key && it.executable == executable && it.meta.is_some());
+        if !placed {
+            self.place(w, id, path, key, executable);
+            return;
+        }
+        match self.own_tag(Own::Look { job: id, path, key, executable }) {
+            Ok(tag) => {
+                // clone: the driver's effect owns the file's name, once per output
+                let Some(file) = self.paths.files[path as usize].clone() else { return };
+                self.begin_placing(id, path);
+                w.effects.push(Effect::Stat { file, tag });
+            }
+            Err(error) => self.placing_failed(id, path, error),
+        }
+    }
+
+    /// Each output queued behind its path's effects in flight ([`Queued`]) whose path has
+    /// none now, placed, in the order asked: the first of a path makes it busy again, so the
+    /// rest of that path wait on. One whose job was dropped meanwhile (a stall) is let go.
+    fn release_queued(&mut self, w: &mut World<'_, S>) {
+        let mut at = 0;
+        while at < self.queued.len() {
+            if self.flying.contains_key(&self.queued[at].path) {
+                at += 1;
                 continue;
             }
-            let placed = self.paths.placed[path as usize].as_ref().is_some_and(|it| {
-                it.key == output.key && it.executable == output.executable && it.meta.is_some()
-            });
-            if !placed {
-                self.place(w, id, path, output.key, output.executable);
-                continue;
-            }
-            let look = Own::Look { job: id, path, key: output.key, executable: output.executable };
-            let tag = self.own_tag(look);
-            let Some(job) = self.jobs.get_mut(key_of(id)) else { continue };
-            match tag {
-                Ok(tag) => {
-                    // clone: the driver's effect owns the file's name, once per output
-                    let Some(file) = self.paths.files[path as usize].clone() else { continue };
-                    self.begin_placing(id, path);
-                    w.effects.push(Effect::Stat { file, tag });
-                }
-                Err(error) => _ = job.over.get_or_insert((false, Some(error))),
+            let Queued { job: id, path, key, executable, made, _waits } = self.queued.remove(at);
+            drop(_waits);
+            self.unhold(id, path);
+            if self.owned(id) {
+                self.place_now(w, id, path, key, executable, made);
             }
         }
+    }
+
+    /// Whether something still answers for job `id`'s placements: the job, or what it left
+    /// to settle after its answer ([`Settling::placing`]). Neither for a job a stall dropped.
+    fn owned(&self, id: JobId) -> bool {
+        self.jobs.get(key_of(id)).is_some() || self.settling.iter().any(|it| it.job == id)
+    }
+
+    /// A placement of job `id` at path `path` failed with `error`. The job's error while it
+    /// lives. Once it was answered the answer stands: the path is one it did not name, its
+    /// record is dropped so the next build that makes it places it again, and the failure
+    /// is a loss said as any other ([`Jobs::lose`]): in the daemon's log, in `blaze status`
+    /// and by the checkout's next `blaze why`. Never silent.
+    fn placing_failed(&mut self, id: JobId, path: u32, error: ApiError) {
+        if let Some(job) = self.jobs.get_mut(key_of(id)) {
+            job.over.get_or_insert((false, Some(error)));
+            return;
+        }
+        let Some(it) = self.settling.iter().find(|it| it.job == id) else { return };
+        // clone: a loss's names, once
+        let (command, checkout) = (it.command.clone(), it.checkout.clone());
+        if let Some(placed) = self.paths.placed.get_mut(path as usize) {
+            *placed = None;
+        }
+        // alloc: a loss, once
+        let what = format!(
+            "an output its answer did not name was not placed after the answer, and the next build that \
+             makes it places it again: {}",
+            error.what
+        );
+        self.lose(id, &command, checkout.as_deref(), what);
     }
 
     /// The store's value of `key` placed at path `path` for job `id`.
@@ -6196,19 +6389,22 @@ impl<S: Steps> Jobs<S> {
         {
             w.store.unplace(&before.key, &key, w.effects);
         }
-        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
-        job.placed_any = true;
+        // What an answered job left goes on ([`Settling::placing`]); a dropped job's does not.
+        match self.jobs.get_mut(key_of(id)) {
+            Some(job) => job.placed_any = true,
+            None => {
+                if !self.owned(id) {
+                    return;
+                }
+            }
+        }
         // clone: the store's effect owns the file's name, once per placement
         let Some(file) = self.paths.files[path as usize].clone() else {
             let name = self.paths.names[path as usize].to_string(); // alloc: an error, once
             // alloc: an error, once
-            job.over.get_or_insert((
-                false,
-                Some(ApiError::new(
-                    format!("{name} is no path an output can be placed at"),
-                    Some(name),
-                )),
-            ));
+            let error =
+                ApiError::new(format!("{name} is no path an output can be placed at"), Some(name));
+            self.placing_failed(id, path, error);
             return;
         };
         match w.store.place(&key, file, w.effects) {
@@ -6223,7 +6419,7 @@ impl<S: Steps> Jobs<S> {
                     format!("the store has nothing under {key:?} to place at {name}"),
                     Some(name),
                 );
-                job.over.get_or_insert((false, Some(error)));
+                self.placing_failed(id, path, error);
             }
         }
     }
@@ -6246,19 +6442,22 @@ impl<S: Steps> Jobs<S> {
         {
             w.store.unplace_made(&before.key, w.effects);
         }
-        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
-        job.placed_any = true;
+        // What an answered job left goes on ([`Settling::placing`]); a dropped job's does not.
+        match self.jobs.get_mut(key_of(id)) {
+            Some(job) => job.placed_any = true,
+            None => {
+                if !self.owned(id) {
+                    return;
+                }
+            }
+        }
         // clone: the store's effect owns the file's name, once per placement
         let Some(file) = self.paths.files[path as usize].clone() else {
             let name = self.paths.names[path as usize].to_string(); // alloc: an error, once
             // alloc: an error, once
-            job.over.get_or_insert((
-                false,
-                Some(ApiError::new(
-                    format!("{name} is no path an output can be placed at"),
-                    Some(name),
-                )),
-            ));
+            let error =
+                ApiError::new(format!("{name} is no path an output can be placed at"), Some(name));
+            self.placing_failed(id, path, error);
             return;
         };
         // clone: the runs, which the path's writes own (an effect owns its bytes); once per path
@@ -6268,24 +6467,82 @@ impl<S: Steps> Jobs<S> {
     }
 
     /// An effect of job `id` at path `path` asked: the file is not all there until it ends.
+    /// Counted for the path whoever asked ([`Jobs::flying`]), and for the job ([`Jobs::hold`]).
     fn begin_placing(&mut self, id: JobId, path: u32) {
+        let flying = self.flying.entry(path).or_default();
+        *flying += 1;
+        #[cfg(test)]
+        MOST_AT_A_PATH.set(MOST_AT_A_PATH.get().max(*flying));
+        self.hold(id, path);
+    }
+
+    /// An effect of [`Jobs::begin_placing`] ended; the job, if it is still there. The path's
+    /// count ends whether it is or not: an output queued behind it waits for the effect, not
+    /// for who asked it.
+    fn end_placing(&mut self, id: JobId, path: u32) -> Option<&mut Job<S>> {
+        if let blaze_hash::hash_map::Entry::Occupied(mut flying) = self.flying.entry(path) {
+            *flying.get_mut() -= 1;
+            if *flying.get() == 0 {
+                flying.remove();
+            }
+        }
+        self.unhold(id, path)
+    }
+
+    /// Job `id` has one more thing under way at path `path`: an effect in flight
+    /// ([`Jobs::begin_placing`]) or an output waiting for the path ([`Queued`]). Counted by
+    /// the job while it lives, one of [`Job::needed`] when its answer names the path; by
+    /// what it left to settle once it was answered ([`Settling::placing`]); by nothing for a
+    /// job a stall dropped.
+    fn hold(&mut self, id: JobId, path: u32) {
         if let Some(job) = self.jobs.get_mut(key_of(id)) {
             job.placing += 1;
-            *job.busy.entry(path).or_default() += 1;
+            let named = job.names.contains(&path);
+            let named = {
+                let busy = job.busy.entry(path).or_insert(Busy { effects: 0, named });
+                busy.effects += 1;
+                busy.named
+            };
+            if named {
+                job.needed += 1;
+            }
+        } else if let Some(it) = self.settling.iter_mut().find(|it| it.job == id) {
+            it.placing += 1;
         }
     }
 
-    /// An effect of [`Jobs::begin_placing`] ended; the job, if it is still there.
-    fn end_placing(&mut self, id: JobId, path: u32) -> Option<&mut Job<S>> {
-        let job = self.jobs.get_mut(key_of(id))?;
+    /// What [`Jobs::hold`] counted, ended; the job, if it is still there.
+    fn unhold(&mut self, id: JobId, path: u32) -> Option<&mut Job<S>> {
+        let Some(job) = self.jobs.get_mut(key_of(id)) else {
+            if let Some(it) = self.settling.iter_mut().find(|it| it.job == id) {
+                it.placing = it.placing.saturating_sub(1);
+            }
+            return None;
+        };
         job.placing -= 1;
         if let blaze_hash::hash_map::Entry::Occupied(mut busy) = job.busy.entry(path) {
-            *busy.get_mut() -= 1;
-            if *busy.get() == 0 {
+            if busy.get().named {
+                job.needed -= 1;
+            }
+            busy.get_mut().effects -= 1;
+            if busy.get().effects == 0 {
                 busy.remove();
             }
         }
         Some(job)
+    }
+
+    /// Path `path` is one job `id`'s answer names ([`Job::names`]): what it has under way
+    /// there counts in what its answer waits for, from now.
+    fn name(&mut self, id: JobId, path: u32) {
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        if job.names.insert(path)
+            && let Some(busy) = job.busy.get_mut(&path)
+            && !busy.named
+        {
+            busy.named = true;
+            job.needed += busy.effects as usize;
+        }
     }
 
     /// Each run [`Jobs::run_script`] held, asked again: one whose program is all placed now
@@ -6356,11 +6613,7 @@ impl<S: Steps> Jobs<S> {
                 self.paths.placed[path as usize] = Some(Placement { key, executable, meta: None });
                 w.effects.push(Effect::Stat { file, tag });
             }
-            Err(error) => {
-                if let Some(job) = self.jobs.get_mut(key_of(id)) {
-                    job.over.get_or_insert((false, Some(error)));
-                }
-            }
+            Err(error) => self.placing_failed(id, path, error),
         }
     }
 
@@ -6370,15 +6623,25 @@ impl<S: Steps> Jobs<S> {
             let Some(Placing { job: id, path, key, executable }) = self.placing.remove(&tag) else {
                 continue;
             };
-            let Some(job) = self.jobs.get_mut(key_of(id)) else { continue };
-            job.placed += bytes;
+            // What an answered job left goes on as under the job (its mode, its record); of
+            // a job a stall dropped nothing does, and its path is free again.
+            let live = match self.jobs.get_mut(key_of(id)) {
+                Some(job) => {
+                    job.placed += bytes;
+                    true
+                }
+                None => false,
+            };
+            if !live && !self.owned(id) {
+                self.end_placing(id, path);
+                continue;
+            }
             match result {
                 Ok(()) if executable => match self.own_tag(Own::Mode { job: id, path, key }) {
                     Ok(tag) => w.effects.push(Effect::Mode { file: to, mode: 0o755, tag }),
                     Err(error) => {
-                        if let Some(job) = self.end_placing(id, path) {
-                            job.over.get_or_insert((false, Some(error)));
-                        }
+                        self.end_placing(id, path);
+                        self.placing_failed(id, path, error);
                     }
                 },
                 Ok(()) => {
@@ -6386,12 +6649,11 @@ impl<S: Steps> Jobs<S> {
                     self.record(w, id, path, key, false);
                 }
                 Err(why) => {
-                    if let Some(job) = self.end_placing(id, path) {
-                        // alloc: an error, once
-                        let error =
-                            ApiError::new(format!("placing /{to}: {why}"), Some(format!("/{to}")));
-                        job.over.get_or_insert((false, Some(error)));
-                    }
+                    self.end_placing(id, path);
+                    // alloc: an error, once
+                    let error =
+                        ApiError::new(format!("placing /{to}: {why}"), Some(format!("/{to}")));
+                    self.placing_failed(id, path, error);
                 }
             }
         }
@@ -6476,7 +6738,7 @@ impl<S: Steps> Jobs<S> {
                     (Done::Stat(Some(meta)), Some(placement)) if placement.key == key && placement.meta == Some(*meta)
                 );
                 self.end_placing(id, path);
-                if !unchanged {
+                if !unchanged && self.owned(id) {
                     self.place(w, id, path, key, executable);
                 }
             }
@@ -6492,10 +6754,12 @@ impl<S: Steps> Jobs<S> {
                     }
                     _ => None,
                 };
-                let Some(job) = self.end_placing(id, path) else { return };
+                self.end_placing(id, path);
                 if let Some(error) = failed {
-                    job.over.get_or_insert((false, Some(error)));
-                } else if let Own::Mode { key, .. } = own {
+                    self.placing_failed(id, path, error);
+                } else if let Own::Mode { key, .. } = own
+                    && self.owned(id)
+                {
                     self.record(w, id, path, key, true);
                 }
             }
@@ -7162,7 +7426,7 @@ impl<S: Steps> Jobs<S> {
             }
             // alloc: a loss, once
             let what = format!(
-                "what the build left was not all stored and durable when it was let go: {why}"
+                "what the build left was not all stored, durable and placed when it was let go: {why}"
             );
             self.lose(it.job, &it.command, it.checkout.as_deref(), what);
         }
@@ -7299,12 +7563,27 @@ impl<S: Steps> Jobs<S> {
     /// runs; and a snapshot once all it waits for is durable.
     ///
     /// A job's answer is sent then, in this very winding up: once its plane request has
-    /// finished, its outputs are at their paths with their whole contents (no placement in
-    /// flight) and its runs of user code have ended. Nothing else holds it: not the store's
-    /// commit of what it put or read, not the store of its kept front end, not the front end's
-    /// release, not the profile, not the image. What it leaves not yet durable or not yet
-    /// stored settles after the answer ([`Settling`]). A snapshot alone waits for durability:
-    /// that is what it is asked for.
+    /// finished, the files it names are at their paths with their whole contents (no
+    /// placement of one in flight, [`Job::needed`]) and its runs of user code have ended.
+    ///
+    /// What must be true before the answer, decided once: every file the answer names is
+    /// the file a reader finds at its path. `blaze build`'s `Built` names each unit's
+    /// artifact files (cargo's `filenames`, the uplifted program among them) and a person's
+    /// `./target/debug/app` or a script's next step opens that path the moment the command
+    /// returns, with nothing of blaze between them and the file system: so the path has to
+    /// hold the file, not an image in the daemon's memory that a later write lands. A run
+    /// of the daemon's own (`blaze run`, `blaze test`, a build script) starts only once its
+    /// job has nothing in flight at all ([`Jobs::release_runs`]), named or not.
+    ///
+    /// Nothing else holds the answer: not the outputs it does not name (a program's hashed
+    /// copy under `deps`, dep-info, anything cargo's artifact lists none of), not the
+    /// store's commit of what it put or read, not the store of its kept front end, not the
+    /// front end's release, not the profile, not the image. Those settle after the answer
+    /// ([`Settling`]): an output still being placed goes on exactly as under the job, a
+    /// later job's output at the same path waits for it ([`Queued`]), a stop waits for it
+    /// (`STOP_SETTLES_WITHIN`), and a crash before it lands leaves the old file or the new
+    /// one whole, which the restarted daemon, knowing of no file it placed, places again.
+    /// A snapshot alone waits for durability: that is what it is asked for.
     fn wind_up(&mut self, w: &mut World<'_, S>) {
         self.wind_up_judging(w, false);
     }
@@ -7312,6 +7591,7 @@ impl<S: Steps> Jobs<S> {
     /// [`Jobs::wind_up`], judging whether a wait for the store ran out of time only when
     /// `judge` is set ([`gave_up`]).
     fn wind_up_judging(&mut self, w: &mut World<'_, S>, judge: bool) {
+        self.release_queued(w);
         self.release_held(w);
         self.release_ready(w);
         self.release_runs(w);
@@ -7387,10 +7667,15 @@ impl<S: Steps> Jobs<S> {
             let Some((ok, error)) = &mut job.over else { continue };
             // What of its own is still under way, the first of them: named by a span while
             // the answer is held for it (every-wait-says-what). Each is something the answer
-            // says: its plane request's outcome, its outputs at their paths, its runs' results.
+            // says: its plane request's outcome, the files it names at their paths, its runs'
+            // results. An output it does not name holds nothing: it goes on after the answer.
+            #[cfg(test)]
+            let needed = if PLANT_ANSWER_WAITS_FOR_NO_OUTPUT.get() { 0 } else { job.needed };
+            #[cfg(not(test))]
+            let needed = job.needed;
             let held = if !job.finished {
                 Some("its plane request, not finished")
-            } else if job.placing != 0 {
+            } else if needed != 0 {
                 Some("its outputs, being placed")
             } else if job.runs != 0 {
                 Some("its runs")
@@ -7401,14 +7686,29 @@ impl<S: Steps> Jobs<S> {
             };
             if let Some(what) = held {
                 if job.held_wait.as_ref().is_none_or(|(_, was)| *was != what) {
-                    // `function` and `awaits` are fields of an ad hoc span the profile keeps
-                    // (`blaze_profile::span::ad_hoc_fields`); `what`, `placing` and `runs`
-                    // had no column and are not given (`blaze::span_field_unrecorded`).
+                    // `function` and `awaits` are columns of an ad hoc span
+                    // (`blaze_profile::span::ad_hoc_fields`); the rest are kept as text in
+                    // `spans.fields`. `named_path` is the file the answer names that is
+                    // still being placed (the first by id, so the row does not depend on a
+                    // map's order), `needed` and `placing` how many effects are in flight
+                    // at named paths and in all: a wait that is long says for which file.
+                    let named_path = job
+                        .busy
+                        .iter()
+                        .filter(|(_, busy)| busy.named)
+                        .map(|(path, _)| *path)
+                        .min()
+                        .and_then(|path| self.paths.names.get(path as usize))
+                        .map_or("none", |it| &**it);
                     let span = tracing::info_span!(
                         target: "blaze",
                         "the job's answer waits for what it still does",
                         function = what,
                         awaits = what,
+                        named_path,
+                        needed = job.needed,
+                        placing = job.placing,
+                        runs = job.runs,
                     );
                     job.held_wait = Some((span, what));
                 }
@@ -7476,7 +7776,24 @@ impl<S: Steps> Jobs<S> {
             // failed as the store broke was answered with the break.
             let said = matches!(job.work, Work::Snapshot)
                 || (!ok && storing.is_none() && w.store.broken().is_some());
-            if !said && (storing.is_some() || !stored.is_empty() || !durable.is_empty()) {
+            if said {
+                stored = blaze_cas::Tickets::default();
+                durable = blaze_cas::Tickets::default();
+            }
+            // The outputs it did not name that are still being placed (or wait for their
+            // path): they go on after the answer, under what it leaves to settle, which
+            // holds its build dirs' leases until the last has ended.
+            let placing = job.placing;
+            let placing_span = (placing != 0).then(|| {
+                tracing::info_span!(
+                    target: "blaze",
+                    "a build's other outputs are placed after its answer",
+                    of_job = %id,
+                    placing,
+                )
+            });
+            let leases = (placing != 0).then(|| Arc::clone(&job.leases)); // clone: a refcount, once a job
+            if storing.is_some() || !stored.is_empty() || !durable.is_empty() || placing != 0 {
                 let checkout = job.stored_of.take().or_else(|| {
                     // clone: the request's root, once a job that leaves something to settle
                     targets_of(&job.work).and_then(|it| it.cargo.as_ref()).map(|it| it.root.clone())
@@ -7493,6 +7810,9 @@ impl<S: Steps> Jobs<S> {
                     storing,
                     stored,
                     durable,
+                    placing,
+                    placing_span,
+                    leases,
                     since: None,
                     wait: None,
                 });
@@ -7534,6 +7854,10 @@ impl<S: Steps> Jobs<S> {
         // and stands: the loss is recorded ([`Jobs::lose`]), never a second `Finish`.
         let mut lost = Vec::new(); // alloc: none until a wait is given up
         self.settling.retain_mut(|it| {
+            if it.placing == 0 {
+                it.placing_span = None;
+                it.leases = None;
+            }
             it.stored.retain_pending(|ticket| w.store.durable(ticket));
             it.durable.retain_pending(|ticket| w.store.durable(ticket));
             let waiting = it
@@ -7545,7 +7869,7 @@ impl<S: Steps> Jobs<S> {
             let Some((ticket, stored)) = waiting else {
                 it.wait = None;
                 it.since = None;
-                return it.storing.is_some();
+                return it.storing.is_some() || it.placing != 0;
             };
             recheck |= flush_once(&mut flushed, &mut heard, w.store, w.now, w.effects);
             if it.wait.is_none() {
@@ -7565,7 +7889,7 @@ impl<S: Steps> Jobs<S> {
             it.durable = blaze_cas::Tickets::default();
             it.wait = None;
             it.since = None;
-            it.storing.is_some()
+            it.storing.is_some() || it.placing != 0
         });
         for (job, command, checkout, what) in lost {
             self.lose(job, &command, checkout.as_deref(), what);

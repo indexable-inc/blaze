@@ -105,6 +105,36 @@ made only of a clone waits for the file to be made, sealed and written back firs
   Guards: `loop stalled` spans (a step of a loop turn over 20 ms) fail an edit's budget, and
   `harness/v2/loop_syscalls.py` holds the loop thread's system calls to 20 ms (ledger T16).
 
+## What the answer waits for (2026-11-11; written, not built or run)
+
+A build's answer waits for the files it names and for no other output. The files it names are
+each unit's artifact files (`Built`'s `path`, `filenames`, `executable`: the uplifted program,
+a library's files) and the lock files it writes: what a person or a script opens the moment
+the command returns, straight from the file system, so the path itself has to hold the file.
+Every other output (a program's copy under `deps` with its hash, dep-info, a file cargo's
+artifact lists none of) is placed after the answer (`Settling::placing` in `serve/job.rs`):
+
+- It goes on exactly as under the job (its mode, the `stat` for its record). A failure is a
+  loss said in the log, `blaze status` and the checkout's next `blaze why`, and the next
+  build that makes the output places it again.
+- A later job's output at a path with an effect in flight waits for it (`Queued`), so two
+  placements of one path never race; a run of the daemon's own (`blaze run`, `blaze test`, a
+  build script) still starts only once its job has nothing in flight, named or not.
+- A stop waits for it as for anything settling; the work between requests (the image, the
+  collections) does not run beside it; the job's build dir leases are held until it ends.
+- A crash before it lands leaves the old file or the new one whole (a rename), and the
+  restarted daemon, knowing of no file it placed, places again: no ordering of anything
+  durable changed.
+- Spans: `the job's answer waits for what it still does` (`function` `its outputs, being
+  placed`, with `named_path=`, `needed=`, `placing=` in `fields`) is now the named files'
+  wait alone; `a build's other outputs are placed after its answer` covers the rest; `an
+  output waits for the path's placement in flight` is a later job's wait for one.
+- Proven by `serve/tests.rs`: `a_builds_answer_waits_for_the_files_it_names_and_places_the_rest_after`,
+  `a_run_asked_right_after_an_answer_waits_for_the_output_still_being_placed`, their controls,
+  `an_output_that_fails_to_be_placed_after_the_answer_is_a_loss_said`, and the crash test
+  `a_crash_after_any_turn_keeps_what_had_settled_and_restores_to_a_fresh_build`, whose crash
+  points now include an output in flight after its answer.
+
 ## Checked by
 
 `harness/v2/clone_out.py`, check `a_second_checkout_adds_only_its_own_bytes`. It builds one
