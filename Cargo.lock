@@ -3981,6 +3981,7 @@ dependencies = [
  "tracing",
  "triomphe",
  "wasm-encoder 0.263.0",
+ "wasmtime",
 ]
 
 [[package]]
