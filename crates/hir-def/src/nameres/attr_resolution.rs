@@ -134,6 +134,7 @@ impl DefMap {
                         // `hir-ty-linear`, from `AttrFlags::LINEAR` and `AttrFlags::CONSUMES`.
                         | "linear"
                         | "consumes"
+                        | "holds"
                         // `#![blaze::arbitrary_ints]`, from `DefMap::arbitrary_ints`
                         // (docs/v2/plan/design/arbitrary-ints.md).
                         | "arbitrary_ints"

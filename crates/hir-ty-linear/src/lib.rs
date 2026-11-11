@@ -47,7 +47,7 @@ use base_db::Db;
 use hir_def::DefWithBodyId;
 use hir_ty_mir::mir::{MirBody, MirSpan};
 
-pub use ty::{contains_linear, is_linear_adt};
+pub use ty::{contains_linear, is_holder_adt, is_linear_adt};
 
 /// An error of the check: a linear value dropped implicitly, or a linear type given where
 /// code may drop it.

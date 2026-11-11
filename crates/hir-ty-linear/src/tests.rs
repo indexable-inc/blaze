@@ -734,3 +734,151 @@ fn f(cx: &Cx, buf: &mut [u8; 4]) -> Result<u32, u32> {{
     ));
     expect(&found, &[]);
 }
+
+/// bstd's `Shared`, `Released` and `Shares` as the check sees them (`crates/blaze-std/src/own`):
+/// `#[blaze::holds]` types whose marked impls admit a linear value when its type is `Acyclic`.
+/// The trait is plain here; that it is derived, with a path in its refusal, is hir-ty-mir's
+/// `where_const` tests.
+const SHARED: &str = "
+trait Acyclic {}
+impl Acyclic for Txn {}
+
+#[blaze::holds]
+struct Shared<#[blaze::linear] T> { inner: *const T }
+
+enum Released<#[blaze::linear] T> { Last(T), NotLast }
+
+fn alloc<T>(value: T) -> *const T { loop {} }
+fn take<T>(from: *const T) -> Option<T> { loop {} }
+
+impl<T> Shared<T> {
+    fn new(value: T) -> Shared<T> { Shared { inner: alloc(value) } }
+}
+impl<#[blaze::linear] T: Acyclic> Shared<T> {
+    #[blaze::consumes]
+    fn holding(value: T) -> Shared<T> { Shared { inner: alloc(value) } }
+    fn share(&self) -> Shared<T> { Shared { inner: self.inner } }
+    #[blaze::consumes]
+    fn release(self) -> Released<T> {
+        match take(self.inner) {
+            Some(value) => Released::Last(value),
+            None => Released::NotLast,
+        }
+    }
+}
+impl<T> Shared<T> {
+    fn cloned(&self) -> Shared<T> { Shared { inner: self.inner } }
+}
+
+#[blaze::linear]
+#[blaze::holds]
+struct Shares<#[blaze::linear] T, const N: usize, const D: usize> { value: *const T }
+impl<#[blaze::linear] T, const N: usize, const D: usize> Shares<T, N, D> {
+    #[blaze::consumes]
+    fn split<const A: usize, const B: usize>(self) -> (Shares<T, A, D>, Shares<T, B, D>) {
+        (Shares { value: self.value }, Shares { value: self.value })
+    }
+    #[blaze::consumes]
+    fn whole(self) -> T { loop {} }
+}
+";
+
+/// A handle over a linear value is linear: released through every handle, and the value the
+/// last one gives back finished, is no error. The holder's own impls move the value by code
+/// the check does not follow, and report nothing.
+#[test]
+fn a_shared_linear_value_released_through_every_handle_gets_no_error() {
+    let found = check(&format!(
+        "{TXN}{SHARED}
+fn f() {{
+    let first = Shared::holding(Txn {{ id: 0 }});
+    let second = first.share();
+    match first.release() {{
+        Released::Last(txn) => txn.commit(),
+        Released::NotLast => {{}}
+    }}
+    match second.release() {{
+        Released::Last(txn) => txn.commit(),
+        Released::NotLast => {{}}
+    }}
+}}
+fn plain() {{
+    let handle = Shared::new(7u32);
+    let _copy = handle.cloned();
+}}
+"
+    ));
+    expect(&found, &[]);
+}
+
+/// A handle left in its scope is the linear error, naming the handle and its type.
+#[test]
+fn a_shared_handle_forgotten_is_an_error() {
+    let found = check(&format!(
+        "{TXN}{SHARED}
+fn f() {{
+    let first = Shared::holding(Txn {{ id: 0 }});
+    let second = first.share();
+    match first.release() {{
+        Released::Last(txn) => txn.commit(),
+        Released::NotLast => {{}}
+    }}
+}}
+"
+    ));
+    expect(&found, &[(&["`second`", "`Shared<Txn>`", "at the end of its scope"], "}")]);
+}
+
+/// The value the last handle gives back is linear again: an arm that drops it is the error.
+#[test]
+fn the_last_value_must_be_finished() {
+    let found = check(&format!(
+        "{TXN}{SHARED}
+fn f() {{
+    let only = Shared::holding(Txn {{ id: 0 }});
+    match only.release() {{
+        Released::Last(_txn) => {{}}
+        Released::NotLast => {{}}
+    }}
+}}
+"
+    ));
+    assert_eq!(found.len(), 1, "{found:#?}");
+    assert!(found[0].0.contains("`Txn`"), "{found:#?}");
+}
+
+/// A linear value goes in only through the impl that admits one: `new` and the copy of an
+/// ordinary handle are refused for it, naming the parameter.
+#[test]
+fn a_linear_value_enters_a_handle_only_where_admitted() {
+    let found = check(&format!(
+        "{TXN}{SHARED}
+fn f() {{
+    let handle = Shared::new(Txn {{ id: 0 }});
+    let _ = handle.release();
+}}
+"
+    ));
+    assert!(
+        found.iter().any(|(message, _)| {
+            message.contains("`Txn`") && message.contains("does not admit linear types")
+        }),
+        "{found:#?}"
+    );
+}
+
+/// A share is linear whatever it holds: each part is split, handed on or taken whole, and one
+/// left is the error.
+#[test]
+fn a_share_dropped_is_an_error() {
+    let found = check(&format!(
+        "{TXN}{SHARED}
+fn whole(all: Shares<u32, 2, 2>) -> u32 {{ all.whole() }}
+fn parts(all: Shares<u32, 2, 2>) -> Shares<u32, 1, 2> {{
+    let (left, right) = all.split::<1, 1>();
+    right
+}}
+"
+    ));
+    expect(&found, &[(&["`left`", "at the end of its scope"], "}")]);
+}

@@ -730,6 +730,7 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                 (Some(Word::blaze), Some(Word::norefcount)) => AttrFlags::NOREFCOUNT,
                 (Some(Word::blaze), Some(Word::linear)) => AttrFlags::LINEAR,
                 (Some(Word::blaze), Some(Word::consumes)) => AttrFlags::CONSUMES,
+                (Some(Word::blaze), Some(Word::holds)) => AttrFlags::HOLDS,
                 (Some(Word::blaze), Some(Word::memo)) => AttrFlags::BLAZE_MEMO,
                 (Some(Word::blaze), Some(Word::reflect)) => AttrFlags::BLAZE_REFLECT,
                 (Some(Word::blaze), Some(Word::sealed)) => AttrFlags::BLAZE_SEALED,
@@ -914,6 +915,7 @@ name_set! {
     export_name,
     fundamental,
     has_significant_drop,
+    holds,
     ignore,
     inline,
     instruction_set,
@@ -1230,6 +1232,13 @@ bitflags::bitflags! {
         /// linear types its by-value parameters have end, so in its body those types are not
         /// linear (`hir-ty-linear`). It changes diagnostics, never code.
         const CONSUMES = 1 << 111;
+        /// `#[blaze::holds]`, a word, on a struct or enum: a value of it holds a value of each
+        /// of its type arguments although no field does (behind a raw or counted pointer), so
+        /// it holds a linear value when an argument does, and the bodies of its own crate's
+        /// impls of it, which move those values in and out by trusted code, are not checked
+        /// for them (`hir-ty-linear`, docs/v2/plan/design/linear.md, rule 7). It changes
+        /// diagnostics, never code.
+        const HOLDS = 1 << 103;
         /// `#[rustc_specialization_trait]`, one segment, on a trait: rustc's
         /// `TraitSpecializationKind::AlwaysApplicable` (`TraitFlags::SPECIALIZATION_ALWAYS_APPLICABLE`).
         const RUSTC_SPECIALIZATION_TRAIT = 1 << 120;

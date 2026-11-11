@@ -41,6 +41,12 @@ pub fn is_linear_adt(db: &Db, adt: AdtId) -> bool {
     AttrFlags::query(db, AttrDefId::AdtId(adt)).contains(AttrFlags::LINEAR)
 }
 
+/// Whether `adt` is marked `#[blaze::holds]`: a value of it holds a value of each of its type
+/// arguments where no field shows one (a counted handle, a container over a raw pointer).
+pub fn is_holder_adt(db: &Db, adt: AdtId) -> bool {
+    AttrFlags::query(db, AttrDefId::AdtId(adt)).contains(AttrFlags::HOLDS)
+}
+
 /// Whether a value of `ty` holds a linear value ([`self`]). Read off `ty` alone: a type
 /// parameter is linear by its own mark, and an associated type by its trait's, never by what a
 /// caller substitutes.
@@ -153,6 +159,10 @@ fn parts<'db>(
             if def.is_box() {
                 return part(args.type_at(0));
             }
+            // A `#[blaze::holds]` type holds its type arguments, whatever its fields are.
+            if is_holder_adt(db, def.def_id()) && args.types().any(&mut *part) {
+                return true;
+            }
             let fields = |variant: VariantId, part: &mut dyn FnMut(Ty<'db>) -> bool| {
                 db.field_types(variant)
                     .iter()
@@ -188,6 +198,34 @@ fn parts<'db>(
     }
 }
 
+/// The type arguments of the `#[blaze::holds]` type that `body`'s item is a method of, when
+/// its impl is in the crate that defines the type; none otherwise.
+fn holder_args<'db>(
+    db: &'db Db,
+    body: &MirBody<'db>,
+    krate: base_db::Crate,
+) -> impl Iterator<Item = Ty<'db>> {
+    let impl_ = match body.owner.generic_def(db) {
+        hir_def::GenericDefId::FunctionId(func) => match hir_def::Lookup::lookup(&func, db).container {
+            hir_def::ItemContainerId::ImplId(impl_) => Some(impl_),
+            _ => None,
+        },
+        _ => None,
+    };
+    let args = impl_.and_then(|impl_| {
+        let self_ty: Ty<'db> = db.impl_self_ty(impl_).instantiate_identity().skip_norm_wip();
+        match self_ty.kind() {
+            TyKind::Adt(def, args)
+                if is_holder_adt(db, def.def_id()) && def.def_id().krate(db) == krate =>
+            {
+                Some(args)
+            }
+            _ => None,
+        }
+    });
+    args.into_iter().flat_map(|args| args.types())
+}
+
 /// What the checks of one body ask of its types.
 pub(crate) struct Types<'a, 'db> {
     pub(crate) db: &'db Db,
@@ -218,6 +256,11 @@ impl<'a, 'db> Types<'a, 'db> {
         {
             exempt.extend(body.param_locals.iter().map(|&it| body.locals[it].ty.as_ref()));
         }
+        // The impls of a `#[blaze::holds]` type in its own crate are where the values it
+        // holds are moved in and out, by code the check cannot follow (a raw pointer, a
+        // count): in their bodies, closures included, the type's arguments are linear
+        // nowhere (rule 7). What they hand back is linear again in the caller.
+        exempt.extend(holder_args(db, body, krate));
         Types {
             db,
             interner,

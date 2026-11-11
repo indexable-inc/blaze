@@ -12,11 +12,11 @@ use hegel::{TestCase, generators as gs};
 use super::*;
 
 /// The walk itself.
-const WALK: &str = include_str!("../../../../blaze-std/src/own/reach.rs");
+pub(crate) const WALK: &str = include_str!("../../../../blaze-std/src/own/reach.rs");
 
 /// What the walk stands on in a fixture: the reflection intrinsics, `raw` over them, and
 /// stand-ins for std's containers with their `Owns` impls.
-const BASE: &str = r#"
+pub(crate) const BASE: &str = r#"
 //- minicore: option, slice, matches, phantom_data, copy, clone, derive, str, panic, pointee, transmute, sized
 #![feature(lang_items, marker_trait_attr)]
 #[lang = "type_id"]
@@ -156,7 +156,7 @@ pub mod reach {
 "#;
 
 /// After the walk: the stand-ins for std's containers.
-const STAND_INS: &str = r#"
+pub(crate) const STAND_INS: &str = r#"
 }
 
 use reach::{Acyclic, Cycle, Inline, Jointly, Mutably, Nothing, Owns, Solely, none};
