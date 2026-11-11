@@ -603,6 +603,37 @@ pub(crate) fn store(
     let items =
         session.items.as_ref().map(body_store::Installed::flush).transpose().map_err(error)?;
     stage("a body's steps of the item store");
+    if let Some(items) = &items {
+        // In the profile, not only under `-v`: after a restart every body's inference and MIR
+        // should be a hit here, and a build where they ran says by these counts whether
+        // nothing was stored (`ran` with no refusal), the step was kept out (`refused`, the
+        // read named most first) or the body has no identity (restore.md, "What an edit
+        // needs").
+        let [infer, mir, borrowck] = &items.steps;
+        let (read, bodies) = items.refused.first().map_or(("", 0), |&(read, bodies)| (read, bodies));
+        tracing::info!(
+            target: "blaze",
+            infer_hits = infer.hits,
+            infer_ran = infer.ran,
+            infer_refused = infer.refused,
+            mir_hits = mir.hits,
+            mir_ran = mir.ran,
+            mir_refused = mir.refused,
+            borrowck_hits = borrowck.hits,
+            borrowck_ran = borrowck.ran,
+            borrowck_refused = borrowck.refused,
+            written = items.written as u64,
+            kept = items.kept as u64,
+            slots_full = items.slots_full as u64,
+            no_identity = items.no_identity,
+            unshareable = items.unshareable,
+            unencodable = items.unencodable,
+            dropped = items.dropped,
+            most_refused_read = read,
+            most_refused_bodies = bodies,
+            "item store flushed"
+        );
+    }
     if let Some(stored) = &stored {
         for krate in &stored.written {
             session.refused.remove(krate);
