@@ -447,8 +447,9 @@ library, every golden model and the proofs. After a deliberate change to the tra
 
 Rule `verified-compiler` needs one thing every proof and every pass is held to: what a MIR
 body means. It is `lean/Blaze/Mir`, a deep embedding of blaze's MIR with an executable
-semantics, for a first subset. `lake build` of `lean/` passes with Lean 4.20.0 up to commit 19916d9159 (2026-11-10); what was
-written after it is marked "not yet checked". The Rust tests of `crates/hir-ty-lean` have
+semantics, for a first subset. `lake build` of `lean/` passes with Lean 4.20.0 up to commit cc0f8f3ee7 (2026-11-11), and
+the gate (below) holds every theorem of `lean/theorems.json`; what was written after a
+checked commit says so where it is described. The Rust tests of `crates/hir-ty-lean` have
 not run, so every embedded body is a prediction of the encoder's output. Objectives V6, V7 and V8 decide it.
 
 **Prior art, and the one lesson taken from each.**
@@ -563,7 +564,7 @@ steps is `Outcome.ofResult` of the model run with `len + 1` turns; with less fue
 encoder's output until the golden test runs; when it differs, the file is rewritten and the
 block theorems of `LedgerMir.lean` (one per block, each failing alone) are redone.
 
-Three more functions are tied the same way (not yet checked by Lean), each a file beside its
+Three more functions are tied the same way (checked by Lean and held by the gate), each a file beside its
 model: `arith::add_one` (`BlazeModel/arith/add_one_agrees.lean`: the value, and the overflow
 panic), `early::clamp` (both branches) and `loops::count` (through `run_loop`, the one
 lemma for loops: an invariant and a variant give the loop's result). The other four goldens
@@ -594,17 +595,151 @@ programs; it is the specification of the Rust pass of the same name.
   its value; one that panics is left, so it still panics). blaze has no Rust pass that only
   folds constants or only removes `nop`s, so those two have no pair to check.
 - **`Sim`** (`Opt/Sim.lean`). A lockstep simulation through a map on states, under an
-  invariant, gives equal runs (`Sim.run`). It is what a pass that renumbers blocks or locals,
-  or removes code nothing reaches, is proved with. It has no such client yet: each needs
-  the functions of `Step.lean` proved to commute with the map (about thirty lemmas), which
-  are not written. So no CFG simplification and no dead-store elimination is proved. A pass
-  that changes the number of steps (threading a `goto`) needs a stuttering form on top.
+  invariant, gives equal runs (`Sim.run`). Its clients are the two renumbering passes below.
+- **The CFG passes: checked by Lean** (`lake build` of `lean/` at 4357e681bf, 2026-11-11;
+  what was written after that commit is marked).
+  - **Control is not memory** (`Opt/Ctl.lean`). Every function of `Step.lean` up to
+    `execStmt` leaves each frame's function, block and return target as they were
+    (`execStmt_ctl`). Each proof below that depends on where control is rests on it.
+  - **The commutation lemmas** (`Opt/Rename.lean`). `State.rename ρ` renames each frame's
+    block by its function's map and its return target by its caller's. Every function of
+    `Step.lean`, in the file's order, commutes with it, up to `execTerm_rename` and
+    `step_rename`. `Opt/Bind.lean` has the four facts about `Outcome.bind` they are applied
+    through, as terms: no proof there rewrites.
+  - **A permutation of blocks** (`Opt/Renumber.lean`, `renumber orders`). The orders are
+    checked by `checkPermutation` (every block listed, the entry block first), which the
+    kernel evaluates; `permuteBlocks_correct` then needs no invariant, and
+    `permuteBlocks_call` says every call gives the same outcome.
+  - **Dead-block removal** (`removeDeadBlocks`). The invariant is stated (`Opt/Reach.lean`,
+    `Reaches`): the running frame is at a kept block and every frame returns to one; it is
+    kept by every step when the kept blocks are closed under jumps (`step_reaches`). The pass
+    computes the blocks block 0 reaches and `checkDead` checks they are closed;
+    `removeDeadBlocks_correct` is under the invariant, `removeDeadBlocks_call` for every
+    call, where it holds of the start state.
+  - **Goto threading** (`Opt/Thread.lean`, `threadGotos`), by the stuttering form of `Sim`
+    (`Stutter`): one step of the target is `k + 1` steps of the source, `k` below a bound
+    `K`. The fuel is stated: a target run of `n` steps that ends is the source's run of
+    `K * n` (`Stutter.run_target`), and a source run of `n` steps that ends is the target's
+    run of `n` (`Stutter.run_source`). For threading `K` is 2. Whole chains are the pass
+    again: `threadGotosN k` threads chains of up to `k` empty blocks, with the bounds
+    composed, `2 ^ k * n` one way and `n` the other (`threadGotosN_target`,
+    `threadGotosN_source`; checked at e15b208b49).
+  - **A `switchInt` whose arms all agree is a `goto`** (`Opt/SwitchSame.lean`,
+    `switchToGoto`; checked at 6a85685c71). A refinement, not an equality: the `goto` drops the
+    evaluation of the discriminant, which here can be undefined, so `switchToGoto_refines`
+    says the rewritten run is the program's unless the program's is undefined. The
+    discriminant must be a `copy` of a place with no index (a `move` changes the state, an
+    index can panic); the Rust `simplify_branch` rewrites those too. The file has what
+    every such pass uses: `run_refines` (steps that refine give runs that refine) and
+    `Outcome.Calm` (a value or undefined, never a panic), proved of reads and plain places.
+  - **Where these cover less than the Rust `SimplifyCfg`** (`optimize/cfg.rs`): it merges a block that ends in a call too, and rewrites a `switchInt` whose
+    discriminant is a `move` or has an index; and
+    `remove_dead_blocks` merges every empty `unreachable` block into one. None of those is
+    specified, so `BlazeValidated` has no `after = spec before` pair for a CFG pass, and
+    `validate`'s normal form does not include them: `validate_sound` is equality of runs
+    with the same fuel from the same state, which a renumbering (the state is renamed) and
+    threading (the fuel differs) do not have. The witness validator is where they join.
+  - **Merging a block into its predecessor** (`Opt/Merge.lean`, `mergeGotos pick`; checked
+    at 2ebcfbbab5). A block that ends in `goto t` gets `t`'s statements and terminator. It is
+    right whatever jumps to `t`, so it is proved for every choice of targets; `mergeSuccessors`
+    chooses as the Rust `merge_successor` does (one predecessor). A stuttering simulation
+    through the identity with bound 2 (`mergeGotos_target`, `mergeGotos_source`). It rests on
+    `execBlockFrom_top`: a block that does not end in a call does the same whatever block
+    the running frame is at; `Opt/MemMap.lean` has the commutation lemmas of `Opt/Rename.lean`
+    for any map on the stack that leaves memory alone, which that needs. A target that ends
+    in a call is not merged (the caller's frame would keep a stale `block` under the
+    callee, so the two states would differ): there the specification covers less.
+  - **Threading through every target, a call's return target too** (`Opt/ThreadCalls.lean`,
+    `threadAll`; checked at 9f791ac218). A frame's `target` is then another block in the
+    threaded program, so states are mapped: `retargetStack` sends each frame's `target`
+    through its caller's map and leaves every `block`; it is a `MemMap`. A terminator from
+    the mapped state gives the mapped next state, or the mapped jump one hop further, and
+    that hop is the program's second step: a stuttering simulation through the map with
+    bound 2 (`threadAll_target`, `threadAll_source`, `threadAll_call_source`).
+  - **Not written: merging a target that ends in a call.** The caller's frame keeps a stale
+    `block` under the callee; the map is `block` renamed on the frames under the running
+    one, another `MemMap`.
+  - **`SimplifyCfg` composed** (`Opt/SimplifyCfg.lean`, `simplifyCfg k`; checked at
+    167c97fb61): `nop`s removed, `k` rounds of threading every target, the `switchInt` rule,
+    dead blocks, merging, then dead blocks, in the order of the Rust loop. Proved of it
+    (`simplifyCfg_call`): a call that ends, and not in undefined behaviour, gives the same
+    outcome with the same fuel, which is what an equality, a refinement and two stuttering
+    simulations have in common. It is not yet the Rust pass block for block (that changes
+    blocks in place with predecessor counts kept as it goes, merges a target that ends in a
+    call, rewrites a `switchInt` on a `move`, merges empty `unreachable` blocks), so
+    `after = spec before` is to be tried per body, and no pair is in `BlazeValidated` yet.
+  - **Dead-store elimination: first piece** (`Opt/Ptr.lean`; checked at eadd58c04c).
+    `MemOk P st` says every pointer in every slot of the state satisfies `P`; a read gives a
+    value whose pointers do (`State.read_ok`) and a write of such a value keeps it
+    (`State.write_ok`).
+  - **Dead-store elimination: second piece** (`Opt/Ids.lean`, `Opt/Borrow.lean`; checked at
+    b248b3e485). `PtrOk B ids p`: the pointer names frame 0, a frame that is gone, or a
+    local its frame's function may borrow (`B`); `StateOk B st`: every pointer in memory is
+    such. Writes and moves keep it, and a place whose base may be borrowed, or that goes
+    through a dereference, evaluates to such a pointer (`evalPlace_ptr`). A frame's id and
+    function are left by statements (`execStmt_ids`, `Opt/Ctl.lean`'s proofs for that
+    pair).
+  - **Dead-store elimination: third piece** (`Opt/BorrowExec.lean`; checked at fc96514550). An
+    operator gives a value with no pointer in it, an operand a value read from memory, a
+    `ref` the pointer its place evaluates to; so a statement keeps the invariant
+    (`execStmt_okAt`) when every `ref` in it is of a place whose base may be borrowed or
+    that goes through a dereference (`StmtFine`: the Rust pass's "ever borrowed" as a
+    condition on the body).
+  - **Dead-store elimination: fourth piece** (`Opt/NextId.lean`, `Opt/BorrowStep.lean`;
+    checked at dde643da71). `Borrows B g st`: `g` lists every frame the run has made, those that
+    returned too, with ids below the next one, and memory holds only pointers to frame 0 or
+    to a local that the function of its frame may borrow. A call adds its frame to `g`, a
+    return leaves it. `step_borrows`: every step keeps it, for a program whose every `ref`
+    is of a place that may be borrowed or goes through a dereference (`ProgFine`).
+  - **Dead-store elimination: fifth piece, first part** (`Opt/SlotAlgebra.lean`; checked
+    at 9d978075d2). The two programs' states are the same but in one slot, which is stated
+    with a map (the one is the other with that slot replaced), so the proof computes with
+    replacements: two of different slots commute (`State.setSlot_comm`), a write elsewhere
+    commutes with one (`State.write_setSlot_other`), and a write of the whole slot forgets
+    it (`State.write_setSlot_same`).
+  - **Dead-store elimination: fifth piece, second part** (`Opt/SlotExec.lean`; checked at
+    9d978075d2). When a slot is the running frame's, of a local its function does not
+    borrow, a statement that mentions the local neither as a place's base nor as an index
+    does the same whatever the slot holds (`execStmt_put`), through every function of
+    `Step.lean` up to `execStmt`.
+  - **`removeOverwritten`** (`Opt/RemoveOverwritten.lean`; checked at cc0f8f3ee7, `removeOverwritten_call` after it): the end
+    theorem of the pieces above. In a block, `l = rv1; ..; l = rv2` becomes
+    `nop; ..; l = rv2` when `l` is a whole local its function never borrows, `rv1` is a copy
+    of a place with no index or a constant, and nothing between mentions `l`. A step runs a
+    whole block, so the two programs' states are equal at every step:
+    `removeOverwritten_refines` is `run_refines_inv` (a refinement of runs under an invariant
+    the source's steps keep) with the block lemma, from every state the borrow invariant
+    holds of, for a program `checkBorrows` accepts (evaluated by the kernel, proved sound);
+    `removeOverwritten_call` is the same for every call whose base slots and arguments have
+    pointers into frame 0 only, where the start state holds the invariant.
+  - **What the Rust `DeadStoreElimination` does beyond it, none specified** (ledger V11):
+    liveness over the whole control-flow graph, unwinding included; every rvalue but a
+    pointer-to-address cast removable, where here only one that cannot panic or move is;
+    `Deinit`; a copy into a call made a move; unused storage markers removed. The global
+    form needs the two states related across steps (equal but, per frame, on the locals
+    dead at its resume point), on `Opt/Ptr`, `Opt/Borrow`, `Opt/BorrowStep`,
+    `Opt/SlotAlgebra`, `Opt/SlotExec`. So no `BlazeValidated` pair for DSE.
 - **A validator proved sound** (`Opt/Validate.lean`). `validate a b` accepts when the two
   programs have one normal form under the proved rewrites; `validate_sound`: an accepted
   pair runs alike for every fuel and state. It takes no witness and accepts only what the
-  normal form identifies. The witness form (a block mapping and per-block symbolic execution
-  to stores of expressions, sound through `Sim`) is not written; the inliner needs a
-  relation between one frame and two beyond that.
+  normal form identifies.
+- **A validator that takes a witness** (`Opt/Witness.lean`; not yet elaborated). The witness
+  is a script: the proved rewrites, in order, that take the program before a pass to the
+  program after it (`Rewrite`: the block-local passes, `switchToGoto`, both threadings,
+  merging, dead-block removal, a block permutation with its orders as data).
+  `validateWith a b w` replays the script on `a` and accepts when it gives `b`, which the
+  kernel decides; `validateWith_sound`: an accepted pair gives every call that ends, and not
+  in undefined behaviour, the same outcome with the same fuel. The Rust pass is then not
+  trusted and need not be a fixed specification block for block: a script that reproduces
+  its output is the evidence, and the pass can say which rewrites it applied.
+  **Not written: the validator by symbolic execution**, which needs no script and accepts
+  rewrites nobody proved one by one (copy propagation, local renumbering, reordering of
+  independent statements). It needs an expression language whose evaluation is proved to
+  agree with `evalRvalue`, each block run on symbolic locals to a normal form (stores of
+  expressions, panics in order, a terminator with a symbolic condition), and `Renumbers`
+  with "the target block is symbolically equal" in place of "is the renamed block"; sound
+  through `Sim`, or `Stutter` when blocks were merged. The inliner needs a relation between
+  one frame and two beyond that; loop transforms need a witness that is not per block.
 - **The Rust passes are held to them by translation validation.** The test
   `the_passes_are_their_lean_specifications` and `mir_semantics.py validate` run each pass
   alone on runtime MIR, embed the body before and after, and Lean checks
