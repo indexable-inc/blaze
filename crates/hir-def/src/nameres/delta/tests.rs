@@ -1234,6 +1234,70 @@ fn a_proc_macro_crate_given_its_macros_after_its_map_was_read_resolves_them_agai
     assert!(failures.is_empty(), "{failures}");
 }
 
+/// An attribute macro's crate resolved before its macros were built names no expander for it,
+/// and an item under the attribute expands to nothing; given its macros later, the item is
+/// expanded again however the attribute is named: by path, by a `use`, through the
+/// `#[macro_use]` prelude, and through another crate's re-export in that prelude
+/// (alloy-sol-macro's `#[macro_use] extern crate proc_macro_error3;` over `#[proc_macro]
+/// #[proc_macro_error] pub fn sol`, whose `sol` was left out of the crate's list of macros).
+#[test]
+fn an_item_under_an_attribute_macro_given_after_its_map_was_read_is_expanded_again() {
+    use hir_expand::proc_macro::ProcMacros;
+
+    const REEXPORT: &str = "//- /reexp.rs crate:reexp\npub use proc_macros::identity;\n";
+    let forms: [(&str, &str, &str); 4] = [
+        ("by path", "", "#[proc_macros::identity]\npub fn sol() {}\n"),
+        ("by a `use`", "", "use proc_macros::identity;\n#[identity]\npub fn sol() {}\n"),
+        (
+            "through the `#[macro_use]` prelude",
+            "",
+            "#[macro_use]\nextern crate proc_macros;\n#[identity]\npub fn sol() {}\n",
+        ),
+        (
+            "through a re-export in the `#[macro_use]` prelude",
+            REEXPORT,
+            "#[macro_use]\nextern crate reexp;\n#[identity]\npub fn sol() {}\n",
+        ),
+    ];
+    let mut failures = String::new();
+    for (form, reexport, text) in forms {
+        let deps = if reexport.is_empty() { "" } else { " deps:reexp" };
+        let mut loaded = Loaded::new(&format!(
+            "//- proc_macros: identity\n//- /main.rs crate:main{deps}\n{text}{reexport}"
+        ));
+        let main = loaded.file("/main.rs");
+        let db = &loaded.db;
+        let main =
+            *all_crates(db).iter().find(|it| it.data(db).root_file_id == main).expect("`main`");
+        let macros = *all_crates(db)
+            .iter()
+            .find(|it| it.data(db).target_kind.is_proc_macro())
+            .expect("`proc_macros`");
+        let built = ProcMacros::get_for_crate(db, macros)
+            .and_then(|it| it.macros().map(<[_]>::to_vec))
+            .expect("listed");
+        let has = |db: &Db| {
+            let map = crate_local_def_map(db, main).def_map(db);
+            map.module(db, map.root).scope(db).get(&name("sol")).take_values().is_some()
+        };
+        assert!(has(&loaded.db), "{form}: loaded with its macros built: no `sol`");
+        ProcMacros::give(
+            &mut loaded.db,
+            [(macros, Err(base_db::ProcMacroLoadingError::NotYetBuilt))],
+        );
+        // Read while the macro has no expander, as a build reads a crate before its macros'.
+        let _ = has(&loaded.db);
+        ProcMacros::give(&mut loaded.db, [(macros, Ok(built))]);
+        if !has(&loaded.db) {
+            failures.push_str(&format!(
+                "{form}: given its built macros after its map was read: no `sol`\n"
+            ));
+        }
+        check_db(&loaded.db, form, &Exempt::NONE, true, &mut failures);
+    }
+    assert!(failures.is_empty(), "{failures}");
+}
+
 /// Three crates: `main` globs `lib`, and `other` depends on neither and neither on it.
 const REACH: &str = "//- /main.rs crate:main deps:lib\npub use lib::*;\n//- /lib.rs crate:lib\npub struct A;\n//- /other.rs crate:other\npub struct O;\n";
 
