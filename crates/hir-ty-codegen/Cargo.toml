@@ -87,6 +87,9 @@ blaze-store-check.workspace = true
 hegeltest.workspace = true
 hir.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
+# Runs what `wasm::lower` writes: a function whose values share locals computes what its IR says
+# (`wasm.rs`'s tests).
+wasmtime.workspace = true
 
 [features]
 # LLVM, linked in (inkwell over llvm-sys): the producer of std and every opt-level 2/3 unit, and
