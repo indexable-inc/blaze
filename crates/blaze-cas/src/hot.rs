@@ -67,6 +67,11 @@ const OPEN_SLOT: u16 = 1;
 /// Pages of one stretch of a pack loaded as it opens: 16 MiB a load.
 const OPEN_PAGES: u64 = 256;
 
+/// Times a page's read is asked again as a pack opens, after it failed (the driver's error,
+/// not a block's check), before the page is left out of memory and refused to its readers:
+/// as many as the store's other IO is tried (`FAILURES_MOST`).
+const OPEN_TRIES: u32 = crate::FAILURES_MOST;
+
 /// Threads the loader's driver reads with where it reads on threads (kqueue, IOCP): a queue
 /// deep enough for an NVMe drive.
 const LOADER_THREADS: usize = 16;
@@ -295,6 +300,8 @@ struct OpenLoad {
     pack: usize,
     /// Why the first of its pages that could not be loaded could not.
     failed: Option<String>,
+    /// Reads of the page at `next` that failed, while it is read a page at a time.
+    tries: u32,
     window: Window,
     /// The pack's byte loaded up to, and where the stretch being read ends.
     next: u64,
@@ -513,18 +520,29 @@ impl Open {
                     reading.take_slot();
                     front.reading = None;
                     front.next = front.stretch;
+                    front.tries = 0;
                 }
                 ReadStep::Failed(error) => {
                     reading.take_slot();
                     front.reading = None;
                     // alloc: the error of a pack that cannot be read, once a pack
                     front.failed.get_or_insert_with(|| error.to_string());
-                    match front.stretch - front.next > PAGE {
+                    // A read the driver failed leaves its page unloaded, to be asked again; a
+                    // block that failed its check, or a page abandoned, is refused for good.
+                    let again = matches!(
+                        error,
+                        PoolError::Load(LoadFailure::Read { .. } | LoadFailure::Short { .. })
+                    );
+                    if front.stretch - front.next > PAGE {
                         // Again, a page at a time, so the pages around the one that failed
                         // are loaded.
-                        true => front.single = front.stretch,
+                        front.single = front.stretch;
+                    } else if again && front.tries + 1 < OPEN_TRIES {
+                        front.tries += 1;
+                    } else {
                         // The page is refused to whoever reads it, naming it.
-                        false => front.next = front.stretch,
+                        front.next = front.stretch;
+                        front.tries = 0;
                     }
                 }
                 ReadStep::NeedSlot => unreachable!("an opening's reading holds its slot"),
@@ -681,7 +699,7 @@ impl Hot {
         }
         let idle = open.opens.is_empty();
         let load =
-            OpenLoad { tier, opening, pack, failed: None, window, next: 0, stretch: 0, single: 0, reading: None };
+            OpenLoad { tier, opening, pack, failed: None, tries: 0, window, next: 0, stretch: 0, single: 0, reading: None };
         // alloc: a pack a pumped store opens, until it is loaded
         open.opens.push_back(load);
         if idle {
