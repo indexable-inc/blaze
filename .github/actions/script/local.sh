@@ -11,12 +11,12 @@ cache=$1
 key=$("$here/key.sh")
 dir="$cache/$key"
 echo "key $key"
-if [ -d "$dir" ]; then
+if [ -f "$dir/KEY" ]; then
   echo hit
-  "$here/check.sh" "$dir" "$key"
 else
   echo miss
-  "$here/build.sh" "$dir" "$key"
+  "$here/build.sh" "$dir" "$key" || { echo "local.sh: the build failed" >&2; exit 1; }
 fi
+"$here/check.sh" "$dir" "$key" || exit 1
 echo "BLAZE_SCRIPTS=$dir"
 "$dir/changed" selftest
