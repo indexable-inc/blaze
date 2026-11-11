@@ -194,6 +194,7 @@ pub(crate) fn write_unsynced(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// nothing). Opened to read, so a file sealed read-only is written back too. Nothing of the
 /// file is made durable: no metadata is committed and no drive cache flushed.
 #[cfg(target_os = "linux")]
+#[expect(unsafe_code, reason = "sync_file_range, the one call that starts a file's write-back")]
 pub(crate) fn write_back(path: &Path) -> io::Result<()> {
     use std::os::fd::AsRawFd as _;
     let file = File::open(path)?;
