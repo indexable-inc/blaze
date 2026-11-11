@@ -1842,6 +1842,7 @@ dependencies = [
  "blaze-spin",
  "hegeltest",
  "http",
+ "miniz_oxide",
 ]
 
 [[package]]
