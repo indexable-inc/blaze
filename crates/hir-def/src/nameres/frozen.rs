@@ -2073,6 +2073,7 @@ impl Enc<'_> {
             handles,
             views,
             pattern_types,
+            early_drop,
             edition,
             recursion_limit,
         } = &**data;
@@ -2089,6 +2090,7 @@ impl Enc<'_> {
         self.bool(*handles);
         self.bool(*views);
         self.bool(*pattern_types);
+        self.bool(*early_drop);
         self.option(*recursion_limit, |enc, it| {
             enc.u32(it);
             Ok(())
@@ -3487,6 +3489,7 @@ impl Dec<'_> {
         data.handles = self.bool()?;
         data.views = self.bool()?;
         data.pattern_types = self.bool()?;
+        data.early_drop = self.bool()?;
         data.recursion_limit = self.option(Self::u32)?;
         data.registered_tools = self.many(Self::symbol)?;
         let mut features = UnstableFeatures::default();

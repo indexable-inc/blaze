@@ -80,7 +80,7 @@ fn list_in(p: &mut Parser<'_>, flavor: Flavor) {
             }
         };
 
-        if !p.at_ts(PARAM_FIRST.union(OUTER_ATTR_FIRST)) {
+        if !at_param_first(p) {
             p.error("expected value parameter");
             m.abandon(p);
             if p.eat(T![,]) {
@@ -90,7 +90,7 @@ fn list_in(p: &mut Parser<'_>, flavor: Flavor) {
         }
         param(p, m, flavor);
         if !p.eat(T![,]) {
-            if p.at_ts(PARAM_FIRST.union(OUTER_ATTR_FIRST)) {
+            if at_param_first(p) {
                 p.error("expected `,`");
             } else {
                 break;
@@ -107,6 +107,13 @@ fn list_in(p: &mut Parser<'_>, flavor: Flavor) {
 }
 
 const PARAM_FIRST: TokenSet = patterns::PATTERN_FIRST.union(types::TYPE_FIRST);
+
+/// Whether a parameter may start here: [`PARAM_FIRST`], an attribute, or under
+/// `#![blaze::records]` the `{` of a record pattern (`|{ a, b }| a + b`) or of a record type
+/// (`fn({ a: u8 })`).
+fn at_param_first(p: &Parser<'_>) -> bool {
+    p.at_ts(PARAM_FIRST.union(OUTER_ATTR_FIRST)) || patterns::at_record_pat(p)
+}
 
 fn param(p: &mut Parser<'_>, m: Marker, flavor: Flavor) {
     match flavor {

@@ -1449,6 +1449,21 @@ impl Printer<'_> {
                     self.print_type_ref(*member);
                 }
             }
+            TypeRef::Record { names, types, defaults } => {
+                // As written: `{ a: T, b: U = default }`, and `{}` for no field.
+                w!(self, "{{");
+                for at in 0..types.len() {
+                    // alloc: printing, the edge; `w!` borrows `self` mutably.
+                    let name = self.store.names(names)[at].display(self.db, self.edition).to_string();
+                    w!(self, "{}{}: ", if at == 0 { " " } else { ", " }, name);
+                    self.print_type_ref(types[at]);
+                    if let Some(default) = defaults.get(at) {
+                        w!(self, " = ");
+                        self.print_expr(default.expr);
+                    }
+                }
+                w!(self, "{}", if types.is_empty() { "}" } else { " }" });
+            }
             TypeRef::UnsafeBinder { lifetimes, ty } => {
                 if lifetimes.is_empty() {
                     w!(self, "unsafe ");

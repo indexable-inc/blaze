@@ -6,7 +6,7 @@ date: 2026-11-10
 # Ownership by reflection: `Acyclic`, `Shared`, `Shares`
 
 A property of a type's shape is const Rust over reflection, stated as a trait with a blanket
-impl (rule `reflection-first`). Written, unbuilt (2026-11-10); ledger rows E16, E17, whose
+impl (rule `reflection-first`). Written, unbuilt (2026-11-10); ledger rows E16, E18, whose
 checks name the tests (`hir-ty-mir` `tests/consteval/reach.rs` and `tests/where_const.rs` first).
 
 ## 1. The walk (`bstd::own::reach`, built)

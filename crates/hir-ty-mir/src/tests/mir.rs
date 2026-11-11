@@ -2,6 +2,7 @@ mod comptime;
 mod comptime_codec;
 mod comptime_parity;
 mod contracts;
+mod early_drop;
 mod eval;
 mod handles;
 mod lower;

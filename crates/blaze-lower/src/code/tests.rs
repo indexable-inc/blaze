@@ -6,7 +6,7 @@ use hegel::generators as gs;
 use span::Edition;
 use syntax::{AstNode, SourceFile};
 
-use super::{CodeText, Plant, code_text_of, planting, root_alone_of};
+use super::{CodeText, Plant, code_text_of, planting, root_alone_of, still_text};
 
 fn code(text: &str) -> CodeText {
     let parse = SourceFile::parse(text, Edition::CURRENT);
@@ -918,4 +918,136 @@ fn a_plain_bodys_edit_is_in_the_code_text_and_not_the_interface() {
         assert_ne!(before.inert, after.inert, "{kind:?}");
         assert_ne!(before.strict, after.strict, "{kind:?}");
     }
+}
+
+fn still(text: &str) -> ContentId {
+    still_text(text, Edition::CURRENT)
+}
+
+/// The oracle of the still text ([`super::still_text_of`]): the still text of `items` and of
+/// `items` after `edit` of item `at` are one exactly when the edit is of what no code text
+/// holds whole (a `//` comment at a line's end, spaces before a line's end, what is after the
+/// last token); and two files of one still text have every code text equal, each hash and
+/// each flag, so no unit keyed by code texts tells them apart.
+fn check_still(items: &[Item], at: usize, edit: Own) -> Result<(), String> {
+    let (before, after, _) = own_edited(items, at, edit);
+    let left_out = matches!(edit, Own::Of(Edit::Comment) | Own::Spaces | Own::Ending);
+    let same = still(&before) == still(&after);
+    match (left_out, same) {
+        (true, false) => Err(format!(
+            "{:?} {edit:?}: it is of what no code text holds, and the still text moved",
+            items[at].kind
+        )),
+        (false, true) => Err(format!(
+            "{:?} {edit:?}: a token, a position or a comment a text may hold moved, and the still text is as it was",
+            items[at].kind
+        )),
+        (true, true) if code(&before) != code(&after) => Err(format!(
+            "{:?} {edit:?}: one still text, and a code text that differs",
+            items[at].kind
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The invariant: a file's still text ([`super::still_text_of`]) changes with every edit but
+/// one of what no code text holds whole, and two files of one still text have every code
+/// text equal. What the no-op lane rests on when it answers a build whose files changed
+/// (blaze-cargo's `serve::job::noop`): a changed source of one still text is in every unit's
+/// key as it was.
+/// Drawn: up to five items of any kind, some with a comment at a line's end already, and one
+/// edit of one of them.
+#[hegel::test]
+fn a_files_still_text_moves_with_every_edit_but_what_no_code_text_holds(tc: TestCase) {
+    let drawn: Vec<(u8, u8, u8, u8)> = tc.draw(
+        gs::vecs(gs::tuples!(
+            gs::integers().max_value(10),
+            gs::integers().max_value(2),
+            gs::integers().max_value(9),
+            gs::integers().max_value(3)
+        ))
+        .min_size(1)
+        .max_size(5),
+    );
+    let items: Vec<Item> = drawn
+        .iter()
+        .map(|&(kind, sig, value, laid)| Item {
+            kind: KINDS[usize::from(kind)],
+            sig,
+            value,
+            long: laid & 1 != 0,
+            gated: false,
+            noted: laid & 2 != 0,
+        })
+        .collect();
+    let at: usize = tc.draw(gs::integers().max_value(items.len() - 1));
+    let edit: usize = tc.draw(gs::integers().max_value(OWN.len() - 1));
+    if let Err(found) = check_still(&items, at, OWN[edit]) {
+        panic!("{found}\n{}", file(&items));
+    }
+}
+
+/// Every edit of every kind of item, one item a file: the still text's oracle case by case.
+#[test]
+fn a_files_still_text_holds_every_edit_of_every_kind_of_item() {
+    for kind in KINDS {
+        for edit in OWN {
+            let item = Item { kind, sig: 0, value: 1, long: false, gated: false, noted: false };
+            assert_eq!(check_still(&[item], 0, edit), Ok(()), "{kind:?} {edit:?}");
+        }
+    }
+}
+
+/// With a still text that leaves a token out (a number's digits), an edit of a body's digit
+/// leaves it as it was, and the lane would say a stale answer: the oracle says so.
+#[test]
+fn the_oracle_catches_a_still_text_that_drops_a_token() {
+    let item =
+        Item { kind: Kind::Plain, sig: 0, value: 1, long: false, gated: false, noted: false };
+    let edit = Own::Of(Edit::Body);
+    assert_eq!(check_still(&[item], 0, edit), Ok(()));
+    assert_eq!(
+        planting(Plant::Stale, || check_still(&[item], 0, edit)),
+        Err("Plain Of(Body): a token, a position or a comment a text may hold moved, and the still text is as it was".to_owned())
+    );
+}
+
+/// What the still text leaves out, case by case, and what it keeps that a code text holds
+/// only the shape of: a doc comment's words, a block comment's.
+#[test]
+fn the_still_text_leaves_out_what_ends_a_line_and_nothing_else() {
+    let bare = still("fn f() {\n    g();\n}\n");
+    for same in [
+        "fn f() { // opens\n    g();   // calls\n}\n",
+        "fn f() {  \n    g();\t\n}\n",
+        "fn f() {\n    g();\n}\n// c\n",
+        "fn f() {\n    g();\n}\n\n\n// one\n    // two\n\n",
+        "fn f() {\n    g();\n}",
+        "fn f() {\n    g();\n} // c",
+    ] {
+        assert_eq!(bare, still(same), "{same:?}");
+    }
+    for (text, what) in [
+        ("fn f() {\n    h();\n}\n", "a token"),
+        ("fn f() {\n     g();\n}\n", "a column"),
+        ("fn f() {\n\n    g();\n}\n", "a line"),
+        ("// c\nfn f() {\n    g();\n}\n", "a comment on a line of its own, a line more"),
+        ("fn f() { /* c */\n    g();\n}\n", "a block comment"),
+        ("fn f() { // \u{202E}\n    g();\n}\n", "a comment the compiler reads"),
+        ("fn f() {\n    g();\n}\n/// doc\n", "a doc comment after the last item"),
+    ] {
+        assert_ne!(bare, still(text), "{what}: {text:?}");
+    }
+    // A doc comment's words are in the still text, where a code text holds its shape.
+    let (one, two) = ("/// one\nfn f() {}\n", "/// two\nfn f() {}\n");
+    assert_eq!(code(one), code(two));
+    assert_ne!(still(one), still(two));
+    // A comment's text on a line of its own is left out; its line stays.
+    assert_eq!(still("// one\nfn f() {}\n"), still("// two, longer\nfn f() {}\n"));
+    assert_eq!(still("\nfn f() {}\n"), still("    // one\nfn f() {}\n"));
+    // What looks like a comment inside a string is the string.
+    assert_ne!(
+        still("const A: &str = \"a // b\";\n"),
+        still("const A: &str = \"a // c\";\n")
+    );
 }

@@ -390,6 +390,10 @@ struct DefMapCrateData {
     /// blaze: `#![blaze::pattern_types]`, under which `T is PAT` is a type and a pattern type
     /// may name enum variants (docs/v2/plan/design/edition.md, section 8).
     pattern_types: bool,
+    /// blaze: `#![blaze::early_drop]`, under which a local whose destructor only frees memory
+    /// is dropped after its last use (docs/v2/plan/design/early-drop.md;
+    /// `hir_ty_mir::mir::early_drop`).
+    early_drop: bool,
 
     edition: Edition,
     recursion_limit: Option<u32>,
@@ -412,6 +416,7 @@ impl DefMapCrateData {
             handles: false,
             views: false,
             pattern_types: false,
+            early_drop: false,
             edition,
             recursion_limit: None,
         }
@@ -432,6 +437,7 @@ impl DefMapCrateData {
             handles: _,
             views: _,
             pattern_types: _,
+            early_drop: _,
             edition: _,
             recursion_limit: _,
         } = self;
@@ -1204,6 +1210,13 @@ impl DefMap {
     #[inline]
     pub fn pattern_types(&self) -> bool {
         self.data.pattern_types
+    }
+
+    /// Whether the crate says `#![blaze::early_drop]`, so that a local whose destructor only
+    /// frees memory is dropped after its last use (`hir_ty_mir::mir::early_drop`).
+    #[inline]
+    pub fn early_drop(&self) -> bool {
+        self.data.early_drop
     }
 
     /// The integer of an arbitrary width `name` names in this crate, as the builtin scope's

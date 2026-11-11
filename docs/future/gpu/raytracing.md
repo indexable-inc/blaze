@@ -6,7 +6,8 @@ date: 2026-11-02
 # Ray tracing
 
 This builds on [plan.md](plan.md): the same `#[gpu::kernel]`, the same one-session compile, the
-same `Device` backends. Nothing here is built.
+same `Device` backends. The first piece is being built: an opaque-only inline query on Metal
+(`Tlas::trace` and `Tlas::occluded`), in [shaders.md](shaders.md#compute-kernels-and-inline-ray-query-phase-3b).
 
 ## What each API offers
 
@@ -63,6 +64,27 @@ How each backend lowers it:
   that writes to `out` mid-loop, is a typed error naming the kernel. It never silently runs
   somewhere slower.
 - **The CPU** uses Embree's query API, or a BVH blaze owns, under the same loop.
+
+### As built first: opaque queries through naga
+
+The backend is shaders.md's (MIR to naga IR, then naga's MSL writer, which writes Metal's
+`intersection_query`), not SPIR-V or SPIRV-Cross, so the Metal row above comes before the Vulkan
+one. The first API is the one a query loop with no candidate work reduces to:
+
+```rust
+pub fn trace(&self, ray: Ray, mask: u32) -> Option<Hit>; // FORCE_OPAQUE, the closest hit
+pub fn occluded(&self, ray: Ray, mask: u32) -> bool;     // FORCE_OPAQUE | ACCEPT_FIRST_HIT_AND_END_SEARCH
+```
+
+Both are Rust over one intrinsic, `Tlas::query(ray, flags, mask)`, which lowers to one naga
+query in a local variable: `Initialize` with the ray, a `loop` of
+`Proceed` that breaks when it returns false, and `RayQueryGetIntersection { committed: true }`,
+read into a plain struct by member name; its `kind` (none or triangle, the only kinds an opaque
+query commits) picks `None` or `Some` in Rust.
+`Hit` is a plain Rust struct of the committed intersection's fields (`t`, `instance_index`,
+`instance_custom_index`, `geometry_index`, `primitive_index`, `barycentrics`, `front_face`); the
+object-to-world matrices are left out until a user needs them. `RayQuery::new` and `proceed` with
+`Candidate` arms (above) come next, for alpha-tested and procedural geometry.
 
 ## Pipeline second
 

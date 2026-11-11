@@ -82,6 +82,15 @@ pub(crate) struct Finished<K> {
     left: HashMap<K, u32, Global>, // alloc: one entry a crate, once per build
     /// Crates whose every unit compiled, in the order the last one did, not taken yet.
     ready: Vec<K>,
+    /// The units found kept as they began ([`Finished::kept`]): replayed from the store, with
+    /// nothing of the front end made for them in this build.
+    kept: Vec<bool>,
+    /// The crates a unit of which compiled without being found kept: what this build made
+    /// something of in its front end.
+    made: HashMap<K, (), Global>, // alloc: one entry a crate made, once per build
+    /// Whether a crate of `ready` is one of `made`: a release now has something of this
+    /// build's to let go ([`Finished::has_made`]).
+    ready_made: bool,
     /// Units [`Stand::Open`]. A unit that panicked stays open (no compile ends it), and the
     /// build's MIR then goes only when memory is short or the front end is kept.
     open: u32,
@@ -95,7 +104,25 @@ impl<K: Copy + Eq + Hash> Finished<K> {
             *left.entry(*krate).or_insert(0) += 1;
         }
         let stands = vec![Stand::NotBegun; of.len()]; // alloc: a stand a unit, once per build
-        Finished { of, stands, left, ready: Vec::new(), open: 0 }
+        let kept = vec![false; of.len()]; // alloc: a flag a unit, once per build
+        Finished {
+            of,
+            stands,
+            left,
+            ready: Vec::new(),
+            kept,
+            made: HashMap::new_in(Global), // alloc: as the field
+            ready_made: false,
+            open: 0,
+        }
+    }
+
+    /// Unit `unit` was found kept as it began: its record and outputs are in the store, and
+    /// its compile replays them. Told before its compile ends; a unit not told counts as made.
+    pub(crate) fn kept(&mut self, unit: usize) {
+        if let Some(kept) = self.kept.get_mut(unit) {
+            *kept = true;
+        }
     }
 
     /// Unit `unit`'s first task started. A build script's run has no crate and no compile to
@@ -121,10 +148,14 @@ impl<K: Copy + Eq + Hash> Finished<K> {
         }
         *stand = Stand::Compiled;
         let Some(krate) = self.of[unit] else { return };
+        if !self.kept.get(unit).copied().unwrap_or(false) {
+            self.made.insert(krate, ());
+        }
         if let Some(left) = self.left.get_mut(&krate) {
             *left -= 1;
             if *left == 0 {
                 self.ready.push(krate); // alloc: a crate a build, at most
+                self.ready_made |= self.made.contains_key(&krate);
             }
         }
     }
@@ -138,8 +169,16 @@ impl<K: Copy + Eq + Hash> Finished<K> {
         !self.ready.is_empty()
     }
 
+    /// Whether a crate finished since the last take is one this build made something of: a
+    /// unit of it compiled that was not found kept. A crate whose units were all found kept
+    /// is finished and holds nothing of this build's to let go.
+    pub(crate) fn has_made(&self) -> bool {
+        self.ready_made
+    }
+
     /// The crates finished since the last take.
     pub(crate) fn take(&mut self) -> Vec<K> {
+        self.ready_made = false;
         std::mem::take(&mut self.ready)
     }
 }
@@ -424,6 +463,11 @@ impl<K: Copy + Eq + Hash> Release<K> {
         self.finished.began(unit);
     }
 
+    /// Unit `unit` was found kept as it began ([`Finished::kept`]).
+    pub(crate) fn kept(&mut self, unit: usize) {
+        self.finished.kept(unit);
+    }
+
     /// Unit `unit` compiled, memory read by `now` (only if it can matter): a check's as any
     /// build's, since memory past the limit stays past it until something is let go.
     pub(crate) fn compiled_under(&mut self, unit: usize, now: impl FnOnce() -> Pressure) {
@@ -462,12 +506,20 @@ impl<K: Copy + Eq + Hash> Release<K> {
     }
 
     /// Whether the build should stop its readers for a release: memory makes one due, the
-    /// build is over, or the build compiles and no unit is open and a crate is finished (no
-    /// reader to wait for).
+    /// build is over, or the build compiles and no unit is open and a crate this build made
+    /// something of is finished (no reader to wait for).
+    ///
+    /// A crate whose units were all found kept makes none due. Until 2026-11-10 it did: a
+    /// warm build finds every dependency's unit kept as it begins, so "no unit open and a
+    /// crate finished" held before the first task, and the loop ran a whole release then
+    /// (`UnitWriter::apply`: every crate's drop, the heap given back, two reads of the
+    /// process's memory; about 100 ms of the first `loop turn` of every body edit) to let go
+    /// of nothing this build had made. Such a crate still goes with the next release, one a
+    /// made crate or memory makes due, or the build's end's, which no loop runs.
     pub(crate) fn due(&self) -> bool {
         self.pressed
             || self.ended
-            || (self.compiles && self.finished.idle() && self.finished.has_ready())
+            || (self.compiles && self.finished.idle() && self.finished.has_made())
     }
 
     /// What a release now lets go of, taking it (a second plan is of what finished since);

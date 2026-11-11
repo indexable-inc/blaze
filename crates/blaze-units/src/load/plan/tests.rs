@@ -245,6 +245,59 @@ fn the_workspace_sets_blaze_lints_in_its_metadata() {
     assert_eq!(unknown.at.as_deref(), Some("/w/Cargo.toml"));
 }
 
+/// A line of `[workspace.metadata.blaze.lints-when-ready]` is its flag exactly when the
+/// lint's switch is on, and nothing until then: the one line of blaze's own manifest that
+/// turns `blaze::std_use` on for every crate once bstd is in the tree
+/// (`ready::BSTD_IN_TREE`). A lint with no switch has nothing to wait for.
+#[test]
+fn a_lint_of_the_when_ready_table_is_set_once_its_switch_is_on() {
+    use blaze_lint_defs::ready;
+    let manifest = Path::new("/w/Cargo.toml");
+    let of = |text: &str| {
+        flags::workspace_lints(Some(&toml::Value::Table(toml::from_str(text).unwrap())), manifest)
+    };
+    let waiting =
+        of("[blaze.lints]\nhot_alloc = \"deny\"\n[blaze.lints-when-ready]\nstd_use = \"warn\"\n")
+            .unwrap();
+    let expected: &[&str] = match ready::BSTD_IN_TREE {
+        true => &["--deny=blaze::hot_alloc", "--warn=blaze::std_use"],
+        false => &["--deny=blaze::hot_alloc"],
+    };
+    assert_eq!(waiting, expected);
+    assert_eq!(ready::switch_of("std_use"), Some(ready::BSTD_IN_TREE));
+    let alone = of("[blaze.lints-when-ready]\nstd_use = \"deny\"\n").unwrap();
+    assert_eq!(alone.len(), usize::from(ready::BSTD_IN_TREE), "with no `lints` table beside it");
+    let none = of("[blaze.lints-when-ready]\nhot_alloc = \"warn\"\n").unwrap_err();
+    assert_eq!(
+        none.what,
+        "[workspace.metadata.blaze.lints-when-ready] in /w/Cargo.toml: `hot_alloc` has no switch in blaze-lint-defs' `ready` to wait for: set its level in [workspace.metadata.blaze.lints]"
+    );
+    let unknown = of("[blaze.lints-when-ready]\nstd_uses = \"warn\"\n").unwrap_err();
+    assert_eq!(
+        unknown.what,
+        "[workspace.metadata.blaze.lints-when-ready] in /w/Cargo.toml: `std_uses` is no lint or group of blaze's (`blaze::std_uses`)"
+    );
+    let level = of("[blaze.lints-when-ready]\nstd_use = \"when-ready\"\n").unwrap_err();
+    assert!(level.what.ends_with("the level of `std_use` is `allow`, `warn`, `deny` or `forbid`"));
+    // blaze's own manifest has the line, so flipping the switch is the whole change.
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.toml");
+    let text = std::fs::read_to_string(root).unwrap_or_else(|error| panic!("{root}: {error}"));
+    let table: toml::Table = toml::from_str(&text).unwrap();
+    let metadata = table.get("workspace").and_then(|it| it.get("metadata"));
+    let own = flags::workspace_lints(metadata, manifest).unwrap();
+    assert_eq!(
+        own.iter().any(|it| it == "--warn=blaze::std_use"),
+        ready::BSTD_IN_TREE,
+        "the workspace's own tables: {own:?}"
+    );
+    let line = metadata
+        .and_then(|it| it.get("blaze"))
+        .and_then(|it| it.get("lints-when-ready"))
+        .and_then(|it| it.get("std_use"))
+        .and_then(toml::Value::as_str);
+    assert_eq!(line, Some("warn"), "the line is in {root}");
+}
+
 /// A package's `[lints.blaze]` names blaze's lints as the workspace's table does.
 #[test]
 fn a_packages_unknown_blaze_lint_is_an_error_naming_it() {
@@ -728,6 +781,7 @@ fn unit(
                 noprelude: None,
                 nounused: None,
                 dev: false,
+                gpu: false,
             })
             .collect(),
     }
@@ -885,6 +939,7 @@ fn plan_app_as(target: Option<&str>, lints: bool) -> (PathBuf, Vec<UnitPlan>, St
         host: HOST,
         target,
         macro_wasm: None,
+        gpu: None,
         requested_profile: "dev",
         profile_dir: "debug",
         base_profile: &base_profile,

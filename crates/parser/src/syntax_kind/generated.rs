@@ -362,6 +362,9 @@ pub enum SyntaxKind {
     // blaze's error unions (`#![blaze::error_unions]`, docs/v2/plan/design/edition.md), after
     // the others too.
     UNION_TYPE,
+    // blaze's record types (`#![blaze::records]`, docs/v2/plan/design/records.md), after the
+    // others too.
+    RECORD_TYPE,
     #[doc(hidden)]
     __LAST,
 }
@@ -482,6 +485,7 @@ impl SyntaxKind {
             | UNSAFE_BINDER_TYPE
             | SPEC_CLAUSE
             | UNION_TYPE
+            | RECORD_TYPE
             | OR_PAT
             | PARAM
             | PARAM_LIST

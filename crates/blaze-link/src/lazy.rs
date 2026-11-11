@@ -375,6 +375,7 @@ impl<S: Slots> LazyPlacer<S> {
             let align = scratch.lay_out(image, function)?;
             let range = memory.reserve(scratch.len, align).map_err(|it| fail(it.what))?;
             match scratch.write(image, &mut memory, function, range, slide) {
+                // identity: an address moved by the image's slide; no identity is made
                 Ok(linked) => (index, range, linked.wrapping_add(slide)),
                 Err(error) => {
                     memory.unreserve(range).map_err(|it| fail(it.what))?;

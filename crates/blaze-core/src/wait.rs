@@ -22,6 +22,10 @@
 //! descriptor ([`pollable`]) and a sleep ([`sleep_until`]). The park's protocol and the reap's
 //! are sans-IO cores (`wait/parking.rs`, `wait/reaping.rs`), proven by the DST in `wait/tests.rs`.
 //!
+//! On macOS a [`Parker`] waits on its word's address too, through the same core
+//! (`wait/macos.rs`: `os_sync_wait_on_address_with_deadline` to an absolute Mach time and
+//! `os_sync_wake_by_address_any`; docs/macos.md).
+//!
 //! A process inside blaze's sandbox, whose seccomp filter refuses io_uring, makes the same
 //! waits with direct system calls instead (`wait/direct.rs`: `futex`, `ppoll`, `pidfd_open`,
 //! `waitid`, `clock_nanosleep`), over the same cores. Which of the two a process uses is chosen
@@ -49,10 +53,19 @@ pub use self::{
 )]
 mod direct;
 #[cfg(target_os = "linux")]
+#[expect(
+    unsafe_code,
+    reason = "test support: the seccomp filter a case runs under, and io_uring_setup asked once to see it refused"
+)]
+pub mod filtered;
+#[cfg(target_os = "linux")]
 #[expect(unsafe_code, reason = "Linux's waits: io_uring_enter, one call")]
 mod linux;
 #[cfg(target_os = "macos")]
-#[expect(unsafe_code, reason = "macOS's waits: kevent and mach_wait_until, one call each")]
+#[expect(
+    unsafe_code,
+    reason = "macOS's waits: kevent, mach_wait_until and the wait on an address and its wake, one call each"
+)]
 mod macos;
 #[cfg(not(any(unix, windows)))]
 mod other;
@@ -166,11 +179,13 @@ pub fn until<T>(
 /// On Linux the park is `IORING_OP_FUTEX_WAIT` on the thread's wait ring and the unpark
 /// `IORING_OP_FUTEX_WAKE` on the waker's (a plain `FUTEX_WAKE` from a thread with no ring), or,
 /// in a process that chose the direct driver ([`choose`]), `FUTEX_WAIT_BITSET` to an absolute
-/// time and `FUTEX_WAKE`; elsewhere std's park, until those systems' address waits land. Only
-/// one thread parks on a `Parker`; nothing signals it.
+/// time and `FUTEX_WAKE`. On macOS the park is `os_sync_wait_on_address_with_deadline` on the
+/// word to an absolute Mach time and the unpark `os_sync_wake_by_address_any` (`wait/macos.rs`).
+/// Elsewhere std's park, until that system's address wait lands. Only one thread parks on a
+/// `Parker`; nothing signals it.
 pub struct Parker {
     word: std::sync::atomic::AtomicU32,
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     thread: crate::lock::Lock<Option<std::thread::Thread>>,
 }
 
@@ -178,7 +193,7 @@ impl Parker {
     pub fn new() -> Parker {
         Parker {
             word: std::sync::atomic::AtomicU32::new(parking::EMPTY),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             thread: crate::lock::Lock::unrecorded("wait.parker.thread", None),
         }
     }
@@ -215,7 +230,13 @@ impl Parker {
         ring::Futexes
     }
 
-    #[cfg(not(target_os = "linux"))]
+    /// macOS's wait on an address: its futex.
+    #[cfg(target_os = "macos")]
+    fn kernel(&self) -> macos::Addresses {
+        macos::Addresses
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn kernel(&self) -> ThreadPark<'_> {
         ThreadPark(&self.thread)
     }
@@ -229,10 +250,10 @@ impl Default for Parker {
 
 /// The park of a system with no wait of this module on an address yet: std's thread park,
 /// the thread recorded before it says it is parked.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 struct ThreadPark<'a>(&'a crate::lock::Lock<Option<std::thread::Thread>>);
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 impl parking::Futex for ThreadPark<'_> {
     fn prepare(&self, _: &std::sync::atomic::AtomicU32) {
         *self.0.lock() = Some(std::thread::current());

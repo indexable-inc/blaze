@@ -13,15 +13,19 @@ use hir_ty::{
         AsmOperand, AssertKind, BasicBlockId, BinOp, CastKind, LocalId, MirBody, Operand,
         OperandKind, Rvalue, StatementKind, StoredPlace, TerminatorKind,
     },
-    next_solver::{GenericArgs, TyKind},
+    next_solver::{GenericArgs, StoredGenericArgs, TyKind},
 };
-use hir_ty_verus::{Clause, proved};
+use hir_ty_lean::{NotProved, ProofKey};
 use rustc_type_ir::inherent::IntoKind as _;
 
 use crate::{
     Entry, Fact, How, Use,
     clause::{self, ReturnBound},
 };
+
+/// Whether the `ensures` of a function (with its generic arguments) is proved, and by which
+/// proof.
+pub type Prove<'a> = dyn Fn(FunctionId, StoredGenericArgs) -> Result<ProofKey, NotProved> + 'a;
 
 /// How many copies and casts may stand between a call's destination and an index.
 const MAX_STEPS: u32 = 8;
@@ -30,7 +34,15 @@ const MAX_STEPS: u32 = 8;
 /// facts it used, one per check removed, in block order. A check is kept wherever the fact is
 /// not proved, not of the one form read, or not shown to be about the very value the check
 /// tests; keeping a check is always correct.
-pub fn use_proved_contracts<'db>(db: &'db Db, body: &mut MirBody<'db>) -> Vec<Fact> {
+///
+/// `prove` answers whether a callee's `ensures` is proved: [`hir_ty_lean::proved`] with the
+/// place of the callee's crate's proofs. An `ensures` it does not prove is reported by name,
+/// with why (the event `contracts.not_proved`), and its check stays.
+pub fn use_proved_contracts<'db>(
+    db: &'db Db,
+    body: &mut MirBody<'db>,
+    prove: &Prove<'_>,
+) -> Vec<Fact> {
     let owner = owner_path(db, body.owner);
     let _span =
         tracing::info_span!(target: "blaze", "contracts.use_proved", owner = %owner).entered();
@@ -66,7 +78,7 @@ pub fn use_proved_contracts<'db>(db: &'db Db, body: &mut MirBody<'db>) -> Vec<Fa
             let at = match callees.iter().position(|(it, _)| *it == callee) {
                 Some(at) => at,
                 None => {
-                    callees.push((callee, usable(db, callee, args)));
+                    callees.push((callee, usable(db, callee, args, prove)));
                     callees.len() - 1
                 }
             };
@@ -127,15 +139,19 @@ struct Usable {
 
 /// What a call of `callee` returns is bounded by a proved `ensures`, if it is. The clause is
 /// read first, so a callee with nothing usable never reaches the solver.
-fn usable(db: &Db, callee: FunctionId, args: GenericArgs<'_>) -> Option<Usable> {
+fn usable(
+    db: &Db,
+    callee: FunctionId,
+    args: GenericArgs<'_>,
+    prove: &Prove<'_>,
+) -> Option<Usable> {
     let contract = clause::contract(db, callee);
     let bound = contract.bound?;
     let entry = match contract.has_requires {
         false => Entry::NoRequires,
         true if callee.krate(db).cfg_options(db).contract_checks() => Entry::RequiresChecked,
         // A proved `ensures` assumes the `requires`, which nothing checks here; using the
-        // `requires` at the call site needs `Clause::Requires`, which lane verus does not answer
-        // yet.
+        // `requires` at the call site needs it proved there, which Lean v0 does not do.
         true => return None,
     };
     let key = {
@@ -145,9 +161,15 @@ fn usable(db: &Db, callee: FunctionId, args: GenericArgs<'_>) -> Option<Usable> 
             callee = %blaze_items::key::path(db, ItemId::Function(callee)),
         )
         .entered();
-        proved(db, callee, args.store(), Clause::Ensures)?
+        match prove(callee, args.store()) {
+            Ok(key) => key,
+            Err(not_proved) => {
+                tracing::info!(target: "blaze", why = %not_proved, "contracts.not_proved");
+                return None;
+            }
+        }
     };
-    Some(Usable { bound, entry, how: How::Verus(key) })
+    Some(Usable { bound, entry, how: How::Lean(key) })
 }
 
 /// The function a call at the end of `block` calls directly, with its (empty) generic

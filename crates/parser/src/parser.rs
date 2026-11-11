@@ -97,6 +97,14 @@ impl<'t> Parser<'t> {
         self.inp.extensions_at(self.pos).error_unions()
     }
 
+    /// Whether the current token, a `{`, is of a crate that says `#![blaze::records]`: only then
+    /// does the grammar read it as a record type, value or pattern
+    /// (docs/v2/plan/design/records.md). A `{` another crate wrote (a macro's own, expanded
+    /// here) is Rust's.
+    pub(crate) fn records_gate(&self) -> bool {
+        self.inp.extensions_at(self.pos).records()
+    }
+
     /// Runs `parse` with error unions allowed (`true`, inside a delimiter: only when some
     /// token of the input has the extension) or not (`false`), then puts back what was allowed
     /// before.

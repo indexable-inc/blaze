@@ -457,6 +457,11 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
 
             _ => unreachable!(),
         };
+        // blaze: a record argument (`#![blaze::records]`) takes the defaults of the parameter
+        // it is passed for, which only a function named in the call declares.
+        if let Some(hir_def::CallableDefId::FunctionId(function)) = def_id {
+            self.note_record_arguments(function, 0, arg_exprs);
+        }
 
         // Replace any late-bound regions that appear in the function
         // signature with region variables. We also have to

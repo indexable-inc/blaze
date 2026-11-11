@@ -72,7 +72,8 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 25. **deterministic-output**: No output depends on hash-map order, thread timing, addresses or the wall
     clock; a test builds twice and compares bytes. Skill: `compiler-correctness`.
 26. **persisted-state-round-trips**: Anything persisted has a restore test equal byte for byte to a
-    fresh build; a restore never silently starts empty. Skill: `testing`.
+    fresh build and a test that a file of its previous layout is handled; a restore never silently
+    starts empty. Skill: `testing`.
 27. **no-wait-across-thread-locals**: Hold nothing tied to a thread (a thread-local borrow, a lock
     guard, an `Rc`) across a wait. Skill: `runtime-code`.
 28. **best-long-term-design**: Pick the best long-term design, not the least work, and spend the effort
@@ -143,6 +144,17 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 54. **guard-the-cause**: When you find bad code or a bad decision, find why it was made and remove that
     cause with a guard (a lint, a check in the gate, a rule or a skill's instruction), so it cannot
     be written again; do this unasked. Skill: `changing-code`.
+55. **own-the-language**: blaze owns its compiler: never design around what stable Rust lacks; when the
+    right design needs a feature Rust has not stabilized or does not have (const generic
+    expressions, for one), build it properly in blaze as an opt-in extension. Skill:
+    `compiler-correctness`.
+56. **reflection-first**: Derive a property of a type or a function with blaze's compile-time
+    reflection, not an auto trait, a proc macro or a special case in the compiler, wherever
+    reflection is the more powerful; where reflection cannot yet say something that is possible,
+    improve the language until it can. Skill: `compiler-correctness`.
+57. **verified-compiler**: The goal is a formally verified blaze: one executable Lean semantics of MIR
+    is the specification, every MIR pass is proved or translation-validated against it, proofs are
+    checked in the gate, and what is still trusted is listed. Skill: `testing`.
 
 ## Code Review Rules
 

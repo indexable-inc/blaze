@@ -1269,6 +1269,89 @@ fn only_a_unit_that_uses_an_artifact_dependency_is_refused() {
     assert!(refused.contains("of `a` depends on `b`"), "{refused}");
 }
 
+/// blaze's `artifact = "gpu"` (docs/future/gpu/shaders.md): no `-Z bindeps`, a device unit of
+/// the dependency for `naga-unknown-unknown` that is built even by a check (the dependent's front
+/// end reads its MSL), the MSL among that unit's outputs and named to the dependent alone, and a
+/// library edge too only with `lib = true`.
+#[test]
+fn a_gpu_artifact_dependency_is_built_for_the_device_and_names_its_msl_to_the_dependent() {
+    let fixture = Fixture::new();
+    let shaders = "[package]\nname = \"shaders\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
+    let with_lib =
+        format!("{A}\n[dependencies]\nshaders = {{ path = \"../shaders\", artifact = \"gpu\", lib = true }}\n");
+    let gpu_only = format!("{A}\n[dependencies]\nshaders = {{ path = \"../shaders\", artifact = \"gpu\" }}\n");
+    for (manifest, linked) in [(with_lib.as_str(), true), (gpu_only.as_str(), false)] {
+        let files = [
+            ("ws/Cargo.toml", "[workspace]\nmembers = [\"a\", \"shaders\"]\nresolver = \"2\"\n"),
+            ("ws/a/Cargo.toml", manifest),
+            ("ws/a/src/lib.rs", ""),
+            ("ws/shaders/Cargo.toml", shaders),
+            ("ws/shaders/src/lib.rs", ""),
+        ];
+        for command in [Command::Build, Command::Check] {
+            let units = ready(fixture.plan(fixture.open(&Ask { command, args: &["-p", "a"], ..ask(&files) })));
+            let device: Vec<(usize, &Unit)> = units_of(&units, "shaders")
+                .into_iter()
+                .filter(|(_, it)| it.platform.as_deref() == Some(crate::GPU_DEVICE))
+                .collect();
+            let [(gpu_at, gpu)] = device.as_slice() else {
+                panic!("one device unit of `shaders` under {command:?}, not {device:?}")
+            };
+            assert!(gpu.target.is_lib() && gpu.mode == Mode::Build && !gpu.macro_wasm, "{gpu:?}");
+            assert_eq!(gpu.profile.panic, "abort", "the device has no unwinding");
+            let msl = units.plans[*gpu_at].gpu_msl.as_deref().expect("the device unit writes MSL");
+            assert!(msl.ends_with(".msl") && msl.contains("shaders"), "{msl}");
+            assert!(units.plans[*gpu_at].outputs.iter().any(|it| it == msl), "{:?}", units.plans[*gpu_at].outputs);
+
+            let (a_at, a, a_plan) = units_of(&units, "a")
+                .into_iter()
+                .find(|(_, it)| it.target.is_lib())
+                .map(|(at, it)| (at, it, &units.plans[at]))
+                .expect("a's library unit");
+            assert_eq!(env_of(a_plan, "BLAZE_GPU_MSL_SHADERS"), Some(msl), "a is told the MSL's path");
+            let edges: Vec<(bool, Option<&str>)> = a
+                .dependencies
+                .iter()
+                .filter(|it| units.graph.units[it.index].pkg_id == gpu.pkg_id)
+                .map(|it| (it.gpu, units.graph.units[it.index].platform.as_deref()))
+                .collect();
+            assert!(edges.contains(&(true, Some(crate::GPU_DEVICE))), "{edges:?}");
+            assert_eq!(edges.iter().any(|(gpu, _)| !gpu), linked, "a links shaders only with `lib = true`: {edges:?}");
+            // Only the edge's unit writes MSL, and only its dependent is told of it.
+            for (at, plan) in units.plans.iter().enumerate() {
+                assert_eq!(plan.gpu_msl.is_some(), at == *gpu_at, "{:?}", units.graph.units[at].target.name);
+                if at != a_at {
+                    assert_eq!(env_of(plan, "BLAZE_GPU_MSL_SHADERS"), None, "{:?}", units.graph.units[at].target.name);
+                }
+            }
+        }
+    }
+}
+
+/// `artifact = "gpu"` is the device build alone: no other kind with it, no `target`, and not
+/// a build dependency, each refused naming the dependency.
+#[test]
+fn a_gpu_artifact_dependency_refuses_what_it_has_no_meaning_for() {
+    let fixture = Fixture::new();
+    let shaders = "[package]\nname = \"shaders\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
+    for (dep, says) in [
+        ("[dependencies]\nshaders = { path = \"../shaders\", artifact = [\"gpu\", \"cdylib\"] }", "takes no other artifact kind"),
+        ("[dependencies]\nshaders = { path = \"../shaders\", artifact = \"gpu\", target = \"x86_64-unknown-linux-gnu\" }", "takes no `target`"),
+        ("[build-dependencies]\nshaders = { path = \"../shaders\", artifact = \"gpu\" }", "not a build dependency (shaders)"),
+    ] {
+        let a = format!("{A}\n{dep}\n");
+        let files = [
+            ("ws/Cargo.toml", "[workspace]\nmembers = [\"a\", \"shaders\"]\nresolver = \"2\"\n"),
+            ("ws/a/Cargo.toml", a.as_str()),
+            ("ws/a/src/lib.rs", ""),
+            ("ws/shaders/Cargo.toml", shaders),
+            ("ws/shaders/src/lib.rs", ""),
+        ];
+        let refused = failed(fixture.plan(fixture.open(&Ask { args: &["-p", "a"], ..ask(&files) })));
+        assert!(refused.contains(says), "{dep}: {refused}");
+    }
+}
+
 #[test]
 fn a_workspace_that_is_not_there_is_cargos_error() {
     let fixture = Fixture::new();

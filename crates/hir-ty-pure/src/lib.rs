@@ -14,6 +14,9 @@
 //! - [`models`]: where the walk stops in std (a [`Leaf`]) and the functions whose values it
 //!   follows (a [`Transfer`]), by path (design section 5).
 //! - [`identity`]: the Merkle hash of the instance graph (design section 4).
+//! - [`facts`]: what the walk proves of each function and what is declared and checked of
+//!   each type, as the one record `hir_ty::facts::facts_of` gives the optimizer and the code
+//!   generator (docs/v2/plan/design/facts.md).
 //!
 //! Anything the walk can't prove is [`Purity::Impure`]: the script runs in the sandbox as any
 //! other. That is the design, not a fallback.
@@ -21,12 +24,17 @@
 #![forbid(unsafe_code)]
 #![feature(allocator_api)]
 
+pub mod drop_effects;
 pub mod effect_attrs;
 pub mod effects;
+pub mod facts;
 mod function;
 mod identity;
+mod loops;
+pub mod may;
 mod memory;
 pub mod models;
+pub mod program_lifetime;
 mod values;
 mod walk;
 
@@ -43,7 +51,7 @@ use intern::Symbol;
 pub use effects::{EFFECTS, EffectDef, EffectSet, PURE, Rule};
 pub use function::{
     EffectProof, FnPurity, Place, PureProof, Refusal, Step, Trusted, check, check_generic,
-    fn_memory, fn_purity, fn_purity_generic, instance_effects,
+    derived_pure, fn_memory, fn_purity, fn_purity_generic, instance_effects,
 };
 pub use memory::{Access, MemoryEffects};
 pub use walk::{ScriptProof, main_of, script_proof, script_purity};

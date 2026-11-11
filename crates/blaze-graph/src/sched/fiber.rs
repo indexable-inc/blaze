@@ -1339,6 +1339,7 @@ impl<W: Work> Driver<W> {
             while st.live > 0 && st.failed.is_none() {
                 st.joiner = Some(thread::current());
                 drop(st);
+                // wakes: the worker that ends the last job while `closing`, and `fail`, each unpark `joiner`, set under the lock before this park
                 thread::park();
                 st = self.shared.lock();
             }
@@ -1399,6 +1400,7 @@ impl<W: Work> Driver<W> {
 /// A worker: runs what the scheduler gives its core, parks when it gives nothing.
 fn worker<W: Work>(shared: &Arc<Shared<W>>, me: u32) {
     while !shared.go.load(Ordering::Acquire) {
+        // wakes: `release`, which sets `go` and then unparks every worker's thread
         thread::park();
     }
     if shared.stop.load(Ordering::Acquire) {
@@ -1459,6 +1461,7 @@ fn idle<W: Work>(shared: &Shared<W>, slot: &CoreSlot, deadline: Option<u64>) {
                 }
                 thread::park_timeout(Duration::from_nanos(at - now));
             }
+            // wakes: `CoreSlot::wake`, by whoever gives this core work and by `fail`, which sets `woken` before it unparks
             None => thread::park(),
         }
     }

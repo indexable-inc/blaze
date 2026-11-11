@@ -2744,6 +2744,7 @@ mod tests {
             TypeRef::Error => TypeRefKind::Error,
             TypeRef::UnsafeBinder { .. } => TypeRefKind::UnsafeBinder,
             TypeRef::Union(_) => TypeRefKind::Union,
+            TypeRef::Record { .. } => TypeRefKind::Record,
         }
     }
 

@@ -437,6 +437,11 @@ fn clippy_where(covers: impl Fn(&Info) -> bool) -> On {
 
 /// The lints `blaze::<name>` stands for.
 fn blaze_lints(name: &str) -> On {
+    // `#![blaze::capabilities]` asks for a lint without naming it: the files that write it
+    // have that lint on, as the files that write `#![warn(blaze::std_use)]` do.
+    if name == crate::level::CAPABILITIES {
+        return crate::level::capabilities_asks_for().bit();
+    }
     Target::blaze(name).unwrap_or(On::EMPTY)
 }
 
@@ -954,6 +959,7 @@ mod tests {
                 && !pedantic.intersects(blaze::Lint::HashTwice.bit())
         );
         let (edition, _) = named_in("#[warn(blaze::edition)]");
+        let (macros, _) = named_in("#[allow(blaze::proc_macro)]");
         assert!(
             edition.intersects(blaze::Lint::LossyAs.bit())
                 && edition.intersects(blaze::Lint::GlobalState.bit())
@@ -963,7 +969,25 @@ mod tests {
                 && edition.intersects(blaze::Lint::UnmarkedNoalloc.bit())
                 && edition.intersects(blaze::Lint::UnmarkedNonblocking.bit())
                 && edition.intersects(blaze::Lint::MutRef.bit())
+                && edition.intersects(blaze::Lint::BuildScriptAmbient.bit())
                 && !edition.intersects(blaze::Lint::HashTwice.bit())
+        );
+        assert_eq!(
+            named(macros),
+            [
+                "blaze::proc_macro_attribute",
+                "blaze::proc_macro_derive",
+                "blaze::proc_macro_fn_like",
+            ],
+            "`blaze::proc_macro` is the three macro lints, each of `blaze::edition`"
+        );
+        assert_eq!(macros.without(edition), On::EMPTY);
+        assert!(edition.intersects(blaze::Lint::StdUse.bit()));
+        let (capabilities, _) = named_in("#![blaze::capabilities]");
+        assert_eq!(
+            named(capabilities),
+            ["blaze::std_use"],
+            "`#![blaze::capabilities]` turns `std_use` on where it is written"
         );
         assert!(
             !(general.intersects(pedantic) || internal.intersects(pedantic)),

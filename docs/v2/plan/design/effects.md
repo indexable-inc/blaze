@@ -1,52 +1,212 @@
 ---
 status: plan
-summary: "#[blaze::nopanic], #[blaze::noalloc] and #[blaze::nonblocking]: effects checked over MIR on pure's walk, and where #[blaze::constant_time] would sit."
-date: 2026-11-02
+summary: "#[blaze::may(..)]: a function says what it may do (panic, alloc, block, diverge); what it leaves out is checked over MIR on pure's walk. The old spellings (nopanic, noalloc, nonblocking), which loops are known to end, and where #[blaze::constant_time] would sit."
+date: 2026-11-10
 ---
-# Effect attributes: `nopanic`, `noalloc`, `nonblocking`
+# Effects: what a function may do
 
-Three blaze extensions (AGENTS.md rule 4: opt-in, inert under rustc with
-`#![feature(register_tool)] #![register_tool(blaze)]`, changing no code that blaze builds) that
-each promise one thing about a function and everything it can call, and a deny-by-default lint
-per attribute that holds the promise:
+One blaze extension (AGENTS.md rule 4: opt-in, inert under rustc with
+`#![feature(register_tool)] #![register_tool(blaze)]`, changing no code that blaze builds) says
+what a function, and everything it can call, may do:
 
-| attribute | promise | lint |
+```rust
+#[blaze::may(panic, alloc)]
+pub fn parse(text: &str) -> Tree { .. }
+```
+
+| word | the function may | the old spelling of its absence |
 |---|---|---|
-| `#[blaze::nopanic]` | it cannot panic or abort | `blaze::nopanic` |
-| `#[blaze::noalloc]` | it never calls the global allocator | `blaze::noalloc` |
-| `#[blaze::nonblocking]` | it never blocks the thread | `blaze::nonblocking` |
+| `panic` | panic or abort | `#[blaze::nopanic]` |
+| `alloc` | call the global allocator (an allocator it is handed is a capability, not this) | `#[blaze::noalloc]` |
+| `block` | block the thread | `#[blaze::nonblocking]` |
+| `diverge` | not return: a loop not known to end, or recursion | none |
+
+A word the list leaves out is an effect the function does not have, checked through every call
+it makes. `#[blaze::may()]` (or `#[blaze::may]`) is a function with none of the four.
+
+**Why the list is positive.** A signature that lists what can happen is complete to its reader:
+nothing unlisted happens, so there is no second question ("and does it block?") the mark leaves
+open, as `#[blaze::nopanic]` alone does. A new effect touches only the functions that have it,
+where a negative spelling would have to be added to every function that does not. It matches
+capabilities, which are already positive (a function touches the disk because it was handed a
+`Dir`). And it makes the two mistakes different in kind: a mark is a permission, so listing
+too little is an error and listing too much is advice.
+
+There is no word for code the check can't see (a foreign function no table knows, inline
+assembly, a function pointer or an unmarked `dyn` taken as a parameter, a body that does not
+lower): it may do anything, so it is refused for every word the list leaves out. Only
+`#[blaze::may(panic, alloc, block, diverge)]`, "may anything", admits it, or a callee taken at
+its word (`trusted`, below). `pure` needs no word either: see "Purity" below.
 
 They are checked on the one walk that `#[blaze::pure]` uses ([pure-fns.md](pure-fns.md)): one
 memoized summary per monomorphized instance, carrying an `EffectSet` (one bit per kind of
-effect, `hir_ty_pure::effects::Rule`) with the shortest witness of each. An attribute is a mask
-over those kinds (`EffectDef::refuses`); checking one reads the root's summary. These effects
-add kinds to the vocabulary and data to the tables; the walk itself is pure's.
+effect, `hir_ty_pure::effects::Rule`) with a witness of each. Each word has an `EffectDef`
+(`effect_attrs::of_word`: `NOPANIC`, `NOALLOC`, `NONBLOCKING`, `TERMINATES`), a mask over those
+kinds; a list without the word asks for it, and checking one reads the root's summary.
 
-Code: `crates/hir-def/src/attrs.rs` (the attribute), `crates/hir-ty-pure/src/effect_attrs.rs`
-(the definitions, the site rules and the tables), `crates/blaze-lints/src/blaze/effects.rs` (the
-lints).
+Code: `crates/hir-def/src/attrs.rs` (the attributes: `MayWord`, `MayAttr`, `AttrFlags::MAY` bit
+101, `BLAZE_EFFECTS` bit 102; the old spellings' `EffectWord`, bits 97 to 99),
+`crates/hir-ty-pure/src/may.rs` (the one home of what is declared: `declared`, `Marks`,
+`allowed`, `verdict`), `effect_attrs.rs` (the definitions, the site rules and the tables),
+`loops.rs` (which loops end), `crates/blaze-lints/src/blaze/may.rs` (the lints of the list) and
+`effects.rs` (the old spellings' lints).
 
-## The attributes
+## What is declared, and where it comes from
 
-`#[blaze::nopanic]`, `#[blaze::noalloc]`, `#[blaze::nonblocking]`, each on a function, a method,
-a foreign function or a trait, and each with one optional argument:
+A function's *allowance* is the set of words it may have. The first of these that is written
+holds, alone; nothing is merged (`hir_ty_pure::may::allowed`):
 
-- A word: checked. On a trait: every method of every impl of the trait is checked as if marked.
-- `(trusted = "why")`: not checked; the effect's kinds are taken off every call of it (and, on a
-  trait, of every impl's method and every call through `dyn` of it). Its body is still walked
-  for the other effects. The reason is recorded in the proof (`EffectProof::trusted`, sorted by path)
-  so a reviewer reads every promise made by hand that a proof rests on.
-- Anything else: refused by the lint, naming the text.
+1. **Its own list**, `#[blaze::may(..)]` on the function. What is written on the function is
+   what holds: it replaces a default around it entirely, so `#[blaze::may(alloc)]` in a module
+   whose default is `panic` may allocate and may not panic.
+2. **Its trait's**, for a method of an impl of a trait (or a trait's default method): the
+   `#[blaze::may(..)]` of the trait's method, else of the trait. A trait method's list is the
+   bound every impl must stay within. An impl's method may write its own list with fewer words,
+   never more: one with a word the trait's method lacks is refused.
+3. **The default around it**: `#![blaze::may(panic)]` in a module or at the crate's root is the
+   allowance of every function in it with none of the above; the nearest module's holds.
+   `#![blaze::effects]` at the crate's root is the default "nothing": every function of the
+   crate with no list on it or around it may have no effect. This is the gate. The blaze
+   edition ([edition.md](edition.md)) will turn it on; `edition = "blaze-2026.11"` is not on
+   main yet, so the gate is this attribute today.
+4. **None.** A function none of these reach is of code that asked for nothing: it may do
+   anything, and it is not checked. To its callers it is what the walk infers of its body, as
+   before: a marked function that calls into an unmarked crate is held to what that crate's
+   code does, not to "anything". So a crate on an ordinary edition is linted, and built, exactly
+   as before (rule `superset-of-rust`).
 
-`AttrFlags::NOPANIC` is bit 97, `NOALLOC` 98, `NONBLOCKING` 99 (after `BLAZE_BITS`, 96).
-`AttrFlags::effect_attr(db, owner, EffectWord)` reads the argument (one bit test for an item
-without one); `PureAttr { Checked, Trusted(why), Malformed(text) }` is pure's. No codegen key or
-signature reads the bits: a function without the attribute builds byte for byte as before,
-and so does one with it.
+**Under-declaring is an error** (`blaze::undeclared_effect`, `deny`): a function with an effect
+outside its allowance is refused at its name, saying each such effect with its witness (the
+call chain down to what has it, each step with its file and line, or the loop's line), where
+the allowance is written, and the fix: "add `panic` to its `#[blaze::may(..)]`, or handle it".
+`blaze check --fix` writes the list with the missing words added (a new list above the
+signature where the function had none), which is how a crate is brought under the gate: turn
+`#![blaze::effects]` on and apply the fixes. It replaces the four `unmarked_*` lints of the
+earlier design.
 
-## What each refuses
+**Over-declaring is advice** (`blaze::unneeded_effect`, `warn`, with a fix that takes the word
+off): a word of a list for an effect the function is proved not to have. Only on a private
+function: a function with a visibility written may reserve the right in its signature, a
+trait method's list is its impls' bound, and an impl's method may keep what its trait allows.
 
-The kinds (`Rule`) the walk gives each site, and which attribute refuses which:
+**`trusted`.** `#[blaze::may(alloc, trusted = "why")]` is a list taken at its word: the function
+is not checked, and every call of it has exactly the listed effects (on a trait: every impl's
+method, and every call through `dyn` of it). The reason is recorded in the proof
+(`EffectProof::trusted`) so a reviewer reads every promise made by hand. A module's default
+takes no `trusted`.
+
+**Calls the check can't resolve.**
+- *Through `dyn Trait`, or a method of a type parameter*: the call has the trait method's list
+  (its own, else its trait's). A `dyn` of a trait whose methods all leave a word out can be
+  taken as a parameter by a function that leaves it out too, and a generic function's call of
+  such a method is not left open to each instance. This rests on every impl being held within
+  the list, which `undeclared_effect` does wherever the impl is written.
+- *Through a function pointer*: a function pointer's type has no marks, so one taken as a
+  parameter is "may anything" and refused for every word the function leaves out. One made in
+  the body is different: what it points to was walked where it was made (the walk is
+  closed-world), so its panics, allocations and waits are already counted, and the call adds
+  only `diverge`, since the pointer may lead back to the caller. Effects in function pointer
+  types (`fn(u32) -> u32 may(panic)`) would lift both: the type would carry the list, a
+  coercion of a function to it would check the function's list against it, and a call through
+  it would have the type's list. That needs the list in the type system (a part of `FnSig`,
+  with subtyping from fewer words to more), not an attribute.
+
+## The old spellings
+
+`#[blaze::nopanic]`, `#[blaze::noalloc]` and `#[blaze::nonblocking]` (each with the optional
+`(trusted = "why")`, on a function, a foreign function or a trait) stay accepted in every crate
+and mean exactly what they meant: a promise of the absence of one effect, held by their own
+lints (`blaze::nopanic`, `blaze::noalloc`, `blaze::nonblocking`). Internally there is one
+representation, the allowance: an old spelling lowers to "every word but this one"
+(`may::declared`), so a function with one is not held to a default around it for the others.
+Where effects are declared (under a module's default or the gate), `blaze::negative_effect`
+(`warn`) asks for the positive form, and its fix writes it: every word the old spellings do not
+take off that the function is not proved free of. A function with `nopanic` and `nonblocking`
+that allocates and has a loop not known to end becomes `#[blaze::may(alloc, diverge)]`. A
+function with both spellings is refused. `diverge` has no negative spelling: there never was a
+`#[blaze::terminates]`.
+
+`AttrFlags::effect_attr(db, owner, EffectWord)` reads an old spelling's argument (one bit test
+for an item without one); `AttrFlags::may_attr(db, owner)` reads a list (`MayAttr`: the words,
+`trusted`, or the text of one that is malformed). No codegen key or signature reads the bits:
+a function without an attribute builds byte for byte as before, and so does one with it.
+
+## Purity
+
+`#[blaze::pure]` is not a word of the list and keeps working as it does
+([pure-fns.md](pure-fns.md)): it is what a cache of a function's results keys on. It is
+derivable: `hir_ty_pure::derived_pure(db, func)` is the attribute's own check (the walk, and
+the scan of the parameters for state behind shared references and code the check can't see)
+asked of a function nobody marked, true where it passes with no call left to an instance. So a
+function with no effect of the world and the purity conditions is pure whether or not the word
+is written, and what keys on the attribute may key on the derived answer where it holds. This
+slice adds the query; no consumer is switched to it yet, and the attribute stays the way to
+make purity a promise the lint holds.
+
+## `diverge`: what "returns" means, and which loops end
+
+A function that may not `diverge` **returns or panics; it never runs for ever**. A panic or an
+abort ends it, so `diverge` and `panic` are independent: `#[blaze::may(panic)]` is "ends, maybe
+by panicking", and `#[blaze::may()]` is total: it returns. A wait is not its business either:
+the function returns whenever every wait it makes does, and leaving out `block` says there is
+none.
+
+What the walk records (`Rule`), all refused by a list without `diverge`:
+
+- `Loop`: a loop of the body not known to end, at the loop's line.
+- `Recursion`: the instance can call itself again, through any calls. The refusal names the
+  chain and says which function is called again.
+- `Indirect`: a call through a function pointer or a `dyn`, or the drop of a value that may
+  hold a `dyn`. What it reaches was walked where the pointer or vtable was made, but it may
+  reach the caller again, a recursion no cycle of instances shows. A `dyn` call of a trait
+  method whose list leaves `diverge` out is not one.
+- and, as for every word, what the check can't see (`ForeignUnknown`, `Unchecked`).
+
+**Loops** (`crates/hir-ty-pure/src/loops.rs`). A loop is a strongly connected component of the
+body's control flow graph; a block that goes to itself counts. A component ends when some block
+of it, a *bounding block*, can run only finitely often while control stays in the component,
+and what is left without that block ends too. The bounding rules are data for that one
+algorithm (`loops::Bounding`). This slice has one, sound from the MIR alone:
+
+- **A counted `while`.** `while i < n { ..; i += c; }` (and `<=`, and the mirror with `>`,
+  `>=` and `-=`), where `i` is a local integer, the limit is a constant or a local the loop
+  does not write, every write of `i` in the loop is a step by a positive constant the same
+  way, every path round the loop passes a step, and no local involved has its address taken.
+  **Overflow is accounted for by the profile**, as `nopanic` is: where the crate keeps overflow
+  checks (a dev profile, or `overflow-checks = true`) a step is `AddWithOverflow`, an `Assert`
+  and the sum, and a wrap is a panic, which ends the function, so any positive step and `<=`
+  are bounds. Where the crate drops them (release), a step wraps, so it is a bound only when
+  it cannot: the test is strict, the step is by one, and it is the loop's only write of `i`
+  and runs at most once a turn (`i < n` then gives `i + 1 <= n`). `while i <= n { i += 1 }`
+  and `while i < n { i += 3 }` therefore pass in dev and are refused in release, where `i` can
+  wrap round for ever; the same function can need `diverge` in one profile and not the other.
+
+**Everything else is refused**, naming the loop's line, until a rule for it exists:
+
+- `for`. A `for` over a range or a slice ends (the iterator's `next` is finite and its `None`
+  edge leaves the loop), and that rule is the next one; it is not in this slice because the
+  test toolchain's `Range::next` is `loop {}`, so it could not be proved by a test here, and an
+  untested rule is not shipped.
+- `while i < v.len()` (the limit is computed in the loop), `while let Some(x) = stack.pop()`,
+  `loop { .. break .. }`, iterator adaptors, and every loop inside std that these rules do not
+  cover. A callee proven by hand is marked `#[blaze::may(.., trusted = "why")]`.
+- A **`decreases` clause** proved by the verifier lane ([contracts.md](contracts.md)) is the
+  general answer: a measure that falls on every turn. It is one more `Bounding`, tried on a
+  component after these; the algorithm and its test do not change.
+
+**Recursion and the fixpoint.** A cycle of instances is a cycle of the summary query, which
+starts from `Summary::recursive()`: the summary whose only kind is `Recursion`. Every member of
+the cycle reads it, of itself or through the others, so at the fixpoint each member and each
+caller has `Recursion` through a call site. Every other kind's witness has a depth (the fewest
+calls to where it is done) that grows by one per call; around a cycle that would grow each
+round and the fixpoint would never settle, so `Recursion`'s witness has one constant depth and
+the first site that has it stays. The refusal follows the witnesses and stops where the next
+instance is one already in the chain (and after 64 steps at most), saying it is called again.
+
+## What each old attribute refuses
+
+The kinds (`Rule`) the walk gives each site, and which effect refuses which (`diverge`'s
+kinds are above):
 
 | kind | where the walk finds it | nopanic | noalloc | nonblocking |
 |---|---|---|---|---|
@@ -58,6 +218,9 @@ The kinds (`Rule`) the walk gives each site, and which attribute refuses which:
 | `ForeignUnwind` | a foreign function blaze knows nothing of whose ABI may unwind and that is not `#[rustc_nounwind]`; `asm!(.., options(may_unwind))` | yes | | |
 | `ForeignUnknown` | a foreign function not in the foreign table; inline assembly | | yes | yes |
 | `Unchecked` | what the walk can't follow (a `dyn` or function pointer from a parameter, a body that does not lower) | yes | yes | yes |
+
+A list without `diverge` refuses `Loop`, `Recursion`, `Indirect`, `ForeignUnknown` and
+`Unchecked`.
 
 A refusal says the shortest call chain from the marked function to the site, each step with its
 file and line, the rule, and what the last step does:
@@ -149,7 +312,9 @@ test over the pinned std, core and alloc holds the table to the toolchain, as `m
 
 ## Where blaze uses them
 
-Marked after reading the code (each holds by the rules above; the lint holds them from here on):
+Marked with the old spellings, before the list existed, after reading the code (each holds by
+the rules above; the lints hold them from here on; `negative_effect` rewrites them when their
+crates come under the gate):
 
 - `blaze_graph::sched::Place::{pick, take_own, steal_for, steal_half, nearest_parked,
   search_parked}`: `#[blaze::nonblocking]`. A free core's pick and steal, the path every pool
@@ -167,9 +332,23 @@ that use a frame also call the database, which allocates its memos from the glob
 ## Tests
 
 Per effect, one crate that passes and one per kind of refusal, named for the property
-(`crates/blaze-lints/src/blaze/effects_tests.rs`), plus `an_effect_attribute_changes_no_signature`
-in hir-def: a function's signature and flags other than the effect bits are the same with the
-attribute and without, so an unmarked crate builds byte for byte the same.
+(`crates/blaze-lints/src/blaze/effects_tests.rs` for the old spellings, `may_tests.rs` for the
+list: each word's under-declaration with its witness, the counted `while` and its near misses,
+recursion, function pointers and `dyn`, an impl within its trait's list, a module's default
+and a function's own list, over-declaration, the rewrite of the old spellings, and a crate
+that declares nothing), plus `an_effect_attribute_changes_no_signature` in hir-def: a
+function's signature and flags other than the effect bits are the same with the attributes
+and without, so an unmarked crate builds byte for byte the same.
+
+Two invariants are stated and tested with Hegel, each with planted-bug controls:
+
+- `loops.rs`: a control flow graph the analysis accepts has no infinite path. Random small
+  graphs with random bounding facts, model-checked by brute force. Controls: a self-loop not
+  seen as a cycle; a bounding block taken off a component its exit stays in.
+- `may.rs`: the checker accepts exactly when every function's inferred effects are within its
+  allowed set, where allowed sets flow as specified. Random call graphs, effect sources and
+  declarations against a reference model. Controls: an impl allowed more than its trait; a
+  module's default merged with a function's own list.
 
 ## `#[blaze::constant_time]` on the same seam (later, not this lane)
 
@@ -197,6 +376,16 @@ operand is tainted by a secret, which this walk does not track. How it sits on t
 
 ## Not done
 
+- `for` loops, and every loop but a counted `while`, need `diverge` (above): the `for` rule
+  over ranges and slices is next, then `decreases`.
+- A `for const` loop of generic MIR (`ComptimeFor`) is a loop like any other to a generic
+  check, though it runs once per field.
+- Every call through a function pointer or an unlisted `dyn` needs `diverge`, whether or not
+  its targets could reach the caller: no whole-program graph of indirect calls is built.
+- A malformed `#![blaze::may(..)]` on a module is read as the words before its error and is
+  not reported itself; a function's is.
+- The edition gate is `#![blaze::effects]` until `edition = "blaze-2026.11"` exists.
+- No consumer keys on `derived_pure` yet.
 - The blocking set is rows of the toolchain and five registry crates; any other crate's blocking
   wrapper over a foreign call is found through the foreign table (its `read`, `futex`), so the
   table is complete through its foreign leaves, but the message names the leaf.

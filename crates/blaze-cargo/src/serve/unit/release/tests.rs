@@ -284,3 +284,55 @@ fn a_count_of_rows_is_said_in_the_unit_it_rounds_to() {
     assert_eq!(said(3_190_784), "3.19M");
     assert_eq!(said(9_995_000), "10.00M");
 }
+
+/// A release is made due by what this build made. A crate whose units were all
+/// found kept as they began (a warm build's dependencies, every one of them before its first
+/// task) is finished and makes none due; it goes with the next release, a made crate's or the
+/// build's end's. The control: with one of its units not found kept, the same crate makes a
+/// release due at once, as every finished crate did before.
+#[test]
+fn a_crate_whose_units_were_all_found_kept_makes_no_release_due_and_goes_with_the_next() {
+    const GIB: u64 = 1 << 30;
+    let fine = || Pressure { held: GIB, limit: 48 * GIB, over: None };
+    // Units 0 and 1 of crate 7, a dependency found kept; unit 2 of crate 9, the one edited.
+    let mut release = Release::of(Finished::new(vec![Some(7u32), Some(7), Some(9)]), true);
+    for unit in [0, 1] {
+        release.began(unit);
+        release.kept(unit);
+        release.compiled_under(unit, fine);
+    }
+    assert!(!release.due(), "no unit is open, and the one crate finished was found kept");
+    release.began(2);
+    assert!(!release.due(), "a unit is open");
+    release.compiled_under(2, fine);
+    assert!(release.due(), "the crate this build made is finished");
+    assert_eq!(
+        release.plan(),
+        Some(Plan { crates: vec![7, 9], mir: true, pressed: false, ended: false }),
+        "the kept crate goes with it"
+    );
+    assert!(!release.due() && release.plan().is_none(), "taken");
+
+    let mut made = Release::of(Finished::new(vec![Some(7u32), Some(7), Some(9)]), true);
+    made.began(0);
+    made.kept(0);
+    made.compiled_under(0, fine);
+    made.began(1);
+    made.compiled_under(1, fine);
+    assert!(made.due(), "a unit of crate 7 was made: its crate, finished, is due");
+
+    // A build that found every unit kept has nothing due until its end, which takes them all.
+    let mut kept = Release::of(Finished::new(vec![Some(7u32), Some(9)]), true);
+    for unit in [0, 1] {
+        kept.began(unit);
+        kept.kept(unit);
+        kept.compiled_under(unit, fine);
+    }
+    assert!(!kept.due());
+    kept.end();
+    assert!(kept.due(), "the build's end");
+    assert_eq!(
+        kept.plan(),
+        Some(Plan { crates: vec![7, 9], mir: true, pressed: false, ended: true })
+    );
+}

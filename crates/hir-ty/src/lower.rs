@@ -9,6 +9,7 @@ pub(crate) mod batch;
 pub(crate) mod diagnostics;
 mod error_union;
 pub(crate) mod path;
+pub(crate) mod record;
 pub mod persist;
 
 use std::{alloc::Allocator, iter, mem};
@@ -1281,6 +1282,9 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                 Ty::new_unsafe_binder(interner, Binder::bind_with_vars(inner, bound_vars))
             }
             TypeRef::Union(members) => self.lower_error_union(type_ref_id, members),
+            TypeRef::Record { names, types, defaults } => {
+                self.lower_record(type_ref_id, names, types, defaults)
+            }
             TypeRef::Error => self.types.types.error,
         };
         (ty, res)

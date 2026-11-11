@@ -560,6 +560,7 @@ impl Seed for Host {
 
     fn sync(&mut self, fd: u32, data_only: bool) -> Result<(), Errno> {
         let file = self.file(fd)?;
+        // durable: carries out the guest's own `fd_sync` or `fd_datasync`: the program asked
         if data_only { file.sync_data() } else { file.sync_all() }.map_err(|e| errno(&e))
     }
 

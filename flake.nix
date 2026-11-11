@@ -58,32 +58,6 @@
         # build scripts over the shell's value (Cargo.toml's [workspace.metadata.blaze.native.llvm]);
         # the shell's serves a stage 0 older than that table, and tools other than blaze.
         llvmEnv = { LLVM_SYS_231_PREFIX = "${llvm}"; };
-        # The Z3 blaze_verify's solver runs (crates/hir-ty-verus, docs/v2/plan/design/verus.md):
-        # 4.16.0, the release Verus pins (vendor/verus/SOURCE.md), from Z3's own release
-        # archives by their unpacked hash. BLAZE_Z3 names it; blaze looks for no other.
-        z3 =
-          let
-            archives = {
-              aarch64-darwin = { name = "arm64-osx-15.7.3"; hash = "sha256-uqWm+aBB1plJF853LEteHUJoWq4jFbSs16O1VSUM0I4="; };
-              x86_64-darwin = { name = "x64-osx-15.7.3"; hash = "sha256-ncQ4fzHQquBxUHv2FHgW74yRE518IIaLgXhEHkCRpXM="; };
-              aarch64-linux = { name = "arm64-glibc-2.38"; hash = "sha256-IF5Lk3qXJvtrVYUkuWDfTHjt7CL9DQEROzVIoLFVLNE="; };
-              x86_64-linux = { name = "x64-glibc-2.39"; hash = "sha256-7mP3H8LQEFd2yNYR8QtmUJoB37L8sKmZV8gR7opa7Go="; };
-            };
-            archive = archives.${system} or (throw "no Z3 4.16.0 release archive for ${system}");
-          in pkgs.stdenv.mkDerivation {
-            pname = "z3";
-            version = "4.16.0";
-            src = pkgs.fetchzip {
-              url = "https://github.com/Z3Prover/z3/releases/download/z3-4.16.0/z3-4.16.0-${archive.name}.zip";
-              inherit (archive) hash;
-            };
-            nativeBuildInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.autoPatchelfHook ];
-            buildInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.stdenv.cc.cc.lib ];
-            dontConfigure = true;
-            dontBuild = true;
-            installPhase = "mkdir -p $out/bin && cp bin/z3 $out/bin/z3";
-          };
-        z3Env = { BLAZE_Z3 = "${z3}/bin/z3"; };
         # The Python workspace uses Nix's pinned interpreter on NixOS, where uv's downloaded
         # interpreters cannot run. uv itself comes from the same flake.lock as the toolchain.
         scripts = {
@@ -316,8 +290,8 @@
         # `nix develop`: the pinned LLVM (LLVM_SYS_231_PREFIX, its tools on PATH) and a C
         # toolchain with libstdc++.a, so `cargo build -p blaze-engine` links it in. Rust is
         # rustup at the pinned nightly: plain `cargo` is harness/toolchain's and `cargo +<toolchain>` works.
-        devShells.default = pkgs.mkShell (llvmEnv // z3Env // {
-          packages = scripts.packages ++ [ pkgs.rustup llvm z3 ];
+        devShells.default = pkgs.mkShell (llvmEnv // {
+          packages = scripts.packages ++ [ pkgs.rustup llvm ];
           inherit (scripts) UV_PYTHON UV_PYTHON_DOWNLOADS;
           RUSTUP_TOOLCHAIN = pkgs.lib.fileContents ./harness/toolchain;
           # The pinned DuckDB that `blaze slow`, `blaze debug sql` and `blaze explain` run (blaze

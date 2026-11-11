@@ -700,6 +700,7 @@ Type =
 | SliceType
 | TupleType
 | UnionType
+| RecordType
 | UnsafeBinderType
 
 ParenType =
@@ -748,6 +749,11 @@ PatternType =
 // `A | B | C`, blaze's error unions (`#![blaze::error_unions]`).
 UnionType =
   types:(Type ('|' Type)+)
+
+// `{ a: T, b: U = default }`, blaze's record types (`#![blaze::records]`); a field's
+// default is read only in a function parameter.
+RecordType =
+  RecordFieldList
 
 ImplTraitType =
   'impl' TypeBoundList

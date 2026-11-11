@@ -76,13 +76,20 @@ fn passed_schema(checker: &'static str) -> SchemaHash {
 }
 
 /// `schema` for an answer about a body of `def`'s crate, with the crate attributes that change
-/// what the body's MIR is: `#![blaze::handles]` makes a move of a handle that is used again a
-/// copy (`hir_ty_mir::mir::handles`), so the built MIR and the borrow check's verdict differ.
-/// A crate without it keeps `schema` itself, so its keys are what they were.
+/// what the body's MIR is, a part per attribute: `#![blaze::handles]` makes a move of a handle
+/// that is used again a copy (`hir_ty_mir::mir::handles`), and `#![blaze::early_drop]` drops a
+/// local whose destructor only frees memory after its last use (`hir_ty_mir::mir::early_drop`),
+/// so the built MIR and the borrow check's verdict differ. A crate with neither keeps `schema`
+/// itself, so its keys are what they were.
 fn with_crate_attrs(db: &Db, def: DefWithBodyId, schema: SchemaHash) -> SchemaHash {
     use hir_def::HasModule;
-    match hir_def::nameres::crate_def_map(db, def.krate(db)).handles() {
+    let def_map = hir_def::nameres::crate_def_map(db, def.krate(db));
+    let schema = match def_map.handles() {
         true => schema_of(&[Part::Schema(schema), Part::Str("blaze::handles")]),
+        false => schema,
+    };
+    match def_map.early_drop() {
+        true => schema_of(&[Part::Schema(schema), Part::Str("blaze::early_drop 1")]),
         false => schema,
     }
 }

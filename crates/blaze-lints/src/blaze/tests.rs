@@ -1328,6 +1328,45 @@ pub fn own(base: Own) -> Own {
     assert!(!out.contains("`Ext` literal"), "another crate's struct is not checked:\n{out}");
 }
 
+/// `many_bools`: a call or method call passing two or more bare `bool` literals by position is
+/// found, with how many; one passing a single literal, literals inside another argument, or
+/// values that are not literals is not.
+#[test]
+fn many_bools_finds_a_call_passing_bare_bools_by_position() {
+    let out = lint_only(
+        r#"
+pub fn open(path: u8, create: bool, truncate: bool) -> u8 {
+    path + create as u8 + truncate as u8
+}
+pub fn one(flag: bool) -> bool {
+    flag
+}
+pub struct File;
+impl File {
+    pub fn sync(&self, data: bool, meta: bool, wait: bool) -> bool {
+        data && meta && wait
+    }
+}
+pub fn found(file: &File) -> u8 {
+    let a = open(1, true, false);
+    let b = file.sync(true, false, true);
+    a + b as u8
+}
+pub fn not_found(file: &File, create: bool) -> u8 {
+    let a = open(2, create, false);
+    let b = open(3, one(true), one(false));
+    let c = file.sync(create, !create, true);
+    a + b + c as u8 + one(true) as u8
+}
+"#,
+        "many_bools",
+    );
+    assert!(out.contains("this call passes 2 bare `bool`s by position"), "{out}");
+    assert!(out.contains("this call passes 3 bare `bool`s by position"), "{out}");
+    assert!(out.contains("a record parameter with defaults"), "{out}");
+    assert_eq!(out.matches("bare `bool`s by position").count(), 2, "{out}");
+}
+
 /// `bool_param`: a `bool` parameter of a public, crate-visible or private function, and of a
 /// trait's declaration, is found, the enum named from the parameter; a setter of one `bool`,
 /// a trait impl's method, a closure and an `extern "C"` function are not.

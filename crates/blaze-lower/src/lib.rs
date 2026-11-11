@@ -65,7 +65,7 @@ pub use base_db::{Db, ProcMacroLoadingError};
 pub use hir_expand::proc_macro::{ProcMacro, ProcMacroLoadResult};
 
 pub use self::answer::{SubRequest, SubResponse, answer};
-pub use self::code::{CodeText, code_identity, code_text_of};
+pub use self::code::{CodeText, code_identity, code_text_of, still_text, still_text_of};
 pub use self::crates::{lint_flags, local, target_data};
 pub use self::doctests::DoctestProgram;
 pub use self::harness::{Appended, macros_loaded, wasm_macro};
@@ -270,6 +270,9 @@ struct Lowering {
     set: usize,
     /// A `RunCustomBuild` unit's `OUT_DIR`.
     out_dir: Option<String>,
+    /// A device unit's MSL (`UnitPlan::gpu_msl`): the outside file its dependents'
+    /// `include_str!(env!("BLAZE_GPU_MSL_<CRATE>"))` reads, set by [`Lowered::gpu_msl`].
+    gpu_msl: Option<String>,
     /// The units depending on it directly.
     dependents: Vec<usize>,
     /// Its cfg and env before any run applied.
@@ -636,6 +639,7 @@ fn lower_writes<T: blaze_query::Tree>(
             what: whats[index].clone(),
             set: set_of[unit.pkg_id.as_str()],
             out_dir: plan.out_dir.clone().filter(|_| !compiles),
+            gpu_msl: plan.gpu_msl.clone(),
             dependents: Vec::new(),
             cfg: CfgOptions::default(),
             env: Vec::new(),
@@ -798,7 +802,10 @@ fn lower_writes<T: blaze_query::Tree>(
         let mut dependencies = Vec::with_capacity(unit.dependencies.len());
         for dep in &unit.dependencies {
             let on = &units.graph.units[dep.index];
-            if on.mode == Mode::RunCustomBuild {
+            // An `artifact = "gpu"` edge gives the dependent the MSL its unit writes (its
+            // `BLAZE_GPU_MSL_<CRATE>`, [`Lowered::gpu_msl`]), no crate: a `lib = true` is an edge
+            // of its own, to the library's unit.
+            if on.mode == Mode::RunCustomBuild || dep.gpu {
                 continue;
             }
             let Some(krate) = lowerings[dep.index].krate else {
@@ -1061,6 +1068,92 @@ impl Lowered {
             &mut self.narrowed,
         );
         narrow.own.then_some(Narrowed { code: narrow.code, checked: narrow.checked })
+    }
+
+    /// The workspace sources a build keyed by code texts alone can vouch for
+    /// ([`StillSource`]): each Rust file with text of a workspace package's source root every
+    /// unit of which `narrow` says is keyed by its crate's code text, found under that key
+    /// (blaze-cargo's narrow record key), by path, sorted. An edit of such a file that leaves
+    /// its still text ([`code::still_text_of`]) leaves every one of those keys, as the still
+    /// text's invariant says. Why none can be vouched for, else:
+    ///
+    /// - a proc-macro expansion of the build read something (the log of
+    ///   [`base_db::Files::expansions_read`]): what it read is filed by value, and may be any
+    ///   file;
+    /// - nothing else here: a package one unit of which is not narrow gives no file, and a
+    ///   file a macro read off the disk (`include_str!`, `include!`, a `#[path]` outside the
+    ///   tree) is left out by its name, whichever package's it is.
+    ///
+    /// It reads inputs alone (source roots, crates' data, paths): no query runs, so the loop
+    /// may ask it. What else reads a source by its bytes is not known here: a build script's
+    /// traced reads and a record under what its diagnostics quote are the caller's to take out.
+    pub fn still_sources(
+        &self,
+        narrow: impl Fn(usize) -> bool,
+    ) -> Result<Vec<StillSource>, &'static str> {
+        let db = &self.db;
+        if !db.files().expansions_read().is_empty() {
+            return Err("a proc-macro expansion of the build read a file or a variable");
+        }
+        // Each set's verdict: whether every unit of it is narrow (never, for a library's:
+        // none of its files is the view's to edit), its crates' one edition, and a root file
+        // of it, to find its source root by. `narrow` reads the store, so it is asked only of
+        // a unit whose set still stands.
+        // alloc: once a build that walked and made nothing, a package each
+        let mut sets: Vec<Option<(bool, span::Edition, FileId)>> = vec![None; self.crates.sets];
+        for (unit, lowering) in self.crates.units.iter().enumerate() {
+            let Some(krate) = lowering.krate else { continue };
+            let data = krate.data(db);
+            let Some(slot) = sets.get_mut(lowering.set) else {
+                return Err("a unit of the build is of no source root of it");
+            };
+            let (was, edition, root) = match *slot {
+                Some(it) => it,
+                None => {
+                    let root = db.source_root(db.file_source_root(data.root_file_id).source_root_id(db));
+                    (!root.source_root_ref(db).is_library, data.edition, data.root_file_id)
+                }
+            };
+            *slot = Some((was && edition == data.edition && narrow(unit), edition, root));
+        }
+        // What a macro read off the disk, by its last name: a file of the tree named through
+        // a link is another path, and one name.
+        let files = db.files();
+        let last = |path: &str| path.rsplit('/').next().unwrap_or(path).to_owned(); // alloc: a name, once a file read off the disk
+        // alloc: the names of the files macros read off the disk, a few
+        let mut read: Vec<String> = files.included_files().iter().map(|it| last(it.as_str())).collect();
+        read.extend(files.included_sources().iter().map(|(path, _)| last(path.as_str())));
+        read.sort_unstable();
+        read.dedup();
+        let mut still = Vec::new(); // alloc: once a build that walked and made nothing
+        for (ok, edition, root) in sets.into_iter().flatten() {
+            if !ok {
+                continue;
+            }
+            let root = db.source_root(db.file_source_root(root).source_root_id(db));
+            let set = root.source_root_ref(db);
+            if set.is_library {
+                continue;
+            }
+            for file in set.iter() {
+                let Some(path) =
+                    set.path_for_file(&file).and_then(|it| it.as_path()).map(|it| it.as_str())
+                else {
+                    continue;
+                };
+                if !path.ends_with(".rs") || !db.has_file_text(file) {
+                    continue;
+                }
+                let name = path.rsplit('/').next().unwrap_or(path);
+                if read.binary_search_by(|it| it.as_str().cmp(name)).is_ok() {
+                    continue;
+                }
+                still.push(StillSource { path: path.to_owned(), edition }); // alloc: the edge
+            }
+        }
+        still.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+        still.dedup_by(|a, b| a.path == b.path);
+        Ok(still)
     }
 
     /// Gives each library crate of unit `unit`'s closure (a registry's, a git's, any library
@@ -1542,6 +1635,37 @@ impl Lowered {
         }
     }
 
+    /// Whether unit `unit` writes MSL ([`Lowered::gpu_msl`]): an error naming it if not.
+    pub fn check_gpu_msl(&self, unit: usize) -> Result<&str, LowerError> {
+        let Some(lowering) = self.crates.units.get(unit) else {
+            return Err(LowerError::new(format!("the build has no unit {unit}")));
+        };
+        lowering.gpu_msl.as_deref().ok_or_else(|| {
+            LowerError::at(
+                // alloc: error path
+                format!(
+                    "{} writes no MSL: only the device unit of an `artifact = \"gpu\"` dependency does",
+                    lowering.what
+                ),
+                lowering.what.clone(),
+            )
+        })
+    }
+
+    /// The MSL device unit `unit` wrote, `msl`, set as the bytes of its file (`UnitPlan::gpu_msl`)
+    /// for its dependents' `include_str!(env!("BLAZE_GPU_MSL_<CRATE>"))` to read, before and
+    /// whatever placement puts on disk ([`Db::set_included_file`]). A crate that read the file
+    /// before reads it again; one keyed by it is keyed by these bytes. A write, as
+    /// [`Lowered::ran`] is.
+    pub fn gpu_msl(&mut self, unit: usize, msl: &[u8]) -> Result<(), LowerError> {
+        let path = abs(self.check_gpu_msl(unit)?)?;
+        self.identities.clear();
+        let trigger = Trigger::of("a device build's MSL applied", &self.crates.units[unit].what);
+        let bytes = std::sync::Arc::<[u8]>::from(msl);
+        Db::batch_in(&mut self.db, |db| db, trigger, |db| db.set_included_file(&path, bytes));
+        Ok(())
+    }
+
     /// The expanders of proc-macro unit `unit` once it is built (or why it has none), for the
     /// crates depending on it to expand its macros with. Until then they are
     /// `ProcMacroLoadingError::NotYetBuilt`. A write, as [`Lowered::ran`] is.
@@ -1699,6 +1823,15 @@ pub enum IdentityPart {
     Spelling(ContentId),
     /// A crate it depends on, by the name its code uses, with that crate's identity.
     Dependency { krate: Crate, name: String, identity: ContentId },
+}
+
+/// A Rust source of a workspace package that every key of a build holds by its code text
+/// alone ([`Lowered::still_sources`]): its path as the front end names it, and the edition
+/// its crates parse it in.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct StillSource {
+    pub path: String,
+    pub edition: span::Edition,
 }
 
 /// A crate as the keys that leave trivia out know it ([`Lowered::narrowed`]).

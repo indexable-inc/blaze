@@ -1,5 +1,5 @@
 // Kip, den's mascot (harness-native-kip; copied from den-native's scene/45-mascot.flecs): the `ui.Mascot` primitive (a node with `Kip`) and his one
-// look and motion, `ui.kip`. A small voxel creature drawn by harness-native-render's mascot pass (shaders/mascot.slang),
+// look and motion, `ui.kip`. A small voxel creature drawn by harness-native-render's mascot pass (harness-native-shaders' `mascot`),
 // live: he breathes, blinks, looks toward the pointer and plays moods (`Kip.mood`). Every timing is a token (`kip_*`, below); colours are sRGB per appearance, the den palette's periwinkle and ink. Loaded after prims.flecs.
 
 // Kip's tokens: his default height, his shading and every timing of his motion (den's values; MascotMotion and

@@ -411,7 +411,7 @@ impl Journal {
             let tickets = std::mem::take(&mut self.open).tickets;
             self.rewriting = bytes.len() as u64;
             // clone: an effect owns its file's name (blaze-core's `Effect`); one per effect.
-            effects.push(Effect::Write { file: self.file.clone(), bytes, tag: self.tag(REWRITE) });
+            effects.push(Effect::Write { file: self.file.clone(), bytes, tag: self.tag(REWRITE) }); // durable: the journal rewritten whole is the one record of the tree's heads; a ticket is told durable only once it is on disk
             self.flight = Flight::Rewriting(tickets);
             return;
         }
@@ -454,14 +454,14 @@ impl Journal {
         match (offset, completion.done, std::mem::replace(&mut self.flight, Flight::Idle)) {
             (APPEND, Done::Appended, Flight::Appending(tickets)) => {
                 // clone: an effect owns its file's name (blaze-core's `Effect`); one per effect.
-                effects.push(Effect::Sync { file: self.file.clone(), tag: self.tag(SYNC) });
+                effects.push(Effect::Sync { file: self.file.clone(), tag: self.tag(SYNC) }); // durable: the journal's appended records: their tickets are told durable when this completes
                 self.flight = Flight::Syncing(tickets);
             }
             (SYNC, Done::Synced, Flight::Syncing(tickets)) => durable = tickets,
             (CUT, Done::Truncated, Flight::Cutting) => {
                 self.cut = None;
                 // clone: an effect owns its file's name (blaze-core's `Effect`); one per effect.
-                effects.push(Effect::Sync { file: self.file.clone(), tag: self.tag(SYNC) });
+                effects.push(Effect::Sync { file: self.file.clone(), tag: self.tag(SYNC) }); // durable: the journal cut to its good prefix: the cut is on disk before anything is appended after it
                 // alloc: empty, allocates nothing.
                 self.flight = Flight::Syncing(Vec::new());
             }

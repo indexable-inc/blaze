@@ -1,17 +1,18 @@
 ---
 status: plan
-summary: The long-term verifier: blaze translates its own borrow-checked MIR to Lean 4 (a query in the front end) and proves specs written once in blaze's extensions. v0 safe Rust by functional translation, v1 unsafe and interior mutability in an Iris-style logic, v2 atomics (SC, then RC11), v3 crashes on files and mmap (Perennial-style, sharing the DST's kernel model), v4 compiler correctness. DST stays on everything.
-date: 2026-11-04
+summary: The verifier: blaze translates its own borrow-checked MIR to Lean 4 and the pinned Lean checks proofs of specs written once in blaze's extensions. v0 (safe Rust by functional translation) is written in crates/hir-ty-lean with the first proof in the tree; the Verus tier was retired on 2026-11-10. Planned: v1 unsafe and interior mutability in an Iris-style logic, v2 atomics (SC, then RC11), v3 crashes on files and mmap (Perennial-style, sharing the DST's kernel model), v4 compiler correctness. DST stays on everything.
+date: 2026-11-10
 ---
 # Formal verification: blaze's MIR to Lean
 
-This is the long-term plan for proofs in blaze. blaze translates its own MIR to Lean 4, and a
-Lean program logic proves the specs. Other docs own the parts this one builds on, and it links
+This is the plan for proofs in blaze. blaze translates its own MIR to Lean 4, and a Lean
+program logic proves the specs. v0 is written ("v0 as built" below); the later phases are plan. Other docs own the parts this one builds on, and it links
 to them rather than repeating them:
 
-- **The spec form and the first prover**: lane verus ([verus.md](verus.md)). It owns
-  the native clause grammar (`requires`, `ensures`, `invariant`, `spec fn`, `ghost`/`tracked`),
-  `VerifyRefused`, the interface `proved(..) -> Option<ProofKey>`, and `blaze check --verify`.
+- **The spec form**: the native clause grammar (`requires`, `ensures`, `invariant`,
+  `decreases`, a named return) and `VerifyRefused`, which lane verus built and
+  [verus.md](verus.md) records. The interface `proved(..)` is `crates/hir-ty-lean`'s since
+  2026-11-10.
 - **Checked, generated, used contracts**: [contracts.md](contracts.md).
 - **Purity and effects**: [pure-fns.md](pure-fns.md) and [effects.md](effects.md).
 - **How unsafe code is checked today**: [unsafe.md](unsafe.md), with the shared-memory rules in
@@ -21,9 +22,9 @@ to them rather than repeating them:
 - **The store and incremental checks**: [verify.md](verify.md). Despite its name, that doc is
   not about program proofs.
 
-## Decisions (2026-11-04)
+## Decisions (2026-11-04; the Verus tier retired 2026-11-10)
 
-### Lean, not Verus, in the long term
+### Lean, not Verus
 
 - **One prover for everything.** Lean, with a program logic written in Lean, covers pure
   code, unsafe code (separation logic), concurrent code (atomics, then weak memory), durable
@@ -33,7 +34,7 @@ to them rather than repeating them:
   designed for, and nobody has built them on it.
 - **No SMT brittleness.** A Lean proof is a term that the kernel checks. It does not shift
   when a solver version changes, a seed changes or a trigger heuristic changes. Lean's
-  `maxHeartbeats` is a deterministic budget, as Z3's `rlimit` is in lane verus. But a failed
+  `maxHeartbeats` is a deterministic budget, as Z3's `rlimit` was in lane verus. But a failed
   Lean proof fails for a reason the user can read, not because of an `unknown`.
 - **Agents write most proofs, and the AI-prover ecosystem is strongest on Lean.** Microsoft's
   SymCrypt work verifies production Rust through Aeneas and Lean, and agents write the proofs:
@@ -46,16 +47,15 @@ to them rather than repeating them:
   branch is now `lean`, built on iris-lean ([mit-pdos/perennial](https://github.com/mit-pdos/perennial)).
   So the crash-aware concurrent separation logic that v3 needs already exists in the target
   prover.
-- **What Verus is better at.** First proofs come faster, SMT automates linear arithmetic and
+- **What Verus was better at.** First proofs came faster, SMT automates linear arithmetic and
   quantifier reasoning, and
   [AutoVerus](https://www.microsoft.com/en-us/research/publication/autoverus-automated-proof-generation-for-rust-code/)
-  shows LLMs proving Verus-Bench tasks. That is why lane verus stays as the near-term
-  prover (see "Verus in the meantime").
+  shows LLMs proving Verus-Bench tasks. That was the reason to keep lane verus as the
+  near-term prover; on 2026-11-10 Andrew decided against two provers (see "Verus retired").
 - **No rustc.** Upstream Verus (`rust_verify`) and Aeneas's front end, Charon, are both
-  rustc drivers. `no-rustc` forbids them. Lane verus already replaced Verus's rustc end with
-  a lowering from blaze's HIR. This plan does the same for Aeneas: blaze translates from its
-  own front end, and nothing runs rustc. Neither prover is ruled out by rustc. Lean wins on
-  capability.
+  rustc drivers. `no-rustc` forbids them. Lane verus had replaced Verus's rustc end with a
+  lowering from blaze's HIR. blaze does the same for Aeneas: it translates from its own front
+  end, and nothing runs rustc. Neither prover was ruled out by rustc. Lean won on capability.
 
 ### DST on everything, proofs on small stable cores
 
@@ -81,7 +81,7 @@ to them rather than repeating them:
 
 ### Specs written once, in blaze's extensions
 
-- **One home for specs: the Rust source.** Specs are lane verus's native clauses, plus
+- **One home for specs: the Rust source.** Specs are the native clauses, plus
   `#[blaze::pure]`, the effect attributes, and `ghost`/`tracked`/`proof fn` code
   (`one-concept-one-home`). There are no specs in a Lean-side DSL and no second annotation
   syntax. Every Lean theorem statement about Rust code is generated from these specs.
@@ -96,18 +96,27 @@ to them rather than repeating them:
   `#[blaze::pure]` function's model can be called directly from specs. These are facts the
   front end has already proved, so they cost no new trust.
 
-### Verus in the meantime
+### Verus retired (2026-11-10)
 
-Lane verus continues with its VIR/AIR/Z3 tier for arithmetic clauses, which feed
-contracts part 3.
+Andrew decided on 2026-11-10 that Lean is the prover and the Verus tier goes now, not when v0
+proves every clause it proved: two provers are two trust bases and two lowerings of one spec.
 
-- **Both provers answer the same `proved(..)`.** The `ProofKey`'s "how" names the backend,
-  so a caller's code identity records which prover stands behind each fact it relies on.
-- **The specs are shared.** The spec has one home, and the two provers are two back ends
-  behind one interface.
-- **Retiring Verus.** When v0 proves every clause the Verus tier proves, retiring the Verus
-  tier gets decided, and its `ProofKey` variant is banned through the usual lint (open
-  question 1).
+- **Deleted:** `crates/hir-ty-verus` (the VIR lowering and the Z3 driver), `vendor/verus`,
+  `tools/v2/verus_strip.py`, the pinned Z3 and `BLAZE_Z3`. `.clippy.toml` bans the removed
+  names with their replacements. [verus.md](verus.md) is the record.
+- **One home for specs.** The clauses are in the Rust source; hir-def lowers them to clause
+  groups (`ExpressionStore::spec_clauses`); `crates/hir-ty-lean` states them in Lean
+  (`spec.rs`) and owns `proved(..)`, `Clause` and `ProofKey`; `crates/hir-ty-contracts` reads
+  the groups for the facts the optimizer may use and asks `proved` through the prover it is
+  given.
+- **What lost its prover.** Each is reported "not proved", with why, and never passed:
+  - an `ensures` with no proof file: Z3 proved linear arithmetic over integers and booleans
+    from the clause and the body alone; Lean checks a proof someone wrote and searches for
+    none. Contracts part 3's `r < K` facts are in this class until their callees have proofs;
+  - a loop's `invariant` as an obligation, and termination from `decreases`: the Lean
+    statement of a function with a loop is partial correctness, and `decreases`, `recommends`
+    and a loop's `ensures` are refused by name;
+  - a counterexample from the solver's model: contracts part 2's Hegel run is the one source.
 
 ## Shared pieces (all phases)
 
@@ -119,7 +128,7 @@ contracts part 3.
    Charon makes LLBC from ULLBC ([Charon](https://arxiv.org/abs/2410.18042)). It also folds
    checked arithmetic and bounds assertions back into single operations. Every back end below
    reads this one query.
-2. **Spec lowering.** The clause groups from lane verus, which MIR building drops, are
+2. **Spec lowering.** The clause groups (hir-def's), which MIR building drops, are
    lowered from typed HIR into Lean terms: `int`/`nat` for spec arithmetic, `forall`,
    `==>`, `old`, and `spec fn`.
 3. **Lean emission.** One Lean module per item instance, so a module's imports are exactly
@@ -127,8 +136,7 @@ contracts part 3.
    for its clauses, and a reference to the proof by name.
 4. **Proof check.** blaze runs the pinned Lean toolchain on the generated module plus the
    user's proof file. The toolchain is a pinned input that blaze fetches itself, as the
-   remove-nix plan requires. Lane verus gets `BLAZE_Z3` from the flake today, and that moves
-   the same way.
+   remove-nix plan requires; today `BLAZE_LEAN_PROVER` names its `lean` by an absolute path.
 
 ### Where proofs live and what counts as proved
 
@@ -154,7 +162,7 @@ contracts part 3.
   - the target's pointer width and endianness;
   - the std model's version;
   - the specs of every callee. A callee's body is not an input, because verification is
-    modular, as in lane verus.
+    modular.
 - **The proof key** covers:
   - the generated module and every module it imports;
   - the proof file;
@@ -168,12 +176,11 @@ contracts part 3.
 
 ### The command and its output
 
-`blaze check --verify` (lane verus's decision: one command for checks) runs every changed
-obligation. It reports each obligation as one record, rendered for a terminal and given to
+`blaze check --verify` (one command for checks; not built) runs every changed obligation. It reports each obligation as one record, rendered for a terminal and given to
 agents as data over the agent API ([roadmap §8](../../plan.md)):
 
 ```text
-{ item, clause, prover: lean|verus, key,
+{ item, clause, prover: lean, key,
   outcome: Proved
          | Open { goals }            -- the remaining Lean goals, pretty-printed, hypotheses named
          | Failed { tactic_error }
@@ -240,8 +247,8 @@ used, `sort_unstable_by_key`, and `chunk_by`.
   path it stands for, and a Hegel differential test compares the Lean model, compiled, with
   the real std function that blaze built, on drawn inputs.
 
-**Refused.** These produce lane verus's `VerifyRefused` diagnostic, which names the item, the
-rule and the construct; there is no second diagnostic.
+**Refused.** Each names the item, the rule and the construct (`hir_ty_lean::NotTranslated`
+today; the `VerifyRefused` diagnostic once `blaze check --verify` reports it).
 
 | Rule | What it covers |
 |---|---|
@@ -324,6 +331,116 @@ Second targets:
   cache, so only changed keys rerun.
 - The release train runs a cold replay of every proof, plus the LLBC oracle and differential
   runs on the corpus.
+
+## v0 as built (2026-11-10)
+
+`crates/hir-ty-lean` (the translator and the driver), `lean/` (the library and the checked-in
+models) and `crates/blaze-graph/lean/` (the first proof). It was written without being built
+or run: until the tests and `lake build` have passed on a named commit, read this section as
+what the code is meant to do. Where the plan above left a choice, this is the choice.
+
+**Structured MIR** (`structured.rs`, `body.rs`; `hir_ty_lean::structured(db, func)`).
+- Over built MIR (`mir_body`), after type checking and borrow checking accept the function.
+  It is in its own crate and not in hir-ty-mir: it is a reading of MIR for back ends, not a
+  pass, and hir-ty-mir need not build it. It is computed from memoized queries and is not yet
+  a memoized query itself.
+- Control flow is reconstructed by Ramsey's algorithm ("Beyond Relooper") over the dominator
+  tree: `Branch`, `Loop`, `Block`, `Break`, `Continue`, `Return`. The code a loop exits to is
+  put after the loop. An irreducible graph is refused, naming the edge; nothing is duplicated.
+- Unwind edges are not followed and cleanup blocks are never reached: a panic is `fail`.
+  Storage markers, fake reads and drops go (a type with a destructor is refused).
+- Built MIR already has a checked operation in one statement (`CheckedBinaryOp`) and an index
+  in its place; runtime MIR's spread forms (`AddWithOverflow`, `Assert`, the read of `.0`;
+  `Len`, `Lt`, `Assert` before an index) are folded back to the same.
+- A `&mut` temporary assigned once is replaced by the place it borrows.
+- Its refinement test lowers random structured programs to graphs, reconstructs them and runs
+  all three (`structured_code_runs_as_its_graph`, with two planted bugs).
+
+**The translation** (`translate.rs`).
+- Integers are `Blaze.Scalar ty`: an `Int` with its range, as in Aeneas's first Lean library,
+  so `omega` proves arithmetic facts for signed and unsigned alike and nothing trusts native
+  evaluation. `usize` is 64 bits; v0 translates for 64-bit little-endian targets.
+- A local is a Lean variable rebound at each assignment; a write of a field, a tuple field or
+  an index rebinds the local to an updated copy.
+- `fn f(x: &mut T) -> R` is `f (x : T) : R × T` (`T` alone when `R` is `()`): one function,
+  the backward function merged into it. A function that returns a `&mut` is refused.
+- A branch or block nothing jumps out of is an expression of the locals it changes that are
+  live after it; one with a `return` or an outer `break` takes what follows into its arms.
+- **Loops: fuel.** A loop is `f.loop_N (fuel : Nat) (live locals)`, recursive on `fuel`
+  (structural, so Lean needs no termination proof), `Result.div` at zero. A function with a
+  loop, or calling one, takes `fuel` first. This form is emitted for every loop: neither
+  `partial_fixpoint` nor a `decreases` measure is used yet. A jump from a loop to a loop
+  around it other than a plain `break` is refused (the two functions would be mutually
+  recursive).
+- **Plain function or `Result`.** A model is in `Result` when a fallible operation is left in
+  its body: checked arithmetic (`+ - * << >>` under `overflow-checks`, read from the crate's
+  cfg as MIR building reads it; `/`, `%` and `-` always), an index, an assert, a panic, a
+  loop, or a call of a model in `Result`. With none, it is a plain Lean function. This is
+  decided from the body, not yet from the effects walk's `nopanic`.
+- Calls: a non-generic free function with a body is translated into its own module, which
+  the caller's module imports. Core's `wrapping_add/sub/mul`, `saturating_add/sub` on
+  integers and `len` on slices have models in the library. Any other call into the standard
+  library is refused (`NoModel`).
+
+**Refused** (`NotTranslated { function, what, at }`): raw pointers, `unsafe fn`, statics,
+inline assembly, extern functions, `catch_unwind`, closures, function pointers, `async` and
+coroutines, trait objects, floats, `char`, `str`, `Box`, unions, generic functions and types,
+methods and trait calls, a type with a destructor, a `&mut` inside another type or returned or
+chosen at run time, slice patterns, unsizing and pointer casts, recursion, tail calls,
+`for const`, irreducible control flow, a field of an enum's variant read outside its `match`
+arm. `unsafe` blocks are refused through what they do (a raw pointer, a static, an extern
+call), not yet by themselves.
+
+**Specs** (`spec.rs`). `requires` and `ensures` (with a named return) over literals,
+parameters, the result, `!`, `-`, `+ - *`, comparisons, `&&`, `||`, a field and a slice's
+`len()`. Integers are their `.val : Int`. `forall`, `==>`, `old` and `spec fn` are not in the
+grammar on main; a loop's `invariant` is not lowered (a Lean proof brings its induction);
+`decreases`, `recommends` and a loop's `ensures` are refused by name.
+
+**Emission** (`hir_ty_lean::emit`). One module per function, `BlazeModel.<krate>.<path>`:
+its types, its loops, the model, and `def <fn>.spec.statement : Prop`: for all arguments (and
+all fuel) under the `requires`, the model does not fail and its result meets the `ensures`;
+out of fuel is allowed, so a function with a loop gets partial correctness.
+
+**Where things live.**
+- The library: `lean/Blaze` (`Result`, `Scalar`, `Slice`, `Std`), core Lean only, no Mathlib.
+  It is built into blaze (`hir_ty_lean::LIBRARY`), so a proof key covers its text. It is
+  blaze's own, written for this translation, not a fork of Aeneas's library.
+- Generated modules: a directory blaze owns (`Config::out`), never the source tree. The
+  copies under `lean/BlazeModel` are test expectations: the golden tests hold each to what
+  the translator emits, byte for byte, so `lake build` in `lean/` type-checks the
+  translator's output and the proofs over it without blaze in the loop.
+- Proofs: `lean/` beside the crate's `src/`, one file per Rust module, each path segment in
+  upper camel case (`blaze_graph::ledger` is `crates/blaze-graph/lean/BlazeGraph/Ledger.lean`,
+  the crate's root `<Crate>/Lib.lean`). A proof file imports the model and gives
+  `theorem <fn>.spec.proof : <fn>.spec.statement`. It never restates the statement, so there
+  is nothing to re-bind: blaze's check module states
+  `theorem <fn>.spec : <fn>.spec.statement := <fn>.spec.proof`, which fails to elaborate, naming
+  the theorem, when the proof is of anything else.
+
+**The check** (`hir_ty_lean::check`, `proved`). The pinned Lean is 4.20.0
+(`lean/lean-toolchain`), named by `BLAZE_LEAN_PROVER` (an absolute path to `lean`; no `PATH`,
+no elan; `BLAZE_LEAN` was taken by the code generator), and refused when `--version` says
+another. Proved means Lean accepts the check module and `#print axioms` lists only `propext`,
+`Classical.choice` and `Quot.sound`: a `sorry` (`sorryAx`) and native evaluation
+(`Lean.ofReduceBool`) are refused by name. The proof key covers the Lean version, the
+translator's version, the allowed axioms, the library, every model the proof can see, the
+check module and the proof file. Lean is not yet run in blaze's sandbox, verdicts are not yet
+persisted, and `blaze check --verify` does not exist: the entry is the function.
+
+**The first proof** (objective V5). `blaze_graph::ledger::fnv1a_from`, the checksum of the
+memory ledger's file. blaze's own crates do not turn `blaze_verify` on yet, so its `ensures`
+is on a test fixture that reads the function's text from the tree. The proof file
+`crates/blaze-graph/lean/BlazeGraph/Ledger.lean` states and proves: the loop never fails (no
+index out of bounds, no counter overflow), what it returns is FNV-1a's fold of the seed over
+the bytes, it returns with more fuel than bytes, and the generated statement follows. The
+test `fnv1a_from_is_the_fold_of_its_bytes` states the invariant as proved.
+`harness/v2/lean_differential.py` runs the compiled model against the function blaze built.
+
+**How to run it.** The Rust tests: `blaze test -p hir-ty-lean` (one needs
+`BLAZE_LEAN_PROVER`). The Lean: `lake build` in `lean/` with the pinned toolchain builds the
+library, every golden model and the proofs. After a deliberate change to the translator,
+`UPDATE_EXPECT=1` rewrites the goldens, and `lake build` must pass again.
 
 ## v1: interior mutability and unsafe, by deep embedding
 
@@ -481,11 +598,11 @@ nightly bump, and a proof that breaks on a bump blocks the bump. It must not be 
 
 ## Open questions
 
-1. **When to retire Verus.** Do we retire lane verus's Z3 tier once v0 matches it, or keep
-   SMT as a fast first try that hands off to Lean? Keeping both means keeping two trust
-   bases.
+1. **When to retire Verus.** Decided 2026-11-10: now ("Verus retired"). Open instead: which
+   automation closes the clauses Z3 proved unaided (`omega` and `simp` tried on the generated
+   statement before a proof file is asked for, or agents writing the proofs).
 2. **`blaze verify` or `blaze check --verify`.** This brief asked for a `blaze verify`
-   command. Lane verus decided on `blaze check --verify`. Does interactive proof work (goal
+   command. Lane verus had decided on `blaze check --verify`. Does interactive proof work (goal
    states, holes, `Open` loops) need its own subcommand, or is the agent API enough?
 3. **The manifest codec.** Does the manifest move from `serde_json` derive to a small
    hand-written codec, so its round trip is provable without modelling serde?

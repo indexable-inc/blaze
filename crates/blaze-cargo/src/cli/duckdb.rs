@@ -95,6 +95,7 @@ fn unpack(archive: &Path, to: &Path) -> io::Result<()> {
             use std::os::unix::fs::PermissionsExt as _;
             file.set_permissions(fs::Permissions::from_mode(0o755))?;
         }
+        // durable: review: the unpacked DuckDB is a download unpacked again when missing; synced so its name never holds a torn program, which nothing checks before running it
         file.sync_all()?;
         fs::rename(&part, to)
     })();

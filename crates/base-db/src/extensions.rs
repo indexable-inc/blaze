@@ -1,6 +1,6 @@
 //! A crate's syntax extensions ([`Extensions`], docs/v2/plan/design/edition.md): the crate-level
-//! attributes that change how the crate's files parse, `#![blaze::uniq]` and
-//! `#![blaze::error_unions]` today.
+//! attributes that change how the crate's files parse: `#![blaze::uniq]`,
+//! `#![blaze::error_unions]` and `#![blaze::records]` today.
 //!
 //! A file's parse depends on them, so they are read before any parse: off the tokens of the
 //! crate root's leading inner attributes and of its command-line crate attributes
@@ -23,7 +23,11 @@ use crate::{Crate, Db};
 /// What turns each syntax extension on: its crate attribute's path, as its tokens' text
 /// joined. One row per bit of [`Extensions`] (`every_extension_has_its_attribute` checks).
 const EXTENSION_ATTRS: [(&str, Extensions); Extensions::ALL.len()] =
-    [("blaze::uniq", Extensions::UNIQ), ("blaze::error_unions", Extensions::ERROR_UNIONS)];
+    [
+        ("blaze::uniq", Extensions::UNIQ),
+        ("blaze::error_unions", Extensions::ERROR_UNIONS),
+        ("blaze::records", Extensions::RECORDS),
+    ];
 
 impl Crate {
     /// The syntax extensions the crate's attributes turn on: see the module.

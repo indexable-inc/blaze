@@ -389,6 +389,24 @@ impl Steps for Real {
                 let fresh = session.is_none();
                 if fresh {
                     blaze_item_hash::impls::install(lowered.served_db());
+                    // Which front end computes a body's identity, told before any is asked:
+                    // the one the goal store and the item store are given below. Until
+                    // 2026-11-10 nothing told it, so every identity was `Err("no front-end
+                    // build is set")` behind an untracked read of the singleton's absence:
+                    // the item store refused every body (`Refusal::NoIdentity`), and
+                    // `identity_of` ran again for every body it was asked of in every
+                    // revision (about 10,000 runs a build, all `ran_untracked`). A database
+                    // lowered into again was told when it was made.
+                    blaze_item_hash::identity::set_build(lowered.served_db(), deps::front_end()?);
+                }
+                // The guard: a build whose database was not told stops here, naming it, where
+                // it used to go on with no identity and an untracked read a body.
+                if blaze_item_hash::identity::FrontEnd::try_get(lowered.db()).is_none() {
+                    // alloc: an error, once
+                    return Err(Failed::Error(ApiError::new(
+                        "the front end's database was not told which front end computes its bodies' identities (`blaze_item_hash::identity::set_build`), so each would be asked again in every revision and none filed",
+                        None,
+                    )));
                 }
                 let mut session = match session {
                     Some(session) => session,
@@ -445,6 +463,7 @@ impl Steps for Real {
                     ready: Vec::new(),
                     runs: Vec::new(),
                     macros: Vec::new(),
+                    msls: Vec::new(),
                     deps,
                     flushed,
                     broke: Vec::new(),
@@ -815,6 +834,8 @@ pub struct UnitWriter {
     runs: Vec<(usize, Ran)>,
     /// Proc macros' loads asked for, checked, in the order asked.
     macros: Vec<(usize, ProcMacroLoadResult)>,
+    /// Device units' MSL asked for, checked, in the order asked.
+    msls: Vec<(usize, Vec<u8>)>,
     /// What this job's serves served of crates whose key moved ([`deps::serve`]), for the front
     /// end's images to be stored with it: none when no key moved.
     deps: Option<deps::Kept>,
@@ -859,12 +880,22 @@ impl Writer<Real> for UnitWriter {
         Ok(())
     }
 
+    fn gpu_msl(&mut self, unit: usize, msl: Vec<u8>) -> Result<(), ApiError> {
+        self.front.check_gpu_msl(unit).map_err(lower_error)?;
+        self.msls.push((unit, msl));
+        Ok(())
+    }
+
     fn waiting(&self) -> bool {
-        !self.runs.is_empty() || !self.macros.is_empty() || self.release.due()
+        !self.runs.is_empty() || !self.macros.is_empty() || !self.msls.is_empty() || self.release.due()
     }
 
     fn began(&mut self, unit: usize) {
         self.release.began(unit);
+    }
+
+    fn found_kept(&mut self, unit: usize) {
+        self.release.kept(unit);
     }
 
     fn compiled(&mut self, unit: usize) {
@@ -894,7 +925,7 @@ impl Writer<Real> for UnitWriter {
         // First, with the readers stopped for it or for the writes below: what the crates
         // finished so far keep ([`release`]).
         self.release.release(lowered);
-        if self.runs.is_empty() && self.macros.is_empty() {
+        if self.runs.is_empty() && self.macros.is_empty() && self.msls.is_empty() {
             return Ok(true);
         }
         self.ready.clear();
@@ -904,15 +935,22 @@ impl Writer<Real> for UnitWriter {
             .iter()
             .map(|(unit, _)| *unit as u32)
             .chain(self.runs.iter().map(|(run, _)| *run as u32))
+            .chain(self.msls.iter().map(|(unit, _)| *unit as u32))
             .collect();
         let trigger_of =
             touched.iter().map(|&unit| lowered.what(unit as usize)).collect::<Vec<_>>().join(", "); // alloc: as `touched`
         let trigger =
-            Trigger::of("proc macros loaded and build scripts' runs applied", &trigger_of);
+            Trigger::of("proc macros loaded, build scripts' runs and device builds' MSL applied", &trigger_of);
         // alloc: once an apply, the proc macros it loaded
         let mut loaded: Vec<u32> = Vec::with_capacity(self.macros.len());
-        let (waits, ready, broke, macros, runs) =
-            (&mut self.waits, &mut self.ready, &mut self.broke, &mut self.macros, &mut self.runs);
+        let (waits, ready, broke, macros, runs, msls) = (
+            &mut self.waits,
+            &mut self.ready,
+            &mut self.broke,
+            &mut self.macros,
+            &mut self.runs,
+            &mut self.msls,
+        );
         let first = touched[0] as usize;
         // Each write's failure, an error or a panic, is its unit's ([`Writer::broke`]): the
         // writes after it are still applied, and only the units that depend on it are refused.
@@ -931,6 +969,20 @@ impl Writer<Real> for UnitWriter {
                     let applied = applying_fallible(run, "a build script's run", || {
                         lowered.ran(run, &ran).map_err(lower_error)?;
                         waits.applied(run as u32, ready);
+                        Ok(())
+                    });
+                    if let Err(it) = applied {
+                        ready.truncate(from);
+                        broke.push(it);
+                    }
+                }
+                // A device unit's MSL is, to its dependents, what a run is: what their crates
+                // read, once applied ([`graph::flag::GPU_MSL`]).
+                for (unit, msl) in msls.drain(..) {
+                    let from = ready.len();
+                    let applied = applying_fallible(unit, "a device build's MSL", || {
+                        lowered.gpu_msl(unit, &msl).map_err(lower_error)?;
+                        waits.applied(unit as u32, ready);
                         Ok(())
                     });
                     if let Err(it) = applied {
@@ -1056,6 +1108,44 @@ impl Writer<Real> for UnitWriter {
 
     fn goals_noted(&self) -> Option<blaze_api::Diagnostic> {
         deps::noted(self.flushed.as_ref(), self.session.item_steps().as_ref())
+    }
+
+    /// The sources of the view every key of this build held by code text alone: each Rust
+    /// file of a workspace package all of whose units were found under their narrow record
+    /// key ([`compile::found_narrow`]; `blaze_lower::Lowered::still_sources` says the rest),
+    /// less every file a build script's kept run read ([`script::ReadBytes`], by its last
+    /// name), by its path from the view's root. None, with the reason, when a build script's
+    /// run was not found kept by `fresh` (its reads are not noted), when one hashed a whole
+    /// directory, or when the front end vouches for none.
+    fn still(&self) -> Result<Vec<(String, ::span::Edition)>, String> {
+        let job = &self.job;
+        let reads = job.script_reads.lock();
+        for (unit, it) in job.units().graph.units.iter().enumerate() {
+            if it.mode == Mode::RunCustomBuild && !reads.noted(unit) {
+                // alloc: a reason, once a build
+                return Err(format!(
+                    "what the build script of {} read is not noted: its run was not found kept as the build began",
+                    it.pkg_id
+                ));
+            }
+        }
+        if reads.trees {
+            // alloc: a reason, once a build
+            return Err("a build script reads a whole directory by its bytes".to_owned());
+        }
+        let sources = self
+            .front
+            .still_sources(|unit| compile::found_narrow(job, unit))
+            .map_err(str::to_owned)?; // alloc: a reason, once a build
+        let root = job.input.config.invocation.root.trim_end_matches('/');
+        Ok(sources
+            .into_iter()
+            .filter_map(|it| {
+                let path = it.path.strip_prefix(root)?.strip_prefix('/')?;
+                let name = path.rsplit('/').next().unwrap_or(path);
+                (!reads.reads(name)).then(|| (path.to_owned(), it.edition)) // alloc: the edge
+            })
+            .collect()) // alloc: once a build that walked and made nothing
     }
 
     fn keep(mut self) -> Result<KeptLowered, ApiError> {
@@ -1365,6 +1455,9 @@ pub(crate) struct Job {
     /// Each build script run prepared by `fresh`, taken by `script`, so it is prepared once.
     /// Only the loop touches it: the lock is never contended.
     pub(crate) starts: Box<[Lock<Option<Box<script::Start>>>]>,
+    /// What the build scripts' runs found kept read by their bytes ([`script::ReadBytes`]),
+    /// noted by `fresh` and read by the writer's `still`, both on the loop: never contended.
+    pub(crate) script_reads: Lock<script::ReadBytes>,
     /// The profiles its units' `-C profile-use`s name, read and given to the code generator
     /// once, and held while the job lives.
     pub(crate) profiles: OnceLock<codegen::Profiles>,
@@ -1443,6 +1536,7 @@ impl Job {
             inert: (0..slots).map(|_| Default::default()).collect(),
             pure: (0..slots).map(|_| Default::default()).collect(),
             starts: (0..slots).map(|_| Lock::new("serve.unit.starts", None)).collect(),
+            script_reads: Lock::new("serve.unit.script_reads", script::ReadBytes::default()),
             profiles: Default::default(),
             counted: (0..slots).map(|_| Default::default()).collect(),
             lint_profiles: Default::default(),
@@ -1595,6 +1689,9 @@ pub(crate) fn checks_only(goal: Goal, unit: &Unit) -> bool {
     match unit.mode {
         Mode::Check => true,
         Mode::Build if unit.target.is_custom_build() || unit.target.is_proc_macro() => false,
+        // A device unit's link is where its MSL is written (`UnitPlan::gpu_msl`), which a
+        // checked dependent's front end reads as a built one's does: under every goal.
+        Mode::Build if unit.for_device() => false,
         _ => goal == Goal::Check,
     }
 }

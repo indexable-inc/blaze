@@ -330,15 +330,29 @@ jobs:
       # The fixture has a build script, which runs in a sandbox of user namespaces.
       # 64 s with a release on 32 cores; this runner has 16 and the tree's blaze, whose own code
       # runs slower (#899). The step prints each command's seconds: tighten the bound from them.
+      # It also holds the smoke's guards (harness/v2/guards.py): on the workspace and on a one-file
+      # program, a warm no-op build, a comment edit and a body edit, each held to the table's
+      # bounds on its time and on what the daemon's profile says it did, and a program whose
+      # build script runs $RUSTC built within a bound. Its queries run the job's pinned DuckDB.
       - name: budgets.py smoke, with the blaze this tree built
         timeout-minutes: 20
+        env:
+          DUCKDB: ${{ steps.duckdb.outputs.path }}
         run: |
           if [ "$RUNNER_OS" = Linux ] && [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
             sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
           fi
-          jq -n --arg blaze "$RUNNER_TEMP/blaze/blaze" --arg out "$RUNNER_TEMP/budgets-smoke.json" \
-            '{command: "smoke", engine: {kind: "v2", blaze: $blaze}, out: $out}' > "$RUNNER_TEMP/budgets-smoke-input.json"
+          jq -n --arg blaze "$RUNNER_TEMP/blaze/blaze" --arg out "$RUNNER_TEMP/budgets-smoke.json" --arg duckdb "$DUCKDB" \
+            '{command: "smoke", engine: {kind: "v2", blaze: $blaze}, out: $out, duckdb: $duckdb}' > "$RUNNER_TEMP/budgets-smoke-input.json"
           uv run --frozen --no-dev python harness/v2/budgets.py "$RUNNER_TEMP/budgets-smoke-input.json"
+      # The smoke's result, for blaze.yaml's `ci` job, which is red without it
+      # (harness/v2/guards.py, `held`): whatever the smoke said, and when it did not run at all.
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: budgets-smoke-${{ inputs.platform }}
+          path: ${{ runner.temp }}/budgets-smoke.json
+          if-no-files-found: ignore
       - id: summary
         if: always()
         run: |

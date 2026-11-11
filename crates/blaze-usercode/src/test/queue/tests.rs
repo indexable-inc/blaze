@@ -171,7 +171,7 @@ impl Fake {
             let mut answers = Vec::new();
             for effect in effects.drain(..) {
                 match effect {
-                    Effect::Write { file, bytes, tag } => {
+                    Effect::WriteUnsynced { file, bytes, tag } => {
                         self.records.insert(file, bytes);
                         answers.push(Completion { tag, done: Done::Written });
                     }

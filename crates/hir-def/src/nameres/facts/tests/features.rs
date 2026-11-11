@@ -78,3 +78,26 @@ fn a_crate_without_features_has_none() {
     assert!(!of_root.forced_keywords);
     assert_eq!(of_root, crate_def_map(&db, krate).features());
 }
+
+/// `#![blaze::simd]` is `#![feature(portable_simd, blaze_simd)]` and nothing more; a crate
+/// without it has neither (docs/v2/plan/design/simd.md, "The gate").
+#[test]
+fn blaze_simd_turns_on_portable_simd_and_blaze_simd() {
+    let features = |root: &str| {
+        let fx = fixture::db(&format!("//- /lib.rs crate:foo crate-attr:no_std\n{root}\n"));
+        let _ = fx.only_file();
+        let db = fx.into_db();
+        let krate = db.fetch_test_crate();
+        let of_root = UnstableFeatures::of_root(&db, krate);
+        assert_eq!(of_root, crate_def_map(&db, krate).features());
+        names(of_root)
+    };
+    assert_eq!(features("#![blaze::simd]\npub struct A;"), ["blaze_simd", "portable_simd"]);
+    assert_eq!(
+        features("#![cfg_attr(all(), blaze::simd)]\n#![feature(mut_ref)]\npub struct A;"),
+        ["blaze_simd", "mut_ref", "portable_simd"]
+    );
+    assert!(features("#![cfg_attr(any(), blaze::simd)]\npub struct A;").is_empty());
+    // Another tool's `simd`, and `blaze::simd` on an item, turn nothing on.
+    assert!(features("#![rustfmt::simd]\n#[blaze::simd]\npub struct A;").is_empty());
+}

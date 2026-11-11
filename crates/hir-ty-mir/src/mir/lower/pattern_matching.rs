@@ -419,6 +419,21 @@ impl<'f, 'db> MirLowerCtx<'_, 'f, 'db> {
                 }
                 (then_target, current_else)
             }
+            // blaze: a record pattern `{ a, b: x }` (`#![blaze::records]`) matches each field
+            // named at its place in the tuple core's `Record` holds; it tests nothing itself.
+            Pat::Record { args, .. }
+                if let Some(of) =
+                    crate::record::record_fields(self.lang_items(), self.place_ty(&cond_place)) =>
+            {
+                let inner = cond_place.project(PlaceElem::Field(FieldIndex(0)));
+                let mut named = Vec::with_capacity_in(args.len(), self.frame);
+                for field in args.iter() {
+                    let at =
+                        of.index_of(field.name.as_str()).ok_or(MirLowerError::UnresolvedField)?;
+                    named.push((PlaceElem::Field(FieldIndex(at as u32)), field.pat));
+                }
+                self.pattern_match_adt(current, current_else, named.into_iter(), &inner, mode)?
+            }
             Pat::Record { args, .. } => {
                 let Some(variant) = self.infer.variant_resolution_for_pat(pattern) else {
                     not_supported!("unresolved variant for record");

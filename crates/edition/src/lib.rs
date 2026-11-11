@@ -114,8 +114,13 @@ impl Extensions {
     /// `#![blaze::error_unions]`: `A | B` in type position (docs/v2/plan/design/edition.md,
     /// change 2).
     pub const ERROR_UNIONS: Extensions = Extensions { bits: 1 << 1 };
+    /// `#![blaze::records]`: the record type `{ a: T, b: U }`, the record value
+    /// `{ a: x, b: y }`, the record pattern `{ a, b: p, .. }` and a record parameter's field
+    /// defaults (docs/v2/plan/design/records.md; docs/v2/plan/design/edition.md, change 4).
+    pub const RECORDS: Extensions = Extensions { bits: 1 << 2 };
     /// Every extension, in bit order: what a test walks to cover each set.
-    pub const ALL: [Extensions; 2] = [Extensions::UNIQ, Extensions::ERROR_UNIONS];
+    pub const ALL: [Extensions; 3] =
+        [Extensions::UNIQ, Extensions::ERROR_UNIONS, Extensions::RECORDS];
     /// How many low bits the set takes: one per extension.
     pub const BITS: u32 = Self::ALL.len() as u32;
     /// Every bit some extension has.
@@ -154,5 +159,10 @@ impl Extensions {
     /// Whether `#![blaze::error_unions]` is on.
     pub const fn error_unions(self) -> bool {
         self.bits & Self::ERROR_UNIONS.bits != 0
+    }
+
+    /// Whether `#![blaze::records]` is on.
+    pub const fn records(self) -> bool {
+        self.bits & Self::RECORDS.bits != 0
     }
 }

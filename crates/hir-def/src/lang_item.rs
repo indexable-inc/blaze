@@ -554,6 +554,10 @@ language_item_table! { LangItems =>
     /// `core::error_union::widen::<S, U>`, the conversion a coercion of a member or a smaller
     /// union to an error union calls.
     ErrorUnionWiden,         sym::error_union_widen,   FunctionId;
+    /// The type of blaze's records `{ a: T, b: U }` (`#![blaze::records]`): core's
+    /// `record::Record<"a,b", (T, U)>`, which hir-ty lowers a record type to and a record value
+    /// and pattern are of (docs/v2/plan/design/records.md).
+    Record,                  sym::record,              StructId;
 
     Freeze,                  sym::freeze,              TraitId;
 

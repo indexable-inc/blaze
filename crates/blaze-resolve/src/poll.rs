@@ -84,6 +84,7 @@ where
                 }
             }
             if !progressed {
+                // wakes: the `Unpark` waker given to every pending future, which unparks this thread when one can go on
                 std::thread::park();
             }
         }
@@ -115,6 +116,7 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
         if let Poll::Ready(v) = future.as_mut().poll(&mut cx) {
             return v;
         }
+        // wakes: the `Unpark` waker given to the future, which unparks this thread when it can go on
         std::thread::park();
     }
 }

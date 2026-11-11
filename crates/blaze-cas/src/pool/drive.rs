@@ -438,6 +438,7 @@ fn park<G: Give>(shared: &Shared<G>, queued: bool) {
         && !(queued && !shared.waiting.load(Ordering::Acquire))
     {
         *idle = true;
+        // wakes: whoever queues an ask, a file or a plan, sets `stop`, or takes `waiting` notifies `woken`; the loader serves until `stop`
         shared.woken.wait(&mut idle);
     }
     *idle = false;

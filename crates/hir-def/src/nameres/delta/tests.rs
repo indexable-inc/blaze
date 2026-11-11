@@ -1233,3 +1233,82 @@ fn a_proc_macro_crate_given_its_macros_after_its_map_was_read_resolves_them_agai
     check_db(&loaded.db, "given built macros", &Exempt::NONE, true, &mut failures);
     assert!(failures.is_empty(), "{failures}");
 }
+
+/// Three crates: `main` globs `lib`, and `other` depends on neither and neither on it.
+const REACH: &str = "//- /main.rs crate:main deps:lib\npub use lib::*;\n//- /lib.rs crate:lib\npub struct A;\n//- /other.rs crate:other\npub struct O;\n";
+
+/// The crate of `loaded` whose root is the file at `path`.
+fn crate_at(loaded: &Loaded, path: &str) -> Crate {
+    let root = loaded.file(path);
+    *all_crates(&loaded.db)
+        .iter()
+        .find(|krate| krate.data(&loaded.db).root_file_id == root)
+        .unwrap_or_else(|| panic!("no crate has `{path}` for its root"))
+}
+
+/// The crates the `nameres` maintainer had a job for in the one write `f` makes, sorted: each
+/// reports its work once, zeros included.
+fn went_over(db: &mut Db, f: impl FnOnce(&mut Db)) -> Vec<Crate> {
+    db.keep_maintained(true);
+    let mut records: Vec<Maintained> = Vec::new();
+    db.take_maintained(&mut records);
+    records.clear();
+    f(db);
+    db.take_maintained(&mut records);
+    db.keep_maintained(false);
+    let mut crates: Vec<Crate> =
+        records.into_iter().filter(|it| it.maintainer == "nameres").map(|it| it.krate).collect();
+    crates.sort();
+    crates
+}
+
+/// The invariant: a crate with no job in a write (`delta::unreached`) is one whose job would
+/// change nothing, so after any write every crate's maintained map is the one a fresh
+/// resolution makes (`check_db`). And the cost: a write of a file has a job for its crate and
+/// the crates above it alone, not one for every crate of the graph.
+#[test]
+fn a_write_of_a_file_has_a_job_for_its_crate_and_those_above_it_alone() {
+    let mut loaded = Loaded::new(REACH);
+    let (main, lib, other) =
+        (crate_at(&loaded, "/main.rs"), crate_at(&loaded, "/lib.rs"), crate_at(&loaded, "/other.rs"));
+    let file = loaded.file("/other.rs");
+    let went = went_over(&mut loaded.db, |db| db.set_file_text(file, "pub struct O;\npub struct P;\n"));
+    assert_eq!(went, vec![other], "an edit of `other` alone");
+    let file = loaded.file("/lib.rs");
+    let went = went_over(&mut loaded.db, |db| db.set_file_text(file, "pub struct A;\npub struct B;\n"));
+    let mut above = vec![main, lib];
+    above.sort();
+    assert_eq!(went, above, "an edit of `lib`, which `main` depends on");
+    let map = crate_local_def_map(&loaded.db, main).def_map(&loaded.db);
+    assert!(
+        map.module(&loaded.db, map.root).scope(&loaded.db).get(&name("B")).take_types().is_some(),
+        "`main`'s glob of `lib` did not import `B`"
+    );
+    // An edit that changes nothing a log reads (a comment) still goes over its crate, and
+    // no other but those above it.
+    let file = loaded.file("/main.rs");
+    let went = went_over(&mut loaded.db, |db| db.set_file_text(file, "pub use lib::*; // all\n"));
+    assert_eq!(went, vec![main], "an edit of `main`, which nothing depends on");
+    let mut failures = String::new();
+    check_db(&loaded.db, "a file of each crate edited", &Exempt::NONE, false, &mut failures);
+    assert!(failures.is_empty(), "{failures}");
+}
+
+/// With a crate above a written one left without a job, its map is the one from before the
+/// write: `main`'s glob of `lib` lacks the name `lib` gained, and the oracle says so.
+#[test]
+fn the_oracle_catches_a_crate_above_a_written_one_left_without_a_job() {
+    let mut loaded = Loaded::new(REACH);
+    let main = crate_at(&loaded, "/main.rs");
+    let file = loaded.file("/lib.rs");
+    super::SKIPS_ABOVE.set(true);
+    let went = went_over(&mut loaded.db, |db| db.set_file_text(file, "pub struct A;\npub struct B;\n"));
+    super::SKIPS_ABOVE.set(false);
+    assert!(!went.contains(&main), "the plant left `main` its job");
+    let mut failures = String::new();
+    check_db(&loaded.db, "a dependency gained a name", &Exempt::NONE, false, &mut failures);
+    assert!(
+        !failures.is_empty(),
+        "`main` kept the map from before `lib` gained `B`, and the oracle found no difference"
+    );
+}

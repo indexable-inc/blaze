@@ -48,6 +48,11 @@ pub(crate) struct Shared {
     segments: Box<[OnceLock<Arc<Segment>>]>,
     /// The store's limbo once the store is dropped: what readers still holding this may read.
     orphans: AtomicPtr<Limbo>,
+    /// The whole files (by content, a derived value's by its key) this run began to write and
+    /// has not seen written back: what [`crate::Reader::derivable`] refuses as a base, since
+    /// a clone of one waits for its write-back. Written by the store alone, as a file's
+    /// state changes; held for one insert, remove or lookup.
+    unflushed: blaze_core::lock::Lock<crate::ByHashSet<ContentId, Global>>,
 }
 
 impl Shared {
@@ -60,7 +65,25 @@ impl Shared {
             // alloc: once per store opened, a slot per writer
             segments: (0..SEGMENTS_MOST).map(|_| OnceLock::new()).collect(),
             orphans: AtomicPtr::new(ptr::null_mut()),
+            // alloc: empty, allocates nothing until a whole file is written
+            unflushed: blaze_core::lock::Lock::new("store.unflushed", crate::ByHashSet::new_in(Global)),
         }
+    }
+
+    /// The store began to write the whole file `id`: no base until its write-back completes.
+    pub(crate) fn unflushed(&self, id: ContentId) {
+        // alloc: one entry a whole file being written, removed when it is written back or goes
+        self.unflushed.lock().insert(id);
+    }
+
+    /// The whole file `id` is written back, or is no longer there to be cloned from.
+    pub(crate) fn settled(&self, id: &ContentId) {
+        self.unflushed.lock().remove(id);
+    }
+
+    /// Whether the store wrote the whole file `id` and has not seen it written back.
+    pub(crate) fn is_unflushed(&self, id: &ContentId) -> bool {
+        self.unflushed.lock().contains(id)
     }
 
     pub(crate) fn view<'a>(&'a self, _held: Held<'a>) -> &'a View {

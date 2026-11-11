@@ -2341,6 +2341,11 @@ fn pointee_paths(ty: ast::Type<'_>, pointee: &str, paths: &mut SmallVec<[TextRan
         ast::Type::TupleType(ty) => all_pointee_paths(ty.fields(), pointee, paths),
         ast::Type::UnionType(ty) => all_pointee_paths(ty.types(), pointee, paths),
         ast::Type::PatternType(ty) => ty.ty().is_some_and(|ty| pointee_paths(ty, pointee, paths)),
+        // blaze's record type (`#![blaze::records]`): its fields' types.
+        ast::Type::RecordType(ty) => {
+            let fields = ty.record_field_list().into_iter().flat_map(|list| list.fields());
+            all_pointee_paths(fields.filter_map(|field| field.ty()), pointee, paths)
+        }
         ast::Type::UnsafeBinderType(ty) => {
             let binder = params_pointee_paths(ty.generic_param_list(), pointee, paths);
             ty.ty().is_some_and(|ty| pointee_paths(ty, pointee, paths)) | binder

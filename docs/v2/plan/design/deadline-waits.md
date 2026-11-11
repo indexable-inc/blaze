@@ -96,12 +96,15 @@ Adopted now:
 - `mach_wait_until` (Mach, absolute `mach_absolute_time` deadline): `wait::sleep_until` on
   macOS, so a sleep's deadline is the kernel's and no relative restart exists.
 
-Later, where each wins:
 - `os_sync_wait_on_address_with_deadline` (public since 14.4, absolute deadline on
-  `OS_CLOCK_MACH_ABSOLUTE_TIME`) over `__ulock_wait2` (private, relative ns): the pool's idle
-  park, once it moves off `std::thread::park` into `wait::park_until`. The public one is more
-  capable here (absolute deadline), so it wins; `__ulock_wait2` stays the candidate for older
-  systems blaze does not support.
+  `OS_CLOCK_MACH_ABSOLUTE_TIME`) over `__ulock_wait2` (private, relative ns): `wait::Parker`
+  on macOS (landed 2026-11-10, `wait/macos.rs`), so the pool's idle park. The public one is
+  more capable here (absolute deadline), so it wins.
+
+Every macOS interface in use, each one decided against and what is still to measure is the
+audit in [docs/macos.md](../../../macos.md).
+
+Later, where each wins:
 - `thread_selfcounts` (private, per-thread cycles and instructions): `self_cpu_ns` and an
   instructions column per span.
 - `kevent_id` / workloop kqueues: per-thread queues, if a second driver thread appears.

@@ -14,6 +14,9 @@ exclude = [
     # (crates/harness/README.md).
     "crates/harness",
     "demo",
+    # Extensions (docs/v2/plan/design/extensions.md): crates outside the workspace, as a user's
+    # are; blaze-ext-host's tests link the worked example by path.
+    "extensions",
     "harness",
     # The standard library's own workspace (docs/toolchain.md).
     "library",
@@ -29,13 +32,6 @@ exclude = [
     "vendor/blake3-servil",
     # Patched below; its own tests need dev-dependencies blaze has no use for (vendor/wasmtime/SOURCE.md).
     "vendor/wasmtime",
-    # Verus's verifier crates, built only as dependencies of hir-ty-verus, and its user-side
-    # libraries, which blaze does not build yet (vendor/verus/SOURCE.md).
-    "vendor/verus/air",
-    "vendor/verus/vir",
-    "vendor/verus/vir_macros",
-    "vendor/verus/builtin",
-    "vendor/verus/vstd",
     # Charon's library (charon_lib), built only as a dependency of hir-ty-charon
     # (vendor/charon/SOURCE.md).
     "vendor/charon/charon",
@@ -167,6 +163,16 @@ unrecorded_span = "deny"
 # `lenient_deserialize` (a serde `Deserialize` derive without `#[serde(deny_unknown_fields)]`,
 # which drops an unknown field silently; AGENTS.md rule 3) is on through `internal` above, at
 # `warn`; other workspaces opt in.
+
+# The lints this workspace has once what they tell code to move to is in the tree: a line here
+# sets its level when the lint's switch in crates/blaze-lint-defs/src/ready.rs is `true`, and
+# nothing until then. A table of its own: a released blaze that does not know a lint yet (the
+# stage 0 that builds this tree) reads no table it does not know.
+[workspace.metadata.blaze.lints-when-ready]
+# Every use of Rust's std that blaze's own standard library replaces (docs/lints.md#std_use,
+# docs/v2/plan/design/std.md, step S3): on for every crate of blaze once `BSTD_IN_TREE` is
+# `true`. Until then harness/v2/std_uses.py runs the lint by its flag, for the worklist.
+std_use = "warn"
 
 # The pinned LLVM (docs/cargo.md, "Pinned native inputs"): blaze fetches the release
 # crates/hir-ty-codegen/llvm.json names for the target, checks its sha256, unpacks it read-only
@@ -302,8 +308,8 @@ hir-ty-tailck = { path = "crates/hir-ty-tailck", version = "0.0.0" }
 hir-ty-mir = { path = "crates/hir-ty-mir", version = "0.0.0" }
 hir-ty-print = { path = "crates/hir-ty-print", version = "0.0.0" }
 hir-ty-identity = { path = "crates/hir-ty-identity" }
-hir-ty-verus = { path = "crates/hir-ty-verus", version = "0.0.0" }
 hir-ty-charon = { path = "crates/hir-ty-charon", version = "0.0.0" }
+hir-ty-lean = { path = "crates/hir-ty-lean", version = "0.0.0" }
 hir-ty-pure = { path = "crates/hir-ty-pure", version = "0.0.0" }
 hir-ty-suspend = { path = "crates/hir-ty-suspend", version = "0.0.0" }
 hir-ty-share = { path = "crates/hir-ty-share", version = "0.0.0" }
@@ -321,6 +327,8 @@ blaze-resolve = { path = "crates/blaze-resolve" }
 blaze-source = { path = "crates/blaze-source" }
 blaze-units = { path = "crates/blaze-units" }
 blaze-lower = { path = "crates/blaze-lower" }
+blaze-shader = { path = "crates/blaze-shader" }
+blaze-wasm-pack = { path = "crates/blaze-wasm-pack" }
 blaze-doc = { path = "crates/blaze-doc" }
 blaze-fmt = { path = "crates/blaze-fmt" }
 blaze-fuzz = { path = "crates/blaze-fuzz" }
@@ -353,7 +361,11 @@ blaze-spin = { path = "crates/blaze-spin" }
 blaze-codegen = { path = "crates/blaze-codegen" }
 blaze-codegen-code = { path = "crates/blaze-codegen-code" }
 blaze-dbsp = { path = "crates/blaze-dbsp" }
+blaze-diff = { path = "crates/blaze-diff", version = "0.0.0" }
+blaze-diff-mir = { path = "crates/blaze-diff-mir", version = "0.0.0" }
 blaze-diagnostics = { path = "crates/blaze-diagnostics", version = "0.0.0" }
+blaze-ext = { path = "crates/blaze-ext" }
+blaze-ext-host = { path = "crates/blaze-ext-host" }
 blaze-fetch = { path = "crates/blaze-fetch" }
 blaze-format = { path = "crates/blaze-format" }
 blaze-hash = { path = "crates/blaze-hash" }

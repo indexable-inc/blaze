@@ -9,7 +9,9 @@
 //!
 //! - **The checkout's files** (sources, manifests, the lock file, `.cargo/config.toml` in it,
 //!   a build script's reads and listings in it, `include!`d files in it): the view's root
-//!   ([`Inputs::view`]), which the checkout's watcher commits before the request is seen.
+//!   ([`Inputs::view`]), which the checkout's watcher commits before the request is seen; or,
+//!   where the root is another, each file that differs is a source the walk held by its code
+//!   text alone, with the still text it had ([`LastAnswer::code_unmoved`], below).
 //! - **The request**: its command, arguments, directory, whole environment and the config
 //!   files outside the view by their bytes, the mounts (each source and path dependency
 //!   outside the view by its root), the toolchain, where the daemon builds, and the blaze
@@ -39,8 +41,30 @@
 //! What is not covered refuses ([`NotReplayed`], [`Unkept`]): the build walks, which is the
 //! whole build, and `blaze why` names the input ([`NotReplayed::input`]).
 //!
+//! # An edit that changes no code
+//!
+//! A unit is keyed by its files' code texts (`blaze_lower::code`), not their bytes, so an edit
+//! of what no code text holds leaves every key as it was, and a walk after it finds every
+//! record and says what the last one said. The lane answers such an edit too, at the file: no
+//! job, no plan, no lowering. Exactly these edits qualify, and no other: in a Rust source the
+//! walk held by code text alone ([`StillFile`]), a plain `//` comment's text, one that comes
+//! or goes at a line's end (after code, or on a line that stays a line), the spaces and tabs
+//! before a line's end, and what is after the file's last token (blank lines, `//` comment
+//! lines). They are what `blaze_lower::still_text_of` leaves out; the daemon parses each
+//! changed file once and hands the lane both still texts ([`FileEdit`]). An edit of a doc
+//! comment, of a block comment, of a line that moves the lines after it, of any token, of a
+//! file that is not such a source (a manifest, a file a build script or a macro reads, a
+//! source of a package one unit of which is keyed by its bytes: clippy's, a crate that keeps
+//! its whole text), or a file added or removed, refuses, and the build walks.
+//!
+//! A diagnostic quotes its file's lines, comments and all, so an answer whose diagnostics
+//! name a changed file is not said again ([`NotReplayed::Quoted`]): the walk renders them
+//! again from the places its record keeps (`serve::unit::compile`, `Placed`), which the lane
+//! has not.
+//!
 //! A sans-IO core (rule 14), as `serve::why` is: it reads no file, no clock and no watch;
-//! the daemon hands it the watches' word ([`Vouches`]) and the counts it read.
+//! the daemon hands it the watches' word ([`Vouches`]), the files that differ ([`Edited`])
+//! and the counts it read.
 
 use std::{
     fmt,
@@ -93,9 +117,19 @@ impl Inputs {
 
     /// The first input of `now` that is not as it is here, or none.
     pub(super) fn moved(&self, now: &Inputs) -> Option<Moved> {
-        if self.view != now.view && !planted(Plant::IgnoresFiles) {
+        if self.files_moved(now) {
             return Some(Moved::Files);
         }
+        self.moved_past_files(now)
+    }
+
+    /// Whether `now`'s view is another root than this one's.
+    fn files_moved(&self, now: &Inputs) -> bool {
+        self.view != now.view && !planted(Plant::IgnoresFiles)
+    }
+
+    /// [`Inputs::moved`] of everything but the view.
+    fn moved_past_files(&self, now: &Inputs) -> Option<Moved> {
         if self.config_id != now.config_id && !planted(Plant::IgnoresConfig) {
             return Some(config_moved(&self.config, &now.config));
         }
@@ -158,8 +192,12 @@ fn config_moved(was: &BuildConfig, now: &BuildConfig) -> Moved {
 /// An input of a kept answer that a request has another value of.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(super) enum Moved {
-    /// A file of the checkout: the view's root is another.
+    /// A file of the checkout: the view's root is another, and which files differ was not
+    /// read, or the answer's walk vouched for no source.
     Files,
+    /// This file of the checkout, by its path from the view's root: it differs, and is not a
+    /// source the answer's walk held by code text alone with the still text it had.
+    File(String),
     Command,
     Args,
     /// The directory the command runs in, or the checkout's root.
@@ -184,6 +222,7 @@ impl fmt::Display for Moved {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Moved::Files => f.write_str("a file of the checkout"),
+            Moved::File(path) => write!(f, "the checkout's file {path}"),
             Moved::Command => f.write_str("the command"),
             Moved::Args => f.write_str("the command line's arguments"),
             Moved::Directory => f.write_str("the directory the command runs in"),
@@ -304,6 +343,10 @@ pub(super) enum NotReplayed {
     OutputsMoved(PathBuf),
     /// This path, which the answer's walk found absent, is there now.
     Appeared(PathBuf),
+    /// This file of the checkout changed in what no code text holds, and a diagnostic of the
+    /// answer names it: its quoted lines may say otherwise now, and only a walk renders
+    /// them again.
+    Quoted(String),
 }
 
 impl NotReplayed {
@@ -327,6 +370,9 @@ impl NotReplayed {
                 Some(format!("the outputs under {}", dir.display()))
             }
             NotReplayed::Appeared(path) => Some(path.display().to_string()),
+            NotReplayed::Quoted(path) => {
+                Some(format!("the lines of {path} that the last build's diagnostics quote"))
+            }
         }
     }
 }
@@ -352,6 +398,10 @@ impl fmt::Display for NotReplayed {
             NotReplayed::Appeared(path) => {
                 write!(f, "{} is there now, and was not when the kept build ran", path.display())
             }
+            NotReplayed::Quoted(path) => write!(
+                f,
+                "{path} changed in what no code reads, and a diagnostic of the kept answer quotes it"
+            ),
         }
     }
 }
@@ -380,6 +430,16 @@ pub(super) enum Plant {
     KeepsALook,
     /// Keeps the answer of a build that made something.
     KeepsWork,
+    /// Keyed by code text, and takes a source whose tokens changed for one whose comments
+    /// did: says an answer again over a body edit.
+    IgnoresTokens,
+    /// Takes every file whose still text is as it was for a source held by code text: says
+    /// an answer again over a comment edit in a file a build script, a lint or a macro reads
+    /// by its bytes.
+    IgnoresHeld,
+    /// Says an answer again though a diagnostic of it quotes a file that changed: a quoted
+    /// line with a comment the file no longer has.
+    ReplaysQuotes,
 }
 
 #[cfg(test)]
@@ -400,9 +460,47 @@ fn planted(plant: Plant) -> bool {
     planted
 }
 
+/// A Rust source of the checkout that every key of a walk held by its code text alone
+/// (`blaze_lower::Lowered::still_sources`, less what a build script read): its path from the
+/// view's root, and the edition its crates parse it in, which the daemon parses it in to
+/// work out its still text.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(super) struct StillFile {
+    pub(super) path: String,
+    pub(super) edition: ::span::Edition,
+}
+
+/// A file that differs between a kept answer's view and the view asked, as the daemon read
+/// it: its path from the view's root, and, when it is there in both as text, the still text
+/// (`blaze_lower::still_text`) of each, the answer's first.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(super) struct FileEdit {
+    pub(super) path: String,
+    pub(super) still: Option<(ContentId, ContentId)>,
+}
+
+/// How the files of the view asked differ from those of a kept answer's view.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Edited<'a> {
+    /// Not read, and why: the answer's view is no longer held, more files differ than the
+    /// lane reads ([`MOST_EDITS`]), or the roots are one.
+    Unread(&'static str),
+    /// Each file that differs, by path.
+    Files(&'a [FileEdit]),
+}
+
+/// The most files that may differ for the lane to read them: past it the build walks. Each
+/// costs the daemon's loop one parse of the file as it is now (and one of it as it was, the
+/// first time), so the bound is what keeps the lane's answer in milliseconds.
+pub(super) const MOST_EDITS: usize = 8;
+/// The most bytes of one changed file the lane parses: a longer one walks.
+pub(super) const MOST_BYTES: usize = 1 << 20;
+
 /// A request, as the lane is asked of it.
 pub(super) struct Asked<'a> {
     pub(super) inputs: &'a Inputs,
+    /// How its view's files differ from the kept answer's view's, where the roots differ.
+    pub(super) edited: Edited<'a>,
     /// Its environment asks for the build's trace (`BLAZE_PROFILE`).
     pub(super) traced: bool,
     /// No other job is under way, nor a store of the checkout's kept front end.
@@ -433,9 +531,73 @@ pub(super) struct LastAnswer {
     pub(super) responses: Arc<[Response]>,
     /// Its `Work`, for a build; a check says none.
     pub(super) worked: Option<Worked>,
+    /// The sources its walk held by code text alone, sorted by path; or why it vouched for
+    /// none ([`Recording::vouch`]).
+    pub(super) still: Result<Arc<[StillFile]>, String>,
+    /// The last view asked that differs from `inputs.view` only in what no code text holds
+    /// ([`LastAnswer::code_unmoved`] said so): asked again, it is not read again.
+    pub(super) same: Option<ContentId>,
+}
+
+/// Whether `diagnostic`, or one under it, names a file whose last name is `name`: in a span,
+/// or in its rendered text (every snippet is under its file's path there).
+fn names_file(diagnostic: &blaze_api::Diagnostic, name: &str) -> bool {
+    diagnostic.rendered.contains(name)
+        || diagnostic.spans.iter().any(|span| span.file.ends_with(name))
+        || diagnostic.children.iter().any(|child| names_file(child, name))
 }
 
 impl LastAnswer {
+    /// Whether `view` is known to hold the answer's files as every key of its walk read
+    /// them: its own view, or the last one found so.
+    pub(super) fn files_known(&self, view: &ContentId) -> bool {
+        self.inputs.view == *view || self.same == Some(*view)
+    }
+
+    /// Whether a diagnostic of the answer names the file at `path`, by its last name: a
+    /// diagnostic names a file as its crate was passed it, which is not always its path from
+    /// the view's root, so any file of that name counts.
+    fn quotes(&self, path: &str) -> bool {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        self.responses.iter().any(|response| match response {
+            Response::Diagnostic(diagnostic) => names_file(diagnostic, name),
+            _ => false,
+        })
+    }
+
+    /// That `asked`'s view, another root than the answer's, holds no file a key of the
+    /// answer's walk reads otherwise: each file that differs is a source the walk held by
+    /// code text alone ([`LastAnswer::still`]), there in both views with one still text, and
+    /// no diagnostic of the answer names it. The first that is not is the reason.
+    fn code_unmoved(&self, asked: &Asked<'_>) -> Result<(), NotReplayed> {
+        if self.same == Some(asked.inputs.view) {
+            return Ok(());
+        }
+        let files = NotReplayed::Moved(Moved::Files);
+        let (Ok(still), Edited::Files(edits)) = (&self.still, asked.edited) else {
+            return Err(files);
+        };
+        // Roots that differ in no file differ in a mode or a link: not read here.
+        if edits.is_empty() || edits.len() > MOST_EDITS {
+            return Err(files);
+        }
+        for edit in edits {
+            let held = still.binary_search_by(|it| it.path.as_str().cmp(edit.path.as_str())).is_ok()
+                || planted(Plant::IgnoresHeld);
+            let same = match edit.still {
+                Some((was, now)) => was == now || planted(Plant::IgnoresTokens),
+                None => false,
+            };
+            if !held || !same {
+                return Err(NotReplayed::Moved(Moved::File(edit.path.clone()))); // clone: a reason, once
+            }
+            if self.quotes(&edit.path) && !planted(Plant::ReplaysQuotes) {
+                return Err(NotReplayed::Quoted(edit.path.clone())); // clone: a reason, once
+            }
+        }
+        Ok(())
+    }
+
     /// Whether `asked` is answered by this: every input of the answer's walk is as it was
     /// (the module's list). The first that is not is the reason.
     pub(super) fn replayable(
@@ -446,7 +608,10 @@ impl LastAnswer {
         if asked.traced {
             return Err(NotReplayed::Traced);
         }
-        if let Some(moved) = self.inputs.moved(asked.inputs) {
+        if self.inputs.files_moved(asked.inputs) {
+            self.code_unmoved(asked)?;
+        }
+        if let Some(moved) = self.inputs.moved_past_files(asked.inputs) {
             return Err(NotReplayed::Moved(moved));
         }
         if !asked.alone && !planted(Plant::IgnoresOthers) {
@@ -475,6 +640,16 @@ impl LastAnswer {
 
 /// A checkout's kept answer, or why it has none.
 pub(super) type Last = Result<LastAnswer, Unkept>;
+
+/// `view` noted as one `last`'s answer was said again of ([`LastAnswer::same`]), once
+/// [`ask`] answered it.
+pub(super) fn answered(last: &mut Last, view: ContentId) {
+    if let Ok(answer) = last
+        && answer.inputs.view != view
+    {
+        answer.same = Some(view);
+    }
+}
 
 /// What `asked` is answered with from `last`: the kept answer's responses and its `Work`,
 /// or why the build walks.
@@ -520,6 +695,8 @@ pub(super) struct Recording {
     responses: Vec<Response>,
     /// Why it is not kept, once something says so.
     refused: Option<Unkept>,
+    /// [`LastAnswer::still`], as its front end vouched ([`Recording::vouch`]).
+    still: Result<Arc<[StillFile]>, String>,
 }
 
 impl Recording {
@@ -541,7 +718,20 @@ impl Recording {
             absent,
             responses: Vec::new(), // alloc: once a build that walks its checkout's last plan
             refused: None,
+            // alloc: a reason, once a build that walks its checkout's last plan
+            still: Err("its front end was not asked which sources it held by code text".to_owned()),
         }
+    }
+
+    /// The sources the build's front end held by code text alone, as it says once every
+    /// task of the build ended, sorted by path; or why it vouches for none. A recording not
+    /// told keeps an answer no changed file is said again over.
+    pub(super) fn vouch(&mut self, still: Result<Vec<StillFile>, String>) {
+        self.still = still.map(|mut files| {
+            files.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+            files.dedup_by(|a, b| a.path == b.path);
+            files.into()
+        });
     }
 
     /// A response the build said: kept in order when it is one a build with nothing to do
@@ -590,6 +780,8 @@ impl Recording {
             absent: self.absent.into(),
             responses: self.responses.into(),
             worked: walk.worked,
+            still: self.still,
+            same: None,
         })
     }
 }

@@ -1,3 +1,5 @@
+mod records;
+
 use std::{
     fs,
     path::{Path, PathBuf},

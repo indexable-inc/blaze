@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: What a link after a one-function edit costs, step by step, and the design that makes it cost the edit. Built - the link as a patch of its file (ranges written, a Merkle digest of the file), link inputs kept beside the database and brought forward by the build's delta, function, static and span rows kept per image with one keyed Merkle digest as the link's id, and the spans that count each. Not built - the address and perf maps as patches, the writer's tables built by block, a store that takes a patch, one link for two paths.
+summary: What a link after a one-function edit costs, step by step, and the design that makes it cost the edit. Built - the link as a patch of its file (ranges written, a Merkle digest of the file), link inputs kept beside the database and brought forward by the build's delta, function, static and span rows kept per image with one keyed Merkle digest as the link's id, and the spans that count each. Not built - the address and perf maps as patches, the writer's tables built by block, a store that takes a patch, the patch regions' room out of the file (designed here).
 date: 2026-11-10
 ---
 # Patch in place
@@ -18,7 +18,7 @@ numbers after it are the main lane's to measure.
 | Span tables the code names | `link inputs` | the functions the delta lists are read for their anchors; the workspace's named bodies are each one memo verification (`verified`); the tables whose positions moved are encoded (`made`). A library's bodies are not asked. One call a file the tables name, to check its name. |
 | Native inputs | `link delta` | one `stat` a library, as before |
 | Function, static and span rows | `link delta` (`rows`, `hashed`) | the delta's functions hashed (`filled_id`); a search of the build's sorted lists for each |
-| The link's id | `link delta` | a leaf and about `log2(n)` nodes for each changed row (`blaze_link::keyed`) |
+| The link's id | `link delta` | a leaf and about `log2(n)` nodes for each changed row (`blaze_ids::keyed`) |
 | Names | `link delta` | every name the image exports (`Built::symbols`): a handful for a program, not its functions |
 | Slots of a live image | `link delta` | the patchable (workspace) functions, each a search |
 | What running code assumes | `live assumed` | the workspace's items (`crate_hashes` columns), as before |
@@ -67,7 +67,7 @@ since the last link".
    are of no walked instance and so in no delta.
 4. **The link's id** (`Rows::given`) is the build's id, the root of a keyed Merkle set over
    every function row, static row and span table id, and the natives. The set
-   (`crates/blaze-link/src/keyed.rs`) is a tree over the keys' bits: empty subtree zeros,
+   (`crates/blaze-ids/src/keyed.rs`) is a tree over the keys' bits: empty subtree zeros,
    one entry its leaf, more the hash of the two halves, the root bound to the count. Its
    shape is of the set alone, so the root kept through edits is the root made whole, and
    two sets with one root are the same set by the hash's collision resistance. A sum of
@@ -101,12 +101,12 @@ since the last link".
   The perf map's nodes hold names and edges and need a log, not slots.
 - **The writer's tables by block.** `file.rs` rebuilds each synthetic region (symbols,
   names, unwind header) every stage and compares it with the last in 4 KiB blocks. Building
-  only the blocks that can have changed is a change of each format's writer.
-- **One link for two paths.** `out/hello` and `debug/hello` are two kept images because
-  both are outputs the unit's plan lists (`artifact::made`), and each image's build id is
-  of its own path. One link needs the caller (`compile.rs`) to pass every path of the unit
-  that is the same output, the first as the image's and the rest as places of its file, and
-  the dev run held under each (`DevRuns::adopt` with `runs_from`).
+  only the blocks that can have changed is a change of each format's writer. What each
+  costs is now said: a stage's `link write` events sum the bytes and ranges it writes by
+  region, writer's part and debug section (`shape::record_writes`).
+- **One link for two paths**: built 2026-11-10 ([debug-side-file.md](debug-side-file.md)).
+  `artifact::made` lists a program with no hash in its name once, the profile directory's
+  file is its copy (`uplifted`), and an image's build id is of its file name, not its path.
 - **`blaze why`** names `Full::NoRoom`, `NoThunk`, `Output`, `Layout` on the link line. Why
   the rows or the inputs were made whole is on the spans only (`whole`); a line needs a
   field in `blaze_api::LinkHow`.
@@ -114,9 +114,58 @@ since the last link".
 - **A test binary** still reads every span table (`Generated::spans`) for its execution
   table and its tests' selection.
 
+## The patch room out of the file (designed 2026-11-10, not built)
+
+Hello world's dev executable is 162,021,720 bytes, and at least 134,217,728 of them are the
+room of `Class::Patch` and `Class::PatchData` (64 MiB each, `place.rs` `patch_room`). The
+room is zeros the digest never hashes (its tree is sparse) and a clone never copies; it
+costs where the file is made whole (`Image::file`, `Filed::written`'s `link copy`, a store
+put of `Written::Linked`): 162 MB allocated, zeroed and written. Expected once built: about
+27.8 MB (162,021,720 less 134,217,728, less nothing else: each used part is rounded up to
+64 KiB), a few MB less with the debug info beside it. Measure with `ls -l`, `du`, and
+`readelf -lW` (two more `LOAD`s, `MemSiz` past `FileSiz` on the two that end in a patch
+region).
+
+- **Why it is not a change of the writers alone.** Every writer gives a region the offset
+  `addr - base` (`elf.rs` `offset`), and three things rest on that: a dev run's code memory
+  holds the program "as the linker lays out its file (a file offset is an offset here)"
+  (`blaze-inproc/src/lib.rs`), the start hook takes an overlay only for "one of the image's
+  executable segments at the same file offset", and a live patch names code by that offset
+  (`blaze_live::patch`, hashed by the running program). New code of a live patch goes into
+  the patch region's room, which every run already maps from the code memory. A file
+  without the room has no offset for it.
+- **The layout.** Addresses and the order of regions stay. A patch region's unused pages are
+  a hole: the file holds its used part rounded up to `max(64 KiB, the next power of two)`,
+  and what follows in address order follows it in the file. `offset(region) = addr - base -
+  holes before it`, holes whole pages, so offsets stay congruent to addresses. Each hole
+  splits its segment: the part before ends with memory past its file bytes (ELF `p_memsz >
+  p_filesz`, PE `VirtualSize > SizeOfRawData`), the part after is a segment of its own.
+  Growth past the kept extent doubles it and moves what follows in the file: the core
+  already writes a region whose offset moved whole (`file.rs` `dirty`), so it is a rewrite
+  of the bytes after the hole, amortized over the doubling, never a link from scratch.
+- **Mach-O.** A segment of `vmsize > filesize` is zero-filled only when writable, and on
+  arm64 an executable page must be in the signed file: `__TEXT`-like patch code can't be
+  zero fill. The used part is file bytes (signed); the room is address space the image
+  reserves with a `VM_PROT_NONE` segment of no file bytes, as a dev run's reservations are.
+- **Who runs code in the room.** Only a dev run, and it maps the room from the daemon's code
+  memory, not from the file. A program started from the file runs the used part, which is
+  file bytes; its room is never executed.
+- **Two coordinates.** The code memory and the live patch keep `addr - base` (the *image
+  offset*); the file gets the compact one. `Image::commit_into`, `commit_into_patch` and
+  `roll_back_into` translate each write from file to image offset by the holes; `Image::
+  patch`, `file`, `verify` and the store's derive ranges stay in file offsets; the digest is
+  of the compact file, its length the real one, and the holes are in the headers it hashes.
+  `blaze-inproc`'s hook checks a code overlay against the segment's address, not its file
+  offset, and `host::write_executable` writes the compact file from the image.
+- **Why not in this pass.** It changes the three writers' headers, the dev run's rule
+  (`elf/image.rs` `dev_run`: "is all file bytes"), the code memory's contract and the start
+  hook's check in running programs, on three systems. Written without a build or a run, a
+  mistake is a program that does not start; it needs the linker's tests and a dev run at
+  each step.
+
 ## Tests
 
-- `crates/blaze-link/src/keyed.rs`: the refinement
+- `crates/blaze-ids/src/keyed.rs`: the refinement
   `a_keyed_set_kept_by_edits_is_the_set_made_whole`, control
   `the_oracle_catches_a_removed_entry_left_in_the_root`, counter
   `one_entry_set_hashes_its_path`.

@@ -538,6 +538,7 @@ impl<C: Compiler, P: Placer, A: Answers> Shared<C, P, A> {
                 continue;
             }
             state.parked += 1;
+            // wakes: a job queued and the runner's stop each notify `wake`; a parked worker serves until stopped
             self.wake.wait(&mut state);
             state.parked -= 1;
             spun = false;
