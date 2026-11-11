@@ -91,6 +91,7 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
         "blaze::nonblocking",
         "blaze::pure",
         "blaze::undeclared_effect",
+        "blaze::program_lifetime",
     ];
     for it in &blaze_lints()[1..] {
         let in_ = |g: &Group| g.lints.iter().any(|m| m.name == it.name);
@@ -101,6 +102,7 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
                 + usize::from(in_internal)
                 + usize::from(in_pedantic)
                 + usize::from(in_edition),
+                + usize::from(in_(edition)),
             1,
             "`{}` is general, internal, pedantic_perf or edition, once",
             it.name
@@ -241,6 +243,7 @@ fn counts_are_rustcs() {
             "blaze::pedantic_perf",
             "blaze::edition",
             "blaze::internal",
+            "blaze::edition",
             "blaze::reach",
             "blaze::proc_macro",
         ]

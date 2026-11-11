@@ -22,6 +22,7 @@ blaze-items.workspace = true
 blaze-mem.workspace = true
 
 either.workspace = true
+inventory.workspace = true
 blaze-query.workspace = true
 smallvec.workspace = true
 rustc_type_ir.workspace = true

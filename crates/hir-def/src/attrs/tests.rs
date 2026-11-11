@@ -404,6 +404,10 @@ fn old_match_attr_flags(
                         "reflect" => attr_flags.insert(AttrFlags::BLAZE_REFLECT),
                         "sealed" => attr_flags.insert(AttrFlags::BLAZE_SEALED),
                         "multiversion" => attr_flags.insert(AttrFlags::BLAZE_MULTIVERSION),
+                        "acyclic" => attr_flags.insert(AttrFlags::BLAZE_ACYCLIC),
+                        "program_lifetime" => {
+                            attr_flags.insert(AttrFlags::BLAZE_PROGRAM_LIFETIME)
+                        }
                         _ => {}
                     },
                     _ => {}
@@ -2374,4 +2378,25 @@ fn an_effect_attribute_changes_no_signature() {
         AttrFlags::query(&db, in_module("nothing").into()) - AttrFlags::MAY,
         AttrFlags::query(&db, plain.into())
     );
+}
+
+/// Every flag is one bit and no two flags share one. Lanes that each take "the next bit" on
+/// their own branch collide only when they merge (2026-11-10: three did), and two flags on
+/// one bit read as each other with no error anywhere; this fails the merge instead, naming
+/// both. A new flag takes a bit no flag of the block has.
+#[test]
+fn no_two_attr_flags_share_a_bit() {
+    let mut owner: [Option<&str>; 128] = [None; 128];
+    for (name, flag) in AttrFlags::all().iter_names() {
+        let bits = flag.bits();
+        assert_eq!(bits.count_ones(), 1, "`AttrFlags::{name}` is not one bit: {bits:#x}");
+        let bit = bits.trailing_zeros() as usize;
+        if let Some(other) = owner[bit] {
+            panic!("`AttrFlags::{name}` and `AttrFlags::{other}` are both bit {bit}");
+        }
+        owner[bit] = Some(name);
+    }
+    // The two this lane added keep the bits their commit says.
+    assert_eq!(AttrFlags::BLAZE_ACYCLIC.bits(), 1 << 125);
+    assert_eq!(AttrFlags::BLAZE_PROGRAM_LIFETIME.bits(), 1 << 126);
 }

@@ -104,6 +104,9 @@ const BLAZE_PROC_MACRO: On = {
     }
     bits
 };
+/// The group `blaze::edition`: code written the way blaze's edition wants it
+/// (docs/v2/plan/design/edition.md), allowed until a crate turns it on.
+pub(crate) const BLAZE_EDITION: On = blaze_kind(blaze::Kind::Edition);
 
 /// The lints `deny` by default ([`blaze::DENY_BY_DEFAULT`]), as a [`Target::Blaze`] has them.
 const BLAZE_DENY: On = {

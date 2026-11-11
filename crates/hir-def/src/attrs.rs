@@ -760,6 +760,10 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                 (Some(Word::blaze), Some(Word::reflect)) => AttrFlags::BLAZE_REFLECT,
                 (Some(Word::blaze), Some(Word::sealed)) => AttrFlags::BLAZE_SEALED,
                 (Some(Word::blaze), Some(Word::multiversion)) => AttrFlags::BLAZE_MULTIVERSION,
+                (Some(Word::blaze), Some(Word::acyclic)) => AttrFlags::BLAZE_ACYCLIC,
+                (Some(Word::blaze), Some(Word::program_lifetime)) => {
+                    AttrFlags::BLAZE_PROGRAM_LIFETIME
+                }
                 (Some(Word::clippy), Some(Word::has_significant_drop)) => {
                     AttrFlags::HAS_SIGNIFICANT_DROP
                 }
@@ -922,6 +926,7 @@ fn word(name: &str) -> Option<Word> {
 name_set! {
     /// An attribute name the flags or the value queries read.
     enum Word {
+    acyclic,
     automatically_derived,
     bench,
     bits,
@@ -974,6 +979,7 @@ name_set! {
     pointee,
     prefer_underscore_import,
     proc_macro_derive,
+    program_lifetime,
     pure,
     reflect,
     repr,
@@ -1294,6 +1300,22 @@ bitflags::bitflags! {
         /// [`AttrFlags::multiversion_levels`]'s; it changes code generation only, never what
         /// the function means.
         const BLAZE_MULTIVERSION = 1 << 125;
+        /// `#[blaze::acyclic]`, a word, on a struct or enum: a blaze extension (inert under
+        /// rustc with `#![register_tool(blaze)]`). The spelling that asserts the `Acyclic`
+        /// trait of the type: the trait is derived from the type's shape by compile-time
+        /// reflection with a blanket impl (rule `reflection-first`; built on `lang-int-1110`,
+        /// docs/v2/plan/design/facts.md "Acyclic"), so nothing in the compiler analyses it
+        /// and nothing reads the bit until that lane's assertion does. It changes
+        /// diagnostics, never code: no codegen key reads the bit.
+        const BLAZE_ACYCLIC = 1 << 125;
+        /// `#[blaze::program_lifetime]`, a word, on a struct or enum: a blaze extension (inert
+        /// under rustc with `#![register_tool(blaze)]`), a declared type fact
+        /// (docs/v2/plan/design/facts.md): instances live until the program exits. `hir-ty-pure`'s
+        /// `program_lifetime` checks what the type itself must be for that (no `Drop`, nothing
+        /// in it to drop, no type parameter, not public unless its crate opts in) or refuses it
+        /// naming the field path (`blaze::program_lifetime`). It changes diagnostics, never code: no codegen
+        /// key reads the bit.
+        const BLAZE_PROGRAM_LIFETIME = 1 << 126;
         /// `#[clippy::has_significant_drop]`, a word, on a struct or enum: dropping a value of
         /// it does something another part of the program can see (releases a lock, ends a
         /// borrow), read by blaze-lints' `significant_drop_tightening`. It changes diagnostics,

@@ -4,6 +4,7 @@
 mod apply;
 mod drop_effects;
 mod effects;
+mod facts;
 mod fixture;
 mod fns;
 mod models;

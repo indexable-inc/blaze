@@ -1102,6 +1102,12 @@ pub(super) const BLAZE: &[Lint] = &[
     // and a workspace does in its `lints-when-ready` table.
     l("blaze::std_use", Allow, "detects a use of an item of Rust's standard library that blaze's own standard library replaces or forbids (ambient authority, a hidden cost, a global-heap allocation, a renamed type), once per item per function, naming what is written instead")
         .externally_loaded(),
+    l("blaze::program_lifetime", Deny, "detects a type declared `#[blaze::program_lifetime]` whose instances could not all live until the program exits: it has a parameter or a `Drop`, holds a value that does, borrows for less than `'static`, or is `pub` in a crate that did not opt in")
+        .externally_loaded(),
+    l("blaze::could_be_program_lifetime", Allow, "detects a private type with no `Drop` whose every instance is built into a `static` or leaked, and so already lives until the program exits: `#[blaze::program_lifetime]` and the program arena would hold it by 4-byte references with no count")
+        .externally_loaded(),
+    l("blaze::could_be_ref32", Allow, "detects a field or collection element of a struct stored many times that holds a `#[blaze::program_lifetime]` type as `&'static T`, `Arc<T>`, `Rc<T>` or `Box<T>`, where a `Ref32<T>` is half the size")
+        .externally_loaded(),
     // Emitted by the release build, which reads it from the code LLVM made, never by `blaze check`.
     l("blaze::vecreport", Allow, "reports a bounds check, overflow check or panic path the optimizer kept inside a loop, and a loop it left unvectorized with its reason, read from the optimized code; only hot loops when the build has a profile"),
 ];

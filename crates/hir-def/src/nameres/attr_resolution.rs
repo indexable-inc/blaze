@@ -168,6 +168,11 @@ impl DefMap {
                         // `AttrFlags::BLAZE_MULTIVERSION` (docs/v2/plan/design/simd.md).
                         | "simd"
                         | "multiversion"
+                        // `#[blaze::acyclic]` and `#[blaze::program_lifetime]`, from
+                        // `AttrFlags::BLAZE_ACYCLIC` and `AttrFlags::BLAZE_PROGRAM_LIFETIME`
+                        // (`hir-ty-pure`'s facts, docs/v2/plan/design/facts.md).
+                        | "acyclic"
+                        | "program_lifetime"
                 )
             {
                 return true;

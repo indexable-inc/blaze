@@ -25,6 +25,8 @@ mod build_script_ambient;
 mod checkfree;
 mod clone;
 mod cold_error;
+mod could_be_program_lifetime;
+mod could_be_ref32;
 mod collect_then_consume;
 mod combined_identity;
 #[cfg(test)]
@@ -96,6 +98,9 @@ mod proc_macro;
 #[cfg(test)]
 mod profile_tests;
 mod profiled;
+mod program_lifetime;
+#[cfg(test)]
+mod program_lifetime_tests;
 mod push_without_reserve;
 mod query_in_loop;
 mod relaxed_publish;
@@ -257,6 +262,9 @@ pub enum Lint {
     ProcMacroFnLike,
     BuildScriptAmbient,
     StdUse,
+    ProgramLifetime,
+    CouldBeProgramLifetime,
+    CouldBeRef32,
 }
 
 /// Which workspaces a lint is for.
@@ -277,6 +285,9 @@ pub(crate) enum Kind {
     /// blaze cannot analyse and what blaze's standard library replaces (`std_use`): the group
     /// `blaze::edition`, allowed until a workspace or crate turns it on, but for a lint whose
     /// advice this blaze already has ([`Lint::warns_by_default`]), which warns everywhere.
+    /// It asks for code written the way blaze's edition wants it (docs/v2/plan/design/edition.md):
+    /// allowed until a crate turns it, or the group `blaze::edition`, on; a check of what the
+    /// code declared (`program_lifetime`) is `deny` where it fires ([`DENY_BY_DEFAULT`]).
     Edition,
 }
 
@@ -292,6 +303,8 @@ pub(crate) const DENY_BY_DEFAULT: &[Lint] = &[
     Lint::Nonblocking,
     Lint::Pure,
     Lint::UndeclaredEffect,
+    // Fires only on a type declared `#[blaze::program_lifetime]`.
+    Lint::ProgramLifetime,
 ];
 
 /// Each lint of [`Kind::Edition`] with whether what its help tells code to move to is in this
@@ -465,6 +478,9 @@ impl Lint {
         Lint::ProcMacroFnLike,
         Lint::BuildScriptAmbient,
         Lint::StdUse,
+        Lint::ProgramLifetime,
+        Lint::CouldBeProgramLifetime,
+        Lint::CouldBeRef32,
     ];
 
     /// Which workspaces the lint is for ([`Kind`]); written out per lint, so a new one chooses.
@@ -588,6 +604,12 @@ impl Lint {
             | Lint::DurableWrite
             | Lint::UnboundedWait
             | Lint::CombinedIdentity => Kind::Internal,
+            | Lint::LenientDeserialize => Kind::Internal,
+            // docs/v2/plan/design/facts.md: the check of `#[blaze::program_lifetime]` and the
+            // two lints that say where the attribute and `Ref32` would pay.
+            Lint::ProgramLifetime | Lint::CouldBeProgramLifetime | Lint::CouldBeRef32 => {
+                Kind::Edition
+            }
         }
     }
 
@@ -708,6 +730,9 @@ impl Lint {
             Lint::ProcMacroFnLike => "proc_macro_fn_like",
             Lint::BuildScriptAmbient => "build_script_ambient",
             Lint::StdUse => "std_use",
+            Lint::ProgramLifetime => "program_lifetime",
+            Lint::CouldBeProgramLifetime => "could_be_program_lifetime",
+            Lint::CouldBeRef32 => "could_be_ref32",
         }
     }
 
@@ -812,6 +837,9 @@ impl Lint {
             }
             Lint::BuildScriptAmbient => concat!(general_docs!(), "#build_script_ambient"),
             Lint::StdUse => concat!(general_docs!(), "#std_use"),
+            Lint::ProgramLifetime | Lint::CouldBeProgramLifetime | Lint::CouldBeRef32 => {
+                concat!(general_docs!(), "#program_lifetime-could_be_program_lifetime-could_be_ref32")
+            }
             Lint::FiberBoundary => {
                 "https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan.md"
             }
@@ -1110,6 +1138,14 @@ impl Lint {
                 } else {
                     "nothing to change yet: what the finding names is of blaze's standard library (bstd, docs/v2/plan/design/std.md), which is not in this blaze; this lint is `allow` by default, a crate asks for it with `#![blaze::capabilities]`, and blaze's own workspace has it at `warn` once bstd is in the tree"
                 }
+            Lint::ProgramLifetime => {
+                "a `#[blaze::program_lifetime]` type has no parameter and no `Drop`, holds only plain data, `&'static` references and other program-lifetime types, and is not `pub` unless its crate has `#![blaze::program_lifetime_api]`: change the field or take the attribute off"
+            }
+            Lint::CouldBeProgramLifetime => {
+                "mark the type `#[blaze::program_lifetime]` and allocate it in the program arena (`blaze_mem::ProgramArena::alloc`), which gives a 4-byte `Ref32<T>` with no count to touch; or say why its instances must be freed with `#[expect(blaze::could_be_program_lifetime, reason = \"..\")]`"
+            }
+            Lint::CouldBeRef32 => {
+                "hold it as `blaze_mem::Ref32<T>` (4 bytes, `Copy`, derefs to `&'static T`; `Option<Ref32<T>>` is 4 bytes too), from `ProgramArena::alloc`; or say why with `#[expect(blaze::could_be_ref32, reason = \"..\")]`"
             }
             Lint::FrozenCollection => {
                 "make the field a `Box<[T]>` (`Box<str>` for a string), built once with `into_boxed_slice()` / `into_boxed_str()`; or say why it stays growable with `#[expect(blaze::frozen_collection, reason = \"..\")]`"
@@ -1167,6 +1203,8 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     if let Some(adt) = ast::Adt::cast(node) {
         error_debug::check_attrs(cx, adt);
         lenient_deserialize::check(cx, adt);
+        program_lifetime::check(cx, adt);
+        could_be_program_lifetime::check(cx, adt);
         intern_candidate::check(cx, adt);
         boxed_recursive_node::check(cx, adt);
     }
@@ -1185,6 +1223,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     if let Some(item) = ast::Struct::cast(node) {
         false_sharing::check(cx, item);
         frozen_collection::check(cx, item);
+        could_be_ref32::check(cx, item);
         small_map::check_struct(cx, item);
         jagged_vec::check(cx, item);
         dyn_in_hot_field::check(cx, item);

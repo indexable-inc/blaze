@@ -204,6 +204,12 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::combined_identity",
         ],
     ),
+    // Code written the way blaze's edition wants it (docs/v2/plan/design/edition.md): allowed
+    // until a crate turns the group on (blaze-lints' `blaze::Kind::Edition`).
+    (
+        "blaze::edition",
+        &["blaze::program_lifetime", "blaze::could_be_program_lifetime", "blaze::could_be_ref32"],
+    ),
     // The cross-configuration reachability lints (docs/v2/plan/design/multiconfig-check.md), also in
     // `blaze::general`: one name to make them strict, `reach = "deny"`.
     ("blaze::reach", &["blaze::dead", "blaze::test_only", "blaze::cfg_only"]),

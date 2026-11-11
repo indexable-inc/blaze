@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-53 invariants, 16 refinements, 5 reference models.
-By level: 50 tested, 19 simulated, 0 model-checked, 0 proved.
+54 invariants, 17 refinements, 5 reference models.
+By level: 52 tested, 19 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
@@ -170,6 +170,8 @@ By level: 50 tested, 19 simulated, 0 model-checked, 0 proved.
 
 ### hir-ty-pure
 
+- **`one_key_is_one_optimized_code`** *tested* (`crates/hir-ty-pure/src/facts/model.rs`): a body's key covers every fact its passes relied on. For random pairs of programs that differ in one function, a function with the same code as written and the same recorded digests in both has the same optimized code in both.
+  Controls: `an_unwind_edge_removed_for_a_callee_that_panics_through_a_dyn_call`, `a_pure_call_hoisted_above_the_branch_guarding_its_panic`, `a_fact_relied_on_but_missing_from_the_key`.
 - **`an_accepted_graph_has_no_infinite_path`** *tested* (`crates/hir-ty-pure/src/loops.rs`): a control flow graph the analysis accepts has no infinite path. For random small graphs with random bounding facts, every accepted graph, each fact's block forced through its exit once its bound is used up, has only finite paths (checked by brute force over every state).
   Controls: `a_self_loop_not_seen_as_a_cycle`, `a_bounding_block_whose_exit_stays_inside`.
 - **`the_checker_accepts_exactly_what_is_within_its_allowance`** *tested* (`crates/hir-ty-pure/src/may.rs`): the checker accepts a crate exactly when every function's inferred effects are within its allowed set, where allowed sets flow as specified: its own mark, else its trait method's, else the nearest module's default, else nothing under the gate and anything outside it; and an impl's own mark is within its trait method's. For random small call graphs with random effect sources and random declarations.
@@ -239,6 +241,11 @@ By level: 50 tested, 19 simulated, 0 model-checked, 0 proved.
 
 - **`structured_code_runs_as_its_graph`** *tested* (`crates/hir-ty-lean/src/tests.rs`): structured control flow reconstructed from a control-flow graph runs as the graph does, from every state, to the same end, variables and trace; and what `reconstruct` returns is well formed and a fixed point of lowering and reconstructing.
   Controls: `a_continue_made_a_break`, `an_else_branch_dropped_at_a_join`, `an_xor_made_an_add`.
+
+### hir-ty-pure
+
+- **`a_program_optimized_on_facts_behaves_as_written`** *tested* (`crates/hir-ty-pure/src/facts/model.rs`): a program optimized on the facts proved of its functions is seen to do what the program as written does: the same output, the same panic, the same hang. For random small programs (calls by name and through objects, cleanups, guards, panics and hangs that depend on the argument) and every argument, with every [`Spend`] made wherever [`Facts::license`] allows it.
+  Controls: `an_unwind_edge_removed_for_a_callee_that_panics_through_a_dyn_call`, `a_pure_call_hoisted_above_the_branch_guarding_its_panic`, `a_fact_relied_on_but_missing_from_the_key`.
 
 ### linked
 
