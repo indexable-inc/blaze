@@ -59,6 +59,7 @@ pub mod terminal;
 pub mod test;
 #[cfg(feature = "native")]
 pub mod tree;
+pub mod which;
 
 use std::{
     ffi::OsString,
@@ -393,6 +394,14 @@ pub fn command(words: Vec<OsString>) -> i32 {
             Exit::Failed.code()
         }
     };
+    // A command that only asks the daemon says first when that daemon is another build of
+    // blaze than this binary (`which.rs`): its answer is of that build's work.
+    if matches!(
+        asked,
+        Asked::Status(_) | Asked::Debug(_) | Asked::Explain(_) | Asked::Why(_) | Asked::Slow(_)
+    ) {
+        which::warn_if_other(auto_color());
+    }
     match asked {
         Asked::Help(None) => {
             print!("{HELP}");
@@ -403,7 +412,8 @@ pub fn command(words: Vec<OsString>) -> i32 {
             0
         }
         Asked::Version => {
-            println!("{}", crate::version());
+            // The release line, then which binary this is (`which.rs`).
+            print!("{}", which::version());
             0
         }
         Asked::Unknown(name) => {
