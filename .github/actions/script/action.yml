@@ -7,7 +7,9 @@
 # unless that blaze is already on PATH, builds them with it (build.sh) and saves them: they are
 # blaze's output alone, never cargo's (AGENTS.md blaze-builds-blaze). A restored entry that is
 # not what build.sh made is an error (check.sh), never rebuilt in place. `local.sh CACHE` runs
-# these steps outside Actions.
+# these steps outside Actions. The cached directory (~1.4 GB) is mostly zeros, the patch room
+# blaze-link writes into every dev executable (build.sh's header; ledger D44), which the cache's
+# zstd compresses away; it stays so until the linker stops writing the room.
 name: script
 description: the repository's built scripts, from the Actions cache or built by the pinned blaze
 inputs:

@@ -11,8 +11,12 @@
 # `compiler-artifact` line under --message-format=json (crates/blaze-cargo/src/cli/json.rs,
 # `artifact`), and it is copied into DIR, which may be on any file system.
 #
-# `--profile script` (the root Cargo.toml): dev's opt-levels without debug info, so the cached
-# binaries are small enough for the Actions cache and a fast restore.
+# The dev profile, so a miss reuses what the job's own dev build made. Each binary is ~145 MB,
+# ~135 MB of it zeros: every native link keeps 64 MiB of patch room for code and 64 MiB for
+# data (blaze-link place.rs `PATCH`; blaze-cargo links every executable incremental), written
+# into the file, and no profile the released blaze honours links without it (ledger D44). The
+# Actions cache compresses with zstd, so a cache entry is far smaller than the directory until
+# the linker stops writing the room.
 set -euo pipefail
 die() { echo "::error::$*" >&2; echo "build.sh: $*" >&2; exit 1; }
 [ $# = 2 ] || die "takes DIR and KEY, not: $*"
@@ -29,22 +33,10 @@ unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS RUSTDOCFLAGS RUSTC RUSTC_WRAPPER RUSTC_W
   CARGO_BUILD_TARGET CARGO_BUILD_JOBS CARGO_INCREMENTAL BLAZE_BACKEND BLAZE_OPT BLAZE_EMIT
 for name in $(env | sed -nE 's/^(CARGO_PROFILE_[A-Z0-9_]*|CARGO_TARGET_[A-Z0-9_]*)=.*/\1/p'); do unset "$name"; done
 
-# Interim (ledger D44, the piece being built): each binary's debug sections are stripped after
-# the copy, by the runner's own binutils (`strip --strip-debug` on Linux, `strip -S` on macOS).
-# A dev link carries the shipped standard library's DWARF, ~138 MB of each ~145 MB binary, which
-# no profile setting drops and blaze-link cannot leave out yet.
-# when blaze-link honours strip (ledger D44): remove this and set strip in [profile.script]
-case "$(uname -s)" in
-  Linux) strip_debug=(strip --strip-debug) ;;
-  Darwin) strip_debug=(strip -S) ;;
-  *) die "no way to strip debug sections on $(uname -s): only Linux (binutils) and macOS are known" ;;
-esac
-command -v "${strip_debug[0]}" >/dev/null || die "no \`${strip_debug[0]}\` on PATH, which strips the scripts' debug sections (\`${strip_debug[*]}\`); install binutils"
-
 unset CARGO_TARGET_DIR
 said="$dir.build.json"
 mkdir -p "$(dirname "$dir")"
-blaze build -p scripts --bins --profile script --message-format=json > "$said" || die "blaze build -p scripts --bins --profile script --message-format=json failed (its JSON lines: $said)"
+blaze build -p scripts --bins --message-format=json > "$said" || die "blaze build -p scripts --bins --message-format=json failed (its JSON lines: $said)"
 
 fresh="$dir.new"
 rm -rf "$fresh"
@@ -57,7 +49,6 @@ for src in scripts/src/bin/*.rs; do
   [ "$(echo "$found" | wc -l)" = 1 ] || die "blaze build -p scripts --bins named more than one executable \`$name\`: $(echo "$found" | tr '\n' ' ')"
   [ -x "$found" ] || die "the build named $found for \`$name\`, which is no executable file"
   cp "$found" "$fresh/$name"
-  "${strip_debug[@]}" "$fresh/$name" || die "\`${strip_debug[*]} $fresh/$name\` failed"
 done
 echo "$key" > "$fresh/KEY"
 rm -rf "$dir"
