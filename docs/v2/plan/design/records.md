@@ -5,9 +5,9 @@ date: 2026-11-10
 ---
 # Records and named arguments
 
-Deletes: builders, options structs, one-off structs. Off unless a crate says `#![blaze::records]`
-plainly among the inner attributes that open its root (rule `superset-of-rust`); a crate without
-it parses and builds as before, error for error.
+Deletes: builders, options structs, one-off structs. Off unless a crate says
+`#![blaze::records]` among the inner attributes that open its root (rule `superset-of-rust`); a
+crate without it parses and builds as before, error for error.
 
 ## Syntax
 
@@ -18,19 +18,17 @@ it parses and builds as before, error for error.
 | pattern | wherever a pattern is expected | `{ path, size: n }`, `{ path, .. }` |
 | default | a field of a record type that is a function parameter's type | `opts: { create: bool = false }` |
 
-Each reuses the struct form's nodes with no path before the braces; `RECORD_TYPE` is the one
-new node kind. No Rust type or pattern starts with `{`, so those two need no lookahead.
+Each reuses the struct form's nodes with no path; `RECORD_TYPE` is the one new node kind. No
+Rust type or pattern starts with `{`, so those two need no lookahead.
 
 **A value against a block.** Where an expression starts, a `{` opens a record value exactly when
 the next three tokens are `IDENT` `:` and a token that is not a second `:`, or `IDENT` `,`. No
-Rust block starts so (there is no type ascription, a label is a lifetime, nothing is followed by
-a bare comma). The bound is four tokens with the `{`, kinds only, which is what an incremental
-reparse already holds fixed. So: `{ a }` is a block (one shorthand field is `{ a, }` or
-`{ a: a }`); `{}` is the unit block (the empty record has a type, `{}`, and no literal);
-`{ ..base }` and `{ .. }` are blocks holding ranges; a field value starting with `::` is
+Rust block starts so. The bound is four tokens with the `{`, kinds only, which is what an
+incremental reparse already holds fixed. So `{ a }` is a block (one shorthand field is `{ a, }`
+or `{ a: a }`), `{}` is the unit block (the empty record has a type, `{}`, and no literal),
+`{ ..base }` and `{ .. }` are blocks holding ranges, and a field value starting with `::` is
 parenthesized. Where the grammar requires a block (`fn`, `if`, `loop`, `unsafe` bodies) it never
-asks. In a generic argument list `{` stays Rust's const block unless it starts `{ IDENT :`;
-the subject of a `where` predicate that is a record is parenthesized.
+asks. In a generic argument list `{` stays Rust's const block unless it starts `{ IDENT :`.
 
 **Gate.** `edition::Extensions::RECORDS` (bit 2), read off the root file's tokens by
 `base_db::crate_extensions` and held by every parse. Folding into the integration branch
@@ -43,32 +41,32 @@ macro's expansion parses with no extension, so records cannot be written inside 
 
 `{ a: A, b: B }` is `core::record::Record<"a,b", (A, B)>`: one `#[lang = "record"]` struct,
 `#[repr(transparent)]` over the tuple of the field types in the order of the field names sorted
-by their bytes, with the names joined by `,` as a `&'static str` const argument (`r#type` is the
-name `type`). This is the "one generic struct per sorted name list" with the name list as an
-argument, as error unions are `ErrorUnion<(A, B)>`. So:
+by their bytes, the names joined by `,` as a `&'static str` const argument. It is the "one
+generic struct per sorted name list" with the list as an argument, as error unions are
+`ErrorUnion<(A, B)>`. So:
 
 - **Identity** is the sorted names and the field types, nothing else: two records are one type
   exactly when their (name, type) sets are equal, in every crate and every build, because the
-  type is an ordinary generic instance of one core item. No new id scheme, nothing to keep
-  stable. Defaults are not part of it.
-- **Layout and ABI** are the tuple's (`repr(Rust)` over the sorted fields). Code without
-  records sees no change. An `extern` function of a non-Rust ABI cannot take or return a record.
+  type is an ordinary generic instance of one core item. There is no id of blaze's own to keep
+  stable, and a default is no part of it.
+- **Layout and ABI** are the tuple's (`repr(Rust)` over the sorted fields); code without
+  records sees no change. A function of a non-Rust ABI cannot take a record.
 - **Traits** come from core, as a tuple's do: `Clone`, `Copy`, `PartialEq`, `Eq`, `Hash`,
-  `Default`, `PartialOrd` and `Ord` (comparing fields in sorted-name order) when the tuple has
-  them, so up to twelve fields beyond `Clone` and `Copy`; `Debug` prints `{ a: 1, b: 2 }`.
+  `Default`, `PartialOrd` and `Ord` (in sorted-name order) when the tuple has them, so up to
+  twelve fields beyond `Clone` and `Copy`; `Debug` prints `{a: 1, b: 2}`.
 - **Impls are a tuple's.** A record is foreign to every crate, as a tuple is: an inherent impl
   (E0116) and an impl of a foreign trait (E0117, the orphan rule) are refused by the rules
   that refuse them on `core`'s `Record`, and a crate's own trait may be implemented for a
   record, as for a tuple. To give a record methods, name it with a struct.
-- A duplicate field, a visibility, attribute or `unsafe` on a field, a tuple-index name, and a
-  default outside a function parameter are each an error naming the field.
+- A duplicate field and a default outside a function parameter are errors naming the field; a
+  visibility, attribute, `unsafe` or tuple index on a field is a syntax error.
 
-**Values.** A record's type comes from its literal (all fields written) or from an annotation;
-inference from field use is not attempted. `r.a` on a type not yet known is the existing "type
-must be known" error; `{ a: 1, ..base }` and `{ a: 1, .. }` need a known expected record type
-and say so. Functional update takes the rest from a record with the same fields. Field values
-are evaluated in the order written, then the base. A pattern binds by field name; without `..`
-it names every field.
+**Values.** A record's type comes from its literal (all fields written) or from an annotation,
+never from how a field is used: `r.a` on a type not yet known is the existing "type must be
+known" error, and `{ a: 1, ..base }` and `{ a: 1, .. }` need a known expected record type and
+say so. A functional update takes the rest from a record with the same fields. Field values are
+evaluated in the order written, then the base. A pattern binds by field name; without `..` it
+names every field.
 
 ## Defaults and named arguments
 
@@ -82,52 +80,42 @@ refused in this slice), never another parameter.
   no default must be written (error naming the field and the function). Without `..` every
   field is written. `{ .. }` alone stays Rust's block around the full range, so a call that
   wants every default names one field; a spelling for "all defaults" is open.
-- A default is evaluated as a constant, once, and its value placed at each call that omits the
-  field, in the callee's declaration order after the written fields; being constants, order
-  and count are unobservable.
-- **Key** (rule `keys-cover-every-input`): `record_param_default(callee, parameter index, field
-  name)` is the constant. A caller reads it only for a field it omits, so changing one default
-  recomputes the callers that omit that field and no other; a default is no part of the
-  record's type or of the function's type.
-- A call through a function pointer or a `Fn` value has no callee to ask: `..` there is an
-  error saying so and naming the pointer's type. A trait method's defaults are its
-  declaration's; an impl repeats the types and writes no defaults (an error if it does), so a
-  call on a `dyn Trait` or a type parameter has them too (this is where this page departs from
-  "a trait object has no defaults": the declaration is known statically).
+- A default is a constant, placed at each call that omits the field, in the callee's
+  declaration order after the written fields; order and count are unobservable.
+- **Key** (rule `keys-cover-every-input`): `record_param_default(callee, parameter, field)` is
+  the constant. A caller reads it only for a field it omits, so a changed default recomputes
+  the callers that omit that field and no other.
+- A call through a function pointer, a closure or a `Fn` value has no callee to ask: `..` there
+  is an error saying so. A trait method's defaults are its declaration's; an impl repeats the
+  types and writes none (an error naming the field), so a call on a `dyn Trait` or a type
+  parameter has them too, the declaration being known statically.
 - No positional-to-named conversion, no reordering of other parameters, no overloading.
 
-## Lints (group `blaze::edition`, allow by default)
+## Lints (allow by default; errors under the edition)
 
-| lint | flags | fix |
-|---|---|---|
-| `blaze::many_bools` | a call passing two or more bare `true`/`false` literals positionally | none: suggests a record parameter |
-| `blaze::options_struct` | a function whose last parameter is a struct of the same crate that implements `Default`, has only public fields and is named in no other signature | none in this slice |
-
-`options_struct` judges the declaration only; "built with struct-update syntax at call sites"
-needs every call site in the workspace and is left out.
+`blaze::many_bools`: a call passing two or more bare `true`/`false` literals by position; no
+fix, the help suggests a record parameter. `blaze::options_struct` is not built: "used only as
+that function's options" needs every use in the workspace, which a lint of one crate lacks.
 
 ## MIR and codegen
 
-Nothing new past MIR building: a record is an ADT instance over a tuple. MIR building learns
-three things, all in `hir-ty-mir`'s lowering: a record value is the struct aggregate of a tuple
-aggregate (defaults as constant operands), `r.a` is the projection `.0` then the tuple field,
-and a record pattern projects the same way. Places that match on a field access's base and
-learn the extra projection: `mir/lower/as_place.rs`, `mir/lower/pattern_matching.rs`, the
-closure capture walk (`infer/closure/analysis/expr_use_visitor.rs`), match checking
-(`hir-ty-matchck/src/lower.rs`). Borrow checking, drop elaboration, layout and codegen see a
-struct and a tuple.
+Nothing new past MIR building: a record is an ADT instance over a tuple, which is what borrow
+checking, drop elaboration, layout and codegen see. Four places learned the projection through
+`Record`'s one field into the tuple: `hir-ty-mir`'s `mir/lower.rs` (a record value: a tuple
+aggregate, then the struct's, defaults as constant operands; and `r.a`) and
+`mir/lower/pattern_matching.rs`, the closure capture walk (`expr_use_visitor.rs`), and match
+checking (`hir-ty-matchck/src/lower.rs`). Coarser but correct: the capture walk of
+`{ a: 1, ..base }` consumes all of `base`, and `match_tree.rs` gives up on a record pattern.
+
+## Not built in this slice
+
+A spelling for "every default"; records inside a macro call (see Gate); `options_struct`; a
+"name it" help on E0116 and E0117 for a record; a record in the return type of an `extern`
+function is not refused (a parameter is); defaults that name the function's generic parameters.
 
 ## Use in blaze
 
 None yet: blaze's crates are built by a stage 0 that does not read records (rule
-`blaze-uses-its-extensions`, the stage-0 limit). First, once a release reads them:
-`SourceFile::parse_shared_with(text, edition, extensions)` and its outline twin (`crates/syntax`),
-`Reparse::parse(text, edition, extensions, outline, stored)` (`crates/base-db/src/reparse.rs`),
-and `build_node(source, range, lexed, output, edition, extensions, kind)`
-(`crates/syntax/src/parsing.rs`).
-
-## Tests
-
-`crates/syntax/src/tests/records.rs` (forms, near misses, the gate), `crates/hir-ty/src/tests/records.rs`
-(one type in any order, traits, values, defaults, errors, the default key), `crates/hir-ty-mir`
-(evaluation), and a Hegel property of the canonical form with two planted-bug controls.
+`blaze-uses-its-extensions`). First, once a release reads them, three runs of positional
+edition, extensions and outline arguments: `SourceFile::parse_shared_with` (`crates/syntax`),
+`Reparse::parse` (`crates/base-db/src/reparse.rs`), `build_node` (`crates/syntax/src/parsing.rs`).
