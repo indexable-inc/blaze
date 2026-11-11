@@ -64,6 +64,27 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::RecordRefused) -> Vec<Found> {
                 range,
             )
         }
+        RecordRefusal::DefaultInTraitImpl(at) => {
+            let (name, range) = field(at);
+            (
+                format!(
+                    "the field `{name}` of the record type `{text}` has a default in a method \
+                     of a trait impl"
+                ),
+                "a trait method's defaults are its declaration's, which a call on any \
+                 implementor reads; write the default in the trait and remove this `= ..`",
+                range,
+            )
+        }
+        RecordRefusal::ExternAbi => (
+            format!(
+                "the record type `{text}` is the type of a parameter of a function whose ABI \
+                 is not Rust's"
+            ),
+            "no ABI but Rust's says how a record is passed; name the type with a \
+             `#[repr(C)]` struct",
+            whole,
+        ),
     };
     let mut diag = Diag::error(None, message, cx.span(ty.with_value(range)));
     diag.help(help);

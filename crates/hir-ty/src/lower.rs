@@ -8,7 +8,7 @@
 pub(crate) mod batch;
 pub(crate) mod diagnostics;
 pub(crate) mod path;
-mod record;
+pub(crate) mod record;
 pub mod persist;
 
 use std::{alloc::Allocator, iter, mem};

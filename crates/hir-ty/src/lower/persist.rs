@@ -922,6 +922,8 @@ pub(crate) fn put_diagnostic(w: &mut Vec<u32>, diagnostic: &TyLoweringDiagnostic
                 RecordRefusal::NoLangItem => (1, 0),
                 RecordRefusal::DuplicateField(at) => (2, *at),
                 RecordRefusal::DefaultOutsideParameter(at) => (3, *at),
+                RecordRefusal::DefaultInTraitImpl(at) => (4, *at),
+                RecordRefusal::ExternAbi => (5, 0),
             };
             w.extend([tag, field]);
         }
@@ -1251,6 +1253,8 @@ impl Words<'_> {
                     (1, 0) => RecordRefusal::NoLangItem,
                     (2, at) => RecordRefusal::DuplicateField(at),
                     (3, at) => RecordRefusal::DefaultOutsideParameter(at),
+                    (4, at) => RecordRefusal::DefaultInTraitImpl(at),
+                    (5, 0) => RecordRefusal::ExternAbi,
                     _ => return Err(self.invalid("a record refused for no reason")),
                 },
             },
@@ -1527,6 +1531,11 @@ mod tests {
                 source,
                 reason: RecordRefusal::DefaultOutsideParameter(1),
             },
+            TyLoweringDiagnostic::RecordRefused {
+                source,
+                reason: RecordRefusal::DefaultInTraitImpl(2),
+            },
+            TyLoweringDiagnostic::RecordRefused { source, reason: RecordRefusal::ExternAbi },
             TyLoweringDiagnostic::QueryCycle { def, query: CycleQuery::Predicates },
             TyLoweringDiagnostic::QueryCycle { def: trait_def, query: CycleQuery::SuperClauses },
             TyLoweringDiagnostic::QueryCycle { def: trait_def, query: CycleQuery::ImpliedClauses },

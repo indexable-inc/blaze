@@ -107,6 +107,12 @@ pub enum RecordRefusal {
     /// The field at this place has a default (`= expr`), and the record is not the type of a
     /// function's parameter, the one place a default is read.
     DefaultOutsideParameter(u32),
+    /// The field at this place has a default, and the function is a method of a trait impl:
+    /// a trait method's defaults are its declaration's, which every caller reads.
+    DefaultInTraitImpl(u32),
+    /// The record is the type of a parameter of a function whose ABI is not Rust's
+    /// (`extern "C" fn`): no other ABI says how a record is passed.
+    ExternAbi,
 }
 
 /// The query of `def` whose computation needed itself, in a [`TyLoweringDiagnostic::QueryCycle`].

@@ -128,7 +128,11 @@ pub use lower::{
     diagnostics::*,
     elided_groups, elided_lifetimes, hir_mutability, hybrid_param_env, lower_mutability,
     persist::{BatchKind, ColdBatch, ColdBatchRef, PredicatesRec},
-    predicate_sources, solver_fn_sig, supertraits_cycle, with_elided_regions,
+    predicate_sources,
+    record::{
+        RecordParamDefault, record_defaults_owner, record_param_default, record_param_defaults,
+    },
+    solver_fn_sig, supertraits_cycle, with_elided_regions,
 };
 pub use opaques::{rpit_hidden_types, tait_hidden_types};
 pub use specialization::{
