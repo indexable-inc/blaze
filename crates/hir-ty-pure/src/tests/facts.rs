@@ -398,3 +398,61 @@ fn program_lifetime_is_refused_naming_the_reason() {
         }
     });
 }
+
+/// Functions whose signatures name their own late-bound lifetime inside an associated type's
+/// projection: behind a field (`Unit<R>` holds an `R::Offset`), and written out.
+const LATE_BOUND: &str = r#"
+//- /lib.rs crate:kernel deps:std
+pub trait Reader {
+    type Offset;
+}
+
+pub struct Slice<'a>(&'a [u8]);
+
+impl<'a> Reader for Slice<'a> {
+    type Offset = usize;
+}
+
+pub struct Unit<R: Reader> {
+    pub offset: R::Offset,
+}
+
+pub struct Summary<'a> {
+    pub unit: &'a Unit<Slice<'a>>,
+}
+
+pub fn summary<'a>(unit: &'a Unit<Slice<'a>>) -> Summary<'a> {
+    Summary { unit }
+}
+
+pub fn written<'a>(
+    reader: Slice<'a>,
+    offset: <Slice<'a> as Reader>::Offset,
+) -> <Slice<'a> as Reader>::Offset {
+    let _ = reader;
+    offset
+}
+"#;
+
+/// The facts of every function are asked (`SpendFacts` asks each body's and each callee's), and
+/// purity's scans the parameters' types, normalizing what it reaches: the signature's
+/// late-bound lifetimes are instantiated first, so `<Slice<'a> as Reader>::Offset` is a goal
+/// the solver takes. Skipped instead, the projection kept the bound lifetime and the solver
+/// panicked wrapping it in a binder ("has escaping bound vars, so it cannot be wrapped in a
+/// dummy binder"): wasmtime's `log_get_die_ref<'a, 'r>(entry: &'a ConvertUnitEntry<'a,
+/// EndianSlice<'r, LittleEndian>>)`, whose gimli types hold `<R as gimli::Reader>::Offset`,
+/// which stopped blaze building blaze at stage 2.
+#[test]
+fn a_late_bound_lifetime_in_a_parameters_projection_is_scanned() {
+    let db = db_with(LATE_BOUND);
+    let krate = crate_named(&db, "kernel");
+    blaze_query::db::attach(&db, || {
+        for name in ["summary", "written"] {
+            let func = fn_named(&db, krate, name);
+            if let crate::FnPurity::Impure(refusal) = crate::fn_purity_generic(&db, func) {
+                panic!("`{name}` is pure: {}", refusal.said());
+            }
+            assert!(facts_of(&db, FactItem::Fn(func)).holds(Fact::Pure), "`{name}` is pure");
+        }
+    });
+}
