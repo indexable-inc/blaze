@@ -38,6 +38,7 @@ import Blaze.Mir.Opt.Puts
 import Blaze.Mir.Opt.Skel
 import Blaze.Mir.Opt.PutsTerm
 import Blaze.Mir.Opt.Liveness
+import Blaze.Mir.Opt.RemoveDead
 import Blaze.Mir.Opt.RemoveNops
 import Blaze.Mir.Opt.ConstFold
 import Blaze.Mir.Opt.Validate
