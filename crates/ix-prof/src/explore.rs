@@ -31,7 +31,8 @@ mod tests;
 
 pub use server::{CHECK, Config, Explorer, SHUTDOWN, StartError, serve};
 pub use source::{
-    Answer, Hello, Kind, Layer, Live, LiveTable, OpError, Rule, Source, Stop, Table, Tick,
+    Answer, Detail, ErrorHeader, Hello, Kind, Layer, Live, LiveTable, OpError, Rule, Source, Stop,
+    Table, Tick,
 };
 pub use wasm::CoreWasm;
 

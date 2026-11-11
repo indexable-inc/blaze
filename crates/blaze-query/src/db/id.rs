@@ -52,15 +52,17 @@ impl Id {
     /// The contract: an ID it gives is the word it was given, and a word it refuses is 0 or
     /// past [`Id::MAX_U32`]; so no word decodes to another ID, and none to an ID no storage
     /// could give. It cannot panic or allocate, as [`Id::new`].
+    ///
+    /// The contract is held by a property test over any word
+    /// (`a_decoded_id_is_its_word_and_a_refused_word_is_no_id`), not written as an `ensures`:
+    /// a clause checked at run time ends in an abort where it fails
+    /// (docs/v2/plan/design/contracts.md), which `#[blaze::nopanic]` rightly refuses, and a
+    /// decoder of a file's words is the code that must not have one. It becomes an `ensures`
+    /// once a proved clause builds no check.
     #[inline]
     #[blaze::nopanic]
     #[blaze::noalloc]
-    pub fn decode(word: u64, at: u64, what: &'static str) -> (r: Result<Id, FormatError>)
-        ensures match &r {
-            Ok(id) => id.as_u32() as u64 == word,
-            Err(_) => word == 0 || word > Id::MAX_U32 as u64,
-        }
-    {
+    pub fn decode(word: u64, at: u64, what: &'static str) -> Result<Id, FormatError> {
         match u32::try_from(word).ok().and_then(Id::new) {
             Some(id) => Ok(id),
             None if word == 0 => Err(FormatError::Zero { at, what }),

@@ -2,9 +2,6 @@
 // `#![blaze::sans_io]` marks a sans-IO core for `blaze::sans_io_core`; inert under rustc.
 #![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
-// Native `requires` and `ensures` clauses (docs/v2/plan/design/contracts.md), checked in the
-// dev and test profiles: what a decoder of persisted words promises (`db::Id::decode`).
-#![feature(blaze_verify)]
 //! blaze v2's query database (docs/v2/plan.md section 7, docs/v2/plan/design/item-hash.md
 //! section 6.2).
 //!

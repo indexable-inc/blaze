@@ -152,6 +152,8 @@ tempfile.workspace = true
 hegeltest.workspace = true
 # minicore, the `core` of the gpu dependency's end-to-end test (`serve/unit/tests/gpu.rs`).
 test-utils.workspace = true
+# A database of a fixture's files, for a unit's check run again (`serve/unit/checks/tests.rs`).
+hir-expand = { workspace = true, features = ["fixture"] }
 
 [target.'cfg(windows)'.dependencies]
 uds_windows.workspace = true

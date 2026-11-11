@@ -1510,6 +1510,27 @@ fn a_word_that_is_no_id_is_refused_by_the_checked_constructors_naming_it() {
     assert_eq!(Id::decode(7, 40, "a test's id").map(Id::as_u32), Ok(7));
 }
 
+/// The invariant: `Id::decode`'s contract, for any word: an ID it gives is the word it was
+/// given, and a word it refuses is 0 or past `Id::MAX_U32`, so no word decodes to another ID
+/// and none to an ID no storage could give. Words are drawn around the bounds as well as
+/// anywhere in 64 bits.
+#[hegel::test]
+fn a_decoded_id_is_its_word_and_a_refused_word_is_no_id(tc: TestCase) {
+    let max = u64::from(Id::MAX_U32);
+    let near: u64 = tc.draw(gs::integers::<u64>().max_value(8));
+    let word = match tc.draw(gs::integers::<u8>().max_value(4)) {
+        0 => near,
+        1 => max - near,
+        2 => max + near,
+        3 => u64::from(u32::MAX) - 4 + near,
+        _ => tc.draw(gs::integers::<u64>()),
+    };
+    match Id::decode(word, 40, "a test's id") {
+        Ok(id) => assert_eq!(u64::from(id.as_u32()), word),
+        Err(_) => assert!(word == 0 || word > max, "{word} is an ID and was refused"),
+    }
+}
+
 #[test]
 fn a_fixpoint_that_never_converges_panics_naming_its_head_and_leaves_no_value() {
     let db = TestDb::new();

@@ -16,13 +16,228 @@
 //!
 //! Integers stay exact: serde_json reads a JSON integer into a `u64` or `i64` whole, and a
 //! field that holds anything else is refused, naming the message and the field.
+//!
+//! A header is read into this module's own [`Json`] and [`Object`], by serde_json's parser,
+//! never into `serde_json::Value`: where a crate of the build turns on serde_json's
+//! `preserve_order`, its `Map` is an `IndexMap` seeded from OS randomness, which a sans-IO
+//! core does not reach (and which the page's wasm has none of). An [`Object`] is its fields in
+//! the order the daemon wrote them.
 
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
-use serde_json::{Map, Value};
+use serde::{
+    de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor},
+    ser::{Serialize, SerializeMap, Serializer},
+};
 
 use crate::{Error, field};
+
+/// A JSON value of a header.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Json {
+    Null,
+    Bool(bool),
+    /// An integer that is not negative, whole.
+    U64(u64),
+    /// A negative integer, whole.
+    I64(i64),
+    /// A number that is no integer of 64 bits.
+    F64(f64),
+    String(String),
+    Array(Vec<Json>),
+    Object(Object),
+}
+
+impl Json {
+    /// The integer it holds, when that is one a `u64` holds.
+    pub fn as_u64(&self) -> Option<u64> {
+        match *self {
+            Json::U64(it) => Some(it),
+            Json::I64(it) => u64::try_from(it).ok(),
+            _ => None,
+        }
+    }
+
+    /// The integer it holds, when that is one an `i64` holds.
+    pub fn as_i64(&self) -> Option<i64> {
+        match *self {
+            Json::I64(it) => Some(it),
+            Json::U64(it) => i64::try_from(it).ok(),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Json::String(it) => Some(it),
+            _ => None,
+        }
+    }
+
+    /// The field `name` of an object; `None` for any other value.
+    pub fn get(&self, name: &str) -> Option<&Json> {
+        match self {
+            Json::Object(it) => it.get(name),
+            _ => None,
+        }
+    }
+}
+
+/// As JSON text, for an error that shows what a field holds.
+impl std::fmt::Display for Json {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // alloc: an error's text
+        let text = serde_json::to_string(self).map_err(|_| std::fmt::Error)?;
+        f.write_str(&text)
+    }
+}
+
+impl Serialize for Json {
+    fn serialize<S: Serializer>(&self, to: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Json::Null => to.serialize_unit(),
+            Json::Bool(it) => to.serialize_bool(*it),
+            Json::U64(it) => to.serialize_u64(*it),
+            Json::I64(it) => to.serialize_i64(*it),
+            Json::F64(it) => to.serialize_f64(*it),
+            Json::String(it) => to.serialize_str(it),
+            Json::Array(it) => to.collect_seq(it),
+            Json::Object(it) => it.serialize(to),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Json {
+    fn deserialize<D: Deserializer<'de>>(from: D) -> Result<Json, D::Error> {
+        struct Read;
+
+        impl<'de> Visitor<'de> for Read {
+            type Value = Json;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+
+            fn visit_unit<E>(self) -> Result<Json, E> {
+                Ok(Json::Null)
+            }
+
+            fn visit_bool<E>(self, it: bool) -> Result<Json, E> {
+                Ok(Json::Bool(it))
+            }
+
+            fn visit_u64<E>(self, it: u64) -> Result<Json, E> {
+                Ok(Json::U64(it))
+            }
+
+            fn visit_i64<E>(self, it: i64) -> Result<Json, E> {
+                Ok(match u64::try_from(it) {
+                    Ok(it) => Json::U64(it),
+                    Err(_) => Json::I64(it),
+                })
+            }
+
+            fn visit_f64<E>(self, it: f64) -> Result<Json, E> {
+                Ok(Json::F64(it))
+            }
+
+            fn visit_str<E>(self, it: &str) -> Result<Json, E> {
+                // alloc: once a string of a header
+                Ok(Json::String(it.to_owned()))
+            }
+
+            fn visit_string<E>(self, it: String) -> Result<Json, E> {
+                Ok(Json::String(it))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Json, A::Error> {
+                // alloc: once a list of a header
+                let mut list = Vec::new();
+                while let Some(it) = seq.next_element()? {
+                    list.push(it);
+                }
+                Ok(Json::Array(list))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Json, A::Error> {
+                let mut object = Object::default();
+                // alloc: once a field of a header, its name
+                while let Some((name, value)) = map.next_entry::<String, Json>()? {
+                    object.insert(name, value);
+                }
+                Ok(Json::Object(object))
+            }
+        }
+
+        from.deserialize_any(Read)
+    }
+}
+
+/// A JSON object of a header: its fields in the order written. A name written twice holds
+/// its last value, in its first place.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Object(Vec<(String, Json)>);
+
+impl Object {
+    pub fn get(&self, name: &str) -> Option<&Json> {
+        self.0.iter().find(|(it, _)| it == name).map(|(_, value)| value)
+    }
+
+    pub fn contains_key(&self, name: &str) -> bool {
+        self.get(name).is_some()
+    }
+
+    /// The fields' names, in order.
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().map(|(name, _)| name.as_str())
+    }
+
+    /// The fields, in order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Json)> {
+        self.0.iter().map(|(name, value)| (name.as_str(), value))
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Sets `name`, in the place it has when it is there already.
+    pub fn insert(&mut self, name: String, value: Json) {
+        match self.0.iter_mut().find(|(it, _)| *it == name) {
+            Some((_, held)) => *held = value,
+            None => self.0.push((name, value)),
+        }
+    }
+
+    /// Takes `name` out, the fields after it keeping their order.
+    pub fn remove(&mut self, name: &str) -> Option<Json> {
+        let at = self.0.iter().position(|(it, _)| it == name)?;
+        Some(self.0.remove(at).1)
+    }
+
+    /// Moves every field of `other` into this object, after its own: one it has already takes
+    /// `other`'s value. `other` is left empty.
+    pub fn append(&mut self, other: &mut Object) {
+        for (name, value) in other.0.drain(..) {
+            self.insert(name, value);
+        }
+    }
+}
+
+impl Serialize for Object {
+    fn serialize<S: Serializer>(&self, to: S) -> Result<S::Ok, S::Error> {
+        let mut map = to.serialize_map(Some(self.0.len()))?;
+        for (name, value) in &self.0 {
+            map.serialize_entry(name, value)?;
+        }
+        map.end()
+    }
+}
 
 /// The bytes of a length: an answer's header length, a live frame's length.
 pub const HEAD: usize = 4;
@@ -43,7 +258,7 @@ pub const SCHEMAS: [u32; 1] = [5];
 /// An answer's header and the IPC after it.
 #[derive(Debug)]
 pub struct Head<'a> {
-    pub header: Map<String, Value>,
+    pub header: Object,
     pub ipc: &'a [u8],
 }
 
@@ -53,7 +268,7 @@ pub struct Refusal {
     pub kind: String,
     pub message: String,
     /// The rest of the error object: `op`, `table`, `in_flight`, `query`.
-    pub detail: Map<String, Value>,
+    pub detail: Object,
 }
 
 impl std::fmt::Display for Refusal {
@@ -98,29 +313,29 @@ pub fn answered<'a>(bytes: &'a [u8], message: &str) -> Result<Answered<'a>, Erro
         ));
     };
     let ipc = &bytes[HEAD + len..];
-    let header: Value = serde_json::from_slice(text).map_err(|why| {
+    let header: Json = serde_json::from_slice(text).map_err(|why| {
         // alloc: an error's text
         Error::new(message, "the header", format!("not JSON ({why}): {}", shown(text)))
     })?;
-    let Value::Object(mut header) = header else {
+    let Json::Object(mut header) = header else {
         // alloc: an error's text
         return Err(Error::new(message, "the header", format!("not an object: {}", shown(text))));
     };
     let Some(error) = header.remove("error") else {
         return Ok(Answered::Head(Head { header, ipc }));
     };
-    let Value::Object(mut error) = error else {
+    let Json::Object(mut error) = error else {
         // alloc: an error's text
         return Err(Error::new(message, field("error"), format!("holds {error}, not an object")));
     };
     let mut text = |key: &str| match error.remove(key) {
-        Some(Value::String(it)) => Ok(it),
+        Some(Json::String(it)) => Ok(it),
         other => Err(Error::new(
             message,
             // alloc: an error's text
             format!("field `error.{key}`"),
             // alloc: an error's text
-            format!("holds {}, not a string", other.unwrap_or(Value::Null)),
+            format!("holds {}, not a string", other.unwrap_or(Json::Null)),
         )),
     };
     let (kind, said) = (text("kind")?, text("message")?);
@@ -146,20 +361,20 @@ fn shown(text: &[u8]) -> String {
 
 /// A header's fields, read typed, errors naming `message` and the field.
 pub(crate) struct Fields<'h> {
-    pub(crate) header: &'h Map<String, Value>,
+    pub(crate) header: &'h Object,
     pub(crate) message: &'h str,
 }
 
 impl<'h> Fields<'h> {
-    fn wrong(&self, name: &str, value: &Value, want: &str) -> Error {
+    fn wrong(&self, name: &str, value: &Json, want: &str) -> Error {
         // alloc: an error's text
         Error::new(self.message, field(name), format!("holds {value}, not {want}"))
     }
 
-    pub(crate) fn get(&self, name: &str) -> Result<&'h Value, Error> {
+    pub(crate) fn get(&self, name: &str) -> Result<&'h Json, Error> {
         self.header.get(name).ok_or_else(|| {
             // alloc: an error's text, once
-            let keys: Vec<&str> = self.header.keys().map(String::as_str).collect();
+            let keys: Vec<&str> = self.header.keys().collect();
             // alloc: an error's text
             Error::new(self.message, field(name), format!("missing; the header has {}", keys.join(", ")))
         })
@@ -283,7 +498,7 @@ pub fn hello(bytes: &[u8]) -> Result<Hello, Error> {
 /// them must be there, as every daemon that serves a core sends `source`.
 fn layers(fields: &Fields<'_>) -> Result<Vec<String>, Error> {
     let message = fields.message;
-    let names = |list: &Vec<Value>, what: &str, name_of: fn(&Value) -> Option<&str>| {
+    let names = |list: &Vec<Json>, what: &str, name_of: fn(&Json) -> Option<&str>| {
         list.iter()
             .map(|it| {
                 // alloc: once a layer a session
@@ -296,11 +511,11 @@ fn layers(fields: &Fields<'_>) -> Result<Vec<String>, Error> {
             .collect::<Result<Vec<String>, Error>>()
     };
     if let Some(layers) = fields.header.get("layers") {
-        let Value::Array(list) = layers else {
+        let Json::Array(list) = layers else {
             // alloc: an error's text
             return Err(Error::new(message, field("layers"), format!("holds {layers}, not a list")));
         };
-        return names(list, "layers", |it| it.get("name").and_then(Value::as_str));
+        return names(list, "layers", |it| it.get("name").and_then(Json::as_str));
     }
     let Some(source) = fields.header.get("source") else {
         return Err(Error::new(
@@ -310,12 +525,12 @@ fn layers(fields: &Fields<'_>) -> Result<Vec<String>, Error> {
         ));
     };
     match source.get("extensions") {
-        Some(Value::Array(list)) => names(list, "source.extensions", Value::as_str),
+        Some(Json::Array(list)) => names(list, "source.extensions", Json::as_str),
         other => Err(Error::new(
             message,
             field("source.extensions"),
             // alloc: an error's text
-            format!("holds {}, not a list of names", other.unwrap_or(&Value::Null)),
+            format!("holds {}, not a list of names", other.unwrap_or(&Json::Null)),
         )),
     }
 }
@@ -409,7 +624,7 @@ pub struct Answer<'a> {
     /// The table's rows, for an op that answers with one.
     pub rows: Option<u64>,
     pub elapsed_ns: Option<u64>,
-    pub header: Map<String, Value>,
+    pub header: Object,
     pub ipc: &'a [u8],
 }
 

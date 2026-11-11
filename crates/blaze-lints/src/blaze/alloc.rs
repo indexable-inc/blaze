@@ -23,7 +23,10 @@
 //! says which functions end the walk reaching ([`Roots::is_root`]) and which end it not
 //! reaching ([`Roots::stops`]); everything else is walked into the same way.
 
+use std::alloc::Global;
+
 use base_db::Db;
+use blaze_hash::HashSet;
 use hir_def::{
     AdtId, BuiltinDeriveImplId, DefWithBodyId, FunctionId, HasModule as _, ItemContainerId,
     VariantId,
@@ -118,8 +121,9 @@ pub(crate) fn reaches_root(
 }
 
 /// What the first call of `f`'s body (instantiated with `args`) that reaches a function of
-/// `roots` runs: the next step of a chain to a root. `None` when no call does, or `f` has no
-/// body.
+/// `roots` runs. `None` when no call does, or `f` has no body. It says that `f` reaches a
+/// root, not how: on a cycle of calls the first reaching call may be the one back into the
+/// cycle, so a chain is named by [`chain_to_root`], never by following this.
 pub(super) fn first_reaching_call<'db>(
     db: &'db Db,
     env: ParamEnvAndCrate<'db>,
@@ -128,8 +132,28 @@ pub(super) fn first_reaching_call<'db>(
     through_workspace: bool,
     roots: Roots,
 ) -> Option<Resolved<'db>> {
+    let mut first = None;
+    reaching_calls(db, env, f, args, through_workspace, roots, |resolved| {
+        first = Some(resolved);
+        true
+    });
+    first
+}
+
+/// Hands `each` what every call of `f`'s body (instantiated with `args`) that reaches a
+/// function of `roots` runs, in the body's order, until `each` says to stop. Nothing for an
+/// `f` with no body.
+fn reaching_calls<'db>(
+    db: &'db Db,
+    env: ParamEnvAndCrate<'db>,
+    f: FunctionId,
+    args: GenericArgs<'db>,
+    through_workspace: bool,
+    roots: Roots,
+    mut each: impl FnMut(Resolved<'db>) -> bool,
+) {
     if !FunctionSignature::of(db, f).has_body() {
-        return None;
+        return;
     }
     let def = DefWithBodyId::FunctionId(f);
     let body = Body::of(db, def);
@@ -143,31 +167,73 @@ pub(super) fn first_reaching_call<'db>(
         let callee_args =
             EarlyBinder::bind(interner, callee_args).instantiate(interner, args).skip_norm_wip();
         let resolved = resolve(db, env, callee, callee_args);
-        if instance_reaches_root(db, env, resolved, through_workspace, roots) {
-            return Some(resolved);
+        if instance_reaches_root(db, env, resolved, through_workspace, roots) && each(resolved) {
+            return;
         }
     }
-    None
 }
 
-/// The step after `resolved` on a chain to a function of `roots`: `None` once `resolved` is
-/// a root itself (or reaches none).
-pub(super) fn next_step<'db>(
+/// The most steps [`chain_to_root`] looks at before it gives up on naming a chain (rule 18:
+/// the search is bounded; the walk that found the root is bounded by its memo).
+const CHAIN_SEARCH: usize = 1 << 14;
+
+/// A shortest chain of calls from `first`, what a call runs, to a function of `roots`:
+/// `first` first, the root last. Breadth first over every reaching call of each step, each
+/// step looked at once, so a cycle of calls (a recursive deserializer, a visitor that calls
+/// itself) is left by the call that goes on to the root and never walked around: following
+/// each step's first reaching call names the cycle and no root. `None` when `first` reaches
+/// no root, or none within [`CHAIN_SEARCH`] steps.
+pub(super) fn chain_to_root<'db>(
     db: &'db Db,
     env: ParamEnvAndCrate<'db>,
-    resolved: Resolved<'db>,
+    first: Resolved<'db>,
     through_workspace: bool,
     roots: Roots,
-) -> Option<Resolved<'db>> {
-    match resolved {
-        Resolved::Function(f, _) if roots.is_root(db, f) || roots.stops(db, f) => None,
-        Resolved::Function(f, args) => {
-            first_reaching_call(db, env, f, args, through_workspace, roots)
+) -> Option<Vec<Resolved<'db>>> {
+    let is_root = |it: Resolved<'db>| matches!(it, Resolved::Function(f, _) if roots.is_root(db, f));
+    // alloc: a finding's chain, searched once per finding reported
+    let mut seen: HashSet<Resolved<'db>, Global> = HashSet::new_in(Global);
+    // Each step looked at, with the place of the step that called it.
+    let mut steps: Vec<(Resolved<'db>, usize)> = vec![(first, 0)]; // alloc: as `seen`
+    seen.insert(first);
+    let mut at = 0;
+    let root = loop {
+        let &(step, _) = steps.get(at)?;
+        if is_root(step) {
+            break at;
         }
-        Resolved::Derived(impl_, method, args) => {
-            derived_first(db, env, impl_, method, args, through_workspace, roots)
+        if steps.len() > CHAIN_SEARCH {
+            return None;
         }
+        let mut push = |next: Resolved<'db>| {
+            if seen.insert(next) {
+                steps.push((next, at));
+            }
+            false
+        };
+        match step {
+            Resolved::Function(f, _) if roots.stops(db, f) => {}
+            Resolved::Function(f, args) => {
+                reaching_calls(db, env, f, args, through_workspace, roots, push);
+            }
+            Resolved::Derived(impl_, method, args) => {
+                derived_reaching(db, env, impl_, method, args, through_workspace, roots, &mut push);
+            }
+        }
+        at += 1;
+    };
+    let mut chain = Vec::new(); // alloc: as `seen`
+    let mut at = root;
+    loop {
+        let (step, from) = steps[at];
+        chain.push(step);
+        if at == 0 {
+            break;
+        }
+        at = from;
     }
+    chain.reverse();
+    Some(chain)
 }
 
 /// A function of the allocator itself.
@@ -206,7 +272,7 @@ pub(super) fn written_callee<'db>(
 }
 
 /// What runs for a call of `f` with `args`.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum Resolved<'db> {
     /// A function, a trait's own when no impl is known (its default body, or none).
     Function(FunctionId, GenericArgs<'db>),
@@ -286,26 +352,41 @@ fn derived_first<'db>(
     through_workspace: bool,
     roots: Roots,
 ) -> Option<Resolved<'db>> {
+    let mut found = None;
+    derived_reaching(db, env, impl_, method, args, through_workspace, roots, &mut |resolved| {
+        found = Some(resolved);
+        true
+    });
+    found
+}
+
+/// Hands `each` what each field's call of a built-in derive's `clone` or `default` that
+/// reaches a function of `roots` runs ([`derived_first`]), until `each` says to stop.
+fn derived_reaching<'db>(
+    db: &'db Db,
+    env: ParamEnvAndCrate<'db>,
+    impl_: BuiltinDeriveImplId,
+    method: BuiltinDeriveImplMethod,
+    args: GenericArgs<'db>,
+    through_workspace: bool,
+    roots: Roots,
+    // dyn: the visitor of a finding's chain search or of the walk's one question, off any hot path
+    each: &mut dyn FnMut(Resolved<'db>) -> bool,
+) {
     if !matches!(method, BuiltinDeriveImplMethod::clone | BuiltinDeriveImplMethod::default) {
-        return None;
+        return;
     }
-    let trait_method = method.trait_method(db, impl_)?;
+    let Some(trait_method) = method.trait_method(db, impl_) else { return };
     let interner = DbInterner::new_no_crate(db);
     let adt = impl_.loc(db).adt;
-    let mut found = None;
     any_variant(db, adt, |variant| {
         db.field_types(variant).iter().any(|(_, field)| {
             let ty = field.ty().instantiate(interner, args).skip_norm_wip();
             let field_args = GenericArgs::new_from_slice(&[GenericArg::from(ty)]);
             let resolved = resolve(db, env, trait_method, field_args);
-            let reaches = instance_reaches_root(db, env, resolved, through_workspace, roots);
-            if reaches {
-                found = Some(resolved);
-            }
-            reaches
+            instance_reaches_root(db, env, resolved, through_workspace, roots) && each(resolved)
         })
     });
-    found
 }
 
 /// Whether `f` holds for some variant of `adt`: its one for a struct or union.

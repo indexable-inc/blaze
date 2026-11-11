@@ -7,6 +7,7 @@
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
+use serde::ser::{Serialize, SerializeMap, Serializer};
 use serde_json::{Map, Value};
 
 /// Set when the page stops a request: the sender is dropped as the request's stream ends
@@ -233,37 +234,117 @@ pub struct OpError {
     /// The kind's `snake_case` name ([`Kind::name`], or the source's).
     pub kind: &'static str,
     pub message: String,
-    pub detail: Map<String, Value>,
+    pub detail: Detail,
+}
+
+/// An error's detail: its fields in the order they were added, each name once.
+///
+/// A list and not a `serde_json::Map`: the session core makes errors, and a `Map` that keeps
+/// its order (serde_json's `preserve_order`, which one crate of a build turns on for all) is an
+/// `IndexMap` seeded from OS randomness, which a sans-IO core does not reach. A list is also
+/// the same bytes on the wire whatever the build turned on.
+#[derive(Debug, Default, PartialEq)]
+pub struct Detail(Vec<(String, Value)>);
+
+impl Detail {
+    /// The field `key`, if the detail has it.
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        self.0.iter().find(|(it, _)| it == key).map(|(_, value)| value)
+    }
+
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.get(key).is_some()
+    }
+
+    /// The fields, in the order they were added.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Value)> {
+        self.0.iter().map(|(key, value)| (key.as_str(), value))
+    }
+
+    /// Sets `key`, in the place it has when it is there already.
+    fn insert(&mut self, key: &str, value: Value) {
+        match self.0.iter_mut().find(|(it, _)| it == key) {
+            Some((_, held)) => *held = value,
+            // alloc: an error path
+            None => self.0.push((key.to_owned(), value)),
+        }
+    }
+}
+
+/// `detail[key]`, as a `serde_json::Value`'s: `null` for a field the detail has not.
+impl std::ops::Index<&str> for Detail {
+    type Output = Value;
+
+    fn index(&self, key: &str) -> &Value {
+        static NULL: Value = Value::Null;
+        self.get(key).unwrap_or(&NULL)
+    }
 }
 
 impl OpError {
     pub fn new(kind: impl Into<&'static str>, message: impl Into<String>) -> OpError {
-        OpError { kind: kind.into(), message: message.into(), detail: Map::new() }
+        OpError { kind: kind.into(), message: message.into(), detail: Detail::default() }
     }
 
     /// Adds `key` to the detail.
     #[must_use]
     pub fn with(mut self, key: &str, value: impl Into<Value>) -> OpError {
-        // alloc: an error path
-        self.detail.insert(key.to_owned(), value.into());
+        self.detail.insert(key, value.into());
         self
     }
 
     /// The header an error is sent as: `{"error": {"kind", "message", ...detail}}`.
-    pub fn header(&self) -> Map<String, Value> {
-        let mut error = Map::new();
-        // alloc: an error path
-        error.insert("kind".to_owned(), self.kind.into());
-        // alloc: an error path
-        error.insert("message".to_owned(), self.message.as_str().into());
-        for (key, value) in &self.detail {
-            // clone: an error path
-            error.insert(key.clone(), value.clone());
+    pub fn header(&self) -> ErrorHeader<'_> {
+        ErrorHeader { error: self, op: None }
+    }
+}
+
+/// The header an error is sent as ([`OpError::header`]), written as it is serialized: no map
+/// is made of it.
+#[derive(Clone, Copy, Debug)]
+pub struct ErrorHeader<'a> {
+    error: &'a OpError,
+    /// `op` beside the error: a live frame's (`live`).
+    op: Option<&'static str>,
+}
+
+impl<'a> ErrorHeader<'a> {
+    /// The header with `op` beside its error, as the live stream sends a tick that failed.
+    #[must_use]
+    pub fn with_op(self, op: &'static str) -> ErrorHeader<'a> {
+        ErrorHeader { op: Some(op), ..self }
+    }
+}
+
+impl Serialize for ErrorHeader<'_> {
+    fn serialize<S: Serializer>(&self, to: S) -> Result<S::Ok, S::Error> {
+        let mut map = to.serialize_map(Some(1 + usize::from(self.op.is_some())))?;
+        map.serialize_entry("error", &ErrorBody(self.error))?;
+        if let Some(op) = self.op {
+            map.serialize_entry("op", op)?;
         }
-        let mut header = Map::new();
-        // alloc: an error path
-        header.insert("error".to_owned(), Value::Object(error));
-        header
+        map.end()
+    }
+}
+
+/// The `error` object of an [`ErrorHeader`]: `kind`, `message`, then the detail. A detail
+/// field named `kind` or `message` is the one written, where the detail has it.
+struct ErrorBody<'a>(&'a OpError);
+
+impl Serialize for ErrorBody<'_> {
+    fn serialize<S: Serializer>(&self, to: S) -> Result<S::Ok, S::Error> {
+        let OpError { kind, message, detail } = self.0;
+        let mut map = to.serialize_map(None)?;
+        if !detail.contains_key("kind") {
+            map.serialize_entry("kind", kind)?;
+        }
+        if !detail.contains_key("message") {
+            map.serialize_entry("message", message)?;
+        }
+        for (key, value) in detail.iter() {
+            map.serialize_entry(key, value)?;
+        }
+        map.end()
     }
 }
 

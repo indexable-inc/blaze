@@ -8,6 +8,7 @@
 //! clippy's `MovedVariablesCtxt` asks rustc's.
 
 use hir::{LangItem, PathResolution};
+use hir_def::{AttrDefId, attrs::AttrFlags};
 use syntax::{
     TextRange,
     view::{
@@ -78,6 +79,15 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     }
     let db = cx.db();
     let Some(def) = cx.fn_def(function) else { return };
+    // blaze: a `#[blaze::consumes]` function ends what it takes by value by taking it (the
+    // linear check, docs/v2/plan/design/linear.md: its by-value parameters are not linear in
+    // its body). A reference would end nothing, and its caller would then drop a linear value:
+    // the mark says the argument is consumed, whatever the body moves.
+    if let Ok(id) = hir_def::FunctionId::try_from(def)
+        && AttrFlags::query(db, AttrDefId::FunctionId(id)).contains(AttrFlags::CONSUMES)
+    {
+        return;
+    }
     let Some(analysis) = cx.analysis() else { return };
     if analysis.def() != hir::DefWithBody::Function(def) {
         return;

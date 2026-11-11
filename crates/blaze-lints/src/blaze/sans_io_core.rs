@@ -268,37 +268,32 @@ struct Chain {
     effect: Option<Effect>,
 }
 
-/// The chain from `first`, what a core function's call runs, to the ambient root it reaches,
-/// at most [`LONGEST_CHAIN`] steps.
+/// The chain from `first`, what a core function's call runs, to the ambient root it reaches:
+/// a shortest one ([`alloc::chain_to_root`]), so the root named is the effect and not a step
+/// of a cycle of calls on the way. Of a chain longer than [`LONGEST_CHAIN`] the first steps
+/// and the root are named, with `…` between.
 fn chain<'db>(db: &'db Db, env: ParamEnvAndCrate<'db>, first: Resolved<'db>) -> Chain {
-    // alloc: a finding's chain, reported at the edge
-    let mut names: Vec<String> = Vec::new();
-    let mut at = first;
-    let mut cut = true;
-    for _ in 0..LONGEST_CHAIN {
-        match alloc::next_step(db, env, at, true, Roots::Ambient) {
-            Some(next) => {
-                names.push(step_name(db, at));
-                at = next;
-            }
-            None => {
-                cut = false;
-                break;
-            }
-        }
-    }
-    let (root, effect) = match at {
+    let Some(steps) = alloc::chain_to_root(db, env, first, true, Roots::Ambient) else {
+        // The walk says `first` reaches a root and the search named none within its bound.
+        let name = step_name(db, first);
+        return Chain { steps: format!("`{name}` → `…`"), root: name, effect: None };
+    };
+    let (last, before) = steps.split_last().expect("a chain has its first step");
+    let (root, effect) = match *last {
         Resolved::Function(f, _) => match ambient(db, f) {
             Ambient::Root(effect) => (root_path(db, f), Some(effect)),
-            Ambient::Walk | Ambient::Stop => (step_name(db, at), None),
+            Ambient::Walk | Ambient::Stop => (step_name(db, *last), None),
         },
-        Resolved::Derived(..) => (step_name(db, at), None),
+        Resolved::Derived(..) => (step_name(db, *last), None),
     };
-    // clone: the root's name, once in the chain and once on its own
-    names.push(root.clone());
-    if cut {
+    // alloc: a finding's chain, reported at the edge
+    let mut names: Vec<String> =
+        before.iter().take(LONGEST_CHAIN).map(|&it| step_name(db, it)).collect();
+    if before.len() > LONGEST_CHAIN {
         names.push("…".to_owned()); // alloc: a finding's chain
     }
+    // clone: the root's name, once in the chain and once on its own
+    names.push(root.clone());
     let steps = names.iter().map(|it| format!("`{it}`")).collect::<Vec<_>>().join(" → "); // alloc: a finding's chain
     Chain { steps, root, effect }
 }
@@ -477,6 +472,58 @@ pub fn driver() {
         );
         assert!(!found.contains("`Machine::locks`"), "std's locks end the walk:\n{found}");
         assert!(!found.contains("`driver`"), "a driver outside the core reads the clock:\n{found}");
+    }
+
+    /// A chain through a cycle of calls names the effect, by a shortest way: `walk` calls
+    /// itself before it reads the file, and `again` and `back` call each other, so the first
+    /// call of each that reaches the root is the one back into the cycle (serde_json's `Value`
+    /// deserializer, blaze checking blaze, 2026-11-11: a finding that named
+    /// `SeqAccess::next_element_seed` as its root and "an ambient effect" as what it reached).
+    #[test]
+    fn a_chain_through_a_cycle_of_calls_names_the_effect_it_reaches() {
+        let found = lint_main(
+            r#"
+pub mod machine {
+    #![blaze::sans_io]
+    pub fn recursive(n: u32) -> u64 {
+        crate::walk(n)
+    }
+    pub fn mutual(n: u32) -> u64 {
+        crate::again(n)
+    }
+}
+pub fn walk(n: u32) -> u64 {
+    if n > 0 {
+        return walk(n - 1);
+    }
+    std::fs::read("x")
+}
+pub fn again(n: u32) -> u64 {
+    back(n)
+}
+pub fn back(n: u32) -> u64 {
+    if n > 0 {
+        return again(n - 1);
+    }
+    std::fs::read("y")
+}
+"#,
+        );
+        assert_eq!(found.matches("does no IO").count(), 2, "{found}");
+        assert!(!found.contains("an ambient effect"), "every finding names its effect:\n{found}");
+        assert!(!found.contains('…'), "no chain is cut:\n{found}");
+        assert!(
+            found.contains(
+                "`recursive` reaches the file system through `std::fs::read`: `recursive` → `walk` → `std::fs::read`;"
+            ),
+            "{found}"
+        );
+        assert!(
+            found.contains(
+                "`mutual` reaches the file system through `std::fs::read`: `mutual` → `again` → `back` → `std::fs::read`;"
+            ),
+            "{found}"
+        );
     }
 
     /// The marker on the crate root makes every module a core; a test inside it is not checked.

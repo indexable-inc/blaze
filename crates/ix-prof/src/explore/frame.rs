@@ -20,7 +20,7 @@ use arrow_ipc::{
     writer::{IpcWriteOptions, StreamWriter},
 };
 use arrow_schema::{ArrowError, Schema};
-use serde_json::{Map, Value};
+use serde::Serialize;
 
 use super::{Answer, Kind, OpError, session};
 
@@ -32,8 +32,9 @@ pub const ALIGN: usize = 8;
 pub const ZSTD_LEVEL: i32 = 1;
 
 /// Appends the head of an answer to `out`: the header's length and its JSON, padded so that
-/// what is appended next starts [`ALIGN`]-aligned from where the head began.
-pub fn head(out: &mut Vec<u8>, header: &Map<String, Value>) -> Result<(), serde_json::Error> {
+/// what is appended next starts [`ALIGN`]-aligned from where the head began. A header is what
+/// serializes as one JSON object: a typed header of [`session`]'s, an answer's map.
+pub fn head<H: Serialize + ?Sized>(out: &mut Vec<u8>, header: &H) -> Result<(), serde_json::Error> {
     let start = out.len();
     out.extend_from_slice(&[0; 4]);
     serde_json::to_writer(&mut *out, header)?;
@@ -46,9 +47,9 @@ pub fn head(out: &mut Vec<u8>, header: &Map<String, Value>) -> Result<(), serde_
 
 /// Appends the head of a live frame to `out`: the frame's length, then [`head`], for a frame
 /// whose IPC stream, sent right after, is `ipc_len` bytes.
-pub fn live_head(
+pub fn live_head<H: Serialize + ?Sized>(
     out: &mut Vec<u8>,
-    header: &Map<String, Value>,
+    header: &H,
     ipc_len: usize,
 ) -> Result<(), serde_json::Error> {
     let start = out.len();
@@ -96,7 +97,7 @@ pub fn answer_bytes(answer: Result<Answer, OpError>, elapsed_ns: u64) -> Vec<u8>
     });
     if let Err(why) = encoded {
         out.clear();
-        head(&mut out, &why.header()).expect("a JSON map always serializes");
+        head(&mut out, &why.header()).expect("an error's header always serializes");
     }
     out
 }
@@ -108,6 +109,7 @@ mod tests {
     use arrow_array::{Int64Array, StringArray};
     use arrow_ipc::reader::StreamReader;
     use arrow_schema::{DataType, Field};
+    use serde_json::{Map, Value};
 
     use super::*;
 
