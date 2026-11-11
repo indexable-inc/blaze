@@ -745,14 +745,20 @@ programs; it is the specification of the Rust pass of the same name.
   trace, the locals assigned in order with their expressions (`symStmts`), and what a trace
   means (`den`); `execStmts_sym`: executing the statements is the meaning of their trace,
   so statement lists with one trace do the same from every state (`execStmts_same`).
-  **Not written: the rest of it**, which needs no script and accepts
-  rewrites nobody proved one by one (copy propagation, local renumbering, reordering of
-  independent statements). It needs an expression language whose evaluation is proved to
-  agree with `evalRvalue`, each block run on symbolic locals to a normal form (stores of
-  expressions, panics in order, a terminator with a symbolic condition), and `Renumbers`
-  with "the target block is symbolically equal" in place of "is the renamed block"; sound
-  through `Sim`, or `Stutter` when blocks were merged. The inliner needs a relation between
-  one frame and two beyond that; loop transforms need a witness that is not per block.
+  **Third piece** (`Opt/SymEq.lean`; not yet elaborated): a terminator with a symbolic
+  condition (`symTerm`), a block as its trace and symbolic terminator (`symBlock`,
+  `execBlock_sym`), `symEq a b` (the same types and, block by block, blocks that are equal
+  or have one symbolic form) with `symEq_sound` (they run alike, for every fuel and state),
+  and `validateSym a b w`: a script of proved rewrites replayed on `a`, the result compared
+  with `b` by `symEq` (`validateSym_sound`). The script is the block map; symbolic equality
+  is the rest.
+  **What symbolic equality accepts, and what it does not.** It accepts a pass that rewrites
+  operands inside a block and keeps every store: copy and constant propagation of uses,
+  on the scalar, move-free subset (blocks outside it must be equal). It does not accept a
+  store or a local removed (the deleting half of the Rust `CopyProp`, `SimplifyLocals`):
+  there the two programs' states differ on a dead local across steps, which is ledger V11's
+  relation. The inliner needs a relation between one frame and two; loop transforms need a
+  witness that is not per block.
 - **The Rust passes are held to them by translation validation.** The test
   `the_passes_are_their_lean_specifications` and `mir_semantics.py validate` run each pass
   alone on runtime MIR, embed the body before and after, and Lean checks

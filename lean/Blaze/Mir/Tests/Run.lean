@@ -603,4 +603,30 @@ example :
 
 example : Opt.allPlain cfgScript = true := by decide
 
+/-! Symbolic equality: a use of a copy replaced by the local it copies (copy propagation of
+a use, the copy kept) gives one symbolic form; another constant does not. -/
+
+def viaCopy (use : Local) (k : Int) : Program :=
+  { adts := [],
+    fns :=
+      [{ name := "viaCopy", args := 1,
+         locals := [Ty.int ScalarTy.U32, Ty.int ScalarTy.U32, Ty.int ScalarTy.U32],
+         blocks :=
+           [{ stmts :=
+                [Statement.assign (Place.mk 2 []) (Rvalue.use (Operand.copy (Place.mk 1 []))),
+                 Statement.assign (Place.mk 0 [])
+                   (Rvalue.checked BinOp.add (Operand.copy (Place.mk use []))
+                     (Operand.const (Const.int ScalarTy.U32 k)))],
+              terminator := Terminator.ret }] }] }
+
+example : symEq (viaCopy 2 1) (viaCopy 1 1) = true := by decide
+
+example : symEq (viaCopy 2 1) (viaCopy 1 2) = false := by decide
+
+example : decide (viaCopy 2 1 = viaCopy 1 1) = false := by decide
+
+example : Opt.validateSym (viaCopy 2 1) (viaCopy 1 1) [] = true := by decide
+
+example : isInt ScalarTy.U32 6 ((viaCopy 1 1).call 1 0 [] [u32 5]) = true := by decide
+
 end Blaze.Mir.Tests

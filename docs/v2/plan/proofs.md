@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-78 theorems: 65 in `lean`, 13 in `lean/analysis`.
+80 theorems: 67 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -637,6 +637,22 @@ theorem execStmts_sym (adts : List AdtDecl) (st0 : State) :
 theorem execStmts_same (adts : List AdtDecl) (s1 s2 : List Statement)
     (tr : List (Local × Expr)) (h1 : symStmts [] s1 = some tr) (h2 : symStmts [] s2 = some tr)
     (st : State) : execStmts adts st s1 = execStmts adts st s2
+```
+
+**`Blaze.Mir.symEq_sound`** (`Blaze.Mir.Opt.SymEq`, `lean`): Programs whose blocks are equal or have one symbolic form run alike, for every fuel and every state.
+
+```lean
+theorem symEq_sound (a b : Program) (h : symEq a b = true) (fuel : Nat) (st : State) :
+    run b fuel st = run a fuel st
+```
+
+**`Blaze.Mir.Opt.validateSym_sound`** (`Blaze.Mir.Opt.SymEq`, `lean`): When a script of proved rewrites takes one program to a program symbolically equal to another, every call whose caller hands over pointers into frame 0 only, that ends and not in undefined behaviour, gives the same outcome.
+
+```lean
+theorem validateSym_sound (a b : Program) (w : List Rewrite) (h : validateSym a b w = true)
+    (n : Nat) (id : FnId) (base : List Slot) (args : List Value) (hz : FrameZero base args)
+    (r : Outcome Value) (hr : a.call n id base args = r) (hd : r ≠ Outcome.diverge)
+    (hu : ∀ (why : Undefined), r ≠ Outcome.undefined why) : b.call n id base args = r
 ```
 
 **`Blaze.Mir.Opt.simplifyCfg_call`** (`Blaze.Mir.Opt.SimplifyCfg`, `lean`): SimplifyCfg composed from the proved passes keeps every call that ends, and not in undefined behaviour: the same outcome with the same fuel.

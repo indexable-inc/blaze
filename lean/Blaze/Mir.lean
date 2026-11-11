@@ -32,6 +32,7 @@ import Blaze.Mir.Opt.RemoveOverwritten
 import Blaze.Mir.Opt.Witness
 import Blaze.Mir.Opt.Sym
 import Blaze.Mir.Opt.SymBlock
+import Blaze.Mir.Opt.SymEq
 import Blaze.Mir.Opt.RemoveNops
 import Blaze.Mir.Opt.ConstFold
 import Blaze.Mir.Opt.Validate
