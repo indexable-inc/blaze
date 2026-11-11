@@ -162,6 +162,7 @@ fn a_release_says_why_what_went_and_the_memory_against_the_limit() {
     let storage = Holders::of(vec![infer]);
     let said = Said {
         crates: 2,
+        held: 0,
         mir: true,
         pressed: true,
         ended: false,
@@ -183,6 +184,7 @@ fn a_release_says_why_what_went_and_the_memory_against_the_limit() {
     let storage = Holders::of(Vec::new());
     let said = Said {
         crates: 1,
+        held: 0,
         mir: false,
         pressed: true,
         ended: false,
@@ -204,6 +206,7 @@ fn a_release_says_why_what_went_and_the_memory_against_the_limit() {
     let storage = Holders::total(3 << 29);
     let said = Said {
         crates: 1,
+        held: 0,
         mir: true,
         pressed: false,
         ended: false,
@@ -220,6 +223,7 @@ fn a_release_says_why_what_went_and_the_memory_against_the_limit() {
     // A build's end says what two builds left unread, when anything went.
     let said = Said {
         crates: 0,
+        held: 0,
         mir: true,
         pressed: false,
         ended: true,
@@ -233,6 +237,28 @@ fn a_release_says_why_what_went_and_the_memory_against_the_limit() {
     assert!(said.starts_with("front end release (the build is over)"), "{said}");
     assert!(
         said.contains("trait solver caches, and 12 values the last two builds did not read; "),
+        "{said}"
+    );
+    assert!(!said.contains("holding the inference"), "no workspace crate is held: {said}");
+    // A build that holds workspace crates' inference for the next edit says how many.
+    let said = Said {
+        crates: 3,
+        held: 2,
+        mir: true,
+        pressed: false,
+        ended: true,
+        dropped,
+        unread,
+        before: idle,
+        after: idle,
+        storage: Holders::total(3 << 29),
+    }
+    .to_string();
+    assert!(
+        said.contains(
+            "trait solver caches, holding the inference of the 2 workspace crates finished last \
+             for the next edit; "
+        ),
         "{said}"
     );
 }
@@ -421,4 +447,141 @@ fn the_oracle_catches_a_release_that_lets_go_of_what_an_edit_made() {
         Some(Plan { crates: vec![], mir: true, pressed: false, ended: true }),
         "and its end lets go of every MIR"
     );
+}
+
+/// The invariant: a build that compiles and is no edit's (a cold build, a rebuild of many
+/// crates) lets go of a dependency's inference as the crate finishes and holds the inference
+/// of the workspace's crates it finished last, at most [`EDIT_CRATES`], through its end, so
+/// its end leaves what an edit's build's end leaves and the first edit after it infers only
+/// what changed; a workspace crate goes once [`EDIT_CRATES`] finished after it, and memory
+/// short takes the held ones with the rest. The MIR goes as before.
+#[test]
+fn a_build_that_is_no_edit_s_holds_the_inference_of_the_workspace_crates_it_finished_last() {
+    const GIB: u64 = 1 << 30;
+    let fine = || Pressure { held: GIB, limit: 48 * GIB, over: None };
+    let short = || Pressure { held: 47 * GIB, limit: 48 * GIB, over: Some(Tag::Mir) };
+    // Crates under 100 are dependencies; 100 and up are the workspace's.
+    let member = |krate: &u32| *krate >= 100;
+    // Unit 0 of dependency 7, then a unit each of workspace crates 100.., two more than held.
+    let members = EDIT_CRATES as u32 + 2;
+    let cold = || {
+        let mut of = vec![Some(7u32)];
+        of.extend((0..members).map(|at| Some(100 + at)));
+        Release::of(Finished::new(of), true)
+    };
+    let mut release = cold();
+    release.began(0);
+    release.compiled_under(0, fine);
+    assert!(release.due(), "no unit is open and a dependency this build made is finished");
+    assert_eq!(
+        release.plan_of(member),
+        Some(Plan { crates: vec![7], mir: true, pressed: false, ended: false }),
+        "a dependency's inference goes as it finishes"
+    );
+    assert!(release.held().is_empty());
+    for at in 0..EDIT_CRATES {
+        let unit = 1 + at;
+        release.began(unit);
+        release.compiled_under(unit, fine);
+        assert!(release.due(), "no unit is open: the MIR goes");
+        assert_eq!(
+            release.plan_of(member),
+            Some(Plan { crates: vec![], mir: true, pressed: false, ended: false }),
+            "a workspace crate's inference is held; every MIR goes, as no unit is open"
+        );
+    }
+    let first: Vec<u32> = (0..EDIT_CRATES as u32).map(|at| 100 + at).collect();
+    assert_eq!(release.held(), &first[..], "the workspace crates finished, in their order");
+    // One more: the first held goes, as `EDIT_CRATES` workspace crates finished after it.
+    let unit = 1 + EDIT_CRATES;
+    release.began(unit);
+    release.compiled_under(unit, fine);
+    assert_eq!(
+        release.plan_of(member),
+        Some(Plan { crates: vec![100], mir: true, pressed: false, ended: false }),
+        "never more than `EDIT_CRATES` held: the bound on what the build holds more"
+    );
+    let last: Vec<u32> = (1..=EDIT_CRATES as u32).map(|at| 100 + at).collect();
+    assert_eq!(release.held(), &last[..]);
+    // The build's end: every MIR, and no held crate's inference.
+    release.end();
+    assert!(release.due(), "the build's end");
+    assert_eq!(
+        release.plan_of(member),
+        Some(Plan { crates: vec![], mir: true, pressed: false, ended: true }),
+        "the end lets go of every MIR and of no workspace crate held"
+    );
+    assert_eq!(release.held(), &last[..], "held past the build's end, for the next edit");
+    assert!(!release.due() && release.plan_of(member).is_none(), "taken");
+
+    // Memory short: the held crates go with what finished since, the held ones first.
+    let mut pressed = cold();
+    for unit in 0..3 {
+        pressed.began(unit);
+        pressed.compiled_under(unit, fine);
+        assert!(pressed.plan_of(member).is_some());
+    }
+    assert_eq!(pressed.held(), &[100, 101][..]);
+    pressed.began(3);
+    pressed.compiled_under(3, short);
+    assert!(pressed.due(), "memory is short");
+    assert_eq!(
+        pressed.plan_of(member),
+        Some(Plan { crates: vec![100, 101, 102], mir: true, pressed: true, ended: false }),
+        "memory takes the held crates' inference as any crate's"
+    );
+    assert!(pressed.held().is_empty(), "nothing is held once memory took it");
+
+    // A check names no crate and holds none; an edit's build holds none: it names none.
+    let mut check = Release::of(Finished::new(vec![Some(100u32)]), false);
+    check.began(0);
+    check.compiled_under(0, fine);
+    check.end();
+    assert_eq!(
+        check.plan_of(member),
+        Some(Plan { crates: vec![], mir: true, pressed: false, ended: true })
+    );
+    assert!(check.held().is_empty());
+    let mut edit = Release::of(Finished::new(vec![Some(7u32), Some(100)]), true);
+    edit.began(0);
+    edit.kept(0);
+    edit.compiled_under(0, fine);
+    edit.began(1);
+    edit.compiled_under(1, fine);
+    edit.end();
+    assert_eq!(
+        edit.plan_of(member),
+        Some(Plan { crates: vec![], mir: false, pressed: false, ended: true })
+    );
+    assert!(edit.held().is_empty(), "an edit's build lets go of nothing by name: nothing to hold");
+}
+
+/// The control of
+/// [`a_build_that_is_no_edit_s_holds_the_inference_of_the_workspace_crates_it_finished_last`]:
+/// the same build told that no crate is the workspace's (the planted bug's shape: a release
+/// that does not tell a crate an edit can touch from a dependency, as every release was until
+/// 2026-11-11) lets go of each crate's inference as it finishes and holds none, so the
+/// oracle's plans are not those of every release.
+#[test]
+fn the_oracle_catches_a_release_that_holds_no_workspace_crate() {
+    const GIB: u64 = 1 << 30;
+    let fine = || Pressure { held: GIB, limit: 48 * GIB, over: None };
+    let none = |_: &u32| false;
+    let mut release = Release::of(Finished::new(vec![Some(7u32), Some(100), Some(101)]), true);
+    for (unit, krate) in [(0, 7), (1, 100), (2, 101)] {
+        release.began(unit);
+        release.compiled_under(unit, fine);
+        assert_eq!(
+            release.plan_of(none),
+            Some(Plan { crates: vec![krate], mir: true, pressed: false, ended: false }),
+            "each crate's inference goes as it finishes"
+        );
+        assert!(release.held().is_empty());
+    }
+    release.end();
+    assert_eq!(
+        release.plan_of(none),
+        Some(Plan { crates: vec![], mir: true, pressed: false, ended: true })
+    );
+    assert!(release.held().is_empty(), "nothing is left for the first edit");
 }

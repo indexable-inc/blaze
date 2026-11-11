@@ -47,9 +47,27 @@
 //! `unit bodies` 782 ms. What is kept is bounded: the values of at most [`EDIT_CRATES`]
 //! crates a build, and of those only what the next two builds read again
 //! ([`blaze_query::db::Storage::end_epoch`], run at every build's end, lets go of what the
-//! last two did not read); memory short takes it all as before. A cold build, a rebuild of
-//! many crates and a check release as they did. The first edit after either finds the values
-//! gone and makes them once.
+//! last two did not read); memory short takes it all as before.
+//!
+//! **Every other build that compiles holds the inference of the workspace's crates it
+//! finished last** ([`Release::held`]): a cold build and a rebuild of many crates let go of a
+//! dependency's inference as the crate finishes, as before, and of a workspace member's
+//! (`CrateOrigin::Local`: a crate an edit can touch) only once [`EDIT_CRATES`] members
+//! finished after it. So such a build's end leaves the inference an edit's build's end
+//! leaves: that of at most [`EDIT_CRATES`] crates, the ones at the top of the workspace
+//! (the program, and what depends on the rest), which any edit makes again. Until 2026-11-11
+//! it left none, and the first edit after a cold build made every body's inference of the
+//! edited crate again in the lints of bodies, one body after another on one thread, since
+//! the bodies' check memos (`hir::check::bodies::body_check_clean`) hold and so no check
+//! task reads a body on the pool (ripgrep, 64 cores: the first body edit after a cold build
+//! 5.7 s, each later one 0.95 s). The bound: a build holds the inference of at most
+//! [`EDIT_CRATES`] crates more than it did, from each one's last unit to the build's end and
+//! past it under [`blaze_query::db::Storage::end_epoch`]'s rule; memory short lets go of the
+//! held crates with the rest. Its MIR goes at its end as before, every crate's by its tag
+//! (`hir::evict::drop_mir` keeps none by crate), so the first edit still lowers the edited
+//! crate's built and runtime MIR again where the lints read them: `mir_body_query` and
+//! `runtime_mir_body_query` under `evicted_asked` in that build's `query_counts`. A check
+//! releases as it did.
 //!
 //! A check (`Goal::Check`) keeps its inference: what it made, and what the next check of the
 //! head reads again. Its MIR goes as its front end is kept, as every build's does, and memory
@@ -232,12 +250,18 @@ pub(crate) struct Release<K = Crate> {
     /// The build is over and its front end is to be kept ([`Release::end`]): the next release
     /// lets go of every MIR, whatever the goal and memory.
     ended: bool,
+    /// The workspace's crates finished whose inference is held for the next edit, the first
+    /// finished first: at most [`EDIT_CRATES`], the last to finish ([`Release::plan_of`]).
+    /// Empty for a check and for an edit's build, which name no crate.
+    held: Vec<K>,
 }
 
 /// What one release lets go of, told by [`Release::plan`].
 #[derive(PartialEq, Eq, Debug)]
 pub(crate) struct Plan<K> {
-    /// The crates finished since the last release: their bodies' inference goes. Always
+    /// The crates finished since the last release whose bodies' inference goes: all but the
+    /// workspace's crates the build holds ([`Release::held`]), with each held one that
+    /// [`EDIT_CRATES`] workspace crates finished after, or that memory takes. Always
     /// empty for a check, whose inference the next check of the head reads again, and for an
     /// edit's build ([`Finished::edit`]) that memory does not press.
     pub(crate) crates: Vec<K>,
@@ -271,15 +295,27 @@ impl Release<Crate> {
     /// memory pressure sweeps the values kept by bytes under the squeeze's caps. A span names
     /// what it let go and what blaze held before and after (rule 16).
     pub(crate) fn release(&mut self, lowered: &mut Lowered) {
-        let Some(Plan { crates, mir, pressed, ended }) = self.plan() else { return };
+        let db = lowered.served_db();
+        let plan = {
+            // A workspace member is a crate an edit can touch: its origin, an input's field.
+            let db: &base_db::Db = &*db;
+            self.plan_of(|krate: &Crate| krate.data(db).origin.is_local())
+        };
+        let Some(Plan { crates, mir, pressed, ended }) = plan else { return };
         RELEASES.fetch_add(1, Ordering::Relaxed);
         let before = Pressure::now();
+        // Which crates' inference goes and which is held, by name: the counts alone did not
+        // say whether the crate the next edit makes again was among them (rule 16).
+        let (let_go, kept) = (names(db, &crates), names(db, self.held()));
         let span = tracing::info_span!(
             target: "blaze",
             "front end release",
             pressed,
             ended,
             crates = crates.len(),
+            let_go = let_go.as_str(),
+            kept_crates = self.held().len(),
+            kept = kept.as_str(),
             mir,
             held = before.held,
             limit = before.limit,
@@ -295,7 +331,6 @@ impl Release<Crate> {
             query_storage = tracing::field::Empty,
         );
         let _release = span.enter();
-        let db = lowered.served_db();
         let mut dropped = hir::evict::drop_crates_after_store(db, &crates, mir);
         if ended && !mir {
             // An edit's build ends: its inference and MIR stay for the next edit, and the
@@ -348,6 +383,7 @@ impl Release<Crate> {
             "blaze serve: {}",
             Said {
                 crates: crates.len(),
+                held: self.held().len(),
                 mir,
                 pressed,
                 ended,
@@ -361,10 +397,28 @@ impl Release<Crate> {
     }
 }
 
+/// `crates` by name as a span says them, a comma between: the crates a release lets go of
+/// the inference of, or holds it of.
+fn names(db: &base_db::Db, crates: &[Crate]) -> String {
+    use std::fmt::Write as _;
+    let mut said = String::new(); // alloc: a release's span, a name a crate
+    for krate in crates {
+        if !said.is_empty() {
+            said.push(',');
+        }
+        // A `String` takes every write.
+        let _ = write!(said, "{}", krate.named(db));
+    }
+    said
+}
+
 /// The line a release says ([`Release::release`]): why it ran, what it let go and how much
 /// blaze held before and after it, against the limit, then what the query storage holds.
 pub(crate) struct Said {
     pub(crate) crates: usize,
+    /// The workspace's crates whose inference the build holds for the next edit
+    /// ([`Release::held`]).
+    pub(crate) held: usize,
     pub(crate) mir: bool,
     pub(crate) pressed: bool,
     pub(crate) ended: bool,
@@ -447,8 +501,18 @@ impl std::fmt::Display for Holders {
 impl std::fmt::Display for Said {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let gib = |bytes: u64| bytes as f64 / f64::from(1u32 << 30);
-        let Said { crates, mir, pressed, ended, dropped, unread, before, after, storage: _ } =
-            self;
+        let Said {
+            crates,
+            held,
+            mir,
+            pressed,
+            ended,
+            dropped,
+            unread,
+            before,
+            after,
+            storage: _,
+        } = self;
         f.write_str("front end release (")?;
         match (*pressed, before.over) {
             (true, _) if before.squeezed() => write!(
@@ -478,6 +542,13 @@ impl std::fmt::Display for Said {
             f.write_str(", no MIR (an edit's build keeps what it made for the next edit)")?;
         }
         write!(f, " and {} trait solver caches", dropped.solver_caches)?;
+        if *held != 0 {
+            write!(
+                f,
+                ", holding the inference of the {held} workspace crates finished last for the \
+                 next edit"
+            )?;
+        }
         if *pressed {
             f.write_str(", and swept the front end's values to their fair shares")?;
         }
@@ -503,7 +574,20 @@ impl std::fmt::Display for Said {
 
 impl<K: Copy + Eq + Hash> Release<K> {
     pub(crate) fn of(finished: Finished<K>, compiles: bool) -> Release<K> {
-        Release { finished, squeeze: Squeeze::default(), pressed: false, compiles, ended: false }
+        Release {
+            finished,
+            squeeze: Squeeze::default(),
+            pressed: false,
+            compiles,
+            ended: false,
+            held: Vec::new(), // alloc: none until a workspace crate finishes
+        }
+    }
+
+    /// The workspace's crates whose inference this build holds, the first finished first: at
+    /// most [`EDIT_CRATES`] ([`Release::plan_of`]).
+    pub(crate) fn held(&self) -> &[K] {
+        &self.held
     }
 
     pub(crate) fn began(&mut self, unit: usize) {
@@ -575,14 +659,21 @@ impl<K: Copy + Eq + Hash> Release<K> {
     }
 
     /// What a release now lets go of, taking it (a second plan is of what finished since);
-    /// none when there is nothing. A check's is due to memory or to its end alone and names no
+    /// none when there is nothing. `member` says whether a crate is the workspace's, one an
+    /// edit can touch. A check's is due to memory or to its end alone and names no
     /// crate: its MIR, constant values and solver caches go (and under memory, its values are
     /// swept), its inference kept for the next check of the head except as the sweep's caps
     /// take it. Every build's last, at its end, lets go of every MIR, but an edit's
     /// ([`Finished::edit`]) that memory does not press: that one names no crate and keeps its
     /// MIR, has no plan before its end, and leaves the crates it finished untaken, for a
     /// later plan of the same build should it make more crates than an edit does.
-    pub(crate) fn plan(&mut self) -> Option<Plan<K>> {
+    ///
+    /// The invariant: a plan that memory did not make due names a workspace crate only once
+    /// [`EDIT_CRATES`] workspace crates finished after it, so the build holds, to its end and
+    /// past it, the inference of the workspace crates it finished last, at most
+    /// [`EDIT_CRATES`] of them: what an edit's build leaves (the module). A plan memory made
+    /// due names every crate finished, the held ones first.
+    pub(crate) fn plan_of(&mut self, member: impl Fn(&K) -> bool) -> Option<Plan<K>> {
         let pressed = std::mem::take(&mut self.pressed);
         let ended = std::mem::take(&mut self.ended);
         if !self.compiles {
@@ -597,11 +688,44 @@ impl<K: Copy + Eq + Hash> Release<K> {
             // alloc: an empty `Vec` allocates nothing
             return ended.then(|| Plan { crates: Vec::new(), mir: false, pressed, ended });
         }
-        let crates = self.finished.take();
+        let finished = self.finished.take();
         let mir = pressed || ended || self.finished.idle();
-        if crates.is_empty() && !pressed && !ended {
+        if finished.is_empty() && !pressed && !ended {
             return None;
         }
+        let crates = match pressed {
+            // Memory is short: what was held goes with what finished since.
+            true => {
+                let mut crates = std::mem::take(&mut self.held);
+                crates.extend(finished);
+                crates
+            }
+            false => self.hold(finished, member),
+        };
         Some(Plan { crates, mir, pressed, ended })
+    }
+
+    /// [`Release::plan_of`] of a build none of whose crates is the workspace's: every crate
+    /// finished goes.
+    #[cfg(test)]
+    pub(crate) fn plan(&mut self) -> Option<Plan<K>> {
+        self.plan_of(|_| false)
+    }
+
+    /// Holds each of `finished` that is a `member`, in their order, and gives back what goes
+    /// now: the others, and each held crate that [`EDIT_CRATES`] members finished after.
+    fn hold(&mut self, finished: Vec<K>, member: impl Fn(&K) -> bool) -> Vec<K> {
+        let mut goes = Vec::with_capacity(finished.len()); // alloc: a crate a build, at most
+        for krate in finished {
+            if !member(&krate) {
+                goes.push(krate);
+                continue;
+            }
+            if self.held.len() == EDIT_CRATES {
+                goes.push(self.held.remove(0));
+            }
+            self.held.push(krate); // alloc: at most `EDIT_CRATES` entries a build
+        }
+        goes
     }
 }
