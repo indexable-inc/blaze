@@ -758,6 +758,14 @@ impl<'a, 'db, 'f> Sink<'db> for DeclSink<'a, 'db, 'f> {
         let db = self.cx.db;
         let own = HirFileId::from(call).original_file(db).file_id(db);
         let other_files = &mut self.other_files;
+        // The file an `include!` of the round-0 log parses is a file the log reads beside
+        // its own, as a macro's definition file is.
+        if let Some(included) = call.loc(db).include_file_id(db, call) {
+            let file = included.file_id(db);
+            if file != own && !other_files.contains(&file) {
+                other_files.push(file);
+            }
+        }
         definition_files(db, call, |file| {
             if file != own && !other_files.contains(&file) {
                 other_files.push(file);

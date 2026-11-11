@@ -152,6 +152,7 @@ fn run_in<'db>(
                 | DeclOp::ResolvedMacroPath { .. }
                 | DeclOp::DeriveHelperUse(_) => {
                     out.uses_include |= reads_a_file(op);
+                    out.reads_unnamed_file |= reads_an_unnamed_file(op);
                     out.records.push(clone_op(op));
                 }
                 DeclOp::ExternPrelude { .. }
@@ -311,6 +312,13 @@ fn reads_a_file(op: &DeclOp) -> bool {
     matches!(op, DeclOp::ResolvedMacroPath { def, .. } if def.is_include_like())
 }
 
+/// Whether a record op is a call of a macro like `include!` that is not `include!`
+/// (`include_str!`, `include_bytes!`): the file it reads is not kept by the group, where the
+/// file an `include!` parses is (`RegionSink::collecting_expansion`).
+fn reads_an_unnamed_file(op: &DeclOp) -> bool {
+    matches!(op, DeclOp::ResolvedMacroPath { def, .. } if def.is_include_like() && !def.is_include())
+}
+
 fn diagnostic_count(out: &GroupOut) -> u32 {
     u32::try_from(out.diagnostics.len()).expect("a group has 2^32 diagnostics")
 }
@@ -376,6 +384,7 @@ impl<'db> Sink<'db> for RegionSink<'db, '_> {
             | DeclOp::DeriveHelperUse(_)) => {
                 let out = self.out();
                 out.uses_include |= reads_a_file(&op);
+                out.reads_unnamed_file |= reads_an_unnamed_file(&op);
                 out.records.push(op);
             }
             op => {
@@ -434,6 +443,14 @@ impl<'db> Sink<'db> for RegionSink<'db, '_> {
             }
         };
         add(file);
+        // The file an `include!` parses is the expansion's input as the call's syntax is: a
+        // write of it, and of no other file, runs the group again
+        // (`input::expansion_readers`). One whose path names no file expands to an error, and
+        // comes to name one only by a file added or the crate's env set, each of which walks
+        // every group; one read from outside the VFS changes as `Written::included`.
+        if let Some(included) = call.loc(db).include_file_id(db, call) {
+            add(included.file_id(db));
+        }
         collect::definition_files(db, call, add);
     }
 }

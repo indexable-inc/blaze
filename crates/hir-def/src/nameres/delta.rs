@@ -179,6 +179,23 @@ fn skips_above() -> bool {
     planted
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The bug a test planted: a crate has a job only for a file a module of it is defined
+    /// in, so a write of a file its `include!` parsed, or a call it expanded is in, reaches
+    /// it with none.
+    pub(in crate::nameres) static FORGETS_INCLUDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the test on this thread planted [`FORGETS_INCLUDED`]; never outside a test.
+pub(super) fn forgets_included() -> bool {
+    #[cfg(test)]
+    let planted = FORGETS_INCLUDED.get();
+    #[cfg(not(test))]
+    let planted = false;
+    planted
+}
+
 /// Whether `written` leaves `krate`'s resolution, and everything the state holds of it, as
 /// it is: then the crate has no job in this pass, and its state stays where it is.
 ///
