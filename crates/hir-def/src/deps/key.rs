@@ -100,6 +100,69 @@ pub fn keys(db: &Db, crates: &[Crate], build: ContentId) -> HashMap<Crate, Conte
     walked(db, crates, build).into_iter().filter_map(|(krate, key)| Some((krate, key?))).collect()
 }
 
+/// The walk of [`keys`] kept between calls, for a caller that keys more crates of one
+/// database at one view of it by one `build` (a daemon's front end, served the units each
+/// batch of its build made ready): a crate keyed once is not keyed again, nor its
+/// dependencies walked, so a call costs the crates it is the first to ask for.
+///
+/// What the memo is keyed by is the caller's to hold, and is all a key is a function of
+/// (keys-cover-every-input): the database, the view of it (no input written since: a crate's
+/// data, its source root's files and their content IDs, its proc macros' libraries are all
+/// inputs) and `build`. A caller that sees any of the three move calls [`KeyWalk::clear`]
+/// first. [`PRODUCER`] is the process's.
+pub struct KeyWalk {
+    memo: Memo,
+}
+
+impl Default for KeyWalk {
+    fn default() -> KeyWalk {
+        KeyWalk::new()
+    }
+}
+
+impl KeyWalk {
+    pub fn new() -> KeyWalk {
+        KeyWalk { memo: HashMap::new_in(Global) }
+    }
+
+    /// Forgets every crate walked: the database, its view or `build` moved.
+    pub fn clear(&mut self) {
+        self.memo.clear();
+    }
+
+    /// How many crates it has walked, eligible or not.
+    pub fn len(&self) -> usize {
+        self.memo.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.memo.is_empty()
+    }
+
+    /// The key of each [`eligible`] crate among `crates` and their dependencies that no call
+    /// since the last [`KeyWalk::clear`] walked: what [`keys`] gives of them. The union over
+    /// the calls is [`keys`] of every crate asked, whatever the order they were asked in.
+    pub fn more(
+        &mut self,
+        db: &Db,
+        crates: &[Crate],
+        build: ContentId,
+    ) -> HashMap<Crate, ContentId, Global> {
+        // alloc: once per call that walks a crate, one entry per crate newly keyed
+        let mut fresh = HashMap::new_in(Global);
+        // Called once for each eligible crate the walk had not seen ([`walk`]).
+        let mut hash = |krate, memo: &Memo| {
+            let made = key(db, krate, build, memo);
+            fresh.insert(krate, made);
+            made
+        };
+        for &krate in crates {
+            walk(db, krate, &mut hash, &mut self.memo);
+        }
+        fresh
+    }
+}
+
 /// What the key of a crate was made from that a rule for public keys looks at
 /// (`blaze_global::Rule::image`), from the walk that made it.
 #[derive(Debug, Clone, PartialEq, Eq)]
