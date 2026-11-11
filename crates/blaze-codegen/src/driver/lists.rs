@@ -480,7 +480,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             used,
             kernel,
             misses,
-        } = out.finish(names_of(nodes, Some(statics)));
+        } = out.finish(names_of::<_, _, B>(nodes, Some(statics)));
         if !errors.is_empty() {
             return Patch::Refused(errors);
         }

@@ -2633,7 +2633,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         let mut errors = Vec::new();
         let (nodes, statics, _, _, _) = self.walk(roots, static_roots, &[], None, &mut errors);
         // The caller links what it compiles as [`Build::run_as`] does: one definition a symbol.
-        symbols_defined_twice(&nodes, &statics, &mut errors);
+        symbols_defined_twice::<B>(&nodes, &statics, &mut errors);
         if !errors.is_empty() {
             errors.sort_by_key(|it| (it.unit, it.item));
             errors.dedup();
@@ -2848,7 +2848,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                 statics = statics.len(),
             )
             .entered();
-            symbols_defined_twice(&nodes, &statics, &mut out.errors);
+            symbols_defined_twice::<B>(&nodes, &statics, &mut out.errors);
         }
         // Set with `self.last`, refused or not: `tier_up` reads the two together.
         // alloc: per build, sized by its statics' references
