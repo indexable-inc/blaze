@@ -827,3 +827,15 @@ fn main() {
         _ => fail(SAYS, "one subcommand: check, write, selftest, or python with its input"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every pattern compiles with the regex features the lock builds (a `(?i)` needs
+    /// `unicode-case`), so a missing feature fails `blaze test`, not the script's first run.
+    #[test]
+    fn the_patterns_compile() {
+        let _ = Patterns::new();
+    }
+}

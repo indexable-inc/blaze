@@ -14,7 +14,8 @@ repository.workspace = true
 
 [dependencies]
 blaze-script.workspace = true
-regex.workspace = true
+# `unicode-case` for `(?i)` as Python's `re.IGNORECASE` folds (crates/blaze-script/Cargo.toml).
+regex = { workspace = true, features = ["unicode-case"] }
 serde_json = { workspace = true, features = ["preserve_order"] }
 toml = { workspace = true, features = ["preserve_order"] }
 

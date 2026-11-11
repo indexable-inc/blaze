@@ -1,6 +1,7 @@
 //! Paths as Python's `os.path` and `glob` treat them on a POSIX system, so a ported script
 //! finds the same files and names them the same way: [`normpath`], [`join`], [`abspath`],
-//! [`relpath`], [`glob`] and the [`fnmatch`] it matches names with.
+//! [`relpath`], [`glob`] and the [`fnmatch`] it matches names with, and [`pure_path`], a path
+//! as `pathlib.Path` writes it.
 
 use std::path::Path;
 
@@ -28,6 +29,23 @@ pub fn normpath(path: &str) -> String {
     }
     let joined = format!("{}{}", "/".repeat(slashes), parts.join("/"));
     if joined.is_empty() { ".".to_owned() } else { joined }
+}
+
+/// `str(pathlib.PurePosixPath(path))`: empty and `.` parts dropped (`..` kept), no trailing `/`,
+/// a leading `/` kept (two when there were exactly two), `.` for nothing.
+pub fn pure_path(path: &str) -> String {
+    let root = if path.starts_with("//") && !path.starts_with("///") {
+        "//"
+    } else if path.starts_with('/') {
+        "/"
+    } else {
+        ""
+    };
+    let parts: Vec<&str> = path.split('/').filter(|it| !it.is_empty() && *it != ".").collect();
+    match (root, parts.is_empty()) {
+        ("", true) => ".".to_owned(),
+        (root, _) => format!("{root}{}", parts.join("/")),
+    }
 }
 
 /// `os.path.join(a, b)`: `b` alone when it is absolute.
@@ -206,6 +224,9 @@ mod tests {
         assert_eq!(relpath("/a/b", "/a/c/d"), "../../b");
         assert_eq!(join("a", "/b"), "/b");
         assert_eq!(join("a/", "b"), "a/b");
+        for (path, said) in [("", "."), (".", "."), ("./a//b/", "a/b"), ("a/./../b", "a/../b"), ("//x", "//x"), ("///x", "/x"), ("/", "/")] {
+            assert_eq!(pure_path(path), said, "{path:?}");
+        }
     }
 
     #[test]

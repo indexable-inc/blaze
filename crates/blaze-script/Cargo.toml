@@ -17,7 +17,10 @@ doctest = false
 # Both keep a JSON object's and a table's keys in the order they were written, as Python's do.
 serde_json = { workspace = true, features = ["preserve_order"] }
 toml = { workspace = true, features = ["preserve_order"] }
-regex.workspace = true
+# `unicode-case`: Python's `re.IGNORECASE` on a str pattern folds case by Unicode's rules
+# (`ſ` matches `s`), and a ported pattern's `(?i)` must do the same; the workspace's regex leaves
+# it out.
+regex = { workspace = true, features = ["unicode-case"] }
 
 [lints]
 workspace = true

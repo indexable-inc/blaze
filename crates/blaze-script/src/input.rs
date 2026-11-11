@@ -28,7 +28,7 @@ use std::io::Read;
 
 use serde_json::{Map, Value};
 
-use crate::{os_error, pyjson::dumps};
+use crate::{os_error, pyjson::dumps, pypath::pure_path};
 
 /// What is wrong with the input, naming the field.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,7 +52,9 @@ pub fn read(text: &str) -> Result<Value, InputError> {
         held = all;
         held.as_str()
     } else if !text.trim_start().starts_with(['{', '[']) {
-        held = std::fs::read_to_string(text).map_err(|e| InputError(os_error(&e, text)))?;
+        // `Path(text).read_text()`: the path as `Path` writes it (`""` is `.`), in the error too.
+        let path = pure_path(text);
+        held = std::fs::read_to_string(&path).map_err(|e| InputError(os_error(&e, &path)))?;
         held.as_str()
     } else {
         text
