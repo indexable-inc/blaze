@@ -232,6 +232,20 @@ can answer it; core's `Inject` impls over the paths then do the conversion as li
 core's `From` over both is what `?` and coercion to a union use. Made by lane
 edition-e3-unions-1109 (2026-11-09).
 
+### 0016-where-const-condition
+
+What: `SolverDelegate::const_condition` (`src/delegate.rs`) and `compute_const_evaluatable_goal`
+(`src/solve/mod.rs`), which now asks it: a `ConstEvaluatable` goal holds when the delegate says
+its constant is `true`, is `NoSolution` when it says `false`, and is ambiguous while it cannot
+say.
+
+Why: blaze lowers one predicate to that clause, `where const { COND }`
+(`#![feature(blaze_comptime)]`, docs/v2/plan/design/ownership.md), a `bool` constant over the
+generic parameters; rustc's goal only asked that the constant evaluate and never answered no.
+The condition is evaluated by hir-ty (`where_const::condition`), which also has the reason for
+the error. No `generic_const_exprs` program reaches the goal: blaze never built that feature's
+`ConstEvaluatable` bounds. Made by lane lang-int-1110 (2026-11-10).
+
 ## Dropped since the previous base (ra-ap-rustc_next_trait_solver 0.166.0, rustc `ce89c898`)
 
 - The backport of rust-lang/rust#161380 (a constant sends a goal back to the caller's typing

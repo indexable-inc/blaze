@@ -740,6 +740,7 @@ define_symbols! {
     sized_hierarchy,
     forced_keywords,
     blaze_comptime,
+    blaze_const_exprs,
     blaze_verify,
     mut_ref,
     type_changing_struct_update,

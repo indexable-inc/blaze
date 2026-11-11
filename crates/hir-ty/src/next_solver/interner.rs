@@ -1403,6 +1403,12 @@ impl<'db> Interner for DbInterner<'db> {
         // See https://github.com/rust-lang/trait-system-refactor-initiative/issues/234
     }
 
+    /// blaze: whether two constants that are not the same constant are the same expression
+    /// of the same constants ([`crate::const_exprs`], `#![feature(blaze_const_exprs)]`).
+    fn same_const_expression(self, a: Const<'db>, b: Const<'db>) -> bool {
+        crate::const_exprs::same_expression(self.db, a, b)
+    }
+
     fn expand_abstract_consts<T: rustc_type_ir::TypeFoldable<Self>>(self, _: T) -> T {
         panic!(
             "`#![feature(generic_const_exprs)]` relates abstract consts, which blaze does not \

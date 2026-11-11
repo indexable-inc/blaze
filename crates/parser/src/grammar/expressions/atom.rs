@@ -946,6 +946,16 @@ pub(crate) fn block_expr(p: &mut Parser<'_>) {
     m.complete(p, BLOCK_EXPR);
 }
 
+/// `const { .. }` where the grammar asks for one outside an expression: a where clause's
+/// const condition. The same `BLOCK_EXPR` an expression's `const { .. }` is.
+pub(crate) fn const_block(p: &mut Parser<'_>) {
+    assert!(p.at(T![const]) && p.nth_at(1, T!['{']));
+    let m = p.start();
+    p.bump(T![const]);
+    stmt_list(p);
+    m.complete(p, BLOCK_EXPR);
+}
+
 fn stmt_list(p: &mut Parser<'_>) -> CompletedMarker {
     assert!(p.at(T!['{']));
     let m = p.start();

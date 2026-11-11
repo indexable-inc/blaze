@@ -1740,6 +1740,12 @@ impl<'db> ExprCollector<'db> {
         }
     }
 
+    /// The block of a `where const { COND }` condition, as the root a const argument is: a
+    /// plain block of the signature's store (its `const` only marks the predicate).
+    pub(in crate::expr_store) fn lower_where_const(&mut self, block: ast::BlockExpr<'_>) -> ExprId {
+        self.with_fresh_binding_expr_root(|this| this.collect_block(block))
+    }
+
     pub fn lower_const_arg(&mut self, arg: ast::ConstArg<'_>) -> ConstRef {
         ConstRef {
             expr: self.with_fresh_binding_expr_root(|this| this.collect_expr_opt(arg.expr())),

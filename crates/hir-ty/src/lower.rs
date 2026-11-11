@@ -909,6 +909,18 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
         self.lower_ty_ext(type_ref).0
     }
 
+    /// Whether a const argument or array length written here may be an expression over
+    /// generic parameters: the crate has `#![feature(blaze_const_exprs)]`
+    /// (docs/v2/plan/design/ownership.md). Without it such an expression is refused as rustc
+    /// refuses it ("generic parameters may not be used in const operations").
+    pub(crate) fn const_exprs(&self) -> bool {
+        hir_def::unstable_features::UnstableFeatures::of_root(
+            self.db,
+            self.generic_def.module(self.db).krate(self.db),
+        )
+        .blaze_const_exprs
+    }
+
     pub(crate) fn lower_const(
         &mut self,
         const_ref: ConstRef,
@@ -1082,7 +1094,8 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             }
             TypeRef::Array(array) => {
                 let inner_ty = self.lower_ty(array.ty);
-                let const_len = self.lower_const(array.len, self.types.types.usize, false);
+                let const_len =
+                    self.lower_const(array.len, self.types.types.usize, self.const_exprs());
                 Ty::new_array_with_const_len(interner, inner_ty, const_len)
             }
             TypeRef::Slice(inner) => {
@@ -4880,6 +4893,8 @@ pub enum PredicateSource {
     ImplicitSized(TypeParamId),
     /// A const parameter's `ConstArgHasType`.
     ConstParamType(ConstParamId),
+    /// From `GenericParams::of(def).where_consts()[index]`: a `where const { COND }` condition.
+    WhereConst { def: GenericDefId, index: u32 },
 }
 
 /// The source of each predicate of [`GenericPredicates::query_all`]`(db, def)`, in its order:
@@ -4972,6 +4987,23 @@ fn lower_generic_predicates_with<'db, 'f>(
                     assoc_sources.iter_mut().for_each(|it| it.push(written));
                 }
             }
+        }
+    }
+
+    // `where const { COND }`: the block as an anonymous `bool` constant of the item's own
+    // arguments, required to be `true` (`crate::where_const`). A filtered lowering is a trait's
+    // bounds on `Self`, which a condition is not.
+    if filter == PredicateFilter::All {
+        for (index, &condition) in generics.where_consts().iter().enumerate() {
+            let konst = ctx.lower_const(condition, ctx.types.types.bool, true);
+            own_predicates.push(Clause(Predicate::new(
+                interner,
+                Binder::dummy(rustc_type_ir::PredicateKind::Clause(
+                    rustc_type_ir::ClauseKind::ConstEvaluatable(konst),
+                )),
+            )));
+            let written = PredicateSource::WhereConst { def, index: index as u32 };
+            own_sources.iter_mut().for_each(|it| it.push(written));
         }
     }
 

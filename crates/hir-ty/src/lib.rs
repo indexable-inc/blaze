@@ -34,6 +34,7 @@ pub mod arbitrary_ints;
 pub mod autoderef;
 pub mod body_store;
 pub mod check_cache;
+pub mod const_exprs;
 pub mod const_param_ty;
 pub mod const_valtree;
 pub mod consteval;
@@ -57,6 +58,7 @@ pub mod providers;
 pub mod solver_errors;
 pub mod traits;
 pub mod used_imports;
+pub mod where_const;
 
 #[cfg(test)]
 mod tests;

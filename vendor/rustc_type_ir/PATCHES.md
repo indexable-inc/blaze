@@ -254,6 +254,20 @@ Why: `rustc_next_trait_solver`'s patch `0015-error-union-builtins` answers `U: U
 blaze's error unions (`#![blaze::error_unions]`) and needs to know both items. Made by lane
 edition-e3-unions-1109 (2026-11-09).
 
+### 0019-same-const-expression
+
+What: `Interner::same_const_expression` (`src/interner.rs`), asked by
+`structurally_relate_consts` (`src/relate.rs`) of two constants it would otherwise call
+different when at least one is an alias: two aliases that are not the same alias, or an alias
+against a parameter, placeholder or value.
+
+Why: blaze's generic const expressions (`#![feature(blaze_const_exprs)]`,
+docs/v2/plan/design/ownership.md) are anonymous constants with their owner's arguments; two of
+them that still name generic parameters are one constant when they have one normal form
+(`{ N + M }` and `{ M + N }`), which hir-ty computes (`const_exprs::same_expression`). Without
+an expression on either side the interner answers `false` after two matches, so a crate without
+the feature relates constants as before. Made by lane lang-int-1110 (2026-11-10).
+
 ## Dropped since the previous base (ra-ap-rustc_type_ir 0.166.0, rustc `ce89c898`)
 
 - The backport of rust-lang/rust#159228 (the retry with twice the recursion limit:

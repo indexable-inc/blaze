@@ -1776,6 +1776,11 @@ pub struct UnimplementedTrait<'db> {
     /// For each of `parent_impls`, the impl's bound the step went through (rustc's
     /// `impl_def_predicate_index`), where "unsatisfied trait bound introduced here" goes.
     pub parent_impl_bounds: Vec<Option<BoundSource>>,
+    /// blaze: why the bound does not hold through an impl with a `where const { .. }`
+    /// condition (`#![feature(blaze_comptime)]`): the message the condition's evaluation
+    /// panicked with, which is its own reason (the field path `bstd::own::none` found), or
+    /// that it is `false`. `None` when no such impl of the trait matches the bound.
+    pub condition: Option<String>,
 }
 
 /// Where a predicate of an item comes from, its written bound found in syntax: for rustc's
@@ -1816,6 +1821,8 @@ pub(crate) fn bound_source(db: &Db, def: GenericDefId, bound_index: u32) -> Opti
         PredicateSource::ConstParamType(id) => {
             BoundSource::ConstParamType(crate::ConstParam { id })
         }
+        // A `where const { .. }` condition is no bound on a type: nothing points at it yet.
+        PredicateSource::WhereConst { .. } => return None,
         PredicateSource::Written { def, index } => {
             let (params, _, source_map) = GenericParams::with_source_map(db, def);
             let bound = match *params.where_predicates().get(index as usize)? {
@@ -3981,6 +3988,7 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
                     parent_trait_predicates: Vec::new(), // alloc: empty
                     parent_impls: Vec::new(),            // alloc: empty
                     parent_impl_bounds: Vec::new(),      // alloc: empty
+                    condition: None,
                 }
                 .into(),
                 rustc_type_ir::ClauseKind::Projection(projection) => {
@@ -5062,6 +5070,13 @@ impl<'db> AnyDiagnostic<'db> {
                 parent_trait_predicates,
                 parent_impls,
             } => {
+                // The reason of a `where const` condition, evaluated again here: only for an
+                // error, and its evaluation is the one the solver made (a memoized query).
+                let condition = hir_ty::where_const::bound_refusal(
+                    interner,
+                    trait_predicate.get(interner).trait_ref,
+                )
+                .map(|failure| failure.text());
                 let trait_predicate =
                     crate::TraitClause::new(interner, type_owner, trait_predicate.get(interner));
                 let parent_trait_predicates = parent_trait_predicates
@@ -5094,6 +5109,7 @@ impl<'db> AnyDiagnostic<'db> {
                     parent_trait_predicates,
                     parent_impls,
                     parent_impl_bounds,
+                    condition,
                 }
                 .into()
             }
@@ -5215,7 +5231,16 @@ impl<'db> AnyDiagnostic<'db> {
             StoredGoal::WellFormed { term: wf } => SolverGoal::WellFormed(term(wf)),
             StoredGoal::Subtype { a, b } => SolverGoal::Subtype { a: ty(a), b: ty(b) },
             StoredGoal::Coerce { a, b } => SolverGoal::Coerce { a: ty(a), b: ty(b) },
-            StoredGoal::ConstEvaluatable { ct } => SolverGoal::ConstEvaluatable(text(ct)),
+            // blaze's one use of the goal is a `where const { .. }` condition: the constant,
+            // with why it does not hold when its evaluation says.
+            StoredGoal::ConstEvaluatable { ct } => SolverGoal::ConstEvaluatable(
+                match ct.as_ref().konst().and_then(|it| {
+                    hir_ty::where_const::refusal(interner, it)
+                }) {
+                    Some(failure) => format!("{}`: {} (`", text(ct), failure.text()),
+                    None => text(ct),
+                },
+            ),
             StoredGoal::ConstArgHasType { ct, ty: of } => {
                 SolverGoal::ConstArgHasType { ct: text(ct), ty: ty(of) }
             }
@@ -6114,7 +6139,7 @@ fn goal_text<'db>(db: &'db Db, target: DisplayTarget, goal: &'db StoredGoal) -> 
         StoredGoal::Subtype { a, b } => format!("{} <: {}", ty(a), ty(b)),
         StoredGoal::Coerce { a, b } => format!("{} coerces to {}", ty(a), ty(b)),
         StoredGoal::ConstEvaluatable { ct } => {
-            format!("the constant `{}` can be evaluated", arg(ct))
+            format!("the `where const` condition `{}` holds", arg(ct))
         }
         StoredGoal::ConstArgHasType { ct, ty: of } => {
             format!("the constant `{}` has type `{}`", arg(ct), ty(of))

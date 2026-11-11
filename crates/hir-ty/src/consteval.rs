@@ -457,6 +457,31 @@ pub(crate) fn create_anon_const<'a, 'db: 'a>(
     }
 }
 
+/// Whether the anonymous constant `anon` depends on its owner's generic parameters: it is then
+/// evaluated with the arguments it is used with, for each instance, where an array repeat count
+/// that only may name them is evaluated once with its owner's own. It does when it may name
+/// them and is a `where const { .. }` condition (`#![feature(blaze_comptime)]`), or its crate
+/// has `#![feature(blaze_const_exprs)]` (docs/v2/plan/design/ownership.md): the two forms
+/// whose value is an instance's. A crate with neither has none, so its constants are
+/// evaluated as before.
+pub fn anon_const_is_dependent<'db>(db: &'db Db, anon: AnonConstId<'db>) -> bool {
+    let loc = anon.loc(db);
+    if !loc.allow_using_generic_params {
+        return false;
+    }
+    let def = loc.owner.generic_def(db);
+    if let ExpressionStoreOwnerId::Signature(_) = loc.owner
+        && hir_def::hir::generics::GenericParams::of(db, def)
+            .where_consts()
+            .iter()
+            .any(|it| it.expr == loc.expr)
+    {
+        return true;
+    }
+    hir_def::unstable_features::UnstableFeatures::of_root(db, def.module(db).krate(db))
+        .blaze_const_exprs
+}
+
 /// One variant's discriminant, kept per variant so that what reads it is invalidated only when
 /// its own value changes. Every variant's at once is [`discriminants::enum_discriminants`].
 #[blaze_query::tracked(cycle_result = const_eval_discriminant_cycle_result, returns(clone), mem_tag = Infer)]

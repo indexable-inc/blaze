@@ -119,7 +119,7 @@ pub const TEXT: usize = 768;
 /// How many `(type, behind a cell)` entries one walk visits before it refuses.
 pub const NODES: usize = 192;
 /// No entry.
-const NONE: usize = usize::MAX;
+const NONE: usize = !0;
 
 /// Why a walk refused, as text: the field path to what it found.
 #[derive(Clone, Copy)]

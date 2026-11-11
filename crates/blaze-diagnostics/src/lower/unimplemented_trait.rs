@@ -129,6 +129,12 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::UnimplementedTrait<'db>) -> 
             diag.note(note.clone());
         }
     }
+    // blaze: the bound's impl has a `where const { .. }` condition that does not hold; its own
+    // reason (the field path a reflection walk found) is the note.
+    if let Some(condition) = &d.condition {
+        // clone: on the error path, for an error hir found
+        diag.note(condition.clone());
+    }
     cause.label_call(&mut diag);
     if derivable {
         suggest_derive(cx, leaf, &mut diag);

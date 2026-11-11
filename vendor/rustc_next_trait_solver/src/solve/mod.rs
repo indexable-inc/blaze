@@ -247,41 +247,17 @@ where
         &mut self,
         Goal { param_env, predicate: ct }: Goal<I, Const<I>>,
     ) -> QueryResultOrRerunNonErased<I> {
-        match ct.kind() {
-            ty::ConstKind::Alias(ty::IsRigid::Yes, _)
-            | ty::ConstKind::Placeholder(_)
-            | ty::ConstKind::Value(_)
-            | ty::ConstKind::Error(_) => {
-                self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
-            }
-
-            ty::ConstKind::Infer(_) => {
-                self.evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS)
-            }
-
-            ty::ConstKind::Alias(ty::IsRigid::No, alias_const) => {
-                // We never return `NoSolution` here as `evaluate_const` emits an
-                // error itself when failing to evaluate, so emitting an additional fulfillment
-                // error in that case is unnecessary noise. This may change in the future once
-                // evaluation failures are allowed to impact selection, e.g. generic const
-                // expressions in impl headers or `where`-clauses.
-
-                // FIXME(generic_const_exprs): Implement handling for generic
-                // const expressions here.
-                if let Some(_normalized) = self.evaluate_const(param_env, alias_const)? {
-                    self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
-                } else {
-                    self.evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS)
-                }
-            }
-
-            // We can freely ICE here as:
-            // - `Param` gets replaced with a placeholder during canonicalization
-            // - `Bound` cannot exist as we don't have a binder around the self Type
-            // - `Expr` is part of `feature(generic_const_exprs)` and is not implemented yet
-            ty::ConstKind::Param(_) | ty::ConstKind::Bound(_, _) | ty::ConstKind::Expr(_) => {
-                panic!("unexpected const kind: {:?}", ct)
-            }
+        // blaze: the one predicate that lowers to this goal is `where const { COND }`
+        // (`#![feature(blaze_comptime)]`), a `bool` constant over the generic parameters that
+        // holds when it is `true` for the arguments it is asked with. rustc's goal ("the
+        // constant can be evaluated", for `generic_const_exprs`) never said no: an evaluation
+        // that failed was an error of its own. Here the goal is the condition, so a `false`
+        // or a failed evaluation is `NoSolution`, the impl or function it guards does not
+        // apply, and the delegate has the reason for the error.
+        match self.delegate.const_condition(param_env, ct) {
+            Some(true) => self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes),
+            Some(false) => Err(NoSolution.into()),
+            None => self.evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS),
         }
     }
 

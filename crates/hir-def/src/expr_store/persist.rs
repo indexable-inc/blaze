@@ -1948,6 +1948,7 @@ unit_codes! {
         1 => ComptimeForm::ReflectedField,
         2 => ComptimeForm::BinderBound,
         3 => ComptimeForm::Block,
+        4 => ComptimeForm::WhereConst,
     }
     VerifyRefusal {
         0 => VerifyRefusal::WithoutFeature,
