@@ -113,9 +113,9 @@ mod tests {
     #[test]
     fn a_value_is_written_as_python_writes_it() {
         let value = json!({"a": [1, 2.5, "x\ty", null, true], "é": {"b": 1.0}});
-        assert_eq!(dumps(&value), r#"{"a": [1, 2.5, "x\ty", null, true], "é": {"b": 1.0}}"#);
+        assert_eq!(dumps(&value), r#"{"a": [1, 2.5, "x\ty", null, true], "\u00e9": {"b": 1.0}}"#);
         assert_eq!(dumps_unicode(&value), "{\"a\": [1, 2.5, \"x\\ty\", null, true], \"é\": {\"b\": 1.0}}");
-        assert_eq!(dumps(&json!("\u{1F600}\u{1}")), r#""😀\u0001""#);
+        assert_eq!(dumps(&json!("\u{1F600}\u{1}")), r#""\ud83d\ude00\u0001""#);
     }
 
     #[test]
