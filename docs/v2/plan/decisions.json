@@ -128,6 +128,30 @@
    "why": "Andrew, 2026-11-11: \"can we admin merge anything in as well\". Long-lived unmerged branches were the source of the semantic conflicts that broke main.",
    "recommended": "Merge what is verified now: the invariant controls with the strip note and the nostd port; the lint baselines; the three compiler fixes (memory budget, loader reads, effect-check binder) once stage 2 passes with them.",
    "state": "in progress"
+  },
+  {
+   "id": "D17",
+   "date": "2026-11-11",
+   "decision": "The scheduler is redesigned as one graph of pure, identity-keyed nodes pulled by what is waited for: cycles as single nodes, no shared mutable state in a node, priority from who waits, cores and memory both admitted, built for hundreds of cores (docs/v2/plan/design/scheduler.md). Built in the order of measured cost, summaries and the two codegen locks first.",
+   "why": "Andrew, 2026-11-11: \"redesign the whole scheduler\", \"needs to work on 100s of cores\". A release build of blaze by blaze kept 17 to 43 of 64 cores busy; about 30% of its CPU was one pass redone by many threads; two locks cost 6,555 thread-seconds.",
+   "recommended": "Yes; keep the pool, fibers and slots of the 2026-11-02 plan and replace the model above them.",
+   "state": "design merged; step 1 started"
+  },
+  {
+   "id": "D18",
+   "date": "2026-11-11",
+   "decision": "build, run and test default to the edit goal: tier 0 code first, optimized code made in the background and patched in; the max goal waits for optimized code. The goal and the promotion's progress are on every status line.",
+   "why": "Andrew, 2026-11-11: \"by default we should start with a debug build and then in the background try to get more optimized, like a JIT\"; Relax (makepad) publishes 50 to 200 ms save-to-patch with this shape.",
+   "recommended": "Yes, as step 7 of the scheduler design; one goal setting replaces the two tier settings the tree has.",
+   "state": "designed, not built"
+  },
+  {
+   "id": "D19",
+   "date": "2026-11-11",
+   "decision": "A statement of fact rests on a tool call of the session; rule claims-from-evidence.",
+   "why": "The agent said LLVM was most of an 80-minute build without a query; the profile said about 13%.",
+   "recommended": "Yes.",
+   "state": "done: rule 61 on main (#2052)"
   }
  ]
 }
