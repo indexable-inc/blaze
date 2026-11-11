@@ -508,8 +508,8 @@ substitute:
 
 | wanted | today | needs |
 |---|---|---|
-| `Durable::Started` | refused before anything changes (`FsKind::NoWritebackStart`): a whole flush left in flight makes its file again if it was renamed or removed meanwhile | an effect that begins writeback (`sync_file_range`, `F_BARRIERFSYNC` without the wait) |
-| a name made durable after a remove, a create or `sync_names` on a real disk | refused after the change (`FsKind::NoNameSync`); the simulation syncs names in its ledger | an effect that syncs a directory |
+| `Durable::Started` | built: the change is made, then `Effect::WriteBack` (all-1110's effect: `sync_file_range` on Linux, `fsync` without `F_FULLFSYNC` on Apple's) is handed over and not waited for; a name change also begins its directory's `Effect::SyncDir` | nothing; `F_BARRIERFSYNC` on macOS comes with blaze-sys's macOS layer |
+| a name made durable after a remove, a create or `sync_names` on a real disk | built: `Effect::SyncDir` (`fsync` of the directory), waited for; refused on Windows, naming it, and for names directly beneath the driver's root (`FsKind::NoNameSync`: no `FileName` names the root) | a handle for the root (the opens beneath a handle, `core-effects-1109`); the Windows call |
 | an unsynced rename or publish that costs no sync on a real disk | the native rename syncs its directories itself, so `Durable::No` is true of the promise and not yet of the price | a rename effect that does not sync |
 | a read that does not copy | `Done::Read` hands back a buffer the driver made, copied into the caller's `Bytes` | the page pool (`file.pin`, S1f) |
 | a write that does not copy | each write's bytes are copied once into the effect, which owns them | registered buffers (`WriteFrom`), with S4 |

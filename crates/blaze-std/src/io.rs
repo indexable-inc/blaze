@@ -1015,20 +1015,26 @@ impl Io {
         }
     }
 
-    /// The names of the directory `dir` made durable, waited for: `true` once the simulated
-    /// disk has synced them. `false` on a real driver: blaze-core has no effect that syncs a
-    /// directory (its rename syncs its own), so nothing was done and the caller decides
-    /// whether that is a refusal. A `cx` that stopped already asks nothing.
-    pub(crate) fn sync_names(&self, cx: &Cx, dir: &str) -> Result<bool, Stopped> {
-        cx.stopped_by(self.now())?;
+    /// A sync of the directory `dir`'s names completed and was waited for
+    /// ([`Effect::SyncDir`]): the simulated disk's ledger makes them durable and counts the
+    /// wait. `true` in a simulated world, which has a ledger; `false` in a real one, where
+    /// the disk itself did it.
+    pub(crate) fn names_synced(&self, dir: &str) -> bool {
         match self.world.lock().disk.as_deref_mut() {
             Some(disk) => {
                 disk.sync_names(dir);
                 disk.waited();
-                Ok(true)
+                true
             }
-            None => Ok(false),
+            None => false,
         }
+    }
+
+    /// Whether this world's rename has synced its directories by the time it completes: a
+    /// real driver's does (blaze-core's `Effect::Rename`); the simulation's ledger is told by
+    /// a directory sync.
+    pub(crate) fn rename_syncs_names(&self) -> bool {
+        self.world.lock().disk.is_none()
     }
 
     /// How many effects the driver holds that have not completed: a test's view of whether
@@ -1128,6 +1134,7 @@ fn touch(touched: &mut Vec<(FileName, bool)>, effect: &Effect) {
         | Effect::Map { file, .. } => named(file, false),
         Effect::Append { file, .. }
         | Effect::Sync { file, .. }
+        | Effect::WriteBack { file, .. }
         | Effect::Truncate { file, .. }
         | Effect::Write { file, .. }
         | Effect::WriteAt { file, .. }
@@ -1142,7 +1149,7 @@ fn touch(touched: &mut Vec<(FileName, bool)>, effect: &Effect) {
             named(to, true);
         }
         Effect::List { dir, .. } | Effect::Entries { dir, .. } | Effect::Watch { dir, .. } => named(dir, false),
-        Effect::Private { dir, .. } => named(dir, true),
+        Effect::Private { dir, .. } | Effect::SyncDir { dir, .. } => named(dir, true),
         Effect::Journal { dir, .. } => named(dir, false),
         Effect::Unlock { .. }
         | Effect::Unwatch { .. }

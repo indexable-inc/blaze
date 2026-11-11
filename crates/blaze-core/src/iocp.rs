@@ -904,6 +904,8 @@ impl Iocp {
             effect @ (Effect::ReadAll { .. }
             | Effect::ReadLink { .. }
             | Effect::Sync { .. }
+            | Effect::WriteBack { .. }
+            | Effect::SyncDir { .. }
             | Effect::Truncate { .. }
             | Effect::Stat { .. }
             | Effect::Lstat { .. }

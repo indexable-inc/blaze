@@ -40,6 +40,9 @@ pub struct DiskCounts {
     pub read: u64,
     /// Flushes of a file's bytes asked of the disk, waited for or not.
     pub flushes: u64,
+    /// Write-backs begun (`Durable::Started`): bytes sent toward the device with nothing
+    /// waiting and nothing made durable.
+    pub writebacks: u64,
     /// Syncs of a directory's names.
     pub name_syncs: u64,
     /// Flushes and name syncs a caller waited for: the waits for the device. A path built
@@ -183,6 +186,14 @@ impl Disk {
                 // clone: the ledger's name of the file, a refcount.
                 self.flushing.push((*tag, file.clone(), covered));
             }
+            // A write-back cleans what a flush cleans (a clone after it forces nothing out)
+            // and makes nothing durable: the simulation still tears the file at a crash.
+            Effect::WriteBack { file, tag } => {
+                self.counts.writebacks += 1;
+                let covered = self.dirty_of(file);
+                // clone: the ledger's name of the file, a refcount.
+                self.flushing.push((*tag, file.clone(), covered));
+            }
             Effect::Read { tag, .. } | Effect::ReadAll { tag, .. } => self.reading.push(*tag),
             Effect::Rename { from, to, tag } => {
                 // alloc: a simulated crash's undo, the bytes the rename replaces.
@@ -230,7 +241,7 @@ impl Disk {
         }
         if let Some(at) = self.flushing.iter().position(|(it, _, _)| *it == tag) {
             let (_, file, covered) = self.flushing.swap_remove(at);
-            if matches!(completion.done, Done::Synced) {
+            if matches!(completion.done, Done::Synced | Done::WrittenBack) {
                 if let Some((_, dirty)) = self.dirty.iter_mut().find(|(it, _)| *it == file) {
                     // What was written after the flush was asked is still unflushed.
                     *dirty = dirty.saturating_sub(covered);

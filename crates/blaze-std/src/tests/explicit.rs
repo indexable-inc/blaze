@@ -141,14 +141,49 @@ fn started_is_refused_before_anything_changes() {
     let (cx, dir) = data(&io);
     write_synced(&cx, &dir, &path("f"), b"old").expect("a file");
     let before = io.disk().expect("a simulated disk");
-    let refused = dir.publish(&cx, &path("f"), Content::bytes(b"new"), Durable::Started).expect_err("no driver starts writeback");
-    assert_eq!((refused.op, &refused.kind), (FsOp::Publish, &FsKind::NoWritebackStart));
-    assert!(refused.to_string().contains("Durable::Started"), "{refused}");
-    let refused = dir.remove(&cx, &path("f"), Durable::Started).expect_err("no driver starts writeback");
-    assert_eq!(refused.kind, FsKind::NoWritebackStart);
-    assert_eq!(held(&cx, &dir, "f").as_deref(), Some(&b"old"[..]));
+    // `Started` makes the change, begins the write-back and waits for nothing: no flush is
+    // asked, and no wait for the device is paid.
+    let published = dir.publish(&cx, &path("f"), Content::bytes(b"new"), Durable::Started).expect("a publish");
+    assert!(matches!(published.file, Placed::Written(_)), "Started gives no Flushed: {:?}", published.file);
+    assert_eq!(held(&cx, &dir, "f").as_deref(), Some(&b"new"[..]));
     let after = io.disk().expect("a simulated disk");
-    assert_eq!((before.written, before.flushes, before.device_waits), (after.written, after.flushes, after.device_waits));
+    assert_eq!((after.writebacks - before.writebacks, after.flushes, after.device_waits), (1, before.flushes, before.device_waits));
+    // A file whose write-back has ended is clean: flushed then, its clone forces nothing.
+    let file = match dir.open(&cx, &path("f")) {
+        Ok(file) => file,
+        Err(error) => panic!("the file: {error}"),
+    };
+    let appended = file.append(&cx, &[1; 50], Durable::Started);
+    let closed = file.close_unsynced(Unsynced::Started);
+    appended.expect("an append");
+    let flushed = closed.expect("a close").flush(&cx).expect("a flush");
+    flushed.clone_to(&cx, &dir, &path("clone")).expect("a clone");
+    assert_eq!(io.disk().expect("a simulated disk").forced_writeback, 0);
+    // A remove told `Started` removes, and begins its directory's sync without waiting.
+    let waits = io.disk().expect("a simulated disk").device_waits;
+    dir.remove(&cx, &path("f"), Durable::Started).expect("a remove");
+    assert_eq!(held(&cx, &dir, "f"), None);
+    assert_eq!(io.disk().expect("a simulated disk").device_waits, waits);
+}
+
+/// A name sync is a real effect: `sync_names`, a synced remove and a synced close of a file
+/// its handle made each wait for their directory's sync, and none is refused.
+#[test]
+fn a_directorys_names_are_synced_by_an_effect() {
+    let io = world(25, Plant::None);
+    let (cx, dir) = data(&io);
+    let before = io.disk().expect("a simulated disk");
+    let file = create(&cx, &dir, "made");
+    let appended = file.append(&cx, b"bytes", Durable::No);
+    let closed = file.close_synced(&cx);
+    appended.expect("an append");
+    closed.expect("a synced close of a file its handle made");
+    dir.remove_synced(&cx, &path("made")).expect("a synced remove");
+    dir.sync_names(&cx).expect("a directory's names synced");
+    let after = io.disk().expect("a simulated disk");
+    assert_eq!(after.name_syncs - before.name_syncs, 3);
+    assert!(io.crash());
+    assert_eq!(held(&cx, &dir, "made"), None, "a synced remove is kept through a crash");
 }
 
 #[test]
@@ -290,10 +325,10 @@ fn closing_a_file_gives_the_type_its_durability_made() {
     // The synced close made the file's name durable too; the unsynced one's may be undone.
     assert!(io.crash());
     assert_eq!(held(&cx, &dir, "yes").as_deref(), Some(&b"bytes"[..]));
-    // A close told `Started` is refused and still gives the handle up.
+    // A close told `Started` begins the write-back and gives a `Written`.
     let file = create(&cx, &dir, "started");
-    let refused = file.close(&cx, Durable::Started).expect_err("no driver starts writeback");
-    assert_eq!((refused.op, refused.kind), (FsOp::Close, FsKind::NoWritebackStart));
+    let closed = file.close(&cx, Durable::Started).expect("a close");
+    assert!(matches!(closed, Placed::Written(_)), "{closed:?}");
 }
 
 #[test]

@@ -1283,6 +1283,18 @@ impl Sim {
                 self.files.entry(file).or_default().sync(covers);
                 Done::Synced
             }
+            // Nothing is made durable: a crash after it tears the file as before it. What a
+            // write-back buys (a clean file, so a cheap clone) is counted by who simulates
+            // the disk's costs (bstd's ledger; all-1110's `Sim::bytes_forced`).
+            Effect::WriteBack { file, .. } => match self.files.contains_key(&file) {
+                true => Done::WrittenBack,
+                // alloc: an error's message.
+                false => Done::Failed(IoError(format!("{file}: No such file or directory (os error 2)"))),
+            },
+            // This simulation keeps every name change through a crash (its names are
+            // durable as they are made); what a crash may undo of names not synced is
+            // modelled above it (bstd's ledger), which this completion tells.
+            Effect::SyncDir { .. } => Done::Synced,
             Effect::Truncate { file, len, .. } => {
                 file_mut(&mut self.files, &file).ops.push(Op::Cut(len));
                 self.changed(&file);

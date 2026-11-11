@@ -302,6 +302,32 @@ pub enum Effect {
         file: FileName,
         tag: Tag,
     },
+    /// The file's data that is still only in memory begun to be written to its device, and
+    /// the completion told once it is there (bstd's `Durable::Started`): no metadata is
+    /// committed and no device cache flushed, so nothing of it is durable, and the asker waits
+    /// for nothing (what it goes on with needs no completion of this). What it buys: a file
+    /// whose write-back has completed and that nothing wrote since is clean, so a clone of it
+    /// ([`Effect::Clone`]) shares its blocks at once, where a clone of a file with data not
+    /// written back makes the kernel write all of it first and waits for it (measured on xfs,
+    /// 162 MB: 1.3 s against 1 ms). Linux: `sync_file_range` with
+    /// `WAIT_BEFORE | WRITE | WAIT_AFTER` on a thread; Apple's systems: `fsync`, which writes
+    /// the data out and leaves it in the drive's cache (never `F_FULLFSYNC`); elsewhere the
+    /// data sync the system has. A file that is not there fails. Completes with
+    /// [`Done::WrittenBack`]. The same effect as branch all-1110's (4f260cd351).
+    WriteBack {
+        file: FileName,
+        tag: Tag,
+    },
+    /// The names in the directory `dir` made durable: every create, rename and remove in it
+    /// that completed before this was asked for survives a crash once it completes. What a
+    /// `_synced` remove, create or `sync_names` of bstd waits for; a file's bytes are
+    /// [`Effect::Sync`]'s. Unix: `fsync` of the directory (Apple's: `F_FULLFSYNC`, through
+    /// `sync_all`). Windows has no such call yet and fails, naming that. A `dir` that is not
+    /// there fails. Completes with [`Done::Synced`].
+    SyncDir {
+        dir: FileName,
+        tag: Tag,
+    },
     /// The file cut to its first `len` bytes (made if missing); durable once a later sync
     /// completes.
     Truncate {
@@ -585,6 +611,8 @@ impl Effect {
             | Effect::ReadLink { tag, .. }
             | Effect::Append { tag, .. }
             | Effect::Sync { tag, .. }
+            | Effect::WriteBack { tag, .. }
+            | Effect::SyncDir { tag, .. }
             | Effect::Truncate { tag, .. }
             | Effect::Write { tag, .. }
             | Effect::List { tag, .. }
@@ -845,6 +873,8 @@ pub enum Done {
     Read(Vec<u8>),
     Appended,
     Synced,
+    /// Of an [`Effect::WriteBack`]: the file's data was written to its device (not durably).
+    WrittenBack,
     Truncated,
     Written,
     Listed(Vec<(FileName, Meta)>),

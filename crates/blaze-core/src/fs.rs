@@ -264,6 +264,66 @@ pub(crate) fn sync(path: &Path) -> io::Result<()> {
     return OpenOptions::new().append(true).create(true).open(path)?.sync_all();
 }
 
+/// [`crate::Effect::WriteBack`]: the data of the file at `path` that is only in memory written
+/// to its device, waited for here (on a driver's thread; the effect's asker waits for
+/// nothing). Opened to read, so a file sealed read-only is written back too. Nothing of the
+/// file is made durable: no metadata is committed and no drive cache flushed.
+#[cfg(target_os = "linux")]
+pub(crate) fn write_back(path: &Path) -> io::Result<()> {
+    linux::write_back(path)
+}
+
+/// [`crate::Effect::WriteBack`] on Apple's systems and the other Unixes: `fsync`, which writes
+/// the file's data out and, on Apple's, leaves it in the drive's cache (`F_FULLFSYNC` is the
+/// durable one, and is not asked for).
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(crate) fn write_back(path: &Path) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    let file = File::open(path)?;
+    // SAFETY: an open descriptor.
+    match unsafe { libc::fsync(file.as_raw_fd()) } {
+        0 => Ok(()),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+/// [`crate::Effect::WriteBack`] where the system has no write-back short of a sync (Windows,
+/// WASI): the file's data synced. Opened to write, as a flush of a handle there needs.
+#[cfg(not(unix))]
+pub(crate) fn write_back(path: &Path) -> io::Result<()> {
+    OpenOptions::new().write(true).open(path)?.sync_data()
+}
+
+/// [`crate::Effect::SyncDir`]: the names in the directory at `path` made durable.
+#[cfg(target_os = "linux")]
+pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
+    linux::sync_dir(path)
+}
+
+/// [`crate::Effect::SyncDir`]: the names in the directory at `path` made durable (`sync_all`
+/// is `F_FULLFSYNC` on Apple's systems).
+#[cfg(all(any(unix, target_os = "wasi"), not(target_os = "linux")))]
+pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
+    // durable: the effect is the sync its caller asked for.
+    File::open(path)?.sync_all()
+}
+
+/// [`crate::Effect::SyncDir`] on Windows: not built. A directory's names are flushed there
+/// through a handle opened with backup semantics, which this driver does not open yet, and
+/// nothing stands in for it (rule no-fallback).
+#[cfg(windows)]
+pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        // alloc: an error path.
+        format!(
+            "Effect::SyncDir of {}: this driver has no directory sync on Windows yet \
+             (FlushFileBuffers of a directory handle), and nothing stands in for it",
+            path.display()
+        ),
+    ))
+}
+
 /// `bytes` written at `at` of the file at `path`, which exists.
 #[cfg(target_os = "linux")]
 pub(crate) fn write_at(path: &Path, at: u64, bytes: &[u8]) -> io::Result<()> {

@@ -15,8 +15,8 @@
 //! 5. No call told `Durable::No` waits for the device.
 //! 6. A publish's result says what its durability made: a `Flushed` for `Yes`, a `Written`
 //!    for `No`, and how the content got there.
-//! 7. A call told `Durable::Started`, which no driver can do yet, is refused and changes
-//!    nothing: it is never run as `No` or as `Yes` in its place.
+//! 7. A call told `Durable::Started` makes its change, begins the write-back and waits for
+//!    nothing: what a crash keeps of it is what it keeps of a `No`.
 //!
 //! Plants: [`Plant::PublishBeforeRename`] (a publish that reports done before its rename),
 //! [`Plant::DurableSkipsNameSync`] (a `Durable::Yes` that skipped the directory sync) and
@@ -165,16 +165,12 @@ fn typed(act: Act, placed: Placed, durable: Durable) -> Result<Option<Flushed>, 
     }
 }
 
-/// What a call told `durable` made (invariant 7): `None` when it was told `Started` and
-/// refused so, having changed nothing, which the read after it checks.
-fn as_told<T>(step: usize, act: Act, durable: Durable, called: Result<T, FsError>) -> Result<Option<T>, String> {
-    match (durable, called) {
-        (Durable::Started, Err(error)) if error.kind == FsKind::NoWritebackStart => Ok(None),
-        (Durable::Started, Ok(_)) => {
-            Err(format!("act {step} ({act:?}): told Durable::Started, which no driver can do, it said it did"))
-        }
-        (_, Ok(made)) => Ok(Some(made)),
-        (_, Err(error)) => Err(format!("harness: act {step} ({act:?}): {error}")),
+/// What a call told `durable` made (invariant 7: `Started` makes its change as `No` and
+/// `Yes` do).
+fn as_told<T>(step: usize, act: Act, _durable: Durable, called: Result<T, FsError>) -> Result<Option<T>, String> {
+    match called {
+        Ok(made) => Ok(Some(made)),
+        Err(error) => Err(format!("harness: act {step} ({act:?}): {error}")),
     }
 }
 
@@ -295,7 +291,7 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
             ));
         }
         let Some((at, durable)) = act.told() else { continue };
-        // Invariant 5: only `Durable::Yes` waits for the device (a refused `Started` neither).
+        // Invariant 5: only `Durable::Yes` waits for the device (`Started` begins and goes on).
         if durable != Durable::Yes && after.device_waits != before.device_waits {
             return Err(format!(
                 "act {step} ({act:?}): told {durable:?}, it waited for the device {} times",
@@ -319,8 +315,8 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
 /// The invariant: a file call's durability is what its caller said and nothing else. A read
 /// after a publish or a remove returned gives what it said; a crash keeps exactly what was
 /// synced, and of what was not, the last synced state or an unsynced change cut short; a
-/// clone of a `Flushed` forces no writeback; nothing told `No` waits for the device; and
-/// `Started`, which no driver can do yet, is refused with nothing changed.
+/// clone of a `Flushed` forces no writeback; nothing told `No` or `Started` waits for the
+/// device; and `Started` keeps through a crash no more than `No` does.
 #[hegel::test(test_cases = 200)]
 fn files_keep_what_their_calls_said_through_crashes(tc: TestCase) {
     check(plan(&mut Drawn(&tc)), run);

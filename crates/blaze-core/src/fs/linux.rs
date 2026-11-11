@@ -177,6 +177,25 @@ pub(crate) fn sync(path: &Path) -> io::Result<()> {
     sys::fsync(file.fd()).map_err(|errno| os_error(errno, Plant::None))
 }
 
+/// [`crate::Effect::WriteBack`]: the file's data that is only in memory written to its
+/// device and waited for (`sync_file_range` with `WAIT_BEFORE | WRITE | WAIT_AFTER` over the
+/// whole file), nothing made durable. Opened to read, so a file sealed read-only is written
+/// back too.
+pub(crate) fn write_back(path: &Path) -> io::Result<()> {
+    let file = open(path, OpenFlags::READ, Plant::None)?;
+    let flags = sys::SyncRange::WAIT_BEFORE | sys::SyncRange::WRITE | sys::SyncRange::WAIT_AFTER;
+    // A length of 0 is to the file's end.
+    sys::sync_file_range(file.fd(), 0, 0, flags).map_err(|errno| os_error(errno, Plant::None))
+}
+
+/// [`crate::Effect::SyncDir`]: the directory at `path` opened and synced, so the names in it
+/// are durable.
+pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
+    let dir = open(path, OpenFlags::READ | OpenFlags::DIRECTORY, Plant::None)?;
+    // durable: the effect is the sync its caller asked for.
+    sys::fsync(dir.fd()).map_err(|errno| os_error(errno, Plant::None))
+}
+
 /// [`crate::Effect::Truncate`]: as [`super::truncate`], whose error message wraps this one.
 pub(crate) fn truncate(path: &Path, len: u64) -> io::Result<()> {
     let flags = OpenFlags::WRITE | OpenFlags::CREATE;
@@ -357,6 +376,13 @@ mod tests {
         assert_eq!(read(&path, 100, 4).unwrap(), b"");
         truncate(&path, 1).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 1);
+        // A write-back and a directory sync of what is there succeed; of what is not, both
+        // are the typed error.
+        write_back(&path).unwrap();
+        sync_dir(&root.join("deep/er")).unwrap();
+        assert_eq!(write_back(&root.join("none")).unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert_eq!(sync_dir(&root.join("none")).unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert_eq!(sync_dir(&path).unwrap_err().raw_os_error(), Some(i32::from(Errno::NotDir.raw())));
         sync(&root.join("made-by-sync")).unwrap();
         assert_eq!(std::fs::metadata(root.join("made-by-sync")).unwrap().len(), 0);
         assert_eq!(read(&root.join("none"), 0, 1).unwrap_err().kind(), io::ErrorKind::NotFound);

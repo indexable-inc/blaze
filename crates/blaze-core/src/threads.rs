@@ -987,6 +987,15 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
             fs::sync(path)?;
             Ok(Done::Synced)
         }),
+        // Waited for on this thread; the asker waits for nothing, and nothing is durable.
+        Effect::WriteBack { file, .. } => at(root, &file, |path| {
+            fs::write_back(path)?;
+            Ok(Done::WrittenBack)
+        }),
+        Effect::SyncDir { dir, .. } => at(root, &dir, |path| {
+            fs::sync_dir(path)?;
+            Ok(Done::Synced)
+        }),
         Effect::Truncate { file, len, .. } => at(root, &file, |path| {
             fs::truncate(path, len)?;
             Ok(Done::Truncated)

@@ -110,6 +110,11 @@ fn script(driver: &mut impl Driver) -> BTreeMap<u64, String> {
             26 => Effect::Sync { file: name("store/a/moved"), tag: Tag(27) },
             27 => Effect::Append { file: name("store/a/moved"), bytes: b"!".to_vec(), tag: Tag(28) },
             28 => Effect::ReadAll { file: name("store/a/moved"), tag: Tag(29) },
+            // A write-back of a file that is there and of one that is not, and a directory's
+            // names synced.
+            29 => Effect::WriteBack { file: name("store/a/moved"), tag: Tag(30) },
+            30 => Effect::WriteBack { file: name("missing"), tag: Tag(31) },
+            31 => Effect::SyncDir { dir: name("store/a"), tag: Tag(32) },
             _ => return,
         };
         effects.push(next);
@@ -152,6 +157,9 @@ fn every_driver_ends_the_script_the_same() {
     assert_eq!(simulated[&26], format!("{:?}", Done::Read(b"ga".to_vec())));
     assert_eq!(simulated[&27], format!("{:?}", Done::Synced));
     assert_eq!(simulated[&29], format!("{:?}", Done::Read(b"aga!".to_vec())));
+    assert_eq!(simulated[&30], format!("{:?}", Done::WrittenBack));
+    assert_eq!(simulated[&31], "failed");
+    assert_eq!(simulated[&32], format!("{:?}", Done::Synced));
     #[cfg(target_os = "linux")]
     {
         let root = dir("uring");
