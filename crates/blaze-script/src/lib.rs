@@ -7,6 +7,7 @@
 //! - [`pyjson`]: JSON written as Python's `json.dumps` writes it, so a generated file comes out
 //!   byte for byte as the Python script wrote it.
 //! - [`run`], [`git`], [`run_shown`]: a program run, its output captured or shown.
+//! - [`pyfmt`]: `{x:g}`, `{x!r}` and `{x}` of a value, as an f-string writes them.
 //! - [`pystr`]: Python's `splitlines` and whitespace, where Rust's `lines` and `trim` differ.
 //! - [`fail`], [`expect`]: how a script ends in an error, and how its `selftest` checks.
 //!
@@ -14,6 +15,7 @@
 //! (`bstd::data`) and these become bstd's (`blaze::std_use` moves the callers).
 
 pub mod input;
+pub mod pyfmt;
 pub mod pyjson;
 pub mod pystr;
 

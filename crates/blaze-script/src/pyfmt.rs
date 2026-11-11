@@ -1,0 +1,163 @@
+//! Values written as Python writes them in an f-string: `{x:g}` ([`g`]), `{x!r}` ([`repr`],
+//! [`repr_str`]) and `{x}` ([`py_str`]) of a JSON value, so a ported script's message is the
+//! bytes the Python printed.
+
+use serde_json::Value;
+
+use crate::pyjson;
+
+/// `f"{x:g}"`: six significant digits, trailing zeros dropped, an exponent (`1e+06`, `1e-05`)
+/// when the number's is below -4 or at least 6.
+pub fn g(x: f64) -> String {
+    if x.is_nan() {
+        return "nan".to_owned();
+    }
+    if x.is_infinite() {
+        return if x > 0.0 { "inf".to_owned() } else { "-inf".to_owned() };
+    }
+    if x == 0.0 {
+        return if x.is_sign_negative() { "-0".to_owned() } else { "0".to_owned() };
+    }
+    // Rounded to six significant digits first: the exponent is the rounded number's.
+    let sci = format!("{x:.5e}");
+    let (mantissa, exponent) = sci.split_once('e').unwrap_or((&sci, "0"));
+    let exponent: i32 = exponent.parse().unwrap_or(0);
+    if (-4..6).contains(&exponent) {
+        let decimals = usize::try_from(5 - exponent).unwrap_or(0);
+        trim_zeros(&format!("{x:.decimals$}"))
+    } else {
+        let sign = if exponent < 0 { '-' } else { '+' };
+        format!("{}e{sign}{:02}", trim_zeros(mantissa), exponent.unsigned_abs())
+    }
+}
+
+fn trim_zeros(digits: &str) -> String {
+    if digits.contains('.') { digits.trim_end_matches('0').trim_end_matches('.').to_owned() } else { digits.to_owned() }
+}
+
+/// Whether Python's `str.isprintable` holds for a character that is not ASCII. Close to
+/// Python's: the controls, the separators but the space and the common format characters are
+/// not printable; Python also counts unassigned and private-use code points out, which this
+/// does not.
+fn printable(c: char) -> bool {
+    !(c.is_control()
+        || matches!(c,
+            '\u{a0}' | '\u{ad}' | '\u{1680}' | '\u{2000}'..='\u{200f}' | '\u{2028}'..='\u{202f}'
+            | '\u{205f}'..='\u{2064}' | '\u{3000}' | '\u{feff}'))
+}
+
+/// `repr(s)` of a string: in `'` unless it holds a `'` and no `"`, with `\\`, `\n`, `\r`,
+/// `\t`, the quote and what is not printable escaped.
+pub fn repr_str(s: &str) -> String {
+    let quote = if s.contains('\'') && !s.contains('"') { '"' } else { '\'' };
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push(quote);
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c == quote => {
+                out.push('\\');
+                out.push(c);
+            }
+            c if (c as u32) < 0x20 || c == '\u{7f}' => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c if c.is_ascii() || printable(c) => out.push(c),
+            c if (c as u32) < 0x100 => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c if (c as u32) < 0x10000 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push_str(&format!("\\U{:08x}", c as u32)),
+        }
+    }
+    out.push(quote);
+    out
+}
+
+/// A float as Python's `repr` writes it: `1.0`, `1e-05`, `inf`, `nan`.
+fn float_repr(f: f64) -> String {
+    if f.is_nan() {
+        "nan".to_owned()
+    } else if f.is_infinite() {
+        if f > 0.0 { "inf".to_owned() } else { "-inf".to_owned() }
+    } else {
+        pyjson::float(f)
+    }
+}
+
+/// `repr(value)` of the Python value `json.loads` gave: `None`, `True`, `'a'`, `[1, 'b']`,
+/// `{'k': 1.5}`.
+pub fn repr(value: &Value) -> String {
+    match value {
+        Value::Null => "None".to_owned(),
+        Value::Bool(true) => "True".to_owned(),
+        Value::Bool(false) => "False".to_owned(),
+        Value::Number(n) => match (n.as_i64(), n.as_u64(), n.as_f64()) {
+            (Some(i), _, _) => i.to_string(),
+            (_, Some(u), _) => u.to_string(),
+            (_, _, Some(f)) => float_repr(f),
+            _ => n.to_string(),
+        },
+        Value::String(s) => repr_str(s),
+        Value::Array(items) => format!("[{}]", items.iter().map(repr).collect::<Vec<_>>().join(", ")),
+        Value::Object(fields) => format!(
+            "{{{}}}",
+            fields.iter().map(|(k, v)| format!("{}: {}", repr_str(k), repr(v))).collect::<Vec<_>>().join(", ")
+        ),
+    }
+}
+
+/// `str(value)` of the Python value `json.loads` gave: a string as it is, anything else as
+/// its `repr`.
+pub fn py_str(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        other => repr(other),
+    }
+}
+
+/// `repr` of a list of strings, as `sorted(a_dict)` prints: `['a', 'b']`.
+pub fn repr_strs<S: AsRef<str>>(items: &[S]) -> String {
+    format!("[{}]", items.iter().map(|it| repr_str(it.as_ref())).collect::<Vec<_>>().join(", "))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    // Each expectation is what Python 3.13 prints for the same value.
+    #[test]
+    fn g_is_pythons() {
+        let cases = [
+            (300.0, "300"),
+            (0.0, "0"),
+            (1.5, "1.5"),
+            (25_000.0, "25000"),
+            (10_001.0, "10001"),
+            (1e6, "1e+06"),
+            (1_234_567.0, "1.23457e+06"),
+            (999_999.5, "1e+06"),
+            (0.0001, "0.0001"),
+            (0.00001, "1e-05"),
+            (2.0 / 3.0, "0.666667"),
+            (-4300.25, "-4300.25"),
+            (123_456.0, "123456"),
+        ];
+        for (x, said) in cases {
+            assert_eq!(g(x), said, "{x}");
+        }
+    }
+
+    #[test]
+    fn repr_is_pythons() {
+        assert_eq!(repr_str("a"), "'a'");
+        assert_eq!(repr_str("it's"), "\"it's\"");
+        assert_eq!(repr_str("'\""), "'\\'\"'");
+        assert_eq!(repr_str("a\tb\\\u{1}é\u{2028}"), "'a\\tb\\\\\\x01é\\u2028'");
+        assert_eq!(repr(&json!({"a": [1, 2.5, null, true, "x"]})), "{'a': [1, 2.5, None, True, 'x']}");
+        assert_eq!(py_str(&json!("x")), "x");
+        assert_eq!(py_str(&json!(null)), "None");
+        assert_eq!(repr_strs(&["a", "b"]), "['a', 'b']");
+    }
+}
