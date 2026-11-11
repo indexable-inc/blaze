@@ -89,7 +89,11 @@ fn report(switches: Vec<SwitchIn>, spans: Vec<SpanIn>, wall: i64, facts: &Facts)
     let path = path::critical(&model);
     let one = analyse(&model, &path, facts);
     assert_eq!(one, analyse(&model, &path, facts), "the same rows give the same report");
-    let ranked: Vec<&Finding> = one.findings.iter().filter(|it| it.kind != Kind::NotKept).collect();
+    let ranked: Vec<&Finding> = one
+        .findings
+        .iter()
+        .filter(|it| !matches!(it.kind, Kind::NotKept | Kind::Unfinished))
+        .collect();
     assert!(
         ranked
             .windows(2)
@@ -150,6 +154,29 @@ fn what_the_last_build_lost_is_the_first_finding() {
     facts.misses.truncate(1);
     let without = report(switches(), lowering(), 100, &facts);
     assert!(without.findings.iter().all(|it| it.kind != Kind::NotKept), "{:#?}", without.findings);
+}
+
+/// A build that did the work its checkout's last, failed build left says so before its serial
+/// work: on 2026-11-10 the builds after a failed cold build took 56 s, 10 s and 22 s and read
+/// as slow no-ops.
+#[test]
+fn a_build_finishing_a_failed_one_says_so_first() {
+    let switches = vec![switch(1, 0, Event::Started, 1), switch(1, 100, Event::Ended, 1)];
+    let spans = vec![span(1, 1, None, "impls publish", 0, 100, 1)];
+    let why = "the last build of /w (build 41, `build`) failed with 212 of its 340 units not built";
+    let mut facts = workers(1..=4);
+    facts.misses = vec![MissGroup {
+        step: UNFINISHED_STEP.to_owned(),
+        cause: "always".to_owned(),
+        count: 1,
+        example: "the last build of /w".to_owned(),
+        what: Some(why.to_owned()),
+    }];
+    let it = report(switches, spans, 100, &facts);
+    let first = &it.findings[0];
+    assert_eq!((first.kind, first.fix), (Kind::Unfinished, Fix::CompareAfter), "{:#?}", it.findings);
+    assert_eq!(first.evidence, [why]);
+    assert!(text(&it, 1).contains(" 1. saves ?  the last build did not end well"));
 }
 
 /// What blaze said was wrong in a build is listed before its findings, each once with its

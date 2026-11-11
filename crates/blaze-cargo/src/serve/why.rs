@@ -1152,7 +1152,7 @@ const NOT_KEPT: &str = blaze_profile::slow::NOT_KEPT_STEP;
 /// (blaze-cargo's `job::Unfinished`): said with [`NOT_KEPT`] before every other group and root
 /// cause, as the work under them is that build's remainder, not something this one's inputs
 /// changed.
-pub(super) const UNFINISHED: &str = "work the last build left unfinished";
+pub(super) const UNFINISHED: &str = blaze_profile::slow::UNFINISHED_STEP;
 
 /// Whether `step` is said before every other: what the last build lost, then what it left
 /// unfinished. 0 and 1 for those, 2 for any other, to sort by.

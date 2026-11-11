@@ -1196,6 +1196,8 @@ same rows give the same bytes. Findings that save less than 1% of the wall time 
 
 | kind | what it finds | estimated saving |
 |---|---|---|
+| `not_kept` | the checkout's last build lost what it left for the store after its answer (a `misses` row of step `results kept after the answer`); ranked first | unknown |
+| `unfinished` | the checkout's last build failed or was cancelled, and this build first did the work it left (a `misses` row of step `work the last build left unfinished`); ranked first, with `not_kept` | unknown |
 | `serial` | critical-path running time, grouped by the innermost span it ran in, while most workers were idle | its path time x (1 - busy workers / workers) |
 | `starved` | the same, but the spans' `self_cpu_ns` was under 25% of their running time (1 s or more of running): on a core, or blocked outside any `wait` span, yet getting no CPU | its path time x (1 - CPU / running) |
 | `starved_workers` | workers whose CPU per running second is under a third of the median of the top half | the path's time on them x (1 - their rate / the reference) |

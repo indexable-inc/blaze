@@ -55,7 +55,8 @@ pub use render::{problems_text, text, thread_line};
 /// finding `not_kept` (fix `keep_results`), ranked first. 8: `problems`, what blaze itself said
 /// was wrong during the build (the `problems` view's rows), listed before the findings. 9: `gaps`,
 /// each stretch of the critical path of [`GAP_NS`] or more under no span, with its thread, the
-/// spans before and after it, and the stacks sampled in it.
+/// spans before and after it, and the stacks sampled in it; and the finding `unfinished` (fix
+/// `compare_after`) of a build that did the work its checkout's last, failed build left.
 pub const VERSION: u32 = 9;
 
 /// The least stretch of the critical path under no span that is listed as a gap
@@ -69,6 +70,12 @@ pub const GAPS: usize = 16;
 /// then lost what it left for the store (blaze-cargo's `Jobs::lose`): the daemon lowers this
 /// build's front end anew, so nearly everything else the report finds follows from it.
 pub const NOT_KEPT_STEP: &str = "results kept after the answer";
+
+/// The `step` of the misses row a build takes when its checkout's last build did not end well
+/// (failed or was cancelled) and left work this build does first (blaze-cargo's
+/// `serve::why::UNFINISHED`): the build is finishing a failed one, not slow. On 2026-11-10 the
+/// "no-op" builds after a failed cold build took 56 s, 10 s and 22 s with nothing saying so.
+pub const UNFINISHED_STEP: &str = "work the last build left unfinished";
 
 /// The build the report is of, as its `builds` row says.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -460,6 +467,9 @@ pub enum Kind {
     /// What the checkout's last build left for the store was not kept ([`NOT_KEPT_STEP`]):
     /// ranked first, as the cause of most of what the build computed again.
     NotKept,
+    /// The checkout's last build did not end well, and this one does the work it left
+    /// ([`UNFINISHED_STEP`]): ranked with `not_kept`, before what the profile was read for.
+    Unfinished,
     /// Work on the critical path that ran serially while workers were idle.
     Serial,
     /// Work on the critical path that was on a core but got little CPU.
@@ -498,6 +508,7 @@ pub enum Fix {
     ExplainMiss,
     ReadOnce,
     KeepResults,
+    CompareAfter,
 }
 
 impl Fix {
@@ -530,6 +541,9 @@ impl Fix {
             }
             Fix::KeepResults => {
                 "fix what refused the last build's results (the reason above; the daemon's log has the same line, `were not kept after its answer was sent`): until then every build of this checkout computes again what the last one left, and the findings below are mostly its cost"
+            }
+            Fix::CompareAfter => {
+                "nothing in blaze: this build's time is the last build's unfinished work, not an edit's or a no-op's; measure from the next build that follows one that ended well"
             }
             Fix::ReadOnce => {
                 "read each row once a run: hoist reads out of loops over items, or read one query that gathers them; each read costs the run a query stack entry and its verify a check"
@@ -630,8 +644,9 @@ pub fn analyse(model: &Model, path: &Path, facts: &Facts) -> Report {
     findings.sort_by(|a, b| {
         // What the last build lost comes first: the daemon said it already, and reading the
         // rest of the report without it is reading its consequences.
-        (a.kind != Kind::NotKept)
-            .cmp(&(b.kind != Kind::NotKept))
+        let first = |it: &Finding| !matches!(it.kind, Kind::NotKept | Kind::Unfinished);
+        first(a)
+            .cmp(&first(b))
             .then((a.estimate == Estimate::Unknown).cmp(&(b.estimate == Estimate::Unknown)))
             .then(b.saves_ns.cmp(&a.saves_ns))
             .then(a.kind.cmp(&b.kind))
@@ -1414,6 +1429,22 @@ impl<'a> Ctx<'a> {
                     estimate: Estimate::Unknown,
                     title: "the last build's results were not kept, so this build computed them again".to_owned(),
                     subject: NOT_KEPT_STEP.to_owned(),
+                    owner: None,
+                    evidence: vec![why],
+                });
+                continue;
+            }
+            if it.step == UNFINISHED_STEP {
+                // alloc: a finding's evidence
+                let why = it.what.clone().unwrap_or_else(|| it.example.clone()); // clone: once a report
+                out.push(Finding {
+                    stacks: Stacks::default(),
+                    kind: Kind::Unfinished,
+                    fix: Fix::CompareAfter,
+                    saves_ns: 0,
+                    estimate: Estimate::Unknown,
+                    title: "the last build did not end well, and this build first did the work it left".to_owned(),
+                    subject: UNFINISHED_STEP.to_owned(),
                     owner: None,
                     evidence: vec![why],
                 });
