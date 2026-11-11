@@ -745,30 +745,113 @@ programs; it is the specification of the Rust pass of the same name.
     drops it from the list (`State.write_setSlot_same`); a removed store adds one; a call
     leaves the caller's list as it is and starts the callee with none; a return drops the
     callee's.
-  - **Built so far.** (a) `Opt/SlotExecFar.lean`, `execStmt_putFar`: a statement does the
-    same whatever a hidden slot of a frame that is not running holds (checked at
-    e51837e3a0). (b) `Opt/Puts.lean`: `puts st reps`, the state with a list of slots
-    replaced; `execStmt_puts`, a statement through the list (checked at e51837e3a0);
-    `execStmt_absorb`, the same with the entries the statement stores to leaving the list
-    (`keepReps`), and `puts_append`, a replacement after the list as one more entry, which
-    is what a removed store adds (not yet elaborated). (c) `Opt/Liveness.lean`: the
-    certificate (per function and block, the locals live before each statement and before
-    the terminator), `checkLiveness`, what a passed check says of one statement
-    (`stmtLive_dead`: a local dead before it is stored to whole, or not mentioned and dead
-    after), and the pass `removeDead`, with examples the kernel evaluates (not yet
-    elaborated). There is no theorem about `removeDead` until (d) and (e).
-  - **Left to build, in order.** (d) Terminators on states related by `puts`: operands and
-    places through the list (as `execStmt_puts`, from the single-slot lemmas of
-    `Opt/SlotExec.lean` and `Opt/SlotExecFar.lean`); a jump (`State.put` commutes with
-    `withTopBlock`: `Opt/MemMap.lean`'s `State.setSlot_mapStack`); a call (the new frame's
-    id is above every entry's, so the entries commute with the push); a return (the
-    callee's entries go with its frame, the write of the destination absorbs or commutes).
-    Then the block: an induction over the statements with the points, where a kept
-    statement is `execStmt_absorb` by `stmtLive_dead`, and a removed store puts
-    `(top, l, init v)` in front of the list (`State.write_whole`, `rvalueCalm`).
-    (e) `removeDead_refines` through `run_refines_inv`, with the invariant "the source is
-    `puts` of the target by a list whose entries are dead at their frames' resume points
-    and never borrowed, and the source holds `Borrows`".
+  - **Built, all checked by Lean** (`lake build` of `lean/` at 7aef0a78fb, 2026-11-11).
+    (a) `Opt/SlotExecFar.lean`, `execStmt_putFar`: a statement does the same whatever a
+    hidden slot of a frame that is not running holds. (b) `Opt/Puts.lean`: `puts st reps`,
+    the state with a list of slots replaced (`Rep := Nat × Nat × Slot`: frame id, local,
+    content); `execStmt_puts`, a statement through the list; `execStmt_absorb`, the same
+    with the entries the statement stores to whole leaving the list (`keepReps`);
+    `puts_append`, `puts_okAt`, `puts_top`, `puts_topFn`. (c) `Opt/Liveness.lean`: the
+    certificate, `checkLiveness`, `stmtLive_dead`, and the pass `removeDead`, with examples.
+    **`removeDead` has no theorem**: that is (d) and (e), below.
+  - **Left to build: (d) and (e), for a reader starting fresh.** Names in backticks exist
+    and are checked unless said to be new. `B` is `BorrowedIn borrowed prog`, `g` the list
+    of frames of `Borrows B g st` (`Opt/BorrowStep.lean`).
+    - **The relation.** The source state is `puts t reps` for the target state `t`. Each
+      entry `(f, l, sl)` is `Good`: `SlotOk (PtrOk B g) sl`; `∀ q, PtrOk B g q → Off f l q`
+      (from `ptrOk_off`: `fnOfIds g f = some fn`, `¬ B fn l`, `¬ f = 0` by
+      `KeysBelow.pos`); `f` is the id of a frame of `t` whose function has `l` among its
+      locals; and `l` is dead at that frame's resume point: for the running frame, not in
+      `liveIn points fr.block`; for a frame under it, the same at the block its callee's
+      `target` names, except a local the call writes whole (`termWrites`).
+    - **(d1) new file `Opt/PutsTerm.lean`: operands and places through the list.** As
+      `execStmt_puts` is built from `execStmt_put` and `execStmt_putFar` (see
+      `execStmt_rep`), build from `evalOperand_put`/`evalOperand_putFar`,
+      `evalOperands_put`/`_putFar` and `evalPlace_put`/`_putFar`:
+      `evalOperand (puts st reps) o = Outcome.map (keepState (fun s => puts s reps)) (evalOperand st o)`,
+      the same for `evalOperands`, and
+      `evalPlace (puts st reps) p = evalPlace st p` with the pointer it gives `Off` every
+      entry. The condition per entry is `RepOk` with `operandFine`/`operandsFine`/`placeFine`
+      in place of `stmtFine`; `termFine l term` (`Opt/Liveness.lean`) gives them for the
+      locals dead before the terminator.
+    - **(d2) same file: control.** A jump: `State.jump st x` is
+      `Outcome.ok (Next.state (st.mapStack (withTopBlock x)))` on a stack that is not empty,
+      and `State.setSlot_mapStack (withTopBlock_memMap x)` (`Opt/MemMap.lean`,
+      `Opt/Merge.lean`) commutes a replacement with it, so
+      `(puts st reps).jump x = Outcome.map (Next.map (fun s => puts s reps)) (st.jump x)`
+      by induction on the list; `switchOn` and `assertOn` follow as in `Opt/Reach.lean`.
+      A call: `enterState (puts st reps) .. = puts (enterState st ..) reps`, because the new
+      frame's id is `st.next` and every entry's frame id is below it (`KeysBelow`), so
+      `setFrame` passes the new frame (`setFrame_cons` with `if_neg`) and `State.slots?`
+      of an entry's frame is unchanged. A return: an entry of the returning frame becomes
+      the identity once the frame is gone (`State.setSlot_none`); the write of the
+      destination in the caller absorbs an entry of the destination's whole local
+      (`State.write_setSlot_same`) and commutes with every other
+      (`State.write_setSlot_other`), for which the relation must also say, of each frame
+      under the running one, that its callee's `dest` is `Off` each of its entries or is
+      that entry's whole slot.
+    - **(d3) new file `Opt/RemoveDead.lean`: the block.** By induction on the statements
+      with their points (`stmtsLive`, `killDead` recurse the same way): a kept statement is
+      `execStmt_absorb` with `RepFits` from `stmtLive_dead` (the local is absorbed, or
+      `stmtFine` and still dead; an entry of another frame is the third case); a removed
+      store `l = rv` is, on the source, `evalRvalue_calm` then `State.write_whole`, so the
+      source state becomes `puts t ((top, l, Slot.init v) :: keepReps top s reps)` while the
+      target state stays `t` (`killable_refines` in `Opt/RemoveOverwritten.lean` is the same
+      argument for one block); the value is allowed by `evalRvalue_okAt` on the source
+      state, which holds `OkAt` by `puts_okAt`.
+    - **(e) same file: the runs.** `run_refines_inv` is not enough as it is: it wants the
+      two programs in the same state, and here they are related. Write its relational form
+      first (new, in `Opt/RemoveOverwritten.lean` beside it), about ten lines more than
+      `run_refines_inv`:
+      `theorem run_refines_rel (src tgt : Program) (R : State → State → Prop)
+      (hstep : ∀ s t, R s t → (∃ why, step src s = Outcome.undefined why) ∨ StepRel R (step src s) (step tgt t)) :
+      ∀ fuel s t, R s t → (run tgt fuel t).Refines (run src fuel s)`, where
+      `StepRel R` relates two `Outcome Next`: both `ok (Next.state ..)` with `R`, both
+      `ok (Next.done v)` with one `v`, or the same panic, undefined or `diverge`. Then
+      `removeDead_refines` with `R s t := ∃ reps g, s = puts t reps ∧ Borrows B g t ∧ every entry Good`,
+      under `checkLiveness prog cert = true` and `checkBorrows borrowed prog = true`; and
+      the call form as `removeOverwritten_call` (`start_borrows`; the start state is related
+      by the empty list).
+  - **Idioms that elaborate here, and ones that do not** (Lean 4.20.0; learned on this
+    branch, each from a build):
+    - Prove through `Opt/Bind.lean`, as terms: `Outcome.bind_commutes hx (fun a ha => ..)`,
+      `bind_commutes_map`, `bind_congr`, `bind_map_congr`, and `Outcome.all_bind` for a
+      predicate on the value. The unifier unfolds a definition to its `bind`; no `rw`.
+    - `congrTo f h` (in `Opt/Bind.lean`), never `congrArg f h`, where an expected type is
+      known: `congrArg` lets the goal choose the right-hand side and picks wrongly when it
+      only unfolds to the same.
+    - A structure literal `{ a := .., b := .. }` broken across lines inside parentheses
+      in a `have`'s type does not parse: write `State.mk .. .. ..` / `Frame.mk ..`.
+    - `Preserves.comp (f := ..) (g := ..)` and the like: give the functions; higher-order
+      unification of `fun prog => g (f prog)` picks the identity.
+    - `nomatch h, fun ..` parses as a list: parenthesize `(fun ⟨_, h⟩ => nomatch h)`.
+    - A hypothesis whose type is a `def` (`Reaches`, `RepOk`, `Redirects`): use
+      `And.left`/`And.right`/`And.intro`/`Or.inl`, not `h.1` or `⟨..⟩`; before `cases` on
+      it, restate it with its `∨` written out (`have h' : A ∨ B := h`), or take
+      `And.right (And.right h)` whose type is then the `∨` itself.
+    - A `match` on a value that is not a constructor does not reduce: give every function
+      a helper that matches on its argument (`slotIn`, `switchOr`, `symNext`), and state
+      `f_cons := rfl`; for an inline one, `simp only [f]` then `cases h : scrutinee`
+      (`callOn`), or `unfold f; cases h : scrutinee` when the `match` is the body's head
+      (`Program.start`); `unfold f; split <;> first | ..` for a many-pattern one
+      (`Intrinsic.eval`).
+    - `by omega` as an argument runs before its goal is known: put it in a
+      `have h : <type> := by omega`.
+    - `rw [e] at h` matches up to instances: `k + 1 + 0` also matches `k + 1`. Build
+      arithmetic steps as terms (`congrArg (fun j => run prog j st) e`).
+    - After `subst`, do not name the variable that may be gone; state the lemma for one
+      variable and derive the other form with `congrTo`.
+    - `cases e with | c => ..` needs `e` to appear in the goal as written: `show` the
+      unfolded goal first, or `cases h : e` and `rw [h] at ..`.
+    - `first | exact A | exact B | ..` after `cases x <;> cases y` chooses by unification;
+      order the alternatives so that an earlier one cannot fit a later one's goal.
+    - Generating a file by substitution from one that builds works and is cheap to get
+      right: `Opt/MemMap.lean` from `Opt/Rename.lean`, `Opt/Ids.lean` and `Opt/NextId.lean`
+      from `Opt/Ctl.lean`, `Opt/SlotExecFar.lean` from `Opt/SlotExec.lean`, the operator
+      lemmas of `Opt/SymBlock.lean` from `Opt/BorrowExec.lean`. Assert that no old name is
+      left, and read the result once.
+    - In `decide` examples, state what the pass does by hand first; twice here the
+      expectation was wrong and the pass right.
 - **A validator proved sound** (`Opt/Validate.lean`). `validate a b` accepts when the two
   programs have one normal form under the proved rewrites; `validate_sound`: an accepted
   pair runs alike for every fuel and state. It takes no witness and accepts only what the
