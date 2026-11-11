@@ -125,6 +125,9 @@ inductive Intrinsic where
   | sliceLen
   | wrappingAdd | wrappingSub | wrappingMul
   | saturatingAdd | saturatingSub
+  /-- The constructor function of a tuple struct or of a variant: its arguments are the
+  fields. -/
+  | construct (variant : Nat)
   deriving DecidableEq, Repr
 
 inductive Callee where

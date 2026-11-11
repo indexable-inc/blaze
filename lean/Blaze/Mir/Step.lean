@@ -350,6 +350,7 @@ def Intrinsic.eval (st : State) : Intrinsic → List Value → Outcome Value
   | Intrinsic.wrappingMul, [a, b] => binaryOp false BinOp.mul a b
   | Intrinsic.saturatingAdd, [a, b] => saturatingOp BinOp.add a b
   | Intrinsic.saturatingSub, [a, b] => saturatingOp BinOp.sub a b
+  | Intrinsic.construct variant, fields => Outcome.ok (Value.adt variant fields)
   | _, _ => illTyped
 
 def callOn (sig : FnId → Option FnSig) (st : State) (callee : Callee) (args : List Value)

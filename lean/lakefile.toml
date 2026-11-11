@@ -2,7 +2,7 @@
 # written against, the checked-in models the golden tests hold to the translator's output, and
 # the proofs that live beside each crate's `src/`. No dependency: core Lean only.
 name = "blaze"
-defaultTargets = ["Blaze", "BlazeModel", "BlazeMir", "BlazeGraph"]
+defaultTargets = ["Blaze", "BlazeModel", "BlazeMir", "BlazeValidated", "BlazeGraph"]
 
 # The library (`Blaze.Result`, `Blaze.Scalar`, `Blaze.Slice`, `Blaze.Std`), the semantics of MIR
 # (`Blaze.Mir.*`: syntax, values, `step`, `run`, the proved passes) and their tests.
@@ -21,6 +21,13 @@ globs = ["BlazeModel.+"]
 [[lean_lib]]
 name = "BlazeMir"
 globs = ["BlazeMir.+"]
+
+# Translation validation: bodies before and after a MIR pass, as the encoder writes them, each
+# with `example : after = <the pass's Lean specification> before := rfl`. A failure here says
+# a Rust pass did not do what its specification does.
+[[lean_lib]]
+name = "BlazeValidated"
+globs = ["BlazeValidated.+"]
 
 # blaze-graph's proofs, beside its `src/`.
 [[lean_lib]]
