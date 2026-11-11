@@ -56,9 +56,10 @@ argument, as error unions are `ErrorUnion<(A, B)>`. So:
 - **Traits** come from core, as a tuple's do: `Clone`, `Copy`, `PartialEq`, `Eq`, `Hash`,
   `Default`, `PartialOrd` and `Ord` (comparing fields in sorted-name order) when the tuple has
   them, so up to twelve fields beyond `Clone` and `Copy`; `Debug` prints `{ a: 1, b: 2 }`.
-- **No impls.** `impl .. for { .. }`, inherent or of a trait, is refused: "a record is foreign
-  to every crate (the orphan rule, as for a tuple); name it with a struct". A blanket impl
-  applies as to any type.
+- **Impls are a tuple's.** A record is foreign to every crate, as a tuple is: an inherent impl
+  (E0116) and an impl of a foreign trait (E0117, the orphan rule) are refused by the rules
+  that refuse them on `core`'s `Record`, and a crate's own trait may be implemented for a
+  record, as for a tuple. To give a record methods, name it with a struct.
 - A duplicate field, a visibility, attribute or `unsafe` on a field, a tuple-index name, and a
   default outside a function parameter are each an error naming the field.
 
@@ -79,7 +80,8 @@ refused in this slice), never another parameter.
 
 - `open(p, { create: true, .. })`: each field left out takes the callee's default; a field with
   no default must be written (error naming the field and the function). Without `..` every
-  field is written.
+  field is written. `{ .. }` alone stays Rust's block around the full range, so a call that
+  wants every default names one field; a spelling for "all defaults" is open.
 - A default is evaluated as a constant, once, and its value placed at each call that omits the
   field, in the callee's declaration order after the written fields; being constants, order
   and count are unobservable.
