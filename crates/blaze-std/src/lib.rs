@@ -93,6 +93,9 @@
 // harness, `eprintln!`).
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_code)]
+// A field marked `#[blaze::policy]` (a cost or a guarantee its maker decides) is never chosen
+// by a `Default` or a `new()` that takes nothing (std.md, "The second rule").
+#![warn(blaze::default_policy)]
 #![feature(
     allocator_api,
     allocator_ext,

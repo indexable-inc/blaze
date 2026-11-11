@@ -171,6 +171,7 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::fixed_key_lookup",
             "blaze::struct_update",
             "blaze::bool_param",
+            "blaze::default_policy",
             "blaze::sans_io_core",
             "blaze::key_ignores_field",
             "blaze::wildcard_arm",

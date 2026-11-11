@@ -53,9 +53,11 @@ pub struct Wire {
     /// The most bytes of an answer's body that are read: past it the request fails
     /// ([`HttpKind::TooBig`]). The bytes go to the caller's [`Bytes`], whose arena has its
     /// own limit; this one is the peer's.
+    #[blaze::policy]
     pub body_most: usize,
     /// The most receives made for one answer before it stops waiting for its end
     /// ([`HttpKind::Unending`]; rule bounded-progress).
+    #[blaze::policy]
     pub reads_most: usize,
 }
 

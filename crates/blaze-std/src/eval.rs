@@ -482,9 +482,11 @@ impl Next<'_> {
 pub struct MemoLimit {
     /// The most entries kept at once, in two generations of half of it each: below 2, nothing
     /// is kept.
+    #[blaze::policy]
     pub entries: usize,
     /// The most bytes its two arenas hand out, half each: the entries, their keys and the
     /// maps. An entry that does not fit half of it is not kept.
+    #[blaze::policy]
     pub bytes: usize,
 }
 

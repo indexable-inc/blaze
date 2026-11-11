@@ -28,6 +28,7 @@ mod collect_then_consume;
 #[cfg(test)]
 mod correctness_general_tests;
 mod deep_drop_at_exit;
+mod default_policy;
 mod dispatch;
 mod dos_hasher_on_input;
 mod dropped_error;
@@ -172,6 +173,7 @@ pub enum Lint {
     FixedKeyLookup,
     StructUpdate,
     BoolParam,
+    DefaultPolicy,
     SansIoCore,
     KeyIgnoresField,
     WildcardArm,
@@ -334,6 +336,7 @@ impl Lint {
         Lint::FixedKeyLookup,
         Lint::StructUpdate,
         Lint::BoolParam,
+        Lint::DefaultPolicy,
         Lint::SansIoCore,
         Lint::KeyIgnoresField,
         Lint::WildcardArm,
@@ -489,6 +492,7 @@ impl Lint {
             | Lint::WildcardArm
             | Lint::StructUpdate
             | Lint::BoolParam
+            | Lint::DefaultPolicy
             // Its fix passes only blaze's (and nightly Rust's) borrow checker: on in workspaces
             // that turn on `internal`, allowed in the rest, so a published crate keeps building
             // with stable Rust.
@@ -533,6 +537,7 @@ impl Lint {
             Lint::FixedKeyLookup => "fixed_key_lookup",
             Lint::StructUpdate => "struct_update",
             Lint::BoolParam => "bool_param",
+            Lint::DefaultPolicy => "default_policy",
             Lint::SansIoCore => "sans_io_core",
             Lint::KeyIgnoresField => "key_ignores_field",
             Lint::WildcardArm => "wildcard_arm",
@@ -625,6 +630,7 @@ impl Lint {
             Lint::FixedKeyLookup => concat!(docs!(), "#fixed_key_lookup"),
             Lint::StructUpdate => concat!(docs!(), "#struct_update"),
             Lint::BoolParam => concat!(docs!(), "#bool_param"),
+            Lint::DefaultPolicy => concat!(docs!(), "#default_policy"),
             Lint::SansIoCore => concat!(docs!(), "#sans_io_core"),
             Lint::KeyIgnoresField => concat!(docs!(), "#key_ignores_field"),
             Lint::WildcardArm => concat!(docs!(), "#wildcard_arm"),
@@ -762,6 +768,9 @@ impl Lint {
             }
             Lint::BoolParam => {
                 "take a two-variant enum named for the choice instead of the `bool`, or say why it stays with `#[expect(blaze::bool_param, reason = \"..\")]`"
+            }
+            Lint::DefaultPolicy => {
+                "take the marked field as an argument of every constructor (a named `const` of the type is a value written at the call, not a default), or say why the type decides with `#[expect(blaze::default_policy, reason = \"..\")]`"
             }
             Lint::SansIoCore => {
                 "take what the call reads as a parameter (`advance_clock(now)`) and hand back decisions (`take_decisions`, `next_deadline`); a driver injects IO through a trait object or a type parameter the core takes. Or say why with `#[expect(blaze::sans_io_core, reason = \"..\")]`"
@@ -987,6 +996,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     if let Some(adt) = ast::Adt::cast(node) {
         error_debug::check_attrs(cx, adt);
         lenient_deserialize::check(cx, adt);
+        default_policy::check_adt(cx, adt);
         intern_candidate::check(cx, adt);
         boxed_recursive_node::check(cx, adt);
     }
@@ -1016,6 +1026,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     }
     if let Some(item) = ast::Impl::cast(node) {
         missing_size_hint::check(cx, item);
+        default_policy::check_impl(cx, item);
     }
     if let Some(record) = ast::RecordExpr::cast(node) {
         struct_update::check(cx, record);

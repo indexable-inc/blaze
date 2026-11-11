@@ -90,16 +90,20 @@ pub struct Limits {
     /// How long an abandoned value waits, on the driver's clock, for what it had in flight to
     /// end (a [`crate::pending::Pending`]'s op, a [`crate::task::Scope`]'s tasks) when a panic
     /// drops it: its abandonment path's bound.
+    #[blaze::policy]
     pub abandon_wait: Duration,
     /// The most polls in a row that bring nothing while the deadline has not passed, before
     /// the wait ends as [`Stopped::Stalled`]: a driver whose poll returns early this often
     /// does not keep its deadline.
+    #[blaze::policy]
     pub poll_fuel: u32,
     /// The most connections [`crate::net::Listener::close`] hangs up while it waits for the
     /// listen's end, before it stops waiting.
+    #[blaze::policy]
     pub close_most: usize,
     /// The most records the world's trace keeps; past it each further one is counted in
     /// [`Trace::dropped`].
+    #[blaze::policy]
     pub trace_most: usize,
 }
 
@@ -383,6 +387,7 @@ pub struct SimWorld {
     /// What its program is offered: [`Offers::ALL`] unless a test withholds some.
     pub offers: Offers,
     /// The bounds its waits, closes and trace end by.
+    #[blaze::policy]
     pub limits: Limits,
 }
 

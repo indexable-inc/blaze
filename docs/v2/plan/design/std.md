@@ -1079,8 +1079,8 @@ Lints the second rule implies:
 |---|---|---|
 | `blaze::nopanic`, `noalloc`, `nonblocking` | a marked function that reaches the effect | yes |
 | `blaze::linear` (the borrow check's `LINEAR`) | a `File<ReadWrite>`, `Buffered`, `Pending`, `Scope`, `Conn` left unfinished | yes |
-| `blaze::implicit_policy` | a public bstd function that reaches a cost its signature does not carry (below) | no: specified here, for the lints lane |
-| `blaze::default_policy` | `impl Default`, or a `new()` with no arguments, for a bstd type with a field marked as a cost or a guarantee | no |
+| `blaze::implicit_policy` | a public bstd function that reaches a cost its signature does not carry (below) | no: specified here. Not built with `default_policy` because the lints read no effect summary yet (`instance_effects` is the MIR walk's, with no query the lint pass can ask per function), and the `Sync` and `Write` kinds are not rows of `effect_attrs::ROWS` |
+| `blaze::default_policy` | `impl Default`, `#[derive(Default)]`, or a `new()` with no arguments, for a type with a field marked `#[blaze::policy]` (a cost or a guarantee) | yes: `crates/blaze-lints/src/blaze/default_policy.rs`, on in bstd; `Limits`, `SimWorld::limits`, `Wire` and `MemoLimit` are marked |
 | `.clippy.toml` bans of the removed names (`Dir::write`, `File::sync`, `File::replace`, `Conn::send`, `End::write`) | a use of one, by resolution | no: the names are gone from bstd, so the ban is for crates that move onto it (S3) |
 | compile-fail fixtures for bstd | `written.clone_to(..)`; a `Buffered` dropped; a write through a handle narrowed to read-only; a call of a removed name (`Dir::write`) | yes: `bstd_the_wrong_call_does_not_compile` in `crates/blaze-engine/tests/repro.rs` runs `blaze check` on each file of `crates/blaze-engine/tests/repro/bstd_the_wrong_call_does_not_compile/wrong`, beside a control that checks |
 
