@@ -128,4 +128,18 @@ generates neither the hashing nor the caching.
 
 See [docs/contributing.md#where-new-code-goes](../../../docs/contributing.md#where-new-code-goes).
 
+## own-the-language (rule 55)
+
+blaze has its own front end and its own pinned nightly, so the limits of stable Rust, and of rustc's
+unfinished features, are not blaze's limits. When a design is being bent around something the
+language cannot say (arithmetic on const generic arguments, a bound a parameter cannot state, a type
+the solver refuses), say so, and build the missing piece: finish the nightly feature in blaze's own
+front end where one exists (generic const expressions, specialization as blaze already has it), or
+add the smallest general primitive where none does (`library-over-language`), as an opt-in extension
+that changes no program that does not use it (`superset-of-rust`). Then use it in blaze's own code
+(`blaze-uses-its-extensions`). A workaround written because "stable const generics can't do that" is
+a subpar design to fix (`guard-the-cause`): the spec names the feature it needs and its ledger row.
+
+See [docs/v2/plan/design/edition.md](../../../docs/v2/plan/design/edition.md).
+
 <!-- End of the generated rules. Hand-written notes follow. -->
