@@ -19,8 +19,9 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 2. **blaze-builds-blaze**: Build, check, test, bench and release blaze only with blaze, never cargo,
    rustc or sccache, anywhere (dev loop, CI, harnesses, release); stage 0 is a blaze binary; when
    blaze fails on blaze, that failure is the work. Skill: `build-and-test`.
-3. **no-fallback**: No fallback, ever: when blaze can't do something it stops with an error naming what
-   and where. Skill: `runtime-code`.
+3. **no-fallback**: No fallback, ever, and failures are loud: when blaze can't do something it stops
+   with an error naming what and where; nothing is accepted and ignored, skipped quietly or answered
+   with an empty result. Skill: `runtime-code`.
 4. **superset-of-rust**: Every program the pinned nightly accepts, blaze accepts and runs correctly by
    Rust's semantics; rustc's own behavior is a reference, not the definition; blaze refuses only
    rustc soundness holes, and its extensions are opt-in. Skill: `compiler-correctness`.

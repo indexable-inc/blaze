@@ -13,7 +13,16 @@ No fallback, ever. When blaze can't do something it stops with an error naming w
 quietly takes another path (rustc, a full link or rebuild instead of a patch, a slower backend, an
 older cached result, a default guessed for a missing value). A fallback that only logs its reason is
 still a fallback. A change that touches an existing fallback turns it into an error, and a bench or
-test that hits one fails instead of timing the slow path.
+test that hits one fails instead of timing the slow path. The same holds for the quieter forms, in
+blaze, its tools and its scripts alike: a setting that is accepted and then does nothing (a
+profile's `strip` the linker never honours) is refused or said, by name, every build; a command that
+cannot answer says why instead of printing an empty table (a view that defaults to a build with no
+rows, a failed build with no error row); a step that failed stops the script instead of letting the
+next step run on stale output; a check that could not run is reported as not run, never as passed; a
+retry or a default is written down where it happens with what it replaced. A loud error is the good
+outcome: it names the one broken step, costs minutes and gets fixed; the quiet path costs days and
+is found by accident. When you meet a quiet failure, make it loud in the same change
+(`guard-the-cause`).
 
 ## standard-structures (rule 12)
 
