@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-75 theorems: 62 in `lean`, 13 in `lean/analysis`.
+76 theorems: 63 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -606,6 +606,18 @@ theorem validateWith_sound_frameZero (a b : Program) (w : List Rewrite)
     (args : List Value) (hz : FrameZero base args) (r : Outcome Value)
     (hr : a.call n id base args = r) (hd : r ≠ Outcome.diverge)
     (hu : ∀ (why : Undefined), r ≠ Outcome.undefined why) : b.call n id base args = r
+```
+
+**`Blaze.Mir.evalRvalue_sym`** (`Blaze.Mir.Opt.Sym`, `lean`): An rvalue of the scalar, move-free subset evaluates to the value of its symbolic expression over the block's initial locals, and leaves the state as it was.
+
+```lean
+theorem evalRvalue_sym {st0 : State} {σ : List (Local × Expr)} {st : State}
+    (adts : List AdtDecl) (h : Reads st0 σ st) :
+    ∀ (rv : Rvalue) (e : Expr), symRvalue σ rv = some e →
+      evalRvalue adts st rv = Outcome.map (fun v => (v, st)) (e.eval st0)
+  | Rvalue.use o, e, hs => evalOperand_sym h o e hs
+  | Rvalue.binary op a b, e, hs => by
+    have ⟨ea, eb, ha, hb, he⟩
 ```
 
 **`Blaze.Mir.Opt.simplifyCfg_call`** (`Blaze.Mir.Opt.SimplifyCfg`, `lean`): SimplifyCfg composed from the proved passes keeps every call that ends, and not in undefined behaviour: the same outcome with the same fuel.

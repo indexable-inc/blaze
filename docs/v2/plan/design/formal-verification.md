@@ -735,7 +735,13 @@ programs; it is the specification of the Rust pass of the same name.
   `removeOverwritten` is a rewrite too, proved for the calls whose caller hands over
   pointers into frame 0 only (`FrameZero`): `validateWith_sound` is for scripts without it
   (`allPlain`), `validateWith_sound_frameZero` for any script and those calls.
-  **Not written: the validator by symbolic execution**, which needs no script and accepts
+  **The validator by symbolic execution, first piece** (`Opt/Sym.lean`; not yet
+  elaborated): `Expr`, what a local holds as a function of the locals when its block began,
+  with `Expr.eval`; a symbolic store, and `Reads` (the state agrees with it);
+  `evalRvalue_sym`: an rvalue of the subset (`use`, `binary`, `checked`, `withOverflow`,
+  `unary`, `cast` on constants and copies of whole locals: no move, no projection, no
+  `ref`) evaluates to the value of its expression and leaves the state.
+  **Not written: the rest of it**, which needs no script and accepts
   rewrites nobody proved one by one (copy propagation, local renumbering, reordering of
   independent statements). It needs an expression language whose evaluation is proved to
   agree with `evalRvalue`, each block run on symbolic locals to a normal form (stores of

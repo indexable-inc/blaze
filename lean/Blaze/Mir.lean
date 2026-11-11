@@ -30,6 +30,7 @@ import Blaze.Mir.Opt.SlotAlgebra
 import Blaze.Mir.Opt.SlotExec
 import Blaze.Mir.Opt.RemoveOverwritten
 import Blaze.Mir.Opt.Witness
+import Blaze.Mir.Opt.Sym
 import Blaze.Mir.Opt.RemoveNops
 import Blaze.Mir.Opt.ConstFold
 import Blaze.Mir.Opt.Validate
