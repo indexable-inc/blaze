@@ -121,11 +121,11 @@ pub(crate) fn before_abort(cx: &Cx<'_, '_>, codegen: bool) -> Vec<Found> {
 
 /// The passes of [`before_abort`] that run in the crate (`runs`), over the one body `b`, in
 /// rustc's order: what they find is appended to `found`.
-fn early(
-    b: &mut BodyCx<'_, '_, '_>,
+fn early<'db>(
+    b: &mut BodyCx<'_, '_, 'db>,
     runs: Runs,
     codegen: bool,
-    pool: &mut liveness::Pool,
+    pool: &mut liveness::Pool<'db>,
     found: &mut Vec<Found>,
 ) {
     b.elaborated = codegen || b.is_const_context();

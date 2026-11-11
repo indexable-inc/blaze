@@ -850,6 +850,7 @@ dependencies = [
  "stdx",
  "syntax",
  "tt",
+ "tracing",
  "unicode-ident",
  "unicode-normalization",
  "unicode-security",
