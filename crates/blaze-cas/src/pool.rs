@@ -35,7 +35,12 @@
 //!
 //! Proof: `pool/tests.rs`, a deterministic simulation test of the real word, reading, loads
 //! core, sweep, append and prefetch under `blaze_core::sim::Sim`, with planted bugs 1 to 6, 8
-//! and 9 of the design's section 7 and a tenth of this module's ([`Plant`]).
+//! and 9 of the design's section 7 and three more of this module's ([`Plant`]).
+//!
+//! The store reads its packs through it (`crate::hot`, `crate::read`): a read pins the pages
+//! of what it reads, the pins kept by the readers' table until the store lets it go, and the
+//! pool's resident bytes are held to `Tag::Pool`'s budget by the sweep a load runs first
+//! ([`evict::Sweep::make_room`]); what moved through it is counted in [`counts`].
 
 use std::{
     cell::Cell,
@@ -51,6 +56,7 @@ use blaze_ids::ContentId;
 use blaze_mem::{MemError, Region};
 
 pub(crate) mod append;
+pub(crate) mod counts;
 pub(crate) mod drive;
 pub(crate) mod evict;
 pub(crate) mod loads;
@@ -289,6 +295,13 @@ pub(crate) enum Plant {
     /// 10 (not in the design's list): a load's block checks stop at the first block that fails,
     /// so a later page of the same read with a rotted block is published and served.
     FirstBadBlock,
+    /// 11: a reader that finds a page another asker is loading claims it too and loads it
+    /// again, so two reads into one page are in flight at once and the one that lands last
+    /// is what is served, whatever the other read.
+    DoubleClaim,
+    /// 12: a prefetch is issued without its pages being charged to the prefetch budget, so
+    /// a plan reads ahead past what the pool may hold unread.
+    PrefetchUncharged,
 }
 
 // --- Counting prefetched pages -------------------------------------------------------------------
@@ -578,7 +591,9 @@ impl<G: Give> Pool<G> {
     pub(crate) fn claim(&self, page: u64, slot: u16) -> Result<(), Word> {
         let word = self.word(page);
         let seen = Word(word.load(Ordering::Acquire));
-        if seen.state() != State::Unloaded {
+        // One load a page: a page another asker is loading is waited on, never claimed.
+        let taken = seen.state() == State::Loading && self.planted(Plant::DoubleClaim);
+        if seen.state() != State::Unloaded && !taken {
             return Err(seen);
         }
         let next = Word::loading(seen.version(), slot);
@@ -1476,7 +1491,14 @@ impl Reading {
             };
             match word.state() {
                 State::Loaded => continue,
-                State::Unloaded => {
+                State::Loading if !pool.planted(Plant::DoubleClaim) => {
+                    let slot = word.slot();
+                    if loads::prefetch_slot(slot) {
+                        self.late = Some(page);
+                    }
+                    return self.waited(pool, page, ReadStep::Wait { page, slot });
+                }
+                State::Unloaded | State::Loading => {
                     let Some(slot) = self.slot else { return ReadStep::NeedSlot };
                     let mut claimed = 0u32;
                     while self.pinned + claimed < self.run.pages
@@ -1501,13 +1523,6 @@ impl Reading {
                     }
                     self.asked = Some(Asked { from: self.pinned, pages: claimed, ended: None });
                     return ReadStep::Ask(Load { slot, first: page, pages: claimed });
-                }
-                State::Loading => {
-                    let slot = word.slot();
-                    if loads::prefetch_slot(slot) {
-                        self.late = Some(page);
-                    }
-                    return self.waited(pool, page, ReadStep::Wait { page, slot });
                 }
                 State::Evicting => return self.waited(pool, page, ReadStep::Spin { page }),
                 State::Corrupt => return self.fail(pool, PoolError::Corrupt { page }),
