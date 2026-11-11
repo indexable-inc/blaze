@@ -160,8 +160,10 @@ impl<S: Stable> Placer<S> {
     }
 
     /// Starts placing `bytes`, an image [`crate::Builder`] made; the units are compared on
-    /// `jobs`. Its end is told by [`Placer::complete`].
-    pub fn place(&mut self, bytes: Vec<u8>, jobs: crate::Jobs<'_>, effects: &mut Vec<Effect>) {
+    /// `jobs`. Its end is told by [`Placer::complete`]. This crate's own: outside it an image
+    /// reaches its file only through [`crate::Txn::commit`], so every write of the file has a
+    /// transaction that began it.
+    pub(crate) fn place(&mut self, bytes: Vec<u8>, jobs: crate::Jobs<'_>, effects: &mut Vec<Effect>) {
         assert!(self.job.is_none(), "an image placed while another is");
         let len = bytes.len() as u64;
         let mut job = Job {

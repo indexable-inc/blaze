@@ -39,7 +39,7 @@ use std::{
 use blaze_core::{Completion, Done, Effect, FileName, IoError, Mapping, Tag};
 use blaze_history::{DecodeError, History, section::HistoryError};
 use blaze_image::{
-    Builder, Corrupt, Image, OpenError, Refused, SectionId, Stable, TooLarge,
+    Corrupt, Image, OpenError, Refused, SectionId, Stable, TooLarge, Txn,
     place::{Outcome, Placer, Wrote},
 };
 use blaze_query::{Database, DbError};
@@ -338,10 +338,13 @@ impl Images {
         let _span =
             tracing::info_span!(target: "blaze", "image make", bytes = tracing::field::Empty)
                 .entered();
-        let mut builder = Builder::new();
-        let mark = match parts.vfs.write_image(&mut builder) {
+        // The image as a transaction (`blaze_image::Txn`, linear): every way out of here
+        // commits it to the placer or aborts it, or this does not compile.
+        let mut txn = Txn::begin();
+        let mark = match parts.vfs.write_image(txn.sections()) {
             Ok(mark) => mark,
             Err(ImageError::Busy) => {
+                txn.abort();
                 let before = parts.effects.len();
                 parts.vfs.flush(parts.effects);
                 if idle && parts.effects.len() == before {
@@ -350,13 +353,17 @@ impl Images {
                 self.state = State::Waiting;
                 return;
             }
-            Err(ImageError::Corrupt(corrupt)) => return self.fail(Unmade::Vfs(corrupt)),
+            Err(ImageError::Corrupt(corrupt)) => {
+                txn.abort();
+                return self.fail(Unmade::Vfs(corrupt));
+            }
         };
         let mut live = intern::Live::new();
-        if let Err(error) = parts.db.write_image(&mut builder, &mut live) {
+        if let Err(error) = parts.db.write_image(txn.sections(), &mut live) {
+            txn.abort();
             return self.fail(Unmade::Db(error));
         }
-        blaze_history::section::write(parts.predict, &mut builder);
+        blaze_history::section::write(parts.predict, txn.sections());
         if let Some(front) = parts.front {
             if let Some(failed) = front.trees().and_then(|it| it.failed()) {
                 tracing::warn!(
@@ -367,20 +374,18 @@ impl Images {
             // alloc: the section, once an image.
             let mut trees = Vec::new();
             base_db::trees::write_section(front, &mut trees);
-            builder.add(SectionId::SYNTAX_TREES, base_db::trees::SCHEMA, &trees);
+            txn.sections().add(SectionId::SYNTAX_TREES, base_db::trees::SCHEMA, &trees);
         }
-        intern::write_symbols(&live, &mut builder);
-        match builder.finish_on(&on_pool) {
-            Ok(bytes) => {
-                _span.record("bytes", bytes.len());
-                let len = bytes.len();
-                self.placer.place(bytes, &on_pool, parts.effects);
+        intern::write_symbols(&live, txn.sections());
+        match txn.commit(&mut self.placer, &on_pool, parts.effects) {
+            Ok(asked) => {
+                _span.record("bytes", asked.len);
                 self.made += 1;
                 self.state = State::Writing {
                     mark,
                     made: began.elapsed(),
                     since: Instant::now(),
-                    bytes: len,
+                    bytes: asked.len,
                 };
             }
             Err(error) => self.fail(Unmade::TooLarge(error)),
@@ -532,6 +537,7 @@ mod tests {
 
     use blaze_format::SchemaHash;
     use blaze_history::section::SCHEMA as HISTORY;
+    use blaze_image::Builder;
 
     use super::*;
 
@@ -627,6 +633,7 @@ mod tests {
 #[cfg(test)]
 mod shape_tests {
     use blaze_format::SchemaHash;
+    use blaze_image::Builder;
 
     use super::*;
 

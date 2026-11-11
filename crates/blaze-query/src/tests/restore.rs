@@ -17,6 +17,7 @@ use blaze_core::{
     wait::Deadline,
 };
 use blaze_image::{
+    Txn,
     place::{Outcome, Placer, Plant as PlacePlant},
     serial,
 };
@@ -203,15 +204,29 @@ fn restores_as_the_model_says(ops: &[Op], seed: u64, rot: u64, plant: Plant) -> 
                 }
             }
             Op::Image { stop, settles } => {
-                let (bytes, _) = {
-                    let mut builder = Builder::new();
-                    let mut live = Live::new();
-                    db.write_image(&mut builder, &mut live)
-                        .map_err(|error| format!("step {at}: no image was made: {error}"))?;
-                    (builder.finish().expect("a small image"), live)
-                };
+                // The image through its transaction, as the daemon makes it
+                // (`blaze_image::Txn`); `bytes` are the same database's image written beside
+                // it, to hold the file to.
+                let mut txn = Txn::begin();
+                let mut live = Live::new();
+                if let Err(error) = db.write_image(txn.sections(), &mut live) {
+                    txn.abort();
+                    return Err(format!("step {at}: no image was made: {error}"));
+                }
+                let (bytes, _) = image_of(&db, Builder::new());
                 let mut effects = Vec::new();
-                placing.place(bytes.clone(), &serial, &mut effects);
+                let asked = match txn.commit(&mut placing, &serial, &mut effects) {
+                    Ok(asked) => asked,
+                    Err(error) => return Err(format!("step {at}: no image was made: {error}")),
+                };
+                if asked.len != bytes.len() {
+                    return Err(format!(
+                        "step {at}: the image committed is {} bytes and the same database's \
+                         image {}",
+                        asked.len,
+                        bytes.len()
+                    ));
+                }
                 let (mut handled, mut outcome, mut crashed) = (0usize, None, false);
                 while outcome.is_none() {
                     if stop == Stop::Crash(handled as u8) {
@@ -406,4 +421,73 @@ fn the_oracle_catches_an_image_committed_before_its_bytes_are_durable() {
         .find_map(|seed| restores_as_the_model_says(&directed, seed, 0, Plant::NoSync).err());
     let why = caught.expect("the oracle missed the planted rename without its sync");
     assert!(why.contains("neither the image before it nor the one placed"), "{why}");
+}
+
+/// [`Double`]'s kind as the next blaze computes it: three times [`Len`], by other code, which
+/// its producer says.
+struct DoubleNext;
+
+impl Query for DoubleNext {
+    const KIND: QueryKind = Double::KIND;
+    const NAME: &'static str = "double, the next blaze's";
+    const PRODUCER: ContentId = ContentId([0x92; 32]);
+    type Key = String;
+    type Value = Num;
+    fn input(key: &String) -> ContentId {
+        key_id(key)
+    }
+    fn execute(cx: &mut Cx<'_>, key: &String) -> Result<Num, Cancelled> {
+        Ok(Num(cx.get::<Len>(key)?.wrapping_mul(3)))
+    }
+}
+
+/// [`DoubleNext`]'s code under [`Double`]'s producer: code changed with its producer left as
+/// it was, which a producer written by hand allows.
+struct DoubleUnsaid;
+
+impl Query for DoubleUnsaid {
+    const KIND: QueryKind = Double::KIND;
+    const NAME: &'static str = "double, changed and unsaid";
+    const PRODUCER: ContentId = Double::PRODUCER;
+    type Key = String;
+    type Value = Num;
+    fn input(key: &String) -> ContentId {
+        key_id(key)
+    }
+    fn execute(cx: &mut Cx<'_>, key: &String) -> Result<Num, Cancelled> {
+        Ok(Num(cx.get::<Len>(key)?.wrapping_mul(3)))
+    }
+}
+
+/// What a blaze whose `Double` is `Q` answers for file `a` of three bytes, started on the
+/// image a blaze whose `Double` is [`Double`] left after answering the same.
+fn next_blaze_answers<Q: Query<Key = String, Value = Num>>() -> u64 {
+    let (db, tree) = setup();
+    let one = view(&db, &tree, &[("a", "abc")]);
+    assert_eq!(double(&db, one, "a"), 6);
+    let (bytes, _) = image_of(&db, Builder::new());
+    let mut next = Database::open_image(config(&tree), opened(&bytes)).expect("its own layout");
+    next.register::<Len>();
+    next.register::<Q>();
+    let same = view(&next, &tree, &[("a", "abc")]);
+    next.pin().get::<Q>(same, &"a".to_owned()).expect("an answer")
+}
+
+/// The invariant: a memo is the result of the code that made it and of no other (version
+/// skew, two builds of one query over one image): a blaze whose query has another producer
+/// restores the image and runs the query, never reading the older code's value as its own.
+#[test]
+fn a_memo_made_by_other_code_is_never_read_as_this_codes() {
+    assert_eq!(next_blaze_answers::<DoubleNext>(), 9);
+}
+
+/// The planted-bug control: the code changed and its producer did not. The restored memo is
+/// then the older code's value under the newer code's name, which the oracle sees as 6 where
+/// the code gives 9. What rules it out is a producer derived from the code
+/// (`fn_info(&f).code_id`, rule cache-by-code-id), not one written by hand
+/// (docs/v2/plan/design/restore.md, ledger row R6).
+#[test]
+fn the_oracle_catches_code_changed_under_one_producer() {
+    assert_eq!(next_blaze_answers::<DoubleUnsaid>(), 6, "the stale value is served: the plant");
+    assert_ne!(next_blaze_answers::<DoubleUnsaid>(), next_blaze_answers::<DoubleNext>());
 }

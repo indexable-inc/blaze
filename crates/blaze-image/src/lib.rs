@@ -41,6 +41,7 @@ mod image;
 pub mod place;
 mod raw;
 mod spine;
+mod txn;
 
 #[cfg(test)]
 mod tests;
@@ -58,6 +59,7 @@ use blaze_ids::ContentId;
 pub use crate::build::{Builder, SectionWriter, TooLarge};
 pub use crate::image::{Image, Stable};
 pub use crate::raw::{bytes_of, cast};
+pub use crate::txn::{Asked, Txn};
 pub use blaze_ids::crc32c::crc32c;
 
 /// How a whole-image pass (CRCs at write, a section checked whole at restore) spreads its work:
