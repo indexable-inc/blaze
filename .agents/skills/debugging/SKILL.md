@@ -16,6 +16,20 @@ memory, admission waits, spans and reruns, in `<BLAZE_HOME>/v2/profile/*.parquet
 showed it, and quotes the rows. A guess or a fresh experiment comes only after the rows can't
 answer, and then the gap gets a span or counter.
 
+## claims-from-evidence (rule 61)
+
+A statement of fact to a person (why something is slow, what dominates a build, what a function
+does, that something works, passes, is merged or is running) rests on evidence from this session:
+the rows of a query, a command's output, a test's result, the lines of code read. Quote or name that
+evidence beside the claim. What you have not looked at is said as such: "not measured", "I have not
+checked", or "my guess, unverified:", and a guess is followed by the check that would settle it, run
+before the next claim builds on it. Never turn a prior about how such systems usually behave (Rust
+release builds are LLVM-bound, a daemon restart loses state, this error usually means that) or a
+label on a status line (a task kind named `codegen` is not LLVM) into a sentence in the indicative.
+A number has its source and its tree (`measure-the-exact-tree`); a why has its rows
+(`ask-the-profile-first`); a works has its command and exit status. When the evidence is lost or the
+tool could not run, say that, not the conclusion you expected.
+
 <!-- End of the generated rules. Hand-written notes follow. -->
 
 Every `blaze serve` daemon keeps a profile history: Parquet files that say what each build
