@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-68 theorems: 55 in `lean`, 13 in `lean/analysis`.
+69 theorems: 56 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -536,6 +536,20 @@ theorem State.write_setSlot_other (st : State) (p q : Pointer) (slot : Slot) (v 
 ```lean
 theorem State.write_setSlot_same (st : State) (f l : Nat) (slot : Slot) (v : Value) :
     (st.setSlot { frame
+```
+
+**`Blaze.Mir.execStmt_put`** (`Blaze.Mir.Opt.SlotExec`, `lean`): A statement that does not mention a local its function does not borrow does the same whatever that local's slot holds.
+
+```lean
+theorem execStmt_put {B : FnId → Local → Prop} {g : List (Nat × FnId)} {f l : Nat}
+    (adts : List AdtDecl) {st : State} (h : Hides B g f l st) (sl : Slot) (fn : FnId)
+    (hfn : st.topFn = fn) :
+    ∀ (s : Statement), StmtFine B fn s → stmtFine l s = true →
+      execStmt adts (st.put f l sl) s =
+        Outcome.map (fun x => State.put x f l sl) (execStmt adts st s)
+  | Statement.assign p rv, hB, hfine =>
+    Outcome.bind_commutes_map (evalRvalue_put adts h sl rv (and_true_right hfine)) (fun r hr =>
+      have hr2 : Hides B g f l r.2
 ```
 
 **`Blaze.Mir.Opt.simplifyCfg_call`** (`Blaze.Mir.Opt.SimplifyCfg`, `lean`): SimplifyCfg composed from the proved passes keeps every call that ends, and not in undefined behaviour: the same outcome with the same fuel.

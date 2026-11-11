@@ -695,7 +695,12 @@ programs; it is the specification of the Rust pass of the same name.
     with a map (the one is the other with that slot replaced), so the proof computes with
     replacements: two of different slots commute (`State.setSlot_comm`), a write elsewhere
     commutes with one (`State.write_setSlot_other`), and a write of the whole slot forgets
-    it (`State.write_setSlot_same`). The rest is below.
+    it (`State.write_setSlot_same`).
+  - **Dead-store elimination: fifth piece, second part** (`Opt/SlotExec.lean`; not yet
+    elaborated). When a slot is the running frame's, of a local its function does not
+    borrow, a statement that mentions the local neither as a place's base nor as an index
+    does the same whatever the slot holds (`execStmt_put`), through every function of
+    `Step.lean` up to `execStmt`. The rest is below.
   - **Dead-store elimination: what is not written.** It needs a relation, not a map: two states
     equal but on dead locals. The Rust pass (`optimize/dse.rs`) removes the whole assignment
     of an rvalue it holds to be free of effects (all but a pointer-to-address cast), to a

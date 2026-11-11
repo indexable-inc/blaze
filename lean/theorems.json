@@ -58,6 +58,7 @@
     {"name": "Blaze.Mir.State.setSlot_comm", "package": "core", "module": "Blaze.Mir.Opt.SlotAlgebra", "says": "Replacements of two different slots commute.", "row": "V8"},
     {"name": "Blaze.Mir.State.write_setSlot_other", "package": "core", "module": "Blaze.Mir.Opt.SlotAlgebra", "says": "A write to another slot commutes with the replacement of a slot.", "row": "V8"},
     {"name": "Blaze.Mir.State.write_setSlot_same", "package": "core", "module": "Blaze.Mir.Opt.SlotAlgebra", "says": "A write of a whole slot gives the same state whatever the slot was replaced by before.", "row": "V8"},
+    {"name": "Blaze.Mir.execStmt_put", "package": "core", "module": "Blaze.Mir.Opt.SlotExec", "says": "A statement that does not mention a local its function does not borrow does the same whatever that local's slot holds.", "row": "V8"},
     {"name": "Blaze.Mir.Opt.simplifyCfg_call", "package": "core", "module": "Blaze.Mir.Opt.SimplifyCfg", "says": "SimplifyCfg composed from the proved passes keeps every call that ends, and not in undefined behaviour: the same outcome with the same fuel.", "row": "V8"},
     {"name": "BlazeDiff.diff_correct", "package": "analysis", "module": "BlazeDiff.Correct", "says": "The meaning of diff c x e is the derivative of the meaning of e in variable x, wherever every node is inside its rule's domain.", "row": "V10"},
     {"name": "BlazeDiff.gradient_correct", "package": "analysis", "module": "BlazeDiff.Correct", "says": "Each entry of the gradient is the partial derivative in its variable.", "row": "V10"},
