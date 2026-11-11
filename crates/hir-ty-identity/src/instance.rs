@@ -15,7 +15,8 @@
 //!   `DropAndReplace`'s) is kept as the generic body has it.
 //!
 //! The identity holds the body's item key and code hash ([`blaze_items`]: each item it refers
-//! to by interface, never a position or a path), the code of each body inlined into it, and,
+//! to by interface, never a position or a path), the code of each body inlined into it, each
+//! fact of another item its passes relied on (`Inlined::relied`), and,
 //! where a type or constant of the generic body names a parameter, what an instance has in its
 //! place:
 //!
@@ -618,7 +619,8 @@ pub(crate) fn sites(db: &Db, subject: Subject, options: MirOptions) -> Result<Si
 /// The code of every body MIR inlining built into `body`, in the order it inlined them: which
 /// body ([`code`]: its code hash, its bindings' names and its span-table indices) and whether
 /// its arithmetic is checked. A callee's body edit changes it only where it was inlined: a
-/// plain call names its callee by interface. What the inlined code does with an instance's
+/// plain call names its callee by interface, and by each fact of it a pass relied on
+/// (`Inlined::relied`), hashed after the callees. What the inlined code does with an instance's
 /// arguments is in the body's sites, as the rest of it is; which instance of the callee it is,
 /// the unit's template key holds (`Described::built_in`).
 fn inlined_code(db: &Db, body: &MirBody<'_>) -> Result<ContentId, Unshared> {
@@ -631,6 +633,15 @@ fn inlined_code(db: &Db, body: &MirBody<'_>) -> Result<ContentId, Unshared> {
             InlinedBody::Closure(it) => (tag::DEF_CLOSURE, code::of_closure(db, it)),
         };
         h.update(&[tag, callee.written_checked as u8]).id(code.as_ref().map_err(Clone::clone)?);
+    }
+    // The facts of other items the body's passes relied on (`Inlined::relied`,
+    // docs/v2/plan/design/facts.md), in the order first relied on: the body is the code
+    // they changed. A fact the body did not rely on is not here, so proving more of a
+    // callee, or less of what no pass spent, changes no identity.
+    let relied = &body.inlined.relied;
+    h.update(&(relied.len() as u64).to_le_bytes());
+    for digest in relied {
+        h.update(digest);
     }
     Ok(h.finish())
 }

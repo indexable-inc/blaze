@@ -3,6 +3,7 @@
 
 mod apply;
 mod effects;
+mod facts;
 mod fixture;
 mod fns;
 mod models;

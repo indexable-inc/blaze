@@ -233,7 +233,7 @@ pub fn fn_memory(db: &Db, krate: Crate, body: Body, args: StoredGenericArgs) -> 
 }
 
 /// The environment and arguments of `func` as defined: its where-clauses, its own parameters.
-fn generic(db: &Db, func: FunctionId) -> (StoredParamEnvAndCrate, StoredGenericArgs) {
+pub(crate) fn generic(db: &Db, func: FunctionId) -> (StoredParamEnvAndCrate, StoredGenericArgs) {
     let krate = func.krate(db);
     let param_env = db.trait_environment(func.into());
     let interner = hir_ty::next_solver::DbInterner::new_with(db, krate);
