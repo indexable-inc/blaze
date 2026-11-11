@@ -292,6 +292,10 @@ pub mod reflect;
 // changes).
 #[unstable(feature = "blaze_verify", issue = "none")]
 pub mod blaze;
+// blaze's additions to `core::simd`, re-exported there (`library/UPSTREAM` lists it among blaze's
+// changes).
+#[unstable(feature = "blaze_simd", issue = "none")]
+mod blaze_simd;
 pub mod index;
 pub mod marker;
 pub mod ops;
@@ -402,6 +406,10 @@ pub mod simd {
 
     #[unstable(feature = "portable_simd", issue = "86656")]
     pub use crate::core_simd::simd::*;
+
+    // blaze's: the lanes of the widest vector the calling crate is compiled for.
+    #[unstable(feature = "blaze_simd", issue = "none")]
+    pub use crate::blaze_simd::native_lanes;
 }
 
 // Include private modules that exist solely to provide rustdoc
