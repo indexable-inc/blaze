@@ -749,6 +749,17 @@ typed fields (`event_values`). A link refused for
 reach or room (`OutOfReach`, `NoRoom`, a field a value does not fit) shows the same regions in
 its message, the reach's two ends marked.
 
+**A build script's run, as events.** As a build script's run ends the daemon writes what its
+trace saw as INFO events of the target `blaze` (`crates/blaze-cargo/src/serve/unit/script/said.rs`),
+which `blaze explain script UNIT [--json]` reads, joined with the run's `processes` row:
+`script run traced` (fields `unit`, `program`, how many `files`, `dirs` and `env` it read, what
+of it was `untraceable`, how many `calls` and `execs` were described, and the names read as
+`files_named`, `dirs_named`, `env_named`); a `script call` for each untraceable call and each
+program started that the sandbox's supervisor described (`unit`, `what`, `pid`, `inside_pid`,
+`program`, `argv0`, `syscall`, `number`, `phase`, `before_main` (a heuristic, said as one),
+`ip`, `module`, `module_kind`); and `script calls not described` with how many `more` there
+were past the bound of 32 a run.
+
 ### `errors`: one row an error a build said: a diagnostic of level error, or each function a refused-functions error names
 
 | column | type | |

@@ -246,11 +246,21 @@ What is specified and not built, in the order to build it:
 `harness/v2/loop_syscalls.py` (strace) stays as the cross-check from outside: a system call no
 driver times and no sample caught is only there.
 
-## m. Agent-readable everything
+## m. Agent-readable everything (built, with two said exceptions)
 
-Each command above takes `--json`: a view's rows as JSON lines with the view's columns; a
-report (`blaze slow`, `blaze why`, `blaze doctor`, `blaze bench edits`) as one object with a
-`version`. The views are served by the daemon's socket API as they are to the CLI.
+| command | `--json` | over the daemon's socket |
+|---|---|---|
+| `blaze explain problems`, `timeline`, `long_spans`, `waits_by_reason`, `counts_by_cause`, `writes`, `scripts`, `pool`, `kept`, `syscalls` | JSON lines, an object a row, the view's columns | the explorer's `views` and `view` ops (`explore-wire.md`): each is a named view of `views::VIEWS` |
+| `blaze debug syscalls` | as its view | as its view |
+| `blaze debug schema`, `DESCRIBE`, `SHOW TABLES` | JSON lines: `kind`, `table`, `name`, `ty`, `says` | no: it is the client's own schema, and needs no daemon |
+| `blaze slow` | one object, `version` 9: `problems`, `findings`, `gaps`, `blind_spots` | no: it reads the history's files through DuckDB in the client, as before |
+| `blaze why` | the daemon's `Rebuilt`, with `problems` (or `problems_unread` saying why) | `Request::Rebuilt` |
+| `blaze explain script UNIT` | one object | its events and `processes` row are in the history, read as any view's rows |
+| `blaze debug edits` | one object, `version` 1 | no: it runs builds from the client |
+| `blaze doctor` | one object | no, on purpose: it is for when no daemon starts |
+
+Text output is for people: the first line is the answer, and each command names the next one
+to run.
 
 ## n. The skill
 
