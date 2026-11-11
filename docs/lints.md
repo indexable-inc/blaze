@@ -903,6 +903,41 @@ says how much of the profile the function is.
 **Allowing it.** `#[allow(blaze::profile_hot)]` on the function or module, or `profile_hot =
 "allow"` in `[workspace.metadata.blaze.lints]`, keeps the hot lints at their own levels.
 
+## `program_lifetime`, `could_be_program_lifetime`, `could_be_ref32`
+
+In `blaze::edition`. `program_lifetime` is `deny` where it fires (only on a type declared
+`#[blaze::program_lifetime]`); the other two are allowed by default. Design:
+[facts](v2/plan/design/facts.md).
+
+**What they catch.**
+
+- `program_lifetime`: a type declared `#[blaze::program_lifetime]` (its instances live until
+  the program exits) that cannot be: it has a parameter or a `Drop`; a field holds a value with
+  a `Drop`, borrows for less than `'static`, or is a type the check can't see into (the finding
+  names the field path and the rule); it is `pub` and exported in a crate without
+  `#![blaze::program_lifetime]` at its root; or a record literal of it is built anywhere but as
+  the argument of `blaze_mem::ProgramArena::alloc`, of `Box::leak(Box::new(..))`, or in a
+  `static`'s initializer. Tuple-struct constructors are not followed yet.
+- `could_be_program_lifetime`: a private struct with named fields, no `Drop` and nothing in it
+  that drops or borrows, whose every record literal in the crate is leaked or is in the
+  initializer of a `static` that holds no cell, lock or atomic. The finding says where the first
+  is kept, how many `Arc`/`Rc` clones of it the crate makes, and the gain. Silent for anything it
+  cannot follow: a value bound to a local, returned, passed to another call or put in a table at
+  run time; tuple structs, enums and unions; public types unless the crate opts in. No fix.
+- `could_be_ref32`: a field of a struct stored many times (the element of a collection in the
+  crate, or itself program-lifetime) that holds a `#[blaze::program_lifetime]` type as
+  `&'static T`, `Arc<T>`, `Rc<T>` or `Box<T>`, directly or as the element of the field's
+  collection or `Option`. Never a local, a parameter or a return.
+
+**Why.** A `blaze_mem::Ref32<T>` is 4 bytes, `Copy`, and derefs to `&'static T`;
+`Option<Ref32<T>>` is 4 bytes too. A `&'static T` or a `Box<T>` is 8, and an `Arc<T>` is 8 with
+two counts beside the value and a write for every clone.
+
+**Fix.** `could_be_ref32` is machine-applicable for a private, plain `&'static T` field that
+nothing assigns after the struct is built, no pattern takes apart, and every record literal
+writes as `r.get()` of a `Ref32<T>`: the field becomes `blaze_mem::Ref32<T>`, each literal
+writes `r`, and each read `s.f` becomes `s.f.get()`. The other two have none.
+
 ## `push_without_reserve`
 
 **What it catches.** A `Vec` or `String` made empty (`new()`, `default()`, `vec![]`) whose next

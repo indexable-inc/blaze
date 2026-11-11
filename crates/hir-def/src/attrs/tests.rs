@@ -2327,7 +2327,7 @@ fn an_effect_attribute_changes_no_signature() {
 /// Every flag is one bit and no two flags share one. Lanes that each take "the next bit" on
 /// their own branch collide only when they merge (2026-11-10: three did), and two flags on
 /// one bit read as each other with no error anywhere; this fails the merge instead, naming
-/// both. A new flag takes a bit `free_attr_flag_bits` lists.
+/// both. A new flag takes a bit no flag of the block has.
 #[test]
 fn no_two_attr_flags_share_a_bit() {
     let mut owner: [Option<&str>; 128] = [None; 128];

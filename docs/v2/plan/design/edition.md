@@ -174,6 +174,9 @@ is an error. Where a mechanical fix exists, `blaze check --fix` applies it.
 | `blaze::undeclared_effect` | a function that may panic, allocate from the global heap, block or not return where its `#[blaze::may(..)]`, its trait method's, a module's default or the gate (`#![blaze::effects]`, which the edition turns on) does not allow it ([effects](effects.md)); `deny` wherever something is declared | writes the list with the missing words: under the gate, `#[blaze::may(..)]` with exactly the inferred effects on every function that needs one |
 | `blaze::unneeded_effect` | a word of a private function's list for an effect it is proved not to have | takes the word off |
 | `blaze::negative_effect` | `#[blaze::nopanic]`, `#[blaze::noalloc]`, `#[blaze::nonblocking]` where effects are declared positively | rewrites to the `#[blaze::may(..)]` they stand for |
+| `blaze::program_lifetime` | a type declared `#[blaze::program_lifetime]` whose instances could not all live until exit ([facts](facts.md)); `deny` wherever the attribute is | none |
+| `blaze::could_be_program_lifetime` | a private struct with no `Drop` whose every instance is leaked or built into a `static` | none: names where instances are kept and the gain |
+| `blaze::could_be_ref32` | a field of a holder stored many times that holds a program-lifetime type by `&'static`, `Arc`, `Rc` or `Box` | the field becomes `Ref32<T>` when it is a private `&'static T` every literal writes from a `Ref32` |
 | `blaze::derivable_by_reflection` | a derive that reflection covers (once change 9 exists) | none at first |
 
 The first three need nothing new and are built first. `lossy_as` is one lint with one message in

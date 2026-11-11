@@ -13,7 +13,7 @@ remembered. How rows are picked, worked and landed is
 `harness/v2/ledger.py`. A check in *italics* is not written yet, and writing it is the first
 part of the work. `?` is not measured; "last known" is a lead, not a status.
 
-94 objectives: 0 met, 0 open, 0 blocked, 94 not measured.
+97 objectives: 0 met, 0 open, 0 blocked, 97 not measured.
 
 ## Targets
 
@@ -121,8 +121,11 @@ The parts of [the design](../plan.md#the-design) no check has shown yet.
 | D38 | Symbolic derivatives of pure functions: lifted from MIR, differentiated, simplified with exact rewrites, lowered back; blaze::grad! and blaze explain d/dx | *write: the crates' tests in the gate; nothing calls derivative_body, so grad! and explain do not exist* | layers 2 and 3-minimum written, unbuilt (2026-11-10) | ? |
 | D39 | Every cause found on 2026-11-10 has a guard in the gate: the budget smoke, durable writes that say why, waits with deadlines, zero-work counts, previous-layout tests | *write: the guards' own tests and their first run over the tree* |  | ? |
 | D40 | The Verus tier is gone: Lean is the prover, and a clause with no proof says not proved | *write: lake build of lean/ and the crate's tests on a stage 1; the first proof is unchecked* | written on mir-lean-1110, 128,212 lines removed, nothing run (2026-11-10) | ? |
+| D41 | Proved facts are one record per item, read by the optimizer and codegen through one query and covered by keys | *write: the crates' tests on a stage 1 (hir-ty facts, hir-ty-pure facts::model and tests::facts, hir-ty-identity); a harness check that an edit making a leaf panic recompiles only the bodies that relied on it* | written on facts-1110, unbuilt (2026-11-10) | ? |
+| D42 | A call to a function proved unable to panic has no unwind edge or cleanup; measured code size and edit-time effect on ripgrep | *write: nounwind on the definition (design/facts.md slice 2); a harness script that builds ripgrep release with SpendFacts on and off and compares text and unwind-table size, edge counts and mir optimize time; ripgrep's own tests under it* | written on facts-1110, unbuilt (2026-11-10) | ? |
 | E11 | Effects are declared by what a function may do: #[blaze::may(panic, alloc, block, diverge)], with undeclared_effect, unneeded_effect and negative_effect | *write: the lints' tests on a stage 1; no rule accepts a `for` loop as bounded* | written on terminates-effect, unbuilt (2026-11-10) | ? |
 | E12 | A workspace's proc macros and its build scripts' ambient std uses are linted, warn once their replacements are in the tree | *write: the lints' tests on a stage 1; three of four are allow until reflection phase 2 and bstd land* | written on lints-macros-scripts-1110, unbuilt (2026-11-10) | ? |
+| E15 | `#[blaze::program_lifetime]` is a checked type fact with Ref32; blaze's own syntax trees and interned data use it | *write: the lints' and blaze-mem's tests on a stage 1; the attribute deriving the ProgramLifetime impl (a hand-written unsafe impl refused); a count of blaze's syntax-tree and interner types held by Ref32, which must not be zero* | written on facts-1110, unbuilt (2026-11-10) | ? |
 | S6 | No bstd API hides a cost or a guarantee: durability, waits, allocation, buffering and policy are arguments or types | *write: the explicitness tables of design/std.md and the file-durability simulation test* |  | ? |
 
 ## The agent app
