@@ -37,6 +37,24 @@ const ROW: usize = 8 + 4 + 4;
 /// (a bound on the work one place does, and on how deep the store's steps nest).
 pub const CHAIN_MOST: u32 = 128;
 
+/// The base of a file handed over as the runs of it that hold bytes ([`holes`]): this many
+/// zeros, the least the store keeps as a whole file to clone ([`crate::CLONE_FROM`]).
+pub const HOLES: usize = crate::CLONE_FROM as usize;
+
+/// The value every file of runs is derived from: [`HOLES`] zeros, put as a
+/// [`crate::Kind::Output`] under whatever key the caller names outputs by. A linked image is
+/// mostly room nothing wrote (hello world's dev executable: 162 MB, 134 MB of them two patch
+/// regions of zeros), so a link that wrote the whole file gives the store the recipe of its
+/// runs over this base ([`encode`]), not the file: the record holds the runs and no zero of
+/// the room, nothing hashes or chunks the room, and the whole file the store makes to place
+/// it is this base's clone cut to the image's length (what is past the base is holes, which
+/// take no block and which a clone of the file keeps) with the runs written. The link after
+/// it derives from that file as from any other.
+pub fn holes() -> Vec<u8> {
+    // alloc: the base's value, once per store that lacks it
+    vec![0; HOLES]
+}
+
 /// Why bytes are no recipe, or ranges make none: the rule and the range it is about.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct BadRecipe(String);
@@ -219,6 +237,22 @@ mod tests {
         assert_eq!((made.len(), &made[..4], made[4096], made[4999]), (5000, &[1, 2, 3, 5][..], 9, 5));
         let grown = applied(&[5u8; 10], 5000, recipe.ranges());
         assert_eq!((grown[9], grown[10], grown[4195]), (5, 0, 9));
+    }
+
+    /// The recipe of a file's runs over the base of holes holds the runs and a row each,
+    /// none of the zeros between them, and gives the file.
+    #[test]
+    fn a_file_of_runs_over_the_base_of_holes_is_a_recipe_of_its_runs_alone() {
+        const LEN: u64 = 64 << 20;
+        let runs = vec![(0, vec![7u8; 5000]), (40 << 20, vec![9u8; 300])];
+        let recipe = encode(&key(3), LEN, &runs).unwrap();
+        assert!(recipe.len() < 5300 + 128, "{} bytes of recipe for 5300 bytes of runs", recipe.len());
+        let read = decode(&recipe).unwrap();
+        let file = applied(&holes(), LEN, read.ranges());
+        assert_eq!(file.len() as u64, LEN);
+        assert_eq!((&file[..5000], &file[40 << 20..(40 << 20) + 300]), (&[7u8; 5000][..], &[9u8; 300][..]));
+        let held = file.iter().filter(|it| **it != 0).count();
+        assert_eq!(held, 5300, "what no run wrote is zeros");
     }
 
     #[test]

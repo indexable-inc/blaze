@@ -403,6 +403,7 @@ impl Images {
                     Ok(image) => {
                         let (shape, mapped) = (Shape(&image), since.elapsed());
                         tracing::info!(target: "blaze", bytes = image.len(), written, sections = image.sections().len(), made_ms = made.as_millis() as u64, wrote_ms = wrote.as_millis() as u64, "image written");
+                        // logged: the info event above, with its fields
                         eprintln!(
                             "blaze serve: wrote the daemon image /{} {shape}: made in {}, {} of it written in {} (the rest is the last image's blocks), mapped in {}",
                             self.file,
@@ -455,7 +456,7 @@ impl Images {
             && !self.said_unshared
         {
             self.said_unshared = true;
-            eprintln!(
+            crate::serve::said::logged!(WARN,
                 "blaze serve: the daemon image /{} is written whole ({}) each time, not only what changed: its file could not be cloned: {error}",
                 self.file,
                 Mib(wrote.len)

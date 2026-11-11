@@ -137,6 +137,15 @@ each waited for (`function`, `awaits`). The finding of 2026-11-10 (Linux, XFS): 
 edit of a hello world answered 3.2 s late, held by that span, while the loop thread sat in
 `ioctl(FICLONE)` for 0.9 and 1.4 s. loop_syscalls.py holds the same from outside, with strace.
 
+Results kept. Every edit's row also fails, whatever its time, when the daemon's log gained a
+line saying `were not kept after its answer was sent` over the row's builds (`NOT_KEPT`,
+`not_kept`): what a build left for the store (its dependency images, check outcomes, goals and
+bodies' steps) was lost after its answer, and where the whole of it was, the front end with it,
+so the next build lowered anew. The finding of 2026-11-10 (ripgrep): the daemon printed that
+line after every build ("the item store: keeping the shape of the MIR of StaticId(..): two
+images were made under ..") and each body edit took 43 s in place of 2; the line was found
+after an hour of reading the profile. `blaze slow` and `blaze why` say the same first.
+
 `smoke` is what keeps this script able to run against the blaze of the tree: the merge gate
 runs it with the blaze the change built (blaze-platform.yaml, `profile-gate`). After the
 engine's preflight (engine.V2.preflight) it writes fixture.py's workspace (three small crates),
@@ -163,6 +172,17 @@ budget evaluation, /proc/stat, which rows an input selects, the daemon home's la
 daemon's rule, that the smoke's edit applies to the fixture, and which of a build's spans fail an
 edit (`loop_failures`). The guards' own selftest is
 guards.py's.
+
+The work of an edit: each timed build of the body-edit budget is also held to what its profile
+records of the daemon's work, so a regression fails the gate with the query's name, not as a
+slower median. From the second build on, each query of `EDIT_QUERIES` (inference, the built and the
+runtime MIR, the check of a body and of a module's items) ran at most `edit_runs` times (16): an edit
+of one function's body infers, lowers and checks that body and what reads what changed of it, not
+the crate (ripgrep, 2026-11-10: 1,165 inferences for one line of `rg::main`). The first build is
+left out: it follows a build from nothing, which lets go of every body's results, and makes the
+edited crate's again once. And in every build the critical path's time under no span, the
+`unrecorded` blind spots of `blaze slow --json`, is at most `gap_ms` (20): the same edit had 650 ms
+between its lowering and its first unit task that nothing named.
 """
 
 import bisect
@@ -180,7 +200,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast, get_args
@@ -272,6 +292,8 @@ class Input:
     record: bool = False
     duckdb: str = ""
     hold_ms: float = 200.0
+    edit_runs: int = 16
+    gap_ms: float = 20.0
 
 
 @dataclass(frozen=True)
@@ -968,6 +990,96 @@ def loop_failures(rows: Sequence[SpanRow], hold_ms: float) -> list[str]:
     return out
 
 
+# What a one-function body edit may run again of the front end, from the build's `query_counts`
+# (the docstring's "The work of an edit"). The names are the query functions': inference, the
+# built and the runtime MIR, and the check of a body and of a module's items (hir's
+# `body_check_clean`, `module_check_clean`).
+EDIT_QUERIES = ("infer_body_query", "mir_body_query", "runtime_mir_body_query", "body_check_clean",
+                "module_check_clean")
+COUNTS_SQL = """
+SELECT q.query AS query, q.executed AS executed
+FROM query_counts q
+WHERE q.build_id = (SELECT max(build_id) FROM builds) AND q.query IN (@NAMES@)
+ORDER BY q.query
+""".replace("@NAMES@", ", ".join(f"'{name}'" for name in EDIT_QUERIES))
+
+
+def count_rows(stdout: str, what: str) -> dict[str, int]:
+    """`COUNTS_SQL`'s rows as `blaze debug sql --json` printed them: each query's runs. A query
+    with no row ran nothing. A row that is not the query's is a ValueError naming `what`."""
+    out: dict[str, int] = {}
+    for row in guards.rows(stdout, what):
+        name, executed = row.get("query"), guards.number(row, "executed", what)
+        if not isinstance(name, str) or executed is None:
+            raise ValueError(f"{what}: a row with no query or no executed: {row}")
+        out[name] = int(executed)
+    return out
+
+
+def count_failures(counts: Mapping[str, int], most: int) -> list[str]:
+    """Why a body edit whose build ran `counts` fails; empty when it does not. Each query of
+    `EDIT_QUERIES` that ran more than `most` times fails it, named, with its runs."""
+    return [f"`{name}` ran {counts[name]} times for an edit of one function's body, over the bound of {most}: the "
+            "build ran again what the edit did not change (`blaze debug sql` over `provenance` says why each ran)"
+            for name in EDIT_QUERIES if counts.get(name, 0) > most]
+
+
+def gap_failures(printed: str, most_ms: float, what: str) -> list[str]:
+    """Why a build whose `blaze slow --json` report is `printed` fails its edit by the time no
+    span names; empty when it does not. The report's blind spots of kind `unrecorded` are the
+    critical path's time the record lost (between spans, or cut): over `most_ms` in all, the edit
+    fails, saying how much and where the report says it was. A report that is no report is a
+    ValueError naming `what`."""
+    try:
+        report_ = json.loads(printed)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"{what}: `blaze slow --json` printed no JSON: {error}") from error
+    spots = report_.get("blind_spots") if isinstance(report_, dict) else None
+    if not isinstance(spots, list):
+        raise ValueError(f"{what}: `blaze slow --json` printed no `blind_spots`")
+    lost = [spot for spot in spots if isinstance(spot, dict) and spot.get("kind") == "unrecorded"]
+    hidden = 0.0
+    for spot in lost:
+        ns = spot.get("hidden_ns")
+        if not isinstance(ns, (int, float)) or isinstance(ns, bool):
+            raise ValueError(f"{what}: an `unrecorded` blind spot with no `hidden_ns`: {spot}")
+        hidden += ns / 1e6
+    # Where each stretch is, as the report's `gaps` say it (report version 9): its thread and the
+    # spans of its lane before and after it. A stretch its lane ran inside no span (`no_span`) is
+    # no `unrecorded` blind spot, and is held to the same bound, each on its own.
+    gaps = [gap for gap in report_.get("gaps", []) if isinstance(gap, dict)]
+    out = []
+    for gap in gaps:
+        ms = gap.get("dur_ns", 0) / 1e6
+        if gap.get("kind") == "no_span" and ms > most_ms:
+            out.append(f"{ms:.4g} ms of the critical path ran inside no span, over the bound of {most_ms:.4g} ms "
+                       f"(slow-is-p0-traced: name it with a span first): {gap_where(gap)}")
+    if hidden <= most_ms:
+        return out
+    where = "; ".join([gap_where(gap) for gap in gaps if gap.get("kind") != "no_span"]
+                      or [str(line) for spot in lost for line in spot.get("evidence", [])])
+    return out + [f"{hidden:.4g} ms of the critical path is under no span, over the bound of {most_ms:.4g} ms "
+                  f"(slow-is-p0-traced: name it with a span first): {where or 'the report names no lane'}"]
+
+
+def gap_where(gap: dict[str, Any]) -> str:
+    """One gap of `blaze slow --json`'s `gaps` in words: how long, where in the build, on which
+    thread, and between which spans of its lane."""
+    return (f"{gap.get('dur_ns', 0) / 1e6:.4g} ms at {gap.get('from_ns', 0) / 1e6:.4g} ms on "
+            f"{gap.get('thread_name') or gap.get('lane')} ({gap.get('kind')}), after "
+            f"{gap.get('before') or 'no span of its lane'}, before {gap.get('after') or 'no span of its lane'}")
+
+
+# The daemon's line for what a build left for the store and lost after its answer (blaze-cargo's
+# `Jobs::lose`; the docstring's "Results kept").
+NOT_KEPT = "were not kept after its answer was sent"
+
+
+def not_kept(log: str) -> list[str]:
+    """The lines of the daemon's log that say a build's results were not kept, as printed."""
+    return [line.strip() for line in log.splitlines() if NOT_KEPT in line]
+
+
 @dataclass(frozen=True)
 class Edits:
     seconds: tuple[float, ...]
@@ -1106,16 +1218,26 @@ class Lane:
         return (f"{self.name}: {step}: the warm program says something else than blaze's build of it from "
                 f"nothing: {difference(ours, scratch)}")
 
-    def edits(self, step: str, apply: Apply, revert: Revert, count: bool, limit_ms: float | None = None) -> Edits:
+    def edits(self, step: str, apply: Apply, revert: Revert, count: bool, limit_ms: float | None = None,
+              body: bool = False) -> Edits:
         """The edit, a timed build (with `count`, what it compiled), and the edit taken back and
         built: `runs` times, or with `limit_ms` until the times settle it (`enough`). After the
-        first, the program is checked against blaze's build of it from nothing (`wrong`)."""
+        first, the program is checked against blaze's build of it from nothing (`wrong`). With
+        `body` (the edit changes one function's body) each build's profile is also held to the
+        work of an edit: what it ran again of the front end (`count_failures`; from the second
+        build on, the first being the one that makes what a build from nothing let go) and the
+        critical path's time under no span (`gap_failures`)."""
         seconds: list[float] = []
         compiled: list[int] = []
         counted: list[counters.Counts] = []
         stalled: list[str] = []
+        spent: list[str] = []
         places = 0
         n = 0
+        # What a build left for the store is stored after its answer and before the next build
+        # of the checkout lowers: each timed build's loss is in the log once the build that
+        # takes its edit back has answered.
+        log_from = len(log_text(self).encode())
         while (len(seconds) < self.args.runs if limit_ms is None
                else not enough([s * 1000 for s in seconds], limit_ms, self.args)):
             places = apply(n)
@@ -1125,6 +1247,9 @@ class Lane:
                 counted.append(used)
                 # Before any other build: the profile's last build is the one just timed.
                 stalled += [f"{step} {n + 1} ({took * 1000:.4g} ms): {why}" for why in self.loop_failures(f"{step} {n + 1}")]
+                if body:
+                    spent += [f"{step} {n + 1} ({took * 1000:.4g} ms): {why}"
+                              for why in self.work_failures(f"{step} {n + 1}", n > 0)]
                 if work is not None:
                     if work.compiled is None:
                         raise engine.Unmeasurable(f"{self.eng.kind} did not say how many functions the {step} compiled")
@@ -1135,11 +1260,31 @@ class Lane:
                 revert(n)
             self.build(f"{step} {n + 1} taken back", False)
             n += 1
+        if lost := not_kept(log_text(self, log_from)):
+            raise Wrong(f"{self.name}: {step}: the daemon did not keep what {len(lost)} of its builds left for the "
+                        f"store, so the builds after them started from less (their times: "
+                        f"{samples(s * 1000 for s in seconds)} ms); its log says:\n" + "\n".join(lost))
         if stalled:
             raise Wrong(f"{self.name}: {step}: the daemon's loop thread did not keep up in {len(stalled)} of "
                         f"{len(seconds)} builds' profiles (their times: {samples(s * 1000 for s in seconds)} ms):\n"
                         + "\n".join(stalled))
+        if spent:
+            raise Wrong(f"{self.name}: {step}: the daemon's work on an edit of one function's body was not in "
+                        f"proportion to that function in {len(spent)} findings over {len(seconds)} builds (their "
+                        f"times: {samples(s * 1000 for s in seconds)} ms):\n" + "\n".join(spent))
         return Edits(tuple(seconds), tuple(compiled), places, tuple(counted))
+
+    def work_failures(self, step: str, counts: bool) -> list[str]:
+        """Why the build just run fails a body edit by the work its profile records
+        (`gap_failures`, and with `counts` `count_failures`); empty when it does not."""
+        out: list[str] = []
+        if counts:
+            what = f"{step}: what the edit ran again of the front end"
+            ran = count_rows(sql(self.eng, self, what, COUNTS_SQL), f"{self.name}: {what}")
+            out += count_failures(ran, self.args.edit_runs)
+        what = f"{self.name}: {step}: the critical path's time under no span"
+        said = self.eng.command(what, "slow", ["--json"], self.ws, self.env, 300).checked(what).stdout
+        return out + gap_failures(said, self.args.gap_ms, what)
 
     def loop_failures(self, step: str) -> list[str]:
         """Why the build just run fails its edit by what its profile says of the loop thread
@@ -1172,7 +1317,7 @@ class Lane:
         return apply, revert
 
     def timed_edit(self, step: str, limit_ms: float) -> Measured:
-        e = self.edits(step, *self.bench_edit("body"), False, limit_ms)
+        e = self.edits(step, *self.bench_edit("body"), False, limit_ms, body=True)
         return timed([s * 1000 for s in e.seconds], "ms", places=e.places, **count_numbers(e.counted))
 
     def nothing_compiled(self, step: str, make: Callable[[str, int], str]) -> Measured:
@@ -2150,6 +2295,17 @@ def selftest_ledger() -> None:
                f"the ledger's {row_id} selects no row: {given}")
 
 
+def selftest_not_kept() -> None:
+    """Which lines of a daemon's log fail an edit: the finding of 2026-11-10, and a log without it."""
+    line = ("blaze serve: the results of `build` in /root/m3/rg (job 0v7) were not kept after its answer was sent: "
+            "storing what the build of /root/m3/rg left for the store: the item store: keeping the shape of the MIR "
+            "of StaticId(StaticId(ae34)): two images were made under d1eed1fd3fdb")
+    log = f"blaze serve: listening\n  {line}\nblaze serve: a kept front end is let go\n{line}\n"
+    expect(not_kept(log) == [line, line], f"each line that says so, as printed: {not_kept(log)}")
+    expect(not_kept("blaze serve: listening\nblaze serve: the results of `build` were kept\n") == [] and not_kept("") == [],
+           "a log that does not say so fails nothing")
+
+
 def selftest_loop() -> None:
     """Which of a build's spans fail its edit: the finding of 2026-11-10 in miniature, and the
     fixed state."""
@@ -2182,6 +2338,50 @@ def selftest_loop() -> None:
     expect(parse(Input, spec + "}", SCRIPT).hold_ms == 200.0 and parse(Input, spec + ', "hold_ms": 50.0}', SCRIPT).hold_ms == 50.0,
            "the hold's bound is 200 ms unless given")
     refused("a negative bound", lambda: main(parse(Input, spec + ', "hold_ms": -1.0}', SCRIPT)), SystemExit)
+
+
+def selftest_edit_work() -> None:
+    """Which of a build's counts and unnamed time fail a body edit: the finding of 2026-11-10 in
+    miniature (ripgrep, one line of `rg::main`), and the fixed state."""
+    found = {"infer_body_query": 1165, "mir_body_query": 1166, "runtime_mir_body_query": 1164, "body_check_clean": 2}
+    said = count_failures(found, 16)
+    expect(len(said) == 3 and "`infer_body_query` ran 1165 times" in said[0] and "bound of 16" in said[0]
+           and "`mir_body_query`" in said[1] and "`runtime_mir_body_query`" in said[2],
+           f"each query over the bound fails the edit by name: {said}")
+    expect(count_failures({"infer_body_query": 2, "mir_body_query": 16}, 16) == [] and count_failures({}, 0) == [],
+           "counts within the bound, and a build that ran none, pass")
+    expect(count_failures({"Body::of": 237, "ScopeInput::name": 841}, 16) == [], "a query the bound is not of fails nothing")
+    printed = '{"query":"infer_body_query","executed":1165}\n{"query":"body_check_clean","executed":2}\n'
+    expect(count_rows(printed, "rows") == {"infer_body_query": 1165, "body_check_clean": 2},
+           f"the rows read: {count_rows(printed, 'rows')}")
+    refused("a row with no executed", lambda: count_rows('{"query":"infer_body_query"}', "rows"), ValueError)
+    expect(all(f"'{name}'" in COUNTS_SQL for name in EDIT_QUERIES) and "@" not in COUNTS_SQL,
+           f"the query names every bounded query: {COUNTS_SQL}")
+    lost = {"kind": "unrecorded", "hidden_ns": 650_000_000, "evidence": ["by reason and lane: between_spans on loop 650 ms"]}
+    report_ = json.dumps({"blind_spots": [lost, {"kind": "uncovered", "hidden_ns": 9_000_000_000}]})
+    gap = gap_failures(report_, 20.0, "report")
+    expect(len(gap) == 1 and "650 ms" in gap[0] and "bound of 20 ms" in gap[0] and "between_spans on loop" in gap[0],
+           f"the critical path's unnamed time over the bound fails the edit, saying where: {gap}")
+    expect(gap_failures(json.dumps({"blind_spots": [dict(lost, hidden_ns=20_000_000)]}), 20.0, "report") == []
+           and gap_failures('{"blind_spots": []}', 0.0, "report") == [],
+           "unnamed time within the bound, and a report with none, pass")
+    where = {"kind": "between_spans", "dur_ns": 650_000_000, "from_ns": 1_200_000_000, "thread_name": "blaze-loop",
+             "lane": "thread 7", "before": "`lower` serde", "after": "`task` unit bodies"}
+    named = gap_failures(json.dumps({"blind_spots": [lost], "gaps": [where]}), 20.0, "report")
+    expect(len(named) == 1 and "on blaze-loop (between_spans), after `lower` serde, before `task` unit bodies" in named[0],
+           f"the unnamed time says its thread and the spans around it: {named}")
+    ran = dict(where, kind="no_span", dur_ns=30_000_000)
+    bare = gap_failures(json.dumps({"blind_spots": [], "gaps": [ran]}), 20.0, "report")
+    expect(len(bare) == 1 and "30 ms of the critical path ran inside no span" in bare[0] and "blaze-loop" in bare[0],
+           f"a stretch a lane ran inside no span fails the edit too: {bare}")
+    expect(gap_failures(json.dumps({"blind_spots": [], "gaps": [dict(ran, dur_ns=20_000_000)]}), 20.0, "report") == [],
+           "a stretch inside no span within the bound passes")
+    refused("a report with no blind spots", lambda: gap_failures("{}", 20.0, "report"), ValueError)
+    refused("no JSON", lambda: gap_failures("blaze slow: no build", 20.0, "report"), ValueError)
+    spec = '{"engine": {"kind": "v2", "blaze": "blaze"}, "out": "o.json"'
+    given = parse(Input, spec + ', "edit_runs": 4, "gap_ms": 5.0}', SCRIPT)
+    expect(parse(Input, spec + "}", SCRIPT).edit_runs == 16 and parse(Input, spec + "}", SCRIPT).gap_ms == 20.0
+           and given.edit_runs == 4 and given.gap_ms == 5.0, "the bounds are 16 runs and 20 ms unless given")
 
 
 def selftest() -> None:
@@ -2249,6 +2449,8 @@ def selftest() -> None:
     selftest_ledger()
     selftest_work()
     selftest_loop()
+    selftest_not_kept()
+    selftest_edit_work()
     expect(verdict(30, 30, True) == "pass" and verdict(30.01, 30, True) == "fail", "at most")
     expect(verdict(0.8, 0.8, False) == "pass" and verdict(0.79, 0.8, False) == "fail", "at least")
     expect(describe(12.5, 30, True, "ms") == "12.5 ms against a budget of at most 30 ms", describe(12.5, 30, True, "ms"))

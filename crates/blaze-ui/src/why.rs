@@ -5,6 +5,10 @@
 use blaze_api::{EvictedBy, PartChanged, Reason, Rebuild, RebuildCause, Rebuilt};
 use blaze_ids::ContentId;
 
+/// What is said when the daemon has no build to answer of: why, and the command that reads
+/// the reasons of the builds before it started.
+const NO_BUILD: &str = "no build of a workspace holding this directory has ended since the daemon started, and the daemon keeps a build's reasons only while it runs: earlier builds' are in the history, `blaze debug sql \"SELECT build_id, step, item, cause, what FROM misses ORDER BY build_id DESC LIMIT 50\"`";
+
 /// `rebuilt` as `blaze why` prints it.
 pub fn lines(out: &mut String, rebuilt: &Rebuilt) {
     if rebuilt.restoring {
@@ -31,7 +35,7 @@ pub fn lines(out: &mut String, rebuilt: &Rebuilt) {
     let Some(build) = rebuilt.build else {
         put!(
             out,
-            "no build of a workspace holding this directory has ended since the daemon started: earlier builds' reasons are in the history's `misses` table (`blaze debug sql`)\n"
+            "{NO_BUILD}\n"
         );
         return;
     };
@@ -50,7 +54,7 @@ pub fn lines(out: &mut String, rebuilt: &Rebuilt) {
     }
     put!(out, "build {build} computed {} things again:\n", rebuilt.count);
     for group in &rebuilt.groups {
-        put!(out, "\n  {} {}: {}\n", group.count, group.step, reason(&group.cause, false));
+        put!(out, "\n  {} {}: {}\n", group.count, group.step, reason(&group.cause, false, build));
         for item in &group.items {
             put!(out, "    {item}\n");
         }
@@ -68,7 +72,7 @@ pub fn unexplained(out: &mut String, rebuilt: &Rebuilt) {
     let Some(build) = rebuilt.build else {
         put!(
             out,
-            "no build of a workspace holding this directory has ended since the daemon started: earlier builds' reasons are in the history's `misses` table (`blaze debug sql`)\n"
+            "{NO_BUILD}\n"
         );
         return;
     };
@@ -97,9 +101,9 @@ fn chain(out: &mut String, build: u64, rebuilt: &[Rebuild]) {
         put!(out, "build {build}: nothing of that name was computed again\n");
         return;
     };
-    put!(out, "build {build}: {}\n", one(first));
+    put!(out, "build {build}: {}\n", one(first, build));
     for it in rest {
-        put!(out, "  because {}\n", one(it));
+        put!(out, "  because {}\n", one(it, build));
     }
     for it in &first.ends {
         put!(out, "  in the end: {}\n", end(it));
@@ -123,9 +127,11 @@ fn end(it: &Reason) -> String {
                 EvictedBy::Cap => "blaze why's ledger dropped its record to stay under its cap",
             }
         ),
-        Reason::PreviousFailed { since } => {
-            format!("its last compute, in build {since}, failed or was stopped")
-        }
+        // What is recorded: the build did not end well and nothing was kept. Whether the
+        // step's own compute failed is that build's `errors` rows, named, not guessed here.
+        Reason::PreviousFailed { since } => format!(
+            "its last compute was in build {since}, which did not end well (it failed, was cancelled or its daemon stopped), and nothing of it was kept; whether its own compute failed is in that build's errors: `blaze debug sql \"SELECT unit, message FROM errors WHERE build_id = {since}\"`"
+        ),
         Reason::Forced { how } => format!("it was asked for: {how}"),
         Reason::KeyUnstable { part } => format!(
             "`{part}` came out different from the same inputs (a determinism bug in blaze)"
@@ -134,14 +140,18 @@ fn end(it: &Reason) -> String {
     }
 }
 
-fn one(it: &Rebuild) -> String {
+fn one(it: &Rebuild, this: u64) -> String {
     // alloc: a line, once an item asked
-    format!("{} ({}) was computed again: {}", it.item, it.step, reason(&it.cause, true))
+    format!("{} ({}) was computed again: {}", it.item, it.step, reason(&it.cause, true, this))
 }
 
 /// Why, in words; `exact` adds what tells one item from another (the build it is compared
-/// with, the hashes), which a group leaves out.
-fn reason(cause: &RebuildCause, exact: bool) -> String {
+/// with, the hashes), which a group leaves out. `this` is the build asked of.
+///
+/// Each text says what the daemon recorded and nothing it inferred: where the record does not
+/// say which of two things happened, the text says that it does not, and where the record is
+/// gone, it says where what is left of it can be read.
+fn reason(cause: &RebuildCause, exact: bool, this: u64) -> String {
     // alloc: a reason's text, once an item
     let since = |build: &u64| match exact {
         true => format!(" since it was last computed, in build {build}"),
@@ -157,21 +167,21 @@ fn reason(cause: &RebuildCause, exact: bool) -> String {
             format!("{} changed{}{of}", and(&named), since(build))
         }
         RebuildCause::Lost { since: build } => format!(
-            "its key is the one it had when last computed{}, yet nothing is kept under it now: that compute did not keep it, or it was collected since",
+            "its key is the one it had when last computed{}, yet nothing is kept under it now: either that compute did not keep it or it was collected since, and which is not recorded",
             match exact {
                 true => format!(", in build {build}"),
                 false => String::new(),
             }
         ),
         RebuildCause::Unfinished { since: build } => format!(
-            "its key is the one it had when last computed{}, in a build that did not end well, and nothing is kept under it: that compute likely failed or was stopped",
+            "its key is the one it had when last computed{}, in a build that did not end well, and nothing is kept under it; whether its own compute failed or the build stopped before keeping it is not recorded here: that build's errors say (`blaze debug sql \"SELECT unit, message FROM errors WHERE build_id = {build}\"`)",
             match exact {
                 true => format!(", in build {build}"),
                 false => String::new(),
             }
         ),
         RebuildCause::Dropped { since: build } => format!(
-            "it was last computed{}, and blaze why's ledger dropped what its key was made of then to stay under its cap, so what changed since is not known",
+            "it was last computed{}, and blaze why's ledger dropped what its key was made of then to stay under its cap, so the daemon cannot say what changed since; while the history keeps that build, its `key_parts` rows can: `blaze explain key_part_diff after={this} before={build}`; its compute in this build is recorded whole",
             match exact {
                 true => format!(" in build {build}"),
                 false => String::new(),
@@ -198,11 +208,11 @@ fn reason(cause: &RebuildCause, exact: bool) -> String {
             (false, _) => format!("{read} changed"),
         },
         RebuildCause::Unrecorded => {
-            "shapes of its reads are kept, but blaze has no record of the entry it kept last (kept by another daemon, or before its ledger began)".to_owned()
+            "shapes of its reads are kept, but blaze has no record of the entry it kept last: either another daemon kept it or it was kept before this ledger began, and which is not recorded; its compute in this build is recorded".to_owned()
         }
-        RebuildCause::Collected => "the entry blaze recorded as kept last is not in the store now: that compute did not keep it, or it was collected since".to_owned(),
+        RebuildCause::Collected => "the entry blaze recorded as kept last is not in the store now: either that compute did not keep it or it was collected since, and which is not recorded".to_owned(),
         RebuildCause::Unshaped => {
-            "every read of the entry kept last hashes as it did, yet no shape of reads names it: a keep that did not finish".to_owned()
+            "every read of the entry kept last hashes as it did, yet no shape of reads names it; what left it so is not recorded (a keep that stops between its entry and its shape leaves this state)".to_owned()
         }
         RebuildCause::Twice { count } => format!(
             "this build computed it {count} times under different keys, so none is compared with its last compute (a bug in blaze: it told them apart by less than their keys)"
@@ -245,5 +255,89 @@ fn and(names: &[String]) -> String {
         [] => "nothing it names".to_owned(), // alloc: a reason's text
         [one] => one.clone(),                // clone: a reason's text
         [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn every_cause() -> Vec<RebuildCause> {
+        vec![
+            RebuildCause::First,
+            RebuildCause::Lost { since: 3 },
+            RebuildCause::Unfinished { since: 3 },
+            RebuildCause::Dropped { since: 3 },
+            RebuildCause::Beyond { what: "its process variables".to_owned(), since: 3 },
+            RebuildCause::Unnamed { since: 3 },
+            RebuildCause::Unrecorded,
+            RebuildCause::Collected,
+            RebuildCause::Unshaped,
+            RebuildCause::Twice { count: 2 },
+            RebuildCause::Always { why: "it is unsandboxed".to_owned() },
+            RebuildCause::NotExplained { what: "its key names no parts".to_owned() },
+            RebuildCause::Failed { why: "the ledger was not read".to_owned() },
+        ]
+    }
+
+    /// No reason `blaze why` prints is a guess: none says what "likely" or "probably"
+    /// happened. Until 2026-11-11 a step last computed in a build that did not end well was
+    /// said to have "likely failed or was stopped".
+    #[test]
+    fn no_reason_is_a_guess() {
+        for cause in every_cause() {
+            for exact in [false, true] {
+                let said = reason(&cause, exact, 9);
+                for guess in ["likely", "probably", "perhaps", "presumably", "may have"] {
+                    assert!(!said.contains(guess), "{cause:?} guesses (`{guess}`): {said}");
+                }
+            }
+        }
+        let ends = [
+            Reason::FirstTime,
+            Reason::PreviousFailed { since: 3 },
+            Reason::Evicted { by: EvictedBy::Cap, when: 3 },
+        ];
+        for it in &ends {
+            let said = end(it);
+            assert!(!said.contains("likely") && !said.contains("probably"), "{said}");
+        }
+    }
+
+    /// Where the record that would explain is gone or was never made, the reason says so and
+    /// names the command that reads what is left.
+    #[test]
+    fn an_explanation_that_is_unavailable_says_why_and_where_to_read_it() {
+        let dropped = reason(&RebuildCause::Dropped { since: 3 }, true, 9);
+        assert!(dropped.contains("in build 3"), "{dropped}");
+        assert!(dropped.contains("to stay under its cap"), "{dropped}");
+        assert!(dropped.contains("`blaze explain key_part_diff after=9 before=3`"), "{dropped}");
+        let unfinished = reason(&RebuildCause::Unfinished { since: 3 }, true, 9);
+        assert!(unfinished.contains("is not recorded here"), "{unfinished}");
+        assert!(unfinished.contains("FROM errors WHERE build_id = 3"), "{unfinished}");
+        let failed = end(&Reason::PreviousFailed { since: 3 });
+        assert!(failed.contains("build 3, which did not end well"), "{failed}");
+        assert!(failed.contains("FROM errors WHERE build_id = 3"), "{failed}");
+        for cause in [RebuildCause::Lost { since: 3 }, RebuildCause::Collected, RebuildCause::Unrecorded] {
+            let said = reason(&cause, true, 9);
+            assert!(said.contains("which is not recorded"), "{cause:?}: {said}");
+        }
+        // No build to answer of: why, and the query over the history.
+        let mut out = String::new();
+        let none = Rebuilt {
+            torn: None,
+            build: None,
+            chain: false,
+            count: 0,
+            groups: Vec::new(),
+            command: None,
+            dropped: None,
+            rebuilt: Vec::new(),
+            summary: Vec::new(),
+            restoring: false,
+            workspace: None,
+        };
+        lines(&mut out, &none);
+        assert!(out.contains("only while it runs") && out.contains("FROM misses ORDER BY build_id DESC"), "{out}");
     }
 }

@@ -238,10 +238,18 @@ pub fn check(
         ))
     };
     if let Some(it) = traced.untraceable.first() {
+        // Who read it, as the run's sandbox described the caller (`crate::calls`): the
+        // process, its program, the system call and where in the process it came from.
+        let who = crate::calls::said(
+            &crate::calls::of(places.program),
+            crate::trace::untraceable_name(*it),
+        );
         // alloc: error path
-        return Err(bug(format!(
+        let Error(what) = bug(format!(
             "got what the sandbox could neither trace nor answer from its provider ({it:?}), which its proof says it never does"
-        )));
+        ));
+        // alloc: error path
+        return Err(Error(format!("{what}{who}")));
     }
     if let Some((dir, _)) = traced.dirs.iter().find(|(dir, _)| !runtime(dir, places)) {
         // alloc: error path

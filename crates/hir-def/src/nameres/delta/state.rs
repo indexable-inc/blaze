@@ -120,23 +120,25 @@ pub(super) struct CrateState {
 impl CrateState {
     /// Whether `written` holds a file a round-0 log of this crate reads, as
     /// [`super::input::read`] looks for them: a file a module of it is defined in, a file a
-    /// group's log reads beside its own, a file a call a group expanded is in, or, for a
-    /// group that expanded an `include!`, any file no module of the crate is defined in or a
-    /// file read by its bytes. False says the write leaves every log of the crate as the
-    /// state has it.
+    /// group's log reads beside its own, a file a call a group expanded is in or an
+    /// `include!` it expanded parsed, a file read by its bytes for a group that expanded an
+    /// `include!` or a macro like it, or, for a group that expanded one like it whose file is
+    /// not kept ([`GroupOut::reads_unnamed_file`]), any file no module of the crate is
+    /// defined in. False says the write leaves every log of the crate as the state has it.
     pub(super) fn reads_written(&self, written: &base_db::Written<'_>) -> bool {
         let defines = |file: &FileId| self.files.contains_key(file);
+        if super::forgets_included() {
+            return written.set.iter().any(defines);
+        }
         if written.set.iter().any(|file| defines(file) || self.other_files.contains_key(file)) {
             return true;
         }
-        let included = !written.included.is_empty() || written.set.iter().any(|file| !defines(file));
-        if written.set.is_empty() && !included {
+        let bytes = !written.included.is_empty();
+        let unnamed = written.set.iter().any(|file| !defines(file));
+        if written.set.is_empty() && !bytes {
             return false;
         }
-        self.groups.values().any(|group| {
-            (included && group.out.uses_include)
-                || group.out.expansion_files.iter().any(|it| written.set.contains(it))
-        })
+        self.groups.values().any(|group| group.out.reads(written, bytes, unnamed))
     }
 
     /// A state from empty that keeps the published inputs of `old`, which a cold run sets
@@ -252,11 +254,34 @@ pub(super) struct GroupOut {
     /// Whether an expansion of it wrote the crate root's scope (`#[macro_export]` of a
     /// `macro_rules!` an expansion made): the root's run then needs this group's run too.
     pub(super) writes_root: bool,
-    /// Whether it expanded an `include!`, which reads a file no module is defined in.
+    /// Whether it expanded an `include!` or a macro like it (`include_str!`,
+    /// `include_bytes!`), which reads a file no module is defined in: what a change of a file
+    /// read by its bytes (`Written::included`) runs again.
     pub(super) uses_include: bool,
+    /// Whether it expanded a macro like `include!` that is not `include!`: the file it read
+    /// is not kept, so any written file no module of the crate is defined in may be it. The
+    /// file an `include!` parsed is kept, in `expansion_files`, and only a write of that file
+    /// runs its group again: until 2026-11-10 every group that expanded an `include!` ran
+    /// again, with a removal, on a write of any file its crate does not define, so an edit of
+    /// ripgrep's `main.rs` ran serde_core's groups again (it includes its build script's
+    /// `private.rs`), set 25 of its scopes, and gave every crate above it a job.
+    pub(super) reads_unnamed_file: bool,
     /// The files of the calls it expanded: an expansion's input is its call's syntax, fn bodies
     /// and token trees included, which a write may change with the group's log as it was.
     pub(super) expansion_files: Vec<FileId>,
+}
+
+impl GroupOut {
+    /// Whether a write may have changed what an expansion of the group read: `bytes`, a file
+    /// read by its bytes changed, and it expanded an `include!` or a macro like it; `unnamed`,
+    /// a file no module of the crate is defined in was written, and it expanded a macro like
+    /// `include!` whose file is not kept; or a written file is one a call it expanded is in,
+    /// or one an `include!` it expanded parsed.
+    pub(super) fn reads(&self, written: &base_db::Written<'_>, bytes: bool, unnamed: bool) -> bool {
+        (bytes && self.uses_include)
+            || (unnamed && self.reads_unnamed_file)
+            || self.expansion_files.iter().any(|it| written.set.contains(it))
+    }
 }
 
 /// A copy of `op`: logs are query values, and the state keeps the last one it read of each

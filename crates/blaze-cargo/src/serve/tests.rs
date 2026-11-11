@@ -3570,6 +3570,56 @@ fn a_build_whose_load_fails_before_its_units_ends_not_ok_and_the_daemon_answers_
     assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
 }
 
+/// A build after one that failed says so before it does anything, and `blaze why` has it as a
+/// row of that build; the build after a build that ended well says nothing of it. Before
+/// 2026-11-11 the builds after a failed cold build did its work, exited 0 and said nothing, and
+/// read as slow builds of an unchanged tree.
+#[test]
+fn a_build_after_one_that_failed_says_so_first_and_only_until_one_ends_well() {
+    ENDED_LOST.with(|it| it.borrow_mut().clear());
+    let mut sim = Sim::new(45, Faults::default());
+    checkout(&mut sim, "fail\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 45);
+    let mut client = dial(&mut daemon);
+    let build = |daemon: &mut SimDaemon, client: &mut Client| {
+        client.send(daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() })
+    };
+    // Where a build says its checkout's last build did not end well, among what it says.
+    let noted = |got: &[Response]| {
+        got.iter().position(|it| {
+            matches!(it, Response::Diagnostic(note) if note.rendered.starts_with("note: the last build of /w (")
+                && note.message.contains(") failed")
+                && note.message.contains("this build first does the work that one left"))
+        })
+    };
+    let id = build(&mut daemon, &mut client);
+    let got = client.wait(&mut daemon, id);
+    assert_eq!(got.last(), Some(&Response::Done { ok: false }), "{got:#?}");
+    assert_eq!(noted(&got), None, "the first build of the checkout follows none: {got:#?}");
+
+    daemon.driver().change(&name("w/Cargo.toml"), b"[package]\nname = \"app\"\n");
+    let id = build(&mut daemon, &mut client);
+    let got = client.wait(&mut daemon, id);
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
+    let at = noted(&got).unwrap_or_else(|| panic!("it says the last build failed: {got:#?}"));
+    let built = got.iter().position(|it| matches!(it, Response::Built { .. }));
+    assert!(built.is_none_or(|built| at < built), "said before its work, not after: {got:#?}");
+    let said = ENDED_LOST.with(|it| it.take());
+    assert!(
+        said.iter().any(|it| it.contains("the last build of /w") && it.contains("failed") && it.contains("it ran ")),
+        "the build's row for `blaze why`: {said:#?}"
+    );
+
+    // The control: that build ended well, so the next has nothing to say of it.
+    let id = build(&mut daemon, &mut client);
+    let got = client.wait(&mut daemon, id);
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
+    assert_eq!(noted(&got), None, "{got:#?}");
+    let said = ENDED_LOST.with(|it| it.take());
+    assert!(said.is_empty(), "{said:#?}");
+}
+
 /// A write to the front end that panics as it is applied on the loop, as a maintainer's did
 /// (the self-build of 2026-11-01 00:17), fails the units after it with a typed error naming
 /// the panic, while keep-going builds the unit that does not depend on it, and the daemon

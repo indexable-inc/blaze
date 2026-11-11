@@ -275,6 +275,11 @@ pub(super) fn launch_with(
         Ok(code) => code,
         Err(why) => return not_made(spec, &why),
     };
+    // Before the report: the driver reads who made the run's untraceable calls as it takes
+    // the report, and the report's rename is what says the run's files are whole.
+    if let Err(why) = write_calls(spec, &live) {
+        eprintln!("blaze: the sandbox's calls: {why}");
+    }
     match finish(spec, &live) {
         Ok(report) => {
             if let Err(why) = write_report(&spec.report, &report) {
@@ -336,7 +341,12 @@ fn begin(spec: &confine::Spec) -> Result<Live, String> {
     // alloc: the error, once, and nothing runs.
     file.write_all(text.as_bytes()).map_err(|error| format!("the live record {shown}: {error}"))?;
     // clone: once per run, the live record's path for the sandbox.
-    Ok(Live { path: spec.live.clone(), start, failed: Default::default() })
+    Ok(Live {
+        path: spec.live.clone(),
+        start,
+        failed: Default::default(),
+        calls: Default::default(),
+    })
 }
 
 /// The `T` lines for the launcher's standard descriptors the program is given and may read
@@ -524,6 +534,20 @@ fn lines_of(text: &str) -> Vec<trace::Line> {
         }
     }
     lines
+}
+
+/// Leaves who made the calls the run can't be traced for, and the programs it started, beside
+/// the report ([`blaze_usercode::calls::FILE`]) when the run traces: an empty file for a run
+/// whose sandbox described none, so the driver tells "none" from "not said". No part of the
+/// report: nothing is keyed by a process id or an address.
+fn write_calls(spec: &confine::Spec, live: &Live) -> Result<(), String> {
+    if !spec.trace {
+        return Ok(());
+    }
+    let file = spec.report.with_file_name(blaze_usercode::calls::FILE);
+    let text = blaze_usercode::calls::encode(&live.calls.borrow());
+    // alloc: the error, once.
+    std::fs::write(&file, text).map_err(|error| format!("{}: {error}", file.display()))
 }
 
 /// Writes `report` to `file` whole or not at all: beside it first, then moved there.

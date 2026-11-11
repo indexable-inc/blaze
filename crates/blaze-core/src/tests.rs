@@ -462,6 +462,28 @@ fn a_lock_excludes_another_until_it_is_let_go_of() {
     assert_eq!(locks(&mut crate::native(&dir("locks-native"), 1).unwrap()), want, "native");
 }
 
+/// A lock let go of is free at once though another descriptor of its open file is still open,
+/// as a child's is between this process's fork and the child's exec: the unlock lets the lock
+/// go, not the close. (Closing alone left the lock standing until the child's exec, so a test
+/// that spawned beside `a_lock_excludes_another_until_it_is_let_go_of` made its second take
+/// contend.)
+#[cfg(unix)]
+#[test]
+fn a_lock_let_go_of_is_free_though_a_copy_of_its_descriptor_is_open() {
+    let root = dir("locks-copied");
+    let file = name("history/lock");
+    let mut locks = crate::locks::Locks::new();
+    let taken = locks.lock(&root, &file, crate::LockMode::Exclusive, Tag(1)).unwrap();
+    assert_eq!(taken, Done::Locked);
+    // What a fork gives the child: a second descriptor of the same open file.
+    let copy = locks.copy_of(Tag(1)).expect("the lock's file is copied");
+    assert_eq!(locks.unlock(Tag(1)).unwrap(), Done::Unlocked);
+    let again = locks.lock(&root, &file, crate::LockMode::Exclusive, Tag(2)).unwrap();
+    assert_eq!(again, Done::Locked, "the lock is free while the copy is open");
+    drop(copy);
+    assert_eq!(locks.unlock(Tag(2)).unwrap(), Done::Unlocked);
+}
+
 /// A time with nanoseconds below the second, and a whole number of NTFS's 100 ns, so every
 /// file system the tests run on keeps it exactly.
 const TIME: u64 = 1_700_000_000_123_456_700;

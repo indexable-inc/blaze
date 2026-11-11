@@ -1312,3 +1312,163 @@ fn the_oracle_catches_a_crate_above_a_written_one_left_without_a_job() {
         "`main` kept the map from before `lib` gained `B`, and the oracle found no difference"
     );
 }
+
+/// ripgrep's crate root in miniature: the edited `fn main` is in the root file, which declares
+/// a `#[macro_use]` child whose file exports `macro_rules!` macros (so the root's textual scope
+/// and its `#[macro_export]` share come from a child's file), then more children, with items
+/// after `main`; the other modules call the macros. `body` is the start of `main`'s body,
+/// `item` what is written after `main`.
+fn rooted_text(body: &str, item: &str) -> String {
+    format!(
+        "
+use crate::flags::Mode;
+
+#[macro_use]
+mod messages;
+
+mod flags;
+mod search;
+
+static LIMIT: u32 = 1;
+
+fn main() {{{body}
+    eprintln_locked!(\"{{}}\", 1);
+    run();
+}}
+{item}
+fn run() {{
+    message!(\"run\");
+    search::search();
+}}
+
+fn after(_: Mode) {{}}
+"
+    )
+}
+
+/// The fixture of [`rooted_text`], its crate's def map read: the database, the root file and
+/// the crate.
+fn rooted() -> (TestDB, FileId, Crate) {
+    let fx = fixture::db(&format!(
+        r#"
+//- /main.rs
+{}
+//- /messages.rs
+#[macro_export]
+macro_rules! eprintln_locked {{
+    ($($tt:tt)*) => {{{{}}}};
+}}
+#[macro_export]
+macro_rules! message {{
+    ($($tt:tt)*) => {{ eprintln_locked!($($tt)*) }};
+}}
+//- /flags/mod.rs
+mod defs;
+pub(crate) use self::defs::Mode;
+//- /flags/defs.rs
+pub(crate) enum Mode {{ A }}
+fn f() {{ message!("defs"); }}
+//- /search.rs
+pub(crate) fn search() {{ message!("search"); }}
+"#,
+        rooted_text("", "")
+    ));
+    let file = fx.file_at("/main.rs").file_id(fx.db());
+    let db = fx.into_db();
+    let krate = crate::test_db::TestDBExt::fetch_test_crate(&db);
+    crate_local_def_map(&db, krate);
+    (db, file, krate)
+}
+
+/// The invariant: an edit inside one function's body sets no module's scope and no field of
+/// its crate's resolution, in the crate root's file as in any other and whatever the root's
+/// children export to its textual scope: a body binds no name of a module. On ripgrep
+/// 2026-11-10 a one-line edit of `rg::main` wrote 25 `ScopeInput`s, and 841
+/// `ScopeInput::name` and 833 `ScopeInput::legacy_macro` ran again for them, which every
+/// body of the crate then verified through.
+#[test]
+fn a_body_edit_in_a_crate_root_whose_children_export_macros_sets_no_scope() {
+    let (mut db, file, krate) = rooted();
+    let before = super::publish::Slices::of(&db, krate);
+    for body in ["\n    let _edit = 1;", "\n    let _edit = 2;", ""] {
+        let work =
+            work_of(&mut db, krate, |db| db.set_file_text(file, &rooted_text(body, "")));
+        assert_eq!(work.slices, 0, "a body edit ({body:?}) set inputs of the resolution: {work:?}");
+    }
+    let after = super::publish::Slices::of(&db, krate);
+    assert_eq!(
+        before.differing(&after),
+        Vec::<String>::new(),
+        "fields of the crate's resolution set"
+    );
+}
+
+/// The control of [`a_body_edit_in_a_crate_root_whose_children_export_macros_sets_no_scope`]:
+/// the same write with an item added after `main` (what an edit that renumbers or moves a
+/// module's items would look like to the maintainer) sets the root's scope, and the count the
+/// oracle reads says so.
+#[test]
+fn the_oracle_catches_an_edit_of_a_crate_root_that_changes_a_scope() {
+    let (mut db, file, krate) = rooted();
+    let work = work_of(&mut db, krate, |db| {
+        db.set_file_text(file, &rooted_text("\n    let _edit = 1;", "fn added() {}"))
+    });
+    assert!(work.slices >= 1, "an item added to the root sets its scope: {work:?}");
+}
+
+/// `lib` parses a file with `include!`, as serde_core does its build script's `private.rs`;
+/// `main` depends on it.
+const INCLUDES: &str = "//- /main.rs crate:main deps:lib\npub fn main() { lib::made(); }\n//- /lib.rs crate:lib\n#[rustc_builtin_macro]\nmacro_rules! include { () => {} }\ninclude!(\"gen.rs\");\npub struct A;\n//- /gen.rs\npub fn made() {}\n";
+
+/// The invariant: a crate that expanded an `include!` has a job in a write only when the
+/// write holds a file one of its logs or expansions read: the file its `include!` parsed, not
+/// any file it does not define. So an edit of a crate above it gives it no job and sets
+/// nothing of it, and a write of the included file still reaches it: after either, every
+/// crate's maintained map is the one a fresh resolution makes (`check_db`).
+#[test]
+fn a_crate_that_includes_a_file_has_a_job_for_that_file_and_not_for_another_crates() {
+    let mut loaded = Loaded::new(INCLUDES);
+    let (main, lib) = (crate_at(&loaded, "/main.rs"), crate_at(&loaded, "/lib.rs"));
+    let file = loaded.file("/main.rs");
+    let went = went_over(&mut loaded.db, |db| {
+        db.set_file_text(file, "pub fn main() { let _edit = 1; lib::made(); }\n")
+    });
+    assert_eq!(went, vec![main], "an edit of `main`'s body is no write of a file `lib` read");
+    let mut failures = String::new();
+    check_db(&loaded.db, "a body of the crate above edited", &Exempt::NONE, false, &mut failures);
+    assert!(failures.is_empty(), "{failures}");
+
+    let included = loaded.file("/gen.rs");
+    let went = went_over(&mut loaded.db, |db| {
+        db.set_file_text(included, "pub fn made() {}\npub fn more() {}\n")
+    });
+    assert!(went.contains(&lib), "a write of the file `lib` includes is `lib`'s job: {went:?}");
+    let mut failures = String::new();
+    check_db(&loaded.db, "the included file gained an item", &Exempt::NONE, false, &mut failures);
+    assert!(failures.is_empty(), "{failures}");
+    let root = module_at(&loaded.db, lib, &[]);
+    let def_map = crate::nameres::crate_def_map(&loaded.db, lib);
+    assert!(
+        def_map.module(&loaded.db, root).scope(&loaded.db).get(&name("more")).values.is_some(),
+        "`lib` gained the item its included file gained"
+    );
+}
+
+/// The control of
+/// [`a_crate_that_includes_a_file_has_a_job_for_that_file_and_not_for_another_crates`]: with
+/// a crate given a job only for the files its modules are defined in, a write of the file it
+/// includes leaves `lib` the map from before, and the oracle says so.
+#[test]
+fn the_oracle_catches_an_include_whose_file_is_not_kept() {
+    let mut loaded = Loaded::new(INCLUDES);
+    let included = loaded.file("/gen.rs");
+    super::FORGETS_INCLUDED.set(true);
+    loaded.db.set_file_text(included, "pub fn made() {}\npub fn more() {}\n");
+    super::FORGETS_INCLUDED.set(false);
+    let mut failures = String::new();
+    check_db(&loaded.db, "the included file gained an item", &Exempt::NONE, false, &mut failures);
+    assert!(
+        !failures.is_empty(),
+        "`lib` kept the map from before its included file gained `more`, and the oracle found no difference"
+    );
+}

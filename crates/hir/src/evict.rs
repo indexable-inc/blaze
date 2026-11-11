@@ -68,6 +68,13 @@ pub fn drop_crates_after_store(db: &mut Db, crates: &[Crate], mir: bool) -> Drop
     dropped
 }
 
+/// Lets go of every crate's trait solver caches and nothing else: how many went. For a
+/// build's end that keeps its inference and MIR (blaze-cargo's release of an edit's build):
+/// the caches are of the revision that made them, so they go at every build's end.
+pub fn drop_every_solver_cache(db: &mut Db) -> usize {
+    hir_ty::evict::drop_solver_caches(db, &[], true)
+}
+
 /// After a build stored the code of `compiled`: drops every MIR, every constant's and
 /// static's value and the inference of `compiled`. A workspace body `blaze check` reads again
 /// is better left out of `compiled` when a check follows the build.

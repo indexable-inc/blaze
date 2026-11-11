@@ -598,17 +598,50 @@ pub(super) fn readlink_into(path: &CStr, into: &mut Vec<u8>) -> isize {
     read
 }
 
-/// Runs `argv[0]` with `argv` and `env` in place of this process. It returns only where it
-/// couldn't, with `errno` set.
-pub(super) fn execve(argv: &[CString], env: &[CString]) {
-    let mut args: Vec<*const libc::c_char> = Vec::with_capacity(argv.len() + 1);
-    args.extend(argv.iter().map(|it| it.as_ptr()));
-    args.push(std::ptr::null());
-    let mut envp: Vec<*const libc::c_char> = Vec::with_capacity(env.len() + 1);
-    envp.extend(env.iter().map(|it| it.as_ptr()));
-    envp.push(std::ptr::null());
-    // SAFETY: `args` and `envp` end with null and each other entry is a nul-terminated string
-    // of `argv` or `env`, borrowed for the call; `args[0]` is the program's path, or null with
-    // no `argv`, which the kernel refuses (EFAULT). Nothing is written through them.
-    unsafe { libc::execve(args[0], args.as_ptr(), envp.as_ptr()) };
+/// What an `execve` of `argv[0]` with `argv` and `env` takes, made ahead of it: the two
+/// vectors of pointers are allocated here, so that [`Exec::run`], made after a seccomp filter
+/// that reports the process's calls is installed, allocates nothing. An allocation there is
+/// the program's as far as the supervisor can tell: blaze's allocator seeds a heap it makes
+/// with `getrandom`, which a traced run records as randomness the program read.
+pub(super) struct Exec<'a> {
+    args: Vec<*const libc::c_char>,
+    envp: Vec<*const libc::c_char>,
+    of: std::marker::PhantomData<&'a [CString]>,
+}
+
+impl<'a> Exec<'a> {
+    pub(super) fn new(argv: &'a [CString], env: &'a [CString]) -> Exec<'a> {
+        // alloc: the two vectors of an exec, once a program run, before its filter
+        let mut args: Vec<*const libc::c_char> = Vec::with_capacity(argv.len() + 1);
+        args.extend(argv.iter().map(|it| it.as_ptr()));
+        args.push(std::ptr::null());
+        // alloc: as above
+        let mut envp: Vec<*const libc::c_char> = Vec::with_capacity(env.len() + 1);
+        envp.extend(env.iter().map(|it| it.as_ptr()));
+        envp.push(std::ptr::null());
+        Exec { args, envp, of: std::marker::PhantomData }
+    }
+
+    /// Runs the program in place of this process. It returns only where it couldn't, with
+    /// `errno` set. One system call and nothing else: no allocation, no lock.
+    pub(super) fn run(&self) {
+        // SAFETY: `args` and `envp` end with null and each other entry is a nul-terminated
+        // string of the `argv` or `env` this was made of, borrowed for `'a`; `args[0]` is the
+        // program's path, or null with no `argv`, which the kernel refuses (EFAULT). Nothing
+        // is written through them.
+        unsafe { libc::execve(self.args[0], self.args.as_ptr(), self.envp.as_ptr()) };
+    }
+}
+
+/// What the system says of `errno`, into `room`, without allocating (`strerror_r`); nothing
+/// where it has no text for it.
+pub(super) fn error_text(errno: c_int, room: &mut [u8; 128]) -> &[u8] {
+    // SAFETY: `room` is writable for its length, which the call is given; it writes a
+    // nul-terminated string there or nothing.
+    let said = unsafe { libc::strerror_r(errno, room.as_mut_ptr().cast(), room.len()) };
+    let len = match said {
+        0 => room.iter().position(|it| *it == 0).unwrap_or(room.len()),
+        _ => 0,
+    };
+    &room[..len]
 }

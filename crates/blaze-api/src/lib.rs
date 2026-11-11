@@ -559,8 +559,8 @@ pub enum RebuildCause {
     /// under it: that compute did not keep it.
     Lost { since: u64 },
     /// Its key is the one it had when last computed, in build `since`, which did not end well
-    /// (it failed or was stopped), and nothing is kept under it: that compute likely failed or
-    /// was stopped before it kept anything.
+    /// (it failed or was stopped), and nothing is kept under it. Whether its own compute failed
+    /// is not recorded here: that build's `errors` rows say.
     Unfinished { since: u64 },
     /// It was last computed in build `since`, and that is all blaze why's ledger kept of it:
     /// its record's parts were dropped to keep the ledger under its cap, so what changed

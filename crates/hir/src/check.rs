@@ -195,7 +195,7 @@ pub fn check_crates<'db>(
     crates: &[Crate],
     style_lints: bool,
 ) -> Vec<(Crate, Vec<AnyDiagnostic<'db>>)> {
-    let found = Plan::new(db, crates, &every_body).run(db, style_lints);
+    let found = Plan::of_every_body(db, crates).run(db, style_lints);
     // alloc: once a check, its result, a pair per crate
     crates.iter().copied().zip(found).collect()
 }

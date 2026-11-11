@@ -2686,6 +2686,12 @@ impl<'a, B: Prepare> Build<'a, B> {
             let span = tracing::info_span!(
                 target: "blaze",
                 "codegen walk",
+                // The one field of this span the profile keeps a column for (`function`):
+                // whether the walk was patched or ran whole and why, with what it asked and
+                // described, said as the walk ends. The counts below reach a subscriber that
+                // reads fields; the profile's parquet has no column for them, so until
+                // 2026-11-10 a 2 s walk's row said nothing of which walk it was.
+                function = tracing::field::Empty,
                 roots = roots.len(),
                 described = tracing::field::Empty,
                 verified = tracing::field::Empty,
@@ -2717,6 +2723,13 @@ impl<'a, B: Prepare> Build<'a, B> {
                     span.record("resolved", work.resolved);
                     span.record("built_in", work.built_in);
                     span.record("owners", work.owners);
+                    span.record(
+                        "function",
+                        tracing::field::display(format_args!(
+                            "patched: asked {} functions and statics of {} groups, described {}",
+                            work.asked, work.groups, work.described
+                        )),
+                    );
                     (nodes, statics, roots, walk, Some(keep), Some((touched, work)))
                 }
                 Err(why) => {
@@ -2744,6 +2757,13 @@ impl<'a, B: Prepare> Build<'a, B> {
             }
             if let Some(whole) = walk.whole {
                 span.record("whole", whole);
+                span.record(
+                    "function",
+                    tracing::field::display(format_args!(
+                        "whole ({whole}): described {}, verified {}, reached {}",
+                        walk.described, walk.verified, walk.reached
+                    )),
+                );
             }
             walked
         };

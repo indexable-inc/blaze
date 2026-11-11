@@ -2704,16 +2704,21 @@ mod tests {
     /// byte for byte, and lists exactly the files on disk.
     #[test]
     fn the_manifest_round_trips_through_flushes_a_merge_and_a_reopen() {
+        // Past any build another test of this process writes rows of: a flush is named for
+        // the highest build its rows are of, and the rings are the process's, so a flush here
+        // that took a row of a higher build would be named for it and left out of this
+        // build's merge (with build 5, a run beside the other tests read 3 rows merged of 4).
+        const BUILD: u64 = 8_000_005;
         let dir = scratch("manifest-round-trip");
         let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
         // The first flush takes what the rings hold, other tests' builds' rows among them.
         history.flush(None).unwrap();
         for _ in 0..3 {
-            history.build_ended(row(5, Outcome::Ok));
+            history.build_ended(row(BUILD, Outcome::Ok));
             history.flush(None).unwrap();
         }
-        history.build_ended(row(5, Outcome::Ok));
-        let ended = history.flush(Some(5)).unwrap();
+        history.build_ended(row(BUILD, Outcome::Ok));
+        let ended = history.flush(Some(BUILD)).unwrap();
         assert!(ended.compacted >= 1, "the build's end merges its files: {ended:?}");
         drop(history);
         let bytes = fs::read(dir.join(manifest::FILE)).unwrap();
@@ -2723,7 +2728,7 @@ mod tests {
         assert_eq!(written.flushed(), ended.seq);
         assert_eq!(listed_rows(&dir, &schema::BUILDS), 4, "each build row once");
         let entry = written.entries(schema::BUILDS.name).next().unwrap().1;
-        assert_eq!((entry.version, entry.rows, entry.builds), (schema::VERSION, 4, Some([5, 5])));
+        assert_eq!((entry.version, entry.rows, entry.builds), (schema::VERSION, 4, Some([BUILD, BUILD])));
         assert_eq!(entry.boot.as_deref(), clock::boot());
 
         let history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();

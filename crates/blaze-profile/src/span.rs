@@ -18,9 +18,10 @@
 //! (`crate`, `function`, `unit`, each by its field names) and the typed ones whose value is a
 //! [`Name`] (`awaits`), by the column's own name. The typed columns of numbers and enums
 //! (`owner`, `steps`, `job`, `outcome`, ...) mean what their kind says (a pool job, a plane
-//! node), so only a kind writes them. A field of any other name reaches no column, and
-//! `blaze::span_field_unrecorded` refuses it where it is written ([`ad_hoc_fields`] is the
-//! lint's list).
+//! node), so only a kind writes them. A field of any other name is kept as `name=value` text in
+//! the column `fields` (the one typed column no kind writes), so adding a field to a span needs
+//! no column; `blaze::span_field_unrecorded` refuses only a name that collides with a kind's
+//! column or that the text can't hold apart ([`ad_hoc_field_refused`]).
 
 use std::{
     cell::RefCell,
@@ -330,6 +331,9 @@ pub struct Said {
 
 const CRATE: usize = <col::Crate as Column>::AT;
 const FUNCTION: usize = <col::Function as Column>::AT;
+/// The column an ad hoc span's fields of no other column are kept in, as text
+/// ([`col::Fields`]): the one typed column no kind writes.
+pub(crate) const FIELDS_AT: usize = <col::Fields as Column>::AT;
 const UNIT: usize = <col::Unit as Column>::AT;
 
 impl Said {
@@ -722,7 +726,7 @@ pub struct KindTable {
 }
 
 /// The columns every kind's view has, before its fields.
-const VIEW_COLUMNS: &str =
+pub(crate) const VIEW_COLUMNS: &str =
     "build_id, process, thread, thread_name, span_id, parent, depth, start_ns, dur_ns, self_cpu_ns";
 
 /// Writes into `out` one view a kind, `span_<name>` (`span_macro_expand`): its rows of `spans`
@@ -843,7 +847,7 @@ macro_rules! span_kinds {
         };
         $(
             const _: () = assert!(
-                WRITTEN[Index::$T as usize],
+                WRITTEN[Index::$T as usize] || Index::$T as usize == Index::Fields as usize,
                 concat!("no span kind writes the column `", $tname, "`: give a kind a field `=> ", stringify!($T), "` or remove it")
             );
         )*
@@ -970,6 +974,8 @@ span_kinds! {
             "the bytes a daemon `task`'s work allocated from the global heap in all, never netted against its frees, its fan-out's included (`blaze_graph::arena::Spent`): far past `peak_bytes`, the task churns the heap; null for a task that gave way or panicked, and any other span";
         HeapFreed = "heap_freed_bytes" (U64): u64,
             "the bytes a daemon `task`'s work freed to the global heap in all, whoever allocated them (a memo it replaced counts); null as `heap_allocated_bytes` is";
+        Fields = "fields" (Utf8): Name,
+            "an ad hoc span's fields that fill no other column, as `key=value` text in the order it recorded them, a space between (cut at 1 KiB): a field of any name is kept, so adding one needs no column; null for a span with none, for a span of a kind, and for one too short for a row of its own (`folded`); null in files of a blaze before it";
     }
     kinds {
         /// A unit's names phase: its crate's names resolved, or its record replayed.
@@ -1045,10 +1051,36 @@ pub fn ad_hoc_fields() -> impl Iterator<Item = &'static str> {
     GENERIC_FIELDS.iter().copied().chain(typed).chain([flight::HELD_FIELD])
 }
 
-/// Whether the field `field` of an ad hoc span reaches the profile: it is one of
-/// [`ad_hoc_fields`].
+/// Why the profile keeps nothing of the field `field` of an ad hoc span; `None` for a field it
+/// keeps, which is every other one: a field of [`ad_hoc_fields`] fills its column, and a field
+/// of any other name is kept as `name=value` in `spans.fields` ([`col::Fields`]), so adding a
+/// field never needs a column. Refused, where `blaze::span_field_unrecorded` reads it: a name
+/// that is a `spans` column only a span kind writes (`owner`, `steps`, `job`: the column would
+/// stay null beside a `fields` text that reads as if it were filled), and a name that is not
+/// letters, digits and `_` (`job.id`), which the `key=value` text can't hold apart.
+pub fn ad_hoc_field_refused(field: &str) -> Option<&'static str> {
+    if ad_hoc_column(field).is_some() || field == flight::HELD_FIELD {
+        return None;
+    }
+    if CELLS.iter().any(|it| it.column.name == field) {
+        return Some(
+            "it is the name of a `spans` column only a span kind writes, which an ad hoc span's field never fills: name the field something else, or open the kind",
+        );
+    }
+    let plain = !field.is_empty()
+        && field.bytes().all(|it| it.is_ascii_alphanumeric() || it == b'_');
+    if !plain {
+        return Some(
+            "`spans.fields` keeps a field as `name=value` text, which holds apart only names of letters, digits and `_`: rename it",
+        );
+    }
+    None
+}
+
+/// Whether the field `field` of an ad hoc span reaches the profile: in a column of its own
+/// ([`ad_hoc_fields`]) or in `spans.fields` ([`ad_hoc_field_refused`] says why not).
 pub fn ad_hoc_field_recorded(field: &str) -> bool {
-    ad_hoc_column(field).is_some() || field == flight::HELD_FIELD
+    ad_hoc_field_refused(field).is_none()
 }
 
 /// The names of the unit phase spans, in the order a unit runs them.
@@ -1236,6 +1268,58 @@ mod tests {
         assert_eq!(cell("awaits").as_deref(), what, "the `awaits` column");
     }
 
+    /// An ad hoc span's fields that fill no column of their own are kept, each as
+    /// `name=value` in its row's `fields`, in the order the span recorded them, a value given
+    /// later (`Span::record`) after the ones it began with; the fields with a column still
+    /// fill it and are not said twice. On 2026-11-10 a span was given `what` and `function`
+    /// and the profile kept neither `what` nor, until its column was fixed, `awaits`.
+    #[test]
+    fn an_ad_hoc_spans_fields_of_no_column_are_kept_as_text() {
+        const NAME: &str = "span kinds with fields of no column";
+        crate::install();
+        let tid = std::thread::spawn(|| {
+            let span = tracing::info_span!(
+                target: "blaze",
+                "span kinds with fields of no column",
+                function = "place outputs",
+                what = "the image",
+                runs = 3,
+                why = tracing::field::Empty,
+            );
+            span.record("why", "memory is short");
+            // Long enough for a row of its own: a span under `flight::FOLD_BELOW` is summed.
+            std::thread::sleep(Duration::from_millis(2));
+            drop(span);
+            let plain = tracing::info_span!(target: "blaze", "span kinds with no field");
+            std::thread::sleep(Duration::from_millis(2));
+            drop(plain);
+            crate::sampler::os_tid() as u32
+        })
+        .join()
+        .unwrap();
+        let rows = rows_of(tid);
+        let row = |name: &str| {
+            rows.iter()
+                .find(|it| flight::meta(it.site).map(|it| it.name()) == Some(name))
+                .unwrap_or_else(|| panic!("`{name}` is a row"))
+        };
+        let said = row(NAME);
+        assert_eq!(
+            said.get::<col::Fields>().and_then(Name::text).as_deref(),
+            Some("what=the image runs=3 why=memory is short"),
+            "`function` has a column of its own and is not said twice"
+        );
+        assert_eq!(said.get::<col::Function>().and_then(Name::text).as_deref(), Some("place outputs"));
+        assert_eq!(row("span kinds with no field").get::<col::Fields>(), None);
+
+        let batch =
+            batches::spans(&rows, Process { pid: 1, name: "span kinds test", commit: None })
+                .unwrap();
+        let at = rows.iter().position(|it| std::ptr::eq(it, said)).unwrap();
+        let fields = batch.column_by_name("fields").expect("`fields` is a column of `spans`");
+        assert_eq!(text_at(fields.as_ref(), at), Some("what=the image runs=3 why=memory is short"));
+    }
+
     /// [`ad_hoc_fields`], the list `blaze::span_field_unrecorded` holds a span's fields to, is
     /// the columns of `spans` that hold a name and nothing else: each of its fields fills such
     /// a column, each such column is filled by the field of its own name, and a column of
@@ -1256,9 +1340,14 @@ mod tests {
             assert_eq!(ad_hoc_fields().any(|it| it == name), named.is_some(), "the column `{name}`");
         }
         assert!(ad_hoc_field_recorded(flight::HELD_FIELD), "the recorder reads `held`");
-        for unrecorded in ["what", "placing", "runs", "owner", "steps", "message"] {
-            assert!(!ad_hoc_field_recorded(unrecorded), "`{unrecorded}` reaches no column");
-            assert!(ad_hoc_fields().all(|it| it != unrecorded), "`{unrecorded}`");
+        // A field of any other name is kept in `fields`; only a name that collides with a
+        // column a kind writes, or that the `key=value` text can't hold apart, is refused.
+        for kept in ["what", "placing", "runs", "message", "why"] {
+            assert!(ad_hoc_field_recorded(kept), "`{kept}` is kept in `fields`");
+            assert!(ad_hoc_fields().all(|it| it != kept), "`{kept}` has no column of its own");
+        }
+        for refused in ["owner", "steps", "job", "job.id", "", "a b", "k=v"] {
+            assert!(ad_hoc_field_refused(refused).is_some(), "`{refused}` is refused");
         }
     }
 

@@ -1,9 +1,11 @@
 //! `span_field_unrecorded`: a field of a `tracing` span or event of the target `blaze` that
-//! the profile keeps nothing of. An ad hoc span's fields reach the profile only through the
-//! columns of `spans` that hold a name ([`blaze_profile::span::ad_hoc_fields`]: `crate`,
-//! `function`, `unit` and their other field names, `awaits`, and `held`, which the recorder
-//! reads): a field of any other name is formatted at every call and never seen, so a span
-//! written to say what a wait is for (`what = ..`) says nothing in the profile. An event's
+//! the profile keeps nothing of. An ad hoc span's field fills the column of `spans` its name
+//! is a field of ([`blaze_profile::span::ad_hoc_fields`]: `crate`, `function`, `unit` and
+//! their other field names, `awaits`, and `held`, which the recorder reads), and a field of any
+//! other name is kept as `name=value` text in `spans.fields`, so a span written to say what a
+//! wait is for (`what = ..`) says it. Two kinds of name are kept nowhere
+//! ([`blaze_profile::span::ad_hoc_field_refused`]): the name of a column only a span kind
+//! writes (`owner`, `job`), and a name that is not letters, digits and `_` (`job.id`). An event's
 //! fields are rows of `event_fields`, each by its place among them
 //! ([`blaze_profile::flight::event_field_recorded`]), whatever its name.
 //!
@@ -59,23 +61,11 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         // A raw identifier names the field without its `r#`.
         let name = name.strip_prefix("r#").unwrap_or(name);
         let message = match made {
-            Made::Span if blaze_profile::span::ad_hoc_field_recorded(name) => return,
             Made::Event if blaze_profile::flight::event_field_recorded(field.at) => return,
             Made::Span => {
-                // alloc: a message's part
-                let mut kept = String::new();
-                for (at, field) in blaze_profile::span::ad_hoc_fields().enumerate() {
-                    if at > 0 {
-                        kept.push_str(", ");
-                    }
-                    kept.push('`');
-                    kept.push_str(field);
-                    kept.push('`');
-                }
+                let Some(why) = blaze_profile::span::ad_hoc_field_refused(name) else { return };
                 let span = read.name.map_or("this span", |it| it.text());
-                format!(
-                    "the profile keeps nothing of the field `{name}` of the span {span}: `spans` has no column a span's field of that name fills (the fields that reach one: {kept})"
-                )
+                format!("the profile keeps nothing of the field `{name}` of the span {span}: {why}")
             }
             Made::Event => format!(
                 "the profile keeps nothing of the field `{name}` of this event: `event_fields` keeps an event's first {} fields",
@@ -275,10 +265,12 @@ macro_rules! info { ($($t:tt)*) => { $crate::event!($($t)*) }; }
         format!("//- minicore: sized\n//- /src/lib.rs crate:main deps:tracing\n{main}\n{TRACING}")
     }
 
-    /// Every field a span names that fills a column of `spans` passes, however it is written;
-    /// one that fills none is found by its name, with the span's and the fields that do.
+    /// Every field a span names passes, however it is written: one that fills a column of
+    /// `spans`, and one of any other name, which `spans.fields` keeps. A field named as a
+    /// column only a kind writes, or by a name the `fields` text can't hold apart, is found
+    /// by its name, with the span's and why.
     #[test]
-    fn a_spans_field_with_no_column_is_found_by_name_and_one_with_a_column_is_not() {
+    fn a_spans_field_is_kept_unless_its_name_collides_or_is_malformed() {
         let found = lint(
             &fixture(
                 r#"
@@ -296,23 +288,18 @@ pub struct Job { owner: u32 }
         );
         assert!(!found.contains("every field has a column"), "{found}");
         assert!(!found.contains("no fields"), "{found}");
-        assert!(found.contains("the field `what` of the span \"the answer waits\""), "{found}");
-        assert!(found.contains("the field `placing` of the span \"the answer waits\""), "{found}");
-        assert!(found.contains("the field `runs` of the span \"spanned\""), "{found}");
+        // A field of a name with no column is kept in `spans.fields`: on 2026-11-10 `what`
+        // recorded on a span was in no row.
+        assert!(!found.contains("the answer waits"), "{found}");
+        assert!(!found.contains("\"spanned\""), "{found}");
+        // A dotted name is one the `name=value` text can't hold apart.
         assert!(found.contains("the field `job.id` of the span \"dotted and marked\""), "{found}");
-        assert!(found.contains("the field `job` of the span \"dotted and marked\""), "{found}");
         // A column of numbers is a span kind's to write, never an ad hoc span's.
+        assert!(found.contains("the field `job` of the span \"dotted and marked\""), "{found}");
         assert!(found.contains("the field `owner` of the span \"dotted and marked\""), "{found}");
-        assert_eq!(found.matches(NOTHING).count(), 6, "{found}");
-        // The message lists the profile's own list, whatever it holds.
-        let mut kept = String::new();
-        for field in blaze_profile::span::ad_hoc_fields() {
-            kept.push_str(if kept.is_empty() { "`" } else { ", `" });
-            kept.push_str(field);
-            kept.push('`');
-        }
-        assert!(found.contains(&format!("(the fields that reach one: {kept})")), "{found}");
-        assert!(kept.contains("`function`") && kept.contains("`awaits`"), "{kept}");
+        assert_eq!(found.matches(NOTHING).count(), 3, "{found}");
+        assert!(found.contains("only a span kind writes"), "{found}");
+        assert!(found.contains("letters, digits and `_`"), "{found}");
     }
 
     /// Only a call of the crate `tracing` that names the literal target `blaze`, at a level
@@ -377,7 +364,9 @@ fn events(what: u32, n: u32) {{
         for field in blaze_profile::span::ad_hoc_fields() {
             assert!(blaze_profile::span::ad_hoc_field_recorded(field), "`{field}`");
         }
-        assert!(!blaze_profile::span::ad_hoc_field_recorded("what"));
+        assert!(blaze_profile::span::ad_hoc_field_recorded("what"), "kept in `spans.fields`");
+        assert!(!blaze_profile::span::ad_hoc_field_recorded("owner"));
+        assert!(!blaze_profile::span::ad_hoc_field_recorded("job.id"));
         assert!(blaze_profile::flight::event_field_recorded(0));
         assert!(!blaze_profile::flight::event_field_recorded(blaze_profile::flight::EVENT_FIELDS));
     }

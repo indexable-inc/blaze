@@ -789,13 +789,17 @@ mod tests {
             let mut writer = ArrowWriter::try_new(&mut bytes, batch.schema(), None).unwrap();
             writer.write(&batch).unwrap();
             writer.close().unwrap();
+            // Read back as one batch however many rows it is: the window holds every row the
+            // process's rings do, the tests' beside this one included, and the reader's own
+            // batch is 1024 rows.
             let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes))
                 .unwrap()
+                .with_batch_size(batch.num_rows().max(1))
                 .build()
                 .unwrap();
             let mut batches = reader.map(Result::unwrap);
             let back = batches.next().unwrap();
-            assert!(batches.next().is_none(), "a test's rows are one batch");
+            assert!(batches.next().is_none(), "the rows written are read back as one batch");
             assert_eq!(back.num_rows(), batch.num_rows());
             back
         };

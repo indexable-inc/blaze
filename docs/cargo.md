@@ -1101,6 +1101,50 @@ the checkout, one with `-C profile-use`, one whose outputs are named through a s
 with `BLAZE_PROFILE` set (there is then a build to trace). `blaze why` after a build that
 walked and computed nothing names the input that moved or that nothing covers.
 
+### The client's share, and building on save (specified 2026-11-11, not built)
+
+Measured 2026-11-10 on a 32-core Linux VM: a no-op `blaze build` took 92 to 110 ms of which
+the daemon's answer was 0.4 ms. The rest is the `blaze` process: its start, its command line,
+finding the pin and the daemon, and its exit. Two changes take that away; neither is built.
+
+**`blaze` asks before it sets anything up.** `blaze-fast` (docs/client.md) is already the
+client with nothing else in it: it connects to the daemon's socket, sends one request and
+prints the answers. `blaze build|check|run|test` with only the options `blaze-fast` reads
+takes the same path as its first act: before tracing, before the allocator's tags, before
+the pin and toolchain are looked for, it resolves the daemon's socket for its directory
+(`blaze_client::start`'s lookup, no launch), and when a daemon of its own version answers it
+is the client and nothing more. With no daemon, a daemon of another version, or a word
+`blaze-fast` refuses, it goes on as today; this is one command's two entry points, not a
+fallback, and what it prints is the same bytes either way. The budget: a no-op `blaze build`
+within 5 ms of the daemon's answer, held by budgets.py's no-op row once built.
+
+**The daemon builds when a watched file is saved.** The daemon already watches each open
+checkout. When its watcher commits a change to a source file, the daemon starts the build
+the checkout's last request asked for (the same command, arguments and environment: the
+view's config), so the `blaze build` or `blaze run` typed afterwards finds the answer kept
+and is the no-op lane's. The policy:
+
+- Which build: the checkout's last successful or failed `build`, `check`, `run` or `test`
+  request, once; a checkout nothing has built is not built.
+- On by default for a checkout with a request in the last ten minutes, off with
+  `[blaze] build-on-save = false` in `.cargo/config.toml` or `BLAZE_BUILD_ON_SAVE=0`; it
+  never runs the program or a test, only their build.
+- Debounced: it starts 20 ms after the last change the watcher heard, on the daemon's
+  injected clock.
+- Cancellable: a later change sets the job's stop flag (the one a request's cancel sets) and
+  the build starts again from the new view; a request for the same build that arrives while
+  it runs joins it and takes its answer. Each wait has a bound and a typed end
+  (`bounded-progress`): started, joined, cancelled by a change, or refused.
+- With a live `blaze run` session the save's build is the session's patch: the daemon builds
+  and patches the running program without a request, as `blaze run` does on its own rebuild.
+- It is a job like any other to admission and memory: it yields its workers to a request
+  that arrives for another checkout.
+
+Proof when built: a deterministic simulation over the watcher's core (changes, the clock, a
+request arriving before, during and after the save's build) whose oracle is that every
+request's answer is the answer of a build of the view it was asked at, with a planted bug
+that answers from the view before the last change.
+
 ### Cores and priority
 
 By default blaze leaves two cores to the rest of the machine and runs at background priority,

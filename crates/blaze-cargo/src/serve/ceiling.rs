@@ -120,6 +120,7 @@ pub fn hold(bytes: u64, from: &str) -> anyhow::Result<Bound> {
     let pid = std::process::id();
     // alloc: once a ceiling is set
     let said = format!("blaze serve: pid {pid}{SAYS}{bytes} bytes ({} GiB), {bound}{FROM}{from}", Gib(bytes));
+    // logged: the info event below
     eprintln!("{said}");
     tracing::info!(target: "blaze", "{said}");
     Ok(bound)

@@ -143,6 +143,73 @@ fn only_crates_outside_the_workspace_are_eligible() {
     assert_eq!(names(&db, &keys.keys().copied().collect::<Vec<_>>()), ["core", "lib"]);
 }
 
+/// A map of keys as a list in crate order, to compare and to show.
+fn sorted(keys: &HashMap<Crate, ContentId, Global>) -> Vec<(Crate, ContentId)> {
+    let mut list: Vec<(Crate, ContentId)> =
+        keys.iter().map(|(&krate, &key)| (krate, key)).collect();
+    list.sort_unstable_by_key(|it| it.0);
+    list
+}
+
+/// The oracle of `a_kept_walk_keys_each_crate_once_and_as_one_walk_does`: `asks` made of
+/// `walk` one after another at `db`, what they keyed added to `union`; why the union is not
+/// what one walk of every crate of `db` gives, or `None`.
+fn kept_walk_differs(
+    db: &TestDB,
+    asks: &[Crate],
+    walk: &mut KeyWalk,
+    union: &mut HashMap<Crate, ContentId, Global>,
+) -> Option<String> {
+    for &ask in asks {
+        let more = walk.more(db, &[ask], BUILD);
+        if let Some(krate) = more.keys().find(|it| union.contains_key(*it)) {
+            return Some(format!("{} was keyed twice", krate.named(db)));
+        }
+        union.extend(more);
+    }
+    let (kept, whole) = (sorted(union), sorted(&keys(db, &all(db), BUILD)));
+    (kept != whole).then(|| format!("the kept walk keyed {kept:?}, one walk keys {whole:?}"))
+}
+
+/// The invariant: at one view of one database by one `build`, the keys a [`KeyWalk`] gives
+/// over any sequence of asks are those one walk of all the crates gives, each crate keyed
+/// once: so keeping the walk between a build's serves changes no key (rule 21), and a serve
+/// costs the crates it is the first to ask for. Every order of asking the fixture's crates
+/// one at a time, each asked again after. Its control is
+/// `the_oracle_catches_a_walk_kept_across_a_write`.
+#[test]
+fn a_kept_walk_keys_each_crate_once_and_as_one_walk_does() {
+    let db = fixture::db(FIXTURE).into_db();
+    let crates = all(&db);
+    assert_eq!(crates.len(), 3);
+    for order in [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
+        let asks: Vec<Crate> = order.iter().map(|&at| crates[at]).collect();
+        let (mut walk, mut union) = (KeyWalk::new(), HashMap::new_in(Global));
+        assert_eq!(kept_walk_differs(&db, &asks, &mut walk, &mut union), None, "{order:?}");
+        assert_eq!(walk.len(), 3, "every crate walked, the member too");
+        // Asked again: nothing is keyed, and nothing changes.
+        assert_eq!(kept_walk_differs(&db, &asks, &mut walk, &mut union), None, "{order:?}");
+    }
+}
+
+/// The planted bug: a walk kept across a write of an input (a dependency's text), not
+/// cleared: it goes on giving nothing for the crates it keyed before, whose keys moved.
+#[test]
+fn the_oracle_catches_a_walk_kept_across_a_write() {
+    let db = fixture::db(FIXTURE).into_db();
+    let (mut walk, mut union) = (KeyWalk::new(), HashMap::new_in(Global));
+    assert_eq!(kept_walk_differs(&db, &all(&db), &mut walk, &mut union), None);
+    let edited = FIXTURE.replace("pub trait Sized {}", "pub trait Sized {}\npub struct More;");
+    let written = fixture::db(&edited).into_db();
+    let why = kept_walk_differs(&written, &all(&written), &mut walk, &mut union)
+        .expect("the oracle missed a walk kept across a write");
+    assert!(why.contains("one walk keys"), "{why}");
+    // Cleared, as its caller does when the view moves, it keys the written database rightly.
+    walk.clear();
+    union.clear();
+    assert_eq!(kept_walk_differs(&written, &all(&written), &mut walk, &mut union), None);
+}
+
 #[test]
 fn a_library_on_a_member_is_not_eligible() {
     let db = fixture::db(

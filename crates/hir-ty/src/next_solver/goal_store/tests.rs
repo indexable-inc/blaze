@@ -602,8 +602,10 @@ fn an_answer_is_found_while_its_facts_hash_the_same_and_its_solver_matches() {
     assert_eq!(other.flush().unwrap(), Flushed::default());
 }
 
+/// A second answer under the same facts is the goal's refusal, named in what the flush did; it
+/// is not the flush's error, which would lose every other goal the build offered.
 #[test]
-fn two_answers_under_the_same_facts_stop_the_flush() {
+fn two_answers_under_the_same_facts_are_named_by_the_flush() {
     let mut db = db_of(FIXTURE);
     let krate = local_crate(&db);
     let knob = Knob::new(&db, Durability::LOW, 1, true, krate);
@@ -614,7 +616,9 @@ fn two_answers_under_the_same_facts_stop_the_flush() {
     installed.flush().unwrap();
     knob.set_holds(&mut db).to(false);
     offered(&db, knob);
-    let why = installed.flush().expect_err("the answer depends on a read the facts miss");
+    let flushed = installed.flush().expect("a goal's refusal stops no flush");
+    assert_eq!((flushed.written, flushed.failed), (0, 1), "{flushed:?}");
+    let why = flushed.failure.expect("the answer depends on a read the facts miss");
     assert!(why.contains("two answers under the same fact values"), "{why}");
 }
 

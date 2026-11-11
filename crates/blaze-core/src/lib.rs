@@ -410,8 +410,12 @@ pub enum Effect {
         tag: Tag,
     },
     /// `bytes` written at `at` of `file`, which exists, past its end making it longer; durable
-    /// once a later [`Effect::Sync`] of the file completes. Completes with [`Done::Written`].
-    /// For a link writing the pages that changed into a clone of the last executable.
+    /// once a later [`Effect::Sync`] of the file completes. Completes with [`Done::Written`]
+    /// once the system holds the bytes: through its page cache on every driver, whatever the
+    /// write's size and alignment, so it waits for no device (bytes that are to go around the
+    /// cache are an [`Effect::WriteFrom`] that says so, [`Cache::Bypassed`]).
+    /// For a link writing the pages that changed into a clone of the last executable, and
+    /// for an output written at its path from its maker's runs.
     WriteAt {
         file: FileName,
         at: u64,

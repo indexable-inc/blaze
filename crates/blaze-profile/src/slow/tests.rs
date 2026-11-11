@@ -89,13 +89,164 @@ fn report(switches: Vec<SwitchIn>, spans: Vec<SpanIn>, wall: i64, facts: &Facts)
     let path = path::critical(&model);
     let one = analyse(&model, &path, facts);
     assert_eq!(one, analyse(&model, &path, facts), "the same rows give the same report");
+    let ranked: Vec<&Finding> = one
+        .findings
+        .iter()
+        .filter(|it| !matches!(it.kind, Kind::NotKept | Kind::Unfinished))
+        .collect();
     assert!(
-        one.findings
+        ranked
             .windows(2)
             .all(|it| it[0].saves_ns >= it[1].saves_ns || it[1].estimate == Estimate::Unknown),
         "ranked by saving"
     );
     one
+}
+
+/// A build whose checkout's last build lost what it left for the store says so first, with the
+/// daemon's reason, before the serial work that is its consequence: on 2026-11-10 the line the
+/// daemon had printed after every build of ripgrep ("were not kept after its answer was sent")
+/// took an hour of reading a profile to find.
+#[test]
+fn what_the_last_build_lost_is_the_first_finding() {
+    let switches = || {
+        let mut switches = vec![switch(1, 0, Event::Started, 1), switch(1, 100, Event::Ended, 1)];
+        for it in 2..=4 {
+            switches.extend([
+                switch(it, 0, Event::Started, u64::from(it)),
+                switch(it, 10, Event::Ended, u64::from(it)),
+            ]);
+        }
+        switches
+    };
+    let lowering = || vec![span(1, 1, None, "impls publish", 0, 100, 1)];
+    let why = "the last build of /w (`build`) answered before what it left for the store was \
+               durable, and it was not kept: the item store: keeping the shape of the MIR of \
+               StaticId(StaticId(ae34)): two images were made under d1eed1fd";
+    let mut facts = workers(1..=4);
+    facts.misses = vec![
+        MissGroup {
+            step: "unit".to_owned(),
+            cause: "changed".to_owned(),
+            count: 40,
+            example: "ripgrep".to_owned(),
+            what: None,
+        },
+        MissGroup {
+            step: NOT_KEPT_STEP.to_owned(),
+            cause: "always".to_owned(),
+            count: 1,
+            example: "the last build of /w".to_owned(),
+            what: Some(why.to_owned()),
+        },
+    ];
+    let it = report(switches(), lowering(), 100, &facts);
+    let first = &it.findings[0];
+    assert_eq!((first.kind, first.fix), (Kind::NotKept, Fix::KeepResults), "{:#?}", it.findings);
+    assert_eq!(first.evidence, [why]);
+    assert!(it.findings.len() >= 2, "what it cost follows: {:#?}", it.findings);
+    assert!(it.findings[1..].iter().all(|it| it.kind != Kind::NotKept));
+    let text = text(&it, 1);
+    assert!(text.contains(" 1. saves ?  the last build's results were not kept"), "{text}");
+    assert!(text.contains("two images were made under"), "{text}");
+
+    // The control: with no such row, the same build's first finding is its serial work.
+    facts.misses.truncate(1);
+    let without = report(switches(), lowering(), 100, &facts);
+    assert!(without.findings.iter().all(|it| it.kind != Kind::NotKept), "{:#?}", without.findings);
+}
+
+/// A build that did the work its checkout's last, failed build left says so before its serial
+/// work: on 2026-11-10 the builds after a failed cold build took 56 s, 10 s and 22 s and read
+/// as slow no-ops.
+#[test]
+fn a_build_finishing_a_failed_one_says_so_first() {
+    let switches = vec![switch(1, 0, Event::Started, 1), switch(1, 100, Event::Ended, 1)];
+    let spans = vec![span(1, 1, None, "impls publish", 0, 100, 1)];
+    let why = "the last build of /w (build 41, `build`) failed with 212 of its 340 units not built";
+    let mut facts = workers(1..=4);
+    facts.misses = vec![MissGroup {
+        step: UNFINISHED_STEP.to_owned(),
+        cause: "always".to_owned(),
+        count: 1,
+        example: "the last build of /w".to_owned(),
+        what: Some(why.to_owned()),
+    }];
+    let it = report(switches, spans, 100, &facts);
+    let first = &it.findings[0];
+    assert_eq!((first.kind, first.fix), (Kind::Unfinished, Fix::CompareAfter), "{:#?}", it.findings);
+    assert_eq!(first.evidence, [why]);
+    assert!(text(&it, 1).contains(" 1. saves ?  the last build did not end well"));
+}
+
+/// What blaze said was wrong in a build is listed before its findings, each once with its
+/// count, and a build that said nothing lists nothing.
+#[test]
+fn the_problems_blaze_said_come_before_the_findings() {
+    let switches = vec![switch(1, 0, Event::Started, 1), switch(1, 100, Event::Ended, 1)];
+    let spans = vec![span(1, 1, None, "impls publish", 0, 100, 1)];
+    let mut facts = workers(1..=1);
+    facts.problems = vec![Problem {
+        level: "WARN".to_owned(),
+        source: "blaze event crates/blaze-cargo/src/serve/job.rs:3288".to_owned(),
+        what: "a build's results were not kept after its answer was sent: two images".to_owned(),
+        count: 12,
+        first_ns: 400_000_000,
+        last_ns: 900_000_000,
+    }];
+    let it = report(switches.clone(), spans.clone(), 100, &facts);
+    assert_eq!(it.problems, facts.problems);
+    let said = text(&it, 10);
+    let problems = said.find("problems blaze said in it: 1 (`blaze explain problems build=").unwrap();
+    assert!(said.contains("    WARN x12 from 0.4 s: a build's results were not kept"), "{said}");
+    assert!(problems < said.find("critical path").unwrap(), "before the path and findings: {said}");
+
+    facts.problems.clear();
+    let quiet = text(&report(switches, spans, 100, &facts), 10);
+    assert!(!quiet.contains("problems blaze said"), "{quiet}");
+}
+
+/// Time on the critical path under no span says where it is: the stretch, its thread, and the
+/// spans of its lane before and after it. On 2026-11-10 an edit's build had 650 ms between its
+/// lowering and its first unit's task; the report said how much was unnamed and not where. A
+/// stretch under [`GAP_NS`] is not listed, and a build whose path is under spans lists none.
+#[test]
+fn a_stretch_of_the_critical_path_under_no_span_says_where_it_is() {
+    let switches = || vec![switch(1, 0, Event::Started, 1), switch(1, 100, Event::Ended, 1)];
+    let mut lower = span(1, 1, None, "lower", 0, 30, 1);
+    lower.function = Some("serde".to_owned());
+    let spans = vec![
+        lower.clone(),
+        span(1, 2, None, "tiny", 95, 1, 1),
+        span(1, 3, None, "unit bodies", 97, 3, 1),
+    ];
+    let it = report(switches(), spans, 100, &workers(1..=1));
+    assert_eq!(it.gaps.len(), 1, "the 10 ms between `tiny` and `unit bodies` is under the bound: {:#?}", it.gaps);
+    let gap = &it.gaps[0];
+    assert_eq!((gap.from_ns, gap.dur_ns, gap.kind.as_str()), (30 * U, 65 * U, "no_span"));
+    assert_eq!((gap.process, gap.thread, gap.thread_name.as_deref()), (P, Some(1), Some("blaze-work-1")));
+    assert_eq!((gap.before.as_deref(), gap.after.as_deref()), (Some("`lower` serde"), Some("`tiny`")));
+    assert_eq!((gap.start_ns, gap.end_ns), (30 * U, 95 * U), "what a query over `samples` filters by");
+    let said = text(&it, 10);
+    assert!(said.contains("critical-path time under no span, by stretch (20.0 ms or more each):"), "{said}");
+    assert!(said.contains(" - 650.0 ms at 0.3 s on blaze-work-1 (tid 1), job 0.1: its lane ran inside no span"), "{said}");
+    assert!(said.contains("     after `lower` serde, before `tiny`"), "{said}");
+    assert!(said.contains("no sample fell in it"), "{said}");
+
+    // With the stacks the driver read in it, the text shows them and no longer says how to
+    // get them.
+    let mut sampled = it.clone();
+    sampled.gaps[0].stacks.off_cpu =
+        vec![StackSeen { frames: vec!["turn".to_owned(), "ioctl".to_owned()], samples: 31 }];
+    let said = text(&sampled, 10);
+    assert!(said.contains("     sampled blocked in it 31x: ioctl < turn"), "{said}");
+    assert!(!said.contains("no sample fell in it"), "{said}");
+
+    // The control: the same build with a span over the stretch has no gap.
+    let covered = vec![lower, span(1, 2, None, "place outputs", 30, 67, 1), span(1, 3, None, "unit bodies", 97, 3, 1)];
+    let none = report(switches(), covered, 100, &workers(1..=1));
+    assert!(none.gaps.is_empty(), "{:#?}", none.gaps);
+    assert!(!text(&none, 10).contains("under no span, by stretch"));
 }
 
 fn finding(report: &Report, kind: Kind) -> &Finding {
@@ -563,7 +714,13 @@ fn every_query_of_slow_is_answered_and_the_stacks_are_the_commonest_of_each_span
             (NULL::UBIGINT, 8::UINTEGER, 'live bytes', 900::BIGINT, 5::DOUBLE), \
             (1, 8, 'live bytes', 1010, 7), (1, 8, 'live bytes', 1050, 9), \
             (NULL, 8, 'profile spans made', 900, 1), (1, 8, 'profile spans made', 1090, 3)) \
-            AS t(build_id, process, name, t_ns, value)) TO '{d}/1-00000001.counters.parquet';\n";
+            AS t(build_id, process, name, t_ns, value)) TO '{d}/1-00000001.counters.parquet';\n\
+         COPY (SELECT * FROM (VALUES \
+            (1::UBIGINT, 8::UINTEGER, 10::UINTEGER, 1020::BIGINT, 'WARN', 'blaze', 'event job.rs:9', 'results were not kept: a', 1::UBIGINT), \
+            (NULL, 8, 10, 1105, 'WARN', 'blaze', 'event job.rs:9', 'results were not kept: b', 2), \
+            (1, 8, 10, 1030, 'INFO', 'blaze', 'event job.rs:1', 'fine', 3), \
+            (1, 8, 10, 1040, 'ERROR', 'blaze', 'event stop.rs:5', 'stall', 4)) \
+            AS t(build_id, process, thread, t_ns, level, target, name, message, event_id)) TO '{d}/1-00000001.events.parquet';\n";
     let dir = history_of(&duckdb, "facts", fixture);
     let source = crate::time::load::Source { duckdb: &duckdb, history: &dir };
     let stack = |name: &str, on_cpu, frames: &[&str], samples| SpanStack {
@@ -594,6 +751,21 @@ fn every_query_of_slow_is_answered_and_the_stacks_are_the_commonest_of_each_span
             facts.thread_cpu.iter().map(|it| (it.process, it.thread, it.uncounted)).collect();
         assert_eq!(cpu, [(8, 10, 2)], "window {window:?}");
         assert!(facts.misses.is_empty() && facts.query_counts.is_empty(), "window {window:?}");
+        // What the daemon said was wrong, worst first, each callsite once: the line said after
+        // the build's answer (of no build) is the build's, and an INFO event is no problem.
+        let problems: Vec<(&str, &str, &str, u64)> = facts
+            .problems
+            .iter()
+            .map(|it| (it.level.as_str(), it.source.as_str(), it.what.as_str(), it.count))
+            .collect();
+        assert_eq!(
+            problems,
+            [
+                ("ERROR", "blaze event stop.rs:5", "stall", 1),
+                ("WARN", "blaze event job.rs:9", "results were not kept: b", 2),
+            ],
+            "window {window:?}"
+        );
         if window.is_some() {
             let memory = (facts.memory.live_before, facts.memory.live_first, facts.memory.live_peak);
             assert_eq!(memory, (Some(5), Some(7), Some(9)), "the window's memory");
