@@ -678,7 +678,7 @@ programs; it is the specification of the Rust pass of the same name.
     through a dereference, evaluates to such a pointer (`evalPlace_ptr`). A frame's id and
     function are left by statements (`execStmt_ids`, `Opt/Ctl.lean`'s proofs for that
     pair).
-  - **Dead-store elimination: third piece** (`Opt/BorrowExec.lean`; not yet elaborated). An
+  - **Dead-store elimination: third piece** (`Opt/BorrowExec.lean`; checked at fc96514550). An
     operator gives a value with no pointer in it, an operand a value read from memory, a
     `ref` the pointer its place evaluates to; so a statement keeps the invariant
     (`execStmt_okAt`) when every `ref` in it is of a place whose base may be borrowed or
