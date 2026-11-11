@@ -3118,7 +3118,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             // Kept by row for the next build to patch, where every function is compiled
             // alone; else by its entries, for the next build's delta.
             let now = match keeps_rows {
-                true => match lists::Lists::of_whole(&*nodes, &statics, &built, originals, now, &codes)
+                true => match lists::Lists::of_whole(&*nodes, &statics, &built, &originals, now, &codes)
                 {
                     Ok(lists) => {
                         kept.keep_lists(program_walk, lists);
@@ -3225,7 +3225,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             .map(|(key, _)| *key)
             // alloc: per build, sized by its units
             .collect();
-        self.dev_of(nodes, dev, store, out);
+        self.dev_of(nodes, &dev, store, out);
     }
 
     /// The functions `dev` of `nodes`, none of a release backend, each made of its template:
@@ -3235,7 +3235,7 @@ impl<'a, B: Prepare> Build<'a, B> {
     fn dev_of(
         &self,
         nodes: &Sorted<InstanceKey, Node<B>>,
-        dev: Vec<InstanceKey>,
+        dev: &[InstanceKey],
         store: &impl Lookup,
         out: &mut Out,
     ) {

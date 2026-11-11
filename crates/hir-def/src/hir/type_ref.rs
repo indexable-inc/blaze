@@ -345,7 +345,7 @@ pub(crate) enum TypeRefKind {
 
 impl TypeRefKind {
     /// Every kind, at the index of its value.
-    pub(crate) const ALL: [TypeRefKind; 16] = {
+    pub(crate) const ALL: [TypeRefKind; 17] = {
         use TypeRefKind::*;
         [
             Never,

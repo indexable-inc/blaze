@@ -282,7 +282,7 @@ fn build(main: &str) -> Result<DeviceBuild, Error> {
 }
 
 /// The MSL of `main`, which must lower and validate.
-fn check_msl(main: &str, expect: Expect) {
+fn check_msl(main: &str, expect: &Expect) {
     match build(main) {
         Ok(device) => expect.assert_eq(&device.msl),
         Err(e) => panic!("the device build failed:\n{e}"),
@@ -327,7 +327,7 @@ fn fragment_with_varyings_uniform_and_storage() {
     let d = data[g.count as usize];
     vec4(g.tint.x * s, g.tint.y + d.x as f32, g.tint.z, v.pos.0.w)",
         ),
-        expect![[r#"
+        &expect![[r#"
             // language: metal2.4
             #include <metal_stdlib>
             #include <simd/simd.h>
@@ -483,7 +483,7 @@ fn vertex_corners_from_a_local_array() {
     let c = corners[i.0 as usize];
     VOut { pos: Position(vec4(c.x, c.y, 0.0, 1.0)), uv: c }",
         ),
-        expect![[r#"
+        &expect![[r#"
             // language: metal2.4
             #include <metal_stdlib>
             #include <simd/simd.h>
@@ -697,7 +697,7 @@ fn pick(big: Big, k: usize) -> f32 { big.a[k % 4].x + big.b[k % 8] as f32 + big.
     let n = (v.pos.0.x as i32) / ((g.count as i32) | 1);
     vec4(span.x, span.y, pick(big, n as usize), (n % 3) as f32)",
         ),
-        expect![[r#"
+        &expect![[r#"
             // language: metal2.4
             #include <metal_stdlib>
             #include <simd/simd.h>
@@ -1206,7 +1206,7 @@ fn transmute_is_a_bitcast() {
             "    let bits: u32 = unsafe { core::mem::transmute::<f32, u32>(v.shade.0) };
     vec4((bits >> 31) as f32, 0.0, 0.0, 1.0)",
         ),
-        expect![[r#"
+        &expect![[r#"
             // language: metal2.4
             #include <metal_stdlib>
             #include <simd/simd.h>
@@ -1328,7 +1328,7 @@ fn derivatives_and_discard_in_a_fragment() {
     if d.x > 1.0 { gpu::intrinsic::discard(); }
     vec4(d.x, d.y, 0.0, 1.0)",
         ),
-        expect![[r#"
+        &expect![[r#"
             // language: metal2.4
             #include <metal_stdlib>
             #include <simd/simd.h>
@@ -1551,7 +1551,7 @@ fn a_kernel_reads_storage_and_writes_a_raw_out() {
     unsafe { acc.write(at, h + d.x as u32 + t.local().x + t.group().y) };",
             false,
         ),
-        expect![[r#"
+        &expect![[r#"
             // language: metal2.4
             #include <metal_stdlib>
             #include <simd/simd.h>
@@ -1863,7 +1863,7 @@ fn a_kernel_traces_rays() {
     unsafe { acc.write(id.x as usize, inst * 2 + lit) };",
             true,
         ),
-        expect![[r#"
+        &expect![[r#"
             // language: metal2.4
             #include <metal_stdlib>
             #include <simd/simd.h>

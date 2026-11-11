@@ -107,9 +107,9 @@ fn frozen_static(db: &Db, def: DefWithBodyId) -> bool {
 }
 
 /// What the value of the literal `expr` goes into, from the calls around it.
-fn into(
-    db: &Db,
-    analysis: &hir::BodyAnalysis<'_>,
+fn into<'db>(
+    db: &'db Db,
+    analysis: &hir::BodyAnalysis<'db>,
     parents: &facts::Parents,
     def: DefWithBodyId,
     expr: ExprId,
