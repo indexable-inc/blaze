@@ -19,6 +19,13 @@ Inside a block the running frame's entries are dead at the current point of the 
 carries or absorbs each entry (`execStmt_absorb`, by `stmtLive_dead`), a removed store adds
 one (`dead_store_src`), and the terminator keeps the relation (`execTerm_rel`: `jump_rel`,
 `ret_rel`, `callOn_rel`).
+
+`removeDead_step`: from related states, the source's step is undefined or the two steps are
+related. `removeDead_refines`, by `run_refines_rel`: for a certificate that passes
+`checkLiveness` and a program that passes `checkBorrows`, every run of the rewritten program
+refines the program's, from every state the borrow invariant holds of whose frames are
+`Ordered`. `removeDead_call`: so does every call whose base slots and arguments have pointers
+into frame 0 only.
 -/
 
 namespace Blaze.Mir.Opt
@@ -1288,5 +1295,313 @@ theorem block_rel (prog : Program) (cert : List (List (List (List Local))))
                   have dead : r.2.1 < body.locals.length ∧ has r.2.1 after = false :=
                     And.intro (And.left hh') (And.right stays)
                   exact dead)))
+
+/-! The pass and the certificate, by function and block. -/
+
+theorem sig_removeDeadFns (borrowed : Body → Local → Bool) :
+    ∀ (fns : List Body) (cert : List (List (List (List Local)))) (id : Nat),
+      (nth? (removeDeadFns borrowed fns cert) id).map
+          (fun body => ({ args := body.args, locals := body.locals.length } : FnSig)) =
+        (nth? fns id).map
+          (fun body => ({ args := body.args, locals := body.locals.length } : FnSig))
+  | [], [], _ => rfl
+  | [], _ :: _, _ => rfl
+  | _ :: _, [], _ => rfl
+  | _ :: _, _ :: _, 0 => rfl
+  | _ :: bodies, _ :: rest, id + 1 => sig_removeDeadFns borrowed bodies rest id
+
+theorem sig_removeDead (cert : List (List (List (List Local)))) (borrowed : Body → Local → Bool)
+    (prog : Program) : (removeDead cert borrowed prog).sig = prog.sig :=
+  funext (fun id => sig_removeDeadFns borrowed prog.fns cert id)
+
+theorem nth?_removeDeadFns (borrowed : Body → Local → Bool) :
+    ∀ (fns : List Body) (cert : List (List (List (List Local)))) (fn : Nat) (body : Body)
+      (pts : List (List (List Local))), nth? fns fn = some body → nth? cert fn = some pts →
+        nth? (removeDeadFns borrowed fns cert) fn = some (removeDeadBody borrowed body pts)
+  | [], _, _, _, _, h, _ => none_eq_some_elim h
+  | _ :: _, [], _, _, _, _, h => none_eq_some_elim h
+  | b :: _, p :: _, 0, body, pts, h1, h2 => by
+    have e1 : b = body := Option.some.inj h1
+    have e2 : p = pts := Option.some.inj h2
+    subst e1
+    subst e2
+    rfl
+  | _ :: bodies, _ :: rest, fn + 1, body, pts, h1, h2 =>
+    nth?_removeDeadFns borrowed bodies rest fn body pts h1 h2
+
+theorem nth?_removeDeadBlocksOf (n : Nat) (bw : Local → Bool) :
+    ∀ (blks : List BasicBlock) (ptss : List (List (List Local))) (b : Nat) (blk : BasicBlock)
+      (pts : List (List Local)), nth? blks b = some blk → nth? ptss b = some pts →
+        nth? (removeDeadBlocksOf n bw blks ptss) b =
+          some (BasicBlock.mk (killDead n bw pts blk.stmts) blk.terminator)
+  | [], _, _, _, _, h, _ => none_eq_some_elim h
+  | _ :: _, [], _, _, _, _, h => none_eq_some_elim h
+  | x :: _, p :: _, 0, blk, pts, h1, h2 => by
+    have e1 : x = blk := Option.some.inj h1
+    have e2 : p = pts := Option.some.inj h2
+    subst e1
+    subst e2
+    rfl
+  | _ :: blks, _ :: rest, b + 1, blk, pts, h1, h2 =>
+    nth?_removeDeadBlocksOf n bw blks rest b blk pts h1 h2
+
+/-- The rewritten program's block: the block with its dead stores made `nop`s. -/
+theorem block_removeDead (cert : List (List (List (List Local))))
+    (borrowed : Body → Local → Bool) (prog : Program) (fn : FnId) (b : BlockId) (body : Body)
+    (points : List (List (List Local))) (blk : BasicBlock) (bpts : List (List Local))
+    (hbody : nth? prog.fns fn = some body) (hc : nth? cert fn = some points)
+    (hblk : nth? body.blocks b = some blk) (hp : nth? points b = some bpts) :
+    (removeDead cert borrowed prog).block fn b =
+      some (BasicBlock.mk (killDead body.locals.length (borrowed body) bpts blk.stmts)
+        blk.terminator) := by
+  have e1 : nth? (removeDeadFns borrowed prog.fns cert) fn =
+      some (removeDeadBody borrowed body points) :=
+    nth?_removeDeadFns borrowed prog.fns cert fn body points hbody hc
+  have e2 : (removeDead cert borrowed prog).block fn b =
+      nth? (removeDeadBlocksOf body.locals.length (borrowed body) body.blocks points) b :=
+    congrTo (blockOf b) e1
+  exact e2.trans
+    (nth?_removeDeadBlocksOf body.locals.length (borrowed body) body.blocks points b blk bpts
+      hblk hp)
+
+theorem fnsLive_nth :
+    ∀ (fns : List Body) (cert : List (List (List (List Local)))) (fn : Nat) (body : Body),
+      fnsLive fns cert = true → nth? fns fn = some body →
+        ∃ pts, nth? cert fn = some pts ∧ bodyLive body pts = true
+  | [], _, _, _, _, h => none_eq_some_elim h
+  | _ :: _, [], _, _, hl, _ => false_eq_true_elim hl
+  | b :: _, p :: _, 0, body, hl, h => by
+    have e : b = body := Option.some.inj h
+    have live : bodyLive b p = true := and_true_left hl
+    rw [e] at live
+    exact Exists.intro p (And.intro rfl live)
+  | _ :: bodies, _ :: rest, fn + 1, body, hl, h =>
+    fnsLive_nth bodies rest fn body (and_true_right hl) h
+
+theorem blocksLive_nth (n : Nat) (points : List (List (List Local))) :
+    ∀ (blks : List BasicBlock) (ptss : List (List (List Local))) (b : Nat) (blk : BasicBlock),
+      blocksLive n points blks ptss = true → nth? blks b = some blk →
+        ∃ pts, nth? ptss b = some pts ∧ blockLive n points blk pts = true
+  | [], _, _, _, _, h => none_eq_some_elim h
+  | _ :: _, [], _, _, hl, _ => false_eq_true_elim hl
+  | x :: _, p :: _, 0, blk, hl, h => by
+    have e : x = blk := Option.some.inj h
+    have live : blockLive n points x p = true := and_true_left hl
+    rw [e] at live
+    exact Exists.intro p (And.intro rfl live)
+  | _ :: blks, _ :: rest, b + 1, blk, hl, h =>
+    blocksLive_nth n points blks rest b blk (and_true_right hl) h
+
+/-! The step. -/
+
+theorem step_nil (prog : Program) :
+    ∀ (st : State), st.skel = [] → step prog st = Outcome.undefined Undefined.illFormed
+  | { base := _, stack := [], next := _ }, _ => rfl
+  | { base := _, stack := fr :: rest, next := _ }, h => by
+    have h' : bare fr :: rest.map bare = ([] : List Frame) := h
+    cases h'
+
+/-- A step runs the block the first frame is at. -/
+theorem step_cons (prog : Program) :
+    ∀ (st : State) (fr : Frame) (rest : List Frame), st.skel = fr :: rest →
+      step prog st = execBlock? prog.adts prog.sig st (prog.block fr.fn fr.block)
+  | { base := _, stack := [], next := _ }, fr, rest, h => by
+    have h' : ([] : List Frame) = fr :: rest := h
+    cases h'
+  | { base := _, stack := a :: l, next := _ }, fr, rest, h => by
+    have h' : bare a :: l.map bare = fr :: rest := h
+    have e1 : bare a = fr := And.left (List.cons.inj h')
+    subst e1
+    rfl
+
+/-- One step: from related states, the program's step is undefined or the two programs'
+steps are related. -/
+theorem removeDead_step (cert : List (List (List (List Local))))
+    (borrowed : Body → Local → Bool) (prog : Program) (hlive : checkLiveness prog cert = true)
+    (hfine : ProgFine (BorrowedIn borrowed prog) prog) :
+    ∀ (s t : State), Rel (BorrowedIn borrowed prog) (DeadIn prog cert) s t →
+      (∃ why, step prog s = Outcome.undefined why) ∨
+        StepRel (Rel (BorrowedIn borrowed prog) (DeadIn prog cert)) (step prog s)
+          (step (removeDead cert borrowed prog) t) := by
+  intro s t h
+  have h' : ∃ (reps : List Rep) (g : List (Nat × FnId)),
+      s = puts t reps ∧ Borrows (BorrowedIn borrowed prog) g t ∧ Ordered t.skel ∧
+        ∀ (r : Rep), r ∈ reps →
+          Good (BorrowedIn borrowed prog) (DeadIn prog cert) g
+            (fun fr l => DeadIn prog cert fr.fn fr.block l) t.skel r := h
+  have ⟨reps, g, es, hb, ho, hg⟩ := h'
+  rw [es]
+  cases hsk : t.skel with
+  | nil =>
+    exact Or.inl ⟨Undefined.illFormed,
+      step_nil prog (puts t reps) ((puts_skel reps t).trans hsk)⟩
+  | cons fr rest =>
+    have srcStep : step prog (puts t reps) =
+        execBlock? prog.adts prog.sig (puts t reps) (prog.block fr.fn fr.block) :=
+      step_cons prog (puts t reps) fr rest ((puts_skel reps t).trans hsk)
+    cases hblk : prog.block fr.fn fr.block with
+    | none =>
+      have und : step prog (puts t reps) = Outcome.undefined Undefined.illFormed :=
+        srcStep.trans (congrTo (execBlock? prog.adts prog.sig (puts t reps)) hblk)
+      exact Or.inl ⟨Undefined.illFormed, und⟩
+    | some blk =>
+      cases hbody : nth? prog.fns fr.fn with
+      | none =>
+        have e : prog.block fr.fn fr.block = none := congrTo (blockOf fr.block) hbody
+        exact none_eq_some_elim (e.symm.trans hblk)
+      | some body =>
+        have eb : prog.block fr.fn fr.block = nth? body.blocks fr.block :=
+          congrTo (blockOf fr.block) hbody
+        have hn : nth? body.blocks fr.block = some blk := eb.symm.trans hblk
+        have ⟨points, hc, hbl⟩ := fnsLive_nth prog.fns cert fr.fn body hlive hbody
+        have hbl' : blocksLive body.locals.length points body.blocks points = true := hbl
+        have ⟨bpts, hp, hblock⟩ :=
+          blocksLive_nth body.locals.length points body.blocks points fr.block blk hbl' hn
+        have hblock' : (stmtsLive body.locals.length bpts blk.stmts &&
+            termLive body.locals.length points (lastPoint bpts) blk.terminator) = true := hblock
+        have hpts : ptsOf cert fr.fn = points := congrTo pointsOr hc
+        have hterm : termLive body.locals.length (ptsOf cert fr.fn) (lastPoint bpts)
+            blk.terminator = true := by
+          rw [hpts]
+          exact and_true_right hblock'
+        have ord : Ordered (fr :: rest) := by
+          rw [← hsk]
+          exact ho
+        have ctx : Ctx (BorrowedIn borrowed prog) g fr rest t :=
+          { okAt := And.left hb, keys := And.right hb, skel := hsk, ordered := ord }
+        have goods : ∀ (r : Rep), r ∈ reps →
+            Good (BorrowedIn borrowed prog) (DeadIn prog cert) g
+              (fun _ l => Here body.locals.length (firstPoint bpts) l) (fr :: rest) r := by
+          intro r m
+          have G : Good (BorrowedIn borrowed prog) (DeadIn prog cert) g
+              (fun fr l => DeadIn prog cert fr.fn fr.block l) (fr :: rest) r := by
+            rw [← hsk]
+            exact hg r m
+          exact G.imp (fun _ hd => by
+            have hd' : ∃ body', nth? prog.fns fr.fn = some body' ∧
+                r.2.1 < body'.locals.length ∧
+                  has r.2.1 (liveIn (ptsOf cert fr.fn) fr.block) = false := hd
+            have ⟨body', hb', hlt, hdead⟩ := hd'
+            have eb' : body' = body := Option.some.inj (hb'.symm.trans hbody)
+            have hlt' : r.2.1 < body.locals.length := by
+              rw [← eb']
+              exact hlt
+            have hdead' : has r.2.1 (firstPoint bpts) = false := by
+              rw [← liveIn_first points fr.block bpts hp, ← hpts]
+              exact hdead
+            have dead : r.2.1 < body.locals.length ∧ has r.2.1 (firstPoint bpts) = false :=
+              And.intro hlt' hdead'
+            exact dead)
+        have tgtBlock : (removeDead cert borrowed prog).block fr.fn fr.block =
+            some (BasicBlock.mk (killDead body.locals.length (borrowed body) bpts blk.stmts)
+              blk.terminator) :=
+          block_removeDead cert borrowed prog fr.fn fr.block body points blk bpts hbody hc hn hp
+        have t0 : step (removeDead cert borrowed prog) t =
+            execBlock? (removeDead cert borrowed prog).adts (removeDead cert borrowed prog).sig t
+              ((removeDead cert borrowed prog).block fr.fn fr.block) :=
+          step_cons (removeDead cert borrowed prog) t fr rest hsk
+        have t1 : execBlock? (removeDead cert borrowed prog).adts
+              (removeDead cert borrowed prog).sig t
+              ((removeDead cert borrowed prog).block fr.fn fr.block) =
+            execBlockFrom prog.adts (removeDead cert borrowed prog).sig t
+              (killDead body.locals.length (borrowed body) bpts blk.stmts) blk.terminator :=
+          congrTo (fun b => execBlock? prog.adts (removeDead cert borrowed prog).sig t b) tgtBlock
+        have t2 : execBlockFrom prog.adts (removeDead cert borrowed prog).sig t
+              (killDead body.locals.length (borrowed body) bpts blk.stmts) blk.terminator =
+            execBlockFrom prog.adts prog.sig t
+              (killDead body.locals.length (borrowed body) bpts blk.stmts) blk.terminator :=
+          congrTo
+            (fun sg => execBlockFrom prog.adts sg t
+              (killDead body.locals.length (borrowed body) bpts blk.stmts) blk.terminator)
+            (sig_removeDead cert borrowed prog)
+        have tgtStep : step (removeDead cert borrowed prog) t =
+            execBlockFrom prog.adts prog.sig t
+              (killDead body.locals.length (borrowed body) bpts blk.stmts) blk.terminator :=
+          t0.trans (t1.trans t2)
+        have srcStep' : step prog (puts t reps) =
+            execBlockFrom prog.adts prog.sig (puts t reps) blk.stmts blk.terminator :=
+          srcStep.trans (congrTo (execBlock? prog.adts prog.sig (puts t reps)) hblk)
+        rw [srcStep', tgtStep]
+        exact block_rel prog cert borrowed body hbody blk.terminator blk.stmts bpts t reps
+          (and_true_left hblock') hterm ctx (hfine fr.fn fr.block blk hblk) goods
+
+/-! The runs. -/
+
+/-- Global dead-store elimination refines the program: for a certificate that passes
+`checkLiveness` and a program whose `ref`s are of borrowed locals (`checkBorrows`), every
+run of the rewritten program is the program's, unless the program's is undefined, from every
+state the borrow invariant holds of whose frames are `Ordered`. -/
+theorem removeDead_refines (cert : List (List (List (List Local))))
+    (borrowed : Body → Local → Bool) (prog : Program) (hlive : checkLiveness prog cert = true)
+    (hb : checkBorrows borrowed prog = true) (fuel : Nat) (st : State)
+    (hinv : ∃ g, Borrows (BorrowedIn borrowed prog) g st) (hord : Ordered st.skel) :
+    (run (removeDead cert borrowed prog) fuel st).Refines (run prog fuel st) := by
+  have ⟨g, hbor⟩ := hinv
+  have rel : Rel (BorrowedIn borrowed prog) (DeadIn prog cert) st st :=
+    Exists.intro ([] : List Rep)
+      (Exists.intro g
+        (And.intro rfl (And.intro hbor (And.intro hord (fun _ m => mem_nil_elim m)))))
+  exact run_refines_rel prog (removeDead cert borrowed prog)
+    (Rel (BorrowedIn borrowed prog) (DeadIn prog cert))
+    (removeDead_step cert borrowed prog hlive (checkBorrows_sound borrowed prog hb)) fuel st st
+    rel
+
+/-! Calls. -/
+
+theorem start_removeDead (cert : List (List (List (List Local))))
+    (borrowed : Body → Local → Bool) (prog : Program) (id : FnId) (base : List Slot)
+    (args : List Value) :
+    (removeDead cert borrowed prog).start id base args = prog.start id base args := by
+  unfold Program.start
+  rw [sig_removeDead]
+
+def NextOrdered : Next → Prop
+  | Next.state st => Ordered st.skel
+  | Next.done _ => True
+
+/-- A call's start state has one frame, whose destination is in frame 0. -/
+theorem start_ordered (prog : Program) (id : FnId) (base : List Slot) (args : List Value) :
+    Outcome.All (fun (st : State) => Ordered st.skel) (prog.start id base args) := by
+  unfold Program.start
+  cases hs : prog.sig id with
+  | none => exact Outcome.all_undefined _ _
+  | some s =>
+    have entered : Outcome.All NextOrdered
+        (State.enter { base := base, stack := [], next := 1 } id s args
+          { frame := 0, slot := 0, path := [] } none) := by
+      by_cases hl : args.length = s.args
+      · rw [State.enter_eq, if_pos hl]
+        have o : Ordered
+            [bare (newFrame (State.mk base [] 1) id s args { frame := 0, slot := 0, path := [] }
+              none)] :=
+          And.intro (Nat.succ_pos 0) (And.intro (fun _ m => mem_nil_elim m) True.intro)
+        exact Outcome.all_ok o
+      · rw [State.enter_eq, if_neg hl]
+        exact Outcome.all_undefined _ _
+    exact Outcome.all_bind entered (fun next hn => by
+      cases next with
+      | state st => exact Outcome.all_ok hn
+      | done v => exact Outcome.all_undefined _ _)
+
+/-- Global dead-store elimination refines every call whose base slots and arguments have
+pointers into frame 0 only: the same outcome, unless the program's is undefined. -/
+theorem removeDead_call (cert : List (List (List (List Local))))
+    (borrowed : Body → Local → Bool) (prog : Program) (hlive : checkLiveness prog cert = true)
+    (hb : checkBorrows borrowed prog = true) (fuel : Nat) (id : FnId) (base : List Slot)
+    (args : List Value) (hbase : SlotsOk (PtrOk (BorrowedIn borrowed prog) []) base)
+    (hargs : ∀ (v : Value), v ∈ args → Value.Ok (PtrOk (BorrowedIn borrowed prog) []) v) :
+    ((removeDead cert borrowed prog).call fuel id base args).Refines
+      (prog.call fuel id base args) := by
+  have es : (removeDead cert borrowed prog).start id base args = prog.start id base args :=
+    start_removeDead cert borrowed prog id base args
+  show Outcome.Refines
+    (((removeDead cert borrowed prog).start id base args).bind
+      (run (removeDead cert borrowed prog) fuel))
+    ((prog.start id base args).bind (run prog fuel))
+  rw [es]
+  exact Outcome.Refines.bind (fun st hst =>
+    removeDead_refines cert borrowed prog hlive hb fuel st
+      (start_borrows (BorrowedIn borrowed prog) prog id base args hbase hargs st hst)
+      (start_ordered prog id base args st hst))
 
 end Blaze.Mir.Opt
