@@ -47,7 +47,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     sync::{
         Arc,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering},
     },
 };
 
@@ -100,8 +100,9 @@ struct Walked {
     /// The rows whose last run made an untracked read, sorted.
     untracked: Vec<u32>,
     /// Rows whose verification by a walk unwound, each with its `verified` word then: not
-    /// asked again by a walk while the word stands, named as changed whenever reached.
-    unwound: Vec<(u32, u32)>,
+    /// asked again by a walk while the word stands, named as changed whenever reached, and
+    /// never taken as clean ([`clean`]). Replaced whole by a walk that ended.
+    unwound: Arc<Vec<(u32, u32)>>,
     work: ChangedSetWork,
 }
 
@@ -154,6 +155,11 @@ pub(crate) struct Frontier {
     reverse: Reverse,
     #[expect(clippy::disallowed_types, reason = "held to move the walks' vectors in and out, never across a call")]
     walked: blaze_core::lock::Lock<Walked>,
+    /// The view the last walk ended in ([`Storage::view`]'s number), 0 before any: while it
+    /// is the storage's view, a row not verified in it is unchanged ([`clean`]).
+    clean_at: AtomicU64,
+    /// How many rows [`Walked::unwound`] holds.
+    unwound: AtomicU32,
     plant: Plant,
 }
 
@@ -166,6 +172,8 @@ impl Frontier {
             untracked: SegQueue::new(),
             reverse: Reverse::default(),
             walked: blaze_core::lock::Lock::new("query.frontier.walked", Walked::default()),
+            clean_at: AtomicU64::new(0),
+            unwound: AtomicU32::new(0),
             plant: Plant::None,
         }
     }
@@ -465,7 +473,6 @@ struct Taken<'a> {
     frontier: &'a Frontier,
     written: Vec<u32>,
     untracked: Vec<u32>,
-    unwound: Vec<(u32, u32)>,
 }
 
 impl Drop for Taken<'_> {
@@ -473,7 +480,6 @@ impl Drop for Taken<'_> {
         let mut walked = self.frontier.walked.lock();
         walked.written = std::mem::take(&mut self.written);
         walked.untracked = std::mem::take(&mut self.untracked);
-        walked.unwound = std::mem::take(&mut self.unwound);
     }
 }
 
@@ -548,14 +554,14 @@ fn walk(db: *const (), storage: &Storage) {
     let frontier = &storage.frontier;
     let plant = frontier.plant;
     let view = storage.view().as_u64();
-    let mut taken = {
+    let (mut taken, apart) = {
         let mut walked = frontier.walked.lock();
-        Taken {
+        let taken = Taken {
             frontier,
             written: std::mem::take(&mut walked.written),
             untracked: std::mem::take(&mut walked.untracked),
-            unwound: std::mem::take(&mut walked.unwound),
-        }
+        };
+        (taken, Arc::clone(&walked.unwound)) // clone: a count
     };
     // Named, with what it did: the size of the changed set, the rows visited and the edges
     // walked for this edit (rule 16).
@@ -586,10 +592,15 @@ fn walk(db: *const (), storage: &Storage) {
             .is_some_and(|(header, _, _)| header.meta.load(Ordering::Relaxed) & UNTRACKED != 0)
     });
     // A row whose verification unwound stands apart while its word does.
-    taken.unwound.retain(|&(node, word)| {
-        row_of(storage, node)
-            .is_some_and(|(header, _, _)| header.verified.load(Ordering::Acquire) == word)
-    });
+    // alloc: the rows set apart, none in a build whose every row verifies
+    let mut unwound: Vec<(u32, u32)> = apart
+        .iter()
+        .copied()
+        .filter(|&(node, word)| {
+            row_of(storage, node)
+                .is_some_and(|(header, _, _)| header.verified.load(Ordering::Acquire) == word)
+        })
+        .collect();
 
     let mut changed: Vec<u32> = taken.written.clone(); // alloc: a walk's lists, what the edit reaches
     let mut found: Vec<u32> = Vec::new(); // alloc: as above
@@ -619,7 +630,7 @@ fn walk(db: *const (), storage: &Storage) {
         }
         // A row set apart is not verified again: it is named, and its readers are asked.
         suspects.retain(|&node| {
-            let apart = taken.unwound.iter().any(|&(it, _)| it == node);
+            let apart = unwound.iter().any(|&(it, _)| it == node);
             if apart {
                 changed.push(node);
                 found.push(node);
@@ -645,7 +656,7 @@ fn walk(db: *const (), storage: &Storage) {
             if seen == Seen1::Unwound as u8 {
                 work.unwound += 1;
                 if let Some((header, _, _)) = row_of(storage, node) {
-                    taken.unwound.push((node, header.verified.load(Ordering::Acquire)));
+                    unwound.push((node, header.verified.load(Ordering::Acquire))); // alloc: as above
                 }
             }
         }
@@ -686,9 +697,12 @@ fn walk(db: *const (), storage: &Storage) {
     }
     log.drain(..drop_to);
     let log = Arc::new(log); // alloc: as above
+    let apart = unwound.len() as u32;
+    let unwound = Arc::new(unwound); // alloc: as above
     taken.written.clear();
     let mut walked = frontier.walked.lock();
     walked.log = log;
+    walked.unwound = unwound;
     if let Some(floor) = floor {
         walked.floor = walked.floor.max(floor);
     }
@@ -696,4 +710,46 @@ fn walk(db: *const (), storage: &Storage) {
     walked.work = work;
     drop(walked);
     drop(taken);
+    // Published last: from here a row not verified in this view is unchanged ([`clean`]).
+    frontier.unwound.store(apart, Ordering::Release);
+    frontier.clean_at.store(view, Ordering::Release);
 }
+
+/// Whether the row of `node`, verified in an earlier view, holds in this one with no look at
+/// its edges: a walk ended in this view, and what a walk leaves is that every row made before
+/// it is verified in its view or unchanged (the module's argument), but a row whose last run
+/// made an untracked read (it runs again in every view) and one whose verification by the
+/// walk unwound. So after a walk a pull of an unchanged row costs this, not its edges: what
+/// makes a host's pass over every row it holds cost a few loads a row.
+///
+/// A walk that started again in the same view changes nothing here: only a row set apart
+/// can change behind a walk that ended, and its readers are set apart with it (a reader's
+/// verification pulls it and unwinds as it does).
+#[inline]
+pub(crate) fn clean(storage: &Storage, header: &Header, node: u32) -> bool {
+    let frontier = &storage.frontier;
+    if frontier.clean_at.load(Ordering::Acquire) != storage.view().as_u64() {
+        return false;
+    }
+    if header.meta.load(Ordering::Relaxed) & UNTRACKED != 0 {
+        return false;
+    }
+    frontier.unwound.load(Ordering::Acquire) == 0 || !set_apart(frontier, node)
+}
+
+#[cold]
+fn set_apart(frontier: &Frontier, node: u32) -> bool {
+    let apart = Arc::clone(&frontier.walked.lock().unwound); // clone: a count
+    apart.iter().any(|&(it, _)| it == node)
+}
+
+/// Walks the changed set of this view if a walk is due: what a host calls once after its
+/// writes and before it asks for what it holds, so each row it asks that the edit did not
+/// reach answers by [`clean`]. Returns what the last walk did. For a caller outside any
+/// query.
+pub fn walk_changed_set<D: Database>(db: &D) -> ChangedSetWork {
+    let storage = db.storage();
+    bring_to_date(std::ptr::from_ref(db).cast(), storage);
+    storage.changed_set_work()
+}
+

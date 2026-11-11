@@ -478,6 +478,16 @@ fn refresh<F: Function>(
             }
         } else if word & RUNNING == 0
             && node != 0
+            && word & VIEW_MASK != 0
+            && word & VIEW_MASK != view
+            && super::frontier::clean(storage, header, node)
+        {
+            // A changed-set walk ended in this view and did not reach the row: it is
+            // unchanged, with no look at its edges. A mark another task won is looked at again.
+            mark(storage, header, word, node, index, id);
+            continue;
+        } else if word & RUNNING == 0
+            && node != 0
             && word & VIEW_MASK != view
             && verify::unclaimed(storage, header, word, node)
         {
