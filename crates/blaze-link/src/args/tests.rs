@@ -105,6 +105,67 @@ fn spellings_to_options() {
     }
 }
 
+/// `--export-dynamic-symbol` in each spelling a build script gives it (evm2-jit prints
+/// `-Wl,--export-dynamic-symbol,__revmc_builtin_*`): an executable's pattern, and nothing a
+/// shared library's own exports do not already decide.
+#[test]
+fn export_dynamic_symbol_is_an_executables_pattern_in_each_spelling() {
+    use Kind::{Executable as Exe, Shared};
+    use LinkOption::{ExportDynamic, NoEffect};
+    use Spelling::Gnu;
+    let pattern = || ExportDynamic("__revmc_builtin_*".to_owned());
+    let table: &[(Kind, &[&str], Vec<LinkOption>)] = &[
+        (Exe, &["-Wl,--export-dynamic-symbol,__revmc_builtin_*"], vec![pattern()]),
+        (Exe, &["-Wl,--export-dynamic-symbol=__revmc_builtin_*"], vec![pattern()]),
+        (Exe, &["-Wl,-export-dynamic-symbol=__revmc_builtin_*"], vec![pattern()]),
+        (Exe, &["-Xlinker", "--export-dynamic-symbol", "-Xlinker", "__revmc_builtin_*"], vec![pattern()]),
+        (Shared, &["-Wl,--export-dynamic-symbol,__revmc_builtin_*"], vec![NoEffect(super::reason::SHARED_EXPORTS)]),
+        (Shared, &["-Wl,--export-dynamic-symbol=x"], vec![NoEffect(super::reason::SHARED_EXPORTS)]),
+    ];
+    for (kind, args, want) in table {
+        assert_eq!(&options(Gnu, *kind, args), want, "{kind:?} {args:?}");
+    }
+}
+
+/// A symbol pattern matches as `fnmatch` does, which GNU ld and lld match one by.
+#[test]
+fn a_symbol_pattern_matches_as_fnmatch_does() {
+    let table: &[(&str, &str, bool)] = &[
+        ("__revmc_builtin_*", "__revmc_builtin_add", true),
+        ("__revmc_builtin_*", "__revmc_builtin_", true),
+        ("__revmc_builtin_*", "__revmc_builtin", false),
+        ("__revmc_builtin_*", "x__revmc_builtin_add", false),
+        ("malloc", "malloc", true),
+        ("malloc", "malloc2", false),
+        ("malloc", "mallo", false),
+        ("", "", true),
+        ("", "a", false),
+        ("*", "", true),
+        ("*", "anything", true),
+        ("a*b*c", "a__b__c", true),
+        ("a*b*c", "abcbc", true),
+        ("a*b*c", "a__b__", false),
+        ("*_end", "the_end", true),
+        ("*_end", "the_end_", false),
+        ("f?o", "foo", true),
+        ("f?o", "fo", false),
+        ("v[0-9]", "v7", true),
+        ("v[0-9]", "vx", false),
+        ("v[!0-9]", "vx", true),
+        ("v[^0-9]", "v7", false),
+        ("[]a]", "]", true),
+        ("[]a]", "b", false),
+        ("x[ab", "x[ab", true),
+        ("x[ab", "xa", false),
+        ("a\\*b", "a*b", true),
+        ("a\\*b", "axb", false),
+        ("**a**", "bab", true),
+    ];
+    for (pattern, name, want) in table {
+        assert_eq!(super::glob(pattern, name), *want, "`{pattern}` on `{name}`");
+    }
+}
+
 #[test]
 fn refusals_name_the_argument_the_word_where_and_why() {
     use Kind::{Executable as Exe, Shared};
@@ -116,6 +177,9 @@ fn refusals_name_the_argument_the_word_where_and_why() {
         (Gnu, Exe, &["-Wl,--version-script=v.map"], "exports from an executable only"),
         (Gnu, Exe, &["-rdynamic"], "exports from an executable only"),
         (Gnu, Exe, &["-Wl,--export-dynamic"], "exports from an executable only"),
+        (Gnu, Exe, &["-Wl,--export-dynamic-symbol-list=syms.txt"], "exports from an executable only"),
+        (Gnu, Exe, &["-Wl,--export-dynamic-symbol"], "none follows"),
+        (Gnu, Exe, &["-Wl,--export-dynamic-symbol="], "none follows"),
         (Gnu, Exe, &["-static"], "static"),
         (Gnu, Exe, &["-nostartfiles"], "start-file-less"),
         (Gnu, Exe, &["-Wl,-z,lazy"], "no way to undo"),

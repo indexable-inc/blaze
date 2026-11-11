@@ -3465,6 +3465,9 @@ impl<'a> Stage<'a> {
     /// shared library on its link line also defines or leaves undefined, as GNU ld and lld
     /// do: the dynamic linker then binds the library's own uses of the name to the
     /// executable's definition, which is how a program's `malloc` and `free` replace libc's.
+    /// It also exports each such name a pattern of `--export-dynamic-symbol` matches
+    /// ([`crate::LinkArgs::export_dynamic`]), which is how code made at run time finds the
+    /// program's functions by `dlsym` (evm2-jit's `__revmc_builtin_*`).
     /// A name hidden where it is defined, or by any loaded object that mentions it (ELF
     /// merges visibility to the most constraining), is not exported. Each exported name is
     /// a root of collection, since the loader may call what nothing in the image does, and
@@ -3477,7 +3480,8 @@ impl<'a> Stage<'a> {
         let symbols: &Symbols = &*self.symbols;
         let graph = &b.graph;
         let exports = &graph.exports;
-        if exports.symbols.is_empty() && exports.undefined.is_empty() {
+        let patterns = &self.output.link.export_dynamic;
+        if exports.symbols.is_empty() && exports.undefined.is_empty() && patterns.is_empty() {
             return Ok(());
         }
         // alloc: none unless a library names what the executable defines, once per graph built
@@ -3497,7 +3501,10 @@ impl<'a> Stage<'a> {
                 }
             }
             let Some(name) = symbols.name_of(it.sym) else { continue };
-            if exports.find(name).is_some() || exports.refers(name) {
+            if exports.find(name).is_some()
+                || exports.refers(name)
+                || patterns.iter().any(|it| crate::args::glob(it, name))
+            {
                 found.push((name, slot));
             }
         }
@@ -3532,7 +3539,7 @@ impl<'a> Stage<'a> {
                             None,
                             // alloc: error path
                             format!(
-                                "`{name}` is defined outside every section (an absolute symbol) by {}, and a shared                                  library {} links defines or refers to it, so the executable exports it: blaze's ELF                                  writer exports only what is in the image",
+                                "`{name}` is defined outside every section (an absolute symbol) by {}, and a shared                                  library {} links defines or refers to it or an `--export-dynamic-symbol` pattern                                  matches it, so the executable exports it: blaze's ELF writer exports only what is                                  in the image",
                                 self.input_name(graph.loads[load as usize].input),
                                 self.name
                             ),

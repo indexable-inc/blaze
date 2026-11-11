@@ -397,7 +397,14 @@ fn output_into(hasher: &mut Hasher, output: &Output) {
     for rpath in rpaths {
         hasher.part(rpath.as_bytes());
     }
-    let LinkArgs { rpaths, headerpad, headerpad_max_install_names, undefined, nodelete } = link;
+    let LinkArgs {
+        rpaths,
+        headerpad,
+        headerpad_max_install_names,
+        undefined,
+        nodelete,
+        export_dynamic,
+    } = link;
     count(hasher, rpaths.len());
     for rpath in rpaths {
         hasher.part(rpath.as_bytes());
@@ -412,6 +419,10 @@ fn output_into(hasher: &mut Hasher, output: &Output) {
         undefined,
         *nodelete as u8,
     ]);
+    count(hasher, export_dynamic.len());
+    for pattern in export_dynamic {
+        hasher.part(pattern.as_bytes());
+    }
 }
 
 pub(crate) fn format_tag(format: Format) -> u8 {

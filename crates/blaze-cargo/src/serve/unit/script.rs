@@ -524,10 +524,14 @@ pub(crate) fn script_at(unit: &bs::Unit) -> Text {
 /// What a sandboxed script may print, checked before cargo reads it
 /// ([`crate::directives`]); `None` when it may print it all.
 pub(crate) fn refused(unit: &bs::Unit, stdout: &[u8], link_dirs: &[PathBuf]) -> Option<Report> {
+    // The store of pinned native inputs of the home this daemon lays them out in
+    // ([`super::Real`]'s `native`): the same variables decide both.
+    let native = blaze_manifest::user_config::home().map(|it| it.join(crate::serve::native::NATIVE));
     let ran = crate::directives::Ran {
         package_dir: &unit.package.manifest_dir,
         out_dir: &unit.out_dir,
         link_dirs,
+        native: native.as_deref(),
     };
     let refused = crate::directives::refused(stdout, &ran);
     (!refused.is_empty())
