@@ -293,6 +293,7 @@ pub fn input_new_singleton<I: Input, const N: usize>(
     for (at, node) in (first..end).enumerate() {
         let kind = durability.get(at).copied().unwrap_or(Durability::LOW);
         storage.repaint(node, color(FIELD | u32::from(kind.0), view));
+        storage.note_written(node);
     }
     let (table, _) = reserved::<I>(storage);
     let row = table.pages.row::<RowOf<I>>(id).expect("the reserved row's page");
@@ -344,6 +345,7 @@ impl<I: Input, T> Setter for InputSetter<'_, I, T> {
         let fields = unsafe { (*row.fields.get()).assume_init_mut() };
         let old_value = std::mem::replace((self.at)(fields), value);
         *self.storage.node_mut(node).color_mut() = color(FIELD | u32::from(durability.0), view);
+        self.storage.note_written(node);
         // Counted per input, so a build's `query_counts` name what it set: the cause of every
         // run after it (harness/incremental.py reads them).
         counts::count(I::ingredient().index(), counts::WRITTEN);

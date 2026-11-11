@@ -895,7 +895,13 @@ fn reset_member(storage: &Storage, member: Member) {
 
 /// The untyped header of a member row.
 fn member_header(storage: &Storage, member: Member) -> Option<&Header> {
-    let id = Id::from_u32(member.id);
+    header_of(storage, member.ingredient, Id::from_u32(member.id))
+}
+
+/// The untyped header of row `id` of the function `ingredient`, if its page was made. The
+/// caller names a function's ingredient: another kind's pages hold no [`Header`].
+pub(crate) fn header_of(storage: &Storage, ingredient: u32, id: Id) -> Option<&Header> {
+    let member = Member { ingredient, id: id.as_u32() };
     let size = ingredient::vtable(member.ingredient)?.row_size;
     let dir = storage.dir(member.ingredient);
     if dir.is_null() {
@@ -1004,6 +1010,7 @@ fn store_edges(storage: &Storage, header: &Header, at: u32) {
     counts::reads(ingredient, reads);
     let old = header.edges.swap(span, Ordering::Relaxed);
     storage.forget_edges(old);
+    storage.frontier.stored(header.node.load(Ordering::Relaxed), old, span);
 }
 
 /// Sets the summary of the run at `at` (node `node`): the OR of its edges' and its replayed
@@ -1052,6 +1059,14 @@ fn finish<F: Function>(
                 && old_meta & HASHED != 0
                 && F::hash(&new) == header.extra.load(Ordering::Relaxed)));
     let changed = if backdate { header.changed.load(Ordering::Relaxed) } else { view };
+    // The changed set's feed: a run that was not backdated, of a row made before, says so;
+    // one that made an untracked read is asked by every walk ([`super::frontier`]).
+    if !backdate || storage.frontier.names_equal_rows() {
+        storage.frontier.changed_row(done.node, word);
+    }
+    if done.untracked {
+        storage.frontier.untracked(done.node);
+    }
     let table = table_of::<F>(storage);
     if had {
         // SAFETY: the flight holder with `RUNNING` set drops a value of an earlier view, or a
@@ -1235,6 +1250,11 @@ fn head_round<F: Function>(
     if converged {
         let reads = store_cycle_edges(storage, header, at);
         let meta = finalize(storage, done.members, done.node, reads);
+        // A cycle's rows are never backdated: its head says it changed, as each member does.
+        storage.frontier.changed_row(done.node, header.verified.load(Ordering::Relaxed));
+        if reads.untracked != 0 {
+            storage.frontier.untracked(done.node);
+        }
         storage.set_summary(done.node, reads.summary);
         header.changed.store(view, Ordering::Relaxed);
         header.meta.store(meta, Ordering::Relaxed);
@@ -1337,7 +1357,13 @@ fn finalize(storage: &Storage, from: u32, head: u32, reads: Converged) -> u32 {
         }
         let node = header.node.load(Ordering::Relaxed);
         let span = storage.push_edges(&[head], (member.ingredient, Id::from_u32(member.id)));
-        storage.forget_edges(header.edges.swap(span, Ordering::Relaxed));
+        let old = header.edges.swap(span, Ordering::Relaxed);
+        storage.forget_edges(old);
+        storage.frontier.stored(node, old, span);
+        storage.frontier.changed_row(node, word);
+        if reads.untracked != 0 {
+            storage.frontier.untracked(node);
+        }
         storage.set_summary(node, reads.summary);
         header.changed.store(view, Ordering::Relaxed);
         header.meta.store(lowest | CYCLE | reads.untracked, Ordering::Relaxed);
@@ -1505,7 +1531,9 @@ fn store_cycle_edges(storage: &Storage, header: &Header, at: u32) -> Converged {
     // The head is still on top: a new mark (or its runaway) names it.
     super::noted(storage, note);
     counts::reads(ingredient, reads);
-    storage.forget_edges(header.edges.swap(span, Ordering::Relaxed));
+    let old = header.edges.swap(span, Ordering::Relaxed);
+    storage.forget_edges(old);
+    storage.frontier.stored(header.node.load(Ordering::Relaxed), old, span);
     read
 }
 
@@ -1654,6 +1682,9 @@ unsafe fn reset_row<F: Function>(storage: &Storage, index: u32, id: Id) {
     }
     header.meta.store(CYCLE, Ordering::Relaxed);
     header.extra.store(0, Ordering::Relaxed);
+    // A row that held a final value in an earlier view and is emptied lost it: whatever it
+    // is made as next is a change to whoever held that value ([`super::frontier`]).
+    storage.frontier.changed_row(header.node.load(Ordering::Relaxed), word);
     storage.repaint(header.node.load(Ordering::Relaxed), 0);
     // Release: the row reads as never made.
     header.verified.store(0, Ordering::Release);

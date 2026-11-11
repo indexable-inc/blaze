@@ -18,6 +18,7 @@ mod budget;
 mod capture;
 mod counts;
 mod dense;
+mod frontier;
 mod function;
 mod id;
 mod ingredient;
@@ -25,6 +26,7 @@ mod input;
 mod interned;
 mod local;
 mod provenance;
+mod reverse;
 mod row;
 mod slot;
 mod storage;
@@ -39,6 +41,7 @@ pub use capture::{
     Read, ReadKind, Reads, capture_reads, for_span_text, replay_reads, unshareable_reads,
 };
 pub use counts::{Counts, take as take_counts};
+pub use frontier::{Changed, ChangedSetWork, Unknown as ChangedUnknown};
 pub use function::completed;
 pub use id::{AsId, FromId, FromIdIn, Id};
 pub use input::Setter;
@@ -60,6 +63,7 @@ pub mod plumbing {
     pub use blaze_mem::Tag;
 
     pub use super::{
+        frontier::changed_since,
         function::{
             CycleKind, Function, MAX_ROUNDS, durable, evict_values, evict_values_of, fetch,
         },

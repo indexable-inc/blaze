@@ -53,6 +53,10 @@ pub struct TestDb {
     graph: Vec<GNode>,
     /// The dependency values of each graph node's last run.
     snapshots: Lock<HashMap<usize, Vec<u64>>>,
+    /// The changed set's simulation (`changed`): its program's nodes, and the world its
+    /// untracked reads see.
+    flow: Lock<Vec<changed::FlowNode>>,
+    world: AtomicU64,
 }
 
 impl TestDb {
@@ -72,6 +76,8 @@ impl TestDb {
             cells: Lock::new("query.test.db.cells", Vec::new()),
             graph,
             snapshots: Lock::new("query.test.db.snapshots", HashMap::new()),
+            flow: Lock::new("query.test.db.flow", Vec::new()),
+            world: AtomicU64::new(0),
         }
     }
 
@@ -3283,3 +3289,6 @@ fn after_editing_one_input_every_rerun_memos_cause_chain_leads_back_to_it(tc: Te
         }
     }
 }
+
+/// The changed set ([`super::frontier`]): its deterministic simulation and planted bugs.
+mod changed;
