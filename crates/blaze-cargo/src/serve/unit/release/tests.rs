@@ -285,7 +285,7 @@ fn a_count_of_rows_is_said_in_the_unit_it_rounds_to() {
     assert_eq!(said(9_995_000), "10.00M");
 }
 
-/// The invariant: a release is made due by what this build made. A crate whose units were all
+/// A release is made due by what this build made. A crate whose units were all
 /// found kept as they began (a warm build's dependencies, every one of them before its first
 /// task) is finished and makes none due; it goes with the next release, a made crate's or the
 /// build's end's. The control: with one of its units not found kept, the same crate makes a

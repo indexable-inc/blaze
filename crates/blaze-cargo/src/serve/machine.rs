@@ -601,7 +601,7 @@ mod tests {
         }
     }
 
-    /// The invariant: a turn never waits for the ledger's lock. While another daemon's handle
+    /// A turn never waits for the ledger's lock. While another daemon's handle
     /// holds it, a try says so at once and is no error; once let go, the next try has it. And
     /// the bound: tries that find it held for [`LOCK_WAIT`] in a row, by the daemon's clock,
     /// are the error, and a try that had it starts the count anew. Make `held_since` never

@@ -270,7 +270,7 @@ mod tests {
 
     const S: u64 = 1_000_000_000;
 
-    /// The invariant: the loop's copy of the stall line is the guard's last word, whatever
+    /// The loop's copy of the stall line is the guard's last word, whatever
     /// the guard said between two takes and however many it said to a loop that took none;
     /// and with nothing said since, it is as it was. Make `take_stall` keep the first line it
     /// pops and the loop shows a stall that ended.

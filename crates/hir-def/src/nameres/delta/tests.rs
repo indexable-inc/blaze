@@ -1262,7 +1262,7 @@ fn went_over(db: &mut Db, f: impl FnOnce(&mut Db)) -> Vec<Crate> {
     crates
 }
 
-/// The invariant (`delta::unreached`): a crate with no job in a write is one whose job would
+/// The invariant: a crate with no job in a write (`delta::unreached`) is one whose job would
 /// change nothing, so after any write every crate's maintained map is the one a fresh
 /// resolution makes (`check_db`). And the cost: a write of a file has a job for its crate and
 /// the crates above it alone, not one for every crate of the graph.
