@@ -1533,17 +1533,32 @@ impl ScriptRun {
         };
         let what = match quiet.step(self.tag, completion, effects) {
             Ok(None) => return,
-            // alloc: error path
-            Ok(Some(Stuck { quiet, ran })) => format!(
-                "the build script of `{}` ({}) made no progress: its sandbox's record of what it and \
-                 the programs it started read stayed as it was for {} s, of a run of {} s, so it \
-                 was killed (blaze bounds a run that waits on nothing at {} s of no reads)",
-                start.unit.package.descr(),
-                start.unit.script.display(),
-                quiet.as_secs(),
-                ran.as_secs(),
-                QUIET_MOST.as_secs()
-            ),
+            Ok(Some(Stuck { quiet, ran })) => {
+                // What each of its processes is blocked in, read before the kill takes them:
+                // a walk of `/proc` bounded in entries, processes and time
+                // (`blaze_usercode::blocked`), once a run that hung for `QUIET_MOST`.
+                let blocked = {
+                    let _span = tracing::info_span!(
+                        target: "blaze",
+                        "read what a stuck build script's processes are blocked in"
+                    )
+                    .entered();
+                    blaze_usercode::blocked::said(&blaze_usercode::blocked::of_program(
+                        &start.unit.script,
+                    ))
+                };
+                // alloc: error path
+                format!(
+                    "the build script of `{}` ({}) made no progress: its sandbox's record of what it and \
+                     the programs it started read stayed as it was for {} s, of a run of {} s, so it \
+                     was killed (blaze bounds a run that waits on nothing at {} s of no reads){blocked}",
+                    start.unit.package.descr(),
+                    start.unit.script.display(),
+                    quiet.as_secs(),
+                    ran.as_secs(),
+                    QUIET_MOST.as_secs()
+                )
+            }
             // alloc: error path
             Err(why) => format!(
                 "the build script of `{}`: its bound can't be kept: {why}",

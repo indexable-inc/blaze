@@ -20,6 +20,7 @@
 #![feature(allocator_api, allocator_ext)]
 #![forbid(unsafe_code)]
 
+pub mod blocked;
 pub mod calls;
 pub mod confine;
 pub mod index;
