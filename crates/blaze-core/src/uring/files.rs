@@ -1295,18 +1295,36 @@ impl Uring {
             }
             Err(error) => error.raw_os_error().unwrap_or(libc::EIO),
             Ok((true, _)) => {
-                /// `_IOW(0x94, 9, int)` of `linux/fs.h`.
-                const FICLONE: libc::c_ulong = 0x4004_9409;
                 // No io_uring op shares blocks: one `FICLONE` of the two files the ring opened,
-                // here.
-                // SAFETY: two open descriptors; the call reads the first's blocks into the
-                // second.
-                let cloned =
-                    unsafe { libc::ioctl(target.as_raw_fd(), FICLONE as _, source.as_raw_fd()) };
-                if cloned == 0 {
-                    return Step::Ends(Some(Done::Cloned));
-                }
-                io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)
+                // on a thread of its own, never here. The call waits for the device where the
+                // source has data not written back (a file system that shares blocks writes
+                // it out first): made on this thread, the daemon's loop, it held every
+                // request for 0.9 s and 1.4 s of one edit, in no span (strace, 2026-11-10).
+                // The request ends here with no completion of its own; the thread's is the
+                // effect's, taken in at a poll once it wakes the ring.
+                // alloc: clone: the two names, for the thread's span and its errors; once a clone
+                let from = self.name_of(id, 0).to_string_lossy().into_owned();
+                // alloc: clone: as above
+                let to = self.name_of(id, 1).to_string_lossy().into_owned();
+                // alloc: clone: the name of what the opens made, removed here if no thread starts
+                let unmade = to.clone();
+                let started = self.off_ring_with(hot.tag, move |_| {
+                    Ok(crate::lock::io_wait("clone", &from, || {
+                        share_blocks(&source, target, &from, &to)
+                    }))
+                });
+                return match started {
+                    Ok(()) => Step::Ends(None),
+                    Err(error) => {
+                        // The closure went with the thread that did not start, and the two
+                        // files with it: the empty file the open made is removed by name.
+                        _ = std::fs::remove_file(&unmade);
+                        // alloc: an error path.
+                        Step::Ends(Some(Done::Failed(IoError(format!(
+                            "{unmade}: starting the thread that clones it: {error}"
+                        )))))
+                    }
+                };
             }
         };
         drop((source, target));
@@ -1462,4 +1480,33 @@ impl Uring {
             _ => {}
         }
     }
+}
+
+/// The `FICLONE` of [`Effect::Clone`], whose two files the ring opened, made on a thread off
+/// the ring ([`Uring::cloned`]): `target`, the new empty file at `to`, made to share
+/// `source`'s blocks. One that fails is removed, and the completion says why as the ring's
+/// own did: a file system that cannot share blocks is named with both volumes, and nothing
+/// copies instead.
+fn share_blocks(source: &File, target: OwnedFd, from: &str, to: &str) -> Done {
+    use std::os::fd::AsFd as _;
+    let Err(failed) = crate::raw::ficlone(target.as_fd(), source.as_fd()) else {
+        return Done::Cloned;
+    };
+    drop(target);
+    _ = std::fs::remove_file(to);
+    let code = failed.raw_os_error().unwrap_or(libc::EIO);
+    let why = match matches!(code, libc::EOPNOTSUPP | libc::EXDEV | libc::EINVAL) {
+        // alloc: an error path.
+        true => format!(
+            "the file system of {to} ({}) cannot share blocks with {from} ({}): {}; blaze does not copy \
+             instead",
+            crate::fs::volume_of(
+                std::path::Path::new(to).parent().unwrap_or(std::path::Path::new(to))
+            ),
+            crate::fs::volume_of(std::path::Path::new(from)),
+            error(-code)
+        ),
+        false => error(-code),
+    };
+    Done::Failed(IoError(why))
 }

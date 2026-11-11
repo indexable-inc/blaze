@@ -407,7 +407,7 @@ impl Uring {
             }
             Kind::Wake => Sqe {
                 opcode: OP_READ,
-                fd: self.offload.wake.as_raw_fd(),
+                fd: self.offload.wake.fd.as_raw_fd(),
                 off: u64::MAX,
                 addr: self.offload.count.get() as u64,
                 len: 8,

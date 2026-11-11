@@ -60,7 +60,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering, fence},
+        atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering, fence},
     },
     time::{Duration, Instant},
 };
@@ -1345,7 +1345,7 @@ struct Offload {
     receiver: crossbeam_channel::Receiver<Completion>,
     /// Shared with the threads, so a write of one that ends after the driver is dropped
     /// still reaches an open descriptor.
-    wake: Arc<OwnedFd>,
+    wake: Arc<Wake>,
     /// Work handed to threads whose completion has not been received.
     out: usize,
     /// The request reading `wake`, while there is one.
@@ -1365,7 +1365,8 @@ impl Offload {
         }
         let (sender, receiver) = crossbeam_channel::unbounded();
         // SAFETY: the call returned a descriptor of its own.
-        let wake = Arc::new(unsafe { OwnedFd::from_raw_fd(fd) }); // alloc: setup, once per driver.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let wake = Arc::new(Wake { fd, parked: AtomicBool::new(false) }); // alloc: setup, once per driver.
         // alloc: setup, once per driver.
         let count = ManuallyDrop::new(Box::new(UnsafeCell::new([0; 8])));
         Ok(Offload { sender, receiver, wake, out: 0, reading: None, count })
@@ -1468,7 +1469,7 @@ struct Job {
     out: UnsafeCell<Vec<Stamp>>,
     base: *mut Stamp,
     sender: crossbeam_channel::Sender<Completion>,
-    wake: Arc<OwnedFd>,
+    wake: Arc<Wake>,
 }
 
 // SAFETY: `out` is written through `base` at disjoint chunks, each only by the one thread whose
@@ -1569,7 +1570,7 @@ struct List {
     root: Arc<Path>,
     dir: FileName,
     sender: crossbeam_channel::Sender<Completion>,
-    wake: Arc<OwnedFd>,
+    wake: Arc<Wake>,
 }
 
 impl List {
@@ -1734,11 +1735,33 @@ fn statx_at(dir: RawFd, leaf: &[u8]) -> Stamp {
     unsafe { statx.assume_init_ref() }.stamp()
 }
 
-/// Tells the ring's wait that work off the ring has sent its completion.
-fn wake_ring(wake: &OwnedFd) {
+/// The ring's wake for work done off it: the eventfd its thread reads while it waits, and
+/// whether it is waiting.
+///
+/// The eventfd is written only when the ring's thread is parked in its wait (wake
+/// coalescing): a completion sent while the thread is running is taken at its next poll
+/// ([`Uring::take_offloaded`], every reap) with no system call from the sender. The order
+/// that loses no wake: the sender puts its completion in the channel, then swaps `parked` to
+/// false and writes only if it was true; the ring's thread sets `parked`, then looks at the
+/// channel once more, and only then enters the kernel. Whichever comes second sees the
+/// other's write (both sequentially consistent), so either the thread finds the completion
+/// before it sleeps or the sender finds `parked` and writes.
+struct Wake {
+    fd: OwnedFd,
+    /// Set by the ring's thread before it waits in the kernel, cleared by it after, and by
+    /// the first sender that wakes it.
+    parked: AtomicBool,
+}
+
+/// Tells the ring's wait that work off the ring has sent its completion: a write of the
+/// eventfd where the ring's thread is parked, nothing where it is running ([`Wake`]).
+fn wake_ring(wake: &Wake) {
+    if !wake.parked.swap(false, Ordering::SeqCst) {
+        return;
+    }
     let one = 1u64.to_ne_bytes();
     // SAFETY: eight bytes, which an eventfd write takes, of an open eventfd.
-    unsafe { libc::write(wake.as_raw_fd(), one.as_ptr().cast(), one.len()) };
+    unsafe { libc::write(wake.fd.as_raw_fd(), one.as_ptr().cast(), one.len()) };
 }
 
 pub struct Uring {
@@ -2069,7 +2092,19 @@ impl Uring {
     /// in at a poll once the thread wakes the ring.
     fn off_ring(&mut self, effect: Effect) -> io::Result<()> {
         let tag = effect.tag();
-        self.off_ring_with(tag, move |root| crate::threads::run(root, effect))
+        self.off_ring_with(tag, move |root| {
+            // What the thread waits in is said by file (every-wait-says-what): a write-back
+            // of 162 MB is a second of this thread, and was in no span.
+            let (op, file) = match &effect {
+                Effect::WriteBack { file, .. } => ("write back", file.as_str()),
+                Effect::List { dir, .. } => ("list", dir.as_str()),
+                Effect::Private { dir, .. } => ("make private", dir.as_str()),
+                _ => ("carry out", ""),
+            };
+            // alloc: clone: the file's name for the span, once a call off the ring
+            let file = file.to_owned();
+            crate::lock::io_wait(op, &file, move || crate::threads::run(root, effect))
+        })
     }
 
     /// `work`, given the root, done on a thread of its own for the effect `tag`, as
@@ -2655,7 +2690,19 @@ impl Driver for Uring {
                     .timers
                     .next_deadline()
                     .map_or(until, |due| until.min(Deadline::at(Duration::from_nanos(due))));
-                if let Err(error) = self.ring.enter(Some(wait), &clock) {
+                // Parked from here ([`Wake`]): a thread off the ring that sends its completion
+                // after this writes the eventfd; one that sent before it is found by the look
+                // below, and the kernel is not entered to wait.
+                self.offload.wake.parked.store(true, Ordering::SeqCst);
+                self.take_offloaded();
+                if !self.ready.is_empty() {
+                    self.offload.wake.parked.store(false, Ordering::SeqCst);
+                    out.append(&mut self.ready);
+                    break;
+                }
+                let entered = self.ring.enter(Some(wait), &clock);
+                self.offload.wake.parked.store(false, Ordering::SeqCst);
+                if let Err(error) = entered {
                     self.fail_unsubmitted(&error);
                     out.append(&mut self.ready);
                     break;
