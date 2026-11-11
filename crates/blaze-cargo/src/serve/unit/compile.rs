@@ -161,6 +161,13 @@ pub(crate) fn output_key(bytes: &[u8]) -> Key {
 
 const LINKED_OUTPUT: &str = "blaze v2 cargo linked output 1";
 
+/// The store's key of the base of holes (`blaze_cas::derived::holes`): the value every linked
+/// image handed over as its runs ([`Written::Runs`]) is derived from, an output keyed by its
+/// bytes as any other.
+pub(crate) fn holes_key() -> Key {
+    output_key(&blaze_cas::derived::holes())
+}
+
 /// The store's key of a linked image's file by `root`, the root of the linker's digest of it
 /// ([`blaze_link::Image::digest`]): what [`output_key`] is for a file blaze's linker made,
 /// with no pass over the file. A sound content identity: the root is a collision-resistant
@@ -1871,6 +1878,13 @@ pub(crate) enum Written {
     /// A linked image's bytes, which the store is given under the key of the linker's digest
     /// of them ([`linked_key`]): the file is not hashed again.
     Linked(Vec<u8>, [u8; 32]),
+    /// A linked image as the runs of its file that hold bytes (offset and bytes, by offset),
+    /// the file `len` bytes long and zeros wherever no run is: what a link that wrote the
+    /// whole file hands over. The store is given the recipe of those runs over the base of
+    /// holes ([`holes_key`], `blaze_cas::derived::holes`) under [`linked_key`] of `root`, so
+    /// the patch room an image keeps (most of its length) is in no record, is never hashed
+    /// or chunked, and is holes in every file the store makes of it.
+    Runs { root: [u8; 32], len: u64, runs: Vec<(u64, Vec<u8>)> },
     /// A linked image as what its link changed of the last one: the image of digest `root` is
     /// the image the store holds under `base`'s key with `writes` (offset and bytes, by
     /// offset) written over it, `len` bytes long. The store is given that as a recipe
@@ -1888,15 +1902,16 @@ impl Written {
     /// as a `patch` of the image before it and the store can make that image's file again
     /// (`blaze_cas::Reader::derivable` of its key: it is there, kept as a whole file, and at
     /// the end of no long chain of patches), the patch ([`Written::Derived`]), and `whole` is
-    /// not called; else the whole file `whole` gives ([`Written::Linked`]): an image's first
-    /// link or one from scratch (a full patch), a base the store never had or let go of.
-    /// Having no base is not an error, and why is logged; `whole`'s error is the answer's.
+    /// not called; else what `whole` gives of the whole file (its runs, [`Written::Runs`]):
+    /// an image's first link or one from scratch (a full patch), a base the store never had
+    /// or let go of. Having no base is not an error, and why is logged; `whole`'s error is
+    /// the answer's.
     ///
     /// A base whose whole file the store wrote and has not seen written back is no base
     /// either (`blaze_cas::NoBase::Unflushed`, the dirty-base rule): a derive is a clone of
     /// that file, which would wait for all of it to be written out, so the image is handed
-    /// over whole and written where it goes. That is at most one whole file per write-back
-    /// in flight; the edit after it derives again.
+    /// over as `whole` gives it and written where it goes. That is at most one file's runs
+    /// per write-back in flight; the edit after it derives again.
     ///
     /// Give no patch for a file the daemon reads back by its bytes (a proc macro's wasm
     /// module, [`Module::bytes`]): what the store keeps of a patch is the recipe, and only a
@@ -1905,7 +1920,7 @@ impl Written {
         store: &blaze_cas::Reader,
         root: [u8; 32],
         patch: Option<blaze_link::Patch>,
-        whole: impl FnOnce() -> Result<Vec<u8>, E>,
+        whole: impl FnOnce() -> Result<Written, E>,
     ) -> Result<Written, E> {
         let derived = patch.filter(|it| !it.full && it.digest == root).and_then(|patch| {
             let base = patch.base?;
@@ -1919,7 +1934,7 @@ impl Written {
                         target: "blaze",
                         base = ?key,
                         %why,
-                        "a linked image is put whole: the store cannot derive it from the one before"
+                        "a linked image is put as its whole file's runs: the store cannot derive it from the one before"
                     );
                     None
                 }
@@ -1927,7 +1942,7 @@ impl Written {
         });
         match derived {
             Some(derived) => Ok(derived),
-            None => Ok(Written::Linked(whole()?, root)),
+            None => whole(),
         }
     }
 }
@@ -2647,6 +2662,41 @@ fn store(
                 Written::Linked(bytes, root) => {
                     put_output(&mut puts, bytes, Some((linked_key(&root), Kind::Output)))
                 }
+                // The runs of a file written whole, as the recipe of them over the base of
+                // holes: the store makes the file as it places it, a file of holes with the
+                // runs written. The base is put with the first image of a store that lacks
+                // it (16 KiB of zeros, once).
+                Written::Runs { root, len, runs } => {
+                    let holes = holes_key();
+                    let recipe = {
+                        let _span = tracing::info_span!(
+                            target: "blaze",
+                            "unit output recipe",
+                            path = %path,
+                            ranges = runs.len(),
+                            len,
+                        )
+                        .entered();
+                        blaze_cas::derived::encode(&holes, len, &runs)
+                    };
+                    let recipe = recipe.map_err(|why| {
+                        // alloc: error path
+                        ApiError::new(
+                            format!(
+                                "{}: the runs its link wrote of `{path}` are no recipe the store takes: {why}",
+                                span_unit(u)
+                            ),
+                            None,
+                        )
+                    })?;
+                    if !puts.iter().any(|it| it.key == holes)
+                        && !job.input.store.has(&blaze_cas::enter(), &holes)
+                    {
+                        let bytes = blaze_cas::derived::holes();
+                        puts.push(Put { key: holes, kind: Kind::Output, bytes });
+                    }
+                    put_output(&mut puts, recipe, Some((linked_key(&root), Kind::Derived)))
+                }
                 // The store derives the file as it places it: it is given the recipe, and
                 // the whole image is not handed over.
                 Written::Derived { base, root, len, writes } => {
@@ -2868,7 +2918,8 @@ impl Module<'_> {
                 // Only a doctest's images are kept as they were; a proc macro's is linked, and
                 // whole: a module is read back by its bytes, so no patch is given of one
                 // ([`Written::linked`]).
-                Some((_, Written::Kept(_) | Written::Derived { .. }, _)) | None => {
+                Some((_, Written::Kept(_) | Written::Derived { .. } | Written::Runs { .. }, _))
+                | None => {
                     return Err(ModuleError::NotLinked);
                 }
             },

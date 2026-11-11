@@ -1623,9 +1623,9 @@ pub(crate) type Read = (String, ContentId);
 /// splice ([`Full::NoThunk`]), what the build says of it.
 pub(crate) struct LinkMade {
     /// The file, keyed by the root of the linker's digest of it ([`Image::digest`],
-    /// `compile::linked_key`), which the blocks each link wrote keep: whole, or, where the
-    /// image took the link as a patch of a file the store can derive from, the patch
-    /// ([`Filed::written`]).
+    /// `compile::linked_key`), which the blocks each link wrote keep: the runs of it that
+    /// hold bytes, or, where the image took the link as a patch of a file the store can
+    /// derive from, the patch ([`Filed::written`]).
     pub(crate) written: Written,
     /// The file itself as the runs of it that hold bytes, for the loop to place it from
     /// (`blaze_cas::Store::place_made`): the build made it, so its place reads, clones and
@@ -2161,8 +2161,8 @@ fn link_at(
     };
     // What the store is given of the file, settled while the image is at hand: the patch the
     // image took the link as where the store can derive the file from the one before it, else
-    // the whole file, read from the image only then ([`Filed::written`]). A wasm module is
-    // read back by its bytes ([`super::compile`]'s `Module`), so it goes whole.
+    // the runs of the file that hold bytes ([`Filed::written`]). A wasm module is read back
+    // by its bytes ([`super::compile`]'s `Module`), so it goes whole.
     let made = made.and_then(|(filed, read, table, laid, told)| {
         let written = filed
             .written(&job.input.store, &linked.image, root?, path, wasm)
@@ -2592,13 +2592,9 @@ fn relink(
     if unchanged {
         let _span = tracing::info_span!(target: "blaze", "link unchanged", unit = %path).entered();
         linked.names = kept_names;
-        let bytes = linked
-            .image
-            .file()
-            .map_err(|error| LinkCause::Linker { step: LinkStep::Bytes, error })?;
         let table = tests_table(test, path, generated, linked)?;
         let told = super::run::inproc::Told::Nothing;
-        return Ok((Filed::Whole(bytes), read, table, Laid::Nothing, told));
+        return Ok((Filed::Unchanged, read, table, Laid::Nothing, told));
     }
     // clone: the names gone, a few a link, which an image that refuses the change still has
     let gone_names = unnamed.clone();
@@ -2752,22 +2748,24 @@ fn relink(
 
 /// The file a link left, as [`relink`] has it.
 enum Filed {
-    /// Its bytes: a dev executable's, which is its code memory's image part, or an image the
-    /// link changed nothing of.
-    Whole(Vec<u8>),
+    /// The file the image has: the link changed nothing of it.
+    Unchanged,
     /// What the commit changed of the file before it ([`Image::patch`]): the file itself is
-    /// made only if the store is to be given it whole.
+    /// never made.
     Patch(blaze_link::Patch),
 }
 
 impl Filed {
     /// What the store is given of the file of digest `root` that `image` was just committed
     /// to at `path`. A patch of the file before goes as the patch where the store can derive
-    /// from that file ([`Written::linked`]), and then the whole file is never made; else the
-    /// file is read from the image's state ([`Image::file`]), a copy its length long, which
-    /// the `link copy` span says. A file written whole is its patch's writes over zeros. A
-    /// file the daemon reads back by its bytes (`read_back`: a proc macro's wasm module) is
-    /// always given whole.
+    /// from that file ([`Written::linked`]). Everything else goes as the runs of the file
+    /// that hold bytes ([`Written::Runs`]): a file written whole is its patch's writes, moved,
+    /// and a file the store cannot derive (or one the link left as it was) is read from the
+    /// image's state run by run ([`Image::file_runs`]), which the `link copy` span says. No
+    /// path makes the file at its length: an image's patch room (64 MiB each of code and
+    /// data, at least) is in no run, so it is neither allocated, copied, hashed nor put.
+    /// Only a file the daemon reads back by its bytes (`read_back`: a proc macro's wasm
+    /// module, which keeps no room) is given whole.
     fn written(
         self,
         store: &blaze_cas::Reader,
@@ -2776,33 +2774,37 @@ impl Filed {
         path: &str,
         read_back: bool,
     ) -> Result<Written, blaze_link::LinkError> {
-        let patch = match self {
-            Filed::Whole(bytes) => return Ok(Written::Linked(bytes, root)),
-            Filed::Patch(patch) => patch,
-        };
-        let len = patch.len;
-        let copy = || {
-            let _span =
-                tracing::info_span!(target: "blaze", "link copy", unit = %path, bytes = len)
-                    .entered();
-            image.file()
-        };
-        if patch.full {
-            let _span =
-                tracing::info_span!(target: "blaze", "link copy", unit = %path, bytes = len)
-                    .entered();
-            // alloc: the file, which the store takes
-            let mut out = vec![0; len as usize];
-            for (at, bytes) in &patch.writes {
-                let at = *at as usize;
-                out[at..at + bytes.len()].copy_from_slice(bytes);
-            }
-            return Ok(Written::Linked(out, root));
-        }
         if read_back {
-            return Ok(Written::Linked(copy()?, root));
+            let span = tracing::info_span!(
+                target: "blaze",
+                "link copy",
+                unit = %path,
+                bytes = tracing::field::Empty,
+            )
+            .entered();
+            let bytes = image.file()?;
+            span.record("bytes", bytes.len());
+            return Ok(Written::Linked(bytes, root));
         }
-        Written::linked(store, root, Some(patch), copy)
+        let runs = || {
+            let span = tracing::info_span!(
+                target: "blaze",
+                "link copy",
+                unit = %path,
+                bytes = tracing::field::Empty,
+            )
+            .entered();
+            let (len, runs) = image.file_runs()?;
+            span.record("bytes", runs.iter().map(|it| it.1.len() as u64).sum::<u64>());
+            Ok(Written::Runs { root, len, runs })
+        };
+        match self {
+            Filed::Unchanged => runs(),
+            Filed::Patch(patch) if patch.full => {
+                Ok(Written::Runs { root, len: patch.len, runs: patch.writes })
+            }
+            Filed::Patch(patch) => Written::linked(store, root, Some(patch), runs),
+        }
     }
 }
 

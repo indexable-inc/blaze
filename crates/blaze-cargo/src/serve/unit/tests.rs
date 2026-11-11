@@ -3022,7 +3022,7 @@ fn an_edits_image_is_handed_to_the_loop_as_its_ranges_and_whole_only_over_a_base
         &store.reader(),
         now,
         Some(patch(was, now)),
-        || -> Result<Vec<u8>, String> {
+        || -> Result<compile::Written, String> {
             panic!("the whole image is made although the store can derive it")
         },
     )
@@ -3063,9 +3063,9 @@ fn an_edits_image_is_handed_to_the_loop_as_its_ranges_and_whole_only_over_a_base
         &store.reader(),
         edited,
         Some(patch(cold, edited)),
-        || -> Result<Vec<u8>, String> {
+        || -> Result<compile::Written, String> {
             asked += 1;
-            Ok(vec![0; 8]) // alloc: a test's stand-in for the image.
+            Ok(compile::Written::Linked(vec![0; 8], edited)) // alloc: a test's stand-in for the image.
         },
     )
     .unwrap();
