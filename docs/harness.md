@@ -588,7 +588,7 @@ for each platform, each on a machine of its own kind.
 | `blaze.yaml` (`lean`) | every change | the Lean proofs (`harness/v2/lean_gate.py`, [v2/plan/proofs.md](v2/plan/proofs.md)): `lake build` of `lean/` and `lean/analysis` with the pinned Lean, no `sorry`, and each theorem of `lean/theorems.json` held to Lean's three axioms by `#print axioms`; the checks that need no Lean run in `scripts` | about 4 min from its caches, 15 without; not measured |
 
 The build and the unit tests run only for a change that touches a file they read; any other
-change runs the two scripts alone. `.github/scripts/gate_changes.py` (the `changes` job) names
+change runs the two scripts alone. `scripts/src/bin/gate_changes.rs` (the `changes` job) names
 those files, and why each: the crates (`crates/`, with their test data and the LLVM pin
 `crates/hir-ty-codegen/llvm.json`), the vendored crates
 (`vendor/`), `Cargo.toml`, `Cargo.lock`, `.cargo/`, `.rustfmt.toml` and `.clippy.toml`, the

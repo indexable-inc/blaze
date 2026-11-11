@@ -1,28 +1,28 @@
 //! gate_changes: which tier of blaze.yaml a change runs (its `changes` job). The port of
-//! `.github/scripts/gate_changes.py`, line for line: the same one JSON argument, the lines
-//! printed, `$GITHUB_OUTPUT` and the exit status (docs/v2/plan/design/scripts.md, "Ports and
-//! their parity"). `DOC` below is the Python's docstring, which it prints when not given one
-//! argument; it says what each path list is.
+//! `.github/scripts/gate_changes.py`, deleted once both were run on the same inputs and agreed
+//! (docs/v2/plan/design/scripts.md, "Ports and their parity"). `DOC` below is what it prints when
+//! not given one argument; it says what each path list is.
 //!
 //!     blaze run -q -p scripts --bin gate_changes -- '{"tier": "gate", "repository": "indexable-inc/blaze", "base": SHA, "head": SHA}'
 
-/// .github/scripts/gate_changes.py's docstring, as it prints it.
+/// What it prints when not given one argument: the Python's docstring, with this script's command.
 const DOC: &str = r#"gate_changes.py: which tier of blaze.yaml a change runs (its `changes` job).
 
-    gate_changes.py '{"tier": "gate", "repository": "indexable-inc/blaze", "base": SHA, "head": SHA}'
+    blaze run -q -p scripts --bin gate_changes -- '{"tier": "gate", "repository": "indexable-inc/blaze", "base": SHA, "head": SHA}'
 
 `tier` is the one the event asks for (`gate` for a pull request, `warm` for a push to main or a
 run by hand); it is what runs when the change between `base` and `head` touches a file the
-tier's jobs read (CODE below, and WARM for `warm`), and `none` when it touches nothing else.
+tier's jobs read (CODE in scripts/src/bin/gate_changes.rs, and WARM for `warm`), and `none`
+when it touches nothing else.
 Anything that cannot be told counts as code: no `base` (a run by hand, a new branch), a
 comparison GitHub refuses or cuts short (300 files), or no file at all. Prints `tier=...` and
 writes it to $GITHUB_OUTPUT.
 
 An allow-list, not a deny-list: a new directory of documents, benches or harness scripts runs
-no build until a tier reads it. The harness scripts' own checks (`harness/imports.py`,
-`harness/rustcsites.py`) are blaze.yaml's `scripts` job, which runs on every change.
+no build until a tier reads it. The scripts' own checks (`harness/imports.py`, `rustcsites` and
+the rest) are blaze.yaml's `scripts` job, which runs on every change.
 
-The JSON is inline, a file's path, or `-` for stdin. Needs gh (GH_TOKEN). Python 3.11+, stdlib.
+The JSON is inline, a file's path, or `-` for stdin. Needs gh (GH_TOKEN).
 "#;
 
 use std::{io::Write, path::Path, time::Duration};
@@ -32,23 +32,37 @@ use blaze_script::{Value, pyfmt::repr, run_within};
 const SCRIPT: &str = "gate_changes.py";
 /// What the build of blaze and the unit tests (blaze-platform.yaml's `build` and `tests` jobs,
 /// tiers gate and warm) read. A path ending in `/` is the directory and everything under it.
-/// The Python's list says why each is here; this one is it, plus `scripts/`.
 const CODE: &[&str] = &[
+    // The workspace's crates, with their test data and crates/hir-ty-codegen/llvm.json (the LLVM
+    // the blaze action fetches).
     "crates/",
+    // The patched crates of [patch.crates-io], hashed into BLAZE_SOURCES (blaze-engine/build.rs).
     "vendor/",
+    // ix's linter and rewriter, workspace members, and the rules the workspace check runs.
     "tools/astlog/",
+    // The workspace, the lock file (the build is --locked) and cargo's config ([env]).
     "Cargo.toml",
     "Cargo.lock",
     ".cargo/",
+    // Found by blaze-fmt's and blaze-lints' search up from a directory; not known to be unread
+    // by their tests.
     ".rustfmt.toml",
     ".clippy.toml",
+    // The pinned nightly: compiled into blaze-cargo.
     "harness/toolchain",
+    // The tests job runs it, and holds its failures to the known ones.
     "harness/unittests.py",
     "harness/failures.py",
     "harness/known-failures.toml",
+    // What fetches and checks the pinned LLVM for the build (.github/actions/blaze). No Nix:
+    // neither job reads the flake.
     ".github/scripts/llvm.py",
+    // The profile-gate job: its script, its known list, and the flake that pins its DuckDB (its
+    // fixtures are under crates/).
     "harness/profile_gate.py",
     "harness/profile-gate-known.toml",
+    // The same job's smoke of the budget harness against the blaze the build made: the script,
+    // the engine adapter and its layout of a daemon's home, the fixture it builds, its result.
     "harness/v2/budgets.py",
     "harness/v2/guards.py",
     "harness/v2/guards-known.toml",
@@ -58,17 +72,21 @@ const CODE: &[&str] = &[
     "harness/storelib.py",
     "flake.nix",
     "flake.lock",
+    // The release of blaze that builds and tests blaze (.github/actions/blaze), and its installer.
     ".github/blaze-version",
     "site/install.sh",
+    // The gate's jobs, and the actions they use.
     ".github/workflows/blaze.yaml",
     ".github/workflows/blaze-platform.yaml",
     ".github/actions/toolchain/",
     ".github/actions/blaze/",
-    // The package of the repository's scripts, a workspace member the build checks, among them
-    // the workspace check's fast tier (`changed`).
+    // The package of the repository's scripts (scripts/src/bin/<name>.rs), a workspace member the
+    // build checks, among them the workspace check's fast tier (`changed`, which packages a change
+    // touches); their library is crates/blaze-script, under crates/ above.
     "scripts/",
 ];
-/// What the warm tier (a push to main) reads besides.
+/// What the warm tier (a push to main) reads besides: the std cases of the smoke corpus, run
+/// against the blaze that build built.
 const WARM: &[&str] = &["harness/smoke.py", "harness/smoke/"];
 /// GitHub's comparison lists at most this many files; a longer one is cut short.
 const MOST_FILES: usize = 300;

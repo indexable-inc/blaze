@@ -8,7 +8,6 @@
 .github/scripts/downstream.py
 .github/scripts/downstream_build.py
 .github/scripts/explore_page.py
-.github/scripts/gate_changes.py
 .github/scripts/land.py
 .github/scripts/llvm.py
 .github/scripts/promote.py

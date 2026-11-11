@@ -22,7 +22,7 @@
 # harness/unittests.py, the flake, the release of blaze that builds blaze
 # (.github/blaze-version, site/install.sh), and these workflows and the actions they use; on a push
 # to main, also the smoke corpus (harness/smoke.py, harness/smoke/).
-# .github/scripts/gate_changes.py has the list and why each path is on it. It names what is
+# scripts/src/bin/gate_changes.rs has the list and why each path is on it. It names what is
 # code, so a new directory is not: any other change (documentation, the site, benches, the
 # other harnesses and workflows) runs the script checks alone, and a list of files that cannot
 # be had counts as code. `ci` is the one check that says whether everything that ran passed: it
@@ -72,19 +72,21 @@ jobs:
   # Which tier runs: `gate` for a pull request and the merge queue, `warm` for a push to main
   # (or by hand), or `none` for a change that touches no file the tier reads (the pull
   # request's files, the merge queue entry's or the push's against the commit before it;
-  # .github/scripts/gate_changes.py). Anything that cannot be told counts as code.
+  # scripts/src/bin/gate_changes.rs). Anything that cannot be told counts as code.
   changes:
     name: changes
     runs-on: [ix, arm64]
-    timeout-minutes: 5
+    # The release's install and a build of scripts/ from the runner's store (an ix runner starts
+    # from main's last green disk); not yet measured.
+    timeout-minutes: 20
     outputs:
       tier: ${{ steps.files.outputs.tier }}
     steps:
-      # The script alone: the job decides in seconds, before a whole checkout.
+      # A whole checkout: `blaze run` loads the workspace scripts/ is a member of.
       - uses: actions/checkout@v7
+      - uses: ./.github/actions/blaze
         with:
-          sparse-checkout: |
-            .github/scripts
+          job: changes
       - id: files
         env:
           GH_TOKEN: ${{ github.token }}
@@ -93,7 +95,7 @@ jobs:
           BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
           HEAD: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
         run: |
-          python3 .github/scripts/gate_changes.py \
+          blaze run -q -p scripts --bin gate_changes -- \
             "{\"tier\": \"$TIER\", \"repository\": \"$GITHUB_REPOSITORY\", \"base\": \"$BASE\", \"head\": \"$HEAD\"}"
 
   scripts:
