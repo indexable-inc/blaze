@@ -214,8 +214,15 @@ pub enum ExpandErrorKind {
 impl ExpandErrorKind {
     /// Whether this is a proc macro that ran, or was to, and gave no expansion: the tree in
     /// its place is the empty one `ProcMacroExpander::expand` leaves, not the macro's.
+    /// One that panicked, one whose crate has no expander for it (its module did not load),
+    /// and one disabled.
     pub fn proc_macro_gave_no_expansion(&self) -> bool {
-        matches!(self, ExpandErrorKind::ProcMacroPanic(_))
+        matches!(
+            self,
+            ExpandErrorKind::ProcMacroPanic(_)
+                | ExpandErrorKind::MissingProcMacroExpander { .. }
+                | ExpandErrorKind::MacroDisabled
+        )
     }
 }
 

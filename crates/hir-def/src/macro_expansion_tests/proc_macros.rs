@@ -349,6 +349,56 @@ static HALF: u32 = proc_macros::mirror!(+ 1);
     assert_eq!((panicked, half), (1, 1), "each static's macro call was found in its body");
 }
 
+/// A proc macro whose crate did not load (i18n-embed-fl's wasm module had no glue, in age
+/// 0.11.5's `wfl!`) has one error where an expression is called for, why it has no expander:
+/// the empty tree left in its place is not parsed into a second "macro expansion ends with an
+/// incomplete expression", which doubled each of age's 21 errors.
+#[test]
+fn a_proc_macro_with_no_expander_has_that_error_and_no_parse_error_of_its_empty_expansion() {
+    use hir_expand::{ExpandErrorKind, fixture, proc_macro::ProcMacros};
+
+    use crate::{
+        ModuleDefId, expr_store::Body, nameres::crate_def_map, test_db::TestDBExt as _,
+    };
+
+    let mut db = fixture::db(
+        r#"
+//- proc_macros: mirror
+static UNLOADED: u32 = proc_macros::mirror!(1);
+"#,
+    )
+    .into_db();
+    let macros = *base_db::all_crates(&db)
+        .iter()
+        .find(|it| it.data(&db).target_kind.is_proc_macro())
+        .expect("`proc_macros`");
+    let refused = base_db::ProcMacroLoadingError::Refused("its module has no glue".into());
+    ProcMacros::give(&mut db, [(macros, Err(refused))]);
+    let krate = db.fetch_test_crate();
+    let def_map = crate_def_map(&db, krate);
+    let mut unloaded = 0;
+    for decl in def_map.module(&db, def_map.root).scope(&db).declarations() {
+        let ModuleDefId::StaticId(it) = decl else { continue };
+        let (_, source_map) = Body::with_source_map(&db, it.into());
+        for (_, call) in source_map.macro_calls() {
+            let errors = call.parse_macro_expansion_error(&db).expect("the call has an error");
+            match errors.err.as_ref().map(|err| err.kind()) {
+                Some(ExpandErrorKind::MissingProcMacroExpander { why, .. }) => {
+                    assert!(why.contains("its module has no glue"), "{why}");
+                    assert!(
+                        errors.value.is_empty(),
+                        "a second error for the macro with no expander: {:?}",
+                        errors.value
+                    );
+                    unloaded += 1;
+                }
+                other => panic!("not the error of a macro with no expander: {other:?}"),
+            }
+        }
+    }
+    assert_eq!(unloaded, 1, "the static's macro call was found in its body");
+}
+
 #[test]
 fn cfg_evaluated_before_attr_macros() {
     check_errors(

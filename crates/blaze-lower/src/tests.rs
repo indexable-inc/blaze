@@ -1560,11 +1560,15 @@ fn a_crates_macros_are_loaded_once_every_proc_macro_it_reaches_is() {
     assert!(!super::macros_loaded(db, krate(&built, BIN)), "`m` is not built");
     built.lowered.macros(MACRO, Ok(Vec::new())).unwrap();
     assert!(super::macros_loaded(built.lowered.db(), krate(&built, BIN)));
+    // A macro whose load failed never loads: nothing waits for it, and the crates that reach
+    // it are listed as they are (a use of it fails at the use).
     built.lowered.macros(MACRO, Err(base_db::ProcMacroLoadingError::FailedToBuild)).unwrap();
     assert!(
-        !super::macros_loaded(built.lowered.db(), krate(&built, BIN)),
-        "a macro that failed never loads"
+        super::macros_loaded(built.lowered.db(), krate(&built, BIN)),
+        "a macro whose load failed is waited for, so what reaches it is never listed"
     );
+    built.lowered.macros(MACRO, Err(base_db::ProcMacroLoadingError::NotYetBuilt)).unwrap();
+    assert!(!super::macros_loaded(built.lowered.db(), krate(&built, BIN)), "`m` is not built");
 }
 
 /// The bin's root file (`fn main() { alpha::gen(); }`) as a proc macro's span names it: the
