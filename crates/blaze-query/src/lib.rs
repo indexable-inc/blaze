@@ -1616,6 +1616,10 @@ pub struct Database {
     /// Every key of `image` has a slot ([`Database::slot_image_keys`] ran).
     image_slotted: std::sync::atomic::AtomicBool,
     io: ShortLock<Io>,
+    /// A safeguard left out, for the simulation's control (`tests/restore.rs`): a database
+    /// over an image takes a kept memo of a key without verifying its edges.
+    #[cfg(test)]
+    trusts_restored: std::sync::atomic::AtomicBool,
 }
 
 /// The database read from outside any query: a request's root. What it hands out borrows it,
@@ -1672,6 +1676,8 @@ impl Database {
             image: None,
             image_slotted: std::sync::atomic::AtomicBool::new(false),
             io: ShortLock::new("query.db.io", Io::default()),
+            #[cfg(test)]
+            trusts_restored: std::sync::atomic::AtomicBool::new(false),
         };
         db.register::<subtree::Subtree>();
         db
@@ -2850,7 +2856,14 @@ impl Database {
             if self.store.hot(task, memo).code() != info.code {
                 continue;
             }
-            let change = match self.verify(task, state, memo, run)? {
+            // A kept memo is the key's result only once every edge of it is verified in this
+            // view, a restored one as any other (the control of `tests/restore.rs` leaves
+            // this out).
+            let verdict = match self.trusts_restored() {
+                true => Verdict::Valid,
+                false => self.verify(task, state, memo, run)?,
+            };
+            let change = match verdict {
                 Verdict::Valid => return Ok(Some(self.resolved(task, state, key, memo))),
                 Verdict::Changed(changed) => Some(changed),
                 Verdict::Unknown => None,
@@ -2884,6 +2897,25 @@ impl Database {
         let memo = self.add_memo(task, key, made).map_err(unreadable)?;
         state.reruns.insert(task, key, Rerun { previous });
         Ok(Some(self.resolved(task, state, key, memo)))
+    }
+
+    /// Whether the planted bug of `tests/restore.rs` is on: never outside a test.
+    #[cfg(test)]
+    fn trusts_restored(&self) -> bool {
+        self.image.is_some() && self.trusts_restored.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn trusts_restored(&self) -> bool {
+        false
+    }
+
+    /// Plants the bug the restore simulation's control must catch: from here on, while the
+    /// database is over an image, a kept memo is taken unverified.
+    #[cfg(test)]
+    pub(crate) fn plant_trusting_restored(&self) {
+        self.trusts_restored.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Records `memo` as `key`'s in the view, and says which memo the view has for it (a
