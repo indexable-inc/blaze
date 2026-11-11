@@ -110,6 +110,9 @@ takes no `trusted`.
   A callee `trusted` for the word does not hide it: it answers for its own code, not for the
   object it is handed. So a function that stores the `dyn`, compares it or hands it on to code
   that calls nothing through it is clean, and one that calls a listed method has that list.
+  `PhantomData<T>` in a parameter's type is looked into for what a `T` owns (a `Vec`'s
+  elements are named only by its `PhantomData<T>`), except a function pointer type:
+  `PhantomData<fn() -> T>` holds no pointer and no `T`.
 - *Through a function pointer*: a function pointer's type has no marks, so one taken as a
   parameter is "may anything" and refused for every word the function leaves out. One made in
   the body is different: what it points to was walked where it was made (the walk is

@@ -676,11 +676,26 @@ impl<'db> Params<'_, 'db> {
                         format!("takes the union `{}`, whose live field the check can't know", cx.shown(ty))
                     });
                 }
-                // `Unique<T>` and `PhantomData<T>` own a `T` (a `Box`'s, a `Vec`'s elements).
                 if home && let AdtId::StructId(it) = id {
                     let name = StructSignature::of(cx.db, it).name.symbol().clone(); // clone: a handle of an interned name
-                    if matches!(name.as_str(), "Unique" | "PhantomData") {
+                    // `Unique<T>` owns a `T` (a `Box`'s).
+                    if name.as_str() == "Unique" {
                         if let Some(owned) = adt_args.types().next() {
+                            self.ty(owned, shared, false);
+                        }
+                        return;
+                    }
+                    // `PhantomData<T>` holds no value: it says what the type around it owns
+                    // behind a pointer whose type does not (a `Vec`'s elements are named only by
+                    // `RawVec`'s `PhantomData<T>`, a `ThinBox<dyn Tr>`'s object only by its
+                    // marker), so what a `T` owns is looked into. A function pointer type owns
+                    // nothing, and no value of it is there to call: `PhantomData<fn() -> T>` and
+                    // `PhantomData<fn(T)>` are how a type says it holds no `T` at all (an id, a
+                    // marker of variance), and neither the pointer nor `T` is the function's.
+                    if name.as_str() == "PhantomData" {
+                        if let Some(owned) = adt_args.types().next()
+                            && !matches!(cx.normalize(owned).kind(), TyKind::FnPtr(..))
+                        {
                             self.ty(owned, shared, false);
                         }
                         return;

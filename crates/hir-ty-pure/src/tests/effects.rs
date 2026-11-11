@@ -313,3 +313,75 @@ fn a_dyn_parameter_is_refused_only_for_a_call_through_it() {
         }
     });
 }
+
+/// `PhantomData<fn() -> T>` holds no function pointer and no `T`: it is how an id says it
+/// owns nothing (`blaze_ids::Idx<T>`), so a function that takes one is clean, whatever else
+/// it calls. A real `fn()` field is still refused. `PhantomData<dyn Tr>` names what the type
+/// around it may own (`ThinBox<dyn Tr>`): taking it is clean, as any `dyn` taken and not
+/// called through is.
+#[test]
+fn a_phantom_function_pointer_is_no_function_pointer() {
+    let db = hir_expand::fixture::db(
+        r#"
+//- minicore: sized, copy, phantom_data
+//- /lib.rs crate:kernel
+use core::marker::PhantomData;
+
+pub struct View;
+pub trait Draw {
+    fn draw(&self);
+}
+
+pub struct Idx<T> {
+    raw: u32,
+    marker: PhantomData<fn() -> T>,
+}
+
+pub struct Sink<T> {
+    raw: u32,
+    marker: PhantomData<fn(T)>,
+}
+
+pub struct Hook {
+    run: fn(),
+}
+
+pub struct Erased {
+    raw: u32,
+    marker: PhantomData<dyn Draw>,
+}
+
+pub fn takes_an_id(id: &Idx<View>, sink: &Sink<View>) -> u32 {
+    id.raw + sink.raw
+}
+
+pub fn takes_a_hook(hook: &Hook) -> u32 {
+    let _ = hook;
+    0
+}
+
+pub fn takes_a_phantom_dyn(erased: &Erased) -> u32 {
+    erased.raw
+}
+"#,
+    )
+    .into_db();
+    let krate = crate_named(&db, "kernel");
+    blaze_query::db::attach(&db, || {
+        for clean in ["takes_an_id", "takes_a_phantom_dyn"] {
+            for effect in [&NOALLOC, &NONBLOCKING] {
+                if let Err(refusal) = check_generic(&db, fn_named(&db, krate, clean), effect) {
+                    panic!("`{clean}` should be {}, but {}", effect.name, refusal.said());
+                }
+            }
+        }
+        for effect in [&NOALLOC, &NONBLOCKING] {
+            let Err(refusal) = check_generic(&db, fn_named(&db, krate, "takes_a_hook"), effect)
+            else {
+                panic!("`takes_a_hook` takes a function pointer, so it is not {}", effect.name);
+            };
+            let said = refusal.said();
+            assert!(said.contains("takes the function pointer `fn()`"), "{said}");
+        }
+    });
+}
