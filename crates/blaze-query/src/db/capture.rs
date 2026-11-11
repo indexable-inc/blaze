@@ -338,10 +338,12 @@ pub fn capture_reads<D: Database, T>(db: &D, f: impl FnOnce() -> T) -> (T, Optio
     let opened = local::with(|local| {
         let edges = local.edges.len() as u32;
         let frame_at = local.frames.len().checked_sub(1)? as u32;
+        let opened = local.tick();
         let frame = local.recording(storage)?;
         let capture = Capture {
             frame: frame_at,
             edges_start: edges,
+            opened,
             durability: frame.durability,
             changed: frame.changed,
             summary: frame.summary,

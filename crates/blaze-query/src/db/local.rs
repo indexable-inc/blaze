@@ -306,6 +306,9 @@ pub(crate) struct Pending {
 pub(crate) struct Capture {
     pub(crate) frame: u32,
     pub(crate) edges_start: u32,
+    /// [`Local::clock`] when it opened: a replay before it holds no read of it
+    /// ([`Local::replay`]).
+    pub(crate) opened: u64,
     pub(crate) durability: u8,
     pub(crate) changed: u32,
     pub(crate) summary: [u64; 2],
@@ -374,6 +377,18 @@ pub(crate) struct Local {
     /// ([`Local::replay`]), empty between replays.
     spans: Vec<(u64, u64)>,
     walked: hashbrown::HashSet<u32, FixedState>,
+    /// Each capture replayed into a run on this stack, by the run's serial and the capture:
+    /// [`Local::clock`] when its replay ended ([`Local::replay`]).
+    replayed: hashbrown::HashMap<(u64, u32), u64, FixedState>,
+    /// The keys of [`Local::replayed`], in the order they were made: a run's are above its
+    /// caller's, so a run popped takes its own off the top ([`Local::pop`]).
+    replay_log: Vec<(u64, u32)>,
+    /// Counts the events [`Local::replay`] orders: a replay's end, a capture's opening and a cut
+    /// of a run's own reads.
+    clock: u64,
+    /// [`Local::clock`] at the last [`Local::truncate_edges`]: a replay before it may have been
+    /// cut from its run.
+    cut: u64,
     /// The database [`super::attach`] lent this task, carried with it across fibers as the
     /// rest of its stack is.
     pub(crate) attached: Option<Attached>,
@@ -438,6 +453,10 @@ impl Local {
             entries: Vec::new(),  // alloc: none, empty
             spans: Vec::new(),    // alloc: none, empty
             walked: hashbrown::HashSet::with_hasher(FixedState),
+            replayed: hashbrown::HashMap::with_hasher(FixedState),
+            replay_log: Vec::new(), // alloc: none, empty
+            clock: 0,
+            cut: 0,
             attached: None,
             fuel: None,
             steps: None,
@@ -503,6 +522,10 @@ impl Local {
             entries,
             spans,
             walked,
+            replayed,
+            replay_log,
+            clock: _,
+            cut: _,
             attached: _,
             fuel: _,
             steps: _,
@@ -519,6 +542,8 @@ impl Local {
         map(pending_at);
         vec(walk);
         map(occurrences);
+        map(replayed);
+        vec(replay_log);
         set(seen);
         vec(segments);
         vec(entries);
@@ -1047,10 +1072,24 @@ impl Local {
         &cycle_edges[start..]
     }
 
-    /// Drops the edges from `len` on, and the segments over them.
+    /// Drops the edges from `len` on, and the segments over them, from a run that goes on (a
+    /// fixpoint's next round, the end of an untracked stretch): a capture replayed before this
+    /// is replayed in full again ([`Local::replay`]).
     pub(crate) fn truncate_edges(&mut self, len: usize) {
+        self.cut = self.tick();
+        self.cut_edges(len);
+    }
+
+    /// Drops the edges from `len` on, and the segments over them.
+    fn cut_edges(&mut self, len: usize) {
         self.edges.truncate(len);
         self.drop_segments_from(len);
+    }
+
+    /// The next reading of [`Local::clock`].
+    pub(crate) fn tick(&mut self) -> u64 {
+        self.clock += 1;
+        self.clock
     }
 
     fn drop_segments_from(&mut self, at: usize) {
@@ -1100,7 +1139,34 @@ impl Local {
     /// recording run on top: a replay. What the caller does next, as for a read
     /// ([`Local::read`]): a replay that took the run past its limit drops its repeats
     /// ([`Local::full`]).
+    ///
+    /// A capture this run replayed already pushes nothing when the run still holds every node
+    /// that replay pushed, wherever a dedup moved them, in each capture frame open now: the
+    /// replay was after the innermost capture frame open in the run opened, and after the last
+    /// cut of the run's reads ([`Local::truncate_edges`]). A dedup keeps the first of each node
+    /// above the innermost open frame's start, so it moves none below it; a nested run's reads
+    /// are above the run's own, and a fixpoint's next round renews the serial. So a solver goal
+    /// asked again and again in one run, each time answered from the shared cache, costs its
+    /// reads once, not once an answer. A replay that pushes nothing counts as one read toward
+    /// the run's bound ([`RUN_READS`]), so a run that only replays one capture again and again
+    /// still meets it.
     pub(crate) fn replay(&mut self, storage: &Storage, capture: u32) -> Note {
+        let at = self.frames.len() - 1;
+        let serial = self.frames[at].serial;
+        let opened =
+            self.captures.last().filter(|it| it.frame as usize == at).map_or(0, |it| it.opened);
+        if let Some(&when) = self.replayed.get(&(serial, capture))
+            && when > opened.max(self.cut)
+        {
+            let held = (self.edges.len() - self.frames[at].edges_start as usize) as u64;
+            let frame = &mut self.frames[at];
+            frame.dropped += 1;
+            return if held + frame.dropped >= self.bounds.run_reads {
+                Note::Runaway
+            } else {
+                Note::Fine
+            };
+        }
         let start = self.edges.len();
         let Local { edges, spans, walked, .. } = self;
         let _: Option<()> = walk_capture(storage, capture, spans, walked, |node| {
@@ -1109,6 +1175,12 @@ impl Local {
             ControlFlow::Continue(())
         });
         self.mark_capture(start, capture);
+        let when = self.tick();
+        // alloc: none once warm: the map and its log grow to their high-water marks once per
+        // thread
+        if self.replayed.insert((serial, capture), when).is_none() {
+            push_kept(&mut self.replay_log, (serial, capture));
+        }
         if let Some(note) = self.uncovered_from(storage, start) {
             return note;
         }
@@ -1221,7 +1293,14 @@ impl Local {
             if matches!(frame.kind, Kind::Run | Kind::Verify) {
                 self.bloom[bucket(frame.node)] -= 1;
             }
-            self.truncate_edges(frame.edges_start as usize);
+            // Its replays are of its serial (or an earlier round's), which no run has again.
+            self.cut_edges(frame.edges_start as usize);
+            while let Some(&key) = self.replay_log.last()
+                && key.0 >= frame.serial
+            {
+                self.replay_log.pop();
+                self.replayed.remove(&key);
+            }
             while self.captures.last().is_some_and(|it| it.frame >= at) {
                 self.captures.pop();
             }
@@ -1229,6 +1308,8 @@ impl Local {
         if self.frames.is_empty() {
             self.occurrences.clear();
             self.pending_at.clear();
+            self.replayed.clear();
+            self.replay_log.clear();
             // No head is left to gather for: what a frame that ended outside its cycle left
             // goes with the stack.
             self.cycle_edges.clear();
