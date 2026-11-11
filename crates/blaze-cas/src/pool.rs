@@ -1191,6 +1191,24 @@ impl<G: Give, P: Deref<Target = Pool<G>>> Pins<G, P> {
         unsafe { self.pool.bytes(self.at, self.len) }
     }
 
+    /// The `len` bytes at the pool's byte `at`, a part of what it pins, with no reference
+    /// made to the rest: for a guard of whole pages, whose last page a commit may be writing
+    /// past what its file commits while a reader reads what it does commit.
+    #[allow(unsafe_code, reason = "a part of a pinned run's bytes")]
+    pub(crate) fn part(&self, at: u64, len: u64) -> &[u8] {
+        assert!(
+            self.at <= at && at + len <= self.at + self.len,
+            "bytes {at}..{} of the store's pool read through pins of {}..{}",
+            at + len,
+            self.at,
+            self.at + self.len
+        );
+        // SAFETY: as in `bytes`: the pages under the part are pinned while `self` lives, and
+        // the slice borrows `self`. The caller reads only bytes its file commits, which
+        // nothing writes.
+        unsafe { self.pool.bytes(at, len) }
+    }
+
     pub(crate) fn run(&self) -> Run {
         Run::of(self.at, self.len)
     }

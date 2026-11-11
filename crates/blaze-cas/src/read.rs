@@ -464,10 +464,11 @@ impl PinnedRun {
         side.pin(run.first * PAGE, u64::from(run.pages) * PAGE).map(PinnedRun::new)
     }
 
-    /// The `len` bytes at the pool's byte `at`, which its run covers.
+    /// The `len` bytes at the pool's byte `at`, which its run covers and its file commits.
+    /// Only those: the run is whole pages, and a commit may be writing the last one past
+    /// what is committed, so no reference is made to the rest of it.
     fn bytes(&self, at: u64, len: u64) -> &[u8] {
-        let start = (at - self.pins.at()) as usize;
-        &self.pins.bytes()[start..start + len as usize]
+        self.pins.part(at, len)
     }
 }
 
