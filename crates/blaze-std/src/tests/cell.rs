@@ -3,7 +3,9 @@
 //! compile is the `compile_fail` fixture in `cell.rs`'s docs (unrun: bstd has
 //! `doctest = false`).
 
+use super::{root, world};
 use crate::{
+    Plant,
     cell::{Token, TokenCell},
     sync::Lock,
 };
@@ -28,6 +30,7 @@ fn one_token_reads_and_writes_every_cell_of_its_kind() {
 fn a_token_behind_one_lock_guards_every_cell_across_threads() {
     const THREADS: u32 = 4;
     const EACH: u32 = 100;
+    let io = world(29, Plant::None);
     let (a, b) = Token::scope(|token| {
         let a = TokenCell::new(0u32);
         let b = TokenCell::new(0u64);
@@ -35,10 +38,19 @@ fn a_token_behind_one_lock_guards_every_cell_across_threads() {
         std::thread::scope(|threads| {
             for _ in 0..THREADS {
                 threads.spawn(|| {
+                    // A context is its thread's own (`Cx` is not `Send`): each thread waits
+                    // for the lock under its own root.
+                    let cx = root(&io);
                     for _ in 0..EACH {
-                        let mut token = lock.lock();
-                        *a.get_mut(&mut *token) += 1;
-                        *b.get_mut(&mut *token) += 2;
+                        match lock.lock(&cx) {
+                            Ok(mut token) => {
+                                *a.get_mut(&mut *token) += 1;
+                                *b.get_mut(&mut *token) += 2;
+                            }
+                            // A thread holds the lock for two additions: a wait that ends
+                            // at the root's deadline is the test's failure.
+                            Err(stopped) => panic!("the token's lock, held for two additions: {stopped}"),
+                        }
                     }
                 });
             }

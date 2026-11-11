@@ -28,7 +28,7 @@ pub use blaze_mem::{
 };
 pub use blaze_mem::Arena as RequestArena;
 
-use alloc::{string::String, vec::Vec};
+use alloc::vec::Vec;
 use crate::{Plant, Stopped, io::Io};
 
 /// The most a frame not given a limit hands out: a task's ([`crate::task`]) and the root's.

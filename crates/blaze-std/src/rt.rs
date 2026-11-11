@@ -43,21 +43,32 @@ pub(crate) fn exit(status: i32) -> ! {
 )]
 #[expect(unsafe_code, reason = "the trusted `Owns` assertions for std's own containers, with their SAFETY")]
 mod owns {
-    use std::{
+    // `super::std`: bstd is `#![no_std]`, so `std` is a name only where `rt` declares it.
+    use super::std::{
         collections::{HashMap, HashSet},
         sync::{LazyLock, Mutex, OnceLock, RwLock},
     };
 
     use crate::own::{Mutably, Owns, Solely};
 
-    // SAFETY (all of the impls below): as `own.rs` says of the others. A map keeps each key
-    // and value alive behind a pointer it alone owns, its hasher in place; a lock or a
-    // once-cell keeps its value in place, changeable through a shared reference; none keeps
-    // alive anything else that owns.
+    // As `own.rs` says of the others: each keeps a value of each type argument alive the way
+    // its impl says, and keeps alive nothing else that owns.
+
+    // SAFETY: a `HashMap` keeps each key and value in a table behind a pointer it alone
+    // owns, and its hasher `S` in place (walked as solely owned too, which only refuses more).
     unsafe impl<K, V, S> Owns<Solely> for HashMap<K, V, S> {}
+    // SAFETY: a `HashSet` is a `HashMap<T, (), S>`: its values behind a pointer it alone owns.
     unsafe impl<T, S> Owns<Solely> for HashSet<T, S> {}
+    // SAFETY: a `Mutex` holds its value in place in an `UnsafeCell`; `lock` through a shared
+    // reference gives `&mut T`, so the value is changeable after it exists.
     unsafe impl<T: ?Sized> Owns<Mutably> for Mutex<T> {}
+    // SAFETY: as `Mutex`: the value in place in an `UnsafeCell`, `write` through a shared
+    // reference gives `&mut T`.
     unsafe impl<T: ?Sized> Owns<Mutably> for RwLock<T> {}
+    // SAFETY: a `OnceLock` holds its value in place and `set` writes it through a shared
+    // reference, once, after the cell exists.
     unsafe impl<T> Owns<Mutably> for OnceLock<T> {}
+    // SAFETY: a `LazyLock` holds its initializer `F` and then its value `T` in place, the
+    // one replaced by the other through a shared reference on first use.
     unsafe impl<T, F> Owns<Mutably> for LazyLock<T, F> {}
 }

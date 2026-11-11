@@ -72,9 +72,12 @@ impl<#[blaze::linear] T, K, const N: usize, const D: usize> Shares<T, K, N, D> {
     /// These `N` parts and `other`'s `M`, as one handle of `N + M`.
     #[blaze::consumes]
     pub fn join<const M: usize>(self, other: Shares<T, K, M, D>) -> Shares<T, K, { N + M }, D> {
-        // One kind is one allocation (the module's doc), so `other.value` is `self.value`.
-        let _joined: NonNull<T> = other.value;
-        Shares { value: self.value, kind: PhantomData, owns: PhantomData }
+        // Both handles end here, taken apart: a `Shares` has no destructor, and its parts
+        // go into the handle returned. One kind is one allocation (the module's doc), so
+        // `other`'s pointer is this one's and nothing is compared.
+        let Shares { value, kind: _, owns: _ } = self;
+        let Shares { value: _same, kind: _, owns: _ } = other;
+        Shares { value, kind: PhantomData, owns: PhantomData }
     }
 
     /// The value, from the handle that holds every part.

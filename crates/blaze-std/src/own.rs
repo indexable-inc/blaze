@@ -135,39 +135,79 @@ impl Capability for crate::keys::Keys {}
 // The ones only Rust's `std` has (`HashMap`, `HashSet`, `Mutex`, `RwLock`, `OnceLock`,
 // `LazyLock`) are stated in `crate::rt`, the one module that names `std` (bstd is `#![no_std]`).
 //
-// SAFETY (all of the impls below): the type keeps a value of each type argument alive the way
-// the impl says and keeps alive nothing else that owns: `Option`, `Result`, `ManuallyDrop` and
-// `MaybeUninit` in their own bytes; `Box`, `Vec`, the collections and the maps behind a pointer
-// they alone own, their allocator and hasher in place (the walk treats every type argument the
-// same way, which only refuses more); `Rc` and `Arc` behind a count other handles share;
-// `UnsafeCell` and what is built on it in place, changeable through a shared reference; the
-// `Weak`s own nothing, since dropping one never drops the value.
+// What every impl below promises: the type keeps a value of each type argument alive the way
+// the impl says and keeps alive nothing else that owns. The walk treats every type argument
+// the same way, so an allocator `A` is walked as its container's contents are, which only
+// refuses more. Each SAFETY says why that holds for its type.
+
+// SAFETY: `Some(T)` is the `T` in the option's own bytes.
 unsafe impl<T> Owns<Inline> for Option<T> {}
+// SAFETY: `Ok(T)` or `Err(E)`, either in the result's own bytes.
 unsafe impl<T, E> Owns<Inline> for Result<T, E> {}
+// SAFETY: `repr(transparent)` over `T`; that it never drops the value takes nothing from
+// what the value owns while it is there.
 unsafe impl<T: ?Sized> Owns<Inline> for ManuallyDrop<T> {}
+// SAFETY: a union of `()` and `T` in its own bytes: at most a `T` in place, which is what
+// `Inline` says; uninitialized, it owns less.
 unsafe impl<T> Owns<Inline> for MaybeUninit<T> {}
 
+// SAFETY: a `Box` is the one owner of its allocation: a unique pointer to the `T`, freed
+// with the box.
 unsafe impl<T: ?Sized, A: Allocator> Owns<Solely> for Box<T, A> {}
+// SAFETY: a `Vec` is the one owner of its buffer and drops each element with it.
 unsafe impl<T, A: Allocator> Owns<Solely> for Vec<T, A> {}
+// SAFETY: a `VecDeque` is the one owner of its ring buffer and of each element in it.
 unsafe impl<T, A: Allocator> Owns<Solely> for VecDeque<T, A> {}
+// SAFETY: a `LinkedList` is the one owner of each of its boxed nodes; a node's links point
+// to nodes of the same list, never out of it.
 unsafe impl<T, A: Allocator> Owns<Solely> for LinkedList<T, A> {}
+// SAFETY: a `BinaryHeap` is a `Vec<T, A>` kept in heap order.
 unsafe impl<T, A: Allocator> Owns<Solely> for BinaryHeap<T, A> {}
+// SAFETY: a `BTreeMap` is the one owner of its nodes, which hold the keys and values; a
+// node's parent pointer stays inside the same tree.
 unsafe impl<K, V, A: Allocator + Clone> Owns<Solely> for BTreeMap<K, V, A> {}
+// SAFETY: a `BTreeSet` is a `BTreeMap<T, SetValZST, A>`.
 unsafe impl<T, A: Allocator + Clone> Owns<Solely> for BTreeSet<T, A> {}
+// SAFETY: a `String` is a `Vec<u8>`: bytes, which own nothing. It has no type argument, so
+// the impl only tells the walk not to read its fields.
 unsafe impl Owns<Solely> for String {}
 
+// SAFETY: an `Rc` keeps its `T` alive behind a strong count its clones share on one thread:
+// the value lives while any of them does.
 unsafe impl<T: ?Sized, A: Allocator> Owns<Jointly> for Rc<T, A> {}
+// SAFETY: as `Rc`, the count atomic: the value lives while any clone on any thread does.
 unsafe impl<T: ?Sized, A: Allocator> Owns<Jointly> for Arc<T, A> {}
 
+// SAFETY: `UnsafeCell` is the `T` in place, and the one type whose contents may change
+// through a shared reference: exactly what `Mutably` says.
 unsafe impl<T: ?Sized> Owns<Mutably> for UnsafeCell<T> {}
+// SAFETY: a `Cell` is an `UnsafeCell<T>`; `set` and `replace` change it through `&Cell`.
 unsafe impl<T: ?Sized> Owns<Mutably> for Cell<T> {}
+// SAFETY: a `RefCell` is an `UnsafeCell<T>` and a borrow flag; `borrow_mut` gives `&mut T`
+// through `&RefCell`.
 unsafe impl<T: ?Sized> Owns<Mutably> for RefCell<T> {}
+// SAFETY: a `OnceCell` is an `UnsafeCell<Option<T>>`; `set` writes it through a shared
+// reference, once, after the cell exists.
 unsafe impl<T> Owns<Mutably> for OnceCell<T> {}
+// SAFETY: a `LazyCell` holds its initializer `F` and then its value `T` in place in an
+// `UnsafeCell`, the one replaced by the other through a shared reference on first use.
 unsafe impl<T, F> Owns<Mutably> for LazyCell<T, F> {}
+// SAFETY: an `Atomic<T>` is `T`'s atomic storage in place (an `UnsafeCell` of a primitive:
+// an integer, a `bool` or a raw pointer), stored to through a shared reference. `T` is a
+// primitive, so the walk meets nothing counted below it; a raw pointer is refused as unseen.
 unsafe impl<T: AtomicPrimitive> Owns<Mutably> for Atomic<T> {}
+// SAFETY: blaze-core's `Lock` holds its value in place behind its mutex; `lock` through a
+// shared reference gives `&mut T`.
 unsafe impl<T: ?Sized> Owns<Mutably> for blaze_core::lock::Lock<T> {}
+// SAFETY: as `Lock`: the value in place, `write` through a shared reference gives `&mut T`.
 unsafe impl<T: ?Sized> Owns<Mutably> for blaze_core::lock::ReadLock<T> {}
+// SAFETY: a `TokenCell` is an `UnsafeCell<T>` its kind's token opens: `get_mut` through
+// `&TokenCell` gives `&mut T`. The kind `K` is a marker (no value of it is held), walked as
+// the contents are, which only refuses more.
 unsafe impl<T: ?Sized, K> Owns<Mutably> for crate::cell::TokenCell<T, K> {}
 
+// SAFETY: dropping an `rc::Weak` never drops the `T` (only the strong count does), and it
+// reaches the value only while a strong handle keeps it alive: it owns nothing.
 unsafe impl<T: ?Sized, A: Allocator> Owns<Nothing> for rc::Weak<T, A> {}
+// SAFETY: as `rc::Weak`, of an `Arc`.
 unsafe impl<T: ?Sized, A: Allocator> Owns<Nothing> for sync::Weak<T, A> {}

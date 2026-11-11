@@ -104,6 +104,7 @@
 #![feature(
     allocator_api,
     allocator_ext,
+    atomic_internals,
     blaze_comptime,
     blaze_const_exprs,
     blaze_verify,
@@ -121,7 +122,9 @@
 #![allow(
     internal_features,
     reason = "`core_intrinsics` for the one reflection intrinsic `own::raw` asks directly \
-              (`type_id_vtable`, of an unsized type)"
+              (`type_id_vtable`, of an unsized type); `atomic_internals` for the bound of \
+              `Atomic<T>` (`AtomicPrimitive`), which `own`'s one `Owns` impl for every atomic \
+              has to name"
 )]
 #![register_tool(blaze)]
 
