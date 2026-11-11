@@ -103,6 +103,7 @@ fn dep(index: usize, name: &str, noprelude: bool) -> UnitDep {
         noprelude: noprelude.then_some(true),
         nounused: None,
         dev: false,
+        gpu: false,
     }
 }
 
@@ -140,6 +141,7 @@ fn plan(cfgs: &[&str], env: &[(&str, &str)], out_dir: Option<&str>) -> UnitPlan 
         harness: true,
         clippy: None,
         macro_wasm: false,
+        gpu_msl: None,
     }
 }
 

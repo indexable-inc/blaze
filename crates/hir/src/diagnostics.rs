@@ -79,7 +79,9 @@ pub use hir_expand::BuiltinChild;
 pub use hir_ty::solver_errors::{TypeAnnotationNeeded, UnreportedSolverError};
 pub use hir_ty::{
     AssocTypeFailure, CycleQuery, GenericArgsProhibitedReason, IncorrectGenericsLenKind,
-    MissingLifetimeKind, PatternTypeUnsupported, ReturnKind, StructPathDef, StructPathFound,
+    MissingLifetimeKind, PatternTypeUnsupported, RecordProblem, RecordRefusal, ReturnKind,
+    StructPathDef,
+    StructPathFound,
     const_param_ty::ConstParamTyReason,
     consteval::CreateConstError,
     diagnostics::{CaseType, IdentType, IncorrectCase},
@@ -190,6 +192,7 @@ diagnostics![AnyDiagnostic<'db> ->
     MissingSelfDefaultParams,
     ObjectWithoutTrait,
     PatternTypeNotLowered,
+    RecordRefused,
     QueryCycle,
     InactiveCode,
     IncoherentImpl,
@@ -222,6 +225,7 @@ diagnostics![AnyDiagnostic<'db> ->
     MixedDerefPatterns,
     ConstPatternRefused<'db>,
     NonExhaustiveRecordExpr,
+    RecordUseRefused,
     NonExhaustiveRecordPat,
     NoSuchField,
     MismatchedArrayPatLen,
@@ -1119,6 +1123,16 @@ pub struct NonExhaustiveRecordExpr {
     pub expr: InFile<ExprOrPatPtr>,
 }
 
+/// The record value `{ a: 1, .. }` or record pattern `{ a, .. }` at `node` (blaze's
+/// `#![blaze::records]`) refused for `problem`.
+#[derive(Debug)]
+pub struct RecordUseRefused {
+    pub node: InFile<ExprOrPatPtr>,
+    pub problem: RecordProblem,
+    /// The name of the function a [`RecordProblem::MissingDefault`] is about.
+    pub callee: Option<Name>,
+}
+
 #[derive(Debug)]
 pub struct NonExhaustiveRecordPat {
     pub pat: InFile<ExprOrPatPtr>,
@@ -1683,6 +1697,13 @@ impl QueryCycle {
 pub struct PatternTypeNotLowered {
     pub ty: InFile<AstPtr<ast::Type>>,
     pub reason: PatternTypeUnsupported,
+}
+
+/// The record type `ty` (`{ a: T, .. }`, `#![blaze::records]`) refused for `reason`.
+#[derive(Debug)]
+pub struct RecordRefused {
+    pub ty: InFile<AstPtr<ast::Type>>,
+    pub reason: RecordRefusal,
 }
 
 #[derive(Debug)]
@@ -4446,6 +4467,18 @@ impl<'db> AnyDiagnostic<'db> {
             &InferenceDiagnostic::NonExhaustiveRecordExpr { expr } => {
                 NonExhaustiveRecordExpr { expr: expr_syntax(expr)? }.into()
             }
+            InferenceDiagnostic::RecordRefused { node, problem } => RecordUseRefused {
+                node: expr_or_pat_syntax(node.unpack())?,
+                // clone: one error's reason
+                problem: problem.clone(),
+                callee: match problem {
+                    RecordProblem::MissingDefault { function, .. } => {
+                        Some(hir_def::signatures::FunctionSignature::of(db, *function).name)
+                    }
+                    _ => None,
+                },
+            }
+            .into(),
             &InferenceDiagnostic::NonExhaustiveRecordPat { pat, variant } => {
                 let pat = pat_syntax(pat)?.map(Into::into);
                 NonExhaustiveRecordPat { pat, variant: variant.into() }.into()
@@ -5467,6 +5500,10 @@ impl<'db> AnyDiagnostic<'db> {
                 }
                 .into()
             }
+            TyLoweringDiagnostic::RecordRefused { source, reason } => {
+                RecordRefused { ty: Self::type_syntax(*source, source_map)?, reason: *reason }
+                    .into()
+            }
             TyLoweringDiagnostic::QueryCycle { def, query } => {
                 QueryCycle::new(db, *def, *query).into()
             }
@@ -5791,6 +5828,9 @@ fn unplaced_inference_text<'db>(
         }
         InferenceDiagnostic::NonExhaustiveRecordExpr { .. } => {
             "E0639: cannot create non-exhaustive struct using struct expression".to_owned()
+        }
+        InferenceDiagnostic::RecordRefused { problem, .. } => {
+            format!("a record value or pattern (`#![blaze::records]`) is refused: {problem:?}")
         }
         InferenceDiagnostic::NonExhaustiveRecordPat { .. } => {
             "E0638: a pattern of a `#[non_exhaustive]` struct needs `..`".to_owned()

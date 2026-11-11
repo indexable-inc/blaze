@@ -392,6 +392,14 @@ served lazily when a debugger asks; an edit never waits on them.
 - **Tests**: after a move and a rename, the edit's time does not include debug info (the daemon's
   events show the build finishing before any debug record is made); `lldb`/`gdb` scripts break on a
   line and print a renamed local after the edit; the debug records equal a fresh build's.
+- **Built 2026-11-10** ([debug-side-file.md](debug-side-file.md)): the debug info the linker
+  makes (line rows and a subprogram a function) is out of the executable by default, in a side
+  file found by `.gnu_debuglink` (ELF) or `LC_UUID` (a `.dSYM`), kept as one record a function
+  and patched in place from the committed image (`blaze_link::Image::debug_file`), not served
+  by the daemon: a file every debugger and std's backtrace find with nothing configured needed
+  no endpoint. Not yet: the write after the answer (it runs in the link, span
+  `link debug file`), records keyed by code and presentation hash (a record is found by the
+  function's instance key and compared by a hash of its address, name and rows), variables.
 
 ## 14. Stable item IDs in blaze's reports
 

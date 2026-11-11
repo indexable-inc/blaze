@@ -108,6 +108,13 @@ use hir_ty_mir::mir::{
     owner_of, source_span, written_checked_at,
 };
 
+/// Keeps the analyses behind `hir_ty::facts::facts_of` in every binary that generates code
+/// (docs/v2/plan/design/facts.md): `hir-ty-pure` registers them with `inventory::submit!`,
+/// which a linker keeps only with the object it is in, and this names that object. Without
+/// it `SpendFacts` would prove nothing and change nothing, silently.
+#[used]
+static FACTS_LINKED: fn() = hir_ty_pure::facts::linked_here;
+
 mod asm;
 pub use asm::Assembled;
 mod avx512;

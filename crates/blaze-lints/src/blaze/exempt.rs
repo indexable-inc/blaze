@@ -1,5 +1,6 @@
-//! The comments that keep a cost on a line: `// clone: <why>`, `// alloc: <why>` and
-//! `// dyn: <why>`, on a line of the finding or on the line above it, with a reason that isn't
+//! The comments that keep a cost on a line: `// clone: <why>`, `// alloc: <why>`,
+//! `// dyn: <why>`, `// seqcst: <why>`, `// durable: <why>`, `// wakes: <who>` and
+//! `// identity: <why>`, on a line of the finding or on the line above it, with a reason that isn't
 //! empty. Read from the text of the tree walked, nothing allocated.
 
 use syntax::TextRange;
@@ -14,6 +15,9 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         Lint::HotAlloc | Lint::HotAllocCall | Lint::ImplicitAllocator => Some("alloc"),
         Lint::HotDyn => Some("dyn"),
         Lint::SeqcstUnexplained => Some("seqcst"),
+        Lint::DurableWrite => Some("durable"),
+        Lint::UnboundedWait => Some("wakes"),
+        Lint::CombinedIdentity => Some("identity"),
         // `relaxed_publish` reads it on either side and on the atomic's declaration itself.
         Lint::RelaxedPublish => Some("relaxed"),
         Lint::Parallelizable
@@ -41,6 +45,7 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         // the item, not of one line.
         | Lint::StructUpdate
         | Lint::BoolParam
+        | Lint::ManyBools
         // Kept with `#[expect(..)]`: a core and a key are choices of the item, not of one line
         // (`key_ignores_field`'s `// not in key: <why>` names one field, through [`commented`]).
         | Lint::SansIoCore
@@ -117,6 +122,14 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::NativeContracts
         // Kept with `#[expect(..)]` on the item: what a format accepts is the type's choice.
         | Lint::LenientDeserialize
+        // Kept with `#[expect(..)]` on the macro's function or the script: a macro and a
+        // script's reach are the item's choice, not one line's.
+        | Lint::ProcMacroDerive
+        | Lint::ProcMacroAttribute
+        | Lint::ProcMacroFnLike
+        | Lint::BuildScriptAmbient
+        // Kept with `#[expect(..)]` on the function: what a function reaches is its choice.
+        | Lint::StdUse
         // A hasher is chosen in the type, or kept with `#[expect(blaze::default_hasher, reason = ..)]`:
         // an allocation's comment says nothing about it.
         | Lint::DefaultHasher => None,

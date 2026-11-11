@@ -11,13 +11,16 @@
 use blaze_mem::Frame;
 
 use crate::mir::{
-    BasicBlock, BasicBlockId, LocalId, MirBody, OperandKind, ProjectionElem, Rvalue, StatementKind,
+    BasicBlockId, LocalId, MirBody, OperandKind, ProjectionElem, Rvalue, StatementKind,
     TerminatorKind,
-    framed::{Bits, bits_in, block_index, local_index},
+    framed::{Bits, bits_in, local_index},
     return_slot,
 };
 
-use super::{Location, Mention, reverse_postorder, visit_statement, visit_terminator};
+use super::{
+    Location, Mention, exit_into, live_on_entry, reverse_postorder, visit_statement,
+    visit_terminator,
+};
 
 /// The mentions of one statement or terminator, reused for each.
 type Mentions<'f> = Vec<(LocalId, Mention), &'f Frame>;
@@ -42,8 +45,9 @@ fn removable_destination(statement: &StatementKind, always_live: &Bits<'_>) -> O
 
 /// Liveness across one mention, backwards. rustc ends a local's life at its `StorageDead`;
 /// here only a write does, so a read that lowering misplaces after the `StorageDead` still
-/// keeps the store it reads.
-fn transfer(live: &mut Bits<'_>, local: LocalId, mention: Mention) {
+/// keeps the store it reads. The copies of `#![blaze::handles]` take a local's life the same
+/// way (`mir::handles`).
+pub(in crate::mir) fn transfer(live: &mut Bits<'_>, local: LocalId, mention: Mention) {
     match mention {
         Mention::Assigned | Mention::CallReturned => {
             live.remove(local_index(local));
@@ -102,16 +106,6 @@ fn terminator_effect(
     }
 }
 
-/// Live on exit from `block`: live on entry to any of its successors.
-fn exit_into(entry: &[Bits<'_>], block: &BasicBlock, live: &mut Bits<'_>) {
-    live.clear();
-    if let Some(terminator) = &block.terminator {
-        for target in terminator.kind.all_successors() {
-            live.union_with(&entry[block_index(target)]);
-        }
-    }
-}
-
 fn insert_index_locals(live: &mut Bits<'_>, place: &crate::mir::StoredPlace) {
     for elem in place.projection.as_slice() {
         if let ProjectionElem::Index(local) = elem {
@@ -152,36 +146,21 @@ pub(super) fn dead_store_elimination(body: &mut MirBody<'_>, frame: &Frame) {
 
     // Live on entry to each block, to a fixpoint, in postorder.
     let order = reverse_postorder(body, frame);
-    let blocks = body.basic_blocks.len();
-    let mut entry: Vec<Bits<'_>, &Frame> = Vec::with_capacity_in(blocks, frame);
-    entry.extend((0..blocks).map(|_| bits_in(locals, frame)));
+    let entry = {
+        let mut statement_mentions: Mentions<'_> = Vec::new_in(frame);
+        let mut terminator_mentions: Mentions<'_> = Vec::new_in(frame);
+        live_on_entry(
+            body,
+            &order,
+            frame,
+            |live, statement, at| {
+                statement_effect(live, statement, at, &always_live, &mut statement_mentions)
+            },
+            |live, kind, at| terminator_effect(live, kind, at, &mut terminator_mentions),
+        )
+    };
     let mut live: Bits<'_> = bits_in(locals, frame);
     let mut mentions: Mentions<'_> = Vec::new_in(frame);
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for &bb in order.iter().rev() {
-            let block = &body.basic_blocks[bb];
-            exit_into(&entry, block, &mut live);
-            if let Some(terminator) = &block.terminator {
-                let at = Location { block: bb, index: block.statements.len() };
-                terminator_effect(&mut live, &terminator.kind, at, &mut mentions);
-            }
-            for (index, statement) in block.statements.iter().enumerate().rev() {
-                statement_effect(
-                    &mut live,
-                    &statement.kind,
-                    Location { block: bb, index },
-                    &always_live,
-                    &mut mentions,
-                );
-            }
-            if live != entry[block_index(bb)] {
-                entry[block_index(bb)].copy_from(&live);
-                changed = true;
-            }
-        }
-    }
 
     let mut dead: Vec<Location, &Frame> = Vec::new_in(frame);
     let mut to_move: Vec<(BasicBlockId, usize), &Frame> = Vec::new_in(frame);

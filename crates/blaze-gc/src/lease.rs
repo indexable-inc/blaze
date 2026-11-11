@@ -409,6 +409,7 @@ fn rewrite_abandoned(file: &mut File, dir: &Path) -> Result<bool, String> {
     file.set_len(0).map_err(failed)?;
     file.rewind().map_err(failed)?;
     file.write_all(format!("{}\n", nonce()).as_bytes()).map_err(failed)?;
+    // durable: a lease's nonce says who holds it: a crash must not leave a lease file with none, which reads as abandoned
     file.sync_all().map_err(failed)?;
     tracing::warn!(target: "blaze", lease = %path.display(), "a lease file its maker left without a nonce was given a fresh one");
     Ok(true)
@@ -496,6 +497,7 @@ fn open_or_make(dir: &Path) -> Result<Option<File>, String> {
             Err(error) => return Err(error),
         };
         file.write_all(format!("{}\n", nonce()).as_bytes())?;
+        // durable: a lease's nonce says who holds it: a crash must not leave a lease file with none, which reads as abandoned
         file.sync_all()
     })();
     match made {

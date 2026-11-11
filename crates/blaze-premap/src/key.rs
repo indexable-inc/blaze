@@ -361,7 +361,14 @@ fn output_into(hasher: &mut Hasher, output: &Output) {
             .update(&sdk.to_le_bytes()),
         None => hasher.update(&[0]),
     };
-    hasher.update(&[*incremental as u8, matches!(debug, Debug::Lines) as u8]);
+    // Where the debug info is is in the image's bytes (a side file's image has none, and an
+    // ELF one names the file), so each level is its own key.
+    let debug = match debug {
+        Debug::None => 0u8,
+        Debug::Lines => 1,
+        Debug::Beside => 2,
+    };
+    hasher.update(&[*incremental as u8, debug]);
     // Where running programs take live patches: an image is never patched, so a live output
     // is refused before it is keyed ([`crate::prelink`]); hashed all the same.
     match live {

@@ -48,6 +48,10 @@ The input is one JSON object (inline, a file's path, or `-`):
                     line that opens a function, after which a statement is added
     self_test       the arguments of `blaze test` in the CI budget (none: the workspace's default)
     keep            keep each project's directory under `work` (false)
+    record          `smoke`: write harness/v2/guards-known.toml again from this run's guards
+                    instead of holding the run to it (guards.py; false)
+    duckdb          `smoke`: the DuckDB `blaze debug sql` runs (`BLAZE_DUCKDB`), as an absolute
+                    path; empty for blaze's pin, which its first query fetches
 
 Numbers are JSON numbers; a float field takes one with a point (4.0, not 4).
 
@@ -125,20 +129,32 @@ runs it with the blaze the change built (blaze-platform.yaml, `profile-gate`). A
 engine's preflight (engine.V2.preflight) it writes fixture.py's workspace (three small crates),
 builds it cold in a new home, and measures one no-op build and one body edit through the code
 the budgets run (`Lane.noop`, `Lane.timed_edit`, with the edited program checked against a build
-from nothing in a home of its own), once each and against no budget. It exits 0 only when both
-gave a number and the daemon's lock and store are where engine.layout says; it needs no cargo
-and no network but blaze's own toolchain. It took 64 s with the release of 2026-11-05 on 32
+from nothing in a home of its own), once each and against no budget. Then it holds the guards
+of guards.py: on that workspace and on a one-file program it times a warm no-op build, a comment
+at the end of a line and a statement added to a body, and holds each build's time, and what the
+daemon's profile and log say it did (a kept front end let go, queries run anew or for an
+untracked read, time lowering or maintaining what did not change, an answer held after the last
+task, a loop turn no span covers), to guards.py's one table of bounds, with the bounds known to
+fail listed in harness/v2/guards-known.toml (`record` writes it); and it builds and runs a
+program whose build script runs `$RUSTC` as anyhow's does, within `PROBE_SECS`, so blaze hanging
+or failing inside its own build-script sandbox is a failure naming that step. It exits 0 only when
+the two rows gave a number, the daemon's lock and store are where engine.layout says, and every
+outcome of `guards.names()` is there and passed: nothing asked for is dropped. It needs no cargo,
+and no network but for blaze's own toolchain and, with no `duckdb` given, blaze's pinned DuckDB. It took 64 s with the release of 2026-11-05 on 32
 cores, and says where (`steps_s` in the result, a line per `blaze` command): it builds the
 fixture cold twice, once in the lane's home and once from nothing for the check of the edited
 program.
 
 `selftest` checks the parts that need neither blaze nor cargo nor the network: edit generation,
 budget evaluation, /proc/stat, which rows an input selects, the daemon home's layout against the
-daemon's rule, and that the smoke's edit applies to the fixture.
+daemon's rule, and that the smoke's edit applies to the fixture. The guards' own selftest is
+guards.py's.
 """
 
 import bisect
+import contextlib
 import dataclasses
+import io
 import json
 import math
 import os
@@ -165,6 +181,7 @@ import bounds
 import blaze_cli
 import counters
 import fixture
+import guards
 import memory
 import storelib
 
@@ -238,6 +255,8 @@ class Input:
     self_edit: SelfEdit = SelfEdit()
     self_test: tuple[str, ...] = ()
     keep: bool = False
+    record: bool = False
+    duckdb: str = ""
 
 
 @dataclass(frozen=True)
@@ -318,6 +337,9 @@ SMOKE_ROWS = (
 # The smoke's body edit, as bench.py writes one: a statement after the line that opens a function.
 SMOKE_FILE, SMOKE_OPENING = "base/src/a.rs", "pub fn alpha() -> u32 {"
 SMOKE_PROGRAM = "oracle_app"
+# The most the build and the run of guards.py's probe may take: a build script that runs
+# `$RUSTC` twice, on a program of one line.
+PROBE_SECS = 300
 
 
 def select(projects: Sequence[Project], budgets: Sequence[Budget]) -> list[Row]:
@@ -917,6 +939,8 @@ class Lane:
         self.top.mkdir(parents=True)
         self.spec, self.ws = checkout(name, self.top / "src") if source is None else source(self.top / "src")
         extra = project_env(self.spec)
+        if args.duckdb:
+            extra["BLAZE_DUCKDB"] = args.duckdb
         self.home = self.top / "home"
         self.env = eng.env(self.home, None, extra)
         self.ref = self.top / "cargo-target"
@@ -1538,10 +1562,14 @@ def smoke(eng: engine.Engine, args: Input, rep: report.Report, work: Path) -> No
     began = time.monotonic()
     once = dataclasses.replace(args, runs=1, most_runs=1)
     rows = {row.key: row for row in SMOKE_ROWS}
+    # The workspace's guard steps, or why it gave none: never dropped (`smoke_guards`).
+    gathered: list[Gathered] = []
     try:
         lane = Lane(eng, once, work, "fixture", smoke_source)
     except SETUP_ERRORS as e:
         setup_failed(rep, rows.values(), e)
+        gathered += no_facts("workspace", f"setting up the workspace: {type(e).__name__}: {e}")
+        smoke_guards(eng, args, rep, work, gathered)
         return
     try:
         try:
@@ -1550,6 +1578,7 @@ def smoke(eng: engine.Engine, args: Input, rep: report.Report, work: Path) -> No
             lane.count_daemon()
         except SETUP_ERRORS as e:
             setup_failed(rep, rows.values(), e)
+            gathered += no_facts("workspace", f"the cold build of the workspace: {type(e).__name__}: {e}")
             return
         judge(rep, rows["noop"], lambda: lane.noop(rows["noop"].limit))
         judge(rep, rows["body"], lambda: lane.timed_edit("body edit", rows["body"].limit))
@@ -1560,8 +1589,10 @@ def smoke(eng: engine.Engine, args: Input, rep: report.Report, work: Path) -> No
         rep.add("smoke: the daemon's lock and store are where engine.layout says", "error" if missing else "pass",
                 f"after the builds, the home {lane.home} has no {' and no '.join(missing)}: the daemon keeps them "
                 "elsewhere than storelib.Layout says" if missing else f"{laid.lock}, {laid.store}")
+        gathered += guard_steps(eng, lane, "workspace", SMOKE_FILE, SMOKE_OPENING)
     finally:
         lane.stop(rep)
+        smoke_guards(eng, args, rep, work, gathered)
     for row in rows.values():
         got = [o.numbers.get("measured") for o in rep.outcomes if o.name == row.name and o.verdict == "pass"]
         if not (len(got) == 1 and isinstance(got[0], (int, float)) and math.isfinite(got[0])):
@@ -1575,6 +1606,175 @@ def smoke(eng: engine.Engine, args: Input, rep: report.Report, work: Path) -> No
     print(f"smoke: {time.monotonic() - began:.1f} s", flush=True)
 
 
+def sql(eng: engine.Engine, lane: Lane, what: str, query: str) -> str:
+    """What `blaze debug sql --json QUERY` prints on `lane`'s daemon; a failure is an engine.Failed naming `what`."""
+    step = f"{lane.name}: {what}"
+    ran = eng.command(step, "debug", ["sql", "--json", query], lane.ws, lane.env, 300)
+    return ran.checked(step).stdout
+
+
+def log_text(lane: Lane, since: int = 0) -> str:
+    """The daemon's log from byte `since` on; empty where it has none yet."""
+    try:
+        with open(engine.layout(lane.home).log, "rb") as f:
+            f.seek(since)
+            return engine.text(f.read())
+    except FileNotFoundError:
+        return ""
+
+
+type Facts = dict[str, float | None]
+# What a guard step gave: its facts, or why it gave none.
+type Gathered = tuple[guards.Fixture, guards.Step, Facts | None, str]
+
+
+def guard_facts(eng: engine.Engine, lane: Lane, step: str, took_s: float, warm_from: int, log_from: int) -> Facts:
+    """What `lane`'s last build did, as guards.py's bounds name it: the client's wait, the
+    profile's row of it (`guards.FACTS_SQL`, the view `uncovered_time`) and the log's lines."""
+    row = guards.one_row(sql(eng, lane, f"guards: {step}: the profile's facts", guards.facts_sql(warm_from)),
+                         f"{lane.name}: {step}")
+    facts: Facts = {column: guards.number(row, column, f"{lane.name}: {step}") for column in guards.PROFILE_FACTS}
+    uncovered = guards.one_row(sql(eng, lane, f"guards: {step}: uncovered_time", guards.UNCOVERED_SQL),
+                               f"{lane.name}: {step}: uncovered_time")
+    facts["uncovered_ms"] = guards.number(uncovered, "uncovered_ms", f"{lane.name}: {step}: uncovered_time")
+    facts["ms"] = took_s * 1000
+    facts["let_go_logged"] = float(guards.let_go_lines(log_text(lane, log_from)))
+    return facts
+
+
+def no_facts(fixture: guards.Fixture, why: str) -> list[Gathered]:
+    """Every step of `fixture` with no facts, and why."""
+    return [(fixture, step, None, why) for step in guards.STEPS]
+
+
+def guard_steps(eng: engine.Engine, lane: Lane, fixture: guards.Fixture, file: str, opening: str) -> list[Gathered]:
+    """guards.py's three steps on `lane`, which was built cold: a warm no-op build, a comment at
+    the end of the line `opening` is in `file`, and a statement added to the body it opens; each
+    edit taken back and built before the next. A step that could not be run or read says why."""
+    path = lane.ws / file
+    try:
+        before = read(path)
+        lane.build("guards: the build that warms up", False)
+        mark = guards.one_row(sql(eng, lane, "guards: the mark", guards.MARK_SQL), f"{lane.name}: the mark")
+        warm_from = guards.number(mark, "warm_from", f"{lane.name}: the mark")
+        if warm_from is None:
+            raise engine.Failed(f"{lane.name}: the daemon's history has no build after the cold build and a warm one")
+        log_from = len(log_text(lane).encode())
+    except SETUP_ERRORS as e:
+        return no_facts(fixture, f"setting up {fixture}: {type(e).__name__}: {e}")
+    edits: dict[guards.Step, Callable[[str, str, int], str] | None] = {
+        "noop": None, "comment": guards.eol_comment, "body": guards.body_statement}
+    out: list[Gathered] = []
+    for step in guards.STEPS:
+        make = edits[step]
+        try:
+            if make is not None:
+                write(path, make(before, opening, 1))
+            try:
+                took, _ = lane.build(f"guards: {step}", False)
+                facts = guard_facts(eng, lane, step, took, int(warm_from), log_from)
+            finally:
+                if make is not None:
+                    write(path, before)
+            if make is not None:
+                lane.build(f"guards: {step} taken back", False)
+            out.append((fixture, step, facts, ""))
+        except SETUP_ERRORS as e:
+            out.append((fixture, step, None, f"{type(e).__name__}: {e}"))
+    return out
+
+
+def guard_outcomes(rep: report.Report, gathered: Sequence[Gathered], known: Sequence[guards.Known]) -> None:
+    """An outcome for every bound of every step gathered: judged against `known`, or an error
+    saying why the step gave no facts. Every name of `guards.names()` for those steps is added."""
+    for fixture, step, facts, why in gathered:
+        if facts is None:
+            for bound in guards.BOUNDS:
+                if bound.limit(step) is not None:
+                    rep.add(guards.name(fixture, step, bound.check), "error", why)
+            continue
+        for it in guards.judge(fixture, step, facts, known):
+            rep.add(it.name, it.verdict, it.detail, measured=it.measured, budget=it.limit, unit=it.unit, known=it.known)
+
+
+def sandbox_probe(eng: engine.Engine, rep: report.Report, args: Input, work: Path) -> None:
+    """guards.py's probe built and run within `PROBE_SECS`: its build script runs `$RUSTC`, which
+    is blaze inside the build-script sandbox. A hang, a failure, or a probe that did not compile
+    is the outcome `guards.PROBE` failing, naming the step."""
+    step = "probe: `blaze run` of a program whose build script runs $RUSTC"
+    try:
+        lane = Lane(eng, args, work, "probe", guards.probe_source)
+    except SETUP_ERRORS as e:
+        rep.add(guards.PROBE, "error", f"setting up the probe: {type(e).__name__}: {e}")
+        return
+    ended = False
+    try:
+        ran = eng.build(step, lane.ws, lane.env, [], "run", PROBE_SECS)
+        ended = True
+        if ran.returncode != 0:
+            rep.add(guards.PROBE, "fail", f"{step}: exited {ran.returncode}:\n{ran.said()}", seconds=round(ran.seconds, 2))
+        elif guards.PROBE_SAYS not in ran.stdout:
+            rep.add(guards.PROBE, "fail", f"{step}: the program did not print {guards.PROBE_SAYS!r}: its build script's "
+                    f"probe was not seen to compile:\n{ran.said()}", seconds=round(ran.seconds, 2))
+        else:
+            rep.add(guards.PROBE, "pass", f"{ran.seconds:.1f} s against at most {PROBE_SECS}", seconds=round(ran.seconds, 2))
+    except engine.Failed as e:
+        rep.add(guards.PROBE, "fail", f"{e}\nblaze hung or could not be run inside its build-script sandbox "
+                "(2026-11-10: its workers' wait ring was refused there, each ended silently, and the main thread parked "
+                "with no bound)")
+    finally:
+        if ended:
+            lane.stop(rep)
+        else:
+            # A daemon that hangs on the build does not answer a stop either.
+            try:
+                kill_group(daemon_pid(lane.home))
+            except (engine.Failed, OSError):
+                pass
+            lane.meter.close()
+
+
+def smoke_guards(eng: engine.Engine, args: Input, rep: report.Report, work: Path, gathered: list[Gathered]) -> None:
+    """The guards after the workspace's (`gathered` holds its steps): the one-file program's
+    steps, the outcomes of both against the known list (written first, with `record`), the
+    sandbox's probe, and an error for any outcome of `guards.names()` that is still missing."""
+    once = dataclasses.replace(args, runs=1, most_runs=1)
+    try:
+        lane = Lane(eng, once, work, "onefile", guards.onefile_source)
+    except SETUP_ERRORS as e:
+        gathered += no_facts("onefile", f"setting up onefile: {type(e).__name__}: {e}")
+    else:
+        try:
+            try:
+                lane.build("the cold build", False)
+                eng.wait_ready(lane.ws, lane.env)
+            except SETUP_ERRORS as e:
+                gathered += no_facts("onefile", f"the cold build of onefile: {type(e).__name__}: {e}")
+            else:
+                gathered += guard_steps(eng, lane, "onefile", guards.ONEFILE_FILE, guards.ONEFILE_OPENING)
+        finally:
+            lane.stop(rep)
+    try:
+        known = guards.read_known(guards.KNOWN.read_text())
+        if args.record:
+            judged: list[tuple[guards.Fixture, guards.Step, guards.Judged]] = [
+                (fixture, step, it) for fixture, step, facts, _ in gathered if facts is not None
+                for it in guards.judge(fixture, step, facts, ())]
+            known = guards.recorded_from(judged, known)
+            guards.KNOWN.write_text(guards.render_known(known, dict(
+                commit=report.commit() or "", blaze=getattr(eng, "version", ""), date=time.strftime("%Y-%m-%d"))))
+            print(f"smoke: {guards.KNOWN} written: {len(known)} known failures", flush=True)
+    except (ValueError, OSError) as e:
+        rep.add("guard: the known list (harness/v2/guards-known.toml)", "error", f"{type(e).__name__}: {e}")
+        known = []
+    guard_outcomes(rep, gathered, known)
+    sandbox_probe(eng, rep, once, work)
+    given = {o.name for o in rep.outcomes}
+    for wanted in guards.names():
+        if wanted not in given:
+            rep.add(wanted, "error", "the smoke gave no outcome for it: nothing asked for is dropped")
+
+
 def main(args: Input) -> None:
     if args.runs < 1 or args.runtime_runs < 1:
         fail(SCRIPT, f"runs and runtime_runs: at least 1, not {args.runs} and {args.runtime_runs}")
@@ -1582,6 +1782,10 @@ def main(args: Input) -> None:
         fail(SCRIPT, f"most_runs: at least runs ({args.runs}), not {args.most_runs}")
     if args.command == "smoke" and (args.projects or args.budgets):
         fail(SCRIPT, "command `smoke`: it measures fixture.py's workspace alone and takes no `projects` or `budgets`")
+    if args.command != "smoke" and args.record:
+        fail(SCRIPT, "record: it writes the smoke's known list, and the command is not `smoke`")
+    if args.duckdb and not os.path.isabs(args.duckdb):
+        fail(SCRIPT, f"duckdb: an absolute path, not {args.duckdb!r}")
     if args.command == "run" and not args.out:
         fail(SCRIPT, "out: command `run` writes its result there, and was given none")
     try:
@@ -1604,7 +1808,8 @@ def main(args: Input) -> None:
     if args.command == "smoke":
         smoke(eng, args, rep, work)
         if not args.keep:
-            shutil.rmtree(work / "fixture", ignore_errors=True)
+            for name in ("fixture", "onefile", "probe"):
+                shutil.rmtree(work / name, ignore_errors=True)
             if not args.work:
                 shutil.rmtree(work, ignore_errors=True)
         rep.extra.update(work=str(work), blaze=getattr(eng, "version", ""))
@@ -1791,6 +1996,25 @@ def selftest_smoke() -> None:
         expect(f'name = "{SMOKE_PROGRAM}"' in read(ws / "app" / "Cargo.toml"), "the smoke's program is the fixture's")
     once = dataclasses.replace(given, runs=1, most_runs=1)
     expect(enough([3.0], math.inf, once) and not enough([], math.inf, once), "the smoke times each once")
+    # The guards: the workspace's edits apply to fixture.py's file, every step that gave no facts
+    # still gives each of its outcomes, and a run with every step gathered gives every name.
+    with tempfile.TemporaryDirectory(prefix="bz-budgets-selftest-") as tmp:
+        _, ws = smoke_source(Path(tmp) / "src")
+        source = read(ws / SMOKE_FILE)
+        expect(guards.eol_comment(source, SMOKE_OPENING).count("\n") == source.count("\n")
+               and guards.body_statement(source, SMOKE_OPENING) != source, "the guards' edits apply to the workspace")
+    rep = report.Report(SCRIPT, given.engine, "")
+    facts: Facts = dict(guards.FIXED["comment"])
+    some: list[Gathered] = [(fixture, step, None if step == "noop" else facts, "the daemon did not start")
+                            for fixture in guards.FIXTURES for step in guards.STEPS]
+    with contextlib.redirect_stdout(io.StringIO()):
+        guard_outcomes(rep, some, ())
+    names = [o.name for o in rep.outcomes]
+    expect(sorted(names) == sorted(set(guards.names()) - {guards.PROBE}),
+           "the guards' outcomes are every bound of every step of both fixtures, with or without facts")
+    expect({o.verdict for o in rep.outcomes if ": noop: " in o.name} == {"error"}, "a step with no facts errs, bound by bound")
+    refused("`record` without the smoke", lambda: main(parse(Input, spec.replace('"smoke"', '"run"')[:-1]
+                                                              + ', "record": true, "out": "/tmp/x"}', SCRIPT)), SystemExit)
     got = timed([3.0], "ms")
     expect(verdict(got.value, math.inf, True) == "pass" and got.interval is None, "one sample is a number, and passes no budget")
 
@@ -1836,7 +2060,9 @@ def selftest_ledger() -> None:
             chosen = select(it.projects, it.budgets)
         except (SystemExit, ValueError) as e:
             raise SystemExit(f"{SCRIPT} selftest: the ledger's {row_id} gives an input this script refuses: {e}") from None
-        expect(it.command == "run" and (bool(chosen) or "bounds" in it.budgets),
+        # The smoke's rows are its own (`SMOKE_ROWS`, `guards.names()`): it takes no `budgets`.
+        expect((it.command == "smoke" and not it.projects and not it.budgets)
+               or (it.command == "run" and (bool(chosen) or "bounds" in it.budgets)),
                f"the ledger's {row_id} selects no row: {given}")
 
 

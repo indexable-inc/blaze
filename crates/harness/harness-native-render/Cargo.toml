@@ -1,6 +1,6 @@
 [package]
 name = "harness-native-render"
-description = "The native stack's renderer, shared by the harness app and harness-video: Metal (Slang shaders), den's text shaper and glyph atlas, Slug vector marks, and the paint pass that turns a flecs UI world's painted nodes into one frame's Draw"
+description = "The native stack's renderer, shared by the harness app and harness-video: Metal (shaders in Slang and in Rust, harness-native-shaders), den's text shaper and glyph atlas, Slug vector marks, and the paint pass that turns a flecs UI world's painted nodes into one frame's Draw"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
@@ -12,6 +12,10 @@ harness-native-flecs = { path = "../harness-native-flecs" }
 harness-native-api = { path = "../harness-native-api" }
 harness-native-blaze = { path = "../harness-native-blaze" }
 harness-native-kip = { path = "../harness-native-kip" }
+# Kip's shaders (src/kip.rs): `artifact = "gpu"` is blaze's device build of the crate for `naga-unknown-unknown`, its
+# entries lowered to MSL and the file named in BLAZE_GPU_MSL_HARNESS_NATIVE_SHADERS; `lib = true` also links its host
+# library, whose slots (`mascot::<entry>::<param>`) and types the host binds by. A blaze extension: cargo refuses it.
+harness-native-shaders = { path = "../harness-native-shaders", artifact = "gpu", lib = true }
 harness-native-ui-timeline-api = { path = "../harness-native-ui-timeline-api" }
 tree-sitter-highlight = "0.25"
 tree-sitter-bash = "0.25"
@@ -67,6 +71,9 @@ objc2-core-media = { version = "0.3.2", default-features = false, features = ["s
 objc2-core-video = { version = "0.3.2", default-features = false, features = ["std", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVMetalTexture", "CVMetalTextureCache", "CVReturn", "objc2", "objc2-metal"] }
 
 [dev-dependencies]
+# shader_port.rs checks harness-native-shaders' port of shaders/harness.slang against this crate's structs, binding table
+# and HDR curves until it replaces the Slang.
+gpu = { path = "../../gpu" }
 # Property tests: Hegel, imported as `hegel` (blaze's vendor/hegeltest).
 hegeltest = { path = "../../../vendor/hegeltest", default-features = false, features = ["static-engine"] }
 

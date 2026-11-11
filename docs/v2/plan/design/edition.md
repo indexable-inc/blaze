@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: The blaze edition. Rust with ten opt-in changes (handles that copy themselves, error unions, view types, records, contexts, effects at the border, values that must be used up, contracts and pattern types, compile-time reflection, `&uniq`), what it removes, the lints that get a crate ready for it, and the order it is built in.
+summary: The blaze edition. Rust with eleven opt-in changes (handles that copy themselves, error unions, view types, records, contexts, effects at the border, values that must be used up, contracts and pattern types, compile-time reflection, `&uniq`, early drop), what it removes, the lints that get a crate ready for it, and the order it is built in.
 date: 2026-11-09
 ---
 # The blaze edition
@@ -27,7 +27,7 @@ Three tests decide what goes in:
    functions and written on every `pub` one.
 3. **Each addition deletes something**: a pattern, a crate or a tool people use today.
 
-## The ten changes
+## The changes
 
 Each is its own feature attribute first (`#![blaze::handles]`, ...), usable in any crate, and the
 edition turns them all on. The spec column is where the design lives; this page does not repeat
@@ -38,13 +38,15 @@ it.
 | 1 | **Handles copy themselves.** `Handle` marks types whose clone is a second reference to the same thing (`Arc`, `Rc`, channel senders, interned ids). Where a handle would be moved and is used again, it is copied; the last use moves. | `.clone()` on handles, clone-then-move blocks | here | small |
 | 2 | **Error unions.** `A \| B` in type position is an anonymous enum, order-free; `?` widens a smaller set into a larger one; `match` on it is exhaustive. | error enums, `From` impls, `anyhow`, `thiserror` | here | medium |
 | 3 | **View types.** `fn old_keys(&self.{lru})` says which fields a method borrows. | structs split to please the borrow checker | here | medium |
-| 4 | **Records and named arguments.** `{ a: T, b: U }` is a type, equal to any record with the same fields; fields may have defaults. | builders, options structs, one-off structs | here | medium |
+| 4 | **Records and named arguments.** `{ a: T, b: U }` is a type, equal to any record with the same fields; fields may have defaults. | builders, options structs, one-off structs | [records](records.md) | medium |
 | 5 | **Capabilities as parameters.** With [bstd](std.md), a function touches only what it is handed, so one with no `Fs` or `Dir` parameter cannot reach the disk. (A `with` clause to pass them by name is deferred.) | ambient files, clock, network, allocator | [std](std.md) | large |
 | 6 | **Effects are what a function may do.** `#[blaze::may(panic, alloc, block, diverge)]` lists a function's effects, and an unlisted one is checked absent; a module's `#![blaze::may(..)]` is the default of the functions in it; pure is derived; ambient, unsafe and may-suspend follow the same form; a function that takes a closure does what the closure does. | `async`/`await`, and the async, const and `try_` twins of every API | [effects](effects.md), [pure-fns](pure-fns.md), [may-suspend](may-suspend.md) | medium |
 | 7 | **Values that must be used up.** A `#[blaze::linear]` value cannot be dropped; every path hands it to a function that takes it by value. | forgotten commits, drop bombs | [linear](linear.md) | medium |
 | 8 | **Contracts and pattern types.** `requires` and `ensures` on a function; `usize is 1..` puts a range in the type, and `Conn is Conn::Open { .. }` a variant. | preconditions in doc comments, restated checks, `unreachable!()` after a match already made | [contracts](contracts.md), here | medium |
 | 9 | **Compile-time reflection.** `for const f in fields_of::<T>()` in ordinary typed code. | most derive proc macros | [comptime](comptime.md) | large |
 | 10 | **`&uniq T`.** The unique reference is spelled for what it guarantees. `&mut T` means the same and is the old spelling. | the belief that `&` means immutable and `&mut` means mutable | here | small |
+| 11 | **Portable SIMD.** The pinned nightly's `core::simd` with no `#![feature]`, `simd::native_lanes!`, and `#[blaze::multiversion]` (`#![blaze::simd]`). Availability and code generation, no new syntax, so it is not counted among the ten. | `#![feature(portable_simd)]`, per-architecture `core::arch` code, hand-written feature dispatch | [simd](simd.md) | medium |
+| 11 | **Early drop.** A value whose destructor only frees memory (`Vec`, `String`, `Box`, a struct of them, a type marked `#[blaze::drop(early)]`) is dropped after its last use; a guard keeps its scope. `#![blaze::early_drop]`. | `drop(x);` written to end a borrow, blocks opened to end one, memory held to the end of a long function | [early-drop](early-drop.md) | medium |
 
 ### Rules for the four that have no spec yet
 
@@ -86,7 +88,7 @@ it.
 - A view is part of the method's type for the borrow checker only; layout and ABI are unchanged
   (the method still receives the whole pointer).
 
-**4. Records.**
+**4. Records.** (Spec: [records](records.md).)
 - `{ path: PathBuf, size: u64 }` is structural: field names and types, in any order. It has
   `Clone`, `Debug`, `Eq`, `Hash` and `Default` when its fields do, as a tuple has. To give it
   methods or other traits, name it.
@@ -174,7 +176,32 @@ is an error. Where a mechanical fix exists, `blaze check --fix` applies it.
 | `blaze::undeclared_effect` | a function that may panic, allocate from the global heap, block or not return where its `#[blaze::may(..)]`, its trait method's, a module's default or the gate (`#![blaze::effects]`, which the edition turns on) does not allow it ([effects](effects.md)); `deny` wherever something is declared | writes the list with the missing words: under the gate, `#[blaze::may(..)]` with exactly the inferred effects on every function that needs one |
 | `blaze::unneeded_effect` | a word of a private function's list for an effect it is proved not to have | takes the word off |
 | `blaze::negative_effect` | `#[blaze::nopanic]`, `#[blaze::noalloc]`, `#[blaze::nonblocking]` where effects are declared positively | rewrites to the `#[blaze::may(..)]` they stand for |
+| `blaze::many_bools` | a call passing two or more bare `bool` literals by position ([records](records.md), change 4) | none: suggests a record parameter |
+| `blaze::options_struct` | a function whose last parameter is a struct used only as its options (once change 4 is in a release; not built) | none at first |
+| `blaze::unmarked_pure`, `unmarked_nopanic`, `unmarked_noalloc`, `unmarked_nonblocking` | a function the effects walk proves has that property and that lacks its attribute; `pub` functions by default, every function with `unmarked-effects-private = true` | adds the attribute; never one the check would then refuse |
+| `blaze::unused_guard` | `let _ = expr;` where `expr`'s type keeps its scope's drop (a guard): it is dropped at once (once change 11 exists) | `let _guard = expr;` |
+| `blaze::program_lifetime` | a type declared `#[blaze::program_lifetime]` whose instances could not all live until exit ([facts](facts.md)); `deny` wherever the attribute is | none |
+| `blaze::could_be_program_lifetime` | a private struct with no `Drop` whose every instance is leaked or built into a `static` | none: names where instances are kept and the gain |
+| `blaze::could_be_ref32` | a field of a holder stored many times that holds a program-lifetime type by `&'static`, `Arc`, `Rc` or `Box` | the field becomes `Ref32<T>` when it is a private `&'static T` every literal writes from a `Ref32` |
 | `blaze::derivable_by_reflection` | a derive that reflection covers (once change 9 exists) | none at first |
+| `blaze::proc_macro_derive`, `proc_macro_attribute`, `proc_macro_fn_like` (the group `blaze::proc_macro`) | a procedural macro a workspace crate defines, one finding per macro, naming it and its kind: code blaze cannot see through | none: names the replacement of its kind (a generic impl over fields, reflection over the item, a `const fn`; a macro that parses a foreign syntax may stay) |
+| `blaze::build_script_ambient` | a workspace build script's use of the standard library's ambient file system, environment, processes, network or clock, one finding per item with its count: code blaze must run and trace to key | none: names the capability to take |
+| `blaze::std_use` | a use of an item of Rust's `std` that [bstd](std.md) replaces or forbids (ambient authority, a hidden cost, a global-heap allocation, a renamed type), by what it resolves to, one finding per item per function with its count; `build_script_ambient` is the same table and walk over a build script | the renames (`Arc` to `bstd::sync::Shared`, ...); none for the rest, which change what a function is handed |
+
+The last three rows are built: the lints of code blaze cannot analyse
+([lints.md](../../../lints.md#proc_macro), [lints.md](../../../lints.md#build_script_ambient))
+and `std_use` ([lints.md](../../../lints.md#std_use)), which names what is written where
+`blaze::ambient` and `blaze::global_alloc`, the effects, will prove what is reached. `std_use`
+is `allow` everywhere until a crate has `#![blaze::capabilities]` or a workspace asks for it
+once [bstd](std.md) is in the tree (`BSTD_IN_TREE`). The first two
+are the exception to "`allow` by default": each warns by default, in every workspace, once
+the replacement its help names is in the tree, and is `allow` until then with a help that says
+the replacement is planned. `proc_macro_fn_like` warns now (`const fn` is Rust's);
+`proc_macro_derive` and `proc_macro_attribute` wait for change 9
+(`REFLECTION_REPLACES_MACROS`), and `build_script_ambient` for [bstd](std.md)
+(`CAPABILITIES_FOR_BUILD_SCRIPTS`); both switches are constants of
+`crates/blaze-lint-defs/src/ready.rs`. A use of another crate's macro is not linted:
+`derivable_by_reflection` is the lint for a derive on a type, once reflection covers it.
 
 The first three need nothing new and are built first. `lossy_as` is one lint with one message in
 place of clippy's five cast lints, which stay available by their own names.
@@ -195,6 +222,7 @@ Payoff per unit of compiler work, and what leans on what.
 | E6 | Capabilities as parameters (change 5): blaze's crates on bstd; the `with` clause deferred | S1 to S3 of [std](std.md) |
 | E7 | Effects inferred and declared at the border; closures pass their effects through; `async` removed for crates on fibers (change 6) | E6 |
 | E8 | Linear values, contracts and pattern types, reflection (changes 7 to 9), each finishing its own spec | their specs |
+| E14 | Early drop (change 11) and `unused_guard` | nothing |
 | E9 | `edition = "blaze-2026.11"`: everything above on, everything removed an error, `blaze fix --edition` | E1 to E8, S5 |
 
 Every change follows the rules for an extension: semantics in the front end's query crates, the

@@ -28,7 +28,7 @@ use hir_ty_codegen::v2::{
     HirInstance, ItemHashes, LinkInputs, RootKind, Roots, Runs,
 };
 
-use super::{Job, Real, UnitReader, files::Mounted, graph::flag, script};
+use super::{Job, Real, UnitReader, compile::Written, files::Mounted, graph::flag, script};
 use crate::serve::work::{Full, Linking, OutputFields};
 
 type KeptImage = crate::serve::work::Image<Real>;
@@ -1616,21 +1616,216 @@ struct CrateNatives {
 /// A native input a link read off the machine: its path, and the BLAKE3 hash of its contents.
 pub(crate) type Read = (String, ContentId);
 
-/// What [`link`] made: the file's bytes, every native input the link read off the machine, a
-/// test binary's execution table, how it reached the image, for a dev executable whose
-/// runs could not take the link as a patch, why they were told to start again, and, for an
-/// image linked from scratch because the kept one refused the change as a splice
-/// ([`Full::NoThunk`]), what the build says of it.
+/// What [`link`] made: what the store is given of the file, every native input the link read
+/// off the machine, a test binary's execution table, how it reached the image, for a dev
+/// executable whose runs could not take the link as a patch, why they were told to start
+/// again, and, for an image linked from scratch because the kept one refused the change as a
+/// splice ([`Full::NoThunk`]), what the build says of it.
 pub(crate) struct LinkMade {
-    pub(crate) bytes: Vec<u8>,
-    /// The root of the linker's digest of `bytes` ([`Image::digest`]): what the store keys
-    /// the file by (`compile::linked_key`), kept by the blocks each link wrote.
-    pub(crate) root: [u8; 32],
+    /// The file, keyed by the root of the linker's digest of it ([`Image::digest`],
+    /// `compile::linked_key`), which the blocks each link wrote keep: whole, or, where the
+    /// image took the link as a patch of a file the store can derive from, the patch
+    /// ([`Filed::written`]).
+    pub(crate) written: Written,
     pub(crate) read: Vec<Read>,
     pub(crate) table: Option<blaze_codegen::ExecTable>,
     pub(crate) how: Linking,
     pub(crate) restart: Option<String>,
     pub(crate) whole: Option<String>,
+}
+
+/// Where an image's debug info goes, given its level, its format and the profile's
+/// `split-debuginfo`: beside the image unless the profile says `off`, which puts it inside as
+/// before. `packed` and `unpacked` are both the one side file blaze writes (it has no
+/// per-crate objects to leave debug info in). An image with no debug info has none either
+/// way, and a format blaze writes no side file for (PE, wasm) keeps what it had.
+pub(crate) fn debug_place(
+    debug: blaze_link::Debug,
+    format: blaze_link::Format,
+    split: Option<&str>,
+) -> Result<blaze_link::Debug, String> {
+    use blaze_link::{Debug, Format};
+    match (debug, split) {
+        (Debug::None, _) => Ok(Debug::None),
+        (_, Some("off")) => Ok(Debug::Lines),
+        (_, None | Some("packed" | "unpacked")) => Ok(match format {
+            Format::Elf | Format::MachO => Debug::Beside,
+            Format::Pe | Format::Wasm => debug,
+        }),
+        // alloc: error path
+        (_, Some(other)) => Err(format!(
+            "split-debuginfo `{other}` is none rustc takes: `off`, `packed` or `unpacked`"
+        )),
+    }
+}
+
+/// Where the side file named `name` ([`blaze_link::DebugWrite::name`], from the image's own
+/// file name) goes for the executable at `exe`. ELF: beside it under the name its
+/// `.gnu_debuglink` holds, whatever the copy is called. Mach-O: the bundle a debugger looks
+/// for beside the executable, `<its file name>.dSYM`.
+fn side_path(format: blaze_link::Format, exe: &str, name: &str) -> std::path::PathBuf {
+    let exe = std::path::Path::new(exe);
+    let dir = exe.parent().unwrap_or(std::path::Path::new(""));
+    match (format, exe.file_name().and_then(|it| it.to_str())) {
+        (blaze_link::Format::MachO, Some(own)) => {
+            // alloc: once per side file written, its path
+            dir.join(format!("{own}.dSYM")).join("Contents/Resources/DWARF").join(own)
+        }
+        _ => dir.join(name),
+    }
+}
+
+/// Writes `write` at `to`: a clone of the file there with the ranges written, or a new file
+/// for a whole one, renamed over it. `false`, with nothing changed, when the file there is not
+/// the one a patch is of (it is gone, or carries another build id). Not synced: the side file
+/// is made again from the image whenever it is not the one expected, so a torn one costs a
+/// whole write, never a wrong line.
+fn write_side(
+    to: &std::path::Path,
+    format: blaze_link::Format,
+    write: &blaze_link::DebugWrite,
+) -> Result<bool, String> {
+    use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+    // alloc: error path
+    let failed = |what: &str, error: std::io::Error| format!("{}: {what}: {error}", to.display());
+    if let Some(dir) = to.parent() {
+        std::fs::create_dir_all(dir).map_err(|it| failed("making its directory", it))?;
+    }
+    // alloc: once per side file written, the name its next file is written at
+    let mut next = to.as_os_str().to_owned();
+    next.push(".blaze-next");
+    let next = std::path::PathBuf::from(next);
+    let mut file = match write.base {
+        Some(base) => {
+            if std::fs::copy(to, &next).is_err() {
+                return Ok(false);
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&next)
+                .map_err(|it| failed("opening its clone", it))?;
+            // Its build id is in its first bytes, wherever its format keeps it.
+            let mut head = Vec::with_capacity(128); // alloc: once per side file patched
+            let held = match (&mut file).take(128).read_to_end(&mut head) {
+                Ok(_) => blaze_link::debug_file_id(format, &head),
+                Err(_) => None,
+            };
+            if held != Some(base) {
+                drop(file);
+                std::fs::remove_file(&next).map_err(|it| failed("removing its clone", it))?;
+                return Ok(false);
+            }
+            file
+        }
+        None => std::fs::File::create(&next).map_err(|it| failed("creating it", it))?,
+    };
+    file.set_len(write.len).map_err(|it| failed("sizing it", it))?;
+    for (at, bytes) in &write.writes {
+        file.seek(SeekFrom::Start(*at)).map_err(|it| failed("writing it", it))?;
+        file.write_all(bytes).map_err(|it| failed("writing it", it))?;
+    }
+    drop(file);
+    std::fs::rename(&next, to).map_err(|it| failed("renaming it into place", it))?;
+    Ok(true)
+}
+
+/// The debug side file of the image `linked` was just committed as, written beside `path`
+/// and beside the copy cargo makes of it; nothing for an image with none. Derived data: it is
+/// not in the store, and a build that places the executable from the store without linking it
+/// writes none (the executable then backtraces by its symbol table, without lines, until its
+/// next link).
+///
+/// Called in the link today, in its own span (`link debug file`), so an edit waits for it:
+/// what it costs is the span's. It reads nothing of the link's but the committed image, so
+/// the job can call it from its settling path instead, after the answer
+/// (docs/v2/plan/design/debug-side-file.md, "Not built").
+fn debug_side(job: &Job, unit: usize, path: &str, linked: &mut Linked) -> Result<(), LinkCause> {
+    if linked.output.debug != blaze_link::Debug::Beside {
+        return Ok(());
+    }
+    let format = linked.output.format;
+    let span = tracing::info_span!(
+        target: "blaze",
+        "link debug file",
+        unit = %path,
+        bytes = tracing::field::Empty,
+        written = tracing::field::Empty,
+        ranges = tracing::field::Empty,
+        records = tracing::field::Empty,
+        encoded = tracing::field::Empty,
+        all = tracing::field::Empty,
+        whole = tracing::field::Empty,
+    )
+    .entered();
+    let linker = |error: blaze_link::LinkError| LinkCause::Linker { step: LinkStep::Debug, error };
+    let Some(mut write) = linked.image.debug_file().map_err(linker)? else {
+        return Ok(());
+    };
+    let first = side_path(format, path, &write.name);
+    if !write_side(&first, format, &write).map_err(LinkCause::Given)? {
+        // The file there is not the one the patch is of: someone removed it, or another
+        // build's is there. Made whole from the image, and said.
+        let Some(whole) = linked.image.debug_file_whole().map_err(linker)? else {
+            return Ok(());
+        };
+        write = whole;
+        write.whole = Some("the side file on the disk is not the one last written");
+        if !write_side(&first, format, &write).map_err(LinkCause::Given)? {
+            // alloc: error path
+            return Err(LinkCause::Given(format!(
+                "{}: a whole debug side file was not written: it is a patch of none",
+                first.display()
+            )));
+        }
+    }
+    span.record("bytes", write.len);
+    span.record("written", write.written());
+    span.record("ranges", write.writes.len());
+    span.record("records", write.records);
+    // How many functions' rows were encoded, and why every one was when the update did not
+    // follow the link's change.
+    span.record("encoded", write.encoded);
+    if let Some(why) = write.all {
+        span.record("all", why);
+    }
+    if let Some(why) = write.whole {
+        span.record("whole", why);
+    }
+    write_plist(&first, &write)?;
+    let plan = job.plan(unit).map_err(|it| LinkCause::Given(it.what))?;
+    if let Some(copy) = super::artifact::uplifted(path, plan) {
+        // The copy's side file is the same bytes: cloned where the volume can.
+        let to = side_path(format, copy, &write.name);
+        // alloc: error path
+        let failed = |what: &str, error: std::io::Error| {
+            LinkCause::Given(format!("{}: {what}: {error}", to.display()))
+        };
+        if let Some(dir) = to.parent() {
+            std::fs::create_dir_all(dir).map_err(|it| failed("making its directory", it))?;
+        }
+        let mut next = to.as_os_str().to_owned();
+        next.push(".blaze-next");
+        std::fs::copy(&first, &next).map_err(|it| failed("copying the side file to it", it))?;
+        std::fs::rename(&next, &to).map_err(|it| failed("renaming it into place", it))?;
+        write_plist(&to, &write)?;
+    }
+    Ok(())
+}
+
+/// A `.dSYM` bundle's `Info.plist` for the side file at `side`
+/// (`NAME.dSYM/Contents/Resources/DWARF/NAME`), written where the side file was laid out
+/// whole or the bundle has none; nothing for a side file that is no bundle.
+fn write_plist(side: &std::path::Path, write: &blaze_link::DebugWrite) -> Result<(), LinkCause> {
+    let (Some(bytes), Some(contents)) = (&write.plist, side.ancestors().nth(3)) else {
+        return Ok(());
+    };
+    let to = contents.join("Info.plist");
+    if write.base.is_some() && to.is_file() {
+        return Ok(());
+    }
+    // alloc: error path
+    std::fs::write(&to, bytes).map_err(|it| LinkCause::Given(format!("{}: writing it: {it}", to.display())))
 }
 
 /// What the build says when a splice was refused for a thunk it could not place and the
@@ -1716,6 +1911,8 @@ pub(crate) enum LinkStep {
     Stage,
     /// Taking the staged image's bytes.
     Bytes,
+    /// Making the image's debug side file.
+    Debug,
 }
 
 impl LinkStep {
@@ -1726,6 +1923,7 @@ impl LinkStep {
             LinkStep::Image => "making the image",
             LinkStep::Stage => "staging the change",
             LinkStep::Bytes => "writing the image",
+            LinkStep::Debug => "making the debug side file",
         }
     }
 }
@@ -1789,6 +1987,10 @@ fn link_at(
         false => blaze_link::target::output(triple(job, u), shared, debug, true),
     };
     let mut output = output.map_err(linker(LinkStep::Output))?;
+    // Debug info goes beside the image unless the profile says `split-debuginfo = "off"`
+    // ([`debug_place`]): the image an edit writes, hashes and places carries none.
+    output.debug = debug_place(output.debug, output.format, u.profile.split_debuginfo.as_deref())
+        .map_err(LinkCause::Given)?;
     // Code built to take edits ([`policy`]) is linked as a dev executable: the live descriptor
     // and the start hook's reservations, committed into the daemon's code memory ([`relink`]).
     // A doctest's programs run as processes of their own under its runner, never mapped.
@@ -1940,6 +2142,11 @@ fn link_at(
         Err(_) => Ok(()),
     };
     drop(tables);
+    // The image's debug info, beside it: derived from the image as committed.
+    let debug = match &made {
+        Ok(_) => debug_side(job, unit, path, &mut linked),
+        Err(_) => Ok(()),
+    };
     // The file's identity as the last commit left it: the blocks this link wrote, hashed.
     let root = match &made {
         Ok(_) => linked
@@ -1948,11 +2155,21 @@ fn link_at(
             .map_err(|error| LinkCause::Linker { step: LinkStep::Bytes, error }),
         Err(_) => Ok([0; 32]),
     };
+    // What the store is given of the file, settled while the image is at hand: the patch the
+    // image took the link as where the store can derive the file from the one before it, else
+    // the whole file, read from the image only then ([`Filed::written`]). A wasm module is
+    // read back by its bytes ([`super::compile`]'s `Module`), so it goes whole.
+    let made = made.and_then(|(filed, read, table, laid, told)| {
+        let written = filed
+            .written(&job.input.store, &linked.image, root?, path, wasm)
+            .map_err(|error| LinkCause::Linker { step: LinkStep::Bytes, error })?;
+        Ok((written, read, table, laid, told))
+    });
     images.push(KeptImage { path: path.to_owned(), kept: linked });
-    let (bytes, read, table, laid, told) = made?;
+    let (written, read, table, laid, told) = made?;
     mapped?;
     perf_mapped?;
-    let root = root?;
+    debug?;
     let how = match (&whole, relaid && changed.is_some_and(OutputFields::is_empty)) {
         (Some((reason, _)), _) => Linking::Full(*reason),
         (None, true) => Linking::Full(Full::Layout),
@@ -1962,7 +2179,7 @@ fn link_at(
         super::run::inproc::Told::Restart { why } => Some(why),
         super::run::inproc::Told::Nothing | super::run::inproc::Told::Patched { .. } => None,
     };
-    Ok(LinkMade { bytes, root, read, table, how, restart, whole: whole.map(|it| it.1) })
+    Ok(LinkMade { written, read, table, how, restart, whole: whole.map(|it| it.1) })
 }
 
 /// The image to link `output` laid out by profile `layout` into at `path`, taken out of
@@ -2182,7 +2399,7 @@ fn relink(
     heat: Option<&blaze_link::Heat>,
     linked: &mut Linked,
 ) -> Result<
-    (Vec<u8>, Vec<Read>, Option<blaze_codegen::ExecTable>, Laid, super::run::inproc::Told),
+    (Filed, Vec<Read>, Option<blaze_codegen::ExecTable>, Laid, super::run::inproc::Told),
     LinkCause,
 > {
     let built = generated.built;
@@ -2355,61 +2572,38 @@ fn relink(
             .file()
             .map_err(|error| LinkCause::Linker { step: LinkStep::Bytes, error })?;
         let table = tests_table(test, path, generated, linked)?;
-        return Ok((bytes, read, table, Laid::Nothing, super::run::inproc::Told::Nothing));
+        let told = super::run::inproc::Told::Nothing;
+        return Ok((Filed::Whole(bytes), read, table, Laid::Nothing, told));
     }
     // clone: the names gone, a few a link, which an image that refuses the change still has
     let gone_names = unnamed.clone();
-    // The names for debuggers of what the delta lists: the image holds the rest. A build's
-    // lists are in key order (`driver.rs` makes each from its nodes), so each is a search.
-    let listed = || {
-        let functions = &built.delta.functions;
-        functions.added.iter().chain(&functions.changed)
-    };
-    let debug_names: Vec<(InstanceKey, String)> = match takes {
-        // alloc: none, empty: the image was given this build's names
-        Ok(true) => Vec::new(),
-        Ok(false) => listed()
-            .filter_map(|key| built.debug_names.binary_search_by(|it| it.0.cmp(key)).ok())
-            // clone: per link, the names of the functions the build changed
-            .map(|at| built.debug_names[at].clone())
-            .collect(),
-        // clone: once per image linked from the build's whole lists
-        Err(_) => built.debug_names.clone(),
-    };
-    // What a layout reads of the cold functions: all of them where the image is laid out
-    // whole (its first link, or an output that keeps no room), else those of the functions
-    // this link adds, which are all it places.
-    let cold: Vec<InstanceKey> = match takes.is_err() || !linked.output.incremental {
-        // clone: once per image laid out whole, the functions codegen inferred cold
-        true => built.cold.clone(),
-        false => added_keys
-            .iter()
-            .copied()
-            .filter(|key| built.cold.binary_search(key).is_ok())
-            .collect(),
-    };
+    // What the change gives the linker of the build's lists, each searched by key with its
+    // order checked: a search that proves nothing is the link's error, and the image, which
+    // was not asked to take the change, is as it was.
+    let whole = takes.is_err() || !linked.output.incremental;
+    let (debug_names, cold, added, statics) =
+        match lists(built, takes, whole, &added_keys, &new_statics) {
+            Ok(lists) => lists,
+            Err(what) => {
+                untaken(linked, kept_names, gone_names, undo);
+                // alloc: error path
+                return Err(LinkCause::Given(format!("{path}: {what}")));
+            }
+        };
     let change = Change {
-        added: added_keys
-            .iter()
-            .filter_map(|key| built.functions.binary_search_by(|it| it.key.cmp(key)).ok())
-            .map(|at| &built.functions[at])
-            .collect(),
+        added,
         removed,
         // A whole build tiers nothing up: the slots that run another function than their own
         // are an edited function's earlier keys', in a live image.
         slots,
-        statics: new_statics
-            .iter()
-            .filter_map(|id| {
-                built.statics.binary_search_by(|it| (it.item, it.instance).cmp(id)).ok()
-            })
-            .map(|at| &built.statics[at])
-            .collect(),
+        statics,
         removed_statics: gone_statics,
         names,
         weak_names,
         unnamed,
         debug_names,
+        // What the image holds with this change: in its build id.
+        given: Some(given),
         natives: bytes_of
             .iter()
             .map(|(at, bytes)| match assembled.get(*at) {
@@ -2485,41 +2679,37 @@ fn relink(
                     dev_run.cells,
                     refused.as_deref(),
                 )
-                .map(|(bytes, told)| (bytes, laid, told))
+                // What the commit wrote of the file, as a link with no memory gives it: the
+                // store keeps the file as the one before it with those ranges written, and
+                // its bytes are read (from the image) only where the store cannot
+                // ([`Filed::written`]).
+                .map(|(patch, told)| {
+                    patching.record("full", patch.full);
+                    patching.record("written", patch.written());
+                    patching.record("ranges", patch.writes.len());
+                    (Filed::Patch(patch), laid, told)
+                })
                 // alloc: error path
                 .map_err(|what| LinkCause::Given(format!("{path}: {what}"))),
                 None => linked
                     .image
                     .patch(staged)
-                    .and_then(|patch| {
+                    .map(|patch| {
                         patching.record("full", patch.full);
                         patching.record("written", patch.written());
                         patching.record("ranges", patch.writes.len());
-                        // The store takes the file whole: this copy is the length of the
-                        // file, and the span says so until the store takes a patch.
-                        let _span = tracing::info_span!(
-                            target: "blaze",
-                            "link copy",
-                            unit = %path,
-                            bytes = patch.len,
-                        )
-                        .entered();
-                        whole_file(&linked.image, patch)
+                        // The patch goes on as it is: the whole file is made only where the
+                        // store is given it whole ([`Filed::written`]).
+                        (Filed::Patch(patch), laid, super::run::inproc::Told::Nothing)
                     })
-                    .map(|bytes| (bytes, laid, super::run::inproc::Told::Nothing))
                     .map_err(|error| LinkCause::Linker { step: LinkStep::Bytes, error }),
             }
         });
     drop(patching);
-    let (bytes, laid, told) = match made {
+    let (filed, laid, told) = match made {
         Ok(made) => made,
         Err(cause) => {
-            // Every name the image may still hold: one it never took is unnamed harmlessly.
-            linked.names = kept_names;
-            linked.names.extend(gone_names);
-            linked.names.sort_unstable();
-            // The image is as it was, so its rows are: the next link's delta is against them.
-            linked.rows.undo(undo);
+            untaken(linked, kept_names, gone_names, undo);
             return Err(cause);
         }
     };
@@ -2532,22 +2722,147 @@ fn relink(
         let _span = tracing::info_span!(target: "blaze", "link tables", unit = %path).entered();
         tests_table(test, path, generated, linked)?
     };
-    Ok((bytes, read, table, laid, told))
+    Ok((filed, read, table, laid, told))
 }
 
-/// The whole file a link left, for the store: a file written whole is its patch's writes
-/// over zeros, and one patched is read from the image's state ([`Image::file`]).
-fn whole_file(image: &Image, patch: blaze_link::Patch) -> Result<Vec<u8>, blaze_link::LinkError> {
-    if !patch.full {
-        return image.file();
+/// The file a link left, as [`relink`] has it.
+enum Filed {
+    /// Its bytes: a dev executable's, which is its code memory's image part, or an image the
+    /// link changed nothing of.
+    Whole(Vec<u8>),
+    /// What the commit changed of the file before it ([`Image::patch`]): the file itself is
+    /// made only if the store is to be given it whole.
+    Patch(blaze_link::Patch),
+}
+
+impl Filed {
+    /// What the store is given of the file of digest `root` that `image` was just committed
+    /// to at `path`. A patch of the file before goes as the patch where the store can derive
+    /// from that file ([`Written::linked`]), and then the whole file is never made; else the
+    /// file is read from the image's state ([`Image::file`]), a copy its length long, which
+    /// the `link copy` span says. A file written whole is its patch's writes over zeros. A
+    /// file the daemon reads back by its bytes (`read_back`: a proc macro's wasm module) is
+    /// always given whole.
+    fn written(
+        self,
+        store: &blaze_cas::Reader,
+        image: &Image,
+        root: [u8; 32],
+        path: &str,
+        read_back: bool,
+    ) -> Result<Written, blaze_link::LinkError> {
+        let patch = match self {
+            Filed::Whole(bytes) => return Ok(Written::Linked(bytes, root)),
+            Filed::Patch(patch) => patch,
+        };
+        let len = patch.len;
+        let copy = || {
+            let _span =
+                tracing::info_span!(target: "blaze", "link copy", unit = %path, bytes = len)
+                    .entered();
+            image.file()
+        };
+        if patch.full {
+            let _span =
+                tracing::info_span!(target: "blaze", "link copy", unit = %path, bytes = len)
+                    .entered();
+            // alloc: the file, which the store takes
+            let mut out = vec![0; len as usize];
+            for (at, bytes) in &patch.writes {
+                let at = *at as usize;
+                out[at..at + bytes.len()].copy_from_slice(bytes);
+            }
+            return Ok(Written::Linked(out, root));
+        }
+        if read_back {
+            return Ok(Written::Linked(copy()?, root));
+        }
+        Written::linked(store, root, Some(patch), copy)
     }
-    // alloc: the file, which the store takes
-    let mut out = vec![0; patch.len as usize];
-    for (at, bytes) in &patch.writes {
-        let at = *at as usize;
-        out[at..at + bytes.len()].copy_from_slice(bytes);
-    }
-    Ok(out)
+}
+
+/// Puts `linked` back as it was before a change its image did not take: every name the image
+/// may still hold (one it never took is unnamed harmlessly), and its rows, which the next
+/// link's delta is against.
+fn untaken(
+    linked: &mut Linked,
+    kept_names: Vec<String>,
+    gone_names: Vec<String>,
+    undo: kept::Undo,
+) {
+    linked.names = kept_names;
+    linked.names.extend(gone_names);
+    linked.names.sort_unstable();
+    linked.rows.undo(undo);
+}
+
+/// What a change gives the linker of the build's lists: the debug names of the functions the
+/// build's delta lists, the cold functions a layout reads, the functions and the statics the
+/// change adds.
+type Lists<'a> = (
+    Vec<(InstanceKey, String)>,
+    Vec<InstanceKey>,
+    Vec<&'a blaze_codegen::CompiledFunction>,
+    Vec<&'a blaze_codegen::Static>,
+);
+
+/// [`Lists`] of `built` for a change that adds the functions `added` and the statics
+/// `new_statics`, each found by a search of its list whose key order is checked
+/// ([`kept::Listed`]): a list out of order is an error naming it and the key, and so is a
+/// function or a static the rows hold that the build's list lacks. `takes` is the rows'
+/// ([`kept::Rows::takes`]); `whole` says the image is laid out whole.
+fn lists<'a>(
+    built: &'a Built,
+    takes: Result<bool, &'static str>,
+    whole: bool,
+    added: &[InstanceKey],
+    new_statics: &[blaze_codegen::StaticId],
+) -> Result<Lists<'a>, String> {
+    // The names for debuggers of what the delta lists: the image holds the rest.
+    let debug_names: Vec<(InstanceKey, String)> = match takes {
+        // alloc: none, empty: the image was given this build's names
+        Ok(true) => Vec::new(),
+        Ok(false) => {
+            let names = kept::Listed::new(&built.debug_names, "debug_names", |it| it.0);
+            let functions = &built.delta.functions;
+            // alloc: per link, the names of the functions the build changed
+            let mut out = Vec::with_capacity(functions.added.len() + functions.changed.len());
+            for key in functions.added.iter().chain(&functions.changed) {
+                if let Some(named) = names.find(key)? {
+                    // clone: per link, the names of the functions the build changed
+                    out.push(named.clone());
+                }
+            }
+            out
+        }
+        // clone: once per image linked from the build's whole lists
+        Err(_) => built.debug_names.clone(),
+    };
+    // What a layout reads of the cold functions: all of them where the image is laid out
+    // whole (its first link, or an output that keeps no room), else those of the functions
+    // this link adds, which are all it places.
+    let cold: Vec<InstanceKey> = match whole {
+        // clone: once per image laid out whole, the functions codegen inferred cold
+        true => built.cold.clone(),
+        false => {
+            let colds = kept::Listed::new(&built.cold, "cold", |it| *it);
+            let mut out = Vec::new(); // alloc: per link, the few cold functions it adds
+            for key in added {
+                if colds.find(key)?.is_some() {
+                    out.push(*key);
+                }
+            }
+            out
+        }
+    };
+    let functions = kept::functions_of(built);
+    let statics = kept::statics_of(built);
+    Ok((
+        debug_names,
+        cold,
+        added.iter().map(|key| functions.need(key)).collect::<Result<_, _>>()?,
+        new_statics.iter().map(|id| statics.need(id)).collect::<Result<_, _>>()?,
+    ))
 }
 
 /// A test binary's table, by which its tests are selected and which only its link numbers;

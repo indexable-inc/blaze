@@ -6,6 +6,8 @@ disallowed-types = [
     # docs/v2/plan/design/profile-names.md: the flight recorder names per thread, sharing nothing.
     { path = "blaze_profile::flight::Names", replacement = "blaze_profile::flight::names::Local", reason = "one process-wide name table shared cache lines across every recording thread: a thread names into its own table, defined in its own ring (docs/v2/plan/design/profile-names.md)", allow-invalid = true },
     { path = "blaze_profile::flight::Shared", replacement = "blaze_profile::flight::names::Local", reason = "as for `flight::Names`: names are per thread", allow-invalid = true },
+    # The keyed Merkle set moved to blaze-ids, the one audited place hashes are combined into an identity (rule guard-the-cause, 2026-11-10).
+    { path = "blaze_link::keyed::Keyed", replacement = "blaze_ids::keyed::Keyed", reason = "one home for the identity of a set of hashes: a link's given id and a build's id are both made of it, never of a sum or an XOR of hashes", allow-invalid = true },
     # Locks (rule standard-structures): raw std and parking_lot locks are banned outside crates/blaze-core/src/lock.rs.
     { path = "std::sync::Mutex", replacement = "blaze_core::lock::Lock", reason = "named and recorded (docs/v2/plan/design/named-locks.md): blaze's one lock home is `blaze_core::lock`, whose locks take a name and record who waited behind whom on the slow path only" },
     { path = "std::sync::RwLock", replacement = "blaze_core::lock::ReadLock", reason = "named and recorded (docs/v2/plan/design/named-locks.md): blaze's one lock home is `blaze_core::lock`, whose locks take a name and record who waited behind whom on the slow path only" },
@@ -84,7 +86,7 @@ disallowed-methods = [
     { path = "std::thread::scope", reason = "parallel work runs on blaze's one pool (`blaze_graph::par`), which the scheduler prioritises and the profile sees: a scoped thread is a second, unscheduled pool" },
     { path = "std::thread::available_parallelism", reason = "the pool owns the worker count (`blaze_graph`'s workers); a second count sizes work for cores another pool is using" },
     { path = "std::thread::yield_now", reason = "a yield is a spin with no bound: wait through the scheduler, or the bounded spin-then-park helper (AGENTS.md rules 12 and 18)" },
-    { path = "std::thread::park", reason = "on a pool thread a wait goes through the scheduler (AGENTS.md rule 12); a driver parks through its own wait" },
+    { path = "std::thread::park", reason = "on a pool thread a wait goes through the scheduler (AGENTS.md rule 12); a driver parks through its own wait, `blaze_core::wait::Parker::park` to a `Deadline`. A park with no deadline that stays also names its waker on its line, `// wakes: <who>` (`blaze::unbounded_wait`, docs/lints.md)" },
     { path = "std::thread::park_timeout", reason = "on a pool thread a wait goes through the scheduler (AGENTS.md rule 12); a driver parks through its own wait" },
     # Rule deadline-waits: a thread blocks in the kernel only through `blaze_core::wait`, on an absolute deadline; the wait module and the IO backends hold the raw calls, each with #[expect(clippy::disallowed_methods, reason = ..)].
     { path = "libc::poll", reason = "a wait on descriptors is `blaze_core::wait::readable`, which takes an absolute deadline on the injected clock and retries an interrupted call with the time left, never the whole timeout again. No machine fix: it takes the pollfds, an optional `Deadline` and the clock (rule deadline-waits, docs/v2/plan/design/deadline-waits.md)", allow-invalid = true },

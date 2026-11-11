@@ -1,0 +1,19 @@
+[package]
+name = "gpu"
+description = "Rust on the GPU, the shader side: vectors and Slang's math, built-ins, interpolation and resources as types, and the binding table every entry point's signature generates (docs/future/gpu/shaders.md)"
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+doctest = false
+
+[dependencies]
+gpu-macros = { path = "../gpu-macros" }
+
+[dev-dependencies]
+hegeltest = { path = "../../vendor/hegeltest", default-features = false, features = ["static-engine"] }
+
+[lints]
+workspace = true

@@ -6,11 +6,12 @@
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeMap;
+use std::{cell::Cell, collections::BTreeMap, fmt};
 
-use blaze_codegen::{BuiltId, InstanceKey, StaticId, driver::Built};
-use blaze_ids::{ContentId, Hasher};
-use blaze_link::keyed::Keyed;
+use blaze_codegen::{
+    BuiltId, CompiledFunction, InstanceKey, Static, StaticId, driver::Built,
+};
+use blaze_ids::{ContentId, Hasher, keyed::Keyed};
 use hir_ty_codegen::v2::{LinkInputs, span_table_id};
 
 use super::{FunctionRow, StaticRow, filled_id, function_rows, static_row, static_rows};
@@ -108,6 +109,89 @@ pub(crate) enum Spans<'a> {
     /// Every table of the snapshot `serial`, sorted by anchor, each with its id where the
     /// front end gave one.
     All { serial: u64, tables: Vec<(ContentId, Option<ContentId>, &'a [u8])> },
+}
+
+/// One of a build's lists that a link searches by key: [`Built::functions`] and
+/// [`Built::statics`] here, [`Built::debug_names`] and [`Built::cold`] in [`super::relink`].
+///
+/// The precondition: the list is in key order. `blaze_codegen`'s driver gives each so:
+/// `functions` is sorted by key as dedupe ends (`dedupe.rs`, `functions.sort_by_key`),
+/// `statics` by item and instance where a build finishes (`driver.rs`,
+/// `out.statics.sort_by_key`), and `debug_names` and `cold` are made there by iterating the
+/// walk's nodes, a `Sorted` map whose entries are in key order (`Sorted::of`, kept so by
+/// `Sorted::rekey`). It is checked, never assumed: asserted where the list is taken, in a
+/// build with debug assertions, and in any build a search that finds nothing checks the
+/// order once before it says the key is not there, so a list out of order is an error naming
+/// the list and the key, never a miss taken for an absent key (rule no-fallback).
+pub(crate) struct Listed<'a, T, F> {
+    list: &'a [T],
+    /// The list's name, as the error says it.
+    named: &'static str,
+    key: F,
+    /// A search that found nothing found the list in order: not checked again.
+    ordered: Cell<bool>,
+}
+
+impl<'a, T, K, F> Listed<'a, T, F>
+where
+    K: Ord + fmt::Debug,
+    F: Fn(&T) -> K,
+{
+    /// `list`, a build's list named `named`, each entry's key `key` of it.
+    pub(crate) fn new(list: &'a [T], named: &'static str, key: F) -> Self {
+        debug_assert!(list.is_sorted_by_key(&key), "a build's `{named}` is in key order");
+        Listed::unasserted(list, named, key)
+    }
+
+    /// [`Listed::new`] with no assertion: what a build without debug assertions runs, apart
+    /// so a test gives it a list out of order.
+    fn unasserted(list: &'a [T], named: &'static str, key: F) -> Self {
+        Listed { list, named, key, ordered: Cell::new(false) }
+    }
+
+    /// The entry of `key`; `None` when the list, in key order, has none. An error when it
+    /// has none found and is not in key order, naming the list and the key.
+    pub(crate) fn find(&self, key: &K) -> Result<Option<&'a T>, String> {
+        if let Ok(at) = self.list.binary_search_by(|it| (self.key)(it).cmp(key)) {
+            return Ok(Some(&self.list[at]));
+        }
+        if !self.ordered.get() {
+            if !self.list.is_sorted_by_key(&self.key) {
+                // alloc: error path
+                return Err(format!(
+                    "the build's `{}` is not in key order, so a search of it for {key:?} \
+                     proves nothing: a bug in blaze-codegen's driver, which makes the list",
+                    self.named
+                ));
+            }
+            self.ordered.set(true);
+        }
+        Ok(None)
+    }
+
+    /// The entry of `key`, which the list is known to hold: an error naming the list and the
+    /// key when it does not.
+    pub(crate) fn need(&self, key: &K) -> Result<&'a T, String> {
+        self.find(key)?.ok_or_else(|| {
+            // alloc: error path
+            format!(
+                "the build's `{}` has no entry of {key:?}, which the link's rows of the build name",
+                self.named
+            )
+        })
+    }
+}
+
+/// [`Built::functions`] by key ([`Listed`]).
+pub(crate) fn functions_of(
+    built: &Built,
+) -> Listed<'_, CompiledFunction, impl Fn(&CompiledFunction) -> InstanceKey> {
+    Listed::new(&built.functions, "functions", |it| it.key)
+}
+
+/// [`Built::statics`] by item and instance ([`Listed`]).
+pub(crate) fn statics_of(built: &Built) -> Listed<'_, Static, impl Fn(&Static) -> StaticId> {
+    Listed::new(&built.statics, "statics", |it| (it.item, it.instance))
 }
 
 fn entry_key(kind: u8, parts: &[&[u8; 32]]) -> [u8; 32] {
@@ -340,8 +424,9 @@ impl Rows {
     }
 
     /// The rows of the functions and statics `built`'s delta lists, each hashed; no other
-    /// function or static of the build is read. The lists of a `Built` are in key order
-    /// (`driver.rs` makes each from its nodes, which are), so each is found by search.
+    /// function or static of the build is read: each is found by a search of its list, whose
+    /// key order is checked ([`Listed`]). An error (a list out of order, a static that does
+    /// not encode) is [`Rows::apply`]'s, which takes back what was set.
     fn apply_delta(&mut self, built: &Built, work: &mut Work, applied: &mut Applied) -> Result<(), String> {
         let delta = &built.delta;
         for key in &delta.functions.removed {
@@ -354,28 +439,30 @@ impl Rows {
         };
         #[cfg(not(test))]
         let changed: &[InstanceKey] = &delta.functions.changed;
+        let functions = functions_of(built);
         for key in delta.functions.added.iter().chain(changed) {
             // One dedupe merged away is a function of the walk with no code of its own.
-            let row = match built.functions.binary_search_by(|it| it.key.cmp(key)) {
-                Ok(at) => {
+            let row = match functions.find(key)? {
+                Some(function) => {
                     work.rows += 1;
-                    work.row_bytes += built.functions[at].code.len() as u64;
-                    Some(filled_id(&built.functions[at]))
+                    work.row_bytes += function.code.len() as u64;
+                    Some(filled_id(function))
                 }
-                Err(_) => None,
+                None => None,
             };
             self.set_function(*key, row, applied);
         }
         for id in &delta.statics.removed {
             self.set_static(*id, None, applied);
         }
+        let statics = statics_of(built);
         for id in delta.statics.added.iter().chain(&delta.statics.changed) {
-            let row = match built.statics.binary_search_by(|it| (it.item, it.instance).cmp(id)) {
-                Ok(at) => {
+            let row = match statics.find(id)? {
+                Some(it) => {
                     work.rows += 1;
-                    Some(static_row(&built.statics[at])?.2)
+                    Some(static_row(it)?.2)
                 }
-                Err(_) => None,
+                None => None,
             };
             self.set_static(*id, row, applied);
         }
@@ -451,7 +538,7 @@ impl Rows {
     /// (the digest's root) and the natives in their order. Two links of one image with one
     /// id stage the same image. It is a sound identity of the link's inputs: the root is a
     /// Merkle hash of every function's, static's and span table's content
-    /// ([`blaze_link::keyed`]), the build's id says the rest (names, debug names, symbols,
+    /// ([`blaze_ids::keyed`]), the build's id says the rest (names, debug names, symbols,
     /// which functions are patchable or cold: `BuiltId`), and the natives are hashed here
     /// whole, a few a link.
     pub(crate) fn given(&self, built: BuiltId, natives: &[ContentId]) -> ContentId {

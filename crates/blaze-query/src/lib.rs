@@ -3021,6 +3021,7 @@ impl Database {
             .expect("a name under the database's directory");
         io.cold_files += 1;
         let tag = io.tag(self.config.tags);
+        // durable: review: a cold pack holds memo values a build can compute again; it stays synced until a read after a crash is shown to check each entry against its id, then takes `WriteUnsynced`
         effects.push(Effect::Write { file: file.clone(), bytes, tag }); // clone: see above
         io.pending.insert(tag, Pending::ColdWrite { file, entries });
     }

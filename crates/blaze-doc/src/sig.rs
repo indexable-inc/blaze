@@ -155,6 +155,20 @@ impl<'a> Sig<'a> {
                     out.text(")");
                 }
             }
+            TypeRef::Record { names, types, defaults } => {
+                // blaze's record type (`#![blaze::records]`) as written; a default is `= ..`.
+                out.text("{");
+                for (at, name) in self.store.names(names).iter().enumerate() {
+                    out.text(format!("{}{}: ", if at == 0 { " " } else { ", " }, name.as_str()));
+                    if let Some(ty) = types.get(at) {
+                        self.ty(out, *ty);
+                    }
+                    if defaults.get(at).is_some() {
+                        out.text(" = ..");
+                    }
+                }
+                out.text(if types.is_empty() { "}" } else { " }" });
+            }
             TypeRef::UnsafeBinder { lifetimes, ty } => {
                 // rustdoc's `print_higher_ranked_params_with_space`: nothing when no lifetime is bound.
                 let names = self.store.names(lifetimes);

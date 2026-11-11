@@ -136,6 +136,12 @@ jobs:
       # against the daemon's rule, the smoke's edit on the fixture (harness/v2/budgets.py). Its
       # smoke, against the blaze a change builds, is blaze-platform.yaml's profile-gate job.
       - run: uv run --frozen python harness/v2/budgets.py selftest
+      # The smoke's guards (harness/v2/guards.py): each finding a bound is for, in miniature, is
+      # refused by its bound and the fixed state passes; the known list reads; a result with a
+      # guard missing is refused. And which packages a change touches (harness/v2/changed.py).
+      - run: |
+          uv run --frozen python harness/v2/guards.py selftest
+          uv run --frozen python harness/v2/changed.py selftest
       # Every stated invariant has a control beside it, and docs/v2/plan/invariants.md lists them
       # (harness/v2/invariants.py).
       - run: |
@@ -316,6 +322,24 @@ jobs:
         with:
           job: check
           llvm: true
+      # The fast tier: the packages the change touches and those that depend on them, each
+      # after what it needs (harness/v2/changed.py), checked before the workspace, so a change's
+      # first compile error comes in minutes and names the earliest cause. What it checks the
+      # workspace check below finds checked. Against the base itself: the checkout is shallow.
+      - name: blaze check of the packages this change touches
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+        run: |
+          if [ -z "$BASE" ] || ! git fetch -q --depth=1 origin "$BASE"; then
+            echo "no base to compare with: the workspace check below is the check"; exit 0
+          fi
+          args=$(PYTHONPATH=tools/typed-input/src python3 harness/v2/changed.py "{\"base\": \"$BASE\", \"direct\": true, \"print\": \"args\"}")
+          if [ -z "$args" ] || [ "$args" = --workspace ]; then
+            echo "nothing narrower than the workspace to check first: ${args:-no package changed}"; exit 0
+          fi
+          echo "blaze check $args --lib --tests"
+          # shellcheck disable=SC2086
+          blaze check $args --lib --tests --message-format short
       - run: blaze check --workspace --message-format short
       # Every target, the test targets among them: a test that no longer type-checks against
       # the code it tests fails here, in every crate, where the unit tests job compiles the test
@@ -387,3 +411,26 @@ jobs:
         run: |
           echo "$NEEDS" | jq -r 'to_entries[] | "\(.value.result)\t\(.key)"'
           ! echo "$NEEDS" | jq -e 'any(.[]; .result == "failure" or .result == "cancelled")' > /dev/null
+      # The budget smoke's guards ran and held (harness/v2/guards.py, `held`): a tier that builds
+      # blaze has the smoke's result, with an outcome that passed for every bound of every step
+      # of both fixtures and for the sandbox's probe. A job that was skipped passes the step
+      # above; a smoke that did not run, or dropped a guard, fails this one. A gate run that
+      # did not run the smoke is red (docs/harness.md, "The smoke's guards").
+      - if: needs.changes.outputs.tier != 'none'
+        uses: actions/checkout@v7
+      - if: needs.changes.outputs.tier != 'none'
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: '0.13.5'
+          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (ix runners are arm64)
+          enable-cache: false
+      - if: needs.changes.outputs.tier != 'none'
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: budgets-smoke-linux-arm64
+          path: ${{ runner.temp }}/budgets-smoke
+      - name: the budget smoke's guards ran and held
+        if: needs.changes.outputs.tier != 'none'
+        run: |
+          uv run --frozen --no-dev python harness/v2/guards.py "{\"command\": \"held\", \"result\": \"$RUNNER_TEMP/budgets-smoke/budgets-smoke.json\"}"

@@ -381,6 +381,10 @@ struct DefMapCrateData {
     /// blaze: `#![blaze::arbitrary_ints]`, under which `u1`..`u128` and `i1`..`i128` are
     /// primitive integer types (docs/v2/plan/design/arbitrary-ints.md).
     arbitrary_ints: bool,
+    /// blaze: `#![blaze::early_drop]`, under which a local whose destructor only frees memory
+    /// is dropped after its last use (docs/v2/plan/design/early-drop.md;
+    /// `hir_ty_mir::mir::early_drop`).
+    early_drop: bool,
 
     edition: Edition,
     recursion_limit: Option<u32>,
@@ -400,6 +404,7 @@ impl DefMapCrateData {
             no_std: false,
             proc_macro: false,
             arbitrary_ints: false,
+            early_drop: false,
             edition,
             recursion_limit: None,
         }
@@ -417,6 +422,7 @@ impl DefMapCrateData {
             no_std: _,
             proc_macro: _,
             arbitrary_ints: _,
+            early_drop: _,
             edition: _,
             recursion_limit: _,
         } = self;
@@ -1167,6 +1173,13 @@ impl DefMap {
     #[inline]
     pub fn arbitrary_ints(&self) -> bool {
         self.data.arbitrary_ints
+    }
+
+    /// Whether the crate says `#![blaze::early_drop]`, so that a local whose destructor only
+    /// frees memory is dropped after its last use (`hir_ty_mir::mir::early_drop`).
+    #[inline]
+    pub fn early_drop(&self) -> bool {
+        self.data.early_drop
     }
 
     /// The integer of an arbitrary width `name` names in this crate, as the builtin scope's

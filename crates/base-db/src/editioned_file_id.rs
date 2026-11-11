@@ -6,7 +6,7 @@ use std::{hash::Hash, sync::Arc};
 use crate::FileId;
 use blaze_ids::ContentId;
 use span::Edition;
-use syntax::{SyntaxError, ast};
+use syntax::{Extensions, SyntaxError, ast};
 
 use crate::{Db, trees::Trees};
 
@@ -34,7 +34,8 @@ fn parse_(db: &Db, file: EditionedFileId) -> syntax::Parse<ast::SourceFile> {
     let _p = span.entered();
     let input = db.file_text(file_id);
     let stored = db.trees().map(|it| &**it);
-    let parse = input.reparse_field(db).parse(input.text(db), edition, file.is_library(db), stored);
+    let (extensions, outline) = (file.extensions(db), file.is_library(db));
+    let parse = input.reparse_field(db).parse(input.text(db), edition, extensions, outline, stored);
     parse.unwrap_or_else(|error| {
         let root = db.source_root(db.file_source_root(file_id).source_root_id(db));
         let path = root.source_root_ref(db).path_for_file(&file_id).cloned();
@@ -63,6 +64,20 @@ impl EditionedFileId {
     pub fn is_library(self, db: &Db) -> bool {
         let root = db.file_source_root(self.file_id(db)).source_root_id(db);
         db.source_root(root).source_root_ref(db).is_library
+    }
+
+    /// The syntax extensions the file is parsed under: those of the crates whose root is in its
+    /// source root ([`crate::crate_extensions`]), so a file two crates read gets one parse, as
+    /// for [`EditionedFileId::is_library`]. A firewall the parse depends on, so the parse's key
+    /// covers the crate attributes that turn them on. An extension only adds syntax where the
+    /// language has none, so a crate without it that shares the root parses every program it
+    /// accepts the same; hir-def refuses what such a crate writes of an extension it lacks.
+    #[blaze_query::tracked(returns(copy))]
+    pub fn extensions(self, db: &Db) -> Extensions {
+        let crates = crate::relevant_crates(db, self.file_id(db));
+        crates.iter().fold(Extensions::NONE, |it, &krate| {
+            it.with(crate::crate_extensions(db, krate))
+        })
     }
 
     // firewall query

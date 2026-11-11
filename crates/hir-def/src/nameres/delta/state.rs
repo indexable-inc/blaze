@@ -53,6 +53,13 @@ pub(super) struct Pass {
     pub(super) scratch: Vec<Scratch>,
     /// The crates of the layer whose scopes the step published, for the next step's records.
     pub(super) scoped: Vec<super::Scoped>,
+    /// The layer the next step of crate jobs starts looking at.
+    pub(super) at: usize,
+    /// Whether the next step is the records of the layer whose jobs just ran.
+    pub(super) records: bool,
+    /// The crates this write reaches so far: each one a file of which it wrote, and every
+    /// crate above one (`super::unreached`). Only these have a job.
+    pub(super) reached: HashSet<Crate, Global>,
 }
 
 /// Buffers kept from one write to the next: a warm over-delete allocates nothing.
@@ -111,6 +118,27 @@ pub(super) struct CrateState {
 }
 
 impl CrateState {
+    /// Whether `written` holds a file a round-0 log of this crate reads, as
+    /// [`super::input::read`] looks for them: a file a module of it is defined in, a file a
+    /// group's log reads beside its own, a file a call a group expanded is in, or, for a
+    /// group that expanded an `include!`, any file no module of the crate is defined in or a
+    /// file read by its bytes. False says the write leaves every log of the crate as the
+    /// state has it.
+    pub(super) fn reads_written(&self, written: &base_db::Written<'_>) -> bool {
+        let defines = |file: &FileId| self.files.contains_key(file);
+        if written.set.iter().any(|file| defines(file) || self.other_files.contains_key(file)) {
+            return true;
+        }
+        let included = !written.included.is_empty() || written.set.iter().any(|file| !defines(file));
+        if written.set.is_empty() && !included {
+            return false;
+        }
+        self.groups.values().any(|group| {
+            (included && group.out.uses_include)
+                || group.out.expansion_files.iter().any(|it| written.set.contains(it))
+        })
+    }
+
     /// A state from empty that keeps the published inputs of `old`, which a cold run sets
     /// anew where they changed.
     pub(super) fn cold(root: ModuleId, old: Option<CrateState>) -> CrateState {

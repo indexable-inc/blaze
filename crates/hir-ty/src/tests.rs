@@ -27,6 +27,7 @@ mod probe_errors;
 mod qualifier_resolutions;
 mod query_span_names;
 mod raw_pointer_impls;
+mod records;
 mod ref_mut_bindings;
 mod rpitit_nested;
 mod sizedness;

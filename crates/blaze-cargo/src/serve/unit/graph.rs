@@ -35,10 +35,19 @@ pub(crate) mod flag {
     pub(crate) const STD: u8 = 8;
     /// A test (`--test`).
     pub(crate) const TEST: u8 = 16;
+    /// Built for the device (`blaze_units::GPU_DEVICE`, an `artifact = "gpu"` dependency and
+    /// what it depends on): the front end alone builds it, so it has no native code, and no
+    /// host image links it.
+    pub(crate) const DEVICE: u8 = 32;
+    /// A device unit that writes MSL (`UnitPlan::gpu_msl`): its dependents' front ends read it
+    /// (`include_str!(env!("BLAZE_GPU_MSL_<CRATE>"))`), so, as a run's, it is applied to the
+    /// front end before they are made, and [`Waits`] counts it as one.
+    pub(crate) const GPU_MSL: u8 = 64;
 }
 
 /// For each unit, how many build script runs of its closure are not applied yet: once none
-/// is, what its crate is made from is final. Kept by the writer, which alone applies runs.
+/// is, what its crate is made from is final. Kept by the writer, which alone applies runs. A
+/// device unit's MSL ([`flag::GPU_MSL`]) is one such run: its dependents' crates read it.
 ///
 /// Built with one walk up the dependents per run, `O(R · (N + E))`; each run applied costs
 /// the units it reaches, with nothing allocated.
@@ -62,7 +71,7 @@ impl Waits {
         let mut pending = Vec::new();
         start.push(0);
         for run in 0..count as u32 {
-            if graph.has(run, flag::RUN) {
+            if graph.has(run, flag::RUN | flag::GPU_MSL) {
                 seen.clear();
                 seen.insert(run);
                 pending.push(run);
@@ -163,6 +172,9 @@ fn flags_of(unit: &Unit) -> u8 {
     if unit.mode == Mode::Test {
         flags |= flag::TEST;
     }
+    if unit.for_device() {
+        flags |= flag::DEVICE;
+    }
     flags
 }
 
@@ -184,7 +196,12 @@ impl Graph {
                     .ok_or_else(|| UnitError::Package { unit: at, pkg_id: it.pkg_id.clone() }) // clone: error path
             })
             .collect::<Result<_, _>>()?;
-        let flags: Vec<u8> = all.iter().map(flags_of).collect();
+        let writes_msl = |at: usize| units.plans.get(at).is_some_and(|it| it.gpu_msl.is_some());
+        let flags: Vec<u8> = all
+            .iter()
+            .enumerate()
+            .map(|(at, unit)| flags_of(unit) | if writes_msl(at) { flag::GPU_MSL } else { 0 })
+            .collect();
         let edges = all.iter().map(|it| it.dependencies.len()).sum();
         let mut dep_start = Vec::with_capacity(count + 1);
         let mut deps = Vec::with_capacity(edges);
@@ -388,7 +405,7 @@ impl Graph {
         while let Some(at) = pending.pop() {
             for &dep in self.deps(at) {
                 if self.has(dep, flag::LINKABLE)
-                    && !self.has(dep, flag::FOR_HOST)
+                    && !self.has(dep, flag::FOR_HOST | flag::DEVICE)
                     && inside.insert(dep)
                 {
                     pending.push(dep);

@@ -57,6 +57,9 @@ pub mod handle;
 pub mod huge;
 mod os;
 pub mod pool;
+// A 32-bit offset of 8-byte units reaches 32 GiB: only where an address is 64 bits.
+#[cfg(target_pointer_width = "64")]
+pub mod program;
 pub mod racy;
 pub mod region;
 pub mod region_vec;
@@ -77,6 +80,8 @@ pub use error::MemError;
 pub use frame::{Frame, Marker};
 pub use handle::{Handle, Slab};
 pub use pool::{Cache, Pool, Pooled, Shared};
+#[cfg(target_pointer_width = "64")]
+pub use program::{ProgramArena, ProgramError, ProgramLifetime, Ref32};
 pub use region::Region;
 pub use region_vec::RegionVec;
 pub use revision::{Built, Revisions};

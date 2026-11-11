@@ -38,7 +38,7 @@ use crate::{
         laid_out, release_refs,
     },
     blob,
-    dedupe::{Deduped, dedupe},
+    dedupe::{Deduped, Originals, dedupe_keeping},
     flight::{Asked, Decision, Found, Plan},
     fold::{self, Group, Masked, Masking},
     imports, kernel,
@@ -261,6 +261,9 @@ pub struct Built {
     /// base: a consumer that holds state for the base applies it and reads nothing else;
     /// any other reads the whole lists ([`Delta`]).
     pub delta: Delta,
+    /// What the build's walk and the passes after it did, counted ([`Work`]): of a build
+    /// that patched the walk and the lists kept of the last one. Nothing is keyed by it.
+    pub work: Work,
 }
 
 impl Built {
@@ -323,6 +326,8 @@ type Node<B> = FnNode<FrontInstance<B>, FrontStatic<B>>;
 
 /// A function of a walk, over the front end's instance `I` and static `S`: what a lazy run
 /// keeps of it past its build ([`Later`]) is this, so it names no backend or database.
+// clone: a chunk of the walk's nodes a kept walk shares, copied by the build that patches it
+#[derive(Clone)]
 struct FnNode<I, S> {
     unit: Unit,
     spec: Spec,
@@ -334,6 +339,9 @@ struct FnNode<I, S> {
     /// ([`rebind`]): reached through its slot too, so no caller the image keeps in place
     /// holds a direct branch to code a splice replaces.
     rebound: bool,
+    /// The part of [`Self::rebound`] its own describe decides ([`Described::over_editable`]):
+    /// what [`rebind`]'s rule adds to, and what a patched walk evaluates the rule from again.
+    rebound_own: bool,
     instance: I,
     /// Whose code the walk first asked for it as: what describing it again takes.
     requester: Origin,
@@ -694,138 +702,24 @@ impl<I, S> FnNode<I, S> {
     }
 }
 
-struct StaticNode<B: Prepare> {
-    value: FrontStatic<B>,
-    described: DescribedStatic<FrontInstance<B>, FrontStatic<B>>,
+/// A static of a walk, over the front end's instance `I` and static `S`.
+// clone: a chunk of the walk's statics a kept walk shares, copied by the build that patches it
+#[derive(Clone)]
+struct StaticNode<I, S> {
+    value: S,
+    described: DescribedStatic<I, S>,
     spec: Spec,
     refs: Vec<Target>,
 }
 
+type StaticOf<B> = StaticNode<FrontInstance<B>, FrontStatic<B>>;
+
 /// Which static of a build: its item and which instance of it.
 pub type StaticId = (ItemKey, ContentId);
 
-/// A walk's nodes in key order, sorted once when the walk ends, each found by one hash of its
-/// key: per entry its key, its value and a 4-byte slot of `at`.
-struct Sorted<K, V> {
-    keys: Vec<K>,
-    values: Vec<V>,
-    at: blaze_hash::HashMap<K, u32, Global>,
-}
-
-impl<K, V> Default for Sorted<K, V> {
-    fn default() -> Self {
-        // alloc: none, the lists are empty
-        Sorted { keys: Vec::new(), values: Vec::new(), at: blaze_hash::HashMap::new_in(Global) }
-    }
-}
-
-impl<K: Copy + Ord + Hash, V> Sorted<K, V> {
-    /// The entries of `map` by key. Each value moves twice whatever its size: only the
-    /// permutation is sorted.
-    fn of(map: blaze_hash::HashMap<K, V, Global>) -> Self {
-        // alloc: per build, sized by its units
-        let mut entries: Vec<Option<(K, V)>> = map.into_iter().map(Some).collect();
-        assert!(entries.len() <= u32::MAX as usize, "more than 2^32 nodes");
-        // alloc: per build, sized by its units
-        let mut order: Vec<u32> = (0..entries.len() as u32).collect();
-        // Keys are unique: an unstable sort is the order.
-        order.sort_unstable_by_key(|&at| entries[at as usize].as_ref().expect("not taken yet").0);
-        let mut sorted = Sorted {
-            keys: Vec::with_capacity(entries.len()),
-            values: Vec::with_capacity(entries.len()),
-            at: blaze_hash::HashMap::with_capacity_in(entries.len(), Global),
-        };
-        for at in order {
-            let (key, value) = entries[at as usize].take().expect("each entry once");
-            sorted.at.insert(key, sorted.keys.len() as u32);
-            sorted.keys.push(key);
-            sorted.values.push(value);
-        }
-        sorted
-    }
-
-    fn len(&self) -> usize {
-        self.keys.len()
-    }
-
-    fn get(&self, key: &K) -> Option<&V> {
-        self.at.get(key).map(|&at| &self.values[at as usize])
-    }
-
-    fn get_mut(&mut self, key: &K) -> Option<&mut V> {
-        self.at.get(key).map(|&at| &mut self.values[at as usize])
-    }
-
-    /// `entries`, which are in key order, each key once.
-    fn of_sorted(entries: impl ExactSizeIterator<Item = (K, V)>) -> Self {
-        let mut sorted = Sorted {
-            keys: Vec::with_capacity(entries.len()),
-            values: Vec::with_capacity(entries.len()),
-            at: blaze_hash::HashMap::with_capacity_in(entries.len(), Global),
-        };
-        for (key, value) in entries {
-            debug_assert!(sorted.keys.last().is_none_or(|last| *last < key), "in key order");
-            sorted.at.insert(key, sorted.keys.len() as u32);
-            sorted.keys.push(key);
-            sorted.values.push(value);
-        }
-        sorted
-    }
-
-    /// Gives the entry of `old` the key `new`, moved to its place in the order: the entries
-    /// between the two places each move by one, and nothing else is touched. `false`, with
-    /// nothing changed, when `old` is no key or `new` is one already.
-    fn rekey(&mut self, old: &K, new: K) -> bool {
-        if self.at.contains_key(&new) {
-            return false;
-        }
-        let Some(from) = self.at.remove(old) else { return false };
-        let from = from as usize;
-        self.keys[from] = new;
-        // Those before it and those after it are each in order, the first all below the
-        // second: its place is among the one of them it does not bound.
-        let before = self.keys[..from].partition_point(|it| *it < new);
-        let to = match before < from {
-            true => before,
-            false => from + self.keys[from + 1..].partition_point(|it| *it < new),
-        };
-        if to < from {
-            self.keys[to..=from].rotate_right(1);
-            self.values[to..=from].rotate_right(1);
-        } else if to > from {
-            self.keys[from..=to].rotate_left(1);
-            self.values[from..=to].rotate_left(1);
-        }
-        for at in from.min(to)..=from.max(to) {
-            self.at.insert(self.keys[at], at as u32);
-        }
-        true
-    }
-
-    fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
-        self.keys.iter().zip(&self.values)
-    }
-
-    fn iter_mut(&mut self) -> impl Iterator<Item = (&K, &mut V)> {
-        self.keys.iter().zip(&mut self.values)
-    }
-
-    fn values(&self) -> std::slice::Iter<'_, V> {
-        self.values.iter()
-    }
-
-    fn values_mut(&mut self) -> std::slice::IterMut<'_, V> {
-        self.values.iter_mut()
-    }
-}
-
-impl<K: Copy + Ord + Hash, V> std::ops::Index<&K> for Sorted<K, V> {
-    type Output = V;
-
-    fn index(&self, key: &K) -> &V {
-        self.get(key).expect("a node of the walk")
-    }
-}
+/// A walk's nodes in key order ([`rows`]): found by key, changed one chunk at a time, and
+/// shared between the build that walked and the walk kept for the next.
+type Sorted<K, V> = rows::Rows<K, V>;
 
 /// One compile of a release phase: `name` is the key callers' places and summaries name it
 /// by, `unit` what is compiled (another key for a function tiered up).
@@ -970,7 +864,7 @@ fn naming(why: CodegenError, name: &str) -> CodegenError {
 /// definition. Read from the walk, before anything is compiled.
 fn symbols_defined_twice<B: Prepare>(
     nodes: &Sorted<InstanceKey, Node<B>>,
-    statics: &Sorted<StaticId, StaticNode<B>>,
+    statics: &Sorted<StaticId, StaticOf<B>>,
     errors: &mut Vec<CodegenError>,
 ) {
     // The definer's unit and item, and its name for the message. A static's unit is its value's
@@ -1524,7 +1418,7 @@ impl Out {
 /// [`Out::finish`]'s errors: a function's debug name, a static's path.
 fn names_of<'n, I, S, T>(
     nodes: &'n Sorted<InstanceKey, FnNode<I, S>>,
-    statics: Option<&'n Sorted<StaticId, StaticNode<T>>>,
+    statics: Option<&'n Sorted<StaticId, StaticOf<T>>>,
 ) -> impl Fn(Of) -> Option<&'n str> + 'n
 where
     T: Prepare,
@@ -1732,6 +1626,26 @@ pub struct Build<'a, B: Prepare> {
     /// that holds the patched walk to the whole one.
     checks_shape: bool,
     renames: bool,
+    /// The bug planted in a patched build, for a control of the test that holds it to the
+    /// whole one: none, but in that control.
+    planted: Option<Planted>,
+}
+
+/// A bug a control plants in a patched build ([`Build::planted`]): each takes away one rule
+/// of [`patch`] or [`lists`], and the refinement's oracle must find the difference.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(not(test), expect(dead_code, reason = "made only by the controls of the tests"))]
+enum Planted {
+    /// A referrer of a function whose key changed keeps the function it was made of.
+    KeptTemplates,
+    /// The recursion limit's check is not run after an edge is added.
+    SkippedClaims,
+    /// A function made again keeps the owner its row had.
+    KeptOwner,
+    /// A dedupe class is left as it was when a member's code changed.
+    UnsplitClass,
+    /// The delta names no function the build removed.
+    DeltaOmitsRemoved,
 }
 
 /// How many of a walk's functions are reached each way: what [`rebind`] counted, and the span
@@ -1764,43 +1678,51 @@ struct SlotCounts {
 ///
 /// `asked` is the walk's key of each instance as each origin asks for it. With `rebinds`
 /// off, nothing is marked (the planted bug of the rule's test) and the count says so.
-fn rebind<I: Clone + Eq + Hash, S>(
+fn rebind<I: Clone + Eq + Hash, S: Clone>(
     nodes: &mut Sorted<InstanceKey, FnNode<I, S>>,
     asked: &HashMap<(I, Origin), InstanceKey>,
     rebinds: bool,
 ) -> SlotCounts {
-    // The place among the nodes of the function `node` refers to at `place`.
-    let index = |node: &FnNode<I, S>, place: usize| -> Option<usize> {
-        let FrontRef::Function(callee) = node.described.refs.get(place)? else { return None };
-        // clone: per build, the walk's key of a callee; who asks for it is a copy
-        let key = asked.get(&(callee.clone(), node.described.origin))?;
-        nodes.at.get(key).map(|at| *at as usize)
-    };
     // alloc: per build, a flag per function
-    let mut refers: Vec<bool> = nodes
-        .values()
-        .map(|node| {
-            rebinds
-                && !node.slotted()
-                && (0..node.described.refs.len()).any(|place| {
-                    index(node, place).is_some_and(|at| nodes.values[at].patchable)
-                })
-        })
-        .collect();
-    let mut changed = rebinds;
-    while changed {
-        changed = false;
-        for (at, node) in nodes.values().enumerate() {
-            if refers[at] || node.slotted() {
-                continue;
+    let mut refers: Vec<bool> = vec![false; nodes.len()];
+    {
+        // Each node's place in key order, and the nodes by place.
+        // alloc: per build, sized by its units
+        let list: Vec<&FnNode<I, S>> = nodes.values().collect();
+        let at: blaze_hash::HashMap<InstanceKey, u32, Global> = {
+            let mut at = blaze_hash::HashMap::with_capacity_in(list.len(), Global);
+            for (place, key) in nodes.keys().enumerate() {
+                at.insert(*key, place as u32);
             }
-            let builds_in = node.described.built_in.iter().any(|place| {
-                index(node, *place as usize)
-                    .is_some_and(|it| refers[it] || nodes.values[it].rebound)
-            });
-            if builds_in {
-                refers[at] = true;
-                changed = true;
+            at
+        };
+        // The place among the nodes of the function `node` refers to at `place`.
+        let index = |node: &FnNode<I, S>, place: usize| -> Option<usize> {
+            let FrontRef::Function(callee) = node.described.refs.get(place)? else { return None };
+            // clone: per build, the walk's key of a callee; who asks for it is a copy
+            let key = asked.get(&(callee.clone(), node.described.origin))?;
+            at.get(key).map(|at| *at as usize)
+        };
+        for (place, node) in list.iter().enumerate() {
+            refers[place] = rebinds
+                && !node.slotted()
+                && (0..node.described.refs.len())
+                    .any(|at| index(node, at).is_some_and(|at| list[at].patchable));
+        }
+        let mut changed = rebinds;
+        while changed {
+            changed = false;
+            for (at, node) in list.iter().enumerate() {
+                if refers[at] || node.slotted() {
+                    continue;
+                }
+                let builds_in = node.described.built_in.iter().any(|place| {
+                    index(node, *place as usize).is_some_and(|it| refers[it] || list[it].rebound)
+                });
+                if builds_in {
+                    refers[at] = true;
+                    changed = true;
+                }
             }
         }
     }
@@ -1853,11 +1775,19 @@ impl<'a, B: Prepare> Build<'a, B> {
             asks: true,
             checks_shape: true,
             renames: true,
+            planted: None,
         }
     }
 
+    /// Plants `bug` in this build's patch ([`Planted`]), for a control.
+    #[cfg(test)]
+    fn planting(mut self, bug: Planted) -> Self {
+        self.planted = Some(bug);
+        self
+    }
+
     /// The planted bug of a control of the patched walk: a changed function whose references
-    /// are others is patched all the same, so the walk keeps what it referred to.
+    /// are others keeps its old edges and places, so the walk keeps what it referred to.
     #[cfg(test)]
     fn patching_any_shape(mut self) -> Self {
         self.checks_shape = false;
@@ -1954,6 +1884,11 @@ impl<'a, B: Prepare> Build<'a, B> {
             arch: self.policy.toolchain.arch,
             item: described.item,
         };
+        // Another crate's code over a workspace type, closure or item, where the build has
+        // slots: an edit fills it again under its own key. [`rebind`] adds the ones that
+        // only the walk's keys tell.
+        let rebound_own =
+            self.rebinds && choice.patchable && !described.editable && described.over_editable;
         Ok(FnNode {
             unit,
             spec: choice.first,
@@ -1961,13 +1896,8 @@ impl<'a, B: Prepare> Build<'a, B> {
             // Only code an edit reaches is patched: a generic of another crate a member
             // instantiates is the member's by origin, but no edit changes its body.
             patchable: choice.patchable && described.editable,
-            // Another crate's code over a workspace type, closure or item, where the build
-            // has slots: an edit fills it again under its own key. [`rebind`] adds the ones
-            // that only the walk's keys tell.
-            rebound: self.rebinds
-                && choice.patchable
-                && !described.editable
-                && described.over_editable,
+            rebound: rebound_own,
+            rebound_own,
             // clone: per build, the walk's handle of the instance
             instance: instance.clone(),
             requester,
@@ -2030,7 +1960,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         &self,
         value: &FrontStatic<B>,
         described: DescribedStatic<FrontInstance<B>, FrontStatic<B>>,
-    ) -> Result<StaticNode<B>, CodegenError> {
+    ) -> Result<StaticOf<B>, CodegenError> {
         let choice = self.policy.choose(&described.origin, None).map_err(|why| {
             // alloc: an error
             error(InstanceKey(described.value), described.item, why.to_string())
@@ -2057,7 +1987,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         errors: &mut Vec<CodegenError>,
     ) -> (
         Sorted<InstanceKey, Node<B>>,
-        Sorted<StaticId, StaticNode<B>>,
+        Sorted<StaticId, StaticOf<B>>,
         Vec<InstanceKey>,
         Walk,
         Option<patch::Side<FrontInstance<B>, FrontStatic<B>>>,
@@ -2077,7 +2007,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         };
         let mut nodes: blaze_hash::HashMap<InstanceKey, Node<B>, Global> =
             blaze_hash::HashMap::new_in(Global);
-        let mut statics: blaze_hash::HashMap<StaticId, StaticNode<B>, Global> =
+        let mut statics: blaze_hash::HashMap<StaticId, StaticOf<B>, Global> =
             blaze_hash::HashMap::new_in(Global);
         let mut asked: HashMap<(FrontInstance<B>, Origin), InstanceKey> = HashMap::new();
         let mut static_asked: HashMap<FrontStatic<B>, StaticId> = HashMap::new();
@@ -2703,7 +2633,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         let mut errors = Vec::new();
         let (nodes, statics, _, _, _) = self.walk(roots, static_roots, &[], None, &mut errors);
         // The caller links what it compiles as [`Build::run_as`] does: one definition a symbol.
-        symbols_defined_twice(&nodes, &statics, &mut errors);
+        symbols_defined_twice::<B>(&nodes, &statics, &mut errors);
         if !errors.is_empty() {
             errors.sort_by_key(|it| (it.unit, it.item));
             errors.dedup();
@@ -2713,12 +2643,15 @@ impl<'a, B: Prepare> Build<'a, B> {
         let mut functions = Vec::with_capacity(nodes.len());
         // alloc: per walk, what the caller compiles
         let mut refs = Vec::with_capacity(nodes.len());
-        for node in nodes.values {
-            functions.push((node.instance, node.unit));
-            refs.push(node.refs);
+        for node in nodes.values() {
+            // clone: per walk, what the caller compiles: the walk's nodes are in shared chunks
+            functions.push((node.instance.clone(), node.unit.clone()));
+            refs.push(node.refs.clone()); // clone: as above
         }
+        // clone: as above
         // alloc: per walk, what the caller compiles
-        let statics = statics.values.into_iter().map(|node| (node.value, node.refs)).collect();
+        let statics =
+            statics.values().map(|node| (node.value.clone(), node.refs.clone())).collect();
         Ok(Reached { functions, refs, statics })
     }
 
@@ -2740,9 +2673,16 @@ impl<'a, B: Prepare> Build<'a, B> {
         // before any describe, so what is durable in it stays so while it is the same.
         let policy_id = self.policy.id();
         let view = self.frontend.durable_view();
+        let seen = self.frontend.view();
         let program_walk =
             kept::program(&(roots, static_roots, check, policy_id.0, self.rebinds));
-        let (nodes, statics, root_keys, mut walk, keep) = {
+        // The last `Built` of this program by row, taken whatever the walk does: a build
+        // that ends well keeps its own.
+        let mut lists = match (self.kept, later) {
+            (Some(kept), None) => kept.take_lists(program_walk),
+            _ => None,
+        };
+        let (nodes, statics, root_keys, mut walk, keep, touched) = {
             let span = tracing::info_span!(
                 target: "blaze",
                 "codegen walk",
@@ -2753,6 +2693,14 @@ impl<'a, B: Prepare> Build<'a, B> {
                 visited = tracing::field::Empty,
                 fresh = tracing::field::Empty,
                 whole = tracing::field::Empty,
+                asked = tracing::field::Empty,
+                groups = tracing::field::Empty,
+                graph = tracing::field::Empty,
+                claims = tracing::field::Empty,
+                classified = tracing::field::Empty,
+                resolved = tracing::field::Empty,
+                built_in = tracing::field::Empty,
+                owners = tracing::field::Empty,
             );
             let _entered = span.enter();
             let patched = match later {
@@ -2760,8 +2708,16 @@ impl<'a, B: Prepare> Build<'a, B> {
                 Some(_) => Err("a lazy build's walk order is not kept"),
             };
             let walked = match patched {
-                Ok((nodes, statics, root_keys, walk, keep)) => {
-                    (nodes, statics, root_keys, walk, Some(keep))
+                Ok(patch::Patched { nodes, statics, roots, walk, keep, touched, work }) => {
+                    span.record("asked", work.asked);
+                    span.record("groups", work.groups);
+                    span.record("graph", work.graph);
+                    span.record("claims", work.claims);
+                    span.record("classified", work.classified);
+                    span.record("resolved", work.resolved);
+                    span.record("built_in", work.built_in);
+                    span.record("owners", work.owners);
+                    (nodes, statics, roots, walk, Some(keep), Some((touched, work)))
                 }
                 Err(why) => {
                     let (nodes, statics, root_keys, mut walk, side) = self.walk(
@@ -2772,8 +2728,10 @@ impl<'a, B: Prepare> Build<'a, B> {
                         &mut out.errors,
                     );
                     walk.whole = Some(why);
-                    let keep = side.map(|side| self.keep_of(&nodes, &statics, side));
-                    (nodes, statics, root_keys, walk, keep)
+                    let keep = side.and_then(|side| {
+                        self.keep_of(&nodes, &statics, side, roots, static_roots, check)
+                    });
+                    (nodes, statics, root_keys, walk, keep, None)
                 }
             };
             let walk = &walked.3;
@@ -2789,12 +2747,74 @@ impl<'a, B: Prepare> Build<'a, B> {
             }
             walked
         };
+        // A patched walk with the lists kept of the last `Built`: the rows of what the walk
+        // touched are made again, and the `Built` is the kept one with them ([`lists`]).
+        // What a whole walk checks of its result (the owners, the symbols) the patch
+        // checked of what it touched.
+        let mut work = Work::default();
+        let nodes = match (touched, lists.take()) {
+            (Some((touched, patch_work)), Some(kept_lists)) => {
+                // alloc: per build, sized by its statics' references
+                self.static_callees =
+                    statics.values().flat_map(|it| it.refs.iter().filter_map(callee)).collect();
+                match self.patch_lists(
+                    kept_lists,
+                    &nodes,
+                    &statics,
+                    &root_keys,
+                    &touched,
+                    patch_work,
+                    walk,
+                    store,
+                ) {
+                    lists::Patch::Built(built, kept_lists) => {
+                        // alloc: once per build, the walk its `Later` and the kept walk share
+                        let nodes = Arc::new(nodes);
+                        // clone: a reference count, once per build
+                        self.last = Later { nodes: nodes.clone(), ..Later::default() };
+                        if let (Some(kept), Some(keep), Some(view)) = (self.kept, keep, view) {
+                            kept.keep_lists(program_walk, kept_lists);
+                            self.keep_walk(
+                                program_walk,
+                                roots,
+                                static_roots,
+                                check,
+                                policy_id,
+                                view,
+                                seen,
+                                nodes,
+                                statics,
+                                keep,
+                            );
+                        }
+                        return Ok(*built);
+                    }
+                    lists::Patch::Refused(errors) => {
+                        // alloc: once per build, the walk its `Later` holds
+                        self.last = Later { nodes: Arc::new(nodes), ..Later::default() };
+                        return Err(errors);
+                    }
+                    // The passes run whole over the patched walk, and the delta is made
+                    // against the lists as they were.
+                    lists::Patch::Whole(why, kept_lists) => {
+                        tracing::info!(target: "blaze", why, "the lists are made whole");
+                        work.asked = patch_work.asked;
+                        lists = Some(kept_lists);
+                        nodes
+                    }
+                }
+            }
+            (_, kept_lists) => {
+                lists = kept_lists;
+                nodes
+            }
+        };
         let owning =
             tracing::info_span!(target: "blaze", "codegen owners", functions = nodes.len())
                 .entered();
         // Over the columns, whose iterators clone: the owners are read before they are checked.
         let owned = owners::owners(
-            &nodes.keys.iter().zip(&nodes.values).map(|(key, node)| owners::Function {
+            &nodes.iter().map(|(key, node)| owners::Function {
                 key: *key,
                 item: node.unit.item,
                 owner: node.described.owner,
@@ -2803,7 +2823,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                 name: &node.described.name,
                 origin: node.described.origin,
             }),
-            &statics.keys.iter().zip(&statics.values).map(|(id, node)| owners::StaticOf {
+            &statics.iter().map(|(id, node)| owners::StaticOf {
                 id: *id,
                 unit: InstanceKey(node.described.value),
                 owner: node.described.owner,
@@ -2815,9 +2835,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         );
         // alloc: per build, the keys of its functions written in workspace crates
         let editable: Vec<InstanceKey> = nodes
-            .keys
             .iter()
-            .zip(&nodes.values)
             .filter(|(_, node)| node.described.editable)
             .map(|(key, _)| *key)
             .collect();
@@ -2830,7 +2848,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                 statics = statics.len(),
             )
             .entered();
-            symbols_defined_twice(&nodes, &statics, &mut out.errors);
+            symbols_defined_twice::<B>(&nodes, &statics, &mut out.errors);
         }
         // Set with `self.last`, refused or not: `tier_up` reads the two together.
         // alloc: per build, sized by its statics' references
@@ -2885,7 +2903,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             let _span =
                 tracing::info_span!(target: "blaze", "codegen statics", statics = statics.len())
                     .entered();
-            self.statics(&statics, store, &mut out);
+            self.statics(&statics, None, store, &mut out);
         }
         out.profiled(self.policy.pgo);
         let _finishing =
@@ -2899,7 +2917,16 @@ impl<'a, B: Prepare> Build<'a, B> {
         let deduping =
             tracing::info_span!(target: "blaze", "codegen dedupe", functions = out.functions.len())
                 .entered();
-        let deduped = dedupe(&mut out.functions, &mut out.statics, &mergeable);
+        // A build kept by row holds each function as it was made: what dedupe changes of
+        // them is kept as given.
+        let keeps_rows = self.kept.is_some() && later.is_none();
+        let mut originals = Originals::default();
+        let deduped = dedupe_keeping(
+            &mut out.functions,
+            &mut out.statics,
+            &mergeable,
+            keeps_rows.then_some(&mut originals),
+        );
         drop(deduping);
         let deduped = match deduped {
             Ok((deduped, renamed)) => {
@@ -2995,7 +3022,9 @@ impl<'a, B: Prepare> Build<'a, B> {
         );
         // Each instance's two hashes are its own: on every core, in key order.
         // alloc: per build, what it gives the test binary's table
-        let versions = par::map(&nodes.values, |node| {
+        // alloc: per build, its nodes in key order, for the cores to share
+        let in_order: Vec<&Node<B>> = nodes.values().collect();
+        let versions = par::map(&in_order, |node| {
             let id = crate::exec::fn_id(node.subject(), node.unit.instance.settings);
             let item_of = |key: &InstanceKey| nodes.get(key).map(|it| it.unit.item);
             (id, crate::exec::bound(&node.described.bound, &node.refs, item_of))
@@ -3018,8 +3047,6 @@ impl<'a, B: Prepare> Build<'a, B> {
         if !errors.is_empty() {
             return Err(errors);
         }
-        // clone: per build that keeps its walk, its roots' keys
-        let kept_roots = root_keys.clone();
         let mut built = Built {
             functions,
             statics: compiled_statics,
@@ -3051,6 +3078,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             walk,
             id: BuiltId::default(),
             delta: Delta::default(),
+            work,
         };
         // What the build changed since the last build of the same program: the program is
         // every input of the walk beside the front end's own, which the kept walk is of
@@ -3065,9 +3093,16 @@ impl<'a, B: Prepare> Build<'a, B> {
             removed = tracing::field::Empty,
         );
         let _entered = span.enter();
-        let now = delta::Last::of(&built);
         let program = kept::program(&(roots, static_roots, check, policy_id.0, later));
-        let before = self.kept.and_then(|kept| kept.last(program));
+        // The base: the last `Built` of the program, kept by row or, for a build that is
+        // not, by its entries.
+        let before: Option<Arc<delta::Last>> = match lists.take() {
+            // alloc: once per whole build after one kept by row, its entries
+            Some(lists) => Some(Arc::new(lists.into_last())),
+            None => self.kept.and_then(|kept| kept.last(program)),
+        };
+        let (entries, codes) = delta::function_entries_and_codes(&built);
+        let now = delta::Last::of_entries(&built, entries, before.as_deref());
         let fresh = match self.kept {
             None => Some(Fresh::Unkept),
             Some(_) => Some(walk.fresh.unwrap_or(Fresh::First)),
@@ -3080,11 +3115,27 @@ impl<'a, B: Prepare> Build<'a, B> {
         walk.dropped = built.delta.functions.removed.len();
         built.walk = walk;
         if let Some(kept) = self.kept {
-            // alloc: once per build, what the next build's delta is made against
-            kept.built(program, Arc::new(now));
+            // Kept by row for the next build to patch, where every function is compiled
+            // alone; else by its entries, for the next build's delta.
+            let now = match keeps_rows {
+                true => match lists::Lists::of_whole(&*nodes, &statics, &built, originals, now, &codes)
+                {
+                    Ok(lists) => {
+                        kept.keep_lists(program_walk, lists);
+                        kept.forget_built(program);
+                        None
+                    }
+                    Err(now) => Some(now),
+                },
+                false => Some(now),
+            };
+            if let Some(now) = now {
+                // alloc: once per build, what the next build's delta is made against
+                kept.built(program, Arc::new(now));
+            }
         }
         // The walk of a build that ended well is the one the next build of the program
-        // patches: with the durable view from before its describes.
+        // patches: with the front end's views from before its describes.
         if let (Some(keep), Some(view)) = (keep, view) {
             self.keep_walk(
                 program_walk,
@@ -3093,9 +3144,9 @@ impl<'a, B: Prepare> Build<'a, B> {
                 check,
                 policy_id,
                 view,
+                seen,
                 nodes,
                 statics,
-                kept_roots,
                 keep,
             );
         }
@@ -3174,6 +3225,20 @@ impl<'a, B: Prepare> Build<'a, B> {
             .map(|(key, _)| *key)
             // alloc: per build, sized by its units
             .collect();
+        self.dev_of(nodes, dev, store, out);
+    }
+
+    /// The functions `dev` of `nodes`, none of a release backend, each made of its template:
+    /// from the store, else the memo, else compiled; those the policy folds first. A whole
+    /// build's are all of its dev functions; a patched one's are those its walk touched
+    /// ([`lists`]), none of which is folded.
+    fn dev_of(
+        &self,
+        nodes: &Sorted<InstanceKey, Node<B>>,
+        dev: Vec<InstanceKey>,
+        store: &impl Lookup,
+        out: &mut Out,
+    ) {
         let mut prepared: HashMap<InstanceKey, (Shape, B::Prepared)> = HashMap::new();
 
         // Folding: every candidate's masked IR from its own IR, prepared in this build. No key
@@ -4438,13 +4503,16 @@ impl<'a, B: Prepare> Build<'a, B> {
         }
     }
 
+    /// The definition of each static of `statics`, or with `only` (sorted) of those alone:
+    /// from the store, else compiled.
     fn statics(
         &self,
-        statics: &Sorted<StaticId, StaticNode<B>>,
+        statics: &Sorted<StaticId, StaticOf<B>>,
+        only: Option<&[StaticId]>,
         store: &impl Lookup,
         out: &mut Out,
     ) {
-        let unit_of = |node: &StaticNode<B>| Unit {
+        let unit_of = |node: &StaticOf<B>| Unit {
             instance: Instance {
                 code: blaze_items::CodeHash(node.described.value),
                 args: node.described.instance,
@@ -4456,7 +4524,12 @@ impl<'a, B: Prepare> Build<'a, B> {
         };
         // alloc: per build, sized by its statics
         let (mut hits, mut missing) = (Vec::new(), Vec::new());
-        for (id, node) in statics.iter() {
+        // alloc: per build, the statics it makes
+        let made: Vec<(&StaticId, &StaticOf<B>)> = match only {
+            None => statics.iter().collect(),
+            Some(only) => only.iter().filter_map(|id| Some((id, statics.get(id)?))).collect(),
+        };
+        for (id, node) in made {
             let key =
                 keys::static_value(&definition(&node.described, &node.refs), &node.spec.settings());
             let unit = unit_of(node);
@@ -4606,10 +4679,13 @@ pub use owners::Owner;
 mod delta;
 pub use delta::{BuiltId, Changes, Delta, Fresh};
 mod kept;
-pub use kept::{Kept, Walk};
+pub use kept::{Kept, Walk, Work};
 mod later;
+mod lists;
 mod patch;
 mod recursion;
+mod rows;
+mod support;
 pub use later::{Later, Walked, runs_at_start};
 pub mod digests;
 pub use digests::{Digests, static_definition};

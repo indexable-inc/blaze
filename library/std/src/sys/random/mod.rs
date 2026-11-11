@@ -102,6 +102,8 @@ cfg_select! {
         target_os = "xous",
         target_os = "vexos",
         target_os = "l4re",
+        // blaze: the GPU device target (naga-unknown-unknown) has no randomness.
+        target_arch = "naga",
     ) => {
         // FIXME: finally remove std support for wasm32-unknown-unknown
         // FIXME: add random data generation to xous
@@ -119,6 +121,7 @@ cfg_select! {
     target_os = "xous",
     target_os = "vexos",
     target_os = "l4re",
+    target_arch = "naga",
 )))]
 pub fn hashmap_random_keys() -> (u64, u64) {
     let mut buf = [0; 16];

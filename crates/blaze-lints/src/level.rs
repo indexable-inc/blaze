@@ -75,6 +75,39 @@ pub(crate) const BLAZE_INTERNAL: On = blaze_kind(blaze::Kind::Internal);
 /// see whether the code is hot, allowed until a workspace or crate turns it on.
 pub(crate) const BLAZE_PEDANTIC_PERF: On = blaze_kind(blaze::Kind::PedanticPerf);
 
+/// The group `blaze::edition`: what the blaze edition removes, here the code blaze cannot
+/// analyse (`proc_macro_*`, `build_script_ambient`) and what blaze's standard library replaces
+/// (`std_use`), allowed until a workspace or crate turns
+/// it on, but for the lints whose advice this blaze already has
+/// ([`blaze::Lint::warns_by_default`]) (docs/v2/plan/design/edition.md).
+pub(crate) const BLAZE_EDITION: On = blaze_kind(blaze::Kind::Edition);
+
+/// The attribute a crate (or a module) opts in to capabilities with, after `blaze::`:
+/// `#![blaze::capabilities]` (docs/v2/plan/design/std.md, "The checks"). The effects it will
+/// turn into errors are not built; what it does today is ask for `blaze::std_use` at `warn`
+/// beneath it, as `#![warn(blaze::std_use)]` there would ([`capabilities_asks_for`]).
+pub(crate) const CAPABILITIES: &str = "capabilities";
+
+/// What `#![blaze::capabilities]` sets to `warn` beneath it.
+pub(crate) const fn capabilities_asks_for() -> blaze::Lint {
+    blaze::Lint::StdUse
+}
+
+/// The group `blaze::proc_macro` ([`blaze::PROC_MACRO`]), part of `blaze::edition`: the lints
+/// of the procedural macros a crate defines, one per kind.
+const BLAZE_PROC_MACRO: On = {
+    let mut bits = On::EMPTY;
+    let mut at = 0;
+    while at < blaze::PROC_MACRO.len() {
+        bits = bits.or(blaze::PROC_MACRO[at].bit());
+        at += 1;
+    }
+    bits
+};
+/// The group `blaze::edition`: code written the way blaze's edition wants it
+/// (docs/v2/plan/design/edition.md), allowed until a crate turns it on.
+pub(crate) const BLAZE_EDITION: On = blaze_kind(blaze::Kind::Edition);
+
 /// The lints `deny` by default ([`blaze::DENY_BY_DEFAULT`]), as a [`Target::Blaze`] has them.
 const BLAZE_DENY: On = {
     let mut bits = On::EMPTY;
@@ -128,6 +161,8 @@ impl Target {
             "general" => return Some(BLAZE_GENERAL),
             "internal" => return Some(BLAZE_INTERNAL),
             "pedantic_perf" => return Some(BLAZE_PEDANTIC_PERF),
+            "edition" => return Some(BLAZE_EDITION),
+            "proc_macro" => return Some(BLAZE_PROC_MACRO),
             _ => {}
         }
         blaze::Lint::named(name).map(blaze::Lint::bit)
@@ -151,9 +186,9 @@ impl Target {
 #[derive(Clone, Copy, Debug)]
 pub enum Lint<'a> {
     Clippy(&'a Info),
-    /// A lint of blaze's own: `warn` when it is general ([`blaze::Kind::General`]), `allow`
-    /// when it is blaze's internal one until a workspace turns it on (`deny` where `blaze::hot`
-    /// is).
+    /// A lint of blaze's own: `warn` when it is general ([`blaze::Kind::General`]) or an
+    /// edition lint whose advice is ready ([`blaze::Lint::warns_by_default`]), `allow` when it
+    /// is blaze's internal one until a workspace turns it on (`deny` where `blaze::hot` is).
     Blaze(blaze::Lint),
     /// The `warnings` group, which rustc asks for as a lint.
     Warnings,
@@ -178,7 +213,10 @@ impl Lint<'_> {
             Lint::Blaze(lint) if BLAZE_DENY.intersects(lint.bit()) => Level::Deny,
             Lint::Blaze(lint) => match lint.kind() {
                 blaze::Kind::General => Level::Warn,
-                blaze::Kind::Internal | blaze::Kind::PedanticPerf => Level::Allow,
+                blaze::Kind::Edition if lint.warns_by_default() => Level::Warn,
+                blaze::Kind::Internal | blaze::Kind::PedanticPerf | blaze::Kind::Edition => {
+                    Level::Allow
+                }
             },
             Lint::Warnings | Lint::Rustc(_) => Level::Warn,
         }
@@ -494,6 +532,50 @@ mod tests {
         assert_eq!(hot.of(Lint::Blaze(blaze::Lint::HotClone), &[cold]).level, Level::Deny);
         assert_eq!(Target::of("blaze::no_such_lint"), None);
         assert_eq!(hot_alloc.name(), "blaze::hot_alloc");
+    }
+
+    /// An edition lint warns by default exactly when what its help names is in this blaze, the
+    /// group turns every one on, and `blaze::proc_macro` is the three macro lints.
+    #[test]
+    fn edition_lints_wait_for_what_they_advise() {
+        use blaze_diagnostics::lints::registry::ready;
+        let none = Levels::new(&CommandLine::default());
+        let of = |levels: &Levels, lint| levels.of(Lint::Blaze(lint), &[]).level;
+        assert_eq!(of(&none, blaze::Lint::ProcMacroFnLike), Level::Warn, "`const fn` exists");
+        let reflection = ready::level(ready::REFLECTION_REPLACES_MACROS);
+        assert_eq!(of(&none, blaze::Lint::ProcMacroDerive), reflection);
+        assert_eq!(of(&none, blaze::Lint::ProcMacroAttribute), reflection);
+        assert_eq!(
+            of(&none, blaze::Lint::BuildScriptAmbient),
+            ready::level(ready::CAPABILITIES_FOR_BUILD_SCRIPTS)
+        );
+        let edition = Levels::new(&CommandLine::parse(&args("--warn=blaze::edition")).unwrap());
+        for &lint in blaze::Lint::ALL {
+            if lint.kind() == blaze::Kind::Edition {
+                assert_eq!(of(&edition, lint), Level::Warn, "{}", lint.name());
+            }
+        }
+        assert_eq!(of(&edition, blaze::Lint::HotAlloc), Level::Allow);
+        let macros = Levels::new(&CommandLine::parse(&args("--deny=blaze::proc_macro")).unwrap());
+        assert_eq!(of(&macros, blaze::Lint::ProcMacroDerive), Level::Deny);
+        assert_eq!(of(&macros, blaze::Lint::ProcMacroAttribute), Level::Deny);
+        assert_eq!(of(&macros, blaze::Lint::ProcMacroFnLike), Level::Deny);
+        assert_eq!(
+            of(&macros, blaze::Lint::BuildScriptAmbient),
+            ready::level(ready::CAPABILITIES_FOR_BUILD_SCRIPTS),
+            "a build script is no macro"
+        );
+        let off = Levels::new(&CommandLine::parse(&args("--allow=blaze::proc_macro")).unwrap());
+        assert_eq!(of(&off, blaze::Lint::ProcMacroFnLike), Level::Allow);
+        // `std_use` is never on by default, whatever its switch says: a crate asks for it
+        // (`#![blaze::capabilities]`), a workspace's `lints-when-ready` table does.
+        assert_eq!(of(&none, blaze::Lint::StdUse), Level::Allow);
+        assert!(!blaze::Lint::StdUse.warns_by_default());
+        let asked = Levels::new(&CommandLine::parse(&args("--warn=blaze::std_use")).unwrap());
+        assert_eq!(of(&asked, blaze::Lint::StdUse), Level::Warn);
+        assert_eq!(of(&asked, blaze::Lint::BuildScriptAmbient), of(&none, blaze::Lint::BuildScriptAmbient));
+        assert_eq!(capabilities_asks_for(), blaze::Lint::StdUse);
+        assert_eq!(Target::blaze(CAPABILITIES), None, "an attribute, not a lint's or a group's name");
     }
 
     #[test]

@@ -328,7 +328,11 @@ pub(crate) enum Told {
 /// not `path` (a test's program linked in its unit's directory and run from the profile's
 /// `deps`, cargo's new layout; a binary's `target/debug/foo` of `deps/foo-0123`): the program
 /// is held under both, so a run of either finds the memory this link committed into. Gives
-/// the file's bytes, for the store, and what the runs were told.
+/// what the commit changed of the file ([`blaze_link::Patch`]: the ranges it wrote into the
+/// memory, and the file's identity before and after), for the store, and what the runs were
+/// told. The file's bytes are never copied out of the memory here: the store keeps the file
+/// as the one before it with those ranges written, and where it cannot, the caller reads the
+/// whole file from the image (`codegen`'s `Filed::written`).
 #[expect(
     clippy::too_many_arguments,
     reason = "the link's image, its program and where it runs from, each its own"
@@ -342,11 +346,24 @@ pub(crate) fn commit(
     staged: Staged,
     cells: u64,
     refused: Option<&str>,
-) -> Result<(Vec<u8>, Told), String> {
-    let span = tracing::info_span!(target: "blaze", "dev run commit", path, generation = staged.generation(), full = staged.full())
-        .entered();
+) -> Result<(blaze_link::Patch, Told), String> {
+    let span = tracing::info_span!(
+        target: "blaze",
+        "dev run commit",
+        path,
+        generation = staged.generation(),
+        full = staged.full(),
+        written = tracing::field::Empty,
+        ranges = tracing::field::Empty,
+    )
+    .entered();
+    let wrote = |patch: &blaze_link::Patch| {
+        span.record("written", patch.written());
+        span.record("ranges", patch.writes.len());
+    };
     if let Some(loaded) = kept.as_ref().filter(|_| !staged.full()) {
-        let (bytes, told) = loaded.patch(image, staged, refused)?;
+        let (patch, told) = loaded.patch(image, staged, refused)?;
+        wrote(&patch);
         // A patch keeps the memory: every path it runs from names it still (and one a link
         // before this registered under no copy now does). A program it replaced there is one
         // adopted from a record since ([`DevRuns::adopt`]): its runs start again.
@@ -360,11 +377,12 @@ pub(crate) fn commit(
             (Told::Nothing, held) => held,
             (told, _) => told,
         };
-        return Ok((bytes, told));
+        return Ok((patch, told));
     }
     let host = runs.host()?;
     let name = path.rsplit('/').next().unwrap_or(path);
-    let (loaded, bytes) = load(&host, name, image, staged, cells)?;
+    let (loaded, patch) = load(&host, name, image, staged, cells)?;
+    wrote(&patch);
     let loaded = Arc::new(loaded);
     *kept = Some(loaded.clone());
     let replaced = hold(runs, path, runs_from, &loaded);
@@ -373,7 +391,7 @@ pub(crate) fn commit(
         format!("{path} was linked again from scratch: its code is laid out anew")
     });
     drop(span);
-    Ok((bytes, told))
+    Ok((patch, told))
 }
 
 /// Each of `replaced` that a run still maps told to start again, for `why`; what the runs were
@@ -453,7 +471,8 @@ pub(crate) struct Loaded {
 
 /// `staged`, a link of `image` laid out whole (linked with [`dev_run`]'s reservations),
 /// committed into a new code memory named `name` and laid out for this host's start hook; with
-/// the file's bytes, which go to the store as a written file's would. `cells` is
+/// what the commit wrote of the file (a full patch: every byte of it that is not zero), which
+/// goes to the store as a written file's would. `cells` is
 /// [`dev_run`]'s for the same link. A later full link of the image commits a message that
 /// tells the runs of its old memory to start again; it is the caller's to send them
 /// ([`Loaded::restart`]), so it is not kept here.
@@ -463,7 +482,7 @@ pub(crate) fn load(
     image: &mut Image,
     staged: Staged,
     cells: u64,
-) -> Result<(Loaded, Vec<u8>), String> {
+) -> Result<(Loaded, blaze_link::Patch), String> {
     let format =
         Format::host().ok_or("blaze runs no process in its code memory on this platform")?;
     let len = staged.len();
@@ -475,15 +494,15 @@ pub(crate) fn load(
     let generation = staged.generation();
     let mut memory =
         CodeMemory::with_cells(name, IMAGE, ARENA, cells).map_err(|it| it.to_string())?;
-    image
-        .commit_into(staged, &mut memory)
+    // The image's first commit into this memory: no program runs it yet, so its message is
+    // nobody's.
+    let (patch, _) = image
+        .commit_into_patch(staged, &mut memory)
         .map_err(|it| format!("committing `{name}` into its code memory: {it}"))?;
     memory.lay_out(format).map_err(|it| format!("laying `{name}`'s code memory out: {it}"))?;
-    // alloc: once per dev executable linked, the bytes the store keeps.
-    let bytes = memory.bytes(CodeRange { offset: 0, len }).map_err(|it| it.to_string())?.to_vec();
     let file = host::Image { key: file_key(name, image)?.0.0, len, store: None };
     let loaded = held(host, name, memory, file, generation, image.lineage())?;
-    Ok((loaded, bytes))
+    Ok((loaded, patch))
 }
 
 /// `bytes`, a dev executable's file as a link made it and a record kept it, the output the
@@ -565,7 +584,8 @@ struct Served {
 
 impl Loaded {
     /// `staged`, a later link of `image`, committed into the memory the runs map, and announced
-    /// to them; with the file's bytes for the store. A patch of a memory written out since is
+    /// to them; with what it changed of the file, for the store ([`blaze_link::Patch`]: the
+    /// ranges written, never the file's bytes read back out of the memory). A patch of a memory written out since is
     /// refused when the next run's executable is written ([`Host::write_executable`]), never a
     /// file that differs from the memory.
     ///
@@ -583,7 +603,7 @@ impl Loaded {
         image: &mut Image,
         staged: Staged,
         refused: Option<&str>,
-    ) -> Result<(Vec<u8>, Told), String> {
+    ) -> Result<(blaze_link::Patch, Told), String> {
         let name = &self.name;
         let format =
             Format::host().ok_or("blaze runs no process in its code memory on this platform")?;
@@ -594,8 +614,8 @@ impl Loaded {
             ));
         }
         let mut memory = lock(self.program.memory());
-        let message = image
-            .commit_into(staged, &mut memory)
+        let (filed, message) = image
+            .commit_into_patch(staged, &mut memory)
             .map_err(|it| format!("committing a patch of `{name}` into its code memory: {it}"))?;
         let generation = image.generation();
         let message = match (message, refused) {
@@ -614,9 +634,6 @@ impl Loaded {
         memory
             .lay_out(format)
             .map_err(|it| format!("laying `{name}`'s code memory out after a patch: {it}"))?;
-        // alloc: once per patch, the bytes the store keeps.
-        let bytes =
-            memory.bytes(CodeRange { offset: 0, len }).map_err(|it| it.to_string())?.to_vec();
         let file = host::Image { key: file_key(name, image)?.0.0, len, store: None };
         self.program.relaid(&memory, file).map_err(|it| format!("`{name}`: {it}"))?;
         let told = match &message {
@@ -639,7 +656,7 @@ impl Loaded {
             *lock(&self.patch) = Patch { generation, message: Some(Arc::from(message)) };
             memory.announce(generation);
         }
-        Ok((bytes, told))
+        Ok((filed, told))
     }
 
     /// Whether a run `blaze run` launched still maps the memory.

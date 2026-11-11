@@ -17,6 +17,12 @@ pub(super) const PATTERN_FIRST: TokenSet =
 
 const PAT_TOP_FIRST: TokenSet = PATTERN_FIRST.union(TokenSet::new(&[T![|]]));
 
+/// Whether the parser is at a record pattern `{ a, b: x, .. }` (`#![blaze::records]`), which
+/// [`PATTERN_FIRST`] cannot say: a `{` starts a pattern only under the extension.
+pub(super) fn at_record_pat(p: &Parser<'_>) -> bool {
+    p.at(T!['{']) && p.records_gate()
+}
+
 /// Set of possible tokens at the start of a range pattern's end bound.
 const RANGE_PAT_END_FIRST: TokenSet =
     expressions::LITERAL_FIRST.union(paths::PATH_FIRST).union(TokenSet::new(&[T![-], T![const]]));
@@ -322,6 +328,15 @@ fn atom_pat(p: &mut Parser<'_>, recovery_set: TokenSet) -> Option<CompletedMarke
 
         T![_] => wildcard_pat(p),
         T![&] => ref_pat(p),
+        // blaze, under `#![blaze::records]`: `fn f() { let { a, b: x, .. } = r; }`
+        //
+        // A record pattern: a struct pattern's field list with no path before it. No pattern of
+        // Rust's starts with a `{`.
+        T!['{'] if p.records_gate() => {
+            let m = p.start();
+            record_pat_field_list(p);
+            m.complete(p, RECORD_PAT)
+        }
         T!['('] => tuple_pat(p),
         T!['['] => slice_pat(p),
         T![!] => not_null_pat(p),
@@ -570,7 +585,7 @@ fn tuple_pat(p: &mut Parser<'_>) -> CompletedMarker {
 
     while !p.at(EOF) && !p.at(T![')']) {
         has_pat = true;
-        if !p.at_ts(PAT_TOP_FIRST) {
+        if !p.at_ts(PAT_TOP_FIRST) && !at_record_pat(p) {
             p.error("expected a pattern");
             break;
         }
@@ -604,7 +619,7 @@ fn pat_list(p: &mut Parser<'_>, ket: SyntaxKind) {
     while !p.at(EOF) && !p.at(ket) {
         pattern_top_guard(p);
         if !p.eat(T![,]) {
-            if p.at_ts(PAT_TOP_FIRST) {
+            if p.at_ts(PAT_TOP_FIRST) || at_record_pat(p) {
                 // alloc: error path only, the message names the token found
                 p.error(format!("expected {:?}, got {:?}", T![,], p.current()));
             } else {

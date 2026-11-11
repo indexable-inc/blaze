@@ -90,12 +90,12 @@ pub fn utf8(path: &Path) -> Result<String, String> {
 
 /// Reads `path` onto `files` unless it is not there; a file already among them is not read
 /// again.
-fn add(files: &mut Vec<(String, Vec<u8>)>, path: PathBuf) -> Result<(), String> {
+fn add(files: &mut Vec<(String, Vec<u8>)>, path: &Path) -> Result<(), String> {
     if files.iter().any(|(it, _)| Path::new(it) == path) {
         return Ok(());
     }
-    match std::fs::read(&path) {
-        Ok(bytes) => files.push((utf8(&path)?, bytes)),
+    match std::fs::read(path) {
+        Ok(bytes) => files.push((utf8(path)?, bytes)),
         Err(error)
             if matches!(
                 error.kind(),
@@ -118,13 +118,13 @@ pub fn config_files(
     for dir in place.cwd.ancestors().filter(|it| !it.starts_with(&place.root)) {
         let cargo = dir.join(".cargo");
         if std::fs::metadata(&cargo).is_ok_and(|it| it.is_dir()) {
-            add(&mut files, cargo.join("config"))?;
-            add(&mut files, cargo.join("config.toml"))?;
+            add(&mut files, &cargo.join("config"))?;
+            add(&mut files, &cargo.join("config.toml"))?;
         }
     }
     if let Some(home) = cargo_home.filter(|it| !it.starts_with(&place.root)) {
-        add(&mut files, home.join("config"))?;
-        add(&mut files, home.join("config.toml"))?;
+        add(&mut files, &home.join("config"))?;
+        add(&mut files, &home.join("config.toml"))?;
     }
     Ok(files)
 }
@@ -136,7 +136,7 @@ pub fn clippy_files(place: &Place) -> Result<Vec<(String, Vec<u8>)>, String> {
     let mut files = Vec::new();
     for dir in place.root.ancestors().skip(1) {
         for name in [".clippy.toml", "clippy.toml"] {
-            add(&mut files, dir.join(name))?;
+            add(&mut files, &dir.join(name))?;
         }
     }
     Ok(files)

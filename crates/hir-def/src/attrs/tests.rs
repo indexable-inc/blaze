@@ -241,6 +241,9 @@ fn old_match_attr_flags(
                             attr_flags.insert(AttrFlags::PURE_TRUSTED);
                         }
                     }
+                    "blaze" if &*second_segment == "differentiable" => {
+                        attr_flags.insert(AttrFlags::DIFFERENTIABLE)
+                    }
                     "blaze" if &*second_segment == "bits" => {
                         attr_flags.insert(AttrFlags::BLAZE_BITS)
                     }
@@ -254,6 +257,25 @@ fn old_match_attr_flags(
                         attr_flags.insert(AttrFlags::NONBLOCKING)
                     }
                     "blaze" if &*second_segment == "may" => attr_flags.insert(AttrFlags::MAY),
+                    "blaze" if &*second_segment == "multiversion" => {
+                        attr_flags.insert(AttrFlags::BLAZE_MULTIVERSION)
+                    "blaze" if &*second_segment == "drop" => {
+                        // The words of the list, as `tt_has_token` finds them.
+                        let text = tt.syntax().text().to_string();
+                        let has = |word: &str| {
+                            text.split(|c: char| !c.is_alphanumeric() && c != '_')
+                                .any(|it| it == word)
+                        };
+                        if has("early") {
+                            attr_flags.insert(AttrFlags::DROP_EARLY);
+                            if has("trusted") {
+                                attr_flags.insert(AttrFlags::DROP_TRUSTED);
+                            }
+                        }
+                        if has("scoped") {
+                            attr_flags.insert(AttrFlags::DROP_SCOPED);
+                        }
+                    }
                     _ => {}
                 },
             }
@@ -364,6 +386,7 @@ fn old_match_attr_flags(
                         "sans_io" => attr_flags.insert(AttrFlags::SANS_IO),
                         "checkfree" => attr_flags.insert(AttrFlags::CHECKFREE),
                         "pure" => attr_flags.insert(AttrFlags::PURE),
+                        "differentiable" => attr_flags.insert(AttrFlags::DIFFERENTIABLE),
                         "bits" => attr_flags.insert(AttrFlags::BLAZE_BITS),
                         "nopanic" => attr_flags.insert(AttrFlags::NOPANIC),
                         "noalloc" => attr_flags.insert(AttrFlags::NOALLOC),
@@ -380,6 +403,11 @@ fn old_match_attr_flags(
                         "consumes" => attr_flags.insert(AttrFlags::CONSUMES),
                         "reflect" => attr_flags.insert(AttrFlags::BLAZE_REFLECT),
                         "sealed" => attr_flags.insert(AttrFlags::BLAZE_SEALED),
+                        "multiversion" => attr_flags.insert(AttrFlags::BLAZE_MULTIVERSION),
+                        "acyclic" => attr_flags.insert(AttrFlags::BLAZE_ACYCLIC),
+                        "program_lifetime" => {
+                            attr_flags.insert(AttrFlags::BLAZE_PROGRAM_LIFETIME)
+                        }
                         _ => {}
                     },
                     _ => {}
@@ -757,6 +785,38 @@ fn gated_queries_read_what_the_source_says() {
             "{name}"
         );
     }
+}
+
+/// `#[blaze::multiversion]`'s levels as written, in order; no level for the bare word, and
+/// nothing without the attribute or under another tool's name (docs/v2/plan/design/simd.md).
+#[test]
+fn multiversion_levels_are_the_attributes_strings_in_order() {
+    let db = fixture::db(
+        r#"
+#[blaze::multiversion] pub fn a() {}
+#[blaze::multiversion("x86-64-v3", "avx512f,avx512vl")] pub fn b() {}
+#[cfg_attr(all(), blaze::multiversion("avx2",))] pub fn c() {}
+#[cfg_attr(any(), blaze::multiversion("avx2"))] pub fn d() {}
+#[rustfmt::multiversion("avx2")] pub fn e() {}
+#[blaze::multiversion(avx2)] pub fn f() {}
+pub fn plain() {}
+"#,
+    )
+    .into_db();
+    let functions = functions(&db);
+    let levels = |name: &str| {
+        let func = functions.iter().find(|(it, _)| it == name).unwrap_or_else(|| panic!("{name}"));
+        let levels = AttrFlags::multiversion_levels(&db, func.1)?;
+        Some(levels.iter().map(|it| it.as_str().to_owned()).collect::<Vec<_>>())
+    };
+    assert_eq!(levels("a"), Some(vec![]));
+    assert_eq!(levels("b"), Some(vec!["x86-64-v3".to_owned(), "avx512f,avx512vl".to_owned()]));
+    assert_eq!(levels("c"), Some(vec!["avx2".to_owned()]));
+    assert_eq!(levels("d"), None);
+    assert_eq!(levels("e"), None);
+    // No string literal: kept as its text, for the plan to refuse by name.
+    assert_eq!(levels("f"), Some(vec!["avx2".to_owned()]));
+    assert_eq!(levels("plain"), None);
 }
 
 #[test]
@@ -2318,4 +2378,25 @@ fn an_effect_attribute_changes_no_signature() {
         AttrFlags::query(&db, in_module("nothing").into()) - AttrFlags::MAY,
         AttrFlags::query(&db, plain.into())
     );
+}
+
+/// Every flag is one bit and no two flags share one. Lanes that each take "the next bit" on
+/// their own branch collide only when they merge (2026-11-10: three did), and two flags on
+/// one bit read as each other with no error anywhere; this fails the merge instead, naming
+/// both. A new flag takes a bit no flag of the block has.
+#[test]
+fn no_two_attr_flags_share_a_bit() {
+    let mut owner: [Option<&str>; 128] = [None; 128];
+    for (name, flag) in AttrFlags::all().iter_names() {
+        let bits = flag.bits();
+        assert_eq!(bits.count_ones(), 1, "`AttrFlags::{name}` is not one bit: {bits:#x}");
+        let bit = bits.trailing_zeros() as usize;
+        if let Some(other) = owner[bit] {
+            panic!("`AttrFlags::{name}` and `AttrFlags::{other}` are both bit {bit}");
+        }
+        owner[bit] = Some(name);
+    }
+    // The two this lane added keep the bits their commit says.
+    assert_eq!(AttrFlags::BLAZE_ACYCLIC.bits(), 1 << 125);
+    assert_eq!(AttrFlags::BLAZE_PROGRAM_LIFETIME.bits(), 1 << 126);
 }

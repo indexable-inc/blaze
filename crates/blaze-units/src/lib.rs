@@ -188,6 +188,11 @@ impl Filter {
     }
 }
 
+/// blaze's device target (stdlib/own_targets.json): what a dependency asked for with
+/// `artifact = "gpu"` is built for, by the front end alone, its `GPU_ENTRIES` lowered to MSL by
+/// blaze-shader (docs/future/gpu/shaders.md).
+pub const GPU_DEVICE: &str = "naga-unknown-unknown";
+
 /// A platform built for: its triple and what `rustc --print cfg` says of it.
 #[derive(Clone, Debug)]
 pub struct Platformed {
@@ -229,6 +234,9 @@ pub struct Request<'a> {
     /// The platform proc macros are built for to run as wasm modules (wasm32-wasip1), each
     /// with the normal dependencies it has; `None` builds them for the host, as cargo does.
     pub macro_wasm: Option<&'a Platformed>,
+    /// The device platform ([`GPU_DEVICE`]) that a dependency asked for with blaze's
+    /// `artifact = "gpu"` is built for, with what it depends on; `None` refuses such a dependency.
+    pub gpu: Option<&'a Platformed>,
     /// Whether the dev-dependencies were resolved ([`Filter::need_dev_deps`]).
     pub has_dev_units: bool,
 }

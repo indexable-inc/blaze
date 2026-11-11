@@ -309,6 +309,7 @@ impl File {
         let cut = fs::OpenOptions::new()
             .write(true)
             .open(&self.path)
+            // durable: the why ledger cut back to its last whole record: the cut is on disk before the next append
             .and_then(|it| it.set_len(len).and_then(|()| it.sync_all()));
         match cut {
             Ok(()) => {
@@ -345,8 +346,10 @@ impl File {
             .open(&gap)
             .and_then(|mut it| {
                 use std::io::Write as _;
+                // durable: the gap file says a build's record is missing from the ledger: it must survive a restart (rule 26)
                 write!(it, "{build}").and_then(|()| it.sync_all())
             })
+            // durable: the gap file's name survives a restart
             .and_then(|()| fs::File::open(&self.dir).and_then(|it| it.sync_all()));
         match marked {
             Ok(()) => (
@@ -458,8 +461,10 @@ impl File {
         if len == 0 {
             wrote = file.write_all(&magic);
         }
+        // durable: a build's record in the why ledger: `blaze why` after a crash answers from it
         let wrote = wrote.and_then(|()| file.write_all(record)).and_then(|()| file.sync_data());
         let wrote = match len {
+            // durable: the append made the ledger: its name survives a crash
             0 => wrote.and_then(|()| fs::File::open(&self.dir).and_then(|it| it.sync_all())),
             _ => wrote,
         };
@@ -467,6 +472,7 @@ impl File {
             let magic = if len == 0 { magic.len() as u64 } else { 0 };
             return Ok(len + magic + record.len() as u64);
         };
+        // durable: a failed append cut back: the ledger on disk ends at a whole record
         match file.set_len(len).and_then(|()| file.sync_data()) {
             Ok(()) => Err(format!("{}; cut back to its {len} bytes", fail("appending to", error))), // alloc: error path
             Err(cut) => Err(format!(
@@ -548,8 +554,10 @@ fn copy_aside(dir: &Path, kind: &str, bytes: &[u8]) -> Result<PathBuf, String> {
         .open(&to)
         .and_then(|mut it| {
             made = true;
+            // durable: a ledger's torn tail copied aside before the ledger is written over: the copy is the only one
             it.write_all(bytes).and_then(|()| it.sync_all())
         })
+        // durable: the copy's name survives a crash
         .and_then(|()| fs::File::open(dir).and_then(|it| it.sync_all()));
     if let Err(error) = copied {
         if made {
@@ -617,9 +625,11 @@ fn write_whole(dir: &Path, path: &Path, bytes: &[u8]) -> Result<(), Unwritten> {
         .map_err(step("making the hidden file"))
         .and_then(|mut file| {
             file.write_all(bytes).map_err(step("writing the hidden file"))?;
+            // durable: the whole ledger, on disk before the rename that replaces the old one
             file.sync_all().map_err(step("syncing the hidden file"))
         })
         .and_then(|()| fs::rename(&hidden, path).map_err(step("renaming the hidden file over it")))
+        // durable: the rename that replaces the ledger survives a crash
         .and_then(|()| fs::File::open(dir).and_then(|it| it.sync_all()).map_err(step(SYNC_DIR)));
     written.map_err(|(doing, error)| {
         _ = fs::remove_file(&hidden);
@@ -637,9 +647,11 @@ fn write_whole(dir: &Path, path: &Path, bytes: &[u8]) -> Result<(), Unwritten> {
 /// durable: the file synced, then `dir`. The failure names the file and the step.
 fn sync_held(dir: &Path, gap: &Path) -> Result<(), String> {
     fs::File::open(gap)
+        // durable: a gap file an earlier process made and may not have synced
         .and_then(|it| it.sync_all())
         .map_err(|error| format!("syncing the gap file {} already there: {error}", gap.display())) // alloc: error path
         .and_then(|()| {
+            // durable: the gap file's name survives a restart
             fs::File::open(dir).and_then(|it| it.sync_all()).map_err(|error| {
                 format!(
                     "syncing {}, the directory of the gap file {} already there: {error}",

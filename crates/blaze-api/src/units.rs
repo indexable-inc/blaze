@@ -304,6 +304,7 @@ fn private_write(path: &Path, text: &str) -> std::io::Result<()> {
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     let written = options.open(&temporary).and_then(|mut file| {
         file.write_all(text.as_bytes())?;
+        // durable: a service unit installed for the user: the system's service manager reads it after a reboot
         file.sync_all()
     });
     match written.and_then(|()| std::fs::rename(&temporary, path)) {

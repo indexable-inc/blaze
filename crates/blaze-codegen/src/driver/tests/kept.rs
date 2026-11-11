@@ -43,9 +43,15 @@ enum Edit {
     DynFact,
     /// The recursion limit.
     Limit,
+    /// A function names a static it did not, or stops naming one it did.
+    StaticRef,
+    /// A static's value points to a function it did not, or stops pointing to one.
+    StaticCall,
+    /// The build's roots: whether static 1 is one, and which function the check walks from.
+    Roots,
 }
 
-const EDITS: [Edit; 8] = [
+const EDITS: [Edit; 11] = [
     Edit::Body,
     Edit::AddRef,
     Edit::RemoveRef,
@@ -54,6 +60,9 @@ const EDITS: [Edit; 8] = [
     Edit::Static,
     Edit::DynFact,
     Edit::Limit,
+    Edit::StaticRef,
+    Edit::StaticCall,
+    Edit::Roots,
 ];
 
 /// The safeguard a control takes away.
@@ -72,6 +81,8 @@ enum Plant {
     /// The driver leaves the places that named a changed function's old key
     /// ([`Build::without_renaming`]).
     Unrenamed,
+    /// A bug planted in the patch of the walk or of the lists ([`Planted`]).
+    Patch(Planted),
 }
 
 /// The program's functions, in order: a draw picks among them the same way every run.
@@ -183,6 +194,37 @@ fn apply(
             }
         }
         Edit::DynFact => set_fact(program, pick(a), pick(b)),
+        Edit::StaticRef => {
+            let mut statics: Vec<u32> = program.statics.keys().copied().collect();
+            statics.sort_unstable();
+            if !statics.is_empty() {
+                let (id, value) = (pick(a), statics[b as usize % statics.len()]);
+                let named = &mut program.functions.get_mut(&id).expect("picked among them").statics;
+                match named.iter().position(|it| *it == value) {
+                    Some(at) => {
+                        named.remove(at);
+                    }
+                    None => named.push(value),
+                }
+                program.touch(id);
+            }
+        }
+        Edit::StaticCall => {
+            let mut statics: Vec<u32> = program.statics.keys().copied().collect();
+            statics.sort_unstable();
+            if !statics.is_empty() {
+                let (value, callee) = (statics[a as usize % statics.len()], pick(b));
+                let calls = program.static_calls.entry(value).or_default();
+                match calls.iter().position(|it| *it == callee) {
+                    Some(at) => {
+                        calls.remove(at);
+                    }
+                    None => calls.push(callee),
+                }
+            }
+        }
+        // The roots are the run's: `first_difference` changes them.
+        Edit::Roots => {}
         Edit::Limit => {
             // The limit is every function's crate's: a durable input.
             program.engine.high += 1;
@@ -216,6 +258,7 @@ fn built(
         Some(Plant::Unasked) => build.trusting_kept(),
         Some(Plant::AnyShape) => build.patching_any_shape(),
         Some(Plant::Unrenamed) => build.without_renaming(),
+        Some(Plant::Patch(bug)) => build.planting(bug),
         _ => build,
     };
     build.run_with_statics(&[(1, member())], static_roots, &check, &store)
@@ -277,6 +320,8 @@ fn difference(
     same!(identities);
     same!(cold);
     same!(made);
+    same!(walked);
+    same!(entry);
     // The ID is of the lists alone: a build with nothing kept gives the same one.
     same!(id);
     same!(stats.instances);
@@ -307,12 +352,22 @@ fn first_difference(
 ) -> Option<String> {
     program.engine.misses_facts = plant == Some(Plant::DynFact);
     let kept = Kept::new();
-    let stays: Vec<u32> = [1].into_iter().chain(run.check).collect();
-    // The last build over kept describes that was not refused: the base of the next delta.
-    let mut base: Option<Built> = None;
+    let mut run = run;
+    // The functions that stay: `main`, and every function the check may walk from.
+    let mut stays: Vec<u32> = [1].into_iter().chain(run.check).collect();
+    // The last build over kept describes of each program (the roots it is built from) that
+    // was not refused: the base of that program's next delta. A refused build keeps
+    // nothing, so the build after it has no base.
+    let mut bases: Vec<((bool, Option<u32>), Option<Built>)> = Vec::new();
     for build in 0..=edits.len() {
         if let Some((edit, picks)) = build.checked_sub(1).map(|at| edits[at]) {
             apply(&mut program, edit, picks, &stays, plant);
+            if matches!(edit, Edit::Roots) {
+                let ids = ids(&program);
+                run.static_root = program.statics.contains_key(&1) && picks.0 % 2 == 0;
+                run.check = (picks.1 % 3 != 0).then(|| ids[picks.1 as usize % ids.len()]);
+                stays.extend(run.check);
+            }
         }
         program.begin_build();
         let over_kept = built(&program, run, Some(&kept), plant);
@@ -320,11 +375,79 @@ fn first_difference(
         if let Some(what) = difference(&over_kept, &fresh) {
             return Some(format!("build {build}: {what}"));
         }
-        if let Ok(now) = over_kept {
-            if let Some(what) = delta_differs(base.as_ref(), &now) {
-                return Some(format!("build {build}: {what}"));
+        let of = (run.static_root, run.check);
+        let at = match bases.iter().position(|it| it.0 == of) {
+            Some(at) => at,
+            None => {
+                bases.push((of, None));
+                bases.len() - 1
             }
-            base = Some(now);
+        };
+        match over_kept {
+            Ok(now) => {
+                let base = bases[at].1.as_ref();
+                if let Some(what) = delta_differs(base, &now).or_else(|| unapplied(base, &now)) {
+                    return Some(format!("build {build}: {what}"));
+                }
+                bases[at].1 = Some(now);
+            }
+            Err(_) => bases[at].1 = None,
+        }
+    }
+    None
+}
+
+/// The oracle of a delta's use: `base`'s lists with `now.delta` applied are `now`'s. The
+/// keys of `base` without those removed and with those added are `now`'s keys, and every
+/// function and static the delta does not name is in `now` what it is in `base`: the same
+/// compiled function, the same definition.
+fn unapplied(base: Option<&Built>, now: &Built) -> Option<String> {
+    let base = base?;
+    let delta = &now.delta;
+    let mut keys: Vec<InstanceKey> = (base.inputs.iter().map(|it| it.0))
+        .filter(|key| !delta.functions.removed.contains(key))
+        .chain(delta.functions.added.iter().copied())
+        .collect();
+    keys.sort_unstable();
+    let now_keys: Vec<InstanceKey> = now.inputs.iter().map(|it| it.0).collect();
+    if keys != now_keys {
+        return Some(format!(
+            "the base's functions with the delta applied are {keys:?}, the build's {now_keys:?}"
+        ));
+    }
+    let named = |key: &InstanceKey| {
+        delta.functions.added.contains(key) || delta.functions.changed.contains(key)
+    };
+    for function in now.functions.iter().filter(|it| !named(&it.key)) {
+        let was = base.functions.iter().find(|it| it.key == function.key);
+        if was != Some(function) {
+            return Some(format!(
+                "the delta names no change of {:?}, whose function was {was:?} and is {function:?}",
+                function.key
+            ));
+        }
+    }
+    let mut ids: Vec<StaticId> = (base.static_owners.iter().map(|it| (it.0, it.1)))
+        .filter(|id| !delta.statics.removed.contains(id))
+        .chain(delta.statics.added.iter().copied())
+        .collect();
+    ids.sort_unstable();
+    let mut now_ids: Vec<StaticId> = now.static_owners.iter().map(|it| (it.0, it.1)).collect();
+    now_ids.sort_unstable();
+    if ids != now_ids {
+        return Some(format!(
+            "the base's statics with the delta applied are {ids:?}, the build's {now_ids:?}"
+        ));
+    }
+    let named =
+        |id: &StaticId| delta.statics.added.contains(id) || delta.statics.changed.contains(id);
+    for value in now.statics.iter().filter(|it| !named(&(it.item, it.instance))) {
+        let was = (base.statics.iter()).find(|it| (it.item, it.instance) == (value.item, value.instance));
+        if was != Some(value) {
+            return Some(format!(
+                "the delta names no change of static {:?}, which was {was:?} and is {value:?}",
+                (value.item, value.instance)
+            ));
         }
     }
     None
@@ -412,6 +535,11 @@ fn drawn(tc: &hegel::TestCase) -> (Program, Run) {
                 // A dependency's function reads library inputs alone.
                 program.engine.durable.insert(id);
             }
+            // A member's function whose inputs are one crate's sources: asked again only
+            // when one of them is written.
+            4 => {
+                program.engine.groups.insert(id, u64::from(id % 2));
+            }
             _ => {}
         }
     }
@@ -436,11 +564,12 @@ fn drawn(tc: &hegel::TestCase) -> (Program, Run) {
 }
 
 /// The refinement: for any program and any sequence of edits (a body, a reference added or
-/// removed, a function added or removed, a static's value, a dyn fact, the recursion limit),
-/// the build whose walk takes the describes kept by the builds before it is, after every
-/// edit, the build of a walk that keeps none: the same functions and statics, the same code
-/// and places, symbols, slots, owners, dedupe and reach, and the same errors where it is
-/// refused.
+/// removed, a function added or removed, a static's value, a static named or pointing
+/// elsewhere, a dyn fact, the recursion limit, the build's roots), the build that patches the
+/// walk and the lists the builds before it kept is, after every edit, the build of a walk
+/// that keeps none: every list of the `Built` and its ID are the same, and the same errors
+/// where it is refused; its delta names exactly what changed since the last build of the
+/// same roots, and that build's lists with the delta applied are its own.
 #[hegel::test(test_cases = 64)]
 fn a_walk_over_kept_describes_builds_what_a_fresh_walk_builds(tc: hegel::TestCase) {
     use hegel::generators as gs;
@@ -566,11 +695,11 @@ fn an_edit_of_one_leaf_describes_it_alone() {
     program.functions.get_mut(&(COUNT as u32)).expect("the last leaf").calls.push(COUNT as u32 + 1);
     program.touch(COUNT as u32);
     let (grown, asked) = walk(&program);
-    // The patch asked of every function, found the leaf's shape another and gave way to the
-    // whole walk, which took the leaf's new describe as kept and described the new function.
-    assert!(grown.whole.is_some());
-    assert_eq!((grown.described, grown.verified, grown.reached), (1, COUNT, COUNT + 1));
-    assert_eq!(asked, (2, 2 * COUNT - 1));
+    // The patch asked of every function, set the leaf's edges again and described the one
+    // function that entered.
+    assert_eq!(grown.whole, None);
+    assert_eq!((grown.described, grown.verified, grown.reached), (2, COUNT - 1, COUNT + 1));
+    assert_eq!(asked, (2, COUNT - 1));
 }
 
 /// A build given nothing to keep describes in describes everything and says so.
@@ -658,7 +787,7 @@ fn the_oracle_catches_a_caller_that_names_a_changed_callees_old_key() {
 /// The patched walk's work is the edit's: of 10,000 functions of which all but the last
 /// three are durable, an edit of the last leaf's body asks the front end of those three,
 /// describes one, and touches it and the one function that calls it. An edit that adds a
-/// call changes a function's shape: the walk runs whole and says why.
+/// call to a function already reached is patched too.
 #[test]
 fn a_leaf_edit_among_ten_thousand_functions_touches_the_leaf_and_its_caller() {
     const COUNT: u32 = 10_000;
@@ -697,8 +826,236 @@ fn a_leaf_edit_among_ten_thousand_functions_touches_the_leaf_and_its_caller() {
     program.functions.get_mut(&COUNT).expect("the last leaf").calls.push(COUNT - 1);
     program.touch(COUNT);
     let (grown, _) = walk(&program);
-    assert_eq!(
-        grown.walk.whole,
-        Some("a changed function refers to other things or is another's")
-    );
+    assert_eq!(grown.walk.whole, None, "patched");
+    assert_eq!(grown.walk.reached, COUNT as usize);
+}
+
+/// What one build did, by pass ([`Work`]), without what is linear by design: the rows copied
+/// into the `Built`'s contiguous lists. The bytes hashed are held to a bound of their own,
+/// as a keyed set's path grows with the logarithm of the set.
+fn counted_work(built: &Built) -> Work {
+    assert!(built.work.patched, "the lists were patched: {:?}", built.walk.whole);
+    assert_eq!(built.work.copied, built.inputs.len() + built.static_owners.len());
+    assert!(built.work.hashed <= 64 * 1024, "{} bytes hashed", built.work.hashed);
+    Work { copied: 0, hashed: 0, ..built.work }
+}
+
+/// The work of three edits of a tree of `count` functions, each under a name of its own (so
+/// dedupe merges none), all durable but the last three, which are asked each build, and
+/// the last one's caller, which hangs on a group of inputs: a leaf's body; a call added from
+/// the last leaf to a function already reached; the last leaf removed.
+fn work_of_three_edits(count: u32) -> [Work; 3] {
+    let mut program = tree(count);
+    for id in 2..=count {
+        program.functions.get_mut(&id).expect("of the tree").symbol = Some(format!("f{id}"));
+    }
+    let caller = count / 2;
+    program.engine.durable.extend((1..=count - 3).filter(|id| *id != caller));
+    program.engine.groups.insert(caller, 7);
+    let kept = Kept::new();
+    let build = |program: &Program| {
+        program.begin_build();
+        built(program, WHOLE, Some(&kept), None).unwrap_or_else(|e| panic!("{e:?}"))
+    };
+    assert!(build(&program).walk.whole.is_some());
+
+    program.functions.get_mut(&count).expect("the last leaf").body = 0x12;
+    program.touch(count);
+    let body = build(&program);
+    assert_eq!(body.delta.functions.added.len(), 1);
+
+    program.functions.get_mut(&count).expect("the last leaf").calls.push(count - 1);
+    program.touch(count);
+    let edge = build(&program);
+    assert_eq!(edge.walk.reached, count as usize);
+
+    program.functions.remove(&count);
+    program.functions.get_mut(&caller).expect("its caller").calls.retain(|it| *it != count);
+    program.touch(caller);
+    let removed = build(&program);
+    assert_eq!(removed.walk.reached, count as usize - 1);
+    // The leaf, and its caller's old key: the caller's code names what it calls.
+    assert_eq!(removed.delta.functions.removed.len(), 2);
+    assert_eq!(removed.delta.functions.added.len(), 1);
+    [counted_work(&body), counted_work(&edge), counted_work(&removed)]
+}
+
+/// The invariant: the work of every pass of a build after an edit is the edit's, not the
+/// program's. A leaf's body edit, a call added to a function already reached and a function
+/// removed each count the same work in a program of 100 functions and in one of 10,000, pass
+/// by pass, and each count is a constant and what the edit changed.
+#[test]
+fn the_work_of_an_edit_is_the_same_among_a_hundred_functions_and_ten_thousand() {
+    let (small, large) = (work_of_three_edits(100), work_of_three_edits(10_000));
+    assert_eq!(small, large, "the counts do not grow with the program");
+    for (edit, work) in ["a body", "an added call", "a removed function"].iter().zip(&large) {
+        // Asked: the three functions asked each build and the one of the group written.
+        assert!(work.asked <= 4 && work.groups == 1, "{edit}: {work:?}");
+        assert!(work.described <= 2 && work.graph <= 2 && work.claims == 0, "{edit}: {work:?}");
+        // The changed function and the functions that refer to it or to what it refers to.
+        for count in [work.classified, work.resolved, work.built_in, work.owners] {
+            assert!(count <= 4, "{edit}: {work:?}");
+        }
+        for count in [work.lookups, work.versions, work.deduped, work.reach, work.replaced] {
+            assert!(count <= 4, "{edit}: {work:?}");
+        }
+    }
+    // A body edit: the leaf under its new key and its caller, whose place names it.
+    assert_eq!((large[0].lookups, large[0].replaced), (2, 3));
+    // A function removed: its row and its caller's old one go, and its caller under its
+    // new key and the function that calls that one are made again.
+    assert_eq!((large[2].lookups, large[2].replaced), (2, 4));
+}
+
+/// The control of [`the_work_of_an_edit_is_the_same_among_a_hundred_functions_and_ten_thousand`]:
+/// a build that dedupes whole after an edit hashes every function, and the count says so. Two leaves of one code are one class; an edit of one's
+/// body changes the class, so dedupe runs over all 100 functions as made.
+#[test]
+fn the_oracle_catches_a_pass_that_runs_whole() {
+    let mut program = tree(100);
+    // Every function but the two last leaves under a name of its own: those two are equal.
+    for id in 2..=98 {
+        program.functions.get_mut(&id).expect("of the tree").symbol = Some(format!("f{id}"));
+    }
+    let kept = Kept::new();
+    let build = |program: &Program| {
+        program.begin_build();
+        built(program, WHOLE, Some(&kept), None).unwrap_or_else(|e| panic!("{e:?}"))
+    };
+    let first = build(&program);
+    assert_eq!(first.deduped.merged.len(), 1, "the two leaves are one function");
+    program.functions.get_mut(&100).expect("the last leaf").body = 0x12;
+    program.touch(100);
+    let edited = build(&program);
+    assert!(edited.work.patched);
+    assert!(edited.deduped.merged.is_empty());
+    assert_eq!(edited.work.deduped, 100, "dedupe ran over every function");
+}
+
+/// Builds `program`, changes it by `edit`, and builds again over what the first build kept
+/// with `plant`: the first difference from a fresh build of the changed program.
+fn difference_after(
+    mut program: Program,
+    edit: impl Fn(&mut Program),
+    plant: Option<Plant>,
+) -> Option<String> {
+    let kept = Kept::new();
+    program.begin_build();
+    built(&program, WHOLE, Some(&kept), None).unwrap_or_else(|e| panic!("{e:?}"));
+    edit(&mut program);
+    program.begin_build();
+    let over_kept = built(&program, WHOLE, Some(&kept), plant);
+    difference(&over_kept, &built(&program.copy(), WHOLE, None, None))
+}
+
+/// The control of the lists' rows: an edit of 4's body gives it a new key, which the
+/// function made of 2's template must name. A build that keeps the function 2 was made of
+/// gives the linker a call of a function it no longer holds; the oracle says so.
+#[test]
+fn the_oracle_catches_a_kept_template_used_after_its_callees_key_changed() {
+    let edits = [(Edit::Body, (3, 0))];
+    let plant = Some(Plant::Patch(Planted::KeptTemplates));
+    assert_eq!(first_difference(program(), WHOLE, &edits, None), None);
+    let found = first_difference(program(), WHOLE, &edits, plant)
+        .expect("the planted bug was not found");
+    assert!(found.starts_with("build 1: "), "{found}");
+}
+
+/// The control of the delta: an edit of 4's body takes its old key out of the build. A delta
+/// that names no removed function leaves it in the state of whoever applies it; the oracle
+/// says so.
+#[test]
+fn the_oracle_catches_a_delta_that_omits_a_removed_function() {
+    let edits = [(Edit::Body, (3, 0))];
+    let plant = Some(Plant::Patch(Planted::DeltaOmitsRemoved));
+    let found = first_difference(program(), WHOLE, &edits, plant)
+        .expect("the planted bug was not found");
+    assert!(found.starts_with("build 1: the delta is"), "{found}");
+}
+
+/// The control of a row's owner: a leaf's owner changes and nothing else of it. A build that
+/// keeps the owner its row had gives the dependency image's split the old one; the oracle
+/// says so.
+#[test]
+fn the_oracle_catches_an_owner_kept_when_its_function_changed() {
+    let edit = |program: &mut Program| {
+        program.functions.get_mut(&5).expect("a leaf").owner = Owner::Dependency;
+        program.touch(5);
+    };
+    assert_eq!(difference_after(program(), edit, None), None);
+    let found = difference_after(program(), edit, Some(Plant::Patch(Planted::KeptOwner)))
+        .expect("the planted bug was not found");
+    assert!(found.starts_with("`owners` differs"), "{found}");
+}
+
+/// A program whose two leaves are one code, so dedupe merges them, and then their callers.
+fn merged() -> Program {
+    let mut program = program();
+    program.functions.get_mut(&5).expect("a leaf").body = 0x44;
+    program
+}
+
+/// The control of dedupe's classes: 4 and 5 are one function until 5's body is edited. A
+/// build that leaves the classes as they were when a member's code changed still says 5 was
+/// merged; the oracle says so.
+#[test]
+fn the_oracle_catches_a_dedupe_class_not_split_when_a_members_code_changed() {
+    let edits = [(Edit::Body, (4, 0))];
+    let plant = Some(Plant::Patch(Planted::UnsplitClass));
+    assert_eq!(first_difference(merged(), WHOLE, &edits, None), None);
+    let found =
+        first_difference(merged(), WHOLE, &edits, plant).expect("the planted bug was not found");
+    assert!(found.starts_with("build 1: "), "{found}");
+}
+
+/// The control of the recursion limit: 2, 4 and 5 are instances of one body, under a limit of
+/// one repeat. `main` reaches 4 through 2 and 5 through 3, each within the limit; a call
+/// from 4 to 5 claims 5 on the path through 2 and 4, past it. A patch that runs no check
+/// after the added edge builds what the whole walk refuses; the oracle says so.
+#[test]
+fn the_oracle_catches_a_recursion_claim_not_run_after_an_added_edge() {
+    let limited = || {
+        let mut program = program();
+        for id in [2, 4, 5] {
+            program.bodies.insert(id, (7, false));
+        }
+        program.recursion_limit = Some(1);
+        program
+    };
+    // `Edit::AddRef`: the fourth function calls the fifth.
+    let edits = [(Edit::AddRef, (3, 4))];
+    let plant = Some(Plant::Patch(Planted::SkippedClaims));
+    assert_eq!(first_difference(limited(), WHOLE, &edits, None), None);
+    let found =
+        first_difference(limited(), WHOLE, &edits, plant).expect("the planted bug was not found");
+    assert!(found.starts_with("build 1: built over kept describes, refused fresh"), "{found}");
+}
+
+/// A function added and a function removed are patched: the walk describes the one that
+/// entered and drops the one nothing reaches, and the delta names each.
+#[test]
+fn an_added_and_a_removed_function_are_patched() {
+    let mut program = program();
+    let kept = Kept::new();
+    let build = |program: &Program| {
+        program.begin_build();
+        built(program, WHOLE, Some(&kept), None).unwrap_or_else(|e| panic!("{e:?}"))
+    };
+    let first = build(&program);
+    program.function(6, 0x66, &[]);
+    program.touch(6);
+    program.functions.get_mut(&4).expect("a leaf").calls.push(6);
+    program.touch(4);
+    let grown = build(&program);
+    assert_eq!((grown.walk.whole, grown.walk.reached), (None, 6));
+    assert!(grown.delta.functions.added.contains(&key_named(&grown, 6)));
+    assert_eq!(grown.delta.base, Some(first.id));
+    // `main` stops calling 3: 3 and 5, which nothing else reaches, leave.
+    program.functions.get_mut(&1).expect("main").calls.retain(|it| *it != 3);
+    program.touch(1);
+    let shrunk = build(&program);
+    assert_eq!((shrunk.walk.whole, shrunk.walk.reached), (None, 4));
+    let gone = [key_named(&grown, 3), key_named(&grown, 5)];
+    assert!(gone.iter().all(|key| shrunk.delta.functions.removed.contains(key)));
+    assert_eq!(shrunk.walk.dropped, shrunk.delta.functions.removed.len());
 }

@@ -121,6 +121,22 @@ From [docs/contributing.md#working-in-parallel](../../../docs/contributing.md#wo
   (`--cpu epyc-5`, `xeon-6` or `graviton-5`) with `--memory-commit`.
 - The central loop, run once by the main agent on the combined tree: `blaze check` then
   `blaze test`, keep-going (the default), every failure handed back with the tree, command and error.
+- Checking agents' work fast, per commit, without waiting for the build
+  ([docs/contributing.md#checking-a-change-fast](../../../docs/contributing.md#checking-a-change-fast)):
+  `blaze check $(uv run --frozen python harness/v2/changed.py '{"base": "<the commit before>", "print": "args"}') --lib --tests`
+  in the lane's VM, in parallel with the build. `changed.py` prints the packages the commit
+  touched and their dependents in the order to check; hand the first error back to the agent
+  that wrote the code. Never let thousands of lines pile up unchecked behind an hour-long build.
+- A lane script, a harness and your own loop check every command's exit status and stop at the
+  first failure (`set -euo pipefail`; `check=True`), unless the line says why not. A command
+  that does not exist (`blaze daemon stop`; it is `blaze stop`) exits 101 and a script that
+  goes on measures nothing true
+  ([docs/contributing.md#scripts-that-run-commands](../../../docs/contributing.md#scripts-that-run-commands)).
+- The gate holds the budget smoke's guards
+  ([docs/harness.md#the-smokes-guards](../../../docs/harness.md#the-smokes-guards)): run
+  `uv run --frozen python harness/v2/budgets.py '{"command": "smoke", "engine": {"kind": "v2", "blaze": "<built blaze>"}}'`
+  on the built blaze before landing anything that touches the daemon, the plane, the front end
+  or the store; a guard that fails is fixed, or recorded with its cause (`"record": true`).
 - Run harnesses with `RUST_BACKTRACE=0`.
 - Done: `blaze clean` in the worktree, `git worktree remove <dir>`, `ix rm <lane>`,
   `git branch -D <branch>` once merged.

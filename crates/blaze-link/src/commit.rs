@@ -296,9 +296,11 @@ impl Image {
         // checks it first ([`Image::verify`]) and links from scratch when it is not the
         // last link's.
         if full {
+            // durable: review: the linked file is derived, and synced when written whole so the name never outlives its bytes after a power loss; a patched file is not synced and its next patcher verifies it
             steps.step([Effect::Sync { file: owned(next), tag: tags.next() }]);
         }
         steps.step([Effect::Mode { file: owned(next), mode: 0o755, tag: tags.next() }]);
+        // durable: review: the linked file is derived data a build places again; its rename still waits for the directory's sync and can take `RenameUnsynced` once the tests of a link's steps follow
         steps.step([Effect::Rename { from: owned(next), to: owned(to), tag: tags.next() }]);
         Ok(steps)
     }

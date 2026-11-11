@@ -143,7 +143,7 @@ pub const LEAF_DOMAIN: &str = "blaze v2 behaviour identity leaf 1";
 /// reads (a data object's alignment; which words it relocates).
 pub const CODE_ID_DOMAIN: &str = "blaze v2 code id 5";
 /// The domain of the bodies inlined into another.
-pub const INLINED_DOMAIN: &str = "blaze v2 code identity inlined 2";
+pub const INLINED_DOMAIN: &str = "blaze v2 code identity inlined 3";
 /// The domain of the stable name that orders the members of one component.
 pub const NAME_DOMAIN: &str = "blaze v2 code identity name 1";
 

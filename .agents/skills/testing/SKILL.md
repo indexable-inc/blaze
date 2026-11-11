@@ -17,9 +17,13 @@ hold. Pin a load-bearing one with a test named for the property.
 
 Anything blaze persists (the daemon image, the store, the plane's history; what a persisted value
 is, is `outputs-are-records`) has a test that restores it and checks the result equals a fresh build
-byte for byte, and a budget for restart to first answer. A restore that silently starts empty is a
-failure the daemon reports, naming why. A format that is written while blaze runs and read after a
-crash also gets a DST (`dst-not-review`) that crashes it at every point and checks the restore.
+byte for byte, and a budget for restart to first answer. A file that another version of blaze can
+find (in the state directory, in a home, in `/tmp`) also has a test that a file of its previous
+layout is handled: refused by name with what to do, or read, or left alone under a name that carries
+its layout; docs/cargo.md, "Files that outlive a version", lists each with its test. A restore that
+silently starts empty is a failure the daemon reports, naming why. A format that is written while
+blaze runs and read after a crash also gets a DST (`dst-not-review`) that crashes it at every point
+and checks the restore.
 
 ## dst-not-review (rule 43)
 
@@ -254,6 +258,17 @@ The full DST for it draws records, flushes, merges, retires, pins, reads and res
 point, and checks: every row recorded and flushed appears exactly once; no file a live pin's
 generation lists is deleted; a reader opened after any crash sees only listed files; a restart
 reaches its first answer within its bound. Each row of the table is a planted bug it must catch.
+
+## Waits under the sandbox's filter
+
+Every wait that reaches the real kernel (a new system call, a new driver, a pool or loop that
+parks on one) gets one test that runs it in a process of its own under the build-script sandbox's
+seccomp filter, marked as the sandbox launcher marks one, with a bound: list the case and call
+`blaze_core::wait::filtered::{take_over, run}` (`crates/blaze-core/src/wait/filtered.rs`; its own
+tests cover every public wait of `blaze_core::wait`, blaze-graph's `pool.rs` the workers' park), and
+match on `Ended`, where a wait that does not end is `Ended::Hung` naming the case, never a hung
+test. Its control is the same case not marked, which has to fail naming `io_uring_setup`. Linux
+only: macOS's sandbox filters no system call by number and has one wait driver.
 
 ## Persisted state and causes
 

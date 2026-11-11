@@ -52,7 +52,7 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
     let store = Store::default();
     let lint = lint("blaze::const_impure").expect("blaze's lint");
     assert_eq!(lint.default_level, Level::Warn);
-    assert_eq!(blaze_lints().len(), 86);
+    assert_eq!(blaze_lints().len(), 99);
     assert!(!lint.is_externally_loaded);
     // The compiler's own and the release build's; blaze-lints loads every other.
     let built: Vec<&str> =
@@ -64,6 +64,21 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
     let general = group("blaze::general").expect("blaze's general group");
     let internal = group("blaze::internal").expect("blaze's internal group");
     let pedantic = group("blaze::pedantic_perf").expect("blaze's pedantic_perf group");
+    let edition = group("blaze::edition").expect("blaze's edition group");
+    // The edition lints whose advice this blaze already has warn by default (`ready`): a
+    // function-like proc macro's replacement, `const fn`, needs nothing new; the rest wait for
+    // their switch.
+    let warns = [
+        ("blaze::proc_macro_fn_like", true),
+        ("blaze::proc_macro_derive", ready::REFLECTION_REPLACES_MACROS),
+        ("blaze::proc_macro_attribute", ready::REFLECTION_REPLACES_MACROS),
+        ("blaze::build_script_ambient", ready::CAPABILITIES_FOR_BUILD_SCRIPTS),
+        // Never by default: a crate or a workspace's table asks for it.
+        ("blaze::std_use", false),
+    ];
+    for it in edition.lints.iter() {
+        assert!(warns.iter().any(|(name, _)| *name == it.name), "`{}` says when it warns", it.name);
+    }
     // `deny` by default: they fire only where the code asked for them (`#[blaze::checkfree]`,
     // `#[blaze::nopanic]`, `#[blaze::noalloc]`, `#[blaze::nonblocking]`, `#[blaze::pure]`, a
     // `#[blaze::may(..)]` or `#![blaze::effects]`).
@@ -74,26 +89,33 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
         "blaze::nonblocking",
         "blaze::pure",
         "blaze::undeclared_effect",
+        "blaze::program_lifetime",
     ];
     for it in &blaze_lints()[1..] {
         let in_ = |g: &Group| g.lints.iter().any(|m| m.name == it.name);
-        let (in_general, in_internal, in_pedantic) = (in_(general), in_(internal), in_(pedantic));
+        let (in_general, in_internal, in_pedantic, in_edition) =
+            (in_(general), in_(internal), in_(pedantic), in_(edition));
         assert_eq!(
-            usize::from(in_general) + usize::from(in_internal) + usize::from(in_pedantic),
+            usize::from(in_general)
+                + usize::from(in_internal)
+                + usize::from(in_pedantic)
+                + usize::from(in_edition),
+                + usize::from(in_(edition)),
             1,
-            "`{}` is general, internal or pedantic_perf, once",
+            "`{}` is general, internal, pedantic_perf or edition, once",
             it.name
         );
         let level = if deny.contains(&it.name) {
             Level::Deny
-        } else if in_general {
+        } else if in_general || warns.contains(&(it.name, true)) {
             Level::Warn
         } else {
             Level::Allow
         };
         assert_eq!(
             it.default_level, level,
-            "`{}`: a general lint warns, an internal or pedantic_perf one waits",
+            "`{}`: a general lint warns, an internal, pedantic_perf or edition one waits, but \
+             for an edition lint whose advice is ready",
             it.name
         );
     }
@@ -128,6 +150,54 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
     assert!(matches!(store.check("const_purity", Some(BLAZE_TOOL)), Checked::NoLint { .. }));
     assert_eq!(store.check("const_impure", Some("blazer")), Checked::NoTool);
     assert_eq!(store.group_of(lint), None);
+}
+
+/// The procedural-macro lints are one group inside `blaze::edition`, and the two that wait for
+/// compile-time reflection wait together: one switch turns both to `warn`.
+#[test]
+fn the_proc_macro_lints_are_a_group_of_the_edition_lints() {
+    let store = Store::default();
+    let macros = group("blaze::proc_macro").expect("blaze's proc_macro group");
+    let edition = group("blaze::edition").expect("blaze's edition group");
+    let names: Vec<&str> = macros.lints.iter().map(|it| it.name).collect();
+    assert_eq!(
+        names,
+        ["blaze::proc_macro_derive", "blaze::proc_macro_attribute", "blaze::proc_macro_fn_like"]
+    );
+    for it in macros.lints.iter() {
+        assert!(edition.lints.iter().any(|m| std::ptr::eq(*m, *it)), "{}", it.name);
+        assert!(it.is_externally_loaded, "{}: blaze-lints gives it", it.name);
+    }
+    assert_eq!(store.check("proc_macro", Some(BLAZE_TOOL)), Checked::Tool(&macros.lints, None));
+    let level = |name: &str| lint(name).expect("blaze's lint").default_level;
+    assert_eq!(level("blaze::proc_macro_fn_like"), Level::Warn);
+    assert_eq!(level("blaze::proc_macro_derive"), level("blaze::proc_macro_attribute"));
+    assert_eq!(
+        level("blaze::proc_macro_derive"),
+        ready::level(ready::REFLECTION_REPLACES_MACROS)
+    );
+    assert_eq!(
+        level("blaze::build_script_ambient"),
+        ready::level(ready::CAPABILITIES_FOR_BUILD_SCRIPTS)
+    );
+    assert_eq!(ready::level(true), Level::Warn);
+    assert_eq!(ready::level(false), Level::Allow);
+}
+
+/// `blaze::std_use` is `allow` by default whatever its switch says, and every switch is of a
+/// lint of the edition group: what a workspace's `lints-when-ready` table can name.
+#[test]
+fn std_use_waits_to_be_asked_for_and_every_switch_is_an_edition_lints() {
+    let edition = group("blaze::edition").expect("blaze's edition group");
+    let std_use = lint("blaze::std_use").expect("blaze's lint");
+    assert_eq!(std_use.default_level, Level::Allow);
+    assert!(std_use.is_externally_loaded, "blaze-lints gives it");
+    assert_eq!(ready::switch_of("std_use"), Some(ready::BSTD_IN_TREE));
+    assert_eq!(ready::switch_of("hot_alloc"), None, "its advice needs nothing new");
+    for (name, _) in ready::SWITCHES {
+        let full = format!("blaze::{name}");
+        assert!(edition.lints.iter().any(|it| it.name == full), "{full}");
+    }
 }
 
 #[test]
@@ -169,8 +239,11 @@ fn counts_are_rustcs() {
             "blaze::hot",
             "blaze::general",
             "blaze::pedantic_perf",
+            "blaze::edition",
             "blaze::internal",
+            "blaze::edition",
             "blaze::reach",
+            "blaze::proc_macro",
         ]
     );
     assert_eq!(group("unused").unwrap().lints.len(), 24);

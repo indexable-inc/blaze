@@ -424,6 +424,7 @@ The rest of the rustflags that are the link's, rather than the code's, are read 
 | `-C relro-level` | `full` is what blaze's linker always does on ELF; `partial`, `off` and `none` are refused there, and on macOS every value but `none` |
 | `-C link-dead-code` | off is taken; on is refused: blaze's linker always drops unreferenced sections |
 | `-C strip` | `none` is taken, `debuginfo` links the image without debug info, `symbols` is refused: blaze always writes the functions' local symbols |
+| `split-debuginfo` (the profile's) | **differs from cargo**: unset, `packed` and `unpacked` all put the debug info of an image blaze links in one file beside it, on Linux too (cargo's default there is `off`): `NAME.debug`, named by the executable's `.gnu_debuglink` and carrying its build id, or on macOS `NAME.dSYM`, found by `LC_UUID`. The executable keeps its code, data, unwind tables, symbol table and build id, so a panic's backtrace and a debugger show what they showed. `off` puts the debug info inside the executable, as before. Windows and wasm images are as before. The side file is written beside the executable by the link that made it, and is not in the store ([debug-side-file.md](v2/plan/design/debug-side-file.md)) |
 | `-C linker` | taken when it names a C driver or a system linker (`cc`, `gcc`, `clang`, `ld`, `ld.lld`, `mold`, ..., with a version or a cross prefix): blaze's linker writes what it would; any other program (a wrapper script, `zig cc`) is refused, since it can change the link in ways blaze cannot see |
 | `-C linker-flavor` | taken when it is the spelling blaze reads the target's link arguments in (`gcc`, `gnu-cc` on Linux, `darwin-cc` on macOS, `msvc` on Windows, `wasm-ld`); refused otherwise |
 | `-C default-linker-libraries`, `-C link-self-contained`, `-C prefer-dynamic`, `-C target-feature=+crt-static` | off is taken; on is refused |
@@ -1147,6 +1148,28 @@ request is read. `blaze serve --http ADDR` listens on TCP as well, only with a b
 
 In a project, the daemon writes the programs and test executables where cargo would in the
 workspace's build directory, under `<profile>/` there.
+
+#### Files that outlive a version
+
+The rule (persisted-state-round-trips): a file one blaze writes and another version of blaze can
+find has a test that a file of its previous layout is handled: refused by name with what to do,
+read, or left alone under a name of its own. Never a refusal to start that names nothing, and
+never bytes of one layout read as another's. A new persisted file adds its row here with its test.
+
+| File | Where | Written by | Layout marker | A blaze of another layout | Test |
+|---|---|---|---|---|---|
+| The machine's memory ledger | `/tmp/blaze-<uid>/machine.<layout>` (outside every home) | every daemon of the user, under its `flock` | the layout in the file's name and in its header (`blzledgr`, a `u32`) | left alone: each layout has a file of its own, so daemons of two layouts share no budget and neither refuses to start; bytes of another layout under this name are refused naming the file, both layouts and "stop every blaze daemon of this user, then remove" it | `a_file_of_the_previous_layout_is_left_alone`, `a_file_of_the_previous_layout_is_refused_by_name_under_this_layouts_name` (`crates/blaze-cargo/src/serve/machine.rs`); `a_file_of_the_layout_before_the_lease_is_refused_naming_both_layouts` (`crates/blaze-graph/src/ledger/tests.rs`) |
+| The daemon's socket | `<home>/v2.sock` | the daemon | the API's schema number, in every frame | refused by name: the client says both schemas and builds; a daemon of another build is stopped and this one started | `another_schema_is_refused_by_name` (`crates/blaze-api/src/client/tests.rs`), `a_daemon_of_another_schema_is_refused_naming_both` (`crates/blaze-cargo/src/cli/daemon/tests.rs`) |
+| The state directory | `<home>/v2` | the daemon | the `v2` in its name | left alone: another generation of the daemon's state has another directory | none: the name is the marker |
+| The store's head, indexes and packs | `<home>/v2/store` | the store | a format number in the head and in each index | refused by name: the store is broken naming the file and both formats, never migrated | `a_head_of_another_format_is_refused_by_name`, `a_store_of_the_format_before_block_checks_is_refused_naming_both` (`crates/blaze-cas/src/tests.rs`) |
+| The daemon image (database, symbols, the plane's history, the estimates) | `<home>/v2/db` | the daemon's stop | the schema hash of each section; the estimates' magic | starts cold saying why (a section of another schema), and a damaged one is a fault | `an_image_of_another_layout_starts_cold_and_a_damaged_one_is_a_fault` (`crates/blaze-cargo/src/serve/daemon.rs`), `a_history_of_another_blaze_or_none_starts_empty_saying_why` (`crates/blaze-cargo/src/serve/image.rs`) |
+| The profile history's manifest | `<home>/v2/profile/manifest.json` | the daemon's flushes and merges | `format` | read: formats from the oldest still read up to this one, rewritten as this one at the next commit; any other refused naming both | `a_manifest_reads_back_what_it_consumed_byte_for_byte` (`crates/blaze-profile/src/history/manifest.rs`) |
+| The flight recorder's mapped rings and the crash record | beside the profile history, `<home>/v2/profile` | every blaze process | a magic and a layout number | refused naming its file; its rows are not recovered | `a_mapping_of_another_layout_is_refused_naming_its_file` (`crates/blaze-profile/src/flight/postmortem.rs`), `a_record_of_another_layout_or_blaze_is_refused` (`crates/blaze-profile/src/crash.rs`) |
+| The collector's ledger | `<home>/v2/gc-ledger.json` | the daemon's collector | `format` | refused by name (the file and both formats) in the log and in status, then a new ledger is started | `a_file_of_the_previous_layout_is_refused_by_name` (`crates/blaze-gc/src/ledger.rs`) |
+| The why ledger | under `<home>/v2` | the daemon | a magic that ends in the blaze version's hash | moved aside as another version's, never written over | the `Fault::Version` case in `crates/blaze-cargo/src/serve/why.rs`'s tests |
+| The daemon's lock | `<home>/v2/serve.lock` | the daemon | none: a pid and ` stopped` as text | read by every version | none yet |
+| The performance history's run rows | the build directory | `blaze perf record` | `format` in each row | refused naming the file, the run and both formats, with what to do (record it again) | none yet |
+| Build directories and fetched sources | `<home>/build`, `<home>/sources` | the daemon | none, on purpose: they keep their place across the daemon's formats | read | none: their contents are checked by content hash |
 
 ### Where a build writes
 

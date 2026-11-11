@@ -561,6 +561,7 @@ pub(super) fn link(
         natives: Vec::new(),
         links: Vec::new(),
         macros: None,
+        gpu_msl: None,
         records: Vec::new(),
         quoted: None,
     };
@@ -665,7 +666,7 @@ pub(super) fn link(
                 making.natives.extend(linked.read);
                 // alloc: once per image linked
                 making.links.push((it.path.clone(), linked.how));
-                making.files.push((it.path.clone(), Written::Linked(linked.bytes, linked.root), true)); // clone: as above
+                making.files.push((it.path.clone(), linked.written, true)); // clone: as above
             }
             Err(failed) => match it.at {
                 // alloc: a verdict's words, once per example that fails to link

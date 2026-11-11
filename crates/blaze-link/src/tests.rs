@@ -2181,6 +2181,8 @@ mod thunks;
 
 mod patch;
 
+mod beside;
+
 mod eh_frame_reach;
 
 /// The state's columns, read and written as a stage does.

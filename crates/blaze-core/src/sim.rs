@@ -32,7 +32,12 @@
 //! (the name holds what it held before, a renamed file is back under its old name) and tears
 //! the bytes of an unsynced write by [`SECTOR`]s whether or not it undoes it. A clone holds
 //! its source's bytes as they are when it completes, whole and durable: a file system that
-//! shares blocks writes its source's dirty pages out before it shares them.
+//! shares blocks writes its source's dirty pages out before it shares them. That write is the
+//! clone's cost, and the simulation charges it: the bytes written to a file since its last
+//! write-back ([`Effect::WriteBack`]) or sync are forced out by a clone of it and counted in
+//! [`Sim::bytes_forced`], so a test of a path that must wait for no disk asserts that it forced
+//! none. A write-back makes nothing durable (a crash tears what it covered as before); it and
+//! a sync leave the file clean.
 //! [`Sim::bytes_written`] and [`Sim::bytes_read`] count the bytes effects wrote and read, for a
 //! test that an operation touches only what it must.
 //!
@@ -181,6 +186,10 @@ struct SimFile {
     /// ([`Effect::WriteUnsynced`], [`Effect::RenameUnsynced`]) put this file in place of, until
     /// a sync covers the file: a crash may undo it.
     undo: Option<Box<Undo>>,
+    /// How many of `ops`, from the first, were written back to the device
+    /// ([`Effect::WriteBack`], or a clone that forced them out): not durable, but no longer
+    /// only in memory. The ops after them are the file's dirty data.
+    back: usize,
 }
 
 /// What a crash puts back when it undoes a write or a rename that waited for no sync.
@@ -195,7 +204,14 @@ struct Undo {
 impl Default for SimFile {
     fn default() -> SimFile {
         // alloc: none, two empty vectors.
-        SimFile { durable: Vec::new(), ops: Vec::new(), mode: 0o644, link: false, undo: None }
+        SimFile {
+            durable: Vec::new(),
+            ops: Vec::new(),
+            mode: 0o644,
+            link: false,
+            undo: None,
+            back: 0,
+        }
     }
 }
 
@@ -223,12 +239,31 @@ impl SimFile {
         })
     }
 
+    /// The bytes written to it that are only in memory: what a clone of it forces out.
+    fn dirty(&self) -> u64 {
+        self.ops[self.back.min(self.ops.len())..]
+            .iter()
+            .map(|op| match op {
+                Op::Append(more) | Op::At(_, more) | Op::Sectors(_, more) => more.len() as u64,
+                Op::Cut(_) => 0,
+            })
+            .sum()
+    }
+
+    /// Its dirty data written to the device, none of it durable.
+    fn write_back(&mut self) {
+        self.back = self.ops.len();
+    }
+
     /// The first `covers` of its changes made durable.
     fn sync(&mut self, covers: usize) {
-        let SimFile { durable, ops, undo, .. } = self;
-        for op in ops.drain(..covers.min(ops.len())) {
+        let SimFile { durable, ops, undo, back, .. } = self;
+        let covered = covers.min(ops.len());
+        for op in ops.drain(..covered) {
             op.apply(durable);
         }
+        // What a sync covers it writes out; what came after it is as dirty as it was.
+        *back = back.saturating_sub(covered);
         // A file synced whole is on the disk under its name: nothing is left to undo.
         if ops.is_empty() {
             *undo = None;
@@ -430,6 +465,8 @@ pub struct Sim {
     /// them ([`Sim::bytes_read`]).
     bytes_written: u64,
     bytes_read: u64,
+    /// Bytes clones forced out of their sources ([`Sim::bytes_forced`]).
+    bytes_forced: u64,
 }
 
 /// A delay drawn up to the simulation's latency.
@@ -514,6 +551,7 @@ impl Sim {
             stall_holders: None,
             bytes_written: 0,
             bytes_read: 0,
+            bytes_forced: 0,
         }
     }
 
@@ -522,6 +560,15 @@ impl Sim {
     /// none. For a test that an operation writes only what it must.
     pub fn bytes_written(&self) -> u64 {
         self.bytes_written
+    }
+
+    /// The bytes clones forced out of their sources, ever: a clone of a file holding bytes
+    /// written since its last write-back ([`Effect::WriteBack`]) or sync makes the file system
+    /// write those bytes to the device before it shares the blocks, and waits for them. For a
+    /// test that a path clones only files whose write-back completed (0 here), with no real
+    /// disk: on one, that forced write is what the path would have waited for.
+    pub fn bytes_forced(&self) -> u64 {
+        self.bytes_forced
     }
 
     /// The bytes every effect that completed read from files, ever: reads, reads into memory
@@ -681,6 +728,7 @@ impl Sim {
                 op.apply(&mut file.durable);
             }
             file.ops.clear();
+            file.back = 0;
         }
         for (name, Undo { was, from }) in undone {
             let file = self.files.remove(&name);
@@ -693,12 +741,16 @@ impl Sim {
             // What the name held before is back, as far as it was synced.
             if let Some(mut was) = was {
                 was.ops.clear();
+                was.back = 0;
                 was.undo = None;
                 self.files.insert(name, was);
             }
         }
     }
 
+    /// A write-back ([`Effect::WriteBack`]) of a file under `dir` is held and released as a
+    /// sync is, and failed by [`Sim::fail_syncs`] as one is: both are the device's.
+    ///
     /// From now on, a sync of any file under `dir` is taken and never completes, until a crash:
     /// what the sync covers stays unsynced. For a test of a store whose commit hangs.
     pub fn hold_syncs(&mut self, dir: FileName) {
@@ -1423,7 +1475,13 @@ impl Sim {
             return;
         }
         let sim = self.files.get_mut(file).expect("looked up above");
-        sim.ops.extend(landed);
+        // Each landed sector waits for a sync as a write from memory does: a crash before
+        // one keeps it whole or not at all (`Op::Sectors`), never a prefix of it, which an
+        // `Op::At` cut short would leave.
+        sim.ops.extend(landed.into_iter().map(|op| match op {
+            Op::At(at, sector) => Op::Sectors(at, sector),
+            op => op,
+        }));
         self.changed(file);
     }
 
@@ -1597,6 +1655,16 @@ impl Sim {
                 self.files.entry(file).or_default().sync(covers);
                 Done::Synced
             }
+            // Written out, not durable: the file is clean, and a crash tears it as before.
+            // It covers what was written when it was asked, as a sync does.
+            Effect::WriteBack { file, .. } => match self.files.get_mut(&file) {
+                Some(sim) => {
+                    sim.back = sim.back.max(covers.min(sim.ops.len()));
+                    Done::WrittenBack
+                }
+                // alloc: an error's message.
+                None => Done::Failed(IoError(format!("{file}: no such file"))),
+            },
             Effect::Truncate { file, len, .. } => {
                 file_mut(&mut self.files, &file).ops.push(Op::Cut(len));
                 self.changed(&file);
@@ -1624,6 +1692,7 @@ impl Sim {
                     link: false,
                     // alloc: what a crash may put back, once per unsynced write.
                     undo: Some(Box::new(Undo { was, from: None })),
+                    back: 0,
                 };
                 *file_mut(&mut self.files, &file) = new;
                 self.unlink_locks(&file);
@@ -1718,6 +1787,12 @@ impl Sim {
                 Done::Failed(IoError(format!("{to}: already there")))
             }
             Effect::Clone { from, to, .. } => {
+                // The file system writes the source's dirty data out before it shares the
+                // blocks: charged to the clone, and the source is clean after.
+                if let Some(source) = self.files.get_mut(&from) {
+                    self.bytes_forced += source.dirty();
+                    source.write_back();
+                }
                 self.copy(&from, &to);
                 // A clone is a new file's mode whatever its source's: `Effect::Clone`.
                 file_mut(&mut self.files, &to).mode = SimFile::default().mode;
@@ -2148,6 +2223,7 @@ impl Driver for Sim {
                 (Effect::Timer { after, .. }, _) => *after,
                 (
                     Effect::Sync { file, .. }
+                    | Effect::WriteBack { file, .. }
                     | Effect::Write { file, .. }
                     | Effect::WriteUnsynced { file, .. }
                     | Effect::WriteAt { file, .. }
@@ -2157,7 +2233,8 @@ impl Driver for Sim {
                 ) if file.is_under(dir) => *by,
                 _ => self.delay(),
             };
-            if let (Effect::Sync { file, .. }, Some(dir)) = (&effect, &self.hold_syncs)
+            if let (Effect::Sync { file, .. } | Effect::WriteBack { file, .. }, Some(dir)) =
+                (&effect, &self.hold_syncs)
                 && file.is_under(dir)
             {
                 let covers = self.files.get(file).map_or(0, |it| it.ops.len());
@@ -2183,7 +2260,8 @@ impl Driver for Sim {
                 self.tell(tag, done, Of::Op);
                 continue;
             }
-            if let (Effect::Sync { file, tag }, Some(dir)) = (&effect, &self.fail_syncs)
+            if let (Effect::Sync { file, tag } | Effect::WriteBack { file, tag }, Some(dir)) =
+                (&effect, &self.fail_syncs)
                 && file.is_under(dir)
             {
                 // alloc: an error's message.
@@ -2194,7 +2272,9 @@ impl Driver for Sim {
                 continue;
             }
             let covers = match &effect {
-                Effect::Sync { file, .. } => self.files.get(file).map_or(0, |it| it.ops.len()),
+                Effect::Sync { file, .. } | Effect::WriteBack { file, .. } => {
+                    self.files.get(file).map_or(0, |it| it.ops.len())
+                }
                 _ => 0,
             };
             self.pend(delay, effect, covers);
@@ -2639,6 +2719,39 @@ mod tests {
             }
         }
         assert!(olds > 0 && news > 0 && torns > 0, "{olds} old, {news} new, {torns} torn");
+    }
+
+    /// A clone of a file with bytes written since its last write-back is charged those bytes
+    /// as forced out, once: the source is clean after, so a second clone forces none. A
+    /// write-back completed first, or a sync, makes the clone free; a write after either is
+    /// dirty again. Nothing a write-back covers is durable: a crash still tears it.
+    #[test]
+    fn a_clone_of_a_dirty_file_is_charged_its_forced_write_back() {
+        let mut sim = Sim::new(9, Faults::default());
+        let (file, bytes) = (name("store/placed/value"), vec![7u8; 3 * SECTOR]);
+        // clone: a test's bytes.
+        let write = Effect::WriteUnsynced { file: file.clone(), bytes: bytes.clone(), tag: Tag(1) };
+        assert_eq!(ran(&mut sim, vec![write])[&Tag(1)], Done::Written);
+        let clone = |to: &str, tag| Effect::Clone { from: file.clone(), to: name(to), tag: Tag(tag) };
+        assert_eq!(ran(&mut sim, vec![clone("out/a", 2)])[&Tag(2)], Done::Cloned);
+        assert_eq!(sim.bytes_forced(), 3 * SECTOR as u64, "the clone forced the whole write out");
+        assert_eq!(ran(&mut sim, vec![clone("out/b", 3)])[&Tag(3)], Done::Cloned);
+        assert_eq!(sim.bytes_forced(), 3 * SECTOR as u64, "a second clone of it forces nothing");
+        // Written again, then written back: clean, so the clone after is free.
+        let at = Effect::WriteAt { file: file.clone(), at: 0, bytes: vec![1; 100], tag: Tag(4) };
+        ran(&mut sim, vec![at]);
+        let back = Effect::WriteBack { file: file.clone(), tag: Tag(5) };
+        assert_eq!(ran(&mut sim, vec![back])[&Tag(5)], Done::WrittenBack);
+        assert_eq!(ran(&mut sim, vec![clone("out/c", 6)])[&Tag(6)], Done::Cloned);
+        assert_eq!(sim.bytes_forced(), 3 * SECTOR as u64);
+        // A write after the write-back is dirty, and only it is charged.
+        let at = Effect::WriteAt { file: file.clone(), at: 0, bytes: vec![2; 40], tag: Tag(7) };
+        ran(&mut sim, vec![at]);
+        assert_eq!(ran(&mut sim, vec![clone("out/d", 8)])[&Tag(8)], Done::Cloned);
+        assert_eq!(sim.bytes_forced(), 3 * SECTOR as u64 + 40);
+        // A write-back of a file that is not there fails, naming it.
+        let missing = Effect::WriteBack { file: name("store/placed/none"), tag: Tag(9) };
+        assert!(matches!(&ran(&mut sim, vec![missing])[&Tag(9)], Done::Failed(why) if why.0.contains("none")));
     }
 
     /// A rename that waited for no sync is, after a crash, done (the file under the new name,
@@ -3357,11 +3470,18 @@ mod tests {
 
     /// A crash keeps each sector of a write from memory that was not synced whole or not at
     /// all, never a part of one, on every seed; across seeds it keeps none, all, and some.
+    ///
+    /// A crash keeps each of the write's eight sectors or not by a coin of the seed's, so one
+    /// that keeps none of them is one seed in a few hundred: over 200 seeds whether one
+    /// turned up hung on which numbers the simulation had drawn before the crash, and any
+    /// change to what it draws (a completion shuffled, a span scribbled) failed this test
+    /// with nothing wrong. Over 4000 seeds none fails to turn up once in a hundred thousand
+    /// such changes.
     #[test]
     fn a_crash_tears_a_write_from_memory_by_sectors() {
         let file = name("pool/pack-1");
         let (mut none, mut all, mut some) = (false, false, false);
-        for seed in 0..200 {
+        for seed in 0..4000 {
             let mut sim = Sim::new(seed, Faults::default());
             let mut memory = memory(4096);
             memory.fill(0, 4096, b'x');

@@ -13,7 +13,7 @@ use blaze_items::{CodeHash, ItemKey};
 
 use crate::{InstanceKey, Target};
 
-#[derive(PartialEq, Eq, Debug, Default)]
+#[derive(Clone, PartialEq, Eq, Debug, Default)] // clone: the copy a build keeps to patch for the next
 pub struct Reach {
     /// The functions, sorted: node `i` for `i < functions.len()`.
     functions: Vec<InstanceKey>,
@@ -99,6 +99,159 @@ impl Reach {
         assert!(reach.edges.len() <= u32::MAX as usize, "more than 2^32 references");
         reach.starts.push(reach.edges.len() as u32);
         reach
+    }
+
+    /// The graph of a build from `last`, the graph of the build before it, where the build
+    /// changed only what it names: `removed` and `removed_statics` are no nodes any more,
+    /// and `functions` and `statics` are each new or have other marks or references. Each
+    /// list is sorted by key, each key once. What [`Reach::new`] makes of the same nodes:
+    /// every other node keeps its marks and its edges, renumbered, as a node that is not
+    /// listed refers to nothing that was removed or is new. The lists are copied whole, an
+    /// index an edge, with no lookup but for the listed nodes' references: the graph is flat
+    /// arrays by place in key order, which its readers index, so a key added or removed
+    /// moves every place after it. `Err` names a node that is not listed and refers to a
+    /// removed one: the caller's lists are wrong, and it refuses its build.
+    pub(crate) fn patched<'a>(
+        last: &Reach,
+        removed: &[InstanceKey],
+        removed_statics: &[(ItemKey, ContentId)],
+        functions: &[(InstanceKey, Node<'a>)],
+        statics: &[((ItemKey, ContentId), Node<'a>)],
+    ) -> Result<Reach, String> {
+        /// The keys of `old` without `removed` and with `listed`, sorted; and for each old
+        /// place its new one (`u32::MAX` for one removed).
+        fn merged<K: Copy + Ord>(old: &[K], removed: &[K], listed: &[K]) -> (Vec<K>, Vec<u32>) {
+            // alloc: per build, the graph's keys and where each node went
+            let mut keys = Vec::with_capacity(old.len() + listed.len());
+            let mut places = Vec::with_capacity(old.len());
+            let mut next = 0;
+            for key in old {
+                while next < listed.len() && listed[next] < *key {
+                    keys.push(listed[next]);
+                    next += 1;
+                }
+                if removed.binary_search(key).is_ok() {
+                    places.push(u32::MAX);
+                    continue;
+                }
+                if next < listed.len() && listed[next] == *key {
+                    next += 1;
+                }
+                places.push(keys.len() as u32);
+                keys.push(*key);
+            }
+            keys.extend_from_slice(&listed[next..]);
+            (keys, places)
+        }
+        // alloc: per build, the keys it names
+        let function_keys: Vec<InstanceKey> = functions.iter().map(|it| it.0).collect();
+        let static_keys: Vec<(ItemKey, ContentId)> = statics.iter().map(|it| it.0).collect();
+        let (new_functions, function_places) = merged(&last.functions, removed, &function_keys);
+        let (new_statics, static_places) = merged(&last.statics, removed_statics, &static_keys);
+        let nodes = new_functions.len() + new_statics.len();
+        assert!(nodes < u32::MAX as usize, "more than 2^32 - 1 nodes");
+        let mut reach = Reach {
+            functions: new_functions,
+            statics: new_statics,
+            // alloc: per build, sized by its units
+            starts: Vec::with_capacity(nodes + 1),
+            // alloc: per build, sized by its references
+            edges: Vec::with_capacity(last.edges.len()),
+            // alloc: per build, sized by its units
+            marks: Vec::with_capacity(nodes),
+        };
+        let function_count = reach.functions.len();
+        // Where an old node is now.
+        let moved = |at: u32| -> u32 {
+            let at = at as usize;
+            match at.checked_sub(last.functions.len()) {
+                None => function_places[at],
+                Some(at) => match static_places[at] {
+                    u32::MAX => u32::MAX,
+                    place => function_count as u32 + place,
+                },
+            }
+        };
+        // Each new node in order, functions then statics: a listed one from its node, any
+        // other from its old place.
+        let (mut old, mut listed) = (0, 0);
+        let (mut old_static, mut listed_static) = (0, 0);
+        let (mut starts, mut edges, mut marks) = (
+            std::mem::take(&mut reach.starts),
+            std::mem::take(&mut reach.edges),
+            std::mem::take(&mut reach.marks),
+        );
+        for at in 0..nodes {
+            starts.push(edges.len() as u32);
+            let start = edges.len();
+            let node = match at.checked_sub(function_count) {
+                None => {
+                    let key = reach.functions[at];
+                    while old < last.functions.len() && last.functions[old] < key {
+                        old += 1;
+                    }
+                    while listed < functions.len() && functions[listed].0 < key {
+                        listed += 1;
+                    }
+                    match functions.get(listed).filter(|it| it.0 == key) {
+                        Some((_, node)) => Ok(node),
+                        None => Err(old),
+                    }
+                }
+                Some(at) => {
+                    let key = reach.statics[at];
+                    while old_static < last.statics.len() && last.statics[old_static] < key {
+                        old_static += 1;
+                    }
+                    while listed_static < statics.len() && statics[listed_static].0 < key {
+                        listed_static += 1;
+                    }
+                    match statics.get(listed_static).filter(|it| it.0 == key) {
+                        Some((_, node)) => Ok(node),
+                        None => Err(last.functions.len() + old_static),
+                    }
+                }
+            };
+            match node {
+                Ok(node) => {
+                    marks.push(node.marks);
+                    for target in node.refs {
+                        if let Some(at) = reach.node(target) {
+                            edges.push(at);
+                        }
+                    }
+                    edges[start..].sort_unstable();
+                    let mut kept = start;
+                    for at in start..edges.len() {
+                        if kept == start || edges[kept - 1] != edges[at] {
+                            edges[kept] = edges[at];
+                            kept += 1;
+                        }
+                    }
+                    edges.truncate(kept);
+                }
+                // An old node: its edges go where their nodes went, which keeps their order.
+                Err(was) => {
+                    marks.push(last.marks[was]);
+                    let from = last.starts[was] as usize..last.starts[was + 1] as usize;
+                    for &edge in &last.edges[from] {
+                        let now = moved(edge);
+                        if now == u32::MAX {
+                            // alloc: an error
+                            return Err(match at.checked_sub(function_count) {
+                                None => format!("the function {:?}", reach.functions[at]),
+                                Some(at) => format!("the static {:?}", reach.statics[at]),
+                            });
+                        }
+                        edges.push(now);
+                    }
+                }
+            }
+        }
+        assert!(edges.len() <= u32::MAX as usize, "more than 2^32 references");
+        starts.push(edges.len() as u32);
+        (reach.starts, reach.edges, reach.marks) = (starts, edges, marks);
+        Ok(reach)
     }
 
     /// The node a reference is to: a function or static of the build. `None` for data,

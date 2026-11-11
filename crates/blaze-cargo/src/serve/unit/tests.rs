@@ -21,6 +21,9 @@ use blaze_usercode::run::Value;
 
 use super::{artifact, codegen, compile, graph, run, script, test, unit_target};
 
+/// `artifact = "gpu"` dependencies, their device build and its MSL applied to the host.
+mod gpu;
+
 const HOST: &str = "x86_64-unknown-linux-gnu";
 
 fn target(name: &str, kind: &str, src: &str) -> Target {
@@ -65,6 +68,7 @@ fn unit(pkg: &str, target: Target, mode: Mode, deps: &[usize]) -> Unit {
                 noprelude: None,
                 nounused: None,
                 dev: false,
+                gpu: false,
             })
             .collect(),
     }
@@ -89,6 +93,7 @@ fn plan(extra: &str, outputs: &[&str]) -> UnitPlan {
         harness: true,
         clippy: None,
         macro_wasm: false,
+        gpu_msl: None,
     }
 }
 
@@ -500,6 +505,30 @@ fn a_test_runs_from_deps_beside_the_packages_binaries() {
         artifact::uplifted(&format!("{out}/it-4567"), &plan),
         Some("/w/target/debug/deps/it-4567")
     );
+}
+
+/// A program built in its unit's own directory with no hash in its name (cargo's new layout)
+/// is one file made and one link: the profile directory's is its copy, by where it is, and a
+/// file elsewhere that is no output's copy is the unit's own.
+#[test]
+fn a_program_with_no_hash_in_its_name_is_made_once() {
+    let out = "/w/target/debug/build/p/4567/out";
+    let it = plan(
+        "",
+        &[
+            format!("{out}/my_app").as_str(),
+            "/w/target/debug/my-app",
+            format!("{out}/my_app.d").as_str(),
+            "/w/target/debug/other",
+        ],
+    );
+    assert_eq!(artifact::made(&it), [format!("{out}/my_app").as_str(), "/w/target/debug/other"]);
+    assert_eq!(artifact::uplifted(&format!("{out}/my_app"), &it), Some("/w/target/debug/my-app"));
+    assert_eq!(artifact::uplifted("/w/target/debug/my-app", &it), None);
+    assert_eq!(artifact::uplifted("/w/target/debug/other", &it), None);
+    // A library's files are all in one directory: each is made.
+    let lib = plan("", &["/w/target/debug/deps/libp.so", "/w/target/debug/deps/libp.rlib"]);
+    assert_eq!(artifact::made(&lib).len(), 2);
 }
 
 #[test]
@@ -1179,6 +1208,7 @@ fn lowered_proc_macro() -> blaze_lower::Lowered {
         noprelude: Some(true),
         nounused: None,
         dev: false,
+        gpu: false,
     };
     let made = |pkg: &str, target: Target, is_std: bool, dependencies: Vec<UnitDep>| Unit {
         profile: Profile {
@@ -1520,6 +1550,7 @@ fn script_front_for(
             noprelude: Some(true),
             nounused: None,
             dev: false,
+            gpu: false,
         }],
         false => Vec::new(),
     };
@@ -1997,6 +2028,7 @@ fn front_of(pkgs: &[MemPkg<'_>]) -> MemFront {
                     noprelude: None,
                     nounused: None,
                     dev: false,
+                    gpu: false,
                 })
                 .collect();
             u
@@ -2943,4 +2975,109 @@ fn a_check_entry_restores_to_the_outcome_it_was_made_of() {
         assert!(compile::Checked::decoded(&bytes[..bytes.len() - 1], body).is_err());
         assert!(compile::Checked::decoded(&bytes, bytes.len() + 1).is_err());
     }
+}
+
+/// A test's store's effects run to their end on the simulation.
+fn store_driven(
+    sim: &mut blaze_core::sim::Sim,
+    store: &mut blaze_cas::Store,
+    effects: &mut Vec<blaze_core::Effect>,
+) {
+    blaze_core::run_until_idle(sim, effects, |completion, effects| {
+        if store.owns(completion.tag) {
+            store.complete(completion, effects);
+        }
+    })
+    .expect("the effects end");
+}
+
+/// What the loop is handed to put for an edit of a linked image is the edit, not the image:
+/// where the link is a patch of the image before it and the store can derive from that image's
+/// file, the unit's put for it is the recipe (the ranges and a row each), the whole file is
+/// never made (`whole` is not called), and its place writes the ranges and forces no
+/// write-back. So nothing the loop does with the unit's records (`loop: a unit's records put
+/// into the store`) is as long as the image. Over a base whose file is written and not yet
+/// written back (the dirty-base rule, `blaze_cas::Reader::derivable`), the image is handed
+/// over whole, once.
+#[test]
+fn an_edits_image_is_handed_to_the_loop_as_its_ranges_and_whole_only_over_a_base_not_written_back()
+{
+    use blaze_cas::Kind;
+    const LEN: usize = 1 << 20;
+    let name = |it: &str| blaze_core::FileName::new(it).unwrap();
+    let mut sim = blaze_core::sim::Sim::new(7, blaze_core::sim::Faults::default());
+    let mut store = super::deps::tests::opened(&mut sim);
+    let mut effects = Vec::new();
+    let image: Vec<u8> = (0..LEN).map(|n| (n as u64).wrapping_mul(0x9E37_79B9).to_le_bytes()[3]).collect();
+    let (was, now) = ([1u8; 32], [2u8; 32]);
+    store.put(compile::linked_key(&was), Kind::Output, &image).unwrap();
+    store.flush(&mut effects);
+    store_driven(&mut sim, &mut store, &mut effects);
+    store.place(&compile::linked_key(&was), name("out/debug/app"), &mut effects).unwrap();
+    store_driven(&mut sim, &mut store, &mut effects);
+    assert_eq!(store.placed()[0].result, Ok(()));
+
+    let patch = |base: [u8; 32], digest: [u8; 32]| blaze_link::Patch {
+        full: false,
+        len: LEN as u64,
+        old_len: LEN as u64,
+        writes: vec![(4096, vec![9; 300])],
+        base: Some(base),
+        digest,
+        generation: 2,
+    };
+    let written = compile::Written::linked(
+        &store.reader(),
+        now,
+        Some(patch(was, now)),
+        || -> Result<Vec<u8>, String> {
+            panic!("the whole image is made although the store can derive it")
+        },
+    )
+    .unwrap();
+    let compile::Written::Derived { base, root, len, writes } = written else {
+        panic!("a patch of an image whose file is written back is handed over as the patch");
+    };
+    let recipe = blaze_cas::derived::encode(&compile::linked_key(&base), len, &writes).unwrap();
+    assert!(
+        recipe.len() < 1024,
+        "the put of a 300 byte edit of a 1 MiB image is {} bytes",
+        recipe.len()
+    );
+    let (wrote, key) = (sim.bytes_written(), compile::linked_key(&root));
+    store.put(key, Kind::Derived, &recipe).unwrap();
+    store.unplace(&compile::linked_key(&was), &key, &mut effects);
+    store.place(&key, name("out/debug/app"), &mut effects).unwrap();
+    // The place is answered without the store's commit of the recipe: nothing is flushed.
+    store_driven(&mut sim, &mut store, &mut effects);
+    let placed = store.placed();
+    assert_eq!(placed[0].result, Ok(()));
+    assert_eq!(placed[0].bytes.copied, 300, "its ranges, written where it goes");
+    assert!(sim.bytes_written() - wrote < 4096, "the edit's placement wrote its ranges");
+    assert_eq!(sim.bytes_forced(), 0, "and no clone waited for a write-back");
+
+    // A base written and not yet written back is no base: the image is made whole, once.
+    sim.hold_syncs(name("store/placed"));
+    let (cold, edited) = ([5u8; 32], [6u8; 32]);
+    let other: Vec<u8> = image.iter().map(|it| it ^ 0x5a).collect();
+    store.put(compile::linked_key(&cold), Kind::Output, &other).unwrap();
+    store.flush(&mut effects);
+    store_driven(&mut sim, &mut store, &mut effects);
+    store.place(&compile::linked_key(&cold), name("out/debug/other"), &mut effects).unwrap();
+    store_driven(&mut sim, &mut store, &mut effects);
+    assert_eq!(store.placed()[0].result, Ok(()), "answered while its write-back is held");
+    let mut asked = 0;
+    let written = compile::Written::linked(
+        &store.reader(),
+        edited,
+        Some(patch(cold, edited)),
+        || -> Result<Vec<u8>, String> {
+            asked += 1;
+            Ok(vec![0; 8]) // alloc: a test's stand-in for the image.
+        },
+    )
+    .unwrap();
+    assert!(matches!(written, compile::Written::Linked(_, root) if root == edited));
+    assert_eq!(asked, 1);
+    assert_eq!(sim.bytes_forced(), 0);
 }

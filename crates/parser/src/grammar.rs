@@ -200,7 +200,12 @@ pub(crate) fn reparser(
 ) -> Option<fn(&mut Parser<'_>)> {
     let res = match node {
         BLOCK_EXPR => expressions::block_expr,
-        RECORD_FIELD_LIST => items::record_field_list,
+        // A record type's list (`#![blaze::records]`) is read from outside it where it is a
+        // generic argument (`types::at_record_type_arg`), so it is never parsed alone.
+        RECORD_FIELD_LIST => match parent? {
+            RECORD_TYPE => return None,
+            _ => items::record_field_list,
+        },
         RECORD_EXPR_FIELD_LIST => items::record_expr_field_list,
         VARIANT_LIST => items::variant_list,
         MATCH_ARM_LIST => items::match_arm_list,

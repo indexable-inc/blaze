@@ -22,7 +22,7 @@ use blaze_ids::ContentId;
 use blaze_mem::{Frame, Tag, frame};
 use blaze_query::db::Durability;
 use smallvec::SmallVec;
-use syntax::{LexedStr, SourceFile, SyntaxKind, T, TextRange, TextSize};
+use syntax::{Extensions, LexedStr, SourceFile, SyntaxKind, T, TextRange, TextSize};
 
 use crate::{
     Crate, Db, EditionedFileId, FileSourceRootInput, FileText, Files,
@@ -148,6 +148,70 @@ pub fn crate_attr_error(db: &Db, file: EditionedFileId) -> Option<CrateAttrError
         return Some(CrateAttrError::UnexpectedToken { token: range_of(&lexed, after) });
     }
     file.parse_errors_with_bodies(db).is_some().then_some(CrateAttrError::Syntax)
+}
+
+/// The syntax extensions `krate` turns on (`edition::Extensions`), each by its crate attribute
+/// written plainly among the inner attributes that open its root file, or given as a crate
+/// attribute ([`crate_attr_files`]; every one, since which rustc applies is read off their
+/// parses, which depend on this, and a refused one fails the crate anyway):
+/// `#![blaze::records]` for
+/// [`Extensions::RECORDS`]. Read off the tokens, never a parse, since the parse of every
+/// file of the crate depends on it ([`EditionedFileId::extensions`]). One under `cfg_attr` is
+/// not read here, and hir-def refuses it, naming the rule.
+#[blaze_query::tracked(returns(copy))]
+pub fn crate_extensions(db: &Db, krate: Crate) -> Extensions {
+    let data = krate.data(db);
+    let root: &str = db.file_text(data.root_file_id).text(db);
+    let mut extensions = leading_extensions(data.edition, root);
+    for &file in crate_attr_files(db, krate) {
+        let (file_id, edition) = file.unpack(db);
+        extensions = extensions.with(leading_extensions(edition, db.file_text(file_id).text(db)));
+    }
+    extensions
+}
+
+/// What turns each syntax extension on: its crate attribute's path.
+const EXTENSION_ATTRS: [(&str, Extensions); 1] = [("blaze::records", Extensions::RECORDS)];
+
+/// The syntax extensions the inner attributes that open `text` turn on: each `#![...]` from the
+/// start (after trivia and a shebang) whose tokens are exactly an extension's path.
+fn leading_extensions(edition: span::Edition, text: &str) -> Extensions {
+    // alloc: the tokens of the file, once per change of a crate root's text
+    let lexed = LexedStr::new(edition, text);
+    let mut tokens = (0..lexed.len()).filter(|&at| {
+        let kind = lexed.kind(at);
+        !kind.is_trivia() && kind != SyntaxKind::SHEBANG
+    });
+    let mut extensions = Extensions::NONE;
+    loop {
+        let (Some(hash), Some(bang), Some(open)) = (tokens.next(), tokens.next(), tokens.next())
+        else {
+            return extensions;
+        };
+        let opens = lexed.kind(hash) == T![#]
+            && lexed.kind(bang) == T![!]
+            && lexed.kind(open) == T!['['];
+        if !opens {
+            return extensions;
+        }
+        let (mut depth, mut path, mut plain) = (1usize, String::new(), true); // alloc: a path's text
+        for at in tokens.by_ref() {
+            match lexed.kind(at) {
+                T!['['] | T!['('] | T!['{'] => (depth, plain) = (depth + 1, false),
+                T![']'] | T![')'] | T!['}'] => depth -= 1,
+                _ => path.push_str(lexed.text(at)),
+            }
+            if depth == 0 {
+                break;
+            }
+        }
+        if depth != 0 {
+            return extensions;
+        }
+        if plain && let Some(&(_, it)) = EXTENSION_ATTRS.iter().find(|(name, _)| *name == path) {
+            extensions = extensions.with(it);
+        }
+    }
 }
 
 fn closer(open: SyntaxKind) -> SyntaxKind {

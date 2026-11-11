@@ -163,6 +163,14 @@ pub(super) fn atom_expr(
             stmt_list(p);
             m.complete(p, BLOCK_EXPR)
         }
+        // blaze, under `#![blaze::records]`: `fn f() { open(p, { create: true, .. }); }`
+        //
+        // A record value: a struct literal's field list with no path before it.
+        T!['{'] if at_record_value(p) => {
+            let m = p.start();
+            record_expr_field_list(p);
+            m.complete(p, RECORD_EXPR)
+        }
         T!['{'] => {
             // test for_range_from
             // fn foo() {
@@ -837,7 +845,8 @@ pub(crate) fn match_arm_list(p: &mut Parser<'_>) {
     attributes::inner_attrs(p);
 
     while !p.at(EOF) && !p.at(T!['}']) {
-        if p.at(T!['{']) {
+        // Under `#![blaze::records]` a `{` here opens an arm's record pattern.
+        if p.at(T!['{']) && !p.records_gate() {
             error_block(p, "expected match arm");
             continue;
         }

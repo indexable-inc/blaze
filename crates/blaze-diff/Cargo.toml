@@ -1,0 +1,24 @@
+[package]
+name = "blaze-diff"
+description = "Symbolic differentiation of scalar float expressions (docs/future/autodiff.md, layers 2 and 3): a hash-consed expression graph, derivatives by a rule table, IEEE-exact and fast-math simplification on an e-graph, printing as Rust and as math, and evaluation"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The hash-consing index of the graph and of the e-graph: looked up, never iterated.
+blaze-hash.workspace = true
+
+[dev-dependencies]
+hegeltest.workspace = true
+
+[lints]
+workspace = true

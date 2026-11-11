@@ -23,7 +23,9 @@
 //! on the stack. Passes rustc runs at a level and these do not are listed in
 //! [`passes_not_ported`]. `Specialize` ([`specialize`]), last, with `Inline`, is blaze's too:
 //! it lists the calls the code generator gives a copy of the callee specialized on constant
-//! arguments.
+//! arguments. `SpendFacts` ([`facts`]) is blaze's as well: what is proved of a callee (it
+//! cannot panic, it is pure) removes the call's unwind edge and merges a repeated call, each
+//! recorded in `body.inlined.relied` (docs/v2/plan/design/facts.md).
 //!
 //! The passes run on the generic body, as rustc's do, once per function: monomorphization
 //! substitutes after. An edit to one function optimizes that one again.
@@ -38,6 +40,7 @@ mod copy_prop;
 mod devirt;
 mod dse;
 mod escape;
+mod facts;
 mod inline;
 mod inst_simplify;
 mod locals;
@@ -54,15 +57,19 @@ use crate::{db::HirDatabase, traits::StoredParamEnvAndCrate};
 use crate::next_solver::StoredGenericArgs;
 
 use super::{
-    BasicBlockId, InlinedBody, LocalId, MirBody, MirLowerError, MirOptLevel, MirOptions, MirOwner,
-    MirStage, OperandKind, ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind,
+    BasicBlock, BasicBlockId, InlinedBody, LocalId, MirBody, MirLowerError, MirOptLevel,
+    MirOptions, MirOwner, MirStage, OperandKind, ProjectionElem, Rvalue, StatementKind,
+    StoredPlace, TerminatorKind,
     budget::Pass,
     framed::{Bits, bits_in, block_id, block_index, local_index},
     transform::Ctx,
 };
 
 pub use box_in_place::BOX_IN_PLACE_MIN;
+/// Liveness across one mention, which `mir::handles` shares with dead store elimination.
+pub(super) use dse::transfer;
 pub use escape::heap_held;
+pub use facts::relied_on_own_no_unwind;
 pub use inline::{CallerLocation, caller_location, owner_of, source_span, written_checked_at};
 pub(crate) use inline::{shipped_cross_crate_inlinable, written_cross_crate_inlinable};
 pub use specialize::{CloneId, MAX_COPIES, MAX_COPIES_PER_BODY, specialized_mir_body};
@@ -236,6 +243,14 @@ fn passes<'db>(
             });
         }
     }
+    // blaze's own, at `Release`: a call of a function proved unable to panic loses its
+    // unwind edge, after `Inline` so the calls the callees brought lose theirs too and before
+    // the `SimplifyCfg` that removes the cleanup nothing reaches any more.
+    if release {
+        run!("SpendFacts unwind", |_frame| {
+            facts::unwind_edges(ctx, body);
+        });
+    }
     // rustc keeps storage markers only where it gives the backend lifetimes.
     if !options.lifetime_markers {
         run!("RemoveStorageMarkers", |frame| locals::remove_storage_markers(body, frame));
@@ -262,6 +277,15 @@ fn passes<'db>(
         run!("DeadStoreElimination", |frame| dse::dead_store_elimination(body, frame));
     }
     run!("SimplifyLocals", |frame| locals::simplify_locals(body, frame));
+    // blaze's own, at `Release` and after `CopyProp`, so two calls with the same arguments
+    // name the same locals: the second of a pure function's takes the first's result.
+    if release {
+        run!("SpendFacts repeats", |frame| {
+            if facts::merge_repeats(ctx, body) != 0 {
+                cfg::simplify_cfg(body, frame);
+            }
+        });
+    }
     run!("CriticalCallEdges", |frame| cfg::critical_call_edges(body, frame));
     // Last, so that the blocks it lists are the body's: it changes no statement or block.
     if options.inline && caller.is_some() {
@@ -484,7 +508,7 @@ fn local_id(index: usize) -> LocalId {
 }
 
 /// The blocks reachable from the start, in reverse postorder, unwinding included.
-fn reverse_postorder<'f>(body: &MirBody<'_>, frame: &'f Frame) -> Vec<BasicBlockId, &'f Frame> {
+pub(super) fn reverse_postorder<'f>(body: &MirBody<'_>, frame: &'f Frame) -> Vec<BasicBlockId, &'f Frame> {
     let count = body.basic_blocks.len();
     let mut visited: Bits<'_> = bits_in(count, frame);
     let mut post = Vec::with_capacity_in(count, frame);
@@ -510,6 +534,57 @@ fn reverse_postorder<'f>(body: &MirBody<'_>, frame: &'f Frame) -> Vec<BasicBlock
     }
     post.reverse();
     post
+}
+
+/// Live on exit from `block`: live on entry to any of its successors, unwinding included.
+pub(super) fn exit_into(entry: &[Bits<'_>], block: &BasicBlock, live: &mut Bits<'_>) {
+    live.clear();
+    if let Some(terminator) = &block.terminator {
+        for target in terminator.kind.all_successors() {
+            live.union_with(&entry[block_index(target)]);
+        }
+    }
+}
+
+/// The locals live on entry to each block, by its index: backward liveness to a fixpoint over
+/// `order`, the blocks in reverse postorder ([`reverse_postorder`]), walked in postorder.
+/// `statement` and `terminator` take what is live after a point to what is live before it; what
+/// is live after a block is what is live where any of its successors starts. A block `order`
+/// does not reach has nothing live. The passes' one liveness: dead store elimination's, whose
+/// assignment to a dead local reads nothing, and the copies of `#![blaze::handles]`, where a
+/// drop reads nothing (`mir::handles`).
+pub(super) fn live_on_entry<'f>(
+    body: &MirBody<'_>,
+    order: &[BasicBlockId],
+    frame: &'f Frame,
+    mut statement: impl FnMut(&mut Bits<'f>, &StatementKind, Location),
+    mut terminator: impl FnMut(&mut Bits<'f>, &TerminatorKind, Location),
+) -> Vec<Bits<'f>, &'f Frame> {
+    let locals = body.locals.len();
+    let blocks = body.basic_blocks.len();
+    let mut entry: Vec<Bits<'f>, &'f Frame> = Vec::with_capacity_in(blocks, frame);
+    entry.extend((0..blocks).map(|_| bits_in(locals, frame)));
+    let mut live: Bits<'f> = bits_in(locals, frame);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &bb in order.iter().rev() {
+            let block = &body.basic_blocks[bb];
+            exit_into(&entry, block, &mut live);
+            if let Some(it) = &block.terminator {
+                let at = Location { block: bb, index: block.statements.len() };
+                terminator(&mut live, &it.kind, at);
+            }
+            for (index, it) in block.statements.iter().enumerate().rev() {
+                statement(&mut live, &it.kind, Location { block: bb, index });
+            }
+            if live != entry[block_index(bb)] {
+                entry[block_index(bb)].copy_from(&live);
+                changed = true;
+            }
+        }
+    }
+    entry
 }
 
 /// Immediate dominators of the reachable blocks (Cooper, Harvey and Kennedy).
@@ -616,7 +691,7 @@ impl<'f> Dominators<'f> {
 /// How a statement or terminator mentions a local, as rustc's `PlaceContext` says it for the
 /// distinctions these passes make.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mention {
+pub(super) enum Mention {
     /// The local as a whole is the left-hand side of an assignment.
     Assigned,
     /// A part of the local, not behind a pointer, is the left-hand side of an assignment.
@@ -636,12 +711,12 @@ enum Mention {
 
 /// Where in a body: a block and a statement in it, the terminator at `statements.len()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Location {
-    block: BasicBlockId,
-    index: usize,
+pub(super) struct Location {
+    pub(super) block: BasicBlockId,
+    pub(super) index: usize,
 }
 
-fn visit_place(
+pub(super) fn visit_place(
     place: &StoredPlace,
     outer: Mention,
     at: Location,
@@ -665,7 +740,7 @@ fn visit_place(
     f(place.local, base, at);
 }
 
-fn visit_operand(
+pub(super) fn visit_operand(
     operand: &super::Operand,
     at: Location,
     f: &mut impl FnMut(LocalId, Mention, Location),
@@ -692,7 +767,7 @@ fn visit_rvalue(rvalue: &Rvalue, at: Location, f: &mut impl FnMut(LocalId, Menti
 }
 
 /// Calls `f` with every mention of a local in the statement at `at`.
-fn visit_statement(
+pub(super) fn visit_statement(
     statement: &StatementKind,
     at: Location,
     f: &mut impl FnMut(LocalId, Mention, Location),
@@ -732,7 +807,7 @@ fn visit_statement(
     }
 }
 
-fn visit_terminator(
+pub(super) fn visit_terminator(
     terminator: &TerminatorKind,
     at: Location,
     f: &mut impl FnMut(LocalId, Mention, Location),
