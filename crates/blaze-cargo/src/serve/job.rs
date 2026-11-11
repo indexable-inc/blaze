@@ -2807,6 +2807,86 @@ pub(super) fn lease_build_dirs(units: &Units, checkout: &str, builds: &str) -> s
 }
 
 impl<S: Steps> Job<S> {
+    /// A job as it begins, nothing of it done: `work` on `views`, `idle` when of declared
+    /// intent, `walks` why its checkout's kept answer was not said again, begun at `began` on
+    /// the injected clock. A snapshot has no plane request to finish.
+    ///
+    /// The one place a `Job` is made: [`Jobs::begin`] and every test go through it, so a
+    /// field added to the struct is given its starting value here once and no literal
+    /// elsewhere can miss it (2026-11-11: a test's own literal lacked three fields after a
+    /// merge, and only a build of the tests saw it).
+    fn fresh(
+        work: Work,
+        views: Vec<Opened>,
+        idle: bool,
+        walks: Option<(String, ContentId)>,
+        began: Duration,
+    ) -> Job<S> {
+        let finished = matches!(work, Work::Snapshot);
+        Job {
+            work,
+            views,
+            ready: Vec::new(), // alloc: once per job, a view or two
+            request: None,
+            idle,
+            closed: false,
+            finished,
+            cancelled: Arc::new(AtomicBool::new(false)), // alloc: once per job, shared with its tasks
+            stage: Stage::Over,
+            value: None,
+            updating: HashSet::new_in(Global),
+            said: HashSet::new_in(Global),
+            queries: Vec::new(), // alloc: once per job
+            built: None,
+            borrowed: Vec::new(), // alloc: once per job
+            placing: 0,
+            placed: blaze_cas::PlacedBytes::default(),
+            worked: None,
+            busy: HashMap::new_in(Global),
+            needed: 0,
+            wind_ups: 0,
+            wind_up_ns: 0,
+            names: HashSet::new_in(Global),
+            held: Vec::new(), // alloc: none until a run waits for its program
+            look: 0,
+            awaiting: None,
+            applied: 0,
+            applying: None,
+            shared: false,
+            runs: 0,
+            durable: blaze_cas::Tickets::default(),
+            storing: None,
+            stored: blaze_cas::Tickets::default(),
+            stored_of: None,
+            durable_since: None,
+            over: None,
+            stats: RequestStats::default(),
+            fresh: 0,
+            compiled: 0,
+            served: Vec::new(),    // alloc: none; a build fills it once
+            links: Vec::new(),     // alloc: none until a unit links
+            linked: Vec::new(),    // alloc: none until a unit links
+            misses: Vec::new(),    // alloc: none until a unit misses
+            test_runs: Vec::new(), // alloc: none until a test runs
+            opened_cpu: None,
+            opened_ns: 0,
+            opened_unix_ns: None,
+            leases: Arc::new(Lock::new("serve.job.leases", Leases::default())), // alloc: once per job, shared with its lowering
+            paused: blaze_graph::pressure::Paused::default(),
+            began,
+            doing_said: None,
+            missed: 0,
+            held_wait: None,
+            look_wait: None,
+            placed_any: false,
+            walks,
+            lost: None,
+            after: None,
+            checkout: None,
+            left: None,
+        }
+    }
+
     /// Its plane request opens now.
     fn opening(&mut self) {
         self.opened_ns = blaze_profile::clock::mono_ns();
@@ -3656,68 +3736,7 @@ impl<S: Steps> Jobs<S> {
         };
         let keep_going = keeps_going(&work);
         let snapshot = matches!(work, Work::Snapshot);
-        let job = Job {
-            work,
-            views,
-            ready: Vec::new(), // alloc: once per job, a view or two
-            request: None,
-            idle,
-            closed: false,
-            finished: snapshot,
-            cancelled: Arc::new(AtomicBool::new(false)), // alloc: once per job, shared with its tasks
-            stage: Stage::Over,
-            value: None,
-            updating: HashSet::new_in(Global),
-            said: HashSet::new_in(Global),
-            queries: Vec::new(), // alloc: once per job
-            built: None,
-            borrowed: Vec::new(), // alloc: once per job
-            placing: 0,
-            placed: blaze_cas::PlacedBytes::default(),
-            worked: None,
-            busy: HashMap::new_in(Global),
-            needed: 0,
-            wind_ups: 0,
-            wind_up_ns: 0,
-            names: HashSet::new_in(Global),
-            held: Vec::new(), // alloc: none until a run waits for its program
-            look: 0,
-            awaiting: None,
-            applied: 0,
-            applying: None,
-            shared: false,
-            runs: 0,
-            durable: blaze_cas::Tickets::default(),
-            storing: None,
-            stored: blaze_cas::Tickets::default(),
-            stored_of: None,
-            durable_since: None,
-            over: None,
-            stats: RequestStats::default(),
-            fresh: 0,
-            compiled: 0,
-            served: Vec::new(),    // alloc: none; a build fills it once
-            links: Vec::new(),     // alloc: none until a unit links
-            linked: Vec::new(),    // alloc: none until a unit links
-            misses: Vec::new(),    // alloc: none until a unit misses
-            test_runs: Vec::new(), // alloc: none until a test runs
-            opened_cpu: None,
-            opened_ns: 0,
-            opened_unix_ns: None,
-            leases: Arc::new(Lock::new("serve.job.leases", Leases::default())), // alloc: once per job, shared with its lowering
-            paused: blaze_graph::pressure::Paused::default(),
-            began: w.now,
-            doing_said: None,
-            missed: 0,
-            held_wait: None,
-            look_wait: None,
-            placed_any: false,
-            walks,
-            lost: None,
-            after: None,
-            checkout: None,
-            left: None,
-        };
+        let job = Job::fresh(work, views, idle, walks, w.now);
         if self.jobs.put(key_of(id), job).is_err() {
             // alloc: an error the session's free list can't give
             let error = ApiError::new(

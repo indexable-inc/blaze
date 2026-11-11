@@ -43,70 +43,10 @@ fn opened(root: u8) -> Opened {
     }
 }
 
-/// A job of nothing but its views, as [`Jobs::begin`] puts one in.
+/// A job of nothing but its views, as [`Jobs::begin`] puts one in ([`Job::fresh`], the one
+/// place a job is made: no test writes its fields out).
 fn job(views: Vec<Opened>) -> Job<Real> {
-    Job {
-        work: Work::Snapshot,
-        views,
-        ready: Vec::new(),
-        request: None,
-        idle: false,
-        closed: false,
-        finished: true,
-        cancelled: Arc::new(AtomicBool::new(false)),
-        stage: Stage::Over,
-        value: None,
-        updating: HashSet::new_in(std::alloc::Global),
-        said: HashSet::new_in(std::alloc::Global),
-        queries: Vec::new(),
-        built: None,
-        borrowed: Vec::new(),
-        placing: 0,
-        placed: blaze_cas::PlacedBytes::default(),
-        worked: None,
-        busy: HashMap::new_in(std::alloc::Global),
-        needed: 0,
-        wind_ups: 0,
-        wind_up_ns: 0,
-        names: HashSet::new_in(std::alloc::Global),
-        held: Vec::new(),
-        look: 0,
-        awaiting: None,
-        applied: 0,
-        applying: None,
-        shared: false,
-        runs: 0,
-        durable: blaze_cas::Tickets::default(),
-        storing: None,
-        stored: blaze_cas::Tickets::default(),
-        stored_of: None,
-        durable_since: None,
-        over: None,
-        stats: RequestStats::default(),
-        fresh: 0,
-        compiled: 0,
-        served: Vec::new(),
-        links: Vec::new(),
-        linked: Vec::new(),
-        misses: Vec::new(),
-        test_runs: Vec::new(),
-        opened_cpu: None,
-        opened_ns: 0,
-        opened_unix_ns: None,
-        leases: Arc::new(blaze_core::lock::Lock::new("serve.job.leases", Leases::default())),
-        paused: blaze_graph::pressure::Paused::default(),
-        began: std::time::Duration::ZERO,
-        doing_said: None,
-        missed: 0,
-        held_wait: None,
-        look_wait: None,
-        placed_any: false,
-        walks: None,
-        lost: None,
-        after: None,
-        checkout: None,
-        left: None,
-    }
+    Job::fresh(Work::Snapshot, views, false, None, std::time::Duration::ZERO)
 }
 
 /// A build's row in the history is its plane request's number, the command line it was asked
