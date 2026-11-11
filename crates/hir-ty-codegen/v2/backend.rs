@@ -611,9 +611,10 @@ fn multiversioned(
 }
 
 /// A unit's target features as rustc's tables name them: the baseline's of its target with
-/// what `toolchain` (its sorted `+name` and `-name`) turns on and off. A name only the code
-/// generators know (`fp-armv8`, which rustc folds into `neon`) is no feature of the tables
-/// and is left out: `#[blaze::multiversion]`'s levels are written in rustc's names.
+/// what `toolchain` (its sorted `+name` and `-name`) turns on and off. A name no table of
+/// rustc's has is left out, and one of another arch's table (`fp-armv8` of AArch64's baseline,
+/// which rustc folds into `neon`) implies nothing there: a level never names either, since
+/// `#[blaze::multiversion]`'s levels are checked against the target's own table.
 fn unit_features(target: &crate::Target, toolchain: &[String]) -> hir_ty::TargetFeatureSet {
     let off = |name: &str| toolchain.iter().any(|it| it.strip_prefix('-') == Some(name));
     let baseline = super::toolchain::baseline(target).iter().copied().filter(|it| !off(it));
@@ -1553,7 +1554,7 @@ mod features_tests {
     }
 
     /// What `#[blaze::multiversion]`'s plan is made against: the target's baseline with the
-    /// toolchain's features on and off, in rustc's names; a code generator's own name is none.
+    /// toolchain's features on and off.
     #[test]
     fn a_units_features_are_its_baselines_with_its_toolchains() {
         let has = |set: &hir_ty::TargetFeatureSet, name: &str| {
@@ -1566,7 +1567,6 @@ mod features_tests {
         assert!(has(&unit, "sse2") && has(&unit, "avx2") && !has(&unit, "x87"));
         let arm = crate::Target::of("aarch64-unknown-linux-gnu").expect("a target");
         let unit = unit_features(&arm, &names(&["+sve"]));
-        assert!(has(&unit, "neon") && has(&unit, "sve"));
-        assert_eq!(unit.iter().count(), 2, "`fp-armv8` is LLVM's name, not rustc's: {unit:?}");
+        assert!(has(&unit, "neon") && has(&unit, "sve") && !has(&unit, "sve2"));
     }
 }
