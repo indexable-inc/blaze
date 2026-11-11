@@ -45,6 +45,9 @@ pub enum Refused {
     Stopped(Stopped),
     /// The host refused, saying this.
     Host(&'static str),
+    /// A stream's inbox already held `held` bytes the peer sent and no receive took, and the
+    /// reply would have passed the `most` its opener said: receive, then send again.
+    InboxFull { held: usize, most: usize },
 }
 
 impl fmt::Display for Refused {
@@ -58,6 +61,11 @@ impl fmt::Display for Refused {
             Refused::NotFound => f.write_str("the host has no such thing"),
             Refused::Stopped(stopped) => write!(f, "{stopped}"),
             Refused::Host(said) => write!(f, "the host refused: {said}"),
+            Refused::InboxFull { held, most } => write!(
+                f,
+                "the stream's inbox holds {held} bytes not yet received and would pass the {most} \
+                 its opener allowed: receive what is there first"
+            ),
         }
     }
 }

@@ -19,7 +19,7 @@ use crate::{
     blobs::{Blobs, BlobsKind},
     env::VarName,
     fs::{Content, Dir, Durable, File, FsKind, FsOp, How, Placed, Pushed, ReadWrite, Unsynced},
-    io::{Io, SimWorld},
+    io::{Io, Limits, SimWorld},
     kv::{Key, Kv},
     local::{Pair, pair},
     mem::TASK_FRAME,
@@ -268,7 +268,7 @@ fn a_blob_torn_by_a_crash_is_refused_not_handed_back() {
 
 #[test]
 fn an_env_says_not_allowed_apart_from_not_set() {
-    let mut sim = SimWorld::new(13);
+    let mut sim = SimWorld::new(13, Limits::USUAL);
     sim.env = vec![("HOME".to_owned(), "/home/sim".to_owned()), ("SECRET".to_owned(), "s3".to_owned())];
     let io = Io::simulated(sim);
     let name = |raw: &str| VarName::new(raw).expect("a test's variable");
@@ -348,4 +348,103 @@ fn a_buffered_writer_holds_bytes_until_it_is_full_or_finished_and_says_which() {
     assert!(closed.is_ok());
     // An append with no buffer is in the file when its call returns.
     assert_eq!(io.disk().expect("a simulated disk").device_waits, 0);
+}
+
+/// The bounds a world's waits, closes and trace end by are the ones its maker said: there is
+/// no constant bstd picked. A trace told to keep two records keeps two and counts the rest.
+#[test]
+fn a_worlds_limits_are_the_ones_its_maker_said() {
+    let limits = Limits {
+        abandon_wait: Duration::from_millis(250),
+        poll_fuel: 1 << 10,
+        close_most: 4,
+        trace_most: 2,
+    };
+    let io = Io::simulated(SimWorld::new(21, limits));
+    assert_eq!(io.limits(), limits);
+    let cx = root(&io);
+    for what in ["one", "two", "three", "four"] {
+        cx.event(what);
+    }
+    let (kept, dropped) = io.trace(|trace| (trace.records().len(), trace.dropped()));
+    assert_eq!((kept, dropped), (2, 2), "two kept, two counted");
+    // The usual world's are the named value, said at its call.
+    assert_eq!(world(21, Plant::None).limits(), Limits::USUAL);
+}
+
+/// A stream holds at most the bytes its opener said: a reply that would pass the bound is
+/// refused whole, and received bytes make room again.
+#[test]
+fn a_streams_inbox_is_bounded_by_what_its_opener_said() {
+    use crate::{hosted::Refused, streams::Streams, url::Url};
+    let io = world(22, Plant::None);
+    let cx = root(&io);
+    let origin = Url::parse("https://relay.example/session").expect("a URL");
+    let origin = origin.origin().expect("an origin");
+    let echo = Streams::handler(|_: &crate::Cx, _: &crate::url::Origin, sent: &[u8], reply: &mut crate::mem::Bytes<'_>| {
+        reply.try_extend(sent)
+    });
+    let mut heard = cx.bytes();
+    // A stream is linear: finished whatever it carried, and checked after.
+    let outcome = match echo.open(&cx, origin, 8) {
+        Ok(mut stream) => {
+            let fits = stream.send_all(&cx, b"12345");
+            let over = stream.send_all(&cx, b"6789").map_err(|error| error.kind);
+            let took = stream.recv(&cx, 64, &mut heard);
+            let again = stream.send_all(&cx, b"6789");
+            let finished = stream.finish(&cx);
+            (fits.is_ok(), over, took, again.is_ok(), finished.is_ok())
+        }
+        Err(error) => panic!("a stream to a handler: {error}"),
+    };
+    assert_eq!(outcome, (true, Err(Refused::InboxFull { held: 5, most: 8 }), Ok(5), true, true));
+    assert_eq!(heard.as_slice(), b"12345", "the refused reply left nothing behind");
+}
+
+/// A lock wait is a wait: it takes the task's context, and a lock still held at the
+/// context's deadline ends the wait with the deadline, in a span named for the lock.
+#[test]
+fn a_lock_wait_takes_a_context_and_ends_at_its_deadline() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::sync::Lock;
+    let io = world(23, Plant::None);
+    let cx = root(&io);
+    let clock = io.need_clock().expect("a clock");
+    let lock = Lock::new("a test's lock", 7u32);
+    match lock.lock(&cx) {
+        Ok(guard) => assert_eq!(*guard, 7),
+        Err(stopped) => panic!("a free lock: {stopped}"),
+    }
+    let (held, release) = (AtomicBool::new(false), AtomicBool::new(false));
+    std::thread::scope(|threads| {
+        threads.spawn(|| {
+            let guard = lock.try_lock().expect("the lock is free");
+            held.store(true, Ordering::SeqCst);
+            // Bounded: the test's thread releases it after its one wait; 60 s at most.
+            let start = std::time::Instant::now();
+            while !release.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(60) {
+                std::thread::yield_now();
+            }
+            drop(guard);
+        });
+        let start = std::time::Instant::now();
+        while !held.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(60) {
+            std::thread::yield_now();
+        }
+        assert!(lock.try_lock().is_none(), "held by the other thread");
+        let short = cx.until(clock.after(Duration::from_millis(20)));
+        let waited = lock.lock(&short).map(|_| ());
+        release.store(true, Ordering::SeqCst);
+        match waited {
+            Err(Stopped::Deadline { span, .. }) => assert_eq!(span, "a test's lock"),
+            other => panic!("a lock held past the deadline gave {other:?}"),
+        }
+    });
+    // Free again: the same context takes it.
+    assert!(lock.lock(&cx).is_ok());
+    let said = io.trace(|trace| {
+        trace.records().iter().any(|record| record.span == "a test's lock" && matches!(record.kind, RecordKind::Opened { .. }))
+    });
+    assert!(said, "the lock's wait opened a span named for it");
 }

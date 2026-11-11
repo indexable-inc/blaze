@@ -920,9 +920,11 @@ parameter when records land; its cost and guarantee fields stay required.
 | `pending` | `Pending::cancel(cx, give_up)` | how long a cancel waits past its context | the later of the deadline and 1 s, picked inside |
 | `pending` | `Pending` linear; `read_into`/`write_from` against `read_at`/`write_at` | an op in flight is finished; start against start-and-wait | already explicit |
 | `net` | `Conn::send_all`; `recv(cx, most, into)`; `Net::limit` | all or an error; the caller's bound and buffer; the byte budget | `send` |
-| `net` | `Listener::close` hangs up at most `CLOSE_MOST` and says `Unending` | a bound bstd picks, named | already explicit |
+| `net` | `Listener::close` hangs up at most the world's `Limits::close_most` and says `Unending { accepted, most }` | the bound, said where the `Io` is made | `CLOSE_MOST`, a constant |
+| `io` | `Limits { abandon_wait, poll_fuel, close_most, trace_most }` on `SimWorld` and `NativeWorld`, no `Default`; `Io::limits()` | the bounds of an abandoned value's wait, a stalled driver's polls, a close and the trace | four `pub const`s picked inside |
+| `sync` | `Lock::lock(cx)`, `Lock::try_lock()` | a lock wait is a wait: a deadline, a span named for the lock, `Stopped` | `lock()` with no `Cx` |
 | `local` | `pair(name, NonZero)`, `End::write_all` (`LocalError::moved`) | the buffer's size; all or how far | capacity 0 raised to 1; `write` |
-| `streams` | `Stream::send_all` | all or an error | `send` |
+| `streams` | `Stream::send_all`; `Streams::open(cx, origin, inbox_most)` and `Refused::InboxFull` | all or an error; the most bytes a stream holds unreceived | `send`; an unbounded inbox |
 | `requests` | `Http::over(net, clock, roots, Wire)` (record: `Wire`'s fields) | user agent, most body bytes, most receives; one connection a request, no retry, redirect or pool | three constants picked inside |
 | `requests` | `Exchange` linear, `request(.., into)` | the answer's buffer; finishing | already explicit |
 | `env` | `Env::get -> Result<Option<&str>, NotAllowed>` | not allowed against not set | both `None` |
@@ -947,12 +949,13 @@ chosen otherwise today, and each is a row to close):
 | every write and send | the bytes are copied once into the effect, in the global heap | registered buffers, S4 |
 | `Pending` | one boxed closure an op | the `Frames` layout (the op's state is in its frame) |
 | `requests::Http::over` | the h1 core's head and body buffers are `Vec`s in the global heap | an h1 core that takes an allocator |
-| `streams` (handler provider) | replies are held in an unbounded queue in the global heap | a bound and an allocator on `Streams::handler` |
+| `streams` (handler provider) | replies are held in the global heap (bounded by `inbox_most`) | an allocator on `Streams::open` |
 | `Path::join`, `Dir::subdir`, narrowing (`only`) | a name or an allow-list is allocated in the global heap, once | S4's `String<A>`, or names interned in the task's frame |
 | `keys::Secret` | its bytes are in the global heap | a locked, zeroed arena from `Mem` |
-| `sync::{Lock, RwLock}` | `lock()` takes no `Cx`: no deadline, and nothing in its type says it may wait | S1b: bstd's own lock over the one wait |
+| `sync::RwLock`, `Signal` | `read()`, `write()` and `wait()` take no `Cx` (blaze-core's, re-exported); `Lock::lock(cx)` waits on the wall clock, not the driver's | S1b: bstd's own locks over the one wait |
 | `Io`'s own state | one process lock around the driver (uncontended under `Inline`) | the scheduler (S3b) |
-| `io::ABANDON_WAIT`, `io::POLL_FUEL`, `net::CLOSE_MOST`, `trace::TRACE_MOST`, `kv::KEY_MOST` | bounds bstd picks, each a `pub const` named in the outcome it ends in | record parameters, where a caller could pick |
+| `kv::KEY_MOST` | a bound of the format (a key's longest file name), a `pub const` named in the outcome it ends in | nothing: not a policy |
+| `Io::sim(seed)` | `Limits::USUAL`, a named value its doc says | nothing: a test's world; `Io::simulated(SimWorld::new(seed, limits))` says its own |
 | `SimWorld::new(seed)` | the simulation's latency and faults default (`Faults::default`) | nothing: a test's world, and the seed is said |
 | `audio` callbacks | `Fill`/`Take` should be `noalloc` and `nonblocking`; a closure type cannot carry the mark | effect bounds on closure parameters |
 | the facade (`record`, `report`, `bytes`, `http`, `quic`) | re-exports are not audited here: `record::to_bytes` and `report::render` allocate in the global heap | S1d, as each piece is merged |

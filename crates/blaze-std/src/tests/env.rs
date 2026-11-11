@@ -9,7 +9,7 @@ use super::{Draw, Drawn, Seeds, check, control};
 use crate::{
     Plant,
     env::VarName,
-    io::{Io, SimWorld},
+    io::{Io, Limits, SimWorld},
 };
 
 const VARS: [&str; 5] = ["HOME", "PATH", "TOKEN", "LANG", "UNSET"];
@@ -28,7 +28,7 @@ fn plan(d: &mut impl Draw) -> Plan {
 }
 
 fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
-    let mut world = SimWorld::new(plan.seed);
+    let mut world = SimWorld::new(plan.seed, Limits::USUAL);
     // Every one but UNSET is set.
     world.env = VARS[..4].iter().map(|name| ((*name).to_owned(), format!("{name} value"))).collect();
     let io = Io::planted(world, plant);

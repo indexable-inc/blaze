@@ -16,7 +16,7 @@ use super::{Draw, Drawn, Seeds, check, control, path, root};
 use crate::{
     Cx, Plant,
     fs::ReadWrite,
-    io::{Io, SimWorld},
+    io::{Io, Limits, SimWorld},
     kv::{Key, Kv},
 };
 
@@ -87,7 +87,7 @@ fn agrees(cx: &Cx, kv: &Kv<ReadWrite>, model: &BTreeMap<usize, Vec<u8>>, at: usi
 }
 
 fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
-    let mut world = SimWorld::new(plan.seed);
+    let mut world = SimWorld::new(plan.seed, Limits::USUAL);
     world.faults = Faults { max_latency: Duration::from_micros(plan.latency_us), ..Faults::default() };
     let io = Io::planted(world, plant);
     let cx = root(&io);

@@ -75,14 +75,38 @@ use crate::{
     window::Window,
 };
 
-/// The most polls in a row that bring nothing while the deadline has not passed: a driver
-/// whose poll returns early this often does not keep its deadline (rule bounded-progress).
-pub(crate) const POLL_FUEL: u32 = 1 << 16;
+/// The bounds bstd would otherwise pick for its caller, said once where the [`Io`] is made
+/// (docs/v2/plan/design/std.md, "The second rule": a bound is an argument, never a default).
+/// A world is made with one ([`SimWorld::limits`], [`NativeWorld::limits`]); there is no
+/// `Default`. [`Limits::USUAL`] is a named value, written at the call like any other.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Limits {
+    /// How long an abandoned value waits, on the driver's clock, for what it had in flight to
+    /// end (a [`crate::pending::Pending`]'s op, a [`crate::task::Scope`]'s tasks) when a panic
+    /// drops it: its abandonment path's bound.
+    pub abandon_wait: Duration,
+    /// The most polls in a row that bring nothing while the deadline has not passed, before
+    /// the wait ends as [`Stopped::Stalled`]: a driver whose poll returns early this often
+    /// does not keep its deadline.
+    pub poll_fuel: u32,
+    /// The most connections [`crate::net::Listener::close`] hangs up while it waits for the
+    /// listen's end, before it stops waiting.
+    pub close_most: usize,
+    /// The most records the world's trace keeps; past it each further one is counted in
+    /// [`Trace::dropped`].
+    pub trace_most: usize,
+}
 
-/// How long an abandoned value waits, on the driver's clock, for what it had in flight to end
-/// (a [`crate::pending::Pending`]'s op, a [`crate::task::Scope`]'s tasks) when a panic drops it:
-/// its abandonment path's bound (rule bounded-progress).
-pub const ABANDON_WAIT: Duration = Duration::from_secs(1);
+impl Limits {
+    /// One second for an abandoned value, 65,536 idle polls, 1,024 connections hung up by a
+    /// close, 65,536 trace records: what blaze's own programs and the tests say.
+    pub const USUAL: Limits = Limits {
+        abandon_wait: Duration::from_secs(1),
+        poll_fuel: 1 << 16,
+        close_most: 1024,
+        trace_most: 1 << 16,
+    };
+}
 
 /// What the simulation's generator of [`Io::rng`] starts from, besides the seed: so it draws
 /// other numbers than the simulation's own scheduler.
@@ -205,6 +229,7 @@ pub struct Io {
     env: Arc<[(String, String)]>,
     args: Arc<[String]>,
     offers: Offers,
+    limits: Limits,
 }
 
 /// The table of what a host offers, one flag a root capability, and what is made from it.
@@ -345,13 +370,16 @@ pub struct SimWorld {
     pub host: HostFacts,
     /// What its program is offered: [`Offers::ALL`] unless a test withholds some.
     pub offers: Offers,
+    /// The bounds its waits, closes and trace end by.
+    pub limits: Limits,
 }
 
 impl SimWorld {
     /// The world of [`Io::sim`]: no faults beyond latency, no environment, no arguments, the
-    /// simulated host, every capability offered.
-    pub fn new(seed: u64) -> SimWorld {
+    /// simulated host, every capability offered, with the bounds `limits`.
+    pub fn new(seed: u64, limits: Limits) -> SimWorld {
         SimWorld {
+            limits,
             seed,
             faults: Faults::default(),
             // alloc: none, an empty environment.
@@ -376,6 +404,8 @@ pub struct NativeWorld<'a> {
     pub args: Vec<String>,
     pub host_name: Arc<str>,
     pub seed: u64,
+    /// The bounds its waits, closes and trace end by.
+    pub limits: Limits,
 }
 
 /// What a world starts from, whichever its driver.
@@ -386,6 +416,7 @@ struct Start {
     args: Vec<String>,
     host: HostFacts,
     offers: Offers,
+    limits: Limits,
     hosted: Option<Box<SimHost>>,
     disk: Option<Box<Disk>>,
     plant: Plant,
@@ -408,14 +439,16 @@ impl core::error::Error for OpenError {}
 
 impl Io {
     /// A whole simulated world from `seed`: an in-memory file tree, a virtual clock, a seeded
-    /// generator, no faults beyond the simulation's latency and no environment.
+    /// generator, no faults beyond the simulation's latency and no environment, with
+    /// [`Limits::USUAL`]: a test's world, whose seed is said. A world with other bounds is
+    /// [`Io::simulated`] of a [`SimWorld`].
     pub fn sim(seed: u64) -> Io {
-        Io::simulated(SimWorld::new(seed))
+        Io::simulated(SimWorld::new(seed, Limits::USUAL))
     }
 
     /// [`Io::sim`] offering only what `offers` says: a test of a host that withholds some.
     pub fn sim_with(seed: u64, offers: Offers) -> Io {
-        let mut world = SimWorld::new(seed);
+        let mut world = SimWorld::new(seed, Limits::USUAL);
         world.offers = offers;
         Io::simulated(world)
     }
@@ -434,6 +467,7 @@ impl Io {
             args: world.args,
             host: world.host,
             offers: world.offers,
+            limits: world.limits,
             // alloc: once per simulated world, its host.
             hosted: Some(Box::new(SimHost::new())),
             // alloc: once per simulated world, its disk's ledger.
@@ -462,6 +496,7 @@ impl Io {
             args: world.args,
             host: HostFacts { pid: crate::rt::process_id(), cores, name: world.host_name },
             offers: crate::host::OFFERS,
+            limits: world.limits,
             hosted: None,
             disk: None,
             plant: Plant::None,
@@ -469,7 +504,7 @@ impl Io {
     }
 
     fn over(start: Start) -> Io {
-        let Start { driver, seed, env, args, host, offers, hosted, disk, plant } = start;
+        let Start { driver, seed, env, args, host, offers, limits, hosted, disk, plant } = start;
         let world = World {
             driver,
             next: 0,
@@ -485,7 +520,7 @@ impl Io {
             // alloc: none until a test records.
             touched: Vec::new(),
             record: false,
-            trace: Trace::new(),
+            trace: Trace::new(limits.trace_most),
             host,
             exited: None,
             hosted,
@@ -500,7 +535,16 @@ impl Io {
             // alloc: once per world, its command line.
             args: args.into(),
             offers,
+            limits,
         }
+    }
+
+    /// The bounds this world was made with.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn limits(&self) -> Limits {
+        self.limits
     }
 
     /// The root context: named `main`, never cancelled, ending `budget` from now on the
@@ -972,8 +1016,8 @@ impl Io {
 
     /// The next completion of the one-shot `tag`, waited for until `until` heeding no
     /// cancellation: the wait of a cancel and of an abandonment, which must see their op end
-    /// so that nothing it does lands after they return. Past `until`, or after [`POLL_FUEL`]
-    /// polls in a row that bring nothing, the op is given up ([`Io::forget`]) and the stop
+    /// so that nothing it does lands after they return. Past `until`, or after
+    /// [`Limits::poll_fuel`] polls in a row that bring nothing, the op is given up ([`Io::forget`]) and the stop
     /// says why (rule bounded-progress).
     pub(crate) fn settle(&self, tag: Tag, until: Deadline, span: &'static str) -> Result<Done, Stopped> {
         let mut idle = 0;
@@ -983,7 +1027,7 @@ impl Io {
             }
             let stopped = if until.passed(self.now()) {
                 Some(Stopped::Deadline { span, at: until.get() })
-            } else if idle == POLL_FUEL {
+            } else if idle == self.limits.poll_fuel {
                 Some(Stopped::Stalled { span, polls: idle })
             } else {
                 None

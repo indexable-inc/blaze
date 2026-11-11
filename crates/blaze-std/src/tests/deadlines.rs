@@ -15,7 +15,7 @@ use crate::{
     Cx, Plant, Stopped,
     clock::{Clock, SleepError},
     fs::{Dir, File, ReadWrite},
-    io::{Io, SimWorld},
+    io::{Io, Limits, SimWorld},
 };
 
 /// Writes under `slow` take this long more.
@@ -54,7 +54,7 @@ fn plan(d: &mut impl Draw) -> Plan {
 }
 
 fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
-    let mut world = SimWorld::new(plan.seed);
+    let mut world = SimWorld::new(plan.seed, Limits::USUAL);
     world.faults = Faults { max_latency: Duration::from_micros(plan.latency_us), ..Faults::default() };
     let io = Io::planted(world, plant);
     let cx = root(&io);

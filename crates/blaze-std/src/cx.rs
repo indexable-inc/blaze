@@ -31,7 +31,7 @@ use blaze_mem::Frame;
 
 use crate::{
     Plant, Stopped,
-    io::{Ends, Io, POLL_FUEL},
+    io::{Ends, Io},
     mem::Bytes,
     task::{Scope, TaskError},
     trace::RecordKind,
@@ -208,7 +208,7 @@ impl Cx {
                 Some(Stopped::Cancelled { span: self.span })
             } else if deadline.passed(io.now()) {
                 Some(Stopped::Deadline { span: self.span, at: deadline.get() })
-            } else if idle == POLL_FUEL {
+            } else if idle == io.limits().poll_fuel {
                 Some(Stopped::Stalled { span: self.span, polls: idle })
             } else {
                 None
@@ -255,7 +255,7 @@ impl Cx {
             if deadline.passed(io.now()) {
                 return Err(Stopped::Deadline { span: self.span, at: deadline.get() });
             }
-            if idle == POLL_FUEL {
+            if idle == io.limits().poll_fuel {
                 return Err(Stopped::Stalled { span: self.span, polls: idle });
             }
             match io.poll(deadline) {

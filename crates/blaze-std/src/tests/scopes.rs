@@ -17,7 +17,7 @@ use crate::{
     Cx, Plant,
     clock::Clock,
     fs::{File, ReadWrite},
-    io::{ABANDON_WAIT, Io},
+    io::{Io, Limits},
     mem::TASK_FRAME,
     task::{TaskError, TaskWhy},
 };
@@ -97,13 +97,13 @@ fn act(cx: &Cx, kind: Kind, clock: &Clock, file: &File<ReadWrite>) -> Result<(),
         Kind::Writes { cancel } => {
             let bytes = [7u8; 8];
             let pending = file.write_from(&bytes, 0);
-            let _ = if cancel { pending.cancel(cx, cx.deadline().max(clock.after(ABANDON_WAIT))) } else { pending.wait(cx) };
+            let _ = if cancel { pending.cancel(cx, cx.deadline().max(clock.after(Limits::USUAL.abandon_wait))) } else { pending.wait(cx) };
             Ok(())
         }
         Kind::Reads { cancel } => {
             let mut buf = [0u8; 8];
             let pending = file.read_into(&mut buf, 0);
-            let _ = if cancel { pending.cancel(cx, cx.deadline().max(clock.after(ABANDON_WAIT))) } else { pending.wait(cx) };
+            let _ = if cancel { pending.cancel(cx, cx.deadline().max(clock.after(Limits::USUAL.abandon_wait))) } else { pending.wait(cx) };
             Ok(())
         }
     }

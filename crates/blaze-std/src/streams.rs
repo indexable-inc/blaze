@@ -101,8 +101,11 @@ impl Streams {
         Streams { provider: self.provider.clone(), allowed: self.allowed.one(origin, self.plant), plant: self.plant }
     }
 
-    /// A stream opened to `origin`: finished with [`Stream::finish`].
-    pub fn open(&self, cx: &Cx, origin: &Origin) -> Result<Stream, StreamsError> {
+    /// A stream opened to `origin`: finished with [`Stream::finish`]. `inbox_most` is the most
+    /// bytes it holds that the peer sent and no [`Stream::recv`] has taken: a send whose
+    /// reply would pass it fails with [`Refused::InboxFull`] and keeps none of the reply, so
+    /// what a stream holds is bounded by a number its opener said.
+    pub fn open(&self, cx: &Cx, origin: &Origin, inbox_most: usize) -> Result<Stream, StreamsError> {
         // clone: an error's name of its origin, refcounts.
         let refuse = |kind| StreamsError { op: StreamsOp::Open, origin: origin.clone(), kind };
         if !self.allowed.allows(origin) {
@@ -117,7 +120,7 @@ impl Streams {
             Provider::Handler(_) => {}
         }
         // clone: the stream's provider and origin, refcounts; alloc: none, an empty inbox.
-        Ok(Stream { provider: self.provider.clone(), origin: origin.clone(), inbox: VecDeque::new() })
+        Ok(Stream { provider: self.provider.clone(), origin: origin.clone(), inbox: VecDeque::new(), inbox_most })
     }
 }
 
@@ -140,6 +143,8 @@ pub struct Stream {
     origin: Origin,
     /// What a handler replied and a receive has not taken yet.
     inbox: VecDeque<u8>,
+    /// The most bytes `inbox` holds: said by [`Streams::open`]'s caller.
+    inbox_most: usize,
 }
 
 impl Stream {
@@ -164,9 +169,16 @@ impl Stream {
                 let mut reply = cx.bytes();
                 match handler(cx, &self.origin, bytes, &mut reply) {
                     Ok(()) => {
-                        // alloc: the stream's inbox, freed as it is received.
-                        self.inbox.extend(reply.as_slice());
-                        Ok(())
+                        let held = self.inbox.len();
+                        match held.saturating_add(reply.as_slice().len()) > self.inbox_most {
+                            true => Err(Refused::InboxFull { held, most: self.inbox_most }),
+                            false => {
+                                // alloc: the stream's inbox, at most `inbox_most` bytes, freed
+                                // as it is received.
+                                self.inbox.extend(reply.as_slice());
+                                Ok(())
+                            }
+                        }
                     }
                     Err(stopped) => Err(Refused::Stopped(stopped)),
                 }
@@ -212,7 +224,7 @@ impl Stream {
     /// received is dropped. The one way a `Stream` ends.
     #[blaze::consumes]
     pub fn finish(self, cx: &Cx) -> Result<(), StreamsError> {
-        let Stream { provider, origin, inbox: _ } = self;
+        let Stream { provider, origin, inbox: _, inbox_most: _ } = self;
         let finished = match &provider {
             Provider::Host(io) => hosted::call(io, cx, |host| {
                 host.streams.finished += 1;

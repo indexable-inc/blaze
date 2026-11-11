@@ -15,7 +15,7 @@ use super::{Draw, Drawn, Seeds, check, control, path, root};
 use crate::{
     Cx, Plant,
     fs::{Content, Dir, File, FsKind, ReadWrite, Unsynced},
-    io::{Io, SimWorld},
+    io::{Io, Limits, SimWorld},
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -53,7 +53,7 @@ fn plan(d: &mut impl Draw) -> Plan {
 }
 
 fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
-    let mut world = SimWorld::new(plan.seed);
+    let mut world = SimWorld::new(plan.seed, Limits::USUAL);
     world.faults = Faults { max_latency: Duration::from_micros(plan.latency_us), ..Faults::default() };
     let io = Io::planted(world, plant);
     let cx = root(&io);

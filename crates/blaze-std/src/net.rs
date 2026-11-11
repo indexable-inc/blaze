@@ -376,9 +376,9 @@ pub enum NetKind {
     NoSuchName,
     /// The `Net` it came from has a byte limit ([`Net::limit`]) with no room for it.
     OverLimit(Over),
-    /// [`Listener::close`] took more than [`CLOSE_MOST`] connections made while it closed,
-    /// and stopped waiting for the listen's end.
-    Unending { accepted: usize },
+    /// [`Listener::close`] took more than `most` connections made while it closed (the
+    /// world's [`crate::io::Limits::close_most`]), and stopped waiting for the listen's end.
+    Unending { accepted: usize, most: usize },
     Stopped(Stopped),
     /// The driver failed it, saying this.
     Driver(String),
@@ -410,10 +410,11 @@ impl fmt::Display for NetError {
             NetKind::OverLimit(over) => {
                 write!(f, "bstd::net {op:?} to {addr}: this Net's byte limit: {over}")
             }
-            NetKind::Unending { accepted } => write!(
+            NetKind::Unending { accepted, most } => write!(
                 f,
                 "bstd::net {op:?} to {addr}: {accepted} connections were made while it closed, more \
-                 than {CLOSE_MOST}, and the listen's end never came (rule bounded-progress)"
+                 than {most} (the world's Limits::close_most), and the listen's end never came \
+                 (rule bounded-progress)"
             ),
             NetKind::Stopped(stopped) => write!(f, "bstd::net {op:?} to {addr}: {stopped}"),
             NetKind::Driver(said) => write!(f, "bstd::net {op:?} to {addr}: {said}"),
@@ -530,10 +531,6 @@ impl Net {
     }
 }
 
-/// The most connections [`Listener::close`] hangs up while it waits for the listen's end,
-/// before it stops waiting (rule bounded-progress).
-pub const CLOSE_MOST: usize = 1024;
-
 /// A listen in flight, finished with [`Listener::close`]. Linear (see the module's doc): a
 /// panic that drops one ends the listen without waiting, and drops what comes of it.
 #[blaze::linear]
@@ -582,7 +579,8 @@ impl Listener {
     }
 
     /// The listen ended: it waits, until `cx`'s deadline, for the driver to say so, hanging up
-    /// each connection made meanwhile, at most [`CLOSE_MOST`] of them. The one way a
+    /// each connection made meanwhile, at most the world's
+    /// [`crate::io::Limits::close_most`] of them. The one way a
     /// `Listener` ends.
     #[blaze::consumes]
     pub fn close(mut self, cx: &Cx) -> Result<(), NetError> {
@@ -593,8 +591,9 @@ impl Listener {
         listening.open = false;
         let (io, tag) = (listening.io.clone(), listening.tag);
         let _ = io.submit(|_| Effect::Unlisten { tag });
+        let most = io.limits().close_most;
         let mut accepted = 0;
-        while accepted <= CLOSE_MOST {
+        while accepted <= most {
             let done = match cx.wait(&io, tag, Ends::Stream) {
                 Ok(done) => done,
                 Err(stopped) => {
@@ -613,7 +612,7 @@ impl Listener {
             }
         }
         io.forget(tag, Ends::Stream);
-        Err(error(NetOp::Close, &self.at, NetKind::Unending { accepted }))
+        Err(error(NetOp::Close, &self.at, NetKind::Unending { accepted, most }))
     }
 }
 

@@ -16,7 +16,7 @@ use super::{Draw, Drawn, Seeds, check, control, path, root};
 use crate::{
     Cx, Plant,
     fs::{File, ReadWrite},
-    io::{ABANDON_WAIT, Io, SimWorld},
+    io::{Io, Limits, SimWorld},
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -44,7 +44,7 @@ fn plan(d: &mut impl Draw) -> Plan {
 }
 
 fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
-    let mut world = SimWorld::new(plan.seed);
+    let mut world = SimWorld::new(plan.seed, Limits::USUAL);
     world.faults = Faults { max_latency: Duration::from_micros(plan.latency_us), ..Faults::default() };
     let io = Io::planted(world, plant);
     let cx = root(&io);
@@ -63,9 +63,9 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
 }
 
 /// How long a cancel waits for its op's end: the later of the context's deadline and
-/// [`ABANDON_WAIT`] from now, said here by the caller.
+/// [`Limits::USUAL.abandon_wait`] from now, said here by the caller.
 fn give_up(io: &Io, cx: &Cx) -> Deadline {
-    cx.deadline().max(Deadline::after(io.now(), ABANDON_WAIT))
+    cx.deadline().max(Deadline::after(io.now(), Limits::USUAL.abandon_wait))
 }
 
 /// What the simulated disk holds of `file` now, synced or not.

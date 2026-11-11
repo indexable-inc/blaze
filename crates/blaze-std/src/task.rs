@@ -22,7 +22,7 @@
 //! either unjoined is a compile error, since a scope's tasks must have ended and its failure
 //! been seen before the frame holding it goes on. A [`Task`] borrows its scope, so it is
 //! joined before the scope is. A panic that unwinds past a scope runs its abandonment path,
-//! its `Drop`: it cancels the scope, then waits, bounded by [`ABANDON_WAIT`], for its tasks to
+//! its `Drop`: it cancels the scope, then waits, bounded by [`crate::io::Limits::abandon_wait`], for its tasks to
 //! end, and records how ([`Settled`]) in the trace. The scope holds its tasks' state itself, so
 //! a `Task` is not put in a `Vec` or an `Option` (the checker refuses a linear value in a type
 //! argument of a type that is not marked for it): each is joined where it was spawned.
@@ -50,7 +50,6 @@ use crate::{
     rt::{catch_unwind, resume_unwind},
     cx::Cx,
     host::Exit,
-    io::ABANDON_WAIT,
 };
 
 /// How a waiting task's frames are stored (std.md, "Layouts").
@@ -168,7 +167,7 @@ impl Drop for Live {
             return;
         }
         self.cx.cancel();
-        let until = Deadline::after(self.cx.io().now(), ABANDON_WAIT);
+        let until = Deadline::after(self.cx.io().now(), self.cx.io().limits().abandon_wait);
         let what = match self.settle(until) {
             Settled::All => "scope: abandoned, its tasks ended",
             Settled::Left { .. } => "scope: abandoned, tasks still running",

@@ -9,7 +9,7 @@
 //! **Linear.** A `Pending` is `#[blaze::linear]`: leaving one unfinished is a compile error
 //! (crates/hir-ty-linear), because the op it names is still running and its buffer is lent to
 //! it. A panic that unwinds past one runs its abandonment path, its `Drop`: it waits, heeding
-//! no cancellation, up to [`ABANDON_WAIT`] on the driver's clock for the op to end, then
+//! no cancellation, up to [`crate::io::Limits::abandon_wait`] on the driver's clock for the op to end, then
 //! records in the trace how that wait ended (`pending: abandoned, ended` or `pending:
 //! abandoned, still in flight`).
 //!
@@ -30,7 +30,7 @@ use blaze_core::{Done, Effect, Tag, wait::Deadline};
 use crate::{
     Plant, Stopped,
     cx::Cx,
-    io::{ABANDON_WAIT, Ends, Io},
+    io::{Ends, Io},
     trace::RecordKind,
 };
 
@@ -69,7 +69,7 @@ impl Drop for Settle {
             return;
         }
         let Some(tag) = self.tag else { return };
-        let until = Deadline::after(self.io.now(), ABANDON_WAIT);
+        let until = Deadline::after(self.io.now(), self.io.limits().abandon_wait);
         let what = match self.io.settle(tag, until, self.span) {
             Ok(_) => "pending: abandoned, ended",
             Err(_) => "pending: abandoned, still in flight",
@@ -127,7 +127,7 @@ impl<T> Pending<'_, T> {
     /// The op given up: blaze-core cannot cancel an effect in flight, so this waits, heeding
     /// no cancellation, for the op to end, until `give_up`: the caller's bound on a wait that
     /// by design outlasts a cancelled or expired `cx` (it was once the later of `cx`'s
-    /// deadline and [`ABANDON_WAIT`] from now, picked here). Its outcome is what the op did:
+    /// deadline and [`crate::io::Limits::abandon_wait`] from now, picked here). Its outcome is what the op did:
     /// done, or why the wait stopped (then the op may still be in flight, and the stop says
     /// so). `cx` names the span the wait is recorded in.
     #[blaze::consumes]

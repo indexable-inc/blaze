@@ -38,7 +38,65 @@ pub use core::{
 // ban list, `crates/blaze-std/src/rt.rs`).
 pub use crate::rt::{LazyLock as Lazy, OnceLock as Once};
 
-pub use blaze_core::lock::{Lock, LockGuard, ReadGuard, ReadLock as RwLock, Signal, WriteGuard};
+pub use blaze_core::lock::{LockGuard, ReadGuard, ReadLock as RwLock, Signal, WriteGuard};
+
+use crate::{Stopped, cx::Cx};
+
+/// The one lock, named. Taking it is a wait like any other (docs/v2/plan/design/std.md, "One
+/// wait"): [`Lock::lock`] takes the task's `Cx`, so the wait has a deadline and a span, and
+/// [`Lock::try_lock`] never waits. There is no `lock()` that waits for ever.
+///
+/// Over `blaze_core::lock::Lock`, which names the lock and records who waited behind whom.
+/// The wait is that lock's bounded one (`try_lock_for`), on the wall clock: under the
+/// `Inline` layout a lock is contended only by another thread, never by another task of the
+/// same simulated world, so the simulation's virtual clock has no lock wait to model yet.
+pub struct Lock<T>(blaze_core::lock::Lock<T>);
+
+impl<T> Lock<T> {
+    /// A lock named `name` over `value`.
+    pub const fn new(name: &'static str, value: T) -> Lock<T> {
+        Lock(blaze_core::lock::Lock::new(name, value))
+    }
+
+    /// The lock's name: the span its waits open.
+    pub fn name(&self) -> &'static str {
+        self.0.name()
+    }
+
+    /// The lock if it is free now; never waits.
+    pub fn try_lock(&self) -> Option<LockGuard<'_, T>> {
+        self.0.try_lock()
+    }
+
+    /// The lock, waited for until `cx`'s deadline in a span named for the lock: the guard, or
+    /// why the wait stopped ([`Stopped::Cancelled`] when `cx` was cancelled before the wait,
+    /// [`Stopped::Deadline`] when the deadline passed with the lock still held). A context
+    /// with no deadline ([`blaze_core::wait::Deadline::NEVER`]) said its waits have none.
+    pub fn lock(&self, cx: &Cx) -> Result<LockGuard<'_, T>, Stopped> {
+        cx.check()?;
+        if let Some(guard) = self.0.try_lock() {
+            return Ok(guard);
+        }
+        let cx = cx.span(self.0.name());
+        let Some(deadline) = cx.deadline().finite() else {
+            return Ok(self.0.lock());
+        };
+        match self.0.try_lock_for(deadline.left(cx.io().now())) {
+            Some(guard) => Ok(guard),
+            None => Err(Stopped::Deadline { span: cx.name(), at: deadline.get() }),
+        }
+    }
+
+    /// The value, through the only reference to the lock: no wait.
+    pub fn get_mut(&mut self) -> &mut T {
+        self.0.get_mut()
+    }
+
+    /// The value, the lock consumed.
+    pub fn into_inner(self) -> T {
+        self.0.into_inner()
+    }
+}
 pub use blaze_spin::SpinWait;
 
 /// Reclamation at task ends: a value unlinked from a shared table is dropped once every thread
