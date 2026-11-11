@@ -48,6 +48,8 @@ pub mod views;
 #[cfg(test)]
 mod budget;
 #[cfg(test)]
+mod contracts_tests;
+#[cfg(test)]
 mod differential;
 #[cfg(test)]
 mod dropck_tests;

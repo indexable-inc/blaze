@@ -341,6 +341,10 @@ struct MirLowerCtx<'a, 'f, 'db> {
     /// (`cfg::CONTRACT_CHECKS`, docs/v2/plan/design/contracts.md part 1); `None` everywhere
     /// else, which lowers as before.
     contracts: Option<contract::Contracts>,
+    /// The locals made while an `ensures` clause was lowered, as ranges of local indexes: the
+    /// clause's own, which it may move out of. A clause is lowered at each way out and binds
+    /// the same locals each time.
+    ensures_locals: Vec<(usize, usize), &'f Frame>,
     /// Set only while `unreachable_after_calls`'s probe lowers the body again
     /// (`lower/uninhabited.rs`): lowering goes on past calls of an uninhabited type.
     probe: Option<uninhabited::Probe<'f>>,
@@ -526,6 +530,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             exit_ended_buf: Vec::new_in(frame),
             uninhabited_call: false,
             contracts: None,
+            ensures_locals: Vec::new_in(frame),
             probe: None,
             early_drops: &[],
             early_drops_placed: 0,
