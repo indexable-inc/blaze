@@ -49,12 +49,11 @@ at `allow`. The macro and build-script lints have no fix: neither rewrite is mec
 
 A workspace can wait for a switch too. Beside `[workspace.metadata.blaze.lints]`, the table
 `[workspace.metadata.blaze.lints-when-ready]` takes the same lines, of lints that have a
-switch: each sets its level once the lint's switch is `true`, and nothing until then. blaze's
-own manifest has `std_use = "warn"` there, so turning `BSTD_IN_TREE` to `true` turns the lint
-on for every crate of blaze, and that one constant is the whole change. It is a table of its
-own because a released blaze refuses a lint name it does not know in the first table, and
-reads no table it does not know: the line can be written before the blaze that builds the
-tree has the lint.
+switch: each sets its level once the lint's switch is `true`, and nothing until then. It is a
+table of its own because a released blaze refuses a lint name it does not know in the first
+table, and reads no table it does not know: the line can be written before the blaze that
+builds the tree has the lint. blaze's own manifest does not wait for `BSTD_IN_TREE`: its
+ratchet denies `std_use` now ([the ratchet](#workspace-levels-and-the-ratchet)).
 
 The group also holds what the edition removes or respells (`async_fn`, `global_state`,
 `lossy_as`, `mut_ref`), what it writes at a crate's border (`unmarked_pure`,
@@ -94,6 +93,33 @@ hash_twice = "deny"
 
 A group applies before the single lints the table names, so `hash_twice = "deny"` wins over
 `general = "allow"`. A rustc-style flag (`--allow=blaze::general`) does the same.
+
+## Workspace levels and the ratchet
+
+blaze's own workspace denies every lint of blaze's in every crate, and lets a crate that
+still trips one stay at `warn` on it only while the crate is listed in the lint's baseline.
+The levels are in `[workspace.metadata.blaze.lints-ratchet]`, which this blaze reads in place
+of `[workspace.metadata.blaze.lints]`: every group at `deny`, and below it, each with its
+reason beside it in the manifest, `hot` (the costs that matter only in hot code), the parallel
+lints (suggestions) and `vecreport` (not run by `blaze check`). The released blaze that builds
+the tree reads the older table, at `warn`.
+
+The table's `baselines` key names the directory, `crates/blaze-lints/baselines`. Its file
+`blaze.<lint>.txt` has a line `crate<TAB>count` per crate held at `warn` on that lint, or
+`crate<TAB>unmeasured` before a run has counted it; each listed crate gets
+`--warn=blaze::<lint>` after the workspace's levels. A crate with no line is at `deny`. The
+list only shrinks:
+
+- `harness/v2/guards.py '{"command": "ratchet", "base": "<rev>"}'` refuses a crate a baseline
+  did not list at the base, a count that rose, and a count turned back to `unmeasured`. The
+  gate's `lint-baselines` job runs it against the pull request's base.
+- `blaze check --workspace --target aarch64-unknown-linux-gnu --baselines
+  crates/blaze-lints/baselines` fails on a count over its line or a line over its count.
+  Adding `--bless-baselines` records each count, drops each crate at zero, and deletes a
+  baseline with no crate left, saying so. That lint is then `deny` everywhere.
+
+A new crate gets no line, so it is held to every lint from the start. Making a lint `warn`
+again for a crate is a change to this section's rule, not to a baseline.
 
 ## Thresholds
 
@@ -1588,9 +1614,11 @@ has a fix: each changes what a function is handed, and by whom.
 for it with `#![blaze::capabilities]` at its root (a module can too), which sets it to `warn`
 beneath, as `#![warn(blaze::std_use)]` there would. A workspace asks with
 `std_use = "warn"` in `[workspace.metadata.blaze.lints-when-ready]`, which holds once
-`BSTD_IN_TREE` (`crates/blaze-lint-defs/src/ready.rs`) is `true`; blaze's own table has the
-line. `-W blaze::std_use` in `RUSTFLAGS` turns it on for one run, which is how the worklist is
-made today.
+`BSTD_IN_TREE` (`crates/blaze-lint-defs/src/ready.rs`) is `true`. blaze's own workspace denies
+it ahead of the switch, in its ratchet, each crate not yet ported held at `warn` by its line in
+`crates/blaze-lints/baselines/blaze.std_use.txt` ([the ratchet](#workspace-levels-and-the-ratchet)).
+`-W blaze::std_use` in `RUSTFLAGS` turns it on for one run, which is how the worklist is made
+today.
 
 **Not found.** A build script: that is [`build_script_ambient`](#build_script_ambient), the
 same table and the same walk, its rows those of the file system, the environment, processes,

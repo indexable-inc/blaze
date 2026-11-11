@@ -55,11 +55,14 @@ version = "0.20261105.4"
 # saying what moved (docs/cargo.md, "Lock files").
 lock = "required"
 
-# blaze-lints' own lints (AGENTS.md rules 3, 12, 14, 18-20, 25, 27). Each is `warn` until its
-# count reaches zero, then `deny`; no count is held yet (crates/blaze-lints/baselines/ has no
-# file: see the clippy lints below). The other `hot_*` lints are
-# set by the hot crates that opt in. Here, not in `[workspace.lints]`: cargo hands that to rustc, which
-# refuses the tool `blaze` (E0602).
+# blaze-lints' own lints (AGENTS.md rules 3, 12, 14, 18-20, 25, 27) as a released blaze reads
+# them: the stage 0 at `version` above, which builds this tree and runs the gate's `blaze check
+# --workspace`. It does not know `lints-ratchet` below, nor half the names there, and holds no
+# crate at `warn` the way the ratchet's baselines do, so this table stays at `warn` for it. This
+# tree's blaze reads `lints-ratchet` in place of this table. Delete this one when `version` is a
+# release that reads the ratchet. The other `hot_*` lints are set by the hot crates that opt in.
+# Here, not in `[workspace.lints]`: cargo hands that to rustc, which refuses the tool `blaze`
+# (E0602).
 [workspace.metadata.blaze.lints]
 # blaze's own lints come in two kinds (docs/lints.md): `blaze::general` warns in every workspace
 # by default; `blaze::internal` needs blaze's types and conventions and waits until a workspace
@@ -164,15 +167,53 @@ unrecorded_span = "deny"
 # which drops an unknown field silently; AGENTS.md rule 3) is on through `internal` above, at
 # `warn`; other workspaces opt in.
 
-# The lints this workspace has once what they tell code to move to is in the tree: a line here
-# sets its level when the lint's switch in crates/blaze-lint-defs/src/ready.rs is `true`, and
-# nothing until then. A table of its own: a released blaze that does not know a lint yet (the
-# stage 0 that builds this tree) reads no table it does not know.
-[workspace.metadata.blaze.lints-when-ready]
+# Every lint of blaze's at `deny` in every crate, as this tree's blaze reads them (in place of
+# `lints` above; docs/lints.md, "Workspace levels and the ratchet"). A crate that still trips a
+# lint is held at `warn` on it by its line in the lint's baseline, `baselines/blaze.<lint>.txt`:
+# `crate<TAB>count`, or `crate<TAB>unmeasured` until a counted run. The baselines only shrink
+# (harness/v2/guards.py `ratchet`, in the gate's `lint-baselines` job), and `blaze check
+# --workspace --target aarch64-unknown-linux-gnu --baselines crates/blaze-lints/baselines
+# --bless-baselines` records each run's counts and drops each crate at zero, which turns the
+# lint to `deny` for it. A new crate is held to every lint from its first line. A table of its
+# own: a released blaze reads no table it does not know.
+[workspace.metadata.blaze.lints-ratchet]
+baselines = "crates/blaze-lints/baselines"
+# The whole of each group, the today-`deny` lints among them (the effects lints, `checkfree`,
+# `program_lifetime`, `unrecorded_span`), which no baseline loosens.
+general = "deny"
+internal = "deny"
+edition = "deny"
+pedantic_perf = "deny"
+reach = "deny"
+proc_macro = "deny"
 # Every use of Rust's std that blaze's own standard library replaces (docs/lints.md#std_use,
-# docs/v2/plan/design/std.md, step S3): on for every crate of blaze once `BSTD_IN_TREE` is
-# `true`. Until then harness/v2/std_uses.py runs the lint by its flag, for the worklist.
-std_use = "warn"
+# docs/v2/plan/design/std.md, step S3), in `edition` above and named here: on by Andrew's
+# decision of 2026-11-11 ahead of the switch (`ready::BSTD_IN_TREE` is `false`: bstd does not
+# yet build on a stage-1 blaze with an API to port to). harness/v2/std_uses.py is the worklist.
+std_use = "deny"
+# `blaze::hot` is the lints of code where the time goes, each decided here. `allow` outside
+# hot code, as docs/lints.md#profile_hot says, for the three that find what is right in cold
+# code and `large_move` (moves of over 512 bytes, and lopsided enums, "in hot code" by its own
+# rule): a clone, a call that allocates or a call through a vtable is not a fault where it
+# runs once. Hot crates deny the group (`#![deny(blaze::hot)]`), and a profile raises them in
+# the functions it shows hot (`profile_hot`, denied through `general`).
+hot = "allow"
+# The four members that hold everywhere: a global-heap allocation with no `// alloc: <why>`
+# and a call to the global allocator where one was handed in (AGENTS.md rule bump-allocate), a
+# hash collection whose hasher nobody chose (rules standard-structures, deterministic-output),
+# and an error built inline where `#[cold]` belongs.
+hot_alloc = "deny"
+implicit_allocator = "deny"
+default_hasher = "deny"
+cold_error = "deny"
+# The parallel lints find loops that could run in parallel, a suggestion, not a fault; read in
+# their own lane (docs/lints.md).
+parallelizable = "allow"
+serial_dependence = "allow"
+# Not run by `blaze check` (the release build reports it from LLVM's code), so no run of the
+# ratchet counts it: at `deny` a crate whose baseline a check emptied would fail its release
+# build. Turned on for one build by `RUSTFLAGS="-W blaze::vecreport"` (docs/lints.md#vecreport).
+vecreport = "allow"
 
 # The pinned LLVM (docs/cargo.md, "Pinned native inputs"): blaze fetches the release
 # crates/hir-ty-codegen/llvm.json names for the target, checks its sha256, unpacks it read-only

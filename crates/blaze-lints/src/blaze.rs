@@ -338,9 +338,9 @@ pub(crate) const EDITION_READY: &[(Lint, bool)] = &[
     (Lint::ProcMacroAttribute, ready::REFLECTION_REPLACES_MACROS),
     (Lint::ProcMacroFnLike, true),
     (Lint::BuildScriptAmbient, ready::CAPABILITIES_FOR_BUILD_SCRIPTS),
-    // Never by default, in any workspace: a crate asks for it (`#![blaze::capabilities]`), and
-    // blaze's own workspace does once bstd is in the tree (its manifest's `lints-when-ready`
-    // table and `ready::BSTD_IN_TREE`).
+    // Never by default, in any workspace: a crate asks for it (`#![blaze::capabilities]`), a
+    // workspace by its `lints-when-ready` table once `ready::BSTD_IN_TREE`, and blaze's own
+    // denies it in its `lints-ratchet` ahead of the switch.
     (Lint::StdUse, false),
     // What the edition removes or respells, and the marks it writes: a workspace getting ready
     // for the edition turns the group on.

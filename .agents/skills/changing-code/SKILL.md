@@ -13,13 +13,14 @@ A change that moves a type, path, API or idiom across the code is a ban with a `
 `.clippy.toml` (mirrored in the hot crates' `clippy.toml`), which blaze-lints'
 `disallowed_types`/`disallowed_methods`/`disallowed_macros` enforce with a MachineApplicable fix, or
 a `blaze::` lint where the rule needs types or MIR; either is applied with `blaze check --fix`, and
-its count lives in `crates/blaze-lints/baselines/`, which may only shrink (no baseline file exists
-yet, because blaze cannot yet finish its own check of the workspace: `blaze check --baselines DIR
---new-baseline LINT` starts one, and the merge gate's `lint-baselines` job, docs/cargo.md#lints,
-holds them once they exist); a one-off move of a path is `blaze check --replace A=B`. Both find code
-by name resolution (imports, renames, globs, re-exports, macro output), never by text, and leave it
-compiling and lint-clean, so the rule keeps holding after the port. `sed`, `rg` replace and
-syntax-only rewriters (astlog) are for syntax-only shapes, scoped and checked by a build afterward.
+its count lives in `crates/blaze-lints/baselines/`, which may only shrink (the merge gate's
+`lint-baselines` job, docs/cargo.md#lints, holds them, and its `blaze.<lint>.txt` files are the
+ratchet's: every blaze lint is `deny` except in the crates a file lists,
+docs/lints.md#workspace-levels-and-the-ratchet); a one-off move of a path is `blaze check --replace
+A=B`. Both find code by name resolution (imports, renames, globs, re-exports, macro output), never
+by text, and leave it compiling and lint-clean, so the rule keeps holding after the port. `sed`,
+`rg` replace and syntax-only rewriters (astlog) are for syntax-only shapes, scoped and checked by a
+build afterward.
 
 ## whole-ports (rule 24)
 
