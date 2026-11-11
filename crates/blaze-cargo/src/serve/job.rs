@@ -3750,6 +3750,16 @@ impl<S: Steps> Jobs<S> {
                 },
             );
         }
+        // On the loop from a request's start to its first task posted (the library's, the
+        // plan's, the lowering's): its view opened in the database, its config made, the
+        // checkout's kept answer compared. Named, so a build's account has no stretch of the
+        // loop before its first task that is only `loop turn` (slow-is-p0-traced).
+        let _span = tracing::info_span!(
+            target: "blaze",
+            "loop: a job begun, to its first task posted",
+            request = request.0,
+        )
+        .entered();
         self.prepare(w, id);
     }
 
@@ -5198,6 +5208,14 @@ impl<S: Steps> Jobs<S> {
         if self.jobs.get(key_of(id)).is_none() {
             return;
         }
+        // On the loop once a view: the output directories asked of the watches, the lock
+        // files written, the lowering posted (or held for the kept front end's store).
+        let _span = tracing::info_span!(
+            target: "blaze",
+            "loop: a job's plan taken, to its lowering posted",
+            units = units.graph.units.len(),
+        )
+        .entered();
         // A build or a check of a checkout has the directories its outputs are in watched
         // from the watches' next round, so a later walk's answer can rest on them
         // ([`noop::LastAnswer::replayable`]). Once a directory a process.
@@ -5740,6 +5758,10 @@ impl<S: Steps> Jobs<S> {
     /// The job's units as nodes of the plane: every one, or the `picked` ones of a build ahead
     /// and every unit they depend on.
     fn build(&mut self, w: &mut World<'_, S>, id: JobId, picked: Option<&[u32]>) {
+        // On the loop once a build: every unit's phases made nodes of the plane, named and
+        // sized, its outputs' paths found. Its cost is the plan's size, not the edit's.
+        let _posting =
+            tracing::info_span!(target: "blaze", "loop: a build's units posted").entered();
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
         if w.std.looked() < job.look {
             job.awaiting = Some(picked.map(<[u32]>::to_vec)); // alloc: a build ahead's picks, once
