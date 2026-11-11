@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: The verifier: blaze translates its own borrow-checked MIR to Lean 4 and the pinned Lean checks proofs of specs written once in blaze's extensions. v0 (safe Rust by functional translation) is written in crates/hir-ty-lean with the first proof in the tree; lean/Blaze/Mir is the executable Lean semantics of MIR for a first subset that models, passes and the evaluator are held to, with its trusted base listed; the Verus tier was retired on 2026-11-10. Planned: v1 unsafe and interior mutability in an Iris-style logic, v2 atomics (SC, then RC11), v3 crashes on files and mmap (Perennial-style, sharing the DST's kernel model), v4 compiler correctness. DST stays on everything.
+summary: The verifier: blaze translates its own borrow-checked MIR to Lean 4 and the pinned Lean checks proofs of specs written once in blaze's extensions. v0 (safe Rust by functional translation) is written in crates/hir-ty-lean with the first proof in the tree; lean/Blaze/Mir is the executable Lean semantics of MIR for a first subset that models, passes and the evaluator are held to, with its trusted base listed; the Verus tier was retired on 2026-11-10. Planned: v1 unsafe and interior mutability in an Iris-style logic, v2 atomics (SC, then RC11), v3 crashes on files and mmap (Perennial-style, sharing the DST's kernel model), v4 compiler correctness. DST stays on everything. A second package, lean/analysis, proves blaze-diff's derivative rules and fast_math rewrites over the reals with Mathlib, from the rule table the Rust differentiator runs.
 date: 2026-11-10
 ---
 # Formal verification: blaze's MIR to Lean
@@ -634,6 +634,8 @@ programs; it is the specification of the Rust pass of the same name.
 - MIR to Cranelift IR lowering in `crates/hir-ty-codegen` (today's path), with layout, ABI
   and unwinding.
 - Below it: the stencils, LLVM, the linker, the loader and live patching, the OS, hardware.
+- For the derivative theorems, what ["Derivatives"](#derivatives-2026-11-10) lists: Mathlib,
+  the rule generator, the link from the Lean differentiator to the Rust one, and floats.
 
 ## Two semantics, one lowering
 
@@ -653,6 +655,146 @@ The two memory models meet in one relation, which this semantics must keep stata
 structured value is related to the bytes its type's layout encodes it as (and a `Pointer` to
 an address with provenance for its allocation). Every choice in `Value.lean` is made so that
 relation can be written: values carry no layout, and nothing in the semantics reads one.
+
+## Derivatives (2026-11-10)
+
+`crates/blaze-diff` takes symbolic derivatives by a table of rules and simplifies them by a
+table of rewrites ([autodiff.md](../../../future/autodiff.md)). Both tables are proved, over
+the reals, in a second Lake package, `lean/analysis`. Objective V10 is the row.
+
+**What Lean has checked and what nothing has compiled.** `lake build` of `lean/analysis`
+passes with Lean 4.20.0 at commit a36c7907ae: every theorem below is checked by Lean (their
+axioms have not been printed). The Rust side of the same work has never been compiled: the
+generated table's wiring into `diff::RULES` and `simplify::REWRITES`, the fix of `powi` at
+`i32::MIN`, `eval::dual` and every new test are written and not built.
+
+**Two packages.**
+- `lean/` is unchanged: core Lean only, no dependency, as fast to build as before
+  (`lake build` in `lean/`).
+- `lean/analysis` (package `blazeAnalysis`, library `BlazeDiff`) is for proofs that need real
+  analysis. Its `lean-toolchain` equals `lean/`'s. It requires Mathlib at commit
+  `c211948581bde9846a99e32d97a03f0d5307c31e`, which is what Mathlib's tag `v4.20.0` names (the
+  Mathlib built for Lean 4.20.0), and it requires `lean/` by path, so it reuses `Blaze.*` and
+  does not copy it: a `powi` exponent is `Blaze.I32`, Rust's `i32` as `Blaze.Scalar` models it.
+  Build: in `lean/analysis`, `lake update`, then `lake exe cache get` (Mathlib's prebuilt
+  files; Mathlib is never compiled here), then `lake build`.
+
+**One source for the rules.** `crates/blaze-diff/rules.json` lists the operations, each
+derivative rule (its tangent as a template, its kink, its domain, its IEEE condition) and each
+rewrite (both sides, its class, and for a `fast_math` one the condition its theorem assumes).
+`harness/v2/diff_rules.py` writes from it:
+- `crates/blaze-diff/src/rules_gen.rs`, which `lib.rs` includes: `diff::RULES` and
+  `simplify::REWRITES` are these tables, and the Rust types (`Rule`, `P`, `Rewrite`, `Pat`)
+  are unchanged;
+- `lean/analysis/BlazeDiff/Ops.lean` (`Op`), `Rules.lean` (`Rules.tangent`, `Rules.domain`,
+  `Rules.kink`) and `Rewrites.lean` (one statement per `fast_math` rewrite).
+
+Its `check` fails when any of the four is not what `rules.json` generates, and runs in the
+gate. So the table blaze runs and the table the theorems are about cannot differ. Nothing is
+hand-written on both sides; what stays hand-written once is the Rust `Op` enum (a test holds
+it to the generated list), the meaning of each operation and of each `Domain` in Lean
+(`Expr.lean`, `Template.lean`), and the Rust `Domain::distance`.
+
+**The Lean side** (`lean/analysis/BlazeDiff`).
+- `Expr` is a `Graph` node as a tree, over the generated `Op`. `Expr.eval env e : ℝ` and
+  `Expr.holds env e : Prop` are its meaning at a point `env : ℕ → ℝ`, with Mathlib's total
+  functions (`Real.log`, `Real.sqrt`, `/`, `Real.rpow`, `zpow`).
+- `diff c x e` is `d(e)/d(variable x)` with `c` the value chosen at a kink. At each node it
+  instantiates `Rules.tangent op`: no derivative is written in `Diff.lean`.
+- `DiffAt env x e` is where the rules claim `e` differentiable: every node is inside its
+  rule's `Rules.domain`, and a `select` (whose kink is at its condition) has a condition that
+  does not change near the point and a differentiable taken arm.
+- `Sound.lean` has one lemma per operation (`rule_sound_add`, ..., `rule_sound_select`), each
+  one Mathlib lemma away. `Correct.lean` checks by unfolding that the generated template is
+  the tangent each lemma is about, then proves by induction:
+
+```lean
+theorem diff_correct (c : ℝ) (env : ℕ → ℝ) (x : ℕ) (e : Expr) (h : DiffAt env x e) :
+    HasDerivAt (fun t => e.eval (Function.update env x t)) ((diff c x e).eval env) (env x)
+
+theorem gradient_correct (c : ℝ) (env : ℕ → ℝ) (vars : List ℕ) (e : Expr)
+    (h : ∀ x ∈ vars, DiffAt env x e) :
+    ∀ x ∈ vars,
+      HasDerivAt (fun t => e.eval (Function.update env x t)) ((diff c x e).eval env) (env x)
+
+theorem jacobian_correct (c : ℝ) (env : ℕ → ℝ) (vars : List ℕ) (roots : List Expr)
+    (h : ∀ e ∈ roots, ∀ x ∈ vars, DiffAt env x e) :
+    ∀ e ∈ roots, ∀ x ∈ vars,
+      HasDerivAt (fun t => e.eval (Function.update env x t)) ((diff c x e).eval env) (env x)
+
+theorem hessian_entry_correct (c : ℝ) (env : ℕ → ℝ) (x y : ℕ) (e : Expr)
+    (h : DiffAt env y (diff c x e)) :
+    HasDerivAt (fun t => (diff c x e).eval (Function.update env y t))
+      ((diff c y (diff c x e)).eval env) (env y)
+```
+
+- **At a kink** (`Kink.lean`), where `diff_correct` says nothing, what
+  `Choice::Subgradient(c)` gives is proved of the generated template: `abs` at 0 has tangent
+  `t0 * c`, and a `c` in `[-1, 1]` is a subgradient; `min` and `max` at a tie have
+  `c * t0 + (1 - c) * t1`, for `c` in `[0, 1]` a supergradient of `min` and a subgradient of
+  `max`; `sqrt` at 0 has `c * t0`, a convention (there is no subgradient); `select` has its
+  taken arm's.
+
+```lean
+theorem abs_choice_is_subgradient (c : ℝ) (h1 : -1 ≤ c) (h2 : c ≤ 1) (y : ℝ) :
+    |(0 : ℝ)| + c * (y - 0) ≤ |y|
+
+theorem max_choice_is_subgradient (c : ℝ) (h0 : 0 ≤ c) (h1 : c ≤ 1) (a u v : ℝ) :
+    max a a + (c * (u - a) + (1 - c) * (v - a)) ≤ max u v
+
+theorem min_choice_is_supergradient (c : ℝ) (h0 : 0 ≤ c) (h1 : c ≤ 1) (a u v : ℝ) :
+    min u v ≤ min a a + (c * (u - a) + (1 - c) * (v - a))
+```
+
+- **Rewrites** (`RewriteProofs.lean`). Each of the 28 `fast_math` rewrites is a generated
+  statement, for example
+
+```lean
+def mul_div_cancel : Prop :=
+  ∀ (env : ℕ → ℝ) (a b : Expr),
+    b.eval env ≠ (0 : ℝ) →
+    (Expr.bin .div (Expr.bin .mul a b) b).eval env = a.eval env
+```
+
+  and `theorem rewrites_sound : Rewrite.AllSound` proves them all; `Rewrite.AllSound` is a
+  generated structure with one field per rewrite, so a rewrite added without a proof does not
+  build. For the 21 exact rewrites nothing is generated: they claim equal IEEE 754 bits, which
+  is not a statement about the reals. The crate's tests hold them, on `f64` and `f32` bits
+  (`each_exact_rewrite_keeps_every_bit_f32_sampled`, and the same over all 2^32 patterns
+  under `--ignored`).
+
+**What the proof found.** `powi`'s rule took the exponent less one by wrapping, so at
+`i32::MIN` the derivative was `n * x^i32::MAX`. Stating the rule with the exponent a
+`Blaze.I32`, not an unbounded integer, showed it; `PowiDown` is now the node over its argument
+there, in Rust and in Lean.
+
+**The Rust side is held to a second method.** `eval::dual` is forward-mode differentiation by
+dual numbers over the same graph. It does not read `RULES`: each operation's derivative is
+written out from its definition, on purpose, because an oracle must not share the thing it
+checks. The refinement test `the_symbolic_derivative_is_the_dual_tangent` draws expressions
+and points inside the domains and requires the symbolic derivative to equal the dual tangent
+within `1e-10` of the sum of the tangent's terms, with central finite differences as a third
+check and four planted bugs, one of them too small for finite differences to see.
+
+**Trusted, beyond what is proved** (added to the list above):
+- **Mathlib** at the pinned commit, with Lean's three axioms, which its real analysis uses.
+- **The generator** (`diff_rules.py`): that the Rust table and the Lean table it writes say
+  the same thing. Its selftest and the dual-number test are the evidence; it is not proved.
+- **The link from the Lean `diff` to the Rust `Differentiator`.** The Lean one recurses over a
+  term and builds every zero; the Rust one walks a hash-consed DAG once, never builds a
+  structural zero or one, and asks a rule's domain only at nodes the variable reaches. That
+  sharing and elision change no value is assumed, and tested by the dual-number refinement.
+  One consequence is not covered: `powf` by a constant exponent with a base that is not
+  positive, which Rust differentiates and `DiffAt` excludes.
+- **Floats.** Every theorem is over `ℝ`. `Blaze` has no model of IEEE 754 and none is built
+  here: Rust evaluates in `f32` or `f64`, where a derivative agrees with the real one up to
+  rounding only while every value is finite, and a `fast_math` rewrite can change a result.
+  NaN, infinities, signed zeros and rounding are covered by tests alone.
+- **The simplifier's engine.** Each rewrite is proved; that the e-graph (union-find, rebuild,
+  constant folding, extraction) applies only rewrites and keeps congruence is tested, not
+  proved.
+- **Lifting and lowering** (`crates/blaze-diff-mir`): that a `Graph` means what the MIR it
+  was lifted from means.
 
 ## v1: interior mutability and unsafe, by deep embedding
 
