@@ -1199,7 +1199,7 @@ bitflags::bitflags! {
         /// type alone is `core::reflect::MemoPoint` (`hir_ty::comptime::reflect_is_memo_point`).
         /// It changes diagnostics and which trait goals hold, never code: no codegen key reads
         /// it.
-        const BLAZE_MEMO = 1 << 101;
+        const BLAZE_MEMO = 1 << 102;
         /// `#[blaze::sealed]`, a word, on a trait: a blaze extension (inert under rustc with
         /// `#![register_tool(blaze)]`). No crate but the trait's may implement it or name it as
         /// a supertrait, and when every impl of it is for a local type, a type parameter
