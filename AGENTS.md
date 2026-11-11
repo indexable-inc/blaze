@@ -21,9 +21,9 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
    blaze fails on blaze, that failure is the work. Skill: `build-and-test`.
 3. **no-fallback**: No fallback, ever: when blaze can't do something it stops with an error naming what
    and where. Skill: `runtime-code`.
-4. **superset-of-rust**: Every program the pinned nightly builds builds and behaves the same under
-   blaze; blaze refuses only rustc soundness holes, and its extensions are opt-in. Skill:
-   `compiler-correctness`.
+4. **superset-of-rust**: Every program the pinned nightly accepts, blaze accepts and runs correctly by
+   Rust's semantics; rustc's own behavior is a reference, not the definition; blaze refuses only
+   rustc soundness holes, and its extensions are opt-in. Skill: `compiler-correctness`.
 5. **useful-not-parity**: rustc and cargo are references, not specs: design every output and interface
    as if from scratch, the best way for people and agents, and match them only where real code or
    tools depend on it. Skill: `compiler-correctness`.
@@ -163,14 +163,17 @@ approval; they replace neither.
 
 ### Compiler correctness
 
-- Flag any change that can make a program built by blaze behave differently from the same program
-  built by the pinned nightly rustc (`harness/toolchain`): layout, ABI, drop order, overflow and
-  panic behavior, const eval, trait and method resolution, MIR passes, borrow checking, linking.
-  Safe path: port rustc's rule and add a test (a crate whose own tests exercise it, or a unit test).
-  The allowed differences are sandboxing build scripts and proc macros, and refusing, with a hard
-  error naming the hole, a program rustc accepts only through a soundness bug (`superset-of-rust`).
-  Code that opts into a blaze extension is exempt: it need not build under rustc, but enabling the
-  extension must not change any program that doesn't use it.
+- Flag any change that can make a program built by blaze run incorrectly by Rust's semantics, or
+  stop a program the pinned nightly (`harness/toolchain`) accepts from building: layout, ABI, drop
+  order, overflow and panic behavior, const eval, trait and method resolution, MIR passes, borrow
+  checking, linking. rustc is the reference to read, not the definition: a difference from rustc is
+  fine where rustc or LLVM is wrong, unreliable or unspecified and the change says so; a difference
+  real code depends on is not. Safe path: state the rule being implemented (port rustc's where it is
+  right) and add a test (a crate whose own tests exercise it, or a unit test). blaze also sandboxes
+  build scripts and proc macros, and refuses, with a hard error naming the hole, a program rustc
+  accepts only through a soundness bug (`superset-of-rust`). Code that opts into a blaze extension
+  is exempt: it need not build under rustc, but enabling the extension must not change any program
+  that doesn't use it.
 - Flag a fallback: a path that, when blaze can't do something, quietly takes another route (rustc or
   cargo, rustc's copy of a function or static, a whole rebuild in place of a refused patch, a slower
   backend, an older cached result). Safe path: stop with an error that names what and where.
