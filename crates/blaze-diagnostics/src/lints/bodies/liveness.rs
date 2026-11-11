@@ -608,7 +608,7 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
         }
 
         let store = b.store();
-        let patterns = b.source_map.patterns_for_binding(binding);
+        let patterns = b.unmoved_source_map().patterns_for_binding(binding);
         list.retain(|it| match it.key {
             Key::Start => false,
             Key::At(MirSpan::PatId(pat)) => !patterns.contains(&pat),
@@ -793,7 +793,7 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
                         if place.projection.as_slice().is_empty()
                             && mir.param_locals.contains(local) =>
                     {
-                        let param = b.source_map.patterns_for_binding(*binding).first().copied();
+                        let param = b.unmoved_source_map().patterns_for_binding(*binding).first().copied();
                         param.zip(self.source.assignment(span)).and_then(|(param, assign)| {
                             source::mut_reference_param(b, param, assign)
                         })

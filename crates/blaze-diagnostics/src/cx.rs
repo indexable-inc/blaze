@@ -11,7 +11,7 @@ use std::alloc::Global;
     reason = "OnceCell: memos of one check, dropped with it, not global state"
 )]
 use std::{
-    cell::{OnceCell, RefCell},
+    cell::{Cell, OnceCell, RefCell},
     collections::HashMap,
     ops::ControlFlow,
 };
@@ -42,7 +42,8 @@ use crate::{
 /// workspace they are named from.
 #[derive(Clone, Copy)]
 pub struct Files<'a> {
-    paths: &'a HashMap<FileId, String>,
+    /// None for [`Files::unnamed`].
+    paths: Option<&'a HashMap<FileId, String>>,
     root: &'a str,
 }
 
@@ -50,13 +51,25 @@ impl<'a> Files<'a> {
     /// `paths` named from `root`; a `root` of `""` keeps each relative path whole, as the tests'
     /// paths, already names, are.
     pub fn new(paths: &'a HashMap<FileId, String>, root: &'a str) -> Files<'a> {
-        Files { paths, root }
+        Files { paths: Some(paths), root }
+    }
+
+    /// No names: each file is `<file N>`, one name a file, so a span still says which file it
+    /// is in ([`Cx::file_of`]) and nothing more. What a query that has no build's names checks
+    /// with ([`Cx::probe`]): nothing it gives is written.
+    pub(crate) const fn unnamed() -> Files<'static> {
+        Files { paths: None, root: "" }
+    }
+
+    /// The front end's path of `file`, if it has one.
+    fn path(&self, file: FileId) -> Option<&'a String> {
+        self.paths.and_then(|it| it.get(&file))
     }
 
     /// The name rustc gives `file` in a diagnostic, by [`Files::relative`]; a file the front end
     /// has no path for is `<file N>` (a crate attribute's is named by [`Cx::file_name`]).
     pub fn name(&self, file: FileId) -> String {
-        match self.paths.get(&file) {
+        match self.path(file) {
             // alloc: a span's file name, made only as a diagnostic is built
             Some(path) => Files::relative(path, self.root).to_owned(),
             // alloc: as above
@@ -131,6 +144,11 @@ pub struct Cx<'a, 'db> {
     levels: RefCell<Option<LevelMap<'a, 'db>>>,
     /// The lints that may fire anywhere in the crate, made the first time a pass asks.
     may_fire: OnceCell<LintSet>,
+    /// Made by [`Cx::probe`]: a query's context, which has of the build only what the query's
+    /// key says.
+    probing: bool,
+    /// A probe was asked for something its key does not cover ([`Cx::beyond`]).
+    beyond: Cell<bool>,
 }
 
 impl<'a, 'db> Cx<'a, 'db> {
@@ -158,7 +176,57 @@ impl<'a, 'db> Cx<'a, 'db> {
             effective: OnceCell::new(),
             levels: RefCell::new(None),
             may_fire: OnceCell::new(),
+            probing: false,
+            beyond: Cell::new(false),
         }
+    }
+
+    /// The context a query checks one part of `krate` with (a body's lints,
+    /// `lints::bodies::body_lints_clean`): it has no build's file names, lint flags or
+    /// crate-wide tables, only `may_fire`, the lints that may fire in the crate, which the
+    /// query's key holds. So what it is asked is the database's, which the engine tracks, or
+    /// the key's; anything else it is asked (the lint flags, a level, the crate's walk, its
+    /// items, its effective visibilities, the printing of a type or a path, which reads the
+    /// names of the crate and its dependencies) is answered with a stand-in and noted
+    /// ([`Cx::beyond`]), and the query then says nothing of what it found
+    /// (keys-cover-every-input). Its files are [`Files::unnamed`].
+    #[expect(
+        clippy::disallowed_types,
+        reason = "OnceCell: memos of one check, dropped with it, not global state"
+    )]
+    pub(crate) fn probe(
+        db: &'db Db,
+        krate: hir::Crate,
+        frame: &'a Frame,
+        may_fire: LintSet,
+    ) -> Cx<'a, 'db> {
+        Cx {
+            may_fire: OnceCell::from(may_fire),
+            probing: true,
+            ..Cx::new(db, krate, Files::unnamed(), frame)
+        }
+    }
+
+    /// Whether a probe was asked for something its key does not cover: what it found, or did
+    /// not find, may then differ from what the build's own context finds. Always false of a
+    /// build's context.
+    pub(crate) fn beyond(&self) -> bool {
+        self.beyond.get()
+    }
+
+    /// Notes that something a probe's key does not cover was asked. Nothing of a build's
+    /// context.
+    #[inline]
+    fn asked_beyond(&self) {
+        if self.probing {
+            self.beyond.set(true);
+        }
+    }
+
+    /// The lints that may fire anywhere in the crate ([`Cx::lint_may_fire`]): what a probe of
+    /// the crate is made with.
+    pub(crate) fn may_fire_set(&self) -> LintSet {
+        *self.lints_that_may_fire()
     }
 
     /// The check's task frame, for the crate-sized tables a pass builds.
@@ -174,6 +242,7 @@ impl<'a, 'db> Cx<'a, 'db> {
     /// What rustc's printing of paths and the import suggestions read: the crate's visible
     /// names and its declarations by name, built in the check's frame when first read.
     pub(crate) fn paths(&self) -> &crate::print::Paths<'a> {
+        self.asked_beyond();
         self.paths.get_or_init(|| crate::print::Paths::new(self))
     }
 
@@ -191,24 +260,28 @@ impl<'a, 'db> Cx<'a, 'db> {
     /// The lint flags the crate is checked with: rustc's defaults when none were given.
     pub fn lint_flags(&self) -> &'a crate::lints::CommandLine {
         static NONE: crate::lints::CommandLine = crate::lints::CommandLine::NONE;
+        self.asked_beyond();
         self.lints.unwrap_or(&NONE)
     }
 
     /// The crate as rustc's early lint pass walks it: made once per check, for every pass that
     /// walks the crate's syntax.
     pub(crate) fn walk(&self) -> &Walk<'db> {
+        self.asked_beyond();
         self.walk.get_or_init(|| Walk::of(self))
     }
 
     /// The crate's items in the order rustc's item passes visit them: made once per check, for
     /// the item lints before the abort and after it.
     pub(crate) fn items(&self) -> &ItemWalk<'db> {
+        self.asked_beyond();
         self.items.get_or_init(|| ItemWalk::of(self))
     }
 
     /// The crate's effective visibilities (rustc's `effective_visibilities`): made once per
     /// check, for the stability pass, the dead-code pass and the item lints after the abort.
     pub(crate) fn effective(&self) -> &Effective {
+        self.asked_beyond();
         self.effective.get_or_init(|| Effective::of(self))
     }
 
@@ -269,6 +342,7 @@ impl<'a, 'db> Cx<'a, 'db> {
     /// Whether cargo runs the compile (rustc's `was_invoked_from_cargo`: `CARGO_CRATE_NAME` is
     /// set), as it is under blaze: some help then names `cargo add` and `Cargo.toml`.
     pub fn cargo(&self) -> bool {
+        self.asked_beyond();
         self.lints.is_some_and(|it| it.check_cfg.cargo)
     }
 
@@ -279,7 +353,7 @@ impl<'a, 'db> Cx<'a, 'db> {
     /// path there ([`base_db::Files::included_source_path`]).
     pub fn file_name(&self, file: FileId) -> String {
         let outside = || self.db.files().included_source_path(file);
-        let name = match self.files.paths.contains_key(&file) {
+        let name = match self.files.path(file).is_some() {
             true => Files::of_text(self.db, file, self.files.name(file)),
             // alloc: a span's file name, made only as a diagnostic is built
             false => match outside() {
@@ -548,12 +622,23 @@ impl<'a, 'db> Cx<'a, 'db> {
     /// rustc's printing of `ty`: trimmed paths, `{integer}` for an integer variable, closures
     /// by where they are written.
     pub fn ty(&self, ty: &hir::Type<'db>) -> String {
+        if self.probing {
+            // A probe prints nothing: the names a type is printed by are the crate's and its
+            // dependencies', which its key does not hold.
+            self.beyond.set(true);
+            return "_".to_owned(); // alloc: a stand-in, only of a body a lint is found in
+        }
         crate::print::ty(self, ty)
     }
 
     /// rustc's `def_path_str` of `def`: the shortest path that names it, trimmed to its name
     /// when that name is unique.
     pub fn def_path(&self, def: hir::ModuleDef) -> String {
+        if self.probing {
+            // As `Cx::ty`.
+            self.beyond.set(true);
+            return "_".to_owned(); // alloc: a stand-in, only of a body a lint is found in
+        }
         crate::print::def_path(self, def)
     }
 

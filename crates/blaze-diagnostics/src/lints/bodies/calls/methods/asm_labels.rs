@@ -125,7 +125,7 @@ fn templates<'db>(
     let node = cx.syntax_view(at);
     let asm = ast::AsmExpr::cast(node.value)?;
     let inactive = |ptr: SyntaxNodePtr| {
-        b.source_map.diagnostics().iter().any(|it| {
+        b.source_map().diagnostics().iter().any(|it| {
             matches!(it, ExpressionStoreDiagnostics::InactiveCode { node: inactive, .. }
                 if inactive.file_id == at.file_id && inactive.value == ptr)
         })
