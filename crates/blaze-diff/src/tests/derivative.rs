@@ -21,7 +21,7 @@ const LARGEST: f64 = 1e4;
 /// condition's value, and for `abs`, `min` and `max` the sign that picks their branch. `None`
 /// when the point is not one to check at: a value is not finite or is huge, or the point is
 /// within [`MARGIN`] of where some operation's rule stops holding or a comparison ties.
-fn sides(graph: &Graph, roots: &[Id], point: &[f64]) -> Option<Vec<bool>> {
+pub(super) fn sides(graph: &Graph, roots: &[Id], point: &[f64]) -> Option<Vec<bool>> {
     let values = eval_all::<f64>(graph, roots, point).ok()?;
     let float = |id: Id| values[id.index()].expect("an argument of a reached node").float();
     let mut sides = Vec::new();
@@ -67,7 +67,13 @@ fn sides(graph: &Graph, roots: &[Id], point: &[f64]) -> Option<Vec<bool>> {
 /// can judge (a kink, a pole or a huge value nearby, or the two step sizes disagree, which is
 /// what rounding noise and a function that turns within the step look like); `Err` says what
 /// disagreed. The tolerance is relative to the derivative's size, at least 1.
-fn agrees(graph: &Graph, f: Id, df: Id, var: usize, point: &[f64]) -> Result<bool, String> {
+pub(super) fn agrees(
+    graph: &Graph,
+    f: Id,
+    df: Id,
+    var: usize,
+    point: &[f64],
+) -> Result<bool, String> {
     let h = 1e-5 * point[var].abs().max(1.0);
     let at = |offset: f64| {
         let mut moved = point.to_vec();
@@ -142,7 +148,7 @@ fn judged(
 }
 
 /// [`RULES`] with `op`'s tangent replaced.
-fn rules_with(op: Op, tangent: P) -> Vec<Rule> {
+pub(super) fn rules_with(op: Op, tangent: P) -> Vec<Rule> {
     RULES.iter().map(|rule| if rule.op == op { Rule { tangent, ..*rule } } else { *rule }).collect()
 }
 

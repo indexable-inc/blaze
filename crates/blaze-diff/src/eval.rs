@@ -3,8 +3,13 @@
 //! [`apply`] is the one place an operation's value is defined: Rust's operator or the float
 //! type's method of the same name, on the host. The evaluator, the simplifier's constant folding
 //! ([`fold`]) and the tests all go through it, so they cannot disagree about an operation.
+//!
+//! [`dual`] is forward-mode differentiation by dual numbers over the same graph: the independent
+//! method the symbolic derivative is tested against.
 
 use crate::expr::{Graph, Id, Node, Op, Sort, Width};
+
+pub mod dual;
 
 mod sealed {
     pub trait Sealed {}
