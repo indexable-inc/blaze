@@ -50,9 +50,10 @@ theorem slotsOk_mono {P Q : Pointer → Prop} (h : ∀ (p : Pointer), P p → Q 
 
 /-! The list of frames grows by the frame a call makes. -/
 
-/-- Every id the list has is below `n`. -/
+/-- Every id the list has is above 0 (frame 0 is no call's frame) and below `n`, and `n` is
+above 0. -/
 def KeysBelow (g : List (Nat × FnId)) (n : Nat) : Prop :=
-  ∀ (e : Nat × FnId), e ∈ g → e.1 < n
+  0 < n ∧ ∀ (e : Nat × FnId), e ∈ g → 0 < e.1 ∧ e.1 < n
 
 theorem KeysBelow.of_next {g : List (Nat × FnId)} {n n' : Nat} (e : n' = n)
     (h : KeysBelow g n) : KeysBelow g n' := by
@@ -71,11 +72,19 @@ theorem fnOfIds_key :
       have ⟨x, hx, hk⟩ := fnOfIds_key rest id fn h'
       exact ⟨x, List.mem_cons.mpr (Or.inr hx), hk⟩
 
+/-- No frame in the list has id 0. -/
+theorem KeysBelow.pos {g : List (Nat × FnId)} {n : Nat} (hk : KeysBelow g n) (id : Nat)
+    (fn : FnId) : fnOfIds g id = some fn → 0 < id := by
+  intro h
+  have ⟨e, he, hkey⟩ := fnOfIds_key g id fn h
+  rw [← hkey]
+  exact And.left (And.right hk e he)
+
 /-- A frame the list has is found as before when a new id is put in front. -/
 theorem fnOfIds_grow (g : List (Nat × FnId)) (n : Nat) (hk : KeysBelow g n) (fn : FnId)
     (id : Nat) (f : FnId) (h : fnOfIds g id = some f) : fnOfIds ((n, fn) :: g) id = some f := by
   have ⟨e, he, hkey⟩ := fnOfIds_key g id f h
-  have lt : e.1 < n := hk e he
+  have lt : e.1 < n := And.right (And.right hk e he)
   have ne : ¬ n = id := by omega
   exact ((fnOfIds_cons (n, fn) g id).trans (if_neg ne)).trans h
 
@@ -210,12 +219,15 @@ theorem enterState_borrows {B : FnId → Local → Prop} {g : List (Nat × FnId)
           exact locals)
         (fun m' => slotsOk_mono grow (And.right hmem fr m')))
   have keys : KeysBelow ((st.next, id) :: g) (st.next + 1) := by
+    refine And.intro (Nat.succ_pos st.next) ?_
     intro e he
     cases List.mem_cons.mp he with
     | inl here =>
       rw [here]
-      exact Nat.lt_succ_self st.next
-    | inr there => exact Nat.lt_succ_of_lt (hk e there)
+      exact And.intro (And.left hk) (Nat.lt_succ_self st.next)
+    | inr there =>
+      exact And.intro (And.left (And.right hk e there))
+        (Nat.lt_succ_of_lt (And.right (And.right hk e there)))
   exact And.intro (And.intro cov mem) keys
 
 theorem State.enter_borrows {B : FnId → Local → Prop} {g : List (Nat × FnId)} {st : State}
