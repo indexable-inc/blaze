@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-38 invariants, 7 refinements, 2 reference models.
-By level: 26 tested, 19 simulated, 0 model-checked, 0 proved.
+39 invariants, 8 refinements, 2 reference models.
+By level: 28 tested, 19 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
@@ -127,6 +127,11 @@ By level: 26 tested, 19 simulated, 0 model-checked, 0 proved.
 - **`what_is_kept_after_an_answer_survives_any_crash_and_no_lost_value_is_served`** *tested* (`crates/blaze-storemodel/src/tests.rs`): an answer may be sent on results not yet durable; nothing derived from that answer is reused across a crash unless its tickets were durable. After any crash the restore serves no value whose bytes were lost, holds everything the store called durable and everything an answered build kept, and every answer's settling ended kept or said lost. Two builds on shared and separate keys with a reader, and a snapshot beside a build, each build answering before it flushes: every schedule, a crash after every IO step, so at every point between an answer sent and its results durable; with an IO failure anywhere, so a settling that ends with the store stopped. Then two kernel gets of one identity in two worlds racing for one shape slot, each answering at once and keeping what it left once it and every store before it is durable, with an IO failure anywhere and effects completing in any order.
   Controls: `a_kept_answer_relied_on_before_its_tickets_were_durable`, `a_settling_failure_dropped_silently`.
 
+### hir-ty-lean
+
+- **`fnv1a_from_is_the_fold_of_its_bytes`** *tested* (`crates/hir-ty-lean/src/tests.rs`): the ledger's checksum loop `fnv1a_from` never panics (no index out of bounds, no counter overflow) and returns FNV-1a's fold of the seed over the bytes, for every seed and every slice. The proof is of the model this test holds to the tree's source: the function's text is read from crates/blaze-graph/src/ledger.rs, its emitted Lean must be the checked-in module the proof imports, and its structured MIR runs to the same fold on the inputs here. A Lean proof of it is written (crates/blaze-graph/lean/BlazeGraph/Ledger.lean) and Lean has not checked it: this statement says `(proved: ..)` once `lake build` of `lean/` passes in the gate (ledger V5), never before.
+  Controls: `a_continue_made_a_break`, `an_else_branch_dropped_at_a_join`, `an_xor_made_an_add`.
+
 ### hir-ty-pure
 
 - **`an_accepted_graph_has_no_infinite_path`** *tested* (`crates/hir-ty-pure/src/loops.rs`): a control flow graph the analysis accepts has no infinite path. For random small graphs with random bounding facts, every accepted graph, each fact's block forced through its exit once its bound is used up, has only finite paths (checked by brute force over every state).
@@ -159,6 +164,11 @@ By level: 26 tested, 19 simulated, 0 model-checked, 0 proved.
   Controls: `a_removed_entry_left_in_the_root`.
 - **`a_patched_file_behaves_as_a_fresh_link`** *tested* (`crates/blaze-link/src/tests/patch.rs`): after any sequence of edits (a body changed at the same size, smaller or larger than the room it had, a function added or removed, a callee set changed, a frame entry gained or lost, a static read, dropped or given another value), the file the patches make behaves as a fresh full link of the same program: the same entry, each function's code, each call resolved through its slot to the same function, each static read holding the same bytes, an unwind lookup of each function finding an entry that covers it, and the same function names in the symbol table. Each patch is of the file the last one left, never lays the image out whole, and the digest it gives is the patched file's hashed whole.
   Controls: `a_stale_unwind_entry`, `a_slot_left_on_the_old_body`, `a_removed_function_still_exported`, `a_write_the_digest_missed`, `a_check_of_the_length_alone`.
+
+### hir-ty-lean
+
+- **`structured_code_runs_as_its_graph`** *tested* (`crates/hir-ty-lean/src/tests.rs`): structured control flow reconstructed from a control-flow graph runs as the graph does, from every state, to the same end, variables and trace; and what `reconstruct` returns is well formed and a fixed point of lowering and reconstructing.
+  Controls: `a_continue_made_a_break`, `an_else_branch_dropped_at_a_join`, `an_xor_made_an_add`.
 
 ### linked
 

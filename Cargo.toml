@@ -29,13 +29,6 @@ exclude = [
     "vendor/blake3-servil",
     # Patched below; its own tests need dev-dependencies blaze has no use for (vendor/wasmtime/SOURCE.md).
     "vendor/wasmtime",
-    # Verus's verifier crates, built only as dependencies of hir-ty-verus, and its user-side
-    # libraries, which blaze does not build yet (vendor/verus/SOURCE.md).
-    "vendor/verus/air",
-    "vendor/verus/vir",
-    "vendor/verus/vir_macros",
-    "vendor/verus/builtin",
-    "vendor/verus/vstd",
     # Charon's library (charon_lib), built only as a dependency of hir-ty-charon
     # (vendor/charon/SOURCE.md).
     "vendor/charon/charon",
@@ -302,8 +295,8 @@ hir-ty-tailck = { path = "crates/hir-ty-tailck", version = "0.0.0" }
 hir-ty-mir = { path = "crates/hir-ty-mir", version = "0.0.0" }
 hir-ty-print = { path = "crates/hir-ty-print", version = "0.0.0" }
 hir-ty-identity = { path = "crates/hir-ty-identity" }
-hir-ty-verus = { path = "crates/hir-ty-verus", version = "0.0.0" }
 hir-ty-charon = { path = "crates/hir-ty-charon", version = "0.0.0" }
+hir-ty-lean = { path = "crates/hir-ty-lean", version = "0.0.0" }
 hir-ty-pure = { path = "crates/hir-ty-pure", version = "0.0.0" }
 hir-ty-suspend = { path = "crates/hir-ty-suspend", version = "0.0.0" }
 hir-ty-share = { path = "crates/hir-ty-share", version = "0.0.0" }

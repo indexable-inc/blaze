@@ -3,8 +3,9 @@
 //! [`Fact`] the caller's code identity covers (rule 21).
 //!
 //! What it uses today, and nothing else ([`use_proved_contracts`]): where a body does
-//! `r = f(..)`, `f` a direct call of a non-generic function whose `ensures` lane verus proves
-//! ([`hir_ty_verus::proved`], `Proved` only, never `Unknown`), and that `ensures` bounds the
+//! `r = f(..)`, `f` a direct call of a non-generic function whose `ensures` Lean proves
+//! ([`hir_ty_lean::proved`]: a proof file the pinned Lean checked, nothing less), and that
+//! `ensures` bounds the
 //! return by a literal (`r < K`, `r <= K`), the bounds check of an index into an array of
 //! constant length `len >= K` (`K > len` for `<=`) whose index is `r`, or a copy or unsigned
 //! integer cast of it, is removed.
@@ -20,9 +21,13 @@
 //! tests must be `index < len`, computed in its own block from those very operands.
 //!
 //! **Not built.** A `requires` discharged at a call site (the callee's unchecked entry) needs
-//! [`hir_ty_verus::Clause::Requires`], which answers `None` until lane verus lowers call sites
-//! (its order step 1). Generic callees wait for lane verus's step 5. Facts proved by blaze's own
-//! passes (range facts at every `Return`) are the next kind of [`How`].
+//! [`hir_ty_lean::Clause::Requires`], which is not proved until the Lean translation lowers a
+//! call site's obligation, and generic callees wait for it to translate generics: each is
+//! reported not proved, with why ([`hir_ty_lean::NotProved`]). Until 2026-11-10 a Z3 tier
+//! proved an arithmetic `ensures` with no proof written; Lean checks the proof a crate keeps in
+//! its `lean/` and searches for none, so a clause without one is not proved and its check
+//! stays. Facts proved by blaze's own passes (range facts at every `Return`) are the next kind
+//! of [`How`].
 
 #![forbid(unsafe_code)]
 
@@ -35,9 +40,9 @@ use std::fmt;
 
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::ItemKey;
-use hir_ty_verus::ProofKey;
+use hir_ty_lean::ProofKey;
 
-pub use pass::use_proved_contracts;
+pub use pass::{Prove, use_proved_contracts};
 
 /// The domain of a [`Fact`]'s content id.
 pub const FACT_DOMAIN: &str = "blaze v2 contract fact 1";
@@ -66,15 +71,15 @@ impl ClauseHash {
 /// What a fact's proof is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum How {
-    /// Lane verus proved the callee: the proof's key, which covers the vendored Verus, the Z3
-    /// version, the resource limit, the seed and the callee's VIR (its clauses, body and types).
-    Verus(ProofKey),
+    /// Lean proved the callee: the proof's key, which covers the Lean version, the translator,
+    /// the library, the callee's model (its clauses, body and types) and the proof file.
+    Lean(ProofKey),
 }
 
 impl fmt::Display for How {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            How::Verus(key) => write!(f, "verus {:x}", key.0),
+            How::Lean(key) => write!(f, "lean {:x}", key.id),
         }
     }
 }
@@ -138,7 +143,8 @@ impl Fact {
         let mut h = Hasher::new(FACT_DOMAIN);
         h.id(&self.callee.0).id(&self.clause.0);
         match self.how {
-            How::Verus(key) => h.update(&[0]).id(&key.0),
+            // 0 was the Z3 tier's, retired 2026-11-10: a fact it proved is no fact now.
+            How::Lean(key) => h.update(&[1]).id(&key.id),
         };
         h.update(&[match self.entry {
             Entry::NoRequires => 0,

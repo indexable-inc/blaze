@@ -57,6 +57,8 @@ disallowed-types = [
     { path = "hir_ty_share::BodyOptions", replacement = "hir_ty_identity::Compiled", reason = "one definition of code identity (docs/v2/plan/design/code-identity.md): the share walk is compile identity now", allow-invalid = true },
     { path = "hir_ty_share::OptionsSet", replacement = "hir_ty_identity::OptionsSet", reason = "one definition of code identity (docs/v2/plan/design/code-identity.md): the share walk is compile identity now", allow-invalid = true },
     { path = "hir_ty_codegen::home::Homes", reason = "one home rule (AGENTS.md rules 21, 30, 31): the crate an instance is compiled in is `hir_ty_mir::mir::home::env_of`, which a codegen `Instance` reaches through `Instance::home_env`; there is no per-task state to thread", allow-invalid = true },
+    { path = "hir_ty_verus::ProofKey", replacement = "hir_ty_lean::ProofKey", reason = "the Z3 tier (`hir-ty-verus`, vendored Verus) was retired on 2026-11-10: Lean is the one prover, and `hir_ty_lean` the one home of the `proved` interface (AGENTS.md rule 30)", allow-invalid = true },
+    { path = "hir_ty_verus::Clause", replacement = "hir_ty_lean::Clause", reason = "the Z3 tier (`hir-ty-verus`, vendored Verus) was retired on 2026-11-10: Lean is the one prover, and `hir_ty_lean` the one home of the `proved` interface (AGENTS.md rule 30)", allow-invalid = true },
 ]
 
 disallowed-macros = [
@@ -164,4 +166,6 @@ disallowed-methods = [
     { path = "hir_ty_mir::mir::type_name::block_owner", replacement = "hir_ty_print::block_owner", reason = "one printer of types and paths for every spelling, `hir_ty_print`: the copy in `hir_ty_mir::mir::type_name` is gone (AGENTS.md rule 30)", allow-invalid = true },
     { path = "hir_ty_mir::mir::type_name::closures_around", replacement = "hir_ty_print::closures_around", reason = "one printer of types and paths for every spelling, `hir_ty_print`: the copy in `hir_ty_mir::mir::type_name` is gone (AGENTS.md rule 30)", allow-invalid = true },
     { path = "blaze_diagnostics::print::printer::Printer::new", replacement = "hir_ty_print::Printer::diagnostic", reason = "one printer of types and paths for every spelling, `hir_ty_print`: the diagnostics' copy is gone, a check is its `DiagnosticHost` (AGENTS.md rule 30)", allow-invalid = true },
+    { path = "hir_ty_verus::proved", replacement = "hir_ty_lean::proved", reason = "the Z3 tier (`hir-ty-verus`, vendored Verus) was retired on 2026-11-10: Lean is the one prover, and `hir_ty_lean` the one home of the `proved` interface (AGENTS.md rule 30)", allow-invalid = true },
+    { path = "hir_ty_verus::verify_function", replacement = "hir_ty_lean::check", reason = "the Z3 tier (`hir-ty-verus`, vendored Verus) was retired on 2026-11-10: Lean is the one prover, and `hir_ty_lean` the one home of the `proved` interface (AGENTS.md rule 30)", allow-invalid = true },
 ]

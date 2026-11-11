@@ -54,6 +54,7 @@
 //!     infallible:
 //!     int_bounds:
 //!     int_impl: size_of, transmute
+//!     int_wrapping:
 //!     iterator: option
 //!     iterators: iterator, fn
 //!     iterators_more: iterators, clone
@@ -2785,6 +2786,37 @@ impl_int! {
     isize i8 i16 i32 i64 i128
 }
 // endregion:int_impl
+
+// region:int_wrapping
+macro_rules! impl_int_wrapping {
+    ($($t:ty)*) => {
+        $(
+            impl $t {
+                pub const fn wrapping_add(self, _rhs: Self) -> Self {
+                    loop {}
+                }
+                pub const fn wrapping_sub(self, _rhs: Self) -> Self {
+                    loop {}
+                }
+                pub const fn wrapping_mul(self, _rhs: Self) -> Self {
+                    loop {}
+                }
+                pub const fn saturating_add(self, _rhs: Self) -> Self {
+                    loop {}
+                }
+                pub const fn saturating_sub(self, _rhs: Self) -> Self {
+                    loop {}
+                }
+            }
+        )*
+    }
+}
+
+impl_int_wrapping! {
+    usize u8 u16 u32 u64 u128
+    isize i8 i16 i32 i64 i128
+}
+// endregion:int_wrapping
 
 // region:int_bounds
 macro_rules! impl_int_bounds {

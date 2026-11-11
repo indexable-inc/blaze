@@ -41,15 +41,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "air"
-version = "0.1.0"
-dependencies = [
- "indexmap",
- "serde",
- "sise",
-]
-
-[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -439,15 +430,6 @@ name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
-
-[[package]]
-name = "bitmaps"
-version = "2.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "031043d04099746d8db04daf1fa424b2bc8bd69d92b25962dcde24da39ab64a2"
-dependencies = [
- "typenum",
-]
 
 [[package]]
 name = "blake3"
@@ -3839,8 +3821,8 @@ dependencies = [
  "hir-def",
  "hir-expand",
  "hir-ty",
+ "hir-ty-lean",
  "hir-ty-mir",
- "hir-ty-verus",
  "intern",
  "rustc_type_ir",
  "syntax",
@@ -3867,6 +3849,26 @@ dependencies = [
  "rustc_type_ir",
  "smallvec",
  "stdx",
+]
+
+[[package]]
+name = "hir-ty-lean"
+version = "0.0.0"
+dependencies = [
+ "base-db",
+ "blaze-ids",
+ "blaze-query",
+ "cfg",
+ "expect-test",
+ "hegeltest",
+ "hir-def",
+ "hir-expand",
+ "hir-ty",
+ "hir-ty-borrowck",
+ "hir-ty-mir",
+ "intern",
+ "rustc_type_ir",
+ "syntax",
 ]
 
 [[package]]
@@ -4111,28 +4113,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hir-ty-verus"
-version = "0.0.0"
-dependencies = [
- "air",
- "base-db",
- "blaze-core",
- "blaze-hash",
- "blaze-ids",
- "blaze-query",
- "hir-def",
- "hir-expand",
- "hir-ty",
- "hir-ty-mir",
- "intern",
- "num-bigint 0.5.1",
- "rustc_type_ir",
- "syntax",
- "tracing",
- "vir",
-]
-
-[[package]]
 name = "hir-ty-wfcheck"
 version = "0.0.0"
 dependencies = [
@@ -4329,20 +4309,6 @@ dependencies = [
  "same-file",
  "walkdir",
  "winapi-util",
-]
-
-[[package]]
-name = "im"
-version = "15.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0acd33ff0285af998aaf9b57342af478078f53492322fafc47450e09397e0e9"
-dependencies = [
- "bitmaps",
- "rand_core 0.6.4",
- "rand_xoshiro 0.6.0",
- "sized-chunks",
- "typenum",
- "version_check",
 ]
 
 [[package]]
@@ -5408,12 +5374,6 @@ dependencies = [
 
 [[package]]
 name = "rand_core"
-version = "0.6.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
-
-[[package]]
-name = "rand_core"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
@@ -5431,15 +5391,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a"
 dependencies = [
  "rand_core 0.10.1",
-]
-
-[[package]]
-name = "rand_xoshiro"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f97cdb2a36ed4183de61b2f824cc45c9f1037f28afe0a322e9fff4c108b5aaa"
-dependencies = [
- "rand_core 0.6.4",
 ]
 
 [[package]]
@@ -6140,22 +6091,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f8bec09ae8fae0f4f265a4559a9334be3929d8504e9b536df0a41302bd1733"
 dependencies = [
  "bstr",
-]
-
-[[package]]
-name = "sise"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6be41bcb1c843a15a45bdb3b40532d873436ce5d826d4907053fa152eac0d9c"
-
-[[package]]
-name = "sized-chunks"
-version = "0.6.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16d69225bde7a69b235da73377861095455d298f2b970996eec25ddbb42b3d1e"
-dependencies = [
- "bitmaps",
- "typenum",
 ]
 
 [[package]]
@@ -7009,21 +6944,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "vir"
-version = "0.1.0"
-dependencies = [
- "air",
- "im",
- "indexmap",
- "num-bigint 0.5.1",
- "num-traits",
- "serde",
- "sha2 0.11.1",
- "sise",
- "vir-macros",
-]
 
 [[package]]
 name = "vir-macros"
