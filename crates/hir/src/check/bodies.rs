@@ -12,6 +12,18 @@
 //! ([`Plan::reached`]); every task checks those first, so they are never queued behind bodies
 //! nothing reaches. Which bodies are checked does not change: the batch returns only once every
 //! listed body was, as rustc checks every body of a crate it compiles.
+//!
+//! A plan of every body ([`Plan::of_every_body`]) keeps what each check found as the database's
+//! memo: whether the body, or the module's items, gave no diagnostic ([`body_check_clean`],
+//! [`module_check_clean`]). A build after an edit asks each memo, which the query engine
+//! verifies against what the check read (the body, its inference, its borrow check, the
+//! signatures it names) without running anything, and only a body one of whose reads changed
+//! is checked again. A clean body's task then reads no inference result and no MIR: until
+//! 2026-11-10 every task ran the whole check, which read each body's inference and MIR by
+//! value, and since a build lets those values go when it ends (blaze-cargo's front end
+//! release) a one-line edit of one function inferred every body of the crate again and built
+//! its MIR again (ripgrep, `rg::main`: `infer_body_query` executed 1,165 with 2 changed,
+//! `mir_body_query` 1,166 with 1 changed).
 
 use std::{
     ptr,
@@ -103,8 +115,26 @@ pub struct Plan<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> {
     index: std::sync::OnceLock<HashMap<DefWithBodyId, u32, Global>>,
     queue: Queue,
     started: AtomicBool,
+    /// Whether what a check found clean is kept and asked as the database's memo
+    /// ([`body_check_clean`], [`module_check_clean`]): only for a plan whose `asked` accepts
+    /// every body, which is what the memos were checked with ([`Plan::of_every_body`]).
+    kept: bool,
     #[cfg(test)]
     ran: blaze_core::lock::Lock<Vec<Ran>>,
+}
+
+impl Plan<'static, fn(DefWithBody) -> bool> {
+    /// The check of every body of `crates` ([`Plan::new`] with
+    /// [`every_body`](super::every_body)), a body or a module found clean kept as the
+    /// database's memo and not checked again while nothing it read changed (the module).
+    /// The diagnostics are those of a plan that keeps nothing: a memo says only that a check
+    /// gave none, and a body or module that gave any is checked by its task as before.
+    pub fn of_every_body(db: &Db, crates: &[Crate]) -> Plan<'static, fn(DefWithBody) -> bool> {
+        static EVERY: fn(DefWithBody) -> bool = super::every_body;
+        let mut plan = Plan::new(db, crates, &EVERY);
+        plan.kept = true;
+        plan
+    }
 }
 
 impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
@@ -157,6 +187,7 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
             index: Default::default(),
             queue,
             started: AtomicBool::new(false),
+            kept: false,
             #[cfg(test)]
             ran: blaze_core::lock::Lock::new("test.hir.check.ran", Vec::new()),
         }
@@ -261,15 +292,21 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
         let planned = self.bodies[body as usize];
         #[cfg(test)]
         self.ran.lock().push(Ran::Body(planned.def));
+        // alloc: the body's diagnostics; empty, so no allocation, for a clean body
         let mut found = Vec::new();
-        DiagnosticsCollector::collect_body(
-            db,
-            planned.def,
-            planned.owner,
-            &mut found,
-            style_lints,
-            self.asked,
-        );
+        // A body the memo says is clean gives none, and nothing of it is read. One that gave
+        // any is checked here for them: its queries are the memo's run's, so this reads what
+        // that run made.
+        if !(self.kept && body_check_clean(db, planned.def, style_lints)) {
+            DiagnosticsCollector::collect_body(
+                db,
+                planned.def,
+                planned.owner,
+                &mut found,
+                style_lints,
+                self.asked,
+            );
+        }
         assert!(
             slots.bodies[body as usize].set(found).is_ok(),
             "a body of a check was checked twice"
@@ -283,6 +320,17 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
         self.ran.lock().push(Ran::Module(module));
         let at = module as usize;
         let expected = &self.bodies[self.starts[at] as usize..self.starts[at + 1] as usize];
+        if self.kept && module_check_clean(db, self.modules[at].id, style_lints) {
+            // The module's items gave nothing, so each of its listed bodies' diagnostics is
+            // at the start of the module's: what the walk would mark with none before it.
+            // alloc: a mark a listed body, once a module
+            let marks = vec![0; expected.len()];
+            assert!(
+                slots.modules[at].set((Vec::new(), marks)).is_ok(),
+                "a module of a check was checked twice"
+            );
+            return;
+        }
         let mut found = Vec::new();
         let mut marks = Vec::with_capacity(expected.len());
         let defer = Defer { expected, marks: &mut marks };
@@ -363,6 +411,50 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
     pub(crate) fn listed(&self) -> Vec<DefWithBodyId> {
         self.bodies.iter().map(|it| it.def).collect()
     }
+}
+
+/// Whether the check of body `def` alone ([`check_body`](super::check_body): its lowering's
+/// and expansions' errors, inference, unsafety, match and borrow checks, its constants, the
+/// items its blocks declare) gives no diagnostic, with `style_lints` or without. Kept by the
+/// database, so the next build's plan verifies it where this build's ran it, and a body
+/// nothing changed for is not checked again and none of its results is read
+/// ([`Plan::of_every_body`]). Its value is one bit; the diagnostics of a body that has any are
+/// made by its task, from the results this run left.
+///
+/// A check places a diagnostic only once it has found one, so a clean body's run reads no
+/// source position and stays verified when an edit above it in its file moves it.
+#[blaze_query::tracked(returns(copy))]
+pub fn body_check_clean(db: &Db, def: DefWithBodyId, style_lints: bool) -> bool {
+    #[cfg(test)]
+    tests::CHECKED.lock().push((db.nonce_and_revision().0, def));
+    super::check_body(db, def, style_lints).is_empty()
+}
+
+/// Whether the item checks of file module `module` (its declarations' signatures, its impls,
+/// its visibilities and macro definitions, an enum's discriminants, the inline modules
+/// written in it), the bodies a plan lists left to their own checks ([`list_module`]), give
+/// no diagnostic. Kept by the database as [`body_check_clean`] is. A walk that does not meet
+/// a listed body where the listing has it is the plan's bug, and panics as the task's does.
+#[blaze_query::tracked(returns(copy))]
+pub fn module_check_clean(db: &Db, module: ModuleId, style_lints: bool) -> bool {
+    let every = &super::every_body;
+    // alloc: the module's listed bodies, once per run of its check
+    let mut expected = Vec::new();
+    list_module(db, module, every, &mut expected);
+    // alloc: the diagnostics; empty, so no allocation, for a clean module
+    let mut found = Vec::new();
+    // alloc: a mark a listed body, once per run of its check
+    let mut marks = Vec::with_capacity(expected.len());
+    let defer = Defer { expected: &expected, marks: &mut marks };
+    DiagnosticsCollector::collect_deferred(db, module, &mut found, style_lints, every, defer);
+    if let Some(missed) = expected.get(marks.len()) {
+        panic!(
+            "the check of module {module:?} did not meet body {:?} where the plan lists it: the \
+             plan's listing and the collector's walk disagree",
+            missed.def
+        );
+    }
+    found.is_empty()
 }
 
 /// One crate's diagnostics as [`Plan::run_marked`] gives them.
