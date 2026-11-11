@@ -567,7 +567,7 @@ private; a test that makes raw system calls, or tampers with the interposer in i
 gets past the recording and the private writes but not Seatbelt's read-only machine or its
 network rule; a sandbox inside the sandbox fails with `EPERM`.
 
-What it cost v1, measured with `harness/sandboxbench.py` on 2026-10-26 (one sandbox per
+What it cost v1, measured with `sandboxbench.py` (since deleted) on 2026-10-26 (one sandbox per
 executable, v1's way, against a sandbox per test). v2's fork server is a third way, one sandbox
 per binary and a fork per test, not measured here; its costs are in
 [v2/plan/lanes/usercode/tests.md](v2/plan.md):
@@ -965,7 +965,7 @@ run them instead and send each result, which the client prints in libtest's form
   tries. `--ub` with `--no-run` is refused.
 
 v1's test cache is gone with v1: `BLAZE_TESTS` (`affected`, `verify`, `all`),
-`BLAZE_TESTS_FROM`, `BLAZE_TEST_ENV`, `blaze test --why`, and the `tests-passed`,
+`BLAZE_TESTS_FROM`, its environment setting, `blaze test --why`, and the `tests-passed`,
 `tests-programs` and `target/blaze/tests.ndjson` files it wrote. No v2 crate reads or writes
 them.
 
@@ -1364,7 +1364,7 @@ whichever command started it; to change one there, run `blaze stop` first):
 made without being part of a unit's key, so set in the daemon's environment they fail every
 unit, naming the variable (`crates/hir-ty-codegen/v2/backend.rs`, `CHANGES_CODE`); the profile
 picks the backend ([below](#backends)). v1's splice setting, its build-script runner's,
-`BLAZE_TESTS`, `BLAZE_TESTS_FROM`, `BLAZE_TEST_ENV`, `BLAZE_IDLE_SECS`, `BLAZE_MEMORY_MAX`,
+`BLAZE_TESTS`, `BLAZE_TESTS_FROM`, `BLAZE_IDLE_SECS`, `BLAZE_MEMORY_MAX`,
 `BLAZE_MEMORY_BUDGET`, `BLAZE_SPARE` and `BLAZE_LRU` are read by nothing in v2.
 
 ## Backends

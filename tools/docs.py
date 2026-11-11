@@ -2,7 +2,10 @@
 """docs.py: every document under docs/ says what it is, and the current ones are held to the tree.
 
     python3 tools/docs.py check    fail naming each problem (CI, beside tools/agents/rules.ts)
-    python3 tools/docs.py write    regenerate docs/README.md, the index, from the front matter
+    python3 tools/docs.py write    regenerate docs/README.md, the index, from the front matter, and
+                                   take the files that are gone out of tools/python-allowed.txt
+    python3 tools/docs.py python '{"left": 0}'   at most `left` Python files remain (ledger D43)
+    python3 tools/docs.py selftest
 
 Each docs/**/*.md but docs/README.md (generated) and docs/upstream/ (others' text, as fetched)
 opens with front matter, one `key: value` per line between `---` lines:
@@ -18,8 +21,14 @@ design not (fully) built, dated: its links and anchors resolve, but it may name 
 A `record` (research, a report, a measurement) was true on its date and is never brought up to
 date: only the files it links have to exist. A `superseded` doc names what replaced it and is left
 out of the index. Outside docs/, every doc under docs/ that code or another document names exists.
+
+No new Python (docs/v2/plan/design/scripts.md, rule guard-the-cause): tools/python-allowed.txt
+lists every `.py` file in the tree, a path a line. `check` fails for a `.py` file that is not
+listed (a script is written in Rust) and for a line whose file is gone; `write` takes such lines
+out and never adds one, so the list only shrinks. `python` takes one JSON object, `{"left": N}`,
+and fails while more than N files are left or the list does not hold.
 """
-import os, re, subprocess, sys, unicodedata
+import json, os, re, subprocess, sys, unicodedata
 from dataclasses import dataclass
 from typing import Literal, get_args
 from urllib.parse import unquote
@@ -27,6 +36,11 @@ from urllib.parse import unquote
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DOCS = os.path.join(ROOT, "docs")
 INDEX = os.path.join(DOCS, "README.md")
+ALLOWED = os.path.join(ROOT, "tools", "python-allowed.txt")
+ALLOWED_HEAD = """# The Python files left (docs/v2/plan/design/scripts.md). `python3 tools/docs.py check` fails for a
+# .py file that is not here; `python3 tools/docs.py write` takes out the lines whose file is gone
+# and never adds one. A new script is written in Rust.
+"""
 Status = Literal["current", "plan", "record", "superseded"]
 # Top-level directories whose paths a doc names in backticks; anything else in backticks is a
 # command, a type or a relative path, not checked.
@@ -179,8 +193,53 @@ def read(path):
         return None
 
 
+def python_files():
+    """Every .py file in the tree that git does not ignore, tracked or not."""
+    out = subprocess.run(["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", "*.py"],
+                         cwd=ROOT, check=True, capture_output=True).stdout
+    return sorted({p for p in out.decode().split("\0") if p and os.path.exists(os.path.join(ROOT, p))})
+
+
+def allowed(text):
+    return [line.strip() for line in text.split("\n") if line.strip() and not line.startswith("#")]
+
+
+def python_problems(files, listed):
+    """What is wrong between the .py `files` of the tree and the paths `listed` as allowed."""
+    errors = [f"{path}: a new Python file: write it as a Rust script (docs/v2/plan/design/scripts.md); "
+              "tools/python-allowed.txt only shrinks" for path in files if path not in set(listed)]
+    errors += [f"tools/python-allowed.txt: {path} is gone: run `python3 tools/docs.py write` and commit it"
+               for path in listed if path not in set(files)]
+    if not errors and listed != sorted(set(listed)):
+        errors.append("tools/python-allowed.txt: not sorted, or a path twice: run `python3 tools/docs.py write`")
+    return errors
+
+
+def allowed_after(files, listed):
+    """The list `write` leaves: what was listed and is still there. Never a path that was not listed."""
+    return ALLOWED_HEAD + "".join(f"{path}\n" for path in sorted(set(listed) & set(files)))
+
+
+def left(text):
+    """`python`'s input, `{"left": N}`: a field it does not have is refused."""
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as e:
+        sys.exit(f"tools/docs.py: the input is not JSON: {e}")
+    if not isinstance(value, dict):
+        sys.exit(f"tools/docs.py: the input is a JSON object, not {json.dumps(value)}")
+    if unknown := sorted(set(value) - {"left"}):
+        sys.exit(f"tools/docs.py: no field {', '.join(unknown)} (the fields are left)")
+    if "left" not in value:
+        sys.exit("tools/docs.py: field left is required")
+    if not isinstance(value["left"], int) or isinstance(value["left"], bool):
+        sys.exit(f"tools/docs.py: left is a int, not {json.dumps(value['left'])}")
+    return value["left"]
+
+
 def check():
     docs, errors = load()
+    errors += python_problems(python_files(), allowed(read(rel(ALLOWED)) or ""))
     settings = set()
     for path in tracked():
         if path.startswith(NOT_OURS):
@@ -240,14 +299,44 @@ def index(docs):
     return "\n".join(out).rstrip("\n") + "\n"
 
 
+def selftest():
+    def expect(holds, what):
+        if not holds:
+            sys.exit(f"tools/docs.py selftest: {what}")
+
+    expect(python_problems(["a.py", "b/c.py"], ["a.py", "b/c.py"]) == [], "a tree that is its list holds")
+    added = python_problems(["a.py", "new.py"], ["a.py"])
+    expect(len(added) == 1 and added[0].startswith("new.py: a new Python file"), "a file that is not listed is refused, by name")
+    gone = python_problems(["a.py"], ["a.py", "gone.py"])
+    expect(len(gone) == 1 and "gone.py is gone" in gone[0], "a line whose file is gone is refused, by name")
+    expect(python_problems(["a.py", "b.py"], ["b.py", "a.py"]) != [], "an unsorted list is refused")
+    expect(allowed(allowed_after(["a.py", "new.py"], ["a.py", "gone.py"])) == ["a.py"], "write drops what is gone and adds nothing")
+    expect(allowed(ALLOWED_HEAD + "\n a.py \n# b.py\n") == ["a.py"], "comments and blank lines are not paths")
+    expect(python_problems([], []) == [], "no Python and an empty list hold")
+    print("docs.py selftest: ok")
+
+
 def main():
-    if len(sys.argv) != 2 or sys.argv[1] not in ("check", "write"):
-        sys.exit("tools/docs.py: one subcommand, check or write")
+    if len(sys.argv) == 3 and sys.argv[1] == "python":
+        most, files = left(sys.argv[2]), python_files()
+        errors = python_problems(files, allowed(read(rel(ALLOWED)) or ""))
+        if len(files) > most:
+            errors.append(f"{len(files)} Python files are left (tools/python-allowed.txt), more than {most}")
+        if errors:
+            print("\n".join(errors), file=sys.stderr)
+            sys.exit(f"tools/docs.py: {len(errors)} problems")
+        return
+    if len(sys.argv) != 2 or sys.argv[1] not in ("check", "write", "selftest"):
+        sys.exit("tools/docs.py: one subcommand: check, write, selftest, or python with its input")
+    if sys.argv[1] == "selftest":
+        return selftest()
     if sys.argv[1] == "write":
         docs, errors = load()
         if errors:
             sys.exit("\n".join(errors))
         open(INDEX, "w", encoding="utf-8").write(index(docs))
+        kept = allowed_after(python_files(), allowed(read(rel(ALLOWED)) or ""))
+        open(ALLOWED, "w", encoding="utf-8").write(kept)
         return
     errors = check()
     if errors:

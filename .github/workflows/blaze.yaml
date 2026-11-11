@@ -126,8 +126,11 @@ jobs:
       - run: bun site/node_modules/.bin/tsc -p tools/agents
       - run: bun tools/agents/rules.ts --check
       # Each doc says what it is, the current ones hold against the tree, and docs/README.md is
-      # their index (tools/docs.py).
-      - run: python3 tools/docs.py check
+      # their index (tools/docs.py). And no Python file is added: tools/python-allowed.txt lists
+      # the ones left and only shrinks (docs/v2/plan/design/scripts.md).
+      - run: |
+          python3 tools/docs.py selftest
+          python3 tools/docs.py check
       # The objectives ledger's rows are well formed and its table is current (harness/v2/ledger.py).
       - run: |
           uv run --frozen python harness/v2/ledger.py selftest

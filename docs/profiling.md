@@ -1440,8 +1440,7 @@ SELECT name, count(*) AS n, sum(dur_ns) / 1e6 AS wall_ms, sum(self_cpu_ns) / 1e6
 FROM spans WHERE build_id = 42 GROUP BY name ORDER BY cpu_ms DESC;
 ```
 
-`harness/realbench.py` reads the exported trace's critical path in place of the old
-`blaze.breakdown`; `crates/blaze-profile/src/diff.rs` still reads the `phases.tsv` of old
+`crates/blaze-profile/src/diff.rs` still reads the `phases.tsv` of old
 profile directories a log names. The flight recorder's dump beside a stall (`flight::dump`)
 keeps its own one-process Chrome writer (`crates/blaze-profile/src/dump.rs`).
 
