@@ -357,4 +357,240 @@ example : Opt.validate constant constantSimplified = true := by decide
 
 example : Opt.validate constant (one [] Terminator.ret) = false := by decide
 
+/-! The CFG passes, on `constantSimplified`: block 1 is an empty `goto 3`, block 2 is dead.
+
+Goto threading sends block 0 past block 1; the call gives the same value. -/
+
+example :
+    (Opt.threadGotos constantSimplified).fns.map
+        (fun body => body.blocks.map (fun blk => blk.terminator)) =
+      [[Terminator.goto 3, Terminator.goto 3, Terminator.unreachable, Terminator.ret]] := by
+  decide
+
+example : isInt ScalarTy.U32 4 ((Opt.threadGotos constantSimplified).call 8 0 [] []) = true := by
+  decide
+
+/-- The threaded program is done in two steps where the program takes three. -/
+example : isInt ScalarTy.U32 4 ((Opt.threadGotos constantSimplified).call 2 0 [] []) = true := by
+  decide
+
+example : isDiverge (constantSimplified.call 2 0 [] []) = true := by decide
+
+/-- Two rounds leave what one round made: `constantSimplified` has no chain of two. -/
+example : Opt.threadGotosN 2 constantSimplified = Opt.threadGotos constantSimplified := by decide
+
+/-! Dead-block removal keeps what block 0 reaches, in its old order, and renames the
+targets. The check its theorem takes is evaluated, and the theorem is applied. -/
+
+example : Opt.reachableOrders constantSimplified 0 = [0, 1, 3] := by decide
+
+example : Opt.checkDead constantSimplified = true := by decide
+
+example :
+    (Opt.removeDeadBlocks constantSimplified).fns.map
+        (fun body => body.blocks.map (fun blk => blk.terminator)) =
+      [[Terminator.goto 1, Terminator.goto 2, Terminator.ret]] := by
+  decide
+
+example :
+    (Opt.removeDeadBlocks constantSimplified).call 8 0 [] [] =
+      constantSimplified.call 8 0 [] [] :=
+  Opt.removeDeadBlocks_call constantSimplified (by decide) 8 0 [] []
+
+example : isInt ScalarTy.U32 4 ((Opt.removeDeadBlocks constantSimplified).call 8 0 [] []) = true := by
+  decide
+
+/-- Threading, then dead-block removal: two blocks are left. -/
+example :
+    (Opt.removeDeadBlocks (Opt.threadGotos constantSimplified)).fns.map
+        (fun body => body.blocks.length) = [2] := by
+  decide
+
+/-! A permutation of the blocks: the entry block stays first, every block is listed. -/
+
+def shuffled : FnId → List BlockId := fun _ => [0, 3, 2, 1]
+
+example : Opt.checkPermutation shuffled constantSimplified = true := by decide
+
+/-- An order that misses a block is refused. -/
+example : Opt.checkPermutation (fun _ => [0, 1, 2]) constantSimplified = false := by decide
+
+/-- So is one that does not start at the entry block. -/
+example : Opt.checkPermutation (fun _ => [1, 0, 2, 3]) constantSimplified = false := by decide
+
+example :
+    (Opt.renumber shuffled constantSimplified).fns.map
+        (fun body => body.blocks.map (fun blk => blk.terminator)) =
+      [[Terminator.goto 3, Terminator.ret, Terminator.unreachable, Terminator.goto 1]] := by
+  decide
+
+example :
+    (Opt.renumber shuffled constantSimplified).call 8 0 [] [] =
+      constantSimplified.call 8 0 [] [] :=
+  Opt.permuteBlocks_call shuffled constantSimplified (by decide) 8 0 [] []
+
+example : isInt ScalarTy.U32 4 ((Opt.renumber shuffled constantSimplified).call 8 0 [] []) = true := by
+  decide
+
+/-! A `switchInt` whose arms all go to one block is a `goto` to it; one whose arms differ is
+left. -/
+
+def sameArms (other : BlockId) : Program :=
+  { adts := [],
+    fns :=
+      [{ name := "sameArms", args := 1, locals := [Ty.int ScalarTy.U32, Ty.bool],
+         blocks :=
+           [{ stmts := [],
+              terminator := Terminator.switchInt (Operand.copy (Place.mk 1 [])) [(0, 1)] other },
+            { stmts :=
+                [Statement.assign (Place.mk 0 [])
+                   (Rvalue.use (Operand.const (Const.int ScalarTy.U32 7)))],
+              terminator := Terminator.ret },
+            { stmts := [], terminator := Terminator.unreachable }] }] }
+
+example :
+    (Opt.switchToGoto (sameArms 1)).fns.map
+        (fun body => body.blocks.map (fun blk => blk.terminator)) =
+      [[Terminator.goto 1, Terminator.ret, Terminator.unreachable]] := by
+  decide
+
+example : Opt.switchToGoto (sameArms 2) = sameArms 2 := by decide
+
+example :
+    isInt ScalarTy.U32 7 ((Opt.switchToGoto (sameArms 1)).call 4 0 [] [Value.bool true]) =
+      true := by
+  decide
+
+/-! Merging: block 1 has one predecessor and goes into block 0; block 3 has one and goes
+into block 1. The merged program is done in two steps. -/
+
+example :
+    (Opt.mergeSuccessors constantSimplified).fns.map
+        (fun body => body.blocks.map (fun blk => (blk.stmts.length, blk.terminator))) =
+      [[(1, Terminator.goto 3), (2, Terminator.ret), (0, Terminator.unreachable),
+        (2, Terminator.ret)]] := by
+  decide
+
+example :
+    isInt ScalarTy.U32 4 ((Opt.mergeSuccessors constantSimplified).call 2 0 [] []) = true := by
+  decide
+
+/-! Threading through a call's return target: the caller of `bump` returns to an empty block
+that only jumps on, and goes past it. -/
+
+def callThenHop : Program :=
+  { adts := [],
+    fns :=
+      [{ name := "caller", args := 0, locals := [Ty.int ScalarTy.U32, Ty.int ScalarTy.U32],
+         blocks :=
+           [{ stmts := [],
+              terminator := Terminator.call (Callee.fn 1) [] (Place.mk 1 []) (some 1) },
+            { stmts := [], terminator := Terminator.goto 2 },
+            { stmts :=
+                [Statement.assign (Place.mk 0 []) (Rvalue.use (Operand.copy (Place.mk 1 [])))],
+              terminator := Terminator.ret }] },
+       { name := "seven", args := 0, locals := [Ty.int ScalarTy.U32],
+         blocks :=
+           [{ stmts :=
+                [Statement.assign (Place.mk 0 [])
+                   (Rvalue.use (Operand.const (Const.int ScalarTy.U32 7)))],
+              terminator := Terminator.ret }] }] }
+
+example :
+    (Opt.threadAll callThenHop).block 0 0 =
+      some { stmts := [],
+             terminator := Terminator.call (Callee.fn 1) [] (Place.mk 1 []) (some 2) } := by
+  decide
+
+example : isInt ScalarTy.U32 7 (callThenHop.call 4 0 [] []) = true := by decide
+
+example : isDiverge (callThenHop.call 3 0 [] []) = true := by decide
+
+/-- The threaded program is done in three steps where the program takes four. -/
+example : isInt ScalarTy.U32 7 ((Opt.threadAll callThenHop).call 3 0 [] []) = true := by decide
+
+/-! `SimplifyCfg` composed: one round leaves `constantSimplified` one block, the three
+statements and the return, and its call is done in one step. -/
+
+example :
+    (Opt.simplifyCfg 1 constantSimplified).fns.map
+        (fun body => body.blocks.map (fun blk => (blk.stmts.length, blk.terminator))) =
+      [[(3, Terminator.ret)]] := by
+  decide
+
+example : isInt ScalarTy.U32 4 ((Opt.simplifyCfg 1 constantSimplified).call 1 0 [] []) = true := by
+  decide
+
+/-! A store overwritten in its own block, before its local is mentioned, goes. -/
+
+def storeTwice (read : Bool) : Program :=
+  { adts := [],
+    fns :=
+      [{ name := "storeTwice", args := 0, locals := [Ty.int ScalarTy.U32, Ty.int ScalarTy.U32],
+         blocks :=
+           [{ stmts :=
+                [Statement.assign (Place.mk 1 [])
+                   (Rvalue.use (Operand.const (Const.int ScalarTy.U32 5))),
+                 (if read then
+                   Statement.assign (Place.mk 0 []) (Rvalue.use (Operand.copy (Place.mk 1 [])))
+                 else Statement.nop),
+                 Statement.assign (Place.mk 1 [])
+                   (Rvalue.use (Operand.const (Const.int ScalarTy.U32 7))),
+                 Statement.assign (Place.mk 0 []) (Rvalue.use (Operand.copy (Place.mk 1 [])))],
+              terminator := Terminator.ret }] }] }
+
+example : Opt.checkBorrows Opt.refsOf (storeTwice false) = true := by decide
+
+example :
+    (Opt.removeOverwritten Opt.refsOf (storeTwice false)).fns.map
+        (fun body => body.blocks.map (fun blk => blk.stmts.map Opt.isNop)) =
+      [[[true, true, false, false]]] := by
+  decide
+
+/-- With the first store read before the second, it stays; the store to local 0 that the last
+statement overwrites goes instead. -/
+example :
+    (Opt.removeOverwritten Opt.refsOf (storeTwice true)).fns.map
+        (fun body => body.blocks.map (fun blk => blk.stmts.map Opt.isNop)) =
+      [[[false, true, false, false]]] := by
+  decide
+
+example :
+    isInt ScalarTy.U32 7
+        ((Opt.removeOverwritten Opt.refsOf (storeTwice true)).call 2 0 [] []) = true := by
+  decide
+
+example :
+    isInt ScalarTy.U32 7
+        ((Opt.removeOverwritten Opt.refsOf (storeTwice false)).call 2 0 [] []) = true := by
+  decide
+
+/-! The witness validator: a script of proved rewrites takes `constantSimplified` to one
+block; the same script does not take it to another program, and an empty script takes a
+program only to itself. -/
+
+def oneBlock : Program :=
+  { adts := [],
+    fns :=
+      [{ name := "constant", args := 0, locals := [Ty.int ScalarTy.U32],
+         blocks :=
+           [{ stmts :=
+                [Statement.storageLive 0,
+                 Statement.assign (Place.mk 0 [])
+                   (Rvalue.use (Operand.const (Const.int ScalarTy.U32 4))),
+                 Statement.storageDead 0],
+              terminator := Terminator.ret }] }] }
+
+def cfgScript : List Opt.Rewrite :=
+  [Opt.Rewrite.threadAll, Opt.Rewrite.removeDeadBlocks, Opt.Rewrite.mergeSuccessors,
+   Opt.Rewrite.removeDeadBlocks]
+
+example : Opt.validateWith constantSimplified oneBlock cfgScript = true := by decide
+
+example : Opt.validateWith constantSimplified constantSimplified cfgScript = false := by decide
+
+example : Opt.validateWith constantSimplified oneBlock [] = false := by decide
+
+example : isInt ScalarTy.U32 4 (oneBlock.call 1 0 [] []) = true := by decide
+
 end Blaze.Mir.Tests

@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-31 theorems: 18 in `lean`, 13 in `lean/analysis`.
+74 theorems: 61 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -163,6 +163,448 @@ theorem constFold_correct (prog : Program) (fuel : Nat) (st : State) :
 ```lean
 theorem validate_sound (a b : Program) (h : validate a b = true) (fuel : Nat) (st : State) :
     run b fuel st = run a fuel st
+```
+
+**`Blaze.Mir.execStmt_ctl`** (`Blaze.Mir.Opt.Ctl`, `lean`): A statement leaves control as it was: which function each frame runs, the block it is at, and the block its caller goes on at.
+
+```lean
+theorem execStmt_ctl (adts : List AdtDecl) (st : State) :
+    ∀ (s : Statement), Outcome.All (fun (st' : State) => st'.ctl = st.ctl) (execStmt adts st s)
+  | Statement.assign p rv =>
+    Outcome.all_bind (evalRvalue_ctl adts st rv) (fun r hr =>
+      Outcome.all_bind (Outcome.all_true _) (fun ptr _ =>
+        Outcome.All.imp (State.write_ctl r.2 ptr r.1) (fun _ h => Eq.trans h hr)))
+  | Statement.storageLive _ => Outcome.all_ok rfl
+  | Statement.storageDead _ => Outcome.all_ok rfl
+  | Statement.nop => Outcome.all_ok rfl
+
+end Blaze.Mir
+```
+
+**`Blaze.Mir.execStmt_rename`** (`Blaze.Mir.Opt.Rename`, `lean`): A statement commutes with a renumbering of blocks: from the renamed state it gives the renamed state.
+
+```lean
+theorem execStmt_rename (adts : List AdtDecl) (ρ : FnId → BlockId → BlockId) (st : State) :
+    ∀ (s : Statement),
+      execStmt adts (st.rename ρ) s = Outcome.map (State.rename ρ) (execStmt adts st s)
+  | Statement.assign p rv =>
+    Outcome.bind_commutes_map (evalRvalue_rename adts ρ st rv) (fun r _ =>
+      Outcome.bind_commutes (evalPlace_rename ρ r.2 p) (fun ptr _ =>
+        State.write_rename ρ r.2 ptr r.1))
+  | Statement.storageLive _ => rfl
+  | Statement.storageDead _ => rfl
+  | Statement.nop => rfl
+
+/-! Terminators: a jump goes to the renamed block. Each lemma takes the function the running
+frame runs, `fn`, with `st.topFn = fn`: it is the map a target is renamed by. -/
+
+theorem mapNext_eq (f : State → State) :
+    ∀ (x : Outcome Next), mapNext f x = Outcome.map (Next.map f) x
+  | Outcome.ok _ => rfl
+  | Outcome.panic _ => rfl
+  | Outcome.undefined _ => rfl
+  | Outcome.diverge => rfl
+
+theorem State.jump_rename (ρ : FnId → BlockId → BlockId) (st : State) (fn : FnId)
+    (hfn : st.topFn = fn) (t : BlockId) :
+    (st.rename ρ).jump (ρ fn t) = Outcome.map (Next.map (State.rename ρ)) (st.jump t)
+```
+
+**`Blaze.Mir.step_rename`** (`Blaze.Mir.Opt.Rename`, `lean`): One step of a renumbered program from the renamed state is the renamed step of the program, at every block the renumbering keeps.
+
+```lean
+theorem step_rename {src tgt : Program} {ρ : FnId → BlockId → BlockId}
+    {L : FnId → BlockId → Prop} (h : Renumbers src tgt ρ L) :
+    ∀ (st : State), TopLive L st.ctl →
+      step tgt (st.rename ρ) = Outcome.map (Next.map (State.rename ρ)) (step src st)
+```
+
+**`Blaze.Mir.Renumbers.sim_total`** (`Blaze.Mir.Opt.Rename`, `lean`): A renumbering that keeps every block is a lockstep simulation, with no invariant.
+
+```lean
+theorem Renumbers.sim_total {src tgt : Program} {ρ : FnId → BlockId → BlockId}
+    (h : Renumbers src tgt ρ (fun _ _ => True)) :
+    Sim src tgt (State.rename ρ) (fun _ => True)
+```
+
+**`Blaze.Mir.step_reaches`** (`Blaze.Mir.Opt.Reach`, `lean`): The reachability invariant (control is at a live block and returns to live blocks) is kept by every step, when the live blocks are closed under jumps.
+
+```lean
+theorem step_reaches {prog : Program} {L : FnId → BlockId → Prop} (hc : Closed prog L) :
+    ∀ (st : State), Reaches L st → Outcome.All (NextReaches L) (step prog st)
+```
+
+**`Blaze.Mir.Renumbers.sim_live`** (`Blaze.Mir.Opt.Reach`, `lean`): A renumbering that keeps only a closed set of live blocks is a lockstep simulation on the states the reachability invariant holds of.
+
+```lean
+theorem Renumbers.sim_live {src tgt : Program} {ρ : FnId → BlockId → BlockId}
+    {L : FnId → BlockId → Prop} (h : Renumbers src tgt ρ L) (hc : Closed src L) :
+    Sim src tgt (State.rename ρ) (Reaches L)
+```
+
+**`Blaze.Mir.Opt.permuteBlocks_correct`** (`Blaze.Mir.Opt.Renumber`, `lean`): A checked permutation of each function's blocks runs as the program does, for every fuel and every state.
+
+```lean
+theorem permuteBlocks_correct (orders : FnId → List BlockId) (prog : Program)
+    (h : checkPermutation orders prog = true) (fuel : Nat) (st : State) :
+    run (renumber orders prog) fuel (st.rename (renumbering orders)) = run prog fuel st
+```
+
+**`Blaze.Mir.Opt.permuteBlocks_call`** (`Blaze.Mir.Opt.Renumber`, `lean`): A checked permutation of blocks gives every call the same outcome.
+
+```lean
+theorem permuteBlocks_call (orders : FnId → List BlockId) (prog : Program)
+    (h : checkPermutation orders prog = true) (fuel : Nat) (id : FnId) (base : List Slot)
+    (args : List Value) :
+    (renumber orders prog).call fuel id base args = prog.call fuel id base args
+```
+
+**`Blaze.Mir.Opt.removeDeadBlocks_correct`** (`Blaze.Mir.Opt.Renumber`, `lean`): Dead-block removal, when its check passes, runs as the program does from every state the reachability invariant holds of.
+
+```lean
+theorem removeDeadBlocks_correct (prog : Program) (h : checkDead prog = true) (fuel : Nat)
+    (st : State) (hr : Reaches (Kept (reachableOrders prog)) st) :
+    run (removeDeadBlocks prog) fuel (st.rename (renumbering (reachableOrders prog))) =
+      run prog fuel st
+```
+
+**`Blaze.Mir.Opt.removeDeadBlocks_call`** (`Blaze.Mir.Opt.Renumber`, `lean`): Dead-block removal, when its check passes, gives every call the same outcome.
+
+```lean
+theorem removeDeadBlocks_call (prog : Program) (h : checkDead prog = true) (fuel : Nat)
+    (id : FnId) (base : List Slot) (args : List Value) :
+    (removeDeadBlocks prog).call fuel id base args = prog.call fuel id base args
+```
+
+**`Blaze.Mir.Stutter.run_target`** (`Blaze.Mir.Opt.Sim`, `lean`): Under a stuttering simulation with bound K, a target run of n steps that ends is the source's run of K * n steps.
+
+```lean
+theorem Stutter.run_target {src tgt : Program} {f : State → State} {Inv : State → Prop}
+    {K : Nat} (h : Stutter src tgt f Inv K) :
+    ∀ (n : Nat) (st : State), Inv st → Blaze.Mir.run tgt n (f st) ≠ Outcome.diverge →
+      Blaze.Mir.run src (K * n) st = Blaze.Mir.run tgt n (f st)
+```
+
+**`Blaze.Mir.Stutter.run_source`** (`Blaze.Mir.Opt.Sim`, `lean`): Under a stuttering simulation, a source run of n steps that ends is the target's run of n steps.
+
+```lean
+theorem Stutter.run_source {src tgt : Program} {f : State → State} {Inv : State → Prop}
+    {K : Nat} (h : Stutter src tgt f Inv K) (n : Nat) (st : State) (hinv : Inv st)
+    (hne : Blaze.Mir.run src n st ≠ Outcome.diverge) :
+    Blaze.Mir.run tgt n (f st) = Blaze.Mir.run src n st
+```
+
+**`Blaze.Mir.Opt.threadGotos_target`** (`Blaze.Mir.Opt.Thread`, `lean`): A run of the goto-threaded program that ends in n steps is the program's run of 2 * n steps.
+
+```lean
+theorem threadGotos_target (prog : Program) (n : Nat) (st : State)
+    (hne : run (threadGotos prog) n st ≠ Outcome.diverge) :
+    run prog (2 * n) st = run (threadGotos prog) n st
+```
+
+**`Blaze.Mir.Opt.threadGotos_source`** (`Blaze.Mir.Opt.Thread`, `lean`): A run of the program that ends in n steps is the goto-threaded program's run of n steps.
+
+```lean
+theorem threadGotos_source (prog : Program) (n : Nat) (st : State)
+    (hne : run prog n st ≠ Outcome.diverge) :
+    run (threadGotos prog) n st = run prog n st
+```
+
+**`Blaze.Mir.Opt.threadGotos_call_source`** (`Blaze.Mir.Opt.Thread`, `lean`): A call that ends in n steps gives the same outcome in the goto-threaded program.
+
+```lean
+theorem threadGotos_call_source (prog : Program) (n : Nat) (id : FnId) (base : List Slot)
+    (args : List Value) (hne : prog.call n id base args ≠ Outcome.diverge) :
+    (threadGotos prog).call n id base args = prog.call n id base args
+```
+
+**`Blaze.Mir.Opt.threadGotos_call_target`** (`Blaze.Mir.Opt.Thread`, `lean`): A call of the goto-threaded program that ends in n steps gives the same outcome in the program with 2 * n steps.
+
+```lean
+theorem threadGotos_call_target (prog : Program) (n : Nat) (id : FnId) (base : List Slot)
+    (args : List Value) (hne : (threadGotos prog).call n id base args ≠ Outcome.diverge) :
+    prog.call (2 * n) id base args = (threadGotos prog).call n id base args
+```
+
+**`Blaze.Mir.Opt.threadGotosN_target`** (`Blaze.Mir.Opt.Thread`, `lean`): After k rounds of goto threading, a run that ends in n steps is the program's run of 2 ^ k * n steps.
+
+```lean
+theorem threadGotosN_target (prog : Program) :
+    ∀ (k n : Nat) (st : State), run (threadGotosN k prog) n st ≠ Outcome.diverge →
+      run prog (twoPow k * n) st = run (threadGotosN k prog) n st
+  | 0, n, st, _ => congrTo (fun j => run prog j st) (Nat.one_mul n)
+  | k + 1, n, st, hne => by
+    have t1 : run (threadGotosN k prog) (2 * n) st = run (threadGotos (threadGotosN k prog)) n st
+```
+
+**`Blaze.Mir.Opt.threadGotosN_source`** (`Blaze.Mir.Opt.Thread`, `lean`): A run of the program that ends in n steps is the run of n steps after any number of rounds of goto threading.
+
+```lean
+theorem threadGotosN_source (prog : Program) :
+    ∀ (k n : Nat) (st : State), run prog n st ≠ Outcome.diverge →
+      run (threadGotosN k prog) n st = run prog n st
+  | 0, _, _, _ => rfl
+  | k + 1, n, st, hne => by
+    have ih : run (threadGotosN k prog) n st = run prog n st
+```
+
+**`Blaze.Mir.run_refines`** (`Blaze.Mir.Opt.SwitchSame`, `lean`): When every step of the target refines the step of the source, every run of the target refines the run of the source, with the same fuel.
+
+```lean
+theorem run_refines (src tgt : Program)
+    (h : ∀ (st : State), (step tgt st).Refines (step src st)) :
+    ∀ (fuel : Nat) (st : State), (run tgt fuel st).Refines (run src fuel st)
+```
+
+**`Blaze.Mir.Opt.switchToGoto_refines`** (`Blaze.Mir.Opt.SwitchSame`, `lean`): A switchInt whose arms all go to one block made a goto refines the program: the same run, unless the program's is undefined.
+
+```lean
+theorem switchToGoto_refines (prog : Program) (fuel : Nat) (st : State) :
+    (run (switchToGoto prog) fuel st).Refines (run prog fuel st)
+```
+
+**`Blaze.Mir.execStmt_mapStack`** (`Blaze.Mir.Opt.MemMap`, `lean`): A statement commutes with any map on the stack that leaves memory alone.
+
+```lean
+theorem execStmt_mapStack (adts : List AdtDecl) {M : List Frame → List Frame} (hM : MemMap M) (st : State) :
+    ∀ (s : Statement),
+      execStmt adts (st.mapStack M) s = Outcome.map (State.mapStack M) (execStmt adts st s)
+  | Statement.assign p rv =>
+    Outcome.bind_commutes_map (evalRvalue_mapStack adts hM st rv) (fun r _ =>
+      Outcome.bind_commutes (evalPlace_mapStack hM r.2 p) (fun ptr _ =>
+        State.write_mapStack hM r.2 ptr r.1))
+  | Statement.storageLive _ => rfl
+  | Statement.storageDead _ => rfl
+  | Statement.nop => rfl
+
+end Blaze.Mir
+```
+
+**`Blaze.Mir.execBlockFrom_top`** (`Blaze.Mir.Opt.Merge`, `lean`): A block that does not end in a call does the same whatever block the running frame is at.
+
+```lean
+theorem execBlockFrom_top (adts : List AdtDecl) (sig : FnId → Option FnSig) (c : BlockId)
+    (term : Terminator) (h : isCall term = false) :
+    ∀ (stmts : List Statement) (st : State),
+      execBlockFrom adts sig (st.mapStack (withTopBlock c)) stmts term =
+        execBlockFrom adts sig st stmts term
+  | [], st => execTerm_top sig c st term h
+  | s :: rest, st =>
+    Outcome.bind_map_congr (execStmt_mapStack adts (withTopBlock_memMap c) st s) (fun st1 _ =>
+      execBlockFrom_top adts sig c term h rest st1)
+
+/-- Statements, then more statements and a terminator: what the first statements and a
+`goto` do when they fail, or else the rest from the state the `goto` jumps from. -/
+theorem execBlockFrom_append (adts : List AdtDecl) (sig : FnId → Option FnSig) (t : BlockId)
+    (s2 : List Statement) (term2 : Terminator) :
+    ∀ (s1 : List Statement) (st : State),
+      execBlockFrom adts sig st (s1 ++ s2) term2 =
+          execBlockFrom adts sig st s1 (Terminator.goto t) ∨
+        ∃ st1, st1.ctl = st.ctl ∧
+          execBlockFrom adts sig st s1 (Terminator.goto t) = st1.jump t ∧
+          execBlockFrom adts sig st (s1 ++ s2) term2 = execBlockFrom adts sig st1 s2 term2
+  | [], st => Or.inr ⟨st, rfl, rfl, rfl⟩
+  | s :: rest, st => by
+    cases hs : execStmt adts st s with
+    | ok st' =>
+      have a : execBlockFrom adts sig st ((s :: rest) ++ s2) term2 =
+          execBlockFrom adts sig st' (rest ++ s2) term2
+```
+
+**`Blaze.Mir.Opt.mergeGotos_target`** (`Blaze.Mir.Opt.Merge`, `lean`): A run of the block-merged program that ends in n steps is the program's run of 2 * n steps, for every choice of targets merged.
+
+```lean
+theorem mergeGotos_target (pick : Body → BlockId → Bool) (prog : Program) (n : Nat) (st : State)
+    (hne : run (mergeGotos pick prog) n st ≠ Outcome.diverge) :
+    run prog (2 * n) st = run (mergeGotos pick prog) n st
+```
+
+**`Blaze.Mir.Opt.mergeGotos_source`** (`Blaze.Mir.Opt.Merge`, `lean`): A run of the program that ends in n steps is the block-merged program's run of n steps.
+
+```lean
+theorem mergeGotos_source (pick : Body → BlockId → Bool) (prog : Program) (n : Nat) (st : State)
+    (hne : run prog n st ≠ Outcome.diverge) :
+    run (mergeGotos pick prog) n st = run prog n st
+```
+
+**`Blaze.Mir.Opt.mergeGotos_call_source`** (`Blaze.Mir.Opt.Merge`, `lean`): A call that ends in n steps gives the same outcome in the block-merged program.
+
+```lean
+theorem mergeGotos_call_source (pick : Body → BlockId → Bool) (prog : Program) (n : Nat)
+    (id : FnId) (base : List Slot) (args : List Value)
+    (hne : prog.call n id base args ≠ Outcome.diverge) :
+    (mergeGotos pick prog).call n id base args = prog.call n id base args
+```
+
+**`Blaze.Mir.Opt.threadAll_target`** (`Blaze.Mir.Opt.ThreadCalls`, `lean`): With every target threaded, a call's return target too, a run that ends in n steps from the mapped state is the program's run of 2 * n steps.
+
+```lean
+theorem threadAll_target (prog : Program) (n : Nat) (st : State)
+    (hne : run (threadAll prog) n (st.mapStack (retargetStack (threadMap prog))) ≠
+      Outcome.diverge) :
+    run prog (2 * n) st =
+      run (threadAll prog) n (st.mapStack (retargetStack (threadMap prog)))
+```
+
+**`Blaze.Mir.Opt.threadAll_source`** (`Blaze.Mir.Opt.ThreadCalls`, `lean`): A run of the program that ends in n steps is the run of n steps of the program with every target threaded, from the mapped state.
+
+```lean
+theorem threadAll_source (prog : Program) (n : Nat) (st : State)
+    (hne : run prog n st ≠ Outcome.diverge) :
+    run (threadAll prog) n (st.mapStack (retargetStack (threadMap prog))) = run prog n st
+```
+
+**`Blaze.Mir.Opt.threadAll_call_source`** (`Blaze.Mir.Opt.ThreadCalls`, `lean`): A call that ends in n steps gives the same outcome with every target threaded.
+
+```lean
+theorem threadAll_call_source (prog : Program) (n : Nat) (id : FnId) (base : List Slot)
+    (args : List Value) (hne : prog.call n id base args ≠ Outcome.diverge) :
+    (threadAll prog).call n id base args = prog.call n id base args
+```
+
+**`Blaze.Mir.State.read_ok`** (`Blaze.Mir.Opt.Ptr`, `lean`): When every pointer in memory satisfies P, a read gives a value whose pointers satisfy P.
+
+```lean
+theorem State.read_ok {P : Pointer → Prop} {st : State} (hm : MemOk P st) (p : Pointer)
+    (v : Value) (h : st.read p = Outcome.ok v) : Value.Ok P v
+```
+
+**`Blaze.Mir.State.write_ok`** (`Blaze.Mir.Opt.Ptr`, `lean`): A write of a value whose pointers satisfy P keeps every pointer in memory satisfying P.
+
+```lean
+theorem State.write_ok {P : Pointer → Prop} {st : State} (hm : MemOk P st) (p : Pointer)
+    (v : Value) (hv : Value.Ok P v) (st' : State) (h : st.write p v = Outcome.ok st') :
+    MemOk P st'
+```
+
+**`Blaze.Mir.evalPlace_ptr`** (`Blaze.Mir.Opt.Borrow`, `lean`): A place whose base local may be borrowed, or that goes through a dereference, evaluates to a pointer to frame 0 or to a local its frame's function may borrow.
+
+```lean
+theorem evalPlace_ptr {B : FnId → Local → Prop} {st : State} (hs : StateOk B st) (place : Place)
+    (q : Pointer) (hb : B st.topFn place.base ∨ hasDeref place.proj = true)
+    (h : evalPlace st place = Outcome.ok q) : PtrOk B st.ids q
+```
+
+**`Blaze.Mir.execStmt_okAt`** (`Blaze.Mir.Opt.BorrowExec`, `lean`): A statement whose refs are of places that may be borrowed, or through a dereference, keeps every pointer in memory naming frame 0 or a borrowed local.
+
+```lean
+theorem execStmt_okAt {B : FnId → Local → Prop} {ids : List (Nat × FnId)} (adts : List AdtDecl)
+    (st : State) (hs : OkAt B ids st) (fn : FnId) (hfn : st.topFn = fn) :
+    ∀ (s : Statement), StmtFine B fn s → Outcome.All (OkAt B ids) (execStmt adts st s)
+  | Statement.assign _ rv, hfine =>
+    Outcome.all_bind (evalRvalue_okAt adts st hs fn hfn rv hfine) (fun r hr =>
+      Outcome.all_bind (Outcome.all_true _) (fun ptr _ =>
+        (fun st' h =>
+          And.intro
+            (Covers.of_ids (State.write_ids r.2 ptr r.1 st' h) (And.left (And.right hr)))
+            (State.write_ok (And.right (And.right hr)) ptr r.1 (And.left hr) st' h))))
+  | Statement.storageLive _, _ => Outcome.all_ok hs
+  | Statement.storageDead _, _ => Outcome.all_ok hs
+  | Statement.nop, _ => Outcome.all_ok hs
+
+end Blaze.Mir
+```
+
+**`Blaze.Mir.step_borrows`** (`Blaze.Mir.Opt.BorrowStep`, `lean`): Every step keeps the borrow invariant: memory holds only pointers to frame 0 or to a local the function of its frame may borrow, and no pointer names a frame not yet made.
+
+```lean
+theorem step_borrows {B : FnId → Local → Prop} {prog : Program} (hf : ProgFine B prog)
+    {g : List (Nat × FnId)} :
+    ∀ (st : State), Borrows B g st → Outcome.All (NextBorrows B) (step prog st)
+  | { base
+```
+
+**`Blaze.Mir.State.setSlot_comm`** (`Blaze.Mir.Opt.SlotAlgebra`, `lean`): Replacements of two different slots commute.
+
+```lean
+theorem State.setSlot_comm (st : State) (p q : Pointer) (a b : Slot)
+    (hne : ¬ p.frame = q.frame ∨ ¬ p.slot = q.slot) :
+    (st.setSlot p a).setSlot q b = (st.setSlot q b).setSlot p a
+```
+
+**`Blaze.Mir.State.write_setSlot_other`** (`Blaze.Mir.Opt.SlotAlgebra`, `lean`): A write to another slot commutes with the replacement of a slot.
+
+```lean
+theorem State.write_setSlot_other (st : State) (p q : Pointer) (slot : Slot) (v : Value)
+    (hne : ¬ p.frame = q.frame ∨ ¬ p.slot = q.slot) :
+    (st.setSlot p slot).write q v =
+      Outcome.map (fun s => State.setSlot s p slot) (st.write q v)
+```
+
+**`Blaze.Mir.State.write_setSlot_same`** (`Blaze.Mir.Opt.SlotAlgebra`, `lean`): A write of a whole slot gives the same state whatever the slot was replaced by before.
+
+```lean
+theorem State.write_setSlot_same (st : State) (f l : Nat) (slot : Slot) (v : Value) :
+    (st.setSlot { frame
+```
+
+**`Blaze.Mir.execStmt_put`** (`Blaze.Mir.Opt.SlotExec`, `lean`): A statement that does not mention a local its function does not borrow does the same whatever that local's slot holds.
+
+```lean
+theorem execStmt_put {B : FnId → Local → Prop} {g : List (Nat × FnId)} {f l : Nat}
+    (adts : List AdtDecl) {st : State} (h : Hides B g f l st) (sl : Slot) (fn : FnId)
+    (hfn : st.topFn = fn) :
+    ∀ (s : Statement), StmtFine B fn s → stmtFine l s = true →
+      execStmt adts (st.put f l sl) s =
+        Outcome.map (fun x => State.put x f l sl) (execStmt adts st s)
+  | Statement.assign p rv, hB, hfine =>
+    Outcome.bind_commutes_map (evalRvalue_put adts h sl rv (and_true_right hfine)) (fun r hr =>
+      have hr2 : Hides B g f l r.2
+```
+
+**`Blaze.Mir.run_refines_inv`** (`Blaze.Mir.Opt.RemoveOverwritten`, `lean`): When every step of the target refines the step of the source on the states an invariant holds of, and the source's steps keep it, every run from such a state refines.
+
+```lean
+theorem run_refines_inv (src tgt : Program) (Inv : State → Prop)
+    (hstep : ∀ (st : State), Inv st → (step tgt st).Refines (step src st))
+    (hpres : ∀ (st st' : State), Inv st → step src st = Outcome.ok (Next.state st') → Inv st') :
+    ∀ (fuel : Nat) (st : State), Inv st → (run tgt fuel st).Refines (run src fuel st)
+```
+
+**`Blaze.Mir.Opt.checkBorrows_sound`** (`Blaze.Mir.Opt.RemoveOverwritten`, `lean`): A program checkBorrows accepts takes references only to locals its borrowed-set lists, or through a dereference.
+
+```lean
+theorem checkBorrows_sound (borrowed : Body → Local → Bool) (prog : Program)
+    (h : checkBorrows borrowed prog = true) : ProgFine (BorrowedIn borrowed prog) prog
+```
+
+**`Blaze.Mir.Opt.removeOverwritten_refines`** (`Blaze.Mir.Opt.RemoveOverwritten`, `lean`): Removing a store that its own block overwrites before its local is mentioned refines the program, from every state the borrow invariant holds of; the Rust DeadStoreElimination also removes stores dead by liveness across blocks and unwinding, which is not specified (ledger V11).
+
+```lean
+theorem removeOverwritten_refines (borrowed : Body → Local → Bool) (prog : Program)
+    (hfine : ProgFine (BorrowedIn borrowed prog) prog) (fuel : Nat) (st : State)
+    (hinv : ∃ g, Borrows (BorrowedIn borrowed prog) g st) :
+    (run (removeOverwritten borrowed prog) fuel st).Refines (run prog fuel st)
+```
+
+**`Blaze.Mir.Opt.removeOverwritten_call`** (`Blaze.Mir.Opt.RemoveOverwritten`, `lean`): Removing a store its own block overwrites refines every call whose base slots and arguments have pointers into frame 0 only.
+
+```lean
+theorem removeOverwritten_call (borrowed : Body → Local → Bool) (prog : Program)
+    (hfine : ProgFine (BorrowedIn borrowed prog) prog) (fuel : Nat) (id : FnId)
+    (base : List Slot) (args : List Value)
+    (hbase : SlotsOk (PtrOk (BorrowedIn borrowed prog) []) base)
+    (hargs : ∀ (v : Value), v ∈ args → Value.Ok (PtrOk (BorrowedIn borrowed prog) []) v) :
+    ((removeOverwritten borrowed prog).call fuel id base args).Refines
+      (prog.call fuel id base args)
+```
+
+**`Blaze.Mir.Opt.validateWith_sound`** (`Blaze.Mir.Opt.Witness`, `lean`): The witness validator is sound: when a script of proved rewrites takes one program to another, every call that ends, and not in undefined behaviour, gives the same outcome with the same fuel.
+
+```lean
+theorem validateWith_sound (a b : Program) (w : List Rewrite) (h : validateWith a b w = true)
+    (n : Nat) (id : FnId) (base : List Slot) (args : List Value) (r : Outcome Value)
+    (hr : a.call n id base args = r) (hd : r ≠ Outcome.diverge)
+    (hu : ∀ (why : Undefined), r ≠ Outcome.undefined why) : b.call n id base args = r
+```
+
+**`Blaze.Mir.Opt.simplifyCfg_call`** (`Blaze.Mir.Opt.SimplifyCfg`, `lean`): SimplifyCfg composed from the proved passes keeps every call that ends, and not in undefined behaviour: the same outcome with the same fuel.
+
+```lean
+theorem simplifyCfg_call (k : Nat) (prog : Program) (n : Nat) (id : FnId) (base : List Slot)
+    (args : List Value) (r : Outcome Value) (h : prog.call n id base args = r)
+    (hd : r ≠ Outcome.diverge) (hu : ∀ (why : Undefined), r ≠ Outcome.undefined why) :
+    (simplifyCfg k prog).call n id base args = r
 ```
 
 ## V10
