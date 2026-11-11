@@ -503,6 +503,7 @@ impl State<'_, '_> {
         }
         .map_err(|e| format!("can't be given its mode: {e}"))?;
         if self.rules.sync {
+            // durable: only where the caller's rules ask (`rules.sync`): an unpacked tree whose mark will say it is whole
             out.sync_all().map_err(|e| format!("can't be synced: {e}"))?;
         }
         Ok((Blake3(hasher.finalize()), len))
@@ -784,6 +785,7 @@ pub fn seal_dir(dir: &Path) -> io::Result<()> {
 pub fn sync_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
+        // durable: `sync_dir` is asked by a caller that commits an unpacked tree by its name
         File::open(dir)?.sync_all()
     }
     #[cfg(not(unix))]

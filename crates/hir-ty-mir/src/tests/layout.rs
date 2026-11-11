@@ -767,3 +767,27 @@ fn core_mem_discriminant() {
         struct Goal(core::mem::Discriminant<S>);
     }
 }
+
+/// blaze's records (`#![blaze::records]`): a record is laid out as the tuple of its fields in
+/// canonical order, so two records with the same fields have one layout whatever order they
+/// are written in, and it is the layout of the struct with those fields.
+#[test]
+fn a_record_has_one_layout_whatever_the_order_of_its_fields() {
+    #[allow(dead_code)]
+    struct Same {
+        a: u8,
+        b: u32,
+        c: u16,
+    }
+    let (size, align) = (size_of::<Same>() as u64, align_of::<Same>() as u64);
+    let minicore = "//- minicore: sized, record\n";
+    for goal in [
+        "#![blaze::records]\nstruct Goal({ a: u8, b: u32, c: u16 });",
+        "#![blaze::records]\nstruct Goal({ c: u16, b: u32, a: u8 });",
+        "#![blaze::records]\nstruct Goal { inner: { b: u32, a: u8, c: u16 } }",
+        "#![blaze::records]\ntype Goal = { b: u32, c: u16, a: u8 };",
+    ] {
+        check_size_and_align(goal, minicore, size, align);
+    }
+    check_size_and_align("#![blaze::records]\ntype Goal = {};", minicore, 0, 1);
+}

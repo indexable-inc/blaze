@@ -211,7 +211,7 @@ impl<S: Stable> Placer<S> {
         job.written = job.len;
         job.step = Step::Whole;
         // clone: an effect owns its file's name; one an effect
-        effects.push(Effect::Write {
+        effects.push(Effect::Write { // durable: the image written whole is what a restart restores from: the old image or the new, never a part
             file: self.file.clone(),
             bytes: std::mem::take(&mut job.bytes),
             tag: self.tag,
@@ -246,7 +246,7 @@ impl<S: Stable> Placer<S> {
             None => {
                 job.step = Step::Syncing;
                 // clone: an effect owns its file's name; one an effect
-                effects.push(Effect::Sync { file: self.temp.clone(), tag: self.tag });
+                effects.push(Effect::Sync { file: self.temp.clone(), tag: self.tag }); // durable: the image's bytes are on disk before the rename names them (the DST's `Plant::NoSync` is this sync left out)
             }
         }
     }
@@ -258,7 +258,7 @@ impl<S: Stable> Placer<S> {
         }
         job.step = Step::Renaming;
         // clone: an effect owns its files' names; one an effect
-        effects.push(Effect::Rename { from: self.temp.clone(), to: self.file.clone(), tag: self.tag });
+        effects.push(Effect::Rename { from: self.temp.clone(), to: self.file.clone(), tag: self.tag }); // durable: the rename is the image's commit: a restart restores from the name it left
     }
 
     /// Takes the completion of its effect in flight (one of `tag`); says how the placing ended

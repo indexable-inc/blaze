@@ -2076,6 +2076,15 @@ impl<'t> UnsafeBinderCastExpr<'t> {
     pub fn wrap_binder_token(self) -> Option<Token<'t>> { support::token(self.syntax, T![wrap_binder]) }
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RecordType<'t> {
+    pub(crate) syntax: Node<'t>,
+}
+impl<'t> RecordType<'t> {
+    /// The fields, as written (`#![blaze::records]`).
+    #[inline]
+    pub fn record_field_list(self) -> Option<RecordFieldList<'t>> { support::child(self.syntax) }
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct UnsafeBinderType<'t> {
     pub(crate) syntax: Node<'t>,
 }
@@ -2459,6 +2468,7 @@ pub enum Type<'t> {
     RefType(RefType<'t>),
     SliceType(SliceType<'t>),
     TupleType(TupleType<'t>),
+    RecordType(RecordType<'t>),
     UnsafeBinderType(UnsafeBinderType<'t>),
 }
 
@@ -6066,6 +6076,28 @@ impl fmt::Debug for UnsafeBinderCastExpr<'_> {
         f.debug_struct("UnsafeBinderCastExpr").field("syntax", &self.syntax).finish()
     }
 }
+impl<'t> AstNode<'t> for RecordType<'t> {
+    #[inline]
+    fn kind() -> SyntaxKind
+    where
+        Self: Sized,
+    {
+        RECORD_TYPE
+    }
+    #[inline]
+    fn can_cast(kind: SyntaxKind) -> bool { kind == RECORD_TYPE }
+    #[inline]
+    fn cast(syntax: Node<'t>) -> Option<Self> {
+        if Self::can_cast(syntax.kind()) { Some(Self { syntax }) } else { None }
+    }
+    #[inline]
+    fn syntax(&self) -> Node<'t> { self.syntax }
+}
+impl fmt::Debug for RecordType<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RecordType").field("syntax", &self.syntax).finish()
+    }
+}
 impl<'t> AstNode<'t> for UnsafeBinderType<'t> {
     #[inline]
     fn kind() -> SyntaxKind
@@ -7392,13 +7424,17 @@ impl<'t> From<TupleType<'t>> for Type<'t> {
     #[inline]
     fn from(node: TupleType<'t>) -> Type<'t> { Type::TupleType(node) }
 }
+impl<'t> From<RecordType<'t>> for Type<'t> {
+    #[inline]
+    fn from(node: RecordType<'t>) -> Type<'t> { Type::RecordType(node) }
+}
 impl<'t> From<UnsafeBinderType<'t>> for Type<'t> {
     #[inline]
     fn from(node: UnsafeBinderType<'t>) -> Type<'t> { Type::UnsafeBinderType(node) }
 }
 impl<'t> AstNode<'t> for Type<'t> {
     #[inline]
-    fn can_cast(kind: SyntaxKind) -> bool { matches!(kind, ARRAY_TYPE | DYN_TRAIT_TYPE | FN_PTR_TYPE | FOR_TYPE | IMPL_TRAIT_TYPE | INFER_TYPE | MACRO_TYPE | NEVER_TYPE | PAREN_TYPE | PATH_TYPE | PATTERN_TYPE | PTR_TYPE | REF_TYPE | SLICE_TYPE | TUPLE_TYPE | UNSAFE_BINDER_TYPE) }
+    fn can_cast(kind: SyntaxKind) -> bool { matches!(kind, ARRAY_TYPE | DYN_TRAIT_TYPE | FN_PTR_TYPE | FOR_TYPE | IMPL_TRAIT_TYPE | INFER_TYPE | MACRO_TYPE | NEVER_TYPE | PAREN_TYPE | PATH_TYPE | PATTERN_TYPE | PTR_TYPE | REF_TYPE | SLICE_TYPE | TUPLE_TYPE | RECORD_TYPE | UNSAFE_BINDER_TYPE) }
     #[inline]
     fn cast(syntax: Node<'t>) -> Option<Self> {
         let res = match syntax.kind() {
@@ -7417,6 +7453,7 @@ impl<'t> AstNode<'t> for Type<'t> {
             REF_TYPE => Type::RefType(RefType { syntax }),
             SLICE_TYPE => Type::SliceType(SliceType { syntax }),
             TUPLE_TYPE => Type::TupleType(TupleType { syntax }),
+            RECORD_TYPE => Type::RecordType(RecordType { syntax }),
             UNSAFE_BINDER_TYPE => Type::UnsafeBinderType(UnsafeBinderType { syntax }),
             _ => return None,
         };
@@ -7440,6 +7477,7 @@ impl<'t> AstNode<'t> for Type<'t> {
             Type::RefType(it) => it.syntax,
             Type::SliceType(it) => it.syntax,
             Type::TupleType(it) => it.syntax,
+            Type::RecordType(it) => it.syntax,
             Type::UnsafeBinderType(it) => it.syntax,
         }
     }
@@ -9132,6 +9170,11 @@ impl fmt::Display for UnsafeBinderCastExpr<'_> {
         fmt::Display::fmt(&self.syntax(), f)
     }
 }
+impl fmt::Display for RecordType<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.syntax(), f)
+    }
+}
 impl fmt::Display for UnsafeBinderType<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&self.syntax(), f)
@@ -9826,6 +9869,9 @@ impl view::Typed for crate::ast::Union {
 }
 impl view::Typed for crate::ast::UnsafeBinderCastExpr {
     type Of<'t> = UnsafeBinderCastExpr<'t>;
+}
+impl view::Typed for crate::ast::RecordType {
+    type Of<'t> = RecordType<'t>;
 }
 impl view::Typed for crate::ast::UnsafeBinderType {
     type Of<'t> = UnsafeBinderType<'t>;

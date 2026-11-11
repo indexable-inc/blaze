@@ -35,6 +35,7 @@ pub mod bits;
 #[allow(unsafe_code)]
 pub mod crc32c;
 pub mod fuse;
+pub mod keyed;
 mod many;
 pub mod names;
 pub use blaze_radix as radix;

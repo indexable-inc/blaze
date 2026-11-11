@@ -15,6 +15,11 @@
 //!   last (`blaze explain link_code`). A full link sums every live piece of its code; an
 //!   incremental stage only those it placed.
 //!
+//! - `link write`: what the stage writes of the file, summed by what the bytes are
+//!   ([`record_writes`]): one a region written (its `class`), one a table of the writer's
+//!   outside the regions (`part`, with its file offset) and one a debug section, each with
+//!   `bytes` and `ranges`. What says which of a patch's writes grow with the program.
+//!
 //! Every refusal about size or reach shows the same regions inline ([`render`]): an
 //! [`crate::OutOfReach`] with its two ends marked, and a [`Refusal::NoRoom`] or
 //! [`Refusal::FieldRange`] ([`explained`]), so one failed link says what fills the image.
@@ -34,7 +39,7 @@ use blaze_hash::HashMap;
 
 use crate::model::{Class, Writer};
 use crate::stage::Stage;
-use crate::state::{PieceRef, What};
+use crate::state::{PieceRef, State, What};
 use crate::{LinkError, Refusal};
 
 /// The crates a stage's `link code` events name one by one, the largest first: the rest are
@@ -215,6 +220,62 @@ fn ranked<K>(
         b.1.bytes.cmp(&a.1.bytes).then_with(|| a.0.cmp(&b.0)).then(a.1.pieces.cmp(&b.1.pieces))
     });
     rows
+}
+
+/// The `link write` events of a stage that made `state` and writes `writes` (file offset and
+/// bytes, by offset) of its file: the bytes and ranges written, summed by the region, the
+/// writer's part or the debug section they are in, in file order; what is in none of them is
+/// `other`. One pass over the writes and a search of the file's ranges for each: no byte is
+/// read.
+pub(crate) fn record_writes(image: &str, state: &State, full: bool, writes: &[(u64, Vec<u8>)]) {
+    if !tracing::event_enabled!(target: "blaze", tracing::Level::INFO) {
+        return;
+    }
+    // Each range of the file and what it is, by offset.
+    // alloc: once a stage, a row a region, part and debug section
+    let mut ranges: Vec<(u64, u64, Cow<'static, str>)> = Vec::with_capacity(state.spaces.len() + 8);
+    for space in state.spaces.iter() {
+        if let Some(offset) = space.offset {
+            // alloc: once a region a stage, its class's name
+            ranges.push((offset, space.region.size, Cow::Owned(format!("{:?}", space.region.class))));
+        }
+    }
+    for (at, bytes) in state.parts.iter() {
+        // alloc: once a part a stage
+        ranges.push((*at, bytes.len() as u64, Cow::Owned(format!("part at {at:#x}"))));
+    }
+    for &(at, nth) in state.debug.iter() {
+        if let Some((name, bytes)) = state.lists.debug.get(nth) {
+            ranges.push((at, bytes.len() as u64, Cow::Borrowed(*name)));
+        }
+    }
+    ranges.sort_unstable_by_key(|it| it.0);
+    // alloc: once a stage, a sum a range written
+    let mut sums: Vec<(u64, u64)> = vec![(0, 0); ranges.len() + 1];
+    for (at, bytes) in writes {
+        let (mut at, end) = (*at, *at + bytes.len() as u64);
+        let mut counted = usize::MAX;
+        while at < end {
+            // The last range starting at or before `at`, when `at` is inside it.
+            let before = ranges.partition_point(|it| it.0 <= at);
+            let inside = before.checked_sub(1).filter(|it| at < ranges[*it].0 + ranges[*it].1);
+            let (slot, to) = match inside {
+                Some(it) => (it, (ranges[it].0 + ranges[it].1).min(end)),
+                None => (ranges.len(), ranges.get(before).map_or(end, |it| it.0.min(end))),
+            };
+            sums[slot].0 += to - at;
+            if counted != slot {
+                sums[slot].1 += 1;
+                counted = slot;
+            }
+            at = to;
+        }
+    }
+    let generation = state.generation;
+    for (slot, (bytes, count)) in sums.iter().enumerate().filter(|it| it.1.0 != 0) {
+        let what = ranges.get(slot).map_or("other", |it| &*it.2);
+        tracing::info!(target: "blaze", image, generation, full, what, bytes, ranges = count, "link write");
+    }
 }
 
 impl Stage<'_> {

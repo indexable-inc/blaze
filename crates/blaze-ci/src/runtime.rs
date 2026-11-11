@@ -486,6 +486,7 @@ pub(crate) fn save(path: &Path, state: &State) -> Result<(), String> {
     let mut file =
         fs::File::create(&temp).map_err(|error| failed("creating the temporary file", &error))?;
     file.write_all(&bytes)
+        // durable: the CI service's state is its record of jobs taken and reported: a restart resumes from it
         .and_then(|()| file.sync_all())
         .map_err(|error| failed("writing the temporary file", &error))?;
     drop(file);
@@ -493,6 +494,7 @@ pub(crate) fn save(path: &Path, state: &State) -> Result<(), String> {
         .map_err(|error| failed("renaming the temporary file over it", &error))?;
     if let Some(dir) = path.parent().filter(|it| !it.as_os_str().is_empty()) {
         fs::File::open(dir)
+            // durable: the CI service's state: the rename that replaces it survives a crash
             .and_then(|dir| dir.sync_all())
             .map_err(|error| failed("syncing its directory so the rename lasts", &error))?;
     }

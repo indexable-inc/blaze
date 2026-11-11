@@ -32,6 +32,7 @@ use hir_expand::{
 use super::{
     BodyFacts, INSTALLED, Lookup, Step,
     infer::{Keyed, items_of},
+    with_crate_attrs,
 };
 use crate::{
     InferBodyId,
@@ -197,7 +198,7 @@ fn place<'db>(db: &'db Db, owner: MirOwner<'db>) -> Option<(DefWithBodyId, Schem
     let (tag, closure): (u64, InternedClosure<'db>) = match owner {
         MirOwner::Body(body) => {
             let (def, anon) = in_body(db, body)?;
-            return Some((def, schema_at(0, anon, NONE, NONE)));
+            return Some((def, with_crate_attrs(db, def, schema_at(0, anon, NONE, NONE))));
         }
         MirOwner::Closure(it) => (1, it.loc(db)),
         MirOwner::Coroutine(it) => (2, it.loc(db)),
@@ -205,7 +206,8 @@ fn place<'db>(db: &'db Db, owner: MirOwner<'db>) -> Option<(DefWithBodyId, Schem
     };
     let InternedClosure { owner, expr, kind } = closure;
     let (def, anon) = in_body(db, owner)?;
-    Some((def, schema_at(tag, anon, u64::from(expr.into_raw().into_u32()), kind_code(kind))))
+    let schema = schema_at(tag, anon, u64::from(expr.into_raw().into_u32()), kind_code(kind));
+    Some((def, with_crate_attrs(db, def, schema)))
 }
 
 /// The body `owner` is of, and where in it when `owner` is an anonymous constant of it: its

@@ -1199,6 +1199,10 @@ fn a_body_with_inlined_code_is_refused_on_write() {
             "a body with devirtualized calls, which only optimized MIR has",
         ),
         (
+            Box::new(|body: &mut MirBody<'_>| body.inlined.rely([7; 32])),
+            "a body that relied on facts, which only optimized MIR has",
+        ),
+        (
             Box::new(|body: &mut MirBody<'_>| {
                 body.basic_blocks[idx(0)].statements[0].span = MirSpan::Inlined(0)
             }),
@@ -1399,6 +1403,7 @@ fn owned_blocks(body: &MirBody<'_>) -> u64 {
         devirtualized,
         specialized,
         moved_to_frame: _,
+        relied,
     } = &body.inlined;
     blocks += vec(&body.param_locals)
         + vec(&body.promoted_locals)
@@ -1417,7 +1422,8 @@ fn owned_blocks(body: &MirBody<'_>) -> u64 {
         + vec(bindings)
         + vec(promoted)
         + vec(devirtualized)
-        + vec(specialized);
+        + vec(specialized)
+        + vec(relied);
     blocks
 }
 

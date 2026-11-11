@@ -251,6 +251,42 @@ files are, what they hold, the DuckDB queries that answer each question and the 
 When you report what you did, separate what you ran from what you inferred. The reports
 under `fed1eb428d:docs/reports/` do this and it is the reason they can be used.
 
+### Checking a change fast
+
+Code is checked as it is written, a commit at a time, on the packages it touched. The
+workspace's build and check take an hour and, with the released blaze, more memory than most
+machines have; when that is the only loop, thousands of lines are written before anything
+compiles them, and the first error (2026-11-10: a shadowed binding, then a struct named like
+its crate) arrives an hour in, with the next one an hour after.
+
+`harness/v2/changed.py` names what a change touches: the packages its files are in and the
+packages that depend on them, each after what it needs, so the first error is the earliest
+cause.
+
+    blaze check $(uv run --frozen python harness/v2/changed.py '{"base": "origin/main", "print": "args"}') --lib --tests
+
+- The session that integrates agents' work (rule fan-out-write-only) runs that in the lane's
+  VM after each commit it takes, with `"base"` the commit before, in parallel with the build:
+  the check of a few packages does not wait for the build of all of them, and an error goes
+  back to the agent that wrote the code while it still has it in mind. `"dependents": false`
+  checks the touched packages alone, for a first answer; the dependents follow.
+- A change to a file every package's check reads (the root manifest, the lock file,
+  `.clippy.toml`, the pinned toolchain) is the workspace's: the script prints `--workspace`.
+- The gate's workspace check does the same first, so a pull request's first compile error
+  comes in minutes ([harness.md](harness.md#ci)).
+
+### Scripts that run commands
+
+A harness, a lane script or an agent's loop checks the exit status of every command it runs and
+stops at the first that fails, saying which; a command whose failure is expected says so where
+it is run (`|| true` with a comment, a `check=False` whose result is read on the next line). On
+2026-11-10 a script called `blaze daemon stop`, which is no command, for hours: the command line
+said so and exited 101, the script went on, and every measurement after it ran against the
+daemon it believed stopped. In a shell script that is `set -euo pipefail` on its first line; in
+Python, `subprocess.run(..., check=True)` or the harness's own `engine.run(..., check=True)`
+and `Ran.checked`. The command line now names the command meant (`blaze daemon stop`: did you
+mean `blaze stop`), which helps a person; a script is helped only by stopping.
+
 ### Tests
 
 How blaze tests its own code is the `testing` skill
@@ -327,7 +363,12 @@ It pushes the branch, opens its pull request ("Merge <branch>: what the branch d
 on auto-merge. The pull request's own run is the merge gate, the build and the unit tests on
 Linux x86-64 and the released blaze's `blaze check --workspace` on Linux x86-64 and macOS, with
 astlog's rules after it, and the lint baselines ([harness.md](harness.md#ci)); a failure there ends `land.py`
-with the check's link. Once it passes, GitHub merges the branch with a merge commit, as
+with the check's link. The gate also holds the budget smoke's guards with the blaze the change
+built ([harness.md](harness.md#the-smokes-guards)): what a warm no-op build, a comment edit and a
+body edit of two small fixtures may cost, and that blaze runs inside its build-script sandbox. A
+merge that goes around the gate goes around them: on 2026-11-10, with 4 of the last 300 gate
+runs green and merges going around it, every build had been lowering its program anew for days.
+A red gate is fixed or its failure is listed as known with its cause, never passed by. Once it passes, GitHub merges the branch with a merge commit, as
 `git merge --no-ff` would. There is no merge queue and the branch need not be up to date with
 main: two changes that each pass but break together are caught on main by the release train.
 `land.py` waits for the merge and prints the commit, or says why the pull request did not

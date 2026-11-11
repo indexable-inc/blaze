@@ -9,7 +9,7 @@ use edition::Edition::{Edition2018, Edition2021, Edition2024};
 
 use super::{
     Level::{Allow, Deny, Warn},
-    Lint,
+    Lint, ready,
     Reason::{
         Custom, EditionAndFutureReleaseError, EditionAndFutureReleaseSemanticsChange, EditionError,
         EditionSemanticsChange, FutureReleaseError,
@@ -963,6 +963,8 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::bool_param", Allow, "detects a `bool` parameter of a workspace function where a two-variant enum would name the choice")
         .externally_loaded(),
+    l("blaze::many_bools", Allow, "detects a call passing two or more bare `bool` literals by position, where a record parameter would name them")
+        .externally_loaded(),
     l("blaze::sans_io_core", Allow, "detects a function of a `#![blaze::sans_io]` core that reaches the wall clock or IO")
         .externally_loaded(),
     l("blaze::key_ignores_field", Allow, "detects a hand-written key (`Hash`, `PartialEq`, `Ord` or a key builder) that leaves a field out unnamed")
@@ -1081,6 +1083,30 @@ pub(super) const BLAZE: &[Lint] = &[
     l("blaze::unneeded_effect", Warn, "detects a word of a private function's `#[blaze::may(..)]` for an effect the function is proved not to have")
         .externally_loaded(),
     l("blaze::negative_effect", Warn, "detects `#[blaze::nopanic]`, `#[blaze::noalloc]` or `#[blaze::nonblocking]` where effects are declared by what a function may do, `#[blaze::may(..)]`")
+    l("blaze::durable_write", Allow, "detects a write that waits for the disk (a synced effect, `sync_all`, `fsync`) with no `// durable: <why>` saying what must survive a crash")
+        .externally_loaded(),
+    l("blaze::unbounded_wait", Allow, "detects a park or a condition wait with no deadline and no `// wakes: <who>` naming what always wakes it")
+        .externally_loaded(),
+    l("blaze::combined_identity", Allow, "detects hashes combined into an identity by XOR or a wrapping sum outside `blaze_ids::keyed`")
+    // The lints of code blaze cannot analyse (group `blaze::edition`): each warns by default once
+    // what its help names is in the tree (`ready`), and is allowed until then.
+    l("blaze::proc_macro_derive", ready::level(ready::REFLECTION_REPLACES_MACROS), "detects a derive procedural macro a workspace crate defines, opaque code that rewrites tokens at build time, which a generic impl over the type's fields by compile-time reflection replaces")
+        .externally_loaded(),
+    l("blaze::proc_macro_attribute", ready::level(ready::REFLECTION_REPLACES_MACROS), "detects an attribute procedural macro a workspace crate defines, opaque code that rewrites tokens at build time, which reflection over the item and a generic function replace")
+        .externally_loaded(),
+    l("blaze::proc_macro_fn_like", Warn, "detects a function-like procedural macro a workspace crate defines, opaque code that rewrites tokens at build time, which a `const fn` or a `const` block replaces unless it parses a foreign syntax")
+        .externally_loaded(),
+    l("blaze::build_script_ambient", ready::level(ready::CAPABILITIES_FOR_BUILD_SCRIPTS), "detects a build script of the workspace that reaches the file system, the environment, a process, the network or the clock through the standard library by itself, where a capability it is handed says what it can touch")
+        .externally_loaded(),
+    // `allow` whatever `ready::BSTD_IN_TREE` says: a crate asks for it (`#![blaze::capabilities]`),
+    // and a workspace does in its `lints-when-ready` table.
+    l("blaze::std_use", Allow, "detects a use of an item of Rust's standard library that blaze's own standard library replaces or forbids (ambient authority, a hidden cost, a global-heap allocation, a renamed type), once per item per function, naming what is written instead")
+        .externally_loaded(),
+    l("blaze::program_lifetime", Deny, "detects a type declared `#[blaze::program_lifetime]` whose instances could not all live until the program exits: it has a parameter or a `Drop`, holds a value that does, borrows for less than `'static`, or is `pub` in a crate that did not opt in")
+        .externally_loaded(),
+    l("blaze::could_be_program_lifetime", Allow, "detects a private type with no `Drop` whose every instance is built into a `static` or leaked, and so already lives until the program exits: `#[blaze::program_lifetime]` and the program arena would hold it by 4-byte references with no count")
+        .externally_loaded(),
+    l("blaze::could_be_ref32", Allow, "detects a field or collection element of a struct stored many times that holds a `#[blaze::program_lifetime]` type as `&'static T`, `Arc<T>`, `Rc<T>` or `Box<T>`, where a `Ref32<T>` is half the size")
         .externally_loaded(),
     // Emitted by the release build, which reads it from the code LLVM made, never by `blaze check`.
     l("blaze::vecreport", Allow, "reports a bounds check, overflow check or panic path the optimizer kept inside a loop, and a loop it left unvectorized with its reason, read from the optimized code; only hot loops when the build has a profile"),

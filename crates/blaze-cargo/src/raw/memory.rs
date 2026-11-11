@@ -453,6 +453,7 @@ impl Purger {
             }
             // The purger's idle: it waits for an ask alone, so no deadline.
             let what = "a memory purge the loop or the high-water mark asks";
+            // wakes: the loop and the high-water mark unpark `parker` as they ask for a purge; the purger is idle until then
             if let Err(error) = self.parker.park(what, None, &clock) {
                 let why = format!("the memory purger could not park: {error}"); // alloc: once
                 let _ = self.stopped.set(why);

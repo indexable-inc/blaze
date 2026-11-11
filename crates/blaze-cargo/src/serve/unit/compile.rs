@@ -1244,10 +1244,11 @@ mod erased {
 }
 
 /// The goal as `unit`'s record key holds it. A build script's compile is the same program
-/// whatever the job's goal ([`super::checks_only`] is false for it under every goal), so a
-/// `blaze check` and a `blaze build` share its record; any other unit keys the goal.
+/// whatever the job's goal ([`super::checks_only`] is false for it under every goal), as a
+/// device unit's MSL is, so a `blaze check` and a `blaze build` share its record; any other
+/// unit keys the goal.
 pub(crate) fn keyed_goal(goal: Goal, unit: &Unit) -> u8 {
-    if unit.mode == Mode::Build && unit.target.is_custom_build() {
+    if unit.mode == Mode::Build && (unit.target.is_custom_build() || unit.for_device()) {
         return 1;
     }
     match goal {
@@ -1451,6 +1452,22 @@ pub(crate) fn fresh(job: &Job, unit: usize) -> bool {
         found_in(&job.input.store, false, base)
             || (shared(job, unit) && found_in(&job.input.std, true, base))
     })
+}
+
+/// Whether `unit`'s record is in the store under its narrow key ([`narrow_key`]), the first
+/// of the keys a lookup asks ([`record_keys`]): then the unit is replayed from what its
+/// crate's code texts say alone, and an edit that leaves every code text finds it again. Not
+/// for a unit with no narrow key (its lints read comments, its crate keeps its whole text),
+/// nor one whose record is under what its diagnostics quote or its whole key, which hold its
+/// files' bytes. What the job's front end asks of each unit before it vouches for a source
+/// (`UnitWriter::still`); read in place, as [`fresh`] reads.
+pub(crate) fn found_narrow(job: &Job, unit: usize) -> bool {
+    let Ok(Some(narrow)) = narrow_key(job, unit) else { return false };
+    let guard = blaze_cas::enter();
+    let found_in = |store: &blaze_cas::Reader, std: bool| {
+        matches!(filed_in(job, store, std, &guard, narrow), Ok(Some(_)))
+    };
+    found_in(&job.input.store, false) || (shared(job, unit) && found_in(&job.input.std, true))
 }
 
 /// The narrowed identities of library crates the writer worked out and no unit gave the loop
@@ -1837,6 +1854,8 @@ struct Making {
     natives: Vec<(String, ContentId)>,
     links: Vec<(String, Linking)>,
     macros: Option<ProcMacroLoadResult>,
+    /// A device unit's MSL, as its link wrote it ([`Compiled::gpu_msl`]).
+    gpu_msl: Option<Vec<u8>>,
     /// The records of images keyed by all they are made from before they are built (a
     /// doctest's examples), each filed once its output is keyed ([`doctest`]).
     records: Vec<ImageRecord>,
@@ -1871,17 +1890,23 @@ impl Written {
     /// the end of no long chain of patches), the patch ([`Written::Derived`]), and `whole` is
     /// not called; else the whole file `whole` gives ([`Written::Linked`]): an image's first
     /// link or one from scratch (a full patch), a base the store never had or let go of.
-    /// Having no base is not an error, and why is logged.
+    /// Having no base is not an error, and why is logged; `whole`'s error is the answer's.
+    ///
+    /// A base whose whole file the store wrote and has not seen written back is no base
+    /// either (`blaze_cas::NoBase::Unflushed`, the dirty-base rule): a derive is a clone of
+    /// that file, which would wait for all of it to be written out, so the image is handed
+    /// over whole and written where it goes. That is at most one whole file per write-back
+    /// in flight; the edit after it derives again.
     ///
     /// Give no patch for a file the daemon reads back by its bytes (a proc macro's wasm
     /// module, [`Module::bytes`]): what the store keeps of a patch is the recipe, and only a
     /// place gives the file.
-    pub(crate) fn linked(
+    pub(crate) fn linked<E>(
         store: &blaze_cas::Reader,
         root: [u8; 32],
         patch: Option<blaze_link::Patch>,
-        whole: impl FnOnce() -> Vec<u8>,
-    ) -> Written {
+        whole: impl FnOnce() -> Result<Vec<u8>, E>,
+    ) -> Result<Written, E> {
         let derived = patch.filter(|it| !it.full && it.digest == root).and_then(|patch| {
             let base = patch.base?;
             let key = linked_key(&base);
@@ -1901,8 +1926,8 @@ impl Written {
             }
         });
         match derived {
-            Some(derived) => derived,
-            None => Written::Linked(whole(), root),
+            Some(derived) => Ok(derived),
+            None => Ok(Written::Linked(whole()?, root)),
         }
     }
 }
@@ -2024,6 +2049,7 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Re
                 .collect(),
             artifact: record.artifact.map(|it| Artifact { fresh: true, ..it }),
             macros: None,
+            gpu_msl: None,
             links: Vec::new(),
             // alloc: none
             misses: Vec::new(),
@@ -2061,7 +2087,13 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Re
     let library_reached = reached && makes.as_ref().is_ok_and(|it| *it == Makes::Library);
     let proc_macro = makes.is_ok_and(|it| it == Makes::Shared { proc_macro: true })
         && !codegen::wasm_macro(job, unit);
-    let builds_code = !inert && !checks_only(job.input.goal, u) && !library_reached && !proc_macro;
+    // A device unit has no native code: its library is a crate record, and its MSL is written
+    // from the front end at its link ([`assemble`]).
+    let builds_code = !inert
+        && !checks_only(job.input.goal, u)
+        && !library_reached
+        && !proc_macro
+        && !u.for_device();
     let served = {
         let _span = tracing::info_span!("unit check served").entered();
         blaze_diagnostics::cache::read(db, reader.checks(), krate, job.mounted.root())
@@ -2359,6 +2391,7 @@ fn link(
 ) -> Result<(), Failed> {
     if let Some(mut kept) = phases.kept.take() {
         kept.macros = macros(job, reader, unit, kept.ok, Module::Kept(&kept));
+        kept.gpu_msl = gpu_msl(job, unit, kept.ok, Module::Kept(&kept))?;
         held(job, unit, &mut kept)?;
         phases.linked = Some(Linked::Kept(kept));
         return Ok(());
@@ -2368,6 +2401,7 @@ fn link(
     }
     let mut making = assemble(job, reader, unit, phases, images)?;
     making.macros = macros(job, reader, unit, making.ok, Module::Linked(&making.files));
+    making.gpu_msl = gpu_msl(job, unit, making.ok, Module::Linked(&making.files))?;
     if !making.nothing
         && let Some(Ok((_, Ok(Ok(parts))))) = &mut phases.generated
     {
@@ -2537,6 +2571,7 @@ fn store(
         natives,
         links,
         macros,
+        gpu_msl,
         records,
         quoted,
     } = *making;
@@ -2727,6 +2762,7 @@ fn store(
         outputs,
         artifact,
         macros,
+        gpu_msl,
         links,
         misses,
     };
@@ -2943,6 +2979,47 @@ impl fmt::Display for ModuleError {
             ),
         }
     }
+}
+
+/// Device unit `unit`'s MSL (`UnitPlan::gpu_msl`), for its dependents' front ends
+/// ([`crate::serve::work::Writer::gpu_msl`]): the output at that exact path, as its link wrote
+/// it or its kept record names it. None for a unit that writes none or did not build. An output
+/// its link did not write, or a record that names none or whose bytes the store lacks, is an
+/// error naming the unit and the path, never MSL found another way.
+fn gpu_msl(job: &Job, unit: usize, ok: bool, module: Module<'_>) -> Result<Option<Vec<u8>>, Failed> {
+    let Some(path) = job.plan(unit)?.gpu_msl.as_deref() else { return Ok(None) };
+    if !ok {
+        return Ok(None);
+    }
+    let name = job.unit(unit).map_or("", |it| it.target.name.as_str());
+    // alloc: error path
+    let error = |why: String| Failed::from(ApiError::new(format!("the MSL of the device crate `{name}` at {path}: {why}"), None));
+    let bytes = match module {
+        Module::Linked(files) => match files.iter().find(|(at, _, _)| at == path) {
+            // alloc: once per device unit linked, the MSL for its dependents
+            Some((_, Written::Bytes(bytes), _)) => bytes.clone(),
+            Some((_, Written::Kept(_), _)) | None => return Err(error("its link wrote no MSL there".to_owned())),
+        },
+        Module::Kept(kept) => {
+            let Some(output) = kept.outputs.iter().find(|it| it.path == path) else {
+                return Err(error("its kept record names no output there".to_owned()));
+            };
+            match kept.puts.iter().find(|it| it.key == output.key) {
+                // alloc: as above
+                Some(put) => put.bytes.clone(),
+                None => {
+                    let guard = blaze_cas::enter();
+                    match job.input.store.get(&guard, &output.key) {
+                        // alloc: as above
+                        Ok(Some(it)) => it.bytes.to_vec(),
+                        Ok(None) => return Err(error(format!("the store does not hold its kept output {:x}", output.key.0))),
+                        Err(corrupt) => return Err(error(format!("reading its kept output {:x}: {corrupt}", output.key.0))),
+                    }
+                }
+            }
+        }
+    };
+    Ok(Some(bytes))
 }
 
 /// The expanders of proc-macro unit `unit`, for the crates that use it
@@ -3197,6 +3274,7 @@ fn assemble(
         natives: Vec::new(),
         links: Vec::new(),
         macros: None,
+        gpu_msl: None,
         records: Vec::new(),
         // clone: the files its diagnostics point into, once per unit that fails or builds nothing
         quoted: Some(quoted.clone()),
@@ -3237,12 +3315,32 @@ fn assemble(
             return Err(ApiError::new(format!("unit {unit} ({}) is linked twice in one job: its generated code went with its first link", span_unit(u)), None).into());
         }
         None => {
-            for path in artifact::made(plan) {
+            let msl = plan.gpu_msl.as_deref();
+            for path in artifact::made(plan).into_iter().filter(|it| Some(*it) != msl) {
                 files.push((
                     path.to_owned(),
                     Written::Bytes(crate_record(u, identity, &[])),
                     false,
                 ));
+            }
+            // A device unit of an `artifact = "gpu"` dependency: its `GPU_ENTRIES` lowered,
+            // validated by naga and written as MSL, from the front end as it stands. A refusal
+            // fails the unit naming each construct, never another way to make it.
+            if let Some(path) = msl {
+                let krate = crate_of(job, unit, u)?;
+                let built = {
+                    let _span = tracing::info_span!("unit device build").entered();
+                    blaze_shader::device::device_msl(reader.db(), krate)
+                };
+                match built {
+                    Ok(built) => files.push((path.to_owned(), Written::Bytes(built.msl.into_bytes()), false)),
+                    Err(error) => {
+                        // alloc: error path
+                        let what = format!("{} writes no MSL at {path}: {error}", span_unit(u));
+                        diagnostics.push(say::refused(what, Some(unit_of), color));
+                        return Ok(nothing(diagnostics, false, made));
+                    }
+                }
             }
         }
         Some(Err(what)) => {
@@ -3398,14 +3496,10 @@ fn assemble(
                         }
                         // alloc: once per image linked, a unit links one or two
                         links.push((path.to_owned(), linked.how));
-                        // The link hands over the whole file and no patch yet
-                        // (`codegen::LinkMade`): with the patch it took the link as, and the
-                        // bytes made only when asked, an edit's image is derived in the store.
-                        files.push((
-                            path.to_owned(),
-                            Written::linked(&job.input.store, linked.root, None, || linked.bytes),
-                            true,
-                        ));
+                        // What the link settled the store is given: the patch the image took
+                        // the link as, where the store derives the file from the one before
+                        // it, else the whole file (`codegen::LinkMade::written`).
+                        files.push((path.to_owned(), linked.written, true));
                     }
                     Err(failed) => {
                         // alloc: error path
@@ -3429,6 +3523,7 @@ fn assemble(
         natives,
         links,
         macros: None,
+        gpu_msl: None,
         records: Vec::new(),
         quoted: Some(quoted),
     })

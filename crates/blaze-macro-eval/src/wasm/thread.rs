@@ -98,6 +98,7 @@ impl<T> Link<T> {
     fn ask(&self, question: Question) -> Result<Reply, Stop> {
         self.post(|board| board.question = Some(question));
         let mut board = self.board.lock();
+        // wakes: the job's reply and the link's end (`gone`) each notify `replied`
         self.replied.wait_while(&mut board, |it| it.reply.is_none() && !it.gone);
         board.reply.take().ok_or_else(|| {
             Stop("asked the database of a span after the job that ran it was gone".to_owned()) // alloc: error path

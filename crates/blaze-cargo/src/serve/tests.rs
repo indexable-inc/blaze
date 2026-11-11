@@ -328,6 +328,7 @@ pub(super) fn unit(pkg_id: &str, kind: &str, mode: Mode, deps: &[usize]) -> Unit
                 noprelude: Some(false),
                 nounused: Some(false),
                 dev: false,
+                gpu: false,
             })
             .collect(),
     }
@@ -447,6 +448,7 @@ pub(super) fn of_graph(root: &str, manifest: String, graph: UnitGraph) -> Units 
         harness: true,
         clippy: None,
         macro_wasm: false,
+        gpu_msl: None,
     };
     let package =
         |id: &str, name: &str, version: &str, source: Option<String>, is_member| PackagePlan {
@@ -718,6 +720,10 @@ impl Writer<Fake> for FakeWriter {
             format!("the fakes build no proc macro, and unit {unit} is not one"),
             None,
         ))
+    }
+
+    fn gpu_msl(&mut self, unit: usize, _: Vec<u8>) -> Result<(), ApiError> {
+        Err(ApiError::new(format!("the fakes build no device unit, and unit {unit} is not one"), None))
     }
 
     fn waiting(&self) -> bool {
@@ -1164,6 +1170,7 @@ impl Front<Fake> for FakeFront {
             outputs,
             artifact: None,
             macros: None,
+            gpu_msl: None,
             links: Vec::new(),
             misses: Vec::new(),
         }))

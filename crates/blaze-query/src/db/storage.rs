@@ -235,6 +235,9 @@ pub struct Storage {
     /// `opened` as the last write of kind `HIGH` left it: never renumbered, so a holder that
     /// kept it across views compares it ([`Storage::durable_view`]).
     high_opened: u64,
+    /// `opened` when the views were last renumbered (0: never): the stamps of the views
+    /// since are in step with `opened`, those before are not ([`Storage::stamp_of`]).
+    renumbered: u64,
     /// `written[i]`: the OR of the [`input_bits`] of every field written in the last `i + 1`
     /// views.
     written: [Summary; HISTORY],
@@ -326,6 +329,7 @@ impl Storage {
             opened: u64::from(view),
             last_changed: [view; Durability::KINDS],
             high_opened: u64::from(view),
+            renumbered: 0,
             written: [[0; 2]; HISTORY],
             dirs,
             tables,
@@ -372,6 +376,18 @@ impl Storage {
     #[inline]
     pub fn durable_view(&self) -> View {
         View(self.high_opened)
+    }
+
+    /// The stamp rows and nodes hold for the view a host read as `since`
+    /// ([`Storage::view`]): this view's stamp less the views opened since. `None` when no
+    /// stamp says: the views were renumbered since (a stamp of before is a rank now), or
+    /// `since` is no view of this storage.
+    #[inline]
+    pub(crate) fn stamp_of(&self, since: View) -> Option<u32> {
+        if since.0 < self.renumbered || since.0 > self.opened {
+            return None;
+        }
+        u32::try_from(self.opened - since.0).ok().and_then(|back| self.view.checked_sub(back))
     }
 
     /// What a current row's `verified` equals, or a word no row has once readers are stopped.
@@ -689,6 +705,7 @@ impl Storage {
         );
         self.restamp(&mut Restamp::Rank(&stamps));
         self.written = [ALL; HISTORY];
+        self.renumbered = self.opened;
     }
 
     /// Passes every view stamp the storage holds through `restamp`, storing what it gives.

@@ -72,7 +72,8 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 25. **deterministic-output**: No output depends on hash-map order, thread timing, addresses or the wall
     clock; a test builds twice and compares bytes. Skill: `compiler-correctness`.
 26. **persisted-state-round-trips**: Anything persisted has a restore test equal byte for byte to a
-    fresh build; a restore never silently starts empty. Skill: `testing`.
+    fresh build and a test that a file of its previous layout is handled; a restore never silently
+    starts empty. Skill: `testing`.
 27. **no-wait-across-thread-locals**: Hold nothing tied to a thread (a thread-local borrow, a lock
     guard, an `Rc`) across a wait. Skill: `runtime-code`.
 28. **best-long-term-design**: Pick the best long-term design, not the least work, and spend the effort

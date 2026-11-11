@@ -309,6 +309,8 @@ impl Printer<'_> {
                 }
             }
             ast::Type::MacroType(it) => self.source(it.syntax()),
+            // blaze's record type (`#![blaze::records]`), as written.
+            ast::Type::RecordType(it) => self.source(it.syntax()),
             ast::Type::UnsafeBinderType(it) => {
                 self.word("unsafe");
                 if let Some(list) = it.generic_param_list() {

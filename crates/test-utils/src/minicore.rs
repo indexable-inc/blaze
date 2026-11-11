@@ -74,6 +74,7 @@
 //!     range:
 //!     new_range:
 //!     receiver: deref
+//!     record: clone, copy
 //!     result:
 //!     send: sized
 //!     size_of: sized
@@ -1909,6 +1910,68 @@ pub mod result {
     }
 }
 // endregion:result
+
+// region:record
+pub mod record {
+    use crate::{clone::Clone, marker::Copy};
+
+    // blaze's records (`#![blaze::records]`): `{ a: A, b: B }` is `Record<"a,b", (A, B)>`, as
+    // in library/core/src/record.rs.
+    #[lang = "record"]
+    #[repr(transparent)]
+    pub struct Record<const FIELDS: &'static str, T>(pub T);
+
+    impl<const FIELDS: &'static str, T: Clone> Clone for Record<FIELDS, T> {
+        fn clone(&self) -> Self {
+            Record(self.0.clone())
+        }
+    }
+    impl<const FIELDS: &'static str, T: Copy> Copy for Record<FIELDS, T> {}
+
+    // region:eq
+    impl<const FIELDS: &'static str, T: crate::cmp::PartialEq> crate::cmp::PartialEq
+        for Record<FIELDS, T>
+    {
+        fn eq(&self, other: &Self) -> bool {
+            crate::cmp::PartialEq::eq(&self.0, &other.0)
+        }
+    }
+    impl<A: crate::cmp::PartialEq> crate::cmp::PartialEq for (A,) {
+        fn eq(&self, other: &Self) -> bool {
+            crate::cmp::PartialEq::eq(&self.0, &other.0)
+        }
+    }
+    impl<A: crate::cmp::PartialEq, B: crate::cmp::PartialEq> crate::cmp::PartialEq for (A, B) {
+        fn eq(&self, other: &Self) -> bool {
+            crate::cmp::PartialEq::eq(&self.0, &other.0)
+                && crate::cmp::PartialEq::eq(&self.1, &other.1)
+        }
+    }
+    // endregion:eq
+
+    // region:default
+    impl<const FIELDS: &'static str, T: crate::default::Default> crate::default::Default
+        for Record<FIELDS, T>
+    {
+        fn default() -> Self {
+            Record(crate::default::Default::default())
+        }
+    }
+    impl<A: crate::default::Default> crate::default::Default for (A,) {
+        fn default() -> Self {
+            (crate::default::Default::default(),)
+        }
+    }
+    impl<A: crate::default::Default, B: crate::default::Default> crate::default::Default
+        for (A, B)
+    {
+        fn default() -> Self {
+            (crate::default::Default::default(), crate::default::Default::default())
+        }
+    }
+    // endregion:default
+}
+// endregion:record
 
 // region:pin
 pub mod pin {

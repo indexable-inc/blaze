@@ -1942,6 +1942,17 @@ impl<'a> Stage<'a> {
                 Arc::from(self.debug(&lists)?)
             }
             Debug::Lines => lists.debug,
+            // The image carries no debug info. An ELF image names its side file and the
+            // CRC-32 that file will have (of this generation's build id, so nothing of the
+            // side file is read or made here); the section is laid where the debug sections
+            // are, outside the address space.
+            Debug::Beside => match self.output.format {
+                Format::Elf => Arc::from(vec![(
+                    ".gnu_debuglink",
+                    crate::beside::debuglink(self.name, &self.new.image_id()),
+                )]), // alloc: once per stage, one section of a few bytes
+                Format::MachO | Format::Pe | Format::Wasm => Arc::default(),
+            },
         };
         // alloc: once per stage; the state shares the lists
         self.new.lists = Arc::new(lists);

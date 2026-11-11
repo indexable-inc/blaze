@@ -312,6 +312,44 @@ mod unix {
         .map(drop)
     }
 
+    /// One `getattrlistbulk` of the open directory `dir` (rule macos-private-apis;
+    /// docs/macos.md, "File operations"): the next entries of it packed into `into`, each with
+    /// the attributes `common` names, a directory's data length and a file's, as many as fit;
+    /// how many, 0 once none is left. `getattrlistbulk(2)`, in libSystem from macOS 10.10: it
+    /// wins over `readdir` and an `fstatat` per name by being one system call for a buffer of
+    /// entries where those are one per name. The libc crate's declaration is the header's
+    /// (`int getattrlistbulk(int, void *, void *, size_t, uint64_t)`). A system without it
+    /// does not start blaze (dyld names the symbol); the test below resolves it at run time.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn attrs_bulk(
+        dir: BorrowedFd<'_>,
+        common: u32,
+        into: &mut [u8],
+    ) -> io::Result<usize> {
+        let mut list = libc::attrlist {
+            bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+            reserved: 0,
+            commonattr: common,
+            volattr: 0,
+            dirattr: libc::ATTR_DIR_DATALENGTH,
+            fileattr: libc::ATTR_FILE_DATALENGTH,
+            forkattr: 0,
+        };
+        // SAFETY: `dir` is borrowed open, `list` a live `attrlist` the call reads, and `into`
+        // room for `into.len()` bytes the call writes and does not keep. No option is set:
+        // an entry holds only the attributes its returned set names.
+        let count = checked(unsafe {
+            libc::getattrlistbulk(
+                dir.as_raw_fd(),
+                (&raw mut list).cast(),
+                into.as_mut_ptr().cast(),
+                into.len(),
+                0,
+            )
+        })?;
+        Ok(count as usize)
+    }
+
     /// `F_NOCACHE` on `fd`: its reads and writes stay out of the unified buffer cache.
     #[cfg(target_os = "macos")]
     pub(crate) fn no_cache(fd: BorrowedFd<'_>) -> io::Result<()> {
@@ -447,6 +485,34 @@ mod tests {
         assert_eq!(&into[..5], b"blaze");
         drop(writer);
         assert_eq!(super::read(reader.as_fd(), &mut into).unwrap(), 0);
+    }
+
+    /// `getattrlistbulk`, which `Effect::Entries` lists a directory with on macOS, resolves
+    /// at run time (rule macos-private-apis): a system that drops it fails here, naming it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn getattrlistbulk_is_in_libsystem() {
+        // SAFETY: a lookup of a NUL-terminated name in every image loaded.
+        let found = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"getattrlistbulk".as_ptr()) };
+        assert!(
+            !found.is_null(),
+            "getattrlistbulk is gone from this macOS (it is there from 10.10): \
+             Effect::Entries needs it, and there is no other listing"
+        );
+    }
+
+    /// One call fills the buffer with the root's first entries, and says how many.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_bulk_call_packs_entries_of_the_root() {
+        use std::os::fd::AsFd as _;
+        let dir = super::open_dir(c"/").unwrap();
+        let mut into = vec![0_u8; 8 << 10];
+        let common = libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_NAME;
+        let count = super::attrs_bulk(dir.as_fd(), common, &mut into).unwrap();
+        assert!(count > 0, "the root lists nothing");
+        let first = u32::from_ne_bytes(into[..4].try_into().unwrap()) as usize;
+        assert!((24..=into.len()).contains(&first), "the first entry is {first} bytes");
     }
 
     #[cfg(unix)]

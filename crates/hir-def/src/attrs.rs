@@ -571,6 +571,11 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                             attr_flags.insert(AttrFlags::PURE_TRUSTED);
                         }
                     }
+                    // `#[blaze::differentiable(symbolic)]`; the mode is
+                    // [`AttrFlags::differentiable_attr`]'s to read and refuse.
+                    (Some(Word::blaze), Some(Word::differentiable)) => {
+                        attr_flags.insert(AttrFlags::DIFFERENTIABLE)
+                    }
                     // `#[blaze::bits(u32)]`; the backing integer is
                     // [`AttrFlags::blaze_bits`]'s to read and refuse.
                     (Some(Word::blaze), Some(Word::bits)) => {
@@ -590,6 +595,24 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                     // `#[blaze::may(panic, alloc)]`: the list is [`AttrFlags::may_attr`]'s to
                     // read and refuse.
                     (Some(Word::blaze), Some(Word::may)) => attr_flags.insert(AttrFlags::MAY),
+                    // `#[blaze::multiversion("x86-64-v3", "avx512f")]`; the levels are
+                    // [`AttrFlags::multiversion_levels`]'s to read.
+                    (Some(Word::blaze), Some(Word::multiversion)) => {
+                        attr_flags.insert(AttrFlags::BLAZE_MULTIVERSION)
+                    // `#[blaze::drop(early)]`, `#[blaze::drop(early, trusted = "why")]` and
+                    // `#[blaze::drop(scoped)]` on a type; anything else sets no flag, and
+                    // both words set both, which `hir_ty_mir::mir::early_drop` refuses.
+                    (Some(Word::blaze), Some(Word::drop)) => {
+                        if tt_has_token(tt, "early") {
+                            attr_flags.insert(AttrFlags::DROP_EARLY);
+                            if tt_has_token(tt, "trusted") {
+                                attr_flags.insert(AttrFlags::DROP_TRUSTED);
+                            }
+                        }
+                        if tt_has_token(tt, "scoped") {
+                            attr_flags.insert(AttrFlags::DROP_SCOPED);
+                        }
+                    }
                     _ => {}
                 },
             }
@@ -721,6 +744,7 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                 (Some(Word::blaze), Some(Word::sans_io)) => AttrFlags::SANS_IO,
                 (Some(Word::blaze), Some(Word::checkfree)) => AttrFlags::CHECKFREE,
                 (Some(Word::blaze), Some(Word::pure)) => AttrFlags::PURE,
+                (Some(Word::blaze), Some(Word::differentiable)) => AttrFlags::DIFFERENTIABLE,
                 (Some(Word::blaze), Some(Word::bits)) => AttrFlags::BLAZE_BITS,
                 (Some(Word::blaze), Some(Word::specialization)) => AttrFlags::BLAZE_SPECIALIZATION,
                 (Some(Word::blaze), Some(Word::specialization_trait)) => {
@@ -735,6 +759,11 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                 (Some(Word::blaze), Some(Word::consumes)) => AttrFlags::CONSUMES,
                 (Some(Word::blaze), Some(Word::reflect)) => AttrFlags::BLAZE_REFLECT,
                 (Some(Word::blaze), Some(Word::sealed)) => AttrFlags::BLAZE_SEALED,
+                (Some(Word::blaze), Some(Word::multiversion)) => AttrFlags::BLAZE_MULTIVERSION,
+                (Some(Word::blaze), Some(Word::acyclic)) => AttrFlags::BLAZE_ACYCLIC,
+                (Some(Word::blaze), Some(Word::program_lifetime)) => {
+                    AttrFlags::BLAZE_PROGRAM_LIFETIME
+                }
                 (Some(Word::clippy), Some(Word::has_significant_drop)) => {
                     AttrFlags::HAS_SIGNIFICANT_DROP
                 }
@@ -897,6 +926,7 @@ fn word(name: &str) -> Option<Word> {
 name_set! {
     /// An attribute name the flags or the value queries read.
     enum Word {
+    acyclic,
     automatically_derived,
     bench,
     bits,
@@ -911,8 +941,10 @@ name_set! {
     deprecated,
     diagnostic,
     effects,
+    differentiable,
     do_not_recommend,
     doc,
+    drop,
     export_name,
     fundamental,
     has_significant_drop,
@@ -931,6 +963,7 @@ name_set! {
     may,
     may_dangle,
     may_suspend,
+    multiversion,
     must_not_suspend,
     must_use,
     naked,
@@ -946,6 +979,7 @@ name_set! {
     pointee,
     prefer_underscore_import,
     proc_macro_derive,
+    program_lifetime,
     pure,
     reflect,
     repr,
@@ -1208,6 +1242,25 @@ bitflags::bitflags! {
         /// bounded by it counts as local in its crate's orphan check
         /// (`TraitFlags::SEALED`, `hir_ty::sealed_local_bound`, `hir-ty-coherence`).
         const BLAZE_SEALED = 1 << 100;
+        /// `#[blaze::differentiable]` or `#[blaze::differentiable(..)]`, on a function: a blaze
+        /// extension (inert under rustc with `#![register_tool(blaze)]`), read by
+        /// `blaze-diff-mir` ([`AttrFlags::differentiable_attr`], docs/future/autodiff.md): the
+        /// function has a derivative blaze can be asked for. It changes no code of a function
+        /// that is not asked for its derivative: no codegen key reads it.
+        const DIFFERENTIABLE = 1 << 103;
+        /// `#[blaze::drop(early)]` on a struct, enum or union with a `Drop` impl: a blaze
+        /// extension (inert under rustc with `#![register_tool(blaze)]`). Under
+        /// `#![blaze::early_drop]` a value of the type is dropped after its last use
+        /// (docs/v2/plan/design/early-drop.md): the impl must only free memory
+        /// (`hir_ty_pure::drop_effects`), unless [`AttrFlags::DROP_TRUSTED`] says otherwise.
+        /// Bit 101 is `NOREFCOUNT`'s on `edition-e2-handles-1109`.
+        const DROP_EARLY = 1 << 105;
+        /// `#[blaze::drop(scoped)]` on a type: a value of it, and of any type that holds one,
+        /// is dropped where its scope ends, as in Rust, whatever its destructor does.
+        const DROP_SCOPED = 1 << 106;
+        /// `#[blaze::drop(early, trusted = "why")]`: [`AttrFlags::DROP_EARLY`] asserted, the
+        /// destructor not checked (a pooled buffer whose drop gives it back to its pool).
+        const DROP_TRUSTED = 1 << 107;
         /// `#[blaze::linear]`, a word: a blaze extension (inert under rustc with
         /// `#![register_tool(blaze)]`), read by `hir-ty-linear`
         /// (docs/v2/plan/design/linear.md). On a struct or enum: a value of it may not be
@@ -1240,6 +1293,29 @@ bitflags::bitflags! {
         /// reflection reads and writes every field, private ones too (`hir_ty_comptime`'s
         /// `struct_domain`, docs/v2/plan/design/comptime.md "Which fields").
         const BLAZE_REFLECT = 1 << 124;
+        /// `#[blaze::multiversion]`, a word or with a list of levels, on a function: a blaze
+        /// extension (inert under rustc with `#![register_tool(blaze)]`), the function is
+        /// compiled once per level of target features and the best one the CPU has is picked
+        /// when the program starts (docs/v2/plan/design/simd.md). The levels are
+        /// [`AttrFlags::multiversion_levels`]'s; it changes code generation only, never what
+        /// the function means.
+        const BLAZE_MULTIVERSION = 1 << 125;
+        /// `#[blaze::acyclic]`, a word, on a struct or enum: a blaze extension (inert under
+        /// rustc with `#![register_tool(blaze)]`). The spelling that asserts the `Acyclic`
+        /// trait of the type: the trait is derived from the type's shape by compile-time
+        /// reflection with a blanket impl (rule `reflection-first`; built on `lang-int-1110`,
+        /// docs/v2/plan/design/facts.md "Acyclic"), so nothing in the compiler analyses it
+        /// and nothing reads the bit until that lane's assertion does. It changes
+        /// diagnostics, never code: no codegen key reads the bit.
+        const BLAZE_ACYCLIC = 1 << 108;
+        /// `#[blaze::program_lifetime]`, a word, on a struct or enum: a blaze extension (inert
+        /// under rustc with `#![register_tool(blaze)]`), a declared type fact
+        /// (docs/v2/plan/design/facts.md): instances live until the program exits. `hir-ty-pure`'s
+        /// `program_lifetime` checks what the type itself must be for that (no `Drop`, nothing
+        /// in it to drop, no type parameter, not public unless its crate opts in) or refuses it
+        /// naming the field path (`blaze::program_lifetime`). It changes diagnostics, never code: no codegen
+        /// key reads the bit.
+        const BLAZE_PROGRAM_LIFETIME = 1 << 126;
         /// `#[clippy::has_significant_drop]`, a word, on a struct or enum: dropping a value of
         /// it does something another part of the program can see (releases a lock, ends a
         /// borrow), read by blaze-lints' `significant_drop_tightening`. It changes diagnostics,
@@ -1730,6 +1806,46 @@ fn pure_args(tt: ast::TokenTree<'_>) -> PureAttr {
     }
 }
 
+/// What `#[blaze::differentiable]` on a function says: a blaze extension (inert under rustc
+/// with `#![register_tool(blaze)]`), read by `blaze-diff-mir` (docs/future/autodiff.md).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum DifferentiableAttr {
+    /// `#[blaze::differentiable]`: by automatic differentiation on MIR (layer 1).
+    Auto,
+    /// `#[blaze::differentiable(symbolic)]` or `(symbolic, fast_math)`: by a symbolic
+    /// derivative of the function lifted to an expression (layer 2); with `fast_math`, simplified
+    /// by the algebraic rewrites too, which are not exact in IEEE 754.
+    Symbolic { fast_math: bool },
+    /// `#[blaze::differentiable(..)]` with arguments that are neither: their text, for the
+    /// error.
+    Malformed(Symbol),
+}
+
+/// What the arguments of `#[blaze::differentiable(..)]` say: nothing, `symbolic`, or
+/// `symbolic, fast_math`.
+fn differentiable_args(tt: ast::TokenTree<'_>) -> DifferentiableAttr {
+    // Without the delimiters, whitespace and comments.
+    let tokens: SmallVec<[NodeOrToken<_, _>; 4]> = TokenTreeChildren::new(tt).take(4).collect(); // alloc: inline, the few tokens of one attribute
+    match tokens.as_slice() {
+        [] => DifferentiableAttr::Auto,
+        [NodeOrToken::Token(mode)]
+            if mode.kind() == SyntaxKind::IDENT && mode.text() == "symbolic" =>
+        {
+            DifferentiableAttr::Symbolic { fast_math: false }
+        }
+        [NodeOrToken::Token(mode), NodeOrToken::Token(sep), NodeOrToken::Token(option)]
+            if mode.kind() == SyntaxKind::IDENT
+                && mode.text() == "symbolic"
+                && sep.kind() == T![,]
+                && option.kind() == SyntaxKind::IDENT
+                && option.text() == "fast_math" =>
+        {
+            DifferentiableAttr::Symbolic { fast_math: true }
+        }
+        _ => DifferentiableAttr::Malformed(Symbol::intern(&tt.syntax().text().to_string())),
+    }
+}
+
 /// Which of the effect attributes `hir-ty-effects` checks (docs/v2/plan/design/effects.md): the
 /// word after `blaze::`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1897,6 +2013,13 @@ pub enum BitsBacking {
     Explicit(rustc_abi::Integer),
     /// `#[blaze::bits(..)]` with arguments that are none of these: their text, for the error.
     Malformed(Symbol),
+}
+
+/// Whether `path` is the two segments `blaze::multiversion`.
+fn is_blaze_multiversion(path: Option<ast::Path<'_>>) -> bool {
+    path.and_then(up_to_two_segments).is_some_and(|(first, second)| {
+        name_text(first) == "blaze" && second.is_some_and(|it| name_text(it) == "multiversion")
+    })
 }
 
 /// Whether `path` is the two segments `blaze::bits`.
@@ -2285,6 +2408,28 @@ impl AttrFlags {
                         match attr.token_tree() {
                             Some(tt) => may_args(tt),
                             None => MayAttr { words: 0, trusted: None, malformed: None },
+    /// What `#[blaze::differentiable]` on `owner` says ([`DifferentiableAttr`]); `None` without
+    /// it, one bit test.
+    #[inline]
+    pub fn differentiable_attr(db: &Db, owner: AttrDefId) -> Option<DifferentiableAttr> {
+        if !AttrFlags::query(db, owner).contains(AttrFlags::DIFFERENTIABLE) {
+            return None;
+        }
+        return differentiable_attr(db, owner);
+
+        #[blaze_query::tracked(returns(clone), mem_tag = Nameres)]
+        fn differentiable_attr(db: &Db, owner: AttrDefId) -> Option<DifferentiableAttr> {
+            collect_attrs(db, owner, |attr| {
+                let read = match attr {
+                    ast::Meta::PathMeta(attr) if is_blaze_word(attr.path(), "differentiable") => {
+                        DifferentiableAttr::Auto
+                    }
+                    ast::Meta::TokenTreeMeta(attr)
+                        if is_blaze_word(attr.path(), "differentiable") =>
+                    {
+                        match attr.token_tree() {
+                            Some(tt) => differentiable_args(tt),
+                            None => DifferentiableAttr::Auto,
                         }
                     }
                     _ => return ControlFlow::Continue(()),
@@ -2610,6 +2755,40 @@ impl AttrFlags {
             ControlFlow::Continue(())
         });
         result
+    }
+
+    /// The levels `#[blaze::multiversion(..)]` on `owner` names, in the order written (least
+    /// preferred first): each string literal of its list. `None` without the attribute, one
+    /// bit test; `Some` of no level for the bare word, which asks for the target's defaults
+    /// (`target_features::multiversion::default_levels`). A token of the list that is no
+    /// string literal is kept as its text, so the plan refuses it by name. Read once per
+    /// multiversioned function a unit compiles, so it is no query.
+    pub fn multiversion_levels(db: &Db, owner: FunctionId) -> Option<Vec<Symbol>> {
+        if !AttrFlags::query(db, owner.into()).contains(AttrFlags::BLAZE_MULTIVERSION) {
+            return None;
+        }
+        // alloc: only a function with `#[blaze::multiversion]`; the caller owns the list
+        let mut levels = Vec::new();
+        collect_attrs::<Infallible>(db, owner.into(), |attr| {
+            if let ast::Meta::TokenTreeMeta(attr) = attr
+                && is_blaze_multiversion(attr.path())
+                && let Some(tt) = attr.token_tree()
+            {
+                for token in TokenTreeChildren::new(tt) {
+                    let NodeOrToken::Token(token) = token else { continue };
+                    if token.kind() == T![,] {
+                        continue;
+                    }
+                    let level = match ast::String::cast(token).and_then(|it| it.value().ok()) {
+                        Some(level) => Symbol::intern(&level),
+                        None => Symbol::intern(token.text()),
+                    };
+                    levels.push(level);
+                }
+            }
+            ControlFlow::Continue(())
+        });
+        Some(levels)
     }
 
     /// What `#[doc(test(attr(..)))]` on `owner` (cfg_attr expanded, a crate root's inner and

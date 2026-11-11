@@ -29,6 +29,7 @@ use blaze_core::lock::Lock;
 
 use super::{
     delta::{Fresh, Last},
+    lists::Lists,
     patch::Walked,
 };
 use crate::{backend::Described, plan::Origin};
@@ -51,8 +52,13 @@ pub struct Kept<I, S> {
     /// locked map.
     walks: Lock<std::collections::HashMap<u64, Walked<I, S>>>,
     /// What each program's last build gave, by [`program`] of every input of the build: its
-    /// ID and its entries, which the next build's [`super::Delta`] is made against.
+    /// ID and its entries, which the next build's [`super::Delta`] is made against. Of a
+    /// build that is not kept by row (`lists`): a lazy one, one with a folded or release
+    /// function.
     built: SharedMap<u64, Arc<Last>>,
+    /// Each program's last `Built` by row ([`Lists`]), by the [`program`] its walk is kept
+    /// under: taken by the build that patches it, as its walk is.
+    lists: Lock<std::collections::HashMap<u64, Lists>>,
 }
 
 impl<I: Eq + Hash, S> Default for Kept<I, S> {
@@ -62,6 +68,8 @@ impl<I: Eq + Hash, S> Default for Kept<I, S> {
             // alloc: none until a walk is kept
             walks: Lock::new("codegen.driver.kept_walks", std::collections::HashMap::new()),
             built: SharedMap::default(),
+            // alloc: none until a build's lists are kept
+            lists: Lock::new("codegen.driver.kept_lists", std::collections::HashMap::new()),
         }
     }
 }
@@ -109,6 +117,24 @@ impl<I: Clone + Eq + Hash + Send + Sync, S: Send + Sync> Kept<I, S> {
         self.built.pin().insert(program, built);
     }
 
+    /// Lets go of what `program`'s last build gave: its lists are kept by row from now on.
+    pub(super) fn forget_built(&self, program: u64) {
+        self.built.pin().remove(&program);
+    }
+
+    /// Takes the lists kept of `program`'s last `Built`, if they are: the build that patches
+    /// them owns them, and keeps its own in their place when it ends well. A build that is
+    /// refused keeps none, so the build after it makes its lists whole and its delta has no
+    /// base.
+    pub(super) fn take_lists(&self, program: u64) -> Option<Lists> {
+        self.lists.lock().remove(&program)
+    }
+
+    /// Keeps `lists` as `program`'s last `Built`.
+    pub(super) fn keep_lists(&self, program: u64, lists: Lists) {
+        self.lists.lock().insert(program, lists);
+    }
+
     /// Takes the walk kept of `program`, if one is: a build that patches it owns it, and
     /// keeps the patched one in its place when it ends well.
     pub(super) fn take_walk(&self, program: u64) -> Option<Walked<I, S>> {
@@ -149,6 +175,51 @@ pub struct Walk {
     pub visited: usize,
     /// Why every describe was asked for anew, when no kept one was looked at.
     pub fresh: Option<Fresh>,
+}
+
+/// What a build's walk and the passes after it did, counted: each a bound on the work of
+/// one pass, so a test holds each to the edit and a span records each
+/// (docs/v2/plan/design/incremental-walk.md, "Cost"). All 0 for a build whose walk ran
+/// whole, which counts nothing: its work is the program's.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Work {
+    /// Functions and statics the front end was asked of again.
+    pub asked: usize,
+    /// Groups of inputs the front end was asked whether written ([`Frontend::group`]).
+    ///
+    /// [`Frontend::group`]: crate::backend::Frontend::group
+    pub groups: usize,
+    /// Describes taken anew: of kept functions and statics that changed, and of new ones.
+    pub described: usize,
+    /// Items the reachability graph looked at: entered, dropped or brought back.
+    pub graph: usize,
+    /// Claims of the recursion limit's check: 0 where no body has more instances than the
+    /// least limit admits, else every item of the walk.
+    pub claims: usize,
+    /// Nodes whose slot was decided again.
+    pub classified: usize,
+    /// Nodes and statics whose places were made again.
+    pub resolved: usize,
+    /// Nodes whose built-in closure was made again.
+    pub built_in: usize,
+    /// Nodes and statics the owners' check looked at again.
+    pub owners: usize,
+    /// Store lookups: one a function or static made again.
+    pub lookups: usize,
+    /// Functions whose version IDs were made.
+    pub versions: usize,
+    /// Functions dedupe hashed: those made again, or every one when a class changed.
+    pub deduped: usize,
+    /// Nodes of [`super::Reach`] whose edges were looked up again.
+    pub reach: usize,
+    /// Rows of the kept lists replaced, added or removed.
+    pub replaced: usize,
+    /// Bytes hashed: the code of the functions made again and the paths of the keyed sets.
+    pub hashed: u64,
+    /// Rows copied into the `Built`'s contiguous lists: every one, the one linear cost.
+    pub copied: usize,
+    /// Whether the `Built` was made by patching the lists kept of the last one.
+    pub patched: bool,
 }
 
 /// A walk's counts while its levels describe on all cores.

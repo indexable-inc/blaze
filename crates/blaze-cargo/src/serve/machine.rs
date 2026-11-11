@@ -42,7 +42,10 @@ const EVERY: Duration = Duration::from_millis(250);
 /// back, or a lease that runs low, waits for no floor ([`Machine::due`]).
 const SOON: Duration = Duration::from_millis(25);
 
-/// How long a turn waits for another daemon's hold of the lock, which lasts microseconds.
+/// How long another daemon may hold the lock, which a turn holds for microseconds, before
+/// this one stops with an error naming the file: what a join or a leave waits at most
+/// ([`lock`]), and how long a turn finds it held, try after try, with no wait
+/// ([`Machine::turn`]).
 const LOCK_WAIT: Duration = Duration::from_secs(10);
 
 /// What the machine budget leaves for the kernel and the page cache, past the quarter its 3/4
@@ -64,6 +67,9 @@ pub struct Machine {
     allowance: Option<u64>,
     /// A turn failed and stopped the daemon: no other is taken.
     broken: bool,
+    /// Since when, by the daemon's clock, each turn found the lock held by another daemon
+    /// and was not taken ([`held_since`]); none once one was taken.
+    held_since: Option<Duration>,
     /// What the start says of the machine budget.
     said: String,
     /// Who else holds the machine's memory, as the last turn read the ledger, for a build's
@@ -103,7 +109,7 @@ impl Machine {
         // upgraded while an older daemon ran, or two pinned versions on one machine, stopped
         // every build with "is of layout 1, and this blaze reads layout 2"). Daemons of two
         // layouts then share no budget; each is still held by its own ceiling.
-        let path = dir.join(format!("machine.{}", blaze_graph::ledger::FORMAT)); // alloc: the path, once a daemon start
+        let path = ledger_path(&dir);
         let file = crate::socket::private_file(
             OpenOptions::new().read(true).write(true).create(true).truncate(false),
             &path,
@@ -188,6 +194,7 @@ impl Machine {
             last: None,
             allowance: None,
             broken: false,
+            held_since: None,
             said,
             says: String::new(),
         };
@@ -225,14 +232,41 @@ impl Machine {
     /// when it differs from the last turn's, for the subsystems' budgets
     /// ([`blaze_graph::admission::set_budgets`]). An error stops the daemon; no turn is taken
     /// after one.
+    ///
+    /// The lock is tried once and never waited for: the loop thread calls this, and until
+    /// 2026-11-10 it spun here for up to [`LOCK_WAIT`] while another daemon held the lock. A
+    /// turn that finds it held is not taken (`Ok(None)`, the plane told nothing): the plane
+    /// keeps the room the ledger records for it, the turn stays due, and the loop's next turn
+    /// tries again. Held for [`LOCK_WAIT`] of such tries, it is the error it was.
     pub(crate) fn turn<W: Work, P: Predict>(
         &mut self,
         at: Duration,
         plane: &mut Plane<W, P>,
     ) -> anyhow::Result<Option<u64>> {
-        let turned = self.turn_locked(at, plane);
+        self.turn_as(at, plane, false)
+    }
+
+    /// The daemon's first turn, as it starts and before its loop turns: as [`Machine::turn`],
+    /// but it waits for the lock ([`lock`], at most [`LOCK_WAIT`]), so the plane is told an
+    /// allowance before any request: until one, it would grant up to its ceiling whatever
+    /// the other daemons hold.
+    pub(crate) fn first_turn<W: Work, P: Predict>(
+        &mut self,
+        at: Duration,
+        plane: &mut Plane<W, P>,
+    ) -> anyhow::Result<Option<u64>> {
+        self.turn_as(at, plane, true)
+    }
+
+    fn turn_as<W: Work, P: Predict>(
+        &mut self,
+        at: Duration,
+        plane: &mut Plane<W, P>,
+        waits: bool,
+    ) -> anyhow::Result<Option<u64>> {
+        let turned = self.turn_locked(at, plane, waits);
         self.broken |= turned.is_err();
-        let allowance = turned?;
+        let Some(allowance) = turned? else { return Ok(None) };
         let changed = self.allowance != Some(allowance.bytes);
         self.allowance = Some(allowance.bytes);
         Ok(changed.then_some(allowance.bytes))
@@ -242,9 +276,35 @@ impl Machine {
         &mut self,
         at: Duration,
         plane: &mut Plane<W, P>,
-    ) -> anyhow::Result<Allowance> {
+        waits: bool,
+    ) -> anyhow::Result<Option<Allowance>> {
         let mut bytes = [0; LEN];
-        let lock = lock(&self.file, &self.path)?;
+        let tried = match waits {
+            true => Some(lock(&self.file, &self.path)?),
+            false => try_lock(&self.file, &self.path)?,
+        };
+        let Some(lock) = tried else {
+            let first = self.held_since.is_none();
+            if let Err(held_for) = held_since(&mut self.held_since, at) {
+                bail!(
+                    "the machine's memory ledger {} stayed locked for {held_for:?}, where a turn \
+                     holds it for microseconds: a process of this user holds its lock and does not \
+                     let go (`lsof {}` names it)",
+                    self.path.display(),
+                    self.path.display()
+                );
+            }
+            if first {
+                tracing::info_span!(
+                    target: "blaze",
+                    "the machine's memory ledger is held by another daemon: no turn is taken",
+                    ledger = %self.path.display(),
+                )
+                .in_scope(|| {});
+            }
+            return Ok(None);
+        };
+        self.held_since = None;
         let mut ledger = read(&self.file, &self.path, &mut bytes)?;
         let seen = Seen::of(&ledger, &self.path)?;
         let turn = ledger.turn(self.me, wall_ns(), &seen, &mut Turning { plane, at })?;
@@ -255,7 +315,7 @@ impl Machine {
             tracing::info!(target: "blaze", pruned = turn.pruned, ledger = %self.path.display(), "the machine's memory ledger dropped the records of daemons gone");
         }
         self.last = Some((at, turn.charge - turn.lease));
-        Ok(turn.allowance)
+        Ok(Some(turn.allowance))
     }
 
     /// Who else holds the machine's memory as the last turn read it, for a build's paused line
@@ -342,7 +402,33 @@ impl Alive for Seen {
     }
 }
 
-/// The ledger's lock, waiting at most [`LOCK_WAIT`] for another daemon to let go of it.
+/// A turn at `at` found the lock held by another daemon: `since` is when the first of such
+/// turns in a row was, set here. `Err` with how long that is once it reaches [`LOCK_WAIT`],
+/// the bound past which the daemon stops (bounded-progress).
+fn held_since(since: &mut Option<Duration>, at: Duration) -> Result<(), Duration> {
+    let held_for = at.saturating_sub(*since.get_or_insert(at));
+    match held_for >= LOCK_WAIT {
+        true => Err(held_for),
+        false => Ok(()),
+    }
+}
+
+/// One try of the ledger's lock: none while another daemon holds it. Never waits.
+fn try_lock(file: &File, path: &Path) -> anyhow::Result<Option<Locked>> {
+    let file = file
+        .try_clone()
+        .with_context(|| format!("a handle of the machine's memory ledger {}", path.display()))?;
+    match Locked::try_lock(file) {
+        Ok(Ok(locked)) => Ok(Some(locked)),
+        Ok(Err(_)) => Ok(None),
+        Err(error) => {
+            Err(anyhow!("locking the machine's memory ledger {}: {error}", path.display()))
+        }
+    }
+}
+
+/// The ledger's lock, waiting at most [`LOCK_WAIT`] for another daemon to let go of it: for a
+/// join and a leave, at the daemon's start and end, never a turn's.
 #[allow(
     clippy::disallowed_methods,
     reason = "a bounded wait on another process's lock, which has no wake to park on"
@@ -455,6 +541,13 @@ fn says_of(says: &mut String, me: Process, ledger: &Ledger<'_>, allowance: &Allo
     }
 }
 
+/// The ledger's file in `dir`, named by its layout (`machine.2`): what [`Machine::join`] opens.
+/// The name before layouts were in it was `machine`; no layout's name is another's, so a
+/// blaze never opens, refuses or writes over a file another layout's daemons share.
+fn ledger_path(dir: &Path) -> PathBuf {
+    dir.join(format!("machine.{}", blaze_graph::ledger::FORMAT)) // alloc: the path, once a daemon start
+}
+
 fn user() -> u32 {
     // SAFETY: `geteuid` takes nothing, touches no memory of the caller's and can't fail.
     unsafe { libc::geteuid() }
@@ -462,4 +555,98 @@ fn user() -> u32 {
 
 fn gib(bytes: u64) -> f64 {
     bytes as f64 / f64::from(1u32 << 30)
+}
+
+#[cfg(test)]
+mod tests {
+    use blaze_graph::ledger::FORMAT;
+
+    use super::*;
+
+    /// A ledger of the layout before this one, as its blaze wrote it.
+    fn previous_layout() -> [u8; LEN] {
+        let mut bytes = [0; LEN];
+        Ledger::empty(Path::new("/previous")).encode(&mut bytes);
+        bytes[8..12].copy_from_slice(&(FORMAT - 1).to_le_bytes());
+        bytes
+    }
+
+    fn open(path: &Path) -> File {
+        OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path).unwrap()
+    }
+
+    /// The bug this guards (2026-11-10): layout 2 kept layout 1's file name, so a new blaze
+    /// beside an older daemon's `/tmp/blaze-<uid>/machine` refused to start. A file of the
+    /// previous layout, under either name a previous blaze gave it, is not the file this blaze
+    /// opens, and this blaze's writes leave its bytes as they were.
+    #[test]
+    fn a_file_of_the_previous_layout_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let ours = ledger_path(dir.path());
+        let theirs = [dir.path().join("machine"), dir.path().join(format!("machine.{}", FORMAT - 1))];
+        assert_eq!(ours, dir.path().join(format!("machine.{FORMAT}")), "the name carries the layout");
+        let old = previous_layout();
+        for path in &theirs {
+            assert_ne!(&ours, path);
+            std::fs::write(path, old).unwrap();
+        }
+        let file = open(&ours);
+        let mut bytes = [0; LEN];
+        let ledger = read(&file, &ours, &mut bytes).expect("a new file is an empty ledger");
+        assert_eq!(ledger.records().count(), 0);
+        let mut out = [0; LEN];
+        write(&file, &ours, &ledger, &mut out).unwrap();
+        for path in &theirs {
+            assert_eq!(std::fs::read(path).unwrap(), old, "{} was written over", path.display());
+        }
+    }
+
+    /// A turn never waits for the ledger's lock. While another daemon's handle
+    /// holds it, a try says so at once and is no error; once let go, the next try has it. And
+    /// the bound: tries that find it held for [`LOCK_WAIT`] in a row, by the daemon's clock,
+    /// are the error, and a try that had it starts the count anew. Make `held_since` never
+    /// say `Err` and a daemon beside one stuck under the lock grants nothing for ever, silently.
+    #[test]
+    fn a_turn_tries_the_lock_once_and_stops_once_it_was_held_for_the_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = ledger_path(dir.path());
+        // Two opens: two holders, as two daemons are.
+        let (ours, theirs) = (open(&path), open(&path));
+        let held = lock(&theirs, &path).unwrap();
+        assert!(try_lock(&ours, &path).unwrap().is_none(), "held by the other, and no error");
+        drop(held);
+        assert!(try_lock(&ours, &path).unwrap().is_some(), "let go");
+
+        let mut since = None;
+        let at = |ms: u64| Duration::from_millis(ms);
+        assert_eq!(held_since(&mut since, at(1_000)), Ok(()));
+        assert_eq!(held_since(&mut since, at(5_000)), Ok(()));
+        assert_eq!(since, Some(at(1_000)), "counted from the first try that found it held");
+        assert_eq!(held_since(&mut since, at(1_000) + LOCK_WAIT), Err(LOCK_WAIT));
+        // A turn taken in between clears it (`Machine::turn_locked`), and the count starts anew.
+        since = None;
+        assert_eq!(held_since(&mut since, at(60_000)), Ok(()));
+    }
+
+    /// Bytes of the previous layout under this layout's name (a copy, a restore of `/tmp`) are
+    /// refused naming the file, both layouts and what to do, never read as this layout's.
+    #[test]
+    fn a_file_of_the_previous_layout_is_refused_by_name_under_this_layouts_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let ours = ledger_path(dir.path());
+        std::fs::write(&ours, previous_layout()).unwrap();
+        let mut bytes = [0; LEN];
+        let said = match read(&open(&ours), &ours, &mut bytes) {
+            Ok(_) => panic!("layout {} read as layout {FORMAT}", FORMAT - 1),
+            Err(error) => format!("{error:#}"),
+        };
+        let path = ours.display().to_string();
+        assert!(
+            said.contains(&path)
+                && said.contains(&format!("layout {}", FORMAT - 1))
+                && said.contains(&format!("layout {FORMAT}"))
+                && said.contains(&format!("remove {path}")),
+            "{said}"
+        );
+    }
 }

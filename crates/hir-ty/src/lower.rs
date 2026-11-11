@@ -8,6 +8,7 @@
 pub(crate) mod batch;
 pub(crate) mod diagnostics;
 pub(crate) mod path;
+pub(crate) mod record;
 pub mod persist;
 
 use std::{alloc::Allocator, iter, mem};
@@ -1259,6 +1260,9 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                     self.with_shifted_in(self.store.names(lifetimes), |ctx| ctx.lower_ty(ty));
                 self.lifetime_elision = old_lifetime_elision;
                 Ty::new_unsafe_binder(interner, Binder::bind_with_vars(inner, bound_vars))
+            }
+            TypeRef::Record { names, types, defaults } => {
+                self.lower_record(type_ref_id, names, types, defaults)
             }
             TypeRef::Error => self.types.types.error,
         };

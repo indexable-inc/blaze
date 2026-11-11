@@ -49,6 +49,8 @@ const GENERIC_ARG_RECOVERY_SET: TokenSet = TokenSet::new(&[T![>], T![,]]);
 pub(crate) fn generic_arg(p: &mut Parser<'_>) -> bool {
     match p.current() {
         LIFETIME_IDENT if !p.nth_at(1, T![+]) => lifetime_arg(p),
+        // blaze, under `#![blaze::records]`: `type T = Vec<{ a: u8, b: u8 }>;`
+        T!['{'] if types::at_record_type_arg(p) => type_arg(p),
         T!['{'] | T![true] | T![false] | T![-] => const_arg(p),
         k if k.is_literal() => const_arg(p),
         // test generic_arg_bounds
@@ -69,7 +71,7 @@ pub(crate) fn generic_arg(p: &mut Parser<'_>) -> bool {
             match p.current() {
                 T![=] => {
                     p.bump_any();
-                    if types::TYPE_FIRST.contains(p.current()) {
+                    if types::TYPE_FIRST.contains(p.current()) || types::at_record_type_arg(p) {
                         // test assoc_type_eq
                         // type T = StreamingIterator<Item<'a> = &'a T>;
                         types::type_(p);

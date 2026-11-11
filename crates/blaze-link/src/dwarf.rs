@@ -35,23 +35,23 @@ pub(crate) struct Row {
 
 const _: () = assert!(size_of::<Row>() == 16);
 
-const DW_TAG_COMPILE_UNIT: u8 = 0x11;
-const DW_TAG_SUBPROGRAM: u8 = 0x2e;
-const DW_AT_NAME: u8 = 0x03;
-const DW_AT_STMT_LIST: u8 = 0x10;
-const DW_AT_LOW_PC: u8 = 0x11;
-const DW_AT_HIGH_PC: u8 = 0x12;
-const DW_AT_LANGUAGE: u8 = 0x13;
-const DW_AT_COMP_DIR: u8 = 0x1b;
-const DW_AT_PRODUCER: u8 = 0x25;
-const DW_AT_LINKAGE_NAME: u8 = 0x6e;
-const DW_FORM_ADDR: u8 = 0x01;
-const DW_FORM_DATA2: u8 = 0x05;
-const DW_FORM_STRING: u8 = 0x08;
-const DW_FORM_STRP: u8 = 0x0e;
+pub(crate) const DW_TAG_COMPILE_UNIT: u8 = 0x11;
+pub(crate) const DW_TAG_SUBPROGRAM: u8 = 0x2e;
+pub(crate) const DW_AT_NAME: u8 = 0x03;
+pub(crate) const DW_AT_STMT_LIST: u8 = 0x10;
+pub(crate) const DW_AT_LOW_PC: u8 = 0x11;
+pub(crate) const DW_AT_HIGH_PC: u8 = 0x12;
+pub(crate) const DW_AT_LANGUAGE: u8 = 0x13;
+pub(crate) const DW_AT_COMP_DIR: u8 = 0x1b;
+pub(crate) const DW_AT_PRODUCER: u8 = 0x25;
+pub(crate) const DW_AT_LINKAGE_NAME: u8 = 0x6e;
+pub(crate) const DW_FORM_ADDR: u8 = 0x01;
+pub(crate) const DW_FORM_DATA2: u8 = 0x05;
+pub(crate) const DW_FORM_STRING: u8 = 0x08;
+pub(crate) const DW_FORM_STRP: u8 = 0x0e;
 const DW_FORM_UDATA: u8 = 0x0f;
-const DW_FORM_SEC_OFFSET: u8 = 0x17;
-const DW_LANG_RUST: u16 = 0x1c;
+pub(crate) const DW_FORM_SEC_OFFSET: u8 = 0x17;
+pub(crate) const DW_LANG_RUST: u16 = 0x1c;
 
 const DW_LNS_COPY: u8 = 0x01;
 const DW_LNS_ADVANCE_PC: u8 = 0x02;
@@ -68,11 +68,11 @@ const OPCODE_BASE: u8 = 13;
 const STANDARD_LENGTHS: [u8; 12] = [0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1];
 
 /// Abbreviation codes: the unit, a named subprogram, an unnamed one.
-const UNIT: u8 = 1;
-const NAMED: u8 = 2;
-const UNNAMED: u8 = 3;
+pub(crate) const UNIT: u8 = 1;
+pub(crate) const NAMED: u8 = 2;
+pub(crate) const UNNAMED: u8 = 3;
 
-const PRODUCER: &[u8] = b"blaze\0";
+pub(crate) const PRODUCER: &[u8] = b"blaze\0";
 
 /// Functions per piece the subprograms and line sequences are encoded in, in parallel.
 const CHUNK: usize = 1024;
@@ -212,24 +212,7 @@ pub(crate) fn sections(
     parts.extend(strings.iter().map(|it| &it[..]));
     let strings = concat(&parts);
 
-    let file_bytes: usize = files.iter().map(|it| it.len() + 4).sum();
-    // alloc: once per link, the line program's header
-    let mut line = Vec::with_capacity(10 + 6 + STANDARD_LENGTHS.len() + 2 + file_bytes);
-    line.extend_from_slice(&[0; 4]);
-    line.extend_from_slice(&4u16.to_le_bytes());
-    line.extend_from_slice(&[0; 4]);
-    let header = line.len();
-    line.extend_from_slice(&[1, 1, 1, LINE_BASE as i8 as u8, LINE_RANGE as u8, OPCODE_BASE]);
-    line.extend_from_slice(&STANDARD_LENGTHS);
-    line.push(0);
-    for file in files {
-        line.extend_from_slice(file.as_bytes());
-        line.extend_from_slice(&[0, 0, 0, 0]);
-    }
-    line.push(0);
-    let header_len =
-        u32::try_from(line.len() - header).map_err(|_| "a line program header past 4 GiB")?;
-    line[6..10].copy_from_slice(&header_len.to_le_bytes());
+    let mut line = line_header(files)?;
     // alloc: once per link, one buffer per piece
     let lines: Vec<Vec<u8>> = lines.into_iter().collect::<Result<_, _>>()?;
     let len = line.len() + lines.iter().map(Vec::len).sum::<usize>();
@@ -281,6 +264,73 @@ pub(crate) fn sections(
         (".debug_line", line),
         (".debug_str", strings),
     ])
+}
+
+/// The line program's header for `files`, its unit length (the first four bytes) left 0 for
+/// the caller, who knows the program's length: what [`sections`] starts `.debug_line` with,
+/// and what a side file ([`crate::beside`]) keeps at the start of its own.
+pub(crate) fn line_header(files: &[&str]) -> Result<Vec<u8>, String> {
+    for file in files {
+        if file.is_empty() || file.contains('\0') {
+            // alloc: error path
+            return Err(format!("a span in the file {file:?}, which DWARF can't name"));
+        }
+    }
+    let file_bytes: usize = files.iter().map(|it| it.len() + 4).sum();
+    // alloc: once per link, the line program's header
+    let mut line = Vec::with_capacity(10 + 6 + STANDARD_LENGTHS.len() + 2 + file_bytes);
+    line.extend_from_slice(&[0; 4]);
+    line.extend_from_slice(&4u16.to_le_bytes());
+    line.extend_from_slice(&[0; 4]);
+    let header = line.len();
+    line.extend_from_slice(&[1, 1, 1, LINE_BASE as i8 as u8, LINE_RANGE as u8, OPCODE_BASE]);
+    line.extend_from_slice(&STANDARD_LENGTHS);
+    line.push(0);
+    for file in files {
+        line.extend_from_slice(file.as_bytes());
+        line.extend_from_slice(&[0, 0, 0, 0]);
+    }
+    line.push(0);
+    let header_len =
+        u32::try_from(line.len() - header).map_err(|_| "a line program header past 4 GiB")?;
+    line[6..10].copy_from_slice(&header_len.to_le_bytes());
+    Ok(line)
+}
+
+/// Overwrites `out`, a line sequence of the program, with operations that change no register
+/// and make no row: what a side file leaves where a function's sequence was
+/// ([`crate::beside`]). Each is `DW_LNS_advance_pc` by 0, the 0 a ULEB128 padded with
+/// continuation bytes to at most ten (what every reader's decoder takes), so any length
+/// from 2 up is covered; a sequence is never shorter (its end alone is 3 bytes). The address
+/// stays where the last sequence's end reset it, so the next sequence's `DW_LNE_set_address`
+/// never moves it back (gimli refuses a sequence whose address decreases).
+pub(crate) fn dead(out: &mut [u8]) {
+    debug_assert!(out.len() != 1, "one byte holds no operation with an operand");
+    let mut rest = out;
+    while !rest.is_empty() {
+        let take = match rest.len() {
+            len if len <= 11 => len,
+            12 => 10,
+            _ => 11,
+        };
+        let (this, after) = rest.split_at_mut(take);
+        this.fill(0x80);
+        this[0] = DW_LNS_ADVANCE_PC;
+        this[take - 1] = 0;
+        rest = after;
+    }
+}
+
+/// One function's line sequence, as [`sections`] encodes it within the program, for 8-byte
+/// addresses: empty for a function with no rows. `rows` are the function's own, their `file`
+/// an index below `files`.
+pub(crate) fn sequence(addr: u64, size: u64, rows: &[Row], files: usize) -> Result<Vec<u8>, String> {
+    let function = DebugFunction { addr, size, name: None, lines: 0..rows.len() as u32 };
+    let put = |out: &mut Vec<u8>, value: u64| -> Result<(), String> {
+        out.extend_from_slice(&value.to_le_bytes());
+        Ok(())
+    };
+    sequences(&[0], std::slice::from_ref(&function), rows, files, 8, &put)
 }
 
 /// The line sequences of `chunk`'s functions (indexes into `functions`, in address order), one

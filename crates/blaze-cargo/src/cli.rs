@@ -276,6 +276,100 @@ fn auto_color() -> bool {
         .unwrap_or(false)
 }
 
+/// Every word that names a command (`args::parse`'s), as `blaze --help` orders them; the
+/// one-letter aliases are left out, since any short typo is near one. A test parses each, so a
+/// word here that is no command fails.
+const COMMANDS: &[&str] = &[
+    "build",
+    "check",
+    "run",
+    "test",
+    "bench",
+    "doc",
+    "lock",
+    "clean",
+    "cache",
+    "fmt",
+    "new",
+    "init",
+    "tree",
+    "metadata",
+    "serve",
+    "stop",
+    "status",
+    "toolchain",
+    "daemon",
+    "codegen-inputs",
+    "trace",
+    "tables",
+    "explore",
+    "debug",
+    "explain",
+    "why",
+    "reach",
+    "slow",
+    "pprof",
+    "perf",
+];
+
+/// What people type for a command that has another name: the words typed, the command meant,
+/// and what to know about it. `blaze daemon` takes `install` and `uninstall` alone; the
+/// daemon's other verbs are top-level commands, and nothing starts it by hand.
+const ALIASES: &[(&str, &str, &str)] = &[
+    ("daemon stop", "blaze stop", "it makes the daemon's state durable and stops it"),
+    ("daemon kill", "blaze stop", "it makes the daemon's state durable and stops it"),
+    ("daemon shutdown", "blaze stop", "it makes the daemon's state durable and stops it"),
+    ("daemon quit", "blaze stop", "it makes the daemon's state durable and stops it"),
+    ("daemon status", "blaze status", "it says what the daemon is doing"),
+    ("daemon restart", "blaze stop", "the next command starts the daemon again"),
+    ("daemon start", "blaze serve", "though any command starts the daemon when none runs"),
+    ("daemon run", "blaze serve", "though any command starts the daemon when none runs"),
+    ("daemon serve", "blaze serve", "though any command starts the daemon when none runs"),
+    ("daemon", "blaze daemon install", "or `blaze daemon uninstall`"),
+    ("shutdown", "blaze stop", "it makes the daemon's state durable and stops it"),
+    ("kill", "blaze stop", "it makes the daemon's state durable and stops it"),
+    ("start", "blaze serve", "though any command starts the daemon when none runs"),
+    ("clippy", "blaze check", "it runs every lint, clippy's too"),
+    ("fix", "blaze check --fix", "it makes the machine-applicable suggestions"),
+    ("gc", "blaze cache gc", "it collects what blaze keeps on disk"),
+];
+
+/// The command `name` (the words typed, as `args::parse` hands them: `daemon stop`) most
+/// likely meant, with what to know about it: a known other name for one ([`ALIASES`]), else
+/// the nearest of [`COMMANDS`] by rustc's edit distance (`stdx::edit_distance`, the one
+/// "did you mean" of the tree), for `daemon <word>` the nearest of its two verbs. None when
+/// nothing is near: a guess that is far off sends a script further wrong than no guess.
+fn meant(name: &str) -> Option<(String, &'static str)> {
+    if let Some((_, command, note)) = ALIASES.iter().find(|(typed, _, _)| *typed == name) {
+        // alloc: the suggestion of a refusal, once
+        return Some(((*command).to_owned(), *note));
+    }
+    if let Some(verb) = name.strip_prefix("daemon ") {
+        let verbs = ["install", "uninstall"];
+        let near = stdx::edit_distance::find_best_match_for_name(&verbs, verb, None)?;
+        // alloc: the suggestion of a refusal, once
+        return Some((format!("blaze daemon {near}"), ""));
+    }
+    let near = stdx::edit_distance::find_best_match_for_name(COMMANDS, name, None)?;
+    // alloc: the suggestion of a refusal, once
+    Some((format!("blaze {near}"), ""))
+}
+
+/// The refusal of `blaze <name>` where `name` is no command: the command it most likely meant
+/// ([`meant`]) said first, then every command. The caller exits nonzero either way: a script
+/// that runs a command that does not exist has failed, whatever was meant.
+fn no_such_command(name: &str) -> String {
+    let commands = COMMANDS.join(", "); // alloc: the refusal, once
+    // alloc: the refusal, once
+    let help = match meant(name) {
+        Some((command, "")) => format!("help: did you mean `{command}`?\n\n"),
+        Some((command, note)) => format!("help: did you mean `{command}`? ({note})\n\n"),
+        None => String::new(),
+    };
+    // alloc: the refusal, once
+    format!("no such command: `blaze {name}`\n\n{help}help: blaze's commands are {commands}")
+}
+
 /// One command line, run: its exit code.
 pub fn command(words: Vec<OsString>) -> i32 {
     let parsing =
@@ -310,12 +404,7 @@ pub fn command(words: Vec<OsString>) -> i32 {
             0
         }
         Asked::Unknown(name) => {
-            let what = format!(
-                "no such command: `{name}`\n\nhelp: blaze's commands are build, check, run, test, bench, \
-                 doc, clean, cache, fmt, new, init, tree, metadata, serve, stop, status, toolchain, daemon, \
-                 codegen-inputs, trace, tables, explore, debug, explain, why, reach and slow"
-            );
-            eprint!("{}", say::error(&what, auto_color()));
+            eprint!("{}", say::error(&no_such_command(&name), auto_color()));
             Exit::Failed.code()
         }
         Asked::Stop => said(daemon::stop(&mut io::stderr().lock(), auto_color())),

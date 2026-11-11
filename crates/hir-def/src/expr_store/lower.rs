@@ -69,7 +69,7 @@ use crate::{
     signatures::{ImplSignature, StructSignature, TypeAliasSignature},
     type_ref::{
         ArrayType, ConstRef, FnType, LifetimeRef, LifetimeRefId, Mutability, PathId, Rawness,
-        RefType, TraitBoundModifier, TraitRef, TypeBound, TypeRef, TypeRefId,
+        RecordDefaults, RefType, TraitBoundModifier, TraitRef, TypeBound, TypeRef, TypeRefId,
     },
     unstable_features::UnstableFeatures,
 };
@@ -1283,6 +1283,37 @@ impl<'db> ExprCollector<'db> {
                 let ty = self.lower_type_ref_opt(inner.ty(), impl_trait_lower_fn);
                 self.alloc_type_ref(TypeRef::UnsafeBinder { lifetimes, ty }, ptr)
             }
+            // blaze's record type (`#![blaze::records]`): the fields as written, a field the
+            // parser gave no name left out with its error. A visibility, an attribute or
+            // `unsafe` on a field is the parser's error too.
+            ast::Type::RecordType(inner) => {
+                // alloc: inline up to 8 fields, a record's names and defaults before they are
+                // pushed
+                let mut names: SmallVec<[Name; 8]> = SmallVec::new();
+                let mut defaults: SmallVec<[u32; 8]> = SmallVec::new();
+                let mark = self.store.list_mark();
+                let fields = inner.record_field_list().into_iter().flat_map(|it| it.fields());
+                for field in fields {
+                    let Some(name) = field.name() else { continue };
+                    let ty = self.lower_type_ref_opt(field.ty(), impl_trait_lower_fn);
+                    let default = field
+                        .eq_token()
+                        .and_then(|_| field.default_val())
+                        .map(|default| self.lower_const_arg(default));
+                    names.push(name.as_name());
+                    defaults.push(RecordDefaults::word(default));
+                    self.store.push_list_type(ty);
+                }
+                let names = self.store.paths_mut().push_names(names);
+                let id = self.with_lists(mark, |this, lists| {
+                    this.store.alloc_type_ref(TypeRef::Record {
+                        names,
+                        types: lists.types_since(mark),
+                        defaults: RecordDefaults::from_words(&defaults),
+                    })
+                });
+                self.map_type_ref(id, ptr, false)
+            }
             ast::Type::MacroType(mt) => match mt.macro_call() {
                 Some(mcall) => {
                     let macro_ptr = AstPtr::<tag::MacroCall>::of(mcall);
@@ -2030,9 +2061,10 @@ impl<'db> ExprCollector<'db> {
             }
             ast::Expr::RecordExpr(e) => {
                 let written = e.path().map(|it| it.syntax().text_range());
-                let path = e
-                    .path()
-                    .and_then(|path| self.lower_path_view(path, &mut ImplTraitLowering::Error));
+                let path = match e.path() {
+                    Some(path) => self.lower_path_view(path, &mut ImplTraitLowering::Error),
+                    None => self.record_path(),
+                };
                 let Some(path) = path else {
                     return Some(self.missing_expr());
                 };
@@ -2706,9 +2738,10 @@ impl<'db> ExprCollector<'db> {
                 id
             }
             ast::Expr::RecordExpr(e) => {
-                let path = e
-                    .path()
-                    .and_then(|path| self.lower_path_view(path, &mut ImplTraitLowering::Error));
+                let path = match e.path() {
+                    Some(path) => self.lower_path_view(path, &mut ImplTraitLowering::Error),
+                    None => self.record_path(),
+                };
                 let Some(path) = path else {
                     return Some(self.missing_pat());
                 };
@@ -3770,9 +3803,10 @@ impl<'db> ExprCollector<'db> {
             ast::Pat::WildcardPat(_) => Pat::Wild,
             ast::Pat::RecordPat(p) => {
                 let written = p.path().map(|it| it.syntax().text_range());
-                let path = p
-                    .path()
-                    .and_then(|path| self.lower_path_view(path, &mut ImplTraitLowering::Error));
+                let path = match p.path() {
+                    Some(path) => self.lower_path_view(path, &mut ImplTraitLowering::Error),
+                    None => self.record_path(),
+                };
                 let Some(path) = path else {
                     return self.missing_pat();
                 };
@@ -4308,6 +4342,18 @@ impl<'db> ExprCollector<'db> {
 
     fn lang_path(&mut self, lang: Option<impl Into<LangItemTarget>>) -> Option<PathIdx> {
         Some(self.store.push_lang_path(lang?.into(), None))
+    }
+
+    /// The path of a record value `{ a: 1, b }` or a record pattern `{ a, b: x }` (blaze,
+    /// `#![blaze::records]`), which is written with none: core's `#[lang = "record"]` struct.
+    /// The parser makes a struct literal or a struct pattern with no path only for a record,
+    /// under the extension; hir-ty reads this path as one ([`LangItems::Record`]), names the
+    /// fields against the record's type and refuses it in a crate that lacks the attribute.
+    /// `None` in a `core` that declares no records, where the value is a missing expression
+    /// and the type its own error.
+    fn record_path(&mut self) -> Option<PathIdx> {
+        let record = self.lang_items().Record;
+        self.lang_path(record)
     }
 
     fn ty_rel_lang_path(

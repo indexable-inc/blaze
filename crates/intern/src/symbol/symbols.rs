@@ -864,7 +864,7 @@ define_symbols! {
     inline, cold, unsafe_unpin, global_alloc_ty, maybe_dangling,
     panic_null_reference_constructed, panic_invalid_enum_construction, mem_size_const,
     mem_align_const, rustc_diagnostic_item, try_as_dyn, arbitrary_int, arbitrary_signed, int_from,
-    int_try_from, blaze_int_cast,
+    int_try_from, blaze_int_cast, record,
     // The most frequent identifiers of `library/` and `harness/` (comments and literals left
     // out, keywords and the names above skipped), most frequent first, so that each is a
     // fixed ID found by `COMPILED` with no probe of the table. Not here, though common: the

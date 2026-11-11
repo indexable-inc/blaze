@@ -284,6 +284,9 @@ pub struct Compiled {
     /// A proc macro's expanders, loaded from what it compiled to (or why there are none):
     /// the loop asks the job's [`Writer::macros`] with them. None for any other unit.
     pub macros: Option<blaze_lower::ProcMacroLoadResult>,
+    /// A device unit's MSL (`blaze_units::UnitPlan::gpu_msl`), as it made or kept it: the loop
+    /// asks the job's [`Writer::gpu_msl`] with it. None for any other unit.
+    pub gpu_msl: Option<Vec<u8>>,
     /// Each image the compile linked, by its path, and how the link reached it: what the job's
     /// [`blaze_api::Worked`] says, and the bench fails an edit by.
     pub links: Vec<(String, Linking)>,
@@ -769,12 +772,21 @@ pub trait Writer<S: Steps>: Send + 'static {
         unit: usize,
         macros: blaze_lower::ProcMacroLoadResult,
     ) -> Result<(), ApiError>;
+    /// Asks for device unit `unit`'s MSL set as the bytes of its file
+    /// (`blaze_lower::Lowered::gpu_msl`), which its dependents' front ends read: checked now,
+    /// applied by [`Writer::apply`], counted as a run's (`unit::graph::flag::GPU_MSL`).
+    fn gpu_msl(&mut self, unit: usize, msl: Vec<u8>) -> Result<(), ApiError>;
     /// Whether a write was asked for and is not applied yet, or the front end asks to let go
     /// of what nothing still to compile reads (the daemon's `unit::release`): either way the
     /// loop posts no reading task of the job until [`Writer::apply`] applied it.
     fn waiting(&self) -> bool;
     /// On the loop, as unit `unit`'s first task starts: it is open until [`Writer::compiled`].
     fn began(&mut self, unit: usize) {
+        let _ = unit;
+    }
+    /// On the loop, as unit `unit` began and was found kept ([`Front::fresh`]): its compile
+    /// replays its record, and makes nothing in the front end for a release to let go.
+    fn found_kept(&mut self, unit: usize) {
         let _ = unit;
     }
     /// On the loop, as unit `unit`'s compile ended (its last phase gave its outcome, ok or
@@ -831,6 +843,17 @@ pub trait Writer<S: Steps>: Send + 'static {
     /// with no database, and while the run log is off.
     fn run_log(&self) -> blaze_query::db::Taken {
         blaze_query::db::Taken::default()
+    }
+    /// On the loop, once every task of a build that made nothing so far has ended and before
+    /// it is kept: the Rust sources of the view that every key of the build held by code text
+    /// alone, each by its path from the view's root with the edition its crates parse it in,
+    /// so that an edit of one that leaves its still text (`blaze_lower::still_text_of`)
+    /// leaves every key, and the no-op lane says the build's answer again over it
+    /// (`serve::job::noop`, "An edit that changes no code"). Or why it vouches for none: a
+    /// reason, never an empty list. It runs no query and reads no file: inputs, what the
+    /// build noted, and the store's index. A front end that does not say vouches for none.
+    fn still(&self) -> Result<Vec<(String, ::span::Edition)>, String> {
+        Err("its front end does not say which sources it held by code text".to_owned()) // alloc: a reason, once a build
     }
     /// Under `-v`: the note of what storing the kept front end this build lowered into did with
     /// the goals its build offered to the persistent goal cache. None when nothing was kept.

@@ -2742,6 +2742,7 @@ mod tests {
             TypeRef::PatternType(..) => TypeRefKind::PatternType,
             TypeRef::Error => TypeRefKind::Error,
             TypeRef::UnsafeBinder { .. } => TypeRefKind::UnsafeBinder,
+            TypeRef::Record { .. } => TypeRefKind::Record,
         }
     }
 

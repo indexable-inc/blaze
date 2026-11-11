@@ -1176,6 +1176,12 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         fields: &[RecordLitField],
         base_expr: RecordSpread,
     ) -> Ty<'db> {
+        // blaze: a record value `{ a: 1, b }` (`#![blaze::records]`), which has no path.
+        if let Some(record) = self.record_path(path) {
+            let ty = self.infer_record_value(expr, record, expected, fields, base_expr);
+            self.require_type_is_sized(ty, expr.into(), ObligationCauseCode::Misc);
+            return ty;
+        }
         // Find the relevant variant
         let (adt_ty, Some(variant)) = self.resolve_variant(expr.into(), path, false) else {
             if let Some(segment) = self.first_unresolved_segment(path, expr.into()) {
@@ -2006,6 +2012,18 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     });
                 }
                 TyKind::Adt(adt, parameters) => match adt.def_id() {
+                    // blaze: `r.a` on a record (`#![blaze::records]`) is the field `a` of the
+                    // tuple core's `Record` holds; it resolves to the struct's one field, and
+                    // MIR building and the capture walk add the tuple's (`crate::record`).
+                    hir_def::AdtId::StructId(s)
+                        if let Some(record) =
+                            crate::record::record_fields(self.lang_items, derefed_ty) =>
+                    {
+                        let at = record.index_of(name.as_str())?;
+                        let (local_id, _) = s.fields(self.db).fields().iter().next()?;
+                        let field = FieldId { parent: s.into(), local_id };
+                        return Some((Either::Left(field), record.ty(at)?));
+                    }
                     hir_def::AdtId::StructId(s) => {
                         let local_id =
                             s.fields(self.db).field_written(self.db, s.into(), name, hygiene)?;
@@ -2270,6 +2288,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                         item: func.def_id.into(),
                     })
                 }
+                // A record argument takes the defaults of this method's parameter after the
+                // receiver.
+                self.note_record_arguments(func.def_id, 1, args);
                 self.check_method_call(tgt_expr, args, func.sig, expected)
             }
             // Failed to resolve, report diagnostic and try to resolve as call to field access or

@@ -208,22 +208,33 @@ fn rename_data(
     Ok(ids)
 }
 
-/// Renames what `function` calls by `kept`, in place, and makes its data's IDs again; leaves
-/// it as it is, and says so, when it names nothing of `kept`.
-fn rename(
-    function: &mut CompiledFunction,
-    kept: &HashMap<InstanceKey, InstanceKey, Global>,
-) -> Result<bool, DedupeError> {
+/// Whether `function` names a function of `kept`: in its code, its data or its unwind
+/// routine. What [`rename`] changes it for.
+fn names_any(function: &CompiledFunction, kept: &HashMap<InstanceKey, InstanceKey, Global>) -> bool {
     let routine_named = match &function.unwind {
         Some(
             Unwind::Dwarf { personality: Some(it), .. } | Unwind::Windows { handler: Some(it), .. },
         ) => names(it, kept),
         _ => false,
     };
-    if !names_kept(&function.relocs, kept)
-        && !function.data.iter().any(|it| names_kept(&it.relocs, kept))
-        && !routine_named
-    {
+    names_kept(&function.relocs, kept)
+        || function.data.iter().any(|it| names_kept(&it.relocs, kept))
+        || routine_named
+}
+
+/// Whether `value` names a function of `kept`: what [`rename_static`] changes it for.
+fn static_names_any(value: &Static, kept: &HashMap<InstanceKey, InstanceKey, Global>) -> bool {
+    matches!(&value.init, Init::Bytes { relocs, .. } if names_kept(relocs, kept))
+        || value.data.iter().any(|it| names_kept(&it.relocs, kept))
+}
+
+/// Renames what `function` calls by `kept`, in place, and makes its data's IDs again; leaves
+/// it as it is, and says so, when it names nothing of `kept`.
+pub(crate) fn rename(
+    function: &mut CompiledFunction,
+    kept: &HashMap<InstanceKey, InstanceKey, Global>,
+) -> Result<bool, DedupeError> {
+    if !names_any(function, kept) {
         return Ok(false);
     }
     let ids = rename_data(&mut function.data, kept, DataOwner::Function(function.key))?;
@@ -234,12 +245,11 @@ fn rename(
 
 /// Renames what `value` points at by `kept`, in place, and makes its data's IDs again; says
 /// whether anything changed, which changes its digest.
-fn rename_static(
+pub(crate) fn rename_static(
     value: &mut Static,
     kept: &HashMap<InstanceKey, InstanceKey, Global>,
 ) -> Result<bool, DedupeError> {
-    let init_names = matches!(&value.init, Init::Bytes { relocs, .. } if names_kept(relocs, kept));
-    if !init_names && !value.data.iter().any(|it| names_kept(&it.relocs, kept)) {
+    if !static_names_any(value, kept) {
         return Ok(false);
     }
     let ids = rename_data(&mut value.data, kept, DataOwner::Static(value.item, value.instance))?;
@@ -247,6 +257,26 @@ fn rename_static(
         *relocs = rename_relocs(relocs, kept, &ids);
     }
     Ok(true)
+}
+
+/// Whether dedupe may merge `function` with another of equal code, where its caller says its
+/// key is `mergeable`. A covered function counts its own blocks, a counting one its own calls
+/// and an instrumented one its own PGO record: merged, two would share counters.
+pub(crate) fn candidate(function: &CompiledFunction, mergeable: bool) -> bool {
+    let counts = function.profile.is_some_and(|it| it.counted().is_some())
+        || (function.relocs.targets().iter())
+            .any(|it| matches!(it, Target::Counter(_) | Target::ProfileCounters));
+    mergeable && function.coverage.is_none() && !counts
+}
+
+/// What [`dedupe_keeping`] changed, as it was before: each function merged away or renamed
+/// and each static renamed, as given. A build that keeps its functions across edits
+/// (`driver::lists`) holds every function as it was made, so a later dedupe starts from
+/// what this one started from.
+#[derive(Default)]
+pub struct Originals {
+    pub functions: Vec<CompiledFunction>,
+    pub statics: Vec<Static>,
 }
 
 /// Merges the functions of a build whose code is equal, in place: `functions` keeps one of
@@ -259,18 +289,22 @@ pub fn dedupe(
     statics: &mut [Static],
     mergeable: impl Fn(&InstanceKey) -> bool,
 ) -> Result<(Deduped, Vec<usize>), DedupeError> {
-    // A covered function counts its own blocks, a counting one its own calls and an
-    // instrumented one its own PGO record: merged, two would share counters.
-    let counts = |it: &CompiledFunction| {
-        it.profile.is_some_and(|it| it.counted().is_some())
-            || it
-                .relocs
-                .targets()
-                .iter()
-                .any(|it| matches!(it, Target::Counter(_) | Target::ProfileCounters))
-    };
-    let candidate =
-        |it: &CompiledFunction| mergeable(&it.key) && it.coverage.is_none() && !counts(it);
+    dedupe_keeping(functions, statics, mergeable, None)
+}
+
+/// [`dedupe`], which also gives `originals`, when asked, each function and static it changes
+/// or takes out as it was given ([`Originals`]): a copy of each renamed one, made before its
+/// first rename, and each merged one itself.
+pub fn dedupe_keeping(
+    functions: &mut Vec<CompiledFunction>,
+    statics: &mut [Static],
+    mergeable: impl Fn(&InstanceKey) -> bool,
+    mut originals: Option<&mut Originals>,
+) -> Result<(Deduped, Vec<usize>), DedupeError> {
+    let candidate = |it: &CompiledFunction| candidate(it, mergeable(&it.key));
+    // The keys whose original is kept already: a function renamed in two rounds is copied
+    // before the first.
+    let mut copied: blaze_hash::HashSet<InstanceKey, Global> = blaze_hash::HashSet::new_in(Global);
     // Each candidate's code ID, by key: hashed once, and again only when a round renames it.
     // Unordered: only grouped, and each group is sorted on its own.
     let mut ids: HashMap<InstanceKey, ContentId, Global> = HashMap::new_in(Global);
@@ -314,11 +348,29 @@ pub fn dedupe(
             break;
         }
         last = more.iter().min().map(|(from, to)| (*from, *to));
-        functions.retain(|it| {
-            let gone = more.contains_key(&it.key);
-            bytes += if gone { it.code.len() as u64 } else { 0 };
-            !gone
-        });
+        match originals.as_deref_mut() {
+            None => functions.retain(|it| {
+                let gone = more.contains_key(&it.key);
+                bytes += if gone { it.code.len() as u64 } else { 0 };
+                !gone
+            }),
+            Some(originals) => {
+                // alloc: per round that merges, the functions it keeps
+                let mut stay = Vec::with_capacity(functions.len());
+                for it in std::mem::take(functions) {
+                    if !more.contains_key(&it.key) {
+                        stay.push(it);
+                        continue;
+                    }
+                    bytes += it.code.len() as u64;
+                    // Renamed in a round before: its original is kept already.
+                    if copied.insert(it.key) {
+                        originals.functions.push(it);
+                    }
+                }
+                *functions = stay;
+            }
+        }
         for key in more.keys() {
             ids.remove(key);
         }
@@ -327,16 +379,37 @@ pub fn dedupe(
         }
         kept.extend(more.iter().map(|(from, to)| (*from, *to)));
         for function in functions.iter_mut() {
-            if rename(function, &more)? && ids.contains_key(&function.key) {
+            let before = match originals.is_some() && !copied.contains(&function.key) {
+                // clone: a function as it was given, when this round may rename it and its
+                // original is kept; dropped when the round leaves it as it is
+                true if names_any(function, &more) => Some(function.clone()),
+                _ => None,
+            };
+            let changed = rename(function, &more)?;
+            if let (true, Some(before), Some(originals)) = (changed, before, originals.as_deref_mut())
+            {
+                copied.insert(before.key);
+                originals.functions.push(before);
+            }
+            if changed && ids.contains_key(&function.key) {
                 ids.insert(function.key, code_id(function));
             }
         }
     }
     let mut renamed_statics = Vec::new(); // alloc: per build, the few statics that name a merged function
     for (at, value) in statics.iter_mut().enumerate() {
+        // clone: a static as it was given, when its original is kept and it may be renamed
+        let before = (originals.is_some() && static_names_any(value, &kept)).then(|| value.clone());
         if rename_static(value, &kept)? {
             renamed_statics.push(at);
+            if let (Some(before), Some(originals)) = (before, originals.as_deref_mut()) {
+                originals.statics.push(before);
+            }
         }
+    }
+    if let Some(originals) = originals {
+        originals.functions.sort_by_key(|it| it.key);
+        originals.statics.sort_by_key(|it| (it.item, it.instance));
     }
     functions.sort_by_key(|it| it.key);
     span.record("folded", kept.len()).record("rounds", rounds).record("bytes", bytes);

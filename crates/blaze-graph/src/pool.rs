@@ -2812,6 +2812,7 @@ fn block(until: &dyn Fn() -> bool, deadline: Option<u64>) {
             // A client of pools with threads of their own: its waker unparks it.
             Round::None if THREADS => match left() {
                 Some(left) => thread::park_timeout(left),
+                // wakes: the client's waker as its wait ends, and the pool this thread is listed with (`Blocked`) as it stops for an error and as each worker ends, which the loop then reads as `ended_broken`
                 None => thread::park(),
             },
             Round::Ran => {}
@@ -5153,69 +5154,13 @@ mod broken {
         until("the last worker to end", || ended(&pool) == 4);
     }
 
-    /// The variable that makes this test binary, run again, a process under a filter that
-    /// refuses io_uring: `direct` for one the sandbox launcher marked, `ring` for one it did not.
-    #[cfg(target_os = "linux")]
-    const UNDER_FILTER: &str = "__BLAZE_GRAPH_TEST_UNDER_FILTER";
-
-    /// Installs, for this thread and those it starts, a seccomp filter that answers
-    /// `io_uring_setup` with `ENOSYS` and allows every other call: the part of the sandbox's
-    /// filter (`blaze-cargo/src/sandbox/linux.rs`, `filter_program`) a blaze inside it meets.
-    #[cfg(target_os = "linux")]
-    fn refuse_io_uring() {
-        let insn =
-            |code: u32, jt: u8, jf: u8, k: u32| libc::sock_filter { code: code as u16, jt, jf, k };
-        let (load, jump, ret) = (
-            libc::BPF_LD | libc::BPF_W | libc::BPF_ABS,
-            libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
-            libc::BPF_RET | libc::BPF_K,
-        );
-        let mut filter = [
-            // The call's number, which is `io_uring_setup`'s or not.
-            insn(load, 0, 0, 0),
-            insn(jump, 0, 1, libc::SYS_io_uring_setup as u32),
-            insn(ret, 0, 0, libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32),
-            insn(ret, 0, 0, libc::SECCOMP_RET_ALLOW),
-        ];
-        let program = libc::sock_fprog { len: filter.len() as u16, filter: filter.as_mut_ptr() };
-        let (on, no): (libc::c_ulong, libc::c_ulong) = (1, 0);
-        // SAFETY: `prctl` with integer arguments, each the `unsigned long` it reads; `seccomp`
-        // reads `program` and the filter it points at, both live for the call, and keeps a
-        // copy of its own.
-        unsafe {
-            assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, on, no, no, no), 0, "no_new_privs");
-            let installed = libc::syscall(
-                libc::SYS_seccomp,
-                libc::SECCOMP_SET_MODE_FILTER,
-                0,
-                std::ptr::from_ref(&program),
-            );
-            assert_eq!(installed, 0, "seccomp: {}", std::io::Error::last_os_error());
-        }
-    }
-
-    /// What `io_uring_setup` answers this thread: the error's number.
-    #[cfg(target_os = "linux")]
-    fn io_uring_setup_errno() -> Option<i32> {
-        // SAFETY: a null `io_uring_params`, which a kernel that takes the call refuses
-        // (`EFAULT`) before it makes anything.
-        let made = unsafe {
-            libc::syscall(libc::SYS_io_uring_setup, 8u32, std::ptr::null_mut::<libc::c_void>())
-        };
-        assert!(made < 0, "io_uring_setup with no parameters made a ring");
-        std::io::Error::last_os_error().raw_os_error()
-    }
-
     /// The failing scenario, in a process of its own: under the filter, the driver chosen as
     /// blaze's `main` chooses it, a pool's workers park idle and are woken by jobs eight
     /// times over, and a loop of [`crate::par`] runs on the process's own pool from this
     /// thread, as the probe of a build script's `rustc` does. Which driver it chose.
     #[cfg(target_os = "linux")]
-    fn park_and_wake_under_the_filter() -> blaze_core::wait::Waits {
+    fn park_and_wake_under_the_filter(waits: blaze_core::wait::Waits) -> String {
         use std::sync::atomic::AtomicUsize;
-        refuse_io_uring();
-        assert_eq!(io_uring_setup_errno(), Some(libc::ENOSYS), "the filter is not in force");
-        let waits = blaze_core::wait::choose_from_env().unwrap();
         let pool = Pool::new(&two_groups_of_two(), false).unwrap();
         let sum = AtomicUsize::new(0);
         for _ in 0..8 {
@@ -5240,33 +5185,22 @@ mod broken {
         );
         assert!(again.is_empty() && seen.load(Ordering::SeqCst) == 256);
         assert!(crate::exec::shared().broken().is_none());
-        waits
+        format!("parked and woke its workers on {waits:?}")
     }
 
-    /// This test binary run again with [`UNDER_FILTER`]: does [`park_and_wake_under_the_filter`]
-    /// before libtest's `main`, as the process's one thread, and ends: 0 having said the
-    /// driver, 3 having said the panic.
+    /// The cases this test binary runs in a process of its own under the filter that refuses
+    /// io_uring (`blaze_core::wait::filtered`, the one helper for it).
     #[cfg(target_os = "linux")]
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "a test binary run again as another process: told so by a variable, and ended here, before \
-                  libtest's `main`"
-    )]
+    const UNDER_FILTER: &[blaze_core::wait::filtered::Case] = &[blaze_core::wait::filtered::Case {
+        name: "park and wake the pool's workers",
+        run: park_and_wake_under_the_filter,
+    }];
+
+    /// This test binary run again with a case named: runs it before libtest's `main`, as the
+    /// process's one thread, and ends (`filtered::take_over`).
+    #[cfg(target_os = "linux")]
     extern "C" fn take_over() {
-        if std::env::var_os(UNDER_FILTER).is_none() {
-            return;
-        }
-        let code = match catch_unwind(park_and_wake_under_the_filter) {
-            Ok(waits) => {
-                println!("parked and woke its workers on {waits:?}");
-                0
-            }
-            Err(panic) => {
-                eprintln!("failed: {}", message(&*panic));
-                3
-            }
-        };
-        std::process::exit(code)
+        blaze_core::wait::filtered::take_over(UNDER_FILTER);
     }
 
     // SAFETY: the loader calls each entry of this section as a function as the binary loads,
@@ -5278,50 +5212,20 @@ mod broken {
     #[unsafe(link_section = ".init_array")]
     static TAKE_OVER: extern "C" fn() = take_over;
 
-    /// Runs this test binary again under the filter, marked as the sandbox marks what it
-    /// launches or not: its exit status and what it wrote, within a bound.
-    #[cfg(target_os = "linux")]
-    #[allow(clippy::disallowed_methods, reason = "a test's child: this test binary, run again")]
-    fn under_the_filter(marked: bool) -> (std::process::ExitStatus, String) {
-        use blaze_core::wait::{Clock as _, Deadline, Monotonic, Waited};
-        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-        command
-            .env(UNDER_FILTER, if marked { "direct" } else { "ring" })
-            .env_remove(blaze_core::wait::SANDBOXED)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        if marked {
-            command.env(blaze_core::wait::SANDBOXED, "1");
-        }
-        let mut child = command.spawn().unwrap();
-        let clock = Monotonic::new();
-        let deadline = Some(Deadline::after(clock.now(), LONG));
-        let pid = i32::try_from(child.id()).unwrap();
-        let what = "the test binary run again under a filter that refuses io_uring";
-        if blaze_core::wait::exited(what, pid, deadline, &clock).unwrap() == Waited::Deadline {
-            child.kill().unwrap();
-            panic!("{what} did not end within 60 s: its threads wait for workers that ended");
-        }
-        let out = child.wait_with_output().unwrap();
-        let said = format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        (out.status, said)
-    }
-
     /// The invariant (tested): a process the sandbox launcher marked, under a filter that
     /// refuses io_uring as the sandbox's does, parks and wakes its pool's workers and runs a
     /// parallel loop to its end on the direct driver, and makes no ring.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_sandboxed_process_parks_its_workers_with_no_io_uring() {
-        let (status, said) = under_the_filter(true);
-        assert!(status.success(), "{status}: {said}");
-        assert!(said.contains("parked and woke its workers on Direct"), "{said}");
-        assert!(!said.contains("io_uring"), "it asked for a ring: {said}");
+        use blaze_core::wait::filtered::{Ended, run};
+        match run("park and wake the pool's workers", true, LONG) {
+            Ended::Passed { said } => {
+                assert!(said.contains("parked and woke its workers on Direct"), "{said}");
+                assert!(!said.contains("io_uring"), "it asked for a ring: {said}");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     /// The control (the cause, put back): the same process not marked waits on its ring,
@@ -5331,10 +5235,15 @@ mod broken {
     #[cfg(target_os = "linux")]
     #[test]
     fn the_oracle_catches_a_sandboxed_process_on_the_ring() {
-        let (status, said) = under_the_filter(false);
-        assert_eq!(status.code(), Some(3), "{status}: {said}");
-        for names in ["could not park", "io_uring_setup", "__BLAZE_SANDBOXED"] {
-            assert!(said.contains(names), "the failure does not say `{names}`: {said}");
+        use blaze_core::wait::filtered::{Ended, run};
+        match run("park and wake the pool's workers", false, LONG) {
+            Ended::Failed { code, said } => {
+                assert_eq!(code, Some(3), "{said}");
+                for names in ["could not park", "io_uring_setup", "__BLAZE_SANDBOXED"] {
+                    assert!(said.contains(names), "the failure does not say `{names}`: {said}");
+                }
+            }
+            other => panic!("{other:?}"),
         }
     }
 }

@@ -62,6 +62,15 @@ impl<'t> Parser<'t> {
         }
     }
 
+    /// Whether the current token, a `{`, is of a crate that says `#![blaze::records]`: only then
+    /// does the grammar read it as a record type, value or pattern
+    /// (docs/v2/plan/design/records.md). Without the extension every `{` is Rust's. Asked of the
+    /// `{` that makes the form, which is where the edition's integration branch reads a token's
+    /// own extensions (`Tokens::extensions_at(self.pos)`); here an input has one set.
+    pub(crate) fn records_gate(&self) -> bool {
+        self.inp.extensions().records()
+    }
+
     pub(super) fn new_outline(inp: impl Into<Tokens<'t>>) -> Parser<'t> {
         Parser { outline: true, ..Parser::new(inp) }
     }
