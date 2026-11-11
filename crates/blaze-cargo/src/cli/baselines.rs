@@ -14,7 +14,8 @@ use std::path::Path;
 
 use blaze_api::DiagnosticRef;
 use blaze_hash::HashSet;
-use blaze_lints::baseline::{self, Baseline, Blessed, Counts, Off};
+use blaze_lints::baseline::{self, Baseline, Blessed, Counts, Held, Off};
+use std::collections::BTreeMap;
 use std::alloc::Global;
 
 use super::say;
@@ -119,7 +120,10 @@ impl Counted {
         }
         for lint in new {
             let path = dir.join(baseline::file_name(lint));
-            let counts = self.counts.get(lint).cloned().unwrap_or_default(); // clone: one lint's counts, once
+            let counts = self.counts.get(lint).map_or_else(BTreeMap::new, |it| {
+                // alloc: one lint's counts, once
+                it.iter().map(|(krate, count)| (krate.clone(), Held::Count(*count))).collect()
+            });
             let text = Baseline { counts }.render();
             std::fs::create_dir_all(&dir).map_err(|error| format!("{shown}: {error}"))?;
             std::fs::write(&path, text).map_err(|error| format!("{}: {error}", path.display()))?;
@@ -152,9 +156,10 @@ impl Counted {
             let blessed = baseline::bless(&dir, &self.counts).map_err(|it| it.to_string())?;
             said.extend(blessed.into_iter().map(|(lint, blessed)| match blessed {
                 Blessed::Lowered => format!("{lint}: baseline lowered to this run's counts"),
-                Blessed::Emptied => {
-                    format!("{lint}: no finding left, baseline deleted: set the lint to `deny`")
-                }
+                Blessed::Emptied => format!(
+                    "{lint}: no finding left, baseline deleted: it is `deny` in every crate where the \
+                     workspace's `lints-ratchet` denies it; elsewhere set it to `deny`"
+                ),
             }));
             return Ok(said);
         }
@@ -247,7 +252,10 @@ mod tests {
         let none = counted(&[]).finish(&root, "b", T, true, &[]).unwrap();
         assert_eq!(
             none,
-            ["clippy::disallowed_types: no finding left, baseline deleted: set the lint to `deny`"]
+            [
+                "clippy::disallowed_types: no finding left, baseline deleted: it is `deny` in every crate \
+                 where the workspace's `lints-ratchet` denies it; elsewhere set it to `deny`"
+            ]
         );
         assert!(!root.join("b/clippy.disallowed_types.txt").exists());
         std::fs::remove_file(root.join("b/TARGET")).unwrap();

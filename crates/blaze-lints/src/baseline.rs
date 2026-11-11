@@ -7,6 +7,16 @@
 //! (after `blaze check --fix`, or a port by hand) only lowers counts and drops crates at zero; a
 //! baseline that reaches empty is deleted, and its lint moves to `deny`.
 //!
+//! A line may hold `unmeasured` in place of a count (`crate<TAB>unmeasured`): the crate is held
+//! at `warn` with no number yet, as every crate was when the workspace's ratchet turned its lints
+//! to `deny` before a run had counted them. Any count passes it, and it is stale, as a count under
+//! its baseline is, until a bless records the run's count in its place or drops the crate at zero.
+//!
+//! A `blaze` lint's file is also what holds a crate at `warn` under the workspace's
+//! `[workspace.metadata.blaze.lints-ratchet]`, which denies the lint everywhere else
+//! (blaze-units' `flags::ratchet_downgrades` reads the crate names of these files): dropping a
+//! crate's line is what turns the lint to `deny` for it.
+//!
 //! The counts are of one target's cfg, which the directory's `TARGET` file names (a target
 //! triple and a newline): a run for another target is refused, never compared.
 //!
@@ -18,8 +28,20 @@ use std::{collections::BTreeMap, path::Path};
 /// A lint's counts, by crate (the package's name).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Baseline {
-    pub counts: BTreeMap<String, u32>,
+    pub counts: BTreeMap<String, Held>,
 }
+
+/// What a baseline holds of one crate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Held {
+    /// At most this many findings, above 0.
+    Count(u32),
+    /// Held at `warn` with no count yet: any count passes until a bless records one.
+    Unmeasured,
+}
+
+/// The text of [`Held::Unmeasured`] in a baseline's line.
+pub const UNMEASURED: &str = "unmeasured";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum BaselineError {
@@ -54,7 +76,10 @@ impl std::fmt::Display for BaselineError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BaselineError::Line { file, line, text } => {
-                write!(f, "{file}:{line}: `{text}` is not `crate<TAB>count` with a count above 0")
+                write!(
+                    f,
+                    "{file}:{line}: `{text}` is not `crate<TAB>count` with a count above 0, nor `crate<TAB>{UNMEASURED}`"
+                )
             }
             BaselineError::Order { file, line, krate } => {
                 write!(
@@ -85,12 +110,14 @@ pub enum Off {
     /// Under: a crate has fewer findings than its baseline (`now` may be 0), so the baseline is
     /// stale until a bless lowers it.
     Shrank { krate: String, was: u32, now: u32 },
+    /// A crate held [`Held::Unmeasured`]: stale until a bless records the run's count.
+    Unmeasured { krate: String, now: u32 },
 }
 
 impl Off {
     /// Whether the run is over the baseline here, which no bless takes away.
     pub fn over(&self) -> bool {
-        !matches!(self, Off::Shrank { .. })
+        !matches!(self, Off::Shrank { .. } | Off::Unmeasured { .. })
     }
 }
 
@@ -106,6 +133,9 @@ impl std::fmt::Display for Off {
             Off::Unbaselined { now } => write!(f, "{now} findings, and the lint has no baseline"),
             Off::Shrank { krate, was, now } => {
                 write!(f, "`{krate}`: {now} findings, under the baseline's {was}")
+            }
+            Off::Unmeasured { krate, now } => {
+                write!(f, "`{krate}`: {now} findings, where the baseline holds `{UNMEASURED}`")
             }
         }
     }
@@ -123,7 +153,12 @@ impl Baseline {
                 text: line.to_owned(),
             };
             let (krate, count) = line.split_once('\t').ok_or_else(line_error)?;
-            let count: u32 = count.parse().ok().filter(|it| *it > 0).ok_or_else(line_error)?;
+            let held = match count {
+                UNMEASURED => Held::Unmeasured,
+                count => Held::Count(
+                    count.parse().ok().filter(|it| *it > 0).ok_or_else(line_error)?,
+                ),
+            };
             if krate.is_empty() {
                 return Err(line_error());
             }
@@ -135,7 +170,7 @@ impl Baseline {
                 });
             }
             last = Some(krate);
-            counts.insert(krate.to_owned(), count);
+            counts.insert(krate.to_owned(), held);
         }
         Ok(Baseline { counts })
     }
@@ -143,10 +178,13 @@ impl Baseline {
     /// The file's text: what [`Baseline::parse`] reads back.
     pub fn render(&self) -> String {
         let mut text = String::new();
-        for (krate, count) in &self.counts {
+        for (krate, held) in &self.counts {
             text.push_str(krate);
             text.push('\t');
-            text.push_str(&count.to_string());
+            match held {
+                Held::Count(count) => text.push_str(&count.to_string()),
+                Held::Unmeasured => text.push_str(UNMEASURED),
+            }
             text.push('\n');
         }
         text
@@ -167,7 +205,10 @@ impl Baseline {
             match order {
                 std::cmp::Ordering::Less => {
                     let (krate, &was) = was.next().unwrap();
-                    off.push(Off::Shrank { krate: krate.clone(), was, now: 0 });
+                    off.push(match was {
+                        Held::Count(was) => Off::Shrank { krate: krate.clone(), was, now: 0 },
+                        Held::Unmeasured => Off::Unmeasured { krate: krate.clone(), now: 0 },
+                    });
                 }
                 std::cmp::Ordering::Greater => {
                     let (krate, &now) = now.next().unwrap();
@@ -175,25 +216,34 @@ impl Baseline {
                 }
                 std::cmp::Ordering::Equal => {
                     let ((krate, &was), (_, &now)) = (was.next().unwrap(), now.next().unwrap());
-                    if now > was {
-                        off.push(Off::Grew { krate: krate.clone(), was, now });
-                    } else if now < was {
-                        off.push(Off::Shrank { krate: krate.clone(), was, now });
+                    match was {
+                        Held::Count(was) if now > was => {
+                            off.push(Off::Grew { krate: krate.clone(), was, now })
+                        }
+                        Held::Count(was) if now < was => {
+                            off.push(Off::Shrank { krate: krate.clone(), was, now })
+                        }
+                        Held::Count(_) => {}
+                        Held::Unmeasured => off.push(Off::Unmeasured { krate: krate.clone(), now }),
                     }
                 }
             }
         }
     }
 
-    /// The baseline lowered to `now`: each crate's count at most what it was, a crate at zero
-    /// dropped, and none added or raised.
+    /// The baseline lowered to `now`: each crate's count at most what it was, an unmeasured
+    /// crate's the run's, a crate at zero dropped, and none added or raised.
     pub fn blessed(&self, now: &BTreeMap<String, u32>) -> Baseline {
         let counts = self
             .counts
             .iter()
             .filter_map(|(krate, &was)| {
-                let now = now.get(krate).copied().unwrap_or(0).min(was);
-                (now > 0).then(|| (krate.clone(), now))
+                let now = now.get(krate).copied().unwrap_or(0);
+                let now = match was {
+                    Held::Count(was) => now.min(was),
+                    Held::Unmeasured => now,
+                };
+                (now > 0).then(|| (krate.clone(), Held::Count(now)))
             })
             .collect();
         Baseline { counts }
@@ -230,13 +280,17 @@ pub fn file_name(lint: &str) -> String {
     format!("{}.txt", lint.replace("::", "."))
 }
 
-/// The lint whose baseline is the file `name`, if it is `<tool>.<lint>.txt` of a clippy or blaze
-/// lint this crate knows.
+/// The lint whose baseline is the file `name`, if it is `<tool>.<lint>.txt` of a clippy lint this
+/// crate knows or a blaze lint of the compile's registry: this crate's, the front end's
+/// (`nopanic`, `borrow_workaround`) and the daemon's reachability lints (`dead`, `test_only`,
+/// `cfg_only`), all of which a run counts.
 pub fn lint_of(name: &str) -> Option<String> {
+    use blaze_diagnostics::lints::registry::{Named, named};
     let (tool, lint) = name.strip_suffix(".txt")?.split_once('.')?;
     let known = match tool {
         "clippy" => crate::registry::lint(lint).is_some(),
-        "blaze" => crate::blaze::Lint::ALL.iter().any(|it| it.name() == lint),
+        // alloc: a lint's full name, once per baseline file read
+        "blaze" => matches!(named(&format!("blaze::{lint}")), Named::Lint(_)),
         _ => false,
     };
     known.then(|| format!("{tool}::{lint}"))
@@ -342,19 +396,34 @@ mod tests {
         pairs.iter().map(|(krate, count)| ((*krate).to_owned(), *count)).collect()
     }
 
+    fn held(pairs: &[(&str, u32)]) -> BTreeMap<String, Held> {
+        pairs.iter().map(|(krate, count)| ((*krate).to_owned(), Held::Count(*count))).collect()
+    }
+
     #[test]
     fn a_baseline_reads_back_what_it_writes() {
         let text = "blaze-cargo\t3\nhir-def\t1\n";
         let baseline = Baseline::parse("clippy.disallowed_types.txt", text).unwrap();
-        assert_eq!(baseline.counts, map(&[("blaze-cargo", 3), ("hir-def", 1)]));
+        assert_eq!(baseline.counts, held(&[("blaze-cargo", 3), ("hir-def", 1)]));
+        assert_eq!(baseline.render(), text);
+        let text = "blaze-cargo\t3\nhir-def\tunmeasured\n";
+        let baseline = Baseline::parse("blaze.std_use.txt", text).unwrap();
+        assert_eq!(baseline.counts.get("hir-def"), Some(&Held::Unmeasured));
         assert_eq!(baseline.render(), text);
         assert_eq!(file_name("clippy::disallowed_types"), "clippy.disallowed_types.txt");
         assert_eq!(file_name("blaze::held_across_wait"), "blaze.held_across_wait.txt");
+        // Every blaze lint a run counts has a file: the daemon's reachability lints too, a
+        // group none.
+        assert_eq!(lint_of("blaze.dead.txt").as_deref(), Some("blaze::dead"));
+        assert_eq!(lint_of("blaze.std_use.txt").as_deref(), Some("blaze::std_use"));
+        assert_eq!(lint_of("blaze.internal.txt"), None);
     }
 
     #[test]
     fn a_line_that_does_not_read_or_a_crate_out_of_order_is_an_error_naming_it() {
-        for (text, line) in [("a\t0\n", 1), ("a\t1\nb 2\n", 2), ("\t1\n", 1)] {
+        for (text, line) in
+            [("a\t0\n", 1), ("a\t1\nb 2\n", 2), ("\t1\n", 1), ("a\tunmeasure\n", 1), ("\tunmeasured\n", 1)]
+        {
             let error = Baseline::parse("x.txt", text).unwrap_err();
             assert!(
                 matches!(&error, BaselineError::Line { line: at, .. } if *at == line),
@@ -369,7 +438,7 @@ mod tests {
 
     #[test]
     fn a_count_off_its_baseline_either_way_is_named_and_a_bless_only_lowers() {
-        let baseline = Baseline { counts: map(&[("a", 3), ("b", 2), ("c", 1), ("e", 4)]) };
+        let baseline = Baseline { counts: held(&[("a", 3), ("b", 2), ("c", 1), ("e", 4)]) };
         let now = map(&[("a", 4), ("b", 1), ("d", 2), ("e", 4), ("f", 0)]);
         assert_eq!(
             baseline.off(&now),
@@ -380,10 +449,33 @@ mod tests {
                 Off::New { krate: "d".to_owned(), now: 2 },
             ]
         );
-        assert_eq!(baseline.blessed(&now).counts, map(&[("a", 3), ("b", 1), ("e", 4)]));
-        assert!(baseline.off(&baseline.counts).is_empty());
+        assert_eq!(baseline.blessed(&now).counts, held(&[("a", 3), ("b", 1), ("e", 4)]));
+        assert!(baseline.off(&map(&[("a", 3), ("b", 2), ("c", 1), ("e", 4)])).is_empty());
         assert!(baseline.off(&map(&[("a", 4)])).iter().any(Off::over));
         assert!(!baseline.off(&map(&[("a", 2)])).iter().any(Off::over));
+    }
+
+    /// The invariant: an unmeasured crate passes any count and is never over, is stale until a
+    /// bless, and a bless gives it the run's count or drops it at zero, so the ratchet's first
+    /// measured run only turns `unmeasured` into numbers or into `deny`.
+    #[test]
+    fn an_unmeasured_crate_takes_any_count_until_a_bless_records_it() {
+        let mut counts = held(&[("a", 2)]);
+        counts.insert("b".to_owned(), Held::Unmeasured);
+        counts.insert("c".to_owned(), Held::Unmeasured);
+        let baseline = Baseline { counts };
+        let now = map(&[("a", 2), ("b", 40)]);
+        assert_eq!(
+            baseline.off(&now),
+            [
+                Off::Unmeasured { krate: "b".to_owned(), now: 40 },
+                Off::Unmeasured { krate: "c".to_owned(), now: 0 },
+            ]
+        );
+        assert!(!baseline.off(&now).iter().any(Off::over), "no count is over `unmeasured`");
+        assert_eq!(baseline.blessed(&now).counts, held(&[("a", 2), ("b", 40)]));
+        // The control: once measured, the same count over it is over.
+        assert!(baseline.blessed(&now).off(&map(&[("b", 41)])).iter().any(Off::over));
     }
 
     #[test]
