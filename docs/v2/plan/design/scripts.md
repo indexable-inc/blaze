@@ -178,6 +178,42 @@ S4) and the missing pieces above; reflection phase 2 with `bstd::data`; the edit
 `fn main(cx, io)` entry (S5). A tier 0 script moves by the lints that move blaze's own crates
 (`blaze::std_use`'s renames, `blaze check --fix`), not by hand.
 
+### The engine and the report (harness/v2's shared modules)
+
+`harness/v2/engine.py` (the blaze under test) and `report.py` (a run's result) are two
+modules of `crates/blaze-script`, `engine` and `report`, ported whole: every name keeps its
+meaning and every message its words, so a harness ports line by line.
+
+- **Types.** `EngineSpec` (the `engine` field: `kind`, `blaze`, `backend`, `dev_backend`, read
+  through `Input`) and `Engine`, made by `Engine::of(&spec)`, which runs the preflight. Python's
+  two exceptions are one error, `Fault::{Failed, Unmeasurable}`, and every fallible method
+  returns `Result<T, Fault>`. `Ran` (argv, seconds, status, stdout, stderr), `Work`, `Table`,
+  `Mark` and storelib's `Layout` keep their fields. `report` has `Verdict`, `Number` (int,
+  float, str, bool or none), `Outcome` and `Report` with `add`, `guarded`, `failing` and
+  `finish`.
+- **A harness** is a bin of `scripts/` like any other: an `Input` struct with
+  `engine: EngineSpec` and `out`, then `main` does
+  `let eng = Engine::of(&args.engine).unwrap_or_else(|f| fail(SCRIPT, f.said()))`, a
+  `Report::new(SCRIPT, &args.engine, &args.out)`, one `rep.add(...)` per thing checked, and ends
+  with `rep.finish()`. A step that may fail is a closure returning `Result<_, Fault>`, handed to
+  `rep.guarded(name, ...)` as Python's `guarded` takes a callable.
+- **Fan-out.** `ThreadPoolExecutor(jobs)` and asyncio's tasks under a semaphore are both
+  "N at once, results in input order": `blaze_script::fan_out(jobs, items, f)` runs `f` on `jobs`
+  named threads, each taking the next item, and returns the results in the items' order. A
+  subprocess with a deadline (`asyncio.timeout`) is `engine::run` with its timeout, blocking its
+  thread. `Engine`'s own records (what each build did, by home) sit behind a lock, so the
+  threads share one engine as the Python's do under the GIL.
+- **Byte compatibility while Python harnesses remain.** The result file is the same JSON:
+  `dumps_indent(1)` with the same keys in the same order (`script`, `engine` as `asdict` writes
+  it, `host`, `commit`, `started`, `ended`, `outcomes`, `counts` in first-seen order, `extra`),
+  a float written as `repr` writes it and `round(x, n)` done as Python does. So `proof.py` and
+  the ledger read a Rust harness's result as they read a Python one, and `SCRIPT` stays
+  `<name>.py` until the last reader moves. The printed lines (`PASS       name  k=v  detail`,
+  the closing count line) are the same, and so is the exit status. What cannot be the same is
+  listed in a port's parity row: random temporary names, timings, and the
+  `blake3`-hashing parts (`digest`, `digests`, `outputs`), which come with the first harness
+  that uses them (`proof.py`).
+
 ### The order, and the guard
 
 Nothing is ported one for one that can be deleted instead. Sizes are from the audit.

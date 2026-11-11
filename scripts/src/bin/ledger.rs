@@ -63,7 +63,9 @@ checkout had changes. Exit status: `check` 1 on any problem; `run` 1 when a row 
 use std::path::{Path, PathBuf};
 
 use blaze_script::{
-    Map, Value, fail,
+    Map, Value,
+    engine::EngineSpec,
+    fail,
     input::{self, Fields, Input, InputError},
     pyjson::{dumps, dumps_unicode},
     run, run_shown,
@@ -188,28 +190,6 @@ impl Input for Ledger {
 
     fn parse(f: &Fields<'_>) -> Result<Ledger, InputError> {
         Ok(Ledger { rows: f.objects("rows", true)?, questions: f.strs("questions")? })
-    }
-}
-
-/// The `engine` field of every script's input (harness/v2/engine.py's `EngineSpec`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct EngineSpec {
-    kind: String,
-    blaze: String,
-    backend: String,
-    dev_backend: String,
-}
-
-impl Input for EngineSpec {
-    const FIELDS: &'static [&'static str] = &["kind", "blaze", "backend", "dev_backend"];
-
-    fn parse(f: &Fields<'_>) -> Result<EngineSpec, InputError> {
-        Ok(EngineSpec {
-            kind: f.one_of("kind", &["v2"], None)?,
-            blaze: f.str("blaze", None)?,
-            backend: f.one_of("backend", &["cranelift", "llvm"], Some("cranelift"))?,
-            dev_backend: f.one_of("dev_backend", &["default", "stencil", "cranelift"], Some("default"))?,
-        })
     }
 }
 
@@ -593,12 +573,7 @@ fn run_checks(it: &Args, root: &Path, ledger: &Ledger) -> (Ledger, Vec<usize>) {
         Ok(ran) if ran.status == 0 => ran.out().trim().to_owned(),
         _ => fail(SCRIPT, "`date +%Y-%m-%d` did not run"),
     };
-    let engine_value = object(vec![
-        ("kind", Value::String(engine.kind.clone())),
-        ("blaze", Value::String(engine.blaze.clone())),
-        ("backend", Value::String(engine.backend.clone())),
-        ("dev_backend", Value::String(engine.dev_backend.clone())),
-    ]);
+    let engine_value = engine.to_value();
     let mut rows: Vec<Row> = Vec::new();
     let mut touched: Vec<usize> = Vec::new();
     let mut pinned = false;

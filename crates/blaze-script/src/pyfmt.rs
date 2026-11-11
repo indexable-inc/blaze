@@ -171,6 +171,31 @@ pub fn repr_strs<S: AsRef<str>>(items: &[S]) -> String {
     format!("[{}]", items.iter().map(|it| repr_str(it.as_ref())).collect::<Vec<_>>().join(", "))
 }
 
+/// `repr(b)` of bytes: `b'...'` in `'` unless they hold a `'` and no `"`, printable ASCII as
+/// it is, `\\`, `\t`, `\n`, `\r` and the quote escaped, every other byte `\xNN`.
+pub fn repr_bytes(b: &[u8]) -> String {
+    let quote = if b.contains(&b'\'') && !b.contains(&b'"') { b'"' } else { b'\'' };
+    let mut out = String::with_capacity(b.len() + 3);
+    out.push('b');
+    out.push(char::from(quote));
+    for &c in b {
+        match c {
+            b'\\' => out.push_str("\\\\"),
+            b'\t' => out.push_str("\\t"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            c if c == quote => {
+                out.push('\\');
+                out.push(char::from(c));
+            }
+            0x20..0x7f => out.push(char::from(c)),
+            c => out.push_str(&format!("\\x{c:02x}")),
+        }
+    }
+    out.push(char::from(quote));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -178,6 +203,20 @@ mod tests {
     use super::*;
 
     // Each expectation is what Python 3.13 prints for the same value.
+    #[test]
+    fn repr_bytes_is_pythons() {
+        let cases: [(&[u8], &str); 5] = [
+            (b"", "b''"),
+            (b"\x00\x01ab\x7f\xff", "b'\\x00\\x01ab\\x7f\\xff'"),
+            (b"it's", "b\"it's\""),
+            (b"'\"", "b'\\'\"'"),
+            (b"\\\t\n\r", "b'\\\\\\t\\n\\r'"),
+        ];
+        for (b, said) in cases {
+            assert_eq!(repr_bytes(b), said, "{b:?}");
+        }
+    }
+
     #[test]
     fn g_is_pythons() {
         let cases = [
