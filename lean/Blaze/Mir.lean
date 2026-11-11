@@ -9,6 +9,12 @@ import Blaze.Mir.Opt.Local
 import Blaze.Mir.Opt.SimplifyConstCondition
 import Blaze.Mir.Opt.RemoveStorageMarkers
 import Blaze.Mir.Opt.Sim
+import Blaze.Mir.Opt.Bind
+import Blaze.Mir.Opt.Ctl
+import Blaze.Mir.Opt.Rename
+import Blaze.Mir.Opt.Reach
+import Blaze.Mir.Opt.Renumber
+import Blaze.Mir.Opt.Thread
 import Blaze.Mir.Opt.RemoveNops
 import Blaze.Mir.Opt.ConstFold
 import Blaze.Mir.Opt.Validate

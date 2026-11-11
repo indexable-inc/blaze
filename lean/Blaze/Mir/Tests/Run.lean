@@ -357,4 +357,76 @@ example : Opt.validate constant constantSimplified = true := by decide
 
 example : Opt.validate constant (one [] Terminator.ret) = false := by decide
 
+/-! The CFG passes, on `constantSimplified`: block 1 is an empty `goto 3`, block 2 is dead.
+
+Goto threading sends block 0 past block 1; the call gives the same value. -/
+
+example :
+    (Opt.threadGotos constantSimplified).fns.map
+        (fun body => body.blocks.map (fun blk => blk.terminator)) =
+      [[Terminator.goto 3, Terminator.goto 3, Terminator.unreachable, Terminator.ret]] := by
+  decide
+
+example : isInt ScalarTy.U32 4 ((Opt.threadGotos constantSimplified).call 8 0 [] []) = true := by
+  decide
+
+/-- The threaded program is done in two steps where the program takes three. -/
+example : isInt ScalarTy.U32 4 ((Opt.threadGotos constantSimplified).call 2 0 [] []) = true := by
+  decide
+
+example : isDiverge (constantSimplified.call 2 0 [] []) = true := by decide
+
+/-! Dead-block removal keeps what block 0 reaches, in its old order, and renames the
+targets. The check its theorem takes is evaluated, and the theorem is applied. -/
+
+example : Opt.reachableOrders constantSimplified 0 = [0, 1, 3] := by decide
+
+example : Opt.checkDead constantSimplified = true := by decide
+
+example :
+    (Opt.removeDeadBlocks constantSimplified).fns.map
+        (fun body => body.blocks.map (fun blk => blk.terminator)) =
+      [[Terminator.goto 1, Terminator.goto 2, Terminator.ret]] := by
+  decide
+
+example :
+    (Opt.removeDeadBlocks constantSimplified).call 8 0 [] [] =
+      constantSimplified.call 8 0 [] [] :=
+  Opt.removeDeadBlocks_call constantSimplified (by decide) 8 0 [] []
+
+example : isInt ScalarTy.U32 4 ((Opt.removeDeadBlocks constantSimplified).call 8 0 [] []) = true := by
+  decide
+
+/-- Threading, then dead-block removal: two blocks are left. -/
+example :
+    (Opt.removeDeadBlocks (Opt.threadGotos constantSimplified)).fns.map
+        (fun body => body.blocks.length) = [2] := by
+  decide
+
+/-! A permutation of the blocks: the entry block stays first, every block is listed. -/
+
+def shuffled : FnId → List BlockId := fun _ => [0, 3, 2, 1]
+
+example : Opt.checkPermutation shuffled constantSimplified = true := by decide
+
+/-- An order that misses a block is refused. -/
+example : Opt.checkPermutation (fun _ => [0, 1, 2]) constantSimplified = false := by decide
+
+/-- So is one that does not start at the entry block. -/
+example : Opt.checkPermutation (fun _ => [1, 0, 2, 3]) constantSimplified = false := by decide
+
+example :
+    (Opt.renumber shuffled constantSimplified).fns.map
+        (fun body => body.blocks.map (fun blk => blk.terminator)) =
+      [[Terminator.goto 3, Terminator.ret, Terminator.unreachable, Terminator.goto 1]] := by
+  decide
+
+example :
+    (Opt.renumber shuffled constantSimplified).call 8 0 [] [] =
+      constantSimplified.call 8 0 [] [] :=
+  Opt.permuteBlocks_call shuffled constantSimplified (by decide) 8 0 [] []
+
+example : isInt ScalarTy.U32 4 ((Opt.renumber shuffled constantSimplified).call 8 0 [] []) = true := by
+  decide
+
 end Blaze.Mir.Tests

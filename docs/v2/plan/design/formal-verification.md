@@ -594,17 +594,62 @@ programs; it is the specification of the Rust pass of the same name.
   its value; one that panics is left, so it still panics). blaze has no Rust pass that only
   folds constants or only removes `nop`s, so those two have no pair to check.
 - **`Sim`** (`Opt/Sim.lean`). A lockstep simulation through a map on states, under an
-  invariant, gives equal runs (`Sim.run`). It is what a pass that renumbers blocks or locals,
-  or removes code nothing reaches, is proved with. It has no such client yet: each needs
-  the functions of `Step.lean` proved to commute with the map (about thirty lemmas), which
-  are not written. So no CFG simplification and no dead-store elimination is proved. A pass
-  that changes the number of steps (threading a `goto`) needs a stuttering form on top.
+  invariant, gives equal runs (`Sim.run`). Its clients are the two renumbering passes below.
+- **Written, not yet elaborated (2026-11-10): the CFG passes.** Until a build of `lean/`
+  passes with them, each line below is a claim Lean has not checked.
+  - **Control is not memory** (`Opt/Ctl.lean`). Every function of `Step.lean` up to
+    `execStmt` leaves each frame's function, block and return target as they were
+    (`execStmt_ctl`). Each proof below that depends on where control is rests on it.
+  - **The commutation lemmas** (`Opt/Rename.lean`). `State.rename ρ` renames each frame's
+    block by its function's map and its return target by its caller's. Every function of
+    `Step.lean`, in the file's order, commutes with it, up to `execTerm_rename` and
+    `step_rename`. `Opt/Bind.lean` has the four facts about `Outcome.bind` they are applied
+    through, as terms: no proof there rewrites.
+  - **A permutation of blocks** (`Opt/Renumber.lean`, `renumber orders`). The orders are
+    checked by `checkPermutation` (every block listed, the entry block first), which the
+    kernel evaluates; `permuteBlocks_correct` then needs no invariant, and
+    `permuteBlocks_call` says every call gives the same outcome.
+  - **Dead-block removal** (`removeDeadBlocks`). The invariant is stated (`Opt/Reach.lean`,
+    `Reaches`): the running frame is at a kept block and every frame returns to one; it is
+    kept by every step when the kept blocks are closed under jumps (`step_reaches`). The pass
+    computes the blocks block 0 reaches and `checkDead` checks they are closed;
+    `removeDeadBlocks_correct` is under the invariant, `removeDeadBlocks_call` for every
+    call, where it holds of the start state.
+  - **Goto threading** (`Opt/Thread.lean`, `threadGotos`), by the stuttering form of `Sim`
+    (`Stutter`): one step of the target is `k + 1` steps of the source, `k` below a bound
+    `K`. The fuel is stated: a target run of `n` steps that ends is the source's run of
+    `K * n` (`Stutter.run_target`), and a source run of `n` steps that ends is the target's
+    run of `n` (`Stutter.run_source`). For threading `K` is 2.
+  - **Where these cover less than the Rust `SimplifyCfg`** (`optimize/cfg.rs`): it follows a
+    whole chain of gotos at once and threads a call's return target too (the specification
+    is one hop and leaves call targets, so that no state is renamed); it merges a block into
+    its only predecessor and turns a `switchInt` whose arms all agree into a `goto`; and
+    `remove_dead_blocks` merges every empty `unreachable` block into one. None of those is
+    specified, so `BlazeValidated` has no `after = spec before` pair for a CFG pass, and
+    `validate`'s normal form does not include them: `validate_sound` is equality of runs
+    with the same fuel from the same state, which a renumbering (the state is renamed) and
+    threading (the fuel differs) do not have. The witness validator is where they join.
+  - **Dead-store elimination is not written.** It needs a relation, not a map: two states
+    equal but on dead locals. The Rust pass (`optimize/dse.rs`) removes the whole assignment
+    of an rvalue it holds to be free of effects (all but a pointer-to-address cast), to a
+    local that is not live after and is never borrowed. In this semantics an rvalue can
+    panic (a checked operation, a division, an index), be undefined (an uninitialized or
+    moved-out read) or move, so the specification must either keep those or prove only a
+    refinement; and a read through a pointer must be shown never to reach a dead local,
+    which needs an invariant over every pointer a state holds (a never-borrowed local has
+    no pointer to it). Start: a relation on states `st ~[D] st'` (equal but on the slots
+    `D` of the running frame), the `Opt/Ctl.lean` lemmas for which frame that is, and
+    relational forms of `State.read`, `evalPlace` and `evalOperand` for places whose base is
+    outside `D`.
 - **A validator proved sound** (`Opt/Validate.lean`). `validate a b` accepts when the two
   programs have one normal form under the proved rewrites; `validate_sound`: an accepted
   pair runs alike for every fuel and state. It takes no witness and accepts only what the
-  normal form identifies. The witness form (a block mapping and per-block symbolic execution
-  to stores of expressions, sound through `Sim`) is not written; the inliner needs a
-  relation between one frame and two beyond that.
+  normal form identifies. The witness form is not written: a block map (`Renumbers` is its
+  shape: at `ρ fn b` the target has block `b`, here with its targets renamed, there with a
+  body that symbolic execution shows equal), per-block symbolic execution of straight-line
+  statements to a store of expressions over the block's initial locals, and soundness
+  through `Sim`, or `Stutter` when blocks were merged. The inliner needs a relation between
+  one frame and two beyond that; loop transforms need a witness that is not per block.
 - **The Rust passes are held to them by translation validation.** The test
   `the_passes_are_their_lean_specifications` and `mir_semantics.py validate` run each pass
   alone on runtime MIR, embed the body before and after, and Lean checks
