@@ -1234,7 +1234,7 @@ bitflags::bitflags! {
         /// `#[blaze::multiversion]`, a word or with a list of levels, on a function: a blaze
         /// extension (inert under rustc with `#![register_tool(blaze)]`), the function is
         /// compiled once per level of target features and the best one the CPU has is picked
-        /// when the program first needs it (docs/v2/plan/design/simd.md). The levels are
+        /// when the program starts (docs/v2/plan/design/simd.md). The levels are
         /// [`AttrFlags::multiversion_levels`]'s; it changes code generation only, never what
         /// the function means.
         const BLAZE_MULTIVERSION = 1 << 125;
