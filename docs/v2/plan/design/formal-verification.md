@@ -752,10 +752,9 @@ programs; it is the specification of the Rust pass of the same name.
     `execStmt_absorb`, the same with the entries the statement stores to leaving the list
     (`keepReps`), and `puts_append`, a replacement after the list as one more entry, which
     is what a removed store adds (not yet elaborated).
-  - **What to build, in order:** ~~`execStmt_put` for any frame~~ (a, above); the list of replacements with its commutation
-    through a statement; `checkLiveness` and its two facts (a local dead on entry and not
-    written is dead on exit; the removed store's local is dead after it); terminators,
-    calls and returns on related states; `removeDead_refines` through `run_refines_inv`
+  - **Left to build, in order:** (c) `checkLiveness` and its two facts (a local dead on entry and not
+    written is dead on exit; the removed store's local is dead after it); (d) terminators,
+    calls and returns on related states; (e) `removeDead_refines` through `run_refines_inv`
     with the invariant "related, and the source holds `Borrows`".
 - **A validator proved sound** (`Opt/Validate.lean`). `validate a b` accepts when the two
   programs have one normal form under the proved rewrites; `validate_sound`: an accepted
