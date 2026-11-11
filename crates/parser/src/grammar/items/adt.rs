@@ -226,7 +226,7 @@ fn tuple_field_list(p: &mut Parser<'_>) {
                 m.complete(p, MUT_RESTRICTION);
             }
 
-            if !p.at_ts(types::TYPE_FIRST) {
+            if !p.at_ts(types::TYPE_FIRST) && !types::at_record_type(p) {
                 p.error("expected a type");
                 if has_vis {
                     m.complete(p, ERROR);

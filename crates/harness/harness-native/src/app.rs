@@ -32,7 +32,10 @@ mod chat;
 mod floats;
 mod fold;
 mod keys;
+mod maps;
 pub use floats::Float;
+#[cfg(target_os = "macos")]
+pub use maps::{MapCard, Places};
 mod panes;
 mod pointer;
 mod row_menu;
@@ -41,6 +44,7 @@ mod sidebar;
 mod stats;
 pub use stats::TICK as STATS_TICK;
 mod ghostty;
+mod world;
 mod script;
 pub use keys::{MenuLine, Outcome};
 pub use sidebar::Wheel;
@@ -277,6 +281,12 @@ pub struct App {
     /// When cmd+N last asked for a new chat (the frame clock): an empty chat's lantern is struck again at it, so the
     /// key always shows, even on the chat that already is the new one.
     relit: f32,
+    /// The world api's calls waiting for the main thread (src/world_api.rs; None: not served), and how many scripts
+    /// its calls have run.
+    world_rx: Option<std::sync::mpsc::Receiver<crate::world_api::Pending>>,
+    world_scripts: u32,
+    /// The chat (its session) whose window the person asked to tuck away, until the window takes it ([`App::take_tuck`]).
+    tuck: Option<u64>,
     /// Remember the selected object in native.json (not for the offscreen shot).
     pub persist: bool,
     /// An offscreen shot's `HARNESS_NATIVE_SHOT_WORKING` (src/shot.rs): every session row and every run row shows at
@@ -323,6 +333,8 @@ pub struct App {
     screen: Option<[f32; 4]>,
     /// The windowed overlays the last frame drew, until the host takes them (src/app/floats.rs).
     floats: Vec<floats::Float>,
+    /// The map cards the last frame painted, until the host takes them (src/app/maps.rs).
+    maps: Vec<maps::MapCard>,
     /// The embedded browser: its link to the host, the pane, the views' input (app/browser.rs).
     browser: browser::Browser,
     /// A sidebar row's menu while it is open (a right press or a control-click on the row; src/app/row_menu.rs).
@@ -336,6 +348,28 @@ fn tone(w: WorldRef<'_>, name: &str) -> Fill {
 
 fn rgba(c: Rgba) -> [f32; 4] {
     [c.r, c.g, c.b, c.a]
+}
+
+/// Run `code` as the managed script `scene::<name>` in a [`scene_world`]. Err is flecs's error and line, under that name.
+pub fn load(world: &World, name: &str, code: &str) -> Result<(), String> {
+    let e = world.script_named(&format!("scene::{name}")).build_from_code(code);
+    script_error(*e).map_or(Ok(()), |err| Err(format!("scene script {name}: {err}")))
+}
+
+/// [`load`] from a file flecs reads (compiled in through `harness_native_ecs::embed_files`, or on disk), with what it
+/// `include`s: each include is a managed script of its own, so its error is on its own entity, not the includer's.
+pub fn load_file(world: &World, name: &str, path: &str) -> Result<(), String> {
+    let e = world.script_named(&format!("scene::{name}")).build_from_file(path);
+    if let Some(err) = script_error(*e) {
+        return Err(format!("scene script {path}: {err}"));
+    }
+    let mut bad = None;
+    world.new_query::<&flecs::Script>().each_entity(|e, _| {
+        if bad.is_none() {
+            bad = script_error(e).map(|err| format!("scene script {}: {err}", e.name()));
+        }
+    });
+    bad.map_or(Ok(()), Err)
 }
 
 fn script_error(e: EntityView<'_>) -> Option<String> {
@@ -372,8 +406,8 @@ fn tilde(p: &str) -> String {
 
 /// The app's world before anything runs in it: every component registered, the tokens, the primitives and the harness
 /// scene (with its included widget files) loaded. Err names the first script that failed and flecs's error. No window,
-/// Metal or daemon: the `scenes_load` test builds it headless.
-fn scene_world() -> Result<World, String> {
+/// Metal or daemon: the `scenes_load` test builds it headless, and harness-video loads a video's scene into it.
+pub fn scene_world() -> Result<World, String> {
     harness_native_ecs::init_os_api();
     harness_native_flecs::set_message_source(harness_native_ecs::last_error);
     // SAFETY: the OS API is set, and this binary links flecs (harness-native-ecs).
@@ -385,6 +419,7 @@ fn scene_world() -> Result<World, String> {
     crate::look::register(&world);
     archive::register(&world);
     browser::register(&world);
+    maps::register(&world);
     stats::register(&world);
     crate::keys::register(&world);
     view::register(&world);
@@ -400,29 +435,12 @@ fn scene_world() -> Result<World, String> {
     world.set(Clock::default());
     world.set(PointerState::default());
     world.set(Paint::default());
-    let mut scripts: Vec<(&str, &str)> = vec![("00-tokens", TOKENS)];
-    scripts.extend(harness_native_ui_prims::SCENES.iter().copied());
-    for (name, src) in scripts {
-        let e = world.script_named(&format!("scene::{name}")).build_from_code(src);
-        if let Some(err) = script_error(*e) {
-            return Err(format!("scene script {name}: {err}"));
-        }
+    load(&world, "00-tokens", TOKENS)?;
+    for (name, src) in harness_native_ui_prims::SCENES {
+        load(&world, name, src)?;
     }
     harness_native_ecs::embed_files(SCENE);
-    let e = world.script_named("scene::10-harness").build_from_file(SCENE[0].0);
-    if let Some(err) = script_error(*e) {
-        return Err(format!("scene script {}: {err}", SCENE[0].0));
-    }
-    // Each `include` is a managed script of its own, so its error is on its own entity, not the includer's.
-    let mut bad = None;
-    world.new_query::<&flecs::Script>().each_entity(|e, _| {
-        if bad.is_none() {
-            bad = script_error(e).map(|err| format!("scene script {}: {err}", e.name()));
-        }
-    });
-    if let Some(err) = bad {
-        return Err(err);
-    }
+    load_file(&world, "10-harness", SCENE[0].0)?;
     // The inline components' labels and marks (`<PR repo=.. n={..}/>` shows `#n`), for the typesetter, which reads no
     // world.
     harness_native_render::inline::install(world.world_ref());
@@ -589,6 +607,9 @@ impl App {
             pending_archive: false,
             pruned: false,
             relit: 0.0,
+            world_rx: None,
+            world_scripts: 0,
+            tuck: None,
             persist: true,
             shot_working: false,
             shot_plan: Vec::new(), // alloc: empty but in a shot
@@ -613,6 +634,7 @@ impl App {
             look,
             screen: None,
             floats: Vec::new(), // alloc: empty until an overlay's window shows
+            maps: Vec::new(), // alloc: empty until a cell draws a Map
             browser: browser::Browser::new(browser_wake, web_clip, web_pane),
             row_menu: None,
         };
@@ -1911,6 +1933,23 @@ impl App {
         self.palette = None;
     }
 
+    /// The chat the person asked to tuck the window away for, once.
+    pub fn take_tuck(&mut self) -> Option<u64> {
+        self.tuck.take()
+    }
+
+    /// What a tucked-away window's item shows for chat `sid` (src/window/mini.rs): the item of the step it is on while
+    /// its turn runs, `done` once it ended, `fail` when it ended on an error; and whether it still runs.
+    pub fn tucked(&self, sid: u64) -> (&'static str, bool) {
+        let chats = self.chats.borrow();
+        let Some(t) = chats.get(&sid) else { return ("done", false) };
+        if t.busy {
+            return (harness_native_render::block::item(chat::live_face()), true);
+        }
+        let failed = t.items.iter().rev().find(|i| !matches!(i, model::chat::Item::TurnEnd { .. })).is_some_and(|i| matches!(i, model::chat::Item::Error { .. }));
+        (if failed { "fail" } else { "done" }, false)
+    }
+
     // ---- the frame ----
 
     /// One frame at `points` (the window's size in points) on a display of `backing` pixels a point.
@@ -1926,6 +1965,7 @@ impl App {
         self.stats_begin();
         self.reload_keys_if_changed();
         self.reload_ghostty_if_changed();
+        self.step_world();
         let z = self.zoom();
         let view = (points.0 / z, points.1 / z);
         let scale = backing * z;
@@ -2270,6 +2310,9 @@ impl App {
             } else if let Some(target) = a.strip_prefix("open:") {
                 // A link in a view (in the browser pane), or a file (a cell's FileRef) in the app its kind opens in, at its line.
                 self.open_target(target, alt);
+            } else if a == "chat:tuck" {
+                // Put the window away until the chat in front is done (src/window/mini.rs).
+                self.tuck = self.focused_chat().map(|(_, _, sid)| sid);
             } else if a == "chat:focus" {
                 self.tree_focus = false;
             } else if a == "pal:close" {
@@ -2305,6 +2348,8 @@ impl App {
         let dark = self.dark;
         // The windowed overlays' draws (src/app/floats.rs), by their node, in the order they first paint.
         let mut floats: Vec<(u64, Draw)> = Vec::new(); // alloc: none, or an overlay window's draw or two a frame
+        // The Map cards painted in the main window, for the host to lay its maps over (src/app/maps.rs).
+        self.maps.clear();
         for (id, mut p) in painted {
             let w = self.world.world_ref();
             let e = w.entity_from_id(id);
@@ -2319,6 +2364,14 @@ impl App {
             // Nothing is drawn that cannot be seen, a terminal's thousands of cells least of all.
             if !seen(&p) {
                 continue;
+            }
+            // A Map's card: the host covers it with its map. One in a windowed overlay keeps its empty plate (a map is a
+            // view of the main window's).
+            if p.window == 0
+                && e.has(maps::MapPlaces::id())
+                && let Some(card) = maps::card(e, &p, [laid.x, laid.y, laid.w * p.scale, laid.h * p.scale], dark)
+            {
+                self.maps.push(card);
             }
             // A terminal's cells and a Kip's picture are drawn on the main window's pixel grid and passes only.
             if p.window != 0 && (is_term || e.has(harness_native_ui_text_api::Kip::id())) {
@@ -2436,6 +2489,20 @@ impl App {
                 .try_cloned::<&harness_native_ui_layout_api::ScrollState>()
                 .map_or(0.0, |s| s.y)
         )
+    }
+
+    /// Draw the sidebar's ground opaque: for a host with nothing blurred behind it (an offscreen shot, iOS). The theme's
+    /// `tone_sidebar` is a tint over the window's vibrancy (src/window.rs: the effect view under the Metal view); with
+    /// no vibrancy under it the tint would show whatever the host lays there instead, so the fold's clip (hn.SideClip,
+    /// whose Fill is the sidebar's ground) takes the same colour at alpha 1. The macOS window never calls this.
+    pub fn opaque_sidebar(&mut self) {
+        let w = self.world.world_ref();
+        let mut fill = crate::look::tone(w, "sidebar");
+        fill.dark.a = 1.0;
+        fill.light.a = 1.0;
+        if let Some(clip) = w.entity_from_id(self.ids.device).parent().and_then(|side| side.parent()) {
+            clip.set(fill);
+        }
     }
 
     /// Start with the sidebar folded away (`HARNESS_NATIVE_SIDEBAR=0`, for captures).
@@ -3064,10 +3131,7 @@ mod tests {
         let mut extra = vec![("20-keys", keys::KEYS), harness_native_ui_prims::GALLERY];
         extra.extend(harness_native_ui_prims::EXAMPLES.iter().copied());
         for (name, src) in extra {
-            let e = world.script_named(&format!("scene::{name}")).build_from_code(src);
-            if let Some(err) = script_error(*e) {
-                panic!("scene script {name}: {err}");
-            }
+            load(&world, name, src).unwrap_or_else(|e| panic!("{e}"));
         }
         let mut bad = Vec::new();
         world.new_query::<&flecs::Script>().each_entity(|e, _| {
@@ -3112,7 +3176,7 @@ mod tests {
             "hn.GenCanvas", "hn.GenShape", "hn.GenShapeBack", "hn.GenChart", "hn.GenChartPlot", "hn.GenChartTick",
             "hn.GenChartBar", "hn.GenChartGroup", "hn.GenChartStack", "hn.GenChartHit", "hn.GenChartLabel",
             "hn.GenChartLegend", "hn.GenChartKey", "hn.GenChartPie", "hn.GenChartCenter", "hn.GenTone.faint",
-            "hn.GenTone.series1", "hn.GenTone.series8", "ui.Browser", "hn.GenBrowser", "hn.WebClip", "hn.WebPane",
+            "hn.GenTone.series1", "hn.GenTone.series8", "ui.Browser", "hn.GenBrowser", "hn.GenMap", "hn.WebClip", "hn.WebPane",
             "hn.WebMenu", "hn.WebPopup", "ui.MenuItem", "ui.MenuNote", "ui.MenuSep", "hn.ChatMention", "hn.ChatMentionItem", "hn.ChatMentionHead", "hn.ChatMentionCode", "hn.ChatMentionImage", "hn.PeekList", "hn.PeekEntry", "hn.PeekMeta",
         ]
         .into_iter()

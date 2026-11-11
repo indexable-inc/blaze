@@ -221,6 +221,11 @@ pub struct GenericParams {
     /// The type parameters of the where predicates' `for<..>` binders, each predicate's a run
     /// ([`WherePredicate::TypeBound`]'s `binder`).
     pub(crate) binder_params: Arena<BinderParamData>,
+    /// The `where const { COND }` conditions (`#![feature(blaze_comptime)]`,
+    /// docs/v2/plan/design/ownership.md), in the order written: each a `bool` constant over
+    /// the generic parameters, an expression of the signature's store as a const argument is.
+    /// They are no [`WherePredicate`]: a condition bounds no type. Empty without the feature.
+    pub(crate) where_consts: Box<[ConstRef]>,
 }
 
 impl ops::Index<LocalTypeOrConstParamId> for GenericParams {
@@ -268,6 +273,7 @@ static EMPTY: std::sync::LazyLock<GenericParams> = std::sync::LazyLock::new(|| G
     where_predicates: Box::default(),
     early_bound_lifetimes_len: 0,
     binder_params: Arena::default(),
+    where_consts: Box::default(),
 });
 
 impl GenericParams {
@@ -411,7 +417,13 @@ impl GenericParams {
 
     #[inline]
     pub fn has_no_predicates(&self) -> bool {
-        self.where_predicates.is_empty()
+        self.where_predicates.is_empty() && self.where_consts.is_empty()
+    }
+
+    /// The `where const { COND }` conditions, in the order written.
+    #[inline]
+    pub fn where_consts(&self) -> &[ConstRef] {
+        &self.where_consts
     }
 
     #[inline]

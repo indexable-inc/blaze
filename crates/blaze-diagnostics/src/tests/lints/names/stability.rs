@@ -602,3 +602,50 @@ fn main() {
         checked.messages().into_iter().filter(|it| it.starts_with("deprecated")).collect();
     assert_eq!(messages, ["deprecated: use of deprecated function `dep::f`: n"]);
 }
+
+/// A crate whose `simd` module is unstable under `portable_simd`, as `core::simd` is, with
+/// `root` as the root of the crate that uses it: the E0658s of the use.
+fn portable_simd_gate(root: &str) -> Vec<String> {
+    let checked = checked(&format!(
+        r#"//- /dep.rs crate:dep edition:2021 library
+#![feature(staged_api)]
+#![stable(feature = "dep", since = "1.0.0")]
+#[unstable(feature = "portable_simd", issue = "86656")]
+pub mod simd {{
+    #[unstable(feature = "portable_simd", issue = "86656")]
+    pub struct Simd;
+    #[unstable(feature = "blaze_simd", issue = "none")]
+    pub fn native() {{}}
+}}
+//- /main.rs crate:other:main edition:2021 deps:dep
+{root}
+fn main() {{
+    let _ = dep::simd::Simd;
+    dep::simd::native();
+}}
+"#
+    ));
+    checked.messages().into_iter().filter(|it| it.starts_with("E0658")).collect()
+}
+
+/// `#![blaze::simd]` is the whole gate: the crate uses what is unstable under `portable_simd`
+/// and `blaze_simd` with no `#![feature]` (docs/v2/plan/design/simd.md).
+#[test]
+fn core_simd_needs_no_feature_under_blaze_simd() {
+    assert_eq!(portable_simd_gate("#![blaze::simd]"), Vec::<String>::new());
+}
+
+/// The control of the test above, and what `superset-of-rust` asks: a crate that does not opt
+/// in is refused exactly as before, and `#![feature(portable_simd)]` alone still opens only
+/// `portable_simd`.
+#[test]
+fn core_simd_without_blaze_simd_is_gated_as_before() {
+    let gated = portable_simd_gate("");
+    assert!(!gated.is_empty(), "no E0658 without the attribute");
+    assert!(gated.iter().all(|it| it.contains("`portable_simd`") || it.contains("`blaze_simd`")));
+    assert!(gated.iter().any(|it| it.contains("`portable_simd`")), "{gated:?}");
+    assert!(gated.iter().any(|it| it.contains("`blaze_simd`")), "{gated:?}");
+    let by_hand = portable_simd_gate("#![feature(portable_simd)]");
+    assert!(!by_hand.is_empty(), "blaze_simd is its own feature");
+    assert!(by_hand.iter().all(|it| it.contains("`blaze_simd`")), "{by_hand:?}");
+}

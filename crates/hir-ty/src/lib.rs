@@ -34,6 +34,7 @@ pub mod arbitrary_ints;
 pub mod autoderef;
 pub mod body_store;
 pub mod check_cache;
+pub mod const_exprs;
 pub mod const_param_ty;
 pub mod const_valtree;
 pub mod consteval;
@@ -46,16 +47,20 @@ pub mod dropck;
 pub mod dyn_compatibility;
 pub mod effects;
 pub mod evict;
+pub mod facts;
 pub mod fn_cache;
 pub mod lang_items;
 pub mod layout;
 pub mod method_resolution;
 pub mod mir;
+pub mod pattern_types;
 pub mod primitive;
 pub mod providers;
+pub mod record;
 pub mod solver_errors;
 pub mod traits;
 pub mod used_imports;
+pub mod where_const;
 
 #[cfg(test)]
 mod tests;
@@ -110,8 +115,8 @@ use crate::{
 pub use autoderef::autoderef;
 pub use infer::{
     Adjust, Adjustment, AutoBorrow, BindingMode, ByRef, CallArguments, ExplicitDropMethodUseKind,
-    InferenceDiagnostic, InferenceResult, OverloadedDeref, PointerCast, ReturnKind, StructPathDef,
-    StructPathFound, Unreachable, UnreachableAt,
+    InferenceDiagnostic, InferenceResult, NumericVar, OverloadedDeref, PointerCast, RecordProblem,
+    ReturnKind, StructPathDef, StructPathFound, Unreachable, UnreachableAt,
     cast::{CastError, CastPointerKind, CastPointers},
     could_coerce, could_unify, could_unify_deeply, infer_query_with_inspect,
     prelude_lints::{EditionLint, ReceiverAdjustment},
@@ -127,13 +132,19 @@ pub use lower::{
     diagnostics::*,
     elided_groups, elided_lifetimes, hir_mutability, hybrid_param_env, lower_mutability,
     persist::{BatchKind, ColdBatch, ColdBatchRef, PredicatesRec},
-    predicate_sources, solver_fn_sig, supertraits_cycle, with_elided_regions,
+    predicate_sources,
+    record::{
+        RecordParamDefault, record_defaults_owner, record_param_default, record_param_defaults,
+    },
+    solver_fn_sig, supertraits_cycle, with_elided_regions,
 };
 pub use opaques::{rpit_hidden_types, tait_hidden_types};
 pub use specialization::{
     SpecializationMode, impl_unconstrained_params, specialization_mode, specialized_ancestor,
 };
-pub use target_feature::{TargetFeature, TargetFeatureSet, TargetFeatures, crate_target_features};
+pub use target_feature::{
+    TargetFeature, TargetFeatureSet, TargetFeatures, crate_target_features, multiversion_plan,
+};
 pub use traits::{
     ParamEnvAndCrate, SealedOpen, check_orphan_rules, declares_sealed, param_is_sized,
     relaxed_uncovered_input, sealed_bounds, sealed_closure, sealed_in_graph, sealed_local_bound,

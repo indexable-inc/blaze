@@ -345,6 +345,63 @@ impl WorldRef<'_> {
         }
     }
 
+    /// Entity `path` (`hn.Theme.card`) as flecs's `ecs_entity_to_json` writes it: its parent and name, its tags and pairs,
+    /// and every component with its value, those it inherits from a prefab too. An error names a path nothing has.
+    #[cfg(feature = "json")]
+    pub fn entity_json(self, path: &str) -> Result<String, String> {
+        let w = self.raw().as_ptr();
+        // SAFETY: a live world; a zeroed desc is flecs's "unset"; the string is taken once.
+        unsafe {
+            let e = lookup(w, &cstr(path));
+            if e == 0 {
+                return Err(format!("the world has no entity `{path}`"));
+            }
+            let mut d: sys::ecs_entity_to_json_desc_t = core::mem::zeroed();
+            d.serialize_values = true;
+            d.serialize_full_paths = true;
+            d.serialize_inherited = true;
+            take(sys::ecs_entity_to_json(w, e, &d)).ok_or_else(|| format!("flecs could not serialize `{path}`"))
+        }
+    }
+
+    /// Write `json` into component `component` of entity `path` and tell what observes it: the members `json` names
+    /// change, the rest stay (a component the entity only inherited becomes its own first, with the inherited value). The
+    /// component's value after, as JSON.
+    ///
+    /// # Errors
+    /// Naming what refused: no such entity or component, a component with no data, one the host keeps
+    /// ([`HOST_OWNED`]: it writes it itself, so a write would be lost), or a value that does not fit its type.
+    #[cfg(feature = "json")]
+    pub fn set_json(self, path: &str, component: &str, json: &str) -> Result<String, String> {
+        let w = self.raw().as_ptr();
+        let text = CString::new(json).map_err(|_| format!("a value cannot hold a NUL: {json:?}"))?;
+        if self.host_owned(component) {
+            return Err(format!("`{component}` is the app's own ({HOST_OWNED}): it writes it itself, so a write to `{path}` would be lost"));
+        }
+        // SAFETY: a live world, outside a frame (not deferred); `ensure` gives the entity's own value of the component's
+        // size, live until the next structural change, which nothing here makes before it is read back.
+        unsafe {
+            let e = lookup(w, &cstr(path));
+            if e == 0 {
+                return Err(format!("the world has no entity `{path}`"));
+            }
+            let c = lookup(w, &cstr(component));
+            if c == 0 {
+                return Err(format!("the world has no component `{component}`"));
+            }
+            let info = sys::ecs_get_type_info(w, c);
+            if info.is_null() || (*info).size <= 0 {
+                return Err(format!("`{component}` holds no data (a tag): there is nothing to set on `{path}`"));
+            }
+            let p = sys::ecs_ensure_id(w, e, c, (*info).size as usize);
+            if p.is_null() || sys::ecs_ptr_from_json(w, c, p, text.as_ptr(), core::ptr::null()).is_null() {
+                return Err(format!("{json} does not fit `{component}` (its type: world.schema(\"{component}\"))"));
+            }
+            sys::ecs_modified_id(w, e, c);
+            take(sys::ecs_ptr_to_json(w, c, p)).ok_or_else(|| format!("flecs could not serialize `{component}` of `{path}`"))
+        }
+    }
+
     /// flecs's own `ecs_type_info_to_json` of component `name` (the json addon), which [`schema_json`](Self::schema_json)'s text
     /// for a type without den's marks equals but for spacing.
     #[cfg(feature = "json")]

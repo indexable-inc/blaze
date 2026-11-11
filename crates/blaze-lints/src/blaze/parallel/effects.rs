@@ -892,6 +892,12 @@ pub(crate) fn static_changes(db: &Db, krate: base_db::Crate, id: StaticId) -> bo
     {
         return true;
     }
+    interior_mutable(db, krate, id)
+}
+
+/// Whether the static `id`'s type has interior mutability: it is not `Freeze` (an atomic, a
+/// lock, a cell, or anything holding one), so a shared `&` to it can change it.
+pub(crate) fn interior_mutable(db: &Db, krate: base_db::Crate, id: StaticId) -> bool {
     let ty = db.type_for_static(id).skip_binder();
     !is_freeze(&infer_ctxt(db, krate), ty, ParamEnv::empty())
 }

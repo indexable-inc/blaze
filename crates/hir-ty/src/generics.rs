@@ -64,6 +64,11 @@ impl<'db> SingleGenerics<'db> {
         self.params.where_predicates().iter()
     }
 
+    /// The `where const { COND }` conditions, in the order written.
+    pub(crate) fn where_consts(&self) -> &'db [hir_def::hir::type_ref::ConstRef] {
+        self.params.where_consts()
+    }
+
     pub(crate) fn has_no_params(&self) -> bool {
         self.params.is_empty()
     }

@@ -612,6 +612,19 @@ pub fn structurally_relate_consts<I: Interner, R: TypeRelation<I>>(
         // While this is slightly incorrect, it shouldn't matter for `min_const_generics`
         // and is the better alternative to waiting until `generic_const_exprs` can
         // be stabilized.
+        // blaze: two generic const expressions that are different anonymous constants are
+        // one constant when they have one normal form (`Interner::same_const_expression`); so
+        // is one against the parameter or value it reduces to (`{ N + 0 }` and `N`).
+        _ if matches!(a.kind(), ty::ConstKind::Alias(..)) != matches!(b.kind(), ty::ConstKind::Alias(..))
+            && cx.same_const_expression(a, b) =>
+        {
+            true
+        }
+        (ty::ConstKind::Alias(_, au), ty::ConstKind::Alias(_, bu))
+            if au != bu && cx.same_const_expression(a, b) =>
+        {
+            true
+        }
         (ty::ConstKind::Alias(is_rigid_a, au), ty::ConstKind::Alias(is_rigid_b, bu)) => {
             // Users shouldn't know about this so the mismatch should be caught
             // during development rather than presented as type error.

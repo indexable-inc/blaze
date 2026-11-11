@@ -77,7 +77,8 @@ Left, each a known gap rather than a quiet difference:
   type_info tests do not use it.
 - `field_offset` called at run time (not in const) reaches codegen, which has no arm for it
   and stops with its unsupported-intrinsic error. rustc answers it in codegen by const eval.
-- `Type::of::<(A, B)>()` is refused, as rustc ICEs on it at the pinned nightly.
+- `Type::of::<(A, B)>()` was refused, as rustc ICEs on it at the pinned nightly; it now answers
+  `TypeKind::Tuple` (2026-11-10, for `bstd::own`'s walk).
 
 ## Phase 2: `#![feature(blaze_comptime)]`
 
@@ -374,6 +375,81 @@ The construct lives in `crates/hir-ty-mir`; the domain rule (which fields, which
 `Struct`/`Enum`) in a new front-end crate `crates/hir-ty-comptime`, which the solver's
 builtin candidates and the expansion both call, so the two cannot disagree.
 
+### Building a struct (2026-11-09)
+
+Decoding needs a `T` made field by field, which `x.[f]` cannot do: it is a place of a value that
+already exists. A closure cannot be the per-field callback (it is not generic, and each field
+has its own type), so the callback is a generic method, `take<F: Field<T>>`, and a library
+loop calls it once per field:
+
+```rust
+/// What `build` takes each field's value from: asked once per field, in declaration order.
+pub trait FieldSource<Base: ?Sized> {
+    type Error;
+    fn take<F: Field<Base>>(&mut self, field: F) -> Result<F::Type, Self::Error>;
+}
+
+/// A `T` whose every field, in declaration order, is what `source` gives for it.
+pub fn build<T: Struct, S: FieldSource<T>>(mut source: S) -> Result<T, S::Error> {
+    let mut out = MaybeUninit::<T>::uninit();
+    let base = out.as_mut_ptr();
+    // Drops the fields written so far, in declaration order, on an error or a panic in `take`.
+    let mut written = Written { out: base, count: 0, drop: drop_written::<T> };
+    for const f in fields_of::<T>() {
+        let value = source.take(f)?;
+        // SAFETY: `field_ptr` is `base` plus `<F as core::field::Field>::OFFSET`, a field of
+        // `T` of type `F::Type`, written once.
+        unsafe { field_ptr(base, f).write(value) };
+        written.count += 1;
+    }
+    mem::forget(written);
+    // SAFETY: the loop wrote every field of `T` exactly once.
+    Ok(unsafe { out.assume_init() })
+}
+```
+
+`drop_written::<T>(out, count)` is a `for const` loop that drops field `f` when
+`f.index() < count`; `Written`'s `Drop` calls it through the function pointer, so the guard
+needs no field binder of its own.
+
+Every field is produced exactly once, in declaration order, by construction: the loop is
+unrolled once per field with no early exit but the error's, and the source is asked for a
+given field and must return that field's type; it never picks one. That is checked when
+`build` is type-checked, once, not per `T`. Building a `#[blaze::reflect]` struct with private
+fields is the same consent as writing `x.[f] = ..`.
+
+**The primitive (no library could express it).** A decoder's `take` needs
+`F::Type: Decode` of its own `F`, which the caller has as `for<F: Field<T>> F::Type: Decode`:
+
+```rust
+impl<T> FieldSource<T> for Decoder<'_> where for<F: Field<T>> F::Type: Decode {
+    type Error = Short;
+    fn take<F: Field<T>>(&mut self, _: F) -> Result<F::Type, Short> { Decode::decode(&mut *self.0) }
+}
+```
+
+Inside `take`, `F` is a type parameter, and rule 1 above reached a field binder only through a
+loop's binder or the solver's placeholder member, so the binder said nothing of it; the impl
+cannot write `where F::Type: Decode` itself (E0276: stricter than the trait). The addition is
+rule 1 for a parameter: a function's environment with `P: Field<C>` (`P: Variant<C>`) has each
+field binder over `C` in that domain instantiated at `P`, elaborated
+(`hir_ty::comptime::with_member_bounds`, run by `param_env_from_clauses`, so inference, the
+MIR passes and the impl-method comparison all see it). Sound for the reason rule 1 is: whatever
+instantiates `P` proves `P: Field<C>`, so it is a member, and the binder holds of every member.
+An environment with no field binder is returned as it is, so a crate without the feature is
+unchanged. It is a general rule, not a construction form: any helper generic over one field
+(`fn encode_one<T, F: Field<T>>(..)`) gets the same.
+
+**Where it lives.** `build`, `FieldSource` and the guard are library code over `for const`,
+`fields_of`, `Field::OFFSET` and `MaybeUninit`; they belong to the serialization library
+(`bstd::data`), not `core::reflect`: a `for const` in `core` would need
+`#![feature(blaze_comptime)]` on `core`, which turns on phase 2b's dispatch check in `core`'s
+const bodies. The tests carry a copy (`crates/hir-ty-mir/src/tests/mir/comptime_codec.rs`).
+
+Not yet: building an enum's variant (`build::<V::View>` makes a `VariantOf<E, v>` but does not
+write its discriminant, and `core::field::Field` of an enum's field representing types is still
+refused, so `<F as Field>::Type` of a variant's field does not normalize).
+
 ### Enums
 
 ```rust
@@ -445,6 +521,12 @@ known at compile time.
 - Borrowck: `&mut x.[f]` twice in one iteration is refused; moving `x.[f]` out of `&T` is
   refused, naming the place.
 - `if const` pruning: a copy whose dead arm holds `const { panic!() }` builds.
+- The codec (`hir-ty-mir/src/tests/mir/comptime_codec.rs`): `field_names` and `encode` over a
+  struct of a `u8`, a string and a `bool` print the names and encodings in declaration order;
+  `decode` through `build` makes a struct, and when the input runs out at the third field drops
+  the two written, in order. `encode` of a struct with a field lacking `Encode` is refused at
+  the call naming the field (`hir-ty/src/tests/comptime_solver.rs`); a parameter `F: Field<T>`
+  gets the binders over `T`, and one of `Field<U>` does not (`comptime_infer.rs`).
 
 ### Work split (lanes for phase 2)
 
@@ -572,6 +654,29 @@ generic code can come later on top.
   owns (a `Box`, `Vec` or `String` by value, one behind `&mut` or behind an `UnsafeCell`) is
   `HeapInValue`, as today: each use of the constant would copy its owner, and a drop would free
   the constant's memory. Heap the value does not reach is dropped, as in any constant.
+
+### `where const { COND }` and names by id (2026-11-10)
+
+Two more pieces of the feature, for properties derived by a const walk over `type_info`
+([ownership](ownership.md) has the design, the coherence rule and the tests):
+
+- **`where const { COND }`**: a where predicate that is a `bool` constant over the generic
+  parameters, evaluated per instance. A blanket impl gated on it is how a reflection-derived
+  trait is stated (`unsafe impl<T: ?Sized> Acyclic for T where const { none::<T, Cycle>() } {}`).
+  A condition that panics does not hold, and its message is the reason the unmet bound's error
+  shows. `hir-def` `GenericParams::where_consts`, `ComptimeForm::WhereConst`;
+  `hir_ty::where_const`; the solver's `ConstEvaluatable` goal asks the delegate.
+- **`core::reflect::name_of(id)`** (intrinsic `blaze_type_name_of`): the type a `TypeId` is of,
+  as a diagnostic names it. A walk over ids names the types on its path with it.
+- **A constant of `TypeId`s read by another evaluation** (`walk(id::<T>(), &Q::ASK)`, where
+  `Q::ASK` holds ids): an id's bytes in the evaluator are its place in the list of the
+  evaluation that made it, and the constant carries what type each is of
+  (`ComplexMemoryMap::type_ids`). Copying the constant into a reader gives each id the walk by
+  type reaches the reader's id of the same type (`Evaluator::own_type_id`), so the value is the
+  same whoever reads it and nothing is evaluated twice. A constant whose type could hide an id
+  from that walk (a raw pointer, a `dyn`, a union that may hold one) is refused by name.
+- Phase 1 answers a tuple's `TypeKind` (`Tuple`), which it refused as rustc ICEs: a walk by
+  kind has to tell a tuple from what it cannot see into.
 
 ### Without the feature
 

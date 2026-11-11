@@ -20,6 +20,10 @@ pub fn run(path: &str) -> Result<(), String> {
     let mut renderer =
         Renderer::new(objc2_metal::MTLCreateSystemDefaultDevice().ok_or("no Metal device")?);
     let mut app = App::new(Arc::new(|| {}))?;
+    // The edits saved through the world api (src/world_api.rs), as a launch applies them.
+    app.replay_world();
+    // No window, so no vibrancy behind the sidebar: its ground is drawn opaque.
+    app.opaque_sidebar();
     app.persist = false;
     // The canvas is the screen: a windowed overlay is kept on it, as the window keeps one on its screen.
     app.set_screen([0.0, 0.0, w, h]);
@@ -39,6 +43,12 @@ pub fn run(path: &str) -> Result<(), String> {
     }
     // HARNESS_NATIVE_APPEARANCE=light: the light appearance (the window follows the system's or NSApp's).
     app.dark = std::env::var("HARNESS_NATIVE_APPEARANCE").as_deref() != Ok("light");
+    // HARNESS_NATIVE_SHOT_REDUCE_MOTION: drawn under Reduce Motion, as the window is when AppKit asks for it: Kip rests
+    // still, blinking only, so two builds' frames of him compare pixel for pixel (docs/future/gpu/shaders.md, "Verifying
+    // the port").
+    if std::env::var_os("HARNESS_NATIVE_SHOT_REDUCE_MOTION").is_some() {
+        app.set_reduce_motion(true);
+    }
     // HARNESS_NATIVE_SHOT_HEADROOM=h: a display with h times SDR white of room (an XDR screen at full brightness: 16).
     if let Some(h) = std::env::var("HARNESS_NATIVE_SHOT_HEADROOM").ok().and_then(|s| s.trim().parse::<f32>().ok()) {
         app.headroom = harness_native_render::hdr::Headroom { current: h, potential: h, reference: 0.0 };
@@ -337,6 +347,7 @@ pub fn run(path: &str) -> Result<(), String> {
     }
     // HARNESS_NATIVE_MENU_DUMP: the menu bar the window would have, read back from the NSMenu built from the keys.
     if std::env::var_os("HARNESS_NATIVE_MENU_DUMP").is_some() {
+        #[cfg(target_os = "macos")]
         eprint!("harness-native: menu bar\n{}", crate::window::dump_menu(&app.menu()));
     }
     Ok(())

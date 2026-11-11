@@ -675,6 +675,25 @@ fn arbitrary_ints_layout() {
     );
 }
 
+/// blaze: a refinement of an enum by a set of its variants (`#![blaze::pattern_types]`,
+/// docs/v2/plan/design/edition.md, section 8) has its enum's layout, field for field: a value
+/// widens to the enum for free, and a `&(E is ..)` is a `&E`.
+#[test]
+fn pattern_type_of_variants_has_its_enums_layout() {
+    let fixture = |goal: &str| {
+        format!(
+            "#![blaze::pattern_types]\n\
+             enum E {{ A(u32, u8), B, C {{ x: u64 }} }}\n\
+             type Goal = {goal};"
+        )
+    };
+    let base = eval_goal(&fixture("E"), "").unwrap();
+    for refined in ["E is E::A(..)", "E is E::A(_, _) | E::B", "E is E::C { .. }", "E is E::B"] {
+        let layout = eval_goal(&fixture(refined), "").unwrap();
+        assert_eq!(*layout, *base, "`{refined}` has the layout of `E`");
+    }
+}
+
 #[test]
 fn const_eval_simple() {
     size_and_align! {
@@ -766,4 +785,28 @@ fn core_mem_discriminant() {
         }
         struct Goal(core::mem::Discriminant<S>);
     }
+}
+
+/// blaze's records (`#![blaze::records]`): a record is laid out as the tuple of its fields in
+/// canonical order, so two records with the same fields have one layout whatever order they
+/// are written in, and it is the layout of the struct with those fields.
+#[test]
+fn a_record_has_one_layout_whatever_the_order_of_its_fields() {
+    #[allow(dead_code)]
+    struct Same {
+        a: u8,
+        b: u32,
+        c: u16,
+    }
+    let (size, align) = (size_of::<Same>() as u64, align_of::<Same>() as u64);
+    let minicore = "//- minicore: sized, record\n";
+    for goal in [
+        "#![blaze::records]\nstruct Goal({ a: u8, b: u32, c: u16 });",
+        "#![blaze::records]\nstruct Goal({ c: u16, b: u32, a: u8 });",
+        "#![blaze::records]\nstruct Goal { inner: { b: u32, a: u8, c: u16 } }",
+        "#![blaze::records]\ntype Goal = { b: u32, c: u16, a: u8 };",
+    ] {
+        check_size_and_align(goal, minicore, size, align);
+    }
+    check_size_and_align("#![blaze::records]\ntype Goal = {};", minicore, 0, 1);
 }

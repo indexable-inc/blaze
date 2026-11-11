@@ -17,6 +17,9 @@ pub const SCENES: &[(&str, &str)] = &[
     ("08-field", include_str!("../scene/field.flecs")),
     // The `ui.inline` module: inline components' vocabulary (harness-native-ui-inline is its grammar).
     ("08-inline", include_str!("../scene/inline.flecs")),
+    // The `cue.*` moves a timeline makes and the `voice.*` voices a sound is made in (harness-native-ui-timeline-api).
+    ("09-cue", include_str!("../scene/cue.flecs")),
+    ("09-voice", include_str!("../scene/voice.flecs")),
 ];
 
 /// The gallery scene: one of each primitive. Loaded by the gallery test and by a dev command, never by the app's scene.

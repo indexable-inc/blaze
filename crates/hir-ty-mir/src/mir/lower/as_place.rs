@@ -126,7 +126,10 @@ impl<'db> MirLowerCtx<'_, '_, 'db> {
                         },
                     )
                 }
-                Adjust::NeverToAny | Adjust::Borrow(_) | Adjust::Pointer(_) => try_rvalue(self),
+                Adjust::NeverToAny
+                | Adjust::Borrow(_)
+                | Adjust::Pointer(_)
+                | Adjust::ErrorUnion => try_rvalue(self),
             }
         } else {
             self.lower_expr_as_place_without_adjust(current, expr_id, upgrade_rvalue)

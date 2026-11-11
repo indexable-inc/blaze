@@ -65,7 +65,7 @@ pub use crate::{
         SyntaxNodeChildren, SyntaxToken, SyntaxTreeBuilder, Tree,
     },
 };
-pub use parser::{Edition, LexedStr, SyntaxKind, T};
+pub use parser::{Edition, Extensions, LexedStr, SyntaxKind, T};
 pub use rustc_literal_escaper as unescape;
 pub use smol_str::{SmolStr, SmolStrBuilder, ToSmolStr, format_smolstr};
 pub use syntax_tree::{
@@ -85,16 +85,20 @@ pub struct Parse<T> {
     /// The edition of an outline ([`SourceFile::parse_outline`]), in which its lazy bodies'
     /// errors are found when asked.
     outline: Option<Edition>,
+    /// The syntax extensions the text was parsed under (its crate's, `edition::Extensions`):
+    /// an outline's lazy bodies and every reparse use them too.
+    extensions: Extensions,
     _ty: PhantomData<fn() -> T>,
 }
 
 /// What the derived `PartialEq` compares, without bounding the marker `T`: the tree's content
-/// (never its address), the errors and the outline's edition.
+/// (never its address), the errors, the outline's edition and the extensions.
 impl<T> std::hash::Hash for Parse<T> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.tree.hash(state);
         self.errors.hash(state);
         self.outline.hash(state);
+        self.extensions.hash(state);
     }
 }
 
@@ -104,6 +108,7 @@ impl<T> Clone for Parse<T> {
             tree: self.tree.clone(),
             errors: self.errors.clone(),
             outline: self.outline,
+            extensions: self.extensions,
             _ty: PhantomData,
         }
     }
@@ -111,16 +116,27 @@ impl<T> Clone for Parse<T> {
 
 impl<T> Parse<T> {
     fn new(tree: Tree, errors: Vec<SyntaxError>) -> Parse<T> {
-        Parse::with_outline(tree, errors, None)
+        Parse::with_outline(tree, errors, None, Extensions::NONE)
     }
 
-    fn with_outline(tree: Tree, errors: Vec<SyntaxError>, outline: Option<Edition>) -> Parse<T> {
+    fn with_outline(
+        tree: Tree,
+        errors: Vec<SyntaxError>,
+        outline: Option<Edition>,
+        extensions: Extensions,
+    ) -> Parse<T> {
         Parse {
             tree: Some(tree),
             errors: if errors.is_empty() { None } else { Some(errors.into()) },
             outline,
+            extensions,
             _ty: PhantomData,
         }
+    }
+
+    /// The syntax extensions this was parsed under.
+    pub fn extensions(&self) -> Extensions {
+        self.extensions
     }
 
     fn take(&mut self) -> Parse<SyntaxNode> {
@@ -128,6 +144,7 @@ impl<T> Parse<T> {
             tree: self.tree.take(),
             errors: self.errors.take(),
             outline: self.outline,
+            extensions: self.extensions,
             _ty: PhantomData,
         }
     }
@@ -162,6 +179,7 @@ impl<T> Parse<T> {
             tree: std::sync::Arc::downgrade(self.tree.as_ref().unwrap().flat()),
             errors: self.errors.clone(),
             outline: self.outline,
+            extensions: self.extensions,
             _ty: PhantomData,
         }
     }
@@ -248,6 +266,7 @@ pub struct WeakParse<T> {
     tree: std::sync::Weak<FlatTree>,
     errors: Option<Arc<[SyntaxError]>>,
     outline: Option<Edition>,
+    extensions: Extensions,
     _ty: PhantomData<fn() -> T>,
 }
 
@@ -259,6 +278,7 @@ impl<T> WeakParse<T> {
             tree: Some(Tree::new(tree)),
             errors: self.errors.clone(),
             outline: self.outline,
+            extensions: self.extensions,
             _ty: PhantomData,
         })
     }
@@ -296,6 +316,7 @@ impl Parse<SyntaxNode> {
                 tree: self.tree.take(),
                 errors: self.errors.take(),
                 outline: self.outline,
+                extensions: self.extensions,
                 _ty: PhantomData,
             })
         } else {
@@ -344,9 +365,11 @@ impl Parse<SourceFile> {
             insert,
             self.errors.as_deref().unwrap_or_default().iter().cloned(),
             edition,
+            self.extensions,
             self.outline,
         )?;
-        Some(Parse::with_outline(Tree::new(std::sync::Arc::new(tree)), errors, self.outline))
+        let tree = Tree::new(std::sync::Arc::new(tree));
+        Some(Parse::with_outline(tree, errors, self.outline, self.extensions))
     }
 
     fn full_reparse(&self, delete: TextRange, insert: &str, edition: Edition) -> Parse<SourceFile> {
@@ -356,9 +379,14 @@ impl Parse<SourceFile> {
             insert,
             &source[usize::from(delete.end())..],
         ]);
+        self.parse_again(text, edition)
+    }
+
+    /// A whole parse of `text` of this parse's kind (an outline or not) and extensions.
+    fn parse_again(&self, text: Text, edition: Edition) -> Parse<SourceFile> {
         match self.outline {
-            Some(_) => SourceFile::parse_outline(text, edition),
-            None => SourceFile::parse_shared(text, edition),
+            Some(_) => SourceFile::parse_outline_with(text, edition, self.extensions),
+            None => SourceFile::parse_shared_with(text, edition, self.extensions),
         }
     }
 
@@ -391,15 +419,15 @@ impl Parse<SourceFile> {
         let text = text.into();
         let tree = self.tree.as_ref().unwrap().flat();
         let errors = self.errors.as_deref().unwrap_or_default().iter().cloned();
-        match parsing::incremental_reparse_onto(tree, delete, &text, errors, edition, self.outline)
-        {
+        let (extensions, outline) = (self.extensions, self.outline);
+        match parsing::incremental_reparse_onto(
+            tree, delete, &text, errors, edition, extensions, outline,
+        ) {
             Some((tree, errors, _reparsed)) => {
-                Parse::with_outline(Tree::new(std::sync::Arc::new(tree)), errors, self.outline)
+                let tree = Tree::new(std::sync::Arc::new(tree));
+                Parse::with_outline(tree, errors, outline, extensions)
             }
-            None => match self.outline {
-                Some(_) => SourceFile::parse_outline(text, edition),
-                None => SourceFile::parse_shared(text, edition),
-            },
+            None => self.parse_again(text, edition),
         }
     }
 
@@ -419,16 +447,22 @@ impl Parse<SourceFile> {
         let errors = self.errors.as_deref().unwrap_or_default().iter().cloned();
         let reparsed = match edits.is_empty() {
             true => None,
-            false => parsing::reparse_all(tree, edits, &text, errors, edition, self.outline),
+            false => parsing::reparse_all(
+                tree,
+                edits,
+                &text,
+                errors,
+                edition,
+                self.extensions,
+                self.outline,
+            ),
         };
         match reparsed {
             Some((tree, errors)) => {
-                Parse::with_outline(Tree::new(std::sync::Arc::new(tree)), errors, self.outline)
+                let tree = Tree::new(std::sync::Arc::new(tree));
+                Parse::with_outline(tree, errors, self.outline, self.extensions)
             }
-            None => match self.outline {
-                Some(_) => SourceFile::parse_outline(text, edition),
-                None => SourceFile::parse_shared(text, edition),
-            },
+            None => self.parse_again(text, edition),
         }
     }
 
@@ -448,9 +482,15 @@ impl ast::Expr {
     /// ast::Expr::parse("let fail = true;", Edition::CURRENT).tree();
     /// ```
     pub fn parse(text: &str, edition: Edition) -> Parse<ast::Expr> {
+        Self::parse_with(text, edition, Extensions::NONE)
+    }
+
+    /// [`ast::Expr::parse`] under `extensions`, the syntax extensions of the crate whose
+    /// source `text` is from.
+    pub fn parse_with(text: &str, edition: Edition, extensions: Extensions) -> Parse<ast::Expr> {
         let _p = tracing::info_span!(target: "blaze", "Expr::parse").entered();
-        let (tree, errors) =
-            parsing::parse_text_at(&text.into(), parser::TopEntryPoint::Expr, edition);
+        let entry = parser::TopEntryPoint::Expr;
+        let (tree, errors) = parsing::parse_text_at(&text.into(), entry, edition, extensions);
         let root = tree.root();
 
         assert!(
@@ -467,8 +507,9 @@ impl ast::MacroStmts {
     /// rustc retries an expansion that is no expression (`failed_to_match_macro`).
     pub fn parse(text: &str, edition: Edition) -> Parse<ast::MacroStmts> {
         let _p = tracing::info_span!(target: "blaze", "MacroStmts::parse").entered();
+        let entry = parser::TopEntryPoint::MacroStmts;
         let (tree, errors) =
-            parsing::parse_text_at(&text.into(), parser::TopEntryPoint::MacroStmts, edition);
+            parsing::parse_text_at(&text.into(), entry, edition, Extensions::NONE);
         assert_eq!(tree.root().kind(), SyntaxKind::MACRO_STMTS);
         Parse::new(tree, errors)
     }
@@ -520,12 +561,22 @@ impl SourceFile {
 
     /// A full parse of `text`, whose tree shares it: the parse costs the tree's arrays only.
     pub fn parse_shared(text: impl Into<Text>, edition: Edition) -> Parse<SourceFile> {
+        SourceFile::parse_shared_with(text, edition, Extensions::NONE)
+    }
+
+    /// [`SourceFile::parse_shared`] under a crate's syntax extensions (`edition::Extensions`):
+    /// with none, exactly that parse.
+    pub fn parse_shared_with(
+        text: impl Into<Text>,
+        edition: Edition,
+        extensions: Extensions,
+    ) -> Parse<SourceFile> {
         let _p = tracing::info_span!(target: "blaze", "SourceFile::parse").entered();
-        let (tree, errors) = parsing::parse_text(&text.into(), edition, false);
+        let (tree, errors) = parsing::parse_text(&text.into(), edition, extensions, false);
         let root = tree.root();
 
         assert_eq!(root.kind(), SyntaxKind::SOURCE_FILE);
-        Parse::new(tree, errors)
+        Parse::with_outline(tree, errors, None, extensions)
     }
 
     /// An outline of `text`, for the files of dependency crates (#1294): every `fn` item's body
@@ -534,12 +585,22 @@ impl SourceFile {
     /// tokens could parse otherwise alone (`parser::lazy_block_len`) is parsed in full here.
     /// Its errors: [`Parse::errors`], [`Parse::errors_with_bodies`].
     pub fn parse_outline(text: impl Into<Text>, edition: Edition) -> Parse<SourceFile> {
+        SourceFile::parse_outline_with(text, edition, Extensions::NONE)
+    }
+
+    /// [`SourceFile::parse_outline`] under a crate's syntax extensions, which its lazy bodies
+    /// are parsed under too.
+    pub fn parse_outline_with(
+        text: impl Into<Text>,
+        edition: Edition,
+        extensions: Extensions,
+    ) -> Parse<SourceFile> {
         let _p = tracing::info_span!(target: "blaze", "SourceFile::parse_outline").entered();
-        let (tree, errors) = parsing::parse_text(&text.into(), edition, true);
+        let (tree, errors) = parsing::parse_text(&text.into(), edition, extensions, true);
         let root = tree.root();
 
         assert_eq!(root.kind(), SyntaxKind::SOURCE_FILE);
-        Parse::with_outline(tree, errors, Some(edition))
+        Parse::with_outline(tree, errors, Some(edition), extensions)
     }
 }
 

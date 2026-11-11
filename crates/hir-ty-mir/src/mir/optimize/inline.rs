@@ -367,6 +367,11 @@ impl<'a, 'f, 'db> Inliner<'a, 'f, 'db> {
         for &digest in &callee.inlined.devirtualized {
             body.inlined.read_devirt(digest);
         }
+        // The same of the facts the callee's body relied on (`SpendFacts`): its copy here is
+        // the code they changed.
+        for &digest in &callee.inlined.relied {
+            body.inlined.rely(digest);
+        }
         // `monomorphized` instantiated the arguments of the callee's own inlined callees.
         let nested: SmallVec<[u32; 8]> = callee
             .inlined

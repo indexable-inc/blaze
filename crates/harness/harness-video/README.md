@@ -23,13 +23,17 @@ sheets stay 8-bit sRGB PNG, clipped to SDR. `scene/launch.flecs` is 960 x 540 po
 
 - The root node carries `Video: {width, height, fps, seconds, scale}`: the frame in points, drawn at `scale` pixels a
   point (`960 x 540` at 2 is 1920 x 1080).
-- `tokens.flecs` beside the scene holds the names the prims read (tones, radii, sizes, springs, and the `Strong`,
-  `Ink`, `Muted`, `Accent`, `Wash`, `Plate` prefabs); it loads before the prims and the scene.
+- A scene is loaded into the app's own world (`harness_native::scene::world`), so it names the app's tokens
+  (`harness-native/scene/00-tokens.flecs`: `$tone_ground`, `$size_body`...), the `ui.*` prims and the app's `hn.*`
+  widgets (`hn.Badge`, a chat's bubble, a tree row) exactly as the app does: a video of the app is made of the app's
+  parts, and nothing is copied. What is only the video's (its own colours and sizes) goes in a token file beside the
+  scene that the scene includes (`include tokens`; `scene/tokens.flecs` is the launch video's).
 - Motion is data. A `Cue` child moves one member of its node, named by path, over a stretch of the clock:
   `{ Cue: {member: "Pose.fade", from: 1, to: 0, at: 0.5, dur: 0.4, ease: Out} }`. Any numeric member of any reflected
   component can be cued: `Size.w.value` relays out the neighbours, `Pose` (`dx`, `dy`, `shrink`, `fade`, `cut`) moves,
-  scales, fades or types on only the node and what is under it. Cues on one member take turns by `at`. Templates name the
-  moves a video makes (`cue.FadeIn show(at: 2.0)`; see `scene/launch.flecs`).
+  scales, fades or types on only the node and what is under it. Cues on one member take turns by `at`. The `cue.*`
+  templates name the moves (`cue.FadeIn show(at: 2.0)`, `cue.FadeOut`, `cue.PushIn`), shared with every host in
+  `harness-native-ui-prims/scene/cue.flecs`; a move a scene needs twice goes there.
 - `BlazeMark: {start, exit, glow}` is blaze's wordmark set on fire, live (`harness-native-blaze`, ported from
   indexable-inc/anim): its letters drop in from the top of the frame at `start`, the fire catches, and from `exit` the
   letters burn into embers. Its soundtrack (the landings climbing to A major, the physically modelled fire, the burn) is
@@ -38,9 +42,9 @@ sheets stay 8-bit sRGB PNG, clipped to SDR. `scene/launch.flecs` is 960 x 540 po
   HDR10 peak over 203-nit white), drawn as a light layer over the mark; the UI stays at white.
 - Sound is data, one component per concern: `Sound: {voice}` (`Bell`, `Mallet`, `Bass`, `Click`, `Thud`, `Whoosh`,
   `Fire`), `Onset: {at}`, `Lasts: {dur}`, `Pitch: {hz}`, `Gain: {amp}`, `Pan: {pos, sweep}` (-1 the frame's left edge,
-  1 its right; `sweep` moves it). `src/sound.flecs` (loaded before every scene) has a `sound.*` prefab per voice with its
+  1 its right; `sweep` moves it). `harness-native-ui-prims/scene/voice.flecs` has a `voice.*` prefab per voice with its
   defaults, so an instance sets only its onset and what differs:
-  `ding : sound.Bell {` then `Onset: {at: 2.0}` and `Pitch: {hz: 1760}` on their own lines, `}`. They mix in the same room as
+  `ding : voice.Bell {` then `Onset: {at: 2.0}` and `Pitch: {hz: 1760}` on their own lines, `}`. Only sounds under the frame (the node with the `Video`) are the video's. They mix in the same room as
   the mark's score, and every voice, the mark's included, is placed binaurally (a spherical head: the delay around it
   and its shadow on the far ear), so on headphones a sound comes from where it is on screen; on speakers it is an
   ordinary stereo mix.

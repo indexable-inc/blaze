@@ -11,22 +11,36 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const SHADERS: [&str; 2] = ["harness", "mascot"];
+/// The shaders still compiled from Slang. Each is being ported to Rust in harness-native-shaders
+/// (docs/future/gpu/shaders.md); one leaves this list when blaze's device build of its Rust port
+/// exists and the offscreen shots of the two match, and its pass then takes the MSL blaze wrote
+/// (`BLAZE_GPU_MSL_HARNESS_NATIVE_SHADERS`) and binds through the slots its Rust signatures
+/// generated. Never both: a shader off this list whose Rust build fails fails the build, naming it.
+/// mascot left first (phase 3): Kip's pass (src/kip.rs) takes harness-native-shaders' `mascot`
+/// from the device build, and shaders/mascot.slang is gone.
+const SLANG: [&str; 1] = ["harness"];
 
 fn main() {
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=shaders");
     println!("cargo:rerun-if-env-changed=SLANGC");
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
-        panic!("harness-native-render is macOS only (AppKit + Metal)");
-    }
-    for name in SHADERS {
-        slang(&out, name);
+    // The SDK whose Metal compiler builds the library: the Mac's, an iPhone's, or the iOS simulator's.
+    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let abi = std::env::var("CARGO_CFG_TARGET_ABI").unwrap_or_default();
+    let (sdk, min) = match (os.as_str(), abi.as_str()) {
+        ("macos", _) => ("macosx", None),
+        // Metal 3.1 is iOS 17's: the library says the oldest OS it loads on.
+        ("ios", "sim") => ("iphonesimulator", Some("-mios-simulator-version-min=17.0")),
+        ("ios", _) => ("iphoneos", Some("-mios-version-min=17.0")),
+        _ => panic!("harness-native-render draws with Metal: it builds for macOS and iOS, not {os}"),
+    };
+    for name in SLANG {
+        slang(&out, name, sdk, min);
     }
 }
 
-fn slang(out: &Path, name: &str) {
+fn slang(out: &Path, name: &str, sdk: &str, min: Option<&str>) {
     let src = PathBuf::from(format!("shaders/{name}.slang"));
     let text =
         std::fs::read_to_string(&src).unwrap_or_else(|e| panic!("read {}: {e}", src.display()));
@@ -45,7 +59,8 @@ fn slang(out: &Path, name: &str) {
     let air = out.join(format!("{name}.air"));
     run(
         Command::new("xcrun")
-            .args(["-sdk", "macosx", "metal", "-c", "-std=metal3.1", "-ffast-math"])
+            .args(["-sdk", sdk, "metal", "-c", "-std=metal3.1", "-ffast-math"])
+            .args(min)
             .arg(&msl)
             .arg("-o")
             .arg(&air),
@@ -53,7 +68,7 @@ fn slang(out: &Path, name: &str) {
     );
     run(
         Command::new("xcrun")
-            .args(["-sdk", "macosx", "metallib"])
+            .args(["-sdk", sdk, "metallib"])
             .arg(&air)
             .arg("-o")
             .arg(out.join(format!("{name}.metallib"))),

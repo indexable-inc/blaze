@@ -180,6 +180,6 @@ fn push_ty_pat<I: Interner>(stack: &mut TypeWalkerStack<I>, pat: I::Pat) {
                 push_ty_pat::<I>(stack, pat)
             }
         }
-        ty::PatternKind::NotNull => {}
+        ty::PatternKind::NotNull | ty::PatternKind::Variant { .. } => {}
     }
 }

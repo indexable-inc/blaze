@@ -44,7 +44,8 @@ use crate::{
         Adjust, Adjustment, AllowTwoPhase, AutoBorrow, AutoBorrowMutability, CallArguments,
         CaptureInfo, CaptureSourceStack, CapturedPlace, ClosureData, ComptimeLoop,
         ExplicitDropMethodUseKind, InferenceDiagnostic, InferenceResult, MinCaptures,
-        OverloadedDeref, PatAdjust, PatAdjustment, PointerCast, ReturnKind, StructPathDef,
+        OverloadedDeref, PatAdjust, PatAdjustment, PointerCast, RecordProblem, ReturnKind,
+        StructPathDef,
         StructPathFound, Unreachable, UnreachableAt, UpvarCapture,
         cast::{CastError, CastPointerKind, CastPointers},
         closure::analysis::{
@@ -417,7 +418,7 @@ fn candidate_of(tag: u8, bits: u64) -> Option<CandidateId> {
 }
 
 /// Every [`Adjust`], by its code.
-const ADJUSTS: [Adjust; 16] = [
+const ADJUSTS: [Adjust; 17] = [
     Adjust::NeverToAny,
     Adjust::Deref(None),
     Adjust::Deref(Some(OverloadedDeref(Mutability::Not))),
@@ -438,6 +439,7 @@ const ADJUSTS: [Adjust; 16] = [
     Adjust::Pointer(PointerCast::MutToConstPointer),
     Adjust::Pointer(PointerCast::ArrayToPointer),
     Adjust::Pointer(PointerCast::Unsize),
+    Adjust::ErrorUnion,
 ];
 
 fn adjust_code(adjust: &Adjust) -> u8 {
@@ -462,6 +464,7 @@ fn adjust_code(adjust: &Adjust) -> u8 {
         Adjust::Pointer(PointerCast::MutToConstPointer) => 13,
         Adjust::Pointer(PointerCast::ArrayToPointer) => 14,
         Adjust::Pointer(PointerCast::Unsize) => 15,
+        Adjust::ErrorUnion => 16,
     }
 }
 
@@ -1033,7 +1036,11 @@ impl Persist for InferenceRecord {
         // 25: `comptime_loops`, after the named pattern types in the side table words.
         // 26: `SolverDiagnosticKind::ReflectedMemberUnmet` (solver kind 9).
         // 27: `InferenceDiagnostic::PrivateField::at`, an `offset_of!` field's position.
-        Part::U64(27),
+        // 28: `InferenceDiagnostic::WholeValueWriteThroughRefinement` (tag 90) and
+        //     `Adjust::ErrorUnion` (adjust code 16).
+        // 29: `InferenceDiagnostic::UnresolvedMethodCall::numeric_var`.
+        // 30: `InferenceDiagnostic::RecordRefused` (tag 81).
+        Part::U64(30),
         Part::Schema(<InferRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = InferenceRecordRef<'a>;
@@ -2271,6 +2278,7 @@ impl Sink {
                 name,
                 field_with_same_name,
                 assoc_func_with_same_name,
+                numeric_var,
             } => {
                 self.words.extend([9, local(*expr)]);
                 self.ty(tys, receiver);
@@ -2283,6 +2291,11 @@ impl Sink {
                         self.id(*it);
                     }
                 }
+                self.word(match numeric_var {
+                    None => 0,
+                    Some(crate::infer::NumericVar::Integer) => 1,
+                    Some(crate::infer::NumericVar::Float) => 2,
+                });
             }
             D::UnresolvedAssocItem { id, ty, name } => {
                 self.word(10);
@@ -2315,10 +2328,38 @@ impl Sink {
                     ComptimeForm::ReflectedField => 1,
                     ComptimeForm::BinderBound => 2,
                     ComptimeForm::Block => 3,
+                    ComptimeForm::WhereConst => 4,
                 };
                 self.words.extend([80, local(*expr), form]);
             }
             D::NonExhaustiveRecordExpr { expr } => self.words.extend([13, local(*expr)]),
+            D::RecordRefused { node, problem } => {
+                self.word(81);
+                self.node(*node);
+                match problem {
+                    RecordProblem::NotEnabled => self.word(0),
+                    RecordProblem::TypeUnknown => self.word(1),
+                    RecordProblem::NotARecord => self.word(2),
+                    RecordProblem::NoSuchField(name) => {
+                        self.word(3);
+                        self.name(name);
+                    }
+                    RecordProblem::DuplicateField(name) => {
+                        self.word(4);
+                        self.name(name);
+                    }
+                    RecordProblem::MissingField(name) => {
+                        self.word(5);
+                        self.name(name);
+                    }
+                    RecordProblem::MissingDefault { field, function } => {
+                        self.word(6);
+                        self.name(field);
+                        self.id(*function);
+                    }
+                    RecordProblem::NoCallee => self.word(7),
+                }
+            }
             D::NonExhaustiveRecordPat { pat, variant } => {
                 self.words.extend([14, local(*pat)]);
                 self.variant(*variant);
@@ -2634,6 +2675,10 @@ impl Sink {
             D::SelfCtorNotTupleOrUnit { expr, self_ty } => {
                 self.words.extend([55, local(*expr)]);
                 self.ty(tys, self_ty);
+            }
+            D::WholeValueWriteThroughRefinement { place, ty } => {
+                self.words.extend([90, local(*place)]);
+                self.ty(tys, ty);
             }
         }
     }
@@ -3362,6 +3407,12 @@ impl Source<'_> {
                     1 => Some(self.id()?),
                     _ => return Err(self.invalid("an optional function of no kind")),
                 },
+                numeric_var: match self.word()? {
+                    0 => None,
+                    1 => Some(crate::infer::NumericVar::Integer),
+                    2 => Some(crate::infer::NumericVar::Float),
+                    _ => return Err(self.invalid("a numeric variable of no kind")),
+                },
             },
             10 => {
                 D::UnresolvedAssocItem { id: self.node()?, ty: self.ty(tys)?, name: self.name()? }
@@ -3382,10 +3433,25 @@ impl Source<'_> {
                     1 => ComptimeForm::ReflectedField,
                     2 => ComptimeForm::BinderBound,
                     3 => ComptimeForm::Block,
+                    4 => ComptimeForm::WhereConst,
                     _ => return Err(self.invalid("a comptime form of no kind")),
                 },
             },
             13 => D::NonExhaustiveRecordExpr { expr: self.local()? },
+            81 => D::RecordRefused {
+                node: self.node()?,
+                problem: match self.word()? {
+                    0 => RecordProblem::NotEnabled,
+                    1 => RecordProblem::TypeUnknown,
+                    2 => RecordProblem::NotARecord,
+                    3 => RecordProblem::NoSuchField(self.name()?),
+                    4 => RecordProblem::DuplicateField(self.name()?),
+                    5 => RecordProblem::MissingField(self.name()?),
+                    6 => RecordProblem::MissingDefault { field: self.name()?, function: self.id()? },
+                    7 => RecordProblem::NoCallee,
+                    _ => return Err(self.invalid("a record refused for no reason")),
+                },
+            },
             14 => D::NonExhaustiveRecordPat { pat: self.local()?, variant: self.variant()? },
             15 => D::UnionPatMustHaveExactlyOneField { pat: self.local()? },
             16 => D::UnionPatHasRest { pat: self.local()? },
@@ -3685,6 +3751,7 @@ impl Source<'_> {
             54 => D::FnTraitArgsNotTuple { call_expr: self.local()? },
             55 => D::SelfCtorNotTupleOrUnit { expr: self.local()?, self_ty: self.ty(tys)? },
             56 => D::TyvarBehindRawPointer { span: self.span()? },
+            90 => D::WholeValueWriteThroughRefinement { place: self.local()?, ty: self.ty(tys)? },
             _ => return Err(self.invalid("an inference diagnostic of no kind")),
         })
     }
@@ -4058,6 +4125,7 @@ mod tests {
                 name: Name::new_root("frobnicate"),
                 field_with_same_name: Some(ty(types.unit)),
                 assoc_func_with_same_name: Some(FunctionId::from_id(id(7))),
+                numeric_var: Some(crate::infer::NumericVar::Float),
             },
             D::UnresolvedMethodCall {
                 expr: expr(6),
@@ -4065,6 +4133,15 @@ mod tests {
                 name: Name::new_root(""),
                 field_with_same_name: None,
                 assoc_func_with_same_name: None,
+                numeric_var: None,
+            },
+            D::UnresolvedMethodCall {
+                expr: expr(6),
+                receiver: ty(types.i32),
+                name: Name::new_root("saturating_add"),
+                field_with_same_name: None,
+                assoc_func_with_same_name: None,
+                numeric_var: Some(crate::infer::NumericVar::Integer),
             },
             D::UnresolvedAssocItem {
                 id: pat(6).into(),
@@ -4099,6 +4176,7 @@ mod tests {
             D::InheritedRefMutabilityMismatch { pat: pat(3) },
             D::FnTraitArgsNotTuple { call_expr: expr(9) },
             D::SelfCtorNotTupleOrUnit { expr: expr(2), self_ty: ty(types.never) },
+            D::WholeValueWriteThroughRefinement { place: expr(3), ty: ty(types.never) },
             D::NotAStructPath {
                 node: pat(2).into(),
                 found: StructPathFound::TypeRelative(StructPathDef::SelfCtor),
@@ -4110,6 +4188,29 @@ mod tests {
             D::AsyncCoroutinesNotSupported { expr: expr(10) },
             D::ComptimeNotYetSupported { expr: expr(9), form: ComptimeForm::ReflectedField },
             D::NonExhaustiveRecordExpr { expr: expr(9) },
+            D::RecordRefused { node: expr(9).into(), problem: RecordProblem::NotEnabled },
+            D::RecordRefused { node: pat(3).into(), problem: RecordProblem::TypeUnknown },
+            D::RecordRefused { node: pat(3).into(), problem: RecordProblem::NotARecord },
+            D::RecordRefused {
+                node: expr(9).into(),
+                problem: RecordProblem::NoSuchField(Name::new_root("mod")),
+            },
+            D::RecordRefused {
+                node: expr(9).into(),
+                problem: RecordProblem::DuplicateField(Name::new_root("mode")),
+            },
+            D::RecordRefused {
+                node: pat(3).into(),
+                problem: RecordProblem::MissingField(Name::new_root("mode")),
+            },
+            D::RecordRefused {
+                node: expr(9).into(),
+                problem: RecordProblem::MissingDefault {
+                    field: Name::new_root("path"),
+                    function: FunctionId::from_id(id(7)),
+                },
+            },
+            D::RecordRefused { node: expr(9).into(), problem: RecordProblem::NoCallee },
             D::NonExhaustiveRecordPat { pat: pat(7), variant },
             D::UnionPatMustHaveExactlyOneField { pat: pat(8) },
             D::UnionPatHasRest { pat: pat(9) },

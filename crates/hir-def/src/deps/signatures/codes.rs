@@ -125,6 +125,7 @@ fn in_store(store: &ExpressionStore, params: &GenericParams, bounds: &[TypeBound
     for (_, param) in params.binder_params.iter() {
         param.bounds.iter().try_for_each(|bound| types.check_outside_bound(bound, lifetimes))?;
     }
+    params.where_consts.iter().try_for_each(|&it| ids.konst(it))?;
     bounds.iter().try_for_each(|bound| types.check_outside_bound(bound, lifetimes))
 }
 
@@ -308,6 +309,7 @@ impl Code for GenericParams {
         w.put(&self.where_predicates);
         w.put(&self.early_bound_lifetimes_len);
         put_arena(w, &self.binder_params);
+        w.put(&self.where_consts);
     }
 
     fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
@@ -317,6 +319,7 @@ impl Code for GenericParams {
             where_predicates: r.get()?,
             early_bound_lifetimes_len: r.get()?,
             binder_params: get_arena(r)?,
+            where_consts: r.get()?,
         })
     }
 }

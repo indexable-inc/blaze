@@ -151,6 +151,55 @@ pub(crate) fn crate_data(db: &Db, krate: Crate) -> Arc<DefMapCrateData> {
             crate_data.arbitrary_ints = true;
             continue;
         }
+        // `#![blaze::handles]`: a handle that would be moved and is used again is copied
+        // (`DefMap::handles`, docs/v2/plan/design/edition.md, change 1).
+        if let [tool, name] = attr.path.segments()
+            && tool.symbol().as_str() == "blaze"
+            && name.symbol().as_str() == "handles"
+        {
+            crate_data.handles = true;
+            continue;
+        }
+        // `#![blaze::views]`: a receiver may name the fields it borrows, `&self.{a, b}`
+        // (`DefMap::views`, docs/v2/plan/design/edition.md, change 3).
+        if let [tool, name] = attr.path.segments()
+            && tool.symbol().as_str() == "blaze"
+            && name.symbol().as_str() == "views"
+        {
+            crate_data.views = true;
+            continue;
+        }
+        // `#![blaze::pattern_types]`: `T is PAT` types and variant refinements in this crate
+        // (`DefMap::pattern_types`, docs/v2/plan/design/edition.md, section 8).
+        if let [tool, name] = attr.path.segments()
+            && tool.symbol().as_str() == "blaze"
+            && name.symbol().as_str() == "pattern_types"
+        {
+            crate_data.pattern_types = true;
+            continue;
+        }
+        // `#![blaze::simd]`: the pinned nightly's `core::simd` and blaze's additions to it
+        // (`core::simd::native_lanes!`) need no `#![feature]` in this crate. The two library
+        // features are entered as if written, so every stability check reads them as it reads
+        // any other; nothing else of the crate changes (docs/v2/plan/design/simd.md).
+        if let [tool, name] = attr.path.segments()
+            && tool.symbol().as_str() == "blaze"
+            && name.symbol().as_str() == "simd"
+        {
+            for feature in ["portable_simd", "blaze_simd"] {
+                crate_data.unstable_features.enable(Symbol::intern(feature));
+            }
+            continue;
+        }
+        // `#![blaze::early_drop]`: a local whose destructor only frees memory is dropped after
+        // its last use (`DefMap::early_drop`, docs/v2/plan/design/early-drop.md).
+        if let [tool, name] = attr.path.segments()
+            && tool.symbol().as_str() == "blaze"
+            && name.symbol().as_str() == "early_drop"
+        {
+            crate_data.early_drop = true;
+            continue;
+        }
         let Some(attr_name) = attr.path.as_ident() else { continue };
 
         match () {

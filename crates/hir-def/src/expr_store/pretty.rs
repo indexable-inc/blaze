@@ -337,10 +337,20 @@ pub fn print_function(
 }
 
 fn print_where_clauses(db: &Db, generic_params: &GenericParams, p: &mut Printer<'_>) {
-    if !generic_params.where_predicates.is_empty() {
+    if !generic_params.has_no_predicates() {
         w!(p, "\nwhere\n");
         p.indented(|p| {
+            // `where const { COND }` conditions first: they bound no type.
+            for (i, condition) in generic_params.where_consts.iter().enumerate() {
+                if i != 0 {
+                    w!(p, ",\n");
+                }
+                w!(p, "const ");
+                p.print_expr(condition.expr);
+            }
+            let after_conditions = !generic_params.where_consts.is_empty();
             for (i, pred) in generic_params.where_predicates.iter().enumerate() {
+                let i = i + usize::from(after_conditions);
                 if i != 0 {
                     w!(p, ",\n");
                 }
@@ -1430,6 +1440,29 @@ impl Printer<'_> {
                 self.print_type_ref(ty);
                 w!(self, " is ");
                 self.print_pat(pat);
+            }
+            TypeRef::Union(members) => {
+                for (i, member) in members.iter().enumerate() {
+                    if i != 0 {
+                        w!(self, " | ");
+                    }
+                    self.print_type_ref(*member);
+                }
+            }
+            TypeRef::Record { names, types, defaults } => {
+                // As written: `{ a: T, b: U = default }`, and `{}` for no field.
+                w!(self, "{{");
+                for at in 0..types.len() {
+                    // alloc: printing, the edge; `w!` borrows `self` mutably.
+                    let name = self.store.names(names)[at].display(self.db, self.edition).to_string();
+                    w!(self, "{}{}: ", if at == 0 { " " } else { ", " }, name);
+                    self.print_type_ref(types[at]);
+                    if let Some(default) = defaults.get(at) {
+                        w!(self, " = ");
+                        self.print_expr(default.expr);
+                    }
+                }
+                w!(self, "{}", if types.is_empty() { "}" } else { " }" });
             }
             TypeRef::UnsafeBinder { lifetimes, ty } => {
                 if lifetimes.is_empty() {

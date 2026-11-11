@@ -19,6 +19,7 @@ pub(crate) mod bad_rtn;
 pub(crate) mod conflicting_assoc_type_bindings;
 pub(crate) mod const_param_ty_not_allowed;
 pub(crate) mod elided_lifetimes_in_path;
+pub(crate) mod error_union_refused;
 pub(crate) mod fn_trait_args_not_tuple;
 pub(crate) mod generic_args_prohibited;
 pub(crate) mod generic_default_refers_to_self;
@@ -37,6 +38,7 @@ pub(crate) mod macro_def_error;
 pub(crate) mod macro_error;
 pub(crate) mod macro_expansion_parse_error;
 pub(crate) mod malformed_derive;
+pub(crate) mod method_on_ambiguous_numeric;
 pub(crate) mod method_on_unknown_raw_pointee;
 pub(crate) mod missing_body;
 pub(crate) mod missing_lifetime;
@@ -48,6 +50,8 @@ pub(crate) mod object_without_trait;
 pub(crate) mod parenthesized_generic_args_without_fn_trait;
 pub(crate) mod pattern_arg_in_extern_fn;
 pub(crate) mod pattern_type_not_lowered;
+pub(crate) mod record_refused;
+pub(crate) mod record_use_refused;
 pub(crate) mod query_cycle;
 pub(crate) mod self_ctor_not_tuple_or_unit;
 pub(crate) mod trait_impl_incorrect_safety;
@@ -139,6 +143,7 @@ pub(crate) mod unreachable_label;
 pub(crate) mod unused_must_use;
 pub(crate) mod val_tree_error;
 pub(crate) mod verify_refused;
+pub(crate) mod whole_value_write_through_refinement;
 pub(crate) mod yield_outside_coroutine;
 
 /// When rustc gives a diagnostic, by the pass that gives it: the driver writes them in this
@@ -225,6 +230,9 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> 
         AnyDiagnostic::MissingSelfDefaultParams(d) => missing_self_default_params::lower(cx, &d),
         AnyDiagnostic::ObjectWithoutTrait(d) => object_without_trait::lower(cx, &d),
         AnyDiagnostic::PatternTypeNotLowered(d) => pattern_type_not_lowered::lower(cx, &d),
+        AnyDiagnostic::ErrorUnionRefused(d) => error_union_refused::lower(cx, &d),
+        AnyDiagnostic::RecordRefused(d) => record_refused::lower(cx, &d),
+        AnyDiagnostic::RecordUseRefused(d) => record_use_refused::lower(cx, &d),
         AnyDiagnostic::QueryCycle(d) => query_cycle::lower(cx, &d),
         AnyDiagnostic::NotAStructPath(d) => not_a_struct_path::lower(cx, &d),
         AnyDiagnostic::AutoderefRecursionLimit(d) => autoderef_recursion_limit::lower(cx, &d),
@@ -232,6 +240,9 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> 
         AnyDiagnostic::InheritedRefMutabilityMismatch(d) => inherited_ref_mutability_mismatch::lower(cx, &d),
         AnyDiagnostic::MethodOnUnknownRawPointee(d) => method_on_unknown_raw_pointee::lower(cx, &d),
         AnyDiagnostic::SelfCtorNotTupleOrUnit(d) => self_ctor_not_tuple_or_unit::lower(cx, &d),
+        AnyDiagnostic::WholeValueWriteThroughRefinement(d) => {
+            whole_value_write_through_refinement::lower(cx, &d)
+        }
         AnyDiagnostic::TyvarBehindRawPointer(d) => tyvar_behind_raw_pointer::lower(cx, &d),
         AnyDiagnostic::LateBoundLifetimeArgs(d) => late_bound_lifetime_args::lower(cx, &d),
         AnyDiagnostic::MacroDefError(d) => macro_def_error::lower(cx, &d),

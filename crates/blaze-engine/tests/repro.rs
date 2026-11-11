@@ -701,3 +701,41 @@ fn generated_test_finds_planted_bug() {
         assert!(said.contains(line), "the case to paste lacks `{line}`:\n{said}");
     }
 }
+
+/// "The wrong call is unwritable" (docs/v2/plan/design/std.md, "The second rule"), tested and
+/// not only said: each file under `wrong/` is one call bstd's types refuse, and `blaze check`
+/// of it fails naming the call. The control is the crate as it stands (`src/lib.rs`): the
+/// right form of each of those calls, which checks, so a failure below is the wrong call's
+/// and not the setup's.
+#[test]
+fn bstd_the_wrong_call_does_not_compile() {
+    let case = Case::new("bstd_the_wrong_call_does_not_compile");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    case.write(
+        "Cargo.toml",
+        &format!(
+            "[package]\nname = \"repro\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n\
+             bstd = {{ package = \"blaze-std\", path = {:?} }}\n\n[workspace]\n",
+            root.join("crates/blaze-std").display().to_string()
+        ),
+    );
+    case.write("Cargo.lock", &fs::read_to_string(root.join("Cargo.lock")).unwrap());
+    case.ok(&["check"]);
+    // Each wrong call, and what its error must name: the call, and the type that lacks it.
+    let wrong: [(&str, &[&str]); 4] = [
+        ("a_clone_from_written", &["clone_to", "Written"]),
+        ("a_buffered_writer_dropped", &["`writer`", "Buffered"]),
+        ("a_write_through_a_narrowed_handle", &["append_unsynced", "ReadOnly"]),
+        ("a_removed_name", &["`write`", "Dir"]),
+    ];
+    for (fixture, names) in wrong {
+        let source = fs::read_to_string(case.dir.join("wrong").join(format!("{fixture}.rs"))).unwrap();
+        case.write("src/lib.rs", &source);
+        let out = case.blaze_in("", &["check"]);
+        assert!(!out.ok, "{fixture}: the wrong call checked:\n{}", out.stderr);
+        for name in names {
+            assert!(out.stderr.contains(name), "{fixture}: the error does not name {name}:\n{}", out.stderr);
+        }
+        assert!(out.stderr.contains("src/lib.rs"), "{fixture}: the error does not say where:\n{}", out.stderr);
+    }
+}

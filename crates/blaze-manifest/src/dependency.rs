@@ -30,7 +30,7 @@ pub struct Dependency {
     pub default_features: bool,
     pub platform: Option<Platform>,
     pub explicit_name_in_toml: Option<String>,
-    /// `artifact = ..` with `-Z bindeps`.
+    /// `artifact = ..` with `-Z bindeps`, or blaze's `artifact = "gpu"` ([`Artifact::GPU`]).
     pub artifact: Option<Artifact>,
 }
 
@@ -38,7 +38,7 @@ pub struct Dependency {
 /// them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Artifact {
-    /// As written: `bin`, `bin:<name>`, `cdylib`, `staticlib`.
+    /// As written: `bin`, `bin:<name>`, `cdylib`, `staticlib`, or blaze's `gpu` alone.
     pub kinds: Vec<String>,
     pub lib: bool,
     /// `target = "<triple>"`, or `"target"` for the build's own.
@@ -46,7 +46,37 @@ pub struct Artifact {
 }
 
 impl Artifact {
+    /// blaze's device build (docs/future/gpu/shaders.md): the dependency built for
+    /// `naga-unknown-unknown`, its `GPU_ENTRIES` lowered to MSL, the file named to the dependent
+    /// in `BLAZE_GPU_MSL_<CRATE>`. A blaze extension, so it needs no `-Z bindeps`; cargo refuses it.
+    pub const GPU: &str = "gpu";
+
+    /// Whether `kinds` asks for blaze's device build ([`Artifact::GPU`]), which takes no other kind.
+    pub fn asks_gpu(kinds: &[String]) -> bool {
+        kinds.iter().any(|it| it == Self::GPU)
+    }
+
+    /// Whether this is blaze's device build ([`Artifact::GPU`]).
+    pub fn is_gpu(&self) -> bool {
+        Self::asks_gpu(&self.kinds)
+    }
+
     pub fn parse(kinds: &[String], lib: bool, target: Option<&str>) -> anyhow::Result<Artifact> {
+        if Self::asks_gpu(kinds) {
+            // The device build has one target, blaze's own, and one output, its MSL.
+            if kinds.len() != 1 {
+                bail!(
+                    "artifact `gpu` (blaze's device build) takes no other artifact kind, but `{}` is asked with it",
+                    kinds.iter().filter(|it| *it != Self::GPU).cloned().collect::<Vec<_>>().join("`, `")
+                );
+            }
+            if let Some(target) = target {
+                bail!(
+                    "artifact `gpu` is built for `naga-unknown-unknown` alone, so it takes no `target` (`{target}` is asked)"
+                );
+            }
+            return Ok(Artifact { kinds: kinds.to_vec(), lib, target: None });
+        }
         for kind in kinds {
             if !matches!(kind.as_str(), "bin" | "cdylib" | "staticlib") && !kind.starts_with("bin:")
             {

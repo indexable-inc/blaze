@@ -1591,7 +1591,11 @@ under its baseline, saying to run the same command again with `--bless-baselines
 the baselines to the run's (it never raises one or adds a crate) and deletes one that reaches
 empty, whose lint then moves to `deny`. `--new-baseline LINT[,LINT...]` starts a lint's
 baseline at the run's counts, refusing a lint with no findings or one that has a baseline. A
-baseline holds a lint at `warn`: a `deny` lint's finding fails the check, baselined or not.
+baseline holds a lint at `warn`: a `deny` lint's finding fails the check, baselined or not. A
+line may read `crate<TAB>unmeasured`: any count passes it and it is stale, and the bless
+records the run's count in its place or drops the crate at zero. A workspace whose
+`lints-ratchet` names the directory holds each crate a `blaze.<lint>.txt` lists at `warn` on
+that lint and every other crate at `deny` ([the ratchet](lints.md#workspace-levels-and-the-ratchet)).
 
 blaze's own baselines go in crates/blaze-lints/baselines, of `aarch64-unknown-linux-gnu`
 (AGENTS.md rule fix-through-blaze-lints), and the merge gate's `lint-baselines` job holds every
@@ -1603,9 +1607,10 @@ needs that target's C compiler and LLVM for the build scripts, so it is not the 
 
 Tests are not counted yet: blaze's check of a test target fails for now ("can't find crate for
 `test`"), and once it passes the scope grows to every target and the baselines are made again.
-None is made yet: blaze cannot yet finish this check of its own workspace (see
-[the lints plan](lints.md)), so `lint-baselines` fails until a run does
-and the first baselines are made with `--new-baseline`.
+The `blaze.*.txt` baselines were written on 2026-11-11 with every crate `unmeasured` on every
+lint the ratchet newly denied. `lint-baselines` fails until a run of the command above with
+`--bless-baselines` records them, with `--new-baseline` for each clippy lint that run names as
+having findings and no baseline.
 
 A record of v1 (as of 2026-10-27). v1's `blaze clippy` linted with
 blaze's own lints, `crates/blaze-lints`:

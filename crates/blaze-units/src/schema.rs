@@ -66,6 +66,14 @@ impl Unit {
     pub fn gives_expanders(&self) -> bool {
         self.mode == Mode::Build && self.target.is_proc_macro()
     }
+
+    /// Whether the unit is built for the device ([`crate::GPU_DEVICE`]): an `artifact = "gpu"`
+    /// dependency or what it depends on. The front end alone builds it: it has no native code,
+    /// no host image links it, and its library is a crate record. The one rule the plan, the
+    /// unit graph and the daemon's phases read.
+    pub fn for_device(&self) -> bool {
+        !self.macro_wasm && self.platform.as_deref() == Some(crate::GPU_DEVICE)
+    }
 }
 
 /// Whether code built for `built_for` under the profile named `profile` runs on the machine
@@ -248,4 +256,10 @@ pub struct UnitDep {
     /// cargo's graph. An edge of a build script's compile is a build-dependency either way.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dev: bool,
+    /// blaze's: the edge is an `artifact = "gpu"` dependency's, to the unit that builds it for
+    /// the device ([`crate::GPU_DEVICE`]). The dependent links nothing of it and has no extern
+    /// crate of it; it is given the MSL that unit writes (`BLAZE_GPU_MSL_<CRATE>`). That unit
+    /// alone writes MSL: what it depends on is built for the device as libraries.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gpu: bool,
 }

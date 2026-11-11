@@ -5,7 +5,7 @@ use std::{hash::Hash, sync::Arc};
 
 use crate::FileId;
 use blaze_ids::ContentId;
-use span::Edition;
+use span::{Edition, Extensions};
 use syntax::{SyntaxError, ast};
 
 use crate::{Db, trees::Trees};
@@ -22,7 +22,11 @@ pub struct EditionedFileId {
 /// the trees count against that tag.
 #[blaze_query::tracked(self_ty = EditionedFileId, lru, weigh = syntax::Parse::heap_bytes, mem_tag = Parse, returns(ref))]
 fn parse_(db: &Db, file: EditionedFileId) -> syntax::Parse<ast::SourceFile> {
+    // The key is the interned file id, which holds the crate's syntax extensions beside the
+    // edition (`span::EditionedFileId::extensions`): a file of a crate that turns one on is
+    // another key, and another parse.
     let (file_id, edition) = file.unpack(db);
+    let (extensions, outline) = (file.extensions(db), file.is_library(db));
     let span = tracing::info_span!("parse_query", function = tracing::field::Empty);
     if !span.is_disabled() {
         // alloc: only while a subscriber records the span, which interns it
@@ -34,7 +38,7 @@ fn parse_(db: &Db, file: EditionedFileId) -> syntax::Parse<ast::SourceFile> {
     let _p = span.entered();
     let input = db.file_text(file_id);
     let stored = db.trees().map(|it| &**it);
-    let parse = input.reparse_field(db).parse(input.text(db), edition, file.is_library(db), stored);
+    let parse = input.reparse_field(db).parse(input.text(db), edition, extensions, outline, stored);
     parse.unwrap_or_else(|error| {
         let root = db.source_root(db.file_source_root(file_id).source_root_id(db));
         let path = root.source_root_ref(db).path_for_file(&file_id).cloned();
@@ -92,9 +96,31 @@ impl EditionedFileId {
         parse_(db, self)
     }
 
+    /// The file read in `edition` for a crate that turns on no syntax extension.
     #[inline]
     pub fn new(db: &Db, file_id: FileId, edition: Edition) -> Self {
         Self::from_span_file_id(db, span::EditionedFileId::new(file_id, edition))
+    }
+
+    /// The file read in `edition` for a crate whose syntax `extensions` are on
+    /// ([`crate::Crate::extensions`]): a file of the crate is always made with them, so it
+    /// parses and prints under them.
+    #[inline]
+    pub fn new_with_extensions(
+        db: &Db,
+        file_id: FileId,
+        edition: Edition,
+        extensions: Extensions,
+    ) -> Self {
+        let file = span::EditionedFileId::new_with_extensions(file_id, edition, extensions);
+        Self::from_span_file_id(db, file)
+    }
+
+    /// The syntax extensions of the crate the file is read for, which it is parsed under: part
+    /// of the interned id, so of the key of the parse and of every query keyed by the file.
+    #[inline]
+    pub fn extensions(self, db: &Db) -> Extensions {
+        self.field(db).extensions()
     }
 
     #[inline]
@@ -136,7 +162,9 @@ impl EditionedFileId {
         parse: &syntax::Parse<ast::SourceFile>,
     ) -> bool {
         let (file_id, edition) = self.unpack(db);
+        let extensions = self.extensions(db);
         let input = db.file_text(file_id);
-        input.content(db) == content && input.reparse_field(db).seed(input.text(db), edition, parse)
+        input.content(db) == content
+            && input.reparse_field(db).seed(input.text(db), edition, extensions, parse)
     }
 }

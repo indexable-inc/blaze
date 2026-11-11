@@ -619,6 +619,13 @@ pub struct UnitPlan {
     /// host's bridge (`proc_macro_bridge`), and a proc macro's links as a WASI reactor the host
     /// loads.
     pub macro_wasm: bool,
+    /// The MSL file the unit writes, absolute, when it is the device build of an
+    /// `artifact = "gpu"` dependency ([`crate::schema::UnitDep::gpu`]): its crate's `GPU_ENTRIES`
+    /// lowered by blaze-shader, validated by naga. Its dependents are given it in
+    /// `BLAZE_GPU_MSL_<CRATE>`. It is among [`UnitPlan::outputs`], beside the library's own
+    /// (another device crate may use it as a library); the front end alone builds the unit, so
+    /// none of them is native code, and no host unit links it.
+    pub gpu_msl: Option<String>,
 }
 
 /// What `check` lints a crate with beyond its compile, as cargo-clippy gives clippy's driver;

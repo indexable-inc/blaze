@@ -392,6 +392,19 @@ struct DefMapCrateData {
     /// blaze: `#![blaze::arbitrary_ints]`, under which `u1`..`u128` and `i1`..`i128` are
     /// primitive integer types (docs/v2/plan/design/arbitrary-ints.md).
     arbitrary_ints: bool,
+    /// blaze: `#![blaze::handles]`, under which a move of a `Share` value that is used again
+    /// later is a copy (docs/v2/plan/design/edition.md, change 1; `hir_ty_mir::mir::handles`).
+    handles: bool,
+    /// blaze: `#![blaze::views]`, under which a method's receiver may name the fields it
+    /// borrows, `&self.{a, b}` (docs/v2/plan/design/edition.md, change 3).
+    views: bool,
+    /// blaze: `#![blaze::pattern_types]`, under which `T is PAT` is a type and a pattern type
+    /// may name enum variants (docs/v2/plan/design/edition.md, section 8).
+    pattern_types: bool,
+    /// blaze: `#![blaze::early_drop]`, under which a local whose destructor only frees memory
+    /// is dropped after its last use (docs/v2/plan/design/early-drop.md;
+    /// `hir_ty_mir::mir::early_drop`).
+    early_drop: bool,
 
     edition: Edition,
     recursion_limit: Option<u32>,
@@ -411,6 +424,10 @@ impl DefMapCrateData {
             no_std: false,
             proc_macro: false,
             arbitrary_ints: false,
+            handles: false,
+            views: false,
+            pattern_types: false,
+            early_drop: false,
             edition,
             recursion_limit: None,
         }
@@ -428,6 +445,10 @@ impl DefMapCrateData {
             no_std: _,
             proc_macro: _,
             arbitrary_ints: _,
+            handles: _,
+            views: _,
+            pattern_types: _,
+            early_drop: _,
             edition: _,
             recursion_limit: _,
         } = self;
@@ -1178,6 +1199,35 @@ impl DefMap {
     #[inline]
     pub fn arbitrary_ints(&self) -> bool {
         self.data.arbitrary_ints
+    }
+
+    /// Whether the crate says `#![blaze::handles]`, so that a move of a handle (a `Share`
+    /// value) that is used again on some later path is a copy (`hir_ty_mir::mir::handles`).
+    #[inline]
+    pub fn handles(&self) -> bool {
+        self.data.handles
+    }
+
+    /// Whether the crate says `#![blaze::views]`: a method's receiver may name the fields it
+    /// borrows, and a private method's are inferred from its body (`hir_ty_borrowck::views`).
+    #[inline]
+    pub fn views(&self) -> bool {
+        self.data.views
+    }
+
+    /// Whether the crate says `#![blaze::pattern_types]`, so that `T is PAT` is a type and its
+    /// pattern may name variants of an enum (`Conn is Conn::Open { .. }`), and a match, `if let`
+    /// or `let else` narrows a plain local to the variants its pattern admits.
+    #[inline]
+    pub fn pattern_types(&self) -> bool {
+        self.data.pattern_types
+    }
+
+    /// Whether the crate says `#![blaze::early_drop]`, so that a local whose destructor only
+    /// frees memory is dropped after its last use (`hir_ty_mir::mir::early_drop`).
+    #[inline]
+    pub fn early_drop(&self) -> bool {
+        self.data.early_drop
     }
 
     /// The integer of an arbitrary width `name` names in this crate, as the builtin scope's

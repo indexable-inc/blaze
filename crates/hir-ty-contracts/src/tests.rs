@@ -1,6 +1,6 @@
-//! End to end: a caller's runtime MIR, a callee proved (or not) by hir-ty-verus with Z3 from
-//! `BLAZE_Z3` (the flake's pinned 4.16.0), and the pass. Without `BLAZE_Z3` each test fails,
-//! never skips.
+//! A caller's runtime MIR, a callee whose `ensures` is proved or not, and the pass. The prover
+//! is the pass's argument: here one that answers with a fixed proof key or a fixed refusal, so
+//! the pass is tested without Lean; hir-ty-lean's own tests run Lean.
 
 use base_db::{Crate, Db, all_crates};
 use blaze_items::{ItemId, item_key};
@@ -8,11 +8,12 @@ use hir_def::{FunctionId, ModuleDefId, nameres::crate_def_map};
 use hir_expand::{fixture, name::Name};
 use hir_ty::{
     InferBodyId,
+    next_solver::StoredGenericArgs,
     mir::{AssertKind, MirOwner, MirStage, TerminatorKind},
     providers::mir_at,
 };
 use hir_ty_mir as _;
-use hir_ty_verus::{Config, DEFAULT_RLIMIT, Outcome, verify_function};
+use hir_ty_lean::{Clause, NotProved, ProofKey, Prover};
 use intern::Symbol;
 
 use crate::{Entry, Fact, How, Use, use_proved_contracts};
@@ -61,10 +62,9 @@ fn function(db: &Db, name: &str) -> FunctionId {
     }
 }
 
-/// Z3 from `BLAZE_Z3`: a missing one fails the test.
-#[track_caller]
-fn config() -> Config {
-    Config::from_env(DEFAULT_RLIMIT).unwrap_or_else(|err| panic!("{err}"))
+/// A proof key of the bytes `tag`.
+fn key(tag: u8) -> ProofKey {
+    ProofKey { how: Prover::Lean, id: blaze_ids::ContentId([tag; 32]) }
 }
 
 fn bounds_checks(body: &hir_ty::mir::MirBody<'_>) -> usize {
@@ -81,7 +81,7 @@ fn bounds_checks(body: &hir_ty::mir::MirBody<'_>) -> usize {
 
 /// `caller`'s runtime MIR: its bounds checks before and after the pass, and the facts the pass
 /// used.
-fn run_pass(db: &Db) -> (usize, usize, Vec<Fact>) {
+fn run_pass(db: &Db, proved: Option<ProofKey>) -> (usize, usize, Vec<Fact>) {
     let caller = function(db, "caller");
     blaze_query::db::attach(db, || {
         let owner = MirOwner::Body(InferBodyId::DefWithBodyId(caller.into()));
@@ -89,44 +89,45 @@ fn run_pass(db: &Db) -> (usize, usize, Vec<Fact>) {
         // clone: the query's body is kept; the pass changes a copy
         let mut body = runtime.clone();
         let before = bounds_checks(&body);
-        let facts = use_proved_contracts(db, &mut body);
+        let prove = |_: FunctionId, _: StoredGenericArgs| {
+            proved.ok_or_else(|| NotProved {
+                function: "main::pick".to_owned(),
+                clause: Clause::Ensures,
+                why: "there is no proof file".to_owned(),
+            })
+        };
+        let facts = use_proved_contracts(db, &mut body, &prove);
         (before, bounds_checks(&body), facts)
     })
 }
 
 #[test]
 fn proved_contract_removes_bounds_check() {
-    let config = config();
     let db = db_with("if n < 4 { n } else { 3 }");
     let pick = function(&db, "pick");
-    let verdict = verify_function(&db, pick, &config);
-    assert!(matches!(verdict.outcome, Outcome::Proved), "{verdict:?}");
-    let key = verdict.key.expect("a proved function has a key");
-
-    let (before, after, facts) = run_pass(&db);
+    let (before, after, facts) = run_pass(&db, Some(key(7)));
     assert_eq!(before, 1, "`xs[r as usize]` has one bounds check");
     assert_eq!(after, 0, "the proved `ensures r < 4` makes it pass always: {facts:?}");
     let [fact] = facts.as_slice() else { panic!("one fact, not {facts:?}") };
     assert_eq!(fact.callee, item_key(&db, ItemId::Function(pick)));
-    assert_eq!(fact.how, How::Verus(key), "the fact names the proof it rests on");
+    assert_eq!(fact.how, How::Lean(key(7)), "the fact names the proof it rests on");
     assert_eq!(fact.entry, Entry::NoRequires);
     assert_eq!(fact.used, Use::BoundsCheckRemoved);
 
     // The fact is the same in another database: it is content, never an interned id.
-    let (_, _, again) = run_pass(&db_with("if n < 4 { n } else { 3 }"));
+    let (_, _, again) = run_pass(&db_with("if n < 4 { n } else { 3 }"), Some(key(7)));
     assert_eq!(again.iter().map(Fact::id).collect::<Vec<_>>(), [fact.id()]);
+    // Another proof is another fact.
+    let (_, _, other) = run_pass(&db, Some(key(8)));
+    assert_ne!(other.iter().map(Fact::id).collect::<Vec<_>>(), [fact.id()]);
 }
 
 #[test]
 fn unproved_contract_keeps_bounds_check() {
-    let config = config();
-    // `pick(4)` is 4: Z3 refutes `r < 4`, so the check stays.
+    // No proof stands behind `r < 4` (and `pick(4)` is 4): the check stays.
     let db = db_with("n");
-    let verdict = verify_function(&db, function(&db, "pick"), &config);
-    assert!(matches!(verdict.outcome, Outcome::Refuted(_)), "{verdict:?}");
-
-    let (before, after, facts) = run_pass(&db);
+    let (before, after, facts) = run_pass(&db, None);
     assert_eq!(before, 1, "`xs[r as usize]` has one bounds check");
-    assert_eq!(after, 1, "a refuted `ensures` is never used");
+    assert_eq!(after, 1, "an `ensures` that is not proved is never used");
     assert!(facts.is_empty(), "{facts:?}");
 }

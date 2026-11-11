@@ -32,8 +32,8 @@ use blaze_hash::HashMap;
 use blaze_mem::scratch::Scratch as Stack;
 use intern::Symbol;
 use span::{
-    Edition, EditionedFileId, FileId, ROOT_ERASED_FILE_AST_ID, Span, SpanAnchor, SyntaxContext,
-    TextRange, TextSize,
+    Edition, EditionedFileId, Extensions, FileId, ROOT_ERASED_FILE_AST_ID, Span, SpanAnchor,
+    SyntaxContext, TextRange, TextSize,
 };
 
 use crate::{
@@ -459,14 +459,16 @@ impl Columns<'_> {
         symbol(self.symbols[at as usize])
     }
 
-    /// The context of a packed span: its part's, with no range unpacked.
+    /// The context of a packed span and the syntax extensions of the file it is anchored in
+    /// (the crate's whose source wrote its token): its part's, with no range unpacked.
     #[inline]
-    fn ctx_of(&self, span: PackedSpan) -> SyntaxContext {
+    fn ctx_of(&self, span: PackedSpan) -> (SyntaxContext, Extensions) {
         let part = match span.len_part {
             WIDE => self.wide(span.start).part,
             len_part => len_part >> 16,
         };
-        self.part(part).ctx()
+        let part = self.part(part);
+        (part.ctx(), part.extensions())
     }
 }
 
@@ -857,7 +859,8 @@ thread_local! {
 
 impl Tree {
     /// Calls `f` with each token of the token trees `start..end` in order, a subtree being its
-    /// opening delimiter, its token trees and its closing delimiter, with the context of each.
+    /// opening delimiter, its token trees and its closing delimiter, with the context of each
+    /// and the syntax extensions of the file its span is anchored in.
     /// Reads the columns: no span's range and no leaf is unpacked, and nothing is allocated
     /// but the stack of open subtrees, kept per thread.
     #[inline]
@@ -865,9 +868,9 @@ impl Tree {
         &self,
         start: u32,
         end: u32,
-        mut f: impl FnMut(crate::FlatToken, SyntaxContext),
+        mut f: impl FnMut(crate::FlatToken, SyntaxContext, Extensions),
     ) {
-        self.walk_tokens(start, end, |_, token, ctx| f(token, ctx))
+        self.walk_tokens(start, end, |_, token, ctx, extensions| f(token, ctx, extensions))
     }
 
     /// The number of token slots: one a node, one a subtree's closing delimiter.
@@ -888,7 +891,10 @@ impl Tree {
     /// [`Tree::for_each_token`] over the whole tree, with each token's slot: a leaf's or an
     /// opening delimiter's node, or its subtree's [`Tree::token_slots`] entry for a
     /// closing one. What [`TreeWords`] are made from.
-    pub fn for_each_slotted_token(&self, f: impl FnMut(u32, crate::FlatToken, SyntaxContext)) {
+    pub fn for_each_slotted_token(
+        &self,
+        f: impl FnMut(u32, crate::FlatToken, SyntaxContext, Extensions),
+    ) {
         self.walk_tokens(0, self.node_count() as u32, f)
     }
 
@@ -896,22 +902,25 @@ impl Tree {
         &self,
         start: u32,
         end: u32,
-        mut f: impl FnMut(u32, crate::FlatToken, SyntaxContext),
+        mut f: impl FnMut(u32, crate::FlatToken, SyntaxContext, Extensions),
     ) {
         use crate::FlatToken;
+        // A whole span's context and the extensions of its anchor's file, as `ctx_of` reads
+        // a packed one's.
+        let written = |span: Span| (span.ctx, span.anchor.file_id.extensions());
         let columns = self.columns();
         let node_count = columns.nodes.len();
         // The slot, token and context of the closing delimiter of the subtree at `at`.
         let close = |at: u32| {
             let node = columns.node(at as usize);
-            let (slot, ctx) = match at {
-                0 => (columns.spans.len(), self.top_close.ctx),
+            let (slot, (ctx, extensions)) = match at {
+                0 => (columns.spans.len(), written(self.top_close)),
                 _ => {
                     let slot = node_count + node.ordinal() as usize - 1;
                     (slot, columns.ctx_of(columns.span(slot)))
                 }
             };
-            (slot as u32, FlatToken::Close(node.delimiter_kind()), ctx)
+            (slot as u32, FlatToken::Close(node.delimiter_kind()), ctx, extensions)
         };
         let mut stack = OPEN.replace(Stack::new());
         let open = stack.take();
@@ -919,7 +928,8 @@ impl Tree {
         if start == 0 && end > 0 {
             let top = columns.node(0);
             open.push((1 + top.data, 0));
-            f(0, FlatToken::Open(top.delimiter_kind()), self.top_open.ctx);
+            let (ctx, extensions) = written(self.top_open);
+            f(0, FlatToken::Open(top.delimiter_kind()), ctx, extensions);
             from = 1;
         }
         let end = end as usize;
@@ -930,8 +940,8 @@ impl Tree {
                 && after == at
             {
                 open.pop();
-                let (slot, token, ctx) = close(subtree);
-                f(slot, token, ctx);
+                let (slot, token, ctx, extensions) = close(subtree);
+                f(slot, token, ctx, extensions);
             }
             let token = match node.tag() {
                 SUBTREE => {
@@ -949,11 +959,12 @@ impl Tree {
                     suffix_len: node.suffix_len(),
                 },
             };
-            f(at, token, columns.ctx_of(span));
+            let (ctx, extensions) = columns.ctx_of(span);
+            f(at, token, ctx, extensions);
         }
         while let Some((_, subtree)) = open.pop() {
-            let (slot, token, ctx) = close(subtree);
-            f(slot, token, ctx);
+            let (slot, token, ctx, extensions) = close(subtree);
+            f(slot, token, ctx, extensions);
         }
         OPEN.set(stack);
     }

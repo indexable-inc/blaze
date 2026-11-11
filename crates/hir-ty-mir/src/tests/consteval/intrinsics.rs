@@ -793,6 +793,84 @@ fn type_id_in_constant() {
     });
 }
 
+/// What the tests of a constant of `TypeId`s read by other evaluations share: a question as
+/// data, as bstd's `Question::ASK` is (crates/blaze-std/src/own/reach.rs), with an id in a
+/// field, in an array of structs, behind a reference and in an enum's variant.
+const ASKED: &str = r#"
+    const fn eq(a: &TypeId, b: &TypeId) -> bool { a.t.0 == b.t.0 && a.t.1 == b.t.1 }
+    struct Pair { id: TypeId, n: u8 }
+    struct Ask { first: TypeId, rest: [Pair; 2], back: &'static TypeId, some: Option<TypeId> }
+    trait Question { const ASK: Ask; }
+    struct A;
+    impl Question for A {
+        const ASK: Ask = Ask {
+            first: type_id::<u16>(),
+            rest: [Pair { id: type_id::<Shape>(), n: 1 }, Pair { id: type_id::<u8>(), n: 2 }],
+            back: &type_id::<Packed>(),
+            some: Some(type_id::<u32>()),
+        };
+    }
+    const fn agrees<Q: Question>() -> bool {
+        // Made here before the constant is read, and in another order than the constant's
+        // own evaluation made them: an id copied as its bytes would be of another type here.
+        let byte = type_id::<u8>();
+        let shape = type_id::<Shape>();
+        let ask = &Q::ASK;
+        eq(&ask.first, &type_id::<u16>())
+            && !eq(&ask.first, &byte)
+            && eq(&ask.rest[0].id, &shape)
+            && ask.rest[0].n == 1
+            && eq(&ask.rest[1].id, &byte)
+            && ask.rest[1].n == 2
+            && eq(ask.back, &type_id::<Packed>())
+            && match &ask.some {
+                Some(it) => eq(it, &type_id::<u32>()),
+                None => false,
+            }
+    }
+"#;
+
+/// A constant's value is the same whoever reads it: an associated constant holding `TypeId`s,
+/// read by two other evaluations (`ONE`'s and `GOAL`'s, the second twice and once through a
+/// third constant), compares equal there to `type_id::<T>()` of each type and to no other.
+/// The ids in its bytes are places in the list of the evaluation that made it; each reader
+/// gives them its own.
+#[test]
+fn a_constant_of_type_ids_is_the_same_to_every_evaluation_that_reads_it() {
+    check_number(
+        &format!(
+            "{TYPE_INFO}{ASKED}
+            const ONE: bool = agrees::<A>();
+            const NESTED: [Pair; 2] = A::ASK.rest;
+            const GOAL: usize = ONE as usize
+                + (agrees::<A>() as usize) * 2
+                + (agrees::<A>() as usize) * 4
+                + (eq(&NESTED[1].id, &type_id::<u8>()) as usize) * 8
+                + (eq(&NESTED[0].id, &type_id::<u8>()) as usize) * 16;"
+        ),
+        1 + 2 + 4 + 8,
+    );
+}
+
+/// Where the walk by type cannot find an id (the constant's type has a raw pointer, which may
+/// point at one), the constant is refused by name rather than read with ids that mean other
+/// types to the reader.
+#[test]
+fn a_constant_that_may_hide_a_type_id_is_refused_by_name() {
+    check_fail(
+        &format!(
+            "{TYPE_INFO}
+            struct Hidden {{ id: TypeId, at: *const u8 }}
+            const HIDDEN: Hidden = Hidden {{ id: type_id::<u8>(), at: 0 as *const u8 }};
+            const GOAL: bool = same(HIDDEN.id, type_id::<u8>());"
+        ),
+        |e| {
+            let why = format!("{e:?}");
+            why.contains("HIDDEN") && why.contains("computed from a `TypeId`")
+        },
+    );
+}
+
 #[test]
 fn transmute() {
     check_number(

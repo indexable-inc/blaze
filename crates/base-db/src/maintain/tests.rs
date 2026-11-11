@@ -387,6 +387,7 @@ fn one_crate(db: &mut Db) -> CrateGraphBuilder {
             target: Err("no target in maintain tests".into()),
             toolchain: None,
             const_eval: Default::default(),
+            trusted: Box::default(),
         }),
     );
     graph

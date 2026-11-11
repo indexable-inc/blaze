@@ -721,6 +721,9 @@ pub(super) struct Effects<'f> {
     /// By location: where its effects start in `all`; each block's run ends with one more.
     starts: Vec<u32, &'f Frame>,
     all: Vec<Effect, &'f Frame>,
+    /// What [`Effects::add`] has locations do on top of their own: (block index, location,
+    /// effect). Empty for drop elaboration, whose effects are the body's alone.
+    added: Vec<(u32, u32, Effect), &'f Frame>,
 }
 
 impl<'f> Effects<'f> {
@@ -729,7 +732,16 @@ impl<'f> Effects<'f> {
             block_start: frame.alloc_slice_fill_with(blocks, |_| u32::MAX),
             starts: Vec::new_in(frame),
             all: Vec::new_in(frame),
+            added: Vec::new_in(frame),
         }
+    }
+
+    /// Has the statement `at` of `block`, its terminator when `at` is the number of
+    /// statements, also do `effect`, after what it does of its own. Only before the first
+    /// [`Effects::at`]: a block asked for keeps the effects it was given then.
+    pub(super) fn add(&mut self, block: BasicBlockId, at: usize, effect: Effect) {
+        debug_assert!(self.starts.is_empty(), "an effect is added before any block is asked for");
+        self.added.push((block_index(block) as u32, at as u32, effect));
     }
 
     /// The effects at statement `at` of `block`, its terminator when `at` is the number of
@@ -748,6 +760,12 @@ impl<'f> Effects<'f> {
             for at in 0..=body.basic_blocks[block].statements.len() {
                 self.starts.push(self.all.len() as u32);
                 effects_at(ctx, data, body, block, at, &mut self.all);
+                if !self.added.is_empty() {
+                    let here = (index as u32, at as u32);
+                    self.all.extend(
+                        self.added.iter().filter(|it| (it.0, it.1) == here).map(|it| it.2),
+                    );
+                }
             }
             self.starts.push(self.all.len() as u32);
         }

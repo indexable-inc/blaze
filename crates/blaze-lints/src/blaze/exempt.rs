@@ -47,6 +47,8 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         // the item, not of one line.
         | Lint::StructUpdate
         | Lint::BoolParam
+        | Lint::ManyBools
+        | Lint::DefaultPolicy
         // Kept with `#[expect(..)]`: a core and a key are choices of the item, not of one line
         // (`key_ignores_field`'s `// not in key: <why>` names one field, through [`commented`]).
         | Lint::SansIoCore
@@ -112,6 +114,11 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::Noalloc
         | Lint::Nonblocking
         | Lint::Pure
+        | Lint::Capabilities
+        // Kept by the list itself, or with `#[expect(..)]` on the function.
+        | Lint::UndeclaredEffect
+        | Lint::UnneededEffect
+        | Lint::NegativeEffect
         | Lint::Packable
         | Lint::SoaCandidate
         | Lint::BorrowWorkaround
@@ -119,9 +126,31 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::NativeContracts
         // Kept with `#[expect(..)]` on the item: what a format accepts is the type's choice.
         | Lint::LenientDeserialize
+        // Kept with `#[expect(..)]` on the macro's function or the script: a macro and a
+        // script's reach are the item's choice, not one line's.
+        | Lint::ProcMacroDerive
+        | Lint::ProcMacroAttribute
+        | Lint::ProcMacroFnLike
+        | Lint::BuildScriptAmbient
+        // Kept with `#[expect(..)]` on the function: what a function reaches is its choice.
+        | Lint::StdUse
         // A hasher is chosen in the type, or kept with `#[expect(blaze::default_hasher, reason = ..)]`:
         // an allocation's comment says nothing about it.
-        | Lint::DefaultHasher => None,
+        | Lint::DefaultHasher
+        // The edition's lints name a construct the edition removes, not a cost on a line.
+        | Lint::LossyAs
+        | Lint::GlobalState
+        | Lint::AsyncFn
+        | Lint::MutRef
+        // Kept with `#[expect(..)]` on the function: a mark is the item's choice, not a line's.
+        | Lint::UnmarkedPure
+        | Lint::UnmarkedNopanic
+        | Lint::UnmarkedNoalloc
+        | Lint::UnmarkedNonblocking
+        // A type's declaration and where it is held: kept with `#[expect(..)]` on the item.
+        | Lint::ProgramLifetime
+        | Lint::CouldBeProgramLifetime
+        | Lint::CouldBeRef32 => None,
     }
 }
 

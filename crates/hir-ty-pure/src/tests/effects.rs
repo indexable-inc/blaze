@@ -6,8 +6,8 @@ use super::{
     fns::fn_named,
 };
 use crate::{
-    PURE, check_generic,
-    effect_attrs::{NOALLOC, NONBLOCKING},
+    PURE, Rule, check_generic,
+    effect_attrs::{NOALLOC, NONBLOCKING, NOPANIC},
 };
 
 /// The pinned core's `unsafe` precondition checks (`unchecked_add`'s, under every
@@ -126,5 +126,262 @@ pub fn raw(raw: &mut Raw, input: &u8) -> u8 {
         };
         let said = refusal.said();
         assert!(said.contains("takes the raw pointer `*const u8`"), "{said}");
+    });
+}
+
+/// The pinned library's `unsafe` precondition checks (`assert_unsafe_precondition!`'s
+/// `precondition_check`, which aborts) are not a panic of a safe toolchain function that
+/// reaches one: its contract is that it upholds the precondition, and the toolchain is trusted
+/// for `unsafe` (`wrapping_shl`, slice iteration, `NonNull::new`, `MaybeUninit::zeroed` and
+/// `CStr::to_bytes` at the pin, each a safe function over an `unsafe fn` with a check). A
+/// workspace call of the `unsafe fn` still counts: there the workspace upholds it, and a build
+/// with the checks on aborts when it does not. A panic that is no precondition check counts
+/// wherever it is, and so does a function that only has the check's name.
+#[test]
+fn an_unsafe_precondition_check_is_a_panic_only_to_who_must_uphold_it() {
+    let db = db_with(
+        r#"
+//- /lib.rs crate:kernel deps:std
+pub fn through_a_safe_function(n: usize) -> usize {
+    std::unchecked::to_bytes(n)
+}
+
+pub fn through_a_closure_of_a_safe_function() -> usize {
+    std::unchecked::zeroed()
+}
+
+pub fn calls_the_unsafe_function(n: usize) -> usize {
+    // SAFETY: none given: the fixture's point.
+    unsafe { std::unchecked::new_unchecked(n) }
+}
+
+pub fn calls_the_checked_function_itself(n: usize) {
+    // SAFETY: as above.
+    unsafe { std::unchecked::assert_unchecked(n != 0) }
+}
+
+pub fn a_real_panic(value: Option<usize>) -> usize {
+    std::unchecked::unwrap(value)
+}
+
+pub fn only_the_name(n: usize) {
+    std::unchecked::precondition_check(n != 0)
+}
+"#,
+    );
+    let krate = crate_named(&db, "kernel");
+    blaze_query::db::attach(&db, || {
+        for clean in ["through_a_safe_function", "through_a_closure_of_a_safe_function"] {
+            if let Err(refusal) = check_generic(&db, fn_named(&db, krate, clean), &NOPANIC) {
+                panic!("`{clean}` should be nopanic, but {}", refusal.said());
+            }
+        }
+        for (refused, names) in [
+            ("calls_the_unsafe_function", "new_unchecked"),
+            ("calls_the_checked_function_itself", "assert_unchecked"),
+        ] {
+            let Err(refusal) = check_generic(&db, fn_named(&db, krate, refused), &NOPANIC) else {
+                panic!("`{refused}` calls an `unsafe fn` whose precondition it must uphold");
+            };
+            let said = refusal.said();
+            assert_eq!(refusal.rule, Rule::Panic, "{said}");
+            assert!(
+                said.contains(names)
+                    && said.contains("an `unsafe fn` of the toolchain whose precondition check"),
+                "{said}"
+            );
+        }
+        for (refused, names) in [("a_real_panic", "unwrap"), ("only_the_name", "precondition_check")]
+        {
+            let Err(refusal) = check_generic(&db, fn_named(&db, krate, refused), &NOPANIC) else {
+                panic!("`{refused}` reaches a panic that is no precondition check");
+            };
+            let said = refusal.said();
+            assert_eq!(refusal.rule, Rule::Panic, "{said}");
+            assert!(said.contains(names) && said.contains("which panics"), "{said}");
+        }
+    });
+}
+
+/// What the tests of a `dyn` the root takes share: a trait with a method whose
+/// `#[blaze::may(..)]` says what any object's may do and one with none, and a holder of one.
+const PROBED: &str = r#"
+//- minicore: sized, copy, phantom_data, drop, unsize, coerce_unsized, dispatch_from_dyn
+//- /lib.rs crate:kernel
+pub trait Probe {
+    /// Allocates, in any impl, and nothing else.
+    #[blaze::may(alloc)]
+    fn listed(&self, at: u32);
+    fn unlisted(&self, at: u32);
+}
+
+pub struct World<'a> {
+    pub probe: &'a dyn Probe,
+    pub clock: u32,
+}
+
+pub fn only_stores<'a>(probe: &'a dyn Probe, clock: u32) -> World<'a> {
+    World { probe, clock }
+}
+
+pub fn reads_beside_it(world: &World<'_>) -> u32 {
+    world.clock
+}
+
+fn inner(world: &World<'_>) -> u32 {
+    world.clock
+}
+
+pub fn hands_it_on(world: &World<'_>) -> u32 {
+    inner(world)
+}
+
+pub fn calls_listed(probe: &dyn Probe) {
+    probe.listed(1)
+}
+
+pub fn calls_unlisted(probe: &dyn Probe) {
+    probe.unlisted(1)
+}
+
+fn calls_inside(world: &World<'_>) {
+    world.probe.unlisted(2)
+}
+
+pub fn hands_it_to_a_caller(world: &World<'_>) {
+    calls_inside(world)
+}
+
+#[blaze::nopanic(trusted = "the fixture's: it answers for its own code")]
+#[blaze::nonblocking(trusted = "the fixture's: it answers for its own code")]
+fn trusted_inside(world: &World<'_>) {
+    world.probe.unlisted(3)
+}
+
+pub fn hands_it_to_a_trusted_function(world: &World<'_>) {
+    trusted_inside(world)
+}
+"#;
+
+/// A function that takes a `dyn` is refused for what it does through it, not for taking it:
+/// one that stores it, reads beside it or hands it to a function that calls nothing through
+/// it is clean. A call through it has the effects the trait's method declares
+/// (`#[blaze::may(alloc)]`: no panic and no wait in any impl, an allocation in some). A call
+/// of a method with no list is refused naming the method and the `dyn` taken, wherever in
+/// the root's graph it is made, under a callee trusted for the effect too: that one answers
+/// for its own code, not for the object it is handed.
+#[test]
+fn a_dyn_parameter_is_refused_only_for_a_call_through_it() {
+    let db = hir_expand::fixture::db(PROBED).into_db();
+    let krate = crate_named(&db, "kernel");
+    blaze_query::db::attach(&db, || {
+        for clean in ["only_stores", "reads_beside_it", "hands_it_on"] {
+            for effect in [&NOPANIC, &NOALLOC, &NONBLOCKING] {
+                if let Err(refusal) = check_generic(&db, fn_named(&db, krate, clean), effect) {
+                    panic!("`{clean}` should be {}, but {}", effect.name, refusal.said());
+                }
+            }
+        }
+        // Exactly the declared effects: `alloc` and no other.
+        let listed = fn_named(&db, krate, "calls_listed");
+        for effect in [&NOPANIC, &NONBLOCKING] {
+            if let Err(refusal) = check_generic(&db, listed, effect) {
+                panic!("`calls_listed` should be {}, but {}", effect.name, refusal.said());
+            }
+        }
+        let Err(refusal) = check_generic(&db, listed, &NOALLOC) else {
+            panic!("`Probe::listed` may allocate, so `calls_listed` is not noalloc");
+        };
+        assert!(refusal.said().contains("listed"), "{}", refusal.said());
+        for refused in
+            ["calls_unlisted", "hands_it_to_a_caller", "hands_it_to_a_trusted_function"]
+        {
+            for effect in [&NOPANIC, &NONBLOCKING] {
+                let Err(refusal) = check_generic(&db, fn_named(&db, krate, refused), effect)
+                else {
+                    panic!("`{refused}` calls `Probe::unlisted` through a `dyn` it is given");
+                };
+                let said = refusal.said();
+                assert_eq!(refusal.rule, Rule::Unchecked, "{said}");
+                assert!(
+                    said.contains("unlisted")
+                        && said.contains("through a `dyn`")
+                        && said.contains("dyn Probe"),
+                    "{said}"
+                );
+            }
+        }
+    });
+}
+
+/// `PhantomData<fn() -> T>` holds no function pointer and no `T`: it is how an id says it
+/// owns nothing (`blaze_ids::Idx<T>`), so a function that takes one is clean, whatever else
+/// it calls. A real `fn()` field is still refused. `PhantomData<dyn Tr>` names what the type
+/// around it may own (`ThinBox<dyn Tr>`): taking it is clean, as any `dyn` taken and not
+/// called through is.
+#[test]
+fn a_phantom_function_pointer_is_no_function_pointer() {
+    let db = hir_expand::fixture::db(
+        r#"
+//- minicore: sized, copy, phantom_data
+//- /lib.rs crate:kernel
+use core::marker::PhantomData;
+
+pub struct View;
+pub trait Draw {
+    fn draw(&self);
+}
+
+pub struct Idx<T> {
+    raw: u32,
+    marker: PhantomData<fn() -> T>,
+}
+
+pub struct Sink<T> {
+    raw: u32,
+    marker: PhantomData<fn(T)>,
+}
+
+pub struct Hook {
+    run: fn(),
+}
+
+pub struct Erased {
+    raw: u32,
+    marker: PhantomData<dyn Draw>,
+}
+
+pub fn takes_an_id(id: &Idx<View>, sink: &Sink<View>) -> u32 {
+    id.raw + sink.raw
+}
+
+pub fn takes_a_hook(hook: &Hook) -> u32 {
+    let _ = hook;
+    0
+}
+
+pub fn takes_a_phantom_dyn(erased: &Erased) -> u32 {
+    erased.raw
+}
+"#,
+    )
+    .into_db();
+    let krate = crate_named(&db, "kernel");
+    blaze_query::db::attach(&db, || {
+        for clean in ["takes_an_id", "takes_a_phantom_dyn"] {
+            for effect in [&NOALLOC, &NONBLOCKING] {
+                if let Err(refusal) = check_generic(&db, fn_named(&db, krate, clean), effect) {
+                    panic!("`{clean}` should be {}, but {}", effect.name, refusal.said());
+                }
+            }
+        }
+        for effect in [&NOALLOC, &NONBLOCKING] {
+            let Err(refusal) = check_generic(&db, fn_named(&db, krate, "takes_a_hook"), effect)
+            else {
+                panic!("`takes_a_hook` takes a function pointer, so it is not {}", effect.name);
+            };
+            let said = refusal.said();
+            assert!(said.contains("takes the function pointer `fn()`"), "{said}");
+        }
     });
 }

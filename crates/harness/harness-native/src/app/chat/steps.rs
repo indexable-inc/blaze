@@ -52,8 +52,10 @@ impl Line {
 pub(super) enum Out {
     /// A step's head: its kind's icon and what it did; failed, a mark and its plain sentence after.
     Head { kind: &'static str, words: String, why: String, tip: String },
-    /// A fetched page: the verb, its host as a link, its path muted.
-    Page { verb: String, url: String, tip: String },
+    /// A fetched page: the verb, its host as a link, its path muted. `view`: the harness browser view the page is
+    /// open in for the person (browser.open); a press on its link then shows that view in the browser pane, where a
+    /// fetched page's link opens the address as a view of its own.
+    Page { verb: String, url: String, tip: String, view: Option<u64> },
     /// A file read, written or deleted: the verb, then its chip.
     File { verb: String, path: String, tip: String },
     /// Search results; a query's own under its words when they came grouped (`more`: how many not shown).
@@ -88,13 +90,13 @@ impl Out {
     }
 
     /// Its words a selection can cover (see chat.rs `texts`).
-    pub(super) fn texts(&self) -> Vec<(&'static [&'static str], String, bool)> {
+    pub(super) fn texts(&self) -> Vec<Words> {
         match self {
-            Out::Head { words, .. } => vec![(&["line", "words"], words.clone(), false)],
-            Out::Text(s) => vec![(&["text"], s.clone(), false)],
-            Out::Code(s) => vec![(&["card", "text"], s.clone(), false)],
-            Out::Fail(s) => vec![(&["line", "why"], s.clone(), false)],
-            Out::Note(s) => vec![(&["text"], s.clone(), false)],
+            Out::Head { words, .. } => vec![Words::at("line/words", words.clone(), false)],
+            Out::Text(s) => vec![Words::at("text", s.clone(), false)],
+            Out::Code(s) => vec![Words::at("card/text", s.clone(), false)],
+            Out::Fail(s) => vec![Words::at("line/why", s.clone(), false)],
+            Out::Note(s) => vec![Words::at("text", s.clone(), false)],
             Out::Page { .. } | Out::File { .. } | Out::Results { .. } | Out::Value { .. } => Vec::new(),
         }
     }
@@ -159,6 +161,16 @@ fn tally<'c>(calls: impl IntoIterator<Item = &'c group::Call>) -> Vec<(&'static 
         out.push(("cell", 1));
     }
     out
+}
+
+thread_local! {
+    /// The step the live line last filled is on (the chat in front's turn): what a tucked-away window's item shows.
+    static LIVE_FACE: std::cell::Cell<&'static str> = const { std::cell::Cell::new("think") };
+}
+
+/// The step the turn in front is on, as its live line last showed it.
+pub(in crate::app) fn live_face() -> &'static str {
+    LIVE_FACE.with(std::cell::Cell::get)
 }
 
 /// The kind of step `calls` are on now: the newest step of the newest call still running; `think` when none runs (the
@@ -294,6 +306,12 @@ pub(super) fn outs(block: &str, d: &Detail, fold: &HashMap<String, bool>, out: &
     }
 }
 
+/// The harness browser view a step's shown value names as open for the person (`{t: "browser", view, pane: true}`,
+/// cdp.ts `Page.kept`): the one a press shows in the browser pane.
+pub(super) fn pane_view(v: &Value) -> Option<u64> {
+    genui::browser_view_id(&v["view"]).filter(|_| v["t"] == "browser" && v["pane"] == true)
+}
+
 /// One step's rows: its head (a page's host, a file's chip, or its words), then its output.
 fn effect_outs(key: &str, e: &model::chat::Effect, fold: &HashMap<String, bool>, out: &mut Vec<Row>) {
     let kind = kind_of(Act::of_effect(&e.kind));
@@ -315,7 +333,7 @@ fn effect_outs(key: &str, e: &model::chat::Effect, fold: &HashMap<String, bool>,
         "wait" => {}
         // A fetched page is its host and path; its body is the agent's to read, not the person's.
         "net" if e.target.starts_with("http://") || e.target.starts_with("https://") => {
-            out.push(Row::Out(Out::Page { verb: verb(), url: e.target.clone(), tip }));
+            out.push(Row::Out(Out::Page { verb: verb(), url: e.target.clone(), tip, view: pane_view(&e.value) }));
             return;
         }
         "read" | "write" | "delete" if is_path(&e.target) && empty_value(&e.value) => {
@@ -364,8 +382,6 @@ fn value_outs(key: &str, v: &Arc<Value>, fold: &HashMap<String, bool>, out: &mut
                 out.push(Row::Grid { v: v.clone(), cap: usize::MAX });
             }
         }
-        // A page the cell drove in the harness browser: its live card (genui's Browser, src/app/browser.rs).
-        "browser" => out.push(Row::Ui { v: Arc::new(genui::shown_card(v)), cell: String::new(), block: String::new(), code: false }),
         _ => {}
     }
 }
@@ -487,8 +503,9 @@ pub(super) fn fill_line(row: View<'_>, l: &Line) {
             block.face = kind.into();
             e.set(block);
         }
-        // The step it is on, to the ear (src/audio.rs: a new one plays its cue).
+        // The step it is on, to the ear (src/audio.rs: a new one plays its cue), and for a tucked-away window's item.
         crate::audio::step(kind);
+        LIVE_FACE.with(|f| f.set(kind));
     }
     let tally: &[(&'static str, usize)] = if l.live.is_some() { &[] } else { &l.tally };
     if let Some(items) = h.part("items") {
@@ -523,7 +540,7 @@ pub(super) fn fill(row: View<'_>, o: &Out) {
                 }
             }
         }
-        Out::Page { verb, url, tip } => {
+        Out::Page { verb, url, tip, view } => {
             if let Some(l) = row.part("line") {
                 look(l, "net", verb);
                 tooltip(l, tip);
@@ -531,7 +548,7 @@ pub(super) fn fill(row: View<'_>, o: &Out) {
                 let path = rest.find('/').map_or("", |i| &rest[i..]);
                 if let Some(k) = l.part("link") {
                     k.text(view::table::host(url));
-                    k.action(&format!("open:{url}"));
+                    k.action(&view.map_or_else(|| format!("open:{url}"), |v| format!("web:show:{v}")));
                     tooltip(k, url);
                 }
                 if let Some(p) = l.part("path") {

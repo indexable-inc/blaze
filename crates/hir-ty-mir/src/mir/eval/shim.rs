@@ -818,7 +818,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             | Intrinsic::BlazeFieldAttrs
             | Intrinsic::BlazeFieldIndex
             | Intrinsic::BlazeVariantDiscriminant
-            | Intrinsic::BlazeVariantIndex => {
+            | Intrinsic::BlazeVariantIndex
+            | Intrinsic::BlazeCodeId => {
                 return self
                     .exec_blaze_reflection_intrinsic(intrinsic, generic_args, destination)
                     .map(|()| true);
@@ -841,7 +842,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             | Intrinsic::FieldRepresentingTypeName
             | Intrinsic::FieldRepresentingTypeOffset
             | Intrinsic::TypeIdGenerics
-            | Intrinsic::TypeIdFunctionPtr => {
+            | Intrinsic::TypeIdFunctionPtr
+            | Intrinsic::BlazeTypeNameOf => {
                 return self.exec_reflection_intrinsic(intrinsic, args, destination, locals);
             }
             Intrinsic::Sqrt
@@ -2226,7 +2228,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
 
     /// The bytes of the `TypeId` of `ty` (already as [`Self::type_id_ty`] makes it), made when
     /// it is the first one asked for.
-    fn type_id(&mut self, ty: Ty<'db>) -> [u8; 16] {
+    pub(super) fn type_id(&mut self, ty: Ty<'db>) -> [u8; 16] {
         let id = self.type_ids.iter().position(|&it| it == ty).unwrap_or_else(|| {
             self.type_ids.push(ty);
             self.type_ids.len() - 1

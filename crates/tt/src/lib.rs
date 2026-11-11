@@ -25,7 +25,7 @@ use intern::Symbol;
 use stdx::{impl_from, itertools::Itertools as _};
 
 pub use span::Span;
-use span::SyntaxContext;
+use span::{Extensions, SyntaxContext};
 pub use text_size::{TextRange, TextSize};
 
 pub use self::iter::{TtElement, TtIter};
@@ -309,10 +309,11 @@ impl<'a> TokenTreesView<'a> {
 
     /// Calls `f` with each token of the view in order, as a parser reads them: a subtree is its
     /// opening delimiter, its token trees and its closing delimiter. Each comes with the
-    /// context of its span (an opening or closing delimiter's own). Read from the columns, with
-    /// no span unpacked: what a pass that needs kinds and contexts only (the parser's input)
-    /// walks.
-    pub fn for_each_token(&self, f: impl FnMut(FlatToken, SyntaxContext)) {
+    /// context of its span (an opening or closing delimiter's own) and the syntax extensions of
+    /// the file the span is anchored in, which are those of the crate whose source wrote the
+    /// token. Read from the columns, with no span unpacked: what a pass that needs kinds,
+    /// contexts and extensions only (the parser's input) walks.
+    pub fn for_each_token(&self, f: impl FnMut(FlatToken, SyntaxContext, Extensions)) {
         self.tree.for_each_token(self.start, self.end, f)
     }
 }

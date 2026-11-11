@@ -4148,7 +4148,7 @@ impl Store {
         // The planted bug: cloned from now, its write-back begun and not waited for.
         #[cfg(test)]
         if self.plant == PlacePlant::ClonesUnflushed {
-            return self.there(content, file.planted_flushed(), waiting, written, false, effects);
+            return self.there(content, &file.planted_flushed(), waiting, written, false, effects);
         }
         // No parent: the write-back ends on a later completion, under whatever request is
         // current then.
@@ -4170,7 +4170,7 @@ impl Store {
     fn there(
         &mut self,
         content: ContentId,
-        file: Flushed,
+        file: &Flushed,
         waiting: Vec<Waiter>,
         written: u64,
         doomed: bool,
@@ -4196,7 +4196,7 @@ impl Store {
         for (at, waiter) in waiting.into_iter().enumerate() {
             // The first place made the file: its bytes are written once, for all.
             let written = if at == 0 { written } else { 0 };
-            self.serve(content, &file, waiter, written, effects);
+            self.serve(content, file, waiter, written, effects);
         }
     }
 
@@ -4285,7 +4285,7 @@ impl Store {
                 // file one a clone is asked of ([`publish::Written::flushed`]).
                 match file.flushed(&done) {
                     // The file is clean, and may be cloned.
-                    Ok(file) => self.there(content, file, waiting, written, doomed, effects),
+                    Ok(file) => self.there(content, &file, waiting, written, doomed, effects),
                     Err(file) => {
                         // Not known written back, so never cloned from: it goes, what waited
                         // for it is refused by name, and the next place writes it again.

@@ -1618,6 +1618,11 @@ bitflags! {
         const EXPLICIT_SAFE = 1 << 12;
         const HAS_LEGACY_CONST_GENERICS = 1 << 13;
         const RUSTC_INTRINSIC = 1 << 14;
+        /// `#![blaze::views]`: the receiver is written with a view, `&self.{a, b}`
+        /// ([`written_self_view`]). In the signature's hash, so the method's borrow check and
+        /// its callers' are keyed by it; nothing that lowers the signature's types reads it, so
+        /// the method's type, ABI and code are what they are without it.
+        const SELF_VIEW = 1 << 15;
     }
 }
 
@@ -1655,6 +1660,35 @@ pub struct FunctionSignature {
 
 signature_queries!(FunctionSignature, FunctionId, served_function);
 
+/// The view a method's receiver is written with under `#![blaze::views]`, `&self.{a, b}` or
+/// `&mut self.{a}`: the fields named, as written. Whether they are fields of `Self`, once each,
+/// is the borrow check's question (`hir_ty_borrowck::views`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WrittenSelfView {
+    /// The names in the braces, in the order written.
+    pub fields: Box<[Name]>,
+    /// `&mut self.{..}`.
+    pub mutable: bool,
+}
+
+/// The view `func`'s receiver is written with, if it is ([`FnFlags::SELF_VIEW`]). Read from
+/// the source only for a function whose signature says it has one, so no other function's
+/// borrow check reads a position.
+#[blaze_query::tracked(returns(ref))]
+pub fn written_self_view(db: &Db, func: FunctionId) -> Option<WrittenSelfView> {
+    if !FunctionSignature::of(db, func).has_self_view() {
+        return None;
+    }
+    let source = func.lookup(db).source_view(db);
+    let param = source.value.param_list()?.self_param()?;
+    let fields = param.view_fields()?;
+    Some(WrittenSelfView {
+        // alloc: the memo's names, once per method written with a view
+        fields: fields.map(|it| it.as_name()).collect(),
+        mutable: param.mut_token().is_some(),
+    })
+}
+
 impl FunctionSignature {
     /// Lowered from its [`signature_syntax_of`], its body left out.
     fn lower(
@@ -1679,6 +1713,14 @@ impl FunctionSignature {
         flags.set(FnFlags::DEFAULT, default);
         flags.set(FnFlags::EXPLICIT_SAFE, safe);
         flags.set(FnFlags::HAS_BODY, source.value.body().is_some());
+        flags.set(
+            FnFlags::SELF_VIEW,
+            source
+                .value
+                .param_list()
+                .and_then(|it| it.self_param())
+                .is_some_and(|it| it.view_fields().is_some()),
+        );
 
         let name = as_name_opt(source.value.name());
         let abi = source
@@ -1727,6 +1769,11 @@ impl FunctionSignature {
     /// can be called as a method.
     pub fn has_self_param(&self) -> bool {
         self.flags.contains(FnFlags::HAS_SELF_PARAM)
+    }
+
+    /// Whether the receiver is written with a view, `&self.{a, b}` (`#![blaze::views]`).
+    pub fn has_self_view(&self) -> bool {
+        self.flags.contains(FnFlags::SELF_VIEW)
     }
 
     pub fn is_default(&self) -> bool {

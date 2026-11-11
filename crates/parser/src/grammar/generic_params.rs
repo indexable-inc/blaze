@@ -299,6 +299,8 @@ pub(super) fn opt_where_clause(p: &mut Parser<'_>) {
         match p.current() {
             LIFETIME_IDENT => true,
             T![impl] => false,
+            // `where const { .. }`; a `const` before anything else starts no predicate.
+            T![const] => p.nth_at(1, T!['{']),
             token => types::TYPE_FIRST.contains(token),
         }
     }
@@ -317,6 +319,14 @@ fn where_predicate(p: &mut Parser<'_>) {
         }
         T![impl] => {
             p.error("expected lifetime or type");
+        }
+        // `where const { COND }` (blaze's `#![feature(blaze_comptime)]`,
+        // docs/v2/plan/design/ownership.md): the predicate is a `const` block, a `bool` over
+        // the generic parameters that holds when it evaluates to `true`. No Rust program has
+        // it: no type starts with `const`, so rustc refuses the token here. Lowering refuses
+        // it without the feature.
+        T![const] if p.nth_at(1, T!['{']) => {
+            expressions::const_block(p);
         }
         _ => {
             if p.at(T![for]) {

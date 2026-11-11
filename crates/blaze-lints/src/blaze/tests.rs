@@ -1328,6 +1328,103 @@ pub fn own(base: Own) -> Own {
     assert!(!out.contains("`Ext` literal"), "another crate's struct is not checked:\n{out}");
 }
 
+/// `many_bools`: a call or method call passing two or more bare `bool` literals by position is
+/// found, with how many; one passing a single literal, literals inside another argument, or
+/// values that are not literals is not.
+#[test]
+fn many_bools_finds_a_call_passing_bare_bools_by_position() {
+    let out = lint_only(
+        r#"
+pub fn open(path: u8, create: bool, truncate: bool) -> u8 {
+    path + create as u8 + truncate as u8
+}
+pub fn one(flag: bool) -> bool {
+    flag
+}
+pub struct File;
+impl File {
+    pub fn sync(&self, data: bool, meta: bool, wait: bool) -> bool {
+        data && meta && wait
+    }
+}
+pub fn found(file: &File) -> u8 {
+    let a = open(1, true, false);
+    let b = file.sync(true, false, true);
+    a + b as u8
+}
+pub fn not_found(file: &File, create: bool) -> u8 {
+    let a = open(2, create, false);
+    let b = open(3, one(true), one(false));
+    let c = file.sync(create, !create, true);
+    a + b + c as u8 + one(true) as u8
+}
+"#,
+        "many_bools",
+    );
+    assert!(out.contains("this call passes 2 bare `bool`s by position"), "{out}");
+    assert!(out.contains("this call passes 3 bare `bool`s by position"), "{out}");
+    assert!(out.contains("a record parameter with defaults"), "{out}");
+    assert_eq!(out.matches("bare `bool`s by position").count(), 2, "{out}");
+}
+
+/// `default_policy`: a type with a field marked `#[blaze::policy]` is found where it
+/// implements `Default`, derives it, or has a `new()` that takes nothing; a constructor that
+/// takes the field, a named constant, and a type with no marked field are not.
+#[test]
+fn default_policy_finds_a_marked_field_chosen_for_the_caller() {
+    let out = lint_only(
+        r#"
+pub struct Limits {
+    #[blaze::policy]
+    pub abandon_wait: u64,
+    pub name: u32,
+}
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits { abandon_wait: 1, name: 0 }
+    }
+}
+impl Limits {
+    pub const USUAL: Limits = Limits { abandon_wait: 1, name: 0 };
+    pub fn new() -> Limits {
+        Limits { abandon_wait: 1, name: 0 }
+    }
+    pub fn with(abandon_wait: u64) -> Limits {
+        Limits { abandon_wait, name: 0 }
+    }
+}
+#[derive(Default)]
+pub struct Wire {
+    #[blaze::policy]
+    pub body_most: usize,
+}
+pub struct Plain {
+    pub count: u32,
+}
+impl Default for Plain {
+    fn default() -> Plain {
+        Plain { count: 0 }
+    }
+}
+impl Plain {
+    pub fn new() -> Plain {
+        Plain { count: 0 }
+    }
+}
+"#,
+        "default_policy",
+    );
+    assert!(out.contains("`impl Default for Limits` picks its `abandon_wait`"), "{out}");
+    assert!(out.contains("`Limits::new()` takes nothing, so it picks `abandon_wait`"), "{out}");
+    assert!(out.contains("`Wire` derives `Default`, which picks its `body_most`"), "{out}");
+    assert!(out.contains("marked `#[blaze::policy]`"), "{out}");
+    // The control: the same shapes on a type with no marked field, a constructor that takes
+    // the field and a named constant are not findings.
+    assert!(!out.contains("Plain"), "a type with no marked field is not checked:\n{out}");
+    assert!(!out.contains("Limits::with"), "a constructor that takes the field is not a finding:\n{out}");
+    assert_eq!(out.matches("blaze::default_policy").count() >= 3, true, "{out}");
+}
+
 /// `bool_param`: a `bool` parameter of a public, crate-visible or private function, and of a
 /// trait's declaration, is found, the enum named from the parameter; a setter of one `bool`,
 /// a trait impl's method, a closure and an `extern "C"` function are not.

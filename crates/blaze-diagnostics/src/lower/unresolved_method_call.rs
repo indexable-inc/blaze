@@ -2,7 +2,8 @@
 //! rustc's notes: an associated function of that name to call with `T::f()` instead, a field
 //! of that name to call as `(x.f)()`, the other types the method is on, a method of a similar
 //! name, the traits that would give it (to import, or to implement), and where the type is
-//! defined. The parts shared with `T::f` (`unresolved_assoc_item`) are here.
+//! defined. The parts shared with `T::f` (`unresolved_assoc_item`) are here. A receiver that
+//! was a number of undecided type at the call is `method_on_ambiguous_numeric`'s (E0689).
 //!
 //! Follows rustc's `compiler/rustc_hir_typeck/src/method/suggest.rs`
 //! (`report_no_match_method_error`, `create_no_assoc_err`, `set_label_for_method_error`,
@@ -32,7 +33,7 @@ use crate::{
     cx::{Cx, def_range_view as def_range},
     lints::code_fact,
     lower::{
-        Found, Phase,
+        Found, Phase, method_on_ambiguous_numeric,
         unresolved_field::{fn_def_span, type_param_span},
     },
     model::{Applicability, Diag, Span, Suggestion, SuggestionStyle},
@@ -59,6 +60,21 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::UnresolvedMethodCall<'db>) -
         is_method: true,
         args: Some(args.len()),
     };
+    // A receiver that was `{integer}` or `{float}` where the method was looked up: E0689,
+    // which never names the type the number became afterwards (`d.receiver`).
+    if let Some(numeric) = d.numeric_var {
+        let mut diag = method_on_ambiguous_numeric::lower(
+            cx,
+            d,
+            numeric,
+            call,
+            node.file_id,
+            &no_match,
+        );
+        code_fact(cx, &mut diag, d.expr.map(|it| it.syntax_node_ptr()));
+        // alloc: the error's parts, for an error hir found
+        return vec![Found::new(diag, Phase::Bodies)];
+    }
     let name = no_match.name();
     let item_kind = no_match.item_kind();
     let mut diag = no_match.error(cx, item_kind);

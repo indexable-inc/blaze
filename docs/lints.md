@@ -16,8 +16,54 @@ The group `blaze::pedantic_perf` (`deep_drop_at_exit`, `packable`, `pod_serializ
 `soa_candidate`, `vecreport`) is speed advice that trades something else away or can't see whether the code is hot; it is
 allowed unless a workspace or crate turns it on (`pedantic_perf = "warn"`; `vecreport`, which
 the release build reports, only by its flags). `checkfree`,
-`nopanic`, `noalloc` and `nonblocking` are in `blaze::general` but `deny` by default, and fire
-only on functions marked with their attribute (`#[blaze::checkfree]`, `#[blaze::nopanic]`, ...).
+`nopanic`, `noalloc`, `nonblocking` and `undeclared_effect` are in `blaze::general` but `deny` by
+default, and fire only where the code asks: on functions marked with their attribute
+(`#[blaze::checkfree]`, `#[blaze::nopanic]`, ...), and for `undeclared_effect` where a
+`#[blaze::may(..)]` or `#![blaze::effects]` reaches the function.
+
+The group `blaze::edition` flags what the blaze edition removes
+([the plan](v2/plan/design/edition.md)). Its lints here are those of code blaze cannot analyse:
+a procedural macro a crate of the workspace defines ([`proc_macro`](#proc_macro), one lint per
+kind, the three also a group of their own, `blaze::proc_macro`) and a build script that uses
+the standard library's ambient IO ([`build_script_ambient`](#build_script_ambient)); and the
+lint of what blaze's own standard library replaces, [`std_use`](#std_use). Each tells
+code to move to something of blaze's, so none says "write X" before X is in the tree: until
+then each is `allow` by default and says in its help that the replacement is planned. The
+switches are the constants of `crates/blaze-lint-defs/src/ready.rs`; a test holds this
+table to the levels the lints have:
+
+| lint | default | the replacement it names | warns by default once |
+|---|---|---|---|
+| `blaze::proc_macro_derive` | `allow` | a generic impl over the type's fields (`for const f in fields_of::<T>()`) | `REFLECTION_REPLACES_MACROS` is `true`: phase 2 of [compile-time reflection](v2/plan/design/comptime.md) is built and its tests pass |
+| `blaze::proc_macro_attribute` | `allow` | reflection over the item and a generic function | the same switch |
+| `blaze::proc_macro_fn_like` | `warn` | a `const fn` or a `const` block; a macro that parses a foreign syntax may stay | now: `const fn` is Rust's |
+| `blaze::build_script_ambient` | `allow` | a capability the script is handed (`Fs`, `Env`, `Process`, `Net`, `Clock`) | `CAPABILITIES_FOR_BUILD_SCRIPTS` is `true`: [blaze's standard library](v2/plan/design/std.md) is in the tree and a build script is handed its capabilities |
+| `blaze::std_use` | `allow` | what [bstd](v2/plan/design/std.md) has in place of each item of Rust's `std`, by [its table](#std_use) | never by default: a crate asks with `#![blaze::capabilities]`, and a workspace with a line of its `lints-when-ready` table, which holds once `BSTD_IN_TREE` is `true` |
+
+`edition = "warn"` (or `#![warn(blaze::edition)]`) turns the whole group on whatever the
+switches say; `proc_macro = "allow"` (or `#![allow(blaze::proc_macro)]`) turns the three macro lints
+off. They look only at the workspace's own crates, as every lint here does: `blaze check` lints
+the workspace's packages, and a registry or git crate is checked, not linted, its lints capped
+at `allow`. The macro and build-script lints have no fix: neither rewrite is mechanical.
+`std_use` has one for its renames alone.
+
+A workspace can wait for a switch too. Beside `[workspace.metadata.blaze.lints]`, the table
+`[workspace.metadata.blaze.lints-when-ready]` takes the same lines, of lints that have a
+switch: each sets its level once the lint's switch is `true`, and nothing until then. It is a
+table of its own because a released blaze refuses a lint name it does not know in the first
+table, and reads no table it does not know: the line can be written before the blaze that
+builds the tree has the lint. blaze's own manifest does not wait for `BSTD_IN_TREE`: its
+ratchet denies `std_use` now ([the ratchet](#workspace-levels-and-the-ratchet)).
+
+The group also holds what the edition removes or respells (`async_fn`, `global_state`,
+`lossy_as`, `mut_ref`), what it writes at a crate's border (`unmarked_pure`,
+`unmarked_nopanic`, `unmarked_noalloc`, `unmarked_nonblocking`) and the type facts
+(`program_lifetime`, which is `deny` where it fires, `could_be_program_lifetime`,
+`could_be_ref32`). None of these has a switch: each is allowed unless a workspace or crate
+turns it, or the group, on. Of them only `mut_ref` and the four `unmarked_*` lints have a fix.
+The three `unmarked_*` effect lints still write the old spellings (`#[blaze::nopanic]`, ..),
+which [`negative_effect`](#undeclared_effect-unneeded_effect-negative_effect) then asks to
+respell as `#[blaze::may(..)]`; they are to be ported to write the list.
 
 Several lints come from ideas of the Goose language (no global heap, data stacks, bump
 growth, inline nested data, narrow relative links, variable-size enums, in-place construction
@@ -48,6 +94,33 @@ hash_twice = "deny"
 A group applies before the single lints the table names, so `hash_twice = "deny"` wins over
 `general = "allow"`. A rustc-style flag (`--allow=blaze::general`) does the same.
 
+## Workspace levels and the ratchet
+
+blaze's own workspace denies every lint of blaze's in every crate, and lets a crate that
+still trips one stay at `warn` on it only while the crate is listed in the lint's baseline.
+The levels are in `[workspace.metadata.blaze.lints-ratchet]`, which this blaze reads in place
+of `[workspace.metadata.blaze.lints]`: every group at `deny`, and below it, each with its
+reason beside it in the manifest, `hot` (the costs that matter only in hot code), the parallel
+lints (suggestions) and `vecreport` (not run by `blaze check`). The released blaze that builds
+the tree reads the older table, at `warn`.
+
+The table's `baselines` key names the directory, `crates/blaze-lints/baselines`. Its file
+`blaze.<lint>.txt` has a line `crate<TAB>count` per crate held at `warn` on that lint, or
+`crate<TAB>unmeasured` before a run has counted it; each listed crate gets
+`--warn=blaze::<lint>` after the workspace's levels. A crate with no line is at `deny`. The
+list only shrinks:
+
+- `harness/v2/guards.py '{"command": "ratchet", "base": "<rev>"}'` refuses a crate a baseline
+  did not list at the base, a count that rose, and a count turned back to `unmeasured`. The
+  gate's `lint-baselines` job runs it against the pull request's base.
+- `blaze check --workspace --target aarch64-unknown-linux-gnu --baselines
+  crates/blaze-lints/baselines` fails on a count over its line or a line over its count.
+  Adding `--bless-baselines` records each count, drops each crate at zero, and deletes a
+  baseline with no crate left, saying so. That lint is then `deny` everywhere.
+
+A new crate gets no line, so it is held to every lint from the start. Making a lint `warn`
+again for a crate is a change to this section's rule, not to a baseline.
+
 ## Thresholds
 
 The lints with a threshold read it from `clippy.toml` (or `.clippy.toml`), as clippy's lints do:
@@ -64,6 +137,7 @@ The lints with a threshold read it from `clippy.toml` (or `.clippy.toml`), as cl
 | `bounded-heap-field-string-bytes` | `bounded_heap_field` | 16 (bytes) |
 | `bounded-heap-field-vec-len` | `bounded_heap_field` | 8 (elements) |
 | `large-box-threshold` | `box_large_new` | 4096 (bytes) |
+| `unmarked-effects-private` | `unmarked_pure`, `unmarked_nopanic`, `unmarked_noalloc`, `unmarked_nonblocking` | `false` (a flag; `true` also finds functions with no visibility written) |
 
 ```toml
 # clippy.toml
@@ -136,6 +210,25 @@ read it under epoch or hazard-pointer reclamation (arc-swap's guards, `crossbeam
 clone lives.
 
 **Allowing it.** `#[expect(blaze::arc_clone_only_borrowed, reason = "..")]` on the function.
+
+## `async_fn`
+
+In `blaze::edition`, allowed by default.
+
+**What it catches.** An `async fn`, an `async` block and an `async` closure: one finding per
+outermost one, so an `.await`, or an `async` block inside an `async fn`, goes with the finding
+of the construct it is in. An `async fn` declared inside another function is found on its own.
+
+**Why it matters.** The blaze edition has no `async` or `.await`: code runs on a fiber, a call
+that waits parks the fiber, and the may-suspend effect is inferred from the body. `async`
+splits every API into two colours and every caller has to choose one.
+
+**How to fix it.** Write it as a plain function run on a fiber, and call what it awaited
+directly.
+
+**Not found.** What a macro wrote with no input of the file (a macro's own `async` block).
+
+**Allowing it.** `#[expect(blaze::async_fn, reason = "..")]` on the function or item.
 
 ## `blocking_in_async`
 
@@ -278,6 +371,66 @@ relative links.
 (`struct NodeId(u32)`): one allocation, nodes next to each other, freed at once.
 
 **Allowing it.** `#[expect(blaze::boxed_recursive_node, reason = "..")]` on the type.
+
+## `build_script_ambient`
+
+In `blaze::edition`; its default is in [the table above](#the-general-lints).
+
+**What it catches.** A build script of the workspace (`build.rs`, or the file the manifest's
+`build =` names) that uses the standard library's ambient authority, reaching by itself for:
+
+- the file system: a function of `std::fs`, or of its `File`, `OpenOptions`, `DirBuilder`,
+  `ReadDir` or `DirEntry`;
+- the environment: `std::env`'s `var`, `var_os`, `vars`, `vars_os`, `set_var`, `remove_var`,
+  `current_dir`, `set_current_dir`, `args`, `args_os`, `current_exe`, `temp_dir`, `home_dir`;
+- processes: `std::process`'s `Command` and `Child`, `exit`, `abort`, `id`;
+- the network: `std::net`'s `TcpStream`, `TcpListener`, `UdpSocket`;
+- the clock: `now` and `elapsed` of `Instant` and `SystemTime`.
+
+It is [`std_use`](#std_use) over a build script: the same table of what bstd replaces and the
+same walk, here the rows of these five authorities, reported once per script and not once per
+function, since it is the script's whole reach that keeps blaze from analysing it. `std_use`
+says nothing of a build script.
+
+A use is a path that names the function, called or not, or a method call (`cmd.status()`),
+found by what it resolves to: through a `use`, an alias, a glob or a re-export, never by the
+text written. There is one finding per distinct item per script (a free function, or the type
+for a type's functions), at its first use, with the count of its uses in the whole script:
+
+```text
+warning: `std::env::var`, used 2 times in this build script, reads or changes the environment by itself
+  = note: a build script that reaches for the file system, the environment or a process by itself cannot be analysed: blaze must run it in a sandbox, trace what it read, and rerun it whenever anything it might have read changes
+  = note: the capability that replaces `std::env::var` is `Env` (`Args` for the command line), of blaze's standard library, which is planned and not in this blaze
+  = help: nothing to change yet: the replacement is a capability the script is handed (`Fs`, `Env`, `Process`, `Net`, `Clock` of blaze's standard library, docs/v2/plan/design/std.md), which states in the script's signature what it can touch, lets blaze prove what it reads, and reruns it only when that changes; that library is not in this blaze, and this lint is `allow` by default until it is
+```
+
+Once the library is in the tree the second note reads "take `Env` (`Args` for the command
+line) as a parameter in place of `std::env::var`" and the help "take the capability as a
+parameter instead (..)".
+
+**Why it matters.** blaze cannot tell what such a script depends on without running it. It runs
+every build script in a sandbox, traces the files and variables it read, and keys the run by
+them ([cargo.md](cargo.md#build-scripts-and-proc-macros-run-in-a-sandbox)); a script that walks
+its environment or starts a program is keyed by all of it. A script that is handed a capability
+states in its signature what it can touch, so what it reads is proved before it runs and it
+reruns only when that changes.
+
+**How to fix it.** Nothing yet, while the lint is `allow` by default: the capabilities are
+[bstd's](v2/plan/design/std.md) (`Fs` and a `Dir` of it, `Env` and `Args`, `Process` and the
+`Runner` that runs a command in a sandbox, `Net`, `Clock`), which is planned. A script that
+only prints constant directives is already read and never run.
+
+**Not found.** `println!("cargo::..")` (and `cargo:..`): that is how a script talks to the
+build, and information, not ambient authority. A type only named in a signature,
+an item only code a macro wrote uses, and `env!` and `option_env!`, which the compile reads.
+The same code in a crate that is not a build script: that is [`std_use`](#std_use). Whether a
+script is needed at all is not judged.
+
+**No fix.** Which capability a script is handed, and by whom, is not a mechanical rewrite.
+
+**Allowing it.** `#![allow(blaze::build_script_ambient)]` at the top of the script, or
+`#[expect(blaze::build_script_ambient, reason = "..")]` on the function with the first use of
+an item, which keeps that item's finding.
 
 ## `checkfree`
 
@@ -518,6 +671,32 @@ each constant time. Or reverse the `Vec` once and work at its end with `pop` and
 **Allowing it.** `#[expect(blaze::front_vec_ops, reason = "..")]`, for a `Vec` known to stay
 a few elements long.
 
+## `global_state`
+
+In `blaze::edition`, allowed by default.
+
+**What it catches.** State of the whole program any code can reach by name: a `static mut`; a
+`static` whose type has interior mutability, decided by the type system (its type is not
+`Freeze`: an atomic, a `Mutex`, `RwLock`, `OnceLock` or `LazyLock`, a `Cell`, `RefCell` or
+`UnsafeCell`, a `blaze_core::lock` lock, or anything holding one); and each item of std's
+`thread_local!`. The message lists where in the crate it is used, each body once, in a fixed
+order: for a `static mut` the functions that write it and those that only read it, for the
+rest those that use it (a use through `&` may write).
+
+**Why it matters.** Every access to a `static mut` is `unsafe`, and nothing orders one
+thread's write before another's read. Interior-mutable statics and thread-locals are state
+shared by every caller, invisible in any signature; a thread-local's value can change under
+code on a fiber that moves between threads. The blaze edition removes all three.
+
+**How to fix it.** Choose the owner from the uses the message lists, and hand the state (or a
+handle to it) to the code that uses it as a context. For a `static mut` of an integer, `bool`
+or pointer that must stay shared, the message names the atomic that fits.
+
+**Not found.** A `static` of plain data that is not `mut` (`static NAMES: [&str; 2]`), a
+`const`, and what a macro wrote with no input of the file.
+
+**Allowing it.** `#[expect(blaze::global_state, reason = "..")]` on the item.
+
 ## `hash_twice`
 
 **What it catches.** A lookup of a key in a hash map or set (`get`, `contains_key`, `contains`,
@@ -588,6 +767,48 @@ found.
 
 **Allowing it.** `#[expect(blaze::jagged_vec, reason = "..")]` on the struct.
 
+## `lossy_as`
+
+In `blaze::edition`, allowed by default.
+
+**What it catches.** An `as` cast that can lose value or sign, or that goes between a pointer
+and an integer, by the types the front end inferred: an integer to a narrower one
+(`u64 as u32`), between signed and unsigned (`i32 as u32`, `u32 as i32`), a float to an
+integer (drops the fraction, saturates), an integer to a float whose mantissa can't hold it
+(`u64 as f64`), a float to a narrower float, a `char` to an integer narrower than 21 bits, a
+pointer to an integer (drops provenance) and an integer to a pointer. `usize` and `isize` count
+as 32 to 64 bits, so `usize as u32` and `u64 as usize` are both found. The message names the
+two types and what can be lost; the note names the conversion that says it (`T::try_from`,
+`cast_signed`, `cast_unsigned`, `wrapping_*`, `ptr.addr()`, `ptr::with_exposed_provenance`).
+
+**Why it matters.** `as` silently truncates, wraps, rounds or saturates, and the cast looks
+the same whether it can lose or not. The blaze edition removes the lossy forms.
+
+**How to fix it.** `From` where nothing can be lost (`u64::from(x)`), `T::try_from(x)` where
+it can, or the method that names the loss.
+
+**Not found.** A cast that can't lose (`u8 as u32`, `bool as u8`, `f32 as f64`), a cast to its
+own type, and a cast of a literal or a `const` whose value fits the target.
+
+**Allowing it.** `#[expect(blaze::lossy_as, reason = "..")]`.
+
+## `many_bools`
+
+Allowed by default; part of getting a crate ready for
+[records](v2/plan/design/records.md) (the edition's change 4).
+
+**What it catches.** A call or method call that passes two or more bare `true` or `false`
+literals by position: `open(path, true, false)`. Nothing at the call says what each chooses,
+and two of them swap without a type error. It reads the call alone, so the callee may be any
+crate's. Not counted: a literal inside another argument (`f(g(true), true)` passes one), a call
+under `#[cfg(test)]` or `#[test]`, and a call a macro wrote.
+
+**What to do.** Name the choices at the call. Under `#![blaze::records]` the callee takes a
+record parameter with defaults, `fn open(path: &Path, opts: { create: bool = false, truncate:
+bool = false })`, called as `open(path, { create: true, .. })`; without it, two-variant enums
+named for the choices. There is no fix: the names are the author's. To keep a call, say why:
+`#[expect(blaze::many_bools, reason = "..")]`.
+
 ## `missing_size_hint`
 
 **What it catches.** An `impl Iterator` for a struct of the crate that either:
@@ -605,6 +826,48 @@ their buffer by doubling (reallocating and copying) instead of allocating once, 
 ExactSizeIterator for ..` when the count is exact.
 
 **Allowing it.** `#[expect(blaze::missing_size_hint, reason = "..")]` on the impl.
+
+## `mut_ref`
+
+In `blaze::edition`, allowed by default; says nothing in a crate without `#![blaze::uniq]`.
+
+**What it catches.** In a crate that says `#![blaze::uniq]`, a unique reference spelled with
+`mut`: `&mut T` and `&'a mut T` in a type, `&mut expr` in an expression, `&mut self` and
+`&'a mut self` as a receiver, and `ref mut x` and `&mut pat` in a pattern.
+
+**Why it matters.** Under `#![blaze::uniq]`, `&uniq T` is `&mut T`, spelled for what it
+guarantees: no other reference to the place is live while it is. Mutation through it follows
+from that. The two spellings are the same type and are accepted for each other, so the lint
+only brings a crate to the one spelling the edition uses.
+
+**How to fix it.** `blaze check --fix`: the fix is machine-applicable and only respells `mut`
+as `uniq`. An operand that starts with `<`, `::`, `!` (or, in an expression, `.`, `{` or
+`#`; in a pattern, `.`) would keep `uniq` a name there, so the fix puts it in parentheses:
+`&mut <T>::new()` becomes `&uniq (<T>::new())`.
+
+**The gate.** `#![blaze::uniq]`, written as itself among the crate root's leading inner
+attributes (not through `cfg_attr` or a macro), makes `uniq` a keyword in exactly those five
+places, told by the token after it: `&uniq;`, `&uniq.x`, `&uniq::X`, `&uniq<T>` and
+`&uniq!()` stay a variable, path or macro named `uniq`, and in a pattern `&uniq =`, `&uniq,`
+and `&uniq::X` stay a shared reference pattern that binds or names `uniq`. Under the gate
+`&uniq (x)`, `&uniq [0]`, `&uniq - 1` and `&uniq * x` are unique borrows of the operand, where
+rustc would read a call, an index or arithmetic on `uniq`, and the pattern `&uniq (a, b)` is a
+unique reference pattern over a tuple, where rustc would read a tuple struct `uniq`. Types print as `&uniq T` in the crate's diagnostics. Without
+the gate, `&uniq T` is the syntax error it is in rustc.
+
+**In macros.** A token is parsed under the gate of the crate whose source wrote it, wherever
+a macro carries it: `&uniq x` in `vec![..]` or `assert!(..)`, in a function under `#[test]`,
+and in the body of a `macro_rules!` of a crate with the gate, expanded in any crate. What a
+crate without the gate writes stays Rust, also when it is handed to such a macro. The lint
+finds what a macro call of the file is handed (a call's arguments, an item under an attribute
+macro) as it finds the file's other code.
+
+**Not found.** `let mut x` and any `mut` binding without `ref`, `mut self`, `*mut T`,
+`&raw mut place`, a `&pin mut pat` reference pattern (which has no `uniq` spelling), a
+reference already spelled `uniq`, and what a macro's definition writes (token trees, respelled by
+hand).
+
+**Allowing it.** `#[expect(blaze::mut_ref, reason = "..")]` on the function or item.
 
 ## `native_contracts`
 
@@ -682,15 +945,23 @@ method of an impl of a trait so marked, that may, through any call:
 - `nopanic`: panic or abort: a panic entry point, an `Assert` the MIR keeps (a bounds check, a
   division check; an overflow check when the crate is built with `overflow-checks`, which the
   lint says), a foreign function whose ABI may unwind. An assert the constants decide
-  (`arr[2]` on a `[T; 4]`) is not one.
+  (`arr[2]` on a `[T; 4]`) is not one. Nor is the library's check of an `unsafe` precondition
+  (`core::ub_checks::assert_unsafe_precondition!`, which aborts in a build with debug
+  assertions) reached through a safe function of the toolchain: `wrapping_shl`, a slice's
+  iterator, `NonNull::new`, `MaybeUninit::zeroed` and `CStr::to_bytes` uphold what they call,
+  and the toolchain is trusted for `unsafe`. Calling the `unsafe fn` yourself
+  (`unchecked_add`, `NonNull::new_unchecked`, `hint::assert_unchecked`) still counts: the
+  precondition is yours to uphold, and the finding names the call.
 - `noalloc`: call the global allocator (`Vec::new`, `Box::new`, `to_owned`, `malloc`). An
   allocator the code names (`Vec::new_in(frame)`) is allowed.
 - `nonblocking`: block the thread: std's and `parking_lot`'s locks, condvars and channels,
   `thread::sleep`, `JoinHandle::join`, and the syscalls that wait (`read`, `write`, `futex`,
   `poll`, `accept`, `connect`).
 
-Each also refuses what it can't see: a call through a `dyn` or a function pointer it can't
-follow, and (`noalloc`, `nonblocking`) a foreign function or `asm!` it knows nothing of. The
+Each also refuses what it can't see: a function pointer the function takes, a call through a
+`dyn` it takes whose method has no `#[blaze::may(..)]` leaving the word out (taking the `dyn`,
+storing it or handing it on is fine; the finding names the method called), and (`noalloc`,
+`nonblocking`) a foreign function or `asm!` it knows nothing of. The
 finding says the shortest call chain to what does it, each step with its file and line. They
 are `deny` by default: the function asked for it. The tables and rules are in
 [v2/plan/lanes/effects.md](v2/plan/design/effects.md).
@@ -706,6 +977,62 @@ proof. Or take the attribute off.
 
 **Allowing it.** `#[expect(blaze::nopanic, reason = "..")]` on the function.
 
+These three are the old spellings of `#[blaze::may(..)]`, next.
+
+## `undeclared_effect`, `unneeded_effect`, `negative_effect`
+
+`#[blaze::may(panic, alloc, block, diverge)]` (a blaze extension, opt-in; it changes
+diagnostics, never code) lists what a function, and everything it calls, may do: panic or
+abort, call the global allocator, block the thread, not return. A word the list leaves out is
+an effect the function does not have. The design, the rules and the tables are in
+[v2/plan/design/effects.md](v2/plan/design/effects.md).
+
+**What they catch.**
+
+- `undeclared_effect` (`deny`): a function with an effect its allowance leaves out. The
+  allowance is the function's own list; else the list of the trait's method it implements (or
+  of the trait); else the `#![blaze::may(..)]` of the nearest module around it; else nothing
+  at all in a crate with `#![blaze::effects]`. The first written holds alone: a function's own
+  list replaces a module's default, it is not added to it. A function none of these reach is
+  not looked at, so a crate that declares nothing is unaffected. The finding says each effect
+  with its witness: the shortest call chain to what has it, each step with its file and line,
+  or for `diverge` the line of a loop not known to end, or the chain of a recursion and which
+  function is called again. Also: an impl's method whose list has a word its trait's method
+  does not allow (an impl may declare fewer effects, never more), a function with both a list
+  and an old spelling, and a list that is not words separated by commas.
+- `unneeded_effect` (`warn`): a word of a private function's list for an effect the function
+  is proved not to have. Not on a function with a visibility written, a trait's method or an
+  impl's method of one: a public signature may reserve the right, and a trait method's list is
+  the bound of its impls. `panic` is found only where the crate is checked with overflow
+  checks, so the shorter list holds in dev and in release.
+- `negative_effect` (`warn`): `#[blaze::nopanic]`, `#[blaze::noalloc]` or `#[blaze::nonblocking]`
+  on a function under a module's default or `#![blaze::effects]`. The old spellings still mean
+  what they meant, everywhere; where effects are declared, the function says what it may do.
+
+`diverge` in short: a counted `while i < n { ..; i += 1; }` is known to end (with the crate's
+overflow checks, any positive step and `<=` too); every other loop (`for`, `while let`,
+`loop`), recursion, and a call through a function pointer or a `dyn` whose trait method has no
+list need the word, until `decreases` clauses exist. What the check can't see (an unknown
+foreign function, a function pointer or unlisted `dyn` parameter) may do anything, so it needs
+every word.
+
+**Why it matters.** A signature that lists what can happen is complete: a reader, and a caller
+on a pool thread, in a signal handler or under a deadline, knows what the call can do without
+reading its body, and the list keeps holding as the code changes, in every crate it reaches.
+
+**How to fix it.** `blaze check --fix` writes each list: the missing words added
+(`undeclared_effect`; under `#![blaze::effects]` that is a `#[blaze::may(..)]` with exactly the
+inferred effects on every function that needs one), the unneeded word taken off
+(`unneeded_effect`), the old spellings rewritten to the list they stand for
+(`negative_effect`: `nopanic` and `nonblocking` on a function that allocates and may not return
+become `#[blaze::may(alloc, diverge)]`). Or handle the effect so the function no longer has it
+(`get` or `checked_*`, the task's frame, the scheduler's wait, a counted loop), or mark a
+callee proven by hand `#[blaze::may(.., trusted = "why")]`: its list is then taken at its word,
+and the reason is kept in the proof.
+
+**Allowing it.** `#[expect(blaze::undeclared_effect, reason = "..")]` (likewise the others) on
+the function.
+
 ## `pure`
 
 **What it catches.** A function marked `#[blaze::pure]` (a blaze extension, opt-in; it changes
@@ -715,7 +1042,8 @@ stdio; spawning, sleeping or asking about threads; reading or writing a `static 
 with interior mutability or a thread-local; observing an address (a pointer cast to a number, a
 pointer hashed, ordered or formatted with `{:p}`); `RandomState` or the system's randomness; a
 foreign function or `asm!` not known to be deterministic. A root parameter the check can't see
-through is refused too: a `dyn` or a function pointer (take a type parameter), a raw pointer, or
+through is refused too: a function pointer (take a type parameter), a `dyn` the function calls
+an unlisted method through, a raw pointer, or
 state with interior mutability behind a shared reference (`&AtomicU64`, `&Mutex<T>`), which
 another thread can change during the call. Allocation, panics, atomics and cells on memory the
 function owns are allowed. The finding says the shortest call chain to what does it, each step
@@ -732,6 +1060,46 @@ function, or a trait: every impl's method and every call through `dyn` of it); t
 the trusted function's crate are kept in the proof. Or take the attribute off.
 
 **Allowing it.** `#[expect(blaze::pure, reason = "..")]` on the function.
+
+## `capabilities`
+
+**What it catches.** A function of a crate whose root says `#![blaze::capabilities]` (a blaze
+extension, opt-in; it changes diagnostics, never code) that, through any call, reaches one of
+three effects past the crates its workspace trusts:
+
+- `ambient`: std's file, environment, network, clock, randomness, process and thread entry
+  points, or a system call or other foreign call beneath them;
+- `unsafe`: an `unsafe` block written in the reached code, or an `unsafe fn`'s body (the block
+  `format_args!` makes, and a macro defined `#[allow_internal_unsafe]`, are not);
+- `global_alloc`: a call of the global allocator. An allocator the code is handed
+  (`Vec::new_in(arena)`) is not one.
+
+The finding names the function, the effect, the call or block that does it and the call path,
+each step with its file and line. It is `deny` by default: the crate asked for it. A crate
+without the attribute is not checked. What counts and why is in
+[v2/plan/design/std.md](v2/plan/design/std.md).
+
+**The trusted crates.** A workspace lists the crates whose code it has checked by hand:
+
+```toml
+[workspace.metadata.blaze.trusted]
+libc = { owner = "io", reason = "the C library's calls, behind bstd's Io" }
+```
+
+Each entry needs an `owner` and a `reason`; a toolchain crate can't be listed. What a trusted
+crate does itself, and what it reaches in the crates it depends on, does not count for any of
+the three effects; a closure or impl of another crate it calls still does. core and alloc are
+trusted for `ambient` and `unsafe` by default, but `alloc`'s allocation of the global heap
+(`Vec::new`) still counts for `global_alloc`; the rest of the toolchain is trusted for `unsafe`.
+
+**Why it matters.** A capability-based crate reaches the outside world only through what it is
+handed, so what a caller gives it is all it can do; the promise holds only when nothing it
+reaches, in any crate, takes the world another way.
+
+**How to fix it.** Take the IO, the allocator or the safe interface as an argument, move the
+code into a trusted crate (with an owner and a reason), or take the attribute off.
+
+**Allowing it.** `#[expect(blaze::capabilities, reason = "..")]` on the function.
 
 ## `outline_generic_body`
 
@@ -826,6 +1194,62 @@ machine's byte order.
 **Why it is off.** The lint can't see whether the values are serialized often enough to
 matter, nor whether the format needs serde's (text, or a fixed byte order).
 
+## `proc_macro`
+
+The group `blaze::proc_macro` of three lints, `proc_macro_derive`, `proc_macro_attribute` and
+`proc_macro_fn_like`, each in `blaze::edition`; their defaults are in
+[the table above](#the-general-lints).
+
+**What it catches.** A procedural macro a crate of the workspace defines: a `#[proc_macro]`,
+`#[proc_macro_derive(..)]` or `#[proc_macro_attribute]` function of a crate with
+`proc-macro = true`. One finding per macro, at the function's name, naming the macro as it is
+called (a derive by the name it is derived by) and its kind:
+
+```text
+warning: the function-like macro `sql` is a procedural macro, which blaze cannot see through
+  = note: a procedural macro is opaque code that runs at build time and rewrites tokens: what it generates is not checked until it is expanded, cannot be analysed or cached per item, and reruns whenever the tokens of its input move
+  = help: a macro that builds data at compile time is a `const fn` or a `const { .. }` block, which blaze checks once, analyses and caches as ordinary code (`core::mem::type_info` answers there, docs/v2/plan/design/comptime.md); a macro that parses a foreign syntax (a DSL in a string or in tokens) is not replaced by reflection and may stay: say so with `#[expect(blaze::proc_macro_fn_like, reason = "parses ..")]`
+```
+
+The first line is the same for "the derive macro `Describe`" and "the attribute macro
+`route`"; the help is the kind's:
+
+| kind | lint | help today |
+|---|---|---|
+| derive | `proc_macro_derive` | "nothing to change yet: the replacement is a generic impl over the type's fields by compile-time reflection (`for const f in fields_of::<T>()`), phase 2 of docs/v2/plan/design/comptime.md, which is behind the opt-in `#![feature(blaze_comptime)]` and not complete in this blaze; this lint is `allow` by default until it is" |
+| attribute | `proc_macro_attribute` | "nothing to change yet: the replacement is reflection over the item (`fields_of::<T>()`, `fn_info(&f)`) and a generic function that does what the generated impls or registrations do, phase 2 of docs/v2/plan/design/comptime.md, which is behind the opt-in `#![feature(blaze_comptime)]` and not complete in this blaze; this lint is `allow` by default until it is" |
+| function-like | `proc_macro_fn_like` | as above |
+
+Once phase 2 is built the first two say what to write: "write the derive as a generic impl over
+the type's fields by compile-time reflection: `for const f in fields_of::<T>()` reading
+`value.[f]`, bounded by `for<F: Field<T>> F::Type: Trait`, under `#![feature(blaze_comptime)]`"
+and "write what the attribute generates as a generic function over the item by compile-time
+reflection: its fields with `for const f in fields_of::<T>()`, a function's facts with
+`fn_info(&f)`".
+
+**Why it matters.** blaze checks, caches and reruns code per item. A procedural macro is a
+program that takes tokens and returns tokens: nothing about what it generates is known until it
+has run, an error in its output is reported in code nobody wrote, and it runs again whenever
+the tokens of its input move, a comment or a reordering included. Code written with
+[compile-time reflection](v2/plan/design/comptime.md) is ordinary typed code, checked once.
+
+**How to fix it.** A function-like macro that builds data at compile time: a `const fn` or a
+`const` block, today. A derive or an attribute macro: nothing yet; phase 1 of reflection
+(`core::mem::type_info`) is in blaze's const evaluator, and phase 2, which replaces them, is
+behind the opt-in `#![feature(blaze_comptime)]` and not complete. A macro that parses a
+foreign syntax (a query language, a template, a grammar in a string or in tokens) is not
+replaced by reflection and may stay.
+
+**Not found.** A use of a macro another crate defines (`#[derive(Serialize)]`): a workspace
+cannot rewrite serde, so only definitions are findings, and there is no lint that lists uses.
+A `macro_rules!` macro, which blaze expands and sees through. A dependency's proc-macro crate,
+which is not linted.
+
+**No fix.** The rewrite is the author's.
+
+**Allowing it.** `#[expect(blaze::proc_macro_fn_like, reason = "parses ..")]` (or the kind's
+lint) on the macro's function, or `#![allow(blaze::proc_macro)]` for the crate.
+
 ## `profile_hot`
 
 **What it catches.** Nothing of its own: it is the level of the perf lints in a function the
@@ -844,6 +1268,41 @@ says how much of the profile the function is.
 
 **Allowing it.** `#[allow(blaze::profile_hot)]` on the function or module, or `profile_hot =
 "allow"` in `[workspace.metadata.blaze.lints]`, keeps the hot lints at their own levels.
+
+## `program_lifetime`, `could_be_program_lifetime`, `could_be_ref32`
+
+In `blaze::edition`. `program_lifetime` is `deny` where it fires (only on a type declared
+`#[blaze::program_lifetime]`); the other two are allowed by default. Design:
+[facts](v2/plan/design/facts.md).
+
+**What they catch.**
+
+- `program_lifetime`: a type declared `#[blaze::program_lifetime]` (its instances live until
+  the program exits) that cannot be: it has a parameter or a `Drop`; a field holds a value with
+  a `Drop`, borrows for less than `'static`, or is a type the check can't see into (the finding
+  names the field path and the rule); it is `pub` and exported in a crate without
+  `#![blaze::program_lifetime]` at its root; or a record literal of it is built anywhere but as
+  the argument of `blaze_mem::ProgramArena::alloc`, of `Box::leak(Box::new(..))`, or in a
+  `static`'s initializer. Tuple-struct constructors are not followed yet.
+- `could_be_program_lifetime`: a private struct with named fields, no `Drop` and nothing in it
+  that drops or borrows, whose every record literal in the crate is leaked or is in the
+  initializer of a `static` that holds no cell, lock or atomic. The finding says where the first
+  is kept, how many `Arc`/`Rc` clones of it the crate makes, and the gain. Silent for anything it
+  cannot follow: a value bound to a local, returned, passed to another call or put in a table at
+  run time; tuple structs, enums and unions; public types unless the crate opts in. No fix.
+- `could_be_ref32`: a field of a struct stored many times (the element of a collection in the
+  crate, or itself program-lifetime) that holds a `#[blaze::program_lifetime]` type as
+  `&'static T`, `Arc<T>`, `Rc<T>` or `Box<T>`, directly or as the element of the field's
+  collection or `Option`. Never a local, a parameter or a return.
+
+**Why.** A `blaze_mem::Ref32<T>` is 4 bytes, `Copy`, and derefs to `&'static T`;
+`Option<Ref32<T>>` is 4 bytes too. A `&'static T` or a `Box<T>` is 8, and an `Arc<T>` is 8 with
+two counts beside the value and a write for every clone.
+
+**Fix.** `could_be_ref32` is machine-applicable for a private, plain `&'static T` field that
+nothing assigns after the struct is built, no pattern takes apart, and every record literal
+writes as `r.get()` of a `Ref32<T>`: the field becomes `blaze_mem::Ref32<T>`, each literal
+writes `r`, and each read `s.f` becomes `s.f.get()`. The other two have none.
 
 ## `push_without_reserve`
 
@@ -1033,6 +1492,148 @@ For that reason `#[inline]` and `#[inline(always)]` are not taken as hot markers
 
 **Allowing it.** `#[expect(blaze::stale_hot_marker, reason = "..")]`.
 
+## `std_use`
+
+In `blaze::edition`; its default is in [the table above](#the-general-lints).
+
+**What it catches.** A use of an item of Rust's standard library that blaze's own standard
+library ([bstd](v2/plan/design/std.md)) replaces or forbids, naming what is written instead.
+What is replaced is one table (`TABLE` in `crates/blaze-lints/src/blaze/std_use.rs`), a row per
+group of items; bstd's API is still moving, so a change there is a change of a row. Each row
+has a kind:
+
+- **ambient authority**: the file system, the environment, processes, the network, the clock,
+  the standard streams, threads, thread-locals, `static mut` and randomness, reached from
+  nowhere. A capability, or a value someone owns and passes, replaces each.
+- **hidden cost**: a call that decides something costly with no argument for it: durability
+  (`fs::write`, `fs::rename`, `File::sync_all`), a buffer lost on drop (`BufWriter`), a wait
+  with no deadline (`thread::park`), a lock that poisons.
+- **global-heap allocation**: `Vec::new`, `Box::new`, `String::from`, `format!`, `vec!` and
+  the like. `blaze::hot_alloc` and `blaze::implicit_allocator` (of `blaze::internal`) already
+  find these (and `collect()`, by its target type), so this lint leaves such a row to them
+  wherever one of them is on: one use has one finding. The same holds for the hash rows and
+  `blaze::default_hasher`.
+- **renamed**: a type bstd re-exports under its one name (`Arc` is `bstd::sync::Shared`). The
+  two names are one definition, so a path counts only where the type's segment is written by
+  std's name; `bstd::sync::Shared::new(..)` is not a finding, or the port could never end.
+
+The rows, in the order a function is matched against them (a named function before its
+module's catch-all); "fix" says whether a finding carries a machine-applicable fix, "left to"
+which lints report the row in this one's place where they are on:
+
+| std's item | kind | replaced by | fix | left to |
+|---|---|---|---|---|
+| `std::fs::{write}` | hidden cost | `dir.write(cx, path, bytes, Durable::..)` or `dir.publish(path, content, durable)` on a `Dir`: durability is an argument with no default | no |  |
+| `std::fs::{rename}` | hidden cost | `dir.rename(cx, from, to, Durable::..)` or `dir.publish(path, content, durable)` on a `Dir` | no |  |
+| `std::fs::{copy}` | hidden cost | `flushed.clone_to(..)`, which exists on a `Flushed` file alone, or `copy_to(..)`, a plain write of the bytes | no |  |
+| `std::fs::{File}::{sync_all, sync_data}` | hidden cost | `written.flush(cx)`, which gives a `Flushed`, or `Durable::Yes` on the write | no |  |
+| `std::io::{BufWriter, LineWriter}` | hidden cost | build the bytes in a buffer you own (`mem::Bytes`), write them with one call, and end the file with `file.close(cx)?` | no |  |
+| `std::thread::{park, park_timeout}` | hidden cost | the one wait of `Cx`, which ends in what it waited for or in a `Stopped` | no |  |
+| `std::sync::{Mutex, RwLock, MutexGuard, RwLockReadGuard, RwLockWriteGuard}` | hidden cost | `Lock` and `RwLock` of `bstd::sync`, each made with its name, whose `lock` returns the guard and not a `Result` | no |  |
+| `std::fs`'s functions | ambient authority | take a `Dir` (from `Fs`: `io.fs().open_dir(cx, path)`) and call its method (`dir.read_all(cx, path, &mut bytes)`, `dir.stat(cx, path)`, `dir.remove(cx, path)`) | no |  |
+| `std::fs::{File, OpenOptions, DirBuilder, ReadDir, DirEntry}` | ambient authority | take a `Dir` and open beneath it (`dir.open(cx, path)`, `dir.create(cx, path)`, `dir.list(cx, frame)`), which gives a `File` of that directory's rights | no |  |
+| `std::env::{var, var_os, vars, vars_os, set_var, remove_var}` | ambient authority | take an `Env` and call `env.get(&var!("NAME"))`; hand on less with `env.only(..)` | no |  |
+| `std::env::{args, args_os}` | ambient authority | take `Args` (`io.args()`) | no |  |
+| `std::env::{current_dir, set_current_dir, current_exe, temp_dir, home_dir}` | ambient authority | take the `Dir` the path stood for; the home directory is `User`'s | no |  |
+| `std::process::{exit, abort, id}` | ambient authority | take a `Host` (`host.exit(status)`, `host.pid()`), or return from `main` | no |  |
+| `std::process::{Command, Child}` | ambient authority | take a `Runner` of a sandbox and call `run.run(cx, &Command::new(prog!("..")))`: what the program can touch is the sandbox's spec | no |  |
+| `std::net::{TcpStream, TcpListener, UdpSocket}` | ambient authority | take a `Net` (`net.connect(cx, &addr)`, `net.listen(cx, &addr)`), or the `Http` made over it | no |  |
+| `std::time::{Instant, SystemTime}::{now, elapsed}` | ambient authority | take a `Clock` and call `clock.now()`; a simulated run then has a simulated time | no |  |
+| `std::io::{stdin, stdout, stderr}` | ambient authority | take `Out` (`io.out()`) | no |  |
+| `std::println!`, `std::eprintln!` | ambient authority | take `Out` and write to it; what a program says to a person or an agent is a `Report` | no |  |
+| `std::thread::{sleep, sleep_until}` | ambient authority | take a `Clock` and call `clock.sleep(cx, wait)` | no |  |
+| `std::thread::{available_parallelism}` | ambient authority | `host.cores()` of a `Host` | no |  |
+| `std::thread::{LocalKey}` | ambient authority | `Cx` for the current span, deadline or runtime, `cx.frame()` for scratch, a local the task owns, or a `PerWorker<T>` someone passes | no |  |
+| `std::thread`'s functions | ambient authority | start a task through `Cx`: `let s = cx.scope();`, `s.spawn("name", ..)`, `s.join(cx)?` | no |  |
+| `std::thread::{Builder, JoinHandle, Thread, Scope, ScopedJoinHandle}` | ambient authority | a `Scope` from `cx.scope()` and the `Task` its `spawn` gives, joined with `join(cx)` | no |  |
+| `std::thread_local!` | ambient authority | `Cx` for the current span, deadline or runtime, `cx.frame()` for scratch, a local the task owns, or a `PerWorker<T>` someone passes | no |  |
+| `static mut` | ambient authority | a value someone owns and passes down, or a context | no |  |
+| `std::sync::mpsc::{Sender, SyncSender, Receiver}` | ambient authority | the one channel of `bstd::chan` | no |  |
+| `std::sync::mpsc::{channel, sync_channel}` | ambient authority | the one channel of `bstd::chan` | no |  |
+| `std::sync::{Condvar, Barrier}` | ambient authority | `Signal` of `bstd::sync`, or a scope's `join(cx)` | no |  |
+| `std::sync::{Once, OnceState}` | ambient authority | `Once<T>` of `bstd::sync`, a value to own and pass, never in a `static` | no |  |
+| `std::hash::{RandomState, DefaultHasher}` | ambient authority | `bstd::hash::FixedState`, the one fixed seed; under keys an attacker picks, `SipKey` from an `Rng` | no | `blaze::default_hasher` |
+| `std::collections::{HashMap, HashSet}` | ambient authority | `bstd::map::Map` and `bstd::set::Set`, made with `new_in(alloc)` | no | `blaze::default_hasher`, `blaze::implicit_allocator` |
+| `std::random`'s functions | ambient authority | take an `Rng` (`rng.next_u64()`, `rng.fill(..)`), which is seeded in a simulation | no |  |
+| `std::sync::{Arc}` | renamed | `bstd::sync::Shared` | yes |  |
+| `std::rc::{Rc}` | renamed | `bstd::sync::LocalShared` | yes |  |
+| `std::cell::{RefCell, OnceCell, LazyCell, UnsafeCell}` | renamed | `bstd::sync::LocalLock`, `bstd::sync::LocalOnce`, `bstd::sync::LocalLazy`, `bstd::cell::RawCell` | yes |  |
+| `std::sync::{OnceLock, LazyLock}` | renamed | `bstd::sync::Once`, `bstd::sync::Lazy` | yes |  |
+| `std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, AtomicI8, AtomicI16, AtomicI32, AtomicI64, AtomicIsize}` | renamed | `bstd::sync::Atomic::<bool>`, `bstd::sync::Atomic::<u8>`, `bstd::sync::Atomic::<u16>`, `bstd::sync::Atomic::<u32>`, `bstd::sync::Atomic::<u64>`, `bstd::sync::Atomic::<usize>`, `bstd::sync::Atomic::<i8>`, `bstd::sync::Atomic::<i16>`, `bstd::sync::Atomic::<i32>`, `bstd::sync::Atomic::<i64>`, `bstd::sync::Atomic::<isize>` | yes |  |
+| `std::vec::{Vec}::{new, with_capacity, from, from_iter, default}` | global-heap allocation | `Vec::new_in(alloc)` or `Vec::with_capacity_in(n, alloc)`, in the allocator the code was handed (`cx.frame()`, an `Arena`) | no | `blaze::hot_alloc`, `blaze::implicit_allocator` |
+| `std::vec!` | global-heap allocation | `Vec::with_capacity_in(n, alloc)` and its pushes, in the allocator the code was handed | no | `blaze::hot_alloc`, `blaze::implicit_allocator` |
+| `std::boxed::{Box}::{new, pin, from, default}` | global-heap allocation | `Box::new_in(value, alloc)` | no | `blaze::hot_alloc`, `blaze::implicit_allocator` |
+| `std::string::{String}::{new, with_capacity, from, from_utf8, from_utf8_lossy, from_iter, default}` | global-heap allocation | `String::new_in(alloc)` of `bstd::mem`, text in the allocator the code was handed | no | `blaze::hot_alloc`, `blaze::implicit_allocator` |
+| `std::string::ToString::to_string` | global-heap allocation | `format_in!(alloc, "{value}")` of `bstd::mem` | no | `blaze::hot_alloc`, `blaze::implicit_allocator` |
+| `std::format!` | global-heap allocation | `format_in!(alloc, ..)` of `bstd::mem` | no | `blaze::hot_alloc`, `blaze::implicit_allocator` |
+| `std::collections::{BTreeMap, BTreeSet, VecDeque, BinaryHeap, LinkedList}::{new, with_capacity, from, from_iter, default}` | global-heap allocation | its `new_in(alloc)`, in the allocator the code was handed | no | `blaze::hot_alloc`, `blaze::implicit_allocator` |
+| `std::path::{PathBuf}::{new, with_capacity, from, default}` | global-heap allocation | `bstd::path::Path`, relative and beneath a `Dir`; an owned one is `mem::PathBuf<A>` in an allocator | no | `blaze::hot_alloc`, `blaze::implicit_allocator` |
+
+Never found, because bstd re-exports it unchanged and it reaches nothing: `core::option`,
+`core::result`, `core::iter`, `core::slice`, `core::str`, `core::num`, `core::cmp`,
+`core::ops`, `core::mem`, `core::convert`, `core::fmt` and `core::time::Duration`. A function
+of a module with a row that only computes (`env::split_paths`, `Instant::duration_since`, a
+`Metadata`'s accessors) is not found either.
+
+A use is found by what it resolves to, never by its text: a path that names a function, called
+or not, through a `use`, an alias, a glob or a re-export; a method call, by the function it
+resolves to; a trait's method, by the type it is called on (`file.write_all(..)` is a use of
+`std::fs::File`, `String::from(..)` of `String`); a macro, by what its expansion calls
+(`println!` is `std::io::_print`) or, for `thread_local!`, by the crate that defines it. There
+is one finding per distinct item per function, at its first use there, with the count of its
+uses in that function; a `static mut` and a `thread_local!` are found where they are declared:
+
+```text
+warning: `std::fs::read_to_string` (ambient authority), used 3 times in `fn load`, takes the file system from nowhere: take a `Dir` (from `Fs`: `io.fs().open_dir(cx, path)`) and call its method (`dir.read_all(cx, path, &mut bytes)`, `dir.stat(cx, path)`, `dir.remove(cx, path)`)
+  = note: with no capability, code is pure computation: what a function can reach outside its own values is handed to it, so its signature is the whole list
+  = note: blaze's standard library (bstd) is planned and not in this blaze: this is where the code is going, and there is nothing to change yet
+```
+
+The second note goes once `BSTD_IN_TREE` is `true`.
+
+**Why it matters.** With no capability, code is pure computation: a function that is handed
+nothing cannot touch a file, a socket, the clock or the environment, cannot wait, and cannot
+allocate from a heap it was not given. Then a signature is the whole list of what a function
+can do, a program runs unchanged under a simulated world, and every byte has an owner. Rust's
+`std` lets any function do all of it, and nothing in its signature says so.
+
+**How to fix it.** Take what the finding names as a parameter, from the caller that has it,
+up to `main`, which receives the `Io`; a sans-IO core takes nothing and is handed bytes. This
+is a change of signatures, done a crate at a time, leaves first: `harness/v2/std_uses.py`
+writes the order and each crate's findings.
+
+**The fix.** Only the renamed rows have one: `blaze check --fix` writes bstd's path where
+std's is written (`Arc::new(x)` becomes `bstd::sync::Shared::new(x)`, `AtomicU32::new(0)`
+becomes `bstd::sync::Atomic::<u32>::new(0)`), keeping the type's arguments. It is offered only
+in a crate with a dependency named `bstd`, so it never writes a path that does not resolve. It
+renames expressions; a type written in a signature or a `use` is the same type under either
+name and is moved by `blaze check --replace std::sync::Arc=bstd::sync::Shared`. No other row
+has a fix: each changes what a function is handed, and by whom.
+
+**Levels.** `allow` by default, in every workspace, whatever the switch says. A crate asks
+for it with `#![blaze::capabilities]` at its root (a module can too), which sets it to `warn`
+beneath, as `#![warn(blaze::std_use)]` there would. A workspace asks with
+`std_use = "warn"` in `[workspace.metadata.blaze.lints-when-ready]`, which holds once
+`BSTD_IN_TREE` (`crates/blaze-lint-defs/src/ready.rs`) is `true`. blaze's own workspace denies
+it ahead of the switch, in its ratchet, each crate not yet ported held at `warn` by its line in
+`crates/blaze-lints/baselines/blaze.std_use.txt` ([the ratchet](#workspace-levels-and-the-ratchet)).
+`-W blaze::std_use` in `RUSTFLAGS` turns it on for one run, which is how the worklist is made
+today.
+
+**Not found.** A build script: that is [`build_script_ambient`](#build_script_ambient), the
+same table and the same walk, its rows those of the file system, the environment, processes,
+the network and the clock, reported once per script. Test code (`#[cfg(test)]`, `#[test]`),
+which drives the crate from outside. A type only named in a signature or a field: its value
+came from a path that is found. A renamed type's path inside a macro call's arguments, or
+under a name a `use .. as` gave it.
+`AtomicPtr`, whose bstd form needs the pointee written. A `static` with interior mutability
+that is not `static mut`, and what a call reaches through other crates: those are the effects
+`global_state` and `ambient` of [the plan](v2/plan/design/std.md), not built yet. This lint
+names what is written; the effects will prove what is reached.
+
+**Allowing it.** `#[expect(blaze::std_use, reason = "..")]` on the function, or
+`#![allow(blaze::std_use)]` in a module that owns the IO for now.
+
 ## `stdout_lock_in_loop`
 
 **What it catches.** `println!`, `print!`, `eprintln!`, `eprint!`, or a `write` on an unlocked
@@ -1100,6 +1701,71 @@ and make the calls on the wrapper. A `BufWriter` writes what is left when droppe
 
 **Allowing it.** `#[expect(blaze::unbuffered_io, reason = "..")]`, where each call must reach
 the system on its own (a log that must survive a crash).
+
+## `unmarked_pure`, `unmarked_nopanic`, `unmarked_noalloc`, `unmarked_nonblocking`
+
+In `blaze::edition`, allowed by default. Each can be turned on alone.
+
+**What it catches.** A function, method or associated function with a body that the effects
+walk proves pure, nopanic, noalloc or nonblocking and that lacks `#[blaze::pure]`,
+`#[blaze::nopanic]`, `#[blaze::noalloc]` or `#[blaze::nonblocking]`. The proof is the answer
+the attribute's own lint (`pure`, `nopanic`, `noalloc`, `nonblocking`) computes for a marked
+function, so the attribute is suggested only where it then passes: nothing is trusted but what
+that check trusts, and where the walk can't decide (a body that does not lower, a call it can't
+resolve) nothing is found. By default only a function at the crate's border is found: one with
+a visibility written (`pub`, `pub(crate)`, `pub(in ..)`), or a method of a trait, or of an impl
+of one, whose trait has one. `unmarked-effects-private = true` in `clippy.toml` finds every
+function.
+
+One finding per lint that is on and proved, each at the function's name with its own fix, so a
+level set on the function (`#[expect(blaze::unmarked_noalloc, reason = "..")]`, `#[allow(..)]`)
+works per lint, and `--fix` writes only the attributes of the lints left on there.
+
+- A generic function is proved as a marked one is checked: in its own where-clauses, with what
+  only an instance decides (a type parameter's method, its drop) left to each instance.
+- `unmarked_nopanic` finds only in a crate checked with overflow checks (a dev profile, or
+  `overflow-checks = true`), where a proof covers the checks release drops, so the mark holds
+  in dev and in release. Checked without them it finds nothing.
+- No attribute implies another: each refuses a kind of effect the others allow.
+- In a crate with `#![blaze::capabilities]` the global heap is out of reach, so
+  `unmarked_noalloc` finds only a function whose signature could allocate: a parameter (`self`
+  included, behind references too) that is or holds a type implementing
+  `core::alloc::Allocator`, a type with an allocator parameter (`Vec<T, A>`), or bstd's `Cx`.
+  A signature with none already says noalloc.
+- A method of an impl is found whether or not its trait is marked: the check reads the
+  function's own attribute first. A method covered by its trait's attribute is not found.
+
+**Why it matters.** The blaze edition infers effects inside a crate and writes them at its
+border. A mark the code already earns lets callers rely on it (a `pure` caller needs no
+`trusted`, the kernel caches a pure step), and from then on its lint refuses a change that
+breaks it, naming the call chain.
+
+**How to fix it.** `blaze check --fix` writes each attribute on its own line at the item's
+indentation, keeping the function's effect attributes in the order pure, nopanic, noalloc,
+nonblocking and moving none it has: before the first one written that comes later in that
+order, else after the last one written, else directly above the signature, under the doc
+comments and the other attributes. Attributes that land at one place are written one per pass
+of `--fix`, so a function gaining all four takes its four passes.
+
+**Not found.** A function already marked in any form (the bare word, `trusted = ".."`, a
+malformed attribute, or the attribute on its trait); a trait method with no body; a test, a
+bench, the crate's `main` and test code; a function a macro wrote.
+
+**Allowing it.** `#[expect(blaze::unmarked_pure, reason = "..")]` (or the lint the finding
+names) on the function, where the effect is an accident of today's body and not a promise.
+
+## `unused_guard`
+
+Planned with `#![blaze::early_drop]` ([early-drop](v2/plan/design/early-drop.md), objective
+E14), in the group `blaze::edition`; `blaze check` does not report it yet.
+
+**What it will catch.** `let _ = expr;` where a value of `expr`'s type keeps its scope's drop
+under early drop (a lock guard, a file, anything with a `Drop` impl that is not marked
+`#[blaze::drop(early)]`). `_` binds nothing, so the value is dropped at once: the lock is
+released on the same line.
+
+**How to fix it.** `let _guard = expr;` keeps it to the end of the scope (the fix `blaze check
+--fix` will apply); `drop(expr);` says the immediate drop is meant.
 
 ## `unwind_across_ffi`
 

@@ -328,3 +328,51 @@ where
         assert_env_has_no_error(&db, dependent);
     });
 }
+
+/// A type parameter bounded `F: Field<T>` is a member of `T` (docs/v2/plan/design/comptime.md,
+/// "Building a struct"): the environment's field binders over `T` hold of it, so a callback
+/// generic over the field (`take<F: Field<T>>`, what a decoder hands `build`) may use the
+/// caller's `for<G: Field<T>> G::Type: Show` of its own `F`. The control: the same body with
+/// `F` a field of another container `U` is refused, so it is the membership that gives it.
+#[test]
+fn a_parameter_bounded_by_field_gets_the_field_binders_over_its_container() {
+    let fixture = format!(
+        "//- minicore: sized, copy, clone\n#![feature(blaze_comptime, lang_items)]\n{REFLECT}{}",
+        r#"
+fn member<T, F: Field<T>>(x: &F::Type) where for<G: Field<T>> G::Type: Show {
+    show(x);
+}
+fn other<T, U, F: Field<U>>(x: &F::Type) where for<G: Field<T>> G::Type: Show {
+    show(x);
+}
+pub trait Source<B> {
+    fn take<F: Field<B>>(&self, x: &F::Type);
+}
+pub struct S;
+impl<T> Source<T> for S where for<G: Field<T>> G::Type: Show {
+    fn take<F: Field<T>>(&self, x: &F::Type) {
+        show(x);
+    }
+}
+"#
+    );
+    let db = fixture::db(&fixture).into_db();
+    blaze_query::db::attach(&db, || {
+        for func in [function(&db, "member"), method(&db, "S", "take")] {
+            assert_env_has_no_error(&db, func);
+            let result = infer(&db, func);
+            assert!(result.diagnostics().is_empty(), "{func:?}: {:?}", result.diagnostics());
+            assert!(!result.has_errors, "{func:?} was inferred with error types");
+        }
+        let result = infer(&db, function(&db, "other"));
+        assert!(
+            !result.diagnostics().is_empty()
+                && result
+                    .diagnostics()
+                    .iter()
+                    .all(|it| !matches!(it, InferenceDiagnostic::ComptimeNotYetSupported { .. })),
+            "a field of `U` gets no binder over `T`: {:?}",
+            result.diagnostics()
+        );
+    });
+}

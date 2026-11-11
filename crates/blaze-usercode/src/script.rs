@@ -48,8 +48,10 @@ use crate::{
     trace::ALL_ENV_NAME,
 };
 
-/// Variables of one run alone: a script's jobserver, which another run is given another of.
-pub const RUN_ONLY: &[&str] = &["CARGO_MAKEFLAGS"];
+/// Variables of one run alone: a script's jobserver, which another run is given another of,
+/// and the run's provider ([`crate::provider::VAR`]), which is made of the run's key and so is
+/// no part of it: std reads it before `main`, and that read is of nothing the key lacks.
+pub const RUN_ONLY: &[&str] = &["CARGO_MAKEFLAGS", crate::provider::VAR];
 
 /// make's variables, passed through from a build started under make: its flags and variable
 /// overrides, which a script that runs make honours, and the jobserver of make's run, which is

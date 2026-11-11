@@ -1,5 +1,6 @@
 import { DRAWING, PROPS, article, TEXT_PROP, WIRED, WORDS_ONLY, ViewNode, commonWire, elementWire, holdsError, placeError, taskOf, wholeChartError, wireValue, written } from './element.ts';
 import type { ElementName } from './element.ts';
+import { mapOf, mapWire } from './map.ts';
 import { resolveFile, resolveMedia } from './media.ts';
 import { resolveRefs } from './shader.ts';
 import type { Attachment, Handler } from './element.ts';
@@ -329,6 +330,16 @@ export class UiTree implements Attachment {
       if (typeof found !== 'string') throw placed(new TypeError(`<CellRef task="${task}"> ${found.refused}${where}`), node.at);
       props.task = task;
       props.call = found;
+    }
+    // A Map goes as its checked places and where it looks (map.ts `mapWire`): the app covers its card with Apple's map.
+    if (type === 'Map') {
+      const where = node.at ? ` (${node.at})` : '';
+      const inner = kids.find(child => child.isElement);
+      if (inner) throw placed(new TypeError(`<Map> holds ${inner.type}${where}: a Map holds nothing; its places are markers={[{lat, lon, label}]}`), node.at);
+      const spec = mapOf(props);
+      if (typeof spec === 'string') throw placed(new TypeError(`<Map> ${spec}${where}`), node.at);
+      try { return { type: 'Map', props: commonWire('Map', props, mapWire(spec), node.at), children: [] }; }
+      catch (error) { throw error instanceof Error ? placed(error, node.at) : error; }
     }
     // A control, and every element of tier 3, goes as exactly what the app reads of it (element.ts `elementWire`). One that holds only
     // its words (a Button's label) or nothing has no children on the wire; the rest hold what `holdsError` lets them, where `placeError` does.

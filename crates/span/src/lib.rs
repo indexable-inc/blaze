@@ -25,7 +25,7 @@ pub use self::{
     map::{RealSpanMap, SpanMap, kept_maps},
 };
 
-pub use syntax::Edition;
+pub use syntax::{Edition, Extensions};
 pub use text_size::{TextRange, TextSize};
 
 /// A source file: a dense number base-db hands out, at most [`EditionedFileId::MAX_FILE_ID`].
@@ -155,15 +155,22 @@ impl fmt::Debug for SpanAnchor {
 
 /// A [`FileId`] and [`Edition`] bundled up together.
 /// The MSB is reserved for `HirFileId` encoding, more upper bits are used to then encode the edition.
+///
+/// The top bits of the edition's ([`EditionedFileId::EXTENSIONS_MASK`]) hold the syntax
+/// extensions of the crate the file is read for ([`Extensions`], one bit each): they change
+/// the file's parse as its edition does, so they ride with it into every key the file id is
+/// part of, the parse's first.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct EditionedFileId(u32);
 
 impl fmt::Debug for EditionedFileId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("EditionedFileId")
-            .field(&self.file_id().index())
-            .field(&self.edition())
-            .finish()
+        let mut tuple = f.debug_tuple("EditionedFileId");
+        tuple.field(&self.file_id().index()).field(&self.edition());
+        if self.extensions() != Extensions::NONE {
+            tuple.field(&self.extensions());
+        }
+        tuple.finish()
     }
 }
 
@@ -183,6 +190,14 @@ const _: () = assert!(
     EditionedFileId::RESERVED_MASK ^ EditionedFileId::EDITION_MASK ^ EditionedFileId::FILE_ID_MASK
         == 0xFFFF_FFFF
 );
+const _: () = assert!(
+    EditionedFileId::EXTENSIONS_MASK & EditionedFileId::EDITION_MASK
+        == EditionedFileId::EXTENSIONS_MASK
+        && Extensions::BITS <= EditionedFileId::EXTENSIONS_MASK.count_ones()
+        && (Edition::LATEST as u32) << EditionedFileId::FILE_ID_BITS
+            < 1 << EditionedFileId::EXTENSIONS_SHIFT,
+    "the syntax extensions fit above every edition"
+);
 
 impl EditionedFileId {
     pub const RESERVED_MASK: u32 = 0x8000_0000;
@@ -195,20 +210,47 @@ impl EditionedFileId {
     pub const FILE_ID_BITS: u32 = Self::FILE_ID_MASK.count_ones();
     pub const EDITION_BITS: u32 = Self::EDITION_MASK.count_ones();
 
+    /// The syntax extensions' bits, the top four of [`EditionedFileId::EDITION_MASK`]'s, one
+    /// per extension ([`Extensions::bits`]): an edition is at most [`Edition::LATEST`], in the
+    /// four below them.
+    pub const EXTENSIONS_MASK: u32 = 0x7800_0000;
+    pub const EXTENSIONS_SHIFT: u32 = Self::EXTENSIONS_MASK.trailing_zeros();
+
     pub const fn current_edition(file_id: FileId) -> Self {
         Self::new(file_id, Edition::CURRENT)
     }
 
+    /// The file read in `edition` with no syntax extension: a file of a crate that turns none
+    /// on.
     pub const fn new(file_id: FileId, edition: Edition) -> Self {
+        Self::new_with_extensions(file_id, edition, Extensions::NONE)
+    }
+
+    /// The file read in `edition` under the crate's syntax `extensions`.
+    pub const fn new_with_extensions(
+        file_id: FileId,
+        edition: Edition,
+        extensions: Extensions,
+    ) -> Self {
         let file_id = file_id.index();
         let edition = edition as u32;
         assert!(file_id <= Self::MAX_FILE_ID);
-        Self(file_id | (edition << Self::FILE_ID_BITS))
+        let extensions = (extensions.bits() as u32) << Self::EXTENSIONS_SHIFT;
+        Self(file_id | (edition << Self::FILE_ID_BITS) | extensions)
+    }
+
+    /// Whether `raw` is the bits of an `EditionedFileId`: the reserved bit clear, an edition
+    /// up to [`Edition::LATEST`], and syntax extensions there are.
+    pub const fn is_valid_raw(raw: u32) -> bool {
+        let edition = (raw & Self::EDITION_MASK & !Self::EXTENSIONS_MASK) >> Self::FILE_ID_BITS;
+        let extensions = (raw & Self::EXTENSIONS_MASK) >> Self::EXTENSIONS_SHIFT;
+        raw & Self::RESERVED_MASK == 0
+            && edition <= Edition::LATEST as u32
+            && Extensions::from_bits(extensions as u8).is_some()
     }
 
     pub fn from_raw(u32: u32) -> Self {
-        assert!(u32 & Self::RESERVED_MASK == 0);
-        assert!((u32 & Self::EDITION_MASK) >> Self::FILE_ID_BITS <= Edition::LATEST as u32);
+        assert!(Self::is_valid_raw(u32), "{u32:#x} is no EditionedFileId");
         Self(u32)
     }
 
@@ -224,6 +266,20 @@ impl EditionedFileId {
         (self.file_id(), self.edition())
     }
 
+    /// The syntax extensions of the crate the file is read for.
+    pub const fn extensions(self) -> Extensions {
+        let bits = (self.0 & Self::EXTENSIONS_MASK) >> Self::EXTENSIONS_SHIFT;
+        match Extensions::from_bits(bits as u8) {
+            Some(extensions) => extensions,
+            None => panic!("an EditionedFileId with a bit that is no syntax extension's"),
+        }
+    }
+
+    /// The same file and edition with no syntax extensions.
+    pub const fn without_extensions(self) -> Self {
+        Self(self.0 & !Self::EXTENSIONS_MASK)
+    }
+
     pub const fn edition(self) -> Edition {
         const E2015: u32 = Edition::Edition2015 as u32;
         const E2018: u32 = Edition::Edition2018 as u32;
@@ -231,7 +287,7 @@ impl EditionedFileId {
         const E2024: u32 = Edition::Edition2024 as u32;
         const _: () = assert!(Edition::LATEST as u32 == E2024, "a new edition: add it here");
         // `new` and `from_raw` only make editions up to `Edition::LATEST`.
-        match (self.0 & Self::EDITION_MASK) >> Self::FILE_ID_BITS {
+        match (self.0 & Self::EDITION_MASK & !Self::EXTENSIONS_MASK) >> Self::FILE_ID_BITS {
             E2015 => Edition::Edition2015,
             E2018 => Edition::Edition2018,
             E2021 => Edition::Edition2021,

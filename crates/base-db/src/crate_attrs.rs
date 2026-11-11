@@ -68,16 +68,20 @@ impl Crate {
     }
 }
 
-/// The files of `krate`'s crate attributes at its edition, in the order given, refused or not.
+/// The files of `krate`'s crate attributes at its edition and under its syntax extensions (a
+/// file of the crate, as its root is), in the order given, refused or not.
 #[blaze_query::tracked(returns(deref))]
 pub fn crate_attr_files(db: &Db, krate: Crate) -> Box<[EditionedFileId]> {
     let files = krate.crate_attr_files(db);
     if files.is_empty() {
         return Box::default();
     }
-    let edition = krate.data(db).edition;
+    let (edition, extensions) = (krate.data(db).edition, krate.extensions(db));
     // alloc: the memo's value, once per change of the crate's attributes.
-    files.iter().map(|&file| EditionedFileId::new(db, file, edition)).collect()
+    files
+        .iter()
+        .map(|&file| EditionedFileId::new_with_extensions(db, file, edition, extensions))
+        .collect()
 }
 
 /// The files of `krate`'s crate attributes rustc applies, in the order given: those without a

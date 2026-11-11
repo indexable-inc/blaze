@@ -195,8 +195,10 @@ pub(crate) fn facts<'db>(
 }
 
 /// The digests of the dyn facts the body of `instance` read when it was devirtualized
-/// (`MirBody::inlined.devirtualized`), sorted, each once: what its code is keyed by beside its
-/// body ([`super::devirt::code`]). Empty for a walk without the program's world.
+/// (`MirBody::inlined.devirtualized`) and of the facts of other items its passes relied on
+/// (`MirBody::inlined.relied`), sorted, each once: what its code is keyed by beside its
+/// body ([`super::devirt::code`]). Empty for a walk without the program's world of a body
+/// that relied on nothing.
 pub(crate) fn read<'db>(
     db: &'db Db,
     instance: &HirInstance,
@@ -336,6 +338,10 @@ fn code_refs(
     for (at, (build, body)) in bodies.iter().enumerate() {
         let body = &**body;
         found.read.extend_from_slice(&body.inlined.devirtualized);
+        // The facts of other items the body's passes relied on (`SpendFacts`,
+        // docs/v2/plan/design/facts.md): its code is the code they changed, so they key it
+        // beside the dyn facts, whatever else names the instance.
+        found.read.extend_from_slice(&body.inlined.relied);
         found.read.sort_unstable();
         found.read.dedup();
         pass(db, env, Some(body), tracked, (*build, &mut found), |walk| {

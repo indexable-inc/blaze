@@ -78,6 +78,8 @@ pub enum Cmd {
     OpenPopup { opener: u64, url: String },
     /// The app's port died.
     AppGone,
+    /// A location request's bound passed (location.rs): answer it if nothing has.
+    LocationWaited { conn: u64, req: u64 },
     Quit { why: String },
 }
 
@@ -177,6 +179,11 @@ pub fn with<R>(what: &str, f: impl FnOnce(&mut Host) -> R) -> Option<R> {
 }
 
 // ---------------------------------------------------------------- sending
+
+/// Send `msg` to connection `conn`, from a step that is not the host's own (location.rs: Core Location's callbacks).
+pub fn answer(conn: u64, msg: &KernelDown) {
+    with("an answer to a connection", |h| h.to_conn(conn, msg));
+}
 
 fn cdp_error(id: &Value, message: &str) -> String {
     serde_json::json!({ "id": id, "error": { "code": -32000, "message": message } }).to_string()
@@ -348,6 +355,7 @@ fn handle(cmd: Cmd) {
         Cmd::Dropped { conn, why } => dropped(conn, &why),
         Cmd::OpenPopup { opener, url } => open_popup(opener, url),
         Cmd::AppGone => app_gone(),
+        Cmd::LocationWaited { conn, req } => crate::location::waited(conn, req),
         Cmd::Quit { why } => quit(why),
     }
 }
@@ -522,6 +530,8 @@ fn kernel_msg(conn: u64, msg: KernelUp) {
                 Err(error) => h.to_conn(conn, &KernelDown::Error { req: Some(req), error }),
             });
         }
+        KernelUp::Location { req } => crate::location::request(conn, req),
+        KernelUp::Places { req, query, latitude, longitude, radius_m, limit } => crate::places::request(conn, req, &query, latitude, longitude, radius_m, limit),
         KernelUp::Manage { req, url } => {
             let r = manage::open(url.as_deref());
             with("manage", |h| match r {

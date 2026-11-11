@@ -18,6 +18,9 @@ mod bulk;
 
 #[cfg(target_os = "macos")]
 pub(crate) use bulk::entries;
+/// The file effects' calls on Linux, on blaze-sys: no `libc`, no `std::fs`.
+#[cfg(target_os = "linux")]
+pub(crate) mod linux;
 
 /// The calls WASI makes its own way or has none of (the wasm32-wasip1 seed).
 #[cfg(target_os = "wasi")]
@@ -143,9 +146,14 @@ pub(crate) fn making_parent<T>(
 /// earlier request: the name may be another file by now (a build directory removed and made
 /// again by `blaze clean` and the next build).
 pub(crate) fn truncate(path: &Path, len: u64) -> io::Result<()> {
-    let open = || OpenOptions::new().write(true).create(true).truncate(false).open(path);
-    making_parent(path, open)
-        .and_then(|file| file.set_len(len))
+    #[cfg(target_os = "linux")]
+    let cut = linux::truncate(path, len);
+    #[cfg(not(target_os = "linux"))]
+    let cut = {
+        let open = || OpenOptions::new().write(true).create(true).truncate(false).open(path);
+        making_parent(path, open).and_then(|file| file.set_len(len))
+    };
+    cut
         // alloc: an error path.
         .map_err(|error| {
             io::Error::new(
@@ -196,47 +204,6 @@ pub(crate) fn write_unsynced(path: &Path, bytes: &[u8]) -> io::Result<()> {
     })
 }
 
-/// [`crate::Effect::WriteBack`]: the data of the file at `path` that is only in memory written
-/// to its device, waited for here (on a driver's thread; the effect's asker waits for
-/// nothing). Opened to read, so a file sealed read-only is written back too. Nothing of the
-/// file is made durable: no metadata is committed and no drive cache flushed.
-#[cfg(target_os = "linux")]
-#[expect(unsafe_code, reason = "sync_file_range, the one call that starts a file's write-back")]
-pub(crate) fn write_back(path: &Path) -> io::Result<()> {
-    use std::os::fd::AsRawFd as _;
-    let file = File::open(path)?;
-    let flags = libc::SYNC_FILE_RANGE_WAIT_BEFORE
-        | libc::SYNC_FILE_RANGE_WRITE
-        | libc::SYNC_FILE_RANGE_WAIT_AFTER;
-    // SAFETY: an open descriptor, and a range of the whole file (0 bytes means to its end).
-    match unsafe { libc::sync_file_range(file.as_raw_fd(), 0, 0, flags) } {
-        0 => Ok(()),
-        _ => Err(io::Error::last_os_error()),
-    }
-}
-
-/// [`crate::Effect::WriteBack`] on Apple's systems and the other Unixes: `fsync`, which writes
-/// the file's data out and, on Apple's, leaves it in the drive's cache (`F_FULLFSYNC` is the
-/// durable one, and is not asked for).
-#[cfg(all(unix, not(target_os = "linux")))]
-#[expect(unsafe_code, reason = "fsync, the one call that writes a file's data back")]
-pub(crate) fn write_back(path: &Path) -> io::Result<()> {
-    use std::os::fd::AsRawFd as _;
-    let file = File::open(path)?;
-    // SAFETY: an open descriptor.
-    match unsafe { libc::fsync(file.as_raw_fd()) } {
-        0 => Ok(()),
-        _ => Err(io::Error::last_os_error()),
-    }
-}
-
-/// [`crate::Effect::WriteBack`] where the system has no write-back short of a sync (Windows,
-/// WASI): the file's data synced. Opened to write, as a flush of a handle there needs.
-#[cfg(not(unix))]
-pub(crate) fn write_back(path: &Path) -> io::Result<()> {
-    OpenOptions::new().write(true).open(path)?.sync_data()
-}
-
 /// [`crate::Effect::RenameUnsynced`]: `from` renamed over `to`, neither directory synced;
 /// `from` is left as it was when the rename fails.
 #[cfg(any(unix, target_os = "wasi"))]
@@ -266,7 +233,140 @@ pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
+/// [`crate::Effect::Read`]: up to `len` bytes of the file at `path` from `at`, fewer only at
+/// its end.
+#[cfg(target_os = "linux")]
+pub(crate) fn read(path: &Path, at: u64, len: usize) -> io::Result<Vec<u8>> {
+    linux::read(path, at, len)
+}
+
+/// [`crate::Effect::Read`]: up to `len` bytes of the file at `path` from `at`, fewer only at
+/// its end.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn read(path: &Path, at: u64, len: usize) -> io::Result<Vec<u8>> {
+    let file = std::fs::File::open(path)?;
+    // alloc: the read's payload.
+    let mut bytes = vec![0; len];
+    let mut read = 0;
+    while read < len {
+        let n = read_at(&file, &mut bytes[read..], at + read as u64)?;
+        if n == 0 {
+            break;
+        }
+        read += n;
+    }
+    bytes.truncate(read);
+    Ok(bytes)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn read_at(file: &std::fs::File, buffer: &mut [u8], at: u64) -> io::Result<usize> {
+    std::os::unix::fs::FileExt::read_at(file, buffer, at)
+}
+
+#[cfg(windows)]
+fn read_at(file: &std::fs::File, buffer: &mut [u8], at: u64) -> io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_read(file, buffer, at)
+}
+
+#[cfg(target_os = "wasi")]
+fn read_at(file: &std::fs::File, buffer: &mut [u8], at: u64) -> io::Result<usize> {
+    std::os::wasi::fs::FileExt::read_at(file, buffer, at)
+}
+
+/// [`crate::Effect::Append`]: `bytes` at the end of the file at `path`, made with its
+/// directories where it is missing.
+pub(crate) fn append(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    return linux::append(path, bytes);
+    #[cfg(not(target_os = "linux"))]
+    {
+        use std::io::Write as _;
+        let open = || OpenOptions::new().create(true).append(true).open(path);
+        making_parent(path, open)?.write_all(bytes)
+    }
+}
+
+/// [`crate::Effect::Sync`]: the file at `path`, made where it is missing, synced to the
+/// device. Off Linux, `sync_all` is `F_FULLFSYNC` on Apple's systems, where `fsync` leaves
+/// the bytes in the drive's cache.
+pub(crate) fn sync(path: &Path) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    return linux::sync(path);
+    #[cfg(not(target_os = "linux"))]
+    // durable: the effect is the sync its caller asked for.
+    return OpenOptions::new().append(true).create(true).open(path)?.sync_all();
+}
+
+/// [`crate::Effect::WriteBack`]: the data of the file at `path` that is only in memory written
+/// to its device, waited for here (on a driver's thread; the effect's asker waits for
+/// nothing). Opened to read, so a file sealed read-only is written back too. Nothing of the
+/// file is made durable: no metadata is committed and no drive cache flushed.
+#[cfg(target_os = "linux")]
+pub(crate) fn write_back(path: &Path) -> io::Result<()> {
+    linux::write_back(path)
+}
+
+/// [`crate::Effect::WriteBack`] on Apple's systems and the other Unixes: `fsync`, which writes
+/// the file's data out and, on Apple's, leaves it in the drive's cache (`F_FULLFSYNC` is the
+/// durable one, and is not asked for).
+#[cfg(all(unix, not(target_os = "linux")))]
+#[expect(unsafe_code, reason = "fsync, the one call that writes a file's data back")]
+pub(crate) fn write_back(path: &Path) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    let file = File::open(path)?;
+    // SAFETY: an open descriptor.
+    match unsafe { libc::fsync(file.as_raw_fd()) } {
+        0 => Ok(()),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+/// [`crate::Effect::WriteBack`] where the system has no write-back short of a sync (Windows,
+/// WASI): the file's data synced. Opened to write, as a flush of a handle there needs.
+#[cfg(not(unix))]
+pub(crate) fn write_back(path: &Path) -> io::Result<()> {
+    OpenOptions::new().write(true).open(path)?.sync_data()
+}
+
+/// [`crate::Effect::SyncDir`]: the names in the directory at `path` made durable.
+#[cfg(target_os = "linux")]
+pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
+    linux::sync_dir(path)
+}
+
+/// [`crate::Effect::SyncDir`]: the names in the directory at `path` made durable (`sync_all`
+/// is `F_FULLFSYNC` on Apple's systems).
+#[cfg(all(any(unix, target_os = "wasi"), not(target_os = "linux")))]
+pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
+    // durable: the effect is the sync its caller asked for.
+    File::open(path)?.sync_all()
+}
+
+/// [`crate::Effect::SyncDir`] on Windows: not built. A directory's names are flushed there
+/// through a handle opened with backup semantics, which this driver does not open yet, and
+/// nothing stands in for it (rule no-fallback).
+#[cfg(windows)]
+pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        // alloc: an error path.
+        format!(
+            "Effect::SyncDir of {}: this driver has no directory sync on Windows yet \
+             (FlushFileBuffers of a directory handle), and nothing stands in for it",
+            path.display()
+        ),
+    ))
+}
+
 /// `bytes` written at `at` of the file at `path`, which exists.
+#[cfg(target_os = "linux")]
+pub(crate) fn write_at(path: &Path, at: u64, bytes: &[u8]) -> io::Result<()> {
+    linux::write_at(path, at, bytes)
+}
+
+/// `bytes` written at `at` of the file at `path`, which exists.
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn write_at(path: &Path, at: u64, bytes: &[u8]) -> io::Result<()> {
     let file = OpenOptions::new().write(true).open(path)?;
     // As `uring.rs`'s `O_DIRECT`: a large aligned write stays out of the unified buffer cache;
