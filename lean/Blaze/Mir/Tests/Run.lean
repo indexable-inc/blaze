@@ -565,4 +565,32 @@ example :
         ((Opt.removeOverwritten Opt.refsOf (storeTwice false)).call 2 0 [] []) = true := by
   decide
 
+/-! The witness validator: a script of proved rewrites takes `constantSimplified` to one
+block; the same script does not take it to another program, and an empty script takes a
+program only to itself. -/
+
+def oneBlock : Program :=
+  { adts := [],
+    fns :=
+      [{ name := "constant", args := 0, locals := [Ty.int ScalarTy.U32],
+         blocks :=
+           [{ stmts :=
+                [Statement.storageLive 0,
+                 Statement.assign (Place.mk 0 [])
+                   (Rvalue.use (Operand.const (Const.int ScalarTy.U32 4))),
+                 Statement.storageDead 0],
+              terminator := Terminator.ret }] }] }
+
+def cfgScript : List Opt.Rewrite :=
+  [Opt.Rewrite.threadAll, Opt.Rewrite.removeDeadBlocks, Opt.Rewrite.mergeSuccessors,
+   Opt.Rewrite.removeDeadBlocks]
+
+example : Opt.validateWith constantSimplified oneBlock cfgScript = true := by decide
+
+example : Opt.validateWith constantSimplified constantSimplified cfgScript = false := by decide
+
+example : Opt.validateWith constantSimplified oneBlock [] = false := by decide
+
+example : isInt ScalarTy.U32 4 (oneBlock.call 1 0 [] []) = true := by decide
+
 end Blaze.Mir.Tests

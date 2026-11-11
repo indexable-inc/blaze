@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-73 theorems: 60 in `lean`, 13 in `lean/analysis`.
+74 theorems: 61 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -587,6 +587,15 @@ theorem removeOverwritten_call (borrowed : Body → Local → Bool) (prog : Prog
     (hargs : ∀ (v : Value), v ∈ args → Value.Ok (PtrOk (BorrowedIn borrowed prog) []) v) :
     ((removeOverwritten borrowed prog).call fuel id base args).Refines
       (prog.call fuel id base args)
+```
+
+**`Blaze.Mir.Opt.validateWith_sound`** (`Blaze.Mir.Opt.Witness`, `lean`): The witness validator is sound: when a script of proved rewrites takes one program to another, every call that ends, and not in undefined behaviour, gives the same outcome with the same fuel.
+
+```lean
+theorem validateWith_sound (a b : Program) (w : List Rewrite) (h : validateWith a b w = true)
+    (n : Nat) (id : FnId) (base : List Slot) (args : List Value) (r : Outcome Value)
+    (hr : a.call n id base args = r) (hd : r ≠ Outcome.diverge)
+    (hu : ∀ (why : Undefined), r ≠ Outcome.undefined why) : b.call n id base args = r
 ```
 
 **`Blaze.Mir.Opt.simplifyCfg_call`** (`Blaze.Mir.Opt.SimplifyCfg`, `lean`): SimplifyCfg composed from the proved passes keeps every call that ends, and not in undefined behaviour: the same outcome with the same fuel.

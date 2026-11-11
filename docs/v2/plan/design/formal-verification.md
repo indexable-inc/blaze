@@ -722,10 +722,22 @@ programs; it is the specification of the Rust pass of the same name.
 - **A validator proved sound** (`Opt/Validate.lean`). `validate a b` accepts when the two
   programs have one normal form under the proved rewrites; `validate_sound`: an accepted
   pair runs alike for every fuel and state. It takes no witness and accepts only what the
-  normal form identifies. The witness form is not written: a block map (`Renumbers` is its
-  shape: at `ρ fn b` the target has block `b`, here with its targets renamed, there with a
-  body that symbolic execution shows equal), per-block symbolic execution of straight-line
-  statements to a store of expressions over the block's initial locals, and soundness
+  normal form identifies.
+- **A validator that takes a witness** (`Opt/Witness.lean`; not yet elaborated). The witness
+  is a script: the proved rewrites, in order, that take the program before a pass to the
+  program after it (`Rewrite`: the block-local passes, `switchToGoto`, both threadings,
+  merging, dead-block removal, a block permutation with its orders as data).
+  `validateWith a b w` replays the script on `a` and accepts when it gives `b`, which the
+  kernel decides; `validateWith_sound`: an accepted pair gives every call that ends, and not
+  in undefined behaviour, the same outcome with the same fuel. The Rust pass is then not
+  trusted and need not be a fixed specification block for block: a script that reproduces
+  its output is the evidence, and the pass can say which rewrites it applied.
+  **Not written: the validator by symbolic execution**, which needs no script and accepts
+  rewrites nobody proved one by one (copy propagation, local renumbering, reordering of
+  independent statements). It needs an expression language whose evaluation is proved to
+  agree with `evalRvalue`, each block run on symbolic locals to a normal form (stores of
+  expressions, panics in order, a terminator with a symbolic condition), and `Renumbers`
+  with "the target block is symbolically equal" in place of "is the renamed block"; sound
   through `Sim`, or `Stutter` when blocks were merged. The inliner needs a relation between
   one frame and two beyond that; loop transforms need a witness that is not per block.
 - **The Rust passes are held to them by translation validation.** The test
