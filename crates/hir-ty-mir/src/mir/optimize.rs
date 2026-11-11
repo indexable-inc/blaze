@@ -23,7 +23,9 @@
 //! on the stack. Passes rustc runs at a level and these do not are listed in
 //! [`passes_not_ported`]. `Specialize` ([`specialize`]), last, with `Inline`, is blaze's too:
 //! it lists the calls the code generator gives a copy of the callee specialized on constant
-//! arguments.
+//! arguments. `SpendFacts` ([`facts`]) is blaze's as well: what is proved of a callee (it
+//! cannot panic, it is pure) removes the call's unwind edge and merges a repeated call, each
+//! recorded in `body.inlined.relied` (docs/v2/plan/design/facts.md).
 //!
 //! The passes run on the generic body, as rustc's do, once per function: monomorphization
 //! substitutes after. An edit to one function optimizes that one again.
@@ -38,6 +40,7 @@ mod copy_prop;
 mod devirt;
 mod dse;
 mod escape;
+mod facts;
 mod inline;
 mod inst_simplify;
 mod locals;
@@ -63,6 +66,7 @@ use super::{
 
 pub use box_in_place::BOX_IN_PLACE_MIN;
 pub use escape::heap_held;
+pub use facts::relied_on_own_no_unwind;
 pub use inline::{CallerLocation, caller_location, owner_of, source_span, written_checked_at};
 pub(crate) use inline::{shipped_cross_crate_inlinable, written_cross_crate_inlinable};
 pub use specialize::{CloneId, MAX_COPIES, MAX_COPIES_PER_BODY, specialized_mir_body};
@@ -236,6 +240,14 @@ fn passes<'db>(
             });
         }
     }
+    // blaze's own, at `Release`: a call of a function proved unable to panic loses its
+    // unwind edge, after `Inline` so the calls the callees brought lose theirs too and before
+    // the `SimplifyCfg` that removes the cleanup nothing reaches any more.
+    if release {
+        run!("SpendFacts unwind", |_frame| {
+            facts::unwind_edges(ctx, body);
+        });
+    }
     // rustc keeps storage markers only where it gives the backend lifetimes.
     if !options.lifetime_markers {
         run!("RemoveStorageMarkers", |frame| locals::remove_storage_markers(body, frame));
@@ -262,6 +274,15 @@ fn passes<'db>(
         run!("DeadStoreElimination", |frame| dse::dead_store_elimination(body, frame));
     }
     run!("SimplifyLocals", |frame| locals::simplify_locals(body, frame));
+    // blaze's own, at `Release` and after `CopyProp`, so two calls with the same arguments
+    // name the same locals: the second of a pure function's takes the first's result.
+    if release {
+        run!("SpendFacts repeats", |frame| {
+            if facts::merge_repeats(ctx, body) != 0 {
+                cfg::simplify_cfg(body, frame);
+            }
+        });
+    }
     run!("CriticalCallEdges", |frame| cfg::critical_call_edges(body, frame));
     // Last, so that the blocks it lists are the body's: it changes no statement or block.
     if options.inline && caller.is_some() {
