@@ -137,17 +137,47 @@ pub struct Delta {
 /// key, the two keyed sets of them, and the ID. The lists themselves are the consumer's.
 pub(super) struct Last {
     pub(super) id: BuiltId,
-    functions: Vec<(InstanceKey, ContentId)>,
-    statics: Vec<(StaticId, ContentId)>,
+    pub(super) functions: Vec<(InstanceKey, ContentId)>,
+    pub(super) statics: Vec<(StaticId, ContentId)>,
     /// The entries of `functions` and of `statics` as keyed sets: their roots make `id`.
-    sets: Sets,
+    pub(super) sets: Sets,
 }
 
 /// The keyed sets of a `Built`'s function entries and static entries.
 #[derive(Clone)] // clone: the last build's sets, moved to this build's with no hash made again
-struct Sets {
+pub(super) struct Sets {
     functions: Keyed,
     statics: Keyed,
+}
+
+impl Sets {
+    /// Sets function `key`'s entry, or takes it out with `None`: the one path of the set
+    /// to it is hashed again, and nothing else.
+    pub(super) fn function(&mut self, key: &InstanceKey, entry: Option<ContentId>) {
+        match entry {
+            Some(entry) => self.functions.set(function_key(key), entry.0),
+            None => self.functions.remove(&function_key(key)),
+        };
+    }
+
+    /// As [`Self::function`], of static `id`.
+    pub(super) fn static_(&mut self, id: &StaticId, entry: Option<ContentId>) {
+        match entry {
+            Some(entry) => self.statics.set(static_key(id), entry.0),
+            None => self.statics.remove(&static_key(id)),
+        };
+    }
+
+    /// The bytes hashed into the two sets since they were made.
+    pub(super) fn hashed(&self) -> u64 {
+        self.functions.hashed() + self.statics.hashed()
+    }
+
+    /// The [`BuiltId`] of a `Built` of these entries, these roots and nothing that is of no
+    /// function of its walk (no lazy entry, no folded group): what [`id_of`] gives it.
+    pub(super) fn id(&self, roots: &[InstanceKey]) -> BuiltId {
+        id_from(self, roots, &[], std::iter::empty(), std::iter::empty())
+    }
 }
 
 /// A function's key in its set: its instance key, a content ID already.
@@ -186,12 +216,16 @@ fn moved<K: Copy + Ord>(
 }
 
 impl Last {
-    /// Of `built`, the build after `before` of the same program (none: the first): every
-    /// entry made, and the sets moved from `before`'s by the entries that differ, or made
-    /// whole with none before. Either way the ID is the one a build with nothing kept gets
+    /// Of `built`, whose function entries are `functions` ([`function_entries_and_codes`]),
+    /// the build after `before` of the same program (none: the first): its static entries
+    /// made, and the sets moved from `before`'s by the entries that differ, or made whole
+    /// with none before. Either way the ID is the one a build with nothing kept gets
     /// (`an_id_kept_through_edits_is_a_fresh_builds`).
-    pub(super) fn of(built: &Built, before: Option<&Last>) -> Last {
-        let functions = function_entries(built);
+    pub(super) fn of_entries(
+        built: &Built,
+        functions: Vec<(InstanceKey, ContentId)>,
+        before: Option<&Last>,
+    ) -> Last {
         let statics = static_entries(built);
         let sets = match before {
             Some(before) => {
@@ -261,35 +295,48 @@ fn changes<K: Copy + Ord>(before: &[(K, ContentId)], now: &[(K, ContentId)]) -> 
 
 /// What a `Built` says of one function, gathered from its lists before it is hashed.
 #[derive(Clone, Default)]
-struct Row {
+pub(super) struct Row {
     /// Bits: compiled, has a side table, merged away, has a symbol, weak, patchable, tiered,
     /// cold (0 to 7).
-    flags: u8,
+    pub(super) flags: u8,
     /// Bits: editable, a root, in the entry, the workspace's, has an owner, has an identity,
     /// has an origin (0 to 6).
-    more: u8,
-    code_id: ContentId,
-    side: ContentId,
-    piece: ContentId,
-    merged: ContentId,
-    name: ContentId,
-    symbol: usize,
-    generic: ContentId,
-    identity: ContentId,
-    origin: Option<Origin>,
+    pub(super) more: u8,
+    pub(super) code_id: ContentId,
+    pub(super) side: ContentId,
+    pub(super) piece: ContentId,
+    pub(super) merged: ContentId,
+    pub(super) name: ContentId,
+    /// Its symbol's place in `Built::symbols`, for a row made from a whole `Built`.
+    pub(super) symbol: usize,
+    pub(super) generic: ContentId,
+    pub(super) identity: ContentId,
+    pub(super) origin: Option<Origin>,
 }
 
 /// The entry of each function of `built`, in key order ([`Built::inputs`]'s): everything
 /// `built` says of it ([`Delta`] lists what).
+#[cfg(test)]
 pub(crate) fn function_entries(built: &Built) -> Vec<(InstanceKey, ContentId)> {
+    function_entries_and_codes(built).0
+}
+
+/// [`function_entries`], with the code ID ([`content::code_id`]) of each function the build
+/// kept after dedupe, in key order: hashed once for the two.
+pub(super) fn function_entries_and_codes(
+    built: &Built,
+) -> (Vec<(InstanceKey, ContentId)>, Vec<(InstanceKey, ContentId)>) {
     let keys = &built.inputs;
     let at = |key: &InstanceKey| keys.binary_search_by_key(key, |it| it.0).ok();
     // alloc: per build, a row a function, freed with the pass
     let mut rows = vec![Row::default(); keys.len()];
+    // alloc: per build, a code ID a function it kept
+    let mut codes = Vec::with_capacity(built.functions.len());
     for function in &built.functions {
         let Some(at) = at(&function.key) else { continue };
         rows[at].flags |= 1;
         rows[at].code_id = content::code_id(function);
+        codes.push((function.key, rows[at].code_id));
         if let Some(side) = function.side {
             rows[at].flags |= 1 << 1;
             rows[at].side = side;
@@ -357,33 +404,57 @@ pub(crate) fn function_entries(built: &Built) -> Vec<(InstanceKey, ContentId)> {
     // alloc: per build, an entry a function, kept for the next build's delta
     let mut entries = Vec::with_capacity(keys.len());
     for (index, ((key, code), row)) in keys.iter().zip(&rows).enumerate() {
-        entries.push((*key, function_entry(built, index, *key, *code, row)));
+        let symbol = (row.flags & (1 << 3) != 0).then(|| built.symbols[row.symbol].1.as_str());
+        entries.push((*key, function_entry(*key, *code, row, symbol, built.versions.get(index))));
     }
-    entries
+    (entries, codes)
 }
 
-fn function_entry(
-    built: &Built,
-    index: usize,
+/// The entry of function `key` made from `code`: `row` gathered of it, its symbol where it
+/// has one (bit 3 of `row.flags`) and its version IDs. The one hash of a function's entry: a
+/// whole `Built`'s ([`function_entries`]) and a patched one's (`lists`) are made here.
+pub(super) fn function_entry(
     key: InstanceKey,
     code: CodeHash,
     row: &Row,
+    symbol: Option<&str>,
+    version: Option<&(ContentId, Result<ContentId, String>)>,
 ) -> ContentId {
     let mut hasher = Hasher::new(FUNCTION_ENTRY_DOMAIN);
     hasher.id(&key.0).id(&code.0).update(&[row.flags, row.more]);
     hasher.id(&row.code_id).id(&row.side).id(&row.piece).id(&row.merged).id(&row.name);
-    if row.flags & (1 << 3) != 0 {
-        hasher.part(built.symbols[row.symbol].1.as_bytes());
+    if let Some(symbol) = symbol {
+        hasher.part(symbol.as_bytes());
     }
     hasher.id(&row.generic).id(&row.identity);
     if let Some(origin) = row.origin {
         origin.hash_into(&mut hasher);
     }
-    match built.versions.get(index) {
+    match version {
         Some((version, Ok(bound))) => hasher.update(&[1]).id(version).id(bound),
         Some((version, Err(why))) => hasher.update(&[2]).id(version).part(why.as_bytes()),
         None => hasher.update(&[0]),
     };
+    hasher.finish()
+}
+
+/// The entry of static `id`: whose it is, its definition's digest where it was compiled, and
+/// each symbol it is defined as with whether weakly. As [`function_entry`], the one hash.
+pub(super) fn static_entry<'s>(
+    id: &StaticId,
+    owner: Owner,
+    digest: Option<ContentId>,
+    symbols: impl Iterator<Item = (&'s str, Linkage)>,
+) -> ContentId {
+    let mut hasher = Hasher::new(STATIC_ENTRY_DOMAIN);
+    hasher.id(&id.0.0).id(&id.1).update(&[u8::from(owner == Owner::Workspace)]);
+    match digest {
+        Some(digest) => hasher.update(&[1]).id(&digest),
+        None => hasher.update(&[0]),
+    };
+    for (symbol, linkage) in symbols {
+        hasher.part(symbol.as_bytes()).update(&[u8::from(linkage == Linkage::Weak)]);
+    }
     hasher.finish()
 }
 
@@ -398,18 +469,10 @@ pub(crate) fn static_entries(built: &Built) -> Vec<(StaticId, ContentId)> {
     let mut entries = Vec::with_capacity(built.static_owners.len());
     for (item, instance, owner) in &built.static_owners {
         let id = (*item, *instance);
-        let mut hasher = Hasher::new(STATIC_ENTRY_DOMAIN);
-        hasher.id(&item.0).id(instance).update(&[u8::from(*owner == Owner::Workspace)]);
-        match digest(&id) {
-            Some(digest) => hasher.update(&[1]).id(&digest),
-            None => hasher.update(&[0]),
-        };
-        for (_, _, symbol, linkage) in
-            built.static_symbols.iter().filter(|it| (it.0, it.1) == id)
-        {
-            hasher.part(symbol.as_bytes()).update(&[u8::from(*linkage == Linkage::Weak)]);
-        }
-        entries.push((id, hasher.finish()));
+        let symbols = (built.static_symbols.iter())
+            .filter(|it| (it.0, it.1) == id)
+            .map(|it| (it.2.as_str(), it.3));
+        entries.push((id, static_entry(&id, *owner, digest(&id), symbols)));
     }
     entries.sort_unstable_by_key(|it| it.0);
     entries
@@ -417,22 +480,41 @@ pub(crate) fn static_entries(built: &Built) -> Vec<(StaticId, ContentId)> {
 
 /// The [`BuiltId`] of `built`, whose entries are in `sets`.
 fn id_of(built: &Built, sets: &Sets) -> BuiltId {
+    // What is of no function of the walk: a folded group's body and its identity.
+    let walked = |key: &InstanceKey| built.inputs.binary_search_by_key(key, |it| it.0).is_ok();
+    id_from(
+        sets,
+        &built.roots,
+        &built.entry,
+        built.identities.iter().filter(|it| !walked(&it.0)).copied(),
+        (built.functions.iter().filter(|it| !walked(&it.key)))
+            .map(|function| (function.key, content::code_id(function))),
+    )
+}
+
+/// The [`BuiltId`] of the entries in `sets`, the roots, a lazy build's entry, and what is of
+/// no function of the walk: each folded group's identity and its body's code ID.
+fn id_from(
+    sets: &Sets,
+    roots: &[InstanceKey],
+    entry: &[InstanceKey],
+    identities: impl Iterator<Item = (InstanceKey, ContentId)>,
+    bodies: impl Iterator<Item = (InstanceKey, ContentId)>,
+) -> BuiltId {
     let mut hasher = Hasher::new(BUILT_ID_DOMAIN);
     // Each root says its set's entries and how many there are.
     hasher.update(&sets.functions.root()).update(&sets.statics.root());
-    for list in [&built.roots, &built.entry] {
+    for list in [roots, entry] {
         hasher.update(&(list.len() as u64).to_le_bytes());
         for key in list {
             hasher.id(&key.0);
         }
     }
-    // What is of no function of the walk: a folded group's body and its identity.
-    let walked = |key: &InstanceKey| built.inputs.binary_search_by_key(key, |it| it.0).is_ok();
-    for (key, identity) in built.identities.iter().filter(|it| !walked(&it.0)) {
-        hasher.id(&key.0).id(identity);
+    for (key, identity) in identities {
+        hasher.id(&key.0).id(&identity);
     }
-    for function in built.functions.iter().filter(|it| !walked(&it.key)) {
-        hasher.id(&function.key.0).id(&content::code_id(function));
+    for (key, code) in bodies {
+        hasher.id(&key.0).id(&code);
     }
     BuiltId(hasher.finish())
 }

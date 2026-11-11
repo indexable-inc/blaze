@@ -286,6 +286,33 @@ pub trait Frontend: Sync {
         None
     }
 
+    /// The front end's view: a number that is another after any write of any input, and that
+    /// [`Self::written_since`] is asked against; `None` for a front end that tells none,
+    /// whose every function that is not durable is asked again each build. Read once a
+    /// build, before any describe.
+    fn view(&self) -> Option<u64> {
+        None
+    }
+
+    /// The group of inputs a describe and a count of `instance` for `requester` hang on
+    /// beside durable ones, where the front end can name one whose writes it tells
+    /// ([`Self::written_since`]): a workspace crate's sources, say. Asked after a describe of
+    /// it in this build, with [`Self::durable`]. `Some` promises that while no input of the
+    /// group is written and the durable view is the same, a describe and a count give what
+    /// they gave, so a build after a write to another group asks nothing of it. The default
+    /// is `None`: asked each build.
+    fn group(&self, instance: &Self::Instance, requester: &Origin) -> Option<u64> {
+        let _ = (instance, requester);
+        None
+    }
+
+    /// Whether an input of `group` ([`Self::group`]) was written since the front end's view
+    /// was `view` ([`Self::view`]). Exact, or `true`: the default, which asks.
+    fn written_since(&self, group: u64, view: u64) -> bool {
+        let _ = (group, view);
+        true
+    }
+
     /// Whether a walk of this front end may close facts of the whole program
     /// ([`Self::closed`] may say `true`). The facts are made from everything the walk reached
     /// ([`Self::reached`]), so a walk patched from a kept one, which tells only what changed,
