@@ -91,7 +91,7 @@ COMPONENTS = [
     "rustc-codegen-cranelift-preview",
 ]
 # Where the old pin is written down besides harness/toolchain and pins.txt.
-MENTIONS = ["site/install.sh", "crates/rustc_lexer/Cargo.toml"]
+MENTIONS = ["site/install.sh", "site/install.ps1", "crates/rustc_lexer/Cargo.toml"]
 # Docs that name the pin as it is today. Only its names and `rustc -V` move there: a bare commit
 # in them can be what something was ported from.
 DOCS = ["README.md", "docs/toolchain.md", "docs/cargo.md"]

@@ -1,6 +1,6 @@
 name: install
 
-# site/install.sh, run as a user runs it, on each platform it installs on: from the newest release
+# site/install.sh, run as a user runs it, and site/install.ps1 on Windows (the last job), on each platform they install on: from the newest release
 # (the nightly build before the first), into a CARGO_HOME of its own, toolchain included; then
 # `blaze` in a new project; then each channel and pin form (`--channel`, BLAZE_CHANNEL,
 # `--version stable|canary|V`) against the release GitHub says it is. And this commit's build, installed in a Debian
@@ -10,9 +10,9 @@ name: install
 on:
   push:
     branches: [main]
-    paths: ["site/install.sh", ".github/workflows/install.yaml"]
+    paths: ["site/install.sh", "site/install.ps1", ".github/workflows/install.yaml"]
   pull_request:
-    paths: ["site/install.sh", ".github/workflows/install.yaml"]
+    paths: ["site/install.sh", "site/install.ps1", ".github/workflows/install.yaml"]
   release:
     types: [published]
   schedule:
@@ -255,3 +255,96 @@ jobs:
             echo "::error::the proc macros were not blaze's"; exit 1
           fi
           blaze stop
+
+  # site/install.ps1, in Windows PowerShell 5.1 and in PowerShell 7, piped to `iex` as the docs
+  # have it. Until a release has a Windows archive (#1389) the newest release has none to install,
+  # so the steps that install use an archive laid out as a release's, with a stand-in for
+  # blaze.exe, and the step against the newest release accepts either its build or the plain
+  # "has no build for Windows on x86-64".
+  windows:
+    name: windows (${{ matrix.shell }})
+    runs-on: windows-2025
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    env:
+      BLAZE_NO_TOOLCHAIN: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - name: an archive laid out as a release's, and a CARGO_HOME of its own
+        run: |
+          $name = 'blaze-v0.0.0-x86_64-pc-windows-msvc'
+          $dir = Join-Path $env:RUNNER_TEMP "pkg\$name"
+          New-Item -ItemType Directory -Path $dir | Out-Null
+          Copy-Item "$env:SystemRoot\System32\whoami.exe" (Join-Path $dir 'blaze.exe')
+          Copy-Item "$env:SystemRoot\System32\whoami.exe" (Join-Path $dir 'blaze-engine.exe')
+          Set-Content (Join-Path $dir 'explore-core.wasm') 'wasm'
+          tar.exe -czf (Join-Path $env:RUNNER_TEMP "$name.tar.gz") -C (Join-Path $env:RUNNER_TEMP 'pkg') $name
+          "CARGO_HOME=$env:RUNNER_TEMP\cargo" | Add-Content $env:GITHUB_ENV
+          "BLAZE_HOME=$env:RUNNER_TEMP\blaze-home" | Add-Content $env:GITHUB_ENV
+          "ARCHIVE=$env:RUNNER_TEMP\$name.tar.gz" | Add-Content $env:GITHUB_ENV
+      # Piped, as the docs have it: no terminal, nothing asked.
+      - name: install
+        env:
+          BLAZE_ARCHIVE: ${{ env.ARCHIVE }}
+        run: |
+          Get-Content -Raw site/install.ps1 | Invoke-Expression
+          if ($LASTEXITCODE) { throw "install.ps1 failed: $LASTEXITCODE" }
+          foreach ($f in 'blaze.exe', 'blaze-engine.exe', 'explore-core.wasm') {
+            if (-not (Test-Path "$env:CARGO_HOME\bin\$f")) { throw "$f was not installed" }
+          }
+      - name: again, which replaces them in place
+        env:
+          BLAZE_ARCHIVE: ${{ env.ARCHIVE }}
+        run: |
+          & ./site/install.ps1 -Detail
+          if ($LASTEXITCODE) { throw "install.ps1 failed: $LASTEXITCODE" }
+      # Windows refuses to overwrite a program that runs, such as the daemon: the installer moves it
+      # aside and puts the new one in its place.
+      - name: over a blaze.exe that is running
+        env:
+          BLAZE_ARCHIVE: ${{ env.ARCHIVE }}
+        run: |
+          Copy-Item "$env:SystemRoot\System32\PING.EXE" "$env:CARGO_HOME\bin\blaze.exe" -Force
+          $running = Start-Process -PassThru -WindowStyle Hidden "$env:CARGO_HOME\bin\blaze.exe" -ArgumentList '-t', 'localhost'
+          Start-Sleep -Seconds 1
+          & ./site/install.ps1
+          if ($LASTEXITCODE) { throw "install.ps1 over a running blaze.exe failed: $LASTEXITCODE" }
+          $stopped = $running.HasExited
+          Stop-Process -Id $running.Id -Force -ErrorAction SilentlyContinue
+          if ($stopped) { throw 'the blaze.exe that was running was stopped' }
+          if ((Get-Item "$env:CARGO_HOME\bin\blaze.exe").Length -eq (Get-Item "$env:SystemRoot\System32\PING.EXE").Length) { throw 'blaze.exe is still the old one' }
+      - name: a release that is not there says so
+        env:
+          BLAZE_ARCHIVE: ""
+        run: |
+          $said = & ./site/install.ps1 -Version 0.0.0-none *>&1 | Out-String
+          Write-Host $said
+          if ($said -notmatch [regex]::Escape('there is no blaze release 0.0.0-none')) { throw 'the message is not the one for a missing release' }
+          $global:LASTEXITCODE = 0
+      - name: a channel that is not one says so
+        env:
+          BLAZE_ARCHIVE: ""
+        run: |
+          $said = & ./site/install.ps1 -Channel nightly *>&1 | Out-String
+          Write-Host $said
+          if ($said -notmatch [regex]::Escape('blaze has no channel nightly')) { throw 'the message is not the one for a missing channel' }
+          $global:LASTEXITCODE = 0
+      - name: the newest release
+        env:
+          BLAZE_ARCHIVE: ""
+        run: |
+          $said = & ./site/install.ps1 -Detail *>&1 | Out-String
+          Write-Host $said
+          if ($LASTEXITCODE) {
+            # A release with no Windows archive yet (#1389) is the one failure allowed.
+            if ($said -notmatch 'has no build for Windows on x86-64') { throw 'it failed, and not for that reason' }
+          } else {
+            & "$env:CARGO_HOME\bin\blaze.exe" --version
+          }
+          $global:LASTEXITCODE = 0

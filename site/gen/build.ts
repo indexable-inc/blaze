@@ -270,6 +270,8 @@ async function build() {
 	// The installer, at <base>/install.sh, from site/; the worker also answers <base>/ with it for curl
 	// (`curl -fsSL https://ix.dev/blaze | sh`).
 	cpSync(path.join(root, 'install.sh'), path.join(dist, 'install.sh'));
+	// And the Windows one, at <base>/install.ps1 (`irm https://ix.dev/blaze/install.ps1 | iex`).
+	cpSync(path.join(root, 'install.ps1'), path.join(dist, 'install.ps1'));
 
 	write(path.join(gen, 'site.cbor'), snap);
 	cpSync(path.join(modules, 'site.wasm'), path.join(gen, 'site.wasm'));
