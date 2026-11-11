@@ -21,6 +21,14 @@ impl SystemTime {
     }
 
     pub fn now() -> SystemTime {
+        // blaze: a process given a provider with a wall clock is told that time, whole
+        // seconds, however often it asks (`sys::provider`); every other process reads the
+        // system's clock, as the nightly's std does.
+        if let Some(seconds) = crate::sys::provider::wall()
+            && let Ok(t) = Timespec::new(seconds, 0)
+        {
+            return SystemTime { t };
+        }
         SystemTime { t: Timespec::now(libc::CLOCK_REALTIME) }
     }
 
