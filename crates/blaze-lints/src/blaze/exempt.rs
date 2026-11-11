@@ -119,6 +119,8 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::ProcMacroAttribute
         | Lint::ProcMacroFnLike
         | Lint::BuildScriptAmbient
+        // Kept with `#[expect(..)]` on the function: what a function reaches is its choice.
+        | Lint::StdUse
         // A hasher is chosen in the type, or kept with `#[expect(blaze::default_hasher, reason = ..)]`:
         // an allocation's comment says nothing about it.
         | Lint::DefaultHasher => None,

@@ -175,10 +175,15 @@ is an error. Where a mechanical fix exists, `blaze check --fix` applies it.
 | `blaze::derivable_by_reflection` | a derive that reflection covers (once change 9 exists) | none at first |
 | `blaze::proc_macro_derive`, `proc_macro_attribute`, `proc_macro_fn_like` (the group `blaze::proc_macro`) | a procedural macro a workspace crate defines, one finding per macro, naming it and its kind: code blaze cannot see through | none: names the replacement of its kind (a generic impl over fields, reflection over the item, a `const fn`; a macro that parses a foreign syntax may stay) |
 | `blaze::build_script_ambient` | a workspace build script's use of the standard library's ambient file system, environment, processes, network or clock, one finding per item with its count: code blaze must run and trace to key | none: names the capability to take |
+| `blaze::std_use` | a use of an item of Rust's `std` that [bstd](std.md) replaces or forbids (ambient authority, a hidden cost, a global-heap allocation, a renamed type), by what it resolves to, one finding per item per function with its count; `build_script_ambient` is the same table and walk over a build script | the renames (`Arc` to `bstd::sync::Shared`, ...); none for the rest, which change what a function is handed |
 
-The last two rows are the lints of code blaze cannot analyse, and are built
-([lints.md](../../../lints.md#proc_macro), [lints.md](../../../lints.md#build_script_ambient)).
-They are the exception to "`allow` by default": each warns by default, in every workspace, once
+The last three rows are built: the lints of code blaze cannot analyse
+([lints.md](../../../lints.md#proc_macro), [lints.md](../../../lints.md#build_script_ambient))
+and `std_use` ([lints.md](../../../lints.md#std_use)), which names what is written where
+`blaze::ambient` and `blaze::global_alloc`, the effects, will prove what is reached. `std_use`
+is `allow` everywhere until a crate has `#![blaze::capabilities]` or a workspace asks for it
+once [bstd](std.md) is in the tree (`BSTD_IN_TREE`). The first two
+are the exception to "`allow` by default": each warns by default, in every workspace, once
 the replacement its help names is in the tree, and is `allow` until then with a help that says
 the replacement is planned. `proc_macro_fn_like` warns now (`const fn` is Rust's);
 `proc_macro_derive` and `proc_macro_attribute` wait for change 9

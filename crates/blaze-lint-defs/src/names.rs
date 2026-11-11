@@ -145,7 +145,7 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
         ],
     ),
     // What the blaze edition removes (docs/v2/plan/design/edition.md), here the code blaze
-    // cannot analyse: allowed until a workspace turns the group on, but for the members whose
+    // cannot analyse and what blaze's standard library replaces (`std_use`): allowed until a workspace turns the group on, but for the members whose
     // advice this blaze already has (`ready`), which warn.
     (
         "blaze::edition",
@@ -154,6 +154,7 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::proc_macro_attribute",
             "blaze::proc_macro_fn_like",
             "blaze::build_script_ambient",
+            "blaze::std_use",
         ],
     ),
     (

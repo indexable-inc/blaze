@@ -52,7 +52,7 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
     let store = Store::default();
     let lint = lint("blaze::const_impure").expect("blaze's lint");
     assert_eq!(lint.default_level, Level::Warn);
-    assert_eq!(blaze_lints().len(), 90);
+    assert_eq!(blaze_lints().len(), 91);
     assert!(!lint.is_externally_loaded);
     // The compiler's own and the release build's; blaze-lints loads every other.
     let built: Vec<&str> =
@@ -73,6 +73,8 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
         ("blaze::proc_macro_derive", ready::REFLECTION_REPLACES_MACROS),
         ("blaze::proc_macro_attribute", ready::REFLECTION_REPLACES_MACROS),
         ("blaze::build_script_ambient", ready::CAPABILITIES_FOR_BUILD_SCRIPTS),
+        // Never by default: a crate or a workspace's table asks for it.
+        ("blaze::std_use", false),
     ];
     for it in edition.lints.iter() {
         assert!(warns.iter().any(|(name, _)| *name == it.name), "`{}` says when it warns", it.name);
@@ -176,6 +178,22 @@ fn the_proc_macro_lints_are_a_group_of_the_edition_lints() {
     );
     assert_eq!(ready::level(true), Level::Warn);
     assert_eq!(ready::level(false), Level::Allow);
+}
+
+/// `blaze::std_use` is `allow` by default whatever its switch says, and every switch is of a
+/// lint of the edition group: what a workspace's `lints-when-ready` table can name.
+#[test]
+fn std_use_waits_to_be_asked_for_and_every_switch_is_an_edition_lints() {
+    let edition = group("blaze::edition").expect("blaze's edition group");
+    let std_use = lint("blaze::std_use").expect("blaze's lint");
+    assert_eq!(std_use.default_level, Level::Allow);
+    assert!(std_use.is_externally_loaded, "blaze-lints gives it");
+    assert_eq!(ready::switch_of("std_use"), Some(ready::BSTD_IN_TREE));
+    assert_eq!(ready::switch_of("hot_alloc"), None, "its advice needs nothing new");
+    for (name, _) in ready::SWITCHES {
+        let full = format!("blaze::{name}");
+        assert!(edition.lints.iter().any(|it| it.name == full), "{full}");
+    }
 }
 
 #[test]

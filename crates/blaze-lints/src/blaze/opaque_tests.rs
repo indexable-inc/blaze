@@ -301,7 +301,7 @@ fn script_findings() -> Vec<(u32, String)> {
         ),
         (
             8,
-            "`std::process::Command`, used once in this build script, starts or ends a process by itself"
+            "`std::process::Command`, used 2 times in this build script, starts or ends a process by itself"
                 .to_owned(),
         ),
     ]
@@ -309,8 +309,9 @@ fn script_findings() -> Vec<(u32, String)> {
 
 /// One finding per item of std's ambient authority a build script uses, at its first use, with
 /// the count of its uses in every body: a path through a `use` and one through an alias are the
-/// same item; a method on a value, a function that only computes and the `println!` of a cargo
-/// directive are none. Each names the capability that stands for it.
+/// same item, and a method called on a value is a use of its type (`Command::new` and
+/// `cc.status()` are two of `Command`); a function that only computes and the `println!` of a
+/// cargo directive are none. Each names the capability that stands for it.
 #[test]
 fn a_build_scripts_ambient_uses_are_found_once_each_with_their_count() {
     let out = lint(
@@ -390,6 +391,7 @@ fn the_docs_table_has_each_lints_default_level() {
         Lint::ProcMacroAttribute,
         Lint::ProcMacroFnLike,
         Lint::BuildScriptAmbient,
+        Lint::StdUse,
     ] {
         let row = format!("| `blaze::{}` | `", lint.name());
         let said = docs

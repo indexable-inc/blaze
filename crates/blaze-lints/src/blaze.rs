@@ -100,6 +100,9 @@ mod shared_collection_lock;
 mod small_map;
 mod soa_candidate;
 mod stable_sort_needless;
+mod std_use;
+#[cfg(test)]
+mod std_use_tests;
 mod stdout_lock_in_loop;
 mod string_key;
 mod struct_update;
@@ -239,6 +242,7 @@ pub enum Lint {
     ProcMacroAttribute,
     ProcMacroFnLike,
     BuildScriptAmbient,
+    StdUse,
 }
 
 /// Which workspaces a lint is for.
@@ -256,9 +260,9 @@ pub(crate) enum Kind {
     /// turns it, or the group `blaze::pedantic_perf`, on.
     PedanticPerf,
     /// It flags what the blaze edition removes (docs/v2/plan/design/edition.md), here the code
-    /// blaze cannot analyse: the group `blaze::edition`, allowed until a workspace or crate
-    /// turns it on, but for a lint whose advice this blaze already has
-    /// ([`Lint::warns_by_default`]), which warns everywhere.
+    /// blaze cannot analyse and what blaze's standard library replaces (`std_use`): the group
+    /// `blaze::edition`, allowed until a workspace or crate turns it on, but for a lint whose
+    /// advice this blaze already has ([`Lint::warns_by_default`]), which warns everywhere.
     Edition,
 }
 
@@ -278,6 +282,10 @@ pub(crate) const EDITION_READY: &[(Lint, bool)] = &[
     (Lint::ProcMacroAttribute, ready::REFLECTION_REPLACES_MACROS),
     (Lint::ProcMacroFnLike, true),
     (Lint::BuildScriptAmbient, ready::CAPABILITIES_FOR_BUILD_SCRIPTS),
+    // Never by default, in any workspace: a crate asks for it (`#![blaze::capabilities]`), and
+    // blaze's own workspace does once bstd is in the tree (its manifest's `lints-when-ready`
+    // table and `ready::BSTD_IN_TREE`).
+    (Lint::StdUse, false),
 ];
 
 /// The group `blaze::proc_macro`: one lint per kind of procedural macro a workspace crate
@@ -427,6 +435,7 @@ impl Lint {
         Lint::ProcMacroAttribute,
         Lint::ProcMacroFnLike,
         Lint::BuildScriptAmbient,
+        Lint::StdUse,
     ];
 
     /// Which workspaces the lint is for ([`Kind`]); written out per lint, so a new one chooses.
@@ -490,7 +499,9 @@ impl Lint {
             Lint::ProcMacroDerive
             | Lint::ProcMacroAttribute
             | Lint::ProcMacroFnLike
-            | Lint::BuildScriptAmbient => Kind::Edition,
+            | Lint::BuildScriptAmbient
+            // What blaze's standard library replaces, which the edition's `std` no longer has.
+            | Lint::StdUse => Kind::Edition,
             // `blaze::hot` and its comments (`// clone:`, `// alloc:`, `// dyn:`).
             Lint::HotClone
             | Lint::HotAlloc
@@ -649,6 +660,7 @@ impl Lint {
             Lint::ProcMacroAttribute => "proc_macro_attribute",
             Lint::ProcMacroFnLike => "proc_macro_fn_like",
             Lint::BuildScriptAmbient => "build_script_ambient",
+            Lint::StdUse => "std_use",
         }
     }
 
@@ -745,6 +757,7 @@ impl Lint {
                 concat!(general_docs!(), "#proc_macro")
             }
             Lint::BuildScriptAmbient => concat!(general_docs!(), "#build_script_ambient"),
+            Lint::StdUse => concat!(general_docs!(), "#std_use"),
             Lint::FiberBoundary => {
                 "https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan.md"
             }
@@ -1017,6 +1030,13 @@ impl Lint {
                     "nothing to change yet: the replacement is a capability the script is handed (`Fs`, `Env`, `Process`, `Net`, `Clock` of blaze's standard library, docs/v2/plan/design/std.md), which states in the script's signature what it can touch, lets blaze prove what it reads, and reruns it only when that changes; that library is not in this blaze, and this lint is `allow` by default until it is"
                 }
             }
+            Lint::StdUse => {
+                if ready::BSTD_IN_TREE {
+                    "take the capability, or write the form of blaze's standard library, that the finding names (bstd, docs/v2/plan/design/std.md): a function then says in its signature everything it can touch, wait for and allocate from; where the finding has a fix, `blaze check --fix` makes it; or say why std's stays with `#[expect(blaze::std_use, reason = \"..\")]`"
+                } else {
+                    "nothing to change yet: what the finding names is of blaze's standard library (bstd, docs/v2/plan/design/std.md), which is not in this blaze; this lint is `allow` by default, a crate asks for it with `#![blaze::capabilities]`, and blaze's own workspace has it at `warn` once bstd is in the tree"
+                }
+            }
             Lint::FrozenCollection => {
                 "make the field a `Box<[T]>` (`Box<str>` for a string), built once with `into_boxed_slice()` / `into_boxed_str()`; or say why it stays growable with `#[expect(blaze::frozen_collection, reason = \"..\")]`"
             }
@@ -1116,6 +1136,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         shared_collection_lock::check_declaration(cx, node);
     }
     unrecorded_span::check(cx, node);
+    std_use::check_declaration(cx, node);
     if node == cx.root() && cx.in_file() {
         error_debug::check(cx);
         dropped_error::check(cx);
@@ -1164,6 +1185,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         fmt_allocates::check(cx);
         stable_sort_needless::check(cx);
         build_script_ambient::check(cx);
+        std_use::check(cx);
         check_body(cx);
     }
 }

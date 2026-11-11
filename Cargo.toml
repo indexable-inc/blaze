@@ -171,6 +171,16 @@ unrecorded_span = "deny"
 # which drops an unknown field silently; AGENTS.md rule 3) is on through `internal` above, at
 # `warn`; other workspaces opt in.
 
+# The lints this workspace has once what they tell code to move to is in the tree: a line here
+# sets its level when the lint's switch in crates/blaze-lint-defs/src/ready.rs is `true`, and
+# nothing until then. A table of its own: a released blaze that does not know a lint yet (the
+# stage 0 that builds this tree) reads no table it does not know.
+[workspace.metadata.blaze.lints-when-ready]
+# Every use of Rust's std that blaze's own standard library replaces (docs/lints.md#std_use,
+# docs/v2/plan/design/std.md, step S3): on for every crate of blaze once `BSTD_IN_TREE` is
+# `true`. Until then harness/v2/std_uses.py runs the lint by its flag, for the worklist.
+std_use = "warn"
+
 # The pinned LLVM (docs/cargo.md, "Pinned native inputs"): blaze fetches the release
 # crates/hir-ty-codegen/llvm.json names for the target, checks its sha256, unpacks it read-only
 # under its home and sets LLVM_SYS_231_PREFIX to it for these build scripts, over any value the

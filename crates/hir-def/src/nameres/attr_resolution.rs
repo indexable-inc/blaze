@@ -142,6 +142,11 @@ impl DefMap {
                         | "reflect"
                         // `#[blaze::sealed]`, from `AttrFlags::BLAZE_SEALED` (`hir-ty-coherence`).
                         | "sealed"
+                        // `#![blaze::capabilities]` (docs/v2/plan/design/std.md, "The checks"):
+                        // read from the syntax by blaze-lints, where it asks for
+                        // `blaze::std_use` beneath it; the effects it will make errors are
+                        // not built.
+                        | "capabilities"
                 )
             {
                 return true;

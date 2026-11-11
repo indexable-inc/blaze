@@ -437,6 +437,11 @@ fn clippy_where(covers: impl Fn(&Info) -> bool) -> On {
 
 /// The lints `blaze::<name>` stands for.
 fn blaze_lints(name: &str) -> On {
+    // `#![blaze::capabilities]` asks for a lint without naming it: the files that write it
+    // have that lint on, as the files that write `#![warn(blaze::std_use)]` do.
+    if name == crate::level::CAPABILITIES {
+        return crate::level::capabilities_asks_for().bit();
+    }
     Target::blaze(name).unwrap_or(On::EMPTY)
 }
 
@@ -969,6 +974,13 @@ mod tests {
             "`blaze::proc_macro` is the three macro lints, each of `blaze::edition`"
         );
         assert_eq!(macros.without(edition), On::EMPTY);
+        assert!(edition.intersects(blaze::Lint::StdUse.bit()));
+        let (capabilities, _) = named_in("#![blaze::capabilities]");
+        assert_eq!(
+            named(capabilities),
+            ["blaze::std_use"],
+            "`#![blaze::capabilities]` turns `std_use` on where it is written"
+        );
         assert!(
             !(general.intersects(pedantic) || internal.intersects(pedantic)),
             "the kinds are disjoint"
