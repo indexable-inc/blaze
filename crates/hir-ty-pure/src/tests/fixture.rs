@@ -218,6 +218,8 @@ mod sys {
         pub fn mkdir(path: *const u8, mode: u32) -> i32;
         pub fn posix_spawnp(pid: *mut i32, file: *const u8) -> i32;
         pub fn exit(code: i32) -> !;
+        pub fn getrandom(buf: *mut u8, len: usize, flags: u32) -> isize;
+        pub fn clock_gettime(clock: i32, time: *mut i64) -> i32;
     }
 
     pub mod io {
@@ -577,6 +579,35 @@ pub mod fs {
     pub fn create_dir_all<P: AsRef<Path>>(path: P) -> io::Result<()> {
         let made = unsafe { crate::sys::mkdir(path.as_ref().as_ptr(), 0o755) };
         if made < 0 { Err(io::Error { code: made }) } else { Ok(()) }
+    }
+}
+
+pub mod hash {
+    pub struct RandomState {
+        pub k0: u64,
+        pub k1: u64,
+    }
+
+    impl RandomState {
+        pub fn new() -> RandomState {
+            let mut keys = [0u8; 16];
+            unsafe { crate::sys::getrandom(keys.as_mut_ptr(), 16, 0) };
+            RandomState { k0: keys[0] as u64, k1: keys[8] as u64 }
+        }
+    }
+}
+
+pub mod time {
+    pub struct SystemTime {
+        pub seconds: i64,
+    }
+
+    impl SystemTime {
+        pub fn now() -> SystemTime {
+            let mut time = [0i64; 2];
+            unsafe { crate::sys::clock_gettime(0, time.as_mut_ptr()) };
+            SystemTime { seconds: time[0] }
+        }
     }
 }
 
