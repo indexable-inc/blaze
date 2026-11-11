@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-62 theorems: 49 in `lean`, 13 in `lean/analysis`.
+63 theorems: 50 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -475,6 +475,14 @@ theorem State.read_ok {P : Pointer → Prop} {st : State} (hm : MemOk P st) (p :
 theorem State.write_ok {P : Pointer → Prop} {st : State} (hm : MemOk P st) (p : Pointer)
     (v : Value) (hv : Value.Ok P v) (st' : State) (h : st.write p v = Outcome.ok st') :
     MemOk P st'
+```
+
+**`Blaze.Mir.evalPlace_ptr`** (`Blaze.Mir.Opt.Borrow`, `lean`): A place whose base local may be borrowed, or that goes through a dereference, evaluates to a pointer to frame 0 or to a local its frame's function may borrow.
+
+```lean
+theorem evalPlace_ptr {B : FnId → Local → Prop} {st : State} (hs : StateOk B st) (place : Place)
+    (q : Pointer) (hb : B st.topFn place.base ∨ hasDeref place.proj = true)
+    (h : evalPlace st place = Outcome.ok q) : PtrOk B st.ids q
 ```
 
 **`Blaze.Mir.Opt.simplifyCfg_call`** (`Blaze.Mir.Opt.SimplifyCfg`, `lean`): SimplifyCfg composed from the proved passes keeps every call that ends, and not in undefined behaviour: the same outcome with the same fuel.

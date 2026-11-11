@@ -670,7 +670,14 @@ programs; it is the specification of the Rust pass of the same name.
   - **Dead-store elimination: first piece** (`Opt/Ptr.lean`; checked at eadd58c04c).
     `MemOk P st` says every pointer in every slot of the state satisfies `P`; a read gives a
     value whose pointers do (`State.read_ok`) and a write of such a value keeps it
-    (`State.write_ok`). The rest is below.
+    (`State.write_ok`).
+  - **Dead-store elimination: second piece** (`Opt/Ids.lean`, `Opt/Borrow.lean`; not yet
+    elaborated). `PtrOk B ids p`: the pointer names frame 0, a frame that is gone, or a
+    local its frame's function may borrow (`B`); `StateOk B st`: every pointer in memory is
+    such. Writes and moves keep it, and a place whose base may be borrowed, or that goes
+    through a dereference, evaluates to such a pointer (`evalPlace_ptr`). A frame's id and
+    function are left by statements (`execStmt_ids`, `Opt/Ctl.lean`'s proofs for that
+    pair). The rest is below.
   - **Dead-store elimination: what is not written.** It needs a relation, not a map: two states
     equal but on dead locals. The Rust pass (`optimize/dse.rs`) removes the whole assignment
     of an rvalue it holds to be free of effects (all but a pointer-to-address cast), to a
