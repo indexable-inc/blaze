@@ -327,4 +327,34 @@ example :
 example : isInt ScalarTy.U32 4 ((Opt.removeStorageMarkers constant).call 8 0 [] []) = true := by
   decide
 
+/-! Constant folding: an operation on constants is its value; one that panics stays. -/
+
+def c32 (n : Int) : Operand := Operand.const (Const.int ScalarTy.U32 n)
+
+example :
+    Opt.foldRvalue (Rvalue.binary BinOp.add (c32 2) (c32 3)) = Rvalue.use (c32 5) := by
+  decide
+
+example :
+    Opt.foldRvalue (Rvalue.checked BinOp.add (c32 4294967295) (c32 1)) =
+      Rvalue.checked BinOp.add (c32 4294967295) (c32 1) := by
+  decide
+
+example :
+    Opt.foldRvalue (Rvalue.binary BinOp.lt (c32 2) (c32 3)) =
+      Rvalue.use (Operand.const (Const.bool true)) := by
+  decide
+
+example :
+    Opt.foldRvalue (Rvalue.cast (c32 300) ScalarTy.U8) =
+      Rvalue.use (Operand.const (Const.int ScalarTy.U8 44)) := by
+  decide
+
+/-! The validator: `constant` and what `SimplifyConstCondition` makes of it have one normal
+form; a program that returns another constant does not. -/
+
+example : Opt.validate constant constantSimplified = true := by decide
+
+example : Opt.validate constant (one [] Terminator.ret) = false := by decide
+
 end Blaze.Mir.Tests

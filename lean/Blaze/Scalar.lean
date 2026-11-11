@@ -136,6 +136,10 @@ theorem lit_val (ty : ScalarTy) (x : Int) (h : ty.min ≤ x ∧ x ≤ ty.max) :
   unfold lit
   rw [dif_pos h]
 
+/-- An integer written back from its own value is itself. -/
+theorem lit_self {ty : ScalarTy} (x : Scalar ty) : lit ty x.val = x :=
+  ext (lit_val ty x.val ⟨x.hmin, x.hmax⟩)
+
 instance {ty : ScalarTy} {n : Nat} : OfNat (Scalar ty) n := ⟨lit ty (n : Int)⟩
 
 /-- A numeral in range is its value: `(1 : Usize).val = 1`. -/
