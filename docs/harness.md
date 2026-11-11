@@ -633,6 +633,7 @@ for each platform, each on a machine of its own kind.
 | `fmt.yaml` | push to main | `blaze fmt --all` with the release `.github/blaze-version` names, and a commit `fmt` when it changed a file | 2 min |
 | `train.yaml` | push to main, by hand | everything below, then a release or the train's issue | about 45 min |
 | `blaze.yaml` | a change the build and the unit tests do not read | the two scripts | 1 min |
+| `blaze.yaml` (`lean`) | every change | the Lean proofs (`harness/v2/lean_gate.py`, [v2/plan/proofs.md](v2/plan/proofs.md)): `lake build` of `lean/` and `lean/analysis` with the pinned Lean, no `sorry`, and each theorem of `lean/theorems.json` held to Lean's three axioms by `#print axioms`; the checks that need no Lean run in `scripts` | about 4 min from its caches, 15 without; not measured |
 
 The build and the unit tests run only for a change that touches a file they read; any other
 change runs the two scripts alone. `.github/scripts/gate_changes.py` (the `changes` job) names
