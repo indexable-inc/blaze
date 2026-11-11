@@ -3164,6 +3164,10 @@ pub struct Jobs<S: Steps> {
     /// The plane requests that ended, as the profile history's rows, for the daemon to hand
     /// to its history.
     pub rows: Vec<Ended>,
+    /// The builds (plane requests, by number) whose answer was said this turn, in the order
+    /// said: the daemon tells its history once the answers are with the driver
+    /// (`Observe::answered`), and only then is a build's profile flushed.
+    pub answered: Vec<u64>,
     /// The plane requests that opened, as their rows of outcome running ([`Job::row`]), for the
     /// daemon to hand to its history at once.
     pub started: Vec<BuildRow>,
@@ -3288,6 +3292,7 @@ impl<S: Steps> Jobs<S> {
             cold: false,
             ended: false,
             rows: Vec::new(),        // alloc: none until a build ends, then reused
+            answered: Vec::new(),    // alloc: none until a build is answered, then reused
             started: Vec::new(),     // alloc: none until a build opens, then reused
             held_leases: Vec::new(), // alloc: none until a stall
             lowering: Vec::new(), // alloc: none until a job lowers while its root's front end is stored
@@ -7104,6 +7109,7 @@ impl<S: Steps> Jobs<S> {
             if let Some(request) = job.request {
                 let stats = w.plane.stats(request);
                 self.rows.push(job.ended(request, stats, profile_history::Outcome::Stalled, true));
+                self.answered.push(u64::from(request.0));
                 job.cancelled.store(true, Ordering::Release);
                 if w.plane.is_open(request) {
                     w.plane.cancel(w.now, request);
@@ -7501,6 +7507,10 @@ impl<S: Steps> Jobs<S> {
                         left: job.left,
                     }),
                 };
+            }
+            // Its profile is flushed from here on, never before ([`Jobs::answered`]).
+            if let Some(request) = job.request {
+                self.answered.push(u64::from(request.0));
             }
             w.said.push(Said::Finish(id, ok, error, job.built));
         }

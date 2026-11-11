@@ -2191,6 +2191,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         for row in self.jobs.rows.drain(..) {
             self.observe.ended(row);
         }
+        // After the rows of the same turn (a stalled build's row and its answer are one turn's),
+        // and after this turn's answers went to the driver (`turn_after_wait` submits before
+        // it calls this): a build's profile is flushed behind its answer, never beside it.
+        for build in self.jobs.answered.drain(..) {
+            self.observe.answered(build);
+        }
         // The run logs of builds whose front end was kept, named after their answers.
         if !self.jobs.ran.is_empty() {
             self.observe.ran(std::mem::take(&mut self.jobs.ran));

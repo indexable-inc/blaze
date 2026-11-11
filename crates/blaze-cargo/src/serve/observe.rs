@@ -344,7 +344,17 @@ enum ToHistory {
     /// Its row with outcome running and no end, written at once: the row a build has if its
     /// daemon dies before it ends ([`history::writes`]).
     Started(BuildRow),
+    /// Its misses explained and told at once (`blaze why` is answered from them), and its
+    /// rows kept by the thread ([`Noted`]), given to no flush: the build's answer may still be
+    /// on its way (its outputs being placed), and a flush is seconds of writes and syncs on
+    /// the disk the outputs go to. [`ToHistory::Answered`] is its flush.
     Ended(Finished),
+    /// The build's answer was handed to the driver: its rows are flushed now, each table of
+    /// it merged into one file ([`History::flush`] with its number). Never before: the
+    /// answer of a build waits behind nothing of the profile, on the loop or on the disk.
+    /// One that never comes (a daemon that stops first) leaves the rows to the thread's last
+    /// flush, which writes them all the same.
+    Answered(u64),
     /// The run log of a build that ended with its front end kept, named after its answer by
     /// the task that stored the front end ([`super::work::Steps::kept_run_log`]): its
     /// `provenance` rows, written by the flush this asks for.
@@ -374,6 +384,55 @@ pub const FLUSH_WAIT: Duration = Duration::from_secs(30);
 struct Finished {
     ended: Ended,
     query_counts: Vec<QueryCountRow>,
+}
+
+/// A build that ended, explained, whose rows wait on the history's thread for its answer
+/// ([`ToHistory::Answered`]): given to the history, and flushed, only then.
+///
+/// What the history needs of the disk, said once: it is a profile. Losing the rows of the
+/// last builds to a power loss costs a rerun of a measurement and nothing else, so no build's
+/// answer is ever worth a sync of it, and none waits for one: the flush is behind the answer
+/// by this order. The flush itself still syncs each file before the manifest's rename names
+/// it (`blaze_profile::history::files`), because its readers trust a listed file whole;
+/// dropping that sync for a manifest that carries each file's length and hash, so a torn
+/// tail is refused on read by name (persisted-state-round-trips), is the history's own next
+/// step and changes its simulation test's oracle, not this order.
+struct Noted {
+    row: BuildRow,
+    links: Vec<LinkRow>,
+    crate_deps: Vec<CrateDepRow>,
+    query_counts: Vec<QueryCountRow>,
+    provenance: Vec<ProvenanceRow>,
+    keyed: Vec<KeyedMiss>,
+    misses: Vec<blaze_profile::facts::MissRow>,
+    test_runs: Vec<blaze_profile::facts::TestRunRow>,
+    /// `profile rows wait for the build's answer`, open from its end to its answer.
+    _waits: tracing::Span,
+}
+
+impl Noted {
+    /// Its rows given to `history` for the flush that follows.
+    fn give(self, history: &mut History) {
+        let Noted {
+            row,
+            links,
+            crate_deps,
+            query_counts,
+            provenance,
+            keyed,
+            misses,
+            test_runs,
+            _waits,
+        } = self;
+        history.linked(links);
+        history.crate_graph(crate_deps);
+        history.query_counted(query_counts);
+        history.ran(provenance);
+        history.keyed(keyed);
+        history.missed(misses);
+        history.tests_ran(test_runs);
+        history.build_ended(row);
+    }
 }
 
 /// A front end's run log, as `build`'s `provenance` rows: each memo that ran again and its
@@ -707,7 +766,8 @@ fn claim(dir: &Path) -> Result<Owner, Claim> {
 
 /// The history's loop: a flush every [`history::EVERY`], one each time the history's drain
 /// thread took [`history::FLUSH_ROWS`] (it drains the rings every [`history::DRAIN`] while this
-/// thread writes), and one for each build as it ends, which writes its row and gives its spans
+/// thread writes), and one for each build once its answer was said ([`ToHistory::Answered`],
+/// never as it ends: [`Noted`]), which writes its row and gives its spans
 /// its commit. A flush that fails is logged and told to the daemon, for `blaze daemon status`;
 /// the next one goes on.
 fn keep(
@@ -719,6 +779,8 @@ fn keep(
     doing: &Doing,
 ) {
     let mut flushed_at = Instant::now();
+    // The builds that ended and whose answer has not been said, oldest first ([`Noted`]).
+    let mut noted: Vec<Noted> = Vec::new(); // alloc: none until a build ends
     loop {
         doing.set(Step::Waiting, 0);
         let due = history::EVERY.saturating_sub(flushed_at.elapsed());
@@ -748,7 +810,7 @@ fn keep(
                     Err(error) => Err(format!("the profile history's flush failed: {error}")),
                 };
                 _ = told.send(Told::Flushed { to, seq });
-                (flushed, false)
+                (flushed.map(drop), false)
             }
             Ok(ToHistory::FlushFor(reply)) => {
                 doing.set(Step::FlushingAsked, 0);
@@ -759,22 +821,23 @@ fn keep(
                     Err(error) => Err(format!("the profile history's flush failed: {error}")),
                 };
                 _ = reply.send(seq);
-                (flushed, false)
+                (flushed.map(drop), false)
             }
             Ok(ToHistory::Started(row)) => {
                 doing.set(Step::Flushing, row.build_id);
                 history.build_started(row);
-                (history.flush(None), false)
+                (history.flush(None).map(drop), false)
             }
             Ok(ToHistory::Ran(rows)) => {
                 doing.set(Step::Flushing, rows.first().map_or(0, |it| it.build_id));
                 history.ran(rows);
-                (history.flush(None), false)
+                (history.flush(None).map(drop), false)
             }
             Ok(ToHistory::Client(rows)) => {
                 let build = rows.build;
                 doing.set(Step::Flushing, build);
-                (history.client_rows(&rows).and_then(|()| history.flush(Some(build))), false)
+                let flushed = history.client_rows(&rows).and_then(|()| history.flush(Some(build)));
+                (flushed.map(drop), false)
             }
             Ok(ToHistory::Ended(Finished {
                 ended: Ended { mut row, links, crate_deps, misses, test_runs, provenance },
@@ -800,20 +863,43 @@ fn keep(
                 if row.commit.is_none() {
                     row.commit = commit_of(Path::new(&row.workspace));
                 }
-                history.linked(links);
-                history.crate_graph(crate_deps);
-                history.query_counted(query_counts);
-                history.ran(provenance);
-                history.keyed(keyed);
-                history.missed(misses);
-                history.tests_ran(test_runs);
-                history.build_ended(row);
+                // No flush, and nothing given to the history a flush of another kind (the
+                // timer's, a reader's) would write: the build's answer comes first
+                // ([`ToHistory::Answered`]). The span is open until then, so the profile says
+                // how long a build's rows waited for its answer.
+                let waits = tracing::info_span!(
+                    target: "blaze",
+                    parent: None,
+                    "profile rows wait for the build's answer",
+                    build
+                );
+                // alloc: once a build, on the history's thread
+                noted.push(Noted {
+                    row,
+                    links,
+                    crate_deps,
+                    query_counts,
+                    provenance,
+                    keyed,
+                    misses,
+                    test_runs,
+                    _waits: waits,
+                });
+                (Ok(()), false)
+            }
+            Ok(ToHistory::Answered(build)) => {
                 doing.set(Step::Flushing, build);
-                (history.flush(Some(build)), false)
+                // Its rows, and those of any build noted before it (in the order they ended):
+                // an answer said out of order leaves none behind.
+                let upto = noted.iter().rposition(|it| it.row.build_id == build);
+                for it in noted.drain(..upto.map_or(0, |at| at + 1)) {
+                    it.give(&mut history);
+                }
+                (history.flush(Some(build)).map(drop), false)
             }
             Err(RecvTimeoutError::Timeout) => {
                 doing.set(Step::Flushing, 0);
-                (history.flush(None), false)
+                (history.flush(None).map(drop), false)
             }
             Err(RecvTimeoutError::Disconnected) => {
                 doing.set(Step::Closing, 0);
@@ -821,9 +907,13 @@ fn keep(
                     tracing::error!("{error}");
                     _ = failed.send(error);
                 }
+                // Builds that ended and were never said answered: their rows go with this flush.
+                for it in noted.drain(..) {
+                    it.give(&mut history);
+                }
                 // Builds still under way as the daemon stops write the DEBUG events held for them.
                 history.release_held();
-                (history.flush(None), true)
+                (history.flush(None).map(drop), true)
             }
         });
         flushed_at = Instant::now();
@@ -1099,6 +1189,21 @@ impl Observe {
         self.sent += 1;
         self.unexplained.push_back(build);
         if sent.is_err() {
+            self.history_error = Some(
+                "the profile history's thread (`blaze-history`) is gone: no build is written"
+                    .to_owned(),
+            ); // alloc: error path
+        }
+    }
+
+    /// The answer of `build` was handed to the driver: its rows, which the history's thread
+    /// explained and noted as it ended ([`Observe::ended`]), are flushed now. The order is the
+    /// rule: a build's flush (Parquet encoded, written, synced, merged: 1.5 s after an edit
+    /// of ripgrep, 3.5 s after a 53 s build) starts only once nothing of the build's answer
+    /// is left to do, so the answer never shares the disk or a core with it.
+    pub fn answered(&mut self, build: u64) {
+        let Some(profiling) = &self.profiling else { return };
+        if profiling.ended.send(ToHistory::Answered(build)).is_err() {
             self.history_error = Some(
                 "the profile history's thread (`blaze-history`) is gone: no build is written"
                     .to_owned(),
@@ -1609,6 +1714,77 @@ mod tests {
 
     fn to(conn: u64, id: u64) -> RequestRef {
         RequestRef { conn: Conn(conn), id }
+    }
+
+    /// The files of the history in `dir` that hold a build's own row (`builds`), by name.
+    fn builds_files(dir: &Path) -> Vec<String> {
+        let mut files: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|it| it.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|it| it.ends_with(".builds.parquet") && !it.starts_with("schema."))
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// The oracle of `a_builds_rows_are_flushed_only_after_its_answer`: why the files a
+    /// history held before a build's answer was said break the rule, or `None`.
+    fn flushed_before_its_answer(before: &[String], build: u64) -> Option<String> {
+        let own = format!("{build}-");
+        before.iter().find(|it| it.starts_with(&own)).map(|file| {
+            format!("build {build}'s row was written ({file}) before its answer was said")
+        })
+    }
+
+    /// The invariant: a build's rows reach no file of the history until its answer was said
+    /// ([`ToHistory::Answered`]), whatever else is flushed meanwhile; its misses are explained
+    /// and told as it ends, before that. So the answer of a build never shares the disk with
+    /// the flush of its own profile. The history's thread is given the build's end and then a
+    /// reader's flush: once that is told, nothing of the build is on disk. Then its answer and
+    /// a second reader's flush behind it: its row is there. Its control is
+    /// `the_oracle_catches_a_build_flushed_as_it_ends`.
+    #[test]
+    fn a_builds_rows_are_flushed_only_after_its_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        static UNSAMPLED: blaze_profile::sampler::Ring = blaze_profile::sampler::Ring::new();
+        let history = History::open(dir.path(), history::CAP_BYTES, &UNSAMPLED).unwrap();
+        let (sent, rows) = crossbeam_channel::unbounded();
+        let (failed_to, failed) = crossbeam_channel::unbounded();
+        let (told_to, told) = crossbeam_channel::unbounded();
+        let (mut why, _) = File::restore(dir.path());
+        let keeper = std::thread::Builder::new()
+            .name("blaze-history-test".to_owned())
+            .spawn(move || keep(history, &mut why, &rows, &failed_to, &told_to, &Doing::default()))
+            .unwrap();
+        let bound = Duration::from_secs(60);
+        let ended = Finished { ended: ended_row(71), query_counts: Vec::new() };
+        sent.send(ToHistory::Ended(ended)).unwrap();
+        sent.send(ToHistory::Flush(to(1, 1))).unwrap();
+        assert!(matches!(
+            told.recv_timeout(bound),
+            Ok(Told::Explained { answer: Answer { build: 71, .. }, .. })
+        ));
+        assert!(matches!(told.recv_timeout(bound), Ok(Told::Flushed { seq: Ok(_), .. })));
+        let before = builds_files(dir.path());
+        assert_eq!(flushed_before_its_answer(&before, 71), None, "{before:?}");
+        sent.send(ToHistory::Answered(71)).unwrap();
+        sent.send(ToHistory::Flush(to(1, 2))).unwrap();
+        assert!(matches!(told.recv_timeout(bound), Ok(Told::Flushed { seq: Ok(_), .. })));
+        let after = builds_files(dir.path());
+        assert!(after.iter().any(|it| it.starts_with("71-")), "{after:?}");
+        drop(sent);
+        keeper.join().unwrap();
+        assert_eq!(failed.try_recv().ok(), None);
+    }
+
+    /// The planted bug: the history as it was until 2026-11-11, a build's row in a file as
+    /// the build ended, before its answer. The oracle names the file.
+    #[test]
+    fn the_oracle_catches_a_build_flushed_as_it_ends() {
+        let before = ["70-3-5-1.builds.parquet".to_owned(), "71-6.builds.parquet".to_owned()];
+        let why = flushed_before_its_answer(&before, 71).expect("the oracle missed the flush");
+        assert!(why.contains("71-6.builds.parquet"), "{why}");
+        assert_eq!(flushed_before_its_answer(&before[..1], 71), None);
     }
 
     /// A reader's flush goes to the history's thread, which flushes and tells the loop the
