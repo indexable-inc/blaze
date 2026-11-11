@@ -90,8 +90,8 @@ What is built (crates/blaze-query/src/db/reverse.rs, the core, and frontier.rs, 
 4. **What a walk leaves**: every row made before it is verified in its view or unchanged.
    So until the next write, a pull of a row not verified in the view marks it with no look
    at its edges (`frontier::clean`): a host's pass over everything it holds costs a few
-   loads a row. This is what the body check (`Plan::new`) uses today: it still visits
-   every item, at that cost. The codegen walk asks only what item 5 names.
+   loads a row. This is what a task of the body check pays for a memo the edit did not
+   reach. The codegen walk and the body check ask only what item 5 names.
 5. **Naming**: `plumbing::changed_since::<F>(db, view) -> Changed<F::Key>` and each tracked
    query's generated `changed_since` (IDs): the keys of `F` whose value changed since
    `view`, from a log of the last 256 walks (2^20 nodes), or `Unknown` naming why (asked
@@ -129,10 +129,23 @@ two tasks at once, and a verification that unwinds.
 Next. The codegen walk starts from the named set ("Finding the changed set"); its
 refinement and controls are in `driver/tests/kept.rs` (a changed function the set does not
 name, a function asked each build that is not asked, the asks of one edit among 100 and
-10,000 functions). The body check is to do the same: it
-posts a task only for the bodies and modules of `body_check_clean::changed_since`, which
-needs the plan to keep its last answers between builds. The refinements of
+10,000 functions). The refinements of
 `driver/tests/kept.rs` already hold a patched walk to the whole walk's.
+
+The body check does the same (crates/hir/src/check/bodies.rs; written 2026-11-11, not yet
+built or run). A plan of every body keeps, in memory by (database nonce, crates, style
+lints), the file modules, each module's listed bodies and which checks gave a diagnostic,
+with the view it ran in. The next plan asks `changed_since` of `crate_file_modules`,
+`module_bodies` (both queries now), `module_check_clean` and `body_check_clean`, and holds
+a slot only for the modules touched and a task only for what is named, what was not clean
+(its diagnostics are not kept) and the bodies new in a module listed again; every other
+answer is the kept one, clean, with no task and no fetch. It is whole, and its spans say
+why (`body check plan`, `body check sweep`: `whole`, `why`, held, named, visited,
+`kept_unvisited`), when nothing is kept, the engine answers `Unknown`, or a crate's file
+modules changed. Its refinement test holds it to a whole plan's diagnostics over edits,
+with two planted bugs and a count of the tasks of one edit among 20 bodies and 200. What
+still grows with more than the edit: the slots of a touched module are all its bodies, and
+a body or module that is not clean (a warning counts) is visited every build.
 
 ## The patched walk
 
@@ -226,7 +239,8 @@ them to the edit.
 ## Not built
 
 - **Hosts that start from the changed set** (above, "Next"): the engine names it and makes
-  each ask of an unchanged memo a few loads; the walk and the check still ask every item.
+  each ask of an unchanged memo a few loads; the walk still asks every item (the body check
+  starts from the set).
 - **The `Vec` copy.** Removing it means `Built`'s lists are `Rows`, or `CompiledFunction`'s
   buffers shared, and every reader ported.
 - **The dyn world.** A build that may close facts walks whole; narrowing needs the world's

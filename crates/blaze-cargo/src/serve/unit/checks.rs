@@ -34,7 +34,8 @@ impl Checking {
     /// clean is the database's memo ([`Plan::of_every_body`]), so the build after an edit
     /// checks the bodies the edit changed something for and reads nothing of the others.
     pub(crate) fn new(db: &Db, krate: hir::Crate) -> Checking {
-        Checking { krate, plan: Plan::of_every_body(db, &[krate]), failed: AtomicBool::new(false) }
+        let plan = Plan::of_every_body(db, &[krate], false);
+        Checking { krate, plan, failed: AtomicBool::new(false) }
     }
 
     /// The check's diagnostics and whether they break its items ([`CrateCheck`]), once every
