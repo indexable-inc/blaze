@@ -1082,7 +1082,7 @@ Lints the second rule implies:
 | `blaze::implicit_policy` | a public bstd function that reaches a cost its signature does not carry (below) | no: specified here, for the lints lane |
 | `blaze::default_policy` | `impl Default`, or a `new()` with no arguments, for a bstd type with a field marked as a cost or a guarantee | no |
 | `.clippy.toml` bans of the removed names (`Dir::write`, `File::sync`, `File::replace`, `Conn::send`, `End::write`) | a use of one, by resolution | no: the names are gone from bstd, so the ban is for crates that move onto it (S3) |
-| a compile-fail fixture for bstd | `written.clone_to(..)`; a call of a removed name | no: bstd has no compile-fail harness; hir-ty-linear's fixtures mirror only its linear types |
+| compile-fail fixtures for bstd | `written.clone_to(..)`; a `Buffered` dropped; a write through a handle narrowed to read-only; a call of a removed name (`Dir::write`) | yes: `bstd_the_wrong_call_does_not_compile` in `crates/blaze-engine/tests/repro.rs` runs `blaze check` on each file of `crates/blaze-engine/tests/repro/bstd_the_wrong_call_does_not_compile/wrong`, beside a control that checks |
 
 **`blaze::implicit_policy`**, for crates on the trusted list that are libraries (bstd first).
 For each `pub` function and method, read the effect summary the walk already makes

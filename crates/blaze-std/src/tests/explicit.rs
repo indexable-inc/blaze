@@ -3,13 +3,11 @@
 //! to decide for its caller, showing that the explicit form does what it says and that what
 //! was implicit is gone. The invariant across crashes is [`super::durable`]'s.
 //!
-//! What only a compiler can show is not here. That a `File<ReadWrite>` or a `Buffered` cannot
-//! be dropped unfinished is in crates/hir-ty-linear's fixtures, which mirror bstd's linear
-//! types (`bstd_a_writable_file_left_unclosed_is_an_error`,
-//! `bstd_a_buffered_writer_left_unfinished_is_an_error`). That `Written` has no `clone_to`,
-//! and that `Dir::write`, `File::sync`, `File::replace`, `Conn::send` and a two-argument
-//! `Scope::spawn` no longer exist, has no harness: the crate has no compile-fail tests, and
-//! the spec lists the fixture that is owed.
+//! What only a compiler can show is not here: it is the compile-fail harness
+//! `bstd_the_wrong_call_does_not_compile` (crates/blaze-engine/tests/repro.rs), whose fixtures
+//! are each one call bstd's types refuse (a clone from a `Written`, a `Buffered` dropped, a
+//! write through a narrowed handle, a removed name) beside a control that checks.
+//! crates/hir-ty-linear's fixtures mirror bstd's linear types for the check's own tests.
 
 use std::{num::NonZero, time::Duration};
 
