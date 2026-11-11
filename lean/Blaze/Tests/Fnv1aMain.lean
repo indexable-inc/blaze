@@ -15,7 +15,7 @@ def answer (line : String) : String :=
   | none => "error: not numbers"
   | some [] => "error: no seed"
   | some (seed :: bytes) =>
-    match Slice.ofList? (bytes.map (fun byte => Scalar.lit ScalarTy.U8 (byte : Int))) with
+    match Slice.ofList? (bytes.map (fun (byte : Nat) => Scalar.lit ScalarTy.U8 (Int.ofNat byte))) with
     | none => "error: too many bytes"
     | some slice =>
       match blaze_graph.ledger.fnv1a_from (bytes.length + 1)
