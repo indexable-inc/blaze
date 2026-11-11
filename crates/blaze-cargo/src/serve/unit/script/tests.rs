@@ -194,11 +194,12 @@ fn a_file_is_named_under_the_drivers_root() {
 #[test]
 fn a_directory_the_run_left_is_no_file_of_it() {
     let files = vec![
-        OutFile { path: "gen".to_owned(), executable: false, bytes: None },
+        OutFile { path: "gen".to_owned(), executable: false, bytes: None, link: None },
         OutFile {
             path: "gen/z.rs".to_owned(),
             executable: false,
             bytes: Some(b"pub const Z: u8 = 1;".to_vec()),
+            link: None,
         },
     ];
     assert_eq!(out_files(files), [("gen/z.rs".to_owned(), b"pub const Z: u8 = 1;".to_vec())]);
