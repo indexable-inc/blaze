@@ -588,6 +588,23 @@ found.
 
 **Allowing it.** `#[expect(blaze::jagged_vec, reason = "..")]` on the struct.
 
+## `many_bools`
+
+Allowed by default; part of getting a crate ready for
+[records](v2/plan/design/records.md) (the edition's change 4).
+
+**What it catches.** A call or method call that passes two or more bare `true` or `false`
+literals by position: `open(path, true, false)`. Nothing at the call says what each chooses,
+and two of them swap without a type error. It reads the call alone, so the callee may be any
+crate's. Not counted: a literal inside another argument (`f(g(true), true)` passes one), a call
+under `#[cfg(test)]` or `#[test]`, and a call a macro wrote.
+
+**What to do.** Name the choices at the call. Under `#![blaze::records]` the callee takes a
+record parameter with defaults, `fn open(path: &Path, opts: { create: bool = false, truncate:
+bool = false })`, called as `open(path, { create: true, .. })`; without it, two-variant enums
+named for the choices. There is no fix: the names are the author's. To keep a call, say why:
+`#[expect(blaze::many_bools, reason = "..")]`.
+
 ## `missing_size_hint`
 
 **What it catches.** An `impl Iterator` for a struct of the crate that either:

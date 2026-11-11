@@ -963,6 +963,8 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::bool_param", Allow, "detects a `bool` parameter of a workspace function where a two-variant enum would name the choice")
         .externally_loaded(),
+    l("blaze::many_bools", Allow, "detects a call passing two or more bare `bool` literals by position, where a record parameter would name them")
+        .externally_loaded(),
     l("blaze::sans_io_core", Allow, "detects a function of a `#![blaze::sans_io]` core that reaches the wall clock or IO")
         .externally_loaded(),
     l("blaze::key_ignores_field", Allow, "detects a hand-written key (`Hash`, `PartialEq`, `Ord` or a key builder) that leaves a field out unnamed")
