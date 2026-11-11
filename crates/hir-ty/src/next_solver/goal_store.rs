@@ -25,6 +25,7 @@
 
 mod pending;
 mod record;
+pub(crate) mod slots;
 mod stable;
 #[cfg(test)]
 mod tests;
@@ -352,45 +353,26 @@ impl Store {
         error.get_or_insert(why);
     }
 
-    /// Writes one buffered goal: its shape in the first slot that holds it or is free, then its
-    /// answer under the shape's key and the values its facts had.
-    fn write(&self, entry: &pending::Entry<'_>) -> Result<Wrote, String> {
+    /// Writes one buffered goal: its shape in the first slot that holds it or is free
+    /// (`claimed`: what this flush placed in the slots of the goal's key before, [`slots`]),
+    /// then its answer under the shape's key and the values its facts had.
+    fn write<'a>(
+        &self,
+        entry: &pending::Entry<'a>,
+        claimed: &mut slots::Claimed<'a, { SLOTS as usize }>,
+    ) -> Result<Wrote, String> {
         let goal = entry.goal_key;
         // alloc: error text
         let error = |what: &str, why: String| format!("{what} goal {goal:x}: {why}");
-        let mut wrote = Wrote::Kept;
-        let mut slot = None;
-        for n in 0..SLOTS {
-            let at = shape_key(&goal, n);
-            match self.images.get(&at).map_err(|why| error("reading the shape of", why))? {
-                Some(kept) if kept.bytes() == entry.shape => {
-                    slot = Some(at);
-                    break;
-                }
-                Some(_) => continue,
-                // alloc: the shape's bytes, once per goal written
-                None => match self.images.put(at, entry.shape.to_vec()) {
-                    Ok(()) => {
-                        wrote = Wrote::Written;
-                        slot = Some(at);
-                        break;
-                    }
-                    Err(why) => match self
-                        .images
-                        .get(&at)
-                        .map_err(|why| error("reading the shape of", why))?
-                    {
-                        Some(kept) if kept.bytes() == entry.shape => {
-                            slot = Some(at);
-                            break;
-                        }
-                        Some(_) => continue,
-                        None => return Err(error("keeping the shape of", why)),
-                    },
-                },
-            }
-        }
-        let Some(at) = slot else { return Ok(Wrote::SlotsFull) };
+        let placed = claimed
+            .claim(&*self.images, entry.shape, |n| shape_key(&goal, n))
+            .map_err(|slots::Refused { doing, why }| error(doing, why))?;
+        let Some(slots::Slot { n, written }) = placed else { return Ok(Wrote::SlotsFull) };
+        let wrote = match written {
+            true => Wrote::Written,
+            false => Wrote::Kept,
+        };
+        let at = shape_key(&goal, n);
         let mut key = AnswerKey::new(&at);
         for value in entry.values() {
             key.value(&value);
@@ -444,6 +426,12 @@ pub struct Flushed {
     pub too_long: u64,
     /// Goals dropped as the buffer of their thread was full.
     pub dropped: u64,
+    /// Goals the store would not keep (a store that could not be read or refused a record, a
+    /// second answer under the same fact values): each is a bug in a key or in the store, and
+    /// every other goal of the flush was written all the same.
+    pub failed: usize,
+    /// Why the first of them, in the order the flush writes, was not kept, naming the goal.
+    pub failure: Option<String>,
 }
 
 /// How many databases may have a goal store at once.
@@ -554,10 +542,13 @@ impl Installed {
     }
 
     /// Writes every goal offered since the last flush, on the store's threads
-    /// (`ImageStore::for_each`). The driver calls it where it writes the dependency images:
-    /// after a build's front-end work, with no query running. An error a lookup met since the
-    /// last flush, a store that will not keep a record, or a second answer under the same
-    /// facts (a read the facts do not cover) is an error naming the goal.
+    /// (`ImageStore::for_each`): the goals of one key one after another, in an order that is
+    /// of their bytes alone, so two shapes of one key take two slots whichever thread offered
+    /// them ([`slots`]). The driver calls it where it writes the dependency images: after a
+    /// build's front-end work, with no query running. An error a lookup met since the last
+    /// flush is an error naming the goal. A goal the store will not keep (a record it refuses,
+    /// a second answer under the same facts: a read the facts do not cover) is counted and
+    /// named in [`Flushed::failed`] and [`Flushed::failure`], and keeps no other goal out.
     pub fn flush(&self) -> Result<Flushed, String> {
         let store = self.store();
         let (buffers, tallies) = store.pending.take();
@@ -571,20 +562,35 @@ impl Installed {
         )]
         let results: Vec<std::sync::OnceLock<Result<Wrote, String>>> =
             entries.iter().map(|_| std::sync::OnceLock::new()).collect();
-        store.images.for_each(entries.len(), &|at| {
-            _ = results[at].set(store.write(&entries[at]));
+        let (order, runs) = slots::groups(
+            entries.len(),
+            |a, b| entries[a].cmp_bytes(&entries[b]),
+            |a, b| entries[a].goal_key == entries[b].goal_key,
+        );
+        store.images.for_each(runs.len(), &|run| {
+            let mut claimed = slots::Claimed::new();
+            // clone: a range of two words
+            for &at in &order[runs[run].clone()] {
+                _ = results[at].set(store.write(&entries[at], &mut claimed));
+            }
         });
         let Tallies { inexpressible, unhashable, too_long, dropped } = tallies;
         let mut flushed =
             Flushed { inexpressible, unhashable, too_long, dropped, ..Flushed::default() };
-        for result in results {
-            let wrote = result.into_inner().unwrap_or_else(|| {
+        let mut results = results;
+        // In the order written, so the failure named is the same one whichever thread wrote it.
+        for at in order {
+            let wrote = results[at].take().unwrap_or_else(|| {
                 panic!("`ImageStore::for_each` did not run every task of a goal store flush")
-            })?;
+            });
             match wrote {
-                Wrote::Written => flushed.written += 1,
-                Wrote::Kept => flushed.kept += 1,
-                Wrote::SlotsFull => flushed.slots_full += 1,
+                Ok(Wrote::Written) => flushed.written += 1,
+                Ok(Wrote::Kept) => flushed.kept += 1,
+                Ok(Wrote::SlotsFull) => flushed.slots_full += 1,
+                Err(why) => {
+                    flushed.failed += 1;
+                    flushed.failure.get_or_insert(why);
+                }
             }
         }
         if let Some(why) = store.error.lock().take() {

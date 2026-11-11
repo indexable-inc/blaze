@@ -143,7 +143,7 @@ impl<'db> TyLoweringContext<'db, '_> {
         for &ty in types {
             tys.push(self.lower_ty(ty));
         }
-        if !base_db::crate_extensions(self.db, self.resolver.krate()).records() {
+        if !self.resolver.krate().extensions(self.db).records() {
             refuse(self, RecordRefusal::NotEnabled);
             return error;
         }

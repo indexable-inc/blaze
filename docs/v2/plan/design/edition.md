@@ -48,6 +48,15 @@ it.
 | 11 | **Portable SIMD.** The pinned nightly's `core::simd` with no `#![feature]`, `simd::native_lanes!`, and `#[blaze::multiversion]` (`#![blaze::simd]`). Availability and code generation, no new syntax, so it is not counted among the ten. | `#![feature(portable_simd)]`, per-architecture `core::arch` code, hand-written feature dispatch | [simd](simd.md) | medium |
 | 11 | **Early drop.** A value whose destructor only frees memory (`Vec`, `String`, `Box`, a struct of them, a type marked `#[blaze::drop(early)]`) is dropped after its last use; a guard keeps its scope. `#![blaze::early_drop]`. | `drop(x);` written to end a borrow, blocks opened to end one, memory held to the end of a long function | [early-drop](early-drop.md) | medium |
 
+Gates added since, each off unless a crate asks (the table above lists changes, these are the
+features some of them are written with):
+
+| gate | what | spec |
+|---|---|---|
+| `#![feature(blaze_comptime)]`: `where const { COND }` | a where predicate that is a `bool` constant over the generic parameters; a blanket impl gated on it derives a trait from a type's shape | [ownership](ownership.md) |
+| `#![feature(blaze_const_exprs)]` | const generic arguments and array lengths that are expressions over generic parameters, unified by value or by a normal form (ledger E16) | [ownership](ownership.md) |
+| `#[blaze::holds]` | a type that holds its type arguments where no field shows it, so a handle over a linear value is linear (part of change 7) | [linear](linear.md), rule 7 |
+
 ### Rules for the four that have no spec yet
 
 **1. Handles.**

@@ -107,7 +107,7 @@ const COUNTS: [&str; 19] = [
 ];
 
 /// The flags the lints read ([`Conf::bool`]).
-const FLAGS: [&str; 7] = [
+const FLAGS: [&str; 8] = [
     "accept-comment-above-attributes",
     "accept-comment-above-statement",
     "allow-dbg-in-tests",
@@ -115,6 +115,8 @@ const FLAGS: [&str; 7] = [
     "allow-useless-vec-in-tests",
     "avoid-breaking-exported-api",
     "upper-case-acronyms-aggressive",
+    // blaze's own: `unmarked_*` on every function, not only those at the border (docs/lints.md).
+    "unmarked-effects-private",
 ];
 
 /// A value of a key the lints read that is not of its type (or a negative count) is clippy's

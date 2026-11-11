@@ -12,10 +12,9 @@
 //! one. A lookup is a bounds check, one compare of the generation and a load.
 //!
 //! The names requests on paths hand the kernel (and the `statx` and descriptor it reads or
-//! writes beside them) are in [`Paths`], two arenas used in turn, and the registered buffers of writes that bypass the page cache are lent by [`Lent`],
-//! in the order they were asked for.
+//! writes beside them) are in [`Paths`], two arenas used in turn.
 
-use std::{collections::VecDeque, ffi::CStr, mem, os::fd::OwnedFd};
+use std::{ffi::CStr, mem, os::fd::OwnedFd};
 
 use blaze_mem::{Handle, MemError, RegionVec, Slab, Tag as MemTag};
 
@@ -47,9 +46,8 @@ pub(super) enum Kind {
     /// written at [`Cold::at`] of its kept positional file ([`Hot::of`]).
     WriteFrom,
     /// Its buffer at [`Cold::at`] of the file named first, opened into a slot of its own
-    /// ([`Cold::slots`] 0) by the first link of its chain. With [`DIRECT`] the descriptor
-    /// bypasses the page cache, and each piece is copied into the registered buffer
-    /// [`Hot::buffer`] and written from there; a `statx` first says whether it may.
+    /// ([`Cold::slots`] 0) by the first link of its chain. Through the page cache, always:
+    /// it waits for no device.
     WriteAt,
     /// Its kept file ([`Hot::of`]) synced.
     Sync,
@@ -111,7 +109,9 @@ pub(super) enum Kind {
 pub(super) const ABANDONED: u8 = 1 << 0;
 /// A listen, or a watch of memory pressure, being stopped.
 pub(super) const STOPPING: u8 = 1 << 1;
-/// A write at an offset that bypasses the page cache.
+/// A read into or a write from memory of the asker's ([`Kind::ReadInto`], [`Kind::WriteFrom`])
+/// that bypasses the page cache, and the open of its file ([`POSITIONAL`]): asked for by its
+/// effect ([`crate::Cache::Bypassed`]), never chosen by the driver.
 pub(super) const DIRECT: u8 = 1 << 2;
 /// The output pipe read is the spawn's standard error.
 pub(super) const STDERR: u8 = 1 << 3;
@@ -148,8 +148,6 @@ pub(super) const POSITIONAL: u8 = 1 << 3;
 /// A [`Kind::ReadInto`] at `IOPRIO_CLASS_IDLE` (the bit [`WHOLE`] is).
 pub(super) const IDLE: u8 = 1 << 3;
 
-/// In [`Hot::buffer`]: none.
-pub(super) const NO_BUFFER: u16 = u16::MAX;
 /// In [`Cold::slots`]: none.
 pub(super) const NO_SLOT: u32 = u32::MAX;
 
@@ -180,15 +178,13 @@ pub(super) struct Hot {
     /// Notifications of zero-copy sends the kernel still owes it: one per send asked, so a
     /// send cut short many times owes many at once.
     pub notifs: u16,
-    /// Its registered buffer, or [`NO_BUFFER`].
-    pub buffer: u16,
 }
 
 const _: () = assert!(size_of::<Hot>() == 32);
 
 impl Hot {
     pub(super) const fn new(tag: Tag, kind: Kind, of: u64) -> Hot {
-        Hot { tag, done: 0, of, kind, flags: 0, links: 0, phase: 0, notifs: 0, buffer: NO_BUFFER }
+        Hot { tag, done: 0, of, kind, flags: 0, links: 0, phase: 0, notifs: 0 }
     }
 }
 
@@ -421,58 +417,6 @@ pub(super) fn arena_of(hot: &Hot) -> u8 {
     u8::from(hot.flags & SECOND != 0)
 }
 
-/// The registered buffers lent to writes that bypass the page cache, one each: a write asks
-/// for one as it is queued, and one that finds none free waits, in the order it asked, for the
-/// next given back. Never an error: a buffer is given back by every such write as it ends.
-pub(super) struct Lent {
-    free: Vec<u16>,
-    waiting: VecDeque<Id>,
-}
-
-impl Lent {
-    pub(super) fn new(count: u16) -> Lent {
-        // alloc: setup, once per driver.
-        Lent {
-            free: (0..count).rev().collect(),
-            waiting: VecDeque::with_capacity(super::ENTRIES as usize),
-        }
-    }
-
-    /// A buffer for `id`, or none, `id` then waiting for the next given back.
-    pub(super) fn take(&mut self, id: Id) -> Option<u16> {
-        let buffer = self.free.pop();
-        if buffer.is_none() {
-            self.waiting.push_back(id);
-        }
-        buffer
-    }
-
-    /// `buffer` given back: to the request that has waited longest and is still `live`, or
-    /// kept free.
-    pub(super) fn give(&mut self, buffer: u16, live: impl Fn(Id) -> bool) -> Option<(Id, u16)> {
-        while let Some(id) = self.waiting.pop_front() {
-            if live(id) {
-                return Some((id, buffer));
-            }
-        }
-        self.free.push(buffer);
-        None
-    }
-
-    pub(super) fn free(&self) -> usize {
-        self.free.len()
-    }
-
-    pub(super) fn waiters(&self) -> impl Iterator<Item = Id> + '_ {
-        self.waiting.iter().copied()
-    }
-
-    /// Forgets every request waiting: none of them is given to the kernel.
-    pub(super) fn clear_waiting(&mut self) -> std::collections::vec_deque::Drain<'_, Id> {
-        self.waiting.drain(..)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use blaze_hash::HashMap;
@@ -533,36 +477,5 @@ mod tests {
         assert_eq!(names.held(), [0, 0]);
         let again = names.begin();
         assert!(names.arena(again).is_empty(), "nothing held: emptied as it is next used");
-    }
-
-    /// More writes than buffers: each that finds none free waits, and each buffer given back
-    /// goes to the one that waited longest and is still in flight, never failing one.
-    #[test]
-    fn a_write_without_a_free_buffer_waits_for_the_next() {
-        let mut ops = Ops::new(64).unwrap();
-        let ids: Vec<Id> = (0..12)
-            .map(|n| ops.insert(Hot::new(Tag(n), Kind::WriteAt, 0), Vec::new(), Cold::EMPTY))
-            .collect();
-        let mut lent = Lent::new(4);
-        let mut holding: VecDeque<(Id, u16)> = VecDeque::new();
-        for &id in &ids {
-            if let Some(buffer) = lent.take(id) {
-                holding.push_back((id, buffer));
-            }
-        }
-        assert_eq!((holding.len(), lent.free(), lent.waiters().count()), (4, 0, 8));
-        // One waiter ends before its turn: it is passed over.
-        ops.remove(ids[5]);
-        let mut served = Vec::new();
-        while let Some((id, buffer)) = holding.pop_front() {
-            served.push(id);
-            ops.remove(id);
-            if let Some(next) = lent.give(buffer, |it| ops.contains(it)) {
-                holding.push_back(next);
-            }
-        }
-        let wanted: Vec<Id> = ids.iter().copied().filter(|&it| it != ids[5]).collect();
-        assert_eq!(served, wanted, "in the order they asked");
-        assert_eq!((lent.free(), lent.waiters().count()), (4, 0));
     }
 }

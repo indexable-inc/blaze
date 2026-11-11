@@ -25,7 +25,9 @@ use crate::span;
 /// `outcome` says `ran` or `untracked read` (no file before 4 has a `provenance` row). At 5: `events.message` is the message alone (it
 /// was the message, then each other field as `name=value`); an event's other fields are rows of
 /// `event_fields`, joined on `process` and `events.event_id`. A file of version 4 or older has no
-/// `event_id` and its fields are in its `message`.
+/// `event_id` and its fields are in its `message`. Still 5 with `spans.fields` (2026-11-11), the
+/// last typed column of the span registry, nullable and at the table's end: a file from before
+/// reads it as null through the table's schema file.
 pub const VERSION: u32 = 5;
 
 /// A version before [`VERSION`] whose files a reader reads as [`VERSION`]'s, and what reading
@@ -450,7 +452,11 @@ pub const BUILDS: Table = Table {
             "ok, failed, cancelled, stalled, running or crashed (its daemon died while it ran; written by the postmortem of the daemon's flight recorder)",
         ),
         opt("hits", Type::U64, "nodes the memo settled without running them"),
-        opt("misses", Type::U64, "nodes that ran their task"),
+        opt(
+            "misses",
+            Type::U64,
+            "the things it computed again: how many rows `misses` holds of it (until 2026-11-11, the plane's nodes that ran a task)",
+        ),
         opt("joined", Type::U64, "nodes that took a task another node ran"),
         opt(
             "tree",
@@ -537,7 +543,7 @@ pub const PROVENANCE: Table = Table {
         col(
             "query_key",
             Type::Utf8,
-            "the memo: its query and its key as the key's type shows it, `` `infer_query`(DefWithBodyId(FunctionId(..))) `` (its id where the key has no `Debug`), as `cause_key` names it where it is another run's cause",
+            "the memo: its query and its key as the key's type shows it, `` `infer_query`(DefWithBodyId(FunctionId(..))) `` (its id where the key has no `Debug`), each id in it followed by its row's name where the front end names it, `Crate(Id(21548) = serde v1.0.219 (lib))`, as `cause_key` names it where it is another run's cause",
         ),
         col("kind", Type::Dict, "the query, as `query_counts.query` names it"),
         col(
@@ -558,7 +564,7 @@ pub const PROVENANCE: Table = Table {
         opt(
             "cause_key",
             Type::Utf8,
-            "for changed: the read that changed: an input's or tracked struct's field as `` `Input.field`(<row>) ``, its row by name where the front end names it (a file's text by its path, `` `FileText.text`(/src/lib.rs) ``) else its id, or a memo as `query_key` names it, whose own row says why it changed",
+            "for changed: the read that changed: an input's or tracked struct's field as `` `Input.field`(<row>) ``, its row by name where the front end names it (a file's text by its path, `` `FileText.text`(/src/lib.rs) ``; a crate as spans name it; a module's scope by crate and module path, `` `ScopeInput.scope`(serde::de) ``) else its id, or a memo as `query_key` names it, whose own row says why it changed",
         ),
         opt("cause_kind", Type::Dict, "what `cause_key` is: input, tracked or function"),
         opt(

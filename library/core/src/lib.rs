@@ -297,6 +297,10 @@ pub mod record;
 // changes).
 #[unstable(feature = "blaze_verify", issue = "none")]
 pub mod blaze;
+// blaze's error unions, the type of `A | B` under `#![blaze::error_unions]` (`library/UPSTREAM`
+// lists it among blaze's changes).
+#[unstable(feature = "blaze_error_unions", issue = "none")]
+pub mod error_union;
 // blaze's additions to `core::simd`, re-exported there (`library/UPSTREAM` lists it among blaze's
 // changes).
 #[unstable(feature = "blaze_simd", issue = "none")]

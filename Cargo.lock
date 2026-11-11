@@ -759,6 +759,7 @@ dependencies = [
  "blaze-radix",
  "blaze-rng",
  "blaze-spin",
+ "blaze-sys",
  "crossbeam-channel",
  "crossbeam-queue",
  "hegeltest",
@@ -1858,6 +1859,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-script"
+version = "0.0.0"
+dependencies = [
+ "regex",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "blaze-seed-run"
 version = "0.0.0"
 dependencies = [
@@ -1933,6 +1943,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-std"
+version = "0.0.0"
+dependencies = [
+ "blaze-alloc-count",
+ "blaze-bytes",
+ "blaze-check",
+ "blaze-core",
+ "blaze-format",
+ "blaze-hash",
+ "blaze-http",
+ "blaze-ids",
+ "blaze-mem",
+ "blaze-phf",
+ "blaze-radix",
+ "blaze-reclaim",
+ "blaze-report",
+ "blaze-rng",
+ "blaze-sha256",
+ "blaze-spin",
+ "hegeltest",
+ "http",
+ "miniz_oxide",
+]
+
+[[package]]
 name = "blaze-stencil"
 version = "0.0.0"
 dependencies = [
@@ -1987,6 +2022,13 @@ dependencies = [
  "blaze-rng",
  "blaze-store-check",
  "crossbeam-channel",
+]
+
+[[package]]
+name = "blaze-sys"
+version = "0.0.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -4001,6 +4043,7 @@ dependencies = [
  "hir-ty",
  "hir-ty-mir",
  "hir-ty-share",
+ "inventory",
  "rustc_abi",
  "rustc_type_ir",
  "smallvec",
@@ -4158,6 +4201,8 @@ dependencies = [
  "rustc_type_ir",
  "smallvec",
  "span",
+ "syntax",
+ "triomphe",
 ]
 
 [[package]]
@@ -6046,6 +6091,16 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "scripts"
+version = "0.0.0"
+dependencies = [
+ "blaze-script",
+ "regex",
+ "serde_json",
+ "toml",
+]
 
 [[package]]
 name = "security-framework"

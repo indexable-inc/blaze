@@ -143,9 +143,9 @@ fn changed_in(db: &Db, def: DefWithBodyId, out: &mut HashSet<FieldId, Global>) {
     }
 }
 
-/// Whether the field place `expr` is changed where it is used: borrowed mutably, assigned, or
-/// the place of a projection that is.
-fn changes(
+/// Whether the place `expr` (a field, a `static`) is changed where it is used: borrowed
+/// mutably, assigned, or the place of a projection that is (`global_state` asks too).
+pub(super) fn changes(
     analysis: &hir::BodyAnalysis<'_>,
     parents: &facts::Parents,
     expr: ExprId,

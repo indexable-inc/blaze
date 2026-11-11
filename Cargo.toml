@@ -2,6 +2,8 @@
 members = [
     "crates/*",
     "fuzz",
+    # The repository's scripts, built by the pinned released blaze (docs/v2/plan/design/scripts.md).
+    "scripts",
     # ix's linter and rewriter (tools/astlog/UPSTREAM).
     "tools/astlog/cli",
     "tools/astlog/core",
@@ -55,11 +57,14 @@ version = "0.20261105.4"
 # saying what moved (docs/cargo.md, "Lock files").
 lock = "required"
 
-# blaze-lints' own lints (AGENTS.md rules 3, 12, 14, 18-20, 25, 27). Each is `warn` until its
-# count reaches zero, then `deny`; no count is held yet (crates/blaze-lints/baselines/ has no
-# file: see the clippy lints below). The other `hot_*` lints are
-# set by the hot crates that opt in. Here, not in `[workspace.lints]`: cargo hands that to rustc, which
-# refuses the tool `blaze` (E0602).
+# blaze-lints' own lints (AGENTS.md rules 3, 12, 14, 18-20, 25, 27) as a released blaze reads
+# them: the stage 0 at `version` above, which builds this tree and runs the gate's `blaze check
+# --workspace`. It does not know `lints-ratchet` below, nor half the names there, and holds no
+# crate at `warn` the way the ratchet's baselines do, so this table stays at `warn` for it. This
+# tree's blaze reads `lints-ratchet` in place of this table. Delete this one when `version` is a
+# release that reads the ratchet. The other `hot_*` lints are set by the hot crates that opt in.
+# Here, not in `[workspace.lints]`: cargo hands that to rustc, which refuses the tool `blaze`
+# (E0602).
 [workspace.metadata.blaze.lints]
 # blaze's own lints come in two kinds (docs/lints.md): `blaze::general` warns in every workspace
 # by default; `blaze::internal` needs blaze's types and conventions and waits until a workspace
@@ -164,15 +169,53 @@ unrecorded_span = "deny"
 # which drops an unknown field silently; AGENTS.md rule 3) is on through `internal` above, at
 # `warn`; other workspaces opt in.
 
-# The lints this workspace has once what they tell code to move to is in the tree: a line here
-# sets its level when the lint's switch in crates/blaze-lint-defs/src/ready.rs is `true`, and
-# nothing until then. A table of its own: a released blaze that does not know a lint yet (the
-# stage 0 that builds this tree) reads no table it does not know.
-[workspace.metadata.blaze.lints-when-ready]
+# Every lint of blaze's at `deny` in every crate, as this tree's blaze reads them (in place of
+# `lints` above; docs/lints.md, "Workspace levels and the ratchet"). A crate that still trips a
+# lint is held at `warn` on it by its line in the lint's baseline, `baselines/blaze.<lint>.txt`:
+# `crate<TAB>count`, or `crate<TAB>unmeasured` until a counted run. The baselines only shrink
+# (harness/v2/guards.py `ratchet`, in the gate's `lint-baselines` job), and `blaze check
+# --workspace --target aarch64-unknown-linux-gnu --baselines crates/blaze-lints/baselines
+# --bless-baselines` records each run's counts and drops each crate at zero, which turns the
+# lint to `deny` for it. A new crate is held to every lint from its first line. A table of its
+# own: a released blaze reads no table it does not know.
+[workspace.metadata.blaze.lints-ratchet]
+baselines = "crates/blaze-lints/baselines"
+# The whole of each group, the today-`deny` lints among them (the effects lints, `checkfree`,
+# `program_lifetime`, `unrecorded_span`), which no baseline loosens.
+general = "deny"
+internal = "deny"
+edition = "deny"
+pedantic_perf = "deny"
+reach = "deny"
+proc_macro = "deny"
 # Every use of Rust's std that blaze's own standard library replaces (docs/lints.md#std_use,
-# docs/v2/plan/design/std.md, step S3): on for every crate of blaze once `BSTD_IN_TREE` is
-# `true`. Until then harness/v2/std_uses.py runs the lint by its flag, for the worklist.
-std_use = "warn"
+# docs/v2/plan/design/std.md, step S3), in `edition` above and named here: on by Andrew's
+# decision of 2026-11-11 ahead of the switch (`ready::BSTD_IN_TREE` is `false`: bstd does not
+# yet build on a stage-1 blaze with an API to port to). harness/v2/std_uses.py is the worklist.
+std_use = "deny"
+# `blaze::hot` is the lints of code where the time goes, each decided here. `allow` outside
+# hot code, as docs/lints.md#profile_hot says, for the three that find what is right in cold
+# code and `large_move` (moves of over 512 bytes, and lopsided enums, "in hot code" by its own
+# rule): a clone, a call that allocates or a call through a vtable is not a fault where it
+# runs once. Hot crates deny the group (`#![deny(blaze::hot)]`), and a profile raises them in
+# the functions it shows hot (`profile_hot`, denied through `general`).
+hot = "allow"
+# The four members that hold everywhere: a global-heap allocation with no `// alloc: <why>`
+# and a call to the global allocator where one was handed in (AGENTS.md rule bump-allocate), a
+# hash collection whose hasher nobody chose (rules standard-structures, deterministic-output),
+# and an error built inline where `#[cold]` belongs.
+hot_alloc = "deny"
+implicit_allocator = "deny"
+default_hasher = "deny"
+cold_error = "deny"
+# The parallel lints find loops that could run in parallel, a suggestion, not a fault; read in
+# their own lane (docs/lints.md).
+parallelizable = "allow"
+serial_dependence = "allow"
+# Not run by `blaze check` (the release build reports it from LLVM's code), so no run of the
+# ratchet counts it: at `deny` a crate whose baseline a check emptied would fail its release
+# build. Turned on for one build by `RUSTFLAGS="-W blaze::vecreport"` (docs/lints.md#vecreport).
+vecreport = "allow"
 
 # The pinned LLVM (docs/cargo.md, "Pinned native inputs"): blaze fetches the release
 # crates/hir-ty-codegen/llvm.json names for the target, checks its sha256, unpacks it read-only
@@ -215,6 +258,22 @@ blaze-inproc-rt.opt-level = 3
 # reruns on every edit of them: optimized, as a build dependency is not by default.
 blake3.opt-level = 3
 blaze-codegen-code.opt-level = 3
+# The tier 0 scripts (`blaze run -p scripts --bin <name>`) are run, not developed: `docs check`
+# reads every tracked file, and unoptimized it took 26.5 s. The scripts and what they parse with
+# are optimized in dev builds too.
+scripts.opt-level = 3
+blaze-script.opt-level = 3
+regex.opt-level = 3
+regex-automata.opt-level = 3
+regex-syntax.opt-level = 3
+aho-corasick.opt-level = 3
+memchr.opt-level = 3
+serde_json.opt-level = 3
+indexmap.opt-level = 3
+toml.opt-level = 3
+toml_parser.opt-level = 3
+toml_datetime.opt-level = 3
+winnow.opt-level = 3
 
 [profile.release]
 # Set this to 1 or 2 to get more useful backtraces in debugger.
@@ -328,7 +387,6 @@ blaze-source = { path = "crates/blaze-source" }
 blaze-units = { path = "crates/blaze-units" }
 blaze-lower = { path = "crates/blaze-lower" }
 blaze-shader = { path = "crates/blaze-shader" }
-blaze-wasm-pack = { path = "crates/blaze-wasm-pack" }
 blaze-doc = { path = "crates/blaze-doc" }
 blaze-fmt = { path = "crates/blaze-fmt" }
 blaze-fuzz = { path = "crates/blaze-fuzz" }
@@ -341,6 +399,7 @@ blaze-explore = { path = "crates/blaze-explore" }
 blaze-explore-core = { path = "crates/blaze-explore-core" }
 blaze-protocol = { path = "crates/blaze-protocol" }
 blaze-report = { path = "crates/blaze-report" }
+blaze-script = { path = "crates/blaze-script" }
 blaze-serde = { path = "crates/blaze-serde" }
 blaze-serde-derive = { path = "crates/blaze-serde-derive" }
 blaze-ui = { path = "crates/blaze-ui" }
@@ -358,6 +417,7 @@ blaze-kernel = { path = "crates/blaze-kernel" }
 blaze-gc = { path = "crates/blaze-gc" }
 blaze-check = { path = "crates/blaze-check" }
 blaze-spin = { path = "crates/blaze-spin" }
+blaze-sys = { path = "crates/blaze-sys" }
 blaze-codegen = { path = "crates/blaze-codegen" }
 blaze-codegen-code = { path = "crates/blaze-codegen-code" }
 blaze-dbsp = { path = "crates/blaze-dbsp" }
@@ -377,6 +437,8 @@ blaze-lint-defs = { path = "crates/blaze-lint-defs", version = "0.0.0" }
 blaze-radix = { path = "crates/blaze-radix" }
 blaze-rng = { path = "crates/blaze-rng" }
 blaze-sha256 = { path = "crates/blaze-sha256" }
+# bstd, blaze's own standard library (docs/v2/plan/design/std.md).
+blaze-std = { path = "crates/blaze-std" }
 blaze-items = { path = "crates/blaze-items" }
 blaze-item-hash = { path = "crates/blaze-item-hash" }
 blaze-link = { path = "crates/blaze-link", default-features = false }
@@ -605,6 +667,16 @@ drop_bomb = "0.1.5"
 dunce = "1.0.5"
 filetime = "0.2.29"
 flate2 = { version = "1.1.10", default-features = false }
+# bstd::image's inflate (crates/blaze-std): the no-alloc core only (`inflate::core` into a buffer
+# the caller sized), the one flate2's rust backend already brings into the lock.
+miniz_oxide = { version = "0.9.1", default-features = false }
+# bstd::video's VideoToolbox provider (crates/blaze-std, macOS only): the hardware HEVC session,
+# CoreVideo's pool buffers and CoreMedia's sample buffers. Default features off: their defaults
+# pull in frameworks the encoder never uses (the harness's harness-video takes the same sets).
+objc2-core-foundation = "0.3.2"
+objc2-core-media = { version = "0.3.2", default-features = false, features = ["std", "objc2", "CMBase", "CMTime", "CMBlockBuffer", "CMFormatDescription", "CMSampleBuffer", "objc2-core-audio-types"] }
+objc2-core-video = { version = "0.3.2", default-features = false, features = ["std", "objc2", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVPixelBufferPool", "CVReturn"] }
+objc2-video-toolbox = { version = "0.3.2", default-features = false, features = ["std", "objc2", "VTBase", "VTErrors", "VTSession", "VTCompressionSession", "VTCompressionProperties", "objc2-core-media", "objc2-core-video"] }
 # blaze-hash's hasher (`crates/blaze-hash`), not a crate's own pick.
 foldhash = "0.2.0"
 fst = { version = "0.4.7", default-features = false }

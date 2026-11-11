@@ -34,7 +34,7 @@ const MACRO: usize = 4;
 const BIN: usize = 5;
 const LIB_TEST: usize = 6;
 
-const WORKSPACE: &str = "[workspace]\nmembers = [\"a\", \"b\", \"m\"]\n\n[workspace.metadata.blaze]\nconst-eval = { steps = 5000 }\n";
+const WORKSPACE: &str = "[workspace]\nmembers = [\"a\", \"b\", \"m\"]\n\n[workspace.metadata.blaze]\nconst-eval = { steps = 5000 }\n\n[workspace.metadata.blaze.trusted]\nzeta-sys = { owner = \"io\", reason = \"the C library's calls\" }\nalpha = { owner = \"runtime\", reason = \"its arenas\" }\n";
 
 /// The view's files.
 const FILES: &[(&str, &[u8])] = &[
@@ -647,6 +647,53 @@ fn editions_kinds_and_origins_are_cargos() {
         krate(&built, CORE).workspace_data(db).const_eval,
         base_db::ConstEvalBudget::default()
     );
+    // The trusted crates are the workspace's own crates', sorted by name, `-` written `_`; the
+    // toolchain's trust is blaze's, so std's list is empty.
+    let trusted: Vec<(&str, &str, &str)> = krate(&built, LIB)
+        .workspace_data(db)
+        .trusted
+        .iter()
+        .map(|it| (&*it.name, &*it.owner, &*it.reason))
+        .collect();
+    assert_eq!(
+        trusted,
+        [("alpha", "runtime", "its arenas"), ("zeta_sys", "io", "the C library's calls")]
+    );
+    assert!(krate(&built, CORE).workspace_data(db).trusted.is_empty());
+}
+
+/// `trusted` under `[workspace.metadata.blaze]`: each entry says an owner and a reason, names
+/// no toolchain crate and no setting but those two; each refusal names the key.
+#[test]
+fn a_trusted_crate_says_who_and_why() {
+    let parsed = |text: &str| {
+        let table: toml::Table = text.parse().unwrap();
+        crate::crates::trusted(&table["workspace"], "/w/Cargo.toml")
+    };
+    let ok = parsed(
+        "[workspace.metadata.blaze.trusted]\nb = { owner = \"x\", reason = \"y\" }\na = { owner = \"x\", reason = \"z\" }\n",
+    )
+    .unwrap();
+    let names: Vec<&str> = ok.iter().map(|it| &*it.name).collect();
+    assert_eq!(names, ["a", "b"]);
+    for (text, said) in [
+        ("[workspace.metadata.blaze]\ntrusted = 1\n", "is a table"),
+        ("[workspace.metadata.blaze.trusted]\na = { owner = \"x\" }\n", "with `reason`"),
+        ("[workspace.metadata.blaze.trusted]\na = { owner = \" \", reason = \"y\" }\n", "with `owner`"),
+        (
+            "[workspace.metadata.blaze.trusted]\na = { owner = \"x\", reason = \"y\", since = 1 }\n",
+            "`trusted.a.since` is not a setting",
+        ),
+        ("[workspace.metadata.blaze.trusted]\nstd = { owner = \"x\", reason = \"y\" }\n", "the toolchain's"),
+        (
+            "[workspace.metadata.blaze.trusted]\na-b = { owner = \"x\", reason = \"y\" }\na_b = { owner = \"x\", reason = \"y\" }\n",
+            "twice",
+        ),
+    ] {
+        let Err(error) = parsed(text) else { panic!("`{text}` was taken") };
+        assert!(error.what.contains(said), "{text}: {}", error.what);
+        assert_eq!(error.at.as_deref(), Some("/w/Cargo.toml"));
+    }
 }
 
 #[test]

@@ -394,7 +394,11 @@ fn own_code(db: &Db, krate: Crate) -> ContentId {
             return whole(&mut hasher);
         };
         let code = match path.ends_with(".rs") {
-            true => code_text(db, EditionedFileId::new(db, file, data.edition)),
+            true => {
+                let extensions = krate.extensions(db);
+                let file = EditionedFileId::new_with_extensions(db, file, data.edition, extensions);
+                code_text(db, file)
+            }
             false => None,
         };
         files.push((path, file, code));

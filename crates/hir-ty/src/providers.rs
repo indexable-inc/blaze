@@ -64,6 +64,35 @@ pub struct Mir {
 
 inventory::collect!(Mir);
 
+/// hir-ty-identity's code for `core::reflect::code_id_of::<F>()`, which const eval (hir-ty-mir,
+/// below hir-ty-identity) answers through this table.
+pub struct CodeIdentity {
+    /// The behaviour identity of the fn item or closure type, compiled in the environment's
+    /// crate (`hir_ty_identity::fn_code_id`), or why it has none.
+    pub fn_code_id:
+        for<'db> fn(&'db Db, Ty<'db>, &StoredParamEnvAndCrate) -> Result<[u8; 32], String>,
+    /// As [`Mir::own_tests`].
+    pub own_tests: bool,
+}
+
+inventory::collect!(CodeIdentity);
+
+/// The linked code-identity table: a test build's own when there is one. A binary that links
+/// none, or two of a kind, has no answer, and says what to link: an error of the constant that
+/// asked (a job's failure), never a guessed id.
+pub fn code_identity() -> Result<&'static CodeIdentity, String> {
+    let name = std::any::type_name::<CodeIdentity>();
+    for own_tests in [true, false] {
+        let mut tables = inventory::iter::<CodeIdentity>().filter(|it| it.own_tests == own_tests);
+        let Some(first) = tables.next() else { continue };
+        if tables.next().is_some() {
+            return Err(format!("two `{name}` are linked")); // alloc: error path
+        }
+        return Ok(first);
+    }
+    Err(format!("no `{name}` is linked: link hir-ty-identity (`use hir_ty_identity as _;`)")) // alloc: error path
+}
+
 /// The linked MIR table.
 pub fn mir() -> &'static Mir {
     #[expect(

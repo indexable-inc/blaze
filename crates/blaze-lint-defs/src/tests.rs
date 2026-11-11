@@ -52,7 +52,7 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
     let store = Store::default();
     let lint = lint("blaze::const_impure").expect("blaze's lint");
     assert_eq!(lint.default_level, Level::Warn);
-    assert_eq!(blaze_lints().len(), 99);
+    assert_eq!(blaze_lints().len(), 113);
     assert!(!lint.is_externally_loaded);
     // The compiler's own and the release build's; blaze-lints loads every other.
     let built: Vec<&str> =
@@ -75,19 +75,33 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
         ("blaze::build_script_ambient", ready::CAPABILITIES_FOR_BUILD_SCRIPTS),
         // Never by default: a crate or a workspace's table asks for it.
         ("blaze::std_use", false),
+        ("blaze::lossy_as", false),
+        ("blaze::global_state", false),
+        ("blaze::async_fn", false),
+        ("blaze::unmarked_pure", false),
+        ("blaze::unmarked_nopanic", false),
+        ("blaze::unmarked_noalloc", false),
+        ("blaze::unmarked_nonblocking", false),
+        ("blaze::mut_ref", false),
+        // `program_lifetime` is `deny` where it fires (below); the two that say where it would
+        // pay wait for the group.
+        ("blaze::program_lifetime", false),
+        ("blaze::could_be_program_lifetime", false),
+        ("blaze::could_be_ref32", false),
     ];
     for it in edition.lints.iter() {
         assert!(warns.iter().any(|(name, _)| *name == it.name), "`{}` says when it warns", it.name);
     }
     // `deny` by default: they fire only where the code asked for them (`#[blaze::checkfree]`,
     // `#[blaze::nopanic]`, `#[blaze::noalloc]`, `#[blaze::nonblocking]`, `#[blaze::pure]`, a
-    // `#[blaze::may(..)]` or `#![blaze::effects]`).
+    // `#[blaze::may(..)]`, `#![blaze::effects]` or `#![blaze::capabilities]`).
     let deny = [
         "blaze::checkfree",
         "blaze::nopanic",
         "blaze::noalloc",
         "blaze::nonblocking",
         "blaze::pure",
+        "blaze::capabilities",
         "blaze::undeclared_effect",
         "blaze::program_lifetime",
     ];
@@ -100,7 +114,6 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
                 + usize::from(in_internal)
                 + usize::from(in_pedantic)
                 + usize::from(in_edition),
-                + usize::from(in_(edition)),
             1,
             "`{}` is general, internal, pedantic_perf or edition, once",
             it.name

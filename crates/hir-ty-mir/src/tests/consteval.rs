@@ -33,6 +33,7 @@ mod const_traits;
 mod deps;
 mod intrinsics;
 mod memo;
+pub(crate) mod reach;
 mod records;
 mod simd;
 mod trivial;

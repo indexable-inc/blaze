@@ -515,6 +515,14 @@ where
         ecx.probe_builtin_trait_candidate(BuiltinImplSource::Misc)
             .enter(|ecx| ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes))
     }
+
+    /// blaze: `UnionFrom` is not a `const` trait, so no `[const] UnionFrom` goal holds.
+    fn consider_builtin_error_union_from_candidate(
+        _ecx: &mut EvalCtxt<'_, D>,
+        _goal: Goal<I, Self>,
+    ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
+        Err(NoSolution.into())
+    }
 }
 
 impl<D, I> EvalCtxt<'_, D>

@@ -24,28 +24,30 @@ pub(crate) fn parse_text(
 ) -> (Tree, Vec<SyntaxError>) {
     let _p = tracing::info_span!(target: "blaze", "parse_text", outline).entered();
     let lexed = parser::LexedStr::new(edition, text);
-    let mut parser_input = lexed.to_input(edition);
-    parser_input.set_extensions(extensions);
+    let parser_input = lexed.to_input(edition);
+    let tokens = parser_input.tokens().with_extensions(extensions);
     let parser_output = match outline {
-        true => parser::TopEntryPoint::SourceFile.parse_outline(&parser_input),
-        false => parser::TopEntryPoint::SourceFile.parse(&parser_input),
+        true => parser::TopEntryPoint::SourceFile.parse_outline(tokens),
+        false => parser::TopEntryPoint::SourceFile.parse(tokens),
     };
     let (tree, errors, _eof) =
         build_tree(text.clone(), &lexed, &parser_output, edition, extensions);
     (Tree::new(Arc::new(tree)), errors)
 }
 
+/// The tree of `text` read at `entry` under `extensions`, those of the crate that wrote it.
 pub(crate) fn parse_text_at(
     text: &Text,
     entry: parser::TopEntryPoint,
     edition: Edition,
+    extensions: Extensions,
 ) -> (Tree, Vec<SyntaxError>) {
     let _p = tracing::info_span!(target: "blaze", "parse_text_at").entered();
     let lexed = parser::LexedStr::new(edition, text);
     let parser_input = lexed.to_input(edition);
-    let parser_output = entry.parse(&parser_input);
+    let parser_output = entry.parse(parser_input.tokens().with_extensions(extensions));
     let (tree, errors, _eof) =
-        build_tree(text.clone(), &lexed, &parser_output, edition, Extensions::NONE);
+        build_tree(text.clone(), &lexed, &parser_output, edition, extensions);
     (Tree::new(Arc::new(tree)), errors)
 }
 
@@ -181,9 +183,8 @@ pub(crate) fn expand_lazy(
     let reparser = parser::Reparser::for_node(kind, None, None)
         .unwrap_or_else(|| panic!("a lazy {kind:?}: only blocks are left unparsed"));
     let lexed = parser::LexedStr::new(edition, &source[range]);
-    let mut input = lexed.to_input(edition);
-    input.set_extensions(extensions);
-    let output = reparser.parse(&input);
+    let input = lexed.to_input(edition);
+    let output = reparser.parse(input.tokens().with_extensions(extensions));
     // clone: one count of the file's text, which the part shares
     let (tree, errors, is_eof) =
         build_parsed(source.clone(), range, &lexed, &output, edition, extensions);

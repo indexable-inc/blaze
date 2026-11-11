@@ -43,6 +43,61 @@ group's writes by. **`HirFrontend` does not implement `group` yet**
 (crates/hir-ty-codegen/v2/frontend.rs, beside `durable`): until it does, every function that
 is not durable is asked each build.
 
+### The changed set from the engine (design, 2026-11-11; not built)
+
+Measured on ripgrep 15.1.0, a one-line edit inside `fn main` (build 49): `codegen walk` 348
+ms, 38 ms of it the walk's own thread, `patched: asked 86708 functions and statics of 0
+groups, described 2`; `described_memo` verified 86,480. The same shape is in the unit's
+check (`unit bodies` 484 ms, `body_check_clean` executed 6, verified 1,149): every memo of
+the program or the crate is verified by pull to find the handful an edit changed. The span
+`codegen walk: ask functions` (and `: ask statics`) now holds the asking apart.
+
+Why `group` is not the fix. A per-crate group (the bullet under "Not built") is exact only if
+it covers every input a describe can read: the files of the crate that asks and of every
+local crate it reaches, and the thirty-odd other input kinds (crate data, source roots,
+proc-macro libraries, the published name-resolution and method-resolution deltas, the
+settings), each of which must then count as a write of every group. It is also too coarse to
+matter here: an edit of a binary's `main` writes the group of the binary, which holds every
+function the binary's code asks for, its dependencies' generics included.
+
+What is exact and costs the edit is the engine saying which memos changed, with early
+cutoff, starting from what was written:
+
+1. **Reverse edges.** A memo row keeps the rows that read it (appended as an edge is
+   recorded; an entry of a row that has since run again without the edge is skipped when
+   it is met, and the list is compacted then). Input fields keep theirs the same way.
+2. **A frontier per view.** After the writes of a build and before its first query, the
+   engine walks from the written fields: each reader is verified (run again where a read
+   changed, backdated where its value is equal), and only a reader whose value changed
+   passes the walk on to its own readers. A body edit stops at the file's item tree (equal,
+   backdated) and goes on through the one body, its inference, its MIR. The walk is bounded
+   by the rows it visits and ends in a typed outcome (`bounded-progress`).
+3. **What a host asks.** `plumbing::changed_since::<F>(storage, view) -> Changed<F::Key>`:
+   the keys of function `F` whose memo's value changed, or was made, after `view`, or
+   `Changed::Unknown` where the storage can no longer say (views renumbered, a row
+   evicted), which a host takes as "ask everything". Exact, never a guess.
+4. **The walk.** `Frontend::changed_since(view) -> Option<Vec<(Instance, Origin)>>` takes
+   the place of `group` and `written_since`: `HirFrontend` answers it from
+   `changed_since::<described_memo>` and `changed_since::<counted_memo>`. `patched` asks
+   those, the functions whose describe names a file (`Memoed::NamesFiles`, asked each
+   build as now) and the statics by the same call on `described_static_memo`. `Hangs` goes.
+5. **The check.** `Plan::run_marked` posts the bodies and modules of
+   `changed_since::<body_check_clean>` and `::<module_check_clean>` and takes every other
+   one's empty answer without a task.
+
+The result stays the whole walk's because nothing else changes: the patch still redescribes
+each function it is told of and compares, so a key the engine names that did not change costs
+one ask, and the refinements of `driver/tests/kept.rs` hold the patched walk to the whole
+walk's (their planted bugs are the dependent missed: a caller that names a changed callee's
+old key, a patch that keeps a changed function's old references). What has to be proved new is the
+engine's frontier: a memo it does not name is one a pull would verify unchanged. That is a
+deterministic simulation test in blaze-query (`dst-not-review`): draw writes and reads,
+compare `changed_since` with the pull's answer for every row, and plant the two bugs it must
+catch (a reverse edge not recorded, a changed reader that does not pass the walk on).
+
+Why it was not written with the measurement: it changes the engine's rows and its
+concurrent verify, which is proven by that test run, not by reading.
+
 ## The patched walk
 
 Conditions, each checked; failing one, the walk runs whole and `Walk::whole` says which:
@@ -133,7 +188,8 @@ them to the edit.
 
 ## Not built
 
-- **`HirFrontend::group`** and a per-crate input for it to ask `input_written_since` of.
+- **The changed set from the engine** (above), which replaces `group`: until it is built
+  every function that is not durable is asked each build (86,708 asks, 348 ms, on ripgrep).
 - **The `Vec` copy.** Removing it means `Built`'s lists are `Rows`, or `CompiledFunction`'s
   buffers shared, and every reader ported.
 - **The dyn world.** A build that may close facts walks whole; narrowing needs the world's

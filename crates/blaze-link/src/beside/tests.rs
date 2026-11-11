@@ -54,7 +54,7 @@ struct F {
 /// The reference model: a program is its functions by number; what a debugger sees of it is
 /// what [`inside`] reads of its debug info made whole.
 #[derive(Clone, Debug)]
-struct Program {
+struct DebugProgram {
     funcs: BTreeMap<u32, F>,
     /// Where the next function made is placed: code is never placed where code was.
     next: u64,
@@ -65,9 +65,9 @@ fn file(n: u8) -> String {
     format!("src/f{n}.rs")
 }
 
-impl Program {
-    fn start() -> Program {
-        let mut program = Program { funcs: BTreeMap::new(), next: 0x1000, generation: 0 };
+impl DebugProgram {
+    fn start() -> DebugProgram {
+        let mut program = DebugProgram { funcs: BTreeMap::new(), next: 0x1000, generation: 0 };
         program.make(0, 0);
         program.make(1, 1);
         program
@@ -271,7 +271,7 @@ fn seen<'a>(get: impl Fn(&str) -> &'a [u8]) -> Result<Seen, String> {
 
 /// What `program`'s debug info linked inside its image resolves: [`crate::dwarf::sections`]
 /// of its functions.
-fn inside(program: &Program) -> Result<Seen, String> {
+fn inside(program: &DebugProgram) -> Result<Seen, String> {
     let files: Vec<String> = (0..FILES).map(file).collect();
     let names: Vec<&str> = files.iter().map(String::as_str).collect();
     let (mut rows, mut functions) = (Vec::new(), Vec::new());
@@ -311,7 +311,7 @@ enum Plant {
 /// The oracle: `side` describes `program` as its debug info inside would, and is the
 /// executable's: its build id, its symbols, and the CRC-32 the executable's
 /// `.gnu_debuglink` names.
-fn check(program: &Program, side: &[u8]) -> Result<(), String> {
+fn check(program: &DebugProgram, side: &[u8]) -> Result<(), String> {
     let id = program.id();
     let aligned = Aligned::of(side);
     let elf = ElfFile64::<Endianness>::parse(aligned.bytes())
@@ -355,13 +355,13 @@ fn key_of(n: u32, f: &F) -> InstanceKey {
 }
 
 /// The model's functions as an [`Input`]'s, by address.
-fn views<'a>(program: &'a Program, files: &'a [String]) -> (Vec<Func<'a>>, Vec<Lined<'a>>) {
+fn views<'a>(program: &'a DebugProgram, files: &'a [String]) -> (Vec<Func<'a>>, Vec<Lined<'a>>) {
     views_of(program, files, |_, _| true)
 }
 
 /// Those of the model's functions that `takes`, as an [`Input`]'s, by address.
 fn views_of<'a>(
-    program: &'a Program,
+    program: &'a DebugProgram,
     files: &'a [String],
     takes: impl Fn(u32, &F) -> bool,
 ) -> (Vec<Func<'a>>, Vec<Lined<'a>>) {
@@ -388,7 +388,7 @@ fn views_of<'a>(
 
 /// `program`'s functions `functions` as an update is given them.
 fn input_of<'a>(
-    program: &Program,
+    program: &DebugProgram,
     functions: &'a [Func<'a>],
     lines: &'a [Lined<'a>],
     given: Given<'a>,
@@ -409,7 +409,7 @@ struct Disk {
     kept: Kept,
     side: Option<Vec<u8>>,
     /// The program the side file was last brought to.
-    last: Option<Program>,
+    last: Option<DebugProgram>,
     /// Whether an update is given the link's change (what differs from `last`), as
     /// [`crate::Image::debug_file`] gives it when it can, or every function.
     follow: bool,
@@ -426,7 +426,7 @@ impl Disk {
 
     /// `program`'s next generation: its side file brought to it, as `plant` writes it, and
     /// what was written.
-    fn link(&mut self, program: &mut Program, plant: Plant) -> Result<DebugWrite, String> {
+    fn link(&mut self, program: &mut DebugProgram, plant: Plant) -> Result<DebugWrite, String> {
         program.generation += 1;
         let exe = program.exe();
         let files: Vec<String> = (0..FILES).map(file).collect();
@@ -543,7 +543,7 @@ fn refines(ops: &[Op], plant: Plant) -> Result<(), String> {
 
 /// [`refines`], each update given the link's change (`follow`) or every function.
 fn refines_by(ops: &[Op], plant: Plant, follow: bool) -> Result<(), String> {
-    let mut program = Program::start();
+    let mut program = DebugProgram::start();
     let mut disk = Disk { follow, ..Disk::new() };
     disk.link(&mut program, Plant::None)?;
     for op in ops {
@@ -580,7 +580,7 @@ fn the_oracle_catches_a_changed_function_left_out_of_the_change() {
 /// asks for every function, says why, and the file is right.
 #[test]
 fn a_change_that_misses_a_removed_function_is_made_from_every_function() {
-    let mut program = Program::start();
+    let mut program = DebugProgram::start();
     program.make(2, 5);
     let mut disk = Disk::new();
     disk.link(&mut program, Plant::None).unwrap();
@@ -598,7 +598,7 @@ fn a_change_that_misses_a_removed_function_is_made_from_every_function() {
 fn a_whole_side_file_is_the_same_bytes_twice() {
     let ops = [Op::Edit(1, 9), Op::Add(3, 77), Op::Shift(0, 3), Op::Remove(0)];
     let make = || {
-        let mut program = Program::start();
+        let mut program = DebugProgram::start();
         for op in &ops {
             program.apply(op);
         }
@@ -638,7 +638,7 @@ fn the_oracle_catches_a_debuglink_crc_not_updated() {
 /// another build id, or to none, is refused by name, and nothing is made.
 #[test]
 fn a_patch_of_another_side_file_is_refused() {
-    let mut program = Program::start();
+    let mut program = DebugProgram::start();
     let mut disk = Disk::new();
     disk.link(&mut program, Plant::None).unwrap();
     let first = disk.side.clone().unwrap();
@@ -659,7 +659,7 @@ fn a_patch_of_another_side_file_is_refused() {
 fn a_one_function_edit_rewrites_its_own_records() {
     let mut written = Vec::new();
     for count in [100u32, 10_000] {
-        let mut program = Program::start();
+        let mut program = DebugProgram::start();
         for n in 2..count {
             program.make(n, (n % 251) as u8);
         }
@@ -701,7 +701,7 @@ fn a_one_function_edit_rewrites_its_own_records() {
 /// since gone, the file is laid out whole, and says so.
 #[test]
 fn a_side_file_mostly_dead_rows_is_laid_out_again() {
-    let mut program = Program::start();
+    let mut program = DebugProgram::start();
     for n in 2..400 {
         program.make(n, 7);
     }
@@ -753,7 +753,7 @@ fn crc_32_is_zlibs_and_four_bytes_force_it() {
 /// symbol table.
 #[test]
 fn a_mach_o_side_file_carries_the_uuid_the_segments_and_the_dwarf() {
-    let mut program = Program::start();
+    let mut program = DebugProgram::start();
     program.generation = 3;
     let id = program.id();
     let mut exe = Vec::new();
@@ -844,7 +844,7 @@ fn a_mach_o_side_file_carries_the_uuid_the_segments_and_the_dwarf() {
 /// An executable with no build id has no side file: a debugger could not tell whose it is.
 #[test]
 fn an_executable_with_no_build_id_is_refused_by_name() {
-    let program = Program::start();
+    let program = DebugProgram::start();
     let mut exe = program.exe();
     let at = exe.windows(18).position(|it| it == b".note.gnu.build-id").unwrap();
     exe[at + 1] = b'x';

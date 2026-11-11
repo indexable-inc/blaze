@@ -209,10 +209,40 @@ fn work_out(
         // alloc: once per impure script: what the build's report says of it
         hir_ty_pure::Purity::Impure(impure) => return Ok(Purity::Impure(impure.said())),
     };
+    // A script that asks the time is told the build's `SOURCE_DATE_EPOCH` by its provider
+    // (docs/v2/plan/design/determinism.md): the variable is one its key reads. Where a run
+    // of it has none, the script is told the system's clock, which nothing can key: it is
+    // not kept as pure, and runs traced as any script.
+    let wall = proved.effects.has(hir_ty_pure::Effects::WALL);
+    // alloc: once per pure script: the names its key reads
+    let mut names: Vec<OsString> =
+        proved.env.iter().map(|it| OsString::from(it.as_str())).collect();
+    if wall {
+        names.push(OsString::from(blaze_usercode::provider::SOURCE_DATE_EPOCH));
+        names.sort();
+        names.dedup();
+        let units = job.units();
+        for run in 0..units.graph.units.len() {
+            let is_run = matches!(units.graph.units[run].mode, Mode::RunCustomBuild);
+            if !is_run || compile_of(units, run) != Some(compile) {
+                continue;
+            }
+            let (unit, env) = run_of(job, run)?;
+            let set = script_env(&unit, &env)?.iter().any(|(name, _)| {
+                name.as_os_str()
+                    == std::ffi::OsStr::new(blaze_usercode::provider::SOURCE_DATE_EPOCH)
+            });
+            if !set {
+                // alloc: once per such script: what the build's report says of it
+                return Ok(Purity::Impure(
+                    "`main` reads the wall clock (`std::time::SystemTime::now`), and the build sets no `SOURCE_DATE_EPOCH` for it to be told".to_owned(),
+                ));
+            }
+        }
+    }
     let proof = Proof {
         identity: proved.identity,
-        // alloc: once per pure script: the names its key reads
-        env: proved.env.iter().map(|it| OsString::from(it.as_str())).collect(),
+        env: names,
         reads: proved.effects.has(hir_ty_pure::Effects::READ)
             || proved.effects.has(hir_ty_pure::Effects::PROBE),
         writes: proved.effects.has(hir_ty_pure::Effects::WRITE),

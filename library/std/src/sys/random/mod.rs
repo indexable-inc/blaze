@@ -124,6 +124,11 @@ cfg_select! {
     target_arch = "naga",
 )))]
 pub fn hashmap_random_keys() -> (u64, u64) {
+    // blaze: a process given a provider takes its keys from the seed (`sys::provider`; only
+    // Apple's targets of those here can be given one).
+    if let Some(keys) = crate::sys::provider::hashmap_keys() {
+        return keys;
+    }
     let mut buf = [0; 16];
     fill_bytes(&mut buf);
     let k1 = u64::from_ne_bytes(buf[..8].try_into().unwrap());

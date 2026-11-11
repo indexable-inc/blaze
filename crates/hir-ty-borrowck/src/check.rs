@@ -1487,8 +1487,27 @@ impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
                         InitAction::Borrow,
                     ),
                 };
-                self.access_place(location, place, span, access, Allowed::No, depth);
-                self.check_if_path_or_subpath_is_moved(location, action, place, span);
+                match self.ctx.call_views.get(&location).copied() {
+                    // `#![blaze::views]`: the receiver of a method with a view, which borrows
+                    // only the fields of the view, so each is accessed as its own loan is made
+                    // (`Loans::gather`).
+                    Some(fields) => {
+                        let mut projection: FVec<'_, PlaceElem> =
+                            Vec::with_capacity_in(place.projection.len() + 1, self.ctx.frame);
+                        for &field in fields {
+                            projection.clear();
+                            projection.extend_from_slice(place.projection);
+                            projection.push(ProjectionElem::Field(field));
+                            let field = PlaceRef { local: place.local, projection: &projection };
+                            self.access_place(location, field, span, access, Allowed::No, depth);
+                            self.check_if_path_or_subpath_is_moved(location, action, field, span);
+                        }
+                    }
+                    None => {
+                        self.access_place(location, place, span, access, Allowed::No, depth);
+                        self.check_if_path_or_subpath_is_moved(location, action, place, span);
+                    }
+                }
                 if !matches!(kind, BorrowKind::Shallow)
                     && let Some((strukt, field)) = self.bits_field(place)
                 {

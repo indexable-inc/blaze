@@ -231,6 +231,14 @@ pub enum Intrinsic {
     /// `core::num::arbitrary`'s (`#![blaze::arbitrary_ints]`): `x as D` between two integer
     /// types of any width, which the const evaluator and the code generator both answer.
     BlazeIntCast,
+    /// `core::reflect::code_id_of`'s (`#![feature(blaze_comptime)]`): the behaviour identity of
+    /// a fn item or closure type, answered only by blaze's const evaluator, from
+    /// `hir_ty_identity::fn_code_id` through [`crate::providers::CodeIdentity`].
+    BlazeCodeId,
+    /// `core::reflect::name_of`'s (`#![feature(blaze_comptime)]`): the type a `TypeId` is of,
+    /// as diagnostics name it, answered only by blaze's const evaluator. A walk over ids
+    /// (`bstd::own::reach`) names the types on a refused path with it.
+    BlazeTypeNameOf,
 }
 
 const _: () = assert!(size_of::<Intrinsic>() == 2);
@@ -1094,6 +1102,10 @@ intrinsics! {
     381 blaze_variant_index => BlazeVariantIndex,
     // `core::num::arbitrary`'s (`#![blaze::arbitrary_ints]`).
     382 blaze_int_cast => BlazeIntCast,
+    // `core::reflect::code_id_of`'s.
+    383 blaze_code_id => BlazeCodeId,
+    // `core::reflect::name_of`'s.
+    384 blaze_type_name_of => BlazeTypeNameOf,
 }
 
 #[cfg(test)]
@@ -1149,9 +1161,9 @@ mod tests {
 
     #[test]
     fn every_name_is_its_own_intrinsic() {
-        assert_eq!(Intrinsic::COUNT, 383);
-        assert_eq!(BY_INDEX.iter().filter(|intrinsic| !intrinsic.is_legacy()).count(), 283);
-        assert_eq!(BY_INDEX.iter().filter(|intrinsic| intrinsic.is_blaze()).count(), 6);
+        assert_eq!(Intrinsic::COUNT, 384);
+        assert_eq!(BY_INDEX.iter().filter(|intrinsic| !intrinsic.is_legacy()).count(), 284);
+        assert_eq!(BY_INDEX.iter().filter(|intrinsic| intrinsic.is_blaze()).count(), 7);
         let mut seen = [false; Intrinsic::COUNT];
         for (at, intrinsic) in BY_INDEX.into_iter().enumerate() {
             assert_eq!(usize::from(intrinsic.index()), at, "{intrinsic}");
@@ -1190,6 +1202,8 @@ mod tests {
             (380, "blaze_variant_discriminant"),
             (381, "blaze_variant_index"),
             (382, "blaze_int_cast"),
+            (383, "blaze_code_id"),
+            (384, "blaze_type_name_of"),
         ] {
             let intrinsic = Intrinsic::from_symbol(&Symbol::intern(name)).expect(name);
             assert_eq!(intrinsic.index(), index, "{name}");

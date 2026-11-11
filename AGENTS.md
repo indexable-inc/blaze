@@ -19,8 +19,9 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 2. **blaze-builds-blaze**: Build, check, test, bench and release blaze only with blaze, never cargo,
    rustc or sccache, anywhere (dev loop, CI, harnesses, release); stage 0 is a blaze binary; when
    blaze fails on blaze, that failure is the work. Skill: `build-and-test`.
-3. **no-fallback**: No fallback, ever: when blaze can't do something it stops with an error naming what
-   and where. Skill: `runtime-code`.
+3. **no-fallback**: No fallback, ever, and failures are loud: when blaze can't do something it stops
+   with an error naming what and where; nothing is accepted and ignored, skipped quietly or answered
+   with an empty result. Skill: `runtime-code`.
 4. **superset-of-rust**: Every program the pinned nightly accepts, blaze accepts and runs correctly by
    Rust's semantics; rustc's own behavior is a reference, not the definition; blaze refuses only
    rustc soundness holes, and its extensions are opt-in. Skill: `compiler-correctness`.
@@ -139,8 +140,8 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
     `memory-and-data`.
 53. **invariants-are-stated**: State what code promises once (a contract, a reference model, `/// The
     invariant:` or `/// The refinement:` on its test) and raise its level of evidence as needed:
-    tested, simulated, model-checked, proved in Lean; `harness/v2/invariants.py` lists them and the
-    gate holds each to its control. Skill: `testing`.
+    tested, simulated, model-checked, proved in Lean; `scripts/src/bin/invariants.rs` lists them and
+    the gate holds each to its control. Skill: `testing`.
 54. **guard-the-cause**: When you find bad code or a bad decision, find why it was made and remove that
     cause with a guard (a lint, a check in the gate, a rule or a skill's instruction), so it cannot
     be written again; do this unasked. Skill: `changing-code`.
@@ -158,6 +159,13 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 58. **build-the-missing-piece**: When the right design needs something the tree does not have (a
     compiler feature, a library module, a tool), build it and add it to the tree; never ship the
     weaker form because the piece was missing. Skill: `changing-code`.
+59. **unease-is-work**: When anything seems iffy, suboptimal or makes you uneasy, stop and find the core
+    reason it is that way, then fix that reason at its root, whatever it takes: a redesign, a
+    language change, addition or removal. Skill: `changing-code`.
+60. **incremental-first**: Incremental builds come first: optimise and judge blaze by the edit loop
+    (no-op, comment, body edit, first edit, edit after restart, memory while warm); design so cold
+    builds can be fast too, but do not spend on them ahead of incremental for now. Skill:
+    `perf-and-tracing`.
 
 ## Code Review Rules
 

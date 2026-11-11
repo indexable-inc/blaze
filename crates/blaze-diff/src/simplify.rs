@@ -66,7 +66,7 @@ pub struct Rewrite {
 
 /// The rewrites: the exact ones first, then `fast_math`'s. The one owner: the simplifier, the
 /// tests that check each rule numerically and `blaze explain` read this table. Its source is
-/// `crates/blaze-diff/rules.json`, which `harness/v2/diff_rules.py` writes this table from, and
+/// `crates/blaze-diff/rules.json`, which `scripts/src/bin/diff_rules.rs` writes this table from, and
 /// each `fast_math` rewrite as a statement over the reals that
 /// `lean/analysis/BlazeDiff/RewriteProofs.lean` proves. An exact rewrite claims equal bits, not
 /// equal reals: the tests of this crate hold it, bit for bit.

@@ -151,7 +151,8 @@ pub(crate) fn stamp(lowered: &Lowered, build: ContentId, session: &mut Session) 
 /// `build` in `mode` ([`Lowered::serve_deps`]): what that serve did of those crates alone, or
 /// `None`, nothing written, when no key moved: with no walk when every crate of `crates` was
 /// keyed at the database's present view, or by a [`serve`] that left it (no write came
-/// between). A crate whose
+/// between), and with a walk of only the crates no serve at that view keyed yet when some
+/// were not ([`Walked::keys`]: the keys of one view are made once). A crate whose
 /// key moved loses the image it was read from: it is read from the image under its new key,
 /// or resolved. A crate whose key did not move is asked of the store again only as a
 /// dependency of one whose key did, and is not imaged again.
@@ -166,10 +167,23 @@ pub(crate) fn images(
     if session.walked.covers(at, build, crates) {
         return Ok(None);
     }
+    // The crates this walk is the first to key at this view, and their dependencies: those
+    // keyed here before are in `keyed` under the keys they have now ([`Walked`]).
     let keys = {
-        let _span = tracing::info_span!(target: "blaze", "dependency image keys", crates = crates.len(), subject = ?at.1).entered();
+        let span = tracing::info_span!(
+            target: "blaze",
+            "dependency image keys",
+            crates = crates.len(),
+            subject = ?at.1,
+            known = tracing::field::Empty,
+            keyed = tracing::field::Empty,
+        )
+        .entered();
         session.walked.walks += 1;
-        hir_def::deps::keys(lowered.db(), crates, build)
+        let (known, keys) = session.walked.keys(lowered.db(), at, build, crates);
+        span.record("known", known);
+        span.record("keyed", keys.len());
+        keys
     };
     let mut moved: Vec<Crate> = keys
         .iter()
@@ -182,8 +196,15 @@ pub(crate) fn images(
         return Ok(None);
     }
     moved.sort_unstable();
-    let served =
-        lowered.serve_deps(&moved, build, &*session.images, mode).map_err(super::lower_error)?;
+    let served = match lowered.serve_deps(&moved, build, &*session.images, mode) {
+        Ok(served) => served,
+        Err(error) => {
+            // The walk keyed crates `keyed` does not hold: nothing of it is kept, so the next
+            // serve walks them again and finds them moved (rule 21).
+            session.walked.forget();
+            return Err(super::lower_error(error));
+        }
+    };
     debug_assert!(session.images.take_puts().is_empty(), "serving puts nothing");
     // The walk is noted only once `keyed` holds its keys: a serve that failed above leaves no
     // record that a later serve at this view could skip on with the old keys (rule 21).
@@ -252,16 +273,33 @@ pub(crate) struct Session {
 /// [`Session::walked`]: the crates keyed at one view of one database by one `build`, each of
 /// whose keys (and its dependencies') `keyed` holds; no view while a serve that moved a key is
 /// writing.
+///
+/// The walk itself is kept with them (`walk`), so the keys of one view are made once: a
+/// build's serves come a batch of units at a time (eight in an edit of ripgrep, each of which
+/// walked every crate again from nothing, 52-58 ms on the loop's thread, 425 ms before the
+/// edited unit began), and each now walks only the crates no serve at this view asked for.
+/// What the kept walk is keyed by is `at`: the database (its nonce), its view (no input was
+/// written since; a serve's own writes are no input of a key, which [`stamp`] asserts) and
+/// `build`, the code identity of the front end that makes the images. Those are all a key is
+/// a function of ([`hir_def::deps::KeyWalk`]), so a walk kept under them is complete (rule
+/// 21); when any moves the walk is cleared with the crates.
 struct Walked {
     at: Option<(base_db::Nonce, blaze_query::db::View, ContentId)>,
     crates: HashSet<Crate, Global>,
+    /// The walk at `at`: every crate a serve there walked, with its key.
+    walk: hir_def::deps::KeyWalk,
     /// How many walks [`images`] ran over the session's life: what a test of the skip counts.
     walks: u64,
 }
 
 impl Walked {
     fn new() -> Walked {
-        Walked { at: None, crates: HashSet::new_in(Global), walks: 0 }
+        Walked {
+            at: None,
+            crates: HashSet::new_in(Global),
+            walk: hir_def::deps::KeyWalk::new(),
+            walks: 0,
+        }
     }
 
     /// That each crate walked keys at `db`'s present view by `build` as `keyed` holds it: what
@@ -294,6 +332,31 @@ impl Walked {
         crates: &[Crate],
     ) -> bool {
         self.at == Some((at.0, at.1, build)) && crates.iter().all(|it| self.crates.contains(it))
+    }
+
+    /// The keys of the eligible crates among `crates` and their dependencies that no walk at
+    /// `at` by `build` keyed before, and how many crates the walk kept from those before knew
+    /// already. A walk kept at another view, or left by a serve that never stamped its view
+    /// (it failed past its images), is forgotten first, with the crates noted there.
+    fn keys(
+        &mut self,
+        db: &Db,
+        at: (base_db::Nonce, blaze_query::db::View),
+        build: ContentId,
+        crates: &[Crate],
+    ) -> (usize, HashMap<Crate, ContentId, Global>) {
+        if self.at != Some((at.0, at.1, build)) {
+            self.forget();
+        }
+        let known = self.walk.len();
+        (known, self.walk.more(db, crates, build))
+    }
+
+    /// Nothing is keyed at any view: the next serve walks every crate it asks for.
+    fn forget(&mut self) {
+        self.at = None;
+        self.crates.clear();
+        self.walk.clear();
     }
 
     /// `crates` (those asked and the dependencies keyed with them) keyed at `at` by `build`:
@@ -469,7 +532,8 @@ pub(crate) fn differences(kept: &Kept) -> Result<(), ApiError> {
 /// [`hir_def::deps::store`] and resolved again in each build); the outcomes and checked bodies
 /// of the dependency crates it checked (`later`, their paths named from `root`), after their
 /// dependencies'; the constants' values they evaluated; the goals and bodies' steps offered,
-/// with what their flushes did ([`noted`]). Called on a worker as the front end is kept
+/// with what their flushes did ([`noted`]). A goal or a step its flush would not keep is in
+/// what the flush did and stops nothing here ([`Flushes::take_refusal`]). Called on a worker as the front end is kept
 /// ([`crate::serve::work::Steps::store_kept`]), which no task reads then, and its puts made
 /// durable before the build that kept it answers.
 pub(crate) fn store(
@@ -555,6 +619,38 @@ pub(crate) struct Flushes {
     pub(crate) items: Option<body_store::Flushed>,
 }
 
+impl Flushes {
+    /// What the flushes would not keep, taken, to be said once: `None` when each kept every
+    /// goal and body's step it was given. Such a record is a bug in a key or in the store
+    /// (keys-cover-every-input), so it is said as a loss of the build's
+    /// ([`crate::serve::work::Steps::kept_refusal`]); it is one record's all the same, and
+    /// everything else the build left was kept and its front end with it
+    /// (panics-fail-one-job): until 2026-11-10 one such step stopped [`store`], which lost
+    /// every image, outcome, goal and step of the build and dropped its front end, so the
+    /// checkout's next build lowered anew.
+    pub(crate) fn take_refusal(&mut self) -> Option<String> {
+        let items = self.items.as_mut().and_then(|it| Some((it.failed, it.failure.take()?)));
+        let goals = self.goals.failure.take().map(|why| (self.goals.failed, why));
+        let said = |what: &str, (failed, why): (usize, String)| {
+            // alloc: a loss, once
+            format!(
+                "{what} did not keep {failed} of the records this build offered (every other was kept, and the \
+                 front end with them), the first: {why}"
+            )
+        };
+        match (items, goals) {
+            (None, None) => None,
+            (Some(items), None) => Some(said("the item store", items)),
+            (None, Some(goals)) => Some(said("the persistent goal cache", goals)),
+            (Some(items), Some(goals)) => Some(format!(
+                "{}; {}",
+                said("the item store", items),
+                said("the persistent goal cache", goals)
+            )), // alloc: a loss, once
+        }
+    }
+}
+
 /// The `-v` note of a build: what [`store`]'s flushes did for the head's last front end it
 /// lowered into (`flushes`: the goals' ([`flushed`]), then the bodies' steps the head's last
 /// build offered, and why any were kept out), then what this build's item store lookups
@@ -615,12 +711,18 @@ fn items_flushed(items: &body_store::Flushed, message: &mut String) {
         unshareable,
         unencodable,
         dropped,
+        failed,
+        failure: _,
         steps: _,
     } = items;
     // alloc: under `-v`, once per build that stored a front end
     message.push_str(&format!(
         "the item store: {written} written, {kept} kept, {slots_full} with every slot full"
     ));
+    if *failed > 0 {
+        // alloc: as above
+        message.push_str(&format!("; {failed} the store would not keep (the daemon's log says which)"));
+    }
     if !refused.is_empty() {
         let by: Vec<String> =
             refused.iter().map(|(read, count)| format!("`{read}` ({count})")).collect(); // alloc: as above
@@ -650,6 +752,8 @@ pub(crate) fn flushed(flushed: &goal_store::Flushed) -> Diagnostic {
         unhashable,
         too_long,
         dropped,
+        failed,
+        failure: _,
     } = flushed;
     // alloc: under `-v`, once per build that stored a front end
     let mut message = format!(
@@ -668,6 +772,10 @@ pub(crate) fn flushed(flushed: &goal_store::Flushed) -> Diagnostic {
         if *count > 0 {
             message.push_str(&format!("; {count} {why}")); // alloc: as above
         }
+    }
+    if *failed > 0 {
+        // alloc: as above
+        message.push_str(&format!("; {failed} the store would not keep (the daemon's log says which)"));
     }
     Diagnostic::note(message)
 }
@@ -771,19 +879,35 @@ struct Images {
     /// The daemon's proc macros, whose kept expansions' reads [`ImageStore::reads_now`] works
     /// out again.
     macros: Arc<blaze_macro_eval::Macros>,
-    /// What it asked to keep, in the order asked; a write path, once per crate it images and
-    /// per goal a flush writes.
-    puts: Lock<Vec<Put>>,
+    /// What it asked to keep; a write path, once per crate it images and per goal and body's
+    /// step a flush writes.
+    puts: Lock<Puts>,
+}
+
+/// What an [`Images`] was asked to keep since the last take: the puts in the order asked, and
+/// where each key's is. A flush asks a put for the shape and the answer of every goal and
+/// body's step a build offered (a few hundred thousand of a real workspace), and each put
+/// looks for its key among those asked before: by the index, never a scan of them all.
+///
+/// A get does not read them: a value is in the store once the loop put it, after the flush
+/// that asked. A flush that writes two values of one family of keys in turn (two shapes of
+/// one base key) keeps what it placed itself (`goal_store::slots`).
+struct Puts {
+    list: Vec<Put>,
+    at: HashMap<ContentId, usize, Global>,
 }
 
 impl Images {
     fn new(store: blaze_cas::Reader, macros: Arc<blaze_macro_eval::Macros>) -> Images {
-        Images { store, macros, puts: Lock::new("serve.deps.images.puts", Vec::new()) }
+        let puts = Puts { list: Vec::new(), at: HashMap::new_in(Global) }; // alloc: none until a put
+        Images { store, macros, puts: Lock::new("serve.deps.images.puts", puts) }
     }
 
     /// What it was asked to keep since the last take, in the order asked.
     fn take_puts(&self) -> Vec<Put> {
-        std::mem::take(&mut *self.puts.lock())
+        let mut puts = self.puts.lock();
+        puts.at.clear();
+        std::mem::take(&mut puts.list)
     }
 }
 
@@ -818,10 +942,14 @@ impl ImageStore for Images {
             Err(corrupt) => return Err(corrupt.to_string()),
         }
         let mut puts = self.puts.lock();
-        match puts.iter().find(|it| it.key == Key(key)) {
-            Some(put) if put.bytes == value => {}
+        let Puts { list, at } = &mut *puts;
+        match at.get(&key).copied() {
+            Some(asked) if list[asked].bytes == value => {}
             Some(_) => return Err(format!("two images were made under {key:?}")),
-            None => puts.push(Put { key: Key(key), kind: Kind::Query, bytes: value }),
+            None => {
+                at.insert(key, list.len()); // alloc: the index, one entry per put of a flush
+                list.push(Put { key: Key(key), kind: Kind::Query, bytes: value });
+            }
         }
         Ok(())
     }

@@ -13,10 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use base_db::Db;
 use blaze_diagnostics::{CrateCheck, Diag, Files, Options};
-use hir::{
-    DefWithBody,
-    check::{bodies::Plan, every_body},
-};
+use hir::{DefWithBody, check::bodies::Plan};
 use hir_def::DefWithBodyId;
 use hir_ty_codegen::v2::BodyChecks;
 
@@ -33,10 +30,11 @@ pub(crate) struct Checking {
 }
 
 impl Checking {
-    /// The check of every body of `krate`, listed.
+    /// The check of every body of `krate`, listed. What a body's or a module's check found
+    /// clean is the database's memo ([`Plan::of_every_body`]), so the build after an edit
+    /// checks the bodies the edit changed something for and reads nothing of the others.
     pub(crate) fn new(db: &Db, krate: hir::Crate) -> Checking {
-        static EVERY: fn(DefWithBody) -> bool = every_body;
-        Checking { krate, plan: Plan::new(db, &[krate], &EVERY), failed: AtomicBool::new(false) }
+        Checking { krate, plan: Plan::of_every_body(db, &[krate]), failed: AtomicBool::new(false) }
     }
 
     /// The check's diagnostics and whether they break its items ([`CrateCheck`]), once every

@@ -34,6 +34,23 @@
 //! the head, makes it again and backdates it: nothing read can differ, a re-read costs time and
 //! is named by its query's reruns.
 //!
+//! **An edit's build keeps what it made** ([`Finished::edit`]): a build that found units kept
+//! and made at most [`EDIT_CRATES`] crates lets go of no crate's inference by name and of no
+//! MIR, mid-build or at its end, unless memory makes a release due. The crate an edit made is
+//! the one the next edit makes again, and that build's check reads every body of it: the
+//! lints of bodies (`blaze-diagnostics`' `lints/bodies.rs`, one loop over the crate's bodies)
+//! read each body's inference, its built MIR (liveness) and its runtime MIR (the known-panics
+//! lint and a `Drop`'s recursion), and the dead-code pass reads each body's inference. With
+//! the values let go, every edit inferred and lowered every body of the edited crate again,
+//! on one thread: ripgrep, one line of `rg::main`, 2026-11-10: `infer_body_query` executed
+//! 1,165 of which 2 changed, `mir_body_query` 1,166 (1), `runtime_mir_body_query` 1,164 (1),
+//! `unit bodies` 782 ms. What is kept is bounded: the values of at most [`EDIT_CRATES`]
+//! crates a build, and of those only what the next two builds read again
+//! ([`blaze_query::db::Storage::end_epoch`], run at every build's end, lets go of what the
+//! last two did not read); memory short takes it all as before. A cold build, a rebuild of
+//! many crates and a check release as they did. The first edit after either finds the values
+//! gone and makes them once.
+//!
 //! A check (`Goal::Check`) keeps its inference: what it made, and what the next check of the
 //! head reads again. Its MIR goes as its front end is kept, as every build's does, and memory
 //! makes a release of a check due mid-build as of any build: then the MIR, constant values and
@@ -62,6 +79,11 @@ use blaze_query::db::{Database as _, MemoryUsage};
 
 #[cfg(test)]
 mod tests;
+
+/// The most crates a build may make and still be an edit's ([`Finished::edit`]): the crate
+/// edited and the few a changed interface reaches at once. Past it the build is a rebuild,
+/// whose crates' values go as each finishes, as a cold build's do.
+pub(crate) const EDIT_CRATES: usize = 4;
 
 /// Where each unit of a build stands, for [`Finished`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -94,6 +116,8 @@ pub(crate) struct Finished<K> {
     /// Units [`Stand::Open`]. A unit that panicked stays open (no compile ends it), and the
     /// build's MIR then goes only when memory is short or the front end is kept.
     open: u32,
+    /// Units found kept ([`Finished::kept`]), each once.
+    found_kept: u32,
 }
 
 impl<K: Copy + Eq + Hash> Finished<K> {
@@ -114,15 +138,27 @@ impl<K: Copy + Eq + Hash> Finished<K> {
             made: HashMap::new_in(Global), // alloc: as the field
             ready_made: false,
             open: 0,
+            found_kept: 0,
         }
     }
 
     /// Unit `unit` was found kept as it began: its record and outputs are in the store, and
     /// its compile replays them. Told before its compile ends; a unit not told counts as made.
     pub(crate) fn kept(&mut self, unit: usize) {
-        if let Some(kept) = self.kept.get_mut(unit) {
-            *kept = true;
+        if let Some(kept) = self.kept.get_mut(unit)
+            && !std::mem::replace(kept, true)
+        {
+            self.found_kept += 1;
         }
+    }
+
+    /// Whether the build is, so far, an edit's: it found a unit kept (the store holds an
+    /// earlier build's results of it, so this is not a first build) and made at most
+    /// [`EDIT_CRATES`] crates. What such a build made is what the next edit's build reads
+    /// again (the module), so it is not let go by name. A build that goes on to make more
+    /// stops being one, and the crates it finished meanwhile, never taken, go then.
+    pub(crate) fn edit(&self) -> bool {
+        self.found_kept > 0 && self.made.len() <= EDIT_CRATES
     }
 
     /// Unit `unit`'s first task started. A build script's run has no crate and no compile to
@@ -202,9 +238,13 @@ pub(crate) struct Release<K = Crate> {
 #[derive(PartialEq, Eq, Debug)]
 pub(crate) struct Plan<K> {
     /// The crates finished since the last release: their bodies' inference goes. Always
-    /// empty for a check, whose inference the next check of the head reads again.
+    /// empty for a check, whose inference the next check of the head reads again, and for an
+    /// edit's build ([`Finished::edit`]) that memory does not press.
     pub(crate) crates: Vec<K>,
-    /// Every MIR and constant's value goes too: no unit is open, or memory is short.
+    /// Every MIR and constant's value goes too: no unit is open, or memory is short, or the
+    /// build is over; never for an edit's build that memory does not press, whose end
+    /// (`ended` without `mir`) lets go of the trait solver's caches and the unread values
+    /// alone.
     pub(crate) mir: bool,
     /// Memory made it due: the values kept by bytes are swept under the squeeze's caps.
     pub(crate) pressed: bool,
@@ -256,7 +296,12 @@ impl Release<Crate> {
         );
         let _release = span.enter();
         let db = lowered.served_db();
-        let dropped = hir::evict::drop_crates_after_store(db, &crates, mir);
+        let mut dropped = hir::evict::drop_crates_after_store(db, &crates, mir);
+        if ended && !mir {
+            // An edit's build ends: its inference and MIR stay for the next edit, and the
+            // trait solver's caches, which are of this revision alone, go as at any end.
+            dropped.solver_caches += hir::evict::drop_every_solver_cache(db);
+        }
         if pressed {
             db.storage_mut().sweep_values(&Squeeze::caps(before));
         }
@@ -299,7 +344,7 @@ impl Release<Crate> {
         // One line each release in the daemon's log, on its standard error as the memory line
         // is: why, what went, blaze's memory before and after against the limit (B5), and the
         // query storage's largest holders.
-        eprintln!(
+        crate::serve::said::logged!(INFO,
             "blaze serve: {}",
             Said {
                 crates: crates.len(),
@@ -429,6 +474,8 @@ impl std::fmt::Display for Said {
         )?;
         if *mir {
             write!(f, ", {} MIR bodies, {} constant values", dropped.mir, dropped.const_eval)?;
+        } else if *ended {
+            f.write_str(", no MIR (an edit's build keeps what it made for the next edit)")?;
         }
         write!(f, " and {} trait solver caches", dropped.solver_caches)?;
         if *pressed {
@@ -506,8 +553,10 @@ impl<K: Copy + Eq + Hash> Release<K> {
     }
 
     /// Whether the build should stop its readers for a release: memory makes one due, the
-    /// build is over, or the build compiles and no unit is open and a crate this build made
-    /// something of is finished (no reader to wait for).
+    /// build is over, or the build compiles, is no edit's ([`Finished::edit`]), and no unit
+    /// is open and a crate this build made something of is finished (no reader to wait for).
+    /// An edit's build has nothing to let go until its end, so its loop stops no reader and
+    /// runs no release for the crate it made.
     ///
     /// A crate whose units were all found kept makes none due. Until 2026-11-10 it did: a
     /// warm build finds every dependency's unit kept as it begins, so "no unit open and a
@@ -519,14 +568,20 @@ impl<K: Copy + Eq + Hash> Release<K> {
     pub(crate) fn due(&self) -> bool {
         self.pressed
             || self.ended
-            || (self.compiles && self.finished.idle() && self.finished.has_made())
+            || (self.compiles
+                && self.finished.idle()
+                && self.finished.has_made()
+                && !self.finished.edit())
     }
 
     /// What a release now lets go of, taking it (a second plan is of what finished since);
     /// none when there is nothing. A check's is due to memory or to its end alone and names no
     /// crate: its MIR, constant values and solver caches go (and under memory, its values are
     /// swept), its inference kept for the next check of the head except as the sweep's caps
-    /// take it. Every build's last, at its end, lets go of every MIR.
+    /// take it. Every build's last, at its end, lets go of every MIR, but an edit's
+    /// ([`Finished::edit`]) that memory does not press: that one names no crate and keeps its
+    /// MIR, has no plan before its end, and leaves the crates it finished untaken, for a
+    /// later plan of the same build should it make more crates than an edit does.
     pub(crate) fn plan(&mut self) -> Option<Plan<K>> {
         let pressed = std::mem::take(&mut self.pressed);
         let ended = std::mem::take(&mut self.ended);
@@ -537,6 +592,10 @@ impl<K: Copy + Eq + Hash> Release<K> {
                 pressed,
                 ended,
             });
+        }
+        if !pressed && self.finished.edit() {
+            // alloc: an empty `Vec` allocates nothing
+            return ended.then(|| Plan { crates: Vec::new(), mir: false, pressed, ended });
         }
         let crates = self.finished.take();
         let mir = pressed || ended || self.finished.idle();

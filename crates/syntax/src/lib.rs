@@ -482,9 +482,15 @@ impl ast::Expr {
     /// ast::Expr::parse("let fail = true;", Edition::CURRENT).tree();
     /// ```
     pub fn parse(text: &str, edition: Edition) -> Parse<ast::Expr> {
+        Self::parse_with(text, edition, Extensions::NONE)
+    }
+
+    /// [`ast::Expr::parse`] under `extensions`, the syntax extensions of the crate whose
+    /// source `text` is from.
+    pub fn parse_with(text: &str, edition: Edition, extensions: Extensions) -> Parse<ast::Expr> {
         let _p = tracing::info_span!(target: "blaze", "Expr::parse").entered();
-        let (tree, errors) =
-            parsing::parse_text_at(&text.into(), parser::TopEntryPoint::Expr, edition);
+        let entry = parser::TopEntryPoint::Expr;
+        let (tree, errors) = parsing::parse_text_at(&text.into(), entry, edition, extensions);
         let root = tree.root();
 
         assert!(
@@ -501,8 +507,9 @@ impl ast::MacroStmts {
     /// rustc retries an expansion that is no expression (`failed_to_match_macro`).
     pub fn parse(text: &str, edition: Edition) -> Parse<ast::MacroStmts> {
         let _p = tracing::info_span!(target: "blaze", "MacroStmts::parse").entered();
+        let entry = parser::TopEntryPoint::MacroStmts;
         let (tree, errors) =
-            parsing::parse_text_at(&text.into(), parser::TopEntryPoint::MacroStmts, edition);
+            parsing::parse_text_at(&text.into(), entry, edition, Extensions::NONE);
         assert_eq!(tree.root().kind(), SyntaxKind::MACRO_STMTS);
         Parse::new(tree, errors)
     }

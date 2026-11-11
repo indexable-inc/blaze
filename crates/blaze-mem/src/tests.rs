@@ -427,8 +427,8 @@ fn a_reserved_region_takes_pool_pages_or_names_the_pool() {
     assert_eq!(region.committed(), 2 * HUGE_PAGE);
     region.ensure(3 * HUGE_PAGE).expect("take it again");
     assert!(filled(&region, 0, 2 * HUGE_PAGE), "the kept pages kept their bytes");
-    // SAFETY: committed again just now.
     assert_eq!(
+        // SAFETY: committed again just now.
         unsafe { region.at(2 * HUGE_PAGE + 5).as_ptr().read() },
         0,
         "a page made again is zeroed"
@@ -456,8 +456,8 @@ fn a_reserved_region_takes_pool_pages_or_names_the_pool() {
     for thread in threads {
         thread.join().expect("grower");
     }
-    // SAFETY: committed by the growers, who wrote it.
     assert_eq!(
+        // SAFETY: committed by the growers, who wrote it.
         unsafe { region.at(3 * HUGE_PAGE - 1).as_ptr().read() },
         1,
         "no grower mapped over another's"

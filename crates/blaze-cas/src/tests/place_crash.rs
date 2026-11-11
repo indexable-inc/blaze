@@ -583,6 +583,26 @@ fn derived_once(sim: &mut Sim, len: usize, ranges: u64, range: usize) -> (Store,
     (store, base, gives)
 }
 
+/// A derived value read back as a file is its base's bytes with every recipe's ranges
+/// written, down a chain; [`Reader::get`] of it is the recipe. (A dev executable adopted from
+/// a record after a restart was handed the recipe as its image: "Unknown file magic".)
+#[test]
+fn a_derived_values_file_is_its_chain_applied_and_never_its_recipe() {
+    let mut sim = Sim::new(37, quiet());
+    let (mut store, base, first) = derived_once(&mut sim, 64 << 10, 2, 300);
+    let second = edit(&mut sim, &mut store, (2, &first), 3, 8192);
+    let reader = store.reader();
+    let guard = enter();
+    assert_eq!(reader.file_of(&guard, &key(1)), Ok(Some(base)));
+    assert_eq!(reader.file_of(&guard, &key(2)).unwrap().as_ref(), Some(&first));
+    assert_eq!(reader.file_of(&guard, &key(3)).unwrap().as_ref(), Some(&second));
+    assert_eq!(reader.file_of(&guard, &key(9)), Ok(None));
+    // The control: what `get` gives of it is the recipe, a few hundred bytes, no file.
+    let recipe = reader.get(&guard, &key(3)).unwrap().unwrap();
+    assert_eq!(recipe.kind, Kind::Derived);
+    assert_ne!(recipe.bytes, &second[..]);
+}
+
 /// The one place asked, driven to its end.
 fn placed_one(sim: &mut Sim, store: &mut Store, effects: &mut Vec<Effect>) -> Placed {
     drive(sim, store, effects);
@@ -758,6 +778,75 @@ fn an_edit_over_a_base_not_written_back_is_put_whole_written_once_and_forces_not
     assert!(sim.exists(&name(&format!("store/placed/{:x}", content_of(&edited)))));
     assert_eq!(sim.bytes_forced(), 0);
     assert!(store.problems().is_empty(), "{:?}", store.problems());
+}
+
+/// An image of `LEN` bytes that is two runs and, between and after them, room nothing wrote:
+/// the runs, and the file.
+fn roomy(len: usize) -> (Vec<(u64, Vec<u8>)>, Vec<u8>) {
+    let runs = vec![(0, noise(24 << 10, 41)), (len as u64 / 2, noise(8 << 10, 42))];
+    let file = derived::applied(&[], len as u64, runs.iter().map(|(at, it)| (*at, it)));
+    (runs, file)
+}
+
+/// What a place of `key(2)` at `one/build/a` wrote into files in all, the store's own file of
+/// it included, and the file it left there.
+fn placed_writing(sim: &mut Sim, store: &mut Store) -> (u64, Vec<u8>) {
+    let wrote = sim.bytes_written();
+    let mut effects = Vec::new();
+    store.place(&key(2), name("one/build/a"), &mut effects).unwrap();
+    let placed = placed_one(sim, store, &mut effects);
+    assert_eq!(placed.result, Ok(()));
+    (sim.bytes_written() - wrote, sim.contents(&name("one/build/a")))
+}
+
+/// The invariant: an image put as its runs over the base of holes ([`derived::holes`]) is
+/// placed as the file those runs give, and from its put to its place nothing writes its
+/// room: the record is the runs, and the place writes the base once and the runs once (into
+/// the store's own file of it, which the output is a clone of). The image is then a base as
+/// any other, so the edit after it derives from it.
+#[test]
+fn an_image_put_as_its_runs_over_holes_is_placed_writing_its_runs_and_none_of_its_room() {
+    const LEN: usize = 10 << 20;
+    let mut sim = Sim::new(35, quiet());
+    let mut store = open(&mut sim, "store");
+    let (runs, file) = roomy(LEN);
+    let held: usize = runs.iter().map(|it| it.1.len()).sum();
+    store.put(key(1), Kind::Output, &derived::holes()).unwrap();
+    let recipe = derived::encode(&key(1), LEN as u64, &runs).unwrap();
+    assert!(recipe.len() < held + 256, "a record of {} bytes for {held} bytes of runs", recipe.len());
+    store.put(key(2), Kind::Derived, &recipe).unwrap();
+    flush(&mut sim, &mut store);
+    let (wrote, placed) = placed_writing(&mut sim, &mut store);
+    assert_eq!(placed, file);
+    assert!(
+        wrote <= (2 * (derived::HOLES + held) + (64 << 10)) as u64,
+        "placing {held} bytes of runs in an image of {LEN} wrote {wrote} bytes"
+    );
+    assert_eq!(sim.bytes_forced(), 0, "no clone was of a file with data to write back");
+    assert_eq!(store.reader().file_of(&enter(), &key(2)).unwrap().as_ref(), Some(&file));
+    assert_eq!(store.reader().derivable(&enter(), &key(2)), Derivable::Yes, "a base for the next edit");
+    let edited = edit(&mut sim, &mut store, (2, &file), 3, 8192);
+    let mut effects = Vec::new();
+    store.unplace(&key(2), &key(3), &mut effects);
+    store.place(&key(3), name("one/build/a"), &mut effects).unwrap();
+    assert_eq!(placed_one(&mut sim, &mut store, &mut effects).result, Ok(()));
+    assert_eq!(sim.contents(&name("one/build/a")), edited);
+    assert!(store.problems().is_empty(), "{:?}", store.problems());
+}
+
+/// The control of the invariant above (test-the-cause): the same image put whole, its room
+/// in its bytes, is placed as the same file by writing all of it, room and all.
+#[test]
+fn the_oracle_catches_an_image_put_whole_with_its_room() {
+    const LEN: usize = 10 << 20;
+    let mut sim = Sim::new(35, quiet());
+    let mut store = open(&mut sim, "store");
+    let (_, file) = roomy(LEN);
+    store.put(key(2), Kind::Output, &file).unwrap();
+    flush(&mut sim, &mut store);
+    let (wrote, placed) = placed_writing(&mut sim, &mut store);
+    assert_eq!(placed, file);
+    assert!(wrote >= LEN as u64, "a whole put of {LEN} bytes was placed writing {wrote}");
 }
 
 /// A derived value across a restart: its recipe is durable as every value is, and the whole

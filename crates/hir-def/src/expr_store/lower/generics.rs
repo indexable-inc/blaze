@@ -29,7 +29,8 @@ use crate::{
         },
     },
     type_ref::{
-        LifetimeRef, LifetimeRefId, TraitBoundModifier, TypeBound, TypeRef, TypeRefId, UseArgRef,
+        ConstRef, LifetimeRef, LifetimeRefId, TraitBoundModifier, TypeBound, TypeRef, TypeRefId,
+        UseArgRef,
     },
 };
 
@@ -96,6 +97,7 @@ pub(crate) struct GenericParamsCollector {
     lifetimes: Arena<LifetimeParamData>,
     where_predicates: Vec<WherePredicate>,
     binder_params: Arena<BinderParamData>,
+    where_consts: Vec<ConstRef>,
     parent: GenericDefId,
 }
 
@@ -106,6 +108,7 @@ impl GenericParamsCollector {
             lifetimes: Default::default(),
             where_predicates: Default::default(),
             binder_params: Default::default(),
+            where_consts: Default::default(),
             parent,
         }
     }
@@ -159,6 +162,7 @@ impl GenericParamsCollector {
             mut type_or_consts,
             where_predicates,
             mut binder_params,
+            where_consts,
             parent: _,
         } = self;
         let early_bound_lifetimes_len =
@@ -173,6 +177,7 @@ impl GenericParamsCollector {
             lifetimes,
             where_predicates: where_predicates.into_boxed_slice(),
             binder_params,
+            where_consts: where_consts.into_boxed_slice(),
         }
     }
 
@@ -240,6 +245,17 @@ impl GenericParamsCollector {
     ) {
         ec.with_lifetime_bound_scope(LifetimeBoundScope::WhereClause, |ec| {
             for pred in where_clause.predicates() {
+                // `where const { COND }`: the block is lowered as a const argument is, a root
+                // of the signature's store. Without the feature it is the
+                // `ComptimeWithoutFeature` error and no condition.
+                if let Some(block) = pred.const_condition() {
+                    let node = SyntaxNodePtr::from(AstPtr::<tag::WherePred>::of(pred));
+                    if ec.comptime_enabled(node, ComptimeForm::WhereConst) {
+                        let expr = ec.lower_where_const(block);
+                        self.where_consts.push(ConstRef { expr });
+                    }
+                    continue;
+                }
                 let target = if let Some(type_ref) = pred.ty() {
                     Either::Left(ec.lower_type_ref(type_ref, &mut ImplTraitLowering::Error))
                 } else if let Some(lifetime) = pred.lifetime() {

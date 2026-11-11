@@ -1819,9 +1819,12 @@ impl CrateGraphBuilder {
 }
 
 impl Crate {
+    /// The crate's root file, read in the crate's edition and under its syntax extensions
+    /// ([`Crate::extensions`]).
     pub fn root_file_id(self, db: &Db) -> EditionedFileId {
         let data = self.data(db);
-        EditionedFileId::new(db, data.root_file_id, data.edition)
+        let extensions = self.extensions(db);
+        EditionedFileId::new_with_extensions(db, data.root_file_id, data.edition, extensions)
     }
 }
 
@@ -1971,6 +1974,7 @@ mod tests {
             target: Err("".into()),
             toolchain: None,
             const_eval: Default::default(),
+            trusted: Box::default(),
         })
     }
 

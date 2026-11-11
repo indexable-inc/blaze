@@ -24,6 +24,7 @@ pub mod dispatch;
 pub mod early_drop;
 mod eval;
 mod framed;
+pub mod handles;
 pub mod home;
 pub mod location;
 mod lower;

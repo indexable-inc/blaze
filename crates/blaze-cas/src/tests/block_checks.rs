@@ -297,7 +297,7 @@ fn every_pack_is_open_in_the_pool_as_far_as_it_is_committed() {
     drop(store);
     let mut store = open(&mut sim, "store");
     open_as_committed(&store);
-    assert_eq!(store.hot.pack_removed(0, 0), Ok(()));
+    store.hot.pack_removed(0, 0);
     assert_eq!(store.hot.pack_open(0, 0), None);
 }
 
@@ -434,4 +434,132 @@ fn a_removed_packs_checks_are_removed_with_it() {
     drive(&mut sim, &mut store, &mut effects);
     assert!(!sim.exists(&name("store/pack-000000")) && !sim.exists(&name("store/checks-000000")));
     assert_eq!(store.problems(), &[] as &[String]);
+}
+
+/// A reopened store asks for no mapping of a pack: what its packs commit is loaded into its
+/// pool by reads its driver carries out, each block checked, and every value is read from
+/// there, its pages pinned by the readers' table until the store lets the table go.
+#[test]
+fn a_store_reads_its_packs_through_its_pool_and_maps_none() {
+    let mut sim = Sim::new(21, quiet());
+    let mut store = open(&mut sim, "store");
+    for n in 0..5 {
+        store.put(key(n), Kind::Code, &noise(40_000, n)).unwrap();
+    }
+    flush(&mut sim, &mut store);
+    let committed = store.tiers[0].packs[0].committed;
+    drop(store);
+    let mut effects = Vec::new();
+    let mut store = Store::open(config("store"), &mut effects);
+    let (mut maps, mut reads) = (0, 0);
+    run_until_idle(&mut sim, &mut effects, |completion, effects| {
+        if store.owns(completion.tag) {
+            store.complete(completion, effects);
+        }
+        maps += effects.iter().filter(|it| matches!(it, Effect::Map { .. })).count();
+        reads += effects.iter().filter(|it| matches!(it, Effect::ReadInto { .. })).count();
+    })
+    .expect("the effects end");
+    assert!(store.ready(), "{:?}", store.broken());
+    assert_eq!(maps, 0, "no pack is mapped");
+    assert!(reads >= 1, "the pack was read into the pool");
+    let census = store.pool_census().expect("the store has a pool");
+    assert!(census.loaded >= committed, "{census:?}: the pack commits {committed}");
+    for n in 0..5 {
+        assert_eq!(bytes_of(&store, &key(n)), Some(noise(40_000, n)), "{n}");
+    }
+    let pinned = store.pool_census().expect("the store has a pool").pinned;
+    assert!(pinned >= crate::pool::PAGE, "the reads' pages are pinned by the readers' table: {pinned}");
+    // A value held past its task has pins of its own.
+    let held = store.pinned(&key(1)).unwrap().expect("the value is kept");
+    assert_eq!(&*held, noise(40_000, 1).as_slice());
+    assert_eq!(store.verify(None), Vec::new());
+}
+
+/// A prefetch of records that are neighbours in a pack is one plan of one run, and one read:
+/// given back by a sweep, a pumped store's pages are refused to a read (it can load nothing),
+/// naming why; the hint's read brings them back, and the values read whole.
+#[test]
+fn a_prefetch_of_neighbouring_records_is_one_run_and_one_read() {
+    let mut sim = Sim::new(22, quiet());
+    let mut store = open(&mut sim, "store");
+    for n in 0..5 {
+        store.put(key(n), Kind::Code, &noise(40_000, n)).unwrap();
+    }
+    flush(&mut sim, &mut store);
+    let swept = store.hot.evict(u64::MAX).expect("the store has a pool");
+    assert!(swept.freed >= 2 * crate::pool::PAGE && swept.refused.is_none(), "{swept:?}");
+    let refused = store.get(&key(0)).expect_err("its page is not in memory, and nothing loads it");
+    assert!(refused.what.contains("not in memory") && refused.what.contains("Loader::Pumped"), "{refused}");
+    let keys: Vec<Key> = (0..4).map(key).collect();
+    let mut effects = Vec::new();
+    let hint = store.prefetch(&keys, &mut effects);
+    assert_eq!((hint.runs, hint.handed), (1, true), "{hint:?}");
+    let reads = effects.iter().filter(|it| matches!(it, Effect::ReadInto { .. })).count();
+    assert_eq!(reads, 1, "{} records, one read: {effects:?}", keys.len());
+    drive(&mut sim, &mut store, &mut effects);
+    for n in 0..5 {
+        assert_eq!(bytes_of(&store, &key(n)), Some(noise(40_000, n)), "{n}");
+    }
+}
+
+/// A read at the pinned bound waits, a tick at a time, for the store to let pins go, and ends
+/// in a typed refusal naming the bound when none are: never a wait without end, and never a
+/// pin past the bound.
+#[test]
+fn a_read_at_the_pinned_bound_waits_its_ticks_and_is_refused_naming_the_bound() {
+    let mut sim = Sim::new(23, quiet());
+    let store = open(&mut sim, "store");
+    let page = crate::pool::PAGE;
+    assert_eq!(store.shared.pin_room_within(page, u64::MAX, 2), Ok(()), "under the bound: no wait");
+    let refused = store.shared.pin_room_within(page, 0, 2).expect_err("nothing fits under a bound of 0");
+    assert_eq!((refused.bound, refused.need), (0, page), "{refused}");
+    assert!(refused.to_string().contains("its bound is 0"), "{refused}");
+}
+
+/// A store whose misses its loader's thread loads ([`Loader::Thread`]), on a real file
+/// system: reopened, it reads what its opening's scan and its readers ask for through the
+/// pool; given back by a sweep (the pins of ended tasks let go first), its pages load again
+/// as they are read, each block checked; and no pack is mapped at any point.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[test]
+fn a_store_with_a_loader_loads_what_is_read_and_again_once_it_is_given_back() {
+    let root = std::env::temp_dir().join(format!("blaze-cas-loader-{}", std::process::id()));
+    _ = std::fs::remove_dir_all(&root);
+    let loader = || Loader::Thread { root: root.clone() };
+    {
+        let mut driven = Driven::open_with(&root, loader()).unwrap();
+        for n in 0..5 {
+            driven.store().put(key(n), Kind::Code, &noise(40_000, n)).unwrap();
+        }
+        driven.flush().unwrap();
+        for n in 0..5 {
+            assert_eq!(bytes_of(driven.store(), &key(n)), Some(noise(40_000, n)), "{n}: as it was put");
+        }
+    }
+    let mut driven = Driven::open_with(&root, loader()).unwrap();
+    for round in 0..2 {
+        for n in 0..5 {
+            assert_eq!(bytes_of(driven.store(), &key(n)), Some(noise(40_000, n)), "round {round}: {n}");
+        }
+        let before = driven.store().pool_census().expect("the store has a pool");
+        // The pins of the reads above go once their grace has passed: other tests of this
+        // process hold guards of their own meanwhile, so the sweep is asked until it has.
+        let mut freed = 0;
+        for _ in 0..10_000 {
+            freed += driven.store().evict_pool(u64::MAX);
+            if freed >= before.loaded {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        let after = driven.store().pool_census().expect("the store has a pool");
+        assert_eq!(
+            (freed, after.loaded, after.pinned),
+            (before.loaded, 0, 0),
+            "round {round}: every page is given back once no task pins it: {before:?} before, {after:?} after"
+        );
+    }
+    drop(driven);
+    _ = std::fs::remove_dir_all(&root);
 }

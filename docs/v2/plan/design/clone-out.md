@@ -60,6 +60,51 @@ reach a stored file through a shared inode.
   The `Work` report moved from the plan's finish to the job's last finish, so it counts every
   placement.
 
+## An output the build made (2026-11-10; written, not built or run)
+
+Supersedes, for the edit path, "cloned from `placed/<content>`, written once per content" and
+the handoff of 4f260cd351 (write `placed/<id>`, write it back, clone it). Measured on xfs
+after a one-line body edit of hello world: the answer held 3.2 s while the loop thread sat in
+`ioctl(FICLONE)` for 0.9 s and 1.4 s, the second from a 162 MB `placed/` file made in that
+build. A clone of a file with data not written back waits for all of it; a place that can be
+made only of a clone waits for the file to be made, sealed and written back first.
+
+- **The rule.** An output the build that asks just linked is placed from the bytes its maker
+  holds, by `Store::place_made(to, Sparse { len, runs })`: remove the staged name beside the
+  path, truncate it to `len` (a file of holes), one `pwrite` a run, rename onto the path
+  unsynced. No file of the store is read, cloned, derived or waited for, and nothing is
+  synced. There is one route, chosen by what the caller has (bytes), never tried after
+  another. `Store::place` (clone from a file written back) stays for a value with no bytes at
+  hand: a second checkout, a record replayed.
+- **Patch room is not written.** The runs are `Image::file_runs`: the regions' bytes, gaps past
+  a page left out, so the two 64 MiB patch regions are holes. Hello world's edit writes about
+  28 MB a path where it wrote or cloned 162 MB. The room out of the file's length altogether
+  is [patch-in-place.md](patch-in-place.md)'s layout change, still not built.
+- **Not in place, and not only the changed blocks.** Writing the path's file in place is
+  refused while a program runs it (`ETXTBSY`) and changes its mapped pages under it; a private
+  copy to write changed blocks into is a clone of the path's last file, which was written an
+  edit ago with no sync, so it is the same wait. So: a new file, whole content, renamed over.
+  Writing only changed blocks needs a source known written back; that is a later step
+  (write-back of the output after the answer, then clone-and-patch when it has completed).
+- **The store's copy.** The value is put as a recipe: of the link's ranges over the file
+  before it, a few KB, or on a first link of the file's runs over the base of holes
+  ([patch-in-place.md](patch-in-place.md), "The patch room"), never the file at its length.
+  It is durable with the store's next commit, after the
+  answer (`Settling`). No `placed/` file is made on the edit path; `Store::unplace_made` lets
+  go of the one the path's last value was cloned from.
+- **Crash safety.** After a crash the path holds its old file, the new one, or what the power
+  left of the new one. Nothing believes it: the daemon records a path as holding a key only
+  after the place completed and a `stat` of it (`paths.placed`, in memory), and a daemon that
+  starts knows of no placed file, so the next build places again. No hash of the file is
+  taken: the check is the recorded length and mtime against a `stat`.
+- **The loop thread.** `FICLONE` runs on a thread off the ring with a span `io clone <file>`;
+  the ring's eventfd is written only while its thread is parked. Still in line on the ring's
+  thread, each one metadata call: mode, seal, times, readlink, flock, truncate, mmap.
+- **Proven by** `crates/blaze-cas/src/tests/place_made.rs`: the invariant
+  `a_made_output_is_placed_with_no_clone_and_no_wait_for_a_write_back` and its two controls.
+  Guards: `loop stalled` spans (a step of a loop turn over 20 ms) fail an edit's budget, and
+  `harness/v2/loop_syscalls.py` holds the loop thread's system calls to 20 ms (ledger T16).
+
 ## Checked by
 
 `harness/v2/clone_out.py`, check `a_second_checkout_adds_only_its_own_bytes`. It builds one

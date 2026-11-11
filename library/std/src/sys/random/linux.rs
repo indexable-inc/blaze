@@ -160,10 +160,19 @@ fn getrandom(mut bytes: &mut [u8], insecure: bool) {
 }
 
 pub fn fill_bytes(bytes: &mut [u8]) {
+    // blaze: a process given a provider takes its bytes from the seed, with no system call
+    // (`sys::provider`); every other process is as the nightly's.
+    if crate::sys::provider::fill(bytes) {
+        return;
+    }
     getrandom(bytes, false);
 }
 
 pub fn hashmap_random_keys() -> (u64, u64) {
+    // blaze: as in `fill_bytes`.
+    if let Some(keys) = crate::sys::provider::hashmap_keys() {
+        return keys;
+    }
     let mut bytes = [0; 16];
     getrandom(&mut bytes, true);
     let k1 = u64::from_ne_bytes(bytes[..8].try_into().unwrap());

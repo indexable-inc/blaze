@@ -86,6 +86,10 @@ pub enum Rule {
     RelaxedUncoveredParam,
     /// A relaxed impl that overlaps another impl of its trait.
     Overlap,
+    /// An impl with a `where const { .. }` condition of a trait that is not `#[marker]`.
+    ConditionNotMarker,
+    /// An impl with a `where const { .. }` condition outside the crate of its trait.
+    ConditionElsewhere,
 }
 
 impl Rule {
@@ -100,6 +104,8 @@ impl Rule {
             Rule::RelaxedUnsized => "relaxed-unsized",
             Rule::RelaxedUncoveredParam => "relaxed-uncovered-param",
             Rule::Overlap => "relaxed-overlap",
+            Rule::ConditionNotMarker => "condition-not-marker",
+            Rule::ConditionElsewhere => "condition-elsewhere",
         }
     }
 
@@ -109,6 +115,61 @@ impl Rule {
             Rule::Overlap => "E0119",
             _ => "",
         }
+    }
+}
+
+/// The coherence rule of an impl with a `where const { COND }` condition
+/// (`#![feature(blaze_comptime)]`, docs/v2/plan/design/ownership.md).
+///
+/// Whether such an impl applies to a type is known only when the condition is evaluated for
+/// it, so no check of headers can show it disjoint from another impl, and blaze has no general
+/// overlap check to try. The rule makes overlap harmless instead of absent:
+///
+/// - the trait is `#[marker]`: it has no associated item, so two impls that both apply to a
+///   type are indistinguishable, and the solver merges them (rustc's `marker_trait_attr`, RFC
+///   1268). The derived impl and an explicit `unsafe impl Tr for X {}` may then both hold;
+/// - the impl is in the trait's own crate: the condition is part of what the trait means, and
+///   every other crate's impls of it stay under the orphan rules as they are.
+///
+/// A trait with items would need the impls shown disjoint, which is the overlap check blaze
+/// lacks (rustc's E0119); until it has one, a condition on such a trait's impl is refused
+/// here rather than left to two impls that disagree. Cost for an impl with no condition: one
+/// read of its generic parameters.
+fn check_condition(db: &Db, impl_: ImplId, trait_: TraitId, found: &mut Vec<CoherenceError>) {
+    if GenericParams::of(db, impl_.into()).where_consts().is_empty() {
+        return;
+    }
+    let krate = impl_.krate(db);
+    let this = || impl_text(db, krate, impl_.into());
+    let marker = hir_def::attrs::AttrFlags::query(db, hir_def::AttrDefId::TraitId(trait_))
+        .contains(hir_def::attrs::AttrFlags::MARKER);
+    if !marker {
+        found.push(error(
+            Rule::ConditionNotMarker,
+            format_args!(
+                "`{}` has a `where const` condition, but `{}` is not a `#[marker]` trait: \
+                 whether the impl applies is known only per type, so it could overlap another \
+                 impl of the trait, and impls of a trait with items must not",
+                this(),
+                trait_name(db, trait_),
+            ),
+            Some(
+                "a `where const` condition is allowed on an impl of a `#[marker]` trait, whose \
+                 impls may overlap because they have no items to disagree on",
+            ),
+        ));
+    }
+    if trait_.krate(db) != krate {
+        found.push(error(
+            Rule::ConditionElsewhere,
+            format_args!(
+                "`{}` has a `where const` condition, but `{}` is a trait of crate `{}`",
+                this(),
+                trait_name(db, trait_),
+                trait_.krate(db).named(db),
+            ),
+            Some("only the crate that defines a trait may derive it with a `where const` impl"),
+        ));
     }
 }
 
@@ -144,6 +205,8 @@ pub fn check_impl(db: &Db, impl_: ImplId) -> Vec<CoherenceError> {
             Some("only the crate that defines a `#[blaze::sealed]` trait may implement it"),
         ));
     }
+
+    check_condition(db, impl_, trait_, &mut found);
 
     let Some((_, sealed)) = sealed_relaxation(db, impl_) else { return found };
     let sealed_name = || trait_name(db, sealed);
@@ -508,7 +571,12 @@ fn is_sealed(db: &Db, trait_: TraitId) -> bool {
 }
 
 fn error(rule: Rule, message: std::fmt::Arguments<'_>, note: Option<&str>) -> CoherenceError {
-    let extension = "blaze extension `#[blaze::sealed]`";
+    let extension = match rule {
+        Rule::ConditionNotMarker | Rule::ConditionElsewhere => {
+            "blaze extension `where const`, `#![feature(blaze_comptime)]`"
+        }
+        _ => "blaze extension `#[blaze::sealed]`",
+    };
     CoherenceError {
         rule,
         // alloc: the error's own text, once per refused rule

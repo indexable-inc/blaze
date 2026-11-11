@@ -553,7 +553,10 @@ pub(super) fn goal_text<'db>(cx: &Cx<'_, 'db>, goal: &hir::SolverGoal<'db>) -> O
         // alloc: the error's text, for an error hir found
         hir::SolverGoal::Coerce { a, b } => format!("{} -> {}", cx.ty(a), cx.ty(b)),
         // alloc: the error's text, for an error hir found
-        hir::SolverGoal::ConstEvaluatable(ct) => format!("the constant `{ct}` can be evaluated"),
+        // blaze's one use of the goal: a `where const { .. }` condition, whose phrase hir
+        // makes, with why it does not hold when its evaluation says.
+        // clone: the error's text, for an error hir found
+        hir::SolverGoal::ConstEvaluatable(phrase) => phrase.clone(),
         // alloc: the error's text, for an error hir found
         hir::SolverGoal::ConstArgHasType { ct, ty } => {
             format!("the constant `{ct}` has type `{}`", cx.ty(ty))

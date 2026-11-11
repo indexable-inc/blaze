@@ -34,13 +34,18 @@ use super::{
     say,
 };
 
+mod script;
+
 const EXPLORE_USAGE: &str = "blaze explore [--dev] [--print]: the explorer's link, opened in the browser (`--print`: printed only; \
                              `--dev`: the page's development server, http://localhost:5173, may connect too)";
 const DEBUG_USAGE: &str = "blaze debug profile [--seconds N] | blaze debug live | blaze debug sql [--json] QUERY \
+                           | blaze debug schema [TABLE] [--json] \
+                           | blaze debug syscalls [--loop | --thread NAME] [--unit TEXT] [--over MS] [--build N] [--json] \
                            | blaze debug hot [--top N] [--last-build] | blaze debug time [--build N] [--by unit|item|wait] [--top N] \
                            [--match TEXT] [--cores [LINES]] [--html FILE] [--trace FILE] \
                            | blaze debug gate [--build N] [--history DIR] [--json] [--summary FILE] \
-                           | blaze debug locks [--build N] [--top N] [--json]";
+                           | blaze debug locks [--build N] [--top N] [--json] \
+                           | blaze debug edits KIND [--file PATH] [--fn NAME[:LINE]] [--runs N] [--json] [-- BUILD ARGS]";
 const EXPLAIN_USAGE: &str =
     "blaze explain RULE | PACKAGE [--json] | memory [BUILD] [limit=N] [--json] | VIEW [NAME=VALUE ...] [--json]";
 const MEMORY_USAGE: &str = "blaze explain memory [BUILD] [limit=N] [--json]";
@@ -126,10 +131,14 @@ pub fn debug(words: Vec<OsString>, color: bool) -> i32 {
             ))),
         },
         Some("sql") => query(words.collect()),
+        Some("schema") => schema_of(words.collect()),
+        Some("syscalls") => syscalls(words.collect()),
         Some("hot") => hot(words.collect()),
         Some("time") => time(words.collect()),
         Some("gate") => gate(words.collect()),
         Some("locks") => locks(words.collect()),
+        // The edit loop as one command (`edits.rs`), which says its own usage and exit code.
+        Some("edits") => return super::edits::main(words.collect(), color),
         _ => Err(Refusal::Usage(DEBUG_USAGE.to_owned())),
     };
     said(result, color)
@@ -291,21 +300,58 @@ fn rebuilt(words: Vec<OsString>) -> Result<(), Refusal> {
     let Some(rebuilt) = answer else {
         return Err(Refusal::Failed("the daemon answered `blaze why` with no answer".to_owned()));
     };
+    // What blaze itself said was wrong in that build comes first (the `problems` view): a
+    // build whose daemon said its results were not kept, or that a job panicked, computed
+    // again for that, whatever each item's own reason reads as.
+    let problems = problems_of(rebuilt.build);
     if json {
-        println!(
-            "{}",
-            serde_json::to_string(&rebuilt)
-                .map_err(|error| format!("`blaze why`'s answer as JSON: {error}"))?
-        );
+        let mut answer = serde_json::to_value(&rebuilt)
+            .map_err(|error| format!("`blaze why`'s answer as JSON: {error}"))?;
+        if let Value::Object(answer) = &mut answer {
+            let (key, value) = match &problems {
+                Ok(problems) => ("problems", serde_json::to_value(problems)),
+                Err(why) => ("problems_unread", serde_json::to_value(why)),
+            };
+            let value =
+                value.map_err(|error| format!("`blaze why`'s problems as JSON: {error}"))?;
+            answer.insert(key.to_owned(), value);
+        }
+        println!("{answer}");
         return Ok(());
     }
     let mut text = String::new();
+    match (&problems, rebuilt.build) {
+        (Ok(problems), Some(build)) if !problems.is_empty() => {
+            // Writing to a String cannot fail.
+            _ = writeln!(text, "build {build}:");
+            slow::problems_text(problems, build, 10, &mut text);
+        }
+        (Ok(_), _) => {}
+        (Err(why), _) => {
+            _ = writeln!(
+                text,
+                "note: what blaze said was wrong in that build was not read ({why}): `blaze explain problems` reads it"
+            );
+        }
+    }
     match unexplained {
         true => blaze_ui::why::unexplained(&mut text, &rebuilt),
         false => blaze_ui::why::lines(&mut text, &rebuilt),
     }
     print!("{text}");
     Ok(())
+}
+
+/// What blaze said was wrong in `build` (`blaze explain problems build=N`), for `blaze why` to
+/// say first; none for no build. An error says why they were not read: `blaze why` answers
+/// from the daemon's ledger either way, and says the problems were not read.
+fn problems_of(build: Option<u64>) -> Result<Vec<slow::Problem>, String> {
+    let Some(build) = build else { return Ok(Vec::new()) };
+    let (duckdb, dir) = history_paths()?;
+    let source = load::Source { duckdb: &duckdb, history: &dir };
+    slow::load::problems_of(&source, Some(build))
+        .map(|(_, problems)| problems)
+        .map_err(|error| error.to_string())
 }
 
 /// Why the build this process asked for recomputed what it did, as the daemon sums it up once
@@ -650,7 +696,111 @@ fn query(words: Vec<OsString>) -> Result<(), Refusal> {
         }
     }
     let sql = sql.ok_or_else(|| Refusal::Usage(DEBUG_USAGE.to_owned()))?;
+    // `DESCRIBE spans` and `SHOW TABLES` are answered from the schema, with no DuckDB and no
+    // daemon: the tables DuckDB would list are the views of one connection, with no meaning.
+    if let Some(answer) = blaze_profile::describe::statement(&sql) {
+        let (rows, of) = answer.map_err(|error| Refusal::Usage(error.to_string()))?;
+        return described(&rows, of.as_deref(), shape);
+    }
     print(&run(&sql)?, shape)
+}
+
+const SYSCALLS_USAGE: &str =
+    "blaze debug syscalls [--loop | --thread NAME] [--unit TEXT] [--over MS] [--build N] [--json]";
+
+/// `blaze debug syscalls`: what a build's threads blocked in, as the daemon itself recorded
+/// it (the `syscalls` view: the drivers' file calls off the loop, the loop's steps that ran in
+/// line past their bound, and the samples of blocked threads), with no strace: of the daemon's
+/// loop thread with `--loop`, of the threads named like `--thread`, inside the spans of a unit
+/// with `--unit`, of `--over` milliseconds or more (1), of the last build that ended unless
+/// `--build` says.
+fn syscalls(words: Vec<OsString>) -> Result<(), Refusal> {
+    let (args, shape) = syscalls_args(texts(words)?)?;
+    let view = views::find("syscalls").map_err(|error| error.to_string())?;
+    let sql = views::render(view, &args).map_err(|error| error.to_string())?;
+    print(&run(&sql)?, shape)
+}
+
+/// The `syscalls` view's arguments as `blaze debug syscalls`' words give them.
+fn syscalls_args(words: Vec<String>) -> Result<(Map<String, Value>, Shape), Refusal> {
+    let usage = |what: &str| Refusal::Usage(format!("{SYSCALLS_USAGE}: {what}"));
+    let (mut args, mut shape) = (Map::new(), Shape::Table);
+    let mut words = words.into_iter();
+    while let Some(word) = words.next() {
+        let mut value =
+            |what: &str| words.next().ok_or_else(|| usage(&format!("`{word}` takes {what}")));
+        match word.as_str() {
+            "--json" => shape = Shape::Json,
+            "--loop" | "--thread" if args.contains_key("thread") => {
+                return Err(usage("one of `--loop` and `--thread`, once"));
+            }
+            "--loop" => _ = args.insert("thread".to_owned(), Value::from("loop")),
+            "--thread" => {
+                _ = args.insert("thread".to_owned(), Value::from(value("a thread's name")?));
+            }
+            "--unit" => {
+                let unit = value("text the unit's spans hold")?;
+                _ = args.insert("within".to_owned(), Value::from(format!("%{unit}%")));
+            }
+            "--over" => {
+                let ms = value("milliseconds")?
+                    .parse::<f64>()
+                    .ok()
+                    .and_then(serde_json::Number::from_f64)
+                    .ok_or_else(|| usage("`--over` takes milliseconds"))?;
+                _ = args.insert("min_ms".to_owned(), Value::Number(ms));
+            }
+            "--build" => {
+                let build = value("a build id")?
+                    .parse::<u64>()
+                    .map_err(|_| usage("`--build` takes a build id"))?;
+                _ = args.insert("build".to_owned(), Value::from(build));
+            }
+            _ => return Err(usage(&format!("not `{word}`"))),
+        }
+    }
+    Ok((args, shape))
+}
+
+/// `blaze debug schema [TABLE] [--json]`: the tables and views of the profile, each with what
+/// it holds; with a table (or a span view), its columns with their types and meaning. From the
+/// schema this blaze reads and writes (`blaze_profile::schema`), so no column is a guess; no
+/// DuckDB and no daemon is asked.
+fn schema_of(words: Vec<OsString>) -> Result<(), Refusal> {
+    const USAGE: &str = "blaze debug schema [TABLE] [--json]";
+    let (mut shape, mut table) = (Shape::Table, None);
+    for word in texts(words)? {
+        match word.as_str() {
+            "--json" => shape = Shape::Json,
+            flag if flag.starts_with('-') => {
+                return Err(Refusal::Usage(format!("{USAGE}, not `{flag}`")));
+            }
+            _ if table.is_some() => {
+                return Err(Refusal::Usage(format!("{USAGE}: one table, not `{word}` too")));
+            }
+            _ => table = Some(word),
+        }
+    }
+    let rows = match &table {
+        Some(name) => blaze_profile::describe::columns(name)
+            .map_err(|error| Refusal::Usage(error.to_string()))?,
+        None => blaze_profile::describe::listing(),
+    };
+    described(&rows, table.as_deref(), shape)
+}
+
+/// A listing of the schema on stdout: text for a person, JSON lines with `--json`.
+fn described(
+    rows: &[blaze_profile::describe::Row],
+    of: Option<&str>,
+    shape: Shape,
+) -> Result<(), Refusal> {
+    let text = match shape {
+        Shape::Table => blaze_profile::describe::text(rows, of),
+        Shape::Json => blaze_profile::describe::json(rows)
+            .map_err(|error| format!("the schema as JSON: {error}"))?,
+    };
+    stdout(&text)
 }
 
 fn explained(words: Vec<OsString>) -> Result<(), Refusal> {
@@ -673,6 +823,9 @@ fn explained(words: Vec<OsString>) -> Result<(), Refusal> {
     }
     if name == "memory" {
         return memory(words);
+    }
+    if name == "script" {
+        return script::explain(words);
     }
     if !views::VIEWS.iter().any(|it| it.name == name)
         && let Some(report) = failure_of(&name)?
@@ -838,6 +991,15 @@ fn argument(view: &views::View, key: &str, value: &str) -> Result<Value, Refusal
             .ok_or_else(wrong)?,
         views::ArgType::Text => Value::from(value),
     })
+}
+
+/// `sql`'s rows over the flushed history as JSON lines ([`json`]), for the CLI's commands that
+/// read the profile themselves (`edits.rs`); the error is the reader's, as text.
+pub(super) fn rows_json(sql: &str) -> Result<String, String> {
+    let batches = run(sql).map_err(|refusal| match refusal {
+        Refusal::Usage(what) | Refusal::Failed(what) => what,
+    })?;
+    json(&batches)
 }
 
 /// `sql` over the history in the daemon's state directory, by the DuckDB `duckdb.rs`
@@ -1082,6 +1244,30 @@ mod tests {
         assert_eq!(lines[0], r#"{"name":"parse","count":3,"share":0.5,"note":"a \"quoted\" one"}"#);
         assert_eq!(lines[1], r#"{"name":null,"count":10,"share":1.0,"note":""}"#);
         assert_eq!(lines.len(), 3);
+    }
+
+    /// `blaze debug syscalls`' words are the `syscalls` view's arguments, and the view binds
+    /// them: the loop thread, a unit's spans, a bound and a build.
+    #[test]
+    fn debug_syscalls_words_bind_the_syscalls_view() {
+        let words = |it: &[&str]| it.iter().map(|it| (*it).to_owned()).collect::<Vec<_>>();
+        let (args, shape) = syscalls_args(words(&[
+            "--loop", "--unit", "serde", "--over", "20", "--build", "7", "--json",
+        ]))
+        .ok()
+        .unwrap();
+        assert!(shape == Shape::Json);
+        assert_eq!(args.get("thread"), Some(&Value::from("loop")));
+        assert_eq!(args.get("within"), Some(&Value::from("%serde%")));
+        assert_eq!(args.get("build"), Some(&Value::from(7u64)));
+        let sql = views::render(views::find("syscalls").unwrap(), &args).unwrap();
+        assert!(sql.contains("LIKE 'loop'") && sql.contains("'loop' = 'loop'"), "{sql}");
+        assert!(sql.contains("LIKE '%serde%'") && sql.contains(">= 2e1 * 1e6"), "{sql}");
+        let (none, _) = syscalls_args(Vec::new()).ok().unwrap();
+        assert!(none.is_empty(), "every thread of the last build, 1 ms or more");
+        for bad in [&["--loop", "--thread", "x"][..], &["--over", "soon"], &["--thread"], &["--nope"]] {
+            assert!(matches!(syscalls_args(words(bad)), Err(Refusal::Usage(_))), "{bad:?}");
+        }
     }
 
     #[test]

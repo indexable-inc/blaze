@@ -53,6 +53,7 @@ impl<'db> Features<'db> {
         same_bounds
             && a.generic_const_exprs == b.generic_const_exprs
             && a.gca_const_items == b.gca_const_items
+            && a.blaze_const_exprs == b.blaze_const_exprs
             && a.coroutine_clone == b.coroutine_clone
             && a.sized_hierarchy == b.sized_hierarchy
     }
@@ -66,7 +67,11 @@ impl<'db> inherent::Features<DbInterner<'db>> for Features<'db> {
 
     #[inline]
     fn gca_const_items(self) -> bool {
-        self.unstable.gca_const_items
+        // What the solver does under it is one thing: a constant too generic to evaluate
+        // normalizes to itself, rigid, where it is otherwise ambiguous for ever. blaze's generic
+        // const expressions (`#![feature(blaze_const_exprs)]`) need exactly that: `{ N + M }` in
+        // a generic signature is a rigid constant until its arguments are concrete.
+        self.unstable.gca_const_items || self.unstable.blaze_const_exprs
     }
 
     #[inline]

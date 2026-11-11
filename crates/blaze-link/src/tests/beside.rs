@@ -119,6 +119,14 @@ fn inside(disk: &Disk, to: &str) -> Resolved {
     resolved(|name| elf.section_by_name(name).map_or(&[][..], |it| it.data().unwrap()))
 }
 
+/// What a side file's own debug sections resolve, with none of [`beside`]'s checks that it is
+/// the executable's.
+fn side_resolves(side: &[u8]) -> Resolved {
+    let read = side_file(side);
+    let elf = read.elf();
+    resolved(|name| elf.section_by_name(name).map_or(&[][..], |it| it.data().unwrap()))
+}
+
 /// What a side file resolves, after checking it is the executable's at `to`: its build id
 /// note is the image's, and its CRC-32 is the one the executable's `.gnu_debuglink` names
 /// under the side file's name.
@@ -227,6 +235,32 @@ fn an_image_and_its_side_file_resolve_as_debug_info_inside() {
     let whole = image.debug_file_whole().unwrap().unwrap();
     assert_eq!(whole.base, None);
     assert_eq!(beside(&image, &disk, TO, &whole.apply(Format::Elf, None).unwrap()), inside(&with_disk, TO));
+}
+
+/// The planted bug: a body edit whose side file update is never applied, so the side file is
+/// the first link's. The refinement's comparison, the rows the side file resolves against the
+/// program linked with its debug info inside, finds the edited function's rows, and only them.
+#[test]
+fn the_oracle_catches_a_side_file_left_behind_an_edit() {
+    let (functions, spans) = program(12);
+    let (mut with, mut with_disk) = linked(Debug::Lines, TO, first(&functions, &spans));
+    let (mut image, mut disk) = linked(Debug::Beside, TO, first(&functions, &spans));
+    let side = image.debug_file().unwrap().unwrap().apply(Format::Elf, None).unwrap();
+    assert_eq!(side_resolves(&side), inside(&with_disk, TO), "the first link's side file is right");
+    let edited = CompiledFunction { key: wide_key(100), ..lined(5, 9) };
+    let edit = || Change {
+        added: vec![&edited],
+        removed: vec![wide_key(5)],
+        debug_names: vec![(wide_key(100), "f5".into())],
+        ..Change::default()
+    };
+    with_disk.link(&mut with, edit()).unwrap();
+    disk.link(&mut image, edit()).unwrap();
+    let want = inside(&with_disk, TO);
+    let stale = side_resolves(&side);
+    assert_ne!(stale, want, "the oracle missed a side file left behind an edit");
+    let wrong: Vec<_> = want.symmetric_difference(&stale).filter(|it| it.0 != "f5").collect();
+    assert!(wrong.is_empty(), "rows of functions the edit did not touch differ: {wrong:?}");
 }
 
 /// Counter: the executable of a program with its debug info beside it has no section that

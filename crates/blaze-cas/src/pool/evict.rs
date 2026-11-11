@@ -239,6 +239,28 @@ impl Sweep {
         }
     }
 
+    /// Room for a load of `bytes` made within `budget` resident bytes, of which `held` are
+    /// resident now: what a load does before it claims its pages. Nothing when the load
+    /// fits; else the sweep gives back what the load would pass the budget by, and `slack`
+    /// more, so the loads after it find room without a sweep each.
+    ///
+    /// The bound it keeps: after it, and the load, the pool's resident bytes are within the
+    /// budget, or, when the sweep stopped short, are what is pinned (and each hot tail, and
+    /// what is loading) plus the load. So resident bytes never pass the budget plus what
+    /// readers pin, and readers pin at most their bound.
+    pub(crate) fn make_room<G: Give>(
+        &mut self,
+        pool: &Pool<G>,
+        windows: &Windows,
+        held: u64,
+        budget: u64,
+        bytes: u64,
+        slack: u64,
+    ) -> Option<Swept> {
+        let over = held.saturating_add(bytes).saturating_sub(budget);
+        (over > 0).then(|| self.evict(pool, windows, over.saturating_add(slack)))
+    }
+
     /// At least `bytes` given back, if the sweep can find them within twice the open pages'
     /// visits: the pool's `evict(bytes) -> freed`.
     pub(crate) fn evict<G: Give>(&mut self, pool: &Pool<G>, windows: &Windows, bytes: u64) -> Swept {

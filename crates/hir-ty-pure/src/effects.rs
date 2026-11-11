@@ -2,8 +2,9 @@
 //! an instance may do ([`Rule`]), as the bitset ([`EffectSet`]) each instance's summary carries
 //! with a witness per kind; the attribute effects that refuse some kinds ([`EffectDef`]:
 //! `#[blaze::pure]` here; beside it `nopanic`, `noalloc`, `nonblocking` and `terminates`, which
-//! `#[blaze::may(..)]` asks for by the words it leaves out, [`crate::may`]); and the
-//! toolchain's entry points a call of which counts as kinds at the call ([`MODELS`]).
+//! `#[blaze::may(..)]` asks for by the words it leaves out, [`crate::may`]; and the crate-wide
+//! `ambient`, `unsafe` and `global_alloc` of `#![blaze::capabilities]`); and the toolchain's
+//! entry points a call of which counts as kinds at the call ([`MODELS`]).
 //!
 //! One walk answers every effect: checking one reads the root's summary, never walks again. A
 //! new effect is an [`EffectDef`] in [`EFFECTS`] over the kinds the walk already records, with
@@ -58,6 +59,8 @@ pub enum Rule {
     ForeignUnwind,
     /// A call only an instance decides (a generic check only).
     Open,
+    /// `unsafe` code: an `unsafe` block written in the body, or the body of an `unsafe fn`.
+    Unsafe,
     /// A loop not known to end: blocks of the body that reach themselves again, with no
     /// bounding block (`crate::loops`).
     Loop,
@@ -67,10 +70,27 @@ pub enum Rule {
     /// `dyn`: what it reaches was walked where the pointer or vtable was made, but it may
     /// reach the caller again, a recursion no cycle of instances shows.
     Indirect,
+    /// The abort of an `unsafe` precondition check of the toolchain (the `precondition_check`
+    /// of `core::ub_checks::assert_unsafe_precondition!`), not answered for yet. It goes up
+    /// through the toolchain's `unsafe fn`s to the first safe function of the toolchain, whose
+    /// contract is that it upholds the precondition (dropped there: the toolchain is trusted
+    /// for `unsafe`), or to code outside the toolchain that calls the `unsafe fn`, which has to
+    /// uphold it itself: there it is a [`Rule::Panic`] (`walk::Fold::callee`). Kept only in
+    /// the sets of an effect that refuses a panic, never a kind of [`crate::walk::Summary`]'s
+    /// `kinds`, and never refused itself.
+    Precondition,
+    /// A call through a `dyn` of a method no `#[blaze::may(..)]` or trust says the effects of
+    /// (or through a `dyn Fn`), or the drop of a value that owns a `dyn`: its target is
+    /// whatever object the function is handed. It matters only to a check whose root takes
+    /// such a `dyn` (`crate::function`): every other object is made in the root's own graph,
+    /// where its vtable's methods were walked. Kept in every effect's set, never refused by an
+    /// effect itself, and it crosses a callee trusted for the effect, which answers for its
+    /// own code and not for the object it is given.
+    Dyn,
 }
 
 impl Rule {
-    pub const ALL: [Rule; 20] = [
+    pub const ALL: [Rule; 23] = [
         Rule::Io,
         Rule::Env,
         Rule::Clock,
@@ -88,9 +108,12 @@ impl Rule {
         Rule::ForeignUnknown,
         Rule::ForeignUnwind,
         Rule::Open,
+        Rule::Unsafe,
         Rule::Loop,
         Rule::Recursion,
         Rule::Indirect,
+        Rule::Precondition,
+        Rule::Dyn,
     ];
 
     /// What an instance with this kind does: "reads the environment".
@@ -113,9 +136,12 @@ impl Rule {
             Rule::ForeignUnknown => "calls a foreign function no table knows",
             Rule::ForeignUnwind => "calls a foreign function that may unwind",
             Rule::Open => "makes a call only an instance decides",
+            Rule::Unsafe => "runs `unsafe` code",
             Rule::Loop => "has a loop not known to end",
             Rule::Recursion => "may call itself again",
             Rule::Indirect => "makes a call that may reach it again",
+            Rule::Precondition => "has an `unsafe` precondition its caller upholds",
+            Rule::Dyn => "calls through a `dyn` it is given",
         }
     }
 
@@ -139,9 +165,12 @@ impl Rule {
             Rule::ForeignUnknown => "foreign_unknown",
             Rule::ForeignUnwind => "foreign_unwind",
             Rule::Open => "open",
+            Rule::Unsafe => "unsafe",
             Rule::Loop => "loop",
             Rule::Recursion => "recursion",
             Rule::Indirect => "indirect",
+            Rule::Precondition => "precondition",
+            Rule::Dyn => "dyn",
         }
     }
 }
@@ -214,6 +243,12 @@ pub struct EffectDef {
     /// Whether what a callee that never returns (its type's output is `!`) does counts. Not for
     /// purity: such a call gives no result to keep, so what it does can't make one differ.
     pub through_never: bool,
+    /// An effect of `#![blaze::capabilities]` (`effect_attrs::AMBIENT`, `UNSAFE`,
+    /// `GLOBAL_ALLOC`): asked of every function of a crate with the attribute, not of a marked
+    /// one; no attribute trusts a function for it, a crate's trust does
+    /// (`effect_attrs::crate_trust`); and a check does not refuse the root's parameters, as a
+    /// `dyn` or a function pointer it takes is walked where it is made.
+    pub crate_wide: bool,
 }
 
 /// What `#[blaze::pure]` refuses: everything that makes a result depend on more than the
@@ -239,17 +274,22 @@ pub const PURE: EffectDef = EffectDef {
     says: Rule::said,
     fix: "a pure function reads the outside world only through its arguments",
     through_never: false,
+    crate_wide: false,
 };
 
 /// Every attribute effect, in the order each summary keeps their sets. The effects lane appends
-/// `&NOPANIC, &NOALLOC, &NONBLOCKING, &TERMINATES` (defined in `effect_attrs`). A summary's
-/// inline room (`walk::Sets`) is this many.
+/// `&NOPANIC, &NOALLOC, &NONBLOCKING, &TERMINATES` (defined in `effect_attrs`), then the
+/// crate-wide effects of `#![blaze::capabilities]`. A summary's inline room (`walk::Sets`) is
+/// this many.
 pub const EFFECTS: &[&EffectDef] = &[
     &PURE,
     &crate::effect_attrs::NOPANIC,
     &crate::effect_attrs::NOALLOC,
     &crate::effect_attrs::NONBLOCKING,
     &crate::effect_attrs::TERMINATES,
+    &crate::effect_attrs::AMBIENT,
+    &crate::effect_attrs::UNSAFE,
+    &crate::effect_attrs::GLOBAL_ALLOC,
 ];
 
 /// The index of `effect` in [`EFFECTS`], by name: a copy with fewer `refuses` (a profile's
@@ -317,6 +357,28 @@ pub(crate) fn bound_mask(db: &Db, method: FunctionId) -> u32 {
         .enumerate()
         .filter(|(_, effect)| effect.word.is_some_and(|word| !may.has(word)))
         .fold(0, |mask, (index, _)| mask | 1 << index)
+}
+
+/// Whether `func` is the check of an `unsafe` precondition in the pinned library: the
+/// `precondition_check` that `core::ub_checks::assert_unsafe_precondition!` declares inside the
+/// function whose precondition it is, `#[rustc_no_mir_inline]` and `#[rustc_nounwind]`, which
+/// aborts through `panic_nounwind_fmt` when the caller of that function broke its contract.
+/// Only a function of the toolchain written inside a body with both attributes is one: a
+/// function of that name anywhere else is not.
+pub(crate) fn precondition_check(db: &Db, func: FunctionId) -> bool {
+    use hir_def::HasModule as _;
+    if !matches!(func.krate(db).data(db).origin, CrateOrigin::Lang(_)) {
+        return false;
+    }
+    let ItemContainerId::ModuleId(module) = func.lookup(db).container else { return false };
+    if !module.is_block_module(db) {
+        return false;
+    }
+    let flags = AttrFlags::query(db, AttrDefId::FunctionId(func));
+    flags.contains(AttrFlags::RUSTC_NO_MIR_INLINE)
+        && flags.contains(AttrFlags::RUSTC_NOUNWIND)
+        && hir_def::signatures::FunctionSignature::of(db, func).name.as_str()
+            == "precondition_check"
 }
 
 /// Whether a body of `krate` is the code a person writes: a crate of the workspace. The address
@@ -998,5 +1060,9 @@ pub(crate) fn leaf_kinds(leaf: crate::models::Leaf) -> (EffectSet, &'static str)
         Leaf::Panic => (EffectSet::one(Rule::Panic), "panics"),
         Leaf::Alloc => (EffectSet::one(Rule::Alloc), "allocates or frees memory"),
         Leaf::ErrorText => (EffectSet::of(&[Rule::Alloc, Rule::Panic]), "gives an error's text"),
+        // What `#[blaze::pure]` refuses of them is unchanged: only a build script's run is
+        // given a provider.
+        Leaf::Seeded => (EffectSet::one(Rule::Random), "uses randomness"),
+        Leaf::Wall => (EffectSet::one(Rule::Clock), "reads the clock"),
     }
 }

@@ -1,7 +1,7 @@
 //! Library files' parses kept across a daemon restart (docs/v2/plan/design/store.md):
 //! the trees of every library file's outline, with the bodies parsed so far, stored in a
-//! section of the daemon's image by the text's content ID, its edition and the parse's kind,
-//! and read back in place: on restart a dependency file's parse is a lookup and a few checks,
+//! section of the daemon's image by the text's content ID, its edition, the parse's kind and
+//! the syntax extensions it was made under, and read back in place: on restart a dependency file's parse is a lookup and a few checks,
 //! not a lex and a parse.
 //!
 //! The section, little-endian, every offset from its start (a multiple of 8 in the image):
@@ -9,12 +9,13 @@
 //!   entries, the index's offset (`u64`), 0 (`u64`);
 //! - the parses, each a record of `syntax::image` from a multiple of 8;
 //! - the index: an [`ENTRY`]-byte row a parse, sorted by key: the text's content ID (32
-//!   bytes), the edition, 1 for an outline, two bytes of 0, the record's length (`u32`) and
-//!   offset (`u64`).
+//!   bytes), the edition, 1 for an outline, the syntax extensions' bits
+//!   ([`Extensions::bits`]), a byte of 0, the record's length (`u32`) and offset (`u64`).
 //!
 //! What a stored parse depends on is its key and the versions in the head and the schema
-//! ([`SCHEMA`]): the text (its content ID), the edition, the kind of parse, the lexer's,
-//! parser's and grammar's version and the tree's layout. A section of another version is
+//! ([`SCHEMA`]): the text (its content ID), the edition, the kind of parse, the crate's syntax
+//! extensions (a file of a crate with `#![blaze::uniq]` is another tree of the same text), the
+//! lexer's, parser's and grammar's version and the tree's layout. A section of another version is
 //! refused whole at [`Trees::open`]; an entry that is not its parse is an error naming the
 //! file, never a silent parse ([`Trees::map`]). A text with no entry is parsed as any other
 //! and stored with the next image ([`write_section`]).
@@ -24,7 +25,7 @@ use std::sync::{Arc, OnceLock};
 use blaze_bytes::Bytes;
 use blaze_format::{Part, SchemaHash, schema_of};
 use blaze_ids::ContentId;
-use span::Edition;
+use span::{Edition, Extensions};
 use syntax::{IMAGE_LAYOUT, Parse, SourceFile, Text, image::TREE_VERSION};
 
 use crate::Db;
@@ -32,8 +33,8 @@ use crate::Db;
 /// The section's schema: its layout here, the parse record's and the tree record's versions.
 pub const SCHEMA: SchemaHash = schema_of(&[
     Part::Str(
-        "blaze v2 base-db library trees 1: head [u32; 4] u64 u64; parse records; index rows \
-         [u8; 32] u8 u8 [u8; 2] u32 u64",
+        "blaze v2 base-db library trees 2: head [u32; 4] u64 u64; parse records; index rows \
+         [u8; 32] u8 u8 u8 u8 u32 u64",
     ),
     Part::U64(TREE_VERSION as u64),
     Part::U64(IMAGE_LAYOUT as u64),
@@ -72,11 +73,14 @@ struct Key {
     text: [u8; 32],
     edition: u8,
     outline: u8,
+    /// The syntax extensions the parse was made under ([`Extensions::bits`]).
+    extensions: u8,
 }
 
 impl Key {
-    fn new(text: ContentId, edition: Edition, outline: bool) -> Key {
-        Key { text: text.0, edition: edition as u8, outline: u8::from(outline) }
+    fn new(text: ContentId, edition: Edition, outline: bool, extensions: Extensions) -> Key {
+        let (edition, outline) = (edition as u8, u8::from(outline));
+        Key { text: text.0, edition, outline, extensions: extensions.bits() }
     }
 }
 
@@ -149,6 +153,10 @@ impl Trees {
         if !sorted {
             return Err(wrong("an index out of order"));
         }
+        let known = |n| Extensions::from_bits(trees.key(n).extensions).is_some();
+        if !(0..entries).all(known) {
+            return Err(wrong("an entry under syntax extensions this blaze has none of"));
+        }
         Ok(trees)
     }
 
@@ -181,7 +189,7 @@ impl Trees {
     fn key(&self, n: usize) -> Key {
         let row = self.row(n);
         let text = row[..32].try_into().expect("32 bytes");
-        Key { text, edition: row[32], outline: row[33] }
+        Key { text, edition: row[32], outline: row[33], extensions: row[34] }
     }
 
     /// Where entry `n`'s record is: its offset and length.
@@ -205,27 +213,35 @@ impl Trees {
         None
     }
 
-    /// Whether a parse of the text of content ID `text` in `edition` and of the kind is
-    /// stored.
-    pub fn has(&self, text: ContentId, edition: Edition, outline: bool) -> bool {
-        self.find(Key::new(text, edition, outline)).is_some()
+    /// Whether a parse of the text of content ID `text` in `edition`, of the kind and under
+    /// `extensions` is stored.
+    pub fn has(
+        &self,
+        text: ContentId,
+        edition: Edition,
+        outline: bool,
+        extensions: Extensions,
+    ) -> bool {
+        self.find(Key::new(text, edition, outline, extensions)).is_some()
     }
 
-    /// The stored parse of `text` (of content ID `id`) in `edition` and of the kind, its tree
-    /// read in place; `None` when none is stored. An entry that is not that parse is an error,
-    /// recorded ([`Trees::failed`]).
+    /// The stored parse of `text` (of content ID `id`) in `edition`, of the kind and under
+    /// `extensions`, its tree read in place; `None` when none is stored. An entry that is not
+    /// that parse is an error, recorded ([`Trees::failed`]).
     pub(crate) fn map(
         &self,
         id: ContentId,
         text: &Text,
         edition: Edition,
         outline: bool,
+        extensions: Extensions,
     ) -> Result<Option<Parse<SourceFile>>, TreeError> {
-        let Some(n) = self.find(Key::new(id, edition, outline)) else { return Ok(None) };
+        let key = Key::new(id, edition, outline, extensions);
+        let Some(n) = self.find(key) else { return Ok(None) };
         let (at, len) = self.record(n);
         let inside = at.checked_add(len).is_some_and(|end| end <= self.index) && at >= HEAD;
         let read = match inside {
-            true => syntax::image::read(&self.bytes, at, text, edition, outline)
+            true => syntax::image::read(&self.bytes, at, text, edition, outline, extensions)
                 // alloc: the error's message, once per stored tree refused
                 .map_err(|it| it.to_string()),
             // alloc: as above
@@ -234,7 +250,7 @@ impl Trees {
         read.map(Some).map_err(|error| {
             // alloc: as above
             let error = TreeError(format!(
-                "the stored tree of the text {id:x} ({edition:?}, {}): {error}",
+                "the stored tree of the text {id:x} ({edition:?}, {}, {extensions:?}): {error}",
                 if outline { "outline" } else { "full parse" },
             ));
             let _ = self.failed.set(error.0.clone()); // clone: the error path, once
@@ -260,8 +276,8 @@ pub fn write_section(db: &Db, out: &mut Vec<u8>) {
     for input in db.files().texts() {
         let reparse = input.reparse_field(db);
         texts.push(reparse.id().0);
-        for (edition, parse) in reparse.kept_outlines() {
-            let key = Key::new(reparse.id(), edition, true);
+        for (edition, extensions, parse) in reparse.kept_outlines() {
+            let key = Key::new(reparse.id(), edition, true, extensions);
             if written.insert(key) {
                 let record = syntax::image::write(&parse, out);
                 rows.push((key, (record.start - base) as u64, to_u32(record.len())));
@@ -296,7 +312,7 @@ fn finish(out: &mut Vec<u8>, base: usize, rows: &[(Key, u64, u32)]) {
     let index = out.len() - base;
     for (key, at, len) in rows {
         out.extend_from_slice(&key.text);
-        out.extend_from_slice(&[key.edition, key.outline, 0, 0]);
+        out.extend_from_slice(&[key.edition, key.outline, key.extensions, 0]);
         out.extend_from_slice(&len.to_le_bytes());
         out.extend_from_slice(&at.to_le_bytes());
     }

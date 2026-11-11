@@ -109,11 +109,17 @@ fn incremental(
     if deps_changed {
         checked.push(state.root);
     }
-    // A written file no module is defined in may be one an `include!` read (`include_readers`).
+    // A written file no module is defined in may be one a macro like `include!` read, and a
+    // written file may be one an `include!` parsed (`include_readers`).
     let unknown = |file: &FileId| !state.files.contains_key(file);
-    if written.set.iter().any(unknown) || !written.included.is_empty() {
+    let (bytes, unnamed) = (!written.included.is_empty(), written.set.iter().any(unknown));
+    if bytes || unnamed {
         checked.extend(
-            state.groups.iter().filter(|(_, g)| g.out.uses_include).map(|(&group, _)| group),
+            state
+                .groups
+                .iter()
+                .filter(|(_, g)| (bytes && g.out.uses_include) || (unnamed && g.out.reads_unnamed_file))
+                .map(|(&group, _)| group),
         );
     }
     for file in written.set {
@@ -311,16 +317,23 @@ fn expansion_readers(state: &CrateState, written: &Written<'_>, delta: &mut Delt
     }
 }
 
-/// A written file that defines no module of the crate may be one an `include!` read, and an
-/// `include_str!` or `include_bytes!` file whose bytes changed (`Written::included`) is one
-/// such a call read: every group that expanded one is a seed, with a possible removal.
+/// A file read by its bytes that changed (`Written::included`) is one an `include!`, an
+/// `include_str!` or an `include_bytes!` read: every group that expanded one is a seed, with
+/// a possible removal. A written file that defines no module of the crate may be one an
+/// `include_str!` or `include_bytes!` read, whose file a group does not keep: every group that
+/// expanded one of those is a seed too. The file an `include!` parsed is kept with the
+/// group's expansion files, so a group that expanded only `include!`s is a seed when that
+/// file is written ([`expansion_readers`]) and for no other file: an edit of another crate's
+/// source is not a write of a file this crate's `include!` read.
 fn include_readers(state: &CrateState, written: &Written<'_>, delta: &mut Delta) {
     let unknown = |file: &FileId| !state.files.contains_key(file);
-    if !written.set.iter().any(unknown) && written.included.is_empty() {
+    let (bytes, unnamed) = (!written.included.is_empty(), written.set.iter().any(unknown));
+    if !bytes && !unnamed {
         return;
     }
     for (&group, g) in &state.groups {
-        if g.out.uses_include && !delta.seeds.contains(&group) {
+        let reads = (bytes && g.out.uses_include) || (unnamed && g.out.reads_unnamed_file);
+        if reads && !delta.seeds.contains(&group) {
             delta.seeds.push(group);
             delta.removing.push(group);
         }

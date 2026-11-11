@@ -685,12 +685,14 @@ fn lower_writes<T: blaze_query::Tree>(
             None => {
                 // The workspace's `const-eval` budget is for its own crates: the standard
                 // library's are evaluated under blaze's, the same in every workspace.
-                let const_eval = if unit.is_std {
-                    ConstEvalBudget::default()
+                // So is its trusted list: the toolchain's trust is blaze's.
+                let (const_eval, trusted) = if unit.is_std {
+                    (ConstEvalBudget::default(), Box::default())
                 } else {
-                    workspace_root.const_eval
+                    // clone: once per triple, the workspace's trusted crates
+                    (workspace_root.const_eval, workspace_root.trusted.clone())
                 };
-                let made = crates::workspace_data(triple, &toolchain, const_eval)?;
+                let made = crates::workspace_data(triple, &toolchain, const_eval, trusted)?;
                 workspaces.insert((triple, unit.is_std), made.clone());
                 made
             }
@@ -1444,11 +1446,19 @@ impl Lowered {
             loaded.push(files::Loaded { path: format!("{out_dir}/{path}"), id, bytes });
         }
 
-        self.identities.clear();
-        self.narrowed.clear();
         let db = &mut self.db;
         let change = set_files(db, out_dir, &[], lowering.set, crates.sets, &loaded)?;
         note(&mut self.paths, db, lowering.set, &change);
+        // Whether the run changed anything the front end reads: a file of its `OUT_DIR`, or
+        // below a dependent's cfg or env. A run applied again with what it gave before (a
+        // script blaze ran again whose outputs are byte for byte the last run's) writes
+        // nothing, so the identities made of the database stay: until 2026-11-10 every
+        // applied run dropped them, and each unit's was made again in every build.
+        let mut changed = !(change.set.is_empty()
+            && change.added.is_empty()
+            && change.removed.is_empty()
+            && change.no_text.is_empty()
+            && change.roots.is_empty());
         let class = lowering.class;
         // Each crate once: units of one crate depend on runs of the same classes.
         let mut written: Vec<Crate> = Vec::with_capacity(lowering.dependents.len()); // alloc: once per apply, a handful
@@ -1474,10 +1484,16 @@ impl Lowered {
             }
             if *krate.cfg_options(&*db) != cfg {
                 krate.set_cfg_options(db, cfg);
+                changed = true;
             }
             if *krate.env(&*db) != env {
                 krate.set_env(db, env);
+                changed = true;
             }
+        }
+        if changed {
+            self.identities.clear();
+            self.narrowed.clear();
         }
         Ok(())
     }

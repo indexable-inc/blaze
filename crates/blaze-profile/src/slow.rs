@@ -38,7 +38,7 @@ use crate::time::{
     report,
 };
 
-pub use render::{text, thread_line};
+pub use render::{problems_text, text, thread_line};
 
 /// The version of the report's JSON: bumped when a field changes meaning or goes away. 2: an
 /// unnamed wait's `hidden_ns` is the wall its waits cover, not their parked time summed, and
@@ -51,8 +51,31 @@ pub use render::{text, thread_line};
 /// park whose wait span was under the floor is classed `<kind> wait under the read floor`, not an
 /// unnamed wait; the workers' CPU counts every span, read or not.
 /// 6: `build.panics`, the build's panics and its daemon's fatal signal, each with its stack's
-/// top frames.
-pub const VERSION: u32 = 6;
+/// top frames. 7: a build whose checkout's last build lost what it left for the store has the
+/// finding `not_kept` (fix `keep_results`), ranked first. 8: `problems`, what blaze itself said
+/// was wrong during the build (the `problems` view's rows), listed before the findings. 9: `gaps`,
+/// each stretch of the critical path of [`GAP_NS`] or more under no span, with its thread, the
+/// spans before and after it, and the stacks sampled in it; and the finding `unfinished` (fix
+/// `compare_after`) of a build that did the work its checkout's last, failed build left.
+pub const VERSION: u32 = 9;
+
+/// The least stretch of the critical path under no span that is listed as a gap
+/// ([`Report::gaps`]): 20 ms, the bound the daemon's loop holds one step of a turn to
+/// (`loop stalled`) and the budgets harness holds an edit's unnamed time to (`gap_ms`).
+pub const GAP_NS: i64 = 20_000_000;
+/// The most gaps a report lists, the longest.
+pub const GAPS: usize = 16;
+
+/// The `step` of the misses row a build takes when its checkout's last build answered and
+/// then lost what it left for the store (blaze-cargo's `Jobs::lose`): the daemon lowers this
+/// build's front end anew, so nearly everything else the report finds follows from it.
+pub const NOT_KEPT_STEP: &str = "results kept after the answer";
+
+/// The `step` of the misses row a build takes when its checkout's last build did not end well
+/// (failed or was cancelled) and left work this build does first (blaze-cargo's
+/// `serve::why::UNFINISHED`): the build is finishing a failed one, not slow. On 2026-11-10 the
+/// "no-op" builds after a failed cold build took 56 s, 10 s and 22 s with nothing saying so.
+pub const UNFINISHED_STEP: &str = "work the last build left unfinished";
 
 /// The build the report is of, as its `builds` row says.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -130,10 +153,68 @@ pub struct DiedSpan {
     pub for_ns: i64,
 }
 
+/// One thing blaze itself said was wrong in the build, once however often it said it: a row of
+/// the `problems` view (`sql/examples.sql`): a WARN or ERROR event by callsite (every line the
+/// daemon writes to its log is one), a panic, a fatal signal, a `blaze-bug`, or the build's own
+/// failure. `blaze slow`, `blaze why` and `blaze explain problems` list them first: on
+/// 2026-11-10 the daemon wrote that a build's results were not kept after every build for hours,
+/// to a log no command read.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct Problem {
+    /// FATAL, PANIC, BUG, BUILD, ERROR or WARN.
+    pub level: String,
+    /// Where it was said: an event's target and callsite, a panic's location, an error's kind.
+    pub source: String,
+    /// The last thing said there, with its fields.
+    pub what: String,
+    /// How often it was said in the build.
+    pub count: u64,
+    /// When it was first and last said, from the build's start; past the build's end for what
+    /// was said after its answer was sent.
+    pub first_ns: i64,
+    pub last_ns: i64,
+}
+
+/// A stretch of the critical path under no span: where the build's time went and nothing
+/// says what it was. On 2026-11-10 an edit's build had 650 ms between its lowering and its
+/// first unit's task, and a 3 s `FICLONE` on the loop thread inside a wait, each found only by
+/// reading spans by hand or with strace; "the record lost 0.65 s" did not say where.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct Gap {
+    /// When it began, from the build's start, and how long it was.
+    pub from_ns: i64,
+    pub dur_ns: i64,
+    /// `no_span`: its lane ran, inside no span. Else what the record lacks, as
+    /// `job_intervals.unrecorded` says: `between_spans` (a thread with no job, between two of
+    /// its spans: running or blocked, the record can't tell), `cut` or `no_end`.
+    pub kind: String,
+    /// The lane it is on: `job 3.17` or `thread 7`.
+    pub lane: String,
+    /// The process and thread it was on, and the thread's name; none where the record does not
+    /// say which thread the lane was on then.
+    pub process: u32,
+    pub thread: Option<u32>,
+    pub thread_name: Option<String>,
+    /// The span of its lane that closed last before it, and the one that opened first after
+    /// it, each as its name and what it was of: what ran between them is the gap.
+    pub before: Option<String>,
+    pub after: Option<String>,
+    /// When it began and ended on the history's clock: what a query over `samples` or
+    /// `switches` filters by.
+    pub start_ns: i64,
+    pub end_ns: i64,
+    /// The stacks sampled on its thread in it, the commonest first ([`STACKS`] of each side);
+    /// empty when no sample fell in it.
+    #[serde(skip_serializing_if = "Stacks::is_empty")]
+    pub stacks: Stacks,
+}
+
 /// What the report reads beside the time model.
 #[derive(Clone, Debug, Default)]
 pub struct Facts {
     pub build: BuildFacts,
+    /// What blaze said was wrong in the build, worst first ([`Problem`]).
+    pub problems: Vec<Problem>,
     /// The threads' names.
     pub threads: Vec<ThreadName>,
     /// The spans in the build's window by name and query kind.
@@ -280,9 +361,16 @@ pub struct Memory {
 pub struct Report {
     pub version: u32,
     pub build: BuildFacts,
+    /// What blaze itself said was wrong in the build, worst first, each once with its count: read
+    /// these before the findings, which are often their cost.
+    pub problems: Vec<Problem>,
     pub summary: Summary,
     /// Ranked: most wall time saved first; those whose saving can't be estimated last.
+    /// A `not_kept` finding is before them all.
     pub findings: Vec<Finding>,
+    /// Each stretch of the critical path of [`GAP_NS`] or more under no span, longest first, at
+    /// most [`GAPS`]: where the unnamed time is, not only how much.
+    pub gaps: Vec<Gap>,
     /// What the profile could not see, most time hidden first.
     pub blind_spots: Vec<BlindSpot>,
 }
@@ -376,6 +464,12 @@ pub struct SpanStack {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
+    /// What the checkout's last build left for the store was not kept ([`NOT_KEPT_STEP`]):
+    /// ranked first, as the cause of most of what the build computed again.
+    NotKept,
+    /// The checkout's last build did not end well, and this one does the work it left
+    /// ([`UNFINISHED_STEP`]): ranked with `not_kept`, before what the profile was read for.
+    Unfinished,
     /// Work on the critical path that ran serially while workers were idle.
     Serial,
     /// Work on the critical path that was on a core but got little CPU.
@@ -413,6 +507,8 @@ pub enum Fix {
     KeepAcrossBuilds,
     ExplainMiss,
     ReadOnce,
+    KeepResults,
+    CompareAfter,
 }
 
 impl Fix {
@@ -442,6 +538,12 @@ impl Fix {
             }
             Fix::ExplainMiss => {
                 "find why each was computed again (`blaze why`) and key it so it is reused"
+            }
+            Fix::KeepResults => {
+                "fix what refused the last build's results (the reason above; the daemon's log has the same line, `were not kept after its answer was sent`): until then every build of this checkout computes again what the last one left, and the findings below are mostly its cost"
+            }
+            Fix::CompareAfter => {
+                "nothing in blaze: this build's time is the last build's unfinished work, not an edit's or a no-op's; measure from the next build that follows one that ended well"
             }
             Fix::ReadOnce => {
                 "read each row once a run: hoist reads out of loops over items, or read one query that gathers them; each read costs the run a query stack entry and its verify a check"
@@ -540,8 +642,12 @@ pub fn analyse(model: &Model, path: &Path, facts: &Facts) -> Report {
     findings.retain(|it| it.estimate == Estimate::Unknown || it.saves_ns >= cut_ns);
     let smaller = (before - findings.len()) as u32;
     findings.sort_by(|a, b| {
-        (a.estimate == Estimate::Unknown)
-            .cmp(&(b.estimate == Estimate::Unknown))
+        // What the last build lost comes first: the daemon said it already, and reading the
+        // rest of the report without it is reading its consequences.
+        let first = |it: &Finding| !matches!(it.kind, Kind::NotKept | Kind::Unfinished);
+        first(a)
+            .cmp(&first(b))
+            .then((a.estimate == Estimate::Unknown).cmp(&(b.estimate == Estimate::Unknown)))
             .then(b.saves_ns.cmp(&a.saves_ns))
             .then(a.kind.cmp(&b.kind))
             .then_with(|| a.subject.cmp(&b.subject))
@@ -556,8 +662,11 @@ pub fn analyse(model: &Model, path: &Path, facts: &Facts) -> Report {
     Report {
         version: VERSION,
         build: facts.build.clone(),
+        // clone: the build's problems, once a report
+        problems: facts.problems.clone(),
         summary: ctx.summary(smaller, cut_ns),
         findings,
+        gaps: ctx.gaps(),
         blind_spots: blind,
     }
 }
@@ -1304,9 +1413,43 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    /// The misses table, by step and cause; a first build's misses have nothing to reuse.
+    /// The misses table, by step and cause; a first build's misses have nothing to reuse. The
+    /// row that says the last build's results were not kept ([`NOT_KEPT_STEP`]) is a finding of
+    /// its own kind, ranked first.
     fn missed(&self, out: &mut Vec<Finding>) {
         for it in self.facts.misses.iter().filter(|it| it.cause != "first") {
+            if it.step == NOT_KEPT_STEP {
+                // alloc: a finding's evidence
+                let why = it.what.clone().unwrap_or_else(|| it.example.clone()); // clone: once a report
+                out.push(Finding {
+                    stacks: Stacks::default(),
+                    kind: Kind::NotKept,
+                    fix: Fix::KeepResults,
+                    saves_ns: 0,
+                    estimate: Estimate::Unknown,
+                    title: "the last build's results were not kept, so this build computed them again".to_owned(),
+                    subject: NOT_KEPT_STEP.to_owned(),
+                    owner: None,
+                    evidence: vec![why],
+                });
+                continue;
+            }
+            if it.step == UNFINISHED_STEP {
+                // alloc: a finding's evidence
+                let why = it.what.clone().unwrap_or_else(|| it.example.clone()); // clone: once a report
+                out.push(Finding {
+                    stacks: Stacks::default(),
+                    kind: Kind::Unfinished,
+                    fix: Fix::CompareAfter,
+                    saves_ns: 0,
+                    estimate: Estimate::Unknown,
+                    title: "the last build did not end well, and this build first did the work it left".to_owned(),
+                    subject: UNFINISHED_STEP.to_owned(),
+                    owner: None,
+                    evidence: vec![why],
+                });
+                continue;
+            }
             // alloc: a finding's evidence
             let mut evidence = vec![format!("for example {}", it.example)];
             if let Some(what) = &it.what {
@@ -1360,6 +1503,77 @@ impl<'a> Ctx<'a> {
                 memory.footprint_peak.unwrap_or(0) as f64 / MIB
             )],
         });
+    }
+
+    /// The critical path's stretches of [`GAP_NS`] or more under no span, longest first (then
+    /// earliest), at most [`GAPS`]: where its lane ran inside no span, and where the record
+    /// says nothing of its lane (an `unrecorded` link). Each with its thread and the spans of
+    /// its lane before and after it; the driver adds the stacks sampled in it.
+    fn gaps(&self) -> Vec<Gap> {
+        let model = self.model;
+        // alloc: once a report
+        let mut found: Vec<(i64, i64, usize, &'static str)> = Vec::new();
+        for &(from, to, span, lane) in &self.path_ran {
+            if span.is_none() && to - from >= GAP_NS {
+                found.push((from, to, lane, "no_span"));
+            }
+        }
+        for link in self.path.links.iter().filter(|it| it.kind == LinkKind::Unrecorded) {
+            if link.dur_ns() < GAP_NS {
+                continue;
+            }
+            let why = match model.lanes[link.lane].intervals[link.interval].state {
+                State::Unrecorded { why } => why.name(),
+                _ => "unrecorded",
+            };
+            found.push((link.from_ns, link.to_ns, link.lane, why));
+        }
+        found.sort_unstable_by(|a, b| (b.1 - b.0).cmp(&(a.1 - a.0)).then(a.cmp(b)));
+        found.truncate(GAPS);
+        let said = |span: usize| {
+            let it = &model.spans[span];
+            match subject_of(model, span) {
+                // alloc: a label, once a gap
+                Some(of) if !of.is_empty() => format!("`{}` {of}", it.name),
+                // alloc: a label, once a gap
+                _ => format!("`{}`", it.name),
+            }
+        };
+        found
+            .into_iter()
+            .map(|(from, to, at, kind)| {
+                let lane = &model.lanes[at];
+                let cut = crate::time::path::innermost(model, at);
+                let ended = cut.partition_point(|it| it.1 <= from);
+                let before = cut[..ended].last().map(|it| said(it.2));
+                let after = cut[ended..].iter().find(|it| it.0 >= to).map(|it| said(it.2));
+                let thread = match lane.id {
+                    crate::time::LaneId::Thread { thread, .. } => Some(thread),
+                    crate::time::LaneId::Job { .. } => lane
+                        .intervals
+                        .iter()
+                        .filter(|it| it.from_ns < to && it.to_ns > from)
+                        .find_map(|it| match it.state {
+                            State::Running { thread, .. } => Some(thread),
+                            _ => None,
+                        }),
+                };
+                Gap {
+                    from_ns: from - model.bounds.start_ns,
+                    dur_ns: to - from,
+                    kind: kind.to_owned(), // alloc: a label, once a gap
+                    lane: lane.id.to_string(), // alloc: a label, once a gap
+                    process: lane.id.process(),
+                    thread,
+                    thread_name: thread.map(|it| self.thread_name(lane.id.process(), it)),
+                    before,
+                    after,
+                    start_ns: from,
+                    end_ns: to,
+                    stacks: Stacks::default(),
+                }
+            })
+            .collect()
     }
 
     fn blind_spots(&self, out: &mut Vec<BlindSpot>) {
@@ -1502,7 +1716,7 @@ impl<'a> Ctx<'a> {
                 subject: "misses".to_owned(),
                 title: format!("the build counted {counted} misses and the misses table explains {explained}"),
                 evidence: Vec::new(),
-                fix: "give every node that ran its task a misses row with its cause, or define builds.misses as what the table counts".to_owned(),
+                fix: "builds.misses is the count of the build's rows in `misses` (since 2026-11-11): a build that counts more was written by an older blaze, whose count was the plane's nodes that ran a task, or its history lost rows".to_owned(),
             });
         }
         let r = self.facts.recorder;

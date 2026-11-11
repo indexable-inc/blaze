@@ -127,6 +127,7 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::noalloc",
             "blaze::nonblocking",
             "blaze::pure",
+            "blaze::capabilities",
             "blaze::undeclared_effect",
             "blaze::unneeded_effect",
             "blaze::negative_effect",
@@ -147,8 +148,10 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::vecreport",
         ],
     ),
-    // What the blaze edition removes (docs/v2/plan/design/edition.md), here the code blaze
-    // cannot analyse and what blaze's standard library replaces (`std_use`): allowed until a workspace turns the group on, but for the members whose
+    // What the blaze edition removes or respells (docs/v2/plan/design/edition.md): the code blaze
+    // cannot analyse, what blaze's standard library replaces (`std_use`), `lossy_as`,
+    // `global_state`, `async_fn`, `mut_ref`, and the marks it writes at a crate's border
+    // (`unmarked_*`). Allowed until a workspace turns the group on, but for the members whose
     // advice this blaze already has (`ready`), which warn.
     (
         "blaze::edition",
@@ -158,6 +161,18 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::proc_macro_fn_like",
             "blaze::build_script_ambient",
             "blaze::std_use",
+            "blaze::lossy_as",
+            "blaze::global_state",
+            "blaze::async_fn",
+            "blaze::unmarked_pure",
+            "blaze::unmarked_nopanic",
+            "blaze::unmarked_noalloc",
+            "blaze::unmarked_nonblocking",
+            "blaze::mut_ref",
+            // Code written the way the edition wants it (docs/v2/plan/design/facts.md).
+            "blaze::program_lifetime",
+            "blaze::could_be_program_lifetime",
+            "blaze::could_be_ref32",
         ],
     ),
     (
@@ -190,6 +205,7 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::struct_update",
             "blaze::bool_param",
             "blaze::many_bools",
+            "blaze::default_policy",
             "blaze::sans_io_core",
             "blaze::key_ignores_field",
             "blaze::wildcard_arm",
@@ -202,13 +218,8 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::durable_write",
             "blaze::unbounded_wait",
             "blaze::combined_identity",
+            "blaze::span_field_unrecorded",
         ],
-    ),
-    // Code written the way blaze's edition wants it (docs/v2/plan/design/edition.md): allowed
-    // until a crate turns the group on (blaze-lints' `blaze::Kind::Edition`).
-    (
-        "blaze::edition",
-        &["blaze::program_lifetime", "blaze::could_be_program_lifetime", "blaze::could_be_ref32"],
     ),
     // The cross-configuration reachability lints (docs/v2/plan/design/multiconfig-check.md), also in
     // `blaze::general`: one name to make them strict, `reach = "deny"`.

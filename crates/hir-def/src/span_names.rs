@@ -37,6 +37,61 @@ use crate::{
 #[cfg(test)]
 mod tests;
 
+/// Gives the query engine's run log the front end's names for its rows
+/// ([`blaze_query::db::name_rows`]), so `provenance` (and `why_reran`, `what_reran`,
+/// `untracked_reads` over it) says which crate, module or item a row is, not its id: a `Crate` as
+/// spans name it (`serde v1.0.219 (lib)`), a module and a `ScopeInput` or `CrateResolution` by
+/// the module's path, a function, const or static by its path. Called before each take of the
+/// log; given again it is the same namer.
+pub fn name_log_rows() {
+    blaze_query::db::name_rows(name_row);
+}
+
+/// The run log of `db` since its last take, its rows named ([`name_log_rows`]): what the
+/// daemon takes as a build ends.
+pub fn take_run_log(db: &Db) -> blaze_query::db::Taken {
+    name_log_rows();
+    blaze_query::db::take_log_in(db)
+}
+
+/// The front end's [`blaze_query::db::RowNamer`]: false for a row that is not one of its own,
+/// or not of the database the log is taken with. Read outside any query (the log's holder takes
+/// it as a build ends), so it records no read.
+fn name_row(ingredient: &str, id: blaze_query::db::Id, out: &mut String) -> bool {
+    use blaze_query::db::FromIdIn;
+    blaze_query::db::with_attached_db::<Db, _>(|db| {
+        let Some(db) = db else { return false };
+        let storage = blaze_query::db::Database::storage(db);
+        match ingredient {
+            "Crate" => match <Crate as FromIdIn>::from_id_in(storage, id) {
+                Some(krate) => write_crate_label(db, krate, out),
+                None => return false,
+            },
+            "ModuleId" | "ModuleIdLt" => match <ModuleId as FromIdIn>::from_id_in(storage, id) {
+                Some(module) => module_path(db, module, out),
+                None => return false,
+            },
+            "FunctionId" => match <crate::FunctionId as FromIdIn>::from_id_in(storage, id) {
+                Some(it) => write_body_path(db, DefWithBodyId::FunctionId(it), out),
+                None => return false,
+            },
+            "ConstId" => match <crate::ConstId as FromIdIn>::from_id_in(storage, id) {
+                Some(it) => write_body_path(db, DefWithBodyId::ConstId(it), out),
+                None => return false,
+            },
+            "StaticId" => match <crate::StaticId as FromIdIn>::from_id_in(storage, id) {
+                Some(it) => write_body_path(db, DefWithBodyId::StaticId(it), out),
+                None => return false,
+            },
+            _ => match crate::nameres::log_row_module(db, ingredient, id) {
+                Some(module) => module_path(db, module, out),
+                None => return false,
+            },
+        }
+        true
+    })
+}
+
 /// A span named `$name` for the body `$def`, its fields `krate` and `function` written while a
 /// subscriber records it.
 #[macro_export]

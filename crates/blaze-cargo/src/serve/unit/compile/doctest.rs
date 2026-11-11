@@ -563,6 +563,7 @@ pub(super) fn link(
         macros: None,
         gpu_msl: None,
         records: Vec::new(),
+        made_files: Vec::new(),
         quoted: None,
     };
     let runner = match runner {

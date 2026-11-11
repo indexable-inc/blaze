@@ -321,7 +321,7 @@ impl<'db, 'f> Context<'db, 'f> {
                 self.add_constraints_from_const(start);
                 self.add_constraints_from_const(end);
             }
-            PatternKind::NotNull => {}
+            PatternKind::NotNull | PatternKind::Variant { .. } => {}
             PatternKind::Or(patterns) => {
                 for pat in patterns {
                     self.add_constraints_from_pat(pat)

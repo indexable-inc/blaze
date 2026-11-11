@@ -391,7 +391,8 @@ impl Solving<'_> {
                 }
             }
         };
-        self.cache.last.insert(self.last_key(node), parts);
+        let last = self.last_key(node);
+        self.cache.last.insert(last, parts);
         let slot = &mut solved.table.values[fact][node as usize];
         let changed = slot.as_ref() != Some(&value);
         *slot = Some(value);

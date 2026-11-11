@@ -136,6 +136,17 @@ impl Refusal {
     /// (src/lib.rs:12) → `helper` (src/lib.rs:20), which calls `var`, which reads the
     /// environment; a pure function reads the outside world only through its arguments".
     pub fn said(&self) -> String {
+        // A crate-wide effect is asked by the crate's `#![blaze::capabilities]`, not the function.
+        if EFFECTS.iter().any(|it| it.crate_wide && it.name == self.effect) {
+            return format!(
+                "`{}` is in a `#![blaze::capabilities]` crate, which refuses `{}`, but {}: {}; {}",
+                self.function,
+                self.effect,
+                self.says,
+                self.witness(),
+                self.fix
+            ); // alloc: said once, when a lint reports it
+        }
         format!(
             "`{}` is `#[blaze::{}]`, but {}: {}; {}",
             self.function,
@@ -276,11 +287,32 @@ fn checked(
         found.trust(db, func, reason, door);
         return FnPurity::Pure(found.proof(1));
     }
-    if let Some(refusal) = params(&cx, func, args.as_ref(), def, refuses, generic, &mut found) {
+    // A crate-wide effect checks every function of its crate as a root, so a `dyn` or function
+    // pointer parameter is the caller's to answer for, checked where that caller is.
+    if !def.crate_wide
+        && let Some(refusal) = params(&cx, func, args.as_ref(), def, refuses, generic, &mut found)
+    {
         return FnPurity::Impure(refusal);
     }
     let summary = summary(db, env.clone(), root.clone()); // clone: the query's key, reference counts
     let mut refused = summary.set(index).intersect(refuses);
+    // The root takes a `dyn` nothing answers for, and reaches a call through one (or the drop
+    // of one it owns): the object is the caller's, so its code is code the check can't see.
+    // Said before any other kind, as what the parameters hide is.
+    if let Some(taken) = &found.unlisted_dyn
+        && summary.set(index).has(Rule::Dyn)
+    {
+        let mut refusal = refusal(&cx, def, index, Rule::Dyn, &root, summary);
+        refusal.rule = Rule::Unchecked;
+        refusal.says = (def.says)(Rule::Unchecked);
+        // alloc: the refusal's text, once
+        refusal.what = format!(
+            "{}; the function takes `{taken}`, whose calls the check can't see: give the trait's method a `#[blaze::may(..)]`, take a type parameter, or mark the trait trusted",
+            refusal.what
+        )
+        .into();
+        return FnPurity::Impure(refusal);
+    }
     if generic {
         found.open |= summary.set(index).has(Rule::Open);
     } else if summary.set(index).has(Rule::Open) {
@@ -303,6 +335,11 @@ struct Found {
     // alloc: the proof's trusted functions, few, once per check
     trusted: Vec<Trusted>,
     open: bool,
+    /// The first `dyn` the root takes whose trait neither bounds every method nor is trusted
+    /// for the effect, as written: a call through it is refused where the walk reaches one
+    /// ([`Rule::Dyn`]); one only stored, compared or handed on to code that makes no such call
+    /// is not.
+    unlisted_dyn: Option<Box<str>>,
 }
 
 impl Found {
@@ -615,9 +652,17 @@ impl<'db> Params<'_, 'db> {
                             }
                         }
                     }
-                    None => self.refuse(Rule::Unchecked, || {
-                        format!("takes `{}`, whose calls the check can't see: take a type parameter, or mark the trait trusted", cx.shown(ty))
-                    }),
+                    // Its methods' effects are each method's to say (`effects::bound_mask`):
+                    // whether the function makes a call nothing answers for is the walk's to
+                    // find ([`Rule::Dyn`], refused in `checked`).
+                    None if self.refuses.has(Rule::Unchecked) => {
+                        if self.found.unlisted_dyn.is_none() {
+                            let shown = cx.shown(ty);
+                            let text = blaze_query::db::attach(cx.db, || format!("{shown}")); // alloc: a refusal's text, once per check
+                            self.found.unlisted_dyn = Some(text.into());
+                        }
+                    }
+                    None => {}
                 }
             }
             TyKind::Adt(adt, adt_args) => {
@@ -631,11 +676,26 @@ impl<'db> Params<'_, 'db> {
                         format!("takes the union `{}`, whose live field the check can't know", cx.shown(ty))
                     });
                 }
-                // `Unique<T>` and `PhantomData<T>` own a `T` (a `Box`'s, a `Vec`'s elements).
                 if home && let AdtId::StructId(it) = id {
                     let name = StructSignature::of(cx.db, it).name.symbol().clone(); // clone: a handle of an interned name
-                    if matches!(name.as_str(), "Unique" | "PhantomData") {
+                    // `Unique<T>` owns a `T` (a `Box`'s).
+                    if name.as_str() == "Unique" {
                         if let Some(owned) = adt_args.types().next() {
+                            self.ty(owned, shared, false);
+                        }
+                        return;
+                    }
+                    // `PhantomData<T>` holds no value: it says what the type around it owns
+                    // behind a pointer whose type does not (a `Vec`'s elements are named only by
+                    // `RawVec`'s `PhantomData<T>`, a `ThinBox<dyn Tr>`'s object only by its
+                    // marker), so what a `T` owns is looked into. A function pointer type owns
+                    // nothing, and no value of it is there to call: `PhantomData<fn() -> T>` and
+                    // `PhantomData<fn(T)>` are how a type says it holds no `T` at all (an id, a
+                    // marker of variance), and neither the pointer nor `T` is the function's.
+                    if name.as_str() == "PhantomData" {
+                        if let Some(owned) = adt_args.types().next()
+                            && !matches!(cx.normalize(owned).kind(), TyKind::FnPtr(..))
+                        {
                             self.ty(owned, shared, false);
                         }
                         return;

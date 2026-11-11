@@ -157,15 +157,17 @@ pub(crate) fn opt_path_type_args(p: &mut Parser<'_>) {
         // test_err generic_arg_list_recover
         // type T = T<0, ,T>;
         // type T = T::<0, ,T>;
-        delimited(
-            p,
-            T![<],
-            T![>],
-            T![,],
-            || "expected generic argument".into(),
-            generic_args::GENERIC_ARG_FIRST,
-            generic_args::generic_arg,
-        );
+        p.with_unions(true, |p| {
+            delimited(
+                p,
+                T![<],
+                T![>],
+                T![,],
+                || "expected generic argument".into(),
+                generic_args::GENERIC_ARG_FIRST,
+                generic_args::generic_arg,
+            )
+        });
         m.complete(p, GENERIC_ARG_LIST);
     } else if p.nth_at(1, T![..]) {
         // test return_type_syntax_in_path
@@ -185,20 +187,22 @@ pub(crate) fn opt_path_type_args(p: &mut Parser<'_>) {
         // type F = Box<::Fn(i32) -> ()>;
         // type F = Box<Fn::(i32) -> ()>;
         // type F = Box<::Fn::(i32) -> ()>;
-        delimited(
-            p,
-            T!['('],
-            T![')'],
-            T![,],
-            || "expected type".into(),
-            types::TYPE_FIRST,
-            |p| {
-                let progress =
-                    types::TYPE_FIRST.contains(p.current()) || types::at_record_type(p);
-                generic_args::type_arg(p);
-                progress
-            },
-        );
+        p.with_unions(true, |p| {
+            delimited(
+                p,
+                T!['('],
+                T![')'],
+                T![,],
+                || "expected type".into(),
+                types::TYPE_FIRST,
+                |p| {
+                    let progress =
+                        types::TYPE_FIRST.contains(p.current()) || types::at_record_type(p);
+                    generic_args::type_arg(p);
+                    progress
+                },
+            )
+        });
         m.complete(p, PARENTHESIZED_ARG_LIST);
         opt_ret_type(p);
     }

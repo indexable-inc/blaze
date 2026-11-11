@@ -1054,7 +1054,9 @@ fn pattern_flags(kind: PatternKind<'_>) -> (TypeFlags, rustc_type_ir::DebruijnIn
             .fold((TypeFlags::empty(), rustc_type_ir::INNERMOST), |(flags, binder), pat| {
                 (flags | pat.flags(), binder.max(pat.outer_exclusive_binder()))
             }),
-        PatternKind::NotNull => (TypeFlags::empty(), rustc_type_ir::INNERMOST),
+        PatternKind::NotNull | PatternKind::Variant { .. } => {
+            (TypeFlags::empty(), rustc_type_ir::INNERMOST)
+        }
     }
 }
 
@@ -1142,9 +1144,18 @@ impl<'db> rustc_type_ir::relate::Relate<DbInterner<'db>> for Pattern<'db> {
                 Ok(Pattern::new(tcx, PatternKind::Or(pats)))
             }
             (PatternKind::NotNull, PatternKind::NotNull) => Ok(a),
-            (PatternKind::Range { .. } | PatternKind::Or(_) | PatternKind::NotNull, _) => {
-                Err(TypeError::Mismatch)
+            // blaze: a variant of the base enum (`#![blaze::pattern_types]`); a set is
+            // canonical (sorted, no variant twice), so equal sets are equal patterns.
+            (PatternKind::Variant { index: a_index }, PatternKind::Variant { index: b_index }) => {
+                if a_index == b_index { Ok(a) } else { Err(TypeError::Mismatch) }
             }
+            (
+                PatternKind::Range { .. }
+                | PatternKind::Or(_)
+                | PatternKind::NotNull
+                | PatternKind::Variant { .. },
+                _,
+            ) => Err(TypeError::Mismatch),
         }
     }
 }
@@ -1390,6 +1401,12 @@ impl<'db> Interner for DbInterner<'db> {
     fn assert_evaluation_is_concurrent(&self) {
         // Turns out, the assumption for this function isn't perfect.
         // See https://github.com/rust-lang/trait-system-refactor-initiative/issues/234
+    }
+
+    /// blaze: whether two constants that are not the same constant are the same expression
+    /// of the same constants ([`crate::const_exprs`], `#![feature(blaze_const_exprs)]`).
+    fn same_const_expression(self, a: Const<'db>, b: Const<'db>) -> bool {
+        crate::const_exprs::same_expression(self.db, a, b)
     }
 
     fn expand_abstract_consts<T: rustc_type_ir::TypeFoldable<Self>>(self, _: T) -> T {
@@ -1886,9 +1903,11 @@ impl<'db> Interner for DbInterner<'db> {
             SolverTraitLangItem::ArbitrarySigned => lang_items.ArbitrarySigned,
             SolverTraitLangItem::IntFrom => lang_items.IntFrom,
             SolverTraitLangItem::IntTryFrom => lang_items.IntTryFrom,
+            SolverTraitLangItem::ErrorUnionFrom => lang_items.ErrorUnionFrom,
             SolverTraitLangItem::ReflectEnum => lang_items.ReflectEnum,
             SolverTraitLangItem::ReflectField => lang_items.ReflectField,
             SolverTraitLangItem::ReflectFnItem => lang_items.ReflectFnItem,
+            SolverTraitLangItem::ReflectMemoPoint => lang_items.ReflectMemoPoint,
             SolverTraitLangItem::ReflectStruct => lang_items.ReflectStruct,
             SolverTraitLangItem::ReflectVariant => lang_items.ReflectVariant,
         };
@@ -1902,6 +1921,7 @@ impl<'db> Interner for DbInterner<'db> {
             SolverAdtLangItem::Poll => lang_items.Poll.map(Into::into),
             SolverAdtLangItem::DynMetadata => lang_items.DynMetadata.map(Into::into),
             SolverAdtLangItem::OwnedBox => lang_items.OwnedBox.map(Into::into),
+            SolverAdtLangItem::ErrorUnion => lang_items.ErrorUnion.map(Into::into),
         };
         AdtIdWrapper(lang_item.expect("Lang item required but not found."))
     }
@@ -1954,9 +1974,11 @@ impl<'db> Interner for DbInterner<'db> {
             ArbitrarySigned,
             IntFrom,
             IntTryFrom,
+            ErrorUnionFrom,
             ReflectEnum,
             ReflectField,
             ReflectFnItem,
+            ReflectMemoPoint,
             ReflectStruct,
             ReflectVariant,
         )
@@ -2022,9 +2044,11 @@ impl<'db> Interner for DbInterner<'db> {
             ArbitrarySigned,
             IntFrom,
             IntTryFrom,
+            ErrorUnionFrom,
             ReflectEnum,
             ReflectField,
             ReflectFnItem,
+            ReflectMemoPoint,
             ReflectStruct,
             ReflectVariant,
         )
@@ -2058,6 +2082,10 @@ impl<'db> Interner for DbInterner<'db> {
         matches!(ty.kind(), TyKind::Adt(def, _) if matches!(def.def_id(), AdtId::EnumId(_)))
     }
 
+    fn reflect_is_memo_point(self, ty: Ty<'db>) -> bool {
+        crate::comptime::reflect_is_memo_point(self, ty)
+    }
+
     fn param_env_with_clauses(
         self,
         env: ParamEnv<'db>,
@@ -2074,6 +2102,7 @@ impl<'db> Interner for DbInterner<'db> {
             Poll,
             DynMetadata,
             OwnedBox,
+            ErrorUnion,
         )
     }
 

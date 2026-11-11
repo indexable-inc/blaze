@@ -309,6 +309,7 @@ const LANG_ITEMS: &[(&str, &[Policy])] = &[
     ("blaze_fields", STRUCT),
     ("blaze_fn_item", TRAIT),
     ("blaze_marked", TRAIT),
+    ("blaze_memo_point", TRAIT),
     ("blaze_only_marked", STRUCT),
     ("blaze_only_unmarked", STRUCT),
     ("blaze_struct", TRAIT),

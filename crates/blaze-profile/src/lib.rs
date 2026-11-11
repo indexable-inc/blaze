@@ -30,6 +30,7 @@ pub mod arrow;
 pub mod batches;
 pub mod clock;
 pub mod crash;
+pub mod describe;
 pub mod diff;
 pub mod dump;
 pub mod errors;

@@ -331,6 +331,45 @@ pub const fn variants_of<T: Enum>() -> Variants<T> {
 #[unstable(feature = "blaze_comptime", issue = "none")]
 pub unsafe trait FnItem {}
 
+/// The item type of a function written `#[blaze::memo]`: a memo point, which an evaluator
+/// (`bstd::eval::Eval`) may compute, remember or record. The attribute holds the function to
+/// `#[blaze::pure]`, so its value is a function of its arguments and of its code
+/// ([`code_id_of`]). No closure, function pointer or unmarked function is one. Implemented by
+/// the trait solver.
+///
+/// # Safety
+///
+/// `Self` is the fn item type of a function written `#[blaze::memo]`. Only the trait solver
+/// implements it.
+#[lang = "blaze_memo_point"]
+#[rustc_deny_explicit_impl]
+#[rustc_dyn_incompatible_trait]
+#[unstable(feature = "blaze_comptime", issue = "none")]
+pub unsafe trait MemoPoint: FnItem {}
+
+/// The behaviour identity of the function item or closure type `F`
+/// (`hir_ty_identity::fn_code_id`), [`FnInfo::code_id`] alone: what running it can depend on,
+/// over everything it can call, so it changes when the function or any code it can run
+/// changes, and not for a comment or a move. A constant in every context, runtime or const, as
+/// it is evaluated in a `const { .. }` for each instance of `F` (as [`FnInfo::of`] is). Code
+/// whose constants ask for the id of code that runs them is refused, naming it, never given a
+/// guessed id.
+#[unstable(feature = "blaze_comptime", issue = "none")]
+pub const fn code_id_of<F: FnItem>() -> [u8; 32] {
+    const { intrinsics::blaze_code_id::<F>() }
+}
+
+/// The type `id` is of, as blaze's diagnostics name it: `Shared<Parent>`, not
+/// `type_name`'s full paths. For code that walks types by their ids
+/// (`core::mem::type_info`) and has to say which one it stopped at; `type_name::<T>()` needs
+/// the type itself. Only at compile time.
+#[unstable(feature = "blaze_comptime", issue = "none")]
+#[rustc_const_unstable(feature = "blaze_comptime", issue = "none")]
+#[rustc_comptime]
+pub fn name_of(id: crate::any::TypeId) -> &'static str {
+    intrinsics::blaze_type_name_of(id)
+}
+
 /// Const facts about a function item or a closure, from [`fn_info`].
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
@@ -440,4 +479,14 @@ mod intrinsics {
     #[rustc_intrinsic]
     #[rustc_comptime]
     pub(super) fn blaze_fn_info<F>() -> super::FnInfo;
+
+    /// The behaviour identity of the fn item or closure type `F` ([`super::code_id_of`]).
+    #[rustc_intrinsic]
+    #[rustc_comptime]
+    pub(super) fn blaze_code_id<F>() -> [u8; 32];
+
+    /// The type `id` is of, as a diagnostic names it ([`super::name_of`]).
+    #[rustc_intrinsic]
+    #[rustc_comptime]
+    pub(super) fn blaze_type_name_of(id: crate::any::TypeId) -> &'static str;
 }

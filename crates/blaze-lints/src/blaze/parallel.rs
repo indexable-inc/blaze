@@ -12,7 +12,7 @@
 //! and its callees' and multiplied by its trip count, passes `parallel-threshold`.
 
 mod deps;
-mod effects;
+pub(super) mod effects;
 mod iter;
 #[cfg(test)]
 mod prop;

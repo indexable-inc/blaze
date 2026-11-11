@@ -301,6 +301,12 @@ pub trait Interner:
 
     fn expand_abstract_consts<T: TypeFoldable<Self>>(self, t: T) -> T;
 
+    /// blaze: whether the constants `a` and `b`, which are not one constant, are the same
+    /// expression of the same constants (`#![feature(blaze_const_exprs)]`: `{ N + M }` and
+    /// `{ M + N }`), by a normal form the interner computes. `false` wherever no generic const
+    /// expression is involved.
+    fn same_const_expression(self, a: Const<Self>, b: Const<Self>) -> bool;
+
     type GenericsOf: GenericsOf<Self>;
     fn generics_of(self, def_id: Self::DefId) -> Self::GenericsOf;
 
@@ -520,6 +526,10 @@ pub trait Interner:
 
     /// blaze: whether `ty` is an enum (`core::reflect::Enum`).
     fn reflect_is_enum(self, ty: Self::Ty) -> bool;
+
+    /// blaze: whether `ty` is the item type of a function written `#[blaze::memo]`
+    /// (`core::reflect::MemoPoint`).
+    fn reflect_is_memo_point(self, ty: Self::Ty) -> bool;
 
     /// blaze: `env` with `clauses` added, for a member of a field binder entering the
     /// environment (`rustc_next_trait_solver`'s `env_with_reflected_member`).

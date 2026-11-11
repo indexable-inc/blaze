@@ -13,13 +13,14 @@ A change that moves a type, path, API or idiom across the code is a ban with a `
 `.clippy.toml` (mirrored in the hot crates' `clippy.toml`), which blaze-lints'
 `disallowed_types`/`disallowed_methods`/`disallowed_macros` enforce with a MachineApplicable fix, or
 a `blaze::` lint where the rule needs types or MIR; either is applied with `blaze check --fix`, and
-its count lives in `crates/blaze-lints/baselines/`, which may only shrink (no baseline file exists
-yet, because blaze cannot yet finish its own check of the workspace: `blaze check --baselines DIR
---new-baseline LINT` starts one, and the merge gate's `lint-baselines` job, docs/cargo.md#lints,
-holds them once they exist); a one-off move of a path is `blaze check --replace A=B`. Both find code
-by name resolution (imports, renames, globs, re-exports, macro output), never by text, and leave it
-compiling and lint-clean, so the rule keeps holding after the port. `sed`, `rg` replace and
-syntax-only rewriters (astlog) are for syntax-only shapes, scoped and checked by a build afterward.
+its count lives in `crates/blaze-lints/baselines/`, which may only shrink (the merge gate's
+`lint-baselines` job, docs/cargo.md#lints, holds them, and its `blaze.<lint>.txt` files are the
+ratchet's: every blaze lint is `deny` except in the crates a file lists,
+docs/lints.md#workspace-levels-and-the-ratchet); a one-off move of a path is `blaze check --replace
+A=B`. Both find code by name resolution (imports, renames, globs, re-exports, macro output), never
+by text, and leave it compiling and lint-clean, so the rule keeps holding after the port. `sed`,
+`rg` replace and syntax-only rewriters (astlog) are for syntax-only shapes, scoped and checked by a
+build afterward.
 
 ## whole-ports (rule 24)
 
@@ -88,5 +89,20 @@ scalar loop where the design is vectorized, a hand-written impl where reflection
 guessed number where a measurement tool should exist. If the piece is large, say so and start it; do
 not quietly scope it out. This is `own-the-language` for the whole tree, and `guard-the-cause` for
 capabilities: the cause of a weak design is a missing piece, so add the piece.
+
+## unease-is-work (rule 59)
+
+Unease is a finding, not a mood: a workaround that had to be written, a result explained by
+inspection where a check should explain it, a tool that could be misused the same way again, a step
+that only works when done carefully, a number that surprised you, code tied to other code by
+convention. Do not note it and move on, and do not patch the instance. Ask why it is that way until
+the answer is a cause that can be removed (a missing type, a missing check, an API that allows the
+mistake, a representation that hides the fact, a language that cannot state the invariant), and
+remove it there: redesign the piece, add the guard (`guard-the-cause`), build what is missing
+(`build-the-missing-piece`), or change the language: add a feature, change one, or delete one that
+invites the mistake (`own-the-language`). The size of the right fix is not a reason to prefer the
+wrong one (`best-long-term-design`); if it is large, say so, start it, and give it a ledger row. Say
+in the change what the unease was and what cause was removed, so the next reader does not rediscover
+it.
 
 <!-- End of the generated rules. Hand-written notes follow. -->

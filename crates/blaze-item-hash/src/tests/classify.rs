@@ -566,7 +566,7 @@ impl BodyFacts for Probe {
     }
 
     fn value(&self, db: &Db, def: DefWithBodyId, fact: FactRef) -> Option<ContentId> {
-        values::value(db, def.krate(db), fact)
+        values::value_in(db, def, fact)
     }
 
     fn def_key<'db>(&self, db: &'db Db, body: DefWithBodyId, def: SolverDefId<'db>) -> ContentId {
@@ -612,7 +612,11 @@ impl ImageStore for Memory {
 /// Runs inference, MIR building and the borrow check of every body of [`STEPS`] with an item
 /// store installed, and gives what each read was classified as.
 fn steps_seen() -> (Db, Vec<Seen>) {
-    let db = db_of(STEPS);
+    steps_seen_in(db_of(STEPS))
+}
+
+/// [`steps_seen`] of every body of `db`'s local crate.
+fn steps_seen_in(db: Db) -> (Db, Vec<Seen>) {
     let probe = Arc::new(Probe { seen: Lock::new("test.itemhash.seen", Vec::new()) });
     let installed = body_store::install(
         &db,
@@ -834,7 +838,7 @@ fn own_earlier_steps_are_step_facts() {
         match it.class {
             Classified::Fact(fact) => {
                 assert!(earlier < it.step, "{}: a fact for {:?}", it.name, it.step);
-                assert_eq!(Some(fact), values::step_fact(&db, it.def, earlier), "{}", it.name);
+                assert_eq!(Some(fact), values::step_fact(earlier), "{}", it.name);
                 infer |= fact.kind == kinds::STEP_INFER;
                 mir |= fact.kind == kinds::STEP_MIR;
             }
@@ -892,4 +896,105 @@ fn hashing_this_crates_facts_again_allocates_nothing() {
 fn attrs_of_item_or_adt(db: &Db, name: &str) -> FactRef {
     let ItemId::Adt(adt) = named(db, name) else { panic!("`{name}` is no ADT") };
     values::attrs(db, adt.into()).expect("an ADT's attrs have a key")
+}
+
+/// Two statics and two functions alike but for their names: each pair has one identity.
+const TWINS: &str = r#"
+//- minicore: sized, copy, clone, add
+pub static FIRST: u32 = 1 + 2;
+pub static SECOND: u32 = 1 + 2;
+pub fn one(n: u32) -> u32 { n + 1 }
+pub fn two(n: u32) -> u32 { n + 1 }
+"#;
+
+fn body_named(db: &Db, name: &str) -> DefWithBodyId {
+    match named(db, name) {
+        ItemId::Function(it) => DefWithBodyId::FunctionId(it),
+        ItemId::Static(it) => DefWithBodyId::StaticId(it),
+        ItemId::Const(it) => DefWithBodyId::ConstId(it),
+        _ => panic!("`{name}` has no body"),
+    }
+}
+
+/// The shapes of each step of the bodies of `a` and `b`, which have one identity, compared:
+/// `Ok` with how many facts of them name the body's own item, `Err` naming a step the two list
+/// different facts for. `listed` is how a shape lists a fact of a body: as it was classified,
+/// or as a planted bug lists it.
+fn alike_bodies_list_one_shape(
+    db: &Db,
+    seen: &[Seen],
+    (a, b): (&str, &str),
+    listed: impl Fn(DefWithBodyId, FactRef) -> FactRef,
+) -> Result<usize, String> {
+    let (first, second) = (body_named(db, a), body_named(db, b));
+    assert_eq!(
+        crate::identity::identity(db, first),
+        crate::identity::identity(db, second),
+        "`{a}` and `{b}` are alike but for their names: one identity"
+    );
+    let mut own = 0;
+    for step in Step::ALL {
+        let shape = |def: DefWithBodyId| {
+            let mut facts: Vec<FactRef> = seen
+                .iter()
+                .filter(|it| it.def == def && it.step == step)
+                .filter_map(|it| match it.class {
+                    Classified::Fact(fact) => Some(listed(def, fact)),
+                    Classified::Covered | Classified::Refused => None,
+                })
+                .collect();
+            facts.sort_unstable();
+            facts.dedup();
+            facts
+        };
+        let (of_first, of_second) = (shape(first), shape(second));
+        if of_first != of_second {
+            return Err(format!(
+                "`{a}` and `{b}` have one identity and two shapes of their {step:?}: {of_first:?} and {of_second:?}"
+            ));
+        }
+        own += of_first.iter().filter(|it| it.subject == values::OWN).count();
+    }
+    Ok(own)
+}
+
+/// The invariant: two bodies of one identity that read the same of themselves list one shape
+/// for each step, so the store keeps one shape and one answer for both, and a rename keeps a
+/// body's records. A body's identity writes its own item as "self"; a fact about that item
+/// (its inference as its MIR reads it, its MIR and match check as its borrow check does) names
+/// it as [`values::OWN`], and its value is the body's own ([`values::value_in`]).
+///
+/// Until 2026-11-10 such a fact named the item by its key: `FIRST` and `SECOND` filed two
+/// shapes of their MIR under one base key in one flush, which the daemon's store refused
+/// ("keeping the shape of the MIR of StaticId(..): two images were made under ..") after every
+/// build of ripgrep.
+#[test]
+fn bodies_alike_but_for_their_names_list_one_shape() {
+    let (db, seen) = steps_seen_in(super::perturb::db(TWINS));
+    for pair in [("FIRST", "SECOND"), ("one", "two")] {
+        let own = alike_bodies_list_one_shape(&db, &seen, pair, |_, fact| fact)
+            .unwrap_or_else(|why| panic!("{why}"));
+        assert!(own > 0, "{pair:?}: no step read a fact of its own body, so nothing was tested");
+        // With no body to say whose, a fact of "its own" has no value: never `absent`, which
+        // every body's would share.
+        let def = body_named(&db, pair.0);
+        let infer = values::step_fact(Step::Infer).expect("inference has a fact");
+        assert_eq!(values::value(&db, def.krate(&db), infer), None);
+    }
+}
+
+/// The control: a shape that names the body's own item by its key, as before the fix, gives
+/// two bodies of one identity two shapes, and the oracle names the step.
+#[test]
+fn the_oracle_catches_a_shape_that_names_its_own_body_by_key() {
+    let (db, seen) = steps_seen_in(super::perturb::db(TWINS));
+    let by_key = |def: DefWithBodyId, fact: FactRef| match fact.subject == values::OWN {
+        true => FactRef { subject: values::body_key(&db, def), ..fact },
+        false => fact,
+    };
+    for pair in [("FIRST", "SECOND"), ("one", "two")] {
+        let why = alike_bodies_list_one_shape(&db, &seen, pair, by_key)
+            .expect_err("each body's key is its own");
+        assert!(why.contains("one identity and two shapes of their"), "{why}");
+    }
 }

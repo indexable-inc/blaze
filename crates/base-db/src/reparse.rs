@@ -115,8 +115,8 @@ impl Reparse {
 
     /// The parse of `text` (this one's text) in `edition` and under `extensions`, an outline
     /// when `outline`, made from the kept parse when there is one, else read from `stored` when
-    /// it has the text's ([`Trees`], which keeps parses under no extensions only); kept for the
-    /// next text. A stored parse that is not the text's is an error.
+    /// it has the text's under those extensions ([`Trees`]); kept for the next text. A stored
+    /// parse that is not the text's is an error.
     pub(crate) fn parse(
         &self,
         text: &Text,
@@ -129,7 +129,6 @@ impl Reparse {
         if let Some(own) = self.own(edition, extensions, outline) {
             return Ok(own);
         }
-        let stored = stored.filter(|_| extensions.is_none());
         let parse = match self.previous(edition, extensions, outline) {
             Some((previous, delete)) => {
                 #[cfg(test)]
@@ -141,16 +140,19 @@ impl Reparse {
                 }
                 parse
             }
-            // clone: a refcount, as above.
             None => match stored {
-                Some(stored) => match stored.map(self.slot.id, text, edition, outline)? {
-                    Some(parse) => parse,
-                    None => whole(text.clone(), edition, extensions, outline),
-                },
+                Some(stored) => {
+                    match stored.map(self.slot.id, text, edition, outline, extensions)? {
+                        Some(parse) => parse,
+                        // clone: a refcount, as above.
+                        None => whole(text.clone(), edition, extensions, outline),
+                    }
+                }
+                // clone: a refcount, as above.
                 None => whole(text.clone(), edition, extensions, outline),
             },
         };
-        self.keep(&parse, edition, outline);
+        self.keep(&parse, edition, extensions, outline);
         Ok(parse)
     }
 
@@ -164,30 +166,40 @@ impl Reparse {
         self.slot.id
     }
 
-    /// The live outlines of this text, by edition: what the image stores of a library file.
-    pub(crate) fn kept_outlines(&self) -> impl Iterator<Item = (Edition, Parse<SourceFile>)> + '_ {
+    /// The live outlines of this text, by edition and syntax extensions: what the image
+    /// stores of a library file, each under its own key.
+    pub(crate) fn kept_outlines(
+        &self,
+    ) -> impl Iterator<Item = (Edition, Extensions, Parse<SourceFile>)> + '_ {
         self.slot
             .kept
             .iter()
             .filter_map(OnceLock::get)
-            .filter(|kept| kept.outline && kept.extensions.is_none())
-            .filter_map(|kept| Some((kept.edition, kept.parse.upgrade()?)))
+            .filter(|kept| kept.outline)
+            .filter_map(|kept| Some((kept.edition, kept.extensions, kept.parse.upgrade()?)))
     }
 
     /// Takes `parse`, a full parse its caller made of this text in `edition` (an edit's tree
     /// reparsed in place, `blaze_intent::Seed`), as the text's parse: [`Reparse::parse`] returns
     /// it while it lives. It is kept weakly, as the parses `parse` makes are, so the caller holds
-    /// it until the file is parsed. `false`, and nothing kept, when its text is not this one or
-    /// the slot has a live parse of the edition already.
-    pub(crate) fn seed(&self, text: &Text, edition: Edition, parse: &Parse<SourceFile>) -> bool {
+    /// it until the file is parsed. `false`, and nothing kept, when its text is not this one,
+    /// it was made under other syntax extensions than `extensions`, or the slot has a live
+    /// parse of the edition and extensions already.
+    pub(crate) fn seed(
+        &self,
+        text: &Text,
+        edition: Edition,
+        extensions: Extensions,
+        parse: &Parse<SourceFile>,
+    ) -> bool {
         debug_assert!(text.ptr_eq(&self.slot.text), "a seed of another text");
-        if parse.root().text() != text.as_str() {
+        if parse.root().text() != text.as_str() || parse.extensions() != extensions {
             return false;
         }
         if cfg!(debug_assertions) {
             assert_whole(parse, text, edition, false);
         }
-        self.keep(parse, edition, false)
+        self.keep(parse, edition, extensions, false)
     }
 
     /// A live parse of this text in `edition`, under `extensions` and of the kind: a seed, or
@@ -233,10 +245,15 @@ impl Reparse {
         Some((parse, edit.delete))
     }
 
-    /// Keeps `parse` in this text's slot, unless a live one of its edition, extensions and kind
-    /// is kept: whether it kept this one.
-    fn keep(&self, parse: &Parse<SourceFile>, edition: Edition, outline: bool) -> bool {
-        let extensions = parse.extensions();
+    /// Keeps `parse` in this text's slot, unless a live one of its edition, extensions and kind is
+    /// kept: whether it kept this one.
+    fn keep(
+        &self,
+        parse: &Parse<SourceFile>,
+        edition: Edition,
+        extensions: Extensions,
+        outline: bool,
+    ) -> bool {
         for kept in &self.slot.kept {
             match kept.get() {
                 Some(it) if it.is(edition, extensions, outline) => {

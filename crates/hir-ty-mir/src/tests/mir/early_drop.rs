@@ -15,6 +15,7 @@ use crate::{
         },
         print_mir_body,
     },
+    mir_pretty::MirEvalErrorPretty as _,
     test_db::TestDBExt as _,
 };
 

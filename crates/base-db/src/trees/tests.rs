@@ -3,7 +3,7 @@ use std::{cell::Cell, panic, sync::Arc as StdArc};
 use crate::{FileId, FileSet, VfsPath};
 use blaze_bytes::Bytes;
 use blaze_query::db::Durability;
-use span::Edition;
+use span::{Edition, Extensions};
 use syntax::{FlatTree, SourceFile};
 use triomphe::Arc;
 
@@ -119,6 +119,55 @@ fn a_restart_reads_library_trees_back_without_parsing() {
     assert_eq!(db.trees().and_then(|it| it.failed()), None);
 }
 
+/// A restart with a library file read by a crate that turns syntax extensions on
+/// (`#![blaze::uniq]`, `#![blaze::error_unions]`) and by one that turns none on: the one text
+/// is stored once under each set, and a new database reads each file id's outline from the
+/// store under its own extensions, with no whole parse, as the parse a fresh parse under those
+/// extensions makes (the same tree walked, lazy bodies too, and the same errors: none under
+/// the extensions, Rust's without them). No entry answers for another set.
+#[test]
+fn a_restart_reads_gated_library_trees_back_under_their_extensions() {
+    let both = Extensions::UNIQ.with(Extensions::ERROR_UNIONS);
+    let source = "fn f(x: &uniq u8) -> &uniq u8 { let y: &uniq u8 = &uniq *x; y }\n\
+                  fn g(e: A | B) { h(e) }\n";
+    let texts = vec![("gated.rs".to_owned(), source.to_owned())];
+    let content = blaze_ids::ContentId::of(blaze_vfs::FILE_DOMAIN, source.as_bytes());
+    let section = {
+        let mut db = Db::for_tests();
+        let file = library(&mut db, &texts)[0].file_id(&db);
+        let gated = EditionedFileId::new_with_extensions(&db, file, EDITION, both);
+        let plain = EditionedFileId::new(&db, file, EDITION);
+        assert!(gated.parse(&db).is_outline() && plain.parse(&db).is_outline());
+        assert!(gated.parse(&db).errors_with_bodies().is_empty(), "the extensions' syntax");
+        assert!(!plain.parse(&db).errors_with_bodies().is_empty(), "Rust's errors without them");
+        stored(&db)
+    };
+    assert_eq!(section.len(), 2, "the text's outline under each set of extensions");
+    assert!(section.has(content, EDITION, true, both));
+    assert!(section.has(content, EDITION, true, Extensions::NONE));
+    assert!(!section.has(content, EDITION, true, Extensions::UNIQ), "no entry for another set");
+
+    let mut db = Db::for_tests();
+    db.set_trees(Some(StdArc::new(section)));
+    let file = library(&mut db, &texts)[0].file_id(&db);
+    let before = whole_parses();
+    for extensions in [both, Extensions::NONE, Extensions::UNIQ] {
+        let id = EditionedFileId::new_with_extensions(&db, file, EDITION, extensions);
+        let kept = extensions != Extensions::UNIQ;
+        assert_eq!(tree(&db, id).is_read_in_place(), kept, "{extensions:?}");
+        let fresh = SourceFile::parse_outline_with(source, EDITION, extensions);
+        let parse = id.parse(&db);
+        assert_eq!(parse, &fresh, "{extensions:?}");
+        assert_eq!(parse.extensions(), extensions);
+        assert_eq!(parse.errors_with_bodies(), fresh.errors_with_bodies(), "{extensions:?}");
+        assert_eq!(elements(parse), elements(&fresh), "{extensions:?}");
+    }
+    assert_eq!(whole_parses(), before + 1, "one whole parse: the set no entry is stored for");
+    assert_eq!(db.trees().and_then(|it| it.failed()), None);
+    let next = stored(&db);
+    assert_eq!(next.len(), 3, "the stored entries kept, the new set's outline added");
+}
+
 /// A file the store has no entry for is parsed as any other, and stored with the next section;
 /// a stored entry no file read this time is carried into it as it was.
 #[test]
@@ -216,7 +265,8 @@ fn a_stored_parse_reads_in_place() {
     let (name, text) = texts.iter().max_by_key(|it| it.1.len()).unwrap();
     let text = syntax::Text::from(text.as_str());
     let id = blaze_ids::ContentId::of(blaze_vfs::FILE_DOMAIN, text.as_bytes());
-    let (read, used) = blaze_alloc_count::measure(|| section.map(id, &text, EDITION, true));
+    let none = Extensions::NONE;
+    let (read, used) = blaze_alloc_count::measure(|| section.map(id, &text, EDITION, true, none));
     let read = read.unwrap().expect("stored");
     let tree = read.syntax_node().flat_tree().unwrap().clone();
     assert!(tree.is_read_in_place(), "{name}");

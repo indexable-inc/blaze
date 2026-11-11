@@ -51,6 +51,7 @@ fn lib_root(graph: &mut CrateGraphBuilder, root: FileId) -> CrateBuilderId {
             target: Err("no target in budget tests".into()),
             toolchain: None,
             const_eval: Default::default(),
+            trusted: Box::default(),
         }),
     )
 }

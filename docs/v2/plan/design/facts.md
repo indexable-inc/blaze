@@ -129,9 +129,9 @@ into one range `ProgramArena::establish` reserves once (at most 32 GiB); `Copy`,
 published once; allocation needs the handle and reading needs a `Ref32`, so the base is an
 address, not ambient authority.
 
-`#[blaze::acyclic]` is only the spelling that asserts the `Acyclic` trait. The trait is derived
-from a type's shape by reflection with a blanket impl, built on `lang-int-1110`; nothing here
-analyses it.
+`Acyclic` is no attribute and no fact of this crate: the trait is derived from a type's shape
+by reflection with a blanket impl, and asserted for one type with `unsafe impl Acyclic for X {}`
+([ownership.md](ownership.md)).
 
 ## The two lints (group `blaze::edition`, allow)
 

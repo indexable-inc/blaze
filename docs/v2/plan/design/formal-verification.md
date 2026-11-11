@@ -990,7 +990,7 @@ generated table's wiring into `diff::RULES` and `simplify::REWRITES`, the fix of
 **One source for the rules.** `crates/blaze-diff/rules.json` lists the operations, each
 derivative rule (its tangent as a template, its kink, its domain, its IEEE condition) and each
 rewrite (both sides, its class, and for a `fast_math` one the condition its theorem assumes).
-`harness/v2/diff_rules.py` writes from it:
+`scripts/src/bin/diff_rules.rs` writes from it:
 - `crates/blaze-diff/src/rules_gen.rs`, which `lib.rs` includes: `diff::RULES` and
   `simplify::REWRITES` are these tables, and the Rust types (`Rule`, `P`, `Rewrite`, `Pat`)
   are unchanged;
@@ -1086,7 +1086,7 @@ check and four planted bugs, one of them too small for finite differences to see
 
 **Trusted, beyond what is proved** (added to the list above):
 - **Mathlib** at the pinned commit, with Lean's three axioms, which its real analysis uses.
-- **The generator** (`diff_rules.py`): that the Rust table and the Lean table it writes say
+- **The generator** (`scripts/src/bin/diff_rules.rs`): that the Rust table and the Lean table it writes say
   the same thing. Its selftest and the dual-number test are the evidence; it is not proved.
 - **The link from the Lean `diff` to the Rust `Differentiator`.** The Lean one recurses over a
   term and builds every zero; the Rust one walks a hash-consed DAG once, never builds a

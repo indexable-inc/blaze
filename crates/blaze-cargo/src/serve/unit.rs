@@ -282,8 +282,12 @@ impl Steps for Real {
         Ok(puts)
     }
 
+    fn kept_refusal(&self, kept: &mut KeptLowered) -> Option<String> {
+        kept.flushed.as_mut().and_then(deps::Flushes::take_refusal)
+    }
+
     fn kept_run_log(&self, kept: &KeptLowered) -> blaze_query::db::Taken {
-        blaze_query::db::take_log_in(kept.lowered.db())
+        hir_def::span_names::take_run_log(kept.lowered.db())
     }
 
     fn release_kept(&self, kept: &mut KeptLowered, wanted: &std::sync::atomic::AtomicBool) {
@@ -371,7 +375,7 @@ impl Steps for Real {
                                     let variable = "";
                                     let _span =
                                 tracing::info_span!(target: "blaze", "kept front end let go", checkout, why, variable).entered();
-                                    eprintln!(
+                                    crate::serve::said::logged!(WARN,
                                         "blaze serve: the kept front end of {checkout} is let go, and its build lowers anew: {why}"
                                     );
                                     drop((session, lowered, seeds));
@@ -637,7 +641,7 @@ fn let_go(kept: KeptLowered, why: &str, variable: Option<&str>) {
     let _span =
         tracing::info_span!(target: "blaze", "kept front end let go", checkout, why, variable)
             .entered();
-    eprintln!(
+    crate::serve::said::logged!(WARN,
         "blaze serve: the kept front end of {checkout} is let go, and its build lowers anew: {why}"
     );
     drop(kept);
@@ -650,7 +654,8 @@ fn let_go(kept: KeptLowered, why: &str, variable: Option<&str>) {
 /// file, never a whole parse in its place.
 fn seed(db: &base_db::Db, seeds: &[blaze_intent::Seed]) -> Result<(), blaze_lower::LowerError> {
     for it in seeds {
-        if !base_db::EditionedFileId::new(db, it.file, it.edition)
+        let extensions = it.parse.extensions();
+        if !base_db::EditionedFileId::new_with_extensions(db, it.file, it.edition, extensions)
             .seed_parse(db, it.content, &it.parse)
         {
             // alloc: an error path.
@@ -1102,7 +1107,7 @@ impl Writer<Real> for UnitWriter {
     }
 
     fn run_log(&self) -> blaze_query::db::Taken {
-        blaze_query::db::take_log_in(self.front.db())
+        hir_def::span_names::take_run_log(self.front.db())
     }
 
     fn goals_noted(&self) -> Option<blaze_api::Diagnostic> {
@@ -1261,7 +1266,7 @@ impl<T> Drop for Held<T> {
         if let Some(it) = self.it.take()
             && let Err(panic) = dropped(it)
         {
-            eprintln!(
+            crate::serve::said::logged!(ERROR,
                 "blaze serve: letting go of {} {panic}; the daemon goes on, the memory it held may be lost",
                 self.what
             );

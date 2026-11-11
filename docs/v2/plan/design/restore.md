@@ -66,3 +66,35 @@ a reboot, takes about as long as the same answer from a warm daemon, plus a few 
   dependencies from their images. Restoring it needs the front end's memos in the image as
   `Persist` values, the work [query-unify](../../plan.md) names.
 
+
+## A restore that cannot be trusted (2026-11-11)
+
+On 2026-11-10 a daemon restored a bad `<state>/db` and failed builds of unrelated crates with
+"asked for the key Id(..), an ID this database never gave" until the directory was moved aside
+by hand. What holds now:
+
+- **The image's references are checked as it opens** (`blaze_query::image::ImageMap::check_references`,
+  under the span `check the image's references`): every table slot names a memo the image
+  holds and the table names as many keys as the memos have; every memo's edges, value and key
+  bytes and every input's path are inside their sections. Bytes that pass their CRC and break
+  this are `DbError::Dangling`, naming the section and the record, at the restore and when a
+  daemon settles onto the image it wrote, never at the first request that reads the record.
+  The cost is one read of the table and the memo records (8 bytes a slot, 192 a memo), which
+  also moves a failed CRC of those two sections from a failed request to a refused start; the
+  edges and the values stay checked as they are read. Test:
+  `a_restored_image_names_only_what_it_holds`, with its control
+  `the_oracle_catches_a_table_slot_naming_a_memo_the_image_lacks` (`crates/blaze-query/src/tests.rs`).
+- **A restore that fails a check never serves and never starts empty.** The start stops with
+  `the daemon image /<file>: <fault>; nothing of it is used and the daemon does not start`,
+  and points at `blaze doctor`. The database starts empty only by a rule, each said in the
+  start's log: no image, another blaze's layout, a section of another schema.
+- **A key no database gave names the restore** (`blaze_query::db::NeverGiven::restored`): when
+  the process restored from an image, the report says its file, layout and hash and that the
+  restore is suspect; when it restored nothing, it says no restored file holds the key.
+- **`blaze doctor [--json]`** (`crates/blaze-cargo/src/cli/doctor.rs`) checks the state
+  directory without a daemon: the image's layout and spine, every group's CRC, the database's
+  references as above, and that the profile history's manifest reads. Each part is `ok`,
+  `absent`, `unused` (whole, another blaze's: no fault) or `FAULT`. For a fault it prints the
+  command that sets the part aside whole (`blaze stop && mv <state>/db <state>/db.suspect-<time>`);
+  it moves and deletes nothing itself, and exits 101. It reads files, so it is not a request
+  of the daemon's API: it is for when no daemon starts.

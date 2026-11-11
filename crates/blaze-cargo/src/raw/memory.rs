@@ -35,10 +35,69 @@ fn resident(status: &str) -> Option<u64> {
 
 /// Bytes of memory this process holds as the system counts it, what a limit on it is held to
 /// (`blaze_mem::tag::resident_by`): its physical footprint on macOS ([`footprint`]). Allocates
-/// nothing, as it is read once a run ends.
+/// nothing, as it is read once a run ends. Asks the system every call: what decides on the
+/// footprint many times a millisecond reads [`own_footprint`].
 #[cfg(target_os = "macos")]
-pub fn own_footprint() -> Option<u64> {
+pub fn own_footprint_now() -> Option<u64> {
     footprint(std::process::id())
+}
+
+/// How long one reading of the process's footprint stands ([`own_footprint`]): the loop asked
+/// for it twice a turn, a turn every half millisecond while busy, which was 40,000 opens of
+/// `/proc/self/statm` in 14 s of one build (2026-11-10). Admission, the releases and the plots
+/// decide on a number that moves by megabytes a millisecond at most, so one reading a tick
+/// is the same decision.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+pub const FOOTPRINT_TICK_NS: u64 = 10_000_000;
+
+/// The last reading of the footprint and when it was made ([`Reading::at`]).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+static READING: Reading = Reading::new();
+
+/// One reading kept for a tick: `stamp` is the clock's nanoseconds it was made at plus one
+/// (zero: none yet), `bytes` what it read (`u64::MAX`: the system did not say). Two words
+/// written apart: a reader that sees a new stamp with the last tick's bytes is one tick
+/// stale, which a cache of a tick allows anyway.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+struct Reading {
+    stamp: std::sync::atomic::AtomicU64,
+    bytes: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+impl Reading {
+    const fn new() -> Reading {
+        Reading {
+            stamp: std::sync::atomic::AtomicU64::new(0),
+            bytes: std::sync::atomic::AtomicU64::new(u64::MAX),
+        }
+    }
+
+    /// The footprint as of `now_ns` on the caller's clock: the kept reading where it is
+    /// younger than [`FOOTPRINT_TICK_NS`], else `read`'s, kept. `read` is called at most once
+    /// a tick by each caller that finds the reading old (two threads at a tick's edge may
+    /// both read; each keeps what it read).
+    fn at(&self, now_ns: u64, read: impl FnOnce() -> Option<u64>) -> Option<u64> {
+        use std::sync::atomic::Ordering;
+        let stamp = self.stamp.load(Ordering::Acquire);
+        if stamp != 0 && now_ns.saturating_sub(stamp - 1) < FOOTPRINT_TICK_NS {
+            let bytes = self.bytes.load(Ordering::Acquire);
+            return (bytes != u64::MAX).then_some(bytes);
+        }
+        let read = read();
+        self.bytes.store(read.unwrap_or(u64::MAX), Ordering::Release);
+        self.stamp.store(now_ns.saturating_add(1), Ordering::Release);
+        read
+    }
+}
+
+/// [`own_footprint_now`], read from the system at most once each [`FOOTPRINT_TICK_NS`] of the
+/// profile's monotonic clock for the whole process: what the loop's plots, the plane's
+/// admission and the releases ask (`blaze_mem::tag::resident_by`).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn own_footprint() -> Option<u64> {
+    let now = u64::try_from(blaze_profile::clock::mono_ns()).unwrap_or(0);
+    READING.at(now, own_footprint_now)
 }
 
 /// The daemon's own cgroup's `memory.current` and `memory.stat`, once the kernel holds its
@@ -66,8 +125,10 @@ pub fn count_own_cgroup(dir: &std::path::Path) {
 ///
 /// A cgroup that cannot be read is `None`, never the resident set in its place. Allocates
 /// nothing: each path fits std's stack buffer and each file is read into a buffer here.
+/// Opens and reads a file every call: what decides on the footprint many times a millisecond
+/// reads [`own_footprint`].
 #[cfg(target_os = "linux")]
-pub fn own_footprint() -> Option<u64> {
+pub fn own_footprint_now() -> Option<u64> {
     match OWN_CGROUP.get() {
         Some((current, stat)) => cgroup_charge(current, stat),
         None => own_resident(),
@@ -140,6 +201,12 @@ fn statm_resident(statm: &[u8]) -> Option<u64> {
 /// No reading of the process's footprint here.
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn own_footprint() -> Option<u64> {
+    None
+}
+
+/// No reading of the process's footprint here.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn own_footprint_now() -> Option<u64> {
     None
 }
 
@@ -349,7 +416,8 @@ pub fn purge() -> Purged {
         of = tracing::field::Empty,
     )
     .entered();
-    let before = own_footprint();
+    // Read from the system both times: a purge measures what it gave back between them.
+    let before = own_footprint_now();
     blaze_mem::tag::ask_heap_give_back();
     let settle = settle_heaps();
     #[cfg(feature = "native")]
@@ -357,7 +425,7 @@ pub fn purge() -> Purged {
     blaze_mem::chunks::trim();
     #[cfg(target_os = "macos")]
     relieve_system_zones();
-    let after = own_footprint();
+    let after = own_footprint_now();
     let purged = Purged { before, after, settle };
     PURGED.fetch_add(purged.returned(), std::sync::atomic::Ordering::Relaxed);
     if let Some(before) = before {
@@ -581,6 +649,29 @@ mod tests {
     #[test]
     fn this_process_holds_some_by_its_own_count() {
         assert!(super::own_footprint().is_some_and(|it| it > 0));
+    }
+
+    /// The footprint is read from the system at most once a tick: a second ask inside the
+    /// tick is the kept reading and reads nothing, the first ask after it reads again, and a
+    /// reading the system refused is kept as refused for its tick.
+    #[test]
+    fn the_footprint_is_read_once_a_tick() {
+        let reading = super::Reading::new();
+        let tick = super::FOOTPRINT_TICK_NS;
+        let mut reads = 0;
+        let mut ask = |now: u64, says: Option<u64>| {
+            reading.at(now, || {
+                reads += 1;
+                says
+            })
+        };
+        assert_eq!(ask(0, Some(7)), Some(7), "the first ask reads");
+        assert_eq!(ask(tick - 1, Some(8)), Some(7), "inside the tick: the kept reading");
+        assert_eq!(ask(tick, Some(9)), Some(9), "a tick on: read again");
+        assert_eq!(ask(tick + 1, Some(10)), Some(9));
+        assert_eq!(ask(3 * tick, None), None, "the system did not say");
+        assert_eq!(ask(3 * tick + 1, Some(11)), None, "and that stands for its tick");
+        assert_eq!(reads, 3);
     }
 
     #[cfg(target_os = "macos")]
