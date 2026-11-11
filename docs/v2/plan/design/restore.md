@@ -98,3 +98,138 @@ by hand. What holds now:
   command that sets the part aside whole (`blaze stop && mv <state>/db <state>/db.suspect-<time>`);
   it moves and deletes nothing itself, and exits 101. It reads files, so it is not a request
   of the daemon's API: it is for when no daemon starts.
+
+## Persisted state that is hard to get wrong (2026-11-11, lane restart-1111)
+
+What is written here is built unless it names a ledger row (R1 to R9 in
+[objectives.md](../objectives.md)); nothing of this lane was compiled or run by it.
+
+### What is persisted, and what ties it
+
+| File | Holds | Its commit | Tied to the root by |
+|---|---|---|---|
+| `<state>/db/image` | the query database's memos, the VFS tree, the plane's history, the symbols, the library syntax trees | one rename (`blaze_image::place`), after the clone's sync | it is the root: its hash covers the spine, the spine every group's CRC and each section's schema |
+| `<state>/journal` | VFS changes since the image | appends, cut at the last whole record | names the image's hash; a journal of another image stops the start (`VfsFault::Unnamed`) |
+| `<state>/store`, the shared std store | records by content key: dependency images, checked bodies, the item store, goals, templates, outputs | the store's own (blaze-cas) | nothing: a record is found by a key that covers its inputs and is checked against it, so one that is missing or fails is a miss, never a wrong value |
+| `<state>/db/cold/<n>` | memo values moved out of memory | none | nothing, and no start reads one: garbage after a restart (R3: removed at start) |
+| `<home>/v2/profile` | the profile history | `manifest.json` under its lock | nothing: it decides no build |
+
+So there are two commit points a build's state depends on, the image's rename and the
+store's commit, and they cannot disagree in a way a later start accepts: the image holds
+no key of a store record that the store may not have (a store miss is recomputed), and the
+journal names its image.
+
+### The six constraints
+
+1. **One commit point.** Held by the image for everything addressed by ID. The store is
+   content-addressed and is reached only by keys computed from inputs, so it needs no
+   root. Not held: cold packs are written and never reclaimed across a restart (R3).
+2. **No process-local ID crosses the process boundary.** By table:
+   - the query database's memos: content IDs (`QueryKey`), never a dense ID;
+   - symbols: IDs of the image's own symbol table, restored first and checked whole; a
+     database section is used only when `intern::restored_from()` is its image's hash;
+   - dependency images, checked bodies, the item store, signatures: every ID goes through
+     a relocation table (`hir_ty::check_cache::ids`, `hir_def::hir::persist::relocating`)
+     to a portable form, and is made again by interning; a table index is checked for
+     bound and kind at decode (`IdRefused`);
+   - the front end's dense database (`blaze_query::db`): not persisted at all.
+   `Id::decode` is the one way from a word to an `Id`; it now states its contract and is
+   `#[blaze::nopanic]`. Not held structurally: the relocating scope is a thread-local, so a
+   record written outside it holds this process's IDs and nothing in the type says which
+   it is (R4: the encoder takes the table as an argument).
+3. **Every record self-verifies.** The image: a CRC32C per 64 KiB group, checked on the
+   group's first read (about 3 µs, then one relaxed load a read), and the reference check
+   at open. The store: by its key (not re-read by this lane).
+4. **Persisted state is only a cache.** A start uses a part or says why not
+   (`Started`); a damaged image stops the start naming the file. Granular recompute of
+   one damaged group, in place of the stop, is not built (R3).
+5. **The write path is a type.** `blaze_image::Txn` is `#[blaze::linear]`: an image begun
+   ends in `commit` (to the placer) or `abort`, or the code does not compile; and
+   `Placer::place` is the crate's own, so no code writes the image's file without one.
+   The placer stays the `#![blaze::sans_io]` core the crash simulation drives.
+6. **Evidence.** (a) `blaze-image/src/place/tests.rs` (every effect of a placing, torn
+   writes) and `blaze-query/src/tests/restore.rs` (the database across images, power cuts
+   and starts); (b) the last step of that test changes a byte of the file and holds every
+   answer to the model or a typed refusal, and `a_corrupt_group_fails_the_keys_in_it`;
+   (c) restored, warm and fresh databases answer alike in the same test; (d) the kill
+   loop on a real build is R3, not written.
+
+Costs: the transaction adds nothing to a commit. An open reads the spine (128 bytes, 64 a
+section, 4 a group) and hashes it once, then the table (8 bytes a slot) and the memo
+records (192 a memo): for 100,000 memos about 21 MiB read and CRC'd, some tens of
+milliseconds, measured by the span `check the image's references`.
+
+### Language features used, and what waits
+
+| Feature | Used here | Waits on |
+|---|---|---|
+| `#[blaze::linear]`, `#[blaze::consumes]` | `blaze_image::Txn` | |
+| `#[blaze::nopanic]`, `#[blaze::noalloc]` | `blaze_query::db::Id::new`, `Id::decode` | R4: the open path (`Image::open`, `ImageMap::open`, `check_references`, `open_image`). `nopanic` refuses every global allocation (`handle_alloc_error`) and every index, so the path's lists go to a frame and its `bytes[a..b]` to `get` first |
+| native `ensures` (`blaze_verify`) | `Id::decode` | R5: `restore(persist(x)) == x` on `blaze_format::Persist`, which needs a clause that names a value behind a reference; contracts.md says today's lowering takes the return and by-value arguments only |
+| `#![blaze::sans_io]` | the placer (already) | |
+| reflection (`for const`) for layouts and schema hashes | none | R5: the generic `Persist` over `for const` is planned in memory-and-data and not in this tree; the hand-written `SchemaHash`es stay until it is |
+| `fn_info(&f).code_id` as a memo's producer | none | R6: const eval does not answer `fn_info` yet (comptime.md, "Wired once hir-ty-identity compiles"); `Query::PRODUCER` is a string versioned by hand. `the_oracle_catches_code_changed_under_one_producer` shows what that allows |
+
+Version skew is tested at the level the tree has: an image of another layout or schema
+starts empty by rule, and a memo of another producer is never read
+(`a_memo_made_by_other_code_is_never_read_as_this_codes`).
+
+### What an edit needs (A: a restart, then a body edit)
+
+Measured: 53 to 57 s and 375 s of CPU, against about 1 s warm. Read: nothing of the front
+end is in the image, by design (its IDs are a process's). What a restart can read is in
+the store, by content key, lazily: dependency def maps and signatures, each dependency's
+checked bodies (`check_cache`), each body's inference, MIR and borrow check verdict (the
+item store), goals, templates. What it cannot read:
+
+| Recomputed | Count on ripgrep | Why | Row |
+|---|---|---|---|
+| inference | 21,624 ran | each is a miss of both stores (`infer_body_query` asks them first). Which miss is not known: the event `item store flushed` now says hits, runs and refusals by step, with the read that kept most out | R1 |
+| describes | 86,702 | a describe is a memo of the dense database only; the kept walk names its IDs | R7 |
+| the walk, lists, link base | whole | kept in memory beside the database | R7 |
+| the workspace's lowering | 4.7 s | `KeptLowered` is memory only | R1 |
+
+The design: the store stays the one place, and a describe becomes a record there
+(`Step::Describe` beside the item store's three: base key from the instance's identity,
+the requester and `Facing`; shapes of the facts it read; the answer with its references in
+portable form). A walk after a restart is then 86,702 lookups on all cores, not 130 s of
+describing, and the walk itself is made again from them: nothing ID-bearing is written.
+It is not built here because a describe's reads have to be classified as facts
+(`BodyFacts::classify`) and that cannot be done without running one; built blind it would
+refuse most describes or, worse, cover too little (keys-cover-every-input).
+
+The budget (R1): restart to the end of the first body edit at most 2 s over a warm edit
+on ripgrep, reading at most 64 MiB; bounded by the instances the roots reach, one lookup
+each. The no-op after a restart is 13 to 14 s today and should be the start's spans plus
+one plan verify; which span holds it is not known from reading (`daemon start: *`,
+`lower`, the plan's verify are the candidates).
+
+### B: the first edit after a cold build
+
+5.7 s against 0.95 s. Read (incremental-walk.md has the table): the cold build let go of
+the edited crate's inference by name and of every MIR; the check's memos held, so the only
+readers were the body lints, on one thread. Built: a cold build holds the inference of the
+last `EDIT_CRATES` workspace crates it finished. Left (R2): their MIR still goes, and the
+lints still read on one thread.
+
+### C: a daemon that starts on bad state
+
+Not found by reading. What reading rules out: a dense `Id` cannot come from the image or
+a store record without passing `Id::new` (which refuses 0), so `Id(0)` was read from zeroed
+memory of the running process. Ranked:
+
+1. A value of the dense database read after the release let it go. The restored part that
+   changes this is the plane's history, which changes how many tasks run at once and in
+   what order; the first `Id(0)` (2026-11-09) came with no restore.
+2. A served dependency image with zero bytes inside a part that passes its key.
+3. The method-resolution stall is separate: each `deps::serve` that fetches a crate raises
+   `written.crates`, and every such write warms every crate again (R8). A fresh store
+   fetches nothing, so it never happens there. The stop's guard then ended the daemon
+   because verified memos and loop items were not counted as work (fixed).
+
+### Which part a fault follows
+
+`BLAZE_RESTORE_WITHOUT=database,history,trees` starts a daemon that leaves those parts of
+a good image unused, each said in the start's log. On a kept bad state: all three (the
+VFS alone is restored), then one at a time. The part whose absence makes the build clean
+holds the fault; `history` alone clean is candidate 1.
