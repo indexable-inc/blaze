@@ -380,6 +380,10 @@ fn old_match_attr_flags(
                         "consumes" => attr_flags.insert(AttrFlags::CONSUMES),
                         "reflect" => attr_flags.insert(AttrFlags::BLAZE_REFLECT),
                         "sealed" => attr_flags.insert(AttrFlags::BLAZE_SEALED),
+                        "acyclic" => attr_flags.insert(AttrFlags::BLAZE_ACYCLIC),
+                        "program_lifetime" => {
+                            attr_flags.insert(AttrFlags::BLAZE_PROGRAM_LIFETIME)
+                        }
                         _ => {}
                     },
                     _ => {}

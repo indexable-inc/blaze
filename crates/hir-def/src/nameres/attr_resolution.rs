@@ -146,6 +146,11 @@ impl DefMap {
                         | "reflect"
                         // `#[blaze::sealed]`, from `AttrFlags::BLAZE_SEALED` (`hir-ty-coherence`).
                         | "sealed"
+                        // `#[blaze::acyclic]` and `#[blaze::program_lifetime]`, from
+                        // `AttrFlags::BLAZE_ACYCLIC` and `AttrFlags::BLAZE_PROGRAM_LIFETIME`
+                        // (`hir-ty-facts`, docs/v2/plan/design/facts.md).
+                        | "acyclic"
+                        | "program_lifetime"
                 )
             {
                 return true;

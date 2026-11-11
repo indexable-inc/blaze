@@ -735,6 +735,10 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                 (Some(Word::blaze), Some(Word::consumes)) => AttrFlags::CONSUMES,
                 (Some(Word::blaze), Some(Word::reflect)) => AttrFlags::BLAZE_REFLECT,
                 (Some(Word::blaze), Some(Word::sealed)) => AttrFlags::BLAZE_SEALED,
+                (Some(Word::blaze), Some(Word::acyclic)) => AttrFlags::BLAZE_ACYCLIC,
+                (Some(Word::blaze), Some(Word::program_lifetime)) => {
+                    AttrFlags::BLAZE_PROGRAM_LIFETIME
+                }
                 (Some(Word::clippy), Some(Word::has_significant_drop)) => {
                     AttrFlags::HAS_SIGNIFICANT_DROP
                 }
@@ -897,6 +901,7 @@ fn word(name: &str) -> Option<Word> {
 name_set! {
     /// An attribute name the flags or the value queries read.
     enum Word {
+    acyclic,
     automatically_derived,
     bench,
     bits,
@@ -946,6 +951,7 @@ name_set! {
     pointee,
     prefer_underscore_import,
     proc_macro_derive,
+    program_lifetime,
     pure,
     reflect,
     repr,
@@ -1240,6 +1246,21 @@ bitflags::bitflags! {
         /// reflection reads and writes every field, private ones too (`hir_ty_comptime`'s
         /// `struct_domain`, docs/v2/plan/design/comptime.md "Which fields").
         const BLAZE_REFLECT = 1 << 124;
+        /// `#[blaze::acyclic]`, a word, on a struct or enum: a blaze extension (inert under
+        /// rustc with `#![register_tool(blaze)]`), a declared type fact
+        /// (docs/v2/plan/design/facts.md): no chain of owning pointers leads from a value of
+        /// the type back to itself. `hir-ty-facts` proves it from the fields or refuses the
+        /// type naming the field path that can close a cycle (`blaze::acyclic`). It changes
+        /// diagnostics, never code: no codegen key reads the bit.
+        const BLAZE_ACYCLIC = 1 << 125;
+        /// `#[blaze::program_lifetime]`, a word, on a struct or enum: a blaze extension (inert
+        /// under rustc with `#![register_tool(blaze)]`), a declared type fact
+        /// (docs/v2/plan/design/facts.md): instances live until the program exits. `hir-ty-facts`
+        /// checks what the type itself must be for that (no `Drop`, nothing in it to drop, no
+        /// type parameter, not public unless its crate opts in) or refuses it naming the field
+        /// path (`blaze::program_lifetime`). It changes diagnostics, never code: no codegen
+        /// key reads the bit.
+        const BLAZE_PROGRAM_LIFETIME = 1 << 126;
         /// `#[clippy::has_significant_drop]`, a word, on a struct or enum: dropping a value of
         /// it does something another part of the program can see (releases a lock, ends a
         /// borrow), read by blaze-lints' `significant_drop_tightening`. It changes diagnostics,
