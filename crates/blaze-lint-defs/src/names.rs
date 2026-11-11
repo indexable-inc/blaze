@@ -149,10 +149,16 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
     ),
     // What the blaze edition removes (docs/v2/plan/design/edition.md), here the code blaze
     // cannot analyse and what blaze's standard library replaces (`std_use`): allowed until a workspace turns the group on, but for the members whose
-    // advice this blaze already has (`ready`), which warn.
+    // advice this blaze already has (`ready`), which warn. And code written the way blaze's
+    // edition wants it (`program_lifetime` and the two lints that suggest it): allowed until a
+    // crate turns the group on (blaze-lints' `blaze::Kind::Edition`). One group: a name is one
+    // entry of the store.
     (
         "blaze::edition",
         &[
+            "blaze::program_lifetime",
+            "blaze::could_be_program_lifetime",
+            "blaze::could_be_ref32",
             "blaze::proc_macro_derive",
             "blaze::proc_macro_attribute",
             "blaze::proc_macro_fn_like",
@@ -203,12 +209,6 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::unbounded_wait",
             "blaze::combined_identity",
         ],
-    ),
-    // Code written the way blaze's edition wants it (docs/v2/plan/design/edition.md): allowed
-    // until a crate turns the group on (blaze-lints' `blaze::Kind::Edition`).
-    (
-        "blaze::edition",
-        &["blaze::program_lifetime", "blaze::could_be_program_lifetime", "blaze::could_be_ref32"],
     ),
     // The cross-configuration reachability lints (docs/v2/plan/design/multiconfig-check.md), also in
     // `blaze::general`: one name to make them strict, `reach = "deny"`.

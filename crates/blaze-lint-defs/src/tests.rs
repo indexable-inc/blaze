@@ -52,7 +52,7 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
     let store = Store::default();
     let lint = lint("blaze::const_impure").expect("blaze's lint");
     assert_eq!(lint.default_level, Level::Warn);
-    assert_eq!(blaze_lints().len(), 99);
+    assert_eq!(blaze_lints().len(), 102);
     assert!(!lint.is_externally_loaded);
     // The compiler's own and the release build's; blaze-lints loads every other.
     let built: Vec<&str> =
@@ -75,6 +75,11 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
         ("blaze::build_script_ambient", ready::CAPABILITIES_FOR_BUILD_SCRIPTS),
         // Never by default: a crate or a workspace's table asks for it.
         ("blaze::std_use", false),
+        // Code written the way the edition wants it: `program_lifetime` is `deny` (below) where
+        // a type asked for it, the two that suggest it wait.
+        ("blaze::program_lifetime", false),
+        ("blaze::could_be_program_lifetime", false),
+        ("blaze::could_be_ref32", false),
     ];
     for it in edition.lints.iter() {
         assert!(warns.iter().any(|(name, _)| *name == it.name), "`{}` says when it warns", it.name);
@@ -100,7 +105,6 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
                 + usize::from(in_internal)
                 + usize::from(in_pedantic)
                 + usize::from(in_edition),
-                + usize::from(in_(edition)),
             1,
             "`{}` is general, internal, pedantic_perf or edition, once",
             it.name
@@ -241,7 +245,6 @@ fn counts_are_rustcs() {
             "blaze::pedantic_perf",
             "blaze::edition",
             "blaze::internal",
-            "blaze::edition",
             "blaze::reach",
             "blaze::proc_macro",
         ]
