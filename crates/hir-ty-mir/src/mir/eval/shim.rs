@@ -2228,7 +2228,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
 
     /// The bytes of the `TypeId` of `ty` (already as [`Self::type_id_ty`] makes it), made when
     /// it is the first one asked for.
-    fn type_id(&mut self, ty: Ty<'db>) -> [u8; 16] {
+    pub(super) fn type_id(&mut self, ty: Ty<'db>) -> [u8; 16] {
         let id = self.type_ids.iter().position(|&it| it == ty).unwrap_or_else(|| {
             self.type_ids.push(ty);
             self.type_ids.len() - 1
