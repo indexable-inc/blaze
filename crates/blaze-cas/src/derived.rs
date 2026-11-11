@@ -239,8 +239,8 @@ mod tests {
         assert_eq!((grown[9], grown[10], grown[4195]), (5, 0, 9));
     }
 
-    /// The invariant: the recipe of a file's runs over the base of holes holds the runs and
-    /// a row each, none of the zeros between them, and gives the file.
+    /// The recipe of a file's runs over the base of holes holds the runs and a row each,
+    /// none of the zeros between them, and gives the file.
     #[test]
     fn a_file_of_runs_over_the_base_of_holes_is_a_recipe_of_its_runs_alone() {
         const LEN: u64 = 64 << 20;

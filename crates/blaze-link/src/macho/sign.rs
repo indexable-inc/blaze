@@ -437,8 +437,8 @@ mod tests {
         assert_eq!(seen, want);
     }
 
-    /// The invariant: a view with whole pages nothing is in (an image's patch room) signs as
-    /// the assembled file does, with and without a cache, whose pages of zeros are hashed.
+    /// A view with whole pages nothing is in (an image's patch room) signs as the assembled
+    /// file does, whose pages of zeros are hashed, with and without a cache.
     #[test]
     fn a_view_with_room_signs_as_the_assembled_file() {
         let (a, b) = (noise(4, 2 * PAGE), noise(5, PAGE + 9));
