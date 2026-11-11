@@ -336,25 +336,22 @@ impl Requests {
         loop {
             let at = from + got.len() as u64;
             let tried: anyhow::Result<()> = async {
-                let mut opened =
-                    self.open(&url, &headers, (at, Some(to)), if_range.as_deref(), bounds).await?;
-                // A server that has the same body (its `ETag` is the first answer's) and yet
-                // answers the whole of it does not honour `If-Range` (static.crates.io's CDN:
-                // 200 to a `Range` with `If-Range`, 206 to the `Range` alone, 2026-11-11). The
-                // range is asked for alone, and the piece is held to that same `ETag`, which is
-                // what `If-Range` was for.
-                if opened.status == 200
-                    && if_range.is_some()
-                    && opened.header("etag") == if_range.as_deref()
+                // The range is asked for alone, and the piece is held to the first answer's
+                // `ETag` here: what `If-Range` is for, without relying on the server to honour
+                // it. static.crates.io's CDN does not (2026-11-11: 200 with the whole body to
+                // a `Range` with a matching `If-Range`, 206 to the `Range` alone), and a whole
+                // body answered and then dropped mid-transfer is a request this client would
+                // have to cancel cleanly for nothing.
+                let mut opened = self.open(&url, &headers, (at, Some(to)), None, bounds).await?;
+                if let Some(first) = if_range.as_deref()
+                    && opened.header("etag") != Some(first)
                 {
-                    opened = self.open(&url, &headers, (at, Some(to)), None, bounds).await?;
-                    if opened.header("etag") != if_range.as_deref() {
-                        anyhow::bail!(
-                            "{} answered a request for bytes {at}-{to} with another `ETag` than \
-                             its first answer's: its body changed since the download began",
-                            opened.said,
-                        );
-                    }
+                    anyhow::bail!(
+                        "{} answered a request for bytes {at}-{to} with another `ETag` ({}) than \
+                         its first answer's ({first}): its body changed since the download began",
+                        opened.said,
+                        opened.header("etag").unwrap_or("none"),
+                    );
                 }
                 let said = opened.header("content-range").and_then(content_range);
                 if opened.status != 206 || said.and_then(|it| it.0) != Some((at, to)) {
