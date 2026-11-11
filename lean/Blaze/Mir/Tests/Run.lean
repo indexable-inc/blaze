@@ -188,6 +188,83 @@ example :
         Terminator.ret).call 4 0 [] []) = true := by
   decide
 
+/-- A move out of a part of a local leaves a hole there: a read of the part after is
+undefined, and the rest of the local is still read. -/
+def movePart (read : Nat) : Program :=
+  { adts := [],
+    fns :=
+      [{ name := "movePart", args := 0,
+         locals := [Ty.int ScalarTy.U32, Ty.adt 0, Ty.int ScalarTy.U32],
+         blocks :=
+           [{ stmts :=
+                [Statement.assign (Place.mk 1 [])
+                   (Rvalue.aggregate AggKind.tuple
+                     [Operand.const (Const.int ScalarTy.U32 3),
+                      Operand.const (Const.int ScalarTy.U32 4)]),
+                 Statement.assign (Place.mk 2 [])
+                   (Rvalue.use (Operand.move (Place.mk 1 [ProjElem.field 0]))),
+                 Statement.assign (Place.mk 0 [])
+                   (Rvalue.use (Operand.copy (Place.mk 1 [ProjElem.field read])))],
+              terminator := Terminator.ret }] }] }
+
+example : isUndefined Undefined.moved ((movePart 0).call 4 0 [] []) = true := by decide
+
+example : isInt ScalarTy.U32 4 ((movePart 1).call 4 0 [] []) = true := by decide
+
+/-- A reference into a frame that returned is dangling for the rest of the run: the second
+call's frame has an id of its own, so it is not taken for the first's. -/
+def dangle : Program :=
+  { adts := [],
+    fns :=
+      [{ name := "dangle", args := 0,
+         locals :=
+           [Ty.int ScalarTy.U32, Ty.ref false (Ty.int ScalarTy.U32),
+            Ty.ref false (Ty.int ScalarTy.U32)],
+         blocks :=
+           [{ stmts := [],
+              terminator := Terminator.call (Callee.fn 1) [] (Place.mk 1 []) (some 1) },
+            { stmts := [],
+              terminator := Terminator.call (Callee.fn 1) [] (Place.mk 2 []) (some 2) },
+            { stmts :=
+                [Statement.assign (Place.mk 0 [])
+                   (Rvalue.use (Operand.copy (Place.mk 1 [ProjElem.deref])))],
+              terminator := Terminator.ret }] },
+       { name := "escape", args := 0,
+         locals := [Ty.ref false (Ty.int ScalarTy.U32), Ty.int ScalarTy.U32],
+         blocks :=
+           [{ stmts :=
+                [Statement.assign (Place.mk 1 [])
+                   (Rvalue.use (Operand.const (Const.int ScalarTy.U32 5))),
+                 Statement.assign (Place.mk 0 []) (Rvalue.ref false (Place.mk 1 []))],
+              terminator := Terminator.ret }] }] }
+
+example : isUndefined Undefined.dangling (dangle.call 8 0 [] []) = true := by decide
+
+/-- Two `&mut` to one local, both live: the model has no aliasing rule, so a write through
+one is read through the other (7 here), where Rust says undefined behaviour. No program the
+borrow checker accepts does this, and the encoder embeds only such programs: every theorem
+about a Rust program has that as its hypothesis. -/
+def aliased : Program :=
+  { adts := [],
+    fns :=
+      [{ name := "aliased", args := 0,
+         locals :=
+           [Ty.int ScalarTy.U32, Ty.int ScalarTy.U32, Ty.ref true (Ty.int ScalarTy.U32),
+            Ty.ref true (Ty.int ScalarTy.U32)],
+         blocks :=
+           [{ stmts :=
+                [Statement.assign (Place.mk 1 [])
+                   (Rvalue.use (Operand.const (Const.int ScalarTy.U32 1))),
+                 Statement.assign (Place.mk 2 []) (Rvalue.ref true (Place.mk 1 [])),
+                 Statement.assign (Place.mk 3 []) (Rvalue.ref true (Place.mk 1 [])),
+                 Statement.assign (Place.mk 2 [ProjElem.deref])
+                   (Rvalue.use (Operand.const (Const.int ScalarTy.U32 7))),
+                 Statement.assign (Place.mk 0 [])
+                   (Rvalue.use (Operand.copy (Place.mk 3 [ProjElem.deref])))],
+              terminator := Terminator.ret }] }] }
+
+example : isInt ScalarTy.U32 7 (aliased.call 4 0 [] []) = true := by decide
+
 /-! The first function with a proof: FNV-1a of the byte `a` from the offset basis. -/
 
 example :

@@ -137,11 +137,11 @@ theorem inBounds_some (p : Pointer) (n : Nat) (v : Value) :
     inBounds p n (some v) = Outcome.ok (p.push (PathElem.index n)) := rfl
 
 /-- A step is the running frame's block. -/
-theorem step_block (prog : Program) (base : List Slot) (fr : Frame) (rest : List Frame)
+theorem step_block (prog : Program) (base : List Slot) (fr : Frame) (rest : List Frame) (next : Nat)
     (blk : BasicBlock) (hb : prog.block fr.fn fr.block = some blk) :
-    step prog { base := base, stack := fr :: rest } =
-      execBlock prog.adts prog.sig { base := base, stack := fr :: rest } blk := by
-  show execBlock? prog.adts prog.sig { base := base, stack := fr :: rest }
+    step prog { base := base, stack := fr :: rest, next := next } =
+      execBlock prog.adts prog.sig { base := base, stack := fr :: rest, next := next } blk := by
+  show execBlock? prog.adts prog.sig { base := base, stack := fr :: rest, next := next }
     (prog.block fr.fn fr.block) = _
   rw [hb]
   rfl

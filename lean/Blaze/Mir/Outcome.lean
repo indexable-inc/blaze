@@ -44,6 +44,21 @@ def Outcome.bind {α β : Type} (x : Outcome α) (f : α → Outcome β) : Outco
 theorem Outcome.bind_ok {α β : Type} (v : α) (f : α → Outcome β) :
     (Outcome.ok v).bind f = f v := rfl
 
+/-- A bind that gives a value had a value to bind. -/
+theorem Outcome.bind_eq_ok {α β : Type} (x : Outcome α) (f : α → Outcome β) (b : β)
+    (h : x.bind f = Outcome.ok b) : ∃ a, x = Outcome.ok a ∧ f a = Outcome.ok b := by
+  cases x with
+  | ok v => exact ⟨v, rfl, h⟩
+  | panic e =>
+    have h' : (Outcome.panic e : Outcome β) = Outcome.ok b := h
+    cases h'
+  | undefined why =>
+    have h' : (Outcome.undefined why : Outcome β) = Outcome.ok b := h
+    cases h'
+  | diverge =>
+    have h' : (Outcome.diverge : Outcome β) = Outcome.ok b := h
+    cases h'
+
 def Outcome.map {α β : Type} (f : α → β) (x : Outcome α) : Outcome β :=
   x.bind (fun v => Outcome.ok (f v))
 

@@ -269,7 +269,8 @@ inductive Next where
 def State.jump (st : State) (target : BlockId) : Outcome Next :=
   match st.stack with
   | [] => Outcome.undefined Undefined.illFormed
-  | fr :: rest => Outcome.ok (Next.state { base := st.base, stack := fr.withBlock target :: rest })
+  | fr :: rest => Outcome.ok (Next.state
+      { base := st.base, stack := fr.withBlock target :: rest, next := st.next })
 
 def State.jump? (st : State) : Option BlockId → Outcome Next
   | some target => st.jump target
@@ -309,11 +310,12 @@ def State.enter (st : State) (id : FnId) (sig : FnSig) (args : List Value) (dest
     Outcome.ok (Next.state
       { base := st.base,
         stack :=
-          ({ fn := id, block := 0,
+          ({ id := st.next, fn := id, block := 0,
              locals :=
                Slot.uninit ::
                  (args.map Slot.init ++ List.replicate (sig.locals - 1 - sig.args) Slot.uninit),
-             dest := dest, target := target } : Frame) :: st.stack })
+             dest := dest, target := target } : Frame) :: st.stack,
+        next := st.next + 1 })
   else Outcome.undefined Undefined.illFormed
 
 /-- The running frame returns what its local 0 holds: to its caller's destination, or as the
@@ -329,7 +331,7 @@ def State.ret (st : State) : Outcome Next :=
         match rest with
         | [] => Outcome.ok (Next.done v)
         | _ :: _ =>
-          (State.write { base := st.base, stack := rest } fr.dest v).bind (fun st1 =>
+          (State.write { base := st.base, stack := rest, next := st.next } fr.dest v).bind (fun st1 =>
             st1.jump? fr.target))
 
 def saturating (op : BinOp) {ty : ScalarTy} (a b : Scalar ty) : Outcome Value :=
