@@ -174,6 +174,9 @@ fn mark(storage: &Storage, header: &Header, word: u32, node: &NodeRow) -> bool {
         Ok(_) => {
             node.paint(color(view, header.changed.load(Ordering::Relaxed)));
             counts::count(key_parts(node.key()).0, counts::VERIFIED);
+            // A row proved current is query work ended, as one verified under its flight is:
+            // what the stall watchdog reads (`function::completed`).
+            super::function::complete_one();
             true
         }
         Err(now) => now == to,

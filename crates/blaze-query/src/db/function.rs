@@ -535,7 +535,10 @@ std::thread_local! {
     static SLOT: Cell<usize> = const { Cell::new(usize::MAX) };
 }
 
-fn complete_one() {
+/// One more of [`completed`]'s count, on this thread's slot: a query brought up to date under
+/// its flight ([`refresh`]), a row the claim-free verification marked (`verify::mark`), or an
+/// item of a loop over the pool that ran to its end ([`super::par_for_each`]).
+pub(crate) fn complete_one() {
     let at = SLOT.with(|slot| {
         if slot.get() == usize::MAX {
             slot.set(NEXT_SLOT.fetch_add(1, Ordering::Relaxed) % SLOTS);
@@ -545,9 +548,15 @@ fn complete_one() {
     COMPLETED[at].0.fetch_add(1, Ordering::Relaxed);
 }
 
-/// The queries this process's databases brought up to date under their flight (each run or
-/// verified there), on every thread: it grows while query work moves, so the daemon's
-/// watchdog fails a build where tasks run and it stays still.
+/// The query work this process's databases ended, on every thread: each query brought up to
+/// date under its flight (run or verified there), each row the claim-free verification marked
+/// current (`verify::unclaimed`: after a restart, or a write of a durable input, a memo is
+/// proved by a walk that claims nothing, and a daemon whose every worker did only that counted
+/// nothing here for the stall bound and was ended as stalled, 2026-11-11), and each item of a
+/// loop over the pool that ran to its end ([`super::par_for_each`]: a loop's jobs each run
+/// many items, so no job of the pool ends while the loop lasts). It grows while query work
+/// moves and only then: a worker parked on a wait, or blocked, ends none of the three. So the
+/// daemon's watchdog fails a build where tasks run and it stays still.
 pub fn completed() -> u64 {
     COMPLETED.iter().map(|it| it.0.load(Ordering::Relaxed)).sum()
 }
