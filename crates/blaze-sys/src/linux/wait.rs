@@ -116,7 +116,9 @@ impl SigSet {
     #[blaze::nopanic]
     pub const fn with(self, signal: u32) -> SigSet {
         match signal {
-            1..=64 => SigSet(self.0 | 1 << (signal - 1)),
+            // Wrapping forms: the arm's range keeps both in bounds, and no overflow check
+            // (a panic path) is compiled in.
+            1..=64 => SigSet(self.0 | 1u64.wrapping_shl(signal.wrapping_sub(1))),
             _ => self,
         }
     }
