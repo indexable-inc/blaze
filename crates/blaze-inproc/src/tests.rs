@@ -691,6 +691,30 @@ fn memory(image: u64, arena: u64) -> Option<CodeMemory> {
     }
 }
 
+/// [`CodeMemory::zero`] leaves its range zeros and fills only the pages something wrote
+/// since the object was made: a range never written (an image's patch room) costs nothing.
+#[test]
+fn zeroing_fills_only_the_pages_that_were_written() {
+    let Some(mut memory) = memory(1, 1) else { return };
+    let page = memory.page();
+    drop(memory);
+    let Some(mut memory) = self::memory(64 * page, page) else { return };
+    assert_eq!(memory.zero(0, 64 * page).unwrap(), 0, "nothing was written: nothing is filled");
+    memory.write(3 * page + 5, &[7]).unwrap();
+    memory.fill(10 * page, 2 * page + 1, 0xcc).unwrap();
+    // Part of a written run: what is before the range stays.
+    assert_eq!(memory.zero(10 * page + 100, page).unwrap(), page);
+    let held = memory.bytes(CodeRange { offset: 10 * page, len: 2 * page + 1 }).unwrap();
+    assert!(held[..100].iter().all(|it| *it == 0xcc));
+    assert!(held[100..100 + page as usize].iter().all(|it| *it == 0));
+    assert!(held[100 + page as usize..].iter().all(|it| *it == 0xcc));
+    // The whole image: the four pages ever written, of 64.
+    assert_eq!(memory.zero(0, 64 * page).unwrap(), 4 * page);
+    let all = memory.bytes(CodeRange { offset: 0, len: 64 * page }).unwrap();
+    assert!(all.iter().all(|it| *it == 0));
+    assert!(memory.zero(64 * page, 2 * page).is_err(), "past the image and the arena");
+}
+
 #[test]
 fn sizes_round_up_to_pages() {
     let Some(memory) = memory(1, 1) else { return };
