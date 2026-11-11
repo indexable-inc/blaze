@@ -1129,8 +1129,14 @@ fn group_of(cause: &RebuildCause) -> String {
     }
 }
 
-/// `rebuilt` in groups by step and reason, the most items first, then by step and reason;
-/// each lists its first [`LISTED`] items, or every one with `all`. With how many there are.
+/// The step of what a build's checkout lost of its last build's results (blaze-cargo's
+/// `Jobs::lose`): said before every other group and root cause, as the daemon lowered the
+/// build's front end anew for it, and most of what else was computed again follows from that.
+const NOT_KEPT: &str = blaze_profile::slow::NOT_KEPT_STEP;
+
+/// `rebuilt` in groups by step and reason: what the last build lost first ([`NOT_KEPT`]), then
+/// the most items first, then by step and reason; each lists its first [`LISTED`] items, or
+/// every one with `all`. With how many there are.
 fn groups<'a>(rebuilt: impl Iterator<Item = &'a Rebuild>, all: bool) -> (u32, Vec<RebuildGroup>) {
     // alloc: once a request, a group a reason
     let mut by: BTreeMap<(&str, String), RebuildGroup> = BTreeMap::new();
@@ -1152,14 +1158,19 @@ fn groups<'a>(rebuilt: impl Iterator<Item = &'a Rebuild>, all: bool) -> (u32, Ve
     }
     // alloc: once a request
     let mut groups: Vec<((&str, String), RebuildGroup)> = by.into_iter().collect();
-    groups.sort_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(&b.0)));
+    groups.sort_by(|a, b| {
+        (a.1.step != NOT_KEPT)
+            .cmp(&(b.1.step != NOT_KEPT))
+            .then(b.1.count.cmp(&a.1.count))
+            .then_with(|| a.0.cmp(&b.0))
+    });
     (count, groups.into_iter().map(|(_, it)| it).collect())
 }
 
 /// What a build that computed `rebuilt` again says of itself once it ends
 /// (docs/v2/plan/design/why.md, "What is printed"): a report a root cause (the ends its steps
-/// share), the most steps first and then in the ends' order, the first [`CAUSES`], and one
-/// more counting the rest. Nothing for a build that computed nothing again. A function of
+/// share), what the last build lost first ([`NOT_KEPT`]), then the most steps first and then
+/// in the ends' order, the first [`CAUSES`], and one more counting the rest. Nothing for a build that computed nothing again. A function of
 /// `rebuilt`'s steps and their ends alone, whatever order they are in (rule 25).
 pub fn summary(rebuilt: &[Rebuild]) -> Vec<Report> {
     // alloc: once a build, a group a root cause
@@ -1168,7 +1179,15 @@ pub fn summary(rebuilt: &[Rebuild]) -> Vec<Report> {
         by.entry(it.ends.as_slice()).or_default().push(it);
     }
     let mut groups: Vec<(&[Reason], Vec<&Rebuild>)> = by.into_iter().collect(); // alloc: as above
-    groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(b.0)));
+    // What the last build lost is said first, however many steps share its cause: with more
+    // than `CAUSES` root causes it would be counted among "the rest" and never read.
+    let not_kept = |steps: &[&Rebuild]| steps.iter().any(|it| it.step == NOT_KEPT);
+    groups.sort_by(|a, b| {
+        not_kept(&b.1)
+            .cmp(&not_kept(&a.1))
+            .then(b.1.len().cmp(&a.1.len()))
+            .then_with(|| a.0.cmp(b.0))
+    });
     // alloc: once a build, a report a cause said
     let mut out: Vec<Report> =
         groups.iter().take(CAUSES).map(|(ends, steps)| cause(ends, steps)).collect();
@@ -1414,6 +1433,34 @@ mod tests {
 
     fn id(n: u8) -> ContentId {
         ContentId([n; 32])
+    }
+
+    /// What the last build lost is the first group `blaze why` prints and the first root
+    /// cause a build says of itself, though one row among hundreds: on 2026-11-10 it was the
+    /// last of both, under every unit it had made the build compute again.
+    #[test]
+    fn what_the_last_build_lost_is_said_first() {
+        let lost = RebuildCause::Always { why: "the item store: two images were made".to_owned() };
+        let step = |step: &str, item: &str, cause: &RebuildCause| Rebuild {
+            ends: Vec::new(),
+            item: item.to_owned(),
+            step: step.to_owned(),
+            cause: cause.clone(),
+        };
+        let mut rebuilt: Vec<Rebuild> =
+            (0..5).map(|n| step("unit", &format!("crate-{n}"), &RebuildCause::First)).collect();
+        rebuilt.push(step(NOT_KEPT, "the last build of /w", &lost));
+        let (count, groups) = groups(rebuilt.iter(), false);
+        assert_eq!(count, 6);
+        assert_eq!((groups[0].step.as_str(), groups[0].count), (NOT_KEPT, 1), "{groups:#?}");
+        assert_eq!((groups[1].step.as_str(), groups[1].count), ("unit", 5), "{groups:#?}");
+        // The control: with no such row the most items are first, as before.
+        let (_, without) = groups_of(&rebuilt[..5]);
+        assert_eq!(without[0].step, "unit");
+    }
+
+    fn groups_of(rebuilt: &[Rebuild]) -> (u32, Vec<RebuildGroup>) {
+        groups(rebuilt.iter(), false)
     }
 
     fn miss(item: &str, subject: u8, key: u8, parts: &[(&str, u8)]) -> Miss {

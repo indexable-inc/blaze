@@ -137,6 +137,15 @@ each waited for (`function`, `awaits`). The finding of 2026-11-10 (Linux, XFS): 
 edit of a hello world answered 3.2 s late, held by that span, while the loop thread sat in
 `ioctl(FICLONE)` for 0.9 and 1.4 s. loop_syscalls.py holds the same from outside, with strace.
 
+Results kept. Every edit's row also fails, whatever its time, when the daemon's log gained a
+line saying `were not kept after its answer was sent` over the row's builds (`NOT_KEPT`,
+`not_kept`): what a build left for the store (its dependency images, check outcomes, goals and
+bodies' steps) was lost after its answer, and where the whole of it was, the front end with it,
+so the next build lowered anew. The finding of 2026-11-10 (ripgrep): the daemon printed that
+line after every build ("the item store: keeping the shape of the MIR of StaticId(..): two
+images were made under ..") and each body edit took 43 s in place of 2; the line was found
+after an hour of reading the profile. `blaze slow` and `blaze why` say the same first.
+
 `smoke` is what keeps this script able to run against the blaze of the tree: the merge gate
 runs it with the blaze the change built (blaze-platform.yaml, `profile-gate`). After the
 engine's preflight (engine.V2.preflight) it writes fixture.py's workspace (three small crates),
@@ -968,6 +977,16 @@ def loop_failures(rows: Sequence[SpanRow], hold_ms: float) -> list[str]:
     return out
 
 
+# The daemon's line for what a build left for the store and lost after its answer (blaze-cargo's
+# `Jobs::lose`; the docstring's "Results kept").
+NOT_KEPT = "were not kept after its answer was sent"
+
+
+def not_kept(log: str) -> list[str]:
+    """The lines of the daemon's log that say a build's results were not kept, as printed."""
+    return [line.strip() for line in log.splitlines() if NOT_KEPT in line]
+
+
 @dataclass(frozen=True)
 class Edits:
     seconds: tuple[float, ...]
@@ -1116,6 +1135,10 @@ class Lane:
         stalled: list[str] = []
         places = 0
         n = 0
+        # What a build left for the store is stored after its answer and before the next build
+        # of the checkout lowers: each timed build's loss is in the log once the build that
+        # takes its edit back has answered.
+        log_from = len(log_text(self).encode())
         while (len(seconds) < self.args.runs if limit_ms is None
                else not enough([s * 1000 for s in seconds], limit_ms, self.args)):
             places = apply(n)
@@ -1135,6 +1158,10 @@ class Lane:
                 revert(n)
             self.build(f"{step} {n + 1} taken back", False)
             n += 1
+        if lost := not_kept(log_text(self, log_from)):
+            raise Wrong(f"{self.name}: {step}: the daemon did not keep what {len(lost)} of its builds left for the "
+                        f"store, so the builds after them started from less (their times: "
+                        f"{samples(s * 1000 for s in seconds)} ms); its log says:\n" + "\n".join(lost))
         if stalled:
             raise Wrong(f"{self.name}: {step}: the daemon's loop thread did not keep up in {len(stalled)} of "
                         f"{len(seconds)} builds' profiles (their times: {samples(s * 1000 for s in seconds)} ms):\n"
@@ -2150,6 +2177,17 @@ def selftest_ledger() -> None:
                f"the ledger's {row_id} selects no row: {given}")
 
 
+def selftest_not_kept() -> None:
+    """Which lines of a daemon's log fail an edit: the finding of 2026-11-10, and a log without it."""
+    line = ("blaze serve: the results of `build` in /root/m3/rg (job 0v7) were not kept after its answer was sent: "
+            "storing what the build of /root/m3/rg left for the store: the item store: keeping the shape of the MIR "
+            "of StaticId(StaticId(ae34)): two images were made under d1eed1fd3fdb")
+    log = f"blaze serve: listening\n  {line}\nblaze serve: a kept front end is let go\n{line}\n"
+    expect(not_kept(log) == [line, line], f"each line that says so, as printed: {not_kept(log)}")
+    expect(not_kept("blaze serve: listening\nblaze serve: the results of `build` were kept\n") == [] and not_kept("") == [],
+           "a log that does not say so fails nothing")
+
+
 def selftest_loop() -> None:
     """Which of a build's spans fail its edit: the finding of 2026-11-10 in miniature, and the
     fixed state."""
@@ -2249,6 +2287,7 @@ def selftest() -> None:
     selftest_ledger()
     selftest_work()
     selftest_loop()
+    selftest_not_kept()
     expect(verdict(30, 30, True) == "pass" and verdict(30.01, 30, True) == "fail", "at most")
     expect(verdict(0.8, 0.8, False) == "pass" and verdict(0.79, 0.8, False) == "fail", "at least")
     expect(describe(12.5, 30, True, "ms") == "12.5 ms against a budget of at most 30 ms", describe(12.5, 30, True, "ms"))

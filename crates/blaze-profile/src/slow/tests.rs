@@ -89,13 +89,67 @@ fn report(switches: Vec<SwitchIn>, spans: Vec<SpanIn>, wall: i64, facts: &Facts)
     let path = path::critical(&model);
     let one = analyse(&model, &path, facts);
     assert_eq!(one, analyse(&model, &path, facts), "the same rows give the same report");
+    let ranked: Vec<&Finding> = one.findings.iter().filter(|it| it.kind != Kind::NotKept).collect();
     assert!(
-        one.findings
+        ranked
             .windows(2)
             .all(|it| it[0].saves_ns >= it[1].saves_ns || it[1].estimate == Estimate::Unknown),
         "ranked by saving"
     );
     one
+}
+
+/// A build whose checkout's last build lost what it left for the store says so first, with the
+/// daemon's reason, before the serial work that is its consequence: on 2026-11-10 the line the
+/// daemon had printed after every build of ripgrep ("were not kept after its answer was sent")
+/// took an hour of reading a profile to find.
+#[test]
+fn what_the_last_build_lost_is_the_first_finding() {
+    let switches = || {
+        let mut switches = vec![switch(1, 0, Event::Started, 1), switch(1, 100, Event::Ended, 1)];
+        for it in 2..=4 {
+            switches.extend([
+                switch(it, 0, Event::Started, u64::from(it)),
+                switch(it, 10, Event::Ended, u64::from(it)),
+            ]);
+        }
+        switches
+    };
+    let lowering = || vec![span(1, 1, None, "impls publish", 0, 100, 1)];
+    let why = "the last build of /w (`build`) answered before what it left for the store was \
+               durable, and it was not kept: the item store: keeping the shape of the MIR of \
+               StaticId(StaticId(ae34)): two images were made under d1eed1fd";
+    let mut facts = workers(1..=4);
+    facts.misses = vec![
+        MissGroup {
+            step: "unit".to_owned(),
+            cause: "changed".to_owned(),
+            count: 40,
+            example: "ripgrep".to_owned(),
+            what: None,
+        },
+        MissGroup {
+            step: NOT_KEPT_STEP.to_owned(),
+            cause: "always".to_owned(),
+            count: 1,
+            example: "the last build of /w".to_owned(),
+            what: Some(why.to_owned()),
+        },
+    ];
+    let it = report(switches(), lowering(), 100, &facts);
+    let first = &it.findings[0];
+    assert_eq!((first.kind, first.fix), (Kind::NotKept, Fix::KeepResults), "{:#?}", it.findings);
+    assert_eq!(first.evidence, [why]);
+    assert!(it.findings.len() >= 2, "what it cost follows: {:#?}", it.findings);
+    assert!(it.findings[1..].iter().all(|it| it.kind != Kind::NotKept));
+    let text = text(&it, 1);
+    assert!(text.contains(" 1. saves ?  the last build's results were not kept"), "{text}");
+    assert!(text.contains("two images were made under"), "{text}");
+
+    // The control: with no such row, the same build's first finding is its serial work.
+    facts.misses.truncate(1);
+    let without = report(switches(), lowering(), 100, &facts);
+    assert!(without.findings.iter().all(|it| it.kind != Kind::NotKept), "{:#?}", without.findings);
 }
 
 fn finding(report: &Report, kind: Kind) -> &Finding {

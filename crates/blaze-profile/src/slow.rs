@@ -51,8 +51,14 @@ pub use render::{text, thread_line};
 /// park whose wait span was under the floor is classed `<kind> wait under the read floor`, not an
 /// unnamed wait; the workers' CPU counts every span, read or not.
 /// 6: `build.panics`, the build's panics and its daemon's fatal signal, each with its stack's
-/// top frames.
-pub const VERSION: u32 = 6;
+/// top frames. 7: a build whose checkout's last build lost what it left for the store has the
+/// finding `not_kept` (fix `keep_results`), ranked first.
+pub const VERSION: u32 = 7;
+
+/// The `step` of the misses row a build takes when its checkout's last build answered and
+/// then lost what it left for the store (blaze-cargo's `Jobs::lose`): the daemon lowers this
+/// build's front end anew, so nearly everything else the report finds follows from it.
+pub const NOT_KEPT_STEP: &str = "results kept after the answer";
 
 /// The build the report is of, as its `builds` row says.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -282,6 +288,7 @@ pub struct Report {
     pub build: BuildFacts,
     pub summary: Summary,
     /// Ranked: most wall time saved first; those whose saving can't be estimated last.
+    /// A `not_kept` finding is before them all.
     pub findings: Vec<Finding>,
     /// What the profile could not see, most time hidden first.
     pub blind_spots: Vec<BlindSpot>,
@@ -376,6 +383,9 @@ pub struct SpanStack {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
+    /// What the checkout's last build left for the store was not kept ([`NOT_KEPT_STEP`]):
+    /// ranked first, as the cause of most of what the build computed again.
+    NotKept,
     /// Work on the critical path that ran serially while workers were idle.
     Serial,
     /// Work on the critical path that was on a core but got little CPU.
@@ -413,6 +423,7 @@ pub enum Fix {
     KeepAcrossBuilds,
     ExplainMiss,
     ReadOnce,
+    KeepResults,
 }
 
 impl Fix {
@@ -442,6 +453,9 @@ impl Fix {
             }
             Fix::ExplainMiss => {
                 "find why each was computed again (`blaze why`) and key it so it is reused"
+            }
+            Fix::KeepResults => {
+                "fix what refused the last build's results (the reason above; the daemon's log has the same line, `were not kept after its answer was sent`): until then every build of this checkout computes again what the last one left, and the findings below are mostly its cost"
             }
             Fix::ReadOnce => {
                 "read each row once a run: hoist reads out of loops over items, or read one query that gathers them; each read costs the run a query stack entry and its verify a check"
@@ -540,8 +554,11 @@ pub fn analyse(model: &Model, path: &Path, facts: &Facts) -> Report {
     findings.retain(|it| it.estimate == Estimate::Unknown || it.saves_ns >= cut_ns);
     let smaller = (before - findings.len()) as u32;
     findings.sort_by(|a, b| {
-        (a.estimate == Estimate::Unknown)
-            .cmp(&(b.estimate == Estimate::Unknown))
+        // What the last build lost comes first: the daemon said it already, and reading the
+        // rest of the report without it is reading its consequences.
+        (a.kind != Kind::NotKept)
+            .cmp(&(b.kind != Kind::NotKept))
+            .then((a.estimate == Estimate::Unknown).cmp(&(b.estimate == Estimate::Unknown)))
             .then(b.saves_ns.cmp(&a.saves_ns))
             .then(a.kind.cmp(&b.kind))
             .then_with(|| a.subject.cmp(&b.subject))
@@ -1304,9 +1321,27 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    /// The misses table, by step and cause; a first build's misses have nothing to reuse.
+    /// The misses table, by step and cause; a first build's misses have nothing to reuse. The
+    /// row that says the last build's results were not kept ([`NOT_KEPT_STEP`]) is a finding of
+    /// its own kind, ranked first.
     fn missed(&self, out: &mut Vec<Finding>) {
         for it in self.facts.misses.iter().filter(|it| it.cause != "first") {
+            if it.step == NOT_KEPT_STEP {
+                // alloc: a finding's evidence
+                let why = it.what.clone().unwrap_or_else(|| it.example.clone()); // clone: once a report
+                out.push(Finding {
+                    stacks: Stacks::default(),
+                    kind: Kind::NotKept,
+                    fix: Fix::KeepResults,
+                    saves_ns: 0,
+                    estimate: Estimate::Unknown,
+                    title: "the last build's results were not kept, so this build computed them again".to_owned(),
+                    subject: NOT_KEPT_STEP.to_owned(),
+                    owner: None,
+                    evidence: vec![why],
+                });
+                continue;
+            }
             // alloc: a finding's evidence
             let mut evidence = vec![format!("for example {}", it.example)];
             if let Some(what) = &it.what {

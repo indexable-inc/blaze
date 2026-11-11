@@ -469,7 +469,8 @@ pub(crate) fn differences(kept: &Kept) -> Result<(), ApiError> {
 /// [`hir_def::deps::store`] and resolved again in each build); the outcomes and checked bodies
 /// of the dependency crates it checked (`later`, their paths named from `root`), after their
 /// dependencies'; the constants' values they evaluated; the goals and bodies' steps offered,
-/// with what their flushes did ([`noted`]). Called on a worker as the front end is kept
+/// with what their flushes did ([`noted`]). A goal or a step its flush would not keep is in
+/// what the flush did and stops nothing here ([`Flushes::take_refusal`]). Called on a worker as the front end is kept
 /// ([`crate::serve::work::Steps::store_kept`]), which no task reads then, and its puts made
 /// durable before the build that kept it answers.
 pub(crate) fn store(
@@ -555,6 +556,37 @@ pub(crate) struct Flushes {
     pub(crate) items: Option<body_store::Flushed>,
 }
 
+impl Flushes {
+    /// What the flushes would not keep, taken, to be said once: `None` when each kept every
+    /// goal and body's step it was given. Such a record is a bug in a key or in the store
+    /// (keys-cover-every-input), so it is said as a loss of the build's
+    /// ([`crate::serve::work::Steps::kept_refusal`]); it is one record's all the same, and
+    /// everything else the build left was kept and its front end with it
+    /// (panics-fail-one-job): until 2026-11-10 one such step stopped [`store`], which lost
+    /// every image, outcome, goal and step of the build and dropped its front end, so the
+    /// checkout's next build lowered anew.
+    pub(crate) fn take_refusal(&mut self) -> Option<String> {
+        let items = self.items.as_mut().and_then(|it| Some((it.failed, it.failure.take()?)));
+        let goals = self.goals.failure.take().map(|why| (self.goals.failed, why));
+        let said = |what: &str, (failed, why): (usize, String)| {
+            // alloc: a loss, once
+            format!(
+                "{what} did not keep {failed} of the records this build offered (every other was kept, and the                  front end with them), the first: {why}"
+            )
+        };
+        match (items, goals) {
+            (None, None) => None,
+            (Some(items), None) => Some(said("the item store", items)),
+            (None, Some(goals)) => Some(said("the persistent goal cache", goals)),
+            (Some(items), Some(goals)) => Some(format!(
+                "{}; {}",
+                said("the item store", items),
+                said("the persistent goal cache", goals)
+            )), // alloc: a loss, once
+        }
+    }
+}
+
 /// The `-v` note of a build: what [`store`]'s flushes did for the head's last front end it
 /// lowered into (`flushes`: the goals' ([`flushed`]), then the bodies' steps the head's last
 /// build offered, and why any were kept out), then what this build's item store lookups
@@ -615,12 +647,18 @@ fn items_flushed(items: &body_store::Flushed, message: &mut String) {
         unshareable,
         unencodable,
         dropped,
+        failed,
+        failure: _,
         steps: _,
     } = items;
     // alloc: under `-v`, once per build that stored a front end
     message.push_str(&format!(
         "the item store: {written} written, {kept} kept, {slots_full} with every slot full"
     ));
+    if *failed > 0 {
+        // alloc: as above
+        message.push_str(&format!("; {failed} the store would not keep (the daemon's log says which)"));
+    }
     if !refused.is_empty() {
         let by: Vec<String> =
             refused.iter().map(|(read, count)| format!("`{read}` ({count})")).collect(); // alloc: as above
@@ -650,6 +688,8 @@ pub(crate) fn flushed(flushed: &goal_store::Flushed) -> Diagnostic {
         unhashable,
         too_long,
         dropped,
+        failed,
+        failure: _,
     } = flushed;
     // alloc: under `-v`, once per build that stored a front end
     let mut message = format!(
@@ -668,6 +708,10 @@ pub(crate) fn flushed(flushed: &goal_store::Flushed) -> Diagnostic {
         if *count > 0 {
             message.push_str(&format!("; {count} {why}")); // alloc: as above
         }
+    }
+    if *failed > 0 {
+        // alloc: as above
+        message.push_str(&format!("; {failed} the store would not keep (the daemon's log says which)"));
     }
     Diagnostic::note(message)
 }
@@ -771,19 +815,35 @@ struct Images {
     /// The daemon's proc macros, whose kept expansions' reads [`ImageStore::reads_now`] works
     /// out again.
     macros: Arc<blaze_macro_eval::Macros>,
-    /// What it asked to keep, in the order asked; a write path, once per crate it images and
-    /// per goal a flush writes.
-    puts: Lock<Vec<Put>>,
+    /// What it asked to keep; a write path, once per crate it images and per goal and body's
+    /// step a flush writes.
+    puts: Lock<Puts>,
+}
+
+/// What an [`Images`] was asked to keep since the last take: the puts in the order asked, and
+/// where each key's is. A flush asks a put for the shape and the answer of every goal and
+/// body's step a build offered (a few hundred thousand of a real workspace), and each put
+/// looks for its key among those asked before: by the index, never a scan of them all.
+///
+/// A get does not read them: a value is in the store once the loop put it, after the flush
+/// that asked. A flush that writes two values of one family of keys in turn (two shapes of
+/// one base key) keeps what it placed itself (`goal_store::slots`).
+struct Puts {
+    list: Vec<Put>,
+    at: HashMap<ContentId, usize, Global>,
 }
 
 impl Images {
     fn new(store: blaze_cas::Reader, macros: Arc<blaze_macro_eval::Macros>) -> Images {
-        Images { store, macros, puts: Lock::new("serve.deps.images.puts", Vec::new()) }
+        let puts = Puts { list: Vec::new(), at: HashMap::new_in(Global) }; // alloc: none until a put
+        Images { store, macros, puts: Lock::new("serve.deps.images.puts", puts) }
     }
 
     /// What it was asked to keep since the last take, in the order asked.
     fn take_puts(&self) -> Vec<Put> {
-        std::mem::take(&mut *self.puts.lock())
+        let mut puts = self.puts.lock();
+        puts.at.clear();
+        std::mem::take(&mut puts.list)
     }
 }
 
@@ -818,10 +878,14 @@ impl ImageStore for Images {
             Err(corrupt) => return Err(corrupt.to_string()),
         }
         let mut puts = self.puts.lock();
-        match puts.iter().find(|it| it.key == Key(key)) {
-            Some(put) if put.bytes == value => {}
+        let Puts { list, at } = &mut *puts;
+        match at.get(&key).copied() {
+            Some(asked) if list[asked].bytes == value => {}
             Some(_) => return Err(format!("two images were made under {key:?}")),
-            None => puts.push(Put { key: Key(key), kind: Kind::Query, bytes: value }),
+            None => {
+                at.insert(key, list.len()); // alloc: the index, one entry per put of a flush
+                list.push(Put { key: Key(key), kind: Kind::Query, bytes: value });
+            }
         }
         Ok(())
     }

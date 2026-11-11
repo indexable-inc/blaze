@@ -647,6 +647,17 @@ pub trait Steps: Sized + Send + Sync + 'static {
     /// after it loses none of it (persisted-state-round-trips). Called once per kept front
     /// end, while no task reads it; one already stored hands back no puts.
     fn store_kept(&self, kept: &mut Self::KeptFront) -> Result<Vec<KeptPut>, ApiError>;
+    /// On the loop, once the puts of a front end [`Steps::store_kept`] stored are made: what
+    /// of the build's the store would not keep although everything else was kept and the
+    /// front end stays (one goal's or one body's step's record its key does not hold: a bug in
+    /// a key, keys-cover-every-input), taken, so it is said once. It is said as a loss of the
+    /// build's (the daemon's log, `blaze status`, the checkout's next `blaze why`), and it
+    /// drops nothing: one record's refusal fails that record (panics-fail-one-job), never
+    /// the front end, without which the checkout's next build would lower anew.
+    fn kept_refusal(&self, kept: &mut Self::KeptFront) -> Option<String> {
+        let _ = kept;
+        None
+    }
     /// On a worker, by the task that stores a kept front end and before it stores: what the
     /// front end's query engine logged of why its queries ran since the last take, each memo
     /// and input named with the database in hand ([`Writer::run_log`], taken here so naming a

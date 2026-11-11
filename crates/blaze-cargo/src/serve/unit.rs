@@ -282,6 +282,10 @@ impl Steps for Real {
         Ok(puts)
     }
 
+    fn kept_refusal(&self, kept: &mut KeptLowered) -> Option<String> {
+        kept.flushed.as_mut().and_then(deps::Flushes::take_refusal)
+    }
+
     fn kept_run_log(&self, kept: &KeptLowered) -> blaze_query::db::Taken {
         blaze_query::db::take_log_in(kept.lowered.db())
     }

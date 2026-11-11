@@ -2268,8 +2268,9 @@ pub struct Lost {
 /// How many losses the jobs keep to show ([`Jobs::lost`]): the last ones.
 const LOST_SHOWN: usize = 16;
 
-/// The step a loss is under in `blaze why` ([`blaze_kernel::Miss::step`]).
-const SETTLING_STEP: &str = "results kept after the answer";
+/// The step a loss is under in `blaze why` ([`blaze_kernel::Miss::step`]), and what `blaze
+/// slow` ranks first by.
+const SETTLING_STEP: &str = blaze_profile::slow::NOT_KEPT_STEP;
 
 /// A job's lowering waiting for its root's front end, which is being stored
 /// ([`Jobs::lower`]): posted as the store ends, into the front end it gives back. It has no
@@ -5115,7 +5116,9 @@ impl<S: Steps> Jobs<S> {
     /// where the store is of what its job left to settle ([`Jobs::settling`]); none while the
     /// job still lives. The tickets of what was put go there, to settle after the answer. A
     /// store that failed, or panicked, changes no answer: it is a loss ([`Jobs::lose`]), its
-    /// front end dropped, and the root's next job lowers anew.
+    /// front end dropped, and the root's next job lowers anew. A store that kept everything
+    /// but a record its key does not hold ([`Steps::kept_refusal`]) is a loss said the same
+    /// way, of that record alone: the front end is the root's again.
     fn stored_kept(
         &mut self,
         w: &mut World<'_, S>,
@@ -5127,7 +5130,7 @@ impl<S: Steps> Jobs<S> {
         self.roots.storing[root as usize] -= 1;
         let mut tickets = blaze_cas::Tickets::default();
         let mut lost: Option<String> = match value {
-            Some((front, Ok(puts))) => {
+            Some((mut front, Ok(puts))) => {
                 let mut failed = None;
                 let put = !puts.is_empty();
                 for super::work::KeptPut { put, what } in puts {
@@ -5156,6 +5159,13 @@ impl<S: Steps> Jobs<S> {
                     w.store.flush(w.effects);
                 }
                 if failed.is_none() {
+                    // A record the store would not keep of a build whose every other was
+                    // kept: said as a loss, and the front end stays the root's
+                    // ([`Steps::kept_refusal`]).
+                    failed = front.as_mut().and_then(|it| w.steps.kept_refusal(it)).map(|why| {
+                        // alloc: a loss, once
+                        format!("storing what the build of {checkout} left for the store: {why}")
+                    });
                     self.roots.fronts[root as usize] = front;
                 }
                 failed
