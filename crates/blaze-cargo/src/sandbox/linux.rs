@@ -520,7 +520,7 @@ pub(super) fn run_as(
         }
         None => None,
     };
-    let ran = run_in(spec, program, scratch.as_deref(), also, interposer.as_deref());
+    let ran = run_in(spec, program, scratch.as_deref(), also, interposer.as_deref(), provider);
     if let Some(dir) = &scratch {
         _ = std::fs::remove_dir_all(dir);
     }
@@ -603,6 +603,7 @@ fn run_in(
     scratch: Option<&Path>,
     also: Also<'_>,
     interposer: Option<&Path>,
+    provider: Option<Provider>,
 ) -> Result<i32, String> {
     // Everything the processes of the sandbox use is made before the first fork.
     let argv: Vec<CString> = program
