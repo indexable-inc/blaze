@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-46 invariants, 15 refinements, 4 reference models.
-By level: 42 tested, 19 simulated, 0 model-checked, 0 proved.
+49 invariants, 16 refinements, 5 reference models.
+By level: 46 tested, 19 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
@@ -88,6 +88,15 @@ By level: 42 tested, 19 simulated, 0 model-checked, 0 proved.
 
 - **`a_kept_lookup_answers_as_the_manifests_do`** *tested* (`crates/blaze-engine/src/pin.rs`): a kept lookup answers what reading the manifests answers, whatever changed on the way since it was kept (the pin edited to one of the same length, a manifest added nearer, the root removed), and an unsettled manifest keeps nothing. The control at its end shows the kept answer is the one served while every stamp stands: a manifest rewritten in place with its stamp put back answers as kept, which is the very case [`SETTLED_NS`] keeps out of the file.
   Controls: `a_manifest_rewritten_under_its_stamp`.
+
+### blaze-ext-host
+
+- **`facts_equal_the_reference_fixpoint_after_any_edits`** *tested* (`crates/blaze-ext-host/src/facts/tests.rs`): after any edits, rewirings and switches of extension, against whatever an earlier solve kept, every fact of every item equals the least fixpoint of its function over the call graph as it stands; a solve with nothing kept gives the same bytes; and a solve after no change computes nothing.
+  Controls: `a_fact_not_recomputed_when_a_callee_s_fact_changed`, `a_cache_hit_across_two_extensions_code_identities`.
+- **`the_key_covers_blaze_the_source_and_the_grants`** *tested* (`crates/blaze-ext-host/src/key.rs`): a build's key changes with each of its inputs, and with nothing else.
+  Controls: `a_key_that_leaves_blaze_out`.
+- **`two_builds_give_the_same_diagnostics`** *tested* (`crates/blaze-ext-host/src/tests.rs`): two checks of the same source, on two databases, give the same diagnostics, byte for byte, in the same order; and so does a check that runs every job twice with its arena elsewhere.
+  Controls: `an_extension_that_misses_a_finding`, `a_result_that_depends_on_an_address`.
 
 ### blaze-graph
 
@@ -192,6 +201,11 @@ By level: 42 tested, 19 simulated, 0 model-checked, 0 proved.
 - **`lifting_and_lowering_keep_what_the_body_computes_on_any_bits`** *tested* (`crates/blaze-diff-mir/src/tests.rs`): the same at drawn inputs of any bits.
   Controls: `a_select_with_its_arms_swapped`.
 
+### blaze-ext-host
+
+- **`the_worked_example_finds_what_the_in_tree_lint_finds`** *tested* (`crates/blaze-ext-host/src/tests.rs`): over the same source, the extension `panic-in-drop` reports exactly what blaze's own `blaze::panic_in_drop` does: the same messages at the same places.
+  Controls: `an_extension_that_misses_a_finding`, `a_result_that_depends_on_an_address`.
+
 ### blaze-ids
 
 - **`a_keyed_set_kept_by_edits_is_the_set_made_whole`** *tested* (`crates/blaze-ids/src/keyed.rs`): after any sequence of sets and removals, the root kept by hashing only the edited entries' paths is the root of the same entries hashed whole, and so are the nodes kept.
@@ -226,6 +240,10 @@ By level: 42 tested, 19 simulated, 0 model-checked, 0 proved.
 ### blaze-diff
 
 - **`saturation_is_no_dearer_than_naive_rewriting`** (`crates/blaze-diff/src/tests/simplify.rs`): equality saturation that ran to the end finds a term at most as dear as naive rewriting to a fixpoint does, since every term naive rewriting reaches is in the root's class, and extraction takes the cheapest of the class.
+
+### blaze-ext-host
+
+- **`reference`** (`crates/blaze-ext-host/src/facts/tests.rs`): every item from its bottom, whole sweeps until one changes nothing. No components, no order, no cache: the least fixpoint by its definition.
 
 ### blaze-link
 

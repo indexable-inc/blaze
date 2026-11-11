@@ -1,0 +1,31 @@
+[package]
+name = "blaze-ext"
+description = "The API of blaze's extensions (docs/v2/plan/design/extensions.md): the real MIR, a capability context and the declarations of lints and facts, behind one deliberately chosen facade that a user's analysis crate is compiled against"
+publish = false
+
+# The API's own version, which an extension's `blaze-ext` requirement is held to
+# (`blaze_ext::VERSION`); not the workspace's.
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# `Applicability`: how sure a fix is, the one type every diagnostic of blaze has.
+blaze-api.workspace = true
+# The frame an extension's capped arena takes its memory from.
+blaze-mem.workspace = true
+# `DefWithBodyId`: which item a body is of.
+hir-def.workspace = true
+# The MIR an extension reads: `hir_ty_mir::mir`, as the front end builds it.
+hir-ty-mir.workspace = true
+# `Db`, which only the host holds: what makes a `HostKey`.
+base-db.workspace = true
+
+[lints]
+workspace = true

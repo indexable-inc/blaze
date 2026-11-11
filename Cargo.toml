@@ -14,6 +14,9 @@ exclude = [
     # (crates/harness/README.md).
     "crates/harness",
     "demo",
+    # Extensions (docs/v2/plan/design/extensions.md): crates outside the workspace, as a user's
+    # are; blaze-ext-host's tests link the worked example by path.
+    "extensions",
     "harness",
     # The standard library's own workspace (docs/toolchain.md).
     "library",
@@ -359,6 +362,8 @@ blaze-dbsp = { path = "crates/blaze-dbsp" }
 blaze-diff = { path = "crates/blaze-diff", version = "0.0.0" }
 blaze-diff-mir = { path = "crates/blaze-diff-mir", version = "0.0.0" }
 blaze-diagnostics = { path = "crates/blaze-diagnostics", version = "0.0.0" }
+blaze-ext = { path = "crates/blaze-ext" }
+blaze-ext-host = { path = "crates/blaze-ext-host" }
 blaze-fetch = { path = "crates/blaze-fetch" }
 blaze-format = { path = "crates/blaze-format" }
 blaze-hash = { path = "crates/blaze-hash" }

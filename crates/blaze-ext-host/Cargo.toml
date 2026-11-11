@@ -1,0 +1,49 @@
+[package]
+name = "blaze-ext-host"
+description = "The host of blaze's extensions (docs/v2/plan/design/extensions.md): finds the extensions a workspace names, holds each to the compile-time checks, keys its build, loads it, runs its lints over a crate's bodies under fuel and a capped arena, and runs its facts to a fixpoint kept by code identity"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+base-db.workspace = true
+# `Diag`: an extension's finding joins the diagnostics every lint of blaze gives.
+blaze-diagnostics.workspace = true
+blaze-ext.workspace = true
+blaze-hash.workspace = true
+# `ContentId`: the keys of builds and facts.
+blaze-ids.workspace = true
+# `exec::Executable`: the memory an extension's code is mapped executable in, in this process.
+blaze-inproc.workspace = true
+# An item's key and code hash: which item a fact is of, and what it is.
+blaze-items.workspace = true
+# A job's frame.
+blaze-mem.workspace = true
+blaze-query.workspace = true
+hir.workspace = true
+hir-def.workspace = true
+hir-ty.workspace = true
+hir-ty-mir.workspace = true
+# The checks read an extension's source as tokens: a keyword is refused wherever it is written.
+rustc_lexer.workspace = true
+syntax.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+# The in-tree `panic_in_drop`, which the worked example is held to.
+blaze-lints.workspace = true
+hegeltest.workspace = true
+hir-expand = { workspace = true, features = ["fixture"] }
+# The worked example, compiled into the tests as a user's extension is into the daemon.
+panic-in-drop = { path = "../../extensions/panic-in-drop" }
+
+[lints]
+workspace = true
