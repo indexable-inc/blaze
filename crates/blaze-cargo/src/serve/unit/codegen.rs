@@ -1753,6 +1753,8 @@ fn debug_side(job: &Job, unit: usize, path: &str, linked: &mut Linked) -> Result
         written = tracing::field::Empty,
         ranges = tracing::field::Empty,
         records = tracing::field::Empty,
+        encoded = tracing::field::Empty,
+        all = tracing::field::Empty,
         whole = tracing::field::Empty,
     )
     .entered();
@@ -1781,9 +1783,16 @@ fn debug_side(job: &Job, unit: usize, path: &str, linked: &mut Linked) -> Result
     span.record("written", write.written());
     span.record("ranges", write.writes.len());
     span.record("records", write.records);
+    // How many functions' rows were encoded, and why every one was when the update did not
+    // follow the link's change.
+    span.record("encoded", write.encoded);
+    if let Some(why) = write.all {
+        span.record("all", why);
+    }
     if let Some(why) = write.whole {
         span.record("whole", why);
     }
+    write_plist(&first, &write)?;
     let plan = job.plan(unit).map_err(|it| LinkCause::Given(it.what))?;
     if let Some(copy) = super::artifact::uplifted(path, plan) {
         // The copy's side file is the same bytes: cloned where the volume can.
@@ -1799,8 +1808,24 @@ fn debug_side(job: &Job, unit: usize, path: &str, linked: &mut Linked) -> Result
         next.push(".blaze-next");
         std::fs::copy(&first, &next).map_err(|it| failed("copying the side file to it", it))?;
         std::fs::rename(&next, &to).map_err(|it| failed("renaming it into place", it))?;
+        write_plist(&to, &write)?;
     }
     Ok(())
+}
+
+/// A `.dSYM` bundle's `Info.plist` for the side file at `side`
+/// (`NAME.dSYM/Contents/Resources/DWARF/NAME`), written where the side file was laid out
+/// whole or the bundle has none; nothing for a side file that is no bundle.
+fn write_plist(side: &std::path::Path, write: &blaze_link::DebugWrite) -> Result<(), LinkCause> {
+    let (Some(bytes), Some(contents)) = (&write.plist, side.ancestors().nth(3)) else {
+        return Ok(());
+    };
+    let to = contents.join("Info.plist");
+    if write.base.is_some() && to.is_file() {
+        return Ok(());
+    }
+    // alloc: error path
+    std::fs::write(&to, bytes).map_err(|it| LinkCause::Given(format!("{}: writing it: {it}", to.display())))
 }
 
 /// What the build says when a splice was refused for a thunk it could not place and the
@@ -2577,6 +2602,8 @@ fn relink(
         weak_names,
         unnamed,
         debug_names,
+        // What the image holds with this change: in its build id.
+        given: Some(given),
         natives: bytes_of
             .iter()
             .map(|(at, bytes)| match assembled.get(*at) {

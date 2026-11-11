@@ -16,6 +16,9 @@
 //! - `.debug_str`: names, appended.
 //! - the executable's symbol table and its names, copied, since a reader that takes the side
 //!   file takes its symbols too (std's backtrace names a native function from them).
+//! - ELF: the executable's program headers with nothing in the file, as
+//!   `objcopy --only-keep-debug` leaves them. Mach-O: the bundle's `Info.plist`
+//!   ([`DebugWrite::plist`]), as `dsymutil` writes it.
 //!
 //! Each section has room to grow, as an image's regions have. What does not fit a patch (no
 //! room, a file the header does not name, more dead rows than live) lays the file out whole,
@@ -24,6 +27,12 @@
 //! executable's `.gnu_debuglink` holds ([`link_crc`]: of the build id, so the executable is
 //! written without the side file's bytes, and a side file of another generation is refused by
 //! a debugger's CRC check).
+//!
+//! An update follows the link's change ([`Delta`], [`Given::Changed`]): only the functions
+//! the link added, removed or named anew, and those with a line in a span table it gave anew,
+//! are encoded; the rest keep the record and hash they have. An update with no change at hand
+//! (the first, a rollback, a full layout, a link whose side file was never asked for) encodes
+//! every function and compares hashes, and says why ([`DebugWrite::all`]).
 //!
 //! Sans IO: [`Kept::update`] reads the executable through a closure and gives the bytes to
 //! write; who writes them clones the last file, writes the ranges and renames.
@@ -64,9 +73,13 @@ const SYMTAB: usize = 4;
 const STRTAB: usize = 5;
 const DWARF_NAMES: [&str; 4] = [".debug_abbrev", ".debug_info", ".debug_str", ".debug_line"];
 
-/// ELF: the build id note's place in the side file, and the most bytes it may take.
+/// ELF: the build id note's place in the side file, and the most bytes it may take. The
+/// executable's program headers follow, at [`PHDRS_AT`].
 const NOTE_AT: usize = 64;
 const NOTE_ROOM: usize = 64;
+const PHDRS_AT: usize = NOTE_AT + NOTE_ROOM;
+const PHDR: usize = 56;
+const PT_NOTE: u32 = 4;
 const ELF_BUILD_ID: &str = ".note.gnu.build-id";
 
 const SHT_NULL: u32 = 0;
@@ -105,15 +118,55 @@ pub(crate) struct Lined<'a> {
     pub column: u32,
 }
 
-/// What a side file is made from: the image's name, format and build id, and its Rust
-/// functions by address then key, each once.
+/// What a side file is made from: the image's name, format, build id and generation, and its
+/// Rust functions by address then key, each once: all of them, or those a link changed
+/// ([`Given`]).
 pub(crate) struct Input<'a> {
     pub format: Format,
     /// The image's file name.
     pub name: &'a str,
     pub id: [u8; 16],
+    /// The image's generation: what [`Kept::at`] is after this update.
+    pub generation: u64,
     pub functions: &'a [Func<'a>],
     pub lines: &'a [Lined<'a>],
+    pub given: Given<'a>,
+}
+
+/// Which functions an [`Input`] holds.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Given<'a> {
+    /// Every function of the image: each is encoded and compared with its record, and a
+    /// record of none of them is gone.
+    All,
+    /// The functions a link since the last update changed or may have ([`Delta`]); `gone` are
+    /// those it removed, and `count` is how many functions the image has now. Only these are
+    /// encoded. Records that then number other than `count` are not the image's: the update
+    /// asks for all of them ([`Kept::update`] gives `None`).
+    Changed { gone: &'a [InstanceKey], count: usize },
+}
+
+/// What a stage changed that a side file records, against the generation it was staged from:
+/// what lets [`crate::Image::debug_file`] encode the functions of an edit and not of the
+/// program. Kept on the state the stage made.
+#[derive(Debug)]
+pub(crate) struct Delta {
+    /// The generation the stage was made from.
+    pub base: u64,
+    /// The stage laid the image out whole, or is one that records no delta: every function
+    /// may have moved.
+    pub full: bool,
+    /// The functions added, removed or named anew, in any order.
+    pub keys: Vec<InstanceKey>,
+    /// The span tables given anew: every function with a line in one may have other rows.
+    pub anchors: Vec<ContentId>,
+}
+
+impl Default for Delta {
+    fn default() -> Delta {
+        // alloc: none, empty
+        Delta { base: u64::MAX, full: true, keys: Vec::new(), anchors: Vec::new() }
+    }
 }
 
 /// What to write of an image's debug side file so it describes the image as committed
@@ -137,8 +190,18 @@ pub struct DebugWrite {
     pub writes: Vec<(u64, Vec<u8>)>,
     /// The function records written: entries of `.debug_info` and sequences of `.debug_line`.
     pub records: u64,
+    /// The functions whose rows were encoded to make this: those of the link's change when
+    /// the update followed one, every function otherwise ([`DebugWrite::all`] says why).
+    pub encoded: u64,
+    /// Why every function was encoded and compared, when the update did not follow a
+    /// link's change.
+    pub all: Option<&'static str>,
     /// Why the file was laid out whole, when it was.
     pub whole: Option<&'static str>,
+    /// Mach-O: the bundle's `Contents/Info.plist`, which lldb and Spotlight read to take the
+    /// directory for a dSYM. The same bytes every update of one image: who writes the side
+    /// file writes it where it is not there.
+    pub plist: Option<Vec<u8>>,
 }
 
 impl DebugWrite {
@@ -203,6 +266,56 @@ pub(crate) fn file_name(format: Format, image: &str) -> Option<String> {
         Format::MachO => Some(format!("{image}.dSYM/Contents/Resources/DWARF/{image}")),
         Format::Pe | Format::Wasm => None,
     }
+}
+
+/// A `.dSYM` bundle's `Info.plist` for the image `image`, as `dsymutil` writes one; none for
+/// a format whose side file is no bundle.
+fn plist(format: Format, image: &str) -> Option<Vec<u8>> {
+    if format != Format::MachO {
+        return None;
+    }
+    // alloc: once per side file update of a Mach-O image, under a kilobyte
+    let mut name = String::with_capacity(image.len());
+    for c in image.chars() {
+        match c {
+            '&' => name.push_str("&amp;"),
+            '<' => name.push_str("&lt;"),
+            '>' => name.push_str("&gt;"),
+            c => name.push(c),
+        }
+    }
+    let pairs = [
+        ("CFBundleDevelopmentRegion", "English"),
+        ("CFBundleIdentifier", ""),
+        ("CFBundleInfoDictionaryVersion", "6.0"),
+        ("CFBundlePackageType", "dSYM"),
+        ("CFBundleSignature", "????"),
+        ("CFBundleShortVersionString", "1.0"),
+        ("CFBundleVersion", "1"),
+    ];
+    // alloc: as above
+    let mut out = String::with_capacity(768);
+    out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    out.push_str(
+        "<!DOCTYPE plist PUBLIC \"-//Apple Computer//DTD PLIST 1.0//EN\" \
+         \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n",
+    );
+    out.push_str("<plist version=\"1.0\">\n\t<dict>\n");
+    for (key, value) in pairs {
+        out.push_str("\t\t<key>");
+        out.push_str(key);
+        out.push_str("</key>\n\t\t<string>");
+        match key {
+            "CFBundleIdentifier" => {
+                out.push_str("com.apple.xcode.dsym.");
+                out.push_str(&name);
+            }
+            _ => out.push_str(value),
+        }
+        out.push_str("</string>\n");
+    }
+    out.push_str("\t</dict>\n</plist>\n");
+    Some(out.into_bytes())
 }
 
 /// Where a side file of `format` holds its build id.
@@ -348,6 +461,15 @@ pub(crate) struct Kept {
     /// The bytes of `.debug_line` that are overwritten sequences.
     dead: u64,
     turn: u64,
+    /// The image generation the file describes; `None` with no file.
+    at: Option<u64>,
+    /// The unit's address range: of every function recorded since the file was laid out.
+    low: u64,
+    high: u64,
+    /// Why the last update that followed a change stopped and asked for every function.
+    asked: Option<&'static str>,
+    /// The functions the update in hand encoded.
+    encoded: u64,
 }
 
 impl Kept {
@@ -368,7 +490,18 @@ impl Kept {
             by_name: Vec::new(),
             dead: 0,
             turn: 0,
+            at: None,
+            low: 0,
+            high: 0,
+            asked: None,
+            encoded: 0,
         }
+    }
+
+    /// The image generation the side file last given describes; `None` when the next update
+    /// lays it out whole.
+    pub(crate) fn at(&self) -> Option<u64> {
+        self.id.and(self.at)
     }
 
     /// The bytes it holds kept.
@@ -392,11 +525,19 @@ impl Kept {
     /// What brings the side file to `input`: a patch of the file last given where it fits one,
     /// else the whole file, saying why. `exe` reads the executable's file (`exe(at, out)`
     /// fills `out` from offset `at`; what is past the file stays zero).
+    ///
+    /// `None` for an input of a change ([`Given::Changed`]) that the file can't take as one
+    /// (there is no file, it has no room, the records would not number the image's
+    /// functions): the caller gives every function, and that update says why
+    /// ([`DebugWrite::all`]).
     pub(crate) fn update(
         &mut self,
         input: &Input<'_>,
         exe: &impl Fn(u64, &mut [u8]),
-    ) -> Result<DebugWrite, String> {
+        all: Option<&'static str>,
+    ) -> Result<Option<DebugWrite>, String> {
+        let changed = matches!(input.given, Given::Changed { .. });
+        self.encoded = 0;
         let Some(name) = file_name(input.format, input.name) else {
             // alloc: error path
             return Err(format!(
@@ -406,23 +547,37 @@ impl Kept {
             ));
         };
         let table = table_of(input.format, exe)?;
+        // Why every function is encoded, when they are: the caller's reason, or the one the
+        // update of a change stopped for.
+        let asked = match changed {
+            true => None,
+            false => self.asked.take(),
+        };
+        let all = match changed {
+            true => None,
+            false => asked.or(all).or(Some("no link's change was at hand")),
+        };
         let why = match self.id {
-            None => "no side file was written yet",
+            None => asked.unwrap_or("no side file was written yet"),
             Some(_) if self.format != input.format || self.name != input.name => {
                 "the image has another name or format"
             }
             Some(base) => match self.patch(input, &table, exe) {
                 Ok((writes, records)) => {
                     self.id = Some(input.id);
-                    return Ok(DebugWrite {
+                    self.at = Some(input.generation);
+                    return Ok(Some(DebugWrite {
                         name,
                         id: input.id,
                         base: Some(base),
                         len: self.file.len() as u64,
                         writes,
                         records,
+                        encoded: self.encoded,
+                        all,
                         whole: None,
-                    });
+                        plist: plist(input.format, input.name),
+                    }));
                 }
                 Err(Stop::Whole(why)) => why,
                 Err(Stop::Error(what)) => {
@@ -433,9 +588,15 @@ impl Kept {
             },
         };
         self.id = None;
+        if changed {
+            // A whole file is made of every function, which a change does not hold.
+            self.asked = Some(why);
+            return Ok(None);
+        }
         self.whole(input, &table, exe)?;
         self.id = Some(input.id);
-        Ok(DebugWrite {
+        self.at = Some(input.generation);
+        Ok(Some(DebugWrite {
             name,
             id: input.id,
             base: None,
@@ -443,8 +604,11 @@ impl Kept {
             // clone: the whole file, once per whole layout; the model keeps its own to patch
             writes: vec![(0, self.file.clone())],
             records: input.functions.len() as u64,
+            encoded: self.encoded,
+            all,
             whole: Some(why),
-        })
+            plist: plist(input.format, input.name),
+        }))
     }
 
     /// `function`'s rows with their files by number, into `rows`: `None` for a file the line
@@ -520,6 +684,7 @@ impl Kept {
             let lost = || format!("a file of {:?} left the line header as it was made", function.key);
             self.rows(input, function, &mut rows).ok_or_else(lost)?;
             let sequence = sequence_of(function, &rows, self.files.len())?;
+            self.encoded += 1;
             let size = size_of_function(function)?;
             let name_at = match function.name {
                 Some(name) => Some(push_name(&mut strings, name)?),
@@ -547,7 +712,9 @@ impl Kept {
         }
         info.push(0);
         let info_len = info.len();
-        info_head(&mut info[..INFO_HEAD], info_len, input.functions)?;
+        self.low = input.functions.iter().map(|it| it.addr).min().unwrap_or(0);
+        self.high = input.functions.iter().map(|it| it.addr + it.size).max().unwrap_or(0);
+        info_head(&mut info[..INFO_HEAD], info_len, self.low, self.high)?;
         let line_len = offset(line.len() - 4, ".debug_line")?;
         line[..4].copy_from_slice(&line_len.to_le_bytes());
         let abbrev = abbrev();
@@ -623,6 +790,7 @@ impl Kept {
                 return Err(Stop::Whole("a function has a line in a source file the line header does not name"));
             }
             let sequence = sequence_of(function, &rows, self.files.len())?;
+            self.encoded += 1;
             let hash = hash_of(function, &sequence);
             let found = self.find(&function.key);
             if let Ok(at) = found
@@ -712,13 +880,21 @@ impl Kept {
             }
             written += 1;
         }
-        // The functions gone: each entry an empty range, each sequence no rows, by slot.
+        // The functions gone: each entry an empty range, each sequence no rows, by slot. Of
+        // every function, those no longer among them; of a change, those it says are gone.
         // alloc: once per update that removes a function
-        let mut gone: Vec<Record> =
-            self.records.iter().filter(|it| it.1.seen != turn).map(|it| it.1).collect();
+        let mut gone: Vec<(InstanceKey, Record)> = match input.given {
+            Given::All => self.records.iter().filter(|it| it.1.seen != turn).copied().collect(),
+            Given::Changed { gone, .. } => gone
+                .iter()
+                .filter_map(|key| self.find(key).ok().map(|at| self.records[at]))
+                .filter(|it| it.1.seen != turn)
+                .collect(),
+        };
         if !gone.is_empty() {
-            gone.sort_unstable_by_key(|it| it.slot);
-            for record in &gone {
+            gone.sort_unstable_by_key(|it| it.1.slot);
+            gone.dedup_by_key(|it| it.1.slot);
+            for (_, record) in &gone {
                 self.kill(line, *record, &mut dirty);
                 let at = info.at as usize + INFO_HEAD + DIE * record.slot as usize;
                 entry(&mut self.file[at..at + DIE], None, 0, 0);
@@ -727,7 +903,35 @@ impl Kept {
                 written += 1;
             }
             self.free.sort_unstable_by(|a, b| b.cmp(a));
-            self.records.retain(|it| it.1.seen == turn);
+            match input.given {
+                Given::All => self.records.retain(|it| it.1.seen == turn),
+                Given::Changed { .. } => {
+                    for (key, _) in &gone {
+                        if let Ok(at) = self.find(key) {
+                            self.records.remove(at);
+                        }
+                    }
+                }
+            }
+        }
+        // A change that leaves other than the image's functions recorded was not all that
+        // changed (the link dropped a function nothing named): every function is compared.
+        if let Given::Changed { count, .. } = input.given
+            && self.records.len() != count
+        {
+            return Err(Stop::Whole("the records after the link's change are not one a function of the image"));
+        }
+        match input.given {
+            Given::All => {
+                self.low = input.functions.iter().map(|it| it.addr).min().unwrap_or(0);
+                self.high = input.functions.iter().map(|it| it.addr + it.size).max().unwrap_or(0);
+            }
+            Given::Changed { .. } => {
+                for function in input.functions {
+                    self.low = self.low.min(function.addr);
+                    self.high = self.high.max(function.addr + function.size);
+                }
+            }
         }
         if self.dead > ROOM && 2 * self.dead > line_len {
             return Err(Stop::Whole("more than half of .debug_line is rows of functions since changed"));
@@ -738,7 +942,7 @@ impl Kept {
         let mut head = [0u8; INFO_HEAD];
         head.copy_from_slice(&self.file[info.at as usize..info.at as usize + INFO_HEAD]);
         let mut unit = head;
-        info_head(&mut unit, info_len as usize, input.functions)?;
+        info_head(&mut unit, info_len as usize, self.low, self.high)?;
         if unit != head || info_len != info.len {
             self.file[info.at as usize..info.at as usize + INFO_HEAD].copy_from_slice(&unit);
             dirty.push((info.at, INFO_HEAD as u64));
@@ -884,11 +1088,9 @@ fn entry(out: &mut [u8], name: Option<u32>, addr: u64, size: u32) {
 }
 
 /// The unit's header and entry, [`INFO_HEAD`] bytes, for a `.debug_info` of `len` bytes
-/// (entries and end included) over `functions`: its length and their range.
-fn info_head(head: &mut [u8], len: usize, functions: &[Func<'_>]) -> Result<(), String> {
+/// (entries and end included) whose functions are within `low..high`.
+fn info_head(head: &mut [u8], len: usize, low: u64, high: u64) -> Result<(), String> {
     let len = offset(len - 4, ".debug_info")?;
-    let low = functions.iter().map(|it| it.addr).min().unwrap_or(0);
-    let high = functions.iter().map(|it| it.addr + it.size).max().unwrap_or(0);
     head[..4].copy_from_slice(&len.to_le_bytes());
     head[4..6].copy_from_slice(&4u16.to_le_bytes());
     head[6..10].copy_from_slice(&0u32.to_le_bytes());
@@ -981,8 +1183,11 @@ enum Table {
         header: [u8; 64],
         /// Each section header, with its name.
         sections: Vec<(String, [u8; SHDR])>,
-        /// The build id note's bytes.
+        /// The build id note's bytes, and its address.
         note: Vec<u8>,
+        note_addr: u64,
+        /// The program headers, as the executable has them.
+        phdrs: Vec<u8>,
         /// The indexes of `.symtab` and its string table, and each one's place in the file.
         symtab: Option<(usize, usize)>,
         symbols: (u64, u64),
@@ -1022,7 +1227,12 @@ fn table_of(format: Format, exe: &impl Fn(u64, &mut [u8])) -> Result<Table, Stri
                 read(exe, u64_at(of(shstrndx), 24), u64_at(of(shstrndx), 32) as usize);
             // alloc: once per update, a name and a header per section
             let mut sections = Vec::with_capacity(shnum);
-            let (mut note, mut symtab) = (Vec::new(), None);
+            let (mut note, mut note_addr, mut symtab) = (Vec::new(), 0, None);
+            let phnum = usize::from(u16_at(&header, 0x38));
+            if phnum != 0 && usize::from(u16_at(&header, 0x36)) != PHDR {
+                return Err("the executable's ELF program headers are not 56 bytes each".into());
+            }
+            let phdrs = read(exe, u64_at(&header, 0x20), phnum * PHDR);
             let (mut symbols, mut strings) = ((0, 0), (0, 0));
             for nth in 0..shnum {
                 let header: [u8; SHDR] = of(nth).try_into().expect("64 bytes");
@@ -1032,6 +1242,7 @@ fn table_of(format: Format, exe: &impl Fn(u64, &mut [u8])) -> Result<Table, Stri
                 let name = String::from_utf8_lossy(&names[from..from + len]).into_owned();
                 if name == ELF_BUILD_ID {
                     note = read(exe, u64_at(&header, 24), u64_at(&header, 32) as usize);
+                    note_addr = u64_at(&header, 16);
                 }
                 if u32_at(&header, 4) == SHT_SYMTAB {
                     let link = u32_at(&header, 40) as usize;
@@ -1052,7 +1263,7 @@ fn table_of(format: Format, exe: &impl Fn(u64, &mut [u8])) -> Result<Table, Stri
                     note.len()
                 ));
             }
-            Ok(Table::Elf { header, sections, note, symtab, symbols, strings })
+            Ok(Table::Elf { header, sections, note, note_addr, phdrs, symtab, symbols, strings })
         }
         Format::MachO => {
             let header = read(exe, 0, 32);
@@ -1129,7 +1340,7 @@ impl Table {
     /// The side file's bytes before its sections, for sections at `slots`.
     fn head(&self, input: &Input<'_>, slots: &[Slot; 6]) -> Result<Vec<u8>, String> {
         match self {
-            Table::Elf { header, sections, note, symtab, .. } => {
+            Table::Elf { header, sections, note, note_addr, phdrs, symtab, .. } => {
                 // The executable's sections keep their indexes, which its symbols name: one
                 // in memory is here with no bytes, the build id note with its own, the symbol
                 // table and its names with their copies, and any other is no section.
@@ -1181,7 +1392,7 @@ impl Table {
                 let mut out = [0u8; SHDR];
                 out[..4].copy_from_slice(&name(&mut names, ".shstrtab").to_le_bytes());
                 out[4..8].copy_from_slice(&SHT_STRTAB.to_le_bytes());
-                let names_at = NOTE_AT + NOTE_ROOM;
+                let names_at = PHDRS_AT + phdrs.len();
                 out[24..32].copy_from_slice(&(names_at as u64).to_le_bytes());
                 out[32..40].copy_from_slice(&(names.len() as u64).to_le_bytes());
                 out[48..56].copy_from_slice(&1u64.to_le_bytes());
@@ -1194,10 +1405,28 @@ impl Table {
                 // alloc: as above
                 let mut head = vec![0u8; shoff + headers.len() * SHDR];
                 head[..64].copy_from_slice(header);
-                // No program headers: nothing of the side file is loaded.
-                head[0x20..0x28].fill(0);
+                // The executable's program headers, as `objcopy --only-keep-debug` leaves
+                // them: every segment where it is in memory and with nothing in the file, but
+                // the note that is the build id. gdb and lldb take the load addresses of a
+                // separate debug file from them, as they do a distribution's.
+                head[0x20..0x28].copy_from_slice(&match phdrs.is_empty() {
+                    true => 0u64.to_le_bytes(),
+                    false => (PHDRS_AT as u64).to_le_bytes(),
+                });
+                head[PHDRS_AT..names_at].copy_from_slice(phdrs);
+                for phdr in head[PHDRS_AT..names_at].chunks_exact_mut(PHDR) {
+                    let build_id = u32_at(phdr, 0) == PT_NOTE && u64_at(phdr, 16) == *note_addr;
+                    let (at, len) = match build_id {
+                        true => (NOTE_AT as u64, note.len() as u64),
+                        false => (u64_at(phdr, 8), 0),
+                    };
+                    phdr[8..16].copy_from_slice(&at.to_le_bytes());
+                    phdr[32..40].copy_from_slice(&len.to_le_bytes());
+                    if build_id {
+                        phdr[40..48].copy_from_slice(&len.to_le_bytes());
+                    }
+                }
                 head[0x28..0x30].copy_from_slice(&(shoff as u64).to_le_bytes());
-                head[0x38..0x3a].fill(0);
                 head[0x3c..0x3e].copy_from_slice(&(headers.len() as u16).to_le_bytes());
                 head[0x3e..0x40].copy_from_slice(&(headers.len() as u16 - 1).to_le_bytes());
                 head[NOTE_AT..NOTE_AT + note.len()].copy_from_slice(note);

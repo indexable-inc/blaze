@@ -139,6 +139,11 @@ pub struct Change<'a> {
     /// says of its code (`shape.rs`: `link code`); a function with none is summed as
     /// `unsaid`.
     pub made: &'a [(InstanceKey, Made)],
+    /// What the image holds once this change is in it, as one id of the caller's: every
+    /// function, static, span table and native input (blaze-cargo's `Rows::given`). It is in
+    /// the image's build id, with its lineage and generation, so two images of one lineage
+    /// that took different edits never share a build id. `None` keeps the last one given.
+    pub given: Option<ContentId>,
 }
 
 /// The output of a link, made visible only by a commit.
@@ -613,6 +618,9 @@ impl Image {
         // clone: reference counts; columns, the regions list and pages are shared until written (state.rs)
         let mut new = self.state.clone();
         new.generation = self.generations + 1;
+        if let Some(given) = change.given {
+            new.given = given;
+        }
         if new.wants_compaction() {
             new.compact();
         }
@@ -712,9 +720,29 @@ impl Image {
         let image_base = stage.plan.base;
         let finished =
             stage.finish().map_err(|error| shape::explained(error, &layout, image_base))?;
+        let mut state = finished.state;
+        shape::record_writes(&self.name, &state, finished.full, &finished.writes);
+        // What a debug side file records of this stage ([`Image::debug_file`]): the functions
+        // the change names and the span tables it gives, against the generation staged from.
+        state.debug_delta = match self.output.debug {
+            Debug::Beside => {
+                // alloc: once per stage of an image with a side file, the change's keys
+                let mut keys: Vec<InstanceKey> = Vec::with_capacity(
+                    change.added.len() + change.removed.len() + change.debug_names.len(),
+                );
+                keys.extend(change.added.iter().map(|it| it.key));
+                keys.extend(change.removed.iter().copied());
+                keys.extend(change.debug_names.iter().map(|it| it.0));
+                // alloc: as above, its span tables' anchors
+                let anchors = change.spans.iter().map(|it| it.0).collect();
+                let full = finished.full || !self.state.laid_out;
+                std::sync::Arc::new(beside::Delta { base, full, keys, anchors })
+            }
+            Debug::None | Debug::Lines => std::sync::Arc::default(),
+        };
         Ok(Staged {
             base,
-            state: finished.state,
+            state,
             writes: Writes {
                 full: finished.full,
                 len: finished.len,
@@ -993,11 +1021,14 @@ impl Image {
     /// What to write of the image's debug side file so it describes the image as last
     /// committed ([`Debug::Beside`], docs/v2/plan/design/debug-side-file.md); `None` for an
     /// image with no side file. Derived from the committed state alone, so it is called after
-    /// the link is answered, never for it: each Rust function's address, size, name and rows
-    /// are compared with the record the last call left (a hash per function), and only the
-    /// records that differ are written, with the build id and, on ELF, the four bytes that
-    /// keep the file's CRC-32 the one the executable names. A rollback needs nothing said:
-    /// the next call compares against the state rolled back to. An error before the first
+    /// the link is answered, never for it. When the side file last given is of the generation
+    /// the committed link was staged from, only the functions that link changed are encoded
+    /// ([`DebugWrite::encoded`]); otherwise every function's address, size, name and rows are
+    /// compared with the record the last call left (a hash per function), saying why
+    /// ([`DebugWrite::all`]). Either way only the records that differ are written, with the
+    /// build id and, on ELF, the four bytes that keep the file's CRC-32 the one the
+    /// executable names. A rollback needs nothing said: the state rolled back to is of
+    /// another generation, so every function is compared. An error before the first
     /// commit or while one is in flight, or naming the function whose rows no span table
     /// holds.
     pub fn debug_file(&mut self) -> Result<Option<DebugWrite>, LinkError> {
@@ -1013,67 +1044,96 @@ impl Image {
             )));
         }
         let (state, symbols) = (&self.state, &self.symbols);
-        // alloc: once per side file update, a view per Rust function and a row per line
-        let mut functions: Vec<beside::Func<'_>> = Vec::new();
-        let mut lines: Vec<beside::Lined<'_>> = Vec::new();
-        let mut last: Option<(&blaze_ids::ContentId, &position::Spans)> = None;
-        for piece in state.live_pieces() {
-            if !piece.placed() {
-                continue;
-            }
-            let Some(info) = piece.function() else { continue };
-            let start = lines.len() as u32;
-            for line in state.lines(info) {
-                let anchor = &line.span.anchor;
-                let table = match last {
-                    Some((it, table)) if it == anchor => table,
-                    _ => {
-                        let table = symbols
-                            .find_id(anchor)
-                            .and_then(|id| state.span_table(id))
-                            .ok_or_else(|| LinkError {
-                                function: Some(info.key),
-                                refusal: None,
-                                // alloc: error path
-                                what: format!("a line in {anchor:?}, whose span table the link was not given"),
-                            })?;
-                        last = Some((anchor, table));
-                        table
-                    }
-                };
-                let span = table.span(line.span.index).ok_or_else(|| LinkError {
-                    function: Some(info.key),
-                    refusal: None,
-                    // alloc: error path
-                    what: format!("span {} of {anchor:?}, past its table", line.span.index),
-                })?;
-                lines.push(beside::Lined {
-                    at: line.at,
-                    file: table.file(span.file),
-                    line: span.line,
-                    column: span.column,
-                });
-            }
-            functions.push(beside::Func {
-                key: info.key,
-                addr: piece.addr,
-                size: piece.size,
-                name: state.debug_name(info.id).map(|it| symbols.str(it)),
-                lines: start..lines.len() as u32,
-            });
-        }
-        functions.sort_unstable_by_key(|it| (it.addr, it.key));
-        let input = beside::Input {
-            format: self.output.format,
-            name: &self.name,
-            id: state.image_id(),
-            functions: &functions,
-            lines: &lines,
-        };
         let file = file::FileBytes::of(state);
         let exe = |at: u64, out: &mut [u8]| file.copy(at, out);
+        let id = state.image_id();
+        let (format, generation) = (self.output.format, state.generation);
+        let placed = |piece: &state::PieceRef<'_>| piece.placed() && piece.function().is_some();
+        // The link's change, when the side file last given is of the generation it was
+        // staged from: its functions alone are encoded.
+        let delta = &*state.debug_delta;
+        let all = if delta.full {
+            Some("the link laid the image out whole, or recorded no change")
+        } else if self.beside.at() != Some(delta.base) {
+            Some("the side file last given is not of the generation the link was staged from")
+        } else {
+            None
+        };
+        if all.is_none() {
+            // alloc: once per side file update, the change's keys and anchors in order
+            let mut keys = delta.keys.clone(); // clone: an edit's functions
+            keys.sort_unstable();
+            keys.dedup();
+            let mut anchors = delta.anchors.clone(); // clone: an edit's span tables
+            anchors.sort_unstable();
+            let mut views = Views::new(state, symbols);
+            let mut gone = Vec::new();
+            for key in &keys {
+                let piece = symbols
+                    .find_body(key)
+                    .and_then(|sym| state.home(sym))
+                    .and_then(|(piece, _)| state.piece(piece))
+                    .filter(|piece| placed(piece) && piece.function().is_some_and(|it| it.key == *key));
+                match piece {
+                    Some(piece) => views.push(piece)?,
+                    None => gone.push(*key),
+                }
+            }
+            // One pass over the pieces, encoding nothing: how many functions the image has,
+            // and, when a span table was given anew, which functions have a line in one.
+            let mut count = 0;
+            for piece in state.live_pieces().filter(placed) {
+                count += 1;
+                if anchors.is_empty() {
+                    continue;
+                }
+                let Some(info) = piece.function() else { continue };
+                let moved = keys.binary_search(&info.key).is_err()
+                    && (state.lines(info).iter())
+                        .any(|line| anchors.binary_search(&line.span.anchor).is_ok());
+                if moved {
+                    views.push(piece)?;
+                }
+            }
+            views.functions.sort_unstable_by_key(|it| (it.addr, it.key));
+            let input = beside::Input {
+                format,
+                name: &self.name,
+                id,
+                generation,
+                functions: &views.functions,
+                lines: &views.lines,
+                given: beside::Given::Changed { gone: &gone, count },
+            };
+            // alloc: error path
+            let updated = self.beside.update(&input, &exe, None);
+            if let Some(write) = updated.map_err(|what| fail(format!("{}: {what}", self.to)))? {
+                return Ok(Some(write));
+            }
+        }
+        let mut views = Views::new(state, symbols);
+        for piece in state.live_pieces().filter(placed) {
+            views.push(piece)?;
+        }
+        views.functions.sort_unstable_by_key(|it| (it.addr, it.key));
+        let input = beside::Input {
+            format,
+            name: &self.name,
+            id,
+            generation,
+            functions: &views.functions,
+            lines: &views.lines,
+            given: beside::Given::All,
+        };
         // alloc: error path
-        self.beside.update(&input, &exe).map(Some).map_err(|what| fail(format!("{}: {what}", self.to)))
+        let updated = self.beside.update(&input, &exe, all);
+        match updated.map_err(|what| fail(format!("{}: {what}", self.to)))? {
+            Some(write) => Ok(Some(write)),
+            None => Err(fail(format!(
+                "{}: the debug side file asked for every function of the image and was given them: a bug of blaze's",
+                self.to
+            ))), // alloc: error path
+        }
     }
 
     /// [`Image::debug_file`] with nothing kept of the side file last given: the whole file.
@@ -1097,6 +1157,71 @@ impl Image {
             .collect();
         out.sort_unstable_by_key(|it| (it.1, it.0));
         out
+    }
+}
+
+/// The debug views of an image's functions, as a side file is given them ([`beside::Input`]):
+/// each function's place and name, and its rows with their files by name.
+struct Views<'s> {
+    state: &'s State,
+    symbols: &'s Symbols,
+    functions: Vec<beside::Func<'s>>,
+    lines: Vec<beside::Lined<'s>>,
+    /// The span table last looked up: a function's lines are mostly of one.
+    last: Option<(&'s ContentId, &'s position::Spans)>,
+}
+
+impl<'s> Views<'s> {
+    fn new(state: &'s State, symbols: &'s Symbols) -> Views<'s> {
+        // alloc: once per side file update, a view per function given and a row per line
+        Views { state, symbols, functions: Vec::new(), lines: Vec::new(), last: None }
+    }
+
+    /// Adds `piece`, a placed function's. An error names the function whose line no span
+    /// table the image was given holds.
+    fn push(&mut self, piece: state::PieceRef<'s>) -> Result<(), LinkError> {
+        let (state, symbols) = (self.state, self.symbols);
+        let Some(info) = piece.function() else { return Ok(()) };
+        let start = self.lines.len() as u32;
+        for line in state.lines(info) {
+            let anchor = &line.span.anchor;
+            let table = match self.last {
+                Some((it, table)) if it == anchor => table,
+                _ => {
+                    let table = symbols
+                        .find_id(anchor)
+                        .and_then(|id| state.span_table(id))
+                        .ok_or_else(|| LinkError {
+                            function: Some(info.key),
+                            refusal: None,
+                            // alloc: error path
+                            what: format!("a line in {anchor:?}, whose span table the link was not given"),
+                        })?;
+                    self.last = Some((anchor, table));
+                    table
+                }
+            };
+            let span = table.span(line.span.index).ok_or_else(|| LinkError {
+                function: Some(info.key),
+                refusal: None,
+                // alloc: error path
+                what: format!("span {} of {anchor:?}, past its table", line.span.index),
+            })?;
+            self.lines.push(beside::Lined {
+                at: line.at,
+                file: table.file(span.file),
+                line: span.line,
+                column: span.column,
+            });
+        }
+        self.functions.push(beside::Func {
+            key: info.key,
+            addr: piece.addr,
+            size: piece.size,
+            name: state.debug_name(info.id).map(|it| symbols.str(it)),
+            lines: start..self.lines.len() as u32,
+        });
+        Ok(())
     }
 }
 

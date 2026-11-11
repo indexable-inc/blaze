@@ -304,6 +304,8 @@ enum Plant {
     KeepsRows,
     /// The last four bytes are not written again: the file keeps the last CRC's.
     KeepsCrc,
+    /// A function whose name or rows changed in place is left out of the link's change.
+    DropsChanged,
 }
 
 /// The oracle: `side` describes `program` as its debug info inside would, and is the
@@ -343,10 +345,28 @@ fn check(program: &Program, side: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// A function's key, as codegen keys one: what it is and where its code is (an edit's code
+/// is new code, under a new key).
+fn key_of(n: u32, f: &F) -> InstanceKey {
+    let mut key = [0u8; 32];
+    key[..4].copy_from_slice(&n.to_le_bytes());
+    key[4..12].copy_from_slice(&f.addr.to_le_bytes());
+    InstanceKey(ContentId(key))
+}
+
 /// The model's functions as an [`Input`]'s, by address.
 fn views<'a>(program: &'a Program, files: &'a [String]) -> (Vec<Func<'a>>, Vec<Lined<'a>>) {
+    views_of(program, files, |_, _| true)
+}
+
+/// Those of the model's functions that `takes`, as an [`Input`]'s, by address.
+fn views_of<'a>(
+    program: &'a Program,
+    files: &'a [String],
+    takes: impl Fn(u32, &F) -> bool,
+) -> (Vec<Func<'a>>, Vec<Lined<'a>>) {
     let (mut functions, mut lines) = (Vec::new(), Vec::new());
-    for (n, f) in &program.funcs {
+    for (n, f) in program.funcs.iter().filter(|it| takes(*it.0, it.1)) {
         let start = lines.len() as u32;
         lines.extend(f.rows.iter().map(|&(at, file, line, column)| Lined {
             at,
@@ -354,11 +374,8 @@ fn views<'a>(program: &'a Program, files: &'a [String]) -> (Vec<Func<'a>>, Vec<L
             line,
             column,
         }));
-        let mut key = [0u8; 32];
-        key[..4].copy_from_slice(&n.to_le_bytes());
-        key[4..12].copy_from_slice(&f.addr.to_le_bytes());
         functions.push(Func {
-            key: InstanceKey(ContentId(key)),
+            key: key_of(*n, f),
             addr: f.addr,
             size: f.size,
             name: f.name.as_deref(),
@@ -369,15 +386,42 @@ fn views<'a>(program: &'a Program, files: &'a [String]) -> (Vec<Func<'a>>, Vec<L
     (functions, lines)
 }
 
+/// `program`'s functions `functions` as an update is given them.
+fn input_of<'a>(
+    program: &Program,
+    functions: &'a [Func<'a>],
+    lines: &'a [Lined<'a>],
+    given: Given<'a>,
+) -> Input<'a> {
+    Input {
+        format: Format::Elf,
+        name: "app",
+        id: program.id(),
+        generation: program.generation,
+        functions,
+        lines,
+        given,
+    }
+}
+
 /// A side file kept on a disk across the model's generations.
 struct Disk {
     kept: Kept,
     side: Option<Vec<u8>>,
+    /// The program the side file was last brought to.
+    last: Option<Program>,
+    /// Whether an update is given the link's change (what differs from `last`), as
+    /// [`crate::Image::debug_file`] gives it when it can, or every function.
+    follow: bool,
 }
 
 impl Disk {
     fn new() -> Disk {
-        Disk { kept: Kept::new(), side: None }
+        Disk { kept: Kept::new(), side: None, last: None, follow: true }
+    }
+
+    fn all() -> Disk {
+        Disk { follow: false, ..Disk::new() }
     }
 
     /// `program`'s next generation: its side file brought to it, as `plant` writes it, and
@@ -386,24 +430,53 @@ impl Disk {
         program.generation += 1;
         let exe = program.exe();
         let files: Vec<String> = (0..FILES).map(file).collect();
-        let (functions, lines) = views(program, &files);
-        let input = Input {
-            format: Format::Elf,
-            name: "app",
-            id: program.id(),
-            functions: &functions,
-            lines: &lines,
-        };
         let read = |at: u64, out: &mut [u8]| {
             let from = (at as usize).min(exe.len());
             let len = out.len().min(exe.len() - from);
             out[..len].copy_from_slice(&exe[from..from + len]);
         };
-        let mut write = self.kept.update(&input, &read)?;
+        // The link's change: the functions that are not as they were, and the keys gone.
+        let followed = match (&self.last, self.follow) {
+            (Some(last), true) => {
+                let (mut functions, lines) = views_of(program, &files, |n, f| last.funcs.get(&n) != Some(f));
+                if plant == Plant::DropsChanged
+                    && let Some(at) = functions.iter().position(|it| {
+                        last.funcs.iter().any(|(n, f)| key_of(*n, f) == it.key)
+                    })
+                {
+                    functions.remove(at);
+                }
+                let gone: Vec<InstanceKey> = (last.funcs.iter())
+                    .map(|(n, f)| key_of(*n, f))
+                    .filter(|key| !program.funcs.iter().any(|(n, f)| key_of(*n, f) == *key))
+                    .collect();
+                let given = Given::Changed { gone: &gone, count: program.funcs.len() };
+                let write =
+                    self.kept.update(&input_of(program, &functions, &lines, given), &read, None)?;
+                if let Some(write) = &write
+                    && write.encoded > functions.len() as u64
+                {
+                    return Err(format!("{} functions encoded of a change of {}", write.encoded, functions.len()));
+                }
+                write
+            }
+            _ => None,
+        };
+        let mut write = match followed {
+            Some(write) => write,
+            None => {
+                let (functions, lines) = views(program, &files);
+                (self.kept.update(&input_of(program, &functions, &lines, Given::All), &read, None)?)
+                    .ok_or("an update given every function asked for every function")?
+            }
+        };
+        if self.kept.at() != Some(program.generation) {
+            return Err("the side file is not at the generation it was brought to".into());
+        }
         let honest = write.clone();
         if write.base.is_some() {
             match plant {
-                Plant::None | Plant::KeepsRows => {}
+                Plant::None | Plant::KeepsRows | Plant::DropsChanged => {}
                 Plant::KeepsId => write.writes.retain(|it| it.0 != 0),
                 Plant::KeepsCrc => {
                     for (at, bytes) in &mut write.writes {
@@ -432,6 +505,8 @@ impl Disk {
         }
         check(program, &side)?;
         self.side = Some(side);
+        // clone: the model, a few functions
+        self.last = Some(program.clone());
         Ok(honest)
     }
 }
@@ -463,8 +538,13 @@ fn op(tc: &hegel::TestCase) -> Op {
 /// `ops` applied one link each, the side file patched each time as `plant` writes it; the
 /// oracle after each.
 fn refines(ops: &[Op], plant: Plant) -> Result<(), String> {
+    refines_by(ops, plant, true)
+}
+
+/// [`refines`], each update given the link's change (`follow`) or every function.
+fn refines_by(ops: &[Op], plant: Plant, follow: bool) -> Result<(), String> {
     let mut program = Program::start();
-    let mut disk = Disk::new();
+    let mut disk = Disk { follow, ..Disk::new() };
     disk.link(&mut program, Plant::None)?;
     for op in ops {
         program.apply(op);
@@ -480,9 +560,36 @@ fn refines(ops: &[Op], plant: Plant) -> Result<(), String> {
 #[hegel::test(test_cases = 128)]
 fn a_side_file_kept_by_patches_resolves_as_debug_info_inside(tc: hegel::TestCase) {
     let ops: Vec<Op> = tc.draw(gs::vecs(op()).max_size(12));
-    if let Err(why) = refines(&ops, Plant::None) {
+    let follow = tc.draw(gs::integers::<u8>().max_value(1)) == 1;
+    if let Err(why) = refines_by(&ops, Plant::None, follow) {
         panic!("{why}");
     }
+}
+
+/// A function renamed in place and left out of the change keeps its old record, and the
+/// records still number the image's functions: nothing but the oracle sees it.
+#[test]
+fn the_oracle_catches_a_changed_function_left_out_of_the_change() {
+    let ops = [Op::Rename(1)];
+    assert_eq!(refines(&ops, Plant::None), Ok(()));
+    let why = refines(&ops, Plant::DropsChanged).expect_err("the oracle missed a record left stale");
+    assert!(why.starts_with("functions:"), "{why}");
+}
+
+/// A change that does not say a function is gone leaves one record too many: the update
+/// asks for every function, says why, and the file is right.
+#[test]
+fn a_change_that_misses_a_removed_function_is_made_from_every_function() {
+    let mut program = Program::start();
+    program.make(2, 5);
+    let mut disk = Disk::new();
+    disk.link(&mut program, Plant::None).unwrap();
+    // The model's change is exact, so the function is taken out behind its back.
+    disk.last.as_mut().unwrap().funcs.remove(&2);
+    program.funcs.remove(&2);
+    let write = disk.link(&mut program, Plant::None).unwrap();
+    assert!(write.all.is_some_and(|it| it.contains("not one a function")), "{:?}", write.all);
+    assert_eq!(write.encoded, 2, "every function of the image");
 }
 
 /// A fresh side file is a function of the program alone: made twice, the same bytes; and
@@ -562,10 +669,11 @@ fn a_one_function_edit_rewrites_its_own_records() {
         }
         let mut disk = Disk::new();
         let whole = disk.link(&mut program, Plant::None).unwrap();
-        assert_eq!(whole.records, u64::from(count));
+        assert_eq!((whole.records, whole.encoded), (u64::from(count), u64::from(count)));
         program.make(count / 2, 13);
         let write = disk.link(&mut program, Plant::None).unwrap();
-        assert_eq!((write.whole, write.records), (None, 2), "{count} functions");
+        assert_eq!((write.whole, write.records, write.encoded), (None, 2, 1), "{count} functions");
+        assert_eq!(write.all, None, "the update followed the link's change");
         assert!(write.written() < 3 * 4096, "{count} functions: {} bytes written", write.written());
         // A line added above moves the rows of its file's functions: theirs are written, and
         // no other file's.
@@ -575,7 +683,15 @@ fn a_one_function_edit_rewrites_its_own_records() {
             }
         }
         let write = disk.link(&mut program, Plant::None).unwrap();
-        assert_eq!((write.whole, write.records), (None, 10), "{count} functions");
+        assert_eq!((write.whole, write.records, write.encoded), (None, 10, 10), "{count} functions");
+        // With no change at hand, every function is encoded to find the one that differs.
+        let mut all = Disk::all();
+        let mut again = program.clone();
+        all.link(&mut again, Plant::None).unwrap();
+        again.make(count / 2, 17);
+        let write = all.link(&mut again, Plant::None).unwrap();
+        assert_eq!((write.records, write.encoded), (2, u64::from(count)), "{count} functions");
+        assert!(write.all.is_some());
         written.push(whole.written());
     }
     assert!(written[1] > 10 * written[0], "the whole file grows with the program: {written:?}");
@@ -669,16 +785,26 @@ fn a_mach_o_side_file_carries_the_uuid_the_segments_and_the_dwarf() {
     exe.extend_from_slice(b"\0_f\0");
     let files: Vec<String> = (0..FILES).map(file).collect();
     let (functions, lines) = views(&program, &files);
-    let input =
-        Input { format: Format::MachO, name: "app", id, functions: &functions, lines: &lines };
+    let input = Input {
+        format: Format::MachO,
+        name: "app",
+        id,
+        generation: 3,
+        functions: &functions,
+        lines: &lines,
+        given: Given::All,
+    };
     let read = |at: u64, out: &mut [u8]| {
         let from = (at as usize).min(exe.len());
         let len = out.len().min(exe.len() - from);
         out[..len].copy_from_slice(&exe[from..from + len]);
     };
     let mut kept = Kept::new();
-    let write = kept.update(&input, &read).unwrap();
+    let write = kept.update(&input, &read, None).unwrap().unwrap();
     assert_eq!(write.name, "app.dSYM/Contents/Resources/DWARF/app");
+    let plist = String::from_utf8(write.plist.clone().expect("a bundle has an Info.plist")).unwrap();
+    assert!(plist.contains("<string>com.apple.xcode.dsym.app</string>"), "{plist}");
+    assert!(plist.contains("<key>CFBundlePackageType</key>\n\t\t<string>dSYM</string>"), "{plist}");
     let side = write.apply(Format::MachO, None).unwrap();
     assert_eq!(id_of(Format::MachO, &side), Some(id));
     let aligned = Aligned::of(&side);
@@ -699,15 +825,17 @@ fn a_mach_o_side_file_carries_the_uuid_the_segments_and_the_dwarf() {
         format: Format::MachO,
         name: "app",
         id: program.id(),
+        generation: program.generation,
         functions: &functions,
         lines: &lines,
+        given: Given::All,
     };
     let read = |at: u64, out: &mut [u8]| {
         let from = (at as usize).min(exe.len());
         let len = out.len().min(exe.len() - from);
         out[..len].copy_from_slice(&exe[from..from + len]);
     };
-    let write = kept.update(&input, &read).unwrap();
+    let write = kept.update(&input, &read, None).unwrap().unwrap();
     assert_eq!((write.base, write.whole, write.records), (Some(id), None, 0));
     let side = write.apply(Format::MachO, Some(&side)).unwrap();
     assert_eq!(id_of(Format::MachO, &side), Some(program.id()));
@@ -726,14 +854,16 @@ fn an_executable_with_no_build_id_is_refused_by_name() {
         format: Format::Elf,
         name: "app",
         id: program.id(),
+        generation: program.generation,
         functions: &functions,
         lines: &lines,
+        given: Given::All,
     };
     let read = |at: u64, out: &mut [u8]| {
         let from = (at as usize).min(exe.len());
         let len = out.len().min(exe.len() - from);
         out[..len].copy_from_slice(&exe[from..from + len]);
     };
-    let refused = Kept::new().update(&input, &read).unwrap_err();
+    let refused = Kept::new().update(&input, &read, None).unwrap_err();
     assert!(refused.contains(".note.gnu.build-id") && refused.contains("debugger"), "{refused}");
 }
