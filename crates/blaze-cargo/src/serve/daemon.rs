@@ -124,7 +124,21 @@ impl Stalled {
         let Some(ms) = stalled_ms(self.began, now) else { return };
         // alloc: once a step past its bound, the span's `function`
         let function = format!("{}: {ms} ms", self.step);
-        tracing::info_span!(target: "blaze", "loop stalled", function = %function).in_scope(|| {});
+        // `held`: a held span is never folded. This one is opened once the step has ended, so
+        // it is shorter than any span the recorder writes a row for (`flight::FOLD_BELOW`), and
+        // folded it would be a count in `folded` with no `function`: the step's name gone, and
+        // no row of `spans` for the budgets harness to find.
+        tracing::info_span!(target: "blaze", "loop stalled", function = %function, held = true)
+            .in_scope(|| {});
+        // And a problem (`blaze explain problems`, `blaze slow`, `blaze why`): a step of the
+        // loop that ran this long held every client's answer that long.
+        tracing::warn!(
+            target: "blaze",
+            step = self.step,
+            ms,
+            "loop stalled: a step of the daemon's loop ran in line past {} ms",
+            STEP_BOUND_NS / 1_000_000
+        );
     }
 }
 

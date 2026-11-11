@@ -5,8 +5,8 @@
 use arrow_array::RecordBatch;
 
 use super::{
-    BuildFacts, Died, DiedSpan, DiedThread, Facts, Memory, MissGroup, PanicFacts, Problem,
-    QueryCount, Recorder, Report, STACKS, SpanKind, SpanStack, ThreadCpu, ThreadName, analyse,
+    BuildFacts, Died, DiedSpan, DiedThread, Facts, Gap, Memory, MissGroup, PanicFacts, Problem,
+    QueryCount, Recorder, StackSeen, Report, STACKS, SpanKind, SpanStack, ThreadCpu, ThreadName, analyse,
 };
 use crate::time::{
     TimeError,
@@ -31,7 +31,68 @@ pub fn run(source: &Source<'_>, build: Option<u64>) -> Result<Report, TimeError>
         facts.build.died = Some(died(source, process, t0, t1)?);
     }
     facts.build.panics = panics(source, build, pick.died)?;
-    Ok(analyse(&model, &path, &facts))
+    let mut report = analyse(&model, &path, &facts);
+    gap_stacks(source, &mut report.gaps)?;
+    Ok(report)
+}
+
+/// Gives each of `gaps` the stacks sampled on its thread in it, the [`STACKS`] commonest on
+/// and off the CPU: one query for them all, none when no gap names a thread.
+pub fn gap_stacks(source: &Source<'_>, gaps: &mut [Gap]) -> Result<(), TimeError> {
+    let Some(sql) = gap_stacks_sql(gaps) else { return Ok(()) };
+    let batches = query(source, &sql, "reading the stacks sampled in the critical path's gaps")?;
+    for (batch, row) in rows(&batches) {
+        const T: &str = "samples";
+        let (Some(gap), Some(frames)) =
+            (int(batch, T, "gap", row)?, text(batch, T, "frames", row)?)
+        else {
+            continue;
+        };
+        let Some(gap) = usize::try_from(gap).ok().and_then(|it| gaps.get_mut(it)) else { continue };
+        let on_cpu = int(batch, T, "on_cpu", row)? != Some(0);
+        let side = if on_cpu { &mut gap.stacks.on_cpu } else { &mut gap.stacks.off_cpu };
+        side.push(StackSeen {
+            // alloc: a stack's frames, once a stack a gap
+            frames: frames.split('\n').filter(|it| !it.is_empty()).map(str::to_owned).collect(),
+            samples: uint(batch, T, "samples", row)?.unwrap_or(0),
+        });
+    }
+    Ok(())
+}
+
+/// The query of [`gap_stacks`]: the samples of each gap's process and thread in its stretch,
+/// counted by stack and side, the [`STACKS`] commonest of each side a gap, in the gaps' order.
+/// None when no gap names a thread.
+fn gap_stacks_sql(gaps: &[Gap]) -> Option<String> {
+    use std::fmt::Write as _;
+    // alloc: a query's part, once a report
+    let mut values = String::new();
+    for (at, gap) in gaps.iter().enumerate() {
+        let Some(thread) = gap.thread else { continue };
+        if !values.is_empty() {
+            values.push_str(", ");
+        }
+        // Writing to a `String` does not fail.
+        _ = write!(values, "({at}, {}, {thread}, {}, {})", gap.process, gap.start_ns, gap.end_ns);
+    }
+    if values.is_empty() {
+        return None;
+    }
+    // alloc: a query, once a report
+    Some(format!(
+        "WITH gaps(gap, process, thread, from_ns, to_ns) AS (VALUES {values}), counted AS (\
+           SELECT CAST(gaps.gap AS BIGINT) AS gap, \
+             CAST(CASE WHEN s.cpu = 'off' THEN 0 ELSE 1 END AS BIGINT) AS on_cpu, \
+             CAST(coalesce(array_to_string(s.stack, chr(10)), '') AS VARCHAR) AS frames, \
+             CAST(count(*) AS UBIGINT) AS samples \
+           FROM samples AS s JOIN gaps ON s.process = gaps.process AND s.thread = gaps.thread \
+             AND s.t_ns >= gaps.from_ns AND s.t_ns < gaps.to_ns \
+           GROUP BY 1, 2, 3\
+         ) \
+         SELECT gap, on_cpu, frames, samples FROM counted \
+         QUALIFY row_number() OVER (PARTITION BY gap, on_cpu ORDER BY samples DESC, frames) <= {STACKS} \
+         ORDER BY 1, 2 DESC, 4 DESC, 3"
+    ))
 }
 
 /// What the daemon `process` that died in the build `t0..t1` (to its last row) was running:

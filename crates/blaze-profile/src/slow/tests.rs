@@ -179,6 +179,49 @@ fn the_problems_blaze_said_come_before_the_findings() {
     assert!(!quiet.contains("problems blaze said"), "{quiet}");
 }
 
+/// Time on the critical path under no span says where it is: the stretch, its thread, and the
+/// spans of its lane before and after it. On 2026-11-10 an edit's build had 650 ms between its
+/// lowering and its first unit's task; the report said how much was unnamed and not where. A
+/// stretch under [`GAP_NS`] is not listed, and a build whose path is under spans lists none.
+#[test]
+fn a_stretch_of_the_critical_path_under_no_span_says_where_it_is() {
+    let switches = || vec![switch(1, 0, Event::Started, 1), switch(1, 100, Event::Ended, 1)];
+    let mut lower = span(1, 1, None, "lower", 0, 30, 1);
+    lower.function = Some("serde".to_owned());
+    let spans = vec![
+        lower.clone(),
+        span(1, 2, None, "tiny", 95, 1, 1),
+        span(1, 3, None, "unit bodies", 97, 3, 1),
+    ];
+    let it = report(switches(), spans, 100, &workers(1..=1));
+    assert_eq!(it.gaps.len(), 1, "the 10 ms between `tiny` and `unit bodies` is under the bound: {:#?}", it.gaps);
+    let gap = &it.gaps[0];
+    assert_eq!((gap.from_ns, gap.dur_ns, gap.kind.as_str()), (30 * U, 65 * U, "no_span"));
+    assert_eq!((gap.process, gap.thread, gap.thread_name.as_deref()), (P, Some(1), Some("blaze-work-1")));
+    assert_eq!((gap.before.as_deref(), gap.after.as_deref()), (Some("`lower` serde"), Some("`tiny`")));
+    assert_eq!((gap.start_ns, gap.end_ns), (30 * U, 95 * U), "what a query over `samples` filters by");
+    let said = text(&it, 10);
+    assert!(said.contains("critical-path time under no span, by stretch (20.0 ms or more each):"), "{said}");
+    assert!(said.contains(" - 650.0 ms at 0.3 s on blaze-work-1 (tid 1), job 0.1: its lane ran inside no span"), "{said}");
+    assert!(said.contains("     after `lower` serde, before `tiny`"), "{said}");
+    assert!(said.contains("no sample fell in it"), "{said}");
+
+    // With the stacks the driver read in it, the text shows them and no longer says how to
+    // get them.
+    let mut sampled = it.clone();
+    sampled.gaps[0].stacks.off_cpu =
+        vec![StackSeen { frames: vec!["turn".to_owned(), "ioctl".to_owned()], samples: 31 }];
+    let said = text(&sampled, 10);
+    assert!(said.contains("     sampled blocked in it 31x: ioctl < turn"), "{said}");
+    assert!(!said.contains("no sample fell in it"), "{said}");
+
+    // The control: the same build with a span over the stretch has no gap.
+    let covered = vec![lower, span(1, 2, None, "place outputs", 30, 67, 1), span(1, 3, None, "unit bodies", 97, 3, 1)];
+    let none = report(switches(), covered, 100, &workers(1..=1));
+    assert!(none.gaps.is_empty(), "{:#?}", none.gaps);
+    assert!(!text(&none, 10).contains("under no span, by stretch"));
+}
+
 fn finding(report: &Report, kind: Kind) -> &Finding {
     report
         .findings

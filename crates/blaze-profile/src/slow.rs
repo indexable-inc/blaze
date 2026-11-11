@@ -53,8 +53,17 @@ pub use render::{problems_text, text, thread_line};
 /// 6: `build.panics`, the build's panics and its daemon's fatal signal, each with its stack's
 /// top frames. 7: a build whose checkout's last build lost what it left for the store has the
 /// finding `not_kept` (fix `keep_results`), ranked first. 8: `problems`, what blaze itself said
-/// was wrong during the build (the `problems` view's rows), listed before the findings.
-pub const VERSION: u32 = 8;
+/// was wrong during the build (the `problems` view's rows), listed before the findings. 9: `gaps`,
+/// each stretch of the critical path of [`GAP_NS`] or more under no span, with its thread, the
+/// spans before and after it, and the stacks sampled in it.
+pub const VERSION: u32 = 9;
+
+/// The least stretch of the critical path under no span that is listed as a gap
+/// ([`Report::gaps`]): 20 ms, the bound the daemon's loop holds one step of a turn to
+/// (`loop stalled`) and the budgets harness holds an edit's unnamed time to (`gap_ms`).
+pub const GAP_NS: i64 = 20_000_000;
+/// The most gaps a report lists, the longest.
+pub const GAPS: usize = 16;
 
 /// The `step` of the misses row a build takes when its checkout's last build answered and
 /// then lost what it left for the store (blaze-cargo's `Jobs::lose`): the daemon lowers this
@@ -157,6 +166,40 @@ pub struct Problem {
     /// was said after its answer was sent.
     pub first_ns: i64,
     pub last_ns: i64,
+}
+
+/// A stretch of the critical path under no span: where the build's time went and nothing
+/// says what it was. On 2026-11-10 an edit's build had 650 ms between its lowering and its
+/// first unit's task, and a 3 s `FICLONE` on the loop thread inside a wait, each found only by
+/// reading spans by hand or with strace; "the record lost 0.65 s" did not say where.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct Gap {
+    /// When it began, from the build's start, and how long it was.
+    pub from_ns: i64,
+    pub dur_ns: i64,
+    /// `no_span`: its lane ran, inside no span. Else what the record lacks, as
+    /// `job_intervals.unrecorded` says: `between_spans` (a thread with no job, between two of
+    /// its spans: running or blocked, the record can't tell), `cut` or `no_end`.
+    pub kind: String,
+    /// The lane it is on: `job 3.17` or `thread 7`.
+    pub lane: String,
+    /// The process and thread it was on, and the thread's name; none where the record does not
+    /// say which thread the lane was on then.
+    pub process: u32,
+    pub thread: Option<u32>,
+    pub thread_name: Option<String>,
+    /// The span of its lane that closed last before it, and the one that opened first after
+    /// it, each as its name and what it was of: what ran between them is the gap.
+    pub before: Option<String>,
+    pub after: Option<String>,
+    /// When it began and ended on the history's clock: what a query over `samples` or
+    /// `switches` filters by.
+    pub start_ns: i64,
+    pub end_ns: i64,
+    /// The stacks sampled on its thread in it, the commonest first ([`STACKS`] of each side);
+    /// empty when no sample fell in it.
+    #[serde(skip_serializing_if = "Stacks::is_empty")]
+    pub stacks: Stacks,
 }
 
 /// What the report reads beside the time model.
@@ -318,6 +361,9 @@ pub struct Report {
     /// Ranked: most wall time saved first; those whose saving can't be estimated last.
     /// A `not_kept` finding is before them all.
     pub findings: Vec<Finding>,
+    /// Each stretch of the critical path of [`GAP_NS`] or more under no span, longest first, at
+    /// most [`GAPS`]: where the unnamed time is, not only how much.
+    pub gaps: Vec<Gap>,
     /// What the profile could not see, most time hidden first.
     pub blind_spots: Vec<BlindSpot>,
 }
@@ -605,6 +651,7 @@ pub fn analyse(model: &Model, path: &Path, facts: &Facts) -> Report {
         problems: facts.problems.clone(),
         summary: ctx.summary(smaller, cut_ns),
         findings,
+        gaps: ctx.gaps(),
         blind_spots: blind,
     }
 }
@@ -1425,6 +1472,77 @@ impl<'a> Ctx<'a> {
                 memory.footprint_peak.unwrap_or(0) as f64 / MIB
             )],
         });
+    }
+
+    /// The critical path's stretches of [`GAP_NS`] or more under no span, longest first (then
+    /// earliest), at most [`GAPS`]: where its lane ran inside no span, and where the record
+    /// says nothing of its lane (an `unrecorded` link). Each with its thread and the spans of
+    /// its lane before and after it; the driver adds the stacks sampled in it.
+    fn gaps(&self) -> Vec<Gap> {
+        let model = self.model;
+        // alloc: once a report
+        let mut found: Vec<(i64, i64, usize, &'static str)> = Vec::new();
+        for &(from, to, span, lane) in &self.path_ran {
+            if span.is_none() && to - from >= GAP_NS {
+                found.push((from, to, lane, "no_span"));
+            }
+        }
+        for link in self.path.links.iter().filter(|it| it.kind == LinkKind::Unrecorded) {
+            if link.dur_ns() < GAP_NS {
+                continue;
+            }
+            let why = match model.lanes[link.lane].intervals[link.interval].state {
+                State::Unrecorded { why } => why.name(),
+                _ => "unrecorded",
+            };
+            found.push((link.from_ns, link.to_ns, link.lane, why));
+        }
+        found.sort_unstable_by(|a, b| (b.1 - b.0).cmp(&(a.1 - a.0)).then(a.cmp(b)));
+        found.truncate(GAPS);
+        let said = |span: usize| {
+            let it = &model.spans[span];
+            match subject_of(model, span) {
+                // alloc: a label, once a gap
+                Some(of) if !of.is_empty() => format!("`{}` {of}", it.name),
+                // alloc: a label, once a gap
+                _ => format!("`{}`", it.name),
+            }
+        };
+        found
+            .into_iter()
+            .map(|(from, to, at, kind)| {
+                let lane = &model.lanes[at];
+                let cut = crate::time::path::innermost(model, at);
+                let ended = cut.partition_point(|it| it.1 <= from);
+                let before = cut[..ended].last().map(|it| said(it.2));
+                let after = cut[ended..].iter().find(|it| it.0 >= to).map(|it| said(it.2));
+                let thread = match lane.id {
+                    crate::time::LaneId::Thread { thread, .. } => Some(thread),
+                    crate::time::LaneId::Job { .. } => lane
+                        .intervals
+                        .iter()
+                        .filter(|it| it.from_ns < to && it.to_ns > from)
+                        .find_map(|it| match it.state {
+                            State::Running { thread, .. } => Some(thread),
+                            _ => None,
+                        }),
+                };
+                Gap {
+                    from_ns: from - model.bounds.start_ns,
+                    dur_ns: to - from,
+                    kind: kind.to_owned(), // alloc: a label, once a gap
+                    lane: lane.id.to_string(), // alloc: a label, once a gap
+                    process: lane.id.process(),
+                    thread,
+                    thread_name: thread.map(|it| self.thread_name(lane.id.process(), it)),
+                    before,
+                    after,
+                    start_ns: from,
+                    end_ns: to,
+                    stacks: Stacks::default(),
+                }
+            })
+            .collect()
     }
 
     fn blind_spots(&self, out: &mut Vec<BlindSpot>) {

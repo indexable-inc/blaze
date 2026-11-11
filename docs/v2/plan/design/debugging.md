@@ -109,17 +109,30 @@ A text column was chosen over rows of a `span_fields` table (as `event_fields` i
 name costs a hash and a thread-local lookup; a row a field would cost a ring row each for
 every span that says one, on a path events are not on.
 
-## c. Time with no span says where (built in `blaze slow`; the watchdog specified)
+## c. Time with no span says where (built)
 
 A 650 ms gap between spans on the critical path; a 3 s `FICLONE` on the loop thread inside a
 wait with no span, found only with strace.
 
-- `blaze slow` lists each stretch of the critical path over 20 ms that ran inside no span
-  (`Report::gaps`): its thread, the spans before and after it on that thread, and the top
-  stacks sampled in it; with no samples it says how to get them. `budgets.py`'s `gap_ms`
-  reads the same stretches (`unrecorded` blind spots and `gaps`).
-- The loop watchdog's `loop stalled` span carries the step's name in `function`; the syscall
-  it blocked in comes from (d).
+- `blaze slow` lists each stretch of the critical path of 20 ms or more under no span
+  (`Report::gaps`, report version 9): how long, when, its lane and thread, the spans of its
+  lane before and after it, and the stacks sampled on its thread in it; with no sample it says
+  how to find what ran. `budgets.py`'s `gap_ms` fails an edit on the same stretches: the
+  `unrecorded` blind spots summed, as before, and now each `no_span` gap on its own, naming
+  the thread and the spans around it.
+- The loop watchdog's `loop stalled` span already carried the step's name in `function`, but
+  it is opened after the step, so it was shorter than any span the recorder writes a row for:
+  folded into a count, with no `function` and no row for `budgets.py` to find. It is now
+  `held` (never folded), and the stall is also a WARN event with `step` and `ms`, so it is a
+  problem (a). The system call it blocked in comes from (d).
+
+```
+critical-path time under no span, by stretch (20.0 ms or more each):
+ - 650.0 ms at 0.3 s on blaze-loop (tid 4711), thread 4711: a thread with no job, between two of its spans
+     after `lower` serde v1.0.219 (lib), before `task` unit bodies (infer)
+     sampled blocked in it 31x: ioctl < blaze_core::uring::clone_range < blaze_cas::place
+   fix: put a span over what ran there (rule slow-is-p0-traced), then read it again
+```
 
 ## h. One command for the edit loop (see the fork's commit)
 

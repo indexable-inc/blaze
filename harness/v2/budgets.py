@@ -1044,11 +1044,30 @@ def gap_failures(printed: str, most_ms: float, what: str) -> list[str]:
         if not isinstance(ns, (int, float)) or isinstance(ns, bool):
             raise ValueError(f"{what}: an `unrecorded` blind spot with no `hidden_ns`: {spot}")
         hidden += ns / 1e6
+    # Where each stretch is, as the report's `gaps` say it (report version 9): its thread and the
+    # spans of its lane before and after it. A stretch its lane ran inside no span (`no_span`) is
+    # no `unrecorded` blind spot, and is held to the same bound, each on its own.
+    gaps = [gap for gap in report_.get("gaps", []) if isinstance(gap, dict)]
+    out = []
+    for gap in gaps:
+        ms = gap.get("dur_ns", 0) / 1e6
+        if gap.get("kind") == "no_span" and ms > most_ms:
+            out.append(f"{ms:.4g} ms of the critical path ran inside no span, over the bound of {most_ms:.4g} ms "
+                       f"(slow-is-p0-traced: name it with a span first): {gap_where(gap)}")
     if hidden <= most_ms:
-        return []
-    where = "; ".join(str(line) for spot in lost for line in spot.get("evidence", []))
-    return [f"{hidden:.4g} ms of the critical path is under no span, over the bound of {most_ms:.4g} ms "
-            f"(slow-is-p0-traced: name it with a span first): {where or 'the report names no lane'}"]
+        return out
+    where = "; ".join([gap_where(gap) for gap in gaps if gap.get("kind") != "no_span"]
+                      or [str(line) for spot in lost for line in spot.get("evidence", [])])
+    return out + [f"{hidden:.4g} ms of the critical path is under no span, over the bound of {most_ms:.4g} ms "
+                  f"(slow-is-p0-traced: name it with a span first): {where or 'the report names no lane'}"]
+
+
+def gap_where(gap: dict[str, Any]) -> str:
+    """One gap of `blaze slow --json`'s `gaps` in words: how long, where in the build, on which
+    thread, and between which spans of its lane."""
+    return (f"{gap.get('dur_ns', 0) / 1e6:.4g} ms at {gap.get('from_ns', 0) / 1e6:.4g} ms on "
+            f"{gap.get('thread_name') or gap.get('lane')} ({gap.get('kind')}), after "
+            f"{gap.get('before') or 'no span of its lane'}, before {gap.get('after') or 'no span of its lane'}")
 
 
 # The daemon's line for what a build left for the store and lost after its answer (blaze-cargo's
@@ -2346,6 +2365,17 @@ def selftest_edit_work() -> None:
     expect(gap_failures(json.dumps({"blind_spots": [dict(lost, hidden_ns=20_000_000)]}), 20.0, "report") == []
            and gap_failures('{"blind_spots": []}', 0.0, "report") == [],
            "unnamed time within the bound, and a report with none, pass")
+    where = {"kind": "between_spans", "dur_ns": 650_000_000, "from_ns": 1_200_000_000, "thread_name": "blaze-loop",
+             "lane": "thread 7", "before": "`lower` serde", "after": "`task` unit bodies"}
+    named = gap_failures(json.dumps({"blind_spots": [lost], "gaps": [where]}), 20.0, "report")
+    expect(len(named) == 1 and "on blaze-loop (between_spans), after `lower` serde, before `task` unit bodies" in named[0],
+           f"the unnamed time says its thread and the spans around it: {named}")
+    ran = dict(where, kind="no_span", dur_ns=30_000_000)
+    bare = gap_failures(json.dumps({"blind_spots": [], "gaps": [ran]}), 20.0, "report")
+    expect(len(bare) == 1 and "30 ms of the critical path ran inside no span" in bare[0] and "blaze-loop" in bare[0],
+           f"a stretch a lane ran inside no span fails the edit too: {bare}")
+    expect(gap_failures(json.dumps({"blind_spots": [], "gaps": [dict(ran, dur_ns=20_000_000)]}), 20.0, "report") == [],
+           "a stretch inside no span within the bound passes")
     refused("a report with no blind spots", lambda: gap_failures("{}", 20.0, "report"), ValueError)
     refused("no JSON", lambda: gap_failures("blaze slow: no build", 20.0, "report"), ValueError)
     spec = '{"engine": {"kind": "v2", "blaze": "blaze"}, "out": "o.json"'

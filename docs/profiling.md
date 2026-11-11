@@ -1168,6 +1168,13 @@ process (daemons of a blaze before 2026-11-03, which could each number a build 1
 `blaze slow` and `blaze debug time` refuse the build, naming each process with its rows and
 time, rather than read them as one build of all their workers.
 
+Before anything it worked out, the report lists what blaze itself said was wrong in the build
+(`problems`, report version 8): each row of the `problems` view for the build (`blaze explain
+problems`): a WARN or ERROR event by callsite with how often it was said (every line the daemon
+writes to its log is one, `serve::said`), a panic, a fatal signal, a `blaze-bug`, the build's
+own failure. `blaze why` lists the same rows first. On 2026-11-10 the daemon wrote that a
+build's results were not kept after every build for hours, to a log no command read.
+
 Each finding has these fields:
 - a kind;
 - the fix, in words;
@@ -1242,6 +1249,19 @@ What the profile could not see is listed after the findings, as blind spots, nev
   only refusal left is a build whose unended spans alone pass the bound, which takes a recorder
   that left millions of spans open.
 
+
+Where the unnamed time is, not only how much (`gaps`, report version 9): each stretch of the
+critical path of 20 ms or more (`slow::GAP_NS`, the bound of the loop's `loop stalled` and of
+`budgets.py`'s `gap_ms`) that its lane ran inside no span (`no_span`), or of which the record
+says nothing (`between_spans`, `cut`, `no_end`), the longest first, at most 16. Each has when
+it began and how long it was, its lane, its thread by name, the span of its lane that closed
+last before it and the one that opened first after it, its bounds on the history's clock, and
+the stacks sampled on its thread in it, on the CPU and blocked (`slow::load::gap_stacks`); with
+no sample in it the text says how to find what ran (its thread's `switches`, and
+`harness/v2/loop_syscalls.py` from outside). `budgets.py` fails an edit on the same stretches.
+The daemon's loop says a step of a turn that ran past 20 ms twice: as a `loop stalled` span
+whose `function` is the step and its time (`held`, so it is never folded into a count), and as
+a WARN event with `step` and `ms`, which makes it a problem.
 
 Its header says the recorder's loss on a line of its own, even when it lost nothing
 (`recorder: lost no rows; summed N spans under 20us into folded (S); cost C (X ns a span over N spans, R thread-CPU reads)`), and `--json` has it as
