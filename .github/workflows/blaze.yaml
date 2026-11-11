@@ -99,7 +99,9 @@ jobs:
   scripts:
     name: harness imports, rustc sites
     runs-on: [ix, arm64]
-    timeout-minutes: 10
+    # 10 before the Rust scripts; the release's install and a cold build of scripts/ come on top
+    # (not yet measured).
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain
@@ -131,10 +133,17 @@ jobs:
       - run: |
           python3 tools/docs.py selftest
           python3 tools/docs.py check
-      # The objectives ledger's rows are well formed and its table is current (harness/v2/ledger.py).
+      # The repository's Rust scripts (scripts/, docs/v2/plan/design/scripts.md) run on the
+      # release .github/blaze-version names, never on the blaze this tree builds: a tree whose
+      # compiler does not build must still be checked (the stage-0 rule). No LLVM: the scripts
+      # link none.
+      - uses: ./.github/actions/blaze
+        with:
+          job: scripts
+      # The objectives ledger's rows are well formed and its table is current (scripts/src/bin/ledger.rs).
       - run: |
-          uv run --frozen python harness/v2/ledger.py selftest
-          uv run --frozen python harness/v2/ledger.py '{"command": "check"}'
+          blaze run -q -p scripts --bin ledger -- selftest
+          blaze run -q -p scripts --bin ledger -- '{"command": "check"}'
       # The budget harness's own parts hold: which rows an input selects, the daemon home's layout
       # against the daemon's rule, the smoke's edit on the fixture (harness/v2/budgets.py). Its
       # smoke, against the blaze a change builds, is blaze-platform.yaml's profile-gate job.

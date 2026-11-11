@@ -122,7 +122,6 @@ harness/v2/incraudit.py
 harness/v2/invariants.py
 harness/v2/lean_differential.py
 harness/v2/lean_gate.py
-harness/v2/ledger.py
 harness/v2/macroeval_corpus.py
 harness/v2/mir_semantics.py
 harness/v2/oracle.py

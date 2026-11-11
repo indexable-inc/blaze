@@ -30,7 +30,7 @@ The input is one JSON object:
     lake      the pinned toolchain's `lake`, an absolute path; empty for the one elan keeps for
               lean/lean-toolchain's pin (`~/.elan/toolchains/<pin>/bin/lake`). Never PATH
     packages  which packages `check` builds: `core` (lean/) and `analysis` (lean/analysis); both
-    out       where the verdict goes for the ledger (harness/v2/ledger.py), when given
+    out       where the verdict goes for the ledger (scripts/src/bin/ledger.rs), when given
 
 lean/theorems.json is the one list of what blaze claims is proved:
 
